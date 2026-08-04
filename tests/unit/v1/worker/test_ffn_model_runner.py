@@ -13,6 +13,7 @@ pytest.importorskip("vllm")
 import afd_plugin.v1.worker.ffn_model_runner as ffn_model_runner_module  # noqa: E402
 from afd_plugin.connectors import (  # noqa: E402
     AFDA2FTransferPayload,
+    AFDA2FTransportSpec,
     AFDControlPayload,
     AFDExpertRoutingSpec,
     AFDTransferContext,
@@ -31,6 +32,7 @@ class _FakeConnector:
         self.attn_outputs = deque()
         self.ffn_outputs = []
         self.expert_routing_specs = []
+        self.transport_specs = []
         self.dp_metadata_updates = []
         self.closed = False
         # The runners reach the control plane through connector.control_plane;
@@ -47,9 +49,16 @@ class _FakeConnector:
             ),
         )
 
-    def recv_attn_output(self, ubatch_idx=None, routing_spec=None):
+    def recv_attn_output(
+        self,
+        ubatch_idx=None,
+        routing_spec=None,
+        transport_spec=None,
+    ):
         if routing_spec is not None:
             self.expert_routing_specs.append(routing_spec)
+        if transport_spec is not None:
+            self.transport_specs.append(transport_spec)
         if ubatch_idx is None:
             return self.attn_outputs.popleft()
         for item in tuple(self.attn_outputs):
@@ -74,6 +83,9 @@ class _ConnectorDrivenFakeConnector(_FakeConnector):
 class _FakeModel:
     def get_experts_layer_indices(self):
         return ()
+
+    def get_afd_transport_spec(self, layer_idx):
+        return None
 
     def compute_ffn_output(self, hidden_states, layer_idx):
         return f"ffn({hidden_states}, layer={layer_idx})"
@@ -183,12 +195,58 @@ def test_ffn_runner_executes_model_compute_ffn_output():
     assert metadata.layer_idx == 0
 
 
+def test_ffn_runner_forwards_payload_input_ids_to_model():
+    class _InputIdsModel(_FakeModel):
+        def __init__(self):
+            self.calls = []
+
+        def compute_ffn_output(self, hidden_states, layer_idx, *, input_ids):
+            self.calls.append((hidden_states, layer_idx, input_ids))
+            return input_ids
+
+        def get_afd_transport_spec(self, layer_idx):
+            return AFDA2FTransportSpec()
+
+    model = _InputIdsModel()
+    runner = _runner_with_connector_and_model(model)
+    metadata = _metadata()
+    input_ids = torch.tensor([11], dtype=torch.int64)
+    runner.connector.attn_outputs.append(
+        AFDA2FTransferPayload(
+            hidden_states="hidden",
+            context=AFDTransferContext(metadata=metadata),
+            input_ids=input_ids,
+        ),
+    )
+
+    runner.execute_model(
+        dp_metadata_list={0: _FakeDPMetadata([1])},
+        transport_spec=AFDA2FTransportSpec(),
+    )
+
+    assert model.calls == [("hidden", 0, input_ids)]
+    assert runner.connector.ffn_outputs == [(input_ids, metadata)]
+
+
+def test_ffn_runner_rejects_control_transport_mismatch_before_receive():
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.connector.attn_outputs.append(_payload("hidden", _metadata()))
+
+    with pytest.raises(RuntimeError, match="does not match the local model plan"):
+        runner.execute_model(
+            dp_metadata_list={0: _FakeDPMetadata([1])},
+            transport_spec=AFDA2FTransportSpec(),
+        )
+
+    assert len(runner.connector.attn_outputs) == 1
+
+
 def test_ffn_runner_exposes_missing_model_contract():
     runner = _runner_with_connector_and_model(SimpleNamespace())
     metadata = _metadata()
     runner.connector.attn_outputs.append(_payload("hidden", metadata))
 
-    with pytest.raises(AttributeError, match="get_experts_layer_indices"):
+    with pytest.raises(AttributeError, match="get_afd_transport_spec"):
         runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([1])})
 
 

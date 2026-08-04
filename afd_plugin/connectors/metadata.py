@@ -128,6 +128,7 @@ class AFDControlPayload:
     dp_metadata_list: dict[int, AFDDPMetadata]
     is_graph_capturing: bool
     is_warmup: bool
+    transport_spec: AFDA2FTransportSpec | None = None
 
     def __post_init__(self) -> None:
         self.dp_metadata_list = {
@@ -157,6 +158,26 @@ class AFDExpertRoutingSpec(NamedTuple):
 
     router_logits_width: int
     router_logits_dtype: torch.dtype
+
+
+@dataclass(frozen=True, slots=True)
+class AFDA2FTransportSpec:
+    """Versioned model-owned contract for Attention-to-FFN side inputs.
+
+    Version 1 preserves the historical hidden-state/router-logits ordering and
+    optionally appends token-aligned ``input_ids``. The explicit dtype prevents
+    transport implementations from coercing integer identifiers to the model
+    activation dtype.
+    """
+
+    version: int = 1
+    input_ids_dtype: torch.dtype = torch.int64
+
+    def __post_init__(self) -> None:
+        if self.version != 1:
+            raise ValueError(f"unsupported AFD A2F transport version {self.version}")
+        if self.input_ids_dtype != torch.int64:
+            raise ValueError("AFD A2F version 1 input_ids must use torch.int64")
 
 
 @dataclass(slots=True)
@@ -263,11 +284,14 @@ class AFDA2FTransferPayload:
         context: Transfer context describing the received transfer, including
             transfer metadata and backend-produced transfer state.
         router_logits: Optional Attention-side routing tensor.
+        input_ids: Optional token-aligned identifiers required by the remote
+            FFN implementation.
     """
 
     hidden_states: torch.Tensor
     context: AFDTransferContext
     router_logits: torch.Tensor | None = None
+    input_ids: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -325,6 +349,14 @@ def encode_control_payload(payload: AFDControlPayload) -> bytes:
         "dp_metadata_list": metadata_payload,
         "is_graph_capturing": bool(payload.is_graph_capturing),
         "is_warmup": bool(payload.is_warmup),
+        "transport_spec": (
+            None
+            if payload.transport_spec is None
+            else {
+                "version": payload.transport_spec.version,
+                "input_ids_dtype": "int64",
+            }
+        ),
     }
     return json.dumps(wire_payload, separators=(",", ":"), sort_keys=True).encode(
         "utf-8",
@@ -349,10 +381,20 @@ def decode_control_payload(payload_bytes: bytes) -> AFDControlPayload:
         )
         for stage_idx, metadata in payload["dp_metadata_list"].items()
     }
+    transport_payload = payload.get("transport_spec")
+    transport_spec = None
+    if transport_payload is not None:
+        if transport_payload.get("input_ids_dtype") != "int64":
+            raise ValueError("AFD control payload input_ids dtype must be int64")
+        transport_spec = AFDA2FTransportSpec(
+            version=int(transport_payload["version"]),
+            input_ids_dtype=torch.int64,
+        )
     return AFDControlPayload(
         dp_metadata_list=dp_metadata_list,
         is_graph_capturing=bool(payload.get("is_graph_capturing", False)),
         is_warmup=bool(payload.get("is_warmup", False)),
+        transport_spec=transport_spec,
     )
 
 

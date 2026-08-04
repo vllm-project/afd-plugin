@@ -57,6 +57,9 @@ _DEEPSEEK_MODEL_REGISTRATIONS = {
     "DeepseekV32ForCausalLM": (
         "afd_plugin.model_executor.models.deepseek_v2:AFDDeepseekV3ForCausalLM"
     ),
+    "DeepseekV4ForCausalLM": (
+        "afd_plugin.model_executor.models.deepseek_v4:AFDDeepseekV4ForCausalLM"
+    ),
     "GlmMoeDsaForCausalLM": (
         "afd_plugin.model_executor.models.deepseek_v2:AFDGlmMoeDsaForCausalLM"
     ),
