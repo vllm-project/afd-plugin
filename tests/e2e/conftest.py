@@ -195,6 +195,14 @@ def _launch_afd_server(
     enable_dbo: bool = False,
     common_vllm_args: list[str] | None = None,
     served_model_name_prefix: str = "deepseek-v2-lite-afd",
+    connector: str | None = None,
+    attention_tp_size: int | None = None,
+    ffn_tp_size: int | None = None,
+    afd_async: bool = False,
+    compute_gate_on_attention: bool = False,
+    afd_connector_extra_config: list[str] | None = None,
+    attention_env: dict[str, str] | None = None,
+    ffn_env: dict[str, str] | None = None,
 ) -> AFDServer:
     """Start AFD servers and return an AFDServer once the API is ready.
 
@@ -202,11 +210,16 @@ def _launch_afd_server(
     ----------
     backend:
         ``"gpu"`` uses CUDA workers with ``P2pNcclAFDConnector``.
-        ``"npu"`` uses Ascend workers with ``CAMP2pAFDConnector``.
+        ``"npu"`` uses Ascend workers with ``CAMP2pAFDConnector`` by default;
+        pass ``connector`` to override it.
     attention_devices:
         Device IDs for the attention worker (e.g. ``["0"]``).
     ffn_devices:
         Device IDs for the FFN worker (e.g. ``["1"]``).
+    attention_env:
+        Extra environment variables applied only to the Attention process.
+    ffn_env:
+        Extra environment variables applied only to the FFN process.
     """
     attention_devices = attention_devices or ["0"]
     ffn_devices = ffn_devices or ["1"]
@@ -228,19 +241,21 @@ def _launch_afd_server(
             common_vllm_args=common_vllm_args,
             served_model_name_prefix=served_model_name_prefix,
             device_backend=backend,
+            attention_tp_size=attention_tp_size,
+            ffn_tp_size=ffn_tp_size,
+            afd_connector=connector,
+            afd_async=afd_async,
+            compute_gate_on_attention=compute_gate_on_attention,
+            afd_connector_extra_config=afd_connector_extra_config,
         ),
     )
 
-    # NPU uses CAMP2pAFDConnector; GPU uses P2pNcclAFDConnector.
-    # Patch the connector in the AFD config after building the command.
     processes: list[subprocess.Popen[str]] = []
     log_threads: list[threading.Thread] = []
 
     try:
         # --- FFN ---
         ffn_cmd = build_vllm_command(args, role="ffn")
-        if is_npu:
-            ffn_cmd = _patch_connector(ffn_cmd, "CAMP2pAFDConnector")
         ffn_devices_str = ",".join(ffn_devices)
         device_label = (
             f"ASCEND_RT_VISIBLE_DEVICES={ffn_devices_str}"
@@ -248,10 +263,12 @@ def _launch_afd_server(
             else f"CUDA_VISIBLE_DEVICES={ffn_devices_str}"
         )
         print(f"\n[conftest] Starting FFN ({device_label})")
+        ffn_process_env = build_env(ffn_devices_str, args, role="ffn")
+        ffn_process_env.update(ffn_env or {})
         ffn_proc = start_process(
             "ffn",
             ffn_cmd,
-            build_env(ffn_devices_str, args, role="ffn"),
+            ffn_process_env,
         )
         processes.append(ffn_proc)
         log_threads.append(stream_output("ffn", ffn_proc))
@@ -260,8 +277,6 @@ def _launch_afd_server(
 
         # --- Attention ---
         attn_cmd = build_vllm_command(args, role="attention")
-        if is_npu:
-            attn_cmd = _patch_connector(attn_cmd, "CAMP2pAFDConnector")
         attn_devices_str = ",".join(attention_devices)
         device_label = (
             f"ASCEND_RT_VISIBLE_DEVICES={attn_devices_str}"
@@ -269,10 +284,12 @@ def _launch_afd_server(
             else f"CUDA_VISIBLE_DEVICES={attn_devices_str}"
         )
         print(f"[conftest] Starting ATTN ({device_label})")
+        attn_process_env = build_env(attn_devices_str, args, role="attention")
+        attn_process_env.update(attention_env or {})
         attn_proc = start_process(
             "attention",
             attn_cmd,
-            build_env(attn_devices_str, args, role="attention"),
+            attn_process_env,
         )
         processes.append(attn_proc)
         log_threads.append(stream_output("attention", attn_proc))
@@ -312,15 +329,3 @@ def _launch_afd_server(
         for thread in log_threads:
             thread.join(timeout=2)
         raise
-
-
-def _patch_connector(command: list[str], connector: str) -> list[str]:
-    """Replace the connector value in --additional-config JSON."""
-    result = list(command)
-    for i, token in enumerate(result):
-        if token == "--additional-config" and i + 1 < len(result):
-            config = json.loads(result[i + 1])
-            config["afd"]["connector"] = connector
-            result[i + 1] = json.dumps(config, separators=(",", ":"))
-            break
-    return result

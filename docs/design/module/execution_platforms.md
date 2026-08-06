@@ -234,8 +234,20 @@ wrapper. The current path:
 
 `v1/worker/dbo.py` registers the model-side yield operation and dispatches to
 the platform DBO implementation. The optional CAM async MoE pipeline is not
-this native DBO path: it is an eager, request-boundary, two-stage pipeline
-owned by the model/connector flow.
+this native DBO path: it is an eager, two-stage pipeline owned by the
+model/connector flow. It supports request boundaries with or without SP and
+TP-aligned token boundaries for non-PCP DP+TP/SP. The planner balances real
+tokens rather than the DP-padded parent extent; it removes parent padding
+before the split, adds only minimum stage-local TP padding, and restores the
+parent layout after the two stages.
+
+Token-stage SP is role-local when enabled: Attention converts the full-batch TP
+shards into stage-local TP shards, while the FFN server keeps FlashComm1
+disabled and consumes expert-routed CAM payloads. Plain DP+TP Attention is also
+supported without FlashComm1. Its model tensors remain TP-replicated, while the
+CAM boundary dispatches disjoint contiguous token shards and all-gathers each
+FFN result before the next Attention layer. FFN TP may therefore be one even
+when Attention token-stage validation requires TP greater than one.
 
 ### ACL Graph and NPU Graph
 
@@ -290,7 +302,7 @@ an expansion of the supported runtime contract.
 | --- | --- | --- | --- | --- |
 | CUDA + `P2pNcclAFDConnector` | Eager or `FULL_DECODE_ONLY` CUDA Graph | Native DBO, exactly two ubatches | Role-aware DeepSeek path; P2P topology validated by connector/config tests | GPU serving, graph, TP, profiler, model, and accuracy E2E tests |
 | Ascend + `CAMP2pAFDConnector` | Eager or current ACL Graph path | Native DBO, exactly two ubatches | Common and connector-local `compute_gate_on_attention=false`; `connector_extra_config.quant_mode=0`; plugin CANN ops required | NPU serving, graph, TP, ops, profiler, model, and accuracy E2E tests |
-| Ascend + `CAMAsyncAFDConnector` | Eager only | Native DBO rejected; optional async MoE ubatching uses exactly two request-boundary stages | `async=true`; documented path uses common `compute_gate_on_attention=true`; decode context parallel unsupported for async MoE ubatching; `connector_extra_config.dynamicQuant` is 0 or 1; external CAM ops required | Async CAM connector unit tests and `test_async_cam_npu.py` |
+| Ascend + `CAMAsyncAFDConnector` | Eager only | Native DBO rejected; optional async MoE ubatching uses two PCP request or non-PCP token-balanced stages | `async=true`; documented path uses common `compute_gate_on_attention=true`; token mode requires Attention TP > 1 without context parallelism; decode context parallel unsupported for async MoE ubatching; `connector_extra_config.dynamicQuant` is 0 or 1; external CAM ops required | Async CAM connector unit tests, `test_async_cam_npu.py`, and the opt-in GSM8K DP3TP2/EP2 split × SP × ubatching matrix |
 
 All paths use the supported vLLM release and model runner v1. GPU/NPU rank
 topology and connector resource rules remain owned by

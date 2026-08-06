@@ -107,7 +107,7 @@ def _fail_if_unsupported_npu_afd_async_features(
         raise RuntimeError(
             "CAMAsyncAFDConnector supports only eager Attention/FFN execution",
         )
-    if bool(parallel_config.use_ubatching):
+    if bool(parallel_config.enable_dbo) or bool(parallel_config.use_ubatching):
         raise RuntimeError(
             "CAMAsyncAFDConnector does not support vLLM native ubatching/DBO",
         )
@@ -131,26 +131,42 @@ def _fail_if_unsupported_npu_async_moe_ubatching_features(
     num_ubatches: int,
     split: str,
 ) -> None:
-    from afd_plugin.connectors.npu.async_cam import ASYNC_MOE_REQUEST_SPLIT
+    from afd_plugin.async_moe import (
+        ASYNC_MOE_NUM_STAGES,
+        ASYNC_MOE_REQUEST_SPLIT,
+        ASYNC_MOE_TOKEN_SPLIT,
+    )
 
     parallel_config = vllm_config.parallel_config
     if not afd_config.compute_gate_on_attention:
         raise RuntimeError(
             "async_moe_ubatching requires compute_gate_on_attention=true",
         )
-    if num_ubatches != 2:
+    if num_ubatches != ASYNC_MOE_NUM_STAGES:
         raise RuntimeError(
             "async_moe_ubatching currently supports exactly two stages; "
             f"got async_moe_num_ubatches={num_ubatches}",
         )
-    if split != ASYNC_MOE_REQUEST_SPLIT:
+    if split not in (ASYNC_MOE_REQUEST_SPLIT, ASYNC_MOE_TOKEN_SPLIT):
         raise RuntimeError(
-            "async_moe_ubatching currently supports only request-boundary split; "
+            "async_moe_split must be 'request' or 'token'; "
             f"got async_moe_split={split!r}",
         )
+    # Attention owns stage planning and SP layout conversion. FFN workers
+    # consume CAM work items and may use an independent TP/EP topology.
+    if afd_config.is_ffn_server:
+        return
     if int(parallel_config.decode_context_parallel_size) > 1:
         raise RuntimeError(
             "async_moe_ubatching does not support decode context parallel metadata yet",
+        )
+    if split == ASYNC_MOE_TOKEN_SPLIT and (
+        int(parallel_config.tensor_parallel_size) <= 1
+        or int(parallel_config.prefill_context_parallel_size) > 1
+    ):
+        raise RuntimeError(
+            "async_moe_split='token' requires a non-PCP Attention DP+TP/SP "
+            "topology with tensor_parallel_size > 1",
         )
 
 

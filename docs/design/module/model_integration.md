@@ -117,9 +117,10 @@ runs, `use_afd_metadata_provider()` temporarily wraps
 `additional_kwargs` entry, and restores the original function in `finally`.
 This is a scoped compatibility adapter, not a permanent global provider.
 
-Async MoE request ubatching uses a second sidecar key,
-`afd_async_moe_ubatch_metadata`, containing upstream Attention metadata and
-`UBatchSlices`. Both the sidecar shape and the live connector reference are
+Async MoE ubatching uses a second sidecar key,
+`afd_async_moe_ubatch_metadata`, containing upstream Attention metadata and a
+plugin-owned ordered stage plan. Both the sidecar shape and the live connector
+reference are
 **draft** while metadata ownership is discussed in
 [#88](https://github.com/JiusiServe/afd-plugin/issues/88) and payload state is
 split under [#105](https://github.com/JiusiServe/afd-plugin/issues/105).

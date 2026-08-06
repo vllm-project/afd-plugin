@@ -19,7 +19,8 @@ prefill path when all of the following are true:
 - Attention performs MoE gating before dispatch to FFN ranks;
 - execution is eager and AFD async-DP is enabled; **`async=true` is required**;
 - the service is the prefill stage of a prefill/decode-disaggregated deployment;
-- optional MoE ubatching is managed by AFD as two request-boundary stages.
+- optional MoE ubatching is managed by AFD as two stages: request boundaries
+  for PCP, or token-balanced non-PCP DP+TP/SP stages.
 
 CAM async currently does not support decode, ACL graph execution, or vLLM
 native DBO.
@@ -152,10 +153,16 @@ spelling used by the recipes.
 | Field | Type | Default | Meaning and constraint |
 | --- | --- | --- | --- |
 | `dynamicQuant` | `int` | `0` | Enables CAM dispatch/combine dynamic-quant metadata. Only `0` and `1` are accepted. With `1`, FFN receives quantized routed activations plus scale tensors and must return output compatible with combine-send. |
-| `attn_ranks_per_dp` | `int` | `1` | Positive Attention rank count per DP replica, normally the PCP width, passed to CAM as its Attention TP size. Runtime role-rank derivation uses vLLM's DP/PCP/TP placement directly. |
+| `attn_ranks_per_dp` | `int` | `1` | Positive Attention rank count per DP replica (`PCP x TP`), passed to CAM as its Attention grouping width. It is independent of the FFN process's local TP size. Runtime role-rank derivation uses vLLM's DP/PCP/TP placement directly. |
 | `async_moe_ubatching` | `bool` | `false` | Enables AFD-managed asynchronous MoE-only ubatching. |
 | `async_moe_num_ubatches` | `int` | `2` | Number of asynchronous MoE stages. Only `2` is supported. |
-| `async_moe_split` | `str` | `"request"` | Stage split policy. The current async connector supports request-boundary splitting only. |
+| `async_moe_split` | `str` | `"request"` | `"request"` preserves request boundaries and supports PCP, plain TP, and FlashComm1/SP; it requires at least two scheduled requests. `"token"` balances the real flattened token extent for non-PCP DP+TP/SP and requires Attention TP greater than one with no context parallelism. With FlashComm1/SP, each stage gets only its minimum trailing TP padding and the parent padded layout is restored afterward. The FFN side consumes CAM work items and may independently use TP1. |
+
+For a DP+SP deployment such as DP3TP2 Attention + DP2TP1/EP2 FFN, set
+`VLLM_ASCEND_ENABLE_FLASHCOMM1=1` only on Attention and explicitly set it to
+`0` on FFN. Attention then holds contiguous TP-local sequence shards. For plain
+DP+TP Attention, leave FlashComm1 disabled on both roles. In either case, FFN
+consumes expert-routed CAM work items and may independently use TP1.
 
 ## Native DBO and async MoE ubatching are different
 
@@ -176,10 +183,48 @@ synchronous connector deployments.
 ### AFD-managed asynchronous MoE ubatching
 
 `async_moe_ubatching` pipelines only the MoE portion of CAM async execution.
-Requests are divided at request boundaries into exactly two stages. Each stage
-keeps its own pending Attention routing metadata so dispatch and combine remain
-paired while Attention and FFN work overlap. It does not enable vLLM native DBO
-and does not use the DBO threshold flags.
+Work is divided into exactly two stages. Request splitting requires at least
+two requests and keeps every request wholly within one stage. Token splitting
+supports a single long request and balances the real token count even when DP
+padding is much larger. With SP, the full shard layout is transposed once into
+TP-local stage shards and restored once after all MoE layers. Without SP, the
+model keeps its replicated TP token layout; the CAM boundary alone sends one
+contiguous token shard per TP rank and all-gathers the FFN result before the
+next Attention layer. If a DP replica cannot form two stages containing real
+tokens, that step runs without MoE stage pipelining; Async CAM does not add a
+DP synchronization for this decision. Each stage keeps its own pending
+Attention routing metadata so dispatch and combine remain paired while
+Attention and FFN work overlap. This does not enable vLLM native DBO and does
+not use the DBO threshold flags.
+
+For shape-only runtime diagnostics, set
+`AFD_ASYNC_MOE_LAYOUT_LOG=1` on Attention. The log reports the parent token
+extent, CAM-local slice, padding, and whether the FFN result is TP all-gathered.
+It does not inspect tensor values or force a device synchronization.
+
+### E2E validation matrix
+
+The opt-in
+`tests/e2e/accuracy/test_gsm8k_npu_async_cam.py::test_gsm8k_lm_eval_async_cam_dp3tp2_ep2`
+test covers one parameterized DP3TP2 Attention + DP2TP1/EP2 FFN matrix:
+
+- token and request split modes when async MoE ubatching is enabled;
+- Attention FlashComm1/SP enabled and disabled;
+- one non-ubatched case for each SP setting.
+
+This produces six distinct cases. When ubatching is disabled,
+`async_moe_split` is not sent to the server because it has no runtime effect.
+Each case checks the configured GSM8K accuracy threshold independently; the
+suite does not launch a second deployment for an automatic baseline
+comparison.
+
+Run the full matrix with:
+
+```bash
+AFD_NPU_ASYNC_CAM_RUN_DP3TP2=1 \
+pytest -svv \
+  tests/e2e/accuracy/test_gsm8k_npu_async_cam.py::test_gsm8k_lm_eval_async_cam_dp3tp2_ep2
+```
 
 When `async_moe_ubatching=true`, all roles must set:
 
@@ -234,7 +279,8 @@ available: `async_dispatch_send`, `async_dispatch_recv`,
 - Eager execution only; ACL graph mode is unsupported.
 - Prefill stage only in a prefill/decode-disaggregated deployment.
 - vLLM native DBO/ubatching is unsupported.
-- AFD-managed MoE ubatching supports exactly two request-boundary stages.
+- AFD-managed MoE ubatching supports exactly two PCP request or non-PCP
+  token-balanced DP+TP/SP stages.
 - Decode context parallel metadata is unsupported with async MoE ubatching.
 - Routed experts should divide evenly across FFN ranks.
 - Other Ascend hardware, full unmodified DeepSeek-V3.2, different model

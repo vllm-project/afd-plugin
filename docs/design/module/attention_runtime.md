@@ -239,11 +239,21 @@ Attention model path.
 The optional `async_moe_ubatching` mode is distinct from vLLM native DBO. It:
 
 - requires `compute_gate_on_attention=true`;
-- splits at request boundaries into exactly two stages;
+- keeps the PCP policy on exactly two request-boundary stages;
+- splits non-PCP DP+TP/SP work into exactly two stages balanced by real token
+  count, with a TP-aligned boundary when FlashComm1/SP is enabled;
 - runs the dense prefix before the split;
 - pipelines stage Attention send and FFN receive through the MoE layers;
 - rejoins stage outputs after the pipeline;
+- does not synchronize stage eligibility across asynchronous DP replicas;
 - does not support decode context parallel metadata.
+
+Token stages support both ordinary DP+TP and FlashComm1 DP+SP layouts.
+FlashComm1/SP, when selected, belongs only to the Attention role. A topology
+such as Attention DP3TP2 with FFN DP2TP1/EP2 therefore runs Attention with
+`VLLM_ASCEND_ENABLE_FLASHCOMM1=1` and FFN with
+`VLLM_ASCEND_ENABLE_FLASHCOMM1=0`. FFN topology validation is intentionally
+independent of the Attention token-stage TP requirement.
 
 CAM async requires eager execution and rejects vLLM native ubatching. Its
 feature limits are recorded in the

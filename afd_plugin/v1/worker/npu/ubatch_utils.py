@@ -17,6 +17,8 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 
+from afd_plugin.async_moe import AsyncMoeStage
+
 
 def is_last_ubatch_empty(
     orig_num_tokens: int,
@@ -311,6 +313,45 @@ def split_attn_metadata(
     ]
 
 
+# Patch reason: native DBO stages do not distinguish real tokens from
+# Async CAM's stage-local physical padding.
+# Patch functionality: slice all request/token metadata on real ranges, then
+# record the padded physical input size used by the CAM TP/SP stage.
+# Signature: plugin-owned helper; it does not replace an upstream function.
+# ### PATCH START: Async CAM stage metadata
+def split_async_moe_attn_metadata(
+    stages: tuple[AsyncMoeStage, ...],
+    common_attn_metadata: AscendCommonAttentionMetadata,
+    max_num_tokens: int = 0,
+) -> list[AscendCommonAttentionMetadata]:
+    """Build stage metadata while keeping native DBO slicing unchanged.
+
+    Async CAM may add minimum stage-local TP padding after each real-token
+    range. The native Ascend helper must see only real tokens so request
+    offsets, sequence lengths, positions, and KV slots are rebuilt correctly.
+    ``num_input_tokens`` is then restored to the physical stage extent used by
+    the model-side TP/SP layout.
+    """
+
+    stage_metadata = []
+    for stage in stages:
+        actual_token_slice = slice(
+            int(stage.token_slice.start),
+            int(stage.token_slice.start) + stage.actual_tokens,
+        )
+        metadata = _make_metadata_with_slice(
+            UBatchSlice(stage.request_slice, actual_token_slice),
+            common_attn_metadata,
+            max_num_tokens,
+        )
+        metadata.num_input_tokens = stage.num_tokens
+        stage_metadata.append(metadata)
+    return stage_metadata
+
+
+# ### PATCH END: Async CAM stage metadata
+
+
 __all__ = [
     "UBatchSlice",
     "UBatchSlices",
@@ -321,5 +362,8 @@ __all__ = [
     "maybe_create_ubatch_slices",
     "pad_out_ubatch_slices",
     "slice_query_start_locs",
+    # ### PATCH START: Async CAM stage metadata
+    "split_async_moe_attn_metadata",
+    # ### PATCH END: Async CAM stage metadata
     "split_attn_metadata",
 ]
