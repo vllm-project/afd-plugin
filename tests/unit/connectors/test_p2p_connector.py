@@ -25,12 +25,14 @@ def _fake_vllm_config(
     data_parallel_rank=0,
     enforce_eager=True,
 ):
+    text_config = SimpleNamespace(hidden_size=16, num_hidden_layers=2)
     return SimpleNamespace(
         additional_config={},
         model_config=SimpleNamespace(
             dtype=torch.bfloat16,
             enforce_eager=enforce_eager,
-            hf_config=SimpleNamespace(hidden_size=16, num_hidden_layers=2),
+            hf_config=text_config,
+            hf_text_config=text_config,
         ),
         parallel_config=SimpleNamespace(
             data_parallel_size=data_parallel_size,
@@ -72,6 +74,38 @@ def test_p2p_connector_can_be_constructed_without_runtime_initialization():
     assert connector.is_initialized is False
     assert connector.world_rank == 1
     assert connector.dst_list == [0]
+
+
+def test_p2p_connector_uses_nested_text_config_for_multimodal_model():
+    text_config = SimpleNamespace(hidden_size=24, num_hidden_layers=40)
+    connector = AFDConnectorFactory.create_connector(
+        0,
+        0,
+        SimpleNamespace(
+            additional_config={},
+            model_config=SimpleNamespace(
+                dtype=torch.bfloat16,
+                enforce_eager=True,
+                hf_config=SimpleNamespace(model_type="qwen3_5_moe"),
+                hf_text_config=text_config,
+            ),
+            parallel_config=SimpleNamespace(
+                data_parallel_size=1,
+                data_parallel_rank=0,
+                prefill_context_parallel_size=1,
+                tensor_parallel_size=1,
+            ),
+        ),
+        AFDConfig(
+            role="attention",
+            connector="P2pNcclAFDConnector",
+            num_attention_ranks=1,
+            num_ffn_ranks=1,
+        ),
+    )
+
+    assert connector.num_hidden_layers == (40,)
+    assert connector.hidden_size == 24
 
 
 def test_p2p_connector_uses_factory_resolved_role_rank():
@@ -347,6 +381,11 @@ def test_p2p_hidden_state_send_uses_registered_custom_op(monkeypatch):
             ),
         ),
     )
+    synchronized = []
+    torch_module.compiler = SimpleNamespace(is_compiling=lambda: False)
+    torch_module.cuda = SimpleNamespace(
+        synchronize=lambda device: synchronized.append(device),
+    )
     monkeypatch.setattr(module, "torch", torch_module)
 
     hidden_states = SimpleNamespace(
@@ -363,6 +402,7 @@ def test_p2p_hidden_state_send_uses_registered_custom_op(monkeypatch):
     )
 
     assert calls == [(hidden_states, 1, 17)]
+    assert synchronized == ["cuda:0"]
     assert output is None
 
 
@@ -393,6 +433,11 @@ def test_p2p_recv_preserves_dynamic_ref_tensor_first_dim(monkeypatch):
     torch_module.empty = lambda *_args, **_kwargs: pytest.fail(
         "recv should reuse the dynamic ref tensor",
     )
+    synchronized = []
+    torch_module.compiler = SimpleNamespace(is_compiling=lambda: False)
+    torch_module.cuda = SimpleNamespace(
+        synchronize=lambda device: synchronized.append(device),
+    )
     monkeypatch.setattr(module, "torch", torch_module)
 
     ref_tensor = SimpleNamespace(
@@ -417,6 +462,7 @@ def test_p2p_recv_preserves_dynamic_ref_tensor_first_dim(monkeypatch):
 
     assert output is ref_tensor
     assert calls == [(ref_tensor, 0, 23)]
+    assert synchronized == ["cuda:0"]
 
 
 def test_p2p_recv_single_rank_requires_ref_tensor():

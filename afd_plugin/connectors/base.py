@@ -161,7 +161,11 @@ class AFDConnectorBase(ABC):
                 calling convention.
             context: Per-transfer context describing layer, stage, and token
                 layout. Backends may also consume ``context.states``.
-            **kwargs: Optional backend-specific arguments.
+            **kwargs: Optional backend-specific arguments. For an
+                experts-boundary transfer, ``router_logits`` and
+                ``routing_spec`` must be supplied together. The latter is an
+                ``AFDExpertRoutingSpec`` shared with the FFN receiver and
+                defines the router tensor's wire shape and dtype.
 
         Raises:
             ValueError: If tensor shape does not match metadata.

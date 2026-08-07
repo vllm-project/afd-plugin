@@ -17,12 +17,14 @@ from afd_plugin.connectors.gpu.p2p import P2pNcclAFDConnector  # noqa: E402
 
 
 def _vllm_config():
+    text_config = SimpleNamespace(hidden_size=4, num_hidden_layers=3)
     return SimpleNamespace(
         additional_config={},
         model_config=SimpleNamespace(
             dtype=torch.bfloat16,
             enforce_eager=True,
-            hf_config=SimpleNamespace(hidden_size=4, num_hidden_layers=3),
+            hf_config=text_config,
+            hf_text_config=text_config,
         ),
         parallel_config=SimpleNamespace(
             data_parallel_size=1,
@@ -80,6 +82,7 @@ def test_attention_gate_reuses_hidden_state_send_for_router_logits(monkeypatch):
         hidden_states,
         _context(),
         router_logits=router_logits,
+        routing_spec=AFDExpertRoutingSpec(3, torch.float32),
     )
 
     assert sent == [hidden_states, router_logits]
@@ -112,14 +115,69 @@ def test_router_shape_is_validated_before_any_send(monkeypatch):
         lambda tensor, *args: sent.append(tensor),
     )
 
-    with pytest.raises(ValueError, match="equal token counts"):
+    with pytest.raises(ValueError, match="wire-contract mismatch"):
         connector.send_attn_output(
             torch.ones((2, 4), dtype=torch.bfloat16),
             _context(),
             router_logits=torch.ones((3, 3), dtype=torch.float32),
+            routing_spec=AFDExpertRoutingSpec(3, torch.float32),
         )
 
     assert sent == []
+
+
+@pytest.mark.parametrize(
+    ("router_logits", "spec", "message"),
+    [
+        (torch.ones(2), AFDExpertRoutingSpec(3, torch.float32), "2D"),
+        (torch.ones((2, 3, 1)), AFDExpertRoutingSpec(3, torch.float32), "2D"),
+        (
+            torch.ones((2, 4), dtype=torch.float32),
+            AFDExpertRoutingSpec(3, torch.float32),
+            "wire-contract mismatch",
+        ),
+        (
+            torch.ones((2, 3), dtype=torch.bfloat16),
+            AFDExpertRoutingSpec(3, torch.float32),
+            "wire-contract mismatch",
+        ),
+    ],
+)
+def test_router_wire_contract_rejects_invalid_payload(
+    monkeypatch,
+    router_logits,
+    spec,
+    message,
+):
+    connector = _attention_connector()
+    sent = []
+    monkeypatch.setattr(
+        connector,
+        "_send_hidden_states",
+        lambda tensor, *args: sent.append(tensor),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        connector.send_attn_output(
+            torch.ones((2, 4), dtype=torch.bfloat16),
+            _context(),
+            router_logits=router_logits,
+            routing_spec=spec,
+        )
+
+    assert sent == []
+
+
+def test_router_logits_and_spec_are_paired(monkeypatch):
+    connector = _attention_connector()
+    monkeypatch.setattr(connector, "_send_hidden_states", lambda *args: None)
+
+    with pytest.raises(ValueError, match="provided together"):
+        connector.send_attn_output(
+            torch.ones((2, 4), dtype=torch.bfloat16),
+            _context(),
+            router_logits=torch.ones((2, 3), dtype=torch.float32),
+        )
 
 
 def test_attention_gate_fan_in_preserves_peer_order(monkeypatch):

@@ -71,14 +71,16 @@ registers lazy AFD wrapper paths under `AFD`-prefixed aliases.
 | `DeepseekV3ForCausalLM` | `AFDDeepseekV3ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `DeepseekV32ForCausalLM` | `AFDDeepseekV32ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `GlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` |
+| `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` |
 
 Only AFD workers switch their worker-local model configuration to the matching
 alias before constructing the AFD model runner. Non-AFD workers keep the
 checkpoint architecture and resolve to vLLM's native model class.
 
-All registered classes currently share the DeepSeek V2-derived implementation.
-The aliases express known compatible architecture families; they do not make
-the wrapper a generic MoE model API.
+DeepSeek aliases share the DeepSeek V2-derived implementation. The Qwen alias
+is a dedicated Qwen3.5/3.6 MoE adapter that retains native Qwen model, decoder,
+MoE forward, and loader lifecycles. The aliases express known compatible
+architecture families; they do not make the wrapper a generic MoE model API.
 
 ## Role-aware module construction
 
@@ -202,6 +204,14 @@ filtering:
 Any change to these filters must be compared against the pinned upstream
 loader and validated on both roles. A successful load set is not evidence that
 the other role can be omitted from model/accuracy E2E coverage.
+
+For Qwen3.5/3.6 text-only MoE, Attention owns embeddings, norms, full and
+linear-attention state, router checkpoint weights, and router computation.
+FFN owns routed experts, the shared expert, and the shared-expert gate; its
+KV-cache spec is empty. FFN retains the dormant native router module inherited
+from the external-router design in PR #176 to preserve the native model tree
+and loader contract, but loads no router checkpoint weights and never executes
+router computation. The CUDA initial support is eager and synchronous only.
 
 ## Failure and resource ownership
 

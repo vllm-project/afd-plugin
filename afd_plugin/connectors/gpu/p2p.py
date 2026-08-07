@@ -181,8 +181,9 @@ class P2pNcclAFDConnector(AFDConnectorBase):
         self.ratio = self.mapping.ratio
         self.group_size = len(self.mapping.subgroup_ranks)
         self.dst_list = list(self.mapping.dp_metadata_destinations)
-        self.num_hidden_layers = (vllm_config.model_config.hf_config.num_hidden_layers,)
-        self.hidden_size = vllm_config.model_config.hf_config.hidden_size
+        text_config = vllm_config.model_config.hf_text_config
+        self.num_hidden_layers = (text_config.num_hidden_layers,)
+        self.hidden_size = text_config.hidden_size
         self.dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] = {}
         self.is_graph_capturing = False
         self.is_warmup = False
@@ -325,13 +326,58 @@ class P2pNcclAFDConnector(AFDConnectorBase):
                 f"AFD metadata token count {metadata.total_tokens}",
             )
         router_logits: torch.Tensor | None = kwargs.get("router_logits")
-        if (
-            router_logits is not None
-            and router_logits.shape[0] != hidden_states.shape[0]
-        ):
+        routing_spec: AFDExpertRoutingSpec | None = kwargs.get("routing_spec")
+        if (router_logits is None) != (routing_spec is None):
             raise ValueError(
-                "router_logits and hidden_states must have equal token counts",
+                "router_logits and routing_spec must be provided together",
             )
+        if router_logits is not None and routing_spec is not None:
+            if not isinstance(router_logits, torch.Tensor):
+                raise ValueError(
+                    "router_logits wire-contract mismatch: "
+                    f"expected Tensor, got {type(router_logits).__name__}",
+                )
+            if router_logits.ndim != 2:
+                raise ValueError(
+                    "router_logits wire-contract mismatch: "
+                    f"expected 2D shape (tokens, width), got "
+                    f"shape={tuple(router_logits.shape)}",
+                )
+            expected_tokens = int(hidden_states.shape[0])
+            expected_device = hidden_states.device
+            actual = (
+                f"shape={tuple(router_logits.shape)}, "
+                f"dtype={router_logits.dtype}, device={router_logits.device}"
+            )
+            expected = (
+                f"tokens={expected_tokens}, "
+                f"width={routing_spec.router_logits_width}, "
+                f"dtype={routing_spec.router_logits_dtype}, "
+                f"device={expected_device}"
+            )
+            if router_logits.shape != (
+                expected_tokens,
+                routing_spec.router_logits_width,
+            ):
+                raise ValueError(
+                    "router_logits wire-contract mismatch: "
+                    f"got {actual}; expected {expected}",
+                )
+            if router_logits.dtype != routing_spec.router_logits_dtype:
+                raise ValueError(
+                    "router_logits wire-contract mismatch: "
+                    f"got {actual}; expected {expected}",
+                )
+            if router_logits.device != expected_device:
+                raise ValueError(
+                    "router_logits wire-contract mismatch: "
+                    f"got {actual}; expected {expected}",
+                )
+            if not router_logits.is_contiguous():
+                raise ValueError(
+                    "router_logits wire-contract mismatch: "
+                    f"got non-contiguous layout ({actual}); expected contiguous",
+                )
         self._send_hidden_states(
             hidden_states,
             0,
@@ -567,6 +613,8 @@ class P2pNcclAFDConnector(AFDConnectorBase):
             raise ValueError(f"invalid P2P destination rank {dst}")
         if getattr(hidden_states, "is_cpu", False):
             raise ValueError("P2P hidden states must be on GPU")
+        if not torch.compiler.is_compiling() and not self.is_graph_capturing:
+            torch.cuda.synchronize(hidden_states.device)
 
         torch.ops.vllm.afd_p2p_send(
             hidden_states,
@@ -623,6 +671,8 @@ class P2pNcclAFDConnector(AFDConnectorBase):
             src,
             comm_id,
         )
+        if not torch.compiler.is_compiling() and not self.is_graph_capturing:
+            torch.cuda.synchronize(hidden_states.device)
         return hidden_states
 
 
