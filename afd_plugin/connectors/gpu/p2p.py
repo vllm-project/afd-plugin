@@ -621,6 +621,8 @@ class P2pNcclAFDConnector(AFDConnectorBase):
             dst,
             comm_id,
         )
+        if not torch.compiler.is_compiling() and not self.is_graph_capturing:
+            torch.cuda.synchronize(hidden_states.device)
         return
 
     def _recv_hidden_states(

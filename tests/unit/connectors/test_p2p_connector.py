@@ -402,7 +402,7 @@ def test_p2p_hidden_state_send_uses_registered_custom_op(monkeypatch):
     )
 
     assert calls == [(hidden_states, 1, 17)]
-    assert synchronized == ["cuda:0"]
+    assert synchronized == ["cuda:0", "cuda:0"]
     assert output is None
 
 
