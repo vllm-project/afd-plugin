@@ -381,11 +381,6 @@ def test_p2p_hidden_state_send_uses_registered_custom_op(monkeypatch):
             ),
         ),
     )
-    synchronized = []
-    torch_module.compiler = SimpleNamespace(is_compiling=lambda: False)
-    torch_module.cuda = SimpleNamespace(
-        synchronize=lambda device: synchronized.append(device),
-    )
     monkeypatch.setattr(module, "torch", torch_module)
 
     hidden_states = SimpleNamespace(
@@ -402,7 +397,6 @@ def test_p2p_hidden_state_send_uses_registered_custom_op(monkeypatch):
     )
 
     assert calls == [(hidden_states, 1, 17)]
-    assert synchronized == ["cuda:0", "cuda:0"]
     assert output is None
 
 
@@ -433,11 +427,6 @@ def test_p2p_recv_preserves_dynamic_ref_tensor_first_dim(monkeypatch):
     torch_module.empty = lambda *_args, **_kwargs: pytest.fail(
         "recv should reuse the dynamic ref tensor",
     )
-    synchronized = []
-    torch_module.compiler = SimpleNamespace(is_compiling=lambda: False)
-    torch_module.cuda = SimpleNamespace(
-        synchronize=lambda device: synchronized.append(device),
-    )
     monkeypatch.setattr(module, "torch", torch_module)
 
     ref_tensor = SimpleNamespace(
@@ -462,7 +451,6 @@ def test_p2p_recv_preserves_dynamic_ref_tensor_first_dim(monkeypatch):
 
     assert output is ref_tensor
     assert calls == [(ref_tensor, 0, 23)]
-    assert synchronized == ["cuda:0"]
 
 
 def test_p2p_recv_single_rank_requires_ref_tensor():

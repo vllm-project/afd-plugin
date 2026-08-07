@@ -680,16 +680,11 @@ class P2pNcclAFDConnector(AFDConnectorBase):
             raise ValueError(f"invalid P2P destination rank {dst}")
         if getattr(hidden_states, "is_cpu", False):
             raise ValueError("P2P hidden states must be on GPU")
-        if not torch.compiler.is_compiling() and not self.is_graph_capturing:
-            torch.cuda.synchronize(hidden_states.device)
-
         torch.ops.vllm.afd_p2p_send(
             hidden_states,
             dst,
             comm_id,
         )
-        if not torch.compiler.is_compiling() and not self.is_graph_capturing:
-            torch.cuda.synchronize(hidden_states.device)
         return
 
     def _recv_hidden_states(
@@ -740,8 +735,6 @@ class P2pNcclAFDConnector(AFDConnectorBase):
             src,
             comm_id,
         )
-        if not torch.compiler.is_compiling() and not self.is_graph_capturing:
-            torch.cuda.synchronize(hidden_states.device)
         return hidden_states
 
 
