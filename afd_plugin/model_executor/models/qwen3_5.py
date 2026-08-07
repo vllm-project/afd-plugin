@@ -387,6 +387,7 @@ class AFDQwen3_5Model(native.Qwen3_5Model):  # noqa: N801
         return tuple(range(self.start_layer, self.end_layer))
 
     def get_experts_routing_spec(self, layer_idx: int) -> AFDExpertRoutingSpec:
+        """Return this layer's cross-rank router-logits wire contract."""
         if not self.afd_config.compute_gate_on_attention:
             raise RuntimeError(
                 "Qwen router logits are only transferred for Attention-side gate",
