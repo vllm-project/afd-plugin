@@ -165,12 +165,14 @@ class AFDFFNWorker(Worker):
                     dp_metadata_list=dp_metadata_list,
                     is_warmup=is_warmup,
                     is_attn_graph_capturing=is_attn_graph_capturing,
+                    transport_spec=payload.transport_spec,
                 )
             else:
                 self.model_runner.execute_model(
                     dp_metadata_list=dp_metadata_list,
                     is_graph_capturing=is_attn_graph_capturing,
                     is_warmup=is_warmup,
+                    transport_spec=payload.transport_spec,
                 )
 
             if self.device.type == "cuda":

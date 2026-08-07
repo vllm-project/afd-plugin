@@ -82,6 +82,7 @@ class AFDAttentionModelRunner(GPUModelRunner):
         self._afd_pending_metadata: AFDForwardContextMetadata | None = None
         self._afd_suppress_metadata_send = False
         self._afd_transaction_counter = 0
+        self._afd_transport_spec = None
         self.prof = create_afd_gpu_profiler("attention")
 
     @staticmethod
@@ -142,6 +143,7 @@ class AFDAttentionModelRunner(GPUModelRunner):
             dp_metadata_list=dp_metadata_list,
             is_graph_capturing=is_graph_capturing,
             is_warmup=is_warmup,
+            transport_spec=getattr(self, "_afd_transport_spec", None),
         )
         self.connector.control_plane.update_state_from_dp_metadata(payload)
         self.connector.control_plane.send_dp_metadata_list(payload)
@@ -150,6 +152,16 @@ class AFDAttentionModelRunner(GPUModelRunner):
         use_ubatching = bool(self.vllm_config.parallel_config.use_ubatching)
         with _use_afd_ubatch_wrapper_during_load(use_ubatching):
             super().load_model(load_dummy_weights)
+        if self.model is None:
+            raise RuntimeError("AFD transport plan requires a loaded model")
+        num_layers = int(self.model_config.hf_config.num_hidden_layers)
+        transport_spec = self.model.get_afd_transport_spec(0)
+        for layer_idx in range(1, num_layers):
+            if self.model.get_afd_transport_spec(layer_idx) != transport_spec:
+                raise RuntimeError(
+                    "GPU AFD requires one uniform transport spec across layers",
+                )
+        self._afd_transport_spec = transport_spec
         if use_ubatching:
             self._install_afd_ubatch_wrapper()
 

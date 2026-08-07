@@ -9,6 +9,7 @@ from afd_plugin.connectors.base import (
 )
 from afd_plugin.connectors.factory import AFDConnectorFactory
 from afd_plugin.connectors.metadata import (
+    AFDA2FTransportSpec,
     AFDA2FTransferPayload,
     AFDControlPayload,
     AFDDPMetadata,
@@ -25,6 +26,7 @@ __all__ = [
     "AFDConnectorBase",
     "AFDControlPlane",
     "ConnectorExtraInfo",
+    "AFDA2FTransportSpec",
     "AFDExpertRoutingSpec",
     "AFDTransferState",
     "AFDTransferContext",

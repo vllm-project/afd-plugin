@@ -32,6 +32,9 @@ def test_deepseek_afd_model_registration_paths_are_lazy_strings():
     assert registrations["DeepseekV32ForCausalLM"] == (
         "afd_plugin.model_executor.models.deepseek_v2:AFDDeepseekV3ForCausalLM"
     )
+    assert registrations["DeepseekV4ForCausalLM"] == (
+        "afd_plugin.model_executor.models.deepseek_v4:AFDDeepseekV4ForCausalLM"
+    )
 
 
 def test_register_afd_does_not_replace_native_deepseek_model():
@@ -44,6 +47,18 @@ def test_register_afd_does_not_replace_native_deepseek_model():
     assert native_registration.module_name == "vllm.model_executor.models.deepseek_v2"
     assert native_registration.class_name == "DeepseekV2ForCausalLM"
     assert "AFDDeepseekV2ForCausalLM" in ModelRegistry.models
+
+
+def test_register_afd_does_not_replace_native_deepseek_v4_model():
+    pytest.importorskip("vllm")
+    from vllm.model_executor.models import ModelRegistry
+
+    afd_plugin.register_afd()
+
+    native_registration = ModelRegistry.models["DeepseekV4ForCausalLM"]
+    assert native_registration.module_name == "vllm.models.deepseek_v4"
+    assert native_registration.class_name == "DeepseekV4ForCausalLM"
+    assert "AFDDeepseekV4ForCausalLM" in ModelRegistry.models
 
 
 def test_afd_model_config_uses_private_architecture_copy():
@@ -63,6 +78,36 @@ def test_afd_model_config_uses_private_architecture_copy():
     assert afd_model_config.hf_text_config is afd_model_config.hf_config
     assert afd_model_config.hf_config.architectures == ["AFDDeepseekV2ForCausalLM"]
     assert model_config.hf_config.architectures == ["DeepseekV2ForCausalLM"]
+
+
+def test_afd_model_config_uses_v4_private_architecture_copy():
+    pytest.importorskip("vllm")
+    from afd_plugin.model_executor.models.model_utils import get_afd_model_config
+
+    hf_config = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+    model_config = SimpleNamespace(
+        hf_config=hf_config,
+        hf_text_config=hf_config,
+    )
+
+    afd_model_config = get_afd_model_config(model_config)
+
+    assert afd_model_config is not model_config
+    assert afd_model_config.hf_config is not model_config.hf_config
+    assert afd_model_config.hf_text_config is afd_model_config.hf_config
+    assert afd_model_config.hf_config.architectures == ["AFDDeepseekV4ForCausalLM"]
+    assert model_config.hf_config.architectures == ["DeepseekV4ForCausalLM"]
+
+
+def test_non_afd_model_config_is_unchanged():
+    pytest.importorskip("vllm")
+    from afd_plugin.model_executor.models.model_utils import get_afd_model_config
+
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["UnsupportedForCausalLM"]),
+    )
+
+    assert get_afd_model_config(model_config) is model_config
 
 
 def test_afd_model_config_preserves_nested_text_config():

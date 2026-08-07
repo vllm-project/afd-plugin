@@ -813,6 +813,10 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return self.model.get_experts_layer_indices()
 
+    def get_afd_transport_spec(self, layer_idx: int) -> None:
+        """Return no model-specific A2F side-input contract for V2/V3."""
+        return None
+
     def get_experts_routing_spec(
         self,
         layer_idx: int,
