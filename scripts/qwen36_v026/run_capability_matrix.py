@@ -27,13 +27,13 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--topology",
-        choices=("1a1f", "2a2f", "tp2ep2", "dp2ep2"),
+        choices=("1a1f", "2a2f"),
         required=True,
     )
     parser.add_argument("--gate-side", choices=("attention", "ffn"), required=True)
     parser.add_argument(
         "--mode",
-        choices=("eager", "graph", "dbo-graph"),
+        choices=("eager", "graph"),
         required=True,
     )
     parser.add_argument("--batch-size", choices=(1, 2), type=int, required=True)
@@ -50,45 +50,19 @@ def _parser() -> argparse.ArgumentParser:
 
 def _node_id(args: argparse.Namespace) -> str:
     if args.topology == "1a1f":
-        if args.mode != "eager" or args.batch_size != 1:
-            raise ValueError("1a1f currently validates eager batch-size 1 only")
-        gate = "True" if args.gate_side == "attention" else "False"
-        return f"{TEST_FILE}::test_qwen3_6_afd_1a1f_eager_matches_native_tp1[{gate}]"
+        if args.gate_side != "ffn" or args.mode != "eager" or args.batch_size != 1:
+            raise ValueError("1a1f validates the FFN-local-router eager gate only")
+        return f"{TEST_FILE}::test_qwen3_6_afd_1a1f_eager_matches_native_tp1"
 
     if args.topology == "2a2f" and args.mode == "eager":
-        if args.gate_side != "attention" or args.batch_size != 2:
-            raise ValueError("2a2f eager gate covers Attention-side batch-size 2")
+        if args.gate_side != "ffn" or args.batch_size != 2:
+            raise ValueError("2a2f eager validates the FFN-local-router batch-size 2")
         return f"{TEST_FILE}::test_qwen3_6_afd_2a2f_tp2_eager_matches_native_tp2"
 
     if args.topology == "2a2f" and args.mode == "graph":
-        if args.gate_side != "attention":
-            raise ValueError("2a2f graph coverage currently uses Attention-side gate")
-        return (
-            f"{TEST_FILE}::test_qwen3_6_afd_2a2f_tp2ep2_graph_matches_native"
-            f"[tp2-b{args.batch_size}]"
-        )
-
-    if args.topology == "2a2f" and args.mode == "dbo-graph":
-        if args.gate_side != "attention" or args.batch_size != 2:
-            raise ValueError("DBO graph coverage requires Attention-side batch-size 2")
-        if args.compare_native:
-            raise ValueError(
-                "native DBO exact comparison needs external DeepEP/NIXL kernels; "
-                "this environment only runs the AFD two-ubatch runtime gate",
-            )
-        return f"{TEST_FILE}::test_qwen3_6_afd_2a2f_tp2_dbo_graph_runs_two_ubatches"
-
-    if args.topology == "tp2ep2" and args.mode == "graph":
-        if args.gate_side != "attention" or args.batch_size != 1:
-            raise ValueError("tp2ep2 graph coverage uses Attention-side batch-size 1")
-        return (
-            f"{TEST_FILE}::test_qwen3_6_afd_2a2f_tp2ep2_graph_matches_native[tp2ep2-b1]"
-        )
-
-    if args.topology == "dp2ep2" and args.mode == "eager":
-        if args.gate_side != "attention" or args.batch_size != 1:
-            raise ValueError("dp2ep2 eager coverage uses Attention-side batch-size 1")
-        return f"{TEST_FILE}::test_qwen3_6_afd_dp2ep2_eager_matches_native"
+        if args.gate_side != "ffn" or args.batch_size != 1:
+            raise ValueError("2a2f graph validates FFN-local-router batch-size 1")
+        return f"{TEST_FILE}::test_qwen3_6_afd_2a2f_tp2_graph_matches_native[b1]"
 
     raise ValueError(
         "requested topology, gate-side, mode, and batch-size are not gated",

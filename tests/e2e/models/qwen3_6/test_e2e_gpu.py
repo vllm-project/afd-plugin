@@ -349,7 +349,6 @@ def _afd_config(
     num_attention_ranks: int,
     num_ffn_ranks: int,
     port: int,
-    compute_gate_on_attention: bool,
 ) -> str:
     return json.dumps(
         {
@@ -360,7 +359,7 @@ def _afd_config(
                 "port": port,
                 "num_attention_ranks": num_attention_ranks,
                 "num_ffn_ranks": num_ffn_ranks,
-                "compute_gate_on_attention": compute_gate_on_attention,
+                "compute_gate_on_attention": False,
             }
         },
         separators=(",", ":"),
@@ -371,7 +370,7 @@ def _afd_config(
 @pytest.mark.e2e
 @pytest.mark.slow
 def test_qwen3_6_afd_2a2f_tp2_eager_matches_native_tp2(tmp_path: Path):
-    """Check batch-two/repeat/A-B-A state isolation with Attention routing."""
+    """Check batch-two/repeat/A-B-A state isolation with FFN-local routing."""
     devices = _devices()
     if len(devices) < 4:
         pytest.skip(f"Qwen3.6 2A2F TP2 requires 4 GPUs; got {len(devices)}")
@@ -380,7 +379,7 @@ def test_qwen3_6_afd_2a2f_tp2_eager_matches_native_tp2(tmp_path: Path):
     native_batch2: tuple[dict[str, Any], ...] = ()
     native_a: tuple[dict[str, Any], ...] = ()
     native_b: tuple[dict[str, Any], ...] = ()
-    # Repeat cold starts on the same Attention-side TP topology. Comparing
+    # Repeat cold starts on the same FFN-side TP topology. Comparing
     # different physical pairs would conflate reproducibility with topology.
     for oracle_idx in range(2):
         oracle_devices = devices[:2]
@@ -420,14 +419,12 @@ def test_qwen3_6_afd_2a2f_tp2_eager_matches_native_tp2(tmp_path: Path):
         num_attention_ranks=2,
         num_ffn_ranks=2,
         port=AFD_PORT,
-        compute_gate_on_attention=True,
     )
     attention_config = _afd_config(
         role="attention",
         num_attention_ranks=2,
         num_ffn_ranks=2,
         port=AFD_PORT,
-        compute_gate_on_attention=True,
     )
     try:
         ffn_command = [
@@ -478,21 +475,19 @@ def test_qwen3_6_afd_2a2f_tp2_eager_matches_native_tp2(tmp_path: Path):
 @pytest.mark.gpu
 @pytest.mark.e2e
 @pytest.mark.slow
-@pytest.mark.parametrize("compute_gate_on_attention", [True, False])
 def test_qwen3_6_afd_1a1f_eager_matches_native_tp1(
     tmp_path: Path,
-    compute_gate_on_attention: bool,
 ):
-    """Exercise both Qwen routing placements at the native experts boundary."""
+    """Exercise the supported FFN-local-router Qwen experts boundary."""
     devices = _devices()
     if len(devices) < 2:
         pytest.skip(f"Qwen3.6 1A1F requires 2 GPUs; got {len(devices)}")
     model = _model_path()
-    suffix = "attention_gate" if compute_gate_on_attention else "ffn_gate"
-    native_port = 18180 if compute_gate_on_attention else 18183
+    suffix = "ffn_gate"
+    native_port = 18183
     attention_port = native_port + 1
     ffn_port = native_port + 2
-    afd_port = 6380 if compute_gate_on_attention else 6381
+    afd_port = 6381
     native: list[_ServerProcess] = []
     afd: list[_ServerProcess] = []
     try:
@@ -522,14 +517,12 @@ def test_qwen3_6_afd_1a1f_eager_matches_native_tp1(
             num_attention_ranks=1,
             num_ffn_ranks=1,
             port=afd_port,
-            compute_gate_on_attention=compute_gate_on_attention,
         )
         attention_config = _afd_config(
             role="attention",
             num_attention_ranks=1,
             num_ffn_ranks=1,
             port=afd_port,
-            compute_gate_on_attention=compute_gate_on_attention,
         )
         afd.append(
             _launch(
@@ -575,28 +568,21 @@ def test_qwen3_6_afd_1a1f_eager_matches_native_tp1(
 @pytest.mark.gpu
 @pytest.mark.e2e
 @pytest.mark.slow
-@pytest.mark.parametrize(
-    ("enable_expert_parallel", "batch_size"),
-    [(False, 1), (False, 2), (True, 1)],
-    ids=["tp2-b1", "tp2-b2", "tp2ep2-b1"],
-)
-def test_qwen3_6_afd_2a2f_tp2ep2_graph_matches_native(
+@pytest.mark.parametrize("batch_size", [1], ids=["b1"])
+def test_qwen3_6_afd_2a2f_tp2_graph_matches_native(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     batch_size: int,
-    enable_expert_parallel: bool,
 ):
-    """Check Qwen TP2 and TP2/EP2 FULL_DECODE_ONLY Graph against native."""
+    """Check Qwen TP2 FULL_DECODE_ONLY Graph against native."""
     devices = _devices()
     if len(devices) < 4:
-        pytest.skip("Qwen3.6 2A2F TP2/EP2 graph requires 4 GPUs")
+        pytest.skip("Qwen3.6 2A2F TP2 graph requires 4 GPUs")
     model = _model_path()
-    monkeypatch.setenv("AFD_E2E_GRAPH_AUDIT", "1")
-    suffix = f"graph_b{batch_size}_{'ep2' if enable_expert_parallel else 'tp2'}"
-    native_port = 18220 + batch_size + (10 if enable_expert_parallel else 0)
+    suffix = f"graph_b{batch_size}_tp2"
+    native_port = 18220 + batch_size
     attention_port = native_port + 1
     ffn_port = native_port + 2
-    afd_port = 6400 + (10 if enable_expert_parallel else 0) + batch_size
+    afd_port = 6400 + batch_size
     afd: list[_ServerProcess] = []
     native_oracles: tuple[dict[str, Any], ...] = ()
     # Repeat cold starts on the FFN-side TP topology. The AFD Graph output is
@@ -614,7 +600,7 @@ def test_qwen3_6_afd_2a2f_tp2ep2_graph_matches_native(
                             model,
                             tp_size=2,
                             use_cuda_graph=True,
-                            enable_expert_parallel=enable_expert_parallel,
+                            enable_expert_parallel=False,
                         ),
                         "--served-model-name",
                         MODEL_NAME,
@@ -642,7 +628,6 @@ def test_qwen3_6_afd_2a2f_tp2ep2_graph_matches_native(
         num_attention_ranks=2,
         num_ffn_ranks=2,
         port=afd_port,
-        compute_gate_on_attention=True,
     )
     try:
         ffn_config = _afd_config(role="ffn", **config_args)
@@ -651,7 +636,7 @@ def test_qwen3_6_afd_2a2f_tp2ep2_graph_matches_native(
             model,
             tp_size=2,
             use_cuda_graph=True,
-            enable_expert_parallel=enable_expert_parallel,
+            enable_expert_parallel=False,
         )
         afd.append(
             _launch(
@@ -708,183 +693,5 @@ def test_qwen3_6_afd_2a2f_tp2ep2_graph_matches_native(
             server.log_path.name: _log_tail(server.log_path, 65536) for server in afd
         }
         assert "Capturing CUDA graphs" in logs[f"attention_{suffix}.log"]
-        assert "AFD FFN replayed CUDA Graph" in logs[f"ffn_{suffix}.log"]
-    finally:
-        _stop(afd)
-
-
-@pytest.mark.gpu
-@pytest.mark.e2e
-@pytest.mark.slow
-def test_qwen3_6_afd_dp2ep2_eager_matches_native(tmp_path: Path):
-    """Exercise the existing CUDA DP2/EP2 transport without a Qwen protocol.
-
-    Each service uses two local DP ranks with TP1/EP2. The colocated native
-    service is the oracle; the AFD attention and FFN services each use the
-    same DP/EP layout on their respective GPU pairs.
-    """
-    devices = _devices()
-    if len(devices) < 4:
-        pytest.skip("Qwen3.6 DP2/EP2 requires 4 GPUs")
-    model = _model_path()
-    native_port, attention_port, ffn_port, afd_port = 18420, 18421, 18422, 6420
-    native: list[_ServerProcess] = []
-    afd: list[_ServerProcess] = []
-    try:
-        native.append(
-            _launch(
-                [
-                    *_common_args(
-                        model,
-                        tp_size=1,
-                        data_parallel_size=2,
-                        enable_expert_parallel=True,
-                    ),
-                    "--served-model-name",
-                    MODEL_NAME,
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    str(native_port),
-                ],
-                devices[:2],
-                tmp_path / "native_dp2ep2.log",
-            ),
-        )
-        _wait_for_api(native_port, native)
-        oracle = _request(native_port)
-    finally:
-        _stop(native)
-
-    try:
-        config_args = dict(
-            num_attention_ranks=2,
-            num_ffn_ranks=2,
-            port=afd_port,
-            compute_gate_on_attention=True,
-        )
-        shared_args = _common_args(
-            model,
-            tp_size=1,
-            data_parallel_size=2,
-            enable_expert_parallel=True,
-        )
-        afd.append(
-            _launch(
-                [
-                    *shared_args,
-                    "--served-model-name",
-                    MODEL_NAME,
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    str(ffn_port),
-                    "--additional-config",
-                    _afd_config(role="ffn", **config_args),
-                ],
-                devices[2:4],
-                tmp_path / "ffn_dp2ep2.log",
-            ),
-        )
-        afd.append(
-            _launch(
-                [
-                    *shared_args,
-                    "--served-model-name",
-                    MODEL_NAME,
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    str(attention_port),
-                    "--additional-config",
-                    _afd_config(role="attention", **config_args),
-                ],
-                devices[:2],
-                tmp_path / "attention_dp2ep2.log",
-            ),
-        )
-        _wait_for_api(attention_port, afd)
-        _assert_exact(oracle, _request(attention_port))
-        _assert_exact(oracle, _request(attention_port))
-    finally:
-        _stop(afd)
-
-
-@pytest.mark.gpu
-@pytest.mark.e2e
-@pytest.mark.slow
-def test_qwen3_6_afd_2a2f_tp2_dbo_graph_runs_two_ubatches(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """Exercise Qwen's AFD-owned two-ubatch DBO + Graph path.
-
-    vLLM's colocated DBO oracle needs an optional DeepEP/NIXL kernel. The
-    exact native comparison therefore remains conditionally gated on that
-    external kernel, while this test proves that AFD uses two real stages,
-    captures its FFN graph, and replays it for a batch-two request.
-    """
-    devices = _devices()
-    if len(devices) < 4:
-        pytest.skip("Qwen3.6 2A2F TP2 DBO graph requires 4 GPUs")
-    model = _model_path()
-    monkeypatch.setenv("AFD_E2E_GRAPH_AUDIT", "1")
-    monkeypatch.setenv("AFD_E2E_DBO_AUDIT", "1")
-    attention_port, ffn_port, afd_port = 18431, 18432, 6430
-    config_args = dict(
-        num_attention_ranks=2,
-        num_ffn_ranks=2,
-        port=afd_port,
-        compute_gate_on_attention=True,
-    )
-    shared_args = _common_args(
-        model,
-        tp_size=2,
-        use_cuda_graph=True,
-        enable_dbo=True,
-    )
-    afd: list[_ServerProcess] = []
-    try:
-        afd.append(
-            _launch(
-                [
-                    *shared_args,
-                    "--served-model-name",
-                    MODEL_NAME,
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    str(ffn_port),
-                    "--additional-config",
-                    _afd_config(role="ffn", **config_args),
-                ],
-                devices[2:4],
-                tmp_path / "ffn_dbo_graph.log",
-            ),
-        )
-        afd.append(
-            _launch(
-                [
-                    *shared_args,
-                    "--served-model-name",
-                    MODEL_NAME,
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    str(attention_port),
-                    "--additional-config",
-                    _afd_config(role="attention", **config_args),
-                ],
-                devices[:2],
-                tmp_path / "attention_dbo_graph.log",
-            ),
-        )
-        _wait_for_api(attention_port, afd)
-        assert len(_request(attention_port, batch_size=2)["choices"]) == 2
-        assert len(_request(attention_port, batch_size=2)["choices"]) == 2
-        ffn_log = _log_tail(tmp_path / "ffn_dbo_graph.log", 65536)
-        assert "AFD FFN executed two DBO ubatches; stages=[0, 1]" in ffn_log
-        assert "cuda graph addresses" in ffn_log
-        assert "AFD FFN replayed CUDA Graph" in ffn_log
     finally:
         _stop(afd)

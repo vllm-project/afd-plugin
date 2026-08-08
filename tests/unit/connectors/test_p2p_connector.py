@@ -76,6 +76,25 @@ def test_p2p_connector_can_be_constructed_without_runtime_initialization():
     assert connector.dst_list == [0]
 
 
+def test_p2p_connector_rejects_attention_side_gate_at_initialization():
+    with pytest.raises(
+        ValueError,
+        match="compute_gate_on_attention=True is not supported by the GPU AFD backend",
+    ):
+        AFDConnectorFactory.create_connector(
+            0,
+            0,
+            _fake_vllm_config(),
+            AFDConfig(
+                role="attention",
+                connector="P2pNcclAFDConnector",
+                num_attention_ranks=1,
+                num_ffn_ranks=1,
+                compute_gate_on_attention=True,
+            ),
+        )
+
+
 def test_p2p_connector_uses_nested_text_config_for_multimodal_model():
     text_config = SimpleNamespace(hidden_size=24, num_hidden_layers=40)
     connector = AFDConnectorFactory.create_connector(

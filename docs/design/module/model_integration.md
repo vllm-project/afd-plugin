@@ -93,18 +93,17 @@ needed by the split execution.
 | --- | --- | --- |
 | Attention module and KV-facing computation | Constructed and executed. | Not constructed. |
 | MoE with `compute_gate_on_attention=false` | CUDA constructs the native MoE shell with a parameter-free internal-router experts proxy; NPU sends after post-Attention normalization. | Native gate and experts are constructed and executed from connector input. |
-| MoE with `compute_gate_on_attention=true` | CUDA keeps the native gate and uses an external-router experts proxy; NPU uses its Attention-side gate helper. | Expert MLP is constructed and consumes transferred router logits or routed payloads without rerunning the gate. |
+| MoE with `compute_gate_on_attention=true` | Unsupported by the Qwen CUDA AFD path and rejected during connector initialization; NPU uses its Attention-side gate helper where enabled. | Expert MLP consumes the backend's routed payload without rerunning the gate. |
 | Dense MLP, normal mode | Not constructed; output is sent after post-Attention normalization. | Constructed and executed from connector input. |
 | Dense MLP with `compute_gate_on_attention=true` | Constructed and executed locally because there is no routed MoE handoff. | Not constructed and a dense-layer FFN compute request is rejected. |
 | Embedding, final norm, pipeline placeholders | Created according to the pinned pipeline-rank rules. | Same wrapper lifecycle rules; only role-required parameters are loaded. |
 
 CUDA MoE always splits at the remote-experts boundary while preserving native
-`DeepseekV2MoE.forward`. With gate-on-FFN, the proxy asks FFN to run its native
-internal-router MoE. With gate-on-Attention, Attention runs the native gate and
-FFN executes its external-router experts path. CUDA Attention-side remote
-experts currently reject EPLB. The NPU gate helper supports unquantized and
-Ascend W8A8 MoE expert computation; unsupported devices or quantization fail
-explicitly.
+`DeepseekV2MoE.forward`. The supported Qwen CUDA path sends hidden states only
+and asks FFN to run its native internal-router MoE; Attention-side gate and
+router-logit transport are not part of this capability. The NPU gate helper
+supports unquantized and Ascend W8A8 MoE expert computation; unsupported
+devices or quantization fail explicitly.
 
 The full AFD model remains decorated with vLLM's compile support. Backend-only
 helpers are imported inside the NPU path so CUDA model import does not require
@@ -205,13 +204,12 @@ Any change to these filters must be compared against the pinned upstream
 loader and validated on both roles. A successful load set is not evidence that
 the other role can be omitted from model/accuracy E2E coverage.
 
-For Qwen3.5/3.6 text-only MoE, Attention owns embeddings, norms, full and
-linear-attention state, router checkpoint weights, and router computation.
-FFN owns routed experts, the shared expert, and the shared-expert gate; its
-KV-cache spec is empty. FFN retains the dormant native router module inherited
-from the external-router design in PR #176 to preserve the native model tree
-and loader contract, but loads no router checkpoint weights and never executes
-router computation. The CUDA initial support is eager and synchronous only.
+For Qwen3.5/3.6 text-only MoE on CUDA, Attention owns embeddings, norms, and
+full and linear-attention state, then sends hidden states only. FFN owns the
+native gate, routed experts, shared expert, and shared-expert gate; its
+KV-cache spec is empty. `compute_gate_on_attention=true` is rejected during
+GPU connector initialization. The CUDA path supports synchronous eager and
+`FULL_DECODE_ONLY` graph execution only.
 
 ## Failure and resource ownership
 

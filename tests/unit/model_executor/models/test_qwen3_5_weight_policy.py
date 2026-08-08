@@ -34,7 +34,7 @@ NONE = frozenset()
             ATTENTION,
         ),
         ("model.language_model.model.layers.0.input_layernorm.weight", ATTENTION),
-        ("model.language_model.model.layers.0.mlp.gate.weight", ATTENTION),
+        ("model.language_model.model.layers.0.mlp.gate.weight", FFN),
         (
             "model.language_model.model.layers.0.mlp.experts.0.down_proj.weight",
             FFN,
@@ -52,19 +52,13 @@ NONE = frozenset()
     ],
 )
 def test_qwen_checkpoint_weight_roles(name, roles):
-    assert _checkpoint_weight_roles(name, compute_gate_on_attention=True) == roles
+    assert _checkpoint_weight_roles(name) == roles
 
 
 def test_qwen_ffn_gate_owns_router_checkpoint_weight():
     name = "model.language_model.model.layers.0.mlp.gate.weight"
 
-    assert (
-        _checkpoint_weight_roles(
-            name,
-            compute_gate_on_attention=False,
-        )
-        == FFN
-    )
+    assert _checkpoint_weight_roles(name) == FFN
 
 
 def test_qwen_load_weights_filters_one_shot_iterator(monkeypatch):
@@ -101,13 +95,13 @@ def test_qwen_load_weights_filters_one_shot_iterator(monkeypatch):
     object.__setattr__(
         model,
         "afd_config",
-        SimpleNamespace(role="ffn", compute_gate_on_attention=True),
+        SimpleNamespace(role="ffn", compute_gate_on_attention=False),
     )
 
     result = model.load_weights(one_shot())
 
     assert result is expected
-    assert seen == names[2:4]
+    assert seen == names[1:4]
     assert iterations == 1
 
 

@@ -153,12 +153,7 @@ class AFDTransferState:
 
 
 class AFDExpertRoutingSpec(NamedTuple):
-    """Cross-rank wire contract for an experts-routing tensor.
-
-    Attention senders and FFN receivers must use the same width and dtype.
-    These fields determine the receive-buffer shape and NCCL message byte
-    count; they are protocol invariants, not local model metadata.
-    """
+    """Model-owned contract for receiving optional experts routing tensors."""
 
     router_logits_width: int
     router_logits_dtype: torch.dtype

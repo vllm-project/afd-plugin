@@ -161,11 +161,9 @@ class AFDAttentionFusedMoE(RemoteFFNProxy):
         *,
         layer_idx: int,
         is_internal_router: bool,
-        routing_spec: AFDExpertRoutingSpec | None = None,
     ) -> None:
         super().__init__(layer_idx=layer_idx)
         self.is_internal_router = is_internal_router
-        self.routing_spec = routing_spec
 
     def forward(
         self,
@@ -178,12 +176,7 @@ class AFDAttentionFusedMoE(RemoteFFNProxy):
                 "experts-boundary input_ids transport is not implemented",
             )
         send_kwargs = (
-            {}
-            if self.is_internal_router
-            else {
-                "router_logits": router_logits,
-                "routing_spec": self.routing_spec,
-            }
+            {} if self.is_internal_router else {"router_logits": router_logits}
         )
         return self._send_and_receive(hidden_states, **send_kwargs)
 
@@ -292,14 +285,6 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         self.experts = AFDAttentionFusedMoE(
             layer_idx=layer_idx,
             is_internal_router=not compute_gate_on_attention,
-            routing_spec=(
-                AFDExpertRoutingSpec(
-                    router_logits_width=int(config.n_routed_experts),
-                    router_logits_dtype=router_dtype,
-                )
-                if compute_gate_on_attention
-                else None
-            ),
         )
         # ### PATCH END: construct a remote-experts native MoE shell.
 

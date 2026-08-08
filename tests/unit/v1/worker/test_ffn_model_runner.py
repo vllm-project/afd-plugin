@@ -21,7 +21,6 @@ from afd_plugin.connectors import (  # noqa: E402
 from afd_plugin.v1.worker.cuda_graph import make_ffn_graph_key  # noqa: E402
 from afd_plugin.v1.worker.ffn_model_runner import (  # noqa: E402
     GPUFFNModelRunner,
-    _get_num_layers,
     _set_moe_layer_index,
 )
 from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
@@ -64,15 +63,6 @@ class _FakeConnector:
 
     def close(self):
         self.closed = True
-
-
-def test_ffn_runner_uses_nested_text_config_layer_count():
-    model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(),
-        hf_text_config=SimpleNamespace(num_hidden_layers=40),
-    )
-
-    assert _get_num_layers(model_config) == 40
 
 
 class _ConnectorDrivenFakeConnector(_FakeConnector):

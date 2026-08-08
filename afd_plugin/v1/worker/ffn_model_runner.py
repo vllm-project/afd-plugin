@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -14,7 +13,6 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config import update_config as update_vllm_config
 from vllm.distributed.parallel_state import get_world_group, graph_capture
 from vllm.forward_context import DPMetadata, get_forward_context, set_forward_context
-from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.utils.mem_utils import DeviceMemoryProfiler
@@ -46,15 +44,6 @@ if TYPE_CHECKING:
     from vllm.sequence import IntermediateTensors
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-
-
-logger = init_logger(__name__)
-
-
-def _get_num_layers(model_config: Any) -> int:
-    """Return the language-model layer count for text and multimodal configs."""
-
-    return int(model_config.hf_text_config.num_hidden_layers)
 
 
 class GPUFFNModelRunner(LoRAModelRunnerMixin):
@@ -94,7 +83,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
 
         self.model: Any | None = None
         self.model_memory_usage = 0
-        self.num_layers = _get_num_layers(self.model_config)
+        self.num_layers = int(self.model_config.hf_text_config.num_hidden_layers)
         self.use_cuda_graph = bool(
             self.afd_cudagraph_policy.enable_ffn_graph_cache,
         )
@@ -160,8 +149,6 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         )
         if run_mode is AFDGraphRunMode.REPLAY:
             cuda_graph_info["graph"].replay()
-            if os.getenv("AFD_E2E_GRAPH_AUDIT") == "1":
-                logger.warning("AFD FFN replayed CUDA Graph; key=%s", graph_key)
             return None
 
         self._ffn_forward(
@@ -199,8 +186,6 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             else tuple(range(num_layers))
         )
         stage_ids = sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
-        if os.getenv("AFD_E2E_DBO_AUDIT") == "1" and len(stage_ids) == 2:
-            logger.warning("AFD FFN executed two DBO ubatches; stages=%s", stage_ids)
         with _ffn_forward_context(self.vllm_config) as forward_context:
             for layer_idx in layer_indices:
                 uses_remote_experts = layer_idx in experts_layer_indices
@@ -230,11 +215,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                         and self.afd_config.compute_gate_on_attention
                     ):
                         router_logits = payload.router_logits
-                        if router_logits is None:
-                            raise RuntimeError(
-                                "FFN experts execution requires router_logits "
-                                "from the Attention-side wire payload",
-                            )
+                        assert router_logits is not None
                         rank_ffn_output = self.model.compute_experts_output(
                             hidden_states,
                             layer_idx,

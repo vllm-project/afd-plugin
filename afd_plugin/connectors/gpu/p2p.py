@@ -100,38 +100,6 @@ if TYPE_CHECKING:
 _AFD_COMMUNICATORS: dict[int, PyNcclCommunicator] = {}
 _AFD_COMM_ID_COUNTER = 0
 _AFD_CUSTOM_OPS_REGISTERED = False
-_ROUTER_LOGITS_WIRE_DTYPES = (
-    torch.float16,
-    torch.bfloat16,
-    torch.float32,
-    torch.float64,
-)
-
-
-def _validate_routing_spec(
-    routing_spec: object,
-    *,
-    location: str,
-) -> AFDExpertRoutingSpec:
-    if not isinstance(routing_spec, AFDExpertRoutingSpec):
-        raise ValueError(
-            f"invalid router-logits wire contract at {location}: expected "
-            f"AFDExpertRoutingSpec, got {type(routing_spec).__name__}",
-        )
-    width = routing_spec.router_logits_width
-    if type(width) is not int or width <= 0:
-        raise ValueError(
-            f"invalid router-logits wire contract at {location}: expected "
-            f"positive integer width, got {width!r}",
-        )
-    if routing_spec.router_logits_dtype not in _ROUTER_LOGITS_WIRE_DTYPES:
-        supported = ", ".join(str(dtype) for dtype in _ROUTER_LOGITS_WIRE_DTYPES)
-        raise ValueError(
-            f"invalid router-logits wire contract at {location}: got "
-            f"dtype={routing_spec.router_logits_dtype}; supported dtypes are "
-            f"{supported}",
-        )
-    return routing_spec
 
 
 class _TensorMetadata(NamedTuple):
@@ -202,6 +170,10 @@ class P2pNcclAFDConnector(AFDConnectorBase):
                 sizes, and rendezvous host/port.
             role_rank: Runtime rank within the configured AFD role group.
         """
+        if afd_config.compute_gate_on_attention:
+            raise ValueError(
+                "compute_gate_on_attention=True is not supported by the GPU AFD backend"
+            )
         super().__init__(rank, local_rank, vllm_config, afd_config, role_rank)
         self._initialized = False
         self.mapping = build_rank_mapping(afd_config, role_rank)
@@ -341,9 +313,7 @@ class P2pNcclAFDConnector(AFDConnectorBase):
                 whose leading dimension matches
                 ``context.metadata.total_tokens``.
             context: Per-transfer context describing the token layout.
-            **kwargs: Optional ``router_logits`` tensor and matching
-                ``AFDExpertRoutingSpec`` sent after hidden states. The spec
-                defines the cross-rank wire width and dtype.
+            **kwargs: Optional ``router_logits`` tensor sent after hidden states.
 
         Raises:
             ValueError: If the tensor shape does not match the metadata token
@@ -352,16 +322,6 @@ class P2pNcclAFDConnector(AFDConnectorBase):
             RuntimeError: If the connector is not initialized.
         """
         metadata = context.metadata
-        location = (
-            f"P2pNcclAFDConnector role={self.afd_config.role}, "
-            f"layer={metadata.layer_idx}, stage={metadata.stage_idx}"
-        )
-        if hidden_states.ndim != 2:
-            raise ValueError(
-                f"hidden_states wire-contract mismatch at {location}: expected "
-                f"2D shape (tokens, hidden_size), got "
-                f"shape={tuple(hidden_states.shape)}",
-            )
         if not torch.compiler.is_compiling() and not metadata.validate_tensor_shape(
             tuple(hidden_states.shape),
         ):
@@ -370,73 +330,13 @@ class P2pNcclAFDConnector(AFDConnectorBase):
                 f"AFD metadata token count {metadata.total_tokens}",
             )
         router_logits: torch.Tensor | None = kwargs.get("router_logits")
-        routing_spec: AFDExpertRoutingSpec | None = kwargs.get("routing_spec")
-        if (router_logits is None) != (routing_spec is None):
+        if (
+            router_logits is not None
+            and router_logits.shape[0] != hidden_states.shape[0]
+        ):
             raise ValueError(
-                "router_logits and routing_spec must be provided together at "
-                f"{location}",
+                "router_logits and hidden_states must have equal token counts",
             )
-        if router_logits is not None and routing_spec is not None:
-            routing_spec = _validate_routing_spec(
-                routing_spec,
-                location=location,
-            )
-            if not isinstance(router_logits, torch.Tensor):
-                raise ValueError(
-                    "router_logits wire-contract mismatch: "
-                    f"expected Tensor, got {type(router_logits).__name__}",
-                )
-            if router_logits.ndim != 2:
-                raise ValueError(
-                    "router_logits wire-contract mismatch: "
-                    f"expected 2D shape (tokens, width), got "
-                    f"shape={tuple(router_logits.shape)}",
-                )
-            expected_tokens = int(hidden_states.shape[0])
-            expected_device = hidden_states.device
-            communicator_device = getattr(self.a2e_pynccl, "device", None)
-            actual = (
-                f"shape={tuple(router_logits.shape)}, "
-                f"dtype={router_logits.dtype}, device={router_logits.device}"
-            )
-            expected = (
-                f"tokens={expected_tokens}, "
-                f"width={routing_spec.router_logits_width}, "
-                f"dtype={routing_spec.router_logits_dtype}, "
-                f"device={expected_device}"
-            )
-            if router_logits.shape != (
-                expected_tokens,
-                routing_spec.router_logits_width,
-            ):
-                raise ValueError(
-                    "router_logits wire-contract mismatch: "
-                    f"got {actual}; expected {expected}",
-                )
-            if router_logits.dtype != routing_spec.router_logits_dtype:
-                raise ValueError(
-                    "router_logits wire-contract mismatch: "
-                    f"got {actual}; expected {expected}",
-                )
-            if router_logits.device != expected_device:
-                raise ValueError(
-                    "router_logits wire-contract mismatch: "
-                    f"got {actual}; expected {expected}",
-                )
-            if (
-                communicator_device is not None
-                and expected_device != communicator_device
-            ):
-                raise ValueError(
-                    "router_logits wire-contract mismatch: "
-                    f"got {actual}; expected communicator "
-                    f"device={communicator_device} at {location}",
-                )
-            if not router_logits.is_contiguous():
-                raise ValueError(
-                    "router_logits wire-contract mismatch: "
-                    f"got non-contiguous layout ({actual}); expected contiguous",
-                )
         self._send_hidden_states(
             hidden_states,
             0,
@@ -515,14 +415,6 @@ class P2pNcclAFDConnector(AFDConnectorBase):
                 has no Attention peers.
         """
         routing_spec: AFDExpertRoutingSpec | None = kwargs.get("routing_spec")
-        if routing_spec is not None:
-            routing_spec = _validate_routing_spec(
-                routing_spec,
-                location=(
-                    f"P2pNcclAFDConnector role={self.afd_config.role}, "
-                    f"stage={ubatch_idx}"
-                ),
-            )
         hidden_states_list: list[torch.Tensor] = []
         router_logits_list: list[torch.Tensor] = []
 
@@ -680,6 +572,7 @@ class P2pNcclAFDConnector(AFDConnectorBase):
             raise ValueError(f"invalid P2P destination rank {dst}")
         if getattr(hidden_states, "is_cpu", False):
             raise ValueError("P2P hidden states must be on GPU")
+
         torch.ops.vllm.afd_p2p_send(
             hidden_states,
             dst,

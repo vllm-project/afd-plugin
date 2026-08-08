@@ -26,8 +26,8 @@ common_args=(
   --no-enable-expert-parallel
 )
 
-ffn_config=$(printf '{"afd":{"role":"ffn","connector":"P2pNcclAFDConnector","host":"%s","port":%s,"num_attention_ranks":2,"num_ffn_ranks":2,"compute_gate_on_attention":true}}' "$host" "$afd_port")
-attention_config=$(printf '{"afd":{"role":"attention","connector":"P2pNcclAFDConnector","host":"%s","port":%s,"num_attention_ranks":2,"num_ffn_ranks":2,"compute_gate_on_attention":true}}' "$host" "$afd_port")
+ffn_config=$(printf '{"afd":{"role":"ffn","connector":"P2pNcclAFDConnector","host":"%s","port":%s,"num_attention_ranks":2,"num_ffn_ranks":2,"compute_gate_on_attention":false}}' "$host" "$afd_port")
+attention_config=$(printf '{"afd":{"role":"attention","connector":"P2pNcclAFDConnector","host":"%s","port":%s,"num_attention_ranks":2,"num_ffn_ranks":2,"compute_gate_on_attention":false}}' "$host" "$afd_port")
 
 ffn_pid=""
 attention_pid=""

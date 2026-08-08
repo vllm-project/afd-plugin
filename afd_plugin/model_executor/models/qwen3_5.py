@@ -12,7 +12,6 @@ from vllm.model_executor.models import qwen3_5 as native
 from vllm.model_executor.models import qwen3_next as next_native
 
 from afd_plugin.config import parse_optional_afd_config
-from afd_plugin.connectors import AFDExpertRoutingSpec
 from afd_plugin.model_executor.models.deepseek_v2 import AFDAttentionFusedMoE
 
 _ATTENTION_ROLE = frozenset(("attention",))
@@ -36,8 +35,6 @@ def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
 
 def _checkpoint_weight_roles(
     name: str,
-    *,
-    compute_gate_on_attention: bool,
 ) -> frozenset[str]:
     """Classify one native Qwen3.5/3.6 checkpoint path by AFD owner."""
     parts = name.split(".")
@@ -55,7 +52,7 @@ def _checkpoint_weight_roles(
     if stage != "mlp":
         return _ATTENTION_ROLE
     if remainder and remainder[0] == "gate":
-        return _ATTENTION_ROLE if compute_gate_on_attention else _FFN_ROLE
+        return _FFN_ROLE
     if remainder and remainder[0] in (
         "experts",
         "shared_expert",
@@ -69,13 +66,11 @@ def _iter_role_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
     *,
     role: str | None,
-    compute_gate_on_attention: bool,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Consume a checkpoint iterator once and retain only this role's paths."""
     for name, loaded_weight in weights:
         if role is None or role in _checkpoint_weight_roles(
             name,
-            compute_gate_on_attention=compute_gate_on_attention,
         ):
             yield name, loaded_weight
 
@@ -88,7 +83,7 @@ class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
     # Patch reason: native Qwen3NextSparseMoeBlock allocates routed and shared
     # experts on every rank.
     # Patch functionality: preserve its native forward while keeping a
-    # parameter-free experts proxy and, when selected, the Attention router.
+    # parameter-free experts proxy with a local FFN router.
     # Signature: AFD-owned; layer_idx is required for correlation metadata.
     # Upstream: vLLM v0.26.0, vllm/model_executor/models/qwen3_next.py
     # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
@@ -98,7 +93,6 @@ class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
         vllm_config: VllmConfig,
         layer_idx: int,
         prefix: str,
-        compute_gate_on_attention: bool,
     ) -> None:
         # ### PATCH START: construct a remote-experts native MoE shell.
         nn.Module.__init__(self)
@@ -124,30 +118,12 @@ class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
         self.physical_expert_end = (
             self.physical_expert_start + self.n_local_physical_experts
         )
-        self.gate = (
-            next_native.ReplicatedLinear(
-                config.hidden_size,
-                config.num_experts,
-                bias=False,
-                quant_config=None,
-                prefix=f"{prefix}.gate",
-            )
-            if compute_gate_on_attention
-            else None
-        )
+        self.gate = None
         self.shared_expert = None
         self.shared_expert_gate = None
         self.experts = AFDAttentionFusedMoE(
             layer_idx=layer_idx,
-            is_internal_router=not compute_gate_on_attention,
-            routing_spec=(
-                AFDExpertRoutingSpec(
-                    router_logits_width=self.n_routed_experts,
-                    router_logits_dtype=self.gate.weight.dtype,
-                )
-                if compute_gate_on_attention
-                else None
-            ),
+            is_internal_router=True,
         )
         # ### PATCH END: construct a remote-experts native MoE shell.
 
@@ -224,7 +200,6 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
                 vllm_config=vllm_config,
                 layer_idx=self.layer_idx,
                 prefix=f"{prefix}.mlp",
-                compute_gate_on_attention=afd_config.compute_gate_on_attention,
             )
             self.input_layernorm = native.Qwen3_5RMSNorm(
                 config.hidden_size,
@@ -245,10 +220,6 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.mlp",
             )
-            if afd_config.compute_gate_on_attention:
-                # The native external-router path executes routed and shared
-                # experts while consuming Attention-provided router logits.
-                self.mlp.experts.gate = None
             self.input_layernorm = native.PPMissingLayer()
             self.post_attention_layernorm = native.PPMissingLayer()
         # ### PATCH END: construct only the active execution stage.
@@ -262,23 +233,6 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
                 torch.zeros(1, 1, config.hidden_size),
             )
 
-    def compute_experts_output(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        """Execute the native external-router FusedMoE on the FFN role."""
-        if self.afd_role != "ffn":
-            raise RuntimeError("native Qwen experts are owned by the FFN role")
-        if not isinstance(self.mlp, native.Qwen3NextSparseMoeBlock):
-            raise RuntimeError("FFN role does not own native Qwen MoE")
-        if self.mlp.experts.is_internal_router:
-            raise RuntimeError("FFN native runner must use external routing")
-        return self.mlp.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
-
     def compute_ffn_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run the native internal-router MoE on the FFN role."""
         if self.afd_role != "ffn":
@@ -286,9 +240,7 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
         if not isinstance(self.mlp, native.Qwen3NextSparseMoeBlock):
             raise RuntimeError("FFN role does not own native Qwen MoE")
         if not self.mlp.experts.is_internal_router:
-            raise RuntimeError(
-                "Attention-side gate must call compute_experts_output",
-            )
+            raise RuntimeError("FFN native runner must use its local router")
         return self.mlp(hidden_states)
 
 
@@ -365,17 +317,6 @@ class AFDQwen3_5Model(native.Qwen3_5Model):  # noqa: N801
             self.norm = native.PPMissingLayer()
         self.aux_hidden_state_layers: tuple[int, ...] = ()
 
-    def compute_experts_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-        router_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.layers[layer_idx].compute_experts_output(
-            hidden_states,
-            router_logits,
-        )
-
     def compute_ffn_output(
         self,
         hidden_states: torch.Tensor,
@@ -385,23 +326,6 @@ class AFDQwen3_5Model(native.Qwen3_5Model):  # noqa: N801
 
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return tuple(range(self.start_layer, self.end_layer))
-
-    def get_experts_routing_spec(self, layer_idx: int) -> AFDExpertRoutingSpec:
-        """Return this layer's cross-rank router-logits wire contract."""
-        if not self.afd_config.compute_gate_on_attention:
-            raise RuntimeError(
-                "Qwen router logits are only transferred for Attention-side gate",
-            )
-        layer = self.layers[layer_idx]
-        if not isinstance(layer, AFDQwen3_5DecoderLayer):
-            raise RuntimeError(f"layer {layer_idx} is not an AFD Qwen layer")
-        if not isinstance(layer.mlp, native.Qwen3NextSparseMoeBlock):
-            raise RuntimeError(f"layer {layer_idx} does not own native Qwen MoE")
-        gate = layer.mlp.gate
-        return AFDExpertRoutingSpec(
-            router_logits_width=int(layer.mlp.n_routed_experts),
-            router_logits_dtype=gate.weight.dtype,
-        )
 
 
 class AFDQwen3_5MoeForCausalLM(  # noqa: N801
@@ -455,18 +379,6 @@ class AFDQwen3_5MoeForCausalLM(  # noqa: N801
         )
         self.set_moe_parameters()
 
-    def compute_experts_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-        router_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.model.compute_experts_output(
-            hidden_states,
-            layer_idx,
-            router_logits,
-        )
-
     def compute_ffn_output(
         self,
         hidden_states: torch.Tensor,
@@ -476,9 +388,6 @@ class AFDQwen3_5MoeForCausalLM(  # noqa: N801
 
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return self.model.get_experts_layer_indices()
-
-    def get_experts_routing_spec(self, layer_idx: int) -> AFDExpertRoutingSpec:
-        return self.model.get_experts_routing_spec(layer_idx)
 
 
 class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
@@ -525,18 +434,6 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
         )
         self.set_moe_parameters()
 
-    def compute_experts_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-        router_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.language_model.compute_experts_output(
-            hidden_states,
-            layer_idx,
-            router_logits,
-        )
-
     def compute_ffn_output(
         self,
         hidden_states: torch.Tensor,
@@ -547,15 +444,11 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return self.language_model.get_experts_layer_indices()
 
-    def get_experts_routing_spec(self, layer_idx: int) -> AFDExpertRoutingSpec:
-        return self.language_model.get_experts_routing_spec(layer_idx)
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return super().load_weights(
             _iter_role_weights(
                 weights,
                 role=self.afd_role,
-                compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
             ),
         )
 
