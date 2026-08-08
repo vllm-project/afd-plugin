@@ -83,7 +83,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
 
         self.model: Any | None = None
         self.model_memory_usage = 0
-        self.num_layers = int(self.model_config.hf_config.num_hidden_layers)
+        self.num_layers = int(self.model_config.hf_text_config.num_hidden_layers)
         self.use_cuda_graph = bool(
             self.afd_cudagraph_policy.enable_ffn_graph_cache,
         )

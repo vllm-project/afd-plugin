@@ -170,6 +170,10 @@ class P2pNcclAFDConnector(AFDConnectorBase):
                 sizes, and rendezvous host/port.
             role_rank: Runtime rank within the configured AFD role group.
         """
+        if afd_config.compute_gate_on_attention:
+            raise ValueError(
+                "compute_gate_on_attention=True is not supported by the GPU AFD backend"
+            )
         super().__init__(rank, local_rank, vllm_config, afd_config, role_rank)
         self._initialized = False
         self.mapping = build_rank_mapping(afd_config, role_rank)
@@ -181,8 +185,9 @@ class P2pNcclAFDConnector(AFDConnectorBase):
         self.ratio = self.mapping.ratio
         self.group_size = len(self.mapping.subgroup_ranks)
         self.dst_list = list(self.mapping.dp_metadata_destinations)
-        self.num_hidden_layers = (vllm_config.model_config.hf_config.num_hidden_layers,)
-        self.hidden_size = vllm_config.model_config.hf_config.hidden_size
+        text_config = vllm_config.model_config.hf_text_config
+        self.num_hidden_layers = (text_config.num_hidden_layers,)
+        self.hidden_size = text_config.hidden_size
         self.dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] = {}
         self.is_graph_capturing = False
         self.is_warmup = False

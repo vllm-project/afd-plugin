@@ -17,12 +17,14 @@ from afd_plugin.connectors.gpu.p2p import P2pNcclAFDConnector  # noqa: E402
 
 
 def _vllm_config():
+    text_config = SimpleNamespace(hidden_size=4, num_hidden_layers=3)
     return SimpleNamespace(
         additional_config={},
         model_config=SimpleNamespace(
             dtype=torch.bfloat16,
             enforce_eager=True,
-            hf_config=SimpleNamespace(hidden_size=4, num_hidden_layers=3),
+            hf_config=text_config,
+            hf_text_config=text_config,
         ),
         parallel_config=SimpleNamespace(
             data_parallel_size=1,

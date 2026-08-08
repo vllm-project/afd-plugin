@@ -34,6 +34,25 @@ def test_deepseek_afd_model_registration_paths_are_lazy_strings():
     )
 
 
+def test_qwen_afd_model_registration_path_is_lazy_string():
+    registrations = afd_plugin._QWEN_MODEL_REGISTRATIONS
+
+    assert registrations["Qwen3_5MoeForConditionalGeneration"] == (
+        "afd_plugin.model_executor.models.qwen3_5:AFDQwen3_5MoeForConditionalGeneration"
+    )
+
+
+def test_merged_model_registrations_include_deepseek_and_qwen():
+    registrations = afd_plugin._MODEL_REGISTRATIONS
+
+    assert registrations["DeepseekV2ForCausalLM"] == (
+        "afd_plugin.model_executor.models.deepseek_v2:AFDDeepseekV2ForCausalLM"
+    )
+    assert registrations["Qwen3_5MoeForConditionalGeneration"] == (
+        "afd_plugin.model_executor.models.qwen3_5:AFDQwen3_5MoeForConditionalGeneration"
+    )
+
+
 def test_register_afd_does_not_replace_native_deepseek_model():
     pytest.importorskip("vllm")
     from vllm.model_executor.models import ModelRegistry
@@ -44,6 +63,18 @@ def test_register_afd_does_not_replace_native_deepseek_model():
     assert native_registration.module_name == "vllm.model_executor.models.deepseek_v2"
     assert native_registration.class_name == "DeepseekV2ForCausalLM"
     assert "AFDDeepseekV2ForCausalLM" in ModelRegistry.models
+
+
+def test_register_afd_does_not_replace_native_qwen_model():
+    pytest.importorskip("vllm")
+    from vllm.model_executor.models import ModelRegistry
+
+    afd_plugin.register_afd()
+
+    native_registration = ModelRegistry.models["Qwen3_5MoeForConditionalGeneration"]
+    assert native_registration.module_name == "vllm.model_executor.models.qwen3_5"
+    assert native_registration.class_name == "Qwen3_5MoeForConditionalGeneration"
+    assert "AFDQwen3_5MoeForConditionalGeneration" in ModelRegistry.models
 
 
 def test_afd_model_config_uses_private_architecture_copy():
@@ -82,6 +113,29 @@ def test_afd_model_config_preserves_nested_text_config():
     assert afd_model_config.hf_config is not model_config.hf_config
     assert afd_model_config.hf_text_config is not hf_text_config
     assert afd_model_config.hf_text_config is not afd_model_config.hf_config
+
+
+def test_afd_model_config_maps_qwen_architecture_without_aliasing():
+    pytest.importorskip("vllm")
+    from afd_plugin.model_executor.models.model_utils import get_afd_model_config
+
+    hf_text_config = SimpleNamespace(model_type="qwen3_5_moe_text")
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            architectures=["Qwen3_5MoeForConditionalGeneration"],
+        ),
+        hf_text_config=hf_text_config,
+    )
+
+    afd_model_config = get_afd_model_config(model_config)
+
+    assert afd_model_config.hf_config.architectures == [
+        "AFDQwen3_5MoeForConditionalGeneration"
+    ]
+    assert model_config.hf_config.architectures == [
+        "Qwen3_5MoeForConditionalGeneration"
+    ]
+    assert afd_model_config.hf_text_config is not hf_text_config
 
 
 def test_entry_point_is_registered():

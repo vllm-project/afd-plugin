@@ -25,12 +25,14 @@ def _fake_vllm_config(
     data_parallel_rank=0,
     enforce_eager=True,
 ):
+    text_config = SimpleNamespace(hidden_size=16, num_hidden_layers=2)
     return SimpleNamespace(
         additional_config={},
         model_config=SimpleNamespace(
             dtype=torch.bfloat16,
             enforce_eager=enforce_eager,
-            hf_config=SimpleNamespace(hidden_size=16, num_hidden_layers=2),
+            hf_config=text_config,
+            hf_text_config=text_config,
         ),
         parallel_config=SimpleNamespace(
             data_parallel_size=data_parallel_size,
@@ -72,6 +74,57 @@ def test_p2p_connector_can_be_constructed_without_runtime_initialization():
     assert connector.is_initialized is False
     assert connector.world_rank == 1
     assert connector.dst_list == [0]
+
+
+def test_p2p_connector_rejects_attention_side_gate_at_initialization():
+    with pytest.raises(
+        ValueError,
+        match="compute_gate_on_attention=True is not supported by the GPU AFD backend",
+    ):
+        AFDConnectorFactory.create_connector(
+            0,
+            0,
+            _fake_vllm_config(),
+            AFDConfig(
+                role="attention",
+                connector="P2pNcclAFDConnector",
+                num_attention_ranks=1,
+                num_ffn_ranks=1,
+                compute_gate_on_attention=True,
+            ),
+        )
+
+
+def test_p2p_connector_uses_nested_text_config_for_multimodal_model():
+    text_config = SimpleNamespace(hidden_size=24, num_hidden_layers=40)
+    connector = AFDConnectorFactory.create_connector(
+        0,
+        0,
+        SimpleNamespace(
+            additional_config={},
+            model_config=SimpleNamespace(
+                dtype=torch.bfloat16,
+                enforce_eager=True,
+                hf_config=SimpleNamespace(model_type="qwen3_5_moe"),
+                hf_text_config=text_config,
+            ),
+            parallel_config=SimpleNamespace(
+                data_parallel_size=1,
+                data_parallel_rank=0,
+                prefill_context_parallel_size=1,
+                tensor_parallel_size=1,
+            ),
+        ),
+        AFDConfig(
+            role="attention",
+            connector="P2pNcclAFDConnector",
+            num_attention_ranks=1,
+            num_ffn_ranks=1,
+        ),
+    )
+
+    assert connector.num_hidden_layers == (40,)
+    assert connector.hidden_size == 24
 
 
 def test_p2p_connector_uses_factory_resolved_role_rank():
