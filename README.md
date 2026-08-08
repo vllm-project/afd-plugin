@@ -43,6 +43,7 @@ Model support:
 | Model family | Registered architectures | Plugin model wrappers | Notes |
 | --- | --- | --- | --- |
 | DeepSeekV2 / DeepSeekV3 / DeepSeekV3.2 | `DeepseekForCausalLM`, `DeepseekV2ForCausalLM`, `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | `AFDDeepseekForCausalLM`, `AFDDeepseekV2ForCausalLM`, `AFDDeepseekV3ForCausalLM` | DeepSeekV3.2 uses `AFDDeepseekV3ForCausalLM`. Each AFD role constructs and loads only its role-required model components, while shared embedding, normalization, and output components remain available where required by the model lifecycle. |
+| Qwen3 MoE | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | CUDA with `compute_gate_on_attention=false`. A focused 10-case GPU regression covers eager, CUDA graph, DBO, TP, symmetric/asymmetric topology, and pressure; the 235B profile passed a separate 4A4F/TP=4/EP=4 execution smoke. A bounded Qwen3-30B-A3B BF16 oracle matched native TP1 token IDs and top-5 logprobs in AFD 1A1F. |
 
 Connector support:
 
@@ -66,6 +67,8 @@ Known gaps:
 - GPU CUDA graph support is limited to `FULL_DECODE_ONLY`.
 - Native DBO is limited to exactly two ubatches and is not supported by
   `CAMAsyncAFDConnector`.
+- Qwen3 MoE currently rejects Attention-side gate placement, sequence-parallel
+  MoE, EPLB, pipeline parallelism, speculative decoding, LoRA, and NPU.
 - PCP-based NPU model-runner-v1 deployments from v0.19.1rc1 are not supported
   on v0.26.
 

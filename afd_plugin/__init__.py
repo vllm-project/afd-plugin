@@ -62,6 +62,17 @@ _DEEPSEEK_MODEL_REGISTRATIONS = {
     ),
 }
 
+_QWEN_MODEL_REGISTRATIONS = {
+    "Qwen3MoeForCausalLM": (
+        "afd_plugin.model_executor.models.qwen3_moe:AFDQwen3MoeForCausalLM"
+    ),
+}
+
+_MODEL_REGISTRATIONS = {
+    **_DEEPSEEK_MODEL_REGISTRATIONS,
+    **_QWEN_MODEL_REGISTRATIONS,
+}
+
 
 def register_afd() -> None:
     """Entry point for ``vllm.general_plugins``.
@@ -118,7 +129,7 @@ def register_afd() -> None:
 
     from vllm.model_executor.models import ModelRegistry
 
-    for model_arch, model_cls in _DEEPSEEK_MODEL_REGISTRATIONS.items():
+    for model_arch, model_cls in _MODEL_REGISTRATIONS.items():
         ModelRegistry.register_model(f"AFD{model_arch}", model_cls)
 
     _registered = True
@@ -135,5 +146,7 @@ __all__ = [
     "parse_optional_afd_config",
     "__version__",
     "_DEEPSEEK_MODEL_REGISTRATIONS",
+    "_MODEL_REGISTRATIONS",
+    "_QWEN_MODEL_REGISTRATIONS",
     "register_afd",
 ]

@@ -1,13 +1,14 @@
 ---
 name: run-e2e
-description: Run the AFD plugin's e2e test suite — the tests marked @pytest.mark.gpu or @pytest.mark.npu (40 tests: 20 GPU + 20 NPU) under tests/e2e in the afd-plugin repo. Invoke when the user wants to run these e2e/GPU/NPU tests and says things like "test all", "test accuracy limit 5", "test features", "test models", "跑 e2e 测试", "跑 gpu/npu 测试". Auto-detects the hardware backend (GPU vs NPU), validates the toolchain, provisions model/device paths, and runs pytest by marker. Do NOT invoke for unit tests, for test_runner.py, or for "test this function" style requests.
+description: Run the AFD plugin's e2e test suite — the tests marked @pytest.mark.gpu or @pytest.mark.npu (51 tests: 30 GPU + 21 NPU) under tests/e2e in the afd-plugin repo. Invoke when the user wants to run these e2e/GPU/NPU tests and says things like "test all", "test accuracy limit 5", "test features", "test models", "跑 e2e 测试", "跑 gpu/npu 测试". Auto-detects the hardware backend (GPU vs NPU), validates the toolchain, provisions model/device paths, and runs pytest by marker. Do NOT invoke for unit tests, for test_runner.py, or for "test this function" style requests.
 ---
 
 # Run AFD E2E Tests
 
-Runs the AFD plugin e2e suite **by marker** (`-m "gpu or npu"`). The suite is 40
-tests (20 GPU + 20 NPU); each run executes only the subset matching the current
-machine's backend (~20 per box). `tests/e2e/features/test_ops_npu.py` is
+Runs the AFD plugin e2e suite **by marker** (`-m "gpu or npu"`). The suite has
+30 GPU and 21 NPU tests. The GPU set contains 20 shared/DeepSeek tests using
+`AFD_GPU_E2E_MODEL` and 10 Qwen3 MoE tests using
+`AFD_QWEN3_MOE_E2E_MODEL`. `tests/e2e/features/test_ops_npu.py` is
 intentionally out of scope.
 
 ## Hard constraints
@@ -65,7 +66,7 @@ short pre-flight summary before running.
 **Always (both backends):**
 - `vllm` binary runs: `vllm --version` (or `$AFD_GPU_E2E_VLLM_BIN` / `$AFD_NPU_E2E_VLLM_BIN`, default `vllm`).
 - AFD plugin loadable by vllm: `python -c "import afd_plugin"` works (PYTHONPATH=repo root, or installed). `build_env` sets `VLLM_PLUGINS=afd` (gpu) / `ascend,afd` (npu).
-- Model path (from `AFD_*_E2E_MODEL`) exists on disk.
+- Every configured model path (`AFD_*_E2E_MODEL`) exists on disk.
 - pytest importable.
 - Hardware count meets tier (see step 6).
 
@@ -92,10 +93,16 @@ report rather than running a guaranteed-all-skip batch.
 
 ### 4. Provision (read env first, ask only what's missing)
 Check these env vars; if a required one is unset, ask the user to input it:
-- GPU: `AFD_GPU_E2E_MODEL` (required), `AFD_GPU_E2E_GPUS` (default `0,1,2,3`).
+- GPU shared/DeepSeek tests: `AFD_GPU_E2E_MODEL`.
+- GPU Qwen3 MoE tests: `AFD_QWEN3_MOE_E2E_MODEL`.
+- GPU devices: `AFD_GPU_E2E_GPUS` (default `0,1,2,3`).
 - NPU: `AFD_NPU_E2E_MODEL` (required), `AFD_NPU_ATTN_DEVICES` (default 0),
   `AFD_NPU_FFN_DEVICES` (default 1).
 - accuracy NPU: `AFD_NPU_GSM8K_TASK_DIR`.
+
+For `all` or `models`, run every configured model family and report the other
+family as skipped when its model variable is absent. For `accuracy` or
+`features`, `AFD_GPU_E2E_MODEL` remains required.
 
 Use AskUserQuestion for discrete choices (category, full-vs-custom gsm8k). For
 free-form paths/device-lists, ask in prose so the user can paste a path.
@@ -106,7 +113,8 @@ If the message already gave `limit N`, use it. Otherwise ask:
 - **Custom** → user enters N in 1–1319 → set `AFD_GSM8K_LIMIT=N`.
 
 ### 6. Hardware tier prediction
-Tell the user how many of the backend's ~20 will actually run vs skip:
+Tell the user how many collected tests will actually run vs skip. Account for
+missing model-family variables as well as device count:
 - **2 devices** (e.g. L20 dual-card): 1A1F tests run (graph/profiler/serving +
   accuracy + 1A1F model tests); **TP and 2A2F tests skip**.
 - **4 devices**: all run.
@@ -118,7 +126,9 @@ Set env from steps 4–5, then:
 **GPU:**
 ```bash
 cd /path/to/afd-plugin
-AFD_GPU_E2E_MODEL=<model> AFD_GPU_E2E_GPUS=<gpus> \
+[AFD_GPU_E2E_MODEL=<shared-or-deepseek-model>] \
+  [AFD_QWEN3_MOE_E2E_MODEL=<qwen-model>] \
+  AFD_GPU_E2E_GPUS=<gpus> \
   [AFD_GSM8K_LIMIT=<N>] \
   uv run pytest -m gpu tests/e2e/<category>
 ```
@@ -153,7 +163,8 @@ Parse the pytest summary. Report:
 
 | Var | Backend | Default | Required? |
 |---|---|---|---|
-| `AFD_GPU_E2E_MODEL` | gpu | — | yes (else all gpu skip) |
+| `AFD_GPU_E2E_MODEL` | gpu | — | required for shared/DeepSeek tests |
+| `AFD_QWEN3_MOE_E2E_MODEL` | gpu | — | required for the 10 Qwen3 MoE tests |
 | `AFD_GPU_E2E_GPUS` | gpu | `0,1,2,3` | no |
 | `AFD_GPU_E2E_VLLM_BIN` | gpu | `vllm` | no |
 | `AFD_NPU_E2E_MODEL` | npu | — | yes (else all npu skip) |
@@ -167,7 +178,7 @@ Parse the pytest summary. Report:
 
 ## Quick reference: what runs where
 
-- **GPU box (L20 etc.)**: `-m gpu` → up to 20 tests.
-- **NPU box (910C etc.)**: `-m npu` → up to 20 tests (DBO variants self-skip; DBO
+- **GPU box (L20 etc.)**: `-m gpu` → up to 30 tests across configured models.
+- **NPU box (910C etc.)**: `-m npu` → up to 21 tests (DBO variants self-skip; DBO
   not supported on NPU yet).
 - **Dev box, no hw**: stop at detection — can't run e2e.

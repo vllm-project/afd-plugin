@@ -34,6 +34,20 @@ def test_deepseek_afd_model_registration_paths_are_lazy_strings():
     )
 
 
+def test_qwen3_moe_afd_model_registration_path_is_lazy_string():
+    registrations = afd_plugin._QWEN_MODEL_REGISTRATIONS
+
+    assert registrations == {
+        "Qwen3MoeForCausalLM": (
+            "afd_plugin.model_executor.models.qwen3_moe:AFDQwen3MoeForCausalLM"
+        )
+    }
+    assert {
+        **afd_plugin._DEEPSEEK_MODEL_REGISTRATIONS,
+        **registrations,
+    } == afd_plugin._MODEL_REGISTRATIONS
+
+
 def test_register_afd_does_not_replace_native_deepseek_model():
     pytest.importorskip("vllm")
     from vllm.model_executor.models import ModelRegistry
@@ -44,6 +58,18 @@ def test_register_afd_does_not_replace_native_deepseek_model():
     assert native_registration.module_name == "vllm.model_executor.models.deepseek_v2"
     assert native_registration.class_name == "DeepseekV2ForCausalLM"
     assert "AFDDeepseekV2ForCausalLM" in ModelRegistry.models
+
+
+def test_register_afd_does_not_replace_native_qwen3_moe_model():
+    pytest.importorskip("vllm")
+    from vllm.model_executor.models import ModelRegistry
+
+    afd_plugin.register_afd()
+
+    native_registration = ModelRegistry.models["Qwen3MoeForCausalLM"]
+    assert native_registration.module_name == "vllm.model_executor.models.qwen3_moe"
+    assert native_registration.class_name == "Qwen3MoeForCausalLM"
+    assert "AFDQwen3MoeForCausalLM" in ModelRegistry.models
 
 
 def test_afd_model_config_uses_private_architecture_copy():
@@ -63,6 +89,23 @@ def test_afd_model_config_uses_private_architecture_copy():
     assert afd_model_config.hf_text_config is afd_model_config.hf_config
     assert afd_model_config.hf_config.architectures == ["AFDDeepseekV2ForCausalLM"]
     assert model_config.hf_config.architectures == ["DeepseekV2ForCausalLM"]
+
+
+def test_afd_model_config_rewrites_qwen3_moe_architecture_only():
+    pytest.importorskip("vllm")
+    from afd_plugin.model_executor.models.model_utils import get_afd_model_config
+
+    hf_config = SimpleNamespace(architectures=["Qwen3MoeForCausalLM"])
+    model_config = SimpleNamespace(
+        hf_config=hf_config,
+        hf_text_config=hf_config,
+    )
+
+    afd_model_config = get_afd_model_config(model_config)
+
+    assert afd_model_config is not model_config
+    assert afd_model_config.hf_config.architectures == ["AFDQwen3MoeForCausalLM"]
+    assert model_config.hf_config.architectures == ["Qwen3MoeForCausalLM"]
 
 
 def test_afd_model_config_preserves_nested_text_config():

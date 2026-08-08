@@ -597,6 +597,7 @@ def request_completions(args: argparse.Namespace) -> list[dict[str, Any]]:
         return [request_completion(args)]
 
     responses: list[dict[str, Any] | None] = [None] * request_count
+    failures: list[tuple[int, Exception]] = []
     concurrency = (
         int(args.request_concurrency)
         if args.request_concurrency is not None
@@ -612,14 +613,20 @@ def request_completions(args: argparse.Namespace) -> list[dict[str, Any]]:
             try:
                 responses[request_idx] = future.result()
             except Exception as exc:
+                failures.append((request_idx, exc))
                 print(
                     f"Completion request {request_idx} failed: {exc!r}",
                     file=sys.stderr,
                 )
 
+    if failures:
+        failed_indices = ", ".join(str(index) for index, _ in sorted(failures))
+        raise RuntimeError(
+            f"{len(failures)}/{request_count} completion requests failed; "
+            f"request indices: {failed_indices}",
+        ) from failures[0][1]
+
     completed_responses = [response for response in responses if response is not None]
-    if not completed_responses:
-        raise RuntimeError("All completion requests failed")
     return completed_responses
 
 
