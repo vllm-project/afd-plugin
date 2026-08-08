@@ -15,7 +15,10 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_world_group
 from vllm.forward_context import BatchDescriptor, DPMetadata, get_forward_context
 from vllm.sequence import IntermediateTensors
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backend import (
+    AttentionMetadataBuilder,
+    CommonAttentionMetadata,
+)
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, PerLayerAttnMetadata
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
@@ -249,6 +252,19 @@ class AFDAttentionModelRunner(GPUModelRunner):
             dp_metadata = self._build_capture_dp_metadata(padded_graph_tokens)
         self._send_dp_metadata(dp_metadata, ubatch_slices)
 
+    # Patch reason: AFD stages connector metadata before native Attention
+    # metadata construction. In addition, vLLM v0.26 caches Attention metadata
+    # without the ubatch id, so update-capable backends can reuse ubatch 0
+    # sequence metadata for later ubatches.
+    # Patch functionality: stage the AFD metadata and disable block-table-only
+    # metadata updates while native multi-ubatch metadata is built. Remove the
+    # cache workaround after vLLM PR #48659 is included in the pinned release.
+    # Signature: matches upstream; no added parameters.
+    # Upstream: vLLM v0.26.0, vllm/v1/worker/gpu_model_runner.py
+    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Delegation exception: the upstream function is large; this override wraps
+    # the native implementation and scopes the workaround to its metadata-build
+    # window.
     def _build_attention_metadata(
         self,
         num_tokens: int,
@@ -264,24 +280,39 @@ class AFDAttentionModelRunner(GPUModelRunner):
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
+        # ### PATCH START: stage AFD metadata and avoid cross-ubatch cache reuse.
         self._afd_pending_metadata = self._build_afd_metadata(
             ubatch_slices,
             int(num_tokens),
         )
-        return super()._build_attention_metadata(
-            num_tokens,
-            num_reqs,
-            max_query_len,
-            num_tokens_padded,
-            num_reqs_padded,
-            ubatch_slices,
-            logits_indices,
-            use_spec_decode,
-            for_cudagraph_capture,
-            num_scheduled_tokens,
-            cascade_attn_prefix_lens,
-            slot_mappings,
-        )
+        disabled_metadata_builders: dict[int, AttentionMetadataBuilder] = {}
+        try:
+            if ubatch_slices is not None and len(ubatch_slices) > 1:
+                for kv_cache_group in self.attn_groups:
+                    for attention_group in kv_cache_group:
+                        for ubatch_idx in range(len(ubatch_slices)):
+                            builder = attention_group.get_metadata_builder(ubatch_idx)
+                            if builder.supports_update_block_table:
+                                disabled_metadata_builders[id(builder)] = builder
+                                builder.supports_update_block_table = False
+            return super()._build_attention_metadata(
+                num_tokens,
+                num_reqs,
+                max_query_len,
+                num_tokens_padded,
+                num_reqs_padded,
+                ubatch_slices,
+                logits_indices,
+                use_spec_decode,
+                for_cudagraph_capture,
+                num_scheduled_tokens,
+                cascade_attn_prefix_lens,
+                slot_mappings,
+            )
+        finally:
+            for builder in disabled_metadata_builders.values():
+                builder.supports_update_block_table = True
+        # ### PATCH END: stage AFD metadata and avoid cross-ubatch cache reuse.
 
     def _determine_batch_execution_and_padding(
         self,
