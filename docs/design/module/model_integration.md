@@ -21,17 +21,19 @@ validation_paths:
   - "tests/e2e/accuracy/**"
 upstream_refs:
   - "vLLM vllm.model_executor.models.deepseek_v2"
+  - "vLLM vllm.model_executor.models.qwen3_moe"
   - "vLLM vllm.forward_context.ForwardContext"
   - "vLLM vllm.model_executor.model_loader"
 verified_platform_refs:
   - "DeepSeek V2 Lite GPU and NPU model E2E paths"
+  - "Qwen3 MoE CUDA GPU E2E matrix"
   - "CAM async NPU model E2E path"
 related_issues:
   - "#86"
   - "#88"
   - "#105"
   - "#129"
-last_reviewed: 2026-08-03
+last_reviewed: 2026-08-07
 ---
 
 # Model integration
@@ -54,6 +56,7 @@ make a backend-specific worker class the shared model API.
 | --- | --- | --- |
 | Registration map | [`afd_plugin/__init__.py`](../../../afd_plugin/__init__.py) | [`test_package.py`](../../../tests/unit/package/test_package.py) |
 | Role-aware model and weight loading | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py) | [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py), model and accuracy E2E suites |
+| Qwen3 MoE role-aware model and weight loading | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py), [`test_qwen3_moe_weight_policy.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_weight_policy.py), the focused 10-case 30B [`test_e2e_gpu.py`](../../../tests/e2e/models/qwen3_moe/test_e2e_gpu.py) regression, and a separate 235B 4A4F/TP=4/EP=4 execution smoke |
 | CUDA remote-experts boundary | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py), [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py) | [`test_p2p_experts_contract.py`](../../../tests/unit/connectors/test_p2p_experts_contract.py), [`test_deepseek_v2_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_proxy.py) |
 | Forward-context adapter | [`forward_context.py`](../../../afd_plugin/model_executor/models/forward_context.py) | [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
 | Ascend Attention-side gate | [`npu/deepseek_v2_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v2_attention_gate.py) | Attention-gate unit cases in [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
@@ -71,14 +74,16 @@ registers lazy AFD wrapper paths under `AFD`-prefixed aliases.
 | `DeepseekV3ForCausalLM` | `AFDDeepseekV3ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `DeepseekV32ForCausalLM` | `AFDDeepseekV32ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `GlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` |
+| `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` |
 
 Only AFD workers switch their worker-local model configuration to the matching
 alias before constructing the AFD model runner. Non-AFD workers keep the
 checkpoint architecture and resolve to vLLM's native model class.
 
-All registered classes currently share the DeepSeek V2-derived implementation.
-The aliases express known compatible architecture families; they do not make
-the wrapper a generic MoE model API.
+The DeepSeek-family aliases share the DeepSeek V2-derived implementation.
+Qwen3 MoE has a separate wrapper around vLLM's native Qwen3 MoE classes. These
+aliases express known compatible architecture families; they do not make either
+wrapper a generic MoE model API.
 
 ## Role-aware module construction
 
@@ -107,6 +112,33 @@ explicitly.
 The full AFD model remains decorated with vLLM's compile support. Backend-only
 helpers are imported inside the NPU path so CUDA model import does not require
 vLLM-Ascend.
+
+### Qwen3 MoE CUDA boundary
+
+`AFDQwen3MoeModel` uses the native `decoder_layer_type` injection hook. The
+Attention role constructs native Qwen Attention and normalization modules and
+uses a parameter-free `RemoteFFNProxy`; the FFN role constructs the complete
+native dense MLP or `Qwen3MoeSparseMoeBlock`. Native forward order, FusedMoE,
+packed parameter mapping, quantization paths, and weight loading remain owned
+by vLLM. Checkpoint weights are filtered once by layer-stage path before the
+native loader consumes them.
+
+This path is CUDA-only and requires `compute_gate_on_attention=false`. It fails
+during construction for sequence-parallel MoE, EPLB, pipeline parallelism,
+speculative decoding, LoRA, or NPU. The checked-in 10-case regression covers
+construction, memory ownership, transport, execution modes, topology, and load
+pressure. The base 30B checkpoint completed representative real-BF16 eager,
+64-request/concurrency-32 pressure, CUDA graph, and DBO execution cells.
+Instruct-2507, Thinking-2507, and Coder checkpoint identities completed the
+same focused 10-case pre-PR execution matrix.
+
+A bounded real-BF16 Qwen3-30B-A3B oracle compared native TP1 eager with AFD
+1A1F eager. Four English, Chinese, code, and arithmetic prompts had identical
+generated token IDs and top-5 logprobs; a subsequent 64-request/concurrency-32
+AFD pressure cell completed without response failures. This evidence is scoped
+to that checkpoint, topology, 1024-token model-length cell, and vLLM 0.26.0.
+
+The 235B execution smoke used 4A4F with TP=4/EP=4.
 
 ## Forward-context contract
 
@@ -242,8 +274,10 @@ load evidence.
 
 ## Limitations and open issues
 
-The current implementation is DeepSeek-oriented. Metadata ownership and
-transfer state decisions remain linked to
+The common metadata and transfer-state contracts remain DeepSeek-oriented.
+Qwen3 MoE reuses only their existing remote-FFN boundary and does not expand
+them into a generic model API. Metadata ownership and transfer state decisions
+remain linked to
 [#88](https://github.com/JiusiServe/afd-plugin/issues/88) and
 [#105](https://github.com/JiusiServe/afd-plugin/issues/105).
 

@@ -10,6 +10,7 @@ import pytest
 from tests.e2e import runner
 from tests.e2e.models.deepseek_v2_lite import test_async_cam_npu as async_cam_e2e
 from tests.e2e.models.deepseek_v2_lite import test_e2e_npu as npu_e2e
+from tests.e2e.models.qwen3_moe import test_e2e_gpu as qwen3_moe_e2e
 from tests.e2e.runner import build_vllm_command
 
 
@@ -274,7 +275,7 @@ def test_request_completion_includes_http_error_body(monkeypatch):
         runner.request_completion(args)
 
 
-def test_runner_keeps_successful_concurrent_responses(monkeypatch, capsys):
+def test_runner_rejects_partial_concurrent_failures(monkeypatch, capsys):
     args = _args()
     args.num_requests = 3
     calls = []
@@ -287,7 +288,15 @@ def test_runner_keeps_successful_concurrent_responses(monkeypatch, capsys):
 
     monkeypatch.setattr(runner, "request_completion", fake_request_completion)
 
-    responses = runner.request_completions(args)
+    with pytest.raises(RuntimeError, match="1/3 completion requests failed"):
+        runner.request_completions(args)
 
-    assert responses == [{"id": 1}, {"id": 3}]
+    assert len(calls) == 3
     assert "transient request failure" in capsys.readouterr().err
+
+
+def test_qwen3_moe_e2e_uses_model_specific_environment(monkeypatch):
+    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "/models/DeepSeek-V2-Lite")
+    monkeypatch.setenv("AFD_QWEN3_MOE_E2E_MODEL", "/models/Qwen3-30B-A3B")
+
+    assert qwen3_moe_e2e._model_path() == "/models/Qwen3-30B-A3B"

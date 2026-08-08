@@ -29,14 +29,16 @@ upstream_refs:
   - "vLLM vllm.v1.engine.core_client.DPAsyncMPClient"
   - "vLLM vllm.forward_context.set_forward_context"
   - "vLLM vllm.engine.arg_utils.EngineArgs and vllm.config.VllmConfig"
+  - "vLLM vllm.v1.worker.gpu_model_runner.GPUModelRunner"
   - "vLLM-Ascend platform and fused-MoE symbols referenced by NPU patches"
 verified_platform_refs:
   - "CPU/runtime compatibility tests in tests/unit/compat"
   - "Ascend patch evidence in NPU unit and E2E paths"
+  - "Qwen3 MoE and DeepSeek V2 Lite CUDA DBO comparison"
 related_issues:
   - "#86"
   - "#129"
-last_reviewed: 2026-08-03
+last_reviewed: 2026-08-07
 ---
 
 # Compatibility and patches
@@ -76,6 +78,7 @@ compatibility evidence rather than a released package or container tag.
 | Core vLLM patches | [`compat/patches/`](../../../afd_plugin/compat/patches) | [`tests/unit/compat/patches/`](../../../tests/unit/compat/patches) |
 | NPU adapters | [`compat/npu/`](../../../afd_plugin/compat/npu) | [`test_runtime.py`](../../../tests/unit/compat/test_runtime.py), [`test_ascend_ops.py`](../../../tests/unit/compat/test_ascend_ops.py) |
 | NPU patch paths | [`compat/patches/npu/`](../../../afd_plugin/compat/patches/npu) | [`test_force_load_balance.py`](../../../tests/unit/compat/patches/test_force_load_balance.py), [`test_npu_runtime.py`](../../../tests/unit/v1/worker/test_npu_runtime.py) |
+| CUDA DBO Attention metadata adapter | [`attention_model_runner.py`](../../../afd_plugin/v1/worker/attention_model_runner.py) | restoration/error-path unit coverage in [`test_attention_model_runner.py`](../../../tests/unit/v1/worker/test_attention_model_runner.py) and Qwen3 MoE 1A1F/2A2F DBO E2E cases |
 
 ## Patch application lifecycle
 
@@ -121,6 +124,7 @@ These modules adapt upstream behavior without replacing a global symbol:
 | [`compat/npu/feature_validation.py`](../../../afd_plugin/compat/npu/feature_validation.py) | Parses connector-owned typed extra information through the factory and fails before execution for unsupported NPU connector, quantization, graph, DBO, gate, or async MoE combinations. |
 | [`compat/npu/forward_context.py`](../../../afd_plugin/compat/npu/forward_context.py) | Enters the pinned Ascend forward context for connector-driven FFN compute and installs AFD metadata in `additional_kwargs`. |
 | [`compat/npu/ops.py`](../../../afd_plugin/compat/npu/ops.py) | Discovers plugin-owned CAMP2P operators and external CAM operators with explicit missing-runtime errors; operator build/runtime ownership is documented in [execution platforms](execution_platforms.md). |
+| [`v1/worker/attention_model_runner.py`](../../../afd_plugin/v1/worker/attention_model_runner.py) | Disables vLLM 0.26's block-table-only Attention metadata cache only while multiple DBO ubatches are built, then restores every builder in `finally`. This trades a small metadata-build optimization for correctness and should be removed when [vLLM #48659](https://github.com/vllm-project/vllm/pull/48659), or its equivalent ubatch-aware cache key, reaches the pinned release. |
 
 Two scoped mutations live with their semantic owners rather than this patch
 directory: model dummy runs temporarily wrap `create_forward_context` as

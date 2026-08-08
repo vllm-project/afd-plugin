@@ -563,6 +563,88 @@ def test_determine_batch_execution_overrides_ubatch_only_for_dp1(
     )
 
 
+@pytest.mark.parametrize("parent_raises", [False, True])
+def test_attention_metadata_disables_cross_ubatch_block_table_cache(
+    monkeypatch,
+    parent_raises,
+):
+    runner = object.__new__(AFDAttentionModelRunner)
+    builders = [
+        SimpleNamespace(supports_update_block_table=True),
+        SimpleNamespace(supports_update_block_table=True),
+    ]
+    attention_group = SimpleNamespace(
+        get_metadata_builder=lambda ubatch_idx: builders[ubatch_idx],
+    )
+    runner.attn_groups = [[attention_group]]
+    runner._build_afd_metadata = lambda *_args: object()
+    observed_cache_flags = []
+
+    def build_attention_metadata(_self, *_args, **_kwargs):
+        observed_cache_flags.append(
+            [builder.supports_update_block_table for builder in builders],
+        )
+        if parent_raises:
+            raise RuntimeError("native metadata build failed")
+        return "attention-metadata", None
+
+    monkeypatch.setattr(
+        GPUModelRunner,
+        "_build_attention_metadata",
+        build_attention_metadata,
+    )
+    ubatch_slices = [
+        _UbatchSlice(0, 4, 0, 1),
+        _UbatchSlice(4, 8, 1, 2),
+    ]
+
+    if parent_raises:
+        with pytest.raises(RuntimeError, match="native metadata build failed"):
+            runner._build_attention_metadata(8, 2, 4, ubatch_slices=ubatch_slices)
+    else:
+        assert runner._build_attention_metadata(
+            8,
+            2,
+            4,
+            ubatch_slices=ubatch_slices,
+        ) == ("attention-metadata", None)
+
+    assert observed_cache_flags == [[False, False]]
+    assert [builder.supports_update_block_table for builder in builders] == [
+        True,
+        True,
+    ]
+
+
+def test_attention_metadata_restores_cache_when_builder_lookup_fails() -> None:
+    runner = object.__new__(AFDAttentionModelRunner)
+    first_builder = SimpleNamespace(supports_update_block_table=True)
+
+    def get_metadata_builder(ubatch_idx: int) -> SimpleNamespace:
+        if ubatch_idx == 1:
+            raise RuntimeError("metadata builder lookup failed")
+        return first_builder
+
+    runner.attn_groups = [
+        [SimpleNamespace(get_metadata_builder=get_metadata_builder)],
+    ]
+    runner._build_afd_metadata = lambda *_args: object()
+    ubatch_slices = [
+        _UbatchSlice(0, 4, 0, 1),
+        _UbatchSlice(4, 8, 1, 2),
+    ]
+
+    with pytest.raises(RuntimeError, match="metadata builder lookup failed"):
+        runner._build_attention_metadata(
+            8,
+            2,
+            4,
+            ubatch_slices=ubatch_slices,
+        )
+
+    assert first_builder.supports_update_block_table is True
+
+
 def test_attention_runner_inherits_native_dummy_run_microbatching():
     assert "_dummy_run" in AFDAttentionModelRunner.__dict__
 
