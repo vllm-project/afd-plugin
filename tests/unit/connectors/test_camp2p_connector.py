@@ -11,7 +11,10 @@ pytest.importorskip("torch_npu")
 
 from afd_plugin.config import AFDConfig
 from afd_plugin.connectors import (
+    AFDConnectorExtension,
     AFDConnectorFactory,
+    AFDControlPayload,
+    AFDDPMetadata,
     AFDTransferContext,
     AFDTransferMetadata,
     AFDTransferState,
@@ -80,6 +83,7 @@ def test_camp2p_factory_creates_connector():
 
     assert isinstance(connector, CAMP2pAFDConnector)
     assert not connector.is_initialized
+    assert isinstance(connector.extension, AFDConnectorExtension)
     assert connector.max_num_reqs == 8
     assert connector.extra_info.core_num == 12
 
@@ -102,6 +106,27 @@ def test_camp2p_topology_matches_original_rank_layout():
     )
     assert not attn2.participates_in_p2p_group
     assert (ffn1.world_rank, ffn1.p2p_rank) == (1, 1)
+
+
+def test_camp2p_control_plane_delegates_model_extension():
+    connector = _init_ffn_connector(0, _vllm_config())
+    received = []
+    connector.extension.update_state_from_control_payload = (
+        lambda bound_connector, payload: received.append((bound_connector, payload))
+    )
+    connector.extension.control_payload = lambda: {"kind": "test"}
+    payload = AFDControlPayload(
+        dp_metadata_list={0: AFDDPMetadata([1])},
+        is_graph_capturing=False,
+        is_warmup=False,
+        extension={"kind": "test"},
+    )
+
+    connector.control_plane.update_state_from_dp_metadata(payload)
+    connector.control_plane.send_dp_metadata_list(payload)
+
+    assert received == [(connector, {"kind": "test"})]
+    assert payload.extension == {"kind": "test"}
 
 
 def _init_ffn_connector(rank, vllm_config):
@@ -133,11 +158,15 @@ def test_camp2p_recv_attn_output_uses_original_contiguous_af_grouping(monkeypatc
     rank1 = _init_ffn_connector(1, _vllm_config())
     rank0.dp_metadata_list = dp_metadata_list
     rank1.dp_metadata_list = dp_metadata_list
+    rank0.extension.recv_attn_extention = lambda connector, ubatch_idx: (
+        "rank0-extension"
+    )
 
     context0 = rank0.recv_attn_output(ubatch_idx=0, layer_idx=3).context
     context1 = rank1.recv_attn_output(ubatch_idx=0, layer_idx=3).context
 
     assert context0.metadata.seq_lens == [5]
+    assert context0.metadata.extension == "rank0-extension"
     assert context1.metadata.seq_lens == [12]
     assert isinstance(context0.states, CAMP2PTransferState)
     assert isinstance(context0.states, AFDTransferState)
@@ -278,6 +307,12 @@ def test_camp2p_send_attn_custom_op_receives_all_hccl_names(monkeypatch):
         seq_len=3,
     )
     context = AFDTransferContext(metadata=metadata)
+    extension_calls = []
+    connector.extension.send_attn_extention = (
+        lambda bound_connector, bound_context, **kwargs: extension_calls.append(
+            (bound_connector, bound_context),
+        )
+    )
 
     # The connector stows the CAMP2P transfer state and ubatch index on the
     # forward context; capture that instead of a dedicated helper.
@@ -302,6 +337,7 @@ def test_camp2p_send_attn_custom_op_receives_all_hccl_names(monkeypatch):
     assert captured["args"][1:4] == ("hccl0", "hccl1", "")
     assert captured["args"][4] == 3
     assert forward_context.cam_afdtransfer_state.batch_size == 3
+    assert extension_calls == [(connector, context)]
 
 
 def test_camp2p_init_fails_cleanly_without_ascend_runtime(monkeypatch):

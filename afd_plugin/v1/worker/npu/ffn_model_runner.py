@@ -95,6 +95,10 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
     def initialize_afd_connector(self) -> None:
         self.connector.init_afd_connector()
 
+    def load_model(self) -> None:
+        super().load_model()
+        self.connector.bind_model(self.model)
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}
 

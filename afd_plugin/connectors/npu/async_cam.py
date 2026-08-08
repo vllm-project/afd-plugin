@@ -541,6 +541,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             self.dynamic_quant,
             self.group_name,
         )
+        self.extension.send_attn_extention(self, context, **kwargs)
         return None
 
     def recv_ffn_output(
@@ -732,6 +733,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         states.dynamic_scales = dynamic_scales
         states.expand_x_shared = expand_x_shared
         states.dynamic_scales_shared = dynamic_scales_shared
+        metadata.extension = self.extension.recv_attn_extention(self, ubatch_idx)
         return AFDA2FTransferPayload(
             hidden_states=hidden_states,
             context=context,

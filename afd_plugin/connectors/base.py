@@ -34,6 +34,39 @@ class ConnectorExtraInfo:
         return {}
 
 
+class AFDConnectorExtension:
+    """No-op model extension for connector control and data planes.
+
+    A model may return a subclass from ``get_afd_connector_extension``. The
+    connector transports its control payload and delegates model-specific data.
+    """
+
+    def control_payload(self) -> dict[str, Any] | None:
+        return None
+
+    def update_state_from_control_payload(
+        self,
+        connector: AFDConnectorBase,
+        payload: dict[str, Any] | None,
+    ) -> None:
+        pass
+
+    def send_attn_extention(
+        self,
+        connector: AFDConnectorBase,
+        context: AFDTransferContext,
+        **kwargs: Any,
+    ) -> None:
+        pass
+
+    def recv_attn_extention(
+        self,
+        connector: AFDConnectorBase,
+        ubatch_idx: int,
+    ) -> object | None:
+        return None
+
+
 class AFDConnectorBase(ABC):
     """Base class for plugin-owned AFD Attention/FFN connectors.
 
@@ -105,10 +138,17 @@ class AFDConnectorBase(ABC):
         self.extra_info = self.parse_extra_config(
             connector_extra_config_from_source(vllm_config),
         )
+        self.extension = AFDConnectorExtension()
 
     # ==============================
     # Lifecycle methods
     # ==============================
+
+    def bind_model(self, model: Any) -> None:
+        """Bind an optional model-owned connector extension."""
+        extension_factory = getattr(model, "get_afd_connector_extension", None)
+        if extension_factory is not None:
+            self.extension = extension_factory()
 
     @abstractmethod
     def close(self) -> None:
@@ -307,4 +347,9 @@ class AFDControlPlane(ABC):
         raise NotImplementedError
 
 
-__all__ = ["AFDConnectorBase", "AFDControlPlane", "ConnectorExtraInfo"]
+__all__ = [
+    "AFDConnectorBase",
+    "AFDConnectorExtension",
+    "AFDControlPlane",
+    "ConnectorExtraInfo",
+]

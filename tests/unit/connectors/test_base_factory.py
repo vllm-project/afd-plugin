@@ -10,6 +10,7 @@ from afd_plugin.config import AFDConfig
 from afd_plugin.connectors import (
     AFDA2FTransferPayload,
     AFDConnectorBase,
+    AFDConnectorExtension,
     AFDConnectorFactory,
     AFDTransferContext,
     AFDTransferMetadata,
@@ -157,3 +158,4 @@ def test_factory_resolves_role_rank_before_connector_construction(monkeypatch):
     )
 
     assert connector.role_rank == 1
+    assert isinstance(connector.extension, AFDConnectorExtension)

@@ -116,6 +116,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                     self.model,
                     model_config=self.model_config,
                 )
+        self.connector.bind_model(self.model)
         self.model_memory_usage = profiler.consumed_memory
 
     def profile_run(self) -> None:

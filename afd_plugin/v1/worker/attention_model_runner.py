@@ -150,6 +150,7 @@ class AFDAttentionModelRunner(GPUModelRunner):
         use_ubatching = bool(self.vllm_config.parallel_config.use_ubatching)
         with _use_afd_ubatch_wrapper_during_load(use_ubatching):
             super().load_model(load_dummy_weights)
+        self.connector.bind_model(self.model)
         if use_ubatching:
             self._install_afd_ubatch_wrapper()
 

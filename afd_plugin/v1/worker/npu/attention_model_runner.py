@@ -1414,6 +1414,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
 
     def load_model(self) -> None:
         super().load_model()
+        self.connector.bind_model(self.model)
         if bool(self.vllm_config.parallel_config.use_ubatching):
             self._install_ascend_ubatch_wrapper()
 

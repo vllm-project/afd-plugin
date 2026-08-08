@@ -4,6 +4,7 @@
 
 from afd_plugin.connectors.base import (
     AFDConnectorBase,
+    AFDConnectorExtension,
     AFDControlPlane,
     ConnectorExtraInfo,
 )
@@ -23,6 +24,7 @@ from afd_plugin.connectors.metadata import (
 
 __all__ = [
     "AFDConnectorBase",
+    "AFDConnectorExtension",
     "AFDControlPlane",
     "ConnectorExtraInfo",
     "AFDExpertRoutingSpec",

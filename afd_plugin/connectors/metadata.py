@@ -9,7 +9,7 @@ import json
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 from vllm.forward_context import DPMetadata
@@ -123,11 +123,13 @@ class AFDControlPayload:
         is_warmup: Whether the payload belongs to a warmup step. This is
             separate from graph capture because warmup may prepare state without
             representing a real serving step.
+        extension: Opaque, model-owned control-plane data.
     """
 
     dp_metadata_list: dict[int, AFDDPMetadata]
     is_graph_capturing: bool
     is_warmup: bool
+    extension: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.dp_metadata_list = {
@@ -174,11 +176,13 @@ class AFDTransferMetadata:
             the expected leading dimension for tensors validated against this
             metadata. For one-to-one transfers this is usually a single-item
             list; for fan-in/fan-out paths it can describe split sizes.
+        extension: Opaque, model-owned data-plane result.
     """
 
     layer_idx: int
     stage_idx: int
     seq_lens: list[int]
+    extension: object | None = None
 
     def __post_init__(self) -> None:
         if not self.seq_lens:
@@ -325,6 +329,7 @@ def encode_control_payload(payload: AFDControlPayload) -> bytes:
         "dp_metadata_list": metadata_payload,
         "is_graph_capturing": bool(payload.is_graph_capturing),
         "is_warmup": bool(payload.is_warmup),
+        "extension": payload.extension,
     }
     return json.dumps(wire_payload, separators=(",", ":"), sort_keys=True).encode(
         "utf-8",
@@ -353,6 +358,7 @@ def decode_control_payload(payload_bytes: bytes) -> AFDControlPayload:
         dp_metadata_list=dp_metadata_list,
         is_graph_capturing=bool(payload.get("is_graph_capturing", False)),
         is_warmup=bool(payload.get("is_warmup", False)),
+        extension=payload.get("extension"),
     )
 
 

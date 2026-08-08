@@ -14,6 +14,7 @@ import torch  # noqa: E402
 
 from afd_plugin.connectors import (  # noqa: E402
     AFDA2FTransferPayload,
+    AFDConnectorExtension,
     AFDConnectorFactory,
     AFDF2ATransferPayload,
     AFDTransferContext,
@@ -317,6 +318,7 @@ def test_async_connector_disables_dp_metadata_control_plane():
     )
 
     assert connector.control_plane is None
+    assert isinstance(connector.extension, AFDConnectorExtension)
 
 
 def test_async_connector_calls_cam_shaped_ops(monkeypatch):
@@ -335,6 +337,12 @@ def test_async_connector_calls_cam_shaped_ops(monkeypatch):
     connector._initialized = True
     connector.comm_args = _FakeTensor((1,), dtype="fp16")
     connector._placeholder = _FakeTensor((8, 16))
+    extension_calls = []
+    connector.extension.send_attn_extention = (
+        lambda bound_connector, bound_context, **kwargs: extension_calls.append(
+            (bound_connector, bound_context),
+        )
+    )
     hidden_states = _FakeTensor((3, 16))
     metadata = AFDTransferMetadata.create_attention_metadata(
         layer_idx=2,
@@ -364,6 +372,7 @@ def test_async_connector_calls_cam_shaped_ops(monkeypatch):
     assert fake_torch.ops.umdk_cam_op_lib.calls[0][1][14] == 3
     assert isinstance(context.states, AFDAsyncTransferState)
     assert isinstance(context.states, AFDTransferState)
+    assert extension_calls == [(connector, context)]
 
 
 def test_async_ffn_side_dispatch_recv_and_combine_send(monkeypatch):
@@ -382,12 +391,16 @@ def test_async_ffn_side_dispatch_recv_and_combine_send(monkeypatch):
     connector._initialized = True
     connector.comm_args = _FakeTensor((1,), dtype="fp16")
     connector._placeholder = _FakeTensor((8, 16))
+    connector.extension.recv_attn_extention = lambda bound_connector, ubatch_idx: (
+        "async-extension"
+    )
 
     recv_output = connector.recv_attn_output(batch_size=4, layer_idx=1)
     connector.send_ffn_output(recv_output.hidden_states, recv_output.context)
 
     states = recv_output.context.states
     assert recv_output.hidden_states.shape == (4, 16)
+    assert recv_output.context.metadata.extension == "async-extension"
     assert states.dynamic_scales.shape == (4,)
     assert states.expand_x_shared.shape == (2, 16)
     assert states.dynamic_scales_shared.shape == (2,)
