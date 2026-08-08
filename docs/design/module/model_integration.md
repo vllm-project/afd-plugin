@@ -31,7 +31,7 @@ related_issues:
   - "#88"
   - "#105"
   - "#129"
-last_reviewed: 2026-08-03
+last_reviewed: 2026-08-06
 ---
 
 # Model integration
@@ -56,7 +56,9 @@ make a backend-specific worker class the shared model API.
 | Role-aware model and weight loading | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py) | [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py), model and accuracy E2E suites |
 | CUDA remote-experts boundary | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py), [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py) | [`test_p2p_experts_contract.py`](../../../tests/unit/connectors/test_p2p_experts_contract.py), [`test_deepseek_v2_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_proxy.py) |
 | Forward-context adapter | [`forward_context.py`](../../../afd_plugin/model_executor/models/forward_context.py) | [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
+| NPU Async CAM stage planning | [`npu/async_cam_ubatching.py`](../../../afd_plugin/model_executor/npu/async_cam_ubatching.py) | [`test_async_cam_ubatching.py`](../../../tests/unit/model_executor/test_async_cam_ubatching.py) |
 | Ascend Attention-side gate | [`npu/deepseek_v2_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v2_attention_gate.py) | Attention-gate unit cases in [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
+| Ascend CAM layout and execution sidecar | [`npu/async_cam_layout.py`](../../../afd_plugin/model_executor/models/npu/async_cam_layout.py) | Async layout cases in [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
 | Ascend CAM orchestration | [`npu/deepseek_v2_async_cam_forward.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v2_async_cam_forward.py) | Async/ubatch unit cases and [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py) |
 
 ## Model registration
@@ -123,9 +125,12 @@ runs, `use_afd_metadata_provider()` temporarily wraps
 `additional_kwargs` entry, and restores the original function in `finally`.
 This is a scoped compatibility adapter, not a permanent global provider.
 
-Async MoE request ubatching uses a second sidecar key,
+Async MoE ubatching uses a second sidecar key,
 `afd_async_moe_ubatch_metadata`, containing upstream Attention metadata and
-`UBatchSlices`. Both the sidecar shape and the live connector reference are
+plugin-owned stage descriptions. The generic adapter owns only `afd_metadata`;
+the NPU sidecar and layout conversion live in `models/npu/async_cam_layout.py`,
+while `model_executor/npu/async_cam_ubatching.py` contains the pure NPU execution
+planner. Both the sidecar shape and the live connector reference are
 **draft** while metadata ownership is discussed in
 [#88](https://github.com/JiusiServe/afd-plugin/issues/88) and payload state is
 split under [#105](https://github.com/JiusiServe/afd-plugin/issues/105).

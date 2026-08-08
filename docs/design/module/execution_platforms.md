@@ -233,8 +233,11 @@ wrapper. The current path:
 
 `v1/worker/dbo.py` registers the model-side yield operation and dispatches to
 the platform DBO implementation. The optional CAM async MoE pipeline is not
-this native DBO path: it is an eager, request-boundary, two-stage pipeline
-owned by the model/connector flow.
+this native DBO path: it is an eager, two-stage pipeline owned by the
+model/connector flow. It supports request-boundary and token-balanced stages,
+with real-token metadata kept separate from physical TP/SP padding. FlashComm1
+is Attention-local; without it, the CAM boundary shards replicated Attention
+tokens and restores the FFN result with TP all-gather.
 
 ### ACL Graph and NPU Graph
 
@@ -289,7 +292,7 @@ an expansion of the supported runtime contract.
 | --- | --- | --- | --- | --- |
 | CUDA + `P2pNcclAFDConnector` | Eager or `FULL_DECODE_ONLY` CUDA Graph | Native DBO, exactly two ubatches | DeepSeek remote-experts boundary; Attention-side or FFN-side gate; EPLB rejected on the Attention remote-experts role | GPU serving, graph, TP/EP, DP/EP, DBO, profiler, model, and accuracy E2E tests |
 | Ascend + `CAMP2pAFDConnector` | Eager or current ACL Graph path | Native DBO, exactly two ubatches | Common and connector-local `compute_gate_on_attention=false`; `connector_extra_config.quant_mode=0`; plugin CANN ops required | NPU serving, graph, TP, ops, profiler, model, and accuracy E2E tests |
-| Ascend + `CAMAsyncAFDConnector` | Eager only | Native DBO rejected; optional async MoE ubatching uses exactly two request-boundary stages | Experimental code path; the former PCP8 recipe is incompatible with v0.26 model runner v1 and was not revalidated in this upgrade | Unit coverage only for the retained connector/model adapters; no v0.26 hardware support claim |
+| Ascend + `CAMAsyncAFDConnector` | Eager only | Native DBO rejected; optional AFD-managed MoE ubatching uses exactly two request or token-balanced stages | Experimental v0.26 port; `async=true`; documented path uses common `compute_gate_on_attention=true`; token mode requires Attention TP > 1; model runner v1 PCP is unsupported; prefill and decode context parallelism are unsupported; `connector_extra_config.dynamicQuant` is 0 or 1; external CAM ops required | Focused unit coverage; the 0.19.1 DP3TP2/EP2 split × SP × ubatching E2E matrix must be rerun before a v0.26 hardware support claim |
 
 The validated CUDA and synchronous Ascend paths use vLLM 0.26.0 and model
 runner v1. GPU/NPU rank topology and connector resource rules remain owned by

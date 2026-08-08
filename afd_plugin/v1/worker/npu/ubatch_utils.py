@@ -18,6 +18,8 @@ from vllm.v1.worker.ubatch_utils import (
 )
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 
+from afd_plugin.model_executor.npu.async_cam_ubatching import AsyncMoeStage
+
 
 def is_last_ubatch_empty(
     orig_num_tokens: int,
@@ -365,6 +367,37 @@ def split_attn_metadata(
     ]
 
 
+def split_async_moe_attn_metadata(
+    stages: tuple[AsyncMoeStage, ...],
+    common_attn_metadata: AscendCommonAttentionMetadata,
+    max_num_tokens: int = 0,
+) -> list[AscendCommonAttentionMetadata]:
+    """Build real-token stage metadata without exposing layout padding.
+
+    Async CAM may add minimum stage-local TP padding after each real-token
+    range. The native Ascend helper must see only real tokens so request
+    offsets, sequence lengths, positions, and KV slots are rebuilt correctly.
+    The physical extent remains in ``AsyncMoeStage.input_tokens`` and the
+    stage forward context. In particular, ``num_input_tokens`` must remain the
+    real-token count: SFA/MLAPO uses it to allocate its query tensors after
+    FlashComm has removed the stage-local padding.
+    """
+
+    stage_metadata = []
+    for stage in stages:
+        actual_token_slice = slice(
+            int(stage.token_slice.start),
+            int(stage.token_slice.start) + stage.actual_tokens,
+        )
+        metadata = _make_metadata_with_slice(
+            UBatchSlice(stage.request_slice, actual_token_slice),
+            common_attn_metadata,
+            max_num_tokens,
+        )
+        stage_metadata.append(metadata)
+    return stage_metadata
+
+
 __all__ = [
     "UBatchSlice",
     "UBatchSlices",
@@ -375,5 +408,6 @@ __all__ = [
     "maybe_create_ubatch_slices",
     "pad_out_ubatch_slices",
     "slice_query_start_locs",
+    "split_async_moe_attn_metadata",
     "split_attn_metadata",
 ]

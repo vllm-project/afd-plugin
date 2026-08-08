@@ -41,7 +41,7 @@ related_issues:
   - "#88"
   - "#105"
   - "#129"
-last_reviewed: 2026-07-20
+last_reviewed: 2026-08-06
 ---
 
 # Attention runtime
@@ -239,11 +239,19 @@ Attention model path.
 The optional `async_moe_ubatching` mode is distinct from vLLM native DBO. It:
 
 - requires `compute_gate_on_attention=true`;
-- splits at request boundaries into exactly two stages;
+- uses exactly two request-boundary or token-balanced stages;
+- keeps real token ranges separate from stage-local TP/SP padding;
 - runs the dense prefix before the split;
 - pipelines stage Attention send and FFN receive through the MoE layers;
 - rejoins stage outputs after the pipeline;
-- does not support decode context parallel metadata.
+- does not synchronize stage eligibility across asynchronous DP replicas;
+- does not support prefill or decode context parallel metadata.
+
+The Attention runner calls the device-independent planner in
+`model_executor/npu/async_cam_ubatching.py`; the NPU model path applies the plan
+through `models/npu/async_cam_layout.py`. FlashComm1/SP is Attention-local and
+FFN topology validation is independent. See the CAM async user guide for the
+supported topology and environment matrix.
 
 CAM async requires eager execution and rejects vLLM native ubatching. Its
 feature limits are recorded in the

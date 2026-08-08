@@ -1,8 +1,11 @@
 # CAMAsyncAFDConnector For DeepSeek-V3.2 Recipe
 
 > [!NOTE]
-> This recipe targets vLLM/vLLM-Ascend `v0.19.1rc1`. Use the AFD Plugin
-> branch `release/v0.19.1rc1` when running it.
+> The commands and measurements in this document target
+> vLLM/vLLM-Ascend `v0.19.1rc1`. Use the AFD Plugin branch
+> `release/v0.19.1rc1` when running them. For the current v0.26 full-model
+> DP2TP8 Attention + EP16 accuracy test, use the
+> [v0.26 accuracy recipe](v0_26_accuracy/README.md).
 
 This recipe describes how to run DeepSeek-V3.2 with the AFD CAM async
 connector on Ascend NPU.

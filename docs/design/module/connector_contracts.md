@@ -93,7 +93,7 @@ than an `AFDConfig` field. Unknown fields fail in the selected connector parser.
 | --- | --- |
 | `P2pNcclAFDConnector` | None; the mapping must be empty. |
 | `CAMP2pAFDConnector` | `core_num`, optional `attn_core_num` / `ffn_core_num`, `compute_gate_on_attention`, and `quant_mode`. Core counts must be positive; the current runtime rejects gate-on-Attention and any nonzero quantization mode. |
-| `CAMAsyncAFDConnector` | `dynamicQuant`, `attn_ranks_per_dp`, `async_moe_ubatching`, `async_moe_num_ubatches`, and `async_moe_split`. Runtime validation further limits dynamic quantization and the optional request-boundary pipeline. |
+| `CAMAsyncAFDConnector` | `dynamicQuant`, `attn_ranks_per_dp`, `async_moe_ubatching`, `async_moe_num_ubatches`, and `async_moe_split`. Runtime validation further limits dynamic quantization and the optional request/token stage pipeline. |
 
 The common `compute_gate_on_attention` field remains on `AFDConfig` and is the
 model-routing selector. CUDA P2P supports both values. CAMP2P also parses a

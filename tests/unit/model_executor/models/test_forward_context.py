@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
+from vllm.forward_context import (  # noqa: E402
+    get_forward_context as get_current_forward_context,
+)
 
 from afd_plugin.model_executor.models import (  # noqa: E402
-    ASYNC_MOE_UBATCH_METADATA_KEY,
     get_afd_metadata_from_forward_context,
+)
+from afd_plugin.model_executor.models.npu.async_cam_layout import (  # noqa: E402
+    ASYNC_MOE_UBATCH_METADATA_KEY,
+    AsyncMoeUbatchMetadata,
     get_async_moe_ubatch_metadata_from_forward_context,
+)
+from afd_plugin.model_executor.npu.async_cam_ubatching import (  # noqa: E402
+    AsyncMoeStage,
 )
 
 
@@ -42,87 +52,6 @@ def test_get_async_moe_ubatch_metadata_from_additional_kwargs():
     assert (
         get_async_moe_ubatch_metadata_from_forward_context(forward_context) is sidecar
     )
-
-
-@pytest.mark.parametrize("raise_inside", [False, True])
-def test_async_moe_ubatch_forward_context_restores_state(raise_inside):
-    from afd_plugin.model_executor.models.npu import (
-        deepseek_v2_async_cam_forward as async_forward,
-    )
-
-    class CloneableMetadata(SimpleNamespace):
-        def clone(self):
-            return CloneableMetadata(**vars(self))
-
-    parent_metadata = CloneableMetadata(
-        stage_idx=7,
-        num_stages=1,
-        tokens_unpadded_lens=[2, 3],
-    )
-    ubatch_slices = [
-        SimpleNamespace(
-            token_slice=slice(0, 2),
-            request_slice=slice(0, 1),
-            num_tokens=2,
-        ),
-        SimpleNamespace(
-            token_slice=slice(2, 5),
-            request_slice=slice(1, 2),
-            num_tokens=3,
-        ),
-    ]
-    async_metadata = {
-        "ubatch_slices": ubatch_slices,
-        "attn_metadata": ["attention-0", "attention-1"],
-    }
-    original_kwargs = {
-        "afd_metadata": parent_metadata,
-        "preserved": object(),
-    }
-    forward_context = SimpleNamespace(
-        attn_metadata="parent-attention",
-        additional_kwargs=original_kwargs,
-        ubatch_idx=7,
-        num_tokens=5,
-    )
-
-    def run_context():
-        with async_forward._use_async_moe_ubatch_forward_context(
-            forward_context=forward_context,
-            parent_afd_metadata=parent_metadata,
-            async_moe_ubatch_metadata=async_metadata,
-            stage_idx=1,
-        ):
-            assert forward_context.attn_metadata == "attention-1"
-            assert forward_context.ubatch_idx == 1
-            assert forward_context.num_ubatches == 2
-            assert forward_context.num_tokens == 3
-            assert forward_context.additional_kwargs is not original_kwargs
-            assert (
-                forward_context.additional_kwargs["preserved"]
-                is original_kwargs["preserved"]
-            )
-            stage_metadata = forward_context.additional_kwargs["afd_metadata"]
-            assert stage_metadata is not parent_metadata
-            assert stage_metadata.stage_idx == 1
-            assert stage_metadata.tokens_start_loc == [2]
-            assert stage_metadata.requests_start_loc == [1]
-            assert stage_metadata.tokens_lens == [3]
-            assert stage_metadata.tokens_unpadded_lens == [3]
-            if raise_inside:
-                raise RuntimeError("test failure")
-
-    if raise_inside:
-        with pytest.raises(RuntimeError, match="test failure"):
-            run_context()
-    else:
-        run_context()
-
-    assert forward_context.attn_metadata == "parent-attention"
-    assert forward_context.additional_kwargs is original_kwargs
-    assert forward_context.ubatch_idx == 7
-    assert forward_context.num_tokens == 5
-    assert not hasattr(forward_context, "num_ubatches")
 
 
 @pytest.mark.parametrize(
@@ -427,71 +356,339 @@ def test_deepseek_compute_gate_on_attention_selects_backend_boundary():
     )
 
 
-def test_deepseek_async_moe_ubatching_runs_attention_inside_stage_context():
-    executor_source = Path(
-        "afd_plugin/model_executor/models/npu/deepseek_v2_async_cam_forward.py",
-    ).read_text()
-    model_forward = executor_source.split("def run_model_forward(", 1)[1].split(
-        "def run_attention_gate_afd_forward(",
-        1,
-    )[0]
-    async_ubatch_forward = executor_source.split(
-        "def run_async_moe_ubatch_afd_forward(",
-        1,
-    )[1].split(
-        "_MISSING_FORWARD_CONTEXT_ATTR = object()",
-        1,
-    )[0]
+def test_async_moe_pipeline_preserves_stage_order(monkeypatch):
+    from afd_plugin.model_executor.models.npu import deepseek_v2_async_cam_forward
 
-    assert "async_moe_ubatch_metadata" in model_forward
-    assert "run_async_moe_ubatch_afd_forward(" in model_forward
-    assert "_log_async_moe_forward_step(" not in async_ubatch_forward
-    assert "first_moe_layer = int(model.config.first_k_dense_replace)" in (
-        async_ubatch_forward
+    events = []
+    forward_context = SimpleNamespace(
+        attn_metadata={"layer": "full"},
+        additional_kwargs={},
+        ubatch_idx=0,
+        num_ubatches=1,
+        num_tokens=4,
+        pad_size=0,
+        flash_comm_v1_enabled=True,
     )
-    assert "dense_end_layer = min(model.end_layer, first_moe_layer)" in (
-        async_ubatch_forward
+
+    def send_attn_output(_hidden_states, context, **_kwargs):
+        events.append(("send", context.metadata.stage_idx))
+
+    def recv_ffn_output(ref_tensor, ubatch_idx):
+        events.append(("recv", ubatch_idx))
+        return ref_tensor
+
+    connector = SimpleNamespace(
+        send_attn_output=send_attn_output,
+        recv_ffn_output=recv_ffn_output,
     )
-    assert "stage_hidden_states = [" in async_ubatch_forward
-    assert (
-        "moe_layers = list(islice(model.layers, moe_start_layer, model.end_layer))"
-        in async_ubatch_forward
+    parent_metadata = SimpleNamespace(
+        stage_idx=0,
+        connector=connector,
     )
-    assert "def compute_stage_attention(" in async_ubatch_forward
-    assert "def send_stage_attention(" in async_ubatch_forward
-    assert "def recv_stage_ffn(" in async_ubatch_forward
-    assert "for moe_layer_offset in range(last_moe_layer_offset):" in (
-        async_ubatch_forward
+    forward_context.additional_kwargs["afd_metadata"] = parent_metadata
+    execution_plan = AsyncMoeUbatchMetadata(
+        attn_metadata=[{"layer": "stage-0"}, {"layer": "stage-1"}],
+        stages=[
+            AsyncMoeStage(
+                slice(0, 1),
+                slice(0, 2),
+                input_tokens=2,
+            ),
+            AsyncMoeStage(
+                slice(1, 2),
+                slice(2, 4),
+                input_tokens=4,
+            ),
+        ],
+        parent_input_tokens=4,
+        use_sequence_parallel=True,
     )
-    assert "def flush_pending_ffn_outputs()" not in async_ubatch_forward
-    assert "torch.cat(stage_hidden_states, dim=0)" in async_ubatch_forward
-    assert "_run_async_moe_ubatch_layer(" not in executor_source
-    assert "_recv_async_moe_ubatch_outputs(" not in executor_source
-    assert "forward_context.attn_metadata = attn_metadata[stage_idx]" in executor_source
-    assert async_ubatch_forward.index(
-        "with _use_async_moe_ubatch_forward_context(",
-    ) < (async_ubatch_forward.index("layer.compute_attn_output("))
-    assert async_ubatch_forward.index(") = layer.compute_attn_output(") < (
-        async_ubatch_forward.index("def send_stage_attention(")
-    )
-    assert async_ubatch_forward.index(
-        "first_layer = moe_layers[0]",
-    ) < async_ubatch_forward.index(
-        "for moe_layer_offset in range(last_moe_layer_offset):",
-    )
-    assert async_ubatch_forward.index("recv_stage_ffn(0)") < (
-        async_ubatch_forward.index(
-            "send_stage_attention(\n            current_layer,\n            1",
+    stage_hidden_states = [torch.zeros((1, 8)), torch.ones((2, 8))]
+
+    def compute_attn_output(
+        _positions,
+        hidden_states,
+        residual,
+        _llama_4_scaling,
+    ):
+        stage_context = get_current_forward_context()
+        events.append(
+            (
+                "compute",
+                stage_context.ubatch_idx,
+                stage_context.attn_metadata,
+                stage_context.num_tokens,
+                stage_context.pad_size,
+            ),
         )
+        topk = hidden_states[:, :1]
+        return hidden_states, residual, topk, topk.to(torch.int32), None
+
+    monkeypatch.setattr(
+        deepseek_v2_async_cam_forward,
+        "get_forward_context",
+        lambda: forward_context,
     )
-    assert async_ubatch_forward.index("recv_stage_ffn(1)") < (
-        async_ubatch_forward.index(
-            "send_stage_attention(\n            next_layer,\n            0",
+    monkeypatch.setattr(
+        deepseek_v2_async_cam_forward,
+        "get_tensor_model_parallel_world_size",
+        lambda: 2,
+    )
+    monkeypatch.setattr(
+        deepseek_v2_async_cam_forward,
+        "build_async_moe_stage_inputs",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            hidden_states=stage_hidden_states,
+            residuals=[None, None],
+            positions=["positions-0", "positions-1"],
+            llama_4_scaling=["scaling-0", "scaling-1"],
+        ),
+    )
+    monkeypatch.setattr(
+        deepseek_v2_async_cam_forward,
+        "restore_async_moe_stage_outputs",
+        lambda outputs, _metadata: tuple(outputs),
+    )
+    monkeypatch.setattr(
+        deepseek_v2_async_cam_forward,
+        "prepare_cam_dispatch_payload",
+        lambda hidden_states, topk_weights, topk_ids, router_logits, **_kwargs: (
+            SimpleNamespace(
+                hidden_states=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                router_logits=router_logits,
+                layout=object(),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        deepseek_v2_async_cam_forward,
+        "restore_cam_dispatch_output",
+        lambda output, _layout: output,
+    )
+
+    output, residual = deepseek_v2_async_cam_forward.run_async_moe_ubatch_afd_forward(
+        model=SimpleNamespace(
+            start_layer=0,
+            end_layer=2,
+            layers=[
+                SimpleNamespace(
+                    is_moe_layer=True,
+                    layer_idx=layer_idx,
+                    compute_attn_output=compute_attn_output,
+                )
+                for layer_idx in range(2)
+            ],
+        ),
+        hidden_states=torch.zeros((4, 8)),
+        residual=None,
+        positions="full-positions",
+        afd_metadata=parent_metadata,
+        async_moe_ubatch_metadata=execution_plan,
+        llama_4_scaling="full-scaling",
+    )
+
+    assert [event[:2] for event in events] == [
+        ("compute", 0),
+        ("send", 0),
+        ("compute", 1),
+        ("recv", 0),
+        ("send", 1),
+        ("compute", 0),
+        ("recv", 1),
+        ("send", 0),
+        ("compute", 1),
+        ("recv", 0),
+        ("send", 1),
+        ("recv", 1),
+    ]
+    for event in (event for event in events if event[0] == "compute"):
+        stage_idx = event[1]
+        assert event[2] == {"layer": f"stage-{stage_idx}"}
+        assert event[3] == 2
+        assert event[4] == (0, 2)[stage_idx]
+    assert all(
+        restored is expected
+        for restored, expected in zip(output, stage_hidden_states, strict=True)
+    )
+    assert residual is None
+    assert forward_context.attn_metadata == {"layer": "full"}
+    assert forward_context.num_tokens == 4
+    assert forward_context.pad_size == 0
+
+
+def test_async_cam_layout_transposes_full_shards_into_stage_shards(monkeypatch):
+    torch = pytest.importorskip("torch")
+
+    from afd_plugin.model_executor.models.npu import async_cam_layout
+
+    metadata = AsyncMoeUbatchMetadata(
+        attn_metadata=[{}, {}],
+        stages=[
+            AsyncMoeStage(slice(0, 1), slice(0, 10), input_tokens=10),
+            AsyncMoeStage(slice(0, 1), slice(10, 15), input_tokens=6),
+        ],
+        parent_input_tokens=16,
+        use_sequence_parallel=True,
+    )
+    global_hidden = torch.arange(32, dtype=torch.float32).reshape(16, 2)
+    global_residual = global_hidden + 100
+    positions = torch.arange(16)
+    scaling = torch.ones(2, 16)
+    tp_group = SimpleNamespace(world_size=2, rank_in_group=0)
+    monkeypatch.setattr(async_cam_layout, "get_tp_group", lambda: tp_group)
+
+    for tp_rank, expected_positions in (
+        (0, [[0, 1, 2, 3, 4], [10, 11, 12]]),
+        (1, [[5, 6, 7, 8, 9], [13, 14, 0]]),
+    ):
+        tp_group.rank_in_group = tp_rank
+        local_slice = slice(tp_rank * 8, (tp_rank + 1) * 8)
+
+        def all_gather(tensor, token_dim):
+            assert token_dim == 0
+            assert tensor.shape[1] == 4
+            return torch.cat((global_hidden, global_residual), dim=-1)
+
+        monkeypatch.setattr(
+            async_cam_layout,
+            "tensor_model_parallel_all_gather",
+            all_gather,
         )
+        stage_inputs = async_cam_layout.build_async_moe_stage_inputs(
+            global_hidden[local_slice],
+            global_residual[local_slice],
+            positions,
+            scaling,
+            metadata,
+        )
+
+        assert [stage.tolist() for stage in stage_inputs.positions] == (
+            expected_positions
+        )
+        assert [int(stage.shape[0]) for stage in stage_inputs.hidden_states] == [
+            5,
+            3,
+        ]
+        assert [tuple(stage.shape) for stage in stage_inputs.llama_4_scaling] == [
+            (2, 5),
+            (2, 3),
+        ]
+        monkeypatch.setattr(
+            async_cam_layout,
+            "tensor_model_parallel_all_gather",
+            lambda tensor, token_dim: (
+                global_hidden[:10]
+                if int(tensor.shape[token_dim]) == 5
+                else torch.cat(
+                    (
+                        global_hidden[10:15],
+                        global_hidden.new_zeros((1, 2)),
+                    ),
+                    dim=0,
+                )
+            ),
+        )
+        restored = async_cam_layout.restore_async_moe_stage_outputs(
+            stage_inputs.hidden_states,
+            metadata,
+        )
+        expected_restored = global_hidden.clone()
+        expected_restored[15].zero_()
+        assert torch.equal(restored, expected_restored[local_slice])
+
+
+def test_async_moe_replicated_layout_removes_and_restores_parent_padding():
+    torch = pytest.importorskip("torch")
+
+    from afd_plugin.model_executor.models.npu import async_cam_layout
+
+    metadata = AsyncMoeUbatchMetadata(
+        attn_metadata=[{}, {}],
+        stages=[
+            AsyncMoeStage(slice(0, 1), slice(0, 3), input_tokens=3),
+            AsyncMoeStage(slice(0, 1), slice(3, 5), input_tokens=2),
+        ],
+        parent_input_tokens=8,
+        use_sequence_parallel=False,
     )
-    assert async_ubatch_forward.index(
-        "send_stage_attention(\n        last_layer,\n        1",
-    ) < (async_ubatch_forward.rindex("recv_stage_ffn(1)"))
+    hidden_states = torch.arange(16, dtype=torch.float32).reshape(8, 2)
+    positions = torch.arange(8)
+
+    stage_inputs = async_cam_layout.build_async_moe_stage_inputs(
+        hidden_states,
+        None,
+        positions,
+        None,
+        metadata,
+    )
+
+    assert [stage[:, 0].tolist() for stage in stage_inputs.hidden_states] == [
+        [0.0, 2.0, 4.0],
+        [6.0, 8.0],
+    ]
+    assert [stage.tolist() for stage in stage_inputs.positions] == [
+        [0, 1, 2],
+        [3, 4],
+    ]
+    restored = async_cam_layout.restore_async_moe_stage_outputs(
+        stage_inputs.hidden_states,
+        metadata,
+    )
+    assert torch.equal(restored[:5], hidden_states[:5])
+    assert torch.count_nonzero(restored[5:]) == 0
+
+
+def test_plain_tp_cam_boundary_shards_and_restores_replicated_tokens(monkeypatch):
+    torch = pytest.importorskip("torch")
+
+    from afd_plugin.model_executor.models.npu import async_cam_layout
+
+    tp_group = SimpleNamespace(world_size=2, rank_in_group=0)
+    monkeypatch.setattr(async_cam_layout, "get_tp_group", lambda: tp_group)
+    hidden_states = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+    topk_weights = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+    topk_ids = torch.arange(10, dtype=torch.int32).reshape(5, 2)
+    router_logits = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    padded_output = torch.arange(12, dtype=torch.float32).reshape(6, 2) + 100
+
+    monkeypatch.setattr(
+        async_cam_layout,
+        "tensor_model_parallel_all_gather",
+        lambda tensor, token_dim: padded_output,
+    )
+
+    expected_hidden_rows = (
+        hidden_states[:3],
+        torch.cat((hidden_states[3:], hidden_states.new_zeros((1, 2)))),
+    )
+    for tp_rank in range(2):
+        tp_group.rank_in_group = tp_rank
+        payload = async_cam_layout.prepare_cam_dispatch_payload(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            router_logits,
+            use_sequence_parallel=False,
+        )
+
+        assert torch.equal(payload.hidden_states, expected_hidden_rows[tp_rank])
+        assert payload.hidden_states.shape[0] == 3
+        assert payload.topk_weights.shape[0] == 3
+        assert payload.topk_ids.shape[0] == 3
+        assert payload.router_logits is not None
+        assert payload.router_logits.shape[0] == 3
+        assert payload.layout.parent_tokens == 5
+        assert payload.layout.padded_tokens == 6
+        assert payload.layout.requires_tp_all_gather is True
+
+        local_output = padded_output[tp_rank * 3 : (tp_rank + 1) * 3]
+        restored = async_cam_layout.restore_cam_dispatch_output(
+            local_output,
+            payload.layout,
+        )
+        assert torch.equal(restored, padded_output[:5])
 
 
 def test_deepseek_afd_ffn_path_reuses_ascend_moe_mlp_after_attention_gate():
@@ -529,6 +726,133 @@ def test_deepseek_afd_ffn_path_reuses_ascend_moe_mlp_after_attention_gate():
     assert "_compute_w8a8_shared_experts_from_int8(" in compute_moe
     assert "shared_input.dtype == torch.int8" in compute_moe
     assert "fusion=False" not in compute_moe
+
+
+@pytest.mark.parametrize(
+    ("num_routed_tokens", "num_shared_tokens"),
+    [(2, 2), (2, 0), (0, 2), (0, 0)],
+)
+def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
+    monkeypatch,
+    num_routed_tokens,
+    num_shared_tokens,
+):
+    from afd_plugin.model_executor.models.npu import deepseek_v2_attention_gate
+
+    class FakeQuantType:
+        NONE = "none"
+        W8A8 = "w8a8"
+
+    class KeywordArguments:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    routed_calls = []
+
+    def fake_unified_apply_mlp(*, mlp_compute_input):
+        routed_calls.append(mlp_compute_input.hidden_states)
+        return (
+            torch.zeros_like(
+                mlp_compute_input.hidden_states,
+                dtype=torch.bfloat16,
+            ),
+            None,
+        )
+
+    fake_moe_mlp = ModuleType("vllm_ascend.ops.fused_moe.moe_mlp")
+    fake_moe_mlp.unified_apply_mlp = fake_unified_apply_mlp
+    fake_stage_contracts = ModuleType(
+        "vllm_ascend.ops.fused_moe.moe_stage_contracts",
+    )
+    fake_stage_contracts.MoEMlpComputeInput = KeywordArguments
+    fake_stage_contracts.MoEWeights = KeywordArguments
+    fake_stage_params = ModuleType(
+        "vllm_ascend.ops.fused_moe.moe_stage_params",
+    )
+    fake_stage_params.MoEQuantParams = KeywordArguments
+    fake_quant_type = ModuleType("vllm_ascend.quantization.quant_type")
+    fake_quant_type.QuantType = FakeQuantType
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_ascend.ops.fused_moe.moe_mlp",
+        fake_moe_mlp,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_ascend.ops.fused_moe.moe_stage_contracts",
+        fake_stage_contracts,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_ascend.ops.fused_moe.moe_stage_params",
+        fake_stage_params,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_ascend.quantization.quant_type",
+        fake_quant_type,
+    )
+
+    shared_calls = []
+
+    def fake_compute_shared(
+        shared_experts,
+        hidden_states,
+        dynamic_scales,
+        *,
+        output_dtype,
+    ):
+        shared_calls.append((shared_experts, hidden_states, dynamic_scales))
+        return torch.zeros_like(hidden_states, dtype=output_dtype)
+
+    monkeypatch.setattr(
+        deepseek_v2_attention_gate,
+        "_compute_w8a8_shared_experts_from_int8",
+        fake_compute_shared,
+    )
+    monkeypatch.setattr(
+        deepseek_v2_attention_gate,
+        "_gmmswigluquant_fusion_enabled",
+        lambda: False,
+    )
+
+    shared_experts = object()
+    experts = SimpleNamespace(
+        quant_type=FakeQuantType.W8A8,
+        dynamic_eplb=False,
+        get_eplb_parameter=lambda name: name,
+        activation="silu",
+        _shared_experts=shared_experts,
+    )
+    layer = SimpleNamespace(
+        mlp=SimpleNamespace(
+            experts=experts,
+            routed_scaling_factor=1.0,
+        ),
+    )
+    hidden_states = torch.zeros((num_routed_tokens, 4), dtype=torch.int8)
+    expand_x_shared = torch.zeros((num_shared_tokens, 4), dtype=torch.int8)
+
+    output = deepseek_v2_attention_gate.compute_attention_gate_moe_ffn(
+        layer,
+        hidden_states=hidden_states,
+        group_list=torch.zeros(2, dtype=torch.int64),
+        dynamic_scales=torch.ones(num_routed_tokens),
+        expand_x_shared=expand_x_shared,
+        dynamic_scales_shared=torch.ones(num_shared_tokens),
+        topk_scales=None,
+        group_list_type=1,
+    )
+
+    assert len(routed_calls) == int(num_routed_tokens > 0)
+    assert output.routed_output.shape == hidden_states.shape
+    assert output.routed_output.dtype == torch.bfloat16
+    assert len(shared_calls) == int(num_shared_tokens > 0)
+    if num_shared_tokens > 0:
+        assert output.shared_output is not None
+        assert output.shared_output.shape == expand_x_shared.shape
+    else:
+        assert output.shared_output is None
 
 
 def test_deepseek_afd_ffn_compute_omits_stub_io_diagnostics():

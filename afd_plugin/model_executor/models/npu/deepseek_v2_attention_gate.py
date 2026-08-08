@@ -167,40 +167,51 @@ def compute_attention_gate_moe_ffn(
         and _gmmswigluquant_fusion_enabled()
     )
 
+    # CAM reports exact rank-local work. An EP rank can legitimately receive
+    # zero routed or shared tokens, while Ascend MoE kernels require non-empty
+    # inputs.
     shared_output = None
     if experts._shared_experts is not None:
+        if expand_x_shared is None:
+            raise RuntimeError(
+                "AFD shared experts require expand_x_shared from CAM dispatch",
+            )
         shared_input = expand_x_shared
         shared_scales = dynamic_scales_shared
-        if shared_input.dtype == torch.int8 and quant_type == QuantType.W8A8:
-            shared_output = _compute_w8a8_shared_experts_from_int8(
-                experts._shared_experts,
-                shared_input,
-                shared_scales,
-                output_dtype=torch.bfloat16,
-            )
-        else:
-            shared_input = _dequantize_int8_activation(
-                shared_input,
-                shared_scales,
-                output_dtype=torch.bfloat16,
-            )
-            shared_output = experts._shared_experts(shared_input)
+        if shared_input.shape[0] > 0:
+            if shared_input.dtype == torch.int8 and quant_type == QuantType.W8A8:
+                shared_output = _compute_w8a8_shared_experts_from_int8(
+                    experts._shared_experts,
+                    shared_input,
+                    shared_scales,
+                    output_dtype=torch.bfloat16,
+                )
+            else:
+                shared_input = _dequantize_int8_activation(
+                    shared_input,
+                    shared_scales,
+                    output_dtype=torch.bfloat16,
+                )
+                shared_output = experts._shared_experts(shared_input)
 
-    routed_output, _ = unified_apply_mlp(
-        mlp_compute_input=MoEMlpComputeInput(
-            hidden_states=hidden_states,
-            group_list=group_list,
-            group_list_type=int(group_list_type),
-            dynamic_scale=dynamic_scales,
-            topk_scales=topk_scales,
-            weights=moe_weights,
-            quant=MoEQuantParams(quant_type=quant_type),
-            fusion=use_gmmswigluquant_fusion,
-            activation=experts.activation,
-            need_trans=False,
-            dynamic_eplb=experts.dynamic_eplb,
-        ),
-    )
+    if hidden_states.shape[0] == 0:
+        routed_output = hidden_states.to(dtype=torch.bfloat16)
+    else:
+        routed_output, _ = unified_apply_mlp(
+            mlp_compute_input=MoEMlpComputeInput(
+                hidden_states=hidden_states,
+                group_list=group_list,
+                group_list_type=int(group_list_type),
+                dynamic_scale=dynamic_scales,
+                topk_scales=topk_scales,
+                weights=moe_weights,
+                quant=MoEQuantParams(quant_type=quant_type),
+                fusion=use_gmmswigluquant_fusion,
+                activation=experts.activation,
+                need_trans=False,
+                dynamic_eplb=experts.dynamic_eplb,
+            ),
+        )
 
     if hidden_states.dtype != torch.float16:
         routed_output *= layer.mlp.routed_scaling_factor

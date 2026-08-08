@@ -18,9 +18,10 @@ control plane.
 The supported deployment requires ``async=true``, eager execution, Ascend CAM
 operator packages, and matching topology/configuration on every rank. vLLM
 native DBO, ACL graph execution, and decode are not supported.
-Optional AFD-managed MoE ubatching is a separate two-stage request-boundary
-pipeline. See ``docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md`` for configuration,
-rank derivation, launch guidance, and the full limitations.
+Optional AFD-managed MoE ubatching is a separate two-stage pipeline using
+request boundaries or token-balanced stages for DP+TP/SP. See
+``docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md`` for configuration, rank
+derivation, launch guidance, and the full limitations.
 """
 
 from __future__ import annotations
@@ -63,7 +64,9 @@ if TYPE_CHECKING:
 AFD_ASYNC_CAM_GROUP_NAME = "afd_async_cam"
 CAM_COMM_ID = 0
 ATTN_RANKS_PER_DP_CONFIG_KEY = "attn_ranks_per_dp"
+ASYNC_MOE_NUM_STAGES = 2
 ASYNC_MOE_REQUEST_SPLIT = "request"
+ASYNC_MOE_TOKEN_SPLIT = "token"
 
 _AFD_ASYNC_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
     {
@@ -85,15 +88,16 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
     Attributes:
         dynamic_quant: Dynamic quantization mode accepted by CAM operators.
         attn_ranks_per_dp: Number of Attention ranks in each data-parallel group.
-        async_moe_ubatching: Whether request-boundary async MoE ubatching is used.
+        async_moe_ubatching: Whether two-stage async MoE ubatching is used.
         async_moe_num_ubatches: Number of stages used by async MoE ubatching.
-        async_moe_split: Boundary at which async MoE work is split.
+        async_moe_split: ``"request"`` for request boundaries or ``"token"``
+            for token-balanced DP+TP/SP stages.
     """
 
     dynamic_quant: int = 0
     attn_ranks_per_dp: int = 1
     async_moe_ubatching: bool = False
-    async_moe_num_ubatches: int = 2
+    async_moe_num_ubatches: int = ASYNC_MOE_NUM_STAGES
     async_moe_split: str = ASYNC_MOE_REQUEST_SPLIT
 
     @classmethod
@@ -128,7 +132,7 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
                 field_name="async_moe_ubatching",
             ),
             async_moe_num_ubatches=coerce_extra_positive_int(
-                raw.get("async_moe_num_ubatches", 2),
+                raw.get("async_moe_num_ubatches", ASYNC_MOE_NUM_STAGES),
                 field_name="async_moe_num_ubatches",
             ),
             async_moe_split=coerce_extra_str(
@@ -926,6 +930,9 @@ __all__ = [
     "AFDAsyncFFNWorkItem",
     "AFDAsyncTopology",
     "ATTN_RANKS_PER_DP_CONFIG_KEY",
+    "ASYNC_MOE_NUM_STAGES",
+    "ASYNC_MOE_REQUEST_SPLIT",
+    "ASYNC_MOE_TOKEN_SPLIT",
     "CAM_COMM_ID",
     "build_async_topology",
 ]

@@ -5,6 +5,7 @@ import logging
 import sys
 import threading
 from collections import deque
+from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from types import ModuleType, SimpleNamespace
 
@@ -25,6 +26,29 @@ from afd_plugin.connectors import (
     AFDTransferMetadata,
     AFDTransferState,
 )
+
+
+@contextmanager
+def _temporarily_reimport_module(module_name: str) -> Iterator[ModuleType]:
+    """Reimport a module without leaking it through its parent package."""
+    package_name, _, module_attribute = module_name.rpartition(".")
+    package = importlib.import_module(package_name)
+    missing_attribute = object()
+    original_package_attribute = package.__dict__.get(
+        module_attribute,
+        missing_attribute,
+    )
+    original_module = sys.modules.pop(module_name, None)
+    try:
+        yield importlib.import_module(module_name)
+    finally:
+        sys.modules.pop(module_name, None)
+        if original_module is not None:
+            sys.modules[module_name] = original_module
+        if original_package_attribute is missing_attribute:
+            package.__dict__.pop(module_attribute, None)
+        else:
+            package.__dict__[module_attribute] = original_package_attribute
 
 
 def _ffn_payload(hidden_states, metadata, states=None):
@@ -177,6 +201,7 @@ def _parallel_config(**overrides):
         "use_ubatching": False,
         "num_ubatches": 1,
         "ubatch_size": 0,
+        "tensor_parallel_size": 1,
         "prefill_context_parallel_size": 1,
         "decode_context_parallel_size": 1,
         "dbo_decode_token_threshold": 1,
@@ -227,6 +252,31 @@ def _vllm_config(
             fast_moe_cold_start=False,
         ),
         speculative_config=speculative_config,
+    )
+
+
+def _async_moe_config(
+    *,
+    role="attention",
+    compute_gate_on_attention=True,
+    tensor_parallel_size=1,
+    prefill_context_parallel_size=1,
+    decode_context_parallel_size=1,
+    **extra_config,
+):
+    return _vllm_config(
+        role=role,
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=compute_gate_on_attention,
+        tensor_parallel_size=tensor_parallel_size,
+        prefill_context_parallel_size=prefill_context_parallel_size,
+        decode_context_parallel_size=decode_context_parallel_size,
+        extra_config={
+            "async_moe_ubatching": True,
+            "attn_ranks_per_dp": tensor_parallel_size,
+            **extra_config,
+        },
     )
 
 
@@ -746,10 +796,9 @@ def test_npu_request_boundary_ubatch_slices_balance_tokens(monkeypatch):
         fake_attention_utils,
     )
 
-    module_name = "afd_plugin.v1.worker.npu.ubatch_utils"
-    original_module = sys.modules.pop(module_name, None)
-    try:
-        ubatch_utils = importlib.import_module(module_name)
+    with _temporarily_reimport_module(
+        "afd_plugin.v1.worker.npu.ubatch_utils",
+    ) as ubatch_utils:
         slices = ubatch_utils.create_request_boundary_ubatch_slices(
             np.array([2, 3, 5, 7], dtype=np.int32),
         )
@@ -773,10 +822,277 @@ def test_npu_request_boundary_ubatch_slices_balance_tokens(monkeypatch):
             )
             is None
         )
-    finally:
-        sys.modules.pop(module_name, None)
-        if original_module is not None:
-            sys.modules[module_name] = original_module
+
+
+def test_npu_async_moe_metadata_tracks_stage_padding_separately(monkeypatch):
+    _require_npu_runtime()
+    torch = pytest.importorskip("torch")
+
+    from afd_plugin.model_executor.npu.async_cam_ubatching import AsyncMoeStage
+    from afd_plugin.v1.worker.npu import ubatch_utils
+
+    monkeypatch.setattr(
+        ubatch_utils,
+        "AscendCommonAttentionMetadata",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    parent = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 1, 1069], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 1069], dtype=torch.int32),
+        seq_lens=torch.tensor([10, 1068], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([10, 1068], dtype=torch.int32),
+        num_computed_tokens_cpu=torch.tensor([9, 0], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=1069,
+        max_query_len=1068,
+        max_seq_len=1068,
+        block_table_tensor=torch.zeros((2, 1), dtype=torch.int32),
+        slot_mapping=torch.arange(1069),
+        causal=True,
+        num_input_tokens=1069,
+        actual_seq_lengths_q=list(range(1, 1070)),
+        positions=torch.arange(1069),
+        attn_state=object(),
+        graph_pad_size=0,
+        decode_token_per_req=1,
+        kvcomp_metadata=None,
+        positions_cpu=None,
+        dcp_local_seq_lens=None,
+        dcp_local_seq_lens_cpu=None,
+        is_prefilling=None,
+        seq_lens_cpu_upper_bound=None,
+        mm_req_doc_ranges=None,
+        rswa_prefix_lens=None,
+        context_parallel_metadata=None,
+        group_len=None,
+        group_key_idx=None,
+        group_key_cache_idx=None,
+        encoder_seq_lens=None,
+        encoder_seq_lens_cpu=None,
+        logits_indices_padded=None,
+        num_logits_indices=0,
+    )
+
+    stages = ubatch_utils.split_async_moe_attn_metadata(
+        (
+            AsyncMoeStage(slice(0, 2), slice(0, 535), input_tokens=536),
+            AsyncMoeStage(slice(1, 2), slice(535, 1069), input_tokens=534),
+        ),
+        parent,
+    )
+
+    first, second = stages
+    assert (first.num_actual_tokens, first.num_input_tokens) == (535, 535)
+    assert first.query_start_loc_cpu.tolist() == [0, 1, 535]
+    assert first.seq_lens.tolist() == [10, 534]
+    assert first.slot_mapping[[0, -1]].tolist() == [0, 534]
+    assert first.positions[[0, -1]].tolist() == [0, 534]
+    assert first.num_input_tokens == first.slot_mapping.numel()
+    assert first.num_input_tokens == first.positions.shape[0]
+    assert (second.num_actual_tokens, second.num_input_tokens) == (534, 534)
+    assert second.query_start_loc_cpu.tolist() == [0, 534]
+    assert second.seq_lens.tolist() == [1068]
+    assert second.slot_mapping[[0, -1]].tolist() == [535, 1068]
+    assert second.num_input_tokens == second.slot_mapping.numel()
+    assert second.num_input_tokens == second.positions.shape[0]
+
+
+def test_npu_attention_runner_builds_stage_metadata(monkeypatch):
+    _require_npu_runtime()
+    import numpy as np
+    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+    from afd_plugin.connectors.npu.async_cam import AFDAsyncExtraInfo
+    from afd_plugin.model_executor.models.npu.async_cam_layout import (
+        AsyncMoeUbatchMetadata,
+    )
+    from afd_plugin.v1.worker.npu import attention_model_runner
+    from afd_plugin.v1.worker.npu.attention_model_runner import (
+        AFDNPUAttentionModelRunner,
+    )
+
+    runner = _new_attention_runner()
+    runner.vllm_config = _vllm_config(
+        role="attention",
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        tensor_parallel_size=2,
+        extra_config={
+            "async_moe_ubatching": True,
+            "async_moe_split": "token",
+        },
+    )
+    runner.connector = _AsyncRecordingConnector()
+    runner._is_warmup = False
+    runner._afd_is_graph_capturing = False
+    runner._afd_pending_metadata = None
+    runner._afd_transaction_counter = 0
+    runner.afd_async_extra_info = AFDAsyncExtraInfo(
+        async_moe_ubatching=True,
+        async_moe_split="token",
+    )
+
+    full_metadata = SimpleNamespace(name="full")
+    stage_attn_metadata = [{"layer": "stage-0"}, {"layer": "stage-1"}]
+    monkeypatch.setattr(
+        NPUModelRunner,
+        "_build_attention_metadata",
+        lambda self, *args, **kwargs: full_metadata,
+    )
+    stage_build_calls = []
+
+    def build_stage_metadata(self, *args, **kwargs):
+        stage_build_calls.append((args, kwargs))
+        return stage_attn_metadata, None
+
+    monkeypatch.setattr(
+        AFDNPUAttentionModelRunner,
+        "_build_attention_metadata_with_ubatches",
+        build_stage_metadata,
+    )
+    monkeypatch.setattr(
+        attention_model_runner,
+        "enable_sp",
+        lambda _config: True,
+    )
+    monkeypatch.setattr(
+        attention_model_runner,
+        "get_tensor_model_parallel_world_size",
+        lambda: 2,
+    )
+
+    result = runner._build_attention_metadata_with_async_moe_ubatches(
+        num_tokens=1099,
+        num_reqs=1,
+        max_query_len=1099,
+        num_tokens_padded=1100,
+        num_reqs_padded=1,
+        ubatch_slices=None,
+        logits_indices=None,
+        use_spec_decode=False,
+        for_cudagraph_capture=False,
+        num_scheduled_tokens=None,
+        num_scheduled_tokens_np=np.array([1099], dtype=np.int32),
+        cascade_attn_prefix_lens=None,
+    )
+
+    assert result is full_metadata
+    metadata = runner._afd_async_moe_ubatch_metadata
+    assert isinstance(metadata, AsyncMoeUbatchMetadata)
+    assert metadata.attn_metadata is stage_attn_metadata
+    assert metadata.use_sequence_parallel is True
+    assert metadata.parent_input_tokens == 1100
+    assert tuple(stage.actual_tokens for stage in metadata.stages) == (550, 549)
+    assert tuple(stage.input_tokens for stage in metadata.stages) == (550, 550)
+    assert [stage.request_slice for stage in metadata.stages] == [
+        slice(0, 1),
+        slice(0, 1),
+    ]
+    assert [stage.token_slice for stage in metadata.stages] == [
+        slice(0, 550),
+        slice(550, 1099),
+    ]
+    assert len(stage_build_calls) == 1
+    assert stage_build_calls[0][1]["metadata_builder_offset"] == 1
+    assert stage_build_calls[0][1]["async_moe_stages"] == metadata.stages
+
+
+def test_npu_attention_runner_uses_runtime_flashcomm_stage_layout():
+    _require_npu_runtime()
+
+    from afd_plugin.model_executor.models.npu.async_cam_layout import (
+        ASYNC_MOE_UBATCH_METADATA_KEY,
+        AsyncMoeUbatchMetadata,
+    )
+    from afd_plugin.model_executor.npu.async_cam_ubatching import AsyncMoeStage
+
+    runner = _new_attention_runner()
+    planned_metadata = AsyncMoeUbatchMetadata(
+        attn_metadata=[{"layer": "stage-0"}, {"layer": "stage-1"}],
+        stages=(
+            AsyncMoeStage(slice(0, 1), slice(0, 2), input_tokens=8),
+            AsyncMoeStage(slice(0, 1), slice(2, 8), input_tokens=8),
+        ),
+        parent_input_tokens=8,
+        use_sequence_parallel=True,
+    )
+    runner._afd_async_moe_ubatch_metadata = planned_metadata
+
+    sp_context = SimpleNamespace(
+        flash_comm_v1_enabled=True,
+        additional_kwargs={},
+    )
+    runner._install_async_moe_ubatch_metadata_on_forward_context(sp_context)
+    assert (
+        sp_context.additional_kwargs[ASYNC_MOE_UBATCH_METADATA_KEY] is planned_metadata
+    )
+
+    replicated_context = SimpleNamespace(
+        flash_comm_v1_enabled=False,
+        additional_kwargs={},
+    )
+    runner._install_async_moe_ubatch_metadata_on_forward_context(
+        replicated_context,
+    )
+    runtime_metadata = replicated_context.additional_kwargs[
+        ASYNC_MOE_UBATCH_METADATA_KEY
+    ]
+    assert runtime_metadata.use_sequence_parallel is False
+    assert tuple(stage.actual_tokens for stage in runtime_metadata.stages) == (2, 6)
+    assert tuple(stage.input_tokens for stage in runtime_metadata.stages) == (2, 6)
+    assert runtime_metadata.attn_metadata is planned_metadata.attn_metadata
+
+
+def test_npu_attention_runner_async_moe_allocates_three_metadata_builders(
+    monkeypatch,
+):
+    _require_npu_runtime()
+    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+    from afd_plugin.connectors.npu.async_cam import AFDAsyncExtraInfo
+
+    runner = _new_attention_runner()
+    runner.vllm_config = _vllm_config(
+        role="attention",
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        tensor_parallel_size=2,
+        extra_config={
+            "async_moe_ubatching": True,
+            "async_moe_split": "token",
+        },
+    )
+    runner.afd_async_extra_info = AFDAsyncExtraInfo(
+        async_moe_ubatching=True,
+        async_moe_split="token",
+    )
+    runner.device = object()
+    create_calls = []
+    attn_group = SimpleNamespace(metadata_builders=[object()])
+
+    def create_metadata_builders(
+        vllm_config,
+        device,
+        *,
+        num_metadata_builders,
+    ):
+        assert vllm_config is runner.vllm_config
+        assert device is runner.device
+        create_calls.append(num_metadata_builders)
+        attn_group.metadata_builders = [object()] * num_metadata_builders
+
+    attn_group.create_metadata_builders = create_metadata_builders
+    runner.attn_groups = [[attn_group]]
+    initialized = object()
+    monkeypatch.setattr(
+        NPUModelRunner,
+        "initialize_attn_backend",
+        lambda self, *args, **kwargs: initialized,
+    )
+
+    assert runner.initialize_attn_backend() is initialized
+    assert create_calls == [3]
+    assert len(attn_group.metadata_builders) == 3
 
 
 def test_npu_create_ascend_forward_context_marks_current_ubatch(monkeypatch):
@@ -1682,13 +1998,23 @@ def test_npu_async_feature_validation_requires_async_config_and_eager():
         fail_if_unsupported_npu_afd_features(config)
 
 
-def test_npu_async_feature_validation_rejects_ubatching():
-    with pytest.raises(RuntimeError, match="ubatching"):
+@pytest.mark.parametrize(
+    ("parallel_override", "error"),
+    [
+        ({"use_ubatching": True}, "ubatching"),
+        ({"enable_dbo": True}, "DBO"),
+    ],
+)
+def test_npu_async_feature_validation_rejects_native_ubatching(
+    parallel_override,
+    error,
+):
+    with pytest.raises(RuntimeError, match=error):
         fail_if_unsupported_npu_afd_features(
             _vllm_config(
                 connector="CAMAsyncAFDConnector",
                 async_dp=True,
-                use_ubatching=True,
+                **parallel_override,
             ),
         )
 
@@ -1712,65 +2038,71 @@ def test_npu_async_feature_validation_allows_dynamic_quant_zero_or_one():
         )
 
 
-def test_npu_async_moe_ubatching_validation_requires_supported_shape():
-    fail_if_unsupported_npu_afd_features(
-        _vllm_config(
-            connector="CAMAsyncAFDConnector",
-            async_dp=True,
-            compute_gate_on_attention=True,
-            extra_config={
-                "async_moe_ubatching": True,
-            },
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param(_async_moe_config(), id="request-tp1"),
+        pytest.param(
+            _async_moe_config(
+                tensor_parallel_size=2,
+                async_moe_split="token",
+            ),
+            id="token-attention-tp2",
         ),
-    )
+        pytest.param(
+            _async_moe_config(role="ffn", async_moe_split="token"),
+            id="token-ffn-tp1",
+        ),
+    ],
+)
+def test_npu_async_moe_ubatching_validation_accepts_supported_shape(config):
+    fail_if_unsupported_npu_afd_features(config)
 
-    with pytest.raises(RuntimeError, match="compute_gate_on_attention"):
-        fail_if_unsupported_npu_afd_features(
-            _vllm_config(
-                connector="CAMAsyncAFDConnector",
-                async_dp=True,
-                extra_config={"async_moe_ubatching": True},
-            ),
-        )
 
-    with pytest.raises(RuntimeError, match="exactly two"):
-        fail_if_unsupported_npu_afd_features(
-            _vllm_config(
-                connector="CAMAsyncAFDConnector",
-                async_dp=True,
-                compute_gate_on_attention=True,
-                extra_config={
-                    "async_moe_ubatching": True,
-                    "async_moe_num_ubatches": 3,
-                },
+@pytest.mark.parametrize(
+    ("config", "error"),
+    [
+        pytest.param(
+            _async_moe_config(compute_gate_on_attention=False),
+            "compute_gate_on_attention",
+            id="missing-attention-gate",
+        ),
+        pytest.param(
+            _async_moe_config(async_moe_num_ubatches=3),
+            "exactly two",
+            id="three-stages",
+        ),
+        pytest.param(
+            _async_moe_config(async_moe_split="token"),
+            "TP/SP",
+            id="token-attention-tp1",
+        ),
+        pytest.param(
+            _async_moe_config(decode_context_parallel_size=2),
+            "context parallel",
+            id="decode-context-parallel",
+        ),
+        pytest.param(
+            _async_moe_config(prefill_context_parallel_size=2),
+            "context parallel",
+            id="prefill-context-parallel",
+        ),
+        pytest.param(
+            _async_moe_config(
+                tensor_parallel_size=2,
+                attn_ranks_per_dp=1,
             ),
-        )
-
-    with pytest.raises(RuntimeError, match="request-boundary"):
-        fail_if_unsupported_npu_afd_features(
-            _vllm_config(
-                connector="CAMAsyncAFDConnector",
-                async_dp=True,
-                compute_gate_on_attention=True,
-                extra_config={
-                    "async_moe_ubatching": True,
-                    "async_moe_split": "token",
-                },
-            ),
-        )
-
-    with pytest.raises(RuntimeError, match="decode context parallel"):
-        fail_if_unsupported_npu_afd_features(
-            _vllm_config(
-                connector="CAMAsyncAFDConnector",
-                async_dp=True,
-                compute_gate_on_attention=True,
-                decode_context_parallel_size=2,
-                extra_config={
-                    "async_moe_ubatching": True,
-                },
-            ),
-        )
+            "attn_ranks_per_dp",
+            id="attention-cam-tp-mismatch",
+        ),
+    ],
+)
+def test_npu_async_moe_ubatching_validation_rejects_unsupported_shape(
+    config,
+    error,
+):
+    with pytest.raises(RuntimeError, match=error):
+        fail_if_unsupported_npu_afd_features(config)
 
 
 def test_npu_ubatch_enabled_when_thresholds_are_met(monkeypatch):
@@ -1827,10 +2159,9 @@ def test_npu_ubatch_enabled_when_thresholds_are_met(monkeypatch):
         fake_attention_utils,
     )
 
-    module_name = "afd_plugin.v1.worker.npu.ubatch_utils"
-    original_module = sys.modules.pop(module_name, None)
-    try:
-        ubatch_utils = importlib.import_module(module_name)
+    with _temporarily_reimport_module(
+        "afd_plugin.v1.worker.npu.ubatch_utils",
+    ) as ubatch_utils:
         config = _vllm_config(
             enable_dbo=True,
             use_ubatching=True,
@@ -1852,10 +2183,6 @@ def test_npu_ubatch_enabled_when_thresholds_are_met(monkeypatch):
             uniform_decode=True,
             vllm_config=config,
         )
-    finally:
-        sys.modules.pop(module_name, None)
-        if original_module is not None:
-            sys.modules[module_name] = original_module
 
 
 def _tokens(dp_metadata):
