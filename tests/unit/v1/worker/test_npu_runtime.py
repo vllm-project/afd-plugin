@@ -585,6 +585,7 @@ def test_npu_attention_runner_builds_and_sets_metadata():
         dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=torch.tensor([1])),
         ubatch_slices=None,
         batch_descriptor=SimpleNamespace(num_tokens=5),
+        cudagraph_runtime_mode=None,
     )
 
     runner._install_afd_metadata_on_forward_context(forward_context)
@@ -924,6 +925,7 @@ def test_npu_attention_runner_builds_stage_metadata(monkeypatch):
     runner._afd_is_graph_capturing = False
     runner._afd_pending_metadata = None
     runner._afd_transaction_counter = 0
+    runner.ubatch_slices = None
     runner.afd_async_extra_info = AFDAsyncExtraInfo(
         async_moe_ubatching=True,
         async_moe_split="token",
