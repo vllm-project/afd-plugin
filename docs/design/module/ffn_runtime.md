@@ -115,9 +115,12 @@ vLLM worker construction
 FFN does not own request KV blocks. Both workers return an empty KV-cache spec,
 and both runners no-op KV-cache initialization. `compile_or_warm_up_model()`
 returns `0.0`; warmup and graph capture, when supported, are driven later by
-connector metadata. The EngineCore compatibility patch keeps FFN daemon mode
-out of upstream scheduler/KV-cache startup assumptions and selects the daemon
-busy loop. See [compatibility and patches](compatibility_and_patches.md).
+connector metadata. Because the FFN EngineCore skips that upstream warmup path,
+the NPU worker performs vLLM-Ascend's CPU-binding step once immediately before
+starting its connector daemon when `enable_cpu_binding` is enabled. The
+EngineCore compatibility patch keeps FFN daemon mode out of upstream
+scheduler/KV-cache startup assumptions and selects the daemon busy loop. See
+[compatibility and patches](compatibility_and_patches.md).
 
 The worker owns the daemon thread, shutdown event, and captured loop error.
 The model runner owns the model, connector, profiler, and graph cache. The

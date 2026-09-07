@@ -465,6 +465,9 @@ def _new_ffn_worker():
 
     worker = object.__new__(AFDNPUFFNWorker)
     worker._ffn_loop_error = None
+    # Most tests exercise the daemon loop rather than CPU placement. Tests for
+    # the startup binding path explicitly reset this guard.
+    worker._cpu_binding_attempted = True
     return worker
 
 
@@ -1897,6 +1900,118 @@ def test_npu_ffn_worker_reports_zero_compilation_times():
 
     assert compilation_times.language_model == 0.0
     assert compilation_times.encoder == 0.0
+
+
+@pytest.mark.parametrize("enable_cpu_binding", [False, True])
+def test_npu_ffn_worker_start_binds_physical_npu_once_before_daemon(
+    monkeypatch,
+    enable_cpu_binding,
+):
+    from afd_plugin.v1.worker.npu import ffn_worker
+
+    worker = _new_ffn_worker()
+    worker._cpu_binding_attempted = False
+    worker._ffn_thread = None
+    worker.local_rank = 3
+    worker.model_runner = SimpleNamespace(
+        connector=SimpleNamespace(is_initialized=True),
+    )
+    events: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        ffn_worker,
+        "get_ascend_config",
+        lambda: SimpleNamespace(enable_cpu_binding=enable_cpu_binding),
+    )
+    monkeypatch.setattr(
+        ffn_worker,
+        "current_platform",
+        SimpleNamespace(
+            device_id_to_physical_device_id=lambda rank: (
+                events.append(("map", rank)) or 11
+            ),
+        ),
+    )
+
+    def record_binding(rank, *, npu_id):
+        events.append(("bind", (rank, npu_id)))
+
+    class _NonRunningThread:
+        def __init__(self, *, target, name, daemon):
+            events.append(("thread", (target, name, daemon)))
+
+        def start(self):
+            events.append(("start", None))
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(ffn_worker, "bind_cpus", record_binding)
+    monkeypatch.setattr(ffn_worker.threading, "Thread", _NonRunningThread)
+
+    worker.start_ffn_server_loop()
+    worker.start_ffn_server_loop()
+
+    binding_events = [event for event in events if event[0] in ("map", "bind")]
+    expected_binding_events = (
+        [("map", 3), ("bind", (3, 11))] if enable_cpu_binding else []
+    )
+    assert binding_events == expected_binding_events
+    first_thread_index = next(
+        i for i, event in enumerate(events) if event[0] == "thread"
+    )
+    if enable_cpu_binding:
+        assert events.index(("bind", (3, 11))) < first_thread_index
+    assert sum(event[0] == "start" for event in events) == 2
+
+
+def test_npu_ffn_worker_cpu_binding_failure_does_not_abort_daemon_start(
+    monkeypatch,
+    caplog,
+):
+    from afd_plugin.v1.worker.npu import ffn_worker
+
+    worker = _new_ffn_worker()
+    worker._cpu_binding_attempted = False
+    worker._ffn_thread = None
+    worker.local_rank = 5
+    worker.model_runner = SimpleNamespace(
+        connector=SimpleNamespace(is_initialized=True),
+    )
+    thread_starts: list[bool] = []
+    monkeypatch.setattr(
+        ffn_worker,
+        "get_ascend_config",
+        lambda: SimpleNamespace(enable_cpu_binding=True),
+    )
+    monkeypatch.setattr(
+        ffn_worker,
+        "current_platform",
+        SimpleNamespace(device_id_to_physical_device_id=lambda _rank: 13),
+    )
+
+    def fail_binding(_local_rank, *, npu_id):
+        raise RuntimeError("binding unavailable")
+
+    class _NonRunningThread:
+        def __init__(self, *, target, name, daemon):
+            pass
+
+        def start(self):
+            thread_starts.append(True)
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(ffn_worker, "bind_cpus", fail_binding)
+    monkeypatch.setattr(ffn_worker.threading, "Thread", _NonRunningThread)
+
+    with caplog.at_level(logging.WARNING, logger=ffn_worker.__name__):
+        worker.start_ffn_server_loop()
+        worker.start_ffn_server_loop()
+
+    assert thread_starts == [True, True]
+    assert "Bind cpus failed in rank5: binding unavailable" in caplog.text
+    assert caplog.text.count("Bind cpus failed") == 1
 
 
 def test_npu_ffn_worker_loop_error_is_propagated(caplog):
