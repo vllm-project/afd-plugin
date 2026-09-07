@@ -1922,13 +1922,16 @@ def test_npu_ffn_worker_start_binds_physical_npu_once_before_daemon(
         "get_ascend_config",
         lambda: SimpleNamespace(enable_cpu_binding=enable_cpu_binding),
     )
+
+    def map_physical_npu(rank):
+        events.append(("map", rank))
+        return 11
+
     monkeypatch.setattr(
         ffn_worker,
         "current_platform",
         SimpleNamespace(
-            device_id_to_physical_device_id=lambda rank: (
-                events.append(("map", rank)) or 11
-            ),
+            device_id_to_physical_device_id=map_physical_npu,
         ),
     )
 
