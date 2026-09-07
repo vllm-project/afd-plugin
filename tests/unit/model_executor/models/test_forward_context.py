@@ -193,8 +193,49 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
         flash_comm_v1_enabled=True,
     )
     monkeypatch.setattr(async_forward, "get_forward_context", lambda: forward_context)
+    monkeypatch.setattr(
+        async_forward,
+        "maybe_apply_dbo_yield",
+        lambda hidden_states, **_kwargs: hidden_states,
+    )
 
     connector_calls: list[str] = []
+    dispatch_layouts: list[object] = []
+    restored_layouts: list[object] = []
+
+    def prepare_dispatch_payload(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        router_logits,
+        *,
+        use_sequence_parallel,
+    ):
+        assert use_sequence_parallel is True
+        layout = object()
+        dispatch_layouts.append(layout)
+        return SimpleNamespace(
+            hidden_states=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            router_logits=router_logits,
+            layout=layout,
+        )
+
+    def restore_dispatch_output(local_output, layout):
+        restored_layouts.append(layout)
+        return local_output
+
+    monkeypatch.setattr(
+        async_forward,
+        "prepare_cam_dispatch_payload",
+        prepare_dispatch_payload,
+    )
+    monkeypatch.setattr(
+        async_forward,
+        "restore_cam_dispatch_output",
+        restore_dispatch_output,
+    )
 
     def send_attn_output(*args, **kwargs):
         connector_calls.append("send")
@@ -247,6 +288,7 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
     assert torch.equal(output, hidden_states + 2)
     assert residual is None
     assert connector_calls == ["send", "recv", "send", "recv"]
+    assert restored_layouts == dispatch_layouts
 
 
 def test_deepseek_afd_wrapper_keeps_full_model_compile_enabled():

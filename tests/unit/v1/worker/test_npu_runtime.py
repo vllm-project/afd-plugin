@@ -236,6 +236,8 @@ def _vllm_config(
     compute_gate_on_attention = bool(
         parallel_overrides.pop("compute_gate_on_attention", False),
     )
+    num_attention_ranks = int(parallel_overrides.pop("num_attention_ranks", 1))
+    num_ffn_ranks = int(parallel_overrides.pop("num_ffn_ranks", 1))
     return SimpleNamespace(
         additional_config={
             "afd": {
@@ -243,6 +245,8 @@ def _vllm_config(
                 "connector": connector,
                 "async": async_dp,
                 "compute_gate_on_attention": compute_gate_on_attention,
+                "num_attention_ranks": num_attention_ranks,
+                "num_ffn_ranks": num_ffn_ranks,
                 "connector_extra_config": extra_config or {},
             },
         },
@@ -269,6 +273,8 @@ def _async_moe_config(
     *,
     role="attention",
     compute_gate_on_attention=True,
+    num_attention_ranks=1,
+    num_ffn_ranks=1,
     tensor_parallel_size=1,
     prefill_context_parallel_size=1,
     decode_context_parallel_size=1,
@@ -279,6 +285,8 @@ def _async_moe_config(
         connector="CAMAsyncAFDConnector",
         async_dp=True,
         compute_gate_on_attention=compute_gate_on_attention,
+        num_attention_ranks=num_attention_ranks,
+        num_ffn_ranks=num_ffn_ranks,
         tensor_parallel_size=tensor_parallel_size,
         prefill_context_parallel_size=prefill_context_parallel_size,
         decode_context_parallel_size=decode_context_parallel_size,
@@ -2271,6 +2279,7 @@ def test_npu_async_feature_validation_allows_dynamic_quant_zero_or_one():
         pytest.param(
             _async_moe_config(
                 tensor_parallel_size=2,
+                num_attention_ranks=2,
                 async_moe_split="token",
             ),
             id="token-attention-tp2",
