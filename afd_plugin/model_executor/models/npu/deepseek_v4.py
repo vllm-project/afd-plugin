@@ -299,6 +299,9 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
                 dynamic_scales_shared=dynamic_scales_shared,
                 topk_scales=topk_scales,
                 group_list_type=group_list_type,
+                # DSV4's Attention-side CANN gate folds routed scaling into
+                # topk_weights, which CAM applies during combine-recv.
+                routed_scale_applied_in_topk=True,
             )
         return self.mlp(hidden_states)
 

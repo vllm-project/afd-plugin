@@ -619,10 +619,16 @@ def test_deepseek_afd_ffn_path_reuses_ascend_moe_mlp_after_attention_gate():
     ("num_routed_tokens", "num_shared_tokens"),
     [(2, 2), (2, 0), (0, 2), (0, 0)],
 )
+@pytest.mark.parametrize(
+    ("routed_scale_applied_in_topk", "expected_routed_value"),
+    [(False, 2.0), (True, 1.0)],
+)
 def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
     monkeypatch,
     num_routed_tokens,
     num_shared_tokens,
+    routed_scale_applied_in_topk,
+    expected_routed_value,
 ):
     from afd_plugin.model_executor.models.npu import deepseek_v2_attention_gate
 
@@ -639,7 +645,7 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
     def fake_unified_apply_mlp(*, mlp_compute_input):
         routed_calls.append(mlp_compute_input.hidden_states)
         return (
-            torch.zeros_like(
+            torch.ones_like(
                 mlp_compute_input.hidden_states,
                 dtype=torch.bfloat16,
             ),
@@ -717,7 +723,7 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
     layer = SimpleNamespace(
         mlp=SimpleNamespace(
             experts=experts,
-            routed_scaling_factor=1.0,
+            routed_scaling_factor=2.0,
         ),
     )
     hidden_states = torch.zeros((num_routed_tokens, 4), dtype=torch.int8)
@@ -732,11 +738,17 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
         dynamic_scales_shared=torch.ones(num_shared_tokens),
         topk_scales=None,
         group_list_type=1,
+        routed_scale_applied_in_topk=routed_scale_applied_in_topk,
     )
 
     assert len(routed_calls) == int(num_routed_tokens > 0)
     assert output.routed_output.shape == hidden_states.shape
     assert output.routed_output.dtype == torch.bfloat16
+    if num_routed_tokens > 0:
+        assert torch.equal(
+            output.routed_output,
+            torch.full_like(output.routed_output, expected_routed_value),
+        )
     assert len(shared_calls) == int(num_shared_tokens > 0)
     if num_shared_tokens > 0:
         assert output.shared_output is not None

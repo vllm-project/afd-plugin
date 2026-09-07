@@ -367,31 +367,37 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
                 "AFD async CAM FFN work item requires "
                 "TokenNums_Rankid_Layeridx from async_dispatch_recv",
             )
-        total_num_tokens = max(1, int(token_nums_rankid_layeridx[0].item()))
-        # A zero in the header's leading count is valid for an FFN rank that
-        # received no routed tokens in this dispatch.  Such ranks must still
-        # enter combine-send (the zero-token fallback below supplies its
-        # placeholder) so every participant completes the CAM collective.
-        layer_idx = int(token_nums_rankid_layeridx[2].item())
-
         expert_token_nums_shared = states.expert_token_nums_shared
         if expert_token_nums_shared is None:
             raise RuntimeError(
                 "AFD async CAM FFN work item requires "
                 "expert_token_nums_shared from async_dispatch_recv",
             )
-        shared_num_tokens = max(0, int(expert_token_nums_shared[0].item()))
-
         expert_token_nums = states.group_list
         if expert_token_nums is None:
             raise RuntimeError(
                 "AFD async CAM FFN work item requires expert_token_nums "
                 "from async_dispatch_recv",
             )
-        num_tokens = max(
-            0,
-            int(expert_token_nums.to(torch.int64).sum().item()),
+        # Pack the CAM control fields before crossing to the host. Python needs
+        # the layer and slice lengths, but four separate scalar D2H reads are
+        # unnecessary. Keep the original header untouched for combine-send.
+        control = torch.stack(
+            (
+                token_nums_rankid_layeridx[0].to(torch.int64),
+                token_nums_rankid_layeridx[2].to(torch.int64),
+                expert_token_nums_shared[0].to(torch.int64),
+                expert_token_nums.sum(dtype=torch.int64),
+            ),
         )
+        total_num_tokens, layer_idx, shared_num_tokens, num_tokens = (
+            control.cpu().tolist()
+        )
+        # Zero routed work is valid; those ranks still participate in
+        # combine-send using the existing BF16 placeholder path.
+        total_num_tokens = max(1, total_num_tokens)
+        shared_num_tokens = max(0, shared_num_tokens)
+        num_tokens = max(0, num_tokens)
 
         metadata.layer_idx = layer_idx
         metadata.stage_idx = stage_idx

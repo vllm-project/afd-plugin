@@ -38,3 +38,11 @@ def test_dsv4_async_gate_validates_local_hash_token_alignment() -> None:
     assert "split_tensor_along_first_dim(" in source
     assert "num_partitions=tp_group.world_size" in source
     assert ")[tp_group.rank_in_group]" in source
+
+
+def test_dsv4_ffn_does_not_reapply_gate_routed_scale() -> None:
+    source = Path(
+        "afd_plugin/model_executor/models/npu/deepseek_v4.py",
+    ).read_text()
+
+    assert "routed_scale_applied_in_topk=True" in source

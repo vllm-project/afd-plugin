@@ -111,8 +111,15 @@ def compute_attention_gate_moe_ffn(
     dynamic_scales_shared: torch.Tensor | None,
     topk_scales: torch.Tensor | None,
     group_list_type: int,
+    routed_scale_applied_in_topk: bool = False,
 ) -> AFDF2ATransferPayload:
-    """Compute FFN output for MoE layers whose gate ran on Attention ranks."""
+    """Compute FFN output for MoE layers whose gate ran on Attention ranks.
+
+    ``routed_scale_applied_in_topk`` records whether the Attention-side gate
+    already folded ``routed_scaling_factor`` into the weights consumed by CAM
+    combine. In that case, scaling every rank-local expert row here would
+    apply the factor twice.
+    """
 
     from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
     from vllm_ascend.ops.fused_moe.moe_stage_contracts import (
@@ -218,10 +225,11 @@ def compute_attention_gate_moe_ffn(
             ),
         )
 
-    if hidden_states.dtype != torch.float16:
-        routed_output *= layer.mlp.routed_scaling_factor
-    elif shared_output is not None:
-        shared_output *= 1.0 / layer.mlp.routed_scaling_factor
+    if not routed_scale_applied_in_topk:
+        if hidden_states.dtype != torch.float16:
+            routed_output *= layer.mlp.routed_scaling_factor
+        elif shared_output is not None:
+            shared_output *= 1.0 / layer.mlp.routed_scaling_factor
 
     return AFDF2ATransferPayload(
         routed_output=routed_output,

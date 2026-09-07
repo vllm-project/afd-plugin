@@ -26,6 +26,7 @@ def ascend_forward_context(
     num_tokens_across_dp: torch.Tensor | None = None,
     in_profile_run: bool = False,
     aclgraph_runtime_mode: CUDAGraphMode | None = None,
+    skip_mc2_mask: bool = False,
 ) -> Iterator[ForwardContext]:
     """Create the minimal forward context needed by connector-driven FFN steps."""
 
@@ -75,6 +76,8 @@ def ascend_forward_context(
         in_profile_run=in_profile_run,
     ):
         forward_context = get_forward_context()
+        if skip_mc2_mask:
+            forward_context.mc2_mask = None
         if forward_context.additional_kwargs is None:
             forward_context.additional_kwargs = {}
         forward_context.additional_kwargs["afd_metadata"] = afd_metadata

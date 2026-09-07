@@ -1587,6 +1587,7 @@ def test_npu_ffn_connector_driven_uses_cam_layer_and_token_metadata(monkeypatch)
     ]
     assert sent_outputs == [(work_item, "npu-ffn(hidden[:5], layer=7)")]
     assert context_calls[0]["num_tokens"] == 5
+    assert context_calls[0]["skip_mc2_mask"] is True
     assert context_calls[0]["afd_metadata"].tokens_lens == [5]
 
 
@@ -2461,6 +2462,57 @@ def _fake_npu_connector_factory(monkeypatch, connector):
         "create_connector",
         lambda rank, local_rank, vllm_config, afd_config: connector,
     )
+
+
+@pytest.mark.parametrize(
+    ("is_cam", "compute_gate", "use_mrv2"),
+    [
+        (True, True, False),
+        (False, True, False),
+        (True, False, False),
+        (True, True, True),
+    ],
+)
+def test_npu_ffn_runner_disables_mask_only_for_cam_mrv1(
+    monkeypatch, is_cam, compute_gate, use_mrv2
+):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_model_runner as module
+
+    mask = object()
+    monkeypatch.setattr(module.ascend_context, "_reserved_mc2_mask", mask)
+
+    def fake_native_init(self, vllm_config, device):
+        self.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(num_hidden_layers=1)
+        )
+        module.ascend_context._reserved_mc2_mask = mask
+
+    connector = object.__new__(module.CAMAsyncAFDConnector) if is_cam else object()
+    monkeypatch.setattr(module.NPUModelRunner, "__init__", fake_native_init)
+    monkeypatch.setattr(
+        module, "fail_if_unsupported_npu_afd_features", lambda *a, **k: None
+    )
+    monkeypatch.setattr(module, "_resolve_world_ranks", lambda: (0, 0))
+    monkeypatch.setattr(module, "_use_npu_aclgraph", lambda *a: False)
+    monkeypatch.setattr(module, "create_afd_npu_profiler", lambda *a: None)
+    monkeypatch.setattr(
+        module.AFDConnectorFactory, "create_connector", lambda *a: connector
+    )
+    monkeypatch.setattr(
+        module.AFDNPUFFNModelRunner,
+        "parse_config",
+        staticmethod(
+            lambda config: SimpleNamespace(compute_gate_on_attention=compute_gate)
+        ),
+    )
+
+    module.AFDNPUFFNModelRunner(
+        SimpleNamespace(use_v2_model_runner=use_mrv2), SimpleNamespace(index=0)
+    )
+
+    expected = None if is_cam and compute_gate and not use_mrv2 else mask
+    assert module.ascend_context._reserved_mc2_mask is expected
 
 
 def test_npu_attention_runner_constructor_does_not_initialize_connector(monkeypatch):

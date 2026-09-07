@@ -35,32 +35,6 @@ from afd_plugin.connectors.npu.async_cam import (  # noqa: E402
 )
 
 
-class _FakeScalar:
-    def __init__(self, value):
-        self._value = int(value)
-
-    def item(self):
-        return self._value
-
-
-class _FakeIntVector:
-    """Stands in for a token-count tensor in fake-torch tests.
-
-    Supports the ``.to(dtype).sum().item()`` chain the connector applies to
-    ``group_list``; ``.to()`` is a no-op so the fake torch's string dtypes
-    cannot leak into a real tensor API.
-    """
-
-    def __init__(self, values):
-        self._values = [int(value) for value in values]
-
-    def to(self, _dtype):
-        return self
-
-    def sum(self):
-        return _FakeScalar(sum(self._values))
-
-
 class _FakeTensorLike:
     def __init__(self, name, *, shape=None, device="npu:0"):
         self.name = name
@@ -570,12 +544,8 @@ def test_async_ffn_work_item_uses_cam_layer_and_token_metadata(monkeypatch):
             hidden_size=connector.hidden_size,
             topk=connector.topk,
             layer_idx=layer_idx,
-            token_nums_rankid_layeridx=[
-                _FakeScalar(7),
-                _FakeScalar(0),
-                _FakeScalar(11),
-            ],
-            expert_token_nums_shared=[_FakeScalar(2)],
+            token_nums_rankid_layeridx=torch.tensor([7, 0, 11], dtype=torch.int64),
+            expert_token_nums_shared=torch.tensor([2], dtype=torch.int64),
             group_list=torch.tensor([2, 3], dtype=torch.int64),
             dynamic_scales=_FakeTensorLike("scales"),
             expand_x_shared=_FakeTensorLike("shared-hidden"),
@@ -637,12 +607,8 @@ def test_async_ffn_work_item_uses_expert_counts_for_routed_tokens(monkeypatch):
             hidden_size=connector.hidden_size,
             topk=connector.topk,
             layer_idx=layer_idx,
-            token_nums_rankid_layeridx=[
-                _FakeScalar(6),
-                _FakeScalar(0),
-                _FakeScalar(23),
-            ],
-            expert_token_nums_shared=[_FakeScalar(0)],
+            token_nums_rankid_layeridx=torch.tensor([6, 0, 23], dtype=torch.int64),
+            expert_token_nums_shared=torch.tensor([0], dtype=torch.int64),
             group_list=group_list,
             expand_x_shared=_FakeTensorLike("shared-hidden"),
             dynamic_scales_shared=_FakeTensorLike("shared-scales"),
@@ -674,7 +640,8 @@ def test_async_send_ffn_work_item_output_preserves_all_shared_passthrough(
     monkeypatch,
 ):
     fake_torch = _FakeTorch()
-    monkeypatch.setattr(async_cam_module, "torch", fake_torch)
+    # Keep real CPU control tensors; only the NPU placeholder allocation is fake.
+    monkeypatch.setattr(async_cam_module.torch, "zeros", fake_torch.zeros)
     connector = CAMAsyncAFDConnector(
         0,
         0,
@@ -700,13 +667,9 @@ def test_async_send_ffn_work_item_output_preserves_all_shared_passthrough(
             hidden_size=connector.hidden_size,
             topk=connector.topk,
             layer_idx=layer_idx,
-            token_nums_rankid_layeridx=[
-                _FakeScalar(5),
-                _FakeScalar(0),
-                _FakeScalar(7),
-            ],
-            expert_token_nums_shared=[_FakeScalar(5)],
-            group_list=_FakeIntVector([0] * 8),
+            token_nums_rankid_layeridx=torch.tensor([5, 0, 7], dtype=torch.int64),
+            expert_token_nums_shared=torch.tensor([5], dtype=torch.int64),
+            group_list=torch.tensor([0] * 8, dtype=torch.int64),
             expand_x_shared=_FakeTensorLike("shared-hidden"),
             dynamic_scales_shared=_FakeTensorLike("shared-scales"),
         )
@@ -739,7 +702,7 @@ def test_async_send_ffn_work_item_output_preserves_all_shared_passthrough(
     assert isinstance(sent_output, AFDF2ATransferPayload)
     assert sent_output.shared_output == "computed-shared"
     assert sent_output.routed_output.shape == (1, 16)
-    assert sent_output.routed_output.dtype == fake_torch.bfloat16
+    assert sent_output.routed_output.dtype == torch.bfloat16
     assert sent_outputs == [
         (
             sent_output.routed_output,
