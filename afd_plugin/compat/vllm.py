@@ -9,7 +9,7 @@ import warnings
 from importlib.metadata import PackageNotFoundError, version
 from typing import Final
 
-TARGET_VLLM_VERSION: Final[str] = "0.26.0"
+TARGET_VLLM_VERSION: Final[str] = "0.28.0"
 
 
 def _parse_release(value: str) -> tuple[int, int, int]:

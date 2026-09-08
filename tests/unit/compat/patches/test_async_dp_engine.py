@@ -56,7 +56,7 @@ def _config(
 
 def _install_fake_vllm_engine(monkeypatch: pytest.MonkeyPatch):
     vllm_module = types.ModuleType("vllm")
-    vllm_module.__version__ = "0.26.0"
+    vllm_module.__version__ = "0.28.0"
     vllm_v1_module = types.ModuleType("vllm.v1")
     engine_module = types.ModuleType("vllm.v1.engine")
     coordinator_module = types.ModuleType("vllm.v1.engine.coordinator")
