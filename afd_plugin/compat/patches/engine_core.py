@@ -8,9 +8,10 @@ initialization returns before KV cache and scheduler setup. This keeps FFN
 startup out of HybridKVCacheCoordinator.
 
 AFD async-DP Attention uses the regular ``EngineCoreProc`` to avoid vLLM's
-synchronous DP-wave loop. The regular vLLM 0.26.0 loop does not publish the
-request counts needed by native DPLB, so this patch reports changed scheduler
-counts without adding wave coordination or cross-DP collectives.
+synchronous DP-wave loop; see the async-DP engine patch for the constructor
+selection. vLLM 0.28.0 publishes DP load-balancer request counts from the base
+busy loop itself, so the AFD async-Attention publication loop that existed for
+vLLM 0.26.0 is no longer needed here.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 import vllm.v1.engine.core as core_module
 
-from afd_plugin.config import AFDConfig, is_afd_async_dp, parse_optional_afd_config
+from afd_plugin.config import AFDConfig, parse_optional_afd_config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -76,6 +77,8 @@ def __init__(
         )
 
     self.log_stats = log_stats
+    # Opaque weight version supplied by the caller.
+    self._weight_version = "default"
 
     # Setup Model.
     self.model_executor = executor_class(vllm_config)
@@ -124,6 +127,8 @@ def __init__(
     )
     if self.scheduler.connector is not None:  # type: ignore
         self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
+    if self.scheduler.ec_connector is not None:  # type: ignore
+        self.model_executor.init_ec_output_aggregator()
 
     mm_registry = core_module.MULTIMODAL_REGISTRY
     self.mm_receiver_cache = mm_registry.engine_receiver_cache_from_config(vllm_config)
@@ -224,7 +229,14 @@ def shutdown(self):
         self.model_executor.shutdown()
     if self.scheduler:
         self.scheduler.shutdown()
+
+    # Undo the gc.freeze() from __init__ so that the objects allocated
+    # during engine startup (model weights, KV caches, etc.) become
+    # visible to the garbage collector again. Without this, deleting
+    # the engine in-process (e.g. unit tests) leaks GPU memory.
     gc.unfreeze()
+    # Tear down distributed state initialized in this EngineCore process
+    # before it exits and release cached memory.
     core_module.cleanup_dist_env_and_memory()
     core_module.logger.debug_once(
         "[shutdown] EngineCore: local resource teardown complete"
@@ -236,6 +248,7 @@ def shutdown(self):
 # Patch functionality: returns a minimal KV-cache-shaped result for AFD FFN
 # configs while preserving upstream KV cache initialization for non-AFD configs.
 # Signature: matches upstream; no added parameters.
+@core_module.instrument(span_name="Prepare model")
 def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
     # ### PATCH START: AFD FFN late-loaded KV cache bypass
     # FFN daemon engines do not schedule requests or own KV cache blocks, but
@@ -255,6 +268,12 @@ def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
     # Get all kv cache needed by the model
     kv_cache_specs = self.model_executor.get_kv_cache_specs()
 
+    # Some layers (e.g. Prefix LM attention) run non-causally and tag their
+    # KV cache spec with ``non_causal=True``. The specs are collected here in
+    # the engine-core process (the same process that builds the scheduler),
+    # so this is the multiproc-safe place to translate that layer-level
+    # signal into a scheduling policy: chunked prefill and prefix caching
+    # both assume causal attention and would corrupt non-causal prefill.
     if any(
         getattr(spec, "non_causal", False)
         for worker_specs in kv_cache_specs
@@ -314,17 +333,14 @@ def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
         vllm_config.cache_config.block_size = min(
             g.kv_cache_spec.block_size for g in kv_cache_groups
         )
-        num_tokens, max_concurrency = core_module.get_kv_cache_capacity(
-            vllm_config,
-            scheduler_kv_cache_config,
-        )
-        vllm_config.cache_config.kv_cache_size_tokens = num_tokens
-        vllm_config.cache_config.kv_cache_max_concurrency = max_concurrency
+        core_module.update_kv_cache_capacity(vllm_config, scheduler_kv_cache_config)
 
     vllm_config.validate_block_size()
 
     # Initialize kv cache and warmup the execution
     self.model_executor.initialize_from_config(kv_cache_configs)
+    if not core_module.envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+        self.model_executor.compile_or_warm_up_model()
 
     elapsed = time.time() - start
     compile_time = vllm_config.compilation_config.compilation_time
@@ -354,12 +370,14 @@ def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
     return scheduler_kv_cache_config
 
 
-# Patch reason: AFD FFN ranks run a connector daemon, while AFD async Attention
-# ranks use the regular EngineCoreProc but still need native DPLB request stats.
-# Patch functionality: starts the FFN connector loop or adds changed-only request
-# count publication to the independent async Attention loop while preserving the
-# target upstream tag's normal busy loops for all other engines.
+# Patch reason: AFD FFN ranks run a connector daemon, so the native busy loops
+# must not drive request scheduling on FFN engines.
+# Patch functionality: diverts AFD FFN engines to the connector loop while
+# preserving the target upstream tag's normal busy loops for all other engines.
+# vLLM 0.28.0 publishes DP load-balancer request counts from the base busy
+# loop itself, so no AFD async-Attention loop is layered on top anymore.
 # Signature: matches upstream; no added parameters.
+@core_module.fault_tolerant_wrapper
 def run_busy_loop(self):
     # ### PATCH START: AFD FFN connector busy loop
     # FFN ranks run the connector server loop and poll worker-side failures
@@ -368,11 +386,6 @@ def run_busy_loop(self):
         result = _run_ffn_busy_loop(self, core_module)
         return result
     # ### PATCH END: AFD FFN connector busy loop
-
-    # ### PATCH START: AFD async-DP request-count publication
-    if _is_afd_async_attention_engine(self):
-        return _run_async_attention_busy_loop(self)
-    # ### PATCH END: AFD async-DP request-count publication
 
     if isinstance(self, core_module.DPEngineCoreProc):
         """Core busy loop of the EngineCore for data parallel case."""
@@ -385,12 +398,16 @@ def run_busy_loop(self):
             self._maybe_publish_request_counts()
 
             if self.eep_scaling_state is not None:
-                _ = self.eep_scaling_state.progress()
-                if self.eep_scaling_state.is_complete():
-                    if self.eep_scaling_state.worker_type == "removing":
+                state = self.eep_scaling_state
+                if state.commit_requested or not state.is_ready_for_switch():
+                    state.progress()
+                if state.is_complete():
+                    if state.worker_type == "removing":
                         raise SystemExit
                     self.process_input_queue_block = True
                     self.eep_scaling_state = None
+                elif not state.commit_requested and state.is_ready_for_switch():
+                    self.process_input_queue_block = True
 
             executed = self._process_engine_step()
             self._maybe_publish_request_counts()
@@ -450,59 +467,13 @@ def run_busy_loop(self):
     while self._handle_shutdown():
         # 1) Poll the input queue until there is work to do.
         self._process_input_queue()
+        # Publish request counts before and after GPU step to ensure freshness.
+        self._maybe_publish_request_counts()
         # 2) Step the engine core and return the outputs.
         self._process_engine_step()
+        self._maybe_publish_request_counts()
 
     raise SystemExit
-
-
-def _run_async_attention_busy_loop(self) -> None:
-    """Run independent Attention steps while publishing native DPLB counts."""
-
-    last_request_counts = (0, 0)
-    while self._handle_shutdown():
-        self._process_input_queue()
-        last_request_counts = _publish_async_attention_request_counts(
-            self,
-            last_request_counts,
-        )
-        self._process_engine_step()
-        last_request_counts = _publish_async_attention_request_counts(
-            self,
-            last_request_counts,
-        )
-
-    raise SystemExit
-
-
-def _publish_async_attention_request_counts(
-    self,
-    last_request_counts: tuple[int, int],
-) -> tuple[int, int]:
-    """Publish changed ``(running, waiting)`` counts to the DP coordinator."""
-
-    if not self.publish_dp_lb_stats:
-        return last_request_counts
-
-    request_counts = self.scheduler.get_request_counts()
-    if request_counts == last_request_counts:
-        return last_request_counts
-
-    num_running_reqs, num_waiting_reqs = request_counts
-    scheduler_stats = core_module.SchedulerStats(
-        num_running_reqs=num_running_reqs,
-        num_waiting_reqs=num_waiting_reqs,
-    )
-    self.output_queue.put_nowait(
-        (-1, core_module.EngineCoreOutputs(scheduler_stats=scheduler_stats))
-    )
-    core_module.logger.debug(
-        "AFD async-DP engine %d published request counts: running=%d waiting=%d",
-        self.engine_index,
-        num_running_reqs,
-        num_waiting_reqs,
-    )
-    return request_counts
 
 
 class _AFDFFNKVCacheConfig:
@@ -670,19 +641,6 @@ def _is_running(self, core_module: Any) -> bool:
 
 def _is_afd_ffn_engine(self) -> bool:
     return _is_afd_ffn_config(getattr(self, "vllm_config", None))
-
-
-def _is_afd_async_attention_engine(self) -> bool:
-    return _is_afd_async_attention_config(self.vllm_config)
-
-
-def _is_afd_async_attention_config(vllm_config: VllmConfig) -> bool:
-    config = _get_afd_config(vllm_config)
-    return (
-        config is not None
-        and config.role == "attention"
-        and is_afd_async_dp(vllm_config)
-    )
 
 
 def _is_afd_ffn_config(vllm_config: VllmConfig | None) -> bool:
