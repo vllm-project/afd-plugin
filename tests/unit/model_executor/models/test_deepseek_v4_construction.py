@@ -31,13 +31,22 @@ class _FakeMissingLayer(_FakeStage):
     pass
 
 
+class _FakeScratchPool:
+    def __init__(self, *args, **kwargs) -> None:
+        self.args = args
+
+
 def _vllm_config(*, layer_count: int = 2):
     config = SimpleNamespace(
         hc_eps=1e-6,
         hc_mult=2,
         hc_sinkhorn_iters=3,
+        head_dim=4,
         hidden_size=8,
+        index_head_dim=4,
+        index_n_heads=2,
         index_topk=4,
+        num_attention_heads=2,
         num_hidden_layers=layer_count,
         rms_norm_eps=1e-6,
         vocab_size=32,
@@ -73,7 +82,17 @@ def construction_env(monkeypatch):
         "_select_dsv4_attn_cls",
         lambda _config: _FakeAttention,
     )
+    monkeypatch.setattr(
+        adapter.native,
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
     monkeypatch.setattr(adapter.native, "DeepseekV4MoE", _FakeMoE)
+    monkeypatch.setattr(
+        adapter.native,
+        "DeepseekV4EagerScratchPool",
+        _FakeScratchPool,
+    )
     monkeypatch.setattr(adapter.native, "PPMissingLayer", _FakeMissingLayer)
     monkeypatch.setattr(adapter.native, "RMSNorm", _FakeStage)
     monkeypatch.setattr(adapter.native, "VocabParallelEmbedding", _FakeStage)

@@ -210,6 +210,7 @@ def _runner_for_metadata(
     runner._afd_transaction_counter = 0
     runner.prof = _StepProfiler()
     runner.cudagraph_manager = SimpleNamespace(run_fullgraph=lambda _desc: None)
+    runner.is_encoder_only = False
     return runner
 
 
