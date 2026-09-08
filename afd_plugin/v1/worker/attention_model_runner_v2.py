@@ -96,10 +96,10 @@ def _use_afd_capture_input_preparation(
     # module symbol once before each warmup/formal-capture forward.
     # Patch functionality: preserve native preparation and publish the
     # matching AFD event before the forward starts.
-    # Signature: matches vLLM v0.26.0 prepare_inputs_to_capture exactly.
+    # Signature: matches vLLM v0.28.0 prepare_inputs_to_capture exactly.
     # Upstream source: vllm/v1/worker/gpu/cudagraph_utils.py,
     # prepare_inputs_to_capture; commit
-    # 568afb3a13806beb53bb2e6bd518269357b237c0.
+    # 2cf0a6915ce544dc493a0990f2ea38d81601128a.
     def prepare_inputs_to_capture(
         num_reqs: int,
         num_tokens: int,
@@ -108,18 +108,20 @@ def _use_afd_capture_input_preparation(
         block_tables: BlockTables,
         attn_groups: list[list[v2_worker_utils.AttentionGroup]],
         kv_cache_config: KVCacheConfig,
-        skip_attn: bool = False,
+        full_cudagraph: bool,
+        max_query_len: int | None = None,
     ) -> v2_cudagraph_utils.AttentionState:
         # ### PATCH START: stage one exact AFD capture event.
         attention_state = original_prepare(
-            num_reqs,
-            num_tokens,
-            model_state,
-            input_buffers,
-            block_tables,
-            attn_groups,
-            kv_cache_config,
-            skip_attn,
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            model_state=model_state,
+            input_buffers=input_buffers,
+            block_tables=block_tables,
+            attn_groups=attn_groups,
+            kv_cache_config=kv_cache_config,
+            full_cudagraph=full_cudagraph,
+            max_query_len=max_query_len,
         )
         desc, is_warmup = event_tracker.consume(num_reqs, num_tokens)
         runner._is_warmup = is_warmup
@@ -168,10 +170,10 @@ def _use_afd_fullgraph_replay_hook(
     # execute-scoped AFD provider cannot publish runtime control.
     # Patch functionality: wrap only this manager instance and publish one
     # ordinary padded control payload immediately before each native replay.
-    # Signature: matches vLLM v0.26.0 ModelCudaGraphManager.run_fullgraph exactly.
+    # Signature: matches vLLM v0.28.0 ModelCudaGraphManager.run_fullgraph exactly.
     # Upstream source: vllm/v1/worker/gpu/cudagraph_utils.py,
     # ModelCudaGraphManager.run_fullgraph; commit
-    # 568afb3a13806beb53bb2e6bd518269357b237c0.
+    # 2cf0a6915ce544dc493a0990f2ea38d81601128a.
     # Delegation exception: native replay remains wholly in the saved bound
     # method; this scope owns only the AFD pre-replay control seam.
     # Removal/upstream plan: delete this hook when vLLM exposes a per-manager
@@ -334,23 +336,23 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     # Patch reason: native V2 load_model has no AFD connector lifecycle.
     # Patch functionality: initialize the AFD connector after native weight
     # loading so Attention and FFN model loading overlap across roles.
-    # Signature: matches vLLM v0.26.0 GPUModelRunnerV2.load_model exactly.
+    # Signature: matches vLLM v0.28.0 GPUModelRunnerV2.load_model exactly.
     def load_model(self, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights)
         if not self.connector.is_initialized:
             self.connector.init_afd_connector()
 
-    # Patch reason: vLLM v0.26.0 prepares FULL graph inputs before each warmup
+    # Patch reason: vLLM v0.28.0 prepares FULL graph inputs before each warmup
     # and formal capture forward, outside torch.cuda.graph, but does not expose
     # that lifecycle to AFD's control plane.
     # Patch functionality: temporarily wrap the exact upstream input-preparation
     # symbol so each native FULL descriptor publishes one warmup and one capture
     # payload before its forward, while the provider installs the pending AFD
     # sidecar without sending control from inside torch.cuda.graph.
-    # Signature: matches vLLM v0.26.0 GPUModelRunner.capture_model exactly.
+    # Signature: matches vLLM v0.28.0 GPUModelRunner.capture_model exactly.
     # Upstream source: vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.capture_model; commit
-    # 568afb3a13806beb53bb2e6bd518269357b237c0.
+    # 2cf0a6915ce544dc493a0990f2ea38d81601128a.
     # Delegation exception: native capture remains wholly in super(); this
     # wrapper owns only the temporary AFD lifecycle seam.
     # Removal/upstream plan: delete this wrapper when vLLM exposes graph
@@ -395,10 +397,10 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     # AFD must install its sidecar at that exact context-construction seam.
     # Patch functionality: delegate all request/input/Attention/KV/sampling/
     # output work to native V2 while temporarily installing AFD metadata.
-    # Signature: matches vLLM v0.26.0 GPUModelRunnerV2.execute_model exactly.
+    # Signature: matches vLLM v0.28.0 GPUModelRunnerV2.execute_model exactly.
     # Upstream source: vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.execute_model; commit
-    # 568afb3a13806beb53bb2e6bd518269357b237c0.
+    # 2cf0a6915ce544dc493a0990f2ea38d81601128a.
     # Delegation exception: the upstream method is intentionally not copied;
     # only this narrow provider/profiler wrapper is AFD-specific.
     # Removal/upstream plan: delete this wrapper when vLLM exposes a plugin
@@ -411,6 +413,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
+        context_len: int = 0,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         # ### PATCH START: scope AFD metadata provider/replay and profiler step.
         step_afd_gpu_profiler(self.prof)
@@ -424,6 +427,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
                 dummy_run=dummy_run,
                 skip_attn_for_dummy_run=skip_attn_for_dummy_run,
                 is_profile=is_profile,
+                context_len=context_len,
             )
         # ### PATCH END: scope AFD metadata provider/replay and profiler step.
 
@@ -431,10 +435,10 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     # connector, or pending metadata sidecar.
     # Patch functionality: preserve delegated native cleanup and guarantee all
     # AFD cleanup layers run when any earlier layer raises.
-    # Signature: matches vLLM v0.26.0 GPUModelRunnerV2.shutdown exactly.
+    # Signature: matches vLLM v0.28.0 GPUModelRunnerV2.shutdown exactly.
     # Upstream source: vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.shutdown; commit
-    # 568afb3a13806beb53bb2e6bd518269357b237c0.
+    # 2cf0a6915ce544dc493a0990f2ea38d81601128a.
     # Delegation exception: native resource release remains in super().shutdown;
     # this override contains only AFD-specific finalizers.
     # Removal/upstream plan: delete this wrapper if AFD-owned lifecycle moves

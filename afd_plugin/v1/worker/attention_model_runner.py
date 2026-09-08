@@ -134,15 +134,15 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
         )
 
     # Patch reason: AFD stages connector metadata before native Attention
-    # metadata construction. In addition, vLLM v0.26 caches Attention metadata
-    # without the ubatch id, so update-capable backends can reuse ubatch 0
-    # sequence metadata for later ubatches.
+    # metadata construction. In addition, vLLM 0.28.0 still caches Attention
+    # metadata without the ubatch id, so update-capable backends can reuse
+    # ubatch 0 sequence metadata for later ubatches.
     # Patch functionality: stage the AFD metadata and disable block-table-only
     # metadata updates while native multi-ubatch metadata is built. Remove the
     # cache workaround after vLLM PR #48659 is included in the pinned release.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/v1/worker/gpu_model_runner.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.28.0, vllm/v1/worker/gpu_model_runner.py
+    # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
     # Delegation exception: the upstream function is large; this override wraps
     # the native implementation and scopes the workaround to its metadata-build
     # window.
@@ -155,6 +155,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
         num_reqs_padded: int | None = None,
         ubatch_slices: UBatchSlices | None = None,
         logits_indices: torch.Tensor | None = None,
+        max_num_sampled_tokens: int | None = None,
         use_spec_decode: bool = False,
         for_cudagraph_capture: bool = False,
         num_scheduled_tokens: dict[str, int] | None = None,
@@ -177,18 +178,19 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
                                 disabled_metadata_builders[id(builder)] = builder
                                 builder.supports_update_block_table = False
             return super()._build_attention_metadata(
-                num_tokens,
-                num_reqs,
-                max_query_len,
-                num_tokens_padded,
-                num_reqs_padded,
-                ubatch_slices,
-                logits_indices,
-                use_spec_decode,
-                for_cudagraph_capture,
-                num_scheduled_tokens,
-                cascade_attn_prefix_lens,
-                slot_mappings,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                max_query_len=max_query_len,
+                num_tokens_padded=num_tokens_padded,
+                num_reqs_padded=num_reqs_padded,
+                ubatch_slices=ubatch_slices,
+                logits_indices=logits_indices,
+                max_num_sampled_tokens=max_num_sampled_tokens,
+                use_spec_decode=use_spec_decode,
+                for_cudagraph_capture=for_cudagraph_capture,
+                num_scheduled_tokens=num_scheduled_tokens,
+                cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                slot_mappings=slot_mappings,
             )
         finally:
             for builder in disabled_metadata_builders.values():
@@ -373,6 +375,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        randomize_inputs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run vLLM's DP dummy batch through the AFD model path.
 
@@ -396,18 +399,19 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
                 self.install_afd_metadata_on_forward_context,
             ):
                 return super()._dummy_run(
-                    num_tokens,
-                    cudagraph_runtime_mode,
-                    force_attention,
-                    uniform_decode,
-                    allow_microbatching,
-                    skip_eplb,
-                    is_profile,
-                    create_mixed_batch,
-                    remove_lora,
-                    is_graph_capturing,
-                    num_active_loras,
-                    profile_seq_lens,
+                    num_tokens=num_tokens,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    force_attention=force_attention,
+                    uniform_decode=uniform_decode,
+                    allow_microbatching=allow_microbatching,
+                    skip_eplb=skip_eplb,
+                    is_profile=is_profile,
+                    create_mixed_batch=create_mixed_batch,
+                    remove_lora=remove_lora,
+                    is_graph_capturing=is_graph_capturing,
+                    num_active_loras=num_active_loras,
+                    profile_seq_lens=profile_seq_lens,
+                    randomize_inputs=randomize_inputs,
                 )
         finally:
             self._afd_is_graph_capturing = previous_is_graph_capturing
@@ -417,8 +421,8 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
     # Patch functionality: preserve the upstream warmup/capture flow while
     # publishing replayable connector state before formal graph capture.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/v1/worker/gpu_model_runner.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.28.0, vllm/v1/worker/gpu_model_runner.py
+    # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
     def _warmup_and_capture(
         self,
         desc: BatchDescriptor,
@@ -461,6 +465,11 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
         finally:
             self._is_warmup = previous_is_warmup
         # ### PATCH END: expose warmup state to the AFD control plane.
+
+        if num_warmups > 0:
+            # vLLM 0.28.0: warmups may use auxiliary streams; ensure all of
+            # their work has completed before beginning CUDA graph capture.
+            torch.accelerator.synchronize()
 
         # ### PATCH START: publish static AFD state before graph capture.
         previous_metadata = self._afd_pending_metadata
@@ -515,8 +524,8 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
     # Patch functionality: preserve native GPUModelRunner cleanup, then close
     # AFD-owned resources even when native cleanup raises.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/v1/worker/gpu_model_runner.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.28.0, vllm/v1/worker/gpu_model_runner.py
+    # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
     def shutdown(self) -> None:
         # ### PATCH START: extend native shutdown with AFD resource cleanup.
         stop_afd_gpu_profiler(self.prof)
