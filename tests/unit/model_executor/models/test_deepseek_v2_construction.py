@@ -416,10 +416,10 @@ def test_npu_ffn_refreshes_native_fused_moe_factory(
     class _FakeMoE(nn.Module):
         def __init__(self, **_kwargs):
             super().__init__()
-            factories_seen_by_native_moe.append(adapter.native.FusedMoE)
+            factories_seen_by_native_moe.append(adapter.native.FusedMoEFactory)
 
-    monkeypatch.setattr(adapter.native, "FusedMoE", stale_factory)
-    monkeypatch.setattr(adapter.fused_moe, "FusedMoE", ascend_factory)
+    monkeypatch.setattr(adapter.native, "FusedMoEFactory", stale_factory)
+    monkeypatch.setattr(adapter.fused_moe, "FusedMoEFactory", ascend_factory)
     monkeypatch.setattr(adapter.native, "DeepseekV2MoE", _FakeMoE)
 
     _make_layer(monkeypatch, role="ffn", layer_idx=1)

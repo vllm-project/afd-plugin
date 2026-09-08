@@ -104,10 +104,17 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
 
     # Patch reason: native Qwen3 MoE constructs both Attention and FFN modules.
     # Patch functionality: construct only the large modules owned by the AFD role.
-    # Signature: matches upstream; no added parameters.
+    # Signature: matches upstream; no added parameters. The native
+    # is_fused_checkpoint_transposed flag only affects native fused-checkpoint
+    # MoE construction, which the AFD role-aware layer never builds.
     # Upstream: vLLM v0.28.0, vllm/model_executor/models/qwen3_moe.py
     # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
-    def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        is_fused_checkpoint_transposed: bool = False,
+    ) -> None:
         # ### PATCH START: initialize the role-aware layer without native allocation.
         nn.Module.__init__(self)
         afd_config = parse_afd_config(vllm_config, validate=False)

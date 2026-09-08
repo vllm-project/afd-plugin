@@ -47,6 +47,7 @@ def _vllm_config(*, layer_count: int = 2):
             enable_eplb=False,
             pipeline_parallel_size=1,
             use_sequence_parallel_moe=False,
+            use_ubatching=False,
         ),
         quant_config=None,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),

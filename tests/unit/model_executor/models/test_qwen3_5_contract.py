@@ -87,7 +87,7 @@ def test_ffn_compute_ffn_output_calls_native_internal_router():
 
     moe = object.__new__(FakeInternalMoe)
     nn.Module.__init__(moe)
-    moe.experts = type("Experts", (), {"is_internal_router": True})()
+    moe.experts = type("Experts", (), {"gate": object()})()
     layer = object.__new__(adapter.AFDQwen3_5DecoderLayer)
     nn.Module.__init__(layer)
     layer.afd_role = "ffn"

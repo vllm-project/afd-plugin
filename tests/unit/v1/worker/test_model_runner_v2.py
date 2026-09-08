@@ -695,6 +695,7 @@ def test_v2_capture_publishes_two_descriptor_events_outside_graph_body(
                     None,
                     [],
                     None,
+                    False,
                 )
                 assert state == f"attention-state-{len(prepare_calls)}"
                 events.append("graph_enter")
@@ -810,6 +811,7 @@ def test_v2_capture_restores_symbol_and_sidecars_on_failure(monkeypatch, failure
             None,
             [],
             None,
+            False,
         )
         afd_forward_context.forward_context_module.create_forward_context()
         if failure == "forward":
@@ -885,6 +887,7 @@ def test_v2_capture_source_drift_fails_loud_and_restores(
                 None,
                 [],
                 None,
+                False,
             )
         return 1
 
@@ -1202,6 +1205,7 @@ def test_v2_profile_before_graph_manager_uses_provider_without_replay_hook(
             "dummy_run": False,
             "skip_attn_for_dummy_run": False,
             "is_profile": True,
+            "context_len": 0,
         },
     ]
     assert events == ["control_update", "control_send", "data"]
@@ -1314,6 +1318,7 @@ def test_native_v2_dummy_profile_thin_path_uses_afd_execute_wrapper(
         dummy_run=False,
         skip_attn_for_dummy_run=False,
         is_profile=False,
+        context_len=0,
     ):
         execute_calls.append(
             (dummy_run, skip_attn_for_dummy_run, is_profile),
