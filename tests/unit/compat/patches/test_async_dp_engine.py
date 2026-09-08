@@ -5,15 +5,12 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import importlib
 import logging
-import multiprocessing
 import sys
-import time
 import types
-from collections import deque
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import pytest
@@ -118,49 +115,13 @@ def _install_fake_vllm_engine(monkeypatch: pytest.MonkeyPatch):
 
     core_module.SignalCallback = SignalCallback
 
-    class EngineCoreOutputs:
-        def __init__(
-            self,
-            *,
-            scheduler_stats=None,
-            engine_index=0,
-            outputs=None,
-            utility_output=None,
-            wave_complete=None,
-            start_wave=None,
-        ):
-            self.scheduler_stats = scheduler_stats
-            self.engine_index = engine_index
-            self.outputs = outputs or []
-            self.utility_output = utility_output
-            self.wave_complete = wave_complete
-            self.start_wave = start_wave
-
-    core_module.EngineCoreOutputs = EngineCoreOutputs
-
-    class EngineState:
-        def __init__(self):
-            self.request_counts = [0, 0]
-
-    class DPCoordinatorProc:
-        def __init__(
-            self,
-            engine_count,
-            min_stats_update_interval_ms=100,
-            enable_wave_coordination=True,
-        ):
-            self.ctx = object()
-            self.engines = [EngineState() for _ in range(engine_count)]
-            self.stats_update_interval_ms = min_stats_update_interval_ms
-            self.enable_wave_coordination = enable_wave_coordination
-
-        def _get_engine_counts(self, do_copy=False):
-            if do_copy:
-                return [copy.copy(engine.request_counts) for engine in self.engines]
-            return [engine.request_counts for engine in self.engines]
-
-        def _send_start_wave(self, _socket, _wave, _exclude_engine_index):
-            return None
+    @dataclass
+    class CoreEngineLaunch:
+        engine_manager: object | None
+        coordinator: object | None
+        addresses: object
+        tensor_queue: object | None
+        watched_frontend_processes: tuple = field(default=())
 
     class DPCoordinator:
         def __init__(self, parallel_config, enable_wave_coordination=True):
@@ -203,38 +164,23 @@ def _install_fake_vllm_engine(monkeypatch: pytest.MonkeyPatch):
         _executor_class,
         _log_stats,
         _addresses,
-        _num_api_servers=1,
     ):
-        yield utils_module.DPCoordinator(
-            vllm_config.parallel_config,
-            enable_wave_coordination=True,
+        yield utils_module.CoreEngineLaunch(
+            None,
+            utils_module.DPCoordinator(
+                vllm_config.parallel_config,
+                enable_wave_coordination=True,
+            ),
+            _addresses,
+            None,
         )
 
-    msgpack_codec = SimpleNamespace(
-        encode=lambda value: value,
-        decode=lambda value: value,
-    )
-    coordinator_module.copy = copy
-    coordinator_module.time = time
-    coordinator_module.msgspec = SimpleNamespace(msgpack=msgpack_codec)
-    coordinator_module.zmq = SimpleNamespace(
-        XPUB="XPUB",
-        PULL="PULL",
-        POLLIN="POLLIN",
-        LAST_ENDPOINT="LAST_ENDPOINT",
-    )
-    coordinator_module.logger = logging.getLogger("fake-async-dp-coordinator")
-    coordinator_module.make_zmq_socket = None
-    coordinator_module.MsgpackDecoder = None
-    coordinator_module.EngineState = EngineState
-    coordinator_module.DPCoordinatorProc = DPCoordinatorProc
-
+    utils_module.CoreEngineLaunch = CoreEngineLaunch
     utils_module.DPCoordinator = DPCoordinator
     utils_module.CoreEngine = CoreEngine
     utils_module.CoreEngineProcManager = CoreEngineProcManager
     utils_module.CoreEngineActorManager = CoreEngineActorManager
     utils_module.get_engine_client_zmq_addr = lambda *_args: "handshake"
-    utils_module.get_open_port = lambda: 12345
     utils_module.get_open_zmq_ipc_path = lambda: "ipc"
     utils_module.zmq_socket_ctx = zmq_socket_ctx
     utils_module.zmq = SimpleNamespace(ROUTER="ROUTER")
@@ -255,7 +201,9 @@ def _install_fake_vllm_engine(monkeypatch: pytest.MonkeyPatch):
             await to_await
             self._ensure_output_queue_task()
 
-    client_module.msgspec = SimpleNamespace(msgpack=msgpack_codec)
+    client_module.msgspec = SimpleNamespace(
+        msgpack=SimpleNamespace(encode=lambda value: value)
+    )
     client_module.DPAsyncMPClient = DPAsyncMPClient
 
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
@@ -280,42 +228,14 @@ def _load_patch_module(monkeypatch: pytest.MonkeyPatch):
     return importlib.import_module(module_name)
 
 
-def _inspect_spawned_coordinator_binding(result_queue):
-    monkeypatch = pytest.MonkeyPatch()
-    try:
-        _install_fake_vllm_engine(monkeypatch)
-        module_name = "afd_plugin.compat.patches.async_dp_engine"
-        sys.modules.pop(module_name, None)
-        patch_module = importlib.import_module(module_name)
-        coordinator = sys.modules["vllm.v1.engine.coordinator"].DPCoordinatorProc
-        result_queue.put(
-            (
-                coordinator.run_coordinator is patch_module.run_coordinator,
-                coordinator.process_input_socket is patch_module.process_input_socket,
-                coordinator.run_coordinator.__module__,
-            )
-        )
-    finally:
-        monkeypatch.undo()
+def test_coordinator_patches_are_removed(monkeypatch):
+    """vLLM 0.28.0 absorbed the non-lockstep coordinator behavior (#49204)."""
+    patch_module = _load_patch_module(monkeypatch)
 
-
-def test_spawn_import_installs_plugin_owned_coordinator_target():
-    context = multiprocessing.get_context("spawn")
-    result_queue = context.Queue()
-    process = context.Process(
-        target=_inspect_spawned_coordinator_binding,
-        args=(result_queue,),
-    )
-    process.start()
-    process.join(timeout=30)
-
-    assert process.exitcode == 0
-    assert result_queue.get(timeout=5) == (
-        True,
-        True,
-        "afd_plugin.compat.patches.async_dp_engine",
-    )
-    result_queue.close()
+    assert not hasattr(patch_module, "run_coordinator")
+    assert not hasattr(patch_module, "process_input_socket")
+    assert not hasattr(patch_module, "_should_patch_pinned_dp_coordinator")
+    assert not hasattr(patch_module, "coordinator_module")
 
 
 def test_async_dp_attention_uses_regular_engine_core(monkeypatch):
@@ -386,8 +306,7 @@ def test_async_dp_engine_patch_rebinds_after_backend_override(monkeypatch):
 
 
 def test_async_dp_coordinator_disables_wave_coordination(monkeypatch):
-    patch_module = _load_patch_module(monkeypatch)
-    coordinator_module = sys.modules["vllm.v1.engine.coordinator"]
+    _load_patch_module(monkeypatch)
     utils_module = sys.modules["vllm.v1.engine.utils"]
     client_module = sys.modules["vllm.v1.engine.core_client"]
 
@@ -397,167 +316,44 @@ def test_async_dp_coordinator_disables_wave_coordination(monkeypatch):
         object,
         False,
         addresses,
-    ) as launch_result:
-        _, coordinator, yielded_addresses, _ = launch_result
-        assert coordinator.enable_wave_coordination is False
-        assert yielded_addresses is addresses
+    ) as launch:
+        assert launch.coordinator.enable_wave_coordination is False
+        assert launch.addresses is addresses
 
     assert client_module.launch_core_engines is utils_module.launch_core_engines
-    assert (
-        coordinator_module.DPCoordinatorProc.process_input_socket
-        is patch_module.process_input_socket
-    )
-    assert (
-        coordinator_module.DPCoordinatorProc.run_coordinator
-        is patch_module.run_coordinator
-    )
-    assert patch_module.run_coordinator.__module__ == (
-        "afd_plugin.compat.patches.async_dp_engine"
-    )
 
 
-def test_newer_dev_vllm_keeps_native_coordinator(monkeypatch):
-    patch_module = _load_patch_module(monkeypatch)
-    vllm_module = sys.modules["vllm"]
-    coordinator_module = sys.modules["vllm.v1.engine.coordinator"]
-
-    def native_run_coordinator(*_args, **_kwargs):
-        return None
-
-    def native_process_input_socket(*_args, **_kwargs):
-        return None
-
-    coordinator_module.DPCoordinatorProc.run_coordinator = staticmethod(
-        native_run_coordinator
-    )
-    coordinator_module.DPCoordinatorProc.process_input_socket = (
-        native_process_input_socket
-    )
-    vllm_module.__version__ = "0.27.0.dev1"
-
-    assert patch_module.apply_async_dp_engine_patch() is True
-    assert (
-        coordinator_module.DPCoordinatorProc.run_coordinator is native_run_coordinator
-    )
-    assert (
-        coordinator_module.DPCoordinatorProc.process_input_socket
-        is native_process_input_socket
-    )
-
-
-@pytest.mark.parametrize(
-    ("enable_wave_coordination", "expected_timeouts", "expects_warning"),
-    (
-        (False, [4000, 0, 0], False),
-        (True, [4000, 50, 50], True),
-    ),
-)
-def test_dp_coordinator_separates_independent_and_lockstep_stats(
-    monkeypatch,
-    caplog,
-    enable_wave_coordination,
-    expected_timeouts,
-    expects_warning,
-):
+def test_non_afd_launch_keeps_upstream_wave_coordination(monkeypatch):
     _load_patch_module(monkeypatch)
-    coordinator_module = sys.modules["vllm.v1.engine.coordinator"]
+    utils_module = sys.modules["vllm.v1.engine.utils"]
+
+    addresses = SimpleNamespace()
+    with utils_module.launch_core_engines(
+        _config(async_dp=False),
+        object,
+        False,
+        addresses,
+    ) as launch:
+        assert launch.coordinator.enable_wave_coordination is True
+
+
+def test_non_target_vllm_release_skips_patch_application(monkeypatch):
+    _load_patch_module(monkeypatch)
+    vllm_module = sys.modules["vllm"]
     core_module = sys.modules["vllm.v1.engine.core"]
+    utils_module = sys.modules["vllm.v1.engine.utils"]
+    client_module = sys.modules["vllm.v1.engine.core_client"]
+    patch_module = sys.modules["afd_plugin.compat.patches.async_dp_engine"]
 
-    class CoordinatorStoppedError(Exception):
-        pass
+    native_run_engine_core = core_module.EngineCoreProc.run_engine_core
+    native_launch = utils_module.launch_core_engines
+    native_add_request = client_module.DPAsyncMPClient.add_request_async
+    vllm_module.__version__ = "0.27.0"
 
-    class Socket:
-        def __init__(self, received=(), *, stop_on_send=False):
-            self.received = deque(received)
-            self.sent = []
-            self.stop_on_send = stop_on_send
-
-        def recv(self):
-            return self.received.popleft()
-
-        def send(self, message):
-            self.sent.append(message)
-            if self.stop_on_send:
-                raise CoordinatorStoppedError
-
-    first_stats = SimpleNamespace(
-        step_counter=10,
-        current_wave=4,
-        num_waiting_reqs=3,
-        num_running_reqs=1,
-    )
-    stale_global_step_stats = SimpleNamespace(
-        step_counter=1,
-        current_wave=0,
-        num_waiting_reqs=4,
-        num_running_reqs=2,
-    )
-    output_front = Socket(stop_on_send=True)
-    output_back = Socket(
-        (
-            core_module.EngineCoreOutputs(
-                scheduler_stats=first_stats,
-                engine_index=0,
-            ),
-            core_module.EngineCoreOutputs(
-                scheduler_stats=stale_global_step_stats,
-                engine_index=1,
-            ),
-        )
-    )
-    publish_back = Socket((b"\x01", b"\x01"))
-    sockets = {
-        "front": output_front,
-        "outputs": output_back,
-        "engines": publish_back,
-    }
-
-    @contextmanager
-    def make_zmq_socket(*, path, **_kwargs):
-        yield sockets[path]
-
-    poll_timeouts = []
-    event_batches = deque(
-        (
-            [(output_back, "POLLIN")],
-            [(output_back, "POLLIN")],
-            [],
-        )
-    )
-
-    class Poller:
-        def register(self, _socket, _event):
-            return None
-
-        def poll(self, timeout):
-            poll_timeouts.append(timeout)
-            return event_batches.popleft()
-
-    class Decoder:
-        def __init__(self, _output_type):
-            pass
-
-        def decode(self, value):
-            return value
-
-    coordinator_module.make_zmq_socket = make_zmq_socket
-    coordinator_module.MsgpackDecoder = Decoder
-    coordinator_module.zmq.Poller = Poller
-    coordinator_module.time = SimpleNamespace(time=lambda: 1.0)
-
-    coordinator = coordinator_module.DPCoordinatorProc(
-        engine_count=2,
-        enable_wave_coordination=enable_wave_coordination,
-    )
-    with (
-        caplog.at_level(logging.WARNING, logger="fake-async-dp-coordinator"),
-        pytest.raises(CoordinatorStoppedError),
-    ):
-        coordinator.process_input_socket("front", "outputs", "engines")
-
-    assert output_front.sent == [([[3, 1], [4, 2]], 0, False)]
-    assert poll_timeouts == expected_timeouts
-    assert ("out-of-order update" in caplog.text) is expects_warning
+    assert patch_module.apply_async_dp_engine_patch() is False
+    assert core_module.EngineCoreProc.run_engine_core is native_run_engine_core
+    assert utils_module.launch_core_engines is native_launch
+    assert client_module.DPAsyncMPClient.add_request_async is native_add_request
 
 
 def test_async_dp_client_skips_first_req(monkeypatch):
