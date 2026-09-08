@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +29,7 @@ def _make_native_dplb_client(
     client = object.__new__(DPLBAsyncMPClient)
     client.client_count = 1
     client.reqs_in_flight = {}
+    client.engine_inflight = Counter()
     client.core_engines = [
         index.to_bytes(2, "little") for index in range(len(request_counts))
     ]
