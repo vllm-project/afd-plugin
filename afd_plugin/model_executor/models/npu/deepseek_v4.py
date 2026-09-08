@@ -50,10 +50,10 @@ _BOTH_ROLES = frozenset((_ATTENTION_ROLE, _FFN_ROLE))
 def _refresh_ascend_fused_moe() -> None:
     """Bind native DSV4 MoE construction to the Ascend implementation."""
     # vLLM-Ascend applies this replacement during platform initialization,
-    # while the DSV4 module keeps a module-level FusedMoE binding.  Refresh it
-    # before either AFD role constructs its local model.
+    # while the DSV4 module keeps a module-level FusedMoEFactory binding.
+    # Refresh it before either AFD role constructs its local model.
     if native.current_platform.device_type == "npu":
-        native.FusedMoE = fused_moe.FusedMoE
+        native.FusedMoEFactory = fused_moe.FusedMoEFactory
 
 
 def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
