@@ -17,9 +17,13 @@ pytestmark = pytest.mark.vllm_runtime
 
 
 def _make_native_dplb_client(
-    request_counts: tuple[tuple[int, int], ...],
+    request_counts: tuple[tuple[int, float], ...],
 ) -> DPLBAsyncMPClient:
-    """Build the smallest client state needed by vLLM's native DPLB method."""
+    """Build the smallest client state needed by vLLM's native DPLB method.
+
+    vLLM 0.28.0 tracks per-engine counts as ``[waiting, running,
+    kv_cache_usage]``.
+    """
 
     client = object.__new__(DPLBAsyncMPClient)
     client.client_count = 1
@@ -41,16 +45,16 @@ def _request(request_id: str) -> SimpleNamespace:
 
 
 def test_native_dplb_uses_reported_request_counts():
-    client = _make_native_dplb_client(((2, 0), (0, 1)))
+    client = _make_native_dplb_client(((2, 0, 0.0), (0, 1, 0.0)))
 
     chosen_engine = client.get_core_engine_for_request(_request("loaded-route"))
 
     assert chosen_engine == client.core_engines[1]
-    assert client.lb_engines == [[2, 0], [1, 1]]
+    assert client.lb_engines == [[2, 0, 0.0], [1, 1, 0.0]]
 
 
 def test_native_dplb_distributes_tied_burst_with_optimistic_counts():
-    client = _make_native_dplb_client(((0, 0), (0, 0)))
+    client = _make_native_dplb_client(((0, 0, 0.0), (0, 0, 0.0)))
 
     chosen_engines = [
         client.get_core_engine_for_request(_request(f"burst-{index}"))
@@ -63,11 +67,11 @@ def test_native_dplb_distributes_tied_burst_with_optimistic_counts():
         client.core_engines[0],
         client.core_engines[1],
     ]
-    assert client.lb_engines == [[2, 0], [2, 0]]
+    assert client.lb_engines == [[2, 0, 0.0], [2, 0, 0.0]]
 
 
 def test_native_dplb_releases_completed_request():
-    client = _make_native_dplb_client(((0, 0), (0, 0)))
+    client = _make_native_dplb_client(((0, 0, 0.0), (0, 0, 0.0)))
     request = _request("finished")
     client.get_core_engine_for_request(request)
 
