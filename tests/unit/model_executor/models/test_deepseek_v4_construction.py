@@ -18,7 +18,9 @@ class _FakeStage(nn.Module):
 
 
 class _FakeAttention(_FakeStage):
-    pass
+    @classmethod
+    def get_padded_num_q_heads(cls, num_heads):
+        return num_heads
 
 
 class _FakeMoE(_FakeStage):

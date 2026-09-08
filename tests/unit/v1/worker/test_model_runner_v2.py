@@ -668,8 +668,8 @@ def test_v2_capture_publishes_two_descriptor_events_outside_graph_body(
 
     runner.connector = CaptureConnector(events)
 
-    def original_prepare(*args):
-        prepare_calls.append((args[0], args[1]))
+    def original_prepare(num_reqs, num_tokens, *args, **kwargs):
+        prepare_calls.append((num_reqs, num_tokens))
         return f"attention-state-{len(prepare_calls)}"
 
     original_create = afd_forward_context.forward_context_module.create_forward_context
@@ -781,7 +781,7 @@ def test_v2_capture_restores_symbol_and_sidecars_on_failure(monkeypatch, failure
     runner._is_warmup = False
     runner._afd_is_graph_capturing = False
 
-    def original_prepare(*args):
+    def original_prepare(*args, **kwargs):
         if failure == "prepare":
             raise RuntimeError("prepare failed")
         return "attention-state"
@@ -873,8 +873,8 @@ def test_v2_capture_source_drift_fails_loud_and_restores(
         calls[0] = (1, 9)
     original_calls = []
 
-    def original_prepare(*args):
-        original_calls.append((args[0], args[1]))
+    def original_prepare(num_reqs, num_tokens, *args, **kwargs):
+        original_calls.append((num_reqs, num_tokens))
         return "attention-state"
 
     def native_capture(self):
