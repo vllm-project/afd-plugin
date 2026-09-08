@@ -20,6 +20,9 @@ class AFDRankMapping:
     The P2P world always places FFN ranks first, followed by Attention ranks:
     ``[F0, F1, ..., A0, A1, ...]``. Each FFN rank owns one subgroup containing
     itself at subgroup rank 0 and one or more consecutive Attention ranks.
+    The Attention ranks are distributed in blocks that differ in size by at
+    most one, so ``ratio``, the number of Attention peers, is a property of
+    this rank's subgroup rather than of the topology as a whole.
     """
 
     role: str
@@ -56,12 +59,6 @@ def validate_p2p_topology(config: AFDConfig) -> None:
         raise ValueError(
             "P2pNcclAFDConnector currently requires num_attention_ranks >= "
             f"num_ffn_ranks, got {attention_size} < {ffn_size}",
-        )
-    if attention_size % ffn_size != 0:
-        raise ValueError(
-            "P2pNcclAFDConnector currently requires num_attention_ranks to be a "
-            "multiple of num_ffn_ranks, got "
-            f"{attention_size} and {ffn_size}",
         )
 
 
@@ -130,7 +127,7 @@ def build_rank_mapping(
                 f"(rank={role_rank}, size={attention_size})",
             )
         world_rank = ffn_size + role_rank
-        subgroup_index = role_rank // (attention_size // ffn_size)
+        subgroup_index = role_rank * ffn_size // attention_size
     elif config.role == "ffn":
         if role_rank >= ffn_size:
             raise ValueError(
@@ -142,15 +139,19 @@ def build_rank_mapping(
     else:
         raise ValueError(f"unknown AFD role {config.role!r}")
 
-    ratio = attention_size // ffn_size
+    # Balanced block distribution: Attention rank ``a`` joins the subgroup of
+    # FFN rank ``a * F // A``. The blocks are contiguous and differ in size by
+    # at most one, so an integral ratio is no longer required; when A is a
+    # multiple of F this is the same grouping as before.
     min_size = min(ffn_size, attention_size)
-    ffn_ranks = list(range(ffn_size))
-    attention_ranks = list(range(ffn_size, ffn_size + attention_size))
-    subgroup_ranks = tuple(
-        [ffn_ranks[subgroup_index]]
-        + [attention_ranks[subgroup_index * ratio + offset] for offset in range(ratio)],
-    )
+    subgroup_attention_ranks = [
+        ffn_size + attention_rank
+        for attention_rank in range(attention_size)
+        if attention_rank * ffn_size // attention_size == subgroup_index
+    ]
+    subgroup_ranks = tuple([subgroup_index] + subgroup_attention_ranks)
     rank_in_subgroup = subgroup_ranks.index(world_rank)
+    ratio = len(subgroup_attention_ranks)
     p2p_rank = role_rank + min_size if config.role == "attention" else role_rank
 
     destinations: list[int] = []

@@ -158,20 +158,34 @@ def test_p2p_connector_uses_factory_resolved_role_rank():
 
 
 @pytest.mark.parametrize(
-    ("attention_size", "ffn_size", "role", "role_rank", "subgroup_ranks", "dsts"),
+    (
+        "attention_size",
+        "ffn_size",
+        "role",
+        "role_rank",
+        "subgroup_ranks",
+        "ratio",
+        "dsts",
+    ),
     [
-        (2, 2, "attention", 1, (1, 3), (1,)),
-        (2, 1, "attention", 0, (0, 1, 2), (0,)),
-        (4, 2, "attention", 2, (1, 4, 5), ()),
-        (4, 2, "ffn", 1, (1, 4, 5), ()),
+        (2, 2, "attention", 1, (1, 3), 1, (1,)),
+        (2, 1, "attention", 0, (0, 1, 2), 2, (0,)),
+        (4, 2, "attention", 2, (1, 4, 5), 2, ()),
+        (4, 2, "ffn", 1, (1, 4, 5), 2, ()),
+        # A % F != 0: the blocks differ in size by one, so ratio is per subgroup.
+        (3, 2, "ffn", 0, (0, 2, 3), 2, ()),
+        (3, 2, "ffn", 1, (1, 4), 1, ()),
+        (3, 2, "attention", 2, (1, 4), 1, ()),
+        (5, 3, "attention", 4, (2, 7), 1, ()),
     ],
 )
-def test_p2p_topology_supports_equal_and_integer_multiple_attention_counts(
+def test_p2p_topology_supports_uneven_attention_counts(
     attention_size,
     ffn_size,
     role,
     role_rank,
     subgroup_ranks,
+    ratio,
     dsts,
 ):
     mapping = build_rank_mapping(
@@ -184,7 +198,7 @@ def test_p2p_topology_supports_equal_and_integer_multiple_attention_counts(
         role_rank,
     )
 
-    assert mapping.ratio == attention_size // ffn_size
+    assert mapping.ratio == ratio
     assert mapping.subgroup_ranks == subgroup_ranks
     assert mapping.dp_metadata_destinations == dsts
 
@@ -343,6 +357,9 @@ def test_p2p_tp2_maps_shared_dp_payload_one_to_one(monkeypatch):
         (4, 2, 0, [3, 5, 7, 11], [3, 5]),
         (4, 2, 1, [3, 5, 7, 0], [7, 1]),
         (6, 3, 2, [2, 3, 5, 7, 11, 13], [11, 13]),
+        # A % F != 0: subgroup 0 holds A0 and A1, subgroup 1 holds A2 alone.
+        (3, 2, 0, [3, 5, 7], [3, 5]),
+        (3, 2, 1, [3, 5, 7], [7]),
     ],
 )
 def test_p2p_ffn_metadata_tracks_each_attention_peer_in_xayf(
@@ -439,14 +456,6 @@ def test_p2p_tensor_metadata_clamps_idle_attention_rank_to_dummy_token():
                 "num_ffn_ranks": 2,
             },
             "num_attention_ranks >= num_ffn_ranks",
-        ),
-        (
-            {
-                "connector": "P2pNcclAFDConnector",
-                "num_attention_ranks": 3,
-                "num_ffn_ranks": 2,
-            },
-            "multiple of num_ffn_ranks",
         ),
     ],
 )

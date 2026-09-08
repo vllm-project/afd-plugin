@@ -14,7 +14,7 @@ It supports both prefill and decode which all support eager mode. CUDA graph sup
 
 ## How it works
 
-Throughout this section, let `A = num_attention_ranks`, `F = num_ffn_ranks`, and `ratio = A / F`. The topology rules (`A >= F`, `A % F == 0`) guarantee `ratio` is a whole number and make `min_size = min(A, F) = F`. One physical process sits at up to three different rank numbers — an AFD world rank, a subgroup rank, and a control-plane (`p2p`) rank — all derived deterministically from the role, role rank, and topology counts.
+Throughout this section, let `A = num_attention_ranks` and `F = num_ffn_ranks`. The topology rule (`A >= F`) makes `min_size = min(A, F) = F`. Each subgroup's `ratio` is the number of Attention peers it holds; when `F` divides `A` every subgroup holds `A / F` of them, and otherwise the counts differ by one. One physical process sits at up to three different rank numbers — an AFD world rank, a subgroup rank, and a control-plane (`p2p`) rank — all derived deterministically from the role, role rank, and topology counts.
 
 ### AFD world (shared rendezvous)
 
@@ -29,7 +29,7 @@ FFN role rank `i` gets world rank `i`; Attention role rank `j` gets world rank `
 
 ### Data plane: one subgroup per FFN rank
 
-Each FFN rank `k` owns subgroup `k`, containing itself plus its `ratio` consecutive Attention peers `A(k*ratio) .. A(k*ratio + ratio - 1)`. Inside a subgroup the FFN rank is always subgroup rank `0` and the Attention peers occupy subgroup ranks `1..ratio`.
+Each FFN rank `k` owns subgroup `k`, containing itself plus the consecutive Attention peers assigned to it: Attention rank `a` joins subgroup `a * F // A`, which is `a // ratio` whenever `F` divides `A`. Inside a subgroup the FFN rank is always subgroup rank `0` and the Attention peers occupy subgroup ranks `1..ratio`.
 
 Each subgroup is its own process group, rendezvoused on the AFD world's store under a `PrefixStore` of its own so no extra port is needed, carrying two NCCL communicators: Attention-to-FFN for hidden states and FFN-to-Attention for FFN outputs. Per layer/stage, each Attention peer sends its hidden states to subgroup rank `0`; the FFN rank receives from ranks `1..ratio` in order, concatenates along the token dimension, runs FFN work, splits the output by the recorded sequence lengths, and sends each slice back to the originating Attention rank. The data path uses vLLM `PyNcclCommunicator.send()` / `recv()` on the current CUDA stream.
 
@@ -105,10 +105,9 @@ role rank.
 
 ```text
 num_attention_ranks >= num_ffn_ranks
-num_attention_ranks % num_ffn_ranks == 0
 ```
 
-Therefore, every FFN rank maps to the same integer number of consecutive Attention ranks.
+The Attention ranks are then spread over the FFN ranks in consecutive blocks that differ in size by at most one: Attention rank `a` joins the subgroup of FFN rank `a * F // A`. When `F` divides `A` every FFN rank maps to the same number of Attention ranks, as before.
 
 Examples:
 
@@ -118,7 +117,7 @@ Examples:
 | `2A2F` | Yes | `F0 <-> A0`, `F1 <-> A1` |
 | `4A2F` | Yes | `F0 <-> A0,A1`, `F1 <-> A2,A3` |
 | `1A2F` | No | Attention rank count is smaller than FFN rank count. |
-| `3A2F` | No | Attention rank count is not divisible by FFN rank count. |
+| `3A2F` | Yes | `F0 <-> A0,A1`, `F1 <-> A2` |
 
 ## Minimal launch shape
 

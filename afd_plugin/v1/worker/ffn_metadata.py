@@ -14,14 +14,17 @@ def aggregate_ffn_token_counts(
 ) -> tuple[int, ...]:
     """Aggregate consecutive Attention-rank counts for each FFN rank.
 
-    For example, ``4A2F`` counts ``(0, 4, 5, 6)`` become ``(5, 11)`` because
-    every zero-token Attention peer contributes one placeholder row. Missing
-    peers use the same per-peer fallback, so empty counts become ``(2, 2)``.
+    The blocks are the ones the rank mapping builds: contiguous and differing
+    in size by at most one, so ``3A2F`` groups ``{A0, A1}`` onto ``F0`` and
+    ``{A2}`` onto ``F1``. For example, ``4A2F`` counts ``(0, 4, 5, 6)`` become
+    ``(5, 11)`` because every zero-token Attention peer contributes one
+    placeholder row. Missing peers use the same per-peer fallback, so empty
+    counts become ``(2, 2)``.
     """
 
     fallback_count = max(1, int(fallback))
     fallback_counts = tuple(fallback_count for _ in range(max(0, ffn_size)))
-    if ffn_size <= 0 or attention_size < ffn_size or attention_size % ffn_size != 0:
+    if ffn_size <= 0 or attention_size < ffn_size:
         return fallback_counts
 
     expanded_counts = attention_counts
@@ -36,15 +39,17 @@ def aggregate_ffn_token_counts(
             for rank in range(attention_size)
         )
 
-    group_size = attention_size // ffn_size
+    # Block ``g`` spans Attention ranks ``[ceil(g*A/F), ceil((g+1)*A/F))``, the
+    # same partition ``build_rank_mapping`` uses. The ``+ ffn_size - 1`` rounds
+    # the division up; it is a plain ``//`` when ``ffn_size`` divides ``g*A``.
     return tuple(
         sum(
             max(1, int(expanded_counts[attention_rank]))
             if attention_rank < len(expanded_counts)
             else fallback_count
             for attention_rank in range(
-                ffn_rank * group_size,
-                (ffn_rank + 1) * group_size,
+                (ffn_rank * attention_size + ffn_size - 1) // ffn_size,
+                ((ffn_rank + 1) * attention_size + ffn_size - 1) // ffn_size,
             )
         )
         for ffn_rank in range(ffn_size)

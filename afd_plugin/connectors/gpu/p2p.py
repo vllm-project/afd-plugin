@@ -15,7 +15,9 @@ Topology:
     consecutive Attention ranks, which requires::
 
         num_attention_ranks >= num_ffn_ranks
-        num_attention_ranks % num_ffn_ranks == 0
+
+    The Attention ranks are spread over the FFN ranks in blocks that differ
+    in size by at most one, so the counts need not divide evenly.
 
     Attention sends hidden states to its mapped FFN rank; the FFN rank
     concatenates inputs from its Attention peers, runs FFN work, splits the
@@ -751,10 +753,10 @@ class P2pNcclAFDControlPlane(AFDControlPlane):
                 for src_rank in range(1, connector.group_size):
                     if src_rank <= 0 or src_rank >= connector.group_size:
                         raise ValueError(f"invalid Attention subgroup rank {src_rank}")
+                    # Subgroups need not be the same size, so read the peer
+                    # from the roster instead of assuming a uniform ratio.
                     attention_rank = (
-                        connector.mapping.subgroup_index * connector.ratio
-                        + src_rank
-                        - 1
+                        connector.mapping.subgroup_ranks[src_rank] - connector.ffn_size
                     )
 
                     tensor_metadata = _TensorMetadata(

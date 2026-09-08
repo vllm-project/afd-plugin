@@ -110,8 +110,9 @@ synchronous NPU runtime requires both common and connector-local values to be
 | `CAMAsyncAFDConnector` | Ascend | Attention ranks, then FFN ranks | `None`; routing/token metadata travels with CAM dispatch payloads | `connector.control_plane is None` |
 
 The CUDA P2P mapping requires
-`num_attention_ranks >= num_ffn_ranks` and an integral A/F ratio. Each FFN rank
-owns a subgroup containing itself and consecutive Attention peers. CAMP2P also
+`num_attention_ranks >= num_ffn_ranks`. Each FFN rank owns a subgroup containing
+itself and consecutive Attention peers; the peers are distributed in blocks that
+differ in size by at most one, so an integral A/F ratio is not required. CAMP2P also
 requires at least as many Attention ranks as FFN ranks; its control and HCCL
 groups remain connector-owned. CAM async maps role ranks directly into an
 Attention-first world and distributes routed experts across FFN ranks.
@@ -258,7 +259,7 @@ metadata is present.
 
 | Connector | Connector-owned resources | Topology constraints and mapping |
 | --- | --- | --- |
-| CUDA P2P | AFD process group, PyNccl data communicators, separate NCCL metadata group, compiled custom-op communicator registry, and graph-oriented receive buffers/state. | Requires `A >= F` and `A % F == 0`. One FFN rank is grouped with a consecutive block of `A/F` Attention ranks in FFN-first ordering. |
+| CUDA P2P | AFD process group, PyNccl data communicators, separate NCCL metadata group, compiled custom-op communicator registry, and graph-oriented receive buffers/state. | Requires `A >= F`. One FFN rank is grouped with a consecutive block of Attention ranks in FFN-first ordering; the blocks differ in size by at most one, and hold `A/F` ranks each when `F` divides `A`. |
 | Ascend CAMP2P | AFD process group, one HCCL communication group per ubatch, FFN HCCL state, Gloo metadata group, custom-op state and transfer handles. | FFN-first ordering and `A >= F`; group construction derives each FFN/Attention mapping. |
 | Ascend CAM async | Attention-first HCCL group, external CAM operator state, per-stage pending Attention payload queues, and connector work-item state. | Role ranks map into a combined Attention-first world; CAM tensor metadata determines actual layer and routed/shared token counts. |
 
