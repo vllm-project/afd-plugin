@@ -126,14 +126,15 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
     # Patch reason: native DeepSeek-V4 always constructs Attention and FFN.
     # Patch functionality: allocate only the stage owned by the active AFD role.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/models/deepseek_v4/nvidia/model.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.28.0, vllm/models/deepseek_v4/nvidia/model.py
+    # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
     def __init__(
         self,
         vllm_config,
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        eager_scratch_pool=None,
     ):
         # ### PATCH START: construct a role-local decoder stage.
         nn.Module.__init__(self)
@@ -152,6 +153,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 prefix=f"{prefix}.attn",
                 topk_indices_buffer=topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
+                eager_scratch_pool=eager_scratch_pool,
             )
             self.ffn = RemoteDeepseekV4FFN(layer_idx=layer_idx)
         elif afd_config.role == "ffn":
@@ -203,8 +205,8 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
     # Patch functionality: preserve native mHC state locally while the proxy
     # transfers only the two-dimensional FFN activation and input IDs.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/models/deepseek_v4/nvidia/model.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.28.0, vllm/models/deepseek_v4/nvidia/model.py
+    # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
     def forward(
         self,
         x: torch.Tensor,
@@ -319,8 +321,8 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
     # Patch reason: native DeepSeek-V4 allocates every decoder stage and stream.
     # Patch functionality: build role-aware layers and Attention-only resources.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/models/deepseek_v4/nvidia/model.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.28.0, vllm/models/deepseek_v4/nvidia/model.py
+    # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # ### PATCH START: validate the deliberately narrow first release.
         nn.Module.__init__(self)
@@ -373,6 +375,30 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         else:
             aux_stream_list = None
             self.topk_indices_buffer = None
+
+        # vLLM 0.28.0 derives use_sequence_parallel from the EP/TP/DP layout,
+        # which would enable native SP paths for AFD DP2TP2 layouts; AFD
+        # rejects sequence-parallel MoE, so pin the flag the forward reads.
+        self.use_sequence_parallel = False
+        # Mirror the native eager-mode scratch pool: Attention-side sparse MLA
+        # consumes it whenever DBO/uBatching is disabled.
+        self.eager_scratch_pool = None
+        if self.afd_config.role == "attention" and not parallel_config.use_ubatching:
+            padded_heads = native._select_dsv4_attn_cls(
+                vllm_config
+            ).get_padded_num_q_heads(
+                config.num_attention_heads
+                // native.get_tensor_model_parallel_world_size()
+            )
+            self.eager_scratch_pool = native.DeepseekV4EagerScratchPool(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                padded_heads,
+                config.head_dim,
+                config.index_n_heads,
+                config.index_head_dim,
+                config.index_topk,
+                native.current_platform.device_type,
+            )
         # ### PATCH END
 
         if native.get_pp_group().is_first_rank:
@@ -393,6 +419,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
+                eager_scratch_pool=self.eager_scratch_pool,
             ),
             prefix=f"{prefix}.layers",
         )
