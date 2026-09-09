@@ -44,6 +44,7 @@ public:
         this->Attr("aiv_num").Int();
 
         this->AICore().AddConfig("ascend910_93");
+        this->AICore().AddConfig("ascend950");
         this->MC2().HcclGroup({"group_ep"});
     }
 };

@@ -146,6 +146,8 @@ extend-ignore-identifiers-re = [
     ".*nin.*",
     ".*[Oo]no.*[Aa]nna.*",
     ".*cann.*",
+    "alog",
+    ".*alog.*",
     ".*[Nn][Dd]3.*",
     ".*updator.*",
     "byt5.*",
