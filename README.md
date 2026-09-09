@@ -75,7 +75,9 @@ Known gaps:
 - Qwen3 MoE currently rejects Attention-side gate placement, sequence-parallel
   MoE, EPLB, pipeline parallelism, speculative decoding, LoRA, and NPU.
 - Qwen3.5/Qwen3.6 MoE adapter-family support is limited to the CUDA text-only
-  lane; repository hardware E2E evidence currently covers Qwen3.6-35B-A3B.
+  lane; repository hardware E2E evidence covers Qwen3.6-35B-A3B on
+  vLLM `0.28.0` (baseline-graph/afd-eager-2a1f/afd-graph-2a1f; the DBO
+  scenario is blocked by the known 2A1F DBO FFN CUDA-graph defect).
   NPU and multimodal execution are unsupported/unverified;
   `compute_gate_on_attention=true`, pipeline parallelism, asynchronous and
   multi-node execution are unsupported; quantization is unverified; no

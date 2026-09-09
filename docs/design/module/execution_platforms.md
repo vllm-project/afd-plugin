@@ -332,7 +332,9 @@ an expansion of the supported runtime contract.
 All rows target vLLM 0.28.0. Hardware validation on vLLM 0.28.0 exists for
 the CUDA V1 row (DeepSeek-V2-Lite eager/graph/DBO 2A2F) and the CUDA V2 row
 (`afd-v2-eager/graph-dp2/tp2`), both on NVIDIA L20X with GSM8K-7 per
-scenario; the Ascend V1, Ascend V2, and CAM-async rows keep their v0.26-era
+scenario; the Qwen3 MoE 2A1F and Qwen3.6-35B-A3B suites also pass on
+0.28.0 (Qwen3.6 DBO excluded for the known 2A1F DBO FFN CUDA-graph
+defect); the Ascend V1, Ascend V2, and CAM-async rows keep their v0.26-era
 evidence and are not re-validated on 0.28.0 — the Ascend rows additionally
 await the NPU runtime upgrade. The Ascend V2 row remains an implemented,
 unit-tested contract rather than a hardware-validated claim. GPU/NPU rank topology and
