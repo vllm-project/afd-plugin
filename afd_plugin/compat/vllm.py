@@ -35,6 +35,24 @@ def is_vllm_version_supported(installed_version: str | None = None) -> bool:
     return _parse_release(installed_version) == _parse_release(TARGET_VLLM_VERSION)
 
 
+def is_target_vllm_compatible() -> bool:
+    """Whether the compatibility patches should install.
+
+    Accepts the target minor line and development builds; an absent or
+    stubbed vLLM keeps the guard permissive for CPU-only imports.
+    """
+    try:
+        import vllm
+
+        version_value = vllm.__version__
+    except (AttributeError, ImportError):
+        return True
+    version_text = str(version_value)
+    if "dev" in version_text:
+        return True
+    return version_text.startswith(TARGET_VLLM_VERSION)
+
+
 def assert_vllm_version_supported(*, strict: bool = True) -> None:
     installed_version = get_installed_vllm_version()
     if is_vllm_version_supported(installed_version):
@@ -52,6 +70,7 @@ def assert_vllm_version_supported(*, strict: bool = True) -> None:
 
 __all__ = [
     "TARGET_VLLM_VERSION",
+    "is_target_vllm_compatible",
     "assert_vllm_version_supported",
     "get_installed_vllm_version",
     "is_vllm_version_supported",

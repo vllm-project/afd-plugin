@@ -451,12 +451,9 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                     ),
                 )
                 if self.compute_gate_on_attention and device_type == "cuda":
-                    # Keep the native gate parameter and path for loader/model
-                    # compatibility. In vLLM 0.28.0 the runner created by
-                    # FusedMoEFactory holds the gate and computes router logits
-                    # internally only when runner.gate is set; clearing it makes
-                    # the runner consume the router logits transferred from
-                    # Attention.
+                    # Keep the gate weights loadable, but with the runner's
+                    # gate cleared it consumes the Attention-side router
+                    # logits instead of computing its own.
                     self.mlp.experts.gate = None
             else:
                 self.mlp = native.DeepseekV2MLP(

@@ -481,12 +481,9 @@ class _AFDFFNKVCacheConfig:
 
 
 class _AFDFFNNoopScheduler:
-    # A freshly spawned FFN engine process loads the AFD patches in the middle
-    # of its first native ``EngineCore.__init__`` frame: the class-level patch
-    # then diverts only the nested ``_initialize_kv_caches`` call, and the
-    # native frame keeps running against this noop scheduler. The attributes
-    # below mirror everything upstream still touches after KV-cache setup
-    # (vLLM 0.28.0 added the ``ec_connector`` output-aggregator check).
+    # A cold FFN engine loads the patches mid-native-init and then runs on
+    # with this noop, so it must mirror every scheduler member upstream
+    # touches after KV-cache setup.
     connector = None
     ec_connector = None
 

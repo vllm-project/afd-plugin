@@ -257,8 +257,7 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
             raise RuntimeError("native Qwen MoE is owned by the FFN role")
         if not isinstance(self.mlp, native.Qwen3NextSparseMoeBlock):
             raise RuntimeError("FFN role does not own native Qwen MoE")
-        # In vLLM 0.28.0 the runner computes routing internally exactly when
-        # its gate is present; AFD Qwen always keeps the local router.
+        # The runner routes internally exactly when its gate is present.
         if self.mlp.experts.gate is None:
             raise RuntimeError("FFN native runner must use its local router")
         return self.mlp(hidden_states)

@@ -376,12 +376,11 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
             aux_stream_list = None
             self.topk_indices_buffer = None
 
-        # vLLM 0.28.0 derives use_sequence_parallel from the EP/TP/DP layout,
-        # which would enable native SP paths for AFD DP2TP2 layouts; AFD
-        # rejects sequence-parallel MoE, so pin the flag the forward reads.
+        # AFD rejects sequence-parallel MoE; pin the flag the forward reads
+        # because 0.28.0 derives it from the EP/TP/DP layout.
         self.use_sequence_parallel = False
-        # Mirror the native eager-mode scratch pool: Attention-side sparse MLA
-        # consumes it whenever DBO/uBatching is disabled.
+        # Same eager-mode scratch pool the native model allocates for
+        # Attention-side sparse MLA.
         self.eager_scratch_pool = None
         if self.afd_config.role == "attention" and not parallel_config.use_ubatching:
             padded_heads = native._select_dsv4_attn_cls(
