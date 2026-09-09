@@ -301,6 +301,23 @@ def test_engine_core_patch_skips_kv_scheduler_init_for_ffn(monkeypatch):
     assert isinstance(engine.model_executor, Executor)
 
 
+def test_ffn_noop_scheduler_tolerates_late_patch_load():
+    """A cold FFN engine loads the patches mid-native-init.
+
+    The native frame then runs on with the noop scheduler returned by the
+    patched ``_initialize_kv_caches``, so the noop must expose every
+    scheduler attribute upstream touches after KV-cache setup — including
+    the vLLM 0.28.0 ``ec_connector`` output-aggregator check.
+    """
+    from afd_plugin.compat.patches.engine_core import _AFDFFNNoopScheduler
+
+    scheduler = _AFDFFNNoopScheduler()
+    assert scheduler.connector is None
+    assert scheduler.ec_connector is None
+    assert scheduler.get_kv_connector() is None
+    assert scheduler.has_requests() is False
+
+
 def test_engine_core_patch_leaves_cuda_non_ffn_path_untouched(monkeypatch):
     core_module = _install_fake_vllm_core(monkeypatch)
     _load_patch_module()
