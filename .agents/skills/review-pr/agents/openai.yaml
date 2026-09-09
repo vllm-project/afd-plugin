@@ -1,0 +1,4 @@
+interface:
+  display_name: "AFD Plugin PR Review"
+  short_description: "Review afd-plugin PRs with patch-contract and evidence rules"
+  default_prompt: "Use $review-pr to review this afd-plugin pull request with evidence-backed findings."
