@@ -66,7 +66,8 @@ Known gaps:
 - The Ascend NPU pairing below is the v0.26 baseline: the vLLM `0.28.0`
   version gate excludes the NPU runtime until the NPU upgrade lands, so
   NPU execution is not claimed by this release.
-- vLLM/vLLM-Ascend model runner v2 is not supported.
+- The CUDA model runner v2 is validated (DeepSeek-V2-Lite `afd-v2-*`
+  scenarios); the Ascend model runner v2 remains unit-tested only.
 - GPU and NPU E2E tests are opt-in and require real hardware plus model weights.
 - GPU CUDA graph support is limited to `FULL_DECODE_ONLY`.
 - Native DBO is limited to exactly two ubatches and is not supported by

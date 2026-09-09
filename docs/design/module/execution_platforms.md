@@ -329,12 +329,13 @@ an expansion of the supported runtime contract.
 | Ascend V2 + `CAMP2pAFDConnector` | Eager, `FULL`, or `FULL_DECODE_ONLY` native V2 ACL Graph | DBO and ubatching rejected | `compute_gate_on_attention=false`; PP/CP, elastic EP, EPLB, SP MoE, and compile SP rejected; role ranks equal DP x TP | Focused runner, context, validation, and device-contract unit tests; no repository hardware E2E case |
 | Ascend + `CAMAsyncAFDConnector` | Eager only | Native DBO rejected; optional AFD-managed MoE ubatching uses exactly two request or token-balanced stages | Experimental v0.26 port; `async=true`; documented path uses common `compute_gate_on_attention=true`; token mode requires Attention TP > 1; model runner v1 PCP is unsupported; prefill and decode context parallelism are unsupported; `connector_extra_config.dynamicQuant` is 0 or 1; external CAM ops required | Focused unit coverage; pre-fix DP3TP2/EP2 six-case E2E matrix; post-fix full 61-layer DP2TP8+EP16 token-split run reached `0.9522` strict match on the complete GSM8K evaluation |
 
-All rows target vLLM 0.28.0. Hardware validation on vLLM 0.28.0 exists for the
-CUDA V1 row (DeepSeek-V2-Lite eager/graph/DBO 2A2F on NVIDIA L20X, GSM8K-7
-per scenario); the CUDA V2, Ascend V1, Ascend V2, and CAM-async rows keep
-their v0.26-era evidence and are not re-validated on 0.28.0 — the Ascend rows
-additionally await the NPU runtime upgrade. The Ascend V2 row remains an
-implemented, unit-tested contract rather than a hardware-validated claim. GPU/NPU rank topology and
+All rows target vLLM 0.28.0. Hardware validation on vLLM 0.28.0 exists for
+the CUDA V1 row (DeepSeek-V2-Lite eager/graph/DBO 2A2F) and the CUDA V2 row
+(`afd-v2-eager/graph-dp2/tp2`), both on NVIDIA L20X with GSM8K-7 per
+scenario; the Ascend V1, Ascend V2, and CAM-async rows keep their v0.26-era
+evidence and are not re-validated on 0.28.0 — the Ascend rows additionally
+await the NPU runtime upgrade. The Ascend V2 row remains an implemented,
+unit-tested contract rather than a hardware-validated claim. GPU/NPU rank topology and
 connector resource rules remain owned by
 [connector contracts](connector_contracts.md).
 
