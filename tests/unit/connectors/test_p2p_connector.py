@@ -46,6 +46,19 @@ def _fake_vllm_config(
     )
 
 
+class _NullSwitcher:
+    """Stand-in for DefaultProcessGroupSwitcher when no real group exists."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *args):
+        return False
+
+
 def _tolist(value):
     tolist = getattr(value, "tolist", None)
     if callable(tolist):
@@ -671,3 +684,58 @@ def test_p2p_recv_single_rank_requires_ref_tensor():
             connector.e2a_comm_id,
             tensor_metadata,
         )
+
+
+@pytest.mark.parametrize(
+    ("role", "role_rank", "expected_subgroup"),
+    [("ffn", 0, 0), ("ffn", 1, 1), ("attention", 0, 0), ("attention", 3, 1)],
+)
+def test_p2p_subgroup_rendezvous_reuses_the_afd_world_store(
+    monkeypatch, role, role_rank, expected_subgroup
+):
+    """Subgroups share the AFD world's store under a per-subgroup prefix.
+
+    Creating a store of their own would bind ``afd.host``, which only the rank
+    that lives on that host can do, so FFN ranks on other nodes could not come
+    up. Keys must stay separated per subgroup or the two subgroups overwrite
+    each other's ncclUniqueId.
+    """
+    from torch.distributed import HashStore
+
+    module = importlib.import_module("afd_plugin.connectors.gpu.p2p")
+
+    root_store = HashStore()
+    afd_pg = SimpleNamespace(get_group_store=lambda: root_store)
+
+    monkeypatch.setattr(module, "init_afd_process_group", lambda **kwargs: afd_pg)
+    monkeypatch.setattr(module, "_get_default_group", lambda: None)
+    monkeypatch.setattr(module, "DefaultProcessGroupSwitcher", _NullSwitcher)
+    monkeypatch.setattr(module, "PyNcclCommunicator", lambda **kwargs: object())
+    monkeypatch.setattr(module, "_register_comm", lambda communicator: 0)
+    monkeypatch.setattr(module, "_register_p2p_custom_ops", lambda: None)
+
+    connector = AFDConnectorFactory.create_connector(
+        role_rank,
+        0,
+        _fake_vllm_config(
+            data_parallel_size=4 if role == "attention" else 2,
+            data_parallel_rank=role_rank,
+        ),
+        AFDConfig(
+            role=role,
+            connector="P2pNcclAFDConnector",
+            num_attention_ranks=4,
+            num_ffn_ranks=2,
+            host="10.0.0.1",
+            port=6269,
+        ),
+    )
+    connector.init_afd_connector()
+
+    assert connector.mapping.subgroup_index == expected_subgroup
+
+    # A write through the subgroup store lands under that subgroup's prefix
+    # only, so the sibling subgroup never sees the key.
+    connector.a2e_group.store.set("probe", b"value")
+    assert root_store.get(f"afd_subgroup_{expected_subgroup}/probe") == b"value"
+    assert root_store.check([f"afd_subgroup_{1 - expected_subgroup}/probe"]) is False

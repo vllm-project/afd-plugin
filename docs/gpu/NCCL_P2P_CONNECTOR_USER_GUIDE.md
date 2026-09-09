@@ -32,7 +32,7 @@ FFN role rank `i` gets world rank `i`; Attention role rank `j` gets world rank `
 
 Each FFN rank `k` owns subgroup `k`, containing itself plus its `ratio` consecutive Attention peers `A(k*ratio) .. A(k*ratio + ratio - 1)`. Inside a subgroup the FFN rank is always subgroup rank `0` and the Attention peers occupy subgroup ranks `1..ratio`.
 
-Each subgroup is its own process group rendezvoused on `port + subgroup_index + 1` (this is where the derived-port requirement comes from), carrying two NCCL communicators: Attention-to-FFN for hidden states and FFN-to-Attention for FFN outputs. Per layer/stage, each Attention peer sends its hidden states to subgroup rank `0`; the FFN rank receives from ranks `1..ratio` in order, concatenates along the token dimension, runs FFN work, splits the output by the recorded sequence lengths, and sends each slice back to the originating Attention rank. The data path uses vLLM `PyNcclCommunicator.send()` / `recv()` on the current CUDA stream.
+Each subgroup is its own process group, rendezvoused on the AFD world's store under a `PrefixStore` of its own so no extra port is needed, carrying two NCCL communicators: Attention-to-FFN for hidden states and FFN-to-Attention for FFN outputs. Per layer/stage, each Attention peer sends its hidden states to subgroup rank `0`; the FFN rank receives from ranks `1..ratio` in order, concatenates along the token dimension, runs FFN work, splits the output by the recorded sequence lengths, and sends each slice back to the originating Attention rank. The data path uses vLLM `PyNcclCommunicator.send()` / `recv()` on the current CUDA stream.
 
 ### Control plane: the DP metadata group
 
@@ -87,7 +87,7 @@ AFD configuration is supplied through vLLM's `--additional-config` under the `af
 | `role` | `"attention" \| "ffn"` | `"attention"` | Role owned by this process. Attention sends hidden states; FFN receives and returns FFN outputs. |
 | `connector` | `str` | `"P2pNcclAFDConnector"` | Must be `P2pNcclAFDConnector` for this GPU path. |
 | `host` | `str` | `"127.0.0.1"` | Non-empty rendezvous/control-plane host. All participating ranks must use a reachable, identical value. Host must be the first rank of FFN.|
-| `port` | `int` | `1239` | Base rendezvous port, valid range `1..65535`. The connector also uses `port + subgroup_index + 1`, so those ports must be free and reachable. |
+| `port` | `int` | `1239` | Rendezvous port on `host`, valid range `1..65535`. It must be free and reachable. Subgroups share this rendezvous and need no ports of their own. |
 | `num_attention_ranks` | `int` | `1` | Total number of AFD Attention ranks, including DP/TP-derived worker ranks. Must be positive. |
 | `num_ffn_ranks` | `int` | `1` | Total number of AFD FFN ranks, including DP/TP-derived worker ranks. Must be positive. |
 | `compute_gate_on_attention` | `bool` | `false` | When `false`, FFN owns the native gate and experts. When `true`, Attention owns the native gate and transfers router logits to the FFN external-router expert path. |
@@ -170,7 +170,7 @@ For complete `1A1F`, `2A2F`, `4A4F`, eager, DBO, and CUDA graph examples, see `r
 - CUDA-capable PyTorch/vLLM environment with NCCL and vLLM's `PyNcclCommunicator` available.
 - Hidden-state tensors must reside on CUDA devices; CPU tensors are rejected.
 - All ranks must agree on `host`, `port`, rank counts, model hidden size/dtype, and role-rank assignment.
-- The rendezvous base port and derived subgroup ports must be free and reachable.
+- The rendezvous port on `host` must be free and reachable.
 - Initialization is collective: missing ranks, mismatched counts, or duplicate role ranks can cause initialization failure or timeout.
 - Current GPU CUDA graph support is `FULL_DECODE_ONLY`; GPU DBO plus CUDA graph is limited to exactly two ubatches.
 - CUDA remote experts do not currently support EPLB on the Attention role.

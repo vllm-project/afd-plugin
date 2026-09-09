@@ -47,8 +47,8 @@ Requirements and limitations:
       size/dtype, and role-rank assignment. Initialization is collective:
       missing ranks, mismatched counts, or duplicate role ranks can cause
       initialization failure or timeout.
-    - The rendezvous base ``port`` and the derived subgroup ports
-      (``port + subgroup_index + 1``) must be free and reachable.
+    - The rendezvous ``port`` on ``host`` must be free and reachable. Subgroups
+      share that rendezvous and do not need ports of their own.
     - AFD async mode (``async`` / ``async_dp``) is not supported; GPU DBO
       combined with CUDA graphs is limited to exactly two ubatches.
     - Cross-node use is not established by the checked-in recipes and should
@@ -66,7 +66,11 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
-from torch.distributed.distributed_c10d import ProcessGroup, _get_default_group
+from torch.distributed.distributed_c10d import (
+    PrefixStore,
+    ProcessGroup,
+    _get_default_group,
+)
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.forward_context import DPMetadata
@@ -241,10 +245,10 @@ class P2pNcclAFDConnector(AFDConnectorBase):
 
         1. Joins the AFD world process group (FFN ranks first, then Attention
            ranks) rendezvoused at ``tcp://host:port``.
-        2. Creates this rank's subgroup ``StatelessProcessGroup`` on
-           ``port + subgroup_index + 1`` and two ``PyNcclCommunicator``
-           instances over it (Attention-to-FFN and FFN-to-Attention), each
-           registered for use by the P2P custom ops.
+        2. Creates this rank's subgroup ``StatelessProcessGroup`` over a
+           ``PrefixStore`` on the AFD world's rendezvous store, and two
+           ``PyNcclCommunicator`` instances over it (Attention-to-FFN and
+           FFN-to-Attention), each registered for use by the P2P custom ops.
         3. On ranks that participate in the DP metadata control plane, joins
            the ``p2p`` process group that ``control_plane`` uses to
            distribute per-stage token counts.
@@ -266,12 +270,18 @@ class P2pNcclAFDConnector(AFDConnectorBase):
         )
 
         with DefaultProcessGroupSwitcher(_get_default_group(), afd_pg):
-            base_port = self.afd_config.port
-            self.a2e_group = StatelessProcessGroup.create(
-                host=self.afd_config.host,
-                port=base_port + self.mapping.subgroup_index + 1,
+            # The subgroup only has to hand rank 0's ncclUniqueId to its
+            # members, so it reuses the store the AFD world already
+            # rendezvoused on. StatelessProcessGroup.create would stand up a
+            # second store bound to ``host``, which is only correct while
+            # every subgroup's rank 0 sits on that host.
+            self.a2e_group = StatelessProcessGroup(
                 rank=self.mapping.rank_in_subgroup,
                 world_size=len(self.mapping.subgroup_ranks),
+                store=PrefixStore(
+                    f"afd_subgroup_{self.mapping.subgroup_index}",
+                    afd_pg.get_group_store(),
+                ),
             )
             self.e2a_group = self.a2e_group
             self.a2e_pynccl = PyNcclCommunicator(
