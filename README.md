@@ -16,7 +16,7 @@ tests for GPU and Ascend NPU deployments.
 > This project is still experimental and needs more large-scale testing across
 > different hardware backends.
 
-The target runtime is **vLLM `v0.26.0`**. The plugin does not modify the vLLM
+The target runtime is **vLLM `v0.28.0`**. The plugin does not modify the vLLM
 source tree. AFD behavior is installed through the `vllm.general_plugins` entry
 point, `--additional-config`, automatically selected role workers, plugin-owned
 model wrappers, and narrow version-scoped compatibility shims.
@@ -62,7 +62,10 @@ Connector implementations are grouped by backend package:
 
 Known gaps:
 
-- vLLM versions other than `0.26.0` are not claimed as supported.
+- vLLM versions other than `0.28.0` are not claimed as supported.
+- The Ascend NPU pairing below is the v0.26 baseline: the vLLM `0.28.0`
+  version gate excludes the NPU runtime until the NPU upgrade lands, so
+  NPU execution is not claimed by this release.
 - vLLM/vLLM-Ascend model runner v2 is not supported.
 - GPU and NPU E2E tests are opt-in and require real hardware plus model weights.
 - GPU CUDA graph support is limited to `FULL_DECODE_ONLY`.
@@ -101,7 +104,7 @@ command:
 uv sync --group dev --extra vllm
 ```
 
-The optional extra pins `vllm==0.26.0`.
+The optional extra pins `vllm==0.28.0`.
 
 ### Ascend NPU installation
 
@@ -112,14 +115,17 @@ the devices with `npu-smi info`. Use this source baseline:
 | Component | Version |
 | --- | --- |
 | Python | `3.10` or `3.11` |
-| vLLM | `0.26.0` |
+| vLLM | `0.26.0` (NPU baseline, pending the 0.28 NPU upgrade) |
 | vLLM-Ascend | commit [`80d8c194f`](https://github.com/vllm-project/vllm-ascend/commit/80d8c194f7584b17fe08065ea99a130916f6b0e7) |
 | CANN / torch / torch-npu | Use the mutually compatible versions required by that vLLM-Ascend source snapshot. |
 
 #### Environment
 
-The v0.26 integration was refreshed against vLLM-Ascend commit `80d8c194f`;
-the repository does not currently claim a released v0.26 container tag. Use the
+The NPU integration was last refreshed against vLLM-Ascend commit `80d8c194f`
+(the v0.26 baseline). The current release gates the plugin on vLLM `0.28.0`,
+which the NPU runtime above does not satisfy, so NPU execution is
+**unsupported until the NPU upgrade lands**; the instructions below are kept
+as the pending-upgrade baseline. Use the
 [installation guide at that source snapshot](https://github.com/vllm-project/vllm-ascend/blob/80d8c194f7584b17fe08065ea99a130916f6b0e7/docs/source/installation.md)
 to prepare a matching A3/openEuler environment, then install AFD from the
 repository root. Do not reuse the former v0.19.1rc1 image as a v0.26 runtime.

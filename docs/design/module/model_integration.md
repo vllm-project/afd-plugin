@@ -145,7 +145,7 @@ focused unit coverage but no repository model or accuracy E2E case.
 `AFDQwen3MoeModel` uses the native `decoder_layer_type` injection hook. The
 Attention role constructs native Qwen Attention and normalization modules and
 uses a parameter-free `RemoteFFNProxy`; the FFN role constructs the complete
-native dense MLP or `Qwen3MoeSparseMoeBlock`. Native forward order, FusedMoE,
+native dense MLP or `Qwen3MoeSparseMoeBlock`. Native forward order, the FusedMoEFactory/MoERunner pipeline,
 packed parameter mapping, quantization paths, and weight loading remain owned
 by vLLM. Checkpoint weights are filtered once by layer-stage path before the
 native loader consumes them.

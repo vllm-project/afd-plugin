@@ -42,7 +42,7 @@ or any behavior that intentionally differs from the original AFD commit.
 
 - [ ] Purpose is clear and linked to public context when possible.
 - [ ] Scope is bounded.
-- [ ] Compatibility with vLLM v0.26.0 is considered.
+- [ ] Compatibility with vLLM v0.28.0 is considered.
 - [ ] No changes are made to the vLLM source checkout.
 - [ ] Plugin-owned classes or explicit dotted class paths are preferred over monkey patches.
 - [ ] Any compat shim or monkey patch is isolated, idempotent, version-guarded, documented, and tested.
