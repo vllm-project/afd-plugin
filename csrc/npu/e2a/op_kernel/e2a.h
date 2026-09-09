@@ -30,7 +30,12 @@ class E2a {
     constexpr static int64_t MAGIC_OFFSET = 32;
     constexpr static uint32_t INT32_COUNT_PER_BLOCK = 8;
     constexpr static uint32_t DOUBLE_BUFFER_COUNT = 2;
+#if defined(AFD_ARCH_A5)
+    // A5 per-rank window step is EP_RANK_OFFSET_STEP (1KB), not the A3 512B step.
+    constexpr static uint32_t OPT_RANK_OFFSET = 1024;
+#else
     constexpr static uint32_t OPT_RANK_OFFSET = 512;
+#endif
 public:
     __aicore__ inline E2a(int rank, int rankSize)
     {

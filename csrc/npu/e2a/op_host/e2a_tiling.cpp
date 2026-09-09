@@ -79,8 +79,11 @@ namespace optiling {
 
         AscendC::Mc2CcTilingConfig mc2CcTilingConfig(groupEp, opType1, algConfigAllToAllStr);
 #ifdef AFD_TILING_HAS_COMM_ENGINE
-        // On A5 (Ascend 950) HCCL allocates MC2 resources via comm engine 3;
-        // without this HcclAllocComResourceByTiling fails with HCCL_E_NOT_SUPPORT.
+        // On A5 (Ascend 950) the MC2 tiling's commEngine field is a
+        // HcclAccelerator, not a CommEngine. The AIV value (=3, see CANN
+        // hccl_params/MAKE_ENUM HcclAccelerator: DEFAULT,HOSTCPU_TS,AICPU_TS,
+        // AIV) is required for the MTE path. SetCommEngine(2)=AICPU_TS is
+        // rejected by HCCL GetTilingAccelerator with HCCL_E_NOT_SUPPORT.
         auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
         if (ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950) {
             mc2CcTilingConfig.SetCommEngine(3);

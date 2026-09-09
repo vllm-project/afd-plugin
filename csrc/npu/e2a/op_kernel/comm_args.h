@@ -16,6 +16,12 @@ constexpr int CAM_MAX_RANK_SIZE = 384; // Maximum number of NPU cards supported 
 
 #ifdef AFD_ARCH_A5
 constexpr uint32_t HCCL_MTE_MAX_RANK_NUM = 64;
+// A5 (Ascend 950) MTE per-rank window layout, taken from CANN ops_transformer
+// moe_distribute_base.h: the state region occupies A5_MTE_STATE_WIN_SIZE at the
+// head of each rank's base, the data region follows, and each rank's per-rank
+// step is EP_RANK_OFFSET_STEP.  This replaces the A3 512B-step/2MB-data offsets.
+constexpr uint64_t A5_MTE_STATE_WIN_SIZE = 1024UL * 1024UL; // state region per rank (bytes)
+constexpr uint32_t EP_RANK_OFFSET_STEP = 1024;              // per-rank window step (bytes)
 
 struct HcclCombinOpParam {
     uint64_t workSpace;          // client和server之间通信的地址
@@ -34,7 +40,14 @@ struct HcclCombinOpParam {
 #endif // AFD_ARCH_A5
 
 constexpr int64_t IPC_BUFF_MAX_SIZE = 100 * 1024 * 1024;
+#ifdef AFD_ARCH_A5
+// On A5 each rank's window keeps a 1MB state region at its head and the data
+// region right after it, so the "data offset" from the state base is the state
+// region size (not the A3 2MB flag+data split).
+constexpr int64_t IPC_DATA_OFFSET = A5_MTE_STATE_WIN_SIZE;
+#else
 constexpr int64_t IPC_DATA_OFFSET = 2 * 1024 * 1024; // First 2MB as flag, then 100MB as data storage
+#endif
 constexpr int64_t PING_PONG_SIZE = 2;
 constexpr int64_t UB_SINGLE_DMA_SIZE_MAX = 190 * 1024;
 constexpr int64_t SMALL_DATA_SIZE = 1 * 1024 * 1024;
