@@ -499,6 +499,9 @@ class _AFDFFNNoopScheduler:
     def get_kv_event_publisher_config(self) -> None:
         return None
 
+    def get_ec_connector(self) -> None:
+        return None
+
     def shutdown(self) -> None:
         return None
 
