@@ -315,6 +315,7 @@ def test_ffn_noop_scheduler_tolerates_late_patch_load():
     assert scheduler.connector is None
     assert scheduler.ec_connector is None
     assert scheduler.get_kv_connector() is None
+    assert scheduler.get_kv_event_publisher_config() is None
     assert scheduler.has_requests() is False
 
 
