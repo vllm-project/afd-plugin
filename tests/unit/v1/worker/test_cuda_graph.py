@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from afd_plugin.v1.worker.cuda_graph import (
     FULL_DECODE_ONLY,
@@ -10,6 +14,11 @@ from afd_plugin.v1.worker.cuda_graph import (
     cudagraph_mode_name,
     graph_run_mode,
     make_ffn_graph_key,
+    pad_counts_to_shape,
+    padded_ffn_graph_buckets,
+    padded_ffn_graph_shape,
+    select_padded_ffn_bucket,
+    shared_rows_for_bucket,
     validate_cuda_graph_mode,
 )
 
@@ -226,3 +235,141 @@ def test_graph_run_mode_requires_attention_replaying(
         )
         is expected
     )
+
+
+# ----------------------------------------------------------------------
+# Padded FFN graph shape
+#
+# A grouped GEMM reads its grouping from a device-side count vector, not from
+# its row count, so one row count can be captured and smaller items padded up
+# to it. These pin what "big enough" means and where the padding lands.
+# ----------------------------------------------------------------------
+
+
+def test_padded_shape_bounds_the_largest_batch():
+    # Worst case for one FFN rank: every token sends every one of its topk
+    # slots here. Shared rows are split contiguously, so a rank holds a share.
+    routed, shared = padded_ffn_graph_shape(
+        num_tokens=8,
+        topk=6,
+        ffn_size=2,
+        has_shared_experts=True,
+    )
+    assert routed == 48
+    assert shared == 4
+
+
+def test_padded_shape_rounds_the_shared_split_up():
+    # 7 tokens over 2 ranks is 4 and 3; the buffer has to hold the larger.
+    _, shared = padded_ffn_graph_shape(
+        num_tokens=7,
+        topk=2,
+        ffn_size=2,
+        has_shared_experts=True,
+    )
+    assert shared == 4
+
+
+def test_padded_shape_has_no_shared_rows_without_shared_experts():
+    routed, shared = padded_ffn_graph_shape(
+        num_tokens=8,
+        topk=6,
+        ffn_size=2,
+        has_shared_experts=False,
+    )
+    assert routed == 48
+    assert shared == 0
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "topk", "ffn_size"),
+    [(0, 6, 2), (8, 0, 2), (8, 6, 0)],
+)
+def test_padded_shape_rejects_nonpositive_inputs(num_tokens, topk, ffn_size):
+    with pytest.raises(ValueError):
+        padded_ffn_graph_shape(
+            num_tokens=num_tokens,
+            topk=topk,
+            ffn_size=ffn_size,
+            has_shared_experts=True,
+        )
+
+
+def test_padding_lands_on_the_last_expert():
+    # Real rows are grouped by expert in ascending order, so the tail of the
+    # row range is the last expert's either way -- charging the padding there
+    # leaves every real row's expert assignment untouched.
+    counts = torch.tensor([3, 2, 1], dtype=torch.int32)
+    pad_counts_to_shape(counts, padded_rows=10, actual_rows=6)
+    assert counts.tolist() == [3, 2, 5]
+    assert int(counts.sum()) == 10
+
+
+def test_padding_an_exact_fit_changes_nothing():
+    counts = torch.tensor([3, 2, 1], dtype=torch.int32)
+    pad_counts_to_shape(counts, padded_rows=6, actual_rows=6)
+    assert counts.tolist() == [3, 2, 1]
+
+
+def test_padding_refuses_rows_that_do_not_fit():
+    counts = torch.tensor([4, 4], dtype=torch.int32)
+    with pytest.raises(ValueError, match="do not fit"):
+        pad_counts_to_shape(counts, padded_rows=6, actual_rows=8)
+
+
+def test_bucket_ladder_puts_exact_stops_on_the_common_item_sizes():
+    # The sizes items actually cluster at: a whole item is max_routed/ffn_size,
+    # a DBO ubatch is half of that. A boundary sitting exactly on either sends
+    # every above-average item a full step up, which is what made the first
+    # bucketed run only 7% faster.
+    buckets = padded_ffn_graph_buckets(12288, ffn_size=2)
+    assert 6144 in buckets, "whole item size needs its own bucket"
+    assert 3072 in buckets, "DBO ubatch size needs its own bucket"
+    # And an item just above either pays a small step, not a doubling.
+    assert select_padded_ffn_bucket(buckets, 6200) / 6200 < 1.15
+    assert select_padded_ffn_bucket(buckets, 3100) / 3100 < 1.15
+
+
+def test_bucket_ladder_scales_with_the_step_size():
+    small = padded_ffn_graph_buckets(12288, ffn_size=2)
+    large = padded_ffn_graph_buckets(24576, ffn_size=2)
+    assert len(small) == len(large)
+    assert max(large) == 2 * max(small)
+
+
+def test_oversized_item_has_no_bucket_and_runs_eager():
+    buckets = padded_ffn_graph_buckets(12288, ffn_size=2)
+    assert select_padded_ffn_bucket(buckets, max(buckets) + 1) is None
+
+
+def test_bucket_ladder_stays_within_the_row_bound():
+    # The ladder no longer has to reach max_routed -- the workspace ceiling is
+    # pinned by an eager warm-up in capture_padded_ffn_graphs instead, which
+    # costs one forward rather than the largest graph per layer -- but no bucket
+    # may exceed the buffers.
+    for max_routed, ffn_size in ((12288, 2), (24576, 2), (4096, 4)):
+        buckets = padded_ffn_graph_buckets(max_routed, ffn_size=ffn_size)
+        assert max(buckets) <= max_routed
+        assert min(buckets) > 0
+
+
+def test_shared_rows_scale_with_the_bucket():
+    # Both row counts scale with the item's tokens, so a half-sized bucket
+    # captures half the shared rows. Capturing every bucket at max_shared made
+    # a DBO ubatch pay double on the shared expert, which is what kept graphs
+    # losing to eager under DBO after the routed rows were already bucketed.
+    assert shared_rows_for_bucket(12288, max_routed=24576, max_shared=4096) == 2048
+    assert shared_rows_for_bucket(24576, max_routed=24576, max_shared=4096) == 4096
+    # No shared experts stays zero.
+    assert shared_rows_for_bucket(1024, max_routed=2048, max_shared=0) == 0
+
+
+def test_bucket_selection_escalates_when_the_shared_slice_does_not_fit():
+    buckets = (12288, 24576)
+    kwargs = {"max_routed": 24576, "max_shared": 4096}
+    # Routed fits the small bucket and so does its share of the shared rows.
+    assert select_padded_ffn_bucket(buckets, 12288, 2048, **kwargs) == 12288
+    # Same routed rows but more shared rows than the small bucket captured.
+    assert select_padded_ffn_bucket(buckets, 12288, 4000, **kwargs) == 24576
+    # Beyond every bucket's shared capacity: eager.
+    assert select_padded_ffn_bucket(buckets, 12288, 9999, **kwargs) is None
