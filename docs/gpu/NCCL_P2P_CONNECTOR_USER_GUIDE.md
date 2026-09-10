@@ -12,7 +12,6 @@ The MoE gate may run on Attention or FFN.
 
 It supports both prefill and decode which all support eager mode. CUDA graph support is currently limited to `FULL_DECODE_ONLY`, which is mainly used in decode instance. The checked-in DeepSeek V2 Lite recipes cover colocated and prefill/decode-disaggregated deployments.
 
-
 ## How it works
 
 Throughout this section, let `A = num_attention_ranks`, `F = num_ffn_ranks`, and `ratio = A / F`. The topology rules (`A >= F`, `A % F == 0`) guarantee `ratio` is a whole number and make `min_size = min(A, F) = F`. One physical process sits at up to three different rank numbers — an AFD world rank, a subgroup rank, and a control-plane (`p2p`) rank — all derived deterministically from the role, role rank, and topology counts.
@@ -86,7 +85,7 @@ AFD configuration is supplied through vLLM's `--additional-config` under the `af
 | --- | --- | --- | --- |
 | `role` | `"attention" \| "ffn"` | `"attention"` | Role owned by this process. Attention sends hidden states; FFN receives and returns FFN outputs. |
 | `connector` | `str` | `"P2pNcclAFDConnector"` | Must be `P2pNcclAFDConnector` for this GPU path. |
-| `host` | `str` | `"127.0.0.1"` | Non-empty rendezvous/control-plane host. All participating ranks must use a reachable, identical value. Host must be the first rank of FFN.|
+| `host` | `str` | `"127.0.0.1"` | Non-empty rendezvous/control-plane host. All participating ranks must use a reachable, identical value. Host must be the first rank of FFN. |
 | `port` | `int` | `1239` | Rendezvous port on `host`, valid range `1..65535`. It must be free and reachable. Subgroups share this rendezvous and need no ports of their own. |
 | `num_attention_ranks` | `int` | `1` | Total number of AFD Attention ranks, including DP/TP-derived worker ranks. Must be positive. |
 | `num_ffn_ranks` | `int` | `1` | Total number of AFD FFN ranks, including DP/TP-derived worker ranks. Must be positive. |

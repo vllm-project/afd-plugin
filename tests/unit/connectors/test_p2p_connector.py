@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import importlib
@@ -13,6 +16,7 @@ pytest.importorskip("vllm")
 
 from afd_plugin.config import AFDConfig, afd_config_from_mapping  # noqa: E402
 from afd_plugin.connectors import (  # noqa: E402
+    AFDConnectorBase,
     AFDConnectorFactory,
     AFDControlPayload,
     AFDDPMetadata,
@@ -194,8 +198,8 @@ def test_p2p_tp2_maps_shared_dp_payload_one_to_one(monkeypatch):
         is_warmup=False,
     )
 
-    attention_connectors = []
-    ffn_connectors = []
+    attention_connectors: list[AFDConnectorBase] = []
+    ffn_connectors: list[AFDConnectorBase] = []
     for role, connectors in (
         ("attention", attention_connectors),
         ("ffn", ffn_connectors),
@@ -250,10 +254,15 @@ def test_p2p_tp2_maps_shared_dp_payload_one_to_one(monkeypatch):
         connector.control_plane.send_dp_metadata_list(payload)
 
     received_sources = []
+
+    def receive_payload(**kwargs):
+        received_sources.append(kwargs["src"])
+        return payload
+
     monkeypatch.setattr(
         p2p_module,
         "recv_control_payload",
-        lambda **kwargs: received_sources.append(kwargs["src"]) or payload,
+        receive_payload,
     )
     for connector in ffn_connectors:
         connector.p2p_pg = object()
@@ -514,11 +523,11 @@ def test_p2p_custom_ops_register_send_recv_with_fake_impls(monkeypatch):
     module = importlib.import_module("afd_plugin.connectors.gpu.p2p")
     calls = []
 
-    torch_module = types.ModuleType("torch")
-    torch_module.Tensor = object
     # Empty ops namespace: the registration helper skips ops that already
     # exist on torch.ops.vllm, so the fake must report none registered.
-    torch_module.ops = SimpleNamespace(vllm=SimpleNamespace())
+    torch_module = SimpleNamespace(
+        Tensor=object, ops=SimpleNamespace(vllm=SimpleNamespace())
+    )
 
     vllm_module = types.ModuleType("vllm")
     utils_module = types.ModuleType("vllm.utils")
@@ -527,9 +536,14 @@ def test_p2p_custom_ops_register_send_recv_with_fake_impls(monkeypatch):
     def direct_register_custom_op(**kwargs):
         calls.append(kwargs)
 
-    torch_utils_module.direct_register_custom_op = direct_register_custom_op
-    utils_module.torch_utils = torch_utils_module
-    vllm_module.utils = utils_module
+    monkeypatch.setattr(
+        torch_utils_module,
+        "direct_register_custom_op",
+        direct_register_custom_op,
+        raising=False,
+    )
+    monkeypatch.setattr(utils_module, "torch_utils", torch_utils_module, raising=False)
+    monkeypatch.setattr(vllm_module, "utils", utils_module, raising=False)
 
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
     monkeypatch.setitem(sys.modules, "vllm.utils", utils_module)
@@ -566,11 +580,13 @@ def test_p2p_hidden_state_send_uses_registered_custom_op(monkeypatch):
     connector.a2e_comm_id = 17
 
     calls = []
-    torch_module = types.ModuleType("torch")
-    torch_module.ops = SimpleNamespace(
-        vllm=SimpleNamespace(
-            afd_p2p_send=lambda tensor, dst, comm_id: (
-                calls.append((tensor, dst, comm_id)) or None
+
+    torch_module = SimpleNamespace(
+        ops=SimpleNamespace(
+            vllm=SimpleNamespace(
+                afd_p2p_send=lambda tensor, dst, comm_id: calls.append(
+                    (tensor, dst, comm_id),
+                ),
             ),
         ),
     )
@@ -609,16 +625,18 @@ def test_p2p_recv_preserves_dynamic_ref_tensor_first_dim(monkeypatch):
     connector.e2a_comm_id = 23
 
     calls = []
-    torch_module = types.ModuleType("torch")
-    torch_module.ops = SimpleNamespace(
-        vllm=SimpleNamespace(
-            afd_p2p_recv=lambda tensor, src, comm_id: (
-                calls.append((tensor, src, comm_id)) or None
+
+    torch_module = SimpleNamespace(
+        ops=SimpleNamespace(
+            vllm=SimpleNamespace(
+                afd_p2p_recv=lambda tensor, src, comm_id: calls.append(
+                    (tensor, src, comm_id),
+                ),
             ),
         ),
-    )
-    torch_module.empty = lambda *_args, **_kwargs: pytest.fail(
-        "recv should reuse the dynamic ref tensor",
+        empty=lambda *_args, **_kwargs: pytest.fail(
+            "recv should reuse the dynamic ref tensor",
+        ),
     )
     monkeypatch.setattr(module, "torch", torch_module)
 
