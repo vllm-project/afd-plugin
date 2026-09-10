@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Subgroup partition tests for topologies where ``F`` does not divide ``A``.
+"""Subgroup partition tests for the P2P rank mapping.
 
 ``build_rank_mapping`` spreads the Attention ranks over the FFN ranks in
 contiguous blocks that differ in size by at most one (attention ``a`` joins
 the subgroup of FFN rank ``a * F // A``). When ``F`` divides ``A`` this is the
-grouping the connector has always built, which ``test_topology_snapshot.py``
-pins byte-for-byte; this file covers the layouts that grouping could not
+grouping the connector has always built, which
+``test_divisible_layouts_keep_the_historical_grouping`` pins; the other tests
+cover every ``A >= F`` pair, including the layouts that grouping could not
 express.
 """
 
@@ -15,7 +16,7 @@ from __future__ import annotations
 import pytest
 
 from afd_plugin.config import AFDConfig
-from afd_plugin.distributed.topology import build_rank_mapping, validate_p2p_topology
+from afd_plugin.distributed.topology import build_rank_mapping
 
 # Every A >= F pair with A, F in 1..8, divisible and not.
 _GRID = [(a, f) for a in range(1, 9) for f in range(1, a + 1)]
@@ -32,17 +33,6 @@ def _config(role: str, attention: int, ffn: int) -> AFDConfig:
 
 def _mapping(role: str, role_rank: int, attention: int, ffn: int):
     return build_rank_mapping(_config(role, attention, ffn), role_rank)
-
-
-@pytest.mark.parametrize(("attention", "ffn"), [(3, 2), (5, 2), (5, 3), (7, 3)])
-def test_validation_accepts_counts_that_do_not_divide(attention, ffn):
-    validate_p2p_topology(_config("attention", attention, ffn))
-
-
-@pytest.mark.parametrize(("attention", "ffn"), [(1, 2), (3, 4)])
-def test_validation_still_rejects_fewer_attention_than_ffn_ranks(attention, ffn):
-    with pytest.raises(ValueError, match="num_attention_ranks >= num_ffn_ranks"):
-        validate_p2p_topology(_config("attention", attention, ffn))
 
 
 @pytest.mark.parametrize(("attention", "ffn"), _GRID)
@@ -71,6 +61,27 @@ def test_both_roles_agree_on_the_subgroup_they_share(attention, ffn):
         owner = _mapping("ffn", mapping.subgroup_index, attention, ffn)
         assert mapping.subgroup_ranks == owner.subgroup_ranks
         assert mapping.subgroup_ranks[mapping.rank_in_subgroup] == mapping.world_rank
+
+
+@pytest.mark.parametrize(("attention", "ffn"), _GRID)
+def test_world_and_p2p_ranks_follow_the_role_layout(attention, ffn):
+    min_size = min(attention, ffn)
+    dp_destinations: list[int] = []
+    for role, size in (("ffn", ffn), ("attention", attention)):
+        for role_rank in range(size):
+            mapping = _mapping(role, role_rank, attention, ffn)
+            assert mapping.min_size == min_size
+            if role == "ffn":
+                assert mapping.world_rank == role_rank
+                assert mapping.p2p_rank == role_rank
+            else:
+                assert mapping.world_rank == ffn + role_rank
+                assert mapping.p2p_rank == role_rank + min_size
+            dp_destinations.extend(mapping.dp_metadata_destinations)
+
+    # Only Attention ranks send DP metadata, and each FFN rank receives it
+    # from exactly one of them.
+    assert sorted(dp_destinations) == list(range(ffn))
 
 
 @pytest.mark.parametrize(

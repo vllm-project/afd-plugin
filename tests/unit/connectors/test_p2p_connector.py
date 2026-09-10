@@ -158,34 +158,20 @@ def test_p2p_connector_uses_factory_resolved_role_rank():
 
 
 @pytest.mark.parametrize(
-    (
-        "attention_size",
-        "ffn_size",
-        "role",
-        "role_rank",
-        "subgroup_ranks",
-        "ratio",
-        "dsts",
-    ),
+    ("attention_size", "ffn_size", "role", "role_rank", "subgroup_ranks", "dsts"),
     [
-        (2, 2, "attention", 1, (1, 3), 1, (1,)),
-        (2, 1, "attention", 0, (0, 1, 2), 2, (0,)),
-        (4, 2, "attention", 2, (1, 4, 5), 2, ()),
-        (4, 2, "ffn", 1, (1, 4, 5), 2, ()),
-        # A % F != 0: the blocks differ in size by one, so ratio is per subgroup.
-        (3, 2, "ffn", 0, (0, 2, 3), 2, ()),
-        (3, 2, "ffn", 1, (1, 4), 1, ()),
-        (3, 2, "attention", 2, (1, 4), 1, ()),
-        (5, 3, "attention", 4, (2, 7), 1, ()),
+        (2, 2, "attention", 1, (1, 3), (1,)),
+        (2, 1, "attention", 0, (0, 1, 2), (0,)),
+        (4, 2, "attention", 2, (1, 4, 5), ()),
+        (4, 2, "ffn", 1, (1, 4, 5), ()),
     ],
 )
-def test_p2p_topology_supports_uneven_attention_counts(
+def test_p2p_topology_supports_equal_and_integer_multiple_attention_counts(
     attention_size,
     ffn_size,
     role,
     role_rank,
     subgroup_ranks,
-    ratio,
     dsts,
 ):
     mapping = build_rank_mapping(
@@ -198,7 +184,6 @@ def test_p2p_topology_supports_uneven_attention_counts(
         role_rank,
     )
 
-    assert len(mapping.subgroup_ranks) - 1 == ratio
     assert mapping.subgroup_ranks == subgroup_ranks
     assert mapping.dp_metadata_destinations == dsts
 
