@@ -6,6 +6,7 @@ from afd_plugin.distributed.topology import (
     AFDRankMapping,
     build_rank_mapping,
     resolve_role_rank,
+    subgroup_attention_block,
     topology_from_config,
     validate_p2p_topology,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "create_hccl_process_group_options",
     "init_afd_process_group",
     "resolve_role_rank",
+    "subgroup_attention_block",
     "topology_from_config",
     "validate_p2p_topology",
 ]

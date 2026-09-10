@@ -198,7 +198,7 @@ def test_p2p_topology_supports_uneven_attention_counts(
         role_rank,
     )
 
-    assert mapping.ratio == ratio
+    assert len(mapping.subgroup_ranks) - 1 == ratio
     assert mapping.subgroup_ranks == subgroup_ranks
     assert mapping.dp_metadata_destinations == dsts
 

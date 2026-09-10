@@ -186,7 +186,7 @@ class P2pNcclAFDConnector(AFDConnectorBase):
         self.attn_size = self.mapping.attention_size
         self.ffn_size = self.mapping.ffn_size
         self.min_size = self.mapping.min_size
-        self.ratio = self.mapping.ratio
+        self.ratio = len(self.mapping.subgroup_ranks) - 1
         self.group_size = len(self.mapping.subgroup_ranks)
         self.dst_list = list(self.mapping.dp_metadata_destinations)
         text_config = vllm_config.model_config.hf_text_config

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from afd_plugin.distributed import subgroup_attention_block
+
 
 def aggregate_ffn_token_counts(
     attention_counts: tuple[int, ...],
@@ -39,17 +41,14 @@ def aggregate_ffn_token_counts(
             for rank in range(attention_size)
         )
 
-    # Block ``g`` spans Attention ranks ``[ceil(g*A/F), ceil((g+1)*A/F))``, the
-    # same partition ``build_rank_mapping`` uses. The ``+ ffn_size - 1`` rounds
-    # the division up; it is a plain ``//`` when ``ffn_size`` divides ``g*A``.
+    # Each FFN rank sums the block that ``build_rank_mapping`` assigns to it.
     return tuple(
         sum(
             max(1, int(expanded_counts[attention_rank]))
             if attention_rank < len(expanded_counts)
             else fallback_count
-            for attention_rank in range(
-                (ffn_rank * attention_size + ffn_size - 1) // ffn_size,
-                ((ffn_rank + 1) * attention_size + ffn_size - 1) // ffn_size,
+            for attention_rank in subgroup_attention_block(
+                ffn_rank, attention_size, ffn_size
             )
         )
         for ffn_rank in range(ffn_size)

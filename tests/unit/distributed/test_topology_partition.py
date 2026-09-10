@@ -70,7 +70,6 @@ def test_both_roles_agree_on_the_subgroup_they_share(attention, ffn):
         mapping = _mapping("attention", attention_rank, attention, ffn)
         owner = _mapping("ffn", mapping.subgroup_index, attention, ffn)
         assert mapping.subgroup_ranks == owner.subgroup_ranks
-        assert mapping.ratio == owner.ratio == len(owner.subgroup_ranks) - 1
         assert mapping.subgroup_ranks[mapping.rank_in_subgroup] == mapping.world_rank
 
 
@@ -95,7 +94,7 @@ def test_divisible_layouts_keep_the_historical_grouping(attention, ffn):
     ratio = attention // ffn
     for ffn_rank in range(ffn):
         mapping = _mapping("ffn", ffn_rank, attention, ffn)
-        assert mapping.ratio == ratio
+        assert len(mapping.subgroup_ranks) - 1 == ratio
         assert mapping.subgroup_ranks == (
             ffn_rank,
             *(ffn + ffn_rank * ratio + offset for offset in range(ratio)),

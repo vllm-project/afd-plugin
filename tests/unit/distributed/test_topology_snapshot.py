@@ -34,7 +34,8 @@ def _config(role: str, attention: int, ffn: int) -> AFDConfig:
 
 def _mapping_dict(role: str, attention: int, ffn: int, role_rank: int) -> dict:
     mapping = build_rank_mapping(_config(role, attention, ffn), role_rank)
-    return dataclasses.asdict(mapping)
+    # ratio is derived now; fill it in so the golden entries stay as captured.
+    return {**dataclasses.asdict(mapping), "ratio": len(mapping.subgroup_ranks) - 1}
 
 
 # Captured from main @ 603c111 (pre-M2N). Do not regenerate to make a failing
@@ -269,7 +270,6 @@ def test_rank_mapping_invariants(attention, ffn):
                 assert mapping.p2p_rank == role_rank + min_size
                 assert mapping.subgroup_index == role_rank // ratio
 
-            assert mapping.ratio == ratio
             assert mapping.min_size == min_size
             assert len(mapping.subgroup_ranks) == 1 + ratio
             assert mapping.subgroup_ranks[0] == mapping.subgroup_index
