@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import sys
 import types
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -44,19 +45,6 @@ def _fake_vllm_config(
             tensor_parallel_size=tensor_parallel_size,
         ),
     )
-
-
-class _NullSwitcher:
-    """Stand-in for DefaultProcessGroupSwitcher when no real group exists."""
-
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def __enter__(self):
-        return None
-
-    def __exit__(self, *args):
-        return False
 
 
 def _tolist(value):
@@ -709,7 +697,9 @@ def test_p2p_subgroup_rendezvous_reuses_the_afd_world_store(
 
     monkeypatch.setattr(module, "init_afd_process_group", lambda **kwargs: afd_pg)
     monkeypatch.setattr(module, "_get_default_group", lambda: None)
-    monkeypatch.setattr(module, "DefaultProcessGroupSwitcher", _NullSwitcher)
+    monkeypatch.setattr(
+        module, "DefaultProcessGroupSwitcher", lambda *a, **k: nullcontext()
+    )
     monkeypatch.setattr(module, "PyNcclCommunicator", lambda **kwargs: object())
     monkeypatch.setattr(module, "_register_comm", lambda communicator: 0)
     monkeypatch.setattr(module, "_register_p2p_custom_ops", lambda: None)

@@ -51,8 +51,8 @@ In code, the control plane is a pluggable module rather than part of the connect
 AFD world (port):        F0=0  F1=1  A0=2  A1=3  A2=4  A3=5
 
 Data plane:
-  subgroup 0 (port+1):   F0(rank 0) <-> A0(rank 1), A1(rank 2)
-  subgroup 1 (port+2):   F1(rank 0) <-> A2(rank 1), A3(rank 2)
+  subgroup 0 (prefix afd_subgroup_0):   F0(rank 0) <-> A0(rank 1), A1(rank 2)
+  subgroup 1 (prefix afd_subgroup_1):   F1(rank 0) <-> A2(rank 1), A3(rank 2)
 
 Control plane "p2p" group (port, size 4):
   p2p ranks:             F0=0  F1=1  A0=2  A1=3      (A2, A3 excluded)
@@ -175,5 +175,5 @@ For complete `1A1F`, `2A2F`, `4A4F`, eager, DBO, and CUDA graph examples, see `r
 - Current GPU CUDA graph support is `FULL_DECODE_ONLY`; GPU DBO plus CUDA graph is limited to exactly two ubatches.
 - CUDA remote experts do not currently support EPLB on the Attention role.
 - To enable DBO, set `--enable-dbo`, and configure the threshold with `--dbo-decode-token-threshold` and `--dbo-prefill-token-threshold`. See `recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite` for examples.
-- The repository recipes currently validate specific GPU layouts (including DeepSeek V2 Lite and tested A/H-class hardware). Cross-node use depends on NCCL/network configuration and is not established by the current recipes; document it as unverified rather than promising transparent fallback.
+- The repository recipes currently validate specific GPU layouts (including DeepSeek V2 Lite and tested A/H-class hardware). Cross-node placement is verified for DeepSeek-V2-Lite `2A2F` with the FFN ranks on separate hosts, over TCP (ENA) and over EFA; other topologies and hardware should be treated as unverified.
 - There is no automatic fallback from this connector to another transport. Select an NPU connector explicitly on Ascend.

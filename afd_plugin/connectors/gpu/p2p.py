@@ -51,8 +51,9 @@ Requirements and limitations:
       share that rendezvous and do not need ports of their own.
     - AFD async mode (``async`` / ``async_dp``) is not supported; GPU DBO
       combined with CUDA graphs is limited to exactly two ubatches.
-    - Cross-node use is not established by the checked-in recipes and should
-      be treated as unverified.
+    - Cross-node placement is verified for DeepSeek-V2-Lite ``2A2F`` with the
+      FFN ranks on separate hosts, over TCP (ENA) and over EFA. Other
+      topologies and hardware should be treated as unverified.
 
 See ``docs/gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.md`` for the configuration
 contract and launch examples, and ``recipe/gpu/p2p_nccl/`` for complete
@@ -275,13 +276,15 @@ class P2pNcclAFDConnector(AFDConnectorBase):
             # rendezvoused on. StatelessProcessGroup.create would stand up a
             # second store bound to ``host``, which is only correct while
             # every subgroup's rank 0 sits on that host.
+            subgroup_store = PrefixStore(
+                f"afd_subgroup_{self.mapping.subgroup_index}",
+                afd_pg.get_group_store(),
+            )
+            subgroup_store.set_timeout(timedelta(seconds=300))
             self.a2e_group = StatelessProcessGroup(
                 rank=self.mapping.rank_in_subgroup,
                 world_size=len(self.mapping.subgroup_ranks),
-                store=PrefixStore(
-                    f"afd_subgroup_{self.mapping.subgroup_index}",
-                    afd_pg.get_group_store(),
-                ),
+                store=subgroup_store,
             )
             self.e2a_group = self.a2e_group
             self.a2e_pynccl = PyNcclCommunicator(
