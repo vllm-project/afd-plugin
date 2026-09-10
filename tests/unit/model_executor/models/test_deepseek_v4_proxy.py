@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -6,6 +9,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
+
+from torch import nn  # noqa: E402
 
 from afd_plugin.model_executor.models import deepseek_v4 as adapter  # noqa: E402
 
@@ -23,7 +28,7 @@ class _FakeConnector:
 
 
 def test_remote_v4_ffn_sends_token_ids(monkeypatch):
-    events = []
+    events: list[tuple] = []
     connector = _FakeConnector(events)
     afd_metadata = SimpleNamespace(
         connector=connector,
@@ -34,11 +39,7 @@ def test_remote_v4_ffn_sends_token_ids(monkeypatch):
         "get_afd_metadata_from_forward_context",
         lambda: afd_metadata,
     )
-    monkeypatch.setattr(
-        adapter,
-        "get_forward_context",
-        lambda: SimpleNamespace(ubatch_idx=2, slot_mapping={}),
-    )
+    monkeypatch.setattr(adapter, "current_dbo_ubatch_id", lambda: 2)
 
     def record_yield(hidden_states, *, role):
         events.append(("yield", hidden_states, role))
@@ -68,7 +69,7 @@ def test_remote_v4_ffn_sends_token_ids(monkeypatch):
 
 
 def test_remote_v4_ffn_preserves_ids_in_padding_slots(monkeypatch):
-    events = []
+    events: list[tuple] = []
     connector = _FakeConnector(events)
     afd_metadata = SimpleNamespace(connector=connector, stage_idx=0)
     monkeypatch.setattr(
@@ -76,14 +77,7 @@ def test_remote_v4_ffn_preserves_ids_in_padding_slots(monkeypatch):
         "get_afd_metadata_from_forward_context",
         lambda: afd_metadata,
     )
-    monkeypatch.setattr(
-        adapter,
-        "get_forward_context",
-        lambda: SimpleNamespace(
-            ubatch_idx=0,
-            slot_mapping={"model.layers.0.attn": torch.tensor([5, 6, -1, -1])},
-        ),
-    )
+    monkeypatch.setattr(adapter, "current_dbo_ubatch_id", lambda: 0)
     monkeypatch.setattr(
         adapter,
         "maybe_apply_dbo_yield",
@@ -129,7 +123,7 @@ def test_remote_v4_ffn_validates_token_ids_before_metadata_lookup(
 
 
 def test_v4_decoder_forward_rejects_ffn_role(monkeypatch):
-    class FakeMissingLayer(torch.nn.Module):
+    class FakeMissingLayer(nn.Module):
         pass
 
     monkeypatch.setattr(adapter.native, "PPMissingLayer", FakeMissingLayer)
@@ -155,7 +149,7 @@ def test_v4_ffn_compute_rejects_attention_role_before_input_ids():
 
 
 def test_v4_ffn_compute_requires_input_ids(monkeypatch):
-    class FakeMoE(torch.nn.Module):
+    class FakeMoE(nn.Module):
         pass
 
     monkeypatch.setattr(adapter.native, "DeepseekV4MoE", FakeMoE)

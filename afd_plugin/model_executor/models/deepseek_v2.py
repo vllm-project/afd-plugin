@@ -15,7 +15,6 @@ import torch
 import torch.nn as nn
 from transformers import DeepseekV2Config, DeepseekV3Config, GlmMoeDsaConfig
 from vllm.config import ParallelConfig, VllmConfig
-from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -29,7 +28,10 @@ from afd_plugin.connectors import (
     AFDTransferMetadata,
 )
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
-from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
+from afd_plugin.v1.worker.dbo import (
+    current_dbo_ubatch_id,
+    maybe_apply_dbo_yield,
+)
 
 logger = init_logger(__name__)
 
@@ -127,9 +129,13 @@ class RemoteFFNProxy(nn.Module):
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
             raise RuntimeError("RemoteFFNProxy requires AFD forward metadata")
-        forward_context = get_forward_context()
-        stage_idx = int(
-            getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),
+        # vLLM tracks the ubatch by thread, not on the forward context, so
+        # forward_context.ubatch_idx does not exist and reading it made both
+        # DBO halves look like stage 0 -- one window slot for two concurrent
+        # dispatches, the second overwriting the first's flag.
+        dbo_ubatch_id = current_dbo_ubatch_id()
+        stage_idx = (
+            afd_metadata.stage_idx if dbo_ubatch_id is None else int(dbo_ubatch_id)
         )
         afd_metadata.stage_idx = stage_idx
         metadata = AFDTransferMetadata.create_attention_metadata(
