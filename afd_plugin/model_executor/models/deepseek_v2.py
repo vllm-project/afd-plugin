@@ -21,7 +21,7 @@ from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models import deepseek_v2 as native
 
-from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
+from afd_plugin.config import AFD_ASYNC_CONNECTORS, parse_afd_config
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
     AFDF2ATransferPayload,
@@ -165,7 +165,9 @@ class AFDAttentionFusedMoE(RemoteFFNProxy):
         super().__init__(layer_idx=layer_idx)
         self.is_internal_router = is_internal_router
 
-    def forward(
+    # The router logits ride along on this proxy only; nn.Module dispatch is
+    # duck-typed and no caller holds a RemoteFFNProxy-typed reference.
+    def forward(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
@@ -512,7 +514,8 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         topk_weights = None
         topk_ids = None
         router_logits = None
-        # NPU-only: Attention-side gate/topk is implemented in the NPU helper.
+        # The gate helper delegates expert selection to the connector, so both
+        # platforms share it despite the module's location.
         if self.compute_gate_on_attention and self.is_moe_layer:
             from afd_plugin.model_executor.models.npu import (
                 deepseek_v2_attention_gate,
@@ -568,8 +571,23 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
             )
             return output
         if self.compute_gate_on_attention:
-            raise RuntimeError(
-                "GPU Attention-side gate must call compute_experts_output",
+            if group_list is None:
+                # Without a group list the caller is the control-plane path,
+                # which routes on this side and must use compute_experts_output.
+                raise RuntimeError(
+                    "GPU Attention-side gate must call compute_experts_output",
+                )
+            # Token-level dispatch: rows arrive pre-routed and grouped by local
+            # expert, so only the grouped GEMM is left to run here.
+            from afd_plugin.model_executor.models.gpu import (
+                deepseek_v2_attention_gate as gpu_attention_gate,
+            )
+
+            return gpu_attention_gate.compute_attention_gate_moe_ffn(
+                self,
+                hidden_states=hidden_states,
+                group_list=group_list,
+                expand_x_shared=expand_x_shared,
             )
         hidden_states = self.mlp(hidden_states)
         if (
@@ -703,7 +721,10 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         intermediate_tensors: native.IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | native.IntermediateTensors:
-        if self.afd_config.connector == AFD_ASYNC_CONNECTOR:
+        if self.afd_config.connector in AFD_ASYNC_CONNECTORS:
+            # The schedule below is platform-neutral -- it only drives the model
+            # and the connector interface -- so both async connectors share it
+            # despite the module still living under the npu package.
             from afd_plugin.model_executor.models.npu import (
                 deepseek_v2_async_cam_forward,
             )
