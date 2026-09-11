@@ -28,13 +28,13 @@ if (BUILD_OPEN_PROJECT)
             register
             c_sec
     )
-    set(CMAKE_MODULE_PATH 
-        ${CMAKE_MODULE_PATH} 
+    set(CMAKE_MODULE_PATH
+        ${CMAKE_MODULE_PATH}
         ${CMAKE_CURRENT_LIST_DIR}/cmake/modules
     )
 
-    set(CMAKE_PREFIX_PATH 
-        ${CMAKE_PREFIX_PATH} 
+    set(CMAKE_PREFIX_PATH
+        ${CMAKE_PREFIX_PATH}
         ${ASCEND_CANN_PACKAGE_PATH}
     )
 
@@ -155,6 +155,11 @@ if (BUILD_OPEN_PROJECT)
             LOG_CPP
             PROCESS_LOG
     )
+    # Mc2CcTilingConfig::SetCommEngine only exists in CANN releases that support
+    # Ascend 950; gate its use so 910C builds against older CANN still compile.
+    if ("${ASCEND_COMPUTE_UNIT}" MATCHES "ascend950")
+        target_compile_definitions(optiling PRIVATE AFD_TILING_HAS_COMM_ENGINE=1)
+    endif ()
     target_link_libraries(optiling PRIVATE
             $<BUILD_INTERFACE:intf_pub>
             -Wl,--whole-archive

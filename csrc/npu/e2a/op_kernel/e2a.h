@@ -17,7 +17,7 @@
 
 using namespace AscendC;
 
-#define DATA_FULSH_E2A(_gm_tensor, _type) \
+#define DATA_FLUSH_E2A(_gm_tensor, _type) \
     Barrier(); \
     DataCacheCleanAndInvalid<_type, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(_gm_tensor); \
     __asm__("NOP"); \
@@ -30,7 +30,12 @@ class E2a {
     constexpr static int64_t MAGIC_OFFSET = 32;
     constexpr static uint32_t INT32_COUNT_PER_BLOCK = 8;
     constexpr static uint32_t DOUBLE_BUFFER_COUNT = 2;
+#if defined(AFD_ARCH_A5)
+    // A5 per-rank window step is EP_RANK_OFFSET_STEP (1KB), not the A3 512B step.
+    constexpr static uint32_t OPT_RANK_OFFSET = 1024;
+#else
     constexpr static uint32_t OPT_RANK_OFFSET = 512;
+#endif
 public:
     __aicore__ inline E2a(int rank, int rankSize)
     {
@@ -52,11 +57,15 @@ public:
         this->blockNum = GetBlockNum();
 
         pipe.InitBuffer(tBuf, UB_SINGLE_TOTAL_SIZE_MAX);
-        
-        epWinContext_ = (__gm__ HcclOpResParam *)AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
 
-        magicTensor_.SetGlobalBuffer((__gm__ int32_t*)((epWinContext_->localWindowsIn) + 
-            IPC_DATA_OFFSET - blockNum * sizeof(int32_t) * INT32_COUNT_PER_BLOCK)); 
+#ifdef AFD_ARCH_A5
+        epWinContextA5_ = (__gm__ Moe::HcclCombinOpParam *)AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
+#else
+        epWinContext_ = (__gm__ HcclOpResParam *)AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
+#endif
+
+        magicTensor_.SetGlobalBuffer((__gm__ int32_t*)(winBaseOf(rank) +
+            IPC_DATA_OFFSET - blockNum * sizeof(int32_t) * INT32_COUNT_PER_BLOCK));
 
         LocalTensor<int32_t> tempLocal = tBuf.GetWithOffset<int32_t>(INT32_COUNT_PER_BLOCK, 0);
         tempLocal(0) = 1;
@@ -71,20 +80,15 @@ public:
         PipeBarrier<PIPE_ALL>();
 
         if (rank >= expertRankSize) {
-            shareAddrs[rank] = (GM_ADDR)(epWinContext_->localWindowsIn) + rank * OPT_RANK_OFFSET;
-            shareAddrs[rank % expertRankSize] = (GM_ADDR)(((HcclRankRelationResV2 *)(epWinContext_->
-                remoteRes[rank % expertRankSize].nextDevicePtr))->windowsIn) + (rank % expertRankSize) * OPT_RANK_OFFSET;
+            shareAddrs[rank] = winBaseOf(rank) + rank * OPT_RANK_OFFSET;
+            shareAddrs[rank % expertRankSize] = winBaseOf(rank % expertRankSize) +
+                (rank % expertRankSize) * OPT_RANK_OFFSET;
             pipe_barrier(PIPE_ALL);
         } else {
             pipe_barrier(PIPE_ALL);
 
             for (int i = 0; i < rankSize; i++) {
-                if (i == rank) {
-                    shareAddrs[i] = (GM_ADDR)(epWinContext_->localWindowsIn) + rank * OPT_RANK_OFFSET;
-                    continue;
-                }
-                shareAddrs[i] = (GM_ADDR)(((HcclRankRelationResV2 *)(epWinContext_->remoteRes[i].nextDevicePtr))->
-                    windowsIn) + i * OPT_RANK_OFFSET;
+                shareAddrs[i] = winBaseOf(i) + i * OPT_RANK_OFFSET;
             }
         }
 
@@ -110,6 +114,20 @@ public:
     }
 
 private:
+    // Window base address of `rankId` as mapped on this device. On A5 HCCL hands
+    // out a flat cross-card window array; on A3 the local window and the
+    // remoteRes tree are separate.
+    __aicore__ inline GM_ADDR winBaseOf(int rankId)
+    {
+#ifdef AFD_ARCH_A5
+        return (GM_ADDR)(epWinContextA5_->windowsIn[rankId]);
+#else
+        if (rankId == this->rank) {
+            return (GM_ADDR)(epWinContext_->localWindowsIn);
+        }
+        return (GM_ADDR)(((HcclRankRelationResV2 *)(epWinContext_->remoteRes[rankId].nextDevicePtr))->windowsIn);
+#endif
+    }
 
     __aicore__ inline uint64_t mergeMagicWithValue(uint32_t magic, uint16_t offset, uint16_t count)
     {
@@ -175,6 +193,9 @@ private:
     __gm__ T *x;
     __gm__ T *expandX;
     __gm__ HcclOpResParam *epWinContext_{nullptr};
+#ifdef AFD_ARCH_A5
+    __gm__ Moe::HcclCombinOpParam *epWinContextA5_{nullptr};
+#endif
     TPipe pipe;
     TBuf<QuePosition::VECCALC> tBuf;
     GM_ADDR shareAddrs[CAM_MAX_RANK_SIZE];

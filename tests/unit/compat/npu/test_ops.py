@@ -9,6 +9,10 @@ The real NPU kernel path needs a two-rank HCCL group.  Run it explicitly with:
 
     AFD_RUN_ASCEND_OP_RUNTIME=1 torchrun --standalone --nproc_per_node=2 \
         tests/unit/compat/npu/test_ops.py
+
+The A5 1A1F mp.spawn hardware sample is:
+
+    python tests/unit/compat/npu/a2e_e2a_a5.py
 """
 
 from __future__ import annotations
@@ -281,8 +285,8 @@ def _run_as_script() -> int:
     for name, reason in skipped:
         print(f"SKIP {name}: {reason}", flush=True)
 
-    for name, exc in failures:
-        print(f"FAIL {name}: {exc!r}", flush=True)
+    for name, error in failures:
+        print(f"FAIL {name}: {error!r}", flush=True)
 
     return 1 if failures else 0
 

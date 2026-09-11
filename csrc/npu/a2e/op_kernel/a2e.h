@@ -17,7 +17,7 @@
 
 using namespace AscendC;
 
-#define DATA_FULSH(_gm_tensor, _type) \
+#define DATA_FLUSH(_gm_tensor, _type) \
     Barrier(); \
     DataCacheCleanAndInvalid<_type, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(_gm_tensor); \
     __asm__("NOP"); \
@@ -34,7 +34,12 @@ class A2e {
     constexpr static uint32_t DOUBLE_BUFFER_COUNT = 2;
     constexpr static uint32_t BLOCK_IDX_USED_2 = 2;
     constexpr static uint32_t UB_OFFSET = 32;
+#if defined(AFD_ARCH_A5)
+    // A5 per-rank window step is EP_RANK_OFFSET_STEP (1KB), not the A3 512B step.
+    constexpr static uint32_t OPT_RANK_OFFSET = 1024;
+#else
     constexpr static uint32_t OPT_RANK_OFFSET = 512;
+#endif
     constexpr static uint32_t INT64_COUNT_PER_BLOCK = 4;
     constexpr static uint32_t INT32_COUNT_PER_BLOCK = 8;
 public:
@@ -73,10 +78,14 @@ public:
 
         pipe.InitBuffer(tBuf, UB_SINGLE_TOTAL_SIZE_MAX);
 
+#ifdef AFD_ARCH_A5
+        epWinContextA5_ = (__gm__ Moe::HcclCombinOpParam *)AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
+#else
         epWinContext_ = (__gm__ HcclOpResParam *)AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
+#endif
 
-        magicTensor_.SetGlobalBuffer((__gm__ int32_t*)((epWinContext_->localWindowsIn) + 
-            IPC_DATA_OFFSET - blockNum * sizeof(int32_t) * INT32_COUNT_PER_BLOCK)); 
+        magicTensor_.SetGlobalBuffer((__gm__ int32_t*)(winBaseOf(rank) +
+            IPC_DATA_OFFSET - blockNum * sizeof(int32_t) * INT32_COUNT_PER_BLOCK));
 
         LocalTensor<int32_t> tempLocal = tBuf.GetWithOffset<int32_t>(INT32_COUNT_PER_BLOCK, 0);
         tempLocal(0) = 1;
@@ -91,20 +100,15 @@ public:
         PipeBarrier<PIPE_ALL>();
 
         if (rank >= expertRankSize) {
-            shareAddrs[rank] = (GM_ADDR)(epWinContext_->localWindowsIn) + rank * OPT_RANK_OFFSET;
-            shareAddrs[rank % expertRankSize] = (GM_ADDR)(((HcclRankRelationResV2 *)(epWinContext_->
-                remoteRes[rank % expertRankSize].nextDevicePtr))->windowsIn) + (rank % expertRankSize) * OPT_RANK_OFFSET;
+            shareAddrs[rank] = winBaseOf(rank) + rank * OPT_RANK_OFFSET;
+            shareAddrs[rank % expertRankSize] = winBaseOf(rank % expertRankSize) +
+                (rank % expertRankSize) * OPT_RANK_OFFSET;
             pipe_barrier(PIPE_ALL);
         } else {
             pipe_barrier(PIPE_ALL);
 
             for (int i = 0; i < rankSize; i++) {
-                if (i == rank) {
-                    shareAddrs[i] = (GM_ADDR)(epWinContext_->localWindowsIn) + rank * OPT_RANK_OFFSET;
-                    continue;
-                }
-                shareAddrs[i] = (GM_ADDR)(((HcclRankRelationResV2 *)(epWinContext_->remoteRes[i].nextDevicePtr))->
-                    windowsIn) + i * OPT_RANK_OFFSET;
+                shareAddrs[i] = winBaseOf(i) + i * OPT_RANK_OFFSET;
             }
         }
 
@@ -150,11 +154,26 @@ public:
     }
 
 private:
+    // Window base address of `rankId` as mapped on this device. On A5 HCCL hands
+    // out a flat cross-card window array; on A3 the local window and the
+    // remoteRes tree are separate.
+    __aicore__ inline GM_ADDR winBaseOf(int rankId)
+    {
+#ifdef AFD_ARCH_A5
+        return (GM_ADDR)(epWinContextA5_->windowsIn[rankId]);
+#else
+        if (rankId == this->rank) {
+            return (GM_ADDR)(epWinContext_->localWindowsIn);
+        }
+        return (GM_ADDR)(((HcclRankRelationResV2 *)(epWinContext_->remoteRes[rankId].nextDevicePtr))->windowsIn);
+#endif
+    }
+
     __aicore__ inline void waitFlagWithScalar(int addr, uint32_t magic) {
         GlobalTensor<uint32_t> flagGt;
         flagGt.SetGlobalBuffer((__gm__ uint32_t *)(shareAddrs[rank] + addr));
         while(1) {
-            DATA_FULSH(flagGt, uint32_t);
+            DATA_FLUSH(flagGt, uint32_t);
             if (flagGt.GetValue(0) == magic) {
                 return;
             }
@@ -170,7 +189,7 @@ private:
         flagLt.SetValue(0, mergeMagicWithValue(magic, 0));
 
         GlobalTensor<uint64_t> shareFlagGt;
-        shareFlagGt.SetGlobalBuffer((__gm__ uint64_t *)(shareAddrs[rank % expertRankSize]) + 
+        shareFlagGt.SetGlobalBuffer((__gm__ uint64_t *)(shareAddrs[rank % expertRankSize]) +
             (1 * attnToMoeRatio + sendOffset) * flagUnitInt64Num);
 
         AscendC::SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
@@ -193,7 +212,7 @@ private:
         flagLt.SetValue(0, mergeMagicWithValue(magic, 0));
 
         GlobalTensor<uint64_t> shareFlagGt;
-        shareFlagGt.SetGlobalBuffer((__gm__ uint64_t *)(shareAddrs[rank % expertRankSize]) + 
+        shareFlagGt.SetGlobalBuffer((__gm__ uint64_t *)(shareAddrs[rank % expertRankSize]) +
             (WAIT_FLAG_OFFSET_2 * attnToMoeRatio + sendOffset) * flagUnitInt64Num);
 
         AscendC::SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
@@ -220,7 +239,7 @@ private:
         flagLt.SetValue(0, mergeMagicWithValue(magic, 0));
 
         GlobalTensor<uint64_t> shareFlagGt;
-        shareFlagGt.SetGlobalBuffer((__gm__ uint64_t *)(shareAddrs[rank % expertRankSize]) + 
+        shareFlagGt.SetGlobalBuffer((__gm__ uint64_t *)(shareAddrs[rank % expertRankSize]) +
             (WAIT_FLAG_OFFSET_4 * attnToMoeRatio + sendOffset) * flagUnitInt64Num);
 
         AscendC::SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
@@ -236,9 +255,9 @@ private:
     __aicore__ inline void sendX(int sendOffset, int xOffset) {
         GlobalTensor<T> shareXGt;
         shareXGt.SetGlobalBuffer((__gm__ T *)(shareAddrs[rank] + IPC_DATA_OFFSET + xOffset));
-        
+
         int actualBlockNum = (computeGate == 0) ? blockNum : (blockNum - BLOCK_IDX_USED_2);
-        
+
         copyGmToGmWithBlocks(shareXGt, xGt, batchSize * hiddenSize, actualBlockNum, blockIdx);
 
         AscendC::SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
@@ -250,7 +269,7 @@ private:
         flagLt.SetValue(0, mergeMagicWithValue(magic, 0));
 
         GlobalTensor<uint64_t> shareFlagGt;
-        shareFlagGt.SetGlobalBuffer((__gm__ uint64_t *)(shareAddrs[rank % expertRankSize]) + 
+        shareFlagGt.SetGlobalBuffer((__gm__ uint64_t *)(shareAddrs[rank % expertRankSize]) +
             (WAIT_FLAG_OFFSET_3 * attnToMoeRatio + sendOffset) * flagUnitInt64Num);
 
         AscendC::SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
@@ -292,7 +311,7 @@ private:
         int expertScalesOffset = sizeof(int32_t) + expertIdsReserveSize;
 
         int sendRank = rank + (index + 1) * expertRankSize;
-        
+
         if (computeGate == 0) {
             waitFlagWithScalar((WAIT_FLAG_OFFSET_3 * attnToMoeRatio + index) * flagUnitInt64Num * sizeof(uint64_t) +
                 sizeof(uint32_t), magic);
@@ -308,7 +327,7 @@ private:
             GlobalTensor<float> shareExpertScalesGt;
             shareExpertScalesGt.SetGlobalBuffer((__gm__ float *)(shareAddrs[sendRank] + IPC_DATA_OFFSET +
                 expertScalesOffset));
-            
+
             copyGmToGmWithBlocks(simulateExpertScalesGt[expertScalesOutputOffset], shareExpertScalesGt,
                 recvBatchSize * topk, blockNum - 1, blockIdx);
             expertScalesOutputOffset += recvBatchSize * topk;
@@ -358,6 +377,9 @@ private:
     __gm__ TQ *expandX;
     __gm__ float *dynamicScales;
     __gm__ HcclOpResParam *epWinContext_{nullptr};
+#ifdef AFD_ARCH_A5
+    __gm__ Moe::HcclCombinOpParam *epWinContextA5_{nullptr};
+#endif
     TPipe pipe;
     TBuf<QuePosition::VECCALC> tBuf;
     GM_ADDR shareAddrs[CAM_MAX_RANK_SIZE];
