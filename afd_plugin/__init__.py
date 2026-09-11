@@ -8,6 +8,7 @@ import importlib.util
 import logging
 import multiprocessing
 import os
+from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from types import MappingProxyType
@@ -170,18 +171,30 @@ def register_afd() -> None:
             exc_info=True,
         )
 
-    try:
-        import afd_plugin.compat.patches.async_dp_engine  # noqa: F401
-        import afd_plugin.compat.patches.async_dp_forward_context  # noqa: F401
-        import afd_plugin.compat.patches.config_validation  # noqa: F401
-        import afd_plugin.compat.patches.dp_coordinator_timeout  # noqa: F401
-        import afd_plugin.compat.patches.engine_core  # noqa: F401
-        import afd_plugin.compat.patches.ffn_local_moe_prepare  # noqa: F401
-    except Exception:
-        _logger.debug(
-            "AFD plugin: compatibility patches could not be applied",
-            exc_info=True,
-        )
+    # One import per patch, each isolated. A single try block around the whole
+    # list means the first failure silently skips every patch after it: a stale
+    # module name here once disabled the ubatch positions and split patches,
+    # which surfaced two layers away as "positions is required for C128A
+    # metadata build" inside DeepSeek-V4's kernel warmup. Warn rather than
+    # debug for the same reason -- a patch that did not load is not a detail.
+    for _patch in (
+        "async_dp_engine",
+        "async_dp_forward_context",
+        "config_validation",
+        "dp_coordinator_timeout",
+        "engine_core",
+        "ffn_local_moe_prepare",
+        "ubatch_positions",
+        "ubatch_split",
+    ):
+        try:
+            import_module(f"afd_plugin.compat.patches.{_patch}")
+        except Exception:
+            _logger.warning(
+                "AFD plugin: compatibility patch %r could not be applied",
+                _patch,
+                exc_info=True,
+            )
 
     from afd_plugin.model_executor.routing_simulator import (
         register_afd_balanced_routing_strategy,

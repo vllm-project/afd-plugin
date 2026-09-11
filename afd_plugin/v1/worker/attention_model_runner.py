@@ -290,9 +290,16 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
         kwargs: dict[str, Any] = {}
 
         # determine if ubatch should be activated.
-        # 1. For dp = 1, vLLM hardcodes `should_ubatch=False`.
-        # This is the extra support for dp = 1
-        if self.vllm_config.parallel_config.data_parallel_size == 1:
+        # 1. Whenever the cross-DP agreement did not run, nobody has decided
+        # yet and the answer above is a hardcoded False: vLLM hardcodes it for
+        # dp = 1, and `_dp_batch_coordination_disabled` hardcodes it for the
+        # connectors that opt out of the collective. Both cases need the
+        # rank-local decision instead, or `--enable-dbo` is accepted and then
+        # silently ignored for the whole run.
+        if (
+            self.vllm_config.parallel_config.data_parallel_size == 1
+            or self.connector.control_plane is None
+        ):
             should_ubatch = self._should_ubatch_single_rank(
                 batch_descriptor,
                 args,
