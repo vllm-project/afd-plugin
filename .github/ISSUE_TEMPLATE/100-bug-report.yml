@@ -8,7 +8,7 @@ body:
     attributes:
       value: >
         Before submitting, please search existing issues to avoid duplicates.
-        afd-plugin targets vLLM v0.26.0 unless an issue explicitly says otherwise.
+        afd-plugin targets vLLM v0.28.0 unless an issue explicitly says otherwise.
 
   - type: markdown
     attributes:
@@ -76,5 +76,5 @@ body:
       options:
         - label: I searched existing issues for related reports.
           required: true
-        - label: I confirmed whether this reproduces against vLLM v0.26.0 or explained why not.
+        - label: I confirmed whether this reproduces against vLLM v0.28.0 or explained why not.
           required: true

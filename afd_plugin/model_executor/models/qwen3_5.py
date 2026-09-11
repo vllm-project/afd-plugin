@@ -95,8 +95,8 @@ class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
     # Patch functionality: preserve its native forward while keeping a
     # parameter-free experts proxy with a local FFN router.
     # Signature: AFD-owned; layer_idx is required for correlation metadata.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/qwen3_next.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.28.0, vllm/model_executor/models/qwen3_next.py
+    # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
     def __init__(
         self,
         *,
@@ -151,8 +151,8 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
     # Patch reason: native Qwen3_5DecoderLayer constructs Attention/GDN and MoE.
     # Patch functionality: allocate only the modules owned by the active role.
     # Signature: matches upstream.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/qwen3_5.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.28.0, vllm/model_executor/models/qwen3_5.py
+    # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -257,7 +257,8 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
             raise RuntimeError("native Qwen MoE is owned by the FFN role")
         if not isinstance(self.mlp, native.Qwen3NextSparseMoeBlock):
             raise RuntimeError("FFN role does not own native Qwen MoE")
-        if not self.mlp.experts.is_internal_router:
+        # The runner routes internally exactly when its gate is present.
+        if self.mlp.experts.gate is None:
             raise RuntimeError("FFN native runner must use its local router")
         return self.mlp(hidden_states)
 
@@ -279,8 +280,8 @@ class AFDQwen3_5Model(native.Qwen3_5Model):  # noqa: N801
     # Patch functionality: use role-aware layers without replacing its forward
     # or load_weights implementation.
     # Signature: matches upstream.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/qwen3_5.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.28.0, vllm/model_executor/models/qwen3_5.py
+    # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # ### PATCH START: require the minimal experts boundary.
         afd_config = parse_optional_afd_config(vllm_config, validate=False)
@@ -365,8 +366,8 @@ class AFDQwen3_5MoeForCausalLM(  # noqa: N801
     # Patch functionality: construct AFDQwen3_5Model while preserving inherited
     # forward, logits, state, and loader methods.
     # Signature: matches upstream.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/qwen3_5.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.28.0, vllm/model_executor/models/qwen3_5.py
+    # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # ### PATCH START: require AFD activation for the replacement shell.
         afd_config = parse_optional_afd_config(vllm_config, validate=False)
@@ -437,8 +438,8 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
     # Patch functionality: retain native tower staging but construct the AFD
     # language model. Forward and multimodal interfaces stay native.
     # Signature: matches upstream.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/qwen3_5.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.28.0, vllm/model_executor/models/qwen3_5.py
+    # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         # ### PATCH START: enforce AFD's supported Qwen GPU configuration.
         afd_config = parse_optional_afd_config(vllm_config, validate=False)

@@ -8,7 +8,7 @@ body:
     attributes:
       value: >
         Before submitting, please search existing issues and RFCs. Keep proposals
-        tied to vLLM v0.26.0 compatibility unless the issue explicitly proposes a
+        tied to vLLM v0.28.0 compatibility unless the issue explicitly proposes a
         version expansion.
 
   - type: textarea
@@ -31,7 +31,7 @@ body:
     id: compatibility
     attributes:
       label: vLLM compatibility and extension points
-      description: Explain how this should work without modifying the vLLM v0.26.0 source tree.
+      description: Explain how this should work without modifying the vLLM v0.28.0 source tree.
       placeholder: |
         Preferred extension point:
         Compat shim needed:

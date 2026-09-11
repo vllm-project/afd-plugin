@@ -34,7 +34,7 @@ dependencies = []
 # Keep vLLM optional so macOS and CPU-only development can run import/config tests.
 # Install the runtime extra only in environments with a compatible vLLM wheel.
 [project.optional-dependencies]
-vllm = ["vllm==0.26.0"]
+vllm = ["vllm==0.28.0"]
 
 [project.urls]
 Homepage = "https://github.com/vllm-project/afd-plugin"

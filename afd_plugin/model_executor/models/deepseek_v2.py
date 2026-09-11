@@ -243,8 +243,11 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
     # constructing only the gate owned by Attention and a parameter-free proxy.
     # Signature: AFD-owned; adds layer_idx and compute_gate_on_attention and omits
     # quant_config because no local expert kernel is constructed.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.28.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
+    # In v0.28.0 the native forward always delegates routing to the experts
+    # runner, so forward() below computes the Attention-side gate first when
+    # this shell owns one.
     def __init__(
         self,
         *,
@@ -288,6 +291,42 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         )
         # ### PATCH END: construct a remote-experts native MoE shell.
 
+    # Patch reason: v0.28.0's native forward always delegates routing to the
+    # experts runner (router_logits=hidden_states), so a shell that owns a
+    # gate would never compute it and Attention would ship hidden states as
+    # router logits.
+    # Patch functionality: compute the Attention-side gate before transport;
+    # gate-less shells keep the native delegation unchanged.
+    # Signature: matches upstream; no added parameters.
+    # Upstream: vLLM v0.28.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        already_sequence_parallel: bool = False,
+    ) -> torch.Tensor:
+        if self.gate is None:
+            return super().forward(hidden_states, already_sequence_parallel)
+
+        # ### PATCH START: compute the Attention-side gate before transport.
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        if self.is_sequence_parallel and not already_sequence_parallel:
+            hidden_states = native.sequence_parallel_chunk(hidden_states)
+        router_logits, _ = self.gate(hidden_states)
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+        )
+        if self.is_sequence_parallel and not already_sequence_parallel:
+            final_hidden_states = native.tensor_model_parallel_all_gather(
+                final_hidden_states,
+                0,
+            )
+            final_hidden_states = final_hidden_states[:num_tokens]
+        return final_hidden_states.view(num_tokens, hidden_dim)
+        # ### PATCH END: compute the Attention-side gate before transport.
+
 
 class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
     """DeepSeek decoder layer with separable Attention and FFN execution."""
@@ -295,8 +334,8 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
     # Patch reason: native DeepSeek constructs both Attention and FFN modules.
     # Patch functionality: construct only the modules owned by the active AFD role.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.28.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -431,12 +470,12 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
             if self.compute_gate_on_attention and not self.is_moe_layer:
                 self.mlp = native.PPMissingLayer()
             elif self.is_moe_layer:
-                # vLLM models bind FusedMoE at module import time. AFD can import
-                # native DeepSeek before vLLM-Ascend patches the package factory,
-                # so refresh that binding after platform initialization and before
-                # constructing the NPU FFN MoE.
+                # vLLM models bind FusedMoEFactory at module import time. AFD
+                # can import native DeepSeek before vLLM-Ascend patches the
+                # package factory, so refresh that binding after platform
+                # initialization and before constructing the NPU FFN MoE.
                 if device_type == "npu":
-                    native.FusedMoE = fused_moe.FusedMoE
+                    native.FusedMoEFactory = fused_moe.FusedMoEFactory
                 self.mlp = native.DeepseekV2MoE(
                     config=config,
                     parallel_config=parallel_config,
@@ -448,9 +487,9 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                     ),
                 )
                 if self.compute_gate_on_attention and device_type == "cuda":
-                    # Keep the native gate parameter and path for loader/model
-                    # compatibility, but configure the runner to consume the
-                    # router logits transferred from Attention.
+                    # Keep the gate weights loadable, but with the runner's
+                    # gate cleared it consumes the Attention-side router
+                    # logits instead of computing its own.
                     self.mlp.experts.gate = None
             else:
                 self.mlp = native.DeepseekV2MLP(
@@ -591,7 +630,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
             )
         if not isinstance(self.mlp, native.DeepseekV2MoE):
             raise RuntimeError("FFN role does not own a native DeepSeek MoE")
-        if self.mlp.experts.is_internal_router:
+        if self.mlp.experts.gate is not None:
             raise RuntimeError("FFN native runner must use external routing")
         return self.mlp.experts(
             hidden_states=hidden_states,
@@ -608,8 +647,8 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
     # Patch reason: native DeepSeek always creates native Decoder layers.
     # Patch functionality: create role-aware AFD layers without full allocation.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.28.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # ### PATCH START: require AFD activation and avoid native allocation.
         afd_config = parse_afd_config(vllm_config, validate=False)

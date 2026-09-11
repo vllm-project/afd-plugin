@@ -28,7 +28,7 @@ validation_paths:
   - "tests/e2e/models/qwen3_moe/test_qwen3_moe.py"
   - "tests/e2e/models/qwen3_6/test_qwen3_6.py"
 upstream_refs:
-  - "vLLM 0.26.0 serving and shutdown interfaces"
+  - "vLLM 0.28.0 serving and shutdown interfaces"
   - "lm-evaluation-harness GSM8K task and local-completions API"
   - "pytest parameterized test IDs"
 verified_platform_refs:

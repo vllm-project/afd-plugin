@@ -210,6 +210,7 @@ def _runner_for_metadata(
     runner._afd_transaction_counter = 0
     runner.prof = _StepProfiler()
     runner.cudagraph_manager = SimpleNamespace(run_fullgraph=lambda _desc: None)
+    runner.is_encoder_only = False
     return runner
 
 
@@ -668,8 +669,8 @@ def test_v2_capture_publishes_two_descriptor_events_outside_graph_body(
 
     runner.connector = CaptureConnector(events)
 
-    def original_prepare(*args):
-        prepare_calls.append((args[0], args[1]))
+    def original_prepare(num_reqs, num_tokens, *args, **kwargs):
+        prepare_calls.append((num_reqs, num_tokens))
         return f"attention-state-{len(prepare_calls)}"
 
     original_create = afd_forward_context.forward_context_module.create_forward_context
@@ -695,6 +696,7 @@ def test_v2_capture_publishes_two_descriptor_events_outside_graph_body(
                     None,
                     [],
                     None,
+                    False,
                 )
                 assert state == f"attention-state-{len(prepare_calls)}"
                 events.append("graph_enter")
@@ -780,7 +782,7 @@ def test_v2_capture_restores_symbol_and_sidecars_on_failure(monkeypatch, failure
     runner._is_warmup = False
     runner._afd_is_graph_capturing = False
 
-    def original_prepare(*args):
+    def original_prepare(*args, **kwargs):
         if failure == "prepare":
             raise RuntimeError("prepare failed")
         return "attention-state"
@@ -810,6 +812,7 @@ def test_v2_capture_restores_symbol_and_sidecars_on_failure(monkeypatch, failure
             None,
             [],
             None,
+            False,
         )
         afd_forward_context.forward_context_module.create_forward_context()
         if failure == "forward":
@@ -871,8 +874,8 @@ def test_v2_capture_source_drift_fails_loud_and_restores(
         calls[0] = (1, 9)
     original_calls = []
 
-    def original_prepare(*args):
-        original_calls.append((args[0], args[1]))
+    def original_prepare(num_reqs, num_tokens, *args, **kwargs):
+        original_calls.append((num_reqs, num_tokens))
         return "attention-state"
 
     def native_capture(self):
@@ -885,6 +888,7 @@ def test_v2_capture_source_drift_fails_loud_and_restores(
                 None,
                 [],
                 None,
+                False,
             )
         return 1
 
@@ -1202,6 +1206,7 @@ def test_v2_profile_before_graph_manager_uses_provider_without_replay_hook(
             "dummy_run": False,
             "skip_attn_for_dummy_run": False,
             "is_profile": True,
+            "context_len": 0,
         },
     ]
     assert events == ["control_update", "control_send", "data"]
@@ -1314,6 +1319,7 @@ def test_native_v2_dummy_profile_thin_path_uses_afd_execute_wrapper(
         dummy_run=False,
         skip_attn_for_dummy_run=False,
         is_profile=False,
+        context_len=0,
     ):
         execute_calls.append(
             (dummy_run, skip_attn_for_dummy_run, is_profile),

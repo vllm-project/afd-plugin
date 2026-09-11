@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Config normalization shim for AFD-owned runtime behavior.
 
-vLLM 0.26.0 validates native microbatching by requiring a supported all2all
+vLLM 0.28.0 validates native microbatching by requiring a supported all2all
 backend. AFD ubatching uses plugin connectors instead, so this patch only
 relaxes that assertion for configs with active ``additional_config["afd"]``.
 It also replaces the platform's default worker with the role-specific AFD
@@ -17,7 +17,9 @@ from typing import TYPE_CHECKING, Any
 import vllm.config.vllm as config_module
 import vllm.engine.arg_utils as arg_utils_module
 
-from afd_plugin.compat.vllm import TARGET_VLLM_VERSION
+from afd_plugin.compat.vllm import (
+    is_target_vllm_compatible as _is_target_vllm_compatible,
+)
 from afd_plugin.config import parse_optional_afd_config
 from afd_plugin.validation import afd_worker_qualname_for_platform_default
 
@@ -193,19 +195,6 @@ def _should_relax_vllm_config_backend(vllm_config: VllmConfig) -> bool:
         "deepep_high_throughput",
         "nixl_ep",
     }
-
-
-def _is_target_vllm_compatible() -> bool:
-    try:
-        import vllm
-
-        version_value = vllm.__version__
-    except (AttributeError, ImportError):
-        return True
-    version_text = str(version_value)
-    if "dev" in version_text:
-        return True
-    return version_text.startswith(TARGET_VLLM_VERSION)
 
 
 if _is_target_vllm_compatible():

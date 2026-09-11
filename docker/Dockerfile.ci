@@ -4,7 +4,7 @@
 # The base image already ships vLLM and its CUDA runtime stack (torch,
 # flashinfer, etc.). Install only the AFD plugin + dev tools on top.
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
-ARG VLLM_BASE_TAG=v0.26.0
+ARG VLLM_BASE_TAG=v0.28.0
 
 # deps stage: everything except the real project sources, so most PRs can
 # cache-hit on the heavy dependency layer.

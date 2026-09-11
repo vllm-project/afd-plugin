@@ -17,14 +17,14 @@ validation_paths:
   - "tests/unit/**"
   - "tests/e2e/**"
 upstream_refs:
-  - "vLLM 0.26.0"
-  - "vLLM-Ascend commit 80d8c194f and environment evidence recorded in the NPU guides"
+  - "vLLM 0.28.0"
+  - "vLLM-Ascend commit 80d8c194f and environment evidence recorded in the NPU guides (v0.26 NPU baseline, pending the 0.28 NPU upgrade)"
 verified_platform_refs:
-  - "CUDA: tests/e2e tests marked gpu; no canonical image is recorded"
+  - "CUDA: tests/e2e tests marked gpu on NVIDIA L20X, vLLM 0.28.0 wheel (torch 2.13.0+cu130); no canonical image is recorded"
   - "Ascend E2E environment recorded in the installation and NPU guides"
 related_issues:
   - "#129"
-last_reviewed: 2026-08-27
+last_reviewed: 2026-09-09
 ---
 
 # AFD module design

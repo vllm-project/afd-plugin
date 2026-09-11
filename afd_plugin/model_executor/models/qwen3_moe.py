@@ -104,10 +104,16 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
 
     # Patch reason: native Qwen3 MoE constructs both Attention and FFN modules.
     # Patch functionality: construct only the large modules owned by the AFD role.
-    # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/qwen3_moe.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
-    def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
+    # Signature: matches upstream; is_fused_checkpoint_transposed is unused
+    # because the role-aware layer never builds the fused-checkpoint MoE.
+    # Upstream: vLLM v0.28.0, vllm/model_executor/models/qwen3_moe.py
+    # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        is_fused_checkpoint_transposed: bool = False,
+    ) -> None:
         # ### PATCH START: initialize the role-aware layer without native allocation.
         nn.Module.__init__(self)
         afd_config = parse_afd_config(vllm_config, validate=False)
@@ -218,8 +224,8 @@ class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
     # Patch functionality: construct AFDQwen3MoeModel and retain native lifecycle
     # and MoE metadata without requiring local experts on the Attention role.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/qwen3_moe.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.28.0, vllm/model_executor/models/qwen3_moe.py
+    # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # ### PATCH START: avoid constructing the full native model first.
         nn.Module.__init__(self)
@@ -252,7 +258,7 @@ class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
             prefix=native.maybe_prefix(prefix, "lm_head"),
         )
         if self.config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
+            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         self.logits_processor = native.LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
@@ -312,8 +318,8 @@ class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
     # Patch functionality: retain only role-owned checkpoint paths, then use the
     # native loader unchanged for mapping, packing, and loaded-parameter results.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/qwen3_moe.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.28.0, vllm/model_executor/models/qwen3_moe.py
+    # Commit: 2cf0a6915ce544dc493a0990f2ea38d81601128a
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # ### PATCH START: filter the checkpoint stream by AFD execution role.
         role_weights = _iter_role_weights(weights, role=self.afd_role)

@@ -1,7 +1,11 @@
 # DeepSeek-V2-Lite AFD Examples
 
 End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
-(Attention-FFN Disaggregation) plugin on vLLM `v0.26.0`.
+(Attention-FFN Disaggregation) plugin on vLLM `v0.28.0`. The 2A2F
+eager/graph/DBO family was hardware-validated on NVIDIA L20X through
+`tests/e2e/models/deepseek_v2_lite/` on vLLM `v0.28.0`; the individual
+launch scripts below were inspected against that runtime and not
+re-run one by one.
 
 > [!NOTE]
 > `P2pNcclAFDConnector` is an example connector implementation. Contributions
@@ -12,7 +16,7 @@ End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
 
 - Install [NIXL](https://github.com/ai-dynamo/nixl).
 - At least 4 GPUs(A/H-class, tested against L20X).
-- vLLM `v0.26.0` and the `afd-plugin` package installed in the same
+- vLLM `v0.28.0` and the `afd-plugin` package installed in the same
   environment (see repository root `AGENTS.md`).
 - DeepSeek-V2-Lite weights on disk. All scripts default to
   `/path/model_weights/DeepSeek-V2-Lite`; override with

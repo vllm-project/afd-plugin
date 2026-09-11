@@ -50,10 +50,10 @@ class AFDAttentionWorker(Worker):
     # Patch functionality: validate the supported V2 contract, select the AFD model
     # identity before construction, and scope the module-class substitution to
     # the delegated native initialization window.
-    # Signature: matches vLLM v0.26.0 Worker.init_device exactly: (self).
+    # Signature: matches vLLM v0.28.0 Worker.init_device exactly: (self).
     # Upstream source: vllm/v1/worker/gpu_worker.py, Worker.init_device;
     # runner local-import/construct seam; commit
-    # 568afb3a13806beb53bb2e6bd518269357b237c0.
+    # 2cf0a6915ce544dc493a0990f2ea38d81601128a.
     # Delegation exception: the large native device/distributed setup remains
     # in super().init_device(); only this missing runner-factory seam is local.
     # Removal/upstream plan: delete this substitution when vLLM adds runner
