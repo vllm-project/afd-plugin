@@ -561,10 +561,12 @@ def _initialize_ffn_engine_core(
         cache_config.num_cpu_blocks = 0
 
     # These attributes let common shutdown/debug utility paths tolerate the
-    # intentionally skipped KV/scheduler initialization.
+    # intentionally skipped KV/scheduler initialization. The noop scheduler
+    # (not None) is required: the native ready handshake calls
+    # scheduler.get_kv_event_publisher_config() unconditionally.
     self.available_gpu_memory_for_kv_cache = -1
     self.structured_output_manager = None
-    self.scheduler = None
+    self.scheduler = _AFDFFNNoopScheduler()
     self.mm_receiver_cache = None
     self.batch_queue_size = 0
     self.batch_queue = None

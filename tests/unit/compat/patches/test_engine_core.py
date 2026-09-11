@@ -292,11 +292,13 @@ def test_engine_core_patch_skips_kv_scheduler_init_for_ffn(monkeypatch):
         def shutdown(self):
             self.calls.append("shutdown")
 
+    from afd_plugin.compat.patches.engine_core import _AFDFFNNoopScheduler
+
     engine = core_module.EngineCore(_config("ffn"), Executor, log_stats=True)
 
     assert not hasattr(engine, "original_init_called")
     assert engine.afd_config.role == "ffn"
-    assert engine.scheduler is None
+    assert isinstance(engine.scheduler, _AFDFFNNoopScheduler)
     assert engine.structured_output_manager is None
     assert isinstance(engine.model_executor, Executor)
 
@@ -317,6 +319,28 @@ def test_ffn_noop_scheduler_tolerates_late_patch_load():
     assert scheduler.get_kv_connector() is None
     assert scheduler.get_kv_event_publisher_config() is None
     assert scheduler.has_requests() is False
+
+
+def test_ffn_early_init_satisfies_native_ready_handshake():
+    """Both plugin-loading orders must survive vLLM 0.28.0's ready handshake.
+
+    When the patches are installed before FFN EngineCore construction (fork
+    inheritance, in-process engines), the FFN divert at the top of
+    ``EngineCore.__init__`` runs and ``_make_ready_response`` later calls
+    ``scheduler.get_kv_event_publisher_config()`` unconditionally. The
+    early-loaded path therefore needs the same noop scheduler the
+    late-loaded path already gets.
+    """
+    from afd_plugin.compat.patches.engine_core import _AFDFFNNoopScheduler
+
+    noop = _AFDFFNNoopScheduler()
+    assert noop.connector is None
+    assert noop.ec_connector is None
+    assert noop.get_kv_connector() is None
+    assert noop.get_ec_connector() is None
+    assert noop.get_kv_event_publisher_config() is None
+    assert noop.has_requests() is False
+    assert noop.has_unfinished_requests() is False
 
 
 def test_engine_core_patch_leaves_cuda_non_ffn_path_untouched(monkeypatch):

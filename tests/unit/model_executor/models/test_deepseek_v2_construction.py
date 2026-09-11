@@ -417,7 +417,6 @@ def test_attention_shell_computes_gate_before_transport(
     shipping hidden states breaks the P2P width contract (hidden_size vs
     n_routed_experts) on the FFN side.
     """
-    construction_env(monkeypatch)
     monkeypatch.setattr(
         adapter.native,
         "current_platform",
@@ -480,7 +479,6 @@ def test_attention_shell_without_gate_keeps_native_delegation(
     construction_env,
 ):
     """With the gate on the FFN side, the shell ships hidden states only."""
-    construction_env(monkeypatch)
     monkeypatch.setattr(
         adapter.native,
         "get_ep_group",
