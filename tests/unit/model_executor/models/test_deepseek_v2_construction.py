@@ -383,7 +383,10 @@ def test_cuda_ffn_gate_uses_parameter_free_internal_router_shell(
     assert isinstance(moe.mlp.experts, adapter.AFDAttentionFusedMoE)
     assert moe.mlp.gate is None
     assert moe.mlp.experts.is_internal_router
-    assert "forward" not in type(moe.mlp).__dict__
+    # 0.28.0's native MoE forward no longer computes an external gate, so
+    # the shell overrides forward and delegates to it while its gate is
+    # None (behavior covered by
+    # test_attention_shell_without_gate_keeps_native_delegation).
     assert list(moe.mlp.experts.parameters()) == []
     assert list(moe.mlp.experts.buffers()) == []
     assert not any(name.startswith("mlp.") for name in _parameter_names(moe))
