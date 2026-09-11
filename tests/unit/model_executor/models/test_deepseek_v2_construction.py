@@ -405,6 +405,119 @@ def test_ffn_constructs_no_real_attention(
     assert not any(name.startswith("self_attn.") for name in _parameter_names(moe))
 
 
+def test_attention_shell_computes_gate_before_transport(
+    monkeypatch,
+    construction_env,
+):
+    """CUDA compute_gate_on_attention=True ships real router logits.
+
+    vLLM 0.28.0's native MoE forward passes router_logits=hidden_states and
+    expects the experts runner to hold the gate. The Attention-side shell
+    owns the gate, so its forward must compute the logits before transport;
+    shipping hidden states breaks the P2P width contract (hidden_size vs
+    n_routed_experts) on the FFN side.
+    """
+    construction_env(monkeypatch)
+    monkeypatch.setattr(
+        adapter.native,
+        "current_platform",
+        SimpleNamespace(device_type="cuda"),
+    )
+    monkeypatch.setattr(
+        adapter.native,
+        "get_ep_group",
+        lambda: SimpleNamespace(
+            device_group=SimpleNamespace(size=lambda: 1),
+            rank_in_group=0,
+        ),
+    )
+    monkeypatch.setattr(adapter.native, "_get_moe_router_dtype", lambda _c: None)
+
+    gate_calls = []
+
+    class _FakeGate(nn.Module):
+        def __init__(self, hidden_size, n_experts, out_dtype=None, prefix=""):
+            super().__init__()
+            self.n_experts = n_experts
+
+        def forward(self, hidden_states):
+            gate_calls.append(tuple(hidden_states.shape))
+            return torch.zeros((hidden_states.shape[0], self.n_experts)), None
+
+    monkeypatch.setattr(adapter.native, "GateLinear", _FakeGate)
+
+    sent = []
+
+    class _RecordingProxy(adapter.AFDAttentionFusedMoE):
+        def _send_and_receive(self, hidden_states, **send_kwargs):
+            sent.append(send_kwargs)
+            return hidden_states
+
+    monkeypatch.setattr(adapter, "AFDAttentionFusedMoE", _RecordingProxy)
+
+    vllm_config = _vllm_config()
+    shell = adapter.AFDDeepseekV2RemoteExpertsMoE(
+        config=vllm_config.model_config.hf_config,
+        parallel_config=vllm_config.parallel_config,
+        layer_idx=1,
+        prefix="model.layers.1.mlp",
+        compute_gate_on_attention=True,
+    )
+    hidden_states = torch.zeros((2, 8))
+    output = shell.forward(hidden_states)
+
+    assert gate_calls == [(2, 8)]
+    assert len(sent) == 1
+    assert sent[0]["router_logits"].shape == (
+        2,
+        vllm_config.model_config.hf_config.n_routed_experts,
+    )
+    assert torch.equal(output, hidden_states)
+
+
+def test_attention_shell_without_gate_keeps_native_delegation(
+    monkeypatch,
+    construction_env,
+):
+    """With the gate on the FFN side, the shell ships hidden states only."""
+    construction_env(monkeypatch)
+    monkeypatch.setattr(
+        adapter.native,
+        "get_ep_group",
+        lambda: SimpleNamespace(
+            device_group=SimpleNamespace(size=lambda: 1),
+            rank_in_group=0,
+        ),
+    )
+    monkeypatch.setattr(adapter.native, "_get_moe_router_dtype", lambda _c: None)
+
+    sent = []
+
+    class _RecordingProxy(adapter.AFDAttentionFusedMoE):
+        def _send_and_receive(self, hidden_states, **send_kwargs):
+            sent.append(send_kwargs)
+            return hidden_states
+
+    monkeypatch.setattr(adapter, "AFDAttentionFusedMoE", _RecordingProxy)
+
+    vllm_config = _vllm_config()
+    shell = adapter.AFDDeepseekV2RemoteExpertsMoE(
+        config=vllm_config.model_config.hf_config,
+        parallel_config=vllm_config.parallel_config,
+        layer_idx=1,
+        prefix="model.layers.1.mlp",
+        compute_gate_on_attention=False,
+    )
+    assert shell.gate is None
+    assert shell.experts.is_internal_router is True
+
+    hidden_states = torch.zeros((2, 8))
+    output = shell.forward(hidden_states)
+
+    assert sent == [{}]
+    assert torch.equal(output, hidden_states)
+
+
 def test_npu_ffn_refreshes_native_fused_moe_factory(
     monkeypatch,
     construction_env,
