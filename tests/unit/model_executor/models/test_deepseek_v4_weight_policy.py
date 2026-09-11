@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 from __future__ import annotations
 
 import pytest
@@ -28,13 +30,21 @@ class _OneShotWeights:
 @pytest.mark.parametrize(
     "name",
     [
-        "layers.0.ffn.gate.weight",
         "layers.1.ffn.experts.0.w1.weight",
         "model.layers.2.ffn.shared_experts.w2.weight",
     ],
 )
 def test_v4_raw_checkpoint_ffn_paths_are_ffn_owned(name):
     assert _checkpoint_weight_roles(name) == frozenset(("ffn",))
+
+
+def test_v4_gate_loads_on_both_roles():
+    # The gate's parameters live under .ffn so the checkpoint names resolve,
+    # but with compute_gate_on_attention the Attention side is what runs it --
+    # so both roles have to load the same tensor.
+    assert _checkpoint_weight_roles("layers.0.ffn.gate.weight") == frozenset(
+        ("attention", "ffn")
+    )
 
 
 @pytest.mark.parametrize(
@@ -78,6 +88,7 @@ def test_v4_raw_checkpoint_public_paths_are_shared(name):
             [
                 "layers.0.attn.fused_wqa_wkv.weight",
                 "layers.0.hc_ffn_fn",
+                "layers.0.ffn.gate.weight",
                 "model.hc_head_fn",
                 "embed.weight",
             ],
@@ -104,7 +115,7 @@ def test_v4_load_weights_filters_raw_checkpoint_names_once(
         "embed.weight",
     ]
     weights = _OneShotWeights(names)
-    seen = []
+    seen: list[str] = []
     native_result = {"native.loaded"}
 
     def fake_native_loader(self, filtered_weights):

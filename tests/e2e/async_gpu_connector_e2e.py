@@ -36,13 +36,13 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from afd_plugin.model_executor.models.gpu.deepseek_v2_attention_gate import (
-    compute_attention_gate_moe_ffn,
-)
 
 from afd_plugin.config import AFDConfig
 from afd_plugin.connectors.gpu.async_gpu import GpuAsyncAFDConnector
 from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
+from afd_plugin.model_executor.models.gpu.deepseek_v2_attention_gate import (
+    compute_attention_gate_moe_ffn,
+)
 
 NUM_TOKENS = 48
 HIDDEN = 128

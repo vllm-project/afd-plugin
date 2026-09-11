@@ -17,11 +17,11 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
+
+from afd_plugin.connectors.gpu.async_gpu import plan_dispatch
 from afd_plugin.model_executor.models.gpu.deepseek_v2_attention_gate import (
     compute_attention_gate_moe_ffn,
 )
-
-from afd_plugin.connectors.gpu.async_gpu import plan_dispatch
 
 NUM_TOKENS = 32
 HIDDEN = 128

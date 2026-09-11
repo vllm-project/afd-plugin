@@ -18,6 +18,10 @@ from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.nvidia import model as native
 
 from afd_plugin.config import parse_afd_config
+from afd_plugin.connectors import (
+    AFDExpertRoutingSpec,
+    AFDF2ATransferPayload,
+)
 from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
@@ -27,8 +31,8 @@ _FFN_ROLE = frozenset(("ffn",))
 _BOTH_ROLES = frozenset(("attention", "ffn"))
 
 
-def _weight_layer_path(name: str) -> tuple[int, str] | None:
-    """Extract the decoder layer index and first layer-local path component."""
+def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
+    """Extract the decoder layer index and the path below ``layers.N``."""
     parts = name.split(".")
     for marker_idx, part in enumerate(parts[:-2]):
         if part != "layers":
@@ -37,7 +41,11 @@ def _weight_layer_path(name: str) -> tuple[int, str] | None:
             layer_idx = int(parts[marker_idx + 1])
         except ValueError:
             continue
-        return layer_idx, parts[marker_idx + 2]
+        return (
+            layer_idx,
+            parts[marker_idx + 2],
+            tuple(parts[marker_idx + 3 :]),
+        )
     return None
 
 
@@ -55,8 +63,13 @@ def _checkpoint_weight_roles(name: str) -> frozenset[str]:
     layer_path = _weight_layer_path(name)
     if layer_path is None:
         return _BOTH_ROLES
-    _, stage = layer_path
+    _, stage, remainder = layer_path
     if stage == "ffn":
+        if remainder and remainder[0] == "gate":
+            # The gate computes on Attention, and the parameters live under
+            # .ffn.gate to match the checkpoint; the FFN role's native MoE
+            # gate loads the same tensors at the same path.
+            return _BOTH_ROLES
         return _FFN_ROLE
     return _ATTENTION_ROLE
 
@@ -75,18 +88,68 @@ def _iter_role_weights(
 class RemoteDeepseekV4FFN(nn.Module):
     """Parameter-free FFN proxy carrying V4 hash-router token identifiers."""
 
-    def __init__(self, *, layer_idx: int) -> None:
+    def __init__(
+        self,
+        *,
+        layer_idx: int,
+        vllm_config: VllmConfig | None = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        # The gate computes on Attention, but its parameters live under .ffn so
+        # the checkpoint names (…ffn.gate.*) load straight onto them; the FFN
+        # role loads the same tensors into its native MoE gate. Without a
+        # config there is nothing to size a gate from -- the control-plane path
+        # routes on the FFN side and never asks for one.
+        self.gate: native.GateLinear | None = None
+        if vllm_config is None:
+            return
+        if not parse_afd_config(vllm_config, validate=False).compute_gate_on_attention:
+            return
+        config = vllm_config.model_config.hf_config
+        self.gate = native.GateLinear(
+            input_size=config.hidden_size,
+            output_size=config.n_routed_experts,
+            bias=False,
+            out_dtype=torch.float32,
+            prefix=f"{prefix}.ffn.gate",
+        )
+        self.gate.e_score_correction_bias = None
+        self.gate.tid2eid = None
+        if layer_idx < config.num_hash_layers:
+            self.gate.tid2eid = nn.Parameter(
+                torch.randint(
+                    0,
+                    config.n_routed_experts,
+                    (config.vocab_size, config.num_experts_per_tok),
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+        elif getattr(config, "topk_method", None) == "noaux_tc":
+            self.gate.e_score_correction_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        input_ids: torch.Tensor | None,
+        input_ids: torch.Tensor | None = None,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if input_ids is None:
-            raise RuntimeError("DeepSeek-V4 remote FFN requires input_ids")
-        if input_ids.ndim != 1 or input_ids.shape[0] != hidden_states.shape[0]:
+        if input_ids is None and topk_ids is None:
+            raise RuntimeError(
+                "DeepSeek-V4 remote FFN requires input_ids or expert routing",
+            )
+        if (
+            input_ids is not None
+            and input_ids.ndim != 1
+            or input_ids is not None
+            and input_ids.shape[0] != hidden_states.shape[0]
+        ):
             raise ValueError(
                 "DeepSeek-V4 input_ids must be one-dimensional and token-aligned",
             )
@@ -105,11 +168,21 @@ class RemoteDeepseekV4FFN(nn.Module):
             seq_len=int(hidden_states.shape[0]),
         )
         context = AFDTransferContext(metadata=metadata)
-        afd_metadata.connector.send_attn_output(
-            hidden_states,
-            context,
-            input_ids=input_ids,
-        )
+        if topk_ids is not None:
+            # Expert-routed dispatch (async connector): the gate ran here, so
+            # the wire carries the routing instead of the token ids.
+            afd_metadata.connector.send_attn_output(
+                hidden_states,
+                context,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+            )
+        else:
+            afd_metadata.connector.send_attn_output(
+                hidden_states,
+                context,
+                input_ids=input_ids,
+            )
         hidden_states = maybe_apply_dbo_yield(
             hidden_states,
             role="attention",
@@ -153,7 +226,21 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 topk_indices_buffer=topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
             )
-            self.ffn = RemoteDeepseekV4FFN(layer_idx=layer_idx)
+            self.ffn = RemoteDeepseekV4FFN(
+                layer_idx=layer_idx,
+                vllm_config=vllm_config,
+                prefix=prefix,
+            )
+            # ### PATCH START: gate runs on Attention for the async connector.
+            if afd_config.compute_gate_on_attention:
+                self.n_activated_experts = config.num_experts_per_tok
+                self.routed_scaling_factor = getattr(
+                    config, "routed_scaling_factor", 1.0
+                )
+                self.renormalize = config.norm_topk_prob
+                self.scoring_func = getattr(config, "scoring_func", "sqrtsoftplus")
+                self.hash_indices_dtype = torch.int32
+            # ### PATCH END
         elif afd_config.role == "ffn":
             self.attn = native.PPMissingLayer()
             self.ffn = native.DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
@@ -197,6 +284,74 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         self.hc_ffn_scale = nn.Parameter(
             torch.empty(3, dtype=torch.float32),
             requires_grad=False,
+        )
+
+    def compute_ffn_output(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        input_ids: torch.Tensor | None = None,
+        group_list: torch.Tensor | None = None,
+        expand_x_shared: torch.Tensor | None = None,
+    ) -> torch.Tensor | AFDF2ATransferPayload:
+        if not isinstance(self.ffn, native.DeepseekV4MoE):
+            raise RuntimeError("DeepSeek-V4 FFN compute is FFN-role only")
+        if group_list is None:
+            # P2pNccl path: the whole MoE, including its native router.
+            if input_ids is None:
+                raise RuntimeError("DeepSeek-V4 FFN compute requires input_ids")
+            return self.ffn(hidden_states, input_ids)
+        moe = self.ffn
+        counts = group_list.to(torch.int64)
+        num_rows = int(hidden_states.shape[0])
+        num_local_experts = int(counts.numel())
+        if num_rows == 0:
+            return AFDF2ATransferPayload(
+                routed_output=hidden_states.new_empty((0, self.hidden_size)),
+                shared_output=None,
+            )
+        # Rows arrive sorted by local expert; rebuild global expert ids so the
+        # FusedMoE layer's own mapping sees the owning expert.
+        expert_ids = torch.repeat_interleave(
+            torch.arange(
+                num_local_experts,
+                device=hidden_states.device,
+                dtype=torch.int32,
+            )
+            + moe.experts_start_idx,
+            counts,
+            output_size=num_rows,
+        ).unsqueeze(1)
+        # V4's routed scaling was already folded into the dispatch-side topk
+        # weights, so each partial row carries weight 1.0 here; the connector
+        # applies the per-partial weights when it reduces back to one row per
+        # token on the Attention side.
+        row_weights = torch.ones(
+            (num_rows, 1),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        # The SWIGLUOAI clamp rides in FusedMoEConfig (built from
+        # swiglu_limit at construction), so the grouped call must not pass a
+        # runtime clamp here: the modular runner rejects the kwarg.
+        routed_output = moe.experts(
+            hidden_states,
+            row_weights,
+            expert_ids,
+        )
+        shared_output = None
+        # A dispatch's round-robin shared slice is empty for a rank whenever
+        # the ubatch holds fewer tokens than FFN ranks, so zero rows are a
+        # normal item shape, not a missing payload.
+        if (
+            moe.shared_experts is not None
+            and expand_x_shared is not None
+            and expand_x_shared.shape[0] > 0
+        ):
+            shared_output = moe.shared_experts(expand_x_shared)
+        return AFDF2ATransferPayload(
+            routed_output=routed_output,
+            shared_output=shared_output,
         )
 
     # Patch reason: native forward directly invokes its locally allocated FFN.
@@ -294,23 +449,35 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             norm_eps=ffn_norm_eps,
         )
 
-        # ### PATCH START: this call enters the synchronous remote FFN proxy.
-        x = self.ffn(x, input_ids)
+        # ### PATCH START: enter the remote FFN proxy (sync or expert-routed).
+        gate = self.ffn.gate
+        if gate is not None:
+            router_logits, _ = gate(x)
+            topk_weights, topk_ids = native.fused_topk_bias(
+                hidden_states=x,
+                gating_output=router_logits,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=(
+                    gate.e_score_correction_bias.data
+                    if gate.e_score_correction_bias is not None
+                    else None
+                ),
+                topk=self.n_activated_experts,
+                renormalize=self.renormalize,
+                indices_type=self.hash_indices_dtype,
+                input_tokens=input_ids,
+                hash_indices_table=gate.tid2eid,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+            x = self.ffn(
+                x,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+            )
+        else:
+            x = self.ffn(x, input_ids)
         # ### PATCH END
         return x, residual, post_mix, res_mix
-
-    def compute_ffn_output(
-        self,
-        hidden_states: torch.Tensor,
-        *,
-        input_ids: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Execute the complete native V4 MoE, including its native router."""
-        if not isinstance(self.ffn, native.DeepseekV4MoE):
-            raise RuntimeError("DeepSeek-V4 FFN compute is FFN-role only")
-        if input_ids is None:
-            raise RuntimeError("DeepSeek-V4 FFN compute requires input_ids")
-        return self.ffn(hidden_states, input_ids)
 
 
 class AFDDeepseekV4Model(native.DeepseekV4Model):
@@ -327,13 +494,28 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         self.afd_config = parse_afd_config(vllm_config, validate=False)
         if native.current_platform.device_type != "cuda":
             raise RuntimeError("AFD DeepSeek-V4 supports CUDA only")
-        if self.afd_config.connector != "P2pNcclAFDConnector":
+        if self.afd_config.connector not in (
+            "P2pNcclAFDConnector",
+            "GpuAsyncAFDConnector",
+        ):
             raise RuntimeError(
-                "AFD DeepSeek-V4 requires the synchronous P2pNcclAFDConnector",
+                "AFD DeepSeek-V4 supports P2pNcclAFDConnector or GpuAsyncAFDConnector",
             )
-        if self.afd_config.compute_gate_on_attention:
+        if (
+            self.afd_config.connector == "GpuAsyncAFDConnector"
+            and not self.afd_config.compute_gate_on_attention
+        ):
             raise RuntimeError(
-                "AFD DeepSeek-V4 does not support compute_gate_on_attention",
+                "AFD DeepSeek-V4 async dispatch routes by expert: "
+                "compute_gate_on_attention is required",
+            )
+        if (
+            self.afd_config.connector == "P2pNcclAFDConnector"
+            and self.afd_config.compute_gate_on_attention
+        ):
+            raise RuntimeError(
+                "AFD DeepSeek-V4 over P2pNccl routes on the FFN side: "
+                "compute_gate_on_attention must stay off",
             )
         parallel_config = vllm_config.parallel_config
         if parallel_config.pipeline_parallel_size != 1:
@@ -436,15 +618,27 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         hidden_states: torch.Tensor,
         layer_idx: int,
         *,
-        input_ids: torch.Tensor | None,
-    ) -> torch.Tensor:
+        input_ids: torch.Tensor | None = None,
+        group_list: torch.Tensor | None = None,
+        expand_x_shared: torch.Tensor | None = None,
+    ) -> torch.Tensor | AFDF2ATransferPayload:
         return self.layers[layer_idx].compute_ffn_output(
             hidden_states,
             input_ids=input_ids,
+            group_list=group_list,
+            expand_x_shared=expand_x_shared,
         )
 
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return tuple(range(int(self.config.num_hidden_layers)))
+
+    def get_experts_routing_spec(self, layer_idx: int) -> AFDExpertRoutingSpec:
+        """Router contract for the async FFN loop's receive buffers."""
+        gate = self.layers[layer_idx].gate
+        return AFDExpertRoutingSpec(
+            router_logits_width=int(self.config.n_routed_experts),
+            router_logits_dtype=gate.out_dtype or gate.weight.dtype,
+        )
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         """Return native expert mappings only where real experts are owned."""
@@ -482,6 +676,9 @@ class AFDDeepseekV4ForCausalLM(native.DeepseekV4ForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         self.afd_config = parse_afd_config(vllm_config, validate=False)
         self.afd_role = self.afd_config.role
+        # Only the P2pNccl wire carries token ids; the async wire carries the
+        # expert routing the Attention-side gate computed.
+        self.afd_requires_input_ids = self.afd_config.connector == "P2pNcclAFDConnector"
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
     def compute_ffn_output(
@@ -490,13 +687,20 @@ class AFDDeepseekV4ForCausalLM(native.DeepseekV4ForCausalLM):
         layer_idx: int,
         *,
         input_ids: torch.Tensor | None = None,
+        group_list: torch.Tensor | None = None,
+        expand_x_shared: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | AFDF2ATransferPayload:
         return self.model.compute_ffn_output(
             hidden_states,
             layer_idx,
             input_ids=input_ids,
+            group_list=group_list,
+            expand_x_shared=expand_x_shared,
         )
+
+    def get_experts_routing_spec(self, layer_idx: int) -> AFDExpertRoutingSpec:
+        return self.model.get_experts_routing_spec(layer_idx)
 
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return self.model.get_experts_layer_indices()

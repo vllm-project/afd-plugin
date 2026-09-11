@@ -174,7 +174,9 @@ def register_afd() -> None:
         import afd_plugin.compat.patches.async_dp_engine  # noqa: F401
         import afd_plugin.compat.patches.async_dp_forward_context  # noqa: F401
         import afd_plugin.compat.patches.config_validation  # noqa: F401
+        import afd_plugin.compat.patches.dp_coordinator_timeout  # noqa: F401
         import afd_plugin.compat.patches.engine_core  # noqa: F401
+        import afd_plugin.compat.patches.ffn_local_moe_prepare  # noqa: F401
     except Exception:
         _logger.debug(
             "AFD plugin: compatibility patches could not be applied",
