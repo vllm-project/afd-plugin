@@ -16,14 +16,22 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 AFD_ADDITIONAL_CONFIG_KEY: Final[str] = "afd"
-AFD_ASYNC_CONNECTOR: Final[str] = "CAMAsyncAFDConnector"
+AFD_ASYNC_NPU_CONNECTOR: Final[str] = "CAMAsyncAFDConnector"
+AFD_ASYNC_GPU_CONNECTOR: Final[str] = "GpuAsyncAFDConnector"
+# Connectors that drive FFN work from the connector receive loop instead of a DP
+# metadata control plane, and therefore need the async-DP engine patches. The
+# patches are platform-neutral; only the connector below them differs.
+AFD_ASYNC_CONNECTORS: Final[frozenset[str]] = frozenset(
+    {AFD_ASYNC_NPU_CONNECTOR, AFD_ASYNC_GPU_CONNECTOR},
+)
 AFDRole = Literal["attention", "ffn"]
 
 SUPPORTED_AFD_ROLES: Final[tuple[str, ...]] = ("attention", "ffn")
 SUPPORTED_AFD_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pNcclAFDConnector",
     "CAMP2pAFDConnector",
-    AFD_ASYNC_CONNECTOR,
+    AFD_ASYNC_NPU_CONNECTOR,
+    AFD_ASYNC_GPU_CONNECTOR,
 )
 
 _ALIASES: Final[dict[str, str]] = {
@@ -283,7 +291,7 @@ def is_afd_async_dp(vllm_config: VllmConfig) -> bool:
     return (
         config is not None
         and config.async_dp
-        and config.connector == AFD_ASYNC_CONNECTOR
+        and config.connector in AFD_ASYNC_CONNECTORS
     )
 
 
@@ -307,9 +315,10 @@ def validate_afd_config(
             "AFD connector must be one of "
             f"{SUPPORTED_AFD_CONNECTORS!r}, got {config.connector!r}",
         )
-    if config.async_dp and config.connector != AFD_ASYNC_CONNECTOR:
+    if config.async_dp and config.connector not in AFD_ASYNC_CONNECTORS:
         raise ValueError(
-            "AFD async mode requires connector='CAMAsyncAFDConnector'",
+            "AFD async mode requires one of "
+            f"{sorted(AFD_ASYNC_CONNECTORS)!r}, got {config.connector!r}",
         )
     if config.connector == "P2pNcclAFDConnector":
         from afd_plugin.distributed import validate_p2p_topology
@@ -331,7 +340,9 @@ def validate_afd_config(
 
 __all__ = [
     "AFDConfig",
-    "AFD_ASYNC_CONNECTOR",
+    "AFD_ASYNC_NPU_CONNECTOR",
+    "AFD_ASYNC_CONNECTORS",
+    "AFD_ASYNC_GPU_CONNECTOR",
     "afd_config_from_mapping",
     "AFD_ADDITIONAL_CONFIG_KEY",
     "AFDRole",

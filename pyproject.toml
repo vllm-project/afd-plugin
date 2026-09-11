@@ -97,6 +97,7 @@ select = [
     "ISC",
     "SIM",
 ]
+extend-ignore = ["N812"]
 
 [tool.ruff.lint.per-file-ignores]
 "afd_plugin/compat/patches/**/*.py" = [

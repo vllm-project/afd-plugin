@@ -24,6 +24,7 @@ from afd_plugin.connectors import (
     AFDTransferContext,
     AFDTransferMetadata,
 )
+from afd_plugin.connectors.gpu.async_moe_op import register_async_moe_ops
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 from afd_plugin.model_executor.models.npu.async_cam_layout import (
     AsyncMoeUbatchMetadata,
@@ -36,6 +37,22 @@ from afd_plugin.model_executor.models.npu.async_cam_layout import (
     restore_cam_dispatch_output,
 )
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
+
+afd_async_dispatch, afd_async_recv = register_async_moe_ops()
+
+
+def _dispatches_through_ops(connector: object) -> bool:
+    """Whether this connector's round trip goes through the opaque ops.
+
+    The ops exist so Dynamo splits at the MoE round trip instead of tracing
+    into the connector, which is the GPU async connector's requirement. CAM
+    keeps the direct calls: the ops carry neither router logits nor FlashComm1
+    token sharding, and the CAM protocol needs both.
+    """
+    from afd_plugin.connectors.gpu.async_gpu import GpuAsyncAFDConnector
+
+    return isinstance(connector, GpuAsyncAFDConnector)
+
 
 if TYPE_CHECKING:
     from afd_plugin.model_executor.models.deepseek_v2 import (
@@ -119,12 +136,12 @@ def run_attention_gate_afd_forward(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the Attention-side gate AFD path used by async CAM."""
 
-    afd_connector = afd_metadata.connector
-    forward_context = get_forward_context()
-    stage_idx = afd_metadata.stage_idx
+    # Stage resolution (vLLM tracks the DBO ubatch by thread) lives inside the
+    # dispatch/receive ops, which the compiled graph treats as opaque.
     pending_ffn_recv = False
-    pending_dispatch_layout: CAMDispatchLayout | None = None
     pending_dispatch_ref: torch.Tensor | None = None
+    pending_dispatch_layout: CAMDispatchLayout | None = None
+    use_ops = _dispatches_through_ops(afd_metadata.connector)
 
     # Async CAM profile forwards are a distributed startup contract: every
     # Attention rank pairs CAM I/O with the FFN daemon to initialize resources.
@@ -132,18 +149,27 @@ def run_attention_gate_afd_forward(
         islice(model.layers, model.start_layer, model.end_layer),
     ):
         if layer_offset > 0 and pending_ffn_recv:
-            if pending_dispatch_layout is None or pending_dispatch_ref is None:
+            if pending_dispatch_ref is None:
                 raise RuntimeError("Async CAM receive is missing its dispatch layout")
-            local_ffn_output = afd_connector.recv_ffn_output(
-                ref_tensor=pending_dispatch_ref,
-                ubatch_idx=stage_idx,
-            )
-            hidden_states = restore_cam_dispatch_output(
-                local_ffn_output,
-                pending_dispatch_layout,
-            )
+            if use_ops:
+                # Opaque op: waits for the reply on the stream and restores the
+                # model layout. Tracing splits here; the payload it needs was
+                # stashed by the dispatch op one layer earlier.
+                hidden_states = afd_async_recv(pending_dispatch_ref)
+            else:
+                if pending_dispatch_layout is None:
+                    raise RuntimeError(
+                        "Async CAM receive is missing its dispatch layout",
+                    )
+                hidden_states = restore_cam_dispatch_output(
+                    afd_metadata.connector.recv_ffn_output(
+                        ref_tensor=pending_dispatch_ref,
+                        ubatch_idx=afd_metadata.stage_idx,
+                    ),
+                    pending_dispatch_layout,
+                )
+                pending_dispatch_layout = None
             pending_ffn_recv = False
-            pending_dispatch_layout = None
             pending_dispatch_ref = None
 
         if not layer.is_moe_layer:
@@ -168,45 +194,62 @@ def run_attention_gate_afd_forward(
             llama_4_scaling,
         )
 
-        dispatch_payload = prepare_cam_dispatch_payload(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            router_logits,
-            use_sequence_parallel=forward_context.flash_comm_v1_enabled,
-        )
-        metadata = AFDTransferMetadata.create_attention_metadata(
-            layer_idx=layer.layer_idx,
-            stage_idx=stage_idx,
-            seq_len=int(dispatch_payload.hidden_states.shape[0]),
-        )
-        context = AFDTransferContext(metadata=metadata)
-        afd_connector.send_attn_output(
-            dispatch_payload.hidden_states,
-            context,
-            topk_weights=dispatch_payload.topk_weights,
-            topk_ids=dispatch_payload.topk_ids,
-            router_logits=dispatch_payload.router_logits,
-        )
+        if use_ops:
+            # Opaque op: builds the rank-local payload and sends it. Tracing
+            # splits here -- everything inside (NVSHMEM views, host caches,
+            # ctypes waits) is invisible to Dynamo and recorded once per
+            # capture.
+            hidden_states = afd_async_dispatch(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                layer.layer_idx,
+            )
+            pending_dispatch_ref = hidden_states
+        else:
+            dispatch_payload = prepare_cam_dispatch_payload(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                router_logits,
+                use_sequence_parallel=get_forward_context().flash_comm_v1_enabled,
+            )
+            afd_metadata.connector.send_attn_output(
+                dispatch_payload.hidden_states,
+                AFDTransferContext(
+                    metadata=AFDTransferMetadata.create_attention_metadata(
+                        layer_idx=layer.layer_idx,
+                        stage_idx=afd_metadata.stage_idx,
+                        seq_len=int(dispatch_payload.hidden_states.shape[0]),
+                    ),
+                ),
+                topk_weights=dispatch_payload.topk_weights,
+                topk_ids=dispatch_payload.topk_ids,
+                router_logits=dispatch_payload.router_logits,
+            )
+            pending_dispatch_layout = dispatch_payload.layout
+            pending_dispatch_ref = dispatch_payload.hidden_states
         pending_ffn_recv = True
-        pending_dispatch_layout = dispatch_payload.layout
-        pending_dispatch_ref = dispatch_payload.hidden_states
         hidden_states = maybe_apply_dbo_yield(
             hidden_states,
             role="attention",
         )
 
     if pending_ffn_recv:
-        if pending_dispatch_layout is None or pending_dispatch_ref is None:
+        if pending_dispatch_ref is None:
             raise RuntimeError("Async CAM receive is missing its dispatch layout")
-        local_ffn_output = afd_connector.recv_ffn_output(
-            ref_tensor=pending_dispatch_ref,
-            ubatch_idx=stage_idx,
-        )
-        hidden_states = restore_cam_dispatch_output(
-            local_ffn_output,
-            pending_dispatch_layout,
-        )
+        if use_ops:
+            hidden_states = afd_async_recv(pending_dispatch_ref)
+        else:
+            if pending_dispatch_layout is None:
+                raise RuntimeError("Async CAM receive is missing its dispatch layout")
+            hidden_states = restore_cam_dispatch_output(
+                afd_metadata.connector.recv_ffn_output(
+                    ref_tensor=pending_dispatch_ref,
+                    ubatch_idx=afd_metadata.stage_idx,
+                ),
+                pending_dispatch_layout,
+            )
     return hidden_states, residual
 
 
@@ -222,7 +265,11 @@ def run_async_moe_ubatch_afd_forward(
     """Run the two-stage async MoE ubatch pipeline used by async CAM."""
 
     forward_context = get_forward_context()
-    runtime_sequence_parallel = bool(forward_context.flash_comm_v1_enabled)
+    runtime_sequence_parallel = getattr(
+        forward_context,
+        "flash_comm_v1_enabled",
+        False,
+    )
     if runtime_sequence_parallel != async_moe_ubatch_metadata.use_sequence_parallel:
         raise RuntimeError(
             "Async CAM stage layout does not match the current FlashComm1 "
@@ -327,6 +374,16 @@ def run_async_moe_ubatch_afd_forward(
         else:
             stage_forward_context.num_tokens = int(stage.input_tokens)
             stage_forward_context.pad_size = 0
+            # KV-cache writes are indexed per token, so a stage's slot mapping
+            # is its slice of the batch's. Leaving the full-batch mapping in
+            # place makes the attention layer write this stage's rows into the
+            # whole batch's slots and corrupt the cache. Under sequence
+            # parallelism the stage slice is in global coordinates and does not
+            # index the rank-local mapping, so that layout keeps the parent's.
+            stage_forward_context.slot_mapping = {
+                layer_name: mapping[stage.token_slice]
+                for layer_name, mapping in forward_context.slot_mapping.items()
+            }
         expected_tokens = int(stage_hidden_states[stage_idx].shape[0])
         log_async_moe_stage_attention(
             stage_idx,
@@ -503,7 +560,10 @@ def _restore_async_moe_stage_state(
         (hidden_width, residual_width),
         dim=-1,
     )
-    return hidden_states, residual
+    # Splitting the last dimension leaves two interleaved views. The next thing
+    # to touch them is the final norm, and CUDA's fused_add_rms_norm requires
+    # contiguous inputs -- it aborts in the kernel rather than falling back.
+    return hidden_states.contiguous(), residual.contiguous()
 
 
 __all__ = [

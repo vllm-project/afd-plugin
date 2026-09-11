@@ -46,6 +46,12 @@ from afd_plugin.config_utils import (
     coerce_extra_str,
     coerce_optional_extra_positive_int,
 )
+from afd_plugin.connectors.async_topology import (
+    ASYNC_MOE_REQUEST_SPLIT,
+    ATTN_RANKS_PER_DP_CONFIG_KEY,
+    AFDAsyncTopology,
+    build_async_topology,
+)
 from afd_plugin.connectors.base import (
     AFDConnectorBase,
     ConnectorExtraInfo,
@@ -68,9 +74,7 @@ if TYPE_CHECKING:
 
 AFD_ASYNC_CAM_GROUP_NAME = "afd_async_cam"
 CAM_COMM_ID = 0
-ATTN_RANKS_PER_DP_CONFIG_KEY = "attn_ranks_per_dp"
 ASYNC_MOE_NUM_STAGES = 2
-ASYNC_MOE_REQUEST_SPLIT = "request"
 ASYNC_MOE_TOKEN_SPLIT = "token"
 
 _AFD_ASYNC_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
@@ -202,23 +206,6 @@ class AFDAsyncFFNWorkItem:
     num_tokens: int
     total_num_tokens: int
     shared_num_tokens: int
-
-
-@dataclass(frozen=True, slots=True)
-class AFDAsyncTopology:
-    """Role-local and HCCL-world rank information for one CAM participant."""
-
-    role: str
-    role_rank: int
-    world_rank: int
-    attn_size: int
-    ffn_size: int
-    expert_per_rank: int
-
-    @property
-    def world_size(self) -> int:
-        """Return the total number of Attention and FFN ranks."""
-        return self.attn_size + self.ffn_size
 
 
 class CAMAsyncAFDConnector(AFDConnectorBase):
@@ -877,56 +864,6 @@ def _log_cam_op_values(op_name: str, label: str, **kwargs: object) -> None:
             description = repr(value)
         lines.append(f"  {name}={description}")
     logger.warning("AFD CAM %s %s:\n%s", op_name, label, "\n".join(lines))
-
-
-def build_async_topology(
-    afd_config: AFDConfig,
-    role_rank: int,
-    *,
-    num_routed_experts: int | None = None,
-) -> AFDAsyncTopology:
-    """Validate role-local rank settings and derive HCCL world rank.
-
-    The world is Attention-first: Attention role rank ``i`` maps to world rank
-    ``i`` and FFN role rank ``j`` maps to
-    ``num_attention_ranks + j``. Routed experts are distributed across FFN
-    ranks using a ceiling division; production model layouts should keep the
-    routed-expert count divisible by the FFN rank count.
-    """
-    attn_size = afd_config.num_attention_ranks
-    ffn_size = afd_config.num_ffn_ranks
-    if attn_size <= 0 or ffn_size <= 0:
-        raise ValueError("AFD async topology sizes must be positive")
-    if role_rank < 0:
-        raise ValueError(f"AFD async role rank must be non-negative, got {role_rank}")
-
-    if afd_config.role == "attention":
-        if role_rank >= attn_size:
-            raise ValueError(
-                "Attention role rank must be within attention size "
-                f"(rank={role_rank}, size={attn_size})",
-            )
-        world_rank = role_rank
-    elif afd_config.role == "ffn":
-        if role_rank >= ffn_size:
-            raise ValueError(
-                "FFN role rank must be within FFN size "
-                f"(rank={role_rank}, size={ffn_size})",
-            )
-        world_rank = attn_size + role_rank
-    else:
-        raise ValueError(f"unknown AFD role {afd_config.role!r}")
-
-    expert_count = num_routed_experts or 1
-    expert_per_rank = (expert_count + ffn_size - 1) // ffn_size
-    return AFDAsyncTopology(
-        role=afd_config.role,
-        role_rank=role_rank,
-        world_rank=world_rank,
-        attn_size=attn_size,
-        ffn_size=ffn_size,
-        expert_per_rank=expert_per_rank,
-    )
 
 
 def _validate_topk_payload(
