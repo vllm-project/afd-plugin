@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -13,6 +14,7 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config import update_config as update_vllm_config
 from vllm.distributed.parallel_state import get_world_group, graph_capture
 from vllm.forward_context import DPMetadata, get_forward_context, set_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.utils.mem_utils import DeviceMemoryProfiler
@@ -39,9 +41,15 @@ from afd_plugin.v1.worker.attention_model_runner import (
     fail_if_unsupported_ubatching,
 )
 from afd_plugin.v1.worker.cuda_graph import (
+    MAX_REPLAY_PADDING_RATIO,
     AFDGraphRunMode,
     graph_run_mode,
     make_ffn_graph_key,
+    pad_counts_to_shape,
+    padded_ffn_graph_buckets,
+    padded_ffn_graph_shape,
+    select_padded_ffn_bucket,
+    shared_rows_for_bucket,
     validate_cuda_graph_mode,
 )
 from afd_plugin.v1.worker.ffn_metadata import (
@@ -49,10 +57,28 @@ from afd_plugin.v1.worker.ffn_metadata import (
     project_ffn_token_counts_to_dp,
 )
 
+# Name the logger inside vLLM's tree so its handler picks the lines up; a bare
+# afd_plugin.* logger propagates to a handler-less root and is dropped.
+logger = init_logger(f"vllm.{__name__}")
+
 if TYPE_CHECKING:
     from vllm.sequence import IntermediateTensors
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+
+
+# How often the padded-graph runner reports its padding overhead. One line per
+# this many replays keeps a 43-layer step from writing a line per layer.
+_PADDED_STATS_EVERY = 2000
+
+
+@dataclass(slots=True)
+class _PaddedFFNGraph:
+    """One MoE layer's experts, captured at the padded shape."""
+
+    graph: torch.cuda.CUDAGraph
+    routed_out: torch.Tensor
+    shared_out: torch.Tensor | None
 
 
 class GPUFFNModelRunner(LoRAModelRunnerMixin):
@@ -86,9 +112,10 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         # A connector without a control plane drives FFN steps from its own
         # receive loop instead of from broadcast DP metadata.
         self.is_connector_driven = self.connector.control_plane is None
-        # The connector-driven path never touches vLLM's graph machinery, so
-        # vLLM's cudagraph_mode says nothing about it -- running the policy gate
-        # here would reject modes that are simply irrelevant.
+        # The connector-driven path captures its own padded graphs and never
+        # touches vLLM's graph machinery, so vLLM's cudagraph_mode says nothing
+        # about it -- running the policy gate here would reject modes that are
+        # simply irrelevant. The only question is whether graphs are wanted.
         if self.is_connector_driven:
             self.afd_cudagraph_policy = None
         else:
@@ -100,12 +127,32 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         self.model: Any = None
         self.model_memory_usage = 0
         self.num_layers = int(self.model_config.hf_text_config.num_hidden_layers)
-        self.use_cuda_graph = bool(
-            self.afd_cudagraph_policy is not None
-            and self.afd_cudagraph_policy.enable_ffn_graph_cache
+        self.use_cuda_graph = (
+            not bool(self.model_config.enforce_eager)
+            if self.is_connector_driven
+            else bool(
+                self.afd_cudagraph_policy is not None
+                and self.afd_cudagraph_policy.enable_ffn_graph_cache
+            )
         )
         self._cuda_graphs: dict[tuple, dict[str, Any]] = {}
         self._graph_memory_pool: Any | None = None
+        # Connector-driven padded graphs, one per MoE layer. Empty unless the
+        # async connector runs with graphs on; see capture_padded_ffn_graphs.
+        self._padded_graphs: dict[tuple[int, int], _PaddedFFNGraph] = {}
+        self._padded_buckets: tuple[int, ...] = ()
+        # Rows a replay really carried vs rows it was charged, so a run reports
+        # how much of the FFN's GPU time went to padding. Host-side ints; the
+        # ladder is only worth tuning against a measured distribution.
+        self._padded_rows_real = 0
+        self._padded_rows_charged = 0
+        self._padded_replays = 0
+        self._padded_eager_items = 0
+        self._padded_hidden: torch.Tensor | None = None
+        self._padded_counts: torch.Tensor | None = None
+        self._padded_shared: torch.Tensor | None = None
+        self._padded_max_routed = 0
+        self._padded_max_shared = 0
         self.prof = create_afd_gpu_profiler("ffn")
 
     @property
@@ -280,17 +327,305 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         step_afd_gpu_profiler(self.prof)
         self._ffn_forward_connector_driven()
 
+    # ==================================================================
+    # Connector-driven padded CUDA graphs
+    # ==================================================================
+
+    def capture_padded_ffn_graphs(self) -> int:
+        """Capture the local experts once per MoE layer, at the maximum shape.
+
+        The connector-driven path has no control plane, so nothing tells this
+        rank the shape of the next work item -- which is why it ran eagerly.
+        Padding removes the need to know: a grouped GEMM takes its grouping
+        from a device-side count vector rather than from its row count, so the
+        largest shape can be captured and every item padded up to it, with the
+        padding charged to the last expert and its output sliced off. Only the
+        counts differ between replays, and a replay re-reads them.
+
+        The shape is the largest batch the sender can produce,
+        ``max_num_batched_tokens``, so prefill and decode both replay it.
+
+        One graph per layer, because a graph records the weight pointers and
+        each layer has its own. Input buffers are shared across layers -- work
+        items are served one at a time on one stream.
+
+        Called once, before the connector joins its process group. That
+        rendezvous is the only barrier between the roles, and the Attention
+        rank profiles -- and so dispatches -- the moment it clears; capturing
+        after joining would leave those dispatches landing in a slot nobody is
+        polling yet.
+
+        Returns:
+            Bytes of device memory the graphs took.
+        """
+        if not self.use_cuda_graph or not self.is_connector_driven:
+            return 0
+        if self._padded_graphs:
+            # start_ffn_server_loop is callable more than once.
+            return 0
+        if self.model is None:
+            raise RuntimeError("capture_padded_ffn_graphs needs a loaded model")
+
+        connector: Any = self.connector
+        device = torch.device(self.device)
+        # This runs on whichever thread called start_ffn_server_loop, which is
+        # not the serving thread and has no device bound yet.
+        torch.cuda.set_device(device)
+
+        self._padded_max_routed, self._padded_max_shared = padded_ffn_graph_shape(
+            num_tokens=int(self.vllm_config.scheduler_config.max_num_batched_tokens),
+            topk=connector.topk,
+            ffn_size=connector.ffn_size,
+            has_shared_experts=connector.has_shared_experts,
+        )
+        self._padded_hidden = torch.zeros(
+            (self._padded_max_routed, connector.hidden_size),
+            dtype=self.dtype,
+            device=device,
+        )
+        self._padded_counts = torch.zeros(
+            connector.expert_per_rank,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._padded_shared = (
+            torch.zeros(
+                (self._padded_max_shared, connector.hidden_size),
+                dtype=self.dtype,
+                device=device,
+            )
+            if self._padded_max_shared
+            else None
+        )
+        # A grouping that fills the captured shape. Any grouping records the
+        # same kernels; a replay re-reads the counts.
+        self._padded_buckets = padded_ffn_graph_buckets(
+            self._padded_max_routed,
+            ffn_size=connector.ffn_size,
+        )
+
+        inner = self.model.model
+        # Same source as the forward loop above: the model reports which of its
+        # layers own experts. Reading a per-layer flag instead only works for
+        # the adapters that happen to define one -- DeepSeek-V4's layers do not.
+        experts_layer_indices = frozenset(self.model.get_experts_layer_indices())
+        moe_layers = [
+            layer_idx
+            for layer_idx in range(inner.start_layer, inner.end_layer)
+            if layer_idx in experts_layer_indices
+        ]
+        num_warmups = max(
+            1,
+            int(self.vllm_config.compilation_config.cudagraph_num_of_warmups),
+        )
+
+        start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+        if self._graph_memory_pool is None:
+            self._graph_memory_pool = torch.cuda.graph_pool_handle()
+
+        # Pin the shared MoE workspace at its ceiling before capturing anything.
+        # It grows by freeing the old buffer and allocating a bigger one, so any
+        # growth after a capture leaves that graph reading freed memory -- one
+        # run died with an illegal memory access when an oversized item took the
+        # eager path and grew it. One eager call at the largest shape any path
+        # can ask for settles it, and costs a single forward instead of the
+        # captured graph per layer that reserving it through the ladder would.
+        with _ffn_forward_context(self.vllm_config) as warmup_context:
+            _set_moe_layer_index(warmup_context, moe_layers[0])
+            self._fill_padded_counts(self._padded_max_routed)
+            self._padded_ffn_compute(moe_layers[0], self._padded_max_routed)
+        torch.cuda.synchronize()
+
+        set_cudagraph_capturing_enabled(True)
+        try:
+            with (
+                _ffn_forward_context(self.vllm_config) as forward_context,
+                graph_capture(device=self.device),
+            ):
+                for layer_idx in moe_layers:
+                    _set_moe_layer_index(forward_context, layer_idx)
+                    # Largest bucket first, and that order is load-bearing:
+                    # vLLM's WorkspaceManager grows the shared MoE scratch by
+                    # freeing the old buffer and allocating a bigger one, which
+                    # leaves every graph already captured against the old
+                    # pointer dangling. Capturing ascending therefore made each
+                    # small bucket's graph fault on its first replay. Starting
+                    # at the largest sizes the workspace once, and every
+                    # smaller capture reuses it.
+                    for bucket in reversed(self._padded_buckets):
+                        # A replay costs its captured row count, so each bucket
+                        # gets its own graph and an item takes the smallest one
+                        # that holds it.
+                        self._fill_padded_counts(bucket)
+                        # Warm first: the fused MoE picks a kernel on its first
+                        # call, and that choice must settle before capture --
+                        # autotuning synchronizes, which capture forbids.
+                        for _ in range(num_warmups):
+                            self._padded_ffn_compute(layer_idx, bucket)
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph, pool=self._graph_memory_pool):
+                            payload = self._padded_ffn_compute(layer_idx, bucket)
+                        self._padded_graphs[(layer_idx, bucket)] = _PaddedFFNGraph(
+                            graph=graph,
+                            routed_out=payload.routed_output,
+                            shared_out=payload.shared_output,
+                        )
+        finally:
+            set_cudagraph_capturing_enabled(False)
+
+        graph_bytes = start_free_gpu_memory - torch.cuda.mem_get_info()[0]
+        logger.info(
+            "AFD FFN padded graphs ready: graphs=%d layers=%d buckets=%s "
+            "shared_rows=%d experts=%d size=%.1fMiB",
+            len(self._padded_graphs),
+            len(moe_layers),
+            list(self._padded_buckets),
+            self._padded_max_shared,
+            connector.expert_per_rank,
+            graph_bytes / 2**20,
+        )
+        return int(graph_bytes)
+
+    def _fill_padded_counts(self, bucket: int) -> None:
+        """Spread ``bucket`` rows over every local expert for capture.
+
+        Not any grouping will do, even though the row total is what sizes the
+        grouped GEMM. The fused MoE pads each non-empty expert's rows up to a
+        block, so the scratch it reserves grows with the number of experts that
+        have rows -- and a capture is stuck with the scratch it reserved. All
+        rows on one expert reserves the least, and a replay whose real routing
+        touches every expert then runs off the end of it. Spreading rows evenly
+        is both the worst case for that padding and what real routing looks
+        like, so the capture reserves enough for any replay.
+        """
+        assert self._padded_counts is not None
+        num_experts = int(self._padded_counts.numel())
+        share, remainder = divmod(bucket, num_experts)
+        self._padded_counts.fill_(share)
+        if remainder:
+            # One row each rather than all on the last expert, so a bucket
+            # smaller than the expert count still touches as many experts as
+            # it has rows instead of collapsing onto one.
+            self._padded_counts[:remainder] += 1
+
+    def _shared_rows_for(self, bucket: int) -> int:
+        """This bucket's share of the shared-expert rows."""
+        return shared_rows_for_bucket(
+            bucket,
+            max_routed=self._padded_max_routed,
+            max_shared=self._padded_max_shared,
+        )
+
+    def _padded_ffn_compute(
+        self,
+        layer_idx: int,
+        bucket: int,
+    ) -> AFDF2ATransferPayload:
+        """Run one layer's experts over the first ``bucket`` padded rows."""
+        assert self._padded_hidden is not None
+        shared = self._padded_shared
+        if shared is not None:
+            shared = shared[: self._shared_rows_for(bucket)]
+        return self.model.compute_ffn_output(
+            hidden_states=self._padded_hidden[:bucket],
+            layer_idx=layer_idx,
+            group_list=self._padded_counts,
+            expand_x_shared=shared,
+        )
+
     def _compute_work_item(
         self,
         work_item: Any,
         states: GpuAsyncTransferState,
     ) -> torch.Tensor | AFDF2ATransferPayload:
-        """Run this work item's layer over the rows that arrived."""
-        return self.model.compute_ffn_output(
-            hidden_states=work_item.hidden_states,
-            layer_idx=work_item.layer_idx,
-            group_list=states.group_list,
-            expand_x_shared=states.expand_x_shared,
+        """Replay this layer's smallest fitting padded graph, or run it eagerly.
+
+        A replay costs its captured row count rather than the item's real one,
+        so taking the smallest bucket that holds the item is what keeps a small
+        item cheap -- a DBO ubatch is a quarter of a full batch's rows, and
+        charging it the full-batch shape is what made ubatching a loss.
+
+        Eager is the fallback for an item that does not fit the captured shape
+        and for the empty item a decode can produce when none of a token's
+        experts landed here.
+        """
+        routed_rows = int(states.routed_tokens)
+        shared_rows = int(states.shared_tokens)
+        bucket = (
+            select_padded_ffn_bucket(
+                self._padded_buckets,
+                routed_rows,
+                shared_rows,
+                max_routed=self._padded_max_routed,
+                max_shared=self._padded_max_shared,
+            )
+            if routed_rows > 0
+            else None
+        )
+        if bucket is not None and bucket > routed_rows * MAX_REPLAY_PADDING_RATIO:
+            # The padding this replay would carry costs more than the launches
+            # eager pays. Take the cheaper of the two per item rather than
+            # charging every item to the nearest bucket above it.
+            bucket = None
+        graph = (
+            self._padded_graphs.get((work_item.layer_idx, bucket))
+            if bucket is not None
+            else None
+        )
+        fits = (
+            graph is not None
+            and 0 < routed_rows <= self._padded_max_routed
+            and shared_rows <= self._padded_max_shared
+        )
+        if not fits:
+            self._padded_eager_items += 1
+            return self.model.compute_ffn_output(
+                hidden_states=work_item.hidden_states,
+                layer_idx=work_item.layer_idx,
+                group_list=states.group_list,
+                expand_x_shared=states.expand_x_shared,
+            )
+
+        assert graph is not None and bucket is not None
+        self._padded_rows_real += routed_rows
+        self._padded_rows_charged += bucket
+        self._padded_replays += 1
+        if self._padded_replays % _PADDED_STATS_EVERY == 0:
+            logger.info(
+                "AFD FFN padded replays=%d eager=%d rows_real=%d rows_charged=%d "
+                "padding_overhead=%.2fx",
+                self._padded_replays,
+                self._padded_eager_items,
+                self._padded_rows_real,
+                self._padded_rows_charged,
+                self._padded_rows_charged / max(self._padded_rows_real, 1),
+            )
+
+        assert self._padded_hidden is not None
+        assert self._padded_counts is not None
+        if not states.staged_routed:
+            # The receive could not use the buffer -- no graph existed when the
+            # item arrived, or it did not fit -- so the rows still need moving.
+            self._padded_hidden[:routed_rows].copy_(work_item.hidden_states)
+        self._padded_counts.copy_(states.group_list)
+        pad_counts_to_shape(
+            self._padded_counts,
+            padded_rows=bucket,
+            actual_rows=routed_rows,
+        )
+        if self._padded_shared is not None and shared_rows:
+            self._padded_shared[:shared_rows].copy_(states.expand_x_shared)
+        graph.graph.replay()
+        # Views into the graph's own output buffers. The next replay overwrites
+        # them, and the reply that consumes them is queued before it on this
+        # stream, so the ordering holds without a copy.
+        return AFDF2ATransferPayload(
+            routed_output=graph.routed_out[:routed_rows],
+            shared_output=(
+                graph.shared_out[:shared_rows]
+                if graph.shared_out is not None and shared_rows
+                else None
+            ),
         )
 
     def _ffn_forward_connector_driven(
@@ -307,6 +642,11 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                     work_item = connector.recv_ffn_work_item(  # type: ignore[attr-defined]
                         stage_idx=stage_idx,
                         max_num_tokens=self.vllm_config.scheduler_config.max_num_batched_tokens,
+                        # Hand the graph its input buffer so the arrival's
+                        # gather lands there directly. The gather had to write
+                        # somewhere either way; staging afterwards would be a
+                        # second pass over the whole payload, per layer.
+                        routed_out=self._padded_hidden,
                     )
                 except TimeoutError:
                     # Nothing pending; hand control back so the worker loop can
