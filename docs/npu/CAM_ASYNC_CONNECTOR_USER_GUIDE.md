@@ -9,7 +9,9 @@ This guide describes the supported deployment shape, configuration contract,
 rank mapping, data flow, startup requirements, and current limitations. The
 [DeepSeek-V3.2 recipe](../../recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md)
 links the current v0.26 launch scripts and retains the historical v0.19
-multi-node commands and measurements for provenance.
+multi-node commands and measurements for provenance. The experimental
+[DeepSeek-V4-Flash recipe](../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md)
+documents a single-node DP4TP2 Attention + EP8 FFN FlashComm1 deployment.
 
 > [!WARNING]
 > The vLLM 0.26 CAM async port remains experimental. The linked PCP8 recipe and
