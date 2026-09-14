@@ -165,7 +165,6 @@ def compute_attention_gate_moe_ffn(
                 ],
                 w2_scale=[experts.get_eplb_parameter("w2_weight_scale")],
             )
-    # ### PATCH START: W4A8 CAM expert weights
     # Mirror AscendW4A8DynamicFusedMoEMethod.apply's weight payload; CAM
     # already dispatched and quantized the activations, so use only its MLP.
     elif quant_type == QuantType.W4A8:
@@ -190,7 +189,6 @@ def compute_attention_gate_moe_ffn(
                 w1_scale_bias=[bias1.detach()] if bias1 is not None else None,
                 w2_scale_bias=[bias2.detach()] if bias2 is not None else None,
             )
-    # ### PATCH END: W4A8 CAM expert weights
     else:
         raise RuntimeError(
             "compute_gate_on_attention supports unquantized, W8A8 or W4A8 "
@@ -243,7 +241,6 @@ def compute_attention_gate_moe_ffn(
                 dynamic_scale=dynamic_scales,
                 topk_scales=topk_scales,
                 weights=moe_weights,
-                # ### PATCH START: W4A8 MLP quantization contract
                 quant=MoEQuantParams(
                     quant_type=quant_type,
                     is_per_channel_weight=(
@@ -257,7 +254,6 @@ def compute_attention_gate_moe_ffn(
                     if quant_type == QuantType.W4A8
                     else 0.0
                 ),
-                # ### PATCH END: W4A8 MLP quantization contract
                 fusion=use_gmmswigluquant_fusion,
                 activation=experts.activation,
                 need_trans=False,
