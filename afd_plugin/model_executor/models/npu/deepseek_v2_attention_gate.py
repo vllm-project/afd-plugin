@@ -165,10 +165,36 @@ def compute_attention_gate_moe_ffn(
                 ],
                 w2_scale=[experts.get_eplb_parameter("w2_weight_scale")],
             )
+    # ### PATCH START: W4A8 CAM expert weights
+    # Mirror AscendW4A8DynamicFusedMoEMethod.apply's weight payload; CAM
+    # already dispatched and quantized the activations, so use only its MLP.
+    elif quant_type == QuantType.W4A8:
+        owner = experts.routed_experts
+        if experts.dynamic_eplb:
+            moe_weights = MoEWeights(
+                w1=[w.view(torch.int32) for w in owner.w13_weight_list],
+                w2=[w.view(torch.int32) for w in owner.w2_weight_list],
+                w1_scale=owner.w13_weight_scale_list,
+                w2_scale=owner.w2_weight_scale_list,
+                w1_scale_bias=owner.w13_scale_bias_list,
+                w2_scale_bias=owner.w2_scale_bias_list,
+            )
+        else:
+            bias1 = owner._parameters.get("w13_scale_bias")
+            bias2 = owner._parameters.get("w2_scale_bias")
+            moe_weights = MoEWeights(
+                w1=[owner.w13_weight],
+                w2=[owner.w2_weight],
+                w1_scale=[owner.w13_weight_scale],
+                w2_scale=[owner.w2_weight_scale],
+                w1_scale_bias=[bias1.detach()] if bias1 is not None else None,
+                w2_scale_bias=[bias2.detach()] if bias2 is not None else None,
+            )
+    # ### PATCH END: W4A8 CAM expert weights
     else:
         raise RuntimeError(
-            "compute_gate_on_attention currently supports only unquantized "
-            f"or W8A8 Ascend MoE experts, got {quant_type}",
+            "compute_gate_on_attention supports unquantized, W8A8 or W4A8 "
+            f"Ascend MoE experts, got {quant_type}",
         )
     use_gmmswigluquant_fusion = (
         quant_type in (QuantType.W8A8, getattr(QuantType, "MXFP8", None))
@@ -217,7 +243,21 @@ def compute_attention_gate_moe_ffn(
                 dynamic_scale=dynamic_scales,
                 topk_scales=topk_scales,
                 weights=moe_weights,
-                quant=MoEQuantParams(quant_type=quant_type),
+                # ### PATCH START: W4A8 MLP quantization contract
+                quant=MoEQuantParams(
+                    quant_type=quant_type,
+                    is_per_channel_weight=(
+                        experts.routed_experts.quant_method.quant_method.is_per_channel_weight
+                        if quant_type == QuantType.W4A8
+                        else False
+                    ),
+                ),
+                swiglu_limit=(
+                    float(layer.mlp.swiglu_limit or 0.0)
+                    if quant_type == QuantType.W4A8
+                    else 0.0
+                ),
+                # ### PATCH END: W4A8 MLP quantization contract
                 fusion=use_gmmswigluquant_fusion,
                 activation=experts.activation,
                 need_trans=False,

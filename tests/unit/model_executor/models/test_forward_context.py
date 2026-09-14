@@ -635,6 +635,7 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
     class FakeQuantType:
         NONE = "none"
         W8A8 = "w8a8"
+        W4A8 = "w4a8"
 
     class KeywordArguments:
         def __init__(self, **kwargs):
