@@ -21,6 +21,7 @@ depends_on:
   - "execution_platforms.md"
   - "compatibility_and_patches.md"
 validation_paths:
+  - "recipe/npu/CAMP2pAFDConnector/deepseek_v2_lite/README.md"
   - "tests/unit/v1/worker/test_ffn_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_device_contract.py"
@@ -29,12 +30,14 @@ validation_paths:
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
 upstream_refs:
+  - "NPU target: vLLM 2cf0a6915ce544dc493a0990f2ea38d81601128a / Ascend bd69bad88fc19e1aeeea585416d408df8bda8fef"
   - "vLLM vllm.v1.worker.gpu_worker.Worker"
   - "vLLM vllm.v1.worker.gpu.model_runner.GPUModelRunner construction seam"
   - "vLLM vllm.v1.engine.core.EngineCore"
   - "vLLM-Ascend vllm_ascend.worker.worker.NPUWorker (tested environment evidence only)"
   - "vLLM-Ascend vllm_ascend.worker.model_runner_v1.NPUModelRunner (tested environment evidence only)"
 verified_platform_refs:
+  - "2026-09-16: BF16 DSV2 NPU V1 synchronous GSM8K-7; seven cells pass; full accuracy deferred by requester"
   - "CUDA paths marked gpu in tests/e2e"
   - "Ascend E2E environment recorded in the installation and NPU guides"
 related_issues:
@@ -43,10 +46,19 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-08-27
+last_reviewed: 2026-09-16
 ---
 
 # FFN runtime
+
+## NPU v0.28 review scope
+
+The FFN MoE constructs through Ascend's installed modular FusedMoEFactory;
+AFD refreshes the native model binding before construction and tests the actual
+factory owner and native forward. CAMP2P fan-in receives equal-sized chunks
+from padded Attention ranks. FFN token aggregation and per-stage forward
+context retain their existing ownership. Hardware evidence covers TP1 FFN
+DP1 and DP2/EP2, with FFN-side gating; async work-item execution is excluded.
 
 ## Purpose and boundary
 

@@ -24,11 +24,11 @@ or any behavior that intentionally differs from the original AFD commit.
 
 ## Test Plan
 
-<!-- Commands or manual checks planned. Include CPU-only and GPU-gated coverage separately when relevant. -->
+<!-- Commands or manual checks planned. Include CPU-only, GPU and NPU coverage separately; record both exact upstream SHAs. -->
 
 ## Test Result
 
-<!-- Paste command results, skip reasons, links to GPU validation, or a short explanation if not run. -->
+<!-- Paste command results, skip reasons, links to GPU/NPU validation, or a short explanation if not run. -->
 
 ## Docs Impact
 
@@ -47,7 +47,7 @@ or any behavior that intentionally differs from the original AFD commit.
 - [ ] Plugin-owned classes or explicit dotted class paths are preferred over monkey patches.
 - [ ] Any compat shim or monkey patch is isolated, idempotent, version-guarded, documented, and tested.
 - [ ] Imports remain CPU-safe; CUDA-heavy work is delayed or GPU-gated.
-- [ ] Validation evidence is included, including skipped GPU tests when applicable.
+- [ ] Backend-scoped validation includes exact upstream refs, stack/topology, skip reasons and any deferred full-accuracy runs.
 - [ ] Documentation impact is stated.
 
 </details>

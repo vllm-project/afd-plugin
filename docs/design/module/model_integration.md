@@ -16,15 +16,18 @@ depends_on:
   - "connector_contracts.md"
   - "execution_platforms.md"
 validation_paths:
+  - "recipe/npu/CAMP2pAFDConnector/deepseek_v2_lite/README.md"
   - "tests/unit/model_executor/**"
   - "tests/e2e/models/**"
   - "tests/e2e/accuracy/**"
 upstream_refs:
+  - "NPU target: vLLM 2cf0a6915ce544dc493a0990f2ea38d81601128a / Ascend bd69bad88fc19e1aeeea585416d408df8bda8fef"
   - "vLLM vllm.model_executor.models.deepseek_v2"
   - "vLLM vllm.model_executor.models.qwen3_moe"
   - "vLLM vllm.forward_context.ForwardContext"
   - "vLLM vllm.model_executor.model_loader"
 verified_platform_refs:
+  - "2026-09-16: BF16 DSV2 NPU V1 synchronous GSM8K-7; seven cells pass; full accuracy deferred by requester"
   - "DeepSeek V2 Lite GPU and NPU model E2E paths"
   - "CAM async NPU model E2E path"
   - "DeepSeek V4 CUDA boundary has focused unit coverage only"
@@ -33,10 +36,20 @@ related_issues:
   - "#88"
   - "#105"
   - "#129"
-last_reviewed: 2026-08-27
+last_reviewed: 2026-09-16
 ---
 
 # Model integration
+
+## NPU v0.28 review scope
+
+Target native DeepSeek construction uses the Ascend modular FusedMoEFactory.
+AFD refreshes the native model's import-time binding before constructing FFN
+MoE and verifies actual constructor ownership and native forward in tests.
+The native runner performs internal gating; routing weights remain native.
+Only BF16 DeepSeek-V2-Lite synchronous FFN-side gating is hardware-validated
+by this upgrade. W8A8 adaptation has unit evidence; DSV4 and async CAM are
+excluded, and historical V3.2 accuracy is not evidence for this target.
 
 ## Purpose and boundary
 

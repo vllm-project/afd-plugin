@@ -16,10 +16,13 @@ is limited to `FULL_DECODE_ONLY`.
 
 ## Prerequisites
 
-- vLLM `0.26.0` (v0.26 NPU baseline; the current release gates vLLM `0.28.0`,
-  so this pairing is unsupported until the NPU upgrade) and an Ascend
-  PyTorch/vLLM-Ascend environment based on source
-  commit [`80d8c194f`](https://github.com/vllm-project/vllm-ascend/commit/80d8c194f7584b17fe08065ea99a130916f6b0e7).
+- vLLM `v0.28.0` (`2cf0a6915ce544dc493a0990f2ea38d81601128a`) with
+  vLLM-Ascend `bd69bad88fc19e1aeeea585416d408df8bda8fef`. The tested stack and
+  complete paired launch commands are in the
+  [DeepSeek-V2-Lite recipe](../../recipe/npu/CAMP2pAFDConnector/deepseek_v2_lite/README.md).
+- Hardware validation covers BF16 DeepSeek-V2-Lite, V1, TP1, 2A2F/2A1F
+  eager/graph/DBO with GSM8K-7. Full accuracy was deferred by the requester.
+  Larger topologies, W8A8 and other models are not validated by this upgrade.
 - The AFD Ascend custom operators must be built and available at runtime.
 - HCCL connectivity for the data path and Gloo connectivity for DP metadata.
 - Identical model hidden size, model dtype, AFD topology, rendezvous address,
@@ -40,7 +43,9 @@ mapping:     F0 <-> A0,A1
 `num_attention_ranks` must be greater than or equal to `num_ffn_ranks`. For
 the normal balanced mapping used by CAMP2p, the Attention rank count is an
 integer multiple of the FFN rank count. Each FFN rank handles the consecutive
-Attention ranks assigned to it.
+Attention ranks assigned to it. For fan-in (`A > F`), kernels require equal
+per-Attention token chunks. The V1 Attention runner pads DP token counts to
+the shared maximum even in eager mode; omitting this corrupts uneven batches.
 
 The connector creates these communication groups:
 

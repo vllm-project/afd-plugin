@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -20,26 +21,29 @@ def npu_afd_num_ubatches(vllm_config: VllmConfig) -> int:
 
 
 def fix_all2all_backend_for_afd(vllm_config: VllmConfig) -> None:
-    """Apply vLLM-Ascend's default-worker all2all fix to AFD workers.
+    """Normalize the backend before serialization and worker construction.
 
-    vLLM-Ascend normally rewrites ``all2all_backend`` to
-    ``"flashinfer_all2allv"`` when sequence parallelism is disabled, but that
-    compatibility rewrite is gated on the default ``worker_cls == "auto"``.
-    Automatic AFD worker selection preserves that upstream rewrite. Legacy
-    commands that explicitly select an AFD worker miss it and can keep the
-    default ``"allgather_reducescatter"`` backend.
-
-    Leaving that backend in place can make the Ascend MoE path think sequence
-    parallel MoE is enabled and split tokens through ``sequence_parallel_chunk``,
-    which is not the layout AFD's NPU connector path sends. Mirror the upstream
-    rewrite here before AFD creates the NPU model runner.
+    Mirror Ascend bd69bad88fc19e1aeeea585416d408df8bda8fef's effective
+    FlashComm selector. Use the original DSA-CP option: native derivation can
+    clear its finalized value after choosing the backend. A later worker-only
+    rewrite otherwise changes the config hash after EngineCore serialization.
     """
-    parallel_config = vllm_config.parallel_config
-    if (
-        not vllm_config.compilation_config.pass_config.enable_sp
-        and parallel_config.all2all_backend != FLASHINFER_ALL2ALLV_BACKEND
-    ):
-        parallel_config.all2all_backend = FLASHINFER_ALL2ALLV_BACKEND
+    from vllm_ascend.ascend_config import validate_additional_config_bool
+
+    additional_config = vllm_config.additional_config or {}
+    flashcomm_explicitly_enabled = validate_additional_config_bool(
+        additional_config.get("enable_flashcomm1", False),
+        "additional_config.enable_flashcomm1",
+    ) or os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0").strip().lower() in (
+        "1",
+        "true",
+    )
+    enable_dsa_cp = validate_additional_config_bool(
+        additional_config.get("enable_dsa_cp", False),
+        "additional_config.enable_dsa_cp",
+    )
+    if not (flashcomm_explicitly_enabled or enable_dsa_cp):
+        vllm_config.parallel_config.all2all_backend = FLASHINFER_ALL2ALLV_BACKEND
 
 
 __all__ = ["fix_all2all_backend_for_afd", "npu_afd_num_ubatches"]

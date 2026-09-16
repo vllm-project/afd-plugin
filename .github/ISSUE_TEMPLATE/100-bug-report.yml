@@ -20,14 +20,17 @@ body:
     id: environment
     attributes:
       label: Current environment
-      description: Include Python version, platform, afd-plugin commit, vLLM version or checkout, CUDA/GPU details if relevant, and install command.
+      description: Include Python version, platform, afd-plugin commit, vLLM version or checkout, CUDA/GPU or CANN/torch-npu/NPU details, both upstream SHAs, and install command.
       value: |
         ```text
         Python:
         OS:
         afd-plugin commit:
         vLLM version/checkout:
-        CUDA/GPU:
+        CUDA/GPU or NPU/SoC:
+        vLLM-Ascend commit:
+        CANN / torch / torch-npu:
+        Connector / TP / DP / EP / graph / DBO:
         Install command:
         ```
     validations:

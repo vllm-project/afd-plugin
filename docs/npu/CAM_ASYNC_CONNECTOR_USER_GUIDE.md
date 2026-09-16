@@ -8,14 +8,14 @@ through CAM async dispatch/combine operators.
 This guide describes the supported deployment shape, configuration contract,
 rank mapping, data flow, startup requirements, and current limitations. The
 [DeepSeek-V3.2 recipe](../../recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md)
-links the current v0.26 launch scripts and retains the historical v0.19
+links historical v0.26 launch scripts and retains the historical v0.19
 multi-node commands and measurements for provenance.
 
 > [!WARNING]
-> The current release gates the plugin on vLLM `0.28.0`, which the NPU
-> runtime below (vLLM `0.26.0` + vLLM-Ascend `80d8c194f`) does not satisfy;
-> NPU execution is unsupported until the NPU upgrade lands and this guide is
-> the pending-upgrade baseline. The vLLM 0.26 CAM async port remains experimental. The linked PCP8 recipe and
+> Async CAM was explicitly excluded from the v0.28 synchronous NPU upgrade.
+> This guide retains historical vLLM `0.26.0` + vLLM-Ascend `80d8c194f`
+> contracts and results; it does not establish compatibility or accuracy on
+> vLLM `0.28.0` + Ascend `bd69bad88`. The linked PCP8 recipe and
 > its measurements belong to the former vLLM/vLLM-Ascend 0.19.1 environment;
 > v0.26 model runner v1 uses the DP+TP/SP topology documented below. The
 > DP3TP2/EP2 matrix passed before the metadata-ownership fix. After that fix,

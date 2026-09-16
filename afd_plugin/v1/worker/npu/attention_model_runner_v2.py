@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""NPU Attention-side model runner for AFD ModelRunnerV2 execution."""
+"""NPU Attention-side model runner for AFD ModelRunnerV2 execution.
+
+Historical v0.26 implementation; excluded from v0.28 hardware qualification.
+Source annotations below retain their original revision, not a new support claim.
+"""
 
 from __future__ import annotations
 

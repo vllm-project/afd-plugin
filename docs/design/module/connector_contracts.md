@@ -17,15 +17,18 @@ depends_on:
   - "plugin_boundary.md"
   - "execution_platforms.md"
 validation_paths:
+  - "recipe/npu/CAMP2pAFDConnector/deepseek_v2_lite/README.md"
   - "tests/unit/connectors/**"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
 upstream_refs:
+  - "NPU target: vLLM 2cf0a6915ce544dc493a0990f2ea38d81601128a / Ascend bd69bad88fc19e1aeeea585416d408df8bda8fef"
   - "vLLM vllm.forward_context.DPMetadata"
   - "vLLM vllm.distributed.parallel_state"
   - "PyTorch torch.distributed process-group APIs used by the pinned runtime"
 verified_platform_refs:
+  - "2026-09-16: BF16 DSV2 NPU V1 synchronous GSM8K-7; seven cells pass; full accuracy deferred by requester"
   - "P2pNcclAFDConnector GPU unit and E2E paths"
   - "CAMP2pAFDConnector and CAMAsyncAFDConnector Ascend unit and E2E paths"
 related_issues:
@@ -34,10 +37,20 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-08-27
+last_reviewed: 2026-09-16
 ---
 
 # Connector contracts
+
+## NPU v0.28 review scope
+
+The CAMP2P A2E/E2A kernels divide the FFN buffer into equal per-Attention
+chunks. A summed token count alone cannot encode uneven fan-in: the V1
+Attention runner must pad DP counts to a common maximum for `A > F`, including
+eager execution. The wire protocol and connector-owned state are unchanged.
+Real 3-rank equal-length 1/4/128-token roundtrips passed; unequal 4/2-token
+inputs reproduced corruption. Hardware qualification covers 2A1F and 2A2F;
+other topologies and async CAM are not covered by this experiment.
 
 ## Purpose and boundary
 

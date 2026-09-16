@@ -12,8 +12,45 @@ from afd_plugin.compat.npu import runtime as ascend_runtime
 from afd_plugin.compat.npu.runtime import fix_all2all_backend_for_afd
 
 
+@pytest.fixture(autouse=True)
+def stub_ascend_namespace_patch(monkeypatch):
+    # Namespace behavior is covered separately with a strict native config stub.
+    patch_module = ModuleType("afd_plugin.compat.patches.npu.ascend_config")
+    calls = []
+    patch_module.apply_afd_ascend_config_patch = lambda: calls.append("namespace")
+    monkeypatch.setitem(sys.modules, patch_module.__name__, patch_module)
+    return calls
+
+
+def test_config_namespace_patch_installed_after_dbo_patch(
+    monkeypatch, stub_ascend_namespace_patch
+):
+    platform_patch = ModuleType("afd_plugin.compat.patches.npu.ascend_platform")
+
+    def install_dbo():
+        stub_ascend_namespace_patch.append("dbo")
+        return True
+
+    platform_patch.apply_afd_ascend_dbo_config_patch = install_dbo
+    monkeypatch.setitem(sys.modules, platform_patch.__name__, platform_patch)
+    ascend_runtime.apply_afd_ascend_config_patch_if_needed()
+    assert stub_ascend_namespace_patch == ["dbo", "namespace"]
+
+
+@pytest.fixture
+def backend_config_env(monkeypatch):
+    native_config = ModuleType("vllm_ascend.ascend_config")
+    native_config.validate_additional_config_bool = lambda value, name: (
+        value if isinstance(value, bool) else str(value).lower() in {"1", "true"}
+    )
+    monkeypatch.setitem(sys.modules, native_config.__name__, native_config)
+    monkeypatch.delenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", raising=False)
+    return native_config
+
+
 def _vllm_config(*, enable_sp=False, all2all_backend="allgather_reducescatter"):
     return SimpleNamespace(
+        additional_config={},
         compilation_config=SimpleNamespace(
             pass_config=SimpleNamespace(enable_sp=enable_sp),
         ),
@@ -23,7 +60,9 @@ def _vllm_config(*, enable_sp=False, all2all_backend="allgather_reducescatter"):
     )
 
 
-def test_fix_all2all_backend_overrides_to_flashinfer_when_sp_disabled():
+def test_fix_all2all_backend_overrides_to_flashinfer_when_sp_disabled(
+    backend_config_env,
+):
     config = _vllm_config(enable_sp=False, all2all_backend="allgather_reducescatter")
 
     fix_all2all_backend_for_afd(config)
@@ -31,15 +70,15 @@ def test_fix_all2all_backend_overrides_to_flashinfer_when_sp_disabled():
     assert config.parallel_config.all2all_backend == "flashinfer_all2allv"
 
 
-def test_fix_all2all_backend_skips_when_sp_enabled():
+def test_fix_all2all_backend_ignores_compile_pass_sp(backend_config_env):
     config = _vllm_config(enable_sp=True, all2all_backend="allgather_reducescatter")
 
     fix_all2all_backend_for_afd(config)
 
-    assert config.parallel_config.all2all_backend == "allgather_reducescatter"
+    assert config.parallel_config.all2all_backend == "flashinfer_all2allv"
 
 
-def test_fix_all2all_backend_skips_when_already_flashinfer():
+def test_fix_all2all_backend_skips_when_already_flashinfer(backend_config_env):
     config = _vllm_config(enable_sp=False, all2all_backend="flashinfer_all2allv")
 
     fix_all2all_backend_for_afd(config)
@@ -445,3 +484,36 @@ def test_npu_patches_route_mla_graph_params_from_forward_context(monkeypatch):
 
     ascend_runtime.apply_afd_ascend_patches_if_needed()
     assert fake_mla.get_graph_params is patched_get_graph_params
+
+
+@pytest.mark.parametrize("enable_sp", [False, True])
+@pytest.mark.parametrize(
+    ("options", "environment", "preserved"),
+    [
+        ({"enable_flashcomm1": True}, None, True),
+        ({"enable_flashcomm1": "true"}, None, True),
+        ({"enable_flashcomm1": "false"}, None, False),
+        ({}, " TRUE ", True),
+        ({}, " 1 ", True),
+        ({}, "false", False),
+        ({"enable_dsa_cp": True}, None, True),
+        ({"enable_dsa_cp": "true"}, None, True),
+        ({"enable_dsa_cp": "false"}, None, False),
+    ],
+)
+def test_backend_follows_native_raw_flashcomm_selector(
+    monkeypatch, backend_config_env, enable_sp, options, environment, preserved
+):
+    config = _vllm_config(enable_sp=enable_sp)
+    config.additional_config = options
+    # Finalized native DSA-CP can be false despite the original true input.
+    backend_config_env.get_ascend_config = lambda: SimpleNamespace(enable_dsa_cp=False)
+    if environment is not None:
+        monkeypatch.setenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", environment)
+    fix_all2all_backend_for_afd(config)
+    backend = config.parallel_config.all2all_backend
+    assert backend == (
+        "allgather_reducescatter" if preserved else "flashinfer_all2allv"
+    )
+    fix_all2all_backend_for_afd(config)
+    assert config.parallel_config.all2all_backend == backend

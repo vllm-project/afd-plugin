@@ -53,8 +53,8 @@ See the [recipe index](recipe/README.md) for deployment and benchmark examples.
 | Connector | Platform | Recommend Stage | Sync or Async | Graph Support | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `P2pNcclAFDConnector` | CUDA | Decode | Sync | `FULL_DECODE_ONLY` CUDA graph | FFN ranks are ordered before Attention ranks. `num_attention_ranks` must be greater than or equal to `num_ffn_ranks` and divisible by it. See the [DeepSeek V2 Lite recipe](recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md). |
-| `CAMP2pAFDConnector` | Ascend NPU | Decode | Sync | `FULL_DECODE_ONLY` ACL graph | Uses HCCL/CAMP2P custom ops. Ascend ops build by default on NPU platforms. See the [synchronous DeepSeek V3.2 recipe](recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md). |
-| `CAMAsyncAFDConnector` | Ascend NPU | Prefill / decode | Async | Not supported | Experimental v0.26 DP+TP/SP path with AFD-managed two-stage MoE ubatching; native DBO and PCP are unsupported. Post-fix DeepSeek-V3.2 DP2TP8+EP16 token split reached `0.9522` strict match on the complete GSM8K evaluation. The [legacy PCP8 recipe](recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) requires `release/v0.19.1rc1`. |
+| `CAMP2pAFDConnector` | Ascend NPU | Decode | Sync | `FULL_DECODE_ONLY` ACL graph | Uses HCCL/CAMP2P custom ops. Ascend ops build by default on NPU platforms. Validated with DeepSeek-V2-Lite in eager/graph/DBO 2A2F and 2A1F; full accuracy deferred. See the [v0.28 recipe](recipe/npu/CAMP2pAFDConnector/deepseek_v2_lite/README.md). |
+| `CAMAsyncAFDConnector` | Ascend NPU | Prefill / decode | Async | Not supported | Excluded from this v0.28 experiment; historical experimental v0.26 DP+TP/SP path with AFD-managed two-stage MoE ubatching; native DBO and PCP are unsupported. Post-fix DeepSeek-V3.2 DP2TP8+EP16 token split reached `0.9522` strict match on the complete GSM8K evaluation. The [legacy PCP8 recipe](recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) requires `release/v0.19.1rc1`. |
 
 Connector implementations are grouped by backend package:
 `afd_plugin.connectors.gpu` for GPU-only connectors,
@@ -63,9 +63,10 @@ Connector implementations are grouped by backend package:
 Known gaps:
 
 - vLLM versions other than `0.28.0` are not claimed as supported.
-- The Ascend NPU pairing below is the v0.26 baseline: the vLLM `0.28.0`
-  version gate excludes the NPU runtime until the NPU upgrade lands, so
-  NPU execution is not claimed by this release.
+- NPU hardware evidence covers synchronous DeepSeek-V2-Lite, BF16, runner V1,
+  FFN-side gate, TP1, 2A2F/2A1F eager/graph/DBO. GSM8K-7 passed; full
+  GSM8K was deferred by the upgrade requester. Async CAM and DSV4 are
+  excluded; W8A8 and additional topologies are not hardware-qualified.
 - The CUDA model runner v2 is validated (DeepSeek-V2-Lite `afd-v2-*`
   scenarios); the Ascend model runner v2 remains unit-tested only.
 - GPU and NPU E2E tests are opt-in and require real hardware plus model weights.
@@ -83,7 +84,7 @@ Known gaps:
   multi-node execution are unsupported; quantization is unverified; no
   performance claim is made.
 - PCP-based NPU model-runner-v1 deployments from v0.19.1rc1 are not supported
-  on v0.26.
+  on this target runtime.
 
 ## Install
 
@@ -111,27 +112,30 @@ The optional extra pins `vllm==0.28.0`.
 
 ### Ascend NPU installation
 
-AFD's Ascend path is validated on openEuler 22.03 (aarch64) with
-Ascend 910C / Atlas A3. Install a compatible driver and firmware, and confirm
-the devices with `npu-smi info`. Use this source baseline:
+The synchronous DeepSeek-V2-Lite path was tested on openEuler 24.03 LTS-SP4
+(aarch64), Ascend 910C / Atlas A3. Confirm devices with `npu-smi info`.
+Use these exact source revisions; an image label alone is not a runtime pin.
 
-| Component | Version |
+| Component | Tested version |
 | --- | --- |
-| Python | `3.10` or `3.11` |
-| vLLM | `0.26.0` (NPU baseline, pending the 0.28 NPU upgrade) |
-| vLLM-Ascend | commit [`80d8c194f`](https://github.com/vllm-project/vllm-ascend/commit/80d8c194f7584b17fe08065ea99a130916f6b0e7) |
-| CANN / torch / torch-npu | Use the mutually compatible versions required by that vLLM-Ascend source snapshot. |
+| Python | `3.12.13` |
+| vLLM | `v0.28.0`, `2cf0a6915ce544dc493a0990f2ea38d81601128a` |
+| vLLM-Ascend | `bd69bad88fc19e1aeeea585416d408df8bda8fef` |
+| PyTorch / torch-npu | `2.10.0+cpu` / `2.10.0.post4` |
+| CANN | `9.1.0` |
+| Triton / Triton Ascend | `3.5.0` / `3.2.2` |
+| memfabric-hybrid / memcache-hybrid | `1.2.0` / `1.2.0` |
 
 #### Environment
 
-The NPU integration was last refreshed against vLLM-Ascend commit `80d8c194f`
-(the v0.26 baseline). The current release gates the plugin on vLLM `0.28.0`,
-which the NPU runtime above does not satisfy, so NPU execution is
-**unsupported until the NPU upgrade lands**; the instructions below are kept
-as the pending-upgrade baseline. Use the
-[installation guide at that source snapshot](https://github.com/vllm-project/vllm-ascend/blob/80d8c194f7584b17fe08065ea99a130916f6b0e7/docs/source/installation.md)
-to prepare a matching A3/openEuler environment, then install AFD from the
-repository root. Do not reuse the former v0.19.1rc1 image as a v0.26 runtime.
+Prepare the Ascend runtime using the
+[target source instructions](https://github.com/vllm-project/vllm-ascend/tree/bd69bad88fc19e1aeeea585416d408df8bda8fef).
+The tested environment retained FastAPI `0.123.10` despite the vLLM dependency
+conflict, explicitly accepted by the requester. Other inherited optional-tool
+conflicts also remain; this is scoped runtime evidence, not a clean `pip check`
+certification. Do not silently resolve dependencies by changing either source pin.
+See the [v0.28 NPU recipe](recipe/npu/CAMP2pAFDConnector/deepseek_v2_lite/README.md)
+for the tested commands, scope, and deferred full-accuracy rerun.
 
 #### Install AFD
 
@@ -139,7 +143,7 @@ From the AFD repository root:
 
 ```bash
 AFD_BUILD_ASCEND_OPS=1 \
-SOC_VERSION=ascend910_9391 \
+SOC_VERSION=910c \
 python -m pip install -v --no-build-isolation --no-deps -e .
 ```
 
@@ -167,7 +171,7 @@ PY
 
 After `AFD_OPS_OK`, the environment is ready to run the NPU examples and E2E
 tests. See the
-[synchronous NPU recipe](recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md).
+[synchronous NPU recipe](recipe/npu/CAMP2pAFDConnector/deepseek_v2_lite/README.md).
 For implementation details, see the
 [Attention runtime design](docs/design/module/attention_runtime.md) and
 [FFN runtime design](docs/design/module/ffn_runtime.md).
@@ -184,8 +188,8 @@ or standard Ascend NPU platform. Explicit AFD worker paths remain accepted for
 compatibility with existing commands, but are not required or stable launch
 interfaces.
 
-GPU model runner v2 is not supported. Select model runner v1 before starting
-either GPU role:
+The following launch fragments use model runner v1. GPU V2 has a separate
+validated test matrix; NPU V2 remains unvalidated on this target. Select V1:
 
 ```bash
 export VLLM_USE_V2_MODEL_RUNNER=0
@@ -220,7 +224,9 @@ vllm serve /path/to/DeepSeek-V2-Lite \
 ```
 
 NPU uses the same config channel with `CAMP2pAFDConnector`; the plugin selects
-the NPU worker automatically:
+the NPU worker automatically. This is an Attention-only fragment; use the
+[complete paired runner](recipe/npu/CAMP2pAFDConnector/deepseek_v2_lite/README.md)
+to start both roles:
 
 ```bash
 vllm serve /path/to/DeepSeek-V2-Lite \

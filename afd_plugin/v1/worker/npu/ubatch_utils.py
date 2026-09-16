@@ -4,7 +4,9 @@
 
 Originally copied from vLLM-Ascend commit
 ``cdd212830271249a1cafcb850c210133f21771c5`` and aligned with the attention
-metadata schema at commit ``80d8c194f``. It remains plugin-owned because the
+metadata schema at commit ``80d8c194f``. Target v0.28 synchronous validation
+is recorded in the upgrade lesson; these revisions describe provenance.
+It remains plugin-owned because the
 current vLLM-Ascend release no longer provides NPU ubatch helpers.
 """
 

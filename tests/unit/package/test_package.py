@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,8 +33,13 @@ def test_deepseek_afd_model_registration_paths_are_lazy_strings():
     assert registrations["DeepseekV32ForCausalLM"] == (
         "afd_plugin.model_executor.models.deepseek_v2:AFDDeepseekV3ForCausalLM"
     )
+    model_module = (
+        "afd_plugin.model_executor.models.npu.deepseek_v4"
+        if importlib.util.find_spec("torch_npu") is not None
+        else "afd_plugin.model_executor.models.deepseek_v4"
+    )
     assert registrations["DeepseekV4ForCausalLM"] == (
-        "afd_plugin.model_executor.models.deepseek_v4:AFDDeepseekV4ForCausalLM"
+        f"{model_module}:AFDDeepseekV4ForCausalLM"
     )
 
 

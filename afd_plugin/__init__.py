@@ -197,8 +197,18 @@ def register_afd() -> None:
             exc_info=True,
         )
 
-    # NPU compatibility patches are applied during AFD config construction and
-    # worker startup, after vLLM-Ascend completes its platform initialization.
+    # EngineCore can initialize an Ascend scheduler directly after loading
+    # general plugins, before config revalidation or AFD worker startup.
+    # Install only namespace routing here; other NPU runtime patches still
+    # follow platform initialization during config construction/worker startup.
+    from vllm.platforms import current_platform
+
+    if current_platform.device_type == "npu":
+        from afd_plugin.compat.patches.npu.ascend_config import (
+            apply_afd_ascend_config_patch,
+        )
+
+        apply_afd_ascend_config_patch()
 
     from vllm.model_executor.models import ModelRegistry
 

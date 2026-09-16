@@ -25,6 +25,7 @@ depends_on:
   - "execution_platforms.md"
   - "compatibility_and_patches.md"
 validation_paths:
+  - "recipe/npu/CAMP2pAFDConnector/deepseek_v2_lite/README.md"
   - "tests/unit/v1/worker/test_attention_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_device_contract.py"
@@ -33,6 +34,7 @@ validation_paths:
   - "tests/e2e/accuracy/**"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
 upstream_refs:
+  - "NPU target: vLLM 2cf0a6915ce544dc493a0990f2ea38d81601128a / Ascend bd69bad88fc19e1aeeea585416d408df8bda8fef"
   - "vLLM vllm.v1.worker.gpu_worker.Worker"
   - "vLLM vllm.v1.worker.gpu_model_runner.GPUModelRunner"
   - "vLLM vllm.v1.worker.gpu.model_runner.GPUModelRunner"
@@ -40,6 +42,7 @@ upstream_refs:
   - "vLLM-Ascend vllm_ascend.worker.model_runner_v1.NPUModelRunner (tested environment evidence only)"
   - "vLLM-Ascend vllm_ascend.worker.v2.model_runner.NPUModelRunner (unit-test evidence only)"
 verified_platform_refs:
+  - "2026-09-16: BF16 DSV2 NPU V1 synchronous GSM8K-7; seven cells pass; full accuracy deferred by requester"
   - "CUDA paths marked gpu in tests/e2e"
   - "CUDA ModelRunnerV2 DP2/TP2 eager and graph scenarios in tests/e2e"
   - "Ascend E2E environment recorded in the installation and NPU guides"
@@ -48,10 +51,20 @@ related_issues:
   - "#88"
   - "#105"
   - "#129"
-last_reviewed: 2026-08-27
+last_reviewed: 2026-09-16
 ---
 
 # Attention runtime
+
+## NPU v0.28 review scope
+
+The v0.28 Ascend metadata and dummy-forward copies preserve upstream DCP/GDN,
+KVPP and device-metadata state while routing the two AFD ubatches separately.
+Final sequence-parallel output gathering belongs to the native model, so the
+runner must not gather a second time. CAMP2P fan-in (`A > F`) requires equal
+per-Attention token chunks; DP padding is enabled even in eager mode. Unequal
+4/2-token real-kernel input reproduced corruption; padding restores 2A1F output.
+The exact patch signature and target-contract tests remain the upgrade seam.
 
 ## Purpose and boundary
 

@@ -14,17 +14,20 @@ related_code_paths:
   - "pyproject.toml"
 depends_on: []
 validation_paths:
+  - "recipe/npu/CAMP2pAFDConnector/deepseek_v2_lite/README.md"
   - "tests/unit/**"
   - "tests/e2e/**"
 upstream_refs:
+  - "NPU target: vLLM 2cf0a6915ce544dc493a0990f2ea38d81601128a / Ascend bd69bad88fc19e1aeeea585416d408df8bda8fef"
   - "vLLM 0.28.0"
-  - "vLLM-Ascend commit 80d8c194f and environment evidence recorded in the NPU guides (v0.26 NPU baseline, pending the 0.28 NPU upgrade)"
+  - "vLLM-Ascend bd69bad88fc19e1aeeea585416d408df8bda8fef; synchronous scope in the NPU recipe"
 verified_platform_refs:
+  - "2026-09-16: BF16 DSV2 NPU V1 synchronous GSM8K-7; seven cells pass; full accuracy deferred by requester"
   - "CUDA: tests/e2e tests marked gpu on NVIDIA L20X, vLLM 0.28.0 wheel (torch 2.13.0+cu130); no canonical image is recorded"
   - "Ascend E2E environment recorded in the installation and NPU guides"
 related_issues:
   - "#129"
-last_reviewed: 2026-09-09
+last_reviewed: 2026-09-16
 ---
 
 # AFD module design
@@ -34,6 +37,16 @@ document declares its own status. A document remains `draft` until its owners
 verify boundaries, invariants, and validation evidence. The documents record
 plugin, role runtime, connector, model, platform, compatibility, and E2E
 testing contracts; open interfaces remain explicitly draft.
+
+## NPU v0.28 review scope
+
+The synchronous NPU baseline is vLLM v0.28.0 at
+`2cf0a6915ce544dc493a0990f2ea38d81601128a` with vLLM-Ascend
+`bd69bad88fc19e1aeeea585416d408df8bda8fef`. The
+[current NPU recipe](../../../recipe/npu/CAMP2pAFDConnector/deepseek_v2_lite/README.md)
+records seven passing BF16 DeepSeek-V2-Lite V1 baseline/eager/graph/DBO cells.
+Full GSM8K is deferred by requester instruction. Async CAM and DSV4 are
+excluded; NPU V2 remains unvalidated. Historical evidence is not target evidence.
 
 ## Reading order
 

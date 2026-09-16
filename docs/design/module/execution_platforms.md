@@ -27,6 +27,7 @@ related_code_paths:
 depends_on:
   - "plugin_boundary.md"
 validation_paths:
+  - "recipe/npu/CAMP2pAFDConnector/deepseek_v2_lite/README.md"
   - "tests/unit/compat/test_profiler.py"
   - "tests/unit/compat/test_ascend_ops.py"
   - "tests/unit/compat/npu/test_profiler.py"
@@ -40,19 +41,31 @@ validation_paths:
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
 upstream_refs:
+  - "NPU target: vLLM 2cf0a6915ce544dc493a0990f2ea38d81601128a / Ascend bd69bad88fc19e1aeeea585416d408df8bda8fef"
   - "vLLM vllm.compilation and vllm.v1.worker V1/V2 graph/ubatching APIs"
   - "vLLM-Ascend ACL graph, forward-context, and model-runner V1/V2 APIs in the tested environment"
   - "PyTorch CUDA, torch_npu, CMake, and Ascend CANN build interfaces used by the repository"
 verified_platform_refs:
+  - "2026-09-16: BF16 DSV2 NPU V1 synchronous GSM8K-7; seven cells pass; full accuracy deferred by requester"
   - "CUDA eager, graph, DBO, and ModelRunnerV2 E2E paths; no canonical CUDA image is recorded"
   - "Ascend E2E environment recorded in the installation and NPU guides"
 related_issues:
   - "#86"
   - "#129"
-last_reviewed: 2026-08-27
+last_reviewed: 2026-09-16
 ---
 
 # Execution platforms
+
+## NPU v0.28 review scope
+
+Target evidence covers Ascend V1 synchronous BF16 DeepSeek-V2-Lite,
+CAMP2P, TP1, 2A2F/2A1F eager, FULL_DECODE_ONLY and DBO, plus native DP4
+baseline: seven GSM8K-7 cells pass at 2/7 each. Native TP1 eager control
+returned a real response. Full GSM8K was explicitly deferred by the requester.
+NPU V2 remains implemented/unit-only; async CAM/DSV4 are excluded. Stack,
+commands and historical boundaries are recorded in the
+[current recipe](../../../recipe/npu/CAMP2pAFDConnector/deepseek_v2_lite/README.md).
 
 ## Purpose and boundary
 
@@ -247,8 +260,8 @@ wrapper. The current path:
   metadata per stage;
 - merges final tensors or pipeline-parallel intermediate tensors in stage
   order;
-- performs TP all-gather and removes stage padding when the upstream FlashComm
-  path requires it.
+- preserves native-model final output gathering and trimming; it does not
+  perform a second runner-level TP all-gather.
 
 `v1/worker/dbo.py` registers the model-side yield operation and dispatches to
 the platform DBO implementation. The optional CAM async MoE pipeline is not
@@ -334,16 +347,15 @@ the CUDA V1 row (DeepSeek-V2-Lite eager/graph/DBO 2A2F) and the CUDA V2 row
 (`afd-v2-eager/graph-dp2/tp2`), both on NVIDIA L20X with GSM8K-7 per
 scenario; the Qwen3 MoE 2A1F and Qwen3.6-35B-A3B suites also pass on
 0.28.0 (Qwen3.6 DBO excluded for the known 2A1F DBO FFN CUDA-graph
-defect); the Ascend V1, Ascend V2, and CAM-async rows keep their v0.26-era
-evidence and are not re-validated on 0.28.0 — the Ascend rows additionally
-await the NPU runtime upgrade. The Ascend V2 row remains an implemented,
-unit-tested contract rather than a hardware-validated claim. GPU/NPU rank topology and
+defect). Ascend V1 synchronous DSV2 now has the scoped v0.28 evidence above.
+Ascend V2 remains implemented/unit-only; async CAM retains historical v0.26
+results and was excluded. GPU/NPU rank topology and
 connector resource rules remain owned by
 [connector contracts](connector_contracts.md).
 
 The repository does not record a canonical CUDA container (CI builds from the
-`vllm/vllm-openai:v0.28.0` base image) or a released vLLM-Ascend v0.26
-container. The NPU implementation records source commit `80d8c194f`;
+`vllm/vllm-openai:v0.28.0` base image) or a canonical image for this NPU pair. The NPU implementation pins source
+commit `bd69bad88fc19e1aeeea585416d408df8bda8fef`;
 environment evidence is not an authoritative package tag.
 
 ## Failure and cleanup boundaries
@@ -376,8 +388,7 @@ E2E paths listed above.
 
 ## Limitations and open issues
 
-The official vLLM-Ascend v0.26 tag/container (NPU baseline, pending the 0.28
-NPU upgrade) and canonical CUDA/Ascend versus
+A canonical image for the pinned Ascend commit and canonical CUDA/Ascend versus
 GPU/NPU terminology are unresolved. This document uses CUDA/Ascend for backend
 mechanisms and preserves GPU/NPU where it appears in public names, environment
 variables, or test markers. See

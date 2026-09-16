@@ -17,7 +17,6 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import (
     DPMetadata,
@@ -58,7 +57,7 @@ def _cat_ubatch_outputs(
 ) -> AscendLastRankOutput:
     """Preserve the current Ascend model-output structure across ubatches.
 
-    Upstream source: vLLM v0.26.0 commit 568afb3a1,
+    Historical source: vLLM v0.26.0 commit 568afb3a1,
     ``gpu_ubatch_wrapper._cat_ubatch_outputs``. Ascend auxiliary hidden states
     use ``tuple[Tensor, list[Tensor]]`` rather than upstream's tuple of tensors,
     so this plugin-owned wrapper concatenates that concrete nested contract.
@@ -85,30 +84,6 @@ def _cat_ubatch_outputs(
         )
     # ### PATCH END: Ascend auxiliary hidden-state output
     return torch.cat(cast(list[torch.Tensor], sorted_results), dim=0)
-
-
-def _all_gather_ubatch_output(
-    output: AscendLastRankOutput,
-    pad_size: int,
-) -> AscendLastRankOutput:
-    if isinstance(output, tuple):
-        hidden_states, aux_hidden_states = output
-        gathered_hidden_states = _all_gather_ubatch_output(hidden_states, pad_size)
-        assert isinstance(gathered_hidden_states, torch.Tensor)
-        gathered_aux_hidden_states = [
-            _all_gather_ubatch_output(aux_hidden_state, pad_size)
-            for aux_hidden_state in aux_hidden_states
-        ]
-        assert all(
-            isinstance(aux_hidden_state, torch.Tensor)
-            for aux_hidden_state in gathered_aux_hidden_states
-        )
-        return gathered_hidden_states, cast(
-            list[torch.Tensor],
-            gathered_aux_hidden_states,
-        )
-    output = tensor_model_parallel_all_gather(output, 0)
-    return output[:-pad_size, :] if pad_size > 0 else output
 
 
 @dataclass
@@ -521,11 +496,7 @@ class AscendUBatchWrapper(UBatchWrapper):
             )
 
         last_rank_results = cast(list[AscendLastRankOutput], sorted_results)
-        ubatch_forward_context = ubatch_metadata[0].context.forward_context
-        if ubatch_forward_context.flash_comm_v1_enabled:
-            for i, result in enumerate(last_rank_results):
-                pad_size = ubatch_metadata[i].context.forward_context.pad_size
-                last_rank_results[i] = _all_gather_ubatch_output(result, pad_size)
+        # Native models return gathered, trimmed SP output for each ubatch.
         return _cat_ubatch_outputs(last_rank_results)
 
     @torch.inference_mode()

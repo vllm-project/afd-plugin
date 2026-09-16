@@ -38,7 +38,8 @@ _original_vllm_config_post_init: Callable[..., Any] | None = None
 # Patch reason: vLLM validates native ubatching by requiring a DeepEP all2all
 # backend, while AFD ubatching is implemented by plugin connectors.
 # Patch functionality: temporarily uses a supported backend only during
-# upstream EngineArgs-to-VllmConfig validation for AFD configs.
+# upstream EngineArgs-to-VllmConfig validation for AFD configs and installs
+# Ascend configuration patches before native validation.
 # Expansion exception: upstream create_engine_config is a large config builder;
 # keep a narrow original-function delegation so this patch only owns the AFD
 # validation bypass.
@@ -55,15 +56,7 @@ def create_engine_config(
     worker_cls_was_auto = _uses_auto_worker_value(self.worker_cls)
     # ### PATCH END: AFD automatic worker selection
     # ### PATCH START: AFD Ascend config patch ordering
-    if parse_optional_afd_config(self.additional_config) is not None:
-        from vllm.platforms import current_platform
-
-        if current_platform.device_type == "npu":
-            from afd_plugin.compat.npu import (
-                apply_afd_ascend_config_patch_if_needed,
-            )
-
-            apply_afd_ascend_config_patch_if_needed()
+    _apply_afd_npu_config_patches(self)
     # ### PATCH END: AFD Ascend config patch ordering
     if not _should_relax_engine_args_backend(self):
         config = _original_create_engine_config(
@@ -94,11 +87,21 @@ def create_engine_config(
     if worker_cls_was_auto:
         _select_afd_worker_for_auto(config)
     # ### PATCH END: AFD automatic worker selection
+    # ### PATCH START: finalize AFD NPU backend before serialization
+    from vllm.platforms import current_platform
+
+    if (
+        current_platform.device_type == "npu"
+        and parse_optional_afd_config(config) is not None
+    ):
+        from afd_plugin.compat.npu import fix_all2all_backend_for_afd
+
+        fix_all2all_backend_for_afd(config)
+    # ### PATCH END: finalize AFD NPU backend before serialization
     # ### PATCH START: AFD Ascend async-DP patch ordering
     # Ascend platform initialization wraps EngineCoreProc.run_engine_core after
     # general plugins load. Finalize the AFD Attention binding only after the
     # complete config exists and before vLLM captures the subprocess target.
-    from vllm.platforms import current_platform
 
     if current_platform.device_type == "npu":
         from afd_plugin.compat.npu import (
@@ -114,14 +117,19 @@ def create_engine_config(
 # after the config's actual AFD all2all backend has been restored.
 # Patch functionality: temporarily presents a validation-safe backend during
 # explicit AFD ubatching revalidation, then restores the actual backend.
+# Install Ascend configuration patches in fresh EngineCore processes before
+# native validation, including eager configs that do not use ubatching.
 # Expansion exception: upstream VllmConfig.__post_init__ is a large validation
 # pipeline; keep narrow original-function delegation so this patch only owns
-# the AFD backend validation bypass.
+# AFD backend validation and platform patch ordering.
 # Signature: matches upstream; no added parameters.
 def __post_init__(self):
     """Verify configs are valid & consistent with each other."""
 
     assert _original_vllm_config_post_init is not None
+    # ### PATCH START: AFD child-process Ascend config ordering
+    _apply_afd_npu_config_patches(self)
+    # ### PATCH END: AFD child-process Ascend config ordering
     if not _should_relax_vllm_config_backend(self):
         return _original_vllm_config_post_init(self)
 
@@ -135,6 +143,20 @@ def __post_init__(self):
         parallel_config.all2all_backend = original_backend
     # ### PATCH END: AFD repeated ubatching backend validation
     return result
+
+
+def _apply_afd_npu_config_patches(config: EngineArgs | VllmConfig) -> None:
+    if parse_optional_afd_config(config.additional_config) is None:
+        return
+
+    from vllm.platforms import current_platform
+
+    if current_platform.device_type == "npu":
+        from afd_plugin.compat.npu import (
+            apply_afd_ascend_config_patch_if_needed,
+        )
+
+        apply_afd_ascend_config_patch_if_needed()
 
 
 def _uses_auto_worker_value(worker_cls: str | type[Any]) -> bool:

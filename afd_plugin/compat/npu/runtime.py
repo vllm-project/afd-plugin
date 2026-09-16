@@ -35,6 +35,11 @@ def apply_afd_ascend_config_patch_if_needed() -> None:
         raise RuntimeError(
             "AFD NPU DBO config patch requires vLLM-Ascend NPUPlatform",
         )
+    from afd_plugin.compat.patches.npu.ascend_config import (
+        apply_afd_ascend_config_patch,
+    )
+
+    apply_afd_ascend_config_patch()
 
 
 def apply_afd_async_dp_engine_patch_if_needed(vllm_config: VllmConfig) -> bool:

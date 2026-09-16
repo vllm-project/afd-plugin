@@ -21,24 +21,38 @@ related_code_paths:
   - "afd_plugin/v1/worker/**"
 depends_on: []
 validation_paths:
+  - "recipe/npu/CAMP2pAFDConnector/deepseek_v2_lite/README.md"
   - "tests/unit/config/**"
   - "tests/unit/package/test_package.py"
   - "tests/unit/test_envs.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_runtime_classpaths.py"
 upstream_refs:
+  - "NPU target: vLLM 2cf0a6915ce544dc493a0990f2ea38d81601128a / Ascend bd69bad88fc19e1aeeea585416d408df8bda8fef"
   - "vLLM vllm.general_plugins entry-point group"
   - "vLLM vllm.config.VllmConfig"
 verified_platform_refs:
+  - "2026-09-16: BF16 DSV2 NPU V1 synchronous GSM8K-7; seven cells pass; full accuracy deferred by requester"
   - "CPU-only import and configuration tests in tests/unit"
   - "CUDA and Ascend E2E launch paths in tests/e2e"
 related_issues:
   - "#89"
   - "#129"
-last_reviewed: 2026-08-27
+last_reviewed: 2026-09-16
 ---
 
 # Plugin boundary
+
+## NPU v0.28 review scope
+
+On NPU, `register_afd` installs the narrow Ascend config namespace patch
+before model registration completes, since scheduler construction can call
+`get_ascend_config` before a worker exists. Full platform/operator patches
+remain deferred. Known already-imported config aliases are rebound without
+forcing optional imports; no module scan or code-object mutation is used.
+Both parent EngineArgs and spawned-child VllmConfig revalidation install the
+required config patches before upstream validation. CPU/CUDA registration
+continues without importing the Ascend namespace adapter.
 
 ## Purpose and boundary
 
@@ -96,8 +110,8 @@ order and failure behavior are:
 | 4 | Import the four core compatibility patch modules. | Best effort. They share one `try` block, so an early import failure can leave a partial patch set and skip later imports. |
 | 5 | Register the plugin-owned `afd_balanced` routing-simulator strategy. | Required when vLLM is installed. An error propagates and `_registered` remains false. |
 | 6 | Register the DBO yield custom op. | Best effort; failure is logged at debug level. |
-| 7 | Register the AFD model architecture mappings with vLLM `ModelRegistry`. | Required when vLLM is installed. An error propagates and `_registered` remains false. |
-| 8 | Mark registration complete. | Later calls are no-ops. Ascend compatibility remains deferred to NPU configuration/worker startup. |
+| 7 | On NPU, install the required Ascend config namespace adapter; then register the AFD model architecture mappings with vLLM `ModelRegistry`. | Required when vLLM is installed. An error propagates and `_registered` remains false. |
+| 8 | Mark registration complete. | Later calls are no-ops. The NPU config namespace adapter is installed before completion; remaining Ascend patches are deferred to config/worker startup. |
 
 ```mermaid
 flowchart TD

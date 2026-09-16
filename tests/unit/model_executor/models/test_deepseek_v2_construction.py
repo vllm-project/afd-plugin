@@ -523,22 +523,78 @@ def test_npu_ffn_refreshes_native_fused_moe_factory(
     monkeypatch,
     construction_env,
 ):
-    stale_factory = object()
-    ascend_factory = object()
-    factories_seen_by_native_moe = []
+    # Exercise the native constructor rather than replacing it: v0.28 passes
+    # gate/shared ownership into the factory and forwards hidden states as the
+    # router input, which the Ascend modular runner must consume internally.
+    native_moe = adapter.AFDDeepseekV2RemoteExpertsMoE.__bases__[0]
+    factory_calls = []
+    forward_calls = []
 
-    class _FakeMoE(nn.Module):
-        def __init__(self, **_kwargs):
+    class _FakeGate(nn.Module):
+        def __init__(self, hidden_size, num_experts, *, out_dtype, prefix):
             super().__init__()
-            factories_seen_by_native_moe.append(adapter.native.FusedMoEFactory)
+            self.out_dtype = out_dtype
+            self.weight = nn.Parameter(torch.empty(num_experts, hidden_size))
+
+    class _FakeDense(_FakeStage):
+        kind = "dense"
+
+        def __init__(self, **kwargs):
+            super().__init__(construction_env, **kwargs)
+
+    class _RecordingRunner(nn.Module):
+        def __init__(self, *, gate, shared_experts, **kwargs):
+            super().__init__()
+            self.gate = gate
+            self.shared_experts = shared_experts
+            factory_calls.append(kwargs)
+
+        def forward(self, *, hidden_states, router_logits):
+            forward_calls.append((hidden_states, router_logits))
+            return hidden_states + 1
+
+    def stale_factory(**_kwargs):
+        raise AssertionError("NPU FFN used the factory bound before registration")
 
     monkeypatch.setattr(adapter.native, "FusedMoEFactory", stale_factory)
-    monkeypatch.setattr(adapter.fused_moe, "FusedMoEFactory", ascend_factory)
-    monkeypatch.setattr(adapter.native, "DeepseekV2MoE", _FakeMoE)
+    monkeypatch.setattr(adapter.fused_moe, "FusedMoEFactory", _RecordingRunner)
+    monkeypatch.setattr(adapter.native, "DeepseekV2MoE", native_moe)
+    monkeypatch.setattr(adapter.native, "DeepseekV2MLP", _FakeDense)
+    monkeypatch.setattr(adapter.native, "GateLinear", _FakeGate)
+    monkeypatch.setattr(adapter.native, "_get_moe_router_dtype", lambda _c: None)
+    monkeypatch.setattr(
+        adapter.native, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(adapter.native, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        adapter.native,
+        "get_ep_group",
+        lambda: SimpleNamespace(device_group=SimpleNamespace(size=lambda: 1)),
+    )
+    monkeypatch.setattr(
+        adapter.native.rocm_aiter_ops, "is_fused_moe_enabled", lambda: False
+    )
+    monkeypatch.setattr(
+        adapter.native.rocm_aiter_ops,
+        "is_fusion_moe_shared_experts_enabled",
+        lambda: False,
+    )
 
-    _make_layer(monkeypatch, role="ffn", layer_idx=1)
+    layer = _make_layer(monkeypatch, role="ffn", layer_idx=1)
 
-    assert factories_seen_by_native_moe == [ascend_factory]
+    assert isinstance(layer.mlp, native_moe)
+    assert layer.mlp.experts.gate is layer.mlp.gate
+    assert layer.mlp.experts.shared_experts is layer.mlp.shared_experts
+    assert factory_calls[0]["prefix"] == "model.layers.1.mlp.experts"
+    assert factory_calls[0]["num_experts"] == 4
+    assert factory_calls[0]["top_k"] == 2
+    assert construction_env["attention"] == []
+    hidden_states = torch.zeros((2, 8))
+    output = layer.compute_ffn_output(hidden_states)
+    assert len(forward_calls) == 1
+    assert forward_calls[0][0] is forward_calls[0][1]
+    assert torch.equal(forward_calls[0][0], hidden_states)
+    assert torch.equal(output, hidden_states + 1)
 
 
 @pytest.mark.parametrize(
