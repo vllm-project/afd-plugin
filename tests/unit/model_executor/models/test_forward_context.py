@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -603,7 +604,27 @@ def test_deepseek_afd_ffn_path_reuses_ascend_moe_mlp_after_attention_gate():
     assert "w13_weight_scale_fp32" in compute_moe
     assert "w13_weight_scale_fp32_list" in compute_moe
     assert "w2_weight_scale_list" in compute_moe
-    assert "MoEQuantParams(quant_type=quant_type)" in compute_moe
+    compute_moe_function = next(
+        node
+        for node in ast.parse(gate_source).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "compute_attention_gate_moe_ffn"
+    )
+    quant_params_calls = [
+        node
+        for node in ast.walk(compute_moe_function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "MoEQuantParams"
+    ]
+    assert len(quant_params_calls) == 1
+    # Check the contract without pinning formatting or optional quant fields.
+    assert any(
+        keyword.arg == "quant_type"
+        and isinstance(keyword.value, ast.Name)
+        and keyword.value.id == "quant_type"
+        for keyword in quant_params_calls[0].keywords
+    )
     assert "_gmmswigluquant_fusion_enabled()" in compute_moe
     assert "fusion=use_gmmswigluquant_fusion" in compute_moe
     assert "_compute_w8a8_shared_experts_from_int8(" in compute_moe
@@ -644,6 +665,8 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
     routed_calls = []
 
     def fake_unified_apply_mlp(*, mlp_compute_input):
+        assert mlp_compute_input.quant.quant_type == FakeQuantType.W8A8
+        assert mlp_compute_input.quant.is_per_channel_weight is False
         routed_calls.append(mlp_compute_input.hidden_states)
         return (
             torch.ones_like(
