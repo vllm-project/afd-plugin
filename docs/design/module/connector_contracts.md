@@ -18,6 +18,7 @@ depends_on:
   - "execution_platforms.md"
 validation_paths:
   - "tests/unit/connectors/**"
+  - "tests/unit/connectors/gpu/test_symm_window.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
@@ -34,7 +35,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-08-27
+last_reviewed: 2026-09-17
 ---
 
 # Connector contracts
@@ -60,6 +61,7 @@ depend on role worker implementations.
 | CUDA P2P | [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py), [`topology.py`](../../../afd_plugin/distributed/topology.py) | [`test_p2p_connector.py`](../../../tests/unit/connectors/test_p2p_connector.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) |
 | Ascend CAMP2P | [`npu/camp2p.py`](../../../afd_plugin/connectors/npu/camp2p.py) | [`test_camp2p_connector.py`](../../../tests/unit/connectors/test_camp2p_connector.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) |
 | Ascend CAM async | [`npu/async_cam.py`](../../../afd_plugin/connectors/npu/async_cam.py) | [`test_async_cam_connector.py`](../../../tests/unit/connectors/test_async_cam_connector.py), [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py) |
+| NVSHMEM symmetric window | [`gpu/symm_window.py`](../../../afd_plugin/connectors/gpu/symm_window.py), [`gpu/nvshmem_rt.py`](../../../afd_plugin/connectors/gpu/nvshmem_rt.py), [`gpu/cuda_rt.py`](../../../afd_plugin/connectors/gpu/cuda_rt.py) | [`test_symm_window.py`](../../../tests/unit/connectors/gpu/test_symm_window.py) (slot layout and header codec, CPU-only) |
 | Process-group construction | [`afd_process_group.py`](../../../afd_plugin/distributed/afd_process_group.py) | Connector initialization tests plus platform E2E paths |
 
 ## Factory and construction
@@ -333,6 +335,15 @@ configuration allow-list is not derived from the factory registry, and
 Connector-owned typed configuration implements the decision from
 [#89](https://github.com/JiusiServe/afd-plugin/issues/89), but it does not by
 itself make factory registration a public extension contract.
+
+The NVSHMEM symmetric window carries substrate limitations that no in-tree
+test covers: it needs the NVSHMEM host library (`libnvshmem_host.so.3`) present
+at runtime and resolved by ctypes, it assumes every peer is NVLink-reachable
+because `nvshmem_ptr` must return a mapped address for a one-sided write to
+land, and its in-stream flag wait needs a device that supports CUDA stream
+memory operations. The ctypes ABI assumptions -- struct sizes and the
+`(1 << 16) + sizeof` init versioning -- are validated by nothing executable
+until a GPU-gated test exercises a real window.
 
 Operational material: [NCCL P2P guide](../../gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.md),
 [CAM P2P guide](../../npu/CAM_P2P_CONNECTOR_USER_GUIDE.md),
