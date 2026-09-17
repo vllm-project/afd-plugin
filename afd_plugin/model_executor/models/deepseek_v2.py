@@ -516,7 +516,8 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         topk_weights = None
         topk_ids = None
         router_logits = None
-        # NPU-only: Attention-side gate/topk is implemented in the NPU helper.
+        # The gate helper delegates expert selection to the connector, so both
+        # platforms share it despite the module's location.
         if self.compute_gate_on_attention and self.is_moe_layer:
             from afd_plugin.model_executor.models.npu import (
                 deepseek_v2_attention_gate,
@@ -572,8 +573,23 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
             )
             return output
         if self.compute_gate_on_attention:
-            raise RuntimeError(
-                "GPU Attention-side gate must call compute_experts_output",
+            if group_list is None:
+                # Without a group list the caller is the control-plane path,
+                # which routes on this side and must use compute_experts_output.
+                raise RuntimeError(
+                    "GPU Attention-side gate must call compute_experts_output",
+                )
+            # Token-level dispatch: rows arrive pre-routed and grouped by local
+            # expert, so only the grouped GEMM is left to run here.
+            from afd_plugin.model_executor.models.gpu import (
+                deepseek_v2_attention_gate as gpu_attention_gate,
+            )
+
+            return gpu_attention_gate.compute_attention_gate_moe_ffn(
+                self,
+                hidden_states=hidden_states,
+                group_list=group_list,
+                expand_x_shared=expand_x_shared,
             )
         hidden_states = self.mlp(hidden_states)
         if (

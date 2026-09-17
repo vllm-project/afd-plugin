@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -49,11 +49,48 @@ from afd_plugin.v1.worker.attention_metadata import (
 from afd_plugin.v1.worker.cuda_graph import validate_cuda_graph_mode
 from afd_plugin.v1.worker.ubatch_wrapper import AFDUBatchWrapper
 
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+
+@contextmanager
+def _dp_batch_coordination_disabled(disabled: bool):
+    """Skip vLLM's cross-DP batch agreement for connector-driven runs.
+
+    ``GPUModelRunner._determine_batch_execution_and_padding`` all-reduces the
+    batch shape across the DP group whenever ``data_parallel_size > 1``. Async
+    AFD deliberately lets each Attention replica advance on its own, so an idle
+    replica never joins that collective and a busy one blocks in it forever --
+    which is where a 2A2F run hangs before it reaches the first MoE layer.
+
+    Returning the single-rank answer (``num_tokens_across_dp=None``) makes the
+    upstream function skip its DP-padding branch entirely, exactly as it does
+    for ``data_parallel_size == 1``.
+    """
+    if not disabled:
+        yield
+        return
+
+    original = gpu_model_runner.coordinate_batch_across_dp
+
+    def _single_rank_coordination(*_args: Any, cudagraph_mode: int, **_kwargs: Any):
+        return False, None, cudagraph_mode
+
+    gpu_model_runner.coordinate_batch_across_dp = _single_rank_coordination
+    try:
+        yield
+    finally:
+        gpu_model_runner.coordinate_batch_across_dp = original
+
 
 class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
     """Attention model runner that injects AFD metadata into forward context."""
 
     afd_expected_role = "attention"
+
+    #: Declared, not assigned: the ubatch-wrapper install both reads and
+    #: rebinds it, which leaves its type unresolvable from the base class.
+    model: Any
 
     def __init__(
         self,
@@ -75,11 +112,9 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
             self.afd_config,
         )
         # The connector rendezvous is deferred to the end of ``load_model()``
-        # so Attention and FFN weight loading overlap; see that method.
-        # TODO: Async GPU connector will be supported in the future
-        assert self.connector.control_plane is not None, (
-            "GPU model runner only supports control-plane-driven connectors"
-        )
+        # so Attention and FFN weight loading overlap; see that method. The
+        # async GPU connector drives FFN work from its own receive loop and so
+        # has no control plane, which is why there is no assertion here.
         self._is_warmup = False
         self._afd_is_graph_capturing = False
         self._afd_is_graph_replaying = False
@@ -114,22 +149,18 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
             self.connector.init_afd_connector()
 
     def _install_afd_ubatch_wrapper(self) -> None:
-        if isinstance(self.model, AFDUBatchWrapper):
-            self.model.configure_afd_context_provider(
-                self.install_afd_metadata_on_forward_context,
+        model: Any = self.model
+        if not isinstance(model, AFDUBatchWrapper):
+            if isinstance(model, UBatchWrapper):
+                model = model.unwrap()
+            model = AFDUBatchWrapper(
+                model,
+                self.vllm_config,
+                CUDAGraphMode.NONE,
+                self.device,
             )
-            return
-
-        model = self.model
-        if isinstance(model, UBatchWrapper):
-            model = model.unwrap()
-        self.model = AFDUBatchWrapper(
-            model,
-            self.vllm_config,
-            CUDAGraphMode.NONE,
-            self.device,
-        )
-        self.model.configure_afd_context_provider(
+            self.model = model
+        model.configure_afd_context_provider(
             self.install_afd_metadata_on_forward_context,
         )
 
@@ -215,25 +246,28 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
         torch.Tensor | None,
         CUDAGraphStat | None,
     ]:
-        (
-            cudagraph_mode,
-            batch_descriptor,
-            should_ubatch,
-            num_tokens_across_dp,
-            cudagraph_stats,
-        ) = super()._determine_batch_execution_and_padding(
-            num_tokens,
-            num_reqs,
-            num_scheduled_tokens_np,
-            max_num_scheduled_tokens,
-            use_cascade_attn,
-            allow_microbatching,
-            force_eager,
-            force_uniform_decode,
-            force_has_lora,
-            force_num_active_loras,
-            num_encoder_reqs,
-        )
+        with _dp_batch_coordination_disabled(
+            self.connector.control_plane is None,
+        ):
+            (
+                cudagraph_mode,
+                batch_descriptor,
+                should_ubatch,
+                num_tokens_across_dp,
+                cudagraph_stats,
+            ) = super()._determine_batch_execution_and_padding(
+                num_tokens,
+                num_reqs,
+                num_scheduled_tokens_np,
+                max_num_scheduled_tokens,
+                use_cascade_attn,
+                allow_microbatching,
+                force_eager,
+                force_uniform_decode,
+                force_has_lora,
+                force_num_active_loras,
+                num_encoder_reqs,
+            )
         self._afd_is_graph_replaying = (
             not bool(getattr(self, "_is_warmup", False))
             and not bool(getattr(self, "_afd_is_graph_capturing", False))
@@ -255,7 +289,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
         )
         kwargs: dict[str, Any] = {}
 
-        # determin if ubatch should be activated.
+        # determine if ubatch should be activated.
         # 1. For dp = 1, vLLM hardcodes `should_ubatch=False`.
         # This is the extra support for dp = 1
         if self.vllm_config.parallel_config.data_parallel_size == 1:

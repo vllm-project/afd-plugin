@@ -133,8 +133,24 @@ parameter-free `RemoteDeepseekV4FFN`. FFN owns the complete native
 Role-aware weight filtering keeps layer `.ffn` parameters on FFN and all
 other layer-local and mHC head parameters on Attention; common non-layer paths
 remain available to both roles for the native loader lifecycle. The adapter is
-CUDA-only and requires synchronous `P2pNcclAFDConnector`,
-`compute_gate_on_attention=false`, and pipeline-parallel size 1. It rejects
+CUDA-only and requires pipeline-parallel size 1.
+
+The paragraph above describes the synchronous path. `GpuAsyncAFDConnector`
+inverts two of its facts, so the boundary now has two shapes:
+
+| | `P2pNcclAFDConnector` | `GpuAsyncAFDConnector` |
+| --- | --- | --- |
+| `compute_gate_on_attention` | must be `false` | must be `true` |
+| Where routing runs | FFN, on the native hash router | Attention, on a gate proxy |
+| What crosses the boundary | the activation plus token-aligned `input_ids` | the activation plus the topk already chosen |
+| Where the gate's weights load | the FFN role's native MoE | **both** roles |
+
+On the async path the gate parameters live on the Attention-side proxy but keep
+the checkpoint's own `.ffn.gate.*` names, so the same tensors load onto the
+proxy on Attention and onto the native MoE gate on FFN --
+`test_v4_gate_loads_on_both_roles` pins exactly that. Reading the gate off a
+decoder layer therefore goes through `.ffn`, which resolves to the proxy on one
+role and the native MoE on the other. It rejects
 sequence-parallel MoE, EPLB, and the `deep_gemm_mega_moe` backend. The P2P
 connector validates one-dimensional `torch.int32` input IDs and preallocates
 their receive buffers for graph execution. This boundary currently has

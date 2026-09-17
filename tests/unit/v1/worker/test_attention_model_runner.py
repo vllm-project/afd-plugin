@@ -1,7 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import sys
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -401,10 +405,10 @@ def test_ubatch_missing_metadata_uses_complete_public_installer():
 
     wrapper._install_missing_afd_metadata(forward_context)
 
-    metadata = forward_context.additional_kwargs["afd_metadata"]
-    assert metadata is runner._afd_pending_metadata
+    metadata: Any = forward_context.additional_kwargs["afd_metadata"]
     assert metadata.transaction_id == "afd-0"
     assert metadata.tokens_lens == [3, 5]
+    assert metadata is runner._afd_pending_metadata
     assert set(runner.connector.sent_dp_metadata_lists[0]) == {0, 1}
 
 
@@ -423,13 +427,21 @@ def test_phase5_allows_two_way_ubatching_but_rejects_other_counts():
         )
 
 
-def _ubatch_runner(uniform_decode, **parallel_overrides):
+_DUMMY_CONTROL_PLANE = object()
+
+
+def _ubatch_runner(
+    uniform_decode, *, control_plane=_DUMMY_CONTROL_PLANE, **parallel_overrides
+):
     runner = object.__new__(AFDAttentionModelRunner)
     runner.vllm_config = SimpleNamespace(
         parallel_config=_parallel_config(**parallel_overrides),
     )
     runner.uniform_decode_query_len = 1
     runner._is_uniform_decode = lambda **_kwargs: uniform_decode
+    # The override consults the connector to decide whether cross-DP batch
+    # coordination applies; a non-None control plane keeps upstream behaviour.
+    runner.connector = SimpleNamespace(control_plane=control_plane)
     return runner
 
 
@@ -1091,6 +1103,9 @@ class _LifecycleConnector:
         self.events = events
         self.control_plane = object()
         self._initialized = False
+        # Every real connector carries one; the runner reads it to decide
+        # whether async MoE ubatching is configured.
+        self.extra_info = None
 
     @property
     def is_initialized(self):
@@ -1119,7 +1134,7 @@ def _fake_connector_factory(monkeypatch, connector):
 def test_attention_runner_constructor_does_not_initialize_connector(monkeypatch):
     import afd_plugin.v1.worker.attention_model_runner as attention_model_runner
 
-    events = []
+    events: list[str] = []
     connector = _LifecycleConnector(events)
 
     def fake_native_init(self, vllm_config, device):
@@ -1163,7 +1178,7 @@ def test_attention_runner_load_model_initializes_connector_after_weights(
     monkeypatch,
     use_ubatching,
 ):
-    events = []
+    events: list[str] = []
     connector = _LifecycleConnector(events)
     runner = object.__new__(AFDAttentionModelRunner)
     runner.connector = connector
@@ -1192,3 +1207,35 @@ def test_attention_runner_load_model_initializes_connector_after_weights(
     expected.append("connector_init")
     assert events == expected
     assert connector.is_initialized is True
+
+
+def test_connector_driven_runs_skip_cross_dp_batch_coordination():
+    """An idle Attention replica never joins the DP all-reduce.
+
+    Async AFD lets each replica advance alone, so a busy replica must not block
+    in ``coordinate_batch_across_dp`` waiting for one that never steps.
+    """
+    import vllm.v1.worker.gpu_model_runner as gpu_model_runner
+
+    from afd_plugin.v1.worker.attention_model_runner import (
+        _dp_batch_coordination_disabled,
+    )
+
+    original = gpu_model_runner.coordinate_batch_across_dp
+
+    with _dp_batch_coordination_disabled(True):
+        assert gpu_model_runner.coordinate_batch_across_dp is not original
+        result = gpu_model_runner.coordinate_batch_across_dp(
+            num_tokens_unpadded=8,
+            parallel_config=None,
+            allow_microbatching=False,
+            num_tokens_padded=8,
+            uniform_decode=True,
+            cudagraph_mode=0,
+        )
+        # num_tokens_across_dp None makes upstream skip its DP-padding branch.
+        assert result == (False, None, 0)
+    assert gpu_model_runner.coordinate_batch_across_dp is original
+
+    with _dp_batch_coordination_disabled(False):
+        assert gpu_model_runner.coordinate_batch_across_dp is original

@@ -169,6 +169,31 @@ connector state before `torch.cuda.graph(...)`, captures only
 model/data-plane work, and stores the graph by `make_ffn_graph_key()`. A
 matching future payload replays the graph; a missing key runs eagerly.
 
+### CUDA Graphs and the async GPU connector
+
+`GpuAsyncAFDConnector` has no control plane, so the FFN worker takes the
+connector-driven branch and never reaches the graph cache above: that side
+stays eager. The Attention side captures, and its dispatch sits inside the
+captured region, which constrains the window's flag protocol in two ways --
+a replay runs no Python, and a captured stream wait compares against the value
+recorded at capture time.
+
+- The dispatch sequence number lives in a device tensor the graph increments,
+  not in a host counter, so each replay still stamps a peer's flag with a
+  number it has not seen; an FFN rank recognizes an arrival exactly by that
+  change.
+- A reply stamps the constant `FLAG_REPLY_READY`, and the Attention side calls
+  `SymmWindow.clear_flag()` inside the graph once it has consumed the slot.
+  A rising reply sequence cannot work here: the wait would be frozen at one
+  value and fall straight through on every later replay.
+- The header prefix a dispatch copies from the host is therefore fixed per
+  `(layer, stage, token count)` and cached in pinned memory, since a graph
+  records the source address.
+
+A role either polls its flags or stream-waits and clears them, never both:
+`poll()` recognizes an arrival by the flag differing from what it last saw,
+which a reset would defeat.
+
 ### CUDA native ubatching
 
 `AFDUBatchWrapper` replaces vLLM's GPU wrapper during Attention model load

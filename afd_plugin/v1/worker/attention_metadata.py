@@ -15,6 +15,7 @@ from afd_plugin.connectors import (
     AFDDPMetadata,
     AFDForwardContextMetadata,
 )
+from afd_plugin.connectors.base import AFDConnectorBase
 
 
 class AFDMetadataProviderMixin:
@@ -28,6 +29,13 @@ class AFDMetadataProviderMixin:
     """
 
     _afd_is_profile: bool = False
+
+    #: Provided by the consuming runner; declared so the mixin type-checks.
+    connector: AFDConnectorBase
+    vllm_config: VllmConfig
+    _is_warmup: bool
+    _afd_pending_metadata: AFDForwardContextMetadata | None
+    _afd_transaction_counter: int
 
     def build_afd_metadata(
         self,
@@ -81,9 +89,13 @@ class AFDMetadataProviderMixin:
         payload; it does not allocate a transaction or perform data-plane work.
         """
 
-        assert self.connector.control_plane is not None, (
-            "send_dp_metadata needs control plane driven connectors"
-        )
+        if self.connector.control_plane is None:
+            # Control-plane-less connectors (GpuAsyncAFDConnector) carry all
+            # per-stage control on the data plane and drive the FFN from its
+            # own receive loop; each Attention replica also advances on its
+            # own (see _dp_batch_coordination_disabled), so there is nothing
+            # to publish here.
+            return
 
         if ubatch_slices and len(ubatch_slices) > 1:
             dp_metadata_list = {

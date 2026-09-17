@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import logging
 import threading
 from collections import deque
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -20,6 +24,7 @@ from afd_plugin.connectors import (  # noqa: E402
     AFDTransferContext,
     AFDTransferMetadata,
 )
+from afd_plugin.connectors.gpu.async_gpu import ConnectorShutdown  # noqa: E402
 from afd_plugin.model_executor.models.deepseek_v2 import (  # noqa: E402
     AFDDeepseekV2ForCausalLM,
 )
@@ -33,7 +38,7 @@ from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
 
 class _FakeConnector:
     def __init__(self):
-        self.attn_outputs = deque()
+        self.attn_outputs: deque = deque()
         self.ffn_outputs = []
         self.expert_routing_specs = []
         self.recv_input_ids = []
@@ -82,7 +87,7 @@ class _FakeConnector:
 class _ConnectorDrivenFakeConnector(_FakeConnector):
     def __init__(self):
         super().__init__()
-        self.control_plane = None
+        self.control_plane: Any = None
 
 
 class _FakeModel:
@@ -236,7 +241,9 @@ def test_ffn_runner_forwards_payload_input_ids_to_model():
         def __init__(self):
             self.calls = []
 
-        def compute_ffn_output(self, hidden_states, layer_idx, *, input_ids):
+        def compute_ffn_output(  # type: ignore[override]
+            self, hidden_states, layer_idx, *, input_ids
+        ):
             self.calls.append((hidden_states, layer_idx, input_ids))
             return input_ids
 
@@ -739,18 +746,45 @@ def test_ffn_worker_reports_zero_compilation_times():
     assert compilation_times.encoder == 0.0
 
 
-def test_ffn_worker_loop_rejects_connector_without_control_plane():
+def test_ffn_worker_loop_drives_connector_without_control_plane():
     worker = object.__new__(AFDFFNWorker)
     event = threading.Event()
+    steps = []
+
+    def execute_connector_driven_step():
+        steps.append(1)
+        # The connector-driven step returns on an idle poll; the loop must come
+        # back to the shutdown event rather than block forever.
+        if len(steps) == 3:
+            event.set()
 
     worker._ffn_shutdown_event = event
     worker.device = SimpleNamespace(type="cpu")
     worker.model_runner = SimpleNamespace(
         connector=_ConnectorDrivenFakeConnector(),
+        execute_connector_driven_step=execute_connector_driven_step,
     )
 
-    with pytest.raises(NotImplementedError, match="control-plane-driven"):
-        worker._run_ffn_server_loop()
+    worker._run_ffn_server_loop()
+
+    assert len(steps) == 3
+
+
+def test_ffn_worker_loop_exits_cleanly_when_peer_announces_shutdown():
+    worker = object.__new__(AFDFFNWorker)
+
+    def execute_connector_driven_step():
+        raise ConnectorShutdown("peer left")
+
+    worker._ffn_shutdown_event = threading.Event()
+    worker.device = SimpleNamespace(type="cpu")
+    worker.model_runner = SimpleNamespace(
+        connector=_ConnectorDrivenFakeConnector(),
+        execute_connector_driven_step=execute_connector_driven_step,
+    )
+
+    # A peer shutdown is an ordinary exit, not a loop failure.
+    worker._run_ffn_server_loop()
 
 
 def test_ffn_worker_loop_logs_unexpected_thread_errors(caplog):

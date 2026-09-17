@@ -14,6 +14,7 @@ from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
 from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.worker_base import CompilationTimes
 
+from afd_plugin.connectors.gpu.async_gpu import ConnectorShutdown
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.attention_model_runner import fail_if_unsupported_ubatching
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
@@ -160,6 +161,13 @@ class AFDFFNWorker(Worker):
             try:
                 self._run_ffn_server_loop()
             except Exception as exc:
+                shutdown_event = self._ffn_shutdown_event
+                if shutdown_event is not None and shutdown_event.is_set():
+                    logger.debug(
+                        "AFD FFN receive loop stopped during shutdown",
+                        exc_info=True,
+                    )
+                    return
                 self._ffn_loop_error = exc
                 logger.exception("AFD FFN worker loop failed")
 
@@ -180,11 +188,17 @@ class AFDFFNWorker(Worker):
 
         while not event.is_set():
             if self.model_runner.connector.control_plane is None:
-                raise NotImplementedError(
-                    "GPU FFN only supports control-plane-driven connectors; "
-                    "connectors without a control plane (control_plane is None) "
-                    "are not supported.",
-                )
+                # Connector-driven: the step returns on an idle poll, so the
+                # loop gets to re-check the shutdown event. No device-wide
+                # synchronize here -- it would serialize every receive against
+                # the previous compute and erase the overlap this path exists
+                # for; ordering is carried by the connector's own streams.
+                try:
+                    self.model_runner.execute_connector_driven_step()
+                except ConnectorShutdown:
+                    logger.info("AFD FFN loop exiting: peer announced shutdown")
+                    return
+                continue
 
             payload = self.model_runner.connector.control_plane.recv_dp_metadata_list()
             dp_metadata_list = payload.dp_metadata_list

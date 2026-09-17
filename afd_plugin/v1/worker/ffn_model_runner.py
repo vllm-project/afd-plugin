@@ -30,6 +30,11 @@ from afd_plugin.connectors import (
     AFDControlPayload,
     AFDDPMetadata,
 )
+from afd_plugin.connectors.gpu.async_gpu import (
+    ConnectorShutdown,
+    GpuAsyncTransferState,
+)
+from afd_plugin.connectors.metadata import AFDF2ATransferPayload
 from afd_plugin.v1.worker.attention_model_runner import (
     fail_if_unsupported_ubatching,
 )
@@ -53,10 +58,12 @@ if TYPE_CHECKING:
 class GPUFFNModelRunner(LoRAModelRunnerMixin):
     """FFN model runner for AFD GPU execution.
 
-    FFN steps are driven by the connector control plane rather than the vLLM
-    scheduler. GPU only supports control-plane-driven connectors, so the runner
-    asserts ``connector.control_plane is not None`` at construction; connectors
-    without a control plane (``control_plane is None``) are not supported.
+    FFN steps are driven by the connector rather than the vLLM scheduler, in one
+    of two ways. Control-plane connectors receive broadcast DP metadata and then
+    walk every layer in lockstep with the Attention side. Connectors without a
+    control plane (``control_plane is None``) instead pull one work item at a
+    time from their receive loop, learning the layer and token counts from the
+    arriving payload; see ``execute_connector_driven_step``.
     """
 
     afd_expected_role = "ffn"
@@ -69,10 +76,6 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         self.dtype = self.model_config.dtype
         self.afd_config = self.parse_config(vllm_config)
         fail_if_unsupported_ubatching(vllm_config)
-        self.afd_cudagraph_policy = validate_cuda_graph_mode(
-            vllm_config,
-            role="ffn",
-        )
         rank, local_rank = _resolve_world_ranks()
         self.connector = AFDConnectorFactory.create_connector(
             rank,
@@ -80,20 +83,39 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             vllm_config,
             self.afd_config,
         )
-        # TODO: Async GPU connector will be supported in the future
-        assert self.connector.control_plane is not None, (
-            "GPU model runner only supports control-plane-driven connectors"
-        )
+        # A connector without a control plane drives FFN steps from its own
+        # receive loop instead of from broadcast DP metadata.
+        self.is_connector_driven = self.connector.control_plane is None
+        # The connector-driven path never touches vLLM's graph machinery, so
+        # vLLM's cudagraph_mode says nothing about it -- running the policy gate
+        # here would reject modes that are simply irrelevant.
+        if self.is_connector_driven:
+            self.afd_cudagraph_policy = None
+        else:
+            self.afd_cudagraph_policy = validate_cuda_graph_mode(
+                vllm_config,
+                role="ffn",
+            )
 
-        self.model: Any | None = None
+        self.model: Any = None
         self.model_memory_usage = 0
         self.num_layers = int(self.model_config.hf_text_config.num_hidden_layers)
         self.use_cuda_graph = bool(
-            self.afd_cudagraph_policy.enable_ffn_graph_cache,
+            self.afd_cudagraph_policy is not None
+            and self.afd_cudagraph_policy.enable_ffn_graph_cache
         )
         self._cuda_graphs: dict[tuple, dict[str, Any]] = {}
         self._graph_memory_pool: Any | None = None
         self.prof = create_afd_gpu_profiler("ffn")
+
+    @property
+    def _control_plane(self) -> Any:
+        """The control plane, on the paths that only run when there is one."""
+        control_plane = self.connector.control_plane
+        assert control_plane is not None, (
+            "control-plane FFN path reached on a connector-driven runner",
+        )
+        return control_plane
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
@@ -154,6 +176,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             graph_exists=cuda_graph_info is not None,
         )
         if run_mode is AFDGraphRunMode.REPLAY:
+            assert cuda_graph_info is not None
             cuda_graph_info["graph"].replay()
             return None
 
@@ -173,7 +196,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         update_connector_state: bool = True,
     ) -> torch.Tensor | None:
         if update_connector_state:
-            self.connector.control_plane.update_state_from_dp_metadata(
+            self._control_plane.update_state_from_dp_metadata(
                 _make_dp_metadata_payload(
                     dp_metadata_list,
                     is_graph_capturing=is_graph_capturing,
@@ -246,6 +269,69 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                     self.connector.send_ffn_output(rank_ffn_output, context)
         return rank_ffn_output
 
+    def execute_connector_driven_step(self) -> None:
+        """Drain whatever the connector has already received, then return.
+
+        Returning on an idle poll rather than blocking forever is what lets the
+        worker loop observe its shutdown event. The batch size below is only a
+        drain granularity: successive work items may belong to different layers
+        of different Attention replicas.
+        """
+        step_afd_gpu_profiler(self.prof)
+        self._ffn_forward_connector_driven()
+
+    def _compute_work_item(
+        self,
+        work_item: Any,
+        states: GpuAsyncTransferState,
+    ) -> torch.Tensor | AFDF2ATransferPayload:
+        """Run this work item's layer over the rows that arrived."""
+        return self.model.compute_ffn_output(
+            hidden_states=work_item.hidden_states,
+            layer_idx=work_item.layer_idx,
+            group_list=states.group_list,
+            expand_x_shared=states.expand_x_shared,
+        )
+
+    def _ffn_forward_connector_driven(
+        self,
+    ) -> torch.Tensor | AFDF2ATransferPayload | None:
+        stage_idx = 0
+        rank_ffn_output = None
+        connector = self.connector
+        max_items = max(1, int(self.num_layers))
+
+        with _ffn_forward_context(self.vllm_config) as forward_context:
+            for _ in range(max_items):
+                try:
+                    work_item = connector.recv_ffn_work_item(  # type: ignore[attr-defined]
+                        stage_idx=stage_idx,
+                        max_num_tokens=self.vllm_config.scheduler_config.max_num_batched_tokens,
+                    )
+                except TimeoutError:
+                    # Nothing pending; hand control back so the worker loop can
+                    # check for shutdown.
+                    return rank_ffn_output
+                except ConnectorShutdown:
+                    raise
+
+                states = work_item.context.states
+                if not isinstance(states, GpuAsyncTransferState):
+                    raise RuntimeError(
+                        "async GPU FFN work item requires GpuAsyncTransferState",
+                    )
+                metadata = work_item.context.metadata
+                forward_context.dp_metadata = None
+                forward_context.additional_kwargs["afd_metadata"] = metadata
+                _set_moe_layer_index(forward_context, work_item.layer_idx)
+
+                rank_ffn_output = self._compute_work_item(work_item, states)
+                rank_ffn_output = connector.send_ffn_work_item_output(  # type: ignore[attr-defined]
+                    work_item,
+                    rank_ffn_output,
+                )
+        return rank_ffn_output
+
     def _execute_eager_mode(
         self,
         hidden_states: torch.Tensor,
@@ -307,7 +393,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             cudagraph = torch.cuda.CUDAGraph()
             # DP metadata receive/update is a control-plane side effect and must
             # complete before CUDA graph capture starts.
-            self.connector.control_plane.update_state_from_dp_metadata(
+            self._control_plane.update_state_from_dp_metadata(
                 _make_dp_metadata_payload(
                     dp_metadata_list,
                     is_graph_capturing=is_attn_graph_capturing,
@@ -349,7 +435,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         try:
             with graph_capture(device=self.device):
                 if is_warmup:
-                    self.connector.control_plane.update_state_from_dp_metadata(
+                    self._control_plane.update_state_from_dp_metadata(
                         _make_dp_metadata_payload(
                             dp_metadata_list,
                             is_graph_capturing=False,
@@ -436,7 +522,7 @@ def _ffn_forward_context(vllm_config: VllmConfig):
         yield get_forward_context()
 
 
-def _set_moe_layer_index(forward_context: object, layer_idx: int) -> None:
+def _set_moe_layer_index(forward_context: Any, layer_idx: int) -> None:
     all_moe_layers = forward_context.all_moe_layers
     if not all_moe_layers:
         return

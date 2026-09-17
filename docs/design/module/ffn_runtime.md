@@ -155,13 +155,15 @@ The worker selects one of two FFN step paths from the optional
 | Selection state | Connectors | Worker behavior |
 | --- | --- | --- |
 | `control_plane is not None` | `P2pNcclAFDConnector`, `CAMP2pAFDConnector` | Call `control_plane.recv_dp_metadata_list()`, then profile, warm, capture, replay, or execute its stage map. |
-| `control_plane is None` | `CAMAsyncAFDConnector` (NPU only) | Block directly on a connector work item; no separate DP-metadata control plane. |
+| `control_plane is None` | `CAMAsyncAFDConnector`, `GpuAsyncAFDConnector` | Block directly on a connector work item; no separate DP-metadata control plane. |
 
-The connector-driven path exists only on Ascend. GPU FFN supports
-control-plane-driven connectors exclusively: `GPUFFNModelRunner` asserts
-`connector.control_plane is not None` at construction, and the GPU daemon loop
-raises `NotImplementedError` if a connector without a control plane is ever
-installed.
+The connector-driven path now runs on both platforms. `GPUFFNModelRunner` no
+longer asserts `connector.control_plane is not None` at construction, and the
+GPU daemon loop calls `execute_connector_driven_step` where it used to raise
+`NotImplementedError`. That step drains at most `num_layers` work items and
+returns on an idle poll, which is what lets the worker loop observe its
+shutdown event; successive items may belong to different layers of different
+Attention replicas, so each installs its own forward context and AFD metadata.
 
 ```mermaid
 flowchart TD
