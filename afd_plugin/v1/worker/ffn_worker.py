@@ -150,6 +150,26 @@ class AFDFFNWorker(Worker):
             return
 
         self.raise_ffn_loop_error_if_any()
+        # Capture before the rendezvous, not after. The connector's process
+        # group is the only barrier between the two roles: the Attention rank
+        # leaves it and immediately profiles, which dispatches. Capturing after
+        # joining leaves a window -- 35 seconds for a 26-layer model -- where
+        # those dispatches land in a slot nobody is polling. The Attention rank
+        # then parks its stream on a flag that will not be stamped until this
+        # side starts polling, runs ahead until the launch queue fills, and
+        # blocks mid-write with the next dispatch's flag unstamped, which the
+        # poll can never see. Under vLLM's ubatching that is fatal rather than
+        # merely slow: the blocked thread never reaches its next yield and the
+        # peer ubatch waits on it forever.
+        #
+        # Capture needs the model and the connector's shape config, both ready
+        # before init_afd_connector, so moving it earlier costs nothing.
+        #
+        # Here rather than in initialize_from_config because an AFD FFN
+        # EngineCore is a daemon that reaches this by collective_rpc and never
+        # runs KV/scheduler setup; this is the one point both entry paths cross.
+        self.model_runner.capture_padded_ffn_graphs()
+
         connector = self.model_runner.connector
         if not connector.is_initialized:
             self.model_runner.initialize_afd_connector()

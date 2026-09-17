@@ -83,6 +83,9 @@ def runner(monkeypatch):
         scheduler_config=SimpleNamespace(max_num_batched_tokens=512),
     )
     runner._compute_work_item = lambda item, states: torch.full((1,), item.layer_idx)
+    # No padded graph is captured here, so the arrival gathers into its own
+    # buffer the way it did before bucketed capture.
+    runner._padded_hidden = None
     runner.forward_context = forward_context
     return runner
 

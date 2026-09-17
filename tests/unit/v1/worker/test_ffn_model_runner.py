@@ -28,7 +28,10 @@ from afd_plugin.connectors.gpu.async_gpu import ConnectorShutdown  # noqa: E402
 from afd_plugin.model_executor.models.deepseek_v2 import (  # noqa: E402
     AFDDeepseekV2ForCausalLM,
 )
-from afd_plugin.v1.worker.cuda_graph import make_ffn_graph_key  # noqa: E402
+from afd_plugin.v1.worker.cuda_graph import (  # noqa: E402
+    make_ffn_graph_key,
+    padded_ffn_graph_buckets,
+)
 from afd_plugin.v1.worker.ffn_model_runner import (  # noqa: E402
     GPUFFNModelRunner,
     _set_moe_layer_index,
@@ -794,6 +797,7 @@ def test_ffn_worker_loop_logs_unexpected_thread_errors(caplog):
     worker._ffn_loop_error = None
     worker.model_runner = SimpleNamespace(
         connector=SimpleNamespace(is_initialized=True),
+        capture_padded_ffn_graphs=lambda: 0,
     )
 
     expected_error = RuntimeError("boom")
@@ -813,3 +817,288 @@ def test_ffn_worker_loop_logs_unexpected_thread_errors(caplog):
     with pytest.raises(RuntimeError, match="AFD FFN worker loop failed") as exc:
         worker.raise_ffn_loop_error_if_any()
     assert exc.value.__cause__ is expected_error
+
+
+# ----------------------------------------------------------------------
+# Connector-driven padded graphs
+#
+# The FFN side never learns the next work item's shape ahead of time, which is
+# why it ran eagerly. Padding removes the need to: the grouping is device data,
+# so one captured row count serves every smaller item.
+# ----------------------------------------------------------------------
+
+
+class _RecordingPaddedGraph:
+    def __init__(self, routed_out, shared_out=None):
+        self.routed_out = routed_out
+        self.shared_out = shared_out
+        self.replays = 0
+
+    @property
+    def graph(self):
+        return self
+
+    def replay(self):
+        self.replays += 1
+
+
+class _RecordingFFNModel:
+    """Stands in for the model; records eager compute calls."""
+
+    def __init__(self):
+        self.eager_calls = []
+
+    def compute_ffn_output(self, *, hidden_states, layer_idx, group_list, **kwargs):
+        self.eager_calls.append((layer_idx, int(hidden_states.shape[0])))
+        return torch.zeros_like(hidden_states)
+
+
+def _padded_runner(*, max_routed=8, max_shared=2, expert_per_rank=2, buckets=None):
+    runner = object.__new__(GPUFFNModelRunner)
+    runner.model = _RecordingFFNModel()
+    runner._padded_max_routed = max_routed
+    runner._padded_max_shared = max_shared
+    runner._padded_hidden = torch.zeros(max_routed, 4)
+    runner._padded_counts = torch.zeros(expert_per_rank, dtype=torch.int32)
+    runner._padded_shared = torch.zeros(max_shared, 4) if max_shared else None
+    runner._padded_graphs = {}
+    runner._padded_buckets = (
+        buckets if buckets is not None else padded_ffn_graph_buckets(max_routed)
+    )
+    runner._padded_rows_real = 0
+    runner._padded_rows_charged = 0
+    runner._padded_replays = 0
+    runner._padded_eager_items = 0
+    return runner
+
+
+def _work_item(layer_idx, routed, shared, expert_per_rank=2, staged=False):
+    counts = torch.zeros(expert_per_rank, dtype=torch.int32)
+    counts[0] = routed
+    states = SimpleNamespace(
+        routed_tokens=routed,
+        shared_tokens=shared,
+        group_list=counts,
+        staged_routed=staged,
+        expand_x_shared=torch.ones(shared, 4) if shared else None,
+    )
+    item = SimpleNamespace(layer_idx=layer_idx, hidden_states=torch.ones(routed, 4))
+    return item, states
+
+
+def test_padded_graph_replays_and_slices_off_the_padding():
+    # 1000 rows into a 1024 bucket: 2.4% padding, inside the ratio that makes a
+    # replay worth more than the launches eager would pay.
+    runner = _padded_runner(max_routed=1024, max_shared=2, buckets=(1024,))
+    graph = _RecordingPaddedGraph(
+        routed_out=torch.arange(1024 * 4, dtype=torch.float32).reshape(1024, 4),
+        shared_out=torch.zeros(2, 4),
+    )
+    runner._padded_graphs[(3, runner._padded_buckets[-1])] = graph
+    item, states = _work_item(3, routed=1000, shared=1)
+
+    payload = GPUFFNModelRunner._compute_work_item(runner, item, states)
+
+    assert graph.replays == 1
+    assert runner.model.eager_calls == []
+    # The reply only ever sees the real rows.
+    assert payload.routed_output.shape[0] == 1000
+    assert payload.shared_output.shape[0] == 1
+    # Counts must sum to the captured row count, with the pad on the last
+    # expert -- otherwise the grouping and the row count disagree.
+    assert runner._padded_counts.tolist() == [1000, 24]
+
+
+def test_padded_graph_stages_the_real_rows_at_the_front():
+    runner = _padded_runner(max_routed=1024, max_shared=0, buckets=(1024,))
+    runner._padded_graphs[(0, 1024)] = _RecordingPaddedGraph(
+        routed_out=torch.zeros(1024, 4)
+    )
+    item, states = _work_item(0, routed=1000, shared=0)
+    item.hidden_states = torch.full((1000, 4), 7.0)
+
+    GPUFFNModelRunner._compute_work_item(runner, item, states)
+
+    assert torch.equal(runner._padded_hidden[:1000], torch.full((1000, 4), 7.0))
+
+
+def test_rows_already_gathered_into_the_buffer_are_not_copied_again():
+    # The arrival's gather can write straight into the graph's input buffer,
+    # and it had to write somewhere regardless. Copying afterwards would be a
+    # second pass over the whole payload, once per layer -- which measured as
+    # the reason capturing was slower than running eagerly.
+    runner = _padded_runner(max_routed=1024, max_shared=0, buckets=(1024,))
+    runner._padded_graphs[(0, 1024)] = _RecordingPaddedGraph(
+        routed_out=torch.zeros(1024, 4)
+    )
+    runner._padded_hidden[:1000] = 7.0
+    item, states = _work_item(0, routed=1000, shared=0, staged=True)
+    # What a stale copy would put there instead.
+    item.hidden_states = torch.full((1000, 4), -1.0)
+
+    GPUFFNModelRunner._compute_work_item(runner, item, states)
+
+    assert torch.equal(runner._padded_hidden[:1000], torch.full((1000, 4), 7.0))
+
+
+@pytest.mark.parametrize(
+    ("routed", "shared", "why"),
+    [
+        (9, 0, "more routed rows than the capture"),
+        (4, 5, "more shared rows than the capture"),
+        (0, 0, "nothing routed here at all"),
+    ],
+)
+def test_work_that_does_not_fit_the_capture_runs_eagerly(routed, shared, why):
+    runner = _padded_runner(max_routed=8, max_shared=2)
+    graph = _RecordingPaddedGraph(routed_out=torch.zeros(8, 4))
+    runner._padded_graphs[(1, runner._padded_buckets[-1])] = graph
+    item, states = _work_item(1, routed=routed, shared=shared)
+
+    GPUFFNModelRunner._compute_work_item(runner, item, states)
+
+    assert graph.replays == 0, why
+    assert runner.model.eager_calls == [(1, routed)], why
+
+
+def test_a_layer_without_a_captured_graph_runs_eagerly():
+    runner = _padded_runner()
+    item, states = _work_item(7, routed=4, shared=1)
+
+    GPUFFNModelRunner._compute_work_item(runner, item, states)
+
+    assert runner.model.eager_calls == [(7, 4)]
+
+
+@pytest.mark.parametrize(
+    ("use_cuda_graph", "connector_driven"),
+    [(False, True), (True, False), (False, False)],
+)
+def test_capture_is_skipped_unless_graphs_and_connector_driven(
+    use_cuda_graph,
+    connector_driven,
+):
+    # The padded path is for the connector-driven connector only. With a
+    # control plane the runner already has a shape-keyed graph cache, and with
+    # graphs off nothing should allocate.
+    runner = object.__new__(GPUFFNModelRunner)
+    runner.use_cuda_graph = use_cuda_graph
+    runner.is_connector_driven = connector_driven
+    runner._padded_graphs = {}
+    runner.model = None  # would raise if capture got past the guard
+
+    assert GPUFFNModelRunner.capture_padded_ffn_graphs(runner) == 0
+    assert runner._padded_graphs == {}
+
+
+def test_capture_does_not_run_twice():
+    # start_ffn_server_loop is callable more than once; a second capture would
+    # leak the first set of graphs and their pool.
+    runner = object.__new__(GPUFFNModelRunner)
+    runner.use_cuda_graph = True
+    runner.is_connector_driven = True
+    runner._padded_graphs = {0: object()}
+    runner.model = None  # would raise if capture got past the guard
+
+    assert GPUFFNModelRunner.capture_padded_ffn_graphs(runner) == 0
+    assert list(runner._padded_graphs) == [0]
+
+
+def _ordering_worker(order, *, initialized):
+    worker = object.__new__(AFDFFNWorker)
+    worker._ffn_thread = None
+    worker._ffn_shutdown_event = None
+    worker._ffn_loop_error = None
+    worker.model_runner = SimpleNamespace(
+        connector=SimpleNamespace(is_initialized=initialized),
+        capture_padded_ffn_graphs=lambda: order.append("capture") or 0,
+        initialize_afd_connector=lambda: order.append("rendezvous"),
+    )
+    return worker
+
+
+def test_graphs_are_captured_before_the_connector_joins():
+    # The connector's process group is the only barrier between the roles: the
+    # Attention rank profiles, and so dispatches, the moment it clears. Joining
+    # first and capturing after leaves those dispatches landing in a slot
+    # nobody is polling, which wedges the Attention rank mid-write with a flag
+    # unstamped -- fatal under ubatching, where the blocked thread never
+    # reaches its next yield.
+    order: list[str] = []
+    worker = _ordering_worker(order, initialized=False)
+    worker._run_ffn_server_loop = lambda: None
+
+    worker.start_ffn_server_loop()
+    worker._ffn_thread.join(timeout=5)
+
+    assert order == ["capture", "rendezvous"]
+
+
+def test_graphs_are_captured_before_the_serving_thread_starts():
+    # Capture has to happen on an idle stream, and an AFD FFN EngineCore is a
+    # daemon that reaches start_ffn_server_loop by collective_rpc and never
+    # runs initialize_from_config -- so this is the only point that sees both
+    # entry paths.
+    order: list[str] = []
+    worker = _ordering_worker(order, initialized=True)
+    started = threading.Event()
+
+    def serve_loop():
+        order.append("serve")
+        started.set()
+
+    worker._run_ffn_server_loop = serve_loop
+
+    worker.start_ffn_server_loop()
+    assert started.wait(timeout=5)
+    worker._ffn_thread.join(timeout=5)
+
+    assert order == ["capture", "serve"]
+
+
+def test_item_padded_far_past_its_bucket_runs_eagerly():
+    # A replay costs its whole bucket, so an item far below one is cheaper run
+    # eagerly. Measured on DeepSeek-V4: eager beat a 1.18x-padded replay by 6%.
+    runner = _padded_runner(max_routed=1024, max_shared=0, buckets=(1024,))
+    runner._padded_graphs[(0, 1024)] = _RecordingPaddedGraph(
+        routed_out=torch.zeros(1024, 4)
+    )
+    item, states = _work_item(0, routed=600, shared=0)
+
+    GPUFFNModelRunner._compute_work_item(runner, item, states)
+
+    assert runner.model.eager_calls == [(0, 600)]
+
+
+def test_small_item_replays_the_small_bucket_not_the_largest():
+    # The regression this guards: one graph at the upper bound charged every
+    # item the full-batch row count, which is what made a DBO ubatch -- a
+    # quarter of the rows -- cost the same as a whole batch.
+    runner = _padded_runner(max_routed=4096, max_shared=0, buckets=(1024, 2048, 4096))
+    graphs = {
+        bucket: _RecordingPaddedGraph(routed_out=torch.zeros(bucket, 4))
+        for bucket in (1024, 2048, 4096)
+    }
+    for bucket, graph in graphs.items():
+        runner._padded_graphs[(0, bucket)] = graph
+    item, states = _work_item(0, routed=2020, shared=0)
+
+    payload = GPUFFNModelRunner._compute_work_item(runner, item, states)
+
+    assert graphs[2048].replays == 1, "should take the smallest bucket that fits"
+    assert graphs[1024].replays == 0
+    assert graphs[4096].replays == 0
+    assert runner.model.eager_calls == []
+    assert payload.routed_output.shape[0] == 2020
+    # Counts sum to the chosen bucket, not to the largest one.
+    assert runner._padded_counts.tolist() == [2020, 28]
+
+
+def test_item_larger_than_every_bucket_still_runs_eagerly():
+    runner = _padded_runner(max_routed=8, max_shared=0, buckets=(2, 4, 8))
+    runner._padded_graphs[(0, 8)] = _RecordingPaddedGraph(routed_out=torch.zeros(8, 4))
+    item, states = _work_item(0, routed=9, shared=0)
+
+    GPUFFNModelRunner._compute_work_item(runner, item, states)
+
+    assert runner.model.eager_calls == [(0, 9)]
