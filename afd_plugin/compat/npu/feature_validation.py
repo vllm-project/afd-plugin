@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from afd_plugin.config import (
-    AFD_ASYNC_CONNECTOR,
+    AFD_ASYNC_NPU_CONNECTOR,
     AFDConfig,
     is_afd_async_dp,
     parse_afd_config,
@@ -38,7 +38,7 @@ def fail_if_unsupported_npu_afd_features(
     if is_dsv4:
         _fail_if_unsupported_dsv4_connector(afd_config)
 
-    if afd_config.connector == AFD_ASYNC_CONNECTOR:
+    if afd_config.connector == AFD_ASYNC_NPU_CONNECTOR:
         _fail_if_unsupported_npu_afd_async_features(
             vllm_config,
             afd_config,
@@ -130,7 +130,7 @@ def _fail_if_unsupported_dsv4_async_features(
 
 
 def _fail_if_unsupported_dsv4_connector(afd_config: AFDConfig) -> None:
-    if afd_config.connector != AFD_ASYNC_CONNECTOR:
+    if afd_config.connector != AFD_ASYNC_NPU_CONNECTOR:
         raise RuntimeError("DSV4 NPU AFD supports only CAMAsyncAFDConnector")
 
 

@@ -75,7 +75,7 @@ from afd_plugin.compat.npu.profiler import (
     stop_afd_npu_profiler,
 )
 from afd_plugin.config import (
-    AFD_ASYNC_CONNECTOR,
+    AFD_ASYNC_NPU_CONNECTOR,
     AFDConfig,
     parse_afd_config,
 )
@@ -146,7 +146,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             self.afd_config,
         )
         self.afd_async_extra_info = AFDAsyncExtraInfo()
-        if afd_config.connector == AFD_ASYNC_CONNECTOR:
+        if afd_config.connector == AFD_ASYNC_NPU_CONNECTOR:
             connector_extra_info = self.connector.extra_info
             if not isinstance(connector_extra_info, AFDAsyncExtraInfo):
                 raise TypeError(

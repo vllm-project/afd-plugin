@@ -248,6 +248,8 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
     connector = SimpleNamespace(
         send_attn_output=send_attn_output,
         recv_ffn_output=recv_ffn_output,
+        # CAM keeps the direct calls; the opaque ops are the GPU connector's.
+        uses_opaque_moe_ops=False,
     )
     afd_metadata = SimpleNamespace(connector=connector, stage_idx=0)
 

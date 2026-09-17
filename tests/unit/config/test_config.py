@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -119,13 +122,65 @@ def test_parse_async_dp_config_from_async_alias():
 
 
 def test_async_dp_requires_async_connector():
-    with pytest.raises(ValueError, match="requires connector='CAMAsyncAFDConnector'"):
+    with pytest.raises(ValueError, match="AFD async mode requires one of"):
         parse_afd_config(
             {
                 "afd": {
                     "connector": "CAMP2pAFDConnector",
                     "role": "attention",
                     "async": True,
+                },
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("connector", "extra"),
+    [
+        ("CAMAsyncAFDConnector", {}),
+        # The GPU connector has no FFN-side router, so the gate is not optional.
+        ("GpuAsyncAFDConnector", {"compute_gate_on_attention": True}),
+    ],
+)
+def test_async_dp_accepts_every_async_connector(connector, extra):
+    config = parse_afd_config(
+        {
+            "afd": {
+                "connector": connector,
+                "role": "attention",
+                "async": True,
+                **extra,
+            },
+        },
+    )
+    assert config.connector == connector
+    assert config.async_dp
+
+
+@pytest.mark.parametrize(
+    ("afd", "expected"),
+    [
+        (
+            {"async": False, "compute_gate_on_attention": True},
+            "requires async=true",
+        ),
+        (
+            {"async": True, "compute_gate_on_attention": False},
+            "requires compute_gate_on_attention=true",
+        ),
+    ],
+)
+def test_gpu_async_rejects_the_combinations_it_cannot_run(afd, expected):
+    # Both are structural: FFN steps come off the connector receive loop, which
+    # only the async-DP patches drive, and topk is chosen on the Attention side.
+    # Without this the failure is a startup hang or a missing-gate crash.
+    with pytest.raises(ValueError, match=expected):
+        parse_afd_config(
+            {
+                "afd": {
+                    "connector": "GpuAsyncAFDConnector",
+                    "role": "attention",
+                    **afd,
                 },
             },
         )

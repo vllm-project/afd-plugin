@@ -61,6 +61,7 @@ depend on role worker implementations.
 | CUDA P2P | [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py), [`topology.py`](../../../afd_plugin/distributed/topology.py) | [`test_p2p_connector.py`](../../../tests/unit/connectors/test_p2p_connector.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) |
 | Ascend CAMP2P | [`npu/camp2p.py`](../../../afd_plugin/connectors/npu/camp2p.py) | [`test_camp2p_connector.py`](../../../tests/unit/connectors/test_camp2p_connector.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) |
 | Ascend CAM async | [`npu/async_cam.py`](../../../afd_plugin/connectors/npu/async_cam.py) | [`test_async_cam_connector.py`](../../../tests/unit/connectors/test_async_cam_connector.py), [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py) |
+| Async GPU connector | [`gpu/async_gpu.py`](../../../afd_plugin/connectors/gpu/async_gpu.py), [`async_topology.py`](../../../afd_plugin/connectors/async_topology.py) | [`test_async_gpu_connector.py`](../../../tests/unit/connectors/test_async_gpu_connector.py), [`async_gpu_connector_e2e.py`](../../../tests/e2e/async_gpu_connector_e2e.py), [`async_gpu_moe_equivalence.py`](../../../tests/e2e/async_gpu_moe_equivalence.py) |
 | NVSHMEM symmetric window | [`gpu/symm_window.py`](../../../afd_plugin/connectors/gpu/symm_window.py), [`gpu/nvshmem_rt.py`](../../../afd_plugin/connectors/gpu/nvshmem_rt.py), [`gpu/cuda_rt.py`](../../../afd_plugin/connectors/gpu/cuda_rt.py) | [`test_symm_window.py`](../../../tests/unit/connectors/gpu/test_symm_window.py) (slot layout and header codec, CPU-only) |
 | Process-group construction | [`afd_process_group.py`](../../../afd_plugin/distributed/afd_process_group.py) | Connector initialization tests plus platform E2E paths |
 
@@ -110,6 +111,7 @@ synchronous NPU runtime requires both common and connector-local values to be
 | `P2pNcclAFDConnector` | CUDA | FFN ranks, then Attention ranks | `P2pNcclAFDControlPlane`; stage DP metadata over a separate NCCL group | `connector.control_plane is not None` |
 | `CAMP2pAFDConnector` | Ascend | FFN ranks, then Attention ranks | `CAMP2pAFDControlPlane`; stage DP metadata over Gloo plus HCCL data groups | `connector.control_plane is not None` |
 | `CAMAsyncAFDConnector` | Ascend | Attention ranks, then FFN ranks | `None`; routing/token metadata travels with CAM dispatch payloads | `connector.control_plane is None` |
+| `GpuAsyncAFDConnector` | CUDA | Attention ranks, then FFN ranks | `None`; routing and token metadata travel in the symmetric window's slot header | `connector.control_plane is None` |
 
 The CUDA P2P mapping requires
 `num_attention_ranks >= num_ffn_ranks`. Each FFN rank owns a subgroup containing
@@ -118,6 +120,27 @@ differ in size by at most one, so an integral A/F ratio is not required. CAMP2P 
 requires at least as many Attention ranks as FFN ranks; its control and HCCL
 groups remain connector-owned. CAM async maps role ranks directly into an
 Attention-first world and distributes routed experts across FFN ranks.
+
+The async GPU connector maps role ranks into an Attention-first world like CAM
+async, and distributes routed experts across FFN ranks. Its connector-owned
+configuration is `attn_ranks_per_dp`, `ring_depth`, `routed_cap_multiplier`,
+`recv_poll_timeout_ms`, `async_moe_ubatching`, `async_moe_num_ubatches` and
+`async_moe_split`; unknown fields are rejected. `attn_ranks_per_dp` must equal
+the Attention deployment's `tensor_parallel_size`, and `async=true` plus
+`compute_gate_on_attention=true` are structural requirements rather than
+defaults -- `validate_afd_config` rejects the other combinations, because FFN
+steps come off the connector receive loop and the wire carries topk chosen on
+the Attention side.
+
+It is the only connector whose Attention-side data path is CUDA-graph
+capturable. That is what fixes the flag protocol's shape: a captured stream wait
+compares against a value baked in at capture time, so a reply signals with the
+constant `FLAG_REPLY_READY` and the reader resets the flag in band once it has
+consumed the slot, making every replay identical. The FFN side is driven by a
+host poll loop and stays eager. Because only that constant releases a combine
+wait, an FFN rank that leaves between a dispatch and its reply stamps
+`FLAG_REPLY_READY` on every ring as it announces shutdown; an Attention rank is
+expected to drain its pending combines before the FFN world closes.
 
 These are current implementation facts, not approved long-term extension
 contracts. Individual connectors remain sections of this document until they

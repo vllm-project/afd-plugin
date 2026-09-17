@@ -1,8 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import builtins
-import sys
-from types import SimpleNamespace
 
 import pytest
 
@@ -14,7 +15,7 @@ from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 
 def test_maybe_apply_dbo_yield_uses_custom_op(monkeypatch):
-    calls = []
+    calls: list[object] = []
     tensor = object()
 
     monkeypatch.setattr(
@@ -84,22 +85,14 @@ def test_maybe_apply_dbo_yield_does_not_probe_ascend(monkeypatch):
 def test_dbo_yield_prefers_plugin_ascend_context(monkeypatch):
     calls = []
 
-    monkeypatch.setitem(
-        sys.modules,
-        "afd_plugin.v1.worker.npu.ubatching",
-        SimpleNamespace(
-            dbo_enabled=lambda: True,
-            dbo_yield=lambda: calls.append("ascend"),
-        ),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.v1.worker.ubatching",
-        SimpleNamespace(
-            dbo_enabled=lambda: True,
-            dbo_yield=lambda: calls.append("vllm"),
-        ),
-    )
+    # The Ascend yield is resolved once at import, so patch the resolved names
+    # rather than sys.modules: re-importing per call cost 833us of host time on
+    # a CUDA build, where the import can only ever fail.
+    monkeypatch.setattr(dbo, "_ascend_dbo_enabled", lambda: True)
+    monkeypatch.setattr(dbo, "_ascend_dbo_yield", lambda: calls.append("ascend"))
+    monkeypatch.setattr(dbo, "dbo_enabled", lambda: True)
+    monkeypatch.setattr(dbo, "dbo_yield", lambda: calls.append("vllm"))
+
     dbo._yield_if_dbo_enabled()
 
     assert calls == ["ascend"]
@@ -108,25 +101,31 @@ def test_dbo_yield_prefers_plugin_ascend_context(monkeypatch):
 def test_dbo_yield_falls_back_to_vllm_context(monkeypatch):
     calls = []
 
-    monkeypatch.setitem(
-        sys.modules,
-        "afd_plugin.v1.worker.npu.ubatching",
-        SimpleNamespace(
-            dbo_enabled=lambda: False,
-            dbo_yield=lambda: calls.append("ascend"),
-        ),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.v1.worker.ubatching",
-        SimpleNamespace(
-            dbo_enabled=lambda: True,
-            dbo_yield=lambda: calls.append("vllm"),
-        ),
-    )
+    monkeypatch.setattr(dbo, "_ascend_dbo_enabled", lambda: False)
+    monkeypatch.setattr(dbo, "_ascend_dbo_yield", lambda: calls.append("ascend"))
     monkeypatch.setattr(dbo, "dbo_enabled", lambda: True)
     monkeypatch.setattr(dbo, "dbo_yield", lambda: calls.append("vllm"))
 
     dbo._yield_if_dbo_enabled()
 
     assert calls == ["vllm"]
+
+
+def test_ubatch_id_is_none_when_dbo_is_off(monkeypatch):
+    # Off DBO the caller keeps whatever stage it already had; returning 0 here
+    # would silently pin every dispatch to stage 0.
+    from afd_plugin.v1.worker import dbo as dbo_module
+
+    monkeypatch.setattr(dbo_module, "dbo_enabled", lambda: False)
+    assert dbo_module.current_dbo_ubatch_id() is None
+
+
+def test_ubatch_id_comes_from_the_thread_not_the_forward_context(monkeypatch):
+    # vLLM never sets ubatch_idx on the forward context, so reading it there
+    # made both DBO halves look like stage 0 -- one window slot for two
+    # concurrent dispatches, the second overwriting the first's flag.
+    from afd_plugin.v1.worker import dbo as dbo_module
+
+    monkeypatch.setattr(dbo_module, "dbo_enabled", lambda: True)
+    monkeypatch.setattr(dbo_module, "dbo_current_ubatch_id", lambda: 1)
+    assert dbo_module.current_dbo_ubatch_id() == 1

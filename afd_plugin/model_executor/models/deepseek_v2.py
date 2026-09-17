@@ -21,7 +21,7 @@ from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models import deepseek_v2 as native
 
-from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
+from afd_plugin.config import AFD_ASYNC_CONNECTORS, parse_afd_config
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
     AFDF2ATransferPayload,
@@ -165,7 +165,11 @@ class AFDAttentionFusedMoE(RemoteFFNProxy):
         super().__init__(layer_idx=layer_idx)
         self.is_internal_router = is_internal_router
 
-    def forward(
+    # The base proxy stands in for a plain MLP and this one for vLLM's
+    # FusedMoE, so the two forwards match different upstream call shapes and
+    # cannot be substituted for each other. Nothing calls them polymorphically;
+    # the inheritance is for _send_and_receive, not for forward.
+    def forward(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
@@ -703,7 +707,10 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         intermediate_tensors: native.IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | native.IntermediateTensors:
-        if self.afd_config.connector == AFD_ASYNC_CONNECTOR:
+        # Both async connectors run this schedule: it is the connector-driven
+        # shape, not an Ascend one. The module still lives under models/npu/
+        # because CAM got here first.
+        if self.afd_config.connector in AFD_ASYNC_CONNECTORS:
             from afd_plugin.model_executor.models.npu import (
                 deepseek_v2_async_cam_forward,
             )

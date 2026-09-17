@@ -22,7 +22,7 @@ from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.sequence import IntermediateTensors
 
-from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
+from afd_plugin.config import AFD_ASYNC_NPU_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
     AFDF2ATransferPayload,
@@ -315,7 +315,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         afd_config = parse_afd_config(vllm_config, validate=False)
         if (
-            afd_config.connector == AFD_ASYNC_CONNECTOR
+            afd_config.connector == AFD_ASYNC_NPU_CONNECTOR
             and not afd_config.compute_gate_on_attention
         ):
             raise ValueError(

@@ -60,6 +60,13 @@ class AFDConnectorBase(ABC):
     control_plane: AFDControlPlane | None = None
     attn_size: int = 0
     ffn_size: int = 0
+    # Whether the MoE round trip goes through the opaque dispatch/recv ops
+    # rather than direct connector calls. The ops exist so Dynamo splits the
+    # graph at the round trip instead of tracing into the connector; a
+    # connector that needs that split sets this True. Connectors whose protocol
+    # carries data the ops do not -- router logits, FlashComm1 token sharding --
+    # keep the direct calls and leave it False.
+    uses_opaque_moe_ops: bool = False
 
     @classmethod
     @abstractmethod
