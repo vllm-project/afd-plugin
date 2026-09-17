@@ -14,7 +14,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
-from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.nvidia import model as native
 
 from afd_plugin.config import parse_afd_config
@@ -24,7 +23,10 @@ from afd_plugin.connectors import (
 )
 from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
-from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
+from afd_plugin.v1.worker.dbo import (
+    current_dbo_ubatch_id,
+    maybe_apply_dbo_yield,
+)
 
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
@@ -157,9 +159,15 @@ class RemoteDeepseekV4FFN(nn.Module):
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
             raise RuntimeError("RemoteDeepseekV4FFN requires AFD forward metadata")
-        forward_context = get_forward_context()
-        stage_idx = int(
-            getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),
+        # vLLM tracks the ubatch by thread, not on the forward context, so
+        # forward_context.ubatch_idx does not exist and reading it pinned both
+        # DBO halves to stage 0 -- one window slot for two concurrent
+        # dispatches, the second overwriting the first's flag, after which the
+        # first forward waits for a reply that never comes. That surfaced as
+        # "RPC call to sample_tokens timed out" on a V4 decode run with DBO on.
+        dbo_ubatch_id = current_dbo_ubatch_id()
+        stage_idx = (
+            afd_metadata.stage_idx if dbo_ubatch_id is None else int(dbo_ubatch_id)
         )
         afd_metadata.stage_idx = stage_idx
         metadata = AFDTransferMetadata.create_attention_metadata(

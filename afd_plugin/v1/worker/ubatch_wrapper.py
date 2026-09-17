@@ -71,6 +71,20 @@ class AFDUBatchWrapper(UBatchWrapper):
         forward_context = get_forward_context()
         ubatch_slices = forward_context.ubatch_slices
         if ubatch_slices is None:
+            # ### PATCH START: uncaptured FULL without a cudagraph wrapper
+            # runs eagerly. The AFD wrapper owns only cooperative capture and
+            # never builds a cudagraph_wrapper, so a whole-batch FULL dispatch
+            # whose key was never captured has nowhere to replay into and
+            # upstream asserts. A decode bucket the splitter declines to divide
+            # reaches this during capture of its own key.
+            if (
+                forward_context.cudagraph_runtime_mode is CUDAGraphMode.FULL
+                and self.cudagraph_wrapper is None
+                and forward_context.batch_descriptor is not None
+                and forward_context.batch_descriptor.num_tokens not in self.cudagraphs
+            ):
+                return self.runnable(*args, **kwargs)
+            # ### PATCH END: uncaptured FULL without a cudagraph wrapper.
             return super().__call__(*args, **kwargs)
 
         cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode

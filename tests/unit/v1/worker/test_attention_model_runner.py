@@ -586,23 +586,68 @@ def test_should_ubatch_single_rank(
 @pytest.mark.parametrize(
     (
         "dp_size",
+        "control_plane",
         "parent_should_ubatch",
         "num_tokens",
         "padded_num_tokens",
         "expected",
     ),
     [
-        pytest.param(1, False, 48, 64, True, id="dp1-enables-local-dbo"),
-        pytest.param(1, False, 2, 64, False, id="dp1-rejects-empty-last-ubatch"),
-        pytest.param(2, True, 2, 64, True, id="dp2-keeps-coordinated-true"),
-        pytest.param(2, False, 48, 64, False, id="dp2-keeps-coordinated-false"),
-        pytest.param(2, True, 1, 1, False, id="dp2-rejects-empty-first-ubatch"),
-        pytest.param(2, True, 2, 2, True, id="dp2-keeps-minimal-nonempty-split"),
+        pytest.param(
+            1, _DUMMY_CONTROL_PLANE, False, 48, 64, True, id="dp1-enables-local-dbo"
+        ),
+        pytest.param(
+            1,
+            _DUMMY_CONTROL_PLANE,
+            False,
+            2,
+            64,
+            False,
+            id="dp1-rejects-empty-last-ubatch",
+        ),
+        pytest.param(
+            2, _DUMMY_CONTROL_PLANE, True, 2, 64, True, id="dp2-keeps-coordinated-true"
+        ),
+        pytest.param(
+            2,
+            _DUMMY_CONTROL_PLANE,
+            False,
+            48,
+            64,
+            False,
+            id="dp2-keeps-coordinated-false",
+        ),
+        pytest.param(
+            2,
+            _DUMMY_CONTROL_PLANE,
+            True,
+            1,
+            1,
+            False,
+            id="dp2-rejects-empty-first-ubatch",
+        ),
+        pytest.param(
+            2,
+            _DUMMY_CONTROL_PLANE,
+            True,
+            2,
+            2,
+            True,
+            id="dp2-keeps-minimal-nonempty-split",
+        ),
+        # Without a control plane the cross-DP agreement never runs, so the
+        # parent's False is a hardcoded placeholder rather than a decision:
+        # the rank has to decide locally or DBO never activates at all.
+        pytest.param(2, None, False, 48, 64, True, id="dp2-no-control-plane-decides"),
+        pytest.param(
+            2, None, False, 2, 64, False, id="dp2-no-control-plane-rejects-empty"
+        ),
     ],
 )
-def test_determine_batch_execution_overrides_ubatch_only_for_dp1(
+def test_determine_batch_execution_overrides_ubatch_without_dp_coordination(
     monkeypatch,
     dp_size,
+    control_plane,
     parent_should_ubatch,
     num_tokens,
     padded_num_tokens,
@@ -610,6 +655,7 @@ def test_determine_batch_execution_overrides_ubatch_only_for_dp1(
 ):
     runner = _ubatch_runner(
         True,
+        control_plane=control_plane,
         data_parallel_size=dp_size,
         use_ubatching=True,
         num_ubatches=2,
