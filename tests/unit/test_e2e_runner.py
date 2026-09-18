@@ -869,6 +869,31 @@ def test_run_lm_eval_passes_max_gen_toks_to_local_completions(
     assert "max_gen_toks=321" in model_args.split(",")
 
 
+def test_run_lm_eval_passes_num_concurrent_to_local_completions(
+    monkeypatch,
+    tmp_path,
+):
+    popen_calls = []
+
+    def fake_popen(command, **_kwargs):
+        popen_calls.append(command)
+        raise RuntimeError("stop after inspecting lm-eval invocation")
+
+    monkeypatch.setattr(helpers_gsm8k.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(RuntimeError, match="stop after inspecting"):
+        helpers_gsm8k._run_lm_eval(
+            "http://127.0.0.1:8000",
+            "model",
+            output_path=str(tmp_path / "results"),
+            num_concurrent=12,
+        )
+
+    command = popen_calls[0]
+    model_args = command[command.index("--model_args") + 1]
+    assert "num_concurrent=12" in model_args.split(",")
+
+
 def test_run_lm_eval_reads_timestamped_results_file(monkeypatch, tmp_path):
     output_path = tmp_path / "results"
     model_output_path = output_path / "deepseek-v2-lite-afd-attention"
@@ -1293,6 +1318,29 @@ def test_run_gsm8k_evaluation_uses_batch_two_for_async_token_split(
     runner.run_gsm8k_evaluation(args)
 
     assert calls[0][2]["batch_size"] == 2
+
+
+def test_run_gsm8k_evaluation_concurrency_and_sample_floor_for_dbo(monkeypatch):
+    args = _args()
+    args.scenario = "afd-graph-dbo-2a1f"
+    args.device_backend = "gpu"
+    runner.configure_scenario(args)
+    calls = []
+    monkeypatch.delenv("AFD_GSM8K_LIMIT", raising=False)
+
+    def fake_run_lm_eval(base_url, model_name, **kwargs):
+        calls.append((base_url, model_name, kwargs))
+        return {
+            "n-samples": {"gsm8k": {"effective": runner.DBO_EVAL_MIN_SAMPLES}},
+            "results": {"gsm8k": {"exact_match": 0.27}},
+        }
+
+    monkeypatch.setattr(runner, "_run_lm_eval", fake_run_lm_eval)
+
+    runner.run_gsm8k_evaluation(args)
+
+    assert calls[0][2]["num_concurrent"] == runner.DBO_EVAL_NUM_CONCURRENT
+    assert calls[0][2]["limit"] == runner.DBO_EVAL_MIN_SAMPLES
 
 
 def test_run_gsm8k_evaluation_rejects_an_incomplete_full_dataset(
