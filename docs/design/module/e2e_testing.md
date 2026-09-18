@@ -149,16 +149,23 @@ unverified.
 | Task | GSM8K | GSM8K |
 | Few-shot examples | 8 | 8 |
 | Generated-token limit | 512 | 512 |
-| Samples | first 7 | first 7 |
+| Samples | first 7; DBO gates floor at 24 | first 7; the DeepSeek `afd-graph-dbo-2a1f` case floors at 24 |
 | Metric | GSM8K exact match | GSM8K exact match |
 | Minimum accuracy | 0.27 | 0.27 |
 | Cases | four legacy cases plus four CUDA ModelRunnerV2 cases | six Qwen3 MoE / Qwen3.6 MoE cases plus DeepSeek-V2-Lite `afd-graph-dbo-2a1f` |
 
-An accuracy of `0.27` requires at least 2 correct answers out of 7.
+An accuracy of `0.27` requires at least 2 correct answers out of 7 (7 out
+of 24 in DBO scenarios).
 
 - PR and weekly CI leave `AFD_GSM8K_LIMIT` unset.
 - Set `AFD_GSM8K_LIMIT=all` locally for a full 1319-sample run.
 - Other limits are for local debugging, not CI gates.
+- DBO scenarios (`--enable-dbo`) run GSM8K with 12 concurrent requests and
+  floor the sample count at 24: a sequential client never satisfies the
+  DP-wide split agreement, so live requests would never run as two ubatches
+  and only warmup/capture would exercise the split path. The gate asserts
+  that at least one live two-ubatch step was recorded; `AFD_GSM8K_LIMIT=all`
+  still bypasses the floor.
 - CI leaves `AFD_GSM8K_THRESHOLD` unset or raises it.
 - Use the official GSM8K task, `HF_HOME`, and `results_*.json`. Do not commit a
   seven-row dataset or custom task YAML.
