@@ -76,6 +76,8 @@ DEFAULT_GSM8K_THRESHOLD = 0.27
 COMPLETION_REQUEST_TIMEOUT_S = 120
 COMPLETION_MAX_TOKENS = 32
 COMPLETION_TEMPERATURE = 0
+DBO_EVAL_NUM_CONCURRENT = 12
+DBO_EVAL_MIN_SAMPLES = 2 * DBO_EVAL_NUM_CONCURRENT
 ACCOUNTING_PROMPT = (
     "<|im_start|>system\n"
     "You are a professional accountant. Answer questions using accounting "
@@ -752,6 +754,8 @@ def run_gsm8k_evaluation(args: argparse.Namespace) -> None:
         str(DEFAULT_GSM8K_SAMPLE_LIMIT),
     )
     sample_limit = None if configured_limit == "all" else int(configured_limit)
+    if args.enable_dbo and sample_limit is not None:
+        sample_limit = max(sample_limit, DBO_EVAL_MIN_SAMPLES)
     expected_sample_count = (
         GSM8K_FULL_SAMPLE_COUNT if sample_limit is None else sample_limit
     )
@@ -763,6 +767,8 @@ def run_gsm8k_evaluation(args: argparse.Namespace) -> None:
         if args.scenario == ASYNC_UBATCH_SCENARIO
         else {}
     )
+    if args.enable_dbo:
+        scenario_options["num_concurrent"] = DBO_EVAL_NUM_CONCURRENT
     role = "baseline" if args.baseline else "attention"
     results = _run_lm_eval(
         f"http://{args.api_host}:{attention_api_port(args)}",

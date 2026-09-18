@@ -66,6 +66,7 @@ def _run_lm_eval(
     output_path: str,
     num_fewshot: int | None = None,
     batch_size: int | None = None,
+    num_concurrent: int | None = None,
     max_gen_toks: int = 512,
     tokenizer: str | None = None,
     limit: int | None = None,
@@ -73,6 +74,9 @@ def _run_lm_eval(
 ) -> dict:
     """Run lm-eval against the AFD attention server and return results dict."""
     tokenizer_arg = f",tokenizer={tokenizer}" if tokenizer else ""
+    num_concurrent_arg = (
+        f",num_concurrent={num_concurrent}" if num_concurrent is not None else ""
+    )
     cmd = [
         sys.executable,
         "-m",
@@ -85,6 +89,7 @@ def _run_lm_eval(
             f"base_url={base_url}/v1/completions,"
             f"max_gen_toks={max_gen_toks},"
             f"tokenized_requests=False"
+            f"{num_concurrent_arg}"
             f"{tokenizer_arg}"
         ),
     ]
@@ -133,7 +138,7 @@ def _run_lm_eval(
             return
         delegated = True
         signum, frame = received_signal
-        previous_handler = previous_handlers[signum]
+        previous_handler = previous_handlers[signal.Signals(signum)]
         if callable(previous_handler):
             previous_handler(signum, frame)
         elif previous_handler != signal.SIG_IGN:
@@ -283,7 +288,9 @@ def _parse_lm_eval_stdout(stdout: str) -> dict:
         gsm8k["exact_match,strict-match"] = strict_val
     if flex_val is not None:
         gsm8k["exact_match,flexible-extract"] = flex_val
-    gsm8k["exact_match"] = strict_val if strict_val is not None else flex_val
+    exact_match = strict_val if strict_val is not None else flex_val
+    assert exact_match is not None
+    gsm8k["exact_match"] = exact_match
     return {"results": {"gsm8k": gsm8k}}
 
 
