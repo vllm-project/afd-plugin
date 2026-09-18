@@ -273,6 +273,11 @@ registry is exposed only through the active forward context under
 `afd_mla_graph_params`; the compatibility resolver falls back to upstream
 process-global state outside that scope.
 
+This protocol belongs to the plain MLA backend alone. Upstream's sparse (SFA)
+and compressor (DSA) backends implement `update_graph_params()` as a no-op and
+register no FIA workspace, so those models, DeepSeek V4 among them, take the
+generic two-stage path with no MLA registries.
+
 The NPU V2 runner supports eager, `FULL`, and `FULL_DECODE_ONLY`. Like CUDA V2,
 it publishes descriptor-matched warmup/capture control outside formal graph
 capture and installs an instance-scoped pre-replay hook because native full

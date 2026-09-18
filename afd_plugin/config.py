@@ -17,12 +17,13 @@ if TYPE_CHECKING:
 
 AFD_ADDITIONAL_CONFIG_KEY: Final[str] = "afd"
 AFD_ASYNC_CONNECTOR: Final[str] = "CAMAsyncAFDConnector"
+CAMP2P_CONNECTOR: Final[str] = "CAMP2pAFDConnector"
 AFDRole = Literal["attention", "ffn"]
 
 SUPPORTED_AFD_ROLES: Final[tuple[str, ...]] = ("attention", "ffn")
 SUPPORTED_AFD_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pNcclAFDConnector",
-    "CAMP2pAFDConnector",
+    CAMP2P_CONNECTOR,
     AFD_ASYNC_CONNECTOR,
 )
 
@@ -335,6 +336,7 @@ __all__ = [
     "afd_config_from_mapping",
     "AFD_ADDITIONAL_CONFIG_KEY",
     "AFDRole",
+    "CAMP2P_CONNECTOR",
     "SUPPORTED_AFD_CONNECTORS",
     "SUPPORTED_AFD_ROLES",
     "connector_extra_config_from_mapping",

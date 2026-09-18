@@ -27,17 +27,30 @@ def test_dsv4_async_gate_bypasses_native_moe_communicator() -> None:
 
 
 def test_dsv4_async_gate_validates_local_hash_token_alignment() -> None:
+    """The Hash ids sent to FFN must be sliced like the router logits.
+
+    The alignment logic now lives in ``local_hash_input_ids`` so that the
+    send-side selection and this local routing path cannot drift apart. These
+    assertions are structural: the helper's numerics are covered by
+    ``tests/unit/model_executor/test_deepseek_v4_hash_ids.py``.
+    """
+
     source = Path(
         "afd_plugin/model_executor/models/npu/deepseek_v4_attention_gate.py",
     ).read_text()
 
-    assert "DSV4 Hash routing input_ids/token count mismatch on Attention" in source
-    assert "input_ids = input_ids.reshape(-1).to(torch.int64)" in source
-    assert "forward_context.flash_comm_v1_enabled" in source
-    assert "and input_ids.numel() != router_logits.shape[0]" in source
+    assert "def local_hash_input_ids(" in source
+    assert "DSV4 Hash routing cannot align the ids sent to FFN" in source
+    assert "ids = input_ids.reshape(-1).to(torch.int64)" in source
+    assert "flash_comm_v1_enabled" in source
+    assert "ids.numel() != router_tokens" in source
     assert "split_tensor_along_first_dim(" in source
-    assert "num_partitions=tp_group.world_size" in source
-    assert ")[tp_group.rank_in_group]" in source
+    assert "num_partitions=group.world_size" in source
+    assert ")[group.rank_in_group]" in source
+    # The send-side selection must reuse this helper rather than re-deriving a
+    # slice; its numerics live in test_deepseek_v4_hash_ids.py.
+    assert "def hash_input_ids_from_context(" in source
+    assert "return local_hash_input_ids(" in source
 
 
 def test_dsv4_ffn_does_not_reapply_gate_routed_scale() -> None:

@@ -559,6 +559,7 @@ def test_npu_attention_runner_installs_mla_graph_wrapper(monkeypatch):
         cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True),
     )
     runner.use_sparse = False
+    runner.use_compress = False
     runner.enable_enpu = False
 
     runner._install_ascend_ubatch_wrapper()
@@ -570,6 +571,45 @@ def test_npu_attention_runner_installs_mla_graph_wrapper(monkeypatch):
     updater = kwargs["full_graph_params_updater"]
     assert isinstance(updater, MethodType)
     assert updater.__self__ is runner
+
+
+def test_npu_attention_runner_keeps_compressor_models_off_the_mla_path(monkeypatch):
+    """DeepSeek V4 selects the DSA backend, whose graph params are a no-op."""
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    captured_kwargs: list[dict[str, object]] = []
+
+    class RecordingUBatchWrapper:
+        def __init__(self, *args: object, **kwargs: object):
+            captured_kwargs.append(kwargs)
+
+    monkeypatch.setattr(
+        attention_model_runner,
+        "AscendUBatchWrapper",
+        RecordingUBatchWrapper,
+    )
+    runner = object.__new__(
+        attention_model_runner.AFDNPUAttentionModelRunner,
+    )
+    runner.model = "model"
+    runner.device = "npu"
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(use_mla=True),
+    )
+    runner.compilation_config = SimpleNamespace(
+        cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True),
+    )
+    runner.use_sparse = False
+    runner.use_compress = True
+    runner.enable_enpu = False
+
+    runner._install_ascend_ubatch_wrapper()
+
+    # The MLA DBO full graph path requires a single-batch FIA workspace that a
+    # compressor model never registers, so those models stay on the generic
+    # two-stage path.
+    assert captured_kwargs[0]["mla_full_graph_enabled"] is False
 
 
 def test_npu_attention_runner_builds_and_sets_metadata():
@@ -2326,6 +2366,23 @@ def test_npu_feature_validation_requires_decode_only_full_graph_for_mla_dbo(
     )
     sparse_config.model_config.hf_text_config = SimpleNamespace(index_topk=8)
     fail_if_unsupported_npu_afd_features(sparse_config)
+
+    # A compressor model such as DeepSeek V4 selects the DSA backend, whose
+    # graph-params update is a no-op, so the MLA DBO full graph rules do not
+    # apply to it either.
+    compressor_config = _vllm_config(
+        use_mla=True,
+        cudagraph_mode="FULL",
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        ubatch_size=4,
+    )
+    compressor_config.model_config.hf_text_config = SimpleNamespace(
+        index_topk=512,
+        compress_ratios=[0, 4, 128],
+    )
+    fail_if_unsupported_npu_afd_features(compressor_config)
 
 
 def test_npu_feature_validation_rejects_speculative_mla_dbo_full_graph():

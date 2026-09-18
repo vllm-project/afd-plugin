@@ -244,6 +244,10 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         )
         stage_ids = sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
         rank_ffn_output = None
+        # A model whose router is keyed by token identity declares that the FFN
+        # role needs the tokens' ids. Resolve it once per forward, outside the
+        # layer loop, so a per-layer re-read cannot drift within a step.
+        recv_input_ids = getattr(self.model, "afd_requires_input_ids", False)
 
         for layer_idx in _ffn_layer_indices(self):
             for stage_idx in stage_ids:
@@ -264,6 +268,22 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     num_tokens_across_dp,
                     dp_size=int(self.vllm_config.parallel_config.data_parallel_size),
                 )
+                # A model whose router is keyed by token identity needs the ids
+                # of the tokens this rank computes on installed in the forward
+                # context before the FFN compute runs. They arrive on the
+                # transfer payload, so the receive must happen before the
+                # context is built rather than inside it.
+                payload = self.connector.recv_attn_output(
+                    ubatch_idx=stage_idx,
+                    layer_idx=layer_idx,
+                    max_num_tokens=self.max_num_tokens,
+                    recv_input_ids=recv_input_ids,
+                )
+                context = payload.context
+                metadata = context.metadata
+                states = context.states
+                hidden_states = payload.hidden_states
+                received_input_ids = payload.input_ids
                 with ascend_forward_context(
                     vllm_config=self.vllm_config,
                     afd_metadata=afd_metadata,
@@ -272,16 +292,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     num_tokens_across_dp=dp_num_tokens_across_dp,
                     in_profile_run=is_profile,
                     aclgraph_runtime_mode=aclgraph_runtime_mode,
+                    input_ids=received_input_ids,
                 ) as forward_context:
-                    payload = self.connector.recv_attn_output(
-                        ubatch_idx=stage_idx,
-                        layer_idx=layer_idx,
-                        max_num_tokens=self.max_num_tokens,
-                    )
-                    context = payload.context
-                    metadata = context.metadata
-                    states = context.states
-                    hidden_states = payload.hidden_states
                     metadata.layer_idx = layer_idx
                     metadata.stage_idx = stage_idx
                     forward_context.dp_metadata = dp_metadata_list.get(stage_idx)

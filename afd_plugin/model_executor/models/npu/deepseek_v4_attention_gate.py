@@ -9,8 +9,93 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
+    from vllm.forward_context import ForwardContext
+
     from afd_plugin.model_executor.models.npu.deepseek_v4 import (
         AFDDeepseekV4AttentionGateRemoteMoE,
+    )
+
+
+def local_hash_input_ids(
+    *,
+    input_ids: torch.Tensor | None,
+    router_tokens: int,
+    flash_comm_v1_enabled: bool,
+    pad_size: int,
+) -> torch.Tensor:
+    """Return the rank-local token ids that a Hash layer routes on.
+
+    A DSV4 Hash layer routes by token identity rather than by router logits, so
+    the FFN rank executing that layer needs the ids of exactly the tokens it
+    computes on. On Attention the forward context carries the *global* ids while
+    FlashComm v1 shards router logits across TP ranks, so the global vector must
+    receive the same padding and contiguous TP split as the logits before it can
+    be sent.
+
+    Both the local routing path and the AFD send path call this, so the ids that
+    cross the boundary describe the same tokens the Attention-side routing used.
+
+    Args:
+        input_ids: Global ids from the forward context, or ``None``.
+        router_tokens: Token count of this rank's router logits.
+        flash_comm_v1_enabled: Whether FlashComm v1 is active for this forward.
+        pad_size: FlashComm v1 padding applied to the activation.
+
+    Returns:
+        A one-dimensional ``int64`` tensor of ``router_tokens`` local ids.
+
+    Raises:
+        RuntimeError: If ids are unavailable, or if the ids do not describe
+            exactly ``router_tokens`` tokens. Both would otherwise let a
+            token-keyed router select experts for the wrong tokens.
+    """
+
+    if input_ids is None:
+        raise RuntimeError(
+            "DSV4 Hash routing requires input_ids to send towards the FFN role, "
+            "but the forward context carries none. This path routes by token "
+            "identity and has no fallback, so the runner must install the "
+            "request's input_ids before the model forward.",
+        )
+    ids = input_ids.reshape(-1).to(torch.int64)
+    if flash_comm_v1_enabled and ids.numel() != router_tokens:
+        from vllm.distributed import get_tp_group
+        from vllm_ascend.distributed.utils import split_tensor_along_first_dim
+
+        if pad_size > 0:
+            ids = torch.nn.functional.pad(ids, (0, pad_size))
+        group = get_tp_group()
+        ids = split_tensor_along_first_dim(
+            ids,
+            num_partitions=group.world_size,
+            contiguous_split_chunks=True,
+        )[group.rank_in_group]
+    if ids.numel() != router_tokens:
+        raise RuntimeError(
+            "DSV4 Hash routing cannot align the ids sent to FFN with the local "
+            f"tokens: ids={ids.numel()} router_tokens={router_tokens}",
+        )
+    return ids
+
+
+def hash_input_ids_from_context(
+    *,
+    forward_context: ForwardContext,
+    router_tokens: int,
+) -> torch.Tensor:
+    """Return the ids to send for a Hash layer, raising if the context has none.
+
+    The ids channel belongs to the transfer rather than to one layer: the FFN
+    role cannot tell a Hash layer from a non-Hash one, so it asks for ids on
+    every layer. Answering with activations alone would leave it reading an ids
+    slot the operator never wrote.
+    """
+
+    return local_hash_input_ids(
+        input_ids=forward_context.input_ids,
+        router_tokens=router_tokens,
+        flash_comm_v1_enabled=forward_context.flash_comm_v1_enabled,
+        pad_size=forward_context.pad_size,
     )
 
 
@@ -54,40 +139,12 @@ def _compute_sqrtsoftplus_topk(
         from vllm.forward_context import get_forward_context
 
         forward_context = get_forward_context()
-        input_ids = getattr(forward_context, "input_ids", None)
-        if input_ids is None:
-            raise RuntimeError(
-                "DSV4 Hash routing requires local input_ids in the forward context",
-            )
-        input_ids = input_ids.reshape(-1).to(torch.int64)
-        # FlashComm v1 shards router logits across TP ranks, but the forward
-        # context still carries global input IDs. Apply the same padding and
-        # contiguous TP split so Hash routing receives rank-local token IDs.
-        if (
-            forward_context.flash_comm_v1_enabled
-            and input_ids.numel() != router_logits.shape[0]
-        ):
-            from vllm.distributed import get_tp_group
-            from vllm_ascend.distributed.utils import (
-                split_tensor_along_first_dim,
-            )
-
-            if forward_context.pad_size > 0:
-                input_ids = torch.nn.functional.pad(
-                    input_ids,
-                    (0, forward_context.pad_size),
-                )
-            tp_group = get_tp_group()
-            input_ids = split_tensor_along_first_dim(
-                input_ids,
-                num_partitions=tp_group.world_size,
-                contiguous_split_chunks=True,
-            )[tp_group.rank_in_group]
-        if input_ids.numel() != router_logits.shape[0]:
-            raise RuntimeError(
-                "DSV4 Hash routing input_ids/token count mismatch on Attention: "
-                f"input_ids={input_ids.numel()} router_tokens={router_logits.shape[0]}",
-            )
+        input_ids = local_hash_input_ids(
+            input_ids=getattr(forward_context, "input_ids", None),
+            router_tokens=router_logits.shape[0],
+            flash_comm_v1_enabled=forward_context.flash_comm_v1_enabled,
+            pad_size=forward_context.pad_size,
+        )
         input_ids = torch.where(input_ids == -1, 0, input_ids)
         tid2eid = tid2eid.to(torch.int32)
     correction_bias = moe.gate.e_score_correction_bias

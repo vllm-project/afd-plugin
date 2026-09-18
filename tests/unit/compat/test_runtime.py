@@ -48,7 +48,12 @@ def test_fix_all2all_backend_skips_when_already_flashinfer():
 
 
 @pytest.mark.parametrize("skip_mc2_mask", [False, True])
-def test_ascend_forward_context_installs_afd_metadata(monkeypatch, skip_mc2_mask):
+@pytest.mark.parametrize("input_ids", [(11, 22, 33), None])
+def test_ascend_forward_context_installs_afd_metadata(
+    monkeypatch,
+    skip_mc2_mask,
+    input_ids,
+):
     fake_vllm = ModuleType("vllm")
     fake_vllm.__path__ = []
     fake_config = ModuleType("vllm.config")
@@ -122,10 +127,15 @@ def test_ascend_forward_context_installs_afd_metadata(monkeypatch, skip_mc2_mask
         num_tokens=3,
         in_profile_run=True,
         skip_mc2_mask=skip_mc2_mask,
+        input_ids=input_ids,
     ) as current_forward_context:
         assert current_forward_context is forward_context
         assert forward_context.additional_kwargs["afd_metadata"] is afd_metadata
         assert forward_context.mc2_mask is (None if skip_mc2_mask else original_mask)
+        if input_ids is None:
+            assert not hasattr(forward_context, "input_ids")
+        else:
+            assert forward_context.input_ids is input_ids
 
     assert calls == [
         {
@@ -219,6 +229,7 @@ def test_ascend_forward_context_uses_native_mrv2_layout(monkeypatch):
     afd_metadata = SimpleNamespace()
     model_instance = SimpleNamespace()
     num_tokens_across_dp = SimpleNamespace()
+    input_ids = (11, 22, 33)
     with ascend_runtime.ascend_forward_context(
         vllm_config=vllm_config,
         afd_metadata=afd_metadata,
@@ -227,10 +238,12 @@ def test_ascend_forward_context_uses_native_mrv2_layout(monkeypatch):
         num_tokens_across_dp=num_tokens_across_dp,
         in_profile_run=True,
         skip_mc2_mask=True,
+        input_ids=input_ids,
     ) as current_forward_context:
         assert current_forward_context is forward_context
         assert forward_context.additional_kwargs["afd_metadata"] is afd_metadata
         assert forward_context.additional_kwargs["model_instance"] is model_instance
+        assert forward_context.input_ids is input_ids
 
     assert profile_calls == [True]
     assert context_calls == [

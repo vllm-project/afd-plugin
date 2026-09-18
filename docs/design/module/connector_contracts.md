@@ -184,7 +184,11 @@ are resolved.
 
 Model-specific tensors remain explicit payload fields rather than transfer
 state. P2P can send optional router logits and one-dimensional, token-aligned
-`torch.int32` input IDs after hidden states. FFN requests only the fields its
+`torch.int32` input IDs after hidden states. CAMP2P sends the same ids through
+the A2E operator's ids channel, which the receiving FFN rank selects with
+`recv_input_ids`; both roles derive that mode from the model's
+`afd_requires_input_ids` declaration, because the operator only writes the ids
+slot in the mode the sender chose. FFN requests only the fields its
 model declares, concatenates them with the same per-peer token order as hidden
 states, and returns them in `AFDA2FTransferPayload`. The input-ID path supports
 DeepSeek V4's native hash router and has graph-stable receive buffers; it does

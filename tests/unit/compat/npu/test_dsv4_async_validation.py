@@ -24,14 +24,25 @@ def _afd_config(
     )
 
 
-def test_dsv4_rejects_camp2p_connector() -> None:
-    with pytest.raises(RuntimeError, match="only CAMAsyncAFDConnector"):
+def test_dsv4_rejects_connectors_without_a_token_id_channel() -> None:
+    with pytest.raises(RuntimeError, match="supports only CAMAsyncAFDConnector"):
         _fail_if_unsupported_dsv4_connector(
             _afd_config(
                 compute_gate_on_attention=False,
-                connector="CAMP2pAFDConnector",
+                connector="P2pNcclAFDConnector",
             ),
         )
+
+
+def test_dsv4_accepts_the_camp2p_connector() -> None:
+    """CAMP2P carries the Hash ids over the A2E ids channel with the gate on FFN."""
+
+    _fail_if_unsupported_dsv4_connector(
+        _afd_config(
+            compute_gate_on_attention=False,
+            connector="CAMP2pAFDConnector",
+        ),
+    )
 
 
 def test_dsv4_async_requires_attention_side_gate() -> None:

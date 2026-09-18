@@ -1580,14 +1580,23 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             runtime_mode = CUDAGraphMode.FULL
         elif self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             runtime_mode = CUDAGraphMode.FULL
+        # Only the plain MLA backend owns the merged graph-params registry.
+        # The sparse (SFA) and compressor (DSA) backends define upstream's
+        # update_graph_params as a no-op and register no FIA workspace, which is
+        # why upstream itself skips its graph-params update for them. A
+        # compressor model such as DeepSeek V4 therefore takes the generic
+        # two-stage path instead of the MLA one.
+        mla_full_graph_enabled = (
+            self.vllm_config.model_config.use_mla
+            and not self.use_sparse
+            and not self.use_compress
+        )
         self.model = AscendUBatchWrapper(
             model,
             self.vllm_config,
             runtime_mode,
             self.device,
-            mla_full_graph_enabled=(
-                self.vllm_config.model_config.use_mla and not self.use_sparse
-            ),
+            mla_full_graph_enabled=mla_full_graph_enabled,
             full_graph_params_updater=self._update_full_graph_params_if_needed,
             enable_enpu=self.enable_enpu,
         )
