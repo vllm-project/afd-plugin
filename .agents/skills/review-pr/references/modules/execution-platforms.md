@@ -6,9 +6,10 @@ head.
 Use for NPU/GPU selection and platform mechanics: `validation.py`
 (`assert_compatible_afd_stack`,
 `afd_worker_qualname_for_platform_default`), `setup.py` Ascend-op build
-gating, and `csrc/` (a2e/e2a ACLNN operators, `aclnn_torch_adapter`,
-`torch_extension` → `afd_plugin._C_ascend`). Does not own connector behavior
-or the deferred NPU patch application ([npu-compat.md](npu-compat.md)).
+gating, and `csrc/npu/` (`ascend_kernels/` a2e/e2a ACLNN operators under the
+`npu_op_*` build system, `pybind/` → `afd_plugin._C_ascend`, and the build
+drivers in `scripts/`). Does not own connector behavior or the deferred NPU
+patch application ([npu-compat.md](npu-compat.md)).
 
 ## Contract checks
 

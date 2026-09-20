@@ -112,7 +112,7 @@ class BuildAscendOps(build_ext):
 ext_modules = []
 if _should_build_ascend_ops():
     ext_modules.append(
-        CMakeExtension("afd_plugin._C_ascend", "csrc/npu/torch_extension"),
+        CMakeExtension("afd_plugin._C_ascend", "csrc/npu/pybind"),
     )
 
 

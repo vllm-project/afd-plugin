@@ -20,18 +20,21 @@ case "$SOC_VERSION" in
     ;;
 esac
 
-cd "${ROOT_DIR}/csrc/npu"
-rm -rf build output
+NPU_CSRC_DIR="${ROOT_DIR}/csrc/npu"
+rm -rf "${NPU_CSRC_DIR}/build" "${NPU_CSRC_DIR}/output"
 echo "building AFD ACLNN custom ops a2e;e2a for ${SOC_ARG}"
-bash build.sh -n "a2e;e2a" -c "${SOC_ARG}"
+bash "${NPU_CSRC_DIR}/scripts/compile_ascend_proj.sh" \
+  "${NPU_CSRC_DIR}" \
+  "${SOC_ARG}" \
+  "${CMAKE_BUILD_TYPE:-Release}" \
+  "${NPU_CSRC_DIR}/output"
 
 INSTALL_PATH="${ROOT_DIR}/afd_plugin/_cann_ops_custom"
 rm -rf "${INSTALL_PATH}"
 mkdir -p "${INSTALL_PATH}"
-shopt -s nullglob
-run_files=(./output/CANN-custom_ops*.run)
-if [ "${#run_files[@]}" -ne 1 ]; then
-  echo "expected one CANN-custom_ops installer under output/, found ${#run_files[@]}"
+run_file="${NPU_CSRC_DIR}/output/AFD_${SOC_ARG}.run"
+if [ ! -f "${run_file}" ]; then
+  echo "expected run package at ${run_file} but it is missing"
   exit 1
 fi
-"${run_files[0]}" --install-path="${INSTALL_PATH}"
+"${run_file}" --install-path="${INSTALL_PATH}"
