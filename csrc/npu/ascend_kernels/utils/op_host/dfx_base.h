@@ -1,0 +1,133 @@
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * Description: dfx_base implementation
+ * Create: 2026-01-23
+ * Note:
+ * History: 2026-01-23 create dfx_base file
+ */
+
+#ifndef DFX_BASE_H
+#define DFX_BASE_H
+
+#include <string>
+#include <cstdint>
+#include <sstream>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <securec.h>
+#include <base/alog_pub.h>
+#include <base/err_msg.h>
+#include <exe_graph/runtime/tiling_context.h>
+#include <exe_graph/runtime/tiling_parse_context.h>
+#include <exe_graph/runtime/infer_shape_context.h>
+#include <exe_graph/runtime/infer_datatype_context.h>
+
+namespace ops {
+namespace utils {
+class DfxBase {
+public:
+    static constexpr const int MAX_LOG_LEN = 16000;
+    static constexpr const int MSG_HDR_LEN = 200;
+
+    static inline uint64_t GetTid()
+    {
+        return static_cast<uint64_t>(syscall(__NR_gettid));
+    }
+
+    static inline std::string GetOpInfo(const std::string &str)
+    {
+        return str;
+    }
+
+    static inline std::string GetOpInfo(const gert::TilingContext *context)
+    {
+        return GetOpInfoFromContext(context);
+    }
+
+    static inline std::string GetOpInfo(const gert::TilingParseContext *context)
+    {
+        return GetOpInfoFromContext(context);
+    }
+
+    static inline std::string GetOpInfo(const gert::InferShapeContext *context)
+    {
+        return GetOpInfoFromContext(context);
+    }
+
+    static inline std::string GetOpInfo(const gert::InferDataTypeContext *context)
+    {
+        return GetOpInfoFromContext(context);
+    }
+
+private:
+    template <class T>
+    static inline std::string GetOpInfoFromContext(T context)
+    {
+        if (context == nullptr) {
+            return "nil:nil";
+        }
+        std::string opInfo = context->GetNodeType() != nullptr ? context->GetNodeType() : "nil";
+        opInfo += ":";
+        opInfo += context->GetNodeName() != nullptr ? context->GetNodeName() : "nil";
+        return opInfo;
+    }
+};
+
+}  // namespace utils
+
+template <typename T>
+std::string Shape2String(const T &shape)
+{
+    std::ostringstream oss;
+    oss << "[";
+    if (shape.GetDimNum() > 0) {
+        for (size_t i = 0; i < shape.GetDimNum() - 1; ++i) {
+            oss << shape.GetDim(i) << ", ";
+        }
+        oss << shape.GetDim(shape.GetDimNum() - 1);
+    }
+    oss << "]";
+    return oss.str();
+}
+}  // namespace ops
+
+#define OPS_LOG_STUB(MOD_ID, LOG_LEVEL, OPS_DESC, FMT, ...)                                                          \
+    do {                                                                                                             \
+        if (AlogCheckDebugLevel(static_cast<int>(MOD_ID), (LOG_LEVEL)) == 1) {                                       \
+            std::string op_info_tmp = ops::utils::DfxBase::GetOpInfo(OPS_DESC);                                      \
+            AlogRecord(static_cast<int>(MOD_ID), DLOG_TYPE_DEBUG, (LOG_LEVEL),                                       \
+                       "[%s:%d][%s]%s[%s][%lu] OpName:[%s] " #FMT, __FILE__, __LINE__, (OPS_UTILS_LOG_SUB_MOD_NAME), \
+                       (OPS_UTILS_LOG_PACKAGE_TYPE), __FUNCTION__, ops::utils::DfxBase::GetTid(),                    \
+                       op_info_tmp.c_str(), ##__VA_ARGS__);                                                          \
+        }                                                                                                            \
+    } while (0)
+
+#define OPS_LOG_STUB_IF(COND, LOG_FUNC, EXPR)                                                               \
+    static_assert(std::is_same<bool, std::decay<decltype(COND)>::type>::value, "condition should be bool"); \
+    do {                                                                                                    \
+        if (__builtin_expect((COND), 0)) {                                                                  \
+            LOG_FUNC;                                                                                       \
+            EXPR;                                                                                           \
+        }                                                                                                   \
+    } while (0)
+
+#define OPS_INNER_ERR_STUB(ERR_CODE_STR, OPS_DESC, FMT, ...)        \
+    do {                                                            \
+        OPS_LOG_STUB(OP, DLOG_ERROR, OPS_DESC, FMT, ##__VA_ARGS__); \
+        REPORT_INNER_ERR_MSG(ERR_CODE_STR, FMT, ##__VA_ARGS__);     \
+    } while (0)
+
+#define OPS_CALL_ERR_STUB(ERR_CODE_STR, OPS_DESC, FMT, ...)         \
+    do {                                                            \
+        OPS_LOG_STUB(OP, DLOG_ERROR, OPS_DESC, FMT, ##__VA_ARGS__); \
+        REPORT_INNER_ERR_MSG(ERR_CODE_STR, FMT, ##__VA_ARGS__);     \
+    } while (0)
+
+#define OPS_LOG_STUB_D(OPS_DESC, FMT, ...) OPS_LOG_STUB(OP, DLOG_DEBUG, OPS_DESC, FMT, ##__VA_ARGS__)
+#define OPS_LOG_STUB_I(OPS_DESC, FMT, ...) OPS_LOG_STUB(OP, DLOG_INFO, OPS_DESC, FMT, ##__VA_ARGS__)
+#define OPS_LOG_STUB_W(OPS_DESC, FMT, ...) OPS_LOG_STUB(OP, DLOG_WARN, OPS_DESC, FMT, ##__VA_ARGS__)
+#define OPS_LOG_STUB_E(OPS_DESC, FMT, ...) OPS_LOG_STUB(OP, DLOG_ERROR, OPS_DESC, FMT, ##__VA_ARGS__)
+#define OPS_LOG_STUB_EVENT(OPS_DESC, FMT, ...) OPS_LOG_STUB(OP, DLOG_EVENT, OPS_DESC, FMT, ##__VA_ARGS__)
+
+#endif // DFX_BASE_H

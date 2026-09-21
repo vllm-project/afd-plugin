@@ -46,6 +46,7 @@ set(AFD_CANN_OPS_DIR "${AFD_PLUGIN_ROOT}/afd_plugin/_cann_ops_custom/vendors/afd
 pybind11_add_module(afd_plugin_ascend_C
   "${CMAKE_CURRENT_LIST_DIR}/torch_binding.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/torch_binding_meta.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/torch_binding_gmm_swiglu_quant.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/pytorch_extension/NPUBridge.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/pytorch_extension/NPUStorageImpl.cpp")
 

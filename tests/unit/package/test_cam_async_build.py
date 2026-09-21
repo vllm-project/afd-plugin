@@ -123,9 +123,15 @@ def test_selected_cam_sources_do_not_overwrite_other_operators_when_staged():
     for part in ("op_api", "op_host", "op_kernel"):
         staged: dict[str, Path] = {}
         for operator in ("utils", *result.stdout.split()):
-            for path in (root / operator / part).glob("*"):
-                assert path.is_file(), f"Build staging expects flat sources: {path}"
-                previous = staged.setdefault(path.name, path)
+            part_dir = root / operator / part
+            for path in part_dir.rglob("*"):
+                if not path.is_file():
+                    # Nested subdirectories (e.g. op_host/op_tiling/) are copied
+                    # recursively by the build driver; only file collisions
+                    # matter for the staging check.
+                    continue
+                rel = path.relative_to(part_dir).as_posix()
+                previous = staged.setdefault(rel, path)
                 assert previous.read_bytes() == path.read_bytes(), (
                     f"{path} overwrites different contents from {previous}"
                 )

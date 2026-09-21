@@ -7,7 +7,8 @@
       "afd_async_dispatch_send",
       "afd_async_dispatch_recv",
       "afd_async_combine_send",
-      "afd_async_combine_recv"
+      "afd_async_combine_recv",
+      "grouped_matmul_swiglu_quant_v2_layered"
     ],
     "ascend950": [
       "a2e",
@@ -31,6 +32,9 @@
       "requires_shmem": false
     },
     "afd_async_combine_recv": {
+      "requires_shmem": false
+    },
+    "grouped_matmul_swiglu_quant_v2_layered": {
       "requires_shmem": false
     }
   }

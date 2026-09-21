@@ -274,6 +274,7 @@ def _run_select_ops(*args: str) -> subprocess.CompletedProcess[str]:
                 "afd_async_dispatch_recv",
                 "afd_async_combine_send",
                 "afd_async_combine_recv",
+                "grouped_matmul_swiglu_quant_v2_layered",
             ],
         ),
         ("ascend950", ["a2e", "e2a"]),

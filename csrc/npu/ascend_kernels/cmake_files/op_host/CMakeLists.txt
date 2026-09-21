@@ -52,8 +52,48 @@ if(DEFINED ASCEND_COMPUTE_UNIT AND "${ASCEND_COMPUTE_UNIT}" MATCHES "ascend950")
     message(STATUS ">>> [op_host] ascend950 detected, defined AFD_TILING_HAS_COMM_ENGINE")
 endif()
 
-# Collect all host-side source files
-aux_source_directory(${CMAKE_CURRENT_SOURCE_DIR} ops_srcs)
+# =====================================================
+# Host-side include paths
+# =====================================================
+# The grouped_matmul_swiglu_quant_v2_layered op_host/op_api sources use the
+# l0op composite pattern and CANN op_common headers that resolve outside the
+# canonical ASCEND_HOME_PATH/include tree. Add the pkg_inc and aclnn include
+# directories to both the in-tree compile (include_directories) and the
+# separate npu_op_code_gen process (CODE_GEN_COMPILE_OPTS), mirroring the
+# upstream cam comm_operator op_host build.
+set(CANN_ARCH_DIR "")
+foreach(cand "aarch64-linux" "x86_64-linux" "linux")
+    if(EXISTS "${CANN_ROOT}/${cand}/pkg_inc/op_common")
+        set(CANN_ARCH_DIR "${CANN_ROOT}/${cand}")
+        break()
+    endif()
+endforeach()
+if(NOT "${CANN_ARCH_DIR}" STREQUAL "")
+    include_directories("${CANN_ARCH_DIR}/pkg_inc/op_common")
+    list(APPEND CODE_GEN_COMPILE_OPTS -I${CANN_ARCH_DIR}/pkg_inc/op_common)
+    # migrated op_host sources include "util/math_util.h"
+    # (pkg_inc/op_common/op_host/util)
+    if(EXISTS "${CANN_ARCH_DIR}/pkg_inc/op_common/op_host")
+        include_directories("${CANN_ARCH_DIR}/pkg_inc/op_common/op_host")
+        list(APPEND CODE_GEN_COMPILE_OPTS -I${CANN_ARCH_DIR}/pkg_inc/op_common/op_host)
+    endif()
+    # log/log.h includes "op_common/op_host/util/opbase_export.h" and "dlog_pub.h"
+    if(EXISTS "${CANN_ARCH_DIR}/pkg_inc")
+        include_directories("${CANN_ARCH_DIR}/pkg_inc")
+        list(APPEND CODE_GEN_COMPILE_OPTS -I${CANN_ARCH_DIR}/pkg_inc)
+    endif()
+    if(EXISTS "${CANN_ARCH_DIR}/pkg_inc/base")
+        include_directories("${CANN_ARCH_DIR}/pkg_inc/base")
+        list(APPEND CODE_GEN_COMPILE_OPTS -I${CANN_ARCH_DIR}/pkg_inc/base)
+    endif()
+endif()
+if(EXISTS "${CANN_ROOT}/include/aclnn")
+    include_directories("${CANN_ROOT}/include/aclnn")
+    list(APPEND CODE_GEN_COMPILE_OPTS -I${CANN_ROOT}/include/aclnn)
+endif()
+
+# Collect all host-side source files recursively.
+file(GLOB_RECURSE ops_srcs "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
 # =====================================================
 # Step 1: Generate ACLNN stubs, op_proto.cc, fallback files
@@ -83,6 +123,13 @@ file(GLOB aclnn_src ${ASCEND_AUTOGEN_PATH}/aclnn*.cpp)
 npu_op_library(cust_opapi ACLNN
     ${aclnn_src}
 )
+# The grouped_matmul_swiglu_quant_v2_layered aclnn sources use the l0op
+# composite pattern (l0op::Contiguous / ReFormat / TransData / ViewCopy live in
+# the CANN built-in libopapi.so). The ACLNN target template only links
+# nnopbase/ascendcl, so add libopapi as a direct dependency: it becomes a
+# DT_NEEDED entry of libcust_opapi.so and the loader resolves the l0op builtins
+# from it no matter whether torch_npu has libopapi in the global dlopen scope.
+target_link_libraries(cust_opapi PRIVATE opapi)
 target_compile_options(cust_opapi PRIVATE
     -fvisibility=hidden
 )
