@@ -191,7 +191,17 @@ class P2pNcclAFDConnector(AFDConnectorBase):
         self.dst_list = list(self.mapping.dp_metadata_destinations)
         text_config = vllm_config.model_config.hf_text_config
         self.num_hidden_layers = (text_config.num_hidden_layers,)
-        self.hidden_size = text_config.hidden_size
+        # Width of the tensors crossing the AFD wire. Attention-role gates
+        # for latent-MoE models (e.g. Kimi K3) transfer the down-projected
+        # routed latent instead of the model hidden states, which halves the
+        # bytes per direction; every other model transfers hidden states.
+        routed_expert_hidden_size = getattr(
+            text_config, "routed_expert_hidden_size", None
+        )
+        if afd_config.compute_gate_on_attention and routed_expert_hidden_size:
+            self.hidden_size = routed_expert_hidden_size
+        else:
+            self.hidden_size = text_config.hidden_size
         self.dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] = {}
         self.is_graph_capturing = False
         self.is_warmup = False

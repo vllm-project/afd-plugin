@@ -7,7 +7,11 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import TYPE_CHECKING, Literal
 
-from afd_plugin import _MODEL_REGISTRATIONS, _QWEN3_5_MODEL_REGISTRATIONS
+from afd_plugin import (
+    _KIMI_MODEL_REGISTRATIONS,
+    _MODEL_REGISTRATIONS,
+    _QWEN3_5_MODEL_REGISTRATIONS,
+)
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -34,6 +38,11 @@ def get_afd_model_config(
             if model_arch in _QWEN3_5_MODEL_REGISTRATIONS and device_type != "cuda":
                 raise ValueError(
                     "AFD Qwen3.5/3.6 supports CUDA execution only; "
+                    f"got device_type={device_type!r}",
+                )
+            if model_arch in _KIMI_MODEL_REGISTRATIONS and device_type != "cuda":
+                raise ValueError(
+                    "AFD Kimi K3 supports CUDA execution only; "
                     f"got device_type={device_type!r}",
                 )
             # deepcopy preserves aliasing within the copied object graph, so

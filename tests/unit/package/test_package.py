@@ -58,6 +58,7 @@ def test_qwen3_moe_afd_model_registration_path_is_lazy_string():
         **afd_plugin._DEEPSEEK_MODEL_REGISTRATIONS,
         **registrations,
         **afd_plugin._QWEN3_5_MODEL_REGISTRATIONS,
+        **afd_plugin._KIMI_MODEL_REGISTRATIONS,
     } == afd_plugin._MODEL_REGISTRATIONS
 
 
@@ -67,6 +68,16 @@ def test_qwen3_5_afd_model_registration_path_is_lazy_string():
     assert registrations["Qwen3_5MoeForConditionalGeneration"] == (
         "afd_plugin.model_executor.models.qwen3_5:AFDQwen3_5MoeForConditionalGeneration"
     )
+
+
+def test_kimi_afd_model_registration_path_is_lazy_string():
+    registrations = afd_plugin._KIMI_MODEL_REGISTRATIONS
+
+    assert registrations == {
+        "KimiK3ForConditionalGeneration": (
+            "afd_plugin.model_executor.models.kimi_k3:AFDKimiK3ForConditionalGeneration"
+        )
+    }
 
 
 def test_merged_model_registrations_include_both_qwen_families():
@@ -122,6 +133,19 @@ def test_register_afd_does_not_replace_native_qwen3_5_model():
     assert native_registration.module_name == "vllm.model_executor.models.qwen3_5"
     assert native_registration.class_name == "Qwen3_5MoeForConditionalGeneration"
     assert "AFDQwen3_5MoeForConditionalGeneration" in ModelRegistry.models
+
+
+def test_register_afd_does_not_replace_native_kimi_k3_model():
+    pytest.importorskip("vllm")
+    pytest.importorskip("vllm.models.kimi_k3")
+    from vllm.model_executor.models import ModelRegistry
+
+    afd_plugin.register_afd()
+
+    native_registration = ModelRegistry.models["KimiK3ForConditionalGeneration"]
+    assert native_registration.module_name == "vllm.models.kimi_k3"
+    assert native_registration.class_name == "KimiK3ForConditionalGeneration"
+    assert "AFDKimiK3ForConditionalGeneration" in ModelRegistry.models
 
 
 def test_register_afd_does_not_replace_native_deepseek_v4_model():
@@ -263,6 +287,40 @@ def test_afd_model_config_rejects_qwen_architecture_on_npu():
     assert model_config.hf_config.architectures == [
         "Qwen3_5MoeForConditionalGeneration"
     ]
+
+
+def test_afd_model_config_maps_kimi_architecture_on_cuda():
+    pytest.importorskip("vllm")
+    from afd_plugin.model_executor.models.model_utils import get_afd_model_config
+
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            architectures=["KimiK3ForConditionalGeneration"],
+        ),
+    )
+
+    afd_model_config = get_afd_model_config(model_config, device_type="cuda")
+
+    assert afd_model_config.hf_config.architectures == [
+        "AFDKimiK3ForConditionalGeneration"
+    ]
+    assert model_config.hf_config.architectures == ["KimiK3ForConditionalGeneration"]
+
+
+def test_afd_model_config_rejects_kimi_architecture_on_npu():
+    pytest.importorskip("vllm")
+    from afd_plugin.model_executor.models.model_utils import get_afd_model_config
+
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            architectures=["KimiK3ForConditionalGeneration"],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Kimi K3 supports CUDA execution only"):
+        get_afd_model_config(model_config, device_type="npu")
+
+    assert model_config.hf_config.architectures == ["KimiK3ForConditionalGeneration"]
 
 
 def test_afd_model_config_preserves_unknown_architecture():

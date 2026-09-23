@@ -131,11 +131,20 @@ _QWEN3_5_MODEL_REGISTRATIONS = MappingProxyType(
     }
 )
 
+_KIMI_MODEL_REGISTRATIONS = MappingProxyType(
+    {
+        "KimiK3ForConditionalGeneration": (
+            "afd_plugin.model_executor.models.kimi_k3:AFDKimiK3ForConditionalGeneration"
+        ),
+    }
+)
+
 _MODEL_REGISTRATIONS = MappingProxyType(
     {
         **_DEEPSEEK_MODEL_REGISTRATIONS,
         **_QWEN_MODEL_REGISTRATIONS,
         **_QWEN3_5_MODEL_REGISTRATIONS,
+        **_KIMI_MODEL_REGISTRATIONS,
     }
 )
 
@@ -219,6 +228,7 @@ __all__ = [
     "parse_optional_afd_config",
     "__version__",
     "_DEEPSEEK_MODEL_REGISTRATIONS",
+    "_KIMI_MODEL_REGISTRATIONS",
     "_MODEL_REGISTRATIONS",
     "_QWEN_MODEL_REGISTRATIONS",
     "_QWEN3_5_MODEL_REGISTRATIONS",
