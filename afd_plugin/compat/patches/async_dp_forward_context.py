@@ -6,7 +6,7 @@ This module patches:
 1. ``vllm.forward_context.set_forward_context``
 
 Why:
-    vLLM 0.26.0 constructs ``DPMetadata`` and coordinates token counts across
+    vLLM 0.30.0 constructs ``DPMetadata`` and coordinates token counts across
     MoE DP ranks whenever DP size is greater than one. AFD async-DP uses the
     connector data flow instead of vLLM's DP metadata control plane, so those
     all-reduce and metadata paths must be skipped for the AFD async connector.
@@ -183,6 +183,7 @@ def set_forward_context(
                 forward_stats = []
                 for bs, times in forward_context_module.batchsize_forward_time.items():
                     if len(times) <= 1:
+                        # can be cudagraph / profiling run
                         continue
                     medium = forward_context_module.torch.quantile(
                         forward_context_module.torch.tensor(times),
