@@ -684,7 +684,7 @@ def test_v2_capture_publishes_two_descriptor_events_outside_graph_body(
             cudagraph_runtime_mode=CUDAGraphMode.FULL,
         )
 
-    def native_capture(self):
+    def native_capture(self, *, profile_only=False):
         nonlocal in_graph_body
         for desc in descriptors:
             for _ in (True, False):
@@ -804,7 +804,7 @@ def test_v2_capture_restores_symbol_and_sidecars_on_failure(monkeypatch, failure
             cudagraph_runtime_mode=CUDAGraphMode.FULL,
         )
 
-    def native_capture(self):
+    def native_capture(self, *, profile_only=False):
         cudagraph_utils.prepare_inputs_to_capture(
             descriptor.num_reqs,
             descriptor.num_tokens,
@@ -880,7 +880,7 @@ def test_v2_capture_source_drift_fails_loud_and_restores(
         original_calls.append((num_reqs, num_tokens))
         return "attention-state"
 
-    def native_capture(self):
+    def native_capture(self, *, profile_only=False):
         for num_reqs, num_tokens in calls:
             cudagraph_utils.prepare_inputs_to_capture(
                 num_reqs,

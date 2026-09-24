@@ -61,7 +61,14 @@ def construction_env(monkeypatch):
     }
 
     def bind(stage_type):
-        return lambda *args, **kwargs: stage_type(calls, *args, **kwargs)
+        # vLLM 0.30 resolves MoE layers with isinstance() (e.g.
+        # is_model_fused_shared_expert_compatible), so the native stand-ins
+        # must be real classes, not callable factories.
+        class _BoundStage(stage_type):
+            def __init__(self, *args, **kwargs):
+                super().__init__(calls, *args, **kwargs)
+
+        return _BoundStage
 
     attention_type = _stage_type("attention")
     dense_type = _stage_type("dense")

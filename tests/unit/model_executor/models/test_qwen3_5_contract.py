@@ -400,11 +400,14 @@ def test_qwen_text_only_uses_upstream_missing_vision_tower_stage(monkeypatch):
             self.weight = nn.Parameter(torch.ones(1))
 
     multimodal_config = MultiModalConfig(language_model_only=True)
+    # vLLM 0.30 _mark_tower_model resolves the MM config through the
+    # ModelConfig method rather than the raw attribute.
     model_config = SimpleNamespace(
         hf_config=SimpleNamespace(
             vision_config=SimpleNamespace(out_hidden_size=8),
         ),
         multimodal_config=multimodal_config,
+        get_multimodal_config=lambda: multimodal_config,
     )
     vllm_config = SimpleNamespace(
         lora_config=None,
