@@ -582,6 +582,15 @@ def test_ffn_runner_requires_dp_metadata_list():
         runner.execute_model()
 
 
+def test_ffn_runner_profiles_zero_cudagraph_memory():
+    """vLLM 0.30.0 Worker.determine_available_memory calls this on CUDA when
+    CUDA graphs are enabled; FFN graphs are captured lazily from the connector
+    loop into their own pool, so the engine estimate must stay zero."""
+
+    runner = object.__new__(GPUFFNModelRunner)
+    assert GPUFFNModelRunner.profile_cudagraph_memory(runner) == 0
+
+
 def test_ffn_runner_makes_original_style_graph_key():
     key = make_ffn_graph_key(
         {

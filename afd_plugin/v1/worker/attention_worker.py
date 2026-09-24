@@ -45,15 +45,18 @@ class AFDAttentionWorker(Worker):
             is_driver_worker,
         )
 
-    # Patch reason: vLLM 0.26.0 constructs its runner inside Worker.init_device
+    # Patch reason: vLLM 0.30.0 constructs its runner inside Worker.init_device
     # after an internal module import, with no injectable runner factory.
     # Patch functionality: validate the supported V2 contract, select the AFD model
     # identity before construction, and scope the module-class substitution to
     # the delegated native initialization window.
-    # Signature: matches vLLM v0.26.0 Worker.init_device exactly: (self).
+    # Signature: matches vLLM v0.30.0 Worker.init_device exactly: (self).
     # Upstream source: vllm/v1/worker/gpu_worker.py, Worker.init_device;
     # runner local-import/construct seam; commit
-    # 568afb3a13806beb53bb2e6bd518269357b237c0.
+    # ced6857afa0ea7b2e3f0846a62e1394e90f15607. The 0.30.0 init_device still
+    # local-imports GPUModelRunnerV1 from vllm.v1.worker.gpu_model_runner and
+    # GPUModelRunnerV2 from vllm.v1.worker.gpu.model_runner before construction,
+    # so the module-attribute substitutions stay effective.
     # Delegation exception: the large native device/distributed setup remains
     # in super().init_device(); only this missing runner-factory seam is local.
     # Removal/upstream plan: delete this substitution when vLLM adds runner

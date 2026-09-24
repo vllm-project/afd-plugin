@@ -650,6 +650,7 @@ def test_v2_capture_publishes_two_descriptor_events_outside_graph_body(
     descriptors = [_capture_descriptor(1, 8), _capture_descriptor(2, 16)]
     runner.cudagraph_manager = SimpleNamespace(
         _capture_descs={CUDAGraphMode.FULL: descriptors},
+        _max_full_descs_to_capture=None,
     )
     in_graph_body = False
     payloads = []
@@ -668,8 +669,8 @@ def test_v2_capture_publishes_two_descriptor_events_outside_graph_body(
 
     runner.connector = CaptureConnector(events)
 
-    def original_prepare(*args):
-        prepare_calls.append((args[0], args[1]))
+    def original_prepare(num_reqs, num_tokens, *args, **kwargs):
+        prepare_calls.append((num_reqs, num_tokens))
         return f"attention-state-{len(prepare_calls)}"
 
     original_create = afd_forward_context.forward_context_module.create_forward_context
@@ -695,6 +696,7 @@ def test_v2_capture_publishes_two_descriptor_events_outside_graph_body(
                     None,
                     [],
                     None,
+                    True,
                 )
                 assert state == f"attention-state-{len(prepare_calls)}"
                 events.append("graph_enter")
@@ -773,6 +775,7 @@ def test_v2_capture_restores_symbol_and_sidecars_on_failure(monkeypatch, failure
     descriptor = _capture_descriptor(1, 8)
     runner.cudagraph_manager = SimpleNamespace(
         _capture_descs={CUDAGraphMode.FULL: [descriptor]},
+        _max_full_descs_to_capture=None,
     )
     previous_metadata = object()
     runner._afd_pending_metadata = previous_metadata
@@ -780,7 +783,7 @@ def test_v2_capture_restores_symbol_and_sidecars_on_failure(monkeypatch, failure
     runner._is_warmup = False
     runner._afd_is_graph_capturing = False
 
-    def original_prepare(*args):
+    def original_prepare(*args, **kwargs):
         if failure == "prepare":
             raise RuntimeError("prepare failed")
         return "attention-state"
@@ -810,6 +813,7 @@ def test_v2_capture_restores_symbol_and_sidecars_on_failure(monkeypatch, failure
             None,
             [],
             None,
+            True,
         )
         afd_forward_context.forward_context_module.create_forward_context()
         if failure == "forward":
@@ -859,6 +863,7 @@ def test_v2_capture_source_drift_fails_loud_and_restores(
         descriptors[0].cg_mode = CUDAGraphMode.PIECEWISE
     runner.cudagraph_manager = SimpleNamespace(
         _capture_descs={CUDAGraphMode.FULL: descriptors},
+        _max_full_descs_to_capture=None,
     )
     calls = [(1, 8), (1, 8), (2, 16), (2, 16)]
     if drift == "missing":
@@ -871,8 +876,8 @@ def test_v2_capture_source_drift_fails_loud_and_restores(
         calls[0] = (1, 9)
     original_calls = []
 
-    def original_prepare(*args):
-        original_calls.append((args[0], args[1]))
+    def original_prepare(num_reqs, num_tokens, *args, **kwargs):
+        original_calls.append((num_reqs, num_tokens))
         return "attention-state"
 
     def native_capture(self):
@@ -885,6 +890,7 @@ def test_v2_capture_source_drift_fails_loud_and_restores(
                 None,
                 [],
                 None,
+                True,
             )
         return 1
 
@@ -900,6 +906,101 @@ def test_v2_capture_source_drift_fails_loud_and_restores(
 
     assert cudagraph_utils.prepare_inputs_to_capture is original_prepare
     assert original_calls == calls[:expected_prepare_count]
+
+
+def test_v2_capture_profile_only_truncates_tracker_and_forwards_flag(monkeypatch):
+    """Mirror the 0.30.0 memory-profiling capture: the manager truncates the
+    FULL descriptor list to ``_max_full_descs_to_capture`` and the AFD wrapper
+    must forward ``profile_only`` while pairing exactly the captured subset."""
+    events: list[str] = []
+    runner = _runner_for_metadata(events)
+    descriptors = [
+        _capture_descriptor(1, 8),
+        _capture_descriptor(2, 16),
+        _capture_descriptor(3, 32),
+    ]
+    runner.cudagraph_manager = SimpleNamespace(
+        _capture_descs={CUDAGraphMode.FULL: descriptors},
+        _max_full_descs_to_capture=2,
+    )
+    forwarded_profile_only = []
+    prepare_calls = []
+
+    def original_prepare(num_reqs, num_tokens, *args, **kwargs):
+        prepare_calls.append((num_reqs, num_tokens))
+        return "attention-state"
+
+    def native_capture(self, *, profile_only=False):
+        forwarded_profile_only.append(profile_only)
+        # Native capture() truncates FULL descs the same way before pairing.
+        for desc in descriptors[: self.cudagraph_manager._max_full_descs_to_capture]:
+            for _ in (True, False):
+                cudagraph_utils.prepare_inputs_to_capture(
+                    desc.num_reqs,
+                    desc.num_tokens,
+                    None,
+                    None,
+                    None,
+                    [],
+                    None,
+                    True,
+                )
+        return 42
+
+    monkeypatch.setattr(
+        cudagraph_utils,
+        "prepare_inputs_to_capture",
+        original_prepare,
+    )
+    monkeypatch.setattr(native_v2.GPUModelRunner, "capture_model", native_capture)
+
+    assert AFDAttentionModelRunnerV2.capture_model(runner, profile_only=True) == 42
+
+    assert forwarded_profile_only == [True]
+    assert prepare_calls == [(1, 8), (1, 8), (2, 16), (2, 16)]
+    assert cudagraph_utils.prepare_inputs_to_capture is original_prepare
+
+
+def test_v2_capture_profile_only_rejects_partial_event_stream(monkeypatch):
+    """Without truncation the third descriptor's events never arrive, so the
+    wrapper must fail loudly instead of silently skipping AFD payloads."""
+    events: list[str] = []
+    runner = _runner_for_metadata(events)
+    descriptors = [_capture_descriptor(1, 8), _capture_descriptor(2, 16)]
+    runner.cudagraph_manager = SimpleNamespace(
+        _capture_descs={CUDAGraphMode.FULL: descriptors},
+        _max_full_descs_to_capture=None,
+    )
+
+    def original_prepare(num_reqs, num_tokens, *args, **kwargs):
+        return "attention-state"
+
+    def native_capture(self, *, profile_only=False):
+        # Simulates a capture that stops after the first descriptor.
+        for _ in (True, False):
+            cudagraph_utils.prepare_inputs_to_capture(
+                descriptors[0].num_reqs,
+                descriptors[0].num_tokens,
+                None,
+                None,
+                None,
+                [],
+                None,
+                True,
+            )
+        return 0
+
+    monkeypatch.setattr(
+        cudagraph_utils,
+        "prepare_inputs_to_capture",
+        original_prepare,
+    )
+    monkeypatch.setattr(native_v2.GPUModelRunner, "capture_model", native_capture)
+
+    with pytest.raises(RuntimeError, match="call count"):
+        AFDAttentionModelRunnerV2.capture_model(runner, profile_only=True)
+
+    assert cudagraph_utils.prepare_inputs_to_capture is original_prepare
 
 
 @pytest.mark.parametrize(
@@ -1202,6 +1303,8 @@ def test_v2_profile_before_graph_manager_uses_provider_without_replay_hook(
             "dummy_run": False,
             "skip_attn_for_dummy_run": False,
             "is_profile": True,
+            "context_len": 0,
+            "valid_dummy_state_slots": False,
         },
     ]
     assert events == ["control_update", "control_send", "data"]
@@ -1314,6 +1417,8 @@ def test_native_v2_dummy_profile_thin_path_uses_afd_execute_wrapper(
         dummy_run=False,
         skip_attn_for_dummy_run=False,
         is_profile=False,
+        context_len=0,
+        valid_dummy_state_slots=False,
     ):
         execute_calls.append(
             (dummy_run, skip_attn_for_dummy_run, is_profile),
@@ -1595,7 +1700,7 @@ def test_v2_load_model_initializes_connector_after_native_load(monkeypatch):
             events.append("connector_init")
             self.is_initialized = True
 
-    def native_load(self, load_dummy_weights=False):
+    def native_load(self, load_dummy_weights=False, *args, **kwargs):
         events.append(f"native_load:{load_dummy_weights}")
 
     runner = object.__new__(AFDAttentionModelRunnerV2)

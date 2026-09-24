@@ -59,13 +59,15 @@ class AFDFFNWorker(Worker):
         self._ffn_shutdown_event: threading.Event | None = None
         self._ffn_loop_error: BaseException | None = None
 
-    # Patch reason: vLLM 0.26.0 selects its V2 runner from a module-level symbol
-    # inside Worker.init_device and exposes no injectable runner factory.
+    # Patch reason: vLLM 0.30.0 selects its V2 runner from a module-level
+    # symbol inside Worker.init_device and exposes no injectable runner factory.
     # Patch functionality: replace only the V2 construction seam with the
     # existing connector-driven GPUFFNModelRunner; keep the V1 path unchanged.
-    # Signature: matches vLLM v0.26.0 Worker.init_device exactly: (self).
+    # Signature: matches vLLM v0.30.0 Worker.init_device exactly: (self).
     # Upstream source: vllm/v1/worker/gpu_worker.py, Worker.init_device;
-    # 568afb3a13806beb53bb2e6bd518269357b237c0.
+    # ced6857afa0ea7b2e3f0846a62e1394e90f15607. The 0.30.0 init_device still
+    # local-imports ``GPUModelRunner`` from vllm.v1.worker.gpu.model_runner and
+    # constructs it there, so the module-attribute substitution stays effective.
     # Delegation exception: native device and distributed setup remain in
     # super().init_device(). Remove this branch when vLLM exposes runner injection.
     # Worker initialization is synchronous within each worker process.

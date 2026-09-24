@@ -128,12 +128,6 @@ V026_OVERRIDE_CONTRACTS = [
         "ubatch_wrapper",
         "AFDUBatchWrapper",
         "UBatchWrapper",
-        "_create_sm_control_context",
-    ),
-    (
-        "ubatch_wrapper",
-        "AFDUBatchWrapper",
-        "UBatchWrapper",
         "_make_ubatch_metadata",
     ),
 ]
