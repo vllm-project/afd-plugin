@@ -124,10 +124,13 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
     """DeepSeek-V4 decoder layer with an FFN-boundary synchronous split."""
 
     # Patch reason: native DeepSeek-V4 always constructs Attention and FFN.
-    # Patch functionality: allocate only the stage owned by the active AFD role.
+    # Patch functionality: allocate only the stage owned by the active AFD role
+    # and pin sequence parallelism off (the native derivation would enable SP
+    # for AFD DP>1 layouts, which the synchronous AFD boundary does not
+    # support).
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/models/deepseek_v4/nvidia/model.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.30.0, vllm/models/deepseek_v4/nvidia/model.py
+    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
     def __init__(
         self,
         vllm_config,
@@ -139,6 +142,9 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         nn.Module.__init__(self)
         afd_config = parse_afd_config(vllm_config, validate=False)
         layer_idx = int(prefix.rsplit(".", maxsplit=1)[-1])
+        # Native derives SP from the EP/TP/DP layout; AFD splits roles across
+        # dedicated workers and requires full-token boundary payloads.
+        self.use_sequence_parallel = False
         # ### PATCH END
 
         config = vllm_config.model_config.hf_config
@@ -156,7 +162,12 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             self.ffn = RemoteDeepseekV4FFN(layer_idx=layer_idx)
         elif afd_config.role == "ffn":
             self.attn = native.PPMissingLayer()
-            self.ffn = native.DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
+            self.ffn = native.DeepseekV4MoE(
+                vllm_config,
+                prefix=f"{prefix}.ffn",
+                use_sequence_parallel=self.use_sequence_parallel,
+                num_hash_layers=config.num_hash_layers,
+            )
         else:
             raise ValueError(f"unsupported AFD role {afd_config.role!r}")
         # ### PATCH END
@@ -198,13 +209,63 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             torch.empty(3, dtype=torch.float32),
             requires_grad=False,
         )
+        if vllm_config.kernel_config.enable_jit_warmup:
+            # MHC pre/post kernels execute only on the Attention role; the FFN
+            # role returns above without mHC state, so it skips the warmup.
+            from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+                _HC_PRENORM_GEMM_TILELANG_KERNEL,
+                _MHC_FUSED_TILELANG_KERNEL,
+                _MHC_POST_TILELANG_KERNEL,
+                _MHC_PRE_BIG_FUSE_TILELANG_KERNEL,
+            )
+            from vllm.utils.deep_gemm import is_deep_gemm_supported
+
+            include_pre_gemm_splits = is_deep_gemm_supported()
+            _MHC_PRE_BIG_FUSE_TILELANG_KERNEL.register_warmup(
+                vllm_config,
+                hidden_size=self.hidden_size,
+                hc_mult=self.hc_mult,
+                use_norm_weight=True,
+                include_pre_gemm_splits=include_pre_gemm_splits,
+                include_broadcast_splits=(
+                    native.get_pp_group().is_first_rank and layer_idx == 0
+                ),
+                rms_eps=self.rms_norm_eps,
+                hc_pre_eps=self.hc_eps,
+                hc_sinkhorn_eps=self.hc_eps,
+                hc_post_mult_value=self.hc_post_alpha,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+                norm_eps=(
+                    self.attn_norm.variance_epsilon,
+                    self.ffn_norm.variance_epsilon,
+                ),
+                broadcast_norm_eps=self.attn_norm.variance_epsilon,
+            )
+            if not include_pre_gemm_splits:
+                _HC_PRENORM_GEMM_TILELANG_KERNEL.register_warmup(
+                    vllm_config,
+                    hidden_size=self.hidden_size,
+                    hc_mult=self.hc_mult,
+                    n_out=self.hc_mult * (2 + self.hc_mult),
+                )
+            _MHC_POST_TILELANG_KERNEL.register_warmup(
+                hidden_size=self.hidden_size,
+                hc_mult=self.hc_mult,
+            )
+            _MHC_FUSED_TILELANG_KERNEL.register_warmup(
+                vllm_config,
+                hidden_size=self.hidden_size,
+                hc_mult=self.hc_mult,
+            )
 
     # Patch reason: native forward directly invokes its locally allocated FFN.
     # Patch functionality: preserve native mHC state locally while the proxy
-    # transfers only the two-dimensional FFN activation and input IDs.
+    # transfers only the two-dimensional FFN activation and input IDs. The
+    # v0.30.0 native sequence-parallel gather/scatter branches around the
+    # attention call are omitted because AFD pins use_sequence_parallel off.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/models/deepseek_v4/nvidia/model.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.30.0, vllm/models/deepseek_v4/nvidia/model.py
+    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
     def forward(
         self,
         x: torch.Tensor,
@@ -317,10 +378,13 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
     """Role-aware DeepSeek-V4 model retaining mHC exclusively on Attention."""
 
     # Patch reason: native DeepSeek-V4 allocates every decoder stage and stream.
-    # Patch functionality: build role-aware layers and Attention-only resources.
+    # Patch functionality: build role-aware layers and Attention-only resources
+    # and pin sequence parallelism off (the native derivation would enable SP
+    # for AFD DP>1 layouts, which the synchronous AFD boundary does not
+    # support).
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/models/deepseek_v4/nvidia/model.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.30.0, vllm/models/deepseek_v4/nvidia/model.py
+    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # ### PATCH START: validate the deliberately narrow first release.
         nn.Module.__init__(self)
@@ -350,11 +414,14 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         self.quant_config = quant_config
         self.parallel_config = parallel_config
         self.use_mega_moe = (
-            vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+            vllm_config.kernel_config.moe_backend in native.MEGA_MOE_BACKENDS
         )
         # ### PATCH START: MegaMoE has unproven role-local finalization semantics.
         if self.use_mega_moe:
             raise RuntimeError("AFD DeepSeek-V4 does not support MegaMoE")
+        # Native derives SP from the EP/TP/DP layout; AFD splits roles across
+        # dedicated workers and requires full-token boundary payloads.
+        self.use_sequence_parallel = False
         # ### PATCH END
         self.vocab_size = config.vocab_size
         self.hc_eps = config.hc_eps
@@ -375,7 +442,9 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
             self.topk_indices_buffer = None
         # ### PATCH END
 
-        if native.get_pp_group().is_first_rank:
+        if native.get_pp_group().is_first_rank or native.spec_decode_needs_target_embed(
+            vllm_config
+        ):
             self.embed_tokens = native.VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -421,7 +490,15 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
             self.hc_head_fn = None
             self.hc_head_base = None
             self.hc_head_scale = None
-        if self.afd_config.role == "attention" and native.get_pp_group().is_last_rank:
+        spec_config = vllm_config.speculative_config
+        needs_mtp_hidden_states = spec_config is not None and (
+            spec_config.use_eagle() or spec_config.uses_draft_model()
+        )
+        if (
+            self.afd_config.role == "attention"
+            and native.get_pp_group().is_last_rank
+            and needs_mtp_hidden_states
+        ):
             self._mtp_hidden_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 self.hc_dim,
@@ -429,6 +506,23 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
             )
         else:
             self._mtp_hidden_buffer = None
+        if (
+            self.afd_config.role == "attention"
+            and vllm_config.kernel_config.enable_jit_warmup
+            and native.get_pp_group().is_last_rank
+        ):
+            # The hc-head kernel runs only on the Attention role; the FFN role
+            # never finalizes the mHC stream, so it skips the warmup.
+            from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+                _HC_HEAD_FUSED_TILELANG_KERNEL,
+            )
+
+            _HC_HEAD_FUSED_TILELANG_KERNEL.register_warmup(
+                hidden_size=config.hidden_size,
+                hc_mult=self.hc_mult,
+                rms_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+            )
         # ### PATCH END
 
     def compute_ffn_output(
@@ -466,11 +560,15 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
             return
         layer = self.layers[self.start_layer]
         if isinstance(layer, AFDDeepseekV4DecoderLayer):
-            layer.hc_attn_fn_broadcast = (
+            broadcast = (
                 layer.hc_attn_fn.detach()
                 .view(-1, layer.hc_mult, layer.hidden_size)
                 .sum(dim=1)
             )
+            if layer.hc_attn_fn_broadcast is None:
+                layer.hc_attn_fn_broadcast = broadcast
+            else:
+                layer.hc_attn_fn_broadcast.copy_(broadcast)
 
 
 class AFDDeepseekV4ForCausalLM(native.DeepseekV4ForCausalLM):

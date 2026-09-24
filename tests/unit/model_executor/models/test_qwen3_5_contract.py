@@ -45,8 +45,9 @@ def test_attention_moe_uses_native_forward_and_parameter_free_proxy():
     )
     proxy = AFDAttentionFusedMoE(
         layer_idx=7,
-        is_internal_router=True,
+        external_routing=False,
     )
+    assert proxy.external_routing is False
     assert list(proxy.parameters()) == []
 
 
@@ -54,7 +55,7 @@ def test_qwen_remote_experts_proxy_preserves_completed_ffn_output_under_tp(
     monkeypatch,
 ):
     class FakeRemoteExperts(nn.Module):
-        is_internal_router = True
+        gate = object()
 
         def forward(self, *, hidden_states, router_logits):
             assert router_logits is hidden_states
@@ -65,6 +66,8 @@ def test_qwen_remote_experts_proxy_preserves_completed_ffn_output_under_tp(
     remote_moe.experts = FakeRemoteExperts()
     remote_moe.tp_size = 2
     remote_moe.is_sequence_parallel = False
+    remote_moe.shared_expert = None
+    remote_moe.replicate_shared_expert = False
     monkeypatch.setattr(
         adapter.next_native,
         "tensor_model_parallel_all_gather",
@@ -87,7 +90,7 @@ def test_ffn_compute_ffn_output_calls_native_internal_router():
 
     moe = object.__new__(FakeInternalMoe)
     nn.Module.__init__(moe)
-    moe.experts = type("Experts", (), {"is_internal_router": True})()
+    moe.experts = type("Experts", (), {"gate": object()})()
     layer = object.__new__(adapter.AFDQwen3_5DecoderLayer)
     nn.Module.__init__(layer)
     layer.afd_role = "ffn"
@@ -98,6 +101,19 @@ def test_ffn_compute_ffn_output_calls_native_internal_router():
 
     assert calls == [hidden_states]
     assert torch.equal(output, hidden_states + 1)
+
+
+def test_ffn_compute_ffn_output_rejects_external_router():
+    moe = object.__new__(native.Qwen3NextSparseMoeBlock)
+    nn.Module.__init__(moe)
+    moe.experts = type("Experts", (), {"gate": None})()
+    layer = object.__new__(adapter.AFDQwen3_5DecoderLayer)
+    nn.Module.__init__(layer)
+    layer.afd_role = "ffn"
+    layer.mlp = moe
+
+    with pytest.raises(RuntimeError, match="must use its local router"):
+        layer.compute_ffn_output(torch.zeros(2, 4))
 
 
 def test_qwen_conditional_model_rejects_multimodal_before_visual_construction(
@@ -305,10 +321,14 @@ def test_qwen_conditional_model_initializes_for_text_only(monkeypatch):
             self.make_empty_intermediate_tensors = object()
 
     model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(vision_config=SimpleNamespace()),
+        hf_config=SimpleNamespace(
+            vision_config=SimpleNamespace(out_hidden_size=8),
+        ),
         multimodal_config=SimpleNamespace(
             language_model_only=True,
             mm_encoder_tp_mode="weights",
+            is_multimodal_pruning_enabled=lambda: False,
+            video_pruning_rate=0.2,
         ),
     )
     vllm_config = SimpleNamespace(
@@ -346,6 +366,11 @@ def test_qwen_conditional_model_initializes_for_text_only(monkeypatch):
         lambda *_args, **_kwargs: nn.Identity(),
     )
     monkeypatch.setattr(
+        adapter.native,
+        "cached_tokenizer_from_config",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
         adapter,
         "AFDQwen3_5MoeForCausalLM",
         lambda **_kwargs: FakeCausalLM(),
@@ -376,7 +401,9 @@ def test_qwen_text_only_uses_upstream_missing_vision_tower_stage(monkeypatch):
 
     multimodal_config = MultiModalConfig(language_model_only=True)
     model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(vision_config=SimpleNamespace()),
+        hf_config=SimpleNamespace(
+            vision_config=SimpleNamespace(out_hidden_size=8),
+        ),
         multimodal_config=multimodal_config,
     )
     vllm_config = SimpleNamespace(
@@ -399,6 +426,11 @@ def test_qwen_text_only_uses_upstream_missing_vision_tower_stage(monkeypatch):
         ),
     )
     monkeypatch.setattr(adapter.native, "Qwen3_VisionTransformer", FakeVisionTower)
+    monkeypatch.setattr(
+        adapter.native,
+        "cached_tokenizer_from_config",
+        lambda *_args, **_kwargs: object(),
+    )
     monkeypatch.setattr(
         adapter,
         "AFDQwen3_5MoeForCausalLM",

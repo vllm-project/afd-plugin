@@ -166,13 +166,16 @@ class AFDAttentionFusedMoE(RemoteFFNProxy):
         self,
         *,
         layer_idx: int,
-        is_internal_router: bool,
+        external_routing: bool,
     ) -> None:
         super().__init__(layer_idx=layer_idx)
-        self.is_internal_router = is_internal_router
+        # v0.30 routing contract: the experts runner consumes transported
+        # router_logits only when its gate is None (external routing); a held
+        # gate routes internally and ignores the forwarded logits argument.
+        self.external_routing = external_routing
 
-    # Native FusedMoE passes router_logits at this boundary; only the proxy's
-    # transport is reused, not its hidden-states-only forward contract.
+    # The native MoERunner boundary passes router_logits and input_ids; only
+    # the proxy's transport is reused, not its kernel execution contract.
     def forward(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor,
@@ -183,13 +186,13 @@ class AFDAttentionFusedMoE(RemoteFFNProxy):
             raise NotImplementedError(
                 "experts-boundary input_ids transport is not implemented",
             )
-        send_kwargs = (
-            {} if self.is_internal_router else {"router_logits": router_logits}
-        )
+        send_kwargs: dict[str, torch.Tensor] = {}
+        if self.external_routing:
+            send_kwargs["router_logits"] = router_logits
         return self._send_and_receive(hidden_states, **send_kwargs)
 
     def update_expert_map(self) -> None:
-        """Satisfy the native EPLB model interface without local experts."""
+        """Satisfy the native MoERunner EPLB interface without local experts."""
 
 
 class GateOnlyRemoteMoE(RemoteFFNProxy):
@@ -266,13 +269,17 @@ class GateOnlyRemoteMoE(RemoteFFNProxy):
 class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
     """Native DeepSeek MoE forward with parameter-free remote experts."""
 
-    # Patch reason: native DeepseekV2MoE constructs local routed/shared experts.
+    # Patch reason: native DeepseekV2MoE constructs local routed/shared experts
+    # through FusedMoEFactory.
     # Patch functionality: preserve the native MoE forward contract while
     # constructing only the gate owned by Attention and a parameter-free proxy.
     # Signature: AFD-owned; adds layer_idx and compute_gate_on_attention and omits
     # quant_config because no local expert kernel is constructed.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.30.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # In v0.30.0 the native forward always delegates routing to the experts
+    # runner, so forward() below computes the Attention-side gate first when
+    # this shell owns one.
     def __init__(
         self,
         *,
@@ -287,6 +294,7 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
         router_dtype = native._get_moe_router_dtype(config)
+        self.router_dtype = router_dtype
         if compute_gate_on_attention:
             self.gate = native.GateLinear(
                 config.hidden_size,
@@ -310,11 +318,50 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         self.n_logical_experts = self.n_routed_experts
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
         self.n_local_physical_experts = self.n_physical_experts // ep_size
+        # No local shared-expert MLP is constructed, so fused shared experts
+        # can never be enabled for this shell.
+        self.is_fused_shared_expert_enabled = False
         self.experts = AFDAttentionFusedMoE(
             layer_idx=layer_idx,
-            is_internal_router=not compute_gate_on_attention,
+            external_routing=compute_gate_on_attention,
         )
         # ### PATCH END: construct a remote-experts native MoE shell.
+
+    # Patch reason: v0.30.0's native forward always delegates routing to the
+    # experts runner (router_logits=hidden_states), so a shell that owns a
+    # gate would never compute it and Attention would ship hidden states as
+    # router logits.
+    # Patch functionality: compute the Attention-side gate before transport;
+    # gate-less shells keep the native delegation unchanged.
+    # Signature: matches upstream; no added parameters.
+    # Upstream: vLLM v0.30.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        already_sequence_parallel: bool = False,
+    ) -> torch.Tensor:
+        if self.gate is None:
+            return super().forward(hidden_states, already_sequence_parallel)
+
+        # ### PATCH START: compute the Attention-side gate before transport.
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        if self.is_sequence_parallel and not already_sequence_parallel:
+            hidden_states = native.sequence_parallel_chunk(hidden_states)
+        router_logits, _ = self.gate(hidden_states)
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+        )
+        if self.is_sequence_parallel and not already_sequence_parallel:
+            final_hidden_states = native.tensor_model_parallel_all_gather(
+                final_hidden_states,
+                0,
+            )
+            final_hidden_states = final_hidden_states[:num_tokens]
+        return final_hidden_states.view(num_tokens, hidden_dim)
+        # ### PATCH END: compute the Attention-side gate before transport.
 
 
 class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
@@ -323,14 +370,15 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
     # Patch reason: native DeepSeek constructs both Attention and FFN modules.
     # Patch functionality: construct only the modules owned by the active AFD role.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.30.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
     def __init__(
         self,
         vllm_config: VllmConfig,
         prefix: str,
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        index_group_builder: native.SparseMLAIndexGroupBuilder | None = None,
     ) -> None:
         # ### PATCH START: require an explicit AFD role before allocation.
         afd_config = parse_afd_config(vllm_config, validate=False)
@@ -410,6 +458,11 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                     else native.DeepseekV2Attention
                 )
             )
+            attn_kwargs = (
+                {"index_group_builder": index_group_builder}
+                if attn_cls is native.DeepseekV2MLAAttention
+                else {}
+            )
             self.self_attn = attn_cls(
                 vllm_config=vllm_config,
                 config=config,
@@ -426,6 +479,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 reduce_results=not self.use_sequence_parallel_moe,
+                **attn_kwargs,
             )
 
             if self.uses_remote_experts:
@@ -459,12 +513,12 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
             if self.compute_gate_on_attention and not self.is_moe_layer:
                 self.mlp = native.PPMissingLayer()
             elif self.is_moe_layer:
-                # vLLM models bind FusedMoE at module import time. AFD can import
-                # native DeepSeek before vLLM-Ascend patches the package factory,
-                # so refresh that binding after platform initialization and before
-                # constructing the NPU FFN MoE.
+                # vLLM models bind FusedMoEFactory at module import time. AFD
+                # can import native DeepSeek before vLLM-Ascend patches the
+                # package factory, so refresh that binding after platform
+                # initialization and before constructing the NPU FFN MoE.
                 if device_type == "npu":
-                    native.FusedMoE = fused_moe.FusedMoE
+                    native.FusedMoEFactory = fused_moe.FusedMoEFactory
                 moe_config = config
                 if afd_config.connector == AFD_ASYNC_CONNECTOR:
                     moe_config = copy(config)
@@ -484,9 +538,10 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                     ),
                 )
                 if self.compute_gate_on_attention and device_type == "cuda":
-                    # Keep the native gate parameter and path for loader/model
-                    # compatibility, but configure the runner to consume the
-                    # router logits transferred from Attention.
+                    # Keep the gate weights loadable, but with the runner's
+                    # gate cleared it consumes the Attention-side router
+                    # logits instead of computing its own (gate is None means
+                    # external routing in the v0.30 runner contract).
                     self.mlp.experts.gate = None
             else:
                 self.mlp = native.DeepseekV2MLP(
@@ -627,7 +682,9 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
             )
         if not isinstance(self.mlp, native.DeepseekV2MoE):
             raise RuntimeError("FFN role does not own a native DeepSeek MoE")
-        if self.mlp.experts.is_internal_router:
+        # v0.30 runner contract: gate is None means the runner consumes the
+        # router logits transported from Attention (external routing).
+        if self.mlp.experts.gate is not None:
             raise RuntimeError("FFN native runner must use external routing")
         return self.mlp.experts(
             hidden_states=hidden_states,
@@ -644,8 +701,8 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
     # Patch reason: native DeepSeek always creates native Decoder layers.
     # Patch functionality: create role-aware AFD layers without full allocation.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.30.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # ### PATCH START: require AFD activation and avoid native allocation.
         afd_config = parse_afd_config(vllm_config, validate=False)
@@ -683,6 +740,14 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
             )
         else:
             topk_indices_buffer = None
+        index_group_builder = (
+            native.SparseMLAIndexGroupBuilder(
+                topk_indices_buffer,
+                native.get_sparse_mla_index_group_max_rows(vllm_config),
+            )
+            if topk_indices_buffer is not None
+            else None
+        )
         # ### PATCH END
 
         if native.get_pp_group().is_first_rank:
@@ -702,10 +767,21 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
                 vllm_config=vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
+                index_group_builder=index_group_builder,
             ),
             prefix=f"{prefix}.layers",
         )
         # ### PATCH END
+
+        # Needed by the inherited native loader to route fused shared-expert
+        # checkpoints; role-local shells never enable the fused path.
+        self.is_fused_shared_expert_enabled = (
+            native.is_model_fused_shared_expert_compatible(
+                self.layers,
+                native.DeepseekV2MoE,
+                "mlp",
+            )
+        )
 
         if native.get_pp_group().is_last_rank:
             self.norm = native.RMSNorm(self.hidden_size, eps=config.rms_norm_eps)

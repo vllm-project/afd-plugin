@@ -95,8 +95,8 @@ class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
     # Patch functionality: preserve its native forward while keeping a
     # parameter-free experts proxy with a local FFN router.
     # Signature: AFD-owned; layer_idx is required for correlation metadata.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/qwen3_next.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.30.0, vllm/model_executor/models/qwen3_next.py
+    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
     def __init__(
         self,
         *,
@@ -115,25 +115,23 @@ class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
 
         self.tp_size = next_native.get_tensor_model_parallel_world_size()
         self.ep_group = next_native.get_ep_group().device_group
-        self.ep_rank = next_native.get_ep_group().rank_in_group
         self.ep_size = self.ep_group.size()
         self.n_routed_experts = int(config.num_experts)
         self.is_sequence_parallel = False
+        # No local shared-expert module and no fused shared-expert slot.
+        self.is_fused_shared_expert_enabled = False
+        self.replicate_shared_expert = False
         self.enable_eplb = False
         self.n_logical_experts = self.n_routed_experts
         self.n_redundant_experts = 0
         self.n_physical_experts = self.n_logical_experts
         self.n_local_physical_experts = self.n_physical_experts // self.ep_size
-        self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
-        self.physical_expert_end = (
-            self.physical_expert_start + self.n_local_physical_experts
-        )
         self.gate = None
         self.shared_expert = None
         self.shared_expert_gate = None
         self.experts = AFDAttentionFusedMoE(
             layer_idx=layer_idx,
-            is_internal_router=True,
+            external_routing=False,
         )
         # ### PATCH END: construct a remote-experts native MoE shell.
 
@@ -151,8 +149,8 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
     # Patch reason: native Qwen3_5DecoderLayer constructs Attention/GDN and MoE.
     # Patch functionality: allocate only the modules owned by the active role.
     # Signature: matches upstream.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/qwen3_5.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.30.0, vllm/model_executor/models/qwen3_5.py
+    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -181,9 +179,14 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
 
         self.layer_type = layer_type
         self.layer_idx = native.extract_layer_index(prefix)
-        # ### PATCH START: disable unsupported sequence-parallel MoE reduction.
-        self.use_attn_reduce_scatter_for_moe = False
-        # ### PATCH END
+        # Native v0.30.0 derives the MoE reduce-scatter mode from the SP
+        # configuration; AFD rejects SP MoE above, so this is always False.
+        is_moe_layer = config.model_type == "qwen3_5_moe_text"
+        self.use_attn_reduce_scatter_for_moe = (
+            parallel_config.use_sequence_parallel_moe
+            and parallel_config.pipeline_parallel_size == 1
+            and is_moe_layer
+        )
 
         # ### PATCH START: record the role that owns this decoder's modules.
         self.afd_config = afd_config
@@ -199,7 +202,7 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
                     vllm_config=vllm_config,
                     prefix=f"{prefix}.linear_attn",
                     gqa_interleaved_layout=False,
-                    reduce_results=True,
+                    reduce_results=not self.use_attn_reduce_scatter_for_moe,
                 )
             elif self.layer_type == "full_attention":
                 self.self_attn = native.Qwen3NextAttention(
@@ -208,7 +211,7 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
                     cache_config=cache_config,
                     quant_config=quant_config,
                     prefix=f"{prefix}.self_attn",
-                    reduce_results=True,
+                    reduce_results=not self.use_attn_reduce_scatter_for_moe,
                 )
             else:
                 raise ValueError(f"Invalid layer_type {self.layer_type}")
@@ -257,7 +260,9 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
             raise RuntimeError("native Qwen MoE is owned by the FFN role")
         if not isinstance(self.mlp, native.Qwen3NextSparseMoeBlock):
             raise RuntimeError("FFN role does not own native Qwen MoE")
-        if not self.mlp.experts.is_internal_router:
+        # v0.30 runner contract: a held gate routes internally, consuming no
+        # transported router logits.
+        if self.mlp.experts.gate is None:
             raise RuntimeError("FFN native runner must use its local router")
         return self.mlp(hidden_states)
 
@@ -279,8 +284,8 @@ class AFDQwen3_5Model(native.Qwen3_5Model):  # noqa: N801
     # Patch functionality: use role-aware layers without replacing its forward
     # or load_weights implementation.
     # Signature: matches upstream.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/qwen3_5.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.30.0, vllm/model_executor/models/qwen3_5.py
+    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # ### PATCH START: require the minimal experts boundary.
         afd_config = parse_optional_afd_config(vllm_config, validate=False)
@@ -328,6 +333,15 @@ class AFDQwen3_5Model(native.Qwen3_5Model):  # noqa: N801
             get_layer,
             prefix=f"{prefix}.layers",
         )
+        # Needed by the inherited native loader's fused shared-expert routing;
+        # role-local shells never enable the fused path.
+        self.is_fused_shared_expert_enabled = (
+            native.is_model_fused_shared_expert_compatible(
+                self.layers,
+                native.Qwen3NextSparseMoeBlock,
+                "mlp",
+            )
+        )
         self.make_empty_intermediate_tensors = (
             native.make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"],
@@ -365,8 +379,8 @@ class AFDQwen3_5MoeForCausalLM(  # noqa: N801
     # Patch functionality: construct AFDQwen3_5Model while preserving inherited
     # forward, logits, state, and loader methods.
     # Signature: matches upstream.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/qwen3_5.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.30.0, vllm/model_executor/models/qwen3_5.py
+    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # ### PATCH START: require AFD activation for the replacement shell.
         afd_config = parse_optional_afd_config(vllm_config, validate=False)
@@ -399,15 +413,14 @@ class AFDQwen3_5MoeForCausalLM(  # noqa: N801
 
         # ### PATCH START: restrict LM-head ownership to the Attention role.
         if afd_config.role == "attention" and native.get_pp_group().is_last_rank:
+            self.lm_head = native.ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=self.quant_config,
+                prefix=native.maybe_prefix(prefix, "lm_head"),
+            )
             if config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = native.ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=self.quant_config,
-                    prefix=native.maybe_prefix(prefix, "lm_head"),
-                )
+                self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         else:
             self.lm_head = native.PPMissingLayer()
         # ### PATCH END
@@ -437,8 +450,8 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
     # Patch functionality: retain native tower staging but construct the AFD
     # language model. Forward and multimodal interfaces stay native.
     # Signature: matches upstream.
-    # Upstream: vLLM v0.26.0, vllm/model_executor/models/qwen3_5.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.30.0, vllm/model_executor/models/qwen3_5.py
+    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         # ### PATCH START: enforce AFD's supported Qwen GPU configuration.
         afd_config = parse_optional_afd_config(vllm_config, validate=False)
@@ -474,7 +487,21 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
         self.model_config = vllm_config.model_config
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
-        self.is_multimodal_pruning_enabled = False
+        self.is_multimodal_pruning_enabled = (
+            multimodal_config.is_multimodal_pruning_enabled()
+        )
+        self.video_pruning_rate = self.multimodal_config.video_pruning_rate
+        self._tokenizer = native.cached_tokenizer_from_config(vllm_config.model_config)
+
+        # Attributes needed by EVS-related functions inherited from Qwen3-VL.
+        self.use_deepstack = hasattr(config.vision_config, "deepstack_visual_indexes")
+        self.deepstack_num_level = (
+            len(config.vision_config.deepstack_visual_indexes)
+            if self.use_deepstack
+            else 0
+        )
+        self.visual_dim = config.vision_config.out_hidden_size
+        self.multiscale_dim = self.visual_dim * self.deepstack_num_level
         # ### PATCH START: retain AFD role metadata for filtered loading.
         self.afd_config = afd_config
         self.afd_role = afd_config.role
