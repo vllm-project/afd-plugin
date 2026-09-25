@@ -50,6 +50,16 @@ class AFDNPUFFNWorker(NPUWorker):
         # its MoE modules from the general-plugin hook can race Ascend's own
         # ops package initialization and leave DeviceOperator partially loaded.
         import afd_plugin.compat.patches.npu.force_load_balance  # noqa: F401
+        from afd_plugin.compat.patches.npu.hash_ids_alignment import (
+            apply_afd_hash_ids_alignment_patch,
+        )
+
+        # The FFN role routes Hash layers by token identity, and the ids the
+        # connector installs already describe exactly the rows its router sees.
+        # The patch rebinds the pinned selector directly, so a vLLM-Ascend
+        # revision that renamed it fails here with the attribute error rather
+        # than leaving the upstream re-alignment silently in place.
+        apply_afd_hash_ids_alignment_patch()
 
         apply_afd_ascend_patches_if_needed()
         super().__init__(*args, **kwargs)

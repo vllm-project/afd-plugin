@@ -24,7 +24,7 @@ verified_platform_refs:
   - "Ascend E2E environment recorded in the installation and NPU guides"
 related_issues:
   - "#129"
-last_reviewed: 2026-08-27
+last_reviewed: 2026-09-22
 ---
 
 # AFD module design
@@ -95,7 +95,7 @@ contract. File-level entries deliberately resolve mixed directories.
 | [Plugin boundary](plugin_boundary.md) | `afd_plugin/__init__.py`, `afd_plugin/config.py`, `afd_plugin/config_utils.py`, `afd_plugin/envs.py`, `afd_plugin/validation.py`, `afd_plugin/py.typed`, `afd_plugin/v1/__init__.py`, `afd_plugin/v1/worker/__init__.py`, `afd_plugin/v1/worker/npu/__init__.py`, `pyproject.toml` |
 | [Attention runtime](attention_runtime.md) | `afd_plugin/v1/worker/attention_metadata.py`, `afd_plugin/v1/worker/attention_model_runner.py`, `afd_plugin/v1/worker/attention_model_runner_v2.py`, `afd_plugin/v1/worker/attention_worker.py`, `afd_plugin/v1/worker/ubatch_wrapper.py`, `afd_plugin/v1/worker/npu/attention_model_runner.py`, `afd_plugin/v1/worker/npu/attention_model_runner_v2.py`, `afd_plugin/v1/worker/npu/attention_worker.py` |
 | [FFN runtime](ffn_runtime.md) | `afd_plugin/v1/worker/ffn_model_runner.py`, `afd_plugin/v1/worker/ffn_worker.py`, `afd_plugin/v1/worker/npu/ffn_model_runner.py`, `afd_plugin/v1/worker/npu/ffn_worker.py` |
-| [Connector contracts](connector_contracts.md) | `afd_plugin/connectors/**/*.py`, `afd_plugin/connectors/npu/bin/**`, `afd_plugin/distributed/**/*.py` |
+| [Connector contracts](connector_contracts.md) | `afd_plugin/connectors/**/*.py`, `afd_plugin/connectors/npu/bin/**`, `afd_plugin/distributed/**/*.py`, `afd_plugin/a2e_layout.py` |
 | [Model integration](model_integration.md) | `afd_plugin/model_executor/**/*.py` |
 | [Execution platforms](execution_platforms.md) | `afd_plugin/compat/profiler.py`, `afd_plugin/compat/npu/forward_context.py`, `afd_plugin/compat/npu/ops.py`, `afd_plugin/compat/npu/profiler.py`, `afd_plugin/v1/worker/cuda_graph.py`, `afd_plugin/v1/worker/dbo.py`, `afd_plugin/v1/worker/npu/forward_context.py`, `afd_plugin/v1/worker/npu/mla_graph.py`, `afd_plugin/v1/worker/npu/npu_ubatch_wrapper.py`, `afd_plugin/v1/worker/npu/ubatch_utils.py`, `afd_plugin/v1/worker/npu/ubatching.py`, `csrc/**`, `setup.py`, `MANIFEST.in` |
 | [Compatibility and patches](compatibility_and_patches.md) | `afd_plugin/compat/__init__.py`, `afd_plugin/compat/vllm.py`, `afd_plugin/compat/npu/__init__.py`, `afd_plugin/compat/npu/feature_validation.py`, `afd_plugin/compat/npu/runtime.py`, `afd_plugin/compat/npu/runtime_config.py`, `afd_plugin/compat/patches/**/*.py` |

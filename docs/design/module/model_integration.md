@@ -9,6 +9,8 @@ primary_code_paths:
   - "afd_plugin/model_executor/**/*.py"
 related_code_paths:
   - "afd_plugin/connectors/metadata.py"
+  - "afd_plugin/a2e_layout.py"
+  - "afd_plugin/compat/patches/npu/hash_ids_alignment.py"
   - "afd_plugin/v1/worker/dbo.py"
   - "afd_plugin/v1/worker/{attention_metadata,attention_model_runner,attention_model_runner_v2,ffn_model_runner}.py"
 depends_on:
@@ -34,7 +36,7 @@ related_issues:
   - "#88"
   - "#105"
   - "#129"
-last_reviewed: 2026-08-27
+last_reviewed: 2026-09-22
 ---
 
 # Model integration
@@ -197,6 +199,13 @@ planner. Both the sidecar shape and the live connector reference are
 **draft** while metadata ownership is discussed in
 [#88](https://github.com/JiusiServe/afd-plugin/issues/88) and payload state is
 split under [#105](https://github.com/JiusiServe/afd-plugin/issues/105).
+
+A model whose router is keyed by token identity routes on ids that arrive from
+the Attention role, and those ids index a token-to-expert table the model owns.
+When the ids already describe every router row,
+`compat/patches/npu/hash_ids_alignment.py` keeps the pinned vLLM-Ascend fused
+selector from re-aligning them to a sequence-parallel layout the FFN role does
+not use.
 
 ## Model execution flow
 
