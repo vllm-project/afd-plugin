@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -131,6 +134,20 @@ def test_make_ffn_graph_key_can_aggregate_attention_counts_to_ffn_counts():
         ffn_size=4,
         fallback=24,
     ) == ((0, (24, 24, 24, 24)),)
+
+
+def test_make_ffn_graph_key_distinguishes_camp2p_receiver_shapes():
+    first_metadata = {0: SimpleNamespace(num_tokens_across_dp_cpu=[2, 4, 2, 4])}
+    second_metadata = {0: SimpleNamespace(num_tokens_across_dp_cpu=[3, 3, 3, 3])}
+
+    # Contiguous aggregation aliases these shapes to (6, 6), but CAMP2P maps
+    # A0/A2 to F0 and A1/A3 to F1. Each receiver still has equal-size peers.
+    first_key = make_ffn_graph_key(first_metadata, attention_size=4, ffn_size=2)
+    second_key = make_ffn_graph_key(second_metadata, attention_size=4, ffn_size=2)
+
+    assert first_key == ((0, (4, 8)),)
+    assert second_key == ((0, (6, 6)),)
+    assert first_key != second_key
 
 
 # --- TP expansion tests ---

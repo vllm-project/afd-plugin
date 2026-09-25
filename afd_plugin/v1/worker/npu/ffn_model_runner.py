@@ -629,9 +629,16 @@ def _ffn_token_counts_across_ranks(
             and int(connector.attn_size) >= int(connector.ffn_size)
             and int(connector.attn_size) % int(connector.ffn_size) == 0
         ):
-            group_size = int(connector.attn_size) // int(connector.ffn_size)
+            # CAMP2P maps Attention rank a to FFN rank a % ffn_size.
             values = [
-                max(1, sum(attention_counts[idx * group_size : (idx + 1) * group_size]))
+                max(
+                    1,
+                    sum(
+                        attention_counts[
+                            idx : int(connector.attn_size) : int(connector.ffn_size)
+                        ]
+                    ),
+                )
                 for idx in range(int(connector.ffn_size))
             ]
         else:

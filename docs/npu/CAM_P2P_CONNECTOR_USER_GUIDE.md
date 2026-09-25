@@ -31,14 +31,17 @@ For a `4A2F` deployment:
 ```text
 world rank:  0   1   2   3   4   5
 member:      F0  F1  A0  A1  A2  A3
-mapping:     F0 <-> A0,A1
-             F1 <-> A2,A3
+mapping:     F0 <-> A0,A2
+             F1 <-> A1,A3
 ```
 
 `num_attention_ranks` must be greater than or equal to `num_ffn_ranks`. For
 the normal balanced mapping used by CAMP2p, the Attention rank count is an
-integer multiple of the FFN rank count. Each FFN rank handles the consecutive
-Attention ranks assigned to it.
+integer multiple of the FFN rank count. Attention role rank `a` communicates
+with FFN role rank `a % num_ffn_ranks`. Token counts and FFN graph keys use
+this same mapping after expanding DP counts to Attention TP workers.
+Within each batch or ubatch, Attention peers feeding the same FFN rank must
+send equal-sized token blocks, as required by the CAMP2p kernels.
 
 The connector creates these communication groups:
 
