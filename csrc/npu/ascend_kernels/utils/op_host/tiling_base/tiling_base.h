@@ -16,6 +16,9 @@
 #pragma once
 
 #include <sstream>
+// CheckLogLevel uses the OP module ID from dlog_pub.h. Include it before
+// log/log.h so newer CANN releases reuse its DLOG_* definitions.
+#include "dlog_pub.h"
 #include <exe_graph/runtime/tiling_context.h>
 #include <graph/utils/type_utils.h>
 #include "platform/soc_spec.h"

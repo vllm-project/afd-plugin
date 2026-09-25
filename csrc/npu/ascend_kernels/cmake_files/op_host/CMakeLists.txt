@@ -55,12 +55,19 @@ endif()
 # =====================================================
 # Host-side include paths
 # =====================================================
-# The grouped_matmul_swiglu_quant_v2_layered op_host/op_api sources use the
-# l0op composite pattern and CANN op_common headers that resolve outside the
-# canonical ASCEND_HOME_PATH/include tree. Add the pkg_inc and aclnn include
-# directories to both the in-tree compile (include_directories) and the
-# separate npu_op_code_gen process (CODE_GEN_COMPILE_OPTS), mirroring the
-# upstream cam comm_operator op_host build.
+# Public op_common headers moved from pkg_inc to include in newer CANN
+# releases. Keep both layouts available to host compilation and the separate
+# npu_op_code_gen process; pkg_inc still contains other internal headers.
+if(EXISTS "${CANN_ROOT}/include/op_common/log/log.h")
+    include_directories(
+        "${CANN_ROOT}/include/op_common"
+        "${CANN_ROOT}/include/op_common/op_host"
+    )
+    list(APPEND CODE_GEN_COMPILE_OPTS
+        -I${CANN_ROOT}/include/op_common
+        -I${CANN_ROOT}/include/op_common/op_host
+    )
+endif()
 set(CANN_ARCH_DIR "")
 foreach(cand "aarch64-linux" "x86_64-linux" "linux")
     if(EXISTS "${CANN_ROOT}/${cand}/pkg_inc/op_common")
