@@ -13,6 +13,7 @@ from afd_plugin.config import (
     is_afd_async_dp,
     parse_afd_config,
 )
+from afd_plugin.envs import async_cam_layered_gmm_enabled
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -28,6 +29,17 @@ def fail_if_unsupported_npu_afd_features(
     """Fail fast for NPU AFD settings that are not currently supported."""
 
     afd_config = afd_config or parse_afd_config(vllm_config)
+    layered_gmm_requested = async_cam_layered_gmm_enabled()
+    if layered_gmm_requested and (
+        afd_config.role != "ffn" or afd_config.connector != AFD_ASYNC_CONNECTOR
+    ):
+        raise RuntimeError(
+            "AFD_ASYNC_CAM_LAYERED_GMM requires the async CAM FFN role; "
+            f"got role={afd_config.role!r}, connector={afd_config.connector!r}"
+        )
+    is_dsv4 = _is_dsv4_target(vllm_config)
+    if layered_gmm_requested and not is_dsv4:
+        raise RuntimeError("AFD_ASYNC_CAM_LAYERED_GMM supports only DeepSeek V4")
     from afd_plugin.connectors.factory import AFDConnectorFactory
 
     extra_info = AFDConnectorFactory.parse_connector_extra_info(
@@ -35,7 +47,6 @@ def fail_if_unsupported_npu_afd_features(
         vllm_config,
     )
 
-    is_dsv4 = _is_dsv4_target(vllm_config)
     if is_dsv4:
         _fail_if_unsupported_dsv4_connector(afd_config)
 

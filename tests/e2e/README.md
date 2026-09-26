@@ -10,7 +10,10 @@ Each default gate runs four scenarios:
 - `afd-graph-2a2f` (DeepSeek-V2-Lite gate only; Qwen3 MoE/Qwen3.6 use `afd-graph-2a1f`)
 - `afd-graph-dbo-2a2f` (DeepSeek-V2-Lite gate only; Qwen3 MoE/Qwen3.6 use `afd-graph-dbo-2a1f`)
 
-Each scenario evaluates the first 7 GSM8K samples. If `AFD_E2E_DEVICES` is set,
+Each scenario evaluates the first 7 GSM8K samples; the DBO scenarios run 24
+samples with 12 concurrent requests so that live requests actually execute
+as two ubatches (see the accuracy gate in
+`docs/design/module/e2e_testing.md`). If `AFD_E2E_DEVICES` is set,
 that value is used as-is; otherwise the defaults are:
 
 - `0,1,2,3` for the gate scenarios. The 2A2F AFD cases (DeepSeek-V2-Lite gate

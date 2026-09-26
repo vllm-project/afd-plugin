@@ -74,6 +74,7 @@ AFD configuration is supplied through vLLM's `--additional-config` under the `af
     "num_attention_ranks": 1,
     "num_ffn_ranks": 1,
     "compute_gate_on_attention": false,
+    "afd_process_group_timeout_s": 120,
     "connector_extra_config": {}
   }
 }
@@ -90,6 +91,7 @@ AFD configuration is supplied through vLLM's `--additional-config` under the `af
 | `num_attention_ranks` | `int` | `1` | Total number of AFD Attention ranks, including DP/TP-derived worker ranks. Must be positive. |
 | `num_ffn_ranks` | `int` | `1` | Total number of AFD FFN ranks, including DP/TP-derived worker ranks. Must be positive. |
 | `compute_gate_on_attention` | `bool` | `false` | When `false`, FFN owns the native gate and experts. When `true`, Attention owns the native gate and transfers router logits to the FFN external-router expert path. |
+| `afd_process_group_timeout_s` | `int` | `120` | Rendezvous timeout, in seconds, for the AFD world process group join. Must be positive. The right value depends on rank count, placement, and model size; deployment tooling should compute it and pass it in. |
 | `connector_extra_config` | `dict` | `{}` | Must remain empty; `P2pNcclAFDConnector` does not currently support connector-specific options. |
 | `async` / `async_dp` | `bool` | `false` | Must remain `false` for `P2pNcclAFDConnector`; AFD async mode requires `CAMAsyncAFDConnector`. |
 

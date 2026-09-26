@@ -144,6 +144,8 @@ extend-ignore-identifiers-re = [
     ".*temperal_downsample",
     ".*nd",
     ".*[Nn][Dd]$",
+    ".*_ND_.*",
+    ".*NDExpectShape.*",
     ".*EmbedND$",
     ".*nothink.*",
     ".*NOTHINK.*",

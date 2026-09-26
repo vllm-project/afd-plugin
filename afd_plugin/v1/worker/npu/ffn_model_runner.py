@@ -13,12 +13,14 @@ from vllm.forward_context import DPMetadata
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm_ascend import ascend_forward_context as ascend_context
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner, graph_capture
 
 from afd_plugin.compat.npu import (
     ascend_forward_context,
     fail_if_unsupported_npu_afd_features,
 )
+from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.compat.npu.profiler import (
     create_afd_npu_profiler,
     step_afd_npu_profiler,
@@ -37,6 +39,8 @@ from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
 )
+from afd_plugin.envs import async_cam_layered_gmm_enabled
+from afd_plugin.model_executor.npu.async_cam_w4a8 import AsyncCAMW4A8Executor
 from afd_plugin.v1.worker.attention_metadata import (
     _resolve_world_ranks,
 )
@@ -96,13 +100,60 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         )
         self.prof = create_afd_npu_profiler("ffn")
         self._is_shutdown = False
+        self._layered_gmm_requested = async_cam_layered_gmm_enabled()
+        self._layered_executor: AsyncCAMW4A8Executor | None = None
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
         return parse_afd_config(vllm_config, expected_role="ffn")
 
     def initialize_afd_connector(self) -> None:
+        self._initialize_layered_executor()
         self.connector.init_afd_connector()
+
+    def _initialize_layered_executor(self) -> None:
+        reason = "switch disabled"
+        if self._layered_gmm_requested:
+            if not isinstance(self.connector, CAMAsyncAFDConnector):
+                reason = "requires CAMAsyncAFDConnector"
+            elif not self.afd_config.compute_gate_on_attention:
+                reason = "requires Attention-side gate"
+            else:
+                layers, reason = self.model.get_async_cam_w4a8_layers()
+                if layers:
+                    if get_ascend_device_type() != AscendDeviceType.A3:
+                        raise ValueError("layered W4A8 GMM requires Ascend 910C/A3")
+                    if self.connector.dynamic_quant != 1:
+                        raise ValueError("layered W4A8 GMM requires dynamicQuant=1")
+                    if self.use_aclgraph or self.vllm_config.use_v2_model_runner:
+                        raise ValueError(
+                            "layered W4A8 GMM requires eager ModelRunnerV1"
+                        )
+                    if tuple(sorted(layer.layer_idx for layer in layers)) != tuple(
+                        _ffn_layer_indices(self)
+                    ):
+                        raise ValueError(
+                            "layered GMM weights do not cover the remote MoE layer IDs"
+                        )
+                    ensure_cam_async_ops_available()
+                    self._layered_executor = AsyncCAMW4A8Executor(layers)
+                    self.connector.layered_gmm_enabled = True
+                    logger.info(
+                        "AFD_ASYNC_CAM_LAYERED_GMM requested=1 actual=layered "
+                        "quant=W4A8 layers=%d mode=%s layer_mapping=%s "
+                        "swiglu_limit=%s ignored=%s",
+                        len(layers),
+                        "per-channel" if layers[0].per_channel else "per-group",
+                        self._layered_executor.layer_id_to_slot is not None,
+                        layers[0].swiglu_limit,
+                        layers[0].swiglu_limit != 0.0,
+                    )
+                    return
+        logger.info(
+            "AFD_ASYNC_CAM_LAYERED_GMM requested=%s actual=legacy reason=%s",
+            self._layered_gmm_requested,
+            reason,
+        )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}
@@ -319,6 +370,18 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         stage_idx = 0
         rank_ffn_output = None
         connector = cast(CAMAsyncAFDConnector, self.connector)
+        if self._layered_executor is not None:
+            for _ in _ffn_layer_indices(self):
+                payload = connector.recv_attn_output()
+                states = cast(AFDAsyncTransferState, payload.context.states)
+                rank_ffn_output = self._layered_executor(
+                    payload.hidden_states,
+                    states.dynamic_scales,
+                    states.group_list,
+                    states.token_nums_rankid_layeridx,
+                )
+                connector.send_ffn_output(rank_ffn_output, payload.context)
+            return rank_ffn_output
 
         for _ in _ffn_layer_indices(self):
             work_item = connector.recv_ffn_work_item(
@@ -327,8 +390,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             )
             hidden_states = work_item.hidden_states
             metadata = work_item.context.metadata
-            states = work_item.context.states
-            if not isinstance(states, AFDAsyncTransferState):
+            legacy_states = work_item.context.states
+            if not isinstance(legacy_states, AFDAsyncTransferState):
                 raise RuntimeError(
                     "CAM async FFN work item requires AFDAsyncTransferState",
                 )
@@ -358,8 +421,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 rank_ffn_output = self.model.compute_ffn_output(
                     hidden_states=hidden_states,
                     layer_idx=layer_idx,
-                    group_list=states.group_list,
-                    dynamic_scales=states.dynamic_scales,
+                    group_list=legacy_states.group_list,
+                    dynamic_scales=legacy_states.dynamic_scales,
                 )
                 rank_ffn_output = connector.send_ffn_work_item_output(
                     work_item,

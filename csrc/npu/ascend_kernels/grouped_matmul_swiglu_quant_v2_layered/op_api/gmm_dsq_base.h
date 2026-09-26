@@ -49,6 +49,7 @@ constexpr size_t GROUP_LIST_DIM_LIMIT = 1UL;
 constexpr size_t QUANTOUT_DIM_LIMIT = 2UL;
 constexpr size_t QUANTSCALEOUT_DIM_LIMIT = 1UL;
 constexpr size_t INT4_PER_INT32 = 8UL;
+constexpr size_t INT4_PER_INT8 = 2UL;
 constexpr size_t LAST_SECOND_DIM_INDEX = 2UL;
 constexpr size_t NZ_ALIGN_K = 16UL;
 constexpr size_t NZ_ALIGN_N = 32UL;
@@ -111,9 +112,15 @@ class GroupedMatmulSwigluQuantBaseHandler : public GroupedMatmulSwigluQuantHandl
             const aclTensor *w = (*gmmDsqParams_.weight)[i];
             const aclTensor *wScale = (*gmmDsqParams_.weightScale)[i];
             op::Format weightViewFormat = w->GetViewFormat();
-            // weight dims: per-layer single tensor (ND [E, K, N] or NZ 5-dim)
-            OP_CHECK_WRONG_DIMENSION(w, (IsPrivateFormat(weightViewFormat) ? WEIGHT_NZ_DIM_LIMIT : WEIGHT_ND_DIM_LIMIT),
-                                     return false);
+            // torch_npu keeps an NZ weight's logical view [E, K, N] while its
+            // storage is five-dimensional. Explicit NZ views are also valid.
+            bool logicalNZView = IsPrivateFormat(weightViewFormat) &&
+                                 w->GetViewShape().GetDimNum() == WEIGHT_ND_DIM_LIMIT &&
+                                 w->GetStorageShape().GetDimNum() == WEIGHT_NZ_DIM_LIMIT;
+            if (!logicalNZView) {
+                OP_CHECK_WRONG_DIMENSION(
+                    w, (IsPrivateFormat(weightViewFormat) ? WEIGHT_NZ_DIM_LIMIT : WEIGHT_ND_DIM_LIMIT), return false);
+            }
             // weight scale dims (per-layer single-tensor form)
             OP_CHECK_WRONG_DIMENSION(wScale,
                                      (gmmDsqParams_.dequantMode == 0 ? SINGLE_WEIGHT_SCALE_PERCHANNEL_DIM_LIMIT
@@ -291,14 +298,22 @@ class GroupedMatmulSwigluQuantBaseHandler : public GroupedMatmulSwigluQuantHandl
             }
             op::Format weightViewFormat = w->GetViewFormat();
             if (IsPrivateFormat(weightViewFormat)) {
-                if (!(w->GetViewShape() == weightNZExpectShape || w->GetViewShape() == weightNZTransposeExpectShape1 ||
-                      w->GetViewShape() == weightNZTransposeExpectShape2)) {
+                const auto &viewShape = w->GetViewShape();
+                const auto &storageShape = w->GetStorageShape();
+                bool explicitNZView = viewShape == weightNZExpectShape ||
+                                      viewShape == weightNZTransposeExpectShape1 ||
+                                      viewShape == weightNZTransposeExpectShape2;
+                bool logicalNZView = viewShape == weightNDExpectShape &&
+                                     (storageShape == weightNZExpectShape ||
+                                      storageShape == weightNZTransposeExpectShape1 ||
+                                      storageShape == weightNZTransposeExpectShape2);
+                if (!(explicitNZView || logicalNZView)) {
                     OP_LOGE(ACLNN_ERR_PARAM_INVALID,
-                            "Expected tensor for weight to have same size as %s %s or %s, but got %s.",
+                            "Expected NZ weight view or storage shape %s %s or %s, but got view %s and storage %s.",
                             op::ToString(weightNZExpectShape).GetString(),
                             op::ToString(weightNZTransposeExpectShape1).GetString(),
                             op::ToString(weightNZTransposeExpectShape2).GetString(),
-                            op::ToString(w->GetViewShape()).GetString());
+                            op::ToString(viewShape).GetString(), op::ToString(storageShape).GetString());
                     return false;
                 }
             } else {
@@ -473,7 +488,8 @@ class GroupedMatmulSwigluQuantBaseHandler : public GroupedMatmulSwigluQuantHandl
         return false;
     }
 
-    void UnpackInt32ToInt4(const aclTensor *&tensorS32, const std::string &tensorType)
+    void UnpackInt32ToInt4(const aclTensor *&tensorS32, const std::string &tensorType,
+                           bool nzWeightPackedAsInt8 = false)
     {
         OP_LOGD("Unpack %s from int32 to int4 start.", tensorType.c_str());
         auto tensorS4 = const_cast<aclTensor *>(tensorS32);
@@ -495,7 +511,11 @@ class GroupedMatmulSwigluQuantBaseHandler : public GroupedMatmulSwigluQuantHandl
             OP_LOGD("Reset %s storageShape because tensor is NZ format.", tensorType.c_str());
             auto storageShape = tensorS4->GetStorageShape();
             auto storageShapeDim = storageShape.GetDimNum();
-            storageShape[storageShapeDim - 1] *= INT4_PER_INT32;
+            // The W4A8 loader packs two INT4 values into each INT8 before NZ
+            // conversion, then exposes an INT32 view. NZ storage retains the
+            // original INT8 element geometry, unlike an ND INT32 tensor.
+            storageShape[storageShapeDim - 1] *=
+                nzWeightPackedAsInt8 ? INT4_PER_INT8 : INT4_PER_INT32;
             tensorS4->SetStorageShape(storageShape);
         }
         if (transposeTensor) {
@@ -531,7 +551,7 @@ class GroupedMatmulSwigluQuantBaseHandler : public GroupedMatmulSwigluQuantHandl
                 size_t wLength = gmmDsqParams_.weight->Size();
                 for (size_t i = 0; i < wLength; i++) {
                     const aclTensor *w = (*gmmDsqParams_.weight)[i];
-                    UnpackInt32ToInt4(w, "weight");
+                    UnpackInt32ToInt4(w, "weight", gmmDsqParams_.isA8W4);
                 }
             }
 

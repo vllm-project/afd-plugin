@@ -153,3 +153,17 @@ opbuild's filename (issue #372). No extra JSON aliases are installed.
 No new NPU correctness, performance, or ACL graph support is claimed without
 device validation. The new operators are inference-only and do not transfer
 shared-expert payloads.
+
+## Layered GMM device group list
+
+`torch.ops.afd_ascend.grouped_matmul_layered` requires a device `group_list`
+tensor. It must be a nonempty 1D `int64` tensor on the same
+NPU as `x[0]`, with one entry per expert in each layer's weight tensor.
+`group_list_type=1` means counts and passes the tensor directly to ACLNN.
+`group_list_type=0` means cumulative offsets, which are converted to counts on
+the NPU. It accepts one merged 2D activation in `x`, `split_item=3`, and a
+one-element device `int64` `layer_index`. Output rows come from `x[0].shape[0]`;
+the caller can supply a capacity-sized activation without a group-count read.
+`per_token_scale` is optional at the binding level; A8W4 MSD requires a
+capacity-sized device `float32` tensor. An absent `group_list` and other split
+modes are not supported by this binding.

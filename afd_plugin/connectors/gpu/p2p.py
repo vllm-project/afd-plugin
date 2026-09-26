@@ -269,7 +269,7 @@ class P2pNcclAFDConnector(AFDConnectorBase):
             world_size=self.ffn_size + self.attn_size,
             rank=self.world_rank,
             group_name="afd",
-            timeout=timedelta(minutes=2),
+            timeout=timedelta(seconds=self.afd_config.afd_process_group_timeout_s),
         )
 
         with DefaultProcessGroupSwitcher(_get_default_group(), afd_pg):

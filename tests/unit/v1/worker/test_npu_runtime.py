@@ -444,6 +444,8 @@ def _new_ffn_runner():
     # object.__new__ bypasses __init__, which is where the runner would set up
     # the profiler and device; provide inert defaults the runtime paths expect.
     runner = object.__new__(AFDNPUFFNModelRunner)
+    runner._layered_executor = None
+    runner._layered_gmm_requested = False
     runner.prof = None
     runner.device = SimpleNamespace(type="npu")
     runner._is_shutdown = False

@@ -306,3 +306,58 @@ actual vendor library path. Missing source operators fail startup.
 
 For startup, HCCL, CAM operator, and shutdown failures, see the
 [NPU troubleshooting guide](TROUBLESHOOTING.md).
+
+## W4A8 layered GMM (experimental, disabled by default)
+
+Set `AFD_ASYNC_CAM_LAYERED_GMM=1` on every FFN rank to use the two layered GMM
+operators for compatible W4A8 routed experts. Leave it unset on Attention
+ranks; enabling it on another role or connector fails at startup. The startup
+log must show `actual=layered` to confirm that the new path is active.
+
+```bash
+# Use the same checkpoint, topology, capacity, and requests for both runs.
+AFD_ASYNC_CAM_LAYERED_GMM=0 bash <W4A8-FFN-launch-script>
+AFD_ASYNC_CAM_LAYERED_GMM=1 bash <W4A8-FFN-launch-script>
+```
+
+The intended configuration is Ascend 910C / `ascend910_93`, async CAM FFN,
+Attention-side gate, `dynamicQuant=1`, eager ModelRunnerV1, and static expert
+placement. This path applies only to Ascend DeepSeek V4; enabling the switch
+for another model fails at startup. All remote MoE layers must share geometry,
+SiLU activation, quantization layout, and scaling semantics. Both per-channel
+and per-group parameters can be extracted, but neither mode has been validated
+with a target checkpoint. Shared experts remain on Attention. DSV4 already
+applies routed scaling in top-k, so FFN does not apply it again.
+
+The existing fused operator does not apply a nonzero `swiglu_limit`. The
+layered path temporarily ignores the model's limit and logs
+`swiglu_limit=<value> ignored=True`; its output must not be treated as a
+precision-equivalent replacement until the fused operator implements the
+clamp. Missing `w13_scale_bias` or `w2_scale_bias`, dynamic EPLB, non-SiLU
+activation, or incompatible parameters fail before receiving work. Non-W4A8,
+mixed-quantization, and heterogeneous layers stay on the legacy path with a
+startup reason. Do not fill absent compensation parameters with zeros merely
+to enable this path.
+
+The new path uses the full dispatch-recv capacity and device expert counts. A
+slice of the original metadata, or a device mapping, selects the layer; the
+original metadata goes to combine-send. Empty ranks, chunks, and ubatches use
+the existing communication protocol. With `AFD_CAM_OP_IO_LOG` enabled, the new
+path logs only Tensor shape, dtype, and device without reading metadata values.
+The existing synchronization after each work-item group remains. Measure peak
+memory for the capacity-sized intermediates, and set `BATCH_SIZE_FACTOR` high
+enough for every whole-expert chunk.
+
+CPU contract tests cover layer mapping, repeated layer IDs, capacity, zero
+counts, parameter rejection, startup selection, and the absence of explicit
+metadata D2H in the new Python path. They do not establish NPU numerical
+accuracy, empty-work completion, hidden synchronization, or a performance gain.
+Run the compiled Meta and NPU numerical tests described in the
+[testing guide](TESTING.md#layered-w4a8-validation). Multi-rank CAM completion,
+checkpoint accuracy, profiling, and A/B performance still need target-device
+validation.
+
+To revert, set `AFD_ASYNC_CAM_LAYERED_GMM=0` and restart the FFN processes.
+For performance runs, disable `AFD_CAM_OP_IO_LOG` and
+`AFD_FORCE_BALANCED_TOPK_IDS`, retain the actual-path startup log, and measure
+the existing group synchronization separately.

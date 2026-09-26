@@ -61,8 +61,7 @@ _N = 64  # output features
 _INT4_PER_INT32 = 8
 
 # Device shapes for the opt-in runtime test. Two layers are supplied so the
-# device-side layer_index has a real choice and the host list-length check has
-# something to accept.
+# device-side layer_index has a real choice.
 _RUNTIME_LAYERS = 2
 _RUNTIME_M = 128
 _RUNTIME_K = 256
@@ -107,7 +106,7 @@ def _build_meta_inputs(torch: ModuleType, layers: int = 1) -> dict:
         ],
         "layer_index": torch.zeros((1,), dtype=torch.int64, **meta),
         "per_token_scale": torch.empty((_M,), dtype=torch.float32, **meta),
-        "group_list": [_M // _E] * _E,
+        "group_list": torch.empty((_E,), dtype=torch.int64, **meta),
     }
 
 
@@ -118,8 +117,8 @@ def _invoke_gmm(torch: ModuleType, inputs: dict) -> list:
         inputs["all_bias"],
         inputs["all_scale"],
         inputs["layer_index"],
-        inputs["per_token_scale"],
         inputs["group_list"],
+        inputs["per_token_scale"],
         1,  # group_list_type: count
         3,  # split_item: NO_SEPARATED
         None,  # output_dtype: derive from the A8W4 scenario
@@ -129,6 +128,9 @@ def _invoke_gmm(torch: ModuleType, inputs: dict) -> list:
 def test_gmm_layered_registers_inference_and_meta_kernels(
     gmm_runtime: ModuleType,
 ) -> None:
+    schema = str(gmm_runtime.ops.afd_ascend.grouped_matmul_layered.default._schema)
+    assert "Tensor group_list" in schema
+    assert "int[]? group_list" not in schema
     for dispatch_key in ("PrivateUse1", "AutogradPrivateUse1", "Meta"):
         assert gmm_runtime._C._dispatch_has_kernel_for_dispatch_key(
             _OP_NAME, dispatch_key
@@ -200,8 +202,8 @@ def test_gmm_layered_rejects_bad_split_item(gmm_runtime: ModuleType) -> None:
             inputs["all_bias"],
             inputs["all_scale"],
             inputs["layer_index"],
-            inputs["per_token_scale"],
             inputs["group_list"],
+            inputs["per_token_scale"],
             1,  # group_list_type
             9,  # split_item out of range
             None,
@@ -213,7 +215,7 @@ def test_gmm_layered_runtime_multi_layer(gmm_runtime: ModuleType) -> None:
 
     This is the only layer that reaches the op_api validation and the kernel, so
     it covers what Meta cannot: the per-layer TensorList indexing driven by the
-    device-side layer_index, and the host list-length checks. It needs a 910C
+    device-side layer_index and group list. It needs a 910C
     device and the AFD CANN run package, hence the opt-in gate.
     """
     if os.environ.get(_RUNTIME_ENV_VAR) != "1":
@@ -244,7 +246,9 @@ def test_gmm_layered_runtime_multi_layer(gmm_runtime: ModuleType) -> None:
         for _ in range(_RUNTIME_LAYERS)
     ]
     per_token_scale = torch.ones((_RUNTIME_M,), dtype=torch.float32, device=device)
-    group_list = [_RUNTIME_M // _RUNTIME_E] * _RUNTIME_E
+    group_list = torch.full(
+        (_RUNTIME_E,), _RUNTIME_M // _RUNTIME_E, dtype=torch.int64, device=device
+    )
 
     for layer in range(_RUNTIME_LAYERS):
         outputs = torch.ops.afd_ascend.grouped_matmul_layered(
@@ -253,8 +257,8 @@ def test_gmm_layered_runtime_multi_layer(gmm_runtime: ModuleType) -> None:
             all_bias,
             all_scale,
             torch.tensor([layer], dtype=torch.int64, device=device),
-            per_token_scale,
             group_list,
+            per_token_scale,
             1,  # group_list_type: count
             3,  # split_item: NO_SEPARATED
             None,
@@ -266,3 +270,26 @@ def test_gmm_layered_runtime_multi_layer(gmm_runtime: ModuleType) -> None:
         assert tuple(y_out.shape) == (_RUNTIME_M, _RUNTIME_N)
         assert y_out.dtype == torch.bfloat16
         assert y_out.device.type == "npu"
+
+
+def test_gmm_layered_device_group_list_meta(gmm_runtime: ModuleType) -> None:
+    torch = gmm_runtime
+    inputs = _build_meta_inputs(torch, layers=2)
+    inputs["group_list"] = torch.empty((_E,), dtype=torch.int64, device="meta")
+    # A slice with a nonzero storage offset is the production layer-index contract.
+    inputs["layer_index"] = torch.empty((5,), dtype=torch.int64, device="meta")[2:3]
+    output = torch.ops.afd_ascend.grouped_matmul_layered(
+        **inputs,
+        output_dtype=torch.bfloat16,
+    )[0]
+    assert output.shape == (_M, _N)
+    assert output.dtype == torch.bfloat16
+    cumulative = torch.ops.afd_ascend.grouped_matmul_layered(
+        **inputs, group_list_type=0
+    )[0]
+    assert cumulative.shape == output.shape
+    with pytest.raises(RuntimeError, match="group_list_type=0/1"):
+        torch.ops.afd_ascend.grouped_matmul_layered(**inputs, group_list_type=2)
+    inputs["group_list"] = torch.empty((_E,), dtype=torch.int32, device="meta")
+    with pytest.raises(RuntimeError, match="1D int64"):
+        torch.ops.afd_ascend.grouped_matmul_layered(**inputs)

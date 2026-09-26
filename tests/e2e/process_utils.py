@@ -32,6 +32,45 @@ def close_process_identities(processes: Sequence[ProcessIdentity]) -> None:
             os.close(process.pidfd)
 
 
+def process_group_is_alive(pgid: int, *, proc_root: Path = PROC_ROOT) -> bool:
+    """Return whether a process group has a member that is not a zombie.
+
+    ``os.killpg(pgid, 0)`` also succeeds for zombies, which a non-reaping PID 1
+    (for example ``exec pytest`` in a container) never collects. Zombies hold no
+    device memory, so a group whose only members are zombies counts as gone.
+    Errors from ``os.killpg`` other than ``ProcessLookupError`` propagate, and a
+    ``stat`` entry whose process group cannot be parsed raises ``ValueError``.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    try:
+        process_entries = list(proc_root.iterdir())
+    except OSError:
+        return True
+    found_zombie_member = False
+    for process_entry in process_entries:
+        if not process_entry.name.isdecimal():
+            continue
+        try:
+            # Read bytes: comm is arbitrary bytes and need not be valid UTF-8.
+            stat = (process_entry / "stat").read_bytes()
+        except OSError:
+            # Processes may exit or be inaccessible while /proc is scanned.
+            continue
+        # comm may contain spaces or ')'; state, ppid and pgrp follow the last ')'.
+        fields = stat[stat.rfind(b")") + 2 :].split()
+        if len(fields) < 3 or int(fields[2]) != pgid:
+            continue
+        if fields[0] not in (b"Z", b"X"):
+            return True
+        found_zombie_member = True
+    # Finding no member at all means /proc is unavailable or the group exited
+    # mid-scan; keep the conservative killpg answer and let the caller re-poll.
+    return not found_zombie_member
+
+
 def terminate_process_groups(
     processes: Sequence[subprocess.Popen[str]],
     *,
@@ -40,12 +79,15 @@ def terminate_process_groups(
     reap_timeout_s: float,
     process_name: str = "",
     deferred_sigkill_pgids: Collection[int] = (),
+    proc_root: Path = PROC_ROOT,
 ) -> list[str]:
     """Terminate process groups with one deadline and reap their leaders.
 
     ``deferred_sigkill_pgids`` identifies process groups whose successful
     SIGKILL escalation and liveness verification are owned by caller-specific
     cleanup. Signal-delivery and process-reaping failures are always reported.
+    A group whose remaining members are all zombies counts as terminated; see
+    ``process_group_is_alive``.
     """
     failures: list[str] = []
     live_pgids: list[int] = []
@@ -89,10 +131,9 @@ def terminate_process_groups(
         surviving_pgids: list[int] = []
         for pgid in live_pgids:
             try:
-                os.killpg(pgid, 0)
-            except ProcessLookupError:
-                continue
-            except OSError as exc:
+                if not process_group_is_alive(pgid, proc_root=proc_root):
+                    continue
+            except (OSError, ValueError) as exc:
                 failures.append(
                     f"liveness check failed for {group_description} {pgid}: {exc}",
                 )
@@ -137,10 +178,9 @@ def terminate_process_groups(
         still_alive: list[int] = []
         for pgid in surviving_pgids:
             try:
-                os.killpg(pgid, 0)
-            except ProcessLookupError:
-                continue
-            except OSError as exc:
+                if not process_group_is_alive(pgid, proc_root=proc_root):
+                    continue
+            except (OSError, ValueError) as exc:
                 failures.append(
                     f"post-SIGKILL liveness check failed for "
                     f"{group_description} {pgid}: {exc}",

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 
 from afd_plugin.config_utils import coerce_extra_bool as _coerce_bool
 from afd_plugin.config_utils import coerce_extra_int as _coerce_int
+from afd_plugin.config_utils import coerce_extra_positive_int as _coerce_positive_int
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -62,6 +63,10 @@ class AFDConfig:
     num_ffn_ranks: int = 1
     # Whether Attention computes MoE gate outputs before sending to FFN.
     compute_gate_on_attention: bool = False
+    # Timeout, in seconds, for the AFD world process group rendezvous.
+    # The right value depends on rank count, placement, and model size, so
+    # it is left to the caller (deployment tooling) rather than derived here.
+    afd_process_group_timeout_s: int = 120
 
     @property
     def afd_connector(self) -> str:
@@ -146,6 +151,12 @@ def _normalize_mapping(
                 normalized[field_name],
                 field_name=field_name,
             )
+
+    if "afd_process_group_timeout_s" in normalized:
+        normalized["afd_process_group_timeout_s"] = _coerce_positive_int(
+            normalized["afd_process_group_timeout_s"],
+            field_name="afd_process_group_timeout_s",
+        )
 
     if "compute_gate_on_attention" in normalized:
         normalized["compute_gate_on_attention"] = _coerce_bool(

@@ -228,6 +228,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
     ) -> AFDAsyncExtraInfo:
         return AFDAsyncExtraInfo.from_mapping(raw)
 
+    layered_gmm_enabled: bool = False
+
     def __init__(
         self,
         rank: int,
@@ -747,6 +749,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             ffn_output=ffn_output,
             comm_args=self.comm_args,
             token_nums_rankid_layeridx=token_nums_rankid_layeridx,
+            metadata_values=not self.layered_gmm_enabled,
             comm_id=self.comm_id,
             max_seq_len=self.max_num_batched_tokens,
             batch_size=states.batch_size,
@@ -798,7 +801,9 @@ _CAM_LOG_SKIPPED_ARGS = frozenset({"comm_args", "comm_id", "group_name"})
 _CAM_OP_IO_LOG_ENV = "AFD_CAM_OP_IO_LOG"
 
 
-def _log_cam_op_values(op_name: str, label: str, **kwargs: object) -> None:
+def _log_cam_op_values(
+    op_name: str, label: str, *, metadata_values: bool = True, **kwargs: object
+) -> None:
     if os.environ.get(_CAM_OP_IO_LOG_ENV, "").lower() not in {
         "1",
         "true",
@@ -811,8 +816,11 @@ def _log_cam_op_values(op_name: str, label: str, **kwargs: object) -> None:
         if name in _CAM_LOG_SKIPPED_ARGS:
             continue
         if isinstance(value, Tensor):
-            description = f"Tensor(dtype={value.dtype}, shape={tuple(value.shape)})"
-            if name == "token_nums_rankid_layeridx":
+            description = (
+                f"Tensor(dtype={value.dtype}, shape={tuple(value.shape)}, "
+                f"device={value.device})"
+            )
+            if metadata_values and name == "token_nums_rankid_layeridx":
                 try:
                     first5: object = value.detach().flatten()[:5].cpu().tolist()
                 except Exception as exc:  # pragma: no cover - defensive logging helper

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -144,6 +147,21 @@ def test_original_common_afd_field_aliases_are_supported():
     assert config.connector == "P2pNcclAFDConnector"
     assert config.afd_host == "localhost"
     assert config.afd_port == 2345
+
+
+def test_afd_process_group_timeout_s_defaults_and_is_configurable():
+    assert afd_config_from_mapping({}).afd_process_group_timeout_s == 120
+
+    config = afd_config_from_mapping({"afd_process_group_timeout_s": "300"})
+
+    assert config.afd_process_group_timeout_s == 300
+
+
+def test_afd_process_group_timeout_s_must_be_positive():
+    with pytest.raises(
+        ValueError, match="afd_process_group_timeout_s must be positive"
+    ):
+        afd_config_from_mapping({"afd_process_group_timeout_s": 0})
 
 
 def test_has_afd_config_only_checks_presence():
