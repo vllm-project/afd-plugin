@@ -533,12 +533,18 @@ def configure_scenario(args: argparse.Namespace) -> None:
         # microbatch count (2), so a decode threshold of 1 is rejected.
         args.dbo_decode_token_threshold = 2
         args.dbo_prefill_token_threshold = 8
+        # vLLM 0.30 requires chunked prefill when mamba cache mode 'align'
+        # is active (hybrid Qwen3.5/3.6 models), so callers can opt out of
+        # the legacy DBO chunked-prefill disable via env.
         if not any(
             arg == "--no-enable-chunked-prefill" for arg in args.common_vllm_arg
-        ):
+        ) and os.environ.get("AFD_E2E_DBO_KEEP_CHUNKED_PREFILL") != "1":
             args.common_vllm_arg.append("--no-enable-chunked-prefill")
-        if not any(
-            arg == "--no-enable-chunked-prefill" for arg in args.common_vllm_arg
+        if (
+            not any(
+                arg == "--no-enable-chunked-prefill" for arg in args.common_vllm_arg
+            )
+            and os.environ.get("AFD_E2E_DBO_KEEP_CHUNKED_PREFILL") != "1"
         ):
             args.common_vllm_arg.append("--no-enable-chunked-prefill")
 
