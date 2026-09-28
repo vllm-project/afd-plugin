@@ -536,10 +536,6 @@ def configure_scenario(args: argparse.Namespace) -> None:
         # vLLM 0.30 requires chunked prefill when mamba cache mode 'align'
         # is active (hybrid Qwen3.5/3.6 models), so callers can opt out of
         # the legacy DBO chunked-prefill disable via env.
-        if not any(
-            arg == "--no-enable-chunked-prefill" for arg in args.common_vllm_arg
-        ) and os.environ.get("AFD_E2E_DBO_KEEP_CHUNKED_PREFILL") != "1":
-            args.common_vllm_arg.append("--no-enable-chunked-prefill")
         if (
             not any(
                 arg == "--no-enable-chunked-prefill" for arg in args.common_vllm_arg

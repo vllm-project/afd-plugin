@@ -25,6 +25,12 @@ from typing import TYPE_CHECKING, Any
 
 import vllm.v1.engine.core as core_module
 
+from afd_plugin.compat.vllm import (
+    TARGET_VLLM_VERSION,
+)
+from afd_plugin.compat.vllm import (
+    is_target_vllm_compatible as _is_target_vllm_compatible,
+)
 from afd_plugin.config import AFDConfig, parse_optional_afd_config
 
 if TYPE_CHECKING:
@@ -255,10 +261,12 @@ def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
     if _is_afd_ffn_config(vllm_config):
         _prepare_late_loaded_ffn_engine_core(self, vllm_config)
         return _AFDFFNKVCacheConfig()
+    # ### PATCH END: AFD FFN late-loaded KV cache bypass
 
+    # ### PATCH START: NPU KV cache utils patch hook
     if vllm_config.device_config.device_type == "npu":
         import vllm_ascend.patch.platform.patch_kv_cache_utils  # noqa: F401
-    # ### PATCH END: AFD FFN late-loaded KV cache bypass
+    # ### PATCH END: NPU KV cache utils patch hook
 
     start = time.time()
 
@@ -711,12 +719,19 @@ def _get_afd_config(vllm_config: VllmConfig | None) -> AFDConfig | None:
         return None
 
 
-core_module.EngineCore.__init__ = __init__
-core_module.EngineCore._initialize_kv_caches = _initialize_kv_caches
-core_module.EngineCore.shutdown = shutdown
-core_module.EngineCoreProc.run_busy_loop = run_busy_loop
-core_module.DPEngineCoreProc.run_busy_loop = run_busy_loop
-core_module.logger.debug("AFD EngineCore patch applied")
+if _is_target_vllm_compatible():
+    core_module.EngineCore.__init__ = __init__
+    core_module.EngineCore._initialize_kv_caches = _initialize_kv_caches
+    core_module.EngineCore.shutdown = shutdown
+    core_module.EngineCoreProc.run_busy_loop = run_busy_loop
+    core_module.DPEngineCoreProc.run_busy_loop = run_busy_loop
+    core_module.logger.debug("AFD EngineCore patch applied")
+else:
+    core_module.logger.warning(
+        "Skipping AFD EngineCore patch: vLLM %s does not match target %s",
+        getattr(core_module, "VLLM_VERSION", "unknown"),
+        TARGET_VLLM_VERSION,
+    )
 
 
 __all__: list[str] = []
