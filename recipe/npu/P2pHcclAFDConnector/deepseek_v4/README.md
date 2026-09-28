@@ -21,7 +21,7 @@ Use an image or environment containing this exact software family:
 | --- | --- |
 | Hardware | One eight-device Atlas A5 host |
 | vLLM | `releases/v0.23.0`, commit `0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665` |
-| vLLM-Ascend | `rfc/vllm_cann`, commit `3da28f9414583d2d0b672a8f06d1fae142404bda` |
+| vLLM-Ascend | `rfc/vllm_cann`, commit `11ee45653b199a097805b87011824a81ffa51b95` |
 | afd-plugin | `feat/dsv4-afd-phase1-delivery`, commit `57bcde14cc0da248bfcb8641476b8426811a64c5` |
 | CANN/HCCL | The exact versions recorded in the validated image manifest |
 

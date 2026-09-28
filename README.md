@@ -113,7 +113,7 @@ profile required by the recipe:
 | Profile | Platform | vLLM | vLLM-Ascend | Connector/model |
 | --- | --- | --- | --- | --- |
 | A3 CAM | openEuler 22.03 aarch64, Ascend 910C / Atlas A3 | `0.26.0` | [`80d8c194f`](https://github.com/vllm-project/vllm-ascend/commit/80d8c194f7584b17fe08065ea99a130916f6b0e7) | CAM, DeepSeek-V3.2 |
-| A5 DeepSeek-V4 | Single-host eight-device Atlas A5 | `0.23.0` (`0fc695fc`) | `rfc/vllm_cann` (`3da28f941`) | HCCL P2P A4F2 recipe; Window AFD code path |
+| A5 DeepSeek-V4 | Single-host eight-device Atlas A5 | `0.23.0` (`0fc695fc`) | `rfc/vllm_cann` (`11ee45653`) | HCCL P2P A4F2 recipe; Window AFD code path |
 
 Use Python 3.10 or 3.11 and the mutually compatible CANN, HCCL, torch, and
 torch-npu versions recorded by the selected runtime or image manifest.

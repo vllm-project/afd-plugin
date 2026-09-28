@@ -27,7 +27,7 @@ The DeepSeek-V4 A5 recipe is tied to the following source baseline:
 | Component | Baseline |
 | --- | --- |
 | vLLM | `releases/v0.23.0`, `0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665` |
-| vLLM-Ascend | `rfc/vllm_cann`, `3da28f9414583d2d0b672a8f06d1fae142404bda` |
+| vLLM-Ascend | `rfc/vllm_cann`, `11ee45653b199a097805b87011824a81ffa51b95` |
 | afd-plugin | `feat/dsv4-afd-phase1-delivery`, `57bcde14cc0da248bfcb8641476b8426811a64c5` |
 | Hardware | One eight-device Atlas A5 host for the A4F2 recipe |
 | CANN/HCCL | Exact versions from the validated image manifest |
