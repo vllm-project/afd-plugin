@@ -16,10 +16,13 @@ tests for GPU and Ascend NPU deployments.
 > This project is still experimental and needs more large-scale testing across
 > different hardware backends.
 
-The target runtime is **vLLM `v0.26.0`**. The plugin does not modify the vLLM
-source tree. AFD behavior is installed through the `vllm.general_plugins` entry
-point, `--additional-config`, automatically selected role workers, plugin-owned
-model wrappers, and narrow version-scoped compatibility shims.
+The supported runtime baselines are **vLLM `v0.23.0` and `v0.26.0`**. Features
+remain version scoped: the DeepSeek-V4 Atlas A5 HCCL P2P recipe uses v0.23,
+while the DeepSeek-V3.2 Atlas A3 CAM recipes use v0.26. The plugin does not
+modify the vLLM source tree. AFD behavior is installed through the
+`vllm.general_plugins` entry point, `--additional-config`, automatically
+selected role workers, plugin-owned model wrappers, and narrow version-scoped
+compatibility shims.
 
 ## Architecture
 
@@ -34,15 +37,16 @@ Core runtime support:
   execution for CUDA and Ascend NPU.
 - Eager and `FULL_DECODE_ONLY` graph execution, plus backend-specific profiling
   support.
-- Native DBO with exactly two ubatches on CUDA and the synchronous Ascend path.
-- DeepSeek MoE handoff at the remote-experts boundary on CUDA, with the gate
-  placed on either Attention or FFN.
+- Native DBO with exactly two ubatches on CUDA and the supported Ascend paths.
+- DeepSeek MoE handoff at the remote-experts boundary on CUDA and DeepSeek-V4
+  Ascend NPU, with backend-specific gate placement.
 
 Model support:
 
 | Model family | Registered architectures | Plugin model wrappers | Notes |
 | --- | --- | --- | --- |
 | DeepSeekV2 / DeepSeekV3 / DeepSeekV3.2 | `DeepseekForCausalLM`, `DeepseekV2ForCausalLM`, `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | `AFDDeepseekForCausalLM`, `AFDDeepseekV2ForCausalLM`, `AFDDeepseekV3ForCausalLM` | DeepSeekV3.2 uses `AFDDeepseekV3ForCausalLM`. Each AFD role constructs and loads only its role-required model components, while shared embedding, normalization, and output components remain available where required by the model lifecycle. |
+| DeepSeekV4 | `DeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` | The pinned v0.23 Ascend path supports role-selective model loading, synchronous HCCL P2P and Window communication, eager and `FULL_DECODE_ONLY` Graph execution, U2, and MTP/DSpark integration within the validator's feature boundaries. The public A5 A4F2 recipe uses HCCL P2P with MTP and DSpark disabled; Window AFD remains a separately documented code path. |
 
 Connector support:
 
@@ -51,6 +55,8 @@ See the [recipe index](recipe/README.md) for deployment and benchmark examples.
 | Connector | Platform | Recommend Stage | Sync or Async | Graph Support | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `P2pNcclAFDConnector` | CUDA | Decode | Sync | `FULL_DECODE_ONLY` CUDA graph | FFN ranks are ordered before Attention ranks. `num_attention_ranks` must be greater than or equal to `num_ffn_ranks` and divisible by it. See the [DeepSeek V2 Lite recipe](recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md). |
+| `P2pHcclAFDConnector` | Ascend NPU | Decode | Sync | `FULL_DECODE_ONLY` ACL graph | Uses standard PyTorch distributed HCCL send/receive and supports integer-multiple A/F ratios in either direction. The [A5 DeepSeek-V4 A4F2 recipe](recipe/npu/P2pHcclAFDConnector/deepseek_v4/README.md) is pinned to v0.23. See the [connector guide](docs/npu/HCCL_P2P_CONNECTOR_USER_GUIDE.md). |
+| `WindowAFDConnector` | Ascend NPU | Decode | Lock-step or async DP | `FULL_DECODE_ONLY` ACL graph | Uses HCCL CommContext Window operators, Attention-side routing, and a dedicated shared-expert FFN rank. The implementation supports one or two Window slots; async DP allows Attention sessions to advance independently. See the [code-level connector guide](docs/npu/WINDOW_AFD_CONNECTOR_USER_GUIDE.md). |
 | `CAMP2pAFDConnector` | Ascend NPU | Decode | Sync | `FULL_DECODE_ONLY` ACL graph | Uses HCCL/CAMP2P custom ops. Ascend ops build by default on NPU platforms. See the [synchronous DeepSeek V3.2 recipe](recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md). |
 | `CAMAsyncAFDConnector` | Ascend NPU | Prefill | Async | Not supported | Validated on v0.26 without PCP or Dual Batch. The checked-in [PCP8 recipe](recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) records the earlier v0.19.1rc1 experiment and must be used with the `release/v0.19.1rc1` branch. |
 
@@ -60,12 +66,17 @@ Connector implementations are grouped by backend package:
 
 Known gaps:
 
-- vLLM versions other than `0.26.0` are not claimed as supported.
+- vLLM versions other than the exact `0.23.0` and `0.26.0` baselines are not
+  claimed as supported; individual connectors and models remain tied to their
+  documented baseline.
 - vLLM/vLLM-Ascend model runner v2 is not supported.
 - GPU and NPU E2E tests are opt-in and require real hardware plus model weights.
 - GPU CUDA graph support is limited to `FULL_DECODE_ONLY`.
 - Native DBO is limited to exactly two ubatches and is not supported by
   `CAMAsyncAFDConnector`.
+- `WindowAFDConnector` is code-supported on the pinned v0.23 DeepSeek-V4 path,
+  but this repository does not yet publish a hardware-qualified launch recipe
+  for it.
 - PCP-based NPU model-runner-v1 deployments from v0.19.1rc1 are not supported
   on v0.26.
 
@@ -95,16 +106,17 @@ The optional extra pins `vllm==0.26.0`.
 
 ### Ascend NPU installation
 
-AFD's Ascend path is validated on openEuler 22.03 (aarch64) with
-Ascend 910C / Atlas A3. Install a compatible driver and firmware, and confirm
-the devices with `npu-smi info`. Use this source baseline:
+AFD's Ascend paths have separate version-scoped baselines. Install a compatible
+driver and firmware, confirm the devices with `npu-smi info`, and select the
+profile required by the recipe:
 
-| Component | Version |
-| --- | --- |
-| Python | `3.10` or `3.11` |
-| vLLM | `0.26.0` |
-| vLLM-Ascend | commit [`80d8c194f`](https://github.com/vllm-project/vllm-ascend/commit/80d8c194f7584b17fe08065ea99a130916f6b0e7) |
-| CANN / torch / torch-npu | Use the mutually compatible versions required by that vLLM-Ascend source snapshot. |
+| Profile | Platform | vLLM | vLLM-Ascend | Connector/model |
+| --- | --- | --- | --- | --- |
+| A3 CAM | openEuler 22.03 aarch64, Ascend 910C / Atlas A3 | `0.26.0` | [`80d8c194f`](https://github.com/vllm-project/vllm-ascend/commit/80d8c194f7584b17fe08065ea99a130916f6b0e7) | CAM, DeepSeek-V3.2 |
+| A5 DeepSeek-V4 | Single-host eight-device Atlas A5 | `0.23.0` (`0fc695fc`) | `rfc/vllm_cann` (`3da28f941`) | HCCL P2P A4F2 recipe; Window AFD code path |
+
+Use Python 3.10 or 3.11 and the mutually compatible CANN, HCCL, torch, and
+torch-npu versions recorded by the selected runtime or image manifest.
 
 #### Environment
 
@@ -113,6 +125,13 @@ the repository does not currently claim a released v0.26 container tag. Use the
 [installation guide at that source snapshot](https://github.com/vllm-project/vllm-ascend/blob/80d8c194f7584b17fe08065ea99a130916f6b0e7/docs/source/installation.md)
 to prepare a matching A3/openEuler environment, then install AFD from the
 repository root. Do not reuse the former v0.19.1rc1 image as a v0.26 runtime.
+
+The v0.23 A5 path is distributed as a pinned image because its CANN and HCCL
+packages must remain an auditable unit. Follow the
+[DeepSeek-V4 HCCL P2P recipe](recipe/npu/P2pHcclAFDConnector/deepseek_v4/README.md),
+record the final image digest and package versions, and do not mix a host CANN
+toolkit into the container. The HCCL P2P connector uses standard distributed
+send/receive and does not require the CAMP2P custom operators.
 
 #### Install AFD
 
@@ -146,9 +165,14 @@ print("AFD_OPS_OK")
 PY
 ```
 
-After `AFD_OPS_OK`, the environment is ready to run the NPU examples and E2E
-tests. See the
-[synchronous NPU recipe](recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md).
+After `AFD_OPS_OK`, the environment is ready to run the CAM NPU examples and
+E2E tests. See the
+[synchronous CAM recipe](recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md).
+For the v0.23 A5 path, use the separately pinned
+[HCCL P2P recipe](recipe/npu/P2pHcclAFDConnector/deepseek_v4/README.md).
+The experimental Window path has separate runtime and checkpoint constraints;
+read the [Window connector guide](docs/npu/WINDOW_AFD_CONNECTOR_USER_GUIDE.md)
+before constructing a launch configuration.
 For implementation details, see the
 [Attention runtime design](docs/design/module/attention_runtime.md) and
 [FFN runtime design](docs/design/module/ffn_runtime.md).
@@ -215,9 +239,10 @@ vllm serve /path/to/DeepSeek-V2-Lite \
   --additional-config '{"afd":{"role":"attention","connector":"CAMP2pAFDConnector","host":"127.0.0.1","port":6239,"num_attention_ranks":1,"num_ffn_ranks":1}}'
 ```
 
-Attention and FFN may be started in either order. Send requests only to the
-Attention API server. FFN workers are connector-driven; scheduler-driven FFN
-`execute_model()` calls fail fast.
+Launch Attention and FFN back-to-back because either side can wait during AFD
+rendezvous. The A5 recipe starts FFN first and Attention immediately afterward.
+Send requests only to the Attention API server. FFN workers are
+connector-driven; scheduler-driven FFN `execute_model()` calls fail fast.
 
 For repeatable local smoke testing, prefer the bundled runner:
 
@@ -234,8 +259,9 @@ uv run python tests/e2e/runner.py \
   --common-vllm-arg=--trust-remote-code
 ```
 
-For NPU, use `--device-backend npu`; the runner maps the same device arguments
-to `ASCEND_RT_VISIBLE_DEVICES` and selects `CAMP2pAFDConnector`.
+For NPU, use `--device-backend npu`; the generic runner maps the same device
+arguments to `ASCEND_RT_VISIBLE_DEVICES` and selects `CAMP2pAFDConnector`. Use
+the dedicated DeepSeek-V4 recipe for `P2pHcclAFDConnector` and A5 A4F2.
 
 ## AFD Config
 
@@ -257,7 +283,8 @@ The canonical config shape is:
 ```
 
 `role` must be `attention` or `ffn`. `connector` must be `P2pNcclAFDConnector`,
-`CAMP2pAFDConnector`, or `CAMAsyncAFDConnector`. AFD is active when
+`P2pHcclAFDConnector`, `WindowAFDConnector`, `CAMP2pAFDConnector`, or
+`CAMAsyncAFDConnector`. AFD is active when
 `additional_config["afd"]` is present and passes common AFD config validation;
 omit `additional_config["afd"]` to disable AFD. Connector-owned
 `connector_extra_config` is strictly validated by the selected connector parser

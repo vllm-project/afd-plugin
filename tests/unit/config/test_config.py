@@ -169,7 +169,7 @@ def test_parse_async_dp_config_from_async_alias():
 
 
 def test_async_dp_requires_async_connector():
-    with pytest.raises(ValueError, match="requires connector='CAMAsyncAFDConnector'"):
+    with pytest.raises(ValueError, match="requires an async-DP capable connector"):
         parse_afd_config(
             {
                 "afd": {
@@ -179,6 +179,22 @@ def test_async_dp_requires_async_connector():
                 },
             },
         )
+
+
+def test_window_connector_accepts_async_dp():
+    config = parse_afd_config(
+        {
+            "afd": {
+                "connector": "WindowAFDConnector",
+                "role": "attention",
+                "async": True,
+                "compute_gate_on_attention": True,
+            },
+        },
+    )
+
+    assert config.async_dp is True
+    assert config.connector == "WindowAFDConnector"
 
 
 def test_original_common_afd_field_aliases_are_supported():

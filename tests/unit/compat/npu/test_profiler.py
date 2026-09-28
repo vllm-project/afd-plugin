@@ -21,6 +21,7 @@ _ENV_NAMES = (
     "AFD_NPU_ATTENTION_PROFILER_SKIP_FIRST",
     "AFD_NPU_ATTENTION_PROFILER_DIR",
     "AFD_NPU_ATTENTION_PROFILER_WITH_STACK",
+    "AFD_NPU_ATTENTION_PROFILER_RANKS",
     "AFD_NPU_FFN_PROFILER_ENABLE",
     "AFD_NPU_FFN_PROFILER_WAIT",
     "AFD_NPU_FFN_PROFILER_WARMUP",
@@ -29,6 +30,7 @@ _ENV_NAMES = (
     "AFD_NPU_FFN_PROFILER_SKIP_FIRST",
     "AFD_NPU_FFN_PROFILER_DIR",
     "AFD_NPU_FFN_PROFILER_WITH_STACK",
+    "AFD_NPU_FFN_PROFILER_RANKS",
     "VLLM_ASCEND_MODEL_RUNNER_PROFILER_ENABLE",
     "VLLM_ASCEND_FFN_PROFILER_ENABLE",
     "VLLM_TORCH_PROFILER_DIR",
@@ -53,10 +55,33 @@ def test_npu_profiler_defaults_are_disabled():
     assert attention.skip_first == 1500
     assert attention.trace_dir == "/tmp/profile/attn"
     assert attention.with_stack is False
+    assert attention.ranks == frozenset({0})
     assert ffn.enabled is False
     assert ffn.active == 20
     assert ffn.trace_dir == "/tmp/profile/ffn"
     assert ffn.with_stack is False
+    assert ffn.ranks == frozenset({0})
+
+
+def test_npu_profiler_parses_rank_selection(monkeypatch):
+    monkeypatch.setenv("AFD_NPU_ATTENTION_PROFILER_RANKS", "0,2,2")
+    monkeypatch.setenv("AFD_NPU_FFN_PROFILER_RANKS", "all")
+
+    assert afd_npu_profiler_config("attention").ranks == frozenset({0, 2})
+    assert afd_npu_profiler_config("ffn").ranks is None
+
+
+def test_npu_profiler_rejects_invalid_rank_selection(monkeypatch):
+    monkeypatch.setenv("AFD_NPU_ATTENTION_PROFILER_RANKS", "0,-1")
+
+    with pytest.raises(ValueError, match="non-negative ranks"):
+        afd_npu_profiler_config("attention")
+
+
+def test_create_npu_profiler_skips_unselected_rank(monkeypatch):
+    monkeypatch.setenv("AFD_NPU_FFN_PROFILER_ENABLE", "true")
+
+    assert create_afd_npu_profiler("ffn", role_rank=1) is None
 
 
 def test_npu_profiler_uses_only_plugin_owned_enable_env(monkeypatch):
