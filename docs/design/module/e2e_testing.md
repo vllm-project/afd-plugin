@@ -33,7 +33,7 @@ validation_paths:
   - "tests/e2e/models/qwen3_moe/test_qwen3_moe.py"
   - "tests/e2e/models/qwen3_6/test_qwen3_6.py"
 upstream_refs:
-  - "vLLM 0.26.0 serving and shutdown interfaces"
+  - "vLLM 0.30.0 serving and shutdown interfaces"
   - "lm-evaluation-harness GSM8K task and local-completions API"
   - "pytest parameterized test IDs"
 verified_platform_refs:
@@ -155,6 +155,13 @@ The Qwen3.5/3.6 adapter family has text-only CUDA E2E evidence through
 `--language-model-only`. Its default suite uses native DP4/TP1/EP4 for
 `baseline-graph`, and
 synchronous AFD 2A1F for `afd-eager`, `afd-graph`, and `afd-graph-dbo`.
+The Qwen3.6 `afd-graph-dbo-2a1f` case is currently excluded from hardware
+validation claims: on 8x NVIDIA L20X with vLLM 0.30.0 the FFN worker hits a
+CUDA illegal memory access during the live two-ubatch decode split, which
+crashes the FFN engine and hangs the Attention control plane (5/5
+reproductions, full py-spy stack chain). This matches the known defect
+recorded at 0.28 and is not a 0.30.0 regression; other models see the same
+signature only sporadically and pass on rerun.
 Multimodal, NPU, `compute_gate_on_attention=true`, pipeline-parallel,
 asynchronous, and multi-node execution are outside this case; quantization is
 unverified.
@@ -182,7 +189,12 @@ of 24 in DBO scenarios).
   DP-wide split agreement, so live requests would never run as two ubatches
   and only warmup/capture would exercise the split path. The gate asserts
   that at least one live two-ubatch step was recorded; `AFD_GSM8K_LIMIT=all`
-  still bypasses the floor.
+  still bypasses the floor. On vLLM 0.30 the runner sets the DBO decode token
+  threshold to 2 because upstream validates both DBO thresholds against the
+  two-microbatch count; the prefill threshold stays at 8. `AFD_E2E_API_PORT_BASE`
+  (default `8000`) offsets the API server ports on shared machines, and
+  `AFD_E2E_DBO_KEEP_CHUNKED_PREFILL=1` keeps chunked prefill enabled for the
+  hybrid Qwen3.6 DBO case, whose 0.30 validation requires chunked prefill.
 - CI leaves `AFD_GSM8K_THRESHOLD` unset or raises it.
 - Use the official GSM8K task, `HF_HOME`, and `results_*.json`. Do not commit a
   seven-row dataset or custom task YAML.
