@@ -103,6 +103,11 @@ def register_afd() -> None:
         import afd_plugin.compat.patches.async_dp_forward_context  # noqa: F401
         import afd_plugin.compat.patches.config_validation  # noqa: F401
         import afd_plugin.compat.patches.engine_core  # noqa: F401
+        from afd_plugin.compat.patches.npu.mxfp_worker_resolution import (
+            apply_afd_mxfp_worker_resolution_patch,
+        )
+
+        apply_afd_mxfp_worker_resolution_patch()
     except Exception:
         _logger.debug(
             "AFD plugin: compatibility patches could not be applied",
@@ -119,8 +124,9 @@ def register_afd() -> None:
             exc_info=True,
         )
 
-    # NPU compatibility patches are applied during AFD config construction and
-    # worker startup, after vLLM-Ascend completes its platform initialization.
+    # Remaining NPU compatibility patches are applied during AFD config
+    # construction and worker startup, after vLLM-Ascend completes its platform
+    # initialization.
 
     from vllm.model_executor.models import ModelRegistry
 
