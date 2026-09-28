@@ -511,7 +511,8 @@ def test_configure_scenario_overwrites_fixed_topology_and_features(
     if args.cuda_graph_full_decode_only:
         assert args.cudagraph_capture_size == 8
     if args.enable_dbo:
-        assert args.dbo_decode_token_threshold == 1
+        # vLLM 0.30 requires DBO thresholds >= the microbatch count (2).
+        assert args.dbo_decode_token_threshold == 2
         assert args.dbo_prefill_token_threshold == 8
 
 
