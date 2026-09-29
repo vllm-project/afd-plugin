@@ -169,4 +169,17 @@ def apply_afd_mxfp_alltoallv_patch() -> bool:
     return True
 
 
-__all__ = ["apply_afd_mxfp_alltoallv_patch"]
+def get_afd_mxfp_alltoallv_patch_status() -> tuple[bool, str]:
+    """Return whether the dispatcher is patched and its active method module."""
+
+    postprocess = TokenDispatcherWithAll2AllV._dispatch_postprocess
+    return (
+        hasattr(TokenDispatcherWithAll2AllV, _MXFP_ALLTOALLV_PATCH_ATTR),
+        postprocess.__module__,
+    )
+
+
+__all__ = [
+    "apply_afd_mxfp_alltoallv_patch",
+    "get_afd_mxfp_alltoallv_patch_status",
+]

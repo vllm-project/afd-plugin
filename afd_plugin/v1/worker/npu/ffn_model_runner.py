@@ -221,9 +221,26 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 is_warmup=is_warmup,
             )
         if bool(self.use_aclgraph) and (is_graph_capturing or is_warmup):
+            stage_diagnostics = bool(
+                getattr(self.connector, "stage_diagnostics_enabled", False)
+            )
+            if stage_diagnostics:
+                logger.warning(
+                    "AFD NPU FFN step progress: event=input_ids_recv_begin "
+                    "stages=%s graph_capture=%s warmup=%s",
+                    tuple(sorted(dp_metadata_list)),
+                    is_graph_capturing,
+                    is_warmup,
+                )
             input_ids_by_stage = self._receive_input_ids_before_model(
                 dp_metadata_list,
             )
+            if stage_diagnostics:
+                logger.warning(
+                    "AFD NPU FFN step progress: event=input_ids_recv_returned "
+                    "stages=%s",
+                    tuple(sorted(dp_metadata_list)),
+                )
             logger.debug(
                 "AFD NPU FFN execute_ffn_step enters capture_model; "
                 "key=%s is_graph_capturing=%s is_warmup=%s",
@@ -239,9 +256,25 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 connector_state_prepared=True,
             )
             return None
+        stage_diagnostics = bool(
+            getattr(self.connector, "stage_diagnostics_enabled", False)
+        )
+        if stage_diagnostics:
+            logger.warning(
+                "AFD NPU FFN step progress: event=input_ids_recv_begin "
+                "stages=%s graph_capture=%s warmup=%s",
+                tuple(sorted(dp_metadata_list)),
+                is_graph_capturing,
+                is_warmup,
+            )
         input_ids_by_stage = self._receive_input_ids_before_model(
             dp_metadata_list,
         )
+        if stage_diagnostics:
+            logger.warning(
+                "AFD NPU FFN step progress: event=input_ids_recv_returned stages=%s",
+                tuple(sorted(dp_metadata_list)),
+            )
         self.execute_model(
             dp_metadata_list=dp_metadata_list,
             input_ids_by_stage=input_ids_by_stage,
@@ -778,6 +811,11 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         )
         eager_stream_overlap = bool(
             getattr(self, "ffn_stream_overlap_enabled", False)
+            and getattr(
+                self.connector,
+                "eager_u2_stream_overlap_enabled",
+                True,
+            )
             and len(stage_ids) > 1
             and not graph_stream_overlap
             and aclgraph_runtime_mode in (None, CUDAGraphMode.NONE)
@@ -810,10 +848,45 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             graph_recv_ready_event = self.ffn_graph_recv_ready_event
             assert graph_recv_ready_event is not None
             graph_recv_ready_event.record(torch.npu.current_stream())
+        stage_diagnostics = bool(
+            getattr(self.connector, "stage_diagnostics_enabled", False)
+        )
+        compute_sync_diagnostics = bool(
+            getattr(
+                self.connector,
+                "ffn_compute_sync_diagnostics_enabled",
+                False,
+            )
+            and len(stage_ids) == 1
+            and not is_graph_capturing
+            and not bool(getattr(self.connector, "is_warmup", False))
+            and not compute_stream_overlap
+        )
+        diagnostic_layers = (
+            {layer_indices[0], layer_indices[-1]} if layer_indices else set()
+        )
+        pipeline_mode = (
+            "graph-streamed"
+            if graph_stream_overlap
+            else "eager-streamed"
+            if eager_stream_overlap
+            else "serial"
+        )
         try:
             for layer_idx in layer_indices:
                 graph_pending_send_events: list[Any] = []
                 for stage_idx in stage_ids:
+                    log_stage = bool(
+                        stage_diagnostics and layer_idx in diagnostic_layers
+                    )
+                    if log_stage:
+                        logger.warning(
+                            "AFD NPU FFN stage progress: event=recv_begin "
+                            "mode=%s layer=%s stage=%s",
+                            pipeline_mode,
+                            layer_idx,
+                            stage_idx,
+                        )
                     stage_input_ids = (
                         input_ids_by_stage.get(stage_idx)
                         if input_ids_by_stage is not None and layer_idx == 0
@@ -846,6 +919,14 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                         if graph_stream_overlap:
                             recv_event = self.ffn_recv_events[(layer_idx, stage_idx)]
                             recv_event.record(torch.npu.current_stream())
+                    if log_stage:
+                        logger.warning(
+                            "AFD NPU FFN stage progress: event=recv_returned "
+                            "mode=%s layer=%s stage=%s",
+                            pipeline_mode,
+                            layer_idx,
+                            stage_idx,
+                        )
                     if layer_idx == 0 and num_hash_layers > 0:
                         if payload.input_ids is None:
                             raise RuntimeError(
@@ -875,6 +956,14 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                         compute_kwargs = {}
                         if hash_input_ids is not None:
                             compute_kwargs["input_ids"] = hash_input_ids
+                        if log_stage:
+                            logger.warning(
+                                "AFD NPU FFN stage progress: event=compute_begin "
+                                "mode=%s layer=%s stage=%s",
+                                pipeline_mode,
+                                layer_idx,
+                                stage_idx,
+                            )
                         if compute_stream_overlap:
                             assert recv_event is not None
                             compute_event = self.ffn_compute_events[
@@ -896,8 +985,25 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                                     layer_idx=layer_idx,
                                     **compute_kwargs,
                                 )
+                                if log_stage:
+                                    logger.warning(
+                                        "AFD NPU FFN stage progress: "
+                                        "event=compute_returned mode=%s "
+                                        "layer=%s stage=%s",
+                                        pipeline_mode,
+                                        layer_idx,
+                                        stage_idx,
+                                    )
                                 compute_event.record(self.ffn_compute_stream)
                             send_event = self.ffn_send_events[(layer_idx, stage_idx)]
+                            if log_stage:
+                                logger.warning(
+                                    "AFD NPU FFN stage progress: "
+                                    "event=send_begin mode=%s layer=%s stage=%s",
+                                    pipeline_mode,
+                                    layer_idx,
+                                    stage_idx,
+                                )
                             self.connector.send_ffn_output_streamed(
                                 rank_ffn_output,
                                 context,
@@ -914,22 +1020,93 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                                 layer_idx=layer_idx,
                                 **compute_kwargs,
                             )
+                            if log_stage:
+                                logger.warning(
+                                    "AFD NPU FFN stage progress: "
+                                    "event=compute_returned mode=%s "
+                                    "layer=%s stage=%s",
+                                    pipeline_mode,
+                                    layer_idx,
+                                    stage_idx,
+                                )
+                            if compute_sync_diagnostics:
+                                logger.warning(
+                                    "AFD NPU FFN stage progress: "
+                                    "event=compute_sync_begin mode=%s "
+                                    "layer=%s stage=%s",
+                                    pipeline_mode,
+                                    layer_idx,
+                                    stage_idx,
+                                )
+                                torch.npu.synchronize()
+                                logger.warning(
+                                    "AFD NPU FFN stage progress: "
+                                    "event=compute_sync_complete mode=%s "
+                                    "layer=%s stage=%s",
+                                    pipeline_mode,
+                                    layer_idx,
+                                    stage_idx,
+                                )
+                            if log_stage:
+                                logger.warning(
+                                    "AFD NPU FFN stage progress: "
+                                    "event=send_begin mode=%s layer=%s stage=%s",
+                                    pipeline_mode,
+                                    layer_idx,
+                                    stage_idx,
+                                )
                             _send_ffn_output(
                                 self.connector,
                                 rank_ffn_output,
                                 context,
                                 stage_idx=stage_idx,
                             )
+                        if log_stage:
+                            logger.warning(
+                                "AFD NPU FFN stage progress: event=send_returned "
+                                "mode=%s layer=%s stage=%s",
+                                pipeline_mode,
+                                layer_idx,
+                                stage_idx,
+                            )
                 if graph_pending_send_events and not graph_cross_layer_overlap:
                     current_stream = torch.npu.current_stream()
+                    if stage_diagnostics and layer_idx in diagnostic_layers:
+                        logger.warning(
+                            "AFD NPU FFN stage progress: "
+                            "event=layer_send_wait_begin mode=%s layer=%s",
+                            pipeline_mode,
+                            layer_idx,
+                        )
                     for send_event in graph_pending_send_events:
                         send_event.wait(current_stream)
+                    if stage_diagnostics and layer_idx in diagnostic_layers:
+                        logger.warning(
+                            "AFD NPU FFN stage progress: "
+                            "event=layer_send_wait_returned mode=%s layer=%s",
+                            pipeline_mode,
+                            layer_idx,
+                        )
             if eager_stream_overlap or graph_cross_layer_overlap:
                 current_stream = torch.npu.current_stream()
                 final_layer_idx = layer_indices[-1]
+                if stage_diagnostics:
+                    logger.warning(
+                        "AFD NPU FFN stage progress: event=final_send_wait_begin "
+                        "mode=%s layer=%s",
+                        pipeline_mode,
+                        final_layer_idx,
+                    )
                 for stage_idx in stage_ids:
                     self.ffn_send_events[(final_layer_idx, stage_idx)].wait(
                         current_stream
+                    )
+                if stage_diagnostics:
+                    logger.warning(
+                        "AFD NPU FFN stage progress: "
+                        "event=final_send_wait_returned mode=%s layer=%s",
+                        pipeline_mode,
+                        final_layer_idx,
                     )
         finally:
             input_ids_cache.clear()

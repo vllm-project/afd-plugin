@@ -7,7 +7,8 @@ from __future__ import annotations
 import copy
 import logging
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import fields as dataclass_fields, replace
+from dataclasses import fields as dataclass_fields
+from dataclasses import replace
 from functools import partial
 from typing import Any
 
@@ -30,9 +31,9 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec, KVCacheConfig
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.ubatch_utils import UBatchSlices
@@ -353,6 +354,20 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         step_afd_npu_profiler(self.prof)
+        stage_diagnostics = bool(
+            getattr(
+                getattr(self, "connector", None),
+                "stage_diagnostics_enabled",
+                False,
+            )
+        )
+        diagnostic_step = int(getattr(self, "_afd_diagnostic_step", 0)) + 1
+        self._afd_diagnostic_step = diagnostic_step
+        if stage_diagnostics:
+            logger.warning(
+                "AFD NPU Attention step progress: step=%s event=execute_begin",
+                diagnostic_step,
+            )
         # ### PATCH START: AFD live execution scope
         self._afd_live_execution = True
         try:
@@ -360,6 +375,36 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         finally:
             self._afd_live_execution = False
         # ### PATCH END: AFD live execution scope
+        if stage_diagnostics:
+            logger.warning(
+                "AFD NPU Attention step progress: step=%s event=execute_returned",
+                diagnostic_step,
+            )
+        return result
+
+    def sample_tokens(
+        self,
+        grammar_output: GrammarOutput | None,
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        stage_diagnostics = bool(
+            getattr(
+                getattr(self, "connector", None),
+                "stage_diagnostics_enabled",
+                False,
+            )
+        )
+        diagnostic_step = int(getattr(self, "_afd_diagnostic_step", 0))
+        if stage_diagnostics:
+            logger.warning(
+                "AFD NPU Attention step progress: step=%s event=sample_begin",
+                diagnostic_step,
+            )
+        result = super().sample_tokens(grammar_output)
+        if stage_diagnostics:
+            logger.warning(
+                "AFD NPU Attention step progress: step=%s event=sample_returned",
+                diagnostic_step,
+            )
         return result
 
     # Upstream source: vllm-ascend commit 80d8c194f,
@@ -444,6 +489,16 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         if pretransfer_input_ids:
             if input_ids is None:
                 raise RuntimeError("DSV4 Attention model forward requires input_ids")
+            stage_diagnostics = bool(
+                getattr(connector, "stage_diagnostics_enabled", False)
+            )
+            if stage_diagnostics:
+                logger.warning(
+                    "AFD NPU Attention step progress: step=%s "
+                    "event=input_ids_send_begin stages=%s",
+                    int(getattr(self, "_afd_diagnostic_step", 0)),
+                    len(self.ubatch_slices) if self.ubatch_slices is not None else 1,
+                )
             if uses_hccl_stream_pipeline:
                 assert self.ubatch_slices is not None
                 for stage_idx, ubatch_slice in enumerate(self.ubatch_slices):
@@ -453,6 +508,12 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     )
             else:
                 connector.send_input_ids(input_ids, ubatch_idx=0)
+            if stage_diagnostics:
+                logger.warning(
+                    "AFD NPU Attention step progress: step=%s "
+                    "event=input_ids_send_returned",
+                    int(getattr(self, "_afd_diagnostic_step", 0)),
+                )
         previous_pretransfer = getattr(
             forward_context,
             "afd_input_ids_pretransferred",
@@ -2247,7 +2308,15 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 stage1_counts,
             )
 
-        if allow_dp_padding or is_draft_model or should_ubatch:
+        # P2P peers must derive graph padding from the synchronized mode. A
+        # live prefill rank can select NONE while idle ranks select FULL; using
+        # those local modes gives FFN peers incompatible collective layouts.
+        if (
+            (not window_async and synced_cudagraph_mode != CUDAGraphMode.NONE)
+            or allow_dp_padding
+            or is_draft_model
+            or should_ubatch
+        ):
             num_tokens_after_padding = torch.tensor(
                 [max_tokens_across_dp] * self.dp_size,
                 device="cpu",
@@ -2365,6 +2434,12 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             if request_boundary_slices is not None
             else (0 if mtp_request_boundary_u2 else None)
         )
+        # Window async keeps its rank-local graph policy. P2P must defer graph
+        # padding until after the DP graph mode has been synchronized.
+        window_local_graph_padding = bool(
+            getattr(self.connector, "is_window_connector", False)
+            and cudagraph_mode != CUDAGraphMode.NONE
+        )
         # ### PATCH START: AFD DP metadata synchronization
         if self.vllm_config.parallel_config.data_parallel_size > 1:
             should_ubatch, _, num_tokens_across_dp, synced_cudagraph_mode = (
@@ -2373,7 +2448,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     num_tokens_padded=num_tokens_padded,
                     uniform_decode=uniform_decode,
                     cudagraph_mode=cudagraph_mode,
-                    allow_dp_padding=(cudagraph_mode != CUDAGraphMode.NONE)
+                    allow_dp_padding=window_local_graph_padding
                     or enable_sp(self.vllm_config)
                     or oproj_tp_enable()
                     or embedding_tp_enable(),

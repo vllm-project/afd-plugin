@@ -502,6 +502,42 @@ def test_npu_attention_live_execution_scope_restores_on_success_and_error(
     assert runner._afd_live_execution is False
 
 
+def test_npu_attention_logs_execute_and_sample_boundaries(monkeypatch, caplog):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    runner = _new_attention_runner()
+    runner.connector = SimpleNamespace(stage_diagnostics_enabled=True)
+    runner._afd_live_execution = False
+    monkeypatch.setattr(
+        attention_model_runner,
+        "step_afd_npu_profiler",
+        lambda _prof: None,
+    )
+    monkeypatch.setattr(
+        attention_model_runner.NPUModelRunner,
+        "execute_model",
+        lambda _runner, _scheduler_output, _intermediate_tensors=None: "executed",
+    )
+    monkeypatch.setattr(
+        attention_model_runner.NPUModelRunner,
+        "sample_tokens",
+        lambda _runner, _grammar_output: "sampled",
+    )
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="afd_plugin.v1.worker.npu.attention_model_runner",
+    ):
+        assert runner.execute_model(object()) == "executed"
+        assert runner.sample_tokens(None) == "sampled"
+
+    assert "step=1 event=execute_begin" in caplog.text
+    assert "step=1 event=execute_returned" in caplog.text
+    assert "step=1 event=sample_begin" in caplog.text
+    assert "step=1 event=sample_returned" in caplog.text
+
+
 def test_npu_attention_non_live_execution_disables_microbatching(monkeypatch):
     _require_npu_runtime()
     import numpy as np
@@ -562,6 +598,119 @@ def test_npu_attention_non_live_execution_disables_microbatching(monkeypatch):
         allow_microbatching=False,
     )
     assert result[2] is True
+
+
+@pytest.mark.parametrize("live_tokens", [1, 2, 3])
+@pytest.mark.parametrize("force_dp_padding", [False, True])
+def test_npu_attention_mixed_graph_modes_share_dp_token_counts(
+    monkeypatch,
+    live_tokens,
+    force_dp_padding,
+):
+    _require_npu_runtime()
+    import numpy as np
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import BatchDescriptor
+
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    counts = [live_tokens, 4, 4, 4]
+
+    def all_reduce(packed_tensor, *, group):
+        assert group == "cpu-group"
+        assert tuple(packed_tensor.shape) == (6, 4)
+        packed_tensor[0, :] = torch.tensor(counts)
+        packed_tensor[1, :] = torch.tensor(counts)
+        packed_tensor[2, :] = torch.tensor(
+            [
+                CUDAGraphMode.NONE.value,
+                *([CUDAGraphMode.FULL.value] * 3),
+            ]
+        )
+        packed_tensor[3, :] = torch.tensor([0, 1, 1, 1])
+        packed_tensor[5, :] = torch.tensor([0, 1, 1, 1])
+
+    def dispatch(*, num_tokens, uniform_decode, valid_modes=None, **_kwargs):
+        mode = CUDAGraphMode.FULL if uniform_decode else CUDAGraphMode.NONE
+        if valid_modes is not None:
+            mode = next(iter(valid_modes))
+        return mode, BatchDescriptor(num_tokens)
+
+    monkeypatch.setattr(attention_model_runner.dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(
+        attention_model_runner,
+        "get_dp_group",
+        lambda: SimpleNamespace(cpu_group="cpu-group"),
+    )
+    monkeypatch.setattr(
+        attention_model_runner,
+        "should_skip_allreduce_across_dp_group",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        attention_model_runner,
+        "check_enable_ubatch",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(attention_model_runner, "enable_sp", lambda _config: False)
+    monkeypatch.setattr(
+        attention_model_runner,
+        "oproj_tp_enable",
+        lambda: force_dp_padding,
+    )
+    monkeypatch.setattr(attention_model_runner, "embedding_tp_enable", lambda: False)
+
+    observed_counts = []
+    for rank, num_tokens in enumerate(counts):
+        runner = _new_attention_runner()
+        runner.dp_size = 4
+        runner.dp_rank = rank
+        runner._afd_live_execution = rank == 0
+        runner._afd_engine_idle_dummy = rank != 0
+        runner.connector = SimpleNamespace(
+            control_plane=object(),
+            is_window_connector=False,
+            requires_lockstep_dp_sync=False,
+        )
+        runner.vllm_config = _vllm_config(
+            data_parallel_size=4,
+            data_parallel_rank=rank,
+            tensor_parallel_size=1,
+            enable_dbo=True,
+            use_ubatching=True,
+            num_ubatches=2,
+        )
+        runner.vllm_config.observability_config = SimpleNamespace(
+            cudagraph_metrics=False
+        )
+        runner.parallel_config = runner.vllm_config.parallel_config
+        runner.model_config = SimpleNamespace(is_encoder_decoder=False)
+        runner.speculative_config = None
+        runner.uniform_decode_query_len = 4
+        runner.input_batch = SimpleNamespace(
+            num_computed_tokens_cpu=np.ones(1, dtype=np.int32),
+            lora_id_to_lora_request={},
+        )
+        runner._pad_for_sequence_parallelism = lambda tokens: tokens
+        runner.cudagraph_dispatcher = SimpleNamespace(dispatch=dispatch)
+
+        mode, descriptor, _, token_counts, _ = (
+            runner._determine_batch_execution_and_padding(
+                num_tokens=num_tokens,
+                num_reqs=1,
+                num_scheduled_tokens_np=np.array([num_tokens]),
+                max_num_scheduled_tokens=num_tokens,
+                use_cascade_attn=False,
+                force_uniform_decode=rank != 0,
+            )
+        )
+
+        assert mode is CUDAGraphMode.NONE
+        assert descriptor.num_tokens == (4 if force_dp_padding else num_tokens)
+        observed_counts.append(token_counts.tolist())
+
+    expected = [4, 4, 4, 4] if force_dp_padding else counts
+    assert observed_counts == [expected] * 4
 
 
 def _new_ffn_runner():
@@ -2366,6 +2515,146 @@ def test_dsv4_ffn_runner_clears_ids_cache_after_exception(monkeypatch):
     assert runner._ffn_input_ids_cache == {}
 
 
+def test_dsv4_ffn_runner_logs_u1_stage_boundaries(monkeypatch, caplog):
+    _patch_ffn_forward_context(monkeypatch)
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(role="ffn")
+    runner.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(num_hash_layers=0),
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.connector.stage_diagnostics_enabled = True
+    runner.model = _RecordingFakeModel()
+    runner.num_layers = 2
+    runner.max_num_tokens = 1
+    for layer_idx in range(2):
+        metadata = AFDTransferMetadata.create_attention_metadata(
+            layer_idx=layer_idx,
+            stage_idx=0,
+            seq_len=1,
+        )
+        runner.connector.attn_outputs.append(
+            _ffn_payload(f"hidden-{layer_idx}", metadata),
+        )
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="afd_plugin.v1.worker.npu.ffn_model_runner",
+    ):
+        runner._ffn_forward(dp_metadata_list={0: _FakeDPMetadata([1])})
+
+    assert "event=recv_begin mode=serial layer=0 stage=0" in caplog.text
+    assert "event=compute_begin mode=serial layer=0 stage=0" in caplog.text
+    assert "event=send_returned mode=serial layer=1 stage=0" in caplog.text
+
+
+def test_dsv4_ffn_runner_compute_sync_diagnostics_run_before_send(
+    monkeypatch,
+    caplog,
+):
+    _patch_ffn_forward_context(monkeypatch)
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    events = []
+
+    class SyncDiagnosticConnector(_FakeFFNConnector):
+        def send_ffn_output(self, ffn_output, context, **kwargs):
+            events.append(("send", context.metadata.layer_idx))
+            return super().send_ffn_output(ffn_output, context, **kwargs)
+
+    class SyncDiagnosticModel:
+        def compute_ffn_output(self, hidden_states, layer_idx, **_kwargs):
+            events.append(("compute", layer_idx))
+            return f"npu-ffn({hidden_states}, layer={layer_idx})"
+
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(role="ffn")
+    runner.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(num_hash_layers=0),
+    )
+    runner.connector = SyncDiagnosticConnector()
+    runner.connector.ffn_compute_sync_diagnostics_enabled = True
+    runner.connector.is_warmup = False
+    runner.model = SyncDiagnosticModel()
+    runner.num_layers = 2
+    runner.max_num_tokens = 1
+    for layer_idx in range(2):
+        metadata = AFDTransferMetadata.create_attention_metadata(
+            layer_idx=layer_idx,
+            stage_idx=0,
+            seq_len=1,
+        )
+        runner.connector.attn_outputs.append(
+            _ffn_payload(f"hidden-{layer_idx}", metadata),
+        )
+
+    monkeypatch.setattr(
+        ffn_model_runner.torch.npu,
+        "synchronize",
+        lambda: events.append(("sync",)),
+    )
+    with caplog.at_level(
+        logging.WARNING,
+        logger="afd_plugin.v1.worker.npu.ffn_model_runner",
+    ):
+        runner._ffn_forward(dp_metadata_list={0: _FakeDPMetadata([1])})
+
+    assert events == [
+        ("compute", 0),
+        ("sync",),
+        ("send", 0),
+        ("compute", 1),
+        ("sync",),
+        ("send", 1),
+    ]
+    assert "event=compute_sync_begin mode=serial layer=0 stage=0" in caplog.text
+    assert "event=compute_sync_complete mode=serial layer=1 stage=0" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("is_graph_capturing", "is_warmup"),
+    [(True, False), (False, True)],
+)
+def test_dsv4_ffn_runner_compute_sync_diagnostics_skip_startup_paths(
+    monkeypatch,
+    is_graph_capturing,
+    is_warmup,
+):
+    _patch_ffn_forward_context(monkeypatch)
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(role="ffn")
+    runner.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(num_hash_layers=0),
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.connector.ffn_compute_sync_diagnostics_enabled = True
+    runner.connector.is_warmup = is_warmup
+    runner.model = _RecordingFakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 1
+    metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0,
+        stage_idx=0,
+        seq_len=1,
+    )
+    runner.connector.attn_outputs.append(_ffn_payload("hidden", metadata))
+    sync_calls = []
+    monkeypatch.setattr(
+        ffn_model_runner.torch.npu,
+        "synchronize",
+        lambda: sync_calls.append(True),
+    )
+
+    runner._ffn_forward(
+        dp_metadata_list={0: _FakeDPMetadata([1])},
+        is_graph_capturing=is_graph_capturing,
+    )
+
+    assert sync_calls == []
+
+
 def test_npu_ffn_runner_dp_path_invokes_model_with_hidden_states_and_layer(monkeypatch):
     from afd_plugin.connectors.npu.async_cam import AFDAsyncTransferState
 
@@ -3015,6 +3304,55 @@ def test_npu_ffn_worker_preserves_complete_control_payload(monkeypatch):
             "connector_state_prepared": True,
         }
     ]
+
+
+def test_npu_ffn_worker_logs_u1_execute_and_sync_boundaries(monkeypatch, caplog):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_worker as ffn_worker_module
+
+    event = threading.Event()
+    payload = AFDControlPayload(
+        dp_metadata_list={0: _FakeDPMetadata([1])},
+        is_graph_capturing=False,
+        is_warmup=False,
+        target_graph_replay=False,
+    )
+
+    def execute_ffn_step(**_kwargs):
+        event.set()
+
+    connector = SimpleNamespace(
+        control_plane=SimpleNamespace(
+            recv_dp_metadata_list=lambda: payload,
+            update_state_from_dp_metadata=lambda _payload: None,
+        ),
+        stage_diagnostics_enabled=True,
+    )
+    worker = _new_ffn_worker()
+    worker._ffn_shutdown_event = event
+    worker.device = SimpleNamespace(type="npu")
+    worker.model_runner = SimpleNamespace(
+        connector=connector,
+        execute_ffn_step=execute_ffn_step,
+    )
+    monkeypatch.setattr(ffn_worker_module.torch.npu, "set_device", lambda _device: None)
+    monkeypatch.setattr(ffn_worker_module.torch.npu, "synchronize", lambda: None)
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="afd_plugin.v1.worker.npu.ffn_worker",
+    ):
+        worker._run_ffn_server_loop()
+
+    assert "stages=(0,)" in caplog.text
+    assert "target_graph_replay=False" in caplog.text
+    for event_name in (
+        "execute_begin",
+        "execute_returned",
+        "device_sync_begin",
+        "device_sync_complete",
+    ):
+        assert f"event={event_name}" in caplog.text
 
 
 def test_npu_ffn_worker_loop_error_is_propagated(caplog):

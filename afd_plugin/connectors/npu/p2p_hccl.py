@@ -42,6 +42,7 @@ import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
 from torch.distributed.distributed_c10d import ProcessGroup
 from vllm.forward_context import DPMetadata, get_forward_context
+from vllm.logger import init_logger
 from vllm_ascend.utils import is_dspark_config
 
 from afd_plugin.config import AFDConfig
@@ -65,6 +66,8 @@ from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+logger = init_logger(__name__)
 
 
 # torch-npu 2.10.0.post2 source:
@@ -234,6 +237,8 @@ class HCCLAttentionReceiveDependency:
 _MTP_HEADER_MAGIC = 0x4D545031
 _MTP_HEADER_PREFIX_SIZE = 4
 _EAGER_U2_STREAM_OVERLAP_ENV = "AFD_HCCL_EAGER_U2_STREAM_OVERLAP"
+_STAGE_DIAGNOSTICS_ENV = "AFD_HCCL_STAGE_DIAGNOSTICS"
+_FFN_COMPUTE_SYNC_DIAGNOSTICS_ENV = "AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS"
 _GRAPH_U2_COMPUTE_OVERLAP_ENV = "AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP"
 _GRAPH_U2_HYBRID_DAG_ENV = "AFD_HCCL_GRAPH_U2_HYBRID_DAG"
 _GRAPH_U2_ATTENTION_THREE_STREAM_ENV = "AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM"
@@ -254,6 +259,17 @@ def _graph_u2_compute_overlap_enabled() -> bool:
 
 def _eager_u2_stream_overlap_enabled() -> bool:
     return _strict_binary_env_enabled(_EAGER_U2_STREAM_OVERLAP_ENV)
+
+
+def _stage_diagnostics_enabled() -> bool:
+    return _strict_binary_env_enabled(_STAGE_DIAGNOSTICS_ENV, default="0")
+
+
+def _ffn_compute_sync_diagnostics_enabled() -> bool:
+    return _strict_binary_env_enabled(
+        _FFN_COMPUTE_SYNC_DIAGNOSTICS_ENV,
+        default="0",
+    )
 
 
 def _graph_u2_hybrid_dag_enabled() -> bool:
@@ -361,6 +377,10 @@ class P2pHcclAFDConnector(AFDConnectorBase):
         self.eager_u2_stream_overlap_enabled = bool(
             self.stream_overlap_enabled and _eager_u2_stream_overlap_enabled()
         )
+        self.stage_diagnostics_enabled = _stage_diagnostics_enabled()
+        self.ffn_compute_sync_diagnostics_enabled = (
+            _ffn_compute_sync_diagnostics_enabled()
+        )
         self.graph_u2_compute_overlap_enabled = _graph_u2_compute_overlap_enabled()
         self.graph_u2_hybrid_dag_enabled = _graph_u2_hybrid_dag_enabled()
         self.graph_u2_attention_three_stream_enabled = (
@@ -375,6 +395,26 @@ class P2pHcclAFDConnector(AFDConnectorBase):
             raise RuntimeError(
                 f"{_GRAPH_U2_FFN_CROSS_LAYER_ENV}=1 requires "
                 f"{_GRAPH_U2_FFN_RECV_STREAM_ENV}=1"
+            )
+        if self.stage_diagnostics_enabled or self.ffn_compute_sync_diagnostics_enabled:
+            logger.warning(
+                "AFD HCCL diagnostics configuration: role=%s world_rank=%s "
+                "role_rank=%s stages=%s eager_u2_stream_overlap=%s "
+                "ffn_compute_sync=%s "
+                "graph_u2_compute_overlap=%s graph_u2_hybrid_dag=%s "
+                "graph_u2_attention_three_stream=%s "
+                "graph_u2_ffn_recv_stream=%s graph_u2_ffn_cross_layer=%s",
+                self.afd_config.role,
+                self.world_rank,
+                self.role_rank,
+                self.num_stages,
+                int(self.eager_u2_stream_overlap_enabled),
+                int(self.ffn_compute_sync_diagnostics_enabled),
+                int(self.graph_u2_compute_overlap_enabled),
+                int(self.graph_u2_hybrid_dag_enabled),
+                int(self.graph_u2_attention_three_stream_enabled),
+                int(self.graph_u2_ffn_recv_stream_enabled),
+                int(self.graph_u2_ffn_cross_layer_enabled),
             )
 
         self.data_pg_list: list[ProcessGroup] = []

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -87,6 +88,12 @@ def test_remote_proxy_skips_send_yield_for_blocking_connector(monkeypatch):
 
     assert [event[0] for event in events] == ["send", "recv"]
     assert torch.equal(output, hidden_states * 0.25)
+
+
+def test_remote_proxy_compiled_path_contains_no_logging_calls():
+    source = inspect.getsource(adapter.RemoteFFNProxy)
+
+    assert "logger." not in source
 
 
 @pytest.mark.parametrize("layer_idx", [0, 1], ids=["dense", "moe"])

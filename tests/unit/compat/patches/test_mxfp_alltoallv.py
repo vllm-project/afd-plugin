@@ -117,6 +117,20 @@ def test_mxfp_alltoallv_patch_is_idempotent(mxfp_patch):
     assert dispatcher_cls._dispatch_postprocess is patched_postprocess
 
 
+def test_mxfp_alltoallv_patch_reports_active_status(mxfp_patch):
+    module, _dispatcher_cls, _ = mxfp_patch
+
+    patched, dispatcher_module = module.get_afd_mxfp_alltoallv_patch_status()
+    assert patched is False
+    assert dispatcher_module == __name__
+
+    assert module.apply_afd_mxfp_alltoallv_patch()
+    assert module.get_afd_mxfp_alltoallv_patch_status() == (
+        True,
+        "afd_plugin.compat.patches.npu.mxfp_alltoallv",
+    )
+
+
 def test_mxfp_alltoallv_patch_leaves_other_signatures_unchanged(mxfp_patch):
     module, dispatcher_cls, _ = mxfp_patch
 

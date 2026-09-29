@@ -333,3 +333,37 @@ Confirm both roles use `FULL_DECODE_ONLY`, U2, async scheduling off, the same
 capture sizes, and the same five Graph/U2 stream switches. Preserve both logs
 and the exact image digest. Do not describe a fallback or a single successful
 request as a completed functional gate.
+
+For a request that stops without an HCCL error, export the diagnostic switch to
+both roles before startup:
+
+```text
+AFD_HCCL_STAGE_DIAGNOSTICS=1
+```
+
+The switch is off by default and accepts only `0` or `1`. It reports the
+effective HCCL overlap switches, the FFN worker's MXFP AllToAllV patch status,
+Attention execute/input/sample boundaries, and first/last-layer FFN
+receive/compute/send boundaries. It also reports whether `execute_ffn_step`
+returned and whether the final `torch.npu.synchronize()` completed. The markers
+apply to both U1 and U2, so a short request that falls back to one stage remains
+observable. Disable the switch after diagnosis because every worker emits
+warning-level markers. Per-layer logging is deliberately kept out of the
+Attention model forward path because Dynamo traces that path during startup.
+
+If both FFN ranks reach `device_sync_begin` without completing it, enable the
+second-stage FFN diagnostic together with the stage markers:
+
+```text
+AFD_HCCL_STAGE_DIAGNOSTICS=1
+AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS=1
+```
+
+The second switch is also off by default and accepts only `0` or `1`. For a
+live serial U1 step, it synchronizes the NPU after every FFN layer compute and
+before that layer's F2A send. It is deliberately inactive during warmup, graph
+capture, and streamed U2 execution. A `compute_sync_begin` without a matching
+`compute_sync_complete` locates the unfinished FFN layer and keeps the failure
+on the MXFP/MoE/AllToAllV side of the boundary. If every layer sync completes
+but the worker's final device sync does not, investigate the F2A P2P transfer.
+Disable this switch after diagnosis because it serializes device execution.

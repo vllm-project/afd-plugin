@@ -621,10 +621,48 @@ def test_p2p_hccl_eager_u2_stream_overlap_can_be_disabled_for_comparison(
     assert connector._attention_stream_pipeline_active() is False
 
 
+def test_p2p_hccl_stage_diagnostics_default_off(monkeypatch):
+    monkeypatch.delenv("AFD_HCCL_STAGE_DIAGNOSTICS", raising=False)
+
+    connector = _connector(role="attention", num_ubatches=2)
+
+    assert connector.stage_diagnostics_enabled is False
+
+
+def test_p2p_hccl_stage_diagnostics_can_be_enabled_for_u1(monkeypatch):
+    monkeypatch.setenv("AFD_HCCL_STAGE_DIAGNOSTICS", "1")
+
+    connector = _connector(role="attention", num_ubatches=1)
+
+    assert connector.stage_diagnostics_enabled is True
+    assert connector.num_stages == 1
+
+
+def test_p2p_hccl_ffn_compute_sync_diagnostics_default_off(monkeypatch):
+    monkeypatch.delenv(
+        "AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS",
+        raising=False,
+    )
+
+    connector = _connector(role="ffn", num_ubatches=1)
+
+    assert connector.ffn_compute_sync_diagnostics_enabled is False
+
+
+def test_p2p_hccl_ffn_compute_sync_diagnostics_can_be_enabled(monkeypatch):
+    monkeypatch.setenv("AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS", "1")
+
+    connector = _connector(role="ffn", num_ubatches=1)
+
+    assert connector.ffn_compute_sync_diagnostics_enabled is True
+
+
 @pytest.mark.parametrize(
     "name",
     [
         "AFD_HCCL_EAGER_U2_STREAM_OVERLAP",
+        "AFD_HCCL_STAGE_DIAGNOSTICS",
+        "AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS",
         "AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM",
         "AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM",
         "AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER",

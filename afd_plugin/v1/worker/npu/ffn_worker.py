@@ -88,6 +88,30 @@ class AFDNPUFFNWorker(NPUWorker):
         )
         install_afd_speculative_model_config(self.vllm_config)
         self.model_runner = AFDNPUFFNModelRunner(self.vllm_config, self.device)
+        if getattr(
+            self.model_runner.connector,
+            "stage_diagnostics_enabled",
+            False,
+        ):
+            try:
+                from afd_plugin.compat.patches.npu.mxfp_alltoallv import (
+                    get_afd_mxfp_alltoallv_patch_status,
+                )
+
+                patched, dispatcher_module = get_afd_mxfp_alltoallv_patch_status()
+                logger.warning(
+                    "AFD MXFP AllToAllV diagnostics: patched=%s "
+                    "dispatcher_module=%s worker=%s.%s",
+                    patched,
+                    dispatcher_module,
+                    type(self).__module__,
+                    type(self).__qualname__,
+                )
+            except Exception:
+                logger.warning(
+                    "AFD MXFP AllToAllV diagnostics unavailable",
+                    exc_info=True,
+                )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}
@@ -153,6 +177,7 @@ class AFDNPUFFNWorker(NPUWorker):
             return
 
         torch.npu.set_device(self.device)
+        diagnostic_step = 0
         while not event.is_set():
             if self.model_runner.connector.control_plane is None:
                 self.model_runner.execute_connector_driven_step()
@@ -173,6 +198,25 @@ class AFDNPUFFNWorker(NPUWorker):
             dp_metadata_list = payload.dp_metadata_list
             is_attn_graph_capturing = payload.is_graph_capturing
             is_warmup = payload.is_warmup
+            stage_diagnostics = bool(
+                getattr(
+                    self.model_runner.connector,
+                    "stage_diagnostics_enabled",
+                    False,
+                )
+            )
+            diagnostic_step += 1
+            if stage_diagnostics:
+                logger.warning(
+                    "AFD NPU FFN step progress: step=%s event=execute_begin "
+                    "stages=%s graph_capture=%s warmup=%s "
+                    "target_graph_replay=%s",
+                    diagnostic_step,
+                    tuple(sorted(dp_metadata_list)),
+                    is_attn_graph_capturing,
+                    is_warmup,
+                    payload.target_graph_replay,
+                )
 
             self.model_runner.execute_ffn_step(
                 dp_metadata_list=dp_metadata_list,
@@ -180,7 +224,21 @@ class AFDNPUFFNWorker(NPUWorker):
                 is_warmup=is_warmup,
                 connector_state_prepared=True,
             )
+            if stage_diagnostics:
+                logger.warning(
+                    "AFD NPU FFN step progress: step=%s event=execute_returned",
+                    diagnostic_step,
+                )
+                logger.warning(
+                    "AFD NPU FFN step progress: step=%s event=device_sync_begin",
+                    diagnostic_step,
+                )
             torch.npu.synchronize()
+            if stage_diagnostics:
+                logger.warning(
+                    "AFD NPU FFN step progress: step=%s event=device_sync_complete",
+                    diagnostic_step,
+                )
 
     def raise_ffn_loop_error_if_any(self) -> None:
         error = getattr(self, "_ffn_loop_error", None)
