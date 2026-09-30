@@ -2779,7 +2779,10 @@ def test_npu_ffn_runner_disables_mask_only_for_cam_mrv1(
         module.AFDNPUFFNModelRunner,
         "parse_config",
         staticmethod(
-            lambda config: SimpleNamespace(compute_gate_on_attention=compute_gate)
+            lambda config: SimpleNamespace(
+                compute_gate_on_attention=compute_gate,
+                connector="P2pNcclAFDConnector",
+            )
         ),
     )
 
@@ -2895,6 +2898,7 @@ def test_npu_attention_runner_afd_ubatching_does_not_install_native_wrapper(
     connector = _LifecycleConnector(events)
     runner = object.__new__(attention_model_runner.AFDNPUAttentionModelRunner)
     runner.connector = connector
+    runner._async_cam_startup = None
     runner.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(
             use_ubatching=False,
