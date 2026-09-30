@@ -23,6 +23,35 @@ from vllm.distributed import parallel_state
 from vllm.utils.torch_utils import is_torch_equal_or_newer
 
 
+class ProcessGroupRendezvousContext:
+    """Borrow the Store and process group created by one CAM rendezvous."""
+
+    def __init__(self) -> None:
+        self._store: Store | None = None
+        self._process_group: ProcessGroup | None = None
+        self._closed = False
+
+    def retain_store(self, store: Store) -> None:
+        if self._closed or self._store is not None:
+            raise RuntimeError("CAM rendezvous context cannot accept another Store")
+        self._store = store
+
+    def bind(self, process_group: ProcessGroup) -> None:
+        if self._closed or self._store is None or self._process_group is not None:
+            raise RuntimeError("CAM rendezvous context is not ready to bind")
+        self._process_group = process_group
+
+    def borrow(self) -> tuple[Store, ProcessGroup]:
+        if self._closed or self._store is None or self._process_group is None:
+            raise RuntimeError("CAM rendezvous context is not bound")
+        return self._store, self._process_group
+
+    def invalidate(self) -> None:
+        self._closed = True
+        self._store = None
+        self._process_group = None
+
+
 class DefaultProcessGroupSwitcher:
     """Temporarily switch PyTorch's default process group."""
 
@@ -123,6 +152,7 @@ def init_afd_process_group(
 
 __all__ = [
     "DefaultProcessGroupSwitcher",
+    "ProcessGroupRendezvousContext",
     "create_hccl_process_group_options",
     "init_afd_process_group",
 ]

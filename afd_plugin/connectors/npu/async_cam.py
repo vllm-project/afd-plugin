@@ -28,7 +28,6 @@ derivation, launch guidance, and the full limitations.
 from __future__ import annotations
 
 import os
-import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
@@ -37,7 +36,6 @@ from typing import TYPE_CHECKING, Any, Final, cast
 import torch
 import torch.distributed as dist
 from torch import Tensor
-from torch.distributed.distributed_c10d import PrefixStore, Store
 from vllm.logger import init_logger
 
 from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
@@ -61,6 +59,7 @@ from afd_plugin.connectors.metadata import (
     AFDTransferState,
 )
 from afd_plugin.distributed import (
+    ProcessGroupRendezvousContext,
     create_hccl_process_group_options,
     init_afd_process_group,
 )
@@ -75,11 +74,6 @@ ATTN_RANKS_PER_DP_CONFIG_KEY = "attn_ranks_per_dp"
 ASYNC_MOE_NUM_STAGES = 2
 ASYNC_MOE_REQUEST_SPLIT = "request"
 ASYNC_MOE_TOKEN_SPLIT = "token"
-FFN_STARTUP_TIMEOUT_SECONDS = 300
-FFN_STARTUP_POLL_SECONDS = 0.25
-FFN_STARTUP_NONCE_BYTES = 16
-STARTUP_WARMUP_TOKEN_COUNT = 1
-STARTUP_WARMUP_HIDDEN_VALUE = 0.25
 
 _AFD_ASYNC_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
     {
@@ -245,6 +239,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         vllm_config: VllmConfig,
         afd_config: AFDConfig,
         role_rank: int,
+        *,
+        rendezvous_context: ProcessGroupRendezvousContext | None = None,
     ) -> None:
         """Derive CAM topology, tensor dimensions, and connector state.
 
@@ -270,8 +266,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         self.comm_id = CAM_COMM_ID
         self.tp_size = extra_info.attn_ranks_per_dp
         self.cam_pg: ProcessGroup | None = None
-        self._rendezvous_store: Store | None = None
-        self._startup_store: Store | None = None
+        self._rendezvous_context = rendezvous_context
         self.topology = build_async_topology(
             afd_config,
             role_rank,
@@ -314,7 +309,11 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             pg_options=create_hccl_process_group_options(
                 self.hccl_buffer_size_mb,
             ),
-            on_rendezvous=self._retain_rendezvous_store,
+            on_rendezvous=(
+                self._rendezvous_context.retain_store
+                if self._rendezvous_context is not None
+                else None
+            ),
         )
         backend = self.cam_pg._get_backend(torch.device("npu"))
         self.group_name = str(backend.get_hccl_comm_name(self.world_rank))
@@ -325,253 +324,21 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dtype=self.activation_dtype,
             device=device,
         )
+        if self._rendezvous_context is not None:
+            self._rendezvous_context.bind(self.cam_pg)
         self._initialized = True
 
-    def _retain_rendezvous_store(self, store: Store) -> None:
-        self._rendezvous_store = store
-
-    def _get_startup_store(self) -> Store:
-        """Make one rank-shared namespace tied to this CAM process group."""
-        if self._startup_store is not None:
-            return self._startup_store
-        if self.cam_pg is None or self._rendezvous_store is None:
-            raise RuntimeError("CAM startup coordination requires an initialized group")
-        nonce = torch.zeros(
-            FFN_STARTUP_NONCE_BYTES,
-            dtype=torch.uint8,
-            device=f"npu:{self.local_rank}",
-        )
-        if self.world_rank == 0:
-            nonce.copy_(
-                torch.tensor(
-                    list(os.urandom(FFN_STARTUP_NONCE_BYTES)),
-                    dtype=torch.uint8,
-                    device=nonce.device,
-                )
-            )
-        logger.info("CAM startup nonce broadcast start rank=%d", self.world_rank)
-        dist.broadcast(nonce, src=0, group=self.cam_pg)
-        logger.info("CAM startup nonce broadcast done rank=%d", self.world_rank)
-        torch.npu.synchronize()
-        logger.info("CAM startup nonce synchronize done rank=%d", self.world_rank)
-        namespace = bytes(nonce.cpu().tolist()).hex()
-        self._startup_store = PrefixStore(
-            f"{AFD_ASYNC_CAM_GROUP_NAME}/startup/{namespace}",
-            self._rendezvous_store,
-        )
-        return self._startup_store
-
-    def prepare_startup_coordination(self) -> None:
-        self._get_startup_store()
-
-    def _wait_for_startup_entries(
-        self, keys: list[str], failure_keys: list[str]
-    ) -> list[str]:
-        store = self._get_startup_store()
-        deadline = time.monotonic() + FFN_STARTUP_TIMEOUT_SECONDS
-        while True:
-            for key in failure_keys:
-                if store.check([key]):
-                    status = store.get(key).decode()
-                    if key.startswith("attn/failure/") or status.startswith("failed:"):
-                        raise RuntimeError(f"CAM startup {key} {status}")
-            values = []
-            pending = []
-            for key in keys:
-                if store.check([key]):
-                    values.append(store.get(key).decode())
-                else:
-                    pending.append(key)
-            if not pending:
-                return values
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Timed out waiting for CAM startup keys: {sorted(pending)}"
-                )
-            time.sleep(FFN_STARTUP_POLL_SECONDS)
-
-    def publish_ffn_mode(self, layer_idx: int | None) -> None:
-        store = self._get_startup_store()
-        if self.topology.role != "ffn":
-            raise RuntimeError("Only CAM FFN ranks may publish their mode")
-        mode = "eager" if layer_idx is None else f"graph:{layer_idx}"
-        store.set(f"ffn/mode/{self.world_rank}", mode)
-
-    def wait_for_ffn_modes(self) -> int | None:
-        ffn_ranks = range(self.attn_size, self.topology.world_size)
-        modes = self._wait_for_startup_entries(
-            [f"ffn/mode/{rank}" for rank in ffn_ranks],
-            [f"ffn/{rank}" for rank in ffn_ranks],
-        )
-        if len(set(modes)) != 1:
-            raise RuntimeError(f"CAM FFN startup modes disagree: {modes}")
-        mode = modes[0]
-        if mode == "eager":
-            return None
-        if not mode.startswith("graph:"):
-            raise RuntimeError(f"Invalid CAM FFN startup mode: {mode}")
-        return int(mode.removeprefix("graph:"))
-
-    def publish_attention_startup_failure(self, error: str) -> None:
-        self._get_startup_store().set(f"attn/failure/{self.world_rank}", error)
-
-    def _attention_failure_keys(self) -> list[str]:
-        return [f"attn/failure/{rank}" for rank in range(self.attn_size)]
-
-    def _ffn_failure_keys(self) -> list[str]:
-        return [
-            f"ffn/{rank}" for rank in range(self.attn_size, self.topology.world_size)
-        ]
-
-    def wait_for_attention_warmup_prepared(self) -> None:
-        self._wait_for_startup_entries(
-            [f"attn/prepared/{rank}" for rank in range(self.attn_size)],
-            self._attention_failure_keys(),
-        )
-
-    def publish_ffn_warmup_started(self) -> None:
-        self._get_startup_store().set(f"ffn/warmup/start/{self.world_rank}", "ready")
-
-    def publish_ffn_warmup_done(self) -> None:
-        self._get_startup_store().set(f"ffn/warmup/done/{self.world_rank}", "ready")
-
-    def wait_for_communication_warmup_done(self) -> None:
-        self._wait_for_startup_entries(
-            [f"attn/done/{rank}" for rank in range(self.attn_size)]
-            + [
-                f"ffn/warmup/done/{rank}"
-                for rank in range(self.attn_size, self.topology.world_size)
-            ],
-            self._attention_failure_keys() + self._ffn_failure_keys(),
-        )
-
-    def run_attention_startup_warmup(self, layer_idx: int) -> None:
-        """Complete one isolated CAM transaction before FFN graph capture."""
-        if self.topology.role != "attention":
-            raise RuntimeError("CAM Attention warmup requires Attention role")
-        device = f"npu:{self.local_rank}"
-        hidden = torch.full(
-            (STARTUP_WARMUP_TOKEN_COUNT, self.hidden_size),
-            STARTUP_WARMUP_HIDDEN_VALUE,
-            dtype=self.activation_dtype,
-            device=device,
-        )
-        tp_rank = self.world_rank % self.tp_size
-        expert_ids = [
-            ((tp_rank * self.topk + index) % self.ffn_size) * self.expert_per_rank
-            + ((tp_rank * self.topk + index) // self.ffn_size) % self.expert_per_rank
-            for index in range(self.topk)
-        ]
-        ids = torch.tensor([expert_ids], dtype=torch.int32, device=device)
-        weights = torch.full(
-            (STARTUP_WARMUP_TOKEN_COUNT, self.topk),
-            1.0 / self.topk,
-            dtype=torch.float32,
-            device=device,
-        )
-        store = self._get_startup_store()
-        store.set(f"attn/prepared/{self.world_rank}", "ready")
-        self._wait_for_startup_entries(
-            [
-                f"ffn/warmup/start/{rank}"
-                for rank in range(self.attn_size, self.topology.world_size)
-            ],
-            self._ffn_failure_keys(),
-        )
-        logger.info("CAM Attention startup warmup DS rank=%d", self.world_rank)
-        torch.ops.afd_ascend.afd_async_dispatch_send(
-            hidden,
-            ids,
-            self.comm_args,
-            self.comm_id,
-            self.max_num_batched_tokens,
-            STARTUP_WARMUP_TOKEN_COUNT,
-            self.hidden_size,
-            self.topk,
-            self.ffn_size,
-            self.attn_size,
-            self.expert_per_rank,
-            self.world_rank,
-            self.topology.world_size,
-            layer_idx,
-            self.tp_size,
-            self.dynamic_quant,
-            self.group_name,
-        )
-        warmup_output = torch.ops.afd_ascend.afd_async_combine_recv(
-            self._placeholder,
-            ids,
-            weights,
-            self.comm_args,
-            self.comm_id,
-            STARTUP_WARMUP_TOKEN_COUNT,
-            self.hidden_size,
-            self.topk,
-            self.ffn_size,
-            self.attn_size,
-            self.expert_per_rank,
-            self.world_rank,
-            self.topology.world_size,
-            self.group_name,
-        )
-        torch.npu.synchronize()
-        del warmup_output
-        logger.info("CAM Attention startup warmup CR done rank=%d", self.world_rank)
-        store.set(f"attn/done/{self.world_rank}", "ready")
-        self.wait_for_communication_warmup_done()
-
-    def publish_ffn_startup(self, error: str | None = None) -> None:
-        store = self._get_startup_store()
-        if self.topology.role != "ffn":
-            raise RuntimeError("Only CAM FFN ranks may publish startup status")
-        key = f"ffn/{self.world_rank}"
-        if error is not None:
-            store.set(key, f"failed:{error}")
-            return
-        status = store.compare_set(key, "", "ready").decode()
-        if status != "ready":
-            raise RuntimeError(f"CAM FFN startup {key} {status}")
-
-    def wait_for_ffn_ready(self) -> None:
-        store = self._get_startup_store()
-        keys = [
-            f"ffn/{rank}" for rank in range(self.attn_size, self.topology.world_size)
-        ]
-        deadline = time.monotonic() + FFN_STARTUP_TIMEOUT_SECONDS
-        while True:
-            pending = []
-            for key in keys:
-                if not store.check([key]):
-                    pending.append(key)
-                    continue
-                status = store.get(key).decode()
-                if status != "ready":
-                    raise RuntimeError(f"CAM FFN startup {key} {status}")
-            if not pending:
-                return
-            if pending and time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Timed out waiting for CAM FFN ranks: {sorted(pending)}"
-                )
-            time.sleep(FFN_STARTUP_POLL_SECONDS)
-
-    def close(self, *, release_buffers: bool = True) -> None:
-        """Destroy the HCCL process group and clear pending transfer states."""
+    def close(self) -> None:
+        """Destroy the communicator and release its operator buffers."""
         if self.cam_pg is not None:
             dist.destroy_process_group(self.cam_pg)
         self.cam_pg = None
         self._initialized = False
-        if release_buffers:
-            self.release_closed_buffers()
-
-    def release_closed_buffers(self) -> None:
-        if self._initialized:
-            raise RuntimeError("Cannot release active CAM operator buffers")
         self.comm_args = None
         self._placeholder = None
-        self._startup_store = None
-        self._rendezvous_store = None
         self._pending_attention_payloads.clear()
+        if self._rendezvous_context is not None:
+            self._rendezvous_context.invalidate()
 
     def select_experts(self, **kwargs: Any) -> tuple[Tensor, Tensor]:
         """Run the pinned vLLM-Ascend expert selector on Attention."""

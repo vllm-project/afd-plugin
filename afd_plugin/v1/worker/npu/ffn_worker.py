@@ -59,6 +59,7 @@ class AFDNPUFFNWorker(NPUWorker):
         self._ffn_shutdown_event: threading.Event | None = None
         self._ffn_loop_error: BaseException | None = None
         self._ffn_loop_started_event: threading.Event | None = None
+        self._ffn_receiver_drained = False
         self._cpu_binding_attempted = False
 
     def init_device(self) -> None:
@@ -109,72 +110,47 @@ class AFDNPUFFNWorker(NPUWorker):
         )
 
     def start_ffn_server_loop(self) -> None:
+        startup = self.model_runner._async_cam_startup
         if self._ffn_thread is not None and self._ffn_thread.is_alive():
             self.raise_ffn_loop_error_if_any()
+            if startup is not None and startup.failed:
+                raise RuntimeError("CAM FFN startup previously failed")
             return
-
         self.raise_ffn_loop_error_if_any()
-        connector = self.model_runner.connector
-        cam_connector = (
-            connector if isinstance(connector, CAMAsyncAFDConnector) else None
-        )
-        if cam_connector is not None:
-            logger.info(
-                "CAM FFN startup entered rank=%d graph=%s",
-                cam_connector.world_rank,
-                self.model_runner._async_cam_ffn_graph_enabled,
+        if startup is not None and self._ffn_thread is not None:
+            raise RuntimeError("CAM FFN receiver stopped; startup cannot be reused")
+        if startup is not None:
+            startup.start_ffn(
+                prepare=self.model_runner.prepare_async_cam_ffn_startup,
+                consume_warmup=self.model_runner.warmup_async_cam_ffn_communication,
+                capture=self.model_runner.capture_async_cam_ffn_graph,
+                start_receiver=self._start_ffn_receiver,
             )
-        try:
-            if cam_connector is not None:
-                logger.info(
-                    "CAM FFN layered executor prepare start rank=%d",
-                    cam_connector.world_rank,
-                )
-                self.model_runner.prepare_async_cam_ffn_graph()
-                logger.info(
-                    "CAM FFN layered executor prepare done rank=%d",
-                    cam_connector.world_rank,
-                )
-            if not connector.is_initialized:
-                self.model_runner.initialize_afd_connector()
-            if cam_connector is not None:
-                logger.info(
-                    "CAM FFN startup store start rank=%d", cam_connector.world_rank
-                )
-                cam_connector.prepare_startup_coordination()
-                logger.info(
-                    "CAM FFN startup store done rank=%d", cam_connector.world_rank
-                )
-                if self.model_runner._async_cam_ffn_graph_enabled:
-                    executor = self.model_runner._layered_executor
-                    if executor is None:
-                        raise RuntimeError("CAM FFN graph has no layered executor")
-                    cam_connector.publish_ffn_mode(executor.layer_ids[0])
-                    cam_connector.wait_for_attention_warmup_prepared()
-                    cam_connector.publish_ffn_warmup_started()
-                    self.model_runner.warmup_async_cam_ffn_communication()
-                    cam_connector.publish_ffn_warmup_done()
-                    cam_connector.wait_for_communication_warmup_done()
-                    self.model_runner.capture_async_cam_ffn_graph()
-                else:
-                    cam_connector.publish_ffn_mode(None)
-        except Exception as exc:
-            if cam_connector is not None and cam_connector._startup_store is not None:
-                cam_connector.publish_ffn_startup(error=str(exc))
-            raise
+            return
+        if not self.model_runner.connector.is_initialized:
+            self.model_runner.initialize_afd_connector()
+        self._start_ffn_receiver()
 
+    def _start_ffn_receiver(self) -> None:
+        """Start the receive thread and confirm that its NPU device is set."""
         self._bind_cpus_once()
         self._ffn_shutdown_event = threading.Event()
         started_event = threading.Event()
         self._ffn_loop_started_event = started_event
         self._ffn_loop_error = None
+        self._ffn_receiver_drained = False
+        startup = self.model_runner._async_cam_startup
 
         def ffn_worker_loop() -> None:
             try:
                 self._run_ffn_server_loop()
             except Exception as exc:
                 shutdown_event = self._ffn_shutdown_event
-                if shutdown_event is not None and shutdown_event.is_set():
+                if (
+                    startup is None
+                    and shutdown_event is not None
+                    and shutdown_event.is_set()
+                ):
                     logger.debug(
                         "AFD NPU FFN receive loop stopped during shutdown",
                         exc_info=True,
@@ -183,11 +159,8 @@ class AFDNPUFFNWorker(NPUWorker):
                 self._ffn_loop_error = exc
                 started_event.set()
                 logger.exception("AFD NPU FFN worker loop failed")
-                if (
-                    cam_connector is not None
-                    and cam_connector._startup_store is not None
-                ):
-                    cam_connector.publish_ffn_startup(error=str(exc))
+                if startup is not None:
+                    startup.report_failure(exc)
 
         self._ffn_thread = threading.Thread(
             target=ffn_worker_loop,
@@ -196,7 +169,7 @@ class AFDNPUFFNWorker(NPUWorker):
         )
         try:
             self._ffn_thread.start()
-            if cam_connector is not None:
+            if startup is not None:
                 if not started_event.wait(timeout=FFN_STARTUP_THREAD_TIMEOUT_SECONDS):
                     self.raise_ffn_loop_error_if_any()
                     raise TimeoutError("AFD NPU FFN service thread did not start")
@@ -205,10 +178,9 @@ class AFDNPUFFNWorker(NPUWorker):
                     raise RuntimeError(
                         "AFD NPU FFN service thread stopped during startup"
                     )
-                cam_connector.publish_ffn_startup()
         except Exception as exc:
-            if cam_connector is not None and cam_connector._startup_store is not None:
-                cam_connector.publish_ffn_startup(error=str(exc))
+            if startup is not None:
+                startup.report_failure(exc)
             raise
 
     def _bind_cpus_once(self) -> None:
@@ -262,11 +234,11 @@ class AFDNPUFFNWorker(NPUWorker):
                 is_graph_replaying=is_graph_replaying,
             )
             torch.npu.synchronize()
+        self._ffn_receiver_drained = True
 
     def raise_ffn_loop_error_if_any(self) -> None:
         error = self._ffn_loop_error
         if error is not None:
-            self._ffn_loop_error = None
             raise RuntimeError("AFD NPU FFN worker loop failed") from error
 
     def stop_ffn_server_loop(self) -> None:
@@ -278,35 +250,40 @@ class AFDNPUFFNWorker(NPUWorker):
         # work item. Do not destroy its communicator or graph-owned tensors
         # while the worker thread is still using them.
         connector = self.model_runner.connector
-        graph_connector = (
-            connector
-            if isinstance(connector, CAMAsyncAFDConnector)
-            and self.model_runner._async_cam_ffn_graph_enabled
-            else None
+        cam_connector = (
+            connector if isinstance(connector, CAMAsyncAFDConnector) else None
         )
         thread = self._ffn_thread
-        if graph_connector is not None and thread is not None:
+        if cam_connector is not None and thread is not None:
             thread.join(timeout=FFN_SHUTDOWN_TIMEOUT_SECONDS)
             if thread.is_alive():
                 raise RuntimeError(
-                    "AFD NPU FFN graph loop is still active; retain graph and "
+                    "AFD NPU FFN receive loop is still active; retain graph and "
                     "connector resources until the worker process exits"
                 )
-        # Release a completed graph before its communicator. The legacy path
-        # still closes the connector before joining its receive thread.
-        if graph_connector is not None:
+            self.raise_ffn_loop_error_if_any()
+            if not self._ffn_receiver_drained:
+                raise RuntimeError(
+                    "AFD NPU FFN receiver did not confirm device completion; "
+                    "retain graph and connector resources"
+                )
+        startup = self.model_runner._async_cam_startup
+        if cam_connector is not None and startup is not None and startup.failed:
+            raise RuntimeError(
+                "CAM FFN startup failed; retain communicator and graph resources"
+            )
+        # Only a normally drained CAM receiver may release captured resources.
+        if cam_connector is not None:
             self.model_runner.release_async_cam_ffn_graph()
-            graph_connector.close(release_buffers=False)
+            cam_connector.close()
         else:
             connector.close()
-        if thread is not None and graph_connector is None:
+        if thread is not None and cam_connector is None:
             thread.join(timeout=FFN_SHUTDOWN_TIMEOUT_SECONDS)
             if thread.is_alive():
                 raise RuntimeError(
                     "AFD NPU FFN worker loop did not stop after connector close",
                 )
-        if graph_connector is not None:
-            graph_connector.release_closed_buffers()
         self._ffn_thread = None
         self._ffn_shutdown_event = None
         self._ffn_loop_started_event = None

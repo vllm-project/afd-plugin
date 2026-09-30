@@ -15,6 +15,7 @@ from afd_plugin.distributed.topology import (
 def __getattr__(name: str):
     if name in {
         "DefaultProcessGroupSwitcher",
+        "ProcessGroupRendezvousContext",
         "create_hccl_process_group_options",
         "init_afd_process_group",
     }:
@@ -29,6 +30,7 @@ def __getattr__(name: str):
 __all__ = [
     "AFDRankMapping",
     "DefaultProcessGroupSwitcher",
+    "ProcessGroupRendezvousContext",
     "build_rank_mapping",
     "create_hccl_process_group_options",
     "init_afd_process_group",

@@ -26,7 +26,7 @@ from afd_plugin.compat.npu.profiler import (
     step_afd_npu_profiler,
     stop_afd_npu_profiler,
 )
-from afd_plugin.config import AFDConfig, parse_afd_config
+from afd_plugin.config import AFD_ASYNC_CONNECTOR, AFDConfig, parse_afd_config
 from afd_plugin.connectors import (
     AFDConnectorFactory,
     AFDControlPayload,
@@ -39,6 +39,7 @@ from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
 )
+from afd_plugin.distributed.afd_process_group import ProcessGroupRendezvousContext
 from afd_plugin.envs import async_cam_layered_gmm_enabled
 from afd_plugin.model_executor.npu.async_cam_w4a8 import (
     AsyncCAMW4A8Executor,
@@ -52,6 +53,11 @@ from afd_plugin.v1.worker.cuda_graph import (
     make_ffn_graph_key,
 )
 from afd_plugin.v1.worker.ffn_model_runner import _set_moe_layer_index
+from afd_plugin.v1.worker.npu.async_cam_startup import (
+    AsyncCamStartupCoordinator,
+    AsyncCamStartupSpec,
+    FFNStartupPlan,
+)
 
 if TYPE_CHECKING:
     from vllm.sequence import IntermediateTensors
@@ -81,12 +87,38 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         )
         rank, _ = _resolve_world_ranks()
         local_rank = int(device.index)
-        self.connector = AFDConnectorFactory.create_connector(
-            rank,
-            local_rank,
-            vllm_config,
-            self.afd_config,
+        rendezvous_context = (
+            ProcessGroupRendezvousContext()
+            if afd_config.connector == AFD_ASYNC_CONNECTOR
+            else None
         )
+        if rendezvous_context is None:
+            self.connector = AFDConnectorFactory.create_connector(
+                rank, local_rank, vllm_config, self.afd_config
+            )
+        else:
+            self.connector = AFDConnectorFactory.create_connector(
+                rank,
+                local_rank,
+                vllm_config,
+                self.afd_config,
+                rendezvous_context=rendezvous_context,
+            )
+        self._async_cam_startup: AsyncCamStartupCoordinator | None = None
+        if rendezvous_context is not None:
+            assert isinstance(self.connector, CAMAsyncAFDConnector)
+            self._async_cam_startup = AsyncCamStartupCoordinator(
+                self.connector,
+                rendezvous_context,
+                AsyncCamStartupSpec(
+                    topology=self.connector.topology,
+                    local_rank=local_rank,
+                    tp_size=self.connector.tp_size,
+                    hidden_size=vllm_config.model_config.hf_config.hidden_size,
+                    topk=vllm_config.model_config.hf_config.num_experts_per_tok,
+                    activation_dtype=vllm_config.model_config.dtype,
+                ),
+            )
         if (
             isinstance(self.connector, CAMAsyncAFDConnector)
             and self.afd_config.compute_gate_on_attention
@@ -250,31 +282,29 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self._ffn_forward_connector_driven()
         return None
 
-    def prepare_async_cam_ffn_graph(self) -> None:
-        """Initialize the layered executor before collective CAM warmup."""
-        if (
-            not self._async_cam_ffn_graph_enabled
-            or self._async_cam_ffn_graph is not None
-        ):
-            return
+    def prepare_async_cam_ffn_startup(self) -> FFNStartupPlan:
+        """Prepare the executor and select eager or one FULL graph."""
         if self._layered_executor is None:
             self._initialize_layered_executor()
-        if self._layered_executor is None:
-            raise RuntimeError("CAM async FFN FULL requires layered GMM")
+        if not self._async_cam_ffn_graph_enabled:
+            return FFNStartupPlan(use_graph=False)
+        executor = self._layered_executor
+        if executor is None or not executor.layer_ids:
+            raise RuntimeError("CAM async FFN FULL requires layered GMM layers")
+        return FFNStartupPlan(use_graph=True, first_layer_idx=executor.layer_ids[0])
 
-    def warmup_async_cam_ffn_communication(self) -> None:
+    def warmup_async_cam_ffn_communication(self, count: int) -> None:
         """Consume one controlled CAM work item from each Attention DP group."""
         if not self._async_cam_ffn_graph_enabled:
             return
         connector = cast(CAMAsyncAFDConnector, self.connector)
-        attention_dp_size = connector.attn_size // connector.tp_size
-        for _ in range(attention_dp_size):
+        for _ in range(count):
             self._execute_layered_work_item()
         torch.npu.synchronize()
         logger.info(
             "CAM async FFN communication warmup done rank=%d items=%d",
             connector.world_rank,
-            attention_dp_size,
+            count,
         )
 
     def capture_async_cam_ffn_graph(self) -> None:
@@ -657,6 +687,11 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         if self._is_shutdown:
             return
         stop_afd_npu_profiler(self.prof)
+        if self._async_cam_startup is not None and self.connector.is_initialized:
+            raise RuntimeError(
+                "CAM FFN receiver must drain and close its connector before "
+                "model runner shutdown"
+            )
         if self.connector.is_initialized:
             self.connector.close()
         self.release_async_cam_ffn_graph()

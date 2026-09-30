@@ -19,6 +19,10 @@ from afd_plugin.distributed import resolve_role_rank
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+    from afd_plugin.distributed.afd_process_group import (
+        ProcessGroupRendezvousContext,
+    )
+
 
 class AFDConnectorFactory:
     _registry: dict[str, Callable[[], type[AFDConnectorBase]]] = {}
@@ -53,12 +57,29 @@ class AFDConnectorFactory:
         local_rank: int,
         vllm_config: VllmConfig,
         afd_config: AFDConfig | None = None,
+        *,
+        rendezvous_context: ProcessGroupRendezvousContext | None = None,
     ) -> AFDConnectorBase:
         config = afd_config or parse_afd_config(vllm_config)
         if config.connector not in cls._registry:
             raise ValueError(f"unsupported AFD connector type: {config.connector}")
         connector_cls = cls._registry[config.connector]()
         role_rank = resolve_role_rank(vllm_config, config)
+        if rendezvous_context is not None:
+            from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+
+            if not issubclass(connector_cls, CAMAsyncAFDConnector):
+                raise TypeError(
+                    "rendezvous_context requires a CAMAsyncAFDConnector class"
+                )
+            return connector_cls(
+                rank,
+                local_rank,
+                vllm_config,
+                config,
+                role_rank,
+                rendezvous_context=rendezvous_context,
+            )
         return connector_cls(
             rank,
             local_rank,
