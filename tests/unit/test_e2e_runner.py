@@ -23,6 +23,7 @@ from tests.e2e.accuracy import gsm8k as helpers_gsm8k
 from tests.e2e.models.deepseek_v2_lite import (
     test_deepseek_v2_lite as deepseek_v2_lite_e2e,
 )
+from tests.e2e.models.deepseek_v4_flash import config as dsv4_config
 from tests.e2e.models.qwen3_6 import test_qwen3_6 as qwen3_6_e2e
 from tests.e2e.models.qwen3_moe import test_qwen3_moe as qwen3_moe_e2e
 
@@ -475,6 +476,20 @@ def test_parse_args_rejects_legacy_fixed_scenario_options(monkeypatch, legacy_ar
         ("afd-eager-async-cam", (False, False, False, 2, 2, 1, 2, 1, False)),
         ("afd-async-ubatch", (False, False, False, 2, 1, 1, 2, 1, False)),
         (runner.DSV4_ASYNC_CAM_SCENARIO, (False, False, False, 8, 8, 1, 4, 1, False)),
+        (
+            dsv4_config.DSV4_SYNC_CAMP2P_A5_SCENARIO,
+            # The A5 profile runs Attention DP2/TP1 and FFN DP2/TP1 with ACL
+            # graph capture like its launch script, but without that script's
+            # native DBO, whose split path is the current suspect for the A5 DSA
+            # attention operator tiling failure.
+            (False, True, False, 2, 2, 1, 1, 1, False),
+        ),
+        (
+            dsv4_config.DSV4_SYNC_CAMP2P_A3_SCENARIO,
+            # Sixteen dies: Attention DP2/TP4 and FFN DP8/TP1 with expert
+            # parallelism, the shape its recorded deployment uses.
+            (False, False, False, 8, 8, 1, 4, 1, True),
+        ),
         ("afd-v2-eager-1a1f", (False, False, False, 1, 1, 1, 1, 1, True)),
         ("afd-v2-eager-dp2", (False, False, False, 2, 2, 1, 1, 1, True)),
         ("afd-v2-eager-tp2", (False, False, False, 2, 2, 1, 2, 2, True)),
@@ -508,8 +523,16 @@ def test_configure_scenario_overwrites_fixed_topology_and_features(
         args.ffn_tp_size,
         args.use_v2_model_runner,
     ) == expected
+    # A scenario that carries its own launch profile (the DSV4 synchronous
+    # cases) uses that profile's graph setting instead of the default.
+    profile = dsv4_config.sync_shape(scenario)
     if args.cuda_graph_full_decode_only:
-        assert args.cudagraph_capture_size == 8
+        expected_capture_size = (
+            profile.cudagraph_capture_size
+            if profile is not None
+            else runner.DEFAULT_CUDAGRAPH_CAPTURE_SIZE
+        )
+        assert args.cudagraph_capture_size == expected_capture_size
     if args.enable_dbo:
         assert args.dbo_decode_token_threshold == 1
         assert args.dbo_prefill_token_threshold == 8
