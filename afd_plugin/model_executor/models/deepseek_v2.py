@@ -15,8 +15,7 @@ from typing import Any, TypeAlias
 import torch
 import torch.nn as nn
 from transformers import DeepseekV2Config, DeepseekV3Config, GlmMoeDsaConfig
-from vllm.config import ParallelConfig, VllmConfig
-from vllm.forward_context import get_forward_context
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -26,11 +25,11 @@ from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
     AFDF2ATransferPayload,
-    AFDTransferContext,
-    AFDTransferMetadata,
 )
-from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
-from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
+from afd_plugin.model_executor.remote_moe import (
+    build_attention_moe_runner,
+    remote_ffn_forward,
+)
 
 logger = init_logger(__name__)
 
@@ -130,66 +129,11 @@ class RemoteFFNProxy(nn.Module):
         hidden_states: torch.Tensor,
         **send_kwargs: torch.Tensor,
     ) -> torch.Tensor:
-        afd_metadata = get_afd_metadata_from_forward_context()
-        if afd_metadata is None:
-            raise RuntimeError("RemoteFFNProxy requires AFD forward metadata")
-        forward_context = get_forward_context()
-        stage_idx = int(
-            getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),
-        )
-        afd_metadata.stage_idx = stage_idx
-        metadata = AFDTransferMetadata.create_attention_metadata(
-            layer_idx=self.layer_idx,
-            stage_idx=stage_idx,
-            seq_len=int(hidden_states.shape[0]),
-        )
-        context = AFDTransferContext(metadata=metadata)
-        afd_metadata.connector.send_attn_output(
+        return remote_ffn_forward(
             hidden_states,
-            context,
+            layer_idx=self.layer_idx,
             **send_kwargs,
         )
-        hidden_states = maybe_apply_dbo_yield(
-            hidden_states,
-            role="attention",
-        )
-        return afd_metadata.connector.recv_ffn_output(
-            ref_tensor=hidden_states,
-            ubatch_idx=stage_idx,
-        )
-
-
-class AFDAttentionFusedMoE(RemoteFFNProxy):
-    """Parameter-free native-MoE experts proxy for the Attention runtime."""
-
-    def __init__(
-        self,
-        *,
-        layer_idx: int,
-        is_internal_router: bool,
-    ) -> None:
-        super().__init__(layer_idx=layer_idx)
-        self.is_internal_router = is_internal_router
-
-    # Native FusedMoE passes router_logits at this boundary; only the proxy's
-    # transport is reused, not its hidden-states-only forward contract.
-    def forward(  # type: ignore[override]
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if input_ids is not None:
-            raise NotImplementedError(
-                "experts-boundary input_ids transport is not implemented",
-            )
-        send_kwargs = (
-            {} if self.is_internal_router else {"router_logits": router_logits}
-        )
-        return self._send_and_receive(hidden_states, **send_kwargs)
-
-    def update_expert_map(self) -> None:
-        """Satisfy the native EPLB model interface without local experts."""
 
 
 class GateOnlyRemoteMoE(RemoteFFNProxy):
@@ -268,26 +212,25 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
 
     # Patch reason: native DeepseekV2MoE constructs local routed/shared experts.
     # Patch functionality: preserve the native MoE forward contract while
-    # constructing only the gate owned by Attention and a parameter-free proxy.
-    # Signature: AFD-owned; adds layer_idx and compute_gate_on_attention and omits
-    # quant_config because no local expert kernel is constructed.
+    # constructing only the Attention gate and a registered remote runner.
+    # Signature: AFD-owned; vllm_config replaces parallel_config/quant_config.
     # Upstream: vLLM v0.26.0, vllm/model_executor/models/deepseek_v2.py
     # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
     def __init__(
         self,
         *,
         config: _DeepseekAdapterConfig,
-        parallel_config: ParallelConfig,
-        layer_idx: int,
+        vllm_config: VllmConfig,
         prefix: str,
-        compute_gate_on_attention: bool,
     ) -> None:
         # ### PATCH START: construct a remote-experts native MoE shell.
         nn.Module.__init__(self)
+        parallel_config = vllm_config.parallel_config
+        afd_config = parse_afd_config(vllm_config, validate=False)
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
         router_dtype = native._get_moe_router_dtype(config)
-        if compute_gate_on_attention:
+        if afd_config.compute_gate_on_attention:
             self.gate = native.GateLinear(
                 config.hidden_size,
                 config.n_routed_experts,
@@ -305,14 +248,25 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
 
         ep_size = native.get_ep_group().device_group.size()
         self.n_routed_experts = int(config.n_routed_experts)
-        self.n_shared_experts = int(config.n_shared_experts)
+        self.n_shared_experts = config.n_shared_experts
         self.n_redundant_experts = parallel_config.eplb_config.num_redundant_experts
         self.n_logical_experts = self.n_routed_experts
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
         self.n_local_physical_experts = self.n_physical_experts // ep_size
-        self.experts = AFDAttentionFusedMoE(
-            layer_idx=layer_idx,
-            is_internal_router=not compute_gate_on_attention,
+        self.experts = build_attention_moe_runner(
+            vllm_config,
+            num_experts=config.n_routed_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            prefix=f"{prefix}.experts",
+            renormalize=config.norm_topk_prob,
+            use_grouped_topk=True,
+            num_expert_group=getattr(config, "n_group", 1),
+            topk_group=getattr(config, "topk_group", 1),
+            scoring_func=getattr(config, "scoring_func", "softmax"),
+            routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
+            router_logits_dtype=router_dtype,
         )
         # ### PATCH END: construct a remote-experts native MoE shell.
 
@@ -386,14 +340,6 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         )
         device_type = native.current_platform.device_type
         self.uses_remote_experts = device_type == "cuda" and self.is_moe_layer
-        if (
-            afd_role == "attention"
-            and self.uses_remote_experts
-            and parallel_config.enable_eplb
-        ):
-            raise RuntimeError(
-                "CUDA remote experts do not support EPLB on the Attention role",
-            )
         if self.compute_gate_on_attention and device_type not in ("cuda", "npu"):
             raise RuntimeError(
                 "DeepSeekV2 compute_gate_on_attention requires CUDA or NPU",
@@ -431,10 +377,8 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
             if self.uses_remote_experts:
                 self.mlp = AFDDeepseekV2RemoteExpertsMoE(
                     config=config,
-                    parallel_config=parallel_config,
-                    layer_idx=layer_idx,
+                    vllm_config=vllm_config,
                     prefix=f"{prefix}.mlp",
-                    compute_gate_on_attention=self.compute_gate_on_attention,
                 )
             elif self.compute_gate_on_attention and self.is_moe_layer:
                 self.mlp = GateOnlyRemoteMoE(
