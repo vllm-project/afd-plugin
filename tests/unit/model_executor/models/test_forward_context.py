@@ -14,9 +14,15 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 from vllm.forward_context import (  # noqa: E402
+    ForwardContext,
+    override_forward_context,
+)
+from vllm.forward_context import (  # noqa: E402
     get_forward_context as get_current_forward_context,
 )
+from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE  # noqa: E402
 
+from afd_plugin.connectors import AFDForwardContextMetadata  # noqa: E402
 from afd_plugin.model_executor.models import (  # noqa: E402
     get_afd_metadata_from_forward_context,
 )
@@ -25,9 +31,25 @@ from afd_plugin.model_executor.models.npu.async_cam_layout import (  # noqa: E40
     AsyncMoeUbatchMetadata,
     get_async_moe_ubatch_metadata_from_forward_context,
 )
+from afd_plugin.model_executor.npu.async_cam_execution import (  # noqa: E402
+    CAM_ASYNC_EXECUTION_KEY,
+    CAM_ASYNC_SCHEDULER_KEY,
+    CAMAsyncExecutionContext,
+    CAMAsyncPhase,
+    CAMAsyncUbatchScheduler,
+    require_cam_async_execution_context,
+)
 from afd_plugin.model_executor.npu.async_cam_ubatching import (  # noqa: E402
     AsyncMoeStage,
+    plan_async_moe_stages,
 )
+
+
+@pytest.fixture
+def cam_scheduler():
+    scheduler = CAMAsyncUbatchScheduler(wait_timeout=2)
+    yield scheduler
+    scheduler.shutdown()
 
 
 def test_get_afd_metadata_from_additional_kwargs():
@@ -183,26 +205,43 @@ def test_async_model_forward_preserves_pp_boundaries(
         assert torch.equal(output["residual"], scheduled_residual)
 
 
-def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
+@pytest.mark.parametrize("in_profile_run", [False, True], ids=["regular", "profile"])
+@pytest.mark.parametrize(
+    "dense_prefix", [False, True], ids=["moe-only", "dense-prefix"]
+)
+def test_async_cam_profile_forward_runs_matched_connector_io(
+    monkeypatch,
+    in_profile_run,
+    dense_prefix,
+    cam_scheduler,
+):
     from afd_plugin.model_executor.models.npu import (
         deepseek_v2_async_cam_forward as async_forward,
     )
+    from afd_plugin.model_executor.npu import remote_moe as npu_remote_moe
 
-    forward_context = SimpleNamespace(
-        in_profile_run=True,
-        ubatch_idx=0,
-        flash_comm_v1_enabled=True,
+    execution = CAMAsyncExecutionContext(0, 0, 1, True)
+    forward_context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata=None,
+        slot_mapping={},
+        additional_kwargs={
+            CAM_ASYNC_EXECUTION_KEY: execution,
+            CAM_ASYNC_SCHEDULER_KEY: cam_scheduler,
+        },
     )
-    monkeypatch.setattr(async_forward, "get_forward_context", lambda: forward_context)
-    monkeypatch.setattr(
-        async_forward,
-        "maybe_apply_dbo_yield",
-        lambda hidden_states, **_kwargs: hidden_states,
-    )
+    forward_context.in_profile_run = in_profile_run
+    forward_context.ubatch_idx = 0
+    forward_context.num_ubatches = 1
+    forward_context.flash_comm_v1_enabled = True
+    native_calls = []
+    runner_calls = []
 
-    connector_calls: list[str] = []
+    events: list[tuple[Any, ...]] = []
     dispatch_layouts: list[object] = []
     restored_layouts: list[object] = []
+    pending = []
+    completed_layer_idx = None
 
     def prepare_dispatch_payload(
         hidden_states,
@@ -224,38 +263,81 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
         )
 
     def restore_dispatch_output(local_output, layout):
+        events.append(("restore", completed_layer_idx, 0))
         restored_layouts.append(layout)
         return local_output
 
     monkeypatch.setattr(
-        async_forward,
+        npu_remote_moe,
         "prepare_cam_dispatch_payload",
         prepare_dispatch_payload,
     )
     monkeypatch.setattr(
-        async_forward,
+        npu_remote_moe,
         "restore_cam_dispatch_output",
         restore_dispatch_output,
     )
 
-    def send_attn_output(*args, **kwargs):
-        connector_calls.append("send")
+    def send_attn_output(hidden_states, context, **kwargs):
+        metadata = context.metadata
+        assert metadata.seq_lens == [hidden_states.shape[0]]
+        assert kwargs["topk_weights"].shape == (hidden_states.shape[0], 1)
+        assert kwargs["topk_ids"].dtype == torch.int32
+        events.append(("send", metadata.layer_idx, metadata.stage_idx))
+        pending.append((metadata.layer_idx, hidden_states))
 
     def recv_ffn_output(ref_tensor, ubatch_idx):
-        connector_calls.append("recv")
-        return ref_tensor
+        nonlocal completed_layer_idx
+        completed_layer_idx, dispatched = pending.pop(0)
+        assert ref_tensor is dispatched
+        events.append(("recv", completed_layer_idx, ubatch_idx))
+        return ref_tensor + 10 * (completed_layer_idx - int(dense_prefix) + 1)
 
     connector = SimpleNamespace(
         send_attn_output=send_attn_output,
         recv_ffn_output=recv_ffn_output,
     )
     afd_metadata = SimpleNamespace(connector=connector, stage_idx=0)
+    forward_context.additional_kwargs["afd_metadata"] = afd_metadata
 
-    class _ProfileMoELayer:
+    class _Runner:
+        __call__ = npu_remote_moe.AFDCAMAsyncMoERunner.forward
+        _dispatch_cam = npu_remote_moe.AFDCAMAsyncMoERunner._dispatch_cam
+        _combine_cam = npu_remote_moe.AFDCAMAsyncMoERunner._combine_cam
+        layer_id = npu_remote_moe.AFDCAMAsyncMoERunner.layer_id
+        is_internal_router = True
+
+        def __init__(self, layer_idx):
+            self.layer_name = f"model.layers.{layer_idx}.mlp.experts"
+
+        def _route_native(self, hidden_states):
+            runner_calls.append(self.layer_id)
+            return (
+                torch.ones((hidden_states.shape[0], 1)),
+                torch.zeros((hidden_states.shape[0], 1), dtype=torch.int32),
+                torch.ones((hidden_states.shape[0], 1)),
+            )
+
+        def _compute_attention_shared(self, hidden_states):
+            events.append(("shared", self.layer_id, 0))
+            return 2 * hidden_states
+
+    class _MoE:
+        is_sequence_parallel = False
+
+        def __init__(self, layer_idx):
+            self.experts = _Runner(layer_idx)
+
+        def __call__(self, hidden_states):
+            native_calls.append(self.experts.layer_id)
+            return DeepseekV2MoE.forward(self, hidden_states)
+
+    class _MoELayer:
         is_moe_layer = True
 
-        layer_idx = 0
-        mlp = SimpleNamespace(shared_experts=lambda x: 2 * x)
+        def __init__(self, layer_idx):
+            self.layer_idx = layer_idx
+            self.mlp = _MoE(layer_idx)
 
         def compute_attn_output(
             self,
@@ -264,33 +346,59 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
             residual,
             llama_4_scaling,
         ):
-            return (
-                hidden_states + 1,
+            events.append(("compute", self.layer_idx, 0))
+            return hidden_states + 1, residual + 2
+
+    class _DenseLayer:
+        is_moe_layer = False
+
+        def __call__(self, positions, hidden_states, residual, llama_4_scaling):
+            events.append(("dense", 0))
+            return hidden_states + 5, residual + 1
+
+    moe_layers = [_MoELayer(int(dense_prefix) + offset) for offset in range(2)]
+    layers: list[_MoELayer | _DenseLayer] = list(moe_layers)
+    if dense_prefix:
+        layers.insert(0, _DenseLayer())
+    model = SimpleNamespace(layers=layers, start_layer=0, end_layer=len(layers))
+    expected_events: list[tuple[Any, ...]] = [("dense", 0)] if dense_prefix else []
+    for layer in moe_layers:
+        expected_events.extend(
+            (event, layer.layer_idx, 0)
+            for event in ("compute", "send", "shared", "recv", "restore")
+        )
+
+    for call_idx in range(2):
+        events.clear()
+        native_calls.clear()
+        runner_calls.clear()
+        dispatch_layouts.clear()
+        restored_layouts.clear()
+        hidden_states = torch.full((2, 4), float(2 * call_idx))
+        residual = torch.full_like(hidden_states, 7)
+        with override_forward_context(forward_context):
+            output, output_residual = async_forward.run_attention_gate_afd_forward(
+                model,
+                hidden_states,
                 residual,
-                torch.ones((hidden_states.shape[0], 1)),
-                torch.zeros((hidden_states.shape[0], 1), dtype=torch.int32),
-                torch.ones((hidden_states.shape[0], 1)),
+                torch.arange(2),
+                afd_metadata,
             )
 
-    model = SimpleNamespace(
-        layers=[_ProfileMoELayer(), _ProfileMoELayer()],
-        start_layer=0,
-        end_layer=2,
-    )
-    hidden_states = torch.zeros((2, 4))
-
-    output, residual = async_forward.run_attention_gate_afd_forward(
-        model,
-        hidden_states,
-        None,
-        torch.arange(2),
-        afd_metadata,
-    )
-
-    assert torch.equal(output, (hidden_states + 1) * 9 + 3)
-    assert residual is None
-    assert connector_calls == ["send", "recv", "send", "recv"]
-    assert restored_layouts == dispatch_layouts
+        torch.testing.assert_close(
+            output,
+            9 * (hidden_states + 5 * int(dense_prefix)) + 62,
+        )
+        torch.testing.assert_close(output_residual, residual + 4 + int(dense_prefix))
+        assert events == expected_events
+        assert native_calls == runner_calls == [layer.layer_idx for layer in moe_layers]
+        assert forward_context.additional_kwargs[CAM_ASYNC_EXECUTION_KEY] is execution
+        assert restored_layouts == dispatch_layouts
+        assert not pending
+        for layer in moe_layers:
+            assert vars(layer.mlp.experts) == {
+                "layer_name": f"model.layers.{layer.layer_idx}.mlp.experts"
+            }
 
 
 def test_deepseek_afd_wrapper_keeps_full_model_compile_enabled():
@@ -330,10 +438,7 @@ def test_deepseek_afd_attention_path_can_compute_gate_before_send():
         "    def compute_ffn_output(",
         1,
     )[0]
-    gate_proxy = source.split("class GateOnlyRemoteMoE", 1)[1].split(
-        "class AFDDeepseekV2RemoteExpertsMoE",
-        1,
-    )[0]
+    gate_runner = Path("afd_plugin/model_executor/npu/remote_moe.py").read_text()
     attention_gate_forward = executor_source.split(
         "def run_attention_gate_afd_forward(",
         1,
@@ -344,42 +449,58 @@ def test_deepseek_afd_attention_path_can_compute_gate_before_send():
     assert "def _forward_attention(" not in source
     assert "return super().forward(" in model_forward
     assert "deepseek_v2_async_cam_forward.run_model_forward(" in model_forward
-    assert "compute_gate_topk(" in gate_proxy
-    assert "topk_weights=topk_weights" in gate_proxy
-    assert "topk_ids=topk_ids" in gate_proxy
-    assert "router_logits=router_logits" in gate_proxy
+    assert "def _route_native(" in gate_runner
+    assert "class AFDCAMAsyncMoERunner(AFDRemoteMoERunnerBase):" in gate_runner
+    assert "execution.checkpoint(self.layer_id, CAMAsyncPhase.ROUTED)" in gate_runner
+    assert (
+        "execution.checkpoint(self.layer_id, CAMAsyncPhase.DISPATCHED)" in gate_runner
+    )
     assert "layer.compute_attn_output(" in attention_gate_forward
-    assert "pending_ffn_recv" in attention_gate_forward
-    assert "topk_weights" in attention_gate_forward
-    assert "topk_ids" in attention_gate_forward
+    assert "layer.mlp(hidden_states)" in attention_gate_forward
+    assert "layer_done(layer.layer_idx)" in attention_gate_forward
+    assert "send_attn_output(" not in executor_source
+    assert "recv_ffn_output(" not in executor_source
+    assert "prepare_cam_dispatch_payload(" not in executor_source
+    assert "restore_cam_dispatch_output(" not in executor_source
+    for name in (
+        "compute_gate_topk",
+        "stage_runners",
+        "stage_dispatch_refs",
+        "stage_dispatch_layouts",
+        "stage_shared_outputs",
+        "topk_weights",
+        "topk_ids",
+    ):
+        assert name not in executor_source
 
 
 def test_deepseek_afd_attention_gate_can_force_balanced_topk_ids():
     source = Path("afd_plugin/model_executor/models/deepseek_v2.py").read_text()
-    gate_source = Path(
-        "afd_plugin/model_executor/models/npu/deepseek_v2_attention_gate.py",
-    ).read_text()
+    gate_source = Path("afd_plugin/model_executor/npu/remote_moe.py").read_text()
     module_imports = source.split("logger = init_logger(__name__)", 1)[0]
     compute_attn_output = source.split("    def compute_attn_output(", 1)[1].split(
         "    def compute_ffn_output(",
         1,
     )[0]
 
-    assert "compute_attention_gate_topk(" in compute_attn_output
+    assert "self.mlp.experts" not in compute_attn_output
     assert "afd_plugin.model_executor.models.npu" not in module_imports
-    assert "from afd_plugin.model_executor.models.npu import (" in compute_attn_output
-    assert "deepseek_v2_attention_gate," in compute_attn_output
+    assert "deepseek_v2_attention_gate" not in compute_attn_output
+    helper_source = Path(
+        "afd_plugin/model_executor/models/npu/deepseek_v2_attention_gate.py",
+    ).read_text()
+    assert "def compute_attention_gate_topk(" not in helper_source
     assert "force_balanced_topk_ids_enabled" in gate_source
-    assert "def _force_balanced_topk_ids(" in gate_source
-    assert "topk_ids.copy_(balanced_topk_ids)" in gate_source
-    assert "topk_weights, topk_ids = afd_connector.select_experts(" in (gate_source)
+    assert "balanced_topk_ids = torch.arange(" in gate_source
+    assert "topk_ids.copy_(" in gate_source
+    assert "topk_weights, topk_ids = select_experts(" in (gate_source)
     assert "if force_balanced_topk_ids_enabled():" in gate_source
     assert (
         gate_source.index(
-            "topk_weights, topk_ids = afd_connector.select_experts(",
+            "topk_weights, topk_ids = select_experts(",
         )
         < gate_source.index("if force_balanced_topk_ids_enabled():")
-        < gate_source.index("topk_weights = topk_weights.to(torch.float32)")
+        < gate_source.index("return topk_weights.to(torch.float32)")
     )
 
 
@@ -402,91 +523,205 @@ def test_deepseek_compute_gate_on_attention_selects_backend_boundary():
 
     assert 'device_type not in ("cuda", "npu")' in source
     assert "self.mlp = AFDDeepseekV2RemoteExpertsMoE(" in source
-    assert "self.mlp = GateOnlyRemoteMoE(" in source
+    assert "GateOnlyRemoteMoE" not in source
+    assert "build_attention_moe_runner(" in source
     assert 'prefix=f"{prefix}.mlp"' in source
-    assert (
-        "# NPU-only: Attention-side gate/topk is implemented in the NPU helper."
-        in source
-    )
+    assert "compute_gate_topk(" not in source
     assert (
         "# NPU-only: gated MoE FFN compute consumes Attention-side topk payloads."
         in source
     )
 
 
-def test_async_moe_pipeline_preserves_stage_order(monkeypatch):
+@pytest.mark.parametrize(
+    "dense_prefix", [False, True], ids=["moe-only", "dense-prefix"]
+)
+@pytest.mark.parametrize("num_moe_layers", [1, 2])
+@pytest.mark.parametrize(
+    "use_sequence_parallel", [False, True], ids=["tp", "flashcomm1"]
+)
+def test_async_moe_pipeline_preserves_stage_order(
+    monkeypatch, dense_prefix, cam_scheduler, num_moe_layers, use_sequence_parallel
+):
     from afd_plugin.model_executor.models.npu import deepseek_v2_async_cam_forward
+    from afd_plugin.model_executor.npu import remote_moe as npu_remote_moe
 
     events: list[tuple[Any, ...]] = []
-    forward_context = SimpleNamespace(
+    forward_context = ForwardContext(
+        no_compile_layers={},
         attn_metadata={"layer": "full"},
-        additional_kwargs={},
-        ubatch_idx=0,
-        num_ubatches=1,
-        num_tokens=4,
-        pad_size=0,
-        flash_comm_v1_enabled=True,
+        slot_mapping={},
+        additional_kwargs={CAM_ASYNC_SCHEDULER_KEY: cam_scheduler},
     )
+    forward_context.ubatch_idx = 0
+    forward_context.num_ubatches = 1
+    forward_context.num_tokens = 4
+    forward_context.pad_size = 0
+    forward_context.flash_comm_v1_enabled = use_sequence_parallel
+    forward_context.dbo_enabled = False
+    native_calls = []
+    runner_calls = []
+    stage_contexts = {}
 
-    def send_attn_output(_hidden_states, context, **_kwargs):
-        events.append(("send", context.metadata.stage_idx))
+    pending = {}
+    dispatch_layouts = []
+    restored_layouts = []
+
+    def send_attn_output(hidden_states, context, **_kwargs):
+        metadata = context.metadata
+        assert metadata.seq_lens == [hidden_states.shape[0]]
+        assert metadata.stage_idx not in pending
+        events.append(("send", metadata.layer_idx, metadata.stage_idx))
+        pending[metadata.stage_idx] = (metadata.layer_idx, hidden_states)
 
     def recv_ffn_output(ref_tensor, ubatch_idx):
-        events.append(("recv", ubatch_idx))
-        return ref_tensor
+        layer_idx, dispatched = pending.pop(ubatch_idx)
+        assert ref_tensor is dispatched
+        events.append(("recv", layer_idx, ubatch_idx))
+        return ref_tensor + 10 * (layer_idx - int(dense_prefix) + 1)
 
     connector = SimpleNamespace(
         send_attn_output=send_attn_output,
         recv_ffn_output=recv_ffn_output,
     )
-    parent_metadata = SimpleNamespace(
+    parent_metadata = AFDForwardContextMetadata(
         stage_idx=0,
         connector=connector,
+        tokens_start_loc=[0],
+        requests_start_loc=[0],
+        tokens_lens=[4],
+        num_stages=1,
     )
     forward_context.additional_kwargs["afd_metadata"] = parent_metadata
-    execution_plan = AsyncMoeUbatchMetadata(
-        attn_metadata=[{"layer": "stage-0"}, {"layer": "stage-1"}],
-        stages=[
-            AsyncMoeStage(
-                slice(0, 1),
-                slice(0, 2),
-                input_tokens=2,
-            ),
-            AsyncMoeStage(
-                slice(1, 2),
-                slice(2, 4),
-                input_tokens=4,
-            ),
-        ],
-        parent_input_tokens=4,
-        use_sequence_parallel=True,
-    )
-    stage_hidden_states = [torch.zeros((1, 8)), torch.ones((2, 8))]
 
-    def compute_attn_output(
-        _positions,
-        hidden_states,
-        residual,
-        _llama_4_scaling,
-    ):
-        stage_context = get_current_forward_context()
-        events.append(
-            (
-                "compute",
-                stage_context.ubatch_idx,
-                stage_context.attn_metadata,
-                stage_context.num_tokens,
-                stage_context.pad_size,
-            ),
+    class _Runner:
+        __call__ = npu_remote_moe.AFDCAMAsyncMoERunner.forward
+        _dispatch_cam = npu_remote_moe.AFDCAMAsyncMoERunner._dispatch_cam
+        _combine_cam = npu_remote_moe.AFDCAMAsyncMoERunner._combine_cam
+        layer_id = npu_remote_moe.AFDCAMAsyncMoERunner.layer_id
+        is_internal_router = True
+
+        def __init__(self, layer_idx):
+            self.layer_name = f"model.layers.{layer_idx}.mlp.experts"
+
+        def _route_native(self, hidden_states):
+            stage_idx = get_current_forward_context().ubatch_idx
+            runner_calls.append((self.layer_id, stage_idx))
+            topk = hidden_states[:, :1]
+            return topk, topk.to(torch.int32), None
+
+        def _compute_attention_shared(self, hidden_states):
+            stage_idx = get_current_forward_context().ubatch_idx
+            assert pending[stage_idx][0] == self.layer_id
+            assert pending[stage_idx][1] is hidden_states
+            events.append(("shared", self.layer_id, stage_idx))
+            return hidden_states + self.layer_id - int(dense_prefix) + 1
+
+    class _MoE:
+        is_sequence_parallel = False
+
+        def __init__(self, layer_idx):
+            self.experts = _Runner(layer_idx)
+
+        def __call__(self, hidden_states):
+            native_calls.append(
+                (self.experts.layer_id, get_current_forward_context().ubatch_idx)
+            )
+            return DeepseekV2MoE.forward(self, hidden_states)
+
+    class _MoELayer:
+        is_moe_layer = True
+
+        def __init__(self, layer_idx):
+            self.layer_idx = layer_idx
+            self.mlp = _MoE(layer_idx)
+
+        def compute_attn_output(
+            self,
+            positions,
+            hidden_states,
+            residual,
+            llama_4_scaling,
+        ):
+            stage_context = get_current_forward_context()
+            stage_idx = stage_context.ubatch_idx
+            if stage_context.num_ubatches == 1:
+                assert stage_context is forward_context
+                assert stage_context.num_tokens == hidden_states.shape[0] * (
+                    2 if use_sequence_parallel else 1
+                )
+                assert positions == "full-positions"
+                assert llama_4_scaling == "full-scaling"
+                return hidden_states, residual
+            assert positions == f"positions-{stage_idx}"
+            assert llama_4_scaling == f"scaling-{stage_idx}"
+            events.append(
+                (
+                    "compute",
+                    self.layer_idx,
+                    stage_idx,
+                    stage_context.attn_metadata,
+                    stage_context.num_tokens,
+                    stage_context.pad_size,
+                ),
+            )
+            stage_contexts[stage_idx] = stage_context
+            assert stage_context.dbo_enabled is False
+            assert stage_context.num_ubatches == 2
+            metadata = stage_context.additional_kwargs["afd_metadata"]
+            assert metadata is not parent_metadata
+            assert metadata.stage_idx == stage_idx
+            assert metadata.num_stages == 2
+            assert metadata.tokens_start_loc == [0, actual_counts[0]]
+            assert metadata.tokens_lens == list(stage_input_counts)
+            return hidden_states, residual
+
+    class _DenseLayer:
+        is_moe_layer = False
+
+        def __call__(self, positions, hidden_states, residual, llama_4_scaling):
+            assert positions == "full-positions"
+            assert llama_4_scaling == "full-scaling"
+            events.append(("dense", 0))
+            return hidden_states + 3, residual
+
+    def build_stage_inputs(hidden_states, residual, positions, scaling, metadata):
+        events.append(("split",))
+        assert metadata is execution_plan
+        return SimpleNamespace(
+            hidden_states=[
+                hidden_states[: stage_rows[0]].clone(),
+                hidden_states[: stage_rows[1]].clone() + 1,
+            ],
+            residuals=[None, None],
+            positions=["positions-0", "positions-1"],
+            llama_4_scaling=["scaling-0", "scaling-1"],
         )
-        topk = hidden_states[:, :1]
-        return hidden_states, residual, topk, topk.to(torch.int32), None
 
-    monkeypatch.setattr(
-        deepseek_v2_async_cam_forward,
-        "get_forward_context",
-        lambda: forward_context,
-    )
+    def restore_stage_outputs(outputs, metadata):
+        events.append(("restore-parent",))
+        assert metadata is execution_plan
+        assert not pending
+        return tuple(outputs)
+
+    def prepare_dispatch_payload(
+        hidden_states, topk_weights, topk_ids, router_logits, **kwargs
+    ):
+        assert kwargs["use_sequence_parallel"] is use_sequence_parallel
+        layout = object()
+        dispatch_layouts.append(layout)
+        return SimpleNamespace(
+            hidden_states=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            router_logits=router_logits,
+            layout=layout,
+        )
+
+    def restore_dispatch_output(output, layout):
+        restored_layouts.append(layout)
+        return output
+
     monkeypatch.setattr(
         deepseek_v2_async_cam_forward,
         "get_tensor_model_parallel_world_size",
@@ -495,90 +730,440 @@ def test_async_moe_pipeline_preserves_stage_order(monkeypatch):
     monkeypatch.setattr(
         deepseek_v2_async_cam_forward,
         "build_async_moe_stage_inputs",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            hidden_states=stage_hidden_states,
-            residuals=[None, None],
-            positions=["positions-0", "positions-1"],
-            llama_4_scaling=["scaling-0", "scaling-1"],
-        ),
+        build_stage_inputs,
     )
     monkeypatch.setattr(
         deepseek_v2_async_cam_forward,
         "restore_async_moe_stage_outputs",
-        lambda outputs, _metadata: tuple(outputs),
+        restore_stage_outputs,
     )
     monkeypatch.setattr(
-        deepseek_v2_async_cam_forward,
+        npu_remote_moe,
         "prepare_cam_dispatch_payload",
-        lambda hidden_states, topk_weights, topk_ids, router_logits, **_kwargs: (
-            SimpleNamespace(
-                hidden_states=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                router_logits=router_logits,
-                layout=object(),
-            )
-        ),
+        prepare_dispatch_payload,
     )
     monkeypatch.setattr(
-        deepseek_v2_async_cam_forward,
+        npu_remote_moe,
         "restore_cam_dispatch_output",
-        lambda output, _layout: output,
+        restore_dispatch_output,
     )
 
-    output, residual = deepseek_v2_async_cam_forward.run_async_moe_ubatch_afd_forward(
-        model=SimpleNamespace(
-            start_layer=0,
-            end_layer=2,
-            layers=[
-                SimpleNamespace(
-                    is_moe_layer=True,
-                    layer_idx=layer_idx,
-                    mlp=SimpleNamespace(
-                        shared_experts=lambda x, offset=layer_idx + 1: x + offset,
-                    ),
-                    compute_attn_output=compute_attn_output,
-                )
-                for layer_idx in range(2)
-            ],
-        ),
-        hidden_states=torch.zeros((4, 8)),
-        residual=None,
-        positions="full-positions",
-        afd_metadata=parent_metadata,
-        async_moe_ubatch_metadata=execution_plan,
-        llama_4_scaling="full-scaling",
-    )
-
-    assert [event[:2] for event in events] == [
-        ("compute", 0),
-        ("send", 0),
-        ("compute", 1),
-        ("recv", 0),
-        ("send", 1),
-        ("compute", 0),
-        ("recv", 1),
-        ("send", 0),
-        ("compute", 1),
-        ("recv", 0),
-        ("send", 1),
-        ("recv", 1),
+    moe_layers = [
+        _MoELayer(int(dense_prefix) + offset) for offset in range(num_moe_layers)
     ]
-    for event in (event for event in events if event[0] == "compute"):
-        stage_idx = event[1]
-        assert event[2] == {"layer": f"stage-{stage_idx}"}
-        assert event[3] == 2
-        assert event[4] == (0, 2)[stage_idx]
-    assert all(
-        restored is expected
-        for restored, expected in zip(output, stage_hidden_states, strict=True)
+    layers: list[_MoELayer | _DenseLayer] = list(moe_layers)
+    if dense_prefix:
+        layers.insert(0, _DenseLayer())
+    model = SimpleNamespace(start_layer=0, end_layer=len(layers), layers=layers)
+    first_layer_idx = int(dense_prefix)
+    last_layer_idx = first_layer_idx + 1
+    expected_events: list[tuple[Any, ...]] = [("dense", 0)] if dense_prefix else []
+    expected_events += [
+        ("split",),
+        ("compute", first_layer_idx, 0),
+        ("send", first_layer_idx, 0),
+        ("shared", first_layer_idx, 0),
+        ("compute", first_layer_idx, 1),
+        ("recv", first_layer_idx, 0),
+        ("send", first_layer_idx, 1),
+        ("shared", first_layer_idx, 1),
+    ]
+    if num_moe_layers == 2:
+        expected_events += [
+            ("compute", last_layer_idx, 0),
+            ("recv", first_layer_idx, 1),
+            ("send", last_layer_idx, 0),
+            ("shared", last_layer_idx, 0),
+            ("compute", last_layer_idx, 1),
+            ("recv", last_layer_idx, 0),
+            ("send", last_layer_idx, 1),
+            ("shared", last_layer_idx, 1),
+            ("recv", last_layer_idx, 1),
+        ]
+    else:
+        expected_events.append(("recv", first_layer_idx, 1))
+    expected_events.append(("restore-parent",))
+    gain, offset = {1: (2, 11), 2: (4, 44)}[num_moe_layers]
+    worker_threads = None
+
+    for call_idx, stage_input_counts in enumerate(((2, 4), (4, 6))):
+        actual_counts = (
+            ((2, 2) if call_idx == 0 else (3, 5))
+            if use_sequence_parallel
+            else stage_input_counts
+        )
+        stage_rows = tuple(
+            count // (2 if use_sequence_parallel else 1) for count in stage_input_counts
+        )
+        parent_tokens = sum(actual_counts)
+        parent_rows = parent_tokens // (2 if use_sequence_parallel else 1)
+        forward_context.num_tokens = parent_tokens
+        parent_metadata.tokens_lens = [parent_tokens]
+        execution_plan = AsyncMoeUbatchMetadata(
+            attn_metadata=[
+                {"layer": f"stage-{stage}", "request": call_idx} for stage in range(2)
+            ],
+            stages=[
+                AsyncMoeStage(
+                    slice(0, 1),
+                    slice(0, actual_counts[0]),
+                    input_tokens=stage_input_counts[0],
+                ),
+                AsyncMoeStage(
+                    slice(1, 2),
+                    slice(actual_counts[0], parent_tokens),
+                    input_tokens=stage_input_counts[1],
+                ),
+            ],
+            parent_input_tokens=parent_tokens,
+            use_sequence_parallel=use_sequence_parallel,
+        )
+        events.clear()
+        native_calls.clear()
+        runner_calls.clear()
+        stage_contexts.clear()
+        dispatch_layouts.clear()
+        restored_layouts.clear()
+        with override_forward_context(forward_context):
+            output, residual = (
+                deepseek_v2_async_cam_forward.run_async_moe_ubatch_afd_forward(
+                    model=model,
+                    hidden_states=torch.full((parent_rows, 8), float(2 * call_idx)),
+                    residual=None,
+                    positions="full-positions",
+                    afd_metadata=parent_metadata,
+                    async_moe_ubatch_metadata=execution_plan,
+                    llama_4_scaling="full-scaling",
+                )
+            )
+            assert get_current_forward_context() is forward_context
+
+        assert [event[:3] for event in events] == expected_events
+        assert (
+            native_calls
+            == runner_calls
+            == [(layer.layer_idx, stage) for layer in moe_layers for stage in range(2)]
+        )
+        assert stage_contexts[0] is not stage_contexts[1]
+        assert (
+            stage_contexts[0].additional_kwargs
+            is not stage_contexts[1].additional_kwargs
+        )
+        assert (
+            stage_contexts[0].additional_kwargs["afd_metadata"].tokens_lens
+            is not stage_contexts[1].additional_kwargs["afd_metadata"].tokens_lens
+        )
+        for event in (event for event in events if event[0] == "compute"):
+            stage_idx = event[2]
+            assert event[3] == {"layer": f"stage-{stage_idx}", "request": call_idx}
+            assert event[4] == actual_counts[stage_idx]
+            assert event[5] == stage_input_counts[stage_idx] - actual_counts[stage_idx]
+        expected = gain * (2 * call_idx + 3 * int(dense_prefix)) + offset
+        torch.testing.assert_close(
+            output[0], torch.full((stage_rows[0], 8), float(expected))
+        )
+        torch.testing.assert_close(
+            output[1], torch.full((stage_rows[1], 8), float(expected + gain))
+        )
+        assert restored_layouts == dispatch_layouts
+        assert residual is None
+        assert not pending
+        assert forward_context.attn_metadata == {"layer": "full"}
+        assert forward_context.additional_kwargs == {
+            "afd_metadata": parent_metadata,
+            CAM_ASYNC_SCHEDULER_KEY: cam_scheduler,
+        }
+        assert parent_metadata.tokens_start_loc == [0]
+        assert parent_metadata.tokens_lens == [parent_tokens]
+        assert parent_metadata.num_stages == 1
+        assert forward_context.ubatch_idx == 0
+        assert forward_context.num_ubatches == 1
+        assert forward_context.num_tokens == parent_tokens
+        assert forward_context.pad_size == 0
+        for layer in moe_layers:
+            assert vars(layer.mlp.experts) == {
+                "layer_name": f"model.layers.{layer.layer_idx}.mlp.experts"
+            }
+
+        current_threads = tuple(cam_scheduler._threads)
+        assert len(current_threads) == 2
+        if worker_threads is None:
+            worker_threads = current_threads
+        else:
+            assert current_threads == worker_threads
+        if call_idx == 0:
+            native_calls.clear()
+            runner_calls.clear()
+            execution = CAMAsyncExecutionContext(0, 0, 1, use_sequence_parallel)
+            forward_context.additional_kwargs[CAM_ASYNC_EXECUTION_KEY] = execution
+            single_hidden = torch.full((3, 8), 7.0)
+            forward_context.num_tokens = 3 * (2 if use_sequence_parallel else 1)
+            parent_metadata.tokens_lens = [forward_context.num_tokens]
+            with override_forward_context(forward_context):
+                single_output, single_residual = (
+                    deepseek_v2_async_cam_forward.run_attention_gate_afd_forward(
+                        model,
+                        single_hidden,
+                        None,
+                        "full-positions",
+                        parent_metadata,
+                        "full-scaling",
+                    )
+                )
+                assert get_current_forward_context() is forward_context
+            torch.testing.assert_close(
+                single_output,
+                torch.full_like(
+                    single_hidden, gain * (7 + 3 * int(dense_prefix)) + offset
+                ),
+            )
+            assert single_residual is None
+            assert (
+                native_calls
+                == runner_calls
+                == [(layer.layer_idx, 0) for layer in moe_layers]
+            )
+            assert not pending
+            assert tuple(cam_scheduler._threads) == worker_threads
+            assert (
+                forward_context.additional_kwargs.pop(CAM_ASYNC_EXECUTION_KEY)
+                is execution
+            )
+
+
+def _cam_model_context(scheduler, num_tokens):
+    metadata = AFDForwardContextMetadata(
+        tokens_start_loc=[0],
+        requests_start_loc=[0],
+        stage_idx=0,
+        connector=SimpleNamespace(),
+        tokens_lens=[num_tokens],
+        num_stages=1,
     )
-    torch.testing.assert_close(output[0], torch.full((1, 8), 4.0))
-    torch.testing.assert_close(output[1], torch.full((2, 8), 8.0))
+    context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata={"parent": True},
+        slot_mapping={},
+        additional_kwargs={
+            "afd_metadata": metadata,
+            CAM_ASYNC_SCHEDULER_KEY: scheduler,
+        },
+    )
+    context.flash_comm_v1_enabled = False
+    context.dbo_enabled = False
+    context.ubatch_idx = 0
+    context.num_ubatches = 1
+    context.num_tokens = num_tokens
+    context.pad_size = 0
+    return context, metadata
+
+
+def test_async_pipeline_without_moe_runs_dense_without_starting_workers(
+    monkeypatch, cam_scheduler
+):
+    from afd_plugin.model_executor.models.npu import (
+        deepseek_v2_async_cam_forward as model_forward,
+    )
+
+    context, metadata = _cam_model_context(cam_scheduler, 4)
+    plan = AsyncMoeUbatchMetadata(
+        attn_metadata=[{}, {}],
+        stages=[
+            AsyncMoeStage(slice(0, 1), slice(0, 2), 2),
+            AsyncMoeStage(slice(1, 2), slice(2, 4), 2),
+        ],
+        parent_input_tokens=4,
+        use_sequence_parallel=False,
+    )
+    visited = []
+
+    class Dense:
+        is_moe_layer = False
+
+        def __init__(self, layer_id):
+            self.layer_id = layer_id
+
+        def __call__(self, positions, hidden, residual, scaling):
+            assert get_current_forward_context() is context
+            visited.append(self.layer_id)
+            return hidden + self.layer_id, residual + 1
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("A dense-only model must not split inputs or start CAM execution")
+
+    monkeypatch.setattr(model_forward, "build_async_moe_stage_inputs", unexpected)
+    monkeypatch.setattr(model_forward, "CAMAsyncRuntimeContext", unexpected)
+    layers = [Dense(2), Dense(3)]
+    hidden = torch.arange(8).reshape(4, 2).float()
+    residual = torch.ones_like(hidden)
+    with override_forward_context(context):
+        output, actual_residual = model_forward.run_async_moe_ubatch_afd_forward(
+            SimpleNamespace(layers=layers, start_layer=0, end_layer=2),
+            hidden,
+            residual,
+            torch.arange(4),
+            metadata,
+            plan,
+        )
+        assert get_current_forward_context() is context
+    torch.testing.assert_close(output, hidden + 5)
+    torch.testing.assert_close(actual_residual, residual + 2)
+    assert visited == [2, 3]
+    assert cam_scheduler._threads == []
+    assert cam_scheduler.quiescent
+    assert metadata.tokens_lens == [4]
+
+
+@pytest.mark.parametrize("failed_stage", [0, 1])
+@pytest.mark.parametrize("failed_phase", ["attention", "combine"])
+def test_async_pipeline_error_restores_parent_context_without_replay(
+    monkeypatch, cam_scheduler, failed_stage, failed_phase
+):
+    from afd_plugin.model_executor.models.npu import (
+        deepseek_v2_async_cam_forward as model_forward,
+    )
+
+    context, metadata = _cam_model_context(cam_scheduler, 4)
+    plan = AsyncMoeUbatchMetadata(
+        attn_metadata=[{"stage": 0}, {"stage": 1}],
+        stages=[
+            AsyncMoeStage(slice(0, 1), slice(0, 2), 2),
+            AsyncMoeStage(slice(1, 2), slice(2, 4), 2),
+        ],
+        parent_input_tokens=4,
+        use_sequence_parallel=False,
+    )
+    monkeypatch.setattr(
+        model_forward, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    original_error = RuntimeError("stage execution failed")
+    operations = []
+
+    def record(phase):
+        stage_idx = get_current_forward_context().ubatch_idx
+        operations.append((phase, stage_idx))
+        if (phase, stage_idx) == (failed_phase, failed_stage):
+            raise original_error
+
+    def compute_attention(positions, hidden, residual, scaling):
+        record("attention")
+        return hidden, residual
+
+    def run_moe(hidden):
+        execution = require_cam_async_execution_context()
+        execution.checkpoint(7, CAMAsyncPhase.ROUTED)
+        execution.checkpoint(7, CAMAsyncPhase.DISPATCHED)
+        record("combine")
+        return hidden + 1
+
+    layer = SimpleNamespace(
+        is_moe_layer=True,
+        layer_idx=7,
+        compute_attn_output=compute_attention,
+        mlp=run_moe,
+    )
+    with override_forward_context(context):
+        with pytest.raises(RuntimeError) as caught:
+            model_forward.run_async_moe_ubatch_afd_forward(
+                SimpleNamespace(layers=[layer], start_layer=0, end_layer=1),
+                torch.ones(4, 2),
+                None,
+                torch.arange(4),
+                metadata,
+                plan,
+            )
+        assert caught.value is original_error
+        assert get_current_forward_context() is context
+    assert operations[-1] == (failed_phase, failed_stage)
+    assert operations.count((failed_phase, failed_stage)) == 1
+    assert cam_scheduler.quiescent
+    assert context.attn_metadata == {"parent": True}
+    assert context.additional_kwargs == {
+        "afd_metadata": metadata,
+        CAM_ASYNC_SCHEDULER_KEY: cam_scheduler,
+    }
+    assert metadata.tokens_lens == [4]
+    assert metadata.num_stages == 1
+    assert context.ubatch_idx == 0
+    assert context.num_ubatches == 1
+    with (
+        pytest.raises(RuntimeError, match="FAILED"),
+        cam_scheduler.single_stage(use_sequence_parallel=False),
+    ):
+        pytest.fail("A failed model execution must not be replayed")
+
+
+def test_same_request_stages_observe_causal_cpu_kv_writes(monkeypatch, cam_scheduler):
+    from afd_plugin.model_executor.models.npu import (
+        deepseek_v2_async_cam_forward as model_forward,
+    )
+
+    context, metadata = _cam_model_context(cam_scheduler, 5)
+    stages = plan_async_moe_stages(
+        [5],
+        split="token",
+        use_sequence_parallel=False,
+        tensor_parallel_size=2,
+    )
+    assert stages is not None
+    assert [stage.request_slice for stage in stages] == [slice(0, 1), slice(0, 1)]
+    plan = AsyncMoeUbatchMetadata(
+        attn_metadata=[
+            {"request_id": "same-request", "slots": torch.arange(3), "seq_len": 3},
+            {"request_id": "same-request", "slots": torch.arange(3, 5), "seq_len": 5},
+        ],
+        stages=stages,
+        parent_input_tokens=5,
+        use_sequence_parallel=False,
+    )
+    monkeypatch.setattr(
+        model_forward, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    hidden = torch.arange(1, 11).reshape(5, 2).float()
+    kv_cache = torch.full_like(hidden, torch.nan)
+    writes = []
+
+    def causal_attention(positions, stage_hidden, residual, scaling):
+        stage_context = get_current_forward_context()
+        stage_metadata = stage_context.attn_metadata
+        assert stage_metadata["request_id"] == "same-request"
+        assert torch.equal(positions, stage_metadata["slots"])
+        prefix_len = int(positions[0])
+        assert torch.isfinite(kv_cache[:prefix_len]).all()
+        assert torch.isnan(kv_cache[prefix_len:]).all()
+        kv_cache[positions] = stage_hidden
+        writes.append((stage_context.ubatch_idx, tuple(positions.tolist())))
+        # This CPU attention stub reads exactly the prefix visible to each token.
+        output = torch.stack([kv_cache[: int(pos) + 1].sum(0) for pos in positions])
+        assert stage_metadata["seq_len"] == int(positions[-1]) + 1
+        return output, residual
+
+    def run_moe(stage_hidden):
+        execution = require_cam_async_execution_context()
+        execution.checkpoint(7, CAMAsyncPhase.ROUTED)
+        execution.checkpoint(7, CAMAsyncPhase.DISPATCHED)
+        return stage_hidden + 5
+
+    layer = SimpleNamespace(
+        is_moe_layer=True,
+        layer_idx=7,
+        compute_attn_output=causal_attention,
+        mlp=run_moe,
+    )
+    with override_forward_context(context):
+        output, residual = model_forward.run_async_moe_ubatch_afd_forward(
+            SimpleNamespace(layers=[layer], start_layer=0, end_layer=1),
+            hidden,
+            None,
+            torch.arange(5),
+            metadata,
+            plan,
+        )
+        assert get_current_forward_context() is context
+    assert writes == [(0, (0, 1, 2)), (1, (3, 4))]
+    torch.testing.assert_close(kv_cache, hidden)
+    torch.testing.assert_close(output, hidden.cumsum(0) + 5)
     assert residual is None
-    assert forward_context.attn_metadata == {"layer": "full"}
-    assert forward_context.num_tokens == 4
-    assert forward_context.pad_size == 0
 
 
 def test_deepseek_afd_ffn_path_reuses_ascend_moe_mlp_after_attention_gate():

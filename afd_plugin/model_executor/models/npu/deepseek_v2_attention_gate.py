@@ -4,13 +4,11 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import torch
 
 from afd_plugin.connectors import AFDF2ATransferPayload
-from afd_plugin.envs import force_balanced_topk_ids_enabled
-from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 
 try:
     from vllm_ascend.ascend_config import get_ascend_config
@@ -18,87 +16,9 @@ except ImportError:
     get_ascend_config = None
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
-
-    from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
     from afd_plugin.model_executor.models.deepseek_v2 import (
         AFDDeepseekV2DecoderLayer,
-        _DeepseekAdapterConfig,
     )
-
-
-def compute_attention_gate_topk(
-    layer: AFDDeepseekV2DecoderLayer,
-    hidden_states: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute router logits and top-k payloads for Attention-side gate."""
-
-    return compute_gate_topk(
-        gate=layer.mlp.gate,
-        vllm_config=layer.vllm_config,
-        config=layer.config,
-        top_k=layer.top_k,
-        hidden_states=hidden_states,
-    )
-
-
-def compute_gate_topk(
-    *,
-    gate: torch.nn.Module,
-    vllm_config: VllmConfig,
-    config: _DeepseekAdapterConfig,
-    top_k: int,
-    hidden_states: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute routing payloads for a native-path gate proxy."""
-
-    router_logits, _ = gate(hidden_states)
-    afd_metadata = get_afd_metadata_from_forward_context()
-    if afd_metadata is None:
-        raise RuntimeError(
-            "AFD connector required for compute_gate_on_attention "
-            "but not found in forward context",
-        )
-    afd_connector = cast("CAMAsyncAFDConnector", afd_metadata.connector)
-    mix_placement = bool(
-        getattr(vllm_config, "additional_config", {}).get(
-            "mix_placement",
-            False,
-        ),
-    )
-    num_redundant_experts = (
-        vllm_config.parallel_config.eplb_config.num_redundant_experts
-    )
-    if mix_placement:
-        num_experts = (
-            config.n_shared_experts + config.n_routed_experts + num_redundant_experts
-        )
-    else:
-        num_experts = config.n_routed_experts + num_redundant_experts
-    routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
-    topk_weights, topk_ids = afd_connector.select_experts(
-        hidden_states=hidden_states,
-        router_logits=router_logits,
-        top_k=top_k,
-        use_grouped_topk=True,
-        renormalize=getattr(config, "norm_topk_prob", True),
-        scoring_func=getattr(config, "scoring_func", "softmax"),
-        num_expert_group=getattr(config, "n_group", 1),
-        topk_group=getattr(config, "topk_group", 1),
-        routed_scaling_factor=(routed_scaling_factor if mix_placement else 1.0),
-        e_score_correction_bias=gate.e_score_correction_bias,
-        mix_placement=mix_placement,
-        num_logical_experts=router_logits.shape[1],
-        num_shared_experts=config.n_shared_experts,
-        num_experts=num_experts,
-    )
-    if force_balanced_topk_ids_enabled():
-        topk_ids = _force_balanced_topk_ids(
-            topk_ids,
-            num_logical_experts=router_logits.shape[1],
-        )
-    topk_weights = topk_weights.to(torch.float32)
-    return topk_weights, topk_ids, router_logits
 
 
 def compute_attention_gate_moe_ffn(
@@ -375,24 +295,6 @@ def _gmmswigluquant_fusion_enabled() -> bool:
     return bool(getattr(fusion_config, "fusion_ops_gmmswigluquant", False))
 
 
-def _force_balanced_topk_ids(
-    topk_ids: torch.Tensor,
-    *,
-    num_logical_experts: int,
-) -> torch.Tensor:
-    balanced_topk_ids = torch.arange(
-        topk_ids.numel(),
-        device=topk_ids.device,
-        dtype=torch.int64,
-    ).reshape(topk_ids.shape)
-    balanced_topk_ids = balanced_topk_ids.remainder(num_logical_experts).to(
-        dtype=topk_ids.dtype,
-    )
-    topk_ids.copy_(balanced_topk_ids)
-    return topk_ids
-
-
 __all__ = [
     "compute_attention_gate_moe_ffn",
-    "compute_attention_gate_topk",
 ]

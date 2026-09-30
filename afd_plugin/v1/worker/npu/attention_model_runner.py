@@ -95,6 +95,12 @@ from afd_plugin.model_executor.models.npu.deepseek_attention_metadata import (
     materialize_deepseek_attention_metadata,
     materialize_deepseek_attention_metadata_by_layer,
 )
+from afd_plugin.model_executor.npu.async_cam_execution import (
+    CAM_ASYNC_EXECUTION_KEY,
+    CAM_ASYNC_SCHEDULER_KEY,
+    CAMAsyncExecutionContext,
+    CAMAsyncUbatchScheduler,
+)
 from afd_plugin.model_executor.npu.async_cam_ubatching import (
     AsyncMoeStage,
     plan_async_moe_stages,
@@ -145,6 +151,14 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             vllm_config,
             self.afd_config,
         )
+        self._afd_cam_async_scheduler: (
+            CAMAsyncUbatchScheduler[tuple[torch.Tensor, torch.Tensor | None]] | None
+        ) = (
+            CAMAsyncUbatchScheduler()
+            if afd_config.connector == AFD_ASYNC_CONNECTOR
+            else None
+        )
+        self._afd_shutdown = False
         self.afd_async_extra_info = AFDAsyncExtraInfo()
         if afd_config.connector == AFD_ASYNC_CONNECTOR:
             connector_extra_info = self.connector.extra_info
@@ -1444,6 +1458,18 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         if forward_context.additional_kwargs is None:
             forward_context.additional_kwargs = {}
         forward_context.additional_kwargs["afd_metadata"] = self._afd_pending_metadata
+        if self.afd_config.connector == AFD_ASYNC_CONNECTOR:
+            forward_context.additional_kwargs[CAM_ASYNC_SCHEDULER_KEY] = (
+                self._afd_cam_async_scheduler
+            )
+            forward_context.additional_kwargs[CAM_ASYNC_EXECUTION_KEY] = (
+                CAMAsyncExecutionContext(
+                    run_id=0,
+                    stage_idx=self._afd_pending_metadata.stage_idx,
+                    num_stages=1,
+                    use_sequence_parallel=bool(forward_context.flash_comm_v1_enabled),
+                )
+            )
         if self.connector.control_plane is None:
             return
         if self._afd_suppress_metadata_send:
@@ -1929,9 +1955,30 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         return result
 
     def shutdown(self) -> None:
-        stop_afd_npu_profiler(self.prof)
-        self.connector.close()
-        super().shutdown()
+        scheduler = self._afd_cam_async_scheduler
+        if self._afd_shutdown:
+            if scheduler is not None:
+                scheduler.shutdown()
+                self._afd_cam_async_scheduler = None
+            return
+        self._afd_shutdown = True
+        if scheduler is None:
+            stop_afd_npu_profiler(self.prof)
+            self.connector.close()
+            super().shutdown()
+            return
+        scheduler.cancel()
+        try:
+            self.connector.close()
+        finally:
+            try:
+                scheduler.shutdown()
+                self._afd_cam_async_scheduler = None
+            finally:
+                try:
+                    stop_afd_npu_profiler(self.prof)
+                finally:
+                    super().shutdown()
 
     def _next_afd_transaction_id(self) -> str:
         counter = self._afd_transaction_counter

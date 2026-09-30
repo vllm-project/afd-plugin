@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from copy import copy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -129,7 +130,7 @@ def main() -> None:
 
     # Worker setup owns all pinned Ascend operator/quantization registration.
     # Imports remain deferred until CLI setup, just like the worker process.
-    from vllm.config import set_current_vllm_config
+    from vllm.config import CompilationConfig, set_current_vllm_config
     from vllm.distributed import destroy_distributed_environment, destroy_model_parallel
     from vllm.engine.arg_utils import EngineArgs
     from vllm.model_executor.layers import fused_moe
@@ -143,7 +144,6 @@ def main() -> None:
     from afd_plugin.compat.npu.forward_context import ascend_forward_context
     from afd_plugin.model_executor.models.npu.deepseek_v2_attention_gate import (
         compute_attention_gate_moe_ffn,
-        compute_gate_topk,
     )
 
     config = EngineArgs(
@@ -194,7 +194,7 @@ def main() -> None:
                 from vllm.model_executor.models import deepseek_v2 as native
 
                 from afd_plugin.model_executor.models.deepseek_v2 import (
-                    GateOnlyRemoteMoE,
+                    AFDDeepseekV2RemoteExpertsMoE,
                     _iter_role_weights,
                 )
 
@@ -226,6 +226,7 @@ def main() -> None:
                     prefix=prefix,
                     **extra,
                 )
+                attention_config = config
                 if args.family == "dsv4":
                     attention = AFDDeepseekV4AttentionGateRemoteMoE(
                         config=hf,
@@ -234,12 +235,15 @@ def main() -> None:
                         vllm_config=config,
                     )
                 else:
-                    attention = GateOnlyRemoteMoE(
-                        config=hf,
-                        layer_idx=layer_idx,
-                        prefix=prefix,
-                        vllm_config=config,
-                    )
+                    attention_config = copy(config)
+                    attention_config.compilation_config = CompilationConfig()
+                    with set_current_vllm_config(attention_config):
+                        attention = AFDDeepseekV2RemoteExpertsMoE(
+                            config=hf,
+                            layer_idx=layer_idx,
+                            prefix=prefix,
+                            vllm_config=attention_config,
+                        )
                 native_holder = model_holder(
                     native, reference_moe, hf, layer_idx, args.family
                 )
@@ -272,11 +276,15 @@ def main() -> None:
                             (name.removeprefix("model."), tensor)
                             for name, tensor in weights
                         )
-                    loaded = holder.load_weights(weights)
-                    assert loaded, "checkpoint filter did not load any MoE parameters"
-                    process_weights_after_loading(
-                        holder, config.model_config, torch.device("npu")
-                    )
+                    owner_config = attention_config if shared_only else config
+                    with set_current_vllm_config(owner_config):
+                        loaded = holder.load_weights(weights)
+                        assert loaded, (
+                            "checkpoint filter did not load any MoE parameters"
+                        )
+                        process_weights_after_loading(
+                            holder, owner_config.model_config, torch.device("npu")
+                        )
 
             torch.manual_seed(SEED)
             hidden = (
@@ -308,20 +316,25 @@ def main() -> None:
                 # and combination. Subtract independently computed shared
                 # output in FP32 to expose its routed contribution.
                 native_routed = native_final.float() - native_shared.float()
-                if args.family == "dsv4":
-                    weights, ids = (
-                        deepseek_v4_attention_gate.compute_attention_gate_topk(
-                            attention, hidden
+                with (
+                    set_current_vllm_config(attention_config),
+                    ascend_forward_context(
+                        vllm_config=attention_config,
+                        afd_metadata=afd_metadata,
+                        model_instance=attention_holder,
+                        num_tokens=TOKENS,
+                        input_ids=token_ids,
+                    ),
+                ):
+                    if args.family == "dsv4":
+                        weights, ids = (
+                            deepseek_v4_attention_gate.compute_attention_gate_topk(
+                                attention, hidden
+                            )
                         )
-                    )
-                else:
-                    weights, ids, _ = compute_gate_topk(
-                        gate=attention.gate,
-                        vllm_config=config,
-                        config=hf,
-                        top_k=hf.num_experts_per_tok,
-                        hidden_states=hidden,
-                    )
+                    else:
+                        weights, ids, _ = attention.experts.compute_gate_topk(hidden)
+                    afd_shared = attention.shared_experts(hidden)
                 routing_diagnostic = {}
                 routing_tensors = {}
                 if args.family == "dsv4":
@@ -408,7 +421,6 @@ def main() -> None:
                     TOKENS, hf.num_experts_per_tok, hf.hidden_size
                 )
                 afd_routed = (routed.float() * weights[:, :, None]).sum(dim=1).to(dtype)
-                afd_shared = attention.shared_experts(hidden)
                 if dtype == torch.float16 and args.family == "dsv2":
                     afd_shared = afd_shared / factor
                 afd_final = afd_routed + afd_shared

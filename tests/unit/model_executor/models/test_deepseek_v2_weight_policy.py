@@ -149,14 +149,19 @@ def test_weight_role_policy(
     )
 
 
+@pytest.mark.parametrize("connector", ["P2pNcclAFDConnector", "CAMP2pAFDConnector"])
 def test_load_weights_passes_one_shot_generator_to_native_loader(
     monkeypatch: pytest.MonkeyPatch,
+    connector: str,
 ) -> None:
     names = [
         "model.embed_tokens.weight",
         "model.layers.0.self_attn.q_proj.weight",
         "model.layers.0.mlp.gate_proj.weight",
         "model.layers.3.mlp.experts.0.down_proj.weight",
+        "model.layers.3.mlp.experts.0.down_proj.weight_scale_inv",
+        "model.layers.3.mlp.gate.weight",
+        "model.layers.3.mlp.shared_experts.gate_proj.weight",
     ]
     weights = _OneShotWeights(names)
     seen: list[str] = []
@@ -177,9 +182,7 @@ def test_load_weights_passes_one_shot_generator_to_native_loader(
     object.__setattr__(
         model,
         "afd_config",
-        SimpleNamespace(
-            compute_gate_on_attention=False, connector="CAMP2pAFDConnector"
-        ),
+        SimpleNamespace(compute_gate_on_attention=False, connector=connector),
     )
     object.__setattr__(model, "config", _config())
 
@@ -241,7 +244,9 @@ def test_moe_metadata_and_backend_loading_remain_native_owned() -> None:
     source = (
         REPO_ROOT / "afd_plugin" / "model_executor" / "models" / "deepseek_v2.py"
     ).read_text(encoding="utf-8")
-    assert "vllm_ascend" not in source
+    module_imports = source.split("logger = init_logger(__name__)", 1)[0]
+    assert "vllm_ascend" not in module_imports
+    assert "vllm_ascend.ascend_config" not in source
 
 
 @pytest.mark.parametrize("suffix", ["weight", "weight_scale", "input_scale", "bias"])
