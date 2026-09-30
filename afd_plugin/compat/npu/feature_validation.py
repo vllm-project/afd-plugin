@@ -183,19 +183,6 @@ def _fail_if_unsupported_npu_afd_async_features(
             "CAMAsyncAFDConnector requires additional_config['afd'] "
             "with async=true and connector='CAMAsyncAFDConnector'",
         )
-    if (
-        afd_config.role == "ffn"
-        and _is_dsv4_target(vllm_config)
-        and async_cam_layered_gmm_enabled()
-        and (
-            bool(vllm_config.model_config.enforce_eager)
-            or vllm_config.compilation_config.cudagraph_mode.name != "FULL"
-        )
-    ):
-        raise RuntimeError(
-            "DSV4 layered Async CAM FFN requires enforce_eager=false "
-            "and cudagraph_mode=FULL"
-        )
     if not bool(vllm_config.model_config.enforce_eager):
         graph_mode = vllm_config.compilation_config.cudagraph_mode.name
         if not (

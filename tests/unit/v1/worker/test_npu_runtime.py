@@ -2469,21 +2469,16 @@ def test_npu_async_feature_validation_allows_only_layered_dsv4_ffn_full(
     )
     fail_if_unsupported_npu_afd_features(config)
 
-    for enforce_eager, graph_mode in (
-        (True, "FULL"),
-        (False, "NONE"),
-        (False, "PIECEWISE"),
-        (False, "FULL_AND_PIECEWISE"),
-        (False, "FULL_DECODE_ONLY"),
+    for graph_mode in (
+        "NONE",
+        "PIECEWISE",
+        "FULL_AND_PIECEWISE",
+        "FULL_DECODE_ONLY",
     ):
-        config.model_config.enforce_eager = enforce_eager
         config.compilation_config.cudagraph_mode.name = graph_mode
-        with pytest.raises(RuntimeError, match="requires enforce_eager=false"):
+        with pytest.raises(RuntimeError, match="requires FFN FULL"):
             fail_if_unsupported_npu_afd_features(config)
 
-    monkeypatch.setattr(
-        feature_validation, "async_cam_layered_gmm_enabled", lambda: False
-    )
     config.model_config.enforce_eager = True
     config.compilation_config.cudagraph_mode.name = "NONE"
     fail_if_unsupported_npu_afd_features(config)
