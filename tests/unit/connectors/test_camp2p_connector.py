@@ -123,7 +123,18 @@ def _init_ffn_connector(rank, vllm_config):
     return connector
 
 
-def test_camp2p_recv_attn_output_uses_original_contiguous_af_grouping(monkeypatch):
+@pytest.mark.parametrize(
+    ("attention_counts", "expected"),
+    [
+        ([2, 3, 2, 3], [4, 6]),
+        ([2, 3, 5, 7], [7, 10]),
+        ([4, 8], [12, 12]),
+        ([4, 4, 4, 4], [8, 8]),
+    ],
+)
+def test_camp2p_recv_attn_output_matches_kernel_rank_mapping(
+    monkeypatch, attention_counts, expected
+):
     torch = pytest.importorskip("torch")
     monkeypatch.setattr(
         torch.ops.afd_ascend,
@@ -131,7 +142,7 @@ def test_camp2p_recv_attn_output_uses_original_contiguous_af_grouping(monkeypatc
         lambda *args: ("hidden", None, None, "atten-batch", "active-mask"),
         raising=False,
     )
-    dp_metadata_list = {0: _FakeDPMetadata([2, 3, 5, 7])}
+    dp_metadata_list = {0: _FakeDPMetadata(attention_counts)}
     rank0 = _init_ffn_connector(0, _vllm_config())
     rank1 = _init_ffn_connector(1, _vllm_config())
     rank0.dp_metadata_list = dp_metadata_list
@@ -140,11 +151,12 @@ def test_camp2p_recv_attn_output_uses_original_contiguous_af_grouping(monkeypatc
     context0 = rank0.recv_attn_output(ubatch_idx=0, layer_idx=3).context
     context1 = rank1.recv_attn_output(ubatch_idx=0, layer_idx=3).context
 
-    assert context0.metadata.seq_lens == [5]
-    assert context1.metadata.seq_lens == [12]
+    assert context0.metadata.seq_lens == [expected[0]]
+    assert context1.metadata.seq_lens == [expected[1]]
     assert isinstance(context0.states, CAMP2PTransferState)
     assert isinstance(context0.states, AFDTransferState)
-    assert context0.states.batch_size == 5
+    assert context0.states.batch_size == expected[0]
+    assert context1.states.batch_size == expected[1]
     assert context0.states.h == 16
     assert context0.states.k == 2
 
@@ -185,7 +197,7 @@ def test_camp2p_recv_attn_output_drives_the_operator_ids_mode(monkeypatch):
     )
 
     assert calls[0][-1] == 1
-    assert with_ids.input_ids.tolist() == [0, 2, 4, 6, 8]
+    assert with_ids.input_ids.tolist() == [0, 2, 4, 6, 8, 10, 12]
     assert calls[1][-1] == 0
     assert without_ids.input_ids is None
 
@@ -240,7 +252,7 @@ def test_camp2p_connector_uses_role_specific_core_num(monkeypatch):
     states = connector.recv_attn_output(ubatch_idx=0, layer_idx=3).context.states
 
     assert states.k == 2
-    assert states.batch_size == 5
+    assert states.batch_size == 7
     # The ffn_core_num override applies because this is an FFN-role connector.
     assert states.aiv_num == 13
 

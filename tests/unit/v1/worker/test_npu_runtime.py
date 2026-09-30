@@ -1773,14 +1773,34 @@ def test_npu_ffn_runner_skips_replay_when_attention_is_eager(monkeypatch):
     ]
 
 
-def test_npu_ffn_runner_graph_key_uses_ffn_aggregated_token_counts():
+@pytest.mark.parametrize(
+    ("attention_counts", "attention_size", "ffn_size", "expected"),
+    [
+        ([2, 3, 2, 3], 4, 2, [4, 6]),
+        ([2, 3, 5, 7], 4, 2, [7, 10]),
+        ([4, 8], 4, 2, [12, 12]),
+        ([12] * 8, 8, 4, [24] * 4),
+        ([2, 3], 2, 2, [2, 3]),
+        ([2, 3], 2, 1, [5]),
+    ],
+)
+def test_npu_ffn_runner_token_counts_and_graph_key_match_kernel_rank_mapping(
+    attention_counts, attention_size, ffn_size, expected
+):
     runner = _new_ffn_runner()
-    runner.connector = _FakeFFNConnector(attn_size=8, ffn_size=4)
-    runner.max_num_tokens = 24
+    from afd_plugin.v1.worker.npu.ffn_model_runner import _ffn_token_counts_across_ranks
 
-    assert runner._make_graph_key({0: _FakeDPMetadata([12] * 8)}) == (
-        (0, (24, 24, 24, 24)),
+    runner.connector = _FakeFFNConnector(attn_size=attention_size, ffn_size=ffn_size)
+    runner.max_num_tokens = 24
+    dp_metadata = {0: _FakeDPMetadata(attention_counts)}
+
+    assert (
+        _ffn_token_counts_across_ranks(
+            runner.connector, dp_metadata, 0, fallback=runner.max_num_tokens
+        ).tolist()
+        == expected
     )
+    assert runner._make_graph_key(dp_metadata) == ((0, tuple(expected)),)
 
 
 def test_npu_ffn_runner_falls_back_to_eager_on_acl_graph_miss(monkeypatch):

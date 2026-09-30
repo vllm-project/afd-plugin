@@ -9,10 +9,10 @@ used by CPU-safe tests.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, SupportsInt, cast
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -107,16 +107,17 @@ def make_ffn_graph_key(
     attention_size: int | None = None,
     ffn_size: int | None = None,
     fallback: int = 1,
-) -> tuple[tuple[int, tuple]]:
-    """Extract the AFD FFN graph hashable key from DP metadata."""
+) -> tuple[tuple[int, tuple[int, ...] | tuple[str]], ...]:
+    """Extract an FFN graph key, using CAMP2P aggregation when sizes are given."""
 
-    key_parts: list[tuple[int, tuple]] = []
+    key_parts: list[tuple[int, tuple[int, ...] | tuple[str]]] = []
+    values_tuple: tuple[int, ...] | tuple[str]
     for stage_idx, metadata in sorted(dp_metadata_list.items()):
         values = getattr(metadata, "num_tokens_across_dp_cpu", None)
         if values is None:
             if _use_ffn_aggregated_key(attention_size, ffn_size):
                 values_tuple = tuple(
-                    max(1, int(fallback)) for _ in range(int(ffn_size))
+                    max(1, int(fallback)) for _ in range(int(cast(int, ffn_size)))
                 )
             else:
                 values_tuple = (repr(metadata),)
@@ -125,8 +126,8 @@ def make_ffn_graph_key(
             if _use_ffn_aggregated_key(attention_size, ffn_size):
                 values_tuple = _aggregate_ffn_values_tuple(
                     values_tuple,
-                    attention_size=int(attention_size),
-                    ffn_size=int(ffn_size),
+                    attention_size=int(cast(int, attention_size)),
+                    ffn_size=int(cast(int, ffn_size)),
                     fallback=int(fallback),
                 )
         key_parts.append((int(stage_idx), values_tuple))
@@ -157,9 +158,9 @@ def _metadata_values_tuple(values: object) -> tuple[int, ...]:
     elif hasattr(values, "item"):
         values = [values.item()]
     try:
-        return tuple(int(value) for value in values)
+        return tuple(int(value) for value in cast(Iterable[SupportsInt], values))
     except TypeError:
-        return (int(values),)
+        return (int(cast(SupportsInt, values)),)
 
 
 def _use_ffn_aggregated_key(
@@ -192,10 +193,9 @@ def _aggregate_ffn_values_tuple(
         expanded = tuple(values[i // tp_size] for i in range(attention_size))
     if len(expanded) < attention_size:
         return tuple(max(1, int(fallback)) for _ in range(ffn_size))
-    group_size = attention_size // ffn_size
+    # CAMP2P maps Attention rank a to FFN rank a % ffn_size.
     return tuple(
-        max(1, sum(expanded[idx * group_size : (idx + 1) * group_size]))
-        for idx in range(ffn_size)
+        max(1, sum(expanded[idx:attention_size:ffn_size])) for idx in range(ffn_size)
     )
 
 
