@@ -22,8 +22,6 @@ constexpr uint64_t CAM_MAX_RANK_SIZE = 384;  // max NPUs supported by the Cam co
 constexpr uint32_t UB_ALIGN = 32;            // UB aligned to 32 bytes
 constexpr uint32_t MAX_AIV_NUM = 48;         // max AIV core count
 constexpr uint32_t INFO_NUM = 5;  // number of valid batch-info fields; also start/end expert per chunk
-constexpr uint32_t ATTN_RANK_ID_INDEX = 1;
-constexpr int64_t STOP_ATTENTION_RANK = -1;
 
 template <AscendC::HardEvent event>
 __aicore__ inline void SyncFunc()
@@ -179,12 +177,6 @@ __aicore__ inline void AfdAsyncCombineSend<TemplateMC2TypeFunc>::Process()
         {false, 0U, 0U, 0U});
     SyncFunc<HardEvent::MTE2_S>();
     SyncFunc<HardEvent::S_MTE2>();
-
-    // FFN graph shutdown emits a local synthetic work item. Its negative
-    // Attention rank must never be used to address a remote CAM window.
-    if (tpBatchInfoTensor_(ATTN_RANK_ID_INDEX) == STOP_ATTENTION_RANK) {
-        return;
-    }
 
     CombineSend();
 }

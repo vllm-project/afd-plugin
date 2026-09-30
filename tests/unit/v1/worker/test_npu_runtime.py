@@ -2964,9 +2964,6 @@ def test_npu_async_cam_ffn_startup_orders_warmup_capture_and_ready(monkeypatch):
     connector._startup_store = object()
     connector.world_rank = 8
     connector.prepare_startup_coordination = lambda: events.append("coordination")
-    connector.enable_ffn_graph_stop = lambda layer_idx: events.append(
-        ("stop input", layer_idx)
-    )
     connector.publish_ffn_mode = lambda layer_idx: events.append(("mode", layer_idx))
     connector.wait_for_attention_warmup_prepared = lambda: events.append("prepared")
     connector.publish_ffn_warmup_started = lambda: events.append("warmup start")
@@ -3011,7 +3008,6 @@ def test_npu_async_cam_ffn_startup_orders_warmup_capture_and_ready(monkeypatch):
         "warmup",
         "connector",
         "coordination",
-        ("stop input", 0),
         ("mode", 0),
         "prepared",
         "warmup start",
@@ -3026,14 +3022,13 @@ def test_npu_async_cam_ffn_startup_orders_warmup_capture_and_ready(monkeypatch):
     ]
 
 
-def test_npu_async_cam_graph_shutdown_drains_before_destroying_group():
+def test_npu_async_cam_graph_shutdown_releases_after_thread_stops():
     _require_npu_runtime()
     from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
 
     events = []
     connector = object.__new__(CAMAsyncAFDConnector)
     connector.world_rank = 8
-    connector.signal_ffn_graph_stop = lambda: events.append("stop bit")
     connector.close = lambda **_: events.append("close group")
     connector.release_closed_buffers = lambda: events.append("release anchors")
     worker = _new_ffn_worker()
@@ -3060,11 +3055,9 @@ def test_npu_async_cam_graph_shutdown_drains_before_destroying_group():
     worker.stop_ffn_server_loop()
 
     assert events == [
-        "stop bit",
         "join",
         "release graph",
         "close group",
-        "join",
         "release anchors",
     ]
 
@@ -3076,7 +3069,6 @@ def test_npu_async_cam_graph_shutdown_retains_anchors_if_join_times_out():
     events = []
     connector = object.__new__(CAMAsyncAFDConnector)
     connector.world_rank = 8
-    connector.signal_ffn_graph_stop = lambda: events.append("stop bit")
     connector.close = lambda **_: events.append("close group")
     connector.release_closed_buffers = lambda: events.append("release anchors")
     worker = _new_ffn_worker()
@@ -3096,7 +3088,7 @@ def test_npu_async_cam_graph_shutdown_retains_anchors_if_join_times_out():
         release_async_cam_ffn_graph=lambda: events.append("release graph"),
     )
 
-    with pytest.raises(RuntimeError, match="did not stop after stop bit"):
+    with pytest.raises(RuntimeError, match="still active"):
         worker.stop_ffn_server_loop()
 
-    assert events == ["stop bit", "join timeout"]
+    assert events == ["join timeout"]

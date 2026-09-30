@@ -80,7 +80,6 @@ FFN_STARTUP_POLL_SECONDS = 0.25
 FFN_STARTUP_NONCE_BYTES = 16
 STARTUP_WARMUP_TOKEN_COUNT = 1
 STARTUP_WARMUP_HIDDEN_VALUE = 0.25
-FFN_GRAPH_STOP_BUFFER_INT64_VALUES = 4
 
 _AFD_ASYNC_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
     {
@@ -273,8 +272,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         self.cam_pg: ProcessGroup | None = None
         self._rendezvous_store: Store | None = None
         self._startup_store: Store | None = None
-        self._ffn_graph_stop_stream: torch.npu.Stream | None = None
-        self._ffn_graph_stop_host: Tensor | None = None
         self.topology = build_async_topology(
             afd_config,
             role_rank,
@@ -366,33 +363,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
 
     def prepare_startup_coordination(self) -> None:
         self._get_startup_store()
-
-    def enable_ffn_graph_stop(self, first_layer_idx: int) -> None:
-        """Keep a graph-owned 32-byte stop input and an independent copy stream."""
-        if self.topology.role != "ffn" or not self.is_initialized:
-            raise RuntimeError("CAM graph stop input requires initialized FFN rank")
-        if self._ffn_graph_stop_stream is not None:
-            return
-        initial = torch.zeros(FFN_GRAPH_STOP_BUFFER_INT64_VALUES, dtype=torch.int64)
-        initial[1] = first_layer_idx
-        stop = initial.clone().pin_memory()
-        stop[0] = 1
-        self._placeholder = initial.view(self.activation_dtype).to(
-            device=f"npu:{self.local_rank}"
-        )
-        self._ffn_graph_stop_host = stop.view(self.activation_dtype)
-        self._ffn_graph_stop_stream = torch.npu.Stream(device=self.local_rank)
-
-    def signal_ffn_graph_stop(self) -> None:
-        """Write the stop bit while the graph stream may be blocked in DR."""
-        stream = self._ffn_graph_stop_stream
-        source = self._ffn_graph_stop_host
-        destination = self._placeholder
-        if stream is None or source is None or destination is None:
-            raise RuntimeError("CAM FFN graph stop input was not initialized")
-        with torch.npu.stream(stream):
-            destination.copy_(source, non_blocking=True)
-        stream.synchronize()
 
     def _wait_for_startup_entries(
         self, keys: list[str], failure_keys: list[str]
@@ -599,8 +569,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             raise RuntimeError("Cannot release active CAM operator buffers")
         self.comm_args = None
         self._placeholder = None
-        self._ffn_graph_stop_stream = None
-        self._ffn_graph_stop_host = None
         self._startup_store = None
         self._rendezvous_store = None
         self._pending_attention_payloads.clear()

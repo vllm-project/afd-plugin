@@ -39,7 +39,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 FFN_SHUTDOWN_TIMEOUT_SECONDS = 5
-FFN_GRAPH_SHUTDOWN_TIMEOUT_SECONDS = 30
 FFN_STARTUP_THREAD_TIMEOUT_SECONDS = 30
 
 
@@ -138,7 +137,6 @@ class AFDNPUFFNWorker(NPUWorker):
                     executor = self.model_runner._layered_executor
                     if executor is None:
                         raise RuntimeError("CAM FFN graph has no layered executor")
-                    connector.enable_ffn_graph_stop(executor.layer_ids[0])
                     connector.publish_ffn_mode(executor.layer_ids[0])
                     connector.wait_for_attention_warmup_prepared()
                     connector.publish_ffn_warmup_started()
@@ -261,9 +259,9 @@ class AFDNPUFFNWorker(NPUWorker):
         if event is not None:
             event.set()
 
-        # The graph DR can block inside the NPU kernel. Signal its graph-owned
-        # input from an independent stream, then wait for every queued replay
-        # before destroying the communicator or releasing graph anchors.
+        # A graph replay may be blocked in DR until Attention sends another
+        # work item. Do not destroy its communicator or graph-owned tensors
+        # while the worker thread is still using them.
         connector = self.model_runner.connector
         graph_cam = (
             isinstance(connector, CAMAsyncAFDConnector)
@@ -271,27 +269,20 @@ class AFDNPUFFNWorker(NPUWorker):
         )
         thread = self._ffn_thread
         if graph_cam and thread is not None:
-            logger.info("CAM FFN graph shutdown entered rank=%d", connector.world_rank)
-        if graph_cam and thread is not None and thread.is_alive():
-            connector.signal_ffn_graph_stop()
-            logger.info("CAM FFN graph stop copied rank=%d", connector.world_rank)
-            thread.join(timeout=FFN_GRAPH_SHUTDOWN_TIMEOUT_SECONDS)
+            thread.join(timeout=FFN_SHUTDOWN_TIMEOUT_SECONDS)
             if thread.is_alive():
-                raise RuntimeError("AFD NPU FFN graph loop did not stop after stop bit")
-            logger.info("CAM FFN graph thread joined rank=%d", connector.world_rank)
-        # The stopped graph must release its captured HCCL resources while the
-        # communicator is still valid. Keep operator anchors until both are
-        # released; the legacy path still closes before its bounded join.
+                raise RuntimeError(
+                    "AFD NPU FFN graph loop is still active; retain graph and "
+                    "connector resources until the worker process exits"
+                )
+        # Release a completed graph before its communicator. The legacy path
+        # still closes the connector before joining its receive thread.
         if graph_cam:
             self.model_runner.release_async_cam_ffn_graph()
-            logger.info(
-                "CAM FFN graph resources released rank=%d", connector.world_rank
-            )
             connector.close(release_buffers=False)
-            logger.info("CAM FFN communicator closed rank=%d", connector.world_rank)
         else:
             connector.close()
-        if thread is not None:
+        if thread is not None and not graph_cam:
             thread.join(timeout=FFN_SHUTDOWN_TIMEOUT_SECONDS)
             if thread.is_alive():
                 raise RuntimeError(
@@ -299,13 +290,10 @@ class AFDNPUFFNWorker(NPUWorker):
                 )
         if graph_cam:
             connector.release_closed_buffers()
-            logger.info("CAM FFN graph anchors released rank=%d", connector.world_rank)
         self._ffn_thread = None
         self._ffn_shutdown_event = None
         self._ffn_loop_started_event = None
         self.raise_ffn_loop_error_if_any()
-        if graph_cam and thread is not None:
-            logger.info("CAM FFN graph shutdown complete rank=%d", connector.world_rank)
 
     def shutdown(self) -> None:
         # Stop the connector-driven daemon before NPUWorker releases the model

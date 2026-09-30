@@ -5,19 +5,13 @@
 Run with torchrun --standalone --nproc-per-node=2. Rank 0 is Attention and
 rank 1 is FFN. ``cold`` captures immediately; ``warmup`` completes one eager
 CAM transaction on both ranks before capture. Both modes send a matched task
-for graph replay only after capture completes. ``shutdown`` first follows the
-successful ``warmup`` path, then starts an unmatched FFN replay to test whether
-destroying the CAM process group releases a blocked dispatch-recv kernel.
-``stop`` instead uses the opt-in 32-byte FFN input to drain that replay before
-destroying the communicator.
+for graph replay only after capture completes.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import threading
-import time
 from datetime import timedelta
 
 import torch
@@ -37,10 +31,6 @@ EXPERTS_PER_RANK = 1
 DYNAMIC_QUANT = 1
 COMM_ID = 0
 RENDEZVOUS_TIMEOUT_SECONDS = 120
-SHUTDOWN_IDLE_SECONDS = 2
-SHUTDOWN_JOIN_SECONDS = 5
-GRAPH_STOP_BUFFER_INT64_VALUES = 4
-UNMATCHED_REPLAY_COUNT = 43
 
 
 def log(rank: int, phase: str) -> None:
@@ -145,9 +135,7 @@ def ffn_transaction(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--mode", choices=("cold", "warmup", "shutdown", "stop"), required=True
-    )
+    parser.add_argument("--mode", choices=("cold", "warmup"), required=True)
     parser.add_argument("--cam-port", type=int, required=True)
     args = parser.parse_args()
     rank = int(os.environ["RANK"])
@@ -176,18 +164,10 @@ def main() -> None:
     )
     comm_args = torch.empty((1,), dtype=torch.float16, device="npu")
     anchor = torch.empty((1,), dtype=torch.bfloat16, device="npu")
-    stop_host = None
-    stop_stream = None
-    if args.mode == "stop" and rank == ATTN_RANKS:
-        control = torch.zeros(GRAPH_STOP_BUFFER_INT64_VALUES, dtype=torch.int64)
-        anchor = control.view(torch.bfloat16).to("npu")
-        control[0] = 1
-        stop_host = control.pin_memory().view(torch.bfloat16)
-        stop_stream = torch.npu.Stream()
     log(rank, "CAM HCCL group initialized")
 
     with torch.inference_mode():
-        if args.mode in ("warmup", "shutdown", "stop"):
+        if args.mode == "warmup":
             log(rank, "eager warmup start")
             if rank == 0:
                 attention_transaction(
@@ -225,78 +205,6 @@ def main() -> None:
             torch.npu.synchronize()
             log(rank, "graph replay complete")
         dist.barrier()
-
-        if args.mode in ("shutdown", "stop"):
-            results: dict[str, str] = {}
-
-            def synchronize_unmatched_replay() -> None:
-                try:
-                    torch.npu.set_device(local_rank)
-                    torch.npu.synchronize()
-                    results["sync"] = "complete"
-                except Exception as exc:
-                    results["sync"] = f"failed: {exc}"
-
-            def close_cam_group() -> None:
-                try:
-                    torch.npu.set_device(local_rank)
-                    dist.destroy_process_group(cam_group)
-                    results["close"] = "complete"
-                except Exception as exc:
-                    results["close"] = f"failed: {exc}"
-
-            def copy_stop_bit() -> None:
-                assert stop_host is not None and stop_stream is not None
-                try:
-                    torch.npu.set_device(local_rank)
-                    with torch.npu.stream(stop_stream):
-                        anchor.copy_(stop_host, non_blocking=True)
-                    stop_stream.synchronize()
-                    results["stop_copy"] = "complete"
-                except Exception as exc:
-                    results["stop_copy"] = f"failed: {exc}"
-
-            sync_thread = None
-            if rank == ATTN_RANKS:
-                assert graph is not None and references is not None
-                log(rank, "unmatched graph replay start")
-                for _ in range(UNMATCHED_REPLAY_COUNT):
-                    graph.replay()
-                log(
-                    rank,
-                    f"unmatched graph replay submitted count={UNMATCHED_REPLAY_COUNT}; "
-                    "anchors retained",
-                )
-                sync_thread = threading.Thread(
-                    target=synchronize_unmatched_replay, daemon=True
-                )
-                sync_thread.start()
-            dist.barrier()
-            time.sleep(SHUTDOWN_IDLE_SECONDS)
-            if sync_thread is not None:
-                log(rank, f"unmatched synchronize blocked={sync_thread.is_alive()}")
-            if args.mode == "stop" and rank == ATTN_RANKS:
-                stop_thread = threading.Thread(target=copy_stop_bit, daemon=True)
-                stop_thread.start()
-                stop_thread.join(timeout=SHUTDOWN_JOIN_SECONDS)
-                log(rank, f"graph stop bit copy={results.get('stop_copy', 'blocked')}")
-                if results.get("stop_copy") != "complete":
-                    log(rank, "shutdown probe failed; forcing this probe process exit")
-                    os._exit(2)
-            close_thread = threading.Thread(target=close_cam_group, daemon=True)
-            close_thread.start()
-            close_thread.join(timeout=SHUTDOWN_JOIN_SECONDS)
-            if sync_thread is not None:
-                sync_thread.join(timeout=SHUTDOWN_JOIN_SECONDS)
-                log(rank, f"post-close sync={results.get('sync', 'blocked')}")
-            log(rank, f"CAM group close={results.get('close', 'blocked')}")
-            if results.get("close") != "complete" or (
-                sync_thread is not None and results.get("sync") != "complete"
-            ):
-                log(rank, "shutdown probe failed; forcing this probe process exit")
-                os._exit(2)
-            dist.destroy_process_group()
-            return
 
     dist.destroy_process_group(cam_group)
     dist.destroy_process_group()
