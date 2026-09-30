@@ -184,9 +184,21 @@ def _fail_if_unsupported_npu_afd_async_features(
             "with async=true and connector='CAMAsyncAFDConnector'",
         )
     if not bool(vllm_config.model_config.enforce_eager):
-        raise RuntimeError(
-            "CAMAsyncAFDConnector supports only eager Attention/FFN execution",
-        )
+        graph_mode = vllm_config.compilation_config.cudagraph_mode.name
+        if not (
+            afd_config.role == "ffn"
+            and async_cam_layered_gmm_enabled()
+            and _is_dsv4_target(vllm_config)
+            and afd_config.compute_gate_on_attention
+            and extra_info.dynamic_quant == 1
+            and not vllm_config.use_v2_model_runner
+            and graph_mode == "FULL"
+        ):
+            raise RuntimeError(
+                "CAMAsyncAFDConnector graph execution requires FFN FULL, "
+                "DeepSeek V4, layered W4A8 GMM, Attention-side gate, "
+                "dynamicQuant=1, and ModelRunnerV1; Attention remains eager"
+            )
     if bool(parallel_config.enable_dbo) or bool(parallel_config.use_ubatching):
         raise RuntimeError(
             "CAMAsyncAFDConnector does not support vLLM native ubatching/DBO",

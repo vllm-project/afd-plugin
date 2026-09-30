@@ -33,6 +33,9 @@ from afd_plugin.connectors.npu.async_cam import (  # noqa: E402
     CAMAsyncAFDConnector,
     build_async_topology,
 )
+from afd_plugin.distributed.afd_process_group import (  # noqa: E402
+    ProcessGroupRendezvousContext,
+)
 
 
 class _FakeTensorLike:
@@ -353,6 +356,7 @@ def test_async_connector_init_creates_attention_first_hccl_group(monkeypatch):
             "timeout": calls[0]["timeout"],
             "init_method": "tcp://127.0.0.1:1239",
             "pg_options": pg_options,
+            "on_rendezvous": None,
         },
     ]
     assert connector.cam_pg is not None
@@ -509,6 +513,84 @@ def test_async_ffn_side_dispatch_recv_and_combine_send(monkeypatch):
     }
     for index in (0, 2):
         assert logs[index][2]["max_seq_len"] == connector.max_num_batched_tokens
+
+
+def test_startup_warmup_uses_real_connector_fifo_then_formal_task(monkeypatch):
+    from afd_plugin.v1.worker.npu import async_cam_startup
+
+    fake_torch = _FakeTorch()
+    routed_ids = []
+    synchronizations = []
+    fake_torch.full = lambda shape, value, *, dtype, device: _FakeTensor(
+        shape, dtype=dtype, device=device
+    )
+
+    def make_ids(values, *, dtype, device):
+        routed_ids.append(values)
+        return _FakeTensor((len(values), len(values[0])), dtype=dtype, device=device)
+
+    fake_torch.tensor = make_ids
+    fake_torch.npu = SimpleNamespace(
+        synchronize=lambda: synchronizations.append("done")
+    )
+    monkeypatch.setattr(async_cam_module, "torch", fake_torch)
+    monkeypatch.setattr(async_cam_startup, "torch", fake_torch)
+    connector = CAMAsyncAFDConnector(
+        0, 0, _vllm_config(), _afd_config(role="attention"), 0
+    )
+    connector._initialized = True
+    connector.comm_args = _FakeTensor((1,), dtype="fp16")
+
+    class ReadyStore:
+        values = {
+            **{f"ffn/warmup/start/{rank}": b"ready" for rank in (4, 5)},
+            **{f"ffn/warmup/done/{rank}": b"ready" for rank in (4, 5)},
+            **{f"attn/done/{rank}": b"ready" for rank in (1, 2, 3)},
+        }
+
+        def set(self, key, value):
+            self.values[key] = value.encode()
+
+        def check(self, keys):
+            return all(key in self.values for key in keys)
+
+        def get(self, key):
+            return self.values[key]
+
+    context = ProcessGroupRendezvousContext()
+    store = ReadyStore()
+    context.retain_store(store)
+    context.bind(SimpleNamespace())
+    startup = async_cam_startup.AsyncCamStartupCoordinator(
+        connector,
+        context,
+        async_cam_startup.AsyncCamStartupSpec(
+            topology=connector.topology,
+            local_rank=0,
+            tp_size=connector.tp_size,
+            hidden_size=connector.hidden_size,
+            topk=connector.topk,
+            activation_dtype=fake_torch.bfloat16,
+        ),
+    )
+    startup._store = store
+    startup._run_attention_warmup(layer_idx=3)
+
+    assert routed_ids == [[[0, 4]]]
+    assert synchronizations == ["done"]
+    assert connector._pending_attention_payloads == {}
+    assert store.values["attn/done/0"] == b"ready"
+
+    formal_context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=5, stage_idx=0, seq_len=1
+        )
+    )
+    formal_hidden = _FakeTensor((1, 16))
+    connector.send_attn_output(formal_hidden, formal_context, **_topk_payload(1))
+    assert connector._pending_attention_payloads[0][0][0] is formal_context
+    connector.recv_ffn_output(formal_hidden, ubatch_idx=0)
+    assert connector._pending_attention_payloads == {}
 
 
 def test_async_combine_send_requires_dispatch_recv_token_metadata(monkeypatch):
@@ -851,3 +933,71 @@ def test_close_releases_every_stage_routing(monkeypatch):
     assert set(connector._pending_attention_payloads) == {0, 1}
     connector.close()
     assert connector._pending_attention_payloads == {}
+
+
+def test_async_factory_injects_context_only_into_cam_connector():
+    context = ProcessGroupRendezvousContext()
+    connector = AFDConnectorFactory.create_connector(
+        0,
+        0,
+        _vllm_config(),
+        _afd_config(role="attention"),
+        rendezvous_context=context,
+    )
+    assert isinstance(connector, CAMAsyncAFDConnector)
+    assert connector._rendezvous_context is context
+    with pytest.raises(RuntimeError, match="not bound"):
+        context.borrow()
+
+    with pytest.raises(TypeError, match="requires a CAMAsyncAFDConnector"):
+        AFDConnectorFactory.create_connector(
+            0,
+            0,
+            _vllm_config(),
+            AFDConfig(connector="CAMP2pAFDConnector", role="attention"),
+            rendezvous_context=context,
+        )
+
+
+def test_async_connector_binds_context_only_after_anchor_init(monkeypatch):
+    context = ProcessGroupRendezvousContext()
+    store = object()
+    backend = SimpleNamespace(get_hccl_comm_name=lambda rank: "cam-test")
+    process_group = SimpleNamespace(_get_backend=lambda device: backend)
+    fake_torch = _FakeTorch()
+    monkeypatch.setattr(async_cam_module, "torch", fake_torch)
+    monkeypatch.setattr(
+        async_cam_module, "ensure_cam_async_ops_available", lambda: None
+    )
+
+    def fake_init_afd_process_group(**kwargs):
+        kwargs["on_rendezvous"](store)
+        with pytest.raises(RuntimeError, match="not bound"):
+            context.borrow()
+        return process_group
+
+    monkeypatch.setattr(
+        async_cam_module, "init_afd_process_group", fake_init_afd_process_group
+    )
+    monkeypatch.setattr(
+        async_cam_module, "create_hccl_process_group_options", lambda _: None
+    )
+    monkeypatch.setattr(
+        async_cam_module.dist,
+        "destroy_process_group",
+        lambda group: None,
+    )
+    connector = CAMAsyncAFDConnector(
+        0,
+        0,
+        _vllm_config(),
+        _afd_config(role="attention"),
+        0,
+        rendezvous_context=context,
+    )
+
+    connector.init_afd_connector()
+    assert context.borrow() == (store, process_group)
+    connector.close()
+    with pytest.raises(RuntimeError, match="not bound"):
+        context.borrow()

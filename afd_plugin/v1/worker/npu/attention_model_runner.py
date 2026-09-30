@@ -85,7 +85,11 @@ from afd_plugin.connectors import (
     AFDDPMetadata,
     AFDForwardContextMetadata,
 )
-from afd_plugin.connectors.npu.async_cam import AFDAsyncExtraInfo
+from afd_plugin.connectors.npu.async_cam import (
+    AFDAsyncExtraInfo,
+    CAMAsyncAFDConnector,
+)
+from afd_plugin.distributed.afd_process_group import ProcessGroupRendezvousContext
 from afd_plugin.model_executor.models.npu.async_cam_layout import (
     ASYNC_MOE_UBATCH_METADATA_KEY,
     AsyncMoeUbatchMetadata,
@@ -104,6 +108,10 @@ from afd_plugin.v1.worker.attention_metadata import (
     _full_cudagraph_padded_tokens,
     _resolve_world_ranks,
     build_ubatch_dp_metadata_list,
+)
+from afd_plugin.v1.worker.npu.async_cam_startup import (
+    AsyncCamStartupCoordinator,
+    AsyncCamStartupSpec,
 )
 from afd_plugin.v1.worker.npu.npu_ubatch_wrapper import AscendUBatchWrapper
 from afd_plugin.v1.worker.npu.ubatch_utils import (
@@ -139,12 +147,38 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         )
         rank, _ = _resolve_world_ranks()
         local_rank = int(device.index)
-        self.connector = AFDConnectorFactory.create_connector(
-            rank,
-            local_rank,
-            vllm_config,
-            self.afd_config,
+        rendezvous_context = (
+            ProcessGroupRendezvousContext()
+            if afd_config.connector == AFD_ASYNC_CONNECTOR
+            else None
         )
+        if rendezvous_context is None:
+            self.connector = AFDConnectorFactory.create_connector(
+                rank, local_rank, vllm_config, self.afd_config
+            )
+        else:
+            self.connector = AFDConnectorFactory.create_connector(
+                rank,
+                local_rank,
+                vllm_config,
+                self.afd_config,
+                rendezvous_context=rendezvous_context,
+            )
+        self._async_cam_startup: AsyncCamStartupCoordinator | None = None
+        if rendezvous_context is not None:
+            assert isinstance(self.connector, CAMAsyncAFDConnector)
+            self._async_cam_startup = AsyncCamStartupCoordinator(
+                self.connector,
+                rendezvous_context,
+                AsyncCamStartupSpec(
+                    topology=self.connector.topology,
+                    local_rank=local_rank,
+                    tp_size=self.connector.tp_size,
+                    hidden_size=vllm_config.model_config.hf_config.hidden_size,
+                    topk=vllm_config.model_config.hf_config.num_experts_per_tok,
+                    activation_dtype=vllm_config.model_config.dtype,
+                ),
+            )
         self.afd_async_extra_info = AFDAsyncExtraInfo()
         if afd_config.connector == AFD_ASYNC_CONNECTOR:
             connector_extra_info = self.connector.extra_info
@@ -1557,7 +1591,10 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
     # Attention and FFN model loading overlap across roles. Connector
     # initialization is skipped when it already succeeded (the FFN side uses
     # the same guard), and the rendezvous completes before memory profiling or
-    # the first model forward. The connector itself is idempotent.
+    # the first model forward. Async CAM then waits for every FFN service to
+    # complete a controlled CAM communication warmup, finish capture, and start
+    # its receive loop before Attention can profile.
+    # The connector itself is idempotent.
     # Signature: matches upstream; no added parameters.
     def load_model(self) -> None:
         super().load_model()
@@ -1567,8 +1604,13 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         # rendezvous is the blocking cross-role collective, so it is
         # deliberately last: it doubles as the "both roles finished loading
         # weights" barrier before memory profiling.
-        if not self.connector.is_initialized:
+        # ### PATCH START: CAM startup coordination
+        startup = self._async_cam_startup
+        if startup is not None:
+            startup.start_attention()
+        elif not self.connector.is_initialized:
             self.connector.init_afd_connector()
+        # ### PATCH END: CAM startup coordination
 
     def _install_ascend_ubatch_wrapper(self) -> None:
         if isinstance(self.model, AscendUBatchWrapper):
@@ -1930,6 +1972,14 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
 
     def shutdown(self) -> None:
         stop_afd_npu_profiler(self.prof)
+        startup = self._async_cam_startup
+        if startup is not None and self.connector.is_initialized:
+            if not startup.started or startup.failed:
+                raise RuntimeError(
+                    "CAM Attention startup did not complete safely; "
+                    "retain communicator resources"
+                )
+            torch.npu.synchronize()
         self.connector.close()
         super().shutdown()
 
