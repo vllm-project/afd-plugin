@@ -317,6 +317,11 @@ class AsyncCamStartupCoordinator:
                 self._run_attention_warmup(layer_idx)
             self._wait_for_ffn_ready()
             self._started = True
+            logger.info(
+                "CAM Attention startup all FFN ready rank=%d mode=%s",
+                self._spec.topology.world_rank,
+                "eager" if layer_idx is None else f"graph:{layer_idx}",
+            )
         except Exception as exc:
             self.report_failure(exc)
             raise
@@ -367,6 +372,9 @@ class AsyncCamStartupCoordinator:
             if status != "ready":
                 raise RuntimeError(f"CAM FFN startup {key} {status}")
             self._started = True
+            logger.info(
+                "CAM FFN startup ready rank=%d mode=%s", topology.world_rank, mode
+            )
         except Exception as exc:
             self.report_failure(exc)
             raise
