@@ -38,9 +38,15 @@ def cam_runtime() -> ModuleType:
     return torch
 
 
-def _dispatch_recv(torch: ModuleType, *, dynamic_quant: int = 0, moe_rank_id: int = 2):
+def _dispatch_recv(
+    torch: ModuleType,
+    *,
+    dynamic_quant: int = 0,
+    moe_rank_id: int = 2,
+    anchor_size: int = 1,
+):
     return torch.ops.afd_ascend.afd_async_dispatch_recv(
-        torch.empty(1, device="meta", dtype=torch.bfloat16),
+        torch.empty(anchor_size, device="meta", dtype=torch.bfloat16),
         torch.empty(1, device="meta", dtype=torch.float16),
         comm_id=0,
         max_seq_len=64,
@@ -55,6 +61,25 @@ def _dispatch_recv(torch: ModuleType, *, dynamic_quant: int = 0, moe_rank_id: in
         dynamic_quant=dynamic_quant,
         group_name="meta_only",
     )
+
+
+@pytest.mark.parametrize(
+    ("anchor_size", "dynamic_quant", "accepted"),
+    [(1, 0, True), (1, 1, True), (16, 1, True), (16, 0, False)],
+)
+def test_dispatch_recv_graph_stop_buffer_meta_contract(
+    cam_runtime, anchor_size, dynamic_quant, accepted
+):
+    if accepted:
+        outputs = _dispatch_recv(
+            cam_runtime, anchor_size=anchor_size, dynamic_quant=dynamic_quant
+        )
+        assert len(outputs) == 4
+    else:
+        with pytest.raises(RuntimeError, match="requires dynamic_quant=1"):
+            _dispatch_recv(
+                cam_runtime, anchor_size=anchor_size, dynamic_quant=dynamic_quant
+            )
 
 
 @pytest.mark.parametrize(

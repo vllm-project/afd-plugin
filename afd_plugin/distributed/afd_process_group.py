@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
 
@@ -12,6 +13,7 @@ from torch.distributed import Backend
 from torch.distributed.distributed_c10d import (
     PrefixStore,
     ProcessGroup,
+    Store,
     _new_process_group_helper,
     _update_default_pg,
     _world,
@@ -67,6 +69,7 @@ def init_afd_process_group(
     group_name: str,
     timeout: timedelta,
     pg_options: Any | None = None,
+    on_rendezvous: Callable[[Store], None] | None = None,
 ) -> ProcessGroup:
     """Create a plugin-owned process group without patching vLLM source.
 
@@ -83,6 +86,8 @@ def init_afd_process_group(
     )
     store, rank, world_size = next(rendezvous_iterator)
     store.set_timeout(timeout)
+    if on_rendezvous is not None:
+        on_rendezvous(store)
     prefixed_store = PrefixStore(group_name, store)
     backend_value = Backend(backend) if backend else Backend("undefined")
     pg_options_param_name = (

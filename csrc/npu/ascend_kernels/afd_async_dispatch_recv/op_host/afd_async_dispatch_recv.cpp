@@ -57,6 +57,7 @@ constexpr static int LIMIT_EXPERT_RANK_SIZE_MIN = 1;
 constexpr static int BATCH_INFO_VAL_NUM = 5;
 constexpr static int UB_ALIGN = 32;
 constexpr static int MAX_AIV_NUM = 48;
+constexpr static int GRAPH_STOP_BUFFER_ELEMENTS = 16;
 
 constexpr static float EP_BALANCE_FACTOR = 1.2;
 
@@ -134,14 +135,20 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 
     OPS_ERR_IF(dynamicQuant != 0 && dynamicQuant != 1,
         OPS_LOG_E(nodeName, "dynamicQuant is invalid, only support 0 or 1, but got dynamicQuant=%ld.",
-            dynamicQuant), return ge::GRAPH_FAILED);
+        dynamicQuant), return ge::GRAPH_FAILED);
+
+    OPS_ERR_IF(xShape != nullptr && xShape->GetStorageShape().GetDimNum() == ONE_DIM &&
+        xShape->GetStorageShape().GetDim(0) == GRAPH_STOP_BUFFER_ELEMENTS && dynamicQuant != 1,
+        OPS_LOG_E(nodeName, "graph stop buffer requires dynamicQuant=1"), return ge::GRAPH_FAILED);
 
     OPS_ERR_IF(xShape == nullptr, OPS_LOG_E(nodeName, "xShape is null."), return ge::GRAPH_FAILED);
     OPS_ERR_IF(xShape->GetStorageShape().GetDimNum() != ONE_DIM,
         OPS_LOG_E(nodeName, "xShape dim is invalid, must be %d, but got dimNum=%u.",
             ONE_DIM, xShape->GetStorageShape().GetDimNum()), return ge::GRAPH_FAILED);
-    OPS_ERR_IF(xShape->GetStorageShape().GetDim(0) != 1,
-        OPS_LOG_E(nodeName, "xShape dim0 is invalid, must be 1, but got dim0=%u.",
+    OPS_ERR_IF(xShape->GetStorageShape().GetDim(0) != 1 &&
+        xShape->GetStorageShape().GetDim(0) != GRAPH_STOP_BUFFER_ELEMENTS,
+        OPS_LOG_E(nodeName, "xShape dim0 is invalid, must be 1 or %d, but got dim0=%u.",
+            GRAPH_STOP_BUFFER_ELEMENTS,
             xShape->GetStorageShape().GetDim(0)), return ge::GRAPH_FAILED);
 
     int64_t limitMaxSeqLenPerRank = maxSeqLen / tpSize;
@@ -188,6 +195,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     tilingData->moeDistributeDispatchInfo.tpSize = tpSize;
     tilingData->moeDistributeDispatchInfo.maxTokenNum = maxTokenNum;
     tilingData->moeDistributeDispatchInfo.dynamicQuant = dynamicQuant;
+    tilingData->moeDistributeDispatchInfo.shutdownEnabled =
+        xShape->GetStorageShape().GetDim(0) == GRAPH_STOP_BUFFER_ELEMENTS;
 
     uint32_t blockDim = 1U;
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());

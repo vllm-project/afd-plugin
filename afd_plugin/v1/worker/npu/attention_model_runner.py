@@ -85,7 +85,10 @@ from afd_plugin.connectors import (
     AFDDPMetadata,
     AFDForwardContextMetadata,
 )
-from afd_plugin.connectors.npu.async_cam import AFDAsyncExtraInfo
+from afd_plugin.connectors.npu.async_cam import (
+    AFDAsyncExtraInfo,
+    CAMAsyncAFDConnector,
+)
 from afd_plugin.model_executor.models.npu.async_cam_layout import (
     ASYNC_MOE_UBATCH_METADATA_KEY,
     AsyncMoeUbatchMetadata,
@@ -1557,7 +1560,10 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
     # Attention and FFN model loading overlap across roles. Connector
     # initialization is skipped when it already succeeded (the FFN side uses
     # the same guard), and the rendezvous completes before memory profiling or
-    # the first model forward. The connector itself is idempotent.
+    # the first model forward. Async CAM then waits for every FFN service to
+    # complete a controlled CAM communication warmup, finish capture, and start
+    # its receive loop before Attention can profile.
+    # The connector itself is idempotent.
     # Signature: matches upstream; no added parameters.
     def load_model(self) -> None:
         super().load_model()
@@ -1569,6 +1575,18 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         # weights" barrier before memory profiling.
         if not self.connector.is_initialized:
             self.connector.init_afd_connector()
+        # ### PATCH START: CAM startup coordination
+        if isinstance(self.connector, CAMAsyncAFDConnector):
+            try:
+                layer_idx = self.connector.wait_for_ffn_modes()
+                if layer_idx is not None:
+                    self.connector.run_attention_startup_warmup(layer_idx)
+                self.connector.wait_for_ffn_ready()
+            except Exception as exc:
+                if self.connector._startup_store is not None:
+                    self.connector.publish_attention_startup_failure(str(exc))
+                raise
+        # ### PATCH END: CAM startup coordination
 
     def _install_ascend_ubatch_wrapper(self) -> None:
         if isinstance(self.model, AscendUBatchWrapper):

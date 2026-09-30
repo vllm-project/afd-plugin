@@ -40,7 +40,10 @@ from afd_plugin.connectors.npu.async_cam import (
     CAMAsyncAFDConnector,
 )
 from afd_plugin.envs import async_cam_layered_gmm_enabled
-from afd_plugin.model_executor.npu.async_cam_w4a8 import AsyncCAMW4A8Executor
+from afd_plugin.model_executor.npu.async_cam_w4a8 import (
+    CAM_LAYER_INDEX,
+    AsyncCAMW4A8Executor,
+)
 from afd_plugin.v1.worker.attention_metadata import (
     _resolve_world_ranks,
 )
@@ -60,6 +63,7 @@ if TYPE_CHECKING:
     from afd_plugin.connectors import AFDConnectorBase
 
 logger = init_logger(__name__)
+FFN_GRAPH_REPLAY_LOG_INTERVAL = 1000
 
 
 class AFDNPUFFNModelRunner(NPUModelRunner):
@@ -102,13 +106,22 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self._is_shutdown = False
         self._layered_gmm_requested = async_cam_layered_gmm_enabled()
         self._layered_executor: AsyncCAMW4A8Executor | None = None
+        self._async_cam_ffn_graph_enabled = (
+            isinstance(self.connector, CAMAsyncAFDConnector)
+            and not self.model_config.enforce_eager
+            and self.compilation_config.cudagraph_mode.name == "FULL"
+        )
+        self._async_cam_ffn_graph: torch.npu.NPUGraph | None = None
+        self._async_cam_ffn_output: torch.Tensor | None = None
+        self._async_cam_ffn_replays = 0
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
         return parse_afd_config(vllm_config, expected_role="ffn")
 
     def initialize_afd_connector(self) -> None:
-        self._initialize_layered_executor()
+        if self._layered_executor is None:
+            self._initialize_layered_executor()
         self.connector.init_afd_connector()
 
     def _initialize_layered_executor(self) -> None:
@@ -125,9 +138,11 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                         raise ValueError("layered W4A8 GMM requires Ascend 910C/A3")
                     if self.connector.dynamic_quant != 1:
                         raise ValueError("layered W4A8 GMM requires dynamicQuant=1")
-                    if self.use_aclgraph or self.vllm_config.use_v2_model_runner:
+                    if self.vllm_config.use_v2_model_runner:
+                        raise ValueError("layered W4A8 GMM requires ModelRunnerV1")
+                    if self.use_aclgraph and not self._async_cam_ffn_graph_enabled:
                         raise ValueError(
-                            "layered W4A8 GMM requires eager ModelRunnerV1"
+                            "layered W4A8 GMM graph requires FFN FULL mode"
                         )
                     if tuple(sorted(layer.layer_idx for layer in layers)) != tuple(
                         _ffn_layer_indices(self)
@@ -149,6 +164,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                         layers[0].swiglu_limit != 0.0,
                     )
                     return
+        if self._async_cam_ffn_graph_enabled:
+            raise ValueError(f"CAM async FFN FULL requires layered W4A8 GMM: {reason}")
         logger.info(
             "AFD_ASYNC_CAM_LAYERED_GMM requested=%s actual=legacy reason=%s",
             self._layered_gmm_requested,
@@ -203,8 +220,177 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 "AFD connector",
             )
         step_afd_npu_profiler(self.prof)
+        if self._async_cam_ffn_graph_enabled:
+            graph = self._async_cam_ffn_graph
+            if graph is None:
+                raise RuntimeError(
+                    "CAM async FFN graph was not captured before dispatch"
+                )
+            layer_indices = _ffn_layer_indices(self)
+            previous_replays = self._async_cam_ffn_replays
+            for _ in layer_indices:
+                graph.replay()
+                self._async_cam_ffn_replays += 1
+            if previous_replays == 0:
+                logger.info(
+                    "CAM async FFN graph replay rank=%d count=%d",
+                    self.connector.world_rank,
+                    self._async_cam_ffn_replays,
+                )
+            elif (
+                self._async_cam_ffn_replays // FFN_GRAPH_REPLAY_LOG_INTERVAL
+                > previous_replays // FFN_GRAPH_REPLAY_LOG_INTERVAL
+            ):
+                logger.debug(
+                    "CAM async FFN graph replay rank=%d count=%d",
+                    self.connector.world_rank,
+                    self._async_cam_ffn_replays,
+                )
+            return None
         self._ffn_forward_connector_driven()
         return None
+
+    def warmup_async_cam_ffn_graph(self) -> None:
+        """Prepare layered GMM locally before collective CAM initialization."""
+        if (
+            not self._async_cam_ffn_graph_enabled
+            or self._async_cam_ffn_graph is not None
+        ):
+            return
+        if self._layered_executor is None:
+            self._initialize_layered_executor()
+        executor = self._layered_executor
+        if executor is None:
+            raise RuntimeError("CAM async FFN FULL requires layered GMM")
+        connector = cast(CAMAsyncAFDConnector, self.connector)
+        # Meta dispatch uses the very same C++ allocator and float32
+        # BATCH_SIZE_FACTOR parser as the real receive, without communication.
+        meta_outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(
+            torch.empty((1,), dtype=connector.activation_dtype, device="meta"),
+            torch.empty((1,), dtype=torch.float16, device="meta"),
+            connector.comm_id,
+            connector.max_num_batched_tokens,
+            connector.hidden_size,
+            connector.topk,
+            connector.ffn_size,
+            connector.attn_size,
+            connector.expert_per_rank,
+            connector.world_rank,
+            connector.topology.world_size,
+            connector.tp_size,
+            connector.dynamic_quant,
+            "warmup",
+        )
+        capacity = meta_outputs[0].shape[0]
+        hidden_states = torch.empty(
+            meta_outputs[0].shape,
+            dtype=meta_outputs[0].dtype,
+            device=self.device,
+        )
+        hidden_states[0].zero_()
+        dynamic_scales = torch.empty(
+            meta_outputs[1].shape,
+            dtype=meta_outputs[1].dtype,
+            device=self.device,
+        )
+        dynamic_scales[0] = 1.0
+        group_list = torch.zeros(
+            meta_outputs[3].shape,
+            dtype=meta_outputs[3].dtype,
+            device=self.device,
+        )
+        group_list[0] = 1
+        batch_info = torch.zeros(
+            meta_outputs[2].shape,
+            dtype=meta_outputs[2].dtype,
+            device=self.device,
+        )
+        batch_info[CAM_LAYER_INDEX] = executor.layer_ids[0]
+        executor(hidden_states, dynamic_scales, group_list, batch_info)
+        torch.npu.synchronize()
+        logger.info(
+            "CAM async FFN local layered warmup complete rank=%d capacity=%d",
+            connector.world_rank,
+            capacity,
+        )
+
+    def warmup_async_cam_ffn_communication(self) -> None:
+        """Consume one controlled CAM work item from each Attention DP group."""
+        if not self._async_cam_ffn_graph_enabled:
+            return
+        connector = cast(CAMAsyncAFDConnector, self.connector)
+        attention_dp_size = connector.attn_size // connector.tp_size
+        for _ in range(attention_dp_size):
+            self._execute_layered_work_item()
+        torch.npu.synchronize()
+        logger.info(
+            "CAM async FFN communication warmup done rank=%d items=%d",
+            connector.world_rank,
+            attention_dp_size,
+        )
+
+    def capture_async_cam_ffn_graph(self) -> None:
+        """Capture one DR, layered GMM, CS transaction for every MoE layer."""
+        if (
+            not self._async_cam_ffn_graph_enabled
+            or self._async_cam_ffn_graph is not None
+        ):
+            return
+        if self._layered_executor is None or not self.connector.is_initialized:
+            raise RuntimeError("CAM async FFN graph requires weights and HCCL group")
+        graph = torch.npu.NPUGraph()
+        logger.info(
+            "CAM async FFN graph capture start rank=%d", self.connector.world_rank
+        )
+        with torch.npu.graph(graph, pool=self.graph_pool):
+            logger.info(
+                "CAM async FFN graph context entered rank=%d",
+                self.connector.world_rank,
+            )
+            output = self._execute_layered_work_item(capture_trace=True)
+        self._async_cam_ffn_output = output
+        self._async_cam_ffn_graph = graph
+        logger.info(
+            "CAM async FFN graph capture complete rank=%d graphs=1",
+            self.connector.world_rank,
+        )
+
+    def release_async_cam_ffn_graph(self) -> None:
+        if self._async_cam_ffn_graph is None:
+            return
+        self._async_cam_ffn_graph = None
+        self._async_cam_ffn_output = None
+        logger.info(
+            "CAM async FFN graph released rank=%d replays=%d",
+            self.connector.world_rank,
+            self._async_cam_ffn_replays,
+        )
+
+    def _execute_layered_work_item(
+        self, *, capture_trace: bool = False
+    ) -> torch.Tensor:
+        connector = cast(CAMAsyncAFDConnector, self.connector)
+        executor = self._layered_executor
+        if executor is None:
+            raise RuntimeError("CAM async FFN layered executor is unavailable")
+        payload = connector.recv_attn_output()
+        if capture_trace:
+            logger.info("CAM async FFN graph DR captured rank=%d", connector.world_rank)
+        states = cast(AFDAsyncTransferState, payload.context.states)
+        output = executor(
+            payload.hidden_states,
+            states.dynamic_scales,
+            states.group_list,
+            states.token_nums_rankid_layeridx,
+        )
+        if capture_trace:
+            logger.info(
+                "CAM async FFN graph GMM captured rank=%d", connector.world_rank
+            )
+        connector.send_ffn_output(output, payload.context)
+        if capture_trace:
+            logger.info("CAM async FFN graph CS captured rank=%d", connector.world_rank)
+        return output
 
     def execute_model(
         self,
@@ -372,15 +558,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         connector = cast(CAMAsyncAFDConnector, self.connector)
         if self._layered_executor is not None:
             for _ in _ffn_layer_indices(self):
-                payload = connector.recv_attn_output()
-                states = cast(AFDAsyncTransferState, payload.context.states)
-                rank_ffn_output = self._layered_executor(
-                    payload.hidden_states,
-                    states.dynamic_scales,
-                    states.group_list,
-                    states.token_nums_rankid_layeridx,
-                )
-                connector.send_ffn_output(rank_ffn_output, payload.context)
+                rank_ffn_output = self._execute_layered_work_item()
             return rank_ffn_output
 
         for _ in _ffn_layer_indices(self):
@@ -533,6 +711,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         stop_afd_npu_profiler(self.prof)
         if self.connector.is_initialized:
             self.connector.close()
+        self.release_async_cam_ffn_graph()
         super().shutdown()
         self._is_shutdown = True
 

@@ -155,7 +155,14 @@ std::vector<at::Tensor> dispatch_recv(
   check_tp(max_seq_len, tp_size, attn_rank_num);
   TORCH_CHECK(moe_rank_id >= attn_rank_num && moe_rank_id < world_size,
               "moe_rank_id must be the global rank of a MoE participant");
-  TORCH_CHECK(x.dim() == 1 && x.size(0) == 1, "x must be a one-element anchor");
+  // x[16] is an opt-in graph stop ABI. Old one-element eager anchors retain
+  // their existing behavior; an old binary rejects the new shape visibly.
+  constexpr int64_t kGraphStopBufferElements = 16;
+  TORCH_CHECK(x.dim() == 1 &&
+                  (x.size(0) == 1 || x.size(0) == kGraphStopBufferElements),
+              "x must be a one-element anchor or a 16-element FFN graph stop buffer");
+  TORCH_CHECK(x.size(0) == 1 || dynamic_quant == 1,
+              "FFN graph stop buffer requires dynamic_quant=1");
   TORCH_CHECK(comm_args.scalar_type() == at::kHalf,
               "comm_args must have dtype float16");
   TORCH_CHECK(dynamic_quant == 0 || dynamic_quant == 1,

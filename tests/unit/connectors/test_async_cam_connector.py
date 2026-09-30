@@ -353,6 +353,7 @@ def test_async_connector_init_creates_attention_first_hccl_group(monkeypatch):
             "timeout": calls[0]["timeout"],
             "init_method": "tcp://127.0.0.1:1239",
             "pg_options": pg_options,
+            "on_rendezvous": connector._retain_rendezvous_store,
         },
     ]
     assert connector.cam_pg is not None
@@ -851,3 +852,148 @@ def test_close_releases_every_stage_routing(monkeypatch):
     assert set(connector._pending_attention_payloads) == {0, 1}
     connector.close()
     assert connector._pending_attention_payloads == {}
+
+
+def test_ffn_startup_failure_reaches_attention_waiter():
+    class FakeStore:
+        def __init__(self):
+            self.values = {}
+
+        def set(self, key, value):
+            self.values[key] = value.encode()
+
+        def check(self, keys):
+            return all(key in self.values for key in keys)
+
+        def get(self, key):
+            return self.values[key]
+
+    store = FakeStore()
+    ffn = object.__new__(CAMAsyncAFDConnector)
+    ffn._startup_store = store
+    ffn.topology = SimpleNamespace(role="ffn", world_size=3)
+    ffn.world_rank = 2
+    ffn.publish_ffn_startup(error="graph capture failed")
+
+    attention = object.__new__(CAMAsyncAFDConnector)
+    attention._startup_store = store
+    attention.attn_size = 2
+    attention.topology = SimpleNamespace(world_size=3)
+    with pytest.raises(RuntimeError, match="graph capture failed"):
+        attention.wait_for_ffn_ready()
+
+
+def test_attention_wait_rechecks_previously_ready_ffn(monkeypatch):
+    class ChangingStore:
+        def __init__(self):
+            self.values = {"ffn/8": b"ready"}
+
+        def check(self, keys):
+            return all(key in self.values for key in keys)
+
+        def get(self, key):
+            return self.values[key]
+
+    attention = object.__new__(CAMAsyncAFDConnector)
+    store = ChangingStore()
+    attention._startup_store = store
+    attention.attn_size = 8
+    attention.topology = SimpleNamespace(world_size=10)
+
+    def fail_first_rank(_: float) -> None:
+        store.values["ffn/8"] = b"failed:loop stopped"
+        store.values["ffn/9"] = b"ready"
+
+    monkeypatch.setattr(async_cam_module.time, "sleep", fail_first_rank)
+
+    with pytest.raises(RuntimeError, match="loop stopped"):
+        attention.wait_for_ffn_ready()
+
+
+def test_ffn_ready_cannot_overwrite_failed_status():
+    class FakeStore:
+        def __init__(self):
+            self.values = {"ffn/8": b"failed:startup crashed"}
+
+        def compare_set(self, key, expected, desired):
+            current = self.values.get(key, b"")
+            if current == expected.encode():
+                current = desired.encode()
+                self.values[key] = current
+            return current
+
+    ffn = object.__new__(CAMAsyncAFDConnector)
+    ffn._startup_store = FakeStore()
+    ffn.topology = SimpleNamespace(role="ffn")
+    ffn.world_rank = 8
+    with pytest.raises(RuntimeError, match="startup crashed"):
+        ffn.publish_ffn_startup()
+
+
+def test_graph_warmup_wait_propagates_attention_failure():
+    class FakeStore:
+        def __init__(self):
+            self.values = {"attn/failure/0": b"failed before dispatch"}
+
+        def check(self, keys):
+            return all(key in self.values for key in keys)
+
+        def get(self, key):
+            return self.values[key]
+
+    ffn = object.__new__(CAMAsyncAFDConnector)
+    ffn._startup_store = FakeStore()
+    ffn.attn_size = 2
+    with pytest.raises(RuntimeError, match="failed before dispatch"):
+        ffn.wait_for_attention_warmup_prepared()
+
+
+def test_graph_capture_waits_for_all_attention_and_ffn_warmup_done(monkeypatch):
+    class FakeStore:
+        def __init__(self):
+            self.values = {
+                "attn/done/0": b"ready",
+                "ffn/warmup/done/1": b"ready",
+            }
+
+        def check(self, keys):
+            return all(key in self.values for key in keys)
+
+        def get(self, key):
+            return self.values[key]
+
+    store = FakeStore()
+    ffn = object.__new__(CAMAsyncAFDConnector)
+    ffn._startup_store = store
+    ffn.attn_size = 1
+    ffn.topology = SimpleNamespace(world_size=3)
+    polls = []
+
+    def finish_second_ffn(_: float) -> None:
+        polls.append(True)
+        store.values["ffn/warmup/done/2"] = b"ready"
+
+    monkeypatch.setattr(async_cam_module.time, "sleep", finish_second_ffn)
+    ffn.wait_for_communication_warmup_done()
+    assert polls == [True]
+
+
+def test_close_can_retain_graph_anchors_until_worker_stops():
+    connector = object.__new__(CAMAsyncAFDConnector)
+    connector.cam_pg = None
+    connector._initialized = True
+    connector.comm_args = object()
+    connector._placeholder = object()
+    connector._startup_store = object()
+    connector._rendezvous_store = object()
+    connector._pending_attention_payloads = {}
+    comm_args = connector.comm_args
+    placeholder = connector._placeholder
+
+    connector.close(release_buffers=False)
+
+    assert connector.comm_args is comm_args
+    assert connector._placeholder is placeholder
+    connector.release_closed_buffers()
+    assert connector.comm_args is None
+    assert connector._placeholder is None

@@ -30,6 +30,10 @@ constexpr uint32_t LAYER_INDEX_INDEX = 2;
 constexpr uint32_t START_EXPERT_INDEX = 3;
 constexpr uint32_t END_EXPERT_INDEX = 4;
 constexpr uint32_t MOE_PRE_TOKEN_NUM_INDEX = 3;
+constexpr uint32_t STOP_BUFFER_ELEMENTS = 4;  // four int64 values in the 32-byte x input
+constexpr uint32_t STOP_ATTENTION_RANK = 0xFFFFFFFFU;
+constexpr int64_t PENDING_ATTENTION_RANK = -2;
+constexpr int64_t STOP_ATTENTION_RANK_SIGNED = -1;
 
 template<AscendC::HardEvent event>
 __aicore__ inline void SyncFunc() {
@@ -77,6 +81,9 @@ private:
                                                uint32_t startExpert, uint32_t endExpert);
 
     __aicore__ inline uint32_t WaitFromAttn();
+    __aicore__ inline uint32_t WaitFromAttnWithStop();
+    __aicore__ inline void PublishStopDecision(int64_t rankId);
+    __aicore__ inline void EmitStopWorkItem();
 
     __aicore__ inline void ClearFlags(uint32_t attnRankId);
 
@@ -124,6 +131,9 @@ private:
     uint32_t hiddenSizeQuant_{0};
 
     bool isError_{false};
+    bool shutdownEnabled_{false};
+    uint32_t stopLayerId_{0};
+    GlobalTensor<int64_t> stopBufferGMTensor_;
 };
 
 template <TemplateMC2TypeClass>
@@ -147,6 +157,10 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::Init(
     totalWorkspaceSize_ = tilingData->moeDistributeDispatchInfo.totalWorkspaceSize;  // total shared mem
     tpSize_ = tilingData->moeDistributeDispatchInfo.tpSize;
     maxTokenNum_ = tilingData->moeDistributeDispatchInfo.maxTokenNum;
+    shutdownEnabled_ = tilingData->moeDistributeDispatchInfo.shutdownEnabled != 0;
+    if (shutdownEnabled_) {
+        stopBufferGMTensor_.SetGlobalBuffer((__gm__ int64_t *)x);
+    }
 
     uint32_t maxSeqLenPerRank = maxSeqLen_ / tpSize_;
     uint64_t batchInfoWorkspaceSize = MathCeil(sizeof(int64_t) * BATCH_INFO_VAL_NUM, UB_ALIGN);
@@ -242,7 +256,11 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::Process()
 template <TemplateMC2TypeClass>
 __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecv()
 {
-    uint32_t tpAttnRankId = WaitFromAttn();
+    uint32_t tpAttnRankId = shutdownEnabled_ ? WaitFromAttnWithStop() : WaitFromAttn();
+    if (tpAttnRankId == STOP_ATTENTION_RANK) {
+        EmitStopWorkItem();
+        return;
+    }
 
     tpBatchInfoTensor_(ATTN_RANK_ID_INDEX) = tpAttnRankId;  // attnRankId
     tpBatchInfoTensor_(LAYER_INDEX_INDEX) = batchInfoTensor_(LAYER_INDEX_INDEX);  // layerIndex
@@ -494,6 +512,151 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecvRo
     for (uint32_t i = startExpert; i <= endExpert; ++i) {
         tpExpertRecvTokenNumTensor_(expertNumPerMoe_ + i) += expertRecvTokenNumTensor_(i);
     }
+}
+
+template <TemplateMC2TypeClass>
+__aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::PublishStopDecision(int64_t rankId)
+{
+    for (uint32_t i = 0; i < UB_ALIGN / sizeof(int64_t); ++i) {
+        tpBatchInfoTensor_(i) = 0;
+    }
+    tpBatchInfoTensor_(ATTN_RANK_ID_INDEX) = rankId;
+    SyncFunc<HardEvent::S_MTE3>();
+    DataCopy(batchInfoGMTensor_, tpBatchInfoTensor_, UB_ALIGN / sizeof(int64_t));
+    SyncFunc<HardEvent::MTE3_S>();
+}
+
+template <TemplateMC2TypeClass>
+__aicore__ inline uint32_t AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::WaitFromAttnWithStop()
+{
+    // Only AIV0 chooses between a normal DP group and a stop work item. The
+    // output's rank field is a per-launch decision slot; no other op can read
+    // it until this dispatch-recv kernel completes.
+    if (aivId_ == 0) {
+        PublishStopDecision(PENDING_ATTENTION_RANK);
+    }
+    SyncAll<true>();
+
+    int64_t selectedRank = PENDING_ATTENTION_RANK;
+    GM_ADDR dstGM = GetPeerAddrByRankId(moeRankId_);
+    GlobalTensor<int64_t> peerBatchInfoGMTensor;
+    if (aivId_ == 0) {
+        GlobalTensor<int64_t> lastDpGMTensor;
+        lastDpGMTensor.SetGlobalBuffer((__gm__ int64_t *)(dstGM + (totalWorkspaceSize_ - UB_ALIGN)));
+        DataCopy(batchInfoTensor_, lastDpGMTensor, UB_ALIGN / sizeof(int64_t));
+        SyncFunc<HardEvent::MTE2_S>();
+        uint32_t nextAttnRankId = batchInfoTensor_(0);
+        SyncFunc<HardEvent::S_MTE2>();
+
+        while (selectedRank == PENDING_ATTENTION_RANK) {
+            // x is a 32-byte, graph-owned control input in this opt-in path.
+            // A separate H2D stream writes its first int64 on shutdown.
+            DataCopy(batchInfoTensor_, stopBufferGMTensor_, STOP_BUFFER_ELEMENTS);
+            SyncFunc<HardEvent::MTE2_S>();
+            if (batchInfoTensor_(0) != 0) {
+                stopLayerId_ = static_cast<uint32_t>(batchInfoTensor_(1));
+                selectedRank = STOP_ATTENTION_RANK_SIGNED;
+            }
+            SyncFunc<HardEvent::S_MTE2>();
+            if (selectedRank == STOP_ATTENTION_RANK_SIGNED) {
+                PublishStopDecision(selectedRank);
+                return STOP_ATTENTION_RANK;
+            }
+
+            for (uint32_t i = 0; i < (attnRankNum_ / tpSize_); ++i) {
+                bool allReceived = true;
+                for (uint32_t j = tpSize_; j > 0; --j) {
+                    uint32_t srcRankId = (nextAttnRankId + (tpSize_ * i + j - 1)) % attnRankNum_;
+                    peerBatchInfoGMTensor.SetGlobalBuffer((__gm__ int64_t *)(dstGM +
+                        workspaceSizePerAttn_ * srcRankId));
+                    DataCopyPad(batchInfoTensor_, peerBatchInfoGMTensor,
+                        {1U, (uint32_t)(sizeof(int64_t) * BATCH_INFO_VAL_NUM), 0U, 0U, 0U},
+                        {false, 0U, 0U, 0U});
+                    SyncFunc<HardEvent::MTE2_S>();
+                    SyncFunc<HardEvent::S_MTE2>();
+                    if (batchInfoTensor_(TOKEN_NUM_INDEX) == 0) {
+                        allReceived = false;
+                        break;
+                    }
+                }
+                if (allReceived) {
+                    selectedRank = (nextAttnRankId + (tpSize_ * i)) % attnRankNum_;
+                    // Preserve the legacy shared-window marker for normal work.
+                    SyncFunc<HardEvent::S_MTE3>();
+                    DataCopyPad(peerBatchInfoGMTensor[BATCH_INFO_VAL_NUM - 1],
+                        batchInfoTensor_, {1U, sizeof(int64_t), 0U, 0U, 0U});
+                    SyncFunc<HardEvent::MTE3_S>();
+                    PublishStopDecision(selectedRank);
+                    break;
+                }
+            }
+        }
+    } else {
+        while (selectedRank == PENDING_ATTENTION_RANK) {
+            DataCopy(batchInfoTensor_, batchInfoGMTensor_, UB_ALIGN / sizeof(int64_t));
+            SyncFunc<HardEvent::MTE2_S>();
+            selectedRank = batchInfoTensor_(ATTN_RANK_ID_INDEX);
+            SyncFunc<HardEvent::S_MTE2>();
+        }
+        if (selectedRank == STOP_ATTENTION_RANK_SIGNED) {
+            return STOP_ATTENTION_RANK;
+        }
+    }
+
+    // All AIVs need the real layer/token fields from the selected DP group.
+    // The existing DispatchRecv SyncAll keeps AIV0 from clearing them early.
+    peerBatchInfoGMTensor.SetGlobalBuffer((__gm__ int64_t *)(dstGM +
+        workspaceSizePerAttn_ * static_cast<uint32_t>(selectedRank)));
+    DataCopyPad(batchInfoTensor_, peerBatchInfoGMTensor,
+        {1U, (uint32_t)(sizeof(int64_t) * BATCH_INFO_VAL_NUM), 0U, 0U, 0U},
+        {false, 0U, 0U, 0U});
+    SyncFunc<HardEvent::MTE2_S>();
+    SyncFunc<HardEvent::S_MTE2>();
+    return static_cast<uint32_t>(selectedRank);
+}
+
+template <TemplateMC2TypeClass>
+__aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::EmitStopWorkItem()
+{
+    if (aivId_ != 0) {
+        return;
+    }
+    // The layered W4A8 GMM sees one valid zero token on expert 0. Combine-send
+    // recognizes the negative Attention rank and skips all remote writes.
+    // AscendC Duplicate does not support the INT8 output type here.
+    for (uint32_t i = 0; i < hiddenSize_; ++i) {
+        xOutTensor_(i) = static_cast<ExpandXOutType>(0);
+    }
+    SyncFunc<HardEvent::S_MTE3>();
+    DataCopy(xOutGMTensor_, xOutTensor_, hiddenSize_);
+    SyncFunc<HardEvent::MTE3_S>();
+
+    xOutFloatTensor_(0) = 1.0F;
+    SyncFunc<HardEvent::S_MTE3>();
+    DataCopyPad(quantScaleGMTensor_, xOutFloatTensor_, {1U, sizeof(float), 0U, 0U, 0U});
+    SyncFunc<HardEvent::MTE3_S>();
+
+    for (uint32_t i = 0; i < routeExpertNumPerMoe_; ++i) {
+        epRecvCountOutTensor_(i) = i == 0 ? 1 : 0;
+    }
+    SyncFunc<HardEvent::S_MTE3>();
+    DataCopyPad(epRecvCountRoutedGMTensor_, epRecvCountOutTensor_,
+        {1U, (uint32_t)(sizeof(int64_t) * routeExpertNumPerMoe_), 0U, 0U, 0U});
+    SyncFunc<HardEvent::MTE3_S>();
+
+    uint32_t infoCount = INFO_NUM + tpSize_ + routeExpertNumPerMoe_ * tpSize_;
+    for (uint32_t i = 0; i < infoCount; ++i) {
+        tpBatchInfoTensor_(i) = 0;
+    }
+    tpBatchInfoTensor_(TOKEN_NUM_INDEX) = 1;
+    tpBatchInfoTensor_(ATTN_RANK_ID_INDEX) = STOP_ATTENTION_RANK_SIGNED;
+    tpBatchInfoTensor_(LAYER_INDEX_INDEX) = stopLayerId_;
+    tpBatchInfoTensor_(START_EXPERT_INDEX) = 0;
+    tpBatchInfoTensor_(END_EXPERT_INDEX) = 0;
+    SyncFunc<HardEvent::S_MTE3>();
+    DataCopyPad(batchInfoGMTensor_, tpBatchInfoTensor_,
+        {1U, (uint32_t)(sizeof(int64_t) * infoCount), 0U, 0U, 0U});
+    SyncFunc<HardEvent::MTE3_S>();
 }
 
 template <TemplateMC2TypeClass>
