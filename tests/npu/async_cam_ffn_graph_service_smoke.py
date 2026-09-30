@@ -11,9 +11,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-
 
 DEFAULT_TIMEOUT_SECONDS = 120
 CHUNK_SIZE = 8192
@@ -22,7 +22,7 @@ CONCURRENT_REQUESTS = 4
 
 def send_completion(
     endpoint: str, model: str, name: str, prompt: str, timeout: int
-) -> dict:
+) -> dict[str, Any]:
     payload = json.dumps(
         {"model": model, "prompt": prompt, "max_tokens": 1, "temperature": 0}
     ).encode()
@@ -33,18 +33,19 @@ def send_completion(
     )
     started_at = datetime.now(timezone.utc).isoformat()
     start = time.monotonic()
-    result = {"name": name, "started_at": started_at}
+    result: dict[str, Any] = {"name": name, "started_at": started_at}
     try:
         with urlopen(request, timeout=timeout) as response:
             body = json.loads(response.read())
         usage = body.get("usage") or {}
         result.update(
             {
-                "ok": bool(body.get("choices"))
-                and usage.get("completion_tokens") == 1,
+                "ok": bool(body.get("choices")) and usage.get("completion_tokens") == 1,
                 "request_id": body.get("id"),
                 "usage": usage,
-                "completion": [choice.get("text") for choice in body.get("choices", [])],
+                "completion": [
+                    choice.get("text") for choice in body.get("choices", [])
+                ],
             }
         )
     except (HTTPError, URLError, TimeoutError, ValueError) as exc:
@@ -78,7 +79,7 @@ def main() -> int:
     results = []
     with args.output.open("w") as output_file:
 
-        def record(result: dict) -> None:
+        def record(result: dict[str, Any]) -> None:
             results.append(result)
             line = json.dumps(result, ensure_ascii=False, sort_keys=True)
             print(line, flush=True)
@@ -86,7 +87,9 @@ def main() -> int:
             output_file.flush()
 
         for name, prompt in cases:
-            result = send_completion(args.endpoint, args.model, name, prompt, args.timeout)
+            result = send_completion(
+                args.endpoint, args.model, name, prompt, args.timeout
+            )
             record(result)
             if not result["ok"]:
                 return 1
@@ -97,7 +100,7 @@ def main() -> int:
 
         start_concurrent = Event()
 
-        def concurrent_case(index: int) -> dict:
+        def concurrent_case(index: int) -> dict[str, Any]:
             start_concurrent.wait()
             return send_completion(
                 args.endpoint,
@@ -118,7 +121,11 @@ def main() -> int:
 
     over_chunk = next(result for result in results if result["name"] == "over_chunk")
     prompt_tokens = (over_chunk.get("usage") or {}).get("prompt_tokens", 0)
-    return 0 if all(result["ok"] for result in results) and prompt_tokens > CHUNK_SIZE else 1
+    return (
+        0
+        if all(result["ok"] for result in results) and prompt_tokens > CHUNK_SIZE
+        else 1
+    )
 
 
 if __name__ == "__main__":

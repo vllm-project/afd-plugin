@@ -221,6 +221,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             )
         step_afd_npu_profiler(self.prof)
         if self._async_cam_ffn_graph_enabled:
+            connector = cast(CAMAsyncAFDConnector, self.connector)
             graph = self._async_cam_ffn_graph
             if graph is None:
                 raise RuntimeError(
@@ -234,7 +235,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             if previous_replays == 0:
                 logger.info(
                     "CAM async FFN graph replay rank=%d count=%d",
-                    self.connector.world_rank,
+                    connector.world_rank,
                     self._async_cam_ffn_replays,
                 )
             elif (
@@ -243,7 +244,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             ):
                 logger.debug(
                     "CAM async FFN graph replay rank=%d count=%d",
-                    self.connector.world_rank,
+                    connector.world_rank,
                     self._async_cam_ffn_replays,
                 )
             return None
@@ -336,33 +337,33 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             or self._async_cam_ffn_graph is not None
         ):
             return
-        if self._layered_executor is None or not self.connector.is_initialized:
+        connector = cast(CAMAsyncAFDConnector, self.connector)
+        if self._layered_executor is None or not connector.is_initialized:
             raise RuntimeError("CAM async FFN graph requires weights and HCCL group")
         graph = torch.npu.NPUGraph()
-        logger.info(
-            "CAM async FFN graph capture start rank=%d", self.connector.world_rank
-        )
+        logger.info("CAM async FFN graph capture start rank=%d", connector.world_rank)
         with torch.npu.graph(graph, pool=self.graph_pool):
             logger.info(
                 "CAM async FFN graph context entered rank=%d",
-                self.connector.world_rank,
+                connector.world_rank,
             )
             output = self._execute_layered_work_item(capture_trace=True)
         self._async_cam_ffn_output = output
         self._async_cam_ffn_graph = graph
         logger.info(
             "CAM async FFN graph capture complete rank=%d graphs=1",
-            self.connector.world_rank,
+            connector.world_rank,
         )
 
     def release_async_cam_ffn_graph(self) -> None:
         if self._async_cam_ffn_graph is None:
             return
+        connector = cast(CAMAsyncAFDConnector, self.connector)
         self._async_cam_ffn_graph = None
         self._async_cam_ffn_output = None
         logger.info(
             "CAM async FFN graph released rank=%d replays=%d",
-            self.connector.world_rank,
+            connector.world_rank,
             self._async_cam_ffn_replays,
         )
 

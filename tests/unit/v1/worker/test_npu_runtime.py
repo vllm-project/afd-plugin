@@ -2958,7 +2958,7 @@ def test_npu_async_cam_ffn_startup_orders_warmup_capture_and_ready(monkeypatch):
     from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
     from afd_plugin.v1.worker.npu import ffn_worker
 
-    events = []
+    events: list[str | tuple[str, int | None]] = []
     connector = object.__new__(CAMAsyncAFDConnector)
     connector._initialized = False
     connector._startup_store = object()

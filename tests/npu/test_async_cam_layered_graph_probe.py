@@ -62,9 +62,7 @@ def test_layered_w4a8_graph_reuses_device_metadata():
         w13, s13, b13 = make_weight(hidden, 2 * intermediate, factor, True)
         w2, s2, b2 = make_weight(intermediate, hidden, factor, False)
         layers.append(
-            W4A8LayerWeights(
-                layer_idx, w13, w2, s13, s2, b13, b2, True, 0.0, 1.0
-            )
+            W4A8LayerWeights(layer_idx, w13, w2, s13, s2, b13, b2, True, 0.0, 1.0)
         )
     executor = AsyncCAMW4A8Executor(layers)
 
@@ -96,15 +94,21 @@ def test_layered_w4a8_graph_reuses_device_metadata():
         static_hidden.copy_(shared_hidden.npu())
         static_counts.copy_(torch.tensor(counts, dtype=torch.int64).npu())
         static_info.copy_(
-            torch.tensor([capacity * 2, 0, layer_idx, valid_rows], dtype=torch.int64).npu()
+            torch.tensor(
+                [capacity * 2, 0, layer_idx, valid_rows], dtype=torch.int64
+            ).npu()
         )
         graph.replay()
         torch.npu.synchronize()
         assert captured_output.shape == (capacity, hidden)
         graphed = captured_output[:valid_rows].cpu().float()
-        eager = executor(
-            static_hidden, static_scales, static_counts, static_info
-        )[:valid_rows].cpu().float()
+        eager = (
+            executor(static_hidden, static_scales, static_counts, static_info)[
+                :valid_rows
+            ]
+            .cpu()
+            .float()
+        )
         if valid_rows:
             difference = (graphed - eager).abs()
             print(
