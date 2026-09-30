@@ -41,7 +41,6 @@ from afd_plugin.connectors.npu.async_cam import (
 )
 from afd_plugin.envs import async_cam_layered_gmm_enabled
 from afd_plugin.model_executor.npu.async_cam_w4a8 import (
-    CAM_LAYER_INDEX,
     AsyncCAMW4A8Executor,
 )
 from afd_plugin.v1.worker.attention_metadata import (
@@ -251,8 +250,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self._ffn_forward_connector_driven()
         return None
 
-    def warmup_async_cam_ffn_graph(self) -> None:
-        """Prepare layered GMM locally before collective CAM initialization."""
+    def prepare_async_cam_ffn_graph(self) -> None:
+        """Initialize the layered executor before collective CAM warmup."""
         if (
             not self._async_cam_ffn_graph_enabled
             or self._async_cam_ffn_graph is not None
@@ -260,60 +259,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             return
         if self._layered_executor is None:
             self._initialize_layered_executor()
-        executor = self._layered_executor
-        if executor is None:
+        if self._layered_executor is None:
             raise RuntimeError("CAM async FFN FULL requires layered GMM")
-        connector = cast(CAMAsyncAFDConnector, self.connector)
-        # Meta dispatch uses the very same C++ allocator and float32
-        # BATCH_SIZE_FACTOR parser as the real receive, without communication.
-        meta_outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(
-            torch.empty((1,), dtype=connector.activation_dtype, device="meta"),
-            torch.empty((1,), dtype=torch.float16, device="meta"),
-            connector.comm_id,
-            connector.max_num_batched_tokens,
-            connector.hidden_size,
-            connector.topk,
-            connector.ffn_size,
-            connector.attn_size,
-            connector.expert_per_rank,
-            connector.world_rank,
-            connector.topology.world_size,
-            connector.tp_size,
-            connector.dynamic_quant,
-            "warmup",
-        )
-        capacity = meta_outputs[0].shape[0]
-        hidden_states = torch.empty(
-            meta_outputs[0].shape,
-            dtype=meta_outputs[0].dtype,
-            device=self.device,
-        )
-        hidden_states[0].zero_()
-        dynamic_scales = torch.empty(
-            meta_outputs[1].shape,
-            dtype=meta_outputs[1].dtype,
-            device=self.device,
-        )
-        dynamic_scales[0] = 1.0
-        group_list = torch.zeros(
-            meta_outputs[3].shape,
-            dtype=meta_outputs[3].dtype,
-            device=self.device,
-        )
-        group_list[0] = 1
-        batch_info = torch.zeros(
-            meta_outputs[2].shape,
-            dtype=meta_outputs[2].dtype,
-            device=self.device,
-        )
-        batch_info[CAM_LAYER_INDEX] = executor.layer_ids[0]
-        executor(hidden_states, dynamic_scales, group_list, batch_info)
-        torch.npu.synchronize()
-        logger.info(
-            "CAM async FFN local layered warmup complete rank=%d capacity=%d",
-            connector.world_rank,
-            capacity,
-        )
 
     def warmup_async_cam_ffn_communication(self) -> None:
         """Consume one controlled CAM work item from each Attention DP group."""

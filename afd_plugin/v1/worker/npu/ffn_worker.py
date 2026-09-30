@@ -127,11 +127,13 @@ class AFDNPUFFNWorker(NPUWorker):
         try:
             if cam_connector is not None:
                 logger.info(
-                    "CAM FFN local warmup start rank=%d", cam_connector.world_rank
+                    "CAM FFN layered executor prepare start rank=%d",
+                    cam_connector.world_rank,
                 )
-                self.model_runner.warmup_async_cam_ffn_graph()
+                self.model_runner.prepare_async_cam_ffn_graph()
                 logger.info(
-                    "CAM FFN local warmup done rank=%d", cam_connector.world_rank
+                    "CAM FFN layered executor prepare done rank=%d",
+                    cam_connector.world_rank,
                 )
             if not connector.is_initialized:
                 self.model_runner.initialize_afd_connector()

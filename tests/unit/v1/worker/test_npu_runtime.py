@@ -2469,9 +2469,24 @@ def test_npu_async_feature_validation_allows_only_layered_dsv4_ffn_full(
     )
     fail_if_unsupported_npu_afd_features(config)
 
-    config.compilation_config.cudagraph_mode.name = "FULL_DECODE_ONLY"
-    with pytest.raises(RuntimeError, match="requires FFN FULL"):
-        fail_if_unsupported_npu_afd_features(config)
+    for enforce_eager, graph_mode in (
+        (True, "FULL"),
+        (False, "NONE"),
+        (False, "PIECEWISE"),
+        (False, "FULL_AND_PIECEWISE"),
+        (False, "FULL_DECODE_ONLY"),
+    ):
+        config.model_config.enforce_eager = enforce_eager
+        config.compilation_config.cudagraph_mode.name = graph_mode
+        with pytest.raises(RuntimeError, match="requires enforce_eager=false"):
+            fail_if_unsupported_npu_afd_features(config)
+
+    monkeypatch.setattr(
+        feature_validation, "async_cam_layered_gmm_enabled", lambda: False
+    )
+    config.model_config.enforce_eager = True
+    config.compilation_config.cudagraph_mode.name = "NONE"
+    fail_if_unsupported_npu_afd_features(config)
 
 
 @pytest.mark.parametrize(
@@ -2983,7 +2998,7 @@ def test_npu_async_cam_ffn_startup_orders_warmup_capture_and_ready(monkeypatch):
         connector=connector,
         _async_cam_ffn_graph_enabled=True,
         _layered_executor=SimpleNamespace(layer_ids=(0,)),
-        warmup_async_cam_ffn_graph=lambda: events.append("warmup"),
+        prepare_async_cam_ffn_graph=lambda: events.append("prepare"),
         warmup_async_cam_ffn_communication=lambda: events.append("communication"),
         initialize_afd_connector=initialize_connector,
         capture_async_cam_ffn_graph=lambda: events.append("capture"),
@@ -3005,7 +3020,7 @@ def test_npu_async_cam_ffn_startup_orders_warmup_capture_and_ready(monkeypatch):
     worker.start_ffn_server_loop()
 
     assert events == [
-        "warmup",
+        "prepare",
         "connector",
         "coordination",
         ("mode", 0),
