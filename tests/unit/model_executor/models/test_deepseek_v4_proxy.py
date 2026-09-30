@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -8,6 +11,7 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
 from afd_plugin.model_executor.models import deepseek_v4 as adapter  # noqa: E402
+from afd_plugin.model_executor.models import remote_ffn  # noqa: E402
 
 
 class _FakeConnector:
@@ -30,12 +34,12 @@ def test_remote_v4_ffn_sends_token_ids(monkeypatch):
         stage_idx=9,
     )
     monkeypatch.setattr(
-        adapter,
+        remote_ffn,
         "get_afd_metadata_from_forward_context",
-        lambda: afd_metadata,
+        lambda _context: afd_metadata,
     )
     monkeypatch.setattr(
-        adapter,
+        remote_ffn,
         "get_forward_context",
         lambda: SimpleNamespace(ubatch_idx=2, slot_mapping={}),
     )
@@ -44,7 +48,7 @@ def test_remote_v4_ffn_sends_token_ids(monkeypatch):
         events.append(("yield", hidden_states, role))
         return hidden_states
 
-    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", record_yield)
+    monkeypatch.setattr(remote_ffn, "maybe_apply_dbo_yield", record_yield)
     proxy = adapter.RemoteDeepseekV4FFN(layer_idx=3)
     hidden_states = torch.full((2, 4), 8.0, dtype=torch.float16)
     input_ids = torch.tensor([11, 13], dtype=torch.int32)
@@ -72,12 +76,12 @@ def test_remote_v4_ffn_preserves_ids_in_padding_slots(monkeypatch):
     connector = _FakeConnector(events)
     afd_metadata = SimpleNamespace(connector=connector, stage_idx=0)
     monkeypatch.setattr(
-        adapter,
+        remote_ffn,
         "get_afd_metadata_from_forward_context",
-        lambda: afd_metadata,
+        lambda _context: afd_metadata,
     )
     monkeypatch.setattr(
-        adapter,
+        remote_ffn,
         "get_forward_context",
         lambda: SimpleNamespace(
             ubatch_idx=0,
@@ -85,7 +89,7 @@ def test_remote_v4_ffn_preserves_ids_in_padding_slots(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        adapter,
+        remote_ffn,
         "maybe_apply_dbo_yield",
         lambda hidden_states, *, role: hidden_states,
     )
@@ -112,9 +116,9 @@ def test_remote_v4_ffn_validates_token_ids_before_metadata_lookup(
     input_ids,
 ):
     monkeypatch.setattr(
-        adapter,
-        "get_afd_metadata_from_forward_context",
-        lambda: pytest.fail("metadata lookup must follow token-id validation"),
+        remote_ffn,
+        "get_forward_context",
+        lambda: pytest.fail("context lookup must follow token-id validation"),
     )
     proxy = adapter.RemoteDeepseekV4FFN(layer_idx=0)
 

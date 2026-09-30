@@ -253,7 +253,7 @@ def _use_afd_execution_context(
         with (
             replay_scope,
             use_afd_metadata_provider(
-                runner.install_afd_metadata_on_forward_context,
+                runner.prepare_afd_forward_context,
             ),
         ):
             yield
@@ -405,7 +405,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
         try:
             with _use_afd_capture_input_preparation(self, event_tracker):
                 with use_afd_metadata_provider(
-                    self.install_afd_metadata_on_forward_context,
+                    self.prepare_afd_forward_context,
                 ):
                     result = super().capture_model(profile_only=profile_only)
                 event_tracker.assert_complete()

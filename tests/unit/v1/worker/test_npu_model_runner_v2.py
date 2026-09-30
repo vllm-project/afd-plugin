@@ -80,8 +80,8 @@ def test_execute_forwards_dummy_profile_and_context_then_restores(
     forward_module = afd_context.forward_context_module
     monkeypatch.setattr(forward_module, "create_forward_context", lambda: context)
     original_factory = forward_module.create_forward_context
-    runner.install_afd_metadata_on_forward_context = lambda ctx: (
-        ctx.additional_kwargs.update(afd_metadata="installed")
+    runner.prepare_afd_forward_context = lambda ctx: ctx.additional_kwargs.update(
+        afd_metadata="installed"
     )
     forwarded = []
 
@@ -154,7 +154,7 @@ def test_capture_forwards_new_inputs_and_restores(
     runner.send_dp_metadata = lambda tokens, _slices: events.append(
         (tokens, runner._is_warmup, runner._afd_is_graph_capturing)
     )
-    runner.install_afd_metadata_on_forward_context = lambda _ctx: None
+    runner.prepare_afd_forward_context = lambda _ctx: None
     original_prepare = cudagraph_utils.prepare_inputs_to_capture
     sentinels = [object() for _ in range(6)]
     prepare_calls = []

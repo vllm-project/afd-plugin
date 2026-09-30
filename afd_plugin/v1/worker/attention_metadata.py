@@ -181,17 +181,10 @@ class AFDMetadataProviderMixin:
         self,
         forward_context: ForwardContext,
     ) -> None:
-        """Install transaction metadata and publish its matching control.
+        """Build or reuse the local sidecar without publishing control.
 
-        On the ordinary eager path, the method creates a pending transaction from
-        the current context, writes it to ``ForwardContext.additional_kwargs``,
-        and sends the context's native DP control before the model/data-plane
-        forward.  Graph lifecycles may instead pre-stage the transaction and
-        control payload; their suppression scope makes this method attach the
-        staged sidecar without a duplicate send.  A FULL graph context that was
-        not pre-sent uses its padded descriptor count for DP control.  Ubatch
-        child contexts reuse their parent transaction without another send, and
-        native FULL replay uses its pre-replay hook because it creates no context.
+        Native ubatch children retain their stage-specific metadata. Capture
+        and replay callers may pre-stage a transaction before this callback.
         """
 
         if forward_context.additional_kwargs is None:
@@ -214,6 +207,17 @@ class AFDMetadataProviderMixin:
             forward_context.additional_kwargs["afd_metadata"] = (
                 self._afd_pending_metadata
             )
+
+    def publish_afd_control(self, forward_context: ForwardContext) -> None:
+        """Publish synchronous control from the final native execution context.
+
+        Graph hooks send outside capture/replay and suppress this callback.
+        Child contexts share their parent's stage plan and never send again.
+        """
+
+        metadata = forward_context.additional_kwargs["afd_metadata"]
+        if _is_ubatch_child_afd_context(forward_context, metadata):
+            return
         if getattr(self, "_afd_suppress_metadata_send", False):
             return
         dp_metadata = forward_context.dp_metadata
@@ -222,6 +226,13 @@ class AFDMetadataProviderMixin:
         if padded_graph_tokens is not None and not ubatch_slices:
             dp_metadata = self.build_capture_dp_metadata(padded_graph_tokens)
         self.send_dp_metadata(dp_metadata, ubatch_slices)
+
+    def prepare_afd_forward_context(self, forward_context: ForwardContext) -> None:
+        """Handle metadata-ready at the existing pre-forward callback seam."""
+
+        self.install_afd_metadata_on_forward_context(forward_context)
+        if self.connector.control_plane is not None:
+            self.publish_afd_control(forward_context)
 
     def _next_afd_transaction_id(self) -> str:
         counter = self._afd_transaction_counter

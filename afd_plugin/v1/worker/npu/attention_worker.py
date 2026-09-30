@@ -16,12 +16,6 @@ from afd_plugin.compat.npu import (
     npu_afd_num_ubatches,
 )
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
-from afd_plugin.v1.worker.npu.attention_model_runner import (
-    AFDNPUAttentionModelRunner,
-)
-from afd_plugin.v1.worker.npu.attention_model_runner_v2 import (
-    AFDNPUAttentionModelRunnerV2,
-)
 from afd_plugin.validation import (
     NPU_ATTENTION_WORKER_FQCN,
     assert_compatible_afd_stack,
@@ -63,12 +57,17 @@ class AFDNPUAttentionWorker(NPUWorker):
             self.vllm_config.model_config,
             device_type="npu",
         )
-        runner_cls = (
-            AFDNPUAttentionModelRunnerV2
-            if self.use_v2_model_runner
-            else AFDNPUAttentionModelRunner
-        )
-        self.model_runner = runner_cls(
+        # Keep worker resolution independent of the unselected runner.
+        if self.use_v2_model_runner:
+            from afd_plugin.v1.worker.npu.attention_model_runner_v2 import (
+                AFDNPUAttentionModelRunnerV2 as AFDModelRunner,
+            )
+        else:
+            from afd_plugin.v1.worker.npu.attention_model_runner import (
+                AFDNPUAttentionModelRunner as AFDModelRunner,
+            )
+
+        self.model_runner = AFDModelRunner(
             self.vllm_config,
             self.device,
         )

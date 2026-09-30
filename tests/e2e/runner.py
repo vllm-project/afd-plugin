@@ -962,9 +962,13 @@ def build_env(
     env = os.environ.copy()
     env.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "18000")
     env[visible_devices_env_name(args.device_backend)] = visible_devices
-    env["VLLM_USE_V2_MODEL_RUNNER"] = (
-        "1" if args.device_backend == "gpu" and args.use_v2_model_runner else "0"
-    )
+    if args.device_backend == "gpu":
+        env["VLLM_USE_V2_MODEL_RUNNER"] = "1" if args.use_v2_model_runner else "0"
+    elif role == "ffn":
+        # FFN still owns an MRV1 runner independently of Attention's selection.
+        env["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    else:
+        env.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
     if args.baseline:
         env["VLLM_PLUGINS"] = "ascend" if args.device_backend == "npu" else ""
     else:

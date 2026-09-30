@@ -16,7 +16,6 @@ import torch
 import torch.nn as nn
 from transformers import DeepseekV2Config, DeepseekV3Config, GlmMoeDsaConfig
 from vllm.config import ParallelConfig, VllmConfig
-from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.models import deepseek_v2 as native
@@ -25,11 +24,8 @@ from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
     AFDF2ATransferPayload,
-    AFDTransferContext,
-    AFDTransferMetadata,
 )
-from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
-from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
+from afd_plugin.model_executor.models.remote_ffn import send_and_receive_remote_ffn
 
 logger = init_logger(__name__)
 
@@ -129,32 +125,10 @@ class RemoteFFNProxy(nn.Module):
         hidden_states: torch.Tensor,
         **send_kwargs: torch.Tensor,
     ) -> torch.Tensor:
-        afd_metadata = get_afd_metadata_from_forward_context()
-        if afd_metadata is None:
-            raise RuntimeError("RemoteFFNProxy requires AFD forward metadata")
-        forward_context = get_forward_context()
-        stage_idx = int(
-            getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),
-        )
-        afd_metadata.stage_idx = stage_idx
-        metadata = AFDTransferMetadata.create_attention_metadata(
+        return send_and_receive_remote_ffn(
+            hidden_states,
             layer_idx=self.layer_idx,
-            stage_idx=stage_idx,
-            seq_len=int(hidden_states.shape[0]),
-        )
-        context = AFDTransferContext(metadata=metadata)
-        afd_metadata.connector.send_attn_output(
-            hidden_states,
-            context,
             **send_kwargs,
-        )
-        hidden_states = maybe_apply_dbo_yield(
-            hidden_states,
-            role="attention",
-        )
-        return afd_metadata.connector.recv_ffn_output(
-            ref_tensor=hidden_states,
-            ubatch_idx=stage_idx,
         )
 
 

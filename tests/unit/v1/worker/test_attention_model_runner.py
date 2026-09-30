@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import sys
@@ -64,7 +67,7 @@ class _RecordingConnector:
         self.closed = False
         # The runners reach the control plane through connector.control_plane;
         # the fake serves as both.
-        self.control_plane = self
+        self.control_plane: _RecordingConnector | None = self
 
     def update_state_from_dp_metadata(self, payload):
         assert isinstance(payload, AFDControlPayload)
@@ -179,6 +182,10 @@ def test_attention_runner_installs_afd_metadata_on_forward_context():
 
     runner.install_afd_metadata_on_forward_context(forward_context)
 
+    assert runner.connector.dp_metadata_updates == []
+    assert runner.connector.sent_dp_metadata_lists == []
+    runner.publish_afd_control(forward_context)
+
     assert forward_context.additional_kwargs["platform_key"] == "platform_value"
     assert forward_context.additional_kwargs["afd_metadata"].tokens_lens == [5]
     assert set(runner.connector.dp_metadata_updates[0]) == {0}
@@ -186,6 +193,43 @@ def test_attention_runner_installs_afd_metadata_on_forward_context():
     assert set(runner.connector.sent_dp_metadata_lists[0]) == {0}
     assert _tokens(runner.connector.sent_dp_metadata_lists[0][0]) == [5]
     assert runner.connector.sent_dp_metadata_flags == [(False, False, False)]
+
+
+@pytest.mark.parametrize("has_control_plane", [False, True])
+def test_local_metadata_build_and_install_never_publish_control(has_control_plane):
+    runner = object.__new__(AFDAttentionModelRunner)
+    runner.vllm_config = SimpleNamespace(parallel_config=_parallel_config())
+    runner.connector = _RecordingConnector()
+    if not has_control_plane:
+        runner.connector.control_plane = None
+    runner._afd_transaction_counter = 0
+    runner._afd_pending_metadata = None
+    context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata={},
+        slot_mapping={},
+        additional_kwargs={"native": "preserved"},
+        dp_metadata=None,
+        ubatch_slices=None,
+        batch_descriptor=BatchDescriptor(num_tokens=7),
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+    )
+
+    runner.install_afd_metadata_on_forward_context(context)
+    metadata = context.additional_kwargs["afd_metadata"]
+    assert metadata.transaction_id == "afd-0"
+    assert metadata.tokens_lens == [7]
+    assert context.additional_kwargs["native"] == "preserved"
+    runner.install_afd_metadata_on_forward_context(context)
+    assert context.additional_kwargs["afd_metadata"] is metadata
+    assert runner._afd_transaction_counter == 1
+    assert runner.connector.dp_metadata_updates == []
+    assert runner.connector.sent_dp_metadata_lists == []
+
+    if not has_control_plane:
+        runner.prepare_afd_forward_context(context)
+        assert context.additional_kwargs["afd_metadata"] is metadata
+        assert runner.connector.sent_dp_metadata_lists == []
 
 
 def test_attention_runner_initializes_missing_forward_context_kwargs():
@@ -208,7 +252,7 @@ def test_attention_runner_initializes_missing_forward_context_kwargs():
         cudagraph_runtime_mode=CUDAGraphMode.NONE,
     )
 
-    runner.install_afd_metadata_on_forward_context(forward_context)
+    runner.prepare_afd_forward_context(forward_context)
 
     assert forward_context.additional_kwargs["afd_metadata"].tokens_lens == [5]
 
@@ -235,7 +279,7 @@ def test_attention_runner_uses_padded_full_graph_tokens_for_afd_metadata():
         cudagraph_runtime_mode=CUDAGraphMode.FULL,
     )
 
-    runner.install_afd_metadata_on_forward_context(forward_context)
+    runner.prepare_afd_forward_context(forward_context)
 
     metadata = forward_context.additional_kwargs["afd_metadata"]
     assert metadata.tokens_lens == [1]
@@ -299,7 +343,7 @@ def test_attention_runner_skips_dp_metadata_send_for_ubatch_child_context():
 
     assert _is_ubatch_child_afd_context(forward_context, child)
 
-    runner.install_afd_metadata_on_forward_context(forward_context)
+    runner.prepare_afd_forward_context(forward_context)
 
     assert forward_context.additional_kwargs["afd_metadata"] is child
     assert runner.connector.dp_metadata_updates == []
@@ -333,7 +377,7 @@ def test_attention_runner_does_not_skip_single_stage_context():
         runner._afd_pending_metadata,
     )
 
-    runner.install_afd_metadata_on_forward_context(forward_context)
+    runner.prepare_afd_forward_context(forward_context)
 
     assert set(runner.connector.sent_dp_metadata_lists[0]) == {0}
     assert _tokens(runner.connector.sent_dp_metadata_lists[0][0]) == [5]
@@ -396,7 +440,7 @@ def test_ubatch_missing_metadata_uses_complete_public_installer():
     )
     wrapper = object.__new__(AFDUBatchWrapper)
     wrapper.configure_afd_context_provider(
-        runner.install_afd_metadata_on_forward_context,
+        runner.prepare_afd_forward_context,
     )
 
     wrapper._install_missing_afd_metadata(forward_context)
@@ -749,7 +793,10 @@ def test_attention_runner_preserves_native_shutdown(monkeypatch):
     assert runner.connector.closed is True
 
 
-def test_attention_warmup_preserves_profile_seq_lens():
+def test_attention_warmup_preserves_profile_seq_lens(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
     runner = object.__new__(AFDAttentionModelRunner)
     runner.compilation_config = SimpleNamespace(cudagraph_num_of_warmups=1)
     runner._is_warmup = False
@@ -791,7 +838,7 @@ def test_forward_context_provider_installs_metadata_before_model_forward(monkeyp
     )
 
     with use_afd_metadata_provider(
-        runner.install_afd_metadata_on_forward_context,
+        runner.prepare_afd_forward_context,
     ):
         forward_context = fake_forward_context.create_forward_context()
         metadata = get_afd_metadata_from_forward_context(forward_context)
@@ -824,7 +871,7 @@ def test_forward_context_provider_can_install_without_sending_metadata(monkeypat
     )
 
     with use_afd_metadata_provider(
-        runner.install_afd_metadata_on_forward_context,
+        runner.prepare_afd_forward_context,
     ):
         forward_context = fake_forward_context.create_forward_context()
         metadata = get_afd_metadata_from_forward_context(forward_context)

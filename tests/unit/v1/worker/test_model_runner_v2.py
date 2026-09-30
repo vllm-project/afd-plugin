@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 """Unit tests for AFD CUDA GPU ModelRunnerV2 support."""
 
 from __future__ import annotations
@@ -1359,7 +1362,7 @@ def test_dp1_ordinary_native_path_binds_unpadded_afd_metadata():
         batch_descriptor=BatchDescriptor(num_tokens=descriptor.num_tokens),
         cudagraph_runtime_mode=CUDAGraphMode.NONE,
     )
-    runner.install_afd_metadata_on_forward_context(context)
+    runner.prepare_afd_forward_context(context)
     metadata = context.additional_kwargs["afd_metadata"]
     assert metadata.tokens_lens == [7]
     assert metadata.tokens_unpadded_lens == [7]

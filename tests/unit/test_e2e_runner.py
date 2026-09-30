@@ -1629,6 +1629,33 @@ def test_build_env_marks_managed_process_trees_by_role():
     assert ffn_env[runner.E2E_PROCESS_ROLE_ENV] == "ffn"
 
 
+@pytest.mark.parametrize("inherited_runner", [None, "0", "1"])
+@pytest.mark.parametrize("role", ["attention", "baseline"])
+def test_npu_ffn_runner_selection_preserves_attention_and_parent_environment(
+    monkeypatch,
+    inherited_runner,
+    role,
+):
+    args = _args()
+    args.device_backend = "npu"
+    if role == "baseline":
+        args.scenario = "baseline-graph"
+    runner.configure_scenario(args)
+    if inherited_runner is None:
+        monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", inherited_runner)
+
+    attention_env = runner.build_env("0,1", args, role=role)
+    ffn_env = runner.build_env("2,3", args, role="ffn")
+    attention_env_after_ffn = runner.build_env("0,1", args, role=role)
+
+    assert ffn_env["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+    assert attention_env["VLLM_USE_V2_MODEL_RUNNER"] == (inherited_runner or "0")
+    assert attention_env_after_ffn == attention_env
+    assert os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == inherited_runner
+
+
 @pytest.mark.parametrize(
     ("scenario", "expected"),
     [("afd-eager-2a1f", "0"), ("afd-v2-eager-1a1f", "1")],
@@ -1731,9 +1758,12 @@ def test_stream_output_records_live_npu_split_control_metadata(monkeypatch):
     )
     process: Any = argparse.Namespace(
         stdout=io.StringIO(
-            control_entry + "is_graph_capturing=False is_warmup=True\n"
-            + control_entry + "is_graph_capturing=True is_warmup=False\n"
-            + control_entry + "is_graph_capturing=False is_warmup=False\n"
+            control_entry
+            + "is_graph_capturing=False is_warmup=True\n"
+            + control_entry
+            + "is_graph_capturing=True is_warmup=False\n"
+            + control_entry
+            + "is_graph_capturing=False is_warmup=False\n"
         ),
     )
     monkeypatch.setattr(runner.time, "time", lambda: 101.0)

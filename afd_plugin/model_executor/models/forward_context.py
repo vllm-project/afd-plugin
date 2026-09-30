@@ -38,9 +38,11 @@ def get_afd_metadata_from_forward_context(
 def use_afd_metadata_provider(
     installer: Callable[[ForwardContext], None],
 ) -> Iterator[None]:
-    """Install AFD metadata as vLLM creates a forward context.
+    """Run the metadata-ready callback as vLLM creates a forward context.
 
     ``installer`` receives each newly created ``ForwardContext`` exactly once.
+    Callers select either local installation only or installation followed by
+    synchronous control publication; the factory does not choose the backend.
     The native factory symbol is restored when the scope exits, including when
     context creation or installation raises.
 

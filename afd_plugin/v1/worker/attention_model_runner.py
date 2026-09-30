@@ -116,7 +116,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
     def _install_afd_ubatch_wrapper(self) -> None:
         if isinstance(self.model, AFDUBatchWrapper):
             self.model.configure_afd_context_provider(
-                self.install_afd_metadata_on_forward_context,
+                self.prepare_afd_forward_context,
             )
             return
 
@@ -130,7 +130,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
             self.device,
         )
         self.model.configure_afd_context_provider(
-            self.install_afd_metadata_on_forward_context,
+            self.prepare_afd_forward_context,
         )
 
     # Patch reason: AFD stages connector metadata before native Attention
@@ -341,7 +341,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
         **model_kwargs: dict[str, Any],
     ) -> Any:
         forward_context = get_forward_context()
-        self.install_afd_metadata_on_forward_context(forward_context)
+        self.prepare_afd_forward_context(forward_context)
         return super()._model_forward(
             input_ids=input_ids,
             positions=positions,
@@ -398,7 +398,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
         self._afd_is_graph_capturing = is_graph_capturing
         try:
             with use_afd_metadata_provider(
-                self.install_afd_metadata_on_forward_context,
+                self.prepare_afd_forward_context,
             ):
                 return super()._dummy_run(
                     num_tokens=num_tokens,

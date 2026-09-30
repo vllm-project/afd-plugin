@@ -13,6 +13,7 @@ from torch import nn  # noqa: E402
 
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
+from afd_plugin.model_executor.models import remote_ffn  # noqa: E402
 
 
 class _FakeConnector:
@@ -43,12 +44,12 @@ def _install_fake_forward_context(monkeypatch, events, *, stage_idx=2):
     connector = _FakeConnector(events)
     afd_metadata = SimpleNamespace(connector=connector, stage_idx=9)
     monkeypatch.setattr(
-        adapter,
+        remote_ffn,
         "get_afd_metadata_from_forward_context",
-        lambda: afd_metadata,
+        lambda _context: afd_metadata,
     )
     monkeypatch.setattr(
-        adapter,
+        remote_ffn,
         "get_forward_context",
         lambda: SimpleNamespace(ubatch_idx=stage_idx),
     )
@@ -57,7 +58,7 @@ def _install_fake_forward_context(monkeypatch, events, *, stage_idx=2):
         events.append(("yield", hidden_states, role))
         return hidden_states
 
-    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", record_yield)
+    monkeypatch.setattr(remote_ffn, "maybe_apply_dbo_yield", record_yield)
     return afd_metadata
 
 
@@ -210,11 +211,35 @@ def test_remote_experts_proxy_without_external_routing_ships_hidden_states(
     assert torch.equal(output, hidden_states * 0.25)
 
 
+def test_remote_exchange_keeps_stage_and_uses_yielded_reference(monkeypatch):
+    events: list[tuple] = []
+    afd_metadata = _install_fake_forward_context(monkeypatch, events)
+    monkeypatch.setattr(remote_ffn, "get_forward_context", SimpleNamespace)
+    hidden_states = torch.ones(2, 4)
+    yielded_states = hidden_states + 1
+
+    def record_yield(states, *, role):
+        events.append(("yield", states, role))
+        afd_metadata.stage_idx = 7
+        return yielded_states
+
+    monkeypatch.setattr(remote_ffn, "maybe_apply_dbo_yield", record_yield)
+
+    output = remote_ffn.send_and_receive_remote_ffn(hidden_states, layer_idx=3)
+
+    assert [event[0] for event in events] == ["send", "yield", "recv"]
+    assert events[0][2].metadata.stage_idx == 9
+    assert events[2][1] is yielded_states
+    assert events[2][2] == 9
+    assert torch.equal(output, yielded_states * 0.25)
+
+
 def test_remote_proxy_requires_forward_metadata(monkeypatch):
+    monkeypatch.setattr(remote_ffn, "get_forward_context", SimpleNamespace)
     monkeypatch.setattr(
-        adapter,
+        remote_ffn,
         "get_afd_metadata_from_forward_context",
-        lambda: None,
+        lambda _context: None,
     )
 
     with pytest.raises(RuntimeError, match="requires AFD forward metadata"):
@@ -225,7 +250,7 @@ def test_remote_proxy_exchanges_cam_during_profile(monkeypatch):
     events: list[tuple] = []
     _install_fake_forward_context(monkeypatch, events)
     monkeypatch.setattr(
-        adapter,
+        remote_ffn,
         "get_forward_context",
         lambda: SimpleNamespace(in_profile_run=True, ubatch_idx=0),
     )

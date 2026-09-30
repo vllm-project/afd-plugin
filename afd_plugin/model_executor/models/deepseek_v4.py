@@ -14,13 +14,10 @@ from typing import Any
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
-from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.nvidia import model as native
 
 from afd_plugin.config import parse_afd_config
-from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
-from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
-from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
+from afd_plugin.model_executor.models.remote_ffn import send_and_receive_remote_ffn
 
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
@@ -91,32 +88,10 @@ class RemoteDeepseekV4FFN(nn.Module):
                 "DeepSeek-V4 input_ids must be one-dimensional and token-aligned",
             )
 
-        afd_metadata = get_afd_metadata_from_forward_context()
-        if afd_metadata is None:
-            raise RuntimeError("RemoteDeepseekV4FFN requires AFD forward metadata")
-        forward_context = get_forward_context()
-        stage_idx = int(
-            getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),
-        )
-        afd_metadata.stage_idx = stage_idx
-        metadata = AFDTransferMetadata.create_attention_metadata(
+        return send_and_receive_remote_ffn(
+            hidden_states,
             layer_idx=self.layer_idx,
-            stage_idx=stage_idx,
-            seq_len=int(hidden_states.shape[0]),
-        )
-        context = AFDTransferContext(metadata=metadata)
-        afd_metadata.connector.send_attn_output(
-            hidden_states,
-            context,
             input_ids=input_ids,
-        )
-        hidden_states = maybe_apply_dbo_yield(
-            hidden_states,
-            role="attention",
-        )
-        return afd_metadata.connector.recv_ffn_output(
-            ref_tensor=hidden_states,
-            ubatch_idx=stage_idx,
         )
 
 

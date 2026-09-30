@@ -324,7 +324,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         v2_cudagraph_utils.prepare_inputs_to_capture = prepare_inputs_to_capture
         try:
             with use_afd_metadata_provider(
-                self.install_afd_metadata_on_forward_context,
+                self.prepare_afd_forward_context,
             ):
                 result = super().capture_model(profile_only=profile_only)
             if event_index != len(expected_events):
@@ -394,7 +394,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             with (
                 replay_scope,
                 use_afd_metadata_provider(
-                    self.install_afd_metadata_on_forward_context,
+                    self.prepare_afd_forward_context,
                 ),
             ):
                 return super().execute_model(
