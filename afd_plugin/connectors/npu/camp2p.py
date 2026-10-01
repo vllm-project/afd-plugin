@@ -23,10 +23,16 @@ from typing import TYPE_CHECKING, Any, Final, cast
 import torch
 import torch.distributed as dist
 from torch.distributed.distributed_c10d import ProcessGroup
+from vllm.config import CUDAGraphMode
 from vllm.forward_context import DPMetadata, get_forward_context
-from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from afd_plugin.a2e_layout import (
+    attention_rank_token_counts,
+    ffn_rank_for_attention_rank,
+    ffn_receive_rows,
+    padded_tile_rows,
+)
 from afd_plugin.compat.npu import ensure_cam_p2p_ops_available
 from afd_plugin.config import AFDConfig
 from afd_plugin.config_utils import (
@@ -60,7 +66,11 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 _CAMP2P_CUSTOM_OPS_REGISTERED = False
-logger = init_logger(__name__)
+
+# Padding value for token ids that only exist to fill a padded transfer. The
+# receiving FFN maps it to token 0 before routing, so a padded row can never
+# index outside the token-to-expert table.
+_PAD_HASH_TOKEN_ID: Final[int] = -1
 
 _CAMP2P_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
     {
@@ -177,7 +187,9 @@ class CAMP2PTransferState(AFDTransferState):
     ``h`` and ``k`` size the CAMP2p operators, and ``atten_batch_size`` saves the
     A2E-returned Attention token count that the FFN-to-Attention send requires.
     ``x_active_mask`` and ``cam_p2p_ep_name`` are the A2E-returned active-token
-    mask and HCCL endpoint name captured on the receive path.
+    mask and HCCL endpoint name captured on the receive path. ``padded_payload``
+    is set on the Attention side when the payload was extended to the reported
+    token count, which makes the receive return only the rows the model produced.
     """
 
     aiv_num: int = 8
@@ -187,6 +199,7 @@ class CAMP2PTransferState(AFDTransferState):
     atten_batch_size: torch.Tensor | None = None
     x_active_mask: torch.Tensor | None = None
     cam_p2p_ep_name: str | None = None
+    padded_payload: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +235,32 @@ class _CAMP2PTopology:
     def is_attn_top_min_size_rank(self) -> bool:
         """Return whether this is an Attention metadata-sender rank."""
         return self.ffn_size <= self.world_rank < self.ffn_size + self.min_size
+
+
+def _reported_attention_tokens(forward_context: Any) -> int | None:
+    """Return the row count a padded graph step sends, or ``None``.
+
+    Mirror the runner's own condition (``v1/worker/attention_model_runner.py``:
+    ``_full_cudagraph_padded_tokens(forward_context) is not None and not
+    ubatch_slices``): a padded graph runs the batch at its capture size, so the
+    payload of such a step holds that many rows whatever the forward produced.
+
+    ``forward_context.num_tokens`` is *not* a substitute: outside a padded graph it
+    does not describe the payload of the current forward (a prefill step can carry
+    hundreds of rows while it holds a decode-sized value).
+
+    Returns ``None`` for a step that is not a padded graph, which is the step an
+    eager forward produces its own rows for.
+    """
+
+    if getattr(forward_context, "ubatch_slices", None):
+        return None
+    if getattr(forward_context, "cudagraph_runtime_mode", None) != CUDAGraphMode.FULL:
+        return None
+    batch_descriptor = getattr(forward_context, "batch_descriptor", None)
+    if batch_descriptor is None:
+        return None
+    return max(1, int(batch_descriptor.num_tokens))
 
 
 def prepare_token_id_transfer(
@@ -279,30 +318,30 @@ def received_token_ids(
 ) -> torch.Tensor:
     """Collapse the A2E ids channel back to a token-aligned id vector.
 
-    The operator returns ``(N, topk)`` with every column of a row repeating that
-    token's id, and sizes ``N`` to the capacity it was given, so this trims to
-    the tokens the FFN rank actually computes on.
+    Every column of a row repeats that token's id. The operator sizes its ids
+    output to the capacity it was given rather than to the rows it writes, so the
+    shape alone cannot prove which rows arrived; the caller states the row count
+    the FFN rank computes on, and the Attention side pads every peer up to the
+    tile A2E reads so that row count is the one the transfer writes.
 
     Args:
         sim_expert_ids: The operator's ids output.
-        expected_tokens: Token count derived from the FFN rank's DP metadata,
-            which is what the FFN compute will actually run on.
+        expected_tokens: Rows the FFN rank computes on.
 
     Returns:
         A one-dimensional ``int32`` tensor of length ``expected_tokens``.
 
     Raises:
-        ValueError: If fewer ids arrived than the FFN rank computes on. That is
-            the misalignment this channel has to catch: a token-keyed router
-            would otherwise select experts for the wrong tokens.
+        ValueError: If the operator's capacity cannot hold those rows, which
+            means the ids channel is not sized for this topology.
     """
 
-    received_tokens = int(sim_expert_ids.shape[0])
-    if received_tokens < expected_tokens:
+    declared_tokens = int(sim_expert_ids.shape[0])
+    if declared_tokens < expected_tokens:
         raise ValueError(
-            f"received {received_tokens} token ids but the FFN rank computes on "
-            f"{expected_tokens} tokens; the ids channel is not aligned with the "
-            "FFN token layout",
+            f"A2E declared {declared_tokens} id rows but the FFN rank computes "
+            f"on {expected_tokens}; the ids channel is not sized for this "
+            "topology",
         )
     # The columns are replicas of the same id, so the first one carries it.
     return sim_expert_ids[:expected_tokens, 0].contiguous()
@@ -382,7 +421,18 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         self.hidden_size = hf_config.hidden_size
         self.num_experts_per_tok = hf_config.num_experts_per_tok
         self.num_routed_experts = hf_config.n_routed_experts
+        # Row count of the model's token-to-expert (Hash) tables: token ids the
+        # ids channel carries are indices into them.
+        self.vocab_size = int(hf_config.vocab_size)
+        # All-rank token count A2E falls back to when a stage has no usable
+        # counts. Both roles read it from the same scheduler configuration, so the
+        # fallback tile stays equal on the sending and the receiving side.
+        self.max_num_tokens = int(vllm_config.scheduler_config.max_num_batched_tokens)
         self.control_plane = CAMP2pAFDControlPlane(self)
+        # Per-stage, per-DP-rank token counts as plain integers. The control plane
+        # refreshes them whenever it publishes a payload; see
+        # ``_dp_stage_token_counts`` for why the tensors themselves are not read.
+        self.dp_token_counts: dict[int, tuple[int, ...]] = {}
 
     @property
     def is_initialized(self) -> bool:
@@ -497,6 +547,49 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         self.hccl_comm_name_list = []
         self._initialized = False
 
+    def _padding_rows_for_step(
+        self,
+        stage_idx: int,
+    ) -> int:
+        """Return the tile this Attention rank pads its payload up to.
+
+        A2E reads the same number of rows from every Attention peer of an FFN
+        rank, so this rank has to write that many rows. The tile is the largest
+        count of this rank's peer group -- divided by the FlashComm v1 shard,
+        because a TP worker holds only its own share of the DP rank's rows -- and
+        the FFN rank derives the same number from the same counts. Deriving it
+        here rather than from this rank's own report is what keeps the payload and
+        the receive the same shape: a rank that kept its own shorter payload would
+        leave the tail of the peer's tile holding whatever the previous transfer
+        left there, which the FFN rank reads as token ids.
+
+        Only the connector's integer snapshot of the counts is read here, never
+        the tensors themselves: this runs inside the traced model forward, where
+        the DP tensors are symbolic and any comparison against them fails the
+        data-dependent guard in ``torch.compile``.
+
+        The same ``max_num_tokens`` fallback the FFN rank uses covers a step whose
+        counts cannot describe the peer group, so a step without usable metadata
+        still has both sides agree on one tile instead of the receiver guessing a
+        larger one.
+        """
+
+        stage_token_counts = self.dp_token_counts.get(stage_idx, ())
+        ffn_rank = ffn_rank_for_attention_rank(
+            self.role_rank,
+            attention_size=self.attn_size,
+            ffn_size=self.ffn_size,
+        )
+        if ffn_rank is None:
+            return max(1, self.max_num_tokens)
+        return padded_tile_rows(
+            stage_token_counts,
+            ffn_rank=ffn_rank,
+            attention_size=self.attn_size,
+            ffn_size=self.ffn_size,
+            fallback=self.max_num_tokens,
+        )
+
     def send_attn_output(
         self,
         hidden_states: torch.Tensor,
@@ -520,7 +613,9 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 on the payload's ``input_ids`` field.
 
         Raises:
-            RuntimeError: If the communication groups are not ready.
+            RuntimeError: If the communication groups are not ready, or if this
+                rank produced more rows than the tile A2E reads per Attention
+                peer, which the equal-tile layout cannot represent.
             ValueError: If the number of tokens in ``hidden_states`` does not
                 match ``context.metadata`` outside a ``torch.compile`` trace, or
                 if a supplied ``input_ids`` tensor is malformed.
@@ -536,6 +631,72 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 f"CAMP2P metadata token count {metadata.total_tokens}",
             )
         input_ids = cast(torch.Tensor | None, kwargs.get("input_ids"))
+        forward_context = get_forward_context()
+        stage_idx = metadata.stage_idx
+        wire_rows = self._padding_rows_for_step(stage_idx)
+        # Rows this rank's payload holds, from the count snapshot rather than from
+        # the payload tensor: a traced or padded step reports its rows through the
+        # graph, and reading a symbol there is what makes the compiled path fail.
+        own_counts = attention_rank_token_counts(
+            self.dp_token_counts.get(stage_idx, ()),
+            attention_size=self.attn_size,
+        )
+        payload_rows = (
+            None
+            if own_counts is None or self.role_rank >= len(own_counts)
+            else own_counts[self.role_rank]
+        )
+        graph_rows = _reported_attention_tokens(forward_context)
+        if graph_rows is not None:
+            # A graph step sends the rows its captured graph holds and cannot pad
+            # them, so the tile the FFN rank sizes its receive with has to be
+            # exactly those rows.
+            if graph_rows != int(wire_rows):
+                raise RuntimeError(
+                    f"CAMP2P Attention rank {self.role_rank} sends the {graph_rows} "
+                    f"rows of its graph while this step's A2E tile is {wire_rows} "
+                    f"rows (layer={metadata.layer_idx}, stage={stage_idx}, "
+                    f"dp_counts={self.dp_token_counts.get(stage_idx, ())}).",
+                )
+            padded_payload = False
+        else:
+            if (
+                not torch.compiler.is_compiling()
+                and payload_rows is not None
+                and wire_rows < payload_rows
+            ):
+                raise RuntimeError(
+                    f"CAMP2P Attention rank sends {payload_rows} tokens but this "
+                    f"step reports a {wire_rows}-row tile per Attention rank "
+                    f"(layer={metadata.layer_idx}, ubatch={stage_idx}). A2E reads one "
+                    "equal tile per Attention peer and sends the same tile back, so "
+                    "the extra tokens cannot be represented. Align the reported "
+                    "token count with the rows the forward produces.",
+                )
+            # Hand the operator a payload of exactly the tile's rows when the
+            # forward produced fewer: A2E reads one equal tile per Attention peer,
+            # so a shorter payload would leave the tail of this rank's ids and
+            # hidden-state regions unwritten and the receiving FFN would read the
+            # neighbouring regions as token ids. A step whose rows already are the
+            # tile keeps its payload and its buffers untouched.
+            padded_payload = payload_rows is None or wire_rows > payload_rows
+            if padded_payload:
+                hidden_states = self._wire_payload(
+                    hidden_states,
+                    wire_rows=wire_rows,
+                    fill=0,
+                )
+                if input_ids is not None:
+                    input_ids = self._wire_payload(
+                        input_ids.reshape(-1).to(torch.int32),
+                        wire_rows=wire_rows,
+                        fill=_PAD_HASH_TOKEN_ID,
+                    )
+                metadata = AFDTransferMetadata.create_attention_metadata(
+                    layer_idx=metadata.layer_idx,
+                    stage_idx=stage_idx,
+                    seq_len=wire_rows,
+                )
         expert_ids: torch.Tensor | None = None
         expert_scales: torch.Tensor | None = None
         compute_gate = 0
@@ -551,9 +712,9 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             batch_size=metadata.total_tokens,
             h=self.hidden_size,
             k=self.num_experts_per_tok,
+            padded_payload=padded_payload,
         )
         ubatch_idx = metadata.stage_idx
-        forward_context = get_forward_context()
         forward_context.cam_afdtransfer_state = transfer_state
         forward_context.ubatch_idx = ubatch_idx
 
@@ -602,8 +763,30 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         if transfer_state is None:
             raise RuntimeError("CAMP2P Attention side is missing connector data")
         get_forward_context().ubatch_idx = ubatch_idx
-        return torch.ops.vllm.afd_camp2p_recv_ffn_output(
+        # A padded send makes the FFN return the padded tile, so receive into a
+        # tile-sized buffer and hand back only the rows the model produced. The
+        # reference tensor carries that row count symbolically, which keeps the
+        # trim free of any Python branch on the token count.
+        if not transfer_state.padded_payload:
+            return torch.ops.vllm.afd_camp2p_recv_ffn_output(
+                ref_tensor,
+                self.hccl_comm_name,
+                self.hccl_comm_name2,
+                self.hccl_comm_name3,
+                transfer_state.batch_size,
+                transfer_state.h,
+                transfer_state.k,
+                self.ffn_size,
+                self.attn_size,
+                self.world_rank,
+                transfer_state.aiv_num,
+            )
+        destination = self._padded_receive_buffer(
             ref_tensor,
+            transfer_state.batch_size,
+        )
+        received = torch.ops.vllm.afd_camp2p_recv_ffn_output(
+            destination,
             self.hccl_comm_name,
             self.hccl_comm_name2,
             self.hccl_comm_name3,
@@ -614,6 +797,52 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             self.attn_size,
             self.world_rank,
             transfer_state.aiv_num,
+        )
+        return received[: ref_tensor.shape[0]]
+
+    @staticmethod
+    def _wire_payload(
+        payload: torch.Tensor,
+        *,
+        wire_rows: int,
+        fill: int,
+    ) -> torch.Tensor:
+        """Return a ``wire_rows``-row buffer carrying ``payload`` in its head.
+
+        A2E reads a fixed number of rows from every Attention peer, so a payload
+        shorter than that tile leaves the tail of this rank's regions unwritten.
+        Copying into a fixed-size buffer extends the payload without computing a
+        pad amount, which would have to read the payload's token count and
+        therefore specialize the dimension the compiled model declares dynamic.
+        Pad rows keep ``fill``, the sentinel the FFN maps back to token 0 for ids.
+        The tile is a fixed size for every step that pads, so the buffer does not
+        have to outlive the transfer it feeds.
+        """
+
+        buffer = torch.full(
+            (wire_rows, *payload.shape[1:]),
+            fill,
+            dtype=payload.dtype,
+            device=payload.device,
+        )
+        buffer[: payload.shape[0]] = payload
+        return buffer
+
+    @staticmethod
+    def _padded_receive_buffer(
+        ref_tensor: torch.Tensor,
+        rows: int,
+    ) -> torch.Tensor:
+        """Return a ``rows``-row buffer shaped like ``ref_tensor``.
+
+        The tile is a fixed size for every step that pads, so this buffer never
+        has to outlive the transfer it feeds.
+        """
+
+        return torch.empty(
+            (rows, *ref_tensor.shape[1:]),
+            dtype=ref_tensor.dtype,
+            device=ref_tensor.device,
         )
 
     def recv_attn_output(
@@ -641,24 +870,29 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             ids mode was selected.
 
         Raises:
-            RuntimeError: If communication is not ready, transfer information
-                is missing, or the requested ubatch group does not exist.
+            RuntimeError: If communication is not ready or transfer information
+                is missing.
             ValueError: If ids were requested but do not align with the FFN
                 rank's token layout.
         """
         if not self._initialized:
             raise RuntimeError("CAMP2P connector is not initialized")
         layer_idx: int = kwargs.get("layer_idx", 0)
-        max_num_tokens: int = kwargs.get("max_num_tokens", 0)
         recv_input_ids: bool = bool(kwargs.get("recv_input_ids", False))
         compute_gate_mode = 1 if recv_input_ids else 0
-        batch_size = _num_tokens_for_ffn_rank(
-            self.dp_metadata_list,
-            ubatch_idx,
-            ffn_rank=self.role_rank,
+        # A2E gives this rank one tile per Attention peer and reads the same number
+        # of rows from each, so the operator is sized by whole tiles and both roles
+        # derive that tile from the same counts and fallback (see
+        # :mod:`afd_plugin.a2e_layout`). The connector's own ``max_num_tokens`` is
+        # the fallback rather than a caller-supplied value, because the Attention
+        # ranks size the very same fallback and a different number here would make
+        # the operator read rows no peer wrote.
+        batch_size = ffn_receive_rows(
+            self.dp_token_counts.get(ubatch_idx, ()),
+            self.role_rank,
             attention_size=self.attn_size,
             ffn_size=self.ffn_size,
-            fallback=max_num_tokens,
+            fallback=self.max_num_tokens,
         )
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=layer_idx,
@@ -783,6 +1017,7 @@ class CAMP2pAFDControlPlane(AFDControlPlane):
     ) -> None:
         connector = self.connector
         connector.dp_metadata_list = payload.dp_metadata_list
+        connector.dp_token_counts = _dp_stage_token_counts(payload.dp_metadata_list)
         connector.is_graph_capturing = payload.is_graph_capturing
         connector.is_warmup = payload.is_warmup
 
@@ -888,52 +1123,25 @@ def build_camp2p_topology(
     )
 
 
-def _num_tokens_for_ffn_rank(
+def _dp_stage_token_counts(
     dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
-    stage_idx: int,
-    *,
-    ffn_rank: int,
-    attention_size: int,
-    ffn_size: int,
-    fallback: int,
-) -> int:
-    """Count the tokens that one FFN rank will receive from Attention.
+) -> dict[int, tuple[int, ...]]:
+    """Copy the per-DP-rank token counts of every stage into plain integers.
 
-    An FFN rank may receive data from several consecutive Attention ranks. This
-    function adds their token counts. When TP creates several Attention workers
-    for one DP rank, it first copies the DP token count to those TP workers.
-
-    Args:
-        dp_metadata_list: Token counts received from Attention for each ubatch.
-        stage_idx: Ubatch number to inspect.
-        ffn_rank: FFN rank whose token count is needed.
-        attention_size: Total number of Attention ranks.
-        ffn_size: Total number of FFN ranks.
-        fallback: Value used when the token counts are missing or incomplete.
-
-    Returns:
-        The number of tokens this FFN rank should receive, always at least one.
+    The counts are read once, where the control payload is published, because the
+    Attention model forward may be traced: inside a trace the DP tensors are
+    symbolic, so a connector that compared or summed those symbols would fail the
+    data-dependent guard in ``torch.compile``. Everything the connector derives
+    from the counts (the A2E tile and the rows an FFN rank computes on) is derived
+    from this snapshot instead of from the tensors.
     """
-    dp_metadata = dp_metadata_list[stage_idx]
-    if dp_metadata is None:
-        return max(1, fallback)
-    token_counts = dp_metadata.num_tokens_across_dp_cpu
-    counts = token_counts.flatten().tolist()
-    # Expand DP-level counts to AFD-level when TP > 1.
-    # num_tokens_across_dp_cpu has dp_size entries, but attention_size
-    # = num_attention_ranks includes TP workers.  Each DP rank's count
-    # is replicated tp_size times.
-    if len(counts) < attention_size and attention_size % len(counts) == 0:
-        tp_size = attention_size // len(counts)
-        counts = [counts[i // tp_size] for i in range(attention_size)]
-    if len(counts) < attention_size:
-        return max(1, fallback)
-    if attention_size >= ffn_size and attention_size % ffn_size == 0:
-        group_size = attention_size // ffn_size
-        start_idx = ffn_rank * group_size
-        end_idx = start_idx + group_size
-        return max(1, sum(counts[start_idx:end_idx]))
-    return max(1, fallback)
+
+    return {
+        int(stage_idx): tuple(
+            int(count) for count in metadata.num_tokens_across_dp_cpu.flatten().tolist()
+        )
+        for stage_idx, metadata in dp_metadata_list.items()
+    }
 
 
 def _get_group_ep(
@@ -982,7 +1190,13 @@ def _register_camp2p_custom_ops() -> None:
         transfer_state = getattr(get_forward_context(), "cam_afdtransfer_state", None)
         if transfer_state is None:
             transfer_state = CAMP2PTransferState()
-        transfer_state.batch_size = batch_size
+        # This implementation runs once per step with the tensor the compiled
+        # forward produced, while ``batch_size`` is the value the traced Python
+        # passed and stays frozen at the shape that trace saw. Sizing the transfer
+        # from the traced value makes a step whose rows differ from it write too few
+        # rows, and A2E then reads this rank's scales and activations as ids on the
+        # FFN side. The payload's own row count is the step's row count.
+        transfer_state.batch_size = int(hidden_states.shape[0])
         transfer_state.h = hidden_size
         transfer_state.k = topk
         transfer_state.aiv_num = aiv_num
@@ -1044,22 +1258,44 @@ def _register_camp2p_custom_ops() -> None:
         world_rank: int,
         aiv_num: int,
     ) -> torch.Tensor:
-        transfer_state = getattr(get_forward_context(), "cam_afdtransfer_state", None)
-        if transfer_state is None or transfer_state.atten_batch_size is None:
-            raise RuntimeError("CAMP2P Attention side is missing A2E handle data")
-        transfer_state.batch_size = batch_size
+        forward_context = get_forward_context()
+        transfer_state = getattr(forward_context, "cam_afdtransfer_state", None)
+        if transfer_state is None:
+            raise RuntimeError(
+                "CAMP2P Attention side is missing connector data: the A2E send did "
+                "not run in this forward context "
+                f"(num_tokens={getattr(forward_context, 'num_tokens', None)}, "
+                f"ubatch_idx={getattr(forward_context, 'ubatch_idx', None)}, "
+                "runtime_mode="
+                f"{getattr(forward_context, 'cudagraph_runtime_mode', None)})",
+            )
+        atten_batch_size = transfer_state.atten_batch_size
+        if atten_batch_size is None:
+            # The A2E call runs in the model forward, and a graph execution path
+            # does not re-run that Python, so the per-peer row count it publishes
+            # can be missing here. The E2A kernel accepts that tensor but never
+            # reads it (``csrc/npu/ascend_kernels/e2a/op_kernel/e2a.h`` binds
+            # ``attenBatchSize`` and nothing else), so size it from the tile this
+            # rank receives instead of failing the step.
+            atten_batch_size = torch.full(
+                (max(1, -(-int(attn_size) // max(1, int(ffn_size)))),),
+                int(batch_size),
+                dtype=torch.int32,
+                device=ref_tensor.device,
+            )
+        transfer_state.batch_size = int(ref_tensor.shape[0])
         transfer_state.h = hidden_size
         transfer_state.k = topk
         transfer_state.aiv_num = aiv_num
         group_ep = _get_group_ep(
-            int(getattr(get_forward_context(), "ubatch_idx", 0)),
+            int(getattr(forward_context, "ubatch_idx", 0)),
             hccl_comm_name,
             hccl_comm_name2,
             hccl_comm_name3,
         )
         output = torch.ops.afd_ascend.e2a(
             ref_tensor,
-            transfer_state.atten_batch_size,
+            atten_batch_size,
             transfer_state.batch_size,
             transfer_state.h,
             transfer_state.k,

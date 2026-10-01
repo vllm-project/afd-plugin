@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -201,6 +203,22 @@ def test_make_ffn_graph_key_dp1_tp1_unchanged():
         fallback=32,
     )
     assert key == ((0, (8,)),)
+
+
+def test_make_ffn_graph_key_uses_the_shared_fallback_without_counts():
+    """A step without usable counts keys by the fallback both roles size by."""
+
+    metadata = SimpleNamespace(num_tokens_across_dp_cpu=[])
+
+    key = make_ffn_graph_key(
+        {0: metadata},
+        attention_size=4,
+        ffn_size=2,
+        fallback=64,
+    )
+
+    # No counts: two tiles of the 64-row fallback per FFN rank.
+    assert key == ((0, (128, 128)),)
 
 
 @pytest.mark.parametrize(

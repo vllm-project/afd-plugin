@@ -12,7 +12,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from afd_plugin.a2e_layout import ffn_receive_rows
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -107,26 +109,29 @@ def make_ffn_graph_key(
     attention_size: int | None = None,
     ffn_size: int | None = None,
     fallback: int = 1,
-) -> tuple[tuple[int, tuple]]:
+) -> tuple[tuple[int, tuple], ...]:
     """Extract the AFD FFN graph hashable key from DP metadata."""
 
+    attention_ranks = 0 if attention_size is None else int(attention_size)
+    ffn_ranks = 0 if ffn_size is None else int(ffn_size)
+    aggregated = _use_ffn_aggregated_key(attention_size, ffn_size)
     key_parts: list[tuple[int, tuple]] = []
     for stage_idx, metadata in sorted(dp_metadata_list.items()):
         values = getattr(metadata, "num_tokens_across_dp_cpu", None)
         if values is None:
-            if _use_ffn_aggregated_key(attention_size, ffn_size):
-                values_tuple = tuple(
-                    max(1, int(fallback)) for _ in range(int(ffn_size))
+            if aggregated:
+                values_tuple: tuple = tuple(
+                    max(1, int(fallback)) for _ in range(ffn_ranks)
                 )
             else:
                 values_tuple = (repr(metadata),)
         else:
             values_tuple = _metadata_values_tuple(values)
-            if _use_ffn_aggregated_key(attention_size, ffn_size):
+            if aggregated:
                 values_tuple = _aggregate_ffn_values_tuple(
                     values_tuple,
-                    attention_size=int(attention_size),
-                    ffn_size=int(ffn_size),
+                    attention_size=attention_ranks,
+                    ffn_size=ffn_ranks,
                     fallback=int(fallback),
                 )
         key_parts.append((int(stage_idx), values_tuple))
@@ -151,15 +156,17 @@ def graph_run_mode(
 
 
 def _metadata_values_tuple(values: object) -> tuple[int, ...]:
+    items: Any = values
     tolist = getattr(values, "tolist", None)
+    item = getattr(values, "item", None)
     if callable(tolist):
-        values = tolist()
-    elif hasattr(values, "item"):
-        values = [values.item()]
+        items = tolist()
+    elif callable(item):
+        items = [item()]
     try:
-        return tuple(int(value) for value in values)
+        return tuple(int(value) for value in items)
     except TypeError:
-        return (int(values),)
+        return (int(items),)
 
 
 def _use_ffn_aggregated_key(
@@ -181,21 +188,21 @@ def _aggregate_ffn_values_tuple(
     ffn_size: int,
     fallback: int,
 ) -> tuple[int, ...]:
-    # Expand DP-level values to AFD-level when TP > 1.
-    # With TP > 1, attention_size = num_attention_ranks includes TP workers
-    # but values only has dp_size entries (from num_tokens_across_dp_cpu).
-    # Each DP rank's count is replicated tp_size times because all TP workers
-    # within the same DP rank process the same tokens.
-    expanded = values
-    if len(values) < attention_size and attention_size % len(values) == 0:
-        tp_size = attention_size // len(values)
-        expanded = tuple(values[i // tp_size] for i in range(attention_size))
-    if len(expanded) < attention_size:
-        return tuple(max(1, int(fallback)) for _ in range(ffn_size))
-    group_size = attention_size // ffn_size
+    # Only the AFD NPU runners pass the role sizes, so this branch describes the
+    # A2E tile layout: every FFN rank receives ``attention_size // ffn_size`` tiles
+    # of the largest count in its (strided) Attention peer group. The key has to
+    # match the rows the transfer actually delivers, because a key built from the
+    # real counts would send an uneven step to eager execution with a tile A2E
+    # cannot represent.
     return tuple(
-        max(1, sum(expanded[idx * group_size : (idx + 1) * group_size]))
-        for idx in range(ffn_size)
+        ffn_receive_rows(
+            values,
+            ffn_rank,
+            attention_size=int(attention_size),
+            ffn_size=int(ffn_size),
+            fallback=int(fallback),
+        )
+        for ffn_rank in range(max(1, int(ffn_size)))
     )
 
 
