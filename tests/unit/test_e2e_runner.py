@@ -447,6 +447,7 @@ def _args() -> argparse.Namespace:
         gsm8k_output_path="/tmp/gsm8k-results",
         completion_output_path="/tmp/dsv4-completions.json",
         use_v2_model_runner=False,
+        attention_data_parallel_address=None,
     )
 
 
@@ -570,6 +571,83 @@ def test_async_cam_scenario_builds_dp1tp2_attention_and_dp2tp1_ffn():
     assert attention_config["compute_gate_on_attention"] is True
     assert attention_config["connector_extra_config"]["attn_ranks_per_dp"] == 2
     assert "--enable-expert-parallel" in ffn_command
+
+
+def test_pinned_attention_dp_address_is_emitted_once_on_attention_only():
+    """A scenario-pinned DP address reaches Attention alone, exactly once."""
+    args = _args()
+    runner.configure_scenario(args)
+    args.attention_data_parallel_address = "192.0.2.1"
+
+    attention_command = runner.build_vllm_command(args, role="attention")
+    ffn_command = runner.build_vllm_command(args, role="ffn")
+
+    assert attention_command.count("--data-parallel-address") == 1
+    address_index = attention_command.index("--data-parallel-address") + 1
+    assert attention_command[address_index] == "192.0.2.1"
+    assert "--data-parallel-address" not in ffn_command
+
+
+def test_configure_scenario_pins_no_attention_dp_address_by_default():
+    args = _args()
+    runner.configure_scenario(args)
+
+    assert args.attention_data_parallel_address is None
+    command = runner.build_vllm_command(args, role="attention")
+    assert "--data-parallel-address" not in command
+
+
+@pytest.mark.parametrize(
+    ("scenario", "evaluator"),
+    [
+        ("afd-eager-async-cam", "run_completion_evaluation"),
+        (
+            "afd-dsv4-flash-async-cam-dp2tp4-ep8",
+            "run_concurrent_completion_evaluation",
+        ),
+        ("afd-graph-2a2f", "run_gsm8k_evaluation"),
+    ],
+)
+def test_run_scenario_evaluation_routes_to_the_scenario_evaluator(
+    monkeypatch,
+    scenario,
+    evaluator,
+):
+    """Both runners share this mapping, so a new evaluator reaches both."""
+    called: list[str] = []
+    for name in (
+        "run_completion_evaluation",
+        "run_concurrent_completion_evaluation",
+        "run_gsm8k_evaluation",
+    ):
+        monkeypatch.setattr(
+            runner,
+            name,
+            lambda _args, name=name: called.append(name),
+        )
+    args = _args()
+    args.scenario = scenario
+
+    runner.run_scenario_evaluation(args)
+
+    assert called == [evaluator]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "timeout_s"),
+    [
+        (
+            "afd-dsv4-flash-async-cam-dp2tp4-ep8",
+            runner.DSV4_PROCESS_TERMINATION_TIMEOUT_S,
+        ),
+        ("afd-graph-2a2f", runner.PROCESS_TERMINATION_TIMEOUT_S),
+    ],
+)
+def test_process_termination_timeout_follows_the_scenario(scenario, timeout_s):
+    args = _args()
+    args.scenario = scenario
+
+    assert runner.process_termination_timeout(args) == timeout_s
 
 
 def test_async_ubatch_scenario_enforces_token_split_moe_ubatching():
