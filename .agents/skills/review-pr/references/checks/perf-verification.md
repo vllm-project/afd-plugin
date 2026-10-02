@@ -11,7 +11,7 @@ Accept a claim only with base and head runs that hold constant:
 - Hardware pool and placement (CI presets: `l4_1`–`l4_4`, `h100_4`; NPU:
   documented manual environment per `docs/npu/TESTING.md`).
 - Container image and dependency versions (CI image pins
-  `VLLM_BASE_TAG=v0.26.0`).
+  `VLLM_BASE_TAG` from the frozen target).
 - Workload and datasets (`tools/benchmarks/decode_bench.py` or the named E2E
   scenario; GSM8K-7 for accuracy gates).
 - Graph/eager mode, DBO on/off, ubatching mode, and topology (2A2F/2A1F,

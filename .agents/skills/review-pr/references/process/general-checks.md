@@ -19,8 +19,8 @@ vLLM engine/config ingress (--additional-config {"afd": ...})
 - Cover the matrix the change can affect: GPU/NPU, graph/eager, DBO on/off,
   2A2F/2A1F, runner V1/V2, colocation/disaggregation, AFD-on/AFD-off.
 - Patched or wrapper code must be transparent when AFD is inactive
-  (`is_afd_active` false): a non-AFD request must keep upstream vLLM 0.26.0
-  behavior exactly.
+  (`is_afd_active` false): a non-AFD request must preserve behavior at the target's pinned upstream
+  version exactly.
 - Search bounded callers and sibling implementations (the GPU vs NPU twin of
   every worker/model file) rather than assuming the changed hunk is the only
   path; the two platforms drift independently.
@@ -40,9 +40,11 @@ rules, not style nits:
    New mutable globals require approval and must be justified in the PR.
 5. Do not split simple functions into helper layers; extract only for real
    complexity, real duplication, or an established local pattern.
-6. Keep imports CPU-safe at module level: importing `afd_plugin` (or any unit
-   test module) must not import torch, torch_npu, or vLLM runtime modules.
-   Defer or `importorskip` them inside functions/tests.
+6. Keep plugin registration and the CPU-selected test lane import-safe.
+   Inspect the target's lazy exports, collection hooks, and runtime guards;
+   defer optional runtime imports or skip them as required by that lane.
+   Runtime-only modules may import their declared dependencies: prove that a
+   changed import reaches a CPU-only boundary before reporting a defect.
 7. New public behavior needs a named owner for its design page and a docs
    impact statement in the PR template.
 8. Performance-affecting changes need a comparable A/B claim or an explicit
@@ -54,7 +56,7 @@ rules, not style nits:
 | --- | --- |
 | Correctness | A reachable input reaches the changed code and produces wrong output, a hang, or a crash. |
 | Patch-contract drift | A patched function's signature, return type, or upstream copy diverges from the pinned ref, or missing/incorrect `# ### PATCH` markers, `Patch reason`/`Patch functionality` comments, or `# Upstream source:` pointers break upgrade comparability. |
-| Version/compat | The change breaks the vLLM 0.26.0 / vLLM-Ascend `80d8c194f` contract, or moves a pin without updating the version gate, docker base, docs, and design pages together. |
+| Version/compat | The change breaks the target's pinned vLLM / vLLM-Ascend contract, or moves a pin without updating the version gate, docker base, docs, and design pages together. |
 | Platform divergence | The GPU or NPU twin (worker/runner/model variant) is not updated and the change is not provably platform-neutral. |
 | CPU-safe imports | A new module-level import of torch/torch_npu/vLLM runtime breaks `pytest -m "not gpu and not vllm_runtime"` or plugin import on a CPU host. |
 | Concurrency/async | Async-DP busy loops, ubatching state machines, DBO yield, or connector transfer states can deadlock, drop, reorder, or leak work items on abort/timeout. |
