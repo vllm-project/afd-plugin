@@ -16,7 +16,7 @@ mechanics ([compat-patches.md](compat-patches.md)) or worker internals
 - Keep one owner for attention→FFN routing; models and workers must not
   independently select a route or a peer.
 - Keep the async-DP patches externally transparent: non-AFD requests observe
-  upstream vLLM 0.26.0 scheduling, output order, and finish semantics
+  the pinned upstream vLLM scheduling, output order, and finish semantics
   unchanged, on both `EngineCoreProc` and `DPEngineCoreProc` paths.
 - Preserve request identity and ordering across the two roles; correlate every
   connector result, ubatch work item, and DBO yield to the originating

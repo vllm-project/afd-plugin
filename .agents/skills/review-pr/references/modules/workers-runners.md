@@ -16,9 +16,9 @@ model wrappers ([model-integration.md](model-integration.md)).
   fails fast on scheduler-driven calls; attention-side runners never construct
   FFN components and vice versa.
 - Keep runner V1/V2 in pairs: a change to shared runner behavior lands in both
-  variants or states the exclusion; GPU keeps V2 gated off
-  (`VLLM_USE_V2_MODEL_RUNNER=0` required) while NPU V2 exists — flag any change
-  that silently moves that gate.
+  variants or states the exclusion. Resolve GPU/NPU V1/V2 support from the
+  target's feature validation and E2E scenarios; a gate from an older release
+  is not evidence that the reviewed target forbids the combination.
 - Enforce the patch contract on every patched runner method (the NPU
   attention model runner is the heaviest patch site): marked AFD differences,
   upstream-copy fidelity against the pinned ref, identical signatures.

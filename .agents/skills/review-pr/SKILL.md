@@ -1,6 +1,6 @@
 ---
 name: review-pr
-description: Review pull requests and local branches for vllm-project/afd-plugin with a frozen snapshot, module-design ownership, feature overlays, patch-contract enforcement, targeted validation, and concise evidence-backed findings. Use for default, detailed, or repeat reviews; checking correctness, NPU/GPU compatibility, vLLM 0.26.0 patch discipline, connectors, distributed topology, workers and model runners, tests, benchmarks, or model-family additions; and identifying or explicitly requesting code-owner reviewers. Use run-e2e instead to execute E2E suites, and AGENTS.md for authoring rules.
+description: Review pull requests and local branches for vllm-project/afd-plugin with a frozen snapshot, module-design ownership, feature overlays, patch-contract enforcement, targeted validation, and concise evidence-backed findings. Use for default, detailed, or repeat reviews; checking correctness, NPU/GPU compatibility, pinned-upstream patch discipline, connectors, distributed topology, workers and model runners, tests, benchmarks, or model-family additions; and identifying or explicitly requesting code-owner reviewers. Use run-e2e instead to execute E2E suites, and AGENTS.md for authoring rules.
 ---
 
 # Review AFD Plugin Pull Requests
@@ -8,6 +8,17 @@ description: Review pull requests and local branches for vllm-project/afd-plugin
 Review like a maintainer: direct, selective, and focused on issues that CI does
 not prove. Prefer a few high-confidence findings over exhaustive commentary.
 Zero findings is a valid result.
+
+## Target-version evidence
+
+Resolve version-sensitive rules from the frozen target: read
+`afd_plugin/compat/vllm.py`, `docker/Dockerfile.ci`, Python/package metadata,
+Ascend patch provenance, CI commands, pytest markers, and relevant fixtures.
+Version literals in these references describe the baseline they were written
+against; they are not permanent pins for newer or older branches. Compare
+patches to the target's actual upstream ref, preserve AFD-off behavior, and
+verify coordinated pin changes. Do not treat a draft module proposal or a
+hardware-unavailable test as a proved blocker or passing validation.
 
 ## Quality contract
 
@@ -97,6 +108,15 @@ drift.
 | --- | --- |
 | [delivery-style.md](references/delivery/delivery-style.md) | Findings are ready for concise maintainer-style delivery. |
 | [review-requests.md](references/delivery/review-requests.md) | The user asks to identify, suggest, request, or ping code-owner reviewers. |
+
+## Optional review workers
+
+For independent defect discovery on a large diff, or when the user selects
+`auto`, `codex`, `claude`, or `none`, read
+[reviewer-backends.md](references/process/reviewer-backends.md). Pass immutable
+base/head SHAs and a bounded read-only scope. The parent owns domain routing,
+verification, deduplication, severity, and any separately authorized posting.
+Missing optional tooling falls back to direct review without blocking it.
 
 ## Workflow
 
