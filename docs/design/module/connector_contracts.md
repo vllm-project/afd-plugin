@@ -9,15 +9,19 @@ primary_code_paths:
   - "afd_plugin/connectors/**/*.py"
   - "afd_plugin/connectors/npu/bin/**"
   - "afd_plugin/distributed/**/*.py"
+  - "afd_plugin/a2e_layout.py"
 related_code_paths:
   - "afd_plugin/v1/worker/**"
   - "afd_plugin/model_executor/**"
   - "afd_plugin/compat/npu/ops.py"
+  - "afd_plugin/compat/patches/npu/hash_ids_alignment.py"
 depends_on:
   - "plugin_boundary.md"
   - "execution_platforms.md"
 validation_paths:
   - "tests/unit/connectors/**"
+  - "tests/unit/test_a2e_layout.py"
+  - "tests/unit/compat/patches/test_hash_ids_alignment.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
@@ -25,6 +29,8 @@ upstream_refs:
   - "vLLM vllm.forward_context.DPMetadata"
   - "vLLM vllm.distributed.parallel_state"
   - "PyTorch torch.distributed process-group APIs used by the pinned runtime"
+  - "vLLM-Ascend 80d8c194f vllm_ascend.ops.fused_moe.experts_selector._select_experts_with_fusion_ops"
+  - "vLLM-Ascend 80d8c194f vllm_ascend.ascend_forward_context.flash_comm_v1_enabled"
 verified_platform_refs:
   - "P2pNcclAFDConnector GPU unit and E2E paths"
   - "CAMP2pAFDConnector and CAMAsyncAFDConnector Ascend unit and E2E paths"
@@ -34,7 +40,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-08-27
+last_reviewed: 2026-09-22
 ---
 
 # Connector contracts
@@ -126,7 +132,9 @@ have independent stable ownership.
 `AFDConnectorBase` defines the lifecycle and data-plane shape below. Its
 `control_plane: AFDControlPlane | None` attribute is the explicit runtime
 selector: synchronous connectors install a control-plane object during
-construction, while CAM async leaves it as `None`.
+construction, while CAM async leaves it as `None`. Its `attn_size` and `ffn_size`
+attributes describe the transfer layout the concrete connector owns, including
+how many Attention peers one FFN rank has.
 
 | Surface | Caller and current responsibility |
 | --- | --- |
@@ -153,6 +161,24 @@ FFN daemon and a connector-side expert-selection path. Those methods are not
 part of the current abstract base and remain **draft**. Issue
 [#107](https://github.com/JiusiServe/afd-plugin/issues/107) completed the
 control-plane separation but did not establish a public work-item protocol.
+
+## A2E tile layout
+
+`afd_plugin/a2e_layout.py` is the one place that derives the tile an A2E transfer
+moves. The host-side operators pair an FFN rank with strided Attention peers
+(`r, r + ffn_size, ...`) and read one equal tile per peer in both directions, so
+the row count a peer writes, the rows the FFN rank reads per peer, and the rows
+it computes on are one number, derived from `num_tokens_across_dp_cpu` and one
+shared fallback. The connector, the NPU FFN runner, and the CPU-safe graph-key
+helper all call the same helpers, so a change to the layout cannot leave the
+send, the receive, and the graph key disagreeing.
+
+The ids channel that rides with the transfer carries token ids the FFN role's
+router indexes its token-to-expert table with, so the rows it delivers have to be
+the rows the router sees. `afd_plugin/compat/patches/npu/hash_ids_alignment.py`
+patches the pinned vLLM-Ascend fused selector to keep ids that already describe
+every router row instead of re-aligning them to a sequence-parallel layout the
+FFN role does not use.
 
 ## Payload and metadata ownership
 
@@ -291,6 +317,11 @@ resources.
   CAM async instead exposes connector-driven work-item methods.
 - FFN daemon loop failures are propagated by the owning runtime; connectors do
   not swallow compute or communication errors.
+- A compiled forward runs the connector's Python once, at trace time, so anything
+  the transfer size depends on has to come from the tensor the call carries or
+  from state the runtime refreshes per step. The operator implementations size
+  the transfer from the payload they are given; a step whose tile the layout
+  cannot represent fails on the host with both row counts rather than on device.
 - Partial initialization must remain closeable. Connector changes must test
   cleanup and retry/reinitialization behavior appropriate to their backend.
 
@@ -302,6 +333,13 @@ The following RFC candidates are non-normative while this document is draft:
   than serialized vLLM-internal metadata objects.
 - `XFER-INV-002`: a transfer is identified by layer, stage, and token layout;
   its receive-owned backend state remains associated with the matching send.
+- `XFER-INV-003`: the Attention peers of one FFN rank write one tile each, of the
+  same row count, and the FFN rank reads exactly those rows from every peer. A
+  peer that writes fewer rows does not shorten the receive: the operator reads
+  past its payload, into its scales and then its activations. A compiled step
+  cannot pad its payload, so the layout has to keep the peers' row counts equal
+  before the transfer, and eager steps fail fast on a step the layout cannot
+  represent.
 - `LIFE-INV-001`: connector initialization and cleanup own all connector-created
   communication resources and do not transfer that lifetime to model code.
 - `CAP-INV-001`: runtimes choose control-driven or connector-driven FFN steps

@@ -29,6 +29,10 @@ repos:
     rev: v1.49.0
     hooks:
       - id: typos
+        # Copied upstream patch bodies keep upstream spelling, and one of them
+        # names a local variable with a spelling this checker rejects. The mypy
+        # wrapper excludes the same tree for the same reason.
+        exclude: ^afd_plugin/compat/patches/
 
   - repo: https://github.com/rhysd/actionlint
     # v1.7.8+ sets `go 1.24.0` in go.mod, which older Go toolchains (and most

@@ -32,8 +32,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+
 _STUB_MODULES = (
     "vllm",
+    "vllm.config",
     "vllm.forward_context",
     "vllm.logger",
     "vllm.utils",
@@ -73,6 +75,10 @@ def _vllm_stub() -> Iterator[None]:
 
     make("vllm")
     make(
+        "vllm.config",
+        CUDAGraphMode=type("CUDAGraphMode", (), {"FULL": "FULL", "NONE": "NONE"}),
+    )
+    make(
         "vllm.forward_context",
         DPMetadata=type("DPMetadata", (), {}),
         get_forward_context=lambda: None,
@@ -103,6 +109,7 @@ def _vllm_stub() -> Iterator[None]:
 with _vllm_stub():
     from afd_plugin.config import AFDConfig
     from afd_plugin.connectors.metadata import (
+        AFDControlPayload,
         AFDTransferContext,
         AFDTransferMetadata,
     )
@@ -156,6 +163,7 @@ def _vllm_config() -> SimpleNamespace:
                 num_experts_per_tok=2,
                 n_routed_experts=4,
                 n_shared_experts=0,
+                vocab_size=256,
             ),
         ),
     )
@@ -186,6 +194,26 @@ def _connector(*, role: str, rank: int) -> CAMP2pAFDConnector:
     connector.hccl_comm_name3 = ""
     connector.hccl_comm_name1 = "moe"
     return connector
+
+
+def _publish_dp_metadata(
+    connector: CAMP2pAFDConnector,
+    dp_metadata_list: dict[int, _FakeDPMetadata],
+) -> None:
+    """Publish DP metadata the way the control plane does.
+
+    The connector derives its A2E tile from an integer snapshot that the control
+    plane takes when it publishes a payload, so a test that wants a connector to
+    know the counts has to go through the same path.
+    """
+
+    connector.control_plane.update_state_from_dp_metadata(
+        AFDControlPayload(
+            dp_metadata_list=dp_metadata_list,
+            is_graph_capturing=False,
+            is_warmup=False,
+        ),
+    )
 
 
 def test_prepare_token_id_transfer_replicates_ids_across_columns():
@@ -228,7 +256,8 @@ def test_received_token_ids_collapses_replicated_columns():
 
 
 def test_received_token_ids_trims_operator_padded_capacity():
-    # The operator works on a padded capacity, so extra trailing rows are normal.
+    # The operator sizes its output to the capacity it was given rather than to
+    # the rows it writes, so extra trailing rows are normal.
     sent_ids, _ = prepare_token_id_transfer(
         torch.tensor([7, 11, 13, 99, 99], dtype=torch.int32),
         topk=2,
@@ -240,16 +269,15 @@ def test_received_token_ids_trims_operator_padded_capacity():
     assert received.tolist() == [7, 11, 13]
 
 
-def test_received_token_ids_rejects_alignment_shortfall():
-    """Misaligned ids must fail loudly rather than route the wrong tokens."""
+def test_received_token_ids_rejects_capacity_below_the_ffn_rows():
     sent_ids, _ = prepare_token_id_transfer(
         torch.tensor([7, 11], dtype=torch.int32),
         topk=2,
         expected_tokens=2,
     )
 
-    with pytest.raises(ValueError, match="not aligned with the FFN token layout"):
-        received_token_ids(sent_ids, expected_tokens=5)
+    with pytest.raises(ValueError, match="not sized for this topology"):
+        received_token_ids(sent_ids, expected_tokens=3)
 
 
 def test_send_attn_output_selects_the_operator_ids_mode(monkeypatch):
@@ -313,23 +341,17 @@ def test_recv_attn_output_mode_and_ids_follow_the_receiver_declaration(monkeypat
 
     calls: list[tuple[Any, ...]] = []
 
-    def fake_a2e(*args: Any) -> tuple[Any, ...]:
-        calls.append(args)
-        tokens, topk = int(args[3]), int(args[5])
-        ids = (
-            torch.arange(tokens, dtype=torch.int32)
-            .mul(10)
-            .unsqueeze(1)
-            .expand(tokens, topk)
-            .contiguous()
-        )
-        return ("hidden", ids, None, "atten-batch", "active-mask")
-
-    monkeypatch.setattr(torch.ops.afd_ascend, "a2e", fake_a2e, raising=False)
+    monkeypatch.setattr(
+        torch.ops.afd_ascend,
+        "a2e",
+        _a2e_recording(calls, scale=10),
+        raising=False,
+    )
     monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
     connector = _connector(role="ffn", rank=1)
-    # FFN rank 1 owns attention ranks 2 and 3, so it computes on 5 + 7 tokens.
-    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 5, 7])}
+    # FFN rank 1 owns attention ranks 1 and 3, so it computes on 6 + 6 tokens.
+    # A2E lays those out as two equal tiles, so the peers have to agree.
+    _publish_dp_metadata(connector, {0: _FakeDPMetadata([2, 3, 6, 6])})
 
     with_ids = connector.recv_attn_output(
         ubatch_idx=0,
@@ -360,3 +382,261 @@ def test_recv_attn_output_mode_and_ids_follow_the_receiver_declaration(monkeypat
     ]
     assert calls[1][-1] == 0
     assert without_ids.input_ids is None
+
+
+def _a2e_recording(calls: list[tuple[Any, ...]], *, scale: int = 1) -> Any:
+    """Build an operator stub that records its arguments and returns ids.
+
+    The stub sizes the ids to the token count the receiver asked for, which is
+    what the real operator's ``compute_gate`` mode does.
+    """
+
+    def fake_a2e(*args: Any) -> tuple[Any, ...]:
+        calls.append(args)
+        tokens, topk = int(args[3]), int(args[5])
+        ids = (
+            torch.arange(tokens, dtype=torch.int32)
+            .mul(scale)
+            .unsqueeze(1)
+            .expand(tokens, topk)
+            .contiguous()
+        )
+        return ("hidden", ids, None, "atten-batch", "active-mask")
+
+    return fake_a2e
+
+
+def _a2e_returning_ids(*, first_id: int) -> Any:
+    """Build an operator stub whose id column starts at ``first_id``."""
+
+    def fake_a2e(*args: Any) -> tuple[Any, ...]:
+        tokens, topk = int(args[3]), int(args[5])
+        ids = (
+            (torch.arange(tokens, dtype=torch.int32) + first_id)
+            .unsqueeze(1)
+            .expand(tokens, topk)
+            .contiguous()
+        )
+        return ("hidden", ids, None, "atten-batch", "active-mask")
+
+    return fake_a2e
+
+
+def test_recv_attn_output_sizes_uneven_attention_peers_by_the_padded_tile(monkeypatch):
+    """Uneven peers are padded, so the receiver asks for whole tiles.
+
+    A2E reads one equal tile per Attention peer, and the Attention side pads every
+    peer of an FFN rank up to the largest count of its peer group. FFN rank 1
+    serves Attention ranks 1 and 3, which hold 3 and 7 tokens here, so both peers
+    write 7 rows and the receiver reads two of those tiles.
+    """
+
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        torch.ops.afd_ascend,
+        "a2e",
+        _a2e_recording(calls),
+        raising=False,
+    )
+    monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
+    connector = _connector(role="ffn", rank=1)
+    _publish_dp_metadata(connector, {0: _FakeDPMetadata([2, 3, 5, 7])})
+
+    payload = connector.recv_attn_output(ubatch_idx=0, layer_idx=0, recv_input_ids=True)
+
+    assert calls[0][3] == 14
+    assert payload.input_ids is not None
+    assert payload.input_ids.numel() == 14
+
+
+def test_recv_attn_output_follows_the_strided_attention_peer_group(monkeypatch):
+    """The peer group is the kernel's, not a contiguous block of ranks.
+
+    A2E pairs FFN rank ``r`` with Attention ranks ``r, r + ffn_size, ...``, so with
+    four Attention ranks FFN rank 0 owns ranks 0 and 2. Those hold 4 and 16 tokens
+    here, while the contiguous block {0, 1} that the P2P rank mapping builds holds
+    4 and 8; sizing the transfer with the contiguous block would read 16 rows where
+    the peers wrote 32.
+    """
+
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        torch.ops.afd_ascend,
+        "a2e",
+        _a2e_recording(calls),
+        raising=False,
+    )
+    monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
+    connector = _connector(role="ffn", rank=0)
+    _publish_dp_metadata(connector, {0: _FakeDPMetadata([4, 8, 16, 16])})
+
+    connector.recv_attn_output(ubatch_idx=0, layer_idx=0, recv_input_ids=True)
+
+    assert calls[0][3] == 32
+
+
+def _eager_forward_context(*, num_tokens: int) -> SimpleNamespace:
+    """Build the forward-context fields an eager step exposes."""
+
+    return SimpleNamespace(
+        num_tokens=num_tokens,
+        ubatch_slices=None,
+        cudagraph_runtime_mode="NONE",
+    )
+
+
+def test_send_attn_output_pads_uneven_peers_to_the_group_tile(monkeypatch):
+    """Uneven DP peers need padding, and the peer group is the kernel's.
+
+    A2E reads one equal tile per Attention peer, so the peers of this rank's FFN
+    rank have to write the same row count. Attention rank 0 shares FFN rank 0 with
+    attention rank 2, which holds 16 tokens here while this rank holds 4; the
+    contiguous block {0, 1} that the P2P rank mapping builds would pad only to 8.
+    """
+
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_camp2p_send_attn_output",
+        lambda *args: calls.append(args),
+        raising=False,
+    )
+    forward_context = _eager_forward_context(num_tokens=4)
+    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
+    connector = _connector(role="attention", rank=0)
+    _publish_dp_metadata(connector, {0: _FakeDPMetadata([4, 8, 16, 16])})
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=0,
+            seq_len=4,
+        ),
+    )
+
+    connector.send_attn_output(
+        torch.zeros(4, connector.hidden_size),
+        context,
+        input_ids=torch.tensor([7, 11, 13, 17], dtype=torch.int64),
+    )
+
+    (args,) = calls
+    sent_hidden_states, expert_ids = args[0], args[-2]
+    assert tuple(sent_hidden_states.shape) == (16, connector.hidden_size)
+    assert args[4] == 16
+    assert expert_ids[:4, 0].tolist() == [7, 11, 13, 17]
+    assert expert_ids[4:, 0].tolist() == [-1] * 12
+    assert forward_context.cam_afdtransfer_state.padded_payload is True
+
+
+def test_send_attn_output_keeps_an_even_payload(monkeypatch):
+    """An even peer group writes the produced rows, so nothing is copied."""
+
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_camp2p_send_attn_output",
+        lambda *args: calls.append(args),
+        raising=False,
+    )
+    forward_context = _eager_forward_context(num_tokens=16)
+    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
+    connector = _connector(role="attention", rank=0)
+    _publish_dp_metadata(connector, {0: _FakeDPMetadata([16, 16, 16, 16])})
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=0,
+            seq_len=16,
+        ),
+    )
+    payload = torch.zeros(16, connector.hidden_size)
+
+    connector.send_attn_output(payload, context)
+
+    (args,) = calls
+    assert args[0] is payload
+    assert args[4] == 16
+    assert forward_context.cam_afdtransfer_state.padded_payload is False
+
+
+def test_send_attn_output_keeps_a_large_payload_outside_a_full_graph(monkeypatch):
+    """Only a padded FULL graph reports one token count for every rank.
+
+    Outside it the forward context's own ``num_tokens`` does not describe this
+    forward's payload (a prefill step carries many more rows than a decode-sized
+    value), so resizing the payload to it would drop real tokens.
+    """
+
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_camp2p_send_attn_output",
+        lambda *args: calls.append(args),
+        raising=False,
+    )
+    forward_context = SimpleNamespace(
+        num_tokens=16,
+        ubatch_slices=None,
+        cudagraph_runtime_mode="NONE",
+    )
+    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
+    connector = _connector(role="attention", rank=0)
+    payload = torch.zeros(64, connector.hidden_size)
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=0,
+            seq_len=64,
+        ),
+    )
+
+    connector.send_attn_output(
+        payload,
+        context,
+        input_ids=torch.arange(64, dtype=torch.int64),
+    )
+
+    (args,) = calls
+    sent_hidden_states, expert_ids = args[0], args[-2]
+    assert tuple(sent_hidden_states.shape) == (64, connector.hidden_size)
+    assert args[4] == 64
+    assert tuple(expert_ids.shape) == (64, connector.num_experts_per_tok)
+    assert forward_context.cam_afdtransfer_state.padded_payload is False
+
+
+def test_recv_ffn_output_trims_a_padded_tile_back_to_the_model_rows(monkeypatch):
+    """A padded send returns a padded tile, so the model keeps its own rows."""
+
+    forward_context = SimpleNamespace()
+    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
+    connector = _connector(role="attention", rank=0)
+    forward_context.cam_afdtransfer_state = camp2p_module.CAMP2PTransferState(
+        aiv_num=connector.aiv_num,
+        batch_size=8,
+        h=connector.hidden_size,
+        k=connector.num_experts_per_tok,
+        padded_payload=True,
+    )
+    received_rows: list[int] = []
+
+    def fake_recv(destination: Any, *args: Any) -> Any:
+        received_rows.append(int(destination.shape[0]))
+        return torch.arange(
+            destination.numel(),
+            dtype=torch.float32,
+        ).reshape(destination.shape)
+
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_camp2p_recv_ffn_output",
+        fake_recv,
+        raising=False,
+    )
+    ref_tensor = torch.zeros(3, connector.hidden_size)
+
+    result = connector.recv_ffn_output(ref_tensor, ubatch_idx=0)
+
+    # The operator receives the padded tile, and only the model's rows survive.
+    assert received_rows == [8]
+    assert tuple(result.shape) == (3, connector.hidden_size)
+    assert result[0, 0].item() == 0.0
