@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Patch vLLM-Ascend platform config normalization for AFD-owned DBO.
 
-Upstream source: ``vllm_ascend/platform.py`` at commit ``80d8c194f``.
+Upstream source: ``vllm_ascend/platform.py`` at commit ``8d4409d6256d8a6729140ddcc0d1889e3f96cdd6``.
 """
 
 from __future__ import annotations
@@ -16,6 +16,13 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 _ASCEND_PLATFORM_PATCH_ATTR = "_afd_plugin_ascend_platform_patch_state"
+
+
+@dataclass
+class AFDAll2AllValidation:
+    """Actual backend during one VllmConfig validation; never serialized."""
+
+    backend: str
 
 
 @dataclass(frozen=True)
@@ -54,7 +61,10 @@ def apply_afd_ascend_dbo_config_patch() -> bool:
     # backend.
     # Patch functionality: preserves upstream normalization for non-AFD configs and
     # restores AFD DBO fields plus the temporary ubatching backend after upstream
-    # normalization for AFD-enabled configs.
+    # normalization for AFD-enabled configs. The native platform pass uses the
+    # actual backend so cached Ascend config and graph filtering retain SP
+    # semantics. Temporary DeepEP is used only for vLLM's later assertion.
+    # Removal plan: remove once upstream supports connector-owned ubatching.
     # Expansion exception: upstream check_and_update_config is platform-owned
     # normalization; keep narrow original-function delegation so this patch only
     # owns the AFD DBO preservation.
@@ -63,8 +73,15 @@ def apply_afd_ascend_dbo_config_patch() -> bool:
         del cls
         # ### PATCH START: AFD DBO config preservation
         saved = _snapshot_afd_dbo_config(vllm_config)
+        # This optional field is AFD-owned, scoped to __post_init__, and removed
+        # in its finally block; upstream configuration fields remain direct.
+        validation = vllm_config.__dict__.get("_afd_all2all_validation")
+        if validation is not None:
+            vllm_config.parallel_config.all2all_backend = validation.backend
         try:
             original_check_and_update_config(vllm_config)
+            if validation is not None:
+                validation.backend = vllm_config.parallel_config.all2all_backend
         finally:
             if saved is not None:
                 _restore_afd_dbo_config(vllm_config, saved)

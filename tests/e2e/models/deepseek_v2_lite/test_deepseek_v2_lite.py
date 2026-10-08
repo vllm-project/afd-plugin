@@ -21,6 +21,8 @@ from tests.e2e.runner import (
     DEFAULT_GSM8K_SAMPLE_LIMIT,
     GSM8K_LIMIT_ENV,
     GSM8K_THRESHOLD_ENV,
+    V2_DBO_COMPARISON_SCENARIOS,
+    V2_DBO_SAMPLE_LIMIT,
     V2_SCENARIOS,
     V2_SINGLE_RANK_SCENARIOS,
 )
@@ -167,7 +169,12 @@ def _prepare_e2e_assets() -> Iterator[None]:
 def test_deepseek_v2_lite(scenario: str, tmp_path: Path) -> None:
     command = build_runner_command(scenario, tmp_path / scenario)
     env = os.environ.copy()
-    sample_limit = env.get(GSM8K_LIMIT_ENV, str(DEFAULT_GSM8K_SAMPLE_LIMIT))
+    default_limit = (
+        V2_DBO_SAMPLE_LIMIT
+        if scenario in V2_DBO_COMPARISON_SCENARIOS
+        else DEFAULT_GSM8K_SAMPLE_LIMIT
+    )
+    sample_limit = env.get(GSM8K_LIMIT_ENV, str(default_limit))
     if sample_limit != "all" and int(sample_limit) <= SMOKE_MAX_SAMPLES:
         # Model smoke gates require 2/7 or 6/24 correct; larger runs keep 0.27.
         env.setdefault(GSM8K_THRESHOLD_ENV, str(SMOKE_MIN_ACCURACY))

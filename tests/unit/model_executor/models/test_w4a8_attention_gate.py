@@ -4,12 +4,13 @@
 
 from __future__ import annotations
 
-import ast
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from tests.unit.model_executor.models.attention_gate_test_utils import (
+    load_attention_gate_moe_ffn,
+)
 
 torch = pytest.importorskip("torch")
 
@@ -19,53 +20,14 @@ torch = pytest.importorskip("torch")
 @pytest.mark.parametrize("with_bias", [False, True])
 @pytest.mark.parametrize("rows", [0, 2])
 def test_w4a8_cam_mlp_contract(monkeypatch, dynamic_eplb, per_channel, with_bias, rows):
-    # Compile the production function in isolation: importing the model module
-    # would initialize optional vLLM/Ascend dependencies on CPU test hosts.
-    source = Path(
-        "afd_plugin/model_executor/models/npu/deepseek_v2_attention_gate.py"
-    ).read_text()
-    function = next(
-        node
-        for node in ast.parse(source).body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "compute_attention_gate_moe_ffn"
-    )
-    namespace = {
-        "torch": torch,
-        "AFDF2ATransferPayload": SimpleNamespace,
-        "_gmmswigluquant_fusion_enabled": lambda: False,
-    }
-    code = ast.Module(
-        body=[
-            ast.ImportFrom(
-                module="__future__", names=[ast.alias(name="annotations")], level=0
-            ),
-            function,
-        ],
-        type_ignores=[],
-    )
-    exec(compile(ast.fix_missing_locations(code), "<cam-moe>", "exec"), namespace)
-    quant_type = SimpleNamespace(NONE="none", W8A8="w8a8", W4A8="w4a8")
-    calls = []
+    calls: list[SimpleNamespace] = []
 
-    def apply_mlp(*, mlp_compute_input):
+    def apply_mlp(*, mlp_compute_input, quant_method):
+        assert quant_method is owner.quant_method.quant_method
         calls.append(mlp_compute_input)
         return torch.ones((rows, 4), dtype=torch.bfloat16), None
 
-    modules = {
-        "vllm_ascend.ops.fused_moe.moe_mlp": SimpleNamespace(
-            unified_apply_mlp=apply_mlp
-        ),
-        "vllm_ascend.ops.fused_moe.moe_stage_contracts": SimpleNamespace(
-            MoEMlpComputeInput=SimpleNamespace, MoEWeights=SimpleNamespace
-        ),
-        "vllm_ascend.ops.fused_moe.moe_stage_params": SimpleNamespace(
-            MoEQuantParams=SimpleNamespace
-        ),
-        "vllm_ascend.quantization.quant_type": SimpleNamespace(QuantType=quant_type),
-    }
-    for name, module in modules.items():
-        monkeypatch.setitem(sys.modules, name, module)
+    compute_ffn, quant_type = load_attention_gate_moe_ffn(monkeypatch, apply_mlp)
     owner = torch.nn.Module()
     for name in ("w13_weight", "w2_weight"):
         owner.register_parameter(
@@ -94,23 +56,28 @@ def test_w4a8_cam_mlp_contract(monkeypatch, dynamic_eplb, per_channel, with_bias
     owner.quant_method = SimpleNamespace(
         quant_method=SimpleNamespace(is_per_channel_weight=per_channel)
     )
-    # The wrapper owns the clamp; do not accidentally read it from the owner.
+    owner.dynamic_eplb = dynamic_eplb
+    owner.activation = "silu"
+    # The native MoE config owns the activation contract.
     owner.swiglu_limit = None
     experts = SimpleNamespace(
         quant_type=quant_type.W4A8,
-        dynamic_eplb=dynamic_eplb,
         routed_experts=owner,
-        _shared_experts=None,
-        activation="silu",
+        shared_experts=None,
+        moe_config=SimpleNamespace(
+            swiglu_limit=10.0,
+            swiglu_alpha=1.7,
+            swiglu_beta=0.5,
+            activation_situ_beta=0.8,
+            activation_situ_linear_beta=0.3,
+        ),
     )
     layer = SimpleNamespace(
-        mlp=SimpleNamespace(
-            experts=experts, swiglu_limit=10.0, routed_scaling_factor=1.0
-        )
+        mlp=SimpleNamespace(experts=experts, routed_scaling_factor=1.0)
     )
     hidden_states = torch.ones((rows, 4), dtype=torch.int8)
     scales = torch.ones(rows)
-    output = namespace["compute_attention_gate_moe_ffn"](
+    output = compute_ffn(
         layer,
         hidden_states=hidden_states,
         group_list=torch.tensor([rows, rows]),
@@ -127,10 +94,15 @@ def test_w4a8_cam_mlp_contract(monkeypatch, dynamic_eplb, per_channel, with_bias
         return
     contract = calls[0]
     assert contract.hidden_states is hidden_states
+    assert contract.layer is owner
     assert contract.dynamic_scale is scales
     assert contract.quant.quant_type == quant_type.W4A8
     assert contract.quant.is_per_channel_weight == per_channel
     assert contract.swiglu_limit == 10.0
+    assert contract.swiglu_alpha == 1.7
+    assert contract.swiglu_beta == 0.5
+    assert contract.activation_situ_beta == 0.8
+    assert contract.activation_situ_linear_beta == 0.3
     assert contract.weights.w1[0].data_ptr() == owner.w13_weight.data_ptr()
     assert contract.weights.w2[0].data_ptr() == owner.w2_weight.data_ptr()
     assert contract.weights.w1[0].dtype == torch.int32

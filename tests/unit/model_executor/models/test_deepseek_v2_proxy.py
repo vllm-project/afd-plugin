@@ -155,12 +155,14 @@ def test_gate_proxy_sends_routing_payload(monkeypatch):
     proxy.vllm_config = object()
     proxy.config = object()
     proxy.top_k = 2
+    proxy.gate_router = object()
     hidden_states = torch.ones(1, 4)
 
     output = proxy(hidden_states)
 
     assert len(gate_calls) == 1
     assert gate_calls[0]["gate"] is proxy.gate
+    assert gate_calls[0]["gate_router"] is proxy.gate_router
     assert [event[0] for event in events] == ["send", "yield", "recv"]
     send_kwargs = events[0][3]
     assert send_kwargs["router_logits"] is router_logits
@@ -174,7 +176,7 @@ def test_remote_experts_proxy_sends_router_logits(monkeypatch):
     _install_fake_forward_context(monkeypatch, events, stage_idx=1)
     proxy = adapter.AFDAttentionFusedMoE(
         layer_idx=3,
-        is_internal_router=False,
+        external_routing=True,
     )
     hidden_states = torch.ones(1, 4)
     router_logits = torch.ones(1, 8)
@@ -187,6 +189,24 @@ def test_remote_experts_proxy_sends_router_logits(monkeypatch):
     assert context.metadata.stage_idx == 1
     assert context.states is None
     assert events[0][3]["router_logits"] is router_logits
+    assert torch.equal(output, hidden_states * 0.25)
+
+
+def test_remote_experts_proxy_without_external_routing_ships_hidden_states(
+    monkeypatch,
+):
+    events: list[tuple] = []
+    _install_fake_forward_context(monkeypatch, events, stage_idx=1)
+    proxy = adapter.AFDAttentionFusedMoE(
+        layer_idx=2,
+        external_routing=False,
+    )
+    hidden_states = torch.ones(1, 4)
+
+    output = proxy(hidden_states, hidden_states)
+
+    assert [event[0] for event in events] == ["send", "yield", "recv"]
+    assert events[0][3] == {}
     assert torch.equal(output, hidden_states * 0.25)
 
 

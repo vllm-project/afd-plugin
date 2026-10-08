@@ -17,81 +17,75 @@ from afd_plugin.model_executor.npu.async_cam_ubatching import (  # noqa: E402
 )
 
 
-def test_sp_layout_transposes_full_shards_into_stage_shards(monkeypatch):
+@pytest.mark.parametrize("tp_rank", range(4))
+def test_sp_layout_shards_stages_and_restores_global_tokens_once(monkeypatch, tp_rank):
     metadata = AsyncMoeUbatchMetadata(
         attn_metadata=[{}, {}],
-        stages=[
-            AsyncMoeStage(slice(0, 1), slice(0, 10), input_tokens=10),
-            AsyncMoeStage(slice(0, 1), slice(10, 15), input_tokens=6),
-        ],
-        parent_input_tokens=16,
+        stages=(
+            AsyncMoeStage(slice(0, 1), slice(0, 5), input_tokens=8),
+            AsyncMoeStage(slice(0, 1), slice(5, 12), input_tokens=8),
+        ),
+        parent_input_tokens=13,
         use_sequence_parallel=True,
     )
-    global_hidden = torch.arange(32, dtype=torch.float32).reshape(16, 2)
+    global_hidden = torch.arange(26, dtype=torch.float32).reshape(13, 2)
     global_residual = global_hidden + 100
-    positions = torch.arange(16)
-    scaling = torch.ones(2, 16)
-    tp_group = SimpleNamespace(world_size=2, rank_in_group=0)
-    monkeypatch.setattr(async_cam_layout, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(
+        async_cam_layout,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=4, rank_in_group=tp_rank),
+    )
+    gathered = []
+    physical_stages = [
+        torch.cat((global_hidden[:5], torch.zeros(3, 2))),
+        torch.cat((global_hidden[5:12], torch.zeros(1, 2))),
+    ]
 
-    for tp_rank, expected_positions in (
-        (0, [[0, 1, 2, 3, 4], [10, 11, 12]]),
-        (1, [[5, 6, 7, 8, 9], [13, 14, 0]]),
-    ):
-        tp_group.rank_in_group = tp_rank
-        local_slice = slice(tp_rank * 8, (tp_rank + 1) * 8)
+    def all_gather(local, token_dim):
+        assert token_dim == 0
+        stage = physical_stages[len(gathered)]
+        assert torch.equal(local, stage[tp_rank * 2 : (tp_rank + 1) * 2])
+        gathered.append(local)
+        return stage
 
-        def all_gather(tensor, token_dim):
-            assert token_dim == 0
-            assert tensor.shape[1] == 4
-            return torch.cat((global_hidden, global_residual), dim=-1)
-
-        monkeypatch.setattr(
-            async_cam_layout,
-            "tensor_model_parallel_all_gather",
-            all_gather,
+    monkeypatch.setattr(
+        async_cam_layout, "tensor_model_parallel_all_gather", all_gather
+    )
+    stage_inputs = async_cam_layout.build_async_moe_stage_inputs(
+        global_hidden,
+        global_residual,
+        torch.arange(13),
+        torch.ones(2, 13),
+        metadata,
+    )
+    assert gathered == []  # Embeddings are global; no gather is needed to stage them.
+    assert [x.tolist() for x in stage_inputs.positions] == [
+        list(range(5)),
+        list(range(5, 12)),
+    ]
+    assert [tuple(x.shape) for x in stage_inputs.llama_4_scaling] == [(2, 5), (2, 7)]
+    assert [x.shape[0] for x in stage_inputs.hidden_states] == [2, 2]
+    for hidden in stage_inputs.hidden_states:
+        dispatch = async_cam_layout.prepare_cam_dispatch_payload(
+            hidden,
+            torch.ones(2, 1),
+            torch.zeros(2, 1),
+            None,
+            use_sequence_parallel=True,
         )
-        stage_inputs = async_cam_layout.build_async_moe_stage_inputs(
-            global_hidden[local_slice],
-            global_residual[local_slice],
-            positions,
-            scaling,
-            metadata,
+        assert dispatch.hidden_states is hidden
+        assert (
+            async_cam_layout.restore_cam_dispatch_output(hidden, dispatch.layout)
+            is hidden
         )
-
-        assert [stage.tolist() for stage in stage_inputs.positions] == (
-            expected_positions
-        )
-        assert [int(stage.shape[0]) for stage in stage_inputs.hidden_states] == [
-            5,
-            3,
-        ]
-        assert [tuple(stage.shape) for stage in stage_inputs.llama_4_scaling] == [
-            (2, 5),
-            (2, 3),
-        ]
-        monkeypatch.setattr(
-            async_cam_layout,
-            "tensor_model_parallel_all_gather",
-            lambda tensor, token_dim: (
-                global_hidden[:10]
-                if int(tensor.shape[token_dim]) == 5
-                else torch.cat(
-                    (
-                        global_hidden[10:15],
-                        global_hidden.new_zeros((1, 2)),
-                    ),
-                    dim=0,
-                )
-            ),
-        )
-        restored = async_cam_layout.restore_async_moe_stage_outputs(
-            stage_inputs.hidden_states,
-            metadata,
-        )
-        expected_restored = global_hidden.clone()
-        expected_restored[15].zero_()
-        assert torch.equal(restored, expected_restored[local_slice])
+    assert gathered == []  # Remote FFN retains the model's rank-local token layout.
+    restored = async_cam_layout.restore_async_moe_stage_outputs(
+        stage_inputs.hidden_states, metadata
+    )
+    expected = global_hidden.clone()
+    expected[12].zero_()
+    assert torch.equal(restored, expected)
+    assert len(gathered) == 2
 
 
 def test_replicated_layout_removes_and_restores_parent_padding():

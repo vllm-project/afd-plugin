@@ -397,13 +397,13 @@ def model_layer(idx):
     owner = SimpleNamespace(
         **parameters,
         _parameters=parameters,
+        dynamic_eplb=False,
         quant_method=SimpleNamespace(
             quant_method=SimpleNamespace(is_per_channel_weight=True)
         ),
     )
     experts = SimpleNamespace(
         quant_type="w4a8",
-        dynamic_eplb=False,
         activation="silu",
         _shared_experts=None,
         routed_experts=owner,

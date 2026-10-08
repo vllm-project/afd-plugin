@@ -9,8 +9,6 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from vllm.forward_context import ForwardContext
-
     from afd_plugin.model_executor.models.npu.deepseek_v4 import (
         AFDDeepseekV4AttentionGateRemoteMoE,
     )
@@ -20,34 +18,11 @@ def local_hash_input_ids(
     *,
     input_ids: torch.Tensor | None,
     router_tokens: int,
-    flash_comm_v1_enabled: bool,
-    pad_size: int,
 ) -> torch.Tensor:
-    """Return the rank-local token ids that a Hash layer routes on.
+    """Validate IDs already sharded by the model alongside the routed tokens.
 
-    A DSV4 Hash layer routes by token identity rather than by router logits, so
-    the FFN rank executing that layer needs the ids of exactly the tokens it
-    computes on. On Attention the forward context carries the *global* ids while
-    FlashComm v1 shards router logits across TP ranks, so the global vector must
-    receive the same padding and contiguous TP split as the logits before it can
-    be sent.
-
-    Both the local routing path and the AFD send path call this, so the ids that
-    cross the boundary describe the same tokens the Attention-side routing used.
-
-    Args:
-        input_ids: Global ids from the forward context, or ``None``.
-        router_tokens: Token count of this rank's router logits.
-        flash_comm_v1_enabled: Whether FlashComm v1 is active for this forward.
-        pad_size: FlashComm v1 padding applied to the activation.
-
-    Returns:
-        A one-dimensional ``int64`` tensor of ``router_tokens`` local ids.
-
-    Raises:
-        RuntimeError: If ids are unavailable, or if the ids do not describe
-            exactly ``router_tokens`` tokens. Both would otherwise let a
-            token-keyed router select experts for the wrong tokens.
+    The native model and AFD staged model both own the token split. A second
+    split here would silently route a different set of tokens on Hash layers.
     """
 
     if input_ids is None:
@@ -58,18 +33,6 @@ def local_hash_input_ids(
             "request's input_ids before the model forward.",
         )
     ids = input_ids.reshape(-1).to(torch.int64)
-    if flash_comm_v1_enabled and ids.numel() != router_tokens:
-        from vllm.distributed import get_tp_group
-        from vllm_ascend.distributed.utils import split_tensor_along_first_dim
-
-        if pad_size > 0:
-            ids = torch.nn.functional.pad(ids, (0, pad_size))
-        group = get_tp_group()
-        ids = split_tensor_along_first_dim(
-            ids,
-            num_partitions=group.world_size,
-            contiguous_split_chunks=True,
-        )[group.rank_in_group]
     if ids.numel() != router_tokens:
         raise RuntimeError(
             "DSV4 Hash routing cannot align the ids sent to FFN with the local "
@@ -78,44 +41,29 @@ def local_hash_input_ids(
     return ids
 
 
-def hash_input_ids_from_context(
-    *,
-    forward_context: ForwardContext,
-    router_tokens: int,
-) -> torch.Tensor:
-    """Return the ids to send for a Hash layer, raising if the context has none.
-
-    The ids channel belongs to the transfer rather than to one layer: the FFN
-    role cannot tell a Hash layer from a non-Hash one, so it asks for ids on
-    every layer. Answering with activations alone would leave it reading an ids
-    slot the operator never wrote.
-    """
-
-    return local_hash_input_ids(
-        input_ids=forward_context.input_ids,
-        router_tokens=router_tokens,
-        flash_comm_v1_enabled=forward_context.flash_comm_v1_enabled,
-        pad_size=forward_context.pad_size,
-    )
-
-
 def compute_attention_gate_topk(
     moe: AFDDeepseekV4AttentionGateRemoteMoE,
     hidden_states: torch.Tensor,
+    *,
+    input_ids: torch.Tensor | None = None,
+    hidden_states_fp32: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run DSV4 routing without entering vLLM's native MoE communicator.
 
-    AFD Async CAM owns the cross-role dispatch.  The vLLM-Ascend fused
-    selector's hash path instead assumes native EP/SP communication and calls
-    ``forward_context.moe_comm_method.pad_and_split_input_ids``.  That object
-    is intentionally absent on Attention ranks, including the KV-cache profile
-    forward.  Use the same CANN routing operators directly on local Attention
-    tokens, then hand their IDs and weights to CAM dispatch.
+    AFD Async CAM owns cross-role dispatch and receives tokens and IDs already
+    sharded by the model. Preserve the target decoder's exact FP32 RMSNorm
+    result and the precast gate weights, then call the CANN selectors on those
+    local tokens without entering the native MoE runner's EP communication.
     """
 
-    router_logits, _ = moe.gate(hidden_states)
+    router_input = (
+        hidden_states.float() if hidden_states_fp32 is None else hidden_states_fp32
+    )
+    router_logits = torch.nn.functional.linear(router_input, moe.gate.weight_fp32)
     if moe.scoring_func == "sqrtsoftplus":
-        topk_weights, topk_ids = _compute_sqrtsoftplus_topk(moe, router_logits)
+        topk_weights, topk_ids = _compute_sqrtsoftplus_topk(
+            moe, router_logits, input_ids=input_ids
+        )
     else:
         topk_weights, topk_ids = _compute_standard_topk(moe, router_logits)
     return topk_weights.to(torch.float32), topk_ids
@@ -124,6 +72,8 @@ def compute_attention_gate_topk(
 def _compute_sqrtsoftplus_topk(
     moe: AFDDeepseekV4AttentionGateRemoteMoE,
     router_logits: torch.Tensor,
+    *,
+    input_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run DSV4's sqrtsoftplus CANN router without native MoE communication."""
 
@@ -134,19 +84,18 @@ def _compute_sqrtsoftplus_topk(
         )
 
     tid2eid = moe.gate.tid2eid
-    input_ids = None
     if tid2eid is not None:
         from vllm.forward_context import get_forward_context
 
         forward_context = get_forward_context()
         input_ids = local_hash_input_ids(
-            input_ids=getattr(forward_context, "input_ids", None),
+            input_ids=(forward_context.input_ids if input_ids is None else input_ids),
             router_tokens=router_logits.shape[0],
-            flash_comm_v1_enabled=forward_context.flash_comm_v1_enabled,
-            pad_size=forward_context.pad_size,
         )
         input_ids = torch.where(input_ids == -1, 0, input_ids)
         tid2eid = tid2eid.to(torch.int32)
+    else:
+        input_ids = None
     correction_bias = moe.gate.e_score_correction_bias
     if correction_bias is not None and correction_bias.dtype != router_logits.dtype:
         correction_bias = correction_bias.to(router_logits.dtype)

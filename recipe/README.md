@@ -3,7 +3,7 @@
 This directory contains deployment and benchmark recipes for AFD connectors.
 Read each recipe's support status before running it: some historical experiment
 records are retained for provenance but are not supported by the current
-vLLM 0.26 runtime.
+vLLM 0.30 runtime.
 
 ## Directory layout
 
@@ -31,7 +31,7 @@ Directory names follow these conventions:
 
 ## Available recipes
 
-| Hardware | Connector | Model | Recommended stage | v0.26 status | Recipe |
+| Hardware | Connector | Model | Recommended stage | v0.30 status | Recipe |
 | --- | --- | --- | --- | --- | --- |
 | GPU | `P2pNcclAFDConnector` | DeepSeek-V2-Lite | Decode | Validated | [Launch examples](gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md) |
 | Ascend NPU | `CAMP2pAFDConnector` | DeepSeek-V3.2 | Decode | Validated | [Synchronous decode](npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) |

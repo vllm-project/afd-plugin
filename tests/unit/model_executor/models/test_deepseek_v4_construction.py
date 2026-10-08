@@ -36,12 +36,16 @@ def _vllm_config(*, layer_count: int = 2):
         hc_sinkhorn_iters=3,
         hidden_size=8,
         index_topk=4,
+        num_hash_layers=1,
         num_hidden_layers=layer_count,
         rms_norm_eps=1e-6,
         vocab_size=32,
     )
     return SimpleNamespace(
-        kernel_config=SimpleNamespace(moe_backend="cutlass"),
+        kernel_config=SimpleNamespace(
+            enable_jit_warmup=False,
+            moe_backend="cutlass",
+        ),
         model_config=SimpleNamespace(hf_config=config, dtype=torch.float16),
         parallel_config=SimpleNamespace(
             enable_eplb=False,
@@ -50,6 +54,7 @@ def _vllm_config(*, layer_count: int = 2):
         ),
         quant_config=None,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+        speculative_config=None,
     )
 
 
@@ -99,6 +104,19 @@ def _make_model(monkeypatch, *, role: str):
     return adapter.AFDDeepseekV4Model(vllm_config=_vllm_config())
 
 
+def _make_layer(monkeypatch, *, role: str, layer_idx: int):
+    afd_config = SimpleNamespace(role=role)
+    monkeypatch.setattr(
+        adapter,
+        "parse_afd_config",
+        lambda *_args, **_kwargs: afd_config,
+    )
+    return adapter.AFDDeepseekV4DecoderLayer(
+        _vllm_config(),
+        prefix=f"model.layers.{layer_idx}",
+    )
+
+
 @pytest.mark.parametrize("role", ["attention", "ffn"])
 def test_v4_model_constructs_only_role_owned_decoder_stages(
     monkeypatch,
@@ -133,7 +151,7 @@ def test_v4_ffn_model_has_no_head_mhc_parameters_or_mtp_buffer(
     assert model._mtp_hidden_buffer is None
 
 
-def test_v4_attention_model_owns_head_mhc_parameters_and_mtp_buffer(
+def test_v4_attention_model_owns_head_mhc_parameters(
     monkeypatch,
     construction_env,
 ):
@@ -141,7 +159,65 @@ def test_v4_attention_model_owns_head_mhc_parameters_and_mtp_buffer(
     parameter_names = {name for name, _ in model.named_parameters()}
 
     assert {"hc_head_fn", "hc_head_base", "hc_head_scale"} <= parameter_names
+    # The MTP buffer follows the 0.30 native contract: allocated only when
+    # speculative decoding needs target hidden states.
+    assert model._mtp_hidden_buffer is None
+
+
+def test_v4_attention_model_allocates_mtp_buffer_for_spec_decode(
+    monkeypatch,
+    construction_env,
+):
+    vllm_config = _vllm_config()
+    vllm_config.speculative_config = SimpleNamespace(
+        use_eagle=lambda: True,
+        uses_draft_model=lambda: False,
+    )
+    afd_config = SimpleNamespace(
+        compute_gate_on_attention=False,
+        connector="P2pNcclAFDConnector",
+        role="attention",
+    )
+    monkeypatch.setattr(
+        adapter,
+        "parse_afd_config",
+        lambda *_args, **_kwargs: afd_config,
+    )
+    model = adapter.AFDDeepseekV4Model(vllm_config=vllm_config)
+
+    assert model._mtp_hidden_buffer is not None
     assert model._mtp_hidden_buffer.shape == (8, 16)
+
+
+def test_v4_decoder_layer_pins_sequence_parallel_off(
+    monkeypatch,
+    construction_env,
+):
+    layer = _make_layer(monkeypatch, role="attention", layer_idx=0)
+
+    assert layer.use_sequence_parallel is False
+
+
+def test_v4_ffn_layer_passes_hash_layer_contract_to_moe(
+    monkeypatch,
+    construction_env,
+):
+    moe_kwargs = []
+
+    class _RecordingMoE(_FakeMoE):
+        def __init__(self, *args, prefix: str = "", **kwargs) -> None:
+            super().__init__(*args, prefix=prefix, **kwargs)
+            moe_kwargs.append(kwargs)
+
+    monkeypatch.setattr(adapter.native, "DeepseekV4MoE", _RecordingMoE)
+    _make_layer(monkeypatch, role="ffn", layer_idx=0)
+
+    assert moe_kwargs == [
+        {
+            "use_sequence_parallel": False,
+            "num_hash_layers": 1,
+        }
+    ]
 
 
 def test_v4_decoder_constructor_rejects_unknown_role(

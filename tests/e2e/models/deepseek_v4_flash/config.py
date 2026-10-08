@@ -61,6 +61,8 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "0.7",
         "--quantization",
         "ascend",
+        "--attention_config.indexer_kv_dtype",
+        "int8",
         "--tokenizer-mode",
         "deepseek_v4",
         "--model-loader-extra-config",
@@ -69,7 +71,10 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "--no-enable-prefix-caching",
         "--enable-chunked-prefill",
     ]
+    args.ffn_vllm_arg = ["--all2all-backend", "flashinfer_all2allv"]
     args.attention_vllm_arg = [
+        "--all2all-backend",
+        "allgather_reducescatter",
         "--data-parallel-address",
         args.afd_host,
         "--no-disable-hybrid-kv-cache-manager",
@@ -81,15 +86,10 @@ def configure_scenario(args: argparse.Namespace) -> None:
     ]
 
 
-def additional_config() -> dict[str, bool]:
+def additional_config(role: str) -> dict[str, bool]:
     return {
+        "enable_flashcomm1": role == "attention",
         "enable_cpu_binding": True,
-        "enable_force_load_balance": False,
         "enable_dsa_cp": False,
         "multistream_dsv4_dsa_overlap": False,
-        "enable_dsv4_shared_compressor_workspace": False,
     }
-
-
-def role_environment(role: str | None) -> dict[str, str]:
-    return {"VLLM_ASCEND_ENABLE_FLASHCOMM1": "1" if role == "attention" else "0"}

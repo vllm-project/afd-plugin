@@ -18,6 +18,8 @@ is limited to `FULL_DECODE_ONLY`.
 
 - vLLM `0.26.0` and an Ascend PyTorch/vLLM-Ascend environment based on source
   commit [`80d8c194f`](https://github.com/vllm-project/vllm-ascend/commit/80d8c194f7584b17fe08065ea99a130916f6b0e7).
+  NPU is not revalidated against the `0.30.0` GPU target; this guide's
+  validation basis is unchanged.
 - The AFD Ascend custom operators must be built and available at runtime.
 - HCCL connectivity for the data path and Gloo connectivity for DP metadata.
 - Identical model hidden size, model dtype, AFD topology, rendezvous address,

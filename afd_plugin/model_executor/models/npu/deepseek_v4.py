@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
+from transformers import DeepseekV2Config
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers import fused_moe
@@ -39,7 +40,7 @@ from afd_plugin.model_executor.models.npu.deepseek_v4_shared_experts import (
 )
 
 try:
-    from vllm_ascend.models import deepseek_v4 as native
+    from vllm_ascend.models.deepseek_v4 import model as native
 except ImportError as exc:  # pragma: no cover - only reachable off Ascend.
     raise ImportError(
         "DSV4 AFD support requires the vLLM-Ascend native DSV4 model"
@@ -57,10 +58,10 @@ _BOTH_ROLES = frozenset((_ATTENTION_ROLE, _FFN_ROLE))
 def _refresh_ascend_fused_moe() -> None:
     """Bind native DSV4 MoE construction to the Ascend implementation."""
     # vLLM-Ascend applies this replacement during platform initialization,
-    # while the DSV4 module keeps a module-level FusedMoE binding.  Refresh it
+    # while the DSV4 module keeps a module-level FusedMoEFactory binding.  Refresh it
     # before either AFD role constructs its local model.
     if native.current_platform.device_type == "npu":
-        native.FusedMoE = fused_moe.FusedMoE
+        native.FusedMoEFactory = fused_moe.FusedMoEFactory
 
 
 def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
@@ -153,19 +154,26 @@ class AFDDeepseekV4RemoteMoE(RemoteFFNProxy):
     activations-only send.
     """
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        hidden_states_fp32: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         from afd_plugin.model_executor.models.npu.deepseek_v4_attention_gate import (
-            hash_input_ids_from_context,
+            local_hash_input_ids,
         )
 
         # The FFN rank asks for the operator's ids channel on every layer, so
         # this side must send ids rather than fall back to an activations-only
-        # transfer. ``hash_input_ids_from_context`` raises if the forward context
+        # transfer. ``local_hash_input_ids`` raises if the forward context
         # cannot supply them.
         return self._send_and_receive(
             hidden_states,
-            input_ids=hash_input_ids_from_context(
-                forward_context=get_forward_context(),
+            input_ids=local_hash_input_ids(
+                input_ids=(
+                    get_forward_context().input_ids if input_ids is None else input_ids
+                ),
                 router_tokens=int(hidden_states.shape[0]),
             ),
         )
@@ -183,6 +191,9 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         vllm_config: VllmConfig,
     ) -> None:
         super().__init__(layer_idx=layer_idx)
+        self.use_sequence_parallel_moe = (
+            vllm_config.parallel_config.use_sequence_parallel_moe
+        )
         self.top_k = int(config.num_experts_per_tok)
         self.n_routed_experts = int(config.n_routed_experts)
         self.renormalize = bool(config.norm_topk_prob)
@@ -192,8 +203,8 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         self.routed_scaling_factor = float(
             getattr(config, "routed_scaling_factor", 1.5),
         )
-        # Native SP MLP owns replicated shared weights and consumes local
-        # tokens, including FlashComm1 shards, without a TP reduction.
+        # Match native DSV4's explicit shared-output reduction. Ascend keeps
+        # weights TP-sharded with SP unless shared-expert DP is enabled.
         self.shared_experts = (
             AFDDeepseekV4SharedExperts(
                 hidden_size=config.hidden_size,
@@ -202,7 +213,8 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
                 hidden_act=config.hidden_act,
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 quant_config=vllm_config.quant_config,
-                is_sequence_parallel=True,
+                reduce_results=False,
+                is_sequence_parallel=self.use_sequence_parallel_moe,
                 prefix=f"{prefix}.shared_experts",
             )
             if config.n_shared_experts
@@ -218,11 +230,11 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         self.gate.precast_fp32_weight = True
         if layer_idx < config.num_hash_layers:
             self.gate.tid2eid = nn.Parameter(
-                torch.zeros(
-                    config.vocab_size,
-                    config.num_experts_per_tok,
-                    dtype=torch.int32,
-                ),
+                (
+                    torch.arange(config.vocab_size, dtype=torch.int32).unsqueeze(1)
+                    + torch.arange(config.num_experts_per_tok, dtype=torch.int32)
+                )
+                % config.n_routed_experts,
                 requires_grad=False,
             )
             self.gate.e_score_correction_bias = None
@@ -232,20 +244,27 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        hidden_states_fp32: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Select DSV4 experts on Attention and exchange routed work via CAM."""
         from afd_plugin.model_executor.models.npu import deepseek_v4_attention_gate
 
         topk_weights, topk_ids = deepseek_v4_attention_gate.compute_attention_gate_topk(
             self,
             hidden_states,
+            input_ids=input_ids,
+            hidden_states_fp32=hidden_states_fp32,
         )
         dispatch_payload = prepare_cam_dispatch_payload(
             hidden_states,
             topk_weights,
             topk_ids,
             None,
-            use_sequence_parallel=get_forward_context().flash_comm_v1_enabled,
+            use_sequence_parallel=self.use_sequence_parallel_moe,
         )
         output = self._send_and_receive(
             dispatch_payload.hidden_states,
@@ -258,7 +277,7 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         return output
 
 
-class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
+class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
     """Role-local DSV4 decoder layer.
 
     The inherited native ``forward`` is intentionally retained.  On the
@@ -268,43 +287,54 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
     forward method; it invokes ``compute_ffn_output`` instead.
     """
 
+    # Upstream source: vllm-ascend 8d4409d, DeepseekV4DecoderLayer.__init__.
+    # Patch reason: allocate Attention and FFN weights only on their AFD role.
+    # Patch functionality: keep target HC/SP attributes and native layer forward,
+    # replacing the Attention role's MoE with a remote module.
+    # Signature: matches upstream; no added parameters.
     def __init__(
         self,
         vllm_config: VllmConfig,
         prefix: str,
-        config=None,
+        config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
         is_draft_layer: bool = False,
     ) -> None:
+        # ### PATCH START: initialize role-local decoder
         if is_draft_layer:
             raise ValueError("AFD DSV4 decoder layers do not support draft layers")
         afd_config = parse_afd_config(vllm_config, validate=False)
         nn.Module.__init__(self)
+        # ### PATCH END: initialize role-local decoder
+
         if config is None:
             config = vllm_config.model_config.hf_config
-
-        cache_config = vllm_config.cache_config
-        quant_config = vllm_config.quant_config
-        parallel_config = vllm_config.parallel_config
-        layer_idx = int(prefix.split(sep=".")[-1])
-
+        # ### PATCH START: AFD decoder metadata
         self.vllm_config = vllm_config
         self.config = config
         self.afd_role = afd_config.role
-        self.layer_idx = layer_idx
-        self.hidden_size = config.hidden_size
-        self.norm_eps = config.rms_norm_eps
-        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
-        self.hc_mult = config.hc_mult
-        self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
-        self.hc_eps = config.hc_eps
         self.compute_gate_on_attention = bool(afd_config.compute_gate_on_attention)
         self.is_moe_layer = True
-        self.use_sequence_parallel_moe = False
+        # ### PATCH END: AFD decoder metadata
+        cache_config = vllm_config.cache_config
+        quant_config = vllm_config.quant_config
+        parallel_config = vllm_config.parallel_config
 
+        self.hidden_size = config.hidden_size
         max_position_embeddings = config.rope_parameters[
             "original_max_position_embeddings"
         ]
+        # DecoderLayers are created with `native.make_layers` which passes the prefix
+        # with the layer's index.
+        layer_idx = int(prefix.split(sep=".")[-1])
+        self.layer_idx = layer_idx
+        self.norm_eps = config.rms_norm_eps
+        self.use_sequence_parallel_moe = parallel_config.use_sequence_parallel_moe
+        self.enable_dsa_cp = (
+            native.enable_dsa_cp()
+        )  # TODO: delete this when native.enable_dsa_cp is sunset.
+
+        # ### PATCH START: role-local Attention and remote experts
         if afd_config.role == _ATTENTION_ROLE:
             self.self_attn = native.DeepseekV4Attention(
                 vllm_config=vllm_config,
@@ -314,6 +344,8 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
+                reduce_results=not self.use_sequence_parallel_moe,
+                need_gather_q_kv=self.use_sequence_parallel_moe and self.enable_dsa_cp,
             )
             if self.compute_gate_on_attention:
                 self.mlp = AFDDeepseekV4AttentionGateRemoteMoE(
@@ -344,16 +376,18 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
         else:  # pragma: no cover - parse_afd_config validates role values.
             raise ValueError(f"Unsupported AFD role: {afd_config.role!r}")
 
-        self.input_layernorm = native.RMSNorm(
-            config.hidden_size,
-            eps=self.norm_eps,
-        )
+        # ### PATCH END: role-local Attention and remote experts
+
+        self.input_layernorm = native.RMSNorm(config.hidden_size, eps=self.norm_eps)
         self.post_attention_layernorm = native.RMSNorm(
-            config.hidden_size,
-            eps=self.norm_eps,
+            config.hidden_size, eps=self.norm_eps
         )
-        mix_hc = (2 + self.hc_mult) * self.hc_mult
-        hc_dim = self.hc_mult * config.hidden_size
+        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        self.hc_mult = hc_mult = config.hc_mult
+        self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
+        self.hc_eps = config.hc_eps
+        mix_hc = (2 + hc_mult) * hc_mult
+        hc_dim = hc_mult * config.hidden_size
         self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
         self.hc_ffn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
         self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
@@ -399,12 +433,8 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
                 # topk_weights, which CAM applies during combine-recv.
                 routed_scale_applied_in_topk=True,
             )
-        # The native MoE runs the gate internally when the gate is not on
-        # Attention. Its Hash layers route by token identity, and vLLM-Ascend's
-        # fused-expert selector reads ``forward_context.input_ids``, which the
-        # FFN runner installs from the transfer. The native forward takes no
-        # ``input_ids`` argument, so the ambient context is the whole channel.
-        return self.mlp(hidden_states)
+        # Target Hash MoE takes explicit token IDs from the CAM transfer.
+        return self.mlp(hidden_states, input_ids=get_forward_context().input_ids)
 
 
 @native.support_torch_compile
@@ -413,7 +443,13 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
 
     fall_back_to_pt_during_load = False
 
+    # Upstream source: vllm-ascend 8d4409d, DeepseekV4Model.__init__.
+    # Patch reason: construct role-local decoder layers and retain AFD metadata.
+    # Patch functionality: initialize the target SP/PP/HC/MTP model contract
+    # without allocating the native unsplit model through super().__init__.
+    # Signature: matches upstream; no added parameters.
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        # ### PATCH START: initialize role-local model
         afd_config = parse_afd_config(vllm_config, validate=False)
         if (
             afd_config.connector == AFD_ASYNC_CONNECTOR
@@ -422,34 +458,42 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
             raise ValueError(
                 "DSV4 CAMAsyncAFDConnector requires compute_gate_on_attention=true",
             )
-        if vllm_config.parallel_config.use_sequence_parallel_moe:
-            raise RuntimeError("AFD DSV4 does not support sequence-parallel MoE")
-
         _refresh_ascend_fused_moe()
         nn.Module.__init__(self)
+        # ### PATCH END: initialize role-local model
+
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
+        # ### PATCH START: AFD model metadata
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
         self.afd_config = afd_config
+        self.hidden_size = config.hidden_size
+        # ### PATCH END: AFD model metadata
         self.config = config
         self.device = native.current_platform.device_type
-        self.hidden_size = config.hidden_size
-        self.vocab_size = config.vocab_size
-        self.hc_mult = config.hc_mult
-        self.norm_eps = config.rms_norm_eps
-        self.hc_eps = config.hc_eps
+        self.use_sequence_parallel_moe = (
+            vllm_config.parallel_config.use_sequence_parallel_moe
+        )
 
+        self.vocab_size = config.vocab_size
         self.is_v32 = hasattr(config, "index_topk")
+        # ### PATCH START: Attention-owned index buffer
         if self.is_v32 and afd_config.role == _ATTENTION_ROLE:
+            topk_tokens = config.index_topk
             topk_indices_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
-                config.index_topk,
+                topk_tokens,
                 dtype=torch.int32,
                 device=self.device,
             )
         else:
             topk_indices_buffer = None
+
+        # ### PATCH END: Attention-owned index buffer
+
+        # Expose at model level so spec_decode/llm_base_proposer can share
+        # this buffer with the MTP draft via attribute replacement.
         self.topk_indices_buffer = topk_indices_buffer
 
         if native.get_pp_group().is_first_rank:
@@ -461,34 +505,20 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
             )
         else:
             self.embed_tokens = native.PPMissingLayer()
-
+        # ### PATCH START: role-local decoder factory
         self.start_layer, self.end_layer, self.layers = native.make_layers(
             config.num_hidden_layers,
-            lambda prefix, **_: AFDDeepseekV4DecoderLayer(
-                vllm_config=vllm_config,
-                prefix=prefix,
-                topk_indices_buffer=topk_indices_buffer,
+            lambda prefix: AFDDeepseekV4DecoderLayer(
+                vllm_config, prefix, topk_indices_buffer=topk_indices_buffer
             ),
             prefix=f"{prefix}.layers",
         )
+        # ### PATCH END: role-local decoder factory
 
         if native.get_pp_group().is_last_rank:
             self.norm = native.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = native.PPMissingLayer()
-
-        hc_dim = self.hc_mult * config.hidden_size
-        self.hc_head_fn = nn.Parameter(
-            torch.empty(self.hc_mult, hc_dim, dtype=torch.float32)
-        )
-        self.hc_head_base = nn.Parameter(torch.empty(self.hc_mult, dtype=torch.float32))
-        self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
-        self._mtp_hidden_buffer = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            hc_dim,
-            dtype=vllm_config.model_config.dtype,
-            device=self.device,
-        )
 
         def make_empty_intermediate_tensors(
             batch_size: int,
@@ -501,15 +531,55 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
                         (batch_size, self.hc_mult, config.hidden_size),
                         dtype=dtype,
                         device=device,
-                    )
+                    ),
                 }
             )
 
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors
+        self.make_empty_intermediate_tensors = (
+            native.make_pp_empty_intermediate_tensors(
+                self,
+                make_empty_intermediate_tensors,
+            )
+        )
+
+        self.norm_eps = config.rms_norm_eps
+        self.hc_eps = config.hc_eps
+        self.hc_mult = hc_mult = config.hc_mult
+        hc_dim = hc_mult * config.hidden_size
+
+        self.hc_head_fn = nn.Parameter(
+            torch.empty(hc_mult, hc_dim, dtype=torch.float32)
+        )
+        self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
+        self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
+        self.hc_norm = native.RMSNorm(
+            hc_dim, eps=config.rms_norm_eps, has_weight=False, dtype=torch.float32
+        )
+
+        # Pre-hc_head residual stream buffer for the speculative draft
+        # (MTP / DSpark / DFlash). Only needed when the decoder consumes
+        # target-model hidden states; allocating it unconditionally would
+        # permanently cost max_num_batched_tokens * hc_dim per rank.
+        # Aligned with upstream DeepSeekV4 (see vllm PR #50312).
+        spec_config = vllm_config.speculative_config
+        self._needs_mtp_hidden_states = bool(
+            native.get_pp_group().is_last_rank
+            and spec_config is not None
+            and (spec_config.use_eagle() or spec_config.uses_draft_model())
+        )
+        self._mtp_buffer_shape = (
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            hc_dim,
+        )
+        self._mtp_buffer_dtype = vllm_config.model_config.dtype
+        self._mtp_hidden_buffer: torch.Tensor | None = None
+
+        # ### PATCH START: AFD model introspection
         self.aux_hidden_state_layers: tuple[int, ...] = ()
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
+        # ### PATCH END: AFD model introspection
 
     def compute_ffn_output(
         self,
@@ -519,7 +589,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
     ) -> torch.Tensor:
         return self.layers[layer_idx].compute_ffn_output(hidden_states, **kwargs)
 
-    # Upstream source: vllm-ascend commit 80d8c194f,
+    # Upstream source: vllm-ascend commit 8d4409d,
     # DeepseekV4Model.forward.
     # Patch reason: native DSV4 serializes Attention and FFN within each layer,
     # while Async CAM needs a model-owned two-stage schedule at the FFN boundary.
@@ -530,7 +600,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
     # Signature: matches upstream; no added parameters.
     def forward(
         self,
-        input_ids: torch.Tensor | None,
+        input_ids: torch.Tensor,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
@@ -705,7 +775,8 @@ def _extract_async_cam_w4a8_layers(
     weights = []
     for layer in layers:
         experts = layer.mlp.experts
-        if experts.dynamic_eplb:
+        owner = experts.routed_experts
+        if owner.dynamic_eplb:
             raise ValueError(
                 f"layered GMM layer {layer.layer_idx}: dynamic EPLB is unsupported"
             )
@@ -718,7 +789,6 @@ def _extract_async_cam_w4a8_layers(
                 f"layered GMM layer {layer.layer_idx}: "
                 "shared experts must run on Attention"
             )
-        owner = experts.routed_experts
         for name in (
             "w13_weight",
             "w2_weight",

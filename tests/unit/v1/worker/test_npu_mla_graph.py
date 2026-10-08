@@ -314,6 +314,7 @@ def _parent_forward_context():
         prefetch_mlp_gate_up_proj=False,
         prefetch_mlp_down_proj=False,
         model_instance=None,
+        device_metadata_executor=None,
         is_draft_model=False,
         is_draft_model_prefill=False,
         draft_attn_metadatas=None,
@@ -694,6 +695,7 @@ def test_full_graph_capture_passes_shape_key_and_mla_registries(monkeypatch):
         cudagraph_runtime_mode=wrapper_module.CUDAGraphMode.FULL,
         batch_descriptor=_batch_descriptor(),
         attn_metadata=[{"layer0": "m0"}, {"layer0": "m1"}],
+        additional_kwargs={},
         is_draft_model=False,
         max_tokens_across_pcp=0,
     )
@@ -840,6 +842,7 @@ def test_non_mla_graph_replay_keeps_stream_fence(monkeypatch):
         cudagraph_runtime_mode=wrapper_module.CUDAGraphMode.FULL,
         batch_descriptor=_batch_descriptor(),
         attn_metadata=None,
+        additional_kwargs={},
     )
     monkeypatch.setattr(
         wrapper_module,

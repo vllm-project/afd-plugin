@@ -8,7 +8,6 @@ This runtime module depends on vLLM's native ubatching stack.
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -22,7 +21,6 @@ from vllm.model_executor.offloader.base import get_offloader
 from vllm.v1.worker.gpu_ubatch_wrapper import UbatchMetadata, UBatchWrapper
 from vllm.v1.worker.ubatching import make_ubatch_contexts
 
-from afd_plugin.config import is_afd_active
 from afd_plugin.connectors import AFDForwardContextMetadata
 from afd_plugin.v1.worker.attention_metadata import build_ubatch_dp_metadata_list
 
@@ -48,25 +46,12 @@ class AFDUBatchWrapper(UBatchWrapper):
 
         self._afd_metadata_installer = installer
 
-    # Patch reason: native SM partitioning conflicts with AFD connector work.
-    # Patch functionality: disable native SM partitioning only for active AFD.
-    # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/v1/worker/gpu_ubatch_wrapper.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
-    @staticmethod
-    def _create_sm_control_context(vllm_config: VllmConfig):
-        # ### PATCH START: leave all SMs visible to AFD compute and communication.
-        if is_afd_active(vllm_config):
-            return nullcontext()
-        # ### PATCH END: leave all SMs visible to AFD compute and communication.
-        return UBatchWrapper._create_sm_control_context(vllm_config)
-
     # Patch reason: native ubatch contexts do not carry AFD transfer metadata.
     # Patch functionality: install per-ubatch AFD context and control-plane
     # metadata while preserving native capture, replay, and execution behavior.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/v1/worker/gpu_ubatch_wrapper.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.30.0, vllm/v1/worker/gpu_ubatch_wrapper.py
+    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
     def __call__(self, *args, **kwargs):
         forward_context = get_forward_context()
         ubatch_slices = forward_context.ubatch_slices
@@ -146,8 +131,8 @@ class AFDUBatchWrapper(UBatchWrapper):
     # Patch reason: native per-ubatch contexts omit AFD transfer metadata.
     # Patch functionality: clone the parent AFD context into each native ubatch.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/v1/worker/gpu_ubatch_wrapper.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.30.0, vllm/v1/worker/gpu_ubatch_wrapper.py
+    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
     def _make_ubatch_metadata(
         self,
         ubatch_slices,

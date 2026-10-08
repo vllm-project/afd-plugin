@@ -219,6 +219,7 @@ def test_native_model_loader_packs_mha_qkv(
     object.__setattr__(model, "config", _config())
     object.__setattr__(model, "use_mha", True)
     object.__setattr__(model, "num_redundant_experts", 0)
+    object.__setattr__(model, "is_fused_shared_expert_enabled", False)
     object.__setattr__(
         model,
         "named_parameters",

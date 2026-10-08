@@ -48,13 +48,17 @@ def test_dsv4_fixed_deployment_and_cleanup(monkeypatch, tmp_path):
         assert command[command.index("--tensor-parallel-size") + 1] == tp
         assert command[command.index("--max-num-batched-tokens") + 1] == "8192"
         assert command[command.index("--max-model-len") + 1] == "1048576"
+        assert (
+            command[command.index("--attention_config.indexer_kv_dtype") + 1] == "int8"
+        )
         assert "--enforce-eager" in command
         assert "--enable-expert-parallel" in command
         assert "--enable-dbo" not in command
         assert "--kv-transfer-config" not in command
         config = json.loads(command[command.index("--additional-config") + 1])
-        assert config["enable_dsv4_shared_compressor_workspace"] is False
+        assert "enable_dsv4_shared_compressor_workspace" not in config
         assert config["enable_cpu_binding"] is True
+        assert config["enable_flashcomm1"] is (role == "attention")
         assert config["afd"] == {
             "role": role,
             "connector": "CAMAsyncAFDConnector",
@@ -73,9 +77,12 @@ def test_dsv4_fixed_deployment_and_cleanup(monkeypatch, tmp_path):
             },
         }
         env = runner.build_env("0", args, role=role, e2e_run_id="test")
-        assert env["VLLM_ASCEND_ENABLE_FLASHCOMM1"] == (
-            "1" if role == "attention" else "0"
+        assert "VLLM_ASCEND_ENABLE_FLASHCOMM1" not in env
+        assert env["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+        expected_backend = (
+            "allgather_reducescatter" if role == "attention" else "flashinfer_all2allv"
         )
+        assert command[command.index("--all2all-backend") + 1] == expected_backend
         assert env[runner.E2E_RUN_ID_ENV] == "test"
 
 

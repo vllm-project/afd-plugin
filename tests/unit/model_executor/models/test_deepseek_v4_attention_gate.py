@@ -42,15 +42,12 @@ def test_dsv4_async_gate_validates_local_hash_token_alignment() -> None:
     assert "def local_hash_input_ids(" in source
     assert "DSV4 Hash routing cannot align the ids sent to FFN" in source
     assert "ids = input_ids.reshape(-1).to(torch.int64)" in source
-    assert "flash_comm_v1_enabled" in source
+    assert "flash_comm_v1_enabled" not in source
     assert "ids.numel() != router_tokens" in source
-    assert "split_tensor_along_first_dim(" in source
-    assert "num_partitions=group.world_size" in source
-    assert ")[group.rank_in_group]" in source
+    assert "split_tensor_along_first_dim(" not in source
     # The send-side selection must reuse this helper rather than re-deriving a
     # slice; its numerics live in test_deepseek_v4_hash_ids.py.
-    assert "def hash_input_ids_from_context(" in source
-    assert "return local_hash_input_ids(" in source
+    assert "input_ids = local_hash_input_ids(" in source
 
 
 def test_dsv4_ffn_does_not_reapply_gate_routed_scale() -> None:

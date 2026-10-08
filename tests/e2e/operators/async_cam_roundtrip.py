@@ -11,6 +11,9 @@ Example (six NPUs: Attention TP4 + FFN EP2)::
 Run TP1/2/4, float16/bfloat16, dynamic-quant 0/1 separately. Every run covers
 expert zero/last, sparse routes, an empty FFN rank, multiple receive chunks,
 single-token decode, and repeated window reuse. Tolerances are fixed below.
+
+The 16-NPU DSV4 topology can be checked with ``--attention-dp 2
+--ffn-ranks 8 --experts-per-rank 32 --tp 4``.
 """
 
 from __future__ import annotations
@@ -38,21 +41,39 @@ MAX_CAPACITY = 262144
 TOLERANCES = {"float16": (0.008, 0.004), "bfloat16": (0.06, 0.02)}
 
 
-def make_input(rank: int, case: str, dtype: torch.dtype):
+def make_input(
+    rank: int,
+    case: str,
+    dtype: torch.dtype,
+    *,
+    ffn_ranks: int,
+    experts_per_rank: int,
+    hidden_size: int,
+    top_k: int,
+):
     batch = 1 if case == "decode" else BATCH_SIZE
-    values = torch.arange(batch * HIDDEN_SIZE, dtype=torch.float32).reshape(
-        batch, HIDDEN_SIZE
+    values = torch.arange(batch * hidden_size, dtype=torch.float32).reshape(
+        batch, hidden_size
     )
     x = (torch.sin(values * 0.013 + rank) * 0.5).to(dtype)
-    ids = torch.empty((batch, TOP_K), dtype=torch.int32)
+    ids = torch.empty((batch, top_k), dtype=torch.int32)
+    expert_offsets = torch.arange(top_k, dtype=torch.int32)
+    total_experts = ffn_ranks * experts_per_rank
     if case == "empty-rank-multichunk":
-        ids[:, 0], ids[:, 1] = 0, EXPERTS_PER_RANK - 1
+        ids[:] = expert_offsets.remainder(experts_per_rank)
+        ids[:, -1] = experts_per_rank - 1
     elif case == "sparse":
-        ids[:, 0] = (torch.arange(batch) + rank).remainder(3)
-        ids[:, 1] = FFN_RANKS * EXPERTS_PER_RANK - 1
+        ids[:] = (
+            torch.arange(batch, dtype=torch.int32)[:, None]
+            + rank
+            + expert_offsets[None, :] * experts_per_rank
+        ).remainder(total_experts)
+        ids[:, -1] = total_experts - 1
     else:
-        ids[:, 0], ids[:, 1] = 0, FFN_RANKS * EXPERTS_PER_RANK - 1
-    weights = torch.tensor([0.25, 0.75], dtype=torch.float32).repeat(batch, 1)
+        ids[:] = expert_offsets.remainder(total_experts)
+        ids[:, -1] = total_experts - 1
+    weights = torch.arange(1, top_k + 1, dtype=torch.float32)
+    weights = (weights / weights.sum()).repeat(batch, 1)
     return x, ids, weights
 
 
@@ -71,10 +92,18 @@ def main() -> None:
     parser.add_argument("--tp", type=int, choices=(1, 2, 4), required=True)
     parser.add_argument("--dtype", choices=tuple(TOLERANCES), required=True)
     parser.add_argument("--dynamic-quant", type=int, choices=(0, 1), required=True)
+    parser.add_argument("--attention-dp", type=int, default=1)
+    parser.add_argument("--ffn-ranks", type=int, default=FFN_RANKS)
+    parser.add_argument("--experts-per-rank", type=int, default=EXPERTS_PER_RANK)
+    parser.add_argument("--hidden-size", type=int, default=HIDDEN_SIZE)
+    parser.add_argument("--top-k", type=int, default=TOP_K)
     args = parser.parse_args()
+    assert args.attention_dp > 0 and args.ffn_ranks > 0 and args.experts_per_rank > 0
+    assert args.hidden_size > 0 and 1 < args.top_k <= args.experts_per_rank
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
-    world_size = args.tp + FFN_RANKS
+    attention_ranks = args.tp * args.attention_dp
+    world_size = attention_ranks + args.ffn_ranks
     assert int(os.environ["WORLD_SIZE"]) == world_size
     torch.npu.set_device(local_rank)
     dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
@@ -94,8 +123,16 @@ def main() -> None:
         with torch.inference_mode():
             for iteration, case in enumerate(CASES * REPETITIONS):
                 dist.barrier()
-                if rank < args.tp:
-                    x_cpu, ids_cpu, weights_cpu = make_input(rank, case, dtype)
+                if rank < attention_ranks:
+                    x_cpu, ids_cpu, weights_cpu = make_input(
+                        rank,
+                        case,
+                        dtype,
+                        ffn_ranks=args.ffn_ranks,
+                        experts_per_rank=args.experts_per_rank,
+                        hidden_size=args.hidden_size,
+                        top_k=args.top_k,
+                    )
                     x, ids, weights = x_cpu.npu(), ids_cpu.npu(), weights_cpu.npu()
                     ops.afd_async_dispatch_send(
                         x,
@@ -104,11 +141,11 @@ def main() -> None:
                         0,
                         capacity,
                         x.shape[0],
-                        HIDDEN_SIZE,
-                        TOP_K,
-                        FFN_RANKS,
-                        args.tp,
-                        EXPERTS_PER_RANK,
+                        args.hidden_size,
+                        args.top_k,
+                        args.ffn_ranks,
+                        attention_ranks,
+                        args.experts_per_rank,
                         rank,
                         world_size,
                         iteration,
@@ -123,11 +160,11 @@ def main() -> None:
                         comm,
                         0,
                         x.shape[0],
-                        HIDDEN_SIZE,
-                        TOP_K,
-                        FFN_RANKS,
-                        args.tp,
-                        EXPERTS_PER_RANK,
+                        args.hidden_size,
+                        args.top_k,
+                        args.ffn_ranks,
+                        attention_ranks,
+                        args.experts_per_rank,
                         rank,
                         world_size,
                         group_name,
@@ -149,18 +186,19 @@ def main() -> None:
                     )
                 else:
                     chunks = 0
-                    while True:
+                    completed_dp_groups = 0
+                    while completed_dp_groups < args.attention_dp:
                         expanded, scales, batch_info, counts = (
                             ops.afd_async_dispatch_recv(
                                 anchor,
                                 comm,
                                 0,
                                 capacity,
-                                HIDDEN_SIZE,
-                                TOP_K,
-                                FFN_RANKS,
-                                args.tp,
-                                EXPERTS_PER_RANK,
+                                args.hidden_size,
+                                args.top_k,
+                                args.ffn_ranks,
+                                attention_ranks,
+                                args.experts_per_rank,
                                 rank,
                                 world_size,
                                 args.tp,
@@ -178,14 +216,16 @@ def main() -> None:
                         offset = 0
                         for expert, count in enumerate(count_list):
                             multiplier = (
-                                (rank - args.tp) * EXPERTS_PER_RANK + expert + 1
+                                (rank - attention_ranks) * args.experts_per_rank
+                                + expert
+                                + 1
                             )
                             values[offset : offset + count] *= multiplier
                             offset += count
                         result = values.to(dtype).contiguous()
                         if not num_tokens:
                             result = torch.zeros(
-                                (1, HIDDEN_SIZE), dtype=dtype, device="npu"
+                                (1, args.hidden_size), dtype=dtype, device="npu"
                             )
                         ops.afd_async_combine_send(
                             result,
@@ -193,20 +233,20 @@ def main() -> None:
                             batch_info,
                             0,
                             capacity,
-                            HIDDEN_SIZE,
-                            TOP_K,
-                            FFN_RANKS,
-                            args.tp,
-                            EXPERTS_PER_RANK,
+                            args.hidden_size,
+                            args.top_k,
+                            args.ffn_ranks,
+                            attention_ranks,
+                            args.experts_per_rank,
                             rank,
                             world_size,
                             args.tp,
                             group_name,
                         )
                         chunks += 1
-                        if header[4] == EXPERTS_PER_RANK - 1:
-                            break
-                    if case == "empty-rank-multichunk" and rank == args.tp:
+                        if header[4] == args.experts_per_rank - 1:
+                            completed_dp_groups += 1
+                    if case == "empty-rank-multichunk" and rank == attention_ranks:
                         assert chunks > 1
                     reports.append(
                         {"case": case, "iteration": iteration, "chunks": chunks}

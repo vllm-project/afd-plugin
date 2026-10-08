@@ -34,6 +34,7 @@ def test_materializes_sfa_mla_and_dsa_rope_metadata(monkeypatch):
     deepseek_attention_metadata.materialize_deepseek_attention_metadata(
         sfa_metadata,
         torch.arange(4),
+        4,
     )
 
     mla_cos_source = torch.arange(8, dtype=torch.float32)
@@ -50,6 +51,7 @@ def test_materializes_sfa_mla_and_dsa_rope_metadata(monkeypatch):
     deepseek_attention_metadata.materialize_deepseek_attention_metadata(
         mla_metadata,
         torch.arange(8),
+        8,
     )
 
     sfa_cos_source.fill_(-1)
@@ -76,32 +78,18 @@ def test_materializes_sfa_mla_and_dsa_rope_metadata(monkeypatch):
         get_dsa_rope,
     )
     dsa_metadata = object.__new__(AscendDSAMetadata)
-    dsa_metadata.num_input_tokens = 4
-    dsa_metadata.cos = object()
-    dsa_metadata.sin = object()
-    dsa_metadata.prefill = SimpleNamespace(
-        input_positions=torch.tensor([2, 3]),
-        cos=object(),
-        sin=object(),
-    )
-    dsa_metadata.decode = SimpleNamespace(
-        input_positions=torch.tensor([7]),
-        cos=object(),
-        sin=object(),
-    )
+    dsa_metadata.req_metadata = SimpleNamespace(cos=object(), sin=object())
     deepseek_attention_metadata.materialize_deepseek_attention_metadata(
         dsa_metadata,
         torch.arange(6),
+        4,
     )
 
     assert [(positions.tolist(), use_cache) for positions, use_cache in dsa_calls] == [
         ([0, 1, 2, 3], False),
-        ([2, 3], False),
-        ([7], False),
     ]
-    assert dsa_metadata.cos.tolist() == [100, 101, 102, 103]
-    assert dsa_metadata.prefill.sin.tolist() == [202, 203]
-    assert dsa_metadata.decode.cos.tolist() == [107]
+    assert dsa_metadata.req_metadata.cos.tolist() == [100, 101, 102, 103]
+    assert dsa_metadata.req_metadata.sin.tolist() == [200, 201, 202, 203]
 
 
 def test_isolates_mutable_sfa_and_dsa_builder_inputs():

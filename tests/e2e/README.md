@@ -129,6 +129,24 @@ python -m pytest -q -s \
   -k 'afd-v2'
 ```
 
+### GPU MRV2 DBO development comparison
+
+The GPU DBO development branch adds `afd-v2-eager-dbo-dp2` and
+`afd-v2-graph-dbo-dp2`. Together with `afd-v2-eager-dp2`, these use the same
+2A2F DP2/TP1 topology, 128 GSM8K samples, 12 concurrent requests, eight-shot
+prompts, `max_num_seqs=8`, and `max_num_batched_tokens=4096`. Prefix caching,
+chunked prefill, and async scheduling are disabled in all three. Only DBO
+and graph mode change; the graph row uses `FULL_DECODE_ONLY` with capture size 8.
+`AFD_GSM8K_LIMIT` overrides the sample count consistently across the three rows
+(with a shared minimum of 24 for diagnostics).
+
+These are development scenarios, not hardware qualification evidence. The GPU
+validator accepts exactly two microbatches and requires Attention DP > 1;
+FFN remains connector-driven. NPU DBO remains rejected. Do not
+substitute the older MRV1 `afd-graph-dbo-*` scenarios for these rows. Acceptance
+requires live two-stage execution, continuous FULL replay on the graph row,
+paired A/F evidence, accuracy comparison, and a representative overlap trace.
+
 ### Weekly GSM8K
 
 The weekly pipeline runs the Qwen3 MoE and Qwen3.6 MoE suites (baseline,
@@ -153,12 +171,11 @@ samples.
 
 `afd-dsv4-flash-async-cam-dp2tp4-ep8` runs Attention DP2/TP4 on the first
 eight devices and FFN DP8/TP1/EP8 on the last eight. This is a standalone
-Ascend 910C case, outside the four-device PR gate. Use DSV4 Flash W8A8
+Ascend 910C case, outside the four-device PR gate. Use DSV4 Flash W4A8
 weights and a DSV4-capable vLLM/vLLM-Ascend runtime with CAM operators.
 
 The fixed deployment uses eager execution, MBT=8192, max-model-len=1048576,
 max-num-seqs=16, block-size=128, memory utilization=0.7, and seed=1024.
-Both roles explicitly disable `enable_dsv4_shared_compressor_workspace`.
 CAM uses `dynamicQuant=1`, Attention-side gating, and two token-split async
 MoE ubatches. FlashComm1 is enabled only on Attention. CPU binding and
 128-thread weight loading follow the reference prefill scripts. Prefix

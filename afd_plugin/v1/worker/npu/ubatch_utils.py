@@ -220,6 +220,16 @@ def _make_metadata_with_slice(
         if attn_metadata.seq_lens_cpu is not None
         else None
     )
+    seq_lens_cpu_for_builder = (
+        attn_metadata._seq_lens_cpu[request_slice]
+        if attn_metadata._seq_lens_cpu is not None
+        else seq_lens_cpu
+    )
+    seq_lens_cpu_upper_bound = (
+        attn_metadata.seq_lens_cpu_upper_bound[request_slice]
+        if attn_metadata.seq_lens_cpu_upper_bound is not None
+        else None
+    )
 
     if splits_last_request:
         tokens_skipped = start_locs[last_req + 1] - token_slice.stop
@@ -230,11 +240,25 @@ def _make_metadata_with_slice(
         if seq_lens_cpu is not None:
             seq_lens_cpu = seq_lens_cpu.clone()
             seq_lens_cpu[-1] -= tokens_skipped
+        if seq_lens_cpu_for_builder is not None:
+            seq_lens_cpu_for_builder = seq_lens_cpu_for_builder.clone()
+            seq_lens_cpu_for_builder[-1] -= tokens_skipped
+        if seq_lens_cpu_upper_bound is not None:
+            seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound.clone()
+            seq_lens_cpu_upper_bound[-1] -= tokens_skipped
 
-    seq_lens_cpu_for_max = (
-        seq_lens_cpu if seq_lens_cpu is not None else seq_lens.to("cpu")
+    if seq_lens_cpu_for_builder is None:
+        seq_lens_cpu_for_builder = (
+            seq_lens_cpu_upper_bound
+            if seq_lens_cpu_upper_bound is not None
+            else seq_lens.to("cpu")
+        )
+    max_seq_len_source = (
+        seq_lens_cpu_upper_bound
+        if seq_lens_cpu_upper_bound is not None
+        else seq_lens_cpu_for_builder
     )
-    max_seq_len = int(seq_lens_cpu_for_max.max())
+    max_seq_len = max(int(max_seq_len_source.max()), attn_metadata.max_seq_len)
     num_computed_tokens_cpu = (
         attn_metadata.num_computed_tokens_cpu[request_slice]
         if attn_metadata.num_computed_tokens_cpu is not None
@@ -267,7 +291,7 @@ def _make_metadata_with_slice(
         query_start_loc_cpu=query_start_loc_cpu,
         seq_lens=seq_lens,
         seq_lens_cpu=seq_lens_cpu,
-        _seq_lens_cpu=seq_lens_cpu_for_max,
+        _seq_lens_cpu=seq_lens_cpu_for_builder,
         _num_computed_tokens_cpu=num_computed_tokens_cpu,
         num_computed_tokens_cpu=num_computed_tokens_cpu,
         num_reqs=num_requests,
@@ -311,11 +335,7 @@ def _make_metadata_with_slice(
             if attn_metadata.is_prefilling is not None
             else None
         ),
-        seq_lens_cpu_upper_bound=(
-            attn_metadata.seq_lens_cpu_upper_bound[request_slice]
-            if attn_metadata.seq_lens_cpu_upper_bound is not None
-            else None
-        ),
+        seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
         mm_req_doc_ranges=attn_metadata.mm_req_doc_ranges,
         rswa_prefix_lens=(
             attn_metadata.rswa_prefix_lens[request_slice]

@@ -40,7 +40,6 @@ def _async_cam_env() -> dict[str, str]:
     env.setdefault("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
     env.setdefault("ASCEND_LAUNCH_BLOCKING", "1")
     env.setdefault("VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL", "1")
-    env.setdefault("VLLM_ASCEND_ENABLE_FLASHCOMM1", "1")
     return env
 
 

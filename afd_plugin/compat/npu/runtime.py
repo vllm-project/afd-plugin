@@ -27,10 +27,14 @@ _PATCHES_APPLIED = False
 def apply_afd_ascend_config_patch_if_needed() -> None:
     """Apply patches required while vLLM builds an AFD NPU config."""
 
+    from afd_plugin.compat.patches.npu.ascend_config import (
+        apply_afd_ascend_config_patch,
+    )
     from afd_plugin.compat.patches.npu.ascend_platform import (
         apply_afd_ascend_dbo_config_patch,
     )
 
+    apply_afd_ascend_config_patch()
     if not apply_afd_ascend_dbo_config_patch():
         raise RuntimeError(
             "AFD NPU DBO config patch requires vLLM-Ascend NPUPlatform",
@@ -59,6 +63,26 @@ def apply_afd_async_dp_engine_patch_if_needed(vllm_config: VllmConfig) -> bool:
     return True
 
 
+def apply_afd_ascend_engine_core_config_patch_if_needed(
+    vllm_config: VllmConfig,
+) -> bool:
+    """Prepare AFD sync Attention and FFN DP children for Ascend config."""
+    afd_config = parse_optional_afd_config(vllm_config, validate=False)
+    if afd_config is None or (
+        afd_config.role == "attention" and is_afd_async_dp(vllm_config)
+    ):
+        return False
+
+    from vllm.v1.engine.core import EngineCoreProc
+
+    from afd_plugin.compat.patches.npu.ascend_config import (
+        run_afd_ascend_engine_core,
+    )
+
+    EngineCoreProc.run_engine_core = staticmethod(run_afd_ascend_engine_core)
+    return True
+
+
 def apply_afd_ascend_patches_if_needed() -> None:
     """Apply plugin-owned runtime patches after Ascend initialization."""
 
@@ -80,6 +104,7 @@ def apply_afd_ascend_patches_if_needed() -> None:
 
 __all__ = [
     "apply_afd_async_dp_engine_patch_if_needed",
+    "apply_afd_ascend_engine_core_config_patch_if_needed",
     "apply_afd_ascend_config_patch_if_needed",
     "apply_afd_ascend_patches_if_needed",
     "ascend_forward_context",

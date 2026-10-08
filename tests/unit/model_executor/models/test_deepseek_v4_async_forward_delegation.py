@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-native = pytest.importorskip("vllm_ascend.models.deepseek_v4")
+native = pytest.importorskip("vllm_ascend.models.deepseek_v4.model")
 
 from afd_plugin.model_executor.models.npu import deepseek_v4 as adapter  # noqa: E402
 from afd_plugin.model_executor.models.npu import (  # noqa: E402

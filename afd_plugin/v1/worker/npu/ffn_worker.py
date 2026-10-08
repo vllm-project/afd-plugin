@@ -46,11 +46,6 @@ class AFDNPUFFNWorker(NPUWorker):
     afd_expected_role = "ffn"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        # Import after vLLM-Ascend completes platform initialization. Importing
-        # its MoE modules from the general-plugin hook can race Ascend's own
-        # ops package initialization and leave DeviceOperator partially loaded.
-        import afd_plugin.compat.patches.npu.force_load_balance  # noqa: F401
-
         apply_afd_ascend_patches_if_needed()
         super().__init__(*args, **kwargs)
         self._ffn_thread: threading.Thread | None = None

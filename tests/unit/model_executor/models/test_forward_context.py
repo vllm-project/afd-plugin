@@ -7,9 +7,12 @@ import ast
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
+
+if TYPE_CHECKING:
+    from torch import Tensor
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
@@ -212,7 +215,7 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
         *,
         use_sequence_parallel,
     ):
-        assert use_sequence_parallel is True
+        assert use_sequence_parallel is False
         layout = object()
         dispatch_layouts.append(layout)
         return SimpleNamespace(
@@ -253,6 +256,7 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
 
     class _ProfileMoELayer:
         is_moe_layer = True
+        use_sequence_parallel_moe = False
 
         layer_idx = 0
         mlp = SimpleNamespace(shared_experts=lambda x: 2 * x)
@@ -263,6 +267,8 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
             hidden_states,
             residual,
             llama_4_scaling,
+            *,
+            already_sequence_parallel=False,
         ):
             return (
                 hidden_states + 1,
@@ -273,6 +279,9 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
             )
 
     model = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(use_sequence_parallel_moe=True),
+        ),
         layers=[_ProfileMoELayer(), _ProfileMoELayer()],
         start_layer=0,
         end_layer=2,
@@ -461,13 +470,15 @@ def test_async_moe_pipeline_preserves_stage_order(monkeypatch):
         parent_input_tokens=4,
         use_sequence_parallel=True,
     )
-    stage_hidden_states = [torch.zeros((1, 8)), torch.ones((2, 8))]
+    stage_hidden_states = [torch.zeros((2, 8)), torch.ones((2, 8))]
 
     def compute_attn_output(
         _positions,
         hidden_states,
         residual,
         _llama_4_scaling,
+        *,
+        already_sequence_parallel=False,
     ):
         stage_context = get_current_forward_context()
         events.append(
@@ -476,9 +487,13 @@ def test_async_moe_pipeline_preserves_stage_order(monkeypatch):
                 stage_context.ubatch_idx,
                 stage_context.attn_metadata,
                 stage_context.num_tokens,
-                stage_context.pad_size,
             ),
         )
+        if not already_sequence_parallel:
+            local_tokens = (
+                execution_plan.stages[stage_context.ubatch_idx].input_tokens // 2
+            )
+            hidden_states = hidden_states[:local_tokens]
         topk = hidden_states[:, :1]
         return hidden_states, residual, topk, topk.to(torch.int32), None
 
@@ -528,6 +543,12 @@ def test_async_moe_pipeline_preserves_stage_order(monkeypatch):
 
     output, residual = deepseek_v2_async_cam_forward.run_async_moe_ubatch_afd_forward(
         model=SimpleNamespace(
+            vllm_config=SimpleNamespace(
+                parallel_config=SimpleNamespace(
+                    use_sequence_parallel_moe=True,
+                    pipeline_parallel_size=1,
+                ),
+            ),
             start_layer=0,
             end_layer=2,
             layers=[
@@ -568,7 +589,6 @@ def test_async_moe_pipeline_preserves_stage_order(monkeypatch):
         stage_idx = event[1]
         assert event[2] == {"layer": f"stage-{stage_idx}"}
         assert event[3] == 2
-        assert event[4] == (0, 2)[stage_idx]
     assert all(
         restored is expected
         for restored, expected in zip(output, stage_hidden_states, strict=True)
@@ -600,11 +620,13 @@ def test_deepseek_afd_ffn_path_reuses_ascend_moe_mlp_after_attention_gate():
     assert "deepseek_v2_attention_gate," in compute_ffn_output
     assert "AFDF2ATransferPayload(" in compute_moe
     assert "MoEMlpComputeInput(" in compute_moe
-    assert "unified_apply_mlp(" in compute_moe
-    assert "routed_output, _ = unified_apply_mlp(" in compute_moe
+    assert "apply_moe_mlp(" in compute_moe
+    assert "routed_output, _ = apply_moe_mlp(" in compute_moe
+    assert "layer=routed_experts" in compute_moe
+    assert "quant_method=quant_method" in compute_moe
     assert "quant_type == QuantType.W8A8" in compute_moe
-    assert 'experts.get_eplb_parameter("w13_weight")' in compute_moe
-    assert 'experts.get_eplb_parameter("w2_weight")' in compute_moe
+    assert 'routed_experts.get_eplb_parameter("w13_weight")' in compute_moe
+    assert 'routed_experts.get_eplb_parameter("w2_weight")' in compute_moe
     assert "experts.w13_weight" not in compute_moe
     assert "experts.w2_weight" not in compute_moe
     assert "w13_weight_scale_fp32" in compute_moe
@@ -635,7 +657,7 @@ def test_deepseek_afd_ffn_path_reuses_ascend_moe_mlp_after_attention_gate():
     assert "fusion=use_gmmswigluquant_fusion" in compute_moe
     assert "_compute_w8a8_shared_experts_from_int8(" in compute_moe
     assert "shared_input.dtype == torch.int8" in compute_moe
-    assert 'getattr(layer.mlp, "swiglu_limit", None)' in compute_moe
+    assert "swiglu_limit=moe_config.swiglu_limit" in compute_moe
     assert "fusion=False" not in compute_moe
     assert "output_dtype=torch.int32" in gate_source
     assert "npu_dequant_swiglu_quant(" in gate_source
@@ -668,11 +690,13 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
 
-    routed_calls = []
+    routed_calls: list[Tensor] = []
 
-    def fake_unified_apply_mlp(*, mlp_compute_input):
+    def fake_apply_moe_mlp(*, mlp_compute_input, quant_method):
         assert mlp_compute_input.quant.quant_type == FakeQuantType.W8A8
         assert mlp_compute_input.quant.is_per_channel_weight is False
+        assert quant_method == "scheme"
+        assert mlp_compute_input.layer is routed_experts
         routed_calls.append(mlp_compute_input.hidden_states)
         return (
             torch.ones_like(
@@ -683,16 +707,19 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
         )
 
     fake_moe_mlp: Any = ModuleType("vllm_ascend.ops.fused_moe.moe_mlp")
-    fake_moe_mlp.unified_apply_mlp = fake_unified_apply_mlp
-    fake_stage_contracts: Any = ModuleType(
-        "vllm_ascend.ops.fused_moe.moe_stage_contracts",
+    fake_moe_mlp.apply_moe_mlp = fake_apply_moe_mlp
+    fake_mlp_contracts: Any = ModuleType(
+        "vllm_ascend.ops.fused_moe.dataclass.moe_mlp",
     )
-    fake_stage_contracts.MoEMlpComputeInput = KeywordArguments
-    fake_stage_contracts.MoEWeights = KeywordArguments
-    fake_stage_params: Any = ModuleType(
-        "vllm_ascend.ops.fused_moe.moe_stage_params",
+    fake_mlp_contracts.MoEMlpComputeInput = KeywordArguments
+    fake_experts_contracts: Any = ModuleType(
+        "vllm_ascend.ops.fused_moe.dataclass.fused_experts",
     )
-    fake_stage_params.MoEQuantParams = KeywordArguments
+    fake_experts_contracts.MoEWeights = KeywordArguments
+    fake_quant_contracts: Any = ModuleType(
+        "vllm_ascend.ops.fused_moe.dataclass.moe_quant",
+    )
+    fake_quant_contracts.MoEQuantParams = KeywordArguments
     fake_quant_type: Any = ModuleType("vllm_ascend.quantization.quant_type")
     fake_quant_type.QuantType = FakeQuantType
     monkeypatch.setitem(
@@ -702,13 +729,18 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
     )
     monkeypatch.setitem(
         sys.modules,
-        "vllm_ascend.ops.fused_moe.moe_stage_contracts",
-        fake_stage_contracts,
+        "vllm_ascend.ops.fused_moe.dataclass.moe_mlp",
+        fake_mlp_contracts,
     )
     monkeypatch.setitem(
         sys.modules,
-        "vllm_ascend.ops.fused_moe.moe_stage_params",
-        fake_stage_params,
+        "vllm_ascend.ops.fused_moe.dataclass.fused_experts",
+        fake_experts_contracts,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_ascend.ops.fused_moe.dataclass.moe_quant",
+        fake_quant_contracts,
     )
     monkeypatch.setitem(
         sys.modules,
@@ -743,12 +775,23 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
     )
 
     shared_experts = object()
-    experts = SimpleNamespace(
-        quant_type=FakeQuantType.W8A8,
+    routed_experts = SimpleNamespace(
         dynamic_eplb=False,
         get_eplb_parameter=lambda name: name,
         activation="silu",
-        _shared_experts=shared_experts,
+        quant_method=SimpleNamespace(quant_method="scheme"),
+    )
+    experts = SimpleNamespace(
+        quant_type=FakeQuantType.W8A8,
+        moe_config=SimpleNamespace(
+            swiglu_limit=None,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+            activation_situ_beta=None,
+            activation_situ_linear_beta=None,
+        ),
+        shared_experts=SimpleNamespace(_layer=shared_experts),
+        routed_experts=routed_experts,
     )
     layer = SimpleNamespace(
         mlp=SimpleNamespace(

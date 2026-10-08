@@ -125,6 +125,22 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
     def profile_run(self) -> None:
         pass
 
+    # Patch reason: vLLM 0.30.0 Worker.determine_available_memory calls
+    # ``self.model_runner.profile_cudagraph_memory()`` on CUDA when the compile
+    # config enables CUDA graphs (gpu_worker.py), and GPUFFNModelRunner does
+    # not inherit that method from any native runner.
+    # Patch functionality: report zero estimated CUDA graph memory so the
+    # engine's memory planning is unchanged. The FFN runner captures its graphs
+    # lazily from the connector loop after memory profiling, into its own
+    # graph pool, so no graph memory belongs in the profiling estimate.
+    # Signature: matches vLLM v0.30.0 GPUModelRunner.profile_cudagraph_memory
+    # exactly: (self) -> int; 0 mirrors the upstream NONE-mode early return.
+    # Upstream: vLLM v0.30.0, vllm/v1/worker/gpu/model_runner.py,
+    # GPUModelRunner.profile_cudagraph_memory; commit
+    # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
+    def profile_cudagraph_memory(self) -> int:
+        return 0
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}
 
@@ -403,11 +419,12 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
 
     # Patch reason: the FFN runner owns GPUModelRunner-equivalent CUDA state
     # without inheriting GPUModelRunner's shutdown implementation.
-    # Patch functionality: mirror the pinned native GPU resource cleanup and
-    # then close AFD-owned profiler and connector resources.
+    # Patch functionality: mirror the pinned native GPU resource cleanup (the
+    # portable subset; the FFN runner owns no KV caches or attention groups)
+    # and then close AFD-owned profiler and connector resources.
     # Signature: matches GPUModelRunner.shutdown; no added parameters.
-    # Upstream: vLLM v0.26.0, vllm/v1/worker/gpu_model_runner.py
-    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    # Upstream: vLLM v0.30.0, vllm/v1/worker/gpu_model_runner.py
+    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
     def shutdown(self) -> None:
         # ### PATCH START: release native-equivalent and AFD-owned GPU state.
         stop_afd_gpu_profiler(self.prof)

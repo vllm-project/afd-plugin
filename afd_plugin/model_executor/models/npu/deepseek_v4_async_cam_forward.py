@@ -17,7 +17,7 @@ from vllm.forward_context import (
     override_forward_context,
 )
 from vllm.sequence import IntermediateTensors
-from vllm_ascend.models import deepseek_v4 as native
+from vllm_ascend.models.deepseek_v4 import model as native
 
 from afd_plugin.connectors import AFDTransferContext, AFDTransferMetadata
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
@@ -108,11 +108,11 @@ def run_async_moe_ubatch_forward(
         hidden_states = intermediate_tensors["hidden_states"]
 
     parent_context = get_forward_context()
-    if bool(parent_context.flash_comm_v1_enabled) != metadata.use_sequence_parallel:
+    if model.use_sequence_parallel_moe != metadata.use_sequence_parallel:
         raise RuntimeError(
-            "DSV4 async MoE stage layout does not match FlashComm1: "
+            "DSV4 async MoE stage layout does not match model sequence parallelism: "
             f"layout_sequence_parallel={metadata.use_sequence_parallel}, "
-            f"flash_comm_v1_enabled={bool(parent_context.flash_comm_v1_enabled)}",
+            f"use_sequence_parallel_moe={model.use_sequence_parallel_moe}",
         )
     afd_metadata = get_afd_metadata_from_forward_context(parent_context)
     if afd_metadata is None:
@@ -149,12 +149,8 @@ def run_async_moe_ubatch_forward(
         context.num_ubatches = len(metadata.stages)
         context.dbo_enabled = False
         context.input_ids = stage_input_ids[stage_idx]
-        if metadata.use_sequence_parallel:
-            context.num_tokens = stage.actual_tokens
-            context.pad_size = int(stage.input_tokens) - stage.actual_tokens
-        else:
-            context.num_tokens = int(stage.input_tokens)
-            context.pad_size = 0
+        context.num_tokens = stage.actual_tokens
+        context.is_padding = None
         return context
 
     def compute_stage_attention(
@@ -173,11 +169,17 @@ def run_async_moe_ubatch_forward(
                 layer.hc_attn_base,
             )
             stage_hidden = layer.input_layernorm(stage_hidden)
+            if metadata.use_sequence_parallel and not layer.enable_dsa_cp:
+                stage_hidden = native.sp_all_gather(stage_hidden)[
+                    : metadata.stages[stage_idx].actual_tokens
+                ]
             stage_hidden = layer.self_attn(
                 positions=stage_positions[stage_idx],
                 hidden_states=stage_hidden,
                 llama_4_scaling=None,
             )
+            if metadata.use_sequence_parallel and not layer.enable_dsa_cp:
+                stage_hidden = native.sp_reduce_scatter(stage_hidden)
             stage_hidden = layer.hc_post(
                 stage_hidden,
                 attn_residual,
@@ -191,7 +193,7 @@ def run_async_moe_ubatch_forward(
                 layer.hc_ffn_scale,
                 layer.hc_ffn_base,
             )
-            stage_hidden = layer.post_attention_layernorm(stage_hidden)
+            stage_hidden, stage_hidden_fp32 = layer.rms_norm_cast(stage_hidden)
             from afd_plugin.model_executor.models.npu import (
                 deepseek_v4_attention_gate,
             )
@@ -200,6 +202,8 @@ def run_async_moe_ubatch_forward(
                 deepseek_v4_attention_gate.compute_attention_gate_topk(
                     layer.mlp,
                     stage_hidden,
+                    input_ids=stage_input_ids[stage_idx],
+                    hidden_states_fp32=stage_hidden_fp32,
                 )
             )
             dispatch = prepare_cam_dispatch_payload(
@@ -287,16 +291,15 @@ def run_async_moe_ubatch_forward(
         metadata,
     )
 
-    if parent_context.flash_comm_v1_enabled:
-        hidden_flat = native.tensor_model_parallel_all_gather(
-            restored_hidden_states.flatten(1),
-            dim=0,
-        )
-        if parent_context.pad_size > 0:
-            hidden_flat = hidden_flat[: -parent_context.pad_size]
-    else:
+    if model._needs_mtp_hidden_states:
+        if model._mtp_hidden_buffer is None:
+            model._mtp_hidden_buffer = torch.empty(
+                model._mtp_buffer_shape,
+                dtype=model._mtp_buffer_dtype,
+                device=model.device,
+            )
         hidden_flat = restored_hidden_states.flatten(1)
-    model._mtp_hidden_buffer[: hidden_flat.shape[0]].copy_(hidden_flat)
+        model._mtp_hidden_buffer[: hidden_flat.shape[0]].copy_(hidden_flat)
 
     if not pp_group.is_last_rank:
         return IntermediateTensors({"hidden_states": restored_hidden_states})

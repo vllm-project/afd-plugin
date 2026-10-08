@@ -53,8 +53,6 @@ assert current_platform.device_type == "npu"
 import afd_plugin
 
 afd_plugin.register_afd()
-force_load_balance_module = "afd_plugin.compat.patches.npu.force_load_balance"
-assert force_load_balance_module not in sys.modules
 
 from afd_plugin.validation import resolve_class_from_qualname
 
@@ -62,10 +60,9 @@ for qualname in sys.argv[1:]:
     cls = resolve_class_from_qualname(qualname)
     assert cls.__module__.startswith("afd_plugin.v1.worker.npu")
 
-assert force_load_balance_module not in sys.modules
 """
 
-V026_OVERRIDE_CONTRACTS = [
+RUNTIME_OVERRIDE_CONTRACTS = [
     ("attention_worker", "AFDAttentionWorker", "Worker", "__init__"),
     ("attention_worker", "AFDAttentionWorker", "Worker", "init_device"),
     ("ffn_worker", "AFDFFNWorker", "Worker", "__init__"),
@@ -128,12 +125,6 @@ V026_OVERRIDE_CONTRACTS = [
         "ubatch_wrapper",
         "AFDUBatchWrapper",
         "UBatchWrapper",
-        "_create_sm_control_context",
-    ),
-    (
-        "ubatch_wrapper",
-        "AFDUBatchWrapper",
-        "UBatchWrapper",
         "_make_ubatch_metadata",
     ),
 ]
@@ -169,7 +160,7 @@ def test_gpu_runtime_class_paths_resolve_when_vllm_is_available(qualname):
 @pytest.mark.vllm_runtime
 @pytest.mark.parametrize(
     ("module_name", "afd_class_name", "native_class_name", "method_name"),
-    V026_OVERRIDE_CONTRACTS,
+    RUNTIME_OVERRIDE_CONTRACTS,
 )
 def test_gpu_v1_overrides_match_native_call_contract(
     module_name,

@@ -87,10 +87,6 @@ def create_ascend_forward_context(
     new_forward_context.num_tokens = num_tokens
     new_forward_context.ubatch_idx = int(ubatch_num)
     new_forward_context.num_ubatches = len(ubatch_slices)
-    new_forward_context.flash_comm_v1_enabled = (
-        cur_forward_context.flash_comm_v1_enabled
-    )
-    new_forward_context.pad_size = 0
     new_forward_context.is_first_layer = cur_forward_context.is_first_layer
     new_forward_context.layer_idx = cur_forward_context.layer_idx
     new_forward_context.prefetch_mlp_gate_up_proj = (
@@ -100,6 +96,9 @@ def create_ascend_forward_context(
         cur_forward_context.prefetch_mlp_down_proj
     )
     new_forward_context.model_instance = cur_forward_context.model_instance
+    new_forward_context.device_metadata_executor = (
+        cur_forward_context.device_metadata_executor
+    )
     new_forward_context.is_draft_model = cur_forward_context.is_draft_model
     new_forward_context.is_draft_model_prefill = (
         cur_forward_context.is_draft_model_prefill
@@ -119,23 +118,13 @@ def create_ascend_forward_context(
         cur_forward_context.eplb_heat_collection_status
     )
 
-    if new_forward_context.flash_comm_v1_enabled:
-        new_forward_context.pad_size = (
-            tp_world_size - (num_tokens % tp_world_size)
-        ) % tp_world_size
-
     if dp_world_size > 1 and dp_metadata is not None:
         max_tokens_across_dp = dp_metadata.num_tokens_across_dp_cpu.max().item()
-        if new_forward_context.flash_comm_v1_enabled:
-            padded_length = (
-                (max_tokens_across_dp + tp_world_size - 1)
-                // tp_world_size
-                * tp_world_size
-            )
-            new_forward_context.padded_length = padded_length
-            new_forward_context.pad_size = padded_length - num_tokens
     else:
         max_tokens_across_dp = num_tokens
+    new_forward_context.padded_length = (
+        math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
+    )
     new_forward_context.max_tokens_across_dp = max_tokens_across_dp
 
     new_forward_context.padded_num_tokens = (

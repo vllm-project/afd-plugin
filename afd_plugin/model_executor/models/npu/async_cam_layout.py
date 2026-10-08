@@ -93,7 +93,7 @@ def get_async_moe_ubatch_metadata_from_forward_context(
 
 @dataclass
 class AsyncMoeStageInputs:
-    """TP-local tensors for the two global MoE stages."""
+    """Per-stage hidden states and full attention positions/scaling."""
 
     hidden_states: list[torch.Tensor]
     residuals: list[torch.Tensor | None]
@@ -139,7 +139,7 @@ def prepare_cam_dispatch_payload(
 ) -> CAMDispatchPayload:
     """Convert the model token layout to one rank-local CAM payload.
 
-    FlashComm1 already leaves each Attention TP rank with a disjoint token
+    Model-owned sequence parallelism leaves each Attention TP rank with a disjoint token
     shard, so that layout passes through unchanged. Plain TP keeps a replicated
     token dimension after its tensor-parallel collectives; only the CAM
     boundary shards that dimension so each global token is dispatched once.
@@ -241,153 +241,75 @@ def build_async_moe_stage_inputs(
     positions: torch.Tensor,
     llama_4_scaling: torch.Tensor | None,
     metadata: AsyncMoeUbatchMetadata,
+    *,
+    shard_hidden_states: bool = True,
 ) -> AsyncMoeStageInputs:
-    """Convert the full model layout into per-stage Attention layouts."""
+    """Split full model inputs, optionally sharding before the first attention.
 
+    DSV2 sets ``shard_hidden_states=False``: its first MoE attention owns the
+    transition to SP. Stage positions/scaling always match the attention input.
+    """
+
+    # Model inputs and PP boundaries carry global tokens on the target runtime.
+    # Split stages before sharding; no full-batch gather/shard round trip.
+    inputs = _build_replicated_stage_inputs(
+        hidden_states,
+        residual,
+        positions,
+        llama_4_scaling,
+        metadata,
+    )
     if not metadata.use_sequence_parallel:
-        return _build_replicated_stage_inputs(
-            hidden_states,
-            residual,
-            positions,
-            llama_4_scaling,
-            metadata,
-        )
+        return inputs
 
     tp_group = get_tp_group()
-    tp_rank = int(tp_group.rank_in_group)
     tp_size = int(tp_group.world_size)
-    global_input_tokens = metadata.parent_input_tokens
-    if tp_size <= 1 or global_input_tokens % tp_size != 0:
-        raise ValueError(
-            "Invalid sequence-parallel Async CAM layout: "
-            f"global_input_tokens={global_input_tokens}, tp_size={tp_size}",
+    tp_rank = int(tp_group.rank_in_group)
+    for index, stage in enumerate(metadata.stages):
+        if int(stage.input_tokens) % tp_size:
+            raise ValueError("Async CAM stage extent must be TP divisible")
+        local_tokens = int(stage.input_tokens) // tp_size
+        local_slice = slice(tp_rank * local_tokens, (tp_rank + 1) * local_tokens)
+        # DSV4 shards before its first attention; DSV2 enters SP only after
+        # its first MoE attention. Both keep full real-token positions.
+        input_slice = (
+            local_slice if shard_hidden_states else slice(0, stage.actual_tokens)
         )
-    local_full_tokens = global_input_tokens // tp_size
-    if int(hidden_states.shape[0]) != local_full_tokens:
-        raise ValueError(
-            "Async CAM expected a TP-local full-batch hidden-state shard: "
-            f"expected_rows={local_full_tokens}, "
-            f"actual_rows={int(hidden_states.shape[0])}",
-        )
-    if residual is not None and int(residual.shape[0]) != local_full_tokens:
-        raise ValueError(
-            "Async CAM residual must use the same TP-local layout as hidden "
-            f"states: expected_rows={local_full_tokens}, "
-            f"actual_rows={int(residual.shape[0])}",
-        )
-
-    if residual is None:
-        global_hidden_states = _all_gather_rows(
-            hidden_states,
-            expected_rows=global_input_tokens,
-        )
-        global_residual = None
-    else:
-        hidden_width = int(hidden_states.shape[-1])
-        residual_width = int(residual.shape[-1])
-        combined_states = _all_gather_rows(
-            torch.cat((hidden_states, residual), dim=-1),
-            expected_rows=global_input_tokens,
-        )
-        global_hidden_states, global_residual = combined_states.split(
-            (hidden_width, residual_width),
-            dim=-1,
-        )
-    positions_token_dim = _require_global_token_dim(
-        positions,
-        global_input_tokens,
-        tensor_name="positions",
-    )
-    scaling_token_dim = (
-        None
-        if llama_4_scaling is None
-        else _optional_global_token_dim(
-            llama_4_scaling,
-            global_input_tokens,
-            preferred_dim=positions_token_dim,
-        )
-    )
-
-    stage_hidden_states: list[torch.Tensor] = []
-    stage_residuals: list[torch.Tensor | None] = []
-    stage_positions: list[torch.Tensor] = []
-    stage_scaling: list[torch.Tensor | None] = []
-    for stage_slice in metadata.stages:
-        stage_input_tokens = int(stage_slice.input_tokens)
-        if stage_input_tokens % tp_size != 0:
-            raise ValueError(
-                "Async CAM stage extent must be TP divisible: "
-                f"token_slice={stage_slice.token_slice}, tp_size={tp_size}",
-            )
-        local_stage_tokens = stage_input_tokens // tp_size
-        stage_hidden = _slice_and_pad_token_dim(
-            global_hidden_states,
-            0,
-            stage_slice.token_slice,
-            stage_input_tokens,
-        )
-        stage_residual = (
-            None
-            if global_residual is None
-            else _slice_and_pad_token_dim(
-                global_residual,
-                0,
-                stage_slice.token_slice,
-                stage_input_tokens,
-            )
-        )
-        stage_position_tensor = _slice_and_pad_token_dim(
+        inputs.hidden_states[index] = inputs.hidden_states[index][input_slice]
+        if inputs.residuals[index] is not None:
+            inputs.residuals[index] = inputs.residuals[index][input_slice]
+        # Attention sees all real tokens after its model-owned all-gather.
+        # Positions therefore stay global and exclude stage-only SP padding.
+        position_dim = _require_global_token_dim(
             positions,
-            positions_token_dim,
-            stage_slice.token_slice,
-            stage_input_tokens,
+            metadata.parent_input_tokens,
+            tensor_name="positions",
         )
-        stage_scaling_tensor = _slice_and_pad_optional_token_tensor(
-            llama_4_scaling,
-            scaling_token_dim,
-            stage_slice.token_slice,
-            stage_input_tokens,
+        inputs.positions[index] = _slice_token_dim(
+            positions,
+            position_dim,
+            stage.token_slice,
         )
-        local_stage_slice = slice(
-            tp_rank * local_stage_tokens,
-            (tp_rank + 1) * local_stage_tokens,
-        )
-
-        stage_hidden_states.append(stage_hidden[local_stage_slice])
-        stage_residuals.append(
-            None if stage_residual is None else stage_residual[local_stage_slice],
-        )
-        stage_positions.append(
-            _slice_token_dim(
-                stage_position_tensor,
-                positions_token_dim,
-                local_stage_slice,
-            ),
-        )
-        stage_scaling.append(
-            (
-                None
-                if stage_scaling_tensor is None or scaling_token_dim is None
-                else _slice_token_dim(
-                    stage_scaling_tensor,
-                    scaling_token_dim,
-                    local_stage_slice,
-                )
-            ),
-        )
-    return AsyncMoeStageInputs(
-        hidden_states=stage_hidden_states,
-        residuals=stage_residuals,
-        positions=stage_positions,
-        llama_4_scaling=stage_scaling,
-    )
+        if llama_4_scaling is not None:
+            scaling_dim = _optional_global_token_dim(
+                llama_4_scaling,
+                metadata.parent_input_tokens,
+                preferred_dim=position_dim,
+            )
+            inputs.llama_4_scaling[index] = _slice_and_pad_optional_token_tensor(
+                llama_4_scaling,
+                scaling_dim,
+                stage.token_slice,
+                stage.actual_tokens,
+            )
+    return inputs
 
 
 def restore_async_moe_stage_outputs(
     stage_outputs: list[torch.Tensor],
     metadata: AsyncMoeUbatchMetadata,
 ) -> torch.Tensor:
-    """Restore stage-local outputs to the parent model's TP-local layout."""
+    """Gather each stage once and restore the global parent token order."""
 
     if len(stage_outputs) != len(metadata.stages):
         raise ValueError(
@@ -407,9 +329,6 @@ def restore_async_moe_stage_outputs(
             metadata.parent_input_tokens,
         )
 
-    tp_group = get_tp_group()
-    tp_rank = int(tp_group.rank_in_group)
-    tp_size = int(tp_group.world_size)
     global_stage_outputs = [
         _all_gather_rows(
             stage_output,
@@ -431,14 +350,7 @@ def restore_async_moe_stage_outputs(
         ),
         metadata.parent_input_tokens,
     )
-    if int(global_output.shape[0]) % tp_size != 0:
-        raise ValueError(
-            "Restored Async CAM output is not TP divisible: "
-            f"rows={int(global_output.shape[0])}, tp_size={tp_size}",
-        )
-    local_full_tokens = int(global_output.shape[0]) // tp_size
-    local_start = tp_rank * local_full_tokens
-    return global_output[local_start : local_start + local_full_tokens]
+    return global_output
 
 
 def _build_replicated_stage_inputs(
@@ -451,13 +363,13 @@ def _build_replicated_stage_inputs(
     global_input_tokens = metadata.parent_input_tokens
     if int(hidden_states.shape[0]) != global_input_tokens:
         raise ValueError(
-            "Non-SP Async CAM hidden states must contain the full stageable "
+            "Async CAM hidden states must contain the global stageable "
             f"batch: expected_rows={global_input_tokens}, "
             f"actual_rows={int(hidden_states.shape[0])}",
         )
     if residual is not None and int(residual.shape[0]) != global_input_tokens:
         raise ValueError(
-            "Non-SP Async CAM residual must match hidden states: "
+            "Async CAM residual must match global hidden states: "
             f"expected_rows={global_input_tokens}, "
             f"actual_rows={int(residual.shape[0])}",
         )
@@ -583,16 +495,15 @@ def log_async_moe_stage_attention(
     logger.warning(
         "AFD Async CAM stage attention; stage=%s actual_tokens=%s "
         "token_slice=(%s,%s) input_tokens=%s local_tokens=%s sequence_parallel=%s "
-        "context_num_tokens=%s context_pad_size=%s",
+        "context_num_tokens=%s",
         stage_idx,
         stage.actual_tokens,
         stage.token_slice.start,
         stage.token_slice.stop,
         int(stage.input_tokens),
         local_tokens,
-        bool(forward_context.flash_comm_v1_enabled),
+        local_tokens < int(stage.input_tokens),
         int(forward_context.num_tokens),
-        int(forward_context.pad_size),
     )
 
 

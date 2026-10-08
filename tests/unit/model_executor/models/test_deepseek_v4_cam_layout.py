@@ -9,7 +9,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
-pytest.importorskip("vllm_ascend.models.deepseek_v4")
+pytest.importorskip("vllm_ascend.models.deepseek_v4.model")
 
 from afd_plugin.model_executor.models.npu import (  # noqa: E402
     async_cam_layout,  # noqa: E402
@@ -21,18 +21,19 @@ from afd_plugin.model_executor.models.npu import deepseek_v4 as adapter  # noqa:
 def _make_proxy(monkeypatch, *, use_sequence_parallel: bool, in_profile_run: bool):
     proxy = object.__new__(adapter.AFDDeepseekV4AttentionGateRemoteMoE)
     torch.nn.Module.__init__(proxy)
+    proxy.use_sequence_parallel_moe = use_sequence_parallel
+    proxy.shared_experts = None
     topk_weights = torch.arange(32, dtype=torch.float32).reshape(16, 2)
     topk_ids = torch.arange(32, dtype=torch.int32).reshape(16, 2)
     monkeypatch.setattr(
         deepseek_v4_attention_gate,
         "compute_attention_gate_topk",
-        lambda _proxy, _hidden_states: (topk_weights, topk_ids),
+        lambda _proxy, _hidden_states, **_kwargs: (topk_weights, topk_ids),
     )
     monkeypatch.setattr(
         adapter,
         "get_forward_context",
         lambda: SimpleNamespace(
-            flash_comm_v1_enabled=use_sequence_parallel,
             in_profile_run=in_profile_run,
         ),
     )

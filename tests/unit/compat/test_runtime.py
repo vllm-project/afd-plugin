@@ -12,13 +12,19 @@ from afd_plugin.compat.npu import runtime as ascend_runtime
 from afd_plugin.compat.npu.runtime import fix_all2all_backend_for_afd
 
 
-def _vllm_config(*, enable_sp=False, all2all_backend="allgather_reducescatter"):
+def _vllm_config(
+    *,
+    enable_sp=False,
+    use_sequence_parallel_moe=False,
+    all2all_backend="allgather_reducescatter",
+):
     return SimpleNamespace(
         compilation_config=SimpleNamespace(
             pass_config=SimpleNamespace(enable_sp=enable_sp),
         ),
         parallel_config=SimpleNamespace(
             all2all_backend=all2all_backend,
+            use_sequence_parallel_moe=use_sequence_parallel_moe,
         ),
     )
 
@@ -45,6 +51,12 @@ def test_fix_all2all_backend_skips_when_already_flashinfer():
     fix_all2all_backend_for_afd(config)
 
     assert config.parallel_config.all2all_backend == "flashinfer_all2allv"
+
+
+def test_fix_all2all_backend_preserves_model_owned_sp():
+    config = _vllm_config(use_sequence_parallel_moe=True)
+    fix_all2all_backend_for_afd(config)
+    assert config.parallel_config.all2all_backend == "allgather_reducescatter"
 
 
 @pytest.mark.parametrize("skip_mc2_mask", [False, True])

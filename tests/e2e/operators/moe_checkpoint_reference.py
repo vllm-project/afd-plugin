@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -103,6 +104,7 @@ def model_holder(native, moe, config, layer_idx, family):
     torch.nn.Module.__init__(holder)
     holder.config = config
     holder.num_redundant_experts = 0
+    holder.is_fused_shared_expert_enabled = False
     layer = torch.nn.Module()
     layer.mlp = moe
     layers = torch.nn.ModuleDict({str(layer_idx): layer})
@@ -127,6 +129,8 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=29671)
     args = parser.parse_args()
 
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+
     # Worker setup owns all pinned Ascend operator/quantization registration.
     # Imports remain deferred until CLI setup, just like the worker process.
     from vllm.config import set_current_vllm_config
@@ -141,6 +145,7 @@ def main() -> None:
     from vllm_ascend.worker.worker import NPUWorker
 
     from afd_plugin.compat.npu.forward_context import ascend_forward_context
+    from afd_plugin.connectors.npu.async_cam import select_cam_experts
     from afd_plugin.model_executor.models.npu.deepseek_v2_attention_gate import (
         compute_attention_gate_moe_ffn,
         compute_gate_topk,
@@ -178,7 +183,7 @@ def main() -> None:
         for layer_idx in layers:
             prefix = f"model.layers.{layer_idx}.mlp"
             if args.family == "dsv4":
-                from vllm_ascend.models import deepseek_v4 as native
+                from vllm_ascend.models.deepseek_v4 import model as native
 
                 from afd_plugin.model_executor.models.npu import (
                     deepseek_v4_attention_gate,
@@ -200,7 +205,7 @@ def main() -> None:
 
                 moe_type = native.DeepseekV2MoE
                 extra = {"apply_routed_scale_to_output": True}
-            native.FusedMoE = fused_moe.FusedMoE
+            native.FusedMoEFactory = fused_moe.FusedMoEFactory
             if config.quant_config is not None:
                 model_class = (
                     native.AscendDeepseekV4ForCausalLM
@@ -283,10 +288,8 @@ def main() -> None:
                 torch.randn(TOKENS, hf.hidden_size, dtype=dtype, device="npu") * 0.1
             )
             token_ids = torch.arange(TOKENS, dtype=torch.int64, device="npu") + 17
-            from vllm_ascend.ops.fused_moe.experts_selector import select_experts
-
             afd_metadata = SimpleNamespace(
-                connector=SimpleNamespace(select_experts=select_experts)
+                connector=SimpleNamespace(select_experts=select_cam_experts)
             )
             with (
                 torch.inference_mode(),
@@ -299,7 +302,11 @@ def main() -> None:
                     input_ids=token_ids,
                 ),
             ):
-                native_final = reference_moe(hidden)
+                native_final = (
+                    reference_moe(hidden, input_ids=token_ids)
+                    if args.family == "dsv4"
+                    else reference_moe(hidden)
+                )
                 native_shared = reference_moe.shared_experts(hidden)
                 factor = reference_moe.routed_scaling_factor
                 if dtype == torch.float16 and args.family == "dsv2":
@@ -311,7 +318,7 @@ def main() -> None:
                 if args.family == "dsv4":
                     weights, ids = (
                         deepseek_v4_attention_gate.compute_attention_gate_topk(
-                            attention, hidden
+                            attention, hidden, input_ids=token_ids
                         )
                     )
                 else:
@@ -331,22 +338,16 @@ def main() -> None:
                     afd_logits = torch.nn.functional.linear(
                         hidden.float(), attention.gate.weight_fp32
                     )
-                    native_weights, native_ids = select_experts(
-                        hidden_states=hidden,
-                        router_logits=native_logits,
-                        top_k=attention.top_k,
-                        use_grouped_topk=True,
-                        renormalize=attention.renormalize,
-                        topk_group=attention.topk_group,
-                        num_expert_group=attention.num_expert_group,
-                        scoring_func=attention.scoring_func,
-                        routed_scaling_factor=attention.routed_scaling_factor,
-                        e_score_correction_bias=reference_moe.gate.e_score_correction_bias,
-                        tid2eid=reference_moe.gate.tid2eid,
+                    native_weights, native_ids = (
+                        reference_moe.experts.router.select_experts(
+                            hidden,
+                            native_logits,
+                            input_ids=token_ids,
+                        )
                     )
                     fp32_weights, fp32_ids = (
                         deepseek_v4_attention_gate._compute_sqrtsoftplus_topk(
-                            attention, native_logits
+                            attention, native_logits, input_ids=token_ids
                         )
                     )
                     routing_diagnostic = {

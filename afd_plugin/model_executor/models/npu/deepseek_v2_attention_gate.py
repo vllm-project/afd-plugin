@@ -19,11 +19,45 @@ except ImportError:
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.model_executor.layers.fused_moe import FusedMoERouter
 
     from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
     from afd_plugin.model_executor.models.deepseek_v2 import (
         AFDDeepseekV2DecoderLayer,
         _DeepseekAdapterConfig,
+    )
+
+
+def create_gate_router(
+    *,
+    gate: torch.nn.Module,
+    vllm_config: VllmConfig,
+    config: _DeepseekAdapterConfig,
+    top_k: int,
+) -> FusedMoERouter:
+    """Create the Ascend router used by one Attention-side MoE gate."""
+    from vllm_ascend.ops.fused_moe.router import (
+        create_ascend_fused_moe_router,
+    )
+
+    mix_placement = bool(
+        getattr(vllm_config, "additional_config", {}).get(
+            "mix_placement",
+            False,
+        ),
+    )
+    return create_ascend_fused_moe_router(
+        top_k=top_k,
+        global_num_experts=config.n_routed_experts,
+        use_grouped_topk=True,
+        renormalize=getattr(config, "norm_topk_prob", True),
+        scoring_func=getattr(config, "scoring_func", "softmax"),
+        num_expert_group=getattr(config, "n_group", 1),
+        topk_group=getattr(config, "topk_group", 1),
+        routed_scaling_factor=(
+            getattr(config, "routed_scaling_factor", 1.0) if mix_placement else 1.0
+        ),
+        e_score_correction_bias=gate.e_score_correction_bias,
     )
 
 
@@ -39,6 +73,7 @@ def compute_attention_gate_topk(
         config=layer.config,
         top_k=layer.top_k,
         hidden_states=hidden_states,
+        gate_router=layer.mlp.gate_router,
     )
 
 
@@ -49,6 +84,7 @@ def compute_gate_topk(
     config: _DeepseekAdapterConfig,
     top_k: int,
     hidden_states: torch.Tensor,
+    gate_router: FusedMoERouter | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute routing payloads for a native-path gate proxy."""
 
@@ -91,6 +127,7 @@ def compute_gate_topk(
         num_logical_experts=router_logits.shape[1],
         num_shared_experts=config.n_shared_experts,
         num_experts=num_experts,
+        router=gate_router,
     )
     if force_balanced_topk_ids_enabled():
         topk_ids = _force_balanced_topk_ids(
@@ -121,55 +158,55 @@ def compute_attention_gate_moe_ffn(
     apply the factor twice.
     """
 
-    from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
-    from vllm_ascend.ops.fused_moe.moe_stage_contracts import (
-        MoEMlpComputeInput,
-        MoEWeights,
-    )
-    from vllm_ascend.ops.fused_moe.moe_stage_params import MoEQuantParams
+    from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights
+    from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
+    from vllm_ascend.ops.fused_moe.dataclass.moe_quant import MoEQuantParams
+    from vllm_ascend.ops.fused_moe.moe_mlp import apply_moe_mlp
     from vllm_ascend.quantization.quant_type import QuantType
 
     experts = layer.mlp.experts
+    moe_config = experts.moe_config
+    routed_experts = experts.routed_experts
     quant_type = experts.quant_type
     if quant_type == QuantType.NONE:
         moe_weights = MoEWeights(
-            w1=experts.get_eplb_parameter("w13_weight"),
-            w2=experts.get_eplb_parameter("w2_weight"),
+            w1=routed_experts.get_eplb_parameter("w13_weight"),
+            w2=routed_experts.get_eplb_parameter("w2_weight"),
             w1_bias=(
-                experts.get_eplb_parameter("w13_bias")
+                routed_experts.get_eplb_parameter("w13_bias")
                 if experts.moe_config.has_bias
                 else None
             ),
             w2_bias=(
-                experts.get_eplb_parameter("w2_bias")
+                routed_experts.get_eplb_parameter("w2_bias")
                 if experts.moe_config.has_bias
                 else None
             ),
         )
     elif quant_type == QuantType.W8A8:
-        if experts.dynamic_eplb:
+        if routed_experts.dynamic_eplb:
             moe_weights = MoEWeights(
-                w1=experts.get_eplb_parameter("w13_weight_list"),
-                w2=experts.get_eplb_parameter("w2_weight_list"),
-                w1_scale=experts.get_eplb_parameter(
+                w1=routed_experts.get_eplb_parameter("w13_weight_list"),
+                w2=routed_experts.get_eplb_parameter("w2_weight_list"),
+                w1_scale=routed_experts.get_eplb_parameter(
                     "w13_weight_scale_fp32_list",
                 ),
-                w2_scale=experts.get_eplb_parameter("w2_weight_scale_list"),
+                w2_scale=routed_experts.get_eplb_parameter("w2_weight_scale_list"),
             )
         else:
             moe_weights = MoEWeights(
-                w1=[experts.get_eplb_parameter("w13_weight")],
-                w2=[experts.get_eplb_parameter("w2_weight")],
+                w1=[routed_experts.get_eplb_parameter("w13_weight")],
+                w2=[routed_experts.get_eplb_parameter("w2_weight")],
                 w1_scale=[
-                    experts.get_eplb_parameter("w13_weight_scale_fp32"),
+                    routed_experts.get_eplb_parameter("w13_weight_scale_fp32"),
                 ],
-                w2_scale=[experts.get_eplb_parameter("w2_weight_scale")],
+                w2_scale=[routed_experts.get_eplb_parameter("w2_weight_scale")],
             )
     # Mirror AscendW4A8DynamicFusedMoEMethod.apply's weight payload; CAM
     # already dispatched and quantized the activations, so use only its MLP.
     elif quant_type == QuantType.W4A8:
-        owner = experts.routed_experts
-        if experts.dynamic_eplb:
+        owner = routed_experts
+        if routed_experts.dynamic_eplb:
             moe_weights = MoEWeights(
                 w1=[w.view(torch.int32) for w in owner.w13_weight_list],
                 w2=[w.view(torch.int32) for w in owner.w2_weight_list],
@@ -203,7 +240,7 @@ def compute_attention_gate_moe_ffn(
     # zero routed or shared tokens, while Ascend MoE kernels require non-empty
     # inputs.
     shared_output = None
-    if experts._shared_experts is not None:
+    if experts.shared_experts is not None:
         if expand_x_shared is None:
             raise RuntimeError(
                 "AFD shared experts require expand_x_shared from CAM dispatch",
@@ -216,10 +253,10 @@ def compute_attention_gate_moe_ffn(
                 # by DSV2/V3.2 does not. None preserves the native unclamped
                 # SiluAndMul behavior for those models.
                 shared_output = _compute_w8a8_shared_experts_from_int8(
-                    experts._shared_experts,
+                    experts.shared_experts._layer,
                     shared_input,
                     shared_scales,
-                    swiglu_limit=getattr(layer.mlp, "swiglu_limit", None),
+                    swiglu_limit=moe_config.swiglu_limit,
                     output_dtype=torch.bfloat16,
                 )
             else:
@@ -228,12 +265,17 @@ def compute_attention_gate_moe_ffn(
                     shared_scales,
                     output_dtype=torch.bfloat16,
                 )
-                shared_output = experts._shared_experts(shared_input)
+                shared_output = experts.shared_experts._layer(shared_input)
 
     if hidden_states.shape[0] == 0:
         routed_output = hidden_states.to(dtype=torch.bfloat16)
     else:
-        routed_output, _ = unified_apply_mlp(
+        quant_method = (
+            routed_experts.quant_method
+            if quant_type == QuantType.NONE
+            else routed_experts.quant_method.quant_method
+        )
+        routed_output, _ = apply_moe_mlp(
             mlp_compute_input=MoEMlpComputeInput(
                 hidden_states=hidden_states,
                 group_list=group_list,
@@ -241,24 +283,27 @@ def compute_attention_gate_moe_ffn(
                 dynamic_scale=dynamic_scales,
                 topk_scales=topk_scales,
                 weights=moe_weights,
+                layer=routed_experts,
                 quant=MoEQuantParams(
                     quant_type=quant_type,
                     is_per_channel_weight=(
-                        experts.routed_experts.quant_method.quant_method.is_per_channel_weight
+                        routed_experts.quant_method.quant_method.is_per_channel_weight
                         if quant_type == QuantType.W4A8
                         else False
                     ),
                 ),
-                swiglu_limit=(
-                    float(layer.mlp.swiglu_limit or 0.0)
-                    if quant_type == QuantType.W4A8
-                    else 0.0
-                ),
+                # Match Ascend's build_mlp_compute_input for every quant type.
+                swiglu_limit=moe_config.swiglu_limit or 0.0,
+                swiglu_alpha=moe_config.swiglu_alpha or 1.0,
+                swiglu_beta=moe_config.swiglu_beta or 0.0,
+                activation_situ_beta=moe_config.activation_situ_beta,
+                activation_situ_linear_beta=moe_config.activation_situ_linear_beta,
                 fusion=use_gmmswigluquant_fusion,
-                activation=experts.activation,
+                activation=routed_experts.activation,
                 need_trans=False,
-                dynamic_eplb=experts.dynamic_eplb,
+                dynamic_eplb=routed_experts.dynamic_eplb,
             ),
+            quant_method=quant_method,
         )
 
     if not routed_scale_applied_in_topk:

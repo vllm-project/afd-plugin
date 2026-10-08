@@ -20,6 +20,7 @@ from afd_plugin.compat.npu.ops import (
 )
 from afd_plugin.compat.npu.runtime import (
     apply_afd_ascend_config_patch_if_needed,
+    apply_afd_ascend_engine_core_config_patch_if_needed,
     apply_afd_ascend_patches_if_needed,
     apply_afd_async_dp_engine_patch_if_needed,
     ascend_forward_context,
@@ -30,6 +31,7 @@ from afd_plugin.compat.npu.runtime import (
 
 __all__ = [
     "apply_afd_ascend_config_patch_if_needed",
+    "apply_afd_ascend_engine_core_config_patch_if_needed",
     "apply_afd_ascend_patches_if_needed",
     "apply_afd_async_dp_engine_patch_if_needed",
     "ascend_forward_context",

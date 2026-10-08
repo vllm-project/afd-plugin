@@ -343,14 +343,15 @@ an expansion of the supported runtime contract.
 | Ascend V2 + `CAMP2pAFDConnector` | Eager, `FULL`, or `FULL_DECODE_ONLY` native V2 ACL Graph | DBO and ubatching rejected | `compute_gate_on_attention=false`; PP/CP, elastic EP, EPLB, SP MoE, and compile SP rejected; role ranks equal DP x TP | Focused runner, context, validation, and device-contract unit tests; no repository hardware E2E case |
 | Ascend + `CAMAsyncAFDConnector` | Eager only | Native DBO rejected; optional AFD-managed MoE ubatching uses exactly two request or token-balanced stages | Experimental v0.26 port; `async=true`; documented path uses common `compute_gate_on_attention=true`; token mode requires Attention TP > 1; model runner v1 PCP is unsupported; prefill and decode context parallelism are unsupported; `connector_extra_config.dynamicQuant` is 0 or 1; plugin-owned async CAM ops required | Focused unit coverage; pre-fix DP3TP2/EP2 six-case E2E matrix; post-fix full 61-layer DP2TP8+EP16 token-split run reached `0.9522` strict match on the complete GSM8K evaluation |
 
-All rows target vLLM 0.26.0. Hardware validation exists for CUDA V1/V2 and the
-recorded Ascend V1 paths; the Ascend V2 row is an implemented, unit-tested
+CUDA rows target vLLM 0.30.0 (hardware validated). Ascend rows keep their
+vLLM 0.26.0-era validation basis (commit `80d8c194f`) and are not
+revalidated for 0.30.0; the Ascend V2 row is an implemented, unit-tested
 contract rather than a hardware-validated claim. GPU/NPU rank topology and
 connector resource rules remain owned by
 [connector contracts](connector_contracts.md).
 
 The repository does not record a canonical CUDA container or a released
-vLLM-Ascend v0.26 container. The NPU implementation records source commit
+vLLM-Ascend v0.30 container. The NPU implementation records source commit
 `80d8c194f`; environment evidence is not an authoritative package tag.
 
 ## Failure and cleanup boundaries
@@ -383,7 +384,7 @@ E2E paths listed above.
 
 ## Limitations and open issues
 
-The official vLLM-Ascend v0.26 tag/container and canonical CUDA/Ascend versus
+The official vLLM-Ascend v0.30 tag/container and canonical CUDA/Ascend versus
 GPU/NPU terminology are unresolved. This document uses CUDA/Ascend for backend
 mechanisms and preserves GPU/NPU where it appears in public names, environment
 variables, or test markers. See
