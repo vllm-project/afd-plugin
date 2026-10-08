@@ -899,9 +899,10 @@ def _num_tokens_for_ffn_rank(
 ) -> int:
     """Count the tokens that one FFN rank will receive from Attention.
 
-    An FFN rank may receive data from several consecutive Attention ranks. This
-    function adds their token counts. When TP creates several Attention workers
-    for one DP rank, it first copies the DP token count to those TP workers.
+    FFN rank f receives Attention ranks f, f + ffn_size, and so on, matching
+    the A2E/E2A kernel strides. This function adds their token counts. When TP
+    creates several Attention workers for one DP rank, it first copies the DP
+    token count to those TP workers.
 
     Args:
         dp_metadata_list: Token counts received from Attention for each ubatch.
@@ -929,10 +930,7 @@ def _num_tokens_for_ffn_rank(
     if len(counts) < attention_size:
         return max(1, fallback)
     if attention_size >= ffn_size and attention_size % ffn_size == 0:
-        group_size = attention_size // ffn_size
-        start_idx = ffn_rank * group_size
-        end_idx = start_idx + group_size
-        return max(1, sum(counts[start_idx:end_idx]))
+        return max(1, sum(counts[ffn_rank:attention_size:ffn_size]))
     return max(1, fallback)
 
 
