@@ -408,6 +408,25 @@ static aclnnStatus CheckNotNull(const aclTensorList *x, const aclTensorList *wei
     return ACLNN_SUCCESS;
 }
 
+// layered: layer_index is an INT64 tensor carrying exactly one layer id. This is the place to
+// validate it, because GetViewShape() here is the caller's own logical shape while the tiling
+// context sees only a normalized storage shape for this REQUIRED input - a rank-1 [1] int64 tensor
+// arrives there as rank 2 [1, 1], which is why the rank assertion that used to live in
+// GMMTiling::Init had to go (it rejected a well-formed call). The count is what the operator
+// actually relies on: LayeredReadLayerIndex reads element 0 and ignores the shape, so requiring
+// exactly one element accepts both [1] and [1, 1] while still rejecting the two INT64 inputs this
+// could be confused with, group_list [e] and per_token_scale-shaped [m].
+static aclnnStatus CheckLayerIndex(const aclTensor *layerIndex)
+{
+  CHECK_COND(layerIndex != nullptr, ACLNN_ERR_PARAM_NULLPTR, "layer_index must not be nullptr.");
+  OP_CHECK_DTYPE_NOT_MATCH(layerIndex, DataType::DT_INT64, return ACLNN_ERR_PARAM_INVALID);
+  const op::Shape &layerShape = layerIndex->GetViewShape();
+  CHECK_COND(layerShape.GetShapeSize() == 1, ACLNN_ERR_PARAM_INVALID,
+             "layer_index must carry exactly one layer id, but its shape is %s.",
+             op::ToString(layerShape).GetString());
+  return ACLNN_SUCCESS;
+}
+
 static aclnnStatus CheckGroupListCommonIntArray(const gmm::GroupedMatmulParams &gmmParams, const bool isRequiredGroupList,
                                                 const size_t groupNum, int64_t &groupListLastValue) {
   // Must pass groupList scenario, check groupList is not empty.
@@ -2501,6 +2520,11 @@ aclnnStatus aclnnGroupedMatmulLayeredGetWorkspaceSize(const aclTensorList *x, co
   const aclTensorList *y, uint64_t *workspaceSize, aclOpExecutor **executor) {
   CHECK_COND(CheckNotNull(x, weight, y) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_NULLPTR,
              "One of required inputs is nullptr.");
+  // layered: the layer id is validated here, against the caller's logical shape. The tiling
+  // context cannot do it - its view of this REQUIRED input's host storage shape is not the
+  // logical [1] (see CheckLayerIndex).
+  CHECK_COND(CheckLayerIndex(layerIndex) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID,
+             "Invalid layer_index.");
   // torch_npu expresses int4 as int32 (eight nibbles per word); unpack the view
   // so the checks and tiling see the int4 [e, k, n] logical shape (V5 behavior).
   if ((*weight)[0]->GetDataType() == DataType::DT_INT32) {

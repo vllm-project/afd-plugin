@@ -425,20 +425,30 @@ ge::graphStatus GMMTiling::Init(const gert::TilingContext* context) {
   OP_CHECK_IF(!CheckTensorListLength(context),
              OPS_REPORT_VECTOR_INNER_ERR(context->GetNodeName(), "Check tensorList length failed."),
              return ge::GRAPH_FAILED);
-  // layered: layer_index must be INT64 with shape [1]; all_weight / all_bias / all_scale lists
-  // must share the same length (one element per layer). The layer value itself lives on device
-  // and cannot be range-checked here; layerNum is shipped in the tiling so the kernel can
-  // bounds-check the device-side index before dereferencing the pointer array.
+  // layered: layer_index carries the current layer id (INT64, one element); all_weight /
+  // all_bias / all_scale lists must share the same length (one element per layer). The layer
+  // value itself lives on device and cannot be range-checked here; layerNum is shipped in the
+  // tiling so the kernel can bounds-check the device-side index before dereferencing the
+  // pointer array.
   {
     auto layerTensor = context->GetDynamicInputTensor(LAYER_INDEX, 0);
     OP_CHECK_NULL_WITH_CONTEXT(context, layerTensor);
     OP_CHECK_IF(layerTensor->GetDataType() != ge::DT_INT64,
                 OPS_REPORT_VECTOR_INNER_ERR(context->GetNodeName(), "layer_index must be INT64."),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(layerTensor->GetStorageShape().GetDimNum() != 1 ||
-                layerTensor->GetStorageShape().GetDim(0) != 1,
-                OPS_REPORT_VECTOR_INNER_ERR(context->GetNodeName(), "layer_index must be a 1-element tensor."),
-                return ge::GRAPH_FAILED);
+    // No shape assertion here, deliberately. layer_index is a REQUIRED input and the storage shape
+    // this host context exposes for it is not the caller's logical [1]: a rank-1 [1] int64 tensor
+    // arrives here normalized to rank 2 [1, 1]. An unconditional `dimNum == 1 && dim(0) == 1` test
+    // therefore rejected a well-formed call before anything reached the device. The shape is
+    // validated instead where the caller's real logical shape is available - GetViewShape() at the
+    // aclnn entry (CheckLayerIndex in op_api/aclnn_grouped_matmul_layered.cpp) - and the value is
+    // consumed on device by LayeredReadLayerIndex, which reads element 0 from GM without consulting
+    // any shape. The dtype check above is still meaningful and stays.
+    OP_LOGD(context->GetNodeName(),
+            "GMM_tiling: layer_index host storage rank=%zu dim0=%ld (shape not asserted; the layer id "
+            "is validated at the aclnn entry and clamped against layerNum on device).",
+            layerTensor->GetStorageShape().GetDimNum(),
+            layerTensor->GetStorageShape().GetDimNum() >= 1 ? layerTensor->GetStorageShape().GetDim(0) : -1L);
     uint32_t weightListLen = 0;
     while (context->GetDynamicInputTensor(WEIGHT_INDEX, weightListLen) != nullptr) {
       weightListLen++;
