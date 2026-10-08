@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -16,7 +17,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from tests.e2e.accuracy.gsm8k import (
     _extract_gsm8k_accuracy,
@@ -57,7 +58,15 @@ V2_SCENARIOS = (
     "afd-v2-graph-1a1f",
     "afd-v2-graph-dp2",
     "afd-v2-graph-tp2",
+    "afd-v2-eager-dbo-dp2",
+    "afd-v2-graph-dbo-dp2",
 )
+V2_DBO_COMPARISON_SCENARIOS = frozenset(
+    ("afd-v2-eager-dp2", "afd-v2-eager-dbo-dp2", "afd-v2-graph-dbo-dp2"),
+)
+V2_DBO_SAMPLE_LIMIT = 128
+V2_DBO_MAX_NUM_SEQS = 8
+V2_DBO_MAX_BATCHED_TOKENS = 4096
 V2_SINGLE_RANK_SCENARIOS = frozenset(
     ("afd-v2-eager-1a1f", "afd-v2-graph-1a1f"),
 )
@@ -133,6 +142,7 @@ def main() -> int:
     processes_by_role: dict[str, subprocess.Popen[str]] = {}
     log_threads: list[threading.Thread] = []
     dbo_split_steps: list[float] = []
+    mrv2_execution_events: list[tuple[float, str, str]] = []
     dbo_eval_started_at: float | None = None
     handled_signals = (signal.SIGTERM, signal.SIGINT)
     previous_handlers = {signum: signal.getsignal(signum) for signum in handled_signals}
@@ -193,7 +203,9 @@ def main() -> int:
             )
             processes.append(process)
             processes_by_role[role] = process
-            log_threads.append(stream_output(role, process, dbo_split_steps))
+            log_threads.append(
+                stream_output(role, process, dbo_split_steps, mrv2_execution_events)
+            )
             ensure_alive(process, f"{label} process exited during startup")
 
         wait_for_openai_api(args, processes)
@@ -208,7 +220,14 @@ def main() -> int:
                 dbo_eval_started_at = time.time()
             run_gsm8k_evaluation(args)
         if args.enable_dbo:
-            assert_dbo_live_split_coverage(dbo_split_steps, dbo_eval_started_at, args)
+            if args.use_v2_model_runner:
+                assert_mrv2_dbo_execution(
+                    mrv2_execution_events, cast(float, dbo_eval_started_at), args
+                )
+            else:
+                assert_dbo_live_split_coverage(
+                    dbo_split_steps, dbo_eval_started_at, args
+                )
 
         ensure_processes_alive(processes)
     finally:
@@ -446,6 +465,8 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-v2-graph-1a1f": (False, True, False, 1, 1),
         "afd-v2-graph-dp2": (False, True, False, 2, 2),
         "afd-v2-graph-tp2": (False, True, False, 2, 2),
+        "afd-v2-eager-dbo-dp2": (False, False, True, 2, 2),
+        "afd-v2-graph-dbo-dp2": (False, True, True, 2, 2),
     }
     baseline, use_graph, enable_dbo, attention_ranks, ffn_ranks = scenario_settings[
         args.scenario
@@ -705,6 +726,8 @@ def build_vllm_command(
         "--additional-config",
         json.dumps(afd_config, separators=(",", ":")),
     ]
+    if args.scenario in V2_DBO_COMPARISON_SCENARIOS:
+        cmd.extend(["--worker-extension-cls", "tests.e2e.mrv2_evidence.Worker"])
     if args.use_v2_model_runner:
         cmd.extend(
             [
@@ -713,12 +736,23 @@ def build_vllm_command(
                 "--no-async-scheduling",
             ],
         )
-    if args.cuda_graph_full_decode_only:
-        capture_size = str(args.cudagraph_capture_size)
+    if args.scenario in V2_DBO_COMPARISON_SCENARIOS:
+        # Keep scheduling identical for the no-DBO, eager DBO and graph DBO
+        # comparison, including enough prefill space with chunking disabled.
         cmd.extend(
             [
                 "--max-num-seqs",
-                capture_size,
+                str(V2_DBO_MAX_NUM_SEQS),
+                "--max-num-batched-tokens",
+                str(V2_DBO_MAX_BATCHED_TOKENS),
+            ],
+        )
+    if args.cuda_graph_full_decode_only:
+        capture_size = str(args.cudagraph_capture_size)
+        if args.scenario not in V2_DBO_COMPARISON_SCENARIOS:
+            cmd.extend(["--max-num-seqs", capture_size])
+        cmd.extend(
+            [
                 "--max-cudagraph-capture-size",
                 capture_size,
                 "--cudagraph-capture-sizes",
@@ -827,12 +861,15 @@ def run_gsm8k_evaluation(args: argparse.Namespace) -> None:
     """Run the configured GSM8K workload against the scenario's public API."""
     if args.gsm8k_output_path is None:
         raise RuntimeError("--gsm8k-output-path is required for GSM8K scenarios")
+    is_v2_dbo_comparison = args.scenario in V2_DBO_COMPARISON_SCENARIOS
     configured_limit = os.environ.get(
         GSM8K_LIMIT_ENV,
-        str(DEFAULT_GSM8K_SAMPLE_LIMIT),
+        str(
+            V2_DBO_SAMPLE_LIMIT if is_v2_dbo_comparison else DEFAULT_GSM8K_SAMPLE_LIMIT
+        ),
     )
     sample_limit = None if configured_limit == "all" else int(configured_limit)
-    if args.enable_dbo and sample_limit is not None:
+    if (args.enable_dbo or is_v2_dbo_comparison) and sample_limit is not None:
         sample_limit = max(sample_limit, DBO_EVAL_MIN_SAMPLES)
     expected_sample_count = (
         GSM8K_FULL_SAMPLE_COUNT if sample_limit is None else sample_limit
@@ -845,7 +882,7 @@ def run_gsm8k_evaluation(args: argparse.Namespace) -> None:
         if args.scenario == ASYNC_UBATCH_SCENARIO
         else {}
     )
-    if args.enable_dbo:
+    if args.enable_dbo or is_v2_dbo_comparison:
         scenario_options["num_concurrent"] = DBO_EVAL_NUM_CONCURRENT
     role = "baseline" if args.baseline else "attention"
     results = _run_lm_eval(
@@ -901,6 +938,86 @@ def assert_dbo_live_split_coverage(
         f"dbo_prefill_token_threshold={args.dbo_prefill_token_threshold}. "
         "Increase the client concurrency until both attention ranks hold "
         "enough real tokens for two non-empty ubatches.",
+    )
+
+
+def assert_mrv2_dbo_execution(
+    events: list[tuple[float, str, str]],
+    eval_started_at: float,
+    args: argparse.Namespace,
+) -> None:
+    """Require all-rank layout coverage in the window, not exact step pairing."""
+    attention_mode = "FULL" if args.cuda_graph_full_decode_only else "eager"
+    ffn_mode = "replay" if args.cuda_graph_full_decode_only else "eager"
+    attention_layouts: dict[
+        tuple[tuple[int, tuple[int, ...]], ...], set[tuple[int, int]]
+    ] = {}
+    previous_attention: dict[
+        tuple[int, int], tuple[int, tuple[tuple[int, tuple[int, ...]], ...]]
+    ] = {}
+    ffn_layouts: dict[
+        tuple[tuple[int, tuple[int, ...]], ...], set[tuple[int, int]]
+    ] = {}
+    for received_at, role, line in events:
+        if received_at < eval_started_at:
+            continue
+        worker = re.search(r"\(Worker_([^ ]+) pid=\d+\)", line)
+        if worker is None:
+            continue
+        ranks = dict(re.findall(r"(DP|TP)(\d+)", worker[1]))
+        rank = (int(ranks["DP"]), int(ranks.get("TP", "0")))
+        if role == "attention" and (
+            f"runner=MRV2 phase=live mode={attention_mode} stages=2 " in line
+        ):
+            real_match = re.search(r"real_tokens=(\[[^]]+\])", line)
+            tokens_match = re.search(r"\btokens=(\[[^]]+\])", line)
+            count_match = re.search(r"count=(\d+)", line)
+            if real_match is None or tokens_match is None or count_match is None:
+                continue
+            if not all(count > 0 for count in json.loads(real_match[1])):
+                continue
+            tokens = json.loads(tokens_match[1])
+            layout = tuple(
+                (stage, (count,) * args.num_attention_ranks)
+                for stage, count in enumerate(tokens)
+            )
+            count = int(count_match[1])
+            previous = previous_attention.get(rank)
+            previous_attention[rank] = (count, layout)
+            if args.cuda_graph_full_decode_only and previous != (count - 1, layout):
+                continue
+            attention_layouts.setdefault(layout, set()).add(rank)
+        if role == "ffn" and f"runner=FFN mode={ffn_mode} stages=2 " in line:
+            layout_match = re.search(r"layout=(\[.*\]) count=", line)
+            if layout_match is not None:
+                layout = tuple(
+                    (stage, tuple(counts))
+                    for stage, counts in json.loads(layout_match[1])
+                )
+                ffn_layouts.setdefault(layout, set()).add(rank)
+    expected_attention = {
+        (dp, tp)
+        for dp in range(args.num_attention_ranks // args.attention_tp_size)
+        for tp in range(args.attention_tp_size)
+    }
+    expected_ffn = {
+        (dp, tp)
+        for dp in range(args.num_ffn_ranks // args.ffn_tp_size)
+        for tp in range(args.ffn_tp_size)
+    }
+    if any(
+        expected_attention <= ranks and expected_ffn <= ffn_layouts.get(layout, set())
+        for layout, ranks in attention_layouts.items()
+    ):
+        print(
+            f"[dbo-coverage] MRV2 live two-stage {attention_mode} and FFN "
+            f"{ffn_mode} confirmed on all expected ranks with matching DP layouts"
+        )
+        return
+    raise RuntimeError(
+        f"MRV2 DBO lacks live two-stage {attention_mode} and matching FFN "
+        f"{ffn_mode} evidence in the evaluation window; FULL requires "
+        "all expected ranks, consecutive replays and two non-empty microbatches"
     )
 
 
@@ -1010,11 +1127,14 @@ def stream_output(
     name: str,
     process: subprocess.Popen[str],
     dbo_split_steps: list[float] | None = None,
+    mrv2_execution_events: list[tuple[float, str, str]] | None = None,
 ) -> threading.Thread:
     def worker() -> None:
         assert process.stdout is not None
         for line in process.stdout:
             print(f"[{name}] {line}", end="")
+            if mrv2_execution_events is not None and "AFD execution: " in line:
+                mrv2_execution_events.append((time.time(), name, line))
             if (
                 dbo_split_steps is not None
                 and name == "attention"

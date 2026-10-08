@@ -19,9 +19,10 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker import utils as v2_worker_utils
 from vllm.v1.worker.gpu import cudagraph_utils as v2_cudagraph_utils
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.input_batch import InputBuffers
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
 from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.ubatch_utils import UBatchRunner, UBatchState
 
 from afd_plugin.compat.profiler import (
     create_afd_gpu_profiler,
@@ -63,6 +64,7 @@ class _AFDCaptureEventTracker:
         self,
         num_reqs: int,
         num_tokens: int,
+        num_ubatches: int = 1,
     ) -> tuple[v2_cudagraph_utils.BatchExecutionDescriptor, bool]:
         if self._event_index >= len(self._expected_events):
             raise RuntimeError(
@@ -70,11 +72,15 @@ class _AFDCaptureEventTracker:
             )
         desc, is_warmup = self._expected_events[self._event_index]
         self._event_index += 1
-        if num_reqs != desc.num_reqs or num_tokens != desc.num_tokens:
+        if (
+            num_reqs != desc.num_reqs
+            or num_tokens != desc.num_tokens
+            or num_ubatches != desc.num_ubatches
+        ):
             raise RuntimeError(
                 "AFD ModelRunnerV2 CUDA Graph capture descriptor/order drift: "
-                f"expected ({desc.num_reqs}, {desc.num_tokens}), got "
-                f"({num_reqs}, {num_tokens})",
+                f"expected ({desc.num_reqs}, {desc.num_tokens}, {desc.num_ubatches}), "
+                f"got ({num_reqs}, {num_tokens}, {num_ubatches})",
             )
         return desc, is_warmup
 
@@ -85,6 +91,70 @@ class _AFDCaptureEventTracker:
                 "call count drift: "
                 f"expected {len(self._expected_events)}, got {self._event_index}",
             )
+
+
+@contextmanager
+def _use_afd_ubatch_preparation(
+    runner: AFDAttentionModelRunnerV2,
+    event_tracker: _AFDCaptureEventTracker | None = None,
+) -> Iterator[None]:
+    """Publish one transaction from native prepared state before stage execution."""
+    ubatch_runner = runner.ubatch_runner
+    if ubatch_runner is None:
+        yield
+        return
+    state = vars(ubatch_runner)
+    had_override = "prepare" in state
+    previous_override = state.get("prepare")
+    original_prepare = ubatch_runner.prepare
+
+    # Patch reason: native MRV2 creates stage contexts through an imported
+    # factory alias, bypassing the ordinary AFD context provider. Its graph
+    # branch also bypasses prepare_inputs_to_capture.
+    # Patch functionality: decorate native stage state and publish one complete
+    # A/F payload before threads start (or before FULL replay).
+    # Signature: matches UBatchRunner.prepare at vLLM ced6857.
+    # Delegation exception: keep native slicing/attention preparation in the
+    # bound method. Remove this seam when upstream offers a prepared-state
+    # callback; no runner class or module-global function is replaced here.
+    def prepare(
+        self: UBatchRunner,
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        cg_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        for_capture: bool = False,
+    ) -> UBatchState:
+        # ### PATCH START: bind AFD to native stage state outside graph execution.
+        prepared = original_prepare(
+            input_batch, block_tables, slot_mappings, cg_mode, for_capture
+        )
+        if event_tracker is not None:
+            _, is_warmup = event_tracker.consume(
+                input_batch.num_reqs,
+                input_batch.num_tokens_after_padding,
+                len(prepared.slices),
+            )
+            runner._is_warmup = is_warmup
+            runner._afd_is_graph_capturing = not is_warmup
+            runner._afd_is_graph_replaying = False
+        else:
+            runner._afd_is_graph_replaying = cg_mode == CUDAGraphMode.FULL
+        runner.install_mrv2_ubatch_metadata(
+            prepared.slices, prepared.forward_contexts, input_batch.num_tokens
+        )
+        runner.send_dp_metadata(None, prepared.slices)
+        return prepared
+        # ### PATCH END: bind AFD to native stage state outside graph execution.
+
+    ubatch_runner.prepare = MethodType(prepare, ubatch_runner)
+    try:
+        yield
+    finally:
+        if had_override:
+            ubatch_runner.prepare = previous_override
+        else:
+            del ubatch_runner.prepare
 
 
 @contextmanager
@@ -164,7 +234,7 @@ def _use_afd_fullgraph_replay_hook(
         raise RuntimeError(
             "AFD FULL graph replay hook requires an initialized graph manager",
         )
-    manager_state = vars(manager)
+    manager_state = manager.__dict__
     if _AFD_FULLGRAPH_HOOK_MARKER in manager_state:
         raise RuntimeError("AFD FULL graph replay hook is already active")
 
@@ -190,6 +260,12 @@ def _use_afd_fullgraph_replay_hook(
         desc: v2_cudagraph_utils.BatchExecutionDescriptor,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
         # ### PATCH START: publish one AFD pre-replay payload.
+        if desc.num_ubatches > 1:
+            # Native execute_model already prepared live stage inputs and our
+            # prepare seam sent their complete control payload.
+            assert runner._afd_pending_metadata is not None
+            assert runner._afd_pending_metadata.num_stages == desc.num_ubatches
+            return original_run_fullgraph(desc)
         previous_is_graph_replaying = getattr(
             runner,
             "_afd_is_graph_replaying",
@@ -252,6 +328,7 @@ def _use_afd_execution_context(
     try:
         with (
             replay_scope,
+            _use_afd_ubatch_preparation(runner),
             use_afd_metadata_provider(
                 runner.install_afd_metadata_on_forward_context,
             ),
@@ -401,9 +478,13 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
         previous_suppress_send = self._afd_suppress_metadata_send
         previous_is_warmup = self._is_warmup
         previous_is_graph_capturing = self._afd_is_graph_capturing
+        previous_is_graph_replaying = self._afd_is_graph_replaying
 
         try:
-            with _use_afd_capture_input_preparation(self, event_tracker):
+            with (
+                _use_afd_capture_input_preparation(self, event_tracker),
+                _use_afd_ubatch_preparation(self, event_tracker),
+            ):
                 with use_afd_metadata_provider(
                     self.install_afd_metadata_on_forward_context,
                 ):
@@ -415,6 +496,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
             self._afd_suppress_metadata_send = previous_suppress_send
             self._is_warmup = previous_is_warmup
             self._afd_is_graph_capturing = previous_is_graph_capturing
+            self._afd_is_graph_replaying = previous_is_graph_replaying
         # ### PATCH END: publish AFD FULL graph warmup/capture control.
 
     # Patch reason: native V2 creates ForwardContext inside execute_model, so
