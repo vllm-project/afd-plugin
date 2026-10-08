@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
 import json
@@ -20,6 +21,11 @@ import pytest
 from tests.e2e import runner
 from tests.e2e.models.deepseek_v4_flash import completions
 from tests.e2e.models.deepseek_v4_flash import test_async_cam_npu as entrypoint
+from tests.e2e.models.deepseek_v4_flash import (
+    test_deepseek_v4_flash_multi_pod as multi_pod_entrypoint,
+)
+from tests.e2e.models.deepseek_v4_flash.config import DSV4_ASYNC_CAM_SCENARIO
+from tests.e2e.multi_pod.layout import PodLayout, Topology, plan
 
 
 def _arguments(monkeypatch, tmp_path):
@@ -141,6 +147,83 @@ def test_dsv4_rejects_gpu(monkeypatch, tmp_path):
         runner.validate_topology(
             args, list(map(str, range(8))), list(map(str, range(8, 16)))
         )
+
+
+def test_dsv4_single_host_pins_one_attention_dp_address(monkeypatch, tmp_path):
+    args = _arguments(monkeypatch, tmp_path)
+    runner.configure_scenario(args)
+
+    attention = runner.build_vllm_command(args, role="attention")
+    ffn = runner.build_vllm_command(args, role="ffn")
+
+    assert attention.count("--data-parallel-address") == 1
+    assert attention[attention.index("--data-parallel-address") + 1] == "192.0.2.1"
+    assert "--data-parallel-address" not in ffn
+
+
+def _multi_pod_arguments(monkeypatch, layout_name):
+    monkeypatch.setenv("AFD_E2E_BACKEND", "npu")
+    monkeypatch.setenv("AFD_E2E_RUN_ID", "run")
+    monkeypatch.setenv("AFD_NPU_E2E_MODEL", "/models/dsv4")
+    monkeypatch.setenv("AFD_E2E_COMPLETION_OUTPUT", "/work/responses.json")
+    monkeypatch.setenv("AFD_E2E_STORE_HOST", "dsv4-0.dsv4")
+    command = multi_pod_entrypoint.build_runner_command(layout_name)
+    # The multi-pod runner module needs torch for its store; the scenario
+    # options it shares with the single-host runner parse identically here.
+    parser = argparse.ArgumentParser()
+    runner.add_scenario_arguments(parser)
+    args, pod_options = parser.parse_known_args(command[3:])
+    return command, args, pod_options
+
+
+@pytest.mark.parametrize("layout_name", list(multi_pod_entrypoint.POD_LAYOUTS))
+def test_dsv4_multi_pod_entrypoint_targets_npu(monkeypatch, layout_name):
+    command, args, pod_options = _multi_pod_arguments(monkeypatch, layout_name)
+
+    assert command[1:3] == ["-m", "tests.e2e.multi_pod.runner"]
+    assert args.scenario == DSV4_ASYNC_CAM_SCENARIO
+    assert args.device_backend == "npu"
+    assert args.completion_output_path == "/work/responses.json"
+    layout = multi_pod_entrypoint.POD_LAYOUTS[layout_name]
+    assert pod_options[pod_options.index("--pod-layout") + 1] == layout
+    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
+    with pytest.raises(RuntimeError, match="requires AFD_E2E_BACKEND=npu"):
+        multi_pod_entrypoint.build_runner_command(layout_name)
+
+
+@pytest.mark.parametrize("layout_name", list(multi_pod_entrypoint.POD_LAYOUTS))
+def test_dsv4_multi_pod_places_each_pod_once(monkeypatch, layout_name):
+    """Every pod's command names one DP address and the Attention leader."""
+    _, args, _ = _multi_pod_arguments(monkeypatch, layout_name)
+    runner.configure_scenario(args)
+    topology = Topology.from_args(args)
+    layout = PodLayout.parse(multi_pod_entrypoint.POD_LAYOUTS[layout_name])
+    addresses = ["192.0.2.10", "192.0.2.11"]
+
+    pods = plan(topology, layout, addresses)
+
+    for pod in pods:
+        for slot in pod.slots:
+            command = runner.build_vllm_command(args, role=slot.role, slot=slot)
+            config = json.loads(command[command.index("--additional-config") + 1])
+            assert config["afd"]["host"] == "192.0.2.10"
+            assert ("--headless" in command) == slot.headless
+            if slot.role == "attention" or slot.spans_pods:
+                assert command.count("--data-parallel-address") == 1
+                address_index = command.index("--data-parallel-address") + 1
+                assert command[address_index] == slot.dp_address
+            else:
+                assert "--data-parallel-address" not in command
+            env = runner.build_env(
+                ",".join(slot.devices),
+                args,
+                role=slot.role,
+                e2e_run_id="run",
+            )
+            assert env["ASCEND_RT_VISIBLE_DEVICES"] == ",".join(slot.devices)
+            assert env["VLLM_ASCEND_ENABLE_FLASHCOMM1"] == (
+                "1" if slot.role == "attention" else "0"
+            )
 
 
 def test_dsv4_environment_uses_source_ops_and_preserves_network(monkeypatch):

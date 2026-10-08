@@ -69,9 +69,10 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "--no-enable-prefix-caching",
         "--enable-chunked-prefill",
     ]
+    # The runner emits the pinned Attention DP address once, substituting the
+    # Attention leader's address when the role is placed across pods.
+    args.attention_data_parallel_address = args.afd_host
     args.attention_vllm_arg = [
-        "--data-parallel-address",
-        args.afd_host,
         "--no-disable-hybrid-kv-cache-manager",
         "--tool-call-parser",
         "deepseek_v4",
