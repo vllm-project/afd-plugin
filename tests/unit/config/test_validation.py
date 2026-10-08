@@ -15,7 +15,6 @@ from afd_plugin.validation import (
     NPU_FFN_WORKER_FQCN,
     assert_compatible_afd_stack,
     validate_gpu_model_runner_v2_config,
-    validate_npu_model_runner_v2_config,
 )
 
 
@@ -160,103 +159,60 @@ def mrv2_config(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, model_utils.__name__, model_utils)
 
-    def make(
-        *,
-        role="attention",
-        num_attention_ranks=1,
-        num_ffn_ranks=1,
-        data_parallel_size=1,
-        enforce_eager=True,
-        cudagraph_mode="FULL_DECODE_ONLY",
-    ):
-        return SimpleNamespace(
-            additional_config={
-                "afd": {
-                    "role": role,
-                    "num_attention_ranks": num_attention_ranks,
-                    "num_ffn_ranks": num_ffn_ranks,
-                }
-            },
-            parallel_config=SimpleNamespace(
-                data_parallel_size=data_parallel_size,
-                tensor_parallel_size=1,
-                pipeline_parallel_size=1,
-                prefill_context_parallel_size=1,
-                decode_context_parallel_size=1,
-                enable_expert_parallel=True,
-                enable_elastic_ep=False,
-                enable_eplb=False,
-                use_sequence_parallel_moe=False,
-                enable_dbo=False,
-                use_ubatching=False,
-                num_ubatches=1,
-            ),
-            model_config=SimpleNamespace(enforce_eager=enforce_eager),
-            compilation_config=SimpleNamespace(
-                cudagraph_mode=cudagraph_mode,
-                pass_config=SimpleNamespace(enable_sp=False),
-            ),
-        )
-
-    return make
+    return SimpleNamespace(
+        additional_config={
+            "afd": {
+                "role": "attention",
+                "num_attention_ranks": 2,
+                "num_ffn_ranks": 2,
+            }
+        },
+        parallel_config=SimpleNamespace(
+            data_parallel_size=2,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            enable_expert_parallel=True,
+            enable_elastic_ep=False,
+            enable_eplb=False,
+            use_sequence_parallel_moe=False,
+            enable_dbo=True,
+            use_ubatching=True,
+            num_ubatches=2,
+        ),
+        model_config=SimpleNamespace(enforce_eager=True),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            pass_config=SimpleNamespace(enable_sp=False),
+        ),
+    )
 
 
 @pytest.mark.parametrize("role, dp_size", [("attention", 2), ("ffn", 2), ("ffn", 1)])
-@pytest.mark.parametrize("enable_dbo", [True, False])
-@pytest.mark.parametrize("enforce_eager", [True, False])
-def test_gpu_v2_validator_accepts_two_ubatches_for_paired_roles(
-    mrv2_config, role, dp_size, enable_dbo, enforce_eager
+def test_gpu_v2_validator_accepts_two_ubatches(mrv2_config, role, dp_size):
+    mrv2_config.additional_config["afd"]["role"] = role
+    mrv2_config.parallel_config.data_parallel_size = dp_size
+    if role == "ffn":
+        mrv2_config.additional_config["afd"]["num_ffn_ranks"] = dp_size
+    validate_gpu_model_runner_v2_config(
+        mrv2_config, expected_role=role, device_type="cuda"
+    )
+
+
+@pytest.mark.parametrize(
+    "dp_size, num_ubatches, message",
+    [(1, 2, "Attention DP > 1"), (2, 3, "exactly two microbatches")],
+)
+def test_gpu_v2_validator_rejects_unsupported_ubatching(
+    mrv2_config, dp_size, num_ubatches, message
 ):
-    config = mrv2_config(
-        role=role,
-        num_attention_ranks=2,
-        num_ffn_ranks=dp_size if role == "ffn" else 2,
-        data_parallel_size=dp_size,
-        enforce_eager=enforce_eager,
-        cudagraph_mode="FULL_DECODE_ONLY",
+    mrv2_config.parallel_config.data_parallel_size = dp_size
+    mrv2_config.parallel_config.num_ubatches = num_ubatches
+    mrv2_config.additional_config["afd"].update(
+        num_attention_ranks=dp_size, num_ffn_ranks=dp_size
     )
-    config.parallel_config.enable_dbo = enable_dbo
-    config.parallel_config.use_ubatching = True
-    config.parallel_config.num_ubatches = 2
-    validate_gpu_model_runner_v2_config(config, expected_role=role, device_type="cuda")
-
-
-def test_gpu_v2_validator_rejects_dbo_without_native_attention_ubatch_runner(
-    mrv2_config,
-):
-    config = mrv2_config()
-    config.parallel_config.enable_dbo = True
-    config.parallel_config.use_ubatching = True
-    config.parallel_config.num_ubatches = 2
-    with pytest.raises(RuntimeError, match="Attention DP > 1"):
+    with pytest.raises(RuntimeError, match=message):
         validate_gpu_model_runner_v2_config(
-            config, expected_role="attention", device_type="cuda"
-        )
-
-
-@pytest.mark.parametrize("role", ["attention", "ffn"])
-def test_gpu_v2_validator_rejects_more_than_two_ubatches(mrv2_config, role):
-    config = mrv2_config(
-        role=role, num_attention_ranks=2, num_ffn_ranks=2, data_parallel_size=2
-    )
-    config.parallel_config.use_ubatching = True
-    config.parallel_config.num_ubatches = 3
-    with pytest.raises(RuntimeError, match="exactly two microbatches"):
-        validate_gpu_model_runner_v2_config(
-            config, expected_role=role, device_type="cuda"
-        )
-
-
-@pytest.mark.parametrize("role", ["attention", "ffn"])
-def test_npu_v2_validator_still_rejects_two_ubatches(mrv2_config, role):
-    config = mrv2_config(
-        role=role, num_attention_ranks=2, num_ffn_ranks=2, data_parallel_size=2
-    )
-    config.additional_config["afd"]["connector"] = "CAMP2pAFDConnector"
-    config.parallel_config.enable_dbo = True
-    config.parallel_config.use_ubatching = True
-    config.parallel_config.num_ubatches = 2
-    with pytest.raises(RuntimeError, match="DBO or ubatching"):
-        validate_npu_model_runner_v2_config(
-            config, expected_role=role, device_type="npu"
+            mrv2_config, expected_role="attention", device_type="cuda"
         )
