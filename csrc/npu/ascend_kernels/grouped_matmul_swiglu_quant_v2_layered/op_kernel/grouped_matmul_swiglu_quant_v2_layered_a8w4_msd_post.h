@@ -231,6 +231,9 @@ __aicore__ inline void GMMA8W4PostProcess::Swiglu(uint32_t loopIdx, VecConfig &v
     DataCopyParams repeatParams{
         1, static_cast<uint16_t>((gmmSwigluQuantV2->tokenLen / SWIGLU_REDUCE_FACTOR) / ALIGN_8_ELE), 0, 0};
     DataCopy(_inMMLocal[loopIdx * gmmSwigluQuantV2->tokenLen], workspaceLocal, repeatParams);
+    // UB-to-UB DataCopy uses PIPE_V. Finish the SwiGLU write-back before
+    // Quant reads it and reuses workspaceLocal for ReduceMax.
+    PipeBarrier<PIPE_V>();
 
     mmOutQueue.EnQue(_inMMLocal);
 }
