@@ -316,6 +316,7 @@ def test_find_processes_matching_environment_uses_exact_entries(
         process_utils.os,
         "pidfd_open",
         lambda pid: pid + 1000,
+        raising=False,
     )
     monkeypatch.setattr(
         process_utils.os,
@@ -366,13 +367,14 @@ def test_kill_matching_process_does_not_signal_recycled_pid(monkeypatch, tmp_pat
     def fail_numeric_pid_signal(*_args):
         raise AssertionError("numeric PID signaled")
 
-    monkeypatch.setattr(process_utils.os, "pidfd_open", fake_pidfd_open)
+    monkeypatch.setattr(process_utils.os, "pidfd_open", fake_pidfd_open, raising=False)
     monkeypatch.setattr(process_utils.os, "close", fake_close)
     monkeypatch.setattr(process_utils.os, "kill", fail_numeric_pid_signal)
     monkeypatch.setattr(
         process_utils.signal,
         "pidfd_send_signal",
         fake_pidfd_send_signal,
+        raising=False,
     )
     monkeypatch.setattr(process_utils.time, "monotonic", lambda: 100.0)
 
