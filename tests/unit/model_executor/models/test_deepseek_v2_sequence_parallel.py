@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 torch = pytest.importorskip("torch")
+from torch import Tensor  # noqa: E402
+
 pytest.importorskip("vllm")
 
 from vllm.config import ParallelConfig  # noqa: E402
@@ -128,7 +130,7 @@ def test_two_stages_preserve_dense_prefix_and_restore_once(monkeypatch, use_sp):
     )
     context = SimpleNamespace(additional_kwargs={})
     monkeypatch.setattr(schedule, "get_forward_context", lambda: context)
-    active = []
+    active: list[int] = []
 
     def override(stage_context):
         active[:] = [stage_context.ubatch_idx]
@@ -136,7 +138,7 @@ def test_two_stages_preserve_dense_prefix_and_restore_once(monkeypatch, use_sp):
 
     monkeypatch.setattr(schedule, "override_forward_context", override)
     monkeypatch.setattr(schedule, "log_async_moe_stage_attention", lambda *args: None)
-    events = []
+    events: list[str | tuple[str, int] | tuple[str, int, int]] = []
     complete_stages = {}
 
     class Dense:
@@ -207,7 +209,7 @@ def test_two_stages_preserve_dense_prefix_and_restore_once(monkeypatch, use_sp):
         ),
         recv_ffn_output=lambda ref_tensor, ubatch_idx: ref_tensor,
     )
-    gathers = []
+    gathers: list[int] = []
 
     def gather(states, dim):
         stage_idx = len(gathers)
@@ -252,7 +254,7 @@ def test_single_stage_gathers_once_at_dense_or_output_boundary(monkeypatch, dens
     full = torch.tensor([[3.0, 4.0]])
     residual = torch.tensor([[7.0, 8.0]])
     layouts = []
-    gathers = []
+    gathers: list[Tensor] = []
     layer_calls = []
 
     class MoE:
@@ -311,7 +313,7 @@ def test_single_stage_gathers_once_at_dense_or_output_boundary(monkeypatch, dens
     monkeypatch.setattr(
         schedule, "maybe_apply_dbo_yield", lambda states, **kwargs: states
     )
-    layers = [MoE(0), MoE(1)]
+    layers: list[MoE | Dense] = [MoE(0), MoE(1)]
     if dense_tail:
         layers.append(Dense())
     result = schedule.run_attention_gate_afd_forward(

@@ -24,18 +24,20 @@ from afd_plugin.validation import (
 
 def _install_fake_vllm_config(monkeypatch):
     vllm_module = types.ModuleType("vllm")
-    vllm_module.__version__ = "0.30.0"
+    vllm_module.__dict__["__version__"] = "0.30.0"
     config_package = types.ModuleType("vllm.config")
     config_module = types.ModuleType("vllm.config.vllm")
     engine_package = types.ModuleType("vllm.engine")
     arg_utils_module = types.ModuleType("vllm.engine.arg_utils")
     platforms_module = types.ModuleType("vllm.platforms")
-    platforms_module.current_platform = SimpleNamespace(
+    platforms_module.__dict__["current_platform"] = SimpleNamespace(
         is_cuda=lambda: True,
         device_type="cuda",
     )
 
     class VllmConfig:
+        parallel_config: SimpleNamespace
+        additional_config: dict
         platform_worker_cls = VLLM_GPU_WORKER_FQCN
 
         def __post_init__(self):
@@ -49,11 +51,17 @@ def _install_fake_vllm_config(monkeypatch):
             self.post_init_backend = self.parallel_config.all2all_backend
 
     class EngineArgs:
+        enable_dbo: bool
+        ubatch_size: int
+        all2all_backend: str
+        worker_cls: str
+        additional_config: dict
+
         def create_engine_config(self, usage_context=None, headless=False):
             del usage_context, headless
             if (
                 self.enable_dbo
-                and platforms_module.current_platform.device_type != "npu"
+                and platforms_module.__dict__["current_platform"].device_type != "npu"
             ):
                 assert self.all2all_backend in {
                     "deepep_low_latency",
@@ -69,10 +77,14 @@ def _install_fake_vllm_config(monkeypatch):
             cfg.__post_init__()
             return cfg
 
-    config_module.VllmConfig = VllmConfig
-    config_module.logger = SimpleNamespace(debug=lambda *args, **kwargs: None)
-    arg_utils_module.EngineArgs = EngineArgs
-    arg_utils_module.logger = SimpleNamespace(debug=lambda *args, **kwargs: None)
+    config_module.__dict__["VllmConfig"] = VllmConfig
+    config_module.__dict__["logger"] = SimpleNamespace(
+        debug=lambda *args, **kwargs: None
+    )
+    arg_utils_module.__dict__["EngineArgs"] = EngineArgs
+    arg_utils_module.__dict__["logger"] = SimpleNamespace(
+        debug=lambda *args, **kwargs: None
+    )
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
     monkeypatch.setitem(sys.modules, "vllm.config", config_package)
     monkeypatch.setitem(sys.modules, "vllm.config.vllm", config_module)
@@ -106,7 +118,7 @@ def _engine_args(*, active, role="attention", worker_cls="auto"):
 
 
 def _set_fake_platform(*, is_cuda, device_type):
-    sys.modules["vllm.platforms"].current_platform = SimpleNamespace(
+    sys.modules["vllm.platforms"].__dict__["current_platform"] = SimpleNamespace(
         is_cuda=lambda: is_cuda,
         device_type=device_type,
     )
@@ -114,7 +126,7 @@ def _set_fake_platform(*, is_cuda, device_type):
 
 def _install_fake_npu_config(monkeypatch):
     arg_utils_module, config_module = _install_fake_vllm_config(monkeypatch)
-    events = []
+    events: list[tuple[str, str] | tuple[str, str, str]] = []
 
     class FakeParallelConfig:
         def __init__(
@@ -230,9 +242,9 @@ def _install_fake_npu_config(monkeypatch):
     fake_package = types.ModuleType("vllm_ascend")
     fake_package.__path__ = []
     fake_platform = types.ModuleType("vllm_ascend.platform")
-    fake_platform.NPUPlatform = NPUPlatform
+    fake_platform.__dict__["NPUPlatform"] = NPUPlatform
     factory_patch = types.ModuleType("afd_plugin.compat.patches.npu.ascend_config")
-    factory_patch.apply_afd_ascend_config_patch = lambda: None
+    factory_patch.__dict__["apply_afd_ascend_config_patch"] = lambda: None
     monkeypatch.setitem(sys.modules, factory_patch.__name__, factory_patch)
     monkeypatch.setattr(
         npu_compat,
@@ -241,7 +253,7 @@ def _install_fake_npu_config(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "vllm_ascend", fake_package)
     monkeypatch.setitem(sys.modules, "vllm_ascend.platform", fake_platform)
-    sys.modules["vllm.platforms"].current_platform = NPUPlatform
+    sys.modules["vllm.platforms"].__dict__["current_platform"] = NPUPlatform
     monkeypatch.setattr(mla_graph, "apply_afd_mla_graph_patch", lambda: True)
     monkeypatch.setattr(ascend_runtime, "_PATCHES_APPLIED", False)
     return arg_utils_module, NPUPlatform, events
@@ -274,7 +286,7 @@ def test_config_validation_patch_preserves_non_afd_validation(monkeypatch):
 
 def test_config_validation_patch_allows_vllm_dev_checkout(monkeypatch):
     arg_utils_module, _config_module = _install_fake_vllm_config(monkeypatch)
-    sys.modules["vllm"].__version__ = "0.1.dev14230+g68b0c3135"
+    sys.modules["vllm"].__dict__["__version__"] = "0.1.dev14230+g68b0c3135"
     _load_patch_module()
     args = _engine_args(active=True)
 
@@ -551,7 +563,7 @@ def test_config_validation_finalizes_async_attention_patch_after_ascend(monkeypa
     _set_fake_platform(is_cuda=False, device_type="npu")
 
     config_patch_calls = []
-    engine_patch_configs = []
+    engine_patch_configs: list[SimpleNamespace] = []
     monkeypatch.setattr(
         npu_compat,
         "apply_afd_ascend_config_patch_if_needed",

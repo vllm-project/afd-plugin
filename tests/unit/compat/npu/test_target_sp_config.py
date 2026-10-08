@@ -6,6 +6,7 @@ import ast
 import inspect
 import textwrap
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -41,7 +42,7 @@ def test_target_config_switch_survives_afd_worker_fix(monkeypatch, enabled, work
     tree = ast.parse(
         textwrap.dedent(inspect.getsource(ascend.AscendConfig.derive_and_validate))
     )
-    statements = tree.body[0].body
+    statements = cast(ast.FunctionDef, tree.body[0]).body
     start = next(
         i
         for i, node in enumerate(statements)
@@ -55,7 +56,7 @@ def test_target_config_switch_survives_afd_worker_fix(monkeypatch, enabled, work
         i
         for i in range(start, len(statements))
         if isinstance(statements[i], ast.If)
-        and ast.unparse(statements[i].test) == "not effective_flashcomm"
+        and ast.unparse(cast(ast.If, statements[i]).test) == "not effective_flashcomm"
     )
     namespace = dict(
         vars(ascend),

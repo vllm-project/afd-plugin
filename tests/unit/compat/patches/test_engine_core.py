@@ -61,13 +61,15 @@ def _install_fake_vllm_core(monkeypatch: pytest.MonkeyPatch):
             return None
 
     class EngineCoreProc(EngineCore):
+        last_counts: tuple[int, int]
+
         def run_busy_loop(self):
             self.original_run_busy_loop_called = True
 
         def _maybe_publish_request_counts(self):
             if not getattr(self, "publish_dp_lb_stats", False):
                 return
-            counts = self.scheduler.get_request_counts()
+            counts: tuple[int, int] = self.scheduler.get_request_counts()
             if counts != self.last_counts:
                 self.last_counts = counts
                 stats = _SchedulerStats(

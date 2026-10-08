@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 torch = pytest.importorskip("torch")
+from torch import Tensor  # noqa: E402
+
 pytest.importorskip("vllm_ascend.models.deepseek_v4.model")
 
 from afd_plugin.model_executor.models.npu import (  # noqa: E402
@@ -151,7 +153,7 @@ def test_two_stage_sp_keeps_ids_and_attention_positions_aligned(monkeypatch, tp_
         return torch.ones(2, 1), torch.zeros(2, 1, dtype=torch.int32)
 
     monkeypatch.setattr(gate, "compute_attention_gate_topk", topk)
-    final_gathers = []
+    final_gathers: list[Tensor] = []
 
     def gather_output(local, token_dim):
         stage = len(final_gathers)

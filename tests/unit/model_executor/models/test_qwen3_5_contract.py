@@ -8,8 +8,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
-nn = torch.nn
-
+from torch import nn  # noqa: E402
 from vllm.config.multimodal import MultiModalConfig  # noqa: E402
 from vllm.model_executor.models import qwen3_5 as native  # noqa: E402
 from vllm.model_executor.models.utils import StageMissingLayer  # noqa: E402

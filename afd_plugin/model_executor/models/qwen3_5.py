@@ -16,7 +16,7 @@ from afd_plugin.model_executor.models.deepseek_v2 import AFDAttentionFusedMoE
 
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
-_NO_ROLES = frozenset()
+_NO_ROLES: frozenset[str] = frozenset()
 
 
 def _validate_qwen_text_only(model_config: ModelConfig) -> None:

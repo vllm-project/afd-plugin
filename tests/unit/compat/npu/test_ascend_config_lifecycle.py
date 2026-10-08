@@ -19,10 +19,12 @@ import subprocess
 import sys
 import types
 import unittest
+from collections.abc import Callable
 from enum import Enum
 from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -81,7 +83,7 @@ def factory_namespace():
             raise ValueError(key)
         return value
 
-    ns = {
+    ns: dict[str, Any] = {
         "ascend_config": native,
         "AscendConfig": NativeConfig,
         "SchedulerConfig": SimpleNamespace(
@@ -110,14 +112,18 @@ def lifecycle_probe(role, dbo, *, serialized=None, fail=False):
     constructed = []
     modules = {}
     npu_module = types.ModuleType("afd_plugin.compat.npu")
-    npu_module.apply_afd_ascend_config_patch_if_needed = lambda: namespace_calls.append(
-        1
+    npu_module.__dict__["apply_afd_ascend_config_patch_if_needed"] = lambda: (
+        namespace_calls.append(1)
     )
     # Native platform already finalizes the backend in this probe. The separate
     # runtime_config root cause owns worker finalization and is tested separately.
-    npu_module.fix_all2all_backend_for_afd = lambda config: None
-    npu_module.apply_afd_async_dp_engine_patch_if_needed = lambda config: None
-    npu_module.apply_afd_ascend_engine_core_config_patch_if_needed = lambda config: None
+    npu_module.__dict__["fix_all2all_backend_for_afd"] = lambda config: None
+    npu_module.__dict__["apply_afd_async_dp_engine_patch_if_needed"] = lambda config: (
+        None
+    )
+    npu_module.__dict__["apply_afd_ascend_engine_core_config_patch_if_needed"] = (
+        lambda config: None
+    )
     modules[npu_module.__name__] = npu_module
 
     class NPUPlatform:
@@ -142,12 +148,12 @@ def lifecycle_probe(role, dbo, *, serialized=None, fail=False):
                 raise RuntimeError("platform failure")
 
     platform_module = types.ModuleType("vllm_ascend.platform")
-    platform_module.NPUPlatform = NPUPlatform
+    platform_module.__dict__["NPUPlatform"] = NPUPlatform
     modules[platform_module.__name__] = platform_module
     platforms_module = types.ModuleType("vllm.platforms")
-    platforms_module.current_platform = NPUPlatform
+    platforms_module.__dict__["current_platform"] = NPUPlatform
     modules[platforms_module.__name__] = platforms_module
-    platform_ns = {
+    platform_ns: dict[str, Any] = {
         "dataclass": dataclasses.dataclass,
         "parse_optional_afd_config": lambda config, **kwargs: (
             config.additional_config.get("afd")
@@ -169,7 +175,9 @@ def lifecycle_probe(role, dbo, *, serialized=None, fail=False):
     afd_platform_module = types.ModuleType(
         "afd_plugin.compat.patches.npu.ascend_platform"
     )
-    afd_platform_module.AFDAll2AllValidation = platform_ns["AFDAll2AllValidation"]
+    afd_platform_module.__dict__["AFDAll2AllValidation"] = platform_ns[
+        "AFDAll2AllValidation"
+    ]
     modules[afd_platform_module.__name__] = afd_platform_module
 
     class ParallelConfig(SimpleNamespace):
@@ -178,6 +186,8 @@ def lifecycle_probe(role, dbo, *, serialized=None, fail=False):
             return self.enable_dbo or self.ubatch_size > 1
 
     class Config(SimpleNamespace):
+        __post_init__: Callable[..., None]
+
         pass
 
     def native_post_init(config):
@@ -204,7 +214,7 @@ def lifecycle_probe(role, dbo, *, serialized=None, fail=False):
         config.__post_init__()
         return config
 
-    ns = {
+    ns: dict[str, Any] = {
         "_original_create_engine_config": native_create,
         "_original_vllm_config_post_init": native_post_init,
         "_is_target_vllm_compatible": lambda: True,
@@ -307,7 +317,7 @@ class AscendConfigLifecycleTests(unittest.TestCase):
             def has_piecewise_cudagraphs(self):
                 return self in (self.PIECEWISE, self.FULL_AND_PIECEWISE)
 
-        ns = {
+        ns: dict[str, Any] = {
             "CompilationMode": CompilationMode,
             "CUDAGraphMode": CUDAGraphMode,
             "logger": SimpleNamespace(
@@ -354,7 +364,7 @@ class AscendConfigLifecycleTests(unittest.TestCase):
         ns, native, events = factory_namespace()
         utils = types.ModuleType("vllm_ascend.utils")
         clears = []
-        utils.clear_enable_sp = lambda: clears.append(1)
+        utils.__dict__["clear_enable_sp"] = lambda: clears.append(1)
         additional = {
             "afd": {"role": "attention"},
             "enable_force_eplb": True,
@@ -400,7 +410,7 @@ class AscendConfigLifecycleTests(unittest.TestCase):
             ast.literal_eval(node.value)
             for node in tree.body
             if isinstance(node, ast.Assign)
-            and node.targets[0].id == "_ASCEND_CONFIG_ALIAS_MODULES"
+            and cast(ast.Name, node.targets[0]).id == "_ASCEND_CONFIG_ALIAS_MODULES"
         )
         self.assertIn("vllm_ascend.patch.platform.patch_engine_core", aliases)
 
@@ -408,7 +418,7 @@ class AscendConfigLifecycleTests(unittest.TestCase):
             return config
 
         native = SimpleNamespace()
-        ns = {
+        ns: dict[str, Any] = {
             "ascend_config": native,
             "sys": sys,
             "_ASCEND_CONFIG_ALIAS_MODULES": aliases,

@@ -16,7 +16,7 @@ def _parse_release(value: str) -> tuple[int, int, int]:
     match = re.match(r"^(\d+)\.(\d+)\.(\d+)", value)
     if match is None:
         raise ValueError(f"cannot parse vLLM version {value!r}")
-    return tuple(int(part) for part in match.groups())
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
 def get_installed_vllm_version() -> str | None:

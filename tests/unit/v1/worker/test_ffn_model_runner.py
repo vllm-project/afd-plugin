@@ -33,7 +33,7 @@ from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
 
 class _FakeConnector:
     def __init__(self):
-        self.attn_outputs = deque()
+        self.attn_outputs: deque[AFDA2FTransferPayload] = deque()
         self.ffn_outputs = []
         self.expert_routing_specs = []
         self.recv_input_ids = []
@@ -43,7 +43,7 @@ class _FakeConnector:
         self.ffn_size = 1
         # The runners reach the control plane through connector.control_plane;
         # the fake serves as both.
-        self.control_plane = self
+        self.control_plane: _FakeConnector | None = self
 
     def update_state_from_dp_metadata(self, payload):
         assert isinstance(payload, AFDControlPayload)
@@ -230,7 +230,8 @@ def test_v2_ffn_runner_keeps_hidden_state_only_connector_contract():
 
 
 def test_ffn_runner_forwards_payload_input_ids_to_model():
-    class _InputIdsModel(_FakeModel):
+    class _InputIdsModel:
+        get_experts_layer_indices = _FakeModel.get_experts_layer_indices
         afd_requires_input_ids = True
 
         def __init__(self):

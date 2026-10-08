@@ -6,7 +6,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
-nn = torch.nn
+from torch import nn  # noqa: E402
 
 from afd_plugin.model_executor.models import deepseek_v4 as adapter  # noqa: E402
 

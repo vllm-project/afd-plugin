@@ -2971,9 +2971,12 @@ def test_npu_ubatch_wrapper_reuses_synchronized_stage_dp_metadata(
     wrapper.runnable = object()
     wrapper.cudagraphs = {}
     observed = []
-    wrapper._make_ubatch_metadata = lambda *args, **_kwargs: (
-        observed.append(args[7]) or []
-    )
+
+    def make_ubatch_metadata(*args, **_kwargs):
+        observed.append(args[7])
+        return []
+
+    wrapper._make_ubatch_metadata = make_ubatch_metadata
     wrapper._run_ubatches = lambda _metadata, _model: "ran"
 
     model_inputs = dict(

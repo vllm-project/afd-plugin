@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import pytest
 
 torch = pytest.importorskip("torch")
+from torch import Tensor  # noqa: E402
+
 pytest.importorskip("vllm")
 
 from afd_plugin.model_executor.models.npu import async_cam_layout  # noqa: E402
@@ -35,7 +37,7 @@ def test_sp_layout_shards_stages_and_restores_global_tokens_once(monkeypatch, tp
         "get_tp_group",
         lambda: SimpleNamespace(world_size=4, rank_in_group=tp_rank),
     )
-    gathered = []
+    gathered: list[Tensor] = []
     physical_stages = [
         torch.cat((global_hidden[:5], torch.zeros(3, 2))),
         torch.cat((global_hidden[5:12], torch.zeros(1, 2))),

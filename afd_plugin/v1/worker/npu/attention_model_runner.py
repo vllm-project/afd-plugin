@@ -583,8 +583,9 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             return {}, None
         # ### PATCH START: AFD per-ubatch metadata containers
         assert ubatch_slices is not None
+        num_ubatches = len(ubatch_slices)
         attn_metadata: list[dict[str, AttentionMetadata]] = [
-            dict() for _ in range(len(ubatch_slices))
+            dict() for _ in range(num_ubatches)
         ]
         # ### PATCH END: AFD per-ubatch metadata containers
         num_tokens_padded = num_tokens_padded or num_tokens
@@ -790,7 +791,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             # Eager stages must own buffers before another builder overwrites
             # the process-wide RoPE workspace.
             if is_async_moe_stage_build or (
-                len(ubatch_slices) > 1 and cudagraph_runtime_mode != CUDAGraphMode.FULL
+                num_ubatches > 1 and cudagraph_runtime_mode != CUDAGraphMode.FULL
             ):
                 materialize_deepseek_attention_metadata(
                     attn_metadata_i,
@@ -810,7 +811,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         # the same token layout. Native DBO and Async CAM stages can have
         # different requests, positions, and sequence lengths, so each stage
         # owns one cache shared only by its attention groups.
-        dsa_metadata_caches = [{} for _ in ubatch_slices]
+        dsa_metadata_caches: list[dict[object, object]] = [{} for _ in ubatch_slices]
         num_actual_reqs_per_ubatch = [
             max(
                 0,

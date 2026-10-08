@@ -276,8 +276,9 @@ def build_async_moe_stage_inputs(
             local_slice if shard_hidden_states else slice(0, stage.actual_tokens)
         )
         inputs.hidden_states[index] = inputs.hidden_states[index][input_slice]
-        if inputs.residuals[index] is not None:
-            inputs.residuals[index] = inputs.residuals[index][input_slice]
+        stage_residual = inputs.residuals[index]
+        if stage_residual is not None:
+            inputs.residuals[index] = stage_residual[input_slice]
         # Attention sees all real tokens after its model-owned all-gather.
         # Positions therefore stay global and exclude stage-only SP padding.
         position_dim = _require_global_token_dim(
