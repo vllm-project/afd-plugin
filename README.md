@@ -48,7 +48,7 @@ Model support:
 | --- | --- | --- | --- |
 | DeepSeekV2 / DeepSeekV3 / DeepSeekV3.2 | `DeepseekForCausalLM`, `DeepseekV2ForCausalLM`, `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | `AFDDeepseekForCausalLM`, `AFDDeepseekV2ForCausalLM`, `AFDDeepseekV3ForCausalLM` | DeepSeekV3.2 uses `AFDDeepseekV3ForCausalLM`. Each AFD role constructs and loads only its role-required model components, while shared embedding, normalization, and output components remain available where required by the model lifecycle. |
 | Qwen3 MoE | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | CUDA with `compute_gate_on_attention=false`. |
-| Qwen3.5 / Qwen3.6 MoE | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | Qwen3.5/Qwen3.6 adapter family. Repository CUDA E2E evidence currently covers text-only Qwen3.6-35B-A3B with `--language-model-only`, synchronous `P2pNcclAFDConnector`, native DP4/TP1/EP4 baseline, and AFD 2A1F eager/graph. The `afd-graph-dbo-2a1f` case is excluded by a known defect: the FFN worker hits a CUDA illegal memory access during the live two-ubatch decode split, which crashes the FFN engine and hangs the Attention control plane. This matches the known defect recorded at 0.28 and is not a 0.30.0 regression. |
+| Qwen3.5 / Qwen3.6 MoE | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | CUDA text-only Qwen3.6-35B-A3B with `--language-model-only`, native DP4/TP1/EP4, and synchronous AFD 2A1F eager/graph. DBO remains excluded by a known FFN CUDA fault; see the [E2E limits](docs/design/module/e2e_testing.md). |
 
 Connector support:
 
@@ -57,8 +57,8 @@ See the [recipe index](recipe/README.md) for deployment and benchmark examples.
 | Connector | Platform | Recommend Stage | Sync or Async | Graph Support | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `P2pNcclAFDConnector` | CUDA | Decode | Sync | `FULL_DECODE_ONLY` CUDA graph | FFN ranks are ordered before Attention ranks. `num_attention_ranks` must be greater than or equal to `num_ffn_ranks`; the Attention ranks are spread over the FFN ranks in blocks that differ in size by at most one. See the [DeepSeek V2 Lite recipe](recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md). |
-| `CAMP2pAFDConnector` | Ascend NPU | Decode | Sync | `FULL_DECODE_ONLY` ACL graph | Uses HCCL/CAMP2P custom ops. Ascend ops build by default on NPU platforms. See the [synchronous DeepSeek V3.2 recipe](recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md). |
-| `CAMAsyncAFDConnector` | Ascend NPU | Prefill / decode | Async | Not supported | Experimental DP+TP/SP path with AFD-managed two-stage MoE ubatching; native DBO and PCP are unsupported. Historical v0.26 DeepSeek-V3.2 DP2TP8+EP16 token-split accuracy was `0.9522` strict match; integrated v0.30 NPU validation is pending. The [legacy PCP8 recipe](recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) requires `release/v0.19.1rc1`. |
+| `CAMP2pAFDConnector` | Ascend NPU | Decode | Sync | V1 `FULL_DECODE_ONLY`; V2 also `FULL` | Uses HCCL/CAMP2P custom ops. Ascend ops build by default on NPU platforms. See the [synchronous DeepSeek V3.2 recipe](recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md). |
+| `CAMAsyncAFDConnector` | Ascend NPU | Prefill / decode | Async | Not supported | Experimental DP+TP/SP path with AFD-managed two-stage MoE ubatching; native DBO and PCP are unsupported. V2-Lite and DSV4 Flash W4A8 have [representative v0.30 validation](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923). The [legacy PCP8 recipe](recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) requires `release/v0.19.1rc1`. |
 
 Connector implementations are grouped by backend package:
 `afd_plugin.connectors.gpu` for GPU-only connectors,
@@ -68,15 +68,18 @@ Known gaps:
 
 - The GPU target is exactly vLLM `0.30.0`; other vLLM versions are not
   claimed as supported on GPU.
-- The integrated v0.30 NPU paths await hardware validation. Historical v0.26
-  results remain scoped to their recorded vLLM-Ascend `80d8c194f` environment.
+- NPU hardware evidence covers representative DeepSeek-V2-Lite and DSV4
+  Flash W4A8 deployments; see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix).
+  Other models and topologies remain unverified. Historical v0.26 results retain
+  their recorded vLLM-Ascend `80d8c194f` environment.
+- Synchronous DSV4 E2E profiles are smoke cases; A5 concurrent answers remain
+  incorrect. See the [profile limits](tests/e2e/README.md#dsv4-flash-sync-camp2p-concurrent-requests-local-4-or-16-npus).
 - GPU ModelRunnerV2 supports synchronous `P2pNcclAFDConnector` with
   `compute_gate_on_attention=false`, including two-microbatch DBO and
   `FULL_DECODE_ONLY`. H20 validation covers DeepSeek-V2-Lite, 2A2F DP2/TP1;
   see the [MRV2 DBO scenarios](tests/e2e/README.md#gpu-mrv2-dbo-development-comparison).
-  Paired 300-question DBO accuracy differences are under review; see the
-  [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix).
-  Cross-mode outputs are not bitwise equivalent. NPU MRV2 DBO is unsupported.
+  Representative 300-question comparisons do not establish numerical
+  equivalence; see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix). NPU MRV2 DBO is unsupported.
 - GPU and NPU E2E tests are opt-in and require real hardware plus model weights.
 - GPU CUDA graph support is limited to `FULL_DECODE_ONLY`.
 - Native DBO is limited to exactly two ubatches and is not supported by
@@ -118,10 +121,10 @@ The optional extra pins `vllm==0.30.0`.
 
 ### Ascend NPU installation
 
-The Ascend target uses the source pair below. Earlier hardware evidence used
-openEuler 22.03 (aarch64) with Ascend 910C / Atlas A3; integrated v0.30 hardware
-validation is pending. Install a compatible driver and firmware, and confirm
-the devices with `npu-smi info`.
+The Ascend target uses the source pair below. Representative v0.30 validation
+uses Ascend 910C / Atlas A3; see the [recorded environment and results](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923).
+Install a compatible driver and firmware, and confirm the devices with
+`npu-smi info`.
 
 | Component | Version |
 | --- | --- |
@@ -130,14 +133,16 @@ the devices with `npu-smi info`.
 | vLLM-Ascend | commit [`8d4409d6`](https://github.com/vllm-project/vllm-ascend/commit/8d4409d6256d8a6729140ddcc0d1889e3f96cdd6) |
 | CANN / torch / torch-npu | Use the mutually compatible versions required by that vLLM-Ascend source snapshot. |
 
-> This is the integrated target dependency pair, not a claim that NPU
-> hardware acceptance has completed.
+> Hardware evidence is scoped to the recorded models, configurations, and
+> sample counts; it does not cover every NPU deployment or guarantee clean
+> device shutdown.
 
 #### Environment
 
 The Ascend environment targets vLLM-Ascend commit `8d4409d6` and vLLM
-`0.30.0`. Integrated hardware validation is pending. The repository does not currently claim a
-released container tag for either target. Use the
+`0.30.0`. The recorded A3 environment uses CANN 9.1.0, torch 2.10.0+cpu,
+and torch-npu 2.10.0.post4. The repository does not claim a released container
+tag for either target. Use the
 [installation guide at that source snapshot](https://github.com/vllm-project/vllm-ascend/blob/8d4409d6256d8a6729140ddcc0d1889e3f96cdd6/docs/source/getting_started/installation.md)
 to prepare a matching A3/openEuler environment, then install AFD from the
 repository root. Do not reuse the former v0.19.1rc1 image as a v0.30 runtime.

@@ -51,6 +51,9 @@ def test_dsv4_fixed_deployment_and_cleanup(monkeypatch, tmp_path):
         assert (
             command[command.index("--attention_config.indexer_kv_dtype") + 1] == "int8"
         )
+        # The asynchronous 910C case keeps the Ascend quantization method; only
+        # the synchronous case resolves it from the checkpoint.
+        assert command[command.index("--quantization") + 1] == "ascend"
         assert "--enforce-eager" in command
         assert "--enable-expert-parallel" in command
         assert "--enable-dbo" not in command

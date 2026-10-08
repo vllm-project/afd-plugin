@@ -18,10 +18,10 @@ validation_paths:
   - "tests/e2e/**"
 upstream_refs:
   - "vLLM 0.30.0"
-  - "vLLM-Ascend target 8d4409d6256d8a6729140ddcc0d1889e3f96cdd6; integrated NPU hardware acceptance pending"
+  - "vLLM-Ascend target 8d4409d6256d8a6729140ddcc0d1889e3f96cdd6; representative NPU validation in PR #425"
 verified_platform_refs:
   - "CUDA: tests/e2e marked e2e with AFD_E2E_BACKEND=gpu; no canonical image is recorded"
-  - "Ascend: historical environments recorded in the NPU guides; current target in root installation instructions"
+  - "Ascend: current target in root installation instructions; V2-Lite and DSV4 Flash W4A8 evidence in the execution-platform matrix; older environments remain historical"
 related_issues:
   - "#129"
 last_reviewed: 2026-08-27

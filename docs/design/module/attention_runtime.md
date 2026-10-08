@@ -39,7 +39,7 @@ upstream_refs:
   - "vLLM vllm.v1.worker.gpu.model_runner.GPUModelRunner"
   - "vLLM-Ascend vllm_ascend.worker.worker.NPUWorker (tested environment evidence only)"
   - "vLLM-Ascend vllm_ascend.worker.model_runner_v1.NPUModelRunner (tested environment evidence only)"
-  - "vLLM-Ascend vllm_ascend.worker.v2.model_runner.NPUModelRunner (unit-test evidence only)"
+  - "vLLM-Ascend vllm_ascend.worker.v2.model_runner.NPUModelRunner at 8d4409d6"
 verified_platform_refs:
   - "CUDA paths marked gpu in tests/e2e"
   - "CUDA ModelRunnerV2 DP2/TP2 eager and graph scenarios in tests/e2e"
@@ -160,8 +160,10 @@ The supported V2 deployment is deliberately narrower than V1:
 
 Both roles validate the paired V2 topology, but only Attention uses the native
 V2 model runner. FFN remains connector-driven and uses its existing AFD runner
-surface. CUDA V2 has DP2/TP2 eager and graph E2E evidence; the current Ascend
-V2 contract has focused unit evidence but no repository hardware E2E case.
+surface. CUDA V2 has DP2/TP2 eager and graph E2E evidence. Ascend V2 has
+V2-Lite 2A1F eager/graph functional checks and a 2A2F FULL 300-question run;
+see the [NPU validation record](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923).
+The generic V2 E2E harness remains CUDA-only.
 
 ## Request and forward flow
 
@@ -372,7 +374,8 @@ Current shared limits are the supported vLLM release and registered role-aware
 model integrations. V1 native ubatching accepts exactly two ubatches. V2
 instead requires a synchronous control-plane connector, static EP, and no
 PP/CP. CUDA V2 supports the two-microbatch path above; Ascend V2 excludes
-DBO/ubatching and awaits integrated hardware acceptance.
+DBO/ubatching. Hardware evidence remains limited to the recorded model and
+configuration cells.
 Platform/connector limits are intentionally centralized in
 [execution platforms](execution_platforms.md#tested-runtime-matrix).
 

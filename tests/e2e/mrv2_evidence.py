@@ -2,10 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Test-only worker entry point for B/E/G execution evidence.
 
-Re-export their existing base as a no-op native worker extension. No new class
-or production instrumentation is needed; the worker hierarchy is unchanged.
-The probes live only in these explicitly selected E2E worker processes. They
-observe completed native calls, never synchronize devices or change execution.
+Re-export the native Worker for the selected E2E processes and log completed
+Attention/FFN calls for B/E/G assertions.
 """
 
 import json

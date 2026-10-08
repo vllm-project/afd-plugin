@@ -110,16 +110,17 @@ python -m pytest -q -s \
 
 ### GPU ModelRunnerV2 evidence matrix
 
-The GPU-only ModelRunnerV2 regression matrix contains six representative
+The GPU-only ModelRunnerV2 regression matrix contains eight representative
 scenarios:
 
 - `afd-v2-eager-1a1f` and `afd-v2-graph-1a1f`
 - `afd-v2-eager-dp2` and `afd-v2-graph-dp2`
 - `afd-v2-eager-tp2` and `afd-v2-graph-tp2`
+- `afd-v2-eager-dbo-dp2` and `afd-v2-graph-dbo-dp2`
 
 The 1A1F scenarios use two devices and are local-only. DP2 and TP2 use four
-devices, split evenly between Attention and FFN, and run in the CI gate on
-`l4_4`. These rows record hardware-tested coverage; they are not a production
+devices, split evenly between Attention and FFN. CI selects those four cases
+and the two DP2 DBO cases on `l4_4`. These rows record hardware-tested coverage; they are not a production
 topology allowlist. Other valid DP/TP topologies use the same AFD and native
 vLLM topology contracts.
 
@@ -131,8 +132,8 @@ python -m pytest -q -s \
 
 ### GPU MRV2 DBO development comparison
 
-The GPU DBO development branch adds `afd-v2-eager-dbo-dp2` and
-`afd-v2-graph-dbo-dp2`. Together with `afd-v2-eager-dp2`, these use the same
+The `afd-v2-eager-dbo-dp2` and `afd-v2-graph-dbo-dp2` scenarios cover
+the eager and graph DBO paths. Together with `afd-v2-eager-dp2`, these use the same
 2A2F DP2/TP1 topology, 128 GSM8K samples, 12 concurrent requests, eight-shot
 prompts, `max_num_seqs=8`, and `max_num_batched_tokens=4096`. Prefix caching,
 chunked prefill, and async scheduling are disabled in all three. Only DBO
@@ -140,12 +141,14 @@ and graph mode change; the graph row uses `FULL_DECODE_ONLY` with capture size 8
 `AFD_GSM8K_LIMIT` overrides the sample count consistently across the three rows
 (with a shared minimum of 24 for diagnostics).
 
-These are development scenarios, not hardware qualification evidence. The GPU
-validator accepts exactly two microbatches and requires Attention DP > 1;
-FFN remains connector-driven. NPU DBO remains rejected. Do not
-substitute the older MRV1 `afd-graph-dbo-*` scenarios for these rows. Acceptance
-requires live two-stage execution, continuous FULL replay on the graph row,
-paired A/F evidence, accuracy comparison, and a representative overlap trace.
+The GPU validator accepts exactly two microbatches and requires Attention
+DP > 1; FFN remains connector-driven. NPU MRV2 DBO remains rejected. The
+runner requires live two-stage execution and matching layouts on all
+Attention/FFN ranks, plus consecutive FULL replays on the graph row. MRV1
+`afd-graph-dbo-*` scenarios do not substitute for these checks.
+Representative 300-question results and their limits are recorded in
+[PR #425](https://github.com/vllm-project/afd-plugin/pull/425); these comparisons
+do not establish numerical equivalence or full-dataset qualification.
 
 ### Weekly GSM8K
 
@@ -211,6 +214,76 @@ Defaults: API ports 19280/19281, AFD rendezvous port 6455, startup timeout
 `AFD_NPU_DSV4_E2E_AFD_PORT`, and `AFD_NPU_E2E_STARTUP_TIMEOUT`.
 `AFD_NPU_E2E_VLLM_BIN` selects the executable. Build the plugin-owned 910C
 operators before running. Model and all sixteen device IDs must be supplied explicitly; missing setup fails rather than skips.
+
+## DSV4 Flash sync CAMP2P concurrent requests (local, 4 or 16 NPUs)
+
+Two local-only scenarios run DeepSeek V4 Flash over the synchronous
+`CAMP2pAFDConnector` — no CAM vendor package, since the plugin's own a2e/e2a
+operators carry the activations and the Hash-layer token ids — each at its host's
+recorded launch shape:
+
+| Scenario | Host | Deployment | Devices |
+| --- | --- | --- | --- |
+| `afd-dsv4-flash-sync-camp2p-2a2f` | A5 (Ascend 950) | Attention DP2/TP1 + FFN DP2/TP1, expert parallel, ACL graph (`FULL_DECODE_ONLY`, capture 16), 4096 context, native DBO off, 128-token block, prefix caching off | 4 |
+| `afd-dsv4-flash-sync-camp2p-8a8f` | A3 (Ascend 910C) | Attention DP2/TP4 + FFN DP8/TP1, expert parallel, eager, 8192 context | 16 |
+
+Build the operators for the target SOC first (`SOC_VERSION=ascend950` on A5,
+`910c` on A3). The device list is role-defining — the first `attention_ranks`
+entries go to Attention and the rest to FFN, so A5 passes `2,3,0,1` for its
+recorded mapping and A3 passes `0-7` for Attention with `8-15` for FFN — and a
+list sized for the other host fails rather than skips.
+
+Both profiles are **smoke cases**: the async case's ten concurrent chat requests
+(`12 + 7` … `21 + 7`, temperature=0, thinking=false, max_tokens=256) must be served
+together, each returning a nonempty answer that finished. Neither compares the
+answer with the expected sum — A5 corrupts part of a concurrent batch (below) and
+A3 has not been validated against the oracle — and `check_answer` on a profile
+turns the exact check back on once its host is validated.
+
+Deployment differences worth knowing:
+
+- **A5** runs with DBO off, `--block-size 128`, and
+  `--no-enable-prefix-caching`; it uses `HCCL_BUFFSIZE=2048`, the plain
+  allocator, and no required NIC variable.
+- **A3** drops an inherited `HCCL_BUFFSIZE`, sizes its own CAMP2P domains through
+  `connector_extra_config`, and requires `HCCL_IF_IP` and `HCCL_SOCKET_IFNAME`.
+- `--quantization` is resolved from the checkpoint: A5's FP8/W4A8 checkpoint
+  decides, A3's int8 W8A8 loads through `ascend`.
+- Both disable `multistream_dsv4_dsa_overlap` and `enable_dsa_cp` and leave
+  the gate on FFN; KV transfer is not enabled. Shutdown allows 60 seconds, and
+  the async FFN cleanup exception does not apply because no CAM receive is
+  pending.
+
+**Known limitation: A5 produces incorrect answers under concurrent load even
+with DBO off.** A3 answer correctness remains unverified. Passing these smoke
+cases does not establish synchronous DSV4 correctness. Their profiles and
+limitations originate in [PR #359](https://github.com/vllm-project/afd-plugin/pull/359);
+they are separate from the V2-Lite and asynchronous DSV4 accuracy evidence
+recorded in [PR #425](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923).
+
+```bash
+export AFD_E2E_BACKEND=npu
+export AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V4-Flash
+# A5: four dies, Attention on 2,3 and FFN on 0,1
+export AFD_E2E_DEVICES=2,3,0,1
+export HCCL_IF_IP=<local-communication-ip>   # optional on A5
+export HCCL_SOCKET_IFNAME=eth0               # optional on A5
+python -m pytest -q -s \
+  'tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py::test_deepseek_v4_flash_sync_camp2p[afd-dsv4-flash-sync-camp2p-2a2f]'
+# A3: sixteen dies, Attention on 0-7 and FFN on 8-15
+export AFD_E2E_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export HCCL_IF_IP=<local-communication-ip>   # required on A3
+export HCCL_SOCKET_IFNAME=eth0              # required on A3
+python -m pytest -q -s \
+  'tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py::test_deepseek_v4_flash_sync_camp2p[afd-dsv4-flash-sync-camp2p-8a8f]'
+```
+
+Defaults: API ports 19380/19381, AFD rendezvous port 6456, startup timeout
+1800 seconds. Override these using `AFD_NPU_DSV4_SYNC_E2E_API_PORT`,
+`AFD_NPU_DSV4_SYNC_E2E_AFD_PORT`, and `AFD_NPU_E2E_STARTUP_TIMEOUT`.
+`AFD_NPU_E2E_VLLM_BIN` selects the executable. The model and exactly the
+scenario's device count must be supplied; a list sized for the other shape
+fails rather than skips.
 
 ## Run with the Codex skill
 

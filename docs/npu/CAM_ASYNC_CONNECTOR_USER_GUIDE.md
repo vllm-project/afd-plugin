@@ -11,7 +11,9 @@ rank mapping, data flow, startup requirements, and current limitations. The
 retains historical v0.26 launch scripts and v0.19 multi-node measurements
 for provenance. The current dependency pair is recorded in the
 [root installation instructions](../../README.md#ascend-npu-installation);
-integrated v0.30 NPU hardware acceptance is pending.
+v0.30 evidence covers V2-Lite ordinary Async CAM and DSV4 Flash W4A8 layered
+off/on, each with a representative 300-question comparison. See the
+[NPU validation record](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923).
 
 > [!WARNING]
 > CAM async remains experimental. The following evidence is historical v0.26. The linked PCP8 recipe and
@@ -24,8 +26,8 @@ integrated v0.30 NPU hardware acceptance is pending.
 ## When to use this connector
 
 The retained implementation describes an asynchronous Ascend NPU inference path
-with the following code-level constraints. Integrated v0.30 hardware
-validation is pending:
+with the following code-level constraints. Hardware evidence is limited to
+the models and configurations recorded above:
 
 - CAM operator packages are installed on every node;
 - Attention performs MoE gating before dispatch to FFN ranks;
@@ -332,8 +334,13 @@ for another model fails at startup. All remote MoE layers must share geometry,
 SiLU activation, quantization layout, and scaling semantics. The extractor
 can represent per-channel and per-group parameters, but the pinned Ascend
 loader rejects positive `group_size`; the current target is limited to
-per-channel W4A8. Target-checkpoint hardware validation is pending. Shared experts remain on Attention. DSV4 already
-applies routed scaling in top-k, so FFN does not apply it again.
+per-channel W4A8. DSV4 Flash has layered off/on 300-question comparisons and
+real INT8-activation/INT4-weight operator traces in the validation record above.
+The [SwiGLU write-back synchronization fix](https://github.com/vllm-project/afd-plugin/issues/429)
+also passes the original per-group operator regression without changing its
+tolerance; this does not extend the checkpoint loader to per-group weights.
+Shared experts remain on Attention. DSV4 applies routed scaling in top-k, so
+FFN does not apply it again.
 
 The existing fused operator does not apply a nonzero `swiglu_limit`. The
 layered path temporarily ignores the model's limit and logs
