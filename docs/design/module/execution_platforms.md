@@ -353,8 +353,8 @@ connector resource rules remain owned by
 [connector contracts](connector_contracts.md).
 
 The repository does not record a canonical CUDA container or a released
-vLLM-Ascend v0.30 container. The NPU implementation records source commit
-`80d8c194f`; environment evidence is not an authoritative package tag.
+vLLM-Ascend v0.30 container. The NPU integration targets source commit
+`8d4409d6`; environment evidence is not an authoritative package tag.
 
 ## Failure and cleanup boundaries
 
