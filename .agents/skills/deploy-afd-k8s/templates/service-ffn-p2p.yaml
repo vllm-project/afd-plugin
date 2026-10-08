@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-ffn-p2p-service
+  labels:
+    app: afd-recipe
+    role: serve
+spec:
+  # Must be headless: the FFN-head pod binds its own rendezvous server to
+  # this name, and a normal ClusterIP has no real interface to bind to.
+  clusterIP: None
+  # The FFN-head pod resolves/binds this name during its own startup, before
+  # it can be "ready" -- without this, headless DNS would omit it until
+  # ready, deadlocking startup.
+  publishNotReadyAddresses: true
+  selector:
+    app: afd-recipe
+    afd-ffn-node-role: head
+  ports:
+    - name: rendezvous
+      port: ${AFD_CONNECTOR_PORT}
+      targetPort: ${AFD_CONNECTOR_PORT}

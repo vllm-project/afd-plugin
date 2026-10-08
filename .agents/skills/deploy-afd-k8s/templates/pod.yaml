@@ -1,0 +1,193 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${TEMPLATE_POD}
+  labels:
+    app: afd-recipe
+    role: serve
+    afd-attn-node-role: ${TEMPLATE_ATTN_ROLE}
+    afd-ffn-node-role: ${TEMPLATE_FFN_ROLE}
+spec:
+  restartPolicy: Never
+  securityContext:
+    fsGroup: ${TEMPLATE_FSGROUP}
+  volumes:
+    - name: model-storage
+      persistentVolumeClaim:
+        claimName: ${TEMPLATE_PVC}
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 16Gi
+    - name: work
+      emptyDir: {}
+    - name: recipe-script
+      configMap:
+        name: afd-recipe-script
+  containers:
+    - name: afd
+      image: ${TEMPLATE_IMAGE}
+      imagePullPolicy: Always
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+          RECIPE_SCRIPT=/recipe/recipe.sh
+          mkdir -p /work/bin
+          # Recipes only ever call `uv run <cmd>`; drop the `run` and exec
+          # the rest directly instead of invoking uv at all.
+          printf '#!/bin/bash\nshift\nexec "$@"\n' > /work/bin/uv
+          chmod +x /work/bin/uv
+          export PATH="/work/bin:$PATH"
+
+          echo "=== launching $(basename "$RECIPE_SCRIPT") (POD=${POD:-<none>} attn=${AFD_ATTN_NODE_ROLE} ffn=${AFD_FFN_NODE_ROLE}) ==="
+
+          # Rebind the client-facing port off loopback: every `--host
+          # 127.0.0.1` on the branch is an API-server flag (the recipe binds
+          # :${TEMPLATE_CLIENT_PORT} on 127.0.0.1), but the Service needs
+          # 0.0.0.0.
+          RECIPE_BASENAME="$(basename "$RECIPE_SCRIPT" .sh)"
+          PATCHED_SCRIPT="/work/${RECIPE_BASENAME}.patched.sh"
+          sed 's/--host 127\.0\.0\.1/--host 0.0.0.0/' "$RECIPE_SCRIPT" > "$PATCHED_SCRIPT"
+
+          cd /work
+          bash "$PATCHED_SCRIPT" &
+          RECIPE_PID=$!
+          echo "$RECIPE_PID" > /work/recipe.pid
+
+          # Which log(s) this pod will actually produce, and this pod's own
+          # readiness marker per log -- both keyed on this pod's node-role
+          # labels, not re-derived from $POD. Fixed to the attn.log/ffn.log
+          # names every colocation recipe uses today.
+          LOGS=""
+          [ "$AFD_ATTN_NODE_ROLE" != "none" ] && LOGS="$LOGS attn.log"
+          [ "$AFD_FFN_NODE_ROLE" != "none" ] && LOGS="$LOGS ffn.log"
+
+          fail() {
+            echo "ERROR: $*"
+            rm -f /work/ready
+            for log in $LOGS; do
+              echo "----- tail $log -----"
+              tail -n 100 "/work/$log" 2>/dev/null || echo "(missing)"
+            done
+            exit 1
+          }
+
+          [ -n "$LOGS" ] || fail "this pod's node-role labels are both 'none' -- nothing to run"
+
+          # A worker (headless) shard of a split role never starts an API
+          # server, so it never logs "Application startup complete" -- fall
+          # back to the EngineCore's own init-complete line instead.
+          ready_marker() {
+            case "$1" in
+              ffn.log) echo "AFD FFN EngineCore started" ;;
+              attn.log)
+                if [ "$AFD_ATTN_NODE_ROLE" = "worker" ]; then
+                  echo "init engine (profile, create kv cache, warmup model) took"
+                else
+                  echo "Application startup complete"
+                fi
+                ;;
+            esac
+          }
+
+          echo "=== wait for every worker to report startup ==="
+          for log in $LOGS; do
+            marker="$(ready_marker "$log")"
+            echo "--- waiting on $log (marker: $marker) ---"
+            ready=0
+            for i in $(seq 1 240); do
+              if [ -f "/work/$log" ] && grep -q "$marker" "/work/$log"; then
+                echo "$log: ready"
+                ready=1
+                break
+              fi
+              kill -0 "$RECIPE_PID" 2>/dev/null || fail "recipe process exited before $log came up"
+              sleep 10
+            done
+            [ "$ready" = "1" ] || fail "timed out waiting for $log"
+          done
+
+          if [ "$AFD_ATTN_NODE_ROLE" = "head" ]; then
+            echo "--- waiting on attention server /health (127.0.0.1:${TEMPLATE_CLIENT_PORT}) ---"
+            endpoint_ready=0
+            for i in $(seq 1 60); do
+              if curl -fsS "http://127.0.0.1:${TEMPLATE_CLIENT_PORT}/health" >/dev/null 2>&1; then
+                echo "attention server: ready"
+                endpoint_ready=1
+                break
+              fi
+              sleep 5
+            done
+            [ "$endpoint_ready" = "1" ] || fail "attention server did not answer /health"
+          fi
+
+          echo "=== pod ${TEMPLATE_POD} READY ==="
+          touch /work/ready
+
+          echo "=== monitoring serving process (pid $RECIPE_PID) ==="
+          while true; do
+            sleep 10
+            kill -0 "$RECIPE_PID" 2>/dev/null || fail "serving process exited unexpectedly"
+            if [ "$AFD_ATTN_NODE_ROLE" = "head" ]; then
+              curl -fsS "http://127.0.0.1:${TEMPLATE_CLIENT_PORT}/health" >/dev/null 2>&1 \
+                || fail "attention server health check failed"
+            fi
+          done
+      env:
+        - name: USER
+          value: "vllm"
+        - name: HOME
+          value: "/work/home"
+        - name: MODEL_PATH
+          value: "${TEMPLATE_MODEL}"
+        - name: HF_HOME
+          value: "/models/.hf_home"
+        - name: TORCHINDUCTOR_CACHE_DIR
+          value: "/work/inductor"
+        - name: AFD_ATTN_NODE_ROLE
+          value: "${TEMPLATE_ATTN_ROLE}"
+        - name: AFD_FFN_NODE_ROLE
+          value: "${TEMPLATE_FFN_ROLE}"
+        # ${TEMPLATE_EXTRA_ENV}
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token-secret
+              key: token
+              optional: true
+      readinessProbe:
+        exec:
+          command:
+            - /bin/bash
+            - -c
+            - |
+              [ -f /work/ready ] || exit 1
+              kill -0 "$(cat /work/recipe.pid)" 2>/dev/null || exit 1
+              if [ "$AFD_ATTN_NODE_ROLE" = "head" ]; then
+                curl -fsS "http://127.0.0.1:${TEMPLATE_CLIENT_PORT}/health" >/dev/null 2>&1
+              fi
+        initialDelaySeconds: 10
+        periodSeconds: 10
+        timeoutSeconds: 5
+        failureThreshold: 3
+      resources:
+        requests:
+          nvidia.com/gpu: "${TEMPLATE_GPU}"
+          cpu: "16"
+          memory: 128Gi
+        limits:
+          nvidia.com/gpu: "${TEMPLATE_GPU}"
+          cpu: "32"
+          memory: 200Gi
+      volumeMounts:
+        - name: model-storage
+          mountPath: /models
+        - name: dshm
+          mountPath: /dev/shm
+        - name: work
+          mountPath: /work
+        - name: recipe-script
+          mountPath: /recipe
+          readOnly: true

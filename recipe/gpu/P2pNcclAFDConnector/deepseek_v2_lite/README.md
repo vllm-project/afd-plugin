@@ -22,17 +22,21 @@ End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
 
 ## Directory layout
 
-```
+```text
 .
 ├── prefill_decode_disaggregation/        # prefill_decode_disaggregation, 2P1A1F topology
 │   ├── 2p1a1f_eager_dbo.sh
 │   └── 2p1a1f_graph_dbo.sh
-└── prefill_decode_colocation/             # prefill_decode_colocation, 2A2F topology
+└── prefill_decode_colocation/             # prefill_decode_colocation, 2A2F/4A4F topology
     ├── 2a2f_eager_dbo_dp1tp2.sh
     ├── 2a2f_eager_dbo_dp2tp1.sh
     ├── 2a2f_graph_dbo_dp1tp2.sh
-    └── 2a2f_graph_dbo_dp2tp1.sh
+    ├── 2a2f_graph_dbo_dp2tp1.sh
+    ├── 4a4f_eager_dbo_dp2tp2.sh
+    ├── 4a4f_graph_dbo_dp2tp2.sh
+    └── multipod_2a_2f_graph_dbo_dp1tp2.sh  # 2a2f_graph_dbo_dp1tp2, split across 2 k8s pods
 ```
+
 ### 1. Prefill/Decode Disaggregation — `1a1f`
 
 5 processes, 4 GPU workers + 1 proxy server:
@@ -45,7 +49,6 @@ End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
 | 3    | Decode (FFN)        | 18304 |
 | /    | Proxy Server        | 18305 |
 
-
 ### 2. Prefill/Decode Colocation — `2a2f`
 
 2 processes, two GPUs each:
@@ -55,12 +58,22 @@ End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
 | 0, 1 | Attention | 18305 |
 | 2, 3 | FFN       | 18305 |
 
-The four variants cover the TP/DP cross product:
+The four `2a2f_*` variants cover the TP/DP cross product; `4a4f_*` doubles
+both attention and FFN ranks (DP=2 on each side); `multipod_2a_2f_graph_dbo_dp1tp2.sh`
+is the same `2a2f_graph_dbo_dp1tp2` config, but gated on a `POD` env var
+(`ATTENTION_0` or `FFN_0`) for the `deploy-afd-k8s` skill to deploy it
+across 2 pods (see repo-root `recipe/gpu/P2pNcclAFDConnector/README.md`) --
+unlike the scripts above, it is **not** meant to be run directly: with
+`POD` unset, neither `vllm serve` block executes, and its
+`AFD_CONNECTOR_HOST` default (`vllm-ffn-p2p-service`) only resolves inside
+the cluster the skill deploys it to:
 
-| File                            | DP | TP |
-|---------------------------------|----|----|
-| `2a2f_*_dp1tp2.sh`              | 1  | 2  |
-| `2a2f_*_dp2tp1.sh`              | 2  | 1  |
+| File                                  | DP | TP |
+|---------------------------------------|----|----|
+| `2a2f_*_dp1tp2.sh`                    | 1  | 2  |
+| `2a2f_*_dp2tp1.sh`                    | 2  | 1  |
+| `4a4f_*_dp2tp2.sh`                    | 2  | 2  |
+| `multipod_2a_2f_graph_dbo_dp1tp2.sh`  | 1  | 2  |
 
 ## Running
 
@@ -71,6 +84,7 @@ Wait for `attn.log` (and `afd_prefill0.log`, `afd_prefill1.log` in disaggregatio
 before sending traffic.
 
 ### prefill_decode_colocation
+
 ```bash
 export MODEL_PATH=/path/model_weights/DeepSeek-V2-Lite
 export VLLM_USE_V2_MODEL_RUNNER=0
@@ -132,7 +146,7 @@ and deployment configuration.
 
 Graph mode replaces `--enforce-eager` with:
 
-```
+```text
 --max-cudagraph-capture-size 64
 --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY",
                        "cudagraph_capture_sizes":[64]}'

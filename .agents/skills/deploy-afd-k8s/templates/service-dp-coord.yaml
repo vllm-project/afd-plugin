@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-${TEMPLATE_ROLE}-dp-service
+  labels:
+    app: afd-recipe
+    role: serve
+spec:
+  # Headless for the same reason as vllm-ffn-p2p-service: the role's head
+  # pod binds --data-parallel-address to this name, so it must resolve to a
+  # real pod IP, not a virtual ClusterIP.
+  clusterIP: None
+  # The head pod resolves/binds this name during its own startup, before it
+  # can be "ready" -- without this, headless DNS would omit it until ready,
+  # deadlocking startup.
+  publishNotReadyAddresses: true
+  selector:
+    app: afd-recipe
+    afd-${TEMPLATE_ROLE}-node-role: head
+  ports:
+    - name: dp-rpc
+      port: ${TEMPLATE_PORT}
+      targetPort: ${TEMPLATE_PORT}

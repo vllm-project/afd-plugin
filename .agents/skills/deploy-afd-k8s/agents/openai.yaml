@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deploy AFD on Kubernetes"
+  short_description: "Deploy an AFD GPU recipe on k8s and expose a ready endpoint"
+  default_prompt: "Use $deploy-afd-k8s to deploy an AFD GPU colocation recipe on Kubernetes and wait until the endpoint is ready."

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service
+  labels:
+    app: afd-recipe
+    role: serve
+spec:
+  selector:
+    app: afd-recipe
+    afd-attn-node-role: head
+  ports:
+    - name: http
+      port: ${CLIENT_PORT}
+      targetPort: ${CLIENT_PORT}
