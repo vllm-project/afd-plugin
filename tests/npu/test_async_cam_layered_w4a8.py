@@ -104,9 +104,9 @@ def test_layered_w4a8_valid_rows_and_capacity_tail(per_channel, counts, layer_id
             offset += count
         expected = torch.cat(expected)
         torch.testing.assert_close(actual, expected, rtol=0.04, atol=0.05)
-        # Tail perturbations must keep valid rows within the golden tolerance.
-        # Use independent inputs because W2 MSD may modify its activation buffer;
-        # identical invocations can also differ slightly on this kernel path.
+        # Perturb unused rows, or repeat the same input at full capacity.
+        # Use independent inputs because W2 MSD may modify its activation buffer.
+        # Both invocations must satisfy the end-to-end numerical comparison.
         perturbed = x.clone()
         perturbed[valid_rows:] = 127
         changed = executor(perturbed.npu(), x_scale.npu(), device_counts, metadata)
