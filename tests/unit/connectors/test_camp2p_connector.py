@@ -19,6 +19,7 @@ from afd_plugin.connectors import (
     AFDTransferMetadata,
     AFDTransferState,
 )
+from afd_plugin.connectors.metadata import AFDControlPayload, AFDDPMetadata
 from afd_plugin.connectors.npu import camp2p as camp2p_module
 from afd_plugin.connectors.npu.camp2p import (
     CAMP2pAFDConnector,
@@ -85,6 +86,185 @@ def test_camp2p_factory_creates_connector():
     assert not connector.is_initialized
     assert connector.max_num_reqs == 8
     assert connector.extra_info.core_num == 12
+
+
+@pytest.mark.parametrize(
+    "attention_size,ffn_size,counts,physical",
+    [
+        (2, 1, [4, 2], [4, 4]),
+        (4, 2, [4, 1, 2, 3], [4, 3, 4, 3]),
+        (4, 2, [4, 2], [4, 4, 4, 4]),  # Expand DP counts to TP peers first.
+        (2, 2, [4, 2], [4, 2]),
+    ],
+)
+def test_camp2p_stage_wire_counts_preserve_attention_payload(
+    monkeypatch, attention_size, ffn_size, counts, physical
+):
+    import torch
+
+    connector = CAMP2pAFDConnector(
+        0,
+        0,
+        _vllm_config(num_ubatches=2),
+        AFDConfig(
+            connector="CAMP2pAFDConnector",
+            role="attention",
+            num_attention_ranks=attention_size,
+            num_ffn_ranks=ffn_size,
+        ),
+        0,
+    )
+    payload = AFDControlPayload(
+        {stage: AFDDPMetadata(torch.tensor(counts)) for stage in range(2)},
+        False,
+        False,
+    )
+    connector.p2p_pg = "control-group"
+    sent = []
+    monkeypatch.setattr(
+        camp2p_module,
+        "send_control_payload",
+        lambda payload, **kwargs: sent.append(payload),
+    )
+    connector.control_plane.update_state_from_dp_metadata(payload)
+    connector.control_plane.send_dp_metadata_list(payload)
+    for stage in range(2):
+        assert (
+            payload.dp_metadata_list[stage].num_tokens_across_dp_cpu.tolist() == counts
+        )
+        assert (
+            connector.dp_metadata_list[stage].num_tokens_across_dp_cpu.tolist()
+            == physical
+        )
+        assert (
+            sent[0].dp_metadata_list[stage].num_tokens_across_dp_cpu.tolist()
+            == physical
+        )
+
+
+@pytest.mark.parametrize("with_input_ids", [False, True])
+def test_camp2p_opaque_send_uses_current_stage_padding(monkeypatch, with_input_ids):
+    import torch
+
+    connector = CAMP2pAFDConnector(
+        0,
+        0,
+        _vllm_config(num_ubatches=2),
+        AFDConfig(
+            connector="CAMP2pAFDConnector",
+            role="attention",
+            num_attention_ranks=2,
+            num_ffn_ranks=1,
+        ),
+        0,
+    )
+    methods = {}
+    monkeypatch.setattr(camp2p_module, "_CAMP2P_CUSTOM_OPS_REGISTERED", False)
+    monkeypatch.setattr(
+        camp2p_module,
+        "direct_register_custom_op",
+        lambda **kwargs: methods.update({kwargs["op_name"]: kwargs["op_func"]}),
+    )
+    camp2p_module._register_camp2p_custom_ops()
+    contexts = [
+        SimpleNamespace(
+            ubatch_idx=stage,
+            additional_kwargs={"afd_metadata": SimpleNamespace(connector=connector)},
+        )
+        for stage in range(2)
+    ]
+    current = contexts[0]
+    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: current)
+    sent = []
+
+    def native_send(*args):
+        sent.append(args)
+        return None, None, None, torch.tensor([1]), None
+
+    monkeypatch.setattr(
+        torch.ops.afd_ascend,
+        "a2e",
+        native_send,
+        raising=False,
+    )
+    received_refs = []
+
+    def native_recv(*args):
+        received_refs.append(args[0])
+        return args[0]
+
+    monkeypatch.setattr(
+        torch.ops.afd_ascend,
+        "e2a",
+        native_recv,
+        raising=False,
+    )
+
+    # Invoke the same opaque runtime functions after changing the live metadata,
+    # as a model graph traced during an unsplit profile must do without retracing.
+    connector.control_plane.update_state_from_dp_metadata(
+        AFDControlPayload({0: AFDDPMetadata(torch.tensor([4, 4]))}, False, True)
+    )
+    connector.control_plane.update_state_from_dp_metadata(
+        AFDControlPayload(
+            {
+                0: AFDDPMetadata(torch.tensor([4, 2])),
+                1: AFDDPMetadata(torch.tensor([1, 3])),
+            },
+            False,
+            False,
+        )
+    )
+    for stage, real, physical in [(0, 4, 4), (1, 1, 3)]:
+        current = contexts[stage]
+        hidden = torch.arange(real * 16, dtype=torch.float32).reshape(real, 16)
+        ids, scales = (
+            camp2p_module.prepare_token_id_transfer(
+                torch.arange(real), topk=2, expected_tokens=real
+            )
+            if with_input_ids
+            else (None, None)
+        )
+        methods["afd_camp2p_send_attn_output"](
+            hidden,
+            "stage0",
+            "stage1",
+            "",
+            real,
+            16,
+            2,
+            1,
+            2,
+            1,
+            8,
+            int(with_input_ids),
+            ids,
+            scales,
+        )
+        wire = sent[-1][0]
+        assert wire.shape == (physical, 16)
+        assert sent[-1][3] == physical
+        assert torch.equal(wire[:real], hidden)
+        assert torch.count_nonzero(wire[real:]) == 0
+        if with_input_ids:
+            assert torch.equal(sent[-1][1][:real], ids)
+            assert sent[-1][1].shape == (physical, 2)
+            assert sent[-1][2].shape == (physical, 2)
+        methods["afd_camp2p_recv_ffn_output"](
+            hidden,
+            "stage0",
+            "stage1",
+            "",
+            real,
+            16,
+            2,
+            1,
+            2,
+            1,
+            8,
+        )
+        assert received_refs[-1] is hidden
+    assert contexts[0].cam_afdtransfer_state is not contexts[1].cam_afdtransfer_state
 
 
 def test_camp2p_topology_matches_original_rank_layout():

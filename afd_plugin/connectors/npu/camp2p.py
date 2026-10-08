@@ -16,7 +16,7 @@ examples.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Final, cast
 
@@ -782,7 +782,7 @@ class CAMP2pAFDControlPlane(AFDControlPlane):
         payload: AFDControlPayload,
     ) -> None:
         connector = self.connector
-        connector.dp_metadata_list = payload.dp_metadata_list
+        connector.dp_metadata_list = self._physical_payload(payload).dp_metadata_list
         connector.is_graph_capturing = payload.is_graph_capturing
         connector.is_warmup = payload.is_warmup
 
@@ -799,11 +799,30 @@ class CAMP2pAFDControlPlane(AFDControlPlane):
         # CPU rather than the NPU device.
         device = torch.device("cpu")
         send_control_payload(
-            payload,
+            self._physical_payload(payload),
             dst=connector.dst_list,
             group=connector.p2p_pg,
             device=device,
         )
+
+    def _physical_payload(self, payload: AFDControlPayload) -> AFDControlPayload:
+        connector = self.connector
+        if connector.ratio <= 1 or len(payload.dp_metadata_list) <= 1:
+            return payload
+        # Live request-boundary stages can differ across A ranks. CAMP kernels
+        # require equal chunks within each strided FFN receiving group. Keep
+        # Attention's real DP metadata separate from the physical wire counts.
+        physical_metadata: dict[int, AFDDPMetadata] = {}
+        for stage_idx, metadata in payload.dp_metadata_list.items():
+            counts = metadata.num_tokens_across_dp_cpu
+            counts = counts.repeat_interleave(connector.attn_size // counts.numel())
+            counts = counts.reshape(connector.ratio, connector.ffn_size)
+            physical_metadata[stage_idx] = AFDDPMetadata(
+                num_tokens_across_dp_cpu=counts.max(dim=0).values.repeat(
+                    connector.ratio
+                ),
+            )
+        return replace(payload, dp_metadata_list=physical_metadata)
 
     def recv_dp_metadata_list(self) -> AFDControlPayload:
         connector = self.connector
@@ -977,7 +996,8 @@ def _register_camp2p_custom_ops() -> None:
         expert_ids: torch.Tensor | None,
         expert_scales: torch.Tensor | None,
     ) -> torch.Tensor:
-        transfer_state = getattr(get_forward_context(), "cam_afdtransfer_state", None)
+        forward_context = get_forward_context()
+        transfer_state = getattr(forward_context, "cam_afdtransfer_state", None)
         if transfer_state is None:
             transfer_state = CAMP2PTransferState()
         transfer_state.batch_size = batch_size
@@ -985,14 +1005,41 @@ def _register_camp2p_custom_ops() -> None:
         transfer_state.k = topk
         transfer_state.aiv_num = aiv_num
         group_ep = _get_group_ep(
-            int(getattr(get_forward_context(), "ubatch_idx", 0)),
+            int(getattr(forward_context, "ubatch_idx", 0)),
             hccl_comm_name,
             hccl_comm_name2,
             hccl_comm_name3,
         )
 
+        wire_hidden_states = hidden_states
+        if attn_size > ffn_size:
+            connector = forward_context.additional_kwargs["afd_metadata"].connector
+            if len(connector.dp_metadata_list) > 1:
+                stage_idx = forward_context.ubatch_idx
+                counts = connector.dp_metadata_list[stage_idx].num_tokens_across_dp_cpu
+                physical_tokens = int(counts[world_rank - ffn_size].item())
+                padding = physical_tokens - hidden_states.shape[0]
+                # This runs inside the opaque op: model compilation must not
+                # freeze padding from the profile/warmup metadata into its graph.
+                if padding:
+                    wire_hidden_states = torch.cat(
+                        (
+                            hidden_states,
+                            hidden_states.new_zeros((padding, hidden_size)),
+                        ),
+                    )
+                    if expert_ids is not None:
+                        expert_ids = torch.cat(
+                            (expert_ids, expert_ids.new_zeros((padding, topk))),
+                        )
+                        scales = cast(torch.Tensor, expert_scales)
+                        expert_scales = torch.cat(
+                            (scales, scales.new_zeros((padding, topk))),
+                        )
+                transfer_state.batch_size = physical_tokens
+
         outputs = torch.ops.afd_ascend.a2e(
-            hidden_states,
+            wire_hidden_states,
             expert_ids,
             expert_scales,
             transfer_state.batch_size,
