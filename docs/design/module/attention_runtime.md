@@ -33,6 +33,7 @@ validation_paths:
   - "tests/e2e/accuracy/**"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
 upstream_refs:
+  - "vLLM 0.30.0 ced6857afa0ea7b2e3f0846a62e1394e90f15607"
   - "vLLM vllm.v1.worker.gpu_worker.Worker"
   - "vLLM vllm.v1.worker.gpu_model_runner.GPUModelRunner"
   - "vLLM vllm.v1.worker.gpu.model_runner.GPUModelRunner"
@@ -152,7 +153,8 @@ The supported V2 deployment is deliberately narrower than V1:
 | Connector | Synchronous `P2pNcclAFDConnector` | Synchronous `CAMP2pAFDConnector` |
 | Gate placement | `compute_gate_on_attention=false` | `compute_gate_on_attention=false` |
 | Parallelism | PP=PCP=DCP=1; configured role ranks equal DP x TP; static EP enabled | Same |
-| Excluded features | Elastic EP, EPLB, sequence-parallel MoE, compile SP, DBO, and ubatching | Same |
+| Excluded features | Elastic EP, EPLB, sequence-parallel MoE, and compile SP | Same, plus DBO and ubatching |
+| DBO | Exactly two microbatches, Attention DP > 1 | Unsupported |
 | Graph execution | Eager or `FULL_DECODE_ONLY` | Eager, `FULL`, or `FULL_DECODE_ONLY` |
 | Model | Must resolve to a registered AFD architecture | Same |
 
@@ -319,12 +321,15 @@ the platform wrapper send the exact per-stage shape. CUDA Graph, ACL Graph,
 stream, and wrapper implementation details are owned by
 [execution platforms](execution_platforms.md).
 
-V2 rejects DBO and ubatching. For full-graph capture, the V2 runner wraps the
-native capture input-preparation seam and publishes exactly one warmup and one
-capture payload for every native descriptor before the graph body. Native
-full-graph replay does not create a `ForwardContext`, so an execute-scoped
-manager hook publishes the padded control shape immediately before replay.
-All temporary hooks and pending metadata state are restored in `finally`.
+CUDA V2 supports exactly two native microbatches with Attention DP > 1;
+Ascend V2 rejects DBO and ubatching. For full-graph capture, the V2 runner
+wraps native input preparation and publishes one warmup and one capture
+payload per descriptor. CUDA two-stage preparation installs separate AFD
+metadata on both native stage contexts and sends their complete layout before
+eager execution or FULL replay. Single-stage FULL replay publishes its padded
+control shape through an execute-scoped manager hook; two-stage replay reuses
+the control already sent during preparation. All temporary hooks and pending
+metadata state are restored in `finally`.
 
 ## Failure and cleanup behavior
 
@@ -365,9 +370,9 @@ the matching platform and connector tests as well.
 
 Current shared limits are the supported vLLM release and registered role-aware
 model integrations. V1 native ubatching accepts exactly two ubatches. V2
-instead requires a synchronous control-plane connector, static EP, no PP/CP,
-and no DBO/ubatching; the Ascend V2 path is unit-tested but does not yet have
-repository hardware E2E evidence.
+instead requires a synchronous control-plane connector, static EP, and no
+PP/CP. CUDA V2 supports the two-microbatch path above; Ascend V2 excludes
+DBO/ubatching and awaits integrated hardware acceptance.
 Platform/connector limits are intentionally centralized in
 [execution platforms](execution_platforms.md#tested-runtime-matrix).
 

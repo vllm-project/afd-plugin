@@ -29,6 +29,7 @@ validation_paths:
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
 upstream_refs:
+  - "vLLM 0.30.0 ced6857afa0ea7b2e3f0846a62e1394e90f15607"
   - "vLLM vllm.v1.worker.gpu_worker.Worker"
   - "vLLM vllm.v1.worker.gpu.model_runner.GPUModelRunner construction seam"
   - "vLLM vllm.v1.engine.core.EngineCore"
@@ -143,8 +144,9 @@ execution:
 
 The V2 pair therefore requires the synchronous platform connector,
 `compute_gate_on_attention=false`, PP/PCP/DCP size 1, configured role ranks
-equal to DP x TP, static EP, a registered AFD model, and no DBO or ubatching.
-CUDA uses `P2pNcclAFDConnector`; Ascend uses `CAMP2pAFDConnector`. These limits
+equal to DP x TP, static EP, and a registered AFD model. CUDA supports exactly
+two native microbatches with Attention DP > 1; Ascend V2 rejects DBO and
+ubatching. CUDA uses `P2pNcclAFDConnector`; Ascend uses `CAMP2pAFDConnector`. These limits
 describe the pair even though only Attention inherits a native V2 runner.
 
 ## Daemon step selection
@@ -334,8 +336,10 @@ async model E2E coverage.
 
 Current shared limits are the supported vLLM release, connector-driven FFN,
 and registered role-aware model integrations. V1 native DBO accepts exactly
-two ubatches. A V2-paired FFN rejects DBO/ubatching and uses the same AFD FFN
-runner with a V2-compatible construction and forward-context seam. CAM async
+two ubatches. A V2-paired FFN uses the same AFD FFN runner with a
+V2-compatible construction and forward-context seam. CUDA FFN consumes the
+two-stage control layout and replays the matching graph when requested;
+Ascend V2 rejects DBO/ubatching. CAM async
 instead uses eager connector work items and may enable its distinct two-stage
 MoE pipeline. Platform-specific limits are centralized in
 [execution platforms](execution_platforms.md#tested-runtime-matrix).

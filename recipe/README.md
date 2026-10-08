@@ -33,9 +33,9 @@ Directory names follow these conventions:
 
 | Hardware | Connector | Model | Recommended stage | v0.30 status | Recipe |
 | --- | --- | --- | --- | --- | --- |
-| GPU | `P2pNcclAFDConnector` | DeepSeek-V2-Lite | Decode | Validated | [Launch examples](gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md) |
-| Ascend NPU | `CAMP2pAFDConnector` | DeepSeek-V3.2 | Decode | Validated | [Synchronous decode](npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) |
-| Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V3.2 | Prefill / decode | Experimental v0.26 DP+TP/SP path; post-fix DP2TP8+EP16 token split reached `0.9522` strict match on the complete GSM8K evaluation; legacy PCP8 results are v0.19-only | [Async CAM](npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) |
+| GPU | `P2pNcclAFDConnector` | DeepSeek-V2-Lite | Decode | Legacy 2A2F E2E validated; examples inspected | [Launch examples](gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md) |
+| Ascend NPU | `CAMP2pAFDConnector` | DeepSeek-V3.2 | Decode | Integrated v0.30 hardware validation pending; linked recipe is historical | [Synchronous decode](npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) |
+| Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V3.2 | Prefill / decode | Integrated v0.30 hardware validation pending; historical v0.26 DP2TP8+EP16 token split reached `0.9522` strict match; legacy PCP8 results are v0.19-only | [Async CAM](npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) |
 
 Open the model-level README before running a recipe. It documents the required
 hardware and runtime baseline, topology, environment variables, launch order,

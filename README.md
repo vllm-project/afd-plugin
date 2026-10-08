@@ -18,7 +18,8 @@ tests for GPU and Ascend NPU deployments.
 > This project is still experimental and needs more large-scale testing across
 > different hardware backends.
 
-The target runtime is **vLLM `v0.30.0`**. The plugin does not modify the vLLM
+The target runtime is **vLLM `v0.30.0`** at commit `ced6857a`; the Ascend
+integration targets vLLM-Ascend `8d4409d6`. The plugin does not modify the vLLM
 source tree. AFD behavior is installed through the `vllm.general_plugins` entry
 point, `--additional-config`, automatically selected role workers, plugin-owned
 model wrappers, and narrow version-scoped compatibility shims.
@@ -36,7 +37,8 @@ Core runtime support:
   execution for CUDA and Ascend NPU.
 - Eager and `FULL_DECODE_ONLY` graph execution, plus backend-specific profiling
   support.
-- Native DBO with exactly two ubatches on CUDA and the synchronous Ascend path.
+- Native DBO with exactly two ubatches on CUDA V1/V2 and the synchronous
+  Ascend V1 path; Ascend V2 DBO remains unsupported.
 - DeepSeek MoE handoff at the remote-experts boundary on CUDA, with the gate
   placed on either Attention or FFN.
 
@@ -56,7 +58,7 @@ See the [recipe index](recipe/README.md) for deployment and benchmark examples.
 | --- | --- | --- | --- | --- | --- |
 | `P2pNcclAFDConnector` | CUDA | Decode | Sync | `FULL_DECODE_ONLY` CUDA graph | FFN ranks are ordered before Attention ranks. `num_attention_ranks` must be greater than or equal to `num_ffn_ranks`; the Attention ranks are spread over the FFN ranks in blocks that differ in size by at most one. See the [DeepSeek V2 Lite recipe](recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md). |
 | `CAMP2pAFDConnector` | Ascend NPU | Decode | Sync | `FULL_DECODE_ONLY` ACL graph | Uses HCCL/CAMP2P custom ops. Ascend ops build by default on NPU platforms. See the [synchronous DeepSeek V3.2 recipe](recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md). |
-| `CAMAsyncAFDConnector` | Ascend NPU | Prefill / decode | Async | Not supported | Experimental v0.26 DP+TP/SP path with AFD-managed two-stage MoE ubatching; native DBO and PCP are unsupported. Post-fix DeepSeek-V3.2 DP2TP8+EP16 token split reached `0.9522` strict match on the complete GSM8K evaluation. The [legacy PCP8 recipe](recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) requires `release/v0.19.1rc1`. |
+| `CAMAsyncAFDConnector` | Ascend NPU | Prefill / decode | Async | Not supported | Experimental DP+TP/SP path with AFD-managed two-stage MoE ubatching; native DBO and PCP are unsupported. Historical v0.26 DeepSeek-V3.2 DP2TP8+EP16 token-split accuracy was `0.9522` strict match; integrated v0.30 NPU validation is pending. The [legacy PCP8 recipe](recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) requires `release/v0.19.1rc1`. |
 
 Connector implementations are grouped by backend package:
 `afd_plugin.connectors.gpu` for GPU-only connectors,
@@ -66,12 +68,14 @@ Known gaps:
 
 - The GPU target is exactly vLLM `0.30.0`; other vLLM versions are not
   claimed as supported on GPU.
-- NPU is not revalidated for `0.30.0`: Ascend evidence remains tied to the
-  vLLM `0.26.0` + vLLM-Ascend `80d8c194f` baseline below.
+- The integrated v0.30 NPU paths await hardware validation. Historical v0.26
+  results remain scoped to their recorded vLLM-Ascend `80d8c194f` environment.
 - GPU ModelRunnerV2 supports synchronous `P2pNcclAFDConnector` with
   `compute_gate_on_attention=false`, including two-microbatch DBO and
   `FULL_DECODE_ONLY`. H20 validation covers DeepSeek-V2-Lite, 2A2F DP2/TP1;
   see the [MRV2 DBO scenarios](tests/e2e/README.md#gpu-mrv2-dbo-development-comparison).
+  Paired 300-question DBO accuracy differences are under review; see the
+  [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix).
   Cross-mode outputs are not bitwise equivalent. NPU MRV2 DBO is unsupported.
 - GPU and NPU E2E tests are opt-in and require real hardware plus model weights.
 - GPU CUDA graph support is limited to `FULL_DECODE_ONLY`.
@@ -114,28 +118,27 @@ The optional extra pins `vllm==0.30.0`.
 
 ### Ascend NPU installation
 
-AFD's Ascend path is validated on openEuler 22.03 (aarch64) with
-Ascend 910C / Atlas A3. Install a compatible driver and firmware, and confirm
-the devices with `npu-smi info`. Use this source baseline:
+The Ascend target uses the source pair below. Earlier hardware evidence used
+openEuler 22.03 (aarch64) with Ascend 910C / Atlas A3; integrated v0.30 hardware
+validation is pending. Install a compatible driver and firmware, and confirm
+the devices with `npu-smi info`.
 
 | Component | Version |
 | --- | --- |
 | Python | `3.10` or `3.11` |
-| vLLM | `0.26.0` |
-| vLLM-Ascend | commit [`80d8c194f`](https://github.com/vllm-project/vllm-ascend/commit/80d8c194f7584b17fe08065ea99a130916f6b0e7) |
+| vLLM | `0.30.0`, commit `ced6857afa0ea7b2e3f0846a62e1394e90f15607` |
+| vLLM-Ascend | commit [`8d4409d6`](https://github.com/vllm-project/vllm-ascend/commit/8d4409d6256d8a6729140ddcc0d1889e3f96cdd6) |
 | CANN / torch / torch-npu | Use the mutually compatible versions required by that vLLM-Ascend source snapshot. |
 
-> NPU is not revalidated against the `0.30.0` GPU target. The Ascend
-> validation baseline above is unchanged, and NPU support claims remain tied
-> to that `0.26.0` pairing.
+> This is the integrated target dependency pair, not a claim that NPU
+> hardware acceptance has completed.
 
 #### Environment
 
-The Ascend environment remains pinned to vLLM-Ascend commit `80d8c194f`
-(the `0.26.0`-generation baseline); the `0.30.0` target applies to GPU and
-has not been validated on Ascend. The repository does not currently claim a
+The Ascend environment targets vLLM-Ascend commit `8d4409d6` and vLLM
+`0.30.0`. Integrated hardware validation is pending. The repository does not currently claim a
 released container tag for either target. Use the
-[installation guide at that source snapshot](https://github.com/vllm-project/vllm-ascend/blob/80d8c194f7584b17fe08065ea99a130916f6b0e7/docs/source/installation.md)
+[installation guide at that source snapshot](https://github.com/vllm-project/vllm-ascend/blob/8d4409d6256d8a6729140ddcc0d1889e3f96cdd6/docs/source/getting_started/installation.md)
 to prepare a matching A3/openEuler environment, then install AFD from the
 repository root. Do not reuse the former v0.19.1rc1 image as a v0.30 runtime.
 

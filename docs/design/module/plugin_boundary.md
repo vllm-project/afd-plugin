@@ -27,6 +27,7 @@ validation_paths:
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_runtime_classpaths.py"
 upstream_refs:
+  - "vLLM 0.30.0 ced6857afa0ea7b2e3f0846a62e1394e90f15607"
   - "vLLM vllm.general_plugins entry-point group"
   - "vLLM vllm.config.VllmConfig"
 verified_platform_refs:
@@ -173,9 +174,10 @@ When upstream selects ModelRunnerV2, role workers apply an additional CPU-safe
 deployment validator before communication resources are created. Both roles
 must use the platform's synchronous connector, FFN-side gate placement,
 PP/PCP/DCP size 1, role ranks equal to DP x TP, static EP, and a registered AFD
-model; DBO, ubatching, elastic EP, EPLB, sequence-parallel MoE, and compile SP
-are rejected. CUDA V2 requires `P2pNcclAFDConnector`; Ascend V2 requires
-`CAMP2pAFDConnector`. Graph-mode details belong to
+model. Elastic EP, EPLB, sequence-parallel MoE, and compile SP are rejected.
+CUDA V2 requires `P2pNcclAFDConnector` and permits exactly two microbatches
+with Attention DP > 1; Ascend V2 requires `CAMP2pAFDConnector` and rejects
+DBO/ubatching. Graph-mode details belong to
 [execution platforms](execution_platforms.md).
 
 The following internal paths remain loadable for compatibility with existing

@@ -11,15 +11,16 @@ Use this connector when Attention and FFN workers run as separate synchronous
 Ascend services. Use `P2pNcclAFDConnector` for CUDA deployments and
 `CAMAsyncAFDConnector` for the asynchronous Ascend path.
 
-`CAMP2pAFDConnector` supports prefill and decode in eager mode. ACL graph use
-is limited to `FULL_DECODE_ONLY`.
+`CAMP2pAFDConnector` supports prefill and decode in eager mode. V1 ACL graph
+uses `FULL_DECODE_ONLY`; the implemented V2 path also accepts `FULL`.
+Integrated v0.30 NPU hardware acceptance is pending.
 
 ## Prerequisites
 
-- vLLM `0.26.0` and an Ascend PyTorch/vLLM-Ascend environment based on source
-  commit [`80d8c194f`](https://github.com/vllm-project/vllm-ascend/commit/80d8c194f7584b17fe08065ea99a130916f6b0e7).
-  NPU is not revalidated against the `0.30.0` GPU target; this guide's
-  validation basis is unchanged.
+- vLLM `0.30.0` at `ced6857a` and an Ascend PyTorch/vLLM-Ascend environment
+  based on source commit
+  [`8d4409d6`](https://github.com/vllm-project/vllm-ascend/commit/8d4409d6256d8a6729140ddcc0d1889e3f96cdd6).
+  Historical NPU results remain scoped to their original environment.
 - The AFD Ascend custom operators must be built and available at runtime.
 - HCCL connectivity for the data path and Gloo connectivity for DP metadata.
 - Identical model hidden size, model dtype, AFD topology, rendezvous address,
