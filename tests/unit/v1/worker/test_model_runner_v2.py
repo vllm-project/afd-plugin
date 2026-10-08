@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 """Unit tests for AFD CUDA GPU ModelRunnerV2 support."""
 
 from __future__ import annotations
@@ -10,6 +13,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
+from torch import device  # noqa: E402
 from vllm.config import CUDAGraphMode  # noqa: E402
 from vllm.forward_context import (  # noqa: E402
     BatchDescriptor,
@@ -18,7 +22,9 @@ from vllm.forward_context import (  # noqa: E402
 from vllm.v1.worker import gpu_model_runner as native_v1  # noqa: E402
 from vllm.v1.worker.gpu import cudagraph_utils, dp_utils  # noqa: E402
 from vllm.v1.worker.gpu import model_runner as native_v2  # noqa: E402
+from vllm.v1.worker.gpu.ubatch_utils import UBatchState  # noqa: E402
 from vllm.v1.worker.gpu_worker import Worker  # noqa: E402
+from vllm.v1.worker.ubatch_utils import UBatchSlice  # noqa: E402
 
 from afd_plugin.model_executor.models import (  # noqa: E402
     forward_context as afd_forward_context,
@@ -85,7 +91,7 @@ class _StepProfiler:
 
 
 class _RunnerRecorder:
-    instances = []
+    instances: list[tuple[SimpleNamespace, device]] = []
 
     def __init__(self, vllm_config, device):
         type(self).instances.append((vllm_config, device))
@@ -205,9 +211,11 @@ def _runner_for_metadata(
     runner.connector = _RecordingConnector(events)
     runner._is_warmup = False
     runner._afd_is_graph_capturing = False
+    runner._afd_is_graph_replaying = False
     runner._afd_pending_metadata = None
     runner._afd_suppress_metadata_send = False
     runner._afd_transaction_counter = 0
+    runner.ubatch_runner = None
     runner.prof = _StepProfiler()
     runner.cudagraph_manager = SimpleNamespace(run_fullgraph=lambda _desc: None)
     return runner
@@ -299,7 +307,7 @@ def test_pinned_worker_init_device_signature_and_internal_runner_import():
 def test_v2_fullgraph_replay_hook_restores_manager_instance_after_success():
     events: list[str] = []
     runner = _runner_for_metadata(events)
-    descriptor = SimpleNamespace(num_tokens=8)
+    descriptor = SimpleNamespace(num_tokens=8, num_ubatches=1)
 
     def native_replay(self, desc):
         events.append("native_replay")
@@ -325,7 +333,7 @@ def test_v2_fullgraph_replay_hook_removes_temporary_instance_override():
 
     runner = _runner_for_metadata([])
     runner.cudagraph_manager = Manager()
-    descriptor = SimpleNamespace(num_tokens=8)
+    descriptor = SimpleNamespace(num_tokens=8, num_ubatches=1)
     assert "run_fullgraph" not in vars(runner.cudagraph_manager)
 
     with v2_runner_module._use_afd_fullgraph_replay_hook(runner, 3):
@@ -339,7 +347,7 @@ def test_v2_fullgraph_replay_hooks_on_two_managers_do_not_interfere():
     second_events: list[str] = []
     first = _runner_for_metadata(first_events)
     second = _runner_for_metadata(second_events)
-    descriptor = SimpleNamespace(num_tokens=8)
+    descriptor = SimpleNamespace(num_tokens=8, num_ubatches=1)
 
     def first_replay(_self, _desc):
         first_events.append("native_replay")
@@ -621,12 +629,134 @@ def test_v2_metadata_provider_has_complete_transaction_and_dp_dependencies():
     assert runner.build_capture_dp_metadata(9).num_tokens_across_dp_cpu.tolist() == [9]
 
 
-def _capture_descriptor(num_reqs: int, num_tokens: int):
+def _capture_descriptor(num_reqs: int, num_tokens: int, num_ubatches: int = 1):
     return SimpleNamespace(
         cg_mode=CUDAGraphMode.FULL,
+        num_ubatches=num_ubatches,
         num_reqs=num_reqs,
         num_tokens=num_tokens,
     )
+
+
+@pytest.mark.parametrize("real_tokens, expected", [(7, [4, 3]), (3, [3, 0])])
+def test_mrv2_stage_sidecars_preserve_native_slices_and_isolate_mutation(
+    real_tokens, expected
+):
+    runner = _runner_for_metadata([])
+    # The second request straddles the token boundary, as in native MRV2.
+    slices = [
+        UBatchSlice(slice(0, 2), slice(0, 4)),
+        UBatchSlice(slice(1, 3), slice(4, 8)),
+    ]
+    contexts = [SimpleNamespace(additional_kwargs={}) for _ in slices]
+    runner.install_mrv2_ubatch_metadata(slices, contexts, real_tokens)
+    stages = [c.additional_kwargs["afd_metadata"] for c in contexts]
+    assert [m.stage_idx for m in stages] == [0, 1]
+    assert [m.tokens_start_loc for m in stages] == [[0], [4]]
+    assert [m.requests_start_loc for m in stages] == [[0], [1]]
+    assert [m.tokens_lens for m in stages] == [[4], [4]]
+    assert [m.tokens_unpadded_lens for m in stages] == [[n] for n in expected]
+    assert all(m.num_stages == 2 for m in stages)
+    assert stages[0].transaction_id == stages[1].transaction_id
+    assert all(m.connector is runner.connector for m in stages)
+    stages[0].tokens_lens[0] = 99
+    assert stages[1].tokens_lens == [4]
+    assert runner._afd_pending_metadata.tokens_lens == [4, 4]
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_mrv2_prepare_sends_one_complete_payload_and_restores_instance(graph):
+    events: list[str] = []
+    runner = _runner_for_metadata(events, data_parallel_size=2)
+    slices = [
+        UBatchSlice(slice(0, 2), slice(0, 4)),
+        UBatchSlice(slice(2, 4), slice(4, 8)),
+    ]
+    contexts = [SimpleNamespace(additional_kwargs={}) for _ in slices]
+    prepared = UBatchState(slices, contexts)
+    calls = []
+
+    class NativeUBatch:
+        def prepare(self, *args):
+            calls.append(args)
+            return prepared
+
+    runner.ubatch_runner = NativeUBatch()
+    batch = SimpleNamespace(num_tokens=5, num_tokens_after_padding=8, num_reqs=4)
+    mode = CUDAGraphMode.FULL if graph else CUDAGraphMode.NONE
+    with v2_runner_module._use_afd_ubatch_preparation(runner):
+        assert runner.ubatch_runner.prepare(batch, (), None, mode) is prepared
+        if graph:
+            with v2_runner_module._use_afd_fullgraph_replay_hook(runner, 5):
+                runner.cudagraph_manager.run_fullgraph(_capture_descriptor(4, 8, 2))
+    assert "prepare" not in vars(runner.ubatch_runner)
+    assert calls == [(batch, (), None, mode, False)]
+    assert events == ["control_update", "control_send"]
+    payload = runner.connector.last_payload
+    assert payload.is_graph_replaying is graph
+    assert list(payload.dp_metadata_list) == [0, 1]
+    assert [
+        m.num_tokens_across_dp_cpu.tolist() for m in payload.dp_metadata_list.values()
+    ] == [[4, 4], [4, 4]]
+
+
+def test_mrv2_capture_tracker_distinguishes_equal_size_stage_layouts():
+    tracker = v2_runner_module._AFDCaptureEventTracker(
+        [_capture_descriptor(4, 8), _capture_descriptor(4, 8, 2)]
+    )
+    assert tracker.consume(4, 8)[1] is True
+    assert tracker.consume(4, 8)[1] is False
+    assert tracker.consume(4, 8, 2)[1] is True
+    assert tracker.consume(4, 8, 2)[1] is False
+    tracker.assert_complete()
+    wrong = v2_runner_module._AFDCaptureEventTracker([_capture_descriptor(4, 8, 2)])
+    with pytest.raises(RuntimeError, match="descriptor/order drift"):
+        wrong.consume(4, 8)
+
+
+@pytest.mark.parametrize("fail_control", [False, True])
+def test_mrv2_ubatch_capture_events_and_exception_restore(fail_control):
+    events: list[str] = []
+    runner = _runner_for_metadata(events, data_parallel_size=2)
+    slices = [
+        UBatchSlice(slice(0, 2), slice(0, 4)),
+        UBatchSlice(slice(2, 4), slice(4, 8)),
+    ]
+    batch = SimpleNamespace(num_tokens=8, num_tokens_after_padding=8, num_reqs=4)
+    payloads = []
+
+    class CaptureConnector(_RecordingConnector):
+        def send_dp_metadata_list(self, payload):
+            payloads.append(payload)
+            if fail_control:
+                raise RuntimeError("control failed")
+            super().send_dp_metadata_list(payload)
+
+    def native_prepare(*args):
+        return UBatchState(
+            slices, [SimpleNamespace(additional_kwargs={}) for _ in slices]
+        )
+
+    runner.connector = CaptureConnector(events)
+    runner.ubatch_runner = SimpleNamespace(prepare=native_prepare)
+    tracker = v2_runner_module._AFDCaptureEventTracker([_capture_descriptor(4, 8, 2)])
+
+    def capture():
+        with v2_runner_module._use_afd_ubatch_preparation(runner, tracker):
+            for _ in (True, False):
+                runner.ubatch_runner.prepare(batch, (), None, CUDAGraphMode.FULL, True)
+
+    if fail_control:
+        with pytest.raises(RuntimeError, match="control failed"):
+            capture()
+    else:
+        capture()
+        tracker.assert_complete()
+        assert [
+            (p.is_warmup, p.is_graph_capturing, p.is_graph_replaying) for p in payloads
+        ] == [(True, False, False), (False, True, False)]
+        assert events == ["control_update", "control_send"] * 2
+    assert runner.ubatch_runner.prepare is native_prepare
 
 
 @pytest.mark.parametrize(
@@ -1024,10 +1154,10 @@ def test_v2_dp2_repeated_fullgraph_replay_sends_local_real_and_padded_tokens(
     )
     manager = SimpleNamespace()
     runner.cudagraph_manager = manager
-    descriptor = SimpleNamespace(num_tokens=8)
+    descriptor = SimpleNamespace(num_tokens=8, num_ubatches=1)
     payloads = []
     metadata_seen = []
-    replay_returns = []
+    replay_returns: list[str] = []
 
     class ReplayConnector(_RecordingConnector):
         def send_dp_metadata_list(self, payload):
@@ -1125,7 +1255,7 @@ def test_v2_replay_exception_restores_manager_and_sidecars(monkeypatch):
     )
     manager = SimpleNamespace()
     runner.cudagraph_manager = manager
-    descriptor = SimpleNamespace(num_tokens=8)
+    descriptor = SimpleNamespace(num_tokens=8, num_ubatches=1)
     previous_metadata = object()
     runner._afd_pending_metadata = previous_metadata
 
@@ -1160,7 +1290,7 @@ def test_v2_graph_miss_uses_provider_once_without_replay_control(monkeypatch):
     runner.vllm_config.compilation_config.cudagraph_mode = (
         CUDAGraphMode.FULL_DECODE_ONLY
     )
-    replay_calls = []
+    replay_calls: list[str] = []
     context = ForwardContext(
         no_compile_layers={},
         attn_metadata={},
@@ -1652,7 +1782,7 @@ def test_v2_shutdown_runs_all_cleanup_layers_when_each_layer_fails(
         if failure == "connector":
             raise RuntimeError("connector failed")
 
-    runner.connector.close = close_connector
+    monkeypatch.setattr(runner.connector, "close", close_connector)
     monkeypatch.setattr(
         "afd_plugin.v1.worker.attention_model_runner_v2.stop_afd_gpu_profiler",
         stop_profiler,

@@ -31,6 +31,7 @@ VLLM_GPU_WORKER_FQCN: Final[str] = "vllm.v1.worker.gpu_worker.Worker"
 VLLM_ASCEND_NPU_WORKER_FQCN: Final[str] = "vllm_ascend.worker.worker.NPUWorker"
 VLLM_ASCEND_310P_WORKER_FQCN: Final[str] = "vllm_ascend._310p.worker_310p.NPUWorker310"
 VLLM_ASCEND_XLITE_WORKER_FQCN: Final[str] = "vllm_ascend.xlite.xlite_worker.XliteWorker"
+GPU_MRV2_NUM_UBATCHES: Final[int] = 2
 
 
 def validate_gpu_model_runner_v2_config(
@@ -86,7 +87,16 @@ def validate_gpu_model_runner_v2_config(
     ):
         raise RuntimeError("AFD ModelRunnerV2 requires static expert parallelism")
     if parallel.enable_dbo or parallel.use_ubatching:
-        raise RuntimeError("AFD ModelRunnerV2 does not support DBO or ubatching")
+        if parallel.num_ubatches != GPU_MRV2_NUM_UBATCHES:
+            raise RuntimeError(
+                "AFD ModelRunnerV2 DBO/ubatching requires exactly two microbatches",
+            )
+        # Native maybe_build_ubatch_runner requires DP > 1. FFN does not
+        # construct it: its stage layout comes from Attention control messages.
+        if expected_role == "attention" and parallel.data_parallel_size <= 1:
+            raise RuntimeError(
+                "AFD ModelRunnerV2 DBO/ubatching requires Attention DP > 1"
+            )
 
     # Keep importing this CPU-safe validation module independent of the vLLM
     # model-wrapper package; the validator itself runs only after vLLM config

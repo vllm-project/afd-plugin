@@ -583,6 +583,8 @@ def test_async_ubatch_scenario_enforces_token_split_moe_ubatching():
     [
         ("afd-v2-eager-1a1f", "1", "1", False),
         ("afd-v2-eager-dp2", "2", "1", False),
+        ("afd-v2-eager-dbo-dp2", "2", "1", False),
+        ("afd-v2-graph-dbo-dp2", "2", "1", True),
         ("afd-v2-eager-tp2", "1", "2", False),
         ("afd-v2-graph-1a1f", "1", "1", True),
         ("afd-v2-graph-dp2", "2", "1", True),
@@ -605,11 +607,29 @@ def test_v2_scenarios_build_exact_commands(
         assert command[command.index("--tensor-parallel-size") + 1] == expected_tp_size
         assert ("--enforce-eager" in command) is not uses_graph
         assert ("--compilation-config" in command) is uses_graph
-        assert "--enable-dbo" not in command
-        assert "--max-num-batched-tokens" not in command
+        assert ("--enable-dbo" in command) is ("-dbo-" in scenario)
+        assert ("--max-num-batched-tokens" in command) is (
+            scenario in runner.V2_DBO_COMPARISON_SCENARIOS
+        )
         assert "--no-enable-prefix-caching" in command
         assert "--no-enable-chunked-prefill" in command
         assert "--no-async-scheduling" in command
+        if scenario in runner.V2_DBO_COMPARISON_SCENARIOS:
+            assert command[command.index("--worker-extension-cls") + 1] == (
+                "tests.e2e.mrv2_evidence.Worker"
+            )
+            assert command[command.index("--max-num-seqs") + 1] == "8"
+            assert command[command.index("--max-num-batched-tokens") + 1] == "4096"
+        if "-dbo-" in scenario:
+            assert command[command.index("--dbo-decode-token-threshold") + 1] == "2"
+            assert command[command.index("--dbo-prefill-token-threshold") + 1] == "8"
+            if uses_graph:
+                assert json.loads(
+                    command[command.index("--compilation-config") + 1]
+                ) == {
+                    "cudagraph_mode": "FULL_DECODE_ONLY",
+                }
+                assert command[command.index("--cudagraph-capture-sizes") + 1] == "8"
 
 
 @pytest.mark.parametrize(
@@ -1731,9 +1751,12 @@ def test_stream_output_records_live_npu_split_control_metadata(monkeypatch):
     )
     process: Any = argparse.Namespace(
         stdout=io.StringIO(
-            control_entry + "is_graph_capturing=False is_warmup=True\n"
-            + control_entry + "is_graph_capturing=True is_warmup=False\n"
-            + control_entry + "is_graph_capturing=False is_warmup=False\n"
+            control_entry
+            + "is_graph_capturing=False is_warmup=True\n"
+            + control_entry
+            + "is_graph_capturing=True is_warmup=False\n"
+            + control_entry
+            + "is_graph_capturing=False is_warmup=False\n"
         ),
     )
     monkeypatch.setattr(runner.time, "time", lambda: 101.0)
@@ -1768,3 +1791,98 @@ def test_assert_dbo_live_split_coverage_fails_without_evidence(monkeypatch):
 
     with pytest.raises(RuntimeError, match="no live request was ever split"):
         runner.assert_dbo_live_split_coverage([], 100.0, args)
+
+
+@pytest.mark.parametrize("scenario", sorted(runner.V2_DBO_COMPARISON_SCENARIOS))
+def test_v2_dbo_comparison_uses_identical_evaluation(monkeypatch, scenario):
+    args = _args()
+    args.scenario = scenario
+    runner.configure_scenario(args)
+    monkeypatch.delenv("AFD_GSM8K_LIMIT", raising=False)
+    calls = []
+
+    def evaluate(*positional, **kwargs):
+        calls.append(kwargs)
+        return {
+            "n-samples": {"gsm8k": {"effective": 128}},
+            "results": {"gsm8k": {"exact_match": 0.5}},
+        }
+
+    monkeypatch.setattr(runner, "_run_lm_eval", evaluate)
+    runner.run_gsm8k_evaluation(args)
+    assert calls[0]["limit"] == 128
+    assert calls[0]["num_concurrent"] == 12
+    assert calls[0]["num_fewshot"] == 8
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_mrv2_dbo_evidence_requires_live_matching_execution(graph):
+    args = _args()
+    args.scenario = "afd-v2-graph-dbo-dp2" if graph else "afd-v2-eager-dbo-dp2"
+    runner.configure_scenario(args)
+    mode = "FULL" if graph else "eager"
+    ffn_mode = "replay" if graph else "eager"
+    attention = (
+        f"AFD execution: runner=MRV2 phase=live mode={mode} stages=2 "
+        "tokens=[4, 4] real_tokens=[4, 2] count=2"
+    )
+    ffn = (
+        f"AFD execution: runner=FFN mode={ffn_mode} stages=2 "
+        "layout=[[0,[4,4]],[1,[4,4]]] count=128"
+    )
+    events = [
+        (timestamp, role, f"(Worker_DP{rank}_EP{rank} pid={rank + 100}) {line}")
+        for timestamp, role, line in (
+            (101.0, "attention", attention),
+            (102.0, "ffn", ffn),
+        )
+        for rank in range(2)
+    ]
+    events = [
+        (ts, role, line.replace("count=2", "count=1"))
+        for ts, role, line in events
+        if role == "attention"
+    ] + events
+    runner.assert_mrv2_dbo_execution(events, 100.0, args)
+    for missing_role in ("attention", "ffn"):
+        for missing_rank in range(2):
+            with pytest.raises(RuntimeError, match="all expected ranks"):
+                runner.assert_mrv2_dbo_execution(
+                    [
+                        (ts, role, line)
+                        for ts, role, line in events
+                        if not (
+                            role == missing_role and f"Worker_DP{missing_rank}_" in line
+                        )
+                    ],
+                    100.0,
+                    args,
+                )
+    # Reject capture/profile work, empty second stages, and mismatched FFN work.
+    replacements = [
+        ("phase=live", "phase=dummy"),
+        ("phase=live", "phase=profile"),
+        ("real_tokens=[4, 2]", "real_tokens=[4, 0]"),
+        ("[4,4]", "[3,3]"),
+    ]
+    if graph:
+        replacements.append(("mode=FULL", "mode=eager"))
+    for old, new in replacements:
+        with pytest.raises(RuntimeError, match="lacks live two-stage"):
+            runner.assert_mrv2_dbo_execution(
+                [(ts, role, line.replace(old, new)) for ts, role, line in events],
+                100.0,
+                args,
+            )
+    with pytest.raises(RuntimeError, match="lacks live two-stage"):
+        runner.assert_mrv2_dbo_execution(events, 103.0, args)
+    if graph:
+        with pytest.raises(RuntimeError, match="consecutive replays"):
+            runner.assert_mrv2_dbo_execution(
+                [
+                    (ts, role, line.replace("count=2", "count=3"))
+                    for ts, role, line in events
+                ],
+                100.0,
+                args,
+            )

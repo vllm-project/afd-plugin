@@ -68,7 +68,11 @@ Known gaps:
   claimed as supported on GPU.
 - NPU is not revalidated for `0.30.0`: Ascend evidence remains tied to the
   vLLM `0.26.0` + vLLM-Ascend `80d8c194f` baseline below.
-- vLLM/vLLM-Ascend model runner v2 is not supported.
+- GPU ModelRunnerV2 supports synchronous `P2pNcclAFDConnector` with
+  `compute_gate_on_attention=false`, including two-microbatch DBO and
+  `FULL_DECODE_ONLY`. H20 validation covers DeepSeek-V2-Lite, 2A2F DP2/TP1;
+  see the [MRV2 DBO scenarios](tests/e2e/README.md#gpu-mrv2-dbo-development-comparison).
+  Cross-mode outputs are not bitwise equivalent. NPU MRV2 DBO is unsupported.
 - GPU and NPU E2E tests are opt-in and require real hardware plus model weights.
 - GPU CUDA graph support is limited to `FULL_DECODE_ONLY`.
 - Native DBO is limited to exactly two ubatches and is not supported by
@@ -186,8 +190,11 @@ or standard Ascend NPU platform. Explicit AFD worker paths remain accepted for
 compatibility with existing commands, but are not required or stable launch
 interfaces.
 
-GPU model runner v2 is not supported. Select model runner v1 before starting
-either GPU role:
+The examples below use model runner v1. For GPU MRV2, set
+`VLLM_USE_V2_MODEL_RUNNER=1` on both roles and use the
+[dedicated E2E scenarios](tests/e2e/README.md#gpu-mrv2-dbo-development-comparison).
+MRV2 DBO requires two microbatches and Attention DP > 1.
+For the MRV1 examples below, select:
 
 ```bash
 export VLLM_USE_V2_MODEL_RUNNER=0
