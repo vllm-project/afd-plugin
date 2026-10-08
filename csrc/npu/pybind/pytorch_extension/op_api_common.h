@@ -579,7 +579,7 @@ typedef void (*ReleaseHugeMem)(void *, bool);
       workspace_addr = const_cast<void *>(workspace_tensor.storage().data()); \
     }                                                                         \
     auto acl_call = [converted_params, workspace_addr, workspace_size,        \
-                     acl_stream, executor, workspace_tensor]() -> int {       \
+                     acl_stream, executor, workspace_tensor]() mutable -> int {       \
       typedef int (*OpApiFunc)(void *, uint64_t, aclOpExecutor *,             \
                                const aclrtStream);                            \
       OpApiFunc opApiFunc = reinterpret_cast<OpApiFunc>(opApiFuncAddr);       \
@@ -593,6 +593,8 @@ typedef void (*ReleaseHugeMem)(void *, bool);
       if (releaseMemFunc) {                                                   \
         releaseMemFunc(nullptr, false);                                       \
       }                                                                       \
+      /* The queue may retain its completed handler; release the capture. */  \
+      workspace_tensor.reset();                                              \
       return api_ret;                                                         \
     };                                                                        \
     at_npu::native::OpCommand cmd;                                            \

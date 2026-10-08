@@ -47,7 +47,6 @@ from afd_plugin.v1.worker.attention_metadata import (
 from afd_plugin.v1.worker.cuda_graph import (
     AFDGraphRunMode,
     graph_run_mode,
-    make_ffn_graph_key,
 )
 from afd_plugin.v1.worker.ffn_model_runner import _set_moe_layer_index
 
@@ -257,12 +256,16 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self,
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
     ) -> tuple:
-        return make_ffn_graph_key(
-            dp_metadata_list,
-            attention_size=int(self.connector.attn_size),
-            ffn_size=int(self.connector.ffn_size),
-            fallback=int(self.max_num_tokens),
-        )
+        graph_key = []
+        for stage_idx in sorted(dp_metadata_list):
+            token_counts = _ffn_token_counts_across_ranks(
+                self.connector,
+                dp_metadata_list,
+                stage_idx,
+                fallback=self.max_num_tokens,
+            )
+            graph_key.append((int(stage_idx), tuple(token_counts.tolist())))
+        return tuple(graph_key)
 
     def _ffn_forward(
         self,
@@ -347,7 +350,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 ) as forward_context:
                     metadata.layer_idx = layer_idx
                     metadata.stage_idx = stage_idx
-                    forward_context.dp_metadata = dp_metadata_list.get(stage_idx)
                     forward_context.additional_kwargs["afd_metadata"] = metadata
                     assert states, "Context.states must not be None"
                     _set_moe_layer_index(forward_context, layer_idx)
@@ -606,36 +608,35 @@ def _ffn_token_counts_across_ranks(
     *,
     fallback: int,
 ) -> torch.Tensor:
+    attention_size = int(connector.attn_size)
+    ffn_size = int(connector.ffn_size)
     dp_metadata = dp_metadata_list.get(int(stage_idx))
     if dp_metadata is None:
-        values = [max(1, int(fallback))] * int(connector.ffn_size)
+        values = [max(1, int(fallback))] * ffn_size
     else:
         attention_counts = _to_int_list(dp_metadata.num_tokens_across_dp_cpu)
-        # Expand DP-level counts to AFD-level counts when TP > 1.
-        # With TP, attn_size = num_attention_ranks includes TP workers
-        # but num_tokens_across_dp_cpu only has dp_size entries.
-        # Each DP rank's token count is replicated tp_size times because
-        # all TP workers within the same DP rank process the same tokens.
+        # Attention TP peers process the same tokens, so expand each DP count
+        # to all of its physical Attention ranks before grouping by FFN.
         if (
-            len(attention_counts) < int(connector.attn_size)
-            and int(connector.attn_size) % len(attention_counts) == 0
+            len(attention_counts) < attention_size
+            and attention_size % len(attention_counts) == 0
         ):
-            tp_size = int(connector.attn_size) // len(attention_counts)
+            tp_size = attention_size // len(attention_counts)
             attention_counts = [
-                attention_counts[i // tp_size] for i in range(int(connector.attn_size))
+                attention_counts[i // tp_size] for i in range(attention_size)
             ]
         if (
-            len(attention_counts) >= int(connector.attn_size)
-            and int(connector.attn_size) >= int(connector.ffn_size)
-            and int(connector.attn_size) % int(connector.ffn_size) == 0
+            len(attention_counts) >= attention_size
+            and attention_size >= ffn_size
+            and attention_size % ffn_size == 0
         ):
-            group_size = int(connector.attn_size) // int(connector.ffn_size)
+            # Match CAMP2P's strided Attention-to-FFN rank mapping.
             values = [
-                max(1, sum(attention_counts[idx * group_size : (idx + 1) * group_size]))
-                for idx in range(int(connector.ffn_size))
+                max(1, sum(attention_counts[idx:attention_size:ffn_size]))
+                for idx in range(ffn_size)
             ]
         else:
-            values = [max(1, int(fallback))] * int(connector.ffn_size)
+            values = [max(1, int(fallback))] * ffn_size
     return torch.tensor(values, dtype=torch.int32, device="cpu")
 
 

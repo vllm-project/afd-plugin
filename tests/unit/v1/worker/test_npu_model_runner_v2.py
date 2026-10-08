@@ -11,18 +11,19 @@ from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 pytest.importorskip("vllm_ascend")
 
 from vllm.config import CUDAGraphMode  # noqa: E402
-from vllm.v1.worker.gpu import cudagraph_utils  # noqa: E402
+from vllm.v1.worker.gpu import cudagraph_utils, dp_utils  # noqa: E402
+from vllm.v1.worker.gpu import model_runner as native_v2  # noqa: E402
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner  # noqa: E402
 from vllm_ascend.worker.v2 import model_runner as native_ascend_v2  # noqa: E402
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner  # noqa: E402
 
-from afd_plugin.model_executor.models import (
-    forward_context as afd_context,  # noqa: E402
+from afd_plugin.model_executor.models import (  # noqa: E402
+    forward_context as afd_context,
 )
 from afd_plugin.v1.worker.npu import attention_model_runner_v2 as npu_v2  # noqa: E402
 
@@ -34,6 +35,7 @@ def _runner():
     runner.vllm_config = SimpleNamespace(
         compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE)
     )
+    runner.afd_config = SimpleNamespace(num_attention_ranks=2, num_ffn_ranks=2)
     runner.cudagraph_manager = None
     runner.prof = object()
     runner._afd_pending_metadata = object()
@@ -73,6 +75,8 @@ def test_execute_forwards_dummy_profile_and_context_then_restores(
     monkeypatch, raise_in_native
 ):
     runner = _runner()
+    runner.afd_config.num_ffn_ranks = 1
+    original_dispatch = native_v2.dispatch_cg_and_sync_dp
     original_state = _state(runner)
     step_calls: list[object] = []
     monkeypatch.setattr(npu_v2, "step_afd_npu_profiler", step_calls.append)
@@ -86,6 +90,9 @@ def test_execute_forwards_dummy_profile_and_context_then_restores(
     forwarded = []
 
     def native_execute(self, *args, **kwargs):
+        assert inspect.signature(native_v2.dispatch_cg_and_sync_dp, eval_str=True) == (
+            inspect.signature(original_dispatch, eval_str=True)
+        )
         forwarded.append((args, kwargs))
         assert forward_module.create_forward_context().additional_kwargs == {
             "afd_metadata": "installed"
@@ -130,6 +137,7 @@ def test_execute_forwards_dummy_profile_and_context_then_restores(
     assert step_calls == [runner.prof]
     assert _state(runner) == original_state
     assert forward_module.create_forward_context is original_factory
+    assert native_v2.dispatch_cg_and_sync_dp is original_dispatch
 
 
 @pytest.mark.parametrize("profile_only", [False, True])
@@ -269,3 +277,68 @@ def test_native_dummy_run_reaches_afd_execute_with_context_state(monkeypatch):
             },
         )
     ]
+
+
+@pytest.mark.parametrize("need_eager", [True, False], ids=["eager", "graph_fallback"])
+def test_camp2p_many_to_one_padding_precedes_native_inputs(monkeypatch, need_eager):
+    runner = _runner()
+    runner.afd_config.num_ffn_ranks = 1
+    manager = SimpleNamespace(
+        dispatch=lambda _reqs, tokens, _uniform, **_kw: (
+            cudagraph_utils.BatchExecutionDescriptor(CUDAGraphMode.NONE, tokens, 1)
+        ),
+        run_fullgraph=lambda _desc: pytest.fail("fallback must remain eager"),
+    )
+    runner.cudagraph_manager = None if need_eager else manager
+    runner.vllm_config.compilation_config.cudagraph_mode = (
+        CUDAGraphMode.NONE if need_eager else CUDAGraphMode.FULL
+    )
+    monkeypatch.setattr(npu_v2, "step_afd_npu_profiler", lambda _prof: None)
+    monkeypatch.setattr(
+        dp_utils, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
+    )
+    monkeypatch.setattr(dp_utils, "should_skip_dp_coordination", lambda: False)
+
+    def all_reduce(tensor, group):
+        tensor[0] = tensor.new_tensor([5, 7])
+        tensor[1].fill_(CUDAGraphMode.NONE.value)
+        tensor[5].fill_(1)
+
+    monkeypatch.setattr(dp_utils.dist, "all_reduce", all_reduce)
+
+    def native_execute(self, *args, **kwargs):
+        desc, sync = native_v2.dispatch_cg_and_sync_dp(
+            self.cudagraph_manager, 1, 5, None, 2, 0, need_eager=need_eager
+        )
+        # This descriptor is consumed next by native input preparation.
+        assert desc.num_tokens == 7
+        assert desc.cg_mode == CUDAGraphMode.NONE
+        assert sync.num_tokens_across_dp.tolist() == [7, 7]
+        return "native-result"
+
+    monkeypatch.setattr(NPUModelRunner, "execute_model", native_execute)
+    assert (
+        runner.execute_model(SimpleNamespace(total_num_scheduled_tokens=5))
+        == "native-result"
+    )
+
+
+def test_camp2p_padding_preserves_full_descriptor(monkeypatch):
+    desc = cudagraph_utils.BatchExecutionDescriptor(
+        CUDAGraphMode.FULL,
+        8,
+        3,
+        uniform_token_count=1,
+        max_query_len=1,
+        num_active_loras=2,
+    )
+    sync = dp_utils.DPSyncState(torch.tensor([8, 8]), 1, False, 7)
+    monkeypatch.setattr(
+        native_v2, "dispatch_cg_and_sync_dp", lambda *a, **kw: (desc, sync)
+    )
+    with npu_v2._use_camp2p_dp_padding(2, 1):
+        actual_desc, actual_sync = native_v2.dispatch_cg_and_sync_dp(
+            None, 3, 8, 1, 2, 0
+        )
+        assert actual_desc is desc
+        assert actual_sync is sync

@@ -2060,11 +2060,12 @@ def test_npu_ffn_runner_builds_forward_context_for_each_dbo_stage(monkeypatch):
     @contextmanager
     def fake_ascend_forward_context(**kwargs):
         context_calls.append(kwargs)
-        yield SimpleNamespace(
-            additional_kwargs={},
-            dp_metadata=None,
-            all_moe_layers={},
+        native_dp_metadata = object()
+        context = SimpleNamespace(
+            additional_kwargs={}, dp_metadata=native_dp_metadata, all_moe_layers={}
         )
+        yield context
+        assert context.dp_metadata is native_dp_metadata
 
     monkeypatch.setattr(
         ffn_model_runner,
@@ -2073,13 +2074,14 @@ def test_npu_ffn_runner_builds_forward_context_for_each_dbo_stage(monkeypatch):
     )
     runner = _new_ffn_runner()
     runner.vllm_config = _vllm_config(role="ffn")
-    runner.connector = _FakeFFNConnector(attn_size=2, ffn_size=2)
+    runner.vllm_config.parallel_config.data_parallel_size = 2
+    runner.connector = _FakeFFNConnector(attn_size=4, ffn_size=2)
     runner.model = _FakeModel()
     runner.num_layers = 1
     runner.max_num_tokens = 16
     runner.use_aclgraph = False
     runner._acl_graphs = {}
-    for stage_idx, num_tokens in enumerate((6, 7)):
+    for stage_idx, num_tokens in enumerate((7, 4)):
         metadata = AFDTransferMetadata.create_attention_metadata(
             layer_idx=0,
             stage_idx=stage_idx,
@@ -2089,17 +2091,17 @@ def test_npu_ffn_runner_builds_forward_context_for_each_dbo_stage(monkeypatch):
 
     runner.execute_model(
         dp_metadata_list={
-            0: _FakeDPMetadata([6]),
-            1: _FakeDPMetadata([7]),
+            0: _FakeDPMetadata([2, 3, 5, 7]),
+            1: _FakeDPMetadata([3, 8, 1, 7]),
         },
         is_profile=True,
     )
 
-    assert [call["num_tokens"] for call in context_calls] == [6, 7]
+    assert [call["num_tokens"] for call in context_calls] == [7, 4]
     assert [call["in_profile_run"] for call in context_calls] == [True, True]
     assert [call["num_tokens_across_dp"].tolist() for call in context_calls] == [
-        [6],
-        [7],
+        [7, 10],
+        [4, 15],
     ]
 
 
@@ -2371,12 +2373,10 @@ def test_npu_ffn_runner_skips_replay_when_attention_is_eager(monkeypatch):
 
 def test_npu_ffn_runner_graph_key_uses_ffn_aggregated_token_counts():
     runner = _new_ffn_runner()
-    runner.connector = _FakeFFNConnector(attn_size=8, ffn_size=4)
+    runner.connector = _FakeFFNConnector(attn_size=4, ffn_size=2)
     runner.max_num_tokens = 24
 
-    assert runner._make_graph_key({0: _FakeDPMetadata([12] * 8)}) == (
-        (0, (24, 24, 24, 24)),
-    )
+    assert runner._make_graph_key({0: _FakeDPMetadata([2, 3, 5, 7])}) == ((0, (7, 10)),)
 
 
 def test_npu_ffn_runner_falls_back_to_eager_on_acl_graph_miss(monkeypatch):
