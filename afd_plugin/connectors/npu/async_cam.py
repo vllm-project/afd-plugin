@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Ascend CAM asynchronous connector for Attention/FFN disaggregation.
 
-``CAMAsyncAFDConnector`` is the eager-only Ascend inference data path.
+``CAMAsyncAFDConnector`` is the Ascend inference data path.
 Attention ranks run MoE routing, submit activations with CAM async
 dispatch-send, and receive combined expert output with combine-recv. FFN ranks
 receive routed-expert activations with dispatch-recv, execute their
@@ -15,10 +15,10 @@ synchronous connectors, CAM async carries routing and token-count metadata in
 the CAM operator payload and does not create a separate Gloo DP-metadata
 control plane.
 
-The supported deployment requires ``async=true``, eager execution, Ascend CAM
-operator packages, and matching topology/configuration on every rank. Regular
-prefill and autoregressive decode steps use the same connector; vLLM native DBO
-and ACL graph execution are not supported.
+The supported deployment requires ``async=true``, Ascend CAM operator packages,
+and matching topology/configuration on every rank. Attention runs eager; the
+layered W4A8 FFN path can use one FULL graph. Regular prefill and autoregressive
+decode steps use the same connector; vLLM native DBO is not supported.
 Optional AFD-managed MoE ubatching is a separate two-stage pipeline using
 request boundaries or token-balanced stages for DP+TP/SP. See
 ``docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md`` for configuration, rank
@@ -34,6 +34,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Final, cast
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 from vllm.logger import init_logger
 
@@ -58,6 +59,7 @@ from afd_plugin.connectors.metadata import (
     AFDTransferState,
 )
 from afd_plugin.distributed import (
+    ProcessGroupRendezvousContext,
     create_hccl_process_group_options,
     init_afd_process_group,
 )
@@ -237,6 +239,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         vllm_config: VllmConfig,
         afd_config: AFDConfig,
         role_rank: int,
+        *,
+        rendezvous_context: ProcessGroupRendezvousContext | None = None,
     ) -> None:
         """Derive CAM topology, tensor dimensions, and connector state.
 
@@ -262,6 +266,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         self.comm_id = CAM_COMM_ID
         self.tp_size = extra_info.attn_ranks_per_dp
         self.cam_pg: ProcessGroup | None = None
+        self._rendezvous_context = rendezvous_context
         self.topology = build_async_topology(
             afd_config,
             role_rank,
@@ -304,6 +309,11 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             pg_options=create_hccl_process_group_options(
                 self.hccl_buffer_size_mb,
             ),
+            on_rendezvous=(
+                self._rendezvous_context.retain_store
+                if self._rendezvous_context is not None
+                else None
+            ),
         )
         backend = self.cam_pg._get_backend(torch.device("npu"))
         self.group_name = str(backend.get_hccl_comm_name(self.world_rank))
@@ -314,19 +324,21 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dtype=self.activation_dtype,
             device=device,
         )
+        if self._rendezvous_context is not None:
+            self._rendezvous_context.bind(self.cam_pg)
         self._initialized = True
 
     def close(self) -> None:
-        """Destroy the HCCL process group and clear pending transfer states."""
+        """Destroy the communicator and release its operator buffers."""
         if self.cam_pg is not None:
-            import torch.distributed as dist
-
             dist.destroy_process_group(self.cam_pg)
         self.cam_pg = None
+        self._initialized = False
         self.comm_args = None
         self._placeholder = None
         self._pending_attention_payloads.clear()
-        self._initialized = False
+        if self._rendezvous_context is not None:
+            self._rendezvous_context.invalidate()
 
     def select_experts(self, **kwargs: Any) -> tuple[Tensor, Tensor]:
         """Run the pinned vLLM-Ascend expert selector on Attention."""

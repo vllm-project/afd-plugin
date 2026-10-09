@@ -446,6 +446,11 @@ def _new_ffn_runner():
     runner = object.__new__(AFDNPUFFNModelRunner)
     runner._layered_executor = None
     runner._layered_gmm_requested = False
+    runner._async_cam_ffn_graph_enabled = False
+    runner._async_cam_ffn_graph = None
+    runner._async_cam_ffn_output = None
+    runner._async_cam_ffn_replays = 0
+    runner._async_cam_startup = None
     runner.prof = None
     runner.device = SimpleNamespace(type="npu")
     runner._is_shutdown = False
@@ -468,6 +473,7 @@ def _new_ffn_worker():
 
     worker = object.__new__(AFDNPUFFNWorker)
     worker._ffn_loop_error = None
+    worker._ffn_receiver_drained = False
     # Most tests exercise the daemon loop rather than CPU placement. Tests for
     # the startup binding path explicitly reset this guard.
     worker._cpu_binding_attempted = True
@@ -1961,6 +1967,23 @@ def test_npu_ffn_runner_shutdown_is_idempotent(monkeypatch):
     assert parent_calls == [runner]
 
 
+def test_npu_cam_eager_runner_rejects_direct_close_with_live_connector(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    runner = _new_ffn_runner()
+    closes = []
+    runner._async_cam_startup = SimpleNamespace(started=True, failed=False)
+    runner.connector = SimpleNamespace(
+        is_initialized=True, close=lambda: closes.append(True)
+    )
+    monkeypatch.setattr(ffn_model_runner, "stop_afd_npu_profiler", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="receiver must drain"):
+        runner.shutdown()
+    assert closes == []
+
+
 def test_npu_ffn_worker_scheduler_execute_model_fails_fast():
     worker = _new_ffn_worker()
 
@@ -1991,6 +2014,7 @@ def test_npu_ffn_worker_start_binds_physical_npu_once_before_daemon(
     worker.local_rank = 3
     worker.model_runner = SimpleNamespace(
         connector=SimpleNamespace(is_initialized=True),
+        _async_cam_startup=None,
     )
     events: list[tuple[str, object]] = []
     monkeypatch.setattr(
@@ -2056,6 +2080,7 @@ def test_npu_ffn_worker_cpu_binding_failure_does_not_abort_daemon_start(
     worker.local_rank = 5
     worker.model_runner = SimpleNamespace(
         connector=SimpleNamespace(is_initialized=True),
+        _async_cam_startup=None,
     )
     thread_starts: list[bool] = []
     monkeypatch.setattr(
@@ -2101,6 +2126,7 @@ def test_npu_ffn_worker_loop_error_is_propagated(caplog):
     worker._ffn_loop_error = None
     worker.model_runner = SimpleNamespace(
         connector=SimpleNamespace(is_initialized=True),
+        _async_cam_startup=None,
     )
 
     expected_error = RuntimeError("boom")
@@ -2132,6 +2158,7 @@ def test_npu_ffn_worker_ignores_receive_error_during_shutdown(caplog):
     worker._ffn_loop_error = None
     worker.model_runner = SimpleNamespace(
         connector=SimpleNamespace(is_initialized=True),
+        _async_cam_startup=None,
     )
 
     def stop_while_receiving():
@@ -2169,7 +2196,7 @@ def test_npu_ffn_worker_stops_loop_before_parent_shutdown(monkeypatch):
 
     connector = SimpleNamespace(close=lambda: calls.append(("close", None)))
     worker._ffn_thread = _StoppingThread()
-    worker.model_runner = SimpleNamespace(connector=connector)
+    worker.model_runner = SimpleNamespace(connector=connector, _async_cam_startup=None)
     monkeypatch.setattr(
         ffn_worker.NPUWorker,
         "shutdown",
@@ -2207,6 +2234,7 @@ def test_npu_ffn_worker_preserves_live_thread_after_shutdown_timeout(monkeypatch
     worker._ffn_thread = thread
     worker.model_runner = SimpleNamespace(
         connector=SimpleNamespace(close=lambda: calls.append(("close", None))),
+        _async_cam_startup=None,
     )
     monkeypatch.setattr(
         ffn_worker.NPUWorker,
@@ -2440,8 +2468,44 @@ def test_npu_async_feature_validation_requires_async_config_and_eager():
 
     config = _vllm_config(connector="CAMAsyncAFDConnector", async_dp=True)
     config.model_config.enforce_eager = False
-    with pytest.raises(RuntimeError, match="only eager"):
+    with pytest.raises(RuntimeError, match="requires FFN FULL"):
         fail_if_unsupported_npu_afd_features(config)
+
+
+def test_npu_async_feature_validation_allows_only_layered_dsv4_ffn_full(
+    monkeypatch,
+):
+    _require_npu_runtime()
+    from afd_plugin.compat.npu import feature_validation
+
+    config = _vllm_config(
+        role="ffn",
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+        extra_config={"dynamicQuant": "1"},
+    )
+    config.model_config.enforce_eager = False
+    config.model_config.hf_config = SimpleNamespace(model_type="deepseek_v4")
+    config.use_v2_model_runner = False
+    monkeypatch.setattr(
+        feature_validation, "async_cam_layered_gmm_enabled", lambda: True
+    )
+    fail_if_unsupported_npu_afd_features(config)
+
+    for graph_mode in (
+        "NONE",
+        "PIECEWISE",
+        "FULL_AND_PIECEWISE",
+        "FULL_DECODE_ONLY",
+    ):
+        config.compilation_config.cudagraph_mode.name = graph_mode
+        with pytest.raises(RuntimeError, match="requires FFN FULL"):
+            fail_if_unsupported_npu_afd_features(config)
+
+    config.model_config.enforce_eager = True
+    config.compilation_config.cudagraph_mode.name = "NONE"
+    fail_if_unsupported_npu_afd_features(config)
 
 
 @pytest.mark.parametrize(
@@ -2695,7 +2759,8 @@ def test_npu_ffn_runner_disables_mask_only_for_cam_mrv1(
 
     def fake_native_init(self, vllm_config, device):
         self.model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(num_hidden_layers=1)
+            hf_config=SimpleNamespace(num_hidden_layers=1),
+            enforce_eager=True,
         )
         module.ascend_context._reserved_mc2_mask = mask
 
@@ -2714,7 +2779,10 @@ def test_npu_ffn_runner_disables_mask_only_for_cam_mrv1(
         module.AFDNPUFFNModelRunner,
         "parse_config",
         staticmethod(
-            lambda config: SimpleNamespace(compute_gate_on_attention=compute_gate)
+            lambda config: SimpleNamespace(
+                compute_gate_on_attention=compute_gate,
+                connector="P2pNcclAFDConnector",
+            )
         ),
     )
 
@@ -2792,6 +2860,7 @@ def test_npu_attention_runner_load_model_initializes_connector_after_weights(
     connector = _LifecycleConnector(events)
     runner = object.__new__(attention_model_runner.AFDNPUAttentionModelRunner)
     runner.connector = connector
+    runner._async_cam_startup = None
     runner.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(use_ubatching=use_ubatching),
     )
@@ -2829,6 +2898,7 @@ def test_npu_attention_runner_afd_ubatching_does_not_install_native_wrapper(
     connector = _LifecycleConnector(events)
     runner = object.__new__(attention_model_runner.AFDNPUAttentionModelRunner)
     runner.connector = connector
+    runner._async_cam_startup = None
     runner.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(
             use_ubatching=False,
@@ -2849,3 +2919,179 @@ def test_npu_attention_runner_afd_ubatching_does_not_install_native_wrapper(
     runner.load_model()
 
     assert events == ["model_load", "connector_init"]
+
+
+def test_npu_async_cam_ffn_graph_replays_one_item_per_moe_layer(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    class FakeGraph:
+        def __init__(self):
+            self.replays = 0
+
+        def replay(self):
+            self.replays += 1
+
+    graph = FakeGraph()
+    runner = object.__new__(ffn_model_runner.AFDNPUFFNModelRunner)
+    runner.connector = SimpleNamespace(control_plane=None, world_rank=8)
+    runner.prof = None
+    runner._async_cam_ffn_graph_enabled = True
+    runner._async_cam_ffn_graph = graph
+    runner._async_cam_ffn_replays = 0
+    monkeypatch.setattr(ffn_model_runner, "step_afd_npu_profiler", lambda _: None)
+    monkeypatch.setattr(ffn_model_runner, "_ffn_layer_indices", lambda _: [1, 4, 7])
+
+    runner.execute_connector_driven_step()
+
+    assert graph.replays == 3
+    assert runner._async_cam_ffn_replays == 3
+
+
+def test_npu_async_cam_ffn_graph_capture_is_idempotent_and_failure_is_atomic(
+    monkeypatch,
+):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    @contextmanager
+    def fake_graph_context(graph, *, pool):
+        yield graph
+
+    graph_creations = []
+
+    def make_graph():
+        graph = SimpleNamespace()
+        graph_creations.append(graph)
+        return graph
+
+    monkeypatch.setattr(ffn_model_runner.torch.npu, "NPUGraph", make_graph)
+    monkeypatch.setattr(ffn_model_runner.torch.npu, "graph", fake_graph_context)
+    runner = object.__new__(ffn_model_runner.AFDNPUFFNModelRunner)
+    runner.connector = SimpleNamespace(is_initialized=True, world_rank=8)
+    runner._layered_executor = object()
+    runner._async_cam_ffn_graph_enabled = True
+    runner._async_cam_ffn_graph = None
+    runner._async_cam_ffn_output = None
+    runner.graph_pool = None
+    runner._execute_layered_work_item = lambda **_: "captured-output"
+
+    runner.capture_async_cam_ffn_graph()
+    runner.capture_async_cam_ffn_graph()
+    assert len(graph_creations) == 1
+    assert runner._async_cam_ffn_output == "captured-output"
+
+    runner._async_cam_ffn_graph = None
+    runner._async_cam_ffn_output = None
+    runner._execute_layered_work_item = lambda **_: (_ for _ in ()).throw(
+        RuntimeError("capture failed")
+    )
+    with pytest.raises(RuntimeError, match="capture failed"):
+        runner.capture_async_cam_ffn_graph()
+    assert runner._async_cam_ffn_graph is None
+    assert runner._async_cam_ffn_output is None
+
+
+def test_npu_async_cam_ffn_worker_delegates_one_complete_startup():
+    _require_npu_runtime()
+
+    events = []
+    worker = _new_ffn_worker()
+    worker._ffn_thread = None
+    worker._start_ffn_receiver = lambda: events.append("receiver")
+
+    class FakeStartup:
+        failed = False
+
+        def start_ffn(self, *, prepare, consume_warmup, capture, start_receiver):
+            events.append("coordinator")
+            plan = prepare()
+            assert plan.use_graph and plan.first_layer_idx == 3
+            consume_warmup(2)
+            capture()
+            start_receiver()
+
+    worker.model_runner = SimpleNamespace(
+        _async_cam_startup=FakeStartup(),
+        prepare_async_cam_ffn_startup=lambda: SimpleNamespace(
+            use_graph=True, first_layer_idx=3
+        ),
+        warmup_async_cam_ffn_communication=lambda count: events.append(
+            ("warmup", count)
+        ),
+        capture_async_cam_ffn_graph=lambda: events.append("capture"),
+    )
+    worker.start_ffn_server_loop()
+    assert events == ["coordinator", ("warmup", 2), "capture", "receiver"]
+
+
+def test_npu_async_cam_graph_shutdown_releases_after_thread_stops():
+    _require_npu_runtime()
+    from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+
+    events = []
+    connector = object.__new__(CAMAsyncAFDConnector)
+    connector.world_rank = 8
+    connector.close = lambda: events.append("close group and anchors")
+    worker = _new_ffn_worker()
+    worker._ffn_shutdown_event = threading.Event()
+    worker._ffn_loop_started_event = threading.Event()
+    worker._ffn_receiver_drained = True
+
+    class FakeThread:
+        active = True
+
+        def is_alive(self):
+            return self.active
+
+        def join(self, *, timeout):
+            events.append("join")
+            self.active = False
+
+    worker._ffn_thread = FakeThread()
+    worker.model_runner = SimpleNamespace(
+        connector=connector,
+        _async_cam_ffn_graph_enabled=True,
+        _async_cam_startup=SimpleNamespace(failed=False, started=True),
+        release_async_cam_ffn_graph=lambda: events.append("release graph"),
+    )
+
+    worker.stop_ffn_server_loop()
+
+    assert events == [
+        "join",
+        "release graph",
+        "close group and anchors",
+    ]
+
+
+def test_npu_async_cam_graph_shutdown_retains_anchors_if_join_times_out():
+    _require_npu_runtime()
+    from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+
+    events = []
+    connector = object.__new__(CAMAsyncAFDConnector)
+    connector.world_rank = 8
+    connector.close = lambda: events.append("close group and anchors")
+    worker = _new_ffn_worker()
+    worker._ffn_shutdown_event = threading.Event()
+
+    class BlockedThread:
+        def is_alive(self):
+            return True
+
+        def join(self, *, timeout):
+            events.append("join timeout")
+
+    worker._ffn_thread = BlockedThread()
+    worker.model_runner = SimpleNamespace(
+        connector=connector,
+        _async_cam_ffn_graph_enabled=True,
+        _async_cam_startup=SimpleNamespace(failed=False, started=True),
+        release_async_cam_ffn_graph=lambda: events.append("release graph"),
+    )
+
+    with pytest.raises(RuntimeError, match="still active"):
+        worker.stop_ffn_server_loop()
+
+    assert events == ["join timeout"]
