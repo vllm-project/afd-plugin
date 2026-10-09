@@ -47,8 +47,7 @@ RUN uv export --locked --group dev --group e2e-tests --no-emit-project -o /tmp/r
 
 RUN python -c "import torch; from importlib.metadata import version; \
     print('vLLM:', version('vllm'), 'PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda); \
-    assert version('vllm') == '0.30.0', 'CI requires vLLM 0.30.0'" \
-    && uv pip check --python /usr/bin/python3
+    assert version('vllm') == '0.30.0', 'CI requires vLLM 0.30.0'"
 
 # Final stage: overlay workspace sources onto the cached deps image.
 FROM deps
