@@ -204,9 +204,8 @@ of 24 in DBO scenarios).
   threshold to 2 because upstream validates both DBO thresholds against the
   two-microbatch count; the prefill threshold stays at 8. `AFD_E2E_API_PORT_BASE`
   (default `8000`) offsets the API server ports on shared machines, and
-  Legacy DBO preserves the upstream chunked-prefill default and explicit
-  caller choices. The MRV2 B/E/G comparison disables chunked prefill for all
-  three modes.
+  Legacy and MRV2 preserve the upstream chunked-prefill default and explicit
+  caller choices. The MRV2 B/E/G comparison retains the native token budget.
 - CI leaves `AFD_GSM8K_THRESHOLD` unset or raises it.
 - Use the official GSM8K task, `HF_HOME`, and `results_*.json`. Do not commit a
   seven-row dataset or custom task YAML.

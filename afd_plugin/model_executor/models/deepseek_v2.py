@@ -29,11 +29,7 @@ from afd_plugin.connectors import (
     AFDTransferMetadata,
 )
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
-from afd_plugin.v1.worker.dbo import (
-    begin_gpu_dbo_transfer,
-    end_gpu_dbo_transfer,
-    maybe_apply_dbo_yield,
-)
+from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 logger = init_logger(__name__)
 
@@ -147,25 +143,19 @@ class RemoteFFNProxy(nn.Module):
             seq_len=int(hidden_states.shape[0]),
         )
         context = AFDTransferContext(metadata=metadata)
-        if hidden_states.is_cuda:
-            begin_gpu_dbo_transfer(hidden_states)
         afd_metadata.connector.send_attn_output(
             hidden_states,
             context,
             **send_kwargs,
         )
-        if not hidden_states.is_cuda:
-            hidden_states = maybe_apply_dbo_yield(
-                hidden_states,
-                role="attention",
-            )
-        output = afd_metadata.connector.recv_ffn_output(
+        hidden_states = maybe_apply_dbo_yield(
+            hidden_states,
+            role="attention",
+        )
+        return afd_metadata.connector.recv_ffn_output(
             ref_tensor=hidden_states,
             ubatch_idx=stage_idx,
         )
-        if hidden_states.is_cuda:
-            end_gpu_dbo_transfer(output)
-        return output
 
 
 class AFDAttentionFusedMoE(RemoteFFNProxy):

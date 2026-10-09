@@ -20,11 +20,7 @@ from vllm.models.deepseek_v4.nvidia import model as native
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
-from afd_plugin.v1.worker.dbo import (
-    begin_gpu_dbo_transfer,
-    end_gpu_dbo_transfer,
-    maybe_apply_dbo_yield,
-)
+from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
@@ -109,25 +105,19 @@ class RemoteDeepseekV4FFN(nn.Module):
             seq_len=int(hidden_states.shape[0]),
         )
         context = AFDTransferContext(metadata=metadata)
-        if hidden_states.is_cuda:
-            begin_gpu_dbo_transfer(hidden_states)
         afd_metadata.connector.send_attn_output(
             hidden_states,
             context,
             input_ids=input_ids,
         )
-        if not hidden_states.is_cuda:
-            hidden_states = maybe_apply_dbo_yield(
-                hidden_states,
-                role="attention",
-            )
-        output = afd_metadata.connector.recv_ffn_output(
+        hidden_states = maybe_apply_dbo_yield(
+            hidden_states,
+            role="attention",
+        )
+        return afd_metadata.connector.recv_ffn_output(
             ref_tensor=hidden_states,
             ubatch_idx=stage_idx,
         )
-        if hidden_states.is_cuda:
-            end_gpu_dbo_transfer(output)
-        return output
 
 
 class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):

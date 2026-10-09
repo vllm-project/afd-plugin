@@ -73,7 +73,6 @@ V2_DBO_COMPARISON_SCENARIOS = frozenset(
 )
 V2_DBO_SAMPLE_LIMIT = 128
 V2_DBO_MAX_NUM_SEQS = 8
-V2_DBO_MAX_BATCHED_TOKENS = 4096
 V2_SINGLE_RANK_SCENARIOS = frozenset(
     ("afd-v2-eager-1a1f", "afd-v2-graph-1a1f"),
 )
@@ -768,19 +767,16 @@ def build_vllm_command(
         cmd.extend(
             [
                 "--no-enable-prefix-caching",
-                "--no-enable-chunked-prefill",
                 "--no-async-scheduling",
             ],
         )
     if args.scenario in V2_DBO_COMPARISON_SCENARIOS:
-        # Keep scheduling identical for the no-DBO, eager DBO and graph DBO
-        # comparison, including enough prefill space with chunking disabled.
+        # Keep request concurrency identical across the no-DBO, eager DBO
+        # and graph DBO comparison; retain native chunked-prefill defaults.
         cmd.extend(
             [
                 "--max-num-seqs",
                 str(V2_DBO_MAX_NUM_SEQS),
-                "--max-num-batched-tokens",
-                str(V2_DBO_MAX_BATCHED_TOKENS),
             ],
         )
     profile_compilation_config = (

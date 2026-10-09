@@ -667,18 +667,15 @@ def test_v2_scenarios_build_exact_commands(
         assert ("--enforce-eager" in command) is not uses_graph
         assert ("--compilation-config" in command) is uses_graph
         assert ("--enable-dbo" in command) is ("-dbo-" in scenario)
-        assert ("--max-num-batched-tokens" in command) is (
-            scenario in runner.V2_DBO_COMPARISON_SCENARIOS
-        )
+        assert "--max-num-batched-tokens" not in command
         assert "--no-enable-prefix-caching" in command
-        assert "--no-enable-chunked-prefill" in command
+        assert "--no-enable-chunked-prefill" not in command
         assert "--no-async-scheduling" in command
         if scenario in runner.V2_DBO_COMPARISON_SCENARIOS:
             assert command[command.index("--worker-extension-cls") + 1] == (
                 "tests.e2e.mrv2_evidence.Worker"
             )
             assert command[command.index("--max-num-seqs") + 1] == "8"
-            assert command[command.index("--max-num-batched-tokens") + 1] == "4096"
         if "-dbo-" in scenario:
             assert command[command.index("--dbo-decode-token-threshold") + 1] == "2"
             assert command[command.index("--dbo-prefill-token-threshold") + 1] == "8"
@@ -1760,13 +1757,24 @@ def test_v2_model_entry_builds_runner_command_with_exact_devices(
         ["--no-enable-chunked-prefill"],
     ],
 )
-def test_configure_dbo_preserves_chunked_prefill_choice(common_args):
+@pytest.mark.parametrize(
+    "scenario",
+    ["afd-graph-dbo-2a2f", "afd-v2-eager-dbo-dp2", "afd-v2-graph-dbo-dp2"],
+)
+def test_configure_dbo_preserves_chunked_prefill_choice(common_args, scenario):
     args = _args()
-    args.scenario = "afd-graph-dbo-2a2f"
+    args.scenario = scenario
     args.common_vllm_arg = list(common_args)
     runner.configure_scenario(args)
 
     assert args.common_vllm_arg == common_args
+    command = runner.build_vllm_command(args, role="attention")
+    assert command.count("--no-enable-chunked-prefill") == common_args.count(
+        "--no-enable-chunked-prefill"
+    )
+    assert command.count("--enable-chunked-prefill") == common_args.count(
+        "--enable-chunked-prefill"
+    )
 
 
 def test_build_env_enables_debug_logging_for_dbo_scenarios(monkeypatch):
