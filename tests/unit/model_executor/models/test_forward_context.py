@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -555,8 +556,12 @@ def test_async_moe_pipeline_preserves_stage_order(monkeypatch):
                 SimpleNamespace(
                     is_moe_layer=True,
                     layer_idx=layer_idx,
+                    use_sequence_parallel_moe=True,
                     mlp=SimpleNamespace(
-                        shared_experts=lambda x, offset=layer_idx + 1: x + offset,
+                        shared_experts=Mock(
+                            side_effect=lambda x, offset=layer_idx + 1: x + offset,
+                            gate_up_proj=SimpleNamespace(tp_size=1),
+                        ),
                     ),
                     compute_attn_output=compute_attn_output,
                 )
