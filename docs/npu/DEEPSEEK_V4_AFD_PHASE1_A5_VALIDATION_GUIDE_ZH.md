@@ -199,9 +199,19 @@ export RECIPE="$AFD_PLUGIN_ROOT/recipe/npu/P2pHcclAFDConnector/deepseek_v4"
 export API_PORT="$ATTENTION_API_PORT"
 export GLOO_SOCKET_IFNAME="$NIC_NAME"
 export HCCL_SOCKET_IFNAME="$NIC_NAME"
+# 内部 HTTP 地址直连；这是 HTTP 环境代理的豁免，不会关闭 PD Proxy 服务。
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}${no_proxy:+$no_proxy,}localhost,127.0.0.1,$HCCL_IF_IP,$PREFILL_HOST_IP,$ATTENTION_HOST_IP,$FFN_HOST_IP,$PROXY_HOST_IP"
+export no_proxy="$NO_PROXY"
 test -d "/sys/class/net/$NIC_NAME"
 ip -o -4 addr show dev "$NIC_NAME" scope global
 ```
+
+如果本机 IP 的 `/metrics` 返回 504，但 `127.0.0.1` 成功，先在服务本机执行
+`curl --noproxy '*' -v --max-time 10 "http://$HCCL_IF_IP:$ATTENTION_API_PORT/metrics"`。
+绕过代理后成功才可确认 HTTP 环境代理是原因；仍失败则检查 `ss -ltnp`、容器网络、路由与防火墙。
+`a5_1030_requests.py` 使用 `trust_env=False` 直连所填 URL，避免意外走 HTTP 环境代理。
+本机 standalone 客户端可使用 loopback；跨机 HTTP 必须使用对端可达地址。
+不要因此把 HCCL/AFD 的 `HCCL_IF_IP` 或跨机 rendezvous 地址改成 loopback。
 
 ### 3.2 冻结版本、权重和安装位置
 
@@ -425,7 +435,8 @@ export AFD_HCCL_GRAPH_U2_HYBRID_DAG=1
 export AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM=1
 export AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM=1
 export AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER=1
-export ATTENTION_URL="http://$ATTENTION_HOST_IP:$ATTENTION_API_PORT"
+# 本节客户端与 Attention 在同一主机，HTTP 使用 loopback。
+export ATTENTION_URL="http://127.0.0.1:$ATTENTION_API_PORT"
 export BASE_URL="$ATTENTION_URL"
 ```
 
@@ -440,24 +451,24 @@ nohup bash "$RECIPE/afd_attention.sh" > "$RUN_ROOT/attention.log" 2>&1 &
 echo $! > "$RUN_ROOT/attention.pid"
 ```
 
-Attention ready 且两个 FFN rank 进入 loop 后，使用第 6.2 节的 Attention readiness/FFN loop 检查（跳过 Prefill 和 Proxy），并按第 6.3 节生成 token pool。
+Attention ready 且两个 FFN rank 进入 loop 后，使用第 6.2 节的 Attention readiness/FFN loop 检查（跳过 Prefill 和 Proxy）。
+先执行下面的 5 请求 `smoke`，通过后再按第 6.3 节生成 token pool，执行第 6.4 节的完整 92 请求验证。
 
 这里的 **`--standalone` 加在 Python 请求验证脚本 `tools/validation/a5_1030_requests.py` 的命令上**，不加到 `afd_ffn.sh`、`afd_attention.sh` 或 `vllm serve` 的启动命令。
 它是无须填写值的标志，告诉验证脚本本轮没有 Proxy，跳过 Proxy 的 `/healthcheck` 和 `request_num` 检查；其余请求检查及 Attention 请求归零检查保留。
 业务请求的目标由 `--base-url` 决定，`--standalone` 不自动改写 URL，所以两个 URL 都明确填写 Attention 地址。
 
-在当前 standalone 终端执行以下**完整请求验证命令**：
+在当前 standalone 终端执行以下**轻量请求检查命令**，不需要 token pool：
 
 ```bash
-export ATTENTION_URL="http://$ATTENTION_HOST_IP:$ATTENTION_API_PORT"
+export ATTENTION_URL="http://127.0.0.1:$ATTENTION_API_PORT"
 "$PYTHON_BIN" "$AFD_PLUGIN_ROOT/tools/validation/a5_1030_requests.py" \
-  --standalone \
+  --standalone --suite smoke \
   --base-url "$ATTENTION_URL" \
   --attention-url "$ATTENTION_URL" \
-  --token-pool "$RUN_ROOT/token-pool.json" \
-  --output "$RUN_ROOT/requests" \
+  --output "$RUN_ROOT/requests-smoke" \
   --run-id "$RUN_ID"
-curl -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/attention-metrics-after.txt"
+curl --noproxy '*' -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/attention-metrics-after.txt"
 ```
 
 验证 capture、在线 replay、全部 Attention rank 的 stage 0/1、未捕获 shape fallback、正常停机及 NPU 清理。
@@ -498,14 +509,14 @@ echo $! > "$RUN_ROOT/attention.pid"
 ```bash
 wait_http() {
   local url="$1" name="$2" deadline=$((SECONDS + 1200))
-  until curl -fsS --max-time 5 "$url" > "$RUN_ROOT/$name-ready.txt"; do
+  until curl --noproxy '*' -fsS --max-time 5 "$url" > "$RUN_ROOT/$name-ready.txt"; do
     if ((SECONDS >= deadline)); then return 1; fi
     sleep 5
   done
 }
 wait_http "http://$PREFILL_HOST_IP:$PREFILL_API_PORT/health" prefill
 wait_http "http://$ATTENTION_HOST_IP:$ATTENTION_API_PORT/health" attention
-curl -fsS "http://$ATTENTION_HOST_IP:$ATTENTION_API_PORT/v1/models" \
+curl --noproxy '*' -fsS "http://$ATTENTION_HOST_IP:$ATTENTION_API_PORT/v1/models" \
   > "$RUN_ROOT/models.json"
 ```
 
@@ -543,44 +554,86 @@ PY
 使用 token-ID prompt，避免字符长度被误写为 KV block 边界长度。
 
 ```bash
-curl -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/attention-metrics-before.txt"
+curl --noproxy '*' -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/attention-metrics-before.txt"
 "$PYTHON_BIN" - "$RUN_ROOT/tokenize-request.json" <<'PY'
 import json, sys
 with open(sys.argv[1], 'w') as f:
     json.dump({'model': 'dsv4-afd', 'prompt': 'The sky is blue. ' * 2048,
                'add_special_tokens': False}, f)
 PY
-curl -fsS --max-time 60 "$ATTENTION_URL/tokenize" \
+curl --noproxy '*' -fsS --max-time 60 "$ATTENTION_URL/tokenize" \
   -H 'Content-Type: application/json' \
   --data-binary "@$RUN_ROOT/tokenize-request.json" > "$RUN_ROOT/token-pool.json"
 ```
 
 ### 6.4 执行完整请求集
 
-Proxy 主机或可达的验证客户端执行；token-pool 文件从 Attention 拷贝到该节点：
+Proxy 主机或可达的验证客户端执行；token-pool 文件从 Attention 拷贝到该节点。
+`full` 覆盖完整验收请求集，不是启动探活或性能 benchmark；先通过 `smoke` 再运行：
 
 ```bash
 "$PYTHON_BIN" "$AFD_PLUGIN_ROOT/tools/validation/a5_1030_requests.py" \
+  --suite full \
   --base-url "$BASE_URL" \
   --attention-url "$ATTENTION_URL" \
   --token-pool "$RUN_ROOT/token-pool.json" \
   --output "$RUN_ROOT/requests" \
   --run-id "$RUN_ID"
-curl -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/attention-metrics-after.txt"
+curl --noproxy '*' -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/attention-metrics-after.txt"
 ```
 
 上面的命令用于 C1–C5，`BASE_URL` 指向 Proxy，不添加 `--standalone`。
-standalone 回归直接使用第 5 节列出的完整 Python 请求验证命令，其中已添加 `--standalone`，两个 URL 均指向 Attention。
+standalone 的完整验证在上面的 Python 命令添加 `--standalone`，并使用第 5 节已定义的 loopback `ATTENTION_URL`/`BASE_URL`。
+保留 `--suite full` 和 `--token-pool`，输出到新目录 `requests/`；第 5 节的 `requests-smoke/` 只保存轻量检查。
+
+| `--suite` | 推理请求数 | 用途 |
+|---|---:|---|
+| `smoke` | 5 | EOS、1 个短输入、正常 SSE、取消 SSE、恢复请求；启动后先执行 |
+| `eos` | 1 | 单独定位自然 EOS，不重复并发或边界输入 |
+| `tail` | 4 | EOS、正常 SSE、取消 SSE、恢复请求；补测旧脚本在 EOS 处停止后尚未执行的项目 |
+| `full`（默认） | 92 | 完整功能请求覆盖；正式请求门禁使用此结果 |
+
+HTTP `/metrics`/`healthcheck` 查询不计入上表的推理请求数。`full` 的 92 个请求由
+`2 × (1 + 8 + 32) = 82` 个长/短输入并发请求、6 个边界请求及4个EOS/SSE/取消/恢复请求构成。
+并发用于覆盖 DP 调度和 U2 执行，边界输入用于检查 KV block 长度；不是每轮都做 GSM8K。
+脚本现在先执行 EOS，失败后立即停止，不再先跑 88 个负载/边界请求。
+`smoke`/`eos`/`tail` 的成功不等同于完整门禁：查看 summary 的 `suite` 与
+`full_request_suite_passed`；只有 `full` 成功会将后者写为 `true`。
+
+**EOS 报错后的单独复测（standalone 在服务本机执行）**：
+
+```bash
+export ATTENTION_URL="http://127.0.0.1:$ATTENTION_API_PORT"
+"$PYTHON_BIN" "$AFD_PLUGIN_ROOT/tools/validation/a5_1030_requests.py" \
+  --standalone --suite eos \
+  --base-url "$ATTENTION_URL" --attention-url "$ATTENTION_URL" \
+  --output "$RUN_ROOT/requests-eos-$(date +%Y%m%dT%H%M%S)" \
+  --run-id "$RUN_ID-eos"
+```
+
+EOS 通过后，可将该命令的 `--suite eos` 改为 `--suite tail`，并将输出目录及 run ID 的
+`eos` 后缀改为 `tail`，补测 4 个剩余项目。保留原来的 88 个响应及本次补测时间窗，
+用于定位和审阅；补测结果不会自动把原失败 summary 或完整 F0 改为通过。
+
+EOS 使用 `/v1/chat/completions`、user message 和服务的 DeepSeek-V4 聊天模板，
+显式关闭 thinking；不设置人为 `stop` 字符串、不强制忽略 EOS。
+旧脚本给 `/v1/completions` 直接传一句裸文本，可能出现续写而非简短回答，达到 1024 token
+并返回 `finish_reason=length`；这是 EOS 用例未满足，不能单独据此判定 AFD 数据面错误。
+仍不自然结束时，用 `--suite eos --eos-prompt '现场冻结的用户输入' --eos-max-tokens 1024`
+单独定位，保存 `eos.request.json` 与 `eos.json`；不能通过取消 EOS 门禁伪造通过。
+
 脚本依赖环境已有的 `httpx`；输出目录必须不存在，避免覆盖旧证据。脚本依次检查：
 
-1. 并发 1、8、32 的短输入和 1024 token 长输入，每条强制输出 64 token 并检查截断；
-2. 31/32/33/63/64/65 token 输入，检查 PD 后 `usage.prompt_tokens` 没有改变；
-3. 独立 EOS 请求，默认最多 1024 token，必须自然 `finish_reason=stop`；
+1. 独立 chat EOS 请求，默认最多 1024 token，必须自然 `finish_reason=stop`；
+2. 并发 1、8、32 的短输入和 1024 token 长输入，每条强制输出 64 token 并检查截断；
+3. 31/32/33/63/64/65 token 输入，检查 PD 后 `usage.prompt_tokens` 没有改变；
 4. 正常 SSE，必须有文本、结束原因和 `[DONE]`；
 5. SSE 收到实际文本后关闭客户端连接，随后恢复请求成功；
 6. 60 秒内 Proxy `request_num=0`，Attention 所有已暴露的 running/waiting gauge 为 0；standalone 只跳过 Proxy 检查，仍要求 Attention 请求归零。
 
 每个请求原始响应和 SSE 文件写入 `requests/`，结果为 `request_summary.json`。
+非流式请求体另存为 `<name>.request.json`，便于核对模型名、输入和 EOS 参数。
+本 recipe 的 served model name 是 `dsv4-afd`；填写 `dsv4` 会返回 model-not-found 404。
 EOS 用例若未自然结束，先冻结合适的 EOS prompt/预算再重跑，不可直接取消 EOS 门禁。
 脚本返回 0 只表示请求子项通过，不自动判断首 token 内容、远程链路、Graph 或完整 F0。
 取消后还要核对本次请求的上游 abort/cancel 处理及 Prefill KV/session 资源释放，不能仅用 Proxy 计数归零代替。当前 Proxy 自行生成上游 request ID，客户端发送的`X-Request-Id` 不保证原样转发；使用响应 ID、请求时间窗及 Proxy 的 ID 映射定位，缺少映射时补采诊断证据，不把客户端标签当作已经贯通的服务端 ID。

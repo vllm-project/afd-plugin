@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Exercise a running A5 proxy; this checks requests, not the full F0 gate."""
+"""Check A5 requests through Proxy or Attention; select smoke, eos, tail, or full."""
 
 import argparse
 import asyncio
@@ -20,10 +20,12 @@ REQUEST_GAUGES = ("vllm:num_requests_running", "vllm:num_requests_waiting")
 
 
 async def run_checks(args: argparse.Namespace) -> dict:
-    token_data = json.loads(Path(args.token_pool).read_text())
-    tokens = token_data["tokens"]
-    if len(tokens) < LONG_INPUT_LENGTH or any(type(t) is not int for t in tokens):
-        raise ValueError("token pool must contain at least 1024 integer token IDs")
+    tokens = []
+    if args.suite == "full":
+        token_data = json.loads(Path(args.token_pool).read_text())
+        tokens = token_data["tokens"]
+        if len(tokens) < LONG_INPUT_LENGTH or any(type(t) is not int for t in tokens):
+            raise ValueError("token pool must contain at least 1024 integer token IDs")
     records = []
     eos_seen = False
 
@@ -31,24 +33,41 @@ async def run_checks(args: argparse.Namespace) -> dict:
         base_url=args.base_url.rstrip("/"),
         timeout=REQUEST_TIMEOUT,
         limits=httpx.Limits(max_connections=40),
+        trust_env=False,
     ) as client:
 
         async def complete(
-            name: str, prompt: str | list[int], budget: int, force_length: bool = False
+            name: str,
+            prompt: str | list[int],
+            budget: int,
+            force_length: bool = False,
+            *,
+            chat: bool = False,
         ) -> dict:
             body = {
                 "model": args.model,
-                "prompt": prompt,
                 "temperature": 0,
                 "max_tokens": budget,
                 "stream": False,
             }
+            if chat:
+                body["messages"] = [{"role": "user", "content": prompt}]
+                body["chat_template_kwargs"] = {
+                    "thinking": False,
+                    "enable_thinking": False,
+                }
+            else:
+                body["prompt"] = prompt
             if force_length:
                 body.update(ignore_eos=True, min_tokens=budget)
+            endpoint = "/v1/chat/completions" if chat else "/v1/completions"
+            Path(args.output, f"{name}.request.json").write_text(
+                json.dumps(body, ensure_ascii=False, indent=2) + "\n"
+            )
             start = time.monotonic()
             start_timestamp_ns = time.time_ns()
             response = await client.post(
-                "/v1/completions",
+                endpoint,
                 json=body,
                 headers={"X-Request-Id": f"{args.run_id}-{name}"},
             )
@@ -63,7 +82,10 @@ async def run_checks(args: argparse.Namespace) -> dict:
             finish = choice.get("finish_reason")
             usage = data.get("usage", {})
             count = usage.get("completion_tokens", 0)
-            if not choice.get("text") or not 0 < count <= budget:
+            text = (
+                choice.get("message", {}).get("content") if chat else choice.get("text")
+            )
+            if not text or not 0 < count <= budget:
                 raise ValueError(f"{name}: empty output or invalid token count")
             if finish not in ("stop", "length"):
                 raise ValueError(f"{name}: invalid finish_reason={finish}")
@@ -73,6 +95,7 @@ async def run_checks(args: argparse.Namespace) -> dict:
                 raise ValueError(f"{name}: token-ID prompt length changed in PD")
             return {
                 "name": name,
+                "endpoint": endpoint,
                 "response_id": data.get("id"),
                 "start_timestamp_ns": start_timestamp_ns,
                 "end_timestamp_ns": time.time_ns(),
@@ -82,30 +105,44 @@ async def run_checks(args: argparse.Namespace) -> dict:
                 "elapsed_seconds": time.monotonic() - start,
             }
 
-        for concurrency in CONCURRENCIES:
-            for kind, prompt in (
-                ("short", "Reply with a short greeting."),
-                ("long", tokens[:LONG_INPUT_LENGTH]),
-            ):
-                results = await asyncio.gather(
-                    *[
-                        complete(f"c{concurrency}-{kind}-{index}", prompt, 64, True)
-                        for index in range(concurrency)
-                    ]
-                )
-                records.extend(results)
-        for length in BOUNDARY_LENGTHS:
-            records.append(
-                await complete(f"boundary-{length}", tokens[:length], 32, True)
-            )
-        result = await complete(
-            "eos", "Reply with only the word Hello.", args.eos_max_tokens
+        # Run natural EOS first so an unsuitable case does not repeat load tests.
+        print(
+            f"[{args.suite}] checking natural EOS through chat completion", flush=True
         )
+        result = await complete("eos", args.eos_prompt, args.eos_max_tokens, chat=True)
         records.append(result)
         eos_seen = result["finish_reason"] == "stop"
         if not eos_seen:
             raise ValueError(
-                "EOS was not observed; freeze a suitable EOS case before rerunning"
+                "EOS was not observed with the chat template; rerun --suite eos "
+                "with a frozen --eos-prompt/--eos-max-tokens "
+                "before repeating load tests"
+            )
+
+        if args.suite == "full":
+            for concurrency in CONCURRENCIES:
+                for kind, prompt in (
+                    ("short", "Reply with a short greeting."),
+                    ("long", tokens[:LONG_INPUT_LENGTH]),
+                ):
+                    print(
+                        f"[full] {kind} input, {concurrency} concurrent requests",
+                        flush=True,
+                    )
+                    results = await asyncio.gather(
+                        *[
+                            complete(f"c{concurrency}-{kind}-{index}", prompt, 64, True)
+                            for index in range(concurrency)
+                        ]
+                    )
+                    records.extend(results)
+            for length in BOUNDARY_LENGTHS:
+                records.append(
+                    await complete(f"boundary-{length}", tokens[:length], 32, True)
+                )
+        elif args.suite == "smoke":
+            records.append(
+                await complete("smoke-short", "Reply with a short greeting.", 64, True)
             )
 
         async def stream_check(cancel: bool) -> None:
@@ -166,11 +203,15 @@ async def run_checks(args: argparse.Namespace) -> dict:
                 }
             )
 
-        await stream_check(False)
-        await stream_check(True)
-        records.append(
-            await complete("recovery", "Reply with a short greeting.", 64, True)
-        )
+        if args.suite != "eos":
+            print(
+                f"[{args.suite}] checking SSE, cancellation, and recovery", flush=True
+            )
+            await stream_check(False)
+            await stream_check(True)
+            records.append(
+                await complete("recovery", "Reply with a short greeting.", 64, True)
+            )
         deadline = time.monotonic() + DRAIN_TIMEOUT
         while True:
             response = await client.get(f"{args.attention_url.rstrip('/')}/metrics")
@@ -206,7 +247,10 @@ async def run_checks(args: argparse.Namespace) -> dict:
             await asyncio.sleep(1)
     return {
         "run_id": args.run_id,
+        "suite": args.suite,
+        "request_count": len(records),
         "request_checks_passed": True,
+        "full_request_suite_passed": args.suite == "full",
         "f0_passed": None,
         "golden_checked": False,
         "eos_seen": eos_seen,
@@ -220,16 +264,25 @@ def main() -> None:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--attention-url", required=True)
     parser.add_argument(
+        "--suite",
+        choices=("smoke", "eos", "tail", "full"),
+        default="full",
+        help="smoke: 5 requests; eos: 1; tail: 4 remaining checks; full: 92 (default)",
+    )
+    parser.add_argument(
         "--standalone",
         action="store_true",
         help="send to Attention directly and omit proxy healthcheck",
     )
-    parser.add_argument("--token-pool", required=True)
+    parser.add_argument("--token-pool", help="required only for --suite full")
     parser.add_argument("--output", required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--model", default="dsv4-afd")
     parser.add_argument("--eos-max-tokens", type=int, default=1024)
+    parser.add_argument("--eos-prompt", default="Reply with only the word Hello.")
     args = parser.parse_args()
+    if args.suite == "full" and not args.token_pool:
+        parser.error("--token-pool is required for --suite full")
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     try:
@@ -239,7 +292,9 @@ def main() -> None:
             json.dumps(
                 {
                     "run_id": args.run_id,
+                    "suite": args.suite,
                     "request_checks_passed": False,
+                    "full_request_suite_passed": False,
                     "f0_passed": None,
                     "error": str(exc),
                 },
@@ -253,8 +308,9 @@ def main() -> None:
         json.dumps(result, ensure_ascii=False, indent=2) + "\n"
     )
     print(
-        "Request checks passed; PD/AFD/DSpark/Graph/U2 evidence "
-        "and cleanup remain required."
+        f"{args.suite} request checks passed ({result['request_count']} requests); "
+        "only full covers the complete request suite. "
+        "PD/AFD/DSpark/Graph/U2 evidence and cleanup remain required."
     )
 
 

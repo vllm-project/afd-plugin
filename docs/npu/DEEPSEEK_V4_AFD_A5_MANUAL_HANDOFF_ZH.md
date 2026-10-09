@@ -191,12 +191,16 @@ export AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM=1
 export AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER=1
 ```
 
-Attention ready 且两个 FFN rank 进入 loop 后，按第 6.3 节生成 token pool，再执行**统一指导书第 5 节列出的完整 Python 请求验证命令**。
+Attention ready 且两个 FFN rank 进入 loop 后，先执行**统一指导书第 5 节列出的 5 请求 `--suite smoke` 命令**，无需生成 token pool。
+smoke 通过后按第 6.3 节生成 token pool，再执行第 6.4 节的 `--suite full` 完整 92 请求集，添加 `--standalone`，两个 URL 均指向本机 Attention。
 `--standalone` 是 `tools/validation/a5_1030_requests.py` 的参数，已放在该命令中；无需添加到 FFN/Attention 服务启动命令。
 它跳过 Proxy `/healthcheck`/`request_num` 检查；`--base-url` 和 `--attention-url` 均填写 Attention 地址，其他请求验证保留。通过后按第 7 节正常停服；
 收集所有角色/rank 的 capture、在线 replay、stage 0/1 和未捕获 shape eager fallback证据，以及无 fatal、shutdown、NPU/端口清理结果。
 
-本轮没有 PD/DSpark gate。输出 `request_summary.json` 通过但路径或 cleanup 未齐全时，M1 保持 pending。失败先回传此轮证据，不启动同机 C1。
+同机 HTTP 客户端使用 `http://127.0.0.1:$ATTENTION_API_PORT`；本机 IP 返回 504 时，按指导书第 3.1 节用 `curl --noproxy '*'` 诊断，不改 HCCL/AFD 通信地址。
+EOS 失败时先用第 6.4 节的 `--suite eos` 单独发送 1 个 chat 请求定位，再用 `--suite tail` 补测剩余项目，避免反复发送已执行过的 88 个负载/边界请求。
+
+本轮没有 PD/DSpark gate。`smoke`/`eos`/`tail` 成功只代表选定子项通过；M1 请求门禁要求 `full_request_suite_passed=true`，路径或 cleanup 未齐全时仍保持 pending。失败先回传此轮证据，不启动同机 C1。
 
 ## 5. 【A5 手工执行】A5-04 到 A5-07：后续顺序
 

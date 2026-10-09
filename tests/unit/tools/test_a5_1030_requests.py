@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -39,7 +40,9 @@ def request_gate(tmp_path, monkeypatch):
         base_url="http://proxy",
         attention_url="http://attention",
         standalone=False,
+        suite="full",
         eos_max_tokens=1024,
+        eos_prompt="Reply with only the word Hello.",
     )
 
     def exercise(fault=None):
@@ -70,6 +73,16 @@ def request_gate(tmp_path, monkeypatch):
             if fault == "http-error":
                 return httpx.Response(500, text="backend failed")
             body = json.loads(request.content)
+            chat = request.url.path == "/v1/chat/completions"
+            if chat:
+                assert body["messages"] == [
+                    {"role": "user", "content": args.eos_prompt}
+                ]
+                assert body["chat_template_kwargs"] == {
+                    "thinking": False,
+                    "enable_thinking": False,
+                }
+                assert "stop" not in body and not body.get("ignore_eos")
             if body.get("stream"):
                 chunks = [
                     b'data: {"choices":[{"text":"hello","finish_reason":null}]}\n\n'
@@ -91,9 +104,9 @@ def request_gate(tmp_path, monkeypatch):
                 )
             if fault == "empty-response":
                 return httpx.Response(200, json={"choices": []})
-            forced = body.get("ignore_eos", False)
+            forced = body.get("ignore_eos", False) or (chat and fault == "eos-length")
             count = body["max_tokens"] if forced else 2
-            prompt = body["prompt"]
+            prompt = body["messages"][0]["content"] if chat else body["prompt"]
             prompt_length = len(prompt) if isinstance(prompt, list) else 8
             if fault == "changed-boundary" and isinstance(prompt, list):
                 prompt_length += 1
@@ -102,7 +115,11 @@ def request_gate(tmp_path, monkeypatch):
                 json={
                     "choices": [
                         {
-                            "text": "hello",
+                            **(
+                                {"message": {"content": "hello"}}
+                                if chat
+                                else {"text": "hello"}
+                            ),
                             "finish_reason": "length" if forced else "stop",
                         }
                     ],
@@ -115,10 +132,15 @@ def request_gate(tmp_path, monkeypatch):
 
         client_class = httpx.AsyncClient
         transport = httpx.MockTransport(handler)
+
+        def client_factory(**kwargs):
+            assert kwargs["trust_env"] is False
+            return client_class(transport=transport, **kwargs)
+
         monkeypatch.setattr(
             validation.httpx,
             "AsyncClient",
-            lambda **kw: client_class(transport=transport, **kw),
+            client_factory,
         )
         monkeypatch.setattr(validation, "DRAIN_TIMEOUT", 0)
         result = asyncio.run(validation.run_checks(args))
@@ -132,6 +154,8 @@ def test_proxy_request_gate_covers_load_boundaries_cancel_and_drain(request_gate
     result, peak, closed, calls = exercise()
     assert result["request_checks_passed"] is True
     assert result["f0_passed"] is None
+    assert result["full_request_suite_passed"] is True
+    assert result["request_count"] == 92
     assert peak == 32
     names = {record["name"] for record in result["records"]}
     assert {f"boundary-{length}" for length in (31, 32, 33, 63, 64, 65)} <= names
@@ -149,6 +173,44 @@ def test_standalone_gate_uses_attention_metrics_without_proxy(request_gate):
     result, _, _, calls = exercise()
     assert result["request_checks_passed"] is True
     assert all(path != "/healthcheck" for _, path in calls)
+
+
+@pytest.mark.parametrize("suite,count", [("smoke", 5), ("eos", 1), ("tail", 4)])
+def test_selected_suite_does_not_repeat_concurrency_and_boundary_load(
+    request_gate, suite, count
+):
+    args, exercise = request_gate
+    args.suite = suite
+    args.token_pool = None
+    result, peak, closed, calls = exercise()
+    assert result["request_checks_passed"] is True
+    assert result["full_request_suite_passed"] is False
+    assert result["request_count"] == count
+    assert peak == 1
+    names = {record["name"] for record in result["records"]}
+    assert not any(
+        name.startswith(("c1-", "c8-", "c32-", "boundary-")) for name in names
+    )
+    assert ("proxy", "/v1/chat/completions") in calls
+    assert ("attention", "/metrics") in calls
+    if suite == "eos":
+        assert not closed
+        assert names == {"eos"}
+    else:
+        assert {"eos", "stream", "cancel", "recovery"} <= names
+
+
+@pytest.mark.parametrize("suite", ["smoke", "eos", "tail", "full"])
+def test_chat_length_limit_is_not_accepted_as_natural_eos(request_gate, suite):
+    args, exercise = request_gate
+    args.suite = suite
+    with pytest.raises(ValueError, match="EOS was not observed with the chat template"):
+        exercise("eos-length")
+    # EOS runs first; an unsuitable case must not send any concurrency load.
+    assert sorted(path.name for path in Path(args.output).iterdir()) == [
+        "eos.json",
+        "eos.request.json",
+    ]
 
 
 @pytest.mark.parametrize(
