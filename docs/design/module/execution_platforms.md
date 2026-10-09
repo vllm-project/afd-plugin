@@ -344,6 +344,14 @@ an expansion of the supported runtime contract.
 | Ascend V2 + `CAMP2pAFDConnector` | Eager, `FULL`, or `FULL_DECODE_ONLY` native V2 ACL Graph | DBO and ubatching rejected | `compute_gate_on_attention=false`; PP/CP, elastic EP, EPLB, SP MoE, and compile SP rejected; role ranks equal DP x TP | V2-Lite 2A2F FULL 300-question comparison and 2A1F eager/FULL_DECODE_ONLY/FULL functional checks; focused runner, context, validation, and device-contract unit tests |
 | Ascend + `CAMAsyncAFDConnector` | Eager only | Native DBO rejected; optional AFD-managed MoE ubatching uses exactly two request or token-balanced stages | Experimental async path; `async=true`; documented path uses common `compute_gate_on_attention=true`; token mode requires Attention TP > 1; model runner v1 PCP is unsupported; prefill and decode context parallelism are unsupported; `connector_extra_config.dynamicQuant` is 0 or 1; plugin-owned async CAM ops required | V2-Lite ordinary Async and DSV4 Flash W4A8 layered off/on 300-question comparisons, MoE ubatching functional checks, real operator traces, and focused unit coverage; V3.2 v0.26 results remain historical |
 
+The NPU results below were collected with the CAMP input-padding and FFN
+context repair included. That repair is being reviewed separately from the
+upgrade integration; its 2A1F results do not qualify the integration without it.
+NPU MRV2 many-to-one eager/fallback execution can produce incorrect output.
+DSV2 Async CAM with model SP and TP-sharded shared experts also has a known
+output-correctness defect; its separate fix still requires NPU validation.
+Neither deferred repair is included in this integration baseline.
+
 All rows target vLLM `0.30.0` (`ced6857a`); Ascend additionally targets
 vLLM-Ascend `8d4409d6`. GPU integration evidence covers DeepSeek-V2-Lite
 and Qwen3-30B-A3B on H20. The [NPU validation record](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923)

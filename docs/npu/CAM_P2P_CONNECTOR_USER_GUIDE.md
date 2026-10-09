@@ -14,7 +14,10 @@ Ascend services. Use `P2pNcclAFDConnector` for CUDA deployments and
 `CAMP2pAFDConnector` supports prefill and decode in eager mode. V1 ACL graph
 uses `FULL_DECODE_ONLY`; the implemented V2 path also accepts `FULL`.
 V2-Lite V1/V2 has [representative v0.30 hardware evidence](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923),
-including 2A1F/2A2F functional checks. Legacy V1 DBO 2A1F/2A2F regressions are
+including 2A1F/2A2F functional checks with the separately reviewed MRV2 padding
+and FFN context repair applied. The integration alone retains the MRV2
+many-to-one correctness gap described in the [runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix).
+Legacy V1 DBO 2A1F/2A2F regressions are
 recorded with the [stage-padding repair](https://github.com/vllm-project/afd-plugin/pull/430#issuecomment-6063840311).
 V2 DBO remains unsupported; other models and topologies require their own evidence.
 

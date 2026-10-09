@@ -72,6 +72,9 @@ Known gaps:
   Flash W4A8 deployments; see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix).
   Other models and topologies remain unverified. Historical v0.26 results retain
   their recorded vLLM-Ascend `80d8c194f` environment.
+- NPU MRV2 many-to-one padding and DSV2 Async SP with TP-sharded shared
+  experts have known correctness defects deferred to separate fixes; see the
+  [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix).
 - Synchronous DSV4 E2E profiles are smoke cases; A5 concurrent answers remain
   incorrect. See the [profile limits](tests/e2e/README.md#dsv4-flash-sync-camp2p-concurrent-requests-local-4-or-16-npus).
 - GPU ModelRunnerV2 supports synchronous `P2pNcclAFDConnector` with

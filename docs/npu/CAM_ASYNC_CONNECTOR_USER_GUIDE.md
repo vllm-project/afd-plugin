@@ -15,6 +15,9 @@ v0.30 evidence covers V2-Lite ordinary Async CAM and DSV4 Flash W4A8 layered
 off/on, each with a representative 300-question comparison. See the
 [NPU validation record](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923).
 
+DSV2 model SP with TP-sharded shared experts has a known correctness defect
+tracked separately from the upgrade; see the [runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix).
+
 > [!WARNING]
 > CAM async remains experimental. The following evidence is historical v0.26. The linked PCP8 recipe and
 > its measurements belong to the former vLLM/vLLM-Ascend 0.19.1 environment;

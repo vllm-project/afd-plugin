@@ -209,8 +209,7 @@ class GateOnlyRemoteMoE(RemoteFFNProxy):
         self.vllm_config = vllm_config
         self.config = config
         self.top_k = int(config.num_experts_per_tok)
-        # Ascend's shared-expert DP setting determines weight replication;
-        # the async schedule adapts model-local tokens to the actual TP layout.
+        # Construct the native shared MLP; Ascend selects its weight layout.
         self.shared_experts = (
             native.DeepseekV2MLP(
                 hidden_size=config.hidden_size,
