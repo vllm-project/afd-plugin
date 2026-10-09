@@ -16,7 +16,7 @@ require_uint() {
 
 validate_devices() {
   local attention_count=0 ffn_count=0 device
-  declare -A seen=()
+  declare -A attention_seen=() ffn_seen=()
 
   IFS=',' read -r -a attention_devices_array <<<"$ATTENTION_DEVICES"
   IFS=',' read -r -a ffn_devices_array <<<"$FFN_DEVICES"
@@ -28,12 +28,23 @@ validate_devices() {
   ((ffn_count == FFN_RANKS)) \
     || afd_die "FFN_DEVICES must contain $FFN_RANKS devices"
 
-  for device in "${attention_devices_array[@]}" "${ffn_devices_array[@]}"; do
+  for device in "${attention_devices_array[@]}"; do
     [[ "$device" =~ ^[0-7]$ ]] \
       || afd_die "A5 recipe device IDs must be integers in [0, 7], got '$device'"
-    [[ -z "${seen[$device]:-}" ]] \
-      || afd_die "Attention and FFN device lists overlap at device $device"
-    seen[$device]=1
+    [[ -z "${attention_seen[$device]:-}" ]] \
+      || afd_die "Attention device list repeats device $device"
+    attention_seen[$device]=1
+  done
+  for device in "${ffn_devices_array[@]}"; do
+    [[ "$device" =~ ^[0-7]$ ]] \
+      || afd_die "A5 recipe device IDs must be integers in [0, 7], got '$device'"
+    [[ -z "${ffn_seen[$device]:-}" ]] \
+      || afd_die "FFN device list repeats device $device"
+    ffn_seen[$device]=1
+    if [[ "${ATTENTION_HOST_IP:-$HCCL_IF_IP}" == "${FFN_HOST_IP:-$HCCL_IF_IP}" ]]; then
+      [[ -z "${attention_seen[$device]:-}" ]] \
+        || afd_die "Attention and FFN device lists overlap at device $device"
+    fi
   done
 }
 
@@ -91,6 +102,68 @@ if mismatches:
 PY
 }
 
+build_a5_pd_kv_config() {
+  # This A5-only recipe maps local logical ranks to physical NPU endpoint files.
+  # Do not call this helper from A3 recipes, FFN, or standalone Decode-AF.
+  local kv_role="$1" engine_id="$2" kv_port="$3" devices="$4"
+  "$PYTHON_BIN" - "$kv_role" "$engine_id" "$kv_port" \
+    "$PREFILL_DP_SIZE" "$PREFILL_TP_SIZE" "$ATTENTION_RANKS" \
+    "${ASCEND_LOCAL_COMM_RES_PATH:-}" "$devices" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+role, engine_id, port, prefill_dp, prefill_tp, attention_dp, resource_dir, devices = sys.argv[1:]
+if role not in ("kv_producer", "kv_consumer"):
+    raise SystemExit("[dsv4-afd] ERROR: A5 PD requires a KV producer or consumer")
+if not engine_id:
+    raise SystemExit("[dsv4-afd] ERROR: Mooncake engine ID cannot be empty")
+resource_root = Path(resource_dir)
+if not resource_root.is_absolute() or not resource_root.is_dir():
+    raise SystemExit(
+        "[dsv4-afd] ERROR: A5 PD ASCEND_LOCAL_COMM_RES_PATH must be an "
+        f"existing local absolute directory, got {resource_dir!r}"
+    )
+try:
+    port_number = int(port)
+    prefill_dp_size, prefill_tp_size, attention_dp_size = map(
+        int, (prefill_dp, prefill_tp, attention_dp)
+    )
+    device_ids = [int(device) for device in devices.split(",")]
+except ValueError as exc:
+    raise SystemExit(f"[dsv4-afd] ERROR: invalid A5 PD numeric config: {exc}") from exc
+if not 0 < port_number < 65536:
+    raise SystemExit("[dsv4-afd] ERROR: Mooncake KV port is outside 1..65535")
+if prefill_dp_size not in (2, 8) or prefill_tp_size != 1 or attention_dp_size != 4:
+    raise SystemExit("[dsv4-afd] ERROR: A5 PD fixes P2/P8, A4 and TP1")
+expected_devices = prefill_dp_size if role == "kv_producer" else attention_dp_size
+if (len(device_ids) != expected_devices or len(set(device_ids)) != len(device_ids)
+        or any(device < 0 or device > 7 for device in device_ids)):
+    raise SystemExit("[dsv4-afd] ERROR: A5 PD device list does not match local role ranks")
+for device in device_ids:
+    endpoint = resource_root / f"ub_endpoint_npu_{device}.json"
+    try:
+        with endpoint.open(encoding="utf-8") as file:
+            json.load(file)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(
+            f"[dsv4-afd] ERROR: unreadable or invalid A5 HIXL endpoint {endpoint}: {exc}"
+        ) from exc
+print(json.dumps({
+    "kv_connector": "MooncakeHybridConnector",
+    "kv_role": role,
+    "engine_id": engine_id,
+    "kv_port": port_number,
+    "kv_parallel_size": 1,
+    "kv_connector_extra_config": {
+        "prefill": {"dp_size": prefill_dp_size, "tp_size": prefill_tp_size},
+        "decode": {"dp_size": attention_dp_size, "tp_size": 1},
+        "ascend_local_comm_res_path": str(resource_root),
+    },
+}, separators=(",", ":")))
+PY
+}
+
 check_port_free() {
   local host="$1" port="$2" purpose="$3"
   "$PYTHON_BIN" - "$host" "$port" "$purpose" <<'PY'
@@ -131,6 +204,15 @@ configure_execution() {
     eager:1)
       EXECUTION_ARGS=(--enforce-eager)
       ;;
+    eager:2)
+      EXECUTION_ARGS=(--enforce-eager)
+      UBATCH_ARGS=(
+        --enable-dbo
+        --dbo-decode-token-threshold "$DBO_DECODE_TOKEN_THRESHOLD"
+        --dbo-prefill-token-threshold "$DBO_PREFILL_TOKEN_THRESHOLD"
+      )
+      export AFD_HCCL_EAGER_U2_STREAM_OVERLAP=1
+      ;;
     full-decode-only:2)
       read -r -a capture_sizes_array <<<"$CUDAGRAPH_CAPTURE_SIZES"
       ((${#capture_sizes_array[@]} > 0)) \
@@ -151,14 +233,15 @@ configure_execution() {
         --dbo-prefill-token-threshold "$DBO_PREFILL_TOKEN_THRESHOLD"
       )
       export AFD_HCCL_EAGER_U2_STREAM_OVERLAP=0
-      export AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP=1
-      export AFD_HCCL_GRAPH_U2_HYBRID_DAG=1
-      export AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM=1
-      export AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM=1
-      export AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER=1
+      # Default to all-on while preserving explicit 0/1 overrides.
+      export AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP="${AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP:-1}"
+      export AFD_HCCL_GRAPH_U2_HYBRID_DAG="${AFD_HCCL_GRAPH_U2_HYBRID_DAG:-1}"
+      export AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM="${AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM:-1}"
+      export AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM="${AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM:-1}"
+      export AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER="${AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER:-1}"
       ;;
     eager:*)
-      afd_die "the public eager recipe requires U_BATCHES=1"
+      afd_die "eager recipe requires U_BATCHES=1 or 2"
       ;;
     full-decode-only:*)
       afd_die "the public FULL_DECODE_ONLY recipe requires U_BATCHES=2"
@@ -174,13 +257,29 @@ preflight_role() {
   : "${NIC_NAME:?Set NIC_NAME to the container network interface}"
   : "${HCCL_IF_IP:?Set HCCL_IF_IP to the IPv4 address on NIC_NAME}"
 
-  [[ "$ATTENTION_RANKS" == 4 ]] || afd_die "this recipe fixes ATTENTION_RANKS=4"
-  [[ "$FFN_RANKS" == 2 ]] || afd_die "this recipe fixes FFN_RANKS=2"
+  [[ "$ATTENTION_RANKS" == 4 ]] || afd_die "this delivery fixes ATTENTION_RANKS=4"
+  [[ "$FFN_RANKS" == 2 ]] || afd_die "this delivery fixes FFN_RANKS=2"
   [[ "$TENSOR_PARALLEL_SIZE" == 1 ]] \
     || afd_die "this A4F2 recipe fixes TENSOR_PARALLEL_SIZE=1"
   [[ "${ENABLE_MTP:-0}" == 0 ]] || afd_die "this recipe requires ENABLE_MTP=0"
-  [[ "${ENABLE_DSPARK:-0}" == 0 ]] || afd_die "this recipe requires ENABLE_DSPARK=0"
-  [[ "${ENABLE_PD:-0}" == 0 ]] || afd_die "this recipe requires ENABLE_PD=0"
+  [[ "${ENABLE_DSPARK:-0}" == 0 || "${ENABLE_DSPARK:-0}" == 1 ]] \
+    || afd_die "ENABLE_DSPARK must be 0 or 1"
+  [[ "${ENABLE_PD:-0}" == 0 || "${ENABLE_PD:-0}" == 1 ]] \
+    || afd_die "ENABLE_PD must be 0 or 1"
+  [[ "$ROLE" == attention || "${ENABLE_DSPARK:-0}" == 0 ]] \
+    || afd_die "DSpark config belongs only to Attention"
+  [[ "$ROLE" == attention || "${ENABLE_PD:-0}" == 0 ]] \
+    || afd_die "PD KV consumer belongs only to Attention"
+  if [[ "$ROLE" == ffn && "${FFN_HOST_IP:-$HCCL_IF_IP}" != "$HCCL_IF_IP" ]]; then
+    afd_die "FFN_HOST_IP must equal the local HCCL_IF_IP on FFN"
+  fi
+  if [[ "$ROLE" == attention && "${ATTENTION_HOST_IP:-$HCCL_IF_IP}" != "$HCCL_IF_IP" ]]; then
+    afd_die "ATTENTION_HOST_IP must equal the local HCCL_IF_IP on Attention"
+  fi
+  if [[ "${ATTENTION_HOST_IP:-$HCCL_IF_IP}" != "${FFN_HOST_IP:-$HCCL_IF_IP}" ]]; then
+    [[ "$AFD_HOST" == "${FFN_HOST_IP:-}" ]] \
+      || afd_die "cross-host AFD_HOST must equal FFN_HOST_IP"
+  fi
 
   require_uint API_PORT "$API_PORT"
   require_uint AFD_PORT "$AFD_PORT"
@@ -239,6 +338,7 @@ PY
   export ASCEND_RT_VISIBLE_DEVICES="$ROLE_DEVICES"
   export HCCL_IF_IP
   export HCCL_IF_BASE_PORT
+  export VLLM_HOST_IP="$HCCL_IF_IP"
   export GLOO_SOCKET_IFNAME="$NIC_NAME"
   export TP_SOCKET_IFNAME="$NIC_NAME"
   export HCCL_SOCKET_IFNAME="$NIC_NAME"

@@ -40,7 +40,7 @@ VLLM_BIN="${VLLM_BIN:-vllm}"
 
 preflight_role
 
-ADDITIONAL_CONFIG="$(printf '{"afd":{"role":"ffn","connector":"P2pHcclAFDConnector","host":"%s","port":%s,"num_attention_ranks":4,"num_ffn_ranks":2}}' "$AFD_HOST" "$AFD_PORT")"
+ADDITIONAL_CONFIG="$(printf '{"afd":{"role":"ffn","connector":"P2pHcclAFDConnector","host":"%s","port":%s,"num_attention_ranks":%s,"num_ffn_ranks":%s}}' "$AFD_HOST" "$AFD_PORT" "$ATTENTION_RANKS" "$FFN_RANKS")"
 
 run_role_service "$VLLM_BIN" serve "$MODEL_PATH" \
   --host "$API_HOST" \

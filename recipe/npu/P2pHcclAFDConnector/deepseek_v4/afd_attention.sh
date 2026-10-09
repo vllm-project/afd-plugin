@@ -40,7 +40,25 @@ VLLM_BIN="${VLLM_BIN:-vllm}"
 
 preflight_role
 
-ADDITIONAL_CONFIG="$(printf '{"afd":{"role":"attention","connector":"P2pHcclAFDConnector","host":"%s","port":%s,"num_attention_ranks":4,"num_ffn_ranks":2}}' "$AFD_HOST" "$AFD_PORT")"
+ADDITIONAL_CONFIG="$(printf '{"afd":{"role":"attention","connector":"P2pHcclAFDConnector","host":"%s","port":%s,"num_attention_ranks":%s,"num_ffn_ranks":%s}}' "$AFD_HOST" "$AFD_PORT" "$ATTENTION_RANKS" "$FFN_RANKS")"
+PD_ARGS=()
+if [[ "${ENABLE_PD:-0}" == 1 ]]; then
+  : "${PREFILL_DP_SIZE:?Set PREFILL_DP_SIZE for Mooncake PD}"
+  PREFILL_TP_SIZE="${PREFILL_TP_SIZE:-1}"
+  : "${DECODE_ENGINE_ID:?Set DECODE_ENGINE_ID for Mooncake PD}"
+  : "${DECODE_KV_PORT:?Set DECODE_KV_PORT for Mooncake PD}"
+  KV_CONFIG="$(build_a5_pd_kv_config kv_consumer "$DECODE_ENGINE_ID" "$DECODE_KV_PORT" "$ATTENTION_DEVICES")"
+  printf '[dsv4-afd] A5 Attention Mooncake KV config=%s\n' "$KV_CONFIG"
+  PD_ARGS=(--kv-transfer-config "$KV_CONFIG")
+fi
+DSPARK_ARGS=()
+if [[ "${ENABLE_DSPARK:-0}" == 1 ]]; then
+  DSPARK_BLOCK_SIZE="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["dspark_block_size"])' "$MODEL_PATH/config.json")"
+  [[ "$DSPARK_BLOCK_SIZE" =~ ^[1-9][0-9]*$ ]] \
+    || afd_die "MODEL_PATH must be a DSpark checkpoint with dspark_block_size"
+  DSPARK_CONFIG="$(printf '{"method":"dspark","num_speculative_tokens":%s,"draft_sample_method":"greedy","enforce_eager":true}' "$DSPARK_BLOCK_SIZE")"
+  DSPARK_ARGS=(--speculative-config "$DSPARK_CONFIG")
+fi
 
 run_role_service "$VLLM_BIN" serve "$MODEL_PATH" \
   --host "$API_HOST" \
@@ -63,6 +81,8 @@ run_role_service "$VLLM_BIN" serve "$MODEL_PATH" \
   --block-size 32 \
   --kv-cache-dtype auto \
   --additional-config "$ADDITIONAL_CONFIG" \
+  "${PD_ARGS[@]}" \
+  "${DSPARK_ARGS[@]}" \
   "${SCHEDULING_ARGS[@]}" \
   "${UBATCH_ARGS[@]}" \
   "${EXECUTION_ARGS[@]}"
