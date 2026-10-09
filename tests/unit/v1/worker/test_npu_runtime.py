@@ -2060,7 +2060,12 @@ def test_npu_ffn_runner_builds_forward_context_for_each_dbo_stage(monkeypatch):
     @contextmanager
     def fake_ascend_forward_context(**kwargs):
         context_calls.append(kwargs)
-        yield SimpleNamespace(additional_kwargs={}, dp_metadata=None, all_moe_layers={})
+        native_dp_metadata = object()
+        context = SimpleNamespace(
+            additional_kwargs={}, dp_metadata=native_dp_metadata, all_moe_layers={}
+        )
+        yield context
+        assert context.dp_metadata is native_dp_metadata
 
     monkeypatch.setattr(
         ffn_model_runner,
