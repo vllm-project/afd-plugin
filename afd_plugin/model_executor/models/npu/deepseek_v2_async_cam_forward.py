@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import torch
 from vllm.distributed import (
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
@@ -531,10 +532,22 @@ def compute_shared_output(
     layer: AFDDeepseekV2DecoderLayer,
     hidden_states: torch.Tensor,
 ) -> torch.Tensor | None:
-    """Evaluate native replicated shared weights in the model token layout."""
-    if layer.mlp.shared_experts is None:
+    """Evaluate shared experts in their weight layout, then restore model SP."""
+    shared_experts = layer.mlp.shared_experts
+    if shared_experts is None:
         return None
-    output = layer.mlp.shared_experts(hidden_states)
+    gather_tokens = (
+        layer.use_sequence_parallel_moe and shared_experts.gate_up_proj.tp_size > 1
+    )
+    local_tokens = hidden_states.shape[0]
+    if gather_tokens:
+        hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+    # The native TP MLP already all-reduces its partial weight-shard outputs.
+    output = shared_experts(hidden_states)
+    if gather_tokens:
+        output = output.narrow(
+            0, get_tensor_model_parallel_rank() * local_tokens, local_tokens
+        )
     # Match native DeepSeek's FP16 overflow-avoidance convention. Routed
     # outputs are unscaled in FP16; the decoder restores the common scale.
     if hidden_states.dtype == torch.float16:
