@@ -21,9 +21,15 @@ else:
 
 pytest.importorskip("vllm")
 
-from vllm.config import CompilationMode  # noqa: E402
+from vllm.config import (  # noqa: E402
+    CompilationMode,
+    DeviceConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 
 from afd_plugin.config import AFDConfig  # noqa: E402
+from afd_plugin.model_executor import remote_moe  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
 
 CONSTRUCTOR_DIGESTS = {
@@ -145,12 +151,45 @@ def _make_layer(
         "parse_afd_config",
         lambda *_args, **_kwargs: afd_config,
     )
+    monkeypatch.setattr(
+        remote_moe, "parse_afd_config", lambda *_args, **_kwargs: afd_config
+    )
+    monkeypatch.setattr(remote_moe, "current_platform", adapter.native.current_platform)
     if vllm_config is None:
         vllm_config = _vllm_config()
     return adapter.AFDDeepseekV2DecoderLayer(
         vllm_config,
         f"model.layers.{layer_idx}",
     )
+
+
+@pytest.fixture
+def cuda_construction_env(monkeypatch, construction_env):
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    config.model_config = _vllm_config().model_config
+    config.model_config.dtype = torch.float32
+    config.model_config.enable_return_routed_experts = False
+    monkeypatch.setattr(
+        adapter.native, "current_platform", SimpleNamespace(device_type="cuda")
+    )
+    monkeypatch.setattr(
+        adapter.native,
+        "GateLinear",
+        lambda *args, **kwargs: _FakeStage(construction_env, *args, **kwargs),
+    )
+    monkeypatch.setattr(
+        adapter.native, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(adapter.native, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        adapter.native,
+        "get_ep_group",
+        lambda: SimpleNamespace(
+            device_group=SimpleNamespace(size=lambda: 1), rank_in_group=0
+        ),
+    )
+    with set_current_vllm_config(config):
+        yield config
 
 
 def _parameter_names(module: nn.Module) -> set[str]:
@@ -262,8 +301,7 @@ def test_attention_gate_keeps_dense_local_and_gate_at_mlp_path(
 
 
 def test_cuda_attention_gate_uses_v026_native_gate_contract(
-    monkeypatch,
-    construction_env,
+    monkeypatch, cuda_construction_env
 ):
     gate_calls = []
 
@@ -273,129 +311,159 @@ def test_cuda_attention_gate_uses_v026_native_gate_contract(
             gate_calls.append((input_size, output_size, kwargs))
             self.weight = nn.Parameter(torch.empty(output_size, input_size))
 
-    vllm_config = _vllm_config()
-    vllm_config.model_config.hf_config.moe_router_dtype = "float32"
-    monkeypatch.setattr(
-        adapter.native,
-        "current_platform",
-        SimpleNamespace(device_type="cuda"),
-    )
+    config = cuda_construction_env
+    config.model_config.hf_config.moe_router_dtype = "float32"
     monkeypatch.setattr(adapter.native, "GateLinear", _FakeGate)
-    monkeypatch.setattr(
-        adapter.native,
-        "get_tensor_model_parallel_world_size",
-        lambda: 1,
-    )
-    monkeypatch.setattr(
-        adapter.native,
-        "get_tensor_model_parallel_rank",
-        lambda: 0,
-    )
-    monkeypatch.setattr(
-        adapter.native,
-        "get_ep_group",
-        lambda: SimpleNamespace(
-            device_group=SimpleNamespace(size=lambda: 1),
-            rank_in_group=0,
-        ),
-    )
-
-    moe = _make_layer(
+    layer = _make_layer(
         monkeypatch,
         role="attention",
         layer_idx=1,
         attention_gate=True,
-        vllm_config=vllm_config,
+        vllm_config=config,
     )
 
-    assert isinstance(moe.mlp, adapter.AFDDeepseekV2RemoteExpertsMoE)
-    assert isinstance(moe.mlp.experts, adapter.AFDAttentionFusedMoE)
+    assert isinstance(layer.mlp, adapter.AFDDeepseekV2RemoteExpertsMoE)
+    assert type(layer.mlp.experts) is remote_moe.AFDExternalRoutingMoERunner
     assert gate_calls == [
         (
             8,
             4,
-            {
-                "out_dtype": torch.float32,
-                "prefix": "model.layers.1.mlp.gate",
-            },
-        ),
+            {"out_dtype": torch.float32, "prefix": "model.layers.1.mlp.gate"},
+        )
     ]
-    assert list(moe.mlp.experts.parameters()) == []
-    assert list(moe.mlp.experts.buffers()) == []
+    assert _parameter_names(layer.mlp) == {
+        "gate.weight",
+        "gate.e_score_correction_bias",
+    }
+    assert list(layer.mlp.experts.parameters()) == []
+    assert list(layer.mlp.experts.buffers()) == []
 
 
-def test_cuda_remote_experts_reject_eplb_on_attention(
-    monkeypatch,
-    construction_env,
+@pytest.mark.parametrize("attention_gate", [False, True])
+@pytest.mark.parametrize(
+    ("setting", "message"),
+    [
+        ("enable_eplb", "EPLB"),
+        ("num_redundant_experts", "redundant"),
+        ("enable_return_routed_experts", "routed.experts"),
+    ],
+)
+def test_cuda_remote_experts_reject_local_capabilities_before_factory(
+    monkeypatch, cuda_construction_env, attention_gate, setting, message
 ):
-    vllm_config = _vllm_config()
-    vllm_config.parallel_config.enable_eplb = True
+    config = cuda_construction_env
+    if setting == "enable_eplb":
+        config.parallel_config.enable_eplb = True
+    elif setting == "num_redundant_experts":
+        config.parallel_config.eplb_config.num_redundant_experts = 1
+    else:
+        config.model_config.enable_return_routed_experts = True
     monkeypatch.setattr(
-        adapter.native,
-        "current_platform",
-        SimpleNamespace(device_type="cuda"),
+        remote_moe.fused_moe,
+        "FusedMoE",
+        lambda **_kwargs: pytest.fail("native MoE factory must not be called"),
     )
-
-    with pytest.raises(RuntimeError, match="do not support EPLB"):
+    with pytest.raises(RuntimeError, match=message):
         _make_layer(
             monkeypatch,
             role="attention",
             layer_idx=1,
-            attention_gate=True,
-            vllm_config=vllm_config,
+            attention_gate=attention_gate,
+            vllm_config=config,
         )
+    assert config.compilation_config.static_forward_context == {}
+    assert config.compilation_config.static_all_moe_layers == []
 
 
-def test_cuda_ffn_gate_uses_parameter_free_internal_router_shell(
-    monkeypatch,
-    construction_env,
+@pytest.mark.parametrize("attention_gate", [False, True])
+@pytest.mark.parametrize("n_shared_experts", [None, 1])
+def test_cuda_moe_preserves_routing_and_native_registration(
+    monkeypatch, cuda_construction_env, attention_gate, n_shared_experts
 ):
-    monkeypatch.setattr(
-        adapter.native,
-        "current_platform",
-        SimpleNamespace(device_type="cuda"),
-    )
-    monkeypatch.setattr(
-        adapter.native,
-        "GateLinear",
-        lambda *_args, **_kwargs: pytest.fail(
-            "FFN-side gate must not construct an Attention gate",
-        ),
-    )
-    monkeypatch.setattr(
-        adapter.native,
-        "get_tensor_model_parallel_world_size",
-        lambda: 1,
-    )
-    monkeypatch.setattr(
-        adapter.native,
-        "get_tensor_model_parallel_rank",
-        lambda: 0,
-    )
-    monkeypatch.setattr(
-        adapter.native,
-        "get_ep_group",
-        lambda: SimpleNamespace(
-            device_group=SimpleNamespace(size=lambda: 1),
-            rank_in_group=0,
-        ),
-    )
+    config = cuda_construction_env
+    hf_config = config.model_config.hf_config
+    hf_config.n_shared_experts = n_shared_experts
+    hf_config.hidden_size = 7
+    hf_config.moe_intermediate_size = 9
+    hf_config.routed_scaling_factor = 2.5
+    hf_config.scoring_func = "sigmoid"
+    hf_config.topk_group = 2
+    hf_config.n_group = 4
+    config.parallel_config.tensor_parallel_size = 2
+    config.parallel_config.enable_expert_parallel = True
+    config.quant_config = object()
+    if not attention_gate:
+        monkeypatch.setattr(
+            adapter.native,
+            "GateLinear",
+            lambda *_args, **_kwargs: pytest.fail(
+                "Attention must not construct a gate"
+            ),
+        )
+    factory_calls = []
+    native_factory = remote_moe.fused_moe.FusedMoE
 
-    moe = _make_layer(
+    def record_factory(**kwargs):
+        factory_calls.append(kwargs)
+        return native_factory(**kwargs)
+
+    monkeypatch.setattr(remote_moe.fused_moe, "FusedMoE", record_factory)
+    layer = _make_layer(
         monkeypatch,
         role="attention",
         layer_idx=1,
-        attention_gate=False,
+        attention_gate=attention_gate,
+        vllm_config=config,
     )
-
-    assert isinstance(moe.mlp, adapter.AFDDeepseekV2RemoteExpertsMoE)
-    assert isinstance(moe.mlp.experts, adapter.AFDAttentionFusedMoE)
-    assert moe.mlp.gate is None
-    assert moe.mlp.experts.is_internal_router
-    assert "forward" not in type(moe.mlp).__dict__
-    assert list(moe.mlp.experts.parameters()) == []
-    assert list(moe.mlp.experts.buffers()) == []
-    assert not any(name.startswith("mlp.") for name in _parameter_names(moe))
+    moe = layer.mlp
+    runner = moe.experts
+    expected_runner = (
+        remote_moe.AFDExternalRoutingMoERunner
+        if attention_gate
+        else remote_moe.AFDRemoteMoERunner
+    )
+    assert type(runner) is expected_runner
+    assert type(runner.routed_experts) is remote_moe.AFDRemoteRoutedExperts
+    assert type(runner.routed_experts.quant_method) is remote_moe.AFDRemoteMoEMethod
+    assert runner.is_internal_router is not attention_gate
+    assert "forward" not in type(moe).__dict__
+    assert list(runner.parameters()) == []
+    assert list(runner.buffers()) == []
+    assert moe.n_shared_experts == n_shared_experts
+    assert config.compilation_config.static_forward_context == {
+        "model.layers.1.mlp.experts": runner
+    }
+    assert config.compilation_config.static_all_moe_layers == [
+        "model.layers.1.mlp.experts"
+    ]
+    assert runner.moe_config.hidden_dim == runner.moe_config.hidden_dim_unpadded == 7
+    assert runner.moe_config.intermediate_size_per_partition == 9
+    assert runner.moe_config.tp_size == runner.moe_config.ep_size == 1
+    assert config.parallel_config.tensor_parallel_size == 2
+    assert config.parallel_config.enable_expert_parallel
+    assert config.quant_config is not None
+    assert len(factory_calls) == 1
+    factory_kwargs = factory_calls[0]
+    expected_kwargs = {
+        "num_experts": 4,
+        "top_k": 2,
+        "renormalize": True,
+        "use_grouped_topk": True,
+        "num_expert_group": 4,
+        "topk_group": 2,
+        "scoring_func": "sigmoid",
+        "routed_scaling_factor": 2.5,
+        "apply_routed_scale_to_output": True,
+    }
+    assert {name: factory_kwargs[name] for name in expected_kwargs} == expected_kwargs
+    assert factory_kwargs["quant_config"] is factory_kwargs["gate"] is None
+    assert (
+        factory_kwargs["shared_experts"] is factory_kwargs["n_shared_experts"] is None
+    )
+    assert "e_score_correction_bias" not in factory_kwargs
+    if not attention_gate:
+        assert moe.gate is None
+        assert list(moe.parameters()) == []
 
 
 def test_ffn_constructs_no_real_attention(

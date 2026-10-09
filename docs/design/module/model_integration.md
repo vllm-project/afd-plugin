@@ -34,7 +34,7 @@ related_issues:
   - "#88"
   - "#105"
   - "#129"
-last_reviewed: 2026-08-27
+last_reviewed: 2026-09-28
 ---
 
 # Model integration
@@ -60,6 +60,7 @@ make a backend-specific worker class the shared model API.
 | DeepSeek V4 CUDA role boundary | [`deepseek_v4.py`](../../../afd_plugin/model_executor/models/deepseek_v4.py) | [`test_deepseek_v4_construction.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_construction.py), [`test_deepseek_v4_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_proxy.py), [`test_deepseek_v4_weight_policy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_weight_policy.py) |
 | DeepSeek V4 Ascend Hash-id boundary | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py), [`npu/deepseek_v4_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_attention_gate.py) | [`test_deepseek_v4_hash_ids.py`](../../../tests/unit/model_executor/test_deepseek_v4_hash_ids.py), [`test_deepseek_v4_npu_weight_roles.py`](../../../tests/unit/model_executor/test_deepseek_v4_npu_weight_roles.py), ids-mode cases in [`test_camp2p_token_ids.py`](../../../tests/unit/connectors/test_camp2p_token_ids.py) |
 | Qwen3 MoE role-aware model and weight loading | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py), [`test_qwen3_moe_weight_policy.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_weight_policy.py) |
+| Native CUDA remote MoE runners | [`remote_moe.py`](../../../afd_plugin/model_executor/remote_moe.py) | [`test_remote_moe.py`](../../../tests/unit/model_executor/test_remote_moe.py), DeepSeek and Qwen construction/forward contracts |
 | CUDA remote-experts boundary | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py), [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py) | [`test_p2p_experts_contract.py`](../../../tests/unit/connectors/test_p2p_experts_contract.py), [`test_deepseek_v2_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_proxy.py) |
 | Forward-context adapter | [`forward_context.py`](../../../afd_plugin/model_executor/models/forward_context.py) | [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
 | NPU Async CAM stage planning | [`npu/async_cam_ubatching.py`](../../../afd_plugin/model_executor/npu/async_cam_ubatching.py) | [`test_async_cam_ubatching.py`](../../../tests/unit/model_executor/test_async_cam_ubatching.py) |
@@ -104,14 +105,14 @@ needed by the split execution.
 | Layer/component | Attention role | FFN role |
 | --- | --- | --- |
 | Attention module and KV-facing computation | Constructed and executed. | Not constructed. |
-| MoE with `compute_gate_on_attention=false` | CUDA constructs the native MoE shell with a parameter-free internal-router experts proxy; NPU sends after post-Attention normalization. | Native gate and experts are constructed and executed from connector input. |
-| MoE with `compute_gate_on_attention=true` | CUDA keeps the native gate and uses an external-router experts proxy; NPU uses its Attention-side gate helper. | Expert MLP is constructed and consumes transferred router logits or routed payloads without rerunning the gate. |
+| MoE with `compute_gate_on_attention=false` | CUDA constructs the native MoE shell with a parameter-free internal-router MoE runner; NPU sends after post-Attention normalization. | Native gate and experts are constructed and executed from connector input. |
+| MoE with `compute_gate_on_attention=true` | CUDA keeps the native gate and uses an external-routing MoE runner; NPU uses its Attention-side gate helper. | Expert MLP is constructed and consumes transferred router logits or routed payloads without rerunning the gate. |
 | Dense MLP, normal mode | Not constructed; output is sent after post-Attention normalization. | Constructed and executed from connector input. |
 | Dense MLP with `compute_gate_on_attention=true` | Constructed and executed locally because there is no routed MoE handoff. | Not constructed and a dense-layer FFN compute request is rejected. |
 | Embedding, final norm, pipeline placeholders | Created according to the pinned pipeline-rank rules. | Same wrapper lifecycle rules; only role-required parameters are loaded. |
 
 CUDA MoE always splits at the remote-experts boundary while preserving native
-`DeepseekV2MoE.forward`. With gate-on-FFN, the proxy asks FFN to run its native
+`DeepseekV2MoE.forward`. With gate-on-FFN, the runner asks FFN to run its native
 internal-router MoE. With gate-on-Attention, Attention runs the native gate and
 FFN executes its external-router experts path. CUDA Attention-side remote
 experts currently reject EPLB. The NPU gate helper supports unquantized and
@@ -121,6 +122,54 @@ explicitly.
 The full AFD model remains decorated with vLLM's compile support. Backend-only
 helpers are imported inside the NPU path so CUDA model import does not require
 vLLM-Ascend.
+
+### Native CUDA remote MoE runners
+
+`build_attention_moe_runner` constructs Attention-side CUDA P2P experts through
+vLLM's live `fused_moe.FusedMoE` factory. DeepSeek V2-family and Qwen3.5/3.6
+adapters inherit their native MoE forward and pass model routing parameters
+into this common construction entry.
+
+| CUDA P2P gate placement | Runner | Attention MoE weights |
+| --- | --- | --- |
+| FFN | `AFDRemoteMoERunner` | None |
+| Attention (DeepSeek only) | `AFDExternalRoutingMoERunner` | Native gate only |
+
+`AFDRemoteRoutedExperts` uses `AFDRemoteMoEMethod` to skip expert weight
+allocation, dimension padding and local kernel preparation. Native constructors,
+per-config layer registration and post-load processing remain active. The
+empty descriptor uses unit TP/DP/PCP dimensions; FFN topology is unchanged.
+Attention-local EPLB, redundant experts and routed-expert capture are rejected.
+The factory reserves local weight, routing and parallelism arguments so callers
+cannot re-enable local expert execution.
+
+Both runners use `remote_ffn_forward`, preserving one send, DBO yield and receive
+per call with live layer/stage metadata. Gate-on-Attention sends the router logits
+computed by native DeepSeek forward. Neither runner performs local routing,
+scaling, padding or reduction on the completed FFN result. Non-null `input_ids`
+are rejected at this experts boundary before communication.
+
+The previous CUDA `AFDAttentionFusedMoE` proxy is removed. `RemoteFFNProxy`
+continues to serve dense layers, Qwen3 MoE and NPU V4, delegating its existing
+exchange to the shared helper, including token IDs and routing kwargs. NPU
+CAMP2p still uses its legacy proxy, and CAMAsync retains `GateOnlyRemoteMoE`,
+its gate helpers and model-owned scheduling. Neither NPU connector is selected
+by the new factory in this change.
+
+The contract tests cover real vLLM 0.26 construction, registration, post-load,
+weight ownership and synchronous exchange. CUDA loopback compares the frozen
+previous experts boundary against the new runner using the same native FFN
+kernels, both DeepSeek gate placements, BF16, token counts 1 and 7, shared
+experts and routed scale 2.5, with exact equality. Loopback does not establish
+physical transport, full-model accuracy, graph replay or performance parity.
+All GPU-consuming validation must run through the system `gpu run` scheduler.
+
+For this CUDA migration, compilation and repository pre-commit checks passed.
+The scheduled focused suite passed 189 tests with no failures or skips,
+including real CUDA dual-gate BF16 loopback. Four warm profiling cases retained
+identical CUDA activities (18 per call), synchronization counts and one
+send/yield/receive each. Physical E2E validation is queued separately; no
+full-model Qwen, NPU hardware or physical performance parity is claimed.
 
 ### DeepSeek V4 CUDA boundary
 
@@ -162,6 +211,11 @@ speculative decoding, LoRA, or NPU.
 native hybrid Qwen3.5/3.6 architecture. Attention owns embeddings, norms, and
 linear/full-attention state, then sends hidden states only. FFN owns the native
 gate, routed experts, shared expert, and shared-expert gate.
+
+The Attention MoE shell uses `build_attention_moe_runner` with native Qwen
+routing parameters. Gate, routed experts, shared expert and shared-expert gate
+remain on FFN. The factory registers the empty descriptor at the native
+`.mlp.experts` prefix without importing the DeepSeek model adapter.
 
 This path is CUDA-only, text-only, and requires `--language-model-only`,
 `compute_gate_on_attention=false`, and `pipeline_parallel_size=1`. It rejects
