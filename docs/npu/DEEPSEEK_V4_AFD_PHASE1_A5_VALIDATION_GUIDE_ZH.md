@@ -176,6 +176,10 @@ export CANN_BUILD='填写冻结的精确版本和build'
 export HCCL_PACKAGE='填写精确包名版本build及来源'
 ```
 
+`RUN_BASE` 写在 `node.env`，表示本机保存验证记录的基础目录。`RUN_ID`、
+`RUN_ROOT` 在每轮运行的终端中设置：PD 预检按交接清单 A5-02，standalone
+按本指导书第 5 节，C1–C5 按第 4.3 节。下文已将目录初始化放在首次写文件之前。
+
 CANN 路径以冻结的 A5 镜像为准；上面的 9.2.0 仅是现场路径示例，不宣称新组合已在该版本验证。不要回退到开发机 `/mnt/workspace/code/.ascend/cann-9.0.0`，不要混用多个 CANN 安装。**HIXL 配置仅用于 A5**：Prefill producer 和 Decode Attention consumer 分别将本机绝对路径写入 `kv_connector_extra_config.ascend_local_comm_res_path`，路径必须存在且资源文件适配本节点。仅 export 环境变量不足；P/A 路径可不同，不能填另一节点的目录。A3 不注入此字段，也不要求 `/etc/hixlep` 或 `ASCEND_LOCAL_COMM_RES_PATH`；FFN 不创建 Mooncake connector。
 
 每个角色终端加载环境，`SITE_FILE`、`NODE_FILE` 替换为本机保存的文件：
@@ -286,18 +290,36 @@ export AFD_HOST="$FFN_HOST_IP"
 
 不同机器的设备 ID 可重复；同机 P/A/F 列表必须互斥。跨机 AFD rendezvous 使用 FFN IP，不使用 localhost。逐项检查路由、防火墙及实际监听地址；API、Mooncake 端口范围、HCCL base 及其派生端口、AFD rendezvous 均须可达且无冲突。仅检查 base port 不充分。
 
-### 4.3 设置 CASE 和轮次
+### 4.3 C1–C5：设置 CASE、轮次和运行目录
 
-每个角色终端执行同一 CASE/CYCLE/RUN_ID。RUN_ID 在协调终端生成一次，再复制到各节点，不能各节点独立生成时间戳。本机首次准备目录执行 `mkdir`，其他角色终端只加载已有目录。
+本节用于 PD 的 C1–C5；standalone 先执行第 5 节的初始化和配置。
+每个角色终端使用同一 CASE/CYCLE/RUN_ID。RUN_ID 在协调终端确定一次，再复制到各节点，不能各节点独立生成时间戳。
+加载第 3.1 节环境并选择第 4.1 或 4.2 节拓扑后，**每台主机只在第一个角色终端创建目录一次**：
+
+```bash
+export CASE=C1
+export CYCLE=1
+# 每轮替换为新的实际值；本轮所有角色使用相同值。
+export RUN_ID=20261008T180000-single-C1-r1
+: "${RUN_BASE:?先按第 3.1 节加载 node.env 中的 RUN_BASE}"
+export RUN_ROOT="$RUN_BASE/$RUN_ID/$(hostname -s)"
+mkdir -p "$RUN_BASE/$RUN_ID"
+mkdir "$RUN_ROOT"
+```
+
+**本机其他角色终端**加载第 3.1 节环境及相同拓扑后，只执行以下赋值，不重复创建目录：
 
 ```bash
 export CASE=C1
 export CYCLE=1
 export RUN_ID=20261008T180000-single-C1-r1
 export RUN_ROOT="$RUN_BASE/$RUN_ID/$(hostname -s)"
-mkdir -p "$RUN_BASE/$RUN_ID"
-mkdir "$RUN_ROOT"
+test -d "$RUN_ROOT"
+```
 
+随后**每个角色终端**执行本轮开关配置：
+
+```bash
 case "$CASE" in
   C1) export EXECUTION_MODE=eager U_BATCHES=1 ENABLE_DSPARK=0 ;;
   C2) export EXECUTION_MODE=eager U_BATCHES=1 ENABLE_DSPARK=1 ;;
@@ -319,6 +341,17 @@ export AFD_HCCL_GRAPH_U2_HYBRID_DAG="${AFD_HCCL_GRAPH_U2_HYBRID_DAG:-1}"
 export AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM="${AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM:-1}"
 export AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM="${AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM:-1}"
 export AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER="${AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER:-1}"
+```
+
+RUN_ID 示例每轮必须改成新的实际值，且与 CASE/TOPOLOGY/CYCLE 一致。
+
+### 4.4 保存启动前环境和运行清单
+
+C1–C5 完成第 4.3 节配置后执行；standalone 完成第 5 节配置后执行。
+在每台主机的一个已配置终端采集一次，然后再运行对应的 `nohup` 启动命令：
+
+```bash
+test -d "$RUN_ROOT"
 sha256sum "$SITE_FILE" "$NODE_FILE" > "$RUN_ROOT/config.sha256"
 cp "$SITE_FILE" "$RUN_ROOT/site.env"
 cp "$NODE_FILE" "$RUN_ROOT/node.env"
@@ -355,16 +388,27 @@ with open(sys.argv[1], 'w') as f:
 PY
 ```
 
-RUN_ID 示例每轮必须改成新的实际值，且与 CASE/TOPOLOGY/CYCLE 一致。
 保存有效环境和运行清单，至少包括三个源码提交/dirty state、Python package/version/source、镜像、CANN/HCCL、角色地址/设备/端口、CASE/CYCLE、模型 hashes、最终开关。
 只采集本次相关环境变量，避免把无关认证信息写入证据。上述 runtime 保存启动前意图值；角色脚本可能覆盖设置，启动后还须归档实际 argv 和逐 rank 的诊断配置日志，将二者与 runtime 对照，不能仅凭此 JSON 判定最终开关已生效。
 
 ## 5. 【A5 手工执行】第 3 步：先回归 standalone A4F2 Graph/U2
 
 M1 修正后的新 recipe 必须先通过一次 standalone 回归，然后才能进入同机 C1。
-在单台空闲 A5 使用新目录及 run ID，按前文配置环境，覆盖：
+在单台空闲 A5，**先在同一个启动终端执行第 3 节环境加载与版本检查，再执行下面整段**。
+`RUN_ROOT` 的初始化就放在这里：在设备配置和两条 `nohup` 命令之前。
+本节在一个终端启动 FFN 和 Attention，无需重复创建目录；预检和 C1 的记录各用新的 RUN_ID。
 
 ```bash
+# 1. 本轮日志目录：RUN_BASE 已在 node.env 中定义并加载。
+: "${RUN_BASE:?先按第 3.1 节加载 node.env 中的 RUN_BASE}"
+export TOPOLOGY=single CASE=standalone CYCLE=1
+export RUN_ID="$(date +%Y%m%dT%H%M%S)-single-standalone-r${CYCLE}"
+export RUN_ROOT="$RUN_BASE/$RUN_ID/$(hostname -s)"
+mkdir -p "$RUN_BASE/$RUN_ID"
+mkdir "$RUN_ROOT"
+printf 'RUN_ROOT=%s\n' "$RUN_ROOT"
+
+# 2. standalone 的设备、模型和开关。
 export ATTENTION_DEVICES=0,1,2,3
 export FFN_DEVICES=4,5
 export ATTENTION_HOST_IP="$HCCL_IF_IP"
@@ -373,6 +417,23 @@ export AFD_HOST="$FFN_HOST_IP"
 export MODEL_PATH="$FLASH_MODEL_PATH"
 export ENABLE_PD=0 ENABLE_DSPARK=0
 export EXECUTION_MODE=full-decode-only U_BATCHES=2
+export AFD_HCCL_STAGE_DIAGNOSTICS=1
+export AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS=0
+export VLLM_LOGGING_LEVEL=INFO
+export AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP=1
+export AFD_HCCL_GRAPH_U2_HYBRID_DAG=1
+export AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM=1
+export AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM=1
+export AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER=1
+export ATTENTION_URL="http://$ATTENTION_HOST_IP:$ATTENTION_API_PORT"
+export BASE_URL="$ATTENTION_URL"
+```
+
+在上述同一终端执行**第 4.4 节采集命令**，保存本轮生效配置，然后紧接着启动：
+
+```bash
+# 3. 启动 FFN 与 Attention；此时 RUN_ROOT 已存在。
+test -d "$RUN_ROOT"
 nohup bash "$RECIPE/afd_ffn.sh" > "$RUN_ROOT/ffn.log" 2>&1 &
 echo $! > "$RUN_ROOT/ffn.pid"
 nohup bash "$RECIPE/afd_attention.sh" > "$RUN_ROOT/attention.log" 2>&1 &

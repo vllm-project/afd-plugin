@@ -129,9 +129,17 @@ PY
 同机 PD 的 P 设备为 0/1，A 设备为 2/3/4/5；三机 P 为 0–7，A 为 0–3。
 资源文件名按物理设备编号，不按角色内 local rank 重编号。仅 PD 的 P/A 检查 HIXL，standalone 和 FFN 不需要此配置；A3 不调用 A5 专用生成函数。
 
-下面是**同机 PD 的启动前配置预检**，不启动模型。先加载实际 node/site 环境并建立新的 `RUN_ROOT`，填写本机路径；Prefill/Attention 同机可在一个终端执行：
+下面是**同机 PD 的启动前配置预检**，不启动模型。先在当前终端完成统一指导书第 3.1 节的环境加载（含 `site.env`、`node.env`、CANN、venv），再执行下面整段。
+`RUN_ROOT` 的初始化放在**本段开头、`export RECIPE=...` 之前**；预检 JSON 就保存在此目录。`RUN_BASE` 来自 `node.env`，本机路径按现场填写。Prefill/Attention 同机在一个终端执行：
 
 ```bash
+: "${RUN_BASE:?先按统一指导书第 3.1 节加载 node.env 中的 RUN_BASE}"
+export RUN_ID="$(date +%Y%m%dT%H%M%S)-single-precheck"
+export RUN_ROOT="$RUN_BASE/$RUN_ID/$(hostname -s)"
+mkdir -p "$RUN_BASE/$RUN_ID"
+mkdir "$RUN_ROOT"
+printf 'RUN_ROOT=%s\n' "$RUN_ROOT"
+
 export RECIPE="$AFD_PLUGIN_ROOT/recipe/npu/P2pHcclAFDConnector/deepseek_v4"
 export ASCEND_LOCAL_COMM_RES_PATH=/etc/hixlep
 export PREFILL_DP_SIZE=2 PREFILL_TP_SIZE=1 ATTENTION_RANKS=4
@@ -154,11 +162,15 @@ PY
 ```
 
 三机预检改为 `PREFILL_DP_SIZE=8`，分别在 P 本机执行 producer/设备 `0,1,2,3,4,5,6,7`，在 A 本机执行 consumer/设备 `0,1,2,3`，使用各自真实的 HIXL 路径。不要只生成预检 JSON 就手工拼接 CLI；正式 launchers 已调用同一函数并打印生效 JSON。
+三机预检的 `RUN_ID` 在协调终端生成一次，改用 `cross-precheck` 后缀，再复制同一值到 P/A；两机分别初始化本机 `RUN_ROOT`，不要各自生成时间戳。
 文件语法可读不代表平台资源已验证；真实 session 要在 A5-04 证明。
 
 ## 4. 【A5 手工执行】A5-03：首先执行 standalone 回归
 
 按统一指导书第 5 节，单台空闲 A5 执行：
+
+第 5 节已将 `RUN_ROOT` 初始化放在设备配置及 `nohup` 启动命令之前。
+在同一终端依次执行“第 3 节环境加载/版本检查 → 第 5 节目录及开关配置 → 第 4.4 节环境采集 → 第 5 节启动命令”。本轮使用新的 standalone RUN_ID，另建目录保存日志。
 
 | 设置 | 本轮值 |
 |---|---|
