@@ -191,7 +191,9 @@ export AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM=1
 export AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER=1
 ```
 
-Attention ready 且两个 FFN rank 进入 loop 后，按第 6.3 节生成 token pool，使用请求脚本添加 `--standalone`，两个 URL 都指向 Attention。通过后按第 7 节正常停服；
+Attention ready 且两个 FFN rank 进入 loop 后，按第 6.3 节生成 token pool，再执行**统一指导书第 5 节列出的完整 Python 请求验证命令**。
+`--standalone` 是 `tools/validation/a5_1030_requests.py` 的参数，已放在该命令中；无需添加到 FFN/Attention 服务启动命令。
+它跳过 Proxy `/healthcheck`/`request_num` 检查；`--base-url` 和 `--attention-url` 均填写 Attention 地址，其他请求验证保留。通过后按第 7 节正常停服；
 收集所有角色/rank 的 capture、在线 replay、stage 0/1 和未捕获 shape eager fallback证据，以及无 fatal、shutdown、NPU/端口清理结果。
 
 本轮没有 PD/DSpark gate。输出 `request_summary.json` 通过但路径或 cleanup 未齐全时，M1 保持 pending。失败先回传此轮证据，不启动同机 C1。

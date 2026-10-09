@@ -440,7 +440,27 @@ nohup bash "$RECIPE/afd_attention.sh" > "$RUN_ROOT/attention.log" 2>&1 &
 echo $! > "$RUN_ROOT/attention.pid"
 ```
 
-使用下一节的 Attention readiness 检查、token pool 和请求脚本，添加 `--standalone`，`--base-url` 与 `--attention-url` 均指向 Attention。验证 capture、在线 replay、全部 Attention rank 的 stage 0/1、未捕获 shape fallback、正常停机及 NPU 清理。
+Attention ready 且两个 FFN rank 进入 loop 后，使用第 6.2 节的 Attention readiness/FFN loop 检查（跳过 Prefill 和 Proxy），并按第 6.3 节生成 token pool。
+
+这里的 **`--standalone` 加在 Python 请求验证脚本 `tools/validation/a5_1030_requests.py` 的命令上**，不加到 `afd_ffn.sh`、`afd_attention.sh` 或 `vllm serve` 的启动命令。
+它是无须填写值的标志，告诉验证脚本本轮没有 Proxy，跳过 Proxy 的 `/healthcheck` 和 `request_num` 检查；其余请求检查及 Attention 请求归零检查保留。
+业务请求的目标由 `--base-url` 决定，`--standalone` 不自动改写 URL，所以两个 URL 都明确填写 Attention 地址。
+
+在当前 standalone 终端执行以下**完整请求验证命令**：
+
+```bash
+export ATTENTION_URL="http://$ATTENTION_HOST_IP:$ATTENTION_API_PORT"
+"$PYTHON_BIN" "$AFD_PLUGIN_ROOT/tools/validation/a5_1030_requests.py" \
+  --standalone \
+  --base-url "$ATTENTION_URL" \
+  --attention-url "$ATTENTION_URL" \
+  --token-pool "$RUN_ROOT/token-pool.json" \
+  --output "$RUN_ROOT/requests" \
+  --run-id "$RUN_ID"
+curl -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/attention-metrics-after.txt"
+```
+
+验证 capture、在线 replay、全部 Attention rank 的 stage 0/1、未捕获 shape fallback、正常停机及 NPU 清理。
 没有 Prefill/Proxy，也不要求 PD/DSpark 证据。完成后全部停服，再恢复同机 P2+A4+F2 设备配置；不得将 standalone 的进程或日志复用到 C1。
 
 ## 6. 【A5 手工执行】第 4 步：每个 C1–C5 的启动、ready 和请求步骤
@@ -549,7 +569,8 @@ Proxy 主机或可达的验证客户端执行；token-pool 文件从 Attention �
 curl -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/attention-metrics-after.txt"
 ```
 
-standalone 回归将 `BASE_URL` 设为 `ATTENTION_URL`，同一条命令添加 `--standalone`。
+上面的命令用于 C1–C5，`BASE_URL` 指向 Proxy，不添加 `--standalone`。
+standalone 回归直接使用第 5 节列出的完整 Python 请求验证命令，其中已添加 `--standalone`，两个 URL 均指向 Attention。
 脚本依赖环境已有的 `httpx`；输出目录必须不存在，避免覆盖旧证据。脚本依次检查：
 
 1. 并发 1、8、32 的短输入和 1024 token 长输入，每条强制输出 64 token 并检查截断；
@@ -557,7 +578,7 @@ standalone 回归将 `BASE_URL` 设为 `ATTENTION_URL`，同一条命令添加 `
 3. 独立 EOS 请求，默认最多 1024 token，必须自然 `finish_reason=stop`；
 4. 正常 SSE，必须有文本、结束原因和 `[DONE]`；
 5. SSE 收到实际文本后关闭客户端连接，随后恢复请求成功；
-6. 60 秒内 Proxy `request_num=0`，Attention 所有已暴露的 running/waiting gauge 为 0。
+6. 60 秒内 Proxy `request_num=0`，Attention 所有已暴露的 running/waiting gauge 为 0；standalone 只跳过 Proxy 检查，仍要求 Attention 请求归零。
 
 每个请求原始响应和 SSE 文件写入 `requests/`，结果为 `request_summary.json`。
 EOS 用例若未自然结束，先冻结合适的 EOS prompt/预算再重跑，不可直接取消 EOS 门禁。
