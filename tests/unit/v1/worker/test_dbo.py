@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import builtins
@@ -14,7 +17,7 @@ from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 
 def test_maybe_apply_dbo_yield_uses_custom_op(monkeypatch):
-    calls = []
+    calls: list[str | tuple] = []
     tensor = object()
 
     monkeypatch.setattr(
@@ -52,7 +55,26 @@ def test_register_dbo_yield_custom_op_declares_input_mutation(monkeypatch):
 
     dbo.register_dbo_yield_custom_op()
 
-    assert len(registrations) == 1
+    dbo.register_dbo_yield_custom_op()
+    assert [item["op_name"] for item in registrations] == [
+        "manual_dbo_yield",
+        "afd_dbo_transfer_begin",
+        "afd_dbo_transfer_end",
+    ]
+    monkeypatch.setattr(
+        dbo, "dbo_switch_to_comm_sync", lambda: yield_calls.append("begin")
+    )
+    monkeypatch.setattr(
+        dbo,
+        "dbo_yield_and_switch_from_comm_to_compute",
+        lambda: yield_calls.append("end"),
+    )
+    for item in registrations[1:]:
+        assert item["mutates_args"] == ["x"]
+        assert item["op_func"](tensor) is None
+        assert item["fake_impl"](tensor) is None
+    assert yield_calls == ["begin", "end"]
+    yield_calls.clear()
     registration = registrations[0]
     assert registration["op_name"] == "manual_dbo_yield"
     assert registration["mutates_args"] == ["x"]
