@@ -329,7 +329,11 @@ def _new_attention_runner():
         AFDNPUAttentionModelRunner,
     )
 
-    return object.__new__(AFDNPUAttentionModelRunner)
+    runner = object.__new__(AFDNPUAttentionModelRunner)
+    runner.afd_config = SimpleNamespace(connector="CAMP2pAFDConnector")
+    runner._afd_cam_async_scheduler = None
+    runner._afd_shutdown = False
+    return runner
 
 
 def test_npu_attention_live_execution_scope_restores_on_success_and_error(
@@ -650,6 +654,12 @@ def test_npu_attention_async_connector_skips_dp_metadata_control_plane():
         async_dp=True,
         data_parallel_size=2,
     )
+    from afd_plugin.model_executor.npu.async_cam_execution import (
+        CAMAsyncUbatchScheduler,
+    )
+
+    runner.afd_config = SimpleNamespace(connector="CAMAsyncAFDConnector")
+    runner._afd_cam_async_scheduler = CAMAsyncUbatchScheduler()
     runner.connector = _AsyncRecordingConnector()
     runner._is_warmup = False
     runner._afd_is_graph_capturing = False
@@ -659,6 +669,7 @@ def test_npu_attention_async_connector_skips_dp_metadata_control_plane():
     forward_context = SimpleNamespace(
         additional_kwargs={},
         dp_metadata=None,
+        flash_comm_v1_enabled=True,
         ubatch_slices=None,
         batch_descriptor=SimpleNamespace(num_tokens=3),
     )
@@ -669,6 +680,17 @@ def test_npu_attention_async_connector_skips_dp_metadata_control_plane():
     assert metadata.tokens_lens == [3]
     assert runner.connector.dp_metadata_updates == []
     assert runner.connector.sent_dp_metadata_lists == []
+
+    execution = forward_context.additional_kwargs["afd_cam_async_execution"]
+    assert execution.num_stages == 1
+    assert execution.stage_idx == 0
+    assert execution.use_sequence_parallel is True
+    assert execution.scheduler is None
+    assert forward_context.additional_kwargs["afd_cam_async_scheduler"] is (
+        runner._afd_cam_async_scheduler
+    )
+    assert not runner._afd_cam_async_scheduler._threads
+    runner._afd_cam_async_scheduler.shutdown()
 
 
 def test_npu_attention_runner_builds_dp_fallback():
@@ -2465,6 +2487,20 @@ def test_npu_async_feature_validation_rejects_native_ubatching(
         )
 
 
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_npu_async_feature_validation_rejects_mixed_placement(role):
+    config = _vllm_config(
+        role=role,
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+    )
+    config.additional_config["mix_placement"] = True
+
+    with pytest.raises(RuntimeError, match="does not support mix_placement"):
+        fail_if_unsupported_npu_afd_features(config)
+
+
 def test_npu_async_feature_validation_allows_dynamic_quant_zero_or_one():
     fail_if_unsupported_npu_afd_features(
         _vllm_config(
@@ -2849,3 +2885,54 @@ def test_npu_attention_runner_afd_ubatching_does_not_install_native_wrapper(
     runner.load_model()
 
     assert events == ["model_load", "connector_init"]
+
+
+def test_npu_attention_shutdown_cancels_before_connector_and_joins(monkeypatch):
+    from afd_plugin.v1.worker.npu import attention_model_runner as module
+
+    runner = _new_attention_runner()
+    calls = []
+    runner.prof = None
+    runner._afd_cam_async_scheduler = SimpleNamespace(
+        cancel=lambda: calls.append("cancel"),
+        shutdown=lambda: calls.append("join"),
+    )
+    runner.connector = SimpleNamespace(close=lambda: calls.append("close"))
+    monkeypatch.setattr(
+        module, "stop_afd_npu_profiler", lambda _: calls.append("profiler")
+    )
+    monkeypatch.setattr(
+        module.NPUModelRunner, "shutdown", lambda _: calls.append("upstream")
+    )
+    runner.shutdown()
+    runner.shutdown()
+    assert calls == ["cancel", "close", "join", "profiler", "upstream"]
+    assert runner._afd_cam_async_scheduler is None
+
+
+def test_npu_attention_shutdown_propagates_live_stage_failure(monkeypatch):
+    from afd_plugin.v1.worker.npu import attention_model_runner as module
+
+    runner = _new_attention_runner()
+    calls = []
+    runner.prof = None
+
+    def fail_join():
+        calls.append("join")
+        raise RuntimeError("process cleanup required")
+
+    scheduler = SimpleNamespace(
+        cancel=lambda: calls.append("cancel"), shutdown=fail_join
+    )
+    runner._afd_cam_async_scheduler = scheduler
+    runner.connector = SimpleNamespace(close=lambda: calls.append("close"))
+    monkeypatch.setattr(
+        module, "stop_afd_npu_profiler", lambda _: calls.append("profiler")
+    )
+    monkeypatch.setattr(
+        module.NPUModelRunner, "shutdown", lambda _: calls.append("upstream")
+    )
+    with pytest.raises(RuntimeError, match="process cleanup required"):
+        runner.shutdown()
+    assert runner._afd_cam_async_scheduler is scheduler
+    assert calls == ["cancel", "close", "join", "profiler", "upstream"]

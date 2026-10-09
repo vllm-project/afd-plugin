@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import inspect
@@ -8,16 +11,15 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
-nn = torch.nn
 
+from torch import nn  # noqa: E402
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config  # noqa: E402
 from vllm.config.multimodal import MultiModalConfig  # noqa: E402
 from vllm.model_executor.models import qwen3_5 as native  # noqa: E402
 from vllm.model_executor.models.utils import StageMissingLayer  # noqa: E402
 
+from afd_plugin.model_executor import remote_moe  # noqa: E402
 from afd_plugin.model_executor.models import qwen3_5 as adapter  # noqa: E402
-from afd_plugin.model_executor.models.deepseek_v2 import (  # noqa: E402
-    AFDAttentionFusedMoE,
-)
 
 
 def test_qwen_adapter_keeps_native_signatures_and_forward_methods():
@@ -38,43 +40,116 @@ def test_qwen_adapter_keeps_native_signatures_and_forward_methods():
     )
 
 
-def test_attention_moe_uses_native_forward_and_parameter_free_proxy():
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_attention_moe_uses_registered_runner_without_local_weights(
+    monkeypatch, renormalize
+):
+    assert inspect.signature(adapter.AFDQwen3_5RemoteExpertsMoE.__init__) == (
+        inspect.signature(native.Qwen3NextSparseMoeBlock.__init__)
+    )
     assert (
         adapter.AFDQwen3_5RemoteExpertsMoE.forward
         is native.Qwen3NextSparseMoeBlock.forward
     )
-    proxy = AFDAttentionFusedMoE(
-        layer_idx=7,
-        is_internal_router=True,
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    config.additional_config["afd"] = {
+        "role": "attention",
+        "connector": "P2pNcclAFDConnector",
+        "compute_gate_on_attention": False,
+    }
+    config.model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(
+            model_type="qwen3_5_moe_text",
+            rms_norm_eps=1e-6,
+            num_experts=4,
+            num_experts_per_tok=2,
+            hidden_size=7,
+            moe_intermediate_size=11,
+            norm_topk_prob=renormalize,
+        ),
+        dtype=torch.float32,
+        enable_return_routed_experts=False,
     )
-    assert list(proxy.parameters()) == []
-
-
-def test_qwen_remote_experts_proxy_preserves_completed_ffn_output_under_tp(
-    monkeypatch,
-):
-    class FakeRemoteExperts(nn.Module):
-        is_internal_router = True
-
-        def forward(self, *, hidden_states, router_logits):
-            assert router_logits is hidden_states
-            return hidden_states + 1
-
-    remote_moe = object.__new__(adapter.AFDQwen3_5RemoteExpertsMoE)
-    nn.Module.__init__(remote_moe)
-    remote_moe.experts = FakeRemoteExperts()
-    remote_moe.tp_size = 2
-    remote_moe.is_sequence_parallel = False
+    config.parallel_config.tensor_parallel_size = 2
+    monkeypatch.setattr(
+        remote_moe, "current_platform", SimpleNamespace(device_type="cuda")
+    )
+    monkeypatch.setattr(
+        adapter.next_native, "get_tensor_model_parallel_world_size", lambda: 2
+    )
     monkeypatch.setattr(
         adapter.next_native,
-        "tensor_model_parallel_all_gather",
-        lambda *_args, **_kwargs: pytest.fail("unexpected TP collective"),
+        "get_ep_group",
+        lambda: SimpleNamespace(
+            device_group=SimpleNamespace(size=lambda: 1), rank_in_group=0
+        ),
     )
-    hidden_states = torch.zeros(2, 4)
 
-    output = remote_moe(hidden_states)
+    def unexpected_local_compute(*args, **kwargs):
+        pytest.fail("Attention must not allocate or compute local experts")
 
-    assert torch.equal(output, hidden_states + 1)
+    for name in (
+        "ReplicatedLinear",
+        "Qwen3NextMLP",
+        "tensor_model_parallel_all_gather",
+    ):
+        monkeypatch.setattr(adapter.next_native, name, unexpected_local_compute)
+    monkeypatch.setattr(
+        adapter.native, "Qwen3NextAttention", lambda *args, **kwargs: nn.Identity()
+    )
+    prefix = "model.layers.7.mlp"
+    with set_current_vllm_config(config):
+        layer = adapter.AFDQwen3_5DecoderLayer(
+            config, layer_type="full_attention", prefix="model.layers.7"
+        )
+    moe = layer.mlp
+    assert type(moe.experts) is remote_moe.AFDRemoteMoERunner
+    assert type(moe.experts.routed_experts) is remote_moe.AFDRemoteRoutedExperts
+    assert moe.experts.is_internal_router
+    assert moe.experts.routed_experts.renormalize is renormalize
+    assert moe.experts.routed_experts.top_k == 2
+    assert moe.experts.routed_experts.hidden_size == 7
+    assert moe.experts.moe_config.intermediate_size_per_partition == 11
+    assert config.compilation_config.static_forward_context == {
+        f"{prefix}.experts": moe.experts
+    }
+    assert config.compilation_config.static_all_moe_layers == [f"{prefix}.experts"]
+    assert list(moe.parameters()) == []
+    assert moe.gate is moe.shared_expert is moe.shared_expert_gate is None
+
+    hidden_states = torch.zeros(2, 7)
+    expected = torch.full_like(hidden_states, 3)
+    events = []
+
+    def send(states, context, **kwargs):
+        assert torch.equal(states, hidden_states)
+        assert context.metadata.layer_idx == 7
+        assert kwargs == {}
+        events.append("send")
+
+    def receive(**kwargs):
+        events.append("recv")
+        return expected
+
+    def yield_stage(states, **kwargs):
+        events.append("yield")
+        return states
+
+    metadata = SimpleNamespace(
+        stage_idx=0,
+        connector=SimpleNamespace(send_attn_output=send, recv_ffn_output=receive),
+    )
+    monkeypatch.setattr(
+        remote_moe, "get_afd_metadata_from_forward_context", lambda: metadata
+    )
+    monkeypatch.setattr(
+        remote_moe, "get_forward_context", lambda: SimpleNamespace(ubatch_idx=0)
+    )
+    monkeypatch.setattr(remote_moe, "maybe_apply_dbo_yield", yield_stage)
+    monkeypatch.setattr(moe.experts, "_forward_entry", unexpected_local_compute)
+    output = moe(hidden_states)
+    assert torch.equal(output, expected)
+    assert events == ["send", "yield", "recv"]
 
 
 def test_ffn_compute_ffn_output_calls_native_internal_router():

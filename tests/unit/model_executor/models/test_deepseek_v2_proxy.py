@@ -12,6 +12,7 @@ pytest.importorskip("vllm")
 from torch import nn  # noqa: E402
 
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, AFDConfig  # noqa: E402
+from afd_plugin.model_executor import remote_moe  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
 
 
@@ -43,12 +44,12 @@ def _install_fake_forward_context(monkeypatch, events, *, stage_idx=2):
     connector = _FakeConnector(events)
     afd_metadata = SimpleNamespace(connector=connector, stage_idx=9)
     monkeypatch.setattr(
-        adapter,
+        remote_moe,
         "get_afd_metadata_from_forward_context",
         lambda: afd_metadata,
     )
     monkeypatch.setattr(
-        adapter,
+        remote_moe,
         "get_forward_context",
         lambda: SimpleNamespace(ubatch_idx=stage_idx),
     )
@@ -57,14 +58,33 @@ def _install_fake_forward_context(monkeypatch, events, *, stage_idx=2):
         events.append(("yield", hidden_states, role))
         return hidden_states
 
-    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", record_yield)
+    monkeypatch.setattr(remote_moe, "maybe_apply_dbo_yield", record_yield)
     return afd_metadata
 
 
-@pytest.mark.parametrize("layer_idx", [0, 1], ids=["dense", "moe"])
+def _forward_only_remote_moe(layer_idx):
+    runner = object.__new__(remote_moe.AFDRemoteMoERunner)
+    nn.Module.__init__(runner)
+    runner.layer_name = f"model.layers.{layer_idx}.mlp.experts"
+    shell = object.__new__(adapter.AFDDeepseekV2RemoteExpertsMoE)
+    nn.Module.__init__(shell)
+    shell.is_sequence_parallel = False
+    shell.routed_scaling_factor = 2.5
+    shell.gate = None
+    shell.shared_experts = None
+    shell.experts = runner
+    return shell
+
+
+@pytest.mark.parametrize(
+    ("layer_idx", "use_remote_runner"),
+    [(0, False), (1, False), (1, True)],
+    ids=["dense-proxy", "moe-proxy", "moe-runner"],
+)
 def test_native_decoder_forward_calls_remote_proxy_once(
     monkeypatch,
     layer_idx,
+    use_remote_runner,
 ):
     events: list[tuple] = []
     afd_metadata = _install_fake_forward_context(monkeypatch, events)
@@ -79,7 +99,11 @@ def test_native_decoder_forward_calls_remote_proxy_once(
     layer.input_layernorm = _PassthroughNorm()
     layer.self_attn = _FakeAttention()
     layer.post_attention_layernorm = _PassthroughNorm()
-    layer.mlp = adapter.RemoteFFNProxy(layer_idx=layer_idx)
+    layer.mlp = (
+        _forward_only_remote_moe(layer_idx)
+        if use_remote_runner
+        else adapter.RemoteFFNProxy(layer_idx=layer_idx)
+    )
 
     hidden_states = torch.full((2, 4), 8.0, dtype=torch.float16)
     output, residual = layer(
@@ -98,6 +122,61 @@ def test_native_decoder_forward_calls_remote_proxy_once(
     assert afd_metadata.stage_idx == 2
     assert torch.equal(output, hidden_states * 0.25)
     assert torch.equal(residual, hidden_states)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7])
+def test_native_moe_boundary_preserves_legacy_transfer(monkeypatch, num_tokens):
+    events: list[tuple] = []
+    _install_fake_forward_context(monkeypatch, events)
+    shell = _forward_only_remote_moe(layer_idx=1)
+    hidden_states = torch.arange(num_tokens * 7, dtype=torch.bfloat16).view(
+        num_tokens,
+        7,
+    )
+
+    legacy_output = adapter.RemoteFFNProxy(layer_idx=1)(hidden_states)
+    output = shell(hidden_states)
+
+    assert shell.forward.__func__ is adapter.native.DeepseekV2MoE.forward
+    assert [event[0] for event in events] == ["send", "yield", "recv"] * 2
+    for sent in (events[0], events[3]):
+        assert sent[1].shape == hidden_states.shape
+        assert sent[1].data_ptr() == hidden_states.data_ptr()
+        assert sent[2].metadata.layer_idx == 1
+        assert sent[2].metadata.stage_idx == 2
+        assert sent[2].metadata.seq_lens == [num_tokens]
+        assert sent[3] == {}
+    assert torch.equal(output, legacy_output)
+
+
+@pytest.mark.npu
+def test_npu_v4_legacy_proxy_passes_ids_through_common_exchange(monkeypatch):
+    pytest.importorskip("vllm_ascend")
+    from afd_plugin.model_executor.models.npu import deepseek_v4 as npu_v4
+    from afd_plugin.model_executor.models.npu import deepseek_v4_attention_gate
+
+    events: list[tuple] = []
+    _install_fake_forward_context(monkeypatch, events)
+    input_ids = torch.tensor([11, 13], dtype=torch.int32)
+    hidden_states = torch.ones(2, 7, dtype=torch.bfloat16)
+    forward_context = SimpleNamespace(ubatch_idx=2)
+    monkeypatch.setattr(npu_v4, "get_forward_context", lambda: forward_context)
+
+    def token_ids(*, forward_context: object, router_tokens: int):
+        assert router_tokens == 2
+        return input_ids
+
+    monkeypatch.setattr(
+        deepseek_v4_attention_gate, "hash_input_ids_from_context", token_ids
+    )
+    output = npu_v4.AFDDeepseekV4RemoteMoE(layer_idx=3)(hidden_states)
+
+    assert [event[0] for event in events] == ["send", "yield", "recv"]
+    assert events[0][2].metadata.layer_idx == 3
+    assert events[0][2].metadata.stage_idx == 2
+    assert set(events[0][3]) == {"input_ids"}
+    assert events[0][3]["input_ids"] is input_ids
+    assert torch.equal(output, hidden_states * 0.25)
 
 
 @pytest.mark.parametrize(
@@ -130,52 +209,38 @@ def test_ffn_compute_applies_dense_fp16_scaling_once(
     assert torch.equal(output, hidden_states * expected_scale)
 
 
-def test_gate_proxy_sends_routing_payload(monkeypatch):
-    from afd_plugin.model_executor.models.npu import deepseek_v2_attention_gate
-
-    events: list[tuple] = []
-    _install_fake_forward_context(monkeypatch, events, stage_idx=1)
-    topk_weights = torch.tensor([[0.75, 0.25]])
-    topk_ids = torch.tensor([[1, 3]])
-    router_logits = torch.tensor([[0.1, 0.2, 0.3, 0.4]])
-    gate_calls = []
-
-    def compute_gate_topk(**kwargs):
-        gate_calls.append(kwargs)
-        return topk_weights, topk_ids, router_logits
-
-    monkeypatch.setattr(
-        deepseek_v2_attention_gate,
-        "compute_gate_topk",
-        compute_gate_topk,
-    )
-    proxy = object.__new__(adapter.GateOnlyRemoteMoE)
-    adapter.RemoteFFNProxy.__init__(proxy, layer_idx=3)
-    proxy.gate = nn.Linear(4, 4, bias=False)
-    proxy.vllm_config = object()
-    proxy.config = object()
-    proxy.top_k = 2
+def test_cam_decoder_returns_attention_without_routing():
     hidden_states = torch.ones(1, 4)
 
-    output = proxy(hidden_states)
+    def unexpected_routing(_states):
+        raise AssertionError("Attention must leave routing to the complete MoE call")
 
-    assert len(gate_calls) == 1
-    assert gate_calls[0]["gate"] is proxy.gate
-    assert [event[0] for event in events] == ["send", "yield", "recv"]
-    send_kwargs = events[0][3]
-    assert send_kwargs["router_logits"] is router_logits
-    assert send_kwargs["topk_ids"] is topk_ids
-    assert send_kwargs["topk_weights"] is topk_weights
-    assert torch.equal(output, hidden_states * 0.25)
+    layer = object.__new__(adapter.AFDDeepseekV2DecoderLayer)
+    nn.Module.__init__(layer)
+    layer.compute_gate_on_attention = True
+    layer.is_moe_layer = True
+    layer.use_mha = True
+    layer.input_layernorm = _PassthroughNorm()
+    layer.self_attn = _FakeAttention()
+    layer.post_attention_layernorm = _PassthroughNorm()
+    layer.mlp = SimpleNamespace(
+        experts=SimpleNamespace(_route_native=unexpected_routing)
+    )
+    output, residual = layer.compute_attn_output(
+        torch.zeros(1, dtype=torch.long), hidden_states, None
+    )
+
+    assert output is hidden_states
+    assert residual is not hidden_states
+    assert torch.equal(residual, hidden_states)
 
 
-def test_remote_experts_proxy_sends_router_logits(monkeypatch):
+def test_remote_experts_runner_sends_router_logits(monkeypatch):
     events: list[tuple] = []
     _install_fake_forward_context(monkeypatch, events, stage_idx=1)
-    proxy = adapter.AFDAttentionFusedMoE(
-        layer_idx=3,
-        is_internal_router=False,
-    )
+    proxy = object.__new__(remote_moe.AFDExternalRoutingMoERunner)
+    nn.Module.__init__(proxy)
+    proxy.layer_name = "model.layers.3.mlp.experts"
     hidden_states = torch.ones(1, 4)
     router_logits = torch.ones(1, 8)
 
@@ -192,7 +257,7 @@ def test_remote_experts_proxy_sends_router_logits(monkeypatch):
 
 def test_remote_proxy_requires_forward_metadata(monkeypatch):
     monkeypatch.setattr(
-        adapter,
+        remote_moe,
         "get_afd_metadata_from_forward_context",
         lambda: None,
     )
@@ -205,7 +270,7 @@ def test_remote_proxy_exchanges_cam_during_profile(monkeypatch):
     events: list[tuple] = []
     _install_fake_forward_context(monkeypatch, events)
     monkeypatch.setattr(
-        adapter,
+        remote_moe,
         "get_forward_context",
         lambda: SimpleNamespace(in_profile_run=True, ubatch_idx=0),
     )
