@@ -157,13 +157,27 @@ ge::graphStatus GroupedMatmulSwigluQuantV2LayeredBaseTiling::ParseInputAndAttr()
     auto groupListTensor = context_->GetDynamicInputTensor(GROUPLIST_INDEX, 0);
     OP_CHECK_NULL_WITH_CONTEXT(context_, groupListTensor);
 
-    // layered: layer_index must be INT64 with shape [1]
+    // layered: layer_index carries the current layer id (INT64, one element). The dtype check stays
+    // here; the shape is deliberately not asserted.
     auto layerTensor = context_->GetDynamicInputTensor(LAYER_INDEX, 0);
     OP_CHECK_NULL_WITH_CONTEXT(context_, layerTensor);
     OP_CHECK_IF(layerTensor->GetDataType() != ge::DataType::DT_INT64,
                 OP_LOGE(context_->GetNodeName(), "layer_index must be INT64."), return ge::GRAPH_FAILED);
-    OP_CHECK_IF(layerTensor->GetStorageShape().GetDimNum() != 1 || layerTensor->GetStorageShape().GetDim(0) != 1,
-                OP_LOGE(context_->GetNodeName(), "layer_index must be a 1-element tensor."), return ge::GRAPH_FAILED);
+    // No shape assertion here, deliberately. layer_index is a REQUIRED input and the storage shape
+    // this host context exposes for it is not the caller's logical [1]: a rank-1 [1] int64 tensor can
+    // arrive here normalized to rank 2 [1, 1], and the observed rank is not stable across runs. An
+    // unconditional `dimNum == 1 && dim(0) == 1` test therefore rejected well-formed calls before
+    // anything reached the device. The count is validated instead where the caller's real logical
+    // shape is available - GetViewShape() at the op_api entry (CheckLayerIndex in
+    // op_api/aclnn_grouped_matmul_swiglu_quant_v2_layered.cpp) - and the value is consumed on device
+    // by LayeredReadLayerIndex, which reads element 0 from GM without consulting any shape. The
+    // device-side read is also bounded against layerNum by GetLayerTensorAddr before the pointer
+    // array is dereferenced.
+    OP_LOGD(context_->GetNodeName(),
+            "GMM_SWIGLU_QUANT TILING: layer_index host storage rank=%zu dim0=%ld (shape not asserted; the "
+            "layer id is validated at the op_api entry and clamped against layerNum on device).",
+            layerTensor->GetStorageShape().GetDimNum(),
+            layerTensor->GetStorageShape().GetDimNum() >= 1 ? layerTensor->GetStorageShape().GetDim(0) : -1L);
 
     // layered: all_weight / all_weight_scale / all_weight_assist_matrix lists must be the same
     // length (one element per layer). The value of layer_index lives on device and cannot be

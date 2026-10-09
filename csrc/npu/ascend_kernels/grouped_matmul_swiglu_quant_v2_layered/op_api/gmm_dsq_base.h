@@ -80,10 +80,16 @@ class GroupedMatmulSwigluQuantBaseHandler : public GroupedMatmulSwigluQuantHandl
             const aclTensor *w = (*gmmDsqParams_.weight)[i];
             const aclTensor *wScale = (*gmmDsqParams_.weightScale)[i];
             op::Format wFormat = w->GetViewFormat();
-            if (IsPrivateFormat(wFormat)) {
-                OP_CHECK_WRONG_DIMENSION(w, WEIGHT_NZ_DIM_LIMIT, return false);
-            } else {
-                OP_CHECK_WRONG_DIMENSION(w, WEIGHT_ND_DIM_LIMIT, return false);
+            // layered: torch_npu keeps an NZ weight's logical view [E, K, N] while its storage is
+            // five-dimensional, so a private view format with a 3-dim view and 5-dim storage is
+            // legal. The A8W4/A4W4 branch already accepts that combination; without the same
+            // exemption here a framework-produced NZ weight is rejected on the A8W8 path.
+            bool logicalNZView = IsPrivateFormat(wFormat) &&
+                                 w->GetViewShape().GetDimNum() == WEIGHT_ND_DIM_LIMIT &&
+                                 w->GetStorageShape().GetDimNum() == WEIGHT_NZ_DIM_LIMIT;
+            if (!logicalNZView) {
+                OP_CHECK_WRONG_DIMENSION(w, (IsPrivateFormat(wFormat) ? WEIGHT_NZ_DIM_LIMIT : WEIGHT_ND_DIM_LIMIT),
+                                         return false);
             }
             OP_CHECK_WRONG_DIMENSION(wScale, WEIGHT_SCALE_DIM_LIMIT, return false);
         }
@@ -165,12 +171,21 @@ class GroupedMatmulSwigluQuantBaseHandler : public GroupedMatmulSwigluQuantHandl
             op::Format wFormat = w->GetViewFormat();
             op::Format storageFormat = w->GetStorageFormat();
             if (IsPrivateFormat(wFormat)) {
-                if (!(w->GetViewShape() == weightNZExpectShape1 || w->GetViewShape() == weightNZExpectShape2)) {
+                const auto &viewShape = w->GetViewShape();
+                const auto &storageShape = w->GetStorageShape();
+                // layered: mirror the A8W4/A4W4 branch. torch_npu keeps an NZ weight's logical
+                // view [E, K, N] while its storage carries the five-dimensional NZ geometry, so
+                // the logical pair must be accepted alongside an explicit NZ view.
+                bool explicitNZView = viewShape == weightNZExpectShape1 || viewShape == weightNZExpectShape2;
+                bool logicalNZView = (viewShape == weightNDExpectShape1 || viewShape == weightNDExpectShape2) &&
+                                     storageShape.GetDimNum() == WEIGHT_NZ_DIM_LIMIT;
+                if (!(explicitNZView || logicalNZView)) {
                     OP_LOGE(ACLNN_ERR_PARAM_INVALID,
-                            "Expected tensor for weight to have same size as %s or %s, but got %s.",
+                            "Expected NZ weight view %s or %s, or an ND logical view over NZ storage, "
+                            "but got view %s and storage %s.",
                             op::ToString(weightNZExpectShape1).GetString(),
                             op::ToString(weightNZExpectShape2).GetString(),
-                            op::ToString(w->GetViewShape()).GetString());
+                            op::ToString(viewShape).GetString(), op::ToString(storageShape).GetString());
                     return false;
                 }
             } else {

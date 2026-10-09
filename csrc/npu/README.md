@@ -139,11 +139,24 @@ yet selected by `CAMAsyncAFDConnector`, which retains its external legacy CAM
 interface.
 
 `grouped_matmul_swiglu_quant_v2_layered` is a fused
-grouped-matmul + SiLU + dynamic-quantization CAM operator (A4W4 / A8W4-MSD
-variants) built for `ascend910_93`. It is registered as
+grouped-matmul + SiLU + dynamic-quantization CAM operator (A8W8 / A4W4 /
+A8W4-MSD variants) built for `ascend910_93`. It is registered as
 `torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered` (inference + Meta; no
 autograd grad) and is excluded from `ascend950` builds. Nothing selects it at
 runtime yet; switching a connector/model path to it is a separate follow-up.
+
+A8W8 accepts an NZ weight as either an explicit five-dimensional view or the
+three-dimensional logical view `npu_format_cast` produces over NZ storage; the
+dimension and shape checks accept both, as the A8W4/A4W4 path already did.
+`layer_index` is validated by element count at the ACLNN entry
+(`GetViewShape().GetShapeSize() == 1`), not by the storage shape the tiling
+context exposes - a rank-1 one-element `int64` tensor can arrive there as rank 2
+`[1, 1]`.
+
+Note both attributes reach the tiling only as data, while the tiling cache is
+keyed on shape and tiling key: calls that share a shape share the first call's
+tiling and its `group_list_type` / `dequant_mode` values. Vary the shape when a
+process needs both values of either attribute.
 
 For CANN 9.0.1, the layered ACLNN entry explicitly registers
 `grouped_matmul_swiglu_quant_v2_layered.json` as a kernel configuration

@@ -48,6 +48,27 @@ class GmmDsqHandlerFactory {
     }
 };
 
+// layered: layer_index is an INT64 tensor carrying exactly one layer id. This is the place to
+// validate it, because GetViewShape() here is the caller's own logical shape while the tiling
+// context sees only a normalized storage shape for this REQUIRED input - a rank-1 [1] int64 tensor
+// can arrive there as rank 2 [1, 1] (and the observed rank is not stable across runs), which is why
+// the rank assertion that used to live in the base tiling had to go (it rejected well-formed calls).
+// The count is what the operator actually relies on: LayeredReadLayerIndex reads element 0 and
+// ignores the shape, so requiring exactly one element accepts both [1] and [1, 1] while still
+// rejecting the two INT64 inputs this could be confused with, group_list [e] and x_scale-shaped [m].
+// Checking here also covers the A8W8 path, which is tiled by the fusion template and therefore never
+// reaches the base handler's own shape checks.
+static aclnnStatus CheckLayerIndex(const aclTensor *layerIndex)
+{
+    CHECK_COND(layerIndex != nullptr, ACLNN_ERR_PARAM_NULLPTR, "layer_index must not be nullptr.");
+    OP_CHECK_DTYPE_NOT_MATCH(layerIndex, DataType::DT_INT64, return ACLNN_ERR_PARAM_INVALID);
+    const op::Shape &layerShape = layerIndex->GetViewShape();
+    CHECK_COND(layerShape.GetShapeSize() == 1, ACLNN_ERR_PARAM_INVALID,
+               "layer_index must carry exactly one layer id, but its shape is %s.",
+               op::ToString(layerShape).GetString());
+    return ACLNN_SUCCESS;
+}
+
 static aclnnStatus aclnnGroupedMatmulSwigluQuantGetWorkspaceSizeCommon(const char *interfaceName,
                                                                        GroupedMatmulSwigluQuantParamsBase &params,
                                                                        uint64_t *workspaceSize,
@@ -63,7 +84,7 @@ static aclnnStatus aclnnGroupedMatmulSwigluQuantGetWorkspaceSizeCommon(const cha
         handler->Initialize(interfaceName, params, workspaceSize, executor);
         return handler->Process();
     } else {
-        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "interfaceName failed: the soc verison is not support");
+        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "interfaceName failed: the soc version is not support");
     }
 
     return ACLNN_ERR_PARAM_INVALID;
@@ -85,6 +106,9 @@ aclnnStatus aclnnGroupedMatmulSwigluQuantV2LayeredGetWorkspaceSize(
                    DFX_IN(x, allWeight, allWeightScale, xScale, groupList, layerIndex), DFX_OUT(output, outputScale));
     CHECK_COND((output != nullptr), ACLNN_ERR_PARAM_INVALID,
                "Expected a proper Tensor but got null for argument output.");
+    // layered: the layer id is validated here, against the caller's logical shape, so that both the
+    // A8W4/A4W4 handler and the A8W8 fusion template are covered by one check (see CheckLayerIndex).
+    CHECK_COND(CheckLayerIndex(layerIndex) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID, "Invalid layer_index.");
     GroupedMatmulSwigluQuantParamsBase params =
         GroupedMatmulSwigluQuantParamsBuilder::Create(x, allWeight, allWeightScale, output, outputScale)
             .SetXScale(xScale)

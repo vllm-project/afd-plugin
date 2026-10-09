@@ -24,8 +24,11 @@ contract are self-consistent for the Meta binding:
 - ``group_list``: token counts per expert ``[E]`` int64
 - ``layer_index``: current layer ``[1]`` int64
 
-Meta dispatch never reaches the op_api input validation, so the A4W4 rule that
-rejects a non-null assist matrix is only observable on the device path.
+Meta dispatch never reaches the op_api input validation, so the layered
+list-and-layer-index contract is enforced in the binding itself
+(``check_lists`` in ``torch_binding_gmm_swiglu_quant.cpp``) and is therefore
+observable on the Meta path. The A4W4 rule that rejects a non-null assist matrix
+is only observable on the device path:
 ``test_gmm_swiglu_quant_v2_layered_a4w4_empty_assist_matrix_runtime`` covers it
 with a two-layer call and an empty assist list (the ``Tensor[]`` schema cannot
 express ``None``). It needs a 910C device and the AFD CANN run package, so it
@@ -33,6 +36,9 @@ is opt-in::
 
     SOC_VERSION=910c AFD_RUN_ASCEND_OP_RUNTIME=1 \\
         pytest tests/unit/compat/npu/test_gmm_swiglu_quant_v2_layered.py
+
+Numerical correctness is covered separately, against the built-in non-layered
+operator: ``tests/npu/test_gmm_swiglu_quant_v2_layered_precision.py``.
 """
 
 from __future__ import annotations
@@ -177,6 +183,103 @@ def test_gmm_swiglu_quant_v2_layered_meta_contract(gmm_runtime: ModuleType) -> N
     assert y_scale_out.dtype == torch.float32
 
     assert all(tensor.device.type == "meta" for tensor in outputs)
+
+
+def test_gmm_swiglu_quant_v2_layered_rejects_bad_layer_index(
+    gmm_runtime: ModuleType,
+) -> None:
+    """layer_index is a single int64 element, not an int32 or a vector.
+
+    This is the binding-level half of the layered GMM bug fixed for the sibling
+    operator (#426/#427): the tiling context only ever sees a normalized storage
+    shape for this REQUIRED input, so the count must be validated against the
+    caller's logical shape. On the device path that happens in the op_api
+    (``CheckLayerIndex``); here it is the binding's ``check_lists``.
+    """
+    torch = gmm_runtime
+    for bad in (
+        torch.zeros((2,), dtype=torch.int64, device="meta"),  # not one element
+        torch.zeros((1,), dtype=torch.int32, device="meta"),  # wrong dtype
+    ):
+        inputs = _build_pertoken_inputs(torch)
+        inputs = (*inputs[:6], bad)
+        with pytest.raises(RuntimeError, match="layer_index"):
+            _invoke_gmm(torch, inputs)
+
+
+def test_gmm_swiglu_quant_v2_layered_rejects_mismatched_list_lengths(
+    gmm_runtime: ModuleType,
+) -> None:
+    """all_weight and all_weight_scale must agree on the layer count."""
+    torch = gmm_runtime
+    x, weight, weight_scale, assist, x_scale, group_list, layer_index = (
+        _build_pertoken_inputs(torch)
+    )
+    # Two layers of weight but one of scale: the per-layer lists disagree.
+    with pytest.raises(RuntimeError, match="same length"):
+        _invoke_gmm(
+            torch,
+            (
+                x,
+                [weight[0], weight[0]],
+                weight_scale,
+                assist,
+                x_scale,
+                group_list,
+                layer_index,
+            ),
+        )
+
+
+def test_gmm_swiglu_quant_v2_layered_rejects_mismatched_assist_length(
+    gmm_runtime: ModuleType,
+) -> None:
+    """An assist list is either absent (empty) or one element per layer."""
+    torch = gmm_runtime
+    x, weight, weight_scale, _assist, x_scale, group_list, layer_index = (
+        _build_pertoken_inputs(torch)
+    )
+    bad_assist = [torch.empty((_E, _N), dtype=torch.float32, device="meta")]
+    with pytest.raises(RuntimeError, match="all_weight_assist_matrix"):
+        _invoke_gmm(
+            torch,
+            (
+                x,
+                [weight[0], weight[0]],
+                [weight_scale[0], weight_scale[0]],
+                bad_assist,
+                x_scale,
+                group_list,
+                layer_index,
+            ),
+        )
+
+
+def test_gmm_swiglu_quant_v2_layered_meta_multi_layer_lists(
+    gmm_runtime: ModuleType,
+) -> None:
+    """A multi-layer call must succeed on the Meta path too.
+
+    The all_* lengths are the layer count, not the expert count, so a two-element
+    list is the two-layer shape and the output geometry must not change with it.
+    """
+    torch = gmm_runtime
+    x, weight, weight_scale, assist, x_scale, group_list, layer_index = (
+        _build_pertoken_inputs(torch)
+    )
+    outputs = _invoke_gmm(
+        torch,
+        (
+            x,
+            [weight[0], weight[0]],
+            [weight_scale[0], weight_scale[0]],
+            assist,
+            x_scale,
+            group_list,
+            layer_index,
+        ),
+    )
+    assert tuple(outputs[0].shape) == (_M, _N // 2)
 
 
 def test_gmm_swiglu_quant_v2_layered_a4w4_empty_assist_matrix_runtime(
