@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 
 set -euo pipefail
 
@@ -100,6 +102,8 @@ case "${PREFILL_TOPOLOGY}" in
     ;;
   *)
     echo "Unknown PREFILL_TOPOLOGY=${PREFILL_TOPOLOGY}" >&2
+    # A sourced script returns; direct execution falls back to exit.
+    # shellcheck disable=SC2317
     return 2 2>/dev/null || exit 2
     ;;
 esac
@@ -119,6 +123,8 @@ case "${PREFILL_NODE_ID}" in
     ;;
   *)
     echo "PREFILL_NODE_ID must be 0 or 1" >&2
+    # A sourced script returns; direct execution falls back to exit.
+    # shellcheck disable=SC2317
     return 2 2>/dev/null || exit 2
     ;;
 esac
@@ -201,6 +207,8 @@ case "${PREFILL_TOPOLOGY}:${PREFILL_NODE_ID}" in
     ;;
   afd_dp4tp2:1)
     echo "afd_dp4tp2 is a single-node topology; launch only PREFILL_NODE_ID=0" >&2
+    # A sourced script returns; direct execution falls back to exit.
+    # shellcheck disable=SC2317
     return 2 2>/dev/null || exit 2
     ;;
   *)
@@ -282,9 +290,9 @@ configure_network() {
 
 validate_topology() {
   case "${PREFILL_MAX_NUM_BATCHED_TOKENS}" in
-    4096 | 8192 | 16384 | 32768 | 65536) ;;
+    4096 | 8192 | 16384 | 32768 | 49152 | 65536) ;;
     *)
-      echo "PREFILL_MAX_NUM_BATCHED_TOKENS must be one of 4096, 8192, 16384, 32768, 65536" >&2
+      echo "PREFILL_MAX_NUM_BATCHED_TOKENS must be one of 4096, 8192, 16384, 32768, 49152, 65536" >&2
       return 1
       ;;
   esac
@@ -305,4 +313,33 @@ validate_topology() {
     echo "PREFILL_DP_START_RANK + PREFILL_DP_SIZE_LOCAL exceeds global PREFILL_DP_SIZE" >&2
     return 1
   fi
+}
+
+# Resolve the bundled workload only for benchmark entrypoints, not deployment.
+prepare_bench_dataset() {
+  if [[ -z "${DSV4_BENCH_DATASET_PATH:-}" ]]; then
+    local cache_dir=${DSV4_BENCH_DATASET_CACHE_DIR:-${REPO_ROOT}/bench_results/dsv4-flash/datasets}
+    DSV4_BENCH_DATASET_PATH=$("${PYTHON}" "${DSV4_FLASH_SCRIPT_DIR}/prepare_bench_dataset.py" \
+      --output "${cache_dir}/formal_0_1_2_vllm_bench.jsonl")
+  fi
+  export DSV4_BENCH_DATASET_PATH
+}
+
+verify_bench_dataset() {
+  "${PYTHON}" - "$1" "$2" <<'PYTHON'
+import hashlib
+import pathlib
+import sys
+
+CHUNK_BYTES = 1024 * 1024
+path = pathlib.Path(sys.argv[1])
+expected = sys.argv[2]
+digest = hashlib.sha256()
+with path.open("rb") as handle:
+    for chunk in iter(lambda: handle.read(CHUNK_BYTES), b""):
+        digest.update(chunk)
+actual = digest.hexdigest()
+if actual != expected:
+    raise SystemExit(f"Dataset SHA-256 mismatch: expected {expected}, got {actual}")
+PYTHON
 }

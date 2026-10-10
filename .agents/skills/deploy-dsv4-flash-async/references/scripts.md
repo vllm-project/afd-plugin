@@ -18,7 +18,9 @@ export DSV4_SCRIPT_DIR="${PWD}/.agents/skills/deploy-dsv4-flash-async/scripts"
 | `run_decode.sh` | PD 的完整 D 服务 |
 | `run_proxy.sh` | 调用已安装 vllm-ascend 的 PD proxy |
 | `curl_test.sh` | 向 proxy 发 chat smoke 请求，REQUEST_TIMEOUT 默认 120 秒 |
-| `run_bench.sh` | 对已启动的 prefill API 做单次性能测试 |
+| `prepare_bench_dataset.py` | 解压内置冻结 JSONL 并校验 SHA256，复用有效缓存 |
+| `run_bench.sh` | 对已启动的 prefill API 做单个 RPS/repeat 性能测试 |
+| `run_bench_sweep.sh` | 对一个已部署 MBT 循环 RPS/repeat，验证固定请求契约 |
 | `stop_local.sh` | 向指定 PID_DIR 记录的本地进程发送终止信号 |
 
 示例（已完成公共环境设置）：
@@ -32,9 +34,8 @@ PREFILL_TOPOLOGY=afd_dp4tp2 PREFILL_NODE_ID=0 \
 PREFILL_TOPOLOGY=ep16 PREFILL_NODE_ID=0 \
   PREFILL_ENABLE_KV_CONNECTOR=0 bash "${DSV4_SCRIPT_DIR}/run_prefill_full.sh"
 
-# 已启动 AFD prefill 的单次 benchmark；数据集由用户提供
+# 已启动 AFD prefill 的单次 benchmark；默认使用内置冻结数据，也可由用户提供
 DSV4_BENCH_HOST="${P_NODE_IP}" \
-DSV4_BENCH_DATASET_PATH=/absolute/path/to/workload.jsonl \
   bash "${DSV4_SCRIPT_DIR}/run_bench.sh" \
   --topology afd_dp4tp2 --chunk-size 8192 --request-rate 4 --repeat 1
 
@@ -42,8 +43,11 @@ DSV4_BENCH_DATASET_PATH=/absolute/path/to/workload.jsonl \
 bash "${DSV4_SCRIPT_DIR}/stop_local.sh"
 ```
 
-benchmark 的数据集需要 vLLM custom JSONL 字段 `prompt` 和 `output_tokens`。
-使用不同于原实验的数据集时，设置真实 `DSV4_BENCH_DATASET_SHA256`；单次脚本只记录该元数据，不主动计算或核验哈希。完整数据集默认全部执行，先确认请求规模。结果默认位于仓库 `bench_results/dsv4-flash`，可用 `DSV4_BENCH_RESULT_ROOT` 覆盖。
+benchmark 默认自动解压 skill 的固定 1536 请求数据集并校验 SHA256。用户也可提供
+custom JSONL，同时设置 `DSV4_BENCH_DATASET_PATH` 和真实
+`DSV4_BENCH_DATASET_SHA256`。压测轮数按实际需求配置 RPS 和重复次数。
+数据契约、缓存路径、自备数据限制和 sweep 用法见 [固定负载压测](benchmark.md)。
+结果默认位于仓库 `bench_results/dsv4-flash`，可用 `DSV4_BENCH_RESULT_ROOT` 覆盖。
 
 ## 来源与本次整理
 
@@ -55,6 +59,8 @@ benchmark 的数据集需要 vLLM custom JSONL 字段 `prompt` 和 `output_token
 - chat smoke 增加连接和请求超时。
 - 移除外部 CAM vendor 路径和 libopapi 预加载配置；通信算子随插件 pip 安装编译，由运行时 loader 加载。
 
-未复制历史实验 runner、打包/绘图/审计脚本、日志或数据集。原 `run_bench_sweep.sh` 绑定特定数据集规模和零失败验收，未纳入这个通用部署 skill。PD proxy 仍依赖所选 vllm-ascend checkout 的实现。
+压测入口纳入固定 formal_0/1/2 数据、许可证与署名，以及绑定该负载的 sweep 验收；
+部署/压测 MBT 白名单加入 49152。未复制个人实验编排器、日志、PID、
+结果或打包/绘图脚本。PD proxy 仍依赖所选 vllm-ascend checkout 的实现。
 
 这些脚本无 dry-run 参数。静态检查使用 `bash -n`；命令生成验证用临时 mock CLI，不能据此声称 NPU 上服务已验证。

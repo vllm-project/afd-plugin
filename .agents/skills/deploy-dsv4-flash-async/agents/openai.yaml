@@ -1,4 +1,4 @@
 interface:
   display_name: "DSV4-Flash Async 部署"
-  short_description: "整理和执行 DSV4-Flash 的 AFD、非 AFD 与 PD 分离部署"
-  default_prompt: "使用 $deploy-dsv4-flash-async，基于本地参考脚本准备 DSV4-Flash 部署配置并按所选模式验证。"
+  short_description: "执行 DSV4-Flash 部署、验收和固定数据 RPS/MBT 压测"
+  default_prompt: "使用 $deploy-dsv4-flash-async，准备 DSV4-Flash 部署配置、验收服务，并按需求运行固定负载 RPS/MBT 压测。"

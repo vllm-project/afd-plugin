@@ -24,7 +24,7 @@ export LOG_DIR=/absolute/path/to/logs/unique-deployment-id
 export PID_DIR="${LOG_DIR}/pids"
 ```
 
-上面的数值是初始配置示例，不是容量承诺。参考脚本允许 chunk 为 4096/8192/16384/32768/65536；上下文、并发和 chunk 调大前检查容量。`legacy` 默认上下文为 1048576，其他列出的实验拓扑为 65536，因此建议显式设置，PD 的 P/D 也保持一致。
+上面的数值是初始配置示例，不是容量承诺。参考脚本允许 chunk 为 4096/8192/16384/32768/49152/65536；上下文、并发和 chunk 调大前检查容量。`legacy` 默认上下文为 1048576，其他列出的实验拓扑为 65536，因此建议显式设置，PD 的 P/D 也保持一致。
 
 ## 通信算子的安装与加载
 
@@ -84,3 +84,5 @@ curl -fsS --max-time 120 "http://${P_NODE_IP}:${PREFILL_PORT:-7100}/v1/completio
 日志默认命名：`prefill_attention_nodeN.log`、`prefill_ffn_nodeN.log`、`prefill_<topology>_nodeN.log`、`decode.log`、`proxy.log`。源码默认 LOG_DIR 是脚本目录下 logs，但多轮部署应使用独立目录避免覆盖。
 
 性能测试另行确认数据集及实际 chunk。`run_bench.sh` 默认读取完整定制数据集、输出一个 token，并把 `kv_connector=false` 写入元数据，不直接用于 PD 性能结论。传入 `--chunk-size` 是 benchmark 标签，不会修改运行中的服务配置。保留失败请求与原始结果，不用重跑挑选最好值。
+
+内置固定数据集、校验规则和 RPS/MBT sweep 用法见 [固定负载压测](benchmark.md)。
