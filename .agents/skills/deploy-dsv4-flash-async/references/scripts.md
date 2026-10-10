@@ -34,7 +34,7 @@ PREFILL_TOPOLOGY=afd_dp4tp2 PREFILL_NODE_ID=0 \
 PREFILL_TOPOLOGY=ep16 PREFILL_NODE_ID=0 \
   PREFILL_ENABLE_KV_CONNECTOR=0 bash "${DSV4_SCRIPT_DIR}/run_prefill_full.sh"
 
-# 已启动 AFD prefill 的单次 benchmark；默认使用内置冻结数据
+# 已启动 AFD prefill 的单次 benchmark；默认使用内置冻结数据，也可由用户提供
 DSV4_BENCH_HOST="${P_NODE_IP}" \
   bash "${DSV4_SCRIPT_DIR}/run_bench.sh" \
   --topology afd_dp4tp2 --chunk-size 8192 --request-rate 4 --repeat 1
@@ -43,8 +43,10 @@ DSV4_BENCH_HOST="${P_NODE_IP}" \
 bash "${DSV4_SCRIPT_DIR}/stop_local.sh"
 ```
 
-benchmark 默认自动解压 skill 的固定 1536 请求数据集并校验 SHA256。数据契约、
-缓存路径、自备数据覆盖和 60 轮 MBT/RPS 矩阵见 [固定负载压测](benchmark.md)。
+benchmark 默认自动解压 skill 的固定 1536 请求数据集并校验 SHA256。用户也可提供
+custom JSONL，同时设置 `DSV4_BENCH_DATASET_PATH` 和真实
+`DSV4_BENCH_DATASET_SHA256`。压测轮数按实际需求配置 RPS 和重复次数。
+数据契约、缓存路径、自备数据限制和 sweep 用法见 [固定负载压测](benchmark.md)。
 结果默认位于仓库 `bench_results/dsv4-flash`，可用 `DSV4_BENCH_RESULT_ROOT` 覆盖。
 
 ## 来源与本次整理
