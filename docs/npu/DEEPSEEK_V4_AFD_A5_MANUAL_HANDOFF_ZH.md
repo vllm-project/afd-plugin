@@ -123,6 +123,7 @@ PY
 - 三个源码提交与 dirty state，Python 安装位置，镜像 digest，驱动/CANN/HCCL 精确 build。
 - 空闲且健康的 NPU，容器可见 NIC/IP，所有角色地址、端口范围及路由。
 - Flash/DSpark 配套原始 config、权重 manifest/hash，真实 block size 与 target layer IDs。
+- DSpark 点在 Attention 节点按统一指导书第 3.3 节检查 `ascend_ops` 及两个 fused attention NPU kernel；使用服务的同一个 Python/venv，缺依赖时不启动 C2/C4/C5。
 - A5 Prefill/Attention 的本机资源目录；对应物理设备的 endpoint JSON 与设备匹配。
 - 离线 GSM8K/task 配置、题目数、prompt/fewshot、解码参数、评分键及最低分数；最低分必须由现场在运行前确定，本地不代填验收阈值。
 

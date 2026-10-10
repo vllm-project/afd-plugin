@@ -116,6 +116,7 @@ git status --short
 ### 3.1 每个节点准备两个配置文件
 
 所有节点共用同一份 `site.env`，示例地址和模型路径必须替换。不要直接运行示例 IP。
+本文现场日志检索统一使用 `grep`，无需在容器安装 ripgrep。
 三个角色在 DSpark 点使用相同配套 checkpoint，只有 Attention 开启 speculative config。固定 vLLM 0.23 栈通过兼容入口 `method=mtp` 加载 DSpark；不能因日志显示 `mtp` 就判成普通 MTP，须结合 checkpoint 的 `dspark_block_size`、四个 `AscendDSparkProposer`/drafter 和本轮 proposed/accepted 增量确认。
 
 ```bash
@@ -235,7 +236,7 @@ for module, package in [('torch', 'torch'), ('torch_npu', 'torch-npu'),
     print(package, version(package), item.__file__)
 PY
 "$VLLM_BIN" serve --help=all > /tmp/dsv4-1030-serve-help.txt
-rg -n 'kv-transfer|speculative|enable-dbo|no-async|cudagraph' /tmp/dsv4-1030-serve-help.txt
+grep -nE 'kv-transfer|speculative|enable-dbo|no-async|cudagraph' /tmp/dsv4-1030-serve-help.txt
 npu-smi info
 ```
 
@@ -268,6 +269,59 @@ PY
 
 已有可信、未改动的 DSpark 目录时，直接指定该目录并记录 hash，跳过 view 创建。
 recipe 还须通过 native A5 FP8 checkpoint 检查。冻结 target/draft 权重来源、配置、index 和交付权重 manifest 的 SHA256；不能用配置 hash 代替权重一致性证据。
+
+### 3.3 【A5 手工执行】C2/C4/C5 的 DSpark 算子依赖检查
+
+在 Attention 节点使用启动服务的同一个 `PYTHON_BIN`，加载同一 CANN/venv 后、启动任何本轮服务前执行。固定 vLLM-Ascend `11ee45653` 的 DSpark 模型构造函数会导入外部 `ascend_ops`，并从 `_ascend_dsv4`、`_ascend_v4` 或 `custom` 命名空间查找两个 fused attention 算子。仅能导入 vLLM-Ascend 或通过 C1 不足以证明这项依赖就绪。
+
+```bash
+"$PYTHON_BIN" - <<'PY'
+import importlib
+import sys
+import torch
+import torch_npu
+from importlib.metadata import packages_distributions, version
+
+print('python:', sys.executable, flush=True)
+module = importlib.import_module('ascend_ops')
+print('ascend_ops:', module.__file__)
+for package in packages_distributions().get('ascend_ops', []):
+    print('distribution:', package, version(package))
+for name in ('npu_sparse_attn_sharedkv', 'npu_sparse_attn_sharedkv_metadata'):
+    for namespace in ('_ascend_dsv4', '_ascend_v4', 'custom'):
+        qualified = f'{namespace}::{name}'
+        if torch._C._dispatch_has_kernel(qualified):
+            if not torch._C._dispatch_has_kernel_for_dispatch_key(qualified, 'PrivateUse1'):
+                raise RuntimeError(f'DSpark selected operator lacks an NPU kernel: {qualified}')
+            print('NPU kernel:', qualified)
+            break
+    else:
+        raise RuntimeError(f'DSpark NPU kernel is missing: {name}')
+print('DSpark operator import/registration check passed')
+PY
+```
+
+若报 `No module named 'ascend_ops'`，先检查模块是否只装在另一 Python 环境，或现场是否已有配套离线 wheel。`AFD_BUILD_ASCEND_OPS=0` 只关闭 afd-plugin 的 CAMP2P A2E/E2A 扩展构建，与 DSpark 的 `ascend_ops` 是不同依赖；改成 1 不会补齐本错误。固定版本在 A5 上禁用通用自定义算子路径，不能仅以 `_C_ascend` 中存在同名绑定就替换当前 DSpark 依赖。
+
+```bash
+# 查找现场已有的 Python 包、扩展或离线 wheel；不要求安装 grep 之外的检索工具。
+find /home /opt /data /usr/local -type f \
+  \( -path '*/ascend_ops/__init__.py' -o -name 'ascend_ops*.so' \
+     -o -name 'ascend_ops*.whl' -o -name 'ascend-ops*.whl' \) \
+  -print 2>/dev/null || true
+```
+
+**仅在配套包来源和兼容性已确认后安装**：wheel 必须匹配现场 CPU 架构、Python 3.12、torch/torch_npu 2.10、冻结 CANN build 和 Ascend950，且包含以上两个 NPU kernel；不从名称相近的公开包猜测安装。若 wheel 已在容器，执行：
+
+```bash
+export DSPARK_OPS_WHEEL=/data/packages/填写已确认的配套wheel文件名.whl
+test -f "$DSPARK_OPS_WHEEL"
+sha256sum "$DSPARK_OPS_WHEEL"
+"$PYTHON_BIN" -m pip install --no-index --no-deps "$DSPARK_OPS_WHEEL"
+# 随后重新执行本节的 Python import/registration 检查。
+```
+
+缺少已确认的包时先回传查找输出，C2/C4/C5 保持 blocked。导入和注册通过后记录包来源/版本/hash，使用新的 run ID 冷启动 C2；这项预检仍需由实际 draft 加载及在线 proposed/accepted 增量完成实机验证。
 
 ## 4. 【A5 手工执行】第 2 步：选择拓扑、验证点和新运行目录
 
@@ -526,12 +580,12 @@ curl --noproxy '*' -fsS "http://$ATTENTION_HOST_IP:$ATTENTION_API_PORT/v1/models
 FFN 节点要求两个 rank 均进入 connector loop。计数只作初筛，最终核对 rank 身份，重复日志不能充当另一个 rank：
 
 ```bash
-rg -n 'AFD FFN EngineCore started; workers run connector loop.' "$RUN_ROOT/ffn.log"
-test "$(rg -c 'AFD FFN EngineCore started; workers run connector loop.' "$RUN_ROOT/ffn.log")" -ge 2
-rg -n 'AFD HCCL diagnostics configuration:' "$RUN_ROOT/attention.log" "$RUN_ROOT/ffn.log"
+grep -nF 'AFD FFN EngineCore started; workers run connector loop.' "$RUN_ROOT/ffn.log"
+test "$(grep -cF 'AFD FFN EngineCore started; workers run connector loop.' "$RUN_ROOT/ffn.log" || true)" -ge 2
+grep -nF 'AFD HCCL diagnostics configuration:' "$RUN_ROOT/attention.log" "$RUN_ROOT/ffn.log"
 ```
 
-上一个 `rg` 在三机分别对本机日志执行。Graph 点逐 rank 核对最终五个 Graph 开关与本轮配置一致：默认均为 1，显式关闭项应为 0；配置与生效值不一致时返回 M1，不开始流量。`8911` 是 FFN 内部设置，不是 HTTP健康接口。
+上一个 `grep` 在三机分别对本机日志执行。Graph 点逐 rank 核对最终五个 Graph 开关与本轮配置一致：默认均为 1，显式关闭项应为 0；配置与生效值不一致时返回 M1，不开始流量。`8911` 是 FFN 内部设置，不是 HTTP健康接口。
 单个 Attention HTTP API 的 health 只作入口检查，另需核对四个 Attention rank ready、四个 drafter（DSpark 点）及两个 FFN rank ready。
 
 Prefill/Attention ready 且 FFN loop 完整后，在 Proxy 主机执行：
@@ -657,11 +711,11 @@ EOS 用例若未自然结束，先冻结合适的 EOS prompt/预算再重跑，�
 辅助检索命令（现场可能有不同日志措辞，不能把关键词命中直接写成通过）：
 
 ```bash
-rg -n -i 'mooncake|session|transfer|first.token|kv' "$RUN_ROOT"/*.log \
+grep -nEi 'mooncake|session|transfer|first.token|kv' "$RUN_ROOT"/*.log \
   > "$RUN_ROOT/pd-evidence-candidates.txt" || true
-rg -n -i 'stage=0|stage=1|stage 0|stage 1|replay|fallback|capture|draft|specul|verify' \
+grep -nEi 'stage=0|stage=1|stage 0|stage 1|replay|fallback|capture|draft|specul|verify' \
   "$RUN_ROOT"/*.log > "$RUN_ROOT/feature-evidence-candidates.txt" || true
-rg -n -i 'Traceback|EngineCore.*fatal|out of memory|OOM|timeout|watchdog|507[0-9]{3}|ERR99999' \
+grep -nEi 'Traceback|EngineCore.*fatal|out of memory|OOM|timeout|watchdog|507[0-9]{3}|ERR99999' \
   "$RUN_ROOT"/*.log > "$RUN_ROOT/error-candidates.txt" || true
 ```
 
@@ -690,7 +744,7 @@ FFN 节点等待最多 60 秒，逐 rank 核对 shutdown，然后停止仍存活
 
 ```bash
 deadline=$((SECONDS + 60))
-until [[ "$(rg -c 'AFD NPU FFN received Attention shutdown payload' "$RUN_ROOT/ffn.log" || true)" -ge 2 ]]; do
+until [[ "$(grep -cF 'AFD NPU FFN received Attention shutdown payload' "$RUN_ROOT/ffn.log" || true)" -ge 2 ]]; do
   if ((SECONDS >= deadline)); then
     printf 'shutdown gate failed\n' > "$RUN_ROOT/shutdown-failed.txt"
     break
