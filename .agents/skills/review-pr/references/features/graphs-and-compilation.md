@@ -17,7 +17,7 @@ Designs: `docs/design/module/attention_runtime.md`,
   or mixed batches; the FULL_DECODE_ONLY gate stays enforced where the
   connector contract declares it.
 - Keep ACL graph patches pinned: `mla_graph` patches
-  `vllm_ascend/attention/mla_v1.py` at commit `80d8c194f` — apply the patch
+  the target's documented Ascend attention source — apply the patch
   contract (markers, upstream source, signature parity) and re-verify the copy
   against that ref.
 - Preserve the eager escape hatch: every graph path has a tested eager

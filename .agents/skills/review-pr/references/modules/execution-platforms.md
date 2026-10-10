@@ -23,8 +23,8 @@ patch application ([npu-compat.md](npu-compat.md)).
 - Pair `csrc/` kernel changes (a2e/e2a hosts and kernels) with the torch
   adapter/extension updates they require, and state accuracy and performance
   impact; kernel behavior changes need NPU evidence, never simulation.
-- Keep version pins coherent: vLLM 0.26.0 (`TARGET_VLLM_VERSION`) and
-  vLLM-Ascend `80d8c194f` move together across the compat gate, docker base
+- Keep the target's version pins coherent: `TARGET_VLLM_VERSION` and
+  the documented vLLM-Ascend ref move together across the compat gate, docker base
   image, docs, and design-page `upstream_refs`, or the PR states why not.
 - Keep GPU path parity visible: `csrc/gpu/` is reserved — a PR adding GPU
   native ops must state where the GPU counterpart lives.

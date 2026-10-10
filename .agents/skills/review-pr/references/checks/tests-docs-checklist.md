@@ -21,7 +21,7 @@ The template requires Purpose / Issue / Scope / Implementation Notes / Test
 Plan / Test Result / Docs Impact, plus the Essential PR Checklist. Verify the
 high-signal items rather than restating them:
 
-- vLLM 0.26.0 compatibility considered; no vLLM source-checkout changes.
+- Target-pinned vLLM compatibility considered; no vLLM source-checkout changes.
 - Plugin-owned classes or dotted paths preferred over monkey patches; any
   shim isolated, idempotent, version-guarded, documented, tested.
 - Imports remain CPU-safe; CUDA-heavy work delayed or GPU-gated.
