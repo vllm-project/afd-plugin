@@ -220,3 +220,50 @@ run_role_service() {
         assert config["kv_connector_extra_config"]["ascend_local_comm_res_path"] == str(
             resources
         )
+
+
+def test_attention_dspark_uses_v023_mtp_compat_method(local_env, tmp_path):
+    env, _ = local_env
+    recipe_copy = tmp_path / "recipe"
+    shutil.copytree(RECIPE, recipe_copy)
+    with (recipe_copy / "common.sh").open("a") as file:
+        file.write("""
+# Test-only substitutes for model/runtime imports and service startup.
+validate_model_config() { :; }
+preflight_role() { configure_execution; }
+run_role_service() {
+  "$PYTHON_BIN" -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "$@"
+}
+""")
+
+    model = tmp_path / "dspark-model"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"dspark_block_size": 5}))
+    env.update(
+        MODEL_PATH=str(model),
+        NIC_NAME="test0",
+        HCCL_IF_IP="192.0.2.1",
+        ENABLE_PD="0",
+        ENABLE_DSPARK="1",
+        ATTENTION_DEVICES="2,3,4,5",
+        FFN_DEVICES="6,7",
+        EXECUTION_MODE="eager",
+        U_BATCHES="1",
+    )
+    env.pop("ASCEND_LOCAL_COMM_RES_PATH")
+
+    result = subprocess.run(
+        ["bash", str(recipe_copy / "afd_attention.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    argv = json.loads(result.stdout.splitlines()[-1])
+    config = json.loads(argv[argv.index("--speculative-config") + 1])
+    assert config == {
+        "method": "mtp",
+        "num_speculative_tokens": 5,
+        "draft_sample_method": "greedy",
+        "enforce_eager": True,
+    }

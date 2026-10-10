@@ -232,7 +232,9 @@ Use a native A5 DeepSeek-V4 checkpoint satisfying the preflight contract above.
 For DSpark cases, `MODEL_PATH` must be the DSpark checkpoint whose
 `config.json` declares `dspark_block_size`. Use the same checkpoint and runtime
 on all three roles. Attention derives `num_speculative_tokens` from that value
-and runs DSpark eager even when target Decode uses Graph.
+and runs DSpark eager even when target Decode uses Graph. In the pinned vLLM
+0.23 stack, the launcher passes the compatibility method `mtp`; vLLM-Ascend
+selects `AscendDSparkProposer` from the checkpoint's `dspark_block_size` marker.
 
 ### A5-only Mooncake HIXL configuration
 

@@ -56,7 +56,9 @@ if [[ "${ENABLE_DSPARK:-0}" == 1 ]]; then
   DSPARK_BLOCK_SIZE="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["dspark_block_size"])' "$MODEL_PATH/config.json")"
   [[ "$DSPARK_BLOCK_SIZE" =~ ^[1-9][0-9]*$ ]] \
     || afd_die "MODEL_PATH must be a DSpark checkpoint with dspark_block_size"
-  DSPARK_CONFIG="$(printf '{"method":"dspark","num_speculative_tokens":%s,"draft_sample_method":"greedy","enforce_eager":true}' "$DSPARK_BLOCK_SIZE")"
+  # The pinned vLLM 0.23 schema exposes DSpark through the MTP method. The
+  # Ascend runtime selects AscendDSparkProposer from the checkpoint marker.
+  DSPARK_CONFIG="$(printf '{"method":"mtp","num_speculative_tokens":%s,"draft_sample_method":"greedy","enforce_eager":true}' "$DSPARK_BLOCK_SIZE")"
   DSPARK_ARGS=(--speculative-config "$DSPARK_CONFIG")
 fi
 

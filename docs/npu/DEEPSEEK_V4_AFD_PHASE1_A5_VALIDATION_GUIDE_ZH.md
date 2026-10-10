@@ -116,7 +116,7 @@ git status --short
 ### 3.1 每个节点准备两个配置文件
 
 所有节点共用同一份 `site.env`，示例地址和模型路径必须替换。不要直接运行示例 IP。
-三个角色在 DSpark 点使用相同配套 checkpoint，只有 Attention 开启 speculative config。
+三个角色在 DSpark 点使用相同配套 checkpoint，只有 Attention 开启 speculative config。固定 vLLM 0.23 栈通过兼容入口 `method=mtp` 加载 DSpark；不能因日志显示 `mtp` 就判成普通 MTP，须结合 checkpoint 的 `dspark_block_size`、四个 `AscendDSparkProposer`/drafter 和本轮 proposed/accepted 增量确认。
 
 ```bash
 # site.env：所有节点一致，填写后冻结 SHA256。
@@ -145,6 +145,7 @@ export DSPARK_MODEL_PATH=/home/models/DeepSeek-V4-Flash-DSpark
 export AFD_EXPECTED_COMMIT='填写M1冻结后的完整提交'
 export MAX_MODEL_LEN=4096
 export MAX_NUM_SEQS=32
+export GPU_MEMORY_UTILIZATION=0.91
 export ATTENTION_MAX_NUM_BATCHED_TOKENS=4096
 export FFN_MAX_NUM_BATCHED_TOKENS=8192
 export PREFILL_MAX_NUM_BATCHED_TOKENS=4096
@@ -155,7 +156,7 @@ export DBO_PREFILL_TOKEN_THRESHOLD=12
 export ENABLE_MTP=0
 ```
 
-`MAX_NUM_SEQS=32` 是本次请求覆盖配置，必须在 M1 冻结并实测 HBM；现有 recipe 默认 8。若现场只能使用 8，须明确区分“32 个客户端并发”和“32 个活跃序列”，并记录队列行为；不能用排队成功代替未捕获 shape 的 Graph fallback 证据。
+`MAX_NUM_SEQS=32` 是本次请求覆盖配置，必须在 M1 冻结并实测 HBM；现有 recipe 默认 8。若现场只能使用 8，须明确区分“32 个客户端并发”和“32 个活跃序列”，并记录队列行为；不能用排队成功代替未捕获 shape 的 Graph fallback 证据。A5 DSpark checkpoint 在 `GPU_MEMORY_UTILIZATION=0.90` 时实测 Prefill 仅余 1.63 GiB KV cache，低于 4096 所需的 1.70 GiB，因此本矩阵冻结为 0.91；C1–C5 使用同一值，不以降低 `MAX_MODEL_LEN` 绕过。
 
 `node.env` 是本机配置，各节点可以不同，分别保存 SHA256；不再要求本机路径/IP 不同的所有 env 文件字节完全相同。
 
@@ -237,6 +238,8 @@ PY
 rg -n 'kv-transfer|speculative|enable-dbo|no-async|cudagraph' /tmp/dsv4-1030-serve-help.txt
 npu-smi info
 ```
+
+进入新 run 前，目标 NPU 不得有遗留业务进程，空闲 HBM 应回到各卡一致的现场基线；任一卡明显偏高时先清理并重新采集 `npu-before.txt`。例如其他卡约 4.9 GiB 而单卡仍为 56 GiB，不能作为独立冷启动继续执行。
 
 记录镜像 digest、驱动、CANN 和独立 HCCL 包名/版本/build/来源；保存镜像或安装包提供的版本清单及查询原始输出。只写“最新 HCCL”不通过。所有节点须使用同一冻结软件组合及模型 manifest；CANN 不混装，后续性能 trace 的解析器版本与采集版本匹配。
 
@@ -374,7 +377,7 @@ names = '''RUN_ID TOPOLOGY CASE CYCLE IMAGE_DIGEST CANN_ROOT CANN_BUILD HCCL_PAC
 ASCEND_LOCAL_COMM_RES_PATH MODEL_PATH PREFILL_HOST_IP ATTENTION_HOST_IP FFN_HOST_IP
 PROXY_HOST_IP HCCL_IF_IP NIC_NAME PREFILL_DEVICES ATTENTION_DEVICES FFN_DEVICES
 PREFILL_DP_SIZE ATTENTION_RANKS FFN_RANKS PREFILL_API_PORT ATTENTION_API_PORT PROXY_PORT
-PREFILL_KV_PORT DECODE_KV_PORT AFD_HOST AFD_PORT MAX_NUM_SEQS MAX_MODEL_LEN
+PREFILL_KV_PORT DECODE_KV_PORT AFD_HOST AFD_PORT MAX_NUM_SEQS MAX_MODEL_LEN GPU_MEMORY_UTILIZATION
 EXECUTION_MODE U_BATCHES ENABLE_PD ENABLE_DSPARK AFD_HCCL_STAGE_DIAGNOSTICS
 AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP
 AFD_HCCL_GRAPH_U2_HYBRID_DAG AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM
