@@ -48,8 +48,7 @@ PD_KV_DECODE_PORT=${PD_KV_DECODE_PORT:-30100}
 
 # AFD benchmark layouts use two 16-NPU 910C nodes. Node 0 owns 16 Attention
 # ranks in the original layouts; TP2 layouts reserve unused devices idle.
-# Node 1 owns all 8 FFN ranks, normally on devices 8-15.
-# afd_dp3tp4_ep8 uses Attention-only node 0 and FFN-only node 1 (devices 0-7).
+# Node 1 always owns all 8 FFN ranks on devices 8-15.
 # Keep "legacy" for the original single-node DP2TP4 + EP8 layout.
 PREFILL_TOPOLOGY=${PREFILL_TOPOLOGY:-legacy}
 PREFILL_NODE_ID=${PREFILL_NODE_ID:-0}
@@ -81,12 +80,6 @@ case "${PREFILL_TOPOLOGY}" in
     PREFILL_TP_SIZE=${PREFILL_TP_SIZE:-2}
     NUM_ATTENTION_RANKS=${NUM_ATTENTION_RANKS:-8}
     ATTN_RANKS_PER_DP=${ATTN_RANKS_PER_DP:-2}
-    ;;
-  afd_dp3tp4_ep8)
-    PREFILL_DP_SIZE=${PREFILL_DP_SIZE:-3}
-    PREFILL_TP_SIZE=${PREFILL_TP_SIZE:-4}
-    NUM_ATTENTION_RANKS=${NUM_ATTENTION_RANKS:-12}
-    ATTN_RANKS_PER_DP=${ATTN_RANKS_PER_DP:-4}
     ;;
   legacy)
     PREFILL_DP_SIZE=${PREFILL_DP_SIZE:-2}
@@ -137,21 +130,6 @@ case "${PREFILL_NODE_ID}" in
 esac
 
 case "${PREFILL_TOPOLOGY}:${PREFILL_NODE_ID}" in
-  afd_dp3tp4_ep8:0)
-    PREFILL_START_FFN=${PREFILL_START_FFN:-0}
-    PREFILL_START_ATTENTION=${PREFILL_START_ATTENTION:-1}
-    PREFILL_DP_SIZE_LOCAL=${PREFILL_DP_SIZE_LOCAL:-3}
-    PREFILL_DP_START_RANK=${PREFILL_DP_START_RANK:-0}
-    PREFILL_ATTN_VISIBLE_DEVICES=${PREFILL_ATTN_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11}
-    ;;
-  afd_dp3tp4_ep8:1)
-    # This node owns only FFN; all three Attention DP replicas are on node 0.
-    PREFILL_START_FFN=${PREFILL_START_FFN:-1}
-    PREFILL_START_ATTENTION=${PREFILL_START_ATTENTION:-0}
-    PREFILL_DP_SIZE_LOCAL=${PREFILL_DP_SIZE_LOCAL:-0}
-    PREFILL_DP_START_RANK=${PREFILL_DP_START_RANK:-0}
-    PREFILL_FFN_VISIBLE_DEVICES=${PREFILL_FFN_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
-    ;;
   afd_dp12tp2:0)
     PREFILL_START_FFN=${PREFILL_START_FFN:-0}
     PREFILL_DP_SIZE_LOCAL=${PREFILL_DP_SIZE_LOCAL:-8}
@@ -239,7 +217,6 @@ case "${PREFILL_TOPOLOGY}:${PREFILL_NODE_ID}" in
     PREFILL_START_FFN=${PREFILL_START_FFN:-1}
     ;;
 esac
-PREFILL_START_ATTENTION=${PREFILL_START_ATTENTION:-1}
 PREFILL_FFN_VISIBLE_DEVICES=${PREFILL_FFN_VISIBLE_DEVICES:-8,9,10,11,12,13,14,15}
 PREFILL_ENABLE_KV_CONNECTOR=${PREFILL_ENABLE_KV_CONNECTOR:-0}
 
@@ -249,7 +226,7 @@ DECODE_TP_SIZE=${DECODE_TP_SIZE:-1}
 DECODE_VISIBLE_DEVICES=${DECODE_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
 
 case "${PREFILL_TOPOLOGY}" in
-  afd_dp3tp4_ep8 | afd_dp12tp2 | afd_dp10tp2 | afd_dp8tp2 | afd_dp6tp2 | afd_dp6tp4 | afd_dp3tp8 | afd_dp4tp2 | ep16 | ep16_dp4tp4 | ep16_dp8tp2 | ep16_dp2tp8 | ep32) DEFAULT_MAX_MODEL_LEN=65536 ;;
+  afd_dp12tp2 | afd_dp10tp2 | afd_dp8tp2 | afd_dp6tp2 | afd_dp6tp4 | afd_dp3tp8 | afd_dp4tp2 | ep16 | ep16_dp4tp4 | ep16_dp8tp2 | ep16_dp2tp8 | ep32) DEFAULT_MAX_MODEL_LEN=65536 ;;
   *) DEFAULT_MAX_MODEL_LEN=1048576 ;;
 esac
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-${DEFAULT_MAX_MODEL_LEN}}

@@ -29,7 +29,7 @@ usage() {
 Usage: bash run_bench.sh [options] [vllm bench options]
 
 Options:
-  --topology NAME          afd_dp3tp4_ep8, afd_dp12tp2, afd_dp10tp2, afd_dp8tp2, afd_dp6tp2,
+  --topology NAME          afd_dp12tp2, afd_dp10tp2, afd_dp8tp2, afd_dp6tp2,
                            afd_dp6tp4, afd_dp3tp8, afd_dp4tp2,
                            ep16[_dp4tp4|_dp8tp2|
                            _dp2tp8], ep32, or dual_ep16_router.
@@ -109,7 +109,7 @@ done
 : "${DSV4_MODEL:?Set DSV4_MODEL to the checkpoint directory}"
 
 case "${TOPOLOGY}" in
-  afd_dp3tp4_ep8 | afd_dp12tp2 | afd_dp10tp2 | afd_dp8tp2 | afd_dp6tp2 | afd_dp6tp4 | afd_dp3tp8 | afd_dp4tp2 | ep16 | ep16_dp4tp4 | ep16_dp8tp2 | ep16_dp2tp8 | ep32 | dual_ep16_router) ;;
+  afd_dp12tp2 | afd_dp10tp2 | afd_dp8tp2 | afd_dp6tp2 | afd_dp6tp4 | afd_dp3tp8 | afd_dp4tp2 | ep16 | ep16_dp4tp4 | ep16_dp8tp2 | ep16_dp2tp8 | ep32 | dual_ep16_router) ;;
   *)
     echo "Invalid topology: ${TOPOLOGY}" >&2
     exit 2
@@ -137,15 +137,6 @@ fi
 
 TOPOLOGY_METADATA=()
 case "${TOPOLOGY}" in
-  afd_dp3tp4_ep8)
-    TOPOLOGY_METADATA=(
-      "attention_dp=3" "attention_tp=4" "ffn_ep=8"
-      "active_npu_dies=20" "reserved_npu_dies=32"
-      "ffn_graph_mode=${PREFILL_FFN_GRAPH_MODE:-EAGER}" "async_moe_ubatching=true"
-      "compressor_workspace_requested=true" "layered_gmm=true"
-      "ffn_hccl_buffsize=${FFN_HCCL_BUFFSIZE}"
-    )
-    ;;
   afd_dp12tp2 | afd_dp10tp2 | afd_dp8tp2 | afd_dp6tp2)
     BENCH_DP=${TOPOLOGY#afd_dp}
     BENCH_DP=${BENCH_DP%tp2}

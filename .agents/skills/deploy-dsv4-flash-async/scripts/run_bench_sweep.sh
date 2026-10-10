@@ -24,7 +24,7 @@ usage() {
 Usage: bash scripts/dsv4-flash/run_bench_sweep.sh [options]
 
 Options:
-  --topology NAME          afd_dp3tp4_ep8, afd_dp6tp4, afd_dp3tp8, afd_dp4tp2,
+  --topology NAME          afd_dp6tp4, afd_dp3tp8, afd_dp4tp2,
                            ep16[_dp4tp4|_dp8tp2|
                            _dp2tp8], ep32, or dual_ep16_router.
   --chunk-size TOKENS      4096, 8192, 16384, 32768, 49152, or 65536.
@@ -92,7 +92,7 @@ while (( $# > 0 )); do
 done
 
 case "${TOPOLOGY}" in
-  afd_dp3tp4_ep8 | afd_dp6tp4 | afd_dp3tp8 | afd_dp4tp2 | ep16 | ep16_dp4tp4 | ep16_dp8tp2 | ep16_dp2tp8 | ep32 | dual_ep16_router) ;;
+  afd_dp6tp4 | afd_dp3tp8 | afd_dp4tp2 | ep16 | ep16_dp4tp4 | ep16_dp8tp2 | ep16_dp2tp8 | ep32 | dual_ep16_router) ;;
   *) echo "Invalid topology: ${TOPOLOGY}" >&2; exit 2 ;;
 esac
 case "${CHUNK_SIZE}" in

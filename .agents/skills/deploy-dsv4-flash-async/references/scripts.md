@@ -58,7 +58,7 @@ benchmark 默认自动解压 skill 的固定 1536 请求数据集并校验 SHA25
 - 移除外部 CAM vendor 路径和 libopapi 预加载配置；通信算子随插件 pip 安装编译，由运行时 loader 加载。
 
 压测入口纳入固定 formal_0/1/2 数据、许可证与署名，以及绑定该负载的 sweep 验收；
-部署/压测白名单加入 DP3TP4/EP8 和 49152。未复制个人实验编排器、日志、PID、
+部署/压测 MBT 白名单加入 49152。未复制个人实验编排器、日志、PID、
 结果或打包/绘图脚本。PD proxy 仍依赖所选 vllm-ascend checkout 的实现。
 
 这些脚本无 dry-run 参数。静态检查使用 `bash -n`；命令生成验证用临时 mock CLI，不能据此声称 NPU 上服务已验证。

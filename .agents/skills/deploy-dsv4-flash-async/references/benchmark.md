@@ -51,12 +51,12 @@ export DSV4_BENCH_RESULT_ROOT=/absolute/results/dsv4-mbt
 
 # 一个点；示例标签必须与实际部署相同。
 bash "${DSV4_SCRIPT_DIR}/run_bench.sh" \
-  --topology afd_dp3tp4_ep8 --chunk-size 8192 \
+  --topology afd_dp4tp2 --chunk-size 8192 \
   --request-rate 2 --repeat 1
 
 # 一个已部署 MBT 的 12 轮：4 个 RPS × 3 次重复。
 bash "${DSV4_SCRIPT_DIR}/run_bench_sweep.sh" \
-  --topology afd_dp3tp4_ep8 --chunk-size 8192 \
+  --topology afd_dp4tp2 --chunk-size 8192 \
   --rates 2,3,4,5 --repeats 3
 ```
 
@@ -65,49 +65,28 @@ bash "${DSV4_SCRIPT_DIR}/run_bench_sweep.sh" \
 长度和错误。sweep 验证请求数、零失败、总输入/输出 tokens、详细数组和点位
 metadata，失败会停止并记录原因；已有结果保留，不能覆盖后挑选最好值。
 
-## DP3TP4 / EP8 的五档矩阵
+## 五档 MBT/RPS 矩阵
 
 当前矩阵为 MBT `8192/16384/32768/49152/65536`、RPS `2/3/4/5`，每点
 3 次重复，共 60 轮。48k 为 **49152**。每轮 1536 请求，共 92,160 个正式请求，
 另有预热和 benchmark ready probe。请求开放到达，服务端可以出现排队；同时
 报告实际吞吐，不能把 offered RPS 当作 achieved RPS。
 
-`afd_dp3tp4_ep8` 默认拆成两个节点：node0 是 Attention DP3TP4，设备 0–11；
-node1 是 FFN TP1/EP8，设备 0–7。两端 global rank 数都是 A12/F8，Attention
-rank 0–11，FFN rank 12–19，`attn_ranks_per_dp=4`。node1 不启动 Attention。
-设置 `P_NODE_IP`、`P_SECONDARY_NODE_IP`，本地通信 IP 由 node ID 推导。
+先按 [AFD 部署](afd-prefill.md) 或 [非 AFD 部署](baseline.md) 选择已有拓扑，
+在对应节点启动服务，再将同一个拓扑名称传给压测入口。按实际设备容量设置
+上下文、并发序列数、显存比例和通信窗口；最大上下文需覆盖 63,778-token 输入
+及一个输出 token。压测客户端的模型和 tokenizer 必须与部署匹配。
 
-两端共同设置以下参数，再按自己的节点设置源码/CANN 环境和独立 LOG_DIR：
-
-```bash
-export PREFILL_TOPOLOGY=afd_dp3tp4_ep8
-export PREFILL_ENABLE_KV_CONNECTOR=0
-export MAX_MODEL_LEN=65536
-export PREFILL_MAX_NUM_BATCHED_TOKENS=8192
-export PREFILL_MAX_NUM_SEQS=16 FFN_MAX_NUM_SEQS=16
-export PREFILL_FFN_GRAPH_MODE=FULL
-export HCCL_BUFFSIZE=4096 PREFILL_HCCL_BUFFSIZE=4096 FFN_HCCL_BUFFSIZE=4096
-
-# node0：Attention 保持 eager，不继承 layered FFN 开关。
-env -u AFD_ASYNC_CAM_LAYERED_GMM PREFILL_NODE_ID=0 \
-  bash "${DSV4_SCRIPT_DIR}/run_prefill.sh"
-
-# node1：在另一个节点执行；FFN 使用 FULL。
-PREFILL_NODE_ID=1 PREFILL_FFN_GRAPH_MODE=FULL AFD_ASYNC_CAM_LAYERED_GMM=1 \
-  bash "${DSV4_SCRIPT_DIR}/run_prefill.sh"
-```
-
-上面的两个启动命令都提交后才等待全局健康。脚本关闭 prefix cache，请求共享
-compressor workspace，开启 2-stage token ubatch。FFN 图开关和 layered 开关只
-传给 FFN；Attention 的 workspace 必须从实际日志确认启用，而非只检查配置值。
+AFD 脚本关闭 prefix cache，请求共享 compressor workspace，开启 2-stage token
+ubatch。FFN 图开关和 layered 开关只传给 FFN；Attention 的 workspace 必须从
+实际日志确认启用，而非只检查配置值。FFN 使用的图模式应随启动命令和验收日志保存。
 
 **FULL 的运行时前提：**所用 AFD checkout 必须包含 Async CAM FFN 的专用
 graph transaction 和多 DP 启动协调，例如 `capture_async_cam_ffn_graph`。
 本 skill 只提供脚本和参数，不向发布分支添加该模型运行时能力。部署前核对
-实际源码；FULL 验收要求八个 rank 12–19 全部出现 layered、通信预热
-`items=3`、capture complete 和 replay。启动或单 token smoke 通过不能替代
-1536 请求压测，也不能作为模型精度验收。压测客户端也应设置相同的
-`PREFILL_FFN_GRAPH_MODE`，以记录正确配置标签；metadata 不证明实际图执行。
+实际源码；FULL 验收要求所选拓扑的全部 FFN rank 出现 layered、通信预热、
+capture complete 和 replay。启动或单 token smoke 通过不能替代
+1536 请求压测，也不能作为模型精度验收。压测 metadata 不证明实际图执行。
 
 **改变 MBT 必须重新部署：**完成一个 MBT 的 12 轮后，停止本次 A/F 服务并
 确认 worker/端口/设备释放，更新两端 `PREFILL_MAX_NUM_BATCHED_TOKENS`，使用
@@ -115,7 +94,6 @@ graph transaction 和多 DP 启动协调，例如 `capture_async_cam_ffn_graph`�
 `--chunk-size` 仅是压测标签，不会修改服务。每档的容量和窗口都要实际检查，
 不能把 8k 启动成功推断成 64k 已验证。
 
-一套拓扑需要 **20 个逻辑 NPU**；两套并行需要 **40 个**。两台各 16 逻辑 NPU
-只能支撑一套跨节点实例。分摊矩阵时先确定额外资源和不重叠的设备，并隔离
-AFD rendezvous、DP RPC、API 端口及结果目录。按 MBT/RPS 分别报告三个重复的
-中位数及范围，不合并不同输入预算或速率的样本。
+分摊矩阵时按所选拓扑计算所需资源，确定不重叠的设备，并隔离 AFD rendezvous、
+DP RPC、API 端口及结果目录。按 MBT/RPS 分别报告三个重复的中位数及范围，
+不合并不同输入预算或速率的样本。

@@ -15,8 +15,6 @@ source "${SCRIPT_DIR}/common_env.sh"
 if [[ "${PREFILL_START_FFN}" == 1 ]]; then
   bash "${SCRIPT_DIR}/run_prefill_ffn.sh"
 fi
-if [[ "${PREFILL_START_ATTENTION}" == 1 ]]; then
-  bash "${SCRIPT_DIR}/run_prefill_attention.sh"
-fi
+bash "${SCRIPT_DIR}/run_prefill_attention.sh"
 
 echo "P node launch submitted: topology=${PREFILL_TOPOLOGY} node=${PREFILL_NODE_ID}. Watch ${LOG_DIR}/*node${PREFILL_NODE_ID}.log"
