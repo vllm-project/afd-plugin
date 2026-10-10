@@ -6,11 +6,12 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from types import MethodType
 from typing import TYPE_CHECKING, cast
 
 import torch
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
 from vllm.forward_context import ForwardContext
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -19,7 +20,9 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker import utils as v2_worker_utils
 from vllm.v1.worker.dp_utils import skip_dp_coordination
 from vllm.v1.worker.gpu import cudagraph_utils as v2_cudagraph_utils
+from vllm.v1.worker.gpu import model_runner as v2_model_runner
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
@@ -128,6 +131,72 @@ def _use_afd_fullgraph_replay_hook(
         del manager_state[_AFD_FULLGRAPH_HOOK_MARKER]
 
 
+@contextmanager
+def _use_camp2p_dp_padding(attention_size: int, ffn_size: int) -> Iterator[None]:
+    """Pad each CAMP2P receiver group equally before input preparation (FFN TP=1)."""
+    original_dispatch = v2_model_runner.dispatch_cg_and_sync_dp
+
+    # Patch reason: native execute calls this module-level function before input
+    # preparation; no runner method exposes that boundary.
+    # Patch functionality: apply CAMP2P group padding to the agreed eager batch.
+    # Signature: matches vLLM v0.30.0 dispatch_cg_and_sync_dp exactly.
+    # Upstream source: vllm/v1/worker/gpu/dp_utils.py;
+    # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
+    # Delegation exception: preserve native graph selection and DP collectives.
+    # Removal plan: replace when native dispatch exposes a padding callback.
+    def dispatch_cg_and_sync_dp(
+        cudagraph_manager: v2_cudagraph_utils.CudaGraphManager | None,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        dp_size: int,
+        dp_rank: int,
+        max_query_len: int | None = None,
+        need_eager: bool = False,
+        num_active_loras: int = 0,
+        parallel_config: ParallelConfig | None = None,
+        allow_ubatching: bool = False,
+        uniform_decode: bool = False,
+        dp_sync: DPSyncState | None = None,
+    ) -> tuple[v2_cudagraph_utils.BatchExecutionDescriptor, DPSyncState | None]:
+        desc, sync = original_dispatch(
+            cudagraph_manager,
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            dp_size,
+            dp_rank,
+            max_query_len=max_query_len,
+            need_eager=need_eager,
+            num_active_loras=num_active_loras,
+            parallel_config=parallel_config,
+            allow_ubatching=allow_ubatching,
+            uniform_decode=uniform_decode,
+            dp_sync=dp_sync,
+        )
+        # ### PATCH START: equal CAMP2P strides for eager and graph fallback.
+        if desc.cg_mode == CUDAGraphMode.NONE and sync is not None:
+            attention_tp = attention_size // dp_size
+            # Rank a sends to FFN a % ffn_size. Contiguous Attention TP peers
+            # must also pad equally; non-aligned TP blocks connect all groups.
+            num_groups = ffn_size // attention_tp if ffn_size % attention_tp == 0 else 1
+            padded_counts = (
+                sync.num_tokens_across_dp.reshape(-1, num_groups)
+                .amax(dim=0)
+                .repeat(dp_size // num_groups)
+            )
+            desc = replace(desc, num_tokens=int(padded_counts[dp_rank].item()))
+            sync = replace(sync, num_tokens_across_dp=padded_counts)
+        # ### PATCH END: equal CAMP2P strides for eager and graph fallback.
+        return desc, sync
+
+    try:
+        v2_model_runner.dispatch_cg_and_sync_dp = dispatch_cg_and_sync_dp
+        yield
+    finally:
+        v2_model_runner.dispatch_cg_and_sync_dp = original_dispatch
+
+
 class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     """Thin AFD seam over native vLLM-Ascend ModelRunnerV2.
 
@@ -194,8 +263,8 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         # -> ordinary ModelCudaGraphManager.dispatch() or the forced-eager
         # descriptor -> BatchExecutionDescriptor.num_tokens ->
         # prepare_inputs(...).num_tokens_after_padding. For eager execution,
-        # the ordinary no-graph fallback and profile/dummy forced-eager branch
-        # both preserve the native batch-descriptor token count.
+        # CAMP2P many-to-one execution pads the descriptor and DP counts before
+        # native input preparation, including eager fallback and dummy ranks.
         batch_descriptor = forward_context.batch_descriptor
         if batch_descriptor is None:
             raise RuntimeError(
@@ -412,6 +481,12 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         try:
             with (
                 skip_dp_coordination() if self.afd_config.async_dp else nullcontext(),
+                _use_camp2p_dp_padding(
+                    self.afd_config.num_attention_ranks, self.afd_config.num_ffn_ranks
+                )
+                if not self.afd_config.async_dp
+                and self.afd_config.num_attention_ranks > self.afd_config.num_ffn_ranks
+                else nullcontext(),
                 replay_scope,
                 use_async_cam_stage_metadata(self)
                 if self.afd_config.async_dp

@@ -348,7 +348,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 ) as forward_context:
                     metadata.layer_idx = layer_idx
                     metadata.stage_idx = stage_idx
-                    forward_context.dp_metadata = dp_metadata_list.get(stage_idx)
                     forward_context.additional_kwargs["afd_metadata"] = metadata
                     assert states, "Context.states must not be None"
                     _set_moe_layer_index(forward_context, layer_idx)

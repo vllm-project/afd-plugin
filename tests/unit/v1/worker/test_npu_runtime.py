@@ -2054,7 +2054,16 @@ def test_npu_ffn_runner_executes_eager_ffn_step(monkeypatch):
     ]
 
 
-def test_npu_ffn_runner_builds_forward_context_for_each_dbo_stage(monkeypatch):
+@pytest.mark.parametrize(
+    ("attention_counts", "ffn_counts"),
+    [
+        ([[6], [7]], [[6], [7]]),
+        ([[2, 3, 5, 7], [3, 8, 1, 7]], [[7, 10], [4, 15]]),
+    ],
+)
+def test_npu_ffn_runner_builds_forward_context_for_each_dbo_stage(
+    monkeypatch, attention_counts, ffn_counts
+):
     _require_npu_runtime()
     from afd_plugin.v1.worker.npu import ffn_model_runner
 
@@ -2063,7 +2072,14 @@ def test_npu_ffn_runner_builds_forward_context_for_each_dbo_stage(monkeypatch):
     @contextmanager
     def fake_ascend_forward_context(**kwargs):
         context_calls.append(kwargs)
-        yield SimpleNamespace(additional_kwargs={}, dp_metadata=None, all_moe_layers={})
+        native_dp_metadata = object()
+        context = SimpleNamespace(
+            additional_kwargs={},
+            dp_metadata=native_dp_metadata,
+            all_moe_layers={},
+        )
+        yield context
+        assert context.dp_metadata is native_dp_metadata
 
     monkeypatch.setattr(
         ffn_model_runner,
@@ -2072,35 +2088,38 @@ def test_npu_ffn_runner_builds_forward_context_for_each_dbo_stage(monkeypatch):
     )
     runner = _new_ffn_runner()
     runner.vllm_config = _vllm_config(role="ffn")
-    runner.vllm_config.parallel_config.data_parallel_size = 2
-    runner.connector = _FakeFFNConnector(attn_size=4, ffn_size=2)
+    runner.vllm_config.parallel_config.data_parallel_size = len(ffn_counts[0])
+    runner.connector = _FakeFFNConnector(
+        attn_size=max(2, len(attention_counts[0])), ffn_size=2
+    )
     runner.model = _FakeModel()
     runner.num_layers = 1
     runner.max_num_tokens = 16
     runner.use_aclgraph = False
     runner._acl_graphs = {}
-    for stage_idx, num_tokens in enumerate((7, 4)):
+    for stage_idx, counts in enumerate(ffn_counts):
         metadata = AFDTransferMetadata.create_attention_metadata(
             layer_idx=0,
             stage_idx=stage_idx,
-            seq_len=num_tokens,
+            seq_len=counts[0],
         )
         runner.connector.attn_outputs.append((f"hidden-{stage_idx}", metadata))
 
     runner.execute_model(
         dp_metadata_list={
-            0: _FakeDPMetadata([2, 3, 5, 7]),
-            1: _FakeDPMetadata([3, 8, 1, 7]),
+            stage: _FakeDPMetadata(counts)
+            for stage, counts in enumerate(attention_counts)
         },
         is_profile=True,
     )
 
-    assert [call["num_tokens"] for call in context_calls] == [7, 4]
-    assert [call["in_profile_run"] for call in context_calls] == [True, True]
-    assert [call["num_tokens_across_dp"].tolist() for call in context_calls] == [
-        [7, 10],
-        [4, 15],
+    assert [call["num_tokens"] for call in context_calls] == [
+        counts[0] for counts in ffn_counts
     ]
+    assert [call["in_profile_run"] for call in context_calls] == [True, True]
+    assert [
+        call["num_tokens_across_dp"].tolist() for call in context_calls
+    ] == ffn_counts
 
 
 def test_npu_ffn_runner_dp_path_invokes_model_with_hidden_states_and_layer(monkeypatch):
@@ -2372,12 +2391,26 @@ def test_npu_ffn_runner_skips_replay_when_attention_is_eager(monkeypatch):
     ]
 
 
-def test_npu_ffn_runner_graph_key_uses_ffn_aggregated_token_counts():
+@pytest.mark.parametrize(
+    ("attention_counts", "ffn_counts"),
+    [
+        ([12] * 8, (24, 24, 24, 24)),
+        ([2, 3, 5, 7], (7, 10)),
+        ([4, 1, 4, 8], (8, 9)),
+    ],
+)
+def test_npu_ffn_runner_graph_key_uses_ffn_aggregated_token_counts(
+    attention_counts, ffn_counts
+):
     runner = _new_ffn_runner()
-    runner.connector = _FakeFFNConnector(attn_size=4, ffn_size=2)
+    runner.connector = _FakeFFNConnector(
+        attn_size=len(attention_counts), ffn_size=len(ffn_counts)
+    )
     runner.max_num_tokens = 24
 
-    assert runner._make_graph_key({0: _FakeDPMetadata([2, 3, 5, 7])}) == ((0, (7, 10)),)
+    assert runner._make_graph_key({0: _FakeDPMetadata(attention_counts)}) == (
+        (0, ffn_counts),
+    )
 
 
 def test_npu_ffn_runner_falls_back_to_eager_on_acl_graph_miss(monkeypatch):

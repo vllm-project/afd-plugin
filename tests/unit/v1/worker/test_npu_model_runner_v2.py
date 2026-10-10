@@ -11,19 +11,20 @@ from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 pytest.importorskip("vllm_ascend")
 
 from vllm.config import CUDAGraphMode  # noqa: E402
 from vllm.v1.worker.dp_utils import should_skip_dp_coordination  # noqa: E402
 from vllm.v1.worker.gpu import cudagraph_utils, dp_utils  # noqa: E402
+from vllm.v1.worker.gpu import model_runner as native_v2  # noqa: E402
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner  # noqa: E402
 from vllm_ascend.worker.v2 import model_runner as native_ascend_v2  # noqa: E402
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner  # noqa: E402
 
-from afd_plugin.model_executor.models import (
-    forward_context as afd_context,  # noqa: E402
+from afd_plugin.model_executor.models import (  # noqa: E402
+    forward_context as afd_context,
 )
 from afd_plugin.v1.worker.npu import attention_model_runner_v2 as npu_v2  # noqa: E402
 
@@ -339,6 +340,7 @@ def test_native_dummy_run_reaches_afd_execute_with_context_state(monkeypatch, as
 def test_async_execute_uses_native_local_dp_dispatch(monkeypatch, num_tokens, dp_rank):
     runner = _runner(async_dp=True)
     runner.afd_config.num_ffn_ranks = 1
+    original_dispatch = native_v2.dispatch_cg_and_sync_dp
 
     monkeypatch.setattr(npu_v2, "step_afd_npu_profiler", lambda _prof: None)
     monkeypatch.setattr(
@@ -351,6 +353,7 @@ def test_async_execute_uses_native_local_dp_dispatch(monkeypatch, num_tokens, dp
     monkeypatch.setattr(dp_utils.dist, "all_reduce", unexpected_collective)
 
     def native_execute(self, scheduler_output, *args, **kwargs):
+        assert native_v2.dispatch_cg_and_sync_dp is original_dispatch
         desc = cudagraph_utils.BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
             num_tokens=num_tokens,
@@ -367,3 +370,166 @@ def test_async_execute_uses_native_local_dp_dispatch(monkeypatch, num_tokens, dp
     assert desc.num_tokens == num_tokens
     assert (sync is None) is (num_tokens == 0)
     assert not should_skip_dp_coordination()
+
+
+@pytest.mark.parametrize(
+    ("counts", "ffn_ranks", "attention_tp", "expected_counts", "dp_rank"),
+    [
+        (counts, ffn_ranks, attention_tp, expected_counts, dp_rank)
+        for counts, ffn_ranks, attention_tp, expected_counts in [
+            ((3, 7), 1, 1, [7, 7]),
+            ((7, 3), 1, 1, [7, 7]),
+            ((1, 7), 1, 1, [7, 7]),
+            ((8, 8), 1, 1, [8, 8]),
+            ((0, 0), 1, 1, [0, 0]),
+            ((3, 7), 2, 1, [3, 7]),
+            ((3, 7, 5, 2), 2, 1, [5, 7, 5, 7]),
+            ((1, 7, 1, 3), 2, 1, [1, 7, 1, 7]),
+            ((8, 8, 8, 8), 2, 1, [8, 8, 8, 8]),
+            ((3, 7), 2, 2, [7, 7]),
+            ((3, 7, 5, 2), 4, 2, [5, 7, 5, 7]),
+            ((3, 7, 5), 3, 2, [7, 7, 7]),
+        ]
+        for dp_rank in range(len(counts))
+    ],
+)
+@pytest.mark.parametrize("execution", ["eager", "graph_miss", "peer_fallback"])
+def test_camp2p_dispatch_pads_many_to_one_before_native_inputs(
+    monkeypatch, counts, dp_rank, ffn_ranks, attention_tp, expected_counts, execution
+):
+    runner = _runner()
+    dp_size = len(counts)
+    runner.afd_config.num_attention_ranks = dp_size * attention_tp
+    runner.afd_config.num_ffn_ranks = ffn_ranks
+    manager = None
+    if execution != "eager":
+        runner.vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+
+        def dispatch(num_reqs, num_tokens, uniform_token_count, **kwargs):
+            mode = (
+                CUDAGraphMode.NONE
+                if execution == "graph_miss" or dp_rank == 0
+                else CUDAGraphMode.FULL
+            )
+            return cudagraph_utils.BatchExecutionDescriptor(mode, num_tokens, num_reqs)
+
+        def run_fullgraph(desc):
+            pytest.fail("eager fallback must not replay a graph")
+
+        manager = SimpleNamespace(dispatch=dispatch, run_fullgraph=run_fullgraph)
+        runner.cudagraph_manager = manager
+    monkeypatch.setattr(npu_v2, "step_afd_npu_profiler", lambda _prof: None)
+    monkeypatch.setattr(
+        dp_utils, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
+    )
+    monkeypatch.setattr(dp_utils, "should_skip_dp_coordination", lambda: False)
+    reductions = []
+
+    def all_reduce(tensor, group):
+        reductions.append(tensor)
+        tensor[0] = torch.tensor(counts, dtype=torch.int32)
+        tensor[1].fill_(
+            CUDAGraphMode.FULL.value
+            if execution == "peer_fallback"
+            else CUDAGraphMode.NONE.value
+        )
+        tensor[1][0] = CUDAGraphMode.NONE.value
+        tensor[5].fill_(1)
+
+    monkeypatch.setattr(dp_utils.dist, "all_reduce", all_reduce)
+    original_dispatch = native_v2.dispatch_cg_and_sync_dp
+
+    def native_execute(self, *args, **kwargs):
+        desc, sync = native_v2.dispatch_cg_and_sync_dp(
+            manager,
+            1,
+            counts[dp_rank],
+            None,
+            dp_size,
+            dp_rank,
+            need_eager=execution == "eager",
+        )
+        assert desc.num_tokens == expected_counts[dp_rank]
+        assert desc.num_reqs == (0 if max(counts) == 0 else 1)
+        assert desc.cg_mode == CUDAGraphMode.NONE
+        if max(counts) == 0:
+            assert sync is None
+        else:
+            assert sync.num_tokens_across_dp.tolist() == expected_counts
+            assert sync.eager
+        return "native-result"
+
+    monkeypatch.setattr(NPUModelRunner, "execute_model", native_execute)
+    assert (
+        runner.execute_model(
+            SimpleNamespace(total_num_scheduled_tokens=counts[dp_rank]),
+            dummy_run=counts[dp_rank] == 1,
+        )
+        == "native-result"
+    )
+    assert len(reductions) == 1
+    assert reductions[0][0].tolist() == list(counts)
+    assert native_v2.dispatch_cg_and_sync_dp is original_dispatch
+
+
+@pytest.mark.parametrize("raise_in_native", [False, True])
+@pytest.mark.parametrize("mode", [CUDAGraphMode.FULL, CUDAGraphMode.NONE])
+def test_camp2p_padding_preserves_graph_descriptor_and_restores_dispatch(
+    monkeypatch, raise_in_native, mode
+):
+    runner = _runner()
+    runner.afd_config.num_ffn_ranks = 1
+    monkeypatch.setattr(npu_v2, "step_afd_npu_profiler", lambda _prof: None)
+    counts = [8, 8] if mode == CUDAGraphMode.FULL else [3, 7]
+    desc = cudagraph_utils.BatchExecutionDescriptor(
+        mode, counts[0], 3, uniform_token_count=1, max_query_len=1, num_active_loras=2
+    )
+    sync = dp_utils.DPSyncState(torch.tensor(counts), 1, False, 7)
+    dispatch_calls = []
+
+    def native_dispatch(*args, **kwargs):
+        dispatch_calls.append((args, kwargs))
+        return desc, sync
+
+    monkeypatch.setattr(native_v2, "dispatch_cg_and_sync_dp", native_dispatch)
+
+    def native_execute(self, *args, **kwargs):
+        actual_desc, actual_sync = native_v2.dispatch_cg_and_sync_dp(
+            None, 3, 3, 1, 2, 0, max_query_len=1, need_eager=False
+        )
+        if mode == CUDAGraphMode.FULL:
+            assert actual_desc is desc
+            assert actual_sync is sync
+        else:
+            assert actual_desc.num_tokens == 7
+            assert actual_desc.num_reqs == desc.num_reqs
+            assert actual_desc.uniform_token_count == desc.uniform_token_count
+            assert actual_desc.max_query_len == desc.max_query_len
+            assert actual_desc.num_active_loras == desc.num_active_loras
+            assert actual_sync.num_tokens_across_dp.tolist() == [7, 7]
+            assert actual_sync.eager is False
+            assert sync.num_tokens_across_dp.tolist() == [3, 7]
+        if raise_in_native:
+            raise RuntimeError("native execute failed")
+        return "native-result"
+
+    monkeypatch.setattr(NPUModelRunner, "execute_model", native_execute)
+    if raise_in_native:
+        with pytest.raises(RuntimeError, match="native execute failed"):
+            runner.execute_model(SimpleNamespace(total_num_scheduled_tokens=3))
+    else:
+        assert (
+            runner.execute_model(SimpleNamespace(total_num_scheduled_tokens=3))
+            == "native-result"
+        )
+    assert len(dispatch_calls) == 1
+    assert native_v2.dispatch_cg_and_sync_dp is native_dispatch
+
+
+def test_camp2p_dispatch_wrapper_matches_native_signature():
+    original = inspect.signature(native_v2.dispatch_cg_and_sync_dp, eval_str=True)
+    with npu_v2._use_camp2p_dp_padding(4, 2):
+        assert (
+            inspect.signature(native_v2.dispatch_cg_and_sync_dp, eval_str=True)
+            == original
+        )
