@@ -108,6 +108,11 @@ def register_afd() -> None:
         )
 
         apply_afd_mxfp_worker_resolution_patch()
+        from afd_plugin.compat.patches.npu.dspark_pd import (
+            apply_afd_dspark_pd_scheduler_patch,
+        )
+
+        apply_afd_dspark_pd_scheduler_patch()
     except Exception:
         _logger.debug(
             "AFD plugin: compatibility patches could not be applied",

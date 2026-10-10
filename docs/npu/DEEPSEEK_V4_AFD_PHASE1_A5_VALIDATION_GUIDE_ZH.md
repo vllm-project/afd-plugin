@@ -1,10 +1,10 @@
 # DeepSeek-V4 AFD A5 1030 合并验证指导书
 
-更新日期：2026-10-09。本文合并旧 A5 dSpark/PD 指导与[1030 执行计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)，是本期现场操作入口。
+更新日期：2026-10-10。本文合并旧 A5 dSpark/PD 指导与[1030 执行计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)，是本期现场操作入口。
 执行计划规定交付范围和日期，本文规定现场命令、验证顺序、证据与失败处理。
 本文是待执行指导，不代表组合已经通过 A5 验收。
 
-**执行标记**：`【本地已完成】` 为代码/配置的离线检查；`【A5 手工执行】` 为需要你在 A5 实际环境完成的操作。当前从[手工交接清单](DEEPSEEK_V4_AFD_A5_MANUAL_HANDOFF_ZH.md)的 A5-01 开始，先完成环境与 standalone 回归，不直接启动完整 C5。
+**执行标记**：`【本地已完成】` 为代码/配置的离线检查；`【A5 手工执行】` 为需要你在 A5 实际环境完成的操作。首次执行从[手工交接清单](DEEPSEEK_V4_AFD_A5_MANUAL_HANDOFF_ZH.md)的 A5-01 开始。当前现场已回传 standalone EOS、C1 成功日志及 C2 失败日志；本次先按第 3.4 节更新并复测 C2，不推进 C3–C5。
 
 ## 1. 合并后的范围与门禁
 
@@ -323,6 +323,97 @@ sha256sum "$DSPARK_OPS_WHEEL"
 
 缺少已确认的包时先回传查找输出，C2/C4/C5 保持 blocked。导入和注册通过后记录包来源/版本/hash，使用新的 run ID 冷启动 C2；这项预检仍需由实际 draft 加载及在线 proposed/accepted 增量完成实机验证。
 
+### 3.4 【A5 手工执行】C2 的异步 PD KV 分配修复及复测
+
+**适用错误**：Attention 的 Mooncake 接收报 `operands could not be broadcast together with shapes (0,) (3,)`，随后 scheduler 报 `too many values to unpack (expected 1)` 并退出。
+2026-10-10 回传日志证明 DSpark 直连已有 proposal/acceptance，但经 Proxy 的 PD 请求仍失败。原日志目录被覆盖不改变这一结论；本次定位依据日志时间、PID 和请求 ID。
+
+`【本地已完成】` 修复位于 `afd_plugin/compat/patches/npu/dspark_pd.py`，由插件入口自动注册。固定 vLLM 0.23 仅对 EAGLE 的异步 PD load 关闭 lookahead；DSpark 经 `mtp` 入口仍分配预测尾部 block，Mooncake 将它们加入接收列表。本次在 AFD + DSpark + Mooncake consumer 的异步分配阶段将 lookahead 置 0，进入正常 decode 后恢复原预测分配；没有裁剪两端列表来掩盖长度差异。多组 KV 的 `failure_policy=fail` 使用 Mooncake 的 group-0 失败标记终止受影响请求，避免再按单组解包导致 EngineCore 退出。
+本地回归及冻结源码的 CPU 分配重放已通过；实际 NPU 数据传输、模型输出和 C2 F0 仍须现场复测。保持现有 vLLM/vLLM-Ascend 提交、DSpark 和 A5 HIXL 配置。
+
+**1. 【A5 手工执行】保留当前失败日志，按第 7 节正常停服并确认设备/端口释放。** 在已经按第 3.1 节加载现场环境的终端更新代码；下面是本轮实际源码路径：
+
+```bash
+export AFD_PLUGIN_ROOT=/home/z00569729/dsv4-afd-a128f32-r3/src/afd-plugin-phase1-delivery
+test -z "$(git -C "$AFD_PLUGIN_ROOT" status --porcelain)"
+git -C "$AFD_PLUGIN_ROOT" remote get-url origin
+git -C "$AFD_PLUGIN_ROOT" fetch origin feat/dsv4-afd-phase1-delivery
+git -C "$AFD_PLUGIN_ROOT" switch feat/dsv4-afd-phase1-delivery
+git -C "$AFD_PLUGIN_ROOT" merge --ff-only origin/feat/dsv4-afd-phase1-delivery
+export AFD_EXPECTED_COMMIT="$(git -C "$AFD_PLUGIN_ROOT" rev-parse HEAD)"
+printf 'AFD_EXPECTED_COMMIT=%s\n' "$AFD_EXPECTED_COMMIT"
+```
+
+核对提交与本次发布回执一致。`SITE_FILE` 是第 3.1 节实际 `source` 的配置文件，不是旧 `RUN_ROOT` 中的归档副本；**在这个文件中替换 `export AFD_EXPECTED_COMMIT=...`**，避免下次加载环境又恢复旧值：
+
+```bash
+: "${SITE_FILE:?请先设置为第 3.1 节实际 source 的 site.env 绝对路径}"
+test -f "$SITE_FILE"
+grep -n '^export AFD_EXPECTED_COMMIT=' "$SITE_FILE"
+sed -i "s/^export AFD_EXPECTED_COMMIT=.*/export AFD_EXPECTED_COMMIT='$AFD_EXPECTED_COMMIT'/" "$SITE_FILE"
+grep -n '^export AFD_EXPECTED_COMMIT=' "$SITE_FILE"
+sha256sum "$SITE_FILE"
+```
+
+**2. 【A5 手工执行】确认同一个服务 Python 加载新源码和匹配的 scheduler API。** 已有 editable 安装指向上述目录时，Git 更新后重启即可；导入路径不同则先按交接清单第 2.2 节安装本次插件。
+
+```bash
+"$PYTHON_BIN" - "$AFD_PLUGIN_ROOT" <<'PY'
+import sys
+from pathlib import Path
+import afd_plugin
+from afd_plugin.compat.patches.npu.dspark_pd import apply_afd_dspark_pd_scheduler_patch
+source = Path(afd_plugin.__file__).resolve()
+assert source.is_relative_to(Path(sys.argv[1]).resolve()), source
+assert apply_afd_dspark_pd_scheduler_patch(), 'vLLM version/scheduler API mismatch'
+print('DSpark PD scheduler patch registered:', source)
+PY
+```
+
+**3. 【A5 手工执行】冷启动新的同机 C2。** 按第 3.1/3.2、4.1/4.3/4.4、6.1/6.2 节依次执行。第 4.3 节的两个目录配置示例都改为 `CASE=C2`，使用新的实际 `CYCLE/RUN_ID`；本机只创建目录一次，其他角色使用相同值。设备 P0–1/A2–5/F6–7，Attention 为 `eager/U1/DSpark on`。在各角色开关配置前设置：
+
+```bash
+export VLLM_LOGGING_LEVEL=DEBUG
+```
+
+第 4.3 节现在保留这个值，不会再次覆盖为 INFO。Attention 启动后检查四个不同 EngineCore DP rank 均打印补丁启用标记，并确认四个 drafter 加载、FFN 两个 rank 进入 loop：
+
+```bash
+grep -nF 'AFD DSpark PD scheduler compatibility active:' "$RUN_ROOT/attention.log"
+test "$(grep -cF 'AFD DSpark PD scheduler compatibility active:' "$RUN_ROOT/attention.log" || true)" -ge 4
+grep -nE 'AscendDSparkProposer|drafter|AFD FFN EngineCore started' \
+  "$RUN_ROOT/attention.log" "$RUN_ROOT/ffn.log"
+```
+
+仅看到 API health 200 或直连 Attention 成功不足以证明 C2；缺少补丁标记时先核对源码路径、版本及插件注册日志。
+
+**4. 【A5 手工执行】先经 Proxy 发送 1 个 EOS 请求。** 在同机服务终端执行，不加 `--standalone`；`BASE_URL` 的 9000 是 Proxy，`ATTENTION_URL` 的 8910 仅用于管理接口和指标：
+
+```bash
+export BASE_URL="http://127.0.0.1:$PROXY_PORT"
+export ATTENTION_URL="http://127.0.0.1:$ATTENTION_API_PORT"
+curl --noproxy '*' -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/attention-metrics-before.txt"
+"$PYTHON_BIN" "$AFD_PLUGIN_ROOT/tools/validation/a5_1030_requests.py" \
+  --suite eos \
+  --base-url "$BASE_URL" --attention-url "$ATTENTION_URL" \
+  --output "$RUN_ROOT/requests-eos-$(date +%Y%m%dT%H%M%S)" \
+  --run-id "$RUN_ID-eos"
+curl --noproxy '*' -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/attention-metrics-after-eos.txt"
+```
+
+成功要求：脚本退出 0、响应自然 EOS（`finish_reason=stop`）、Proxy 请求归零；同一请求有真实 Prefill→Attention KV 接收证据，Attention 无原 broadcast/解包异常、EngineCore 保持运行。检查本轮 proposed/accepted 增量；一次短请求不能代替完整 DSpark 门禁。失败时保留三角色和 Proxy 日志、请求 JSON/summary、metrics，停止扩大流量。
+
+**5. 【A5 手工执行】EOS 通过后，再执行 5 请求 smoke；成功后才运行完整请求集。**
+
+```bash
+"$PYTHON_BIN" "$AFD_PLUGIN_ROOT/tools/validation/a5_1030_requests.py" \
+  --suite smoke \
+  --base-url "$BASE_URL" --attention-url "$ATTENTION_URL" \
+  --output "$RUN_ROOT/requests-smoke" --run-id "$RUN_ID-smoke"
+```
+
+然后执行第 6.3 节重新保存 full 的 metrics-before/生成 token pool，第 6.4 节执行 92 请求完整集，按第 6.5/7 节核对逐组 KV、DSpark 和清理证据。只在 C2 F0 完整通过后进入 C3。本次更新后的其他矩阵点也冻结同一修复提交。
+
 ## 4. 【A5 手工执行】第 2 步：选择拓扑、验证点和新运行目录
 
 ### 4.1 同机设备配置
@@ -402,7 +493,7 @@ fi
 export ENABLE_PD=1
 export AFD_HCCL_STAGE_DIAGNOSTICS=1
 export AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS=0
-export VLLM_LOGGING_LEVEL=INFO
+export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}"
 export AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP="${AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP:-1}"
 export AFD_HCCL_GRAPH_U2_HYBRID_DAG="${AFD_HCCL_GRAPH_U2_HYBRID_DAG:-1}"
 export AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM="${AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM:-1}"
@@ -486,7 +577,7 @@ export ENABLE_PD=0 ENABLE_DSPARK=0
 export EXECUTION_MODE=full-decode-only U_BATCHES=2
 export AFD_HCCL_STAGE_DIAGNOSTICS=1
 export AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS=0
-export VLLM_LOGGING_LEVEL=INFO
+export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}"
 export AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP=1
 export AFD_HCCL_GRAPH_U2_HYBRID_DAG=1
 export AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM=1
@@ -587,6 +678,7 @@ grep -nF 'AFD HCCL diagnostics configuration:' "$RUN_ROOT/attention.log" "$RUN_R
 
 上一个 `grep` 在三机分别对本机日志执行。Graph 点逐 rank 核对最终五个 Graph 开关与本轮配置一致：默认均为 1，显式关闭项应为 0；配置与生效值不一致时返回 M1，不开始流量。`8911` 是 FFN 内部设置，不是 HTTP健康接口。
 单个 Attention HTTP API 的 health 只作入口检查，另需核对四个 Attention rank ready、四个 drafter（DSpark 点）及两个 FFN rank ready。
+PD 的 C2/C4/C5 还须按第 3.4 节确认四个 EngineCore DP rank 的 `AFD DSpark PD scheduler compatibility active:` 标记。
 
 Prefill/Attention ready 且 FFN loop 完整后，在 Proxy 主机执行：
 

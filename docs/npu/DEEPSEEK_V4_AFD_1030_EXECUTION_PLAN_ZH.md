@@ -49,6 +49,8 @@ Prefill --Mooncake KV--> Decode Attention --P2pHccl AFD--> Decode FFN
 
 2026-10-09 更新：`common.sh` 的五个 Graph/U2 开关默认开启，并保留显式 0/1 覆盖。`【本地已完成】` A5 Prefill/Attention 的 Mooncake 配置已接入本机绝对路径 `ascend_local_comm_res_path`，并检查角色设备对应的 endpoint JSON；此字段仅用于 A5，A3 不注入；旧 `tools/dsv4/run_phase1_a5_*` 和 `mooncake_pd_manual` 入口不在交付分支中。`【A5 手工执行】` 仍需环境审计、HIXL 资源内容核对、安装路径确认和 standalone 回归。本文的后续步骤是待验证计划，不是通过报告。
 
+2026-10-10 现场进展：已回传 standalone EOS 与 C1 执行成功日志；C2 四个 drafter 已加载，直连 Attention 已有 proposal/acceptance，但 Proxy 请求在 Mooncake KV 接收时报 block 长度不匹配，随后 hybrid cache 失败处理触发单组解包错误。`【本地已完成】` afd-plugin scheduler 兼容补丁在异步 PD load 时延后 DSpark lookahead，保留正常 decode 的预测分配，并修正 `failure_policy=fail` 的多组请求失败处理。冻结源码 CPU 分配重放和回归通过，尚未证明 A5 C2 F0。`【A5 手工执行】` 下一步按统一指导书第 3.4 节更新/冻结插件提交、冷启动 C2、确认四个 EngineCore 补丁标记，再经 Proxy 执行 1 请求 EOS→5 请求 smoke→92 请求 full；C2 F0 未通过不进入 C3。各阶段完整门禁仍按本计划核对，三机、精度和性能继续待执行。
+
 ## 3. 固定范围
 
 ### 3.1 验收拓扑
