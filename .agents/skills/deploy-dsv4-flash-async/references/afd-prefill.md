@@ -4,6 +4,7 @@
 
 | PREFILL_TOPOLOGY | 全局 A | node0 的 A | node1 的 A | F 所在节点 |
 | --- | --- | --- | --- | --- |
+| `afd_dp3tp4_ep8` | DP3TP4 | 0–11，DP3 | 无 Attention | node1，0–7 |
 | `legacy` | DP2TP4 | 0–7，DP2 | 无 | node0，8–15 |
 | `afd_dp4tp2` | DP4TP2 | 0–7，DP4 | 无 | node0，8–15 |
 | `afd_dp6tp4` | DP6TP4 | 0–15，DP4 | 0–7，DP2，start=4 | node1，8–15 |
@@ -32,6 +33,9 @@ PREFILL_NODE_ID=1 bash "${DSV4_SCRIPT_DIR}/run_prefill.sh"
 ```
 
 node0 是 DP coordinator 和 HTTP 入口，node1 headless。两个节点启动命令均提交后再等待全局 ready，避免只启动一端就等待健康。脚本会在 F 所在节点先提交 FFN，再提交 Attention。
+
+`afd_dp3tp4_ep8` 的 node1 是 FFN-only；完整启动、FULL 运行时前提及 MBT/RPS
+矩阵命令见 [固定负载压测](benchmark.md)。
 
 ## 不变量
 

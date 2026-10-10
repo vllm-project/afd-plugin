@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 
 set -euo pipefail
 
@@ -46,7 +48,8 @@ PD_KV_DECODE_PORT=${PD_KV_DECODE_PORT:-30100}
 
 # AFD benchmark layouts use two 16-NPU 910C nodes. Node 0 owns 16 Attention
 # ranks in the original layouts; TP2 layouts reserve unused devices idle.
-# Node 1 always owns all 8 FFN ranks on devices 8-15.
+# Node 1 owns all 8 FFN ranks, normally on devices 8-15.
+# afd_dp3tp4_ep8 uses Attention-only node 0 and FFN-only node 1 (devices 0-7).
 # Keep "legacy" for the original single-node DP2TP4 + EP8 layout.
 PREFILL_TOPOLOGY=${PREFILL_TOPOLOGY:-legacy}
 PREFILL_NODE_ID=${PREFILL_NODE_ID:-0}
@@ -79,6 +82,12 @@ case "${PREFILL_TOPOLOGY}" in
     NUM_ATTENTION_RANKS=${NUM_ATTENTION_RANKS:-8}
     ATTN_RANKS_PER_DP=${ATTN_RANKS_PER_DP:-2}
     ;;
+  afd_dp3tp4_ep8)
+    PREFILL_DP_SIZE=${PREFILL_DP_SIZE:-3}
+    PREFILL_TP_SIZE=${PREFILL_TP_SIZE:-4}
+    NUM_ATTENTION_RANKS=${NUM_ATTENTION_RANKS:-12}
+    ATTN_RANKS_PER_DP=${ATTN_RANKS_PER_DP:-4}
+    ;;
   legacy)
     PREFILL_DP_SIZE=${PREFILL_DP_SIZE:-2}
     PREFILL_TP_SIZE=${PREFILL_TP_SIZE:-4}
@@ -100,6 +109,8 @@ case "${PREFILL_TOPOLOGY}" in
     ;;
   *)
     echo "Unknown PREFILL_TOPOLOGY=${PREFILL_TOPOLOGY}" >&2
+    # A sourced script returns; direct execution falls back to exit.
+    # shellcheck disable=SC2317
     return 2 2>/dev/null || exit 2
     ;;
 esac
@@ -119,11 +130,28 @@ case "${PREFILL_NODE_ID}" in
     ;;
   *)
     echo "PREFILL_NODE_ID must be 0 or 1" >&2
+    # A sourced script returns; direct execution falls back to exit.
+    # shellcheck disable=SC2317
     return 2 2>/dev/null || exit 2
     ;;
 esac
 
 case "${PREFILL_TOPOLOGY}:${PREFILL_NODE_ID}" in
+  afd_dp3tp4_ep8:0)
+    PREFILL_START_FFN=${PREFILL_START_FFN:-0}
+    PREFILL_START_ATTENTION=${PREFILL_START_ATTENTION:-1}
+    PREFILL_DP_SIZE_LOCAL=${PREFILL_DP_SIZE_LOCAL:-3}
+    PREFILL_DP_START_RANK=${PREFILL_DP_START_RANK:-0}
+    PREFILL_ATTN_VISIBLE_DEVICES=${PREFILL_ATTN_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11}
+    ;;
+  afd_dp3tp4_ep8:1)
+    # This node owns only FFN; all three Attention DP replicas are on node 0.
+    PREFILL_START_FFN=${PREFILL_START_FFN:-1}
+    PREFILL_START_ATTENTION=${PREFILL_START_ATTENTION:-0}
+    PREFILL_DP_SIZE_LOCAL=${PREFILL_DP_SIZE_LOCAL:-0}
+    PREFILL_DP_START_RANK=${PREFILL_DP_START_RANK:-0}
+    PREFILL_FFN_VISIBLE_DEVICES=${PREFILL_FFN_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+    ;;
   afd_dp12tp2:0)
     PREFILL_START_FFN=${PREFILL_START_FFN:-0}
     PREFILL_DP_SIZE_LOCAL=${PREFILL_DP_SIZE_LOCAL:-8}
@@ -201,6 +229,8 @@ case "${PREFILL_TOPOLOGY}:${PREFILL_NODE_ID}" in
     ;;
   afd_dp4tp2:1)
     echo "afd_dp4tp2 is a single-node topology; launch only PREFILL_NODE_ID=0" >&2
+    # A sourced script returns; direct execution falls back to exit.
+    # shellcheck disable=SC2317
     return 2 2>/dev/null || exit 2
     ;;
   *)
@@ -209,6 +239,7 @@ case "${PREFILL_TOPOLOGY}:${PREFILL_NODE_ID}" in
     PREFILL_START_FFN=${PREFILL_START_FFN:-1}
     ;;
 esac
+PREFILL_START_ATTENTION=${PREFILL_START_ATTENTION:-1}
 PREFILL_FFN_VISIBLE_DEVICES=${PREFILL_FFN_VISIBLE_DEVICES:-8,9,10,11,12,13,14,15}
 PREFILL_ENABLE_KV_CONNECTOR=${PREFILL_ENABLE_KV_CONNECTOR:-0}
 
@@ -218,7 +249,7 @@ DECODE_TP_SIZE=${DECODE_TP_SIZE:-1}
 DECODE_VISIBLE_DEVICES=${DECODE_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
 
 case "${PREFILL_TOPOLOGY}" in
-  afd_dp12tp2 | afd_dp10tp2 | afd_dp8tp2 | afd_dp6tp2 | afd_dp6tp4 | afd_dp3tp8 | afd_dp4tp2 | ep16 | ep16_dp4tp4 | ep16_dp8tp2 | ep16_dp2tp8 | ep32) DEFAULT_MAX_MODEL_LEN=65536 ;;
+  afd_dp3tp4_ep8 | afd_dp12tp2 | afd_dp10tp2 | afd_dp8tp2 | afd_dp6tp2 | afd_dp6tp4 | afd_dp3tp8 | afd_dp4tp2 | ep16 | ep16_dp4tp4 | ep16_dp8tp2 | ep16_dp2tp8 | ep32) DEFAULT_MAX_MODEL_LEN=65536 ;;
   *) DEFAULT_MAX_MODEL_LEN=1048576 ;;
 esac
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-${DEFAULT_MAX_MODEL_LEN}}
@@ -282,9 +313,9 @@ configure_network() {
 
 validate_topology() {
   case "${PREFILL_MAX_NUM_BATCHED_TOKENS}" in
-    4096 | 8192 | 16384 | 32768 | 65536) ;;
+    4096 | 8192 | 16384 | 32768 | 49152 | 65536) ;;
     *)
-      echo "PREFILL_MAX_NUM_BATCHED_TOKENS must be one of 4096, 8192, 16384, 32768, 65536" >&2
+      echo "PREFILL_MAX_NUM_BATCHED_TOKENS must be one of 4096, 8192, 16384, 32768, 49152, 65536" >&2
       return 1
       ;;
   esac
@@ -305,4 +336,33 @@ validate_topology() {
     echo "PREFILL_DP_START_RANK + PREFILL_DP_SIZE_LOCAL exceeds global PREFILL_DP_SIZE" >&2
     return 1
   fi
+}
+
+# Resolve the bundled workload only for benchmark entrypoints, not deployment.
+prepare_bench_dataset() {
+  if [[ -z "${DSV4_BENCH_DATASET_PATH:-}" ]]; then
+    local cache_dir=${DSV4_BENCH_DATASET_CACHE_DIR:-${REPO_ROOT}/bench_results/dsv4-flash/datasets}
+    DSV4_BENCH_DATASET_PATH=$("${PYTHON}" "${DSV4_FLASH_SCRIPT_DIR}/prepare_bench_dataset.py" \
+      --output "${cache_dir}/formal_0_1_2_vllm_bench.jsonl")
+  fi
+  export DSV4_BENCH_DATASET_PATH
+}
+
+verify_bench_dataset() {
+  "${PYTHON}" - "$1" "$2" <<'PYTHON'
+import hashlib
+import pathlib
+import sys
+
+CHUNK_BYTES = 1024 * 1024
+path = pathlib.Path(sys.argv[1])
+expected = sys.argv[2]
+digest = hashlib.sha256()
+with path.open("rb") as handle:
+    for chunk in iter(lambda: handle.read(CHUNK_BYTES), b""):
+        digest.update(chunk)
+actual = digest.hexdigest()
+if actual != expected:
+    raise SystemExit(f"Dataset SHA-256 mismatch: expected {expected}, got {actual}")
+PYTHON
 }

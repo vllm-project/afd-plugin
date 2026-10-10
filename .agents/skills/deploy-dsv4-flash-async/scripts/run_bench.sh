@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common_env.sh
+# Runtime path is relative to this script; syntax/behavior are checked together.
+# shellcheck disable=SC1091
 source "${SCRIPT_DIR}/common_env.sh"
 
-DATASET_PATH=${DSV4_BENCH_DATASET_PATH:-${REPO_ROOT}/moonconv-wildchat-v4-flash-prefill/workloads/formal_0_1_2_vllm_bench.jsonl}
+DATASET_PATH=${DSV4_BENCH_DATASET_PATH:-}
 DATASET_SHA256=${DSV4_BENCH_DATASET_SHA256:-1ebccbd149bc8f28568d3d5eced3911d2a9473fb015bdb829b898a26abf63d08}
 BENCH_HOST=${DSV4_BENCH_HOST:-127.0.0.1}
 BENCH_PORT=${DSV4_BENCH_PORT:-${PREFILL_PORT}}
@@ -25,11 +29,11 @@ usage() {
 Usage: bash run_bench.sh [options] [vllm bench options]
 
 Options:
-  --topology NAME          afd_dp12tp2, afd_dp10tp2, afd_dp8tp2, afd_dp6tp2,
+  --topology NAME          afd_dp3tp4_ep8, afd_dp12tp2, afd_dp10tp2, afd_dp8tp2, afd_dp6tp2,
                            afd_dp6tp4, afd_dp3tp8, afd_dp4tp2,
                            ep16[_dp4tp4|_dp8tp2|
                            _dp2tp8], ep32, or dual_ep16_router.
-  --chunk-size TOKENS      4096, 8192, 16384, 32768, or 65536.
+  --chunk-size TOKENS      4096, 8192, 16384, 32768, 49152, or 65536.
   --request-rate RATE      Offered requests/s; accepts a positive number or inf.
   --repeat N               Repeat index used in the result path.
   --max-concurrency N      Optional client cap. Omit or use 0 for open-loop.
@@ -105,14 +109,14 @@ done
 : "${DSV4_MODEL:?Set DSV4_MODEL to the checkpoint directory}"
 
 case "${TOPOLOGY}" in
-  afd_dp12tp2 | afd_dp10tp2 | afd_dp8tp2 | afd_dp6tp2 | afd_dp6tp4 | afd_dp3tp8 | afd_dp4tp2 | ep16 | ep16_dp4tp4 | ep16_dp8tp2 | ep16_dp2tp8 | ep32 | dual_ep16_router) ;;
+  afd_dp3tp4_ep8 | afd_dp12tp2 | afd_dp10tp2 | afd_dp8tp2 | afd_dp6tp2 | afd_dp6tp4 | afd_dp3tp8 | afd_dp4tp2 | ep16 | ep16_dp4tp4 | ep16_dp8tp2 | ep16_dp2tp8 | ep32 | dual_ep16_router) ;;
   *)
     echo "Invalid topology: ${TOPOLOGY}" >&2
     exit 2
     ;;
 esac
 case "${CHUNK_SIZE}" in
-  4096 | 8192 | 16384 | 32768 | 65536) ;;
+  4096 | 8192 | 16384 | 32768 | 49152 | 65536) ;;
   *)
     echo "Invalid chunk size: ${CHUNK_SIZE}" >&2
     exit 2
@@ -133,6 +137,15 @@ fi
 
 TOPOLOGY_METADATA=()
 case "${TOPOLOGY}" in
+  afd_dp3tp4_ep8)
+    TOPOLOGY_METADATA=(
+      "attention_dp=3" "attention_tp=4" "ffn_ep=8"
+      "active_npu_dies=20" "reserved_npu_dies=32"
+      "ffn_graph_mode=${PREFILL_FFN_GRAPH_MODE:-EAGER}" "async_moe_ubatching=true"
+      "compressor_workspace_requested=true" "layered_gmm=true"
+      "ffn_hccl_buffsize=${FFN_HCCL_BUFFSIZE}"
+    )
+    ;;
   afd_dp12tp2 | afd_dp10tp2 | afd_dp8tp2 | afd_dp6tp2)
     BENCH_DP=${TOPOLOGY#afd_dp}
     BENCH_DP=${BENCH_DP%tp2}
@@ -156,10 +169,14 @@ case "${MAX_CONCURRENCY}" in
     ;;
 esac
 
+prepare_bench_dataset
+DATASET_PATH=${DSV4_BENCH_DATASET_PATH}
 if [[ ! -f "${DATASET_PATH}" ]]; then
   echo "Dataset not found: ${DATASET_PATH}" >&2
   exit 1
 fi
+
+verify_bench_dataset "${DATASET_PATH}" "${DATASET_SHA256}"
 
 RESULT_DIR=${DSV4_BENCH_RESULT_DIR:-${RESULT_ROOT}/${TOPOLOGY}/chunk_${CHUNK_SIZE}/rps_${REQUEST_RATE}/repeat_${REPEAT}}
 RESULT_PATH=${RESULT_DIR}/${RESULT_FILENAME}

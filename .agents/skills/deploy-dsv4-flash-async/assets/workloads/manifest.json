@@ -1,0 +1,24 @@
+{
+  "file": "formal_0_1_2_vllm_bench.jsonl.gz",
+  "uncompressed_file": "formal_0_1_2_vllm_bench.jsonl",
+  "sha256": "1ebccbd149bc8f28568d3d5eced3911d2a9473fb015bdb829b898a26abf63d08",
+  "compressed_sha256": "d34538b16db94b246adfed7b9860293070893fc10b26f493fb56a8545e161ca9",
+  "uncompressed_bytes": 72226673,
+  "requests": 1536,
+  "input_tokens": 15803063,
+  "max_input_tokens": 63778,
+  "mean_input_tokens": 10288.452473958334,
+  "output_tokens_per_request": 1,
+  "format": "vllm custom JSONL: prompt, output_tokens, metadata",
+  "groups": [
+    "formal_0",
+    "formal_1",
+    "formal_2"
+  ],
+  "sources": {
+    "wildchat": "allenai/WildChat-4.8M@c827c6df8fcf008219ffaffa4d1dd77491099367",
+    "mooncake": "kvcache-ai/Mooncake@e94a0b86ba067455d8b0524eb2cbb5fbac2db024",
+    "tokenizer": "deepseek-ai/DeepSeek-V4-Flash@60d8d70770c6776ff598c94bb586a859a38244f1"
+  },
+  "database_license": "ODC-By-1.0; see LICENSE.md and THIRD_PARTY_NOTICES.md"
+}
