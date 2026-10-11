@@ -539,21 +539,58 @@ __aicore__ inline void AfdAsyncDispatchSend<TemplateMC2TypeFunc>::PreProcess(uin
     SyncFunc<HardEvent::MTE2_S>();
     SyncFunc<HardEvent::S_MTE2>();
 
-    // parallel prefix sum: how many each aiv sends to each moe / expert, accumulated along the col dimension
-    for (uint32_t col = 0; col < statEntriesPerAiv; ++col) {
-        if (col % aivNum_ != aivId_) {
-            continue;
-        }
+    // Assign consecutive columns evenly, then stage their inclusive prefixes in aligned UB rows.
+    // Use the same UB capacity decision on every core, including cores with one fewer column.
+    uint32_t maxColumnsPerAiv = (statEntriesPerAiv + aivNum_ - 1) / aivNum_;
+    uint64_t maxPrefixBufferSize = static_cast<uint64_t>(aivNum_ - 1)
+        * MathCeil(maxColumnsPerAiv * sizeof(uint32_t), UB_ALIGN);
+    if (maxPrefixBufferSize <= totalUbSize_ - bufOffset) {
+        uint32_t columnsPerAiv = statEntriesPerAiv / aivNum_;
+        uint32_t extraColumns = statEntriesPerAiv % aivNum_;
+        uint32_t columnStart = aivId_ * columnsPerAiv
+            + (aivId_ < extraColumns ? aivId_ : extraColumns);
+        uint32_t columnCount = columnsPerAiv + (aivId_ < extraColumns ? 1U : 0U);
+        if (columnCount > 0 && aivNum_ > 1) {
+            uint32_t prefixRowStride = MathCeil(columnCount * sizeof(uint32_t), UB_ALIGN) / sizeof(uint32_t);
+            LocalTensor<uint32_t> prefixTensor = ubBuffer_.GetWithOffset<uint32_t>(
+                (aivNum_ - 1) * prefixRowStride, bufOffset);
+            for (uint32_t col = 0; col < columnCount; ++col) {
+                uint32_t sum = aivStatTensor(columnStart + col);
+                for (uint32_t row = 1; row < aivNum_; ++row) {
+                    sum += aivStatTensor(statEntriesPerAiv * row + columnStart + col);
+                    prefixTensor((row - 1) * prefixRowStride + col) = sum;
+                }
+            }
 
-        for (uint32_t row = 1; row < aivNum_; ++row) {
-            uint32_t sum = aivStatTensor(statEntriesPerAiv * (row - 1) + col)
-                + aivStatTensor(statEntriesPerAiv * row + col);
-            aivStatTensor(statEntriesPerAiv * row + col) = sum;
-            aivStatTensor(0) = sum;
+            // GM keeps its original compact row layout; only the UB staging rows are padded.
+            constexpr uint32_t PREFIX_COPY_ROWS = 32;
             SyncFunc<HardEvent::S_MTE3>();
-            DataCopyPad(aivStatGMTensor[statEntriesPerAiv * row + col], aivStatTensor,
-                {1U, sizeof(uint32_t), 0U, 0U, 0U});
+            for (uint32_t row = 1; row < aivNum_; row += PREFIX_COPY_ROWS) {
+                uint32_t rowsToCopy = aivNum_ - row;
+                rowsToCopy = rowsToCopy < PREFIX_COPY_ROWS ? rowsToCopy : PREFIX_COPY_ROWS;
+                DataCopyPad(aivStatGMTensor[statEntriesPerAiv * row + columnStart],
+                    prefixTensor[(row - 1) * prefixRowStride],
+                    {static_cast<uint16_t>(rowsToCopy), static_cast<uint32_t>(columnCount * sizeof(uint32_t)),
+                     0U, static_cast<uint32_t>((statEntriesPerAiv - columnCount) * sizeof(uint32_t)), 0U});
+            }
             SyncFunc<HardEvent::MTE3_S>();
+        }
+    } else {
+        // Preserve support for shapes whose existing statistics buffer nearly fills UB.
+        for (uint32_t col = 0; col < statEntriesPerAiv; ++col) {
+            if (col % aivNum_ != aivId_) {
+                continue;
+            }
+            for (uint32_t row = 1; row < aivNum_; ++row) {
+                uint32_t sum = aivStatTensor(statEntriesPerAiv * (row - 1) + col)
+                    + aivStatTensor(statEntriesPerAiv * row + col);
+                aivStatTensor(statEntriesPerAiv * row + col) = sum;
+                aivStatTensor(0) = sum;
+                SyncFunc<HardEvent::S_MTE3>();
+                DataCopyPad(aivStatGMTensor[statEntriesPerAiv * row + col], aivStatTensor,
+                    {1U, sizeof(uint32_t), 0U, 0U, 0U});
+                SyncFunc<HardEvent::MTE3_S>();
+            }
         }
     }
 
