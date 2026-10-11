@@ -1,0 +1,502 @@
+{
+  "combine-baseline-hidden-1": {
+    "configuration": {
+      "attn_ranks": 2,
+      "moe_ranks": 2,
+      "tp_size": 2,
+      "experts_per_rank": 4,
+      "top_k": 2,
+      "hidden_size": 7168,
+      "lengths": [
+        7,
+        5
+      ],
+      "dtype": "bf16",
+      "dynamic_quant": 1,
+      "routing": "balanced",
+      "capacity": 16,
+      "window_mb": 64,
+      "timeout_seconds": 60.0,
+      "max_seq_len": 14
+    },
+    "moe_rank_samples_us": {
+      "2": [
+        21.9,
+        22.08,
+        22.14,
+        21.56,
+        21.92
+      ],
+      "3": [
+        25.559,
+        25.82,
+        26.24,
+        25.92,
+        26.14
+      ]
+    },
+    "tasks_per_iteration_by_rank": {
+      "2": 1,
+      "3": 1
+    },
+    "slowest_rank_samples_us": [
+      25.559,
+      25.82,
+      26.24,
+      25.92,
+      26.14
+    ],
+    "slowest_mean_us": 25.9358,
+    "selection": "last 5 of 11 iterations per MoE rank; chronologically grouped equal-count combine-send tasks summed per iteration; one precision preflight, 5 warmups"
+  },
+  "combine-baseline-many-1": {
+    "configuration": {
+      "attn_ranks": 2,
+      "moe_ranks": 2,
+      "tp_size": 2,
+      "experts_per_rank": 128,
+      "top_k": 3,
+      "hidden_size": 256,
+      "lengths": [
+        97,
+        65
+      ],
+      "dtype": "bf16",
+      "dynamic_quant": 1,
+      "routing": "balanced",
+      "capacity": 512,
+      "window_mb": 64,
+      "timeout_seconds": 60.0,
+      "max_seq_len": 194
+    },
+    "moe_rank_samples_us": {
+      "3": [
+        50.079,
+        49.879,
+        49.659,
+        49.659,
+        49.859
+      ],
+      "2": [
+        46.159,
+        45.859,
+        46.259,
+        45.799,
+        45.919
+      ]
+    },
+    "tasks_per_iteration_by_rank": {
+      "3": 1,
+      "2": 1
+    },
+    "slowest_rank_samples_us": [
+      50.079,
+      49.879,
+      49.659,
+      49.659,
+      49.859
+    ],
+    "slowest_mean_us": 49.827,
+    "selection": "last 5 of 11 iterations per MoE rank; chronologically grouped equal-count combine-send tasks summed per iteration; one precision preflight, 5 warmups"
+  },
+  "combine-baseline-many-2": {
+    "configuration": {
+      "attn_ranks": 2,
+      "moe_ranks": 2,
+      "tp_size": 2,
+      "experts_per_rank": 128,
+      "top_k": 3,
+      "hidden_size": 256,
+      "lengths": [
+        97,
+        65
+      ],
+      "dtype": "bf16",
+      "dynamic_quant": 1,
+      "routing": "balanced",
+      "capacity": 512,
+      "window_mb": 64,
+      "timeout_seconds": 60.0,
+      "max_seq_len": 194
+    },
+    "moe_rank_samples_us": {
+      "3": [
+        41.359,
+        41.359,
+        41.259,
+        41.46,
+        41.379
+      ],
+      "2": [
+        53.159,
+        53.099,
+        52.979,
+        53.259,
+        52.179
+      ]
+    },
+    "tasks_per_iteration_by_rank": {
+      "3": 1,
+      "2": 1
+    },
+    "slowest_rank_samples_us": [
+      53.159,
+      53.099,
+      52.979,
+      53.259,
+      52.179
+    ],
+    "slowest_mean_us": 52.935,
+    "selection": "last 5 of 11 iterations per MoE rank; chronologically grouped equal-count combine-send tasks summed per iteration; one precision preflight, 5 warmups"
+  },
+  "combine-baseline-small-1": {
+    "configuration": {
+      "attn_ranks": 2,
+      "moe_ranks": 2,
+      "tp_size": 2,
+      "experts_per_rank": 4,
+      "top_k": 2,
+      "hidden_size": 256,
+      "lengths": [
+        7,
+        5
+      ],
+      "dtype": "bf16",
+      "dynamic_quant": 1,
+      "routing": "balanced",
+      "capacity": 16,
+      "window_mb": 64,
+      "timeout_seconds": 60.0,
+      "max_seq_len": 14
+    },
+    "moe_rank_samples_us": {
+      "2": [
+        23.579,
+        17.479,
+        18.599,
+        17.48,
+        17.56
+      ],
+      "3": [
+        16.859,
+        16.42,
+        16.719,
+        15.74,
+        16.22
+      ]
+    },
+    "tasks_per_iteration_by_rank": {
+      "2": 1,
+      "3": 1
+    },
+    "slowest_rank_samples_us": [
+      23.579,
+      17.479,
+      18.599,
+      17.48,
+      17.56
+    ],
+    "slowest_mean_us": 18.9394,
+    "selection": "last 5 of 11 iterations per MoE rank; chronologically grouped equal-count combine-send tasks summed per iteration; one precision preflight, 5 warmups"
+  },
+  "combine-baseline-small-2": {
+    "configuration": {
+      "attn_ranks": 2,
+      "moe_ranks": 2,
+      "tp_size": 2,
+      "experts_per_rank": 4,
+      "top_k": 2,
+      "hidden_size": 256,
+      "lengths": [
+        7,
+        5
+      ],
+      "dtype": "bf16",
+      "dynamic_quant": 1,
+      "routing": "balanced",
+      "capacity": 16,
+      "window_mb": 64,
+      "timeout_seconds": 60.0,
+      "max_seq_len": 14
+    },
+    "moe_rank_samples_us": {
+      "2": [
+        17.3,
+        18.48,
+        17.679,
+        17.159,
+        18.42
+      ],
+      "3": [
+        23.86,
+        23.119,
+        22.399,
+        22.38,
+        23.559
+      ]
+    },
+    "tasks_per_iteration_by_rank": {
+      "2": 1,
+      "3": 1
+    },
+    "slowest_rank_samples_us": [
+      23.86,
+      23.119,
+      22.399,
+      22.38,
+      23.559
+    ],
+    "slowest_mean_us": 23.0634,
+    "selection": "last 5 of 11 iterations per MoE rank; chronologically grouped equal-count combine-send tasks summed per iteration; one precision preflight, 5 warmups"
+  },
+  "combine-combine_send_candidate-hidden-1": {
+    "configuration": {
+      "attn_ranks": 2,
+      "moe_ranks": 2,
+      "tp_size": 2,
+      "experts_per_rank": 4,
+      "top_k": 2,
+      "hidden_size": 7168,
+      "lengths": [
+        7,
+        5
+      ],
+      "dtype": "bf16",
+      "dynamic_quant": 1,
+      "routing": "balanced",
+      "capacity": 16,
+      "window_mb": 64,
+      "timeout_seconds": 60.0,
+      "max_seq_len": 14
+    },
+    "moe_rank_samples_us": {
+      "2": [
+        17.019,
+        15.919,
+        16.14,
+        20.24,
+        16.38
+      ],
+      "3": [
+        17.539,
+        17.6,
+        17.44,
+        17.679,
+        17.599
+      ]
+    },
+    "tasks_per_iteration_by_rank": {
+      "2": 1,
+      "3": 1
+    },
+    "slowest_rank_samples_us": [
+      17.539,
+      17.6,
+      17.44,
+      20.24,
+      17.599
+    ],
+    "slowest_mean_us": 18.0836,
+    "selection": "last 5 of 11 iterations per MoE rank; chronologically grouped equal-count combine-send tasks summed per iteration; one precision preflight, 5 warmups"
+  },
+  "combine-combine_send_candidate-many-1": {
+    "configuration": {
+      "attn_ranks": 2,
+      "moe_ranks": 2,
+      "tp_size": 2,
+      "experts_per_rank": 128,
+      "top_k": 3,
+      "hidden_size": 256,
+      "lengths": [
+        97,
+        65
+      ],
+      "dtype": "bf16",
+      "dynamic_quant": 1,
+      "routing": "balanced",
+      "capacity": 512,
+      "window_mb": 64,
+      "timeout_seconds": 60.0,
+      "max_seq_len": 194
+    },
+    "moe_rank_samples_us": {
+      "2": [
+        42.16,
+        41.979,
+        42.359,
+        42.0,
+        42.04
+      ],
+      "3": [
+        33.44,
+        33.139,
+        33.24,
+        32.959,
+        33.159
+      ]
+    },
+    "tasks_per_iteration_by_rank": {
+      "2": 1,
+      "3": 1
+    },
+    "slowest_rank_samples_us": [
+      42.16,
+      41.979,
+      42.359,
+      42.0,
+      42.04
+    ],
+    "slowest_mean_us": 42.1076,
+    "selection": "last 5 of 11 iterations per MoE rank; chronologically grouped equal-count combine-send tasks summed per iteration; one precision preflight, 5 warmups"
+  },
+  "combine-combine_send_candidate-many-2": {
+    "configuration": {
+      "attn_ranks": 2,
+      "moe_ranks": 2,
+      "tp_size": 2,
+      "experts_per_rank": 128,
+      "top_k": 3,
+      "hidden_size": 256,
+      "lengths": [
+        97,
+        65
+      ],
+      "dtype": "bf16",
+      "dynamic_quant": 1,
+      "routing": "balanced",
+      "capacity": 512,
+      "window_mb": 64,
+      "timeout_seconds": 60.0,
+      "max_seq_len": 194
+    },
+    "moe_rank_samples_us": {
+      "2": [
+        39.259,
+        39.98,
+        39.779,
+        39.399,
+        39.56
+      ],
+      "3": [
+        32.959,
+        32.999,
+        33.039,
+        32.96,
+        32.779
+      ]
+    },
+    "tasks_per_iteration_by_rank": {
+      "2": 1,
+      "3": 1
+    },
+    "slowest_rank_samples_us": [
+      39.259,
+      39.98,
+      39.779,
+      39.399,
+      39.56
+    ],
+    "slowest_mean_us": 39.5954,
+    "selection": "last 5 of 11 iterations per MoE rank; chronologically grouped equal-count combine-send tasks summed per iteration; one precision preflight, 5 warmups"
+  },
+  "combine-combine_send_candidate-small-1": {
+    "configuration": {
+      "attn_ranks": 2,
+      "moe_ranks": 2,
+      "tp_size": 2,
+      "experts_per_rank": 4,
+      "top_k": 2,
+      "hidden_size": 256,
+      "lengths": [
+        7,
+        5
+      ],
+      "dtype": "bf16",
+      "dynamic_quant": 1,
+      "routing": "balanced",
+      "capacity": 16,
+      "window_mb": 64,
+      "timeout_seconds": 60.0,
+      "max_seq_len": 14
+    },
+    "moe_rank_samples_us": {
+      "3": [
+        17.48,
+        16.559,
+        17.399,
+        15.92,
+        17.039
+      ],
+      "2": [
+        20.06,
+        17.04,
+        20.379,
+        15.38,
+        21.52
+      ]
+    },
+    "tasks_per_iteration_by_rank": {
+      "3": 1,
+      "2": 1
+    },
+    "slowest_rank_samples_us": [
+      20.06,
+      17.04,
+      20.379,
+      15.92,
+      21.52
+    ],
+    "slowest_mean_us": 18.9838,
+    "selection": "last 5 of 11 iterations per MoE rank; chronologically grouped equal-count combine-send tasks summed per iteration; one precision preflight, 5 warmups"
+  },
+  "combine-combine_send_candidate-small-2": {
+    "configuration": {
+      "attn_ranks": 2,
+      "moe_ranks": 2,
+      "tp_size": 2,
+      "experts_per_rank": 4,
+      "top_k": 2,
+      "hidden_size": 256,
+      "lengths": [
+        7,
+        5
+      ],
+      "dtype": "bf16",
+      "dynamic_quant": 1,
+      "routing": "balanced",
+      "capacity": 16,
+      "window_mb": 64,
+      "timeout_seconds": 60.0,
+      "max_seq_len": 14
+    },
+    "moe_rank_samples_us": {
+      "3": [
+        17.22,
+        15.96,
+        15.58,
+        16.36,
+        17.279
+      ],
+      "2": [
+        15.719,
+        24.819,
+        16.66,
+        16.219,
+        17.4
+      ]
+    },
+    "tasks_per_iteration_by_rank": {
+      "3": 1,
+      "2": 1
+    },
+    "slowest_rank_samples_us": [
+      17.22,
+      24.819,
+      16.66,
+      16.36,
+      17.4
+    ],
+    "slowest_mean_us": 18.491799999999998,
+    "selection": "last 5 of 11 iterations per MoE rank; chronologically grouped equal-count combine-send tasks summed per iteration; one precision preflight, 5 warmups"
+  }
+}

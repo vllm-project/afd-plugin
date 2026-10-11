@@ -226,11 +226,7 @@ __aicore__ inline void AfdAsyncCombineSend<TemplateMC2TypeFunc>::CombineSend()
     uint32_t nextTokenNumCnt = tpBatchInfoTensor_(tpInfoOffset + expertId);
 
     GlobalTensor<ExpandXType> dstTokenStoreGM;
-    GM_ADDR dstRankWorkspaceGm = GetPeerAddrByRankId(tpAttnRankId + tpIndex) + dispatchOffset_;
-    uint32_t moePrefixTokenNum = tpBatchInfoTensor_(INFO_NUM + tpIndex);
-    uint64_t tokenStoreOffset = MathCeil(sizeof(uint32_t) * moeRankNum_, UB_ALIGN)
-        + (sizeof(ExpandXType) * hiddenSize_ * moePrefixTokenNum);
-    dstTokenStoreGM.SetGlobalBuffer((__gm__ ExpandXType *)(dstRankWorkspaceGm + tokenStoreOffset));
+    uint32_t resolvedTpIndex = tpSize_;
 
     for (uint32_t i = 0; i < totalTokenNumPerAivEnd;) {
         // Skip all empty (expert, TP-rank) cells before scheduling a data copy.
@@ -240,14 +236,6 @@ __aicore__ inline void AfdAsyncCombineSend<TemplateMC2TypeFunc>::CombineSend()
             tpIndex = currSendId % tpSize_;
             expertId = (expertNumPerMoe_ * tpIndex) + (currSendId / tpSize_);
             nextTokenNumCnt += tpBatchInfoTensor_(tpInfoOffset + expertId);
-
-            // target attn rank to write back to
-            dstRankWorkspaceGm = GetPeerAddrByRankId(tpAttnRankId + tpIndex) + dispatchOffset_;
-            // how many tokens prior moe cards wrote back to this tp index's attn card
-            moePrefixTokenNum = tpBatchInfoTensor_(INFO_NUM + tpIndex);
-            tokenStoreOffset = MathCeil(sizeof(uint32_t) * moeRankNum_, UB_ALIGN)
-                + (sizeof(ExpandXType) * hiddenSize_ * moePrefixTokenNum);
-            dstTokenStoreGM.SetGlobalBuffer((__gm__ ExpandXType *)(dstRankWorkspaceGm + tokenStoreOffset));
         }
 
         if (i < totalTokenNumPerAivStart) {
@@ -266,6 +254,16 @@ __aicore__ inline void AfdAsyncCombineSend<TemplateMC2TypeFunc>::CombineSend()
             cnt = maxUbTokenNum_ < cnt ? maxUbTokenNum_ : cnt;
             // offset on the original attn rank, computed from the total count
             uint32_t moeTokenSendIdx = tpExpertTokenSendCntTensor_(tpIndex);
+
+            // Skipped cells need no peer lookup; a destination base depends only on its TP rank.
+            if (resolvedTpIndex != tpIndex) {
+                GM_ADDR dstRankWorkspaceGm = GetPeerAddrByRankId(tpAttnRankId + tpIndex) + dispatchOffset_;
+                uint32_t moePrefixTokenNum = tpBatchInfoTensor_(INFO_NUM + tpIndex);
+                uint64_t tokenStoreOffset = MathCeil(sizeof(uint32_t) * moeRankNum_, UB_ALIGN)
+                    + (sizeof(ExpandXType) * hiddenSize_ * moePrefixTokenNum);
+                dstTokenStoreGM.SetGlobalBuffer((__gm__ ExpandXType *)(dstRankWorkspaceGm + tokenStoreOffset));
+                resolvedTpIndex = tpIndex;
+            }
 
             // copy input to UB: i is offset, cnt is count, i is per this chunk
             DataCopy(xTensor_, xGMTensor_[hiddenSize_ * i], hiddenSize_ * cnt);
