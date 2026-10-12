@@ -51,6 +51,8 @@ Prefill --Mooncake KV--> Decode Attention --P2pHccl AFD--> Decode FFN
 
 2026-10-10 现场进展：已回传 standalone EOS 与 C1 执行成功日志；C2 四个 drafter 已加载，直连 Attention 已有 proposal/acceptance，但 Proxy 请求在 Mooncake KV 接收时报 block 长度不匹配，随后 hybrid cache 失败处理触发单组解包错误。`【本地已完成】` afd-plugin scheduler 兼容补丁在异步 PD load 时延后 DSpark lookahead，保留正常 decode 的预测分配，并修正 `failure_policy=fail` 的多组请求失败处理。冻结源码 CPU 分配重放和回归通过，尚未证明 A5 C2 F0。`【A5 手工执行】` 下一步按统一指导书第 3.4 节更新/冻结插件提交、冷启动 C2、确认四个 EngineCore 补丁标记，再经 Proxy 执行 1 请求 EOS→5 请求 smoke→92 请求 full；C2 F0 未通过不进入 C3。各阶段完整门禁仍按本计划核对，三机、精度和性能继续待执行。
 
+2026-10-12 更新：现场四个 EngineCore 已启用 scheduler 补丁，失败后进程继续运行，但 EOS 经 Proxy 仍失败。新证据确认 Prefill/Attention 为 6/5 组，DSpark 还改变了物理张量排列。`【本地已完成】` 新增按 target 层名协商组号、地址和步长的 Mooncake 修复；保留异步分配和 hybrid fail 修复，并使 Proxy/请求脚本保留 HTTP 错误。CPU 数据核对和握手/错误回归通过，A5 C2 仍未通过。`【A5 手工执行】` 按指导书第 3.4 节更新同一插件提交并冷启动四角色；Prefill 两个 Worker、Attention 四个 Worker 须有布局标记，随后先 Proxy EOS。两端组数可以不同，须以逐层传输成功和原功能门禁判定，不能仅凭启动成功进入 C3。
+
 ## 3. 固定范围
 
 ### 3.1 验收拓扑

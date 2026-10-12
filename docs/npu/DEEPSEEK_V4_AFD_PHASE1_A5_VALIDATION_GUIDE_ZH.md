@@ -1,6 +1,6 @@
 # DeepSeek-V4 AFD A5 1030 合并验证指导书
 
-更新日期：2026-10-10。本文合并旧 A5 dSpark/PD 指导与[1030 执行计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)，是本期现场操作入口。
+更新日期：2026-10-12。本文合并旧 A5 dSpark/PD 指导与[1030 执行计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)，是本期现场操作入口。
 执行计划规定交付范围和日期，本文规定现场命令、验证顺序、证据与失败处理。
 本文是待执行指导，不代表组合已经通过 A5 验收。
 
@@ -323,15 +323,19 @@ sha256sum "$DSPARK_OPS_WHEEL"
 
 缺少已确认的包时先回传查找输出，C2/C4/C5 保持 blocked。导入和注册通过后记录包来源/版本/hash，使用新的 run ID 冷启动 C2；这项预检仍需由实际 draft 加载及在线 proposed/accepted 增量完成实机验证。
 
-### 3.4 【A5 手工执行】C2 的异步 PD KV 分配修复及复测
+### 3.4 【A5 手工执行】C2 的 PD KV 布局修复及复测
 
-**适用错误**：Attention 的 Mooncake 接收报 `operands could not be broadcast together with shapes (0,) (3,)`，随后 scheduler 报 `too many values to unpack (expected 1)` 并退出。
-2026-10-10 回传日志证明 DSpark 直连已有 proposal/acceptance，但经 Proxy 的 PD 请求仍失败。原日志目录被覆盖不改变这一结论；本次定位依据日志时间、PID 和请求 ID。
+**适用错误**：经 Proxy 的 EOS 报 `JSONDecodeError: Expecting value`，Attention 的 Mooncake 接收仍报 `operands could not be broadcast together with shapes (0,) (3,)`。
 
-`【本地已完成】` 修复位于 `afd_plugin/compat/patches/npu/dspark_pd.py`，由插件入口自动注册。固定 vLLM 0.23 仅对 EAGLE 的异步 PD load 关闭 lookahead；DSpark 经 `mtp` 入口仍分配预测尾部 block，Mooncake 将它们加入接收列表。本次在 AFD + DSpark + Mooncake consumer 的异步分配阶段将 lookahead 置 0，进入正常 decode 后恢复原预测分配；没有裁剪两端列表来掩盖长度差异。多组 KV 的 `failure_policy=fail` 使用 Mooncake 的 group-0 失败标记终止受影响请求，避免再按单组解包导致 EngineCore 退出。
-本地回归及冻结源码的 CPU 分配重放已通过；实际 NPU 数据传输、模型输出和 C2 F0 仍须现场复测。保持现有 vLLM/vLLM-Ascend 提交、DSpark 和 A5 HIXL 配置。
+2026-10-12 附件 `cb15c79fe8614ade8b3fc654a8ec62d7.gz` 中，四个 EngineCore 已启用 10-10 scheduler 补丁；请求失败后仍继续运行，证明失败隔离已生效。KV 传输仍失败：同一请求 Prefill 发出 **6 组** block ID，Attention 接收端只有 **5 组**。DSpark 增加缓存层后，上游会重新分组和排列物理张量；组号与注册地址数组下标不能跨两端直接配对。上次只修复异步 lookahead 和 hybrid fail，未解决此布局问题。Proxy 又把后端 500 吞成空 HTTP 200，才导致请求脚本解析空 JSON；更改 EOS prompt 或只修解析异常不能修复 KV 传输。
 
-**1. 【A5 手工执行】保留当前失败日志，按第 7 节正常停服并确认设备/端口释放。** 在已经按第 3.1 节加载现场环境的终端更新代码；下面是本轮实际源码路径：
+`【本地已完成】` 新修复 `afd_plugin/compat/patches/npu/dspark_pd_layout.py` 在 Prefill/Attention Worker 导入完成后自动注册。Prefill 握手发送每个 target 缓存层的层名、组号、实际地址、块步长与组件布局；Attention 按层名映射两端组号，分别使用两端步长，传输前检查布局和块数量。DSpark 独有缓存仅保留在 Attention 本地，不从 Prefill 拉取。两端可以继续分别为 6/5 组；**不要求组数相等，也不按较短列表强行截断错配组**。原 `dspark_pd.py` 的异步分配及 hybrid fail 修复保留。非 DSpark 接收端保持原传输路径。
+
+Proxy 非流式后端失败现在返回带错误内容的 HTTP 502；流式失败发送 SSE error。请求脚本在解析前保存 `<请求名>.response.http.json` 和 `<请求名>.response.body`，包括 HTTP 状态、头和原始响应体。失败仍判为不通过。
+
+本地真实 CPU 张量的 6→5 组数据拷贝、不同物理排列/步长、A5 indexer 重叠视图、非法布局拒绝、msgpack/pickle 握手及错误响应回归已通过；**NPU 实际传输、模型输出和 C2 F0 仍待 A5 复测**。保持 vLLM/vLLM-Ascend 提交、CANN、DSpark、五个默认开关及 A5 本机 HIXL 绝对路径。
+
+**1. 【A5 手工执行】保留当前失败日志，按第 7 节正常停止 Prefill、Attention、FFN、Proxy 并确认设备/端口释放。** 在已经按第 3.1 节加载现场环境的终端更新代码；下面是本轮实际源码路径：
 
 ```bash
 export AFD_PLUGIN_ROOT=/home/z00569729/dsv4-afd-a128f32-r3/src/afd-plugin-phase1-delivery
@@ -355,7 +359,7 @@ grep -n '^export AFD_EXPECTED_COMMIT=' "$SITE_FILE"
 sha256sum "$SITE_FILE"
 ```
 
-**2. 【A5 手工执行】确认同一个服务 Python 加载新源码和匹配的 scheduler API。** 已有 editable 安装指向上述目录时，Git 更新后重启即可；导入路径不同则先按交接清单第 2.2 节安装本次插件。
+**2. 【A5 手工执行】确认同一个服务 Python 加载新源码及匹配的 scheduler/Mooncake API。** 已有 editable 安装指向上述目录时，Git 更新后重启即可；导入路径不同则先按交接清单第 2.2 节安装本次插件。
 
 ```bash
 "$PYTHON_BIN" - "$AFD_PLUGIN_ROOT" <<'PY'
@@ -363,14 +367,16 @@ import sys
 from pathlib import Path
 import afd_plugin
 from afd_plugin.compat.patches.npu.dspark_pd import apply_afd_dspark_pd_scheduler_patch
+from afd_plugin.compat.patches.npu.dspark_pd_layout import apply_afd_dspark_pd_layout_patch
 source = Path(afd_plugin.__file__).resolve()
 assert source.is_relative_to(Path(sys.argv[1]).resolve()), source
 assert apply_afd_dspark_pd_scheduler_patch(), 'vLLM version/scheduler API mismatch'
-print('DSpark PD scheduler patch registered:', source)
+assert apply_afd_dspark_pd_layout_patch(), 'vLLM version/Mooncake API mismatch'
+print('DSpark PD scheduler + layer layout patches registered:', source)
 PY
 ```
 
-**3. 【A5 手工执行】冷启动新的同机 C2。** 按第 3.1/3.2、4.1/4.3/4.4、6.1/6.2 节依次执行。第 4.3 节的两个目录配置示例都改为 `CASE=C2`，使用新的实际 `CYCLE/RUN_ID`；本机只创建目录一次，其他角色使用相同值。设备 P0–1/A2–5/F6–7，Attention 为 `eager/U1/DSpark on`。在各角色开关配置前设置：
+**3. 【A5 手工执行】四个角色冷启动新的同机 C2。** **Prefill 也必须加载新插件并重新启动**，否则会报 `Prefill lacks layer layout metadata`；只重启 Attention 或只重跑请求脚本不生效。 按第 3.1/3.2、4.1/4.3/4.4、6.1/6.2 节依次执行。第 4.3 节的两个目录配置示例都改为 `CASE=C2`，使用新的实际 `CYCLE/RUN_ID`；本机只创建目录一次，其他角色使用相同值。设备 P0–1/A2–5/F6–7，Attention 为 `eager/U1/DSpark on`。在各角色开关配置前设置：
 
 ```bash
 export VLLM_LOGGING_LEVEL=DEBUG
@@ -385,7 +391,15 @@ grep -nE 'AscendDSparkProposer|drafter|AFD FFN EngineCore started' \
   "$RUN_ROOT/attention.log" "$RUN_ROOT/ffn.log"
 ```
 
-仅看到 API health 200 或直连 Attention 成功不足以证明 C2；缺少补丁标记时先核对源码路径、版本及插件注册日志。
+还须确认 Prefill 的两个 Worker 和 Attention 的四个 Worker 打印布局握手标记：
+
+```bash
+grep -nF 'AFD DSpark PD layer layout active:' "$RUN_ROOT/prefill.log" "$RUN_ROOT/attention.log"
+test "$(grep -cF 'AFD DSpark PD layer layout active:' "$RUN_ROOT/prefill.log" || true)" -ge 2
+test "$(grep -cF 'AFD DSpark PD layer layout active:' "$RUN_ROOT/attention.log" || true)" -ge 4
+```
+
+此标记含 `role`、`groups`、`target_layers` 和逐层组号；两端 target 层名必须对应，组号可以不同。仅看到 API health 200 或直连 Attention 成功不足以证明 C2；缺少补丁标记时先核对源码路径、版本及插件注册日志。
 
 **4. 【A5 手工执行】先经 Proxy 发送 1 个 EOS 请求。** 在同机服务终端执行，不加 `--standalone`；`BASE_URL` 的 9000 是 Proxy，`ATTENTION_URL` 的 8910 仅用于管理接口和指标：
 
@@ -400,6 +414,16 @@ curl --noproxy '*' -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/attention-metrics-
   --run-id "$RUN_ID-eos"
 curl --noproxy '*' -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/attention-metrics-after-eos.txt"
 ```
+
+请求后检查本轮传输完成证据：
+
+```bash
+grep -nF 'AFD DSpark PD layer KV transfer:' "$RUN_ROOT/attention.log"
+grep -nE 'broadcast together|hybrid KV load failed|Prefill lacks layer layout|insufficient remote blocks|incompatible cache layout|EngineDeadError' \
+  "$RUN_ROOT/attention.log" "$RUN_ROOT/proxy.log" || true
+```
+
+成功日志包含请求 ID、`local_groups`/`remote_groups`、`regions`、`bytes` 和耗时。本轮 EOS 应有 `regions>0`、`bytes>0`，允许出现 `local_groups=5 remote_groups=6`。失败时必须保留对应 EOS 输出目录的 `eos.response.http.json`、`eos.response.body`、`request_summary.json` 及四角色日志；HTTP 502 或布局检查报错仍是不通过。
 
 成功要求：脚本退出 0、响应自然 EOS（`finish_reason=stop`）、Proxy 请求归零；同一请求有真实 Prefill→Attention KV 接收证据，Attention 无原 broadcast/解包异常、EngineCore 保持运行。检查本轮 proposed/accepted 增量；一次短请求不能代替完整 DSpark 门禁。失败时保留三角色和 Proxy 日志、请求 JSON/summary、metrics，停止扩大流量。
 

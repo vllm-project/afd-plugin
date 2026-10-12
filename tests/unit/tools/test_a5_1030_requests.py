@@ -72,6 +72,12 @@ def request_gate(tmp_path, monkeypatch):
             active -= 1
             if fault == "http-error":
                 return httpx.Response(500, text="backend failed")
+            if fault == "empty-body":
+                return httpx.Response(
+                    200, content=b"", headers={"content-type": "application/json"}
+                )
+            if fault == "html-body":
+                return httpx.Response(200, text="<html>gateway error</html>")
             body = json.loads(request.content)
             chat = request.url.path == "/v1/chat/completions"
             if chat:
@@ -210,6 +216,8 @@ def test_chat_length_limit_is_not_accepted_as_natural_eos(request_gate, suite):
     assert sorted(path.name for path in Path(args.output).iterdir()) == [
         "eos.json",
         "eos.request.json",
+        "eos.response.body",
+        "eos.response.http.json",
     ]
 
 
@@ -229,6 +237,27 @@ def test_invalid_backend_behavior_does_not_pass(request_gate, fault, match):
 
 
 def test_backend_http_failure_does_not_pass(request_gate):
-    _, exercise = request_gate
+    args, exercise = request_gate
     with pytest.raises(httpx.HTTPStatusError):
         exercise("http-error")
+    assert Path(args.output, "eos.response.body").read_text() == "backend failed"
+    assert (
+        json.loads(Path(args.output, "eos.response.http.json").read_text())[
+            "status_code"
+        ]
+        == 500
+    )
+
+
+@pytest.mark.parametrize("fault", ["empty-body", "html-body"])
+def test_invalid_json_records_original_http_response(request_gate, fault):
+    args, exercise = request_gate
+    with pytest.raises(ValueError, match="HTTP 200 returned invalid/empty JSON"):
+        exercise(fault)
+    assert Path(args.output, "eos.response.body").exists()
+    assert (
+        json.loads(Path(args.output, "eos.response.http.json").read_text())[
+            "status_code"
+        ]
+        == 200
+    )

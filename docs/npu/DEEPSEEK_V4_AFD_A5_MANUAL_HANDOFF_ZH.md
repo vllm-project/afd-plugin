@@ -1,6 +1,6 @@
 # DeepSeek-V4 AFD A5 手工执行交接清单
 
-更新日期：2026-10-10。执行顺序与[统一验证指导书](DEEPSEEK_V4_AFD_PHASE1_A5_VALIDATION_GUIDE_ZH.md)、[1030 计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)一致。
+更新日期：2026-10-12。执行顺序与[统一验证指导书](DEEPSEEK_V4_AFD_PHASE1_A5_VALIDATION_GUIDE_ZH.md)、[1030 计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)一致。
 
 `【本地已完成】` 表示源码修改及 CPU/mock 检查；`【A5 手工执行】` 表示需要你在A5 现场运行。首次执行顺序为 **A5-01 → A5-02 → A5-03 → A5-04**。当前现场已回传 standalone EOS、C1 执行成功及 C2 PD 请求失败日志；下一步按统一指导书第 3.4 节更新修复并复测 C2。三机和最终精度留待前置阶段通过后执行。
 
@@ -20,11 +20,12 @@
 | A5-06 | 三机 P8/A4/F2，C1–C5 | **A5 手工执行：你** | 同机矩阵全部通过后执行 |
 | A5-07 | 同机/三机 C5 GSM8K 与诊断关闭的性能采集 | **A5 手工执行：你** | 完整功能组合通过后执行 |
 | LOCAL-05 | 审阅回传证据、定位问题、更新验收表及最终包 | 收到证据后本地继续 | 待现场结果 |
-| LOCAL-06 | DSpark 异步 PD 禁止预测尾部进入接收列表；修复 hybrid fail 解包 | 本地已完成，A5 待复测 | scheduler 补丁、回归及冻结源码 CPU 分配重放通过；见指导书第 3.4 节 |
+| LOCAL-06 | DSpark 异步 PD 分配与 hybrid fail 处理 | 本地已完成，现场失败隔离已生效 | 10-12 日志仍有 KV 传输失败；不能将该补丁视为 C2 通过 |
+| LOCAL-07 | 两端 KV 按层名协商组号/地址/步长；保留原始 HTTP 错误 | 本地已完成，A5 待复测 | CPU 6→5 组逐层数据核对、握手序列化及错误回归通过；必须更新并重启 Prefill/Attention/FFN/Proxy；见指导书第 3.4 节 |
 
 本地测试不会将 A5-01 到 A5-07 自动标记通过。默认 C3/C5 是五开关全开；关闭对照另用 run ID。资源文件内容与真实设备是否匹配、Mooncake session/HCCL 数据面以及Graph/DSpark 在线行为必须在 A5 上验证。
 
-**本次 C2 的手工入口**：统一指导书第 3.4 节包含当前源码路径、Git 更新、`SITE_FILE` 中 `AFD_EXPECTED_COMMIT` 的替换位置、安装路径检查、C2 冷启动及请求命令。四个 Attention EngineCore DP rank 都须打印 `AFD DSpark PD scheduler compatibility active:`；请求走 Proxy 9000，不添加 `--standalone`。保留 `DEBUG` 进行此次故障复测。先发送 1 个 EOS 请求，成功后 5 请求 smoke，最后才执行 92 请求完整集。
+**本次 C2 的手工入口**：统一指导书第 3.4 节包含当前源码路径、Git 更新、`SITE_FILE` 中 `AFD_EXPECTED_COMMIT` 的替换位置、安装路径检查、C2 冷启动及请求命令。Prefill 两个 Worker、Attention 四个 Worker 均须打印 `AFD DSpark PD layer layout active:`；**Prefill 必须更新重启**。四个 Attention EngineCore DP rank 都须打印 `AFD DSpark PD scheduler compatibility active:`；请求走 Proxy 9000，不添加 `--standalone`。保留 `DEBUG` 进行此次故障复测。先发送 1 个 EOS 请求，成功后 5 请求 smoke，最后才执行 92 请求完整集。
 
 ## 2. 【A5 手工执行】A5-01：从 Git 更新交付分支
 

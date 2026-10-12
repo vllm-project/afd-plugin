@@ -204,6 +204,10 @@ def test_worker_resolution_patch_covers_prefill_and_afd_workers(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm.v1.worker.worker_base", worker_base)
 
     apply_calls = []
+    layout_calls = []
+    layout_patch = types.ModuleType("afd_plugin.compat.patches.npu.dspark_pd_layout")
+    layout_patch.apply_afd_dspark_pd_layout_patch = lambda: layout_calls.append(True)
+    monkeypatch.setitem(sys.modules, layout_patch.__name__, layout_patch)
     dispatcher_patch = types.ModuleType(
         "afd_plugin.compat.patches.npu.mxfp_alltoallv",
     )
@@ -229,6 +233,7 @@ def test_worker_resolution_patch_covers_prefill_and_afd_workers(monkeypatch):
 
     assert resolved_qualnames == list(target_workers)
     assert apply_calls == [True, True, True]
+    assert layout_calls == [True, True]
 
 
 def test_worker_resolution_patch_leaves_non_npu_worker_lazy(monkeypatch):

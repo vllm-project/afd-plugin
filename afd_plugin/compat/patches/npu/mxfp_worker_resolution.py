@@ -23,6 +23,7 @@ _TARGET_NPU_WORKERS = frozenset(
         "afd_plugin.v1.worker.npu.AFDNPUFFNWorker",
     }
 )
+_PD_NPU_WORKERS = _TARGET_NPU_WORKERS - {"afd_plugin.v1.worker.npu.AFDNPUFFNWorker"}
 
 
 def apply_afd_mxfp_worker_resolution_patch() -> bool:
@@ -43,7 +44,8 @@ def apply_afd_mxfp_worker_resolution_patch() -> bool:
     # general-plugin hook can observe DeviceOperator during a partial import,
     # while installing only in AFDNPUFFNWorker misses standard Prefill workers.
     # Patch functionality: delegates worker resolution first, then installs the
-    # signature-gated dispatcher patch for standard and AFD Ascend workers.
+    # signature-gated dispatcher patch for standard and AFD Ascend workers,
+    # plus the layout protocol for Prefill/Attention before cache registration.
     # Signature: matches the worker_base module's imported resolver; no added
     # parameters.
     def resolve_obj_by_qualname(qualname: str) -> Any:
@@ -56,6 +58,14 @@ def apply_afd_mxfp_worker_resolution_patch() -> bool:
 
             apply_afd_mxfp_alltoallv_patch()
         # ### PATCH END: lazy A5 MXFP AllToAllV compatibility
+        # ### PATCH START: lazy DSpark PD layer layout negotiation
+        if qualname in _PD_NPU_WORKERS:
+            from afd_plugin.compat.patches.npu.dspark_pd_layout import (
+                apply_afd_dspark_pd_layout_patch,
+            )
+
+            apply_afd_dspark_pd_layout_patch()
+        # ### PATCH END: lazy DSpark PD layer layout negotiation
         return resolved
 
     worker_base_module.resolve_obj_by_qualname = resolve_obj_by_qualname

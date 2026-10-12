@@ -71,8 +71,31 @@ async def run_checks(args: argparse.Namespace) -> dict:
                 json=body,
                 headers={"X-Request-Id": f"{args.run_id}-{name}"},
             )
+            raw_path = Path(args.output, f"{name}.response.body")
+            raw_path.write_bytes(response.content)
+            Path(args.output, f"{name}.response.http.json").write_text(
+                json.dumps(
+                    {
+                        "status_code": response.status_code,
+                        "headers": dict(response.headers),
+                        "body_bytes": len(response.content),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n"
+            )
             response.raise_for_status()
-            data = response.json()
+            try:
+                data = response.json()
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"{name}: HTTP {response.status_code} returned invalid/empty JSON "
+                    f"({len(response.content)} bytes, "
+                    "Content-Type="
+                    f"{response.headers.get('content-type', '<missing>')}); "
+                    f"raw response saved to {raw_path}; inspect Proxy/Attention logs"
+                ) from exc
             Path(args.output, f"{name}.json").write_text(
                 json.dumps(data, ensure_ascii=False, indent=2) + "\n"
             )

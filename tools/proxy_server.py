@@ -1199,6 +1199,23 @@ async def handle_completions_impl(api: str, request: Request):
                     exc,
                     instance_info.request_id,
                 )
+                if not stream_flag:
+                    # Non-streaming callers need an HTTP error before headers
+                    # are sent, instead of an empty application/json HTTP 200.
+                    raise
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "error": {
+                                "message": str(exc),
+                                "type": "decoder_error",
+                                "request_id": instance_info.request_id,
+                            }
+                        }
+                    )
+                    + "\n\n"
+                ).encode("utf-8")
             finally:
                 await _finish_instance(
                     runtime, instance_info, release_prefill_kv=not released_kv
@@ -1206,10 +1223,24 @@ async def handle_completions_impl(api: str, request: Request):
                 released_kv = True
                 request_released = True
 
-        media_type = (
-            "text/event-stream; charset=utf-8" if stream_flag else "application/json"
+        if not stream_flag:
+            try:
+                body = b"".join([chunk async for chunk in generate_stream()])
+            except Exception as exc:
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": {
+                            "message": str(exc),
+                            "type": "decoder_error",
+                            "request_id": instance_info.request_id,
+                        }
+                    },
+                )
+            return Response(content=body, media_type="application/json")
+        return StreamingResponse(
+            generate_stream(), media_type="text/event-stream; charset=utf-8"
         )
-        return StreamingResponse(generate_stream(), media_type=media_type)
     except Exception:
         import traceback
 
