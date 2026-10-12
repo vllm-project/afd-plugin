@@ -25,3 +25,13 @@ Proxy 的非流式后端失败返回 JSON HTTP 502，流式失败发出 SSE erro
 本地相关测试 72 项通过，包含真实 CPU 张量的 6→5 组拷贝、不同物理排列和步长、重叠 indexer 视图、非法布局拒绝、msgpack/pickle、普通 Worker 回退、Worker 导入顺序、代理错误及原始响应归档。Ruff 与 diff 检查通过。CPU 检查不验证 HIXL/NPU、模型语义、输出精度、DSpark acceptance 或 C2 F0。
 
 `【A5 手工执行】` 完整更新/启动/请求命令在[合并指导书第 3.4 节](DEEPSEEK_V4_AFD_PHASE1_A5_VALIDATION_GUIDE_ZH.md)。更新同一插件提交，保留原失败证据，冷启动 Prefill/Attention/FFN/Proxy；确认 P 两个 Worker、A 四个 Worker 的 `AFD DSpark PD layer layout active:`。先 Proxy EOS 一请求，检查 `AFD DSpark PD layer KV transfer:` 的 regions/bytes 非零和自然 EOS。通过后 smoke，再 full；C2 F0 未通过不进入 C3。
+
+## 32 并发通知丢失修复审查（同日追加）
+
+附件 `78b041cf6b3b4f5cb30c3dddef3819de.gz`：EOS 正常 stop/2 tokens，KV 6→5 组成功且四 DP 排空。full 留下 44 个成功响应（EOS 1、1/8 短长 18、32 短 25）。另 7 个 KV 拷贝均成功（0.67–1.02 ms），紧随 `finish req not in reqs to process`，无 scheduler `Finished recving KV transfer`，反复 WAITING_FOR_REMOTE_KVS 直至 300 秒读取超时。未见上一轮 broadcast/传输失败。日志时间按现场日志原样引用，不用 RUN_ID 的旧日期判断是否旧服务。
+
+`MooncakeConnectorWorker.start_load_kv` 的冻结源码先向接收线程入队全部请求，再执行 reqs_in_batch 登记。线程能在登记前完成，tracker 无法发布 finished 标记；之后仅增加 pending 请求，scheduler 永远收不到通知。修复把启用布局协议 Worker 的全批登记前移到任何入队前，并跳过原末尾登记；普通 Worker 保留原顺序。函数签名/返回标注匹配，复制体的差异全部 PATCH 标注。沿用 Worker 实例布局作用域，无新增全局状态、不改线程池、设备/网络/超时、KV 读写及 scheduler 门禁。请求级新增启动标记用于现场核实加载。
+
+确定性测试在 add_request 返回前触发完成，固定上游顺序在 1/8/32 批次全丢通知，修复顺序全保留 finished 且 pending 归零。Prefill 的 delayed send 和不发送 rank 完成仍有登记。传输异常测试验证空 ReadTimeout 也会保存请求名和异常类型。本轮相关回归 77 项通过，Ruff/diff 检查通过，固定上游签名/返回标注和普通路径 AST 核对一致。本地回归不能代替 A5 并发成功及正常清理。上游长期应保证任务发布前登记并审查 tracker 生命周期；满足后移除本段兼容修复。
+
+停止阶段的 Attention Segfault/强杀、FFN follower collective_rpc 错误发生在请求超时之后，不能用来解释此前 7 个遗漏通知，但仍属于未通过的清理门禁。本次先修复请求竞态，现场复测继续保存 shutdown 时间/日志和设备、端口状态。

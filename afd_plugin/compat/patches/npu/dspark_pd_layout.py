@@ -26,6 +26,9 @@ if TYPE_CHECKING:
     import torch
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector import (
+        MooncakeConnectorMetadata,
+    )
 
 _PATCH_ATTR = "_afd_plugin_dspark_pd_layer_layout_patch"
 _LAYOUT_VERSION = 1
@@ -269,6 +272,8 @@ def apply_afd_dspark_pd_layout_patch() -> bool:
         != ("self", "expected_engine_id", "remote_host", "remote_handshake_port")
         or tuple(inspect.signature(receiver._transfer_kv_cache_all_groups).parameters)
         != ("self", "req_meta")
+        or tuple(inspect.signature(worker.start_load_kv).parameters)
+        != ("self", "metadata")
         or upstream.MooncakeAgentMetadata.__struct_fields__
         != tuple(
             field.name
@@ -454,6 +459,10 @@ def apply_afd_dspark_pd_layout_patch() -> bool:
                 len(layer_layout),
                 [(layer.name, layer.group) for layer in layer_layout],
             )
+            logger.info(
+                "AFD DSpark PD request tracking active: register before enqueue"
+            )
+        self._afd_layer_layout = layer_layout
         # ### PATCH END: describe target layers before publishing handshake
         global_te.register_buffer(ptrs, lengths)
         # After KV Caches registered, start the sending or receiving thread.
@@ -617,8 +626,114 @@ def apply_afd_dspark_pd_layout_patch() -> bool:
                     remote_handshake_port,
                 )
 
+    # Patch reason: upstream registers batch requests after enqueueing transfers.
+    # A fast read can finish first, so task_tracker drops its completion and the
+    # scheduler waits for remote KV forever (observed at 32-way concurrency).
+    # Patch functionality: register the entire scoped batch before any enqueue;
+    # do not re-register requests that have already completed. Other workers
+    # keep the pinned upstream order.
+    # Signature: matches start_load_kv; body copied from 11ee45653.
+    def start_load_kv(self, metadata: MooncakeConnectorMetadata):
+        """Start loading KV blocks from remote engine."""
+        # ### PATCH START: register the whole batch before publishing transfer work
+        if self._afd_layer_layout is not None:
+            for req_id in metadata.reqs_in_batch:
+                if self.kv_send_thread is not None:
+                    self.kv_send_thread.task_tracker.add_req_to_process(req_id)
+                if self.kv_recv_thread is not None:
+                    self.kv_recv_thread.task_tracker.add_req_to_process(req_id)
+        # ### PATCH END: register the whole batch before publishing transfer work
+        for req_id, meta in metadata.requests.items():
+            logger.debug(
+                "start_load_kv for request %s from remote engine %s. "
+                "Num local_block_ids: %s. Num remote_block_ids: %s. ",
+                req_id,
+                meta.remote_engine_id,
+                len(meta.local_block_ids),
+                len(meta.remote_block_ids),
+            )
+
+            prefill_tp_size = (
+                meta.remote_ptp_size
+                if getattr(meta, "remote_ptp_size", None)
+                else self._prefill_tp_size
+            )
+            tp_num_need_pulls = self._get_tp_num_need_pulls(prefill_tp_size)
+            remote_req_id = meta.remote_request_id
+
+            if self.use_mamba:
+                assert self.kv_recv_thread is not None
+                chosen_rank_list = self._get_remote_rank(remote_req_id, prefill_tp_size)
+                remote_handshake_port_list = [
+                    [x + meta.remote_port] for x in chosen_rank_list
+                ]
+                remote_host, remote_engine_id = self._get_remote_host_info_by_port(
+                    meta.remote_port,
+                    remote_handshake_port_list[0][0],
+                    meta.remote_host,
+                    meta.remote_engine_id,
+                    meta.remote_multi_nodes_meta_mapping,
+                )
+                self.kv_recv_thread.add_request(
+                    request_id=req_id,
+                    remote_request_id=remote_req_id,
+                    local_block_ids=meta.local_block_ids,
+                    remote_block_ids=meta.remote_block_ids,
+                    remote_engine_id=remote_engine_id,
+                    remote_host=remote_host,
+                    remote_handshake_port=remote_handshake_port_list[0][0],
+                    offset=0,
+                    tp_num_need_pulls=tp_num_need_pulls,
+                    all_task_done=True,
+                )
+            else:  # TODO: support prefill context parallel and pipeline parallel open at the same time
+                chosen_rank_list = self._get_remote_rank(remote_req_id, prefill_tp_size)
+                remote_handshake_port_list = [
+                    [x + meta.remote_port] for x in chosen_rank_list
+                ]
+                for i in range(tp_num_need_pulls * self._prefill_pp_size):
+                    assert self.kv_recv_thread is not None
+                    remote_host, remote_engine_id = self._get_remote_host_info_by_port(
+                        meta.remote_port,
+                        remote_handshake_port_list[i][0],
+                        meta.remote_host,
+                        meta.remote_engine_id,
+                        meta.remote_multi_nodes_meta_mapping,
+                    )
+                    self.kv_recv_thread.add_request(
+                        request_id=req_id,
+                        remote_request_id=remote_req_id,
+                        local_block_ids=meta.local_block_ids,
+                        remote_block_ids=meta.remote_block_ids,
+                        remote_engine_id=remote_engine_id,
+                        remote_host=remote_host,
+                        remote_handshake_port=remote_handshake_port_list[i][0],
+                        offset=i,
+                        tp_num_need_pulls=tp_num_need_pulls,
+                        all_task_done=(
+                            i == tp_num_need_pulls * self._prefill_pp_size - 1
+                        ),
+                    )
+
+        # ### PATCH START: never re-add a request after an early completion
+        if self._afd_layer_layout is None:
+            # ### PATCH END: never re-add a request after an early completion
+            for req_id in metadata.reqs_in_batch:
+                if self.kv_send_thread is not None:
+                    self.kv_send_thread.task_tracker.add_req_to_process(req_id)
+                if self.kv_recv_thread is not None:
+                    self.kv_recv_thread.task_tracker.add_req_to_process(req_id)
+
+        if self.kv_send_thread is not None:
+            for req_id, delay_start_time in metadata.requests_to_send.items():
+                if self.tp_rank in self._prefill_get_remote_rank(req_id):
+                    self.kv_send_thread.add_delayed_request(req_id, delay_start_time)
+                else:
+                    self.kv_send_thread.add_not_transfer_request(req_id)
+
     # ### PATCH START: install the negotiated-layout protocol and transfer methods
     worker.register_kv_caches = register_kv_caches
+    worker.start_load_kv = start_load_kv
     receiver._get_remote_metadata = _get_remote_metadata
     receiver._transfer_kv_cache_all_groups = _transfer_kv_cache_all_groups
     setattr(worker, _PATCH_ATTR, True)

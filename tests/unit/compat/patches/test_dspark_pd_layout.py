@@ -246,6 +246,9 @@ def protocol(monkeypatch):
         def register_kv_caches(self, kv_caches):
             raise AssertionError("original registration")
 
+        def start_load_kv(self, metadata):
+            raise AssertionError("original start_load_kv")
+
     upstream.MooncakeAgentMetadata = Metadata
     upstream.msgspec = msgspec
     upstream.MooncakeConnectorWorker = Worker
@@ -336,3 +339,102 @@ def test_handshake_and_transfer_use_layer_mapping_before_threads_start(
     normal_receiver = workers[1].kv_recv_thread
     normal_receiver._transfer_kv_cache_all_groups({})
     assert normal_receiver.original_called is True
+
+
+@pytest.mark.parametrize("batch_size", [1, 8, 32])
+def test_fast_receive_completion_is_visible_to_scheduler(protocol, batch_size):
+    """Force completion before enqueue returns; never rely on timing/sleeps."""
+    tracker = SimpleNamespace(pending=set(), finished=set(), lost=[])
+    batch_ids = {f"request-{i}" for i in range(batch_size)}
+
+    def add_request(**kwargs):
+        request_id = kwargs["request_id"]
+        # A real transfer thread can reach completion while the model worker
+        # is still enqueueing the rest of the same metadata batch.
+        if request_id in tracker.pending:
+            tracker.pending.remove(request_id)
+            tracker.finished.add(request_id)
+        else:
+            tracker.lost.append(request_id)
+
+    tracker.add_req_to_process = tracker.pending.add
+    receiver = SimpleNamespace(task_tracker=tracker, add_request=add_request)
+    worker = protocol.MooncakeConnectorWorker()
+    worker.__dict__.update(
+        _afd_layer_layout=["target"],
+        kv_send_thread=None,
+        kv_recv_thread=receiver,
+        _prefill_tp_size=1,
+        _prefill_pp_size=1,
+        use_mamba=False,
+        _get_tp_num_need_pulls=lambda tp: 1,
+        _get_remote_rank=lambda request_id, tp: [0],
+        _get_remote_host_info_by_port=lambda *args: ("prefill", "remote-engine"),
+    )
+    metadata = SimpleNamespace(
+        reqs_in_batch=batch_ids,
+        requests={
+            request_id: SimpleNamespace(
+                remote_request_id=f"remote-{request_id}",
+                remote_engine_id="remote-engine",
+                local_block_ids=[[1]],
+                remote_block_ids=[[2]],
+                remote_ptp_size=1,
+                remote_port=30000,
+                remote_host="prefill",
+                remote_multi_nodes_meta_mapping={},
+            )
+            for request_id in batch_ids
+        },
+        requests_to_send={},
+    )
+    worker.start_load_kv(metadata)
+    assert tracker.finished == batch_ids
+    assert tracker.lost == []
+    assert tracker.pending == set()  # no re-registration after completion
+    # Demonstrate the same forced ordering reproduces the old upstream bug.
+    worker._afd_layer_layout = None
+    tracker.finished.clear()
+    worker.start_load_kv(metadata)
+    assert set(tracker.lost) == batch_ids
+    assert tracker.pending == batch_ids
+    assert tracker.finished == set()
+
+
+def test_prefill_registers_before_immediate_no_transfer_completion(protocol):
+    """Prefill tracking covers both delayed sending and ranks without a send."""
+    pending, finished, delayed = set(), set(), {}
+    tracker = SimpleNamespace(add_req_to_process=pending.add)
+
+    def no_transfer(request_id):
+        assert request_id in pending
+        pending.remove(request_id)
+        finished.add(request_id)
+
+    def delay(request_id, start):
+        assert request_id in pending
+        delayed[request_id] = start
+
+    sender = SimpleNamespace(
+        task_tracker=tracker,
+        add_delayed_request=delay,
+        add_not_transfer_request=no_transfer,
+    )
+    worker = protocol.MooncakeConnectorWorker()
+    worker.__dict__.update(
+        _afd_layer_layout=["target"],
+        kv_send_thread=sender,
+        kv_recv_thread=None,
+        tp_rank=0,
+        _prefill_get_remote_rank=lambda rid: [0] if rid == "send" else [1],
+    )
+    worker.start_load_kv(
+        SimpleNamespace(
+            reqs_in_batch={"send", "skip"},
+            requests={},
+            requests_to_send={"send": 123.0, "skip": 124.0},
+        )
+    )
+    assert pending == {"send"}
+    assert finished == {"skip"}
+    assert delayed == {"send": 123.0}

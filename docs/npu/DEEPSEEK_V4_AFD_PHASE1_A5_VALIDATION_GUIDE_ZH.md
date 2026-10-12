@@ -335,6 +335,12 @@ Proxy 非流式后端失败现在返回带错误内容的 HTTP 502；流式失�
 
 本地真实 CPU 张量的 6→5 组数据拷贝、不同物理排列/步长、A5 indexer 重叠视图、非法布局拒绝、msgpack/pickle 握手及错误响应回归已通过；**NPU 实际传输、模型输出和 C2 F0 仍待 A5 复测**。保持 vLLM/vLLM-Ascend 提交、CANN、DSpark、五个默认开关及 A5 本机 HIXL 绝对路径。
 
+**2026-10-12 full 并发复测更新**：附件 `78b041cf6b3b4f5cb30c3dddef3819de.gz` 确认 EOS 自然结束、真实 6→5 组 KV 拷贝成功，EOS 后四 DP 请求归零；full 的 1/8 并发短/长输入均返回成功。在 32 并发短输入阶段，25 个请求返回 64 tokens/`finish_reason=length`，7 个请求等候 300 秒后 `ReadTimeout`。这 7 个的 KV 拷贝已成功，随后报 `finish req not in reqs to process`，一直处于 `WAITING_FOR_REMOTE_KVS`：固定 Mooncake `start_load_kv` 先将全批请求入队，最后才登记 tracker；快速传输完成在登记前到达，通知被丢弃。延长超时或降低并发不能修复此竞态。
+
+`【本地已完成】` 同一 `dspark_pd_layout.py` 现在先登记全批请求，再发布任何 KV 接收任务；已完成请求不再在函数末尾重复登记。范围仍限于启用布局协议的 DSpark PD Worker，普通 Worker 保持固定上游路径。1/8/32 请求的确定性“完成早于入队返回”测试通过。请求脚本发生传输/读取超时时保存 `<请求名>.transport.error.json`（请求名、异常类型、请求 ID、时间及耗时），summary 不再只有空 error。
+
+**本轮只确认 EOS 和部分负载通过，C2 F0/full 仍不通过**。32 并发长输入、边界、SSE、取消恢复尚未执行；停服阶段另有 Attention `Segfault`/强杀和 FFN 清理报错，`shutdown-failed.txt` 已记录，不能把设备最终空闲等同于正常清理通过。先按下列步骤冷启动修复版并完整复测，保留异常清理证据。
+
 **1. 【A5 手工执行】保留当前失败日志，按第 7 节正常停止 Prefill、Attention、FFN、Proxy 并确认设备/端口释放。** 在已经按第 3.1 节加载现场环境的终端更新代码；下面是本轮实际源码路径：
 
 ```bash
@@ -395,11 +401,13 @@ grep -nE 'AscendDSparkProposer|drafter|AFD FFN EngineCore started' \
 
 ```bash
 grep -nF 'AFD DSpark PD layer layout active:' "$RUN_ROOT/prefill.log" "$RUN_ROOT/attention.log"
+grep -nF 'AFD DSpark PD request tracking active: register before enqueue' \
+  "$RUN_ROOT/prefill.log" "$RUN_ROOT/attention.log"
 test "$(grep -cF 'AFD DSpark PD layer layout active:' "$RUN_ROOT/prefill.log" || true)" -ge 2
 test "$(grep -cF 'AFD DSpark PD layer layout active:' "$RUN_ROOT/attention.log" || true)" -ge 4
 ```
 
-此标记含 `role`、`groups`、`target_layers` 和逐层组号；两端 target 层名必须对应，组号可以不同。仅看到 API health 200 或直连 Attention 成功不足以证明 C2；缺少补丁标记时先核对源码路径、版本及插件注册日志。
+新修复版还须在 P 两个、A 四个 Worker 各看到 `AFD DSpark PD request tracking active: register before enqueue`，否则尚未启用并发登记修复。布局标记含 `role`、`groups`、`target_layers` 和逐层组号；两端 target 层名必须对应，组号可以不同。仅看到 API health 200 或直连 Attention 成功不足以证明 C2；缺少补丁标记时先核对源码路径、版本及插件注册日志。
 
 **4. 【A5 手工执行】先经 Proxy 发送 1 个 EOS 请求。** 在同机服务终端执行，不加 `--standalone`；`BASE_URL` 的 9000 是 Proxy，`ATTENTION_URL` 的 8910 仅用于管理接口和指标：
 
@@ -419,7 +427,7 @@ curl --noproxy '*' -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/attention-metrics-
 
 ```bash
 grep -nF 'AFD DSpark PD layer KV transfer:' "$RUN_ROOT/attention.log"
-grep -nE 'broadcast together|hybrid KV load failed|Prefill lacks layer layout|insufficient remote blocks|incompatible cache layout|EngineDeadError' \
+grep -nE 'broadcast together|hybrid KV load failed|Prefill lacks layer layout|insufficient remote blocks|incompatible cache layout|finish req not in reqs to process|EngineDeadError' \
   "$RUN_ROOT/attention.log" "$RUN_ROOT/proxy.log" || true
 ```
 
@@ -436,7 +444,18 @@ grep -nE 'broadcast together|hybrid KV load failed|Prefill lacks layer layout|in
   --output "$RUN_ROOT/requests-smoke" --run-id "$RUN_ID-smoke"
 ```
 
-然后执行第 6.3 节重新保存 full 的 metrics-before/生成 token pool，第 6.4 节执行 92 请求完整集，按第 6.5/7 节核对逐组 KV、DSpark 和清理证据。只在 C2 F0 完整通过后进入 C3。本次更新后的其他矩阵点也冻结同一修复提交。
+**6. 【A5 手工执行】smoke 通过后，完整重跑 full。** 第 6.3 节重新保存 full 的 metrics-before/生成 token pool。每次使用独立输出目录，不能复用已存在的 `$RUN_ROOT/requests`；脚本会拒绝覆盖：
+
+```bash
+"$PYTHON_BIN" "$AFD_PLUGIN_ROOT/tools/validation/a5_1030_requests.py" \
+  --suite full \
+  --base-url "$BASE_URL" --attention-url "$ATTENTION_URL" \
+  --token-pool "$RUN_ROOT/token-pool.json" \
+  --output "$RUN_ROOT/requests-full-$(date +%Y%m%dT%H%M%S)" \
+  --run-id "$RUN_ID-full"
+```
+
+本次保持原 1/8/32 并发和 300 秒请求超时。成功须包含 32 短/长、全部边界和 SSE/取消恢复，不以原先 44 个成功响应代替本次完整结果。再次失败时，保留 `*.transport.error.json`、`*.response.http.json`、原始响应及四角色日志/metrics；定位首次异常后停止扩大流量。按第 6.5/7 节核对逐组 KV、DSpark 和正常清理证据。只在 C2 F0 完整通过后进入 C3。本次更新后的其他矩阵点也冻结同一修复提交。
 
 ## 4. 【A5 手工执行】第 2 步：选择拓扑、验证点和新运行目录
 

@@ -66,11 +66,31 @@ async def run_checks(args: argparse.Namespace) -> dict:
             )
             start = time.monotonic()
             start_timestamp_ns = time.time_ns()
-            response = await client.post(
-                endpoint,
-                json=body,
-                headers={"X-Request-Id": f"{args.run_id}-{name}"},
-            )
+            try:
+                response = await client.post(
+                    endpoint,
+                    json=body,
+                    headers={"X-Request-Id": f"{args.run_id}-{name}"},
+                )
+            except httpx.RequestError as exc:
+                failure = {
+                    "name": name,
+                    "endpoint": endpoint,
+                    "request_id": f"{args.run_id}-{name}",
+                    "exception_type": type(exc).__name__,
+                    "error": str(exc) or repr(exc),
+                    "elapsed_seconds": time.monotonic() - start,
+                    "start_timestamp_ns": start_timestamp_ns,
+                    "end_timestamp_ns": time.time_ns(),
+                }
+                Path(args.output, f"{name}.transport.error.json").write_text(
+                    json.dumps(failure, ensure_ascii=False, indent=2) + "\n"
+                )
+                raise ValueError(
+                    f"{name}: {type(exc).__name__} after "
+                    f"{failure['elapsed_seconds']:.2f}s; "
+                    "see transport.error.json and Proxy/Attention logs"
+                ) from exc
             raw_path = Path(args.output, f"{name}.response.body")
             raw_path.write_bytes(response.content)
             Path(args.output, f"{name}.response.http.json").write_text(
@@ -319,7 +339,8 @@ def main() -> None:
                     "request_checks_passed": False,
                     "full_request_suite_passed": False,
                     "f0_passed": None,
-                    "error": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "error": str(exc) or repr(exc),
                 },
                 ensure_ascii=False,
                 indent=2,

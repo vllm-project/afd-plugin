@@ -72,6 +72,8 @@ def request_gate(tmp_path, monkeypatch):
             active -= 1
             if fault == "http-error":
                 return httpx.Response(500, text="backend failed")
+            if fault == "read-timeout":
+                raise httpx.ReadTimeout("", request=request)
             if fault == "empty-body":
                 return httpx.Response(
                     200, content=b"", headers={"content-type": "application/json"}
@@ -261,3 +263,15 @@ def test_invalid_json_records_original_http_response(request_gate, fault):
         ]
         == 200
     )
+
+
+def test_timeout_records_request_name_and_exception_type(request_gate):
+    args, exercise = request_gate
+    with pytest.raises(ValueError, match="eos: ReadTimeout after"):
+        exercise("read-timeout")
+    failure = json.loads(Path(args.output, "eos.transport.error.json").read_text())
+    assert failure["exception_type"] == "ReadTimeout"
+    assert failure["name"] == "eos"
+    assert failure["error"] == "ReadTimeout('')"
+    assert failure["request_id"] == "test-eos"
+    assert failure["end_timestamp_ns"] >= failure["start_timestamp_ns"]

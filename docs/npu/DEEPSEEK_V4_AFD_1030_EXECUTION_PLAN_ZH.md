@@ -53,6 +53,8 @@ Prefill --Mooncake KV--> Decode Attention --P2pHccl AFD--> Decode FFN
 
 2026-10-12 更新：现场四个 EngineCore 已启用 scheduler 补丁，失败后进程继续运行，但 EOS 经 Proxy 仍失败。新证据确认 Prefill/Attention 为 6/5 组，DSpark 还改变了物理张量排列。`【本地已完成】` 新增按 target 层名协商组号、地址和步长的 Mooncake 修复；保留异步分配和 hybrid fail 修复，并使 Proxy/请求脚本保留 HTTP 错误。CPU 数据核对和握手/错误回归通过，A5 C2 仍未通过。`【A5 手工执行】` 按指导书第 3.4 节更新同一插件提交并冷启动四角色；Prefill 两个 Worker、Attention 四个 Worker 须有布局标记，随后先 Proxy EOS。两端组数可以不同，须以逐层传输成功和原功能门禁判定，不能仅凭启动成功进入 C3。
 
+2026-10-12 full 复测进展：EOS 及 1/8 并发短/长请求已返回成功，布局传输修复生效；32 并发短输入 25 成功、7 超时。7 请求均完成 KV 拷贝，因 Mooncake 先入队后登记 tracker 丢失完成通知，一直等待远端 KV。`【本地已完成】` 全批 tracker 登记前移且不重复登记已完成请求，并记录具体超时请求/异常；确定性竞态回归通过。`【A5 手工执行】` 更新提交后冷启动四角色，确认新增 tracking 标记，再 EOS→smoke→完整 full；保持原并发/超时门禁。附件还记录异常停服/强杀，清理门禁仍未通过。C2 F0 未通过不推进 C3。
+
 ## 3. 固定范围
 
 ### 3.1 验收拓扑
