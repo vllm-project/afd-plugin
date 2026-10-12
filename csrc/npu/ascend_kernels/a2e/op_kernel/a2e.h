@@ -14,6 +14,10 @@
 #include "kernel_tiling/kernel_tiling.h"
 #include "moe_distribute_base.h"
 #include "data_copy.h"
+#include "a2e_packet.h"
+#ifdef AFD_ARCH_A5
+#include "utils/debug/asc_assert.h"
+#endif
 
 using namespace AscendC;
 
@@ -23,7 +27,7 @@ using namespace AscendC;
     __asm__("NOP"); \
     dsb(DSB_ALL);
 
-template <typename T, typename TQ, bool DynamicQuant>
+template <typename T, typename TQ, bool DynamicQuant, bool MxfpTransport = false>
 class A2e {
     constexpr static uint32_t IPC_BUFF_MAX_SIZE_MUL_EXP = 800 * 1024 * 1024;
     constexpr static uint32_t UB_SINGLE_TOTAL_SIZE_MAX = 192 * 1024;
@@ -49,10 +53,10 @@ public:
         this->rankSize = rankSize;
     }
 
-    __aicore__ inline void init(GM_ADDR x, GM_ADDR expertIds, GM_ADDR expertScales, GM_ADDR expandX, \
+    __aicore__ inline void init(GM_ADDR x, GM_ADDR expertIds, GM_ADDR expertScales, GM_ADDR xScale, GM_ADDR expandX, \
             GM_ADDR simulateExpertIds, GM_ADDR simulateExpertScales, GM_ADDR attenBatchSize, \
             GM_ADDR xActiveMask, int64_t batchSize, int64_t hiddenSize, int64_t topk, int64_t expertRankSize, \
-            int64_t attentionRankSize, int64_t rank, GM_ADDR tiling, int64_t computeGate)
+            int64_t attentionRankSize, int64_t rank, GM_ADDR tiling, int64_t computeGate, GM_ADDR xScaleOut)
     {
         this->magic = 0;
         this->batchSize = batchSize;
@@ -83,6 +87,26 @@ public:
 #else
         epWinContext_ = (__gm__ HcclOpResParam *)AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
 #endif
+
+        if constexpr (MxfpTransport) {
+#ifdef AFD_ARCH_A5
+            // Check the runtime window before the magic counter is written.
+            ascendc_assert(epWinContextA5_ != nullptr);
+            ascendc_assert(rankSize <= Moe::A2E_A5_MAX_RANKS && epWinContextA5_->rankDim == rankSize &&
+                epWinContextA5_->rankId == rank);
+            auto layout = Moe::GetA2EPacketLayout(batchSize, hiddenSize, topk, sizeof(T),
+                Moe::A2E_QUANT_MODE_MXFP8);
+            uint64_t requiredBytes = IPC_DATA_OFFSET + (rankSize - 1) * OPT_RANK_OFFSET + layout.endOffset;
+            ascendc_assert(epWinContextA5_->winSize >= requiredBytes);
+            ascendc_assert(rankSize * OPT_RANK_OFFSET + 5 * 32 < IPC_DATA_OFFSET - blockNum * 32);
+            for (int i = 0; i < rankSize; ++i) {
+                ascendc_assert(epWinContextA5_->windowsIn[i] != 0);
+            }
+#endif
+            scaleCols = (hiddenSize + Moe::A2E_MX_GROUP_SIZE - 1) / Moe::A2E_MX_GROUP_SIZE;
+            xScaleGt.SetGlobalBuffer((__gm__ uint8_t *)xScale);
+            xScaleOutGt.SetGlobalBuffer((__gm__ uint8_t *)xScaleOut);
+        }
 
         magicTensor_.SetGlobalBuffer((__gm__ int32_t*)(winBaseOf(rank) +
             IPC_DATA_OFFSET - blockNum * sizeof(int32_t) * INT32_COUNT_PER_BLOCK));
@@ -259,6 +283,13 @@ private:
         int actualBlockNum = (computeGate == 0) ? blockNum : (blockNum - BLOCK_IDX_USED_2);
 
         copyGmToGmWithBlocks(shareXGt, xGt, batchSize * hiddenSize, actualBlockNum, blockIdx);
+        if constexpr (MxfpTransport) {
+            auto layout = Moe::GetA2EPacketLayout(batchSize, hiddenSize, topk, sizeof(T),
+                Moe::A2E_QUANT_MODE_MXFP8);
+            GlobalTensor<uint8_t> shareScaleGt;
+            shareScaleGt.SetGlobalBuffer((__gm__ uint8_t *)(shareAddrs[rank] + IPC_DATA_OFFSET + layout.xScaleOffset));
+            copyGmToGmWithBlocks(shareScaleGt, xScaleGt, batchSize * scaleCols, actualBlockNum, blockIdx);
+        }
 
         AscendC::SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
         AscendC::WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
@@ -279,12 +310,11 @@ private:
 
     __aicore__ inline void sendWithMte() {
         int sendOffset = rank / expertRankSize - 1;
-        int expertIdsReserveSize = batchSize * topk * sizeof(int32_t);
-        int expertScalesReserveSize = batchSize * topk * sizeof(float);
-        int xReserveSize = batchSize * hiddenSize * sizeof(T);
-        int xOffset = sizeof(int32_t) + expertIdsReserveSize + expertScalesReserveSize;
-        int expertScalesOffset = sizeof(int32_t) + expertIdsReserveSize;
-        int expertIdsOffset = sizeof(int32_t);
+        auto layout = Moe::GetA2EPacketLayout(batchSize, hiddenSize, topk, sizeof(T),
+            MxfpTransport ? Moe::A2E_QUANT_MODE_MXFP8 : 0);
+        int xOffset = layout.xOffset;
+        int expertScalesOffset = layout.expertScalesOffset;
+        int expertIdsOffset = layout.expertIdsOffset;
 
         if (computeGate == 0) {
             sendX(sendOffset, xOffset);
@@ -305,10 +335,10 @@ private:
     }
 
     __aicore__ inline void recvWithMte(int index) {
-        int expertIdsReserveSize = recvBatchSize * topk * sizeof(int32_t);
-        int expertScalesReserveSize = recvBatchSize * topk * sizeof(float);
-        int xOffset = sizeof(int32_t) + expertIdsReserveSize + expertScalesReserveSize;
-        int expertScalesOffset = sizeof(int32_t) + expertIdsReserveSize;
+        auto layout = Moe::GetA2EPacketLayout(recvBatchSize, hiddenSize, topk, sizeof(T),
+            MxfpTransport ? Moe::A2E_QUANT_MODE_MXFP8 : 0);
+        int xOffset = layout.xOffset;
+        int expertScalesOffset = layout.expertScalesOffset;
 
         int sendRank = rank + (index + 1) * expertRankSize;
 
@@ -339,6 +369,14 @@ private:
             copyGmToGmWithBlocks(expandXGt[expandXOutputOffset], shareXGt, recvBatchSize * hiddenSize, blockNum - 1,
                 blockIdx);
             expandXOutputOffset += recvBatchSize * hiddenSize;
+        }
+        if constexpr (MxfpTransport) {
+            // Flag 3 covers both activation and scale writes on sender cores.
+            GlobalTensor<uint8_t> shareScaleGt;
+            shareScaleGt.SetGlobalBuffer((__gm__ uint8_t *)(shareAddrs[sendRank] + IPC_DATA_OFFSET + layout.xScaleOffset));
+            copyGmToGmWithBlocks(xScaleOutGt[xScaleOutputOffset], shareScaleGt, recvBatchSize * scaleCols,
+                computeGate == 0 ? blockNum : blockNum - BLOCK_IDX_USED_2, blockIdx);
+            xScaleOutputOffset += recvBatchSize * scaleCols;
         }
     }
 
@@ -372,6 +410,8 @@ private:
     GlobalTensor<int32_t> attenBatchSizeGt;
     GlobalTensor<bool> xActiveMaskOutGt;
     GlobalTensor<int32_t> magicTensor_;
+    GlobalTensor<uint8_t> xScaleGt;
+    GlobalTensor<uint8_t> xScaleOutGt;
 
     __gm__ T *x;
     __gm__ TQ *expandX;
@@ -395,6 +435,8 @@ private:
     int expandXOutputOffset = 0;
     int expertIdsOutputOffset = 0;
     int expertScalesOutputOffset = 0;
+    int xScaleOutputOffset = 0;
+    int scaleCols = 0;
     int rank;
     int rankSize;
     int64_t computeGate;

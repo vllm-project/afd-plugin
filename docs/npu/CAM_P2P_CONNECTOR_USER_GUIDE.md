@@ -141,11 +141,66 @@ role rank.
 | --- | --- | --- | --- |
 | `core_num` | `int` | `8` | Positive default AIV core count for both roles. |
 | `attn_core_num` / `ffn_core_num` | `int` | unset | Positive role-specific override for `core_num`. |
-| `quant_mode` | `int` | `0` | CAM quantization mode. The current runtime supports only `0`. |
+| `quant_mode` | `int` | `0` | CAM quantization mode. Synchronous CAMP2P serving currently accepts only `0`; the A5 A2E operator has an opt-in `4` transport contract for pre-quantized E4M3 or E5M2 activations plus E8M0 MX scales, but the connector keeps rejecting `4` until its FFN consumer accepts both tensors. |
 | `hccl_buffer_size` | `int` | unset | Positive CAMP2P HCCL buffer size in MB. The override applies to every connector-owned `afd*` communication domain and the FFN-side `afd_moe` domain; the Gloo control group is unaffected. When unset, HCCL uses `HCCL_BUFFSIZE`, then its built-in default. Use the same value on all members of each HCCL domain. |
 
 The per-domain setting avoids increasing buffers for unrelated TP, DP, or EP
 process groups. `HCCL_BUFFSIZE` remains a process-wide fallback.
+
+## A5 A2E MXFP8 transport contract
+
+The standalone A2E operator accepts optional `x_scale=None` and `quant_mode=0`
+arguments after `compute_gate`. Existing positional calls remain valid. Mode
+`0` retains the five-output BF16 contract and the unchanged BF16 E2A path.
+
+Both modes use the same native `aclnnA2eGetWorkspaceSize` / `aclnnA2e`
+interface. The workspace-size signature includes `xScale`, `quantMode`, and
+`xScaleOut`; mode `0` passes null scale tensors. Rebuild the custom operator
+library, Torch extension, and any external native callers together: existing
+Python calls remain compatible, but the expanded C signature changes the native
+binary ABI.
+
+Mode `4` is an Ascend 950/A5 transport-only path, initially restricted to equal
+positive Attention and FFN rank counts, with at most 64 total ranks (`E + A <= 64`).
+`compute_gate` must be `0` or `1`; gate `1` requires at least three AIV cores
+(`aiv_num >= 3`). The standalone sample uses four AIV cores for both gates.
+The caller supplies contiguous E4M3 or E5M2 activation
+storage (`torch.float8_e4m3fn` or `torch.float8_e5m2`) and separate contiguous E8M0 MX scales
+(`torch.float8_e8m0fnu`), with shape `[tokens, ceil(hidden_size / 32)]`.
+A2E neither quantizes nor dequantizes either tensor. The activation output keeps
+the input dtype; paired ranks must use the same activation dtype. Activations and MX scales
+occupy separate contiguous packet regions; the existing FP32 `scales` argument
+still carries expert-routing weights when `compute_gate=1`.
+
+Mode `4` returns six tensors: the original five outputs followed by received MX
+scales. On FFN ranks, activation and scale shapes are `[batch_size, hidden_size]`
+and `[batch_size, ceil(hidden_size / 32)]`; Attention ranks receive `[1, 1]`
+placeholders for both. An FFN caller may instead supply an empty contiguous
+`[0, hidden_size]` FP8 input and omit `x_scale`; A2E receives both payloads
+from its paired Attention rank. Supplying full FFN-side activation and scale
+tensors remains valid for callers that retain those buffers. Do not pass the
+received FP8 tensor to BF16 E2A.
+Packet capacity is checked against the runtime HCCL window before shared-window
+writes, requiring
+`IPC_DATA_OFFSET + (rankSize - 1) * 1024 + packetBytes <= winSize`.
+Capacity violations fail closed; no universal maximum batch or hidden
+size is implied by this contract.
+
+The synchronous serving connector continues rejecting `quant_mode=4`: receiving
+both tensors is not equivalent to having a compatible FFN consumer. This is not
+an MXFP8 serving configuration or an end-to-end FFN correctness claim.
+
+On A5 hardware, the explicit standalone byte-transport sample is:
+
+```bash
+AFD_TEST_DEVICES=2,3 AFD_TEST_QUANT_MODE=4 \
+  python tests/unit/compat/npu/a2e_e2a_a5.py
+```
+
+It checks both activation and scale bytes for both FP8 formats and `compute_gate=0` and `1`, without
+calling E2A. Default `AFD_TEST_QUANT_MODE=0` retains the BF16 roundtrip. Runtime
+checks require real A5 devices and are not validated by compilation or Meta
+tests alone.
 
 ## Single-node `4A2F` example
 

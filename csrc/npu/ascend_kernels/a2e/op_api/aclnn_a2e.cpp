@@ -25,29 +25,19 @@ extern "C" {
 #endif
 
 aclnnStatus aclnnA2eGetWorkspaceSize(
-    const aclTensor *x,
-    const aclTensor *expertIds,
-    const aclTensor *scales,
-    int64_t batchSize,
-    int64_t hiddenSize,
-    int64_t topk,
-    int64_t expertRankSize,
-    int64_t attentionRankSize,
-    int64_t rank,
-    char *groupEp,
-    int64_t aivNum,
-    int64_t computeGate,
-    const aclTensor *expandXOut,
-    const aclTensor *simulateExpertIdsOut,
-    const aclTensor *simulateExpertScalesOut,
-    const aclTensor *attenBatchSize,
-    const aclTensor *xActiveMaskOut,
-    uint64_t *workspaceSize,
-    aclOpExecutor **executor)
+    const aclTensor *x, const aclTensor *expertIds, const aclTensor *scales,
+    const aclTensor *xScale, int64_t batchSize, int64_t hiddenSize, int64_t topk,
+    int64_t expertRankSize, int64_t attentionRankSize, int64_t rank,
+    char *groupEp, int64_t aivNum, int64_t computeGate, int64_t quantMode,
+    const aclTensor *expandXOut, const aclTensor *simulateExpertIdsOut,
+    const aclTensor *simulateExpertScalesOut, const aclTensor *attenBatchSize,
+    const aclTensor *xActiveMaskOut, const aclTensor *xScaleOut,
+    uint64_t *workspaceSize, aclOpExecutor **executor)
 {
-    return aclnnInnerA2eGetWorkspaceSize(x, expertIds, scales, batchSize, hiddenSize, topk,
-        expertRankSize, attentionRankSize, rank, groupEp, aivNum, computeGate,
-        expandXOut, simulateExpertIdsOut, simulateExpertScalesOut, attenBatchSize, xActiveMaskOut,
+    return aclnnInnerA2eGetWorkspaceSize(x, expertIds, scales, xScale, batchSize,
+        hiddenSize, topk, expertRankSize, attentionRankSize, rank, groupEp,
+        aivNum, computeGate, quantMode, expandXOut, simulateExpertIdsOut,
+        simulateExpertScalesOut, attenBatchSize, xActiveMaskOut, xScaleOut,
         workspaceSize, executor);
 }
 

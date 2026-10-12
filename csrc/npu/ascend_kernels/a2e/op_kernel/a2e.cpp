@@ -14,8 +14,8 @@
 
 using namespace Moe;
 extern "C" __global__ __aicore__ void a2e(GM_ADDR x, GM_ADDR expertIds, GM_ADDR expertScales,
-            GM_ADDR expandX, GM_ADDR simulateExpertIds, GM_ADDR simulateExpertScales, GM_ADDR attenBatchSize,
-            GM_ADDR xActiveMask, GM_ADDR workspace, GM_ADDR tiling) {
+            GM_ADDR xScale, GM_ADDR expandX, GM_ADDR simulateExpertIds, GM_ADDR simulateExpertScales,
+            GM_ADDR attenBatchSize, GM_ADDR xActiveMask, GM_ADDR xScaleOut, GM_ADDR workspace, GM_ADDR tiling) {
     REGISTER_TILING_DEFAULT(A2ETilingData);
     REGISTER_TILING_FOR_TILINGKEY("TILING_KEY_VAR < 2000", A2ETilingData);
     GET_TILING_DATA_WITH_STRUCT(A2ETilingData, tiling_data, tiling);
@@ -31,9 +31,19 @@ extern "C" __global__ __aicore__ void a2e(GM_ADDR x, GM_ADDR expertIds, GM_ADDR 
 
     if (TILING_KEY_IS(21)) {
         A2e<bfloat16_t, bfloat16_t, false> opKernel(rank, rankSize);
-        opKernel.init(x, expertIds, expertScales, expandX, simulateExpertIds, simulateExpertScales, \
+        opKernel.init(x, expertIds, expertScales, xScale, expandX, simulateExpertIds, simulateExpertScales, \
             attenBatchSize, xActiveMask, batchSize, hiddenSize, topk, expertRankSize, attentionRankSize, \
-            rank, tiling, computeGate);
+            rank, tiling, computeGate, xScaleOut);
         opKernel.process();
     }
+#ifdef AFD_ARCH_A5
+    if (TILING_KEY_IS(23)) {
+        // Public tensors are E4M3 or E5M2 with E8M0 scales. No arithmetic or conversion is done.
+        A2e<uint8_t, uint8_t, false, true> opKernel(rank, rankSize);
+        opKernel.init(x, expertIds, expertScales, xScale, expandX, simulateExpertIds, simulateExpertScales,
+            attenBatchSize, xActiveMask, batchSize, hiddenSize, topk, expertRankSize, attentionRankSize,
+            rank, tiling, computeGate, xScaleOut);
+        opKernel.process();
+    }
+#endif
 }

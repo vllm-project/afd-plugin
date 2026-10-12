@@ -40,6 +40,22 @@ if(ASCEND_HOME_PATH STREQUAL "")
 endif()
 
 set(AFD_PLUGIN_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../..")
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_INCLUDES "${TORCH_INCLUDE_DIRS}" "${ASCEND_HOME_PATH}/include")
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+check_cxx_source_compiles("#include <c10/core/ScalarType.h>
+#include <acl/acl_base.h>
+int main() {
+  auto a = c10::ScalarType::Float8_e4m3fn;
+  auto b = c10::ScalarType::Float8_e8m0fnu;
+  auto c = ACL_FLOAT8_E4M3FN;
+  auto d = ACL_FLOAT8_E8M0;
+  auto e = c10::ScalarType::Float8_e5m2;
+  auto f = ACL_FLOAT8_E5M2;
+  return 0;
+}" AFD_HAS_MXFP8_DTYPES)
+unset(CMAKE_REQUIRED_INCLUDES)
+unset(CMAKE_TRY_COMPILE_TARGET_TYPE)
 set(AFD_NPU_CSRC_DIR "${AFD_PLUGIN_ROOT}/csrc/npu")
 set(AFD_CANN_OPS_DIR "${AFD_PLUGIN_ROOT}/afd_plugin/_cann_ops_custom/vendors/afd-plugin/op_api/lib")
 
@@ -63,6 +79,7 @@ if(AFD_SOC_VERSION STREQUAL "910c" OR AFD_SOC_VERSION MATCHES "^ascend910_93")
   target_sources(afd_plugin_ascend_C PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/torch_binding_cam_async.cpp")
 elseif(AFD_SOC_VERSION STREQUAL "950" OR AFD_SOC_VERSION MATCHES "^[Aa]scend950")
+  target_compile_definitions(afd_plugin_ascend_C PRIVATE AFD_TARGET_A5)
   message(STATUS "CAM asynchronous bindings disabled for Ascend 950")
 else()
   message(FATAL_ERROR "Unsupported AFD_SOC_VERSION: ${AFD_SOC_VERSION}")
@@ -70,6 +87,9 @@ endif()
 
 set_target_properties(afd_plugin_ascend_C PROPERTIES OUTPUT_NAME "_C_ascend")
 target_compile_definitions(afd_plugin_ascend_C PRIVATE TORCH_EXTENSION_NAME=_C_ascend)
+if(AFD_HAS_MXFP8_DTYPES)
+  target_compile_definitions(afd_plugin_ascend_C PRIVATE AFD_HAS_MXFP8_DTYPES)
+endif()
 
 target_include_directories(afd_plugin_ascend_C PRIVATE
   "${AFD_NPU_CSRC_DIR}"
