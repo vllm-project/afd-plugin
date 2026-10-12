@@ -15,6 +15,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import runpy
 import subprocess
 import sys
 import types
@@ -47,16 +48,22 @@ def load_functions(path, namespace, names):
 
 
 def factory_namespace():
+    # Child lifecycle probes run in isolation without importing the package.
+    from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_optional_afd_config
+
+    runtime = runpy.run_path(str(REPO_ROOT / "afd_plugin/compat/npu/runtime_config.py"))
     events = []
     native = SimpleNamespace(_ASCEND_CONFIG=None, _INIT_VLLM_CONFIG=None)
 
     class NativeConfig:
-        __dataclass_fields__ = {"native_option": None}
+        __dataclass_fields__ = {"native_option": None, "enable_shared_expert_dp": None}
 
         def __init__(self, **kwargs):
+            self.enable_shared_expert_dp = kwargs.get("enable_shared_expert_dp", False)
             unknown = set(kwargs) - {
                 "native_option",
                 "enable_force_eplb",
+                "enable_shared_expert_dp",
                 "scheduler_config",
                 "sparse_kv_offload_config",
                 "kvpp_config",
@@ -78,12 +85,21 @@ def factory_namespace():
         def derive_and_validate(self, config):
             events.append(("derive", config))
 
+        def _check_mix_placement(self):
+            pass
+
     def validate_bool(value, key):
         if not isinstance(value, bool):
             raise ValueError(key)
         return value
 
     ns: dict[str, Any] = {
+        "AFD_ASYNC_CONNECTOR": AFD_ASYNC_CONNECTOR,
+        "parse_optional_afd_config": parse_optional_afd_config,
+        "DEEPSEEK_V2_MODEL_TYPES": runtime["DEEPSEEK_V2_MODEL_TYPES"],
+        "npu_model_uses_sequence_parallel_moe": runtime[
+            "npu_model_uses_sequence_parallel_moe"
+        ],
         "ascend_config": native,
         "AscendConfig": NativeConfig,
         "SchedulerConfig": SimpleNamespace(
@@ -403,6 +419,64 @@ class AscendConfigLifecycleTests(unittest.TestCase):
             config.additional_config = {"afd": {}, "refresh": True}
             self.assertIsNot(ns["init_ascend_config"](config), result)
             self.assertEqual(len(clears), 2)
+
+    def test_async_shared_replication_only_overrides_effective_model_sp(self):
+        afd = {
+            "connector": "CAMAsyncAFDConnector",
+            "role": "attention",
+            "compute_gate_on_attention": True,
+        }
+        cases = [
+            (afd, "deepseek_v2", {}, True, 1, True),
+            (afd, "deepseek_v3", {"enable_shared_expert_dp": False}, True, 1, True),
+            ({**afd, "role": "ffn"}, "deepseek_v2", {}, True, 1, False),
+            (
+                {**afd, "connector": "CAMP2pAFDConnector"},
+                "deepseek_v2",
+                {},
+                True,
+                1,
+                False,
+            ),
+            (
+                {**afd, "compute_gate_on_attention": False},
+                "deepseek_v2",
+                {},
+                True,
+                1,
+                False,
+            ),
+            (afd, "deepseek_v4", {}, True, 1, False),
+            (None, "deepseek_v2", {}, True, 1, False),
+            (afd, "deepseek_v2", {}, False, 1, False),
+            (afd, "deepseek_v2", {}, True, 2, False),
+            (afd, "deepseek_v2", {"enable_shared_expert_dp": True}, False, 1, True),
+        ]
+        utils = types.ModuleType("vllm_ascend.utils")
+        utils.__dict__["clear_enable_sp"] = lambda: None
+        for afd_mapping, model_type, options, use_sp, pp_size, expected in cases:
+            with self.subTest(afd=afd_mapping, model_type=model_type, options=options):
+                ns, _, _ = factory_namespace()
+                additional: dict[str, Any] = dict(options)
+                if afd_mapping is not None:
+                    additional["afd"] = afd_mapping
+                config = SimpleNamespace(
+                    additional_config=additional,
+                    model_config=SimpleNamespace(
+                        hf_text_config=SimpleNamespace(model_type=model_type),
+                    ),
+                    parallel_config=SimpleNamespace(
+                        tensor_parallel_size=4,
+                        pipeline_parallel_size=pp_size,
+                        use_sequence_parallel_moe=use_sp,
+                        all2all_backend="allgather_reducescatter",
+                    ),
+                )
+                before = copy.deepcopy(vars(config))
+                with patch.dict(sys.modules, {utils.__name__: utils}):
+                    result = ns["init_ascend_config"](config)
+                self.assertIs(result.enable_shared_expert_dp, expected)
+                self.assertEqual(vars(config), before)
 
     def test_factory_aliases_include_early_scheduler(self):
         tree = ast.parse(FACTORY_PATH.read_text())

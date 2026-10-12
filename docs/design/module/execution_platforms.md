@@ -358,9 +358,13 @@ The NPU results below were collected with the CAMP input-padding and FFN
 context repair included. That repair is being reviewed separately from the
 upgrade integration; its 2A1F results do not qualify the integration without it.
 NPU MRV2 many-to-one eager/fallback execution can produce incorrect output.
-DSV2 Async CAM with model SP and TP-sharded shared experts also has a known
-output-correctness defect; its separate fix still requires NPU validation.
-Neither deferred repair is included in this integration baseline.
+That CAMP repair is not included in this integration baseline.
+
+DSV2/V3 Async CAM Attention with model SP selects Ascend shared-expert DP before
+constructing the shared MLP. Each rank holds complete shared weights and computes
+its local token rows. Attention TP/SP and routed-expert parallelism are unchanged.
+Without model SP, the user's shared-expert DP setting is preserved. MRV2's
+existing rejection of explicit shared-expert DP configuration is unchanged.
 
 All rows target vLLM `0.30.0` (`ced6857a`); Ascend additionally targets
 vLLM-Ascend `8d4409d6`. GPU integration evidence covers DeepSeek-V2-Lite

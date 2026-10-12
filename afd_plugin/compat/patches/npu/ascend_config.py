@@ -17,6 +17,12 @@ from vllm_ascend.ascend_config import (
     validate_additional_config_bool,
 )
 
+from afd_plugin.compat.npu.runtime_config import (
+    DEEPSEEK_V2_MODEL_TYPES,
+    npu_model_uses_sequence_parallel_moe,
+)
+from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_optional_afd_config
+
 # Module-level aliases in the pinned target; later lazy imports use the factory.
 _ASCEND_CONFIG_ALIAS_MODULES = (
     "vllm_ascend.platform",
@@ -36,8 +42,11 @@ _ASCEND_CONFIG_ALIAS_MODULES = (
 # Patch reason: strict AscendConfig construction rejects AFD's shared settings.
 # Patch functionality: exclude the AFD namespace from constructor kwargs,
 # preserving the source mapping, config identity and native singleton/cache.
+# NPU Async CAM DSV2/V3 Attention with model SP uses Ascend shared-expert DP
+# so local token shards run against complete shared weights without shared TP.
 # Signature: matches upstream; no added parameters.
-# Removal plan: remove when upstream supports a plugin configuration namespace.
+# Removal plan: remove namespace filtering when upstream supports plugin config;
+# remove shared-DP selection when Ascend supports this AFD layout natively.
 def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     additional_config = (
         vllm_config.additional_config
@@ -177,6 +186,22 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     # the single legitimate entry point — bypassing the factory leaves derived
     # fields at their sentinel defaults.
     new_config.derive_and_validate(vllm_config)
+    # ### PATCH START: Async CAM shared weights
+    afd_config = parse_optional_afd_config(vllm_config, validate=False)
+    if (
+        afd_config is not None
+        and afd_config.is_attention_server
+        and afd_config.connector == AFD_ASYNC_CONNECTOR
+        and afd_config.compute_gate_on_attention
+        and vllm_config.model_config.hf_text_config.model_type
+        in DEEPSEEK_V2_MODEL_TYPES
+        and npu_model_uses_sequence_parallel_moe(vllm_config)
+    ):
+        # Native derivation has resolved FlashComm/SP. SP requires TP>1 and EP,
+        # satisfying shared-DP prerequisites; preserve its placement validation.
+        new_config.enable_shared_expert_dp = True
+        new_config._check_mix_placement()
+    # ### PATCH END: Async CAM shared weights
     new_config.rl_config.apply(new_config)
     new_config.finegrained_tp_config._validate_preconditions(vllm_config)
     new_config.xlite_graph_config._validate_preconditions(vllm_config)

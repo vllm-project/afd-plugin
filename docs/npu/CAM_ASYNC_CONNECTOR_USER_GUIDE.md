@@ -63,8 +63,13 @@ The V2 Async CAM contract is:
 - `dynamicQuant=1` for DeepSeek-V4 Flash W4A8.
 
 Attention-local FlashComm1/SP is supported. Set
-`VLLM_ASCEND_ENABLE_FLASHCOMM1=1` only on Attention and `0` on FFN;
-shared-expert DP and finegrained TP are unsupported. For V2-Lite MLA Attention,
+`VLLM_ASCEND_ENABLE_FLASHCOMM1=1` only on Attention and `0` on FFN.
+DeepSeek-V2/V3 Attention with effective model SP automatically selects Ascend
+shared-expert DP: shared weights are replicated per rank, which computes its
+local tokens. Without model SP, this automatic override is not applied.
+Attention TP/SP and routed-expert parallelism are unchanged. MRV2 retains its
+existing rejection of explicit `enable_shared_expert_dp=true` and finegrained
+TP configuration. For V2-Lite MLA Attention,
 explicitly set `--block-size=128`; do not apply this setting to V4.
 
 V2 reuses the existing model-local `async_moe_ubatching` pipeline: exactly two
