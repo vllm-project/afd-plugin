@@ -1,8 +1,8 @@
 # DeepSeek-V4 AFD A5 手工执行交接清单
 
-更新日期：2026-10-12。执行顺序与[统一验证指导书](DEEPSEEK_V4_AFD_PHASE1_A5_VALIDATION_GUIDE_ZH.md)、[1030 计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)一致。
+更新日期：2026-10-13。执行顺序与[统一验证指导书](DEEPSEEK_V4_AFD_PHASE1_A5_VALIDATION_GUIDE_ZH.md)、[1030 计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)一致。
 
-`【本地已完成】` 表示源码修改及 CPU/mock 检查；`【A5 手工执行】` 表示需要你在A5 现场运行。首次执行顺序为 **A5-01 → A5-02 → A5-03 → A5-04**。当前现场已回传 standalone EOS、C1 执行成功及 C2 PD 请求失败日志；下一步按统一指导书第 3.4 节更新修复并复测 C2。三机和最终精度留待前置阶段通过后执行。
+`【本地已完成】` 表示源码修改及 CPU/mock 检查；`【A5 手工执行】` 表示需要你在A5 现场运行。首次执行顺序为 **A5-01 → A5-02 → A5-03 → A5-04**。当前 C2 EOS、smoke 和 full 92 项请求已通过，停服验收仍失败；下一步先处理停服链路并在 A5 复测，C2 F0 关闭后进入 C3。详见[C2 本轮核对结果](DEEPSEEK_V4_AFD_C2_20261013_RESULT_ZH.md)。三机和最终精度留待前置阶段通过后执行。
 
 ## 1. 执行分工与当前状态
 
@@ -16,17 +16,18 @@
 | A5-02 | 审计 HIXL、模型、版本、设备/IP/端口；冻结 GSM8K 口径 | **A5 手工执行：你** | 待执行 |
 | A5-03 | standalone A4F2 Graph/U2 全开回归和清理 | **A5 手工执行：你** | 已回传 EOS 成功日志；完整 F0 仍按证据表核对 |
 | A5-04 | 同机 P2+A4+F2，C1 两轮 | **A5 手工执行：你** | 已回传 C1 执行成功日志；轮数和完整 F0 按证据表核对 |
-| A5-05 | 同机 C2→C3→C4→C5，C5 两轮 | **A5 手工执行：你** | C2 KV 接收失败，修复后先 Proxy EOS→smoke→full；未通过不进入 C3 |
+| A5-05 | 同机 C2→C3→C4→C5，C5 两轮 | **A5 手工执行：你** | C2 full 92 项通过；先补正常停服复测，F0 关闭后进入 C3 |
 | A5-06 | 三机 P8/A4/F2，C1–C5 | **A5 手工执行：你** | 同机矩阵全部通过后执行 |
 | A5-07 | 同机/三机 C5 GSM8K 与诊断关闭的性能采集 | **A5 手工执行：你** | 完整功能组合通过后执行 |
 | LOCAL-05 | 审阅回传证据、定位问题、更新验收表及最终包 | 收到证据后本地继续 | 待现场结果 |
-| LOCAL-06 | DSpark 异步 PD 分配与 hybrid fail 处理 | 本地已完成，现场失败隔离已生效 | 10-12 日志仍有 KV 传输失败；不能将该补丁视为 C2 通过 |
-| LOCAL-07 | 两端 KV 按层名协商组号/地址/步长；保留原始 HTTP 错误 | 本地已完成，现场 EOS/1/8 并发已返回成功 | full 的 32 短并发另有 tracker 竞态，C2 F0 未通过 |
-| LOCAL-08 | DSpark PD 全批登记先于 KV 入队；超时请求归档 | 本地已完成，A5 待复测 | 确定性复现旧通知丢失并验证 1/8/32 批次；更新并冷启动四角色后 EOS→smoke→full；见指导书第 3.4 节 |
+| LOCAL-06 | DSpark 异步 PD 分配与 hybrid fail 处理 | 本地已完成，现场请求复测通过 | 本次未见业务期 KV/EngineCore 错误；不单独代表完整 F0 |
+| LOCAL-07 | 两端 KV 按层名协商组号/地址/步长；保留原始 HTTP 错误 | 本地已完成，现场 full 通过 | 6→5 组真实传输及 1/8/32 短长输入通过 |
+| LOCAL-08 | DSpark PD 全批登记先于 KV 入队；超时请求归档 | 本地已完成，现场 full 通过 | 本次 32 短/长各 32 项成功，未再丢失完成通知 |
+| LOCAL-09 | C2 停服链路排查与修复 | 本地证据审阅完成，修复待完成 | Attention 四次 Segfault；FFN shutdown 标记 0，最终强杀；修复并 A5 正常停服复测后才关闭 C2 |
 
 本地测试不会将 A5-01 到 A5-07 自动标记通过。默认 C3/C5 是五开关全开；关闭对照另用 run ID。资源文件内容与真实设备是否匹配、Mooncake session/HCCL 数据面以及Graph/DSpark 在线行为必须在 A5 上验证。
 
-**本次 C2 的手工入口**：统一指导书第 3.4 节包含当前源码路径、Git 更新、`SITE_FILE` 中 `AFD_EXPECTED_COMMIT` 的替换位置、安装路径检查、C2 冷启动及请求命令。Prefill 两个 Worker、Attention 四个 Worker 均须打印 `AFD DSpark PD layer layout active:`；并须打印 `AFD DSpark PD request tracking active: register before enqueue`，**Prefill 必须更新重启**。四个 Attention EngineCore DP rank 都须打印 `AFD DSpark PD scheduler compatibility active:`；请求走 Proxy 9000，不添加 `--standalone`。保留 `DEBUG` 进行此次故障复测。先发送 1 个 EOS 请求，成功后 5 请求 smoke，最后才执行 92 请求完整集。
+**当前手工入口**：[C2 本轮核对结果](DEEPSEEK_V4_AFD_C2_20261013_RESULT_ZH.md)列出剩余停服门禁和后续 C3 参数。当前无需为确认已通过的请求结果立即重发 full，也无需继续处理旧 tracker 超时。统一指导书第 3.4 节仍保留 Git 更新、`SITE_FILE` 中 `AFD_EXPECTED_COMMIT` 的替换位置和 C2 冷启动入口。停服修复后须冻结新提交、使用新 run ID 复测；请求走 Proxy 9000，不添加 `--standalone`。
 
 ## 2. 【A5 手工执行】A5-01：从 Git 更新交付分支
 

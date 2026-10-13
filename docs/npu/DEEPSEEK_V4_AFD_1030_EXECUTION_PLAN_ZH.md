@@ -55,6 +55,8 @@ Prefill --Mooncake KV--> Decode Attention --P2pHccl AFD--> Decode FFN
 
 2026-10-12 full 复测进展：EOS 及 1/8 并发短/长请求已返回成功，布局传输修复生效；32 并发短输入 25 成功、7 超时。7 请求均完成 KV 拷贝，因 Mooncake 先入队后登记 tracker 丢失完成通知，一直等待远端 KV。`【本地已完成】` 全批 tracker 登记前移且不重复登记已完成请求，并记录具体超时请求/异常；确定性竞态回归通过。`【A5 手工执行】` 更新提交后冷启动四角色，确认新增 tracking 标记，再 EOS→smoke→完整 full；保持原并发/超时门禁。附件还记录异常停服/强杀，清理门禁仍未通过。C2 F0 未通过不推进 C3。
 
+2026-10-13 现场核对更新：附件 `c34df56188ed459cb5bb5467ac8f3aa9.gz` 中 EOS、smoke 和 full 92 项请求全部通过，并发 32 短/长各 32 项返回 64 tokens/`length`，取消恢复后四 DP 和 Proxy 请求归零；本次未再出现 KV 完成通知丢失，四 rank 均有实际 DSpark drafted/accepted 证据。**C2 请求验证通过，F0 尚未通过**：停 Attention 后四次 Segfault，FFN 没有 shutdown payload 标记，随后强杀两个 FFN EngineCore；最终设备空闲不能替代正常停服门禁。下一步先修复停服链路并在 A5 复测，C2 F0 关闭后再执行 C3。详情见[C2 本轮核对结果](DEEPSEEK_V4_AFD_C2_20261013_RESULT_ZH.md)。
+
 ## 3. 固定范围
 
 ### 3.1 验收拓扑

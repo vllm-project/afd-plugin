@@ -1,10 +1,10 @@
 # DeepSeek-V4 AFD A5 1030 合并验证指导书
 
-更新日期：2026-10-12。本文合并旧 A5 dSpark/PD 指导与[1030 执行计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)，是本期现场操作入口。
+更新日期：2026-10-13。本文合并旧 A5 dSpark/PD 指导与[1030 执行计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)，是本期现场操作入口。
 执行计划规定交付范围和日期，本文规定现场命令、验证顺序、证据与失败处理。
 本文是待执行指导，不代表组合已经通过 A5 验收。
 
-**执行标记**：`【本地已完成】` 为代码/配置的离线检查；`【A5 手工执行】` 为需要你在 A5 实际环境完成的操作。首次执行从[手工交接清单](DEEPSEEK_V4_AFD_A5_MANUAL_HANDOFF_ZH.md)的 A5-01 开始。当前现场已回传 standalone EOS、C1 成功日志及 C2 失败日志；本次先按第 3.4 节更新并复测 C2，不推进 C3–C5。
+**执行标记**：`【本地已完成】` 为代码/配置的离线检查；`【A5 手工执行】` 为需要你在 A5 实际环境完成的操作。首次执行从[手工交接清单](DEEPSEEK_V4_AFD_A5_MANUAL_HANDOFF_ZH.md)的 A5-01 开始。当前 C2 EOS、smoke 和 full 92 项请求已通过；停服仍有 Attention Segfault、FFN 未收到 shutdown 和强杀，C2 F0 未关闭。下一步先处理停服链路，正常停服复测通过后再进入 C3。详见[C2 本轮核对结果](DEEPSEEK_V4_AFD_C2_20261013_RESULT_ZH.md)。
 
 ## 1. 合并后的范围与门禁
 
@@ -325,6 +325,10 @@ sha256sum "$DSPARK_OPS_WHEEL"
 
 ### 3.4 【A5 手工执行】C2 的 PD KV 布局修复及复测
 
+**2026-10-13 最新状态**：附件 `c34df56188ed459cb5bb5467ac8f3aa9.gz` 已确认 EOS、smoke 和 full 92 项全部通过，并发 32 短/长各 32 项均返回 64 tokens/`length`；取消恢复后四 DP running/waiting 与 Proxy 请求数归零。Prefill/Attention 的 2/4 个 tracking 标记和 6→5 组真实传输存在，未再出现 `finish req not in reqs to process`。下面 10-12 日的失败描述是修复历史，当前无需继续按“32 并发超时”排障。
+
+**剩余门禁是停服**：09:22:22 UTC 停 Attention 后出现四次 Segfault；FFN shutdown payload 标记为 0，随后 FFN 停止报错，09:26:00 UTC 强杀两个 EngineCore。最终设备/服务端口空闲，但不能认定正常停服通过。当前 launcher 的 TERM trap 会向整个服务进程组发送 TERM，须核对这一行为与 Attention 先通知 FFN、再释放 KV/控制面的退出顺序；Segfault 的底层原因尚未由 Python 日志确定。先完成停服修复和 A5 复测，不进入 C3，也不要求为确认本次请求结果立即重发 92 项。证据、手工步骤和 C3 配置见[本轮核对结果](DEEPSEEK_V4_AFD_C2_20261013_RESULT_ZH.md)。
+
 **适用错误**：经 Proxy 的 EOS 报 `JSONDecodeError: Expecting value`，Attention 的 Mooncake 接收仍报 `operands could not be broadcast together with shapes (0,) (3,)`。
 
 2026-10-12 附件 `cb15c79fe8614ade8b3fc654a8ec62d7.gz` 中，四个 EngineCore 已启用 10-10 scheduler 补丁；请求失败后仍继续运行，证明失败隔离已生效。KV 传输仍失败：同一请求 Prefill 发出 **6 组** block ID，Attention 接收端只有 **5 组**。DSpark 增加缓存层后，上游会重新分组和排列物理张量；组号与注册地址数组下标不能跨两端直接配对。上次只修复异步 lookahead 和 hybrid fail，未解决此布局问题。Proxy 又把后端 500 吞成空 HTTP 200，才导致请求脚本解析空 JSON；更改 EOS prompt 或只修解析异常不能修复 KV 传输。
@@ -339,7 +343,7 @@ Proxy 非流式后端失败现在返回带错误内容的 HTTP 502；流式失�
 
 `【本地已完成】` 同一 `dspark_pd_layout.py` 现在先登记全批请求，再发布任何 KV 接收任务；已完成请求不再在函数末尾重复登记。范围仍限于启用布局协议的 DSpark PD Worker，普通 Worker 保持固定上游路径。1/8/32 请求的确定性“完成早于入队返回”测试通过。请求脚本发生传输/读取超时时保存 `<请求名>.transport.error.json`（请求名、异常类型、请求 ID、时间及耗时），summary 不再只有空 error。
 
-**本轮只确认 EOS 和部分负载通过，C2 F0/full 仍不通过**。32 并发长输入、边界、SSE、取消恢复尚未执行；停服阶段另有 Attention `Segfault`/强杀和 FFN 清理报错，`shutdown-failed.txt` 已记录，不能把设备最终空闲等同于正常清理通过。先按下列步骤冷启动修复版并完整复测，保留异常清理证据。
+**10-12 日旧附件仅确认 EOS 和部分负载通过，当时 C2 F0/full 未通过**。当时 32 并发长输入、边界、SSE、取消恢复尚未执行；停服阶段另有 Attention `Segfault`/强杀和 FFN 清理报错，`shutdown-failed.txt` 已记录，不能把设备最终空闲等同于正常清理通过。下列命令保留为该修复的操作入口；10-13 日最新请求结果已通过，当前按本节顶部处理剩余停服问题。
 
 **1. 【A5 手工执行】保留当前失败日志，按第 7 节正常停止 Prefill、Attention、FFN、Proxy 并确认设备/端口释放。** 在已经按第 3.1 节加载现场环境的终端更新代码；下面是本轮实际源码路径：
 
