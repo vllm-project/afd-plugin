@@ -782,7 +782,7 @@ curl --noproxy '*' -fsS --max-time 10 \
 
 ### 6.3 保存 metrics-before，生成精确 token-ID 输入
 
-**2026-10-13 C3 更新**：此前 Prefill HTTP 504 已不再出现，本次 EOS 和 1/8 短长输入成功，但 32 短输入有两个 HTTP 200/64 tokens/`length` 的空文本，均在 Attention DP3。C3 full 未通过。下一步按[C3 空输出核对与定向复测](DEEPSEEK_V4_AFD_C3_EMPTY_OUTPUT_REVIEW_ZH.md)更新诊断脚本，先用 `--suite c32-short`（EOS + 32，共 33 个请求）采集真实 token ID，再做五开关关闭对照；保持默认正式配置全开，不放宽空输出校验、不进入 C4/C5。
+**2026-10-13 C3 最新更新**：附件 `b68d20f6771c4f5d8a0e5e6a843f20dc.gz` 的定向复测已完整收齐 32 短响应，30 非空、2 空；`c32-short-3/11` 均在 DP3，各返回 64 个 token ID `0`、`length`。六个 A/F rank 的实际启动配置均为五开关全 `1`。本地参考 tokenizer 的 `0` 为 BOS，过滤特殊 token 后文本为空；现场模型仍需离线确认，底层全零生成原因未确定。**无需重复默认全开采集**；下一步按[C3 空输出核对与定向复测第 4 节](DEEPSEEK_V4_AFD_C3_EMPTY_OUTPUT_REVIEW_ZH.md#4-a5-手工执行复现后做关闭对照)新建 run ID、重新冻结实际源码/配置，在 A/F 启动前显式设置五开关全 `0`，冷启动后只执行同一 `c32-short`（EOS + 32，共 33 个请求）。这是诊断对照，正式默认仍全开，C3 未通过，不进入 C4/C5；C2 正常停服门禁仍待关闭。
 
 业务请求经 Proxy；`/tokenize` 与 `/metrics` 是 Attention 管理调用，不计作 PD 请求。
 使用 token-ID prompt，避免字符长度被误写为 KV block 边界长度。
