@@ -1,10 +1,14 @@
 # C3 并发 32 空输出核对与定向复测
 
-更新日期：2026-10-13。结论：**五开关全关也复现 DP3 全零/近乎全零 token：一条空文本，另一条仅有 `" Use"`。关闭五开关没有消除异常；下一步执行第 5 节 eager/U2 冷启动对照，保持 PD、DSpark 关闭及五开关全关。底层原因仍未确定，C3 未通过，不进入 C4/C5。**
+更新日期：2026-10-13。结论：**最新 eager/U2 定向 33 请求通过，32 条短响应没有 token 0；Graph 全开/全关故障仍未关闭。本地已修复 CPU 可复现的 DSA RoPE 段间共享问题，尚待 A5 验证。下一步更新修复提交、冷启动默认全开的 Graph/U2，按[最新结果与修复复测步骤](DEEPSEEK_V4_AFD_C3_EAGER_U2_ROPE_REVIEW_ZH.md)执行同一 33 请求；不重复 eager 对照，不进入 C4/C5。**
 
 ## 1. 本轮证据
 
-### 1.1 最新五开关全关对照：仍有异常
+### 1.1 最新 eager/U2：定向请求通过，修复待验证
+
+附件 `88aeb0977212430a9ff742b4a8ad69ef.gz`：实际 eager/U2/PD，DSpark 关闭、五 Graph 开关全关；EOS 成功，32 短响应全部非空、64 tokens、`length`，全部无 ID `0`，四 DP 各 8 条。FFN 在线两 stage 且未 replay，批次结束 A/Proxy 请求归零。源码/runtime 冻结和退出材料仍缺，run ID 复用了上一轮，不能据此关闭 F0。详见[新结果、确定性 RoPE 复现及默认全开复测步骤](DEEPSEEK_V4_AFD_C3_EAGER_U2_ROPE_REVIEW_ZH.md)。
+
+### 1.2 五开关全关对照：仍有异常
 
 附件 `aab420537ef043ff9d6230165620a687.gz` 的新目录为 `requests-c32-short-alloff/`，run ID 为 `20261013T045000-single-C3-alloff-diag-r1-c32-short`。实际启动于 04:51 UTC；Attention 四 rank 和 FFN 两 rank 均记录 `stages=2`、五个 `graph_u2_*` 值为 `0`。Attention 仍是 `FULL_DECODE_ONLY`、U2、Flash、DSpark 关闭、PD 开启；本轮不是误用旧的全开服务。
 
@@ -19,7 +23,7 @@ EOS 返回 `Hello`、2 tokens、`stop`。32 短请求全部 HTTP 200、64 tokens
 
 四角色业务日志无 ERROR/Traceback，Attention/P 请求数随后归零，FFN 继续推进。本包未含 `runtime.json`、site/node 配置、config hash、metrics、现场 tokenizer 报告及停服证据；可确认启动参数/开关和响应，不能确认这次实际源码提交、现场 token 映射或正常退出门禁。下一轮补采这些材料，不为补旧记录而重复本轮负载。
 
-### 1.2 上一轮默认全开 c32：已取得 token ID
+### 1.3 默认全开 c32：已取得 token ID
 
 附件 `b68d20f6771c4f5d8a0e5e6a843f20dc.gz` 的新结果位于 `requests-c32-20261013T034300/`，不能用同包旧 `requests/` 目录替代。本轮 EOS 返回 `Hello`、2 tokens、`stop`；32 短请求全部收到 HTTP 200，并完整归档，30 条非空、2 条空文本。四个 DP 各处理 8 个请求，故障仍集中在 DP3。
 
@@ -36,7 +40,7 @@ EOS 返回 `Hello`、2 tokens、`stop`。32 短请求全部 HTTP 200、64 tokens
 
 包内 `runtime.json`、`site.env` 和 run ID 仍沿用上一轮记录（预期/记录提交 `138202b…`，run ID 时间为 01:33），不能代表本次新启动进程的源码冻结证明。下一轮另建目录并重新执行指导书第 4.4 节采集；不要覆盖当前日志。此次没有正常停服证据，C2 的停服门禁也仍未关闭。
 
-### 1.3 更早的 full：当时没有 token ID
+### 1.4 更早的 full：当时没有 token ID
 
 附件 `cbd77d8f02964963aa7fcdcfb962df95.gz` 中，`runtime.json` 与 `site.env` 的实际/预期插件提交均为 `138202b3797f932e5ea31650413d118b254b0588`，vLLM 为 `0fc695f…`、Ascend 为 `11ee456…`，Python 3.12、torch/torch-npu 2.10、CANN 本机目录 `/usr/local/Ascend/cann-9.2.0`。
 C3 是 Flash 模型、PD + AFD、Graph `FULL_DECODE_ONLY`、U2、DSpark 关闭；五个 Graph/U2 开关均为 1。镜像 digest 和精确 CANN/HCCL build 在附件中仍为空。
@@ -73,14 +77,14 @@ C3 是 Flash 模型、PD + AFD、Graph `FULL_DECODE_ONLY`、U2、DSpark 关闭�
 
 ## 3. 【A5 手工执行】token 离线确认与复测通用采集
 
-默认全开与全关定向请求均已完成，**无需重复这两批**。若环境仍加载，可把 `C3_DIAG_OUTPUT` 指向最新全关目录，然后仅执行本节离线 tokenizer 段；它不发请求、不需要运行 NPU 服务：
+默认全开、全关与 eager/U2 定向请求均已完成，**无需重复这两批**。若环境仍加载，可把 `C3_DIAG_OUTPUT` 指向最新 eager 目录，然后仅执行本节离线 tokenizer 段；它不发请求、不需要运行 NPU 服务：
 
 ```bash
-export C3_DIAG_OUTPUT="$RUN_ROOT/requests-c32-short-alloff"
+export C3_DIAG_OUTPUT="$RUN_ROOT/requests-c32-short-eager-u2-alloff"
 test -f "$C3_DIAG_OUTPUT/batch-c32-short.summary.json"
 ```
 
-以下启动/请求步骤留作后续复测参考；本轮下一步按第 5 节执行。
+以下旧启动/请求步骤留作历史参考；本轮下一步按[新修复复测文档](DEEPSEEK_V4_AFD_C3_EAGER_U2_ROPE_REVIEW_ZH.md)第 4/5 节执行。
 
 先保留本轮日志，按统一指导书更新交付分支、写回实际 `SITE_FILE` 中的完整 `AFD_EXPECTED_COMMIT`，重新冻结 runtime/config hash。正式本轮源码是 `138202b…`，若从远端更新，将包含随后提交的 Proxy 内部直连及此次请求诊断改进；不能继续使用旧脚本执行新 suite。
 
@@ -153,7 +157,7 @@ PY
 
 ## 4. 【A5 手工执行】五开关全关对照（已执行且失败，保留步骤）
 
-本节已执行，结果见第 1.1 节；下一步直接执行第 5 节，不继续重复切换这五个开关。
+本节已执行，结果见第 1.2 节；第 5 节 eager 对照也已执行，不继续重复切换这五个开关。
 
 默认全开已经复现。先归档旧目录，按指导书第 7 节停止服务、保留退出日志并检查设备/端口清理结果；若再次需要强杀，记录为停服失败，不能算正常退出通过。
 
@@ -204,7 +208,9 @@ export C3_DIAG_OUTPUT="$RUN_ROOT/requests-c32-short-alloff"
 
 这是整体多流策略关闭对照，并非单变量定位；关闭后成功不能代替默认全开的 C3 F0。若两组都失败，继续排查 Graph/U2 基础回放、PD KV 和解码；若仅默认全开失败，再按依赖关系分组缩小开关范围，不能凭一次对照直接认定某个开关有错。正式验证的五开关默认仍为全 `1`。
 
-## 5. 【A5 手工执行】下一步：只关闭 Graph，保留 U2/PD
+## 5. 【A5 手工执行】eager/U2 对照（已执行并通过，保留步骤）
+
+本节定向请求已经通过，详细结果见第 1.1 节。下一步按[RoPE 修复复测文档](DEEPSEEK_V4_AFD_C3_EAGER_U2_ROPE_REVIEW_ZH.md)更新代码并恢复 Graph/U2、默认五开关全开；不用重跑本节。
 
 以本轮五开关全关配置为对照，仅将 A/F 的 `EXECUTION_MODE` 从 `full-decode-only` 改为 `eager`。保持 Flash、`U_BATCHES=2`、Attention `ENABLE_PD=1 ENABLE_DSPARK=0`、五开关全关、相同设备/端口/容量和源码；FFN 仍关闭 PD 与 DSpark。**不要改成 C4：C4 会同时打开 DSpark，无法作为本次 Graph 单变量对照。**
 
@@ -258,4 +264,4 @@ curl --noproxy '*' -fsS "$ATTENTION_URL/metrics" \
 
 ## 6. 设计复核
 
-本次仅修改自有 HTTP 验证客户端和诊断资料，不修改上游、模型、KV 数据面或 Graph 实现。token ID 增加响应归档大小但不改变采样/文本验收；并发批次仍最多 32、每请求超时仍为 300 秒，失败批次等待在途请求完成以保留证据，随后停止新增负载。没有新增可变全局状态；诊断 suite 不替代完整验收。后续 vLLM 升级须复核 chat/completion 的 `return_token_ids` 协议。
+早期证据采集修改仅涉及自有 HTTP 验证客户端和诊断资料；最新 DSA RoPE 隔离及 Graph 原位刷新实现、性能成本和上游 ABI 复核见[修复设计复核](DEEPSEEK_V4_AFD_C3_EAGER_U2_ROPE_REVIEW_ZH.md)第 3 节。token ID 增加响应归档大小但不改变采样/文本验收；并发批次仍最多 32、每请求超时仍为 300 秒，失败批次等待在途请求完成以保留证据，随后停止新增负载。没有新增可变全局状态；诊断 suite 不替代完整验收。后续 vLLM 升级须复核 chat/completion 的 `return_token_ids` 协议。

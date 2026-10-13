@@ -65,6 +65,8 @@ Prefill --Mooncake KV--> Decode Attention --P2pHccl AFD--> Decode FFN
 
 2026-10-13 C3 全关对照最新结果：附件 `aab420537ef043ff9d6230165620a687.gz` 确认四 Attention/两 FFN rank 的五开关均为 0；EOS 成功，32 短响应全部归档，仍有 DP3 的 `c32-short-19` 全零空文本，另有 DP3 的 `c32-short-3` 首 token 非零、后 63 个为 0，仅显示 `" Use"`。关闭五开关没有消除异常，非空检查不等于精度通过；未确定 Graph/U2 基础路径、PD 或数值根因。`【A5 手工执行】` 不重复全开/全关测试，按[C3 核对文档第 5 节](DEEPSEEK_V4_AFD_C3_EMPTY_OUTPUT_REVIEW_ZH.md)新建目录并补采实际源码/runtime/config，只把 Graph 改成 eager，保留 U2/PD/Flash、DSpark 关闭和五开关全关，冷启动后执行同一 EOS+32 请求。不是 C4，诊断不替代 F0，C2 停服门禁仍未关闭。
 
+2026-10-13 C3 eager/U2 最新结果：附件 `88aeb0977212430a9ff742b4a8ad69ef.gz` 中 EOS+32 请求全部通过，32 短响应均无 token 0、四 DP 各 8 条，真实 eager U2 stage 0/1 执行、请求归零。Graph 全开/全关仍失败，排查重点收窄至 Graph 路径，未关闭 F0。`【本地已完成】` 固定 Ascend 源码的 CPU 重放确认 DSA decode RoPE 两段共享同一缓冲而发生覆盖；已实现 stage-local 快照/ratio cache 引用同步与 capture 地址原位刷新，回归通过，不能提前认定 A5 已修好。`【A5 手工执行】` 按[RoPE 修复复测文档](DEEPSEEK_V4_AFD_C3_EAGER_U2_ROPE_REVIEW_ZH.md)更新源码/实际提交、冷启动正式 Graph/U2/PD、DSpark 关闭、五开关全开，先同一 33 请求再判断是否继续 full；不重复 eager 对照、不进入 C4/C5，C2 停服门禁仍未关闭。
+
 ### 3.1 验收拓扑
 
 | 部署 | 拓扑 | 用途 |

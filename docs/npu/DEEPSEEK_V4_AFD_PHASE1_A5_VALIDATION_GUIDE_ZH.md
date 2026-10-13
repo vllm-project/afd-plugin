@@ -782,7 +782,7 @@ curl --noproxy '*' -fsS --max-time 10 \
 
 ### 6.3 保存 metrics-before，生成精确 token-ID 输入
 
-**2026-10-13 C3 最新更新**：附件 `aab420537ef043ff9d6230165620a687.gz` 确认六个 A/F rank 的五开关全 `0` 已生效，但 `c32-short-19` 仍在 DP3 返回 64 个 token ID `0`、空文本；`c32-short-3` 也在 DP3，仅有 `" Use"`，后续 63 个 token 为 `0`。EOS 成功；32 条 HTTP 200 全部归档，31 非空不代表 31 条生成正确。关闭五开关未消除异常，底层原因尚未确定。下一步按[C3 核对文档第 5 节](DEEPSEEK_V4_AFD_C3_EMPTY_OUTPUT_REVIEW_ZH.md)另建目录、补采实际源码/runtime/config，**仅将 A/F 的 Graph 改为 eager，保留 U2、PD、Flash、DSpark 关闭及五开关全关**，冷启动后只执行同一 `c32-short`（EOS+32，共 33 个请求）。这不是 C4，不重复全开/全关负载、不改非空验收；C3 未通过，不进入 C4/C5，C2 正常停服门禁仍待关闭。正式默认五开关仍全开。
+**2026-10-13 C3 最新更新**：附件 `88aeb0977212430a9ff742b4a8ad69ef.gz` 确认 eager/U2 定向 33 请求通过，32 短响应均无 token `0`、四 DP 各 8 条，真实 U2 在线、请求归零。结合 Graph 全开/全关均复现，优先排查 Graph 路径；单轮 eager 成功不关闭 C3 F0。本地已修复固定 Ascend DSA decode RoPE 在 U2 两段共享缓冲造成的覆盖，并在 replay 前原位刷新 capture 地址；CPU 可复现及回归通过，**尚未证明消除了 A5 全零输出**。下一步按[最新结果与 RoPE 修复复测](DEEPSEEK_V4_AFD_C3_EAGER_U2_ROPE_REVIEW_ZH.md)更新源码、写回 SITE_FILE 完整提交、补采 runtime/config，冷启动正式 C3（Graph/U2/PD、Flash、DSpark 关闭、五开关全 1），先同一 EOS+32 请求；确认全部 token 正常后再完整 full。此轮不重跑 eager、不进入 C4/C5，C2 正常停服门禁仍待关闭。
 
 业务请求经 Proxy；`/tokenize` 与 `/metrics` 是 Attention 管理调用，不计作 PD 请求。
 使用 token-ID prompt，避免字符长度被误写为 KV block 边界长度。

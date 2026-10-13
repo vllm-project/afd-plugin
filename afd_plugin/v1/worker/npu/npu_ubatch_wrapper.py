@@ -33,8 +33,10 @@ from vllm_ascend.compilation.acl_graph import (
     GraphParams,
     get_graph_params,
 )
+from vllm_ascend.ops.rope_dsv4 import RopeDataProxy
 from vllm_ascend.utils import enable_sp
 
+from afd_plugin.v1.worker.npu.dsa_rope import refresh_dsa_rope
 from afd_plugin.v1.worker.npu.forward_context import (
     create_ascend_forward_context,
 )
@@ -329,6 +331,7 @@ class AscendUBatchWrapper(UBatchWrapper):
                 # DSA ubatch splitting allocates new length tensors. Replay must
                 # retain capture addresses while refreshing their contents.
                 updated_metadata: set[int] = set()
+                updated_rope_tensors: set[int] = set()
                 for stage, saved_ubatch in enumerate(
                     cudagraph_metadata.ubatch_metadata
                 ):
@@ -341,9 +344,7 @@ class AscendUBatchWrapper(UBatchWrapper):
                         ):
                             continue
                         live_dict = (
-                            attn_metadata[stage]
-                            if stage < len(attn_metadata)
-                            else None
+                            attn_metadata[stage] if stage < len(attn_metadata) else None
                         )
                         if not isinstance(live_dict, dict):
                             continue
@@ -355,6 +356,15 @@ class AscendUBatchWrapper(UBatchWrapper):
                         assert saved.num_decode_tokens == live.num_decode_tokens
                         assert saved.num_prefills == live.num_prefills
                         updated_metadata.add(id(saved))
+                        # ### PATCH START: refresh capture-owned DSV4 RoPE
+                        if isinstance(saved.decode.cos, RopeDataProxy):
+                            assert isinstance(live.decode.cos, RopeDataProxy)
+                            refresh_dsa_rope(
+                                saved.decode.cos,
+                                live.decode.cos,
+                                updated_rope_tensors,
+                            )
+                        # ### PATCH END: refresh capture-owned DSV4 RoPE
                         for target, source in (
                             (saved.decode.seq_lens, live.decode.seq_lens),
                             (saved.decode.query_start_loc, live.decode.query_start_loc),
