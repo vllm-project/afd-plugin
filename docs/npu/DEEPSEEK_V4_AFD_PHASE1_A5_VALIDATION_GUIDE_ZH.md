@@ -157,7 +157,7 @@ export DBO_PREFILL_TOKEN_THRESHOLD=12
 export ENABLE_MTP=0
 ```
 
-`MAX_NUM_SEQS=32` 是本次请求覆盖配置，必须在 M1 冻结并实测 HBM；现有 recipe 默认 8。若现场只能使用 8，须明确区分“32 个客户端并发”和“32 个活跃序列”，并记录队列行为；不能用排队成功代替未捕获 shape 的 Graph fallback 证据。A5 DSpark checkpoint 在 `GPU_MEMORY_UTILIZATION=0.90` 时实测 Prefill 仅余 1.63 GiB KV cache，低于 4096 所需的 1.70 GiB，因此本矩阵冻结为 0.91；C1–C5 使用同一值，不以降低 `MAX_MODEL_LEN` 绕过。
+`MAX_NUM_SEQS=32` 是本次请求覆盖配置，必须在 M1 冻结并实测 HBM；现有 recipe 默认 8。若现场只能使用 8，须明确区分“32 个客户端并发”和“32 个活跃序列”，并记录队列行为；不能用排队成功代替未捕获 shape 的 Graph fallback 证据。A5 DSpark checkpoint 在 `GPU_MEMORY_UTILIZATION=0.90` 时实测 Prefill 仅余 1.63 GiB KV cache，低于 4096 所需的 1.70 GiB，因此本矩阵冻结为 0.91；C1–C5 使用同一值，不以降低 `MAX_MODEL_LEN` 绕过。**此 export 必须写入本轮实际 `SITE_FILE` 并在每个启动终端加载，不能只修改指导书或请求终端；未设置时 recipe 仍默认 0.90。** 2026-10-13 C4 附件再次使用 0.90 而失败，重试位置见第 6.1.1 节。
 
 `node.env` 是本机配置，各节点可以不同，分别保存 SHA256；不再要求本机路径/IP 不同的所有 env 文件字节完全相同。
 
@@ -679,6 +679,9 @@ curl --noproxy '*' -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/attention-metrics-
 Prefill 节点：
 
 ```bash
+# 已在 site/node 和 CASE 配置之后、runtime 采集之前设置；启动时再核对。
+test "${GPU_MEMORY_UTILIZATION:-}" = 0.91
+test "$MAX_MODEL_LEN" = 4096
 nohup bash "$RECIPE/afd_prefill.sh" > "$RUN_ROOT/prefill.log" 2>&1 &
 echo $! > "$RUN_ROOT/prefill.pid"
 ```
@@ -697,6 +700,12 @@ echo $! > "$RUN_ROOT/ffn.pid"
 nohup bash "$RECIPE/afd_attention.sh" > "$RUN_ROOT/attention.log" 2>&1 &
 echo $! > "$RUN_ROOT/attention.pid"
 ```
+
+### 6.1.1 【A5 手工执行】C4 Prefill 的 KV 预算不足
+
+附件 `cf4f76620aea40d8aa3c8c77d0c252b2.gz` 的实际 Prefill CLI 为 `gpu_memory_utilization=0.90`、4096、P2/TP1、DSpark checkpoint；两个 Worker 仅有 1.63 GiB KV，低于单条 4096 请求需要的 1.70 GiB，首次在 KV 容量检查失败。历史 C2 成功日志为 0.91、KV 2.54 GiB；本次使用第 3.1 节既定 0.91 重试，实际容量仍须现场确认。
+
+设置必须在 **Prefill 启动终端、加载配置之后、nohup 之前** 生效。修改实际 `SITE_FILE` 的 `export GPU_MEMORY_UTILIZATION=...` 为 0.91（缺行则加在 `export MAX_NUM_SEQS=32` 后），正式新轮在三个角色终端加载并先采集 runtime/config。当前 A/F 已启动时，可仅诊断重试 Prefill；先确认旧 P 进程和端口已释放，日志另存 `prefill-retry-时间戳.log`、PID 另存 `prefill-retry.pid`，停止时使用新 PID，不覆盖旧错误材料。具体命令及 C3 剩余门禁见[C3/C4 最新核对第 4 节](DEEPSEEK_V4_AFD_C3_C4_20261013_REVIEW_ZH.md)。不降低 4096 或修改模型 config 来绕过；重试 ready 不等于 C4 F0。
 
 ### 6.2 判断 ready 后再启动 Proxy
 
@@ -782,7 +791,7 @@ curl --noproxy '*' -fsS --max-time 10 \
 
 ### 6.3 保存 metrics-before，生成精确 token-ID 输入
 
-**2026-10-13 C3 最新更新**：附件 `88aeb0977212430a9ff742b4a8ad69ef.gz` 确认 eager/U2 定向 33 请求通过，32 短响应均无 token `0`、四 DP 各 8 条，真实 U2 在线、请求归零。结合 Graph 全开/全关均复现，优先排查 Graph 路径；单轮 eager 成功不关闭 C3 F0。本地已修复固定 Ascend DSA decode RoPE 在 U2 两段共享缓冲造成的覆盖，并在 replay 前原位刷新 capture 地址；CPU 可复现及回归通过，**尚未证明消除了 A5 全零输出**。下一步按[最新结果与 RoPE 修复复测](DEEPSEEK_V4_AFD_C3_EAGER_U2_ROPE_REVIEW_ZH.md)更新源码、写回 SITE_FILE 完整提交、补采 runtime/config，冷启动正式 C3（Graph/U2/PD、Flash、DSpark 关闭、五开关全 1），先同一 EOS+32 请求；确认全部 token 正常后再完整 full。此轮不重跑 eager、不进入 C4/C5，C2 正常停服门禁仍待关闭。
+**2026-10-13 C3/C4 最新更新**：附件 `48e1a5df943b46b2bc4bc77d7437d0b0.gz` 在实际插件 `f3c8399…` 上完成定向 33 项和 full 92 项，请求检查通过、真实 Graph/U2、A/Proxy 请求归零；但六 A/F rank 的五开关实际仍全 `0`，定向 1 条/full 8 条有尾部 token `0`，其中最长连续 49 个，并非原输出退化已关闭。停服文件记录失败，Attention 四次 Segfault、FFN 正常 shutdown 标记为 0；最终清理不能代替正常停服。旧 INFO RoPE 标记可能被插件 root 日志级别过滤，本次仅改为 WARNING 便于核验，不认定缺标记就是旧源码。详见[C3/C4 最新证据与操作步骤](DEEPSEEK_V4_AFD_C3_C4_20261013_REVIEW_ZH.md)。C4 Prefill 可先按第 6.1.1 节修正 0.91 验证启动；正式默认全开 C3、输出正确性和正常停服仍待关闭，C4 请求扩量/C5/跨机验收保持待执行。
 
 业务请求经 Proxy；`/tokenize` 与 `/metrics` 是 Attention 管理调用，不计作 PD 请求。
 使用 token-ID prompt，避免字符长度被误写为 KV block 边界长度。

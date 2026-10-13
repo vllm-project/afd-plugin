@@ -1,10 +1,10 @@
 # C3 并发 32 空输出核对与定向复测
 
-更新日期：2026-10-13。结论：**最新 eager/U2 定向 33 请求通过，32 条短响应没有 token 0；Graph 全开/全关故障仍未关闭。本地已修复 CPU 可复现的 DSA RoPE 段间共享问题，尚待 A5 验证。下一步更新修复提交、冷启动默认全开的 Graph/U2，按[最新结果与修复复测步骤](DEEPSEEK_V4_AFD_C3_EAGER_U2_ROPE_REVIEW_ZH.md)执行同一 33 请求；不重复 eager 对照，不进入 C4/C5。**
+更新日期：2026-10-13。**最新附件 `48e1a5df943b46b2bc4bc77d7437d0b0.gz` 的 Graph/U2 关闭对照在 `f3c8399…` 上完成定向 33 项/full 92 项请求检查，但仍有非空文字后连续 token `0`，且正常停服失败；五开关实际全 `0`，不能关闭默认全开 C3。当前操作见[C3/C4 最新结果与 Prefill 修正](DEEPSEEK_V4_AFD_C3_C4_20261013_REVIEW_ZH.md)。以下保留此前空输出、全关和 eager 对照历史及离线 token 核对命令，不以旧步骤代替最新执行入口。**
 
 ## 1. 本轮证据
 
-### 1.1 最新 eager/U2：定向请求通过，修复待验证
+### 1.1 此前 eager/U2：定向请求通过，修复待验证
 
 附件 `88aeb0977212430a9ff742b4a8ad69ef.gz`：实际 eager/U2/PD，DSpark 关闭、五 Graph 开关全关；EOS 成功，32 短响应全部非空、64 tokens、`length`，全部无 ID `0`，四 DP 各 8 条。FFN 在线两 stage 且未 replay，批次结束 A/Proxy 请求归零。源码/runtime 冻结和退出材料仍缺，run ID 复用了上一轮，不能据此关闭 F0。详见[新结果、确定性 RoPE 复现及默认全开复测步骤](DEEPSEEK_V4_AFD_C3_EAGER_U2_ROPE_REVIEW_ZH.md)。
 

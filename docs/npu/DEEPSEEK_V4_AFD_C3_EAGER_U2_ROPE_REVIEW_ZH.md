@@ -1,6 +1,6 @@
 # C3 eager/U2 对照结果与 RoPE 隔离修复复测
 
-更新日期：2026-10-13。**本轮 eager/U2 定向 33 请求通过，未再出现 token `0`。已修复一处 CPU 可复现的 DSA RoPE 段间共享问题，尚未证明它消除了 A5 空输出。下一步更新修复提交、冷启动默认五开关全开的 Graph/U2，再执行同一 33 请求；不是进入 C4。**
+更新日期：2026-10-13。**本文记录此前 eager/U2 成功与 RoPE 修复机制。最新 `48e1a5df943b46b2bc4bc77d7437d0b0.gz` 在实际 `f3c8399…` 上完成 Graph/U2 定向 33 项/full 92 项检查，但五开关全 `0`，仍有连续尾部 token `0`，正常停服失败；计算修复尚未被证明消除了现场输出退化。当前 C4 Prefill 的 0.91 修正和下一步以[C3/C4 最新核对](DEEPSEEK_V4_AFD_C3_C4_20261013_REVIEW_ZH.md)为准，本文第 4–5 节保留默认全开 C3 复测命令。**
 
 ## 1. 新附件结果
 
@@ -108,7 +108,7 @@ grep -nF 'AFD HCCL diagnostics configuration:' \
   "$RUN_ROOT/attention.log" "$RUN_ROOT/ffn.log"
 ```
 
-四 Worker 须有新标记；六 rank 须为 `stages=2`、五开关全 `1`。实际 A/F 为 Graph `FULL_DECODE_ONLY`，Attention DSpark 关闭、A/F capture/ready 完整。值不符或新标记缺失先核对源码/启动环境，不发流量。
+四 Worker 须有新标记；六 rank 须为 `stages=2`、五开关全 `1`。实际 A/F 为 Graph `FULL_DECODE_ONLY`，Attention DSpark 关闭、A/F capture/ready 完整。值不符或新标记缺失先核对源码/启动环境，不发流量。旧 `f3c8399…` 使用 INFO 标记，插件 logger 在默认配置下可能继承 root WARNING 而不输出；本次已改为启动时 WARNING，不修改 RoPE 计算路径。缺旧 INFO 标记不能直接证明旧源码仍在运行。启动前同时显式加载 `GPU_MEMORY_UTILIZATION=0.91`，保存实际各角色 CLI 与 runtime，不继承 recipe 的 0.90 默认值。
 
 ## 5. 【A5 手工执行】先 33 请求，再判断是否继续 full
 

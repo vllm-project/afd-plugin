@@ -67,6 +67,8 @@ Prefill --Mooncake KV--> Decode Attention --P2pHccl AFD--> Decode FFN
 
 2026-10-13 C3 eager/U2 最新结果：附件 `88aeb0977212430a9ff742b4a8ad69ef.gz` 中 EOS+32 请求全部通过，32 短响应均无 token 0、四 DP 各 8 条，真实 eager U2 stage 0/1 执行、请求归零。Graph 全开/全关仍失败，排查重点收窄至 Graph 路径，未关闭 F0。`【本地已完成】` 固定 Ascend 源码的 CPU 重放确认 DSA decode RoPE 两段共享同一缓冲而发生覆盖；已实现 stage-local 快照/ratio cache 引用同步与 capture 地址原位刷新，回归通过，不能提前认定 A5 已修好。`【A5 手工执行】` 按[RoPE 修复复测文档](DEEPSEEK_V4_AFD_C3_EAGER_U2_ROPE_REVIEW_ZH.md)更新源码/实际提交、冷启动正式 Graph/U2/PD、DSpark 关闭、五开关全开，先同一 33 请求再判断是否继续 full；不重复 eager 对照、不进入 C4/C5，C2 停服门禁仍未关闭。
 
+2026-10-13 C3/C4 最新核对：附件 `48e1a5df943b46b2bc4bc77d7437d0b0.gz` 的实际插件为 `f3c8399…`，定向 33 项/full 92 项检查通过，真实 Graph/U2、请求归零；但五开关实际全 `0`，定向 1 条/full 8 条有尾部 token `0`（最长连续 49 个），停服失败、Attention 四次 Segfault、FFN shutdown 标记为 0，不能关闭默认全开 C3 F0。附件 `cf4f76620aea40d8aa3c8c77d0c252b2.gz` 的 C4 Prefill 使用 0.90 内存预算，只余 1.63 GiB KV，4096 需要 1.70 GiB；`【A5 手工执行】` 先按既定 `GPU_MEMORY_UTILIZATION=0.91` 在启动终端重试 P 并保留新日志，修正实际 site.env，正式新轮统一冻结预算。`【本地已完成】` RoPE 启动标记改为 WARNING，避免 INFO 被插件日志树过滤，计算逻辑未改。下一步及剩余门禁以[C3/C4 最新核对](DEEPSEEK_V4_AFD_C3_C4_20261013_REVIEW_ZH.md)为准；C4 请求扩量/C5/跨机验收待前置问题关闭，上述旧段落仅记录排障历史。
+
 ### 3.1 验收拓扑
 
 | 部署 | 拓扑 | 用途 |

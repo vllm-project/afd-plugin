@@ -2146,7 +2146,9 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
 
     def _ensure_two_metadata_builders(self) -> None:
         if self.use_compress:
-            logger.info(
+            # vLLM configures its own logger tree, while afd_plugin can inherit
+            # the root WARNING level. Keep this one-time audit marker visible.
+            logger.warning(
                 "AFD DSA U2 RoPE isolation active: stage-local snapshots "
                 "and in-place graph replay refresh",
             )
