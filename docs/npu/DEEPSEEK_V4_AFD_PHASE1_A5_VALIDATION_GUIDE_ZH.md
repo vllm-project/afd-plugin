@@ -909,6 +909,9 @@ bash "$AFD_PLUGIN_ROOT/tools/validation/collect_c5_evidence.sh"
 脚本保存现存服务材料、CANN run/debug 轮转日志、extra-info/atrace、版本信息，
 并使用 driver 的 msnpureport 导出设备系统日志；相关进程仍存在时保存其工作目录、
 选定环境和库加载路径。日志中的其他 Worker PID 会自动加入采集。
+若 msnpureport 提示容器内需要 `--docker`，脚本自动带该参数重试一次，保留两次
+输出和退出码；`DEVICE_EXPORT_FINAL_EXIT=0` 及导出文件清单用于核对采集是否成功。
+空 extra-info 目录会明确标记为没有文件，不能当作已取得异常 dump。
 本次固定故障窗口为 UTC 08:27:47–08:27:51，默认搜索还包括 `/root`、
 `/home/z00569729` 和 `/tmp`。用于其他故障时须调整脚本中的固定 PID、时间窗口及搜索根。
 

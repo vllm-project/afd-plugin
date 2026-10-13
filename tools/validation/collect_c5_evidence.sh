@@ -28,6 +28,7 @@ snap ports ss -ltnp
 snap processes ps -eo pid,ppid,lstart,comm
 snap dmesg dmesg -T
 snap journal journalctl --utc --since '2026-10-13 08:27:30' --until '2026-10-13 08:28:10' --no-pager
+grep -q -- '-- No entries --' "$out/meta/journal.txt" && printf 'NO_JOURNAL_ENTRIES_IN_FAULT_WINDOW\n' >> "$status"
 env | LC_ALL=C sort | grep -E '^(CANN_ROOT|VIRTUAL_ENV|LD_LIBRARY_PATH|PYTHONPATH|ASCEND_(HOME_PATH|TOOLKIT_HOME|PROCESS_LOG_PATH|WORK_PATH)|NPU_COLLECT_PATH|HCCL_[A-Z0-9_]+|AFD_HCCL_[A-Z0-9_]+|EXECUTION_MODE|U_BATCHES|ENABLE_PD|ENABLE_DSPARK)=' > "$out/meta/shell-env.txt" || true
 snap packages "${PYTHON_BIN:-python3}" -m pip show torch torch-npu vllm vllm-ascend vllm-afd-plugin
 roots=("$origin" "$RUN_ROOT" /root /home/z00569729 /tmp)
@@ -70,7 +71,19 @@ if [[ -x "$tool" ]]; then
   grep -Eq '^[[:space:]]*report([[:space:]]|$)' "$out/meta/msnpureport-help.txt" && report_args=(report -f)
   printf 'Exporting device logs; timeout 180 seconds...\n'
   (cd "$out/device-export" && timeout 180 "$tool" "${report_args[@]}") > "$out/meta/msnpureport.txt" 2>&1
-  printf 'COMMAND msnpureport exit=%s\n' "$?" >> "$status"
+  report_rc=$?
+  printf 'COMMAND msnpureport exit=%s\n' "$report_rc" >> "$status"
+  if ((report_rc != 0)) && grep -Fq 'msnpureport in docker should be used with --docker' "$out/meta/msnpureport.txt"; then
+    printf 'Retrying device log export with --docker; timeout 180 seconds...\n'
+    (cd "$out/device-export" && timeout 180 "$tool" "${report_args[@]}" --docker) > "$out/meta/msnpureport-docker.txt" 2>&1
+    report_rc=$?
+    printf 'COMMAND msnpureport-docker exit=%s\n' "$report_rc" >> "$status"
+  fi
+  printf 'DEVICE_EXPORT_FINAL_EXIT=%s\n' "$report_rc" >> "$status"
+  ((report_rc == 0)) || printf 'DEVICE_EXPORT_FAILED; see meta/msnpureport*.txt; host collection may be needed\n' >> "$status"
+  timeout 60 find "$out/device-export" -type f -print0 > "$out/meta/device-export-files.nul" 2>> "$status"
+  printf 'DEVICE_EXPORT_FILE_SEARCH exit=%s\n' "$?" >> "$status"
+  [[ -s "$out/meta/device-export-files.nul" ]] || printf 'NO_DEVICE_EXPORT_FILES\n' >> "$status"
 else printf 'MISSING_TOOL msnpureport; host collection may be needed\n' >> "$status"; fi
 for path in /var/log/npu/report /var/log/npu/slog /var/log/ascend_seclog /usr/local/Ascend/driver/version.info /usr/local/Ascend/driver/ascend_install.info /etc/ascend_install.info; do add "$path"; done
 cann="${CANN_ROOT:-/usr/local/Ascend/cann-9.2.0}"
@@ -90,6 +103,15 @@ for path in "${roots[@]}"; do
 done
 [[ ! -f "$out/meta/dump-paths.nul" ]] || cat "$out/meta/dump-paths.nul" >> "$list"
 [[ ! -s "$out/meta/dump-paths.nul" ]] && printf 'MISSING_EXCEPTION_DUMP_AND_ATRACE_IN_SEARCHED_ROOTS\n' >> "$status"
+touch "$out/meta/extra-info-files.nul"
+while IFS= read -r -d '' path; do
+  [[ "$path" == */extra-info ]] || continue
+  timeout 60 find "$path" -type f -print0 >> "$out/meta/extra-info-files.nul" 2>> "$status"
+  printf 'EXTRA_INFO_FILE_SEARCH %s exit=%s\n' "$path" "$?" >> "$status"
+done < "$out/meta/dump-paths.nul"
+sort -zu "$out/meta/extra-info-files.nul" -o "$out/meta/extra-info-files.nul"
+tr '\0' '\n' < "$out/meta/extra-info-files.nul" > "$out/meta/extra-info-files.txt"
+[[ -s "$out/meta/extra-info-files.nul" ]] || printf 'NO_EXTRA_INFO_FILES_IN_SEARCHED_ROOTS; directories or atrace alone do not establish a saved exception dump\n' >> "$status"
 sort -zu "$list" -o "$list"
 tr '\0' '\n' < "$list" > "$out/meta/source-inventory.txt"
 archive="${out}.tar.gz"
