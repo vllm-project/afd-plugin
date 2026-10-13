@@ -782,6 +782,8 @@ curl --noproxy '*' -fsS --max-time 10 \
 
 ### 6.3 保存 metrics-before，生成精确 token-ID 输入
 
+**2026-10-13 C3 更新**：此前 Prefill HTTP 504 已不再出现，本次 EOS 和 1/8 短长输入成功，但 32 短输入有两个 HTTP 200/64 tokens/`length` 的空文本，均在 Attention DP3。C3 full 未通过。下一步按[C3 空输出核对与定向复测](DEEPSEEK_V4_AFD_C3_EMPTY_OUTPUT_REVIEW_ZH.md)更新诊断脚本，先用 `--suite c32-short`（EOS + 32，共 33 个请求）采集真实 token ID，再做五开关关闭对照；保持默认正式配置全开，不放宽空输出校验、不进入 C4/C5。
+
 业务请求经 Proxy；`/tokenize` 与 `/metrics` 是 Attention 管理调用，不计作 PD 请求。
 使用 token-ID prompt，避免字符长度被误写为 KV block 边界长度。
 

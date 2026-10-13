@@ -112,6 +112,19 @@ def request_gate(tmp_path, monkeypatch):
                 )
             if fault == "empty-response":
                 return httpx.Response(200, json={"choices": []})
+            assert body["return_token_ids"] is True
+            name = request.headers["X-Request-Id"]
+            empty_text = fault == "empty-c32" and name in (
+                "test-c32-short-16",
+                "test-c32-short-29",
+            )
+            if fault == "empty-c32" and name in (
+                "test-c32-short-5",
+                "test-c32-short-22",
+            ):
+                # These siblings finish after the empty response. They must
+                # retain their results rather than be cancelled by gather.
+                await asyncio.sleep(0.01)
             forced = body.get("ignore_eos", False) or (chat and fault == "eos-length")
             count = body["max_tokens"] if forced else 2
             prompt = body["messages"][0]["content"] if chat else body["prompt"]
@@ -126,8 +139,9 @@ def request_gate(tmp_path, monkeypatch):
                             **(
                                 {"message": {"content": "hello"}}
                                 if chat
-                                else {"text": "hello"}
+                                else {"text": "" if empty_text else "hello"}
                             ),
+                            "token_ids": [100000 if empty_text else 10] * count,
                             "finish_reason": "length" if forced else "stop",
                         }
                     ],
@@ -181,6 +195,49 @@ def test_standalone_gate_uses_attention_metrics_without_proxy(request_gate):
     result, _, _, calls = exercise()
     assert result["request_checks_passed"] is True
     assert all(path != "/healthcheck" for _, path in calls)
+
+
+def test_c32_short_suite_preserves_concurrency_without_repeating_full(request_gate):
+    args, exercise = request_gate
+    args.suite = "c32-short"
+    args.token_pool = None
+    result, peak, closed, calls = exercise()
+    assert result["request_checks_passed"] is True
+    assert result["full_request_suite_passed"] is False
+    assert result["request_count"] == 33
+    assert result["f0_passed"] is None
+    assert peak == 32
+    assert not closed
+    assert {r["name"] for r in result["records"]} == {
+        "eos",
+        *(f"c32-short-{index}" for index in range(32)),
+    }
+    assert ("attention", "/metrics") in calls
+
+
+def test_empty_text_keeps_token_ids_and_all_concurrent_results(request_gate):
+    args, exercise = request_gate
+    args.suite = "c32-short"
+    args.token_pool = None
+    with pytest.raises(ValueError, match="2/32 requests failed"):
+        exercise("empty-c32")
+    batch = json.loads(Path(args.output, "batch-c32-short.summary.json").read_text())
+    assert batch["request_count"] == 32
+    assert batch["passed_count"] == 30
+    assert batch["failed_count"] == 2
+    assert batch["request_checks_passed"] is False
+    assert {f["name"] for f in batch["failures"]} == {"c32-short-16", "c32-short-29"}
+    for index in range(32):
+        assert Path(args.output, f"c32-short-{index}.json").exists()
+    for index in (16, 29):
+        error = json.loads(
+            Path(args.output, f"c32-short-{index}.validation.error.json").read_text()
+        )
+        assert error["empty_text"] is True
+        assert error["http_status"] == 200
+        assert error["completion_tokens"] == 64
+        assert error["token_ids"] == [100000] * 64
+    assert not list(Path(args.output).glob("*.transport.error.json"))
 
 
 @pytest.mark.parametrize("suite,count", [("smoke", 5), ("eos", 1), ("tail", 4)])

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Check A5 requests through Proxy or Attention; select smoke, eos, tail, or full."""
+"""Check A5 requests through Proxy or Attention, including targeted c32-short."""
 
 import argparse
 import asyncio
@@ -12,6 +12,7 @@ from pathlib import Path
 import httpx
 
 CONCURRENCIES = (1, 8, 32)
+DIAGNOSTIC_CONCURRENCY = 32
 BOUNDARY_LENGTHS = (31, 32, 33, 63, 64, 65)
 LONG_INPUT_LENGTH = 1024
 REQUEST_TIMEOUT = 300
@@ -49,6 +50,8 @@ async def run_checks(args: argparse.Namespace) -> dict:
                 "temperature": 0,
                 "max_tokens": budget,
                 "stream": False,
+                # Preserve generated IDs without changing detokenization or sampling.
+                "return_token_ids": True,
             }
             if chat:
                 body["messages"] = [{"role": "user", "content": prompt}]
@@ -129,7 +132,24 @@ async def run_checks(args: argparse.Namespace) -> dict:
                 choice.get("message", {}).get("content") if chat else choice.get("text")
             )
             if not text or not 0 < count <= budget:
-                raise ValueError(f"{name}: empty output or invalid token count")
+                failure = {
+                    "name": name,
+                    "response_id": data.get("id"),
+                    "http_status": response.status_code,
+                    "empty_text": not bool(text),
+                    "completion_tokens": count,
+                    "budget": budget,
+                    "finish_reason": finish,
+                    "token_ids": choice.get("token_ids"),
+                }
+                Path(args.output, f"{name}.validation.error.json").write_text(
+                    json.dumps(failure, ensure_ascii=False, indent=2) + "\n"
+                )
+                raise ValueError(
+                    f"{name}: empty output or invalid token count "
+                    f"(empty_text={not bool(text)}, completion_tokens={count}, "
+                    f"finish_reason={finish}); see validation.error.json"
+                )
             if finish not in ("stop", "length"):
                 raise ValueError(f"{name}: invalid finish_reason={finish}")
             if force_length and (finish != "length" or count != budget):
@@ -162,23 +182,70 @@ async def run_checks(args: argparse.Namespace) -> dict:
                 "before repeating load tests"
             )
 
-        if args.suite == "full":
-            for concurrency in CONCURRENCIES:
-                for kind, prompt in (
-                    ("short", "Reply with a short greeting."),
-                    ("long", tokens[:LONG_INPUT_LENGTH]),
-                ):
+        if args.suite in ("full", "c32-short"):
+            concurrencies = (
+                (DIAGNOSTIC_CONCURRENCY,)
+                if args.suite == "c32-short"
+                else CONCURRENCIES
+            )
+            prompts = [("short", "Reply with a short greeting.")]
+            if args.suite == "full":
+                prompts.append(("long", tokens[:LONG_INPUT_LENGTH]))
+            for concurrency in concurrencies:
+                for kind, prompt in prompts:
                     print(
-                        f"[full] {kind} input, {concurrency} concurrent requests",
+                        f"[{args.suite}] {kind} input, "
+                        f"{concurrency} concurrent requests",
                         flush=True,
                     )
                     results = await asyncio.gather(
                         *[
                             complete(f"c{concurrency}-{kind}-{index}", prompt, 64, True)
                             for index in range(concurrency)
-                        ]
+                        ],
+                        return_exceptions=True,
                     )
-                    records.extend(results)
+                    failures = [
+                        {
+                            "name": f"c{concurrency}-{kind}-{index}",
+                            "exception_type": type(result).__name__,
+                            "error": str(result) or repr(result),
+                        }
+                        for index, result in enumerate(results)
+                        if isinstance(result, Exception)
+                    ]
+                    passed = [
+                        result
+                        for result in results
+                        if not isinstance(result, Exception)
+                    ]
+                    # Collect the entire in-flight batch before failing. Cancelling
+                    # siblings at the first empty output obscures their real results.
+                    Path(
+                        args.output, f"batch-c{concurrency}-{kind}.summary.json"
+                    ).write_text(
+                        json.dumps(
+                            {
+                                "request_count": concurrency,
+                                "passed_count": len(passed),
+                                "failed_count": len(failures),
+                                "request_checks_passed": not failures,
+                                "records": passed,
+                                "failures": failures,
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                        + "\n"
+                    )
+                    records.extend(passed)
+                    if failures:
+                        raise ValueError(
+                            f"c{concurrency}-{kind}: {len(failures)}/{concurrency} "
+                            "requests failed; "
+                            + "; ".join(failure["error"] for failure in failures)
+                        )
+        if args.suite == "full":
             for length in BOUNDARY_LENGTHS:
                 records.append(
                     await complete(f"boundary-{length}", tokens[:length], 32, True)
@@ -246,7 +313,7 @@ async def run_checks(args: argparse.Namespace) -> dict:
                 }
             )
 
-        if args.suite != "eos":
+        if args.suite not in ("eos", "c32-short"):
             print(
                 f"[{args.suite}] checking SSE, cancellation, and recovery", flush=True
             )
@@ -308,9 +375,12 @@ def main() -> None:
     parser.add_argument("--attention-url", required=True)
     parser.add_argument(
         "--suite",
-        choices=("smoke", "eos", "tail", "full"),
+        choices=("smoke", "eos", "tail", "full", "c32-short"),
         default="full",
-        help="smoke: 5 requests; eos: 1; tail: 4 remaining checks; full: 92 (default)",
+        help=(
+            "smoke: 5; eos: 1; tail: 4; full: 92 (default); "
+            "c32-short: EOS + 32 short requests for diagnosis only"
+        ),
     )
     parser.add_argument(
         "--standalone",

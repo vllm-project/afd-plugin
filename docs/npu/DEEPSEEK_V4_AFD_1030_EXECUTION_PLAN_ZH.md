@@ -59,6 +59,8 @@ Prefill --Mooncake KV--> Decode Attention --P2pHccl AFD--> Decode FFN
 
 ## 3. 固定范围
 
+2026-10-13 C3 full 复测：Proxy HTTP 504 已不再出现，EOS、1/8 并发短长输入通过；32 短输入有两个 DP3 请求返回 HTTP 200、64 tokens、`length`，但文本为空，C3 full 未通过。现有 token IDs 为 null，不能确认底层 Graph/U2 或 detokenization 原因。`【本地已完成】` 请求脚本保留 token IDs、收齐失败批次并汇总，新增 EOS+32 共 33 请求的定向 suite；23 项相关回归通过。`【A5 手工执行】` 按[C3 空输出核对与定向复测](DEEPSEEK_V4_AFD_C3_EMPTY_OUTPUT_REVIEW_ZH.md)先采集默认全开下的 token 证据，再做五开关关闭对照；不放宽非空验收，不进入 C4/C5。
+
 ### 3.1 验收拓扑
 
 | 部署 | 拓扑 | 用途 |
