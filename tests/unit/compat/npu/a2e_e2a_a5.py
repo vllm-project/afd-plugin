@@ -15,6 +15,7 @@ Environment:
     AFD_TEST_A        attention rank count, default same as E
     AFD_TEST_WORLD    HCCL world size, default E + A
     AFD_TEST_PORT     MASTER_PORT, default 29601
+    AFD_TEST_QUANT_MODE  0: BF16 A2E/E2A; 4: MXFP8 A2E byte transport only
 """
 
 import os
@@ -30,6 +31,8 @@ import torch_npu  # noqa: F401
 # ensure_cam_p2p_ops_available() also sets AFD_CUST_OPAPI_LIB_PATH and the
 # vendor paths so the aclnnA2e/aclnnE2a symbols are resolvable at runtime.
 from afd_plugin.compat.npu.ops import ensure_cam_p2p_ops_available
+
+MAX_MXFP8_RANKS = 64
 
 ensure_cam_p2p_ops_available()
 import afd_plugin._C_ascend  # noqa: E402, F401
@@ -49,8 +52,30 @@ class A2eE2aModule(torch.nn.Module):
         rank,
         group_ep,
         aiv_num,
+        x_scale=None,
+        quant_mode=0,
     ):
         is_attention_side = rank >= expert_rank_size
+
+        if quant_mode == 4:
+            return torch.ops.afd_ascend.a2e(
+                x=x,
+                expert_ids=expert_ids,
+                scales=scales,
+                batch_size=batch_size,
+                hidden_size=hidden_size,
+                topk=topk,
+                expert_rank_size=expert_rank_size,
+                attention_rank_size=attention_rank_size,
+                rank=rank,
+                group_ep=group_ep,
+                aiv_num=aiv_num,
+                compute_gate=1,
+                x_scale=x_scale,
+                quant_mode=quant_mode,
+            )
+        if quant_mode != 0:
+            raise ValueError("AFD_TEST_QUANT_MODE must be 0 or 4")
 
         if is_attention_side:
             # Attention side: send data to MOE side via A2E.
@@ -225,6 +250,77 @@ def run_once(local_rank_id, ep_world_size):
         scales_tensor = torch.empty(0, topk, dtype=torch.float, device="npu")
 
     mod = A2eE2aModule().npu()
+
+    quant_mode = int(os.environ.get("AFD_TEST_QUANT_MODE", "0"))
+    if quant_mode == 4:
+        assert expert_rank_size > 0 and expert_rank_size == attention_rank_size, (
+            "MXFP8 requires equal positive A/F rank counts"
+        )
+        assert expert_rank_size + attention_rank_size <= MAX_MXFP8_RANKS, (
+            f"MXFP8 supports at most {MAX_MXFP8_RANKS} total ranks"
+        )
+        assert world_size == expert_rank_size + attention_rank_size, (
+            "MXFP8 requires WORLD to equal E + A"
+        )
+        scale_width = (hidden_size + 31) // 32
+        sender_rank = rank if is_attention_side else rank + expert_rank_size
+        # Build pre-quantized typed storage, without numerical FP8 conversion.
+        expected_x = (
+            ((torch.arange(batch_size * hidden_size) + sender_rank) % 127)
+            .to(torch.uint8)
+            .reshape(batch_size, hidden_size)
+        )
+        expected_scale = (
+            ((torch.arange(batch_size * scale_width) + sender_rank) % 32 + 112)
+            .to(torch.uint8)
+            .reshape(batch_size, scale_width)
+        )
+        for fp8_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            if is_attention_side:
+                x_tensor = expected_x.to("npu").view(fp8_dtype)
+                x_scale = expected_scale.to("npu").view(torch.float8_e8m0fnu)
+            else:
+                x_tensor = torch.empty((0, hidden_size), dtype=fp8_dtype, device="npu")
+                x_scale = torch.empty(
+                    (0, scale_width), dtype=torch.float8_e8m0fnu, device="npu"
+                )
+            for compute_gate in (0, 1):
+                output = torch.ops.afd_ascend.a2e(
+                    x_tensor,
+                    expert_ids_tensor,
+                    scales_tensor,
+                    batch_size,
+                    hidden_size,
+                    topk,
+                    expert_rank_size,
+                    attention_rank_size,
+                    rank,
+                    ep_hcomm_info,
+                    aiv_num,
+                    compute_gate,
+                    x_scale=x_scale,
+                    quant_mode=4,
+                )
+                torch.npu.synchronize()
+                assert len(output) == 6
+                assert output[0].dtype == fp8_dtype
+                if not is_attention_side:
+                    assert torch.equal(output[0].view(torch.uint8).cpu(), expected_x)
+                    assert torch.equal(
+                        output[5].view(torch.uint8).cpu(), expected_scale
+                    )
+                else:
+                    assert tuple(output[0].shape) == (1, 1)
+                    assert tuple(output[5].shape) == (1, 1)
+                dist.barrier()
+        print(
+            f"Rank {rank} (dev{physical_dev}): MXFP8 A2E bytes match "
+            "(E4M3/E5M2, gate=0/1)"
+        )
+        dist.destroy_process_group()
+        return
+    if quant_mode != 0:
+        raise ValueError("AFD_TEST_QUANT_MODE must be 0 or 4")
 
     (
         e2a_output,

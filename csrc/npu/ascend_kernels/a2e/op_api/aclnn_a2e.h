@@ -18,32 +18,18 @@ extern "C" {
 
 __attribute__((visibility("default")))
 aclnnStatus aclnnA2eGetWorkspaceSize(
-    const aclTensor *x,
-    const aclTensor *expertIds,
-    const aclTensor *scales,
-    int64_t batchSize,
-    int64_t hiddenSize,
-    int64_t topk,
-    int64_t expertRankSize,
-    int64_t attentionRankSize,
-    int64_t rank,
-    char *groupEp,
-    int64_t aivNum,
-    int64_t computeGate,
-    const aclTensor *expandXOut,
-    const aclTensor *simulateExpertIdsOut,
-    const aclTensor *simulateExpertScalesOut,
-    const aclTensor *attenBatchSize,
-    const aclTensor *xActiveMaskOut,
-    uint64_t *workspaceSize,
-    aclOpExecutor **executor);
+    const aclTensor *x, const aclTensor *expertIds, const aclTensor *scales,
+    const aclTensor *xScale, int64_t batchSize, int64_t hiddenSize, int64_t topk,
+    int64_t expertRankSize, int64_t attentionRankSize, int64_t rank,
+    char *groupEp, int64_t aivNum, int64_t computeGate, int64_t quantMode,
+    const aclTensor *expandXOut, const aclTensor *simulateExpertIdsOut,
+    const aclTensor *simulateExpertScalesOut, const aclTensor *attenBatchSize,
+    const aclTensor *xActiveMaskOut, const aclTensor *xScaleOut,
+    uint64_t *workspaceSize, aclOpExecutor **executor);
 
 __attribute__((visibility("default")))
-aclnnStatus aclnnA2e(
-    void *workspace,
-    uint64_t workspaceSize,
-    aclOpExecutor *executor,
-    aclrtStream stream);
+aclnnStatus aclnnA2e(void *workspace, uint64_t workspaceSize,
+                    aclOpExecutor *executor, aclrtStream stream);
 
 #ifdef __cplusplus
 }

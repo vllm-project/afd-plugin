@@ -25,6 +25,7 @@ struct A2ETilingData {
     uint32_t attentionRankSize;
     uint32_t rank;
     uint32_t computeGate;
+    uint32_t quantMode;
 };
 }
 
