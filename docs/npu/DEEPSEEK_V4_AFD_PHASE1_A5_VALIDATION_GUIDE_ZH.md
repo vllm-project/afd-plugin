@@ -894,6 +894,29 @@ EOS 用例若未自然结束，先冻结合适的 EOS prompt/预算再重跑，�
 脚本返回 0 只表示请求子项通过，不自动判断首 token 内容、远程链路、Graph 或完整 F0。
 取消后还要核对本次请求的上游 abort/cancel 处理及 Prefill KV/session 资源释放，不能仅用 Proxy 计数归零代替。当前 Proxy 自行生成上游 request ID，客户端发送的`X-Request-Id` 不保证原样转发；使用响应 ID、请求时间窗及 Proxy 的 ID 映射定位，缺少映射时补采诊断证据，不把客户端标签当作已经贯通的服务端 ID。
 
+### 6.4.1 C5 HCCL/AICPU 故障的一次采集
+
+针对 2026-10-13 C5 并发 32 超时、FFN PID 83688/83687 的故障，现场 FFN
+节点可执行交付分支中的采集脚本。`RUN_ROOT` 必须指向失败轮的日志目录；
+`C5_TASK_DIR` 指向原服务工作目录或安装根，可补充异常 dump 搜索位置。
+
+```bash
+RUN_ROOT="${RUN_ROOT:?请先设置为失败 C5 的日志目录}" \
+C5_TASK_DIR=/home/z00569729/dsv4-afd-a128f32-r3 \
+bash "$AFD_PLUGIN_ROOT/tools/validation/collect_c5_evidence.sh"
+```
+
+脚本保存现存服务材料、CANN run/debug 轮转日志、extra-info/atrace、版本信息，
+并使用 driver 的 msnpureport 导出设备系统日志；相关进程仍存在时保存其工作目录、
+选定环境和库加载路径。日志中的其他 Worker PID 会自动加入采集。
+本次固定故障窗口为 UTC 08:27:47–08:27:51，默认搜索还包括 `/root`、
+`/home/z00569729` 和 `/tmp`。用于其他故障时须调整脚本中的固定 PID、时间窗口及搜索根。
+
+采集不重启服务、不发送信号、不切换 CANN，也不导入 NPU runtime。
+结束后回传打印的 `OUTPUT=…tar.gz`；缺失项、权限错误和命令退出码保存在包内
+`meta/collection-status.txt`，tar 错误另存于打印的 `TAR_STATUS` 路径。
+采集时状态不能替代故障时状态；现存材料无法恢复未落盘或已老化的异常 dump。
+
 ### 6.5 逐项填写真实路径证据
 
 证据必须来自在线请求时间窗，区分 capture/warmup 和业务执行。每条证据记录机器、角色/rank、日志文件、行号或 trace 时间戳、请求 ID。全局关键词出现一次不够。
