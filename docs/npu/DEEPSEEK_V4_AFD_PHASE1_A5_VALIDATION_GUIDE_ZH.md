@@ -4,7 +4,7 @@
 执行计划规定交付范围和日期，本文规定现场命令、验证顺序、证据与失败处理。
 本文是待执行指导，不代表组合已经通过 A5 验收。
 
-**执行标记**：`【本地已完成】` 为代码/配置的离线检查；`【A5 手工执行】` 为需要你在 A5 实际环境完成的操作。首次执行从[手工交接清单](DEEPSEEK_V4_AFD_A5_MANUAL_HANDOFF_ZH.md)的 A5-01 开始。当前 C2 EOS、smoke 和 full 92 项请求已通过；停服仍有 Attention Segfault、FFN 未收到 shutdown 和强杀，C2 F0 未关闭。下一步先处理停服链路，正常停服复测通过后再进入 C3。详见[C2 本轮核对结果](DEEPSEEK_V4_AFD_C2_20261013_RESULT_ZH.md)。
+**执行标记**：`【本地已完成】` 为代码/配置的离线检查；`【A5 手工执行】` 为需要你在 A5 实际环境完成的操作。首次执行从[手工交接清单](DEEPSEEK_V4_AFD_A5_MANUAL_HANDOFF_ZH.md)的 A5-01 开始。最新 C4 full 92 项请求检查通过，Prefill 0.91 重试成功、DSpark/eager U2 有在线证据；正常停服失败，DSpark metrics 和运行清单待补齐，完整 F0 尚未关闭。当前按[C4 本轮结果第 4 节](DEEPSEEK_V4_AFD_C4_20261013_RESULT_ZH.md)补采材料；C2 停服、C3 默认全开和输出退化问题继续保留。C5 按现场要求暂缓分析。
 
 ## 1. 合并后的范围与门禁
 
@@ -157,7 +157,7 @@ export DBO_PREFILL_TOKEN_THRESHOLD=12
 export ENABLE_MTP=0
 ```
 
-`MAX_NUM_SEQS=32` 是本次请求覆盖配置，必须在 M1 冻结并实测 HBM；现有 recipe 默认 8。若现场只能使用 8，须明确区分“32 个客户端并发”和“32 个活跃序列”，并记录队列行为；不能用排队成功代替未捕获 shape 的 Graph fallback 证据。A5 DSpark checkpoint 在 `GPU_MEMORY_UTILIZATION=0.90` 时实测 Prefill 仅余 1.63 GiB KV cache，低于 4096 所需的 1.70 GiB，因此本矩阵冻结为 0.91；C1–C5 使用同一值，不以降低 `MAX_MODEL_LEN` 绕过。**此 export 必须写入本轮实际 `SITE_FILE` 并在每个启动终端加载，不能只修改指导书或请求终端；未设置时 recipe 仍默认 0.90。** 2026-10-13 C4 附件再次使用 0.90 而失败，重试位置见第 6.1.1 节。
+`MAX_NUM_SEQS=32` 是本次请求覆盖配置，必须在 M1 冻结并实测 HBM；现有 recipe 默认 8。若现场只能使用 8，须明确区分“32 个客户端并发”和“32 个活跃序列”，并记录队列行为；不能用排队成功代替未捕获 shape 的 Graph fallback 证据。A5 DSpark checkpoint 在 `GPU_MEMORY_UTILIZATION=0.90` 时实测 Prefill 仅余 1.63 GiB KV cache，低于 4096 所需的 1.70 GiB，因此本矩阵冻结为 0.91；C1–C5 使用同一值，不以降低 `MAX_MODEL_LEN` 绕过。**此 export 必须写入本轮实际 `SITE_FILE` 并在每个启动终端加载，不能只修改指导书或请求终端；未设置时 recipe 仍默认 0.90。** 2026-10-13 C4 前次附件在 0.90 下失败，最新 0.91 重试成功、两个 Worker 均有 2.54 GiB KV；修正位置与证据见第 6.1.1 节。
 
 `node.env` 是本机配置，各节点可以不同，分别保存 SHA256；不再要求本机路径/IP 不同的所有 env 文件字节完全相同。
 
@@ -714,9 +714,9 @@ echo $! > "$RUN_ROOT/attention.pid"
 
 ### 6.1.1 【A5 手工执行】C4 Prefill 的 KV 预算不足
 
-附件 `cf4f76620aea40d8aa3c8c77d0c252b2.gz` 的实际 Prefill CLI 为 `gpu_memory_utilization=0.90`、4096、P2/TP1、DSpark checkpoint；两个 Worker 仅有 1.63 GiB KV，低于单条 4096 请求需要的 1.70 GiB，首次在 KV 容量检查失败。历史 C2 成功日志为 0.91、KV 2.54 GiB；本次使用第 3.1 节既定 0.91 重试，实际容量仍须现场确认。
+附件 `cf4f76620aea40d8aa3c8c77d0c252b2.gz` 的实际 Prefill CLI 为 `gpu_memory_utilization=0.90`、4096、P2/TP1、DSpark checkpoint；两个 Worker 仅有 1.63 GiB KV，低于单条 4096 请求需要的 1.70 GiB，首次在 KV 容量检查失败。最新附件 `6eb6a279f37c4040843516b1966b7354.gz` 的 `prefill-retry-20261013T072805.log` 已确认 0.91、两个 Worker 均有 2.54 GiB KV、ready 成功，随后 C4 full 92 项请求检查通过；不用再重复此次重试。剩余项见[C4 本轮核对结果](DEEPSEEK_V4_AFD_C4_20261013_RESULT_ZH.md)。
 
-设置必须在 **Prefill 启动终端、加载配置之后、nohup 之前** 生效。修改实际 `SITE_FILE` 的 `export GPU_MEMORY_UTILIZATION=...` 为 0.91（缺行则加在 `export MAX_NUM_SEQS=32` 后），正式新轮在三个角色终端加载并先采集 runtime/config。当前 A/F 已启动时，可仅诊断重试 Prefill；先确认旧 P 进程和端口已释放，日志另存 `prefill-retry-时间戳.log`、PID 另存 `prefill-retry.pid`，停止时使用新 PID，不覆盖旧错误材料。具体命令及 C3 剩余门禁见[C3/C4 最新核对第 4 节](DEEPSEEK_V4_AFD_C3_C4_20261013_REVIEW_ZH.md)。不降低 4096 或修改模型 config 来绕过；重试 ready 不等于 C4 F0。
+设置必须在 **Prefill 启动终端、加载配置之后、nohup 之前** 生效。修改实际 `SITE_FILE` 的 `export GPU_MEMORY_UTILIZATION=...` 为 0.91（缺行则加在 `export MAX_NUM_SEQS=32` 后），正式新轮在三个角色终端加载并先采集 runtime/config。以下是失败时的历史操作入口：A/F 已启动时，可仅诊断重试 Prefill；先确认旧 P 进程和端口已释放，日志另存 `prefill-retry-时间戳.log`、PID 另存 `prefill-retry.pid`，停止时使用新 PID，不覆盖旧错误材料。具体命令见[C3/C4 核对第 4 节](DEEPSEEK_V4_AFD_C3_C4_20261013_REVIEW_ZH.md)。不降低 4096 或修改模型 config 来绕过；重试 ready 不等于 C4 F0。
 
 ### 6.2 判断 ready 后再启动 Proxy
 
@@ -802,7 +802,9 @@ curl --noproxy '*' -fsS --max-time 10 \
 
 ### 6.3 保存 metrics-before，生成精确 token-ID 输入
 
-**2026-10-13 C3/C4 最新更新**：附件 `48e1a5df943b46b2bc4bc77d7437d0b0.gz` 在实际插件 `f3c8399…` 上完成定向 33 项和 full 92 项，请求检查通过、真实 Graph/U2、A/Proxy 请求归零；但六 A/F rank 的五开关实际仍全 `0`，定向 1 条/full 8 条有尾部 token `0`，其中最长连续 49 个，并非原输出退化已关闭。停服文件记录失败，Attention 四次 Segfault、FFN 正常 shutdown 标记为 0；最终清理不能代替正常停服。旧 INFO RoPE 标记可能被插件 root 日志级别过滤，本次仅改为 WARNING 便于核验，不认定缺标记就是旧源码。详见[C3/C4 最新证据与操作步骤](DEEPSEEK_V4_AFD_C3_C4_20261013_REVIEW_ZH.md)。C4 Prefill 可先按第 6.1.1 节修正 0.91 验证启动；正式默认全开 C3、输出正确性和正常停服仍待关闭，C4 请求扩量/C5/跨机验收保持待执行。
+**2026-10-13 C4 最新更新**：附件 `6eb6a279f37c4040843516b1966b7354.gz` 在 0.91 下 Prefill 重试成功，P/A/F 使用 DSpark checkpoint；full 92 项请求检查通过、90 个非流式响应全部非空且无 token ID `0`、A/Proxy 请求归零，四 Attention rank 的 drafted/accepted 和在线 U2 已确认。但 Attention 停服四次 Segfault、FFN 同步报 507899，DSpark metrics before/after 仍为 0，缺本轮 runtime/config 和最终清理快照，完整 F0 保持 pending。按[C4 本轮证据与补采步骤](DEEPSEEK_V4_AFD_C4_20261013_RESULT_ZH.md)继续，不立即重发已通过的 full；C5 按现场要求暂缓分析。
+
+**C3 剩余项不变**：附件 `48e1a5df943b46b2bc4bc77d7437d0b0.gz` 在实际插件 `f3c8399…` 上完成定向 33 项和 full 92 项，请求检查通过、真实 Graph/U2、A/Proxy 请求归零；但六 A/F rank 的五开关实际仍全 `0`，定向 1 条/full 8 条有尾部 token `0`，其中最长连续 49 个，并非原输出退化已关闭。停服文件记录失败，Attention 四次 Segfault、FFN 正常 shutdown 标记为 0；最终清理不能代替正常停服。旧 INFO RoPE 标记可能被插件 root 日志级别过滤，本次仅改为 WARNING 便于核验，不认定缺标记就是旧源码。详见[C3/C4 前次证据与操作步骤](DEEPSEEK_V4_AFD_C3_C4_20261013_REVIEW_ZH.md)。C4 eager/DSpark 请求成功不能替代正式默认全开 C3 和输出正确性验证，三机/最终精度验收仍待前置门禁关闭。
 
 业务请求经 Proxy；`/tokenize` 与 `/metrics` 是 Attention 管理调用，不计作 PD 请求。
 使用 token-ID prompt，避免字符长度被误写为 KV block 边界长度。
@@ -917,6 +919,7 @@ grep -nEi 'Traceback|EngineCore.*fatal|out of memory|OOM|timeout|watchdog|507[0-
 ```
 
 DSpark metrics 使用 before/after counter 增量，逐 rank 核对，不使用进程累计值代替本轮业务生效。采集实际指标名、标签和 proposed/accepted 定义；acceptance rate 明确分子分母。
+最新 C4 四 engine 的日志已有正的 drafted/accepted，但导出的两个 token counter 在 before/after 均为 0；记录为业务生效有证据、metrics 证据待核实，不能把日志区间计数直接填作 Prometheus counter 增量。详见[C4 结果第 2 节](DEEPSEEK_V4_AFD_C4_20261013_RESULT_ZH.md)。
 若默认日志没有 PD/首 token/Graph/rank 证据，补充诊断采集或 trace 后再判定，保持 pending。
 只保存 HTTP 200、capture 完成或开关值不能关闭功能门禁。
 
