@@ -14,6 +14,10 @@ Run one of the model suites:
 - `tests/e2e/models/qwen3_6/test_qwen3_6.py` on CUDA (text-only Qwen3.6
   evidence for the Qwen3.5/3.6 adapter family)
 
+To split a scenario's ranks across multiple pods/nodes on a Kubernetes
+cluster instead of running single-process, see
+`resources/k8-multi-pod.md`.
+
 Each suite contains four gate scenarios:
 
 - baseline-graph

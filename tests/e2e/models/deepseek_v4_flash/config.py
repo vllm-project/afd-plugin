@@ -330,16 +330,12 @@ def _configure_dsv4_arguments(
         "--trust-remote-code",
         *cache_flags,
     ]
+    # The runner emits the pinned Attention DP address once, substituting the
+    # Attention leader's address when the role is placed across pods. A
+    # verbatim profile's script pins none.
+    args.attention_data_parallel_address = None if verbatim_launch else args.afd_host
     args.attention_vllm_arg = [
-        *(
-            []
-            if verbatim_launch
-            else [
-                "--data-parallel-address",
-                args.afd_host,
-                "--no-disable-hybrid-kv-cache-manager",
-            ]
-        ),
+        *([] if verbatim_launch else ["--no-disable-hybrid-kv-cache-manager"]),
         "--tool-call-parser",
         "deepseek_v4",
         "--enable-auto-tool-choice",
