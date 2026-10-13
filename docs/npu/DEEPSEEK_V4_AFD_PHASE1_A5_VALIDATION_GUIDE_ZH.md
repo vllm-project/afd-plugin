@@ -212,6 +212,7 @@ ip -o -4 addr show dev "$NIC_NAME" scope global
 `curl --noproxy '*' -v --max-time 10 "http://$HCCL_IF_IP:$ATTENTION_API_PORT/metrics"`。
 绕过代理后成功才可确认 HTTP 环境代理是原因；仍失败则检查 `ss -ltnp`、容器网络、路由与防火墙。
 `a5_1030_requests.py` 使用 `trust_env=False` 直连所填 URL，避免意外走 HTTP 环境代理。
+更新后的 `tools/proxy_server.py` 对 Prefill/Decode 转发和动态节点探测也使用 `trust_env=False`。旧版 Proxy 仍继承 HTTP 环境代理，必须在启动它的终端设置 `NO_PROXY/no_proxy`；只在请求客户端执行 export 或 `curl --noproxy '*'` 不会改变已运行 Proxy 的环境。
 本机 standalone 客户端可使用 loopback；跨机 HTTP 必须使用对端可达地址。
 不要因此把 HCCL/AFD 的 `HCCL_IF_IP` 或跨机 rendezvous 地址改成 loopback。
 
@@ -743,6 +744,41 @@ assert c['prefill_instances'] == 1 and c['decode_instances'] == 1
 assert c['request_num'] == 0
 PY
 ```
+
+### 6.2.1 【A5 手工执行】Proxy 转发 Prefill 返回 504
+
+2026-10-13 C3 附件 `e5c46c41caf044ef8dbf0fb6c688296d.gz` 中，Proxy 请求 `http://7.246.125.18:8100/v1/chat/completions` 连续三次返回 504，随后客户端收到 Proxy 的 500。Prefill 的 `/health` 直连成功，但没有对应 chat POST 日志。Attention 四 rank Graph capture 已完成，`EXECUTION_MODE=full-decode-only`、`U_BATCHES=2`、`ENABLE_DSPARK=0` 与 C3 一致；该 504 首先发生在 Prefill HTTP 转发，尚未到 Decode Graph。
+
+首要排查项是 **Proxy 进程继承的 HTTP 环境代理，以及该进程的 `NO_PROXY/no_proxy` 是否覆盖后端 IP**。附件不包含这些进程环境变量，故尚不能仅凭 504 确认网关来源。旧 `tools/proxy_server.py` 的两处 HTTPX 客户端默认继承环境代理；`curl --noproxy '*'` 的成功检查和 Proxy `/healthcheck` 的实例计数都不能证明实际转发走直连。
+
+**现场立即修正**：在 `node.env` 末尾加入下面两行，并在**启动 Proxy 的终端**重新加载 `site.env`、`node.env`（二者的实际文件路径沿用第 3.1 节）。不要将 HCCL/AFD 地址改成 loopback。
+
+```bash
+# 加入 node.env 末尾；site.env 必须先加载。
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}${no_proxy:+$no_proxy,}localhost,127.0.0.1,$HCCL_IF_IP,$PREFILL_HOST_IP,$ATTENTION_HOST_IP,$FFN_HOST_IP,$PROXY_HOST_IP"
+export no_proxy="$NO_PROXY"
+```
+
+在 Proxy 终端执行，先保存已启动进程的豁免项，再加载修正。不要输出可能包含凭据的代理 URL：
+
+```bash
+tr '\0' '\n' < "/proc/$(cat "$RUN_ROOT/proxy.pid")/environ" \
+  | grep -E '^(NO_PROXY|no_proxy)=' || true
+source "$SITE_FILE"
+source "$NODE_FILE"
+curl --noproxy '*' -fsS --max-time 10 \
+  "http://$PREFILL_HOST_IP:$PREFILL_API_PORT/health"
+curl --noproxy '*' -fsS --max-time 10 \
+  "http://$ATTENTION_HOST_IP:$ATTENTION_API_PORT/health"
+```
+
+两个 health 都成功时，停止旧 Proxy 并等待 9000 端口释放，再按第 6.2 节启动 Proxy；**运行后的 export 不会改变旧进程，必须重启 Proxy**。保留旧 `proxy.log`，新日志使用独立文件。然后先经 Proxy 发送单个 EOS，请求使用 `--suite eos`、新的 `--output`，不加 `--standalone`；Prefill/Attention 两边都应出现该业务请求。EOS 成功后再 smoke/full。health 失败时先恢复角色服务，不只重启 Proxy；附件末尾 01:25:56 UTC 已有三个角色的 EngineDeadError，不能假设它们仍在运行。
+
+**代码修正**：本分支为 Proxy 的 Prefill/Decode 客户端和动态节点 `/models` 探测显式设置 `trust_env=False`，内部 HTTP 始终按配置地址直连。CPU 回归使用真实本机后端和返回 504 的模拟环境代理，验证默认 HTTPX 会被代理拦截，而修正后的 Prefill、Decode 转发及探测均直达后端；不依赖临时关闭 Graph/U2。A5 实机转发仍需现场复测。
+
+设计复核：修改属于自有 Proxy 的内部 HTTP 通信，不改 vLLM/Ascend、AFD/KV 协议或模型执行；沿用客户端复用，无新增全局状态或热路径网络调用。环境代理豁免作为内部服务直连策略保留，未来更新上游 Proxy 示例时继续核对两处客户端设置。
+
+另一个归档问题是附件 `site.env` 的 `AFD_EXPECTED_COMMIT=567ff2d…`，而 `runtime.json` 的实际插件提交为 `6c4dc19…`。这是旧冻结配置不一致，不是已确定的 504 根因。更新交付代码后，将所选完整提交写回实际 `SITE_FILE`，重新采集 runtime 和配置 hash；不要只修改临时 shell 变量。
 
 ### 6.3 保存 metrics-before，生成精确 token-ID 输入
 

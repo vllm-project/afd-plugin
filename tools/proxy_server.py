@@ -577,6 +577,10 @@ class WorkerRuntime:
             clients[key] = httpx.AsyncClient(
                 timeout=None,
                 base_url=build_base_url(host, port),
+                # ### PATCH START: direct PD backend HTTP
+                # Backend IPs must not inherit an external HTTP environment proxy.
+                trust_env=False,
+                # ### PATCH END: direct PD backend HTTP
                 limits=httpx.Limits(
                     max_connections=100000, max_keepalive_connections=100000
                 ),
@@ -630,7 +634,11 @@ class NodeListener:
         headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
         try:
             async with httpx.AsyncClient(
-                timeout=5.0, base_url=build_base_url(host, port)
+                timeout=5.0,
+                base_url=build_base_url(host, port),
+                # ### PATCH START: direct backend readiness HTTP
+                trust_env=False,
+                # ### PATCH END: direct backend readiness HTTP
             ) as client:
                 response = await client.get(endpoint, headers=headers)
                 response.raise_for_status()

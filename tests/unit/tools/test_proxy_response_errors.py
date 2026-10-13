@@ -11,6 +11,87 @@ import pytest
 from tools import proxy_server as proxy
 
 
+def test_backend_requests_and_readiness_bypass_environment_proxy(monkeypatch):
+    """An external gateway must not intercept either PD hop or node readiness."""
+
+    async def exercise():
+        backend_paths = []
+        gateway_requests = []
+
+        async def respond(reader, writer, status, payload, requests):
+            try:
+                headers = await reader.readuntil(b"\r\n\r\n")
+                requests.append(headers.split(b"\r\n", 1)[0])
+                for line in headers.split(b"\r\n"):
+                    if line.lower().startswith(b"content-length:"):
+                        await reader.readexactly(int(line.split(b":", 1)[1]))
+                body = json.dumps(payload).encode()
+                writer.write(
+                    f"HTTP/1.1 {status}\r\nContent-Type: application/json\r\n"
+                    f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                    + body
+                )
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        async def backend(reader, writer):
+            await respond(reader, writer, "200 OK", {"ok": True}, backend_paths)
+
+        async def gateway(reader, writer):
+            await respond(
+                reader,
+                writer,
+                "504 Gateway Timeout",
+                {"error": "gateway"},
+                gateway_requests,
+            )
+
+        backend_server = await asyncio.start_server(backend, "127.0.0.1", 0)
+        gateway_server = await asyncio.start_server(gateway, "127.0.0.1", 0)
+        async with backend_server, gateway_server:
+            backend_port = backend_server.sockets[0].getsockname()[1]
+            gateway_port = gateway_server.sockets[0].getsockname()[1]
+            gateway_url = f"http://127.0.0.1:{gateway_port}"
+            for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+                monkeypatch.setenv(name, gateway_url)
+                monkeypatch.setenv(name.lower(), gateway_url)
+            monkeypatch.setenv("NO_PROXY", "")
+            monkeypatch.setenv("no_proxy", "")
+
+            # Demonstrate the same failure with the old HTTPX default.
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"http://127.0.0.1:{backend_port}/health")
+                assert response.status_code == 504
+
+            runtime = proxy.WorkerRuntime(None)
+            key = proxy.server_key("127.0.0.1", backend_port)
+            try:
+                for role in proxy.ServerRole:
+                    await runtime._sync_clients(
+                        role, {key: ("127.0.0.1", backend_port)}
+                    )
+                    client = await runtime.get_client(role, key)
+                    response = await client.post(
+                        "/chat/completions", json={"role": role.value}
+                    )
+                    assert response.status_code == 200
+                assert await proxy.NodeListener.check_instance_status(
+                    "127.0.0.1", backend_port
+                )
+            finally:
+                await runtime.close()
+            assert len(gateway_requests) == 1
+            assert backend_paths == [
+                b"POST /v1/chat/completions HTTP/1.1",
+                b"POST /v1/chat/completions HTTP/1.1",
+                b"GET /v1/models HTTP/1.1",
+            ]
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize(
     "stream,backend_status", [(False, 500), (False, 200), (True, 500)]
 )
