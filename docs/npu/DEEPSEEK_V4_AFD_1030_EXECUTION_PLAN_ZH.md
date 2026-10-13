@@ -82,7 +82,7 @@ Prefill --Mooncake KV--> Decode Attention --P2pHccl AFD--> Decode FFN
 
 同机和跨机均按以下顺序执行。上一项未通过，不进入下一项。
 
-| ID | 组合 | Target 模式 | U | DSpark |
+| ID | 组合 | Target 模式 | U | Attention DSpark |
 |---|---|---|---:|---:|
 | C1 | PD + AFD | eager | 1 | off |
 | C2 | PD + AFD + DSpark | eager | 1 | on |
@@ -91,6 +91,7 @@ Prefill --Mooncake KV--> Decode Attention --P2pHccl AFD--> Decode FFN
 | C5 | PD + AFD + DSpark + Graph + U2 | `FULL_DECODE_ONLY` | 2 | on |
 
 C5 是最终交付组合。Graph 只要求 target Decode 路径；DSpark draft 允许保持 eager。
+表中的 DSpark on 指 Attention 加载完整 draft。C2/C4/C5 的 FFN 启动仍传入 `ENABLE_PD=0 ENABLE_DSPARK=0`，执行 target FFN，模型路径保留同一配套 DSpark checkpoint；命令前缀只作用于 FFN 进程，不修改随后 Attention 的开启值。具体角色参数见统一指导书第 6.1 节。
 
 ### 3.3 本期不做
 

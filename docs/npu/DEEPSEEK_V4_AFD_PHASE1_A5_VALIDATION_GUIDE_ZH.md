@@ -551,6 +551,8 @@ export AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER="${AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER:-1
 
 RUN_ID 示例每轮必须改成新的实际值，且与 CASE/TOPOLOGY/CYCLE 一致。
 
+上述 CASE 中的 `ENABLE_DSPARK` 表示 **Attention 的 draft 开关**，同时用于先为各角色选择同一配套 `MODEL_PATH`。C2/C4/C5 选择 DSpark checkpoint 后，第 6.1 节仅在 FFN 启动命令前临时传入 `ENABLE_DSPARK=0`；这不会重新选择 Flash checkpoint，也不会关闭 Attention 的 DSpark。Prefill 不添加 speculative config。不要在共用终端中用全局 `export ENABLE_DSPARK=0` 代替 FFN 的命令前缀，否则随后启动 Attention 会继承错误值。
+
 ### 4.4 保存启动前环境和运行清单
 
 C1–C5 完成第 4.3 节配置后执行；standalone 完成第 5 节配置后执行。
@@ -686,17 +688,26 @@ nohup bash "$RECIPE/afd_prefill.sh" > "$RUN_ROOT/prefill.log" 2>&1 &
 echo $! > "$RUN_ROOT/prefill.pid"
 ```
 
-FFN 节点，然后 Attention 节点；不要等待 FFN ready 后才启动 Attention，它们需要rendezvous。FFN 始终关闭 PD 和 DSpark：
+FFN 节点，然后 Attention 节点；不要等待 FFN ready 后才启动 Attention，它们需要 rendezvous。**C4 的 FFN 设 `ENABLE_DSPARK=0` 是正确的**：完整 DSpark draft 在 Attention Worker 上运行；远端 FFN 执行 target 模型的 FFN 计算，不另起 drafter。FFN 也不直接收取 Prefill 的 PD KV，因此 FFN 进程始终使用 `ENABLE_PD=0 ENABLE_DSPARK=0`；系统的 PD/DSpark 由 Attention 的配置开启。
+
+同机 C4 的 A/F 参数应为：
+
+| 角色 | `ENABLE_PD` | `ENABLE_DSPARK` | 执行模式 / U | `MODEL_PATH` |
+|---|---:|---:|---|---|
+| Attention | 1 | 1 | eager / 2 | `$DSPARK_MODEL_PATH` |
+| FFN | 0 | 0 | eager / 2 | `$DSPARK_MODEL_PATH` |
+
+下面 `变量=值 nohup ...` 只覆盖此次 FFN 启动及其子进程环境，**不会把父终端原有的 `ENABLE_DSPARK=1` 改为 0**，随后 Attention 仍继承第 4.3 节的 C4 配置。FFN 启动脚本的 preflight 明确拒绝 `ENABLE_DSPARK=1`，会报告 `DSpark config belongs only to Attention`。
 
 ```bash
-# FFN 节点
+# FFN 节点：只给本次 FFN 进程传入 0；MODEL_PATH 仍为本轮配套 checkpoint。
 ENABLE_PD=0 ENABLE_DSPARK=0 nohup bash "$RECIPE/afd_ffn.sh" \
   > "$RUN_ROOT/ffn.log" 2>&1 &
 echo $! > "$RUN_ROOT/ffn.pid"
 ```
 
 ```bash
-# Attention 节点
+# Attention 节点：C4 应保留 eager/U2、ENABLE_PD=1、ENABLE_DSPARK=1。
 nohup bash "$RECIPE/afd_attention.sh" > "$RUN_ROOT/attention.log" 2>&1 &
 echo $! > "$RUN_ROOT/attention.pid"
 ```
