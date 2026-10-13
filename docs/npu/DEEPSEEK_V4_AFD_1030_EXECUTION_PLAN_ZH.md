@@ -63,6 +63,8 @@ Prefill --Mooncake KV--> Decode Attention --P2pHccl AFD--> Decode FFN
 
 2026-10-13 C3 c32 定向复测更新：附件 `b68d20f6771c4f5d8a0e5e6a843f20dc.gz` 中 EOS 成功，32 短请求完整归档（30 非空、2 空）；`c32-short-3/11` 均在 DP3，各返回 64 个 token ID `0`。四 Attention 与两 FFN rank 实际五开关全开。参考 tokenizer 确认 `0` 为 BOS、默认过滤为空，现场 tokenizer 仍须离线核对；底层全零原因尚未确定。`【A5 手工执行】` 默认全开采集已经完成，下一步按[C3 核对文档第 4 节](DEEPSEEK_V4_AFD_C3_EMPTY_OUTPUT_REVIEW_ZH.md)另建目录、重采 runtime 与实际源码冻结，在 A/F 启动前五开关全关，冷启动后仅重测 EOS+32 共 33 请求。关闭对照不替代全开 F0，不进入 C4/C5；C2 停服门禁仍未关闭。
 
+2026-10-13 C3 全关对照最新结果：附件 `aab420537ef043ff9d6230165620a687.gz` 确认四 Attention/两 FFN rank 的五开关均为 0；EOS 成功，32 短响应全部归档，仍有 DP3 的 `c32-short-19` 全零空文本，另有 DP3 的 `c32-short-3` 首 token 非零、后 63 个为 0，仅显示 `" Use"`。关闭五开关没有消除异常，非空检查不等于精度通过；未确定 Graph/U2 基础路径、PD 或数值根因。`【A5 手工执行】` 不重复全开/全关测试，按[C3 核对文档第 5 节](DEEPSEEK_V4_AFD_C3_EMPTY_OUTPUT_REVIEW_ZH.md)新建目录并补采实际源码/runtime/config，只把 Graph 改成 eager，保留 U2/PD/Flash、DSpark 关闭和五开关全关，冷启动后执行同一 EOS+32 请求。不是 C4，诊断不替代 F0，C2 停服门禁仍未关闭。
+
 ### 3.1 验收拓扑
 
 | 部署 | 拓扑 | 用途 |

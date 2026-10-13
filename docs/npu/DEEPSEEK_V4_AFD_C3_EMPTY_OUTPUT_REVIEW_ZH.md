@@ -1,10 +1,25 @@
 # C3 并发 32 空输出核对与定向复测
 
-更新日期：2026-10-13。结论：**默认五开关全开的 c32 定向复测仍失败，两个 DP3 请求各返回 64 个 token ID `0`、空文本。下一步执行第 4 节五开关全关的冷启动对照；底层原因仍未确定，C3 未通过，不进入 C4/C5。**
+更新日期：2026-10-13。结论：**五开关全关也复现 DP3 全零/近乎全零 token：一条空文本，另一条仅有 `" Use"`。关闭五开关没有消除异常；下一步执行第 5 节 eager/U2 冷启动对照，保持 PD、DSpark 关闭及五开关全关。底层原因仍未确定，C3 未通过，不进入 C4/C5。**
 
 ## 1. 本轮证据
 
-### 1.1 最新 c32 定向复测：已取得 token ID
+### 1.1 最新五开关全关对照：仍有异常
+
+附件 `aab420537ef043ff9d6230165620a687.gz` 的新目录为 `requests-c32-short-alloff/`，run ID 为 `20261013T045000-single-C3-alloff-diag-r1-c32-short`。实际启动于 04:51 UTC；Attention 四 rank 和 FFN 两 rank 均记录 `stages=2`、五个 `graph_u2_*` 值为 `0`。Attention 仍是 `FULL_DECODE_ONLY`、U2、Flash、DSpark 关闭、PD 开启；本轮不是误用旧的全开服务。
+
+EOS 返回 `Hello`、2 tokens、`stop`。32 短请求全部 HTTP 200、64 tokens、`length` 并完整归档，脚本按非空检查报告 31 条通过、1 条失败；四 DP 分配为 9/8/8/7。检查全部输出 token 后发现两条异常，均在 DP3、PID 57661：
+
+| 请求 | response ID | 文本 / token ID | KV 接收 |
+|---|---|---|---|
+| `c32-short-19` | `cmpl-edc656ff-7419-4137-84d2-4e02ac78e7b2` | 空文本；64 个 `0` | 完成，0.96 ms |
+| `c32-short-3` | `cmpl-05146075-6ba2-4c08-83cd-40a88446addd` | `" Use"`；`[6948] + 63 个 0` | 完成 |
+
+因此 **31 条非空不等于 31 条生成正确**；只显示特殊 token 或只检查非空都不能修复底层生成。失败数量由 2 变为 1，不足以说明关闭策略改善了问题，因为新旧批次的 DP 分配和动态 shape 不完全一致。全开与全关均复现，不能把原因只归为开启这五项新增多流策略；Graph/U2 基础执行、padding/metadata、PD KV 内容及模型数值仍待定位。现有日志没有 logits/逐层数值，不能直接断言 NaN 或某个算子错误。
+
+四角色业务日志无 ERROR/Traceback，Attention/P 请求数随后归零，FFN 继续推进。本包未含 `runtime.json`、site/node 配置、config hash、metrics、现场 tokenizer 报告及停服证据；可确认启动参数/开关和响应，不能确认这次实际源码提交、现场 token 映射或正常退出门禁。下一轮补采这些材料，不为补旧记录而重复本轮负载。
+
+### 1.2 上一轮默认全开 c32：已取得 token ID
 
 附件 `b68d20f6771c4f5d8a0e5e6a843f20dc.gz` 的新结果位于 `requests-c32-20261013T034300/`，不能用同包旧 `requests/` 目录替代。本轮 EOS 返回 `Hello`、2 tokens、`stop`；32 短请求全部收到 HTTP 200，并完整归档，30 条非空、2 条空文本。四个 DP 各处理 8 个请求，故障仍集中在 DP3。
 
@@ -21,7 +36,7 @@
 
 包内 `runtime.json`、`site.env` 和 run ID 仍沿用上一轮记录（预期/记录提交 `138202b…`，run ID 时间为 01:33），不能代表本次新启动进程的源码冻结证明。下一轮另建目录并重新执行指导书第 4.4 节采集；不要覆盖当前日志。此次没有正常停服证据，C2 的停服门禁也仍未关闭。
 
-### 1.2 上一轮 full：当时没有 token ID
+### 1.3 更早的 full：当时没有 token ID
 
 附件 `cbd77d8f02964963aa7fcdcfb962df95.gz` 中，`runtime.json` 与 `site.env` 的实际/预期插件提交均为 `138202b3797f932e5ea31650413d118b254b0588`，vLLM 为 `0fc695f…`、Ascend 为 `11ee456…`，Python 3.12、torch/torch-npu 2.10、CANN 本机目录 `/usr/local/Ascend/cann-9.2.0`。
 C3 是 Flash 模型、PD + AFD、Graph `FULL_DECODE_ONLY`、U2、DSpark 关闭；五个 Graph/U2 开关均为 1。镜像 digest 和精确 CANN/HCCL build 在附件中仍为空。
@@ -56,16 +71,16 @@ C3 是 Flash 模型、PD + AFD、Graph `FULL_DECODE_ONLY`、U2、DSpark 关闭�
 
 相关 CPU/mock 回归 23 项通过，包括两条空响应与两条延后响应同批返回的复现；全部 32 条证据保留，批次仍失败。这里修正了证据采集方式，尚未修复或验证 A5 的空输出原因。
 
-## 3. 【A5 手工执行】默认全开 token 采集（本轮已完成请求，保留离线确认）
+## 3. 【A5 手工执行】token 离线确认与复测通用采集
 
-最新附件已完成下面的默认全开定向请求，**无需重复这一批**。若服务仍在同一终端中，可直接把 `C3_DIAG_OUTPUT` 指向已完成的目录，然后仅执行本节的离线 tokenizer 段：
+默认全开与全关定向请求均已完成，**无需重复这两批**。若环境仍加载，可把 `C3_DIAG_OUTPUT` 指向最新全关目录，然后仅执行本节离线 tokenizer 段；它不发请求、不需要运行 NPU 服务：
 
 ```bash
-export C3_DIAG_OUTPUT="$RUN_ROOT/requests-c32-20261013T034300"
+export C3_DIAG_OUTPUT="$RUN_ROOT/requests-c32-short-alloff"
 test -f "$C3_DIAG_OUTPUT/batch-c32-short.summary.json"
 ```
 
-以下启动/请求步骤留作后续复测参考；本轮下一步按第 4 节执行。
+以下启动/请求步骤留作后续复测参考；本轮下一步按第 5 节执行。
 
 先保留本轮日志，按统一指导书更新交付分支、写回实际 `SITE_FILE` 中的完整 `AFD_EXPECTED_COMMIT`，重新冻结 runtime/config hash。正式本轮源码是 `138202b…`，若从远端更新，将包含随后提交的 Proxy 内部直连及此次请求诊断改进；不能继续使用旧脚本执行新 suite。
 
@@ -96,7 +111,7 @@ grep -nEi 'KV cache transfer|step progress|send_dp_metadata|ERROR|Traceback' \
   > "$RUN_ROOT/c32-evidence-candidates.txt" || true
 ```
 
-在已安装现场 tokenizer 的 Python 环境离线解析空输出 token，不增加请求、不改变服务采样：
+在已安装现场 tokenizer 的 Python 环境离线解析全部 c32 输出，不增加请求、不改变服务采样。不能只看空文本，因为 `c32-short-3` 的退化序列仍能返回一个非空词：
 
 ```bash
 "$PYTHON_BIN" - "$C3_DIAG_OUTPUT" "$MODEL_PATH" <<'PY'
@@ -114,25 +129,31 @@ for path in sorted(root.glob("c32-short-*.json")):
     if not data.get("choices"):
         continue
     choice = data["choices"][0]
-    if choice.get("text"):
-        continue
     ids = choice.get("token_ids")
     row = {"file": path.name, "response_id": data.get("id"),
-           "usage": data.get("usage"), "token_ids": ids}
+           "text": choice.get("text"), "usage": data.get("usage"),
+           "token_ids": ids, "bos_token_id": tokenizer.bos_token_id,
+           "eos_token_id": tokenizer.eos_token_id}
     if ids is not None:
         row.update(token_counts=dict(Counter(ids)),
+                   bos_count=ids.count(tokenizer.bos_token_id),
+                   special_token_counts={str(i): ids.count(i)
+                                         for i in tokenizer.all_special_ids if i in ids},
                    decoded_keep_special=tokenizer.decode(ids, skip_special_tokens=False),
                    decoded_skip_special=tokenizer.decode(ids, skip_special_tokens=True))
     report.append(row)
-(root / "empty-output-token-report.json").write_text(
+(root / "output-token-report.json").write_text(
     json.dumps(report, ensure_ascii=False, indent=2) + "\n")
-print(json.dumps(report, ensure_ascii=False, indent=2))
+print(json.dumps([r for r in report if not r["text"] or r.get("bos_count", 0)],
+                 ensure_ascii=False, indent=2))
 PY
 ```
 
 同机使用上述 loopback；跨机客户端必须换为可达的对端地址。保留 `request_summary.json`、逐批 summary、32 条原始响应/错误文件、token 报告、metrics 与四角色日志。若定向测试不复现，不能宣布修复；再按原 full 的顺序采集相同 token 证据，保留失败前的 1/8 负载历史。
 
-## 4. 【A5 手工执行】复现后做关闭对照
+## 4. 【A5 手工执行】五开关全关对照（已执行且失败，保留步骤）
+
+本节已执行，结果见第 1.1 节；下一步直接执行第 5 节，不继续重复切换这五个开关。
 
 默认全开已经复现。先归档旧目录，按指导书第 7 节停止服务、保留退出日志并检查设备/端口清理结果；若再次需要强杀，记录为停服失败，不能算正常退出通过。
 
@@ -183,6 +204,58 @@ export C3_DIAG_OUTPUT="$RUN_ROOT/requests-c32-short-alloff"
 
 这是整体多流策略关闭对照，并非单变量定位；关闭后成功不能代替默认全开的 C3 F0。若两组都失败，继续排查 Graph/U2 基础回放、PD KV 和解码；若仅默认全开失败，再按依赖关系分组缩小开关范围，不能凭一次对照直接认定某个开关有错。正式验证的五开关默认仍为全 `1`。
 
-## 5. 设计复核
+## 5. 【A5 手工执行】下一步：只关闭 Graph，保留 U2/PD
+
+以本轮五开关全关配置为对照，仅将 A/F 的 `EXECUTION_MODE` 从 `full-decode-only` 改为 `eager`。保持 Flash、`U_BATCHES=2`、Attention `ENABLE_PD=1 ENABLE_DSPARK=0`、五开关全关、相同设备/端口/容量和源码；FFN 仍关闭 PD 与 DSpark。**不要改成 C4：C4 会同时打开 DSpark，无法作为本次 Graph 单变量对照。**
+
+先归档当前目录、按指导书第 7 节停止服务并核对设备/端口清理。协调终端加载环境与单机拓扑后只生成一次新 ID，再复制到各角色/请求终端：
+
+```bash
+export CASE=C3 CYCLE=1 TOPOLOGY=single
+export RUN_ID="$(date +%Y%m%dT%H%M%S)-single-C3-eager-u2-alloff-diag-r1"
+export RUN_ROOT="$RUN_BASE/$RUN_ID/$(hostname -s)"
+mkdir -p "$RUN_BASE/$RUN_ID"
+mkdir "$RUN_ROOT"
+printf 'RUN_ID=%s\nRUN_ROOT=%s\n' "$RUN_ID" "$RUN_ROOT"
+```
+
+其他终端赋值同一 ID/目录、不重复 mkdir。各终端加载 site/node、拓扑和指导书第 4.3 节配置后，**在第 4.4 节采集之前、任何 nohup 之前**执行下面整段；尤其 A/F 两个启动终端均须执行。后面不要再次执行 C3 的 case 分支，它会把模式改回 Graph：
+
+```bash
+export MODEL_PATH="$FLASH_MODEL_PATH"
+export EXECUTION_MODE=eager U_BATCHES=2
+export ENABLE_PD=1 ENABLE_DSPARK=0
+export AFD_HCCL_STAGE_DIAGNOSTICS=1
+export AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS=0
+export AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP=0
+export AFD_HCCL_GRAPH_U2_HYBRID_DAG=0
+export AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM=0
+export AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM=0
+export AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER=0
+```
+
+按第 4.4 节重新采集实际源码提交/dirty state、runtime/config hash、site/node 和启动前设备状态；`AFD_EXPECTED_COMMIT` 应等于本轮实际 HEAD，不能用旧 runtime 或旧提交替代。此轮无需修改运行代码，仅下载资料也不必为此变更服务版本。保留 A5 本机 HIXL 绝对路径。按第 6.1/6.2 节冷启动 P、F/A、Proxy（F/A 同轮启动）；FFN 的 nohup 仍显式 `ENABLE_PD=0 ENABLE_DSPARK=0`。
+
+就绪后检查真实 argv 与六个 rank 的配置，A/F 应有 `--enforce-eager`、`--enable-dbo`，`stages=2`、五开关全 `0`，Attention `speculative_config=None`；保留 eager 的真实在线 U2 stage 0/1 证据。recipe 支持 eager/U2，不需手工改服务脚本：
+
+```bash
+grep -nE 'enforce_eager|enable_dbo|speculative_config|AFD HCCL diagnostics configuration:' \
+  "$RUN_ROOT/attention.log" "$RUN_ROOT/ffn.log"
+export BASE_URL="http://127.0.0.1:$PROXY_PORT"
+export ATTENTION_URL="http://127.0.0.1:$ATTENTION_API_PORT"
+export C3_DIAG_OUTPUT="$RUN_ROOT/requests-c32-short-eager-u2-alloff"
+curl --noproxy '*' -fsS "$ATTENTION_URL/metrics" \
+  > "$RUN_ROOT/attention-metrics-before-c32.txt"
+"$PYTHON_BIN" "$AFD_PLUGIN_ROOT/tools/validation/a5_1030_requests.py" \
+  --suite c32-short \
+  --base-url "$BASE_URL" --attention-url "$ATTENTION_URL" \
+  --output "$C3_DIAG_OUTPUT" --run-id "$RUN_ID-c32-short"
+```
+
+仍只发 EOS + 32 短请求，不加 `--standalone`，不需要 token-pool。结束后按第 3 节采集后续 metrics/health 和离线 **全部输出** token 报告，随后保存停服日志，归档新 `RUN_ROOT`。
+
+若 eager/U2 同样出现全零或长段 BOS，则下一步检查 U2 基础执行与 PD/数值路径；若只在 Graph/U2 出现，则优先核对回放输入、padding/DSA metadata 和缓存地址。单轮未复现不能证明修复，更不能证明某个算子或设备有错。此诊断点不计 C3/C4 F0；正式 C3 仍使用 Graph/U2、五开关默认全开。
+
+## 6. 设计复核
 
 本次仅修改自有 HTTP 验证客户端和诊断资料，不修改上游、模型、KV 数据面或 Graph 实现。token ID 增加响应归档大小但不改变采样/文本验收；并发批次仍最多 32、每请求超时仍为 300 秒，失败批次等待在途请求完成以保留证据，随后停止新增负载。没有新增可变全局状态；诊断 suite 不替代完整验收。后续 vLLM 升级须复核 chat/completion 的 `return_token_ids` 协议。
