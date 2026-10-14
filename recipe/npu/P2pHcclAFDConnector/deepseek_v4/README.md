@@ -137,6 +137,21 @@ also disable FFN cross-layer: cross-layer `1` requires receive-stream `1`.
 Record effective values on all ranks and use a fresh run ID for the comparison.
 Default all-on and explicit all-off results must each identify their configuration.
 
+For an eager U2 comparison, `AFD_HCCL_EAGER_U2_STREAM_OVERLAP` defaults to `1`
+and preserves an explicit `0` or `1`. Set it in **both** the Attention and FFN
+launch shells after loading the site configuration:
+
+```bash
+export EXECUTION_MODE=eager U_BATCHES=2
+export AFD_HCCL_EAGER_U2_STREAM_OVERLAP=0
+```
+
+This keeps DBO/U2 enabled and disables eager stream overlap. The five Graph
+switches are separate; setting them to `0` does not disable eager overlap or
+Graph mode. `full-decode-only:2` always sets eager overlap to `0`. Restart the
+roles into a fresh run directory before testing, and check effective values on
+all six ranks. See the A5 validation guide section 6.4.2 for the request sequence.
+
 ## Readiness and request
 
 Wait until the Attention API responds:

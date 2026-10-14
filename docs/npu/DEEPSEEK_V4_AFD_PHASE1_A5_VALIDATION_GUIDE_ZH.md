@@ -574,7 +574,8 @@ PROXY_HOST_IP HCCL_IF_IP NIC_NAME PREFILL_DEVICES ATTENTION_DEVICES FFN_DEVICES
 PREFILL_DP_SIZE ATTENTION_RANKS FFN_RANKS PREFILL_API_PORT ATTENTION_API_PORT PROXY_PORT
 PREFILL_KV_PORT DECODE_KV_PORT AFD_HOST AFD_PORT MAX_NUM_SEQS MAX_MODEL_LEN GPU_MEMORY_UTILIZATION
 EXECUTION_MODE U_BATCHES ENABLE_PD ENABLE_DSPARK AFD_HCCL_STAGE_DIAGNOSTICS
-AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP
+AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS AFD_HCCL_EAGER_U2_STREAM_OVERLAP
+AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP
 AFD_HCCL_GRAPH_U2_HYBRID_DAG AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM
 AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER'''.split()
 runtime = {'environment': {k: os.environ.get(k) for k in names},
@@ -989,6 +990,106 @@ bash "$AFD_PLUGIN_ROOT/tools/validation/collect_c5_evidence.sh"
 结束后回传打印的 `OUTPUT=…tar.gz`；缺失项、权限错误和命令退出码保存在包内
 `meta/collection-status.txt`，tar 错误另存于打印的 `TAR_STATUS` 路径。
 采集时状态不能替代故障时状态；现存材料无法恢复未落盘或已老化的异常 dump。
+
+### 6.4.2 eager U2 overlap 与 Graph 的对照验证
+
+2026-10-14 的附件已确认：五个 Graph 开关均为 0 时，真正 eager/U2 的 full
+92 项及同进程连续两次 `full-to-c8-short` 均通过，但实际
+`eager_u2_stream_overlap=1`；FULL_DECODE_ONLY/U2、五开关均为 0、eager overlap
+为 0 的 full 在 c8-long 失败。因此需要补测 eager overlap=0，控制这一差异。
+
+`common.sh` 现已保留 eager/U2 的 `AFD_HCCL_EAGER_U2_STREAM_OVERLAP=0/1` 显式
+设置，未设置或空值仍默认 1；非法值在启动前报错。FULL_DECODE_ONLY/U2 仍将其
+固定为 0。这个变量与五个 Graph 开关独立，设为 0 仍保留 DBO 和 U2。
+
+| 对照组 | CASE / target 模式 | eager overlap | 五个 Graph 开关 | 用途 |
+|---|---|---:|---|---|
+| E1 | C4 / eager，GraphMode.NONE | 1 | 全 0 | 已有 full 及两次连续前缀通过的基线 |
+| E0 | C4 / eager，GraphMode.NONE | 0 | 全 0 | 本次先补测，排查 eager overlap 的影响 |
+| G0 | C5 / FULL_DECODE_ONLY | 0 | 全 0 | 已有 full 失败；E0 通过后可在相同冻结版本复核 |
+
+对照期间固定源码、CANN/torch_npu、PD/DSpark、P2+A4+F2、U2、DBO 阈值、模型、
+内存配置、诊断设置和请求输入。只在诊断命名中使用 E0/E1/G0；CASE 仍按表填写。
+拉取交付分支后更新本轮 `AFD_EXPECTED_COMMIT`，按第 4.4 节保存新版本及配置。
+不要将本地其他 CANN 环境替换到现场 A5 配置。
+
+**先执行 E0**：在 Attention、FFN 两个启动终端加载 site/node 配置及第 4.3 节
+C4 配置后，启动前都执行以下设置；只在客户端 export 不会改变已有服务：
+
+```bash
+export EXECUTION_MODE=eager U_BATCHES=2
+export AFD_HCCL_EAGER_U2_STREAM_OVERLAP=0
+export AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP=0
+export AFD_HCCL_GRAPH_U2_HYBRID_DAG=0
+export AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM=0
+export AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM=0
+export AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER=0
+```
+
+按第 7 节停服，分别使用新的 RUN_ID/RUN_ROOT，按第 4.4、6.1、6.2 节采集、
+启动并完成 ready。Attention 保持 `ENABLE_PD=1 ENABLE_DSPARK=1`；FFN 使用
+第 6.1 节命令前缀 `ENABLE_PD=0 ENABLE_DSPARK=0`，两侧仍使用 DSpark checkpoint。
+实际日志须确认 target `enforce_eager=True` / `GraphMode.NONE`，并逐 rank 核对
+四个 Attention、两个 FFN 的 `eager_u2_stream_overlap=0` 和五个 Graph 开关为 0：
+
+```bash
+grep -nF 'AFD HCCL diagnostics configuration:' \
+  "$RUN_ROOT/attention.log" "$RUN_ROOT/ffn.log"
+```
+
+使用已通过的 diverse token pool 的**原文件绝对路径**，不能重新生成输入。
+在客户端设置一次，下列两次冷启动均沿用它；文件应有 1549 个 token，前 1024
+个 token 有 571 个不同 ID，现场既有文件 SHA256 为
+`b4040dba955525d816eabdf8bd89188f499980496b0629b20b3b943e765f5e79`。
+
+```bash
+export TOKEN_POOL_FILE=/填写原diverse输入目录的绝对路径/token-pool.json
+test -f "$TOKEN_POOL_FILE"
+sha256sum "$TOKEN_POOL_FILE" > "$RUN_ROOT/comparison-token-pool.sha256"
+```
+
+第一次冷启动完成 ready 后，直接执行 full，不先运行 smoke 或前缀：
+
+```bash
+"$PYTHON_BIN" "$AFD_PLUGIN_ROOT/tools/validation/a5_1030_requests.py" \
+  --suite full \
+  --base-url "$BASE_URL" --attention-url "$ATTENTION_URL" \
+  --token-pool "$TOKEN_POOL_FILE" \
+  --output "$RUN_ROOT/requests-e0-full" \
+  --run-id "$RUN_ID-e0-full"
+```
+
+保存结果和日志后，再使用新 RUN_ID/RUN_ROOT **重新冷启动 E0 服务**，不要沿用
+full 执行后的服务。在同一批服务进程上连续执行两次前缀，两次之间不重启、
+不发其他推理请求；第一遍失败即停止第二遍，保留故障现场：
+
+```bash
+(
+  set -e
+  test -f "$TOKEN_POOL_FILE"
+  sha256sum "$TOKEN_POOL_FILE" > "$RUN_ROOT/comparison-token-pool.sha256"
+  for pass in 1 2; do
+    "$PYTHON_BIN" "$AFD_PLUGIN_ROOT/tools/validation/a5_1030_requests.py" \
+      --suite full-to-c8-short \
+      --base-url "$BASE_URL" --attention-url "$ATTENTION_URL" \
+      --token-pool "$TOKEN_POOL_FILE" \
+      --output "$RUN_ROOT/requests-e0-prefix-$pass" \
+      --run-id "$RUN_ID-e0-prefix-$pass"
+  done
+)
+```
+
+full 应有 92 项通过、`full_request_suite_passed=true`；每次前缀应有 11 项通过，
+`request_checks_passed=true`，其中 c8-short 的 `passed_count=8`。每次结束应确认
+Attention/Proxy 请求归零；保存两次前缀的相同服务 PID、runtime、实际配置、
+四角色日志和逐条请求/响应，不能仅凭 shell 没有报错判断结果。
+
+若 E0 的 full 和两次前缀均通过，说明成功不依赖 eager overlap=1，可进一步用
+相同冻结版本复核 G0：按 C5 配置启动，五个 Graph 开关仍为 0，eager overlap
+实际为 0，重新冷启动后直接执行 full。若 E0 失败，保留首次设备异常及失败阶段，
+再用同一冻结版本将 E0 启动配置的 eager overlap 改为 1，冷启动复测相同序列，
+排查 eager 串行执行路径。已有 E1 成功无需无条件重复。
+以上结果用于缩小执行路径范围，尚不能确定具体错误的 Graph 参数、buffer 或 event。
 
 ### 6.5 逐项填写真实路径证据
 

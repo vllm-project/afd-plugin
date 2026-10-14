@@ -33,6 +33,7 @@ def local_env(tmp_path):
     env = dict(os.environ)
     for name in GRAPH_SWITCHES:
         env.pop(name, None)
+    env.pop("AFD_HCCL_EAGER_U2_STREAM_OVERLAP", None)
     env.update(
         PYTHON_BIN=sys.executable,
         PREFILL_DP_SIZE="2",
@@ -126,6 +127,7 @@ def test_device_mapping_must_match_a5_role(local_env, devices):
 @pytest.mark.parametrize("mode", ["defaults", "all-off", "mixed"])
 def test_graph_default_and_override_values_survive_configuration(local_env, mode):
     env, _ = local_env
+    env["AFD_HCCL_EAGER_U2_STREAM_OVERLAP"] = "1"
     expected = ["1"] * len(GRAPH_SWITCHES)
     if mode != "defaults":
         expected = ["0"] * len(GRAPH_SWITCHES)
@@ -160,6 +162,59 @@ test "${SCHEDULING_ARGS[0]}" = --no-async-scheduling
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == expected
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, "1"), ("", "1"), ("0", "0"), ("1", "1")]
+)
+def test_eager_u2_overlap_is_exported_without_disabling_dbo(local_env, value, expected):
+    env, _ = local_env
+    env.update(dict.fromkeys(GRAPH_SWITCHES, "0"))
+    if value is not None:
+        env["AFD_HCCL_EAGER_U2_STREAM_OVERLAP"] = value
+    script = """
+source "$1"
+EXECUTION_MODE=eager U_BATCHES=2
+DBO_DECODE_TOKEN_THRESHOLD=2 DBO_PREFILL_TOKEN_THRESHOLD=12
+configure_execution
+bash -c 'printf "%s\\n" "$AFD_HCCL_EAGER_U2_STREAM_OVERLAP"'
+printf '%s\\n' "${EXECUTION_ARGS[*]}" "${UBATCH_ARGS[*]}" "${SCHEDULING_ARGS[*]}"
+"""
+    result = subprocess.run(
+        ["bash", "-c", script, "eager-u2-test", str(RECIPE / "common.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        expected,
+        "--enforce-eager",
+        "--enable-dbo --dbo-decode-token-threshold 2 --dbo-prefill-token-threshold 12",
+        "--no-async-scheduling",
+    ]
+
+
+@pytest.mark.parametrize("value", ["2", "true"])
+def test_eager_u2_overlap_rejects_invalid_values(local_env, value):
+    env, _ = local_env
+    env["AFD_HCCL_EAGER_U2_STREAM_OVERLAP"] = value
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; EXECUTION_MODE=eager U_BATCHES=2; '
+            "DBO_DECODE_TOKEN_THRESHOLD=2 DBO_PREFILL_TOKEN_THRESHOLD=12; "
+            "configure_execution",
+            "eager-u2-test",
+            str(RECIPE / "common.sh"),
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 2
+    assert "AFD_HCCL_EAGER_U2_STREAM_OVERLAP must be 0 or 1" in result.stderr
 
 
 @pytest.mark.parametrize(

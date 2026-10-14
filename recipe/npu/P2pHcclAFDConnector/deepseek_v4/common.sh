@@ -211,7 +211,12 @@ configure_execution() {
         --dbo-decode-token-threshold "$DBO_DECODE_TOKEN_THRESHOLD"
         --dbo-prefill-token-threshold "$DBO_PREFILL_TOKEN_THRESHOLD"
       )
-      export AFD_HCCL_EAGER_U2_STREAM_OVERLAP=1
+      # Keep the eager U2 default while allowing serial/overlap comparisons.
+      export AFD_HCCL_EAGER_U2_STREAM_OVERLAP="${AFD_HCCL_EAGER_U2_STREAM_OVERLAP:-1}"
+      case "$AFD_HCCL_EAGER_U2_STREAM_OVERLAP" in
+        0|1) ;;
+        *) afd_die "AFD_HCCL_EAGER_U2_STREAM_OVERLAP must be 0 or 1" ;;
+      esac
       ;;
     full-decode-only:2)
       read -r -a capture_sizes_array <<<"$CUDAGRAPH_CAPTURE_SIZES"
