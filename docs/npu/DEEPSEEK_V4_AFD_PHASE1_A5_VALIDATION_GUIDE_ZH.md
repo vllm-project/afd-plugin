@@ -822,6 +822,34 @@ curl --noproxy '*' -fsS --max-time 60 "$ATTENTION_URL/tokenize" \
   --data-binary "@$RUN_ROOT/tokenize-request.json" > "$RUN_ROOT/token-pool.json"
 ```
 
+**2026-10-14 多样长输入对照**：上述旧输入重复同一句话，作为已有故障复现的
+基线保留。需要构造多样输入时，用新增工具保存独立 token pool：
+
+```bash
+DIVERSE_POOL_ROOT="$RUN_ROOT/token-input-diverse-$(date +%Y%m%dT%H%M%S)"
+"$PYTHON_BIN" "$AFD_PLUGIN_ROOT/tools/validation/a5_1030_token_pool.py" \
+  --attention-url "$ATTENTION_URL" \
+  --output "$DIVERSE_POOL_ROOT"
+"$PYTHON_BIN" "$AFD_PLUGIN_ROOT/tools/validation/a5_1030_requests.py" \
+  --suite full-to-c8-short \
+  --base-url "$BASE_URL" \
+  --attention-url "$ATTENTION_URL" \
+  --token-pool "$DIVERSE_POOL_ROOT/token-pool.json" \
+  --output "$RUN_ROOT/requests-prefix-diverse-$(date +%Y%m%dT%H%M%S)" \
+  --run-id "$RUN_ID-prefix-diverse"
+```
+
+工具使用固定的12段英文自然文本，涵盖海洋、历史、软件、交通、烘焙等不同主题，
+不通过随机整数冒充 token ID。由当前 Attention `/tokenize` 返回真实 IDs，要求
+至少1024个非负整数 token；长输入仍取前1024个，边界输入仍按原长度切片，短输入
+不变。调用只分词，不发送推理请求。输出目录必须不存在，原重复输入不会被覆盖；
+保存原始文本、分词响应与 prompt/pool SHA256，便于冻结和重跑。新 pool 也可供
+`--suite full` 使用。standalone 的请求验证需添加 `--standalone`。
+
+保持模型、并发、输出预算、服务配置和启动前的业务历史一致，再比较重复输入与
+多样输入。内容改变可能影响 MoE 路由、DSpark 接受率和各DP完成时机；多样输入
+通过不能当作原故障已修复，重复输入也不是天然非法。
+
 ### 6.4 执行完整请求集
 
 Proxy 主机或可达的验证客户端执行；token-pool 文件从 Attention 拷贝到该节点。
