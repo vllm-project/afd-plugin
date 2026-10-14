@@ -114,6 +114,13 @@ def request_gate(tmp_path, monkeypatch):
                 return httpx.Response(200, json={"choices": []})
             assert body["return_token_ids"] is True
             name = request.headers["X-Request-Id"]
+            if fault == "timeout-c8" and name in (
+                "test-c8-short-2",
+                "test-c8-short-4",
+                "test-c8-short-6",
+            ):
+                await asyncio.sleep(0.01)
+                raise httpx.ReadTimeout("", request=request)
             empty_text = fault == "empty-c32" and name in (
                 "test-c32-short-16",
                 "test-c32-short-29",
@@ -246,6 +253,84 @@ def test_empty_text_keeps_token_ids_and_all_concurrent_results(request_gate):
     assert not list(Path(args.output).glob("*.transport.error.json"))
 
 
+def test_full_prefix_preserves_long_to_short_sequence_and_stops_at_c8(request_gate):
+    args, exercise = request_gate
+    args.suite = "full-to-c8-short"
+    result, peak, closed, calls = exercise()
+    assert result["request_checks_passed"] is True
+    assert result["full_request_suite_passed"] is False
+    assert result["request_count"] == 11
+    assert peak == 8
+    assert not closed
+    assert [r["name"] for r in result["records"]] == [
+        "eos",
+        "c1-short-0",
+        "c1-long-0",
+        *(f"c8-short-{index}" for index in range(8)),
+    ]
+    long_body = json.loads(Path(args.output, "c1-long-0.request.json").read_text())
+    assert long_body["prompt"] == [10] * 1024
+    short_body = json.loads(Path(args.output, "c1-short-0.request.json").read_text())
+    for index in range(8):
+        body = json.loads(
+            Path(args.output, f"c8-short-{index}.request.json").read_text()
+        )
+        assert body == short_body
+    assert long_body["max_tokens"] == short_body["max_tokens"] == 64
+    assert long_body["min_tokens"] == short_body["min_tokens"] == 64
+    assert long_body["ignore_eos"] is short_body["ignore_eos"] is True
+    assert ("proxy", "/healthcheck") in calls
+    assert ("attention", "/metrics") in calls
+
+
+def test_full_prefix_keeps_completed_siblings_when_c8_requests_time_out(request_gate):
+    args, exercise = request_gate
+    args.suite = "full-to-c8-short"
+    with pytest.raises(ValueError, match="3/8 requests failed"):
+        exercise("timeout-c8")
+    for name in ("c1-short", "c1-long"):
+        batch = json.loads(Path(args.output, f"batch-{name}.summary.json").read_text())
+        assert batch["passed_count"] == 1
+    batch = json.loads(Path(args.output, "batch-c8-short.summary.json").read_text())
+    assert batch["passed_count"] == 5
+    assert batch["failed_count"] == 3
+    assert batch["request_checks_passed"] is False
+    for index in (2, 4, 6):
+        error = json.loads(
+            Path(args.output, f"c8-short-{index}.transport.error.json").read_text()
+        )
+        assert error["exception_type"] == "ReadTimeout"
+    for index in (0, 1, 3, 5, 7):
+        assert Path(args.output, f"c8-short-{index}.json").exists()
+
+
+def test_full_prefix_requires_token_pool_on_command_line(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "a5_1030_requests.py",
+            "--suite",
+            "full-to-c8-short",
+            "--base-url",
+            "http://proxy",
+            "--attention-url",
+            "http://attention",
+            "--output",
+            str(tmp_path / "requests"),
+            "--run-id",
+            "test",
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        validation.main()
+    assert exc.value.code == 2
+    assert (
+        "--token-pool is required for --suite full-to-c8-short"
+        in capsys.readouterr().err
+    )
+    assert not (tmp_path / "requests").exists()
+
+
 @pytest.mark.parametrize("suite,count", [("smoke", 5), ("eos", 1), ("tail", 4)])
 def test_selected_suite_does_not_repeat_concurrency_and_boundary_load(
     request_gate, suite, count
@@ -272,7 +357,8 @@ def test_selected_suite_does_not_repeat_concurrency_and_boundary_load(
 
 
 @pytest.mark.parametrize(
-    "suite", ["smoke", "eos", "tail", "full", "c8-short", "c32-short"]
+    "suite",
+    ["smoke", "eos", "tail", "full", "c8-short", "c32-short", "full-to-c8-short"],
 )
 def test_chat_length_limit_is_not_accepted_as_natural_eos(request_gate, suite):
     args, exercise = request_gate

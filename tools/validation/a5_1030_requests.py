@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Check A5 requests through Proxy or Attention, including targeted short batches."""
+"""Check A5 requests through Proxy or Attention, including targeted sequences."""
 
 import argparse
 import asyncio
@@ -12,6 +12,7 @@ from pathlib import Path
 import httpx
 
 CONCURRENCIES = (1, 8, 32)
+TOKEN_POOL_SUITES = ("full", "full-to-c8-short")
 BOUNDARY_LENGTHS = (31, 32, 33, 63, 64, 65)
 LONG_INPUT_LENGTH = 1024
 REQUEST_TIMEOUT = 300
@@ -22,7 +23,7 @@ REQUEST_GAUGES = ("vllm:num_requests_running", "vllm:num_requests_waiting")
 async def run_checks(args: argparse.Namespace) -> dict:
     diagnostic_concurrencies = {"c8-short": 8, "c32-short": 32}
     tokens = []
-    if args.suite == "full":
+    if args.suite in TOKEN_POOL_SUITES:
         token_data = json.loads(Path(args.token_pool).read_text())
         tokens = token_data["tokens"]
         if len(tokens) < LONG_INPUT_LENGTH or any(type(t) is not int for t in tokens):
@@ -182,69 +183,73 @@ async def run_checks(args: argparse.Namespace) -> dict:
                 "before repeating load tests"
             )
 
-        if args.suite == "full" or args.suite in diagnostic_concurrencies:
-            concurrencies = (
-                CONCURRENCIES
-                if args.suite == "full"
-                else (diagnostic_concurrencies[args.suite],)
+        short_prompt = "Reply with a short greeting."
+        if args.suite == "full":
+            batches = [
+                (concurrency, kind, prompt)
+                for concurrency in CONCURRENCIES
+                for kind, prompt in (
+                    ("short", short_prompt),
+                    ("long", tokens[:LONG_INPUT_LENGTH]),
+                )
+            ]
+        elif args.suite == "full-to-c8-short":
+            # Preserve the full-suite prefix, including the long-to-short switch.
+            batches = [
+                (1, "short", short_prompt),
+                (1, "long", tokens[:LONG_INPUT_LENGTH]),
+                (8, "short", short_prompt),
+            ]
+        elif args.suite in diagnostic_concurrencies:
+            batches = [(diagnostic_concurrencies[args.suite], "short", short_prompt)]
+        else:
+            batches = []
+        for concurrency, kind, prompt in batches:
+            print(
+                f"[{args.suite}] {kind} input, {concurrency} concurrent requests",
+                flush=True,
             )
-            prompts = [("short", "Reply with a short greeting.")]
-            if args.suite == "full":
-                prompts.append(("long", tokens[:LONG_INPUT_LENGTH]))
-            for concurrency in concurrencies:
-                for kind, prompt in prompts:
-                    print(
-                        f"[{args.suite}] {kind} input, "
-                        f"{concurrency} concurrent requests",
-                        flush=True,
-                    )
-                    results = await asyncio.gather(
-                        *[
-                            complete(f"c{concurrency}-{kind}-{index}", prompt, 64, True)
-                            for index in range(concurrency)
-                        ],
-                        return_exceptions=True,
-                    )
-                    failures = [
-                        {
-                            "name": f"c{concurrency}-{kind}-{index}",
-                            "exception_type": type(result).__name__,
-                            "error": str(result) or repr(result),
-                        }
-                        for index, result in enumerate(results)
-                        if isinstance(result, Exception)
-                    ]
-                    passed = [
-                        result
-                        for result in results
-                        if not isinstance(result, Exception)
-                    ]
-                    # Collect the entire in-flight batch before failing. Cancelling
-                    # siblings at the first empty output obscures their real results.
-                    Path(
-                        args.output, f"batch-c{concurrency}-{kind}.summary.json"
-                    ).write_text(
-                        json.dumps(
-                            {
-                                "request_count": concurrency,
-                                "passed_count": len(passed),
-                                "failed_count": len(failures),
-                                "request_checks_passed": not failures,
-                                "records": passed,
-                                "failures": failures,
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        )
-                        + "\n"
-                    )
-                    records.extend(passed)
-                    if failures:
-                        raise ValueError(
-                            f"c{concurrency}-{kind}: {len(failures)}/{concurrency} "
-                            "requests failed; "
-                            + "; ".join(failure["error"] for failure in failures)
-                        )
+            results = await asyncio.gather(
+                *[
+                    complete(f"c{concurrency}-{kind}-{index}", prompt, 64, True)
+                    for index in range(concurrency)
+                ],
+                return_exceptions=True,
+            )
+            failures = [
+                {
+                    "name": f"c{concurrency}-{kind}-{index}",
+                    "exception_type": type(result).__name__,
+                    "error": str(result) or repr(result),
+                }
+                for index, result in enumerate(results)
+                if isinstance(result, Exception)
+            ]
+            passed = [result for result in results if not isinstance(result, Exception)]
+            # Collect the entire in-flight batch before failing. Cancelling
+            # siblings at the first empty output obscures their real results.
+            Path(args.output, f"batch-c{concurrency}-{kind}.summary.json").write_text(
+                json.dumps(
+                    {
+                        "request_count": concurrency,
+                        "passed_count": len(passed),
+                        "failed_count": len(failures),
+                        "request_checks_passed": not failures,
+                        "records": passed,
+                        "failures": failures,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n"
+            )
+            records.extend(passed)
+            if failures:
+                raise ValueError(
+                    f"c{concurrency}-{kind}: {len(failures)}/{concurrency} "
+                    "requests failed; "
+                    + "; ".join(failure["error"] for failure in failures)
+                )
         if args.suite == "full":
             for length in BOUNDARY_LENGTHS:
                 records.append(
@@ -313,7 +318,7 @@ async def run_checks(args: argparse.Namespace) -> dict:
                 }
             )
 
-        if args.suite != "eos" and args.suite not in diagnostic_concurrencies:
+        if args.suite in ("smoke", "tail", "full"):
             print(
                 f"[{args.suite}] checking SSE, cancellation, and recovery", flush=True
             )
@@ -375,11 +380,21 @@ def main() -> None:
     parser.add_argument("--attention-url", required=True)
     parser.add_argument(
         "--suite",
-        choices=("smoke", "eos", "tail", "full", "c8-short", "c32-short"),
+        choices=(
+            "smoke",
+            "eos",
+            "tail",
+            "full",
+            "c8-short",
+            "c32-short",
+            "full-to-c8-short",
+        ),
         default="full",
         help=(
             "smoke: 5; eos: 1; tail: 4; full: 92 (default); "
-            "c8-short/c32-short: EOS + 8/32 short requests for diagnosis only"
+            "c8-short/c32-short: EOS + 8/32 short requests; "
+            "full-to-c8-short: 11 requests, full prefix through c8-short; "
+            "targeted suites are for diagnosis only"
         ),
     )
     parser.add_argument(
@@ -387,15 +402,17 @@ def main() -> None:
         action="store_true",
         help="send to Attention directly and omit proxy healthcheck",
     )
-    parser.add_argument("--token-pool", help="required only for --suite full")
+    parser.add_argument(
+        "--token-pool", help="required for --suite full or full-to-c8-short"
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--model", default="dsv4-afd")
     parser.add_argument("--eos-max-tokens", type=int, default=1024)
     parser.add_argument("--eos-prompt", default="Reply with only the word Hello.")
     args = parser.parse_args()
-    if args.suite == "full" and not args.token_pool:
-        parser.error("--token-pool is required for --suite full")
+    if args.suite in TOKEN_POOL_SUITES and not args.token_pool:
+        parser.error(f"--token-pool is required for --suite {args.suite}")
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     try:

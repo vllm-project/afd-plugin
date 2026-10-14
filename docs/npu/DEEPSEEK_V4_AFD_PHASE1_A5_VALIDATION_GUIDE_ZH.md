@@ -850,6 +850,7 @@ standalone 的完整验证在上面的 Python 命令添加 `--standalone`，并�
 | `full`（默认） | 92 | 完整功能请求覆盖；正式请求门禁使用此结果 |
 | `c8-short` | 9 | EOS + 8 并发短输入，定向诊断，不需要 token pool |
 | `c32-short` | 33 | EOS + 32 并发短输入，定向诊断，不需要 token pool |
+| `full-to-c8-short` | 11 | EOS → c1-short → c1-long → c8-short，保留 full 前缀；需要 token pool |
 
 HTTP `/metrics`/`healthcheck` 查询不计入上表的推理请求数。`full` 的 92 个请求由
 `2 × (1 + 8 + 32) = 82` 个长/短输入并发请求、6 个边界请求及4个EOS/SSE/取消/恢复请求构成。
@@ -915,6 +916,27 @@ EOS 用例若未自然结束，先冻结合适的 EOS prompt/预算再重跑，�
 `request_summary.json` 中 `request_checks_passed=true`。独立执行通过仍不能排除
 full 前序请求/shape 切换触发的故障；保留服务是否刚启动和此前请求序列。
 已经发生 FFN worker failure 的服务需按停服/清理/启动流程恢复后再测。
+
+若独立 `c8-short` 通过而 full 在该批失败，使用以下入口保留前序请求历史：
+
+```bash
+"$PYTHON_BIN" "$AFD_PLUGIN_ROOT/tools/validation/a5_1030_requests.py" \
+  --suite full-to-c8-short \
+  --base-url "$BASE_URL" \
+  --attention-url "$ATTENTION_URL" \
+  --token-pool "$RUN_ROOT/token-pool.json" \
+  --output "$RUN_ROOT/requests-full-to-c8-short-$(date +%Y%m%dT%H%M%S)" \
+  --run-id "$RUN_ID-full-to-c8-short"
+```
+
+严格按 EOS → c1-short → c1-long → c8-short 执行，共 11 个推理请求。
+使用原 full 的 token pool（前 1024 个 token），每批完成后立即执行下一批，
+不在中间重启服务或额外等待请求归零；仅在整个序列结束后检查请求归零。
+该入口不执行 c8-long、c32、边界或 SSE 请求，结果的
+`full_request_suite_passed` 保持 `false`。保持原 C5 服务配置；优先在重新启动并
+完成 ready 的服务上执行。若沿用已做过其他请求的服务，记录此前请求序列。
+保存三个批次 summary、逐条请求/响应、四角色日志和 metrics；失败时仍等待本批
+所有客户端结果落盘。CLI 的 `--token-pool` 缺失会在发请求前报错。
 
 针对 2026-10-13 C5 并发 32 超时、FFN PID 83688/83687 的故障，现场 FFN
 节点可执行交付分支中的采集脚本。`RUN_ROOT` 必须指向失败轮的日志目录；
