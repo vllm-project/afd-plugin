@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Check A5 requests through Proxy or Attention, including targeted c32-short."""
+"""Check A5 requests through Proxy or Attention, including targeted short batches."""
 
 import argparse
 import asyncio
@@ -12,7 +12,6 @@ from pathlib import Path
 import httpx
 
 CONCURRENCIES = (1, 8, 32)
-DIAGNOSTIC_CONCURRENCY = 32
 BOUNDARY_LENGTHS = (31, 32, 33, 63, 64, 65)
 LONG_INPUT_LENGTH = 1024
 REQUEST_TIMEOUT = 300
@@ -21,6 +20,7 @@ REQUEST_GAUGES = ("vllm:num_requests_running", "vllm:num_requests_waiting")
 
 
 async def run_checks(args: argparse.Namespace) -> dict:
+    diagnostic_concurrencies = {"c8-short": 8, "c32-short": 32}
     tokens = []
     if args.suite == "full":
         token_data = json.loads(Path(args.token_pool).read_text())
@@ -182,11 +182,11 @@ async def run_checks(args: argparse.Namespace) -> dict:
                 "before repeating load tests"
             )
 
-        if args.suite in ("full", "c32-short"):
+        if args.suite == "full" or args.suite in diagnostic_concurrencies:
             concurrencies = (
-                (DIAGNOSTIC_CONCURRENCY,)
-                if args.suite == "c32-short"
-                else CONCURRENCIES
+                CONCURRENCIES
+                if args.suite == "full"
+                else (diagnostic_concurrencies[args.suite],)
             )
             prompts = [("short", "Reply with a short greeting.")]
             if args.suite == "full":
@@ -313,7 +313,7 @@ async def run_checks(args: argparse.Namespace) -> dict:
                 }
             )
 
-        if args.suite not in ("eos", "c32-short"):
+        if args.suite != "eos" and args.suite not in diagnostic_concurrencies:
             print(
                 f"[{args.suite}] checking SSE, cancellation, and recovery", flush=True
             )
@@ -375,11 +375,11 @@ def main() -> None:
     parser.add_argument("--attention-url", required=True)
     parser.add_argument(
         "--suite",
-        choices=("smoke", "eos", "tail", "full", "c32-short"),
+        choices=("smoke", "eos", "tail", "full", "c8-short", "c32-short"),
         default="full",
         help=(
             "smoke: 5; eos: 1; tail: 4; full: 92 (default); "
-            "c32-short: EOS + 32 short requests for diagnosis only"
+            "c8-short/c32-short: EOS + 8/32 short requests for diagnosis only"
         ),
     )
     parser.add_argument(

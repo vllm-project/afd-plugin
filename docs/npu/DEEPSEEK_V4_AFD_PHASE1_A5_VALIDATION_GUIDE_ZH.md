@@ -848,12 +848,14 @@ standalone 的完整验证在上面的 Python 命令添加 `--standalone`，并�
 | `eos` | 1 | 单独定位自然 EOS，不重复并发或边界输入 |
 | `tail` | 4 | EOS、正常 SSE、取消 SSE、恢复请求；补测旧脚本在 EOS 处停止后尚未执行的项目 |
 | `full`（默认） | 92 | 完整功能请求覆盖；正式请求门禁使用此结果 |
+| `c8-short` | 9 | EOS + 8 并发短输入，定向诊断，不需要 token pool |
+| `c32-short` | 33 | EOS + 32 并发短输入，定向诊断，不需要 token pool |
 
 HTTP `/metrics`/`healthcheck` 查询不计入上表的推理请求数。`full` 的 92 个请求由
 `2 × (1 + 8 + 32) = 82` 个长/短输入并发请求、6 个边界请求及4个EOS/SSE/取消/恢复请求构成。
 并发用于覆盖 DP 调度和 U2 执行，边界输入用于检查 KV block 长度；不是每轮都做 GSM8K。
 脚本现在先执行 EOS，失败后立即停止，不再先跑 88 个负载/边界请求。
-`smoke`/`eos`/`tail` 的成功不等同于完整门禁：查看 summary 的 `suite` 与
+子套件的成功不等同于完整门禁：查看 summary 的 `suite` 与
 `full_request_suite_passed`；只有 `full` 成功会将后者写为 `true`。
 
 **EOS 报错后的单独复测（standalone 在服务本机执行）**：
@@ -895,6 +897,24 @@ EOS 用例若未自然结束，先冻结合适的 EOS prompt/预算再重跑，�
 取消后还要核对本次请求的上游 abort/cancel 处理及 Prefill KV/session 资源释放，不能仅用 Proxy 计数归零代替。当前 Proxy 自行生成上游 request ID，客户端发送的`X-Request-Id` 不保证原样转发；使用响应 ID、请求时间窗及 Proxy 的 ID 映射定位，缺少映射时补采诊断证据，不把客户端标签当作已经贯通的服务端 ID。
 
 ### 6.4.1 C5 HCCL/AICPU 故障的一次采集
+
+2026-10-13 后续 full 在 `c8-short` 阶段发生 FFN launcher 参数异常。可独立
+执行该批，套件先检查自然 EOS，再发送 8 条短输入；不执行 full 的前序长输入：
+
+```bash
+"$PYTHON_BIN" "$AFD_PLUGIN_ROOT/tools/validation/a5_1030_requests.py" \
+  --suite c8-short \
+  --base-url "$BASE_URL" \
+  --attention-url "$ATTENTION_URL" \
+  --output "$RUN_ROOT/requests-c8-short-$(date +%Y%m%dT%H%M%S)" \
+  --run-id "$RUN_ID-c8-short"
+```
+
+不需要 `--token-pool`；standalone 时添加 `--standalone`，两个 URL 指向 Attention。
+核对 `batch-c8-short.summary.json` 中 `passed_count=8`、`failed_count=0`，以及
+`request_summary.json` 中 `request_checks_passed=true`。独立执行通过仍不能排除
+full 前序请求/shape 切换触发的故障；保留服务是否刚启动和此前请求序列。
+已经发生 FFN worker failure 的服务需按停服/清理/启动流程恢复后再测。
 
 针对 2026-10-13 C5 并发 32 超时、FFN PID 83688/83687 的故障，现场 FFN
 节点可执行交付分支中的采集脚本。`RUN_ROOT` 必须指向失败轮的日志目录；

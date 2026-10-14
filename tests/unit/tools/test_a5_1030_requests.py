@@ -197,21 +197,27 @@ def test_standalone_gate_uses_attention_metrics_without_proxy(request_gate):
     assert all(path != "/healthcheck" for _, path in calls)
 
 
-def test_c32_short_suite_preserves_concurrency_without_repeating_full(request_gate):
+@pytest.mark.parametrize("suite,concurrency", [("c8-short", 8), ("c32-short", 32)])
+def test_short_suite_preserves_concurrency_without_repeating_full(
+    request_gate, suite, concurrency
+):
     args, exercise = request_gate
-    args.suite = "c32-short"
+    args.suite = suite
     args.token_pool = None
     result, peak, closed, calls = exercise()
     assert result["request_checks_passed"] is True
     assert result["full_request_suite_passed"] is False
-    assert result["request_count"] == 33
+    assert result["request_count"] == concurrency + 1
     assert result["f0_passed"] is None
-    assert peak == 32
+    assert peak == concurrency
     assert not closed
     assert {r["name"] for r in result["records"]} == {
         "eos",
-        *(f"c32-short-{index}" for index in range(32)),
+        *(f"{suite}-{index}" for index in range(concurrency)),
     }
+    batch = json.loads(Path(args.output, f"batch-{suite}.summary.json").read_text())
+    assert batch["passed_count"] == concurrency
+    assert batch["failed_count"] == 0
     assert ("attention", "/metrics") in calls
 
 
@@ -265,7 +271,9 @@ def test_selected_suite_does_not_repeat_concurrency_and_boundary_load(
         assert {"eos", "stream", "cancel", "recovery"} <= names
 
 
-@pytest.mark.parametrize("suite", ["smoke", "eos", "tail", "full"])
+@pytest.mark.parametrize(
+    "suite", ["smoke", "eos", "tail", "full", "c8-short", "c32-short"]
+)
 def test_chat_length_limit_is_not_accepted_as_natural_eos(request_gate, suite):
     args, exercise = request_gate
     args.suite = suite
