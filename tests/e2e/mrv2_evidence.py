@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Test-only counters for completed GPU graph and two-stage DBO execution.
+"""Test-only counters for completed GPU/NPU graph and two-stage DBO execution.
 
 After Attention readiness, native RPC resets its counters and a marker arms FFN
 on its first evaluation call. Attention reports after evaluation; FFN reports
@@ -24,11 +24,22 @@ from threading import Lock
 from typing import TYPE_CHECKING
 
 from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
-from afd_plugin.v1.worker import ffn_model_runner, ffn_worker
-from afd_plugin.v1.worker.cuda_graph import AFDGraphRunMode
+from afd_plugin.v1.worker.cuda_graph import AFDGraphRunMode, make_ffn_graph_key
+
+if current_platform.device_type == "npu":
+    from afd_plugin.v1.worker.npu import ffn_model_runner, ffn_worker
+
+    FFN_RUNNER = ffn_model_runner.AFDNPUFFNModelRunner
+    FFN_WORKER = ffn_worker.AFDNPUFFNWorker
+else:
+    from afd_plugin.v1.worker import ffn_model_runner, ffn_worker
+
+    FFN_RUNNER = ffn_model_runner.GPUFFNModelRunner
+    FFN_WORKER = ffn_worker.AFDFFNWorker
 
 if TYPE_CHECKING:
     import torch
@@ -44,7 +55,7 @@ if TYPE_CHECKING:
 __all__ = ["Worker"]
 
 DBO_NUM_STAGES = 2
-GPU_EVIDENCE_START_ENV = "AFD_E2E_GPU_EVIDENCE_START"
+MRV2_EVIDENCE_START_ENV = "AFD_E2E_MRV2_EVIDENCE_START"
 ExecutionLayout = tuple[tuple[int, tuple[int, ...]], ...]
 
 
@@ -73,14 +84,14 @@ def _install_probes() -> type:
     counts_lock = Lock()
     armed = False
     ffn_window_started = False
-    start_marker = Path(os.environ[GPU_EVIDENCE_START_ENV])
+    start_marker = Path(os.environ[MRV2_EVIDENCE_START_ENV])
     complete_marker = start_marker.with_name("evaluation-complete")
     attention_replayed = False
     ffn_mode: AFDGraphRunMode | None = None
     native_execute = GPUModelRunner.execute_model
     native_replay = ModelCudaGraphManager.run_fullgraph
-    ffn_execute = ffn_model_runner.GPUFFNModelRunner.execute_model
-    ffn_check = ffn_worker.AFDFFNWorker.raise_ffn_loop_error_if_any
+    ffn_execute = FFN_RUNNER.execute_model
+    ffn_check = FFN_WORKER.raise_ffn_loop_error_if_any
     select_mode = ffn_model_runner.graph_run_mode
 
     def log_execution_evidence(
@@ -183,7 +194,11 @@ def _install_probes() -> type:
                     if metadata.num_stages == DBO_NUM_STAGES and all(
                         count > 0 for count in real_tokens
                     ):
-                        dp_size = self.vllm_config.parallel_config.data_parallel_size
+                        dp_size = (
+                            1
+                            if self.afd_config.async_dp
+                            else self.vllm_config.parallel_config.data_parallel_size
+                        )
                         layout = tuple(
                             (stage, (tokens,) * dp_size)
                             for stage, tokens in enumerate(metadata.tokens_lens)
@@ -221,6 +236,31 @@ def _install_probes() -> type:
         return ffn_mode
         # ### PATCH END: observe native FFN mode selection.
 
+    def arm_ffn() -> None:
+        # ### PATCH START: arm FFN once, before its first evaluation call.
+        nonlocal counts, armed, ffn_window_started
+        if not ffn_window_started and not armed and start_marker.exists():
+            with counts_lock:
+                counts = _ExecutionCounts()
+                armed = ffn_window_started = True
+        # ### PATCH END: arm FFN once, before its first evaluation call.
+
+    def record_ffn(dp_metadata_list, is_warmup, is_graph_capturing) -> None:
+        # ### PATCH START: count completed live FFN work.
+        with counts_lock:
+            if armed and not (is_warmup or is_graph_capturing):
+                assert dp_metadata_list is not None and ffn_mode is not None
+                replayed = ffn_mode is AFDGraphRunMode.REPLAY
+                layout = (
+                    make_ffn_graph_key(dp_metadata_list)
+                    if len(dp_metadata_list) == DBO_NUM_STAGES
+                    else None
+                )
+                counts.record(replayed, layout)
+            else:
+                counts.previous_replay_layout = None
+        # ### PATCH END: count completed live FFN work.
+
     @wraps(ffn_execute)
     # Patch reason: Attention replay does not prove matching FFN replay ran.
     # Patch functionality: count FFN work only after the real call returns.
@@ -236,13 +276,7 @@ def _install_probes() -> type:
         is_warmup: bool = False,
         is_graph_replaying: bool = False,
     ) -> None:
-        # ### PATCH START: arm FFN once, before its first evaluation call.
-        nonlocal counts, armed, ffn_window_started
-        if not ffn_window_started and not armed and start_marker.exists():
-            with counts_lock:
-                counts = _ExecutionCounts()
-                armed = ffn_window_started = True
-        # ### PATCH END: arm FFN once, before its first evaluation call.
+        arm_ffn()
         ffn_execute(
             self,
             scheduler_output,
@@ -252,20 +286,38 @@ def _install_probes() -> type:
             is_warmup=is_warmup,
             is_graph_replaying=is_graph_replaying,
         )
-        # ### PATCH START: count completed live FFN work.
-        with counts_lock:
-            if armed and not (is_warmup or is_graph_capturing):
-                assert dp_metadata_list is not None and ffn_mode is not None
-                replayed = ffn_mode is AFDGraphRunMode.REPLAY
-                layout = (
-                    ffn_model_runner.make_ffn_graph_key(dp_metadata_list)
-                    if len(dp_metadata_list) == DBO_NUM_STAGES
-                    else None
-                )
-                counts.record(replayed, layout)
-            else:
-                counts.previous_replay_layout = None
-        # ### PATCH END: count completed live FFN work.
+        record_ffn(dp_metadata_list, is_warmup, is_graph_capturing)
+
+    @wraps(ffn_execute)
+    # Patch reason: sync NPU FFN has a profile argument in its concrete API.
+    # Patch functionality: count completed connector-driven work in the same
+    # evaluation window as Attention. Signature matches AFDNPUFFNModelRunner
+    # execute_model. Observation only; remove with the test-only GPU probe.
+    def execute_npu_ffn(
+        self,
+        scheduler_output: SchedulerOutput | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        *,
+        dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] | None = None,
+        is_graph_capturing: bool = False,
+        is_warmup: bool = False,
+        is_profile: bool = False,
+        is_graph_replaying: bool = False,
+    ) -> None:
+        # ### PATCH START: observe NPU completion without adding device fences.
+        arm_ffn()
+        ffn_execute(
+            self,
+            scheduler_output,
+            intermediate_tensors,
+            dp_metadata_list=dp_metadata_list,
+            is_graph_capturing=is_graph_capturing,
+            is_warmup=is_warmup,
+            is_profile=is_profile,
+            is_graph_replaying=is_graph_replaying,
+        )
+        record_ffn(dp_metadata_list, is_warmup or is_profile, is_graph_capturing)
+        # ### PATCH END: observe NPU completion without adding device fences.
 
     @wraps(ffn_check)
     # Patch reason: the FFN daemon does not service HTTP collective RPC.
@@ -291,8 +343,10 @@ def _install_probes() -> type:
     GPUModelRunner.execute_model = execute
     ModelCudaGraphManager.run_fullgraph = replay
     ffn_model_runner.graph_run_mode = mode
-    ffn_model_runner.GPUFFNModelRunner.execute_model = execute_ffn
-    ffn_worker.AFDFFNWorker.raise_ffn_loop_error_if_any = check_ffn
+    FFN_RUNNER.execute_model = (
+        execute_npu_ffn if current_platform.device_type == "npu" else execute_ffn
+    )
+    FFN_WORKER.raise_ffn_loop_error_if_any = check_ffn
     return Worker
 
 

@@ -103,13 +103,9 @@ COMPLETION_TEMPERATURE = 0
 DBO_EVAL_NUM_CONCURRENT = 12
 DBO_EVAL_MIN_SAMPLES = 2 * DBO_EVAL_NUM_CONCURRENT
 DBO_EVAL_NUM_UBATCHES = 2
-GPU_EVIDENCE_RPC_TIMEOUT_S = 30
-GPU_EVIDENCE_REPLAY_MIN_COUNT = 2
-GPU_EVIDENCE_PREFIX = "AFD E2E execution: "
-# The engine logs one DEBUG line per executed step carrying its ubatch slice
-# list; a step line containing UBatchSlice entries is a live two-ubatch run.
-DBO_SPLIT_EVIDENCE_ENTRY = "UBatchSlice("
-NPU_DBO_CONTROL_ENTRY = "AFD NPU Attention send_dp_metadata decision;"
+MRV2_EVIDENCE_RPC_TIMEOUT_S = 30
+MRV2_EVIDENCE_REPLAY_MIN_COUNT = 2
+MRV2_EVIDENCE_PREFIX = "AFD E2E execution: "
 ACCOUNTING_PROMPT = (
     "<|im_start|>system\n"
     "You are a professional accountant. Answer questions using accounting "
@@ -150,11 +146,9 @@ def main() -> int:
     processes: list[subprocess.Popen[str]] = []
     processes_by_role: dict[str, subprocess.Popen[str]] = {}
     log_threads: list[threading.Thread] = []
-    dbo_split_steps: list[float] = []
-    gpu_execution_evidence: list[tuple[str, str]] = []
-    gpu_evidence_dir: tempfile.TemporaryDirectory[str] | None = None
-    gpu_evidence_start: Path | None = None
-    eval_started_at: float | None = None
+    mrv2_execution_evidence: list[tuple[str, str]] = []
+    mrv2_evidence_dir: tempfile.TemporaryDirectory[str] | None = None
+    mrv2_evidence_start: Path | None = None
     handled_signals = (signal.SIGTERM, signal.SIGINT)
     previous_handlers = {signum: signal.getsignal(signum) for signum in handled_signals}
     received_signal: int | None = None
@@ -173,9 +167,9 @@ def main() -> int:
 
     launch_order: tuple[tuple[str, str], ...]
     try:
-        if needs_gpu_execution_evidence(args):
-            gpu_evidence_dir = tempfile.TemporaryDirectory(prefix="afd-e2e-gpu-")
-            gpu_evidence_start = Path(gpu_evidence_dir.name) / "evaluation-start"
+        if needs_mrv2_execution_evidence(args):
+            mrv2_evidence_dir = tempfile.TemporaryDirectory(prefix="afd-e2e-mrv2-")
+            mrv2_evidence_start = Path(mrv2_evidence_dir.name) / "evaluation-start"
         if args.baseline:
             role_devices = {"baseline": attention_devices}
             launch_order = (("baseline", "BASELINE"),)
@@ -203,7 +197,7 @@ def main() -> int:
                 args,
                 role=role,
                 e2e_run_id=e2e_run_id,
-                gpu_evidence_start=gpu_evidence_start,
+                mrv2_evidence_start=mrv2_evidence_start,
             )
             print_command(
                 label,
@@ -218,32 +212,27 @@ def main() -> int:
             )
             processes.append(process)
             processes_by_role[role] = process
-            log_threads.append(
-                stream_output(role, process, dbo_split_steps, gpu_execution_evidence)
-            )
+            log_threads.append(stream_output(role, process, mrv2_execution_evidence))
             ensure_alive(process, f"{label} process exited during startup")
 
         wait_for_openai_api(args, processes)
         ensure_processes_alive(processes)
 
-        if needs_gpu_execution_evidence(args):
-            gpu_execution_evidence_rpc(args, "afd_reset_execution_evidence")
-            assert gpu_evidence_start is not None
-            gpu_evidence_start.touch()
-        eval_started_at = time.time()
+        if needs_mrv2_execution_evidence(args):
+            mrv2_execution_evidence_rpc(args, "afd_reset_execution_evidence")
+            assert mrv2_evidence_start is not None
+            mrv2_evidence_start.touch()
         if args.scenario == ASYNC_CAM_SCENARIO:
             run_completion_evaluation(args)
         elif args.scenario in DSV4_SCENARIOS:
             run_concurrent_completion_evaluation(args)
         else:
             run_gsm8k_evaluation(args)
-        if needs_gpu_execution_evidence(args):
-            gpu_execution_evidence_rpc(args, "afd_log_execution_evidence")
-            assert gpu_evidence_start is not None
-            gpu_evidence_start.with_name("evaluation-complete").touch()
-            wait_for_gpu_execution_summaries(gpu_execution_evidence, args, processes)
-        if args.enable_dbo and args.device_backend == "npu":
-            assert_dbo_live_split_coverage(dbo_split_steps, eval_started_at, args)
+        if needs_mrv2_execution_evidence(args):
+            mrv2_execution_evidence_rpc(args, "afd_log_execution_evidence")
+            assert mrv2_evidence_start is not None
+            mrv2_evidence_start.with_name("evaluation-complete").touch()
+            wait_for_mrv2_execution_summaries(mrv2_execution_evidence, args, processes)
 
         ensure_processes_alive(processes)
     finally:
@@ -291,8 +280,8 @@ def main() -> int:
                                 if previous_handler is None
                                 else previous_handler,
                             )
-                        if gpu_evidence_dir is not None:
-                            gpu_evidence_dir.cleanup()
+                        if mrv2_evidence_dir is not None:
+                            mrv2_evidence_dir.cleanup()
             except BaseException as exc:
                 cleanup_error = exc
         finally:
@@ -310,8 +299,8 @@ def main() -> int:
 
     # FFN reports through its existing health RPC. Read all summaries after process
     # shutdown/join so stdout-reader scheduling cannot look like missing ranks.
-    if needs_gpu_execution_evidence(args):
-        assert_gpu_execution_evidence(gpu_execution_evidence, args)
+    if needs_mrv2_execution_evidence(args):
+        assert_mrv2_execution_evidence(mrv2_execution_evidence, args)
     print(f"\nE2E SCENARIO {args.scenario} PASSED")
     return 0
 
@@ -757,7 +746,7 @@ def build_vllm_command(
             json.dumps(afd_config, separators=(",", ":")),
         ],
     )
-    if needs_gpu_execution_evidence(args):
+    if needs_mrv2_execution_evidence(args):
         cmd.extend(["--worker-extension-cls", "tests.e2e.mrv2_evidence.Worker"])
     if args.scenario in V2_DBO_COMPARISON_SCENARIOS:
         # Keep request concurrency identical across the no-DBO, eager DBO
@@ -953,45 +942,26 @@ def run_gsm8k_evaluation(args: argparse.Namespace) -> None:
         )
 
 
-def assert_dbo_live_split_coverage(
-    split_step_times: list[float],
-    eval_started_at: float | None,
-    args: argparse.Namespace,
-) -> None:
-    live_split_steps = sum(
-        1
-        for received_at in split_step_times
-        if eval_started_at is None or received_at >= eval_started_at
-    )
-    if live_split_steps:
-        print(
-            "\n[dbo-coverage] live DBO split coverage confirmed: "
-            f"{live_split_steps} two-ubatch step(s) recorded in the "
-            f"evaluation window",
-        )
-        return
-    raise RuntimeError(
-        "DBO was enabled but no live request was ever split into "
-        f"{DBO_EVAL_NUM_UBATCHES} ubatches: 0 two-ubatch steps were recorded "
-        "inside the evaluation window (warmup/capture-only execution does "
-        f"not count). Client concurrency: {DBO_EVAL_NUM_CONCURRENT}, sample "
-        f"floor: {DBO_EVAL_MIN_SAMPLES}. Thresholds: "
-        f"dbo_decode_token_threshold={args.dbo_decode_token_threshold}, "
-        f"dbo_prefill_token_threshold={args.dbo_prefill_token_threshold}. "
-        "Increase the client concurrency until both attention ranks hold "
-        "enough real tokens for two non-empty ubatches.",
+def uses_dbo_execution(args: argparse.Namespace) -> bool:
+    # The Lite Async case deliberately supplies enough work for native DBO.
+    # DSV4's legacy alias keeps native thresholds: its ten short requests can
+    # legitimately remain unsplit, so that case retains its original oracle.
+    return args.enable_dbo or args.scenario == ASYNC_UBATCH_SCENARIO
+
+
+def execution_evidence_roles(args: argparse.Namespace) -> tuple[str, ...]:
+    # Async CAM stages belong to Attention; FFN consumes independent native
+    # work items. Sync graph/DBO must prove the matching path on both roles.
+    return ("attention",) if uses_async_connector(args) else ("attention", "ffn")
+
+
+def needs_mrv2_execution_evidence(args: argparse.Namespace) -> bool:
+    return not args.baseline and (
+        args.cuda_graph_full_decode_only or uses_dbo_execution(args)
     )
 
 
-def needs_gpu_execution_evidence(args: argparse.Namespace) -> bool:
-    return (
-        args.device_backend == "gpu"
-        and not args.baseline
-        and (args.cuda_graph_full_decode_only or args.enable_dbo)
-    )
-
-
-def gpu_execution_evidence_rpc(args: argparse.Namespace, method: str) -> None:
+def mrv2_execution_evidence_rpc(args: argparse.Namespace, method: str) -> None:
     """Broadcast on Attention; its DP/TP workers log their own summaries.
 
     Pinned vLLM's DP load balancer returns only the first DP engine's result,
@@ -1001,23 +971,23 @@ def gpu_execution_evidence_rpc(args: argparse.Namespace, method: str) -> None:
     request = urllib.request.Request(
         f"http://{args.api_host}:{attention_api_port(args)}/collective_rpc",
         data=json.dumps(
-            {"method": method, "timeout": GPU_EVIDENCE_RPC_TIMEOUT_S}
+            {"method": method, "timeout": MRV2_EVIDENCE_RPC_TIMEOUT_S}
         ).encode(),
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(
-        request, timeout=GPU_EVIDENCE_RPC_TIMEOUT_S
+        request, timeout=MRV2_EVIDENCE_RPC_TIMEOUT_S
     ) as response:
         response.read()
 
 
-def wait_for_gpu_execution_summaries(
+def wait_for_mrv2_execution_summaries(
     evidence: list[tuple[str, str]],
     args: argparse.Namespace,
     processes: list[subprocess.Popen[str]],
 ) -> None:
     expected: set[tuple[str, int, int]] = set()
-    for role in ("attention", "ffn"):
+    for role in execution_evidence_roles(args):
         tp_size = role_tp_size(args, role)
         rank_count = (
             args.num_attention_ranks if role == "attention" else args.num_ffn_ranks
@@ -1027,7 +997,7 @@ def wait_for_gpu_execution_summaries(
             for dp in range(rank_count // tp_size)
             for tp in range(tp_size)
         )
-    deadline = time.monotonic() + GPU_EVIDENCE_RPC_TIMEOUT_S
+    deadline = time.monotonic() + MRV2_EVIDENCE_RPC_TIMEOUT_S
     while True:
         ensure_processes_alive(processes)
         observed = {
@@ -1039,30 +1009,30 @@ def wait_for_gpu_execution_summaries(
             return
         if time.monotonic() >= deadline:
             raise RuntimeError(
-                "Timed out waiting for GPU execution summaries: "
+                "Timed out waiting for MRV2 execution summaries: "
                 f"{sorted(expected - observed)}"
             )
         time.sleep(PROCESS_POLL_INTERVAL_S)
 
 
-def assert_gpu_execution_evidence(
+def assert_mrv2_execution_evidence(
     evidence: list[tuple[str, str]], args: argparse.Namespace
 ) -> None:
     metric = (
         "two_stage_graph_replays"
-        if args.enable_dbo and args.cuda_graph_full_decode_only
+        if uses_dbo_execution(args) and args.cuda_graph_full_decode_only
         else "two_stage_steps"
-        if args.enable_dbo
+        if uses_dbo_execution(args)
         else "graph_replays"
     )
     minimum = (
-        GPU_EVIDENCE_REPLAY_MIN_COUNT if metric == "two_stage_graph_replays" else 1
+        MRV2_EVIDENCE_REPLAY_MIN_COUNT if metric == "two_stage_graph_replays" else 1
     )
     layout_kind = (
         "consecutive_graph" if args.cuda_graph_full_decode_only else "two_stage"
     )
     common_layouts: set[str] | None = None
-    for role in ("attention", "ffn"):
+    for role in execution_evidence_roles(args):
         tp_size = role_tp_size(args, role)
         rank_count = (
             args.num_attention_ranks if role == "attention" else args.num_ffn_ranks
@@ -1081,17 +1051,18 @@ def assert_gpu_execution_evidence(
             if match is not None and int(match[3]) >= minimum:
                 rank = (int(match[1]), int(match[2]))
                 observed.add(rank)
-                if args.enable_dbo:
+                if uses_dbo_execution(args) and not uses_async_connector(args):
                     payload = json.loads(line.split(" layouts=", 1)[1])
                     for layout in payload[layout_kind]:
                         key = json.dumps(layout, separators=(",", ":"))
                         layouts.setdefault(key, set()).add(rank)
         if missing := expected - observed:
             raise RuntimeError(
-                f"GPU {role} lacks live {metric}>={minimum} evidence on ranks "
+                f"{args.device_backend.upper()} {role} lacks live "
+                f"{metric}>={minimum} evidence on ranks "
                 f"{sorted(missing)}"
             )
-        if args.enable_dbo:
+        if uses_dbo_execution(args) and not uses_async_connector(args):
             complete_layouts = {
                 layout for layout, ranks in layouts.items() if expected <= ranks
             }
@@ -1100,16 +1071,24 @@ def assert_gpu_execution_evidence(
                 if common_layouts is None
                 else common_layouts & complete_layouts
             )
-    if args.enable_dbo and not common_layouts:
+    if (
+        uses_dbo_execution(args)
+        and not uses_async_connector(args)
+        and not common_layouts
+    ):
         raise RuntimeError(
-            "GPU DBO lacks matching two-stage layouts across every A/F rank"
+            f"{args.device_backend.upper()} DBO lacks matching two-stage layouts "
+            "across every participating rank"
             + (
                 " with consecutive graph replays"
                 if args.cuda_graph_full_decode_only
                 else ""
             )
         )
-    print(f"[execution-coverage] live {metric}>={minimum} confirmed on every A/F rank")
+    print(
+        f"[execution-coverage] live {metric}>={minimum} "
+        "confirmed on every participating rank"
+    )
 
 
 def run_completion_evaluation(args: argparse.Namespace) -> None:
@@ -1170,16 +1149,16 @@ def build_env(
     *,
     role: str | None = None,
     e2e_run_id: str | None = None,
-    gpu_evidence_start: Path | None = None,
+    mrv2_evidence_start: Path | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "18000")
     env[visible_devices_env_name(args.device_backend)] = visible_devices
-    env["VLLM_USE_V2_MODEL_RUNNER"] = "1" if args.device_backend == "gpu" else "0"
-    if needs_gpu_execution_evidence(args):
+    env["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    if needs_mrv2_execution_evidence(args):
         env["VLLM_SERVER_DEV_MODE"] = "1"
-        if gpu_evidence_start is not None:
-            env["AFD_E2E_GPU_EVIDENCE_START"] = str(gpu_evidence_start)
+        if mrv2_evidence_start is not None:
+            env["AFD_E2E_MRV2_EVIDENCE_START"] = str(mrv2_evidence_start)
     if args.baseline:
         env["VLLM_PLUGINS"] = "ascend" if args.device_backend == "npu" else ""
     else:
@@ -1224,30 +1203,14 @@ def start_process(
 def stream_output(
     name: str,
     process: subprocess.Popen[str],
-    dbo_split_steps: list[float] | None = None,
-    gpu_execution_evidence: list[tuple[str, str]] | None = None,
+    mrv2_execution_evidence: list[tuple[str, str]] | None = None,
 ) -> threading.Thread:
     def worker() -> None:
         assert process.stdout is not None
         for line in process.stdout:
             print(f"[{name}] {line}", end="")
-            if gpu_execution_evidence is not None and GPU_EVIDENCE_PREFIX in line:
-                gpu_execution_evidence.append((name, line.strip()))
-            if (
-                dbo_split_steps is not None
-                and name == "attention"
-                and (
-                    DBO_SPLIT_EVIDENCE_ENTRY in line
-                    or (
-                        NPU_DBO_CONTROL_ENTRY in line
-                        and "key=((0," in line
-                        and ", (1, (" in line
-                        and "is_graph_capturing=False" in line
-                        and "is_warmup=False" in line
-                    )
-                )
-            ):
-                dbo_split_steps.append(time.time())
+            if mrv2_execution_evidence is not None and MRV2_EVIDENCE_PREFIX in line:
+                mrv2_execution_evidence.append((name, line.strip()))
 
     thread = threading.Thread(target=worker, name=f"{name}-log-stream", daemon=True)
     thread.start()

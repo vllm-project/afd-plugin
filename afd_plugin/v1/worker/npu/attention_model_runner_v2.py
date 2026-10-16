@@ -17,14 +17,10 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.worker import utils as v2_worker_utils
 from vllm.v1.worker.dp_utils import skip_dp_coordination
 from vllm.v1.worker.gpu import cudagraph_utils as v2_cudagraph_utils
 from vllm.v1.worker.gpu import model_runner as v2_model_runner
-from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
-from vllm.v1.worker.gpu.input_batch import InputBuffers
-from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
 
 from afd_plugin.compat.npu import fail_if_unsupported_npu_afd_features
@@ -51,11 +47,19 @@ from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
     _resolve_world_ranks,
 )
-from afd_plugin.v1.worker.attention_model_runner_v2 import _use_afd_ubatch_preparation
+from afd_plugin.v1.worker.attention_model_runner_v2 import (
+    _AFDCaptureEventTracker,
+    _use_afd_capture_input_preparation,
+    _use_afd_ubatch_preparation,
+)
+from afd_plugin.v1.worker.npu.model_io import (
+    pp_transport_rows,
+    prepare_pp_transport_buffers,
+)
 from afd_plugin.validation import validate_npu_model_runner_v2_config
 
 if TYPE_CHECKING:
-    from vllm.v1.worker.gpu.pcp_manager import PCPManager
+    from afd_plugin.v1.worker.npu.ubatch_runner import NPUUBatchRunner
 
 _AFD_FULLGRAPH_HOOK_MARKER = "_afd_fullgraph_replay_hook_active"
 
@@ -85,10 +89,10 @@ def _use_afd_fullgraph_replay_hook(
     # execute-scoped AFD provider cannot publish runtime control.
     # Patch functionality: wrap only this manager instance and publish one
     # ordinary padded control payload immediately before each native replay.
-    # Signature: matches vLLM v0.26.0 ModelCudaGraphManager.run_fullgraph exactly.
+    # Signature: matches vLLM v0.30.0 ModelCudaGraphManager.run_fullgraph exactly.
     # Upstream source: vllm/v1/worker/gpu/cudagraph_utils.py,
     # ModelCudaGraphManager.run_fullgraph; commit
-    # 568afb3a13806beb53bb2e6bd518269357b237c0.
+    # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
     # Delegation exception: native replay remains wholly in the saved bound
     # method; this scope owns only the AFD pre-replay control seam.
     # Removal/upstream plan: delete this hook when vLLM exposes a per-manager
@@ -98,6 +102,12 @@ def _use_afd_fullgraph_replay_hook(
         desc: v2_cudagraph_utils.BatchExecutionDescriptor,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
         # ### PATCH START: publish one AFD pre-replay payload.
+        if desc.num_ubatches > 1:
+            # Native execute already prepared live stages and published their
+            # complete A/F transaction. Update their captured MLA records at
+            # this graph-manager seam without publishing duplicate control.
+            assert runner.ubatch_runner is not None
+            return runner.ubatch_runner.run_fullgraph(self, desc)
         previous_is_graph_replaying = getattr(
             runner,
             "_afd_is_graph_replaying",
@@ -209,6 +219,8 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     """
 
     afd_expected_role = "attention"
+    ubatch_runner: NPUUBatchRunner | None
+    intermediate_tensors: IntermediateTensors | None
 
     def __init__(
         self,
@@ -338,98 +350,37 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                     "AFD NPU ModelRunnerV2 ACL graph expected only FULL capture "
                     "descriptors",
                 )
-        expected_events = [
-            (desc, is_warmup) for desc in capture_descs for is_warmup in (True, False)
-        ]
-        event_index = 0
-        original_prepare = v2_cudagraph_utils.prepare_inputs_to_capture
+        event_tracker = _AFDCaptureEventTracker(capture_descs)
         previous_metadata = self._afd_pending_metadata
         previous_suppress_send = self._afd_suppress_metadata_send
         previous_is_warmup = self._is_warmup
         previous_is_graph_capturing = self._afd_is_graph_capturing
-
-        # Patch reason: native ModelCudaGraphManager.capture calls this exact
-        # module symbol once before each warmup/formal-capture forward.
-        # Patch functionality: preserve native preparation and publish the
-        # matching AFD event before the forward starts.
-        # Signature: matches vLLM v0.30.0 prepare_inputs_to_capture exactly.
-        # Upstream source: vllm/v1/worker/gpu/cudagraph_utils.py,
-        # prepare_inputs_to_capture; commit
-        # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
-        # Delegation exception: preserve native attention preparation; this
-        # wrapper only publishes the AFD event before each capture forward.
-        def prepare_inputs_to_capture(
-            num_reqs: int,
-            num_tokens: int,
-            model_state: ModelState,
-            input_buffers: InputBuffers,
-            block_tables: BlockTables,
-            attn_groups: list[list[v2_worker_utils.AttentionGroup]],
-            kv_cache_config: KVCacheConfig,
-            full_cudagraph: bool,
-            max_query_len: int | None = None,
-            pcp_manager: PCPManager | None = None,
-        ) -> v2_cudagraph_utils.AttentionState:
-            nonlocal event_index
-            # ### PATCH START: stage one exact AFD capture event.
-            attention_state = original_prepare(
-                num_reqs,
-                num_tokens,
-                model_state,
-                input_buffers,
-                block_tables,
-                attn_groups,
-                kv_cache_config,
-                full_cudagraph=full_cudagraph,
-                max_query_len=max_query_len,
-                pcp_manager=pcp_manager,
-            )
-            if event_index >= len(expected_events):
-                raise RuntimeError(
-                    "AFD NPU ModelRunnerV2 ACL graph observed extra capture input "
-                    "preparation",
-                )
-            desc, is_warmup = expected_events[event_index]
-            event_index += 1
-            if num_reqs != desc.num_reqs or num_tokens != desc.num_tokens:
-                raise RuntimeError(
-                    "AFD NPU ModelRunnerV2 ACL graph capture descriptor/order drift: "
-                    f"expected ({desc.num_reqs}, {desc.num_tokens}), got "
-                    f"({num_reqs}, {num_tokens})",
-                )
-            self._is_warmup = is_warmup
-            self._afd_is_graph_capturing = not is_warmup
-            self._afd_pending_metadata = self.build_afd_metadata(
-                None,
-                int(desc.num_tokens),
-            )
-            self.send_dp_metadata(
-                self.build_capture_dp_metadata(int(desc.num_tokens)),
-                None,
-            )
-            self._afd_suppress_metadata_send = True
-            return attention_state
-            # ### PATCH END: stage one exact AFD capture event.
-
-        v2_cudagraph_utils.prepare_inputs_to_capture = prepare_inputs_to_capture
+        previous_is_graph_replaying = self._afd_is_graph_replaying
+        # Pinned Ascend patch_v2/patch_input_batch.py already supplies
+        # AscendInputBatch in both native dummy/capture branches.
         try:
-            with use_afd_metadata_provider(
-                self.install_afd_metadata_on_forward_context,
+            with (
+                _use_afd_capture_input_preparation(self, event_tracker),
+                _use_afd_ubatch_preparation(
+                    self,
+                    event_tracker,
+                    self.ubatch_runner.record_capture_graph_params
+                    if self.ubatch_runner is not None
+                    else None,
+                ),
+                use_afd_metadata_provider(
+                    self.install_afd_metadata_on_forward_context,
+                ),
             ):
                 result = super().capture_model(profile_only=profile_only)
-            if event_index != len(expected_events):
-                raise RuntimeError(
-                    "AFD NPU ModelRunnerV2 ACL graph capture input-preparation "
-                    "call count drift: "
-                    f"expected {len(expected_events)}, got {event_index}",
-                )
+                event_tracker.assert_complete()
             return result
         finally:
-            v2_cudagraph_utils.prepare_inputs_to_capture = original_prepare
             self._afd_pending_metadata = previous_metadata
             self._afd_suppress_metadata_send = previous_suppress_send
             self._is_warmup = previous_is_warmup
             self._afd_is_graph_capturing = previous_is_graph_capturing
+            self._afd_is_graph_replaying = previous_is_graph_replaying
         # ### PATCH END: publish AFD FULL graph warmup/capture control.
 
     # Patch reason: native V2 creates ForwardContext inside execute_model, so
@@ -460,6 +411,17 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         # ### PATCH START: scope AFD metadata provider/replay and profiler step.
         step_afd_npu_profiler(self.prof)
+        if intermediate_tensors is not None and self.intermediate_tensors is not None:
+            # Native execute copies each buffer field after dispatch/padding.
+            # Preserve its copy and graph addresses; prepare only capacity and
+            # any auxiliary transport fields absent from the model allocation.
+            self.intermediate_tensors = IntermediateTensors(
+                prepare_pp_transport_buffers(
+                    self.intermediate_tensors.tensors,
+                    intermediate_tensors.tensors,
+                    pp_transport_rows(self.vllm_config, self.max_num_tokens),
+                )
+            )
         use_fullgraph_replay_hook = (
             self.vllm_config.compilation_config.cudagraph_mode
             in (CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY)
@@ -519,13 +481,13 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         # ### PATCH END: scope AFD metadata provider/replay and profiler step.
 
     # Patch reason: native V2 shutdown does not know about AFD's profiler,
-    # connector, or pending metadata sidecar.
+    # connector, pending metadata sidecar, or stage-local graph inputs.
     # Patch functionality: preserve delegated native cleanup and guarantee all
     # AFD cleanup layers run when any earlier layer raises.
-    # Signature: matches vLLM v0.26.0 NPUModelRunnerV2.shutdown exactly.
+    # Signature: matches vLLM v0.30.0 GPUModelRunner.shutdown exactly.
     # Upstream source: vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.shutdown; commit
-    # 568afb3a13806beb53bb2e6bd518269357b237c0.
+    # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
     # Delegation exception: native resource release remains in super().shutdown;
     # this override contains only AFD-specific finalizers.
     # Removal/upstream plan: delete this wrapper if AFD-owned lifecycle moves
@@ -536,10 +498,19 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             stop_afd_npu_profiler(self.prof)
         finally:
             try:
-                super().shutdown()
+                if self.ubatch_runner is not None:
+                    self.ubatch_runner.abort_pending_run()
             finally:
-                self._afd_pending_metadata = None
-                self.connector.close()
+                try:
+                    super().shutdown()
+                    # Native shutdown synchronizes and releases its graph
+                    # manager. Drop the child owner too: it retains model/KV
+                    # state, captured MLA registries and persistent RoPE inputs.
+                    # If native completion fails, retain it for process cleanup.
+                    self.ubatch_runner = None
+                finally:
+                    self._afd_pending_metadata = None
+                    self.connector.close()
         # ### PATCH END: guarantee profiler/native/connector cleanup.
 
 

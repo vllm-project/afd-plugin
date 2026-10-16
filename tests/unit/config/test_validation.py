@@ -15,6 +15,7 @@ from afd_plugin.validation import (
     NPU_FFN_WORKER_FQCN,
     assert_compatible_afd_stack,
     validate_gpu_model_runner_v2_config,
+    validate_npu_model_runner_v2_config,
 )
 
 
@@ -256,3 +257,33 @@ def test_gpu_validator_rejects_v1_before_importing_model_runtime(
         validate_gpu_model_runner_v2_config(
             mrv2_config, expected_role=role, device_type="cuda"
         )
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_npu_validator_rejects_v1_before_model_runtime(monkeypatch, mrv2_config, role):
+    mrv2_config.use_v2_model_runner = False
+    mrv2_config.additional_config["afd"].update(
+        role=role, connector="CAMP2pAFDConnector"
+    )
+    monkeypatch.setitem(
+        sys.modules, "afd_plugin.model_executor.models.model_utils", None
+    )
+    with pytest.raises(RuntimeError, match="AFD NPU requires ModelRunnerV2"):
+        validate_npu_model_runner_v2_config(
+            mrv2_config, expected_role=role, device_type="npu"
+        )
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+@pytest.mark.parametrize("enforce_eager", [False, True])
+def test_npu_sync_dbo_policy_allows_eager_and_full_graph(
+    mrv2_config, role, enforce_eager
+):
+    mrv2_config.additional_config["afd"].update(
+        role=role, connector="CAMP2pAFDConnector"
+    )
+    mrv2_config.model_config.enforce_eager = enforce_eager
+    mrv2_config.speculative_config = None
+    validate_npu_model_runner_v2_config(
+        mrv2_config, expected_role=role, device_type="npu"
+    )

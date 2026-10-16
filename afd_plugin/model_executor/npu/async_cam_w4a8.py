@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 import torch
@@ -69,6 +70,9 @@ class AsyncCAMW4A8Executor:
         self.w13_bias = [layer.w13_bias for layer in layers]
         self.w2_bias = [layer.w2_bias for layer in layers]
         self.per_channel = first.per_channel
+        # Retain the declared model value in the static signature only.
+        # Like main, the layered operator does not apply this activation limit.
+        self.swiglu_limit = first.swiglu_limit
         self.output_dtype = first.output_dtype
         self.routed_scaling_factor = first.routed_scaling_factor
         self.layer_id_to_slot = None
@@ -84,6 +88,32 @@ class AsyncCAMW4A8Executor:
         # Resolve both operators once, before dispatch can receive work.
         self.w13_op = torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered
         self.w2_op = torch.ops.afd_ascend.grouped_matmul_layered
+
+    def graph_signature(self, capacity: int) -> str:
+        """Compare static layouts across ranks without local device addresses."""
+        tensors = (
+            self.w13,
+            self.w2,
+            self.w13_scale,
+            self.w2_scale,
+            self.w13_bias,
+            self.w2_bias,
+        )
+        return json.dumps(
+            {
+                "capacity": capacity,
+                "layers": self.layer_ids,
+                "weights": [
+                    (tuple(group[0].shape), str(group[0].dtype), group[0].stride())
+                    for group in tensors
+                ],
+                "per_channel": self.per_channel,
+                "limit": self.swiglu_limit,
+                "routed_scaling": self.routed_scaling_factor,
+                "output_dtype": str(self.output_dtype),
+            },
+            sort_keys=True,
+        )
 
     @staticmethod
     def _validate_layer(layer: W4A8LayerWeights) -> None:
@@ -145,6 +175,8 @@ class AsyncCAMW4A8Executor:
         dynamic_scales: torch.Tensor,
         group_list: torch.Tensor,
         batch_info: torch.Tensor,
+        *,
+        retained_tensors: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         layer_index = batch_info[CAM_LAYER_INDEX : CAM_LAYER_INDEX + 1]
         if self.layer_id_to_slot is not None:
@@ -177,6 +209,10 @@ class AsyncCAMW4A8Executor:
             split_item=3,
             output_dtype=self.output_dtype,
         )[0]
+        if retained_tensors is not None:
+            # A graph session owns these capture-time addresses through its
+            # last replay. Eager calls retain only the usual stream lifetimes.
+            retained_tensors.extend((layer_index, activation, scale, output))
         if self.routed_scaling_factor != 1.0:
             output.mul_(self.routed_scaling_factor)
         return output

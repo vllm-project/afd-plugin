@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
@@ -12,15 +12,11 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import DPMetadata
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm_ascend import ascend_forward_context as ascend_context
-from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner, graph_capture
 
 from afd_plugin.compat.npu import (
     ascend_forward_context,
     fail_if_unsupported_npu_afd_features,
 )
-from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.compat.npu.profiler import (
     create_afd_npu_profiler,
     step_afd_npu_profiler,
@@ -35,12 +31,6 @@ from afd_plugin.connectors import (
     AFDForwardContextMetadata,
     AFDTransferContext,
 )
-from afd_plugin.connectors.npu.async_cam import (
-    AFDAsyncTransferState,
-    CAMAsyncAFDConnector,
-)
-from afd_plugin.envs import async_cam_layered_gmm_enabled
-from afd_plugin.model_executor.npu.async_cam_w4a8 import AsyncCAMW4A8Executor
 from afd_plugin.v1.worker.attention_metadata import (
     _resolve_world_ranks,
 )
@@ -48,10 +38,12 @@ from afd_plugin.v1.worker.cuda_graph import (
     AFDGraphRunMode,
     graph_run_mode,
 )
-from afd_plugin.v1.worker.ffn_model_runner import _set_moe_layer_index
+from afd_plugin.v1.worker.ffn_metadata import _set_moe_layer_index
+from afd_plugin.validation import validate_npu_model_runner_v2_config
 
 if TYPE_CHECKING:
     from vllm.sequence import IntermediateTensors
+    from vllm.tasks import SupportedTask
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
     from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
@@ -61,15 +53,22 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class AFDNPUFFNModelRunner(NPUModelRunner):
+class AFDNPUFFNModelRunner:
     """Connector-driven NPU FFN runner for AFD execution."""
 
     afd_expected_role = "ffn"
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
         afd_config = self.parse_config(vllm_config)
-        super().__init__(vllm_config, device)
-
+        validate_npu_model_runner_v2_config(
+            vllm_config, expected_role="ffn", device_type=device.type
+        )
+        self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
+        self.device = device
+        self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self.model: torch.nn.Module | None = None
+        self.model_memory_usage = 0
         self.afd_config = afd_config
         fail_if_unsupported_npu_afd_features(
             vllm_config,
@@ -83,74 +82,65 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             vllm_config,
             self.afd_config,
         )
-        if (
-            isinstance(self.connector, CAMAsyncAFDConnector)
-            and self.afd_config.compute_gate_on_attention
-            and not vllm_config.use_v2_model_runner
-        ):
-            # This dedicated CAM FFN process never consumes the native MC2 mask.
-            # Clear it after super().__init__ so upstream skips per-step fills.
-            ascend_context._reserved_mc2_mask = None
         self.num_layers = int(self.model_config.hf_config.num_hidden_layers)
-        self.use_aclgraph = _use_npu_aclgraph(vllm_config, self)
+        self.use_aclgraph = _use_npu_aclgraph(vllm_config)
         self._acl_graphs: dict[tuple, dict[str, Any]] = {}
         self.graph_pool = (
             current_platform.get_global_graph_pool() if self.use_aclgraph else None
         )
         self.prof = create_afd_npu_profiler("ffn")
         self._is_shutdown = False
-        self._layered_gmm_requested = async_cam_layered_gmm_enabled()
-        self._layered_executor: AsyncCAMW4A8Executor | None = None
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
         return parse_afd_config(vllm_config, expected_role="ffn")
 
-    def initialize_afd_connector(self) -> None:
-        self._initialize_layered_executor()
-        self.connector.init_afd_connector()
-
-    def _initialize_layered_executor(self) -> None:
-        reason = "switch disabled"
-        if self._layered_gmm_requested:
-            if not isinstance(self.connector, CAMAsyncAFDConnector):
-                reason = "requires CAMAsyncAFDConnector"
-            elif not self.afd_config.compute_gate_on_attention:
-                reason = "requires Attention-side gate"
-            else:
-                layers, reason = self.model.get_async_cam_w4a8_layers()
-                if layers:
-                    if get_ascend_device_type() != AscendDeviceType.A3:
-                        raise ValueError("layered W4A8 GMM requires Ascend 910C/A3")
-                    if self.connector.dynamic_quant != 1:
-                        raise ValueError("layered W4A8 GMM requires dynamicQuant=1")
-                    if self.use_aclgraph:
-                        raise ValueError("layered W4A8 GMM requires eager execution")
-                    if tuple(sorted(layer.layer_idx for layer in layers)) != tuple(
-                        _ffn_layer_indices(self)
-                    ):
-                        raise ValueError(
-                            "layered GMM weights do not cover the remote MoE layer IDs"
-                        )
-                    ensure_cam_async_ops_available()
-                    self._layered_executor = AsyncCAMW4A8Executor(layers)
-                    self.connector.layered_gmm_enabled = True
-                    logger.info(
-                        "AFD_ASYNC_CAM_LAYERED_GMM requested=1 actual=layered "
-                        "quant=W4A8 layers=%d mode=%s layer_mapping=%s "
-                        "swiglu_limit=%s ignored=%s",
-                        len(layers),
-                        "per-channel" if layers[0].per_channel else "per-group",
-                        self._layered_executor.layer_id_to_slot is not None,
-                        layers[0].swiglu_limit,
-                        layers[0].swiglu_limit != 0.0,
-                    )
-                    return
-        logger.info(
-            "AFD_ASYNC_CAM_LAYERED_GMM requested=%s actual=legacy reason=%s",
-            self._layered_gmm_requested,
-            reason,
+    def load_model(self) -> None:
+        # Load inside the initialized worker. The native loader owns weight
+        # materialization and quantization postprocessing; FFN does not need
+        # Attention request, sampler, KV or compilation-runner state.
+        from vllm.model_executor.model_loader import get_model_loader
+        from vllm.utils.mem_utils import DeviceMemoryProfiler
+        from vllm_ascend.ascend_forward_context import (
+            set_mc2_mask,
+            set_mc2_tokens_capacity,
         )
+
+        if self.model is not None:
+            raise RuntimeError("Synchronous FFN weights are already loaded")
+        speculative_config = self.vllm_config.speculative_config
+        decode_query_len = 1 + (
+            speculative_config.num_speculative_tokens
+            if speculative_config is not None
+            else 0
+        )
+        # Ascend MoE dispatchers read these helpers during model construction,
+        # including when CAMP2P supplies their input hidden states.
+        set_mc2_tokens_capacity(
+            self.vllm_config,
+            self.vllm_config.scheduler_config.max_num_seqs,
+            decode_query_len,
+        )
+        set_mc2_mask(self.vllm_config, self.device)
+        loader = get_model_loader(self.vllm_config.load_config)
+        with DeviceMemoryProfiler() as profiler:
+            self.model = loader.load_model(
+                vllm_config=self.vllm_config, model_config=self.model_config
+            )
+        self.model_memory_usage = profiler.consumed_memory
+
+    def get_model(self) -> torch.nn.Module:
+        assert self.model is not None
+        return self.model
+
+    def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        return ()
+
+    def update_max_model_len(self, max_model_len: int) -> None:
+        self.model_config.max_model_len = max_model_len
+
+    def initialize_afd_connector(self) -> None:
+        self.connector.init_afd_connector()
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}
@@ -191,16 +181,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             is_profile=is_profile,
             is_graph_replaying=is_graph_replaying,
         )
-        return None
-
-    def execute_connector_driven_step(self) -> None:
-        if self.connector.control_plane is not None:
-            raise RuntimeError(
-                "execute_connector_driven_step requires a connector-driven "
-                "AFD connector",
-            )
-        step_afd_npu_profiler(self.prof)
-        self._ffn_forward_connector_driven()
         return None
 
     def execute_model(
@@ -274,6 +254,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         update_connector_state: bool = True,
         is_profile: bool = False,
     ) -> torch.Tensor | None:
+        assert self.model is not None
         if update_connector_state:
             assert self.connector.control_plane, (
                 "Only DP metadata control plane supports ",
@@ -364,72 +345,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     )
         return rank_ffn_output
 
-    def _ffn_forward_connector_driven(
-        self,
-    ) -> torch.Tensor | AFDF2ATransferPayload | None:
-        stage_idx = 0
-        rank_ffn_output = None
-        connector = cast(CAMAsyncAFDConnector, self.connector)
-        if self._layered_executor is not None:
-            for _ in _ffn_layer_indices(self):
-                payload = connector.recv_attn_output()
-                states = cast(AFDAsyncTransferState, payload.context.states)
-                rank_ffn_output = self._layered_executor(
-                    payload.hidden_states,
-                    states.dynamic_scales,
-                    states.group_list,
-                    states.token_nums_rankid_layeridx,
-                )
-                connector.send_ffn_output(rank_ffn_output, payload.context)
-            return rank_ffn_output
-
-        for _ in _ffn_layer_indices(self):
-            work_item = connector.recv_ffn_work_item(
-                stage_idx=stage_idx,
-                max_num_tokens=self.max_num_tokens,
-            )
-            hidden_states = work_item.hidden_states
-            metadata = work_item.context.metadata
-            legacy_states = work_item.context.states
-            if not isinstance(legacy_states, AFDAsyncTransferState):
-                raise RuntimeError(
-                    "CAM async FFN work item requires AFDAsyncTransferState",
-                )
-            layer_idx = work_item.layer_idx
-            num_tokens = work_item.num_tokens
-            afd_metadata = AFDForwardContextMetadata(
-                tokens_start_loc=[0],
-                requests_start_loc=[0],
-                stage_idx=stage_idx,
-                connector=self.connector,
-                tokens_lens=[num_tokens],
-                num_stages=1,
-                tokens_unpadded_lens=[num_tokens],
-            )
-
-            with ascend_forward_context(
-                vllm_config=self.vllm_config,
-                afd_metadata=afd_metadata,
-                model_instance=self.model,
-                num_tokens=num_tokens,
-                skip_mc2_mask=self.afd_config.compute_gate_on_attention,
-            ) as forward_context:
-                forward_context.dp_metadata = None
-                forward_context.additional_kwargs["afd_metadata"] = metadata
-                _set_moe_layer_index(forward_context, layer_idx)
-
-                rank_ffn_output = self.model.compute_ffn_output(
-                    hidden_states=hidden_states,
-                    layer_idx=layer_idx,
-                    group_list=legacy_states.group_list,
-                    dynamic_scales=legacy_states.dynamic_scales,
-                )
-                rank_ffn_output = connector.send_ffn_work_item_output(
-                    work_item,
-                    rank_ffn_output,
-                )
-        return rank_ffn_output
-
     def capture_model(
         self,
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] | None = None,
@@ -457,7 +372,11 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     is_graph_capturing=False,
                 )
             else:
-                with graph_capture(device=self.device):
+                # FFN owns only its capture stream, with the same initialization
+                # dependency as the old helper; no MRV1 import is needed.
+                stream = torch.npu.Stream(device=self.device)
+                stream.wait_stream(torch.npu.current_stream(self.device))
+                with torch.npu.stream(stream):
                     self._capture_graphs(
                         aclgraph_runtime_mode=CUDAGraphMode.FULL,
                         dp_metadata_list=dp_metadata_list,
@@ -486,22 +405,27 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             "Only DP metadata control plane supports graph capturing."
         )
         graph_key = self._make_graph_key(dp_metadata_list)
-        if graph_key in self._acl_graphs:
-            logger.debug(
-                "AFD NPU FFN ACL graph capture skipped for existing key=%s",
-                graph_key,
-            )
-            return
-
-        logger.debug("AFD NPU FFN capturing ACL graph for key=%s", graph_key)
-        graph = torch.npu.NPUGraph()
-        logger.debug("AFD NPU FFN created NPUGraph for key=%s", graph_key)
         self.connector.control_plane.update_state_from_dp_metadata(
             _make_dp_metadata_payload(
                 dp_metadata_list,
                 is_graph_capturing=is_attn_graph_capturing,
             ),
         )
+        if graph_key in self._acl_graphs:
+            logger.debug(
+                "AFD NPU FFN reusing ACL graph for Attention capture; key=%s",
+                graph_key,
+            )
+            # Distinct native Attention descriptors (or profiling and real
+            # capture) can have identical FFN shapes. Every A/F control payload
+            # still requires a matching FFN execution; a silent cache hit would
+            # leave Attention waiting on communication that was never submitted.
+            self._acl_graphs[graph_key]["graph"].replay()
+            return
+
+        logger.debug("AFD NPU FFN capturing ACL graph for key=%s", graph_key)
+        graph = torch.npu.NPUGraph()
+        logger.debug("AFD NPU FFN created NPUGraph for key=%s", graph_key)
         logger.debug("AFD NPU FFN updated connector state for key=%s", graph_key)
         with torch.npu.graph(graph, pool=self.graph_pool):
             logger.debug(
@@ -533,7 +457,14 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         stop_afd_npu_profiler(self.prof)
         if self.connector.is_initialized:
             self.connector.close()
-        super().shutdown()
+        from vllm.v1.worker.gpu.shutdown import free_before_shutdown
+
+        for graph_info in self._acl_graphs.values():
+            graph_info["graph"].reset()
+        self._acl_graphs.clear()
+        self.graph_pool = None
+        free_before_shutdown(self.vllm_config)
+        self.model = None
         self._is_shutdown = True
 
 
@@ -685,17 +616,12 @@ def _to_dp_level_token_counts(
     return num_tokens_across_dp[indices].contiguous()
 
 
-class _ACLGraphRunner(Protocol):
-    use_aclgraph: bool
-
-
-def _use_npu_aclgraph(vllm_config: VllmConfig, runner: _ACLGraphRunner) -> bool:
-    inherited = bool(runner.use_aclgraph)
+def _use_npu_aclgraph(vllm_config: VllmConfig) -> bool:
     if bool(vllm_config.model_config.enforce_eager):
         return False
 
     mode_name = vllm_config.compilation_config.cudagraph_mode.name
-    return inherited or mode_name in {
+    return mode_name in {
         "FULL",
         "FULL_AND_PIECEWISE",
         "FULL_DECODE_ONLY",

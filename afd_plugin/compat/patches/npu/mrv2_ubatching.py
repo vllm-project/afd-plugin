@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Scoped Ascend seams for vLLM ced6857a's native eager UBatchRunner.
+"""Scoped Ascend seams for vLLM ced6857a's native UBatchRunner.
 
 Ascend baseline: 8d4409d6256d8a6729140ddcc0d1889e3f96cdd6.
-MRV2 uses native preparation; MRV1 Async shares the native NPU contexts.
+MRV2 owns preparation, threads, handoff and graph lifecycle.
 All bindings are scoped to AFD runners and restored on exit.
 Remove when upstream supports Ascend child inputs, streams and cancellation.
 """
@@ -12,10 +12,11 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import ParallelConfig, VllmConfig
+from vllm.sequence import IntermediateTensors
 from vllm.utils import torch_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker import ubatching
@@ -302,3 +303,71 @@ def use_npu_ubatch_contexts() -> Iterator[None]:
         ubatching.UBatchContext = original_context
         ubatching.current_stream = original_stream
         ubatch_utils.current_stream = original_runner_stream
+
+
+@contextmanager
+def use_npu_model_io(vllm_config: VllmConfig) -> Iterator[None]:
+    """Keep native slicing/merging with the Ascend model's physical tensor layout."""
+    from afd_plugin.v1.worker.npu.model_io import (
+        cat_ubatch_outputs,
+        pp_transport_slice,
+    )
+
+    previous_slice = ubatch_utils.slice_model_inputs
+    previous_merge = ubatch_utils.merge_ubatch_outputs
+
+    # Patch reason: native slicing assumes every PP tensor uses global rows.
+    # Patch functionality: retain native input views and use the model's PP
+    # transport coordinates for IntermediateTensors. Signature matches
+    # slice_model_inputs at vLLM ced6857, gpu/ubatch_utils.py. Remove when native
+    # slicing accepts a model-specific transport layout callback.
+    def slice_model_inputs(
+        model_inputs: dict[str, Any], token_slice: slice
+    ) -> dict[str, Any]:
+        sliced = dict(model_inputs)
+        input_ids = model_inputs.get("input_ids")
+        if input_ids is not None:
+            sliced["input_ids"] = input_ids[token_slice]
+        inputs_embeds = model_inputs.get("inputs_embeds")
+        if inputs_embeds is not None:
+            sliced["inputs_embeds"] = inputs_embeds[token_slice]
+        positions = model_inputs.get("positions")
+        if positions is not None:
+            sliced["positions"] = (
+                positions[:, token_slice]
+                if positions.ndim == 2
+                else positions[token_slice]
+            )
+        intermediate_tensors = model_inputs.get("intermediate_tensors")
+        if intermediate_tensors is not None:
+            # ### PATCH START: model-specific PP wire coordinates.
+            sliced["intermediate_tensors"] = intermediate_tensors[
+                pp_transport_slice(vllm_config, token_slice)
+            ]
+            # ### PATCH END: model-specific PP wire coordinates.
+        return sliced
+
+    # Patch reason: Ascend auxiliary outputs are (Tensor, list[Tensor]), which
+    # native torch.cat(parts) cannot concatenate. Preserve the native PP mapping
+    # and tensor merge, adapting only that nested contract. Signature matches
+    # merge_ubatch_outputs at ced6857. Remove when upstream handles nested aux.
+    def merge_ubatch_outputs(outputs: list[Any]) -> Any:
+        first = outputs[0]
+        if isinstance(first, IntermediateTensors):
+            return IntermediateTensors(
+                {
+                    key: torch.cat([out.tensors[key] for out in outputs], dim=0)
+                    for key in first.tensors
+                }
+            )
+        # ### PATCH START: Ascend nested auxiliary outputs.
+        return cat_ubatch_outputs(outputs)
+        # ### PATCH END: Ascend nested auxiliary outputs.
+
+    try:
+        ubatch_utils.slice_model_inputs = slice_model_inputs
+        ubatch_utils.merge_ubatch_outputs = merge_ubatch_outputs
+        yield
+    finally:
+        ubatch_utils.slice_model_inputs = previous_slice
+        ubatch_utils.merge_ubatch_outputs = previous_merge

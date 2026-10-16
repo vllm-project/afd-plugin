@@ -57,8 +57,8 @@ See the [recipe index](recipe/README.md) for deployment and benchmark examples.
 | Connector | Platform | Recommend Stage | Sync or Async | Graph Support | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `P2pNcclAFDConnector` | CUDA | Decode | Sync | `FULL_DECODE_ONLY` CUDA graph | FFN ranks are ordered before Attention ranks. `num_attention_ranks` must be greater than or equal to `num_ffn_ranks`; the Attention ranks are spread over the FFN ranks in blocks that differ in size by at most one. See the [DeepSeek V2 Lite recipe](recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md). |
-| `CAMP2pAFDConnector` | Ascend NPU | Decode | Sync | V1 `FULL_DECODE_ONLY`; V2 also `FULL` | Uses HCCL/CAMP2P custom ops. V2 DBO is eager-only with two ubatches and Attention DP > 1. See the [CAMP2P guide](docs/npu/CAM_P2P_CONNECTOR_USER_GUIDE.md). |
-| `CAMAsyncAFDConnector` | Ascend NPU | Prefill / decode | Async | Not supported | Experimental eager DP+TP/SP path with native two-microbatch DBO on Attention, including DP1. FFN remains connector-driven; PCP/DCP are unsupported. See the [Async CAM guide](docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md) for configuration and validation limits. |
+| `CAMP2pAFDConnector` | Ascend NPU | Decode | Sync | `FULL` or `FULL_DECODE_ONLY`; plain MLA graph DBO requires `FULL_DECODE_ONLY` | Uses HCCL/CAMP2P custom ops and native MRV2. DBO requires two ubatches and Attention DP > 1. See the [CAMP2P guide](docs/npu/CAM_P2P_CONNECTOR_USER_GUIDE.md). |
+| `CAMAsyncAFDConnector` | Ascend NPU | Prefill / decode | Async | FFN-only experimental `FULL` | Eager Attention supports DP+TP/SP and two native DBO microbatches, including DP1. FFN FULL requires the [W4A8 runtime contract](docs/npu/ASYNC_FFN_RUNTIME.md) with DBO disabled; PCP/DCP are unsupported. See the [Async CAM guide](docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md) for configuration and validation limits. |
 
 Connector implementations are grouped by backend package:
 `afd_plugin.connectors.gpu` for GPU-only connectors,
@@ -84,9 +84,10 @@ Known gaps:
   equivalence; see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix) for the recorded GPU evidence and separate NPU DBO constraints.
 - GPU and NPU E2E tests are opt-in and require real hardware plus model weights.
 - GPU CUDA graph support is limited to `FULL_DECODE_ONLY`.
-- Native DBO is limited to exactly two ubatches. NPU MRV2 DBO requires eager
-  execution; Async CAM enables DBO only on Attention. Its current native DBO
-  path still needs target-device model qualification.
+- Native DBO is limited to exactly two ubatches. NPU CAMP2P supports eager
+  and graph DBO; Async CAM enables eager DBO only on Attention. Async FFN
+  FULL does not support DBO. Model evidence remains specific to its workload
+  and topology.
 - Qwen3 MoE currently rejects Attention-side gate placement, sequence-parallel
   MoE, EPLB, pipeline parallelism, speculative decoding, LoRA, and NPU.
 - Qwen3.5/Qwen3.6 MoE adapter-family support is limited to the CUDA text-only
@@ -200,9 +201,9 @@ or standard Ascend NPU platform. Explicit AFD worker paths remain accepted for
 compatibility with existing commands, but are not required or stable launch
 interfaces.
 
-GPU launches require `VLLM_USE_V2_MODEL_RUNNER=1` on both roles. Attention
-uses native ModelRunnerV2; FFN keeps its connector-driven runner. There is no
-GPU V1 fallback. DBO requires exactly two microbatches and accepts Attention
+GPU and NPU launches require `VLLM_USE_V2_MODEL_RUNNER=1` on both roles.
+Attention uses native ModelRunnerV2; FFN keeps its connector-driven runner.
+Neither backend has a V1 fallback. GPU DBO requires two microbatches and accepts Attention
 DP1 or DP > 1. The DP1 path has H20 DeepSeek-V2-Lite DP1/TP2 Graph + DBO
 validation recorded in [PR #454](https://github.com/vllm-project/afd-plugin/pull/454).
 See the [dedicated E2E scenarios](tests/e2e/README.md#gpu-mrv2-dbo-development-comparison).
@@ -240,10 +241,10 @@ vllm serve /path/to/DeepSeek-V2-Lite \
 ```
 
 NPU uses the same config channel with `CAMP2pAFDConnector`; the plugin selects
-the NPU worker automatically. This example retains the NPU V1 runner:
+the NPU worker automatically. Attention uses native Ascend ModelRunnerV2:
 
 ```bash
-VLLM_USE_V2_MODEL_RUNNER=0 vllm serve /path/to/DeepSeek-V2-Lite \
+VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /path/to/DeepSeek-V2-Lite \
   --served-model-name deepseek-v2-lite-afd-attention \
   --data-parallel-size 1 \
   --tensor-parallel-size 1 \

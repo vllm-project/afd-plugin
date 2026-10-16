@@ -4,7 +4,12 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from afd_plugin.distributed import subgroup_attention_block
+
+if TYPE_CHECKING:
+    from vllm.forward_context import ForwardContext
 
 
 def aggregate_ffn_token_counts(
@@ -74,3 +79,15 @@ def project_ffn_token_counts_to_dp(
 
 
 __all__ = ["aggregate_ffn_token_counts", "project_ffn_token_counts_to_dp"]
+
+
+def _set_moe_layer_index(forward_context: ForwardContext, layer_idx: int) -> None:
+    all_moe_layers = forward_context.all_moe_layers
+    if not all_moe_layers:
+        return
+
+    target = f".layers.{int(layer_idx)}."
+    for idx, layer_name in enumerate(all_moe_layers):
+        if target in f".{layer_name}.":
+            forward_context.moe_layer_index = idx
+            return

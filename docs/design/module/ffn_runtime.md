@@ -25,7 +25,6 @@ validation_paths:
   - "tests/unit/v1/worker/test_ffn_metadata.py"
   - "tests/unit/v1/worker/test_ffn_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
-  - "tests/unit/v1/worker/test_npu_device_contract.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
   - "tests/unit/compat/patches/test_engine_core.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
@@ -76,13 +75,16 @@ Attention.
 | Platform | Worker | Model runner | Current connectors |
 | --- | --- | --- | --- |
 | CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `GPUFFNModelRunner` | `P2pNcclAFDConnector` |
-| NPU | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | `AFDNPUFFNModelRunner` | `CAMP2pAFDConnector`, `CAMAsyncAFDConnector` |
+| NPU | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | `AFDNPUFFNModelRunner` (sync) or `AsyncNPUFFNModelRunner` | `CAMP2pAFDConnector`, `CAMAsyncAFDConnector` |
 
-GPU and NPU runtimes use separate internal class paths. `AFDNPUFFNModelRunner`
-inherits vLLM-Ascend `NPUModelRunner` directly instead of inheriting the GPU
-`GPUFFNModelRunner`. Shared AFD semantics are kept in config, connector,
-metadata, validation, and small helper functions rather than through a
-cross-device inheritance chain.
+GPU and NPU FFN runners are independent, connector-driven owners. Ascend
+selects the synchronous or Async runner from the connector, with no MRV1
+inheritance or fallback. Native model loading owns weight materialization and
+quantization postprocessing. The runner explicitly initializes Ascend MC2
+capacity/masks before construction, accounts for loaded memory, executes FFN
+work, and owns its graphs, profiler and cleanup. Request/KV/sampling state
+remains on Attention. Shared semantics live in configuration, metadata,
+validation and small helpers.
 
 CUDA launch shape:
 
@@ -94,7 +96,7 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /path/to/model \
 Ascend launch shape:
 
 ```bash
-VLLM_PLUGINS=ascend,afd vllm serve /path/to/model \
+VLLM_PLUGINS=ascend,afd VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /path/to/model \
   --additional-config '{"afd":{"role":"ffn","connector":"CAMP2pAFDConnector","host":"127.0.0.1","port":1239,"num_attention_ranks":1,"num_ffn_ranks":1}}'
 ```
 
@@ -105,7 +107,7 @@ The common FFN initialization sequence is:
 ```text
 vLLM worker construction
   -> validate AFD config, role, connector, and selected worker class
-  -> validate the paired CUDA V2 or NPU V1/V2 deployment contract
+  -> validate the paired native V2 deployment contract
   -> initialize the matching upstream device worker
   -> construct the AFD FFN model runner
   -> derive the role-local AFD rank from DP/TP ranks when needed
@@ -131,15 +133,15 @@ connector owns transport/process-group resources.
 
 ## ModelRunnerV2 pairing
 
-GPU requires ModelRunnerV2 on both roles. FFN remains connector-driven and
+CUDA and Ascend require ModelRunnerV2 on both roles. FFN remains connector-driven and
 does not adopt native V2 request state or scheduler-driven execution:
 
 - CUDA temporarily substitutes `GPUFFNModelRunner` at the native V2
   construction seam inside `Worker.init_device()`; the existing AFD runner is
   still the runtime object.
-- Ascend always constructs `AFDNPUFFNModelRunner`. When V2 is selected, its
-  connector-driven forward enters the upstream MRV2 forward-context shape so
-  Ascend-specific state is installed in `additional_kwargs`.
+- Ascend constructs `AFDNPUFFNModelRunner` for CAMP2P or
+  `AsyncNPUFFNModelRunner` for Async CAM. Both use the native MRV2
+  forward-context shape and install Ascend state in `additional_kwargs`.
 - Both workers run the same V2 topology and feature validator as the paired
   Attention role before constructing communication resources.
 
@@ -149,9 +151,10 @@ model-specific gate placement and supports two native microbatches with
 Attention DP1 or DP > 1. H20 validation covers DeepSeek-V2-Lite DP1/TP2
 Graph + DBO with 128 GSM8K samples and live two-stage/full-replay assertions.
 Ascend supports synchronous CAMP2P with FFN-side gating, or eager Async CAM
-with Attention-side gating. Ascend V2 DBO is eager-only: CAMP2P requires
-Attention DP > 1 and matching two-stage FFN control metadata; Async CAM also
-supports Attention DP1 but rejects native DBO flags on FFN. Async FFN continues
+with Attention-side gating. CAMP2P supports eager and graph DBO with
+Attention DP > 1 and matching two-stage FFN control metadata. Async CAM
+supports eager Attention DBO at DP1 or DP > 1, and rejects native DBO flags on
+FFN. Async FFN FULL requires DBO disabled on every rank. Async FFN continues
 to receive work items independently of Attention's threads. These limits
 describe the pair even though only Attention inherits a native V2 runner.
 
@@ -224,8 +227,11 @@ control-plane receive. For each layer, the runner:
    A layer is complete only when the received interval ends at the final
    local expert; earlier intervals continue the receive loop.
 
-CAM async is eager-only and does not use the FFN graph-control path; the graph
-cache is keyed by DP metadata, which does not exist without a control plane.
+Async eager does not use the synchronous DP-metadata graph cache. Its FULL
+mode captures a complete original DR/FFN/CS transaction with device-side layer
+selection. The independent Async runner owns one graph and stable resources;
+see [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md) for startup, supported
+W4A8 configuration and the original receiver's process-cleanup boundary.
 
 With `AFD_ASYNC_CAM_LAYERED_GMM=1`, eligible DeepSeek-V4 W4A8 layers instead
 use `AsyncCAMW4A8Executor`: the runner passes capacity-sized payloads, device

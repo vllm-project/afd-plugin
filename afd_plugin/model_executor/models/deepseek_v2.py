@@ -885,11 +885,13 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         )
 
     def get_experts_layer_indices(self) -> tuple[int, ...]:
+        # Async NPU FFN and CUDA remote-expert execution share this inventory.
+        # uses_remote_experts selects a CUDA-specific construction path; it
+        # does not describe whether an NPU decoder contains routed experts.
         return tuple(
             layer_idx
             for layer_idx, layer in enumerate(self.layers)
-            if isinstance(layer, AFDDeepseekV2DecoderLayer)
-            and layer.uses_remote_experts
+            if isinstance(layer, AFDDeepseekV2DecoderLayer) and layer.is_moe_layer
         )
 
     def get_experts_routing_spec(

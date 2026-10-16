@@ -36,22 +36,23 @@ Ordinary cases evaluate the first 7 GSM8K samples; DBO cases have a
 24-sample minimum and 12 concurrent requests. The GPU DP2 eager/eager-DBO/
 graph-DBO comparison retains 128 samples, concurrency 12 and the 0.27
 accuracy threshold. GPU cases check accuracy, service liveness and cleanup.
-AFD GPU graph/DBO cases also load a test-only worker extension: after readiness
+AFD GPU and NPU graph/DBO cases load a test-only worker extension: after readiness
 the harness resets Attention counters through native collective RPC, then creates
 a shared marker to arm FFN at its next call entry. Attention reports through RPC
 after evaluation; a completion marker requests FFN summaries through its existing
 periodic worker health RPC. The harness waits for every rank while checking
 service liveness, with a 30-second limit, before teardown.
 The marker is removed after process cleanup. FFN does not service HTTP utilities.
-Every Attention/FFN rank must report
-the requested replay or two-stage execution. DBO requires matching A/F layouts;
+Every participating rank must report the requested replay or two-stage
+execution. Synchronous DBO requires matching A/F layouts; Async CAM verifies
+Attention replicas independently because their DP layouts may differ.
 graph+DBO requires consecutive completed two-stage replays of the same layout.
 Dummy/profile/capture work and empty second microbatches do not qualify.
 There is no per-step logging or runner-class
 identity check. Pure eager and native baseline cases do not load this extension;
-performance comparisons must omit it. NPU DBO
-retains its live split check (see the accuracy gate in
-`docs/design/module/e2e_testing.md`). If `AFD_E2E_DEVICES` is set, that value
+performance comparisons must omit it. NPU synchronous graph+DBO requires
+completed joint two-stage replays, rather than separate graph/split counters.
+Async DBO requires two nonempty Attention stages during evaluation. If `AFD_E2E_DEVICES` is set, that value
 is used as-is; otherwise the defaults are:
 
 - `0,1,2,3` for the gate scenarios. DeepSeek DP2 cases use the first two for
@@ -254,6 +255,9 @@ CAM uses `dynamicQuant=1`, Attention-side gating, and the legacy
 `async_moe_ubatching` flag, which enables two native DBO children on
 Attention. The retained `async_moe_split="token"` field is ignored by the
 current runtime. Native DBO requires target-device validation.
+The ten short prompts below do not guarantee the native DBO thresholds are
+reached. This case retains its original concurrent-answer and cleanup oracle;
+DSV4 DSA DBO requires separate live above-threshold qualification.
 FlashComm1 is enabled only on Attention. CPU binding and
 128-thread weight loading follow the reference prefill scripts. Prefix
 caching and KV transfer are not enabled; FFN does not enable native DBO.
@@ -276,7 +280,7 @@ async CAM cleanup exception.
 ```bash
 export AFD_E2E_BACKEND=npu
 export AFD_E2E_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-export AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V4-Flash-w8a8-mtp
+export AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V4-Flash-W4A8
 export HCCL_IF_IP='<local-communication-ip>'
 export HCCL_SOCKET_IFNAME=eth0
 python -m pytest -q -s \
@@ -395,7 +399,7 @@ test.
 ## NPU async CAM ubatching test
 
 This case runs the `afd-async-ubatch` scenario (`CAMAsyncAFDConnector` with
-AFD-managed two-stage MoE token-split ubatching). It uses three NPUs: the first
+native MRV2 two-stage DBO on Attention). It uses three NPUs: the first
 two for Attention DP=1/TP=2, and the last one for FFN DP=1/TP=1. Unlike the
 smoke test above, it reuses the shared runner's GSM8K path with batch size 2
 (first 7 samples, 8-shot, sample-count and accuracy gates).

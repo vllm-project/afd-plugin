@@ -17,9 +17,6 @@ from afd_plugin.compat.npu import (
 )
 from afd_plugin.compat.npu.runtime_config import configure_async_cam_dbo
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
-from afd_plugin.v1.worker.npu.attention_model_runner import (
-    AFDNPUAttentionModelRunner,
-)
 from afd_plugin.v1.worker.npu.attention_model_runner_v2 import (
     AFDNPUAttentionModelRunnerV2,
 )
@@ -49,12 +46,11 @@ class AFDNPUAttentionWorker(NPUWorker):
         configure_async_cam_dbo(self.vllm_config)
         fail_if_unsupported_npu_afd_features(self.vllm_config)
         fix_all2all_backend_for_afd(self.vllm_config)
-        if self.use_v2_model_runner:
-            validate_npu_model_runner_v2_config(
-                self.vllm_config,
-                expected_role="attention",
-                device_type="npu",
-            )
+        validate_npu_model_runner_v2_config(
+            self.vllm_config,
+            expected_role="attention",
+            device_type="npu",
+        )
 
         self.device = self._init_device()
         init_workspace_manager(
@@ -65,12 +61,7 @@ class AFDNPUAttentionWorker(NPUWorker):
             self.vllm_config.model_config,
             device_type="npu",
         )
-        runner_cls = (
-            AFDNPUAttentionModelRunnerV2
-            if self.use_v2_model_runner
-            else AFDNPUAttentionModelRunner
-        )
-        self.model_runner = runner_cls(
+        self.model_runner = AFDNPUAttentionModelRunnerV2(
             self.vllm_config,
             self.device,
         )

@@ -40,7 +40,8 @@ AFD_TWO_FFN_DEVICE_COUNT = 2
 BASELINE_DEVICE_COUNT = 4
 TWO_FFN_SCENARIO_SUFFIX = "-2a2f"
 # CI selects exact node IDs (E2E-INV-007). GPU uses the V2 cases for the
-# shared 2A2F coverage; NPU retains its existing backend-neutral cases.
+# shared 2A2F coverage; NPU retains its existing scenario IDs and now runs
+# every case on native Ascend MRV2 through the shared harness.
 SCENARIOS = (
     "baseline-graph",
     *(

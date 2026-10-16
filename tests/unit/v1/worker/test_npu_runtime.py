@@ -3,16 +3,12 @@
 
 from __future__ import annotations
 
-import importlib
-import inspect
 import logging
-import sys
 import threading
 from collections import deque
-from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
-from types import MethodType, ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,34 +22,10 @@ from afd_plugin.connectors import (
     AFDA2FTransferPayload,
     AFDControlPayload,
     AFDF2ATransferPayload,
-    AFDForwardContextMetadata,
     AFDTransferContext,
     AFDTransferMetadata,
     AFDTransferState,
 )
-
-
-@contextmanager
-def _temporarily_reimport_module(module_name: str) -> Iterator[ModuleType]:
-    """Reimport a module without leaking it through its parent package."""
-    package_name, _, module_attribute = module_name.rpartition(".")
-    package = importlib.import_module(package_name)
-    missing_attribute = object()
-    original_package_attribute = package.__dict__.get(
-        module_attribute,
-        missing_attribute,
-    )
-    original_module = sys.modules.pop(module_name, None)
-    try:
-        yield importlib.import_module(module_name)
-    finally:
-        sys.modules.pop(module_name, None)
-        if original_module is not None:
-            sys.modules[module_name] = original_module
-        if original_package_attribute is missing_attribute:
-            package.__dict__.pop(module_attribute, None)
-        else:
-            package.__dict__[module_attribute] = original_package_attribute
 
 
 def _ffn_payload(hidden_states, metadata, states=None):
@@ -231,7 +203,7 @@ def _vllm_config(
     connector="CAMP2pAFDConnector",
     extra_config=None,
     use_mla=False,
-    use_v2_model_runner=False,
+    use_v2_model_runner=True,
     cudagraph_mode="FULL",
     speculative_config=None,
     **parallel_overrides,
@@ -289,6 +261,7 @@ def _async_moe_config(
     return _vllm_config(
         role=role,
         connector="CAMAsyncAFDConnector",
+        use_mla=True,
         async_dp=True,
         compute_gate_on_attention=compute_gate_on_attention,
         num_attention_ranks=num_attention_ranks,
@@ -310,612 +283,15 @@ def _require_npu_runtime():
     pytest.importorskip("torch_npu", reason="NPU runtime tests require torch-npu")
 
 
-def test_npu_v1_runner_signatures_match_pinned_ascend():
-    _require_npu_runtime()
-    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-
-    from afd_plugin.v1.worker.npu.attention_model_runner import (
-        AFDNPUAttentionModelRunner,
-    )
-
-    for method_name in ("_dummy_run", "_build_attention_metadata"):
-        assert inspect.signature(
-            getattr(AFDNPUAttentionModelRunner, method_name),
-            eval_str=True,
-        ) == inspect.signature(
-            getattr(NPUModelRunner, method_name),
-            eval_str=True,
-        )
-
-
-def test_npu_dummy_gdn_skip_uses_native_runner(monkeypatch):
-    _require_npu_runtime()
-    import torch
-    from vllm.v1.worker.ubatch_utils import UBatchSlice
-    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-
-    runner = _new_attention_runner()
-    runner.vllm_config = _vllm_config(use_ubatching=True)
-    runner._afd_is_graph_capturing = False
-    runner._is_warmup = False
-    runner.connector = _RecordingConnector()
-    # The idle step can follow a two-stage graph capture or live batch.
-    runner.ubatch_slices = [
-        UBatchSlice(slice(0, 1), slice(0, 4)),
-        UBatchSlice(slice(1, 2), slice(4, 8)),
-    ]
-    native_calls = []
-
-    def unexpected_stage_collective(_slices):
-        pytest.fail("native unsplit dummy must not enter a stage-count collective")
-
-    runner._build_ubatch_dp_metadata = unexpected_stage_collective
-
-    def native_dummy_run(self, num_tokens, **kwargs):
-        native_calls.append((num_tokens, kwargs))
-        sent = self._send_dp_metadata(
-            _FakeDPMetadata(torch.tensor([num_tokens, num_tokens])),
-            self.ubatch_slices,
-        )
-        assert list(sent) == [0]
-        return "native", "dummy"
-
-    monkeypatch.setattr(NPUModelRunner, "_dummy_run", native_dummy_run)
-    assert runner._dummy_run(4, skip_gdn_state_update=True) == ("native", "dummy")
-    assert native_calls[0][0] == 4
-    assert native_calls[0][1]["skip_gdn_state_update"] is True
-    assert native_calls[0][1]["allow_microbatching"] is False
-    assert runner._afd_is_graph_capturing is False
-
-
-def test_npu_target_dummy_metadata_is_forwarded_to_native_builder(monkeypatch):
-    _require_npu_runtime()
-    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-
-    runner = _new_attention_runner()
-    runner._build_afd_metadata = lambda *_args: "afd"
-    native_calls = []
-
-    def native_builder(self, **kwargs):
-        native_calls.append(kwargs)
-        return {"layer": "native"}, None
-
-    monkeypatch.setattr(NPUModelRunner, "_build_attention_metadata", native_builder)
-    result = runner._build_attention_metadata(
-        num_tokens=4,
-        num_reqs=1,
-        max_query_len=4,
-        offload_dummy=True,
-    )
-    assert result == ({"layer": "native"}, None)
-    assert native_calls[0]["offload_dummy"] is True
-    assert runner._afd_pending_metadata == "afd"
-
-
-@pytest.mark.parametrize("model_raises", [False, True])
-def test_npu_model_forward_releases_device_metadata(monkeypatch, model_raises):
-    _require_npu_runtime()
-    from vllm.config import CUDAGraphMode
-
-    from afd_plugin.v1.worker.npu import attention_model_runner
-
-    events = []
-
-    class FakeModel:
-        def set_attn_backend(self, backend):
-            events.append(("backend", backend))
-
-        def __call__(self, **kwargs):
-            events.append(("model", kwargs))
-            if model_raises:
-                raise RuntimeError("model failed")
-            return "hidden_states"
-
-    executor = SimpleNamespace(
-        submission_in_flight=True,
-        release=lambda: events.append(("release", None)),
-    )
-    forward_context = SimpleNamespace(
-        cudagraph_runtime_mode=CUDAGraphMode.FULL,
-        device_metadata_executor=executor,
-    )
-    monkeypatch.setattr(
-        attention_model_runner,
-        "get_forward_context",
-        lambda: forward_context,
-    )
-    runner = _new_attention_runner()
-    runner.model = FakeModel()
-    runner.attn_backend = "target"
-    runner.enable_enpu = False
-    runner.ubatch_slices = None
-    runner._install_afd_metadata_on_forward_context = lambda _context: None
-    runner._install_async_moe_ubatch_metadata_on_forward_context = lambda _context: None
-    runner._update_full_graph_params_if_needed = lambda *_args: events.append(
-        ("graph", None)
-    )
-
-    if model_raises:
-        with pytest.raises(RuntimeError, match="model failed"):
-            runner._model_forward(2)
-        assert [event[0] for event in events] == ["backend", "model", "release"]
-    else:
-        assert runner._model_forward(2) == "hidden_states"
-        assert [event[0] for event in events] == [
-            "backend",
-            "model",
-            "graph",
-            "release",
-        ]
-
-
 def _new_attention_runner():
     _require_npu_runtime()
-    from afd_plugin.v1.worker.npu.attention_model_runner import (
-        AFDNPUAttentionModelRunner,
+    from afd_plugin.v1.worker.npu.attention_model_runner_v2 import (
+        AFDNPUAttentionModelRunnerV2,
     )
 
-    runner = object.__new__(AFDNPUAttentionModelRunner)
+    runner = object.__new__(AFDNPUAttentionModelRunnerV2)
     runner.vllm_config = _vllm_config()
     return runner
-
-
-def test_npu_attention_live_execution_scope_restores_on_success_and_error(
-    monkeypatch,
-):
-    _require_npu_runtime()
-    from afd_plugin.v1.worker.npu import attention_model_runner
-
-    runner = _new_attention_runner()
-    runner.prof = None
-    runner._afd_live_execution = False
-    observed_live_state = []
-
-    monkeypatch.setattr(
-        attention_model_runner,
-        "step_afd_npu_profiler",
-        lambda _prof: None,
-    )
-
-    def execute_success(_runner, _scheduler_output, _intermediate_tensors=None):
-        observed_live_state.append(_runner._afd_live_execution)
-        return "success"
-
-    monkeypatch.setattr(
-        attention_model_runner.NPUModelRunner,
-        "execute_model",
-        execute_success,
-    )
-    assert runner.execute_model(object()) == "success"
-    assert observed_live_state == [True]
-    assert runner._afd_live_execution is False
-
-    def execute_failure(_runner, _scheduler_output, _intermediate_tensors=None):
-        observed_live_state.append(_runner._afd_live_execution)
-        raise RuntimeError("execute failure")
-
-    monkeypatch.setattr(
-        attention_model_runner.NPUModelRunner,
-        "execute_model",
-        execute_failure,
-    )
-    with pytest.raises(RuntimeError, match="execute failure"):
-        runner.execute_model(object())
-    assert observed_live_state == [True, True]
-    assert runner._afd_live_execution is False
-
-
-def test_npu_attention_non_live_execution_disables_microbatching(monkeypatch):
-    _require_npu_runtime()
-    import numpy as np
-    from vllm.config import CUDAGraphMode
-    from vllm.forward_context import BatchDescriptor
-
-    from afd_plugin.v1.worker.npu import attention_model_runner
-
-    runner = _new_attention_runner()
-    runner._afd_live_execution = False
-    runner._pad_for_sequence_parallelism = lambda num_tokens: num_tokens
-    runner.input_batch = SimpleNamespace(
-        num_computed_tokens_cpu=np.ones(4, dtype=np.int32),
-        lora_id_to_lora_request={},
-    )
-    runner.speculative_config = None
-    runner.uniform_decode_query_len = 1
-    runner.model_config = SimpleNamespace(is_encoder_decoder=False)
-    runner.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            data_parallel_size=1,
-            tensor_parallel_size=1,
-        ),
-        observability_config=SimpleNamespace(cudagraph_metrics=False),
-    )
-    runner.cudagraph_dispatcher = SimpleNamespace(
-        dispatch=lambda **kwargs: (
-            CUDAGraphMode.NONE,
-            BatchDescriptor(kwargs["num_tokens"]),
-        ),
-    )
-    monkeypatch.setattr(attention_model_runner, "enable_sp", lambda _config: False)
-    monkeypatch.setattr(
-        attention_model_runner,
-        "check_enable_ubatch",
-        lambda *_args, **_kwargs: True,
-    )
-
-    result = runner._determine_batch_execution_and_padding(
-        num_tokens=4,
-        num_reqs=4,
-        num_scheduled_tokens_np=np.ones(4, dtype=np.int32),
-        max_num_scheduled_tokens=1,
-        use_cascade_attn=False,
-        allow_microbatching=False,
-    )
-    assert result[2] is False
-
-    runner._afd_live_execution = True
-    result = runner._determine_batch_execution_and_padding(
-        num_tokens=4,
-        num_reqs=4,
-        num_scheduled_tokens_np=np.ones(4, dtype=np.int32),
-        max_num_scheduled_tokens=1,
-        use_cascade_attn=False,
-        allow_microbatching=False,
-    )
-    assert result[2] is True
-
-
-@pytest.mark.parametrize(
-    ("should_ubatch", "use_mla", "live_execution", "expected_mode"),
-    [
-        (True, True, True, "NONE"),
-        (False, True, True, "FULL"),
-        (True, False, True, "FULL"),
-        (True, True, False, "FULL"),
-    ],
-)
-def test_npu_mla_dbo_uses_eager_runtime_for_full_graph_dispatch(
-    monkeypatch, should_ubatch, use_mla, live_execution, expected_mode
-):
-    _require_npu_runtime()
-    import numpy as np
-    from vllm.config import CUDAGraphMode
-    from vllm.forward_context import BatchDescriptor
-
-    from afd_plugin.v1.worker.npu import attention_model_runner
-
-    runner = _new_attention_runner()
-    runner._afd_live_execution = live_execution
-    runner._is_warmup = False
-    runner._afd_is_graph_capturing = False
-    runner._pad_for_sequence_parallelism = lambda num_tokens: num_tokens
-    runner.input_batch = SimpleNamespace(
-        num_computed_tokens_cpu=np.ones(4, dtype=np.int32),
-        lora_id_to_lora_request={},
-    )
-    runner.speculative_config = None
-    runner.uniform_decode_query_len = 1
-    runner.model_config = SimpleNamespace(
-        is_encoder_decoder=False,
-        use_mla=use_mla,
-    )
-    runner.use_sparse = False
-    runner.use_compress = False
-    runner.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(data_parallel_size=1),
-        observability_config=SimpleNamespace(cudagraph_metrics=False),
-    )
-    runner.cudagraph_dispatcher = SimpleNamespace(
-        dispatch=lambda **_kwargs: (CUDAGraphMode.FULL, BatchDescriptor(8)),
-    )
-    monkeypatch.setattr(attention_model_runner, "enable_sp", lambda _config: False)
-    monkeypatch.setattr(
-        attention_model_runner,
-        "check_enable_ubatch",
-        lambda *_args, **_kwargs: should_ubatch,
-    )
-
-    runtime_mode, descriptor, actual_ubatch, _, _ = (
-        runner._determine_batch_execution_and_padding(
-            num_tokens=4,
-            num_reqs=4,
-            num_scheduled_tokens_np=np.ones(4, dtype=np.int32),
-            max_num_scheduled_tokens=1,
-            use_cascade_attn=False,
-            allow_microbatching=not live_execution,
-        )
-    )
-
-    assert runtime_mode == CUDAGraphMode[expected_mode]
-    assert descriptor.num_tokens == 8
-    assert actual_ubatch is should_ubatch
-
-
-@pytest.mark.parametrize(
-    ("connector_name", "skip_dp_sync", "expected_counts"),
-    [
-        ("CAMP2pAFDConnector", False, [8, 8]),
-        ("CAMP2pAFDConnector", True, [8, 8]),
-        ("CAMAsyncAFDConnector", False, [8, 1]),
-        ("CAMAsyncAFDConnector", True, [1, 1]),
-    ],
-)
-def test_npu_eager_camp2p_aligns_uneven_dp_tokens(
-    monkeypatch, connector_name, skip_dp_sync, expected_counts
-):
-    _require_npu_runtime()
-    import numpy as np
-    import torch
-    from vllm.config import CUDAGraphMode
-    from vllm.forward_context import BatchDescriptor
-
-    from afd_plugin.v1.worker.npu import attention_model_runner as module
-
-    runner = _new_attention_runner()
-    runner._afd_live_execution = True
-    runner.dp_size = 2
-    runner.dp_rank = 1
-    runner.connector = SimpleNamespace(control_plane=object())
-    runner.afd_config = SimpleNamespace(connector=connector_name)
-    runner.parallel_config = SimpleNamespace(
-        data_parallel_size=2,
-        data_parallel_rank=1,
-        tensor_parallel_size=1,
-        enable_dbo=False,
-        use_ubatching=False,
-    )
-    runner.vllm_config = SimpleNamespace(
-        parallel_config=runner.parallel_config,
-        observability_config=SimpleNamespace(cudagraph_metrics=False),
-    )
-    runner.model_config = SimpleNamespace(is_encoder_decoder=False)
-    runner.speculative_config = None
-    runner.uniform_decode_query_len = 1
-    runner.input_batch = SimpleNamespace(
-        num_computed_tokens_cpu=np.ones(1, dtype=np.int32),
-        lora_id_to_lora_request={},
-    )
-    runner._pad_for_sequence_parallelism = lambda num_tokens: num_tokens
-    runner.cudagraph_dispatcher = SimpleNamespace(
-        dispatch=lambda **kwargs: (
-            CUDAGraphMode.NONE,
-            BatchDescriptor(kwargs["num_tokens"]),
-        ),
-    )
-    for name in (
-        "enable_sp",
-        "oproj_tp_enable",
-        "embedding_tp_enable",
-        "check_enable_ubatch",
-    ):
-        monkeypatch.setattr(module, name, lambda *args, **kwargs: False)
-    monkeypatch.setattr(
-        module,
-        "should_skip_allreduce_across_dp_group",
-        lambda *args, **kwargs: skip_dp_sync,
-    )
-    monkeypatch.setattr(module, "get_dp_group", lambda: SimpleNamespace(cpu_group=None))
-
-    def sync_dp_counts(packed_counts, group):
-        packed_counts[:, 0] = torch.tensor([8, 8, CUDAGraphMode.NONE.value, 1, 1])
-
-    monkeypatch.setattr(module.dist, "all_reduce", sync_dp_counts)
-    _, descriptor, should_ubatch, token_counts, _ = (
-        runner._determine_batch_execution_and_padding(
-            num_tokens=1,
-            num_reqs=1,
-            num_scheduled_tokens_np=np.ones(1, dtype=np.int32),
-            max_num_scheduled_tokens=1,
-            use_cascade_attn=False,
-        )
-    )
-    assert should_ubatch is False
-    assert token_counts.tolist() == expected_counts
-    assert descriptor.num_tokens == expected_counts[1]
-
-
-def _run_npu_dp_stage_protocol(rank, rendezvous):
-    """Exercise real Gloo collectives and final control payloads without a model."""
-    from datetime import timedelta
-
-    import numpy as np
-    import torch.distributed as dist
-    import vllm_ascend.ops  # noqa: F401 - spawn does not run tests/conftest.py
-    from vllm.config import CUDAGraphMode
-    from vllm.forward_context import BatchDescriptor, DPMetadata
-
-    from afd_plugin.v1.worker.npu import attention_model_runner as module
-    from afd_plugin.v1.worker.npu.ubatch_utils import maybe_create_ubatch_slices
-
-    dist.init_process_group(
-        "gloo",
-        init_method=rendezvous,
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=30),
-    )
-    try:
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(
-                module,
-                "get_dp_group",
-                lambda: SimpleNamespace(cpu_group=dist.group.WORLD),
-            )
-            patch.setattr(
-                module, "should_skip_allreduce_across_dp_group", lambda *_: True
-            )
-            for name in ("enable_sp", "oproj_tp_enable", "embedding_tp_enable"):
-                patch.setattr(module, name, lambda *_: False)
-            patch.setattr(
-                module.NPUModelRunner,
-                "_build_attention_metadata",
-                lambda *a, **k: ({}, None),
-            )
-            all_reduce = dist.all_reduce
-            collective_shapes = []
-
-            def record_all_reduce(tensor, **kwargs):
-                collective_shapes.append(tuple(tensor.shape))
-                return all_reduce(tensor, **kwargs)
-
-            patch.setattr(module.dist, "all_reduce", record_all_reduce)
-            # Scheduled requests, live-execution flags, expected per-stage DP counts.
-            # Mixed below/at prefill threshold; decode below/at its threshold;
-            # an idle rank; a dummy veto; and unequal request-boundary splits.
-            cases = [
-                (([1] * 6, [3, 3]), (True, True), [[6, 6]]),
-                (([1] * 8, [3, 5]), (True, True), [[4, 3], [4, 5]]),
-                (([1] * 3, [1] * 3), (True, True), [[3, 3]]),
-                (([1] * 4, [1] * 4), (True, True), [[2, 2], [2, 2]]),
-                (([1] * 8, [1]), (True, False), [[8, 8]]),
-                (([1] * 8, [1] * 8), (True, False), [[8, 8]]),
-                (([3, 5], [8]), (True, True), [[3, 4], [5, 4]]),
-                (([3, 5], [4, 6]), (True, True), [[3, 4], [5, 6]]),
-            ]
-            for requests, live, expected_counts in cases:
-                collective_shapes.clear()
-                scheduled = np.array(requests[rank], dtype=np.int32)
-                num_tokens = int(scheduled.sum())
-                runner = _new_attention_runner()
-                runner.dp_size, runner.dp_rank = 2, rank
-                runner._afd_transaction_counter = 0
-                runner.connector = _RecordingConnector()
-                runner.afd_config = SimpleNamespace(connector="CAMP2pAFDConnector")
-                runner.parallel_config = _parallel_config(
-                    data_parallel_size=2,
-                    data_parallel_rank=rank,
-                    is_moe_model=True,
-                    enable_dbo=True,
-                    use_ubatching=True,
-                    num_ubatches=2,
-                    dbo_decode_token_threshold=4,
-                    dbo_prefill_token_threshold=8,
-                )
-                runner.vllm_config = SimpleNamespace(
-                    parallel_config=runner.parallel_config,
-                    additional_config={},
-                    observability_config=SimpleNamespace(cudagraph_metrics=False),
-                )
-                runner._afd_live_execution = live[rank]
-                runner._is_warmup = runner._afd_is_graph_capturing = False
-                runner.afd_async_extra_info = SimpleNamespace(async_moe_ubatching=False)
-                runner._pad_for_sequence_parallelism = lambda n: n
-                runner.input_batch = SimpleNamespace(
-                    num_computed_tokens_cpu=np.ones(len(scheduled), dtype=np.int32),
-                    lora_id_to_lora_request={},
-                )
-                runner.speculative_config = None
-                runner.uniform_decode_query_len = 1
-                runner.model_config = SimpleNamespace(is_encoder_decoder=False)
-                runner.cudagraph_dispatcher = SimpleNamespace(
-                    dispatch=lambda **kw: (
-                        CUDAGraphMode.NONE,
-                        BatchDescriptor(kw["num_tokens"]),
-                    )
-                )
-                mode, desc, split, counts, _ = (
-                    runner._determine_batch_execution_and_padding(
-                        num_tokens=num_tokens,
-                        num_reqs=len(scheduled),
-                        num_scheduled_tokens_np=scheduled,
-                        max_num_scheduled_tokens=int(scheduled.max()),
-                        use_cascade_attn=False,
-                        allow_microbatching=False,
-                    )
-                )
-                assert split is (len(expected_counts) == 2)
-                slices, _ = maybe_create_ubatch_slices(
-                    split,
-                    scheduled,
-                    desc.num_tokens,
-                    len(scheduled),
-                    runner.vllm_config,
-                )
-                # Stub only device attention metadata, retaining the production
-                # request-boundary adjustment and final AFD metadata builder.
-                runner._build_attention_metadata_with_ubatches = lambda **kw: ({}, None)
-                runner._build_attention_metadata(
-                    num_tokens=num_tokens,
-                    num_reqs=len(scheduled),
-                    max_query_len=int(scheduled.max()),
-                    num_tokens_padded=desc.num_tokens,
-                    num_reqs_padded=len(scheduled),
-                    ubatch_slices=slices,
-                    num_scheduled_tokens_np=scheduled,
-                    cudagraph_runtime_mode=mode,
-                )
-                runner._send_dp_metadata(
-                    DPMetadata.make(runner.parallel_config, desc.num_tokens, counts),
-                    runner.ubatch_slices,
-                )
-                payload = runner.connector.sent_dp_metadata_payloads[-1]
-                assert list(payload.dp_metadata_list) == list(
-                    range(len(expected_counts))
-                )
-                assert [
-                    m.num_tokens_across_dp_cpu.tolist()
-                    for m in payload.dp_metadata_list.values()
-                ] == expected_counts
-                assert runner._afd_pending_metadata.num_stages == len(expected_counts)
-                assert len(collective_shapes) == (2 if split else 1)
-                assert collective_shapes[0][1] == 2
-                if split:
-                    assert collective_shapes[1] == (2, 2)
-    finally:
-        dist.destroy_process_group()
-
-
-def test_npu_dp_final_stage_protocol_two_processes(tmp_path):
-    _require_npu_runtime()
-    import torch.multiprocessing as mp
-
-    mp.spawn(
-        _run_npu_dp_stage_protocol,
-        args=(f"file://{tmp_path / 'dp-rendezvous'}",),
-        nprocs=2,
-        join=True,
-    )
-
-
-@pytest.mark.parametrize(
-    ("graph_mode", "expected_split"),
-    [("NONE", 3), ("FULL", 4)],
-)
-def test_npu_live_dbo_uses_request_boundary_only_outside_full_graph(
-    graph_mode, expected_split
-):
-    _require_npu_runtime()
-    import numpy as np
-    from vllm.config import CUDAGraphMode
-    from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
-
-    runner = _new_attention_runner()
-    runner._afd_live_execution = True
-    runner.afd_async_extra_info = SimpleNamespace(async_moe_ubatching=False)
-    runner._build_afd_metadata = lambda *_args: object()
-    runner._build_attention_metadata_with_ubatches = lambda **kwargs: (
-        kwargs["ubatch_slices"],
-        None,
-    )
-    scheduled_tokens = np.array([3, 5], dtype=np.int32)
-    midpoint_slices, _ = maybe_create_ubatch_slices(True, scheduled_tokens, 8, 2, 2)
-
-    stage_slices, _ = runner._build_attention_metadata(
-        num_tokens=8,
-        num_reqs=2,
-        max_query_len=5,
-        num_tokens_padded=8,
-        num_reqs_padded=2,
-        ubatch_slices=midpoint_slices,
-        num_scheduled_tokens_np=scheduled_tokens,
-        cudagraph_runtime_mode=CUDAGraphMode[graph_mode],
-    )
-
-    assert [stage.token_slice for stage in stage_slices] == [
-        slice(0, expected_split),
-        slice(expected_split, 8),
-    ]
-    assert runner.ubatch_slices == stage_slices
 
 
 def _new_ffn_runner():
@@ -925,8 +301,6 @@ def _new_ffn_runner():
     # object.__new__ bypasses __init__, which is where the runner would set up
     # the profiler and device; provide inert defaults the runtime paths expect.
     runner = object.__new__(AFDNPUFFNModelRunner)
-    runner._layered_executor = None
-    runner._layered_gmm_requested = False
     runner.prof = None
     runner.device = SimpleNamespace(type="npu")
     runner._is_shutdown = False
@@ -955,151 +329,6 @@ def _new_ffn_worker():
     return worker
 
 
-@pytest.mark.parametrize(
-    ("wrapper_owns_update", "expected_updates"),
-    [(True, 0), (False, 1)],
-)
-def test_npu_attention_runner_skips_outer_update_only_for_owned_graph(
-    monkeypatch,
-    wrapper_owns_update,
-    expected_updates,
-):
-    _require_npu_runtime()
-    from vllm.config import CUDAGraphMode
-
-    from afd_plugin.v1.worker.npu import attention_model_runner
-
-    class FakeUBatchWrapper:
-        def owns_full_graph_update(self, _forward_context):
-            return wrapper_owns_update
-
-        def __call__(self, **_model_inputs):
-            return "hidden_states"
-
-    forward_context = SimpleNamespace(
-        dbo_enabled=False,
-        flash_comm_v1_enabled=False,
-        cudagraph_runtime_mode=CUDAGraphMode.NONE,
-        device_metadata_executor=None,
-    )
-    monkeypatch.setattr(
-        attention_model_runner,
-        "AscendUBatchWrapper",
-        FakeUBatchWrapper,
-    )
-    monkeypatch.setattr(
-        attention_model_runner,
-        "get_forward_context",
-        lambda: forward_context,
-    )
-
-    runner = object.__new__(
-        attention_model_runner.AFDNPUAttentionModelRunner,
-    )
-    runner.enable_enpu = False
-    runner.model = FakeUBatchWrapper()
-    runner.ubatch_slices = None
-    runner._install_afd_metadata_on_forward_context = lambda _context: None
-    runner._install_async_moe_ubatch_metadata_on_forward_context = lambda _context: None
-    updates = []
-    runner._update_full_graph_params_if_needed = lambda *args: updates.append(args)
-
-    input_ids = object()
-    result = runner._model_forward(
-        8,
-        input_ids=input_ids,
-        positions=object(),
-        intermediate_tensors=None,
-        inputs_embeds=None,
-    )
-
-    assert result == "hidden_states"
-    assert len(updates) == expected_updates
-    assert forward_context.input_ids is input_ids
-
-
-def test_npu_attention_runner_installs_mla_graph_wrapper(monkeypatch):
-    _require_npu_runtime()
-    from afd_plugin.v1.worker.npu import attention_model_runner
-
-    captured_args: list[tuple[object, ...]] = []
-    captured_kwargs: list[dict[str, object]] = []
-
-    class RecordingUBatchWrapper:
-        def __init__(self, *args: object, **kwargs: object):
-            captured_args.append(args)
-            captured_kwargs.append(kwargs)
-
-    monkeypatch.setattr(
-        attention_model_runner,
-        "AscendUBatchWrapper",
-        RecordingUBatchWrapper,
-    )
-    runner = object.__new__(
-        attention_model_runner.AFDNPUAttentionModelRunner,
-    )
-    runner.model = "model"
-    runner.device = "npu"
-    runner.vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(use_mla=True),
-    )
-    runner.compilation_config = SimpleNamespace(
-        cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True),
-    )
-    runner.use_sparse = False
-    runner.use_compress = False
-    runner.enable_enpu = False
-
-    runner._install_ascend_ubatch_wrapper()
-
-    assert captured_args[0][:2] == ("model", runner.vllm_config)
-    kwargs = captured_kwargs[0]
-    assert kwargs["mla_full_graph_enabled"] is True
-    assert kwargs["enable_enpu"] is False
-    updater = kwargs["full_graph_params_updater"]
-    assert isinstance(updater, MethodType)
-    assert updater.__self__ is runner
-
-
-def test_npu_attention_runner_keeps_compressor_models_off_the_mla_path(monkeypatch):
-    """DeepSeek V4 selects the DSA backend, whose graph params are a no-op."""
-    _require_npu_runtime()
-    from afd_plugin.v1.worker.npu import attention_model_runner
-
-    captured_kwargs: list[dict[str, object]] = []
-
-    class RecordingUBatchWrapper:
-        def __init__(self, *args: object, **kwargs: object):
-            captured_kwargs.append(kwargs)
-
-    monkeypatch.setattr(
-        attention_model_runner,
-        "AscendUBatchWrapper",
-        RecordingUBatchWrapper,
-    )
-    runner = object.__new__(
-        attention_model_runner.AFDNPUAttentionModelRunner,
-    )
-    runner.model = "model"
-    runner.device = "npu"
-    runner.vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(use_mla=True),
-    )
-    runner.compilation_config = SimpleNamespace(
-        cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True),
-    )
-    runner.use_sparse = False
-    runner.use_compress = True
-    runner.enable_enpu = False
-
-    runner._install_ascend_ubatch_wrapper()
-
-    # The MLA DBO full graph path requires a single-batch FIA workspace that a
-    # compressor model never registers, so those models stay on the generic
-    # two-stage path.
-    assert captured_kwargs[0]["mla_full_graph_enabled"] is False
-
-
 def test_npu_attention_runner_builds_and_sets_metadata():
     torch = pytest.importorskip("torch")
     runner = _new_attention_runner()
@@ -1113,16 +342,16 @@ def test_npu_attention_runner_builds_and_sets_metadata():
     runner._afd_suppress_metadata_send = False
     forward_context = SimpleNamespace(
         additional_kwargs={},
-        dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=torch.tensor([1])),
+        dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=torch.tensor([5])),
         ubatch_slices=None,
         batch_descriptor=SimpleNamespace(num_tokens=5),
         cudagraph_runtime_mode=None,
     )
 
-    runner._install_afd_metadata_on_forward_context(forward_context)
+    runner.install_afd_metadata_on_forward_context(forward_context)
 
     metadata = forward_context.additional_kwargs["afd_metadata"]
-    assert metadata.tokens_lens == [1]
+    assert metadata.tokens_lens == [5]
     assert len(runner.connector.dp_metadata_updates) == 1
     assert len(runner.connector.sent_dp_metadata_lists) == 1
 
@@ -1147,7 +376,7 @@ def test_npu_attention_async_connector_skips_dp_metadata_control_plane():
         batch_descriptor=SimpleNamespace(num_tokens=3),
     )
 
-    runner._install_afd_metadata_on_forward_context(forward_context)
+    runner.install_afd_metadata_on_forward_context(forward_context)
 
     metadata = forward_context.additional_kwargs["afd_metadata"]
     assert metadata.tokens_lens == [3]
@@ -1160,7 +389,7 @@ def test_npu_attention_runner_builds_dp_fallback():
     runner.vllm_config = _vllm_config(role="attention")
     runner.connector = object()
     runner._afd_transaction_counter = 0
-    runner._afd_pending_metadata = runner._build_afd_metadata(None, 7)
+    runner._afd_pending_metadata = runner.build_afd_metadata(None, 7)
 
     dp_metadata = runner._ensure_dp_metadata(None)
 
@@ -1178,9 +407,9 @@ def test_npu_attention_runner_sends_graph_flags():
     runner._is_warmup = True
     runner._afd_is_graph_capturing = True
     runner._afd_transaction_counter = 0
-    runner._afd_pending_metadata = runner._build_afd_metadata(None, 3)
+    runner._afd_pending_metadata = runner.build_afd_metadata(None, 3)
 
-    runner._send_dp_metadata(
+    runner.send_dp_metadata(
         SimpleNamespace(num_tokens_across_dp_cpu=torch.tensor([3])),
         None,
     )
@@ -1215,7 +444,7 @@ def test_npu_attention_runner_sends_per_ubatch_dp_metadata():
         ),
     ]
 
-    runner._send_dp_metadata(
+    runner.send_dp_metadata(
         None,
         ubatch_slices,
     )
@@ -1228,629 +457,6 @@ def test_npu_attention_runner_sends_per_ubatch_dp_metadata():
     assert sorted(sent_dp_metadata_list) == [0, 1]
     assert _tokens(sent_dp_metadata_list[0]) == [4]
     assert _tokens(sent_dp_metadata_list[1]) == [3]
-
-
-def test_npu_attention_ubatch_dp_metadata_keeps_each_rank_stage_count(monkeypatch):
-    _require_npu_runtime()
-    import torch
-
-    from afd_plugin.v1.worker.npu import attention_model_runner
-
-    runner = _new_attention_runner()
-    runner.vllm_config = _vllm_config(
-        role="attention",
-        data_parallel_size=2,
-        data_parallel_rank=1,
-    )
-    runner.dp_rank = 1
-    runner.connector = _RecordingConnector()
-    runner._is_warmup = False
-    runner._afd_is_graph_capturing = False
-    ubatch_slices = [
-        SimpleNamespace(num_tokens=4),
-        SimpleNamespace(num_tokens=3),
-    ]
-
-    def sync_stage_counts(counts, *, group):
-        assert group == "cpu-dp-group"
-        assert counts.tolist() == [[0, 4], [0, 3]]
-        counts[:, 0] = torch.tensor([5, 7], dtype=torch.int32)
-
-    monkeypatch.setattr(
-        attention_model_runner,
-        "get_dp_group",
-        lambda: SimpleNamespace(cpu_group="cpu-dp-group"),
-    )
-    monkeypatch.setattr(attention_model_runner.dist, "all_reduce", sync_stage_counts)
-    monkeypatch.setattr(
-        attention_model_runner,
-        "DPMetadata",
-        SimpleNamespace(
-            make=lambda _config, _local_count, counts: _FakeDPMetadata(counts.clone()),
-        ),
-    )
-
-    metadata = runner._send_dp_metadata(None, ubatch_slices)
-
-    assert _tokens(metadata[0]) == [5, 4]
-    assert _tokens(metadata[1]) == [7, 3]
-    assert runner.connector.sent_dp_metadata_lists[0][0] == metadata
-
-
-def test_npu_attention_passes_stage_dp_metadata_to_ubatch_context(monkeypatch):
-    _require_npu_runtime()
-
-    from afd_plugin.v1.worker.npu import attention_model_runner
-    from afd_plugin.v1.worker.npu.npu_ubatch_wrapper import (
-        AFD_UBATCH_DP_METADATA_KEY,
-    )
-
-    runner = _new_attention_runner()
-    runner.vllm_config = _vllm_config(role="attention", data_parallel_size=2)
-    runner.connector = _RecordingConnector()
-    runner._afd_pending_metadata = object()
-    runner._afd_suppress_metadata_send = False
-    stages = [SimpleNamespace(num_tokens=4), SimpleNamespace(num_tokens=3)]
-    stage_metadata = {0: object(), 1: object()}
-    runner._send_dp_metadata = lambda _metadata, _slices: stage_metadata
-    monkeypatch.setattr(
-        attention_model_runner,
-        "_full_cudagraph_padded_tokens",
-        lambda _context: None,
-    )
-    context = SimpleNamespace(
-        additional_kwargs={},
-        dp_metadata=object(),
-        ubatch_slices=stages,
-    )
-
-    runner._install_afd_metadata_on_forward_context(context)
-
-    assert context.additional_kwargs[AFD_UBATCH_DP_METADATA_KEY] == [
-        stage_metadata[0],
-        stage_metadata[1],
-    ]
-
-
-def test_npu_attention_capture_microbatch_also_captures_single_stage():
-    _require_npu_runtime()
-    from vllm.config import CUDAGraphMode
-
-    runner = _new_attention_runner()
-    runner.compilation_config = SimpleNamespace(cudagraph_num_of_warmups=1)
-    runner.connector = SimpleNamespace(control_plane=object())
-    runner._is_warmup = False
-    runner._afd_is_graph_capturing = False
-    runner._afd_suppress_metadata_send = False
-    runner._afd_pending_metadata = "original"
-    dummy_calls = []
-    sent_metadata = []
-
-    def dummy_run(num_tokens, **kwargs):
-        dummy_calls.append(
-            (
-                num_tokens,
-                kwargs.copy(),
-                runner._is_warmup,
-                runner._afd_is_graph_capturing,
-                runner._afd_suppress_metadata_send,
-            ),
-        )
-        return kwargs["allow_microbatching"]
-
-    runner._dummy_run = dummy_run
-    runner._build_afd_metadata = lambda ubatch_slices, num_tokens: SimpleNamespace(
-        ubatch_slices=ubatch_slices,
-        num_tokens=num_tokens,
-    )
-    runner._build_capture_dp_metadata = lambda num_tokens: SimpleNamespace(
-        num_tokens_across_dp_cpu=[num_tokens],
-    )
-
-    def send_dp_metadata(dp_metadata, ubatch_slices):
-        sent_metadata.append(
-            (
-                dp_metadata,
-                ubatch_slices,
-                runner._afd_is_graph_capturing,
-                runner._is_warmup,
-            ),
-        )
-
-    runner._send_dp_metadata = send_dp_metadata
-    desc = SimpleNamespace(num_tokens=12, uniform=True, num_active_loras=0)
-
-    runner._warmup_and_capture(
-        desc,
-        CUDAGraphMode.FULL,
-        allow_microbatching=True,
-    )
-
-    assert [call[1]["allow_microbatching"] for call in dummy_calls] == [
-        False,
-        False,
-        True,
-        True,
-    ]
-    assert [call[1]["cudagraph_runtime_mode"] for call in dummy_calls] == [
-        CUDAGraphMode.NONE,
-        CUDAGraphMode.FULL,
-        CUDAGraphMode.NONE,
-        CUDAGraphMode.FULL,
-    ]
-    assert [call[1].get("is_graph_capturing", False) for call in dummy_calls] == [
-        False,
-        True,
-        False,
-        True,
-    ]
-    assert [call[2] for call in dummy_calls] == [True, False, True, False]
-    assert [call[3] for call in dummy_calls] == [False, True, False, True]
-    assert len(sent_metadata) == 1
-    dp_metadata, ubatch_slices, is_graph_capturing, is_warmup = sent_metadata[0]
-    assert _tokens(dp_metadata) == [12]
-    assert ubatch_slices is None
-    assert is_graph_capturing is True
-    assert is_warmup is False
-    assert runner._is_warmup is False
-    assert runner._afd_is_graph_capturing is False
-    assert runner._afd_suppress_metadata_send is False
-    assert runner._afd_pending_metadata == "original"
-
-
-def test_npu_attention_metadata_positional_args_and_padded_slices():
-    _require_npu_runtime()
-    from afd_plugin.v1.worker.npu.ubatch_utils import (
-        UBatchSlice,
-        pad_out_ubatch_slices,
-    )
-
-    ubatch_slices = [
-        UBatchSlice(slice(0, 1), slice(0, 4)),
-        UBatchSlice(slice(1, 2), slice(4, 8)),
-    ]
-
-    normalized = pad_out_ubatch_slices(ubatch_slices, 8, 4)
-
-    assert normalized[-1].request_slice == slice(1, 4)
-    assert normalized[-1].token_slice == slice(4, 8)
-
-
-def test_npu_request_boundary_ubatch_slices_balance_tokens(monkeypatch):
-    np = pytest.importorskip("numpy")
-    fake_torch = ModuleType("torch")
-    fake_torch.Tensor = object  # type: ignore[attr-defined]
-    fake_vllm = ModuleType("vllm")
-    fake_vllm_config = ModuleType("vllm.config")
-    fake_vllm_config.VllmConfig = object  # type: ignore[attr-defined]
-    fake_vllm_v1 = ModuleType("vllm.v1")
-    fake_vllm_worker = ModuleType("vllm.v1.worker")
-    fake_vllm_ubatch_utils = ModuleType("vllm.v1.worker.ubatch_utils")
-
-    class UBatchSlice:
-        def __init__(self, request_slice, token_slice):
-            self.request_slice = request_slice
-            self.token_slice = token_slice
-
-        @property
-        def num_tokens(self):
-            return self.token_slice.stop - self.token_slice.start
-
-        def is_empty(self):
-            return self.num_tokens <= 0
-
-    fake_vllm_ubatch_utils.UBatchSlice = UBatchSlice  # type: ignore[attr-defined]
-    fake_vllm_ubatch_utils.UBatchSlices = list  # type: ignore[attr-defined]
-    fake_vllm_ubatch_utils.check_ubatch_thresholds = (  # type: ignore[attr-defined]
-        lambda *_args, **_kwargs: False
-    )
-    for name in (
-        "_pad_out_ubatch_slices",
-        "is_last_ubatch_empty",
-        "maybe_create_ubatch_slices",
-    ):
-        setattr(
-            fake_vllm_ubatch_utils,
-            name,
-            lambda *args: pytest.fail("unused native helper"),
-        )
-    fake_vllm_ascend = ModuleType("vllm_ascend")
-    fake_forward_context = ModuleType("vllm_ascend.ascend_forward_context")
-    fake_forward_context.MoECommType = type(  # type: ignore[attr-defined]
-        "MoECommType", (), {}
-    )
-    fake_attention = ModuleType("vllm_ascend.attention")
-    fake_attention_utils = ModuleType("vllm_ascend.attention.utils")
-    fake_attention_utils.AscendCommonAttentionMetadata = (  # type: ignore[attr-defined]
-        object
-    )
-
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
-    monkeypatch.setitem(sys.modules, "vllm.config", fake_vllm_config)
-    monkeypatch.setitem(sys.modules, "vllm.v1", fake_vllm_v1)
-    monkeypatch.setitem(sys.modules, "vllm.v1.worker", fake_vllm_worker)
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.v1.worker.ubatch_utils",
-        fake_vllm_ubatch_utils,
-    )
-    monkeypatch.setitem(sys.modules, "vllm_ascend", fake_vllm_ascend)
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm_ascend.ascend_forward_context",
-        fake_forward_context,
-    )
-    monkeypatch.setitem(sys.modules, "vllm_ascend.attention", fake_attention)
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm_ascend.attention.utils",
-        fake_attention_utils,
-    )
-
-    with _temporarily_reimport_module(
-        "afd_plugin.v1.worker.npu.ubatch_utils",
-    ) as ubatch_utils:
-        slices = ubatch_utils.create_request_boundary_ubatch_slices(
-            np.array([2, 3, 5, 7], dtype=np.int32),
-        )
-
-        assert slices[0].request_slice == slice(0, 3)
-        assert slices[0].token_slice == slice(0, 10)
-        assert slices[1].request_slice == slice(3, 4)
-        assert slices[1].token_slice == slice(10, 17)
-
-        slices = ubatch_utils.create_request_boundary_ubatch_slices(
-            np.array([824, 846, 16], dtype=np.int32),
-        )
-
-        assert slices[0].request_slice == slice(0, 1)
-        assert slices[0].token_slice == slice(0, 824)
-        assert slices[1].request_slice == slice(1, 3)
-        assert slices[1].token_slice == slice(824, 1686)
-        assert (
-            ubatch_utils.create_request_boundary_ubatch_slices(
-                np.array([17], dtype=np.int32),
-            )
-            is None
-        )
-
-
-@pytest.mark.parametrize(
-    ("straddles_request", "full_graph"),
-    [(True, False), (False, False), (False, True)],
-)
-def test_npu_attention_runner_isolates_dsa_caches_per_stage(
-    monkeypatch, straddles_request, full_graph
-):
-    _require_npu_runtime()
-    torch = pytest.importorskip("torch")
-
-    from afd_plugin.v1.worker.npu import attention_model_runner
-
-    cache_observations = []
-    isolated_builder_inputs = []
-    materialized_stage_metadata = []
-
-    class FakeDSABuilder:
-        def __init__(self, group_id, stage_id):
-            self.group_id = group_id
-            self.stage_id = stage_id
-
-        def build(self, *, common_attn_metadata, **kwargs):
-            common_cache = kwargs["common_ratio_to_sas_metadata"]
-            assert kwargs["full_graph_mode"] is full_graph
-            assert "prefill_ratio_to_sas_metadata" not in kwargs
-            assert "decode_ratio_to_sas_metadata" not in kwargs
-            token_layout = (
-                tuple(common_attn_metadata.positions),
-                tuple(common_attn_metadata.query_start_loc_cpu),
-                tuple(common_attn_metadata.seq_lens),
-            )
-            cached_layout = common_cache.setdefault("token_layout", token_layout)
-            assert cached_layout == token_layout
-            cache_observations.append(
-                (
-                    self.group_id,
-                    self.stage_id,
-                    id(common_cache),
-                    kwargs["num_actual_reqs"],
-                ),
-            )
-            self.common_ratio_to_sas_metadata = common_cache
-            return SimpleNamespace(token_layout=cached_layout)
-
-    class FakeDSACPBuilder:
-        pass
-
-    monkeypatch.setattr(
-        attention_model_runner,
-        "AscendDSAMetadataBuilder",
-        FakeDSABuilder,
-    )
-    monkeypatch.setattr(
-        attention_model_runner,
-        "AscendDSACPMetadataBuilder",
-        FakeDSACPBuilder,
-    )
-    monkeypatch.setattr(
-        attention_model_runner,
-        "split_attn_metadata",
-        lambda *_args, **_kwargs: [
-            SimpleNamespace(
-                positions=range(0, 53),
-                num_input_tokens=53,
-                query_start_loc_cpu=(0, 53),
-                seq_lens=(53,),
-            ),
-            SimpleNamespace(
-                positions=range(53, 105),
-                num_input_tokens=52,
-                query_start_loc_cpu=(0, 52),
-                seq_lens=(105,),
-            ),
-        ],
-    )
-    monkeypatch.setattr(
-        attention_model_runner,
-        "isolate_deepseek_attention_builder_inputs",
-        lambda builder, metadata: isolated_builder_inputs.append(
-            (builder, metadata),
-        ),
-    )
-    monkeypatch.setattr(
-        attention_model_runner,
-        "materialize_deepseek_attention_metadata",
-        lambda metadata, positions, num_tokens: materialized_stage_metadata.append(
-            (metadata, positions, num_tokens),
-        ),
-    )
-
-    def make_attn_group(group_id):
-        builders = {
-            0: FakeDSABuilder(group_id, 0),
-            1: FakeDSABuilder(group_id, 1),
-        }
-        return SimpleNamespace(
-            get_metadata_builder=builders.__getitem__,
-            kv_cache_spec=SimpleNamespace(block_size=128),
-            layer_names=[f"layer-{group_id}"],
-        )
-
-    runner = _new_attention_runner()
-    slot_mapping = torch.arange(105, dtype=torch.int64)
-    block_table = SimpleNamespace(
-        slot_mapping=SimpleNamespace(gpu=slot_mapping),
-        get_device_tensor=lambda: torch.zeros((1, 1), dtype=torch.int32),
-    )
-    runner.kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace())],
-    )
-    runner.attn_groups = [[make_attn_group(0), make_attn_group(1)]]
-    runner.max_model_len = 105
-    num_reqs = 1 if straddles_request else 2
-    runner.optimistic_seq_lens_cpu = torch.tensor(
-        [105] if straddles_request else [53, 105], dtype=torch.int32
-    )
-    # vLLM-Ascend v0.26 exposes use_dcp as a read-only property derived from
-    # dcp_size, so the fixture sets the underlying size instead.
-    runner.dcp_size = 1
-    runner.use_async_spec_decode = False
-    runner.input_batch = SimpleNamespace(
-        block_table=[block_table],
-        num_computed_tokens_cpu_tensor=torch.zeros(num_reqs, dtype=torch.int32),
-        num_prompt_tokens_cpu_tensor=torch.tensor(
-            [105] if straddles_request else [53, 52], dtype=torch.int32
-        ),
-        req_ids=[],
-    )
-    query_start_loc = torch.tensor(
-        [0, 105] if straddles_request else [0, 53, 105], dtype=torch.int32
-    )
-    runner.query_start_loc = SimpleNamespace(
-        gpu=query_start_loc,
-        cpu=query_start_loc,
-    )
-    runner.seq_lens = runner.optimistic_seq_lens_cpu
-    runner.positions = torch.arange(105, dtype=torch.int64)
-    runner.actual_seq_lengths_q = []
-    runner.use_compress = False
-    runner.attn_state = object()
-    runner.decode_token_per_req = 1
-    runner.group_len = SimpleNamespace(gpu=torch.zeros(num_reqs, dtype=torch.int32))
-    runner.group_key_idx = SimpleNamespace(gpu=torch.zeros(num_reqs, dtype=torch.int32))
-    runner.group_key_cache_idx = SimpleNamespace(
-        gpu=torch.zeros(num_reqs, dtype=torch.int32),
-    )
-    runner.cache_config = SimpleNamespace(kv_sharing_fast_prefill=False)
-    runner.model_config = SimpleNamespace(enable_return_routed_experts=False)
-    runner.speculative_config = None
-    runner._has_gdn = False
-    runner.is_mm_prefix_lm = False
-    runner.device = torch.device("cpu")
-    runner.vllm_config = SimpleNamespace(
-        additional_config={},
-        compilation_config=SimpleNamespace(
-            cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False),
-        ),
-    )
-    runner._get_encoder_seq_lens = lambda *_args, **_kwargs: (None, None)
-
-    ubatch_slices = [
-        SimpleNamespace(request_slice=slice(0, 1)),
-        SimpleNamespace(request_slice=slice(0 if straddles_request else 1, num_reqs)),
-    ]
-    from vllm.config import CUDAGraphMode
-
-    metadata, _ = runner._build_attention_metadata_with_ubatches(
-        num_tokens=105,
-        num_reqs=num_reqs,
-        max_query_len=105,
-        num_tokens_padded=112,
-        num_reqs_padded=num_reqs,
-        ubatch_slices=ubatch_slices,
-        cudagraph_runtime_mode=(
-            CUDAGraphMode.FULL if full_graph else CUDAGraphMode.NONE
-        ),
-    )
-
-    assert [stage["layer-0"].token_layout for stage in metadata] == [
-        (tuple(range(0, 53)), (0, 53), (53,)),
-        (tuple(range(53, 105)), (0, 52), (105,)),
-    ]
-    assert [observation[3] for observation in cache_observations] == [1, 1, 1, 1]
-    stage_0_cache_ids = {
-        observation[2] for observation in cache_observations if observation[1] == 0
-    }
-    stage_1_cache_ids = {
-        observation[2] for observation in cache_observations if observation[1] == 1
-    }
-    assert len(stage_0_cache_ids) == 1
-    assert len(stage_1_cache_ids) == 1
-    assert stage_0_cache_ids.isdisjoint(stage_1_cache_ids)
-    assert not isolated_builder_inputs
-    assert len(materialized_stage_metadata) == (0 if full_graph else 4)
-
-
-def test_npu_attention_runner_async_moe_uses_native_metadata_builders(
-    monkeypatch,
-):
-    _require_npu_runtime()
-    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-
-    from afd_plugin.connectors.npu.async_cam import AFDAsyncExtraInfo
-
-    runner = _new_attention_runner()
-    runner.vllm_config = _vllm_config(
-        role="attention",
-        connector="CAMAsyncAFDConnector",
-        async_dp=True,
-        tensor_parallel_size=2,
-        use_ubatching=True,
-        num_ubatches=2,
-        extra_config={
-            "async_moe_ubatching": True,
-            "async_moe_split": "token",
-        },
-    )
-    runner.afd_async_extra_info = AFDAsyncExtraInfo(
-        async_moe_ubatching=True,
-        async_moe_split="token",
-    )
-    runner.device = object()
-    create_calls = []
-    attn_group = SimpleNamespace(metadata_builders=[object()])
-
-    def create_metadata_builders(
-        vllm_config,
-        device,
-        *,
-        num_metadata_builders,
-    ):
-        assert vllm_config is runner.vllm_config
-        assert device is runner.device
-        create_calls.append(num_metadata_builders)
-        attn_group.metadata_builders = [object()] * num_metadata_builders
-
-    attn_group.create_metadata_builders = create_metadata_builders
-    runner.attn_groups = [[attn_group]]
-    initialized = object()
-    monkeypatch.setattr(
-        NPUModelRunner,
-        "initialize_attn_backend",
-        lambda self, *args, **kwargs: initialized,
-    )
-
-    runner.initialize_attn_backend(None)
-    assert create_calls == [2]
-    assert len(attn_group.metadata_builders) == 2
-
-
-def test_npu_create_ascend_forward_context_marks_current_ubatch(monkeypatch):
-    _require_npu_runtime()
-    from afd_plugin.v1.worker.npu import forward_context as forward_context_module
-
-    monkeypatch.setattr(
-        forward_context_module,
-        "get_tensor_model_parallel_world_size",
-        lambda: 1,
-    )
-    monkeypatch.setattr(
-        forward_context_module,
-        "get_dp_group",
-        lambda: SimpleNamespace(world_size=1),
-    )
-    monkeypatch.setattr(
-        forward_context_module,
-        "get_moe_comm_method",
-        lambda moe_comm_type: f"method:{moe_comm_type}",
-    )
-    afd_metadata = AFDForwardContextMetadata(
-        tokens_start_loc=[0, 4],
-        requests_start_loc=[0, 1],
-        stage_idx=0,
-        connector=object(),
-        tokens_lens=[4, 3],
-        num_stages=2,
-        tokens_unpadded_lens=[4, 3],
-    )
-    cur_forward_context = SimpleNamespace(
-        additional_kwargs={"afd_metadata": afd_metadata},
-        all_moe_layers={},
-        moe_comm_type="mc2",
-        in_profile_run=False,
-        capturing=False,
-        mmrs_fusion=False,
-        flash_comm_v1_enabled=False,
-        is_first_layer=True,
-        layer_idx=0,
-        prefetch_mlp_gate_up_proj=False,
-        prefetch_mlp_down_proj=False,
-        model_instance=None,
-        is_draft_model=False,
-        is_draft_model_prefill=False,
-        draft_attn_metadatas=None,
-        max_tokens_across_pcp=None,
-        sinks=False,
-        input_ids=None,
-        eplb_heat_collection_status=False,
-        is_padding=None,
-        mc2_mask=None,
-        device_metadata_executor=object(),
-    )
-    ubatch_slices = [
-        SimpleNamespace(
-            request_slice=slice(0, 1),
-            token_slice=slice(0, 4),
-            num_tokens=4,
-        ),
-        SimpleNamespace(
-            request_slice=slice(1, 2),
-            token_slice=slice(4, 7),
-            num_tokens=3,
-        ),
-    ]
-    vllm_config = SimpleNamespace(
-        compilation_config=SimpleNamespace(static_forward_context={}),
-    )
-
-    new_forward_context = forward_context_module.create_ascend_forward_context(
-        cur_forward_context,
-        attn_metadata=None,
-        vllm_config=vllm_config,
-        ubatch_slices=ubatch_slices,
-        ubatch_num=1,
-    )
-
-    child_metadata = new_forward_context.additional_kwargs["afd_metadata"]
-    assert new_forward_context.ubatch_idx == 1
-    assert new_forward_context.num_ubatches == 2
-    assert new_forward_context.num_tokens == 3
-    assert child_metadata.stage_idx == 1
-    assert (
-        new_forward_context.device_metadata_executor
-        is cur_forward_context.device_metadata_executor
-    )
 
 
 def test_npu_ffn_runner_executes_eager_ffn_step(monkeypatch):
@@ -1994,7 +600,7 @@ def test_npu_ffn_worker_consumes_chunks_across_runner_steps(
         AFDAsyncFFNWorkItem,
         AFDAsyncTransferState,
     )
-    from afd_plugin.v1.worker.npu import ffn_model_runner, ffn_worker
+    from afd_plugin.v1.worker.npu import async_ffn_model_runner, ffn_worker
 
     context_calls = []
     sent_outputs = []
@@ -2009,11 +615,16 @@ def test_npu_ffn_worker_consumes_chunks_across_runner_steps(
         )
 
     monkeypatch.setattr(
-        ffn_model_runner,
+        async_ffn_model_runner,
         "ascend_forward_context",
         fake_ascend_forward_context,
     )
-    runner = _new_ffn_runner()
+    runner = object.__new__(async_ffn_model_runner.AsyncNPUFFNModelRunner)
+    runner._layered_executor = None
+    runner._graph = None
+    runner.effective_mode = "eager"
+    runner.layer_ids = tuple(sorted(set(layer_sequence)))
+    runner.afd_config = SimpleNamespace(compute_gate_on_attention=True)
     runner.vllm_config = _vllm_config(role="ffn")
     runner.connector = SimpleNamespace(control_plane=None, expert_per_rank=2)
     runner.model = _RecordingFakeModel()
@@ -2278,10 +889,10 @@ def test_npu_ffn_runner_warmup_uses_eager_forward_without_graph(monkeypatch):
     runner._acl_graphs = {}
     capture_flags: list[bool] = []
 
-    def fail_graph_capture_context(device):
-        raise AssertionError("warmup must not enter graph_capture context")
+    def fail_capture_stream(*args, **kwargs):
+        raise AssertionError("warmup must not create a capture stream")
 
-    monkeypatch.setattr(ffn_model_runner, "graph_capture", fail_graph_capture_context)
+    monkeypatch.setattr(ffn_model_runner.torch.npu, "Stream", fail_capture_stream)
     monkeypatch.setattr(
         ffn_model_runner,
         "ascend_forward_context",
@@ -2332,7 +943,14 @@ def test_npu_ffn_runner_capture_stores_acl_graph_and_skips_duplicate_state_updat
         "ascend_forward_context",
         _fake_ffn_ascend_forward_context,
     )
-    monkeypatch.setattr(ffn_model_runner, "graph_capture", lambda device: nullcontext())
+    stream = SimpleNamespace(wait_stream=lambda current: None)
+    monkeypatch.setattr(ffn_model_runner.torch.npu, "Stream", lambda **kw: stream)
+    monkeypatch.setattr(
+        ffn_model_runner.torch.npu, "current_stream", lambda device: None
+    )
+    monkeypatch.setattr(
+        ffn_model_runner.torch.npu, "stream", lambda stream: nullcontext()
+    )
     monkeypatch.setattr(
         ffn_model_runner.torch.npu,
         "graph",
@@ -2366,6 +984,40 @@ def test_npu_ffn_runner_capture_stores_acl_graph_and_skips_duplicate_state_updat
     assert update_flags == {"is_graph_capturing": True, "is_warmup": False}
 
 
+def test_npu_ffn_capture_cache_hit_still_updates_state_and_executes(monkeypatch):
+    _require_npu_runtime()
+    from vllm.config import CUDAGraphMode
+
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    runner = _new_ffn_runner()
+    runner.connector = _FakeFFNConnector()
+    runner.max_num_tokens = 8
+    dp_metadata = {0: _FakeDPMetadata([4]), 1: _FakeDPMetadata([4])}
+    graph = _FakeGraph()
+    runner._acl_graphs = {runner._make_graph_key(dp_metadata): {"graph": graph}}
+
+    def reject_new_capture():
+        raise AssertionError("an identical FFN shape must reuse its graph")
+
+    monkeypatch.setattr(ffn_model_runner.torch.npu, "NPUGraph", reject_new_capture)
+    # Different Attention descriptors can share this FFN key. Each payload
+    # nevertheless requires FFN communication, including repeated capture.
+    for is_capturing in (True, False, True):
+        runner._capture_graphs(
+            aclgraph_runtime_mode=CUDAGraphMode.FULL,
+            dp_metadata_list=dp_metadata,
+            is_attn_graph_capturing=is_capturing,
+        )
+
+    assert graph.replay_count == 3
+    assert [flags["is_graph_capturing"] for _, flags in runner.connector.updates] == [
+        True,
+        False,
+        True,
+    ]
+
+
 def test_npu_ffn_runner_requires_compute_hook(monkeypatch):
     _patch_ffn_forward_context(monkeypatch)
     runner = _new_ffn_runner()
@@ -2394,7 +1046,14 @@ def test_npu_ffn_runner_shutdown_is_idempotent(monkeypatch):
     runner = _new_ffn_runner()
     close_calls = []
     profiler_calls = []
-    parent_calls = []
+    free_calls: list[SimpleNamespace] = []
+    reset_calls = []
+    runner.vllm_config = _vllm_config(role="ffn")
+    runner._acl_graphs = {
+        ((0, (1,)),): {"graph": SimpleNamespace(reset=lambda: reset_calls.append(True))}
+    }
+    runner.graph_pool = "pool"
+    runner.model = _FakeModel()
     runner.connector = SimpleNamespace(
         is_initialized=True,
         close=lambda: close_calls.append(True),
@@ -2404,18 +1063,20 @@ def test_npu_ffn_runner_shutdown_is_idempotent(monkeypatch):
         "stop_afd_npu_profiler",
         lambda profiler: profiler_calls.append(profiler),
     )
-    monkeypatch.setattr(
-        ffn_model_runner.NPUModelRunner,
-        "shutdown",
-        lambda self: parent_calls.append(self),
-    )
+    from vllm.v1.worker.gpu import shutdown
+
+    monkeypatch.setattr(shutdown, "free_before_shutdown", free_calls.append)
 
     runner.shutdown()
     runner.shutdown()
 
     assert close_calls == [True]
     assert profiler_calls == [None]
-    assert parent_calls == [runner]
+    assert free_calls == [runner.vllm_config]
+    assert reset_calls == [True]
+    assert runner._acl_graphs == {}
+    assert runner.graph_pool is None
+    assert runner.model is None
 
 
 def test_npu_ffn_worker_scheduler_execute_model_fails_fast():
@@ -2703,13 +1364,14 @@ def test_npu_ffn_worker_uses_connector_driven_loop_for_async_connector(monkeypat
     def execute_connector_driven_step():
         calls.append("step")
         event.set()
+        return True
 
     worker._ffn_shutdown_event = event
     worker.device = SimpleNamespace(type="cpu")
-    worker.model_runner = SimpleNamespace(
-        connector=_AsyncRecordingConnector(),
-        execute_connector_driven_step=execute_connector_driven_step,
-    )
+    worker.model_runner = object.__new__(ffn_worker.AsyncNPUFFNModelRunner)
+    worker.model_runner.connector = _AsyncRecordingConnector()
+    worker.model_runner.effective_mode = "eager"
+    worker.model_runner.execute_connector_driven_step = execute_connector_driven_step
 
     monkeypatch.setattr(
         ffn_worker.torch.npu,
@@ -2768,101 +1430,6 @@ def test_npu_feature_validation_allows_two_ubatches_only():
     config = _vllm_config()
     config.model_config.enforce_eager = False
     fail_if_unsupported_npu_afd_features(config)
-
-
-def test_npu_ubatch_output_merge_preserves_aux_hidden_states():
-    _require_npu_runtime()
-    import torch
-
-    from afd_plugin.v1.worker.npu.npu_ubatch_wrapper import _cat_ubatch_outputs
-
-    merged = _cat_ubatch_outputs(
-        [
-            (torch.tensor([[1.0]]), [torch.tensor([[2.0]])]),
-            (torch.tensor([[3.0]]), [torch.tensor([[4.0]])]),
-        ],
-    )
-
-    assert isinstance(merged, tuple)
-    assert merged[0].tolist() == [[1.0], [3.0]]
-    assert len(merged[1]) == 1
-    assert merged[1][0].tolist() == [[2.0], [4.0]]
-
-
-def test_npu_ubatch_merge_keeps_model_gathered_outputs(monkeypatch):
-    _require_npu_runtime()
-    import torch
-
-    from afd_plugin.v1.worker.npu import npu_ubatch_wrapper
-
-    monkeypatch.setattr(
-        npu_ubatch_wrapper,
-        "get_pp_group",
-        lambda: SimpleNamespace(is_last_rank=True),
-    )
-    wrapper = object.__new__(npu_ubatch_wrapper.AscendUBatchWrapper)
-    output = (torch.tensor([[1.0], [2.0]]), [torch.tensor([[3.0], [4.0]])])
-    # Context intentionally has no removed FlashComm fields. Results are global.
-    merged = wrapper._merge_outputs(
-        [output, output], [SimpleNamespace(), SimpleNamespace()]
-    )
-    assert merged[0].tolist() == [[1.0], [2.0], [1.0], [2.0]]
-    assert merged[1][0].tolist() == [[3.0], [4.0], [3.0], [4.0]]
-
-
-@pytest.mark.parametrize("has_stage_metadata", [False, True])
-def test_npu_ubatch_wrapper_reuses_synchronized_stage_dp_metadata(
-    monkeypatch, has_stage_metadata
-):
-    _require_npu_runtime()
-    import torch
-    from vllm.config import CUDAGraphMode
-
-    from afd_plugin.v1.worker.npu import npu_ubatch_wrapper
-
-    stage_metadata = [object(), object()]
-    slices = [SimpleNamespace(num_tokens=4), SimpleNamespace(num_tokens=3)]
-    context = SimpleNamespace(
-        batch_descriptor=SimpleNamespace(has_lora=False, num_active_loras=0),
-        ubatch_slices=slices,
-        cudagraph_runtime_mode=CUDAGraphMode.NONE,
-        attn_metadata=None,
-        additional_kwargs=(
-            {npu_ubatch_wrapper.AFD_UBATCH_DP_METADATA_KEY: stage_metadata}
-            if has_stage_metadata
-            else {}
-        ),
-    )
-    monkeypatch.setattr(npu_ubatch_wrapper, "get_forward_context", lambda: context)
-    monkeypatch.setattr(torch.npu, "current_stream", lambda: "compute-stream")
-
-    wrapper = object.__new__(npu_ubatch_wrapper.AscendUBatchWrapper)
-    wrapper.mla_full_graph_enabled = False
-    wrapper.vllm_config = _vllm_config(data_parallel_size=2)
-    wrapper.runnable = object()
-    wrapper.cudagraphs = {}
-    observed = []
-
-    def make_ubatch_metadata(*args, **_kwargs):
-        observed.append(args[7])
-        return []
-
-    wrapper._make_ubatch_metadata = make_ubatch_metadata
-    wrapper._run_ubatches = lambda _metadata, _model: "ran"
-
-    model_inputs = dict(
-        input_ids=None,
-        positions=None,
-        intermediate_tensors=None,
-        inputs_embeds=None,
-    )
-    if not has_stage_metadata:
-        with pytest.raises(RuntimeError, match="synchronized stage token counts"):
-            wrapper(**model_inputs)
-        assert observed == []
-    else:
-        assert wrapper(**model_inputs) == "ran"
-        assert observed == [stage_metadata]
 
 
 @pytest.mark.parametrize("cudagraph_mode", ["FULL", "FULL_AND_PIECEWISE"])
@@ -3049,19 +1616,22 @@ def test_npu_async_feature_validation_checks_receive_capacity(
 
 
 def test_npu_async_feature_validation_allows_dynamic_quant_zero_or_one():
-    fail_if_unsupported_npu_afd_features(
-        _vllm_config(
-            connector="CAMAsyncAFDConnector",
-            async_dp=True,
-            extra_config={"dynamicQuant": "1"},
-        ),
-    )
+    for dynamic_quant in (0, "1"):
+        fail_if_unsupported_npu_afd_features(
+            _vllm_config(
+                connector="CAMAsyncAFDConnector",
+                async_dp=True,
+                use_mla=True,
+                extra_config={"dynamicQuant": dynamic_quant},
+            ),
+        )
 
     with pytest.raises(RuntimeError, match="dynamicQuant"):
         fail_if_unsupported_npu_afd_features(
             _vllm_config(
                 connector="CAMAsyncAFDConnector",
                 async_dp=True,
+                use_mla=True,
                 extra_config={"dynamicQuant": 2},
             ),
         )
@@ -3130,104 +1700,6 @@ def test_npu_async_moe_ubatching_validation_rejects_unsupported_shape(
         fail_if_unsupported_npu_afd_features(config)
 
 
-@pytest.fixture
-def npu_ubatch_utils(monkeypatch):
-    fake_numpy = ModuleType("numpy")
-    fake_numpy.ndarray = object  # type: ignore[attr-defined]
-    fake_torch = ModuleType("torch")
-    fake_torch.Tensor = object  # type: ignore[attr-defined]
-    fake_vllm = ModuleType("vllm")
-    fake_vllm_config = ModuleType("vllm.config")
-    fake_vllm_config.VllmConfig = object  # type: ignore[attr-defined]
-    fake_vllm_v1 = ModuleType("vllm.v1")
-    fake_vllm_worker = ModuleType("vllm.v1.worker")
-    fake_vllm_ubatch_utils = ModuleType("vllm.v1.worker.ubatch_utils")
-    fake_vllm_ubatch_utils.UBatchSlice = object  # type: ignore[attr-defined]
-    fake_vllm_ubatch_utils.UBatchSlices = list  # type: ignore[attr-defined]
-
-    def check_ubatch_thresholds(config, num_tokens, uniform_decode):
-        if not config.use_ubatching:
-            return False
-        if uniform_decode:
-            return num_tokens >= config.dbo_decode_token_threshold
-        return num_tokens >= config.dbo_prefill_token_threshold
-
-    fake_vllm_ubatch_utils.check_ubatch_thresholds = (  # type: ignore[attr-defined]
-        check_ubatch_thresholds
-    )
-    fake_vllm_ubatch_utils.is_last_ubatch_empty = (  # type: ignore[attr-defined]
-        lambda *_args: False
-    )
-    for name in ("_pad_out_ubatch_slices", "maybe_create_ubatch_slices"):
-        setattr(
-            fake_vllm_ubatch_utils,
-            name,
-            lambda *_args: pytest.fail("unused native helper"),
-        )
-
-    fake_vllm_ascend = ModuleType("vllm_ascend")
-    fake_forward_context = ModuleType("vllm_ascend.ascend_forward_context")
-
-    fake_attention = ModuleType("vllm_ascend.attention")
-    fake_attention_utils = ModuleType("vllm_ascend.attention.utils")
-    fake_attention_utils.AscendCommonAttentionMetadata = (  # type: ignore[attr-defined]
-        object
-    )
-
-    monkeypatch.setitem(sys.modules, "numpy", fake_numpy)
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
-    monkeypatch.setitem(sys.modules, "vllm.config", fake_vllm_config)
-    monkeypatch.setitem(sys.modules, "vllm.v1", fake_vllm_v1)
-    monkeypatch.setitem(sys.modules, "vllm.v1.worker", fake_vllm_worker)
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.v1.worker.ubatch_utils",
-        fake_vllm_ubatch_utils,
-    )
-    monkeypatch.setitem(sys.modules, "vllm_ascend", fake_vllm_ascend)
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm_ascend.ascend_forward_context",
-        fake_forward_context,
-    )
-    monkeypatch.setitem(sys.modules, "vllm_ascend.attention", fake_attention)
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm_ascend.attention.utils",
-        fake_attention_utils,
-    )
-
-    with _temporarily_reimport_module(
-        "afd_plugin.v1.worker.npu.ubatch_utils",
-    ) as ubatch_utils:
-        yield ubatch_utils
-
-
-def test_npu_ubatch_enabled_when_thresholds_are_met(npu_ubatch_utils):
-    config = _vllm_config(
-        enable_dbo=True,
-        use_ubatching=True,
-        num_ubatches=2,
-        ubatch_size=4,
-        dbo_decode_token_threshold=2,
-        dbo_prefill_token_threshold=12,
-    )
-
-    assert npu_ubatch_utils.check_enable_ubatch(
-        num_tokens_unpadded=12,
-        num_tokens_padded=12,
-        uniform_decode=True,
-        vllm_config=config,
-    )
-    assert npu_ubatch_utils.check_enable_ubatch(
-        num_tokens_unpadded=12,
-        num_tokens_padded=12,
-        uniform_decode=False,
-        vllm_config=config,
-    )
-
-
 def _tokens(dp_metadata):
     values = dp_metadata.num_tokens_across_dp_cpu
     if hasattr(values, "tolist"):
@@ -3253,84 +1725,44 @@ class _LifecycleConnector:
 
 
 def _fake_npu_connector_factory(monkeypatch, connector):
-    from afd_plugin.v1.worker.npu import attention_model_runner
+    from afd_plugin.v1.worker.npu import (
+        attention_model_runner_v2 as attention_model_runner,
+    )
 
     monkeypatch.setattr(
         attention_model_runner,
         "_resolve_world_ranks",
         lambda: (3, 0),
     )
+    calls = []
+
+    def create_connector(rank, local_rank, vllm_config, afd_config):
+        calls.append((rank, local_rank))
+        return connector
+
     monkeypatch.setattr(
         attention_model_runner.AFDConnectorFactory,
         "create_connector",
-        lambda rank, local_rank, vllm_config, afd_config: connector,
+        create_connector,
     )
-
-
-@pytest.mark.parametrize(
-    ("is_cam", "compute_gate", "use_mrv2"),
-    [
-        (True, True, False),
-        (False, True, False),
-        (True, False, False),
-        (True, True, True),
-    ],
-)
-def test_npu_ffn_runner_disables_mask_only_for_cam_mrv1(
-    monkeypatch, is_cam, compute_gate, use_mrv2
-):
-    _require_npu_runtime()
-    from afd_plugin.v1.worker.npu import ffn_model_runner as module
-
-    mask = object()
-    monkeypatch.setattr(module.ascend_context, "_reserved_mc2_mask", mask)
-
-    def fake_native_init(self, vllm_config, device):
-        self.model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(num_hidden_layers=1)
-        )
-        module.ascend_context._reserved_mc2_mask = mask
-
-    connector = object.__new__(module.CAMAsyncAFDConnector) if is_cam else object()
-    monkeypatch.setattr(module.NPUModelRunner, "__init__", fake_native_init)
-    monkeypatch.setattr(
-        module, "fail_if_unsupported_npu_afd_features", lambda *a, **k: None
-    )
-    monkeypatch.setattr(module, "_resolve_world_ranks", lambda: (0, 0))
-    monkeypatch.setattr(module, "_use_npu_aclgraph", lambda *a: False)
-    monkeypatch.setattr(module, "create_afd_npu_profiler", lambda *a: None)
-    monkeypatch.setattr(
-        module.AFDConnectorFactory, "create_connector", lambda *a: connector
-    )
-    monkeypatch.setattr(
-        module.AFDNPUFFNModelRunner,
-        "parse_config",
-        staticmethod(
-            lambda config: SimpleNamespace(compute_gate_on_attention=compute_gate)
-        ),
-    )
-
-    module.AFDNPUFFNModelRunner(
-        SimpleNamespace(use_v2_model_runner=use_mrv2), SimpleNamespace(index=0)
-    )
-
-    expected = None if is_cam and compute_gate and not use_mrv2 else mask
-    assert module.ascend_context._reserved_mc2_mask is expected
+    return calls
 
 
 def test_npu_attention_runner_constructor_does_not_initialize_connector(monkeypatch):
     _require_npu_runtime()
-    from afd_plugin.v1.worker.npu import attention_model_runner
+    from afd_plugin.v1.worker.npu import (
+        attention_model_runner_v2 as attention_model_runner,
+    )
 
     events: list[str] = []
-    connector = _LifecycleConnector(events)
+    connector = _LifecycleConnector(events, control_plane=object())
 
     def fake_native_init(self, vllm_config, device):
         self.vllm_config = vllm_config
         self.device = device
 
     monkeypatch.setattr(
-        attention_model_runner.NPUModelRunner,
+        attention_model_runner.NPUModelRunnerV2,
         "__init__",
         fake_native_init,
     )
@@ -3341,8 +1773,8 @@ def test_npu_attention_runner_constructor_does_not_initialize_connector(monkeypa
     )
     monkeypatch.setattr(
         attention_model_runner,
-        "AFDAsyncExtraInfo",
-        lambda: object(),
+        "validate_npu_model_runner_v2_config",
+        lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
         attention_model_runner,
@@ -3350,26 +1782,66 @@ def test_npu_attention_runner_constructor_does_not_initialize_connector(monkeypa
         lambda _name: object(),
     )
     monkeypatch.setattr(
-        attention_model_runner.AFDNPUAttentionModelRunner,
+        attention_model_runner.AFDNPUAttentionModelRunnerV2,
         "parse_config",
         staticmethod(
             lambda _vllm_config: SimpleNamespace(
                 connector="CAMP2pAFDConnector",
+                async_dp=False,
             )
         ),
     )
-    _fake_npu_connector_factory(monkeypatch, connector)
+    connector_calls = _fake_npu_connector_factory(monkeypatch, connector)
 
-    runner = attention_model_runner.AFDNPUAttentionModelRunner(
+    runner = attention_model_runner.AFDNPUAttentionModelRunnerV2(
         _vllm_config(),
-        SimpleNamespace(index=0),
+        SimpleNamespace(index=2, type="npu"),
     )
 
     assert runner.connector is connector
+    assert connector_calls == [(3, 2)]
     # Connector construction is device-light; the collective rendezvous is
     # deferred to load_model() so Attention and FFN weight loading overlap.
     assert events == []
     assert connector.is_initialized is False
+
+
+def test_npu_ffn_connector_uses_model_device_index_for_dp_worker(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    connector = _LifecycleConnector([], control_plane=object())
+    calls = []
+
+    def create_connector(rank, local_rank, vllm_config, afd_config):
+        calls.append((rank, local_rank))
+        return connector
+
+    monkeypatch.setattr(ffn_model_runner, "_resolve_world_ranks", lambda: (7, 0))
+    monkeypatch.setattr(
+        ffn_model_runner.AFDConnectorFactory, "create_connector", create_connector
+    )
+    monkeypatch.setattr(
+        ffn_model_runner,
+        "validate_npu_model_runner_v2_config",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        ffn_model_runner,
+        "fail_if_unsupported_npu_afd_features",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(ffn_model_runner, "create_afd_npu_profiler", lambda _role: None)
+    monkeypatch.setattr(ffn_model_runner, "_use_npu_aclgraph", lambda _config: False)
+    config = _vllm_config(role="ffn")
+    config.model_config.hf_config = SimpleNamespace(num_hidden_layers=43)
+
+    runner = ffn_model_runner.AFDNPUFFNModelRunner(
+        config, SimpleNamespace(index=3, type="npu")
+    )
+
+    assert runner.connector is connector
+    assert calls == [(7, 3)]
 
 
 @pytest.mark.parametrize("use_ubatching", [False, True])
@@ -3378,69 +1850,27 @@ def test_npu_attention_runner_load_model_initializes_connector_after_weights(
     use_ubatching,
 ):
     _require_npu_runtime()
-    from afd_plugin.v1.worker.npu import attention_model_runner
+    from afd_plugin.v1.worker.npu import (
+        attention_model_runner_v2 as attention_model_runner,
+    )
 
     events: list[str] = []
     connector = _LifecycleConnector(events)
-    runner = object.__new__(attention_model_runner.AFDNPUAttentionModelRunner)
+    runner = object.__new__(attention_model_runner.AFDNPUAttentionModelRunnerV2)
     runner.connector = connector
     runner.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(use_ubatching=use_ubatching),
     )
     monkeypatch.setattr(
-        attention_model_runner.NPUModelRunner,
+        attention_model_runner.NPUModelRunnerV2,
         "load_model",
-        lambda self: events.append("model_load"),
-    )
-    if use_ubatching:
-        monkeypatch.setattr(
-            attention_model_runner.AFDNPUAttentionModelRunner,
-            "_install_ascend_ubatch_wrapper",
-            lambda self: events.append("wrapper_install"),
-        )
-
-    runner.load_model()
-
-    expected = ["model_load"]
-    if use_ubatching:
-        # Wrapper installation is local; the connector rendezvous is the
-        # blocking cross-role collective and comes last.
-        expected.append("wrapper_install")
-    expected.append("connector_init")
-    assert events == expected
-    assert connector.is_initialized is True
-
-
-def test_npu_attention_runner_afd_ubatching_does_not_install_native_wrapper(
-    monkeypatch,
-):
-    _require_npu_runtime()
-    from afd_plugin.v1.worker.npu import attention_model_runner
-
-    events: list[object] = []
-    connector = _LifecycleConnector(events)
-    runner = object.__new__(attention_model_runner.AFDNPUAttentionModelRunner)
-    runner.connector = connector
-    runner.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            use_ubatching=False,
-            num_ubatches=0,
-        ),
-    )
-    monkeypatch.setattr(
-        attention_model_runner.NPUModelRunner,
-        "load_model",
-        lambda self: events.append("model_load"),
-    )
-    monkeypatch.setattr(
-        attention_model_runner.AFDNPUAttentionModelRunner,
-        "_install_ascend_ubatch_wrapper",
-        lambda self: events.append("wrapper_install"),
+        lambda self, load_dummy_weights=False: events.append("model_load"),
     )
 
     runner.load_model()
 
     assert events == ["model_load", "connector_init"]
+    assert connector.is_initialized is True
 
 
 @pytest.mark.parametrize(
@@ -3545,8 +1975,8 @@ def test_npu_async_mrv2_rejects_fractional_tp_capacity():
         (False, True, 1, True),
     ],
 )
-def test_async_cam_dbo_configuration_reuses_mrv1_thresholds(
-    npu_ubatch_utils, native_flag, local_flag, dp_size, expected
+def test_async_cam_dbo_configuration_preserves_thresholds(
+    native_flag, local_flag, dp_size, expected
 ):
     from afd_plugin.compat.npu.runtime_config import configure_async_cam_dbo
 
@@ -3563,15 +1993,13 @@ def test_async_cam_dbo_configuration_reuses_mrv1_thresholds(
     configure_async_cam_dbo(config)
     assert config.parallel_config.enable_dbo is expected
     config.parallel_config.use_ubatching = expected
-    assert npu_ubatch_utils.check_enable_ubatch(8, 8, True, config) is expected
-    config.parallel_config.dbo_decode_token_threshold = 9
-    assert not npu_ubatch_utils.check_enable_ubatch(8, 8, True, config)
+    assert config.parallel_config.dbo_decode_token_threshold == 2
+    assert config.parallel_config.dbo_prefill_token_threshold == 8
 
 
-@pytest.mark.parametrize("use_mrv2", [False, True])
 @pytest.mark.parametrize("dp_size", [1, 2])
 def test_async_moe_flag_initializes_two_workspace_lanes_before_runner(
-    monkeypatch, use_mrv2, dp_size
+    monkeypatch, dp_size
 ):
     _require_npu_runtime()
     from vllm.config import ParallelConfig
@@ -3588,9 +2016,7 @@ def test_async_moe_flag_initializes_two_workspace_lanes_before_runner(
         extra_config={"async_moe_ubatching": True},
     )
     config.parallel_config = parallel
-    worker = SimpleNamespace(
-        vllm_config=config, use_v2_model_runner=use_mrv2, _init_device=lambda: "device"
-    )
+    worker = SimpleNamespace(vllm_config=config, _init_device=lambda: "device")
     events = []
     monkeypatch.setattr(
         attention_worker, "assert_compatible_afd_stack", lambda *a, **k: None
@@ -3618,7 +2044,6 @@ def test_async_moe_flag_initializes_two_workspace_lanes_before_runner(
         events.append(("runner", cfg.parallel_config.num_ubatches))
         return object()
 
-    monkeypatch.setattr(attention_worker, "AFDNPUAttentionModelRunner", runner)
     monkeypatch.setattr(attention_worker, "AFDNPUAttentionModelRunnerV2", runner)
     attention_worker.AFDNPUAttentionWorker.init_device(worker)
     assert events == [("validate", True), ("workspace", 2), ("runner", 2)]

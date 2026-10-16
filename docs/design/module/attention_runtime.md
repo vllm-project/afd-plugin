@@ -10,13 +10,12 @@ primary_code_paths:
   - "afd_plugin/v1/worker/attention_model_runner_v2.py"
   - "afd_plugin/v1/worker/attention_worker.py"
   - "afd_plugin/v1/worker/ubatch_wrapper.py"
-  - "afd_plugin/v1/worker/npu/attention_model_runner.py"
   - "afd_plugin/v1/worker/npu/attention_model_runner_v2.py"
   - "afd_plugin/v1/worker/npu/attention_worker.py"
 related_code_paths:
   - "afd_plugin/connectors/**"
   - "afd_plugin/model_executor/**"
-  - "afd_plugin/v1/worker/npu/{forward_context,npu_ubatch_wrapper,ubatch_utils,ubatching}.py"
+  - "afd_plugin/v1/worker/npu/{ubatch_runner,model_io,mla_graph}.py"
 depends_on:
   - "plugin_boundary.md"
   - "connector_contracts.md"
@@ -26,7 +25,6 @@ depends_on:
 validation_paths:
   - "tests/unit/v1/worker/test_attention_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
-  - "tests/unit/v1/worker/test_npu_device_contract.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
   - "tests/unit/v1/worker/test_npu_model_runner_v2.py"
   - "tests/unit/model_executor/test_async_cam_dbo.py"
@@ -80,7 +78,7 @@ worker for the active platform when `worker_cls="auto"`.
 | Platform | Worker | Model runner | Current connectors |
 | --- | --- | --- | --- |
 | CUDA | `afd_plugin.v1.worker.AFDAttentionWorker` | `AFDAttentionModelRunnerV2` (native V2 only) | `P2pNcclAFDConnector` |
-| NPU | `afd_plugin.v1.worker.npu.AFDNPUAttentionWorker` | `AFDNPUAttentionModelRunner` (V1) or `AFDNPUAttentionModelRunnerV2` | `CAMP2pAFDConnector`, `CAMAsyncAFDConnector` (V1 and V2) |
+| NPU | `afd_plugin.v1.worker.npu.AFDNPUAttentionWorker` | `AFDNPUAttentionModelRunnerV2` (native V2 only) | `CAMP2pAFDConnector`, `CAMAsyncAFDConnector` |
 
 CUDA launch shape:
 
@@ -92,7 +90,7 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /path/to/model \
 Ascend launch shape:
 
 ```bash
-VLLM_PLUGINS=ascend,afd vllm serve /path/to/model \
+VLLM_PLUGINS=ascend,afd VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /path/to/model \
   --additional-config '{"afd":{"role":"attention","connector":"CAMP2pAFDConnector","host":"127.0.0.1","port":1239,"num_attention_ranks":1,"num_ffn_ranks":1}}'
 ```
 
@@ -109,7 +107,7 @@ The common Attention initialization sequence is:
 ```text
 vLLM worker construction
   -> validate AFD config, role, connector, and selected worker class
-  -> require CUDA V2 or select and validate the NPU V1/V2 Attention runner
+  -> require and validate native ModelRunnerV2 on CUDA or Ascend
   -> initialize the matching upstream device worker
   -> construct the AFD Attention model runner
   -> derive the role-local AFD rank from DP/TP ranks when needed
@@ -134,8 +132,7 @@ CUDA scopes a native runner-class substitution around `Worker.init_device()`
 and requires the upstream `use_v2_model_runner` setting to construct
 `AFDAttentionModelRunnerV2`; there is no GPU V1 fallback. NPU applies the
 AFD-scoped vLLM-Ascend patches, fixes the all-to-all backend when required, initializes
-the vLLM workspace manager, and directly constructs the matching V1 or V2 NPU
-runner. Their exact inheritance and device mechanisms are specified in
+the vLLM workspace manager, and directly constructs the NPU V2 runner. Their exact inheritance and device mechanisms are specified in
 [execution platforms](execution_platforms.md).
 
 ## ModelRunnerV2 boundary
@@ -147,18 +144,18 @@ execution, sampling, and output ownership. `AFDMetadataProviderMixin` adds the
 connector-facing sidecar, DP control payload, transaction IDs, and capture
 metadata without porting V1 execution methods.
 
-CUDA requires V2. NPU retains its separate V1/V2 selection. The V2 constraints are:
+Both platforms require V2. The paired deployment constraints are:
 
 | Constraint | CUDA V2 | Ascend V2 synchronous | Ascend V2 Async CAM |
 | --- | --- | --- | --- |
 | Connector | Synchronous `P2pNcclAFDConnector` | Synchronous `CAMP2pAFDConnector` | `CAMAsyncAFDConnector`; `async=true` |
 | Gate placement | Model-specific; Qwen requires `compute_gate_on_attention=false` | `compute_gate_on_attention=false` | `compute_gate_on_attention=true` |
 | Parallelism | PP=PCP=DCP=1; configured role ranks equal DP x TP; static EP enabled | Same | Same; `attn_ranks_per_dp` equals Attention TP |
-| Excluded features | Elastic EP, EPLB, sequence-parallel MoE, and compile SP | Same | Elastic EP, EPLB, native draft models/MTP, finegrained TP, and shared-expert DP |
-| Sequence parallelism | Unsupported | Unsupported | Attention-local FlashComm1/SP supported; disabled on FFN; no PCP/DCP |
-| Native DBO | Exactly two microbatches, Attention DP1 or DP > 1 | Eager only; exactly two microbatches, Attention DP > 1 | Eager only; exactly two microbatches at Attention DP1 or DP > 1 |
+| Excluded features | Elastic EP, EPLB, sequence-parallel MoE, and compile SP | Elastic EP and EPLB; model-specific SP restrictions | Elastic EP, EPLB, native draft models/MTP, finegrained TP, and shared-expert DP |
+| Sequence parallelism | Unsupported | Model-specific; synchronous DeepSeek-V2/V3 SP is rejected | Attention-local FlashComm1/SP supported; disabled on FFN; no PCP/DCP |
+| Native DBO | Exactly two microbatches, Attention DP1 or DP > 1 | Eager or graph; exactly two microbatches, Attention DP > 1 | Eager only; exactly two microbatches at Attention DP1 or DP > 1 |
 | AFD async MoE ubatching | Not applicable | Not applicable | Legacy alias for native DBO; split selector is ignored |
-| Graph execution | Eager or `FULL_DECODE_ONLY` | Eager, `FULL`, or `FULL_DECODE_ONLY`; graphs require a single batch | Eager only on both roles |
+| Graph execution | Eager or `FULL_DECODE_ONLY` | Eager, `FULL`, or `FULL_DECODE_ONLY`; plain MLA graph DBO requires `FULL_DECODE_ONLY` | Eager Attention; independent FFN also supports the narrow W4A8 FULL contract |
 | Model | Must resolve to a registered AFD architecture | Same | Registered DeepSeek-V2/V3 MLA or DeepSeek-V4; V4 requires `dynamicQuant=1` |
 
 Both roles validate the paired V2 topology, but only Attention uses the native

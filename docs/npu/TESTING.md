@@ -34,7 +34,8 @@ python3 -m pytest -q -ra \
   tests/unit/model_executor/test_async_cam_dbo.py \
   tests/unit/model_executor/test_async_cam_layout.py \
   tests/unit/v1/worker/test_npu_model_runner_v2.py \
-  tests/unit/v1/worker/test_npu_ubatch_device.py
+  tests/unit/v1/worker/test_npu_model_io.py \
+  tests/unit/v1/worker/test_npu_mla_graph.py
 ```
 
 The single-device executor test uses real NPU streams/events with isolated
@@ -53,9 +54,20 @@ Attention only and enable chunked prefill for DeepSeek-V2/V3. Keep two ubatches
 and eager execution.
 
 For synchronous MRV2 CAMP2P, include eager two-stage execution at Attention
-DP > 1, many-to-one padding, and graph fallback without DBO. MRV2 DBO graphs
-are rejected. Record actual live two-stage execution, response correctness,
-software revisions and teardown outcomes separately.
+DP > 1, many-to-one padding, and graph+DBO. Plain MLA graph+DBO requires
+`FULL_DECODE_ONLY`. Both existing Lite graph+DBO cases must report completed
+joint two-stage replays during real requests on every participating A/F rank.
+Dummy/profile/capture or padded-only stages do not qualify that gate.
+`tests/npu/test_mrv2_graph_inputs.py` separately checks persistent input
+addresses with real NPU graph reads and modeled builders; model correctness
+still belongs to E2E. Record execution, response correctness, revisions and
+teardown outcomes separately.
+
+The original DSV4 Async concurrent case keeps native DBO thresholds. Its ten
+short prompts can remain unsplit while satisfying its exact-answer, `stop`,
+overlap and cleanup contract. Qualify DSV4 DSA two-stage execution separately
+with an above-threshold workload, retaining native defaults and requiring
+completed nonempty stages on every Attention rank.
 
 ## Operator and model gates
 

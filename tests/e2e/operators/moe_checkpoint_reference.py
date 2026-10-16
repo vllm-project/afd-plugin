@@ -129,7 +129,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=29671)
     args = parser.parse_args()
 
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
 
     # Worker setup owns all pinned Ascend operator/quantization registration.
     # Imports remain deferred until CLI setup, just like the worker process.

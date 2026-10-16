@@ -48,7 +48,7 @@ from afd_plugin.model_executor.models.npu.async_cam_dbo import (  # noqa: E402
 from afd_plugin.v1.worker.npu.ubatch_runner import NPUUBatchRunner  # noqa: E402
 
 
-def _exercise(fault, cam_layers=0):
+def _exercise(fault, cam_layers=0, capture=False):
     # Construct only the native execution state; full initialization/metadata
     # and distributed communication are covered by the checkpoint run.
     adapt_patch(is_global_patch=True)
@@ -117,13 +117,14 @@ def _exercise(fault, cam_layers=0):
         ubatching.dbo_yield_and_switch_from_comm_to_compute()
         ubatching.dbo_maybe_run_recv_hook()
         trace.append((stage, "consume"))
-        torch.testing.assert_close(workspace.cpu(), torch.full((4,), stage + 1.0))
+        if not capture:
+            torch.testing.assert_close(workspace.cpu(), torch.full((4,), stage + 1.0))
         if stage == 0 and fault == "owner_consume":
             fail()
         if stage == 0 and fault == "final_exit":
             # Native __exit__ runs this slot after removing registry identity.
             ubatching._CURRENT_CONTEXTS[stage].recv_hook = fail
-        return value
+        return value + workspace if capture else value
 
     outstanding: list[AFDTransferContext] = []
     if cam_layers:
@@ -176,11 +177,38 @@ def _exercise(fault, cam_layers=0):
             return states
 
     before = set(threading.enumerate())
+    original_blas_handle = torch.cuda.current_blas_handle
     try:
         with override_mrv2_in_profile_run(True), torch_cuda_wrapper():
-            result = runner.run(
-                model, {"input_ids": inputs, "positions": inputs}, state
-            )
+            model_inputs = {"input_ids": inputs, "positions": inputs}
+            if capture:
+                # Match the native manager: park threads before graph entry,
+                # then release and join them inside the NPU capture scope.
+                runner.capture_stream.wait_stream(torch.npu.current_stream())
+                with torch.npu.stream(runner.capture_stream):
+                    finish = runner.begin_capturable_run(
+                        model, model_inputs, state, for_capture=True
+                    )
+                    if fault == "abort_before_capture":
+                        runner.abort_pending_run()
+                        injected.append(fault)
+                        raise RuntimeError("injected " + fault)
+                    finish()
+                    trace.clear()
+                    finish = runner.begin_capturable_run(
+                        model, model_inputs, state, for_capture=True
+                    )
+                    graph = torch.npu.NPUGraph()
+                    try:
+                        with torch.npu.graph(graph, stream=runner.capture_stream):
+                            result = finish()
+                    finally:
+                        runner.abort_pending_run()
+                torch.npu.current_stream().wait_stream(runner.capture_stream)
+                inputs.add_(10)
+                graph.replay()
+            else:
+                result = runner.run(model, model_inputs, state)
         assert fault == "none", "injected failure was lost"
         if cam_layers:
             expected = torch.arange(8, dtype=torch.float32)
@@ -193,9 +221,10 @@ def _exercise(fault, cam_layers=0):
                 == cam_layers * 2
             )
         else:
-            torch.testing.assert_close(
-                result.cpu(), torch.arange(8) * 4, check_dtype=False
-            )
+            expected = torch.arange(8) * 4
+            if capture:
+                expected = expected + 40 + torch.tensor([1] * 4 + [2] * 4)
+            torch.testing.assert_close(result.cpu(), expected, check_dtype=False)
             assert trace == [(0, "send"), (1, "send"), (0, "consume"), (1, "consume")]
     except (RuntimeError, threading.BrokenBarrierError):
         if fault == "none":
@@ -210,8 +239,12 @@ def _exercise(fault, cam_layers=0):
     assert not ubatching.dbo_enabled()
     assert all(context is None for context in ubatching._CURRENT_CONTEXTS)
     assert ubatching.forward_context._forward_context is parent
+    assert torch.cuda.current_blas_handle is original_blas_handle
+    assert runner._pending_finish is None
     torch.npu.synchronize()
     print("NPU_DBO_PASS " + fault, flush=True)
+    if capture:
+        print("NPU_DBO_CAPTURE_PASS " + fault, flush=True)
     if cam_layers:
         print("CAM_TRACE " + repr(trace), flush=True)
 
@@ -260,5 +293,23 @@ def test_native_async_cam_window_and_owner_on_npu(fault, layers):
     assert "NPU_DBO_PASS " + fault in result.stdout
 
 
+@pytest.mark.parametrize("fault", ["none", "abort_before_capture"])
+def test_native_npu_capture_replay_and_parked_thread_abort(fault):
+    if not torch.npu.is_available():
+        pytest.skip("requires an allocated NPU")
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), fault, "0", "capture"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "NPU_DBO_CAPTURE_PASS " + fault in result.stdout
+
+
 if __name__ == "__main__":
-    _exercise(sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 0)
+    _exercise(
+        sys.argv[1],
+        int(sys.argv[2]) if len(sys.argv) > 2 else 0,
+        len(sys.argv) > 3 and sys.argv[3] == "capture",
+    )

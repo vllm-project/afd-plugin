@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import builtins
-import sys
-from types import SimpleNamespace
 
 import pytest
 
@@ -84,42 +82,24 @@ def test_maybe_apply_dbo_yield_does_not_probe_ascend(monkeypatch):
     assert maybe_apply_dbo_yield(tensor, role="attention") is tensor
 
 
-def test_dbo_yield_keeps_legacy_ascend_context(monkeypatch):
+def test_dbo_yield_without_native_context_does_not_import_npu_runtime(monkeypatch):
     calls = []
     monkeypatch.setattr(dbo, "dbo_enabled", lambda: False)
+    monkeypatch.setattr(dbo, "dbo_yield", lambda: calls.append("vllm"))
+    real_import = builtins.__import__
 
-    monkeypatch.setitem(
-        sys.modules,
-        "afd_plugin.v1.worker.npu.ubatching",
-        SimpleNamespace(
-            dbo_enabled=lambda: True,
-            dbo_yield=lambda: calls.append("ascend"),
-        ),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.v1.worker.ubatching",
-        SimpleNamespace(
-            dbo_enabled=lambda: True,
-            dbo_yield=lambda: calls.append("vllm"),
-        ),
-    )
+    def check_import(name, *args, **kwargs):
+        assert not name.startswith("afd_plugin.v1.worker.npu")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", check_import)
     dbo._yield_if_dbo_enabled()
-
-    assert calls == ["ascend"]
+    assert calls == []
 
 
 def test_dbo_yield_prefers_native_context_without_importing_legacy(monkeypatch):
     calls = []
 
-    monkeypatch.setitem(
-        sys.modules,
-        "afd_plugin.v1.worker.npu.ubatching",
-        SimpleNamespace(
-            dbo_enabled=lambda: True,
-            dbo_yield=lambda: calls.append("ascend"),
-        ),
-    )
     monkeypatch.setattr(dbo, "dbo_enabled", lambda: True)
     monkeypatch.setattr(dbo, "dbo_yield", lambda: calls.append("vllm"))
     real_import = builtins.__import__

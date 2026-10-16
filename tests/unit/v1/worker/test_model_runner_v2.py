@@ -511,6 +511,10 @@ def test_npu_async_v2_constructor_validates_before_native_and_connector_init(
     config = _v2_config()
     config.model_config.hf_text_config = config.model_config.hf_config
     config.model_config.use_mla = True
+    config.parallel_config.num_ubatches = 2
+    config.parallel_config.use_ubatching = local_ubatching
+    config.parallel_config.dbo_decode_token_threshold = 2
+    config.parallel_config.dbo_prefill_token_threshold = 2
     config.additional_config["afd"].update(
         connector="CAMAsyncAFDConnector",
         async_dp=True,
@@ -561,21 +565,22 @@ def test_npu_v2_validator_accepts_async_cam(dp_size, tp_size, use_sp):
 
 
 @pytest.mark.parametrize("layout", ["moe_sp", "pass_sp"])
-def test_npu_v2_validator_keeps_synchronous_sp_rejection(layout):
+def test_npu_v2_validator_defers_synchronous_sp_to_model_policy(layout):
     config = _v2_config()
     config.additional_config["afd"]["connector"] = "CAMP2pAFDConnector"
     if layout == "moe_sp":
         config.parallel_config.use_sequence_parallel_moe = True
     else:
         config.compilation_config.pass_config.enable_sp = True
-    with pytest.raises(RuntimeError, match="static expert"):
-        validate_npu_model_runner_v2_config(
-            config, expected_role="attention", device_type="npu"
-        )
+    # Model construction, rather than a backend-wide guard, owns effective SP.
+    # DeepSeek V2's negative construction regression is retained separately.
+    validate_npu_model_runner_v2_config(
+        config, expected_role="attention", device_type="npu"
+    )
 
 
 @pytest.mark.parametrize("invalid", [None, "graph", "dp1", "stages", "speculative"])
-def test_npu_v2_dbo_is_sync_eager_dp2_only(invalid):
+def test_npu_v2_dbo_accepts_eager_or_graph_dp2_and_rejects_invalid_layout(invalid):
     config = _v2_config(num_attention_ranks=2, data_parallel_size=2)
     config.additional_config["afd"]["connector"] = "CAMP2pAFDConnector"
     config.parallel_config.enable_dbo = True
@@ -583,6 +588,7 @@ def test_npu_v2_dbo_is_sync_eager_dp2_only(invalid):
     config.parallel_config.num_ubatches = 2
     if invalid == "graph":
         config.model_config.enforce_eager = False
+        config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
     elif invalid == "dp1":
         config.parallel_config.data_parallel_size = 1
         config.additional_config["afd"]["num_attention_ranks"] = (
@@ -592,7 +598,7 @@ def test_npu_v2_dbo_is_sync_eager_dp2_only(invalid):
         config.parallel_config.num_ubatches = 3
     elif invalid == "speculative":
         config.speculative_config = object()
-    if invalid is None:
+    if invalid in (None, "graph"):
         validate_npu_model_runner_v2_config(
             config, expected_role="attention", device_type="npu"
         )

@@ -249,6 +249,19 @@ def test_standard_attention_constructs_no_ffn_parameters(
     assert not any(name.startswith("mlp.") for name in _parameter_names(moe))
 
 
+def test_npu_async_ffn_layer_inventory_excludes_dense_and_pp_placeholders(
+    monkeypatch, construction_env
+):
+    model = object.__new__(adapter.AFDDeepseekV2Model)
+    nn.Module.__init__(model)
+    dense = _make_layer(monkeypatch, role="ffn", layer_idx=0, attention_gate=True)
+    moe = _make_layer(monkeypatch, role="ffn", layer_idx=2, attention_gate=True)
+    assert not moe.uses_remote_experts, "NPU does not use the CUDA remote proxy"
+    model.layers = nn.ModuleList([dense, nn.Identity(), moe])
+    # #461 iterates this inventory before submitting its first CAM receive.
+    assert model.get_experts_layer_indices() == (2,)
+
+
 def test_attention_gate_keeps_dense_local_and_gate_at_mlp_path(
     monkeypatch,
     construction_env,
@@ -893,7 +906,7 @@ def test_npu_async_attention_allows_model_owned_sp(
     "device_type,connector",
     [
         ("cuda", "CAMAsyncAFDConnector"),
-        ("npu", "CAMP2pConnector"),
+        ("npu", "CAMP2pAFDConnector"),
     ],
 )
 def test_sp_remains_rejected_outside_npu_async_attention(

@@ -43,53 +43,27 @@ def ascend_forward_context(
     if aclgraph_runtime_mode is None:
         aclgraph_runtime_mode = CUDAGraphMode.NONE
 
-    if vllm_config.use_v2_model_runner:
-        from vllm.forward_context import set_forward_context
-        from vllm_ascend.ascend_forward_context import override_mrv2_in_profile_run
+    from vllm.forward_context import set_forward_context
+    from vllm_ascend.ascend_forward_context import override_mrv2_in_profile_run
 
-        # MRv2 stores Ascend-specific state in ForwardContext.additional_kwargs.
-        # Using the legacy context manager here writes attributes directly on
-        # ForwardContext, while vllm-ascend's _EXTRA_CTX proxy reads only the
-        # additional mapping in MRv2. Scope the upstream MRv2 profile marker so
-        # its platform hook installs balanced-MoE and communication state in the
-        # same layout used by the native runner.
-        with (
-            override_mrv2_in_profile_run(in_profile_run),
-            set_forward_context(
-                None,
-                vllm_config,
-                num_tokens=int(num_tokens),
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=aclgraph_runtime_mode,
-                batch_descriptor=None,
-            ),
-        ):
-            forward_context = get_forward_context()
-            forward_context.additional_kwargs["afd_metadata"] = afd_metadata
-            forward_context.additional_kwargs["model_instance"] = model_instance
-            if input_ids is not None:
-                forward_context.input_ids = input_ids
-            yield forward_context
-        return
-
-    from vllm_ascend.ascend_forward_context import set_ascend_forward_context
-
-    with set_ascend_forward_context(
-        None,
-        vllm_config,
-        batch_descriptor=None,
-        aclgraph_runtime_mode=aclgraph_runtime_mode,
-        model_instance=model_instance,
-        num_tokens=int(num_tokens),
-        num_tokens_across_dp=num_tokens_across_dp,
-        in_profile_run=in_profile_run,
+    # Ascend MRV2 reads its state from additional_kwargs. FFN supplies exactly
+    # this native context layout, including the thread-local profile marker.
+    with (
+        override_mrv2_in_profile_run(in_profile_run),
+        set_forward_context(
+            None,
+            vllm_config,
+            num_tokens=int(num_tokens),
+            num_tokens_across_dp=num_tokens_across_dp,
+            cudagraph_runtime_mode=aclgraph_runtime_mode,
+            batch_descriptor=None,
+        ),
     ):
         forward_context = get_forward_context()
-        if skip_mc2_mask:
-            forward_context.mc2_mask = None
-        if forward_context.additional_kwargs is None:
-            forward_context.additional_kwargs = {}
         forward_context.additional_kwargs["afd_metadata"] = afd_metadata
+        forward_context.additional_kwargs["model_instance"] = model_instance
+        if skip_mc2_mask:
+            forward_context.additional_kwargs["mc2_mask"] = None
         if input_ids is not None:
             forward_context.input_ids = input_ids
         yield forward_context

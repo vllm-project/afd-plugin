@@ -53,13 +53,18 @@ The connector creates these communication groups:
 
 ## DBO and ubatching
 
-Select the runner explicitly on both roles with
-`VLLM_USE_V2_MODEL_RUNNER=0` (V1) or `1` (V2). V1 supports the documented
-two-stage ACL graph path. V2 DBO requires `--enforce-eager`, Attention DP > 1,
-exactly two microbatches, and no speculative decoding. V2 also requires
-static EP, PP=PCP=DCP=1, and each role's ranks equal to DP x TP; SP MoE and
-compile SP are rejected. Without DBO, V2 accepts eager, `FULL`, or
-`FULL_DECODE_ONLY`. The [NPU testing guide](TESTING.md) separates executor
+Set `VLLM_USE_V2_MODEL_RUNNER=1` on both roles. Attention extends native
+Ascend MRV2; synchronous FFN is an independent connector-driven runner.
+There is no MRV1 execution or fallback. Without DBO, the runner accepts
+eager, `FULL`, or `FULL_DECODE_ONLY`. Plain MLA graph+DBO requires
+`FULL_DECODE_ONLY`; `FULL` is rejected for that backend. SFA/DSA use the
+generic graph path, whose accepted modes do not establish model qualification.
+DBO requires Attention DP > 1, exactly two microbatches, and no speculative
+decoding. The pair requires static EP, PP=PCP=DCP=1, and each
+role's ranks equal to DP x TP. Sequence parallelism follows the model
+contract; synchronous DeepSeek-V2/V3 rejects effective model SP. Native MRV2
+owns request slicing, capture, graph selection, replay and output merge.
+AFD supplies stage-specific Ascend metadata and CAMP2P control/communication. The [NPU testing guide](TESTING.md) separates executor
 checks from model correctness evidence.
 
 DBO is configured with vLLM CLI flags, not inside the `afd` object:
@@ -167,13 +172,13 @@ process groups. `HCCL_BUFFSIZE` remains a process-wide fallback.
 This example uses six NPUs on one host. It is a configuration template: replace
 `/path/to/model` and add any model-specific vLLM options required by the model.
 
-This graph + DBO template selects ModelRunnerV1 and loads both the Ascend
-and AFD plugins on each role.
+This graph + DBO template selects native ModelRunnerV2 and loads both the
+Ascend and AFD plugins on each role.
 
 The FFN service uses devices `4,5`:
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=4,5 VLLM_PLUGINS=ascend,afd VLLM_USE_V2_MODEL_RUNNER=0 \
+ASCEND_RT_VISIBLE_DEVICES=4,5 VLLM_PLUGINS=ascend,afd VLLM_USE_V2_MODEL_RUNNER=1 \
 vllm serve /path/to/model \
   --host 127.0.0.1 \
   --port 8001 \
@@ -211,7 +216,7 @@ vllm serve /path/to/model \
 The Attention service uses devices `0,1,2,3`:
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 VLLM_PLUGINS=ascend,afd VLLM_USE_V2_MODEL_RUNNER=0 \
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 VLLM_PLUGINS=ascend,afd VLLM_USE_V2_MODEL_RUNNER=1 \
 vllm serve /path/to/model \
   --host 127.0.0.1 \
   --port 8000 \

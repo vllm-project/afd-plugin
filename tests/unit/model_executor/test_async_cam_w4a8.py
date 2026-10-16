@@ -74,8 +74,9 @@ def operators(monkeypatch):
 
 @pytest.mark.parametrize("per_channel", [True, False])
 @pytest.mark.parametrize("layer_ids", [(0, 1), (2, 5)])
+@pytest.mark.parametrize("via_graph", [False, True])
 def test_device_layer_selection_capacity_and_scaling(
-    monkeypatch, operators, per_channel, layer_ids
+    monkeypatch, operators, per_channel, layer_ids, via_graph
 ):
     layers = [weights(idx, per_channel) for idx in reversed(layer_ids)]
     executor = AsyncCAMW4A8Executor(layers)
@@ -91,7 +92,10 @@ def test_device_layer_selection_capacity_and_scaling(
     with monkeypatch.context() as hot:
         for method in ("cpu", "item", "tolist", "__int__", "__bool__"):
             hot.setattr(torch.Tensor, method, reject_host_read)
-        output = executor(hidden, scales, counts, metadata)
+        if via_graph:
+            output = executor(hidden, scales, counts, metadata, retained_tensors=[])
+        else:
+            output = executor(hidden, scales, counts, metadata)
     torch.testing.assert_close(metadata, original)
     assert output.shape == (8, 32)
     assert output.dtype == torch.bfloat16
@@ -134,6 +138,7 @@ def test_nonzero_swiglu_limit_starts_without_passing_a_clamp(operators):
     )
     assert len(operators) == 2
     assert "clamp_value" not in operators[0][2]
+    assert "swiglu_limit" not in operators[0][2]
 
 
 def test_repeated_interleaved_layer_ids(operators):

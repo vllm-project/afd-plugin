@@ -171,7 +171,7 @@ Role mismatches, unsupported platforms, non-standard Ascend workers, and
 incorrect explicit worker paths fail before device execution. CAM async always
 uses the NPU worker family.
 
-CUDA requires ModelRunnerV2; NPU retains its separate runner selection. V2
+CUDA and Ascend require ModelRunnerV2. Role
 role workers apply an additional CPU-safe deployment validator before
 communication resources are created. Both roles must use PP/PCP/DCP size 1,
 role ranks equal to DP x TP, static EP, and a registered AFD model; elastic EP
@@ -181,11 +181,12 @@ The DP1 path has H20 DeepSeek-V2-Lite DP1/TP2 Graph + DBO validation with
 128 GSM8K samples and live two-stage/full-replay assertions.
 Ascend V2 accepts synchronous `CAMP2pAFDConnector` with FFN-side gating or
 eager `CAMAsyncAFDConnector` with async DP and Attention-side gating. Ascend
-V2 native DBO is eager-only with exactly two microbatches and no speculative
-decoding: CAMP2P requires Attention DP > 1, while Async CAM also supports
-DP1 and enables DBO only on Attention. Synchronous V2 rejects sequence-parallel
-MoE and compile SP; Async CAM permits Attention-local model SP under its
-feature validator. Graph-mode details belong to
+native DBO requires exactly two microbatches and no speculative decoding.
+CAMP2P requires Attention DP > 1 and supports eager/graph DBO; plain MLA
+graph DBO requires `FULL_DECODE_ONLY`. Async CAM supports eager Attention
+DBO at DP1 or DP > 1. Its FFN FULL mode requires DBO disabled on all ranks.
+Sequence parallelism follows model policy; synchronous DeepSeek-V2/V3 SP is
+rejected, while Async CAM permits Attention-local model SP. Graph-mode details belong to
 [execution platforms](execution_platforms.md).
 
 The following internal paths remain loadable for compatibility with existing
@@ -194,7 +195,7 @@ commands:
 | Platform | Attention | FFN | Related runtime path |
 | --- | --- | --- | --- |
 | CUDA | `afd_plugin.v1.worker.AFDAttentionWorker` | `afd_plugin.v1.worker.AFDFFNWorker` | `AFDAttentionModelRunnerV2` and connector-driven `GPUFFNModelRunner` are lazy exports; no GPU V1 fallback exists |
-| NPU | `afd_plugin.v1.worker.npu.AFDNPUAttentionWorker` | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | `AFDNPUAttentionModelRunner`, `AFDNPUAttentionModelRunnerV2`, and `AFDNPUFFNModelRunner` in the same module namespace |
+| NPU | `afd_plugin.v1.worker.npu.AFDNPUAttentionWorker` | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | Native `AFDNPUAttentionModelRunnerV2`; independent `AFDNPUFFNModelRunner` (sync) or `AsyncNPUFFNModelRunner` selected by connector; no MRV1 fallback |
 
 New commands should omit `--worker-cls`. These paths may change with the pinned
 runtime integration and are not stable third-party extension interfaces.
@@ -213,8 +214,8 @@ method to `spawn` and redirects explicit `forkserver` contexts as well, so
 spawned model workers apply the workaround before Ascend TE Fusion startup.
 Without this switch, package import leaves multiprocessing selection alone.
 
-`VLLM_USE_V2_MODEL_RUNNER` belongs to the upstream runtime. GPU launches
-require `1` on both roles; NPU retains V1/V2 construction selection. The
+`VLLM_USE_V2_MODEL_RUNNER` belongs to the upstream runtime. CUDA and Ascend
+launches require `1` on both roles; neither backend retains V1 selection. The
 switch does not activate AFD or relax AFD validation.
 
 ## Failure and ownership rules

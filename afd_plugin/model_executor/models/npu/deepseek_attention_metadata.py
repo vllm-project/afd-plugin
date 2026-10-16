@@ -53,6 +53,9 @@ def materialize_deepseek_attention_metadata(
     metadata: AttentionMetadata,
     input_positions: torch.Tensor,
     num_input_tokens: int,
+    *,
+    rope_buffers: dict[str, torch.Tensor] | None = None,
+    rope_capacity: int = 0,
 ) -> None:
     """Detach mutable backend workspaces from one metadata object.
 
@@ -61,6 +64,9 @@ def materialize_deepseek_attention_metadata(
     DBO and Async CAM build multiple metadata objects before executing all of
     them. A later build must not change an earlier metadata object.
 
+    FULL graphs pass stage-owned persistent buffers: their captured pointers
+    must observe later positions as well as isolate the two prepared stages.
+    Eager callers retain fresh copies for independently live metadata objects.
     Only mutable runtime storage is materialized here.  Immutable RoPE tables,
     KV-cache tensors, masks, block tables, and other read-only inputs continue
     to be shared with the upstream runtime.
@@ -69,8 +75,8 @@ def materialize_deepseek_attention_metadata(
     if isinstance(metadata, AscendSFAMetadata):
         # SFA always asks get_cos_and_sin_mla() for its reusable runtime
         # buffer, for both prefill and decode.
-        metadata.cos = metadata.cos.clone()
-        metadata.sin = metadata.sin.clone()
+        metadata.cos = _own_rope(metadata.cos, "cos", rope_buffers, rope_capacity)
+        metadata.sin = _own_rope(metadata.sin, "sin", rope_buffers, rope_capacity)
         return
 
     if isinstance(metadata, AscendMLAMetadata):
@@ -79,11 +85,19 @@ def materialize_deepseek_attention_metadata(
         # buffers.  Materialize both paths so ownership does not depend on
         # that backend implementation detail.
         if metadata.prefill is not None:
-            metadata.prefill.cos = metadata.prefill.cos.clone()
-            metadata.prefill.sin = metadata.prefill.sin.clone()
+            metadata.prefill.cos = _own_rope(
+                metadata.prefill.cos, "prefill.cos", rope_buffers, rope_capacity
+            )
+            metadata.prefill.sin = _own_rope(
+                metadata.prefill.sin, "prefill.sin", rope_buffers, rope_capacity
+            )
         if metadata.decode is not None:
-            metadata.decode.cos = metadata.decode.cos.clone()
-            metadata.decode.sin = metadata.decode.sin.clone()
+            metadata.decode.cos = _own_rope(
+                metadata.decode.cos, "decode.cos", rope_buffers, rope_capacity
+            )
+            metadata.decode.sin = _own_rope(
+                metadata.decode.sin, "decode.sin", rope_buffers, rope_capacity
+            )
         return
 
     if isinstance(metadata, AscendDSAMetadata):
@@ -91,26 +105,59 @@ def materialize_deepseek_attention_metadata(
         # exact physical token span before another async stage reuses the
         # process-wide runtime RoPE buffers.
         assert metadata.req_metadata is not None
-        metadata.req_metadata.cos, metadata.req_metadata.sin = get_cos_and_sin_dsa(
+        cos, sin = get_cos_and_sin_dsa(
             input_positions[:num_input_tokens].long(),
             use_cache=False,
         )
+        if rope_buffers is None:
+            metadata.req_metadata.cos, metadata.req_metadata.sin = cos, sin
+        else:
+            metadata.req_metadata.cos = _own_rope(
+                cos, "request.cos", rope_buffers, rope_capacity
+            )
+            metadata.req_metadata.sin = _own_rope(
+                sin, "request.sin", rope_buffers, rope_capacity
+            )
+
+
+def _own_rope(
+    value: torch.Tensor,
+    field: str,
+    buffers: dict[str, torch.Tensor] | None,
+    capacity: int,
+) -> torch.Tensor:
+    if buffers is None:
+        return value.clone()
+    if field not in buffers:
+        buffers[field] = torch.empty(
+            (capacity, *value.shape[1:]), dtype=value.dtype, device=value.device
+        )
+    return buffers[field][: value.shape[0]].copy_(value)
 
 
 def materialize_deepseek_attention_metadata_by_layer(
     metadata_by_layer: Mapping[str, AttentionMetadata],
     input_positions: torch.Tensor,
     num_input_tokens: int,
+    *,
+    rope_buffers: dict[str, dict[str, torch.Tensor]] | None = None,
+    rope_capacity: int = 0,
 ) -> None:
     """Materialize each shared attention-group metadata object exactly once."""
 
     materialized_ids: set[int] = set()
-    for metadata in metadata_by_layer.values():
+    for layer, metadata in metadata_by_layer.items():
         metadata_id = id(metadata)
         if metadata_id in materialized_ids:
             continue
         materialize_deepseek_attention_metadata(
-            metadata, input_positions, num_input_tokens
+            metadata,
+            input_positions,
+            num_input_tokens,
+            rope_buffers=rope_buffers.setdefault(layer, {})
+            if rope_buffers is not None
+            else None,
+            rope_capacity=rope_capacity,
         )
         materialized_ids.add(metadata_id)
 
