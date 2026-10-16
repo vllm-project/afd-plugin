@@ -315,6 +315,7 @@ def test_async_connector_init_creates_attention_first_hccl_group(monkeypatch):
 
     def fake_init_afd_process_group(**kwargs):
         calls.append(kwargs)
+        connector.graph_startup.mode = "eager"
         backend = SimpleNamespace(
             get_hccl_comm_name=lambda rank: f"hccl:{kwargs['group_name']}:{rank}",
         )
@@ -352,6 +353,7 @@ def test_async_connector_init_creates_attention_first_hccl_group(monkeypatch):
             "timeout": calls[0]["timeout"],
             "init_method": "tcp://127.0.0.1:1239",
             "pg_options": pg_options,
+            "store_callback": connector._initialize_graph_startup,
         },
     ]
     assert connector.cam_pg is not None
@@ -373,6 +375,7 @@ def test_async_connector_init_uses_one_hccl_group_for_all_dp(monkeypatch):
 
     def fake_init_afd_process_group(**kwargs):
         calls.append(kwargs)
+        connector.graph_startup.mode = "eager"
         backend = SimpleNamespace(
             get_hccl_comm_name=lambda rank: f"hccl:{kwargs['group_name']}:{rank}",
         )
@@ -1010,6 +1013,7 @@ def test_async_receive_anchor_uses_model_dtype(monkeypatch, dtype):
     config = _vllm_config()
     config.model_config.dtype = dtype
     connector = CAMAsyncAFDConnector(0, 0, config, _afd_config(role="ffn"), 0)
+    connector.graph_startup.mode = "eager"
     connector.init_afd_connector()
     assert connector._placeholder.dtype == dtype
 

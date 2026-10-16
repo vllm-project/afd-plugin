@@ -15,15 +15,12 @@ from afd_plugin.config import (
     parse_afd_config,
 )
 from afd_plugin.envs import async_cam_layered_gmm_enabled
+from afd_plugin.validation import cam_receive_capacity, requested_ffn_mode
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
     from afd_plugin.connectors.base import ConnectorExtraInfo
-
-
-# Match MAX_SEQUENCE_LENGTH in csrc/npu/pybind/torch_binding_cam_async.cpp.
-_CAM_MAX_RECEIVE_TOKENS = 1024 * 256
 
 
 def fail_if_unsupported_npu_afd_features(
@@ -189,9 +186,15 @@ def _fail_if_unsupported_npu_afd_async_features(
             "with async=true and connector='CAMAsyncAFDConnector'",
         )
     if not bool(vllm_config.model_config.enforce_eager):
-        raise RuntimeError(
-            "CAMAsyncAFDConnector supports only eager Attention/FFN execution",
-        )
+        if afd_config.is_attention_server:
+            raise RuntimeError(
+                "CAMAsyncAFDConnector supports only eager Attention execution"
+            )
+        requested_ffn_mode(vllm_config)
+        if not vllm_config.use_v2_model_runner:
+            raise RuntimeError("Async FFN FULL requires MRV2")
+        if parallel_config.tensor_parallel_size != 1:
+            raise RuntimeError("Async FFN FULL requires F TP=1")
     if bool(parallel_config.enable_dbo) or bool(parallel_config.use_ubatching):
         if not afd_config.is_attention_server:
             raise RuntimeError("Async CAM DBO/ubatching requires the Attention role")
@@ -239,7 +242,7 @@ def _fail_if_unsupported_npu_afd_async_features(
         ) from exc
     if not 0 < batch_size_factor <= 1:
         raise RuntimeError("BATCH_SIZE_FACTOR must be a decimal number in (0, 1]")
-    receive_capacity = int(_CAM_MAX_RECEIVE_TOKENS * batch_size_factor)
+    receive_capacity = cam_receive_capacity()
     max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
     # whole-expert chunks need a full TP group's batch; smaller
     # buffers require native sub-expert chunking.

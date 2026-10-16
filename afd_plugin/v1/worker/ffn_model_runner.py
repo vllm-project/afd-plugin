@@ -37,13 +37,13 @@ from afd_plugin.v1.worker.cuda_graph import (
     validate_cuda_graph_mode,
 )
 from afd_plugin.v1.worker.ffn_metadata import (
+    _set_moe_layer_index,
     aggregate_ffn_token_counts,
     project_ffn_token_counts_to_dp,
 )
 from afd_plugin.validation import validate_gpu_model_runner_v2_config
 
 if TYPE_CHECKING:
-    from vllm.forward_context import ForwardContext
     from vllm.sequence import IntermediateTensors
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
@@ -465,18 +465,6 @@ def _resolve_world_ranks() -> tuple[int, int]:
 def _ffn_forward_context(vllm_config: VllmConfig):
     with set_forward_context(attn_metadata=None, vllm_config=vllm_config):
         yield get_forward_context()
-
-
-def _set_moe_layer_index(forward_context: ForwardContext, layer_idx: int) -> None:
-    all_moe_layers = forward_context.all_moe_layers
-    if not all_moe_layers:
-        return
-
-    target = f".layers.{int(layer_idx)}."
-    for idx, layer_name in enumerate(all_moe_layers):
-        if target in f".{layer_name}.":
-            forward_context.moe_layer_index = idx
-            return
 
 
 def _make_dp_metadata_payload(

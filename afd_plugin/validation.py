@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import importlib
-from typing import TYPE_CHECKING, Any, Final
+import os
+import struct
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
@@ -38,6 +40,37 @@ VLLM_ASCEND_NPU_WORKER_FQCN: Final[str] = "vllm_ascend.worker.worker.NPUWorker"
 VLLM_ASCEND_310P_WORKER_FQCN: Final[str] = "vllm_ascend._310p.worker_310p.NPUWorker310"
 VLLM_ASCEND_XLITE_WORKER_FQCN: Final[str] = "vllm_ascend.xlite.xlite_worker.XliteWorker"
 GPU_MRV2_NUM_UBATCHES: Final[int] = 2
+
+
+CAM_MAX_RECEIVE_TOKENS = 262144
+CAM_MAX_SOURCE_ROWS = (1 << 16) - 1
+
+
+def cam_receive_capacity() -> int:
+    # Match the native std::stof + float multiplication, including rounding.
+    factor = struct.unpack(
+        "f", struct.pack("f", float(os.environ.get("BATCH_SIZE_FACTOR", "1")))
+    )[0]
+    return int(CAM_MAX_RECEIVE_TOKENS * factor)
+
+
+def requested_ffn_mode(config: VllmConfig) -> Literal["eager", "full"]:
+    if config.model_config.enforce_eager:
+        return "eager"
+    if config.compilation_config.cudagraph_mode.name != "FULL":
+        raise ValueError("Async FFN graph requires explicit cudagraph_mode=FULL")
+    return "full"
+
+
+def validate_graph_capacity(max_tokens: int, tp_size: int, capacity: int) -> None:
+    if min(max_tokens, tp_size, capacity) <= 0 or max_tokens % tp_size:
+        raise ValueError("Graph dispatch envelope must be positive and divisible by TP")
+    if capacity < max_tokens:
+        raise ValueError(
+            "Async FFN graph capacity is smaller than the dispatch envelope"
+        )
+    if max_tokens // tp_size > CAM_MAX_SOURCE_ROWS:
+        raise ValueError("Async CAM graph source rows exceed the uint16 protocol bound")
 
 
 def validate_gpu_model_runner_v2_config(
@@ -128,9 +161,12 @@ def validate_npu_model_runner_v2_config(
                 "compute_gate_on_attention=true",
             )
         if not vllm_config.model_config.enforce_eager:
-            raise RuntimeError(
-                "AFD NPU ModelRunnerV2 Async CAM requires eager execution"
-            )
+            if expected_role == "attention":
+                raise RuntimeError(
+                    "AFD NPU ModelRunnerV2 Async CAM requires eager execution "
+                    "on Attention"
+                )
+            requested_ffn_mode(vllm_config)
     elif (
         afd_config.connector != CAMP2P_CONNECTOR or afd_config.compute_gate_on_attention
     ):

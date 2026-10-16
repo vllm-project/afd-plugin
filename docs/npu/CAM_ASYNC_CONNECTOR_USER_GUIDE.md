@@ -21,7 +21,7 @@ Use this connector for eager asynchronous Ascend inference with these requiremen
 
 - plugin-owned Ascend operators are built and installed on every node;
 - Attention performs MoE gating before dispatch to FFN ranks;
-- execution is eager and AFD async-DP is enabled; **`async_dp=true` is required**;
+- Attention execution is eager and AFD async-DP is enabled; **`async_dp=true` is required**;
 - regular prefill and autoregressive decode steps use the same CAM path;
 - optional ubatching uses exactly two native DBO microbatches in MRV1 and MRV2,
   including Attention DP1.
@@ -30,6 +30,12 @@ CAM async supports eager execution. Native DBO requires Attention-side gating,
 PP=PCP=DCP=1, and two ubatches. A step below the native DBO threshold runs
 unsplit locally. Both token thresholds must be at least two.
 Attention DP replicas make that decision independently; FFN is connector-driven.
+
+FFN also supports the experimental complete-transaction FULL mode described in
+[Async FFN runtime](ASYNC_FFN_RUNTIME.md#selection-and-startup).
+FULL requires MRV2 on both roles and accepts Attention-side DBO under the
+existing constraints. Attention graph execution remains unsupported. The
+DBO + FFN FULL combination has not yet been validated on device.
 
 ## ModelRunnerV2 deployment
 
@@ -41,8 +47,11 @@ runner. Use the pinned vLLM/vLLM-Ascend pair in the installation instructions.
 The V2 Async CAM contract is:
 
 - registered DeepSeek-V2/V3 MLA or DeepSeek-V4 models;
-- `--enforce-eager` and `--enable-expert-parallel` on both roles, with
+- `--enforce-eager` on Attention and `--enable-expert-parallel` on both roles, with
   `async_dp=true` and `compute_gate_on_attention=true`;
+- on FFN, select eager with `--enforce-eager`; for FULL, omit `--enforce-eager`
+  and pass `--compilation-config '{"cudagraph_mode":"FULL"}'`, following the narrow
+  W4A8/runtime contract in the linked Async FFN guide;
 - PP=PCP=DCP=1, static expert placement, and each role's configured rank count
   equal to its DP x TP size;
 - `attn_ranks_per_dp` equal to Attention TP, and Attention
@@ -288,7 +297,10 @@ actual vendor library path. Missing source operators fail startup.
 
 ## Current limitations
 
-- Eager execution only; ACL graph mode is unsupported.
+- Attention is eager. FFN FULL targets homogeneous W4A8 layers on A3/910C;
+  see [supported configuration](ASYNC_FFN_RUNTIME.md#selection-and-startup)
+  and [validation commands](ASYNC_FFN_RUNTIME.md#validation).
+  Broader models and topologies require separate validation.
 - Regular prefill and autoregressive decode steps are supported; context
   parallel execution remains outside the supported Async CAM topology.
 - Native DBO requires eager Attention, two ubatches, and no speculative
@@ -316,7 +328,8 @@ AFD_ASYNC_CAM_LAYERED_GMM=1 bash /path/to/W4A8-FFN-launch-script.sh
 ```
 
 The intended configuration is Ascend 910C / `ascend910_93`, async CAM FFN,
-Attention-side gate, `dynamicQuant=1`, eager execution, and static expert
+Attention-side gate, `dynamicQuant=1`, eager execution (or the separately
+qualified FFN FULL mode), and static expert
 placement. `VLLM_USE_V2_MODEL_RUNNER=1` may be set on both roles; FFN still uses
 its connector-driven runner. This path applies only to Ascend DeepSeek V4;
 enabling the switch for another model fails at startup. All remote MoE layers must share geometry,
@@ -331,11 +344,13 @@ per-group weights.
 Shared experts remain on Attention. DSV4 applies routed scaling in top-k, so
 FFN does not apply it again.
 
-The existing fused operator does not apply a nonzero `swiglu_limit`. The
-layered path temporarily ignores the model's limit and logs
-`swiglu_limit=<value> ignored=True`; its output must not be treated as a
-precision-equivalent replacement until the fused operator implements the
-clamp. Missing `w13_scale_bias` or `w2_scale_bias`, dynamic EPLB, non-SiLU
+The graph change preserves the existing layered arithmetic: `swiglu_limit` is
+recorded but is not applied by layered W13. Ordinary eager may apply it, so
+FULL must be compared with corresponding layered eager, not treated as a fix
+for their pre-existing difference. FULL reuses the existing native DR and CS operators. See
+[resource lifetime](ASYNC_FFN_RUNTIME.md#resource-lifetime) for completion and
+process-cleanup requirements.
+Missing `w13_scale_bias` or `w2_scale_bias`, dynamic EPLB, non-SiLU
 activation, or incompatible parameters fail before receiving work. Non-W4A8,
 mixed-quantization, and heterogeneous layers stay on the legacy path with a
 startup reason. Do not fill absent compensation parameters with zeros merely
@@ -346,7 +361,9 @@ slice of the original metadata, or a device mapping, selects the layer; the
 original metadata goes to combine-send. Empty ranks, chunks, and ubatches use
 the existing communication protocol. With `AFD_CAM_OP_IO_LOG` enabled, the new
 path logs only Tensor shape, dtype, and device without reading metadata values.
-The existing synchronization after each work-item group remains. Measure peak
+The Async eager worker synchronizes after each complete FFN layer loop; FULL
+submits a bounded batch on one stream and waits once for that batch. These
+submission loops do not define request boundaries. Measure peak
 memory for the capacity-sized intermediates, and set `BATCH_SIZE_FACTOR` high
 enough for every whole-expert chunk.
 
@@ -355,11 +372,13 @@ counts, parameter rejection, startup selection, and the absence of explicit
 metadata D2H in the new Python path. They do not establish NPU numerical
 accuracy, empty-work completion, hidden synchronization, or a performance gain.
 Run the compiled Meta and NPU numerical tests described in the
-[testing guide](TESTING.md#layered-w4a8-validation). Multi-rank CAM completion,
-checkpoint accuracy, profiling, and A/B performance still need target-device
-validation.
+[testing guide](TESTING.md#layered-w4a8-validation) and the
+[FULL runtime checks](ASYNC_FFN_RUNTIME.md#validation). Deployments require
+target-device validation of completion, checkpoint accuracy and performance.
 
 To revert, set `AFD_ASYNC_CAM_LAYERED_GMM=0` and restart the FFN processes.
+When switching from FULL to legacy eager, also pass `--enforce-eager` explicitly
+before restarting FFN.
 For performance runs, disable `AFD_CAM_OP_IO_LOG` and
 `AFD_FORCE_BALANCED_TOPK_IDS`, retain the actual-path startup log, and measure
 the existing group synchronization separately.

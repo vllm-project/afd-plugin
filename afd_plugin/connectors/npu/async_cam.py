@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Ascend CAM asynchronous connector for Attention/FFN disaggregation.
 
-``CAMAsyncAFDConnector`` is the eager-only Ascend inference data path.
+``CAMAsyncAFDConnector`` supports eager Attention and eager or FULL FFN.
 Attention ranks run MoE routing, submit activations with CAM async
 dispatch-send, and receive combined expert output with combine-recv. FFN ranks
 receive routed-expert activations with dispatch-recv, execute their
@@ -15,19 +15,20 @@ synchronous connectors, CAM async carries routing and token-count metadata in
 the CAM operator payload and does not create a separate Gloo DP-metadata
 control plane.
 
-The supported deployment requires ``async=true``, eager execution, Ascend CAM
+The supported deployment requires ``async=true``, Ascend CAM
 operator packages, and matching topology/configuration on every rank. Regular
 prefill and autoregressive decode steps use the same connector. Attention
-microbatching uses the native DBO runtime with Ascend adaptations; ACL graph
-execution is not supported. Legacy Async microbatching flags are configuration
-aliases, and no independent Async split or model schedule is maintained. See
-``docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md`` for configuration, rank
+microbatching uses the native DBO runtime with Ascend adaptations. FFN FULL
+requires MRV2 and accepts Attention-side DBO. Legacy Async microbatching flags are
+configuration aliases, and no independent Async split or model schedule is
+maintained. See ``docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md`` for configuration, rank
 derivation, launch guidance, and the full limitations.
 """
 
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
@@ -37,6 +38,11 @@ import torch
 from torch import Tensor
 from vllm.logger import init_logger
 
+from afd_plugin.async_cam_startup import (
+    GRAPH_STARTUP_TIMEOUT_SECONDS,
+    POLL_SECONDS,
+    AsyncCAMGraphStartup,
+)
 from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.config import AFDConfig
 from afd_plugin.config_utils import (
@@ -61,8 +67,10 @@ from afd_plugin.distributed import (
     create_hccl_process_group_options,
     init_afd_process_group,
 )
+from afd_plugin.validation import cam_receive_capacity, validate_graph_capacity
 
 if TYPE_CHECKING:
+    from torch.distributed import Store
     from torch.distributed.distributed_c10d import ProcessGroup
     from vllm.config import VllmConfig
     from vllm.model_executor.layers.fused_moe import FusedMoERouter
@@ -232,6 +240,7 @@ class AFDAsyncTransferState(AFDTransferState):
     token_nums_rankid_layeridx: Tensor | None = None
     group_list: Tensor | None = None
     dynamic_scales: Tensor | None = None
+    send_completion: Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -275,6 +284,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
     """
 
     control_plane = None
+    extra_info: AFDAsyncExtraInfo
 
     @classmethod
     def parse_extra_config(
@@ -332,6 +342,9 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             int,
             list[tuple[AFDTransferContext, Tensor, Tensor]],
         ] = {}
+        self.graph_startup = AsyncCAMGraphStartup(
+            self.world_rank, self.attn_size, self.topology.world_size
+        )
 
     @property
     def is_initialized(self) -> bool:
@@ -359,6 +372,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             pg_options=create_hccl_process_group_options(
                 self.hccl_buffer_size_mb,
             ),
+            store_callback=self._initialize_graph_startup,
         )
         backend = self.cam_pg._get_backend(torch.device("npu"))
         self.group_name = str(backend.get_hccl_comm_name(self.world_rank))
@@ -370,6 +384,81 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             device=device,
         )
         self._initialized = True
+        if self.graph_startup.mode == "full" and self.world_rank < self.attn_size:
+            self._run_attention_graph_startup()
+
+    def _initialize_graph_startup(self, store: Store) -> None:
+        signature = repr(
+            (
+                self.attn_size,
+                self.ffn_size,
+                self.hidden_size,
+                self.topk,
+                self.num_routed_experts,
+                str(self.activation_dtype),
+                self.dynamic_quant,
+                self.tp_size,
+                self.max_num_batched_tokens,
+            )
+        )
+        self.graph_startup.initialize(store, signature)
+        if self.graph_startup.mode == "full":
+            try:
+                if not self.vllm_config.use_v2_model_runner:
+                    raise ValueError("Async FFN FULL requires MRV2 on every rank")
+                validate_graph_capacity(
+                    self.max_num_batched_tokens, self.tp_size, cam_receive_capacity()
+                )
+                self.graph_startup.phase("validated")
+            except Exception as exc:
+                self.graph_startup.fail(exc)
+                raise
+
+    def wait_graph_device(self, event: torch.npu.Event) -> None:
+        deadline = time.monotonic() + GRAPH_STARTUP_TIMEOUT_SECONDS
+        while not event.query():
+            self.graph_startup.check_failure()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Async graph warmup timed out; retain resources")
+            time.sleep(POLL_SECONDS)
+
+    def graph_startup_chunks(self) -> int:
+        """Every A TP rank sends one row to experts [0, topk)."""
+        local_experts = max(
+            0,
+            min(
+                self.expert_per_rank,
+                self.topk - (self.world_rank - self.attn_size) * self.expert_per_rank,
+            ),
+        )
+        experts_per_chunk = cam_receive_capacity() // self.tp_size
+        return max(1, (local_experts + experts_per_chunk - 1) // experts_per_chunk)
+
+    def _run_attention_graph_startup(self) -> None:
+        assert self.graph_startup.warmup_layer_id is not None
+        device = torch.device(f"npu:{self.local_rank}")
+        hidden = torch.ones(
+            (1, self.hidden_size), dtype=self.activation_dtype, device=device
+        )
+        ids = torch.arange(self.topk, dtype=torch.int32, device=device).view(1, -1)
+        weights = torch.full((1, self.topk), 1 / self.topk, device=device)
+        try:
+            # Every A/F rank participates in cold MC2 warmup before capture.
+            context = AFDTransferContext(
+                AFDTransferMetadata(self.graph_startup.warmup_layer_id, 0, [1])
+            )
+            self.send_attn_output(hidden, context, topk_ids=ids, topk_weights=weights)
+            output = self.recv_ffn_output(hidden, context=context)
+            done = torch.npu.Event()
+            done.record()
+            self.wait_graph_device(done)
+            del output
+            self.graph_startup.phase("warmup")
+            self.graph_startup.phase("captured")
+            self.graph_startup.wait_service_ready()
+        except Exception as exc:
+            self.graph_startup.fail(exc)
+            raise
 
     def close(self) -> None:
         """Destroy the HCCL process group and clear pending transfer states."""
@@ -804,7 +893,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             tp_size=self.tp_size,
             group_name=self.group_name,
         )
-        torch.ops.afd_ascend.afd_async_combine_send(
+        states.send_completion = torch.ops.afd_ascend.afd_async_combine_send(
             ffn_output,
             self.comm_args,
             token_nums_rankid_layeridx,
