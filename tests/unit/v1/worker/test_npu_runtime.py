@@ -601,7 +601,7 @@ def test_npu_ffn_worker_consumes_chunks_across_runner_steps(
         AFDAsyncFFNWorkItem,
         AFDAsyncTransferState,
     )
-    from afd_plugin.v1.worker.npu import ffn_model_runner, ffn_worker
+    from afd_plugin.v1.worker.npu import async_ffn_model_runner, ffn_worker
 
     context_calls = []
     sent_outputs = []
@@ -616,11 +616,11 @@ def test_npu_ffn_worker_consumes_chunks_across_runner_steps(
         )
 
     monkeypatch.setattr(
-        ffn_model_runner,
+        async_ffn_model_runner,
         "ascend_forward_context",
         fake_ascend_forward_context,
     )
-    runner = object.__new__(ffn_model_runner.AFDNPUFFNModelRunner)
+    runner = object.__new__(async_ffn_model_runner.AsyncNPUFFNModelRunner)
     runner._layered_executor = None
     runner._graph = None
     runner.effective_mode = "eager"
