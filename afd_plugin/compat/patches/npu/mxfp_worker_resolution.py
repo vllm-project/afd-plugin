@@ -45,7 +45,8 @@ def apply_afd_mxfp_worker_resolution_patch() -> bool:
     # while installing only in AFDNPUFFNWorker misses standard Prefill workers.
     # Patch functionality: delegates worker resolution first, then installs the
     # signature-gated dispatcher patch for standard and AFD Ascend workers,
-    # plus the layout protocol for Prefill/Attention before cache registration.
+    # plus cropped checkpoint loading and the layout protocol for
+    # Prefill/Attention before model loading and cache registration.
     # Signature: matches the worker_base module's imported resolver; no added
     # parameters.
     def resolve_obj_by_qualname(qualname: str) -> Any:
@@ -58,6 +59,14 @@ def apply_afd_mxfp_worker_resolution_patch() -> bool:
 
             apply_afd_mxfp_alltoallv_patch()
         # ### PATCH END: lazy A5 MXFP AllToAllV compatibility
+        # ### PATCH START: lazy cropped DeepSeek-V4 checkpoint loading
+        if qualname in _PD_NPU_WORKERS:
+            from afd_plugin.compat.patches.npu.cropped_deepseek_v4_weights import (
+                apply_afd_cropped_deepseek_v4_weights_patch,
+            )
+
+            apply_afd_cropped_deepseek_v4_weights_patch()
+        # ### PATCH END: lazy cropped DeepSeek-V4 checkpoint loading
         # ### PATCH START: lazy DSpark PD layer layout negotiation
         if qualname in _PD_NPU_WORKERS:
             from afd_plugin.compat.patches.npu.dspark_pd_layout import (

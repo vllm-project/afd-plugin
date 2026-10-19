@@ -330,8 +330,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     f"{actual_token_boundary}"
                 )
             self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = (
-                self.arange_np[1 : num_dummy_reqs + 1]
-                + actual_token_boundary
+                self.arange_np[1 : num_dummy_reqs + 1] + actual_token_boundary
             )
             self.query_start_loc.copy_to_gpu()
         else:
