@@ -196,7 +196,7 @@ commands:
 | Platform | Attention | FFN | Related runtime path |
 | --- | --- | --- | --- |
 | CUDA | `afd_plugin.v1.worker.AFDAttentionWorker` | `afd_plugin.v1.worker.AFDFFNWorker` | `AFDAttentionModelRunnerV2` and connector-driven `GPUFFNModelRunner` are lazy exports; no GPU V1 fallback exists |
-| NPU | `afd_plugin.v1.worker.npu.AFDNPUAttentionWorker` | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | Native `AFDNPUAttentionModelRunnerV2`; one independent `AFDNPUFFNModelRunner` with synchronous/Async execution paths; no MRV1 fallback |
+| NPU | `afd_plugin.v1.worker.npu.AFDNPUAttentionWorker` | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | Native `AFDNPUAttentionModelRunnerV2`; independent `AFDNPUFFNModelRunner` (sync) or `AsyncNPUFFNModelRunner` selected by connector; no MRV1 fallback |
 
 New commands should omit `--worker-cls`. These paths may change with the pinned
 runtime integration and are not stable third-party extension interfaces.

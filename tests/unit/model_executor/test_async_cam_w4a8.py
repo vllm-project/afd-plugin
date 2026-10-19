@@ -154,11 +154,13 @@ def test_repeated_interleaved_layer_ids(operators):
 
 
 def runner_method(name, namespace):
-    tree = ast.parse(Path("afd_plugin/v1/worker/npu/ffn_model_runner.py").read_text())
+    tree = ast.parse(
+        Path("afd_plugin/v1/worker/npu/async_ffn_model_runner.py").read_text()
+    )
     cls = next(
         node
         for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "AFDNPUFFNModelRunner"
+        if isinstance(node, ast.ClassDef) and node.name == "AsyncNPUFFNModelRunner"
     )
     method = next(
         node
@@ -207,14 +209,15 @@ def test_runner_preserves_raw_context_and_chunk_capacity():
         computed.append(args)
         return torch.empty(8, 32, dtype=torch.bfloat16)
 
-    runner = SimpleNamespace(connector=connector, _layered_executor=compute)
+    runner = SimpleNamespace(
+        model=object(), connector=connector, _layered_executor=compute, layer_ids=(2, 5)
+    )
     method = runner_method(
         "_ffn_forward_connector_driven",
         {
             "cast": cast,
             "CAMAsyncAFDConnector": SimpleNamespace,
             "AFDAsyncTransferState": SimpleNamespace,
-            "_ffn_layer_indices": lambda self: [2, 5],
         },
     )
     method(runner)
@@ -225,7 +228,7 @@ def test_runner_preserves_raw_context_and_chunk_capacity():
 
 
 def test_runner_switch_off_does_not_touch_model_or_ops():
-    runner = SimpleNamespace(_layered_gmm_requested=False)
+    runner = SimpleNamespace(model=object(), _layered_gmm_requested=False)
     method = runner_method(
         "_initialize_layered_executor",
         {"logger": SimpleNamespace(info=lambda *args: None)},
@@ -277,18 +280,14 @@ def test_layered_switch_rejects_other_roles_connectors_and_models(
 
 
 @pytest.mark.parametrize(
-    "eligible,use_v2_model_runner,use_aclgraph",
+    "eligible,layer_ids,error",
     [
-        (False, False, False),
-        (True, False, False),
-        (True, True, False),
-        (True, False, True),
-        (True, True, True),
+        (False, (0,), None),
+        (True, (0,), None),
+        (True, (2,), "remote MoE layer IDs"),
     ],
 )
-def test_runner_initializes_ops_before_executor(
-    eligible, use_v2_model_runner, use_aclgraph
-):
+def test_runner_initializes_ops_before_executor(eligible, layer_ids, error):
     events: list[str] = []
 
     class Connector:
@@ -304,8 +303,7 @@ def test_runner_initializes_ops_before_executor(
                 ([layer], "") if eligible else ([], "mixed quantization")
             )
         ),
-        use_aclgraph=use_aclgraph,
-        vllm_config=SimpleNamespace(use_v2_model_runner=use_v2_model_runner),
+        layer_ids=layer_ids,
         _layered_executor=None,
     )
 
@@ -320,14 +318,13 @@ def test_runner_initializes_ops_before_executor(
             "CAMAsyncAFDConnector": Connector,
             "AscendDeviceType": SimpleNamespace(A3="A3"),
             "get_ascend_device_type": lambda: "A3",
-            "_ffn_layer_indices": lambda runner: [0],
             "ensure_cam_async_ops_available": lambda: events.append("ops"),
             "AsyncCAMW4A8Executor": build,
             "logger": SimpleNamespace(info=lambda *args: None),
         },
     )
-    if use_aclgraph:
-        with pytest.raises(ValueError, match="requires eager"):
+    if error:
+        with pytest.raises(ValueError, match=error):
             method(runner)
         assert events == []
         assert runner._layered_executor is None

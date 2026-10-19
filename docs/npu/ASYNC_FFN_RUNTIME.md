@@ -5,9 +5,10 @@ receive (DR), existing layered W4A8 FFN, and original combine send (CS).
 Attention remains MRV2 eager. Issue #451 retires the separate MRV1 paths while
 preserving this runtime and its original transport/lifecycle boundary.
 
-The unified `AFDNPUFFNModelRunner` shares configuration, model loading and public
-interfaces with CAMP2P. Its Async path keeps a separate transaction graph and
-the receive-completion requirements described below.
+`AsyncNPUFFNModelRunner` owns Async CAM model loading, eager/FULL transactions
+and receive-safe resource release independently of the synchronous CAMP2P
+`AFDNPUFFNModelRunner`. The FFN worker selects the owner from the connector;
+neither runner inherits MRV1 or owns Attention request/KV state.
 
 ## Selection and startup
 

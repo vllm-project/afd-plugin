@@ -30,7 +30,7 @@ from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
 from afd_plugin.model_executor.npu.async_cam_w4a8 import W4A8LayerWeights
-from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
+from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 
 HIDDEN = 256
 EXPERTS = 4
@@ -178,7 +178,7 @@ def main():
     report = {"rank": rank, "per_group": args.per_group, "work": []}
     print(json.dumps({"rank": rank, "stage": "connector_created"}), flush=True)
     if is_ffn:
-        runner = AFDNPUFFNModelRunner(config, device, connector)
+        runner = AsyncNPUFFNModelRunner(config, device, connector)
         runner.model = SyntheticModel(device, not args.per_group)
         print(json.dumps({"rank": rank, "stage": "weights_ready"}), flush=True)
         runner.initialize_afd_connector()

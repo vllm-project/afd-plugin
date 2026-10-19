@@ -12,8 +12,8 @@ pytest.importorskip("vllm")
 pytest.importorskip("torch_npu")
 import torch  # noqa: E402
 
-from afd_plugin.v1.worker.npu.ffn_model_runner import (  # noqa: E402
-    AFDNPUFFNModelRunner,
+from afd_plugin.v1.worker.npu.async_ffn_model_runner import (  # noqa: E402
+    AsyncNPUFFNModelRunner,
 )
 
 
@@ -76,8 +76,7 @@ def session_harness(monkeypatch):
 
     connector.recv_attn_output = receive
     connector.send_ffn_output = send
-    session = AFDNPUFFNModelRunner.__new__(AFDNPUFFNModelRunner)
-    session.is_async = True
+    session = AsyncNPUFFNModelRunner.__new__(AsyncNPUFFNModelRunner)
     session.model = torch.nn.Linear(1, 1)
     session._layered_executor = execute
     session.connector = connector

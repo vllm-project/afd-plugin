@@ -42,7 +42,7 @@ def evidence(mode) -> tuple[dict, dict]:
         after["ffn"]["results"].append(
             {
                 "rank": rank,
-                "runner": "AFDNPUFFNModelRunner",
+                "runner": "AsyncNPUFFNModelRunner",
                 "mode": mode,
                 "layer_ids": list(range(43)),
                 "capture_count": 1,

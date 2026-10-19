@@ -26,7 +26,8 @@ from afd_plugin.connectors.npu.async_cam import (  # noqa: E402
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
 )
-from afd_plugin.v1.worker.npu import ffn_model_runner as runtime  # noqa: E402
+from afd_plugin.v1.worker.npu import async_ffn_model_runner as runtime  # noqa: E402
+from afd_plugin.v1.worker.npu import ffn_model_runner as sync_runtime  # noqa: E402
 from afd_plugin.v1.worker.npu.ffn_worker import AFDNPUFFNWorker  # noqa: E402
 
 
@@ -86,7 +87,7 @@ def harness(monkeypatch):
     connector._initialized = True
     monkeypatch.setenv("AFD_ASYNC_CAM_LAYERED_GMM", "0")
     monkeypatch.setattr(runtime, "create_afd_npu_profiler", lambda role: None)
-    runner = runtime.AFDNPUFFNModelRunner(cfg, torch.device("cpu"), connector)
+    runner = runtime.AsyncNPUFFNModelRunner(cfg, torch.device("cpu"), connector)
     runner.layer_ids = (2, 5)
     calls: list[str | tuple] = []
     payloads: deque[AFDA2FTransferPayload] = deque()
@@ -131,7 +132,7 @@ def payload(layer, rows):
 @pytest.mark.parametrize(
     "connector_name", ["CAMAsyncAFDConnector", "CAMP2pAFDConnector"]
 )
-def test_common_constructor_preserves_separate_graph_ownership(
+def test_separate_constructors_preserve_graph_ownership(
     harness, monkeypatch, connector_name
 ):
     cfg = config()
@@ -152,17 +153,30 @@ def test_common_constructor_preserves_separate_graph_ownership(
         calls.append("pool")
         return pool
 
-    monkeypatch.setattr(runtime.current_platform, "get_global_graph_pool", global_pool)
-    connector = (
-        harness.connector
-        if is_async
-        else SimpleNamespace(control_plane=object(), is_initialized=False)
+    monkeypatch.setattr(
+        sync_runtime.current_platform, "get_global_graph_pool", global_pool
     )
-    runner = runtime.AFDNPUFFNModelRunner(cfg, harness.runner.device, connector)
+    if is_async:
+        runner = runtime.AsyncNPUFFNModelRunner(
+            cfg, harness.runner.device, harness.connector
+        )
+        assert runner._graph is None and runner._graph_capture_count == 0
+    else:
+        monkeypatch.setattr(
+            sync_runtime, "validate_npu_model_runner_v2_config", lambda *a, **k: None
+        )
+        monkeypatch.setattr(
+            sync_runtime, "fail_if_unsupported_npu_afd_features", lambda *a, **k: None
+        )
+        monkeypatch.setattr(sync_runtime, "create_afd_npu_profiler", lambda role: None)
+        runner = sync_runtime.AFDNPUFFNModelRunner(
+            cfg,
+            harness.runner.device,
+            SimpleNamespace(control_plane=object(), is_initialized=False),
+        )
+        assert runner._acl_graphs == {}
+        assert runner.graph_pool is pool
     assert runner.model is None
-    assert runner._graph is None and runner._graph_capture_count == 0
-    assert runner._acl_graphs == {}
-    assert runner.graph_pool is (None if is_async else pool)
     assert calls == ([] if is_async else ["pool"])
 
 
@@ -218,7 +232,17 @@ def test_direct_loader_uses_role_model_config_and_keeps_memory_accounting(
         if connector_name == "CAMAsyncAFDConnector"
         else SimpleNamespace(control_plane=object(), is_initialized=False)
     )
-    h.runner = runtime.AFDNPUFFNModelRunner(cfg, h.runner.device, connector)
+    if connector_name == "CAMAsyncAFDConnector":
+        h.runner = runtime.AsyncNPUFFNModelRunner(cfg, h.runner.device, connector)
+    else:
+        monkeypatch.setattr(
+            sync_runtime, "validate_npu_model_runner_v2_config", lambda *a, **k: None
+        )
+        monkeypatch.setattr(
+            sync_runtime, "fail_if_unsupported_npu_afd_features", lambda *a, **k: None
+        )
+        monkeypatch.setattr(sync_runtime, "create_afd_npu_profiler", lambda role: None)
+        h.runner = sync_runtime.AFDNPUFFNModelRunner(cfg, h.runner.device, connector)
     h.runner.model = model
     model = h.runner.model
     h.runner.model = None

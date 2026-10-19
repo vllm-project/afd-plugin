@@ -304,7 +304,6 @@ def _new_ffn_runner():
     runner.prof = None
     runner.device = SimpleNamespace(type="npu")
     runner._is_shutdown = False
-    runner.is_async = False
     runner.effective_mode = "eager"
     # _ffn_layer_indices reads these; production runs with the gate on the
     # Attention side, so every layer index is a MoE FFN layer here.
@@ -1374,7 +1373,7 @@ def test_npu_ffn_worker_uses_connector_driven_loop_for_async_connector(monkeypat
 
     worker._ffn_shutdown_event = event
     worker.device = SimpleNamespace(type="cpu")
-    worker.model_runner = object.__new__(ffn_worker.AFDNPUFFNModelRunner)
+    worker.model_runner = object.__new__(ffn_worker.AsyncNPUFFNModelRunner)
     worker.model_runner.connector = _AsyncRecordingConnector()
     worker.model_runner.effective_mode = "eager"
     worker.model_runner.execute_connector_driven_step = execute_connector_driven_step

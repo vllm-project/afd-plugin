@@ -19,7 +19,7 @@ primary_code_paths:
   - "MANIFEST.in"
 related_code_paths:
   - "afd_plugin/v1/worker/{attention_metadata,attention_model_runner_v2,ffn_model_runner}.py"
-  - "afd_plugin/v1/worker/npu/{attention_model_runner_v2,ffn_model_runner}.py"
+  - "afd_plugin/v1/worker/npu/{attention_model_runner_v2,ffn_model_runner,async_ffn_model_runner}.py"
   - "afd_plugin/connectors/{gpu,npu}/**"
 depends_on:
   - "plugin_boundary.md"
@@ -79,7 +79,7 @@ runtime. FFN runners independently own connector-driven execution:
 | Attention worker | `AFDAttentionWorker(Worker)` | `AFDNPUAttentionWorker(NPUWorker)` |
 | Attention runner V2 | `AFDAttentionModelRunnerV2(GPUModelRunnerV2)` | `AFDNPUAttentionModelRunnerV2(NPUModelRunnerV2)` |
 | FFN worker | `AFDFFNWorker(Worker)` | `AFDNPUFFNWorker(NPUWorker)` |
-| FFN runner | Independent `GPUFFNModelRunner` | Unified independent `AFDNPUFFNModelRunner` for CAMP2P and Async CAM |
+| FFN runner | Independent `GPUFFNModelRunner` | Independent `AFDNPUFFNModelRunner` (CAMP2P) or `AsyncNPUFFNModelRunner` (Async CAM) |
 
 The NPU classes do not inherit CUDA AFD classes. Shared behavior is carried
 by configuration, connector payloads, forward-context metadata, graph-policy
@@ -98,7 +98,7 @@ the corresponding runtime stack.
 | --- | --- | --- |
 | Worker/device lifecycle | vLLM `Worker` plus AFD role worker | vLLM-Ascend `NPUWorker` plus AFD role worker |
 | Attention execution | native V2 `GPUModelRunner` extension | native V2 `NPUModelRunner` extension |
-| FFN execution | independent connector-driven runner | one independent runner with synchronous/Async execution paths |
+| FFN execution | independent connector-driven runner | independent synchronous/Async connector-driven runners |
 | Graph policy/keying | `v1/worker/cuda_graph.py` | shared policy/keying plus ACL/NPUGraph integration |
 | Native ubatching | native `UBatchRunner` with scoped AFD metadata preparation | `NPUUBatchRunner` adapting native child inputs, contexts and streams |
 | Profiling | `compat/profiler.py` | `compat/npu/profiler.py` |

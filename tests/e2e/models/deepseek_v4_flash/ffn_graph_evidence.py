@@ -13,10 +13,10 @@ from pathlib import Path
 import torch
 
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 from afd_plugin.v1.worker.npu.attention_model_runner_v2 import (
     AFDNPUAttentionModelRunnerV2,
 )
-from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
 from afd_plugin.v1.worker.npu.ffn_worker import AFDNPUFFNWorker
 
 
@@ -28,7 +28,7 @@ def snapshot(runner) -> dict:
         "rank": connector.world_rank,
         "transport_live": connector.is_initialized,
     }
-    if isinstance(runner, AFDNPUFFNModelRunner):
+    if isinstance(runner, AsyncNPUFFNModelRunner):
         result.update(
             mode=runner.effective_mode,
             requested=runner.requested_mode,
@@ -63,18 +63,18 @@ def record(runner, phase: str) -> None:
 class FFNGraphEvidence:
     """Use vLLM's existing collective_rpc API to snapshot host-only counters."""
 
-    model_runner: AFDNPUFFNModelRunner | AFDNPUAttentionModelRunnerV2
+    model_runner: AsyncNPUFFNModelRunner | AFDNPUAttentionModelRunnerV2
 
     def afd_ffn_graph_snapshot(self) -> dict:
         return snapshot(self.model_runner)
 
 
 def install_observers() -> None:
-    complete = AFDNPUFFNModelRunner._complete_graph
+    complete = AsyncNPUFFNModelRunner._complete_graph
     send_eager = CAMAsyncAFDConnector.send_ffn_output
     execute = AFDNPUAttentionModelRunnerV2.execute_model
     shutdown_attention = AFDNPUAttentionModelRunnerV2.shutdown
-    shutdown_ffn = AFDNPUFFNModelRunner.shutdown
+    shutdown_ffn = AsyncNPUFFNModelRunner.shutdown
     health_check = AFDNPUFFNWorker.raise_ffn_loop_error_if_any
     stop_ffn = AFDNPUFFNWorker.stop_ffn_server_loop
 
@@ -166,11 +166,11 @@ def install_observers() -> None:
         record(self.model_runner, "stop_rpc_complete")
         return result
 
-    AFDNPUFFNModelRunner._complete_graph = completed
+    AsyncNPUFFNModelRunner._complete_graph = completed
     CAMAsyncAFDConnector.send_ffn_output = sent
     AFDNPUAttentionModelRunnerV2.execute_model = executed
     AFDNPUAttentionModelRunnerV2.shutdown = attention_closed
-    AFDNPUFFNModelRunner.shutdown = ffn_closed
+    AsyncNPUFFNModelRunner.shutdown = ffn_closed
     AFDNPUFFNWorker.raise_ffn_loop_error_if_any = checked
     AFDNPUFFNWorker.stop_ffn_server_loop = ffn_stop_requested
 
