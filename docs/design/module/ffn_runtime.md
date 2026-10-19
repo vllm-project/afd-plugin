@@ -78,7 +78,7 @@ Attention.
 | NPU | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | Unified `AFDNPUFFNModelRunner` | `CAMP2pAFDConnector`, `CAMAsyncAFDConnector` |
 
 GPU and NPU FFN runners are independent, connector-driven owners. Ascend
-selects the synchronous or Async runner from the connector, with no MRV1
+selects the synchronous or Async execution path within one runner, with no MRV1
 inheritance or fallback. Native model loading owns weight materialization and
 quantization postprocessing. The runner explicitly initializes Ascend MC2
 capacity/masks before construction, accounts for loaded memory, executes FFN

@@ -1110,7 +1110,7 @@ def test_npu_ffn_worker_start_binds_physical_npu_once_before_daemon(
     worker._ffn_thread = None
     worker.local_rank = 3
     worker.model_runner = SimpleNamespace(
-        connector=SimpleNamespace(is_initialized=True),
+        connector=SimpleNamespace(is_initialized=True, control_plane=object()),
     )
     events: list[tuple[str, object]] = []
     monkeypatch.setattr(
@@ -1175,7 +1175,7 @@ def test_npu_ffn_worker_cpu_binding_failure_does_not_abort_daemon_start(
     worker._ffn_thread = None
     worker.local_rank = 5
     worker.model_runner = SimpleNamespace(
-        connector=SimpleNamespace(is_initialized=True),
+        connector=SimpleNamespace(is_initialized=True, control_plane=object()),
     )
     thread_starts: list[bool] = []
     monkeypatch.setattr(
@@ -1220,7 +1220,7 @@ def test_npu_ffn_worker_loop_error_is_propagated(caplog):
     worker._ffn_shutdown_event = None
     worker._ffn_loop_error = None
     worker.model_runner = SimpleNamespace(
-        connector=SimpleNamespace(is_initialized=True),
+        connector=SimpleNamespace(is_initialized=True, control_plane=object()),
     )
 
     expected_error = RuntimeError("boom")
@@ -1251,7 +1251,7 @@ def test_npu_ffn_worker_ignores_receive_error_during_shutdown(caplog):
     worker._ffn_shutdown_event = None
     worker._ffn_loop_error = None
     worker.model_runner = SimpleNamespace(
-        connector=SimpleNamespace(is_initialized=True),
+        connector=SimpleNamespace(is_initialized=True, control_plane=object()),
     )
 
     def stop_while_receiving():
@@ -1287,7 +1287,9 @@ def test_npu_ffn_worker_stops_loop_before_parent_shutdown(monkeypatch):
         def is_alive(self):
             return False
 
-    connector = SimpleNamespace(close=lambda: calls.append(("close", None)))
+    connector = SimpleNamespace(
+        control_plane=object(), close=lambda: calls.append(("close", None))
+    )
     worker._ffn_thread = _StoppingThread()
     worker.model_runner = SimpleNamespace(connector=connector)
     monkeypatch.setattr(
@@ -1326,7 +1328,9 @@ def test_npu_ffn_worker_preserves_live_thread_after_shutdown_timeout(monkeypatch
     thread = _StoppingThread()
     worker._ffn_thread = thread
     worker.model_runner = SimpleNamespace(
-        connector=SimpleNamespace(close=lambda: calls.append(("close", None))),
+        connector=SimpleNamespace(
+            control_plane=object(), close=lambda: calls.append(("close", None))
+        ),
     )
     monkeypatch.setattr(
         ffn_worker.NPUWorker,
