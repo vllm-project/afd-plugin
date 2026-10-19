@@ -51,8 +51,8 @@ from afd_plugin.compat.patches.npu.mla_graph import AFD_MLA_GRAPH_PARAMS_KEY
 from afd_plugin.compat.patches.npu.mrv2_ubatching import (
     use_async_cam_child_dp_metadata,
     use_npu_input_batch_slicing,
-    use_npu_model_io,
     use_npu_ubatch_contexts,
+    use_npu_ubatch_output_merge,
 )
 from afd_plugin.model_executor.models.npu.deepseek_attention_metadata import (
     materialize_deepseek_attention_metadata_by_layer,
@@ -328,7 +328,7 @@ class NPUUBatchRunner(UBatchRunner):
             override_forward_context(ubatching.forward_context._forward_context)
         )
         stack.enter_context(use_npu_ubatch_contexts())
-        stack.enter_context(use_npu_model_io(self.vllm_config))
+        stack.enter_context(use_npu_ubatch_output_merge())
         if for_capture:
             # Native capture preallocates CUDA cuBLAS handles in each child.
             # Ascend GEMMs initialize during the native warmup instead. The

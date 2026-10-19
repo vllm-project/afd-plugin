@@ -275,6 +275,23 @@ def test_npu_validator_rejects_v1_before_model_runtime(monkeypatch, mrv2_config,
 
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_npu_validator_rejects_pipeline_parallel_before_model_runtime(
+    monkeypatch, mrv2_config, role
+):
+    mrv2_config.additional_config["afd"].update(
+        role=role, connector="CAMP2pAFDConnector"
+    )
+    mrv2_config.parallel_config.pipeline_parallel_size = 2
+    monkeypatch.setitem(
+        sys.modules, "afd_plugin.model_executor.models.model_utils", None
+    )
+    with pytest.raises(RuntimeError, match="does not support PP or CP"):
+        validate_npu_model_runner_v2_config(
+            mrv2_config, expected_role=role, device_type="npu"
+        )
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
 @pytest.mark.parametrize("enforce_eager", [False, True])
 def test_npu_sync_dbo_policy_allows_eager_and_full_graph(
     mrv2_config, role, enforce_eager

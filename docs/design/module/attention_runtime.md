@@ -15,7 +15,7 @@ primary_code_paths:
 related_code_paths:
   - "afd_plugin/connectors/**"
   - "afd_plugin/model_executor/**"
-  - "afd_plugin/v1/worker/npu/{ubatch_runner,model_io,mla_graph}.py"
+  - "afd_plugin/v1/worker/npu/{ubatch_runner,mla_graph}.py"
 depends_on:
   - "plugin_boundary.md"
   - "connector_contracts.md"

@@ -18,7 +18,6 @@ pytest.importorskip("vllm")
 pytest.importorskip("vllm_ascend")
 
 from vllm.config import CUDAGraphMode  # noqa: E402
-from vllm.sequence import IntermediateTensors  # noqa: E402
 from vllm.v1.worker.dp_utils import should_skip_dp_coordination  # noqa: E402
 from vllm.v1.worker.gpu import cudagraph_utils, dp_utils, ubatch_utils  # noqa: E402
 from vllm.v1.worker.gpu import model_runner as native_v2  # noqa: E402
@@ -63,7 +62,6 @@ def _runner(*, async_dp=False):
     )
     runner.cudagraph_manager = None
     runner.ubatch_runner = None
-    runner.intermediate_tensors = None
     runner.prof = object()
     runner._afd_pending_metadata = object()
     runner._afd_suppress_metadata_send = True
@@ -109,64 +107,6 @@ def test_shutdown_joins_native_children_and_releases_owned_stage_state(
     assert calls == ["profiler", "abort", "native", "connector"]
     assert (runner.ubatch_runner is None) is (failure != "native")
     assert runner._afd_pending_metadata is None
-
-
-@pytest.mark.parametrize("fail", [False, True])
-def test_native_model_io_scope_slices_every_pp_field_and_merges_aux(monkeypatch, fail):
-    config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=4,
-            pipeline_parallel_size=1,
-            use_sequence_parallel_moe=True,
-        ),
-        model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(model_type="deepseek_v2")
-        ),
-    )
-    hidden = torch.arange(8).reshape(4, 2)
-    auxiliary = hidden + 10
-    model_inputs = {
-        "input_ids": torch.arange(12),
-        "positions": torch.arange(24).reshape(2, 12),
-        "intermediate_tensors": IntermediateTensors(
-            {"hidden_states": hidden, "pp_transport_aux_hidden_states_0": auxiliary}
-        ),
-        "extra": object(),
-    }
-    original_slice = ubatch_utils.slice_model_inputs
-    original_merge = ubatch_utils.merge_ubatch_outputs
-
-    def exercise():
-        with patches.use_npu_model_io(config):
-            children = [
-                ubatch_utils.slice_model_inputs(model_inputs, stage)
-                for stage in (slice(0, 5), slice(5, 12))
-            ]
-            assert [child["input_ids"].numel() for child in children] == [5, 7]
-            assert [child["positions"].shape for child in children] == [(2, 5), (2, 7)]
-            assert all(child["extra"] is model_inputs["extra"] for child in children)
-            merged = ubatch_utils.merge_ubatch_outputs(
-                [child["intermediate_tensors"] for child in children]
-            )
-            torch.testing.assert_close(merged.tensors["hidden_states"], hidden)
-            torch.testing.assert_close(
-                merged.tensors["pp_transport_aux_hidden_states_0"], auxiliary
-            )
-            nested = ubatch_utils.merge_ubatch_outputs(
-                [(hidden[:2], [auxiliary[:2]]), (hidden[2:], [auxiliary[2:]])]
-            )
-            torch.testing.assert_close(nested[0], hidden)
-            torch.testing.assert_close(nested[1][0], auxiliary)
-            if fail:
-                raise RuntimeError("model failed")
-
-    if fail:
-        with pytest.raises(RuntimeError, match="model failed"):
-            exercise()
-    else:
-        exercise()
-    assert ubatch_utils.slice_model_inputs is original_slice
-    assert ubatch_utils.merge_ubatch_outputs is original_merge
 
 
 def test_mla_capture_registry_uses_exact_native_descriptor_and_skips_warmup():

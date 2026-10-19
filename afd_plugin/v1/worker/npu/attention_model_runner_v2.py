@@ -52,10 +52,6 @@ from afd_plugin.v1.worker.attention_model_runner_v2 import (
     _use_afd_capture_input_preparation,
     _use_afd_ubatch_preparation,
 )
-from afd_plugin.v1.worker.npu.model_io import (
-    pp_transport_rows,
-    prepare_pp_transport_buffers,
-)
 from afd_plugin.validation import validate_npu_model_runner_v2_config
 
 if TYPE_CHECKING:
@@ -220,7 +216,6 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
 
     afd_expected_role = "attention"
     ubatch_runner: NPUUBatchRunner | None
-    intermediate_tensors: IntermediateTensors | None
 
     def __init__(
         self,
@@ -411,17 +406,6 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         # ### PATCH START: scope AFD metadata provider/replay and profiler step.
         step_afd_npu_profiler(self.prof)
-        if intermediate_tensors is not None and self.intermediate_tensors is not None:
-            # Native execute copies each buffer field after dispatch/padding.
-            # Preserve its copy and graph addresses; prepare only capacity and
-            # any auxiliary transport fields absent from the model allocation.
-            self.intermediate_tensors = IntermediateTensors(
-                prepare_pp_transport_buffers(
-                    self.intermediate_tensors.tensors,
-                    intermediate_tensors.tensors,
-                    pp_transport_rows(self.vllm_config, self.max_num_tokens),
-                )
-            )
         use_fullgraph_replay_hook = (
             self.vllm_config.compilation_config.cudagraph_mode
             in (CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY)

@@ -34,7 +34,7 @@ python3 -m pytest -q -ra \
   tests/unit/model_executor/test_async_cam_dbo.py \
   tests/unit/model_executor/test_async_cam_layout.py \
   tests/unit/v1/worker/test_npu_model_runner_v2.py \
-  tests/unit/v1/worker/test_npu_model_io.py \
+  tests/unit/v1/worker/test_npu_ubatch_outputs.py \
   tests/unit/v1/worker/test_npu_mla_graph.py
 ```
 

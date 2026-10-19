@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import ParallelConfig, VllmConfig
-from vllm.sequence import IntermediateTensors
 from vllm.utils import torch_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker import ubatching
@@ -305,69 +304,43 @@ def use_npu_ubatch_contexts() -> Iterator[None]:
         ubatch_utils.current_stream = original_runner_stream
 
 
-@contextmanager
-def use_npu_model_io(vllm_config: VllmConfig) -> Iterator[None]:
-    """Keep native slicing/merging with the Ascend model's physical tensor layout."""
-    from afd_plugin.v1.worker.npu.model_io import (
-        cat_ubatch_outputs,
-        pp_transport_slice,
-    )
+def cat_ubatch_outputs(
+    outputs: list[torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]],
+) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+    """Keep Ascend's nested auxiliary-output contract when native threads merge."""
+    first = outputs[0]
+    if isinstance(first, tuple):
+        pairs = [output for output in outputs if isinstance(output, tuple)]
+        assert len(pairs) == len(outputs)
+        assert all(len(pair[1]) == len(first[1]) for pair in pairs)
+        return (
+            torch.cat([pair[0] for pair in pairs], dim=0),
+            [
+                torch.cat([pair[1][index] for pair in pairs], dim=0)
+                for index in range(len(first[1]))
+            ],
+        )
+    tensors = [output for output in outputs if isinstance(output, torch.Tensor)]
+    assert len(tensors) == len(outputs)
+    return torch.cat(tensors, dim=0)
 
-    previous_slice = ubatch_utils.slice_model_inputs
+
+@contextmanager
+def use_npu_ubatch_output_merge() -> Iterator[None]:
+    """Adapt only Ascend auxiliary-output merging; keep native input slicing."""
     previous_merge = ubatch_utils.merge_ubatch_outputs
 
-    # Patch reason: native slicing assumes every PP tensor uses global rows.
-    # Patch functionality: retain native input views and use the model's PP
-    # transport coordinates for IntermediateTensors. Signature matches
-    # slice_model_inputs at vLLM ced6857, gpu/ubatch_utils.py. Remove when native
-    # slicing accepts a model-specific transport layout callback.
-    def slice_model_inputs(
-        model_inputs: dict[str, Any], token_slice: slice
-    ) -> dict[str, Any]:
-        sliced = dict(model_inputs)
-        input_ids = model_inputs.get("input_ids")
-        if input_ids is not None:
-            sliced["input_ids"] = input_ids[token_slice]
-        inputs_embeds = model_inputs.get("inputs_embeds")
-        if inputs_embeds is not None:
-            sliced["inputs_embeds"] = inputs_embeds[token_slice]
-        positions = model_inputs.get("positions")
-        if positions is not None:
-            sliced["positions"] = (
-                positions[:, token_slice]
-                if positions.ndim == 2
-                else positions[token_slice]
-            )
-        intermediate_tensors = model_inputs.get("intermediate_tensors")
-        if intermediate_tensors is not None:
-            # ### PATCH START: model-specific PP wire coordinates.
-            sliced["intermediate_tensors"] = intermediate_tensors[
-                pp_transport_slice(vllm_config, token_slice)
-            ]
-            # ### PATCH END: model-specific PP wire coordinates.
-        return sliced
-
     # Patch reason: Ascend auxiliary outputs are (Tensor, list[Tensor]), which
-    # native torch.cat(parts) cannot concatenate. Preserve the native PP mapping
-    # and tensor merge, adapting only that nested contract. Signature matches
+    # native torch.cat(parts) cannot concatenate. Preserve the tensor merge,
+    # adapting only that nested contract. Signature matches
     # merge_ubatch_outputs at ced6857. Remove when upstream handles nested aux.
     def merge_ubatch_outputs(outputs: list[Any]) -> Any:
-        first = outputs[0]
-        if isinstance(first, IntermediateTensors):
-            return IntermediateTensors(
-                {
-                    key: torch.cat([out.tensors[key] for out in outputs], dim=0)
-                    for key in first.tensors
-                }
-            )
         # ### PATCH START: Ascend nested auxiliary outputs.
         return cat_ubatch_outputs(outputs)
         # ### PATCH END: Ascend nested auxiliary outputs.
 
     try:
-        ubatch_utils.slice_model_inputs = slice_model_inputs
         ubatch_utils.merge_ubatch_outputs = merge_ubatch_outputs
         yield
     finally:
-        ubatch_utils.slice_model_inputs = previous_slice
         ubatch_utils.merge_ubatch_outputs = previous_merge
