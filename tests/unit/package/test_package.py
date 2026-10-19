@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import builtins
 import importlib.metadata
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -18,6 +20,41 @@ def test_package_import_is_cpu_safe():
 def test_register_afd_is_idempotent():
     afd_plugin.register_afd()
     afd_plugin.register_afd()
+
+
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+def test_registration_does_not_import_native_npu_models(monkeypatch, device_type):
+    registry_module = ModuleType("vllm.model_executor.models")
+    registrations = []
+    registry_module.ModelRegistry = SimpleNamespace(
+        register_model=lambda *args: registrations.append(args)
+    )
+    monkeypatch.setitem(sys.modules, registry_module.__name__, registry_module)
+    platform_module = ModuleType("vllm.platforms")
+    platform_module.current_platform = SimpleNamespace(device_type=device_type)
+    monkeypatch.setitem(sys.modules, platform_module.__name__, platform_module)
+    original_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name: SimpleNamespace() if name == "vllm" else original_find_spec(name),
+    )
+    original_import = builtins.__import__
+    early_imports = []
+
+    def record_native_imports(name, *args, **kwargs):
+        if name == "vllm.platforms" or name.startswith("vllm_ascend"):
+            early_imports.append(name)
+            raise AssertionError("native NPU import before worker resolution")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", record_native_imports)
+    monkeypatch.setattr(afd_plugin, "_registered", False)
+    afd_plugin.register_afd()
+    afd_plugin.register_afd()
+
+    assert len(registrations) == len(afd_plugin._DEEPSEEK_MODEL_REGISTRATIONS)
+    assert early_imports == []
 
 
 def test_deepseek_afd_model_registration_paths_are_lazy_strings():

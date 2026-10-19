@@ -205,6 +205,14 @@ def test_worker_resolution_patch_covers_prefill_and_afd_workers(monkeypatch):
 
     apply_calls = []
     layout_calls = []
+    weight_calls = []
+    weight_patch = types.ModuleType(
+        "afd_plugin.compat.patches.npu.cropped_deepseek_v4_weights"
+    )
+    weight_patch.apply_afd_cropped_deepseek_v4_weights_patch = lambda: (
+        weight_calls.append(list(resolved_qualnames))
+    )
+    monkeypatch.setitem(sys.modules, weight_patch.__name__, weight_patch)
     layout_patch = types.ModuleType("afd_plugin.compat.patches.npu.dspark_pd_layout")
     layout_patch.apply_afd_dspark_pd_layout_patch = lambda: layout_calls.append(True)
     monkeypatch.setitem(sys.modules, layout_patch.__name__, layout_patch)
@@ -234,6 +242,12 @@ def test_worker_resolution_patch_covers_prefill_and_afd_workers(monkeypatch):
     assert resolved_qualnames == list(target_workers)
     assert apply_calls == [True, True, True]
     assert layout_calls == [True, True]
+    assert weight_calls == [list(target_workers[:1]), list(target_workers[:2])]
+
+    # Re-installing the worker resolver must not wrap it a second time.
+    resolver = worker_base.resolve_obj_by_qualname
+    assert module.apply_afd_mxfp_worker_resolution_patch()
+    assert worker_base.resolve_obj_by_qualname is resolver
 
 
 def test_worker_resolution_patch_leaves_non_npu_worker_lazy(monkeypatch):
@@ -244,8 +258,10 @@ def test_worker_resolution_patch_leaves_non_npu_worker_lazy(monkeypatch):
 
     module_name = "afd_plugin.compat.patches.npu.mxfp_worker_resolution"
     dispatcher_module_name = "afd_plugin.compat.patches.npu.mxfp_alltoallv"
+    weight_module_name = "afd_plugin.compat.patches.npu.cropped_deepseek_v4_weights"
     sys.modules.pop(module_name, None)
     sys.modules.pop(dispatcher_module_name, None)
+    monkeypatch.delitem(sys.modules, weight_module_name, raising=False)
     module = importlib.import_module(module_name)
     assert module.apply_afd_mxfp_worker_resolution_patch()
 
@@ -254,3 +270,4 @@ def test_worker_resolution_patch_leaves_non_npu_worker_lazy(monkeypatch):
         is resolved_worker
     )
     assert dispatcher_module_name not in sys.modules
+    assert weight_module_name not in sys.modules

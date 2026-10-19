@@ -138,13 +138,6 @@ def register_afd() -> None:
     for model_arch, model_cls in _DEEPSEEK_MODEL_REGISTRATIONS.items():
         ModelRegistry.register_model(f"AFD{model_arch}", model_cls)
 
-    # The native Prefill model also needs to ignore checkpoint layers beyond
-    # config.num_hidden_layers when a cropped config points to full shards.
-    from vllm.platforms import current_platform
-
-    if current_platform.device_type == "npu":
-        import afd_plugin.compat.patches.npu.cropped_deepseek_v4_weights  # noqa: F401
-
     _registered = True
 
 

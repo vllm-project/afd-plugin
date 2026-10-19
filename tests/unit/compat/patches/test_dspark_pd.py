@@ -10,8 +10,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 
-@pytest.fixture
-def runtime(monkeypatch):
+@pytest.fixture(params=("P2pHcclAFDConnector", "WindowAFDConnector"))
+def runtime(monkeypatch, request):
     class KVCacheManager:
         def __init__(self):
             self.calls = []
@@ -120,15 +120,20 @@ def runtime(monkeypatch):
     modules["vllm_ascend.utils"].is_dspark_config = lambda c: c.dspark
     patch = importlib.import_module("afd_plugin.compat.patches.npu.dspark_pd")
     monkeypatch.setattr(patch, "version", lambda package: "0.23.0+empty")
-    return SimpleNamespace(patch=patch, scheduler=Scheduler, manager=KVCacheManager)
+    return SimpleNamespace(
+        patch=patch,
+        scheduler=Scheduler,
+        manager=KVCacheManager,
+        connector=request.param,
+    )
 
 
-def config(**changes):
+def config(*, connector="P2pHcclAFDConnector", **changes):
     values = dict(
         additional_config={
             "afd": {
                 "role": "attention",
-                "connector": "P2pHcclAFDConnector",
+                "connector": connector,
             }
         },
         kv_transfer_config=SimpleNamespace(
@@ -146,7 +151,7 @@ def config(**changes):
 def scheduler(runtime, **changes):
     assert runtime.patch.apply_afd_dspark_pd_scheduler_patch()
     return runtime.scheduler(
-        config(**changes),
+        config(connector=runtime.connector, **changes),
         SimpleNamespace(kv_cache_groups=[None, None]),
         None,
         32,

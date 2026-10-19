@@ -59,7 +59,11 @@ _ALLOCATE_PARAMETERS = (
 
 def _uses_dspark_pd(config: VllmConfig) -> bool:
     afd = parse_optional_afd_config(config.additional_config)
-    if afd is None or afd.role != "attention" or afd.connector != "P2pHcclAFDConnector":
+    if (
+        afd is None
+        or afd.role != "attention"
+        or afd.connector not in {"P2pHcclAFDConnector", "WindowAFDConnector"}
+    ):
         return False
     kv = config.kv_transfer_config
     if (

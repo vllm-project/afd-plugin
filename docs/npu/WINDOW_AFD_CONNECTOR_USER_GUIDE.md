@@ -192,6 +192,15 @@ parallel size.
 | Graph | `FULL_DECODE_ONLY`; Window Graph/U2 is code-supported |
 | MTP | Not supported with Window; MTP requires HCCL P2P |
 | DSpark | Speculative config belongs to Attention only; no Window release claim |
+| PD | `MooncakeHybridConnector` on Attention as `kv_consumer`; A5 validation pending |
+
+Window + PD is code-supported on the pinned runtime, including DSpark's
+asynchronous KV allocation and per-layer KV layout negotiation. It does not
+establish an A5 validation result for Window + PD, DSpark, or Graph/U2. Keep the
+existing Window TP1, gate, rank, and capacity limits above. Before deployment,
+verify the first token after remote Prefill, continued Decode, real U2 stages
+and Graph replay where enabled, DSpark drafted/accepted counts, and normal
+shutdown. Existing P2pHccl validation results do not certify this combination.
 
 The global Window FFN additionally requires all decoder layers on each FFN rank,
 W4A8MXFP routed experts, W8A8MXFP8 shared experts, and supported group counts.
