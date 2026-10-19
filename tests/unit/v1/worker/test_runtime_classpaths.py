@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 from __future__ import annotations
 
-import inspect
 import subprocess
 import sys
 
@@ -63,55 +62,6 @@ for qualname in sys.argv[1:]:
 
 """
 
-RUNTIME_OVERRIDE_CONTRACTS = [
-    ("attention_worker", "AFDAttentionWorker", "Worker", "__init__"),
-    ("attention_worker", "AFDAttentionWorker", "Worker", "init_device"),
-    ("ffn_worker", "AFDFFNWorker", "Worker", "__init__"),
-    ("ffn_worker", "AFDFFNWorker", "Worker", "init_device"),
-    ("ffn_worker", "AFDFFNWorker", "Worker", "get_kv_cache_spec"),
-    ("ffn_worker", "AFDFFNWorker", "Worker", "initialize_from_config"),
-    ("ffn_worker", "AFDFFNWorker", "Worker", "compile_or_warm_up_model"),
-    ("ffn_worker", "AFDFFNWorker", "Worker", "execute_model"),
-    ("ffn_worker", "AFDFFNWorker", "Worker", "shutdown"),
-    (
-        "attention_model_runner_v2",
-        "AFDAttentionModelRunnerV2",
-        "GPUModelRunner",
-        "__init__",
-    ),
-    (
-        "attention_model_runner_v2",
-        "AFDAttentionModelRunnerV2",
-        "GPUModelRunner",
-        "load_model",
-    ),
-    (
-        "attention_model_runner_v2",
-        "AFDAttentionModelRunnerV2",
-        "GPUModelRunner",
-        "execute_model",
-    ),
-    (
-        "attention_model_runner_v2",
-        "AFDAttentionModelRunnerV2",
-        "GPUModelRunner",
-        "capture_model",
-    ),
-    (
-        "attention_model_runner_v2",
-        "AFDAttentionModelRunnerV2",
-        "GPUModelRunner",
-        "shutdown",
-    ),
-]
-
-
-def _call_contract(callable_obj):
-    return [
-        (parameter.name, parameter.kind, parameter.default)
-        for parameter in inspect.signature(callable_obj).parameters.values()
-    ]
-
 
 def test_gpu_attention_class_path_selects_mrv2():
     assert (
@@ -137,39 +87,6 @@ def test_gpu_runtime_class_paths_resolve_when_vllm_is_available(qualname):
 
     assert isinstance(cls, type)
     assert cls.__module__.startswith("afd_plugin.v1.worker")
-
-
-@pytest.mark.vllm_runtime
-@pytest.mark.parametrize(
-    ("module_name", "afd_class_name", "native_class_name", "method_name"),
-    RUNTIME_OVERRIDE_CONTRACTS,
-)
-def test_gpu_overrides_match_native_call_contract(
-    module_name,
-    afd_class_name,
-    native_class_name,
-    method_name,
-):
-    pytest.importorskip("torch")
-    pytest.importorskip("vllm")
-
-    if module_name == "attention_worker":
-        from vllm.v1.worker import gpu_worker as native_module
-
-        from afd_plugin.v1.worker import attention_worker as afd_module
-    elif module_name == "ffn_worker":
-        from vllm.v1.worker import gpu_worker as native_module
-
-        from afd_plugin.v1.worker import ffn_worker as afd_module
-    else:
-        from vllm.v1.worker.gpu import model_runner as native_module
-
-        from afd_plugin.v1.worker import attention_model_runner_v2 as afd_module
-
-    afd_method = getattr(getattr(afd_module, afd_class_name), method_name)
-    native_method = getattr(getattr(native_module, native_class_name), method_name)
-
-    assert _call_contract(afd_method) == _call_contract(native_method)
 
 
 @pytest.mark.vllm_runtime

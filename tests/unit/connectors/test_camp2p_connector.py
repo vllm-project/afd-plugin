@@ -8,6 +8,9 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from tests.unit.fakes.afd_config import camp2p_config as _afd_config
+from tests.unit.fakes.vllm_config import camp2p_config as _vllm_config
+
 pytest.importorskip("torch")
 pytest.importorskip("vllm")
 pytest.importorskip("torch_npu")
@@ -27,51 +30,7 @@ from afd_plugin.connectors.npu.camp2p import (
     CAMP2PTransferState,
     build_camp2p_topology,
 )
-
-
-class _FakeDPMetadata:
-    def __init__(self, values):
-        import torch
-
-        # The connector reads token counts with .flatten().tolist(), so this
-        # must be a tensor like the real DP metadata, not a plain list.
-        self.num_tokens_across_dp_cpu = torch.tensor(values, dtype=torch.int32)
-
-
-def _vllm_config(
-    *,
-    num_ubatches: int = 1,
-    n_shared_experts: int = 0,
-    extra_config=None,
-):
-    return SimpleNamespace(
-        additional_config={"afd": {"connector_extra_config": extra_config or {}}},
-        parallel_config=SimpleNamespace(
-            data_parallel_size=1,
-            data_parallel_rank=0,
-            prefill_context_parallel_size=1,
-            tensor_parallel_size=1,
-            num_ubatches=num_ubatches,
-        ),
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(
-                hidden_size=16,
-                num_experts_per_tok=2,
-                n_routed_experts=4,
-                n_shared_experts=n_shared_experts,
-            ),
-        ),
-    )
-
-
-def _afd_config(*, role: str):
-    return AFDConfig(
-        connector="CAMP2pAFDConnector",
-        role=role,
-        num_attention_ranks=4,
-        num_ffn_ranks=2,
-    )
+from tests.unit.fakes.dp_metadata import DPMetadata as _FakeDPMetadata
 
 
 def test_camp2p_factory_creates_connector():
@@ -305,6 +264,7 @@ def _init_ffn_connector(rank, vllm_config):
 
 def test_camp2p_recv_attn_output_uses_kernel_strided_af_grouping(monkeypatch):
     torch = pytest.importorskip("torch")
+
     monkeypatch.setattr(
         torch.ops.afd_ascend,
         "a2e",
@@ -341,6 +301,7 @@ def test_camp2p_recv_attn_output_drives_the_operator_ids_mode(monkeypatch):
     """
 
     torch = pytest.importorskip("torch")
+
     calls: list[tuple] = []
 
     def fake_a2e(*args):
@@ -399,6 +360,7 @@ def test_camp2p_extra_info_coerces_integer_bool_values():
 
 def test_camp2p_connector_uses_role_specific_core_num(monkeypatch):
     torch = pytest.importorskip("torch")
+
     monkeypatch.setattr(
         torch.ops.afd_ascend,
         "a2e",
@@ -501,6 +463,7 @@ def test_camp2p_init_scopes_fresh_options_to_each_hccl_group(monkeypatch):
 
 def test_camp2p_send_attn_custom_op_receives_all_hccl_names(monkeypatch):
     torch = pytest.importorskip("torch")
+
     captured = {}
     connector = CAMP2pAFDConnector(
         0,

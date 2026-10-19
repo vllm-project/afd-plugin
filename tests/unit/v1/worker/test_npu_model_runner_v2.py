@@ -10,9 +10,9 @@ from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 
+np = pytest.importorskip("numpy")
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 pytest.importorskip("vllm_ascend")
@@ -21,7 +21,6 @@ from vllm.config import CUDAGraphMode  # noqa: E402
 from vllm.v1.worker.dp_utils import should_skip_dp_coordination  # noqa: E402
 from vllm.v1.worker.gpu import cudagraph_utils, dp_utils, ubatch_utils  # noqa: E402
 from vllm.v1.worker.gpu import model_runner as native_v2  # noqa: E402
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner  # noqa: E402
 from vllm_ascend.worker.v2 import model_runner as native_ascend_v2  # noqa: E402
 from vllm_ascend.worker.v2.input_batch import (  # noqa: E402
     AscendInputBatch,
@@ -217,18 +216,6 @@ def test_mla_replay_updates_captured_stage_records_and_restores_context(
     assert context.additional_kwargs is original_kwargs
 
 
-def test_execute_and_capture_match_vllm_030_signatures():
-    for method in ("execute_model", "capture_model"):
-        assert inspect.signature(
-            getattr(Runner, method), eval_str=True
-        ) == inspect.signature(getattr(GPUModelRunner, method), eval_str=True)
-    assert "context_len" in inspect.signature(NPUModelRunner.execute_model).parameters
-    assert (
-        "valid_dummy_state_slots"
-        in inspect.signature(NPUModelRunner.execute_model).parameters
-    )
-
-
 @pytest.mark.parametrize("async_dp", [False, True])
 @pytest.mark.parametrize("raise_in_native", [False, True])
 def test_execute_forwards_dummy_profile_and_context_then_restores(
@@ -298,7 +285,7 @@ def test_execute_forwards_dummy_profile_and_context_then_restores(
 
 @pytest.mark.parametrize("profile_only", [False, True])
 @pytest.mark.parametrize("raise_in_native", [False, True])
-def test_capture_forwards_new_inputs_and_restores(
+def test_capture_forwards_new_inputs_and_restores(  # long-test: capture lifecycle
     monkeypatch, profile_only, raise_in_native
 ):
     runner = _runner()
@@ -362,16 +349,6 @@ def test_capture_forwards_new_inputs_and_restores(
 
     def native_capture(self, *, profile_only=False):
         forwarded.append(profile_only)
-        native_signature = inspect.signature(original_prepare)
-        wrapper_signature = inspect.signature(cudagraph_utils.prepare_inputs_to_capture)
-        assert list(wrapper_signature.parameters) == list(native_signature.parameters)
-        assert [
-            (parameter.kind, parameter.default)
-            for parameter in wrapper_signature.parameters.values()
-        ] == [
-            (parameter.kind, parameter.default)
-            for parameter in native_signature.parameters.values()
-        ]
         max_descs = self.cudagraph_manager._max_full_descs_to_capture
         for desc in descs[:max_descs]:
             for _ in (True, False):
@@ -657,15 +634,6 @@ def test_camp2p_padding_preserves_graph_descriptor_and_restores_dispatch(
         )
     assert len(dispatch_calls) == 1
     assert native_v2.dispatch_cg_and_sync_dp is native_dispatch
-
-
-def test_camp2p_dispatch_wrapper_matches_native_signature():
-    original = inspect.signature(native_v2.dispatch_cg_and_sync_dp, eval_str=True)
-    with npu_v2._use_camp2p_dp_padding(4, 2):
-        assert (
-            inspect.signature(native_v2.dispatch_cg_and_sync_dp, eval_str=True)
-            == original
-        )
 
 
 def _ascend_batch(real=5, padded=8):

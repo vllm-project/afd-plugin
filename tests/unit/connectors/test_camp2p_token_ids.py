@@ -30,7 +30,12 @@ from typing import Any
 
 import pytest
 
+from tests.unit.fakes.afd_config import camp2p_config as _afd_config
+from tests.unit.fakes.vllm_config import camp2p_config as _vllm_config
+
 torch = pytest.importorskip("torch")
+
+from tests.unit.fakes.dp_metadata import DPMetadata as _FakeDPMetadata  # noqa: E402
 
 _STUB_MODULES = (
     "vllm",
@@ -101,7 +106,6 @@ def _vllm_stub() -> Iterator[None]:
 
 
 with _vllm_stub():
-    from afd_plugin.config import AFDConfig
     from afd_plugin.connectors.metadata import (
         AFDTransferContext,
         AFDTransferMetadata,
@@ -130,44 +134,6 @@ class _CpuTorch:
         if kwargs.get("device") == "npu":
             kwargs["device"] = "cpu"
         return torch.tensor(*args, **kwargs)
-
-
-class _FakeDPMetadata:
-    def __init__(self, values: list[int]) -> None:
-        # The connector counts tokens with .flatten().tolist(), so this has to be
-        # a tensor like the real DP metadata rather than a plain list.
-        self.num_tokens_across_dp_cpu = torch.tensor(values, dtype=torch.int32)
-
-
-def _vllm_config() -> SimpleNamespace:
-    return SimpleNamespace(
-        additional_config={"afd": {"connector_extra_config": {}}},
-        parallel_config=SimpleNamespace(
-            data_parallel_size=1,
-            data_parallel_rank=0,
-            prefill_context_parallel_size=1,
-            tensor_parallel_size=1,
-            num_ubatches=1,
-        ),
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(
-                hidden_size=16,
-                num_experts_per_tok=2,
-                n_routed_experts=4,
-                n_shared_experts=0,
-            ),
-        ),
-    )
-
-
-def _afd_config(*, role: str) -> AFDConfig:
-    return AFDConfig(
-        connector="CAMP2pAFDConnector",
-        role=role,
-        num_attention_ranks=4,
-        num_ffn_ranks=2,
-    )
 
 
 def _connector(*, role: str, rank: int) -> CAMP2pAFDConnector:

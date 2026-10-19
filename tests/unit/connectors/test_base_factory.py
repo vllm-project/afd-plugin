@@ -1,19 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
 
 import pytest
 
-from afd_plugin.config import AFDConfig
-from afd_plugin.connectors import (
+torch = pytest.importorskip("torch")
+pytest.importorskip("vllm")
+
+from afd_plugin.config import AFDConfig  # noqa: E402
+from afd_plugin.connectors import (  # noqa: E402
     AFDA2FTransferPayload,
     AFDConnectorBase,
     AFDConnectorFactory,
     AFDTransferContext,
     AFDTransferMetadata,
 )
-
-torch = pytest.importorskip("torch")
 
 
 def test_dummy_connector_is_not_registered():

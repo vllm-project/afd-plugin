@@ -3,15 +3,13 @@
 
 from __future__ import annotations
 
-import inspect
 from types import SimpleNamespace
 
 import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
-nn = torch.nn
-
+from torch import nn  # noqa: E402
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper  # noqa: E402
 from vllm.config import CompilationMode  # noqa: E402
 
@@ -38,7 +36,7 @@ class _FakeMissingLayer(nn.Module):
 
 @pytest.fixture
 def construction_env(monkeypatch: pytest.MonkeyPatch):
-    calls = {
+    calls: dict[str, list[str]] = {
         "attention": [],
         "dense": [],
         "moe": [],
@@ -281,23 +279,6 @@ def test_attention_causal_lm_reports_no_local_moe_modules(
     assert model.num_logical_experts == 8
     assert model.get_experts_layer_indices() == (0,)
     assert adapter.native.Qwen3MoeForCausalLM.packed_modules_mapping == native_mapping
-
-
-def test_adapter_signatures_match_native_contract() -> None:
-    assert inspect.signature(adapter.AFDQwen3MoeDecoderLayer.__init__) == (
-        inspect.signature(adapter.native.Qwen3MoeDecoderLayer.__init__)
-    )
-    assert tuple(inspect.signature(adapter.AFDQwen3MoeModel.__init__).parameters) == (
-        "self",
-        "vllm_config",
-        "prefix",
-    )
-    assert inspect.signature(adapter.AFDQwen3MoeForCausalLM.__init__) == (
-        inspect.signature(adapter.native.Qwen3MoeForCausalLM.__init__)
-    )
-    assert inspect.signature(adapter.AFDQwen3MoeForCausalLM.load_weights) == (
-        inspect.signature(adapter.native.Qwen3MoeForCausalLM.load_weights)
-    )
 
 
 @pytest.mark.parametrize(

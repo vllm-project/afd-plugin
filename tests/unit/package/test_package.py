@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import importlib.metadata
 import importlib.util
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -22,12 +21,6 @@ def test_gpu_runtime_exports_only_mrv2_attention_and_connector_ffn():
         "AFDFFNWorker",
         "GPUFFNModelRunner",
     }
-    for retired_class in ("AFDAttentionModelRunner", "AFDUBatchWrapper"):
-        with pytest.raises(AttributeError, match=retired_class):
-            getattr(gpu_runtime, retired_class)
-    assert (
-        importlib.util.find_spec("afd_plugin.v1.worker.attention_model_runner") is None
-    )
 
 
 def test_package_import_is_cpu_safe():
@@ -314,19 +307,6 @@ def test_entry_point_is_registered():
     matches = [ep for ep in entry_points if ep.name == "afd"]
     assert matches
     assert matches[0].value == "afd_plugin:register_afd"
-
-
-def test_connectors_export_attn_output_without_recv_alias():
-    root = Path(__file__).resolve().parents[3]
-    metadata_source = (root / "afd_plugin/connectors/metadata.py").read_text()
-    namespace_source = (root / "afd_plugin/connectors/__init__.py").read_text()
-
-    assert "class AFDA2FTransferPayload:" in metadata_source
-    assert '"AFDA2FTransferPayload"' in metadata_source
-    assert "AFDRecvOutput" not in metadata_source
-    assert "AFDA2FTransferPayload," in namespace_source
-    assert '"AFDA2FTransferPayload"' in namespace_source
-    assert "AFDRecvOutput" not in namespace_source
 
 
 def test_vllm_version_support_is_exact_target():

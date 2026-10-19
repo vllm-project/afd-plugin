@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import inspect
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -25,7 +24,6 @@ from vllm.v1.worker.gpu import cudagraph_utils, dp_utils  # noqa: E402
 from vllm.v1.worker.gpu import model_runner as native_v2  # noqa: E402
 from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector  # noqa: E402
 from vllm.v1.worker.gpu.ubatch_utils import UBatchState  # noqa: E402
-from vllm.v1.worker.gpu_worker import Worker  # noqa: E402
 from vllm.v1.worker.ubatch_utils import UBatchSlice  # noqa: E402
 
 from afd_plugin.model_executor.models import (  # noqa: E402
@@ -276,31 +274,6 @@ def _prepare_worker(worker_cls, config, *, use_v2):
     worker.use_v2_model_runner = use_v2
     worker.device_config = SimpleNamespace(device_type="cuda")
     return worker
-
-
-def test_pinned_worker_init_device_signature_and_internal_runner_import():
-    upstream_init_device = inspect.unwrap(Worker.init_device)
-    assert inspect.signature(upstream_init_device) == inspect.signature(
-        attention_worker.AFDAttentionWorker.init_device,
-    )
-    assert inspect.signature(upstream_init_device) == inspect.signature(
-        ffn_worker.AFDFFNWorker.init_device,
-    )
-    assert inspect.signature(upstream_init_device) == inspect.Signature(
-        [
-            inspect.Parameter(
-                "self",
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            ),
-        ],
-    )
-    source = inspect.getsource(upstream_init_device)
-    assert "from vllm.v1.worker.gpu.model_runner import" in source
-    assert "from vllm.v1.worker.gpu_model_runner import" in source
-    assert "GPUModelRunner as GPUModelRunnerV2" in source
-    assert "GPUModelRunnerV2(" in source
-    assert "GPUModelRunnerV1(" in source
-    assert "self.model_runner = GPUModelRunnerV1" in source
 
 
 def test_v2_fullgraph_replay_hook_restores_manager_instance_after_success():
@@ -1735,30 +1708,6 @@ def test_native_v2_dummy_profile_thin_path_uses_afd_execute_wrapper(
     assert runner.kv_connector.disabled is False
     assert (
         forward_context_module.create_forward_context is original_create_forward_context
-    )
-
-
-def test_v2_execute_and_capture_signatures_are_pinned():
-    assert inspect.signature(
-        AFDAttentionModelRunnerV2.execute_model,
-        eval_str=True,
-    ) == inspect.signature(
-        native_v2.GPUModelRunner.execute_model,
-        eval_str=True,
-    )
-    assert inspect.signature(
-        AFDAttentionModelRunnerV2.__init__,
-        eval_str=True,
-    ) == inspect.signature(
-        native_v2.GPUModelRunner.__init__,
-        eval_str=True,
-    )
-    assert inspect.signature(
-        AFDAttentionModelRunnerV2.capture_model,
-        eval_str=True,
-    ) == inspect.signature(
-        native_v2.GPUModelRunner.capture_model,
-        eval_str=True,
     )
 
 

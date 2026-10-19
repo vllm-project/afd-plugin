@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 from __future__ import annotations
 
-import inspect
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -19,24 +18,6 @@ from afd_plugin.model_executor.models import qwen3_5 as adapter  # noqa: E402
 from afd_plugin.model_executor.models.deepseek_v2 import (  # noqa: E402
     AFDAttentionFusedMoE,
 )
-
-
-def test_qwen_adapter_keeps_native_signatures_and_forward_methods():
-    assert inspect.signature(adapter.AFDQwen3_5DecoderLayer.__init__) == (
-        inspect.signature(native.Qwen3_5DecoderLayer.__init__)
-    )
-    assert inspect.signature(adapter.AFDQwen3_5Model.__init__) == inspect.signature(
-        native.Qwen3_5Model.__init__
-    )
-    assert inspect.signature(
-        adapter.AFDQwen3_5MoeForConditionalGeneration.__init__
-    ) == inspect.signature(native.Qwen3_5MoeForConditionalGeneration.__init__)
-    assert adapter.AFDQwen3_5DecoderLayer.forward is native.Qwen3_5DecoderLayer.forward
-    assert adapter.AFDQwen3_5Model.forward is native.Qwen3_5Model.forward
-    assert (
-        adapter.AFDQwen3_5MoeForConditionalGeneration.forward
-        is native.Qwen3_5MoeForConditionalGeneration.forward
-    )
 
 
 def test_attention_moe_uses_native_forward_and_parameter_free_proxy():

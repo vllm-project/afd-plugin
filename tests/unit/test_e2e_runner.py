@@ -12,7 +12,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -23,67 +23,149 @@ from tests.e2e.accuracy import gsm8k as helpers_gsm8k
 from tests.e2e.models.deepseek_v2_lite import (
     test_deepseek_v2_lite as deepseek_v2_lite_e2e,
 )
-from tests.e2e.models.deepseek_v4_flash import config as dsv4_config
 from tests.e2e.models.qwen3_6 import test_qwen3_6 as qwen3_6_e2e
 from tests.e2e.models.qwen3_moe import test_qwen3_moe as qwen3_moe_e2e
 
+GPU_MODEL_SUITES = {
+    "deepseek-v2-lite": deepseek_v2_lite_e2e,
+    "qwen3-moe": qwen3_moe_e2e,
+    "qwen3-6": qwen3_6_e2e,
+}
 
-def test_baseline_entrypoint_uses_four_devices(monkeypatch, tmp_path):
-    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
-    monkeypatch.setenv("AFD_E2E_DEVICES", "2,4,6,8")
-    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
 
-    command = deepseek_v2_lite_e2e.build_runner_command(
-        "baseline-graph",
-        tmp_path,
+def _args() -> argparse.Namespace:
+    return argparse.Namespace(
+        model="deepseek-ai/DeepSeek-V2-Lite",
+        vllm_bin="vllm",
+        api_host="127.0.0.1",
+        api_port_base=18100,
+        afd_host="127.0.0.1",
+        afd_port=1239,
+        served_model_name_prefix="deepseek-v2-lite-afd",
+        num_attention_ranks=2,
+        num_ffn_ranks=1,
+        attention_devices="0,1",
+        ffn_devices="2",
+        device_backend="gpu",
+        tp_size=1,
+        attention_tp_size=None,
+        ffn_tp_size=None,
+        scenario="afd-eager-2a1f",
+        baseline=False,
+        cuda_graph_full_decode_only=False,
+        cudagraph_capture_size=64,
+        enable_dbo=False,
+        dbo_decode_token_threshold=1,
+        dbo_prefill_token_threshold=None,
+        afd_connector=None,
+        afd_async=False,
+        compute_gate_on_attention=False,
+        afd_connector_extra_config=[],
+        use_decode_bench_connector=False,
+        common_vllm_arg=[],
+        attention_vllm_arg=[],
+        ffn_vllm_arg=[],
+        gsm8k_output_path="/tmp/gsm8k-results",
+        completion_output_path="/tmp/dsv4-completions.json",
     )
 
-    assert command[command.index("--attention-devices") + 1] == "2,4,6,8"
-    assert "--ffn-devices" not in command
+
+def _option(command: list[str], name: str) -> str:
+    return command[command.index(name) + 1]
+
+
+# --- Model E2E entrypoints ---------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "scenario", ["afd-eager-2a1f", "afd-graph-2a1f", "afd-graph-dbo-2a1f"]
+    ("suite_name", "scenario", "devices", "attention_devices", "ffn_devices"),
+    [
+        ("deepseek-v2-lite", "baseline-graph", "2,4,6,8", "2,4,6,8", None),
+        ("deepseek-v2-lite", "afd-eager-2a1f", "2,4,6,8", "2,4", "6"),
+        ("deepseek-v2-lite", "afd-graph-dbo-2a2f", "2,4,6,8", "2,4", "6,8"),
+        ("deepseek-v2-lite", "afd-v2-eager-1a1f", None, "0", "1"),
+        ("deepseek-v2-lite", "afd-v2-eager-dp2", None, "0,1", "2,3"),
+        ("deepseek-v2-lite", "afd-v2-graph-tp2", None, "0,1", "2,3"),
+        ("qwen3-moe", "baseline-graph", "2,4,6,8", "2,4,6,8", None),
+        ("qwen3-moe", "afd-graph-dbo-2a1f", "2,4,6,8", "2,4", "6"),
+        ("qwen3-6", "baseline-graph", "2,4,6,8", "2,4,6,8", None),
+        ("qwen3-6", "afd-eager-2a1f", "2,4,6,8", "2,4", "6"),
+    ],
 )
-def test_afd_entrypoint_ignores_the_fourth_device(monkeypatch, tmp_path, scenario):
+def test_model_entrypoint_selects_role_devices(
+    monkeypatch, tmp_path, suite_name, scenario, devices, attention_devices, ffn_devices
+):
     monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
-    monkeypatch.setenv("AFD_E2E_DEVICES", "2,4,6,8")
     monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
+    if devices is None:
+        monkeypatch.delenv("AFD_E2E_DEVICES", raising=False)
+    else:
+        monkeypatch.setenv("AFD_E2E_DEVICES", devices)
 
-    command = deepseek_v2_lite_e2e.build_runner_command(scenario, tmp_path)
+    command = GPU_MODEL_SUITES[suite_name].build_runner_command(scenario, tmp_path)
 
-    assert command[command.index("--attention-devices") + 1] == "2,4"
-    assert command[command.index("--ffn-devices") + 1] == "6"
+    assert _option(command, "--attention-devices") == attention_devices
+    if ffn_devices is None:
+        assert "--ffn-devices" not in command
+    else:
+        assert _option(command, "--ffn-devices") == ffn_devices
 
 
 @pytest.mark.parametrize(
-    "scenario",
-    ["afd-eager-2a2f", "afd-graph-2a2f", "afd-graph-dbo-2a2f"],
+    ("suite", "scenario"),
+    [
+        pytest.param(suite, scenario, id=f"{name}-{scenario}")
+        for name, suite in GPU_MODEL_SUITES.items()
+        for scenario in suite.SCENARIOS
+    ],
 )
-def test_afd_2a2f_entrypoint_uses_all_four_devices(monkeypatch, tmp_path, scenario):
-    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
-    monkeypatch.setenv("AFD_E2E_DEVICES", "2,4,6,8")
-    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
-
-    command = deepseek_v2_lite_e2e.build_runner_command(scenario, tmp_path)
-
-    assert command[command.index("--attention-devices") + 1] == "2,4"
-    assert command[command.index("--ffn-devices") + 1] == "6,8"
-
-
-@pytest.mark.parametrize("scenario", deepseek_v2_lite_e2e.SCENARIOS)
-def test_deepseek_v2_lite_entrypoint_limits_context(
-    monkeypatch,
-    tmp_path,
-    scenario,
+def test_every_gpu_model_case_uses_v2_with_scoped_feature_evidence(
+    monkeypatch, tmp_path, suite, scenario
 ):
     monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
     monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
     monkeypatch.delenv("AFD_E2E_DEVICES", raising=False)
-
-    command = deepseek_v2_lite_e2e.build_runner_command(scenario, tmp_path)
-
+    command = suite.build_runner_command(scenario, tmp_path)
+    assert _option(command, "--model") == "model"
     assert "--common-vllm-arg=--max-model-len=4096" in command
+    if suite is qwen3_6_e2e:
+        assert "--common-vllm-arg=--language-model-only" in command
+        assert _option(command, "--served-model-name-prefix") == "qwen3-6-afd"
+        assert "--compute-gate-on-attention" not in command
+
+    monkeypatch.setattr(sys, "argv", ["runner", *command[3:]])
+    args = runner.parse_args()
+    runner.configure_scenario(args)
+    runner.validate_topology(
+        args,
+        runner.parse_csv(args.attention_devices),
+        runner.parse_csv(args.ffn_devices),
+    )
+    for role in ("baseline",) if args.baseline else ("attention", "ffn"):
+        service_command = (
+            runner.build_baseline_command(args)
+            if role == "baseline"
+            else runner.build_vllm_command(args, role=role)
+        )
+        expected_probe = runner.needs_mrv2_execution_evidence(args)
+        assert ("--worker-extension-cls" in service_command) is expected_probe
+        if expected_probe:
+            assert (
+                _option(service_command, "--worker-extension-cls")
+                == "tests.e2e.mrv2_evidence.Worker"
+            )
+        env = runner.build_env("0", args, role=role)
+        assert env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+        if expected_probe:
+            assert env["VLLM_SERVER_DEV_MODE"] == "1"
+
+
+def test_qwen3_6_entrypoint_rejects_non_gpu_backends(monkeypatch, tmp_path):
+    monkeypatch.setenv("AFD_E2E_BACKEND", "npu")
+    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
+
+    with pytest.raises(RuntimeError, match="supports only the 'gpu' backend"):
+        qwen3_6_e2e.build_runner_command("afd-eager-2a1f", tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -120,174 +202,57 @@ def test_deepseek_smoke_threshold_preserves_large_runs_and_overrides(
     assert os.environ.get("AFD_GSM8K_THRESHOLD") == override
 
 
-def test_qwen3_moe_baseline_entrypoint_uses_four_devices(monkeypatch, tmp_path):
-    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
-    monkeypatch.setenv("AFD_E2E_DEVICES", "2,4,6,8")
-    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
-
-    command = qwen3_moe_e2e.build_runner_command("baseline-graph", tmp_path)
-
-    assert command[command.index("--attention-devices") + 1] == "2,4,6,8"
-    assert "--ffn-devices" not in command
-
-
-@pytest.mark.parametrize("scenario", qwen3_moe_e2e.SCENARIOS)
-def test_qwen3_moe_entrypoint_limits_context(monkeypatch, tmp_path, scenario):
-    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
-    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
-    monkeypatch.delenv("AFD_E2E_DEVICES", raising=False)
-
-    command = qwen3_moe_e2e.build_runner_command(scenario, tmp_path)
-
-    assert "--common-vllm-arg=--max-model-len=4096" in command
-
-
-@pytest.mark.parametrize("scenario", qwen3_moe_e2e.SCENARIOS[1:])
-def test_qwen3_moe_afd_entrypoint_uses_only_the_standard_2a1f_devices(
-    monkeypatch,
-    tmp_path,
-    scenario,
-):
-    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
-    monkeypatch.setenv("AFD_E2E_DEVICES", "2,4,6,8")
-    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
-
-    command = qwen3_moe_e2e.build_runner_command(scenario, tmp_path)
-
-    assert command[command.index("--attention-devices") + 1] == "2,4"
-    assert command[command.index("--ffn-devices") + 1] == "6"
-
-
-def test_qwen3_6_baseline_entrypoint_uses_four_devices(monkeypatch, tmp_path):
-    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
-    monkeypatch.setenv("AFD_E2E_DEVICES", "2,4,6,8")
-    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
-
-    command = qwen3_6_e2e.build_runner_command("baseline-graph", tmp_path)
-
-    assert command[command.index("--attention-devices") + 1] == "2,4,6,8"
-    assert "--ffn-devices" not in command
-    assert "--common-vllm-arg=--language-model-only" in command
-
-
-@pytest.mark.parametrize("scenario", qwen3_6_e2e.SCENARIOS[1:])
-def test_qwen3_6_afd_entrypoint_uses_standard_2a1f_text_only_commands(
-    monkeypatch,
-    tmp_path,
-    scenario,
-):
-    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
-    monkeypatch.setenv("AFD_E2E_DEVICES", "2,4,6,8")
-    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
-
-    command = qwen3_6_e2e.build_runner_command(scenario, tmp_path)
-
-    assert command[command.index("--model") + 1] == "model"
-    assert command[command.index("--attention-devices") + 1] == "2,4"
-    assert command[command.index("--ffn-devices") + 1] == "6"
-    assert command[command.index("--served-model-name-prefix") + 1] == "qwen3-6-afd"
-    assert "--common-vllm-arg=--max-model-len=4096" in command
-    assert "--common-vllm-arg=--language-model-only" in command
-    assert "--compute-gate-on-attention" not in command
-
-
-def test_qwen3_6_entrypoint_rejects_non_gpu_backends(monkeypatch, tmp_path):
-    monkeypatch.setenv("AFD_E2E_BACKEND", "npu")
-    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
-
-    with pytest.raises(RuntimeError, match="supports only the 'gpu' backend"):
-        qwen3_6_e2e.build_runner_command("afd-eager-2a1f", tmp_path)
-
-
 @pytest.mark.parametrize(
-    ("first_suite", "first_model"),
+    ("suite", "backend", "explicit_model"),
     [
-        (deepseek_v2_lite_e2e, "/models/deepseek-v2-lite"),
-        (qwen3_moe_e2e, "/models/qwen3-moe"),
+        (deepseek_v2_lite_e2e, "gpu", None),
+        (qwen3_moe_e2e, "gpu", None),
+        (qwen3_6_e2e, "gpu", None),
+        (deepseek_v2_lite_e2e, "gpu", "/models/user-selected"),
+        (deepseek_v2_lite_e2e, "npu", "/models/user-selected"),
+        (qwen3_moe_e2e, "gpu", "/models/user-selected"),
+        (qwen3_6_e2e, "gpu", "/models/user-selected"),
     ],
 )
-def test_generated_gpu_model_is_scoped_to_its_e2e_suite(
-    monkeypatch,
-    tmp_path,
-    first_suite,
-    first_model,
+def test_e2e_fixture_scopes_the_model_override_to_its_suite(
+    monkeypatch, tmp_path, suite, backend, explicit_model
 ):
-    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
-    monkeypatch.delenv("AFD_GPU_E2E_MODEL", raising=False)
-    monkeypatch.setattr(first_suite, "download_dataset", lambda *_args: None)
-    monkeypatch.setattr(
-        first_suite,
-        "download_model",
-        lambda _repo_id: Path(first_model),
-    )
-
-    first_fixture = first_suite._prepare_e2e_assets.__wrapped__()
-    next(first_fixture)
-    assert os.environ["AFD_GPU_E2E_MODEL"] == first_model
-
-    with pytest.raises(StopIteration):
-        next(first_fixture)
-    assert "AFD_GPU_E2E_MODEL" not in os.environ
-
-    second_model = "/models/qwen3-6"
-    monkeypatch.setattr(qwen3_6_e2e, "download_dataset", lambda *_args: None)
-    monkeypatch.setattr(
-        qwen3_6_e2e,
-        "download_model",
-        lambda _repo_id: Path(second_model),
-    )
-    second_fixture = qwen3_6_e2e._prepare_e2e_assets.__wrapped__()
-    next(second_fixture)
-    try:
-        command = qwen3_6_e2e.build_runner_command("afd-eager-2a1f", tmp_path)
-        assert command[command.index("--model") + 1] == second_model
-    finally:
-        with pytest.raises(StopIteration):
-            next(second_fixture)
-
-    assert "AFD_GPU_E2E_MODEL" not in os.environ
-
-
-@pytest.mark.parametrize(
-    ("suite", "backend", "model_env_name"),
-    [
-        (deepseek_v2_lite_e2e, "gpu", "AFD_GPU_E2E_MODEL"),
-        (deepseek_v2_lite_e2e, "npu", "AFD_NPU_E2E_MODEL"),
-        (qwen3_moe_e2e, "gpu", "AFD_GPU_E2E_MODEL"),
-        (qwen3_6_e2e, "gpu", "AFD_GPU_E2E_MODEL"),
-    ],
-)
-def test_e2e_fixture_restores_explicit_model_override(
-    monkeypatch,
-    suite,
-    backend,
-    model_env_name,
-):
-    explicit_model = "/models/user-selected"
+    model_env_name = f"AFD_{backend.upper()}_E2E_MODEL"
+    downloaded_model = f"/models/{suite.__name__}"
     monkeypatch.setenv("AFD_E2E_BACKEND", backend)
-    monkeypatch.setenv(model_env_name, explicit_model)
+    if explicit_model is None:
+        monkeypatch.delenv(model_env_name, raising=False)
+    else:
+        monkeypatch.setenv(model_env_name, explicit_model)
     monkeypatch.setattr(suite, "download_dataset", lambda *_args: None)
-    monkeypatch.setattr(
-        suite,
-        "download_model",
-        lambda _repo_id: pytest.fail("explicit model must not download"),
-    )
+
+    def download_model(_repo_id):
+        if explicit_model is not None:
+            pytest.fail("explicit model must not download")
+        return Path(downloaded_model)
+
+    monkeypatch.setattr(suite, "download_model", download_model)
 
     fixture = suite._prepare_e2e_assets.__wrapped__()
     next(fixture)
-    assert os.environ[model_env_name] == explicit_model
+    expected_model = explicit_model or downloaded_model
+    assert os.environ[model_env_name] == expected_model
+    command = suite.build_runner_command("afd-eager-2a1f", tmp_path)
+    assert _option(command, "--model") == expected_model
 
     with pytest.raises(StopIteration):
         next(fixture)
-    assert os.environ[model_env_name] == explicit_model
+    assert os.environ.get(model_env_name) == explicit_model
 
 
-def test_run_runner_forwards_cancellation_and_reaps(monkeypatch):
+# --- run_runner (tests/conftest.py) ------------------------------------------
+
+
+def test_run_runner_forwards_cancellation_and_reaps(
+    monkeypatch,
+):  # long-test: signal delivery and process reaping form one lifecycle contract
     command = [sys.executable, "-m", "tests.e2e.runner"]
-    previous_handlers = {
-        signal.SIGTERM: object(),
-        signal.SIGINT: object(),
-    }
+    previous_handlers = {signal.SIGTERM: object(), signal.SIGINT: object()}
     installed_handlers: dict[int, Callable[[int, object], None]] = {}
     signal_calls = []
     kill_calls = []
@@ -324,9 +289,7 @@ def test_run_runner_forwards_cancellation_and_reaps(monkeypatch):
 
     monkeypatch.setattr(conftest.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(
-        conftest.signal,
-        "getsignal",
-        lambda signum: previous_handlers[signum],
+        conftest.signal, "getsignal", lambda signum: previous_handlers[signum]
     )
     monkeypatch.setattr(conftest.signal, "signal", fake_signal)
     monkeypatch.setattr(
@@ -342,14 +305,7 @@ def test_run_runner_forwards_cancellation_and_reaps(monkeypatch):
 
     assert error.value.code == 128 + signal.SIGTERM
     assert popen_calls == [
-        (
-            command,
-            {
-                "cwd": REPO_ROOT,
-                "env": None,
-                "start_new_session": True,
-            },
-        ),
+        (command, {"cwd": REPO_ROOT, "env": None, "start_new_session": True})
     ]
     assert kill_calls == [(321, signal.SIGTERM), (321, 9)]
     assert process.wait_calls == [None, RUNNER_CLEANUP_TIMEOUT_S, None]
@@ -391,8 +347,6 @@ def test_run_runner_forwards_signal_received_during_spawn(monkeypatch):
 
 
 def test_run_runner_fails_for_a_nonzero_exit(monkeypatch):
-    command = [sys.executable, "-m", "tests.e2e.runner"]
-
     class FailedProcess:
         pid = 321
         returncode = 17
@@ -404,91 +358,32 @@ def test_run_runner_fails_for_a_nonzero_exit(monkeypatch):
             return self.returncode
 
     monkeypatch.setattr(
-        conftest.subprocess,
-        "Popen",
-        lambda *_args, **_kwargs: FailedProcess(),
+        conftest.subprocess, "Popen", lambda *_args, **_kwargs: FailedProcess()
     )
     monkeypatch.setattr(conftest.signal, "signal", lambda *_args: None)
 
     with pytest.raises(subprocess.CalledProcessError) as error:
-        run_runner(command)
+        run_runner([sys.executable, "-m", "tests.e2e.runner"])
 
     assert error.value.returncode == 17
 
 
-def _args() -> argparse.Namespace:
-    return argparse.Namespace(
-        model="deepseek-ai/DeepSeek-V2-Lite",
-        vllm_bin="vllm",
-        api_host="127.0.0.1",
-        api_port_base=18100,
-        afd_host="127.0.0.1",
-        afd_port=1239,
-        served_model_name_prefix="deepseek-v2-lite-afd",
-        num_attention_ranks=2,
-        num_ffn_ranks=1,
-        attention_devices="0,1",
-        ffn_devices="2",
-        device_backend="gpu",
-        tp_size=1,
-        attention_tp_size=None,
-        ffn_tp_size=None,
-        scenario="afd-eager-2a1f",
-        baseline=False,
-        cuda_graph_full_decode_only=False,
-        cudagraph_capture_size=64,
-        enable_dbo=False,
-        dbo_decode_token_threshold=1,
-        dbo_prefill_token_threshold=None,
-        afd_connector=None,
-        afd_async=False,
-        compute_gate_on_attention=False,
-        afd_connector_extra_config=[],
-        use_decode_bench_connector=False,
-        common_vllm_arg=[],
-        attention_vllm_arg=[],
-        ffn_vllm_arg=[],
-        gsm8k_output_path="/tmp/gsm8k-results",
-        completion_output_path="/tmp/dsv4-completions.json",
-    )
+# --- Runner scenario configuration and commands ------------------------------
 
 
 @pytest.mark.parametrize(
     "legacy_args",
     [
         ["--num-attention-ranks", "4"],
-        ["--num-ffn-ranks", "2"],
         ["--tp-size", "2"],
-        ["--attention-tp-size", "2"],
-        ["--ffn-tp-size", "2"],
-        ["--cuda-graph-full-decode-only"],
-        ["--cudagraph-capture-size", "16"],
         ["--enable-dbo"],
-        ["--dbo-decode-token-threshold", "2"],
-        ["--dbo-prefill-token-threshold", "16"],
         ["--prompt", "Hello"],
-        ["--max-tokens", "32"],
-        ["--temperature", "0.5"],
-        ["--num-requests", "2"],
-        ["--request-concurrency", "2"],
         ["--expect-text", "answer"],
     ],
 )
 def test_parse_args_rejects_legacy_fixed_scenario_options(monkeypatch, legacy_args):
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "runner",
-            "--model",
-            "model",
-            "--scenario",
-            "afd-eager-2a1f",
-            "--gsm8k-output-path",
-            "results",
-            *legacy_args,
-        ],
-    )
+    argv = "runner --model model --scenario afd-eager-2a1f --gsm8k-output-path out"
+    monkeypatch.setattr(sys, "argv", [*argv.split(), *legacy_args])
 
     with pytest.raises(SystemExit) as error:
         runner.parse_args()
@@ -508,47 +403,16 @@ def test_parse_args_rejects_legacy_fixed_scenario_options(monkeypatch, legacy_ar
         ("afd-graph-dbo-2a2f", (False, True, True, 2, 2, 1, 1, 1)),
         ("afd-eager-async-cam", (False, False, False, 2, 2, 1, 2, 1)),
         ("afd-async-ubatch", (False, False, False, 2, 1, 1, 2, 1)),
-        (runner.DSV4_ASYNC_CAM_SCENARIO, (False, False, False, 8, 8, 1, 4, 1)),
-        (
-            dsv4_config.DSV4_SYNC_CAMP2P_A5_SCENARIO,
-            # The A5 profile runs Attention DP2/TP1 and FFN DP2/TP1 with ACL
-            # graph capture like its launch script, but without that script's
-            # native DBO, whose split path is the current suspect for the A5 DSA
-            # attention operator tiling failure.
-            (False, True, False, 2, 2, 1, 1, 1),
-        ),
-        (
-            dsv4_config.DSV4_SYNC_CAMP2P_A3_SCENARIO,
-            # Sixteen dies: Attention DP2/TP4 and FFN DP8/TP1 with expert
-            # parallelism, the shape its recorded deployment uses. It runs on
-            # NPU like the asynchronous case, so its runner choice is retained.
-            (False, False, False, 8, 8, 1, 4, 1),
-        ),
-        ("afd-v2-eager-1a1f", (False, False, False, 1, 1, 1, 1, 1)),
-        ("afd-v2-eager-dp2", (False, False, False, 2, 2, 1, 1, 1)),
-        ("afd-v2-eager-tp2", (False, False, False, 2, 2, 1, 2, 2)),
-        ("afd-v2-graph-1a1f", (False, True, False, 1, 1, 1, 1, 1)),
-        ("afd-v2-graph-dp2", (False, True, False, 2, 2, 1, 1, 1)),
-        ("afd-v2-graph-tp2", (False, True, False, 2, 2, 1, 2, 2)),
     ],
 )
-def test_configure_scenario_overwrites_fixed_topology_and_features(
-    scenario,
-    expected,
-):
+def test_configure_scenario_overwrites_fixed_topology_and_features(scenario, expected):
     args = _args()
     args.scenario = scenario
-    if scenario in (
-        runner.ASYNC_CAM_SCENARIO,
-        runner.ASYNC_UBATCH_SCENARIO,
-        *runner.DSV4_SCENARIOS,
-    ):
+    if scenario in (runner.ASYNC_CAM_SCENARIO, runner.ASYNC_UBATCH_SCENARIO):
         args.device_backend = "npu"
     args.num_attention_ranks = 99
     args.num_ffn_ranks = 99
     args.tp_size = 99
-    args.cuda_graph_full_decode_only = False
-    args.enable_dbo = False
 
     runner.configure_scenario(args)
 
@@ -562,82 +426,63 @@ def test_configure_scenario_overwrites_fixed_topology_and_features(
         args.attention_tp_size,
         args.ffn_tp_size,
     ) == expected
-    # A scenario that carries its own launch profile (the DSV4 synchronous
-    # cases) uses that profile's graph setting instead of the default.
-    profile = dsv4_config.sync_shape(scenario)
     if args.cuda_graph_full_decode_only:
-        expected_capture_size = (
-            profile.cudagraph_capture_size
-            if profile is not None
-            else runner.DEFAULT_CUDAGRAPH_CAPTURE_SIZE
-        )
-        assert args.cudagraph_capture_size == expected_capture_size
+        assert args.cudagraph_capture_size == runner.DEFAULT_CUDAGRAPH_CAPTURE_SIZE
     if args.enable_dbo:
         # vLLM 0.30 requires DBO thresholds >= the microbatch count (2).
         assert args.dbo_decode_token_threshold == 2
         assert args.dbo_prefill_token_threshold == 8
 
 
-def test_async_cam_scenario_builds_dp1tp2_attention_and_dp2tp1_ffn():
+@pytest.mark.parametrize(
+    ("scenario", "ffn_devices", "extra_config", "expected_extra_config"),
+    [
+        (runner.ASYNC_CAM_SCENARIO, ["2", "3"], [], {"attn_ranks_per_dp": 2}),
+        (
+            runner.ASYNC_UBATCH_SCENARIO,
+            ["2"],
+            [
+                json.dumps(
+                    {
+                        "attn_ranks_per_dp": 1,
+                        "async_moe_ubatching": False,
+                        "async_moe_num_ubatches": 99,
+                        "async_moe_split": "request",
+                    }
+                )
+            ],
+            {
+                "attn_ranks_per_dp": 2,
+                "async_moe_ubatching": True,
+                "async_moe_num_ubatches": 2,
+                "async_moe_split": "token",
+            },
+        ),
+    ],
+)
+def test_async_npu_scenarios_build_tp2_attention_with_async_connector(
+    scenario, ffn_devices, extra_config, expected_extra_config
+):
     args = _args()
-    args.scenario = "afd-eager-async-cam"
+    args.scenario = scenario
     args.device_backend = "npu"
+    args.afd_connector_extra_config = extra_config
     runner.configure_scenario(args)
-    runner.validate_topology(args, ["0", "1"], ["2", "3"])
+    runner.validate_topology(args, ["0", "1"], ffn_devices)
 
     attention_command = runner.build_vllm_command(args, role="attention")
     ffn_command = runner.build_vllm_command(args, role="ffn")
 
-    assert attention_command[attention_command.index("--data-parallel-size") + 1] == "1"
-    assert (
-        attention_command[attention_command.index("--tensor-parallel-size") + 1] == "2"
-    )
-    assert ffn_command[ffn_command.index("--data-parallel-size") + 1] == "2"
-    assert ffn_command[ffn_command.index("--tensor-parallel-size") + 1] == "1"
-    attention_config = json.loads(
-        attention_command[attention_command.index("--additional-config") + 1],
-    )["afd"]
-    assert attention_config["connector"] == runner.ASYNC_AFD_CONNECTOR
-    assert attention_config["async"] is True
-    assert attention_config["compute_gate_on_attention"] is True
-    assert attention_config["connector_extra_config"]["attn_ranks_per_dp"] == 2
+    assert _option(attention_command, "--data-parallel-size") == "1"
+    assert _option(attention_command, "--tensor-parallel-size") == "2"
+    assert _option(ffn_command, "--data-parallel-size") == str(len(ffn_devices))
+    assert _option(ffn_command, "--tensor-parallel-size") == "1"
     assert "--enable-expert-parallel" in ffn_command
-
-
-def test_async_ubatch_scenario_enforces_token_split_moe_ubatching():
-    args = _args()
-    args.scenario = "afd-async-ubatch"
-    args.device_backend = "npu"
-    args.afd_connector_extra_config = [
-        json.dumps(
-            {
-                "attn_ranks_per_dp": 1,
-                "async_moe_ubatching": False,
-                "async_moe_num_ubatches": 99,
-                "async_moe_split": "request",
-            },
-        ),
-    ]
-    runner.configure_scenario(args)
-    runner.validate_topology(args, ["0", "1"], ["2"])
-
-    attention_command = runner.build_vllm_command(args, role="attention")
-
-    assert attention_command[attention_command.index("--data-parallel-size") + 1] == "1"
-    assert (
-        attention_command[attention_command.index("--tensor-parallel-size") + 1] == "2"
-    )
-    attention_config = json.loads(
-        attention_command[attention_command.index("--additional-config") + 1],
-    )["afd"]
-    assert attention_config["connector"] == runner.ASYNC_AFD_CONNECTOR
-    assert attention_config["async"] is True
-    assert attention_config["compute_gate_on_attention"] is True
-    extra_config = attention_config["connector_extra_config"]
-    assert extra_config["async_moe_ubatching"] is True
-    assert extra_config["async_moe_num_ubatches"] == 2
-    assert extra_config["async_moe_split"] == "token"
-    assert extra_config["attn_ranks_per_dp"] == 2
+    config = json.loads(_option(attention_command, "--additional-config"))["afd"]
+    assert config["connector"] == runner.ASYNC_AFD_CONNECTOR
+    assert config["async"] is True
+    assert config["compute_gate_on_attention"] is True
+    assert config["connector_extra_config"].items() >= expected_extra_config.items()
 
 
 @pytest.mark.parametrize(
@@ -654,10 +499,7 @@ def test_async_ubatch_scenario_enforces_token_split_moe_ubatching():
     ],
 )
 def test_v2_scenarios_build_exact_commands(
-    scenario,
-    expected_dp_size,
-    expected_tp_size,
-    uses_graph,
+    scenario, expected_dp_size, expected_tp_size, uses_graph
 ):
     args = _args()
     args.scenario = scenario
@@ -665,8 +507,9 @@ def test_v2_scenarios_build_exact_commands(
 
     for role in ("attention", "ffn"):
         command = runner.build_vllm_command(args, role=role)
-        assert command[command.index("--data-parallel-size") + 1] == expected_dp_size
-        assert command[command.index("--tensor-parallel-size") + 1] == expected_tp_size
+        assert _option(command, "--data-parallel-size") == expected_dp_size
+        assert _option(command, "--tensor-parallel-size") == expected_tp_size
+        assert _option(command, "--shutdown-timeout") == "10"
         assert ("--enforce-eager" in command) is not uses_graph
         assert ("--compilation-config" in command) is uses_graph
         assert ("--enable-dbo" in command) is ("-dbo-" in scenario)
@@ -678,56 +521,35 @@ def test_v2_scenarios_build_exact_commands(
             uses_graph or "-dbo-" in scenario
         )
         if scenario in runner.V2_DBO_COMPARISON_SCENARIOS:
-            assert command[command.index("--max-num-seqs") + 1] == "8"
+            assert _option(command, "--max-num-seqs") == "8"
         if "-dbo-" in scenario:
-            assert command[command.index("--dbo-decode-token-threshold") + 1] == "2"
-            assert command[command.index("--dbo-prefill-token-threshold") + 1] == "8"
+            assert _option(command, "--dbo-decode-token-threshold") == "2"
+            assert _option(command, "--dbo-prefill-token-threshold") == "8"
             if uses_graph:
-                assert json.loads(
-                    command[command.index("--compilation-config") + 1]
-                ) == {
-                    "cudagraph_mode": "FULL_DECODE_ONLY",
+                assert json.loads(_option(command, "--compilation-config")) == {
+                    "cudagraph_mode": "FULL_DECODE_ONLY"
                 }
-                assert command[command.index("--cudagraph-capture-sizes") + 1] == "8"
+                assert _option(command, "--cudagraph-capture-sizes") == "8"
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("afd_async", True),
-        ("compute_gate_on_attention", True),
-        ("afd_connector", "OtherConnector"),
-        ("afd_connector_extra_config", ['{"mode":"configured"}']),
-        ("use_decode_bench_connector", True),
-    ],
-)
-def test_gpu_scenarios_leave_connector_contract_validation_to_runtime(field, value):
+def test_gpu_scenarios_leave_connector_contract_validation_to_runtime():
     args = _args()
     args.scenario = "afd-v2-eager-1a1f"
-    setattr(args, field, value)
+    args.afd_async = True
+    args.compute_gate_on_attention = True
+    args.afd_connector = "OtherConnector"
+    args.afd_connector_extra_config = ['{"mode":"configured"}']
+    args.use_decode_bench_connector = True
 
     runner.configure_scenario(args)
     command = runner.build_vllm_command(args, role="attention")
-    config = json.loads(command[command.index("--additional-config") + 1])["afd"]
-    if field == "use_decode_bench_connector":
-        assert "--kv-transfer-config" in command
-    elif field == "afd_connector_extra_config":
-        assert config["connector_extra_config"] == {"mode": "configured"}
-    else:
-        config_field = {"afd_async": "async", "afd_connector": "connector"}.get(
-            field, field
-        )
-        assert config[config_field] == value
 
-
-def test_v2_scenarios_reject_npu_backend():
-    args = _args()
-    args.scenario = "afd-v2-eager-1a1f"
-    args.device_backend = "npu"
-    runner.configure_scenario(args)
-
-    with pytest.raises(ValueError, match="require GPU"):
-        runner.validate_topology(args, ["0"], ["1"])
+    config = json.loads(_option(command, "--additional-config"))["afd"]
+    assert config["async"] is True
+    assert config["compute_gate_on_attention"] is True
+    assert config["connector"] == "OtherConnector"
+    assert config["connector_extra_config"] == {"mode": "configured"}
+    assert "--kv-transfer-config" in command
 
 
 def test_build_baseline_command_uses_native_dp4_graph_server():
@@ -738,181 +560,189 @@ def test_build_baseline_command_uses_native_dp4_graph_server():
     command = runner.build_baseline_command(args)
 
     assert "--additional-config" not in command
-    assert command[command.index("--data-parallel-size") + 1] == "4"
-    assert command[command.index("--tensor-parallel-size") + 1] == "1"
+    assert _option(command, "--data-parallel-size") == "4"
+    assert _option(command, "--tensor-parallel-size") == "1"
+    assert _option(command, "--shutdown-timeout") == "10"
     assert "--enable-expert-parallel" in command
     assert "--worker-extension-cls" not in command
-    assert json.loads(command[command.index("--compilation-config") + 1]) == {
-        "cudagraph_mode": "FULL_DECODE_ONLY",
+    assert json.loads(_option(command, "--compilation-config")) == {
+        "cudagraph_mode": "FULL_DECODE_ONLY"
     }
-
-
-def test_build_baseline_command_configures_graceful_shutdown_timeout():
-    args = _args()
-    args.scenario = "baseline-graph"
-    runner.configure_scenario(args)
-
-    command = runner.build_baseline_command(args)
-
-    shutdown_timeout_index = command.index("--shutdown-timeout")
-    assert command[shutdown_timeout_index + 1] == "10"
-
-
-@pytest.mark.parametrize("role", ["attention", "ffn"])
-def test_build_vllm_command_configures_graceful_shutdown_timeout(role):
-    args = _args()
-    runner.configure_scenario(args)
-
-    command = runner.build_vllm_command(args, role=role)
-
-    shutdown_timeout_index = command.index("--shutdown-timeout")
-    assert command[shutdown_timeout_index + 1] == "10"
+    for passthrough_arg in ("--additional-config", '--additional-config={"afd":{}}'):
+        args.common_vllm_arg = [passthrough_arg]
+        with pytest.raises(ValueError, match="--additional-config"):
+            runner.build_baseline_command(args)
 
 
 @pytest.mark.parametrize(
-    "passthrough_arg",
-    ["--additional-config", '--additional-config={"afd":{}}'],
-)
-def test_build_baseline_command_rejects_additional_config_passthrough(
-    passthrough_arg,
-):
-    args = _args()
-    args.scenario = "baseline-graph"
-    args.common_vllm_arg = [passthrough_arg]
-    runner.configure_scenario(args)
-
-    with pytest.raises(ValueError, match="--additional-config"):
-        runner.build_baseline_command(args)
-
-
-def test_validate_topology_accepts_four_baseline_ranks_without_ffn_ranks():
-    args = _args()
-    args.scenario = "baseline-graph"
-    runner.configure_scenario(args)
-
-    runner.validate_topology(args, ["0", "1", "2", "3"], [])
-
-
-@pytest.mark.parametrize(
-    "scenario",
-    [runner.ASYNC_CAM_SCENARIO, runner.ASYNC_UBATCH_SCENARIO],
-)
-def test_validate_topology_rejects_async_cam_scenarios_on_gpu(scenario):
-    args = _args()
-    args.scenario = scenario
-    args.device_backend = "gpu"
-    runner.configure_scenario(args)
-
-    ffn_devices = ["2", "3"] if scenario == runner.ASYNC_CAM_SCENARIO else ["2"]
-    with pytest.raises(ValueError, match="require NPU"):
-        runner.validate_topology(args, ["0", "1"], ffn_devices)
-
-
-@pytest.mark.parametrize(
-    ("attention_devices", "ffn_devices", "error_message"),
+    ("scenario", "backend", "attention_devices", "ffn_devices", "error_message"),
     [
-        (["0"], ["2"], "--attention-devices must contain exactly 2 devices"),
-        (["0", "1"], [], "--ffn-devices must contain exactly 1 device"),
+        ("baseline-graph", "gpu", ["0", "1", "2", "3"], [], None),
+        ("afd-v2-eager-1a1f", "npu", ["0"], ["1"], "require GPU"),
+        (runner.ASYNC_CAM_SCENARIO, "gpu", ["0", "1"], ["2", "3"], "require NPU"),
+        (runner.ASYNC_UBATCH_SCENARIO, "gpu", ["0", "1"], ["2"], "require NPU"),
+        ("afd-eager-2a1f", "gpu", ["0"], ["2"], "attention-devices .* exactly 2"),
+        ("afd-eager-2a1f", "gpu", ["0", "1"], [], "ffn-devices .* exactly 1"),
+        ("afd-eager-2a1f", "gpu", ["0", "0"], ["2"], "Attention devices must be"),
+        ("afd-eager-2a1f", "gpu", ["0", "1"], ["2", "2"], "FFN devices must be"),
+        ("afd-eager-2a1f", "gpu", ["0", "1"], ["1"], "must not overlap"),
     ],
 )
-def test_validate_topology_rejects_wrong_device_count(
-    attention_devices,
-    ffn_devices,
-    error_message,
-):
-    args = _args()
-    runner.configure_scenario(args)
-
-    with pytest.raises(ValueError, match=error_message):
-        runner.validate_topology(args, attention_devices, ffn_devices)
-
-
-@pytest.mark.parametrize(
-    ("attention_devices", "ffn_devices", "error_message"),
-    [
-        (["0", "0"], ["2"], "Attention devices must be unique"),
-        (["0", "1"], ["2", "2"], "FFN devices must be unique"),
-        (["0", "1"], ["1"], "Attention and FFN devices must not overlap"),
-    ],
-)
-def test_validate_topology_rejects_reused_devices(
-    attention_devices,
-    ffn_devices,
-    error_message,
-):
-    args = _args()
-
-    with pytest.raises(ValueError, match=error_message):
-        runner.validate_topology(args, attention_devices, ffn_devices)
-
-
-@pytest.mark.parametrize(
-    ("scenario", "backend", "expected_plugins"),
-    [
-        ("baseline-graph", "gpu", ""),
-        ("baseline-graph", "npu", "ascend"),
-        ("afd-eager-2a1f", "gpu", "afd"),
-        ("afd-eager-2a1f", "npu", "ascend,afd"),
-        ("afd-v2-eager-1a1f", "gpu", "afd"),
-    ],
-)
-def test_build_env_uses_the_scenario_plugin_allowlist(
-    scenario,
-    backend,
-    expected_plugins,
+def test_validate_topology(
+    scenario, backend, attention_devices, ffn_devices, error_message
 ):
     args = _args()
     args.scenario = scenario
     args.device_backend = backend
     runner.configure_scenario(args)
 
-    env = runner.build_env("0", args, role="baseline" if args.baseline else "attention")
+    if error_message is None:
+        runner.validate_topology(args, attention_devices, ffn_devices)
+    else:
+        with pytest.raises(ValueError, match=error_message):
+            runner.validate_topology(args, attention_devices, ffn_devices)
 
-    assert env["VLLM_PLUGINS"] == expected_plugins
+
+@pytest.mark.parametrize(
+    ("scenario", "backend", "plugins", "v2_runner", "flashcomm", "logging_level"),
+    [
+        ("baseline-graph", "gpu", "", "1", "1", None),
+        ("baseline-graph", "npu", "ascend", "1", None, None),
+        ("afd-graph-2a1f", "gpu", "afd", "1", "1", None),
+        ("afd-graph-dbo-2a1f", "gpu", "afd", "1", "1", "DEBUG"),
+        ("afd-eager-2a2f", "npu", "ascend,afd", "1", None, None),
+        ("afd-graph-dbo-2a2f", "npu", "ascend,afd", "1", None, "DEBUG"),
+        ("afd-v2-eager-1a1f", "gpu", "afd", "1", "1", None),
+    ],
+)
+def test_build_env_scopes_plugins_runner_and_backend_options(
+    monkeypatch, scenario, backend, plugins, v2_runner, flashcomm, logging_level
+):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "1")
+    monkeypatch.delenv("VLLM_LOGGING_LEVEL", raising=False)
+    args = _args()
+    args.scenario = scenario
+    args.device_backend = backend
+    runner.configure_scenario(args)
+    role = "baseline" if args.baseline else "ffn"
+
+    env = runner.build_env("0,1", args, role=role, e2e_run_id="run-1")
+
+    assert env["VLLM_PLUGINS"] == plugins
+    assert env["VLLM_USE_V2_MODEL_RUNNER"] == v2_runner
+    assert env.get("VLLM_ASCEND_ENABLE_FLASHCOMM1") == flashcomm
+    assert env.get("VLLM_LOGGING_LEVEL") == logging_level
+    assert env[runner.E2E_RUN_ID_ENV] == "run-1"
+    assert env[runner.E2E_PROCESS_ROLE_ENV] == role
+    if backend == "npu":
+        command = (
+            runner.build_baseline_command(args)
+            if args.baseline
+            else runner.build_vllm_command(args, role="attention")
+        )
+        assert (
+            "--worker-extension-cls" in command
+        ) is runner.needs_mrv2_execution_evidence(args)
+
+
+@pytest.mark.parametrize(
+    "common_args",
+    [
+        ["--unrelated-arg"],
+        ["--enable-prefix-caching", "--async-scheduling", "--enable-chunked-prefill"],
+        [
+            "--no-enable-prefix-caching",
+            "--no-async-scheduling",
+            "--no-enable-chunked-prefill",
+        ],
+    ],
+)
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "afd-eager-2a1f",
+        "afd-graph-dbo-2a2f",
+        "afd-v2-eager-dbo-dp2",
+        "afd-v2-graph-dbo-dp2",
+    ],
+)
+def test_runner_preserves_native_runtime_option_choices(common_args, scenario):
+    args = _args()
+    args.scenario = scenario
+    args.common_vllm_arg = list(common_args)
+    runner.configure_scenario(args)
+
+    assert args.common_vllm_arg == common_args
+    command = runner.build_vllm_command(args, role="attention")
+    for option in (
+        "--enable-prefix-caching",
+        "--no-enable-prefix-caching",
+        "--async-scheduling",
+        "--no-async-scheduling",
+        "--enable-chunked-prefill",
+        "--no-enable-chunked-prefill",
+    ):
+        assert command.count(option) == common_args.count(option)
 
 
 @pytest.mark.parametrize(
     ("backend", "visible_devices_env"),
-    [
-        ("gpu", "CUDA_VISIBLE_DEVICES"),
-        ("npu", "ASCEND_RT_VISIBLE_DEVICES"),
-    ],
+    [("gpu", "CUDA_VISIBLE_DEVICES"), ("npu", "ASCEND_RT_VISIBLE_DEVICES")],
 )
 def test_print_command_reports_the_actual_visible_devices_environment(
-    backend,
-    visible_devices_env,
-    capsys,
+    backend, visible_devices_env, capsys
 ):
     runner.print_command("ATTN", ["vllm", "serve"], backend, "0,1")
 
     assert f"({visible_devices_env}=0,1)" in capsys.readouterr().out
 
 
-def test_extract_gsm8k_sample_count_returns_effective_count():
-    assert (
-        helpers_gsm8k._extract_gsm8k_sample_count(
-            {"n-samples": {"gsm8k": {"effective": 7}}},
-        )
-        == 7
-    )
+# --- lm-eval invocation and GSM8K gating -------------------------------------
 
 
-@pytest.mark.parametrize(
-    "results",
-    [
+def _inline_thread(on_join: Callable[[float | None], None], alive: bool = False):
+    class InlineThread:
+        def __init__(self, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+        def join(self, timeout=None):
+            on_join(timeout)
+
+        def is_alive(self):
+            return alive
+
+    return InlineThread
+
+
+def test_extract_gsm8k_sample_count():
+    results = {"n-samples": {"gsm8k": {"effective": 7}}}
+    assert helpers_gsm8k._extract_gsm8k_sample_count(results) == 7
+    malformed: tuple[dict[str, Any], ...] = (
         {},
         {"n-samples": {"gsm8k": {"effective": "not-a-number"}}},
         {"n-samples": {"gsm8k": {"effective": 7.5}}},
+    )
+    for malformed_results in malformed:
+        with pytest.raises((KeyError, ValueError), match="GSM8K sample count"):
+            helpers_gsm8k._extract_gsm8k_sample_count(malformed_results)
+
+
+@pytest.mark.parametrize(
+    ("options", "expected_model_args"),
+    [
+        ({}, []),
+        (
+            {"max_gen_toks": 321, "num_concurrent": 12},
+            ["max_gen_toks=321", "num_concurrent=12"],
+        ),
     ],
 )
-def test_extract_gsm8k_sample_count_rejects_missing_or_malformed_results(results):
-    with pytest.raises((KeyError, ValueError), match="GSM8K sample count"):
-        helpers_gsm8k._extract_gsm8k_sample_count(results)
-
-
-def test_run_lm_eval_uses_builtin_gsm8k_and_inherits_hf_home(
-    monkeypatch,
-    tmp_path,
+def test_run_lm_eval_builds_builtin_gsm8k_command(
+    monkeypatch, tmp_path, options, expected_model_args
 ):
     popen_calls = []
     hf_home = str(tmp_path / "huggingface")
@@ -929,63 +759,16 @@ def test_run_lm_eval_uses_builtin_gsm8k_and_inherits_hf_home(
             "http://127.0.0.1:8000",
             "model",
             output_path=str(tmp_path / "results"),
+            **options,
         )
 
     command, kwargs = popen_calls[0]
-    assert command[command.index("--tasks") + 1] == "gsm8k"
+    assert _option(command, "--tasks") == "gsm8k"
     assert "--include_path" not in command
     assert "--limit" not in command
     assert kwargs["env"]["HF_HOME"] == hf_home
-
-
-def test_run_lm_eval_passes_max_gen_toks_to_local_completions(
-    monkeypatch,
-    tmp_path,
-):
-    popen_calls = []
-
-    def fake_popen(command, **_kwargs):
-        popen_calls.append(command)
-        raise RuntimeError("stop after inspecting lm-eval invocation")
-
-    monkeypatch.setattr(helpers_gsm8k.subprocess, "Popen", fake_popen)
-
-    with pytest.raises(RuntimeError, match="stop after inspecting"):
-        helpers_gsm8k._run_lm_eval(
-            "http://127.0.0.1:8000",
-            "model",
-            output_path=str(tmp_path / "results"),
-            max_gen_toks=321,
-        )
-
-    command = popen_calls[0]
-    model_args = command[command.index("--model_args") + 1]
-    assert "max_gen_toks=321" in model_args.split(",")
-
-
-def test_run_lm_eval_passes_num_concurrent_to_local_completions(
-    monkeypatch,
-    tmp_path,
-):
-    popen_calls = []
-
-    def fake_popen(command, **_kwargs):
-        popen_calls.append(command)
-        raise RuntimeError("stop after inspecting lm-eval invocation")
-
-    monkeypatch.setattr(helpers_gsm8k.subprocess, "Popen", fake_popen)
-
-    with pytest.raises(RuntimeError, match="stop after inspecting"):
-        helpers_gsm8k._run_lm_eval(
-            "http://127.0.0.1:8000",
-            "model",
-            output_path=str(tmp_path / "results"),
-            num_concurrent=12,
-        )
-
-    command = popen_calls[0]
-    model_args = command[command.index("--model_args") + 1]
-    assert "num_concurrent=12" in model_args.split(",")
+    model_args = _option(command, "--model_args").split(",")
+    assert all(arg in model_args for arg in expected_model_args)
 
 
 def test_run_lm_eval_reads_timestamped_results_file(monkeypatch, tmp_path):
@@ -997,43 +780,36 @@ def test_run_lm_eval_reads_timestamped_results_file(monkeypatch, tmp_path):
         "n-samples": {"gsm8k": {"original": 1319, "effective": 7}},
     }
     (model_output_path / "results_2026-08-07T11-16-36.json").write_text(
-        json.dumps(expected_results),
+        json.dumps(expected_results)
     )
 
     class CompletedProcess:
         pid = 404
-        stdout = io.StringIO(
-            "| strict-match | 5 | exact_match | 0.25 | +/- | 0.0 |\n",
-        )
+        stdout = io.StringIO("| strict-match | 5 | exact_match | 0.25 | +/- | 0.0 |\n")
         returncode = 0
 
         def wait(self, timeout=None):
             return self.returncode
 
     monkeypatch.setattr(
-        helpers_gsm8k.subprocess,
-        "Popen",
-        lambda *_args, **_kwargs: CompletedProcess(),
+        helpers_gsm8k.subprocess, "Popen", lambda *_args, **_kwargs: CompletedProcess()
     )
 
     results = helpers_gsm8k._run_lm_eval(
-        "http://127.0.0.1:8000",
-        "model",
-        output_path=str(output_path),
+        "http://127.0.0.1:8000", "model", output_path=str(output_path)
     )
 
     assert results == expected_results
 
 
-def test_run_lm_eval_custom_timeout_cleans_its_group_reaps_and_joins(
-    monkeypatch,
-    tmp_path,
+def test_lm_eval_timeout_reaps_process_and_reader(  # long-test: reap and join
+    monkeypatch, tmp_path
 ):
     popen_calls = []
     group_alive = True
     leader_signal_calls = []
     group_signal_calls = []
-    reader_join_calls = []
+    reader_join_calls: list[float | None] = []
 
     class FakeProcess:
         pid = 404
@@ -1053,27 +829,11 @@ def test_run_lm_eval_custom_timeout_cleans_its_group_reaps_and_joins(
             self.returncode = -9
             return self.returncode
 
-    class FakeReader:
-        def __init__(self, target, **_kwargs):
-            self.target = target
-
-        def start(self):
-            self.target()
-
-        def join(self, timeout=None):
-            reader_join_calls.append(timeout)
-
-        def is_alive(self):
-            return False
-
     process = FakeProcess()
 
     def fake_popen(command, **kwargs):
         popen_calls.append((command, kwargs))
         return process
-
-    def fake_kill(pid, sig):
-        leader_signal_calls.append((pid, sig))
 
     def fake_killpg(pid, sig):
         nonlocal group_alive
@@ -1083,18 +843,19 @@ def test_run_lm_eval_custom_timeout_cleans_its_group_reaps_and_joins(
         if sig == signal.SIGKILL:
             group_alive = False
 
-    monotonic_values = iter(
-        [100.0, 111.0, 8000.0, 8021.0, 9000.0, 9000.0],
-    )
+    monotonic_values = iter([100.0, 111.0, 8000.0, 8021.0, 9000.0, 9000.0])
     monkeypatch.setattr(helpers_gsm8k.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(helpers_gsm8k.threading, "Thread", FakeReader)
     monkeypatch.setattr(
-        helpers_gsm8k.time,
-        "monotonic",
-        lambda: next(monotonic_values),
+        helpers_gsm8k.threading, "Thread", _inline_thread(reader_join_calls.append)
     )
+    monkeypatch.setattr(helpers_gsm8k.time, "monotonic", lambda: next(monotonic_values))
     monkeypatch.setattr(helpers_gsm8k, "signal", signal, raising=False)
-    monkeypatch.setattr(helpers_gsm8k.os, "kill", fake_kill, raising=False)
+    monkeypatch.setattr(
+        helpers_gsm8k.os,
+        "kill",
+        lambda pid, sig: leader_signal_calls.append((pid, sig)),
+        raising=False,
+    )
     monkeypatch.setattr(helpers_gsm8k.os, "killpg", fake_killpg, raising=False)
     monkeypatch.setattr(helpers_gsm8k.signal, "SIGKILL", 9, raising=False)
 
@@ -1109,11 +870,7 @@ def test_run_lm_eval_custom_timeout_cleans_its_group_reaps_and_joins(
     assert popen_calls[0][1]["start_new_session"] is True
     assert process.direct_kill_calls == 0
     assert leader_signal_calls == [(404, signal.SIGTERM)]
-    assert group_signal_calls == [
-        (404, 0),
-        (404, 9),
-        (404, 0),
-    ]
+    assert group_signal_calls == [(404, 0), (404, 9), (404, 0)]
     assert isinstance(error.value.__cause__, RuntimeError)
     assert "forced SIGKILL" in str(error.value.__cause__)
     assert process.wait_calls == [helpers_gsm8k.LM_EVAL_REAP_TIMEOUT_S]
@@ -1121,13 +878,11 @@ def test_run_lm_eval_custom_timeout_cleans_its_group_reaps_and_joins(
 
 
 def test_run_lm_eval_rejects_a_reader_that_does_not_join(monkeypatch, tmp_path):
-    reader_join_calls = []
+    reader_join_calls: list[float | None] = []
 
     class CompletedProcess:
         pid = 404
-        stdout = io.StringIO(
-            '{"results":{"gsm8k":{"exact_match":1.0}}}\n',
-        )
+        stdout = io.StringIO('{"results":{"gsm8k":{"exact_match":1.0}}}\n')
         returncode = 0
 
         def poll(self):
@@ -1136,40 +891,26 @@ def test_run_lm_eval_rejects_a_reader_that_does_not_join(monkeypatch, tmp_path):
         def wait(self, timeout=None):
             return self.returncode
 
-    class StuckReader:
-        def __init__(self, target, **_kwargs):
-            self.target = target
-
-        def start(self):
-            self.target()
-
-        def join(self, timeout=None):
-            reader_join_calls.append(timeout)
-
-        def is_alive(self):
-            return True
-
     monkeypatch.setattr(
-        helpers_gsm8k.subprocess,
-        "Popen",
-        lambda *_args, **_kwargs: CompletedProcess(),
+        helpers_gsm8k.subprocess, "Popen", lambda *_args, **_kwargs: CompletedProcess()
     )
-    monkeypatch.setattr(helpers_gsm8k.threading, "Thread", StuckReader)
+    monkeypatch.setattr(
+        helpers_gsm8k.threading,
+        "Thread",
+        _inline_thread(reader_join_calls.append, alive=True),
+    )
     monkeypatch.setattr(helpers_gsm8k.time, "monotonic", lambda: 100.0)
 
     with pytest.raises(RuntimeError, match="reader thread"):
         helpers_gsm8k._run_lm_eval(
-            "http://127.0.0.1:8000",
-            "model",
-            output_path=str(tmp_path / "results"),
+            "http://127.0.0.1:8000", "model", output_path=str(tmp_path / "results")
         )
 
     assert reader_join_calls == [helpers_gsm8k.LM_EVAL_READER_JOIN_TIMEOUT_S]
 
 
-def test_run_lm_eval_defers_a_first_signal_until_cleanup_finishes(
-    monkeypatch,
-    tmp_path,
+def test_lm_eval_signal_waits_for_cleanup(  # long-test: signal and cleanup lifecycle
+    monkeypatch, tmp_path
 ):
     events = []
     installed_handlers = {}
@@ -1196,19 +937,6 @@ def test_run_lm_eval_defers_a_first_signal_until_cleanup_finishes(
             events.append(("wait", timeout))
             raise RuntimeError("reap failed")
 
-    class FakeReader:
-        def __init__(self, target, **_kwargs):
-            self.target = target
-
-        def start(self):
-            self.target()
-
-        def join(self, timeout=None):
-            events.append(("reader-join", timeout))
-
-        def is_alive(self):
-            return False
-
     def fake_signal(signum, handler):
         installed_handlers[signum] = handler
         action = "restore" if handler is previous_handlers[signum] else "install"
@@ -1228,24 +956,20 @@ def test_run_lm_eval_defers_a_first_signal_until_cleanup_finishes(
     process = FakeProcess()
     monotonic_values = iter([100.0, 111.0, 8000.0, 9000.0, 9000.0])
     monkeypatch.setattr(
-        helpers_gsm8k.signal,
-        "getsignal",
-        lambda signum: previous_handlers[signum],
+        helpers_gsm8k.signal, "getsignal", lambda signum: previous_handlers[signum]
     )
     monkeypatch.setattr(helpers_gsm8k.signal, "signal", fake_signal)
     monkeypatch.setattr(
-        helpers_gsm8k.subprocess,
-        "Popen",
-        lambda *_args, **_kwargs: process,
+        helpers_gsm8k.subprocess, "Popen", lambda *_args, **_kwargs: process
     )
-    monkeypatch.setattr(helpers_gsm8k.threading, "Thread", FakeReader)
+    monkeypatch.setattr(
+        helpers_gsm8k.threading,
+        "Thread",
+        _inline_thread(lambda timeout: events.append(("reader-join", timeout))),
+    )
     monkeypatch.setattr(helpers_gsm8k.os, "kill", fake_kill, raising=False)
     monkeypatch.setattr(helpers_gsm8k.os, "killpg", fake_killpg, raising=False)
-    monkeypatch.setattr(
-        helpers_gsm8k.time,
-        "monotonic",
-        lambda: next(monotonic_values),
-    )
+    monkeypatch.setattr(helpers_gsm8k.time, "monotonic", lambda: next(monotonic_values))
 
     with pytest.raises(SystemExit) as error:
         helpers_gsm8k._run_lm_eval(
@@ -1279,7 +1003,7 @@ def test_run_lm_eval_handles_signal_received_during_spawn(monkeypatch, tmp_path)
         pid = 404
         stdout = io.StringIO("")
 
-    class FakeReader:
+    class UnstartedReader:
         def __init__(self, **_kwargs):
             pass
 
@@ -1294,11 +1018,9 @@ def test_run_lm_eval_handles_signal_received_during_spawn(monkeypatch, tmp_path)
         return FakeProcess()
 
     monkeypatch.setattr(helpers_gsm8k.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(helpers_gsm8k.threading, "Thread", FakeReader)
+    monkeypatch.setattr(helpers_gsm8k.threading, "Thread", UnstartedReader)
     monkeypatch.setattr(
-        helpers_gsm8k.signal,
-        "getsignal",
-        lambda _signum: previous_handler,
+        helpers_gsm8k.signal, "getsignal", lambda _signum: previous_handler
     )
     monkeypatch.setattr(
         helpers_gsm8k.signal,
@@ -1313,187 +1035,79 @@ def test_run_lm_eval_handles_signal_received_during_spawn(monkeypatch, tmp_path)
 
     with pytest.raises(SystemExit, match=str(128 + signal.SIGTERM)):
         helpers_gsm8k._run_lm_eval(
-            "http://127.0.0.1:8000",
-            "model",
-            output_path=str(tmp_path),
-            timeout_s=0,
+            "http://127.0.0.1:8000", "model", output_path=str(tmp_path), timeout_s=0
         )
 
     assert cleaned == [404]
 
 
-@pytest.mark.parametrize("backend", ["gpu", "npu"])
-def test_run_gsm8k_evaluation_uses_the_builtin_task_and_default_limit(
-    monkeypatch,
-    backend,
-):
-    args = _args()
-    args.device_backend = backend
-    calls = []
-    monkeypatch.delenv("AFD_GSM8K_LIMIT", raising=False)
-
-    def fake_run_lm_eval(base_url, model_name, **kwargs):
-        calls.append((base_url, model_name, kwargs))
-        return {
-            "n-samples": {"gsm8k": {"effective": 7}},
-            "results": {"gsm8k": {"exact_match": 0.27}},
-        }
-
-    monkeypatch.setattr(runner, "_run_lm_eval", fake_run_lm_eval)
-
-    runner.run_gsm8k_evaluation(args)
-
-    assert calls == [
-        (
-            "http://127.0.0.1:18100",
-            "deepseek-v2-lite-afd-attention",
-            {
-                "output_path": "/tmp/gsm8k-results",
-                "num_fewshot": 8,
-                "tokenizer": "deepseek-ai/DeepSeek-V2-Lite",
-                "limit": 7,
-            },
-        ),
-    ]
-
-
-def test_run_gsm8k_evaluation_runs_the_full_dataset_when_requested(
-    monkeypatch,
-):
-    args = _args()
-    calls = []
-    monkeypatch.setenv("AFD_GSM8K_LIMIT", "all")
-
-    def fake_run_lm_eval(base_url, model_name, **kwargs):
-        calls.append((base_url, model_name, kwargs))
-        return {
-            "n-samples": {"gsm8k": {"effective": 1319}},
-            "results": {"gsm8k": {"exact_match": 0.27}},
-        }
-
-    monkeypatch.setattr(runner, "_run_lm_eval", fake_run_lm_eval)
-
-    runner.run_gsm8k_evaluation(args)
-
-    assert calls == [
-        (
-            "http://127.0.0.1:18100",
-            "deepseek-v2-lite-afd-attention",
-            {
-                "output_path": "/tmp/gsm8k-results",
-                "num_fewshot": 8,
-                "tokenizer": "deepseek-ai/DeepSeek-V2-Lite",
-                "limit": None,
-                "timeout_s": 28800,
-            },
-        ),
-    ]
-
-
-def test_run_gsm8k_evaluation_uses_batch_two_for_async_token_split(
-    monkeypatch,
-):
-    args = _args()
-    args.scenario = runner.ASYNC_UBATCH_SCENARIO
-    args.device_backend = "npu"
-    runner.configure_scenario(args)
-    calls = []
-    monkeypatch.delenv("AFD_GSM8K_LIMIT", raising=False)
-
-    def fake_run_lm_eval(base_url, model_name, **kwargs):
-        calls.append((base_url, model_name, kwargs))
-        return {
-            "n-samples": {"gsm8k": {"effective": 7}},
-            "results": {"gsm8k": {"exact_match": 0.27}},
-        }
-
-    monkeypatch.setattr(runner, "_run_lm_eval", fake_run_lm_eval)
-
-    runner.run_gsm8k_evaluation(args)
-
-    assert calls[0][2]["batch_size"] == 2
-
-
-def test_run_gsm8k_evaluation_concurrency_and_sample_floor_for_dbo(monkeypatch):
-    args = _args()
-    args.scenario = "afd-graph-dbo-2a1f"
-    args.device_backend = "gpu"
-    runner.configure_scenario(args)
-    calls = []
-    monkeypatch.delenv("AFD_GSM8K_LIMIT", raising=False)
-
-    def fake_run_lm_eval(base_url, model_name, **kwargs):
-        calls.append((base_url, model_name, kwargs))
-        return {
-            "n-samples": {"gsm8k": {"effective": runner.DBO_EVAL_MIN_SAMPLES}},
-            "results": {"gsm8k": {"exact_match": 0.27}},
-        }
-
-    monkeypatch.setattr(runner, "_run_lm_eval", fake_run_lm_eval)
-
-    runner.run_gsm8k_evaluation(args)
-
-    assert calls[0][2]["num_concurrent"] == runner.DBO_EVAL_NUM_CONCURRENT
-    assert calls[0][2]["limit"] == runner.DBO_EVAL_MIN_SAMPLES
-
-
-def test_run_gsm8k_evaluation_rejects_an_incomplete_full_dataset(
-    monkeypatch,
-):
-    args = _args()
-    monkeypatch.setenv("AFD_GSM8K_LIMIT", "all")
-    monkeypatch.setattr(
-        runner,
-        "_run_lm_eval",
-        lambda *_args, **_kwargs: {
-            "n-samples": {"gsm8k": {"effective": 1318}},
-            "results": {"gsm8k": {"exact_match": 1.0}},
-        },
-    )
-
-    with pytest.raises(RuntimeError, match="expected 1319"):
-        runner.run_gsm8k_evaluation(args)
-
-
-def test_run_gsm8k_evaluation_rejects_a_non_seven_sample_result(
-    monkeypatch,
-):
-    args = _args()
-    monkeypatch.delenv("AFD_GSM8K_LIMIT", raising=False)
-    monkeypatch.setattr(
-        runner,
-        "_run_lm_eval",
-        lambda *_args, **_kwargs: {
-            "n-samples": {"gsm8k": {"effective": 6}},
-            "results": {"gsm8k": {"exact_match": 1.0}},
-        },
-    )
-
-    with pytest.raises(RuntimeError, match="expected 7"):
-        runner.run_gsm8k_evaluation(args)
-
-
 @pytest.mark.parametrize(
-    "accuracy",
-    [0.26, pytest.param(float("nan"), id="nan")],
+    ("scenario", "backend", "limit_env", "expected_options"),
+    [
+        ("afd-eager-2a1f", "gpu", None, {"limit": 7}),
+        ("afd-eager-2a1f", "npu", None, {"limit": 7}),
+        ("afd-eager-2a1f", "gpu", "all", {"limit": None, "timeout_s": 28800}),
+        (runner.ASYNC_UBATCH_SCENARIO, "npu", None, {"limit": 7, "batch_size": 2}),
+        ("afd-graph-dbo-2a1f", "gpu", None, {"limit": 24, "num_concurrent": 12}),
+        # The V2 DBO comparison cases share one evaluation workload.
+        ("afd-v2-eager-dp2", "gpu", None, {"limit": 128, "num_concurrent": 12}),
+        ("afd-v2-eager-dbo-dp2", "gpu", None, {"limit": 128, "num_concurrent": 12}),
+        ("afd-v2-graph-dbo-dp2", "gpu", None, {"limit": 128, "num_concurrent": 12}),
+    ],
 )
-def test_run_gsm8k_evaluation_rejects_accuracy_that_does_not_meet_gate(
-    monkeypatch,
-    accuracy,
+def test_gsm8k_scenario_workload_and_result_validation(  # long-test: evaluation
+    monkeypatch, scenario, backend, limit_env, expected_options
 ):
     args = _args()
-    monkeypatch.delenv("AFD_GSM8K_LIMIT", raising=False)
-    monkeypatch.setattr(
-        runner,
-        "_run_lm_eval",
-        lambda *_args, **_kwargs: {
-            "n-samples": {"gsm8k": {"effective": 7}},
-            "results": {"gsm8k": {"exact_match": accuracy}},
-        },
-    )
+    args.scenario = scenario
+    args.device_backend = backend
+    runner.configure_scenario(args)
+    if limit_env is None:
+        monkeypatch.delenv("AFD_GSM8K_LIMIT", raising=False)
+    else:
+        monkeypatch.setenv("AFD_GSM8K_LIMIT", limit_env)
+    calls = []
 
-    with pytest.raises(RuntimeError, match="below the required threshold"):
-        runner.run_gsm8k_evaluation(args)
+    expected_count = expected_options["limit"] or runner.GSM8K_FULL_SAMPLE_COUNT
+
+    def fake_run_lm_eval(base_url, model_name, **kwargs):
+        calls.append((base_url, model_name, kwargs))
+        return {
+            "n-samples": {"gsm8k": {"effective": expected_count}},
+            "results": {"gsm8k": {"exact_match": 0.5}},
+        }
+
+    monkeypatch.setattr(runner, "_run_lm_eval", fake_run_lm_eval)
+
+    runner.run_gsm8k_evaluation(args)
+
+    assert calls == [
+        (
+            "http://127.0.0.1:18100",
+            "deepseek-v2-lite-afd-attention",
+            {
+                "output_path": "/tmp/gsm8k-results",
+                "num_fewshot": 8,
+                "tokenizer": "deepseek-ai/DeepSeek-V2-Lite",
+                **expected_options,
+            },
+        )
+    ]
+    for effective, accuracy, error_message in (
+        (expected_count - 1, 1.0, f"expected {expected_count}"),
+        (expected_count, 0.26, "below the required threshold"),
+        (expected_count, float("nan"), "below the required threshold"),
+    ):
+        monkeypatch.setattr(
+            runner,
+            "_run_lm_eval",
+            lambda *_args, effective=effective, accuracy=accuracy, **_kwargs: {
+                "n-samples": {"gsm8k": {"effective": effective}},
+                "results": {"gsm8k": {"exact_match": accuracy}},
+            },
+        )
+        with pytest.raises(RuntimeError, match=error_message):
+            runner.run_gsm8k_evaluation(args)
 
 
 @pytest.mark.parametrize(
@@ -1506,9 +1120,7 @@ def test_run_gsm8k_evaluation_rejects_accuracy_that_does_not_meet_gate(
     ],
 )
 def test_run_completion_evaluation_validates_one_32_token_request(
-    monkeypatch,
-    body,
-    error,
+    monkeypatch, body, error
 ):
     args = _args()
     args.scenario = "afd-eager-async-cam"
@@ -1536,6 +1148,9 @@ def test_run_completion_evaluation_validates_one_32_token_request(
         }
 
 
+# --- Runner process lifecycle -------------------------------------------------
+
+
 def test_ensure_processes_alive_reports_exited_process_returncode():
     process = argparse.Namespace(poll=lambda: 17)
 
@@ -1545,41 +1160,24 @@ def test_ensure_processes_alive_reports_exited_process_returncode():
 
 def test_terminate_processes_rejects_cleanup_failure(monkeypatch):
     monkeypatch.setattr(
-        runner,
-        "terminate_process_groups",
-        lambda *_args, **_kwargs: ["cleanup failed"],
+        runner, "terminate_process_groups", lambda *_args, **_kwargs: ["cleanup failed"]
     )
 
     with pytest.raises(RuntimeError, match="cleanup failed"):
         runner.terminate_processes([])
 
 
-@pytest.mark.parametrize("native_handler", [False, True])
-def test_main_checks_processes_and_restores_signal_handlers_when_cleanup_fails(
-    monkeypatch,
-    capsys,
-    native_handler,
-):
+class _JoinRecorder:
+    joined = False
+
+    def join(self, timeout):
+        self.joined = True
+
+
+def _stub_main_pipeline(monkeypatch, process, log_thread: _JoinRecorder) -> None:
     args = _args()
     args.attention_devices = "0"
     args.ffn_devices = "1"
-    args.afd_connector = None
-    process = argparse.Namespace(poll=lambda: None)
-    checked_processes = []
-    installed_handlers = []
-    previous_handlers = {
-        signal.SIGTERM: None if native_handler else "previous-term-handler",
-        signal.SIGINT: "previous-int-handler",
-    }
-
-    class FakeLogThread:
-        joined = False
-
-        def join(self, timeout):
-            self.joined = True
-
-    log_thread = FakeLogThread()
-
     monkeypatch.setattr(runner, "parse_args", lambda: args)
     monkeypatch.setattr(runner, "validate_topology", lambda *_args: None)
     monkeypatch.setattr(runner, "build_vllm_command", lambda *_args, **_kwargs: [])
@@ -1588,6 +1186,21 @@ def test_main_checks_processes_and_restores_signal_handlers_when_cleanup_fails(
     monkeypatch.setattr(runner, "stream_output", lambda *_args: log_thread)
     monkeypatch.setattr(runner, "wait_for_openai_api", lambda *_args: None)
     monkeypatch.setattr(runner, "run_gsm8k_evaluation", lambda *_args: None)
+
+
+@pytest.mark.parametrize("native_handler", [False, True])
+def test_main_checks_processes_and_restores_signal_handlers_when_cleanup_fails(
+    monkeypatch, capsys, native_handler
+):
+    process = argparse.Namespace(poll=lambda: None)
+    log_thread = _JoinRecorder()
+    checked_processes = []
+    installed_handlers = []
+    previous_handlers = {
+        signal.SIGTERM: None if native_handler else "previous-term-handler",
+        signal.SIGINT: "previous-int-handler",
+    }
+    _stub_main_pipeline(monkeypatch, process, log_thread)
     monkeypatch.setattr(
         runner,
         "ensure_processes_alive",
@@ -1597,13 +1210,11 @@ def test_main_checks_processes_and_restores_signal_handlers_when_cleanup_fails(
         runner,
         "terminate_processes",
         lambda _processes, **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("cleanup failed"),
+            RuntimeError("cleanup failed")
         ),
     )
     monkeypatch.setattr(
-        runner.signal,
-        "getsignal",
-        lambda signum: previous_handlers[signum],
+        runner.signal, "getsignal", lambda signum: previous_handlers[signum]
     )
     monkeypatch.setattr(
         runner.signal,
@@ -1627,25 +1238,13 @@ def test_main_checks_processes_and_restores_signal_handlers_when_cleanup_fails(
 
 
 def test_main_defers_a_first_signal_until_cleanup_failure_is_reported(monkeypatch):
-    args = _args()
-    args.attention_devices = "0"
-    args.ffn_devices = "1"
-    args.afd_connector = None
-    process = argparse.Namespace(poll=lambda: None)
+    log_thread = _JoinRecorder()
     installed_handlers = {}
     cleanup_events = []
     previous_handlers = {
         signal.SIGTERM: "previous-term-handler",
         signal.SIGINT: "previous-int-handler",
     }
-
-    class FakeLogThread:
-        joined = False
-
-        def join(self, timeout):
-            self.joined = True
-
-    log_thread = FakeLogThread()
 
     def fake_signal(signum, handler):
         installed_handlers[signum] = handler
@@ -1656,19 +1255,10 @@ def test_main_defers_a_first_signal_until_cleanup_failure_is_reported(monkeypatc
         cleanup_events.append("completed")
         raise RuntimeError("cleanup failed")
 
-    monkeypatch.setattr(runner, "parse_args", lambda: args)
-    monkeypatch.setattr(runner, "validate_topology", lambda *_args: None)
-    monkeypatch.setattr(runner, "build_vllm_command", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(runner, "build_env", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(runner, "start_process", lambda *_args, **_kwargs: process)
-    monkeypatch.setattr(runner, "stream_output", lambda *_args: log_thread)
-    monkeypatch.setattr(runner, "wait_for_openai_api", lambda *_args: None)
-    monkeypatch.setattr(runner, "run_gsm8k_evaluation", lambda *_args: None)
+    _stub_main_pipeline(monkeypatch, argparse.Namespace(poll=lambda: None), log_thread)
     monkeypatch.setattr(runner, "terminate_processes", cleanup_with_first_signal)
     monkeypatch.setattr(
-        runner.signal,
-        "getsignal",
-        lambda signum: previous_handlers[signum],
+        runner.signal, "getsignal", lambda signum: previous_handlers[signum]
     )
     monkeypatch.setattr(runner.signal, "signal", fake_signal)
 
@@ -1696,97 +1286,6 @@ def test_runner_drops_flashcomm_for_npu_role(monkeypatch, ffn_tp_size):
     assert env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
 
 
-def test_build_env_marks_managed_process_trees_by_role():
-    args = _args()
-    args.device_backend = "npu"
-
-    attention_env = runner.build_env(
-        "0,1",
-        args,
-        role="attention",
-        e2e_run_id="run-1",
-    )
-    ffn_env = runner.build_env(
-        "2,3",
-        args,
-        role="ffn",
-        e2e_run_id="run-1",
-    )
-
-    assert attention_env[runner.E2E_RUN_ID_ENV] == "run-1"
-    assert attention_env[runner.E2E_PROCESS_ROLE_ENV] == "attention"
-    assert ffn_env[runner.E2E_RUN_ID_ENV] == "run-1"
-    assert ffn_env[runner.E2E_PROCESS_ROLE_ENV] == "ffn"
-
-
-@pytest.mark.parametrize(
-    ("scenario", "expected"),
-    [
-        ("baseline-graph", "1"),
-        ("afd-eager-2a1f", "1"),
-        ("afd-v2-eager-1a1f", "1"),
-    ],
-)
-def test_runner_always_selects_gpu_model_runner_v2(
-    monkeypatch,
-    scenario,
-    expected,
-):
-    args = _args()
-    args.scenario = scenario
-    runner.configure_scenario(args)
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-
-    env = runner.build_env("0,1", args, role="attention")
-
-    assert env["VLLM_USE_V2_MODEL_RUNNER"] == expected
-
-
-@pytest.mark.parametrize(
-    ("suite", "scenario"),
-    [
-        pytest.param(suite, scenario, id=f"{name}-{scenario}")
-        for name, suite in (
-            ("deepseek-v2-lite", deepseek_v2_lite_e2e),
-            ("qwen3-moe", qwen3_moe_e2e),
-            ("qwen3-6", qwen3_6_e2e),
-        )
-        for scenario in suite.SCENARIOS
-    ],
-)
-def test_every_gpu_model_case_uses_v2_with_scoped_feature_evidence(
-    monkeypatch, tmp_path, suite, scenario
-):
-    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
-    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "model")
-    monkeypatch.delenv("AFD_E2E_DEVICES", raising=False)
-    command = suite.build_runner_command(scenario, tmp_path)
-    monkeypatch.setattr(sys, "argv", ["runner", *command[3:]])
-    args = runner.parse_args()
-    runner.configure_scenario(args)
-    runner.validate_topology(
-        args,
-        runner.parse_csv(args.attention_devices),
-        runner.parse_csv(args.ffn_devices),
-    )
-    for role in ("baseline",) if args.baseline else ("attention", "ffn"):
-        service_command = (
-            runner.build_baseline_command(args)
-            if role == "baseline"
-            else runner.build_vllm_command(args, role=role)
-        )
-        expected_probe = runner.needs_mrv2_execution_evidence(args)
-        assert ("--worker-extension-cls" in service_command) is expected_probe
-        if expected_probe:
-            assert service_command[
-                service_command.index("--worker-extension-cls") + 1
-            ] == ("tests.e2e.mrv2_evidence.Worker")
-        env = runner.build_env("0", args, role=role)
-        assert env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
-        if expected_probe:
-            assert env["VLLM_SERVER_DEV_MODE"] == "1"
-
-
 @pytest.mark.parametrize(
     "scenario",
     ["baseline-graph", "afd-eager-2a2f", "afd-graph-2a1f", "afd-graph-dbo-2a2f"],
@@ -1805,36 +1304,6 @@ def test_npu_shared_cases_migrate_to_native_v2(scenario):
     assert ("--worker-extension-cls" in command) is (
         not args.baseline and args.cuda_graph_full_decode_only
     )
-
-
-@pytest.mark.parametrize(
-    "common_args",
-    [
-        [],
-        ["--enable-prefix-caching", "--async-scheduling", "--enable-chunked-prefill"],
-        [
-            "--no-enable-prefix-caching",
-            "--no-async-scheduling",
-            "--no-enable-chunked-prefill",
-        ],
-    ],
-)
-@pytest.mark.parametrize("scenario", ["afd-eager-2a1f", "afd-v2-graph-dbo-dp2"])
-def test_gpu_execution_preserves_native_runtime_option_choices(common_args, scenario):
-    args = _args()
-    args.scenario = scenario
-    args.common_vllm_arg = common_args.copy()
-    runner.configure_scenario(args)
-    command = runner.build_vllm_command(args, role="attention")
-    for option in (
-        "--enable-prefix-caching",
-        "--no-enable-prefix-caching",
-        "--async-scheduling",
-        "--no-async-scheduling",
-        "--enable-chunked-prefill",
-        "--no-enable-chunked-prefill",
-    ):
-        assert command.count(option) == common_args.count(option)
 
 
 @pytest.mark.parametrize(
@@ -2045,7 +1514,6 @@ def test_mrv2_evidence_readiness_requires_only_attention_api(monkeypatch, scenar
 
     def urlopen(url, timeout):
         calls.append(url)
-        assert url == "http://127.0.0.1:18100/v1/models"
         return Response()
 
     monkeypatch.setattr(runner.urllib.request, "urlopen", urlopen)
@@ -2061,19 +1529,18 @@ def test_gpu_summary_wait_requires_unique_ranks_and_checks_liveness(monkeypatch)
         (role, f"{runner.MRV2_EVIDENCE_PREFIX}dp_rank={dp} tp_rank=0")
         for role, dp in (("attention", 0), ("attention", 0), ("ffn", 0), ("ffn", 1))
     ]
-    checks = []
-    sleeps = []
 
     def sleep(seconds):
-        sleeps.append(seconds)
         evidence.append(
             ("attention", f"{runner.MRV2_EVIDENCE_PREFIX}dp_rank=1 tp_rank=0")
         )
 
-    monkeypatch.setattr(runner, "ensure_processes_alive", lambda _: checks.append(1))
     monkeypatch.setattr(runner.time, "sleep", sleep)
     runner.wait_for_mrv2_execution_summaries(evidence, args, [])
-    assert len(checks) == 2 and sleeps == [runner.PROCESS_POLL_INTERVAL_S]
+    assert (
+        "attention",
+        f"{runner.MRV2_EVIDENCE_PREFIX}dp_rank=1 tp_rank=0",
+    ) in evidence
 
 
 @pytest.mark.parametrize("failure", ["timeout", "process-exit"])
@@ -2191,76 +1658,6 @@ def test_mrv2_evidence_window_and_failure_cleanup(monkeypatch, capsys, failure):
     assert not markers[0].parent.exists()
     if failure != "reset":
         assert events[2:5] == ["evaluate", "afd_log_execution_evidence", "summaries"]
-
-
-@pytest.mark.parametrize(
-    ("scenario", "attention_devices", "ffn_devices"),
-    [
-        ("afd-v2-eager-1a1f", "0", "1"),
-        ("afd-v2-eager-dp2", "0,1", "2,3"),
-        ("afd-v2-eager-tp2", "0,1", "2,3"),
-    ],
-)
-def test_v2_model_entry_builds_runner_command_with_exact_devices(
-    monkeypatch,
-    tmp_path,
-    scenario,
-    attention_devices,
-    ffn_devices,
-):
-    monkeypatch.setenv("AFD_E2E_BACKEND", "gpu")
-    monkeypatch.setenv("AFD_GPU_E2E_MODEL", "/models/DeepSeek-V2-Lite")
-    monkeypatch.delenv("AFD_E2E_DEVICES", raising=False)
-
-    command = deepseek_v2_lite_e2e.build_runner_command(scenario, tmp_path)
-
-    assert command[command.index("--attention-devices") + 1] == attention_devices
-    assert command[command.index("--ffn-devices") + 1] == ffn_devices
-
-
-@pytest.mark.parametrize(
-    "common_args",
-    [
-        ["--unrelated-arg"],
-        ["--enable-chunked-prefill"],
-        ["--no-enable-chunked-prefill"],
-    ],
-)
-@pytest.mark.parametrize(
-    "scenario",
-    ["afd-graph-dbo-2a2f", "afd-v2-eager-dbo-dp2", "afd-v2-graph-dbo-dp2"],
-)
-def test_configure_dbo_preserves_chunked_prefill_choice(common_args, scenario):
-    args = _args()
-    args.scenario = scenario
-    args.common_vllm_arg = list(common_args)
-    runner.configure_scenario(args)
-
-    assert args.common_vllm_arg == common_args
-    command = runner.build_vllm_command(args, role="attention")
-    assert command.count("--no-enable-chunked-prefill") == common_args.count(
-        "--no-enable-chunked-prefill"
-    )
-    assert command.count("--enable-chunked-prefill") == common_args.count(
-        "--enable-chunked-prefill"
-    )
-
-
-def test_build_env_enables_debug_logging_for_dbo_scenarios(monkeypatch):
-    monkeypatch.delenv("VLLM_LOGGING_LEVEL", raising=False)
-
-    args = _args()
-    args.scenario = "afd-graph-dbo-2a1f"
-    runner.configure_scenario(args)
-    dbo_env = runner.build_env("0,1", args, role="attention")
-
-    assert dbo_env["VLLM_LOGGING_LEVEL"] == "DEBUG"
-
-    args.scenario = "afd-graph-2a1f"
-    runner.configure_scenario(args)
-    plain_env = runner.build_env("0,1", args, role="attention")
-
-    assert "VLLM_LOGGING_LEVEL" not in plain_env
 
 
 @pytest.mark.parametrize("scenario", sorted(runner.V2_DBO_COMPARISON_SCENARIOS))

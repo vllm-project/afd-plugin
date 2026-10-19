@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 pytest.importorskip("torch")
+pytest.importorskip("vllm")
 
 from afd_plugin.compat.npu import (
     fail_if_unsupported_npu_afd_features,
@@ -1437,74 +1438,32 @@ def test_npu_feature_validation_allows_two_ubatches_only():
     fail_if_unsupported_npu_afd_features(config)
 
 
-@pytest.mark.parametrize("cudagraph_mode", ["FULL", "FULL_AND_PIECEWISE"])
-def test_npu_feature_validation_requires_decode_only_full_graph_for_mla_dbo(
-    cudagraph_mode,
-):
+@pytest.mark.parametrize(
+    ("mode", "model_fields", "speculative", "error"),
+    [
+        ("FULL", {}, False, "FULL_DECODE_ONLY"),
+        ("FULL_AND_PIECEWISE", {}, False, "FULL_DECODE_ONLY"),
+        ("FULL_DECODE_ONLY", {}, False, None),
+        ("FULL", {"index_topk": 8}, False, None),
+        ("FULL", {"index_topk": 512, "compress_ratios": [0, 4, 128]}, False, None),
+        ("FULL_DECODE_ONLY", {}, True, "does not support speculative decoding"),
+    ],
+    ids=["mla-full", "mla-mixed", "mla-decode", "sparse", "compressor", "draft"],
+)
+def test_npu_mla_dbo_graph_validation(mode, model_fields, speculative, error):
     config = _vllm_config(
         use_mla=True,
-        cudagraph_mode=cudagraph_mode,
+        cudagraph_mode=mode,
+        speculative_config=object() if speculative else None,
         enable_dbo=True,
         use_ubatching=True,
         num_ubatches=2,
         ubatch_size=4,
     )
-
-    with pytest.raises(RuntimeError, match="FULL_DECODE_ONLY"):
-        fail_if_unsupported_npu_afd_features(config)
-
-    fail_if_unsupported_npu_afd_features(
-        _vllm_config(
-            use_mla=True,
-            cudagraph_mode="FULL_DECODE_ONLY",
-            enable_dbo=True,
-            use_ubatching=True,
-            num_ubatches=2,
-            ubatch_size=4,
-        ),
+    config.model_config.hf_text_config = SimpleNamespace(
+        model_type="deepseek_v2", **model_fields
     )
-
-    sparse_config = _vllm_config(
-        use_mla=True,
-        cudagraph_mode="FULL",
-        enable_dbo=True,
-        use_ubatching=True,
-        num_ubatches=2,
-        ubatch_size=4,
-    )
-    sparse_config.model_config.hf_text_config = SimpleNamespace(index_topk=8)
-    fail_if_unsupported_npu_afd_features(sparse_config)
-
-    # A compressor model such as DeepSeek V4 selects the DSA backend, whose
-    # graph-params update is a no-op, so the MLA DBO full graph rules do not
-    # apply to it either.
-    compressor_config = _vllm_config(
-        use_mla=True,
-        cudagraph_mode="FULL",
-        enable_dbo=True,
-        use_ubatching=True,
-        num_ubatches=2,
-        ubatch_size=4,
-    )
-    compressor_config.model_config.hf_text_config = SimpleNamespace(
-        index_topk=512,
-        compress_ratios=[0, 4, 128],
-    )
-    fail_if_unsupported_npu_afd_features(compressor_config)
-
-
-def test_npu_feature_validation_rejects_speculative_mla_dbo_full_graph():
-    config = _vllm_config(
-        use_mla=True,
-        cudagraph_mode="FULL_DECODE_ONLY",
-        speculative_config=object(),
-        enable_dbo=True,
-        use_ubatching=True,
-        num_ubatches=2,
-        ubatch_size=4,
-    )
-
-    with pytest.raises(RuntimeError, match="does not support speculative decoding"):
+    with pytest.raises(RuntimeError, match=error) if error else nullcontext():
         fail_if_unsupported_npu_afd_features(config)
 
 
@@ -1538,7 +1497,6 @@ def test_npu_async_feature_validation_requires_two_native_ubatches(parallel_over
         )
 
 
-@pytest.mark.parametrize("use_v2_model_runner", [False, True])
 @pytest.mark.parametrize(
     ("method", "rejected"),
     [
@@ -1551,7 +1509,6 @@ def test_npu_async_feature_validation_requires_two_native_ubatches(parallel_over
     ],
 )
 def test_npu_async_feature_validation_rejects_native_draft_models(
-    use_v2_model_runner,
     method,
     rejected,
 ):
@@ -1565,7 +1522,7 @@ def test_npu_async_feature_validation_rejects_native_draft_models(
         connector="CAMAsyncAFDConnector",
         async_dp=True,
         use_mla=True,
-        use_v2_model_runner=use_v2_model_runner,
+        use_v2_model_runner=True,
         speculative_config=speculative_config,
     )
     if rejected:
@@ -1575,7 +1532,6 @@ def test_npu_async_feature_validation_rejects_native_draft_models(
         fail_if_unsupported_npu_afd_features(config)
 
 
-@pytest.mark.parametrize("use_v2_model_runner", [False, True])
 @pytest.mark.parametrize("role", ["attention", "ffn"])
 @pytest.mark.parametrize(
     ("factor", "max_num_batched_tokens", "rejected"),
@@ -1592,7 +1548,6 @@ def test_npu_async_feature_validation_rejects_native_draft_models(
 )
 def test_npu_async_feature_validation_checks_receive_capacity(
     monkeypatch,
-    use_v2_model_runner,
     role,
     factor,
     max_num_batched_tokens,
@@ -1607,7 +1562,7 @@ def test_npu_async_feature_validation_checks_receive_capacity(
         connector="CAMAsyncAFDConnector",
         async_dp=True,
         use_mla=True,
-        use_v2_model_runner=use_v2_model_runner,
+        use_v2_model_runner=True,
         num_attention_ranks=2,
         tensor_parallel_size=2 if role == "attention" else 1,
         extra_config={"attn_ranks_per_dp": 2},

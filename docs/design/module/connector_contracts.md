@@ -17,6 +17,7 @@ depends_on:
   - "plugin_boundary.md"
   - "execution_platforms.md"
 validation_paths:
+  - "tests/unit/fakes/**"
   - "tests/unit/connectors/**"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"

@@ -59,215 +59,74 @@ def test_fix_all2all_backend_preserves_model_owned_sp():
     assert config.parallel_config.all2all_backend == "allgather_reducescatter"
 
 
-@pytest.mark.parametrize("skip_mc2_mask", [False, True])
-@pytest.mark.parametrize("input_ids", [(11, 22, 33), None])
-def test_ascend_forward_context_installs_afd_metadata(
-    monkeypatch,
-    skip_mc2_mask,
-    input_ids,
-):
-    fake_vllm = ModuleType("vllm")
-    fake_vllm.__path__ = []
-    fake_config = ModuleType("vllm.config")
-    fake_forward_context_module = ModuleType("vllm.forward_context")
-    fake_vllm_ascend = ModuleType("vllm_ascend")
-    fake_vllm_ascend.__path__ = []
-    fake_ascend_forward_context = ModuleType(
-        "vllm_ascend.ascend_forward_context",
-    )
-    original_mask = object()
-    forward_context = SimpleNamespace(additional_kwargs=None, mc2_mask=original_mask)
-    calls = []
-
-    class CUDAGraphMode:
-        NONE = "none"
+@pytest.fixture
+def mrv2_forward_context(monkeypatch):
+    context = SimpleNamespace(additional_kwargs={"mc2_mask": "original-mask"})
+    profile_states = []
 
     @contextmanager
-    def set_ascend_forward_context(
-        attn_metadata,
-        vllm_config,
-        *,
-        batch_descriptor,
-        aclgraph_runtime_mode,
-        model_instance,
-        num_tokens,
-        num_tokens_across_dp,
-        in_profile_run,
-    ):
-        calls.append(
-            {
-                "attn_metadata": attn_metadata,
-                "vllm_config": vllm_config,
-                "batch_descriptor": batch_descriptor,
-                "aclgraph_runtime_mode": aclgraph_runtime_mode,
-                "model_instance": model_instance,
-                "num_tokens": num_tokens,
-                "num_tokens_across_dp": num_tokens_across_dp,
-                "in_profile_run": in_profile_run,
-            },
-        )
-        yield
-
-    fake_config.__dict__["CUDAGraphMode"] = CUDAGraphMode
-    fake_forward_context_module.__dict__["get_forward_context"] = lambda: (
-        forward_context
-    )
-    fake_ascend_forward_context.__dict__["set_ascend_forward_context"] = (
-        set_ascend_forward_context
-    )
-    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
-    monkeypatch.setitem(sys.modules, "vllm.config", fake_config)
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.forward_context",
-        fake_forward_context_module,
-    )
-    monkeypatch.setitem(sys.modules, "vllm_ascend", fake_vllm_ascend)
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm_ascend.ascend_forward_context",
-        fake_ascend_forward_context,
-    )
-
-    vllm_config = SimpleNamespace(use_v2_model_runner=False)
-    afd_metadata = SimpleNamespace()
-    model_instance = SimpleNamespace()
-    with ascend_runtime.ascend_forward_context(
-        vllm_config=vllm_config,
-        afd_metadata=afd_metadata,
-        model_instance=model_instance,
-        num_tokens=3,
-        in_profile_run=True,
-        skip_mc2_mask=skip_mc2_mask,
-        input_ids=input_ids,
-    ) as current_forward_context:
-        assert current_forward_context is forward_context
-        assert forward_context.additional_kwargs["afd_metadata"] is afd_metadata
-        assert forward_context.mc2_mask is (None if skip_mc2_mask else original_mask)
-        if input_ids is None:
-            assert not hasattr(forward_context, "input_ids")
-        else:
-            assert forward_context.input_ids is input_ids
-
-    assert calls == [
-        {
-            "attn_metadata": None,
-            "vllm_config": vllm_config,
-            "batch_descriptor": None,
-            "aclgraph_runtime_mode": CUDAGraphMode.NONE,
-            "model_instance": model_instance,
-            "num_tokens": 3,
-            "num_tokens_across_dp": None,
-            "in_profile_run": True,
-        },
-    ]
-
-
-def test_ascend_forward_context_uses_native_mrv2_layout(monkeypatch):
-    fake_vllm = ModuleType("vllm")
-    fake_vllm.__path__ = []
-    fake_config = ModuleType("vllm.config")
-    fake_forward_context_module = ModuleType("vllm.forward_context")
-    fake_vllm_ascend = ModuleType("vllm_ascend")
-    fake_vllm_ascend.__path__ = []
-    fake_ascend_forward_context = ModuleType(
-        "vllm_ascend.ascend_forward_context",
-    )
-    forward_context = SimpleNamespace(
-        additional_kwargs={"in_profile_run": True},
-    )
-    context_calls = []
-    profile_calls = []
-
-    class CUDAGraphMode:
-        NONE = "none"
-
-    @contextmanager
-    def set_forward_context(
-        attn_metadata,
-        vllm_config,
-        *,
-        num_tokens,
-        num_tokens_across_dp,
-        cudagraph_runtime_mode,
-        batch_descriptor,
-    ):
-        context_calls.append(
-            {
-                "attn_metadata": attn_metadata,
-                "vllm_config": vllm_config,
-                "num_tokens": num_tokens,
-                "num_tokens_across_dp": num_tokens_across_dp,
-                "cudagraph_runtime_mode": cudagraph_runtime_mode,
-                "batch_descriptor": batch_descriptor,
-            },
-        )
+    def set_forward_context(attn_metadata, config, **kwargs):
+        context.num_tokens = kwargs["num_tokens"]
+        context.dp_metadata = kwargs["num_tokens_across_dp"]
         yield
 
     @contextmanager
     def override_mrv2_in_profile_run(enabled):
-        profile_calls.append(enabled)
-        yield
+        profile_states.append(enabled)
+        try:
+            yield
+        finally:
+            profile_states.append(False)
 
-    def unexpected_legacy_context(*args, **kwargs):
-        raise AssertionError("MRv2 must not use set_ascend_forward_context")
-
-    fake_config.__dict__["CUDAGraphMode"] = CUDAGraphMode
-    fake_forward_context_module.__dict__["get_forward_context"] = lambda: (
-        forward_context
-    )
-    fake_forward_context_module.__dict__["set_forward_context"] = set_forward_context
-    fake_ascend_forward_context.__dict__["override_mrv2_in_profile_run"] = (
-        override_mrv2_in_profile_run
-    )
-    fake_ascend_forward_context.__dict__["set_ascend_forward_context"] = (
-        unexpected_legacy_context
-    )
-    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
-    monkeypatch.setitem(sys.modules, "vllm.config", fake_config)
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.forward_context",
-        fake_forward_context_module,
-    )
-    monkeypatch.setitem(sys.modules, "vllm_ascend", fake_vllm_ascend)
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm_ascend.ascend_forward_context",
-        fake_ascend_forward_context,
-    )
-
-    vllm_config = SimpleNamespace(use_v2_model_runner=True)
-    afd_metadata = SimpleNamespace()
-    model_instance = SimpleNamespace()
-    num_tokens_across_dp = SimpleNamespace()
-    input_ids = (11, 22, 33)
-    with ascend_runtime.ascend_forward_context(
-        vllm_config=vllm_config,
-        afd_metadata=afd_metadata,
-        model_instance=model_instance,
-        num_tokens=7,
-        num_tokens_across_dp=num_tokens_across_dp,
-        in_profile_run=True,
-        skip_mc2_mask=True,
-        input_ids=input_ids,
-    ) as current_forward_context:
-        assert current_forward_context is forward_context
-        assert forward_context.additional_kwargs["afd_metadata"] is afd_metadata
-        assert forward_context.additional_kwargs["model_instance"] is model_instance
-        assert forward_context.input_ids is input_ids
-
-    assert profile_calls == [True]
-    assert context_calls == [
-        {
-            "attn_metadata": None,
-            "vllm_config": vllm_config,
-            "num_tokens": 7,
-            "num_tokens_across_dp": num_tokens_across_dp,
-            "cudagraph_runtime_mode": CUDAGraphMode.NONE,
-            "batch_descriptor": None,
+    modules: dict[str, dict] = {
+        "vllm": {},
+        "vllm.config": {"CUDAGraphMode": SimpleNamespace(NONE="none")},
+        "vllm.forward_context": {
+            "get_forward_context": lambda: context,
+            "set_forward_context": set_forward_context,
         },
-    ]
+        "vllm_ascend": {},
+        "vllm_ascend.ascend_forward_context": {
+            "override_mrv2_in_profile_run": override_mrv2_in_profile_run,
+        },
+    }
+    for name, attrs in modules.items():
+        module = ModuleType(name)
+        module.__dict__.update(attrs)
+        monkeypatch.setitem(sys.modules, name, module)
+    return context, profile_states
+
+
+@pytest.mark.parametrize("skip_mc2_mask", [False, True])
+@pytest.mark.parametrize("input_ids", [(11, 22, 33), None])
+def test_ascend_forward_context_uses_native_mrv2_layout(
+    mrv2_forward_context, skip_mc2_mask, input_ids
+):
+    context, profile_states = mrv2_forward_context
+    metadata, model, dp = SimpleNamespace(), SimpleNamespace(), SimpleNamespace()
+    with ascend_runtime.ascend_forward_context(
+        vllm_config=SimpleNamespace(use_v2_model_runner=True),
+        afd_metadata=metadata,
+        model_instance=model,
+        num_tokens=7,
+        num_tokens_across_dp=dp,
+        in_profile_run=True,
+        skip_mc2_mask=skip_mc2_mask,
+        input_ids=input_ids,
+    ) as current:
+        assert current is context
+        assert current.additional_kwargs == {
+            "afd_metadata": metadata,
+            "model_instance": model,
+            "mc2_mask": None if skip_mc2_mask else "original-mask",
+        }
+        assert current.num_tokens == 7 and current.dp_metadata is dp
+        assert profile_states == [True]
+        if input_ids is None:
+            assert not hasattr(current, "input_ids")
+        else:
+            assert current.input_ids is input_ids
+    assert profile_states == [True, False]
 
 
 @pytest.fixture

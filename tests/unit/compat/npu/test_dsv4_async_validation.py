@@ -6,6 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("torch")
+pytest.importorskip("vllm")
+
 from afd_plugin.compat.npu.feature_validation import (
     _fail_if_unsupported_dsv4_async_features,
     _fail_if_unsupported_dsv4_connector,

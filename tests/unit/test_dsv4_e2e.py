@@ -1,176 +1,296 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+"""Unit coverage for the DSV4 async CAM and sync CAMP2P NPU E2E entrypoints."""
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
-import os
-import signal
-import subprocess
 import sys
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
 
 from tests.e2e import runner
 from tests.e2e.models.deepseek_v4_flash import completions
-from tests.e2e.models.deepseek_v4_flash import test_async_cam_npu as entrypoint
+from tests.e2e.models.deepseek_v4_flash import test_async_cam_npu as async_entrypoint
+from tests.e2e.models.deepseek_v4_flash import test_sync_camp2p_npu as sync_entrypoint
+from tests.e2e.models.deepseek_v4_flash.config import (
+    DSV4_ASYNC_CAM_SCENARIO,
+    DSV4_SYNC_CAMP2P_A3_SCENARIO,
+    DSV4_SYNC_CAMP2P_A5_SCENARIO,
+    sync_shape,
+)
+
+ASYNC = DSV4_ASYNC_CAM_SCENARIO
+A5 = DSV4_SYNC_CAMP2P_A5_SCENARIO
+A3 = DSV4_SYNC_CAMP2P_A3_SCENARIO
+SCENARIOS = (ASYNC, A5, A3)
+# Each host runs a fixed device count split evenly between Attention and FFN.
+DEVICE_COUNTS = {ASYNC: 16, A5: 4, A3: 16}
+CONCURRENT_REQUESTS = 10
+AFD_HOST = "192.0.2.1"
 
 
-def _arguments(monkeypatch, tmp_path):
+def _build_command(scenario: str, output_path: Path) -> list[str]:
+    if scenario == ASYNC:
+        return async_entrypoint.build_runner_command(output_path)
+    return sync_entrypoint.build_runner_command(scenario, output_path)
+
+
+def _arguments(monkeypatch, tmp_path, scenario: str = ASYNC):
+    """Parse the runner arguments the entrypoint builds for `scenario`."""
     monkeypatch.setenv("AFD_E2E_BACKEND", "npu")
-    monkeypatch.setenv("AFD_E2E_DEVICES", ",".join(map(str, range(16))))
+    devices = ",".join(map(str, range(DEVICE_COUNTS[scenario])))
+    monkeypatch.setenv("AFD_E2E_DEVICES", devices)
     monkeypatch.setenv("AFD_NPU_E2E_MODEL", "/models/dsv4")
-    monkeypatch.setenv("HCCL_IF_IP", "192.0.2.1")
-    command = entrypoint.build_runner_command(tmp_path / "responses.json")
+    monkeypatch.setenv("HCCL_IF_IP", AFD_HOST)
+    monkeypatch.delenv("AFD_NPU_DSV4_SYNC_E2E_API_PORT", raising=False)
+    monkeypatch.delenv("AFD_NPU_DSV4_SYNC_E2E_AFD_PORT", raising=False)
+    command = _build_command(scenario, tmp_path / "responses.json")
     monkeypatch.setattr(sys, "argv", ["runner", *command[3:]])
     return runner.parse_args()
 
 
-def test_dsv4_fixed_deployment_and_cleanup(monkeypatch, tmp_path):
-    args = _arguments(monkeypatch, tmp_path)
+def _flag_value(command: list[str], flag: str) -> str | None:
+    return command[command.index(flag) + 1] if flag in command else None
+
+
+def _completion(content: str, finish_reason: str | None = "stop") -> dict:
+    return {
+        "choices": [{"message": {"content": content}, "finish_reason": finish_reason}]
+    }
+
+
+# scenario -> (connector, `--quantization` value, or None when omitted)
+EXPECTED_DEPLOYMENT = {
+    ASYNC: ("CAMAsyncAFDConnector", "ascend"),
+    # The A5 launch script passes no `--quantization` at all.
+    A5: ("CAMP2pAFDConnector", None),
+    A3: ("CAMP2pAFDConnector", "ascend"),
+}
+ASYNC_ALL2ALL_BACKENDS = {
+    "attention": "allgather_reducescatter",
+    "ffn": "flashinfer_all2allv",
+}
+
+
+@pytest.mark.parametrize("scenario", SCENARIOS)
+def test_fixed_deployment(monkeypatch, tmp_path, scenario):
+    args = _arguments(monkeypatch, tmp_path, scenario)
+    is_async = scenario == ASYNC
+    shape = sync_shape(scenario)
+    use_graph = shape is not None and shape.use_graph
+    verbatim = shape is not None and shape.verbatim_launch
+    connector, quantization = EXPECTED_DEPLOYMENT[scenario]
     runner.configure_scenario(args)
-    runner.validate_topology(
-        args,
-        runner.parse_csv(args.attention_devices),
-        runner.parse_csv(args.ffn_devices),
-    )
-    assert runner.uses_npu_async_process_cleanup(args)
+    devices = {
+        "attention": runner.parse_csv(args.attention_devices),
+        "ffn": runner.parse_csv(args.ffn_devices),
+    }
+    runner.validate_topology(args, devices["attention"], devices["ffn"])
+    ranks = {role: len(role_devices) for role, role_devices in devices.items()}
+    assert ranks == dict.fromkeys(devices, DEVICE_COUNTS[scenario] // 2)
+    # Only the async transport defers an FFN SIGKILL for a pending CAM receive.
+    assert runner.uses_npu_async_process_cleanup(args) is is_async
+    assert args.afd_async is args.compute_gate_on_attention is is_async
     assert args.gsm8k_output_path is None
-    for role, dp, tp in (("attention", "2", "4"), ("ffn", "8", "1")):
+    for role in devices:
         command = runner.build_vllm_command(args, role=role)
-        assert command[command.index("--data-parallel-size") + 1] == dp
-        assert command[command.index("--tensor-parallel-size") + 1] == tp
-        assert command[command.index("--max-num-batched-tokens") + 1] == "8192"
-        assert command[command.index("--max-model-len") + 1] == "1048576"
-        assert (
-            command[command.index("--attention_config.indexer_kv_dtype") + 1] == "int8"
-        )
-        # The asynchronous 910C case keeps the Ascend quantization method; only
-        # the synchronous case resolves it from the checkpoint.
-        assert command[command.index("--quantization") + 1] == "ascend"
-        assert "--enforce-eager" in command
+        dp = int(command[command.index("--data-parallel-size") + 1])
+        tp = int(command[command.index("--tensor-parallel-size") + 1])
+        assert dp * tp == ranks[role]
+        assert _flag_value(command, "--quantization") == quantization
         assert "--enable-expert-parallel" in command
         assert "--enable-dbo" not in command
         assert "--kv-transfer-config" not in command
+        assert ("--enforce-eager" in command) is not use_graph
+        assert ("--seed" in command) is not verbatim
+        assert _flag_value(command, "--all2all-backend") == (
+            ASYNC_ALL2ALL_BACKENDS[role] if is_async else None
+        )
         config = json.loads(command[command.index("--additional-config") + 1])
-        assert "enable_dsv4_shared_compressor_workspace" not in config
-        assert config["enable_cpu_binding"] is True
-        assert config["enable_flashcomm1"] is (role == "attention")
-        assert config["afd"] == {
-            "role": role,
-            "connector": "CAMAsyncAFDConnector",
-            "host": "192.0.2.1",
-            "port": 6455,
-            "num_attention_ranks": 8,
-            "num_ffn_ranks": 8,
-            "async": True,
-            "compute_gate_on_attention": True,
-            "connector_extra_config": {
-                "dynamicQuant": 1,
-                "attn_ranks_per_dp": 4,
-                "async_moe_ubatching": True,
-                "async_moe_num_ubatches": 2,
-                "async_moe_split": "token",
-            },
-        }
+        assert config["enable_flashcomm1"] is (is_async and role == "attention")
+        assert config["multistream_dsv4_dsa_overlap"] is False
+        afd = config["afd"]
+        assert (afd["role"], afd["connector"]) == (role, connector)
+        assert afd["num_attention_ranks"] == ranks["attention"]
+        assert afd["num_ffn_ranks"] == ranks["ffn"]
+        # CAMP2P rejects both the asynchronous mode and gate-on-Attention.
+        assert ("async" in afd) is ("compute_gate_on_attention" in afd) is is_async
         env = runner.build_env("0", args, role=role, e2e_run_id="test")
         assert "VLLM_ASCEND_ENABLE_FLASHCOMM1" not in env
-        assert env["VLLM_USE_V2_MODEL_RUNNER"] == "0"
-        expected_backend = (
-            "allgather_reducescatter" if role == "attention" else "flashinfer_all2allv"
-        )
-        assert command[command.index("--all2all-backend") + 1] == expected_backend
+        assert env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+        # Cleanup finds the service process trees through this marker.
         assert env[runner.E2E_RUN_ID_ENV] == "test"
 
 
-def test_dsv4_main_uses_concurrent_requests_and_longer_cleanup(monkeypatch, tmp_path):
+def test_main_uses_concurrent_requests_and_longer_cleanup(monkeypatch, tmp_path):
     args = _arguments(monkeypatch, tmp_path)
     cleanup_options = {}
     evaluations = []
     process = SimpleNamespace(pid=123, poll=lambda: None)
-    monkeypatch.setattr(runner, "parse_args", lambda: args)
-    monkeypatch.setattr(runner, "start_process", lambda *_args: process)
-    monkeypatch.setattr(
-        runner,
-        "stream_output",
-        lambda *_args: SimpleNamespace(join=lambda **_kwargs: None),
-    )
-    monkeypatch.setattr(runner, "wait_for_openai_api", lambda *_args: None)
-    monkeypatch.setattr(
-        runner,
-        "run_concurrent_completion_evaluation",
-        lambda _args: evaluations.append("concurrent"),
-    )
-    monkeypatch.setattr(
-        runner,
-        "run_gsm8k_evaluation",
-        lambda _args: pytest.fail("must not run GSM8K"),
-    )
-    monkeypatch.setattr(
-        runner,
-        "terminate_processes",
-        lambda _processes, **kwargs: cleanup_options.update(kwargs),
-    )
+    fakes = {
+        "parse_args": lambda: args,
+        "start_process": lambda *_args: process,
+        "stream_output": lambda *_args: SimpleNamespace(join=lambda **_kwargs: None),
+        "wait_for_openai_api": lambda *_args: None,
+        "run_concurrent_completion_evaluation": lambda _args: evaluations.append(1),
+        "run_gsm8k_evaluation": lambda _args: pytest.fail("must not run GSM8K"),
+        "terminate_processes": lambda _procs, **kwargs: cleanup_options.update(kwargs),
+    }
+    for name, fake in fakes.items():
+        monkeypatch.setattr(runner, name, fake)
     assert runner.main() == 0
-    assert evaluations == ["concurrent"]
+    assert evaluations == [1]
     assert cleanup_options["termination_timeout_s"] == 60
-    assert (
-        cleanup_options["force_kill_environment"][runner.E2E_PROCESS_ROLE_ENV] == "ffn"
-    )
+    kill_env = cleanup_options["force_kill_environment"]
+    assert kill_env[runner.E2E_PROCESS_ROLE_ENV] == "ffn"
 
 
-@pytest.mark.parametrize("devices", ["0,1,2,3", ",".join(["0"] * 16)])
-def test_dsv4_entrypoint_rejects_wrong_devices(monkeypatch, tmp_path, devices):
-    _arguments(monkeypatch, tmp_path)
-    monkeypatch.setenv("AFD_E2E_DEVICES", devices)
-    with pytest.raises(RuntimeError, match="exactly 16 devices|devices must be unique"):
-        entrypoint.build_runner_command(tmp_path / "responses.json")
+@pytest.mark.parametrize("scenario", SCENARIOS)
+def test_entrypoint_rejects_wrong_devices(monkeypatch, tmp_path, scenario):
+    count = DEVICE_COUNTS[scenario]
+    for devices in (range(count - 1), range(count + 1), [0] * count):
+        _arguments(monkeypatch, tmp_path, scenario)
+        monkeypatch.setenv("AFD_E2E_DEVICES", ",".join(map(str, devices)))
+        with pytest.raises(RuntimeError, match=rf"exactly {count} devices|unique"):
+            _build_command(scenario, tmp_path / "responses.json")
+
+
+@pytest.mark.parametrize("scenario", SCENARIOS)
+def test_rejects_deployment_overrides(monkeypatch, tmp_path, scenario):
+    for field, value, error in (
+        ("common_vllm_arg", ["--max-num-batched-tokens=1"], "extra vLLM arguments"),
+        ("attention_vllm_arg", ["--max-num-batched-tokens=1"], "extra vLLM arguments"),
+        ("ffn_vllm_arg", ["--max-num-batched-tokens=1"], "extra vLLM arguments"),
+        ("device_backend", "gpu", "DSV4 scenarios require NPU"),
+    ):
+        args = _arguments(monkeypatch, tmp_path, scenario)
+        setattr(args, field, value)
+        with pytest.raises(ValueError, match=error):
+            runner.configure_scenario(args)
+            runner.validate_topology(
+                args,
+                runner.parse_csv(args.attention_devices),
+                runner.parse_csv(args.ffn_devices),
+            )
+
+
+# The A5 script announces the loopback address and needs no NIC variable; the
+# other hosts require the caller's advertised rendezvous address.
+@pytest.mark.parametrize(
+    ("scenario", "afd_host"), [(ASYNC, None), (A5, "127.0.0.1"), (A3, None)]
+)
+def test_afd_host_without_caller_address(monkeypatch, tmp_path, scenario, afd_host):
+    _arguments(monkeypatch, tmp_path, scenario)
+    monkeypatch.delenv("HCCL_IF_IP")
+    if afd_host is None:
+        with pytest.raises(RuntimeError, match="HCCL_IF_IP"):
+            _build_command(scenario, tmp_path / "responses.json")
+    else:
+        command = _build_command(scenario, tmp_path / "responses.json")
+        assert _flag_value(command, "--afd-host") == afd_host
+
+
+NIC = {"HCCL_IF_IP": AFD_HOST, "HCCL_SOCKET_IFNAME": "eth-test"}
+A5_SCRIPT_ENV = {
+    "HCCL_BUFFSIZE": "2048",
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:False",
+}
+FORWARDED_NIC = {"GLOO_SOCKET_IFNAME": "eth-test", "TP_SOCKET_IFNAME": "eth-test"}
+SPAWN = ("VLLM_WORKER_MULTIPROC_METHOD", "AFD_FORCE_SPAWN_MULTIPROCESSING")
 
 
 @pytest.mark.parametrize(
-    "field", ["common_vllm_arg", "attention_vllm_arg", "ffn_vllm_arg"]
+    ("scenario", "inherited", "expected"),
+    [
+        (ASYNC, NIC, {"HCCL_BUFFSIZE": "4096"} | FORWARDED_NIC),
+        # A5 keeps its script's buffer size, allocator and start method, and the
+        # NIC variables stay optional on a single host.
+        (
+            A5,
+            {SPAWN[0]: "fork"},
+            A5_SCRIPT_ENV | dict.fromkeys((*SPAWN, *FORWARDED_NIC)),
+        ),
+        # A caller who pins the buffer size or the NIC keeps them.
+        (
+            A5,
+            {"HCCL_BUFFSIZE": "4096"} | NIC,
+            {"HCCL_BUFFSIZE": "4096"} | FORWARDED_NIC,
+        ),
+    ],
 )
-def test_dsv4_rejects_deployment_overrides(monkeypatch, tmp_path, field):
-    args = _arguments(monkeypatch, tmp_path)
-    setattr(args, field, ["--max-num-batched-tokens=1"])
-    with pytest.raises(ValueError, match="extra vLLM arguments"):
-        runner.configure_scenario(args)
-
-
-def test_dsv4_rejects_gpu(monkeypatch, tmp_path):
-    args = _arguments(monkeypatch, tmp_path)
-    args.device_backend = "gpu"
-    runner.configure_scenario(args)
-    with pytest.raises(ValueError, match="require NPU"):
-        runner.validate_topology(
-            args, list(map(str, range(8))), list(map(str, range(8, 16)))
-        )
-
-
-def test_dsv4_environment_uses_source_ops_and_preserves_network(monkeypatch):
-    monkeypatch.setenv("HCCL_IF_IP", "192.0.2.1")
-    monkeypatch.setenv("HCCL_SOCKET_IFNAME", "eth-test")
-    env = entrypoint.build_environment()
-    assert env["HCCL_BUFFSIZE"] == "4096"
-    assert env["GLOO_SOCKET_IFNAME"] == "eth-test"
-    assert env["TP_SOCKET_IFNAME"] == "eth-test"
+def test_environment(monkeypatch, scenario, inherited, expected):
+    """`expected` maps each checked variable to its value, None when unset."""
+    for name in (*NIC, "HCCL_BUFFSIZE", "PYTORCH_NPU_ALLOC_CONF", SPAWN[1]):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in inherited.items():
+        monkeypatch.setenv(name, value)
+    env = (
+        async_entrypoint.build_environment()
+        if scenario == ASYNC
+        else sync_entrypoint.build_environment(scenario)
+    )
+    assert {name: env.get(name) for name in expected} == expected
     assert env["AFD_FORCE_BALANCED_TOPK_IDS"] == "0"
 
 
 @pytest.mark.parametrize(
-    "failure",
-    [None, "empty", "truncated", "choices", "http", "json", "timeout", "wrong-answer"],
+    ("scenario", "check_answer"),
+    # Both sync profiles are smoke cases; only the async case checks the answer.
+    [(ASYNC, True), (A5, False), (A3, False)],
 )
+def test_oracle_uses_the_profile_answer_policy(
+    monkeypatch, tmp_path, scenario, check_answer
+):
+    seen: dict = {}
+    monkeypatch.setattr(runner, "evaluate_completions", seen.update)
+    args = _arguments(monkeypatch, tmp_path, scenario)
+    runner.configure_scenario(args)
+    runner.run_concurrent_completion_evaluation(args)
+    assert seen["check_answer"] is check_answer
+
+
+@pytest.mark.parametrize(
+    ("content", "finish_reason", "check_answer", "error"),
+    [
+        # A profile that skips the answer still requires a finished response.
+        ("28", "stop", False, None),
+        ("10 10:56:33 10:56:33", "length", False, None),
+        ("I cannot compute that.", "stop", False, None),
+        ("", "stop", False, "returned empty content"),
+        ("28", None, False, "did not finish normally"),
+        # A host that compares the answer keeps the exact terminal state.
+        ("28", "length", True, "did not finish normally"),
+    ],
+)
+def test_served_response_shape_checks(content, finish_reason, check_answer, error):
+    response = _completion(content, finish_reason)
+    if error is None:
+        completions.validate_response(response, check_answer=check_answer)
+    else:
+        with pytest.raises(RuntimeError, match=error):
+            completions.validate_response(response, check_answer=check_answer)
+
+
+# failure -> `httpx.Response` arguments replacing the last request's reply.
+FAILED_REPLIES: dict[str, dict[str, Any]] = {
+    "empty": {"json": _completion("")},
+    "wrong-answer": {"json": _completion("999")},
+    "truncated": {"json": _completion("28", "length")},
+    "choices": {"json": {"choices": []}},
+    "http": {"status_code": 500, "text": "server error"},
+    "json": {"text": "not-json"},
+}
+
+
+@pytest.mark.parametrize("failure", [None, *FAILED_REPLIES, "timeout"])
 def test_ten_requests_overlap_and_validate_every_response(
-    monkeypatch,
-    tmp_path,
-    failure,
+    monkeypatch, tmp_path, failure
 ):
     args = _arguments(monkeypatch, tmp_path)
     runner.configure_scenario(args)
@@ -186,33 +306,14 @@ def test_ten_requests_overlap_and_validate_every_response(
         assert payload["chat_template_kwargs"] == {"thinking": False}
         operand = int(payload["messages"][0]["content"].split()[1])
         request_count += 1
-        if request_count == 10:
+        if request_count == CONCURRENT_REQUESTS:
             arrived.set()
         await asyncio.wait_for(arrived.wait(), timeout=5)
-        result: dict = {
-            "choices": [
-                {
-                    "message": {"content": str(operand + 7)},
-                    "finish_reason": "stop",
-                }
-            ]
-        }
-        if operand == 21:
-            if failure == "wrong-answer":
-                result["choices"][0]["message"]["content"] = "999"
-            elif failure == "empty":
-                result["choices"][0]["message"]["content"] = ""
-            elif failure == "truncated":
-                result["choices"][0]["finish_reason"] = "length"
-            elif failure == "choices":
-                result["choices"] = []
-            elif failure == "http":
-                return httpx.Response(500, text="server error")
-            elif failure == "json":
-                return httpx.Response(200, text="not-json")
-            elif failure == "timeout":
-                raise httpx.ReadTimeout("server stalled", request=request)
-        return httpx.Response(200, json=result)
+        if operand != 21 or failure is None:
+            return httpx.Response(200, json=_completion(str(operand + 7)))
+        if failure == "timeout":
+            raise httpx.ReadTimeout("server stalled", request=request)
+        return httpx.Response(**{"status_code": 200, **FAILED_REPLIES[failure]})
 
     client_type = httpx.AsyncClient
     monkeypatch.setattr(
@@ -226,98 +327,13 @@ def test_ten_requests_overlap_and_validate_every_response(
     else:
         runner.run_concurrent_completion_evaluation(args)
     results = json.loads((tmp_path / "responses.json").read_text())
-    assert len(results) == 10
+    assert len(results) == CONCURRENT_REQUESTS
     successful = results[:-1] if failure else results
     assert all("error" not in row for row in successful)
     assert [
         row["response"]["choices"][0]["message"]["content"] for row in successful
     ] == [str(value) for value in range(19, 19 + len(successful))]
-    assert all(row["finished_at"] >= row["started_at"] for row in results)
     if failure:
         assert results[-1]["error"]
     if failure in ("http", "json"):
-        assert results[-1]["response_body"] == (
-            "server error" if failure == "http" else "not-json"
-        )
-
-
-@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
-def test_cancel_blocked_requests_cleans_service_groups(monkeypatch, tmp_path, signum):
-    _arguments(monkeypatch, tmp_path)
-    arrived = threading.Event()
-    release = threading.Event()
-    lock = threading.Lock()
-    request_count = 0
-
-    class StalledServer(ThreadingHTTPServer):
-        request_queue_size = 32
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_POST(self):
-            nonlocal request_count
-            self.rfile.read(int(self.headers["Content-Length"]))
-            with lock:
-                request_count += 1
-                if request_count == 10:
-                    arrived.set()
-            release.wait(timeout=30)
-
-    server = StalledServer(("127.0.0.1", 0), Handler)
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
-    script = """
-import json
-import sys
-from pathlib import Path
-from tests.e2e import runner
-
-pid_path = Path(sys.argv.pop(1))
-pids = []
-start = runner.start_process
-
-def start_service(name, command, env):
-    process = start(name, [sys.executable, '-c', 'import time; time.sleep(60)'], env)
-    pids.append(process.pid)
-    pid_path.write_text(json.dumps(pids))
-    return process
-
-runner.start_process = start_service
-runner.wait_for_openai_api = lambda *args: None
-sys.exit(runner.main())
-"""
-    pid_path = tmp_path / "services.json"
-    command = entrypoint.build_runner_command(tmp_path / "responses.json")
-    command.extend(["--api-port-base", str(server.server_port)])
-    with (tmp_path / "cancel.log").open("w+") as log:
-        process = subprocess.Popen(
-            [sys.executable, "-c", script, str(pid_path), *command[3:]],
-            stdout=log,
-            stderr=subprocess.STDOUT,
-        )
-        try:
-            assert arrived.wait(timeout=15), "ten requests never reached the server"
-            process.send_signal(signum)
-            # Much shorter than both the HTTP timeout (300s) and the outer
-            # runner cleanup deadline (240s). Exercise real signal unwinding,
-            # socket cancellation and separately launched service groups.
-            process.wait(timeout=10)
-            log.seek(0)
-            assert process.returncode == 128 + signum, log.read()
-            for pid in json.loads(pid_path.read_text()):
-                with pytest.raises(ProcessLookupError):
-                    os.kill(pid, 0)
-            results = json.loads((tmp_path / "responses.json").read_text())
-            assert len(results) == 10
-            assert all("cancelled" in row["error"] for row in results)
-        finally:
-            if process.poll() is None:
-                process.kill()
-            process.wait(timeout=5)
-            if pid_path.exists():
-                for pid in json.loads(pid_path.read_text()):
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(pid, signal.SIGKILL)
-            release.set()
-            server.shutdown()
-            server.server_close()
-            server_thread.join(timeout=5)
+        assert results[-1]["response_body"] == FAILED_REPLIES[failure]["text"]

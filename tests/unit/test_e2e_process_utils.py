@@ -5,347 +5,223 @@ from __future__ import annotations
 
 import signal
 
+import pytest
+
 from tests.e2e import process_utils
 
-
-def test_terminate_process_groups_signals_the_leader_before_the_group(
-    monkeypatch,
-):
-    class FakeProcess:
-        pid = 101
-
-        def poll(self):
-            return None
-
-        def wait(self, timeout=None):
-            return 0
-
-    group_alive = True
-    leader_signal_calls = []
-    group_signal_calls = []
-
-    def fake_kill(pid, sig):
-        nonlocal group_alive
-        leader_signal_calls.append((pid, sig))
-        group_alive = False
-
-    def fake_killpg(pid, sig):
-        nonlocal group_alive
-        group_signal_calls.append((pid, sig))
-        if sig == signal.SIGTERM:
-            group_alive = False
-        if sig == 0 and not group_alive:
-            raise ProcessLookupError
-
-    monkeypatch.setattr(process_utils.os, "kill", fake_kill, raising=False)
-    monkeypatch.setattr(process_utils.os, "killpg", fake_killpg, raising=False)
-    monkeypatch.setattr(process_utils.time, "monotonic", lambda: 100.0)
-
-    failures = process_utils.terminate_process_groups(
-        [FakeProcess()],  # type: ignore[list-item]
-        termination_timeout_s=20,
-        poll_interval_s=0.2,
-        reap_timeout_s=5,
-    )
-
-    assert failures == []
-    assert leader_signal_calls == [(101, signal.SIGTERM)]
-    assert group_signal_calls == [(101, 0)]
+LEADER_PID = 101
+FORCED = "forced SIGKILL for process group 101 after 0s timeout"
+SURVIVED = "process group 101 still alive after SIGKILL"
+NON_UTF8_COMM = b"bad\xff\xfe"
+RUN_FFN_ENVIRONMENT = {"AFD_E2E_RUN_ID": "run-1", "AFD_E2E_PROCESS_ROLE": "ffn"}
 
 
-def test_terminate_process_groups_cleans_children_after_leader_exits(monkeypatch):
-    class ExitedLeader:
-        pid = 101
-
-        def poll(self):
-            return 0
-
-        def wait(self, timeout=None):
-            return 0
-
-    group_alive = True
-
-    def leader_is_gone(*_args):
-        raise ProcessLookupError
-
-    def fake_killpg(_pid, sig):
-        nonlocal group_alive
-        if sig == signal.SIGTERM:
-            group_alive = False
-        elif not group_alive:
-            raise ProcessLookupError
-
-    monkeypatch.setattr(process_utils.os, "kill", leader_is_gone, raising=False)
-    monkeypatch.setattr(process_utils.os, "killpg", fake_killpg, raising=False)
-    monkeypatch.setattr(process_utils.time, "monotonic", lambda: 100.0)
-
-    failures = process_utils.terminate_process_groups(
-        [ExitedLeader()],  # type: ignore[list-item]
-        termination_timeout_s=20,
-        poll_interval_s=0.2,
-        reap_timeout_s=5,
-    )
-
-    assert failures == []
-    assert group_alive is False
-
-
-def test_terminate_process_groups_reports_force_kill_escalation(monkeypatch):
-    class FakeProcess:
-        pid = 101
-
-        def poll(self):
-            return None
-
-        def wait(self, timeout=None):
-            return 0
-
-    group_alive = True
-
-    def fake_kill(_pid, _sig):
-        return None
-
-    def fake_killpg(_pid, sig):
-        nonlocal group_alive
-        if sig == 0 and not group_alive:
-            raise ProcessLookupError
-        if sig == 9:
-            group_alive = False
-
-    monkeypatch.setattr(process_utils.os, "kill", fake_kill, raising=False)
-    monkeypatch.setattr(process_utils.os, "killpg", fake_killpg, raising=False)
-    monkeypatch.setattr(process_utils.signal, "SIGKILL", 9, raising=False)
-    monkeypatch.setattr(process_utils.time, "monotonic", lambda: 100.0)
-
-    failures = process_utils.terminate_process_groups(
-        [FakeProcess()],  # type: ignore[list-item]
-        termination_timeout_s=0,
-        poll_interval_s=0,
-        reap_timeout_s=0,
-    )
-
-    assert any("forced SIGKILL" in failure for failure in failures)
-    assert not any("still alive after SIGKILL" in failure for failure in failures)
-
-
-def test_terminate_process_groups_reports_a_group_that_survives_sigkill(
-    monkeypatch,
-):
-    class FakeProcess:
-        pid = 101
-
-        def poll(self):
-            return None
-
-        def wait(self, timeout=None):
-            return 0
-
-    group_liveness_checks = 0
-
-    def fake_kill(_pid, _sig):
-        return None
-
-    def fake_killpg(_pid, sig):
-        nonlocal group_liveness_checks
-        if sig == 0:
-            group_liveness_checks += 1
-
-    monkeypatch.setattr(process_utils.os, "kill", fake_kill, raising=False)
-    monkeypatch.setattr(process_utils.os, "killpg", fake_killpg, raising=False)
-    monkeypatch.setattr(process_utils.signal, "SIGKILL", 9, raising=False)
-    monkeypatch.setattr(process_utils.time, "monotonic", lambda: 100.0)
-
-    failures = process_utils.terminate_process_groups(
-        [FakeProcess()],  # type: ignore[list-item]
-        termination_timeout_s=0,
-        poll_interval_s=0,
-        reap_timeout_s=0,
-    )
-
-    assert any("forced SIGKILL" in failure for failure in failures)
-    assert any("still alive after SIGKILL" in failure for failure in failures)
-    assert group_liveness_checks >= 2
-
-
-def _write_proc_stat(proc_root, pid, *, state, pgrp, comm: str | bytes = "python3"):
-    process_dir = proc_root / str(pid)
-    process_dir.mkdir()
-    if isinstance(comm, str):
-        comm = comm.encode()
-    (process_dir / "stat").write_bytes(
-        b"%d (%s) %s 1 %d %d 0\n" % (pid, comm, state.encode(), pgrp, pgrp),
-    )
-
-
-def _patch_group_that_never_disappears(monkeypatch):
-    monkeypatch.setattr(process_utils.os, "kill", lambda _pid, _sig: None)
-    monkeypatch.setattr(process_utils.os, "killpg", lambda _pid, _sig: None)
-    monkeypatch.setattr(process_utils.signal, "SIGKILL", 9, raising=False)
-    monkeypatch.setattr(process_utils.time, "monotonic", lambda: 100.0)
-
-
-class _UnreapedLeader:
-    pid = 101
+class FakeLeader:
+    def __init__(self, pid=LEADER_PID):
+        self.pid = pid
+        self.wait_timeouts = []
 
     def poll(self):
         return None
 
     def wait(self, timeout=None):
-        return 0
+        self.wait_timeouts.append(timeout)
 
 
-def test_terminate_process_groups_ignores_a_group_of_only_zombies(
-    monkeypatch,
-    tmp_path,
+class FakeSignals:
+    """Records os.kill/os.killpg and models which signal ends each group."""
+
+    def __init__(self):
+        self.calls = []
+        self.fatal_signals = {}
+        self.exited_leaders = set()
+        self.dead_groups = set()
+
+    def kill(self, pid, sig):
+        self.calls.append(("kill", pid, sig))
+        if pid in self.exited_leaders:
+            raise ProcessLookupError
+        self._deliver(pid, sig)
+
+    def killpg(self, pgid, sig):
+        self.calls.append(("killpg", pgid, sig))
+        if sig != 0:
+            self._deliver(pgid, sig)
+        elif pgid in self.dead_groups:
+            raise ProcessLookupError
+
+    def _deliver(self, pgid, sig):
+        if self.fatal_signals.get(pgid) == sig:
+            self.dead_groups.add(pgid)
+
+
+@pytest.fixture
+def fake_signals(monkeypatch):
+    signals = FakeSignals()
+    monkeypatch.setattr(process_utils.os, "kill", signals.kill)
+    monkeypatch.setattr(process_utils.os, "killpg", signals.killpg)
+    monkeypatch.setattr(process_utils.time, "monotonic", lambda: 100.0)
+    return signals
+
+
+def _terminate(processes, proc_root, **timeouts):
+    timeouts = {
+        "termination_timeout_s": 0,
+        "poll_interval_s": 0,
+        "reap_timeout_s": 0,
+    } | timeouts
+    return process_utils.terminate_process_groups(
+        processes,  # type: ignore[arg-type]
+        proc_root=proc_root,
+        **timeouts,
+    )
+
+
+def _stat(pid, state, pgrp, comm=b"python3"):
+    return b"%d (%s) %s 1 %d %d 0\n" % (pid, comm, state, pgrp, pgrp)
+
+
+@pytest.mark.parametrize(
+    ("exited_leaders", "expected_calls"),
+    [
+        pytest.param(
+            set(),
+            [("kill", 101, signal.SIGTERM), ("killpg", 101, 0)],
+            id="leader-signaled-first",
+        ),
+        pytest.param(
+            {LEADER_PID},
+            [
+                ("kill", 101, signal.SIGTERM),
+                ("killpg", 101, signal.SIGTERM),
+                ("killpg", 101, 0),
+            ],
+            id="exited-leader-falls-back-to-group",
+        ),
+    ],
+)
+def test_terminate_signals_leader_before_group(
+    fake_signals, tmp_path, exited_leaders, expected_calls
 ):
-    _patch_group_that_never_disappears(monkeypatch)
-    _write_proc_stat(tmp_path, 4481, state="Z", pgrp=101, comm="VLLM::Worker) x")
-    _write_proc_stat(tmp_path, 4482, state="S", pgrp=202)
+    fake_signals.fatal_signals[LEADER_PID] = signal.SIGTERM
+    fake_signals.exited_leaders = exited_leaders
+
+    assert _terminate([FakeLeader()], tmp_path) == []
+    assert fake_signals.calls == expected_calls
+
+
+@pytest.mark.parametrize(
+    ("fatal_signal", "stats", "expected"),
+    [
+        pytest.param(signal.SIGKILL, {}, [FORCED], id="sigkill-ends-group"),
+        pytest.param(None, {}, [FORCED, SURVIVED], id="group-survives-sigkill"),
+        pytest.param(
+            None,
+            {
+                4481: _stat(4481, b"Z", LEADER_PID, b"VLLM::Worker) x"),
+                4482: _stat(4482, b"S", 202, NON_UTF8_COMM),
+            },
+            [],
+            id="only-zombies-left",
+        ),
+        pytest.param(
+            None,
+            {
+                4481: _stat(4481, b"Z", LEADER_PID),
+                4485: _stat(4485, b"R", LEADER_PID, NON_UTF8_COMM),
+            },
+            [FORCED, SURVIVED],
+            id="live-member-beside-zombie",
+        ),
+        pytest.param(
+            None,
+            {4486: b"4486 (python3) S 1 pgrp pgrp 0\n"},
+            [
+                "liveness check failed for process group 101",
+                FORCED,
+                "post-SIGKILL liveness check failed for process group 101",
+                SURVIVED,
+            ],
+            id="unparsable-pgrp",
+        ),
+    ],
+)
+def test_terminate_escalates_and_reports_surviving_groups(
+    fake_signals, tmp_path, fatal_signal, stats, expected
+):
+    fake_signals.fatal_signals[LEADER_PID] = fatal_signal
     (tmp_path / "self").mkdir()
+    for pid, stat in stats.items():
+        (tmp_path / str(pid)).mkdir()
+        (tmp_path / str(pid) / "stat").write_bytes(stat)
 
-    failures = process_utils.terminate_process_groups(
-        [_UnreapedLeader()],  # type: ignore[list-item]
-        termination_timeout_s=0,
-        poll_interval_s=0,
-        reap_timeout_s=0,
-        proc_root=tmp_path,
+    failures = _terminate([FakeLeader()], tmp_path)
+
+    # Drop exception details after ':' so the table pins every message.
+    assert [failure.split(":")[0] for failure in failures] == expected
+
+
+def test_terminate_uses_one_deadline_and_reaps_every_process(
+    fake_signals, monkeypatch, tmp_path
+):
+    first_process, second_process = FakeLeader(101), FakeLeader(102)
+    fake_signals.fatal_signals = {101: signal.SIGTERM, 102: signal.SIGKILL}
+    monotonic_values = iter([100.0, 121.0, 200.0, 201.0, 204.0])
+    monkeypatch.setattr(process_utils.time, "monotonic", lambda: next(monotonic_values))
+
+    failures = _terminate(
+        [first_process, second_process],
+        tmp_path,
+        termination_timeout_s=20,
+        poll_interval_s=0.2,
+        reap_timeout_s=5,
     )
 
-    assert failures == []
+    assert failures == ["forced SIGKILL for process group 102 after 20s timeout"]
+    assert fake_signals.calls == [
+        ("kill", 101, signal.SIGTERM),
+        ("kill", 102, signal.SIGTERM),
+        ("killpg", 101, 0),
+        ("killpg", 102, 0),
+        ("killpg", 102, signal.SIGKILL),
+        ("killpg", 102, 0),
+    ]
+    assert first_process.wait_timeouts == [4]
+    assert second_process.wait_timeouts == [1]
 
 
-def test_terminate_process_groups_still_reports_a_live_member_beside_zombies(
-    monkeypatch,
-    tmp_path,
-):
-    _patch_group_that_never_disappears(monkeypatch)
-    _write_proc_stat(tmp_path, 4481, state="Z", pgrp=101)
-    _write_proc_stat(tmp_path, 4483, state="D", pgrp=101)
-
-    failures = process_utils.terminate_process_groups(
-        [_UnreapedLeader()],  # type: ignore[list-item]
-        termination_timeout_s=0,
-        poll_interval_s=0,
-        reap_timeout_s=0,
-        proc_root=tmp_path,
-    )
-
-    assert any("forced SIGKILL" in failure for failure in failures)
-    assert any("still alive after SIGKILL" in failure for failure in failures)
-
-
-def test_terminate_process_groups_tolerates_a_non_utf8_comm_outside_the_group(
-    monkeypatch,
-    tmp_path,
-):
-    # Any process may set a comm that is not valid UTF-8 via prctl(PR_SET_NAME).
-    _patch_group_that_never_disappears(monkeypatch)
-    _write_proc_stat(tmp_path, 4481, state="Z", pgrp=101)
-    _write_proc_stat(tmp_path, 4484, state="S", pgrp=303, comm=b"bad\xff\xfe")
-
-    failures = process_utils.terminate_process_groups(
-        [_UnreapedLeader()],  # type: ignore[list-item]
-        termination_timeout_s=0,
-        poll_interval_s=0,
-        reap_timeout_s=0,
-        proc_root=tmp_path,
-    )
-
-    assert failures == []
-
-
-def test_terminate_process_groups_counts_a_non_utf8_comm_member_as_alive(
-    monkeypatch,
-    tmp_path,
-):
-    _patch_group_that_never_disappears(monkeypatch)
-    _write_proc_stat(tmp_path, 4481, state="Z", pgrp=101)
-    _write_proc_stat(tmp_path, 4485, state="R", pgrp=101, comm=b"bad\xff\xfe")
-
-    failures = process_utils.terminate_process_groups(
-        [_UnreapedLeader()],  # type: ignore[list-item]
-        termination_timeout_s=0,
-        poll_interval_s=0,
-        reap_timeout_s=0,
-        proc_root=tmp_path,
-    )
-
-    assert any("forced SIGKILL" in failure for failure in failures)
-    assert any("still alive after SIGKILL" in failure for failure in failures)
-
-
-def test_terminate_process_groups_reports_an_unparsable_process_group(
-    monkeypatch,
-    tmp_path,
-):
-    _patch_group_that_never_disappears(monkeypatch)
-    process_dir = tmp_path / "4486"
-    process_dir.mkdir()
-    (process_dir / "stat").write_bytes(b"4486 (python3) S 1 pgrp pgrp 0\n")
-
-    failures = process_utils.terminate_process_groups(
-        [_UnreapedLeader()],  # type: ignore[list-item]
-        termination_timeout_s=0,
-        poll_interval_s=0,
-        reap_timeout_s=0,
-        proc_root=tmp_path,
-    )
-
-    assert any(failure.startswith("liveness check failed") for failure in failures)
-    assert any("forced SIGKILL" in failure for failure in failures)
-    assert any("post-SIGKILL liveness check failed" in failure for failure in failures)
-    assert any("still alive after SIGKILL" in failure for failure in failures)
-
-
-def test_find_processes_matching_environment_uses_exact_entries(
-    monkeypatch,
-    tmp_path,
-):
+def test_find_processes_matching_environment_uses_exact_entries(monkeypatch, tmp_path):
     environments = {
         101: b"AFD_E2E_RUN_ID=run-1\0AFD_E2E_PROCESS_ROLE=ffn\0",
         102: b"AFD_E2E_RUN_ID=run-1\0AFD_E2E_PROCESS_ROLE=attention\0",
         103: b"AFD_E2E_RUN_ID=run-10\0AFD_E2E_PROCESS_ROLE=ffn\0",
     }
     for pid, environment in environments.items():
-        process_dir = tmp_path / str(pid)
-        process_dir.mkdir()
-        (process_dir / "environ").write_bytes(environment)
+        (tmp_path / str(pid)).mkdir()
+        (tmp_path / str(pid) / "environ").write_bytes(environment)
     (tmp_path / "self").mkdir()
     closed_pidfds: list[int] = []
     monkeypatch.setattr(
-        process_utils.os,
-        "pidfd_open",
-        lambda pid: pid + 1000,
-        raising=False,
+        process_utils.os, "pidfd_open", lambda pid: pid + 1000, raising=False
     )
-    monkeypatch.setattr(
-        process_utils.os,
-        "close",
-        closed_pidfds.append,
-    )
+    monkeypatch.setattr(process_utils.os, "close", closed_pidfds.append)
 
     matching_processes = process_utils.find_processes_matching_environment(
-        {
-            "AFD_E2E_RUN_ID": "run-1",
-            "AFD_E2E_PROCESS_ROLE": "ffn",
-        },
-        proc_root=tmp_path,
+        RUN_FFN_ENVIRONMENT, proc_root=tmp_path
     )
 
-    assert [process.pid for process in matching_processes] == [101]
-    assert [process.pidfd for process in matching_processes] == [1101]
+    assert [(process.pid, process.pidfd) for process in matching_processes] == [
+        (101, 1101)
+    ]
     process_utils.close_process_identities(matching_processes)
     assert set(closed_pidfds[:2]) == {1102, 1103}
     assert closed_pidfds[-1] == 1101
 
 
 def test_kill_matching_process_does_not_signal_recycled_pid(monkeypatch, tmp_path):
-    process_dir = tmp_path / "101"
-    process_dir.mkdir()
-    environment_path = process_dir / "environ"
-    environment_path.write_bytes(
-        b"AFD_E2E_RUN_ID=run-1\0AFD_E2E_PROCESS_ROLE=ffn\0",
-    )
+    (tmp_path / "101").mkdir()
+    environment_path = tmp_path / "101" / "environ"
+    environment_path.write_bytes(b"AFD_E2E_RUN_ID=run-1\0AFD_E2E_PROCESS_ROLE=ffn\0")
     opened_pidfds = iter((501, 502))
     closed_pidfds: list[int] = []
     signal_calls: list[tuple[int, int]] = []
@@ -353,9 +229,6 @@ def test_kill_matching_process_does_not_signal_recycled_pid(monkeypatch, tmp_pat
     def fake_pidfd_open(pid):
         assert pid == 101
         return next(opened_pidfds)
-
-    def fake_close(pidfd):
-        closed_pidfds.append(pidfd)
 
     def fake_pidfd_send_signal(pidfd, sig):
         signal_calls.append((pidfd, sig))
@@ -368,7 +241,7 @@ def test_kill_matching_process_does_not_signal_recycled_pid(monkeypatch, tmp_pat
         raise AssertionError("numeric PID signaled")
 
     monkeypatch.setattr(process_utils.os, "pidfd_open", fake_pidfd_open, raising=False)
-    monkeypatch.setattr(process_utils.os, "close", fake_close)
+    monkeypatch.setattr(process_utils.os, "close", closed_pidfds.append)
     monkeypatch.setattr(process_utils.os, "kill", fail_numeric_pid_signal)
     monkeypatch.setattr(
         process_utils.signal,
@@ -379,10 +252,7 @@ def test_kill_matching_process_does_not_signal_recycled_pid(monkeypatch, tmp_pat
     monkeypatch.setattr(process_utils.time, "monotonic", lambda: 100.0)
 
     failures = process_utils.kill_processes_matching_environment(
-        {
-            "AFD_E2E_RUN_ID": "run-1",
-            "AFD_E2E_PROCESS_ROLE": "ffn",
-        },
+        RUN_FFN_ENVIRONMENT,
         timeout_s=0,
         poll_interval_s=0,
         process_name="FFN",
@@ -392,70 +262,3 @@ def test_kill_matching_process_does_not_signal_recycled_pid(monkeypatch, tmp_pat
     assert failures == []
     assert signal_calls == [(501, signal.SIGKILL)]
     assert closed_pidfds == [501, 502]
-
-
-def test_terminate_process_groups_uses_one_deadline_and_reaps_every_process(
-    monkeypatch,
-):
-    class FakeProcess:
-        def __init__(self, pid):
-            self.pid = pid
-            self.returncode = None
-            self.wait_calls = []
-
-        def poll(self):
-            return self.returncode
-
-        def wait(self, timeout=None):
-            self.wait_calls.append(timeout)
-            self.returncode = 0
-
-    first_process = FakeProcess(101)
-    second_process = FakeProcess(102)
-    leader_signal_calls = []
-    group_signal_calls = []
-
-    def fake_kill(pid, sig):
-        leader_signal_calls.append((pid, sig))
-        if pid == first_process.pid and sig == signal.SIGTERM:
-            first_process.returncode = 0
-
-    def fake_killpg(pid, sig):
-        group_signal_calls.append((pid, sig))
-        process = first_process if pid == first_process.pid else second_process
-        if sig == 0 and process.returncode is not None:
-            raise ProcessLookupError
-        if pid == second_process.pid and sig == signal.SIGKILL:
-            second_process.returncode = 0
-
-    monotonic_values = iter([100.0, 121.0, 200.0, 201.0, 204.0])
-    monkeypatch.setattr(process_utils.os, "kill", fake_kill, raising=False)
-    monkeypatch.setattr(process_utils.os, "killpg", fake_killpg, raising=False)
-    monkeypatch.setattr(process_utils.signal, "SIGKILL", 9, raising=False)
-    monkeypatch.setattr(
-        process_utils.time,
-        "monotonic",
-        lambda: next(monotonic_values),
-    )
-
-    failures = process_utils.terminate_process_groups(
-        [first_process, second_process],  # type: ignore[list-item]
-        termination_timeout_s=20,
-        poll_interval_s=0.2,
-        reap_timeout_s=5,
-    )
-
-    assert len(failures) == 1
-    assert "forced SIGKILL" in failures[0]
-    assert leader_signal_calls == [
-        (101, signal.SIGTERM),
-        (102, signal.SIGTERM),
-    ]
-    assert group_signal_calls == [
-        (101, 0),
-        (102, 0),
-        (102, 9),
-        (102, 0),
-    ]
-    assert first_process.wait_calls == [4]
-    assert second_process.wait_calls == [1]

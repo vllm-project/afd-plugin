@@ -108,6 +108,13 @@ repos:
         language: system
         types: [shell]
 
+      - id: unit-test-budget
+        name: Check unit test line budget
+        entry: python tools/pre_commit/check_unit_test_budget.py
+        language: python
+        pass_filenames: false
+        files: ^(tests/unit/|tools/pre_commit/check_unit_test_budget\.py$)
+
       - id: check-spdx-header
         name: Check SPDX headers
         entry: python tools/pre_commit/check_spdx_header.py

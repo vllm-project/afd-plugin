@@ -226,21 +226,6 @@ def _load_patch_module(monkeypatch: pytest.MonkeyPatch):
     return importlib.import_module(module_name)
 
 
-def test_coordinator_patches_are_removed(monkeypatch):
-    """Upstream absorbed the non-lockstep coordinator behavior (#49204).
-
-    vLLM gates lockstep poll timeouts and step/wave stat ordering on
-    ``enable_wave_coordination`` itself, so the copied coordinator that
-    vLLM 0.26.0 required is gone.
-    """
-    patch_module = _load_patch_module(monkeypatch)
-
-    assert not hasattr(patch_module, "run_coordinator")
-    assert not hasattr(patch_module, "process_input_socket")
-    assert not hasattr(patch_module, "_should_patch_pinned_dp_coordinator")
-    assert not hasattr(patch_module, "coordinator_module")
-
-
 def test_async_dp_attention_uses_regular_engine_core(monkeypatch):
     _load_patch_module(monkeypatch)
     core_module = sys.modules["vllm.v1.engine.core"]

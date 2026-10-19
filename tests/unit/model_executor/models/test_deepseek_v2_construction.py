@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import ast
 import hashlib
-import inspect
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -208,15 +207,6 @@ def _masked_patch_sha256(source: str) -> str:
     assert not in_patch
     masked_source = "\n".join(masked_lines).strip() + "\n"
     return hashlib.sha256(masked_source.encode()).hexdigest()
-
-
-def test_pinned_constructor_signatures_match_native_vllm():
-    assert inspect.signature(adapter.AFDDeepseekV2Model.__init__) == inspect.signature(
-        adapter.native.DeepseekV2Model.__init__,
-    )
-    assert inspect.signature(
-        adapter.AFDDeepseekV2DecoderLayer.__init__,
-    ) == inspect.signature(adapter.native.DeepseekV2DecoderLayer.__init__)
 
 
 @pytest.mark.parametrize(

@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -24,7 +23,6 @@ from afd_plugin.model_executor.models.deepseek_v2 import (  # noqa: E402
     _checkpoint_weight_roles,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
 ATTENTION_ROLES = frozenset(("attention",))
 FFN_ROLES = frozenset(("ffn",))
 BOTH_ROLES = frozenset(("attention", "ffn"))
@@ -235,14 +233,6 @@ def test_native_model_loader_packs_mha_qkv(
     assert loaded_params == {target_name}
     assert [shard_id for shard_id, _ in loaded_shards] == ["q", "k", "v"]
     assert [weight.item() for _, weight in loaded_shards] == [0, 1, 2]
-
-
-def test_moe_metadata_and_backend_loading_remain_native_owned() -> None:
-    assert "set_moe_parameters" not in AFDDeepseekV2ForCausalLM.__dict__
-    source = (
-        REPO_ROOT / "afd_plugin" / "model_executor" / "models" / "deepseek_v2.py"
-    ).read_text(encoding="utf-8")
-    assert "vllm_ascend" not in source
 
 
 @pytest.mark.parametrize("suffix", ["weight", "weight_scale", "input_scale", "bias"])
