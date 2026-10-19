@@ -2,80 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Pure host negotiation tests; no device or model runner initialization."""
 
-import ast
-import json
-import sys
-import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, replace
-from pathlib import Path
+from dataclasses import replace
 from threading import Condition
-from types import ModuleType, SimpleNamespace
-from typing import Literal
+from types import SimpleNamespace
 
 import pytest
 
-# Compile the real connector's host-only methods without importing its NPU
-# dependencies. This keeps the existing CPU negotiation tests runnable;
-# full connector construction is covered by test_async_ffn_runtime.py.
-source = Path(__file__).resolve().parents[3] / "afd_plugin/connectors/npu/async_cam.py"
-module_ast = ast.parse(source.read_text())
-host_methods = {
-    "_graph_keys",
-    "_graph_publish",
-    "check_graph_failure",
-    "fail_graph_startup",
-    "_graph_wait",
-    "wait_graph_device",
-    "graph_phase",
-    "_negotiate_graph",
-    "graph_service_ready",
-    "_wait_graph_service_ready",
-}
-body: list[ast.stmt] = [
-    ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
-]
-for node in module_ast.body:
-    if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in (
-        "FFNGraphPlan",
-        "resolve_ffn_mode",
-        "CAMAsyncAFDConnector",
-    ):
-        if isinstance(node, ast.ClassDef) and node.name == "CAMAsyncAFDConnector":
-            node.bases = []
-            node.body = [
-                m
-                for m in node.body
-                if isinstance(m, ast.FunctionDef) and m.name in host_methods
-            ]
-            assert {
-                m.name for m in node.body if isinstance(m, ast.FunctionDef)
-            } == host_methods
-        body.append(node)
-    elif isinstance(node, ast.Assign) and any(
-        isinstance(t, ast.Name)
-        and t.id in {"GRAPH_STARTUP_TIMEOUT_SECONDS", "POLL_SECONDS"}
-        for t in node.targets
-    ):
-        body.append(node)
-startup_module = ModuleType("afd_graph_startup_contract")
-sys.modules[startup_module.__name__] = startup_module
-vars(startup_module).update(
-    json=json, time=time, asdict=asdict, dataclass=dataclass, Literal=Literal
+from afd_plugin import async_cam_startup as startup_module
+from afd_plugin.async_cam_startup import (
+    AsyncCAMGraphStartup,
+    FFNGraphPlan,
+    resolve_ffn_mode,
 )
-exec(
-    compile(
-        ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
-        str(source),
-        "exec",
-    ),
-    vars(startup_module),
-)
-CAMAsyncAFDConnector = startup_module.CAMAsyncAFDConnector
-FFNGraphPlan = startup_module.FFNGraphPlan
-resolve_ffn_mode = startup_module.resolve_ffn_mode
-
-from afd_plugin.validation import (  # noqa: E402
+from afd_plugin.validation import (
     cam_receive_capacity,
     requested_ffn_mode,
     validate_graph_capacity,
@@ -110,13 +50,9 @@ def startup_world(attn=2, ffn=2, store=None):
     store = store or MemoryStore()
     owners = []
     for rank in range(attn + ffn):
-        owner = CAMAsyncAFDConnector()
-        owner._graph_store = store
-        owner.world_rank, owner.attn_size = rank, attn
-        owner.topology = SimpleNamespace(world_size=attn + ffn)
-        owner._graph_prefix = "ffn_graph/test/"
-        owner.ffn_graph_mode = "eager"
-        owner._graph_warmup_layer_id = None
+        owner = AsyncCAMGraphStartup(rank, attn, attn + ffn)
+        owner._store = store
+        owner._prefix = "ffn_graph/test/"
         owners.append(owner)
     return owners
 
@@ -170,28 +106,23 @@ def test_whole_world_agrees_before_service_readiness():
     owners = startup_world()
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [
-            pool.submit(
-                owner._negotiate_graph, None if i < 2 else full_plan(), "same-wire"
-            )
+            pool.submit(owner._negotiate, None if i < 2 else full_plan(), "same-wire")
             for i, owner in enumerate(owners)
         ]
         for future in futures:
             future.result(timeout=3)
-    assert all(
-        owner.ffn_graph_mode == "full" and owner._graph_warmup_layer_id == 2
-        for owner in owners
-    )
+    assert all(owner.mode == "full" and owner.warmup_layer_id == 2 for owner in owners)
     for owner in owners[2:]:
-        owner.graph_service_ready()
+        owner.service_ready()
     for owner in owners[:2]:
-        owner._wait_graph_service_ready()
+        owner.wait_service_ready()
 
 
 def test_transport_mismatch_rejects_before_payload_initialization():
     owners = startup_world(1, 1)
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [
-            pool.submit(owner._negotiate_graph, None if i == 0 else full_plan(), str(i))
+            pool.submit(owner._negotiate, None if i == 0 else full_plan(), str(i))
             for i, owner in enumerate(owners)
         ]
         for future in futures:
@@ -205,14 +136,12 @@ def test_explicit_eager_preserves_existing_transport_check_scope():
     owners = startup_world(1, 1)
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [
-            pool.submit(
-                owner._negotiate_graph, None if i == 0 else FFNGraphPlan(), str(i)
-            )
+            pool.submit(owner._negotiate, None if i == 0 else FFNGraphPlan(), str(i))
             for i, owner in enumerate(owners)
         ]
         for future in futures:
             future.result(timeout=3)
-    assert all(owner.ffn_graph_mode == "eager" for owner in owners)
+    assert all(owner.mode == "eager" for owner in owners)
 
 
 @pytest.mark.parametrize("failure", ["timeout", "publication"])
@@ -221,24 +150,24 @@ def test_nonowner_attention_failure_is_visible_to_late_ffn(monkeypatch, failure)
     attention, ffn = owners[1], owners[2]
     monkeypatch.setattr(startup_module, "GRAPH_STARTUP_TIMEOUT_SECONDS", 0)
     if failure == "publication":
-        original = attention._graph_store.set
+        original = attention._store.set
 
         def fail_plan(key, value):
             if key.endswith("plan/1"):
                 raise RuntimeError("plan publication failed")
             original(key, value)
 
-        monkeypatch.setattr(attention._graph_store, "set", fail_plan)
+        monkeypatch.setattr(attention._store, "set", fail_plan)
     with pytest.raises((TimeoutError, RuntimeError)):
-        attention._negotiate_graph(None, "same-wire")
-    assert attention._graph_store.check(attention._graph_keys("error", range(1, 2)))
+        attention._negotiate(None, "same-wire")
+    assert attention._store.check(attention._keys("error", range(1, 2)))
     # Late plan and ready publications must not conceal the first failure.
     with pytest.raises(RuntimeError):
-        ffn._negotiate_graph(full_plan(), "same-wire")
-    assert ffn.ffn_graph_mode == "eager"
+        ffn._negotiate(full_plan(), "same-wire")
+    assert ffn.mode == "eager"
     with pytest.raises(RuntimeError):
-        ffn.graph_service_ready()
-    assert not ffn._graph_store.check(ffn._graph_keys("service", range(2, 3)))
+        ffn.service_ready()
+    assert not ffn._store.check(ffn._keys("service", range(2, 3)))
 
 
 def test_capacity_matches_native_float32_factor(monkeypatch):
@@ -258,3 +187,49 @@ def test_graph_rejects_unsafe_static_envelope(tokens, tp, capacity):
 def test_graph_accepts_conservative_uint16_boundary():
     validate_graph_capacity(65535, 1, 65535)
     validate_graph_capacity(65536, 2, 65536)
+
+
+@pytest.mark.parametrize("stage", ["validated", "warmup", "captured"])
+def test_phase_requires_all_ranks_and_failure_wins_over_ready(monkeypatch, stage):
+    owners = startup_world()
+    monkeypatch.setattr(startup_module, "GRAPH_STARTUP_TIMEOUT_SECONDS", 0)
+    # Every earlier participant waits until the final participant publishes.
+    for owner in owners[:-1]:
+        with pytest.raises(TimeoutError):
+            owner.phase(stage)
+    owners[-1].phase(stage)
+    owners[0].fail(RuntimeError("peer failed"))
+    with pytest.raises(RuntimeError, match="peer failed"):
+        owners[-1].phase(stage)
+    with pytest.raises(RuntimeError, match="peer failed"):
+        owners[-1].service_ready()
+
+
+def test_attention_waits_for_every_ffn_service(monkeypatch):
+    attention, _, first_ffn, last_ffn = startup_world()
+    monkeypatch.setattr(startup_module, "GRAPH_STARTUP_TIMEOUT_SECONDS", 0)
+    first_ffn.service_ready()
+    with pytest.raises(TimeoutError):
+        attention.wait_service_ready()
+    last_ffn.service_ready()
+    attention.wait_service_ready()
+    last_ffn.fail(RuntimeError("receiver failed"))
+    with pytest.raises(RuntimeError, match="receiver failed"):
+        attention.wait_service_ready()
+
+
+def test_initialize_owns_nonce_and_plan_negotiation():
+    store = MemoryStore()
+    owners = [AsyncCAMGraphStartup(rank, 1, 2) for rank in range(2)]
+    owners[1].plan = full_plan()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(owner.initialize, store, "wire") for owner in owners]
+        for future in futures:
+            future.result(timeout=3)
+    assert all(owner.mode == "full" and owner.warmup_layer_id == 2 for owner in owners)
+    nonce = store.get("ffn_graph/nonce").decode()
+    assert all(
+        key.startswith(f"ffn_graph/{nonce}/")
+        for key in store.values
+        if key != "ffn_graph/nonce"
+    )

@@ -33,8 +33,8 @@ Attention DP replicas make that decision independently; FFN is connector-driven.
 
 FFN also supports the experimental complete-transaction FULL mode described in
 [Async FFN runtime](ASYNC_FFN_RUNTIME.md#selection-and-startup).
-FULL requires MRV2 Attention with DBO disabled on every rank. Attention graph
-execution remains unsupported.
+FULL requires MRV2 on both roles and accepts Attention-side DBO under the
+existing constraints. Attention graph execution remains unsupported.
 
 ## ModelRunnerV2 deployment
 

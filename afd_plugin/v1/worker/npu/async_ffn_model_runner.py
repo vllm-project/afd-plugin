@@ -4,12 +4,18 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 from vllm.logger import init_logger
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
+from afd_plugin.async_cam_startup import (
+    GRAPH_STARTUP_TIMEOUT_SECONDS,
+    POLL_SECONDS,
+    FFNGraphPlan,
+)
 from afd_plugin.compat.npu.forward_context import ascend_forward_context
 from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.compat.npu.profiler import (
@@ -25,7 +31,6 @@ from afd_plugin.connectors.metadata import (
 from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
-    FFNGraphPlan,
 )
 from afd_plugin.envs import async_cam_layered_gmm_enabled
 from afd_plugin.model_executor.npu.async_cam_w4a8 import (
@@ -148,7 +153,7 @@ class AsyncNPUFFNModelRunner:
             if executor is None
             else ""
         )
-        self.connector.ffn_graph_plan = FFNGraphPlan(
+        self.connector.graph_startup.plan = FFNGraphPlan(
             requested=self.requested_mode,
             graph_error=graph_error,
             signature=executor.graph_signature(cam_receive_capacity())
@@ -158,7 +163,7 @@ class AsyncNPUFFNModelRunner:
         )
         try:
             self.connector.init_afd_connector()
-            self.effective_mode = self.connector.ffn_graph_mode
+            self.effective_mode = self.connector.graph_startup.mode
             if self.effective_mode == "full":
                 assert executor is not None
                 chunks = self.connector.graph_startup_chunks() * (
@@ -168,23 +173,30 @@ class AsyncNPUFFNModelRunner:
                     self._ffn_forward_connector_driven(single=True)
                 done = torch.npu.Event()
                 done.record()
-                self.connector.wait_graph_device(done)
-                self.connector.graph_phase("warmup")
+                self._wait_graph_device(done)
+                self.connector.graph_startup.phase("warmup")
                 stream = torch.npu.Stream(device=self.device)
                 stream.wait_stream(torch.npu.current_stream(self.device))
                 self._initialize_graph(stream)
                 self._capture_graph()
-                self.connector.graph_phase("captured")
+                self.connector.graph_startup.phase("captured")
         except Exception as exc:
             self._failure = exc
-            if self.connector._graph_store is not None:
-                self.connector.fail_graph_startup(exc)
+            self.connector.graph_startup.fail(exc)
             raise
         logger.info(
             "Async FFN requested=%s mode=%s",
             self.requested_mode,
             self.effective_mode,
         )
+
+    def _wait_graph_device(self, event: torch.npu.Event) -> None:
+        deadline = time.monotonic() + GRAPH_STARTUP_TIMEOUT_SECONDS
+        while not event.query():
+            self.connector.graph_startup.check_failure()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Async graph warmup timed out; retain resources")
+            time.sleep(POLL_SECONDS)
 
     def _initialize_graph(self, stream: torch.npu.Stream) -> None:
         self._graph_stream = stream
@@ -330,7 +342,7 @@ class AsyncNPUFFNModelRunner:
             self._ffn_forward_connector_driven()
             return True
         if not self._service_announced:
-            self.connector.graph_service_ready()
+            self.connector.graph_startup.service_ready()
             self._service_announced = True
         # Match the reference's bounded submission count. Each DR still selects
         # ready work; this batch is not a request or model-forward boundary.

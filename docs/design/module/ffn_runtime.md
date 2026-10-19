@@ -154,8 +154,8 @@ Ascend supports synchronous CAMP2P with FFN-side gating, or eager Async CAM
 with Attention-side gating. CAMP2P supports eager and graph DBO with
 Attention DP > 1 and matching two-stage FFN control metadata. Async CAM
 supports eager Attention DBO at DP1 or DP > 1, and rejects native DBO flags on
-FFN. Async FFN FULL requires DBO disabled on every rank. Async FFN continues
-to receive work items independently of Attention's threads. These limits
+FFN. Async FFN FULL accepts eager Attention DBO and continues to receive work
+items independently of Attention's threads. These limits
 describe the pair even though only Attention inherits a native V2 runner.
 
 ## Daemon step selection

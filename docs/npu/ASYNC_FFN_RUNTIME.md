@@ -2,8 +2,8 @@
 
 AFD #449 captures one complete routed-expert transaction: original dispatch
 receive (DR), existing layered W4A8 FFN, and original combine send (CS).
-Attention remains MRV2 eager. Issue #451 retires the separate MRV1 paths while preserving this runtime
-and its original transport/lifecycle boundary.
+Attention remains MRV2 eager. Issue #451 retires the separate MRV1 paths while
+preserving this runtime and its original transport/lifecycle boundary.
 
 ## Selection and startup
 
@@ -11,7 +11,9 @@ The target is the pinned vLLM 0.30 / vLLM-Ascend stack on A3/910C, with
 homogeneous DeepSeek-V4 W4A8 layers, dynamicQuant=1, static expert placement,
 F TP=1 and Attention-side gating. Both roles select
 `VLLM_USE_V2_MODEL_RUNNER=1`. Attention keeps `--enforce-eager`.
-Native DBO and its `async_moe_ubatching` alias must be disabled on every rank.
+Attention may enable native DBO or its `async_moe_ubatching` alias under the
+existing two-microbatch constraints. Enable native DBO only on Attention; FFN
+consumes CAM work items without joining Attention's DBO thread schedule.
 
 On F, set `AFD_ASYNC_CAM_LAYERED_GMM=1`, omit `--enforce-eager`, and pass
 `--compilation-config '{"cudagraph_mode":"FULL"}'`. To select eager explicitly,
@@ -37,8 +39,9 @@ F HTTP API initialization is not a readiness requirement.
 ## Capture boundary and ownership
 
 The runner owns capture/replay, weights, stable buffers, a private graph pool
-and one execution stream. The connector owns CAM communication and startup
-negotiation. A captured transaction receives activations, scales, expert counts
+and one execution stream. The connector owns CAM communication. The host-only `AsyncCAMGraphStartup`
+coordinator owns Store negotiation, stage waits and failure propagation; it owns
+no device resources or threads. A captured transaction receives activations, scales, expert counts
 and the original return metadata from DR. Device-side layer selection uses
 `batch_info[2]`, through the existing mapping or a one-element clone. The same
 metadata goes to CS; host code does not select the layer or copy per-item inputs.

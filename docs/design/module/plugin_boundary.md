@@ -184,7 +184,8 @@ eager `CAMAsyncAFDConnector` with async DP and Attention-side gating. Ascend
 native DBO requires exactly two microbatches and no speculative decoding.
 CAMP2P requires Attention DP > 1 and supports eager/graph DBO; plain MLA
 graph DBO requires `FULL_DECODE_ONLY`. Async CAM supports eager Attention
-DBO at DP1 or DP > 1. Its FFN FULL mode requires DBO disabled on all ranks.
+DBO at DP1 or DP > 1, including when FFN uses FULL. FFN remains outside
+Attention's native DBO thread schedule.
 Sequence parallelism follows model policy; synchronous DeepSeek-V2/V3 SP is
 rejected, while Async CAM permits Attention-local model SP. Graph-mode details belong to
 [execution platforms](execution_platforms.md).

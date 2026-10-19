@@ -295,7 +295,7 @@ def main():
                     for _ in expected:
                         runner._ffn_forward_connector_driven(single=True)
                 return
-            connector.graph_service_ready()
+            connector.graph_startup.service_ready()
             for start in range(0, len(expected), len(LAYERS)):
                 batch_index = 0
                 # Test-only finite work count, including the final short batch.
@@ -331,7 +331,7 @@ def main():
             errors.append(exc)
             print(json.dumps({"rank": rank, "service_error": repr(exc)}), flush=True)
             # Report fixture failure to peers; never substitute eager execution.
-            connector.fail_graph_startup(exc)
+            connector.graph_startup.fail(exc)
 
     if is_ffn:
         thread = threading.Thread(target=serve, name="afd-runtime-test", daemon=True)
@@ -371,7 +371,7 @@ def main():
                 done.record()
                 deadline = time.monotonic() + 30
                 while not done.query():
-                    connector.check_graph_failure()
+                    connector.graph_startup.check_failure()
                     if time.monotonic() >= deadline:
                         raise TimeoutError(
                             "runtime test CR did not finish in 30 seconds"

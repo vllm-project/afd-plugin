@@ -106,7 +106,7 @@ def install_observers() -> None:
     @wraps(send_eager)
     def sent(self, output, context, **kwargs):
         result = send_eager(self, output, context, **kwargs)
-        if self.ffn_graph_mode == "eager":
+        if self.graph_startup.mode == "eager":
             # Functional coverage only. This fixture adds an eager event fence
             # for observations and must not be used for performance reporting.
             torch.npu.current_stream().synchronize()
