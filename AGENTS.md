@@ -125,6 +125,8 @@ protocol, the test MUST stay green.
 - Test files mirror the source tree
   (`tests/unit/<mirrored path>/test_<module>.py`). Do not create a file per
   feature or per acceptance bullet.
+- `tests/unit` covers `afd_plugin` only. Harness code under `tests/e2e` is
+  validated by running the E2E cases, not by unit tests.
 
 ### Boundaries
 
