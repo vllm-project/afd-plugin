@@ -30,7 +30,7 @@ from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
 from afd_plugin.model_executor.npu.async_cam_w4a8 import W4A8LayerWeights
-from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
+from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
 
 HIDDEN = 256
 EXPERTS = 4
@@ -139,11 +139,29 @@ def main():
             dtype=torch.bfloat16,
             enforce_eager=not (args.full_graph and is_ffn),
             hf_config=SimpleNamespace(
-                hidden_size=HIDDEN, num_experts_per_tok=2, n_routed_experts=8
+                hidden_size=HIDDEN,
+                num_experts_per_tok=2,
+                n_routed_experts=8,
+                num_hidden_layers=max(LAYERS) + 1,
+                architectures=["DeepseekV4ForCausalLM"],
+                model_type="deepseek_v4",
             ),
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
-        parallel_config=SimpleNamespace(enable_dbo=False, use_ubatching=False),
+        parallel_config=SimpleNamespace(
+            enable_dbo=False,
+            use_ubatching=False,
+            num_ubatches=2,
+            data_parallel_size=2 if is_ffn else args.attn_ranks,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            enable_expert_parallel=True,
+            enable_elastic_ep=False,
+            enable_eplb=False,
+        ),
+        speculative_config=None,
         cache_config=SimpleNamespace(num_gpu_blocks=None),
         compilation_config=SimpleNamespace(
             static_forward_context={}, cudagraph_mode=SimpleNamespace(name="FULL")
@@ -160,7 +178,7 @@ def main():
     report = {"rank": rank, "per_group": args.per_group, "work": []}
     print(json.dumps({"rank": rank, "stage": "connector_created"}), flush=True)
     if is_ffn:
-        runner = AsyncNPUFFNModelRunner(config, device, connector)
+        runner = AFDNPUFFNModelRunner(config, device, connector)
         runner.model = SyntheticModel(device, not args.per_group)
         print(json.dumps({"rank": rank, "stage": "weights_ready"}), flush=True)
         runner.initialize_afd_connector()

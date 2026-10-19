@@ -40,7 +40,7 @@ existing constraints. Attention graph execution remains unsupported.
 
 Set `VLLM_USE_V2_MODEL_RUNNER=1` and `VLLM_PLUGINS=ascend,afd` on both roles.
 Attention uses native Ascend ModelRunnerV2; FFN uses the independent
-`AsyncNPUFFNModelRunner`. Neither role selects or falls back to MRV1. Use the pinned vLLM/vLLM-Ascend pair in the installation instructions.
+`AFDNPUFFNModelRunner`. Neither role selects or falls back to MRV1. Use the pinned vLLM/vLLM-Ascend pair in the installation instructions.
 
 The V2 Async CAM contract is:
 

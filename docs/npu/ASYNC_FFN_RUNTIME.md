@@ -5,6 +5,10 @@ receive (DR), existing layered W4A8 FFN, and original combine send (CS).
 Attention remains MRV2 eager. Issue #451 retires the separate MRV1 paths while
 preserving this runtime and its original transport/lifecycle boundary.
 
+The unified `AFDNPUFFNModelRunner` shares configuration, model loading and public
+interfaces with CAMP2P. Its Async path keeps a separate transaction graph and
+the receive-completion requirements described below.
+
 ## Selection and startup
 
 The target is the pinned vLLM 0.30 / vLLM-Ascend stack on A3/910C, with

@@ -10,7 +10,6 @@ _RUNTIME_EXPORTS = {
     ),
     "AFDNPUAttentionWorker": "afd_plugin.v1.worker.npu.attention_worker",
     "AFDNPUFFNModelRunner": "afd_plugin.v1.worker.npu.ffn_model_runner",
-    "AsyncNPUFFNModelRunner": "afd_plugin.v1.worker.npu.async_ffn_model_runner",
     "AFDNPUFFNWorker": "afd_plugin.v1.worker.npu.ffn_worker",
 }
 
@@ -30,5 +29,4 @@ __all__ = [
     "AFDNPUAttentionWorker",
     "AFDNPUFFNModelRunner",
     "AFDNPUFFNWorker",
-    "AsyncNPUFFNModelRunner",
 ]

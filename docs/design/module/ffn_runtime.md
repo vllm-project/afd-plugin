@@ -75,7 +75,7 @@ Attention.
 | Platform | Worker | Model runner | Current connectors |
 | --- | --- | --- | --- |
 | CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `GPUFFNModelRunner` | `P2pNcclAFDConnector` |
-| NPU | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | `AFDNPUFFNModelRunner` (sync) or `AsyncNPUFFNModelRunner` | `CAMP2pAFDConnector`, `CAMAsyncAFDConnector` |
+| NPU | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | Unified `AFDNPUFFNModelRunner` | `CAMP2pAFDConnector`, `CAMAsyncAFDConnector` |
 
 GPU and NPU FFN runners are independent, connector-driven owners. Ascend
 selects the synchronous or Async runner from the connector, with no MRV1
@@ -139,8 +139,10 @@ does not adopt native V2 request state or scheduler-driven execution:
 - CUDA temporarily substitutes `GPUFFNModelRunner` at the native V2
   construction seam inside `Worker.init_device()`; the existing AFD runner is
   still the runtime object.
-- Ascend constructs `AFDNPUFFNModelRunner` for CAMP2P or
-  `AsyncNPUFFNModelRunner` for Async CAM. Both use the native MRV2
+- Ascend constructs one `AFDNPUFFNModelRunner` for CAMP2P and Async CAM.
+  Configuration, native model loading/quantization postprocessing and public
+  interfaces share one owner. Synchronous stage execution and Async transactions
+  retain their own graph and shutdown boundaries. Both use the native MRV2
   forward-context shape and install Ascend state in `additional_kwargs`.
 - Both workers run the same V2 topology and feature validator as the paired
   Attention role before constructing communication resources.
@@ -229,7 +231,7 @@ control-plane receive. For each layer, the runner:
 
 Async eager does not use the synchronous DP-metadata graph cache. Its FULL
 mode captures a complete original DR/FFN/CS transaction with device-side layer
-selection. The independent Async runner owns one graph and stable resources;
+selection. The unified runner's Async path owns one graph and stable resources;
 see [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md) for startup, supported
 W4A8 configuration and the original receiver's process-cleanup boundary.
 

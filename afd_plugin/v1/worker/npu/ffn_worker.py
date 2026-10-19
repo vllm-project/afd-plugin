@@ -23,10 +23,7 @@ from afd_plugin.compat.npu import (
     npu_afd_num_ubatches,
 )
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
-from afd_plugin.v1.worker.npu.async_ffn_model_runner import (
-    AsyncNPUFFNModelRunner,
-    create_npu_ffn_model_runner,
-)
+from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
 from afd_plugin.validation import (
     NPU_FFN_WORKER_FQCN,
     assert_compatible_afd_stack,
@@ -80,7 +77,7 @@ class AFDNPUFFNWorker(NPUWorker):
             self.vllm_config.model_config,
             device_type="npu",
         )
-        self.model_runner = create_npu_ffn_model_runner(self.vllm_config, self.device)
+        self.model_runner = AFDNPUFFNModelRunner(self.vllm_config, self.device)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}
@@ -136,7 +133,6 @@ class AFDNPUFFNWorker(NPUWorker):
                 logger.exception("AFD NPU FFN worker loop failed")
             else:
                 if self._uses_async_full_graph():
-                    assert isinstance(self.model_runner, AsyncNPUFFNModelRunner)
                     self.model_runner._graph_receiver_exited = True
 
         self._ffn_thread = threading.Thread(
@@ -173,14 +169,13 @@ class AFDNPUFFNWorker(NPUWorker):
 
         torch.npu.set_device(self.device)
         while not event.is_set():
-            if isinstance(self.model_runner, AsyncNPUFFNModelRunner):
+            control_plane = self.model_runner.connector.control_plane
+            if control_plane is None:
                 if not self.model_runner.execute_connector_driven_step():
                     return
                 if self.model_runner.effective_mode == "eager":
                     torch.npu.synchronize()
                 continue
-            control_plane = self.model_runner.connector.control_plane
-            assert control_plane is not None
             payload = control_plane.recv_dp_metadata_list()
             dp_metadata_list = payload.dp_metadata_list
             is_attn_graph_capturing = payload.is_graph_capturing
@@ -199,7 +194,7 @@ class AFDNPUFFNWorker(NPUWorker):
 
     def _uses_async_full_graph(self) -> bool:
         return (
-            isinstance(self.model_runner, AsyncNPUFFNModelRunner)
+            self.model_runner.connector.control_plane is None
             and self.model_runner.effective_mode == "full"
         )
 

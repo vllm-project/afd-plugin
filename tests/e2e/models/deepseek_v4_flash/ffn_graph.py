@@ -302,7 +302,7 @@ def audit_execution(before: dict, after: dict, mode: str) -> None:
             raise AssertionError("No continuous live Attention execution")
     for record in ffn_after:
         baseline = ffn_before[record["rank"]]
-        if record["runner"] != "AsyncNPUFFNModelRunner" or record["mode"] != mode:
+        if record["runner"] != "AFDNPUFFNModelRunner" or record["mode"] != mode:
             raise AssertionError("FFN runner or effective execution mode changed")
         layer_ids = record["layer_ids"]
         if len(layer_ids) != 43:

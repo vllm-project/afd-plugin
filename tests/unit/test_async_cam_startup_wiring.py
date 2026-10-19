@@ -42,6 +42,10 @@ def modules(monkeypatch):
         "torch.distributed.distributed_c10d",
         "torch.distributed.rendezvous",
         "vllm.logger",
+        "vllm.compilation.monitor",
+        "vllm.config",
+        "vllm.forward_context",
+        "vllm.platforms",
         "vllm.distributed",
         "vllm.utils.torch_utils",
         "vllm_ascend.utils",
@@ -50,6 +54,8 @@ def modules(monkeypatch):
         "afd_plugin.compat.npu.profiler",
         "afd_plugin.model_executor.npu.async_cam_w4a8",
         "afd_plugin.v1.worker.ffn_metadata",
+        "afd_plugin.v1.worker.attention_metadata",
+        "afd_plugin.v1.worker.cuda_graph",
     ):
         stub(name)
     stub(
@@ -64,7 +70,7 @@ def modules(monkeypatch):
         "afd_plugin.connectors.npu.async_cam", "afd_plugin/connectors/npu/async_cam.py"
     )
     runtime = load(
-        "host_async_ffn_runner", "afd_plugin/v1/worker/npu/async_ffn_model_runner.py"
+        "host_async_ffn_runner", "afd_plugin/v1/worker/npu/ffn_model_runner.py"
     )
     return group, connector, runtime
 
@@ -191,7 +197,8 @@ def test_graph_dbo_keeps_existing_role_and_count_validation(
 
 def test_ffn_announces_service_only_on_receiver_execution(modules):
     _, _, runtime = modules
-    runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
+    runner = runtime.AFDNPUFFNModelRunner.__new__(runtime.AFDNPUFFNModelRunner)
+    runner.is_async = True
     calls: list[str | tuple[str, str | int]] = []
     runner.__dict__.update(
         prof=None,
@@ -229,7 +236,8 @@ def test_ffn_warmup_capture_order_and_failure_propagation(modules, capture_fails
         if capture_fails:
             raise RuntimeError("capture failed")
 
-    runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
+    runner = runtime.AFDNPUFFNModelRunner.__new__(runtime.AFDNPUFFNModelRunner)
+    runner.is_async = True
     runner.__dict__.update(
         _failure=None,
         requested_mode="full",
