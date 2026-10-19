@@ -230,6 +230,35 @@ def _load_ubatch_wrapper_module(monkeypatch):
     fake_ubatching.AscendUBatchContext = object
     fake_ubatching.make_ubatch_contexts = lambda **_kwargs: []
 
+    fake_attention = ModuleType("vllm_ascend.attention")
+    fake_attention.__path__ = []
+    fake_dsa = ModuleType("vllm_ascend.attention.dsa_v1")
+    fake_dsa.AscendDSAMetadata = type("AscendDSAMetadata", (SimpleNamespace,), {})
+    fake_ops = ModuleType("vllm_ascend.ops")
+    fake_ops.__path__ = []
+    fake_rope = ModuleType("vllm_ascend.ops.rope_dsv4")
+
+    class RopeDataProxy:
+        """Model the pinned proxy's shared data and tensor-view slicing."""
+
+        def __init__(self, data_map, is_cos=True):
+            self._data = data_map
+            self.idx = 0 if is_cos else 1
+
+        def __getitem__(self, index):
+            return RopeDataProxy(
+                {
+                    config: {
+                        group: (cos[index], sin[index])
+                        for group, (cos, sin) in groups.items()
+                    }
+                    for config, groups in self._data.items()
+                },
+                is_cos=self.idx == 0,
+            )
+
+    fake_rope.RopeDataProxy = RopeDataProxy
+
     modules = {
         "vllm": fake_vllm,
         "vllm.config": fake_config,
@@ -240,6 +269,10 @@ def _load_ubatch_wrapper_module(monkeypatch):
         "vllm.v1.worker": fake_vllm_worker,
         "vllm.v1.worker.gpu_ubatch_wrapper": fake_gpu_wrapper,
         "vllm_ascend": fake_ascend,
+        "vllm_ascend.attention": fake_attention,
+        "vllm_ascend.attention.dsa_v1": fake_dsa,
+        "vllm_ascend.ops": fake_ops,
+        "vllm_ascend.ops.rope_dsv4": fake_rope,
         "vllm_ascend.compilation": fake_compilation,
         "vllm_ascend.compilation.acl_graph": fake_acl_graph,
         "vllm_ascend.utils": fake_ascend_utils,
@@ -251,6 +284,7 @@ def _load_ubatch_wrapper_module(monkeypatch):
 
     mla_graph_name = "afd_plugin.v1.worker.npu.mla_graph"
     _reload_module(monkeypatch, mla_graph_name)
+    _reload_module(monkeypatch, "afd_plugin.v1.worker.npu.dsa_rope")
     wrapper_name = "afd_plugin.v1.worker.npu.npu_ubatch_wrapper"
     return _reload_module(monkeypatch, wrapper_name)
 
@@ -275,6 +309,9 @@ def _parent_forward_context():
         draft_attn_metadatas=None,
         max_tokens_across_pcp=None,
         mc2_mask=None,
+        sinks=None,
+        input_ids=None,
+        eplb_heat_collection_status=None,
     )
 
 
@@ -930,3 +967,137 @@ def test_mla_graph_replay_rejects_missing_updater_before_replay(monkeypatch):
         wrapper._replay_mla_graph(graph_metadata, context, 4, object())
 
     assert replay_calls == []
+
+
+def _dsa_metadata(wrapper_module, shared_rope, values):
+    cos, sin = shared_rope
+    cos.copy_(torch.tensor(values, dtype=cos.dtype))
+    sin.copy_(-cos)
+    data = {"config": {"default": (cos, sin)}}
+    proxy = wrapper_module.RopeDataProxy
+    return wrapper_module.AscendDSAMetadata(
+        cos=proxy(data, is_cos=True),
+        sin=proxy(data, is_cos=False),
+        num_decodes=len(values),
+        num_decode_tokens=len(values),
+        num_prefills=0,
+        decode=SimpleNamespace(
+            cos=proxy(data, is_cos=True),
+            sin=proxy(data, is_cos=False),
+            seq_lens=torch.tensor(values, dtype=torch.int32),
+            query_start_loc=torch.arange(len(values) + 1, dtype=torch.int32),
+        ),
+    )
+
+
+def test_dsa_ubatches_keep_separate_rope_when_upstream_buffer_is_overwritten(
+    monkeypatch,
+):
+    wrapper_module = _load_ubatch_wrapper_module(monkeypatch)
+    rope_module = importlib.import_module("afd_plugin.v1.worker.npu.dsa_rope")
+    shared = (torch.empty(2), torch.empty(2))
+    stage0 = _dsa_metadata(wrapper_module, shared, [5, 6])
+    stage0_rope = rope_module.isolate_dsa_rope_metadata(stage0, None)
+    stage1 = _dsa_metadata(wrapper_module, shared, [10, 11])
+    rope_module.isolate_dsa_rope_metadata(stage1, None)
+    assert shared[0].tolist() == [10, 11]
+    assert stage0.decode.cos._data["config"]["default"][0].tolist() == [5, 6]
+    assert stage1.decode.cos._data["config"]["default"][0].tolist() == [10, 11]
+    assert (
+        stage0.decode.cos._data["config"]["default"][0].data_ptr()
+        != stage1.decode.cos._data["config"]["default"][0].data_ptr()
+    )
+    # Later attention groups in stage 0 must reuse its snapshot, even if the
+    # process-wide buffer has already been overwritten while building stage 1.
+    other_group = _dsa_metadata(wrapper_module, shared, [10, 11])
+    reused = rope_module.isolate_dsa_rope_metadata(other_group, stage0_rope)
+    assert reused is stage0_rope
+    assert other_group.decode.cos._data["config"]["default"][0].tolist() == [5, 6]
+
+
+def test_dsa_graph_replay_refreshes_each_stage_rope_without_changing_addresses(
+    monkeypatch,
+):
+    wrapper_module = _load_ubatch_wrapper_module(monkeypatch)
+    rope_module = importlib.import_module("afd_plugin.v1.worker.npu.dsa_rope")
+    wrapper = _new_wrapper_for_unit_test(wrapper_module, mla_full_graph_enabled=False)
+    shared = (torch.empty(2), torch.empty(2))
+    saved = []
+    for values in ([0, 0], [0, 0]):
+        metadata = _dsa_metadata(wrapper_module, shared, values)
+        rope_module.isolate_dsa_rope_metadata(metadata, None)
+        saved.append(metadata)
+    saved_tensors = [
+        tensor
+        for metadata in saved
+        for tensor in metadata.decode.cos._data["config"]["default"]
+    ]
+    addresses = [tensor.data_ptr() for tensor in saved_tensors]
+    replay_values = []
+    ordering = []
+
+    def replay():
+        ordering.append("replay")
+        replay_values.append([tensor.tolist() for tensor in saved_tensors])
+
+    graph = wrapper_module.AscendNPUGraphMetaData(
+        aclgraph=SimpleNamespace(replay=replay),
+        ubatch_metadata=[
+            SimpleNamespace(
+                context=SimpleNamespace(
+                    forward_context=SimpleNamespace(
+                        attn_metadata={"layer0": metadata, "layer1": metadata},
+                    ),
+                )
+            )
+            for metadata in saved
+        ],
+        outputs="output",
+    )
+    wrapper.cudagraphs[wrapper_module.AscendNPUGraphKey((2, 2), False, 0)] = graph
+    monkeypatch.setattr(
+        wrapper_module.torch.npu,
+        "current_stream",
+        lambda: SimpleNamespace(synchronize=lambda: ordering.append("sync")),
+    )
+    for first, second in (([5, 6], [10, 11]), ([7, 8], [12, 13])):
+        live = []
+        for values in (first, second):
+            metadata = _dsa_metadata(wrapper_module, shared, values)
+            rope_module.isolate_dsa_rope_metadata(metadata, None)
+            live.append({"layer0": metadata, "layer1": metadata})
+        context = SimpleNamespace(
+            ubatch_slices=_two_slices(2, 2),
+            cudagraph_runtime_mode=wrapper_module.CUDAGraphMode.FULL,
+            batch_descriptor=_batch_descriptor(4),
+            attn_metadata=live,
+        )
+        monkeypatch.setattr(
+            wrapper_module, "get_forward_context", lambda active=context: active
+        )
+        assert (
+            wrapper(
+                input_ids=None,
+                positions=None,
+                intermediate_tensors=None,
+                inputs_embeds=None,
+            )
+            == "output"
+        )
+        assert [tensor.data_ptr() for tensor in saved_tensors] == addresses
+    assert ordering == ["sync", "replay", "sync", "replay"]
+    assert replay_values == [
+        [[5, 6], [-5, -6], [10, 11], [-10, -11]],
+        [[7, 8], [-7, -8], [12, 13], [-12, -13]],
+    ]
+
+
+def test_dsa_rope_isolation_leaves_prefill_and_tensor_metadata_unchanged(monkeypatch):
+    _load_ubatch_wrapper_module(monkeypatch)
+    rope_module = importlib.import_module("afd_plugin.v1.worker.npu.dsa_rope")
+    prefill = SimpleNamespace(decode=None)
+    assert rope_module.isolate_dsa_rope_metadata(prefill, None) is None
+    cos = torch.tensor([5, 6])
+    metadata = SimpleNamespace(decode=SimpleNamespace(cos=cos), cos=cos)
+    assert rope_module.isolate_dsa_rope_metadata(metadata, None) is None
+    assert metadata.decode.cos is cos

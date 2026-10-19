@@ -104,6 +104,10 @@ from afd_plugin.v1.worker.attention_model_runner import (
     _full_cudagraph_padded_tokens,
     _resolve_world_ranks,
 )
+from afd_plugin.v1.worker.npu.dsa_rope import (
+    DSARopePair,
+    isolate_dsa_rope_metadata,
+)
 from afd_plugin.v1.worker.npu.npu_ubatch_wrapper import AscendUBatchWrapper
 from afd_plugin.v1.worker.npu.ubatch_utils import (
     check_enable_ubatch,
@@ -985,6 +989,21 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 decode_ratio_to_sas_metadata = builder.decode_ratio_to_sas_metadata
                 common_ratio_to_sas_metadata = builder.common_ratio_to_sas_metadata
 
+                # ### PATCH START: DSV4 stage-local decode RoPE
+                assert ubid is not None
+                stage_rope = isolate_dsa_rope_metadata(
+                    attn_metadata_i,
+                    dsa_rope_by_ubatch[ubid],
+                )
+                if stage_rope is not None:
+                    dsa_rope_by_ubatch[ubid] = stage_rope
+                    common_ratio_to_sas_metadata["cos"] = stage_rope[0]
+                    common_ratio_to_sas_metadata["sin"] = stage_rope[1]
+                    assert attn_metadata_i.decode is not None
+                    decode_ratio_to_sas_metadata["cos"] = attn_metadata_i.decode.cos
+                    decode_ratio_to_sas_metadata["sin"] = attn_metadata_i.decode.sin
+                # ### PATCH END: DSV4 stage-local decode RoPE
+
             # ### PATCH START: AFD per-ubatch metadata assignment
             assert ubid is not None
             attn_metadata_dict = attn_metadata[ubid]
@@ -998,6 +1017,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         dsa_ratio_metadata_by_ubatch = _new_ubatch_dsa_ratio_metadata(
             len(ubatch_slices),
         )
+        dsa_rope_by_ubatch: list[DSARopePair | None] = [None for _ in ubatch_slices]
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(
             self.kv_cache_config.kv_cache_groups,
@@ -1045,7 +1065,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     self.drafter,
                     AscendEagleProposer
                     | AscendDraftModelProposer
-                    | AscendDflashProposer
+                    | AscendDflashProposer,
                 ):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
@@ -1187,10 +1207,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         )
         if not (
             bool(self.vllm_config.parallel_config.use_ubatching)
-            and (
-                fixed_window_u2
-                or (allow_microbatching and not is_profile)
-            )
+            and (fixed_window_u2 or (allow_microbatching and not is_profile))
         ):
             try:
                 return super()._dummy_run(
@@ -2128,6 +2145,13 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             self._ensure_two_metadata_builders()
 
     def _ensure_two_metadata_builders(self) -> None:
+        if self.use_compress:
+            # vLLM configures its own logger tree, while afd_plugin can inherit
+            # the root WARNING level. Keep this one-time audit marker visible.
+            logger.warning(
+                "AFD DSA U2 RoPE isolation active: stage-local snapshots "
+                "and in-place graph replay refresh",
+            )
         for attn_groups in self.attn_groups:
             for attn_group in attn_groups:
                 if len(attn_group.metadata_builders) >= 2:
