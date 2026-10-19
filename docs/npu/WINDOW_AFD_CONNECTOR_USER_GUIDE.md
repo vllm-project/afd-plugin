@@ -15,10 +15,8 @@ The connector can run in either lock-step or asynchronous data-parallel mode:
 - `async=true`: each Attention rank is an independent session, and FFN batches
   whichever session/layer records are ready.
 
-This guide documents the code boundary merged at afd-plugin commit
-`57bcde14cc0da248bfcb8641476b8426811a64c5`. It is not a hardware-qualified
-launch recipe and does not establish accuracy or performance results. The
-published Atlas A5 A4F2 functional recipe continues to use
+This guide describes the Window data path on `feat/dsv4-afd`. The
+Atlas A5 A4F2 deployment recipe uses
 [`P2pHcclAFDConnector`](HCCL_P2P_CONNECTOR_USER_GUIDE.md).
 
 ## Runtime baseline
@@ -29,12 +27,18 @@ The implementation belongs to the pinned DeepSeek-V4 vLLM 0.23 source line:
 | --- | --- |
 | vLLM | `releases/v0.23.0`, `0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665` |
 | vLLM-Ascend | `rfc/vllm_cann`, `11ee45653b199a097805b87011824a81ffa51b95` |
-| afd-plugin | `feat/dsv4-afd-phase1-delivery`, `57bcde14cc0da248bfcb8641476b8426811a64c5` |
+| afd-plugin | `feat/dsv4-afd`; record the exact commit with `git rev-parse HEAD` |
 
 The runtime must provide compatible `torch_npu._afd` scheduling APIs,
 `cann_ops_transformer` Window operators, HCCL, and the MXFP kernels required by
 the model path. Record their exact versions in the image manifest and do not
 mix CANN installations.
+
+MXFP8 Window execution uses batching with `mx_output_uint8`, type-2 group
+lists in `DeviceOperator.npu_grouped_matmul_gmm2`, and
+`torch.ops._C_ascend.npu_swiglu_group_quant`. The multistream path uses
+`torch.npu.get_stream_limit`/`set_stream_limit` in eager mode and
+`torch.npu.npugraph_ex.scope.limit_core_num` during Graph capture.
 
 ## Architecture
 
@@ -95,12 +99,16 @@ For each Attention layer and Window slot:
    Window. An active mask distinguishes live rows from capacity padding.
 3. Each FFN rank calls the batching operator and receives only records for its
    local shared or routed experts.
-4. FFN converts the compact group list and runs the ready expert groups.
+4. FFN passes the type-2 group list directly to grouped matrix multiplication
+   and runs the ready expert groups.
 5. FFN publishes its output with the original session, slot, token, and expert
    offsets.
 6. Attention calls `npu_attention_worker_combine` and consumes the combined
    result before the same slot enters its dependent next-layer computation.
 
+`quant_mode=4` is the default: A2F stores FP8 E4M3FN hidden states and E8M0
+scales, one scale per 32 values. FFN consumes the quantized input directly;
+batching exposes E8M0 scale bytes as uint8 for Graph execution.
 `quant_mode=2` stores an INT8 hidden-state record plus one FP32 dynamic scale
 for A2F. `quant_mode=0` stores FP16/BF16 A2F records. F2A records retain the
 Attention continuation dtype.
@@ -161,9 +169,10 @@ published deployment topology:
     "num_attention_ranks": 8,
     "num_ffn_ranks": 16,
     "compute_gate_on_attention": true,
+      "window_ffn_multistream_enabled": true,
     "connector_extra_config": {
       "micro_batch_num": 2,
-      "quant_mode": 2
+      "quant_mode": 4
     }
   }
 }
@@ -172,6 +181,13 @@ published deployment topology:
 Use the same topology and connector options for FFN, changing only `role`.
 For each service, its AFD role-rank count must equal that service's vLLM data
 parallel size.
+
+`window_ffn_multistream_enabled` defaults to `true`. For async Window U2,
+Batching and expert compute run on the main stream while F2A runs on a side
+stream. Communication operators use separate core limits; expert compute keeps
+the full AIC budget. The three local pipeline slots are independent of the two
+protocol micro-batch slots. Set this field to `false` on FFN to use serial
+transactions; keep the same value in both roles' AFD configuration.
 
 ## Code-enforced limits
 
@@ -183,7 +199,7 @@ parallel size.
 | Gate | `compute_gate_on_attention=true` is required |
 | DP scheduling | `async` may be false or true |
 | Window slots | `micro_batch_num` is 1 or 2 and must match native DBO |
-| A2F quantization | `quant_mode` is 0 or 2 |
+| A2F quantization | `quant_mode` is 0, 2, or 4; default 4 |
 | Token capacity | `max_num_batched_tokens <= 512` on each role |
 | Routing | `num_experts_per_tok <= 16`; exactly one shared expert |
 | FFN layout | At least two FFN ranks: one shared plus routed ranks |
@@ -219,6 +235,11 @@ profiler is role-aware and defaults to rank 0 for both Attention and FFN. Set
 `AFD_NPU_FFN_PROFILER_RANKS` to a comma-separated non-negative rank list, or to
 `all`. Keep stack collection disabled for performance traces unless Python
 stacks are explicitly required.
+
+Profiling starts on an explicit vLLM profile request and stops on the matching
+stop request or runner shutdown. Setting the enable environment variable alone
+does not start a trace at worker construction. FFN continues processing utility
+requests while its workers run the connector loop.
 
 ## Startup and readiness
 

@@ -630,6 +630,27 @@ def _prepare_late_loaded_ffn_engine_core(
             scheduler_config.get_scheduler_cls = lambda: _AFDFFNNoopScheduler
 
 
+def _process_ffn_utility_requests(self, core_module: Any) -> None:
+    """Process control requests while FFN workers run the connector loop."""
+    supported_types = {
+        core_module.EngineCoreRequestType.UTILITY,
+        core_module.EngineCoreRequestType.WAKEUP,
+        core_module.EngineCoreRequestType.EXECUTOR_FAILED,
+    }
+    while True:
+        try:
+            request = self.input_queue.get_nowait()
+        except queue.Empty:
+            return
+        if request[0] not in supported_types:
+            core_module.logger.warning(
+                "Ignoring unsupported AFD FFN EngineCore request: %s",
+                request[0],
+            )
+            continue
+        self._handle_client_request(*request)
+
+
 def _run_ffn_busy_loop(self, core_module: Any) -> None:
     core_module.logger.info("AFD FFN EngineCore started; workers run connector loop.")
 
@@ -638,6 +659,7 @@ def _run_ffn_busy_loop(self, core_module: Any) -> None:
         self.model_executor.collective_rpc("start_ffn_server_loop")
         started = True
         while _is_running(self, core_module):
+            _process_ffn_utility_requests(self, core_module)
             self.model_executor.collective_rpc("raise_ffn_loop_error_if_any")
             time.sleep(0.5)
     except KeyboardInterrupt:

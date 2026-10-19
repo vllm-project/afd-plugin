@@ -33,11 +33,10 @@ HCCL_IF_BASE_PORT="${ATTENTION_HCCL_IF_BASE_PORT:-51000}"
 HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-1024}"
 DBO_DECODE_TOKEN_THRESHOLD="${DBO_DECODE_TOKEN_THRESHOLD:-2}"
 DBO_PREFILL_TOKEN_THRESHOLD="${DBO_PREFILL_TOKEN_THRESHOLD:-12}"
-MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-8}"
-CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-1 2 4 8}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 VLLM_BIN="${VLLM_BIN:-vllm}"
 
+configure_dspark
 preflight_role
 
 ADDITIONAL_CONFIG="$(printf '{"afd":{"role":"attention","connector":"P2pHcclAFDConnector","host":"%s","port":%s,"num_attention_ranks":%s,"num_ffn_ranks":%s}}' "$AFD_HOST" "$AFD_PORT" "$ATTENTION_RANKS" "$FFN_RANKS")"
@@ -51,16 +50,6 @@ if [[ "${ENABLE_PD:-0}" == 1 ]]; then
   printf '[dsv4-afd] A5 Attention Mooncake KV config=%s\n' "$KV_CONFIG"
   PD_ARGS=(--kv-transfer-config "$KV_CONFIG")
 fi
-DSPARK_ARGS=()
-if [[ "${ENABLE_DSPARK:-0}" == 1 ]]; then
-  DSPARK_BLOCK_SIZE="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["dspark_block_size"])' "$MODEL_PATH/config.json")"
-  [[ "$DSPARK_BLOCK_SIZE" =~ ^[1-9][0-9]*$ ]] \
-    || afd_die "MODEL_PATH must be a DSpark checkpoint with dspark_block_size"
-  # The pinned vLLM 0.23 schema exposes DSpark through the MTP method. The
-  # Ascend runtime selects AscendDSparkProposer from the checkpoint marker.
-  DSPARK_CONFIG="$(printf '{"method":"mtp","num_speculative_tokens":%s,"draft_sample_method":"greedy","enforce_eager":true}' "$DSPARK_BLOCK_SIZE")"
-  DSPARK_ARGS=(--speculative-config "$DSPARK_CONFIG")
-fi
 
 run_role_service "$VLLM_BIN" serve "$MODEL_PATH" \
   --host "$API_HOST" \
@@ -70,8 +59,8 @@ run_role_service "$VLLM_BIN" serve "$MODEL_PATH" \
   --max-model-len "$MAX_MODEL_LEN" \
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
   --max-num-seqs "$MAX_NUM_SEQS" \
-  --data-parallel-size "$ATTENTION_RANKS" \
-  --tensor-parallel-size 1 \
+  --data-parallel-size "$ROLE_DP_SIZE" \
+  --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" \
   --all2all-backend flashinfer_all2allv \
   --enable-expert-parallel \
   --seed 1024 \

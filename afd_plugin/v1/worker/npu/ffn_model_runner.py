@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -30,6 +32,7 @@ from afd_plugin.compat.npu.profiler import (
 )
 from afd_plugin.config import AFDConfig, parse_afd_config
 from afd_plugin.connectors import (
+    AFDA2FTransferPayload,
     AFDConnectorFactory,
     AFDControlPayload,
     AFDDPMetadata,
@@ -41,7 +44,7 @@ from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
 )
-from afd_plugin.connectors.npu.p2p_hccl import P2pHcclAFDConnector
+from afd_plugin.connectors.npu.p2p_hccl import HCCLMTPHeader, P2pHcclAFDConnector
 from afd_plugin.v1.worker.attention_model_runner import (
     _resolve_world_ranks,
 )
@@ -63,10 +66,37 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# A5 Window Batching and F2A can deadlock when they wait concurrently on
-# different streams.  Keep the implementation available for later core
-# partitioning, but run the FFN Window transaction on one stream for now.
-_WINDOW_FFN_MULTISTREAM_ENABLED = False
+_WINDOW_FFN_PIPELINE_DEPTH = 3
+_WINDOW_BATCHING_AIC_NUM = 32
+_WINDOW_BATCHING_AIV_NUM = 16
+_WINDOW_F2A_AIC_NUM = 32
+_WINDOW_F2A_AIV_NUM = 48
+
+
+@contextmanager
+def _limit_window_ffn_operator_cores(
+    stream: torch.npu.Stream,
+    *,
+    graph_capturing: bool,
+    aic_num: int,
+    aiv_num: int,
+) -> Iterator[None]:
+    """Limit one Window communication operator in eager or NPUGraph capture."""
+    if graph_capturing:
+        with torch.npu.npugraph_ex.scope.limit_core_num(aic_num, aiv_num):
+            yield
+        return
+
+    original_limits = torch.npu.get_stream_limit(stream)
+    torch.npu.set_stream_limit(stream, cube_num=aic_num, vector_num=aiv_num)
+    try:
+        yield
+    finally:
+        torch.npu.set_stream_limit(
+            stream,
+            cube_num=original_limits["cube_core_num"],
+            vector_num=original_limits["vector_core_num"],
+        )
 
 
 class AFDNPUFFNModelRunner(NPUModelRunner):
@@ -99,6 +129,15 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             getattr(self.connector, "is_window_connector", False)
             and self.ffn_stream_overlap_enabled
         )
+        self.window_ffn_multistream_enabled = bool(
+            self.window_ffn_stream_overlap_enabled
+            and self.afd_config.window_ffn_multistream_enabled
+        )
+        if getattr(self.connector, "is_window_connector", False):
+            logger.info(
+                "Window FFN two-stream pipeline: enabled=%s",
+                self.window_ffn_multistream_enabled,
+            )
         self.ffn_recv_stream = None
         self.ffn_compute_stream = None
         self.ffn_send_stream = None
@@ -112,6 +151,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         if self.ffn_stream_overlap_enabled:
             self._initialize_ffn_stream_pipeline(device)
         self.use_aclgraph = _use_npu_aclgraph(vllm_config, self)
+        self._initialize_mtp_graph_sizes()
         self._acl_graphs: dict[tuple, dict[str, Any]] = {}
         self._mtp_acl_graphs: dict[tuple, dict[str, Any]] = {}
         self._window_ffn_acl_graph: dict[str, Any] | None = None
@@ -119,7 +159,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self.graph_pool = (
             current_platform.get_global_graph_pool() if self.use_aclgraph else None
         )
-        self.prof = create_afd_npu_profiler("ffn", role_rank=rank)
+        self._profiler_rank = rank
+        self.prof = None
         self._is_shutdown = False
         self._ffn_input_ids_cache: dict[int, torch.Tensor] = {}
         self.mtp_ffn_model: torch.nn.Module | None = None
@@ -130,7 +171,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self.ffn_compute_stream = torch.npu.Stream(device=device)
         self.ffn_send_stream = torch.npu.Stream(device=device)
         if self.window_ffn_stream_overlap_enabled:
-            slot_num = int(self.vllm_config.parallel_config.num_ubatches)
+            slot_num = _WINDOW_FFN_PIPELINE_DEPTH
             self.window_ffn_compute_events = [
                 torch.npu.Event() for _ in range(slot_num)
             ]
@@ -155,6 +196,17 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
 
     def initialize_afd_connector(self) -> None:
         self.connector.init_afd_connector()
+
+    def start_afd_profiler(self) -> None:
+        """Start the FFN profiler after the connector service is ready."""
+        if self.prof is None:
+            self.prof = create_afd_npu_profiler(
+                "ffn", role_rank=self._profiler_rank
+            )
+
+    def stop_afd_profiler(self) -> None:
+        stop_afd_npu_profiler(self.prof)
+        self.prof = None
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}
@@ -329,16 +381,21 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
 
     def _window_ffn_forward_async(self) -> None:
         """Batch ready Attention sessions and compute their active layers."""
-        if (
-            not _WINDOW_FFN_MULTISTREAM_ENABLED
-            or not self.window_ffn_stream_overlap_enabled
-        ):
-            if self.use_aclgraph:
-                self._run_window_ffn_graph()
-            else:
-                self._run_window_ffn_transaction()
-            return
+        if self.use_aclgraph:
+            self._run_window_ffn_graph()
+        elif self.window_ffn_multistream_enabled:
+            self._run_window_ffn_multistream_transaction(
+                graph_capturing=False,
+            )
+        else:
+            self._run_window_ffn_transaction(graph_capturing=False)
 
+    def _run_window_ffn_multistream_transaction(
+        self,
+        *,
+        graph_capturing: bool,
+    ) -> tuple[AFDA2FTransferPayload, torch.Tensor]:
+        """Run Batching and compute on the main stream, then F2A separately."""
         assert self.ffn_send_stream is not None
         slot_num = len(self.window_ffn_compute_events)
         if slot_num == 0:
@@ -352,15 +409,22 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         send_event = self.window_ffn_send_events[slot]
 
         # Match the reference execution model: Batching, metadata conversion,
-        # and FFN compute are serial on the caller's current stream.  Only F2A
-        # uses a side stream, so this path needs no host synchronization.
+        # and FFN compute are serial on the caller's current stream. Only F2A
+        # uses a side stream. Core limits apply only to the communication ops;
+        # expert compute retains the full AIC budget.
         compute_stream = torch.npu.current_stream()
         if round_index >= slot_num:
             send_event.wait(compute_stream)
-        payload = self.connector.recv_attn_output(
-            ubatch_idx=0,
-            max_num_tokens=self.max_num_tokens,
-        )
+        with _limit_window_ffn_operator_cores(
+            compute_stream,
+            graph_capturing=graph_capturing,
+            aic_num=_WINDOW_BATCHING_AIC_NUM,
+            aiv_num=_WINDOW_BATCHING_AIV_NUM,
+        ):
+            payload = self.connector.recv_attn_output(
+                ubatch_idx=0,
+                max_num_tokens=self.max_num_tokens,
+            )
         full_output = self._compute_window_async_batch(payload)
         compute_event.record(compute_stream)
 
@@ -368,17 +432,40 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             compute_event.wait(self.ffn_send_stream)
             _record_window_payload_stream(payload, self.ffn_send_stream)
             _record_npu_stream(full_output, self.ffn_send_stream)
-            self.connector.send_ffn_output(
-                full_output,
-                payload.context,
-                ubatch_idx=0,
-            )
+            with _limit_window_ffn_operator_cores(
+                self.ffn_send_stream,
+                graph_capturing=graph_capturing,
+                aic_num=_WINDOW_F2A_AIC_NUM,
+                aiv_num=_WINDOW_F2A_AIV_NUM,
+            ):
+                self.connector.send_ffn_output(
+                    full_output,
+                    payload.context,
+                    ubatch_idx=0,
+                )
             send_event.record(self.ffn_send_stream)
+        return payload, full_output
 
     def _run_window_ffn_transaction(
         self,
-    ) -> tuple[AFDA2FTransferPayload, torch.Tensor]:
-        """Run one complete single-stream Window FFN transaction."""
+        *,
+        graph_capturing: bool,
+    ) -> list[tuple[AFDA2FTransferPayload, torch.Tensor]]:
+        """Run a serial transaction or one closed two-stream pipeline."""
+        if self.window_ffn_multistream_enabled:
+            # Local pipeline slots are independent of protocol micro-batches.
+            # Reset before warmup/capture so neither phase consumes stale events.
+            self.window_ffn_round_index = 0
+            retained = [
+                self._run_window_ffn_multistream_transaction(
+                    graph_capturing=graph_capturing,
+                )
+                for _ in range(_WINDOW_FFN_PIPELINE_DEPTH)
+            ]
+            assert self.ffn_send_stream is not None
+            torch.npu.current_stream().wait_stream(self.ffn_send_stream)
+            return retained
+
         payload = self.connector.recv_attn_output(
             ubatch_idx=0,
             max_num_tokens=self.max_num_tokens,
@@ -389,31 +476,35 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             payload.context,
             ubatch_idx=0,
         )
-        return payload, full_output
+        return [(payload, full_output)]
 
     def _run_window_ffn_graph(self) -> None:
-        """Warm, capture, or replay one complete Window FFN transaction."""
+        """Warm, capture, or replay one complete Window FFN pipeline."""
         graph_info = self._window_ffn_acl_graph
         if graph_info is not None:
             graph_info["graph"].replay()
             return
 
         if not self._window_ffn_graph_warmed_up:
-            self._run_window_ffn_transaction()
+            self._run_window_ffn_transaction(graph_capturing=False)
             self._window_ffn_graph_warmed_up = True
             return
 
         graph = torch.npu.NPUGraph()
-        retained: tuple[AFDA2FTransferPayload, torch.Tensor] | None = None
+        retained: list[tuple[AFDA2FTransferPayload, torch.Tensor]] | None = None
         set_cudagraph_capturing_enabled(True)
         try:
-            with graph_capture(device=self.device):
-                with torch.npu.graph(graph, pool=self.graph_pool):
-                    retained = self._run_window_ffn_transaction()
+            with (
+                graph_capture(device=self.device),
+                torch.npu.graph(graph, pool=self.graph_pool),
+            ):
+                retained = self._run_window_ffn_transaction(
+                    graph_capturing=True,
+                )
         finally:
             set_cudagraph_capturing_enabled(False)
 
-        if retained is None:
+        if not retained:
             raise RuntimeError("Window FFN ACLGraph capture produced no outputs")
         # Keep every graph-owned output alive. Batching produces the routing
         # tensors consumed by global FFN compute and F2A inside this graph.
@@ -421,7 +512,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             "graph": graph,
             "retained": retained,
         }
-        logger.info("Captured complete Window FFN ACLGraph")
+        logger.info("Captured Window FFN ACLGraph: transactions=%d", len(retained))
 
     def _compute_window_async_batch(
         self,
@@ -439,7 +530,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         return self.model.compute_window_global_ffn_output(
             hidden_states=payload.hidden_states,
             group_list=states.group_list,
-            actual_token_num=states.actual_token_num,
+            dynamic_scale=states.dynamic_scale,
         )
 
     def _compute_window_ffn_layer(
@@ -573,7 +664,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         ):
             self._replay_mtp_graph(dp_metadata_list)
             return
-        self._mtp_ffn_forward(
+        self._mtp_ffn_forward_sequence(
             sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
         )
 
@@ -669,6 +760,21 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             and speculative_config is not None
             and getattr(speculative_config, "method", None) == "mtp"
             and not bool(getattr(speculative_config, "enforce_eager", False))
+        )
+
+    def _initialize_mtp_graph_sizes(self) -> None:
+        if not self._draft_uses_aclgraph():
+            return
+        # FFN skips Attention's KV/backend initialization, where the pinned
+        # upstream resolves capture sizes to multiples of N+1. Use the same
+        # resolver before padding draft peer layouts (N=2 maps [1,2,4,8] to
+        # [3,6], so rounding six tokens to the original eight corrupts HCCL).
+        self.compilation_config.adjust_cudagraph_sizes_for_spec_decode(
+            self.uniform_decode_query_len,
+            self.parallel_config.tensor_parallel_size,
+        )
+        self.cudagraph_batch_sizes = sorted(
+            self.compilation_config.cudagraph_capture_sizes,
         )
 
     def _make_mtp_graph_key(
@@ -1112,16 +1218,28 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             input_ids_cache.clear()
         return rank_ffn_output
 
+    def _mtp_ffn_forward_sequence(self, stage_ids: list[int]) -> None:
+        """Service every draft iteration before receiving target control again."""
+        speculative_config = self.vllm_config.speculative_config
+        if speculative_config is None or not self._requires_afd_mtp():
+            return
+        for speculative_step in range(speculative_config.num_speculative_tokens):
+            # Graph-capable drafts use a static wire step even on eager fallback.
+            self._mtp_ffn_forward(
+                stage_ids,
+                expected_speculative_step=(
+                    speculative_step if speculative_config.enforce_eager else 0
+                ),
+            )
+
     def _mtp_ffn_forward(
         self,
         stage_ids: list[int],
         *,
-        header: Any | None = None,
+        header: HCCLMTPHeader | None = None,
+        expected_speculative_step: int | None = None,
     ) -> torch.Tensor | None:
-        if (
-            self.vllm_config.speculative_config is None
-            or not self._requires_afd_mtp()
-        ):
+        if self.vllm_config.speculative_config is None or not self._requires_afd_mtp():
             return None
         if stage_ids not in ([0], [0, 1]):
             raise RuntimeError(
@@ -1131,10 +1249,18 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             raise RuntimeError("DSV4 AFD MTP FFN model is not loaded")
 
         # The target decoder may run U2, but the upstream proposer consumes the
-        # merged target output and executes one full-batch MTP phase.
+        # merged target output and executes a full-batch exchange per iteration.
         stage_idx = 0
         if header is None:
             header = self.connector.recv_mtp_header(stage_idx=stage_idx)
+        if (
+            expected_speculative_step is not None
+            and header.speculative_step != expected_speculative_step
+        ):
+            raise RuntimeError(
+                "DSV4 AFD FFN received an out-of-order MTP step: "
+                f"expected={expected_speculative_step}, got={header.speculative_step}"
+            )
         payload = self.connector.recv_attn_output(
             ubatch_idx=stage_idx,
             layer_idx=0,
@@ -1143,7 +1269,10 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             num_tokens=header.num_tokens,
         )
         metadata = payload.context.metadata
-        if metadata.phase != "mtp" or metadata.speculative_step != 0:
+        if (
+            metadata.phase != "mtp"
+            or metadata.speculative_step != header.speculative_step
+        ):
             raise RuntimeError("DSV4 AFD FFN received an invalid MTP phase")
 
         afd_metadata = AFDForwardContextMetadata(
@@ -1292,7 +1421,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 )
                 # Warmup remains end-to-end; only the actual target capture
                 # omits the eager draft phase.
-                self._mtp_ffn_forward(stage_ids)
+                self._mtp_ffn_forward_sequence(stage_ids)
             else:
                 with graph_capture(device=self.device):
                     self._capture_graphs(
@@ -1319,7 +1448,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self,
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
     ) -> None:
-        """Capture the merged MTP phase after the target decoder graph."""
+        """Capture all full-batch draft exchanges in one replayable graph."""
 
         graph_key = self._make_mtp_graph_key(dp_metadata_list)
         existing = self._mtp_acl_graphs.get(graph_key)
@@ -1331,11 +1460,14 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         graph = torch.npu.NPUGraph()
         logger.debug("AFD NPU FFN capturing MTP ACL graph for key=%s", graph_key)
         with torch.npu.graph(graph, pool=self.graph_pool):
-            header = self.connector.recv_mtp_header_for_graph(
-                stage_idx=0,
-                attention_peer_counts=peer_layout,
-            )
-            output = self._mtp_ffn_forward([0], header=header)
+            for _ in range(self.vllm_config.speculative_config.num_speculative_tokens):
+                header = self.connector.recv_mtp_header_for_graph(
+                    stage_idx=0,
+                    attention_peer_counts=peer_layout,
+                )
+                output = self._mtp_ffn_forward(
+                    [0], header=header, expected_speculative_step=0
+                )
         self._mtp_acl_graphs[graph_key] = {
             "graph": graph,
             "output": output,
@@ -1392,7 +1524,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
     def shutdown(self) -> None:
         if self._is_shutdown:
             return
-        stop_afd_npu_profiler(self.prof)
+        self.stop_afd_profiler()
         if self.connector.is_initialized:
             self.connector.close()
         super().shutdown()

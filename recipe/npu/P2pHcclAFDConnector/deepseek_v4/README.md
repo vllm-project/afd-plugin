@@ -1,8 +1,8 @@
-# DeepSeek-V4 A5 A4F2 HCCL P2P Recipe
+# DeepSeek-V4 A5 HCCL P2P Recipe
 
 This recipe launches a standalone DeepSeek-V4 Attention/FFN disaggregated
-service on one eight-device Atlas A5 host. It uses
-`P2pHcclAFDConnector`, vLLM 0.23, TP1, and an A4F2 topology:
+service with `P2pHcclAFDConnector` and vLLM 0.23. The default is TP1 and
+A4F2 on one eight-device Atlas A5 host:
 
 ```text
 client -> Attention API (DP4, NPU 0-3) -> FFN workers (DP2, NPU 4-5)
@@ -59,6 +59,26 @@ export TENSOR_PARALLEL_SIZE=1
 Replace the example NIC and IP with values visible inside the runtime
 namespace. The preflight rejects an IP that is not assigned to `NIC_NAME`.
 
+`ATTENTION_RANKS` and `FFN_RANKS` count physical devices, including TP workers.
+Each role's DP size is its rank count divided by `TENSOR_PARALLEL_SIZE`; use
+the same TP size on both roles. The launchers support TP1 and TP2, with equal
+A/F rank counts for TP2 and an integer rank-count ratio for TP1. Each role
+uses 1–8 local devices. Match device lists to those counts and use disjoint
+lists when A/F share a host.
+
+For A4F4 on one host, change both launch shells to:
+
+```bash
+export ATTENTION_RANKS=4 FFN_RANKS=4
+export ATTENTION_DEVICES=0,1,2,3 FFN_DEVICES=4,5,6,7
+export TENSOR_PARALLEL_SIZE=1   # A DP4, F DP4
+# Or use TENSOR_PARALLEL_SIZE=2 for A DP2/TP2, F DP2/TP2.
+```
+
+For A4F8/TP1, use separate A/F hosts with eight devices listed on F. Set
+`ATTENTION_HOST_IP` and `FFN_HOST_IP` consistently in both shells and set
+`AFD_HOST="$FFN_HOST_IP"`.
+
 Role defaults:
 
 | Setting | Attention | FFN |
@@ -110,12 +130,34 @@ The scripts then enable DBO, set decode/prefill thresholds to 2/12, select
 `FULL_DECODE_ONLY`, and enable the Graph/U2 compute, hybrid DAG,
 Attention three-stream, FFN receive-stream, and FFN cross-layer paths. Override
 capture sizes only when the replacement list has been validated with the same
-image and workload:
+image and workload. By default, the scripts derive sizes from `MAX_NUM_SEQS`
+and the active speculative configuration:
 
 ```bash
-export MAX_CUDAGRAPH_CAPTURE_SIZE=8
-export CUDAGRAPH_CAPTURE_SIZES='1 2 4 8'
+unset MAX_CUDAGRAPH_CAPTURE_SIZE CUDAGRAPH_CAPTURE_SIZES
+export MAX_NUM_SEQS=24
 ```
+
+Attention defaults for this batch limit:
+
+| Decode configuration | Graph max (tokens per DP rank) | Capture sizes |
+| --- | ---: | --- |
+| DSpark off | 24 | `1 2 4 8 16 24` |
+| DSpark on, checkpoint block size 5 | 144 | `6 12 24 48 96 144` |
+
+Dispatch compares the token count before U2 splitting. DSpark covers up to
+`MAX_NUM_SEQS × (dspark_block_size + 1)` tokens. Explicit capture overrides
+must cover this bound, include the exact full Decode shape, end at the declared
+maximum, fit the role's batched-token budget, and use a maximum divisible by
+the decode query length. A list without an explicit maximum supplies its own
+maximum. Default buckets grow by powers of two and include the exact bound.
+
+FFN runs without a speculative configuration. Its default CLI capture sizes
+follow its own `MAX_NUM_SEQS`; remote FFN graphs follow Attention's capture
+metadata. Size FFN's token buffers for the A/F aggregation and speculative
+shapes. For A4F2/TP1 with A BS24, start F with `MAX_NUM_SEQS=48` and its
+8192-token budget. Leave capture overrides unset in each role shell for
+automatic defaults.
 
 Start the roles with the same back-to-back commands used for eager mode.
 
@@ -162,12 +204,12 @@ until curl -fsS --max-time 10 http://127.0.0.1:8910/v1/models \
 done
 ```
 
-FFN has no HTTP readiness endpoint. Require both FFN ranks to enter the
+FFN has no HTTP readiness endpoint. Require all FFN DP engines to enter the
 connector loop:
 
 ```bash
 test "$(grep -c 'AFD FFN EngineCore started; workers run connector loop.' \
-  /logs/dsv4-afd/ffn.log)" -ge 2
+  /logs/dsv4-afd/ffn.log)" -ge "$((FFN_RANKS / TENSOR_PARALLEL_SIZE))"
 ```
 
 Then send requests only to Attention:
@@ -183,8 +225,9 @@ curl -fsS http://127.0.0.1:8910/v1/chat/completions \
   }'
 ```
 
-For functional acceptance, run batch sizes 1, 8, and 32, cancel an in-flight
-request, verify a subsequent request succeeds, and confirm a Graph/U2 run
+For functional acceptance, configure `MAX_NUM_SEQS=32`, run batch sizes 1, 8,
+and 32, cancel an in-flight request, verify a subsequent request succeeds,
+and confirm a Graph/U2 run
 records real stage 0 and stage 1 execution. These checks do not replace a
 separate golden-output or performance evaluation.
 
@@ -338,6 +381,13 @@ the Mooncake KV port ranges, HCCL base ports (`50000/51000/52000` by default),
 and AFD port reachable on the required interfaces. FFN's `8911` port is not a
 health endpoint.
 
+These are example topologies. Prefill uses `PREFILL_DP_SIZE × PREFILL_TP_SIZE`
+physical devices. The generated Mooncake configuration records the actual
+P DP/TP and A DP/TP, with Prefill TP at least Attention TP. For example,
+A4F4/TP2 uses A DP2/TP2 and F DP2/TP2; a separate four-device Prefill host
+can use `PREFILL_DP_SIZE=2 PREFILL_TP_SIZE=2` and `PREFILL_DEVICES=0,1,2,3`.
+Set topology variables consistently on all role shells.
+
 ### Manual start and stop
 
 Set the case's execution variables and start each role from a fresh shell.
@@ -371,7 +421,8 @@ echo $! >"$RUN_ROOT/proxy.pid"
 On three hosts, run only the role assigned to each host; start the proxy on a
 host that can reach both APIs. The FFN role always runs with `ENABLE_PD=0` and
 `ENABLE_DSPARK=0`. Attention is the Mooncake KV consumer and the sole DSpark
-drafter. Check Prefill and Attention `/health`, then require two FFN
+drafter. Check Prefill and Attention `/health`, then require
+`FFN_RANKS / TENSOR_PARALLEL_SIZE` FFN
 connector-loop log markers. Send validation traffic through proxy port 9000.
 To stop, stop sending new requests, let active requests drain, and stop Proxy.
 Then terminate Attention and wait for FFN's shutdown marker before stopping
@@ -380,7 +431,7 @@ FFN and Prefill. On each host, use the PID files for its local roles:
 ```bash
 kill -TERM "$(cat "$RUN_ROOT/proxy.pid")"
 kill -TERM "$(cat "$RUN_ROOT/attention.pid")"
-# Wait for both FFN ranks to log the shutdown payload before stopping FFN.
+# Wait for all FFN ranks to log the shutdown payload before stopping FFN.
 grep 'AFD NPU FFN received Attention shutdown payload' "$RUN_ROOT/ffn.log"
 kill -TERM "$(cat "$RUN_ROOT/ffn.pid")"
 kill -TERM "$(cat "$RUN_ROOT/prefill.pid")"
@@ -425,6 +476,15 @@ Run these CPU unit tests from the repository root in a Python environment with
 
 These tests cover DSpark scheduling, KV layouts and request tracking, MXFP
 routing, Graph/U2 and RoPE state, role configuration, and Proxy error handling.
+
+With the pinned vLLM/vLLM-Ascend runtime installed, also run the MTP runner
+and model construction regressions:
+
+```bash
+"$PYTHON_BIN" -m pytest \
+  tests/unit/v1/worker/test_npu_runtime.py \
+  tests/unit/model_executor/models/test_deepseek_v4_construction.py
+```
 
 ### Accuracy evaluation
 

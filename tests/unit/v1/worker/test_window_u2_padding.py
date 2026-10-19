@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+from collections import namedtuple
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -32,11 +33,35 @@ def runner():
         for node in runner_class.body
         if isinstance(node, ast.FunctionDef)
         and node.name
-        in {"_uses_fixed_window_u2", "_prepare_fixed_window_u2_dummy_padding"}
+        in {
+            "_uses_fixed_window_u2",
+            "_prepare_fixed_window_u2_dummy_padding",
+            "_build_attention_metadata",
+        }
     ]
-    namespace = {"CUDAGraphMode": SimpleNamespace(NONE="none")}
+    namespace = {
+        "CUDAGraphMode": SimpleNamespace(NONE="none"),
+        "np": np,
+        "UBatchSlice": namedtuple("UBatchSlice", "request_slice token_slice"),
+    }
+    helpers_path = path.with_name("ubatch_utils.py")
+    helpers = [
+        node
+        for node in ast.parse(helpers_path.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name == "create_ubatch_slices"
+    ]
+    future = ast.ImportFrom(
+        module="__future__", names=[ast.alias(name="annotations")], level=0
+    )
     exec(
-        compile(ast.Module(body=methods, type_ignores=[]), str(path), "exec"), namespace
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(body=[future, *helpers, *methods], type_ignores=[])
+            ),
+            str(path),
+            "exec",
+        ),
+        namespace,
     )
     runner_type = type(
         "PaddingRunner",
@@ -61,7 +86,31 @@ def runner():
         num_prompt_tokens_cpu_tensor=torch.full((8,), 99),
     )
     instance._pad_query_start_loc_for_fia = Mock(return_value=2)
+    instance.speculative_config = None
+    instance.afd_async_extra_info = SimpleNamespace(async_moe_ubatching=False)
+    instance._build_afd_metadata = Mock(return_value=None)
+    instance._build_attention_metadata_with_ubatches = Mock(
+        side_effect=lambda **kwargs: kwargs
+    )
     return instance
+
+
+@pytest.mark.parametrize("live_requests", [1, 3])
+def test_window_u2_slices_include_the_padded_request(runner, live_requests):
+    capacity = live_requests + 1
+    runner.query_start_loc.np[: live_requests + 1] = np.arange(live_requests + 1)
+    result = runner._build_attention_metadata(
+        num_tokens=live_requests,
+        num_reqs=live_requests,
+        max_query_len=1,
+        num_tokens_padded=capacity,
+        num_reqs_padded=capacity,
+        ubatch_slices=[SimpleNamespace(token_slice=slice(0, live_requests))],
+    )
+    first, second = result["ubatch_slices"]
+    assert first.token_slice == first.request_slice == slice(0, capacity // 2)
+    assert second.token_slice == second.request_slice == slice(capacity // 2, capacity)
+    assert runner.query_start_loc.np[capacity] == capacity
 
 
 @pytest.mark.parametrize(

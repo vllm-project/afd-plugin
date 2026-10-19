@@ -1525,6 +1525,49 @@ def test_npu_attention_eager_draft_gets_phase_boundary_wrapper():
     assert runner.drafter._runnable._runnable is eager_runnable
 
 
+@pytest.mark.parametrize(
+    ("live_proposal", "online_dummy"),
+    [(True, False), (False, True), (False, False)],
+)
+def test_npu_attention_eager_draft_announces_phase_before_all_iterations(
+    monkeypatch, live_proposal, online_dummy
+):
+    from vllm.config import CUDAGraphMode
+
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    runner = _new_attention_runner()
+    runner.speculative_config = _mtp_speculative_config(num_speculative_tokens=3)
+    runner._afd_in_mtp_proposal = live_proposal
+    runner._afd_live_dummy_execution = online_dummy
+    calls = []
+    runner.connector = SimpleNamespace(
+        control_plane=SimpleNamespace(
+            send_mtp_phase_ready=lambda **kwargs: calls.append(
+                ("ready", kwargs["graph_replay"])
+            )
+        )
+    )
+
+    def eager_runnable():
+        for step in range(3):
+            calls.append(("draft", step))
+
+    runner.drafter = SimpleNamespace(_runnable=eager_runnable)
+    # A target graph mode must not make the eager callable look like a graph.
+    monkeypatch.setattr(
+        attention_model_runner,
+        "get_forward_context",
+        lambda: SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL),
+    )
+
+    runner._configure_mtp_draft_graph()
+    runner.drafter._runnable()
+
+    expected = [("ready", False)] if live_proposal or online_dummy else []
+    assert calls == expected + [("draft", 0), ("draft", 1), ("draft", 2)]
+
+
 @pytest.mark.parametrize("online_dummy", [False, True])
 def test_npu_attention_announces_only_executed_live_mtp_phase(
     monkeypatch, online_dummy
@@ -1937,6 +1980,189 @@ def test_npu_ffn_runner_executes_all_configured_mtp_steps(monkeypatch):
     runner._execute_mtp_after_target({0: _FakeDPMetadata([8])})
 
     assert calls == [((0,), 0), ((0,), 1), ((0,), 2)]
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3])
+@pytest.mark.parametrize("num_stages", [1, 2])
+@pytest.mark.parametrize("draft_enforce_eager", [True, False])
+@pytest.mark.parametrize("run_mode", ["eager", "target_replay", "warmup"])
+def test_npu_ffn_runner_services_complete_mtp_sequence(
+    monkeypatch, num_speculative_tokens, num_stages, draft_enforce_eager, run_mode
+):
+    _patch_ffn_forward_context(monkeypatch)
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        connector="P2pHcclAFDConnector",
+        speculative_config=_mtp_speculative_config(
+            enforce_eager=draft_enforce_eager,
+            num_speculative_tokens=num_speculative_tokens,
+        ),
+        use_ubatching=num_stages == 2,
+        num_ubatches=num_stages,
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.model = _FakeModel()
+    runner.mtp_ffn_model = _FakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 3
+    runner.use_aclgraph = run_mode != "eager"
+    runner._acl_graphs = {}
+    dp_metadata = {
+        stage_idx: _FakeDPMetadata([stage_idx + 1]) for stage_idx in range(num_stages)
+    }
+    total_tokens = sum(stage_idx + 1 for stage_idx in range(num_stages))
+    expected_outputs = []
+    target_graph = _FakeGraph()
+    if run_mode == "target_replay":
+        runner._acl_graphs[runner._make_graph_key(dp_metadata)] = {
+            "graph": target_graph,
+        }
+    else:
+        for stage_idx in range(num_stages):
+            metadata = AFDTransferMetadata.create_attention_metadata(
+                layer_idx=0, stage_idx=stage_idx, seq_len=stage_idx + 1
+            )
+            runner.connector.attn_outputs.append((f"decoder-{stage_idx}", metadata))
+            expected_outputs.append(metadata)
+
+    steps = [
+        step if draft_enforce_eager else 0 for step in range(num_speculative_tokens)
+    ]
+    for iteration, step in enumerate(steps):
+        metadata = AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=0,
+            seq_len=total_tokens,
+            phase="mtp",
+            speculative_step=step,
+        )
+        runner.connector.attn_outputs.append((f"draft-{iteration}", metadata))
+        expected_outputs.append(metadata)
+    received_headers = []
+
+    def recv_mtp_header(*, stage_idx):
+        # Each reply must finish before the next header, and all target replies
+        # precede the draft phase. This also checks U2 merges back to stage 0.
+        target_outputs = 0 if run_mode == "target_replay" else num_stages
+        assert len(runner.connector.ffn_outputs) == target_outputs + len(
+            received_headers
+        )
+        assert stage_idx == 0
+        step = steps[len(received_headers)]
+        received_headers.append(step)
+        return SimpleNamespace(
+            num_tokens=total_tokens,
+            speculative_step=step,
+            num_tokens_across_dp=torch.tensor([total_tokens], dtype=torch.int32),
+        )
+
+    runner.connector.recv_mtp_header = recv_mtp_header
+    if run_mode == "warmup":
+        monkeypatch.setattr(ffn_model_runner.torch.npu, "mem_get_info", lambda: (0, 0))
+        monkeypatch.setattr(
+            ffn_model_runner, "set_cudagraph_capturing_enabled", lambda enabled: None
+        )
+        runner.capture_model(dp_metadata, is_warmup=True, input_ids_by_stage={})
+    else:
+        runner.execute_model(dp_metadata_list=dp_metadata, input_ids_by_stage={})
+
+    assert received_headers == steps
+    assert not runner.connector.attn_outputs
+    assert [item[1] for item in runner.connector.ffn_outputs] == expected_outputs
+    assert target_graph.replay_count == int(run_mode == "target_replay")
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3])
+@pytest.mark.parametrize("num_stages", [1, 2])
+def test_npu_ffn_runner_captures_complete_mtp_sequence(
+    monkeypatch, num_speculative_tokens, num_stages
+):
+    _patch_ffn_forward_context(monkeypatch)
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        connector="P2pHcclAFDConnector",
+        speculative_config=_mtp_speculative_config(
+            enforce_eager=False, num_speculative_tokens=num_speculative_tokens
+        ),
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.mtp_ffn_model = _FakeModel()
+    runner.graph_pool = None
+    monkeypatch.setattr(ffn_model_runner.torch.npu, "NPUGraph", _FakeGraph)
+    monkeypatch.setattr(
+        ffn_model_runner.torch.npu, "graph", lambda graph, pool: nullcontext()
+    )
+    dp_metadata = {
+        stage_idx: _FakeDPMetadata([stage_idx + 1]) for stage_idx in range(num_stages)
+    }
+    total_tokens = sum(stage_idx + 1 for stage_idx in range(num_stages))
+    metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0, stage_idx=0, seq_len=total_tokens, phase="mtp", speculative_step=0
+    )
+    for iteration in range(num_speculative_tokens):
+        runner.connector.attn_outputs.append((f"draft-{iteration}", metadata))
+    received_headers = []
+
+    def recv_mtp_header_for_graph(*, stage_idx, attention_peer_counts):
+        assert len(runner.connector.ffn_outputs) == len(received_headers)
+        received_headers.append((stage_idx, attention_peer_counts))
+        return SimpleNamespace(
+            num_tokens=total_tokens,
+            speculative_step=0,
+            num_tokens_across_dp=torch.tensor([total_tokens], dtype=torch.int32),
+        )
+
+    runner.connector.recv_mtp_header_for_graph = recv_mtp_header_for_graph
+    runner._capture_mtp_graphs(dp_metadata)
+
+    assert received_headers == [(0, (total_tokens,))] * num_speculative_tokens
+    assert not runner.connector.attn_outputs
+    assert [item[1] for item in runner.connector.ffn_outputs] == [
+        metadata
+    ] * num_speculative_tokens
+    graph = runner._mtp_acl_graphs[runner._make_mtp_graph_key(dp_metadata)]["graph"]
+    assert graph.replay_count == 0
+
+    # One replay services the entire captured sequence, including duplicate capture.
+    runner._capture_mtp_graphs(dp_metadata)
+    assert graph.replay_count == 1
+    runner._replay_mtp_graph(dp_metadata)
+    assert graph.replay_count == 2
+    assert len(received_headers) == num_speculative_tokens
+
+
+@pytest.mark.parametrize("invalid_header", [True, False])
+def test_npu_ffn_runner_rejects_mismatched_mtp_steps(monkeypatch, invalid_header):
+    _patch_ffn_forward_context(monkeypatch)
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn", speculative_config=_mtp_speculative_config(num_speculative_tokens=3)
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.mtp_ffn_model = _FakeModel()
+    header = SimpleNamespace(
+        num_tokens=1,
+        speculative_step=0 if invalid_header else 1,
+        num_tokens_across_dp=torch.tensor([1], dtype=torch.int32),
+    )
+    metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0, stage_idx=0, seq_len=1, phase="mtp", speculative_step=0
+    )
+    runner.connector.attn_outputs.append(("draft", metadata))
+
+    with pytest.raises(
+        RuntimeError,
+        match="out-of-order MTP step" if invalid_header else "invalid MTP phase",
+    ):
+        runner._mtp_ffn_forward([0], header=header, expected_speculative_step=1)
+
+    assert runner.connector.ffn_outputs == []
 
 
 def test_npu_ffn_runner_executes_u2_decoder_then_one_merged_mtp_phase(
@@ -2935,6 +3161,63 @@ def test_npu_ffn_runner_replays_target_graph_then_runs_mtp_eager(monkeypatch):
     assert runner.connector.ffn_outputs == [
         ("npu-ffn(mtp-hidden, layer=0)", mtp_metadata, {"ubatch_idx": 0}),
     ]
+
+
+@pytest.mark.parametrize(
+    ("num_speculative_tokens", "peer_tokens", "expected_sizes"),
+    [(1, 4, [2, 4, 8]), (2, 6, [3, 6]), (3, 8, [4, 8])],
+)
+def test_npu_ffn_mtp_graph_sizes_match_upstream_decode_capture(
+    num_speculative_tokens, peer_tokens, expected_sizes
+):
+    from vllm.config import CompilationConfig, CUDAGraphMode
+
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        tensor_parallel_size=1,
+        speculative_config=_mtp_speculative_config(
+            enforce_eager=False,
+            num_speculative_tokens=num_speculative_tokens,
+        ),
+    )
+    runner.connector = _FakeFFNConnector(attn_size=2, ffn_size=2)
+    runner.use_aclgraph = True
+    runner.uniform_decode_query_len = num_speculative_tokens + 1
+    runner.parallel_config = runner.vllm_config.parallel_config
+    runner.compilation_config = CompilationConfig(
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        cudagraph_capture_sizes=[1, 2, 4, 8],
+        max_cudagraph_capture_size=8,
+    )
+    runner.cudagraph_batch_sizes = [1, 2, 4, 8]
+
+    runner._initialize_mtp_graph_sizes()
+
+    assert runner.cudagraph_batch_sizes == expected_sizes
+    metadata = {0: _FakeDPMetadata([peer_tokens, peer_tokens])}
+    assert runner._make_mtp_graph_key(metadata)[-1] == (peer_tokens, peer_tokens)
+
+
+@pytest.mark.parametrize(
+    ("requires_mtp", "use_aclgraph", "enforce_eager"),
+    [(False, True, False), (True, False, False), (True, True, True)],
+)
+def test_npu_ffn_mtp_graph_sizes_skip_other_paths(
+    requires_mtp, use_aclgraph, enforce_eager
+):
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        speculative_config=_mtp_speculative_config(enforce_eager=enforce_eager),
+    )
+    runner.connector = SimpleNamespace(requires_mtp=requires_mtp)
+    runner.use_aclgraph = use_aclgraph
+    runner.cudagraph_batch_sizes = [1, 2, 4, 8]
+
+    runner._initialize_mtp_graph_sizes()
+
+    assert runner.cudagraph_batch_sizes == [1, 2, 4, 8]
 
 
 @pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3])

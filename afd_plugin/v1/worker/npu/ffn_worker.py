@@ -134,6 +134,20 @@ class AFDNPUFFNWorker(NPUWorker):
             "execute_model() is not supported.",
         )
 
+    # Upstream: vllm_ascend/worker/worker.py at 11ee45653.
+    # Patch reason: the AFD runner owns its profiler instead of NPUWorker.
+    # Patch functionality: route profile RPCs to the role-aware AFD profiler.
+    # Signature: matches upstream; no added parameters.
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+        """Control the plugin-owned profiler from vLLM's profile endpoint."""
+        # ### PATCH START: AFD profiler control
+        del profile_prefix
+        if is_start:
+            self.model_runner.start_afd_profiler()
+        else:
+            self.model_runner.stop_afd_profiler()
+        # ### PATCH END: AFD profiler control
+
     def start_ffn_server_loop(self) -> None:
         if self._ffn_thread is not None and self._ffn_thread.is_alive():
             self.raise_ffn_loop_error_if_any()
@@ -181,7 +195,7 @@ class AFDNPUFFNWorker(NPUWorker):
         while not event.is_set():
             if self.model_runner.connector.control_plane is None:
                 self.model_runner.execute_connector_driven_step()
-                if not self.model_runner.window_ffn_stream_overlap_enabled:
+                if not self.model_runner.window_ffn_multistream_enabled:
                     torch.npu.synchronize()
                 continue
 

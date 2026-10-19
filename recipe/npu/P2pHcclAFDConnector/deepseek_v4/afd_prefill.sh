@@ -16,7 +16,7 @@ PREFILL_DEVICES="${PREFILL_DEVICES:-0,1}"
 PREFILL_DP_SIZE="${PREFILL_DP_SIZE:-2}"
 PREFILL_TP_SIZE="${PREFILL_TP_SIZE:-1}"
 ATTENTION_RANKS="${ATTENTION_RANKS:-4}"
-TENSOR_PARALLEL_SIZE=1
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_NUM_BATCHED_TOKENS="${PREFILL_MAX_NUM_BATCHED_TOKENS:-4096}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
@@ -30,10 +30,13 @@ VLLM_BIN="${VLLM_BIN:-vllm}"
 : "${MODEL_PATH:?Set MODEL_PATH to the native A5 DeepSeek-V4 checkpoint}"
 : "${NIC_NAME:?Set NIC_NAME to the local network interface}"
 : "${HCCL_IF_IP:?Set HCCL_IF_IP to the local IPv4 address}"
-[[ "$PREFILL_TP_SIZE" == 1 ]] || afd_die "this delivery fixes Prefill TP1"
+require_uint PREFILL_DP_SIZE "$PREFILL_DP_SIZE"
+require_uint PREFILL_TP_SIZE "$PREFILL_TP_SIZE"
+((PREFILL_DP_SIZE > 0 && PREFILL_TP_SIZE > 0 && PREFILL_DP_SIZE * PREFILL_TP_SIZE <= 8)) \
+  || afd_die "Prefill DP x TP must use 1..8 local devices"
 IFS=',' read -r -a prefill_devices_array <<<"$PREFILL_DEVICES"
-((${#prefill_devices_array[@]} == PREFILL_DP_SIZE)) \
-  || afd_die "PREFILL_DEVICES must contain $PREFILL_DP_SIZE devices"
+((${#prefill_devices_array[@]} == PREFILL_DP_SIZE * PREFILL_TP_SIZE)) \
+  || afd_die "PREFILL_DEVICES must contain DP x TP = $((PREFILL_DP_SIZE * PREFILL_TP_SIZE)) devices"
 declare -A prefill_seen=()
 for device in "${prefill_devices_array[@]}"; do
   [[ "$device" =~ ^[0-7]$ ]] || afd_die "invalid Prefill device ID: $device"

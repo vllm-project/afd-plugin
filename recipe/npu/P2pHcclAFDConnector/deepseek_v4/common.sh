@@ -14,6 +14,30 @@ require_uint() {
   [[ "$value" =~ ^[0-9]+$ ]] || afd_die "$name must be an unsigned integer, got '$value'"
 }
 
+configure_parallelism() {
+  require_uint ATTENTION_RANKS "$ATTENTION_RANKS"
+  require_uint FFN_RANKS "$FFN_RANKS"
+  require_uint TENSOR_PARALLEL_SIZE "$TENSOR_PARALLEL_SIZE"
+  ((ATTENTION_RANKS > 0 && ATTENTION_RANKS <= 8 && FFN_RANKS > 0 && FFN_RANKS <= 8)) \
+    || afd_die "each role must use 1..8 local devices; use separate hosts for overlapping device IDs"
+  [[ "$TENSOR_PARALLEL_SIZE" == 1 || "$TENSOR_PARALLEL_SIZE" == 2 ]] \
+    || afd_die "DeepSeek-V4 AFD supports TENSOR_PARALLEL_SIZE=1 or 2"
+  ((ATTENTION_RANKS % TENSOR_PARALLEL_SIZE == 0 && FFN_RANKS % TENSOR_PARALLEL_SIZE == 0)) \
+    || afd_die "Attention and FFN rank counts must be divisible by TENSOR_PARALLEL_SIZE"
+  ((ATTENTION_RANKS % FFN_RANKS == 0 || FFN_RANKS % ATTENTION_RANKS == 0)) \
+    || afd_die "P2pHcclAFDConnector requires one role rank count to be an integer multiple of the other"
+  if [[ "$TENSOR_PARALLEL_SIZE" == 2 && "$ATTENTION_RANKS" != "$FFN_RANKS" ]]; then
+    afd_die "DeepSeek-V4 AFD TP2 requires equal Attention and FFN rank counts"
+  fi
+  ATTENTION_DP_SIZE=$((ATTENTION_RANKS / TENSOR_PARALLEL_SIZE))
+  FFN_DP_SIZE=$((FFN_RANKS / TENSOR_PARALLEL_SIZE))
+  case "$ROLE" in
+    attention) ROLE_DP_SIZE="$ATTENTION_DP_SIZE" ;;
+    ffn) ROLE_DP_SIZE="$FFN_DP_SIZE" ;;
+    *) afd_die "invalid AFD role: $ROLE" ;;
+  esac
+}
+
 validate_devices() {
   local attention_count=0 ffn_count=0 device
   declare -A attention_seen=() ffn_seen=()
@@ -107,13 +131,13 @@ build_a5_pd_kv_config() {
   # Do not call this helper from A3 recipes, FFN, or standalone Decode-AF.
   local kv_role="$1" engine_id="$2" kv_port="$3" devices="$4"
   "$PYTHON_BIN" - "$kv_role" "$engine_id" "$kv_port" \
-    "$PREFILL_DP_SIZE" "$PREFILL_TP_SIZE" "$ATTENTION_RANKS" \
+    "$PREFILL_DP_SIZE" "$PREFILL_TP_SIZE" "$ATTENTION_RANKS" "${TENSOR_PARALLEL_SIZE:-1}" \
     "${ASCEND_LOCAL_COMM_RES_PATH:-}" "$devices" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-role, engine_id, port, prefill_dp, prefill_tp, attention_dp, resource_dir, devices = sys.argv[1:]
+role, engine_id, port, prefill_dp, prefill_tp, attention_ranks, attention_tp, resource_dir, devices = sys.argv[1:]
 if role not in ("kv_producer", "kv_consumer"):
     raise SystemExit("[dsv4-afd] ERROR: A5 PD requires a KV producer or consumer")
 if not engine_id:
@@ -126,17 +150,26 @@ if not resource_root.is_absolute() or not resource_root.is_dir():
     )
 try:
     port_number = int(port)
-    prefill_dp_size, prefill_tp_size, attention_dp_size = map(
-        int, (prefill_dp, prefill_tp, attention_dp)
+    prefill_dp_size, prefill_tp_size, attention_rank_count, attention_tp_size = map(
+        int, (prefill_dp, prefill_tp, attention_ranks, attention_tp)
     )
     device_ids = [int(device) for device in devices.split(",")]
 except ValueError as exc:
     raise SystemExit(f"[dsv4-afd] ERROR: invalid A5 PD numeric config: {exc}") from exc
 if not 0 < port_number < 65536:
     raise SystemExit("[dsv4-afd] ERROR: Mooncake KV port is outside 1..65535")
-if prefill_dp_size not in (2, 8) or prefill_tp_size != 1 or attention_dp_size != 4:
-    raise SystemExit("[dsv4-afd] ERROR: A5 PD fixes P2/P8, A4 and TP1")
-expected_devices = prefill_dp_size if role == "kv_producer" else attention_dp_size
+if (prefill_dp_size < 1 or prefill_tp_size < 1
+        or prefill_dp_size * prefill_tp_size > 8
+        or not 1 <= attention_rank_count <= 8
+        or attention_tp_size not in (1, 2)
+        or attention_rank_count % attention_tp_size):
+    raise SystemExit("[dsv4-afd] ERROR: invalid A5 PD DP/TP or local rank count")
+if prefill_tp_size < attention_tp_size:
+    raise SystemExit("[dsv4-afd] ERROR: Mooncake PD requires Prefill TP >= Attention TP")
+attention_dp_size = attention_rank_count // attention_tp_size
+expected_devices = (
+    prefill_dp_size * prefill_tp_size if role == "kv_producer" else attention_rank_count
+)
 if (len(device_ids) != expected_devices or len(set(device_ids)) != len(device_ids)
         or any(device < 0 or device > 7 for device in device_ids)):
     raise SystemExit("[dsv4-afd] ERROR: A5 PD device list does not match local role ranks")
@@ -157,7 +190,7 @@ print(json.dumps({
     "kv_parallel_size": 1,
     "kv_connector_extra_config": {
         "prefill": {"dp_size": prefill_dp_size, "tp_size": prefill_tp_size},
-        "decode": {"dp_size": attention_dp_size, "tp_size": 1},
+        "decode": {"dp_size": attention_dp_size, "tp_size": attention_tp_size},
         "ascend_local_comm_res_path": str(resource_root),
     },
 }, separators=(",", ":")))
@@ -195,6 +228,82 @@ else:
 PY
 }
 
+configure_dspark() {
+  DSPARK_ARGS=()
+  DSPARK_BLOCK_SIZE=0
+  if [[ "${ENABLE_DSPARK:-0}" == 1 ]]; then
+    DSPARK_BLOCK_SIZE="$("$PYTHON_BIN" - "$MODEL_PATH/config.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as file:
+    size = json.load(file).get("dspark_block_size")
+if type(size) is not int or size < 1:
+    raise SystemExit("[dsv4-afd] ERROR: DSpark requires a positive dspark_block_size")
+print(size)
+PY
+)"
+    # vLLM 0.23 uses the MTP schema; Ascend selects DSpark from the checkpoint.
+    DSPARK_CONFIG="$(printf '{"method":"mtp","num_speculative_tokens":%s,"draft_sample_method":"greedy","enforce_eager":true}' "$DSPARK_BLOCK_SIZE")"
+    DSPARK_ARGS=(--speculative-config "$DSPARK_CONFIG")
+  fi
+}
+
+configure_graph_capture() {
+  # Attention dispatches the whole per-DP-rank token batch before U2 splitting.
+  # FFN has no speculative config: its actual graphs are captured from A metadata.
+  local graph_config
+  graph_config="$("$PYTHON_BIN" - "$MAX_NUM_SEQS" "$MAX_NUM_BATCHED_TOKENS" \
+    "${DSPARK_BLOCK_SIZE:-0}" "${MAX_CUDAGRAPH_CAPTURE_SIZE:-}" \
+    "${CUDAGRAPH_CAPTURE_SIZES:-}" <<'PY'
+import sys
+
+raw_seqs, raw_budget, raw_spec, raw_max, raw_sizes = sys.argv[1:]
+try:
+    seqs, budget, spec = map(int, (raw_seqs, raw_budget, raw_spec))
+    sizes = [int(size) for size in raw_sizes.split()]
+    query_len = spec + 1
+    required = seqs * query_len
+    maximum = int(raw_max) if raw_max else max(sizes, default=required)
+except ValueError as exc:
+    raise SystemExit(f"[dsv4-afd] ERROR: Graph settings must be integers: {exc}") from exc
+if seqs < 1 or budget < 1 or spec < 0 or maximum < 1 or any(size < 1 for size in sizes):
+    raise SystemExit("[dsv4-afd] ERROR: Graph settings must be positive (spec tokens may be zero)")
+if maximum < required:
+    raise SystemExit(
+        f"[dsv4-afd] ERROR: Graph max {maximum} does not cover {seqs} sequences x "
+        f"{query_len} tokens = {required} before U2; unset capture overrides to derive defaults"
+    )
+if maximum > budget:
+    raise SystemExit("[dsv4-afd] ERROR: Graph max exceeds MAX_NUM_BATCHED_TOKENS")
+if maximum % query_len:
+    raise SystemExit(
+        f"[dsv4-afd] ERROR: Graph max must be a multiple of decode query length {query_len}"
+    )
+if sizes:
+    if max(sizes) != maximum:
+        raise SystemExit("[dsv4-afd] ERROR: largest capture size must equal Graph max")
+    # Mirror vLLM's speculative decode alignment without losing the largest bucket.
+    sizes = sorted({((size + query_len - 1) // query_len) * query_len for size in sizes})
+    if required not in sizes:
+        raise SystemExit(
+            f"[dsv4-afd] ERROR: capture sizes must include full Decode shape {required}; "
+            "FULL_DECODE_ONLY excludes buckets above the sequence limit"
+        )
+else:
+    sizes = []
+    size = query_len
+    while size < maximum:
+        sizes.append(size)
+        size *= 2
+    sizes.append(maximum)
+    sizes = sorted(set(sizes + [required]))
+print(maximum, *sizes)
+PY
+)" || afd_die "invalid Graph capture configuration"
+  read -r MAX_CUDAGRAPH_CAPTURE_SIZE CUDAGRAPH_CAPTURE_SIZES <<<"$graph_config"
+}
+
 configure_execution() {
   EXECUTION_ARGS=()
   UBATCH_ARGS=()
@@ -219,14 +328,8 @@ configure_execution() {
       esac
       ;;
     full-decode-only:2)
+      configure_graph_capture
       read -r -a capture_sizes_array <<<"$CUDAGRAPH_CAPTURE_SIZES"
-      ((${#capture_sizes_array[@]} > 0)) \
-        || afd_die "CUDAGRAPH_CAPTURE_SIZES cannot be empty"
-      local size
-      for size in "${capture_sizes_array[@]}"; do
-        [[ "$size" =~ ^[1-9][0-9]*$ ]] \
-          || afd_die "CUDAGRAPH_CAPTURE_SIZES must contain positive integers"
-      done
       EXECUTION_ARGS=(
         --max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE"
         --cudagraph-capture-sizes "${capture_sizes_array[@]}"
@@ -262,10 +365,7 @@ preflight_role() {
   : "${NIC_NAME:?Set NIC_NAME to the container network interface}"
   : "${HCCL_IF_IP:?Set HCCL_IF_IP to the IPv4 address on NIC_NAME}"
 
-  [[ "$ATTENTION_RANKS" == 4 ]] || afd_die "this delivery fixes ATTENTION_RANKS=4"
-  [[ "$FFN_RANKS" == 2 ]] || afd_die "this delivery fixes FFN_RANKS=2"
-  [[ "$TENSOR_PARALLEL_SIZE" == 1 ]] \
-    || afd_die "this A4F2 recipe fixes TENSOR_PARALLEL_SIZE=1"
+  configure_parallelism
   [[ "${ENABLE_MTP:-0}" == 0 ]] || afd_die "this recipe requires ENABLE_MTP=0"
   [[ "${ENABLE_DSPARK:-0}" == 0 || "${ENABLE_DSPARK:-0}" == 1 ]] \
     || afd_die "ENABLE_DSPARK must be 0 or 1"
@@ -294,7 +394,6 @@ preflight_role() {
   require_uint MAX_NUM_SEQS "$MAX_NUM_SEQS"
   require_uint DBO_DECODE_TOKEN_THRESHOLD "$DBO_DECODE_TOKEN_THRESHOLD"
   require_uint DBO_PREFILL_TOKEN_THRESHOLD "$DBO_PREFILL_TOKEN_THRESHOLD"
-  require_uint MAX_CUDAGRAPH_CAPTURE_SIZE "$MAX_CUDAGRAPH_CAPTURE_SIZE"
   ((API_PORT > 0 && API_PORT < 65536)) || afd_die "API_PORT is outside 1..65535"
   ((AFD_PORT > 0 && AFD_PORT < 65536)) || afd_die "AFD_PORT is outside 1..65535"
   ((HCCL_IF_BASE_PORT > 0 && HCCL_IF_BASE_PORT < 65536)) \
@@ -303,8 +402,6 @@ preflight_role() {
   ((MAX_NUM_BATCHED_TOKENS > 0)) \
     || afd_die "MAX_NUM_BATCHED_TOKENS must be positive"
   ((MAX_NUM_SEQS > 0)) || afd_die "MAX_NUM_SEQS must be positive"
-  ((MAX_CUDAGRAPH_CAPTURE_SIZE > 0)) \
-    || afd_die "MAX_CUDAGRAPH_CAPTURE_SIZE must be positive"
 
   command -v "$PYTHON_BIN" >/dev/null || afd_die "Python command not found: $PYTHON_BIN"
   command -v "$VLLM_BIN" >/dev/null || afd_die "vLLM command not found: $VLLM_BIN"
@@ -354,8 +451,13 @@ PY
   export VLLM_PLUGINS="${VLLM_PLUGINS:-ascend,ascend_model,ascend_model_loader,ascend_kv_connector,afd}"
   export VLLM_USE_V1=1
 
-  printf '[dsv4-afd] role=%s devices=%s ranks=%s mode=%s u_batches=%s model=%s\n' \
-    "$ROLE" "$ROLE_DEVICES" "$ROLE_RANKS" "$EXECUTION_MODE" "$U_BATCHES" "$MODEL_PATH"
+  printf '[dsv4-afd] role=%s devices=%s ranks=%s dp=%s tp=%s mode=%s u_batches=%s model=%s\n' \
+    "$ROLE" "$ROLE_DEVICES" "$ROLE_RANKS" "$ROLE_DP_SIZE" "$TENSOR_PARALLEL_SIZE" \
+    "$EXECUTION_MODE" "$U_BATCHES" "$MODEL_PATH"
+  if [[ "$EXECUTION_MODE" == full-decode-only ]]; then
+    printf '[dsv4-afd] graph_max=%s capture_sizes=[%s] decode_query_len=%s\n' \
+      "$MAX_CUDAGRAPH_CAPTURE_SIZE" "$CUDAGRAPH_CAPTURE_SIZES" "$((${DSPARK_BLOCK_SIZE:-0} + 1))"
+  fi
 }
 
 run_role_service() {

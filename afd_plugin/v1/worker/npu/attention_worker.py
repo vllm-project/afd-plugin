@@ -65,14 +65,19 @@ class AFDNPUAttentionWorker(NPUWorker):
             self.device,
         )
 
-    # Online idle DP ranks still need the MTP phase handshake, but startup
-    # capture must not advertise a live draft phase to the FFN worker.
-    def execute_dummy_batch(self) -> None:
-        self.model_runner._afd_live_dummy_execution = True
-        try:
-            super().execute_dummy_batch()
-        finally:
-            self.model_runner._afd_live_dummy_execution = False
+    # Upstream: vllm_ascend/worker/worker.py at 11ee45653.
+    # Patch reason: the AFD runner owns its profiler instead of NPUWorker.
+    # Patch functionality: route profile RPCs to the role-aware AFD profiler.
+    # Signature: matches upstream; no added parameters.
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+        """Control the plugin-owned profiler from vLLM's profile endpoint."""
+        # ### PATCH START: AFD profiler control
+        del profile_prefix
+        if is_start:
+            self.model_runner.start_afd_profiler()
+        else:
+            self.model_runner.stop_afd_profiler()
+        # ### PATCH END: AFD profiler control
 
     # Upstream source: vLLM-Ascend 3da28f94, NPUWorker.execute_dummy_batch.
     # Patch reason: online idle DP ranks also need the MTP phase handshake;

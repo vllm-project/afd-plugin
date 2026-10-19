@@ -89,7 +89,7 @@ class WindowAFDExtraInfo(ConnectorExtraInfo):
     """
 
     micro_batch_num: int = 1
-    quant_mode: int = 2
+    quant_mode: int = 4
 
     @classmethod
     def from_mapping(
@@ -109,12 +109,13 @@ class WindowAFDExtraInfo(ConnectorExtraInfo):
                 + ", ".join(unknown),
             )
         quant_mode = coerce_extra_int(
-            raw.get("quant_mode", 2),
+            raw.get("quant_mode", 4),
             field_name="quant_mode",
         )
-        if quant_mode not in (0, 2):
+        if quant_mode not in (0, 2, 4):
             raise ValueError(
-                "WindowAFDConnector quant_mode must be 0 or 2, " f"got {quant_mode}",
+                "WindowAFDConnector quant_mode must be 0, 2, or 4, "
+                f"got {quant_mode}",
             )
         return cls(
             micro_batch_num=coerce_extra_positive_int(
@@ -159,6 +160,15 @@ def _window_sizes(
     elif quant_mode == 0:
         # H fp16/bfloat16 values, each occupying two bytes.
         a2f_token_bytes = hidden_size * 2
+    elif quant_mode == 4:
+        # MXFP8 stores one FP8 E4M3FN byte per value followed by one E8M0
+        # scale byte per 32 values. The scale region is two-byte aligned.
+        quant_data_bytes = _align_up(hidden_size, 256)
+        scale_bytes = _align_up((hidden_size + 31) // 32, 2)
+        # ScheduleContext requires the source-row stride to be 512-byte
+        # aligned. The operator writes the payload first and leaves row-tail
+        # padding unused.
+        a2f_token_bytes = _align_up(quant_data_bytes + scale_bytes, 512)
     else:
         raise ValueError(f"unsupported Window quant_mode={quant_mode}")
     # F2A always returns H fp16/bfloat16 values.
@@ -722,11 +732,19 @@ class WindowAFDConnector(AFDConnectorBase):
         # Window, not its byte size in every mode.  For H=7168 it is 7168
         # fp16/bfloat16 elements in mode 0, or 7680 one-byte storage elements
         # in mode 2: align(7168 INT8 bytes + 4 scale bytes, 512) = 7680.
-        a2f_token_data_dim = (
-            _align_up(self.hidden_size + 4, 512)
-            if quant_mode == 2
-            else self.hidden_size
-        )
+        if quant_mode == 2:
+            a2f_token_data_dim = _align_up(self.hidden_size + 4, 512)
+        elif quant_mode == 4:
+            # One FP8 byte per hidden value plus an E8M0 scale for every
+            # 32-value block. The operator rounds the scale count to even.
+            quant_data_dim = _align_up(self.hidden_size, 256)
+            scale_dim = _align_up((self.hidden_size + 31) // 32, 2)
+            a2f_token_data_dim = _align_up(
+                quant_data_dim + scale_dim,
+                512,
+            )
+        else:
+            a2f_token_data_dim = self.hidden_size
         ffn_info = [
             self.attn_size,
             micro_batch_num,
@@ -751,6 +769,8 @@ class WindowAFDConnector(AFDConnectorBase):
     def _token_dtype(self) -> int:
         if self.extra_info.quant_mode == 2:
             return 2
+        if self.extra_info.quant_mode == 4:
+            return 4
         return 1 if self.vllm_config.model_config.dtype == torch.bfloat16 else 0
 
     @staticmethod
@@ -1071,6 +1091,10 @@ class WindowAFDConnector(AFDConnectorBase):
                 need_schedule=1,
                 layer_num=self.num_layers,
                 sync_flag=1,
+                # ACLGraph cannot represent E8M0 tensors directly. Expose the
+                # same scale bytes as uint8 in both warmup and replay; the
+                # Global FFN supplies their logical E8M0 dtype to GMM.
+                mx_output_uint8=self.extra_info.quant_mode == 4,
             )
         else:
             outputs = torch_npu.npu_ffn_worker_batching(

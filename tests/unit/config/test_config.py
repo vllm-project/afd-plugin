@@ -125,6 +125,16 @@ def test_compute_gate_on_attention_is_common_config():
     assert config.compute_gate_on_attention is True
 
 
+@pytest.mark.parametrize("enabled", [False, True, "false", "true"])
+def test_window_multistream_config_parsing_and_graph_hash(enabled):
+    config = afd_config_from_mapping({"window_ffn_multistream_enabled": enabled})
+    expected = enabled in (True, "true")
+    assert config.window_ffn_multistream_enabled is expected
+    default = AFDConfig()
+    assert default.window_ffn_multistream_enabled is True
+    assert (config.compute_hash() == default.compute_hash()) is expected
+
+
 def test_common_config_coerces_integer_bool_values():
     assert (
         afd_config_from_mapping(

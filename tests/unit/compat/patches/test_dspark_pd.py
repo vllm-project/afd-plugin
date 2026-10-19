@@ -10,7 +10,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 
-@pytest.fixture(params=("P2pHcclAFDConnector", "WindowAFDConnector"))
+@pytest.fixture(params=(None, "P2pHcclAFDConnector", "WindowAFDConnector"))
 def runtime(monkeypatch, request):
     class KVCacheManager:
         def __init__(self):
@@ -130,12 +130,16 @@ def runtime(monkeypatch, request):
 
 def config(*, connector="P2pHcclAFDConnector", **changes):
     values = dict(
-        additional_config={
-            "afd": {
-                "role": "attention",
-                "connector": connector,
+        additional_config=(
+            {
+                "afd": {
+                    "role": "attention",
+                    "connector": connector,
+                }
             }
-        },
+            if connector is not None
+            else {}
+        ),
         kv_transfer_config=SimpleNamespace(
             kv_connector="MooncakeHybridConnector",
             is_kv_consumer=True,
@@ -211,7 +215,6 @@ def test_only_async_external_load_changes_allocation(runtime, delay, external):
 @pytest.mark.parametrize(
     "changes",
     [
-        {"additional_config": {}},
         {
             "additional_config": {
                 "afd": {"role": "ffn", "connector": "P2pHcclAFDConnector"}

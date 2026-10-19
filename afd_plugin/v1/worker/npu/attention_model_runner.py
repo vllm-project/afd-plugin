@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import fields as dataclass_fields
 from dataclasses import replace
@@ -112,6 +113,7 @@ from afd_plugin.v1.worker.npu.npu_ubatch_wrapper import AscendUBatchWrapper
 from afd_plugin.v1.worker.npu.ubatch_utils import (
     check_enable_ubatch,
     create_request_boundary_ubatch_slices,
+    create_ubatch_slices,
     maybe_create_ubatch_slices,
     pad_out_ubatch_slices,
     split_attn_metadata,
@@ -127,7 +129,7 @@ _ASCEND_COMMON_METADATA_FIELDS = frozenset(
 class _AFDMTPPhaseAwareRunnable:
     """Announce a live draft phase at the exact runnable boundary."""
 
-    def __init__(self, runnable: ACLGraphWrapper, callback: Any) -> None:
+    def __init__(self, runnable: Callable[..., Any], callback: Any) -> None:
         self._runnable = runnable
         self._callback = callback
 
@@ -280,11 +282,23 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             | None
         ) = None
         self._afd_logged_metadata_stage_counts: set[tuple[int, bool, bool]] = set()
-        self.prof = create_afd_npu_profiler("attention", role_rank=rank)
+        self._profiler_rank = rank
+        self.prof = None
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
         return parse_afd_config(vllm_config, expected_role="attention")
+
+    def start_afd_profiler(self) -> None:
+        """Start the Attention profiler on an explicit profile request."""
+        if self.prof is None:
+            self.prof = create_afd_npu_profiler(
+                "attention", role_rank=self._profiler_rank
+            )
+
+    def stop_afd_profiler(self) -> None:
+        stop_afd_npu_profiler(self.prof)
+        self.prof = None
 
     def _uses_fixed_window_u2(self) -> bool:
         return bool(
@@ -594,12 +608,30 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
         )
-        ubatch_slices = _normalize_metadata_ubatch_slices(
-            ubatch_slices,
-            num_tokens_padded,
-            num_reqs_padded,
-            pad_token_capacity=self._uses_fixed_window_u2(),
-        )
+        if (
+            self._uses_fixed_window_u2()
+            and ubatch_slices is not None
+            and num_tokens_padded is not None
+            and num_reqs_padded is not None
+            and num_tokens_padded != num_tokens
+        ):
+            # Window U2 must derive both token and request slices from the
+            # final padded query layout. Extending only the old token slice can
+            # leave its request slice pointing past the last live request.
+            padded_query_lens = np.diff(
+                self.query_start_loc.np[: num_reqs_padded + 1]
+            ).astype(np.int32, copy=False)
+            ubatch_slices = create_ubatch_slices(
+                padded_query_lens,
+                [num_tokens_padded // 2],
+            )
+        else:
+            ubatch_slices = _normalize_metadata_ubatch_slices(
+                ubatch_slices,
+                num_tokens_padded,
+                num_reqs_padded,
+                pad_token_capacity=self._uses_fixed_window_u2(),
+            )
         # MTP target verification schedules the target token and its draft
         # token as one request.  Splitting those two tokens across stages
         # changes the quantized/sparse-attention kernel shape and can change
@@ -1984,33 +2016,42 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             self._install_ascend_ubatch_wrapper()
 
     def _configure_mtp_draft_graph(self) -> None:
-        if self.speculative_config is None or bool(
-            getattr(self.speculative_config, "enforce_eager", False),
-        ):
+        if self.speculative_config is None:
             return
-        draft_runnable = getattr(self.drafter, "_runnable", None)
-        if not isinstance(draft_runnable, ACLGraphWrapper):
-            raise RuntimeError(
-                "DSV4 AFD full draft Graph requires an ACLGraphWrapper",
-            )
+        draft_runnable = self.drafter._runnable
+        draft_enforce_eager = self.speculative_config.enforce_eager
+        if not draft_enforce_eager:
+            if not isinstance(draft_runnable, ACLGraphWrapper):
+                raise RuntimeError(
+                    "DSV4 AFD full draft Graph requires an ACLGraphWrapper",
+                )
+            # Upstream exempts Eagle graphs from pre-replay synchronization.
+            # Remote FFN graph updates require the previous HCCL to finish.
+            draft_runnable.use_eagle = False
         # ### PATCH START: synchronize AFD draft graph replay.
-        # Upstream vLLM-Ascend commit 3da28f94 constructs MTP through
-        # AscendEagleProposer and exempts Eagle graph replay from the normal
-        # pre-replay synchronization. AFD inserts a remote FFN graph and HCCL
-        # boundary, so graph-parameter updates must wait for the previous
-        # replay to finish before buffers are reused.
-        draft_runnable.use_eagle = False
+        # Both eager and graph drafts must announce the phase before any data
+        # transfers; FFN waits for that control message after target execution.
         self.drafter._runnable = _AFDMTPPhaseAwareRunnable(
             draft_runnable,
-            self._announce_live_mtp_phase,
+            (
+                (lambda _runnable: self._announce_live_mtp_phase(None))
+                if draft_enforce_eager
+                else self._announce_live_mtp_phase
+            ),
         )
         # ### PATCH END: synchronize AFD draft graph replay.
 
     def _announce_live_mtp_phase(
         self,
-        draft_runnable: ACLGraphWrapper,
+        draft_runnable: ACLGraphWrapper | None,
     ) -> CUDAGraphMode | None:
-        if not bool(getattr(self, "_afd_in_mtp_proposal", False)):
+        # Idle DP ranks draft through dummy_run rather than propose_draft_token_ids.
+        # They must release their FFN peers before the shared MoE collective;
+        # the worker sets the dummy flag only for online execution.
+        if not (
+            bool(getattr(self, "_afd_in_mtp_proposal", False))
+            or bool(getattr(self, "_afd_live_dummy_execution", False))
+        ):
             return None
         forward_context = get_forward_context()
         if isinstance(self.connector, P2pHcclAFDConnector):
@@ -2022,8 +2063,10 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 )
             self.connector.prepare_mtp_header_for_graph({0: draft_dp_metadata})
         runtime_mode = forward_context.cudagraph_runtime_mode
-        graph_requested = runtime_mode != CUDAGraphMode.NONE and runtime_mode.has_mode(
-            draft_runnable.runtime_mode,
+        graph_requested = (
+            draft_runnable is not None
+            and runtime_mode != CUDAGraphMode.NONE
+            and runtime_mode.has_mode(draft_runnable.runtime_mode)
         )
         graph_entry = (
             draft_runnable.concrete_aclgraph_entries.get(
@@ -2616,7 +2659,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         return result
 
     def shutdown(self) -> None:
-        stop_afd_npu_profiler(self.prof)
+        self.stop_afd_profiler()
         control_plane = self.connector.control_plane
         if control_plane is not None:
             try:
