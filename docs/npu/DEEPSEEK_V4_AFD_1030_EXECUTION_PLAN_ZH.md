@@ -20,6 +20,9 @@ Prefill --Mooncake KV--> Decode Attention --P2pHccl AFD--> Decode FFN
 本文规定范围、顺序和完成定义，指导书规定操作步骤；两者使用同一矩阵和门禁。
 `【本地已完成】` 标记本地代码/离线验证，`【A5 手工执行】` 标记需现场完成的操作。
 具体分工、当前执行入口及回传物见[手工交接清单](DEEPSEEK_V4_AFD_A5_MANUAL_HANDOFF_ZH.md)。
+
+**2026-10-19 跨机进展**：附件 `aa71744666ae49649fd7497a47ffbedc.gz` 的 10-16 日 cross-C5 full 92 项请求检查通过，90 个非流式响应全部非空且无输出 token ID `0`、四 DP 与 Proxy 请求归零。实际为两机 P2+A4+F2，P/F 在 `7.246.125.18`、A 在 `7.246.125.14`；不是三机 P8+A4+F2。FFN 两 rank 五开关全 1，在线 U2 与 payload replay/fallback 标志均有同步完成证据；缺 Attention 日志/metrics，site.env 与实际地址不符，P/F 末尾有 Killed。先按[cross-C5 结果第 5 节](DEEPSEEK_V4_AFD_CROSS_C5_20261016_RESULT_ZH.md)补材料、处理正常退出并冻结实际拓扑，再补独立冷启动轮次。请求通过单独保留，完整 F0、三机主验收及 GSM8K/性能不据此自动关闭。下文各日期的排障进度保留为历史。
+
 2026-09-16 的旧 A4F4/all-on 指导仅保留历史参考，其分支、上游提交、双机拓扑和 draft Graph 不再用于本期正式验收；本期五个 Graph/U2 多流开关默认开启，支持显式关闭。
 
 ## 2. 当前起点

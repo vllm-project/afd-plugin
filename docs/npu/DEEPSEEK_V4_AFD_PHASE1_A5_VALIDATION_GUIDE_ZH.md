@@ -4,7 +4,7 @@
 执行计划规定交付范围和日期，本文规定现场命令、验证顺序、证据与失败处理。
 本文是待执行指导，不代表组合已经通过 A5 验收。
 
-**执行标记**：`【本地已完成】` 为代码/配置的离线检查；`【A5 手工执行】` 为需要你在 A5 实际环境完成的操作。首次执行从[手工交接清单](DEEPSEEK_V4_AFD_A5_MANUAL_HANDOFF_ZH.md)的 A5-01 开始。最新 C4 full 92 项请求检查通过，Prefill 0.91 重试成功、DSpark/eager U2 有在线证据；正常停服失败，DSpark metrics 和运行清单待补齐，完整 F0 尚未关闭。当前按[C4 本轮结果第 4 节](DEEPSEEK_V4_AFD_C4_20261013_RESULT_ZH.md)补采材料；C2 停服、C3 默认全开和输出退化问题继续保留。C5 按现场要求暂缓分析。
+**执行标记**：`【本地已完成】` 为代码/配置的离线检查；`【A5 手工执行】` 为需要你在 A5 实际环境完成的操作。首次执行从[手工交接清单](DEEPSEEK_V4_AFD_A5_MANUAL_HANDOFF_ZH.md)的 A5-01 开始。**2026-10-19 最新跨机核对**：10-16 日 cross-C5 full 92 项通过、90 个非流式响应全部非空且无输出 token ID `0`、四 DP 与 Proxy 请求归零。实际为两机 P2+A4+F2，P/F 在 `.18`、A 在 `.14`；缺 Attention 侧日志/metrics，site.env 与实际地址不符，P/F 末尾有 Killed。当前按[cross-C5 本轮结果第 5 节](DEEPSEEK_V4_AFD_CROSS_C5_20261016_RESULT_ZH.md)补材料，完整 F0、第二轮和三机 P8+A4+F2 尚不能据此关闭。此前各日期的单机状态和对照步骤保留作历史，不要求为确认本轮请求结果立即重跑 full。
 
 ## 0. AFD 性能验证：先读本节，再按步骤操作
 
@@ -908,6 +908,8 @@ curl --noproxy '*' -fsS --max-time 10 \
 另一个归档问题是附件 `site.env` 的 `AFD_EXPECTED_COMMIT=567ff2d…`，而 `runtime.json` 的实际插件提交为 `6c4dc19…`。这是旧冻结配置不一致，不是已确定的 504 根因。更新交付代码后，将所选完整提交写回实际 `SITE_FILE`，重新采集 runtime 和配置 hash；不要只修改临时 shell 变量。
 
 ### 6.3 保存 metrics-before，生成精确 token-ID 输入
+
+**2026-10-19 cross-C5 更新**：最新两机 full 请求结果已通过；本轮补采及后续冷启动安排按[cross-C5 结果第 5 节](DEEPSEEK_V4_AFD_CROSS_C5_20261016_RESULT_ZH.md)。以下 10-13 日 C3/C4 段落为当时记录，不代表当前跨机验证仍停留在 C4。
 
 **2026-10-13 C4 最新更新**：附件 `6eb6a279f37c4040843516b1966b7354.gz` 在 0.91 下 Prefill 重试成功，P/A/F 使用 DSpark checkpoint；full 92 项请求检查通过、90 个非流式响应全部非空且无 token ID `0`、A/Proxy 请求归零，四 Attention rank 的 drafted/accepted 和在线 U2 已确认。但 Attention 停服四次 Segfault、FFN 同步报 507899，DSpark metrics before/after 仍为 0，缺本轮 runtime/config 和最终清理快照，完整 F0 保持 pending。按[C4 本轮证据与补采步骤](DEEPSEEK_V4_AFD_C4_20261013_RESULT_ZH.md)继续，不立即重发已通过的 full；C5 按现场要求暂缓分析。
 

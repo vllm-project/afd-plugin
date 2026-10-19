@@ -1,6 +1,8 @@
 # DeepSeek-V4 AFD A5 手工执行交接清单
 
-更新日期：2026-10-13。执行顺序与[统一验证指导书](DEEPSEEK_V4_AFD_PHASE1_A5_VALIDATION_GUIDE_ZH.md)、[1030 计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)一致。
+更新日期：2026-10-19。执行顺序与[统一验证指导书](DEEPSEEK_V4_AFD_PHASE1_A5_VALIDATION_GUIDE_ZH.md)、[1030 计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)一致。
+
+**最新跨机进展**：10-16 日 cross-C5 full 92 项请求检查通过、90 个非流式响应全部非空且无输出 token ID `0`、请求排空。实际为两机 P2+A4+F2，P/F 在 `.18`、A 在 `.14`；所附 site.env 地址不一致，缺 Attention 日志/metrics，P/F 末尾有 Killed，完整 F0 和计划三机 P8+A4+F2 尚未关闭。当前按[cross-C5 本轮结果第 5 节](DEEPSEEK_V4_AFD_CROSS_C5_20261016_RESULT_ZH.md)补齐证据。以下 10-13 日单机状态保留为历史，当前跨机安排以上段为准。
 
 `【本地已完成】` 表示源码修改及 CPU/mock 检查；`【A5 手工执行】` 表示需要你在A5 现场运行。首次执行顺序为 **A5-01 → A5-02 → A5-03 → A5-04**。最新 C4 Prefill 在 0.91 下启动成功，full 92 项请求检查通过，90 个非流式响应全部非空且无 token ID `0`，DSpark/eager U2 有在线证据；正常停服失败、DSpark metrics 增量和运行清单仍待补齐，完整 F0 未关闭。下一步见[C4 本轮结果与补采步骤](DEEPSEEK_V4_AFD_C4_20261013_RESULT_ZH.md)。C3 的默认全开、输出退化和正常停服问题继续保留；C5 按现场要求暂缓分析，三机和最终精度验收待前置问题关闭。
 
@@ -17,7 +19,7 @@
 | A5-03 | standalone A4F2 Graph/U2 全开回归和清理 | **A5 手工执行：你** | 已回传 EOS 成功日志；完整 F0 仍按证据表核对 |
 | A5-04 | 同机 P2+A4+F2，C1 两轮 | **A5 手工执行：你** | 已回传 C1 执行成功日志；轮数和完整 F0 按证据表核对 |
 | A5-05 | 同机 C2→C3→C4→C5，C5 两轮 | **A5 手工执行：你** | C2 请求通过、停服未关闭；C3 关闭对照定向 33 项/full 92 项检查通过，输出退化/全开组合/正常停服仍未关闭；C4 full 92 项通过、DSpark/eager U2 生效，停服/metrics/运行清单待关闭；C5 暂缓分析 |
-| A5-06 | 三机 P8/A4/F2，C1–C5 | **A5 手工执行：你** | 同机矩阵全部通过后执行 |
+| A5-06 | 三机 P8/A4/F2，C1–C5 | **A5 手工执行：你** | 已有两机 P2+A4+F2 cross-C5 full 92 项通过；Attention/版本/正常停服证据待补，三机主拓扑与完整矩阵不据此关闭 |
 | A5-07 | 同机/三机 C5 GSM8K 与诊断关闭的性能采集 | **A5 手工执行：你** | 完整功能组合通过后执行 |
 | LOCAL-05 | 审阅回传证据、定位问题、更新验收表及最终包 | 收到证据后本地继续 | 待现场结果 |
 | LOCAL-06 | DSpark 异步 PD 分配与 hybrid fail 处理 | 本地已完成，现场请求复测通过 | 本次未见业务期 KV/EngineCore 错误；不单独代表完整 F0 |
