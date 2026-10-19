@@ -114,6 +114,8 @@ def _load_patch_module():
     spec = importlib.util.find_spec("afd_plugin.compat.patches.config_validation")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    # Execute twice: installing the patch must be idempotent.
+    spec.loader.exec_module(module)
     spec.loader.exec_module(module)
     return module
 
@@ -133,13 +135,23 @@ def test_patch_preserves_native_dbo_model_restrictions(monkeypatch, is_hybrid):
     assert config._get_dbo_unsupported_features() == expected
 
 
-def _engine_args(*, active, role="attention", worker_cls="auto"):
+def _engine_args(
+    *,
+    active,
+    role="attention",
+    worker_cls="auto",
+    enable_dbo=True,
+    ubatch_size=0,
+    fail_update=False,
+):
     args = sys.modules["vllm.engine.arg_utils"].EngineArgs()
     args.additional_config = {"afd": {"role": role}} if active else {}
-    args.enable_dbo = True
-    args.ubatch_size = 0
+    args.enable_dbo = enable_dbo
+    args.ubatch_size = ubatch_size
     args.all2all_backend = "allgather_reducescatter"
     args.worker_cls = worker_cls
+    args.enable_sp = False
+    args.fail_update = fail_update
     return args
 
 
@@ -285,120 +297,224 @@ def _install_fake_npu_config(monkeypatch):
     return arg_utils_module, NPUPlatform, events
 
 
-def test_config_validation_patch_relaxes_backend_for_afd_ubatching(monkeypatch):
-    arg_utils_module, _config_module = _install_fake_vllm_config(monkeypatch)
-    patch_module = _load_patch_module()
-    # Re-execute the same isolated module to retain the idempotence check.
-    patch_module.__spec__.loader.exec_module(patch_module)
-    args = _engine_args(active=True)
-
-    cfg = arg_utils_module.EngineArgs.create_engine_config(args)
-
-    assert args.all2all_backend == "allgather_reducescatter"
-    assert cfg.parallel_config.all2all_backend == "allgather_reducescatter"
+_CUDA = (VLLM_GPU_WORKER_FQCN, True, "cuda")
+_NPU = (VLLM_ASCEND_NPU_WORKER_FQCN, False, "npu")
+_AUTO_REJECTED = (ValueError, "automatic worker selection")
 
 
-def test_config_validation_patch_preserves_non_afd_validation(monkeypatch):
-    arg_utils_module, _config_module = _install_fake_vllm_config(monkeypatch)
-    _load_patch_module()
-    args = _engine_args(active=False)
-
-    try:
-        arg_utils_module.EngineArgs.create_engine_config(args)
-    except AssertionError as exc:
-        assert "native all2all" in str(exc)
-    else:
-        raise AssertionError("expected native all2all backend assertion")
-
-
-def test_config_validation_patch_allows_vllm_dev_checkout(monkeypatch):
-    arg_utils_module, _config_module = _install_fake_vllm_config(monkeypatch)
-    sys.modules["vllm"].__dict__["__version__"] = "0.1.dev14230+g68b0c3135"
-    _load_patch_module()
-    args = _engine_args(active=True)
-
-    cfg = arg_utils_module.EngineArgs.create_engine_config(args)
-
-    assert cfg.parallel_config.all2all_backend == "allgather_reducescatter"
-
-
-def test_config_validation_patch_selects_worker_after_upstream_post_init(monkeypatch):
-    arg_utils_module, _config_module = _install_fake_vllm_config(monkeypatch)
-    _load_patch_module()
-    args = _engine_args(active=True)
-
-    cfg = arg_utils_module.EngineArgs.create_engine_config(args)
-    assert cfg.post_init_backend == "deepep_low_latency"
-    assert cfg.parallel_config.all2all_backend == "allgather_reducescatter"
-    assert cfg.parallel_config.worker_cls == ATTENTION_WORKER_FQCN
-
-
-def test_config_validation_patch_relaxes_explicit_post_init_revalidation(monkeypatch):
-    arg_utils_module, _config_module = _install_fake_vllm_config(monkeypatch)
-    _load_patch_module()
-    args = _engine_args(active=True)
-
-    cfg = arg_utils_module.EngineArgs.create_engine_config(args)
-    cfg.__post_init__()
-
-    assert cfg.post_init_backend == "deepep_low_latency"
-    assert cfg.parallel_config.all2all_backend == "allgather_reducescatter"
+def _cuda_case(
+    case_id,
+    *,
+    platform=_CUDA,
+    version="0.30.0",
+    revalidate=False,
+    worker=None,
+    post_init_backend="deepep_low_latency",
+    raises=None,
+    **engine_args,
+):
+    engine_args.setdefault("active", True)
+    return pytest.param(
+        platform,
+        version,
+        engine_args,
+        revalidate,
+        (worker, post_init_backend),
+        raises,
+        id=case_id,
+    )
 
 
 @pytest.mark.parametrize(
-    ("role", "expected_worker_cls"),
+    ("platform", "version", "engine_args", "revalidate", "expected", "raises"),
     [
-        ("attention", NPU_ATTENTION_WORKER_FQCN),
-        ("ffn", NPU_FFN_WORKER_FQCN),
+        _cuda_case(
+            "afd-ubatching-relaxed-auto-attention", worker=ATTENTION_WORKER_FQCN
+        ),
+        _cuda_case("afd-auto-ffn", role="ffn", worker=FFN_WORKER_FQCN),
+        _cuda_case(
+            "vllm-dev-checkout",
+            version="0.1.dev14230+g68b0c3135",
+            worker=ATTENTION_WORKER_FQCN,
+        ),
+        _cuda_case(
+            "explicit-post-init-revalidation",
+            revalidate=True,
+            worker=ATTENTION_WORKER_FQCN,
+        ),
+        _cuda_case(
+            "explicit-worker-preserved",
+            worker_cls=ATTENTION_WORKER_FQCN,
+            worker=ATTENTION_WORKER_FQCN,
+        ),
+        _cuda_case(
+            "auto-without-ubatching",
+            role="ffn",
+            enable_dbo=False,
+            worker=FFN_WORKER_FQCN,
+            post_init_backend="allgather_reducescatter",
+        ),
+        _cuda_case(
+            "non-afd-platform-default",
+            active=False,
+            enable_dbo=False,
+            worker=VLLM_GPU_WORKER_FQCN,
+            post_init_backend="allgather_reducescatter",
+        ),
+        _cuda_case(
+            "non-afd-native-validation",
+            active=False,
+            raises=(AssertionError, "native all2all"),
+        ),
+        _cuda_case(
+            "npu-auto-attention", platform=_NPU, worker=NPU_ATTENTION_WORKER_FQCN
+        ),
+        _cuda_case(
+            "npu-auto-ffn", platform=_NPU, role="ffn", worker=NPU_FFN_WORKER_FQCN
+        ),
+        _cuda_case(
+            "reject-310p",
+            platform=(VLLM_ASCEND_310P_WORKER_FQCN, False, "npu"),
+            raises=_AUTO_REJECTED,
+        ),
+        _cuda_case(
+            "reject-xlite",
+            platform=(VLLM_ASCEND_XLITE_WORKER_FQCN, False, "npu"),
+            raises=_AUTO_REJECTED,
+        ),
+        _cuda_case(
+            "reject-other-platform",
+            platform=("other_platform.worker.Worker", False, "xpu"),
+            raises=_AUTO_REJECTED,
+        ),
+        _cuda_case(
+            "reject-cuda-device-not-cuda",
+            platform=(VLLM_GPU_WORKER_FQCN, False, "cuda"),
+            raises=_AUTO_REJECTED,
+        ),
     ],
 )
-def test_config_validation_preserves_npu_dbo_through_auto_worker_normalization(
-    monkeypatch,
-    role,
-    expected_worker_cls,
+def test_config_validation_outcome(
+    monkeypatch, platform, version, engine_args, revalidate, expected, raises
+):
+    arg_utils_module, config_module = _install_fake_vllm_config(monkeypatch)
+    ascend_patch_calls = []
+    monkeypatch.setattr(
+        npu_compat,
+        "apply_afd_ascend_config_patch_if_needed",
+        lambda: ascend_patch_calls.append("npu"),
+    )
+    platform_worker_cls, is_cuda, device_type = platform
+    config_module.VllmConfig.platform_worker_cls = platform_worker_cls
+    _set_fake_platform(is_cuda=is_cuda, device_type=device_type)
+    sys.modules["vllm"].__dict__["__version__"] = version
+    _load_patch_module()
+    args = _engine_args(**engine_args)
+
+    if raises is not None:
+        with pytest.raises(raises[0], match=raises[1]):
+            arg_utils_module.EngineArgs.create_engine_config(args)
+    else:
+        cfg = arg_utils_module.EngineArgs.create_engine_config(args)
+        if revalidate:
+            cfg.__post_init__()
+        worker, post_init_backend = expected
+        assert cfg.parallel_config.worker_cls == worker
+        assert cfg.post_init_backend == post_init_backend
+        assert cfg.parallel_config.all2all_backend == "allgather_reducescatter"
+    assert args.all2all_backend == "allgather_reducescatter"
+    # The Ascend config shim is installed only for AFD configs on NPU.
+    assert bool(ascend_patch_calls) == (engine_args["active"] and device_type == "npu")
+
+
+def test_config_validation_finalizes_async_attention_patch_after_ascend(monkeypatch):
+    arg_utils_module, config_module = _install_fake_vllm_config(monkeypatch)
+    config_module.VllmConfig.platform_worker_cls = VLLM_ASCEND_NPU_WORKER_FQCN
+    _set_fake_platform(is_cuda=False, device_type="npu")
+    calls: list = []
+    monkeypatch.setattr(
+        npu_compat,
+        "apply_afd_ascend_config_patch_if_needed",
+        lambda: calls.append("config"),
+    )
+    monkeypatch.setattr(
+        npu_compat,
+        "apply_afd_async_dp_engine_patch_if_needed",
+        lambda config: calls.append(("engine", config)),
+    )
+    _load_patch_module()
+    args = _engine_args(active=True)
+    args.additional_config["afd"].update(
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+    )
+
+    config = arg_utils_module.EngineArgs.create_engine_config(args)
+
+    assert calls == ["config", "config", ("engine", config)]
+
+
+def _npu_case(case_id, *, worker, keeps_dbo, dbo=True, revalidate=False, **kwargs):
+    kwargs.setdefault("active", True)
+    kwargs.update(enable_dbo=dbo, ubatch_size=2 if dbo else 0)
+    return pytest.param(kwargs, revalidate, worker, keeps_dbo, id=case_id)
+
+
+@pytest.mark.parametrize(
+    ("engine_args", "revalidate", "worker", "keeps_dbo"),
+    [
+        _npu_case("auto-attention", worker=NPU_ATTENTION_WORKER_FQCN, keeps_dbo=True),
+        _npu_case("auto-ffn", role="ffn", worker=NPU_FFN_WORKER_FQCN, keeps_dbo=True),
+        _npu_case(
+            "revalidation-restores-backend",
+            revalidate=True,
+            worker=NPU_ATTENTION_WORKER_FQCN,
+            keeps_dbo=True,
+        ),
+        _npu_case(
+            "explicit-npu-worker",
+            worker_cls=NPU_ATTENTION_WORKER_FQCN,
+            worker=NPU_ATTENTION_WORKER_FQCN,
+            keeps_dbo=True,
+        ),
+        _npu_case(
+            "non-afd-upstream-disables-dbo",
+            active=False,
+            worker=VLLM_ASCEND_NPU_WORKER_FQCN,
+            keeps_dbo=False,
+        ),
+        _npu_case(
+            "afd-dbo-off",
+            role="ffn",
+            dbo=False,
+            worker=NPU_FFN_WORKER_FQCN,
+            keeps_dbo=False,
+        ),
+    ],
+)
+def test_config_validation_npu_outcome(
+    monkeypatch, engine_args, revalidate, worker, keeps_dbo
 ):
     arg_utils_module, _npu_platform, events = _install_fake_npu_config(monkeypatch)
     _load_patch_module()
-    args = _engine_args(active=True, role=role)
-    args.ubatch_size = 2
-    args.enable_sp = False
-    args.fail_update = False
+    args = _engine_args(**engine_args)
 
     cfg = arg_utils_module.EngineArgs.create_engine_config(args)
+    if revalidate:
+        events.clear()
+        cfg.__post_init__()
 
-    assert (
-        "ascend_normalization",
-        "flashinfer_all2allv",
-        VLLM_ASCEND_NPU_WORKER_FQCN,
-    ) in events
-    assert ("native_dbo_validation", "deepep_low_latency") in events
-    assert cfg.post_init_backend == "deepep_low_latency"
+    parallel_config = cfg.parallel_config
+    validated = ("native_dbo_validation", "deepep_low_latency") in events
+    assert validated is keeps_dbo
+    assert parallel_config.enable_dbo is keeps_dbo
+    assert parallel_config.ubatch_size == (2 if keeps_dbo else 0)
+    assert parallel_config.use_ubatching is keeps_dbo
+    assert parallel_config.all2all_backend == "flashinfer_all2allv"
+    assert parallel_config.worker_cls == worker
     assert args.all2all_backend == "allgather_reducescatter"
-    assert cfg.parallel_config.all2all_backend == "flashinfer_all2allv"
-    assert cfg.parallel_config.enable_dbo is True
-    assert cfg.parallel_config.ubatch_size == 2
-    assert cfg.parallel_config.use_ubatching is True
-    assert cfg.parallel_config.worker_cls == expected_worker_cls
-
-
-def test_config_validation_revalidates_npu_dbo_and_restores_backend(monkeypatch):
-    arg_utils_module, _npu_platform, events = _install_fake_npu_config(monkeypatch)
-    _load_patch_module()
-    args = _engine_args(active=True)
-    args.ubatch_size = 2
-    args.enable_sp = False
-    args.fail_update = False
-
-    cfg = arg_utils_module.EngineArgs.create_engine_config(args)
-    events.clear()
-    cfg.__post_init__()
-
-    assert ("native_dbo_validation", "deepep_low_latency") in events
-    assert cfg.post_init_backend == "deepep_low_latency"
-    assert cfg.parallel_config.all2all_backend == "flashinfer_all2allv"
-    assert cfg.parallel_config.enable_dbo is True
-    assert cfg.parallel_config.ubatch_size == 2
-    assert cfg.parallel_config.worker_cls == NPU_ATTENTION_WORKER_FQCN
+    if keeps_dbo:
+        assert cfg.post_init_backend == "deepep_low_latency"
 
 
 def test_config_validation_restores_npu_snapshot_when_platform_update_fails(
@@ -406,10 +522,7 @@ def test_config_validation_restores_npu_snapshot_when_platform_update_fails(
 ):
     arg_utils_module, npu_platform, _events = _install_fake_npu_config(monkeypatch)
     _load_patch_module()
-    args = _engine_args(active=True)
-    args.ubatch_size = 2
-    args.enable_sp = False
-    args.fail_update = True
+    args = _engine_args(active=True, ubatch_size=2, fail_update=True)
 
     with pytest.raises(RuntimeError, match="upstream config failure"):
         arg_utils_module.EngineArgs.create_engine_config(args)
@@ -419,241 +532,3 @@ def test_config_validation_restores_npu_snapshot_when_platform_update_fails(
     assert cfg.parallel_config.ubatch_size == 2
     assert cfg.parallel_config.all2all_backend == "allgather_reducescatter"
     assert args.all2all_backend == "allgather_reducescatter"
-
-
-def test_config_validation_preserves_explicit_npu_worker(monkeypatch):
-    arg_utils_module, _npu_platform, events = _install_fake_npu_config(monkeypatch)
-    _load_patch_module()
-    args = _engine_args(
-        active=True,
-        worker_cls=NPU_ATTENTION_WORKER_FQCN,
-    )
-    args.ubatch_size = 2
-    args.enable_sp = False
-    args.fail_update = False
-
-    cfg = arg_utils_module.EngineArgs.create_engine_config(args)
-
-    assert ("native_dbo_validation", "deepep_low_latency") in events
-    assert cfg.parallel_config.worker_cls == NPU_ATTENTION_WORKER_FQCN
-    assert cfg.parallel_config.enable_dbo is True
-    assert cfg.parallel_config.ubatch_size == 2
-    assert cfg.parallel_config.all2all_backend == "flashinfer_all2allv"
-
-
-def test_config_validation_preserves_non_afd_npu_upstream_behavior(monkeypatch):
-    arg_utils_module, _npu_platform, events = _install_fake_npu_config(monkeypatch)
-    _load_patch_module()
-    args = _engine_args(active=False)
-    args.ubatch_size = 2
-    args.enable_sp = False
-    args.fail_update = False
-
-    cfg = arg_utils_module.EngineArgs.create_engine_config(args)
-
-    assert not any(event[0] == "native_dbo_validation" for event in events)
-    assert cfg.parallel_config.enable_dbo is False
-    assert cfg.parallel_config.ubatch_size == 0
-    assert cfg.parallel_config.use_ubatching is False
-    assert cfg.parallel_config.all2all_backend == "flashinfer_all2allv"
-    assert cfg.parallel_config.worker_cls == VLLM_ASCEND_NPU_WORKER_FQCN
-
-
-def test_config_validation_preserves_npu_dbo_off_behavior(monkeypatch):
-    arg_utils_module, _npu_platform, events = _install_fake_npu_config(monkeypatch)
-    _load_patch_module()
-    args = _engine_args(active=True, role="ffn")
-    args.enable_dbo = False
-    args.ubatch_size = 0
-    args.enable_sp = False
-    args.fail_update = False
-
-    cfg = arg_utils_module.EngineArgs.create_engine_config(args)
-
-    assert not any(event[0] == "native_dbo_validation" for event in events)
-    assert cfg.parallel_config.enable_dbo is False
-    assert cfg.parallel_config.ubatch_size == 0
-    assert cfg.parallel_config.all2all_backend == "flashinfer_all2allv"
-    assert cfg.parallel_config.worker_cls == NPU_FFN_WORKER_FQCN
-
-
-@pytest.mark.parametrize(
-    (
-        "role",
-        "platform_worker_cls",
-        "is_cuda",
-        "device_type",
-        "expected_worker_cls",
-    ),
-    [
-        (
-            "attention",
-            VLLM_GPU_WORKER_FQCN,
-            True,
-            "cuda",
-            ATTENTION_WORKER_FQCN,
-        ),
-        ("ffn", VLLM_GPU_WORKER_FQCN, True, "cuda", FFN_WORKER_FQCN),
-        (
-            "attention",
-            VLLM_ASCEND_NPU_WORKER_FQCN,
-            False,
-            "npu",
-            NPU_ATTENTION_WORKER_FQCN,
-        ),
-        (
-            "ffn",
-            VLLM_ASCEND_NPU_WORKER_FQCN,
-            False,
-            "npu",
-            NPU_FFN_WORKER_FQCN,
-        ),
-    ],
-)
-def test_config_validation_patch_auto_selects_afd_worker(
-    monkeypatch,
-    role,
-    platform_worker_cls,
-    is_cuda,
-    device_type,
-    expected_worker_cls,
-):
-    arg_utils_module, config_module = _install_fake_vllm_config(monkeypatch)
-    monkeypatch.setattr(
-        npu_compat,
-        "apply_afd_ascend_config_patch_if_needed",
-        lambda: None,
-    )
-    config_module.VllmConfig.platform_worker_cls = platform_worker_cls
-    _set_fake_platform(is_cuda=is_cuda, device_type=device_type)
-    _load_patch_module()
-    args = _engine_args(active=True, role=role)
-
-    cfg = arg_utils_module.EngineArgs.create_engine_config(args)
-
-    assert cfg.parallel_config.worker_cls == expected_worker_cls
-
-
-def test_config_validation_patch_preserves_explicit_worker(monkeypatch):
-    arg_utils_module, config_module = _install_fake_vllm_config(monkeypatch)
-    config_module.VllmConfig.platform_worker_cls = VLLM_GPU_WORKER_FQCN
-    _load_patch_module()
-    args = _engine_args(
-        active=True,
-        role="attention",
-        worker_cls=ATTENTION_WORKER_FQCN,
-    )
-
-    cfg = arg_utils_module.EngineArgs.create_engine_config(args)
-
-    assert cfg.parallel_config.worker_cls == ATTENTION_WORKER_FQCN
-
-
-def test_config_validation_patch_auto_selects_without_ubatching(monkeypatch):
-    arg_utils_module, config_module = _install_fake_vllm_config(monkeypatch)
-    config_module.VllmConfig.platform_worker_cls = VLLM_GPU_WORKER_FQCN
-    _load_patch_module()
-    args = _engine_args(active=True, role="ffn")
-    args.enable_dbo = False
-
-    cfg = arg_utils_module.EngineArgs.create_engine_config(args)
-
-    assert cfg.parallel_config.worker_cls == FFN_WORKER_FQCN
-
-
-def test_config_validation_installs_ascend_patch_only_on_npu(monkeypatch):
-    arg_utils_module, config_module = _install_fake_vllm_config(monkeypatch)
-
-    calls = []
-    monkeypatch.setattr(
-        npu_compat,
-        "apply_afd_ascend_config_patch_if_needed",
-        lambda: calls.append("npu"),
-    )
-    patch_module = _load_patch_module()
-    # Re-execute the same isolated module to retain the idempotence check.
-    patch_module.__spec__.loader.exec_module(patch_module)
-
-    cuda_args = _engine_args(active=True)
-    arg_utils_module.EngineArgs.create_engine_config(cuda_args)
-    assert calls == []
-
-    config_module.VllmConfig.platform_worker_cls = VLLM_ASCEND_NPU_WORKER_FQCN
-    _set_fake_platform(is_cuda=False, device_type="npu")
-    npu_args = _engine_args(active=True)
-    arg_utils_module.EngineArgs.create_engine_config(npu_args)
-    assert calls == ["npu", "npu"]
-
-
-def test_config_validation_finalizes_async_attention_patch_after_ascend(monkeypatch):
-    arg_utils_module, config_module = _install_fake_vllm_config(monkeypatch)
-    config_module.VllmConfig.platform_worker_cls = VLLM_ASCEND_NPU_WORKER_FQCN
-    _set_fake_platform(is_cuda=False, device_type="npu")
-
-    config_patch_calls = []
-    engine_patch_configs: list[SimpleNamespace] = []
-    monkeypatch.setattr(
-        npu_compat,
-        "apply_afd_ascend_config_patch_if_needed",
-        lambda: config_patch_calls.append("config"),
-    )
-    monkeypatch.setattr(
-        npu_compat,
-        "apply_afd_async_dp_engine_patch_if_needed",
-        engine_patch_configs.append,
-    )
-    patch_module = _load_patch_module()
-    # Re-execute the same isolated module to retain the idempotence check.
-    patch_module.__spec__.loader.exec_module(patch_module)
-    args = _engine_args(active=True)
-    args.additional_config["afd"].update(
-        connector="CAMAsyncAFDConnector",
-        async_dp=True,
-    )
-
-    config = arg_utils_module.EngineArgs.create_engine_config(args)
-
-    assert config_patch_calls == ["config", "config"]
-    assert engine_patch_configs == [config]
-
-
-def test_config_validation_patch_preserves_non_afd_platform_default(monkeypatch):
-    arg_utils_module, config_module = _install_fake_vllm_config(monkeypatch)
-    config_module.VllmConfig.platform_worker_cls = VLLM_GPU_WORKER_FQCN
-    _load_patch_module()
-    args = _engine_args(active=False)
-    args.enable_dbo = False
-
-    cfg = arg_utils_module.EngineArgs.create_engine_config(args)
-
-    assert cfg.parallel_config.worker_cls == VLLM_GPU_WORKER_FQCN
-
-
-@pytest.mark.parametrize(
-    ("platform_worker_cls", "is_cuda", "device_type"),
-    [
-        (VLLM_ASCEND_310P_WORKER_FQCN, False, "npu"),
-        (VLLM_ASCEND_XLITE_WORKER_FQCN, False, "npu"),
-        ("other_platform.worker.Worker", False, "xpu"),
-        (VLLM_GPU_WORKER_FQCN, False, "cuda"),
-    ],
-)
-def test_config_validation_patch_rejects_unsupported_auto_platform(
-    monkeypatch,
-    platform_worker_cls,
-    is_cuda,
-    device_type,
-):
-    arg_utils_module, config_module = _install_fake_vllm_config(monkeypatch)
-    monkeypatch.setattr(
-        npu_compat,
-        "apply_afd_ascend_config_patch_if_needed",
-        lambda: None,
-    )
-    config_module.VllmConfig.platform_worker_cls = platform_worker_cls
-    _set_fake_platform(is_cuda=is_cuda, device_type=device_type)
-    _load_patch_module()
-    args = _engine_args(active=True)
-
-    with pytest.raises(ValueError, match="automatic worker selection"):
-        arg_utils_module.EngineArgs.create_engine_config(args)

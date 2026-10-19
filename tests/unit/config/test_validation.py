@@ -18,143 +18,105 @@ from afd_plugin.validation import (
     validate_npu_model_runner_v2_config,
 )
 
+MODEL_UTILS_MODULE = "afd_plugin.model_executor.models.model_utils"
+
 
 def _vllm_like_config(*, afd, worker_cls):
     return SimpleNamespace(
-        additional_config={"afd": afd},
+        additional_config={} if afd is None else {"afd": afd},
         parallel_config=SimpleNamespace(worker_cls=worker_cls),
     )
 
 
-def test_attention_stack_validation_accepts_matching_worker():
-    vllm_config = _vllm_like_config(
-        afd={"role": "attention"},
-        worker_cls=ATTENTION_WORKER_FQCN,
-    )
-
+@pytest.mark.parametrize(
+    "afd, worker_cls, worker_override",
+    [
+        pytest.param(
+            {"role": "attention"},
+            ATTENTION_WORKER_FQCN,
+            None,
+            id="attention-matching-worker",
+        ),
+        pytest.param({"role": "ffn"}, FFN_WORKER_FQCN, None, id="ffn-matching-worker"),
+        pytest.param(
+            {"role": "attention", "connector": "CAMP2pAFDConnector"},
+            NPU_ATTENTION_WORKER_FQCN,
+            NPU_ATTENTION_WORKER_FQCN,
+            id="npu-worker-override",
+        ),
+        pytest.param(
+            {"role": "attention", "connector": "CAMAsyncAFDConnector"},
+            NPU_ATTENTION_WORKER_FQCN,
+            None,
+            id="async-connector-npu-attention-worker",
+        ),
+        pytest.param(
+            {"role": "ffn", "connector": "CAMAsyncAFDConnector"},
+            NPU_FFN_WORKER_FQCN,
+            None,
+            id="async-connector-npu-ffn-worker",
+        ),
+    ],
+)
+def test_stack_validation_accepts(afd, worker_cls, worker_override):
     config = assert_compatible_afd_stack(
-        vllm_config,
+        _vllm_like_config(afd=afd, worker_cls=worker_cls),
         caller="test",
-        expected_role="attention",
+        expected_role=afd["role"],
+        expected_worker_qualname_override=worker_override,
     )
 
-    assert config.role == "attention"
+    assert config.role == afd["role"]
+    if "connector" in afd:
+        assert config.connector == afd["connector"]
 
 
-def test_ffn_stack_validation_accepts_matching_worker():
-    vllm_config = _vllm_like_config(
-        afd={"role": "ffn"},
-        worker_cls=FFN_WORKER_FQCN,
-    )
-
-    config = assert_compatible_afd_stack(
-        vllm_config,
-        caller="test",
-        expected_role="ffn",
-    )
-
-    assert config.role == "ffn"
-
-
-def test_stack_validation_rejects_missing_afd_config():
-    vllm_config = SimpleNamespace(
-        additional_config={},
-        parallel_config=SimpleNamespace(worker_cls=ATTENTION_WORKER_FQCN),
-    )
-
-    with pytest.raises(ValueError, match="requires additional_config"):
-        assert_compatible_afd_stack(vllm_config, caller="test")
-
-
-def test_stack_validation_rejects_wrong_worker():
-    vllm_config = _vllm_like_config(
-        afd={"role": "ffn"},
-        worker_cls=ATTENTION_WORKER_FQCN,
-    )
-
-    with pytest.raises(ValueError, match="invalid worker class") as exc_info:
-        assert_compatible_afd_stack(vllm_config, caller="test")
-    assert "remove --worker-cls" in str(exc_info.value)
-
-
-def test_stack_validation_rejects_auto_worker():
-    vllm_config = _vllm_like_config(
-        afd={"role": "attention"},
-        worker_cls="auto",
-    )
-
-    with pytest.raises(ValueError, match="remained 'auto'") as exc_info:
-        assert_compatible_afd_stack(vllm_config, caller="test")
-    assert "ensure the AFD general plugin is loaded" in str(exc_info.value)
-
-
-def test_stack_validation_accepts_npu_worker_override():
-    vllm_config = _vllm_like_config(
-        afd={
-            "role": "attention",
-            "connector": "CAMP2pAFDConnector",
-        },
-        worker_cls=NPU_ATTENTION_WORKER_FQCN,
-    )
-
-    config = assert_compatible_afd_stack(
-        vllm_config,
-        caller="test",
-        expected_role="attention",
-        expected_worker_qualname_override=NPU_ATTENTION_WORKER_FQCN,
-    )
-
-    assert config.connector == "CAMP2pAFDConnector"
-
-
-def test_async_connector_requires_npu_attention_worker():
-    vllm_config = _vllm_like_config(
-        afd={
-            "role": "attention",
-            "connector": "CAMAsyncAFDConnector",
-        },
-        worker_cls=ATTENTION_WORKER_FQCN,
-    )
-
-    with pytest.raises(ValueError, match="requires Ascend NPU worker"):
+@pytest.mark.parametrize(
+    "afd, worker_cls, expected_fragments",
+    [
+        pytest.param(
+            None,
+            ATTENTION_WORKER_FQCN,
+            ("requires additional_config",),
+            id="missing-afd-config",
+        ),
+        pytest.param(
+            {"role": "ffn"},
+            ATTENTION_WORKER_FQCN,
+            ("invalid worker class", "remove --worker-cls"),
+            id="wrong-worker",
+        ),
+        pytest.param(
+            {"role": "attention"},
+            "auto",
+            ("remained 'auto'", "ensure the AFD general plugin is loaded"),
+            id="auto-worker",
+        ),
+        pytest.param(
+            {"role": "attention", "connector": "CAMAsyncAFDConnector"},
+            ATTENTION_WORKER_FQCN,
+            ("requires Ascend NPU worker",),
+            id="async-connector-gpu-worker",
+        ),
+    ],
+)
+def test_stack_validation_rejects(afd, worker_cls, expected_fragments):
+    with pytest.raises(ValueError) as exc_info:
         assert_compatible_afd_stack(
-            vllm_config,
+            _vllm_like_config(afd=afd, worker_cls=worker_cls),
             caller="test",
-            expected_role="attention",
+            expected_role=None if afd is None else afd["role"],
         )
 
-    vllm_config.parallel_config.worker_cls = NPU_ATTENTION_WORKER_FQCN
-    config = assert_compatible_afd_stack(
-        vllm_config,
-        caller="test",
-        expected_role="attention",
-    )
-    assert config.connector == "CAMAsyncAFDConnector"
-
-
-def test_async_connector_requires_npu_ffn_worker():
-    vllm_config = _vllm_like_config(
-        afd={
-            "role": "ffn",
-            "connector": "CAMAsyncAFDConnector",
-        },
-        worker_cls=NPU_FFN_WORKER_FQCN,
-    )
-
-    config = assert_compatible_afd_stack(
-        vllm_config,
-        caller="test",
-        expected_role="ffn",
-    )
-
-    assert config.connector == "CAMAsyncAFDConnector"
+    for fragment in expected_fragments:
+        assert fragment in str(exc_info.value)
 
 
 @pytest.fixture
 def mrv2_config(monkeypatch):
     # Model registration is tested with the real vLLM runtime elsewhere.
     # Isolate that import so deployment policy tests remain CPU/dependency-safe.
-    model_utils = ModuleType("afd_plugin.model_executor.models.model_utils")
+    model_utils = ModuleType(MODEL_UTILS_MODULE)
     monkeypatch.setattr(
         model_utils, "has_afd_model_registration", lambda config: True, raising=False
     )
@@ -188,119 +150,158 @@ def mrv2_config(monkeypatch):
             cudagraph_mode="FULL_DECODE_ONLY",
             pass_config=SimpleNamespace(enable_sp=False),
         ),
+        speculative_config=None,
     )
 
 
-@pytest.mark.parametrize("role", ["attention", "ffn"])
-@pytest.mark.parametrize("dp_size, tp_size", [(1, 1), (1, 2), (2, 1), (2, 2)])
-@pytest.mark.parametrize("compute_gate_on_attention", [False, True])
-@pytest.mark.parametrize("enforce_eager", [False, True])
-def test_gpu_v2_validator_accepts_two_ubatches(
-    mrv2_config, role, dp_size, tp_size, compute_gate_on_attention, enforce_eager
-):
-    mrv2_config.additional_config["afd"]["role"] = role
-    mrv2_config.additional_config["afd"]["compute_gate_on_attention"] = (
-        compute_gate_on_attention
-    )
-    mrv2_config.model_config.enforce_eager = enforce_eager
-    mrv2_config.parallel_config.data_parallel_size = dp_size
-    mrv2_config.parallel_config.tensor_parallel_size = tp_size
-    mrv2_config.additional_config["afd"].update(
-        num_attention_ranks=dp_size * tp_size,
-        num_ffn_ranks=dp_size * tp_size,
-    )
-    validate_gpu_model_runner_v2_config(
-        mrv2_config, expected_role=role, device_type="cuda"
-    )
+# backend -> (validator, device_type, AFD config defaults for that backend)
+MRV2_BACKENDS = {
+    "gpu": (validate_gpu_model_runner_v2_config, "cuda", {}),
+    "npu": (
+        validate_npu_model_runner_v2_config,
+        "npu",
+        {"connector": "CAMP2pAFDConnector"},
+    ),
+}
 
 
-@pytest.mark.parametrize("role, dp_size", [("attention", 2), ("ffn", 1)])
-def test_gpu_v2_validator_accepts_asymmetric_attention_to_ffn_topology(
-    mrv2_config, role, dp_size
-):
-    mrv2_config.additional_config["afd"].update(
-        role=role, num_attention_ranks=2, num_ffn_ranks=1
-    )
-    mrv2_config.parallel_config.data_parallel_size = dp_size
+def _symmetric_ranks(dp_size, tp_size):
+    return {
+        "parallel_config.data_parallel_size": dp_size,
+        "parallel_config.tensor_parallel_size": tp_size,
+        "afd.num_attention_ranks": dp_size * tp_size,
+        "afd.num_ffn_ranks": dp_size * tp_size,
+    }
 
-    validate_gpu_model_runner_v2_config(
-        mrv2_config, expected_role=role, device_type="cuda"
-    )
+
+GRAPH = {"model_config.enforce_eager": False}
+V1_RUNNER = {"use_v2_model_runner": False}
+PIPELINE_PARALLEL = {"parallel_config.pipeline_parallel_size": 2}
+
+
+def _run_mrv2_validator(config, backend, role, overrides):
+    validator, device_type, afd_defaults = MRV2_BACKENDS[backend]
+    afd = config.additional_config["afd"]
+    afd.update(afd_defaults, role=role)
+    for path, value in overrides.items():
+        if path.startswith("afd."):
+            afd[path.removeprefix("afd.")] = value
+            continue
+        *parents, attr = path.split(".")
+        target = config
+        for parent in parents:
+            target = getattr(target, parent)
+        setattr(target, attr, value)
+    validator(config, expected_role=role, device_type=device_type)
 
 
 @pytest.mark.parametrize(
-    "num_ubatches",
-    [1, 3],
+    "backend, role, overrides",
+    [
+        pytest.param("gpu", "attention", {}, id="gpu-attention-eager"),
+        pytest.param("gpu", "ffn", {}, id="gpu-ffn-eager"),
+        pytest.param("gpu", "attention", GRAPH, id="gpu-attention-full-decode-graph"),
+        pytest.param("gpu", "ffn", GRAPH, id="gpu-ffn-full-decode-graph"),
+        pytest.param(
+            "gpu", "attention", _symmetric_ranks(1, 1), id="gpu-attention-dp1-tp1"
+        ),
+        pytest.param("gpu", "ffn", _symmetric_ranks(1, 2), id="gpu-ffn-dp1-tp2"),
+        pytest.param(
+            "gpu",
+            "attention",
+            {**_symmetric_ranks(2, 2), **GRAPH},
+            id="gpu-attention-dp2-tp2-graph",
+        ),
+        pytest.param(
+            "gpu",
+            "attention",
+            {"afd.compute_gate_on_attention": True},
+            id="gpu-compute-gate-on-attention",
+        ),
+        pytest.param(
+            "gpu",
+            "attention",
+            {"afd.num_ffn_ranks": 1},
+            id="gpu-asymmetric-attention-dp2",
+        ),
+        pytest.param(
+            "gpu",
+            "ffn",
+            {"afd.num_ffn_ranks": 1, "parallel_config.data_parallel_size": 1},
+            id="gpu-asymmetric-ffn-dp1",
+        ),
+        pytest.param("npu", "attention", {}, id="npu-sync-dbo-attention-eager"),
+        pytest.param("npu", "ffn", {}, id="npu-sync-dbo-ffn-eager"),
+        pytest.param("npu", "attention", GRAPH, id="npu-sync-dbo-attention-full-graph"),
+        pytest.param("npu", "ffn", GRAPH, id="npu-sync-dbo-ffn-full-graph"),
+    ],
 )
-def test_gpu_v2_validator_rejects_unsupported_ubatching(mrv2_config, num_ubatches):
-    mrv2_config.parallel_config.num_ubatches = num_ubatches
-    with pytest.raises(RuntimeError, match="exactly two microbatches"):
-        validate_gpu_model_runner_v2_config(
-            mrv2_config, expected_role="attention", device_type="cuda"
-        )
-
-
-@pytest.mark.parametrize("role", ["attention", "ffn"])
-def test_gpu_validator_rejects_v1_before_importing_model_runtime(
-    monkeypatch, mrv2_config, role
+def test_mrv2_validator_accepts_supported_deployment(
+    mrv2_config, backend, role, overrides
 ):
-    mrv2_config.use_v2_model_runner = False
-    mrv2_config.additional_config["afd"]["role"] = role
-    # The V1 deployment must fail before importing or constructing a runner.
-    # Block the runtime module so an import before rejection fails visibly even
-    # when vLLM is installed in the test environment.
-    monkeypatch.setitem(
-        sys.modules, "afd_plugin.model_executor.models.model_utils", None
-    )
-
-    with pytest.raises(RuntimeError, match="requires ModelRunnerV2"):
-        validate_gpu_model_runner_v2_config(
-            mrv2_config, expected_role=role, device_type="cuda"
-        )
+    _run_mrv2_validator(mrv2_config, backend, role, overrides)
 
 
-@pytest.mark.parametrize("role", ["attention", "ffn"])
-def test_npu_validator_rejects_v1_before_model_runtime(monkeypatch, mrv2_config, role):
-    mrv2_config.use_v2_model_runner = False
-    mrv2_config.additional_config["afd"].update(
-        role=role, connector="CAMP2pAFDConnector"
-    )
-    monkeypatch.setitem(
-        sys.modules, "afd_plugin.model_executor.models.model_utils", None
-    )
-    with pytest.raises(RuntimeError, match="AFD NPU requires ModelRunnerV2"):
-        validate_npu_model_runner_v2_config(
-            mrv2_config, expected_role=role, device_type="npu"
-        )
-
-
-@pytest.mark.parametrize("role", ["attention", "ffn"])
-def test_npu_validator_rejects_pipeline_parallel_before_model_runtime(
-    monkeypatch, mrv2_config, role
+@pytest.mark.parametrize(
+    "backend, role, overrides, expected_error",
+    [
+        pytest.param(
+            "gpu",
+            "attention",
+            V1_RUNNER,
+            "AFD GPU requires ModelRunnerV2",
+            id="gpu-v1-attention",
+        ),
+        pytest.param(
+            "gpu", "ffn", V1_RUNNER, "AFD GPU requires ModelRunnerV2", id="gpu-v1-ffn"
+        ),
+        pytest.param(
+            "gpu",
+            "attention",
+            {"parallel_config.num_ubatches": 1},
+            "exactly two microbatches",
+            id="gpu-one-ubatch",
+        ),
+        pytest.param(
+            "gpu",
+            "attention",
+            {"parallel_config.num_ubatches": 3},
+            "exactly two microbatches",
+            id="gpu-three-ubatches",
+        ),
+        pytest.param(
+            "npu",
+            "attention",
+            V1_RUNNER,
+            "AFD NPU requires ModelRunnerV2",
+            id="npu-v1-attention",
+        ),
+        pytest.param(
+            "npu", "ffn", V1_RUNNER, "AFD NPU requires ModelRunnerV2", id="npu-v1-ffn"
+        ),
+        pytest.param(
+            "npu",
+            "attention",
+            PIPELINE_PARALLEL,
+            "does not support PP or CP",
+            id="npu-pipeline-parallel-attention",
+        ),
+        pytest.param(
+            "npu",
+            "ffn",
+            PIPELINE_PARALLEL,
+            "does not support PP or CP",
+            id="npu-pipeline-parallel-ffn",
+        ),
+    ],
+)
+def test_mrv2_validator_rejects_before_importing_model_runtime(
+    monkeypatch, mrv2_config, backend, role, overrides, expected_error
 ):
-    mrv2_config.additional_config["afd"].update(
-        role=role, connector="CAMP2pAFDConnector"
-    )
-    mrv2_config.parallel_config.pipeline_parallel_size = 2
-    monkeypatch.setitem(
-        sys.modules, "afd_plugin.model_executor.models.model_utils", None
-    )
-    with pytest.raises(RuntimeError, match="does not support PP or CP"):
-        validate_npu_model_runner_v2_config(
-            mrv2_config, expected_role=role, device_type="npu"
-        )
+    # Unsupported deployments must fail before importing or constructing a
+    # runner. Block the runtime module so an import before rejection fails
+    # visibly even when vLLM is installed in the test environment.
+    monkeypatch.setitem(sys.modules, MODEL_UTILS_MODULE, None)
 
-
-@pytest.mark.parametrize("role", ["attention", "ffn"])
-@pytest.mark.parametrize("enforce_eager", [False, True])
-def test_npu_sync_dbo_policy_allows_eager_and_full_graph(
-    mrv2_config, role, enforce_eager
-):
-    mrv2_config.additional_config["afd"].update(
-        role=role, connector="CAMP2pAFDConnector"
-    )
-    mrv2_config.model_config.enforce_eager = enforce_eager
-    mrv2_config.speculative_config = None
-    validate_npu_model_runner_v2_config(
-        mrv2_config, expected_role=role, device_type="npu"
-    )
+    with pytest.raises(RuntimeError, match=expected_error):
+        _run_mrv2_validator(mrv2_config, backend, role, overrides)
