@@ -25,6 +25,8 @@ from vllm.v1.worker.gpu import model_runner  # noqa: E402, F401
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadata  # noqa: E402
 from vllm_ascend.attention.mla_v1 import AscendMLAMetadata  # noqa: E402
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadata  # noqa: E402
+from vllm_ascend.ops import rope_dsv4  # noqa: E402
+from vllm_ascend.ops.rope_dsv4 import RopeDataProxy  # noqa: E402
 
 from afd_plugin.model_executor.models.npu import (  # noqa: E402
     deepseek_attention_metadata,
@@ -52,6 +54,14 @@ def test_full_graph_reads_updated_block_ids_and_stage_rope(monkeypatch, backend)
     shared_cos = torch.empty(2, 1, device=device)
     shared_sin = torch.empty_like(shared_cos)
     built_tables = []
+    if backend == "dsa":
+        state = rope_dsv4.RopeGlobalState()
+        state.layer_info["layer"] = ("stage-rope", ["default"])
+        monkeypatch.setattr(rope_dsv4, "_ROPE_STATE", state)
+
+    def dsa_rope(cos, sin):
+        data = {"stage-rope": {"default": (cos, sin)}}
+        return RopeDataProxy(data), RopeDataProxy(data, is_cos=False)
 
     def build(**kwargs):
         table = kwargs["block_tables"][0]
@@ -69,14 +79,15 @@ def test_full_graph_reads_updated_block_ids_and_stage_rope(monkeypatch, backend)
             metadata.cos, metadata.sin = shared_cos, shared_sin
         else:
             metadata = object.__new__(AscendDSAMetadata)
-            metadata.req_metadata = SimpleNamespace(cos=shared_cos, sin=shared_sin)
+            cos, sin = dsa_rope(shared_cos, shared_sin)
+            metadata.req_metadata = SimpleNamespace(cos=cos, sin=sin)
         return {"layer": metadata}
 
     monkeypatch.setattr(ubatch_runner, "build_attn_metadata", build)
     monkeypatch.setattr(
         deepseek_attention_metadata,
         "get_cos_and_sin_dsa",
-        lambda positions, use_cache: (
+        lambda positions, use_cache: dsa_rope(
             positions.float().view(2, 1) * 3,
             positions.float().view(2, 1) * 5,
         ),
@@ -122,7 +133,9 @@ def test_full_graph_reads_updated_block_ids_and_stage_rope(monkeypatch, backend)
             return metadata.decode.cos, metadata.decode.sin
         if backend == "sfa":
             return metadata.cos, metadata.sin
-        return metadata.req_metadata.cos, metadata.req_metadata.sin
+        assert isinstance(metadata.req_metadata.cos, RopeDataProxy)
+        assert isinstance(metadata.req_metadata.sin, RopeDataProxy)
+        return metadata.req_metadata.cos["layer"], metadata.req_metadata.sin["layer"]
 
     captured = [prepare(stage, True) for stage in range(2)]
     captured_tables = list(built_tables)

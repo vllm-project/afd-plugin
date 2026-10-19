@@ -18,7 +18,7 @@ from vllm_ascend.attention.sfa_v1 import (
     AscendSFAMetadataBuilder,
 )
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
-from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
+from vllm_ascend.ops.rope_dsv4 import RopeDataProxy, get_cos_and_sin_dsa
 
 
 def isolate_deepseek_attention_builder_inputs(
@@ -112,12 +112,30 @@ def materialize_deepseek_attention_metadata(
         if rope_buffers is None:
             metadata.req_metadata.cos, metadata.req_metadata.sin = cos, sin
         else:
-            metadata.req_metadata.cos = _own_rope(
-                cos, "request.cos", rope_buffers, rope_capacity
-            )
-            metadata.req_metadata.sin = _own_rope(
-                sin, "request.sin", rope_buffers, rope_capacity
-            )
+            # Pinned vllm-ascend ops/rope_dsv4.py at commit
+            # 8d4409d6256d8a6729140ddcc0d1889e3f96cdd6 shares _data between
+            # the cos/sin proxies. Own each Tensor pair, preserving that API.
+            owned_data: dict[str, dict[str, tuple[torch.Tensor, torch.Tensor]]] = {}
+            for config_key, groups in cos._data.items():
+                owned_data[config_key] = {}
+                for group, (cos_value, sin_value) in groups.items():
+                    field = repr((config_key, group))
+                    owned_data[config_key][group] = (
+                        _own_rope(
+                            cos_value,
+                            f"request.cos.{field}",
+                            rope_buffers,
+                            rope_capacity,
+                        ),
+                        _own_rope(
+                            sin_value,
+                            f"request.sin.{field}",
+                            rope_buffers,
+                            rope_capacity,
+                        ),
+                    )
+            metadata.req_metadata.cos = RopeDataProxy(owned_data)
+            metadata.req_metadata.sin = RopeDataProxy(owned_data, is_cos=False)
 
 
 def _own_rope(
