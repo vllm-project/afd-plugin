@@ -339,8 +339,14 @@ def _fail_if_unsupported_deepseek_v4_pd(
         raise RuntimeError(
             "DeepSeek-V4 AFD Mooncake PD attaches KV transfer only to Attention"
         )
-    if afd_config.connector != "P2pHcclAFDConnector":
-        raise RuntimeError("DeepSeek-V4 AFD Mooncake PD requires P2pHcclAFDConnector")
+    if afd_config.connector not in {
+        "P2pHcclAFDConnector",
+        "WindowAFDConnector",
+    }:
+        raise RuntimeError(
+            "DeepSeek-V4 AFD Mooncake PD requires P2pHcclAFDConnector "
+            "or WindowAFDConnector"
+        )
     if getattr(kv_config, "kv_connector", None) != "MooncakeHybridConnector":
         raise RuntimeError("DeepSeek-V4 AFD PD supports only MooncakeHybridConnector")
     if getattr(kv_config, "kv_role", None) != "kv_consumer":

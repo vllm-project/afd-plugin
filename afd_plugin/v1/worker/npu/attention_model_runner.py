@@ -315,22 +315,42 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 f"requests={num_reqs}/{num_reqs_padded}"
             )
 
-        # Eager execution does not enter vLLM-Ascend's Graph/SP-only padding
-        # branch.  Reuse the same helper used by its dummy run so the padded
-        # request has a valid [0, 1, 2] query layout instead of stale metadata.
-        padded_reqs = self._pad_query_start_loc_for_fia(
-            self.query_start_loc,
-            num_tokens_padded,
-            num_reqs_padded,
-            num_reqs,
-            CUDAGraphMode.NONE,
-            num_reqs_padded,
-        )
-        if padded_reqs != num_reqs_padded:
-            raise RuntimeError(
-                "Window U2 dummy padding unexpectedly changed the request "
-                f"capacity: {num_reqs_padded} -> {padded_reqs}"
+        num_dummy_tokens = num_tokens_padded - num_tokens
+        num_dummy_reqs = num_reqs_padded - num_reqs
+        if num_dummy_tokens == num_dummy_reqs and num_dummy_reqs > 0:
+            # Window owns both sides of this padding: pair each reserved dummy
+            # request with one dummy token.  The generic Ascend helper cannot
+            # infer this relationship when speculative decode has a uniform
+            # query length greater than one (notably the one-token PD handoff).
+            actual_token_boundary = int(self.query_start_loc.np[num_reqs])
+            if actual_token_boundary != num_tokens:
+                raise RuntimeError(
+                    "Window U2 dummy padding received an invalid live request "
+                    f"boundary: expected {num_tokens}, got "
+                    f"{actual_token_boundary}"
+                )
+            self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = (
+                self.arange_np[1 : num_dummy_reqs + 1]
+                + actual_token_boundary
             )
+            self.query_start_loc.copy_to_gpu()
+        else:
+            # Eager execution does not enter vLLM-Ascend's Graph/SP-only
+            # padding branch. Reuse its helper for padding shapes that Window
+            # does not own explicitly.
+            padded_reqs = self._pad_query_start_loc_for_fia(
+                self.query_start_loc,
+                num_tokens_padded,
+                num_reqs_padded,
+                num_reqs,
+                CUDAGraphMode.NONE,
+                num_reqs_padded,
+            )
+            if padded_reqs != num_reqs_padded:
+                raise RuntimeError(
+                    "Window U2 dummy padding unexpectedly changed the request "
+                    f"capacity: {num_reqs_padded} -> {padded_reqs}"
+                )
 
         token_slice = slice(num_tokens, num_tokens_padded)
         request_slice = slice(num_reqs, num_reqs_padded)
