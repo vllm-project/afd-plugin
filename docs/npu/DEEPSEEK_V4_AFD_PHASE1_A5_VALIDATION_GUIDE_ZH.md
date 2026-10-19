@@ -1,6 +1,6 @@
 # DeepSeek-V4 AFD A5 1030 合并验证指导书
 
-更新日期：2026-10-19（性能部分按现场先后顺序组织为九步，统一使用 Synthetic 合成数据发压；不更新已有实机验证结论）。本文合并旧 A5 dSpark/PD 指导与[1030 执行计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)，是本期现场操作入口。
+更新日期：2026-10-19（性能部分按现场先后顺序组织为九步，Synthetic 数据由 benchmark 自动生成后发压；不更新已有实机验证结论）。本文合并旧 A5 dSpark/PD 指导与[1030 执行计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)，是本期现场操作入口。
 执行计划规定交付范围和日期，本文规定现场命令、验证顺序、证据与失败处理。
 本文是待执行指导，不代表组合已经通过 A5 验收。
 
@@ -8,9 +8,9 @@
 
 ## 0. 只做性能验证时，从哪里开始
 
-按第 8.2–8.10 节顺序执行：**准备环境 → 准备输入 → 选择一组配置 → 启动 → 检查 → 预热和测量 → 停服 → 换组/扩展长度 → 计算收益**。
+按第 8.2–8.10 节顺序执行：**准备环境 → 设置 Synthetic 参数 → 选择一组配置 → 启动 → 检查 → 预热和测量 → 停服 → 换组/扩展长度 → 计算收益**。
 
-**性能数据集统一使用 Synthetic，不使用 GSM8K。** 固定 seed 生成合成输入，首轮输入 16K、输出 1024，四组复用同一文件。GSM8K 仅用于第 8.1 节的独立精度验收。
+**性能数据集统一使用 Synthetic，不使用 GSM8K。** benchmark 按固定 seed 自动生成合成输入，首轮输入 16K、输出 1024，同一 BS 的四组保持生成参数一致。GSM8K 仅用于第 8.1 节的独立精度验收。
 
 先在**同一台 8 卡 A5** 上依次运行四组：
 
@@ -1330,74 +1330,35 @@ export BASE_URL="http://$PROXY_HOST_IP:$PROXY_PORT"
 export ATTENTION_URL="http://$ATTENTION_HOST_IP:$ATTENTION_API_PORT"
 export API_PORT="$ATTENTION_API_PORT"
 export PERF_BASE="$RUN_BASE/performance"
-mkdir -p "$PERF_BASE/inputs"
+mkdir -p "$PERF_BASE"
 "$VLLM_BIN" bench serve --help > "$PERF_BASE/bench-help.txt"
 ```
 
-**完成条件：** 版本/资源审计通过，旧服务已清理；本机 HIXL 至少覆盖 P 的 0、1 和 D/A 的 2–5。确认 CLI 支持后续 `custom`、`--disable-shuffle`、`--skip-chat-template`、`--custom-output-len`、`--save-detailed` 等参数。原生启动参数是待实机验收的候选配置。
+**完成条件：** 版本/资源审计通过，旧服务已清理；本机 HIXL 至少覆盖 P 的 0、1 和 D/A 的 2–5。确认 CLI 支持后续 `random`、`--random-input-len`、`--random-output-len`、`--random-range-ratio`、`--random-prefix-len`、`--metadata`、`--save-detailed` 等参数。原生启动参数是待实机验收的候选配置。
 
-### 8.3 性能步骤 2：生成并冻结同一份 Synthetic 数据
+### 8.3 性能步骤 2：设置 Synthetic 参数，由 benchmark 自动生成
 
-**在启动模型服务之前执行一次。** 使用冻结 vLLM 的 `RandomDataset` 生成 Synthetic 合成文本，不下载 GSM8K，也不收集业务文本。第一阶段固定 16K 输入、1024 输出；32K/64K 在首轮比较完成后再生成。四组都读取同一份合成文件。
+**不需要手动生成数据文件，也不需要准备 JSONL。** 参考 recipe 的 AISBench 通过 `--datasets synthetic_gen` 自动生成合成请求。本指导已有的 `vllm bench serve` 同样支持自动生成，使用 `--dataset-name random`；`random` 就是它的 Synthetic 数据入口。
 
-固定生成 **768 条**，覆盖可选 BS32 的最大单轮请求数；seed 为 **1024**，公共前缀长度 **0**，输入/输出长度浮动比例 **0**。使用冻结的 Flash tokenizer，并核对 DSpark checkpoint 的 tokenizer 文件 hash 相同。不套 chat template，避免模板改变输入长度。
+本步骤只确认参数；第 8.4 节设置变量，第 8.6 节调用 benchmark 时自动生成请求并发压：
 
-下面生成文件，同时重新分词检查实际输入长度：
+| 参数 | 首轮取值 | 含义 |
+|---|---|---|
+| `--dataset-name` | `random` | 自动生成 Synthetic 文本 |
+| `--random-input-len` / `ISL` | `16384` | 输入目标长度 16K；后续改为 32768、65536 |
+| `--random-output-len` / `OSL` | `1024` | 每条请求输出预算，配合固定长度解码参数 |
+| `--random-range-ratio` | `0.0` | 输入/输出长度不随机浮动 |
+| `--random-prefix-len` | `0` | 不额外添加固定公共前缀 |
+| `--seed` | `1024` | 合成请求生成 seed |
+| `--num-prompts` | 由本轮 `count` 指定 | 预检/预热为 `CAPACITY`，正式为 `6×CAPACITY` |
 
-```bash
-export ISL=16384 OSL=1024
-"$PYTHON_BIN" - "$FLASH_MODEL_PATH" "$PERF_BASE/inputs" "$ISL" "$OSL" <<'PY'
-import json
-import sys
-from pathlib import Path
+四组统一使用冻结的 Flash tokenizer，并核对 DSpark checkpoint 的 tokenizer 文件 hash 相同。同一个长度/BS 的配对组保持 benchmark、NumPy、tokenizer 版本和上述参数一致；三轮正式测量也保持一致。不同请求数可能生成不同输入集合，不能只凭 seed 相同就认定输入逐条相同。
 
-from vllm.benchmarks.datasets.datasets import RandomDataset
-from vllm.tokenizers import get_tokenizer
+自动生成在 benchmark 的请求计时开始前完成。正式轮次的 JSON 通过 `--metadata` 保存生成参数，连同 tokenizer hash、实际命令和结果归档即可；预先落盘只在另有逐条审计需求时安排，不属于本流程。
 
-SYNTHETIC_REQUEST_COUNT = 768
-SYNTHETIC_SEED = 1024
-SYNTHETIC_PREFIX_LEN = 0
-SYNTHETIC_RANGE_RATIO = 0.0
+**完成条件：** CLI 支持这些参数，冻结版本和 tokenizer 已核对；随后直接进入第 8.4 节。第 8.6 节预检还要核对实际输入/输出 token 数；自动生成器报告 token 长度不匹配时先排查，不把目标 16K 当成实际长度。
 
-model, directory, input_length, output_length = sys.argv[1:]
-input_length, output_length = int(input_length), int(output_length)
-root = Path(directory)
-
-tokenizer = get_tokenizer(model, tokenizer_mode="deepseek_v4")
-requests = RandomDataset(random_seed=SYNTHETIC_SEED).sample(
-    tokenizer=tokenizer, num_requests=SYNTHETIC_REQUEST_COUNT,
-    prefix_len=SYNTHETIC_PREFIX_LEN, range_ratio=SYNTHETIC_RANGE_RATIO,
-    input_len=input_length, output_len=output_length,
-)
-actual_lengths = [len(tokenizer(request.prompt).input_ids) for request in requests]
-assert len(requests) == SYNTHETIC_REQUEST_COUNT
-assert all(length == input_length for length in actual_lengths), (
-    "Synthetic token length mismatch", min(actual_lengths), max(actual_lengths)
-)
-assert all(request.expected_output_len == output_length for request in requests)
-
-target = root / f"synthetic-i{input_length}-o{output_length}.jsonl"
-with target.open("x", encoding="utf-8") as file:
-    for request, actual_length in zip(requests, actual_lengths):
-        file.write(json.dumps({"prompt": request.prompt, "output_tokens": output_length,
-                               "input_tokens": actual_length}, ensure_ascii=False) + "\n")
-protocol = {"dataset": "Synthetic", "generator": "vllm.RandomDataset",
-            "seed": SYNTHETIC_SEED, "request_count": SYNTHETIC_REQUEST_COUNT,
-            "input_tokens": input_length, "output_tokens": output_length,
-            "prefix_len": SYNTHETIC_PREFIX_LEN, "range_ratio": SYNTHETIC_RANGE_RATIO,
-            "chat_template": False}
-with target.with_suffix(".protocol.json").open("x", encoding="utf-8") as file:
-    json.dump(protocol, file, indent=2)
-print(target, min(actual_lengths), max(actual_lengths))
-PY
-sha256sum "$PERF_BASE/inputs/synthetic-i$ISL-o$OSL.jsonl" \
-  "$PERF_BASE/inputs/synthetic-i$ISL-o$OSL.protocol.json" \
-  > "$PERF_BASE/inputs/synthetic-i$ISL-o$OSL.sha256"
-```
-
-**完成条件：** 得到 `synthetic-i16384-o1024.jsonl`、生成协议及 hash，768 条输入重新分词后均为 16384 tokens。已有文件时不覆盖、不重新生成，核对 hash 后复用。长度断言失败时先核对冻结版本和 tokenizer；不放宽长度后仍标成固定 16K。第 8.6 节还要核对服务端实际 token 数。
-
-本入口依据固定 [vLLM 提交的 RandomDataset / CustomDataset](https://github.com/vllm-project/vllm/blob/0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665/vllm/benchmarks/datasets/datasets.py)。后面命令中的 `--dataset-name custom` **只是读取已冻结的 Synthetic JSONL 文件**；数据来源仍是 Synthetic。`--disable-shuffle` 固定顺序，`--skip-chat-template` 保持合成输入长度。生成不计入服务性能计时。
+参考：[V3.2 recipe 的 AISBench 配置](../../recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md#aisbench-configuration)、[固定 vLLM 的 random 数据入口](https://github.com/vllm-project/vllm/blob/0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665/vllm/benchmarks/datasets/datasets.py)。两种工具都能自动生成 Synthetic；本次四组统一使用下文的 vLLM 命令。
 
 ### 8.4 性能步骤 3：选择本轮配置，创建新目录
 
@@ -1424,8 +1385,6 @@ export MAX_NUM_SEQS="$DECODE_BS"
 export FFN_SEQ_CAPACITY=$((2 * DECODE_BS))
 export CAPACITY=$((4 * DECODE_BS))
 export REQUEST_COUNT=$((6 * CAPACITY))
-export DATASET_FILE="$PERF_BASE/inputs/synthetic-i$ISL-o$OSL.jsonl"
-export DATASET_PROTOCOL="$PERF_BASE/inputs/synthetic-i$ISL-o$OSL.protocol.json"
 export ENABLE_PD=1 ENABLE_MTP=0 ENABLE_DSPARK=0 USE_AFD=0
 export MODEL_PATH="$FLASH_MODEL_PATH" EXECUTION_MODE=full-decode-only U_BATCHES=1
 case "$PERF_CASE" in
@@ -1448,19 +1407,15 @@ export RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-single-$PERF_CASE-i$ISL-b$DECODE_BS-$P
 export RUN_ROOT="$RUN_BASE/$RUN_ID/$(hostname -s)"
 mkdir -p "$RUN_BASE/$RUN_ID"
 mkdir "$RUN_ROOT"
-test -f "$DATASET_FILE"
-test -f "$DATASET_PROTOCOL"
 cp "$SITE_FILE" "$RUN_ROOT/site.env"
 cp "$NODE_FILE" "$RUN_ROOT/node.env"
-cp "$DATASET_PROTOCOL" "$RUN_ROOT/synthetic-protocol.json"
-sha256sum "$DATASET_FILE" > "$RUN_ROOT/input.sha256"
 ```
 
 **启动前核对：** 16K+1024 的上限是 17408，不能继续用 4096。保留已冻结的 `GPU_MEMORY_UTILIZATION=0.91`，重新检查 P/D/A/F 的 KV 和 HBM。`FFN_SEQ_CAPACITY=2×DECODE_BS` 仅是序列容量起点，DSpark 的 verify/draft token、buffer、padding 预算另核验。
 
 首个 BS8 预检从原 recipe capture sizes `1 2 4 8` 开始验证；它不证明 DSpark 或更大 BS 的 Graph shape 已覆盖。扩大 BS 前按实际 shape 调整并验收 `MAX_CUDAGRAPH_CAPTURE_SIZE`、`CUDAGRAPH_CAPTURE_SIZES` 和各角色 token budget，记录到本点配置。A/F 需要不同 capture/budget 时，在对应角色的命令前缀分别设置并归档，不能靠共用值推定已覆盖。**未经预检的配置不进入 `measure`。**
 
-按第 4.4 节保存 runtime，补充本轮 `PERF_CASE/PHASE/ISL/OSL/DECODE_BS/FFN_SEQ_CAPACITY`、各角色 token budget、capture sizes 和输入 hash。`USE_AFD` 仅选择下文命令分支，不是插件开关。
+按第 4.4 节保存 runtime，补充本轮 `PERF_CASE/PHASE/ISL/OSL/DECODE_BS/FFN_SEQ_CAPACITY`、各角色 token budget、capture sizes、Synthetic 生成参数和固定 tokenizer hash。`USE_AFD` 仅选择下文命令分支，不是插件开关。
 
 ### 8.5 性能步骤 4：启动服务，最后启动 Proxy
 
@@ -1543,7 +1498,7 @@ PY
 
 ### 8.6 性能步骤 5：先检查请求和真实运行路径
 
-先在当前终端定义下面的函数，预检、预热和正式轮次共用它。读取第 8.3 节冻结的 Synthetic 输入，固定输出预算；`ignore-eos/min_tokens` 用于固定长度压力协议。输出由模型实际生成，不预填输出 token，也不替换专家路由。
+先在当前终端定义下面的函数，预检、预热和正式轮次共用它。benchmark 按第 8.3 节参数自动生成 Synthetic 输入，固定输出预算；`ignore-eos/min_tokens` 用于固定长度压力协议。输出由模型实际生成，不预填输出 token，也不替换专家路由。
 
 ```bash
 run_perf_batch() {
@@ -1551,12 +1506,14 @@ run_perf_batch() {
   curl --noproxy '*' -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/$name.metrics-before.txt"
   "$VLLM_BIN" bench serve \
     --backend openai --base-url "$BASE_URL" --endpoint /v1/completions \
-    --model dsv4-afd --tokenizer "$MODEL_PATH" --tokenizer-mode deepseek_v4 \
-    --dataset-name custom --dataset-path "$DATASET_FILE" \
-    --skip-chat-template --disable-shuffle --no-oversample --custom-output-len "$OSL" \
+    --model dsv4-afd --tokenizer "$FLASH_MODEL_PATH" --tokenizer-mode deepseek_v4 \
+    --dataset-name random --random-input-len "$ISL" --random-output-len "$OSL" \
+    --random-range-ratio 0.0 --random-prefix-len 0 \
     --seed 1024 --num-prompts "$count" --max-concurrency "$CAPACITY" \
     --request-rate inf --ignore-eos --num-warmups 0 --ready-check-timeout-sec 0 \
     --extra-body "{\"temperature\":0,\"seed\":1024,\"min_tokens\":$OSL}" \
+    --metadata dataset=Synthetic synthetic_seed=1024 input_len="$ISL" output_len="$OSL" \
+      prefix_len=0 range_ratio=0.0 \
     --percentile-metrics ttft,tpot,itl --metric-percentiles 50,95,99 \
     --save-result --save-detailed --result-dir "$RUN_ROOT" --result-filename "$name.json" \
     2>&1 | tee "$RUN_ROOT/$name.console.log"
@@ -1620,7 +1577,7 @@ fi
 
 ### 8.7 性能步骤 6：关闭诊断，预热后测三轮
 
-从第 8.4 节重新开始，设置 `PHASE=measure`，选择**已经通过预检**的长度/BS/capture/budget，以新 RUN_ID 冷启动。保持同一输入/模型/执行开关，关闭诊断、DEBUG 和 profiler；不拿预检进程计时。
+从第 8.4 节重新开始，设置 `PHASE=measure`，选择**已经通过预检**的长度/BS/capture/budget，以新 RUN_ID 冷启动。保持相同 Synthetic 参数/模型/执行开关，关闭诊断、DEBUG 和 profiler；不拿预检进程计时。
 
 ready 且第 8.6 节函数已定义后执行：
 
@@ -1692,7 +1649,7 @@ ss -ltnp > "$RUN_ROOT/ports-after-stop.txt"
 | 扩展长输入 | 32K、64K / BS8→16→24 | 每个新长度/BS 先 `check`；合法点进入 `measure`，仍配对三轮 |
 | 可选容量调优 | 各长度 / BS8、16、24、32 | 冻结双方各自最佳合法 BS，再各复测三轮，与同 BS 结果分表 |
 
-32K/64K 先回第 8.3 节，把 `ISL` 分别设为 `32768`、`65536`，生成各自的 Synthetic 文件、协议及 hash。输入上限加 1024 输出对应 `MAX_MODEL_LEN` 至少为：16K **17408**、32K **33792**、64K **66560**。每个长度重新验证 KV/HBM、Graph、DSpark；BS24 是目标，不保证都能容纳。
+32K/64K 在第 8.4 节把 `ISL` 分别设为 `32768`、`65536`；benchmark 自动生成对应长度的请求，无需准备数据文件。输入上限加 1024 输出对应 `MAX_MODEL_LEN` 至少为：16K **17408**、32K **33792**、64K **66560**。每个长度重新验证 KV/HBM、Graph、DSpark；BS24 是目标，不保证都能容纳。
 
 某点 OOM/不支持时，记录实际支持的 BS，同 BS 收益记缺项；另表比较各自最佳合法配置。排队成功不证明达到目标活跃 BS。原生 Graph/DSpark 不可用时该配对保持 pending，不用 eager 补位。
 
@@ -1714,7 +1671,7 @@ ss -ltnp > "$RUN_ROOT/ports-after-stop.txt"
 |---|---:|---:|---:|---:|---:|---:|---|---|---|
 | 16K/1024 | 24 | 48 起，填实际预算 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
 
-附成功/失败数、实际输入/输出 tokens、请求数、输入及模型/runtime hash、卡位、target/draft 模式、原生微批差异和停服结果。最终归档同时收齐 `$PERF_BASE/inputs`、Synthetic 生成协议及输入 hash、各轮实际 argv 和角色配置，不只收结果 JSON。原生实际 6 卡、AFD 实际 8 卡，每卡归一化不等于严格等卡数对照；结论限定为本机这两种部署配置在 Synthetic 负载下的性能，DSpark 接受率不外推为业务数据接受率。另解释 DSpark 开关的收益时先核对 target 权重 hashes 一致。
+附成功/失败数、实际输入/输出 tokens、请求数、Synthetic 生成参数、tokenizer/模型/runtime hash、卡位、target/draft 模式、原生微批差异和停服结果。归档各轮结果 JSON、生成参数、实际 argv、冻结版本和角色配置，不要求预先生成的数据文件。原生实际 6 卡、AFD 实际 8 卡，每卡归一化不等于严格等卡数对照；结论限定为本机这两种部署配置在 Synthetic 负载下的性能，DSpark 接受率不外推为业务数据接受率。另解释 DSpark 开关的收益时先核对 target 权重 hashes 一致。
 
 **完成条件：** 两对都有三轮结果、质量/路径/清理证据，并说明瓶颈。负收益也如实报告，不新增最低收益比例门槛；按第 9 节归档。
 
