@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import pytest
@@ -11,18 +14,7 @@ from afd_plugin.model_executor.models.deepseek_v4 import (  # noqa: E402
     AFDDeepseekV4ForCausalLM,
     _checkpoint_weight_roles,
 )
-
-
-class _OneShotWeights:
-    def __init__(self, names: list[str]) -> None:
-        self.items = [(name, torch.tensor([idx])) for idx, name in enumerate(names)]
-        self.iterations = 0
-
-    def __iter__(self):
-        self.iterations += 1
-        if self.iterations > 1:
-            raise AssertionError("checkpoint iterator was consumed more than once")
-        return iter(self.items)
+from tests.unit.fakes.weights import OneShotWeights as _OneShotWeights  # noqa: E402
 
 
 @pytest.mark.parametrize(
@@ -104,7 +96,7 @@ def test_v4_load_weights_filters_raw_checkpoint_names_once(
         "embed.weight",
     ]
     weights = _OneShotWeights(names)
-    seen = []
+    seen: list[str] = []
     native_result = {"native.loaded"}
 
     def fake_native_loader(self, filtered_weights):

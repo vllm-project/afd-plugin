@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import sys
@@ -11,6 +14,7 @@ from afd_plugin.compat.profiler import (
     step_afd_gpu_profiler,
     stop_afd_gpu_profiler,
 )
+from tests.unit.fakes.profiler import StepProfiler as _StepProfiler
 
 _ENV_NAMES = (
     "AFD_GPU_ATTENTION_PROFILER_ENABLE",
@@ -112,22 +116,6 @@ def test_stop_gpu_profiler_ignores_disabled_profiler():
     assert profiler.stopped is True
 
 
-class _StepProfiler:
-    def __init__(self):
-        self.steps = 0
-        self.started = False
-        self.stopped = False
-
-    def start(self):
-        self.started = True
-
-    def stop(self):
-        self.stopped = True
-
-    def step(self):
-        self.steps += 1
-
-
 class _FakeTorchProfiler:
     class ProfilerActivity:
         CPU = "cpu"
@@ -135,8 +123,8 @@ class _FakeTorchProfiler:
 
     def __init__(self):
         self.created_profiler = _StepProfiler()
-        self.schedule_kwargs = None
-        self.profile_kwargs = None
+        self.schedule_kwargs: dict[str, object] = {}
+        self.profile_kwargs: dict[str, object] = {}
         self.trace_dir = None
 
     def schedule(self, **kwargs):

@@ -26,6 +26,11 @@ from afd_plugin.connectors import (
     AFDTransferMetadata,
     AFDTransferState,
 )
+from tests.unit.fakes.dp_metadata import (  # noqa: E402
+    DPMetadataValues as _FakeDPMetadata,
+)
+from tests.unit.fakes.dp_metadata import dp_tokens as _tokens
+from tests.unit.fakes.graph import Graph as _FakeGraph  # noqa: E402
 from tests.unit.fakes.vllm_config import (  # noqa: E402
     npu_vllm_config as _vllm_config,
 )
@@ -172,11 +177,6 @@ class _FakeStructuredFFNModel:
             routed_output=f"routed({hidden_states}, layer={layer_idx})",
             shared_output=f"shared({hidden_states}, layer={layer_idx})",
         )
-
-
-class _FakeDPMetadata:
-    def __init__(self, values):
-        self.num_tokens_across_dp_cpu = values
 
 
 def _require_npu_runtime():
@@ -674,14 +674,6 @@ def test_npu_ffn_runner_filters_dense_layers_when_gate_runs_on_attention():
     )
 
     assert _ffn_layer_indices(runner) == [2, 4]
-
-
-class _FakeGraph:
-    def __init__(self):
-        self.replay_count = 0
-
-    def replay(self):
-        self.replay_count += 1
 
 
 def test_npu_ffn_runner_replays_acl_graph_when_key_exists():
@@ -1326,13 +1318,6 @@ def test_npu_async_feature_validation_rejects_native_draft_models(
             fail_if_unsupported_npu_afd_features(config)
     else:
         fail_if_unsupported_npu_afd_features(config)
-
-
-def _tokens(dp_metadata):
-    values = dp_metadata.num_tokens_across_dp_cpu
-    if hasattr(values, "tolist"):
-        return values.tolist()
-    return list(values)
 
 
 class _LifecycleConnector:

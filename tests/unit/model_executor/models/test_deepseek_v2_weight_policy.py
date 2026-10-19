@@ -22,6 +22,7 @@ from afd_plugin.model_executor.models.deepseek_v2 import (  # noqa: E402
     AFDDeepseekV2Model,
     _checkpoint_weight_roles,
 )
+from tests.unit.fakes.weights import OneShotWeights as _OneShotWeights  # noqa: E402
 
 ATTENTION_ROLES = frozenset(("attention",))
 FFN_ROLES = frozenset(("ffn",))
@@ -105,18 +106,6 @@ def _config() -> SimpleNamespace:
         n_shared_experts=1,
         num_nextn_predict_layers=0,
     )
-
-
-class _OneShotWeights:
-    def __init__(self, names: list[str]) -> None:
-        self.items = [(name, torch.tensor([index])) for index, name in enumerate(names)]
-        self.iterations = 0
-
-    def __iter__(self):
-        self.iterations += 1
-        if self.iterations > 1:
-            raise AssertionError("checkpoint iterator was consumed more than once")
-        return iter(self.items)
 
 
 @pytest.mark.parametrize(

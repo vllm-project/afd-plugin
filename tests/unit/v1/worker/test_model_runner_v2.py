@@ -48,6 +48,7 @@ from afd_plugin.validation import (  # noqa: E402
     validate_gpu_model_runner_v2_config,
     validate_npu_model_runner_v2_config,
 )
+from tests.unit.fakes.profiler import StepProfiler as _StepProfiler  # noqa: E402
 
 TEST_MODEL_MAX_LEN = 163840
 TEST_HIDDEN_SIZE = 2048
@@ -74,18 +75,6 @@ class _RecordingConnector:
     def close(self):
         self.closed = True
         self.events.append("close")
-
-
-class _StepProfiler:
-    def __init__(self):
-        self.steps = 0
-        self.stopped = False
-
-    def step(self):
-        self.steps += 1
-
-    def stop(self):
-        self.stopped = True
 
 
 class _RunnerRecorder:

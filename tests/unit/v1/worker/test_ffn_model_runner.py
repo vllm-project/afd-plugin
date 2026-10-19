@@ -33,6 +33,12 @@ from afd_plugin.v1.worker.ffn_model_runner import (  # noqa: E402
     _set_moe_layer_index,
 )
 from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
+from tests.unit.fakes.dp_metadata import (  # noqa: E402
+    DPMetadataValues as _FakeDPMetadata,
+)
+from tests.unit.fakes.dp_metadata import dp_tokens as _tokens  # noqa: E402
+from tests.unit.fakes.graph import Graph as _FakeGraph  # noqa: E402
+from tests.unit.fakes.profiler import StepProfiler as _StepProfiler  # noqa: E402
 
 
 def test_native_weight_update_finishes_without_ffn_lora_state(monkeypatch):
@@ -120,18 +126,6 @@ class _FakeModel:
         return f"ffn({hidden_states}, layer={layer_idx})"
 
 
-class _StepProfiler:
-    def __init__(self):
-        self.steps = 0
-        self.stopped = False
-
-    def step(self):
-        self.steps += 1
-
-    def stop(self):
-        self.stopped = True
-
-
 def _metadata():
     return AFDTransferMetadata.create_attention_metadata(
         layer_idx=0,
@@ -179,30 +173,6 @@ def _runner_with_connector_and_model(model, *, num_layers=1):
     runner._cuda_graphs = {}
     runner.prof = None
     return runner
-
-
-class _FakeDPMetadata:
-    def __init__(self, values):
-        self.num_tokens_across_dp_cpu = values
-
-
-def _tokens(dp_metadata):
-    values = dp_metadata.num_tokens_across_dp_cpu
-    if hasattr(values, "tolist"):
-        return values.tolist()
-    return list(values)
-
-
-class _FakeGraph:
-    def __init__(self):
-        self.replay_count = 0
-        self.reset_count = 0
-
-    def replay(self):
-        self.replay_count += 1
-
-    def reset(self):
-        self.reset_count += 1
 
 
 def test_ffn_runner_owns_connector_execution_without_native_runner_inheritance():

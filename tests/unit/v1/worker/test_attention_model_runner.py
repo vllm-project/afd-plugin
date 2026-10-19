@@ -32,6 +32,7 @@ from afd_plugin.v1.worker.ubatch_wrapper import (
     build_ubatch_additional_kwargs,
     build_ubatch_afd_metadata,
 )
+from tests.unit.fakes.dp_metadata import dp_tokens as _tokens  # noqa: E402
 
 
 class _UbatchSlice:
@@ -46,13 +47,6 @@ class _UbatchSlice:
 
 def _dp_metadata(tokens):
     return SimpleNamespace(num_tokens_across_dp_cpu=list(tokens))
-
-
-def _tokens(dp_metadata):
-    values = dp_metadata.num_tokens_across_dp_cpu
-    if hasattr(values, "tolist"):
-        return values.tolist()
-    return list(values)
 
 
 class _RecordingConnector:

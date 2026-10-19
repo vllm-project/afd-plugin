@@ -4,13 +4,18 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from torch import Tensor
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
 from afd_plugin.model_executor.models import qwen3_moe as adapter  # noqa: E402
+from tests.unit.fakes.weights import OneShotWeights as _OneShotWeights  # noqa: E402
 
 ATTENTION_ROLE = frozenset(("attention",))
 FFN_ROLE = frozenset(("ffn",))
@@ -68,18 +73,6 @@ WEIGHT_ROLE_CASES = (
 )
 
 
-class _OneShotWeights:
-    def __init__(self, names: list[str]) -> None:
-        self.items = [(name, torch.tensor([index])) for index, name in enumerate(names)]
-        self.iterations = 0
-
-    def __iter__(self):
-        self.iterations += 1
-        if self.iterations > 1:
-            raise AssertionError("checkpoint iterator was consumed more than once")
-        return iter(self.items)
-
-
 @pytest.mark.parametrize(
     ("checkpoint_name", "roles"),
     [case[1:] for case in WEIGHT_ROLE_CASES],
@@ -129,7 +122,7 @@ def test_load_weights_filters_once_and_delegates_to_native_loader(
         "lm_head.weight",
     ]
     weights = _OneShotWeights(names)
-    seen: list[tuple[str, torch.Tensor]] = []
+    seen: list[tuple[str, Tensor]] = []
     native_result = {"native.loaded_params"}
 
     def fake_native_loader(self, filtered_weights):

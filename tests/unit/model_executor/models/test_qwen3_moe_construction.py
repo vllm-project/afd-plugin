@@ -15,19 +15,7 @@ from vllm.config import CompilationMode  # noqa: E402
 
 from afd_plugin.config import AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import qwen3_moe as adapter  # noqa: E402
-
-
-class _FakeStage(nn.Module):
-    kind = "stage"
-
-    def __init__(self, calls: dict[str, list[str]], *args, prefix="", **kwargs):
-        super().__init__()
-        calls[self.kind].append(prefix)
-        self.weight = nn.Parameter(torch.empty(1))
-
-
-def _stage_type(kind: str):
-    return type(f"Fake{kind.title()}", (_FakeStage,), {"kind": kind})
+from tests.unit.fakes.model_layers import stage_type as _stage_type  # noqa: E402
 
 
 class _FakeMissingLayer(nn.Module):

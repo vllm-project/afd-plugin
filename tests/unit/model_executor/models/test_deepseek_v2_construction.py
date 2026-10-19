@@ -24,6 +24,8 @@ from vllm.config import CompilationMode  # noqa: E402
 
 from afd_plugin.config import AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
+from tests.unit.fakes.model_layers import Stage as _FakeStage  # noqa: E402
+from tests.unit.fakes.model_layers import stage_type as _stage_type
 
 CONSTRUCTOR_DIGESTS = {
     "AFDDeepseekV2Model": (
@@ -33,19 +35,6 @@ CONSTRUCTOR_DIGESTS = {
         "83ebb82ab4e7d4e65fef6ea9427715af121f9eab04e75bbf1e31b370ec05faf1"
     ),
 }
-
-
-class _FakeStage(nn.Module):
-    kind = "stage"
-
-    def __init__(self, calls: dict[str, list[str]], *args, prefix="", **kwargs):
-        super().__init__()
-        calls[self.kind].append(prefix)
-        self.weight = nn.Parameter(torch.empty(1))
-
-
-def _stage_type(kind: str):
-    return type(f"Fake{kind.title()}", (_FakeStage,), {"kind": kind})
 
 
 @pytest.fixture
