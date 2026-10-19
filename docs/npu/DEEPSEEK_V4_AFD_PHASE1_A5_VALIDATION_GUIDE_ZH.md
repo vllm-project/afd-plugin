@@ -1,74 +1,27 @@
 # DeepSeek-V4 AFD A5 1030 合并验证指导书
 
-更新日期：2026-10-16（性能主流程收敛为单台 8 卡 A5，保留两机跨机补充验证；不更新已有实机验证结论）。本文合并旧 A5 dSpark/PD 指导与[1030 执行计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)，是本期现场操作入口。
+更新日期：2026-10-19（性能部分按现场先后顺序重写为九步，统一单机真实输入发压入口；不更新已有实机验证结论）。本文合并旧 A5 dSpark/PD 指导与[1030 执行计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)，是本期现场操作入口。
 执行计划规定交付范围和日期，本文规定现场命令、验证顺序、证据与失败处理。
 本文是待执行指导，不代表组合已经通过 A5 验收。
 
 **执行标记**：`【本地已完成】` 为代码/配置的离线检查；`【A5 手工执行】` 为需要你在 A5 实际环境完成的操作。首次执行从[手工交接清单](DEEPSEEK_V4_AFD_A5_MANUAL_HANDOFF_ZH.md)的 A5-01 开始。**2026-10-19 最新跨机核对**：10-16 日 cross-C5 full 92 项通过、90 个非流式响应全部非空且无输出 token ID `0`、四 DP 与 Proxy 请求归零。实际为两机 P2+A4+F2，P/F 在 `.18`、A 在 `.14`；缺 Attention 侧日志/metrics，site.env 与实际地址不符，P/F 末尾有 Killed。当前按[cross-C5 本轮结果第 5 节](DEEPSEEK_V4_AFD_CROSS_C5_20261016_RESULT_ZH.md)补材料，完整 F0、第二轮和三机 P8+A4+F2 尚不能据此关闭。此前各日期的单机状态和对照步骤保留作历史，不要求为确认本轮请求结果立即重跑 full。
 
-## 0. AFD 性能验证：先读本节，再按步骤操作
+## 0. 只做性能验证时，从哪里开始
 
-**目标：在 Graph、Graph+DSpark 两类常用配置下，比较原生 Decode 与 AFD P2P 的输出吞吐、每卡效率及延迟。** 后文保留完整命令和故障记录；首次阅读只需按本节顺序跳转。
+按第 8.2–8.10 节顺序执行：**准备环境 → 准备输入 → 选择一组配置 → 启动 → 检查 → 预热和测量 → 停服 → 换组/扩展长度 → 计算收益**。
 
-### 0.1 主要只对比两组
+先在**同一台 8 卡 A5** 上依次运行四组：
 
-| 场景 | 原生基线 | AFD 方案 | 正式配对 |
-|---|---|---|---|
-| Graph，不开 DSpark | 完整 Decode + Graph | A4F2 + Graph/U2 | N-G 对 B2（C3） |
-| Graph，开启 DSpark | 完整 Decode + Graph + DSpark | A4F2 + Graph/U2 + DSpark | N-GS 对 B3（C5） |
+| 执行顺序 | 配置 | 用卡 |
+|---|---|---:|
+| 1 | 原生 Decode + Graph | P2 + D4，共 6 卡 |
+| 2 | AFD P2P + Graph/U2 | P2 + A4 + F2，共 8 卡 |
+| 3 | 原生 Decode + Graph + DSpark | P2 + D4，共 6 卡 |
+| 4 | AFD P2P + Graph/U2 + DSpark | P2 + A4 + F2，共 8 卡 |
 
-每对使用同一 checkpoint、输入文件、输出预算和解码参数；DSpark 的 draft 都使用 eager。原生微批能力需实测，若原生与 AFD 的 U 配置不同，结果说明中保留差异。eager 只用来排查和辅助解释，不展开整套性能矩阵。
+**1 对 2、3 对 4**，分别得到不开/开启 DSpark 时的收益。先完成四组 16K/BS8 预检，再测 16K/BS24，最后扩展 32K/64K。BS 指每个 Decode/Attention rank 的活跃序列容量。
 
-**主要性能对比先在同一台 8 卡 A5 上依次执行，四套配置不同时运行。** 使用下面的固定卡位，完整单机配置见[第 4.1 节](#41-同机设备配置)。
-
-| 方案 | Prefill | Decode / Attention | 独立 FFN | 实际使用 NPU |
-|---|---|---|---|---:|
-| 原生 Graph，DSpark 关/开 | P2：0、1 | D4：2–5 | 无，6、7 空闲 | 6 |
-| AFD Graph/U2，DSpark 关/开 | P2：0、1 | A4：2–5 | F2：6、7 | 8 |
-
-Graph 和 DSpark 在各角色分配的卡上执行，不额外增加角色卡数；模型、KV、Graph 和 draft 是否能装入显存仍须逐点实测。这是 6 卡与 8 卡两种部署方案的对比，需同时报总吞吐和每卡吞吐。单机可验证同机 HCCL P2P 的收益；跨机网络开销和扩展性另按[第 4.2.1 节](#421-两机补充拓扑同时覆盖远程-kv-和远程-af)补测，正式三机验收保持原要求。
-
-### 0.2 操作顺序
-
-1. **先关闭已有功能问题。** 沿用现有 4K 配置和 C1→C5 顺序，核实输出、Graph 在线执行、DSpark 指标和正常停服。文档目前记录的 C3 输出/默认全开、C4 指标/停服及 C5 待验证项仍未关闭；详见[第 6.3 节](#63-保存-metrics-before生成精确-token-id-输入)。这些问题未关闭时，不开始正式收益统计。
-2. **冻结单机环境与输入。** 按[第 3 节](#3-a5-手工执行第-1-步准备现场配置和审计环境)填写真实 IP、网卡、模型路径和版本，按第 4.1 节放置角色，P/A/F/Proxy 的角色 IP 均设为本机可达 IP。准备同一份真实文本/代码输入及请求预算，保存文件 hash。DSpark 主测使用真实 Prefill/KV。
-3. **先准备四份启动配置。** 原生 Graph、AFD Graph、原生 Graph+DSpark、AFD Graph+DSpark，各自使用新 RUN_ID。AFD 复用 C3/C5；原生使用[第 8.3.2 节](#832-准备非-afd-原生-decode-基线-b0n-gn-gs)的候选命令，不传 AFD role，也不启动独立 FFN。原生 Graph/DSpark 候选参数仍须现场验收。
-4. **四组先各过一次 16K、BS8 的预检。** 先设置下面的长度/容量，再按[第 6.1–6.2 节](#61-启动-prefill然后立即相邻启动-ffn-与-attention)启动和检查 ready：AFD 为 P ready→F→紧接着 A→Proxy；原生为 P ready→D ready→Proxy。先发 smoke，再发少量真实 16K 输入；检查实际长度、输出、所有 rank、在线 replay/U2、DSpark 增量、HBM 和正常停服。smoke 通过不等于长输入或性能通过。
-5. **升到 BS24，运行第一轮正式比较。** 重新冷启动，分别设置原生 D/A 为 24、F 序列容量起点为 48；核验新的 Graph shape、DSpark token budget 和 HBM。单独 warmup 96 请求，等待归零；正式每轮 576 请求，重复 3 轮，客户端在途容量至少覆盖 96，并核对实际活跃数。发压/采集步骤见[第 8.4.3 节](#843-aisbench-负载与执行步骤)。
-6. **最后扩展到 32K、64K。** 依次先 BS8/16 再尝试 24；四组每个合法点仍测 3 轮。OOM 或只能排队时记录实际可支持的 BS，不写成达到了 BS24。按需扫描 BS8/16/24/32，比较各自最佳合法吞吐；8K 和输出 512–1536 的分布放在主流程之后补充。
-7. **产出两张收益表。** Graph、Graph+DSpark 各一张，每行记录输入长度、D/A 的 BS、F 容量、完成/失败数、输出 tokens/s、每卡 tokens/s、TPOT P95、TTFT P95、HBM；DSpark 表再加接受率。保留 3 轮原始值并报中位数，不只报最快一轮。
-
-第 4 步在所有角色终端加载现场配置后覆盖以下参数；示例只针对**首个 16K、BS8 预检点**，不覆盖整个长度矩阵：
-
-```bash
-export ISL=16384 OSL=1024
-export MAX_MODEL_LEN=$((ISL + OSL))  # 17408；按实际模板 token 数复核
-export DECODE_BS=8
-export FFN_SEQ_CAPACITY=16          # A4/F2 的序列容量起点
-export MAX_NUM_SEQS="$DECODE_BS"     # Prefill、原生 D、Attention 的初始设置
-export EXECUTION_MODE=full-decode-only U_BATCHES=2
-export ENABLE_PD=1 ENABLE_MTP=0
-# 不开 DSpark 的配对：所有角色使用同一 Flash checkpoint。
-export MODEL_PATH="$FLASH_MODEL_PATH" ENABLE_DSPARK=0
-# 开 DSpark 的配对：改为以下两项；Prefill/FFN 仍使用该 DSpark checkpoint。
-# export MODEL_PATH="$DSPARK_MODEL_PATH" ENABLE_DSPARK=1
-```
-
-AFD 的 FFN 按第 6.1 节原启动命令保存日志/PID，但在 `nohup` 前添加角色专用环境：
-
-```bash
-MAX_NUM_SEQS="$FFN_SEQ_CAPACITY" ENABLE_PD=0 ENABLE_DSPARK=0 \
-  nohup bash "$RECIPE/afd_ffn.sh" > "$RUN_ROOT/ffn.log" 2>&1 &
-echo $! > "$RUN_ROOT/ffn.pid"
-```
-
-这条命令替代该轮原 FFN 启动命令，不重复启动。Attention 继续使用 `MAX_NUM_SEQS=8`。DSpark 开启后，16/48 仅是 FFN 的序列容量起点，verify/draft 的 token、buffer 和 capture 预算另行核验；不能只改 BS 就开始计时。现有默认 capture sizes `1 2 4 8` 也不证明 BS24 已覆盖。
-
-正式计时前，按[第 8.2 节](#82-关闭诊断后重新冷启动性能-c5)关闭诊断并新冷启动；通过 Proxy 发同一份真实输入。第 8.3 节 random CLI 和第 8.4 节 synthetic 配置只作辅助压力测试，不能替代 DSpark 主测数据入口。AISBench 的真实数据配置、输出预算传递及版本必须先核实，未就绪时该项保持 pending。
-
-**读结果只记住两个数：总输出 tokens/s，以及总输出 tokens/s÷实际用卡数。** 当前真实 PD 布局，原生除以 6、AFD 除以 8，均包含 P2；两组均预留同一台 8 卡整机，另报按整机 8 卡计算的效率，不混淆实际用卡与预留成本。只有经验证的纯 Decode 测量才分别除以 D4 的 4 卡和 A4F2 的 6 卡。64K 输入加 1024 输出至少需 `MAX_MODEL_LEN=66560`，还需实测 KV、HBM 和 Graph，不保证 BS24 能容纳。
-
-**下一步的第一项操作：先补齐现有功能问题的证据和修复复测；关闭后，交付四份 16K/BS8 的实际启动参数、请求结果及正常停服记录，再进入 BS24 正式比较。**
+第 1–7 节保留功能验收和故障处理；已知问题及实机结论不因本次文档重写而改变。跨机、eager、合成 KV 等补测统一放在第 8.11 节，首轮无需展开。
 
 ## 1. 合并后的范围与门禁
 
@@ -86,7 +39,7 @@ echo $! > "$RUN_ROOT/ffn.pid"
 | 最终精度 | 同机和跨机 C5 各做一次冻结口径的 GSM8K；不逐 token exact |
 | 性能 | 两个 C5 记录吞吐、TTFT、TPOT、峰值 HBM、acceptance rate；不设置收益比例门槛 |
 
-第 8.2 节用于记录 C5 性能。第 8.4 节规定主要性能矩阵：**AFD P2P+Graph/U2、AFD P2P+Graph/U2+DSpark**，分别与功能匹配的原生 Decode 对照，重点验证 BS24 和 8K/16K/32K/64K 输入。eager/U1 仅作辅助归因。第 8.3 节提供真实 PD 的执行入口，承接这两个主要组合的端到端吞吐及延迟验证；纯 Decode 容量实验单独记录入口、KV 来源及资源分母。C1–C5 全部启用 AFD，彼此比较不能给出 AFD 开关本身的收益。
+性能验证统一按第 8.2–8.10 节的单机真实 PD 流程执行，分别比较 Graph、Graph+DSpark 两对原生/AFD 配置。C1–C5 都启用 AFD，彼此比较只能解释组合差异，AFD 部署收益必须与原生 Decode 配对测量。
 
 旧指导的权重可信性、精确版本审计、并发 1/8/32、取消恢复、资源清理和失败采集继续保留。
 旧 `3da28f9`、A4F4/all-on 和两机 P8/A4F4 证据作为历史参考，不能代替本期验收。
@@ -1338,197 +1291,257 @@ export HF_DATASETS_OFFLINE=1
 实际完成样本数必须等于冻结题目数；数据缺失、样本错误、skip 或解析失败不能记为通过。
 自然语言最终答案评分不等于模型输出的逐 token golden。
 
-### 8.2 关闭诊断后重新冷启动性能 C5
+### 8.2 性能步骤 1：准备一台 A5，确认可以开始测试
 
-只修改并记录诊断设置，保持同一已验收 C5 的模型、软件及拓扑：
+**在哪里操作：A5 容器内的一个 Bash 协调终端。** 后续命令都在该终端按顺序执行，各服务在后台运行；换终端时重新加载环境。计时请求统一经过 `Proxy → Prefill → Decode/Attention`，结果称为“真实 PD 端到端性能”。
 
-```bash
-export AFD_HCCL_STAGE_DIAGNOSTICS=0
-export AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS=0
-export VLLM_LOGGING_LEVEL=INFO
-# 正常停服后使用新 run ID，重新执行 C5 启动与 ready；确认最终生效值。
-```
+先完成三件事：
 
-客户端使用本机 vLLM 0.23 的 benchmark CLI，示例负载在 M1 冻结后使用：
+1. 按第 3 节准备并核对实际 `site.env`、`node.env`、软件提交、镜像、模型和 HIXL 资源。后续使用这套已冻结环境，不临时升级工具。
+2. 按第 5–7、8.1 节完成相关功能、输出质量、精度和正常停服验收。原文记录的 C3 输出/默认全开、C4 指标/停服、C5 待验证问题仍须关闭；原生 Graph/DSpark 命令也须通过下面的预检。未通过时只排查，不填正式收益。
+3. 清空本机旧服务，确认 8 卡可用。固定 P2 用卡 0、1；原生 D4 或 A4 用卡 2–5；只有 AFD 组启动 F2，用卡 6、7。Proxy 不额外占 NPU。
 
-```bash
-"$VLLM_BIN" bench serve \
-  --backend openai --base-url "$BASE_URL" --endpoint /v1/completions \
-  --model dsv4-afd --tokenizer "$MODEL_PATH" \
-  --dataset-name random --random-input-len 128 --random-output-len 128 \
-  --num-prompts 128 --max-concurrency 32 --request-rate inf --ignore-eos \
-  --save-result --result-dir "$RUN_ROOT/performance" --result-filename benchmark.json \
-  2>&1 | tee "$RUN_ROOT/performance.console.log"
-```
-
-固定 warmup、测量次数和数据长度；记录全部请求成功率、吞吐、TTFT/TPOT 的均值及分位数，不能只保留最快一轮。另采集所有角色/rank 的 NPU HBM 峰值及 DSpark metrics 增量；`npu-smi` 采样注明间隔和可能遗漏瞬时峰值，不能把当前 HBM 当精确峰值。
-性能期间保留模型/开关生效证据，但不启用同步诊断或 DEBUG 热路径日志。
-收益不足不阻断；请求错误、OOM、timeout 或无法清理仍阻断。
-
-### 8.3 【A5 手工执行】真实 PD 端到端的非 AFD/AFD 对照
-
-本节通过 Proxy 和真实 Prefill/KV 链路检查第 8.4 节主要组合的端到端收益及延迟，尤其用于 DSpark 的真实语义输入/KV、接受率和实际输出吞吐验证。纯 Decode 容量结果与本节分开报告。本节不改变 C1–C5 的功能验收顺序，也不表示原生 Decode 或两机组合已通过实机验证。先完成所测配置的功能、输出正确性、精度和正常停服检查，再用独立性能 RUN_ID 冷启动。主要场景的优先级不代表前置问题已关闭；当前文档保留的 C3/C5 问题未关闭前，性能状态仍为 pending。
-
-#### 8.3.1 冻结对照组和资源口径
-
-| 组名 | Decode 配置 | 要回答的问题 |
-|---|---|---|
-| B0 | 原生完整 Decode，PD on、eager、无 speculative config、无 DBO | 辅助基线，不作为唯一主基线 |
-| B1 | C1：PD+AFD、eager/U1、DSpark off | 辅助归因，与 B0 配对 |
-| N-G | 原生完整 Decode，PD on、target Decode Graph、DSpark off | Graph 主场景的原生基线 |
-| B2 | C3：PD+AFD+Graph/U2、DSpark off | 主要场景一，与 N-G 配对 |
-| N-GS | 原生完整 Decode，PD on、target Decode Graph+DSpark，draft eager | DSpark 主场景的原生基线 |
-| B3 | C5：PD+AFD+DSpark+Graph/U2，draft eager | 主要场景二，与 N-GS 配对 |
-
-功能门禁通过后，主要性能测量优先完成 N-G/B2、N-GS/B3；B0/B1 只选代表点作辅助对照，不要求先跑完整 eager 容量矩阵。B2 对 B1、B3 对 B2 用于解释优化增益，不能替代原生基线。B3 若只对比 B0，结果应标为“AFD+Graph/U2+DSpark 相对 eager 原生 Decode 的组合收益”。原生 Graph/DSpark 或微批能力不支持时，保留缺项和配置差异，不把 eager 结果冒充功能匹配的主基线，也不将仅有 AFD 组的结果写成相对原生收益。
-
-在运行前保存 `performance_protocol.md`，两组共用并冻结以下内容：
-
-- 软件提交、镜像/CANN/HCCL、模型/量化/tokenizer hashes、seed、解码参数、prefix cache 策略。B0/B1、N-G/B2 各配对使用同一 Flash checkpoint；N-GS/B3 使用同一 DSpark checkpoint 和 draft 配置。另比较 DSpark 开关的增益时，核对 target 权重 hashes 是否一致，不将不同权重的效果单独归因于 DSpark。
-- Prefill DP/TP/卡数、KV connector、Proxy、输入集及顺序、输入/输出长度、并发、请求速率、warmup、测量请求数和重复次数。
-- 每个角色的主机/物理卡、原生 Decode 的 DP/TP/EP 与最终通信后端、最大活跃序列数、batch token 上限、HBM/KV 容量及 Graph capture sizes。原生/AFD 对配置的含义可能不同，保留实际值及差异。
-- 预先约定的 TTFT/TPOT 延迟目标、成功率要求、统计方式，以及“占用卡数”还是“预留整机卡数”的成本口径。
-
-**A4F2 的 Decode 使用 6 卡，不能与原生 D4 的 4 卡吞吐直接相除后称为等资源 AFD 收益。** 同资源对照应先验证原生 DP/TP/EP 的合法组合、权重/专家分片和显存，不能为凑 6 卡直接假定 DP6/EP6 可用。若只有 D4 能运行，则两机 P2+D4 使用 6 卡、P2+A4F2 使用 8 卡；分别报告总吞吐、实际卡数、每卡吞吐和预留整机成本，并将结论限定为这两种部署方案。每卡归一化也不等同于严格的等资源因果对照。
-
-#### 8.3.2 准备非 AFD 原生 Decode 基线 B0/N-G/N-GS
-
-本目录没有独立的 DeepSeek-V4 非 AFD launcher。`afd_attention.sh`/`afd_ffn.sh` 固定传入 `additional_config["afd"]`，不能通过设置 `ENABLE_AFD=0` 或仅关闭 DSpark 得到 B0。B0 不启动独立 FFN，原生 Decode 必须同时执行完整 Attention 和 FFN。
-
-下面给出 **P2+D4 候选基线**，不是等卡数基线。主测先按第 4.1 节在单机运行 P2/Proxy 与原生 D4：P 使用 NPU 0、1，D 使用 2–5，6、7 空闲；各角色 IP 均为本机可达 IP。跨机补充时可按第 4.2.1 节在机器 1 运行 P2/Proxy、机器 2 运行 D4（NPU 0–3）。两种拓扑的 `ATTENTION_HOST_IP/ATTENTION_API_PORT` 均指向原生 Decode。停止上一组全部服务并确认清理后，使用包含拓扑及实际组名（B0、N-G 或 N-GS）的新 RUN_ID；加载第 3.1 节环境并初始化本机 RUN_ROOT。
-
-在各角色启动终端先选择同一个 `PERF_GROUP`，设置以下配置，再按第 4.4 节保存运行清单（这三个原生 CASE 为本节扩展标签，不执行第 4.3 节的 AFD CASE 分支）：
-
-```bash
-export PERF_GROUP=N-G       # 首测 N-G；另一主基线用 N-GS；B0 仅为 eager 辅助
-export CASE="$PERF_GROUP"
-export MODEL_PATH="$FLASH_MODEL_PATH" EXECUTION_MODE=full-decode-only
-export U_BATCHES=1          # 原生首次候选采用 U1；不调用 AFD configure_execution
-export ENABLE_PD=1 ENABLE_DSPARK=0 ENABLE_MTP=0
-case "$PERF_GROUP" in
-  B0) export EXECUTION_MODE=eager ;;
-  N-G) ;;
-  N-GS) export MODEL_PATH="$DSPARK_MODEL_PATH" ENABLE_DSPARK=1 ;;
-  *) printf 'Unknown PERF_GROUP: %s\n' "$PERF_GROUP" >&2; exit 2 ;;
-esac
-export AFD_HCCL_STAGE_DIAGNOSTICS=0
-export AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS=0
-export VLLM_LOGGING_LEVEL=INFO
-```
-
-先按第 6.1 节启动 Prefill，等待 ready。原生 Decode 的启动终端在已加载相同组配置且 RUN_ROOT 已存在后执行以下候选命令；单机时两个角色在同一主机，跨机时在各自节点执行。不传 AFD additional config 或 DBO 参数，也不套用 AFD 的临时 all2all backend；N-GS 单独添加 DSpark speculative config。实际通信后端由固定的上游平台选择，须记录启动后的最终值。
+在协调终端先加载第 3.1 节的环境，然后固定单机拓扑：
 
 ```bash
 set -euo pipefail
-test -d "$RUN_ROOT"
-test "$PREFILL_DP_SIZE" = 2
-test "$ATTENTION_RANKS" = 4
-test "$HCCL_IF_IP" = "$ATTENTION_HOST_IP"
-export BASELINE_DEVICES="$ATTENTION_DEVICES"  # 单机 2,3,4,5；两机 0,1,2,3
-export ASCEND_RT_VISIBLE_DEVICES="$BASELINE_DEVICES"
-export VLLM_HOST_IP="$HCCL_IF_IP"
-export HCCL_IF_BASE_PORT="$ATTENTION_HCCL_IF_BASE_PORT"
+# SITE_FILE、NODE_FILE 使用第 3.1 节已经填写并验证过的实际文件。
+source "$SITE_FILE"
+source "$NODE_FILE"
+source "$CANN_ROOT/set_env.sh"
+source "$VENV_ROOT/bin/activate"
+export PYTHON_BIN="$VENV_ROOT/bin/python" VLLM_BIN="$VENV_ROOT/bin/vllm"
+export RECIPE="$AFD_PLUGIN_ROOT/recipe/npu/P2pHcclAFDConnector/deepseek_v4"
+export TOPOLOGY=single PREFILL_DP_SIZE=2 PREFILL_TP_SIZE=1
+export PREFILL_DEVICES=0,1 ATTENTION_DEVICES=2,3,4,5 FFN_DEVICES=6,7
+export ATTENTION_RANKS=4 FFN_RANKS=2 TENSOR_PARALLEL_SIZE=1
+export PREFILL_HOST_IP="$HCCL_IF_IP" ATTENTION_HOST_IP="$HCCL_IF_IP"
+export FFN_HOST_IP="$HCCL_IF_IP" PROXY_HOST_IP="$HCCL_IF_IP" AFD_HOST="$HCCL_IF_IP"
+export GLOO_SOCKET_IFNAME="$NIC_NAME" HCCL_SOCKET_IFNAME="$NIC_NAME"
 export TP_SOCKET_IFNAME="$NIC_NAME"
-export VLLM_USE_V1=1
-# 保留与 Prefill 相同的插件集合；AFD 按 additional_config 是否含 afd 激活。
 export VLLM_PLUGINS=ascend,ascend_model,ascend_model_loader,ascend_kv_connector,afd
-source "$RECIPE/common.sh"
-NATIVE_EXECUTION_ARGS=(--enforce-eager)
-NATIVE_DSPARK_ARGS=()
-if [[ "$PERF_GROUP" == N-G || "$PERF_GROUP" == N-GS ]]; then
-  read -r -a native_capture_sizes <<< "$CUDAGRAPH_CAPTURE_SIZES"
-  NATIVE_EXECUTION_ARGS=(
-    --max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE"
-    --cudagraph-capture-sizes "${native_capture_sizes[@]}"
-    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
-  )
-fi
-if [[ "$PERF_GROUP" == N-GS ]]; then
-  DSPARK_BLOCK_SIZE="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["dspark_block_size"])' "$MODEL_PATH/config.json")"
-  [[ "$DSPARK_BLOCK_SIZE" =~ ^[1-9][0-9]*$ ]] \
-    || afd_die "N-GS requires a DSpark checkpoint with dspark_block_size"
-  DSPARK_CONFIG="$(printf '{"method":"mtp","num_speculative_tokens":%s,"draft_sample_method":"greedy","enforce_eager":true}' "$DSPARK_BLOCK_SIZE")"
-  NATIVE_DSPARK_ARGS=(--speculative-config "$DSPARK_CONFIG")
-fi
-# 此 helper 的 decode.dp_size=4 对应本例原生 D4，不表示启用 AFD。
-KV_CONFIG="$(build_a5_pd_kv_config kv_consumer \
-  "$DECODE_ENGINE_ID" "$DECODE_KV_PORT" "$BASELINE_DEVICES")"
-printf '%s\n' "$KV_CONFIG" > "$RUN_ROOT/baseline-kv-config.json"
-nohup "$VLLM_BIN" serve "$MODEL_PATH" \
-  --host 0.0.0.0 --port "$ATTENTION_API_PORT" \
-  --api-server-count 1 --served-model-name dsv4-afd \
-  --data-parallel-size 4 --tensor-parallel-size 1 --enable-expert-parallel \
-  --max-model-len "$MAX_MODEL_LEN" --max-num-seqs "$MAX_NUM_SEQS" \
-  --max-num-batched-tokens "$ATTENTION_MAX_NUM_BATCHED_TOKENS" \
-  --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" --seed 1024 \
-  --tokenizer-mode deepseek_v4 --no-enable-prefix-caching \
-  --safetensors-load-strategy prefetch --block-size 32 --kv-cache-dtype auto \
-  --no-async-scheduling --kv-transfer-config "$KV_CONFIG" \
-  "${NATIVE_EXECUTION_ARGS[@]}" "${NATIVE_DSPARK_ARGS[@]}" \
-  > "$RUN_ROOT/decode.log" 2>&1 &
-echo $! > "$RUN_ROOT/decode.pid"
-```
-
-另存 `topology.txt`，明确主机数、P2/Proxy 和 D4 的实际卡位、FFN 卡数为 0；共用环境里遗留的 `FFN_DEVICES` 不表示原生组占用了这些卡。单机 P/D 卡位必须互斥；不要沿用两机 D4 的 0–3 与本机 P2 的 0、1 重叠。若候选 D4 启动、KV 接收或正确性失败，保存原始错误并停止性能比较，不能将启动成功写成可用基线。另选合法的原生并行配置时，同时调整两端 KV JSON 的 decode DP/TP、卡表及运行清单；本例 helper 固定 D4/TP1，其他布局需单独生成匹配配置，不能只改 CLI。
-
-按第 6.2 节检查 Prefill 和原生 Decode health、四个 Decode rank ready，然后启动 Proxy；原生组跳过 FFN loop/AFD mapping 检查。经 Proxy 发送 EOS、smoke、full 并检查真实 KV 接收、输出正确、请求归零；使用冻结精度协议验证质量。日志/实际 argv 应显示原生模型和 worker、无 AFD role；B0 为 eager/无 speculative config，N-G 为 Graph/无 speculative config，N-GS 为 target Graph/DSpark draft eager。保留 `dsv4-afd` 服务名仅为两组客户端一致，不代表启用 AFD。
-
-原生组正常停服顺序为停止新请求、请求归零、停 Proxy、`kill -TERM "$(cat "$RUN_ROOT/decode.pid")"`、最后停 Prefill，检查所有原生子进程、NPU 和端口释放。没有 FFN shutdown 门禁。B1 则按 C1 的启动/停服流程，使用独立 RUN_ID，仍保留 P2 和相同模型、请求配置。每组按下一节关闭诊断并重新冷启动性能服务，不复用功能测试后的进程。
-
-上面按 `PERF_GROUP` 生成三套候选参数，尚未经过 A5 实机验收。N-G/N-GS 的 capture sizes 必须覆盖实际负载；分别验收原生 Graph replay、DSpark KV/target verify 和输出质量，AFD 专用 DSpark 补丁存在不代表原生 N-GS 已兼容。原生首次候选不启用 DBO/U2，而 AFD 使用 U2；该差异保留时，只能声明两种部署方案的组合收益。若要进一步隔离 AFD 本身的收益，先确认原生 DBO/U2 支持情况，再建立功能匹配并通过验收的新配置；不在计时过程中临时加参数。原生主场景尚未验收时标 pending，不使用 B0 冒充。
-
-#### 8.3.3 关闭诊断并运行配对压测
-
-所有服务启动终端设置第 8.2 节三个诊断变量，B1 在第 4.3 节 CASE 配置**之后**覆盖 `AFD_HCCL_STAGE_DIAGNOSTICS=0`，避免被功能配置重置。正常停服后以新 RUN_ID 重启、确认 ready，并归档实际 argv、有效开关和拓扑。先验证路径证据，再关闭诊断计时，不在计时窗口开启同步诊断、profiler 或 DEBUG 热路径日志。
-
-压测客户端可固定在 Proxy 主机；两组使用同一位置并确认客户端 CPU/网络未饱和。`BASE_URL` 始终指向 Proxy，不将 B0 的端到端请求与 B1 直连 Attention 的请求混比。直连 Attention 不等于使用相同外部 KV 的纯 Decode 测试；dummy-KV 压测也不替代本节真实 PD 的结果。
-
-下面的短输入矩阵和 random CLI 是入口预检、固定负载及延迟辅助模板，不是第 8.4 节长上下文主要矩阵。初跑可从 128/128、并发 8 做小规模预检；主矩阵改用第 8.4 节的输入长度、BS/客户端容量和代表业务的真实请求集，尤其不使用随机文本的接受率代表 DSpark 业务收益。
-
-| 输入 token / 输出 token | 观察重点 | 最大并发 |
-|---|---|---|
-| 128 / 128 | 与第 8.2 节负载衔接 | 1、8、32 |
-| 128 / 1024 | Decode 吞吐、TPOT | 1、8、32 |
-| 2048 / 128 | Prefill、KV 传输、TTFT | 1、8、32 |
-
-每组每个负载/并发点先 warmup 32 请求，再测 3 轮、每轮 1024 请求；这些是起始协议示例，正式数量在运行前冻结，并确保测量足够长以覆盖稳定服务。两组完全相同，不取最快一轮。`MAX_MODEL_LEN=4096` 能覆盖表中长度，但仍需核验实际输入/输出 token 数，不能把请求的长度参数当成实际完成长度。
-
-客户端先核对固定 vLLM 0.23 的参数，保存帮助；不升级 CLI：
-
-```bash
-"$VLLM_BIN" bench serve --help > "$RUN_ROOT/bench-serve-help.txt"
-```
-
-确认支持下面的 seed 和分位数参数后，逐负载/并发点执行以下整段。替换 `PERF_GROUP`、`ISL/OSL/CONCURRENCY`；`RUN_ROOT` 使用本组独立性能目录。random 输入用于可复现压力测试，不能替代质量评估；固定 CLI/tokenizer/seed，正式业务负载另冻结同一份输入文件及 hash。
-
-```bash
-set -euo pipefail
-export PERF_GROUP=N-G                # N-G/B2、N-GS/B3 配对；本段 random 负载仅作辅助
-export ISL=128 OSL=1024 CONCURRENCY=32
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}localhost,127.0.0.1,$HCCL_IF_IP"
+export no_proxy="$NO_PROXY"
 export BASE_URL="http://$PROXY_HOST_IP:$PROXY_PORT"
 export ATTENTION_URL="http://$ATTENTION_HOST_IP:$ATTENTION_API_PORT"
-export PERF_DIR="$RUN_ROOT/performance/$PERF_GROUP-i$ISL-o$OSL-c$CONCURRENCY"
-mkdir -p "$RUN_ROOT/performance"
-mkdir "$PERF_DIR"                    # 拒绝覆盖已有点位
+export API_PORT="$ATTENTION_API_PORT"
+export PERF_BASE="$RUN_BASE/performance"
+mkdir -p "$PERF_BASE/inputs"
+"$VLLM_BIN" bench serve --help > "$PERF_BASE/bench-help.txt"
+```
 
+**完成条件：** 版本/资源审计通过，旧服务已清理；本机 HIXL 至少覆盖 P 的 0、1 和 D/A 的 2–5。确认 CLI 支持后续 `custom`、`--disable-shuffle`、`--skip-chat-template`、`--custom-output-len`、`--save-detailed` 等参数。原生启动参数是待实机验收的候选配置。
+
+### 8.3 性能步骤 2：先准备同一份真实输入
+
+**在启动模型服务之前准备。** 第一阶段只准备 16K 输入、固定 1024 输出；32K/64K 在首轮比较完成后再准备。四组都读取同一份文件。
+
+从真实文本/代码请求中选取至少 768 条，保存到 `$PERF_BASE/inputs/raw-16384.jsonl`。每行格式如下，`prompt` 是原始用户文本；保留完整任务语义，不重复同一句话凑长度：
+
+```json
+{"prompt":"这里放一条完整的真实长文本或代码请求"}
+```
+
+下面把 chat template 固定到文件中并校验长度。使用冻结的 Flash tokenizer，并核对 DSpark checkpoint 的 tokenizer 文件 hash 相同。示例接受 `[ISL-128, ISL]` token 的输入；将这个范围写入协议，文件名中的 16K 不代替实际 token 数。
+
+```bash
+export ISL=16384 OSL=1024
+"$PYTHON_BIN" - "$FLASH_MODEL_PATH" "$PERF_BASE/inputs" "$ISL" "$OSL" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from vllm.benchmarks.datasets.datasets import CustomDataset
+from vllm.tokenizers import get_tokenizer
+
+model, directory, input_length, output_length = sys.argv[1:]
+input_length, output_length = int(input_length), int(output_length)
+root = Path(directory)
+tokenizer = get_tokenizer(model, tokenizer_mode="deepseek_v4")
+dataset = CustomDataset(dataset_path=str(root / f"raw-{input_length}.jsonl"),
+                        random_seed=1024, disable_shuffle=True)
+requests = dataset.sample(tokenizer=tokenizer, num_requests=768, no_oversample=True,
+                          output_len=output_length,
+                          chat_template_kwargs={"thinking": False, "enable_thinking": False})
+assert len(requests) == 768, "Prepare at least 768 real inputs."
+assert all(input_length - 128 <= request.prompt_len <= input_length
+           for request in requests), "Select inputs in the agreed token-length range."
+target = root / f"requests-{input_length}.jsonl"
+with target.open("x", encoding="utf-8") as file:
+    for request in requests:
+        file.write(json.dumps({"prompt": request.prompt, "output_tokens": output_length,
+                               "input_tokens": request.prompt_len}, ensure_ascii=False) + "\n")
+print(target, min(request.prompt_len for request in requests),
+      max(request.prompt_len for request in requests))
+PY
+sha256sum "$PERF_BASE/inputs/requests-$ISL.jsonl" > "$PERF_BASE/inputs/requests-$ISL.sha256"
+```
+
+**完成条件：** 得到 768 条长度合格的 `requests-16384.jsonl` 及 hash。第 8.6 节还要核对服务端实际 token 数，模板特殊 token 处理不一致时先修正并重新冻结。各组使用同一文件、同一顺序；后面的 `--skip-chat-template` 避免重复套模板。
+
+本入口依据固定 [vLLM 提交的 CustomDataset](https://github.com/vllm-project/vllm/blob/0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665/vllm/benchmarks/datasets/datasets.py)，现场核对实际安装位置及 CLI 帮助。数据文件未准备好时，停在这一步。
+
+### 8.4 性能步骤 3：选择本轮配置，创建新目录
+
+**换配置、输入长度、BS 或诊断模式时，都从本步骤重新开始。** 四组按表逐组执行：
+
+| 顺序 / `PERF_CASE` | 模型 | Decode 路径 | DSpark |
+|---|---|---|---|
+| 1：`native_graph` | Flash | 原生 D4，target Graph | 关 |
+| 2：`afd_graph` | 同一 Flash | A4F2，target Graph/U2（C3） | 关 |
+| 3：`native_dspark` | DSpark checkpoint | 原生 D4，target Graph | draft eager |
+| 4：`afd_dspark` | 同一 DSpark checkpoint | A4F2，target Graph/U2（C5） | draft eager |
+
+原生首次候选为 Graph/U1，AFD 为 Graph/U2；保留此差异时，结论称为“两种部署配置的收益”。隔离 AFD 本身的贡献时，再核验原生 U2 并建立新对照；不用 eager 原生替代 Graph 主基线。
+
+首次只改下面的组名，保留 `PHASE=check`、16K、BS8。后续怎样修改见第 8.9 节。
+
+```bash
+export PERF_CASE=native_graph     # 按表依次换组
+export PHASE=check                # check：路径预检；measure：正式计时
+export CASE="$PERF_CASE" CYCLE=1
+export ISL=16384 OSL=1024 DECODE_BS=8
+export MAX_MODEL_LEN=$((ISL + OSL))
+export MAX_NUM_SEQS="$DECODE_BS"
+export FFN_SEQ_CAPACITY=$((2 * DECODE_BS))
+export CAPACITY=$((4 * DECODE_BS))
+export REQUEST_COUNT=$((6 * CAPACITY))
+export DATASET_FILE="$PERF_BASE/inputs/requests-$ISL.jsonl"
+export ENABLE_PD=1 ENABLE_MTP=0 ENABLE_DSPARK=0 USE_AFD=0
+export MODEL_PATH="$FLASH_MODEL_PATH" EXECUTION_MODE=full-decode-only U_BATCHES=1
+case "$PERF_CASE" in
+  native_graph) ;;
+  afd_graph) export USE_AFD=1 U_BATCHES=2 ;;
+  native_dspark) export MODEL_PATH="$DSPARK_MODEL_PATH" ENABLE_DSPARK=1 ;;
+  afd_dspark) export MODEL_PATH="$DSPARK_MODEL_PATH" ENABLE_DSPARK=1 USE_AFD=1 U_BATCHES=2 ;;
+  *) printf 'Unknown PERF_CASE\n' >&2; exit 2 ;;
+esac
+case "$PHASE" in
+  check) export AFD_HCCL_STAGE_DIAGNOSTICS=1 ;;
+  measure) export AFD_HCCL_STAGE_DIAGNOSTICS=0 ;;
+  *) printf 'PHASE must be check or measure\n' >&2; exit 2 ;;
+esac
+export AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS=0 VLLM_LOGGING_LEVEL=INFO
+export AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP=1 AFD_HCCL_GRAPH_U2_HYBRID_DAG=1
+export AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM=1
+export AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM=1 AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER=1
+export RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-single-$PERF_CASE-i$ISL-b$DECODE_BS-$PHASE"
+export RUN_ROOT="$RUN_BASE/$RUN_ID/$(hostname -s)"
+mkdir -p "$RUN_BASE/$RUN_ID"
+mkdir "$RUN_ROOT"
+test -f "$DATASET_FILE"
+cp "$SITE_FILE" "$RUN_ROOT/site.env"
+cp "$NODE_FILE" "$RUN_ROOT/node.env"
+sha256sum "$DATASET_FILE" > "$RUN_ROOT/input.sha256"
+```
+
+**启动前核对：** 16K+1024 的上限是 17408，不能继续用 4096。保留已冻结的 `GPU_MEMORY_UTILIZATION=0.91`，重新检查 P/D/A/F 的 KV 和 HBM。`FFN_SEQ_CAPACITY=2×DECODE_BS` 仅是序列容量起点，DSpark 的 verify/draft token、buffer、padding 预算另核验。
+
+首个 BS8 预检从原 recipe capture sizes `1 2 4 8` 开始验证；它不证明 DSpark 或更大 BS 的 Graph shape 已覆盖。扩大 BS 前按实际 shape 调整并验收 `MAX_CUDAGRAPH_CAPTURE_SIZE`、`CUDAGRAPH_CAPTURE_SIZES` 和各角色 token budget，记录到本点配置。A/F 需要不同 capture/budget 时，在对应角色的命令前缀分别设置并归档，不能靠共用值推定已覆盖。**未经预检的配置不进入 `measure`。**
+
+按第 4.4 节保存 runtime，补充本轮 `PERF_CASE/PHASE/ISL/OSL/DECODE_BS/FFN_SEQ_CAPACITY`、各角色 token budget、capture sizes 和输入 hash。`USE_AFD` 仅选择下文命令分支，不是插件开关。
+
+### 8.5 性能步骤 4：启动服务，最后启动 Proxy
+
+**4.1 先启动 P，等它 ready。** 每次最多等待 20 分钟；失败保存日志并排查，不继续后续角色。
+
+```bash
+wait_http() {
+  local url="$1" deadline=$((SECONDS + 1200))
+  until curl --noproxy '*' -fsS --max-time 5 "$url" >/dev/null; do
+    ((SECONDS < deadline)) || return 1
+    sleep 5
+  done
+}
+nohup bash "$RECIPE/afd_prefill.sh" > "$RUN_ROOT/prefill.log" 2>&1 &
+echo $! > "$RUN_ROOT/prefill.pid"
+wait_http "http://$PREFILL_HOST_IP:$PREFILL_API_PORT/health"
+```
+
+**4.2 根据本组启动 A/F 或原生 D。** AFD 先 F 后 A，两条紧接执行；原生不启动独立 F。开启 DSpark 时，P/A/F 都保持同一 DSpark checkpoint，只有 A/原生 D 加 drafter。
+
+```bash
+if [[ "$USE_AFD" == 1 ]]; then
+  MAX_NUM_SEQS="$FFN_SEQ_CAPACITY" ENABLE_PD=0 ENABLE_DSPARK=0 \
+    nohup bash "$RECIPE/afd_ffn.sh" > "$RUN_ROOT/ffn.log" 2>&1 &
+  echo $! > "$RUN_ROOT/ffn.pid"
+  nohup bash "$RECIPE/afd_attention.sh" > "$RUN_ROOT/attention.log" 2>&1 &
+  echo $! > "$RUN_ROOT/attention.pid"
+else
+  source "$RECIPE/common.sh"
+  export ASCEND_RT_VISIBLE_DEVICES="$ATTENTION_DEVICES" VLLM_HOST_IP="$HCCL_IF_IP"
+  export HCCL_IF_BASE_PORT="$ATTENTION_HCCL_IF_BASE_PORT" VLLM_USE_V1=1
+  KV_CONFIG="$(build_a5_pd_kv_config kv_consumer \
+    "$DECODE_ENGINE_ID" "$DECODE_KV_PORT" "$ATTENTION_DEVICES")"
+  printf '%s\n' "$KV_CONFIG" > "$RUN_ROOT/native-kv-config.json"
+  read -r -a native_capture_sizes <<< "$CUDAGRAPH_CAPTURE_SIZES"
+  NATIVE_DSPARK_ARGS=()
+  if [[ "$ENABLE_DSPARK" == 1 ]]; then
+    DSPARK_BLOCK_SIZE="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["dspark_block_size"])' "$MODEL_PATH/config.json")"
+    [[ "$DSPARK_BLOCK_SIZE" =~ ^[1-9][0-9]*$ ]] || afd_die "Invalid dspark_block_size"
+    DSPARK_CONFIG="$(printf '{"method":"mtp","num_speculative_tokens":%s,"draft_sample_method":"greedy","enforce_eager":true}' "$DSPARK_BLOCK_SIZE")"
+    NATIVE_DSPARK_ARGS=(--speculative-config "$DSPARK_CONFIG")
+  fi
+  nohup "$VLLM_BIN" serve "$MODEL_PATH" \
+    --host 0.0.0.0 --port "$ATTENTION_API_PORT" \
+    --api-server-count 1 --served-model-name dsv4-afd \
+    --data-parallel-size 4 --tensor-parallel-size 1 --enable-expert-parallel \
+    --max-model-len "$MAX_MODEL_LEN" --max-num-seqs "$DECODE_BS" \
+    --max-num-batched-tokens "$ATTENTION_MAX_NUM_BATCHED_TOKENS" \
+    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" --seed 1024 \
+    --tokenizer-mode deepseek_v4 --no-enable-prefix-caching \
+    --safetensors-load-strategy prefetch --block-size 32 --kv-cache-dtype auto \
+    --no-async-scheduling --kv-transfer-config "$KV_CONFIG" \
+    --max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE" \
+    --cudagraph-capture-sizes "${native_capture_sizes[@]}" \
+    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+    "${NATIVE_DSPARK_ARGS[@]}" > "$RUN_ROOT/decode.log" 2>&1 &
+  echo $! > "$RUN_ROOT/decode.pid"
+fi
+wait_http "$ATTENTION_URL/health"
+```
+
+**完成条件：** 四个 D/A rank ready；AFD 另确认两个 F rank 进入 connector loop。原生日志/argv 无 `additional_config.afd`，AFD 有正确 role 和 A4F2 mapping。保存实际通信后端；Graph 在线 replay、DSpark 四个 drafter 和执行证据在下一步核对。
+
+**4.3 后端就绪后启动 Proxy。**
+
+```bash
+nohup bash "$RECIPE/afd_proxy.sh" > "$RUN_ROOT/proxy.log" 2>&1 &
+echo $! > "$RUN_ROOT/proxy.pid"
+wait_http "$BASE_URL/healthcheck"
+curl --noproxy '*' -fsS "$BASE_URL/healthcheck" > "$RUN_ROOT/proxy-ready.json"
+"$PYTHON_BIN" - "$RUN_ROOT/proxy-ready.json" <<'PY'
+import json
+import sys
+
+state = json.load(open(sys.argv[1]))
+assert state["status"] == "ok" and state["request_num"] == 0, state
+assert state["prefill_instances"] == 1 and state["decode_instances"] == 1, state
+PY
+```
+
+### 8.6 性能步骤 5：先检查请求和真实运行路径
+
+先在当前终端定义下面的函数，预检、预热和正式轮次共用它。读取第 8.3 节的真实输入，固定输出预算；`ignore-eos/min_tokens` 用于固定长度压力协议。自然 EOS 的业务评估单独记录。
+
+```bash
 run_perf_batch() {
-  local phase="$1" count="$2" seed="$3"
-  curl --noproxy '*' -fsS --max-time 10 "$ATTENTION_URL/metrics" \
-    > "$PERF_DIR/$phase.metrics-before.txt"
+  local name="$1" count="$2"
+  curl --noproxy '*' -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/$name.metrics-before.txt"
   "$VLLM_BIN" bench serve \
     --backend openai --base-url "$BASE_URL" --endpoint /v1/completions \
-    --model dsv4-afd --tokenizer "$MODEL_PATH" \
-    --dataset-name random --random-input-len "$ISL" --random-output-len "$OSL" \
-    --seed "$seed" --num-prompts "$count" --max-concurrency "$CONCURRENCY" \
-    --request-rate inf --ignore-eos \
+    --model dsv4-afd --tokenizer "$MODEL_PATH" --tokenizer-mode deepseek_v4 \
+    --dataset-name custom --dataset-path "$DATASET_FILE" \
+    --skip-chat-template --disable-shuffle --no-oversample --custom-output-len "$OSL" \
+    --seed 1024 --num-prompts "$count" --max-concurrency "$CAPACITY" \
+    --request-rate inf --ignore-eos --num-warmups 0 --ready-check-timeout-sec 0 \
+    --extra-body "{\"temperature\":0,\"seed\":1024,\"min_tokens\":$OSL}" \
     --percentile-metrics ttft,tpot,itl --metric-percentiles 50,95,99 \
-    --save-result --result-dir "$PERF_DIR" --result-filename "$phase.json" \
-    2>&1 | tee "$PERF_DIR/$phase.console.log"
-  curl --noproxy '*' -fsS --max-time 10 "$ATTENTION_URL/metrics" \
-    > "$PERF_DIR/$phase.metrics-after.txt"
-  # 固定版本结果应含 completed；字段不同先核对本机格式，不跳过成功数检查。
-  "$PYTHON_BIN" - "$PERF_DIR/$phase.json" "$count" \
-    "$BASE_URL" "$ATTENTION_URL" "$PERF_DIR/$phase.drain.json" <<'PY'
+    --save-result --save-detailed --result-dir "$RUN_ROOT" --result-filename "$name.json" \
+    2>&1 | tee "$RUN_ROOT/$name.console.log"
+  curl --noproxy '*' -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/$name.metrics-after.txt"
+  "$PYTHON_BIN" - "$RUN_ROOT/$name.json" "$count" "$OSL" \
+    "$BASE_URL" "$ATTENTION_URL" "$RUN_ROOT/$name.drain.json" <<'PY'
 import json
 import re
 import sys
@@ -1537,278 +1550,164 @@ from pathlib import Path
 
 import httpx
 
-with open(sys.argv[1], encoding="utf-8") as file:
-    result = json.load(file)
-assert result["completed"] == int(sys.argv[2]), result
+result = json.loads(Path(sys.argv[1]).read_text())
+assert result["completed"] == int(sys.argv[2]) and result["failed"] == 0, result
+assert result["total_output_tokens"] == int(sys.argv[2]) * int(sys.argv[3]), result
 deadline = time.monotonic() + 60
 with httpx.Client(trust_env=False, timeout=10) as client:
     while True:
-        response = client.get(f"{sys.argv[3]}/healthcheck")
+        response = client.get(f"{sys.argv[4]}/healthcheck")
         response.raise_for_status()
         proxy = response.json()
-        response = client.get(f"{sys.argv[4]}/metrics")
+        response = client.get(f"{sys.argv[5]}/metrics")
         response.raise_for_status()
         gauges = {}
-        for name in ("vllm:num_requests_running", "vllm:num_requests_waiting"):
-            values = re.findall(
-                rf"^{re.escape(name)}(?:\{{[^\n]*\}})? ([^\s]+)",
-                response.text,
-                re.MULTILINE,
-            )
-            assert values, f"missing metric: {name}"
-            gauges[name] = [float(value) for value in values]
+        for metric in ("vllm:num_requests_running", "vllm:num_requests_waiting"):
+            values = re.findall(rf"^{re.escape(metric)}(?:\{{[^\n]*\}})? (\S+)",
+                                response.text, re.MULTILINE)
+            assert values, f"Missing metric: {metric}"
+            gauges[metric] = [float(value) for value in values]
         snapshot = {"proxy": proxy, "decode_gauges": gauges}
-        Path(sys.argv[5]).write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+        Path(sys.argv[6]).write_text(json.dumps(snapshot, indent=2))
         if proxy["status"] == "ok" and proxy["request_num"] == 0 and all(
-            value == 0 for values in gauges.values() for value in values
-        ):
+                value == 0 for values in gauges.values() for value in values):
             break
         assert time.monotonic() < deadline, snapshot
         time.sleep(1)
 PY
 }
-
-run_perf_batch warmup 32 1023
-for repeat in 1 2 3; do
-  run_perf_batch "measure-$repeat" 1024 1024
-done
 ```
 
-本段在每次 batch 结束后最多等待 60 秒，检查 Proxy request_num 和 Decode 的 running/waiting 全部归零，保存 `*.drain.json`；缺指标、请求未归零或成功数不足会停止后续 batch。若出现超时/OOM/错误输出，按第 9 节保留现场。CLI 退出 0 不代表所有请求成功，另核对每轮结果的失败数、实际输入/输出总 token。脚本中的 completed 检查只做初筛，不代替这些检查。
+本例检查 `completed/failed/total_output_tokens`；字段不符时先核对冻结版本，不删除成功数/输出量检查。CLI 可对照固定 [vLLM benchmark 源码](https://github.com/vllm-project/vllm/blob/0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665/vllm/benchmarks/serve.py)。无可信 token usage 时先核对统计路径，draft/rejected/verify/padding token 不计作输出。
 
-上述 `request-rate inf` 测饱和吞吐。完成后另建带实际 RPS 的结果目录，将函数内 `--request-rate inf` 改成冻结的数值，对两组施加相同到达速率，逐级提高 RPS；若最大并发上限先限制发压，应明确记录。按预先约定的 TTFT/TPOT 分位数和成功率目标，比较两组最大可承载流量。饱和吞吐与相同延迟目标下的服务容量分别报告。
-
-HBM 在每个服务节点单独采样并保存时间戳；在 warmup 前启动，最后一轮结束后停止。下面示例每 5 秒采样，采样间隔也纳入协议：
+**只有 `PHASE=check` 时执行预检：**
 
 ```bash
-(
-  while :; do
-    date -Iseconds
-    npu-smi info
-    sleep 5
+if [[ "$PHASE" == check ]]; then
+  "$PYTHON_BIN" "$AFD_PLUGIN_ROOT/tools/validation/a5_1030_requests.py" \
+    --base-url "$BASE_URL" --attention-url "$ATTENTION_URL" --suite smoke \
+    --run-id "$RUN_ID" --output "$RUN_ROOT/smoke"
+  run_perf_batch long-input-check "$CAPACITY"
+  npu-smi info > "$RUN_ROOT/npu-after-check.txt"
+fi
+```
+
+保存这些证据：真实 KV 收到且输出正常；四个 D/A rank 的实际输入长度、活跃数和 HBM/KV；target 在线 Graph replay；AFD 的 U2 stage 0/1 和两个 F rank 完成；DSpark 的真实 draft/verify、proposed/accepted 增量及 draft eager。原生 DSpark 兼容性以本轮证据为准。
+
+**完成条件：** smoke 和真实长输入通过，无退化、OOM、hang、NaN/Inf，路径符合本组配置。smoke 不代替第 1–7、8.1 节完整验收。检查轮直接到第 8.8 节停服；四组 BS8 都通过后才开始正式轮次。
+
+### 8.7 性能步骤 6：关闭诊断，预热后测三轮
+
+从第 8.4 节重新开始，设置 `PHASE=measure`，选择**已经通过预检**的长度/BS/capture/budget，以新 RUN_ID 冷启动。保持同一输入/模型/执行开关，关闭诊断、DEBUG 和 profiler；不拿预检进程计时。
+
+ready 且第 8.6 节函数已定义后执行：
+
+```bash
+if [[ "$PHASE" == measure ]]; then
+  (
+    while :; do date -Iseconds; npu-smi info; sleep 5; done
+  ) > "$RUN_ROOT/npu-samples.txt" 2>&1 &
+  echo $! > "$RUN_ROOT/npu-sampler.pid"
+  run_perf_batch warmup "$CAPACITY"
+  for repeat in 1 2 3; do
+    run_perf_batch "measure-$repeat" "$REQUEST_COUNT"
   done
-) > "$RUN_ROOT/npu-performance-samples.txt" 2>&1 &
-echo $! > "$RUN_ROOT/npu-sampler.pid"
-# 全部测量结束后，在本机执行：
-# kill -TERM "$(cat "$RUN_ROOT/npu-sampler.pid")"
+fi
 ```
 
-这是设备 HBM 的采样最大值，可能遗漏瞬时峰值；同机其他进程也会影响数值。以日志/进程表确认卡的归属，分别报告 Prefill、Attention/原生 Decode、FFN，勿把当前 HBM 或各卡不同时间的峰值之和称为精确同时峰值。DSpark 组按每轮 metrics-before/after 计算 proposed/accepted 增量，并写明 acceptance rate 分子分母；counter 不可用时标为缺失，不填写 0 或用进程累计值冒充本轮值。
+每个 batch 后等待 Proxy 请求数、D/A running/waiting 归零，再进入下一轮。失败按第 9 节保存现场，不继续推进。HBM 每 5 秒采样，报告采样最大值，不当作精确瞬时峰值。
 
-#### 8.3.4 计算收益并归档结果
+| 每个 D/A rank 的 BS | F 序列容量起点 | 预热请求 | 每轮正式请求 | 客户端在途上限 |
+|---:|---:|---:|---:|---:|
+| 8 | 16 | 32 | 192 | 32 |
+| 16 | 32 | 64 | 384 | 64 |
+| 24 | 48 | 96 | 576 | 96 |
+| 32（可选） | 64 | 128 | 768 | 128 |
 
-每个相同输入/输出长度、并发和请求速率单独比较，保留 3 轮原始值，报告中位数及最小/最大值；不混合不同负载，也不将 warmup 纳入统计。
+“六波”表示 `正式请求数=4×BS×6`：BS24 共提交 576 条，客户端最多在途 96 条，完成后补充；不表示 576 条同时运行，也不保证每卡实际活跃数达到 24。检查 running/waiting、Prefill 供给和吞吐曲线；P2 或客户端饱和时如实记录瓶颈。窗口不稳定时，配对组统一增大请求数并重新冻结。
 
-| 指标 | 计算或报告方式 |
-|---|---|
-| 输出吞吐收益 | `(AFD 输出 tokens/s ÷ 基线输出 tokens/s - 1) × 100%`；不混用输入+输出总吞吐 |
-| TPOT 降低比例 | `(1 - AFD TPOT ÷ 基线 TPOT) × 100%`；分别比较均值、P95、P99，负值表示变慢 |
-| TTFT | 分别报告均值/P95/P99，判断 Decode 收益是否伴随首 token 延迟恶化 |
-| 单卡输出吞吐 | 输出 tokens/s ÷ 卡数；端到端分母包含 Prefill 与所有 Decode/A/F 卡，另列预留整机卡数 |
-| 服务容量 | 相同 TTFT/TPOT 延迟目标和成功率下的最大可承载 RPS；记录实际完成 RPS |
-| 运行质量与资源 | 成功/失败数、错误类型、实际 token 数、各角色 HBM 采样最大值、DSpark acceptance rate（适用时） |
+**完成条件：** 三个 `measure-*.json` 均完成 N 条、失败 0、输出量符合预算。DSpark 接受率按本轮有效 proposed/accepted 增量计算，注明分子分母/时间窗；指标异常保存缺项，不填 0。通过 Proxy 发压时单独采集 D/A `/metrics`，不假定 Proxy 暴露其指标。
 
-由于本节请求经过 Proxy，不将端到端 tokens/s 除以 Decode 卡数后标为“纯 Decode 每卡吞吐”。若另报按 Decode 卡数归一化的值，必须同时给出 Prefill 配置及其是否构成瓶颈。
+### 8.8 性能步骤 7：请求归零后正常停服
 
-汇总表至少包含：`group/topology/ISL/OSL/concurrency/request_rate/repeat/P卡数/D或A+F卡数/预留卡数/成功数/失败数/实际输入token/实际输出token/输出tokens每秒/TTFT均值及P95/P99/TPOT均值及P95/P99/HBM/acceptance rate/是否满足延迟目标`。连同协议、模型/环境 hash、实际启动参数、两节点或三节点日志、metrics、所有 JSON/console 和正常清理证据归档。
-
-只有两组质量合格、请求完整成功、资源及功能差异已说明，才计算并声明对应范围的收益。收益为负也如实报告；Prefill 饱和、客户端发压不足、网络竞争或卡数不同，应列为解释条件。第 8.2 节“不设置收益比例门槛”保持不变，本节增加收益测量方法，不新增交付收益阈值。
-
-### 8.4 参考 V3.2 recipe：Graph/U2、DSpark 的主要吞吐验证设计
-
-参考来源：[用户指定的 V3.2 CAMP2p recipe](https://github.com/wenhow/afd-plugin/tree/feat/dsv4-afd-phase1-delivery/recipe/npu/CAMP2pAFDConnector/deepseek_v3_2)，本仓库对应 [README](../../recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) 及同目录三个 launcher。本节根据本地源码核对方法，不将 V3.2 的结果或兼容性当作 V4 已验证结果。
-
-参考实验的核心是：原生 EP 与 A/F 分离各自选择可运行的 per-rank batch size，在相同负载分布下测 Decode 饱和输出吞吐，除以全部部署的物理 die 数。它不是固定客户端并发 32 的在线延迟测试。V4 沿用这个容量比较思路，但继续使用本期 A5、冻结的 vLLM 0.23/vLLM-Ascend、V4 checkpoint 和 `P2pHcclAFDConnector`。
-
-**主要组合为 Graph/U2，以及 Graph/U2+DSpark；eager 只作辅助对照。** 每个主要组合都覆盖长上下文与目标 BS24，观察总输出吞吐、单位 NPU 吞吐及 TPOT；保留 HBM、Graph replay、U2 stage、DSpark acceptance rate 解释瓶颈。功能门禁仍按 C1–C5 的原顺序完成，性能矩阵优先级不豁免 C3/C5 的已知问题。
-
-| 主要组合 | 原生基线 | AFD P2P 组 | 首要比较 |
-|---|---|---|---|
-| Graph，DSpark off | N-G：原生 target Decode Graph，DSpark off | B2：A4F2 target FULL_DECODE_ONLY/U2，DSpark off | 优化运行配置下的 AFD 总吞吐及每卡效率 |
-| Graph+DSpark | N-GS：原生 target Decode Graph+DSpark，draft eager | B3：A4F2 target FULL_DECODE_ONLY/U2+DSpark，draft eager | 主流完整组合的吞吐及每卡效率，同时比较接受率 |
-
-两侧使用同一模型/输入/KV 来源/生成预算，并记录原生是否支持与 AFD 相同的微批能力。若原生不支持 U2 或两侧 Graph 能力不同，主结果标为对应完整配置的部署收益，不能声称所有优化都已单变量对齐。C4 eager/U2+DSpark 与 C5 的配对可在代表点解释 Graph 贡献，不要求把所有 eager 模式扩成完整主矩阵。
-
-#### 8.4.1 参考方法到 V4 的映射与前置检查
-
-| 参考 recipe 的做法 | V4 的设计 |
-|---|---|
-| EP64 与 48A16F/64A16F 对比 | 原生 D4、可选 D8 与当前固定 A4F2 对比；不直接缩放成尚未支持的 A/F rank 数 |
-| 分别选择原生/AFD 的 BS | 两侧独立扫描 BS、冻结各自满足相同资源/运行质量约束的最佳点；另保留同 BS 对照 |
-| `请求数 = DP × BS × 6` | 原生用 D ranks，AFD 只用 A ranks；六波请求负责持续供给，不表示每 rank BS 或活跃并发扩大六倍 |
-| `FFN BS = A ranks × A BS / F ranks` | A4F2 的 FFN 容量起点为 `2 × A BS`；U2/Graph 实际 stage 和 buffer 容量另核验 |
-| 16K/32K 输入、512–1536 输出 | 主矩阵实际输入 8K/16K/32K/64K，目标每 A rank BS24；输出先固定 1024，再补 512–1536 分布。现有 4096 配置只作预检 |
-| AISBench synthetic 饱和发压 | 以 AISBench 做主测，固定工具提交、数据、输出预算和随机种子，核对实际发出的请求及完成 token |
-| 输出吞吐除以全部 die | V4 先按实际参与计算的 NPU 设备数归一化；报告 die 时先核对 A5 设备到物理 die 的对应关系 |
-
-**主要组合优先使用真实语义输入及匹配的真实 KV。** 现有可执行入口是第 8.3 节真实 PD：其主结果计入 Prefill 成本，并保留 TTFT/TPOT。若单独测纯 Decode，须先验收将正确的 Prefill/KV 状态准备在计时窗口外的独立流程；当前文档不宣称已有此 launcher。参考 recipe 的合成 KV 可用于隔离性能的补充实验，不能替代 DSpark 的业务接受率和完整方案主结论。本次只补验证设计，不修改 KV connector、模型路由或启动脚本。
-
-合成 Decode 实验另有以下适配前置项；这些前置项不代替真实 PD 的功能验收：
-
-1. **合成 KV 路径未验收。** 当前 [decode_bench.py](../../tools/benchmarks/decode_bench.py) 的 `AFDDecodeBenchConnector.start_load_kv()` 直接返回，没有调用 worker 的 `start_fill_kv()`。因此仅传 `fill_mean=0.015/fill_std=0` 不能证明设备 KV 已填充。V4 还存在多 KV group、滑窗/indexer 等状态，不能仅凭类声明 `SupportsHMA` 判为兼容。先在固定 0.23 栈审查接口、分组/块步长及状态初始化；验证每个实际参与读取的缓存状态都可复现、值有限、容量合法，并确认没有真实 Prefill 计算混入。必要适配另做最小补丁和架构评审，验收前该项保持 pending。
-2. **自然路由是 V4 首轮口径。** 参考 V3.2 使用强制 expert 均衡且改变输出；本地 `force_load_balance.py` 明确只 patch `AscendW8A8DynamicFusedMoEMethod`，不能推断它对 V4 本期的量化路径生效。V4 首轮不设置 `enable_force_load_balance` 或 `force_load_balance_topn_per_rank`，保留完整专家和真实路由。若另做强制均衡实验，须两侧均证明生效、明确专家范围，单独标为合成实验；不用于 GSM8K 或生产收益，也不声称模拟了更大逻辑规模。
-3. **单独准备 benchmark launcher。** 当前 V4 Attention 脚本的 `ENABLE_PD=1` 固定构建 Mooncake，`ENABLE_PD=0` 不注入任何 KV connector；没有直接选择合成 connector 的开关。需为候选测试准备独立 launcher，保留模型/worker/A-F 路径，仅调整下表性能入口参数，并归档完整 argv；不能把 `ENABLE_PD=0` 当作已挂载合成 KV。共享 `tools.benchmarks` 不在 wheel 内，服务所有子进程都需能从本次仓库导入。
-4. **软件/调度配置继续按 V4 冻结。** 不复制 V3.2 的 A3 镜像、W8A8 参数、`--async-scheduling`、16-die 节点参数或强制 `--ubatch-size 2`。当前 V4 recipe 使用 `--no-async-scheduling` 并由 AFD 的 U1/U2 配置管理微批，逐 rank 核验最终值。
-
-合成实验使用初始化过但非真实 Prefill 得到的 KV，输出语义不作为模型质量结论。实际输出有 NaN/Inf、无效 token、错误终止或设备错误时仍不能作为有效性能样本。真实质量及远程 KV 正确性继续按第 6–8.3 节验证。
-
-**DSpark 主结果不能依赖任意合成 KV。** 接受率由 target/draft 对同一真实上下文的预测一致性决定；非真实或未初始化的历史状态可能改变接受率和吞吐。DSpark 主组冻结代表业务的自然语言/代码等输入、chat template、真实历史 KV，并保证 draft 所需本地缓存状态完整。合成状态下即使 proposed/accepted 大于 0，也只记受控实验；真实 PD 主组按本轮 counter 增量、逐 rank draft/verify 和实际接受的输出 token 计算，不将草稿提议量当吞吐。
-
-#### 8.4.2 两机候选拓扑、BS 扫描与六波负载
-
-下面的设备分母表对应独立纯 Decode 容量实验：不启动计时窗口内的 Prefill 或 PD Proxy，客户端直连原生 Decode/Attention API，KV 来源按第 8.4.1 节单独验收。真实 PD 的主要组合沿用第 4.2.1/8.3 节两机 P2+D4/P2+A4F2，客户端经 Proxy，并把 Prefill 计入资源分母。两类结果分开记录；两台主机保留相同镜像、模型和网络条件，同一时刻只运行一组。
-
-| 实验拓扑 | 机器 1 | 机器 2 | 归一化设备数 | 状态 |
-|---|---|---|---:|---|
-| D4 | 空闲 | 原生 DP4/TP1/EP4，设备 0–3 | 4 | 候选原生基线，先完成可运行性检查 |
-| A4F2 | FFN，设备 6–7 | Attention，设备 0–3 | 6 | 固定角色数；合成 KV 和性能 launcher 待适配验收 |
-| D8（可选） | 空闲 | 原生 DP8/TP1/EP8，设备 0–7 | 8 | 补充资源效率基线，需单独验证专家/显存及启动参数 |
-
-当前没有已验收的原生 6 卡对照，因此本设计比较单位设备效率，不将 D4 或 D8 与 A4F2 称为严格等卡数实验。另列预留整机数/设备数：原生一机、AFD 两机的部署成本可能不同，不能只列忙碌设备的效率。
-
-两个主要组合都运行以下输入长度矩阵。K 按 1024 token 计；这里的长度是服务端 tokenizer/template 处理后的实际输入长度，不是单独设置模型上限。
-
-| 实际输入长度 | 目标每 rank 原生/A BS | 输出预算 | 目的 |
-|---|---:|---:|---|
-| 8K（8192） | 24 | 先固定 1024 | 较短上下文参照 |
-| 16K（16384） | 24 | 先固定 1024 | 中等上下文吞吐 |
-| 32K（32768） | 24 | 先固定 1024 | 中长上下文吞吐 |
-| 64K（65536） | 先验证 8、16，再以 24 为目标 | 先固定 1024 | 长上下文容量边界与重点性能点 |
-
-链路稳定后，两种主要组合分别补 512–1536 token 均匀输出预算，与参考 recipe 方法衔接。每个输入长度/功能组合下，原生和 AFD 可独立扫描 per-rank BS `8、16、24、32` 找最佳合法点；BS4 仅用于必要的小规模预检。BS24 是主要目标，不是已经支持的保证。相同 BS 的各组保留一份对照，容量结论另比较各自最佳合法点；基线 BS24 不能运行时，如实记录其可运行容量和差异，不强行凑数。
-
-长上下文性能使用独立配置文件/RUN_ID，不能直接沿用第 6.1 节功能用例固定 `MAX_MODEL_LEN=4096` 的检查和启动流程。实际输入 65536、输出预算 1024 时，上限至少覆盖 66560 token；输出预算最大 1536 时至少覆盖 67072 token，实际模板 token 也计入输入。先确认模型/算子支持，再按新长度重新验证 target 与 draft 的 KV/工作区/Graph 内存、块表和设备容量，冻结新的性能配置，不把它写成本期 4096 功能配置已验证。`MAX_NUM_SEQS=24` 只是调度上限，主结果需证明实际每 A rank 接近 24 条活跃序列，且无抢占/重计算、OOM/timeout/残留，并满足本轮预设的延迟约束。
-
-```text
-D = 原生 Decode ranks；A = Attention ranks；F = FFN ranks
-B_D = 原生每 rank BS；B_A = Attention 每 rank BS；W = 6
-原生配置活跃容量 C_D = D × B_D
-AFD 配置活跃容量 C_A = A × B_A
-AFD FFN 每 rank 序列容量起点 B_F = A × B_A / F = 2 × B_A
-原生总请求数 N_D = C_D × W
-AFD 总请求数 N_A = C_A × W
-```
-
-| 拓扑 | 每 rank 原生/A BS | FFN 容量起点 | 配置活跃容量 | 六波请求数 |
-|---|---:|---:|---:|---:|
-| D4 | 8 / 16 / 24 / 32 | 不适用 | 32 / 64 / 96 / 128 | 192 / 384 / 576 / 768 |
-| A4F2 | 8 / 16 / 24 / 32 | 16 / 32 / 48 / 64 | 32 / 64 / 96 / 128 | 192 / 384 / 576 / 768 |
-| D8（可选） | 8 / 16 / 24 / 32 | 不适用 | 64 / 128 / 192 / 256 | 384 / 768 / 1152 / 1536 |
-
-以 A4F2/BS24 为例，96 是配置同时处理容量，576 是正式提交请求总量；请求持续补充，不要求六批串行完成，也不是同时运行 576 条。六波不包含独立 warmup。DSpark 开启后仍按序列容量计算请求数，不能再乘 speculative token 数。客户端应有足够在途请求覆盖这些容量，不能沿用第 8.3 节固定并发 32；以实际 running/waiting、吞吐曲线和 trace 判断是否压满。若六波仍不足以形成稳定窗口，所有配对组统一提高 W 并冻结后重跑，不只延长某一组。
-
-性能 launcher 的参数设计如下；每个 BS 点独立冷启动，保存 argv 和最终有效值：
-
-| 参数 | 原生 D4/D8 | A4F2 Attention | A4F2 FFN |
-|---|---|---|---|
-| AFD additional config | 无 `afd` 键 | 原 role/connector/rank 配置 | 原 role/connector/rank 配置 |
-| KV connector | 经前置检查验收的合成 Decode connector | 与原生同一 KV 来源/初始化方法 | 无 KV connector |
-| `--max-num-seqs` | `B_D` | `B_A` | 至少覆盖 `B_F`，按实际 worker buffer 契约核验 |
-| Decode token budget | 覆盖本组实际 target verify/draft 峰值 | 覆盖本组实际 target verify/draft 峰值 | 覆盖合并后的 target verify/draft 峰值及 padding；不能只按 `B_F` 算 |
-| `--max-model-len` | 覆盖实际输入+最大输出预算并完成该长度验收 | 与配对原生相同上限 | 与 Attention 配套 |
-| DSpark | N-G 关闭；N-GS 开启，draft eager | B2 关闭；B3 开启，draft eager | 启动开关始终为 0，执行 Attention 发来的配套 FFN 工作；不另起 drafter |
-| async scheduling / prefix cache | 关闭 / 关闭 | 关闭 / 关闭 | async scheduling 关闭 |
-| 主要模式 | 经验证的原生 target Decode Graph；记录原生微批能力 | target FULL_DECODE_ONLY/U2 | 与 Attention 配套的 Graph/U2 |
-| 辅助模式 | eager | eager/U1，或代表点 eager/U2 | 与 Attention 配套 |
-
-现有 V4 脚本中 Attention/FFN 都读取 `MAX_NUM_SEQS`，所以独立性能 launcher 或角色启动前缀应分别提供 `B_A/B_F`，不能全局设一个 BS 后假定 FFN 已按比例扩容。BS24 时 B_F=48 是无 draft 条件下的容量起点；DSpark 的一次 target verify/draft 可能包含每序列多个 token，需要根据 checkpoint 的 block size、实际 verify/draft 形状、U2 分段和 padding 重新核验 batch token budget、HCCL buffer 与 Graph capture key，不能把 48 当作所有阶段的 token 上限。
-
-Graph 的实际 capture key 可能对应 U2 stage 的形状，不能把“capture size=24”直接当成 BS24/DSpark 已覆盖。用在线请求证明四个 A rank 的 target replay、stage 0/1 和两个 F rank 的协议/计算完成；分别记录实际 replay/fallback 比例，区分 capture/warmup 与业务窗口。draft eager 是本期预期配置，不能据此认定整个 Graph 场景回退。性能窗口只保留必要统计，详细 trace 和同步诊断另轮采集。
-
-主要组合均覆盖上述输入长度和 BS24 目标，eager 辅助只选代表点。当前 rank 数固定 A4F2，不能用本轮结果声称已找到最优 A:F 比例；A/F 比例扫描需要另行支持并验收其他拓扑。
-
-#### 8.4.3 AISBench 负载与执行步骤
-
-在协议中冻结 AISBench 的提交/版本、生成器及原始请求文件 hash。配置字段以该版本实际源码为准；可参考 [AISBench 模型配置](https://github.com/AISBench/benchmark/blob/master/ais_bench/benchmark/configs/models/vllm_api/vllm_api_stream_chat.py) 与 [synthetic 配置](https://github.com/AISBench/benchmark/blob/master/ais_bench/datasets/synthetic/synthetic_config.py)。本节不要求临时安装或升级工具。
-
-主矩阵先使用冻结的真实输入母集，经 AISBench 或已验收的同类客户端发送，保留输入语义、长度、预算和每请求结果。第 8.3 节提供 PD 启动与采集方法，客户端并发按容量调整，不能继续固定 32。工具具体数据集配置以现场冻结版本支持的真实数据入口为准；未配置好该入口时，DSpark 主组保持 pending，不用下面的 synthetic 配置冒充。
-
-下面仅示范参考 recipe 的 **synthetic 辅助压力配置**：输入 16K、D4 或 A4F2 的 BS24，故 `REQUEST_COUNT=4×24×6=576`；每个 BS/拓扑都按表重算。输出预算从 512 到 1536 均匀采样，不是所有请求都固定 1536。固定输出 1024 与分布输出的结果分开记录；两者都不自动等于真实业务负载。
-
-`ais_bench/datasets/synthetic/synthetic_config.py` 候选配置：
-
-```python
-INPUT_LENGTH = 16384
-REQUEST_COUNT = 576
-synthetic_config = {
-    "Type": "string",
-    "RequestCount": REQUEST_COUNT,
-    "TrustRemoteCode": False,
-    "StringConfig": {
-        "Input": {
-            "Method": "uniform",
-            "Params": {"MinValue": INPUT_LENGTH, "MaxValue": INPUT_LENGTH},
-        },
-        "Output": {
-            "Method": "uniform",
-            "Params": {"MinValue": 512, "MaxValue": 1536},
-        },
-    },
-    # string 模式不使用本项；若切换 tokenid 模式，RequestSize 表示输入长度。
-    "TokenIdConfig": {"RequestSize": INPUT_LENGTH, "PrefixLen": 0},
-}
-```
-
-`ais_bench/benchmark/configs/models/vllm_api/vllm_api_stream_chat.py` 候选配置：
-
-```python
-from ais_bench.benchmark.models import VLLMCustomAPIChat
-
-REQUEST_COUNT = 576
-models = [dict(
-    attr="service",
-    type=VLLMCustomAPIChat,
-    abbr="dsv4-decode-capacity",
-    path="/填写本组实际模型路径",
-    model="dsv4-afd",
-    stream=True,
-    request_rate=0,
-    retry=0,
-    host_ip="192.0.2.11",  # 原生 Decode 或 Attention API，不是 PD Proxy。
-    host_port=8910,
-    max_out_len=1536,
-    batch_size=REQUEST_COUNT,
-    trust_remote_code=False,
-    generation_kwargs=dict(temperature=0, seed=1024, ignore_eos=True),
-)]
-```
-
-这里将参考配置的 retry 改为 0，避免重试掩盖失败和改变工作量；容量压力测试使用 `ignore_eos=True` 以尽量完成预设输出预算，接受率结论也限定在这个解码协议下，业务评估另保留自然 EOS 协议。先审查冻结 AISBench 版本是否将 synthetic 的每请求输出预算传入 API：`max_out_len=1536` 只是上限，不能证明每请求预算均匀分布。检查输出预算、原始请求和实际响应 token 数；若客户端只发送同一个上限，则先完成适配或标为固定输出实验。AISBench 的生成种子与模型解码 seed 分开冻结；每次重启客户端不保证数据相同，先保存同一输入/预算母集，各 BS 按 N 选固定前缀或确定性重复，禁止按运行组重新随机生成。
-
-所有请求长度按 V4 tokenizer 和实际 chat template 计算，生成配置里的长度不自动等于服务端有效 token 数。归档服务端 usage/trace 和请求正文，确认无工具自动截断，实际输入加输出预算不超过该点新冻结的上限。8K–64K 主矩阵需要重新完成对应长度的 MAX_MODEL_LEN、target/draft HBM/KV、算子和 Graph 验收，不能在本期 4096 功能配置直接执行。
-
-每个候选点按以下步骤执行：
-
-1. 先按 C1–C5 原顺序关闭功能门禁，再完成本轮输入长度、Graph/U2、DSpark、内存和实际 launcher 的前置检查；登记真实输入/KV、自然路由和工具版本。主要组合优先运行第 8.3 节真实 PD；纯 Decode 和合成实验分别通过其 KV/launcher 检查后再测，互不冒充。
-2. 停止其他组，按主要组合/拓扑/BS 独立冷启动，关闭诊断，确认全部 ranks ready。真实 PD 先 Prefill ready，再启动 FFN、紧接着 Attention，最后启动 Proxy；纯 Decode 不在窗口内运行 Prefill/Proxy，AFD 先 FFN、紧接着 Attention；原生均不启动 FFN。采集路径证据后以无诊断配置重启测量服务。N-G/B2 和 N-GS/B3 使用同一轮协议分别配对，draft eager 与 target Graph 分开核验。
-3. 单独 warmup 一波 `D×B_D` 或 `A×B_A` 请求，等待请求归零。再提交六波正式请求，至少重复三轮，每轮单独输出目录并等待所有 rank 归零；同一配对轮次使用同一母集和预算分布。
-4. 在冻结 AISBench checkout 中执行下面命令；每轮记录工具打印的实际输出目录并完整归档，不覆盖历史结果。所有服务节点按第 8.3.3 节采样 HBM，保存实际活跃数、preemption/recompute、Graph replay/fallback 和通信/计算 trace（诊断 trace 另轮采集）。
-5. 核对实际完成数等于 N、失败和重试数为 0、实际输出预算/长度分布正确；确认六波覆盖稳定区间。Graph 主组检查在线 replay 和 U2 两个 stage；DSpark 主组另检查逐 rank proposed/accepted 增量、真实 draft/verify 和本轮接受率。OOM、hang、NaN/Inf、错误输出、未初始化缓存或无法正常清理的样本均无效；纯 Decode 窗口混入 Prefill 时重新分类，真实 PD 的正常 Prefill 不作为错误。
-6. 两个主要组合分别保留 BS24 目标点和每个输入长度的最佳合法 BS，用新 RUN_ID/结果目录独立复测三轮，保留扫描全部原始点及选择依据，避免仅凭一次最快值下结论。真实 PD 与纯 Decode 各自成表；DSpark 业务收益使用真实输入/KV 的主要结果，eager 只作代表点归因。
+停止新请求，确认最后一个 `*.drain.json` 中 Proxy 请求数和所有 D/A running/waiting 为 0，再执行：
 
 ```bash
-# 本命令只运行上面的 synthetic 辅助配置；真实输入主测选择已验收的真实数据集配置。
-ais_bench --models vllm_api_stream_chat --datasets synthetic_gen --mode perf
+kill -TERM "$(cat "$RUN_ROOT/proxy.pid")"
+if [[ "$USE_AFD" == 1 ]]; then
+  kill -TERM "$(cat "$RUN_ROOT/attention.pid")"
+  # 暂停：人工确认两个不同 F rank 都收到 shutdown，再执行下一个代码块。
+  grep 'AFD NPU FFN received Attention shutdown payload' "$RUN_ROOT/ffn.log"
+else
+  kill -TERM "$(cat "$RUN_ROOT/decode.pid")"
+fi
 ```
 
-#### 8.4.4 结果指标与可声明的结论
+AFD 的两个 F rank 都收到 shutdown 后执行；原生直接执行：
 
-```text
-Q = 测量窗口中实际完成的输出 token 总数 / 对应墙钟时间
-E_D4 = Q_D4 / 4；E_AF = Q_A4F2 / (4 + 2)；E_D8 = Q_D8 / 8
-AFD 单位 NPU 收益 = (E_AF / E_native - 1) × 100%
-总输出吞吐收益 = (Q_A4F2 / Q_native - 1) × 100%
+```bash
+if [[ "$USE_AFD" == 1 ]]; then
+  kill -TERM "$(cat "$RUN_ROOT/ffn.pid")"
+fi
+kill -TERM "$(cat "$RUN_ROOT/prefill.pid")"
+if [[ -f "$RUN_ROOT/npu-sampler.pid" ]]; then
+  kill -TERM "$(cat "$RUN_ROOT/npu-sampler.pid")"
+fi
+npu-smi info > "$RUN_ROOT/npu-after-stop.txt"
+ss -ltnp > "$RUN_ROOT/ports-after-stop.txt"
 ```
 
-Q 首先采用冻结工具明确界定的完整测量轮次吞吐，包含该轮排队/收尾，排除独立 warmup。若额外报告稳定区间吞吐，所有组使用同一预先冻结的窗口选择规则，确保输出 token 与时间来自同一窗口，另列完整轮次数据。不得用平均 TPOT 的倒数替代聚合吞吐，也不统计合成输入 token。
+**完成条件：** 本轮主/子进程退出、端口释放、NPU 清理完成，无 Segfault 或设备错误；AFD 按第 7 节完整核对正常 shutdown。停服失败先保存材料并修复，强制清理不记作通过，不继续下一组。
 
-DSpark 的输出 token 只计算实际接受并最终返回的生成 token，不包含被拒绝的 draft、重复 target verify 或内部 padding。成对记录 proposed/accepted 的实际定义和增量、接受率、target verify/draft token budget、target replay/fallback 比例及 U2 生效证据。主结果按 Graph/U2、Graph/U2+DSpark 分表；跨 DSpark 开关的差值解释为该负载下投机解码收益，不能只凭更高 acceptance rate 断言吞吐更好。
+### 8.9 性能步骤 8：按顺序换组，再扩展长度和 BS
 
-Decode-only 的分母包含所有 A+F 计算设备，不包含未启动的 Prefill，也不只除 Attention 卡数。若改成真实 PD 链路，必须回到第 8.3 节端到端口径，另计 Prefill 和整机成本。NPU 设备到物理 die 的映射未核实前，图表用 `output tokens/s/NPU`，不直接写 `tokens/s/die`。
+每行都按 `native_graph → afd_graph → native_dspark → afd_dspark` 执行，第 8.4–8.8 节组成一组的完整操作。清理完成后才换下一组。
 
-汇总表列：`主组合/测量入口/input_length/output_budget_distribution/输入集hash/KV来源与初始化/路由模式/target模式与U/draft模式/拓扑/D或A/F/P/物理NPU数/物理die数及映射/预留主机数/BS_D或BS_A/FFN容量/target_verify及draft预算/实际每rank活跃数/W/N/成功与失败/实际返回输出tokens/全轮Q/稳定区间Q(可选)/单位NPU吞吐/TTFT和TPOT分位数/HBM/preemption/proposed与accepted增量/接受率/target_replay与fallback比例/相对配对基线收益/结果目录`。分别画两个主组合在 8K/16K/32K/64K 的总吞吐、单位 NPU 吞吐和 BS 扫描曲线，突出 BS24 目标点；V3.2 的结果只作为方法来源，不作为 V4 的收益目标。
+| 阶段 | 输入 / 每卡 BS | 操作及通过条件 |
+|---|---|---|
+| 首次跑通 | 16K / BS8 | 四组各用 `check`；请求、路径、正常停服通过 |
+| 首次正式比较 | 16K / BS24 | 先做 BS24 的 `check` 和 capture/budget/HBM 验收，再用 `measure` 冷启动，四组各三轮 |
+| 扩展长输入 | 32K、64K / BS8→16→24 | 每个新长度/BS 先 `check`；合法点进入 `measure`，仍配对三轮 |
+| 可选容量调优 | 各长度 / BS8、16、24、32 | 冻结双方各自最佳合法 BS，再各复测三轮，与同 BS 结果分表 |
 
-单位 NPU 吞吐提高但总吞吐下降、或资源增加后总吞吐提高但每卡效率下降，都如实展示。独立调优 BS 的结果是“各自配置下的容量/效率对比”；功能开关不匹配则标组合收益。合成 KV、强制均衡（若后续实现）和真实 PD 的数据各自成表，均不得替代正常输出/精度验收。
+32K/64K 先回第 8.3 节分别准备输入及 hash。输入上限加 1024 输出对应 `MAX_MODEL_LEN` 至少为：16K **17408**、32K **33792**、64K **66560**。每个长度重新验证 KV/HBM、Graph、DSpark；BS24 是目标，不保证都能容纳。
+
+某点 OOM/不支持时，记录实际支持的 BS，同 BS 收益记缺项；另表比较各自最佳合法配置。排队成功不证明达到目标活跃 BS。原生 Graph/DSpark 不可用时该配对保持 pending，不用 eager 补位。
+
+### 8.10 性能步骤 9：计算收益，交付两张表
+
+只取正式三轮，不混入 check/warmup 或其他长度。保留原始值，报告中位数和最小/最大值。Q 使用 `output_throughput`（实际返回输出 tokens/s），不使用 input+output 吞吐、平均 TPOT 倒数或单次峰值。
+
+| 比较 | 计算方式 |
+|---|---|
+| 总输出吞吐收益 | `(Q_AFD / Q_native - 1) × 100%` |
+| 实际用卡效率 | 原生 `Q_native/6`；AFD `Q_AFD/8`，均包含 P2 |
+| 实际用卡效率收益 | `((Q_AFD/8) / (Q_native/6) - 1) × 100%` |
+| 同整机成本 | 两组都预留 1 台 8 卡 A5，同时报告各自 `Q/8` |
+| 延迟与资源 | TTFT/TPOT 均值和 P95/P99、各角色 HBM；DSpark 加接受率 |
+
+不开 DSpark 一张表，开启 DSpark 一张表：
+
+| 输入/输出 | D/A BS | F 容量 | 原生 Q | AFD Q | 总吞吐收益 | 每卡效率收益 | TPOT P95（原生/AFD） | TTFT P95（原生/AFD） | HBM/接受率/目录 |
+|---|---:|---:|---:|---:|---:|---:|---|---|---|
+| 16K/1024 | 24 | 48 起，填实际预算 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
+
+附成功/失败数、实际输入/输出 tokens、请求数、输入及模型/runtime hash、卡位、target/draft 模式、原生微批差异和停服结果。最终归档同时收齐 `$PERF_BASE/inputs`、输入 hash、各轮实际 argv 和角色配置，不只收结果 JSON。原生实际 6 卡、AFD 实际 8 卡，每卡归一化不等于严格等卡数对照；结论限定为本机这两种部署配置。另解释 DSpark 开关的收益时先核对 target 权重 hashes 一致。
+
+**完成条件：** 两对都有三轮结果、质量/路径/清理证据，并说明瓶颈。负收益也如实报告，不新增最低收益比例门槛；按第 9 节归档。
+
+### 8.11 主流程完成后，再选择补测
+
+| 补测 | 何时做 / 口径 |
+|---|---|
+| 两机跨机 AFD | 单机主结果完成后，按第 4.2.1 节重跑配对，说明网络及 P/F 共机条件 |
+| eager 归因 | 选代表点解释 Graph/U2、DSpark 贡献，不扩成首轮必测矩阵 |
+| 8K、输出 512–1536、自然 EOS、固定 RPS | 另冻结数据/预算/延迟目标，与固定 1024、饱和吞吐分表 |
+| 纯 Decode / 合成 KV / 可选 D8 | 先验收独立 launcher、KV 初始化、V4 多 KV group 和正确性；不纳入单机 PD 主流程。D8 加 P2 超过 8 卡，不能同时放入本布局 |
+
+参考 [V3.2 CAMP2p recipe](../../recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) 的 BS 扫描、F 容量和六波供给；V4 主测用真实输入、真实 Prefill/KV 和自然专家路由。参考中的强制均衡、逻辑专家规模模拟和合成 KV 不用于 DSpark 业务接受率结论。
+
+当前 `tools/benchmarks/decode_bench.py` 的 `start_load_kv()` 不调用其 KV 填充流程，设置 fill mean/std 不证明缓存已初始化。独立纯 Decode 验收后再测，其分母包含所有 D 或 A+F 设备；本节经过 Proxy 的结果始终包含 P 成本。NPU/die 映射未核实时，单位写 `tokens/s/NPU`。
 
 ## 9. 【A5 手工执行】失败回传与最终交付表
 
@@ -1825,7 +1724,7 @@ sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
 
 回传三个角色/Proxy 日志、环境清单 `runtime.json`、site/node env 与 SHA256、完整终端输出、请求 JSON/SSE、before/after metrics、路径证据定位、停服过程及清理结果。
 三机使用统一 run ID，但本机目录和配置分别记录。缺机器/权重/离线数据/资源文件时标记 `blocked` 并写明缺项，不用同机或 A3 结果代替 A5 跨机验收。
-两机补充验证及第 8.3/8.4 节性能对照另存结果包，明确主机数、角色分布、原生基线状态、KV 来源及资源差异；不自动关闭下表三机验收项。第 8.4 节合成 KV 或性能 launcher 尚未验收时记录 pending，不能用端到端数据冒充 Decode-only 容量结果。
+第 8.2–8.10 节性能对照及第 8.11 节补测分别归档，明确主机数、角色分布、原生基线状态、KV 来源及资源差异；不自动关闭下表三机验收项。纯 Decode 流程未验收时记录 pending，不能用端到端数据冒充 Decode-only 结果。
 
 | 验收项 | 需要的结果 |
 |---|---|
