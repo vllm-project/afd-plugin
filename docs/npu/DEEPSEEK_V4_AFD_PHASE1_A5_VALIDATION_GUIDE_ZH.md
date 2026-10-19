@@ -1,6 +1,6 @@
 # DeepSeek-V4 AFD A5 1030 合并验证指导书
 
-更新日期：2026-10-19（性能部分按现场先后顺序重写为九步，统一单机真实输入发压入口；不更新已有实机验证结论）。本文合并旧 A5 dSpark/PD 指导与[1030 执行计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)，是本期现场操作入口。
+更新日期：2026-10-19（性能部分按现场先后顺序组织为九步，统一使用 Synthetic 合成数据发压；不更新已有实机验证结论）。本文合并旧 A5 dSpark/PD 指导与[1030 执行计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)，是本期现场操作入口。
 执行计划规定交付范围和日期，本文规定现场命令、验证顺序、证据与失败处理。
 本文是待执行指导，不代表组合已经通过 A5 验收。
 
@@ -9,6 +9,8 @@
 ## 0. 只做性能验证时，从哪里开始
 
 按第 8.2–8.10 节顺序执行：**准备环境 → 准备输入 → 选择一组配置 → 启动 → 检查 → 预热和测量 → 停服 → 换组/扩展长度 → 计算收益**。
+
+**性能数据集统一使用 Synthetic，不使用 GSM8K。** 固定 seed 生成合成输入，首轮输入 16K、输出 1024，四组复用同一文件。GSM8K 仅用于第 8.1 节的独立精度验收。
 
 先在**同一台 8 卡 A5** 上依次运行四组：
 
@@ -39,7 +41,7 @@
 | 最终精度 | 同机和跨机 C5 各做一次冻结口径的 GSM8K；不逐 token exact |
 | 性能 | 两个 C5 记录吞吐、TTFT、TPOT、峰值 HBM、acceptance rate；不设置收益比例门槛 |
 
-性能验证统一按第 8.2–8.10 节的单机真实 PD 流程执行，分别比较 Graph、Graph+DSpark 两对原生/AFD 配置。C1–C5 都启用 AFD，彼此比较只能解释组合差异，AFD 部署收益必须与原生 Decode 配对测量。
+性能验证统一按第 8.2–8.10 节使用 Synthetic 数据，经过单机真实 Prefill/KV 和 PD 流程，分别比较 Graph、Graph+DSpark 两对原生/AFD 配置。C1–C5 都启用 AFD，彼此比较只能解释组合差异，AFD 部署收益必须与原生 Decode 配对测量。
 
 旧指导的权重可信性、精确版本审计、并发 1/8/32、取消恢复、资源清理和失败采集继续保留。
 旧 `3da28f9`、A4F4/all-on 和两机 P8/A4F4 证据作为历史参考，不能代替本期验收。
@@ -1256,9 +1258,11 @@ timeout、OOM、业务期 HCCL/NPU 首错、错误输出或无法清理均阻断
 所有适用 gate 为 true 才能 `status=passed`。C1/C5 的两轮都 passed 后才关闭点位。
 同机 C1–C5 全部关闭后，三机按同样流程从 C1 重新执行；不能跳到三机 C5。
 
-## 8. 【A5 手工执行】第 6 步：GSM8K、端到端性能与 Decode 容量对照
+## 8. 【A5 手工执行】第 6 步：精度验收与 Synthetic 性能对照
 
 ### 8.1 M1 冻结精度协议，M5 执行
+
+**本节 GSM8K 只用于精度验收。只做性能测试时，从第 8.2 节开始，使用 Synthetic；性能发压不读取本节数据。**
 
 保存 `gsm8k_protocol.json`：数据集/task 配置及 hash、实际题目数/题目顺序、prompt/fewshot、seed、temperature/top_p/max_tokens/stop、模型 hashes、lm-eval 版本/提交、评分键及最低分。
 同机与跨机使用同一协议；最低分不能测试后修改，未冻结分数不能宣布精度通过。
@@ -1298,7 +1302,7 @@ export HF_DATASETS_OFFLINE=1
 先完成三件事：
 
 1. 按第 3 节准备并核对实际 `site.env`、`node.env`、软件提交、镜像、模型和 HIXL 资源。后续使用这套已冻结环境，不临时升级工具。
-2. 按第 5–7、8.1 节完成相关功能、输出质量、精度和正常停服验收。原文记录的 C3 输出/默认全开、C4 指标/停服、C5 待验证问题仍须关闭；原生 Graph/DSpark 命令也须通过下面的预检。未通过时只排查，不填正式收益。
+2. 按第 5–7 节完成相关功能、输出质量和正常停服验收。原文记录的 C3 输出/默认全开、C4 指标/停服、C5 待验证问题仍须关闭；原生 Graph/DSpark 命令也须通过下面的预检。未通过时只排查，不填正式收益。第 8.1 节的 GSM8K 单独安排，不作为性能数据准备步骤；完整交付仍须完成精度验收。
 3. 清空本机旧服务，确认 8 卡可用。固定 P2 用卡 0、1；原生 D4 或 A4 用卡 2–5；只有 AFD 组启动 F2，用卡 6、7。Proxy 不额外占 NPU。
 
 在协调终端先加载第 3.1 节的环境，然后固定单机拓扑：
@@ -1332,17 +1336,13 @@ mkdir -p "$PERF_BASE/inputs"
 
 **完成条件：** 版本/资源审计通过，旧服务已清理；本机 HIXL 至少覆盖 P 的 0、1 和 D/A 的 2–5。确认 CLI 支持后续 `custom`、`--disable-shuffle`、`--skip-chat-template`、`--custom-output-len`、`--save-detailed` 等参数。原生启动参数是待实机验收的候选配置。
 
-### 8.3 性能步骤 2：先准备同一份真实输入
+### 8.3 性能步骤 2：生成并冻结同一份 Synthetic 数据
 
-**在启动模型服务之前准备。** 第一阶段只准备 16K 输入、固定 1024 输出；32K/64K 在首轮比较完成后再准备。四组都读取同一份文件。
+**在启动模型服务之前执行一次。** 使用冻结 vLLM 的 `RandomDataset` 生成 Synthetic 合成文本，不下载 GSM8K，也不收集业务文本。第一阶段固定 16K 输入、1024 输出；32K/64K 在首轮比较完成后再生成。四组都读取同一份合成文件。
 
-从真实文本/代码请求中选取至少 768 条，保存到 `$PERF_BASE/inputs/raw-16384.jsonl`。每行格式如下，`prompt` 是原始用户文本；保留完整任务语义，不重复同一句话凑长度：
+固定生成 **768 条**，覆盖可选 BS32 的最大单轮请求数；seed 为 **1024**，公共前缀长度 **0**，输入/输出长度浮动比例 **0**。使用冻结的 Flash tokenizer，并核对 DSpark checkpoint 的 tokenizer 文件 hash 相同。不套 chat template，避免模板改变输入长度。
 
-```json
-{"prompt":"这里放一条完整的真实长文本或代码请求"}
-```
-
-下面把 chat template 固定到文件中并校验长度。使用冻结的 Flash tokenizer，并核对 DSpark checkpoint 的 tokenizer 文件 hash 相同。示例接受 `[ISL-128, ISL]` token 的输入；将这个范围写入协议，文件名中的 16K 不代替实际 token 数。
+下面生成文件，同时重新分词检查实际输入长度：
 
 ```bash
 export ISL=16384 OSL=1024
@@ -1351,35 +1351,53 @@ import json
 import sys
 from pathlib import Path
 
-from vllm.benchmarks.datasets.datasets import CustomDataset
+from vllm.benchmarks.datasets.datasets import RandomDataset
 from vllm.tokenizers import get_tokenizer
+
+SYNTHETIC_REQUEST_COUNT = 768
+SYNTHETIC_SEED = 1024
+SYNTHETIC_PREFIX_LEN = 0
+SYNTHETIC_RANGE_RATIO = 0.0
 
 model, directory, input_length, output_length = sys.argv[1:]
 input_length, output_length = int(input_length), int(output_length)
 root = Path(directory)
+
 tokenizer = get_tokenizer(model, tokenizer_mode="deepseek_v4")
-dataset = CustomDataset(dataset_path=str(root / f"raw-{input_length}.jsonl"),
-                        random_seed=1024, disable_shuffle=True)
-requests = dataset.sample(tokenizer=tokenizer, num_requests=768, no_oversample=True,
-                          output_len=output_length,
-                          chat_template_kwargs={"thinking": False, "enable_thinking": False})
-assert len(requests) == 768, "Prepare at least 768 real inputs."
-assert all(input_length - 128 <= request.prompt_len <= input_length
-           for request in requests), "Select inputs in the agreed token-length range."
-target = root / f"requests-{input_length}.jsonl"
+requests = RandomDataset(random_seed=SYNTHETIC_SEED).sample(
+    tokenizer=tokenizer, num_requests=SYNTHETIC_REQUEST_COUNT,
+    prefix_len=SYNTHETIC_PREFIX_LEN, range_ratio=SYNTHETIC_RANGE_RATIO,
+    input_len=input_length, output_len=output_length,
+)
+actual_lengths = [len(tokenizer(request.prompt).input_ids) for request in requests]
+assert len(requests) == SYNTHETIC_REQUEST_COUNT
+assert all(length == input_length for length in actual_lengths), (
+    "Synthetic token length mismatch", min(actual_lengths), max(actual_lengths)
+)
+assert all(request.expected_output_len == output_length for request in requests)
+
+target = root / f"synthetic-i{input_length}-o{output_length}.jsonl"
 with target.open("x", encoding="utf-8") as file:
-    for request in requests:
+    for request, actual_length in zip(requests, actual_lengths):
         file.write(json.dumps({"prompt": request.prompt, "output_tokens": output_length,
-                               "input_tokens": request.prompt_len}, ensure_ascii=False) + "\n")
-print(target, min(request.prompt_len for request in requests),
-      max(request.prompt_len for request in requests))
+                               "input_tokens": actual_length}, ensure_ascii=False) + "\n")
+protocol = {"dataset": "Synthetic", "generator": "vllm.RandomDataset",
+            "seed": SYNTHETIC_SEED, "request_count": SYNTHETIC_REQUEST_COUNT,
+            "input_tokens": input_length, "output_tokens": output_length,
+            "prefix_len": SYNTHETIC_PREFIX_LEN, "range_ratio": SYNTHETIC_RANGE_RATIO,
+            "chat_template": False}
+with target.with_suffix(".protocol.json").open("x", encoding="utf-8") as file:
+    json.dump(protocol, file, indent=2)
+print(target, min(actual_lengths), max(actual_lengths))
 PY
-sha256sum "$PERF_BASE/inputs/requests-$ISL.jsonl" > "$PERF_BASE/inputs/requests-$ISL.sha256"
+sha256sum "$PERF_BASE/inputs/synthetic-i$ISL-o$OSL.jsonl" \
+  "$PERF_BASE/inputs/synthetic-i$ISL-o$OSL.protocol.json" \
+  > "$PERF_BASE/inputs/synthetic-i$ISL-o$OSL.sha256"
 ```
 
-**完成条件：** 得到 768 条长度合格的 `requests-16384.jsonl` 及 hash。第 8.6 节还要核对服务端实际 token 数，模板特殊 token 处理不一致时先修正并重新冻结。各组使用同一文件、同一顺序；后面的 `--skip-chat-template` 避免重复套模板。
+**完成条件：** 得到 `synthetic-i16384-o1024.jsonl`、生成协议及 hash，768 条输入重新分词后均为 16384 tokens。已有文件时不覆盖、不重新生成，核对 hash 后复用。长度断言失败时先核对冻结版本和 tokenizer；不放宽长度后仍标成固定 16K。第 8.6 节还要核对服务端实际 token 数。
 
-本入口依据固定 [vLLM 提交的 CustomDataset](https://github.com/vllm-project/vllm/blob/0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665/vllm/benchmarks/datasets/datasets.py)，现场核对实际安装位置及 CLI 帮助。数据文件未准备好时，停在这一步。
+本入口依据固定 [vLLM 提交的 RandomDataset / CustomDataset](https://github.com/vllm-project/vllm/blob/0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665/vllm/benchmarks/datasets/datasets.py)。后面命令中的 `--dataset-name custom` **只是读取已冻结的 Synthetic JSONL 文件**；数据来源仍是 Synthetic。`--disable-shuffle` 固定顺序，`--skip-chat-template` 保持合成输入长度。生成不计入服务性能计时。
 
 ### 8.4 性能步骤 3：选择本轮配置，创建新目录
 
@@ -1406,7 +1424,8 @@ export MAX_NUM_SEQS="$DECODE_BS"
 export FFN_SEQ_CAPACITY=$((2 * DECODE_BS))
 export CAPACITY=$((4 * DECODE_BS))
 export REQUEST_COUNT=$((6 * CAPACITY))
-export DATASET_FILE="$PERF_BASE/inputs/requests-$ISL.jsonl"
+export DATASET_FILE="$PERF_BASE/inputs/synthetic-i$ISL-o$OSL.jsonl"
+export DATASET_PROTOCOL="$PERF_BASE/inputs/synthetic-i$ISL-o$OSL.protocol.json"
 export ENABLE_PD=1 ENABLE_MTP=0 ENABLE_DSPARK=0 USE_AFD=0
 export MODEL_PATH="$FLASH_MODEL_PATH" EXECUTION_MODE=full-decode-only U_BATCHES=1
 case "$PERF_CASE" in
@@ -1430,8 +1449,10 @@ export RUN_ROOT="$RUN_BASE/$RUN_ID/$(hostname -s)"
 mkdir -p "$RUN_BASE/$RUN_ID"
 mkdir "$RUN_ROOT"
 test -f "$DATASET_FILE"
+test -f "$DATASET_PROTOCOL"
 cp "$SITE_FILE" "$RUN_ROOT/site.env"
 cp "$NODE_FILE" "$RUN_ROOT/node.env"
+cp "$DATASET_PROTOCOL" "$RUN_ROOT/synthetic-protocol.json"
 sha256sum "$DATASET_FILE" > "$RUN_ROOT/input.sha256"
 ```
 
@@ -1522,7 +1543,7 @@ PY
 
 ### 8.6 性能步骤 5：先检查请求和真实运行路径
 
-先在当前终端定义下面的函数，预检、预热和正式轮次共用它。读取第 8.3 节的真实输入，固定输出预算；`ignore-eos/min_tokens` 用于固定长度压力协议。自然 EOS 的业务评估单独记录。
+先在当前终端定义下面的函数，预检、预热和正式轮次共用它。读取第 8.3 节冻结的 Synthetic 输入，固定输出预算；`ignore-eos/min_tokens` 用于固定长度压力协议。输出由模型实际生成，不预填输出 token，也不替换专家路由。
 
 ```bash
 run_perf_batch() {
@@ -1541,7 +1562,7 @@ run_perf_batch() {
     2>&1 | tee "$RUN_ROOT/$name.console.log"
   curl --noproxy '*' -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/$name.metrics-after.txt"
   "$PYTHON_BIN" - "$RUN_ROOT/$name.json" "$count" "$OSL" \
-    "$BASE_URL" "$ATTENTION_URL" "$RUN_ROOT/$name.drain.json" <<'PY'
+    "$BASE_URL" "$ATTENTION_URL" "$RUN_ROOT/$name.drain.json" "$ISL" <<'PY'
 import json
 import re
 import sys
@@ -1552,6 +1573,7 @@ import httpx
 
 result = json.loads(Path(sys.argv[1]).read_text())
 assert result["completed"] == int(sys.argv[2]) and result["failed"] == 0, result
+assert result["total_input_tokens"] == int(sys.argv[2]) * int(sys.argv[7]), result
 assert result["total_output_tokens"] == int(sys.argv[2]) * int(sys.argv[3]), result
 deadline = time.monotonic() + 60
 with httpx.Client(trust_env=False, timeout=10) as client:
@@ -1578,7 +1600,7 @@ PY
 }
 ```
 
-本例检查 `completed/failed/total_output_tokens`；字段不符时先核对冻结版本，不删除成功数/输出量检查。CLI 可对照固定 [vLLM benchmark 源码](https://github.com/vllm-project/vllm/blob/0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665/vllm/benchmarks/serve.py)。无可信 token usage 时先核对统计路径，draft/rejected/verify/padding token 不计作输出。
+本例检查 `completed/failed/total_input_tokens/total_output_tokens`；字段不符时先核对冻结版本，不删除成功数/输入输出量检查。CLI 可对照固定 [vLLM benchmark 源码](https://github.com/vllm-project/vllm/blob/0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665/vllm/benchmarks/serve.py)。无可信 token usage 时先核对统计路径，draft/rejected/verify/padding token 不计作输出。
 
 **只有 `PHASE=check` 时执行预检：**
 
@@ -1594,7 +1616,7 @@ fi
 
 保存这些证据：真实 KV 收到且输出正常；四个 D/A rank 的实际输入长度、活跃数和 HBM/KV；target 在线 Graph replay；AFD 的 U2 stage 0/1 和两个 F rank 完成；DSpark 的真实 draft/verify、proposed/accepted 增量及 draft eager。原生 DSpark 兼容性以本轮证据为准。
 
-**完成条件：** smoke 和真实长输入通过，无退化、OOM、hang、NaN/Inf，路径符合本组配置。smoke 不代替第 1–7、8.1 节完整验收。检查轮直接到第 8.8 节停服；四组 BS8 都通过后才开始正式轮次。
+**完成条件：** smoke 和 Synthetic 长输入通过，无异常 token 退化、OOM、hang、NaN/Inf，路径符合本组配置。Synthetic 输出不做 GSM8K 答案评分；smoke 不代替第 1–7、8.1 节完整验收。检查轮直接到第 8.8 节停服；四组 BS8 都通过后才开始正式轮次。
 
 ### 8.7 性能步骤 6：关闭诊断，预热后测三轮
 
@@ -1626,7 +1648,7 @@ fi
 
 “六波”表示 `正式请求数=4×BS×6`：BS24 共提交 576 条，客户端最多在途 96 条，完成后补充；不表示 576 条同时运行，也不保证每卡实际活跃数达到 24。检查 running/waiting、Prefill 供给和吞吐曲线；P2 或客户端饱和时如实记录瓶颈。窗口不稳定时，配对组统一增大请求数并重新冻结。
 
-**完成条件：** 三个 `measure-*.json` 均完成 N 条、失败 0、输出量符合预算。DSpark 接受率按本轮有效 proposed/accepted 增量计算，注明分子分母/时间窗；指标异常保存缺项，不填 0。通过 Proxy 发压时单独采集 D/A `/metrics`，不假定 Proxy 暴露其指标。
+**完成条件：** 三个 `measure-*.json` 均完成 N 条、失败 0、输入/输出量符合预算。DSpark 接受率按本轮有效 proposed/accepted 增量计算，注明分子分母/时间窗和 Synthetic 负载；指标异常保存缺项，不填 0。通过 Proxy 发压时单独采集 D/A `/metrics`，不假定 Proxy 暴露其指标。
 
 ### 8.8 性能步骤 7：请求归零后正常停服
 
@@ -1670,7 +1692,7 @@ ss -ltnp > "$RUN_ROOT/ports-after-stop.txt"
 | 扩展长输入 | 32K、64K / BS8→16→24 | 每个新长度/BS 先 `check`；合法点进入 `measure`，仍配对三轮 |
 | 可选容量调优 | 各长度 / BS8、16、24、32 | 冻结双方各自最佳合法 BS，再各复测三轮，与同 BS 结果分表 |
 
-32K/64K 先回第 8.3 节分别准备输入及 hash。输入上限加 1024 输出对应 `MAX_MODEL_LEN` 至少为：16K **17408**、32K **33792**、64K **66560**。每个长度重新验证 KV/HBM、Graph、DSpark；BS24 是目标，不保证都能容纳。
+32K/64K 先回第 8.3 节，把 `ISL` 分别设为 `32768`、`65536`，生成各自的 Synthetic 文件、协议及 hash。输入上限加 1024 输出对应 `MAX_MODEL_LEN` 至少为：16K **17408**、32K **33792**、64K **66560**。每个长度重新验证 KV/HBM、Graph、DSpark；BS24 是目标，不保证都能容纳。
 
 某点 OOM/不支持时，记录实际支持的 BS，同 BS 收益记缺项；另表比较各自最佳合法配置。排队成功不证明达到目标活跃 BS。原生 Graph/DSpark 不可用时该配对保持 pending，不用 eager 补位。
 
@@ -1686,13 +1708,13 @@ ss -ltnp > "$RUN_ROOT/ports-after-stop.txt"
 | 同整机成本 | 两组都预留 1 台 8 卡 A5，同时报告各自 `Q/8` |
 | 延迟与资源 | TTFT/TPOT 均值和 P95/P99、各角色 HBM；DSpark 加接受率 |
 
-不开 DSpark 一张表，开启 DSpark 一张表：
+两张表都标注“**Synthetic，seed=1024，固定输入/输出长度**”。不开 DSpark 一张表，开启 DSpark 一张表：
 
 | 输入/输出 | D/A BS | F 容量 | 原生 Q | AFD Q | 总吞吐收益 | 每卡效率收益 | TPOT P95（原生/AFD） | TTFT P95（原生/AFD） | HBM/接受率/目录 |
 |---|---:|---:|---:|---:|---:|---:|---|---|---|
 | 16K/1024 | 24 | 48 起，填实际预算 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
 
-附成功/失败数、实际输入/输出 tokens、请求数、输入及模型/runtime hash、卡位、target/draft 模式、原生微批差异和停服结果。最终归档同时收齐 `$PERF_BASE/inputs`、输入 hash、各轮实际 argv 和角色配置，不只收结果 JSON。原生实际 6 卡、AFD 实际 8 卡，每卡归一化不等于严格等卡数对照；结论限定为本机这两种部署配置。另解释 DSpark 开关的收益时先核对 target 权重 hashes 一致。
+附成功/失败数、实际输入/输出 tokens、请求数、输入及模型/runtime hash、卡位、target/draft 模式、原生微批差异和停服结果。最终归档同时收齐 `$PERF_BASE/inputs`、Synthetic 生成协议及输入 hash、各轮实际 argv 和角色配置，不只收结果 JSON。原生实际 6 卡、AFD 实际 8 卡，每卡归一化不等于严格等卡数对照；结论限定为本机这两种部署配置在 Synthetic 负载下的性能，DSpark 接受率不外推为业务数据接受率。另解释 DSpark 开关的收益时先核对 target 权重 hashes 一致。
 
 **完成条件：** 两对都有三轮结果、质量/路径/清理证据，并说明瓶颈。负收益也如实报告，不新增最低收益比例门槛；按第 9 节归档。
 
@@ -1705,7 +1727,7 @@ ss -ltnp > "$RUN_ROOT/ports-after-stop.txt"
 | 8K、输出 512–1536、自然 EOS、固定 RPS | 另冻结数据/预算/延迟目标，与固定 1024、饱和吞吐分表 |
 | 纯 Decode / 合成 KV / 可选 D8 | 先验收独立 launcher、KV 初始化、V4 多 KV group 和正确性；不纳入单机 PD 主流程。D8 加 P2 超过 8 卡，不能同时放入本布局 |
 
-参考 [V3.2 CAMP2p recipe](../../recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) 的 BS 扫描、F 容量和六波供给；V4 主测用真实输入、真实 Prefill/KV 和自然专家路由。参考中的强制均衡、逻辑专家规模模拟和合成 KV 不用于 DSpark 业务接受率结论。
+参考 [V3.2 CAMP2p recipe](../../recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) 的 Synthetic 数据设计、BS 扫描、F 容量和六波供给；V4 主测固定输出 1024，使用 Synthetic 输入、真实 Prefill/KV 和自然专家路由。Synthetic 输入不等于合成 KV；参考中的强制均衡、逻辑专家规模模拟和合成 KV 不加入本节主测。
 
 当前 `tools/benchmarks/decode_bench.py` 的 `start_load_kv()` 不调用其 KV 填充流程，设置 fill mean/std 不证明缓存已初始化。独立纯 Decode 验收后再测，其分母包含所有 D 或 A+F 设备；本节经过 Proxy 的结果始终包含 P 成本。NPU/die 映射未核实时，单位写 `tokens/s/NPU`。
 
