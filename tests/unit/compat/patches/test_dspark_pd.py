@@ -10,8 +10,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 
-@pytest.fixture
-def runtime(monkeypatch):
+@pytest.fixture(params=(None, "P2pHcclAFDConnector"))
+def runtime(monkeypatch, request):
     class KVCacheManager:
         def __init__(self):
             self.calls = []
@@ -120,17 +120,26 @@ def runtime(monkeypatch):
     modules["vllm_ascend.utils"].is_dspark_config = lambda c: c.dspark
     patch = importlib.import_module("afd_plugin.compat.patches.npu.dspark_pd")
     monkeypatch.setattr(patch, "version", lambda package: "0.23.0+empty")
-    return SimpleNamespace(patch=patch, scheduler=Scheduler, manager=KVCacheManager)
+    return SimpleNamespace(
+        patch=patch,
+        scheduler=Scheduler,
+        manager=KVCacheManager,
+        connector=request.param,
+    )
 
 
-def config(**changes):
+def config(*, connector="P2pHcclAFDConnector", **changes):
     values = dict(
-        additional_config={
-            "afd": {
-                "role": "attention",
-                "connector": "P2pHcclAFDConnector",
+        additional_config=(
+            {
+                "afd": {
+                    "role": "attention",
+                    "connector": connector,
+                }
             }
-        },
+            if connector is not None
+            else {}
+        ),
         kv_transfer_config=SimpleNamespace(
             kv_connector="MooncakeHybridConnector",
             is_kv_consumer=True,
@@ -146,7 +155,7 @@ def config(**changes):
 def scheduler(runtime, **changes):
     assert runtime.patch.apply_afd_dspark_pd_scheduler_patch()
     return runtime.scheduler(
-        config(**changes),
+        config(connector=runtime.connector, **changes),
         SimpleNamespace(kv_cache_groups=[None, None]),
         None,
         32,
@@ -206,7 +215,6 @@ def test_only_async_external_load_changes_allocation(runtime, delay, external):
 @pytest.mark.parametrize(
     "changes",
     [
-        {"additional_config": {}},
         {
             "additional_config": {
                 "afd": {"role": "ffn", "connector": "P2pHcclAFDConnector"}

@@ -18,6 +18,31 @@ import torch
 from afd_plugin.compat.patches.npu import dspark_pd_layout as patch
 
 
+@pytest.mark.parametrize("connector", [None, "P2pHcclAFDConnector"])
+@pytest.mark.parametrize("consumer", [False, True])
+@pytest.mark.parametrize("dspark", [False, True])
+def test_layout_scope_covers_native_and_afd(monkeypatch, connector, consumer, dspark):
+    utils = ModuleType("vllm_ascend.utils")
+    utils.is_dspark_config = lambda config: config.dspark
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+    config = SimpleNamespace(
+        additional_config=(
+            {"afd": {"role": "attention", "connector": connector}}
+            if connector is not None
+            else {}
+        ),
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="MooncakeHybridConnector",
+            is_kv_consumer=consumer,
+            is_kv_producer=not consumer,
+        ),
+        speculative_config=SimpleNamespace() if dspark else None,
+        dspark=dspark,
+        model_config=SimpleNamespace(dspark=dspark),
+    )
+    assert patch._uses_layer_layout(config) is dspark
+
+
 @pytest.fixture
 def layouts(monkeypatch):
     interface = ModuleType("vllm.v1.kv_cache_interface")

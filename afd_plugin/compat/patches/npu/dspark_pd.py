@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""vLLM 0.23 scheduler compatibility for AFD DSpark with Mooncake PD.
+"""vLLM 0.23 scheduler compatibility for DSpark with Mooncake PD.
+
+Both native Decode and AFD Attention consumers need the same compatibility.
 
 Upstream: vllm/v1/core/sched/scheduler.py at 0fc695fc6 and
 vllm/v1/core/kv_cache_manager.py at the same revision.
@@ -58,8 +60,11 @@ _ALLOCATE_PARAMETERS = (
 
 
 def _uses_dspark_pd(config: VllmConfig) -> bool:
+    """Match native Decode or Ascend AFD Attention using DSpark Mooncake PD."""
     afd = parse_optional_afd_config(config.additional_config)
-    if afd is None or afd.role != "attention" or afd.connector != "P2pHcclAFDConnector":
+    if afd is not None and (
+        afd.role != "attention" or afd.connector != "P2pHcclAFDConnector"
+    ):
         return False
     kv = config.kv_transfer_config
     if (
@@ -119,7 +124,7 @@ def _install_async_allocation(manager: KVCacheManager) -> None:
 
 
 def apply_afd_dspark_pd_scheduler_patch() -> bool:
-    """Install only on the pinned v0.23 API, with instance-level AFD scope."""
+    """Install on the pinned v0.23 API for matching DSpark PD instances."""
     if not version("vllm").startswith("0.23.0"):
         return False
     from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -139,8 +144,8 @@ def apply_afd_dspark_pd_scheduler_patch() -> bool:
 
     original_init = scheduler_cls.__init__
 
-    # Patch reason: the async allocation shim belongs only to AFD DSpark PD
-    # schedulers, not all KVCacheManager instances in the process.
+    # Patch reason: native Decode and AFD Attention share the DSpark PD admission
+    # issue; the shim belongs only to their matching KVCacheManager instances.
     # Patch functionality: install the per-manager allocation shim after init.
     # Expansion exception: upstream __init__ builds all scheduler subsystems;
     # delegate that construction rather than copying several hundred lines.
