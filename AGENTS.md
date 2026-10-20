@@ -145,12 +145,6 @@ Exactly one module owns upstream signature alignment, as a single parametrized
 table covering patch functions. Inheritance alignment is mypy's job, not
 pytest's.
 
-### Test budget
-
-`tests/unit` total lines are baselined in `tests/unit/.loc-baseline` and may
-only decrease without an approved reason in the PR body. A new feature should
-not add more test lines than source lines; a bug fix has no such cap.
-
 ## Patching Requirement
 
 **Strict Review Required**: All new patches must undergo thorough architectural

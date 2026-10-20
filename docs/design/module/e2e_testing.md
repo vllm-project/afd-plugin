@@ -272,13 +272,7 @@ of 24; the lower threshold applies only at sample counts up to 24.
 Model entrypoints reuse the subprocess and download helpers in
 `tests/conftest.py`.
 
-## Unit test maintenance
-
-`tests/unit/.loc-baseline` limits physical lines in every unit Python file,
-including shared fakes, comments and blank lines. The `unit-test-budget`
-pre-commit hook checks the budget. Lower it after a cleanup; an increase
-requires an approved reason in the PR body. Report tests moved out of unit
-separately from deleted code.
+## Host integration checks
 
 Run host-only process/signal integration coverage explicitly with
 `pytest tests/e2e/test_runner.py`; it launches local processes and sockets
