@@ -16,6 +16,7 @@ export DSV4_SCRIPT_DIR="${PWD}/.agents/skills/deploy-dsv4-flash-async/scripts"
 | `run_prefill_full.sh` | 非 AFD EP16/EP32 入口 |
 | `run_prefill_full_rank.sh` | full-model 子进程实现，由 full 入口传入布局变量 |
 | `run_decode.sh` | PD 的完整 D 服务 |
+| `prepare_decode_speculative_config.py` | 按 checkpoint 元数据选择普通 MTP / DSpark，或验证显式配置；由 D 入口调用 |
 | `run_proxy.sh` | 调用已安装 vllm-ascend 的 PD proxy |
 | `curl_test.sh` | 向 proxy 发 chat smoke 请求，REQUEST_TIMEOUT 默认 120 秒 |
 | `prepare_bench_dataset.py` | 解压内置冻结 JSONL 并校验 SHA256，复用有效缓存 |
@@ -68,3 +69,4 @@ custom JSONL，同时设置 `DSV4_BENCH_DATASET_PATH` 和真实
 结果或打包/绘图脚本。PD proxy 仍依赖所选 vllm-ascend checkout 的实现。
 
 这些脚本无 dry-run 参数。静态检查使用 `bash -n`；命令生成验证用临时 mock CLI，不能据此声称 NPU 上服务已验证。
+主机测试命令、真实接口检查与最小真机 smoke 的边界见 [验证与覆盖](validation.md)。

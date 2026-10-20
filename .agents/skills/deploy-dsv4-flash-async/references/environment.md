@@ -40,7 +40,9 @@ export PID_DIR="${LOG_DIR}/pids"
 记录实际 CANN、torch、torch-npu 和构建产物；已有 A3 记录不是任意版本组合的兼容承诺。
 源码路径默认使用当前 AFD checkout 和同级 vLLM/Ascend，挂载或安装包不同则显式覆盖。
 
-AFD A/F 显式设置 `VLLM_USE_V2_MODEL_RUNNER=1`、`VLLM_PLUGINS=ascend,afd`。
+AFD A/F 显式设置 `VLLM_USE_V2_MODEL_RUNNER=1`，默认插件为 `ascend,afd`；
+P/D 的 Attention 还会添加 `ascend_kv_connector`，以注册 `MooncakeHybridConnector`。
+仅配置 `--kv-transfer-config` 不会自动加载被插件白名单排除的 connector。
 V1 引擎变量不能代替 MRV2。原生 EP/D 记录实际 native runner，不强加 AFD 的运行器约束。
 各模型入口显式设置 `--attention_config.indexer_kv_dtype int8`；
 `DSV4_INDEXER_KV_DTYPE` 可选择在目标环境验证的其他值。
@@ -59,6 +61,13 @@ SOC_VERSION=910c AFD_BUILD_ASCEND_OPS=1 \
 ```
 
 `setup.py` 在检测到 Ascend 环境时默认启用构建；示例显式设为 1，确保此次安装包含 NPU 扩展。正常完整安装不要设置 `AFD_BUILD_ASCEND_OPS=0` 或 `AFD_SKIP_ACLNN_BUILD=1`。后者仅用于已有匹配算子产物时跳过 ACLNN 重编译，不能补齐旧包缺少的通信算子。已安装匹配版本时无需每次启动重新编译。
+
+先核对现有源码、CANN/Torch 和原生产物，再决定是否需要构建；只审查 skill 时无需为此加载模型。
+无卡主机导入真实 CLI 时，Triton 可能因自动识别架构失败而退出。已知实际目标架构时可设置
+`TRITON_ASCEND_ARCH`；本轮 910C 的无卡检查使用 `Ascend910_9392`，这不模拟设备执行。
+无卡构建若因 Torch 的 CMake 路径探测混入设备诊断输出而失败，可显式指定实际安装位置的
+`Torch_DIR` 和 `TORCH_NPU_PATH`。保留原失败日志，复用已经成功生成且匹配的 ACLNN 包；
+不把仅完成绑定续建写成完整安装或真机通信已通过。
 
 运行时 loader 配置插件打包的 `afd-plugin` vendor，并加载 `afd_plugin._C_ascend`。部署前可在与服务相同的 Python 环境中验证四个注册：
 

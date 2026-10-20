@@ -17,9 +17,16 @@ export PREFILL_ENABLE_KV_CONNECTOR=1
 export DECODE_DP_SIZE=16
 export DECODE_TP_SIZE=1
 export MAX_MODEL_LEN=65536
+export DECODE_SPECULATIVE_CONFIG=auto
 ```
 
 P 和 D 均通过 `VLLM_CLI` 选择 vLLM 可执行文件；proxy 使用 `PYTHON`。
+
+AFD Attention 在 KV=1 时会给插件白名单补上 `ascend_kv_connector`，保留自定义插件且不重复添加；
+FFN 不使用 KV connector。仅传 `--kv-transfer-config` 不会加载被白名单排除的插件。
+若启动在 factory 报 `Unsupported connector type: MooncakeHybridConnector`，先检查实际
+Attention 进程的 `VLLM_PLUGINS` 和插件加载日志，这是注册阶段错误，尚未进入 KV 网络传输。
+该配置名在固定 Ascend 版本中解析到 hybrid 模块的 `MooncakeConnector` 类，类名与配置名不同。
 
 ```bash
 # 在 D 节点提交
@@ -39,6 +46,30 @@ PROXY_IP="${P_NODE_IP}" bash "${DSV4_SCRIPT_DIR}/curl_test.sh"
 
 proxy 在其他节点运行时，最后一条使用该节点的真实 IP。默认 proxy 源码为 `${PYTHON_VLLM_ASCEND_PATH}/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py`，可用 PROXY_SCRIPT 覆盖，先检查文件和参数契约。
 
+## Decode draft 与 checkpoint
+
+`DECODE_SPECULATIVE_CONFIG=auto`（默认）读取本地 checkpoint 的 `config.json`，在启动服务前选择：
+
+| checkpoint 元数据 | Decode speculative 配置 |
+| --- | --- |
+| 含正整数 `dspark_block_size=K` | `method=dspark`、`num_speculative_tokens=K` |
+| 无 DSpark 字段，`num_nextn_predict_layers>0` | 普通 `method=mtp`、`num_speculative_tokens=1` |
+| 未声明 draft 层 | 不传 speculative 配置 |
+
+两种 draft 默认均为 `enforce_eager=true`；这不改变 D 主模型的 graph 设置。
+显式 `DECODE_SPECULATIVE_CONFIG=none` 可选择普通 Decode；也可传原生 JSON 覆盖，
+由固定版本真实 CLI 继续验证其完整参数，例如：
+
+```bash
+export DECODE_SPECULATIVE_CONFIG='{"method":"dspark","num_speculative_tokens":5,"enforce_eager":true}'
+```
+
+实测 DSpark W4A8 checkpoint 包含 `mtp.0.*`、`mtp.1.*`、`mtp.2.*`；
+普通 MTP loader 仅接受 `mtp.0.*`，强行选择 `method=mtp` 会在权重加载时报断言。
+入口现在会在提交模型进程前拒绝此组合，要求使用 DSpark，不会静默关闭加速功能。
+draft stage 数、`num_nextn_predict_layers` 与每轮 speculative token 数不是同一个概念；
+使用实际 checkpoint 元数据及对应原生方法，不能统一写死为 MTP 1。
+
 ## 非 AFD P + PD
 
 两端将 `PREFILL_TOPOLOGY` 设置为同一个 full-model 拓扑（例如 `ep16`），保留 `PREFILL_ENABLE_KV_CONNECTOR=1`。D 仍执行 `run_decode.sh`，P 改为：
@@ -55,11 +86,13 @@ EP32 的 P 需要两个节点（各 local DP2），另外为 D 分配独立资�
 
 - P KV：producer、engine_id=0、默认 kv_port=30000；D：consumer、engine_id=1、默认 kv_port=30100。
 - P/D 的 `kv_connector_extra_config.prefill/decode` 必须分别填写真实全局 DP/TP。修改 P 拓扑也要同步 D 的 PREFILL_TOPOLOGY/DP/TP，不能沿用 D 进程的 legacy 默认值。
-- D 是原生完整模型，使用 Ascend 插件白名单，保留 `--async-scheduling`、MTP speculative token=1、`FULL_DECODE_ONLY`、`enable_npugraph_ex=true`。0.30 不再传旧 `VLLM_ASCEND_APPLY_DSV4_PATCH`；D 的 runner/MTP/graph 组合仍需独立验证。这些与 P 端 Async CAM/eager 是不同机制，不能由 AFD Attention 的约束推断 D 的能力。
+- D 是原生完整模型，使用 Ascend 插件白名单，保留 `--async-scheduling`、`FULL_DECODE_ONLY`、`enable_npugraph_ex=true`；draft 按上述 checkpoint 配置选择。0.30 不再传旧 `VLLM_ASCEND_APPLY_DSV4_PATCH`；D 的 runner/draft/graph 组合仍需按实际路径验证。这些与 P 端 Async CAM/eager 是不同机制，不能由 AFD Attention 的约束推断 D 的能力。
 - 默认 D chunk=120、max seqs=60、显存比例=0.9；按容量验证，不推断所有环境均可启动。
 - P 使用双机 AFD 拓扑时，它消耗两个 P 节点，默认完整 D 还需独立资源；不能在第二个 P 节点上照搬 16 卡 D 布局造成设备重叠。该扩展需验证，不能冒称是 README 的两机 1P1D。
 - 验收必须通过 proxy 发实际生成请求，并查看 P/D 请求及 KV 传输日志。仅 P/D `/health` 成功不证明 PD 链路可用。
 - Prefill 是否使用 AFD 不改变 PD 的 producer/consumer 分工；两种组合均以实际 proxy 请求及 KV 传输成功为验收标准。
 
-此处保留 PD 配置入口，尚未完成迁移后的 0.30 链路验收。
-不要将 0.26 的部署记录、proxy 参数兼容或 prefill-only 压测当成新环境的 PD 通过结果。
+2026-10-20 已完成上述 legacy AFD P + 原生 D 的跨机最小 smoke：proxy 生成 32 个 token，
+consumer 确认 86 个外部 KV token 并完成传输，DSpark 实际参与生成，两端请求后仍健康。
+具体版本、容量设置和适用边界见 [本轮验证记录](validation.md#2026-10-20-最小-smoke)。
+该结果不覆盖非 AFD P、EP32、长请求、精度或性能，也不能由旧 0.26 部署记录外推。

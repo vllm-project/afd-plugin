@@ -232,7 +232,14 @@ metadata = {
 }
 metadata.update(item.split("=", 1) for item in sys.argv[7:])
 for key, value in metadata.items():
-    if str(result.get(key)) != value:
+    # vLLM writes its parsed concurrency after metadata: uncapped is JSON null.
+    actual_value = result.get(key)
+    matches = (
+        actual_value is None
+        if key == "max_concurrency" and value == "none"
+        else str(actual_value) == value
+    )
+    if key not in result or not matches:
         raise SystemExit(
             f"{path}: expected metadata {key}={value}, got {result.get(key)!r}"
         )

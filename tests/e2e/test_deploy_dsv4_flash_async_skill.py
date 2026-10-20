@@ -59,6 +59,11 @@ def main():
         ]
         result = {
             **metadata,
+            # vLLM writes the parsed client setting after metadata. In the
+            # uncapped case this overwrites the metadata string with JSON null.
+            "max_concurrency": int(value("--max-concurrency"))
+            if "--max-concurrency" in args
+            else None,
             "completed": count,
             "failed": 0,
             "total_input_tokens": total,
@@ -101,6 +106,9 @@ class DeploymentScriptsTest(unittest.TestCase):
         curl.chmod(0o755)
         dataset = self.root / "synthetic.jsonl"
         dataset.write_text('{"prompt":"test","output_tokens":1}\n')
+        self.model = self.root / "checkpoint with spaces"
+        self.model.mkdir()
+        (self.model / "config.json").write_text('{"num_nextn_predict_layers":1}\n')
         self.env = {
             **os.environ,
             "PATH": f"{self.bin}:{os.environ['PATH']}",
@@ -113,7 +121,7 @@ class DeploymentScriptsTest(unittest.TestCase):
             "PYTHONPATH": "/cann/python:/cann/tbe",
             "VLLM_PLUGINS": "afd",
             "VLLM_USE_V2_MODEL_RUNNER": "0",
-            "DSV4_MODEL": "/models/checkpoint with spaces",
+            "DSV4_MODEL": str(self.model),
             "P_NODE_IP": "192.0.2.1",
             "P_SECONDARY_NODE_IP": "192.0.2.2",
             "D_NODE_IP": "192.0.2.3",
@@ -305,6 +313,9 @@ class DeploymentScriptsTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         producer = json.loads(option(captures[0], "--kv-transfer-config"))
+        self.assertIn(
+            "ascend_kv_connector", captures[0]["env"]["VLLM_PLUGINS"].split(",")
+        )
         self.assertEqual(producer["kv_role"], "kv_producer")
         self.assertEqual(
             producer["kv_connector_extra_config"]["prefill"],
@@ -324,6 +335,114 @@ class DeploymentScriptsTest(unittest.TestCase):
             producer["kv_connector_extra_config"],
         )
         self.assertNotIn("afd", captures[0]["env"]["VLLM_PLUGINS"].split(","))
+
+    def test_pd_attention_includes_connector_plugin_with_overrides(self) -> None:
+        for plugins in (
+            "ascend,afd",
+            "ascend,afd,custom_plugin",
+            "ascend,afd,ascend_kv_connector",
+        ):
+            with self.subTest(plugins=plugins):
+                result, captures = self.run_script(
+                    "run_prefill.sh",
+                    expected_captures=2,
+                    PREFILL_ENABLE_KV_CONNECTOR="1",
+                    AFD_VLLM_PLUGINS=plugins,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                by_role = {
+                    json.loads(option(capture, "--additional-config"))["afd"][
+                        "role"
+                    ]: capture
+                    for capture in captures
+                }
+                attention_plugins = by_role["attention"]["env"]["VLLM_PLUGINS"].split(
+                    ","
+                )
+                self.assertEqual(attention_plugins.count("ascend_kv_connector"), 1)
+                self.assertTrue(set(plugins.split(",")).issubset(attention_plugins))
+                self.assertEqual(by_role["ffn"]["env"]["VLLM_PLUGINS"], plugins)
+
+    def test_decode_selects_checkpoint_speculative_method(self) -> None:
+        for metadata, expected in (
+            ({"num_nextn_predict_layers": 1}, ("mtp", 1)),
+            ({"num_nextn_predict_layers": 1, "dspark_block_size": 5}, ("dspark", 5)),
+            ({}, None),
+            ({"num_nextn_predict_layers": None}, None),
+        ):
+            with self.subTest(metadata=metadata):
+                (self.model / "config.json").write_text(json.dumps(metadata))
+                result, captures = self.run_script("run_decode.sh", expected_captures=1)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if expected is None:
+                    self.assertNotIn("--speculative-config", captures[0]["args"])
+                else:
+                    config = json.loads(option(captures[0], "--speculative-config"))
+                    self.assertEqual(
+                        (config["method"], config["num_speculative_tokens"]), expected
+                    )
+                    self.assertTrue(config["enforce_eager"])
+
+    def test_decode_speculative_overrides(self) -> None:
+        override = {
+            "method": "dspark",
+            "num_speculative_tokens": 7,
+            "enforce_eager": True,
+        }
+        result, captures = self.run_script(
+            "run_decode.sh",
+            expected_captures=1,
+            DECODE_SPECULATIVE_CONFIG=json.dumps(override),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(option(captures[0], "--speculative-config")), override
+        )
+        (self.model / "config.json").write_text('{"dspark_block_size":5}\n')
+        override = {
+            "method": "mtp",
+            "num_speculative_tokens": 1,
+            "model": "/draft/model",
+        }
+        result, captures = self.run_script(
+            "run_decode.sh",
+            expected_captures=1,
+            DECODE_SPECULATIVE_CONFIG=json.dumps(override),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(option(captures[0], "--speculative-config")), override
+        )
+        result, captures = self.run_script(
+            "run_decode.sh", expected_captures=1, DECODE_SPECULATIVE_CONFIG="none"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--speculative-config", captures[0]["args"])
+
+    def test_decode_rejects_incompatible_mtp_before_launch(self) -> None:
+        (self.model / "config.json").write_text('{"dspark_block_size":5}\n')
+        result, captures = self.run_script(
+            "run_decode.sh",
+            DECODE_SPECULATIVE_CONFIG='{"method":"mtp","num_speculative_tokens":1}',
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(captures, [])
+        self.assertIn("DSpark checkpoint requires method=dspark", result.stderr)
+
+    def test_decode_rejects_invalid_speculative_metadata_before_launch(self) -> None:
+        for metadata, override in (
+            ({"dspark_block_size": 0}, "auto"),
+            ({"dspark_block_size": True}, "auto"),
+            ({}, "[]"),
+            ({}, "invalid JSON"),
+        ):
+            with self.subTest(metadata=metadata, override=override):
+                (self.model / "config.json").write_text(json.dumps(metadata))
+                result, captures = self.run_script(
+                    "run_decode.sh", DECODE_SPECULATIVE_CONFIG=override
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(captures, [])
 
     def test_sweep_accepts_added_topologies(self) -> None:
         for topology in (
@@ -357,7 +476,7 @@ class DeploymentScriptsTest(unittest.TestCase):
             captures[0], "--result-filename"
         )
         payload = json.loads(result_path.read_text())
-        self.assertEqual(payload["max_concurrency"], "8")
+        self.assertEqual(payload["max_concurrency"], 8)
         self.assertEqual(payload["num_warmups"], "0")
         self.assertEqual(payload["attention_dbo"], "1")
         self.assertEqual(payload["skill_contract"], "afd-dsv4-v030")
@@ -377,6 +496,7 @@ class DeploymentScriptsTest(unittest.TestCase):
             / "rps_2/repeat_1/result.json"
         )
         original = json.loads(result_path.read_text())
+        self.assertIsNone(original["max_concurrency"])
         self.assertEqual(original["total_input_tokens"], FROZEN_INPUT_TOKENS)
         self.assertEqual(max(original["input_lens"]), FROZEN_MAX_INPUT_TOKENS)
         self.assertEqual(original["completed"], FROZEN_REQUESTS)
@@ -388,6 +508,9 @@ class DeploymentScriptsTest(unittest.TestCase):
             {"skill_contract": "old-v026"},
             {"attention_dbo": "0"},
             {"failed": 1},
+            {"max_concurrency": 8},
+            {"max_concurrency": "none"},
+            {"max_concurrency": "None"},
         ):
             with self.subTest(mutation=mutation):
                 result_path.write_text(json.dumps({**original, **mutation}))
@@ -423,6 +546,28 @@ class DeploymentScriptsTest(unittest.TestCase):
         result = subprocess.run(command, text=True, capture_output=True, timeout=15)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(output.read_text(), "invalid cache\n")
+
+    def test_sweep_accepts_native_client_concurrency(self) -> None:
+        for cap in ("0", "none", "8"):
+            with self.subTest(cap=cap):
+                run_id = f"concurrency-{cap}"
+                result, captures = self.run_script(
+                    "run_bench_sweep.sh",
+                    "--rates",
+                    "2",
+                    "--repeats",
+                    "1",
+                    expected_captures=1,
+                    DSV4_BENCH_MAX_CONCURRENCY=cap,
+                    DSV4_BENCH_RUN_ID=run_id,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                result_path = Path(option(captures[0], "--result-dir")) / option(
+                    captures[0], "--result-filename"
+                )
+                payload = json.loads(result_path.read_text())
+                expected = 8 if cap == "8" else None
+                self.assertEqual(payload["max_concurrency"], expected)
 
 
 if __name__ == "__main__":

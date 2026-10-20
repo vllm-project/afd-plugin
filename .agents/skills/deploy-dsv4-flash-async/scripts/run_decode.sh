@@ -13,6 +13,13 @@ require_common_network
 : "${DSV4_MODEL:?Set DSV4_MODEL to the checkpoint directory}"
 configure_network "${D_NODE_IP}"
 
+SPECULATIVE_CONFIG=$("${PYTHON}" "${SCRIPT_DIR}/prepare_decode_speculative_config.py" \
+  --model "${DSV4_MODEL}" --config "${DECODE_SPECULATIVE_CONFIG:-auto}")
+SPECULATIVE_ARGS=()
+if [[ -n "${SPECULATIVE_CONFIG}" ]]; then
+  SPECULATIVE_ARGS=(--speculative-config "${SPECULATIVE_CONFIG}")
+fi
+
 LOG_FILE=${DECODE_LOG_FILE:-${LOG_DIR}/decode.log}
 PID_FILE=${DECODE_PID_FILE:-${PID_DIR}/decode.pid}
 
@@ -67,7 +74,7 @@ nohup "${VLLM_CLI}" serve "${DSV4_MODEL}" \
   --trust-remote-code \
   --no-enable-prefix-caching \
   --no-disable-hybrid-kv-cache-manager \
-  --speculative-config '{"num_speculative_tokens": 1, "method": "mtp", "enforce_eager": true}' \
+  ${SPECULATIVE_ARGS[@]+"${SPECULATIVE_ARGS[@]}"} \
   --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
   --kv-transfer-config "${KV_TRANSFER_CONFIG}" \
   --additional-config "${DECODE_ADDITIONAL_CONFIG}" > "${LOG_FILE}" 2>&1 &

@@ -62,8 +62,14 @@ case "${PREFILL_ENABLE_DBO}" in
 esac
 
 KV_TRANSFER_ARGS=()
+ATTENTION_VLLM_PLUGINS=${AFD_VLLM_PLUGINS:-ascend,afd}
 case "${PREFILL_ENABLE_KV_CONNECTOR}" in
   1)
+    # The platform plugin does not register general KV connector plugins.
+    case ",${ATTENTION_VLLM_PLUGINS}," in
+      *,ascend_kv_connector,*) ;;
+      *) ATTENTION_VLLM_PLUGINS+=,ascend_kv_connector ;;
+    esac
     KV_TRANSFER_CONFIG=$(printf '%s' "{
       \"kv_connector\": \"MooncakeHybridConnector\",
       \"kv_role\": \"kv_producer\",
@@ -113,7 +119,7 @@ ASCEND_RT_VISIBLE_DEVICES="${PREFILL_ATTN_VISIBLE_DEVICES}" \
 HCCL_BUFFSIZE="${PREFILL_HCCL_BUFFSIZE}" \
 VLLM_ASCEND_ENABLE_FLASHCOMM1="${PREFILL_FLASHCOMM1:-1}" \
 VLLM_USE_V2_MODEL_RUNNER=1 \
-VLLM_PLUGINS="${AFD_VLLM_PLUGINS:-ascend,afd}" \
+VLLM_PLUGINS="${ATTENTION_VLLM_PLUGINS}" \
 AFD_ASYNC_CAM_LAYERED_GMM=0 \
 nohup "${VLLM_CLI}" serve "${DSV4_MODEL}" \
   --host "${VLLM_HOST}" \

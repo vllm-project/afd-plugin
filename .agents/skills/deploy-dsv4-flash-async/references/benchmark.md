@@ -44,6 +44,8 @@ python3 "${DSV4_SCRIPT_DIR}/prepare_bench_dataset.py" \
 按环境参考提供 `DSV4_MODEL`、Python/CLI、源码路径和网络设置；服务需已健康。
 默认每点预热 16 次，顺序固定，不 shuffle、不 oversample。默认不设置客户端
 并发上限；`DSV4_BENCH_MAX_CONCURRENCY=0` 或空值均表示开放负载。
+真实 vLLM 结果中的 `max_concurrency` 此时为 JSON `null`，显式上限则为整数；
+sweep 按此格式校验，不能把 metadata 中的字符串 `none` 当作最终结果值。
 
 ```bash
 export DSV4_BENCH_HOST="${P_NODE_IP}"

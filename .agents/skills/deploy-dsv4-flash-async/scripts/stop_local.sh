@@ -17,7 +17,7 @@ for pid_file in "${PID_DIR}"/*.pid; do
   pid=$(<"${pid_file}")
   if [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
     kill "${pid}"
-    echo "Stopped pid=${pid} (${pid_file})"
+    echo "Sent SIGTERM pid=${pid} (${pid_file})"
   fi
   rm -f "${pid_file}"
 done

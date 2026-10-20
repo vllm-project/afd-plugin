@@ -8,6 +8,11 @@ description: 在固定 vLLM 0.30 / Ascend 环境中部署 DeepSeek-V4-Flash Asyn
 根据用户需求准备配置、执行部署或测量性能。以用户要求的交付状态为终点；
 配置准备、本地命令验证、硬件请求成功、精度和性能验收分别报告。
 
+只验证本 skill、脚本或所附测试的准确性时，先读 [验证与覆盖](references/validation.md)，
+从主机契约检查及固定版本真实接口检查开始；目标平台为 NPU 不表示需要全量运行时验收。
+真机 smoke 按用户选定的范围执行，复用匹配环境和产物；不自动扩展到 DBO、FULL、
+精度、性能或全部拓扑。发现入口缺陷后修复并复验受影响路径，直到约定的交付状态。
+
 ## 选择部署与执行模式
 
 Prefill 实现和 P/D 分离是两个独立维度：
@@ -34,7 +39,7 @@ FFN 可选普通 eager、W4A8 layered eager 或窄范围的 layered FULL；
 先读 [环境与固定版本](references/environment.md) 和所选模式参考，再检查入口脚本。
 脚本选择现有环境，不负责自动升级依赖。
 
-从现有环境查明目标节点/容器、已分配设备、checkpoint 及其量化、运行时和源码路径、
+实际部署时，从现有环境查明目标节点/容器、已分配设备、checkpoint 及其量化、运行时和源码路径、
 网络接口、拓扑、容量参数、端口，以及本次独立日志/PID 目录。
 缺少实际部署所必需的信息时询问；只准备方案时明确待填项。
 源码路径默认以 skill 所在 AFD checkout 及其同级 vLLM/Ascend 目录为起点，
@@ -51,6 +56,7 @@ W4A8 的实际加载路径、容量和启动经验见 [W4A8](references/w4a8-sta
 按本次启动时限观察首个有效错误，不做无信息价值的反复重启。
 Attention API 可用以及 FFN capture/receive loop 就绪共同构成 AFD readiness，
 不要求 FFN HTTP API 就绪。
+短请求结束后再次检查服务存活及错误日志，不能把返回过一个 token 当作完整 smoke 通过。
 
 按 [验证与覆盖](references/validation.md) 选择与请求及变更相称的验证。
 单 token smoke、生成正确性、实际 DBO 执行、graph replay 和性能有不同证据，
