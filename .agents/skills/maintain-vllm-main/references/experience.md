@@ -6,9 +6,10 @@ and the active user agreement.
 
 ## Incremental upstream maintenance trials
 
-The reusable sequence is: inherit the long-lived result branch, merge AFD main,
-fix a vLLM main target with an available runtime, adapt semantics, check and fix,
-then save the result and next starting point.
+The reusable sequence is: inspect the long-lived result branch, recommend a
+coherent target and validation budget for approval, then merge AFD main, adapt
+semantics, check and fix, and save the result and next starting point. Historical
+trial targets and device counts do not prescribe a later round's scope or budget.
 
 Observed problems and evidence limits:
 

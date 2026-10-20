@@ -2,16 +2,17 @@
 name: maintain-vllm-main
 description: >-
   Maintain afd-plugin's long-lived upgrade branch by merging AFD main,
-  incrementally adapting to vLLM main, and recording validation and the next
-  starting point. Use for manual rolling maintenance or resuming unfinished
-  upgrades; qualify releases separately.
+  recommending each round's scope for approval, incrementally adapting to vLLM
+  main, and recording validation and the next starting point. Use for manual
+  rolling maintenance or resuming unfinished upgrades; qualify releases separately.
 ---
 
 # Maintain AFD against vLLM main
 
 Spread upgrade work across manually triggered maintenance rounds. Keep one
 long-lived branch with completed adaptations, validation evidence, and a clear
-starting point for the next round.
+starting point for the next round. Investigate and recommend the target and
+validation budget; the user approves the concrete proposal before execution.
 
 Read [lessons from previous upgrades](references/experience.md) on first use or
 when a related problem arises. For a release, pin the release target and complete
@@ -42,23 +43,53 @@ the repository's final qualification.
 
 ## Each maintenance round
 
-### 1. Fix the inputs and target
+### 1. Investigate and propose this round
 
 Fetch AFD main, the upgrade branch, and vLLM main; record their full SHAs. Read the
 last completed vLLM adaptation point, existing evidence, and pending work. Leave
 upstream changes arriving during the run for the next round.
+When resuming an approved unfinished round, retain its fixed SHAs and remaining
+budget; record newer upstream heads for a later proposal.
 
-Prefer this round's vLLM main HEAD and confirm that its runtime is available for
-the execution platform. If a matching wheel is unavailable, make a bounded search
-for a recent runnable commit and report its distance from main. Do not move
+Recommend a target without requiring the user to name a version. Consider the
+whole pending interval, affected AFD contracts, runtime availability, and likely
+adaptation and validation cost. Select this round's vLLM main HEAD when practical;
+otherwise recommend a smaller, coherent checkpoint and explain the remaining gap.
+An official release or a commit with a matching wheel can be useful, but neither
+a fixed release ladder nor a commit count determines the scope. Account for the
+entire interval to the target, including inherited upstream behavior. Do not move
 behind the completed adaptation point. Honor an exact user-selected target and
 report any runtime gap.
 
 The source, wheel or image, PyTorch/CUDA, and native extensions must correspond
 to the selected target. Record actual provenance and build identity rather than
-inferring them from version strings. If the runtime is unavailable, continue
+inferring them from version strings. If the runtime is unavailable, propose
 source analysis and local implementation with validation marked incomplete.
 Routine preflight does not require rebuilding vLLM or deploying a lasting service.
+
+Before merging or editing the upgrade branch, preparing a new runtime, or running
+compute, present a compact proposal and request human approval. Include:
+
+- The current completed point, fixed AFD main to merge, recommended vLLM target
+  SHA, why this scope is useful, and work left for later rounds.
+- Expected affected behavior, adaptation work, runtime preparation, and material
+  uncertainty that could change the effort.
+- Required checks and the failures they detect, reusable evidence, and the
+  coverage that will remain unvalidated.
+- A resource limit: maximum simultaneous devices and cumulative GPU-minutes
+  (or equivalent accelerator budget), including setup failures and retries;
+  propose zero GPU use when the affected behavior needs none. State runtime
+  preparation limits and when to stop or request a revised scope.
+
+An ordinary request to maintain the branch authorizes investigation, not the
+proposed execution. Wait for approval; silence is not approval. Reuse approval
+for the same concrete round when resuming, without asking again. Routine choices
+within that agreement are autonomous. A materially larger target or effort,
+extra resource budget, or reduced acceptance scope needs approval of a revised
+proposal before proceeding. Save the accepted scope in the maintenance record.
+
+Report no change without requesting an empty approval only when both inputs are
+unchanged, no work is pending, and existing evidence is still valid.
 
 ### 2. Merge AFD main first
 
@@ -70,11 +101,10 @@ Check the semantics of newly merged code, tests, and configuration on the target
 vLLM, including changes without textual conflicts. Avoid reverting newer
 dependency adaptations to an older pin. If main itself advances the upstream
 baseline, reconcile the two histories, retain newer work, and adjust this
-round's target when necessary.
+round's target within the approved scope or request approval for a revised one.
 
-Continue when AFD main changed or pending work remains, even if vLLM did not
-advance. Report no change only when both inputs are unchanged, no work is
-pending, and existing evidence is still valid.
+Include changed AFD main or pending work in the proposal even if vLLM did not
+advance.
 
 ### 3. Adapt the actual differences
 
@@ -111,7 +141,8 @@ acceptance can remove a required in-scope failure from qualification.
 
 ### 4. Validate and resolve failures
 
-State the failure each check detects. Choose checks from the affected behavior:
+State the failure each check detects and choose the cheapest sufficient evidence.
+Consider both AFD edits and changed upstream behavior that AFD inherits:
 
 - **Code or dependency changes:** run repository-required formatting and static
   checks, relevant regressions, and applicable CPU/unit tests. Read commands from
@@ -128,6 +159,26 @@ State the failure each check detects. Choose checks from the affected behavior:
   For communication changes, choose meaningful unequal inputs or asymmetric
   topologies. For Graph/DBO, confirm actual capture/replay or two-stage execution
   and check real output.
+
+Compare affected paths against their last relevant validation, not just the last
+maintenance round. Reuse evidence only when its code, runtime, inputs, and
+assertions remain applicable; retain its original tested SHA. Carry unvalidated
+changes forward so repeated small rounds do not hide an untested interval.
+
+Do non-device preparation and checks before reserving accelerators where possible,
+while preserving required allocation and health checks. Justify the device count
+by the behavior under test: a device-local probe does not establish distributed
+AFD correctness, and a supported small topology does not cover an affected
+asymmetric or multi-rank path. Select the relevant scenario rather than running
+every native, eager, Graph, DBO, and model combination each round. Preserve the
+selected scenario's required inputs and assertions and any mandatory CI gates.
+
+Track cumulative allocated device-minutes, including failed attempts, against
+the approved limit. Reserve only the devices needed for the current check and
+release them before lengthy environment repairs that do not need devices.
+Stop once required affected checks pass; do not spend the remaining budget just
+because it is available. If evidence needs more than the approved budget, save
+partial results and request a revised proposal instead of silently expanding it.
 
 Routine maintenance does not default to the full model and accuracy matrix. Use
 [run-e2e](../run-e2e/SKILL.md) for GPU E2E entry points and operating requirements,
@@ -162,9 +213,11 @@ logs. Include at least:
 Canonical AFD source and merged main SHA
 Upgrade branch and result remote/branch
 Observed vLLM main SHA, selected target, and reason for any lag
+Approved round scope, required checks, resource limits, and approval decision
 Completed vLLM adaptation SHA and pending interval or tasks
 Tested AFD source commit, runtime identity, commands/results, and evidence links
 Latest hardware-validated version, configuration, and results; unvalidated scope
+Allocated device-minutes used; deferred validation and the interval it covers
 Known limits, user-accepted scope decisions, and next action
 ```
 

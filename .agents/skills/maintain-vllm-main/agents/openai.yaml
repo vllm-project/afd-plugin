@@ -1,4 +1,4 @@
 interface:
   display_name: "AFD Upstream Maintenance"
   short_description: "Merge AFD main and adapt to vLLM main incrementally"
-  default_prompt: "Use $maintain-vllm-main to update afd-plugin's long-lived upgrade branch: merge AFD main, adapt to vLLM main, validate this round, and record the next starting point."
+  default_prompt: "Use $maintain-vllm-main to investigate afd-plugin's long-lived upgrade branch and recommend this round's AFD merge, vLLM target, validation, and resource budget for my approval before execution."
