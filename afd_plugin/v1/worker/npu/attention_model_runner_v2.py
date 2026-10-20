@@ -282,6 +282,20 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             )
         return int(batch_descriptor.num_tokens)
 
+    # Native MRV2 KV maintenance creates a context without a model forward or
+    # BatchDescriptor. It must not create/publish an A/F transaction; ordinary
+    # compute contexts still require their native eager descriptor.
+    def install_afd_metadata_on_forward_context(
+        self, forward_context: ForwardContext
+    ) -> None:
+        if (
+            forward_context.batch_descriptor is None
+            and forward_context.attn_metadata is None
+            and self.vllm_config.kv_transfer_config is not None
+        ):
+            return
+        super().install_afd_metadata_on_forward_context(forward_context)
+
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
         return parse_afd_config(vllm_config, expected_role="attention")

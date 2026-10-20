@@ -144,6 +144,13 @@ execution, sampling, and output ownership. `AFDMetadataProviderMixin` adds the
 connector-facing sidecar, DP control payload, transaction IDs, and capture
 metadata without porting V1 execution methods.
 
+On Ascend, native V2 KV maintenance may create a context with neither
+Attention metadata nor a batch descriptor. With KV transfer configured, the
+AFD metadata installer leaves this control-only context unchanged and publishes
+no A/F transaction. Real compute, dummy and ubatch contexts retain their native
+descriptor and metadata requirements. The CPU regression lives in
+[`test_npu_model_runner_v2.py`](../../../tests/unit/v1/worker/test_npu_model_runner_v2.py).
+
 Both platforms require V2. The paired deployment constraints are:
 
 | Constraint | CUDA V2 | Ascend V2 synchronous | Ascend V2 Async CAM |

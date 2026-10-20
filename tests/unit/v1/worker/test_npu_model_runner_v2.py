@@ -82,6 +82,15 @@ def _state(runner):
     )
 
 
+def test_kv_control_context_does_not_publish_afd_metadata():
+    runner = _runner()
+    runner.vllm_config.kv_transfer_config, runner._afd_pending_metadata = object(), None
+    context = SimpleNamespace(attn_metadata=None, batch_descriptor=None)
+    context.additional_kwargs, context.ubatch_slices = {}, None
+    runner.install_afd_metadata_on_forward_context(context)
+    assert context.additional_kwargs == {}
+
+
 @pytest.mark.parametrize("failure", [None, "profiler", "abort", "native"])
 def test_shutdown_joins_native_children_and_releases_owned_stage_state(
     monkeypatch, failure
