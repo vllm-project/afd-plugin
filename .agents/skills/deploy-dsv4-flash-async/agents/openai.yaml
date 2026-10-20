@@ -1,0 +1,4 @@
+interface:
+  display_name: "DSV4-Flash 0.30 部署与压测"
+  short_description: "部署 DSV4-Flash 0.30，验证 Async CAM 并执行固定负载压测"
+  default_prompt: "使用 $deploy-dsv4-flash-async，按固定 0.30 环境准备 DSV4-Flash 部署、验证实际执行路径，并按需求进行固定负载压测。"
