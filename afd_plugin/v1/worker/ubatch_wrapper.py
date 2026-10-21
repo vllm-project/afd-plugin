@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from afd_plugin.connectors import AFDForwardContextMetadata
+from afd_plugin.profiling.model import set_attention_profile_batch
 from afd_plugin.v1.worker.attention_metadata import build_ubatch_dp_metadata_list
 
 if TYPE_CHECKING:
@@ -33,6 +34,12 @@ def build_ubatch_afd_metadata(
     clone.tokens_unpadded_lens = [
         _resolve_ubatch_unpadded_tokens(afd_metadata, ubatch_slice, ubatch_idx),
     ]
+    if len(clone.profile_batch) == 1 and len(ubatch_slices) > 1:
+        # V1 can supply whole-batch counts before native ubatch slicing.
+        _, requests, tokens = clone.profile_batch[0]
+        set_attention_profile_batch(clone, requests, tokens, ubatch_slices)
+    if clone.profile_batch:
+        clone.profile_batch = [clone.profile_batch[ubatch_idx]]
     return clone
 
 

@@ -4,7 +4,7 @@
 
 import importlib.util
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
@@ -77,6 +77,7 @@ def modules(monkeypatch):
     return group, connector, runtime
 
 
+@pytest.mark.parametrize("profiling", [False, True])
 @pytest.mark.parametrize(
     "invalid,dbo_flag",
     [
@@ -88,7 +89,7 @@ def modules(monkeypatch):
     ],
 )
 def test_static_validation_precedes_hccl_creation(
-    modules, monkeypatch, invalid, dbo_flag
+    modules, monkeypatch, invalid, dbo_flag, profiling
 ):
     group, connector_module, _ = modules
     order = []
@@ -109,6 +110,7 @@ def test_static_validation_precedes_hccl_creation(
     )
     connector.__dict__.update(
         _initialized=False,
+        profile_enabled=profiling,
         afd_config=SimpleNamespace(host="localhost", port=1),
         topology=SimpleNamespace(world_size=2),
         world_rank=0,
@@ -140,6 +142,7 @@ def test_static_validation_precedes_hccl_creation(
         connector.graph_startup.mode = "full"
 
     monkeypatch.setattr(connector.graph_startup, "initialize", negotiate)
+    monkeypatch.setattr(connector, "_gather_profile_workers", lambda: None)
     monkeypatch.setattr(
         connector.graph_startup, "phase", lambda stage: order.append(stage)
     )
@@ -218,6 +221,63 @@ def test_ffn_announces_service_only_on_receiver_execution(modules):
     assert calls == ["ready", ("submit", 2), ("submit", 2)]
 
 
+@pytest.mark.parametrize("mode", ["FULL", "LIGHTWEIGHT"])
+def test_graph_wait_starts_profiler_but_stops_only_after_device_completion(
+    modules, monkeypatch, mode
+):
+    _, _, runtime = modules
+    calls: list[tuple] = []
+    runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
+    session = SimpleNamespace(state="IDLE", mode=mode)
+
+    def progress(*, allow_stop=True):
+        calls.append(("profile", session.state, allow_stop, runner._graph_pending))
+        if session.state == "STARTING" or (session.state == "STOPPING" and allow_stop):
+            session.state = "RUNNING" if session.state == "STARTING" else "COMPLETED"
+
+    states = iter(("STARTING", "STOPPING", "STOPPING"))
+
+    def query():
+        session.state = next(states)
+        return len([call for call in calls if call[0] == "yield"]) == 2
+
+    session.advance_profiler = progress
+    runner.__dict__.update(
+        _graph=SimpleNamespace(replay=lambda: calls.append(("replay",))),
+        _graph_capture_count=1,
+        _graph_replay_count=0,
+        _graph_pending=False,
+        _graph_receiver_exited=False,
+        _graph_closed=False,
+        _graph_failure=None,
+        _graph_stream=object(),
+        connector=SimpleNamespace(profile_session=session),
+    )
+    monkeypatch.setattr(
+        runtime.torch,
+        "npu",
+        SimpleNamespace(
+            stream=lambda stream: nullcontext(),
+            Event=lambda: SimpleNamespace(
+                record=lambda stream: calls.append(("record",)), query=query
+            ),
+            synchronize=lambda: calls.append(("synchronize",)),
+        ),
+    )
+    monkeypatch.setattr(runtime.os, "sched_yield", lambda: calls.append(("yield",)))
+    runner._submit_graph(2)
+    assert runner._complete_graph()
+    assert session.state == "COMPLETED"
+    assert [call for call in calls if call[0] == "profile"] == [
+        ("profile", "IDLE", True, False),
+        ("profile", "STARTING", False, True),
+        ("profile", "STOPPING", False, True),
+        ("profile", "STOPPING", True, False),
+    ]
+    assert calls[-2] == ("synchronize",)
+    assert runner._graph_replay_count == 2
+
+
 @pytest.mark.parametrize("capture_fails", [False, True])
 def test_ffn_warmup_capture_order_and_failure_propagation(modules, capture_fails):
     _, _, runtime = modules
@@ -246,6 +306,7 @@ def test_ffn_warmup_capture_order_and_failure_propagation(modules, capture_fails
         _initialize_layered_executor=lambda: None,
         _layered_executor=SimpleNamespace(graph_signature=lambda capacity: "weights"),
         connector=SimpleNamespace(
+            profile_session=None,
             is_initialized=False,
             graph_startup=startup,
             init_afd_connector=initialize_connector,

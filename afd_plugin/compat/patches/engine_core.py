@@ -16,6 +16,7 @@ busy loop itself, so no AFD async-Attention publication loop is layered on top.
 from __future__ import annotations
 
 import gc
+import os
 import queue
 import time
 from collections import deque
@@ -657,9 +658,14 @@ def _run_ffn_busy_loop(self, core_module: Any) -> None:
         core_module.logger.info(
             "AFD FFN EngineCore started; workers run connector loop."
         )
-        while _is_running(self, core_module):
-            self.model_executor.collective_rpc("raise_ffn_loop_error_if_any")
-            time.sleep(0.5)
+        # ### PATCH START: opt-in FFN profiling control
+        if os.environ.get("AFD_CAM_PROFILE_ENABLE") == "1":
+            _run_ffn_profile_control_loop(self, core_module)
+        else:
+            while _is_running(self, core_module):
+                self.model_executor.collective_rpc("raise_ffn_loop_error_if_any")
+                time.sleep(0.5)
+        # ### PATCH END: opt-in FFN profiling control
     except KeyboardInterrupt:
         core_module.logger.info(
             "AFD FFN EngineCore shutting down after KeyboardInterrupt"
@@ -672,6 +678,36 @@ def _run_ffn_busy_loop(self, core_module: Any) -> None:
             _stop_ffn_worker_loop(self)
 
     raise SystemExit
+
+
+def _run_ffn_profile_control_loop(self, core_module: Any) -> None:
+    next_health_check = time.monotonic()
+    while _is_running(self, core_module):
+        if time.monotonic() >= next_health_check:
+            self.model_executor.collective_rpc("raise_ffn_loop_error_if_any")
+            next_health_check = time.monotonic() + 0.5
+        try:
+            request_type, request = self.input_queue.get(
+                timeout=max(0.0, next_health_check - time.monotonic())
+            )
+        except queue.Empty:
+            continue
+
+        request_types = core_module.EngineCoreRequestType
+        if request_type == request_types.ADD:
+            req, _request_wave = request
+            self._send_error_outputs_to_client([req.request_id], req.client_index)
+        elif request_type == request_types.ABORT:
+            # The IO thread also enqueues aborts for the unused scheduler.
+            with self.aborts_queue.mutex:
+                self.aborts_queue.queue.clear()
+        elif request_type in (request_types.UTILITY, request_types.EXECUTOR_FAILED):
+            # Use the base dispatcher without entering DP-wave scheduling.
+            core_module.EngineCoreProc._handle_client_request(
+                self, request_type, request
+            )
+        elif request_type not in (request_types.WAKEUP, request_types.START_DP_WAVE):
+            core_module.logger.error("Unrecognized FFN request type: %s", request_type)
 
 
 def _stop_ffn_worker_loop(self) -> None:

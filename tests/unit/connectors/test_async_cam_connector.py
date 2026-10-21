@@ -83,7 +83,7 @@ class _FakeCamOps:
         return (
             _FakeTensor((batch_size, hidden_size)),
             _FakeTensor((batch_size,), dtype="fp32"),
-            _FakeTensor((5 + tp_size * (1 + expert_per_rank),), dtype="int64"),
+            _FakeTensor((5 + tp_size * (3 + expert_per_rank),), dtype="int64"),
             _FakeTensor((expert_per_rank,), dtype="int64"),
         )
 
@@ -308,6 +308,9 @@ def test_async_connector_init_creates_attention_first_hccl_group(monkeypatch):
     fake_torch = _FakeTorch()
     monkeypatch.setattr(async_cam_module, "torch", fake_torch)
     monkeypatch.setattr(
+        CAMAsyncAFDConnector, "_gather_profile_workers", lambda self: None
+    )
+    monkeypatch.setattr(
         async_cam_module,
         "ensure_cam_async_ops_available",
         lambda: None,
@@ -367,6 +370,9 @@ def test_async_connector_init_uses_one_hccl_group_for_all_dp(monkeypatch):
     calls = []
     fake_torch = _FakeTorch()
     monkeypatch.setattr(async_cam_module, "torch", fake_torch)
+    monkeypatch.setattr(
+        CAMAsyncAFDConnector, "_gather_profile_workers", lambda self: None
+    )
     monkeypatch.setattr(
         async_cam_module,
         "ensure_cam_async_ops_available",
@@ -610,7 +616,8 @@ def test_async_combine_send_requires_dispatch_recv_token_metadata(monkeypatch):
         connector.send_ffn_output(_FakeTensor((4, 16)), context)
 
 
-def test_async_ffn_work_item_uses_cam_layer_and_token_metadata(monkeypatch):
+@pytest.mark.parametrize("profiling", [False, True])
+def test_async_ffn_work_item_uses_cam_layer_and_token_metadata(monkeypatch, profiling):
     connector = CAMAsyncAFDConnector(
         0,
         0,
@@ -619,6 +626,16 @@ def test_async_ffn_work_item_uses_cam_layer_and_token_metadata(monkeypatch):
         0,
     )
     connector.ffn_size = 2
+    controls = []
+
+    def read_ffn_control(control):
+        controls.append(control.tolist())
+        return controls[-1]
+
+    if profiling:
+        connector.profile_session = SimpleNamespace(
+            device_waiter=SimpleNamespace(read_ffn_control=read_ffn_control)
+        )
 
     def fake_recv_attn_output(*, stage_idx, layer_idx, batch_size, ubatch_idx):
         assert ubatch_idx == 0
@@ -659,6 +676,7 @@ def test_async_ffn_work_item_uses_cam_layer_and_token_metadata(monkeypatch):
     assert work_item.context.metadata.layer_idx == 11
     assert work_item.context.metadata.seq_lens == [5]
     assert states.dynamic_scales == "scales[:5]"
+    assert controls == ([[7, 11, 5]] if profiling else [])
 
 
 def test_async_ffn_work_item_uses_expert_counts_for_routed_tokens(monkeypatch):
@@ -995,9 +1013,14 @@ def test_async_select_experts_rejects_mix_placement(router):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_async_receive_anchor_uses_model_dtype(monkeypatch, dtype):
+@pytest.mark.parametrize("profiling", [False, True])
+def test_async_receive_anchor_uses_model_dtype(monkeypatch, dtype, profiling):
+    monkeypatch.setenv("AFD_CAM_PROFILE_ENABLE", "1" if profiling else "0")
     fake_torch = _FakeTorch()
     monkeypatch.setattr(async_cam_module, "torch", fake_torch)
+    monkeypatch.setattr(
+        CAMAsyncAFDConnector, "_gather_profile_workers", lambda self: None
+    )
     monkeypatch.setattr(
         async_cam_module, "ensure_cam_async_ops_available", lambda: None
     )
@@ -1016,6 +1039,52 @@ def test_async_receive_anchor_uses_model_dtype(monkeypatch, dtype):
     connector.graph_startup.mode = "eager"
     connector.init_afd_connector()
     assert connector._placeholder.dtype == dtype
+
+
+def _mock_profile_workers(monkeypatch, enabled, *, peer_flag=None):
+    connector = CAMAsyncAFDConnector(
+        0, 0, _vllm_config(), _afd_config(role="attention"), 0
+    )
+    connector.profile_enabled = enabled
+    connector.comm_args = torch.empty(1, device="cpu")
+    connector.cam_pg = object()
+    peers = [f"{rank + 1:032x}" for rank in range(connector.topology.world_size)]
+    peers[connector.world_rank] = connector.profile_worker_id
+
+    def all_gather(outputs, local, *, group):
+        assert group is connector.cam_pg
+        assert local.tolist() == [
+            int(enabled),
+            *connector.profile_worker_id.encode("ascii"),
+        ]
+        assert len(outputs) == connector.topology.world_size
+        for rank, (output, worker_id) in enumerate(zip(outputs, peers, strict=True)):
+            flag = int(enabled)
+            if rank == len(peers) - 1 and peer_flag is not None:
+                flag = peer_flag
+            output.copy_(torch.tensor([flag, *worker_id.encode("ascii")]))
+
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
+    return connector, peers
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_profile_maps_rank_uids_with_only_native_operators(monkeypatch, enabled):
+    connector, peers = _mock_profile_workers(monkeypatch, enabled)
+    shared_peers = connector.profile_peers
+    connector._gather_profile_workers()
+    assert connector.profile_peers is shared_peers
+    assert shared_peers == peers
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_profile_rejects_mixed_enable_flags(monkeypatch, enabled):
+    connector, _ = _mock_profile_workers(
+        monkeypatch, enabled, peer_flag=int(not enabled)
+    )
+    with pytest.raises(ValueError, match="same profiling enable flag"):
+        connector._gather_profile_workers()
+    assert connector.profile_peers == []
 
 
 def test_async_rejects_nondivisible_expert_placement():

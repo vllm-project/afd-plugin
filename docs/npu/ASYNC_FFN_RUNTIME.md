@@ -69,6 +69,12 @@ host metadata read or cancellation protocol.
 Changing weights, layout, capacity or topology requires fresh workers. There
 is no graph cache, online weight replacement or partial-rank restart.
 
+Both runtime profiling modes support FULL replay; see
+[runtime profiling](CAM_ASYNC_CONNECTOR_USER_GUIDE.md#runtime-profiling).
+Capture bypasses eager profiling's host waits and metadata reads. Runtime
+profiler lifecycle operations stay on the FFN receive thread, with stop deferred
+until the current graph batch completes.
+
 ## Resource lifetime
 
 A host event stops further batch submissions. Graph reset and model/communicator
@@ -108,6 +114,9 @@ coverage does not qualify loading real per-group checkpoints.
   keeping other arguments identical. `--boundary` covers chunking and poisoned
   unused capacity; `--attn-ranks 2` covers different Attention sources. The test
   supplies finite work counts, compares outputs and checks captured addresses.
+  Add `--profile-mode FULL --profile-dir /path/to/full-profile` or
+  `--profile-mode LIGHTWEIGHT --profile-dir /path/to/lightweight-profile` to the
+  FULL run to validate native traces or reconstructed pipeline output.
 - Real MRV2 generation: the bounded 4A/4F fixture below. Its test observers add
   synchronization for functional evidence, so it is not a performance test.
 

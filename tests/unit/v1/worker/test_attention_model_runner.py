@@ -161,10 +161,15 @@ def test_attention_runner_installs_afd_metadata_on_forward_context():
         cudagraph_runtime_mode=CUDAGraphMode.NONE,
     )
 
-    runner.install_afd_metadata_on_forward_context(forward_context)
+    runner.install_afd_metadata_on_forward_context(
+        forward_context, profile_num_requests=2, profile_num_tokens=5
+    )
 
     assert forward_context.additional_kwargs["platform_key"] == "platform_value"
     assert forward_context.additional_kwargs["afd_metadata"].tokens_lens == [5]
+    assert forward_context.additional_kwargs["afd_metadata"].profile_batch == [
+        (0, 2, 5)
+    ]
     assert set(runner.connector.dp_metadata_updates[0]) == {0}
     assert _tokens(runner.connector.dp_metadata_updates[0][0]) == [5]
     assert set(runner.connector.sent_dp_metadata_lists[0]) == {0}
@@ -323,7 +328,8 @@ def test_attention_runner_does_not_skip_single_stage_context():
     assert _tokens(runner.connector.sent_dp_metadata_lists[0][0]) == [5]
 
 
-def test_ubatch_metadata_clones_parent_and_preserves_additional_kwargs():
+@pytest.mark.parametrize("prepared_counts", [False, True])
+def test_ubatch_metadata_clones_parent_and_preserves_additional_kwargs(prepared_counts):
     runner = object.__new__(AFDAttentionModelRunnerV2)
     runner.connector = object()
     runner._afd_transaction_counter = 0
@@ -332,6 +338,7 @@ def test_ubatch_metadata_clones_parent_and_preserves_additional_kwargs():
         8,
     )
     parent.tokens_unpadded_lens = [3, 4]
+    parent.profile_batch = [(0, 1, 3), (1, 1, 4)] if prepared_counts else [(0, 2, 7)]
 
     first = build_ubatch_afd_metadata(
         parent, [_UbatchSlice(0, 3, 0, 1), _UbatchSlice(3, 8, 1, 2)], 0
@@ -356,6 +363,10 @@ def test_ubatch_metadata_clones_parent_and_preserves_additional_kwargs():
     assert second.tokens_unpadded_lens == [4]
     assert child_kwargs["platform_key"] == "platform_value"
     assert child_kwargs["afd_metadata"] is second
+    assert first.profile_batch == [(0, 1, 3)]
+    assert second.profile_batch == [(1, 1, 4)]
+    first.profile_batch.clear()
+    assert len(parent.profile_batch) == (2 if prepared_counts else 1)
 
 
 def test_mrv2_missing_parent_metadata_uses_complete_public_installer():

@@ -45,6 +45,9 @@ Documentation = "https://github.com/vllm-project/afd-plugin#readme"
 [project.entry-points."vllm.general_plugins"]
 afd = "afd_plugin:register_afd"
 
+[project.entry-points."vllm.endpoint_plugins"]
+afd_profile = "afd_plugin.profiling.endpoint:CAMProfileEndpointPlugin"
+
 [dependency-groups]
 dev = [
     "datasets>=3.0",

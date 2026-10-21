@@ -20,7 +20,7 @@ from afd_plugin.v1.worker.npu.async_ffn_model_runner import (  # noqa: E402
 @pytest.fixture
 def session_harness(monkeypatch):
     calls = []
-    connector = SimpleNamespace()
+    connector = SimpleNamespace(profile_session=None)
 
     class FakeGraph:
         fail_launch = False

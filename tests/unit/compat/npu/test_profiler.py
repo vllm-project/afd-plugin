@@ -11,6 +11,7 @@ import pytest
 from afd_plugin.compat.npu.profiler import (
     afd_npu_profiler_config,
     create_afd_npu_profiler,
+    create_runtime_npu_profiler,
     step_afd_npu_profiler,
     stop_afd_npu_profiler,
 )
@@ -110,6 +111,7 @@ def test_create_npu_profiler_uses_configured_schedule(monkeypatch):
         "repeat": 6,
         "skip_first": 7,
     }
+    assert profiler_module.profile_kwargs is not None
     assert profiler_module.profile_kwargs["record_shapes"] is True
     assert profiler_module.profile_kwargs["with_stack"] is True
     assert profiler_module.profile_kwargs["with_modules"] is True
@@ -123,6 +125,43 @@ def test_step_npu_profiler_ignores_disabled_profiler():
     step_afd_npu_profiler(profiler)
 
     assert profiler.steps == 1
+
+
+def test_runtime_profiler_reuses_backend_options_and_handler_without_step_schedule(
+    monkeypatch,
+):
+    profiler_module = _FakeTorchNPUProfiler()
+    monkeypatch.setitem(
+        sys.modules, "torch_npu", SimpleNamespace(profiler=profiler_module)
+    )
+    monkeypatch.setenv("AFD_NPU_FFN_PROFILER_ENABLE", "1")
+    monkeypatch.setenv("AFD_NPU_FFN_PROFILER_WITH_STACK", "1")
+    monkeypatch.setenv("AFD_NPU_FFN_PROFILER_DIR", "/static-output")
+    create_afd_npu_profiler("ffn")
+    assert profiler_module.profile_kwargs is not None
+    expected = dict(profiler_module.profile_kwargs)
+    expected["schedule"] = None
+    expected["on_trace_ready"] = ("handler", "/session/worker/full")
+    monkeypatch.setenv("AFD_NPU_FFN_PROFILER_ENABLE", "0")
+    controllers = []
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu.profiler._profiler_action_controller",
+        SimpleNamespace(ProfActionController=lambda *args: controllers.append(args)),
+    )
+
+    profiler = create_runtime_npu_profiler("ffn", "/session/worker/full")
+    from afd_plugin.compat.npu.profiler import _stop_ffn_trace
+
+    assert profiler.prof_if.stop_trace.__func__ is _stop_ffn_trace
+    assert controllers == [(profiler, profiler.prof_if, profiler.on_trace_ready)]
+
+    assert profiler is profiler_module.created_profiler
+    assert profiler_module.created_profiler.started is True
+    assert profiler_module.profile_kwargs == expected
+    assert profiler_module.trace_dir == "/session/worker/full"
+    assert afd_npu_profiler_config("ffn").enabled is False
+    assert afd_npu_profiler_config("ffn").trace_dir == "/static-output"
 
 
 def test_stop_npu_profiler_ignores_disabled_profiler():
@@ -139,7 +178,9 @@ class _FakeTorchNPUProfiler:
         Text = "text"
 
     class ProfilerLevel:
+        Level0 = "level0"
         Level2 = "level2"
+        Level_none = "level_none"
 
     class AiCMetrics:
         AiCoreNone = "aicore_none"
@@ -162,10 +203,117 @@ class _FakeTorchNPUProfiler:
         self.schedule_kwargs = kwargs
         return kwargs
 
-    def tensorboard_trace_handler(self, trace_dir):
+    def tensorboard_trace_handler(self, trace_dir, **kwargs):
+        self.handler_kwargs = kwargs
         self.trace_dir = trace_dir
         return ("handler", trace_dir)
 
     def profile(self, **kwargs):
         self.profile_kwargs = kwargs
+        self.created_profiler.prof_if = SimpleNamespace()
+        self.created_profiler.on_trace_ready = kwargs["on_trace_ready"]
         return self.created_profiler
+
+
+@pytest.mark.parametrize("valid,flops", [(False, False), (True, False), (True, True)])
+def test_ffn_stop_preserves_native_cleanup_without_synchronizing(
+    monkeypatch, valid, flops
+):
+    from afd_plugin.compat.npu.profiler import _stop_ffn_trace
+
+    calls = []
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu.profiler.profiler_interface",
+        SimpleNamespace(
+            FlopsHookManager=SimpleNamespace(uninstall=lambda: calls.append("flops")),
+            _stop_profiler=lambda: calls.append("native"),
+            _disable_event_record=lambda: calls.append("events"),
+        ),
+    )
+    interface = SimpleNamespace(
+        _is_env_valid=valid,
+        with_flops=flops,
+        experimental_config=SimpleNamespace(tx_enabled=True),
+        stop_gc_detect=lambda: calls.append("gc"),
+    )
+    _stop_ffn_trace(interface)
+    expected = (["flops"] if flops else []) + ["native", "gc", "events"]
+    assert calls == (expected if valid else [])
+
+
+def test_lightweight_collects_only_layer_ranges_without_inline_analysis(monkeypatch):
+    profiler_module = _FakeTorchNPUProfiler()
+    monkeypatch.setitem(
+        sys.modules, "torch_npu", SimpleNamespace(profiler=profiler_module)
+    )
+    monkeypatch.setenv("AFD_NPU_ATTENTION_PROFILER_WITH_STACK", "1")
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu.profiler._profiler_action_controller",
+        SimpleNamespace(ProfActionController=lambda *args: None),
+    )
+    disabled = []
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu.profiler.profiler_interface",
+        SimpleNamespace(
+            _disable_event_record=lambda: disabled.append(
+                profiler_module.created_profiler.started
+            )
+        ),
+    )
+    create_runtime_npu_profiler(
+        "attention", "/session/worker/lightweight", lightweight=True
+    )
+    assert disabled == [True]
+    config = profiler_module.profile_kwargs
+    assert config is not None
+    assert config["activities"] == ["npu"]
+    for field in (
+        "record_shapes",
+        "profile_memory",
+        "with_flops",
+        "with_stack",
+        "with_modules",
+    ):
+        assert config[field] is False
+    assert config["schedule"] is None
+    experimental = config["experimental_config"]
+    assert isinstance(experimental, dict)
+    assert experimental["profiler_level"] == "level_none"
+    assert experimental["aic_metrics"] == "aicore_none"
+    assert profiler_module.handler_kwargs == {"analyse_flag": False}
+    assert experimental["mstx"] is True
+    assert experimental["mstx_domain_include"] == ["afd.cam"]
+
+
+@pytest.mark.parametrize("lightweight", [False, True])
+def test_graph_profiling_uses_native_kernel_collection(monkeypatch, lightweight):
+    profiler_module = _FakeTorchNPUProfiler()
+    monkeypatch.setitem(
+        sys.modules, "torch_npu", SimpleNamespace(profiler=profiler_module)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu.profiler._profiler_action_controller",
+        SimpleNamespace(ProfActionController=lambda *args: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu.profiler.profiler_interface",
+        SimpleNamespace(_disable_event_record=lambda: None),
+    )
+    create_runtime_npu_profiler(
+        "ffn", "/session/worker/graph", lightweight=lightweight, graph=True
+    )
+    config = profiler_module.profile_kwargs
+    assert config is not None
+    assert config["schedule"] is None
+    assert config["activities"] == (["npu"] if lightweight else ["cpu", "npu"])
+    assert config["record_shapes"] is not lightweight
+    experimental = config["experimental_config"]
+    assert isinstance(experimental, dict)
+    assert experimental["profiler_level"] == ("level0" if lightweight else "level2")
+    assert experimental["mstx"] is False
+    assert experimental["mstx_domain_include"] == []

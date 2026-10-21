@@ -18,7 +18,9 @@ import os
 import socket
 import threading
 import time
+import uuid
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -30,12 +32,17 @@ from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
 from afd_plugin.model_executor.npu.async_cam_w4a8 import W4A8LayerWeights
+from afd_plugin.profiling.analyze import export_chrome_trace, read_jsonl
+from afd_plugin.profiling.worker import CAMProfileWorkerMixin
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 
 HIDDEN = 256
 EXPERTS = 4
 LAYERS = (2, 5)
 LIMIT = 10.0
+PROFILE_TIMEOUT_SECONDS = 30
+PROFILE_START_DELAY_NS = 100_000_000
+PROFILE_POLL_SECONDS = 0.001
 
 
 class SyntheticModel(torch.nn.Module):
@@ -92,13 +99,20 @@ def main():
     parser.add_argument("--boundary", action="store_true")
     parser.add_argument("--save-outputs")
     parser.add_argument("--reference-outputs")
+    parser.add_argument("--profile-mode", choices=("FULL", "LIGHTWEIGHT"))
+    parser.add_argument("--profile-dir", type=Path)
     args = parser.parse_args()
     if args.full_graph and not args.reference_outputs:
         parser.error("FULL replay requires saved matching eager outputs")
+    if args.profile_mode and (not args.full_graph or args.profile_dir is None):
+        parser.error("--profile-mode requires --full-graph and --profile-dir")
     faulthandler.dump_traceback_later(60)
     os.environ["AFD_ASYNC_CAM_LAYERED_GMM"] = "1"
     os.environ["BATCH_SIZE_FACTOR"] = str(16 / 262144)
     os.environ["HCCL_BUFFSIZE"] = "64"
+    if args.profile_mode:
+        os.environ["AFD_CAM_PROFILE_ENABLE"] = "1"
+        os.environ["AFD_CAM_PROFILE_DIR"] = str(args.profile_dir)
     ensure_cam_async_ops_available()
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -180,6 +194,11 @@ def main():
     if is_ffn:
         runner = AsyncNPUFFNModelRunner(config, device, connector)
         runner.model = SyntheticModel(device, not args.per_group)
+        worker = None
+        if args.profile_mode:
+            worker = CAMProfileWorkerMixin()
+            worker.device, worker.model_runner = device, runner
+            worker.initialize_cam_profiling()
         print(json.dumps({"rank": rank, "stage": "weights_ready"}), flush=True)
         runner.initialize_afd_connector()
         assert runner._layered_executor is not None
@@ -313,6 +332,37 @@ def main():
                     for _ in expected:
                         runner._ffn_forward_connector_driven(single=True)
                 return
+            if worker is not None:
+                session_id = str(uuid.uuid4())
+                prepared = worker.cam_profile_prepare(
+                    {
+                        "session_id": session_id,
+                        "command_seq": 1,
+                        "mode": args.profile_mode,
+                        "duration_s": PROFILE_TIMEOUT_SECONDS,
+                    }
+                )
+                assert prepared["error"] is None, prepared
+                start_at = time.time_ns() + PROFILE_START_DELAY_NS
+                committed = worker.cam_profile_commit(
+                    {
+                        "session_id": session_id,
+                        "command_seq": 2,
+                        "start_at_ns": start_at,
+                        "clock_by_worker": {
+                            connector.profile_worker_id: {
+                                "offset_ns": 0,
+                                "uncertainty_ns": 0,
+                            }
+                        },
+                    }
+                )
+                assert committed["error"] is None, committed
+                while time.time_ns() < start_at:
+                    time.sleep(PROFILE_POLL_SECONDS)
+                profile_session = worker.cam_profile_session
+                assert profile_session is not None
+                profile_session.tick()
             connector.graph_startup.service_ready()
             for start in range(0, len(expected), len(LAYERS)):
                 batch_index = 0
@@ -344,6 +394,52 @@ def main():
                         session._graph_payload.hidden_states.fill_(113)
                         session._graph_payload.context.states.dynamic_scales.fill_(3)
                         session._graph_output.fill_(123)
+            if worker is not None:
+                stopped = worker.cam_profile_stop(
+                    {"session_id": session_id, "command_seq": 3}
+                )
+                assert stopped["error"] is None, stopped
+                profile_session = worker.cam_profile_session
+                assert profile_session is not None
+                profile_session.advance_profiler()
+                deadline = time.monotonic() + PROFILE_TIMEOUT_SECONDS
+                while profile_session.state not in {"COMPLETED", "FAILED"}:
+                    assert time.monotonic() < deadline, profile_session.status()
+                    profile_session.tick()
+                    time.sleep(PROFILE_POLL_SECONDS)
+                assert profile_session.state == "COMPLETED", profile_session.status()
+                capture = profile_session.capture
+                assert capture is not None and capture.profiler is not None
+                owner = capture.profiler
+                if args.profile_mode == "LIGHTWEIGHT":
+                    while owner.snapshot()["archive_state"] not in {
+                        "COMPLETED",
+                        "FAILED",
+                    }:
+                        assert time.monotonic() < deadline, owner.snapshot()
+                        time.sleep(0.01)
+                    path = (
+                        args.profile_dir
+                        / session_id
+                        / f"{connector.profile_worker_id}.jsonl"
+                    )
+                    trace = export_chrome_trace(read_jsonl([path], analyse_native=True))
+                    assert trace["data_quality"] == "COMPLETE", trace["errors"]
+                    assert {event["name"] for event in trace["traceEvents"]} >= {
+                        "COMPUTE",
+                        "COMMUNICATION",
+                        "WAIT",
+                    }
+                    output = args.profile_dir / f"pipeline-rank{rank}.json"
+                    output.write_text(json.dumps(trace))
+                else:
+                    assert list(owner.trace_dir.rglob("trace_view.json")), (
+                        owner.snapshot()
+                    )
+                report["profiling"] = {
+                    "mode": args.profile_mode,
+                    "state": profile_session.state,
+                }
             runner._graph_receiver_exited = True
         except Exception as exc:
             errors.append(exc)

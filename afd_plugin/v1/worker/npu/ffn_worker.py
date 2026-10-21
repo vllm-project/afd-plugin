@@ -28,6 +28,8 @@ from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
+from afd_plugin.profiling import runtime_profiling_enabled
+from afd_plugin.profiling.worker import CAMProfileWorkerMixin
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
 from afd_plugin.validation import (
@@ -64,7 +66,7 @@ def create_npu_ffn_model_runner(
     return AFDNPUFFNModelRunner(vllm_config, device)
 
 
-class AFDNPUFFNWorker(NPUWorker):
+class AFDNPUFFNWorker(CAMProfileWorkerMixin, NPUWorker):
     """FFN worker that owns a connector-driven NPU daemon loop."""
 
     afd_expected_role = "ffn"
@@ -102,6 +104,8 @@ class AFDNPUFFNWorker(NPUWorker):
             device_type="npu",
         )
         self.model_runner = create_npu_ffn_model_runner(self.vllm_config, self.device)
+        if runtime_profiling_enabled():
+            self.initialize_cam_profiling()
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}

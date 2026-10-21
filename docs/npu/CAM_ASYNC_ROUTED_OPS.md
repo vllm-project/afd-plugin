@@ -110,7 +110,7 @@ expert count per MoE rank, and `T` the Attention TP size.
   `float32[B, K]`. Routing values themselves must satisfy the protocol;
   shape checks do not validate every device-side expert ID.
 - `comm_id` is a retained reserved argument and is not used to select
-  communication resources. `comm_args` remains a float16 tensor placeholder;
+  communication resources. `comm_args` is a one-element float16 placeholder;
   the kernels obtain communication windows through the HCCL context selected
   by `group_name`.
 - All participating ranks must use the same protocol, topology, quantization,

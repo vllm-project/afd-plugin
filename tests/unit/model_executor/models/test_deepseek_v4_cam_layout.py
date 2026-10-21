@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -28,7 +29,12 @@ def _make_proxy(monkeypatch, *, use_sequence_parallel: bool, in_profile_run: boo
     monkeypatch.setattr(
         adapter,
         "get_afd_metadata_from_forward_context",
-        lambda: SimpleNamespace(connector=connector, stage_idx=0),
+        lambda: SimpleNamespace(
+            connector=connector,
+            stage_idx=0,
+            profile_pipeline=None,
+            profile_batch=[(0, 3, 15)],
+        ),
     )
     monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", lambda states, **kw: states)
     topk_weights = torch.arange(32, dtype=torch.float32).reshape(16, 2)
@@ -48,7 +54,8 @@ def _make_proxy(monkeypatch, *, use_sequence_parallel: bool, in_profile_run: boo
     return proxy, topk_weights, topk_ids
 
 
-def test_dsv4_profile_gate_shards_plain_tp8_and_restores(monkeypatch):
+@pytest.mark.parametrize("profiling", [False, True])
+def test_dsv4_profile_gate_shards_plain_tp8_and_restores(monkeypatch, profiling):
     proxy, topk_weights, topk_ids = _make_proxy(
         monkeypatch,
         use_sequence_parallel=False,
@@ -64,10 +71,18 @@ def test_dsv4_profile_gate_shards_plain_tp8_and_restores(monkeypatch):
         lambda _tensor, token_dim: gathered_output,
     )
     sends = []
+    execution = SimpleNamespace(
+        tracer=SimpleNamespace(transition=Mock(), release_execution=Mock())
+    )
+    monkeypatch.setattr(
+        adapter, "begin_profile_call", lambda _: execution if profiling else None
+    )
 
     def send(_connector, local_hidden_states, context, **kwargs):
         assert context.metadata.layer_idx == proxy.layer_idx
         assert context.metadata.stage_idx == 0
+        # Counts describe the unpadded batch, not this rank's two-token shard.
+        assert context.profile_annotation == ("0|3|3|15" if profiling else "")
         sends.append((local_hidden_states, kwargs))
         return lambda: local_hidden_states + 100
 

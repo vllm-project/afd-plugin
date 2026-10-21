@@ -16,6 +16,7 @@ from afd_plugin.connectors import (
     AFDDPMetadata,
     AFDForwardContextMetadata,
 )
+from afd_plugin.profiling.model import set_attention_profile_batch
 
 
 class AFDMetadataProviderMixin:
@@ -120,6 +121,7 @@ class AFDMetadataProviderMixin:
         ubatch_slices: UBatchSlices,
         forward_contexts: list[ForwardContext],
         num_tokens_unpadded: int,
+        profile_num_requests: int | None = None,
     ) -> None:
         """Attach isolated AFD sidecars to native MRV2's prepared stages.
 
@@ -131,6 +133,10 @@ class AFDMetadataProviderMixin:
         """
         assert len(ubatch_slices) == len(forward_contexts)
         metadata = self.build_afd_metadata(ubatch_slices, num_tokens_unpadded)
+        if profile_num_requests is not None:
+            set_attention_profile_batch(
+                metadata, profile_num_requests, num_tokens_unpadded, ubatch_slices
+            )
         metadata.tokens_unpadded_lens = [
             max(0, min(ub.token_slice.stop, num_tokens_unpadded) - ub.token_slice.start)
             for ub in ubatch_slices
@@ -142,6 +148,8 @@ class AFDMetadataProviderMixin:
             stage.requests_start_loc = [metadata.requests_start_loc[stage_idx]]
             stage.tokens_lens = [metadata.tokens_lens[stage_idx]]
             stage.tokens_unpadded_lens = [metadata.tokens_unpadded_lens[stage_idx]]
+            if metadata.profile_batch:
+                stage.profile_batch = [metadata.profile_batch[stage_idx]]
             context.additional_kwargs = dict(context.additional_kwargs or {})
             context.additional_kwargs["afd_metadata"] = stage
         self._afd_pending_metadata = metadata
@@ -211,6 +219,9 @@ class AFDMetadataProviderMixin:
     def install_afd_metadata_on_forward_context(
         self,
         forward_context: ForwardContext,
+        *,
+        profile_num_requests: int | None = None,
+        profile_num_tokens: int = 0,
     ) -> None:
         """Install transaction metadata and publish control for synchronous connectors.
 
@@ -245,6 +256,13 @@ class AFDMetadataProviderMixin:
             forward_context.additional_kwargs["afd_metadata"] = (
                 self._afd_pending_metadata
             )
+            if profile_num_requests is not None:
+                set_attention_profile_batch(
+                    self._afd_pending_metadata,
+                    profile_num_requests,
+                    profile_num_tokens,
+                    forward_context.ubatch_slices,
+                )
         if self.connector.control_plane is None:
             return
         if getattr(self, "_afd_suppress_metadata_send", False):

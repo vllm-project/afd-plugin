@@ -1253,7 +1253,10 @@ def test_npu_ffn_worker_preserves_live_thread_after_shutdown_timeout(monkeypatch
     ]
 
 
-def test_npu_ffn_worker_uses_connector_driven_loop_for_async_connector(monkeypatch):
+@pytest.mark.parametrize("profiling", [False, True])
+def test_npu_ffn_worker_uses_connector_driven_loop_for_async_connector(
+    monkeypatch, profiling
+):
     worker = _new_ffn_worker()
     from afd_plugin.v1.worker.npu import ffn_worker
 
@@ -1271,6 +1274,13 @@ def test_npu_ffn_worker_uses_connector_driven_loop_for_async_connector(monkeypat
     worker.model_runner.connector = _AsyncRecordingConnector()
     worker.model_runner.effective_mode = "eager"
     worker.model_runner.execute_connector_driven_step = execute_connector_driven_step
+    worker.cam_profile_session = (
+        SimpleNamespace(
+            device_waiter=SimpleNamespace(wait_for_stream=lambda: calls.append("wait"))
+        )
+        if profiling
+        else None
+    )
 
     monkeypatch.setattr(
         ffn_worker.torch.npu,
@@ -1282,7 +1292,11 @@ def test_npu_ffn_worker_uses_connector_driven_loop_for_async_connector(monkeypat
     )
     worker._run_ffn_server_loop()
 
-    assert calls == [("bind", worker.device), "step", "sync"]
+    assert calls == [
+        ("bind", worker.device),
+        "step",
+        "sync",
+    ]
 
 
 @pytest.mark.parametrize(

@@ -43,6 +43,13 @@ from afd_plugin.model_executor.models.npu.async_cam_layout import (
 from afd_plugin.model_executor.models.npu.deepseek_v4_shared_experts import (
     AFDDeepseekV4SharedExperts,
 )
+from afd_plugin.profiling import runtime_profiling_enabled
+from afd_plugin.profiling.model import (
+    attention_profile_annotation,
+    begin_profile_call,
+    install_pipeline_hook,
+    transition,
+)
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 try:
@@ -259,6 +266,11 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         """Select DSV4 experts on Attention and exchange routed work via CAM."""
         from afd_plugin.model_executor.models.npu import deepseek_v4_attention_gate
 
+        afd_metadata = get_afd_metadata_from_forward_context()
+        if afd_metadata is None:
+            raise RuntimeError("Async CAM requires AFD forward metadata")
+        execution = begin_profile_call(afd_metadata)
+        transition(execution, "COMPUTE")
         topk_weights, topk_ids = deepseek_v4_attention_gate.compute_attention_gate_topk(
             self,
             hidden_states,
@@ -272,15 +284,18 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
             None,
             use_sequence_parallel=self.use_sequence_parallel_moe,
         )
-        afd_metadata = get_afd_metadata_from_forward_context()
-        if afd_metadata is None:
-            raise RuntimeError("Async CAM requires AFD forward metadata")
         context = AFDTransferContext(
             metadata=AFDTransferMetadata.create_attention_metadata(
                 layer_idx=self.layer_idx,
                 stage_idx=afd_metadata.stage_idx,
                 seq_len=int(dispatch_payload.hidden_states.shape[0]),
+            ),
+            profile=execution,
+            profile_annotation=attention_profile_annotation(
+                afd_metadata, self.layer_idx
             )
+            if execution is not None
+            else "",
         )
         receive = send_async_cam_remote_call(
             afd_metadata.connector,
@@ -289,16 +304,19 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
             topk_weights=dispatch_payload.topk_weights,
             topk_ids=dispatch_payload.topk_ids,
         )
-        shared_output = (
-            self.shared_experts(hidden_states)
-            if self.shared_experts is not None
-            else None
-        )
+        shared_output = None
+        if self.shared_experts is not None:
+            transition(execution, "COMPUTE")
+            shared_output = self.shared_experts(hidden_states)
+        transition(execution, "WAIT")
         maybe_apply_dbo_yield(hidden_states, role="attention")
         output = receive()
+        transition(execution, "COMPUTE")
         output = restore_cam_dispatch_output(output, dispatch_payload.layout)
         if shared_output is not None:
             output = output + shared_output
+        if execution is not None:
+            execution.tracer.release_execution(execution)
         return output
 
 
@@ -402,7 +420,6 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             raise ValueError(f"Unsupported AFD role: {afd_config.role!r}")
 
         # ### PATCH END: role-local Attention and remote experts
-
         self.input_layernorm = native.RMSNorm(config.hidden_size, eps=self.norm_eps)
         self.post_attention_layernorm = native.RMSNorm(
             config.hidden_size, eps=self.norm_eps
@@ -599,12 +616,15 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         self._mtp_buffer_dtype = vllm_config.model_config.dtype
         self._mtp_hidden_buffer: torch.Tensor | None = None
 
-        # ### PATCH START: AFD model introspection
+        # ### PATCH START: AFD model introspection and profiling
+        if runtime_profiling_enabled() and afd_config.role == _ATTENTION_ROLE:
+            install_pipeline_hook(self, get_afd_metadata_from_forward_context)
+
         self.aux_hidden_state_layers: tuple[int, ...] = ()
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
-        # ### PATCH END: AFD model introspection
+        # ### PATCH END: AFD model introspection and profiling
 
     def compute_ffn_output(
         self,

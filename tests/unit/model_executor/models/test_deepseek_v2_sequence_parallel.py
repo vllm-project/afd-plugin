@@ -63,6 +63,7 @@ def test_decoder_first_and_later_moe_own_collectives(monkeypatch, num_tokens, tp
     )
     monkeypatch.setattr(adapter.native, "sequence_parallel_chunk", chunk)
     layer = SimpleNamespace(
+        cam_profile_enabled=False,
         use_sequence_parallel_moe=True,
         input_layernorm=norm,
         post_attention_layernorm=norm,
@@ -164,6 +165,7 @@ def test_single_stage_gathers_once_at_dense_or_output_boundary(monkeypatch, dens
         torch.arange(1),
         SimpleNamespace(
             stage_idx=0,
+            profile_pipeline=None,
             connector=SimpleNamespace(
                 send_attn_output=lambda *args, **kwargs: None,
                 recv_ffn_output=lambda ref_tensor, ubatch_idx, context=None: ref_tensor,

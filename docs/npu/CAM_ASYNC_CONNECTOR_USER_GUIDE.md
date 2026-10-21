@@ -312,6 +312,12 @@ actual vendor library path. Missing source operators fail startup.
 For startup, HCCL, CAM operator, and shutdown failures, see the
 [NPU troubleshooting guide](TROUBLESHOOTING.md).
 
+## Runtime profiling
+
+See [CAM runtime profiling design and usage](CAM_PROFILING.md) for module
+relationships, session lifecycle and thread ownership, FULL/LIGHTWEIGHT behavior,
+and a complete configuration, start/status/stop and trace-export example.
+
 ## W4A8 layered GMM (experimental, disabled by default)
 
 Set `AFD_ASYNC_CAM_LAYERED_GMM=1` on every FFN rank to use the two layered GMM

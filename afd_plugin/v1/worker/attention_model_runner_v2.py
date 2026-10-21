@@ -40,6 +40,7 @@ from afd_plugin.connectors import (
     AFDForwardContextMetadata,
 )
 from afd_plugin.model_executor.models.forward_context import use_afd_metadata_provider
+from afd_plugin.profiling import runtime_profiling_enabled
 from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
     _resolve_world_ranks,
@@ -151,7 +152,12 @@ def _use_afd_ubatch_preparation(
         else:
             runner._afd_is_graph_replaying = cg_mode == CUDAGraphMode.FULL
         runner.install_mrv2_ubatch_metadata(
-            prepared.slices, prepared.forward_contexts, input_batch.num_tokens
+            prepared.slices,
+            prepared.forward_contexts,
+            input_batch.num_tokens,
+            profile_num_requests=input_batch.num_reqs
+            if runtime_profiling_enabled() and not for_capture
+            else None,
         )
         if runner.connector.control_plane is not None:
             runner.send_dp_metadata(None, prepared.slices)
@@ -434,13 +440,20 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     def install_afd_metadata_on_forward_context(
         self,
         forward_context: ForwardContext,
+        *,
+        profile_num_requests: int | None = None,
+        profile_num_tokens: int = 0,
     ) -> None:
         if (
             forward_context.batch_descriptor is None
             and forward_context.attn_metadata is None
         ):
             return
-        super().install_afd_metadata_on_forward_context(forward_context)
+        super().install_afd_metadata_on_forward_context(
+            forward_context,
+            profile_num_requests=profile_num_requests,
+            profile_num_tokens=profile_num_tokens,
+        )
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:

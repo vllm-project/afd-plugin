@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
@@ -67,6 +68,8 @@ from afd_plugin.distributed import (
     create_hccl_process_group_options,
     init_afd_process_group,
 )
+from afd_plugin.profiling import runtime_profiling_enabled
+from afd_plugin.profiling.model import transition
 from afd_plugin.validation import cam_receive_capacity, validate_graph_capacity
 
 if TYPE_CHECKING:
@@ -74,6 +77,9 @@ if TYPE_CHECKING:
     from torch.distributed.distributed_c10d import ProcessGroup
     from vllm.config import VllmConfig
     from vllm.model_executor.layers.fused_moe import FusedMoERouter
+
+    from afd_plugin.profiling.session import WorkerSession
+    from afd_plugin.profiling.tracing import Execution
 
 AFD_ASYNC_CAM_GROUP_NAME = "afd_async_cam"
 CAM_COMM_ID = 0
@@ -241,6 +247,7 @@ class AFDAsyncTransferState(AFDTransferState):
     group_list: Tensor | None = None
     dynamic_scales: Tensor | None = None
     send_completion: Tensor | None = None
+    host_control: list[int] | None = None
 
 
 @dataclass(slots=True)
@@ -294,6 +301,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         return AFDAsyncExtraInfo.from_mapping(raw)
 
     layered_gmm_enabled: bool = False
+    profile_enabled: bool = False
+    profile_session: WorkerSession | None = None
 
     def __init__(
         self,
@@ -312,6 +321,9 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         """
         super().__init__(rank, local_rank, vllm_config, afd_config, role_rank)
         self._initialized = False
+        self.profile_enabled = runtime_profiling_enabled()
+        self.profile_worker_id = uuid.uuid4().hex
+        self.profile_peers: list[str] = []
         hf_config = vllm_config.model_config.hf_config
         self.hidden_size = hf_config.hidden_size
         self.activation_dtype = vllm_config.model_config.dtype
@@ -377,12 +389,13 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         backend = self.cam_pg._get_backend(torch.device("npu"))
         self.group_name = str(backend.get_hccl_comm_name(self.world_rank))
         device = f"npu:{self.local_rank}"
-        self.comm_args = torch.empty((1,), dtype=torch.float16, device=device)
+        self.comm_args = torch.zeros((1,), dtype=torch.float16, device=device)
         self._placeholder = torch.empty(
             (1,),
             dtype=self.activation_dtype,
             device=device,
         )
+        self._gather_profile_workers()
         self._initialized = True
         if self.graph_startup.mode == "full" and self.world_rank < self.attn_size:
             self._run_attention_graph_startup()
@@ -460,6 +473,32 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             self.graph_startup.fail(exc)
             raise
 
+    def _gather_profile_workers(self) -> None:
+        import torch.distributed as dist
+
+        assert self.comm_args is not None
+        # All ranks participate so mixed enable flags fail before inference.
+        local = torch.tensor(
+            [int(self.profile_enabled), *self.profile_worker_id.encode("ascii")],
+            dtype=torch.int64,
+            device=self.comm_args.device,
+        )
+        gathered = [torch.empty_like(local) for _ in range(self.topology.world_size)]
+        dist.all_gather(gathered, local, group=self.cam_pg)
+        values = torch.stack(gathered).cpu().tolist()
+        if any(row[0] != int(self.profile_enabled) for row in values):
+            raise ValueError("all CAM ranks must use the same profiling enable flag")
+        self.profile_peers[:] = [bytes(row[1:]).decode("ascii") for row in values]
+
+    def begin_profile_call(self) -> Execution | None:
+        session = self.profile_session
+        if not self.profile_enabled or session is None or session.tracer is None:
+            return None
+        execution = session.tracer.execution()
+        if execution is not None and not execution.tracer.retain_execution(execution):
+            return None
+        return execution
+
     def close(self) -> None:
         """Destroy the HCCL process group and clear pending transfer states."""
         if self.cam_pg is not None:
@@ -506,14 +545,22 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         assert expert_token_nums is not None
         # Preserve the full compact metadata for combine-send. Its total is
         # rank-wide, while counts describe only this receive chunk.
-        control = torch.stack(
-            (
-                token_nums_rankid_layeridx[0],
-                token_nums_rankid_layeridx[2],
-                expert_token_nums.sum(dtype=torch.int64),
+        if states.host_control is None:
+            control = torch.stack(
+                (
+                    token_nums_rankid_layeridx[0],
+                    token_nums_rankid_layeridx[2],
+                    expert_token_nums.sum(dtype=torch.int64),
+                )
             )
-        )
-        total_num_tokens, layer_idx, num_tokens = control.cpu().tolist()
+            if self.profile_session is None:
+                states.host_control = control.cpu().tolist()
+            else:
+                assert self.profile_session.device_waiter is not None
+                states.host_control = (
+                    self.profile_session.device_waiter.read_ffn_control(control)
+                )
+        total_num_tokens, layer_idx, num_tokens = states.host_control
         if not 0 <= num_tokens <= recv_output.hidden_states.shape[0]:
             raise RuntimeError(
                 "AFD async CAM routed chunk count is outside dispatch-recv capacity"
@@ -618,6 +665,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
                 f"hidden_states shape {hidden_states.shape!r} does not match "
                 f"AFD async metadata token count {metadata.total_tokens}",
             )
+        if self.profile_enabled and context.profile is None:
+            context.profile = self.begin_profile_call()
         states = AFDAsyncTransferState(
             batch_size=metadata.total_tokens,
             hidden_size=self.hidden_size,
@@ -666,6 +715,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dynamic_quant=self.dynamic_quant,
             group_name=self.group_name,
         )
+        transition(context.profile, "COMMUNICATION", context.profile_annotation)
         torch.ops.afd_ascend.afd_async_dispatch_send(
             hidden_states,
             topk_ids,
@@ -756,6 +806,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             world_size=self.topology.world_size,
             group_name=self.group_name,
         )
+        transition(context.profile, "WAIT")
         output = torch.ops.afd_ascend.afd_async_combine_recv(
             placeholder,
             topk_ids,
@@ -819,6 +870,14 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dynamic_quant=self.dynamic_quant,
             group_name=self.group_name,
         )
+        # Captured DR must not execute the eager host wait or copy device metadata.
+        session = self.profile_session if self.graph_startup.mode != "full" else None
+        waiter = session.device_waiter if session is not None else None
+        if waiter is not None:
+            waiter.begin_receive()
+        tracer = session.tracer if session is not None else None
+        execution = tracer.new_work() if tracer is not None else None
+        transition(execution, "WAIT")
         outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(
             placeholder,
             self.comm_args,
@@ -836,6 +895,28 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             self.group_name,
         )
         hidden_states, dynamic_scales, batch_info, expert_token_nums = outputs
+        if waiter is not None:
+            assert session is not None
+            if self.layered_gmm_enabled and (
+                session.capture is None or session.capture.mode != "FULL"
+            ):
+                # Layer selection stays on device; keep only lifecycle fences.
+                waiter.wait_for_stream()
+                session.advance_profiler()
+            else:
+                control = torch.stack(
+                    (
+                        batch_info[0],
+                        batch_info[2],
+                        expert_token_nums.sum(dtype=torch.int64),
+                    )
+                )
+                states.host_control = waiter.read_ffn_control(control)[:3]
+            if tracer is not None:
+                # A receive already pending at capture start has no begin marker.
+                execution = execution or tracer.new_work()
+                if execution is not None and tracer.retain_execution(execution):
+                    context.profile = execution
         _log_cam_op_values(
             "async_dispatch_recv",
             "outputs",
@@ -893,6 +974,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             tp_size=self.tp_size,
             group_name=self.group_name,
         )
+        transition(context.profile, "COMMUNICATION")
         states.send_completion = torch.ops.afd_ascend.afd_async_combine_send(
             ffn_output,
             self.comm_args,
@@ -909,6 +991,9 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             self.tp_size,
             self.group_name,
         )
+        if context.profile is not None:
+            context.profile.tracer.release_execution(context.profile)
+            context.profile.tracer.transition(context.profile, "WAIT")
 
     def _require_initialized(self) -> None:
         if not self._initialized:

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import queue
 import sys
 import types
 from enum import IntEnum
@@ -17,6 +18,20 @@ import pytest
 class _EngineShutdownState(IntEnum):
     RUNNING = 0
     REQUESTED = 1
+
+
+class _EngineCoreRequestType(IntEnum):
+    ADD = 0
+    ABORT = 1
+    UTILITY = 2
+    WAKEUP = 3
+    EXECUTOR_FAILED = 4
+    START_DP_WAVE = 5
+
+
+@pytest.fixture(autouse=True)
+def _disable_cam_profile_control(monkeypatch):
+    monkeypatch.delenv("AFD_CAM_PROFILE_ENABLE", raising=False)
 
 
 def _engine_core_outputs(**kwargs):
@@ -169,6 +184,7 @@ def _install_fake_vllm_core(monkeypatch: pytest.MonkeyPatch):
     core_module.EngineCoreProc = EngineCoreProc
     core_module.DPEngineCoreProc = DPEngineCoreProc
     core_module.EngineShutdownState = _EngineShutdownState
+    core_module.EngineCoreRequestType = _EngineCoreRequestType
     core_module.VLLM_VERSION = "0.30.0"
     core_module.logger = logging.getLogger("fake-vllm-core")
     core_module.logger.info_once = lambda *args, **kwargs: None
@@ -639,3 +655,141 @@ def test_engine_core_ffn_start_rpc_failure_emits_no_readiness_log(monkeypatch, c
         engine.run_busy_loop()
 
     assert "AFD FFN EngineCore started; workers run connector loop." not in caplog.text
+
+
+def _profile_control_engine(monkeypatch):
+    core_module = _install_fake_vllm_core(monkeypatch)
+    patch_module = _load_patch_module()
+    monkeypatch.setenv("AFD_CAM_PROFILE_ENABLE", "1")
+    calls = []
+
+    class Executor:
+        def __init__(self, _config):
+            pass
+
+        def collective_rpc(self, method):
+            calls.append(method)
+
+    engine = core_module.EngineCoreProc(_config("ffn"), Executor, log_stats=True)
+    engine.shutdown_state = _EngineShutdownState.RUNNING
+    engine.input_queue = queue.Queue()
+    return core_module, patch_module, engine, calls
+
+
+def test_ffn_profile_control_dispatches_idle_utility_without_scheduling(monkeypatch):
+    core, _patch, engine, calls = _profile_control_engine(monkeypatch)
+    command = (0, 1, "collective_rpc", ("cam_profile_stop", 1.0, (), None))
+    engine.input_queue.put((_EngineCoreRequestType.UTILITY, command))
+    handled = []
+
+    def dispatch(self, request_type, request):
+        handled.append((request_type, request))
+        self.shutdown_state = _EngineShutdownState.REQUESTED
+
+    monkeypatch.setattr(
+        core.EngineCoreProc, "_handle_client_request", dispatch, raising=False
+    )
+
+    with pytest.raises(SystemExit):
+        engine.run_busy_loop()
+
+    assert handled == [(_EngineCoreRequestType.UTILITY, command)]
+    assert calls == [
+        "start_ffn_server_loop",
+        "raise_ffn_loop_error_if_any",
+        "stop_ffn_server_loop",
+    ]
+
+
+def test_ffn_profile_control_rejects_add_and_ignores_dp_scheduling(monkeypatch):
+    core, _patch, engine, _calls = _profile_control_engine(monkeypatch)
+    request = SimpleNamespace(request_id="misrouted", client_index=7)
+    engine.input_queue.put((_EngineCoreRequestType.ADD, (request, 0)))
+    engine.input_queue.put((_EngineCoreRequestType.START_DP_WAVE, (1, -1)))
+    engine.input_queue.put((_EngineCoreRequestType.ABORT, [request.request_id]))
+    engine.input_queue.put((_EngineCoreRequestType.WAKEUP, None))
+    engine.input_queue.put((_EngineCoreRequestType.UTILITY, "stop-test"))
+    engine.aborts_queue.put([request.request_id])
+    rejected = []
+    engine._send_error_outputs_to_client = lambda reqs, client: rejected.append(
+        (reqs, client)
+    )
+
+    def dispatch(self, request_type, request):
+        assert request_type == _EngineCoreRequestType.UTILITY
+        assert request == "stop-test"
+        self.shutdown_state = _EngineShutdownState.REQUESTED
+
+    monkeypatch.setattr(
+        core.EngineCoreProc, "_handle_client_request", dispatch, raising=False
+    )
+
+    with pytest.raises(SystemExit):
+        engine.run_busy_loop()
+
+    assert rejected == [(["misrouted"], 7)]
+    assert engine.aborts_queue.empty()
+
+
+def test_ffn_profile_control_retains_executor_failure_shutdown(monkeypatch):
+    core, _patch, engine, calls = _profile_control_engine(monkeypatch)
+    engine.input_queue.put((_EngineCoreRequestType.EXECUTOR_FAILED, b""))
+
+    def dispatch(self, request_type, request):
+        assert request_type == _EngineCoreRequestType.EXECUTOR_FAILED
+        raise RuntimeError("Executor failed.")
+
+    monkeypatch.setattr(
+        core.EngineCoreProc, "_handle_client_request", dispatch, raising=False
+    )
+
+    with pytest.raises(RuntimeError, match="Executor failed"):
+        engine.run_busy_loop()
+
+    assert calls[-1] == "stop_ffn_server_loop"
+
+
+def test_ffn_profile_control_checks_health_during_continuous_commands(monkeypatch):
+    core, patch, engine, calls = _profile_control_engine(monkeypatch)
+    clock = [0.0]
+    monkeypatch.setattr(patch.time, "monotonic", lambda: clock[0])
+    for index in range(5):
+        engine.input_queue.put((_EngineCoreRequestType.UTILITY, index))
+    dispatched = []
+
+    def dispatch(self, request_type, request):
+        dispatched.append(request)
+        clock[0] += 0.3
+        if request == 4:
+            self.shutdown_state = _EngineShutdownState.REQUESTED
+
+    monkeypatch.setattr(
+        core.EngineCoreProc, "_handle_client_request", dispatch, raising=False
+    )
+
+    with pytest.raises(SystemExit):
+        engine.run_busy_loop()
+
+    assert dispatched == list(range(5))
+    assert calls.count("raise_ffn_loop_error_if_any") == 3
+
+
+def test_ffn_profile_control_empty_queue_uses_bounded_health_wait(monkeypatch):
+    _core, patch, engine, calls = _profile_control_engine(monkeypatch)
+    clock = [0.0]
+    monkeypatch.setattr(patch.time, "monotonic", lambda: clock[0])
+    waits = []
+
+    def get(*, timeout):
+        waits.append(timeout)
+        clock[0] += timeout
+        if len(waits) == 2:
+            engine.shutdown_state = _EngineShutdownState.REQUESTED
+        raise queue.Empty
+
+    engine.input_queue = SimpleNamespace(get=get)
+    with pytest.raises(SystemExit):
+        engine.run_busy_loop()
+
+    assert waits == [0.5, 0.5]
+    assert calls.count("raise_ffn_loop_error_if_any") == 2

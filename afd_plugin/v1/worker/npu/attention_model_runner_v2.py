@@ -4,9 +4,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
+from functools import partial
 from types import MethodType
 from typing import TYPE_CHECKING
 
@@ -43,6 +44,8 @@ from afd_plugin.connectors import (
     AFDForwardContextMetadata,
 )
 from afd_plugin.model_executor.models.forward_context import use_afd_metadata_provider
+from afd_plugin.profiling import runtime_profiling_enabled
+from afd_plugin.profiling.model import begin_profile_step
 from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
     _resolve_world_ranks,
@@ -56,6 +59,7 @@ from afd_plugin.validation import validate_npu_model_runner_v2_config
 
 if TYPE_CHECKING:
     from afd_plugin.v1.worker.npu.ubatch_runner import NPUUBatchRunner
+
 
 _AFD_FULLGRAPH_HOOK_MARKER = "_afd_fullgraph_replay_hook_active"
 
@@ -286,7 +290,11 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     # BatchDescriptor. It must not create/publish an A/F transaction; ordinary
     # compute contexts still require their native eager descriptor.
     def install_afd_metadata_on_forward_context(
-        self, forward_context: ForwardContext
+        self,
+        forward_context: ForwardContext,
+        *,
+        profile_num_requests: int | None = None,
+        profile_num_tokens: int = 0,
     ) -> None:
         if (
             forward_context.batch_descriptor is None
@@ -294,7 +302,11 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             and self.vllm_config.kv_transfer_config is not None
         ):
             return
-        super().install_afd_metadata_on_forward_context(forward_context)
+        super().install_afd_metadata_on_forward_context(
+            forward_context,
+            profile_num_requests=profile_num_requests,
+            profile_num_tokens=profile_num_tokens,
+        )
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
@@ -420,6 +432,9 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         # ### PATCH START: scope AFD metadata provider/replay and profiler step.
         step_afd_npu_profiler(self.prof)
+        pipeline = (
+            begin_profile_step(self.connector) if runtime_profiling_enabled() else None
+        )
         use_fullgraph_replay_hook = (
             self.vllm_config.compilation_config.cudagraph_mode
             in (CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY)
@@ -442,6 +457,15 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             if use_fullgraph_replay_hook
             else nullcontext()
         )
+        metadata_installer: Callable[[ForwardContext], None] = (
+            self.install_afd_metadata_on_forward_context
+        )
+        if pipeline is not None and not dummy_run and not is_profile:
+            metadata_installer = partial(
+                self.install_afd_metadata_on_forward_context,
+                profile_num_requests=len(scheduler_output.num_scheduled_tokens),
+                profile_num_tokens=scheduler_output.total_num_scheduled_tokens,
+            )
         try:
             with (
                 skip_dp_coordination() if self.afd_config.async_dp else nullcontext(),
@@ -456,9 +480,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                 if self.afd_config.async_dp and self.ubatch_runner is not None
                 else nullcontext(),
                 _use_afd_ubatch_preparation(self),
-                use_afd_metadata_provider(
-                    self.install_afd_metadata_on_forward_context,
-                ),
+                use_afd_metadata_provider(metadata_installer),
             ):
                 return super().execute_model(
                     scheduler_output,
@@ -476,6 +498,8 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             self._afd_is_graph_capturing = previous_is_graph_capturing
             self._afd_is_graph_replaying = previous_is_graph_replaying
             self._afd_is_profile = previous_is_profile
+            if pipeline is not None:
+                pipeline.tracer.idle(pipeline.capture)
         # ### PATCH END: scope AFD metadata provider/replay and profiler step.
 
     # Patch reason: native V2 shutdown does not know about AFD's profiler,

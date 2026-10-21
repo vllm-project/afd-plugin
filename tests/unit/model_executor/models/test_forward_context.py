@@ -223,7 +223,9 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
         send_attn_output=send_attn_output,
         recv_ffn_output=recv_ffn_output,
     )
-    afd_metadata = SimpleNamespace(connector=connector, stage_idx=0)
+    afd_metadata = SimpleNamespace(
+        connector=connector, stage_idx=0, profile_pipeline=None
+    )
 
     class _ProfileMoELayer:
         is_moe_layer = True

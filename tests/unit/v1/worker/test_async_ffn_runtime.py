@@ -9,6 +9,7 @@ import threading
 from collections import deque
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -210,6 +211,55 @@ def test_layered_eager_uses_raw_device_metadata(harness):
     assert len(observed) == 2
     assert [int(header[2]) for _, header in observed] == [5, 2]
     assert not any(isinstance(call, tuple) and call[0] == "compute" for call in h.calls)
+
+
+@pytest.mark.parametrize("layered", [False, True])
+def test_eager_profiling_marks_compute_before_each_ffn_operation(harness, layered):
+    h = harness
+    for layer in (5, 2):
+        item = payload(layer, 3)
+        item.context.profile = SimpleNamespace(
+            tracer=SimpleNamespace(
+                transition=lambda execution, phase: h.calls.append(("phase", phase))
+            )
+        )
+        h.payloads.append(item)
+    if layered:
+
+        def compute(hidden, *args):
+            h.calls.append(("compute",))
+            return hidden.to(torch.bfloat16)
+
+        h.runner._layered_executor = compute
+    assert h.runner.execute_connector_driven_step()
+    assert [call if isinstance(call, str) else call[0] for call in h.calls] == [
+        "receive",
+        "phase",
+        "compute",
+        "send",
+        "receive",
+        "phase",
+        "compute",
+        "send",
+    ]
+    assert [call for call in h.calls if call[0] == "phase"] == [
+        ("phase", "COMPUTE"),
+        ("phase", "COMPUTE"),
+    ]
+
+
+def test_eager_failure_idles_active_profile_and_preserves_error(harness, monkeypatch):
+    h = harness
+    monkeypatch.setenv("AFD_CAM_PROFILE_ENABLE", "1")
+    session = SimpleNamespace(tracer=SimpleNamespace(idle=Mock()), capture=object())
+    h.connector.profile_session = session
+    item = payload(5, 3)
+    item.context.states.host_control = [3, 5, 3]
+    h.payloads.append(item)
+    h.runner.model.compute_ffn_output = Mock(side_effect=ValueError("compute failed"))
+    with pytest.raises(ValueError, match="compute failed"):
+        h.runner.execute_connector_driven_step()
+    session.tracer.idle.assert_called_once_with(session.capture)
 
 
 @pytest.mark.parametrize("speculative_tokens", [None, 3])

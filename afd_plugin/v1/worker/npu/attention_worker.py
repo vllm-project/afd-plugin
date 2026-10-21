@@ -17,6 +17,8 @@ from afd_plugin.compat.npu import (
 )
 from afd_plugin.compat.npu.runtime_config import configure_async_cam_dbo
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
+from afd_plugin.profiling import runtime_profiling_enabled
+from afd_plugin.profiling.worker import CAMProfileWorkerMixin
 from afd_plugin.v1.worker.npu.attention_model_runner_v2 import (
     AFDNPUAttentionModelRunnerV2,
 )
@@ -27,7 +29,7 @@ from afd_plugin.validation import (
 )
 
 
-class AFDNPUAttentionWorker(NPUWorker):
+class AFDNPUAttentionWorker(CAMProfileWorkerMixin, NPUWorker):
     """Attention worker that creates an AFD-aware vLLM-Ascend runner."""
 
     afd_expected_role = "attention"
@@ -65,6 +67,8 @@ class AFDNPUAttentionWorker(NPUWorker):
             self.vllm_config,
             self.device,
         )
+        if runtime_profiling_enabled():
+            self.initialize_cam_profiling()
 
 
 __all__ = ["AFDNPUAttentionWorker"]

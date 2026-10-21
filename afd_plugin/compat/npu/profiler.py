@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from types import MethodType
 from typing import Final, Literal, Protocol
 
 logger = logging.getLogger(__name__)
@@ -75,12 +76,49 @@ def create_afd_npu_profiler(role: AFDNPUProfilerRole) -> AFDNPUProfiler | None:
     config = afd_npu_profiler_config(role)
     if not config.enabled:
         return None
+    return _create_npu_profiler(role, config, runtime=False)
+
+
+def create_runtime_npu_profiler(
+    role: AFDNPUProfilerRole,
+    trace_dir: str,
+    *,
+    lightweight: bool = False,
+    graph: bool = False,
+) -> AFDNPUProfiler:
+    config = replace(afd_npu_profiler_config(role), enabled=True, trace_dir=trace_dir)
+    return _create_npu_profiler(
+        role, config, runtime=True, lightweight=lightweight, graph=graph
+    )
+
+
+def _create_npu_profiler(
+    role: AFDNPUProfilerRole,
+    config: AFDNPUProfilerConfig,
+    *,
+    runtime: bool,
+    lightweight: bool = False,
+    graph: bool = False,
+) -> AFDNPUProfiler:
 
     import torch_npu
 
+    profiler_level = torch_npu.profiler.ProfilerLevel.Level2
+    if lightweight:
+        profiler_level = (
+            torch_npu.profiler.ProfilerLevel.Level0
+            if graph
+            else torch_npu.profiler.ProfilerLevel.Level_none
+        )
     experimental_config = torch_npu.profiler._ExperimentalConfig(
         export_type=torch_npu.profiler.ExportType.Text,
-        profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+        profiler_level=profiler_level,
+        mstx=lightweight and not graph,
+        mstx_domain_include=["afd.cam"] if lightweight and not graph else [],
+        data_simplification=True,
+        record_op_args=False,
+        op_attr=False,
+        l2_cache=False,
         aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
     )
     logger.info(
@@ -91,26 +129,66 @@ def create_afd_npu_profiler(role: AFDNPUProfilerRole) -> AFDNPUProfiler | None:
     )
     profiler = torch_npu.profiler.profile(
         activities=[
-            torch_npu.profiler.ProfilerActivity.CPU,
+            *([torch_npu.profiler.ProfilerActivity.CPU] if not lightweight else []),
             torch_npu.profiler.ProfilerActivity.NPU,
         ],
-        schedule=torch_npu.profiler.schedule(
+        schedule=None
+        if runtime
+        else torch_npu.profiler.schedule(
             wait=config.wait,
             warmup=config.warmup,
             active=config.active,
             repeat=config.repeat,
             skip_first=config.skip_first,
         ),
-        with_stack=config.with_stack,
-        with_modules=config.with_stack,
-        record_shapes=True,
+        with_stack=config.with_stack and not lightweight,
+        with_modules=config.with_stack and not lightweight,
+        record_shapes=not lightweight,
+        profile_memory=False,
+        with_flops=False,
         experimental_config=experimental_config,
         on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
             config.trace_dir,
+            analyse_flag=not lightweight,
         ),
     )
+    if runtime and role == "ffn":
+        from torch_npu.profiler._profiler_action_controller import ProfActionController
+
+        profiler.prof_if.stop_trace = MethodType(_stop_ffn_trace, profiler.prof_if)
+        # The controller captures bound methods when constructed.
+        profiler.action_controller = ProfActionController(
+            profiler, profiler.prof_if, profiler.on_trace_ready
+        )
     profiler.start()
+    if lightweight:
+        from torch_npu.profiler.profiler_interface import _disable_event_record
+
+        # NPU-only capture still installs CPU record_function on every Event query.
+        _disable_event_record()
     return profiler
+
+
+# TorchNPU 2.10 _ProfInterface.stop_trace waits for the permanently idle CAM recv.
+# Runtime FFN's model thread instead checks the pre-receive fence before stopping.
+# shortcut: pinned private API; remove when TorchNPU supports stream-scoped stop.
+def _stop_ffn_trace(self):
+    from torch_npu.profiler.profiler_interface import (
+        FlopsHookManager,
+        _disable_event_record,
+        _stop_profiler,
+    )
+
+    if not self._is_env_valid:
+        return
+    # ### PATCH START: completed FFN work fence replaces device synchronize
+    # The owner has verified completion of all work preceding the pending recv.
+    # ### PATCH END: completed FFN work fence replaces device synchronize
+    if self.with_flops and self.experimental_config.tx_enabled:
+        FlopsHookManager.uninstall()
+    _stop_profiler()
+    self.stop_gc_detect()
+    _disable_event_record()
 
 
 def step_afd_npu_profiler(profiler: AFDNPUProfiler | None) -> None:
@@ -154,6 +232,7 @@ __all__ = [
     "AFDNPUProfiler",
     "afd_npu_profiler_config",
     "create_afd_npu_profiler",
+    "create_runtime_npu_profiler",
     "step_afd_npu_profiler",
     "stop_afd_npu_profiler",
 ]
