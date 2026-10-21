@@ -41,7 +41,7 @@ from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
 )
-from afd_plugin.connectors.npu.p2p_hccl import P2pHcclAFDConnector
+from afd_plugin.connectors.npu.p2p_hccl import HCCLMTPHeader, P2pHcclAFDConnector
 from afd_plugin.v1.worker.attention_model_runner import (
     _resolve_world_ranks,
 )
@@ -573,7 +573,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         ):
             self._replay_mtp_graph(dp_metadata_list)
             return
-        self._mtp_ffn_forward(
+        self._mtp_ffn_forward_sequence(
             sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
         )
 
@@ -1112,16 +1112,28 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             input_ids_cache.clear()
         return rank_ffn_output
 
+    def _mtp_ffn_forward_sequence(self, stage_ids: list[int]) -> None:
+        """Service every draft iteration before receiving target control again."""
+        speculative_config = self.vllm_config.speculative_config
+        if speculative_config is None or not self._requires_afd_mtp():
+            return
+        for speculative_step in range(speculative_config.num_speculative_tokens):
+            # Graph-capable drafts use a static wire step even on eager fallback.
+            self._mtp_ffn_forward(
+                stage_ids,
+                expected_speculative_step=(
+                    speculative_step if speculative_config.enforce_eager else 0
+                ),
+            )
+
     def _mtp_ffn_forward(
         self,
         stage_ids: list[int],
         *,
-        header: Any | None = None,
+        header: HCCLMTPHeader | None = None,
+        expected_speculative_step: int | None = None,
     ) -> torch.Tensor | None:
-        if (
-            self.vllm_config.speculative_config is None
-            or not self._requires_afd_mtp()
-        ):
+        if self.vllm_config.speculative_config is None or not self._requires_afd_mtp():
             return None
         if stage_ids not in ([0], [0, 1]):
             raise RuntimeError(
@@ -1131,10 +1143,18 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             raise RuntimeError("DSV4 AFD MTP FFN model is not loaded")
 
         # The target decoder may run U2, but the upstream proposer consumes the
-        # merged target output and executes one full-batch MTP phase.
+        # merged target output and executes a full-batch exchange per iteration.
         stage_idx = 0
         if header is None:
             header = self.connector.recv_mtp_header(stage_idx=stage_idx)
+        if (
+            expected_speculative_step is not None
+            and header.speculative_step != expected_speculative_step
+        ):
+            raise RuntimeError(
+                "DSV4 AFD FFN received an out-of-order MTP step: "
+                f"expected={expected_speculative_step}, got={header.speculative_step}"
+            )
         payload = self.connector.recv_attn_output(
             ubatch_idx=stage_idx,
             layer_idx=0,
@@ -1143,7 +1163,10 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             num_tokens=header.num_tokens,
         )
         metadata = payload.context.metadata
-        if metadata.phase != "mtp" or metadata.speculative_step != 0:
+        if (
+            metadata.phase != "mtp"
+            or metadata.speculative_step != header.speculative_step
+        ):
             raise RuntimeError("DSV4 AFD FFN received an invalid MTP phase")
 
         afd_metadata = AFDForwardContextMetadata(
@@ -1292,7 +1315,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 )
                 # Warmup remains end-to-end; only the actual target capture
                 # omits the eager draft phase.
-                self._mtp_ffn_forward(stage_ids)
+                self._mtp_ffn_forward_sequence(stage_ids)
             else:
                 with graph_capture(device=self.device):
                     self._capture_graphs(
@@ -1319,7 +1342,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self,
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
     ) -> None:
-        """Capture the merged MTP phase after the target decoder graph."""
+        """Capture all full-batch draft exchanges in one replayable graph."""
 
         graph_key = self._make_mtp_graph_key(dp_metadata_list)
         existing = self._mtp_acl_graphs.get(graph_key)
@@ -1331,11 +1354,14 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         graph = torch.npu.NPUGraph()
         logger.debug("AFD NPU FFN capturing MTP ACL graph for key=%s", graph_key)
         with torch.npu.graph(graph, pool=self.graph_pool):
-            header = self.connector.recv_mtp_header_for_graph(
-                stage_idx=0,
-                attention_peer_counts=peer_layout,
-            )
-            output = self._mtp_ffn_forward([0], header=header)
+            for _ in range(self.vllm_config.speculative_config.num_speculative_tokens):
+                header = self.connector.recv_mtp_header_for_graph(
+                    stage_idx=0,
+                    attention_peer_counts=peer_layout,
+                )
+                output = self._mtp_ffn_forward(
+                    [0], header=header, expected_speculative_step=0
+                )
         self._mtp_acl_graphs[graph_key] = {
             "graph": graph,
             "output": output,

@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, override_forward_context
+from vllm.sequence import IntermediateTensors
 from vllm_ascend.models import deepseek_v4 as native
 from vllm_ascend.models import deepseek_v4_mtp as native_mtp
 from vllm_ascend.utils import is_dspark_config
@@ -1655,7 +1656,8 @@ class AFDDeepSeekMultiTokenPredictor(native_mtp.DeepSeekMultiTokenPredictor):
         return self.embed_tokens(input_ids)
 
     # Patch reason: upstream permits full MTP execution on every constructed role.
-    # Patch functionality: run draft orchestration only on Attention.
+    # Patch functionality: run draft orchestration only on Attention and keep
+    # the proposal iteration separate from the modulo-selected MTP layer.
     # Signature: matches upstream; no added parameters.
     # Upstream: vllm_ascend/models/deepseek_v4_mtp.py
     # Commit: 3da28f9414583d2d0b672a8f06d1fae142404bda
@@ -1679,7 +1681,9 @@ class AFDDeepSeekMultiTokenPredictor(native_mtp.DeepSeekMultiTokenPredictor):
             positions,
             previous_hidden_states,
             inputs_embeds,
-            current_step_idx,
+            # ### PATCH START: preserve the protocol iteration.
+            spec_step_idx,
+            # ### PATCH END: preserve the protocol iteration.
         )
 
     # Patch reason: upstream exposes logits for every constructed role.
@@ -1722,7 +1726,23 @@ class AFDDeepSeekMultiTokenPredictor(native_mtp.DeepSeekMultiTokenPredictor):
         return self.layers[str(layer_idx)].compute_ffn_output(hidden_states)
 
 
-@native_mtp.support_torch_compile
+# ### PATCH START: eager multi-token drafts require a live Python step counter.
+@native_mtp.support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "hidden_states": 0,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    },
+    enable_if=lambda config: (
+        not (
+            config.speculative_config.enforce_eager
+            and config.speculative_config.num_speculative_tokens > 1
+        )
+    )
+)
+# ### PATCH END: eager multi-token drafts require a live Python step counter.
 class AFDDeepSeekV4MTP(native_mtp.DeepSeekV4MTP):
     """Strict AFD role wrapper for the native DSV4 MTP model."""
 
@@ -1737,12 +1757,49 @@ class AFDDeepSeekV4MTP(native_mtp.DeepSeekV4MTP):
         self.afd_role = parse_afd_config(vllm_config, validate=False).role
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
+        # The merged proposer omits spec_step_idx on each call. Eager drafts
+        # number those calls; graph drafts keep the static step-zero contract.
+        speculative_config = vllm_config.speculative_config
+        self._afd_num_speculative_tokens = (
+            speculative_config.num_speculative_tokens
+            if speculative_config.enforce_eager
+            else 1
+        )
+        self._afd_next_speculative_step = 0
         self.model = AFDDeepSeekMultiTokenPredictor(
             vllm_config=vllm_config,
             prefix=native_mtp.maybe_prefix(prefix, "mtp"),
         )
         self.set_moe_parameters()
         # ### PATCH END
+
+    # Patch reason: the pinned merged proposer does not pass proposal step IDs.
+    # Patch functionality: number eager calls modulo N while graph drafts use 0.
+    # Signature: matches upstream; no added parameters. The upstream default 0
+    # denotes the implicit next step; explicit nonzero steps remain supported.
+    # Upstream: vllm_ascend/models/deepseek_v4_mtp.py
+    # Commit: 11ee45653b199a097805b87011824a81ffa51b95
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        # ### PATCH START: track implicit merged-draft iterations.
+        if self._afd_num_speculative_tokens > 1:
+            if spec_step_idx == 0:
+                spec_step_idx = self._afd_next_speculative_step
+            self._afd_next_speculative_step = (
+                spec_step_idx + 1
+            ) % self._afd_num_speculative_tokens
+        # ### PATCH END: track implicit merged-draft iterations.
+        hidden_states = self.model(
+            input_ids, positions, hidden_states, inputs_embeds, spec_step_idx
+        )
+        return hidden_states
 
     def compute_ffn_output(
         self,

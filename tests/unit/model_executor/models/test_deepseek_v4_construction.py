@@ -214,6 +214,9 @@ def test_pinned_constructor_signatures_match_native_model():
     assert without_annotations(
         adapter.AFDDeepSeekV4MTP.__init__
     ) == without_annotations(adapter.native_mtp.DeepSeekV4MTP.__init__)
+    assert without_annotations(adapter.AFDDeepSeekV4MTP.forward) == without_annotations(
+        adapter.native_mtp.DeepSeekV4MTP.forward
+    )
 
 
 @pytest.mark.parametrize("layer_idx", [0, 2, 3, 42])
@@ -773,6 +776,7 @@ def test_mtp_eager_steps_survive_compiled_target_configuration(
         # Graph draft and single-token eager draft keep compilation. Their
         # wire step is zero, so neither relies on a changing Python counter.
         assert len(compiled_graphs) == 1
+        assert observed == [0] * (2 * num_speculative_tokens)
     assert config.compilation_config.mode == CompilationMode.VLLM_COMPILE
 
 

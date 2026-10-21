@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import fields as dataclass_fields
 from dataclasses import replace
@@ -127,7 +128,7 @@ _ASCEND_COMMON_METADATA_FIELDS = frozenset(
 class _AFDMTPPhaseAwareRunnable:
     """Announce a live draft phase at the exact runnable boundary."""
 
-    def __init__(self, runnable: ACLGraphWrapper, callback: Any) -> None:
+    def __init__(self, runnable: Callable[..., Any], callback: Any) -> None:
         self._runnable = runnable
         self._callback = callback
 
@@ -1965,31 +1966,34 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             self._install_ascend_ubatch_wrapper()
 
     def _configure_mtp_draft_graph(self) -> None:
-        if self.speculative_config is None or bool(
-            getattr(self.speculative_config, "enforce_eager", False),
-        ):
+        if self.speculative_config is None:
             return
-        draft_runnable = getattr(self.drafter, "_runnable", None)
-        if not isinstance(draft_runnable, ACLGraphWrapper):
-            raise RuntimeError(
-                "DSV4 AFD full draft Graph requires an ACLGraphWrapper",
-            )
+        draft_runnable = self.drafter._runnable
+        draft_enforce_eager = self.speculative_config.enforce_eager
+        if not draft_enforce_eager:
+            if not isinstance(draft_runnable, ACLGraphWrapper):
+                raise RuntimeError(
+                    "DSV4 AFD full draft Graph requires an ACLGraphWrapper",
+                )
+            # Upstream exempts Eagle graphs from pre-replay synchronization.
+            # Remote FFN graph updates require the previous HCCL to finish.
+            draft_runnable.use_eagle = False
         # ### PATCH START: synchronize AFD draft graph replay.
-        # Upstream vLLM-Ascend commit 3da28f94 constructs MTP through
-        # AscendEagleProposer and exempts Eagle graph replay from the normal
-        # pre-replay synchronization. AFD inserts a remote FFN graph and HCCL
-        # boundary, so graph-parameter updates must wait for the previous
-        # replay to finish before buffers are reused.
-        draft_runnable.use_eagle = False
+        # Both eager and graph drafts must announce the phase before any data
+        # transfers; FFN waits for that control message after target execution.
         self.drafter._runnable = _AFDMTPPhaseAwareRunnable(
             draft_runnable,
-            self._announce_live_mtp_phase,
+            (
+                (lambda _runnable: self._announce_live_mtp_phase(None))
+                if draft_enforce_eager
+                else self._announce_live_mtp_phase
+            ),
         )
         # ### PATCH END: synchronize AFD draft graph replay.
 
     def _announce_live_mtp_phase(
         self,
-        draft_runnable: ACLGraphWrapper,
+        draft_runnable: ACLGraphWrapper | None,
     ) -> CUDAGraphMode | None:
         if not bool(getattr(self, "_afd_in_mtp_proposal", False)):
             return None
@@ -2003,8 +2007,10 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 )
             self.connector.prepare_mtp_header_for_graph({0: draft_dp_metadata})
         runtime_mode = forward_context.cudagraph_runtime_mode
-        graph_requested = runtime_mode != CUDAGraphMode.NONE and runtime_mode.has_mode(
-            draft_runnable.runtime_mode,
+        graph_requested = (
+            draft_runnable is not None
+            and runtime_mode != CUDAGraphMode.NONE
+            and runtime_mode.has_mode(draft_runnable.runtime_mode)
         )
         graph_entry = (
             draft_runnable.concrete_aclgraph_entries.get(
