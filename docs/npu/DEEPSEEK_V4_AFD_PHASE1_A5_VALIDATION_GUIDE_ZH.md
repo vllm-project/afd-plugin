@@ -172,8 +172,8 @@ export GPU_MEMORY_UTILIZATION=0.91
 export ATTENTION_MAX_NUM_BATCHED_TOKENS=4096
 export FFN_MAX_NUM_BATCHED_TOKENS=8192
 export PREFILL_MAX_NUM_BATCHED_TOKENS=4096
-export MAX_CUDAGRAPH_CAPTURE_SIZE=8
-export CUDAGRAPH_CAPTURE_SIZES='1 2 4 8'
+export MAX_CUDAGRAPH_CAPTURE_SIZE=
+export CUDAGRAPH_CAPTURE_SIZES=   # 留空，由当前 BS 和 speculative token 数推导
 export DBO_DECODE_TOKEN_THRESHOLD=2
 export DBO_PREFILL_TOKEN_THRESHOLD=12
 export ENABLE_MTP=0
@@ -1382,6 +1382,7 @@ export CASE="$PERF_CASE" CYCLE=1
 export ISL=16384 OSL=1024 DECODE_BS=8
 export MAX_MODEL_LEN=$((ISL + OSL))
 export MAX_NUM_SEQS="$DECODE_BS"
+export MAX_CUDAGRAPH_CAPTURE_SIZE= CUDAGRAPH_CAPTURE_SIZES=
 export FFN_SEQ_CAPACITY=$((2 * DECODE_BS))
 export CAPACITY=$((4 * DECODE_BS))
 export REQUEST_COUNT=$((6 * CAPACITY))
@@ -1413,7 +1414,9 @@ cp "$NODE_FILE" "$RUN_ROOT/node.env"
 
 **启动前核对：** 16K+1024 的上限是 17408，不能继续用 4096。保留已冻结的 `GPU_MEMORY_UTILIZATION=0.91`，重新检查 P/D/A/F 的 KV 和 HBM。`FFN_SEQ_CAPACITY=2×DECODE_BS` 仅是序列容量起点，DSpark 的 verify/draft token、buffer、padding 预算另核验。
 
-首个 BS8 预检从原 recipe capture sizes `1 2 4 8` 开始验证；它不证明 DSpark 或更大 BS 的 Graph shape 已覆盖。扩大 BS 前按实际 shape 调整并验收 `MAX_CUDAGRAPH_CAPTURE_SIZE`、`CUDAGRAPH_CAPTURE_SIZES` 和各角色 token budget，记录到本点配置。A/F 需要不同 capture/budget 时，在对应角色的命令前缀分别设置并归档，不能靠共用值推定已覆盖。**未经预检的配置不进入 `measure`。**
+不要沿用旧配置的固定 max=8。当前 recipe 在 capture 变量为空时，按每 rank、U2 切分前的 token 上限生成档位：普通 Decode 为 `DECODE_BS`，DSpark 为 `DECODE_BS × (dspark_block_size + 1)`。BS24 对应普通 Decode max=24、档位 `1 2 4 8 16 24`；DSpark block=5 对应 max=144、档位 `6 12 24 48 96 144`。U2 不会把 dispatcher 所需的 max 减半。显式覆盖值不足、最大档位不一致或超出角色 token budget 会在启动前报错。
+
+每个新配置点重新加载上述空 capture 变量，避免复用上一组派生值。A/F 在各自进程内推导；F 无 speculative config，其实际远端 Graph 由 A 的 metadata 触发捕获。F 的接收/计算 buffer 仍须覆盖 A/F 聚合及 DSpark verify 的 token 数。扩大 BS 后重新验收 HBM、实际 replay/eager 比例和 A/F stage key，并保存各角色实际 argv/capture/token budget。自动覆盖上限不代表所有在线 shape 都已 replay。**未经预检的配置不进入 `measure`。**
 
 按第 4.4 节保存 runtime，补充本轮 `PERF_CASE/PHASE/ISL/OSL/DECODE_BS/FFN_SEQ_CAPACITY`、各角色 token budget、capture sizes、Synthetic 生成参数和固定 tokenizer hash。`USE_AFD` 仅选择下文命令分支，不是插件开关。
 
@@ -1450,14 +1453,9 @@ else
   KV_CONFIG="$(build_a5_pd_kv_config kv_consumer \
     "$DECODE_ENGINE_ID" "$DECODE_KV_PORT" "$ATTENTION_DEVICES")"
   printf '%s\n' "$KV_CONFIG" > "$RUN_ROOT/native-kv-config.json"
+  configure_dspark
+  MAX_NUM_BATCHED_TOKENS="$ATTENTION_MAX_NUM_BATCHED_TOKENS" configure_graph_capture
   read -r -a native_capture_sizes <<< "$CUDAGRAPH_CAPTURE_SIZES"
-  NATIVE_DSPARK_ARGS=()
-  if [[ "$ENABLE_DSPARK" == 1 ]]; then
-    DSPARK_BLOCK_SIZE="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["dspark_block_size"])' "$MODEL_PATH/config.json")"
-    [[ "$DSPARK_BLOCK_SIZE" =~ ^[1-9][0-9]*$ ]] || afd_die "Invalid dspark_block_size"
-    DSPARK_CONFIG="$(printf '{"method":"mtp","num_speculative_tokens":%s,"draft_sample_method":"greedy","enforce_eager":true}' "$DSPARK_BLOCK_SIZE")"
-    NATIVE_DSPARK_ARGS=(--speculative-config "$DSPARK_CONFIG")
-  fi
   nohup "$VLLM_BIN" serve "$MODEL_PATH" \
     --host 0.0.0.0 --port "$ATTENTION_API_PORT" \
     --api-server-count 1 --served-model-name dsv4-afd \
@@ -1471,7 +1469,7 @@ else
     --max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE" \
     --cudagraph-capture-sizes "${native_capture_sizes[@]}" \
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-    "${NATIVE_DSPARK_ARGS[@]}" > "$RUN_ROOT/decode.log" 2>&1 &
+    "${DSPARK_ARGS[@]}" > "$RUN_ROOT/decode.log" 2>&1 &
   echo $! > "$RUN_ROOT/decode.pid"
 fi
 wait_http "$ATTENTION_URL/health"

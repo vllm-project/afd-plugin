@@ -311,7 +311,11 @@ that a previous deployment does not still own the port.
 
 ### Rank or shape mismatch
 
-For A4F2, require DP4/TP1 on Attention and DP2/TP1 on FFN. The FFN token limit
+The recipe derives DP as physical role ranks divided by TP. A4F2/TP1 uses
+Attention DP4 and FFN DP2; A4F4/TP2 uses DP2/TP2 on both roles. TP2 currently
+requires equal A/F rank counts. TP1 permits an integer rank-count ratio in
+either direction. Device lists must match the physical counts and be disjoint
+on the same host. For A4F2/TP1, the FFN token limit
 must be at least twice the Attention limit. Inspect both logs for the first
 control payload or graph-key disagreement rather than relying on the final HCCL
 timeout.
@@ -329,9 +333,11 @@ legitimately for the next Attention request.
 
 ### Graph/U2 failure
 
-Confirm both roles use `FULL_DECODE_ONLY`, U2, async scheduling off, the same
-capture sizes, and the same five Graph/U2 stream switches. Preserve both logs
-and the exact image digest. Do not describe a fallback or a single successful
+Confirm both roles use `FULL_DECODE_ONLY`, U2, async scheduling off, matching
+live graph keys, and the same five Graph/U2 stream switches. Attention capture
+sizes must cover the full pre-U2 token batch, including speculative tokens;
+FFN captures the corresponding remote shapes from Attention metadata. Preserve
+both logs and the exact image digest. Do not describe a fallback or a single successful
 request as a completed functional gate.
 
 For a request that stops without an HCCL error, export the diagnostic switch to

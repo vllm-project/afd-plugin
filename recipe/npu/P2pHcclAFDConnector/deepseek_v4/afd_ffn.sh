@@ -33,10 +33,9 @@ HCCL_IF_BASE_PORT="${FFN_HCCL_IF_BASE_PORT:-52000}"
 HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-2048}"
 DBO_DECODE_TOKEN_THRESHOLD="${DBO_DECODE_TOKEN_THRESHOLD:-2}"
 DBO_PREFILL_TOKEN_THRESHOLD="${DBO_PREFILL_TOKEN_THRESHOLD:-12}"
-MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-8}"
-CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-1 2 4 8}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 VLLM_BIN="${VLLM_BIN:-vllm}"
+DSPARK_BLOCK_SIZE=0  # FFN receives target shapes from A; it has no drafter.
 
 preflight_role
 
@@ -50,8 +49,8 @@ run_role_service "$VLLM_BIN" serve "$MODEL_PATH" \
   --max-model-len "$MAX_MODEL_LEN" \
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
   --max-num-seqs "$MAX_NUM_SEQS" \
-  --data-parallel-size "$FFN_RANKS" \
-  --tensor-parallel-size 1 \
+  --data-parallel-size "$ROLE_DP_SIZE" \
+  --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" \
   --all2all-backend flashinfer_all2allv \
   --enable-expert-parallel \
   --seed 1024 \
