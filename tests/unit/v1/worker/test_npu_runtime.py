@@ -1525,9 +1525,12 @@ def test_npu_attention_eager_draft_gets_phase_boundary_wrapper():
     assert runner.drafter._runnable._runnable is eager_runnable
 
 
-@pytest.mark.parametrize("live_proposal", [True, False])
+@pytest.mark.parametrize(
+    ("live_proposal", "online_dummy"),
+    [(True, False), (False, True), (False, False)],
+)
 def test_npu_attention_eager_draft_announces_phase_before_all_iterations(
-    monkeypatch, live_proposal
+    monkeypatch, live_proposal, online_dummy
 ):
     from vllm.config import CUDAGraphMode
 
@@ -1536,6 +1539,7 @@ def test_npu_attention_eager_draft_announces_phase_before_all_iterations(
     runner = _new_attention_runner()
     runner.speculative_config = _mtp_speculative_config(num_speculative_tokens=3)
     runner._afd_in_mtp_proposal = live_proposal
+    runner._afd_live_dummy_execution = online_dummy
     calls = []
     runner.connector = SimpleNamespace(
         control_plane=SimpleNamespace(
@@ -1560,7 +1564,7 @@ def test_npu_attention_eager_draft_announces_phase_before_all_iterations(
     runner._configure_mtp_draft_graph()
     runner.drafter._runnable()
 
-    expected = [("ready", False)] if live_proposal else []
+    expected = [("ready", False)] if live_proposal or online_dummy else []
     assert calls == expected + [("draft", 0), ("draft", 1), ("draft", 2)]
 
 

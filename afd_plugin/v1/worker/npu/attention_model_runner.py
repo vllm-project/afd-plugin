@@ -1995,7 +1995,13 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self,
         draft_runnable: ACLGraphWrapper | None,
     ) -> CUDAGraphMode | None:
-        if not bool(getattr(self, "_afd_in_mtp_proposal", False)):
+        # Idle DP ranks draft through dummy_run rather than propose_draft_token_ids.
+        # They must release their FFN peers before the shared MoE collective;
+        # the worker sets the dummy flag only for online execution.
+        if not (
+            bool(getattr(self, "_afd_in_mtp_proposal", False))
+            or bool(getattr(self, "_afd_live_dummy_execution", False))
+        ):
             return None
         forward_context = get_forward_context()
         if isinstance(self.connector, P2pHcclAFDConnector):
