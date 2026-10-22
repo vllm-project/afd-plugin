@@ -3163,6 +3163,63 @@ def test_npu_ffn_runner_replays_target_graph_then_runs_mtp_eager(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize(
+    ("num_speculative_tokens", "peer_tokens", "expected_sizes"),
+    [(1, 4, [2, 4, 8]), (2, 6, [3, 6]), (3, 8, [4, 8])],
+)
+def test_npu_ffn_mtp_graph_sizes_match_upstream_decode_capture(
+    num_speculative_tokens, peer_tokens, expected_sizes
+):
+    from vllm.config import CompilationConfig, CUDAGraphMode
+
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        tensor_parallel_size=1,
+        speculative_config=_mtp_speculative_config(
+            enforce_eager=False,
+            num_speculative_tokens=num_speculative_tokens,
+        ),
+    )
+    runner.connector = _FakeFFNConnector(attn_size=2, ffn_size=2)
+    runner.use_aclgraph = True
+    runner.uniform_decode_query_len = num_speculative_tokens + 1
+    runner.parallel_config = runner.vllm_config.parallel_config
+    runner.compilation_config = CompilationConfig(
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        cudagraph_capture_sizes=[1, 2, 4, 8],
+        max_cudagraph_capture_size=8,
+    )
+    runner.cudagraph_batch_sizes = [1, 2, 4, 8]
+
+    runner._initialize_mtp_graph_sizes()
+
+    assert runner.cudagraph_batch_sizes == expected_sizes
+    metadata = {0: _FakeDPMetadata([peer_tokens, peer_tokens])}
+    assert runner._make_mtp_graph_key(metadata)[-1] == (peer_tokens, peer_tokens)
+
+
+@pytest.mark.parametrize(
+    ("requires_mtp", "use_aclgraph", "enforce_eager"),
+    [(False, True, False), (True, False, False), (True, True, True)],
+)
+def test_npu_ffn_mtp_graph_sizes_skip_other_paths(
+    requires_mtp, use_aclgraph, enforce_eager
+):
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        speculative_config=_mtp_speculative_config(enforce_eager=enforce_eager),
+    )
+    runner.connector = SimpleNamespace(requires_mtp=requires_mtp)
+    runner.use_aclgraph = use_aclgraph
+    runner.cudagraph_batch_sizes = [1, 2, 4, 8]
+
+    runner._initialize_mtp_graph_sizes()
+
+    assert runner.cudagraph_batch_sizes == [1, 2, 4, 8]
+
+
 @pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3])
 @pytest.mark.parametrize("control_enabled", [False, True])
 def test_npu_ffn_runner_replays_target_then_full_draft_graph(

@@ -112,6 +112,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         if self.ffn_stream_overlap_enabled:
             self._initialize_ffn_stream_pipeline(device)
         self.use_aclgraph = _use_npu_aclgraph(vllm_config, self)
+        self._initialize_mtp_graph_sizes()
         self._acl_graphs: dict[tuple, dict[str, Any]] = {}
         self._mtp_acl_graphs: dict[tuple, dict[str, Any]] = {}
         self._window_ffn_acl_graph: dict[str, Any] | None = None
@@ -669,6 +670,21 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             and speculative_config is not None
             and getattr(speculative_config, "method", None) == "mtp"
             and not bool(getattr(speculative_config, "enforce_eager", False))
+        )
+
+    def _initialize_mtp_graph_sizes(self) -> None:
+        if not self._draft_uses_aclgraph():
+            return
+        # FFN skips Attention's KV/backend initialization, where the pinned
+        # upstream resolves capture sizes to multiples of N+1. Use the same
+        # resolver before padding draft peer layouts (N=2 maps [1,2,4,8] to
+        # [3,6], so rounding six tokens to the original eight corrupts HCCL).
+        self.compilation_config.adjust_cudagraph_sizes_for_spec_decode(
+            self.uniform_decode_query_len,
+            self.parallel_config.tensor_parallel_size,
+        )
+        self.cudagraph_batch_sizes = sorted(
+            self.compilation_config.cudagraph_capture_sizes,
         )
 
     def _make_mtp_graph_key(
