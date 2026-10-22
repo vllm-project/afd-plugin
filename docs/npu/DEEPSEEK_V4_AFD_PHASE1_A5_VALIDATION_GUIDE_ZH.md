@@ -8,7 +8,7 @@
 
 ## 0. 只做性能验证时，从哪里开始
 
-**当前要探索有收益的部署拓扑时，优先按第 8.12 节执行。** 该节结合 10-21 测量中的生成路径异常，先检查执行路径，再对比 A4F2 加 BS、A4F4 和原生 D8；增加 A 卡、TP2 和跨机 A/F 按瓶颈选择补测。下述单机九步保留为原配置的复现流程；新拓扑使用第 8.12 节的环境覆盖和跨机操作说明，不直接套用单机卡位。
+**当前要探索有收益的部署拓扑时，优先按第 8.12 节执行。** 该节结合 10-21 测量中的生成路径异常，先在单机检查执行路径并扫描 A4F2 的 BS，再在统一两机布局下对比 A4F2、A4F4 和原生 D8；增加 A 卡、TP2 和跨机 A/F 按瓶颈选择补测。下述单机九步可直接用于 A4F2 的首轮验证；进入两机比较时使用第 8.12 节的环境覆盖和跨机操作说明，不直接套用单机卡位。
 
 按第 8.2–8.10 节顺序执行：**准备环境 → 设置 Synthetic 参数 → 选择一组配置 → 启动 → 检查 → 预热和测量 → 停服 → 换组/扩展长度 → 计算收益**。
 
@@ -1721,16 +1721,20 @@ ss -ltnp > "$RUN_ROOT/ports-after-stop.txt"
 #### 8.12.2 第一阶段：先确认 Graph/U2 的实际执行路径
 
 1. 各节点冻结相同插件提交、vLLM/vLLM-Ascend、CANN/驱动和模型/tokenizer hashes，原生也使用同一套环境。旧结果保留为历史；新旧版本分别成表。
-2. 原生 D4 与 A4F2 先复查 BS24、并发 96。保留 16384/1024 原负载，再补 1024/1024，区分长上下文、P 供给和生成路径。短输入仍走真实 Prefill/KV/Proxy，称为“Decode 占比较高的端到端测试”。
+2. 原生 D4 与 A4F2 先在同一台 8 卡 A5 复查 BS24、并发 96。保留 16384/1024 原负载，再补 1024/1024，区分长上下文、P 供给和生成路径。短输入仍走真实 Prefill/KV/Proxy，称为“Decode 占比较高的端到端测试”。
 3. capture 留空由 recipe 生成：无 DSpark，BS24 max=24、BS48 max=48；DSpark block=5 时分别为 144、288。检查实际 replay/eager 次数、per-step 真实 token、两级 U2 stage key，以及 F 接收 buffer。仅有捕获日志不能证明在线命中。
 4. 若仍出现数量级的生成时延差距和低 A/F 利用率，暂停全矩阵扩卡。先采集一个代表点约 5–10 秒的 A/F timeline，拆分 A 计算、A→F、F MoE/EP 通信、F→A、CPU launch 和等待，关联相同 step/stage，避免把重叠区间重复相加。
 5. 必要时单独做双方 eager/U1 对照，再比较 AFD eager/U1→eager/U2→Graph/U2，每次只改一个变量。原生 eager 须移除第 8.5 节的 Graph 参数、改用 `--enforce-eager`；AFD 使用 `EXECUTION_MODE=eager U_BATCHES=1/2`。当前 recipe 的 Graph 路径要求 U2，不能直接构造 AFD Graph/U1。诊断结果与正式 Graph 部署对照分表，计时前关闭诊断/profiler。
 
 无既有 replay 计数时，以受控短 profile 验证；不得将 `is_graph_capturing=False` 当作 eager 回退证据。运行异常尚未定位时，只做少量诊断点，不将“扩大 BS 后吞吐变高”视为异常已经修复。
 
-#### 8.12.3 第二阶段：用两台机器筛选 TP1 拓扑
+#### 8.12.3 第二阶段：先单机扫 BS，再用两机比较 TP1 拓扑
 
-推荐先让 **机器 P 独占 P2+Proxy，机器 D 放完整 A/F 或原生 D**。A/F 优先同机，减少每层跨机往返这一变量；P→D 的 KV 跨机在各组保持一致。P 机器暂不混放 F，避免 P/F 争用。下表卡位是示例，须按实际 NPU 互联、NUMA 和网卡亲和性选取并冻结；记录同机 A/F 及 F 内 EP 的真实链路。此布局用于性能筛选，不替代三机远程 A/F 功能验收。
+**A4F2 加 BS 的首轮无需两机。** 单台 8 卡 A5 即可部署 P2（0、1）+A4（2–5）+F2（6、7）+Proxy；原生参照为同机 P2（0、1）+D4（2–5），6、7 空闲。按第 8.2–8.8 节执行，先 BS24，再 BS48，必要时补 BS32；BS24/48 的配置总容量分别为 96/192，增加 BS 不增加卡数。P 的容量参数在各点固定，例如 `PREFILL_MAX_NUM_SEQS=48`、`PREFILL_MAX_NUM_BATCHED_TOKENS=4096`。每个 BS 重新验证 Graph、buffer、KV/HBM 和真实活跃数，BS48 能否容纳以实测为准。
+
+**比较 A4F4 或原生 D8 时，再使用两机。** 两者加上 P2 均需 10 张卡，无法同时装进单台 8 卡机器。此时让机器 P 独占 P2+Proxy，机器 D 放完整 A/F 或原生 D；A4F2 和 D4 也迁到这一布局重测。不能直接用单机 A4F2 对两机 A4F4 计算 F2→F4 的效果，否则同时改变了 KV 路径和 P 的同机资源竞争。单机结果保留为独立部署结果。
+
+A/F 优先同机，减少每层跨机往返这一变量；P→D 的 KV 跨机在两机配对组中保持一致。P 机器暂不混放 F，避免 P/F 争用。下表为统一两机比较的卡位示例，须按实际 NPU 互联、NUMA 和网卡亲和性选取并冻结；记录同机 A/F 及 F 内 EP 的真实链路。此布局用于性能筛选，不替代三机远程 A/F 功能验收。
 
 | 配置点 | 机器 D 卡位 | 每 A/D DP 的 BS | 配置总容量 N | Decode 用卡 | 主要比较 |
 |---|---|---:|---:|---:|---|
@@ -1745,9 +1749,21 @@ ss -ltnp > "$RUN_ROOT/ports-after-stop.txt"
 
 先在 1024/1024 下检查生成路径和 batch 扩展，再用 16384/1024 评估真实长上下文收益；32K/更长输入只测有潜力的 1–2 个拓扑和原生参照。短输入慢不自动否定长上下文价值：若原生先遇到 KV 容量上限，而 AFD 可在相同 SLO 下提高活跃请求数，仍值得做各自最佳容量比较。发现容量拐点时，在 BS24 和 48 之间补 BS32；BS64 仅在 BS48 的 TPOT、KV 和 HBM 仍允许时补测。不要先跑所有维度的笛卡尔积。
 
-**执行覆盖。** 两机分别按第 3 节准备实际 site/node 环境、HIXL 设备资源和端口。下列代码在两机各自加载环境后执行，替代第 8.2、8.4 节固定单机拓扑/BS 的赋值；模型路径、端口、网卡和运行目录仍使用已验证的现场值。`PREFILL_HOST_IP`、`ATTENTION_HOST_IP` 在两机填写相同地址，`HCCL_IF_IP` 保持各自本机地址。
+**执行覆盖。** 两机分别按第 3 节准备实际 site/node 环境、HIXL 设备资源和端口。每台机器的每个新终端都从下面的环境加载开始，先将 `SITE_FILE`、`NODE_FILE` 改为本机实际文件路径；随后覆盖第 8.2、8.4 节的固定单机拓扑/BS 赋值。模型路径、端口、网卡和运行目录仍使用已验证的现场值。`site.env` 在两机保持一致，其中 `PREFILL_HOST_IP` 指向机器 P、`ATTENTION_HOST_IP` 指向机器 D；各自 `node.env` 中的 `HCCL_IF_IP`、网卡及路径使用本机值。不要加载旧 run 目录中的归档 env。
 
 ```bash
+set -euo pipefail
+# 替换为第 3.1 节已填写并核对的本机实际文件路径。
+export SITE_FILE=/data/validation/config/site.env
+export NODE_FILE=/data/validation/config/node.env
+source "$SITE_FILE"
+source "$NODE_FILE"
+test -f "$CANN_ROOT/set_env.sh"
+source "$CANN_ROOT/set_env.sh"
+source "$VENV_ROOT/bin/activate"
+export PYTHON_BIN="$VENV_ROOT/bin/python" VLLM_BIN="$VENV_ROOT/bin/vllm"
+export RECIPE="$AFD_PLUGIN_ROOT/recipe/npu/P2pHcclAFDConnector/deepseek_v4"
+
 export POINT=A4F4           # A4F2 / A4F4 / D4 / D8
 export CAPACITY=192         # 首轮用 96，再测 192；这是客户端并发上限
 export ISL=1024 OSL=1024 PHASE=check
