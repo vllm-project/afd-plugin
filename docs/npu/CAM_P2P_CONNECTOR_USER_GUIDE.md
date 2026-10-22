@@ -160,12 +160,79 @@ role rank.
 | --- | --- | --- | --- |
 | `core_num` | `int` | `8` | Positive default AIV core count for both roles. |
 | `attn_core_num` / `ffn_core_num` | `int` | unset | Positive role-specific override for `core_num`. |
-| `quant_mode` | `int` | `0` | CAM quantization mode. The current runtime supports only `0`. |
+| `quant_mode` | `int` | `0` | CAM quantization mode; the only switch for the A2E transport. `0` transports BF16 and lets the FFN quantize. `4` transports pre-quantized E4M3/E5M2 activations plus E8M0 MX scales, so the attention side quantizes once and the A2E payload halves; the FFN restores the model dtype before its MoE runs, because the router reads the activation itself and the shared experts quantize their own input. `4` additionally requires at least 3 AIV cores and a build whose A2E operator accepts the `x_scale` / `quant_mode` arguments; the connector raises at construction when either is missing. Both roles must use the same value. Measured on A5 4A4F, prefill-dominated: +34.7% total-token throughput versus `0` when concurrency saturates all DP ranks, at about −0.15 GSM8K points. |
 | `compute_gate_on_attention` | `bool` | `false` | Connector-local operator option; must remain `false`, as must the common AFD field. |
 | `hccl_buffer_size` | `int` | unset | Positive CAMP2P HCCL buffer size in MB. The override applies to every connector-owned `afd*` communication domain and the FFN-side `afd_moe` domain; the Gloo control group is unaffected. When unset, HCCL uses `HCCL_BUFFSIZE`, then its built-in default. Use the same value on all members of each HCCL domain. |
 
 The per-domain setting avoids increasing buffers for unrelated TP, DP, or EP
 process groups. `HCCL_BUFFSIZE` remains a process-wide fallback.
+
+## A5 A2E MXFP8 transport contract
+
+The standalone A2E operator accepts optional `x_scale=None` and `quant_mode=0`
+arguments after `compute_gate`. Existing positional calls remain valid. Mode
+`0` retains the five-output BF16 contract and the unchanged BF16 E2A path.
+
+Both modes use the same native `aclnnA2eGetWorkspaceSize` / `aclnnA2e`
+interface. The workspace-size signature includes `xScale`, `quantMode`, and
+`xScaleOut`; mode `0` passes null scale tensors. Rebuild the custom operator
+library, Torch extension, and any external native callers together: existing
+Python calls remain compatible, but the expanded C signature changes the native
+binary ABI.
+
+Mode `4` is an Ascend 950/A5 transport-only path, initially restricted to equal
+positive Attention and FFN rank counts, with at most 64 total ranks (`E + A <= 64`).
+`compute_gate` must be `0` or `1`; gate `1` requires at least three AIV cores
+(`aiv_num >= 3`). The standalone sample uses four AIV cores for both gates.
+The caller supplies contiguous E4M3 or E5M2 activation
+storage (`torch.float8_e4m3fn` or `torch.float8_e5m2`) and separate contiguous E8M0 MX scales
+(`torch.float8_e8m0fnu`), with shape `[tokens, ceil(hidden_size / 32)]`.
+A2E neither quantizes nor dequantizes either tensor. The activation output keeps
+the input dtype; paired ranks must use the same activation dtype. Activations and MX scales
+occupy separate contiguous packet regions; the existing FP32 `scales` argument
+still carries expert-routing weights when `compute_gate=1`.
+
+Mode `4` returns six tensors: the original five outputs followed by received MX
+scales. On FFN ranks, activation and scale shapes are `[batch_size, hidden_size]`
+and `[batch_size, ceil(hidden_size / 32)]`; Attention ranks receive `[1, 1]`
+placeholders for both. An FFN caller may instead supply an empty contiguous
+`[0, hidden_size]` FP8 input and omit `x_scale`; A2E receives both payloads
+from its paired Attention rank. Supplying full FFN-side activation and scale
+tensors remains valid for callers that retain those buffers. Do not pass the
+received FP8 tensor to BF16 E2A.
+Packet capacity is checked against the runtime HCCL window before shared-window
+writes, requiring
+`IPC_DATA_OFFSET + (rankSize - 1) * 1024 + packetBytes <= winSize`.
+Capacity violations fail closed; no universal maximum batch or hidden
+size is implied by this contract.
+
+The synchronous serving connector accepts `quant_mode=4` on this branch. The FFN
+consumer restores the model dtype from the received pair before its MoE runs: the
+router reads the activation itself and the shared experts quantize their own
+input, so a model-dtype copy is needed regardless, and the transport is the only
+stage that quantizes. The connector raises at construction when the A2E operator
+does not accept the `x_scale` / `quant_mode` arguments or when fewer than 3 AIV
+cores are configured, so a misconfigured deployment fails fast rather than
+producing wrong results.
+
+Measured on A5 single-host 4A4F with 128 concurrent 8192-token requests:
+318,519 total token/s versus 236,378 for `quant_mode=0` (+34.7%), TTFT median
+2905 ms versus 3748 ms, GSM8K 93.71% versus 93.86%. The gain depends on the
+concurrency actually saturating the FFN ranks: with 8 concurrent requests the
+same configuration measured −0.3%, because each layer's round-trip wait is then
+dominated by its fixed latency rather than by the activation payload.
+
+On A5 hardware, the explicit standalone byte-transport sample is:
+
+```bash
+AFD_TEST_DEVICES=2,3 AFD_TEST_QUANT_MODE=4 \
+  python tests/unit/compat/npu/a2e_e2a_a5.py
+```
+
+It checks both activation and scale bytes for both FP8 formats and `compute_gate=0` and `1`, without
+calling E2A. Default `AFD_TEST_QUANT_MODE=0` retains the BF16 roundtrip. Runtime
+checks require real A5 devices and are not validated by compilation or Meta
+tests alone.
 
 ## Single-node `4A2F` example
 

@@ -257,15 +257,18 @@ def test_send_attn_output_selects_the_operator_ids_mode(monkeypatch):
     connector.send_attn_output(hidden_states, context)
 
     with_ids, without_ids = calls
-    # Trailing operator arguments: aiv_num, compute_gate, ids, scales.
-    assert with_ids[-3] == 1
-    assert with_ids[-2].dtype == torch.int32
-    assert with_ids[-2][:, 0].tolist() == [7, 11, 13]
-    assert with_ids[-1].dtype == torch.float32
-    assert torch.count_nonzero(with_ids[-1]) == 0
-    assert without_ids[-3] == 0
+    # Trailing operator arguments: aiv_num, compute_gate, ids, scales,
+    # quant_mode. The BF16 wire keeps quant_mode at 0.
+    assert with_ids[-4] == 1
+    assert with_ids[-3].dtype == torch.int32
+    assert with_ids[-3][:, 0].tolist() == [7, 11, 13]
+    assert with_ids[-2].dtype == torch.float32
+    assert torch.count_nonzero(with_ids[-2]) == 0
+    assert with_ids[-1] == 0
+    assert without_ids[-4] == 0
+    assert without_ids[-3] is None
     assert without_ids[-2] is None
-    assert without_ids[-1] is None
+    assert without_ids[-1] == 0
 
 
 def test_recv_attn_output_mode_and_ids_follow_the_receiver_declaration(monkeypatch):

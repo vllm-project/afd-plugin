@@ -60,6 +60,36 @@ def _assert_afd_namespace_registered(torch: object) -> None:
     _ = ops.afd_ascend.e2a
 
 
+#: A2E arguments the MXFP8 transport needs. An operator build older than the one
+#: that added them accepts the call shape at the Python level and then fails
+#: inside the kernel, so the connector checks the schema instead.
+A2E_MXFP8_ARGUMENTS = ("x_scale", "quant_mode")
+
+
+def a2e_accepts_mxfp8_arguments() -> bool:
+    """Whether the loaded ``a2e`` operator takes ``x_scale`` and ``quant_mode``.
+
+    The extension is optional at import time and this module must stay importable
+    without torch, so the answer is ``False`` rather than an exception when the
+    operator cannot be inspected at all. Callers that only need MXFP8 tell the
+    two apart by their own error message.
+    """
+
+    try:
+        import torch
+    except ImportError:
+        return False
+    try:
+        packet = torch.ops.afd_ascend.a2e.default
+    except (AttributeError, RuntimeError):
+        return False
+    schema = getattr(packet, "_schema", None)
+    if schema is None:
+        return False
+    names = {argument.name for argument in schema.arguments}
+    return all(argument in names for argument in A2E_MXFP8_ARGUMENTS)
+
+
 def _assert_cam_namespace_registered(torch: object) -> None:
     ops = vars(torch)["ops"]
     _ = (
@@ -129,6 +159,7 @@ __all__ = [
     "CAM_DISPATCH_RECV",
     "CAM_DISPATCH_SEND",
     "CAM_OP_NAMESPACE",
+    "a2e_accepts_mxfp8_arguments",
     "ensure_afd_ascend_ops_loaded",
     "ensure_cam_async_ops_available",
     "ensure_cam_p2p_ops_available",

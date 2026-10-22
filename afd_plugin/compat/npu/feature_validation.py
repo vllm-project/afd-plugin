@@ -67,7 +67,11 @@ def fail_if_unsupported_npu_afd_features(
             "AFD NPU runtime does not support compute_gate_on_attention=true yet",
         )
     if afd_config.connector == CAMP2P_CONNECTOR:
-        from afd_plugin.connectors.npu.camp2p import CAMP2PExtraInfo
+        from afd_plugin.connectors.npu.camp2p import (
+            A2E_MX_MAX_TOTAL_RANKS,
+            CAMP2PExtraInfo,
+        )
+        from afd_plugin.envs import A2E_QUANT_MODE_MXFP8
 
         if not isinstance(extra_info, CAMP2PExtraInfo):
             raise TypeError(
@@ -75,6 +79,8 @@ def fail_if_unsupported_npu_afd_features(
                 f"{type(extra_info).__name__}",
             )
         extra_info.validate_supported()
+        if extra_info.quant_mode == A2E_QUANT_MODE_MXFP8:
+            _fail_if_unsupported_a2e_mxfp8(afd_config, A2E_MX_MAX_TOTAL_RANKS)
 
     uses_ubatching = bool(vllm_config.parallel_config.use_ubatching)
     if uses_ubatching and int(vllm_config.parallel_config.num_ubatches) != 2:
@@ -158,6 +164,32 @@ def _fail_if_unsupported_dsv4_connector(afd_config: AFDConfig) -> None:
         raise RuntimeError(
             "DSV4 NPU AFD supports only CAMAsyncAFDConnector and "
             f"CAMP2pAFDConnector; got {afd_config.connector!r}",
+        )
+
+
+def _fail_if_unsupported_a2e_mxfp8(
+    afd_config: AFDConfig,
+    max_total_ranks: int,
+) -> None:
+    """Reject A2E MXFP8 topologies the A5 transport contract excludes.
+
+    The A2E operator carries the A5-build restriction itself; the rank-shape
+    restriction is only checkable here, and rejecting it early turns a config
+    mistake into an actionable message instead of a device-side failure.
+    """
+
+    attention_ranks = afd_config.num_attention_ranks
+    ffn_ranks = afd_config.num_ffn_ranks
+    if attention_ranks != ffn_ranks:
+        raise RuntimeError(
+            "A2E MXFP8 requires equal Attention and FFN rank counts, got "
+            f"{attention_ranks} Attention and {ffn_ranks} FFN ranks",
+        )
+    total_ranks = attention_ranks + ffn_ranks
+    if total_ranks > max_total_ranks:
+        raise RuntimeError(
+            f"A2E MXFP8 supports at most {max_total_ranks} ranks in total, "
+            f"got {total_ranks}",
         )
 
 

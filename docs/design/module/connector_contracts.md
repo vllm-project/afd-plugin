@@ -93,7 +93,7 @@ than an `AFDConfig` field. Unknown fields fail in the selected connector parser.
 | Connector | Accepted connector-specific fields |
 | --- | --- |
 | `P2pNcclAFDConnector` | None; the mapping must be empty. |
-| `CAMP2pAFDConnector` | `core_num`, optional `attn_core_num` / `ffn_core_num`, `compute_gate_on_attention`, `quant_mode`, and optional positive `hccl_buffer_size`. Core counts must be positive; the current runtime rejects gate-on-Attention and any nonzero quantization mode. |
+| `CAMP2pAFDConnector` | `core_num`, optional `attn_core_num` / `ffn_core_num`, `compute_gate_on_attention`, `quant_mode`, and optional positive `hccl_buffer_size`. Core counts must be positive and gate-on-Attention is rejected. `quant_mode` accepts `0` (BF16 transport, the default) and `4` (MXFP8: an E4M3 activation plus its E8M0 block scale). Mode 4 is rejected unless the A2E MXFP8 operator is present; the FFN restores the model dtype before its MoE runs, because the router reads the activation itself and the shared experts quantize their own input. |
 | `CAMAsyncAFDConnector` | `dynamicQuant`, `attn_ranks_per_dp`, optional positive `hccl_buffer_size`, and legacy `async_moe_ubatching`, `async_moe_num_ubatches`, `async_moe_split`. The enable flag aliases native Attention DBO, only two ubatches are accepted, and the request/token split selector is ignored with a warning. |
 
 The common `afd_process_group_timeout_s` defaults to 120 seconds and controls

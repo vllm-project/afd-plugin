@@ -33,6 +33,28 @@ from afd_plugin.connectors.npu.camp2p import (
 from tests.unit.fakes.dp_metadata import DPMetadata as _FakeDPMetadata
 
 
+@pytest.fixture
+def mxfp8_operator_available(monkeypatch):
+    """Let a mode-4 connector be constructed without a device-side operator.
+
+    These tests replace ``a2e`` with a plain Python function, which carries no
+    ``.default._schema`` for the constructor's capability probe to read, and the
+    extension cannot be loaded on a host without the CANN runtime. The probe
+    itself is covered by ``test_a2e_mxfp8_contract.py``.
+    """
+
+    monkeypatch.setattr(
+        camp2p_module,
+        "ensure_cam_p2p_ops_available",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        camp2p_module,
+        "a2e_accepts_mxfp8_arguments",
+        lambda: True,
+    )
+
+
 def test_camp2p_factory_creates_connector():
     connector = AFDConnectorFactory.create_connector(
         0,
@@ -199,6 +221,7 @@ def test_camp2p_opaque_send_uses_current_stage_padding(monkeypatch, with_input_i
             int(with_input_ids),
             ids,
             scales,
+            0,
         )
         wire = sent[-1][0]
         assert wire.shape == (physical, 16)
@@ -224,6 +247,262 @@ def test_camp2p_opaque_send_uses_current_stage_padding(monkeypatch, with_input_i
         )
         assert received_refs[-1] is hidden
     assert contexts[0].cam_afdtransfer_state is not contexts[1].cam_afdtransfer_state
+
+
+def _send_path(monkeypatch, *, extra_config=None, ubatch_idx=0):
+    """Wire up the attention-side send path against a recording ``a2e``.
+
+    Both send tests need the same four things: a connector, the custom-op
+    registration that exposes ``afd_camp2p_send_attn_output``, a forward context
+    the implementation can read, and an ``a2e`` that records its arguments. Only
+    the configuration and the quantization stub differ between them.
+    """
+
+    import torch
+
+    connector = CAMP2pAFDConnector(
+        0,
+        0,
+        _vllm_config(num_ubatches=2, extra_config=extra_config),
+        AFDConfig(
+            connector="CAMP2pAFDConnector",
+            role="attention",
+            num_attention_ranks=2,
+            num_ffn_ranks=1,
+        ),
+        0,
+    )
+    methods = {}
+    monkeypatch.setattr(camp2p_module, "_CAMP2P_CUSTOM_OPS_REGISTERED", False)
+    monkeypatch.setattr(
+        camp2p_module,
+        "direct_register_custom_op",
+        lambda **kwargs: methods.update({kwargs["op_name"]: kwargs["op_func"]}),
+    )
+    camp2p_module._register_camp2p_custom_ops()
+
+    current = SimpleNamespace(
+        ubatch_idx=ubatch_idx,
+        additional_kwargs={"afd_metadata": SimpleNamespace(connector=connector)},
+    )
+    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: current)
+    sent: list[tuple] = []
+
+    def native_send(*args):
+        sent.append(args)
+        return (None, None, None, torch.tensor([1]), None, None)
+
+    monkeypatch.setattr(torch.ops.afd_ascend, "a2e", native_send, raising=False)
+    return connector, methods, sent
+
+
+def test_camp2p_send_attn_output_mxfp8_pads_the_scale_with_the_activation(
+    monkeypatch,
+    mxfp8_operator_available,
+):
+    """MXFP8 sends one E8M0 scale row per activation row, padding included.
+
+    The operator validates ``x_scale`` against the activation's row count, so a
+    padded activation with an unpadded scale would fail that check instead of
+    describing the same tokens.
+    """
+
+    import torch
+
+    connector, methods, sent = _send_path(
+        monkeypatch,
+        extra_config={"quant_mode": 4},
+        ubatch_idx=1,
+    )
+
+    scale_columns = (16 + 31) // 32
+
+    def fake_quantize(hidden):
+        return (
+            hidden.to(torch.float8_e4m3fn),
+            torch.ones(
+                (hidden.shape[0], scale_columns),
+                dtype=torch.uint8,
+            ),
+        )
+
+    monkeypatch.setattr(
+        camp2p_module,
+        "mx_quantize_a2e_activation",
+        fake_quantize,
+        raising=False,
+    )
+
+    connector.control_plane.update_state_from_dp_metadata(
+        AFDControlPayload({0: AFDDPMetadata(torch.tensor([4, 4]))}, False, True)
+    )
+    connector.control_plane.update_state_from_dp_metadata(
+        AFDControlPayload(
+            {
+                0: AFDDPMetadata(torch.tensor([4, 2])),
+                1: AFDDPMetadata(torch.tensor([1, 3])),
+            },
+            False,
+            False,
+        )
+    )
+
+    real, physical = 1, 3
+    hidden = torch.arange(real * 16, dtype=torch.float32).reshape(real, 16)
+    methods["afd_camp2p_send_attn_output"](
+        hidden,
+        "stage0",
+        "stage1",
+        "",
+        real,
+        16,
+        2,
+        1,
+        2,
+        1,
+        8,
+        0,
+        None,
+        None,
+        4,
+    )
+
+    a2e_args = sent[-1]
+    assert len(a2e_args) == 14
+    (
+        activation,
+        _expert_ids,
+        _expert_scales,
+        batch,
+        _hidden_size,
+        _topk,
+        _ffn_size,
+        _attn_size,
+        _world_rank,
+        _group_ep,
+        _aiv_num,
+        _compute_gate,
+        scale,
+        quant_mode,
+    ) = a2e_args
+    assert quant_mode == 4
+    assert batch == physical
+    assert activation.shape == (physical, 16)
+    assert activation.dtype == torch.float8_e4m3fn
+    assert scale.shape == (physical, scale_columns)
+    assert torch.count_nonzero(scale[real:]) == 0
+    assert torch.count_nonzero(scale[:real]) == real * scale_columns
+
+
+def test_camp2p_send_attn_output_bf16_keeps_the_original_operator_call(
+    monkeypatch,
+):
+    """Mode 0 must still call ``a2e`` with twelve positional arguments.
+
+    ``quant_mode=4`` adds ``x_scale`` and ``quant_mode`` to the operator, but a
+    build that predates them cannot accept those arguments at all. Keeping the
+    BF16 transport on the original call shape is what lets the default path run
+    against an older extension, so the arity is part of the contract, not an
+    implementation detail.
+    """
+
+    import torch
+
+    _connector, methods, sent = _send_path(monkeypatch)
+
+    hidden = torch.arange(16, dtype=torch.float32).reshape(1, 16)
+    methods["afd_camp2p_send_attn_output"](
+        hidden,
+        "stage0",
+        "stage1",
+        "",
+        1,
+        16,
+        2,
+        1,
+        2,
+        1,
+        8,
+        0,
+        None,
+        None,
+        0,
+    )
+
+    a2e_args = sent[-1]
+    assert len(a2e_args) == 12
+    assert a2e_args[0] is hidden
+    assert a2e_args[0].dtype == torch.float32
+
+
+def test_camp2p_recv_attn_output_mxfp8_requests_both_payloads(
+    monkeypatch, mxfp8_operator_available
+):
+    """The FFN rank supplies an empty FP8 placeholder and reads both outputs.
+
+    The operator fills the activation and its scale from the paired Attention
+    rank, so the FFN side must not pass a scale, and it must restore the model
+    dtype from the pair it gets back: the router and the shared experts both need
+    a BF16 activation, which is why the transport is the only quantized stage.
+    """
+
+    torch = pytest.importorskip("torch")
+    received: list[tuple] = []
+
+    # 1.0 in E4M3 with an E8M0 byte of 128 (2^1) dequantizes to exactly 2.0.
+    scale_byte = 128
+    expected = 2.0
+
+    def native_a2e(*args):
+        received.append(args)
+        tokens, hidden = int(args[3]), int(args[4])
+        return (
+            torch.full((tokens, hidden), 1.0, dtype=torch.float8_e4m3fn),
+            None,
+            None,
+            torch.tensor([tokens]),
+            None,
+            torch.full((tokens, (hidden + 31) // 32), scale_byte, dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(torch.ops.afd_ascend, "a2e", native_a2e, raising=False)
+
+    connector = CAMP2pAFDConnector(
+        0,
+        0,
+        _vllm_config(extra_config={"quant_mode": 4}),
+        AFDConfig(
+            connector="CAMP2pAFDConnector",
+            role="ffn",
+            num_attention_ranks=1,
+            num_ffn_ranks=1,
+        ),
+        0,
+    )
+    connector._initialized = True
+    connector.hccl_comm_name = "hccl0"
+    connector.hccl_comm_name2 = "hccl1"
+    connector.hccl_comm_name3 = ""
+    connector.hccl_comm_name1 = "moe"
+    connector.dp_metadata_list = {0: _FakeDPMetadata([7])}
+
+    payload = connector.recv_attn_output(ubatch_idx=0, layer_idx=0)
+
+    args = received[-1]
+    assert len(args) == 14
+    # Trailing a2e arguments: x_scale then quant_mode.
+    assert args[12] is None
+    assert args[13] == 4
+    assert args[0].dtype == torch.float8_e4m3fn
+    assert args[0].shape == (0, args[4])
+
+    # Whatever the DP metadata decided the row count is, the FFN gets one
+    # model-dtype row per token, carrying the transported scale.
+    hidden = int(args[4])
+    batch = int(payload.context.states.batch_size)
+    assert payload.hidden_states.dtype == torch.bfloat16
+    assert payload.hidden_states.shape == (batch, hidden)
+    assert torch.equal(payload.hidden_states, torch.full((batch, hidden), expected))
 
 
 def test_camp2p_topology_matches_original_rank_layout():
