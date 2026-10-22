@@ -1,12 +1,14 @@
 # DeepSeek-V4 AFD A5 1030 合并验证指导书
 
-更新日期：2026-10-19（性能部分按现场先后顺序组织为九步，Synthetic 数据由 benchmark 自动生成后发压；不更新已有实机验证结论）。本文合并旧 A5 dSpark/PD 指导与[1030 执行计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)，是本期现场操作入口。
+更新日期：2026-10-22（新增第 8.12 节，统一规划 BS、A/F 配比和等资源对照；方案尚未实机执行，不更新已有实机验证结论）。本文合并旧 A5 dSpark/PD 指导与[1030 执行计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)，是本期现场操作入口。
 执行计划规定交付范围和日期，本文规定现场命令、验证顺序、证据与失败处理。
 本文是待执行指导，不代表组合已经通过 A5 验收。
 
 **执行标记**：`【本地已完成】` 为代码/配置的离线检查；`【A5 手工执行】` 为需要你在 A5 实际环境完成的操作。首次执行从[手工交接清单](DEEPSEEK_V4_AFD_A5_MANUAL_HANDOFF_ZH.md)的 A5-01 开始。**2026-10-19 最新跨机核对**：10-16 日 cross-C5 full 92 项通过、90 个非流式响应全部非空且无输出 token ID `0`、四 DP 与 Proxy 请求归零。实际为两机 P2+A4+F2，P/F 在 `.18`、A 在 `.14`；缺 Attention 侧日志/metrics，site.env 与实际地址不符，P/F 末尾有 Killed。当前按[cross-C5 本轮结果第 5 节](DEEPSEEK_V4_AFD_CROSS_C5_20261016_RESULT_ZH.md)补材料，完整 F0、第二轮和三机 P8+A4+F2 尚不能据此关闭。此前各日期的单机状态和对照步骤保留作历史，不要求为确认本轮请求结果立即重跑 full。
 
 ## 0. 只做性能验证时，从哪里开始
+
+**当前要探索有收益的部署拓扑时，优先按第 8.12 节执行。** 该节结合 10-21 测量中的生成路径异常，先检查执行路径，再对比 A4F2 加 BS、A4F4 和原生 D8；增加 A 卡、TP2 和跨机 A/F 按瓶颈选择补测。下述单机九步保留为原配置的复现流程；新拓扑使用第 8.12 节的环境覆盖和跨机操作说明，不直接套用单机卡位。
 
 按第 8.2–8.10 节顺序执行：**准备环境 → 设置 Synthetic 参数 → 选择一组配置 → 启动 → 检查 → 预热和测量 → 停服 → 换组/扩展长度 → 计算收益**。
 
@@ -1386,6 +1388,8 @@ export MAX_CUDAGRAPH_CAPTURE_SIZE= CUDAGRAPH_CAPTURE_SIZES=
 export FFN_SEQ_CAPACITY=$((2 * DECODE_BS))
 export CAPACITY=$((4 * DECODE_BS))
 export REQUEST_COUNT=$((6 * CAPACITY))
+export PERF_REQUEST_RATE=inf
+unset SLO_TTFT_MS SLO_TPOT_MS
 export ENABLE_PD=1 ENABLE_MTP=0 ENABLE_DSPARK=0 USE_AFD=0
 export MODEL_PATH="$FLASH_MODEL_PATH" EXECUTION_MODE=full-decode-only U_BATCHES=1
 case "$PERF_CASE" in
@@ -1432,7 +1436,8 @@ wait_http() {
     sleep 5
   done
 }
-nohup bash "$RECIPE/afd_prefill.sh" > "$RUN_ROOT/prefill.log" 2>&1 &
+MAX_NUM_SEQS="${PREFILL_MAX_NUM_SEQS:-$MAX_NUM_SEQS}" \
+  nohup bash "$RECIPE/afd_prefill.sh" > "$RUN_ROOT/prefill.log" 2>&1 &
 echo $! > "$RUN_ROOT/prefill.pid"
 wait_http "http://$PREFILL_HOST_IP:$PREFILL_API_PORT/health"
 ```
@@ -1459,7 +1464,8 @@ else
   nohup "$VLLM_BIN" serve "$MODEL_PATH" \
     --host 0.0.0.0 --port "$ATTENTION_API_PORT" \
     --api-server-count 1 --served-model-name dsv4-afd \
-    --data-parallel-size 4 --tensor-parallel-size 1 --enable-expert-parallel \
+    --data-parallel-size "$((ATTENTION_RANKS / TENSOR_PARALLEL_SIZE))" \
+    --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" --enable-expert-parallel \
     --max-model-len "$MAX_MODEL_LEN" --max-num-seqs "$DECODE_BS" \
     --max-num-batched-tokens "$ATTENTION_MAX_NUM_BATCHED_TOKENS" \
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" --seed 1024 \
@@ -1501,6 +1507,12 @@ PY
 ```bash
 run_perf_batch() {
   local name="$1" count="$2"
+  local -a goodput_args=()
+  if [[ -n "${SLO_TTFT_MS:-}${SLO_TPOT_MS:-}" ]]; then
+    : "${SLO_TTFT_MS:?Set both SLO_TTFT_MS and SLO_TPOT_MS}"
+    : "${SLO_TPOT_MS:?Set both SLO_TTFT_MS and SLO_TPOT_MS}"
+    goodput_args=(--goodput "ttft:$SLO_TTFT_MS" "tpot:$SLO_TPOT_MS")
+  fi
   curl --noproxy '*' -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/$name.metrics-before.txt"
   "$VLLM_BIN" bench serve \
     --backend openai --base-url "$BASE_URL" --endpoint /v1/completions \
@@ -1508,7 +1520,8 @@ run_perf_batch() {
     --dataset-name random --random-input-len "$ISL" --random-output-len "$OSL" \
     --random-range-ratio 0.0 --random-prefix-len 0 \
     --seed 1024 --num-prompts "$count" --max-concurrency "$CAPACITY" \
-    --request-rate inf --ignore-eos --num-warmups 0 --ready-check-timeout-sec 0 \
+    --request-rate "${PERF_REQUEST_RATE:-inf}" "${goodput_args[@]}" \
+    --ignore-eos --num-warmups 0 --ready-check-timeout-sec 0 \
     --extra-body "{\"temperature\":0,\"seed\":1024,\"min_tokens\":$OSL}" \
     --metadata dataset=Synthetic synthetic_seed=1024 input_len="$ISL" output_len="$OSL" \
       prefix_len=0 range_ratio=0.0 \
@@ -1685,6 +1698,153 @@ ss -ltnp > "$RUN_ROOT/ports-after-stop.txt"
 参考 [V3.2 CAMP2p recipe](../../recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) 的 Synthetic 数据设计、BS 扫描、F 容量和六波供给；V4 主测固定输出 1024，使用 Synthetic 输入、真实 Prefill/KV 和自然专家路由。Synthetic 输入不等于合成 KV；参考中的强制均衡、逻辑专家规模模拟和合成 KV 不加入本节主测。
 
 当前 `tools/benchmarks/decode_bench.py` 的 `start_load_kv()` 不调用其 KV 填充流程，设置 fill mean/std 不证明缓存已初始化。独立纯 Decode 验收后再测，其分母包含所有 D 或 A+F 设备；本节经过 Proxy 的结果始终包含 P 成本。NPU/die 映射未核实时，单位写 `tokens/s/NPU`。
+
+### 8.12 【A5 手工执行】寻找 AFD 收益点：统一调整 BS、A/F 配比与测试负载
+
+本节是 **2026-10-22 的待执行实验方案**。10-21 非 DSpark 测量中，AFD 的生成阶段约慢 11.6–11.9 倍，A/F 利用率也低；当前证据不足以将其归因于 F2 带宽或小 batch。先消除执行异常，再寻找吞吐、延迟和资源效率的折中点；不能预先保证某个拓扑有收益。
+
+#### 8.12.1 先明确每种调整解决什么问题
+
+先关闭 DSpark，固定 TP1、自然专家路由、相同 U2 配置。记 A 侧 DP 数为 `D_A`，每 DP 实际参与该步的序列数为 `B`，则普通 Decode 全局真实 token 数约为 `N=D_A×B`。U2 均分时，每个 stage 约为 `N/2`；实际不均衡、dummy 和 padding 单列。
+
+若该层有 `E=256` 个 routed experts、每 token 路由 `k` 个专家，均匀路由下每个专家每 stage 的平均 token 数约为 `N×k/(2×E)`。`k` 以实际模型配置为准，真实分布需采集，不能用均值宣称所有专家均已激活。
+
+| 调整 | 全局 batch / 每专家 token | 资源和可能代价 |
+|---|---|---|
+| A4F2，BS24→48 | N：96→192，每专家 token 约翻倍 | 卡数不变；A 的计算、KV 和 F 的工作量增加，TPOT 可能上升 |
+| A4F2→A4F4，同 BS | N 不变，每专家 token 不变 | F 的 EP2→EP4，均匀放置时每卡专家 128→64；增加计算/带宽容量，也改变 EP 通信 |
+| A4F2 BS48→A8F2 BS24 | N 都为 192，每专家 token 近似相同 | A 卡翻倍、每 A 的 KV/序列压力降低；F2 容量未增加，需要额外资源及跨机 A/F |
+| A4F4 TP1→TP2，同 N | A DP4→DP2，需要把每 DP BS 翻倍 | F 的 EP 仍为 4；Attention 增加 TP 通信，不能当作专家再切半 |
+
+因此，**BS 与增加 F 是互补的两个变量**。优先比较 A4F2 BS24/48 和 A4F4 BS24/48。U2 的每专家小 batch 问题不因 F2→F4 自动改善；更大的 BS 也不保证延迟更好。
+
+#### 8.12.2 第一阶段：先确认 Graph/U2 的实际执行路径
+
+1. 各节点冻结相同插件提交、vLLM/vLLM-Ascend、CANN/驱动和模型/tokenizer hashes，原生也使用同一套环境。旧结果保留为历史；新旧版本分别成表。
+2. 原生 D4 与 A4F2 先复查 BS24、并发 96。保留 16384/1024 原负载，再补 1024/1024，区分长上下文、P 供给和生成路径。短输入仍走真实 Prefill/KV/Proxy，称为“Decode 占比较高的端到端测试”。
+3. capture 留空由 recipe 生成：无 DSpark，BS24 max=24、BS48 max=48；DSpark block=5 时分别为 144、288。检查实际 replay/eager 次数、per-step 真实 token、两级 U2 stage key，以及 F 接收 buffer。仅有捕获日志不能证明在线命中。
+4. 若仍出现数量级的生成时延差距和低 A/F 利用率，暂停全矩阵扩卡。先采集一个代表点约 5–10 秒的 A/F timeline，拆分 A 计算、A→F、F MoE/EP 通信、F→A、CPU launch 和等待，关联相同 step/stage，避免把重叠区间重复相加。
+5. 必要时单独做双方 eager/U1 对照，再比较 AFD eager/U1→eager/U2→Graph/U2，每次只改一个变量。原生 eager 须移除第 8.5 节的 Graph 参数、改用 `--enforce-eager`；AFD 使用 `EXECUTION_MODE=eager U_BATCHES=1/2`。当前 recipe 的 Graph 路径要求 U2，不能直接构造 AFD Graph/U1。诊断结果与正式 Graph 部署对照分表，计时前关闭诊断/profiler。
+
+无既有 replay 计数时，以受控短 profile 验证；不得将 `is_graph_capturing=False` 当作 eager 回退证据。运行异常尚未定位时，只做少量诊断点，不将“扩大 BS 后吞吐变高”视为异常已经修复。
+
+#### 8.12.3 第二阶段：用两台机器筛选 TP1 拓扑
+
+推荐先让 **机器 P 独占 P2+Proxy，机器 D 放完整 A/F 或原生 D**。A/F 优先同机，减少每层跨机往返这一变量；P→D 的 KV 跨机在各组保持一致。P 机器暂不混放 F，避免 P/F 争用。下表卡位是示例，须按实际 NPU 互联、NUMA 和网卡亲和性选取并冻结；记录同机 A/F 及 F 内 EP 的真实链路。此布局用于性能筛选，不替代三机远程 A/F 功能验收。
+
+| 配置点 | 机器 D 卡位 | 每 A/D DP 的 BS | 配置总容量 N | Decode 用卡 | 主要比较 |
+|---|---|---:|---:|---:|---|
+| A4F2-96 | A：0–3；F：4–5 | 24 | 96 | 6 | 修正执行路径后的起点 |
+| A4F2-192 | 同上 | 48 | 192 | 6 | 固定卡数增加 BS 的效果 |
+| A4F4-96 | A：0–3；F：4–7 | 24 | 96 | 8 | 固定 A 和 batch，增加 F 的效果 |
+| A4F4-192 | 同上 | 48 | 192 | 8 | 增加 F 与 BS 的组合 |
+| D4-96 / D4-192 | D：0–3 | 24 / 48 | 96 / 192 | 4 | 相同 A/D DP 数的原生参照；D4 的 EP4 也有每卡 64 个专家 |
+| D8-96 / D8-192 | D：0–7 | 12 / 24 | 96 / 192 | 8 | 与 A4F4 严格相同 Decode 卡数的部署参照 |
+
+上表的 N 是容量，**不等于实测每步 batch**。每个配对点先固定客户端并发 `C=96` 或 `192`，请求数和输入集合也一致，采集各 DP 实际 running/waiting 与 per-step token。P 供给或客户端不足时，C 不会全部变成生成中序列。需要增加 C 来填满时，双方另建相同 C 的对照，不能只给 AFD 增压。
+
+先在 1024/1024 下检查生成路径和 batch 扩展，再用 16384/1024 评估真实长上下文收益；32K/更长输入只测有潜力的 1–2 个拓扑和原生参照。短输入慢不自动否定长上下文价值：若原生先遇到 KV 容量上限，而 AFD 可在相同 SLO 下提高活跃请求数，仍值得做各自最佳容量比较。发现容量拐点时，在 BS24 和 48 之间补 BS32；BS64 仅在 BS48 的 TPOT、KV 和 HBM 仍允许时补测。不要先跑所有维度的笛卡尔积。
+
+**执行覆盖。** 两机分别按第 3 节准备实际 site/node 环境、HIXL 设备资源和端口。下列代码在两机各自加载环境后执行，替代第 8.2、8.4 节固定单机拓扑/BS 的赋值；模型路径、端口、网卡和运行目录仍使用已验证的现场值。`PREFILL_HOST_IP`、`ATTENTION_HOST_IP` 在两机填写相同地址，`HCCL_IF_IP` 保持各自本机地址。
+
+```bash
+export POINT=A4F4           # A4F2 / A4F4 / D4 / D8
+export CAPACITY=192         # 首轮用 96，再测 192；这是客户端并发上限
+export ISL=1024 OSL=1024 PHASE=check
+export TOPOLOGY=cross PREFILL_DP_SIZE=2 PREFILL_TP_SIZE=1
+export PREFILL_DEVICES=0,1 PREFILL_MAX_NUM_SEQS=48
+export PREFILL_MAX_NUM_BATCHED_TOKENS=4096
+export TENSOR_PARALLEL_SIZE=1 ENABLE_PD=1 ENABLE_MTP=0 ENABLE_DSPARK=0
+export MODEL_PATH="$FLASH_MODEL_PATH" EXECUTION_MODE=full-decode-only
+export USE_AFD=0 U_BATCHES=1 ATTENTION_RANKS=4 FFN_RANKS=2
+export ATTENTION_DEVICES=0,1,2,3 FFN_DEVICES=4,5
+case "$POINT" in
+  A4F2) export USE_AFD=1 U_BATCHES=2 ;;
+  A4F4) export USE_AFD=1 U_BATCHES=2 FFN_RANKS=4 FFN_DEVICES=4,5,6,7 ;;
+  D4) ;;
+  D8) export ATTENTION_RANKS=8 ATTENTION_DEVICES=0,1,2,3,4,5,6,7 ;;
+  *) printf 'Unknown POINT\n' >&2; exit 2 ;;
+esac
+((CAPACITY % ATTENTION_RANKS == 0)) || exit 2
+export DECODE_BS=$((CAPACITY / ATTENTION_RANKS)) MAX_MODEL_LEN=$((ISL + OSL))
+export MAX_NUM_SEQS="$DECODE_BS" REQUEST_COUNT=$((6 * CAPACITY))
+export FFN_SEQ_CAPACITY=$(((CAPACITY + FFN_RANKS - 1) / FFN_RANKS))
+export ATTENTION_MAX_NUM_BATCHED_TOKENS=4096 FFN_MAX_NUM_BATCHED_TOKENS=8192
+export MAX_CUDAGRAPH_CAPTURE_SIZE= CUDAGRAPH_CAPTURE_SIZES=
+export FFN_HOST_IP="$ATTENTION_HOST_IP" AFD_HOST="$ATTENTION_HOST_IP"
+export PROXY_HOST_IP="$PREFILL_HOST_IP" API_PORT="$ATTENTION_API_PORT"
+export BASE_URL="http://$PROXY_HOST_IP:$PROXY_PORT"
+export ATTENTION_URL="http://$ATTENTION_HOST_IP:$ATTENTION_API_PORT"
+export PERF_CASE="${POINT}-n${CAPACITY}"
+export CASE="$PERF_CASE" CYCLE=1
+export PERF_REQUEST_RATE=inf
+unset SLO_TTFT_MS SLO_TPOT_MS
+case "$PHASE" in
+  check) export AFD_HCCL_STAGE_DIAGNOSTICS=1 ;;
+  measure) export AFD_HCCL_STAGE_DIAGNOSTICS=0 ;;
+  *) exit 2 ;;
+esac
+export AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS=0 VLLM_LOGGING_LEVEL=INFO
+export AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP=1 AFD_HCCL_GRAPH_U2_HYBRID_DAG=1
+export AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM=1
+export AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM=1 AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER=1
+export GLOO_SOCKET_IFNAME="$NIC_NAME" HCCL_SOCKET_IFNAME="$NIC_NAME"
+export TP_SOCKET_IFNAME="$NIC_NAME"
+export VLLM_PLUGINS=ascend,ascend_model,ascend_model_loader,ascend_kv_connector,afd
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}localhost,127.0.0.1,$PREFILL_HOST_IP,$ATTENTION_HOST_IP"
+export no_proxy="$NO_PROXY"
+```
+
+`FFN_SEQ_CAPACITY=ceil(N/F)` 只是本表 TP1 普通 Decode 的接收序列容量起点，不是路由后每专家 token 数，也不替代 token/Graph buffer 检查。DSpark、padding 和 F>A 时按真实 shape 重新验收。P 的 max seqs/token budget 在各组固定；P2 无法供满时先标记供给受限，扩大 P 必须双方一起调整并重新计费。
+
+两机使用相同 `RUN_ID`，例如协调终端生成后复制该值到另一机；各机单独创建 `RUN_ROOT`，保存本机 env、runtime、日志和 PID。不要各机独立生成时间戳，也不要在覆盖上述变量后重新执行第 8.2/8.4 节的固定赋值。
+
+```bash
+# 在一个协调终端生成；将打印的完整 export 行复制到另一机执行。
+export RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-topo-$PERF_CASE-i$ISL-$PHASE"
+printf 'export RUN_ID=%q\n' "$RUN_ID"
+# 两机在 RUN_ID 一致后分别执行。
+export RUN_ROOT="$RUN_BASE/$RUN_ID/$(hostname -s)"
+mkdir -p "$RUN_BASE/$RUN_ID"
+mkdir "$RUN_ROOT"
+cp "$SITE_FILE" "$RUN_ROOT/site.env"
+cp "$NODE_FILE" "$RUN_ROOT/node.env"
+```
+
+启动沿用第 8.5 节命令，但 **P 的启动块仅在机器 P 执行，A/F 或原生 D 的启动块仅在机器 D 执行，最后回机器 P 启动 Proxy**。两机均定义 `wait_http`；benchmark 可在机器 P 执行。第 8.5 节原生命令已按 `ATTENTION_RANKS/TP` 推导 DP，D8 不再固定为 DP4。检查 ready、drafter 和 shutdown 的 rank 数按实际拓扑调整，禁止沿用固定“四个 A/D、两个 F”。正常停服同样分别在保存各角色 PID 的本机执行；按第 9 节归档两机材料。
+
+原生候选 Graph/U1、AFD Graph/U2 的差异保留记录，结论称为部署收益。要隔离 AFD 分离本身，另验收原生 U2 或双方 eager/U1 对照。D8/新 A/F 配比均为待实机验收候选，不能仅凭 CLI 合法写成已经支持或性能通过。
+
+#### 8.12.4 如何根据结果选择下一步
+
+| 观察结果 | 下一步 |
+|---|---|
+| A4F2 BS48 的 Q 增长，TPOT 仍在目标内 | 优先保留，验证 BS32/48 的折中；若收益进入平台期，不继续盲加 BS |
+| A4F4 同 N 明显降低 F MoE/关键路径耗时 | 说明增加 F 容量有效；再看 BS48 是否同时改善权重读取摊薄，并与 D8 比等资源效率 |
+| A4F4 比 A4F2 快，但按实际卡数归一后仍下降 | 只能称增资源提速；继续比较 D8 和 SLO 容量，不能宣布效率收益 |
+| A 时间/KV 成为限制，F 尚有余量 | 再测 A8F2 BS24 对 A4F2 BS48（N 都为 192），验证增加 A 的价值 |
+| A、F 都接近容量上限 | 才考虑 A8F4；同样先做同 N 对照，再测自身容量上限 |
+| F 等待 A，或低利用率且通信/同步占比高 | 优先处理执行路径、网络或重叠；继续增加 F 通常无助于该瓶颈 |
+
+可选 **A2F4 BS48/96** 对应 N96/192，与 A4F2 同为 6 张 Decode 卡，可探索把两张 A 转给 F 的效果。它使用 F>A 的 fan-out/切分路径，每 A 负担更重；先过请求、Graph/U2、padding、输出质量和正常停服预检，再做性能测试。该点不能由 A4F4 已跑通推定可用。
+
+A8F2 不能与 P2 一起放在上述机器 D。若只有两机，改为机器一 A8，机器二 P2+F2；**此时 A4F2 BS48 也要按同样的跨机 A/F 布局重测**，才与 A8F2 BS24 配对，避免把跨机通信变化归因于 A 卡数量。三机可固定 P、A、F 各一机后扫配比。当前 recipe 每个角色最多 8 卡、各角色在单机启动，不直接支持一个角色跨多机扩成 A16/F16。
+
+TP2 放到后续：A4F4 TP1 为 A DP4/F DP4，BS24 对应 N96；TP2 为 A DP2/F DP2，需要 BS48 才对应 N96，F 均为 EP4。比较 N192 时分别用 BS48/96。P 的 TP/KV 配置也须相容（当前 helper 要求 P TP≥A TP）；将 P2 从 DP2/TP1 改为 DP1/TP2 属于新的配对实验，双方同步调整。先证明 Attention 的 TP 加速能抵消通信，不能因为每卡专家相同就认为两种并行方式等价。
+
+#### 8.12.5 正式测量与“有收益/不严重劣化”的判定
+
+- 每个新点先 `check`；筛选只做一次预热和短测，不据此写正式收益。优胜 AFD 点及原生参照按第 8.7 节至少各三轮，交替安排配置并记录冷启动/同进程重复关系。初始 `6×C` 请求若没有稳定窗口，双方一起增加请求数；保存统一的开始/结束墙钟、每轮请求集及波动范围。
+- 先在同样输入/输出、C、请求数、DSpark 状态下比较 Q、TTFT/TPOT 的 P50/P95/P99、真实 batch、每角色 HBM/KV、通信/计算等待。一次短 profile 仅用于归因；正式测量关闭 profiler 和 stage 诊断。失败 0、真实 token 数正确、Proxy 和全部 D/A running/waiting 归零、正常停服是每个点的有效性条件；精度验收另行完成。
+- **探索阶段可暂用**“同 C 下 Q≥原生的 90%，且 TPOT P95≤原生的 110%”筛出不严重劣化点，同时检查 TTFT 和业务 SLO；这是建议的筛选线，不是既有交付门槛，也不是用户已冻结的业务目标。正收益应超过重复测量的波动，并在相同 SLO/资源下成立。
+- 用卡数同时报 Decode 和全链路：A4F2 为 6/8，A4F4 为 8/10，D4 为 4/6，D8 为 8/10，后一个数均含 P2。两机各预留整机时，还报 `Q/16` 和实际预留成本。A4F4 相对 D4，总 Q 至少达到 2 倍才持平 Decode 每卡效率；包含 P2 时阈值是 `10/6≈1.67` 倍。与 D8 相比才是相同实际用卡的直接比较。以上比例是核算关系，不是性能预测。D8 有 8 张卡参与专家计算，A4F4 只有 F4，故 A4F4 并不天然占优；应实测 KV 容量、A/F 重叠或共享 F 的价值能否补偿分离和通信成本。
+- 最后冻结业务 TTFT/TPOT SLO，在同一请求集、相同有限 RPS 下逐级增压；双方各自调到合法最佳 BS/C 后再比较最大可持续流量。既要报告相同 C 的对照，也要单列各自最佳容量。不要要求 D8 保持 BS12/24 而限制它进一步调优。
+
+第 8.6 节 `run_perf_batch` 支持 `PERF_REQUEST_RATE` 和可选的 `SLO_TTFT_MS/SLO_TPOT_MS`：吞吐筛选保持 `PERF_REQUEST_RATE=inf`；SLO 实验在新 run 中把它设为双方相同的有限 requests/s，并将两个 SLO 变量设为事先冻结的毫秒值，再调用同一个函数。固定相同 `CAPACITY/REQUEST_COUNT`，检查客户端限并发有无推迟发送，记录实际到达速率；限流导致到达达不到目标时，不称为目标 RPS 已通过。需要 E2E SLO 时再加入 `e2el` 条件。
+
+`request_goodput` 是同时满足门槛的**成功请求数/总秒数**，不是 tokens/s；另报达标请求比例和失败率。官方参数定义见 [vLLM 0.23 benchmark 源码](https://github.com/vllm-project/vllm/blob/v0.23.0/vllm/benchmarks/serve.py)，现场以冻结 commit 的 `--help` 和结果字段为准。EP/DP/TP 的概念可核对 [vLLM EP 文档](https://github.com/vllm-project/vllm/blob/v0.23.0/docs/serving/expert_parallel_deployment.md)；其中 CUDA 通信后端建议不直接套用到 Ascend。
+
+DSpark 只在筛出的 1–2 个拓扑上追加：双方冻结同一 target、draft 和 block，确认 A 的 draft eager、F 无 drafter，重算 capture/buffer，记录 proposed/accepted 增量。以真实输出 Q、TPOT 和 SLO goodput 判优，不能以接受率代替收益。最终至少交付“同负载比较、等资源比较、各自最佳 SLO 容量”三张表，并注明未找到收益点时的瓶颈与适用范围。
 
 ## 9. 【A5 手工执行】失败回传与最终交付表
 
