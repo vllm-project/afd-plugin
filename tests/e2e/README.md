@@ -190,6 +190,27 @@ python -m pytest -q -s \
   -k 'afd-v2'
 ```
 
+### FastAFD connector (SM100)
+
+`FastAFDAFDConnector` runs the same 1A1F scenarios on two Blackwell GPUs with an
+FP8 Qwen3.5/3.6 checkpoint. Build the extension first
+(`AFD_BUILD_FASTAFD_OPS=1`, see the
+[FastAFD guide](../../docs/gpu/FASTAFD_CONNECTOR_USER_GUIDE.md)). The MRV2
+evidence check covers Attention graph replays only; FastAFD FFN launches one
+persistent kernel per step and keeps no graphs.
+
+```bash
+AFD_E2E_BACKEND=gpu python -m tests.e2e.runner \
+  --model /path/to/Qwen3.6-35B-A3B-FP8 \
+  --device-backend gpu \
+  --common-vllm-arg=--max-model-len=4096 \
+  --common-vllm-arg=--language-model-only \
+  --attention-devices 0 --ffn-devices 1 \
+  --scenario afd-v2-graph-1a1f \
+  --afd-connector FastAFDAFDConnector --compute-gate-on-attention \
+  --gsm8k-output-path /tmp/fastafd-gsm8k
+```
+
 ### GPU MRV2 DBO development comparison
 
 The `afd-v2-eager-dbo-dp2` and `afd-v2-graph-dbo-dp2` scenarios cover

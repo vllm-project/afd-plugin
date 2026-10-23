@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
     CAMP2P_CONNECTOR,
+    FASTAFD_CONNECTOR,
     AFDConfig,
     parse_afd_config,
 )
@@ -40,6 +41,11 @@ VLLM_ASCEND_NPU_WORKER_FQCN: Final[str] = "vllm_ascend.worker.worker.NPUWorker"
 VLLM_ASCEND_310P_WORKER_FQCN: Final[str] = "vllm_ascend._310p.worker_310p.NPUWorker310"
 VLLM_ASCEND_XLITE_WORKER_FQCN: Final[str] = "vllm_ascend.xlite.xlite_worker.XliteWorker"
 GPU_MRV2_NUM_UBATCHES: Final[int] = 2
+# Synchronous connectors driven by the GPU ModelRunnerV2 control plane.
+GPU_MRV2_CONNECTORS: Final[tuple[str, ...]] = (
+    "P2pNcclAFDConnector",
+    FASTAFD_CONNECTOR,
+)
 
 
 CAM_MAX_RECEIVE_TOKENS = 262144
@@ -91,9 +97,10 @@ def validate_gpu_model_runner_v2_config(
         raise RuntimeError("AFD GPU requires ModelRunnerV2")
 
     afd_config = parse_afd_config(vllm_config, expected_role=expected_role)
-    if device_type != "cuda" or afd_config.connector != "P2pNcclAFDConnector":
+    if device_type != "cuda" or afd_config.connector not in GPU_MRV2_CONNECTORS:
         raise RuntimeError(
-            "AFD ModelRunnerV2 requires CUDA and synchronous P2pNcclAFDConnector",
+            "AFD ModelRunnerV2 requires CUDA and one of the synchronous "
+            f"connectors {GPU_MRV2_CONNECTORS!r}",
         )
 
     parallel = vllm_config.parallel_config

@@ -188,8 +188,21 @@ native hybrid Qwen3.5/3.6 architecture. Attention owns embeddings, norms, and
 linear/full-attention state, then sends hidden states only. FFN owns the native
 gate, routed experts, shared expert, and shared-expert gate.
 
+With `FastAFDAFDConnector` the split moves: Attention also owns the gate, the
+shared expert and the shared-expert gate (`AFDQwen3_5AttentionRoutedMoE`),
+computes native softmax top-k with `norm_topk_prob` renormalization, and hands
+only routed experts to the connector: `dispatch` sends them, the shared expert
+runs while the FFN ranks compute, and `combine` returns the routed output that
+is added to it. Two custom ops (`afd_fastafd_dispatch`, `afd_fastafd_combine`)
+carry data dependencies through the shared expert, so `torch.compile` keeps it
+between the two kernels while the shared expert itself stays compiled. FFN loads the routed experts itself through
+`FastAFDFFNModelRunner`. The routed experts then run in the kernel's per-32
+UE8M0 FP8 format (activations and the SwiGLU intermediate are quantized), so
+outputs differ from the native block-FP8 path at the level of that format.
+
 This path is CUDA-only, text-only, and requires `--language-model-only`,
-`compute_gate_on_attention=false`, and `pipeline_parallel_size=1`. It rejects
+`compute_gate_on_attention=false` (P2P) or `true` (FastAFD), and
+`pipeline_parallel_size=1`. It rejects
 multimodal execution, sequence-parallel MoE, EPLB, speculative decoding, and
 LoRA before language-model construction; NPU model-config resolution fails
 before model loading. GDN DBO is unsupported under native hybrid/multimodal

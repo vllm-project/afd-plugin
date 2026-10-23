@@ -45,6 +45,7 @@ from tests.e2e.process_utils import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ASYNC_AFD_CONNECTOR = "CAMAsyncAFDConnector"
+FASTAFD_AFD_CONNECTOR = "FastAFDAFDConnector"
 ASYNC_CAM_SCENARIO = "afd-eager-async-cam"
 ASYNC_CAM_ATTENTION_RANKS = 2
 ASYNC_CAM_FFN_RANKS = 2
@@ -948,8 +949,11 @@ def uses_dbo_execution(args: argparse.Namespace) -> bool:
 
 def execution_evidence_roles(args: argparse.Namespace) -> tuple[str, ...]:
     # Async CAM stages belong to Attention; FFN consumes independent native
-    # work items. Sync graph/DBO must prove the matching path on both roles.
-    return ("attention",) if uses_async_connector(args) else ("attention", "ffn")
+    # work items. FastAFD FFN runs one persistent expert kernel per step and
+    # keeps no graphs. Sync graph/DBO must prove the matching path on both roles.
+    if uses_async_connector(args) or args.afd_connector == FASTAFD_AFD_CONNECTOR:
+        return ("attention",)
+    return ("attention", "ffn")
 
 
 def needs_mrv2_execution_evidence(args: argparse.Namespace) -> bool:

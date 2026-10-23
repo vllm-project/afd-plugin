@@ -45,3 +45,28 @@ small outputs cannot pass merely because of the absolute tolerance. It checks
 MoE semantics independently of the transport test, but does not replace
 DP2/TP4/EP8 E2E or two-stage token-layout tests. A failed or unexecuted probe
 must be reported as such rather than treated as evidence of accuracy.
+
+## FastAFD M2N kernel parity (SM100)
+
+`fastafd_m2n_reference` checks the FastAFD dispatch/combine and expert kernels
+on two Blackwell GPUs with real experts from an FP8 Qwen3.5/3.6 checkpoint.
+Build the extension in place first:
+
+```bash
+AFD_BUILD_FASTAFD_OPS=1 python setup.py build_ext --inplace
+torchrun --nproc-per-node 2 -m tests.e2e.operators.fastafd_m2n_reference \
+  --model /path/to/Qwen3.6-35B-A3B-FP8 --output /path/to/evidence/m2n
+```
+
+The last `--num-ffn-ranks` ranks (default 1) are FFN and launch one persistent
+expert kernel per case. The others route tokens and run the Attention kernels
+for every layer and lane, fused or split into dispatch and combine as serving
+does, with checkpoint-gate routing or with every token on the same experts.
+Each output is compared with a matched reference that applies the kernel's
+per-32 UE8M0 FP8 quantization and bf16 rounding (relative L2 bound 0.01, fixed
+in the script), and with the checkpoint's block-FP8 math for information.
+Defaults cover layers 0 and 1, one and two lanes, and 1, 7, 64 and
+`--max-tokens` (256) tokens per rank; `--empty` adds a final step with no
+tokens. `--production` runs the split path through `FastAFDAFDConnector` and
+`FastAFDExpertExecutor` instead of the raw kernels, with uneven lane token
+counts and empty steps between non-empty ones.

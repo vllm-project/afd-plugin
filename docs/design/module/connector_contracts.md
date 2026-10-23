@@ -19,6 +19,7 @@ depends_on:
 validation_paths:
   - "tests/unit/fakes/**"
   - "tests/unit/connectors/**"
+  - "tests/e2e/operators/fastafd_m2n_reference.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
   - "tests/unit/distributed/**"
@@ -28,6 +29,7 @@ upstream_refs:
   - "PyTorch torch.distributed process-group APIs used by the pinned runtime"
 verified_platform_refs:
   - "P2pNcclAFDConnector GPU unit and E2E paths"
+  - "FastAFDAFDConnector SM100 kernel parity and Qwen3.6 FP8 E2E paths"
   - "CAMP2pAFDConnector and CAMAsyncAFDConnector Ascend unit and E2E paths"
 related_issues:
   - "#88"
@@ -93,6 +95,7 @@ than an `AFDConfig` field. Unknown fields fail in the selected connector parser.
 | Connector | Accepted connector-specific fields |
 | --- | --- |
 | `P2pNcclAFDConnector` | None; the mapping must be empty. |
+| `FastAFDAFDConnector` | None; the mapping must be empty. |
 | `CAMP2pAFDConnector` | `core_num`, optional `attn_core_num` / `ffn_core_num`, `compute_gate_on_attention`, `quant_mode`, and optional positive `hccl_buffer_size`. Core counts must be positive; the current runtime rejects gate-on-Attention and any nonzero quantization mode. |
 | `CAMAsyncAFDConnector` | `dynamicQuant`, `attn_ranks_per_dp`, optional positive `hccl_buffer_size`, and FFN two-stream options. Attention microbatching uses native DBO configuration. |
 
@@ -103,7 +106,8 @@ it does not resize unrelated vLLM groups. For Async CAM, also set
 environment rather than querying the allocated domain.
 
 The common `compute_gate_on_attention` field remains on `AFDConfig` and is the
-model-routing selector. CUDA P2P supports both values. CAMP2P also parses a
+model-routing selector. CUDA P2P supports both values; FastAFD requires
+`true` because Attention routes and the kernels carry top-k ids and weights. CAMP2P also parses a
 connector-local field with that name for its operator contract, but the current
 synchronous NPU runtime requires both common and connector-local values to be
 `false`. CAM async requires the common field to be `true`.
@@ -113,6 +117,7 @@ synchronous NPU runtime requires both common and connector-local values to be
 | Connector | Platform | World ordering | Control plane | FFN step selection |
 | --- | --- | --- | --- | --- |
 | `P2pNcclAFDConnector` | CUDA | FFN ranks, then Attention ranks | `P2pNcclAFDControlPlane`; stage DP metadata over a separate NCCL group | `connector.control_plane is not None` |
+| `FastAFDAFDConnector` | CUDA (SM100) | Attention ranks, then FFN ranks | `FastAFDControlPlane`; Attention union rank 0 sends each step plan to every FFN rank over the union NCCL group | `connector.control_plane is not None` |
 | `CAMP2pAFDConnector` | Ascend | FFN ranks, then Attention ranks | `CAMP2pAFDControlPlane`; stage DP metadata over Gloo plus HCCL data groups | `connector.control_plane is not None` |
 | `CAMAsyncAFDConnector` | Ascend | Attention ranks, then FFN ranks | `None`; routing/token metadata travels with CAM dispatch payloads | `connector.control_plane is None` |
 
@@ -274,6 +279,7 @@ metadata is present.
 
 | Connector | Connector-owned resources | Topology constraints and mapping |
 | --- | --- | --- |
+| CUDA FastAFD | Attention-first union NCCL group, one symmetric-memory buffer per microbatch lane. | `A + F <= 72` (kernel limit), one distinct GPU per rank, TP 1 on both roles; routed experts split evenly over FFN ranks (`num_experts % F == 0`). Hardware validation so far covers 1A1F only. |
 | CUDA P2P | AFD process group, PyNccl data communicators, separate NCCL metadata group, compiled custom-op communicator registry, and graph-oriented receive buffers/state. | Requires `A >= F`. One FFN rank is grouped with a consecutive block of Attention ranks in FFN-first ordering; the blocks differ in size by at most one, and hold `A/F` ranks each when `F` divides `A`. |
 | Ascend CAMP2P | AFD process group, one HCCL communication group per ubatch, FFN HCCL state, Gloo metadata group, custom-op state and transfer handles. | FFN-first ordering and `A >= F`; group construction derives each FFN/Attention mapping. |
 | Ascend CAM async | Attention-first HCCL group, plugin-owned routed-only CAM operator state, per-stage pending Attention payload queues, and connector work-item state. | Role ranks map into a combined Attention-first world; Compact metadata determines the actual layer and expert interval; counts.sum() gives this chunk’s routed token count. |
@@ -297,6 +303,39 @@ The input-ID cache still records shapes when graphs are enabled, including
 eager fallback shapes; it does not yet share the hidden-state retention policy.
 See [`test_p2p_connector.py`](../../../tests/unit/connectors/test_p2p_connector.py)
 for capture-address reuse and eager-cache regression coverage.
+
+## FastAFD M2N connector
+
+`FastAFDAFDConnector` replaces the per-layer send/receive pairs with the
+FastAFD M2N MegaMoE kernels (vendored under `csrc/gpu/fastafd`, pinned to
+FastAFD `3c7161949310b6d59d6b4cf9bf997a4935c8113b`, MIT). Its four per-item
+base methods raise `NotImplementedError`; there is no host-side split into
+per-layer receive, compute and send.
+
+- Attention computes the router locally (native softmax top-k and
+  renormalization). For each MoE layer and microbatch lane it calls
+  `dispatch(hidden, topk_ids, topk_weights, lane)`, whose kernel quantizes the
+  hidden states to per-32 UE8M0 FP8, writes each token to the FFN ranks that
+  own its experts and exits. The gated shared expert then runs on Attention,
+  and `combine(...)` waits for the expert outputs and reduces the top-k. Each
+  dispatch is followed by exactly one combine on the same lane, and the lane
+  buffers serve only these split launches (mixing them with the fused kernel
+  on one buffer can hang). The model's
+  custom ops pass data dependencies through the shared expert so
+  `torch.compile` keeps it between the two kernels.
+- FFN does not receive tensors from the connector. `FastAFDFFNModelRunner`
+  receives the step plan and launches one persistent expert kernel that
+  serves every MoE layer and lane of the step.
+- Construction rejects unsupported models, dtypes and checkpoint formats.
+  `init_afd_connector()` creates the union group, checks for an SM100 GPU,
+  checks that every rank has the same lanes, layer count and buffer shape and a
+  distinct physical GPU, and allocates one symmetric buffer per lane. `close()`
+  frees the buffers and destroys the union group. Each buffer holds up to
+  `max_num_batched_tokens` tokens per Attention rank (rounded up to the kernel
+  token alignment), so prefill, mixed and decode steps use the same path.
+- Synchronization is device-side. Every Attention rank must run every layer
+  and lane of a step in the same order; a rank that stops mid-step leaves its
+  peers spinning on the GPU.
 
 ## Failure behavior
 
