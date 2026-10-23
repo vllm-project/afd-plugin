@@ -1,6 +1,6 @@
 # DeepSeek-V4 AFD A5 1030 合并验证指导书
 
-更新日期：2026-10-22（第 8.12 节收敛为 8 个核心配置点：增大 batch、A4F4 与等资源原生对照，再做一对 16K 确认；方案尚未实机执行，不更新已有实机验证结论）。本文合并旧 A5 dSpark/PD 指导与[1030 执行计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)，是本期现场操作入口。
+更新日期：2026-10-23（单机 K1–K4 已有测量附件，AFD 仍显著劣化；根据快慢阶段切换将性能筛选档收紧为 4×并发数、一轮，双机候选仍待测）。本文合并旧 A5 dSpark/PD 指导与[1030 执行计划](DEEPSEEK_V4_AFD_1030_EXECUTION_PLAN_ZH.md)，是本期现场操作入口。
 执行计划规定交付范围和日期，本文规定现场命令、验证顺序、证据与失败处理。
 本文是待执行指导，不代表组合已经通过 A5 验收。
 
@@ -8,7 +8,7 @@
 
 ## 0. 只做性能验证时，从哪里开始
 
-**当前寻找性能收益时，必测场景以第 8.12 节为准。** 先在单机比较 A4F2/D4 的 BS24、BS48，再在两机比较 A4F4/D8 的相同总容量，核心共 8 个配置点；最后选择一对做 16K 确认。增大 batch 是必测主线，A4F2 双机重测、A8、TP2 和 DSpark 为条件补测。第 8.2–8.10 节保留为操作方法和原四组复现流程，不要求再叠加执行其完整矩阵；第 8.12 节提供独立环境加载和场景选择命令。
+**当前寻找性能收益时，必测场景以第 8.12 节为准。** 先在单机比较 A4F2/D4 的 BS24、BS48，再在两机比较 A4F4/D8 的相同总容量，核心共 8 个配置点；最后选择一对做 16K 确认。10-23 已收到 K1–K4，下一步先按第 8.12.6 节定位慢阶段，再决定是否恢复双机筛选。增大 batch 是必测主线，A4F2 双机重测、A8、TP2 和 DSpark 为条件补测。第 8.2–8.10 节保留为操作方法和原四组复现流程，不要求再叠加执行其完整矩阵；第 8.12 节提供独立环境加载和场景选择命令。
 
 按第 8.2–8.10 节顺序执行：**准备环境 → 设置 Synthetic 参数 → 选择一组配置 → 启动 → 检查 → 预热和测量 → 停服 → 换组/扩展长度 → 计算收益**。
 
@@ -1352,7 +1352,7 @@ mkdir -p "$PERF_BASE"
 | `--random-range-ratio` | `0.0` | 输入/输出长度不随机浮动 |
 | `--random-prefix-len` | `0` | 不额外添加固定公共前缀 |
 | `--seed` | `1024` | 合成请求生成 seed |
-| `--num-prompts` | 由本轮 `count` 指定 | 预检/预热为 `CAPACITY`，正式为 `6×CAPACITY` |
+| `--num-prompts` | 由本轮 `count` 指定 | 预检/预热为 `CAPACITY`；本节原流程正式为 `6×CAPACITY`，第 8.12 节另设短测/确认档 |
 
 四组统一使用冻结的 Flash tokenizer，并核对 DSpark checkpoint 的 tokenizer 文件 hash 相同。同一个长度/BS 的配对组保持 benchmark、NumPy、tokenizer 版本和上述参数一致；三轮正式测量也保持一致。不同请求数可能生成不同输入集合，不能只凭 seed 相同就认定输入逐条相同。
 
@@ -1388,6 +1388,7 @@ export MAX_CUDAGRAPH_CAPTURE_SIZE= CUDAGRAPH_CAPTURE_SIZES=
 export FFN_SEQ_CAPACITY=$((2 * DECODE_BS))
 export CAPACITY=$((4 * DECODE_BS))
 export REQUEST_COUNT=$((6 * CAPACITY))
+export PERF_REPEATS=3 PERF_TIER=confirm
 export PERF_REQUEST_RATE=inf
 unset SLO_TTFT_MS SLO_TPOT_MS
 export ENABLE_PD=1 ENABLE_MTP=0 ENABLE_DSPARK=0 USE_AFD=0
@@ -1514,6 +1515,7 @@ run_perf_batch() {
     goodput_args=(--goodput "ttft:$SLO_TTFT_MS" "tpot:$SLO_TPOT_MS")
   fi
   curl --noproxy '*' -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/$name.metrics-before.txt"
+  date -u +%Y-%m-%dT%H:%M:%S.%NZ > "$RUN_ROOT/$name.wallclock-begin.txt"
   "$VLLM_BIN" bench serve \
     --backend openai --base-url "$BASE_URL" --endpoint /v1/completions \
     --model dsv4-afd --tokenizer "$FLASH_MODEL_PATH" --tokenizer-mode deepseek_v4 \
@@ -1524,10 +1526,12 @@ run_perf_batch() {
     --ignore-eos --num-warmups 0 --ready-check-timeout-sec 0 \
     --extra-body "{\"temperature\":0,\"seed\":1024,\"min_tokens\":$OSL}" \
     --metadata dataset=Synthetic synthetic_seed=1024 input_len="$ISL" output_len="$OSL" \
-      prefix_len=0 range_ratio=0.0 \
+      prefix_len=0 range_ratio=0.0 perf_tier="${PERF_TIER:-confirm}" \
+      concurrency="$CAPACITY" num_prompts="$count" repeats="${PERF_REPEATS:-3}" \
     --percentile-metrics ttft,tpot,itl --metric-percentiles 50,95,99 \
     --save-result --save-detailed --result-dir "$RUN_ROOT" --result-filename "$name.json" \
     2>&1 | tee "$RUN_ROOT/$name.console.log"
+  date -u +%Y-%m-%dT%H:%M:%S.%NZ > "$RUN_ROOT/$name.wallclock-end.txt"
   curl --noproxy '*' -fsS "$ATTENTION_URL/metrics" > "$RUN_ROOT/$name.metrics-after.txt"
   "$PYTHON_BIN" - "$RUN_ROOT/$name.json" "$count" "$OSL" \
     "$BASE_URL" "$ATTENTION_URL" "$RUN_ROOT/$name.drain.json" "$ISL" <<'PY'
@@ -1586,9 +1590,11 @@ fi
 
 **完成条件：** smoke 和 Synthetic 长输入通过，无异常 token 退化、OOM、hang、NaN/Inf，路径符合本组配置。Synthetic 输出不做 GSM8K 答案评分；smoke 不代替第 1–7、8.1 节完整验收。检查轮直接到第 8.8 节停服；四组 BS8 都通过后才开始正式轮次。
 
-### 8.7 性能步骤 6：关闭诊断，预热后测三轮
+### 8.7 性能步骤 6：关闭诊断，预热后测量
 
-从第 8.4 节重新开始，设置 `PHASE=measure`，选择**已经通过预检**的长度/BS/capture/budget，以新 RUN_ID 冷启动。保持相同 Synthetic 参数/模型/执行开关，关闭诊断、DEBUG 和 profiler；不拿预检进程计时。
+从第 8.4 节或当前第 8.12 节的独立入口重新加载配置，两者择一，不交叉覆盖。设置 `PHASE=measure`，选择**已经通过预检**的长度/BS/capture/budget，以新 RUN_ID 冷启动。保持相同 Synthetic 参数/模型/执行开关，关闭诊断、DEBUG 和 profiler；不拿预检进程计时。
+
+第 8.4 节原流程固定 `PERF_REPEATS=3`；第 8.12 节使用其独立配置，短测为 1 轮、正式确认为 3 轮。不要将筛选结果按正式三轮验收。
 
 ready 且第 8.6 节函数已定义后执行：
 
@@ -1599,7 +1605,7 @@ if [[ "$PHASE" == measure ]]; then
   ) > "$RUN_ROOT/npu-samples.txt" 2>&1 &
   echo $! > "$RUN_ROOT/npu-sampler.pid"
   run_perf_batch warmup "$CAPACITY"
-  for repeat in 1 2 3; do
+  for ((repeat=1; repeat<=${PERF_REPEATS:-3}; repeat++)); do
     run_perf_batch "measure-$repeat" "$REQUEST_COUNT"
   done
 fi
@@ -1616,7 +1622,7 @@ fi
 
 “六波”表示 `正式请求数=4×BS×6`：BS24 共提交 576 条，客户端最多在途 96 条，完成后补充；不表示 576 条同时运行，也不保证每卡实际活跃数达到 24。检查 running/waiting、Prefill 供给和吞吐曲线；P2 或客户端饱和时如实记录瓶颈。窗口不稳定时，配对组统一增大请求数并重新冻结。
 
-**完成条件：** 三个 `measure-*.json` 均完成 N 条、失败 0、输入/输出量符合预算。DSpark 接受率按本轮有效 proposed/accepted 增量计算，注明分子分母/时间窗和 Synthetic 负载；指标异常保存缺项，不填 0。通过 Proxy 发压时单独采集 D/A `/metrics`，不假定 Proxy 暴露其指标。
+**完成条件：** 正式三轮的 `measure-*.json` 均完成 N 条、失败 0、输入/输出量符合预算；第 8.12 节的一轮短测仅作为筛选。DSpark 接受率按本轮有效 proposed/accepted 增量计算，注明分子分母/时间窗和 Synthetic 负载；指标异常保存缺项，不填 0。通过 Proxy 发压时单独采集 D/A `/metrics`，不假定 Proxy 暴露其指标。
 
 ### 8.8 性能步骤 7：请求归零后正常停服
 
@@ -1701,7 +1707,9 @@ ss -ltnp > "$RUN_ROOT/ports-after-stop.txt"
 
 ### 8.12 【A5 手工执行】寻找 AFD 收益点：统一调整 BS、A/F 配比与测试负载
 
-本节是 **2026-10-22 的待执行实验方案**。10-21 非 DSpark 测量中，AFD 的生成阶段约慢 11.6–11.9 倍，A/F 利用率也低；当前证据不足以将其归因于 F2 带宽或小 batch。先消除执行异常，再寻找吞吐、延迟和资源效率的折中点；不能预先保证某个拓扑有收益。
+本节是 **2026-10-23 更新的待执行实验方案**。10-21 非 DSpark 测量中，AFD 的生成阶段约慢 11.6–11.9 倍，A/F 利用率也低；当前证据不足以将其归因于 F2 带宽或小 batch。先消除执行异常，再寻找吞吐、延迟和资源效率的折中点；不能预先保证某个拓扑有收益。
+
+**10-23 单机反馈：** K1/K2/K4 各收到一轮、K3 三轮，均为 1024/1024、每轮 6×C。AFD BS24/48 为 622.26/850.96 tok/s，native 为 2881.22/4722.06 tok/s；Graph max 已为 24/48，仍有显著生成时延差距。K1 前两组各 C 条请求平均 TPOT 为 53.35/56.72 ms，第三组升至 248.65 ms，故原先 2×C 可能漏掉慢阶段，下面性能短测改为至少 4×C。优先定位快慢切换，暂缓 BS96 和完整双机矩阵；候选拓扑、精度及正常停服验收不能由请求完成推定通过。
 
 **本轮范围：8 个核心配置点各做筛选，再对一组 AFD/native 做 16K 确认。** 所有核心点统一 TP1、关闭 DSpark、固定自然路由和 Graph 配置策略；不展开“全部拓扑×全部 BS×全部长度×DSpark 开关”。已经完成且软件/权重/执行路径/负载完全一致、证据有效的配置点直接复用；旧 max=8 或不同长度/版本的结果不能代替修正后基线。
 
@@ -1726,7 +1734,7 @@ ss -ltnp > "$RUN_ROOT/ports-after-stop.txt"
 2. 先完成下表 K3/K1：原生 D4 与 A4F2 在同一台 8 卡 A5、BS24、并发 96 下预检，输入/输出为 1024/1024。原来的 16384/1024 负载留到优胜配置的确认阶段。短输入仍走真实 Prefill/KV/Proxy，称为“Decode 占比较高的端到端测试”。
 3. capture 留空由 recipe 生成：无 DSpark，BS24 max=24、BS48 max=48；DSpark block=5 时分别为 144、288。检查实际 replay/eager 次数、per-step 真实 token、两级 U2 stage key，以及 F 接收 buffer。仅有捕获日志不能证明在线命中。
 4. 若仍出现数量级的生成时延差距和低 A/F 利用率，暂停全矩阵扩卡。先采集一个代表点约 5–10 秒的 A/F timeline，拆分 A 计算、A→F、F MoE/EP 通信、F→A、CPU launch 和等待，关联相同 step/stage，避免把重叠区间重复相加。
-5. 必要时单独做双方 eager/U1 对照，再比较 AFD eager/U1→eager/U2→Graph/U2，每次只改一个变量。原生 eager 须移除第 8.5 节的 Graph 参数、改用 `--enforce-eager`；AFD 使用 `EXECUTION_MODE=eager U_BATCHES=1/2`。当前 recipe 的 Graph 路径要求 U2，不能直接构造 AFD Graph/U1。诊断结果与正式 Graph 部署对照分表，计时前关闭诊断/profiler。
+5. 必要时单独做双方 eager/U1 对照，再比较 AFD eager/U1→eager/U2→Graph/U2，控制 eager overlap 和五个 Graph 开关，按第 8.12.6 节执行。原生 eager 须移除第 8.5 节的 Graph 参数、改用 `--enforce-eager`；AFD 使用 `EXECUTION_MODE=eager U_BATCHES=1/2`。当前 recipe 的 Graph 路径要求 U2，不能直接构造 AFD Graph/U1。诊断结果与正式 Graph 部署对照分表，计时前关闭诊断/profiler。
 
 无既有 replay 计数时，以受控短 profile 验证；不得将 `is_graph_capturing=False` 当作 eager 回退证据。运行异常尚未定位时，只做少量诊断点，不将“扩大 BS 后吞吐变高”视为异常已经修复。
 
@@ -1736,16 +1744,16 @@ ss -ltnp > "$RUN_ROOT/ports-after-stop.txt"
 
 **第二组 K5–K8：双机 A4F4 与 native D8，必测。** P2+Proxy 独立一机，A4F4 或 D8 独占另一机，两者均为 10 张实际用卡。A4F4 也测 BS24→48；D8 对应 BS12→24，使每个配对的总序列容量和客户端并发保持 96/192。这一组直接判断 A4F4 的部署收益，无需先重跑 A4F2 双机矩阵。
 
-| ID | 布局与 Decode 配置 | 每 A/D DP 的 BS | 总容量 / 客户端并发 C | 每轮请求数起点 | 含 P2 用卡 | 直接比较 |
+| ID | 布局与 Decode 配置 | 每 A/D DP 的 BS | 总容量 / 客户端并发 C | 每轮短测 / 正式确认请求数 | 含 P2 用卡 | 直接比较 |
 |---|---|---:|---:|---:|---:|---|
-| K1 | 单机 P2+A4F2 | 24 | 96 | 576 | 8 | 与 K2 比增 batch；与 K3 比部署 |
-| K2 | 单机 P2+A4F2 | 48 | 192 | 1152 | 8 | 与 K4 比相同负载下的部署 |
-| K3 | 单机 P2+D4 | 24 | 96 | 576 | 6 | K1 的原生参照 |
-| K4 | 单机 P2+D4 | 48 | 192 | 1152 | 6 | 原生也增加 batch，参照 K2 |
-| K5 | 两机 P2 / A4F4 | 24 | 96 | 576 | 10 | 与 K6 比增 batch；与 K7 比等资源 |
-| K6 | 两机 P2 / A4F4 | 48 | 192 | 1152 | 10 | 增 batch 与 F4 的组合，与 K8 配对 |
-| K7 | 两机 P2 / D8 | 12 | 96 | 576 | 10 | K5 的等资源原生参照 |
-| K8 | 两机 P2 / D8 | 24 | 192 | 1152 | 10 | K6 的等资源原生参照 |
+| K1 | 单机 P2+A4F2 | 24 | 96 | 384 / 1152 | 8 | 与 K2 比增 batch；与 K3 比部署 |
+| K2 | 单机 P2+A4F2 | 48 | 192 | 768 / 1152 | 8 | 与 K4 比相同负载下的部署 |
+| K3 | 单机 P2+D4 | 24 | 96 | 384 / 1152 | 6 | K1 的原生参照 |
+| K4 | 单机 P2+D4 | 48 | 192 | 768 / 1152 | 6 | 原生也增加 batch，参照 K2 |
+| K5 | 两机 P2 / A4F4 | 24 | 96 | 384 / 1152 | 10 | 与 K6 比增 batch；与 K7 比等资源 |
+| K6 | 两机 P2 / A4F4 | 48 | 192 | 768 / 1152 | 10 | 增 batch 与 F4 的组合，与 K8 配对 |
+| K7 | 两机 P2 / D8 | 12 | 96 | 384 / 1152 | 10 | K5 的等资源原生参照 |
+| K8 | 两机 P2 / D8 | 24 | 192 | 768 / 1152 | 10 | K6 的等资源原生参照 |
 
 建议执行顺序为 **K3→K1→K4→K2；K7→K5→K8→K6**，先确认小 batch 路径，再增加 batch；预检出现执行异常时按第 8.12.2 节定位，不继续跑完整矩阵。K1/K2 与 K3/K4 卡数不同，报告总 Q 和实际每卡 Q；K5/K7、K6/K8 才是相同用卡数的直接对照。
 
@@ -1755,7 +1763,13 @@ A/F 优先同机，P→D 的 KV 跨机在 K5–K8 中保持一致，P 机器不�
 
 BS24→48 的容量扫描同时将 C 从 96 提到 192；只改 `max_num_seqs` 而仍用 96 并发，不能填满 A DP4×BS48。跨档位的 Q/TPOT 变化用于观察扩展性，不称为同负载提速；同负载部署收益分别看 K1/K3、K2/K4、K5/K7、K6/K8。
 
-**负载和轮次也收敛。** 本节每个点 `check` 通过后即可进入筛选，不要求旧流程的四组 BS8 全部重做。K1–K8 统一输入/输出 1024/1024，先各做一次预热和一轮筛选；`6×C` 是请求数起点，若没有稳定窗口则配对增加。随后只选一组最有潜力的 AFD/native 配对，把输入改为 16384、输出仍为 1024，按原 BS/C 做至少各三轮正式确认；不要求 8 点全部再跑 16K。优先选 K5/K7 或 K6/K8 验证等资源收益；单机 A4F2 更合适时，也可选 K1/K3 或 K2/K4，并保留卡数差异说明。需要正式发布 1K 结果时，仅对其入选配对补足三轮。
+**先用少量请求看趋势。** 本节每个点 `check` 通过后即可进入筛选，不要求旧流程的四组 BS8 全部重做。K1–K8 保持输入/输出 1024/1024，设 `PERF_TIER=screen`、`PHASE=measure`，关闭诊断后各做 `C` 条预热、`4×C` 条测量、1 轮。BS24/C96 测 384 条，BS48/C192 测 768 条；测量请求数比原来的 `6×C` 减少三分之一，不含预检、预热、加载和 Graph 编译，不能直接据此承诺总用时减少三分之一。该下限根据上面的 K1 快慢阶段反馈调整。
+
+短测保持目标 BS 和并发不变；不将总请求数缩到 C 以下，否则客户端无法提供目标并发。只测 C 或 2×C 条可检查链路和早期趋势，不能据此宣布当前 AFD 满载性能已经改善。`4×C` 仍不保证稳态：必须查看 running、per-step token、Graph replay 和吞吐曲线，确认覆盖较快和较慢阶段；窗口不足时将该 AFD/native 配对统一增至 `6×C`。短测差距较小、波动或双方结论矛盾时不直接淘汰。先保留输出 1024，避免同时缩短输出改变 Prefill/Decode 占比。
+
+短测用于回答“执行异常是否消失、增 batch 是否有改善趋势、哪个配对值得继续”。验证某次调整的前后效果时，要在相同 ISL/OSL、BS/C、请求数及测量开关下重跑对照，只改变待验证项；旧 16K 结果不能与新 1K 短测直接计算提速。
+
+**正式确认只留给入选配对。** 设 `PERF_TIER=confirm`，每轮请求数为 `max(1152, 6×C)`、至少 3 轮；核心 C96/C192 均测 1152 条，条件补测 C384 时为 2304 条。双方冻结相同请求数和生成参数，核对输入集合，不能仅凭 seed 相同认定不同请求数的输入逐条一致。最终只选一组 AFD/native 将输入改为 16384、输出仍为 1024、沿用原 BS/C 正式确认；需要发布 1K 收益或短测结论不清时，仅对入选配对追加相同 1K 负载的正式测量，不默认要求两种长度都各三轮。不要求 8 点全部各三轮或全部再跑 16K。优先选 K5/K7 或 K6/K8；单机更合适时可选 K1/K3 或 K2/K4，并保留卡数差异说明。
 
 短输入慢不自动否定长上下文价值；没有短输入优胜点时，也选一个 KV 容量有潜力的 AFD/native 配对做 16K 确认，再决定是否继续。BS48 预检若 OOM/预算不足，记录容量边界；可将该 AFD/native 配对降为 A 侧 BS32 对应的 C=128，D4 用 BS32、D8 用 BS16。不能把失败点当性能结果，也不只降低一侧的请求负载。
 
@@ -1776,6 +1790,8 @@ export RECIPE="$AFD_PLUGIN_ROOT/recipe/npu/P2pHcclAFDConnector/deepseek_v4"
 
 export SCENARIO=K2          # 核心点 K1..K8，按表选择
 export ISL=1024 OSL=1024 PHASE=check
+export PERF_TIER=screen     # screen：少请求、一轮；confirm：正式三轮
+export SCREEN_WAVES=4       # K1 后续慢阶段不能由首 2×C 的结果代表
 case "$SCENARIO" in
   K1) export TOPOLOGY=single POINT=A4F2 DECODE_BS=24 ;;
   K2) export TOPOLOGY=single POINT=A4F2 DECODE_BS=48 ;;
@@ -1809,7 +1825,16 @@ if [[ "$TOPOLOGY" == single ]]; then
 fi
 export CAPACITY=$((ATTENTION_RANKS / TENSOR_PARALLEL_SIZE * DECODE_BS))
 export MAX_MODEL_LEN=$((ISL + OSL))
-export MAX_NUM_SEQS="$DECODE_BS" REQUEST_COUNT=$((6 * CAPACITY))
+export MAX_NUM_SEQS="$DECODE_BS"
+case "$PERF_TIER" in
+  screen) export REQUEST_COUNT=$((SCREEN_WAVES * CAPACITY)) PERF_REPEATS=1 ;;
+  confirm)
+    export REQUEST_COUNT=$((6 * CAPACITY)) PERF_REPEATS=3
+    if ((REQUEST_COUNT < 1152)); then export REQUEST_COUNT=1152; fi
+    ;;
+  *) printf 'Unknown PERF_TIER\n' >&2; exit 2 ;;
+esac
+# 短测窗口不足时，在此对 AFD/native 双方统一改为 6 * CAPACITY。
 export FFN_SEQ_CAPACITY=$(((CAPACITY + FFN_RANKS - 1) / FFN_RANKS))
 export ATTENTION_MAX_NUM_BATCHED_TOKENS=4096 FFN_MAX_NUM_BATCHED_TOKENS=8192
 export MAX_CUDAGRAPH_CAPTURE_SIZE= CUDAGRAPH_CAPTURE_SIZES=
@@ -1817,7 +1842,7 @@ export FFN_HOST_IP="$ATTENTION_HOST_IP" AFD_HOST="$ATTENTION_HOST_IP"
 export PROXY_HOST_IP="$PREFILL_HOST_IP" API_PORT="$ATTENTION_API_PORT"
 export BASE_URL="http://$PROXY_HOST_IP:$PROXY_PORT"
 export ATTENTION_URL="http://$ATTENTION_HOST_IP:$ATTENTION_API_PORT"
-export PERF_CASE="${SCENARIO}-${POINT}-b${DECODE_BS}-n${CAPACITY}"
+export PERF_CASE="${SCENARIO}-${POINT}-b${DECODE_BS}-n${CAPACITY}-${PERF_TIER}"
 export CASE="$PERF_CASE" CYCLE=1
 export PERF_REQUEST_RATE=inf
 unset SLO_TTFT_MS SLO_TPOT_MS
@@ -1839,7 +1864,7 @@ export no_proxy="$NO_PROXY"
 
 `FFN_SEQ_CAPACITY=ceil(N/F)` 只是本表 TP1 普通 Decode 的接收序列容量起点，不是路由后每专家 token 数，也不替代 token/Graph buffer 检查。DSpark、padding 和 F>A 时按真实 shape 重新验收。P 的 max seqs/token budget 在各组固定；P2 无法供满时先标记供给受限，扩大 P 必须双方一起调整并重新计费。
 
-单机在当前终端创建 run；双机使用相同 `SCENARIO/ISL/PHASE/RUN_ID`，由协调终端生成后复制到另一机。各机单独创建 `RUN_ROOT`，保存本机 env、runtime、日志和 PID。16K 确认沿用入选场景 ID，只将上方 `ISL` 改为 `16384`，生成新 run。不要各机独立生成时间戳，也不要重新执行第 8.2/8.4 节的固定赋值。
+单机在当前终端创建 run；双机使用相同 `SCENARIO/ISL/PHASE/PERF_TIER/RUN_ID`，由协调终端生成后复制到另一机。各机单独创建 `RUN_ROOT`，保存本机 env、runtime、日志和 PID。筛选使用 `PHASE=measure PERF_TIER=screen`；正式确认使用 `PHASE=measure PERF_TIER=confirm`，16K 时再将 `ISL` 改为 `16384`，重新创建 run。按第 8.7 节执行一次预热和 `PERF_REPEATS` 轮测量；切勿再手工额外循环三次。不要各机独立生成时间戳，也不要重新执行第 8.2/8.4 节的固定赋值。
 
 ```bash
 # 在一个协调终端生成；将打印的完整 export 行复制到另一机执行。
@@ -1880,7 +1905,7 @@ TP2 放到后续：A4F4 TP1 为 A DP4/F DP4，BS24 对应 N96；TP2 为 A DP2/F 
 
 #### 8.12.5 正式测量与“有收益/不严重劣化”的判定
 
-- 每个新点先 `check`；K1–K8 各做一次预热和一轮筛选，不据此写正式收益，不要求所有点先各三轮。入选 AFD/native 配对再按第 8.7 节至少各三轮，交替安排配置并记录冷启动/同进程重复关系。初始 `6×C` 请求若没有稳定窗口，双方一起增加请求数；保存统一的开始/结束墙钟、每轮请求集及波动范围。
+- 每个新点先 `check`；K1–K8 各做 C 条预热、4×C 条测量、1 轮筛选，须覆盖本批观察到的慢阶段，不据此写正式收益，不要求所有点先各三轮。入选 AFD/native 配对再按第 8.7 节做 `max(1152, 6×C)` 条/轮、至少 3 轮，交替安排配置并记录冷启动/同进程重复关系。筛选或正式确认没有稳定窗口时，双方一起增加请求数；保存统一的开始/结束墙钟、每轮请求集及波动范围。
 - 先在同样输入/输出、C、请求数、DSpark 状态下比较 Q、TTFT/TPOT 的 P50/P95/P99、真实 batch、每角色 HBM/KV、通信/计算等待。一次短 profile 仅用于归因；正式测量关闭 profiler 和 stage 诊断。失败 0、真实 token 数正确、Proxy 和全部 D/A running/waiting 归零、正常停服是每个点的有效性条件；精度验收另行完成。
 - **探索阶段可暂用**“同 C 下 Q≥原生的 90%，且 TPOT P95≤原生的 110%”筛出不严重劣化点，同时检查 TTFT 和业务 SLO；这是建议的筛选线，不是既有交付门槛，也不是用户已冻结的业务目标。正收益应超过重复测量的波动，并在相同 SLO/资源下成立。
 - 用卡数同时报 Decode 和全链路：A4F2 为 6/8，A4F4 为 8/10，D4 为 4/6，D8 为 8/10，后一个数均含 P2。两机各预留整机时，还报 `Q/16` 和实际预留成本。A4F4 相对 D4，总 Q 至少达到 2 倍才持平 Decode 每卡效率；包含 P2 时阈值是 `10/6≈1.67` 倍。与 D8 相比才是相同实际用卡的直接比较。以上比例是核算关系，不是性能预测。D8 有 8 张卡参与专家计算，A4F4 只有 F4，故 A4F4 并不天然占优；应实测 KV 容量、A/F 重叠或共享 F 的价值能否补偿分离和通信成本。
@@ -1891,6 +1916,142 @@ TP2 放到后续：A4F4 TP1 为 A DP4/F DP4，BS24 对应 N96；TP2 为 A DP2/F 
 `request_goodput` 是同时满足门槛的**成功请求数/总秒数**，不是 tokens/s；另报达标请求比例和失败率。官方参数定义见 [vLLM 0.23 benchmark 源码](https://github.com/vllm-project/vllm/blob/v0.23.0/vllm/benchmarks/serve.py)，现场以冻结 commit 的 `--help` 和结果字段为准。EP/DP/TP 的概念可核对 [vLLM EP 文档](https://github.com/vllm-project/vllm/blob/v0.23.0/docs/serving/expert_parallel_deployment.md)；其中 CUDA 通信后端建议不直接套用到 Ascend。
 
 DSpark 只在筛出的 1–2 个拓扑上追加：双方冻结同一 target、draft 和 block，确认 A 的 draft eager、F 无 drafter，重算 capture/buffer，记录 proposed/accepted 增量。以真实输出 Q、TPOT 和 SLO goodput 判优，不能以接受率代替收益。最终至少交付“同负载比较、等资源比较、各自最佳 SLO 容量”三张表，并注明未找到收益点时的瓶颈与适用范围。
+
+#### 8.12.6 10-23 后的下一步：三个诊断点，定位快慢阶段后再扩拓扑
+
+**先做下面三个 A4F2 点，不重跑 K1–K4 全矩阵。** 固定同一版本、同一台 A5、P0–1/A2–5/F6–7、TP1、BS24、C96、输入/输出 1024/1024，关闭 DSpark/MTP。每点先 smoke，再预热 96 条、测量 384 条、一轮；没有覆盖慢阶段时将本次对照的请求数统一增至 576。每个点重新冷启动全部角色，保持相同的预检/预热顺序。
+
+| 诊断点 | `EXECUTION_MODE` | `U_BATCHES` | eager overlap | 五个 Graph 优化开关 | 与上一点比较 |
+|---|---|---:|---:|---|---|
+| S1 | `eager` | 1 | 0 | 全 0 | 不拆 U2 的 AFD 参照 |
+| S2 | `eager` | 2 | 0 | 全 0 | 只增加 U2 拆分 |
+| S3 | `full-decode-only` | 2 | 0 | 全 0 | 启用 recipe 的 Graph 执行路径 |
+| S4（条件追加） | `full-decode-only` | 2 | 0 | 全 1 | 与 S3 比较整组 Graph 多流优化 |
+
+五个优化开关全 0 **仍然可以执行 Graph**。eager/U2 的 recipe 默认 overlap=1，故本表显式固定为 0；不能直接使用默认值来做 S2/S3 对照。S4 一次打开五个开关，只能判断整个组合的影响，不能归因于某一个开关。历史 K1 缺少完整运行开关/版本冻结，不代替本轮 S4 的受控对照。
+
+**步骤 1：加载公共环境，再覆盖诊断变量。** 在同一个启动终端执行第 8.12.3 节从 `set -euo pipefail` 到 `export no_proxy` 的完整配置块，其中改成 `SCENARIO=K1`、`PHASE=measure`、`PERF_TIER=screen`、`SCREEN_WAVES=4`。该块包含实际 `SITE_FILE/NODE_FILE` 的 `source`、CANN 和 venv 加载。先不执行其后创建 RUN_ID 的代码，不再加载第 8.2/8.4 节的固定配置。随后执行：
+
+```bash
+# 每次新终端均先完成上面的公共环境加载；依次选择 S1、S2、S3。
+export DIAG_POINT=S1
+case "$DIAG_POINT" in
+  S1) export EXECUTION_MODE=eager U_BATCHES=1 GRAPH_OPTIMIZATIONS=0 ;;
+  S2) export EXECUTION_MODE=eager U_BATCHES=2 GRAPH_OPTIMIZATIONS=0 ;;
+  S3) export EXECUTION_MODE=full-decode-only U_BATCHES=2 GRAPH_OPTIMIZATIONS=0 ;;
+  S4) export EXECUTION_MODE=full-decode-only U_BATCHES=2 GRAPH_OPTIMIZATIONS=1 ;;
+  *) printf 'Unknown DIAG_POINT\n' >&2; exit 2 ;;
+esac
+test "$SCENARIO:$USE_AFD:$DECODE_BS:$CAPACITY" = K1:1:24:96
+export PHASE=measure PERF_TIER=diagnostic PERF_REPEATS=1
+export REQUEST_COUNT=$((4 * CAPACITY))  # 窗口不足时，对照各点统一改为 6 * CAPACITY。
+export DBO_DECODE_TOKEN_THRESHOLD=2 DBO_PREFILL_TOKEN_THRESHOLD=12
+export AFD_HCCL_EAGER_U2_STREAM_OVERLAP=0
+export AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP="$GRAPH_OPTIMIZATIONS"
+export AFD_HCCL_GRAPH_U2_HYBRID_DAG="$GRAPH_OPTIMIZATIONS"
+export AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM="$GRAPH_OPTIMIZATIONS"
+export AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM="$GRAPH_OPTIMIZATIONS"
+export AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER="$GRAPH_OPTIMIZATIONS"
+export AFD_HCCL_STAGE_DIAGNOSTICS=0 AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS=0
+export AFD_NPU_ATTENTION_PROFILER_ENABLE=0 AFD_NPU_FFN_PROFILER_ENABLE=0
+export VLLM_LOGGING_LEVEL=INFO
+export PERF_CASE="K1-${DIAG_POINT}-b24-n96-diagnostic"
+export CASE="$PERF_CASE"
+export RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-single-$PERF_CASE"
+export RUN_ROOT="$RUN_BASE/$RUN_ID/$(hostname -s)"
+mkdir -p "$RUN_BASE/$RUN_ID"
+mkdir "$RUN_ROOT"
+cp "$SITE_FILE" "$RUN_ROOT/site.env"
+cp "$NODE_FILE" "$RUN_ROOT/node.env"
+```
+
+按第 4.4 节保存本轮 runtime/版本/模型 hashes，另存源码 dirty diff 和本表最终变量。按第 8.5 节顺序启动 P→F+A→Proxy，并保存实际 argv；P/F 的命令前缀仍分别使用 `PREFILL_MAX_NUM_SEQS` 和 `FFN_SEQ_CAPACITY`，不能把 F 的容量改成 A 的 24。核对 S1/S2 实际 `enforce_eager=True`；S3/S4 A 的 Graph max=24、捕获桶包含 24，F 两个 U2 stage 的满载 key 为各 A rank 12 tokens。在线有非均匀 batch 时另记录真实/填充 shape，不能仅凭 max 正确认定全部 replay。
+
+**步骤 2：每点按相同顺序发压。** 定义第 8.6 节的 `run_perf_batch`。本节为诊断筛选，服务 ready 后先执行以下 smoke，通过后执行第 8.7 节的采样、一次预热和一轮测量代码；不要额外跑旧四组矩阵或额外循环三次。
+
+```bash
+"$PYTHON_BIN" "$AFD_PLUGIN_ROOT/tools/validation/a5_1030_requests.py" \
+  --base-url "$BASE_URL" --attention-url "$ATTENTION_URL" --suite smoke \
+  --run-id "$RUN_ID" --output "$RUN_ROOT/smoke"
+```
+
+任一点出现设备错误、hang、失败请求或 token 数不符，先按第 9 节保存现场，不把失败点当作慢点继续计时。每次请求结束核对 drain；结束后按第 8.8 节正常停服并确认两个 F rank shutdown。S1–S3 是三个诊断点，尚不是 AFD/native 收益验收。K3 的历史稳定数据可作背景参照；版本变化或需要计算新收益时，必须补同版本、同请求数的 K3，不能拿旧 576 条直接与新 384 条算提速。
+
+**步骤 3：检查是否仍有约 250 ms 的慢请求，不能只看总 Q。** 测量结束后执行下面的分组检查。`200 ms` 只是根据当前快慢簇设置的诊断阈值，不是业务 SLO；它统计每条请求的平均 TPOT，不能定位单次 token 的切换时刻。
+
+```bash
+"$PYTHON_BIN" - "$RUN_ROOT/measure-1.json" "$CAPACITY" \
+  > "$RUN_ROOT/arrival-cohorts.txt" <<'PY'
+import json
+import statistics
+import sys
+from pathlib import Path
+
+SLOW_TPOT_MS = 200.0
+data = json.loads(Path(sys.argv[1]).read_text())
+capacity = int(sys.argv[2])
+count = data["completed"]
+assert count > 0 and data["failed"] == 0
+for key in ("start_times", "itls", "output_lens"):
+    assert len(data[key]) == count, key
+assert all(length > 1 for length in data["output_lens"])
+tpot = [1000 * sum(itls) / (length - 1)
+        for itls, length in zip(data["itls"], data["output_lens"])]
+order = sorted(range(count), key=lambda index: data["start_times"][index])
+origin = min(data["start_times"])
+print(f'Q={data["output_throughput"]:.2f} tok/s; '
+      f'mean/P95 TPOT={data["mean_tpot_ms"]:.2f}/{data["p95_tpot_ms"]:.2f} ms')
+for offset in range(0, count, capacity):
+    group = order[offset:offset + capacity]
+    starts = [data["start_times"][index] - origin for index in group]
+    values = [tpot[index] for index in group]
+    slow = sum(value >= SLOW_TPOT_MS for value in values)
+    print(f'arrivals {offset + 1}-{offset + len(group)}; '
+          f'start={min(starts):.2f}..{max(starts):.2f}s; '
+          f'mean TPOT={statistics.mean(values):.2f}ms; '
+          f'>={SLOW_TPOT_MS:g}ms={slow}/{len(group)}')
+PY
+cat "$RUN_ROOT/arrival-cohorts.txt"
+```
+
+每 C 条是按请求到达顺序分组，不是独立轮次，也不是严格同步的波次。保存每点 Q、TPOT P50/P95/P99、分组均值/慢请求比例、真实 running/token、空白或异常输出。若 S3 较好，才追加 S4 复核默认优化组合；若 S1 已异常且 smoke 不通过，先停止后续点排查基本链路。
+
+| 观察结果 | 下一步优先验证 |
+|---|---|
+| S1 无慢簇，S2 出现慢簇 | U2 拆分/控制面、两阶段通信与等待；按需另测 eager overlap=1，只与 S2 比较 |
+| S2 无慢簇，S3 出现慢簇 | Graph 命中/回退、stage key/padding、图内通信与同步依赖 |
+| S3 无慢簇，S4 出现慢簇 | Graph 多流优化组合；保留版本与负载，按依赖关系逐项恢复，`FFN_CROSS_LAYER=1` 要求 `FFN_RECV_STREAM=1` |
+| 三点均有慢簇，或只是整体速度不同 | 先拆 F 专家算子/EP、A↔F、CPU 等待；不直接判为 F2 带宽不足 |
+| 新点未复现旧 K1 慢簇 | 保留“未复现”；核对版本、运行开关和窗口，必要时补 S4/576 条，不宣布根因已修复 |
+
+这些结果只用于选择下一处观测，不自动证明具体根因。S1 改变了 microbatch 大小，S2/S3 的 Graph 路径也包含编译/缓存等配套行为，不能将全部差值归给一个算子。
+
+**步骤 4：只对有差异的路径单独采 profile。** 上面三点先不带 profiler。随后选慢点和最接近的较快对照，各新建一个带 `-profile` 标记的 RUN_ID/RUN_ROOT，沿用相同负载与预热；不能向已启动服务 export 后期待它生效。本插件已提供 [profiler.py](../../afd_plugin/compat/npu/profiler.py)，在完成步骤 1 的目录创建后、启动 A/F 前增加：
+
+```bash
+# 初始候选窗口：期望跳过预热和前两组请求；必须用实际 trace 核对。
+export PROFILE_SKIP=3500
+export AFD_NPU_ATTENTION_PROFILER_ENABLE=1 AFD_NPU_FFN_PROFILER_ENABLE=1
+export AFD_NPU_ATTENTION_PROFILER_RANKS=all AFD_NPU_FFN_PROFILER_RANKS=all
+export AFD_NPU_ATTENTION_PROFILER_DIR="$RUN_ROOT/profile/attention"
+export AFD_NPU_FFN_PROFILER_DIR="$RUN_ROOT/profile/ffn"
+export AFD_NPU_ATTENTION_PROFILER_SKIP_FIRST="$PROFILE_SKIP"
+export AFD_NPU_FFN_PROFILER_SKIP_FIRST="$PROFILE_SKIP"
+export AFD_NPU_ATTENTION_PROFILER_WAIT=0 AFD_NPU_FFN_PROFILER_WAIT=0
+export AFD_NPU_ATTENTION_PROFILER_WARMUP=1 AFD_NPU_FFN_PROFILER_WARMUP=1
+export AFD_NPU_ATTENTION_PROFILER_ACTIVE=32 AFD_NPU_FFN_PROFILER_ACTIVE=32
+export AFD_NPU_ATTENTION_PROFILER_REPEAT=1 AFD_NPU_FFN_PROFILER_REPEAT=1
+export AFD_NPU_ATTENTION_PROFILER_WITH_STACK=0 AFD_NPU_FFN_PROFILER_WITH_STACK=0
+mkdir -p "$AFD_NPU_ATTENTION_PROFILER_DIR" "$AFD_NPU_FFN_PROFILER_DIR"
+```
+
+`SKIP_FIRST/ACTIVE` 的单位是 **runner 的 profiler.step 调用数**，不是请求数、层数或秒数。3500 只是按 1024 输出、一次预热加约两组请求估计的起点；A/F 的调用位置及启动/warmup 步数不同，相同数字不保证同时开始。32 个 active step 也不保证固定 5–10 秒。先确认日志有 `AFD NPU attention/ffn profiler enabled`、A/F 两侧 trace 均实际生成，并通过时间戳/通信配对确认它们覆盖同一在线慢窗口；trace 不重叠或只覆盖快阶段时，分别调整两侧 `SKIP_FIRST` 重采，不能据空 trace 推断设备空闲。此处选择 `RANKS=all`，核对四个 A、两个 F 的 trace/PID，以观察 DP/EP 不均衡；当前调用处传入的是 `get_world_group().rank`，筛选值不能直接当作物理卡号。
+
+第 8.6 节函数会保存每个 benchmark 的 `*.wallclock-begin/end.txt` UTC 墙钟与详细 JSON，用于区分预热、在线测量和随后排空。按同一步/stage 对齐 A 计算、A→F、F MoE/EP、F→A、Graph replay/回退和 CPU/stream 等待，提取代表性的关键路径；重叠区间不能重复相加。仅凭 NPU 利用率或 `is_graph_capturing=False` 不作上述归因。若当前 trace 缺 shape/key/实际 token 等字段，明确记录缺项，再做单独的路径日志诊断；不同时打开 DEBUG、强制 compute sync 和 profiler 去比较性能。
+
+**步骤 5：按瓶颈选择一个后续拓扑点。** 若证据主要指向 Graph/U2，先修复或选定通过的配置，关闭 profiler/诊断后重跑同负载 K1/K3，再恢复 BS48 对照；不能只保留 S1 就宣布默认 Graph 性能通过。若证据主要指向 F 专家计算/权重读取，优先只做 K5/K7（A4F4 BS24 与 D8 BS12，均 C96），看增加 F 是否改善关键路径，随后才追加 BS48 的 K6/K8。三点均未定因时，先回传上述材料，不直接扩成完整拓扑矩阵。短输入没有收益但路径正常时，仍按第 8.12.3 节保留一对 16K 容量确认。
+
+回传每点的 `runtime.json`、最终开关/实际 argv、四角色日志、`warmup/measure-1` 的 JSON/console/metrics/drain、`arrival-cohorts.txt`、NPU 采样和正常停服证据；profile 点另附完整 trace、触发参数及在线墙钟范围。上述命令仅完成本地代码/语法核对，A5 现场执行与性能结论仍待本轮实测。
 
 ## 9. 【A5 手工执行】失败回传与最终交付表
 
