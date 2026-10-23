@@ -442,6 +442,7 @@ def plan(args: argparse.Namespace) -> None:
     ]
     common_env = {
         "OMP_NUM_THREADS": "2",
+        "HCCL_BUFFSIZE": str(extra.hccl_buffer_size),
         "VLLM_USE_V2_MODEL_RUNNER": "1",
         "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
         "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS": "120",
