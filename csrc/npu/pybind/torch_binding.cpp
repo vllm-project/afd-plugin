@@ -14,6 +14,12 @@
 #include "a2e/op_api/aclnn_a2e.h"
 #include "e2a/op_api/aclnn_e2a.h"
 
+#ifdef AFD_FFN_FAAS_BINDINGS
+namespace afd_plugin::faas {
+void register_scoped_submitter(pybind11::module_ &module);
+}
+#endif
+
 namespace afd_plugin {
 
 std::vector<at::Tensor> a2e(
@@ -148,4 +154,7 @@ TORCH_LIBRARY(afd_ascend, ops) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "AFD Ascend A2E/E2A custom operator bindings";
+#ifdef AFD_FFN_FAAS_BINDINGS
+  afd_plugin::faas::register_scoped_submitter(m);
+#endif
 }

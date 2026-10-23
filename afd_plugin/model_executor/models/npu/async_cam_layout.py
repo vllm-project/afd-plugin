@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 
 ASYNC_MOE_LAYOUT_LOG_ENV: Final[str] = "AFD_ASYNC_MOE_LAYOUT_LOG"
 _TRUE_ENV_VALUES: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
+_INVALID_EXPERT_ID: Final[int] = -1
 
 logger = init_logger(__name__)
 
@@ -54,6 +55,7 @@ def prepare_cam_dispatch_payload(
     router_logits: torch.Tensor | None,
     *,
     use_sequence_parallel: bool,
+    skip_padding_routes: bool = False,
 ) -> CAMDispatchPayload:
     """Convert the model token layout to one rank-local CAM payload.
 
@@ -61,6 +63,9 @@ def prepare_cam_dispatch_payload(
     shard, so that layout passes through unchanged. Plain TP keeps a replicated
     token dimension after its tensor-parallel collectives; only the CAM
     boundary shards that dimension so each global token is dispatched once.
+    FaaS opts into invalid expert IDs for the known padding range; CAM keeps
+    its existing zero-filled IDs by default. Real rows are never filtered by
+    their input values or routing probabilities.
     """
 
     parent_tokens = int(hidden_states.shape[0])
@@ -120,7 +125,11 @@ def prepare_cam_dispatch_payload(
     return CAMDispatchPayload(
         hidden_states=_pad_first_dim(hidden_states, padded_tokens)[local_token_slice],
         topk_weights=_pad_first_dim(topk_weights, padded_tokens)[local_token_slice],
-        topk_ids=_pad_first_dim(topk_ids, padded_tokens)[local_token_slice],
+        topk_ids=_pad_first_dim(
+            topk_ids,
+            padded_tokens,
+            fill_value=_INVALID_EXPERT_ID if skip_padding_routes else 0,
+        )[local_token_slice],
         router_logits=(
             None
             if router_logits is None
@@ -207,6 +216,8 @@ def _log_cam_layout(
 def _pad_first_dim(
     tensor: torch.Tensor,
     output_tokens: int,
+    *,
+    fill_value: int = 0,
 ) -> torch.Tensor:
     current_tokens = int(tensor.shape[0])
     if current_tokens > output_tokens:
@@ -218,7 +229,7 @@ def _pad_first_dim(
         return tensor
     padding_shape = (output_tokens - current_tokens, *tensor.shape[1:])
     return torch.cat(
-        (tensor, tensor.new_zeros(padding_shape)),
+        (tensor, tensor.new_full(padding_shape, fill_value)),
         dim=0,
     )
 

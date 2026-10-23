@@ -19,6 +19,11 @@ if TYPE_CHECKING:
 
 AFD_ADDITIONAL_CONFIG_KEY: Final[str] = "afd"
 AFD_ASYNC_CONNECTOR: Final[str] = "CAMAsyncAFDConnector"
+FFN_FAAS_CONNECTOR: Final[str] = "FaaSAsyncAFDConnector"
+ASYNC_ATTENTION_CONNECTORS: Final[tuple[str, ...]] = (
+    AFD_ASYNC_CONNECTOR,
+    FFN_FAAS_CONNECTOR,
+)
 CAMP2P_CONNECTOR: Final[str] = "CAMP2pAFDConnector"
 AFDRole = Literal["attention", "ffn"]
 
@@ -27,6 +32,7 @@ SUPPORTED_AFD_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pNcclAFDConnector",
     CAMP2P_CONNECTOR,
     AFD_ASYNC_CONNECTOR,
+    FFN_FAAS_CONNECTOR,
 )
 
 _ALIASES: Final[dict[str, str]] = {
@@ -304,7 +310,7 @@ def is_afd_async_dp(vllm_config: VllmConfig) -> bool:
     return (
         config is not None
         and config.async_dp
-        and config.connector == AFD_ASYNC_CONNECTOR
+        and config.connector in ASYNC_ATTENTION_CONNECTORS
     )
 
 
@@ -328,7 +334,16 @@ def validate_afd_config(
             "AFD connector must be one of "
             f"{SUPPORTED_AFD_CONNECTORS!r}, got {config.connector!r}",
         )
-    if config.async_dp and config.connector != AFD_ASYNC_CONNECTOR:
+    if config.connector == FFN_FAAS_CONNECTOR and (
+        config.role != "attention"
+        or not config.async_dp
+        or not config.compute_gate_on_attention
+    ):
+        raise ValueError(
+            "FFN FaaS connector requires async Attention with "
+            "compute_gate_on_attention=true; launch F separately"
+        )
+    if config.async_dp and config.connector not in ASYNC_ATTENTION_CONNECTORS:
         raise ValueError(
             "AFD async mode requires connector='CAMAsyncAFDConnector'",
         )
@@ -353,6 +368,8 @@ def validate_afd_config(
 __all__ = [
     "AFDConfig",
     "AFD_ASYNC_CONNECTOR",
+    "ASYNC_ATTENTION_CONNECTORS",
+    "FFN_FAAS_CONNECTOR",
     "afd_config_from_mapping",
     "AFD_ADDITIONAL_CONFIG_KEY",
     "AFDRole",

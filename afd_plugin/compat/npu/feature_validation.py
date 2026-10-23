@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
     CAMP2P_CONNECTOR,
+    FFN_FAAS_CONNECTOR,
     AFDConfig,
     is_afd_async_dp,
     parse_afd_config,
@@ -31,6 +32,9 @@ def fail_if_unsupported_npu_afd_features(
     """Fail fast for NPU AFD settings that are not currently supported."""
 
     afd_config = afd_config or parse_afd_config(vllm_config)
+    if afd_config.connector == FFN_FAAS_CONNECTOR:
+        validate_ffn_faas_attention(vllm_config, afd_config)
+        return
     layered_gmm_requested = async_cam_layered_gmm_enabled()
     if layered_gmm_requested and (
         afd_config.role != "ffn" or afd_config.connector != AFD_ASYNC_CONNECTOR
@@ -105,6 +109,57 @@ def fail_if_unsupported_npu_afd_features(
         raise RuntimeError(
             "AFD NPU MLA DBO graph execution requires FULL_DECODE_ONLY",
         )
+
+
+def validate_ffn_faas_attention(vllm_config: VllmConfig, afd_config: AFDConfig) -> None:
+    """Restrict the independent native FFN service to the V4 W4A8 contract."""
+    model, parallel = vllm_config.model_config, vllm_config.parallel_config
+    if (
+        not afd_config.is_attention_server
+        or not is_afd_async_dp(vllm_config)
+        or not afd_config.compute_gate_on_attention
+    ):
+        raise RuntimeError(
+            "FFN FaaS requires async Attention routing; launch F via its service CLI"
+        )
+    architectures = model.hf_config.architectures
+    # The connector's shared V4 checkpoint reader subsequently checks the real
+    # per-channel W4A8 tensors, compensation and activation limit before
+    # transport allocations. The Ascend plugin name alone is not that proof.
+    if (
+        model.hf_config.model_type != "deepseek_v4"
+        or architectures
+        not in (["DeepseekV4ForCausalLM"], ["AFDDeepseekV4ForCausalLM"])
+        or model.quantization != "ascend"
+        or str(model.dtype) != "torch.bfloat16"
+        or not model.enforce_eager
+    ):
+        raise RuntimeError(
+            "FFN FaaS supports only Ascend W4A8 DeepSeek-V4 with BF16 "
+            "activations in eager mode"
+        )
+    if (
+        parallel.enable_dbo
+        or parallel.use_ubatching
+        or parallel.pipeline_parallel_size != 1
+        or parallel.prefill_context_parallel_size != 1
+        or parallel.decode_context_parallel_size != 1
+        or parallel.enable_eplb
+        or parallel.enable_elastic_ep
+        or vllm_config.speculative_config is not None
+        or vllm_config.additional_config.get("mix_placement", False)
+    ):
+        raise RuntimeError(
+            "FFN FaaS requires static routed experts without DBO, PP, CP or speculation"
+        )
+    if async_cam_layered_gmm_enabled():
+        raise RuntimeError("FFN FaaS does not use the Async CAM layered GMM backend")
+
+    # AFDNPUAttentionWorker validates this before its _init_device call.
+    # Prepare transport discovery before that process initializes NPU/GE.
+    from afd_plugin.compat.npu.ops import bootstrap_afd_custom_op_env
+
+    bootstrap_afd_custom_op_env()
 
 
 def _is_dsv4_target(vllm_config: VllmConfig) -> bool:

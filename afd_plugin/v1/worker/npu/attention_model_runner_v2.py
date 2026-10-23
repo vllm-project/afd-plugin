@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
 from types import MethodType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
@@ -36,7 +36,7 @@ from afd_plugin.compat.patches.npu.mrv2_ubatching import (
     use_async_cam_dbo_dispatch,
     use_npu_ubatch_factory,
 )
-from afd_plugin.config import AFDConfig, parse_afd_config
+from afd_plugin.config import FFN_FAAS_CONNECTOR, AFDConfig, parse_afd_config
 from afd_plugin.connectors import (
     AFDConnectorBase,
     AFDConnectorFactory,
@@ -55,6 +55,7 @@ from afd_plugin.v1.worker.attention_model_runner_v2 import (
 from afd_plugin.validation import validate_npu_model_runner_v2_config
 
 if TYPE_CHECKING:
+    from afd_plugin.connectors.npu.ffn_faas import FaaSAsyncAFDConnector
     from afd_plugin.v1.worker.npu.ubatch_runner import NPUUBatchRunner
 
 _AFD_FULLGRAPH_HOOK_MARKER = "_afd_fullgraph_replay_hook_active"
@@ -459,6 +460,15 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                 use_afd_metadata_provider(
                     self.install_afd_metadata_on_forward_context,
                 ),
+                # Completion is checked on __exit__, before this function's
+                # return can expose model state to sampling or another step.
+                cast("FaaSAsyncAFDConnector", self.connector).model_execution_scope()
+                if self.afd_config.connector == FFN_FAAS_CONNECTOR
+                and self.vllm_config.model_config.enforce_eager
+                and not dummy_run
+                and not is_profile
+                and self.ubatch_runner is None
+                else nullcontext(),
             ):
                 return super().execute_model(
                     scheduler_output,
@@ -492,6 +502,11 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     # to a shared composition/factory owner; it never copies native cleanup.
     def shutdown(self) -> None:
         # ### PATCH START: guarantee profiler/native/connector cleanup.
+        # FaaS must publish EOS/abort while its windows and model worker are
+        # alive, before native shutdown synchronizes/frees large KV resources.
+        # Peer failure here reaches the connector's bounded process-exit path.
+        if self.afd_config.connector == FFN_FAAS_CONNECTOR:
+            self.connector.close()
         try:
             stop_afd_npu_profiler(self.prof)
         finally:

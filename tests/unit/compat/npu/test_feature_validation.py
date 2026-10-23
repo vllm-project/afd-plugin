@@ -9,9 +9,6 @@ from types import SimpleNamespace
 
 import pytest
 
-# The validator parses connector extra config, which imports vLLM.
-pytest.importorskip("vllm")
-
 from afd_plugin.compat.npu import (  # noqa: E402
     fail_if_unsupported_npu_afd_features,
     npu_afd_num_ubatches,
@@ -27,6 +24,130 @@ TWO_UBATCH_DBO = dict(
     enable_dbo=True, use_ubatching=True, num_ubatches=2, ubatch_size=4
 )
 ASYNC_CAM = dict(connector="CAMAsyncAFDConnector", async_dp=True)
+
+
+@pytest.fixture
+def vllm_runtime():
+    # Non-FaaS validators parse upstream connector/router configuration.
+    # FaaS model validation is CPU-only and must not acquire that dependency.
+    pytest.importorskip("vllm")
+
+
+@pytest.mark.parametrize(
+    "model_type,architecture,quantization,use_sp,error",
+    [
+        ("deepseek_v4", "DeepseekV4ForCausalLM", "ascend", False, None),
+        ("deepseek_v4", "AFDDeepseekV4ForCausalLM", "ascend", True, None),
+        (
+            "deepseek_v4",
+            "DeepseekV4ForCausalLM",
+            None,
+            False,
+            "Ascend W4A8 DeepSeek-V4",
+        ),
+        (
+            "deepseek_v2",
+            "DeepseekV2ForCausalLM",
+            None,
+            False,
+            "Ascend W4A8 DeepSeek-V4",
+        ),
+        (
+            "deepseek_v2",
+            "AFDDeepseekV2ForCausalLM",
+            None,
+            False,
+            "Ascend W4A8 DeepSeek-V4",
+        ),
+        (
+            "deepseek_v2",
+            "DeepseekV2ForCausalLM",
+            "ascend",
+            False,
+            "Ascend W4A8 DeepSeek-V4",
+        ),
+        (
+            "deepseek_v2",
+            "DeepseekV2ForCausalLM",
+            None,
+            True,
+            "Ascend W4A8 DeepSeek-V4",
+        ),
+        (
+            "deepseek_v3",
+            "DeepseekV3ForCausalLM",
+            None,
+            False,
+            "Ascend W4A8 DeepSeek-V4",
+        ),
+        (
+            "deepseek_v2",
+            "DeepseekV4ForCausalLM",
+            "ascend",
+            False,
+            "Ascend W4A8 DeepSeek-V4",
+        ),
+        (
+            "deepseek_v4",
+            "DeepseekV2ForCausalLM",
+            "ascend",
+            False,
+            "Ascend W4A8 DeepSeek-V4",
+        ),
+    ],
+)
+def test_faas_validation_matches_model_quantization_and_layout(
+    model_type, architecture, quantization, use_sp, error
+):
+    config = _config_with(
+        connector="FaaSAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+        enable_eplb=False,
+        enable_elastic_ep=False,
+        use_sequence_parallel_moe=use_sp,
+        model={
+            "hf_config": SimpleNamespace(
+                model_type=model_type, architectures=[architecture]
+            ),
+            "quantization": quantization,
+            "dtype": "torch.bfloat16",
+        },
+    )
+    with pytest.raises(RuntimeError, match=error) if error else nullcontext():
+        fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize(
+    "model,parallel,error",
+    [
+        ({"dtype": "torch.float16"}, {}, "in eager mode"),
+        ({"enforce_eager": False}, {}, "in eager mode"),
+        ({}, {"enable_dbo": True}, "without DBO"),
+        ({}, {"enable_eplb": True}, "static routed experts"),
+        ({}, {"prefill_context_parallel_size": 2}, "without DBO, PP, CP"),
+    ],
+)
+def test_faas_v4_retains_precision_and_static_execution_boundaries(
+    model, parallel, error
+):
+    config = _config_with(
+        connector="FaaSAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+        enable_elastic_ep=False,
+        model={
+            "hf_config": SimpleNamespace(
+                model_type="deepseek_v4", architectures=["DeepseekV4ForCausalLM"]
+            ),
+            "quantization": "ascend",
+            "dtype": "torch.bfloat16",
+            **model,
+        },
+        **({"enable_eplb": False} | parallel),
+    )
+    with pytest.raises(RuntimeError, match=error):
+        fail_if_unsupported_npu_afd_features(config)
 
 
 def _config_with(*, model=None, max_num_batched_tokens=None, **kwargs):
@@ -177,7 +298,7 @@ def _mla_dbo(cudagraph_mode, **model_fields):
         ),
     ],
 )
-def test_npu_feature_validation(config, error):
+def test_npu_feature_validation(config, error, vllm_runtime):
     with (
         pytest.raises((RuntimeError, ValueError), match=error)
         if error
@@ -210,6 +331,7 @@ def test_npu_async_feature_validation_checks_receive_capacity(
     factor,
     max_num_batched_tokens,
     rejected,
+    vllm_runtime,
 ):
     if factor is None:
         monkeypatch.delenv("BATCH_SIZE_FACTOR", raising=False)
@@ -263,7 +385,7 @@ def test_npu_async_feature_validation_checks_receive_capacity(
     ],
 )
 def test_npu_async_mrv2_feature_boundaries(
-    extra_config, additional_config, model_type, use_mla, error
+    extra_config, additional_config, model_type, use_mla, error, vllm_runtime
 ):
     config = _vllm_config(
         connector="CAMAsyncAFDConnector",
@@ -286,7 +408,7 @@ def test_npu_async_mrv2_feature_boundaries(
 @pytest.mark.parametrize("tp_size,use_sp", [(1, False), (2, False), (2, True)])
 @pytest.mark.parametrize("local_ubatching", [False, True])
 def test_npu_async_mrv2_features_allow_model_layouts(
-    model_type, use_mla, tp_size, use_sp, local_ubatching
+    model_type, use_mla, tp_size, use_sp, local_ubatching, vllm_runtime
 ):
     config = _vllm_config(
         connector="CAMAsyncAFDConnector",

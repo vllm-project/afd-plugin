@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import inspect
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -54,7 +54,10 @@ def _runner(*, async_dp=False):
         parallel_config=SimpleNamespace(enable_dbo=False, use_ubatching=False),
     )
     runner.afd_config = SimpleNamespace(
-        async_dp=async_dp, num_attention_ranks=2, num_ffn_ranks=2
+        async_dp=async_dp,
+        num_attention_ranks=2,
+        num_ffn_ranks=2,
+        connector="CAMAsyncAFDConnector" if async_dp else "CAMP2pAFDConnector",
     )
     runner.connector = SimpleNamespace(extra_info=SimpleNamespace())
     runner.cudagraph_manager = None
@@ -113,6 +116,25 @@ def test_shutdown_joins_native_children_and_releases_owned_stage_state(
     assert calls == ["profiler", "abort", "native", "connector"]
     assert (runner.ubatch_runner is None) is (failure != "native")
     assert runner._afd_pending_metadata is None
+
+
+def test_faas_shutdown_drains_before_native_synchronization(monkeypatch):
+    runner = _runner(async_dp=True)
+    runner.afd_config.connector = "FaaSAsyncAFDConnector"
+    events = []
+    closed = False
+
+    def close():
+        nonlocal closed
+        if not closed:
+            events.append("quiescent")
+            closed = True
+
+    runner.connector.close = close
+    monkeypatch.setattr(npu_v2, "stop_afd_npu_profiler", lambda _: None)
+    monkeypatch.setattr(NPUModelRunner, "shutdown", lambda _: events.append("native"))
+    runner.shutdown()
+    assert events == ["quiescent", "native"]
 
 
 def test_mla_capture_registry_uses_exact_native_descriptor_and_skips_warmup():
@@ -288,6 +310,69 @@ def test_execute_forwards_dummy_profile_and_context_then_restores(
     assert step_calls == [runner.prof]
     assert _state(runner) == original_state
     assert forward_module.create_forward_context is original_factory
+
+
+@pytest.mark.parametrize(
+    "dummy,profile,eager,faas,expected_scope",
+    [
+        (False, False, True, True, True),
+        (True, False, True, True, False),
+        (False, True, True, True, False),
+        (False, False, False, True, False),
+        (False, False, True, False, False),
+    ],
+)
+def test_execute_validates_faas_scope_before_exposing_model_result(
+    monkeypatch, dummy, profile, eager, faas, expected_scope
+):
+    runner = _runner(async_dp=True)
+    runner.vllm_config.model_config = SimpleNamespace(enforce_eager=eager)
+    if faas:
+        runner.afd_config.connector = "FaaSAsyncAFDConnector"
+    events = []
+
+    @contextmanager
+    def model_scope():
+        events.append("scope-enter")
+        yield
+        events.append("validated")
+
+    runner.connector.model_execution_scope = model_scope
+    monkeypatch.setattr(npu_v2, "step_afd_npu_profiler", lambda _: None)
+
+    def native_execute(self, *args, **kwargs):
+        events.append("model")
+        return "model-result"
+
+    monkeypatch.setattr(NPUModelRunner, "execute_model", native_execute)
+    result = runner.execute_model(
+        SimpleNamespace(total_num_scheduled_tokens=3),
+        dummy_run=dummy,
+        is_profile=profile,
+    )
+    assert result == "model-result"
+    assert events == (
+        ["scope-enter", "model", "validated"] if expected_scope else ["model"]
+    )
+
+
+def test_execute_cannot_expose_result_when_faas_scope_validation_fails(monkeypatch):
+    runner = _runner(async_dp=True)
+    runner.vllm_config.model_config = SimpleNamespace(enforce_eager=True)
+    runner.afd_config.connector = "FaaSAsyncAFDConnector"
+
+    @contextmanager
+    def failed_scope():
+        yield
+        raise RuntimeError("invalid completed FFN status")
+
+    runner.connector.model_execution_scope = failed_scope
+    monkeypatch.setattr(npu_v2, "step_afd_npu_profiler", lambda _: None)
+    monkeypatch.setattr(
+        NPUModelRunner, "execute_model", lambda *a, **k: "invalid-result"
+    )
+    with pytest.raises(RuntimeError, match="invalid completed FFN status"):
+        runner.execute_model(SimpleNamespace(total_num_scheduled_tokens=3))
 
 
 @pytest.mark.parametrize("profile_only", [False, True])
