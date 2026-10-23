@@ -2,6 +2,7 @@
   "_comment": "AFD Ascend custom operator registry. soc_versions maps a SOC generation to the operator directory names it supports. operator_meta holds per-operator build metadata. To support a new SOC generation, add an entry under soc_versions. To add an operator, append its directory name to the relevant soc list and (optionally) add meta. Operator identity = source directory name under ascend_kernels/.",
   "soc_versions": {
     "ascend910_93": [
+      "afd_ffn_faas",
       "a2e",
       "e2a",
       "afd_async_dispatch_send",
@@ -17,6 +18,9 @@
     ]
   },
   "operator_meta": {
+    "afd_ffn_faas": {
+      "requires_shmem": false
+    },
     "a2e": {
       "requires_shmem": false
     },

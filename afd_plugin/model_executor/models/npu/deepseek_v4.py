@@ -24,7 +24,11 @@ from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.sequence import IntermediateTensors
 
-from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
+from afd_plugin.config import (
+    AFD_ASYNC_CONNECTOR,
+    FFN_FAAS_CONNECTOR,
+    parse_afd_config,
+)
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
     AFDF2ATransferPayload,
@@ -200,6 +204,10 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         self.use_sequence_parallel_moe = (
             vllm_config.parallel_config.use_sequence_parallel_moe
         )
+        self.skip_padding_routes = (
+            parse_afd_config(vllm_config, validate=False).connector
+            == FFN_FAAS_CONNECTOR
+        )
         self.top_k = int(config.num_experts_per_tok)
         self.n_routed_experts = int(config.n_routed_experts)
         self.renormalize = bool(config.norm_topk_prob)
@@ -271,6 +279,7 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
             topk_ids,
             None,
             use_sequence_parallel=self.use_sequence_parallel_moe,
+            skip_padding_routes=self.skip_padding_routes,
         )
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
@@ -700,7 +709,8 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
             weights,
             role=self.afd_role,
             attn_owns_gate=bool(self.afd_config.compute_gate_on_attention),
-            attention_shared_experts=self.afd_config.connector == AFD_ASYNC_CONNECTOR,
+            attention_shared_experts=self.afd_config.connector
+            in (AFD_ASYNC_CONNECTOR, FFN_FAAS_CONNECTOR),
         )
         loaded = super().load_weights(role_weights)
         return loaded

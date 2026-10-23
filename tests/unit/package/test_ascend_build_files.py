@@ -268,6 +268,7 @@ def _run_select_ops(*args: str) -> subprocess.CompletedProcess[str]:
         (
             "ascend910_93",
             [
+                "afd_ffn_faas",
                 "a2e",
                 "e2a",
                 "afd_async_dispatch_send",

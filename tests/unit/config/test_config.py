@@ -149,6 +149,42 @@ def test_async_dp_requires_async_connector():
         )
 
 
+def test_faas_attention_selects_the_existing_async_dp_runtime():
+    source = {
+        "afd": {
+            "connector": "FaaSAsyncAFDConnector",
+            "role": "attention",
+            "async": True,
+            "compute_gate_on_attention": True,
+        }
+    }
+    assert parse_afd_config(source).role == "attention"
+    assert is_afd_async_dp(source)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"role": "ffn"},
+        {"async": False},
+        {"compute_gate_on_attention": False},
+    ],
+)
+def test_faas_cannot_start_a_legacy_ffn_worker(change):
+    with pytest.raises(ValueError, match="launch F separately"):
+        parse_afd_config(
+            {
+                "afd": {
+                    "connector": "FaaSAsyncAFDConnector",
+                    "role": "attention",
+                    "async": True,
+                    "compute_gate_on_attention": True,
+                    **change,
+                }
+            }
+        )
+
+
 def test_original_common_afd_field_aliases_are_supported():
     raw = {
         "afd_role": "ffn",

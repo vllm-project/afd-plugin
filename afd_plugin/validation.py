@@ -10,7 +10,7 @@ import struct
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 from afd_plugin.config import (
-    AFD_ASYNC_CONNECTOR,
+    ASYNC_ATTENTION_CONNECTORS,
     CAMP2P_CONNECTOR,
     AFDConfig,
     parse_afd_config,
@@ -156,7 +156,7 @@ def validate_npu_model_runner_v2_config(
     afd_config = parse_afd_config(vllm_config, expected_role=expected_role)
     if device_type != "npu":
         raise RuntimeError("AFD NPU ModelRunnerV2 requires NPU")
-    if afd_config.connector == AFD_ASYNC_CONNECTOR:
+    if afd_config.connector in ASYNC_ATTENTION_CONNECTORS:
         if not afd_config.async_dp or not afd_config.compute_gate_on_attention:
             raise RuntimeError(
                 "AFD NPU ModelRunnerV2 Async CAM requires async DP and "
@@ -204,14 +204,14 @@ def validate_npu_model_runner_v2_config(
         raise RuntimeError("AFD ModelRunnerV2 requires static expert parallelism")
     if parallel.enable_dbo or parallel.use_ubatching:
         if (
-            afd_config.connector == AFD_ASYNC_CONNECTOR
+            afd_config.connector in ASYNC_ATTENTION_CONNECTORS
             and not vllm_config.model_config.enforce_eager
         ):
             raise RuntimeError("AFD NPU ModelRunnerV2 DBO requires eager execution")
         if (
             expected_role == "attention"
             and parallel.data_parallel_size <= 1
-            and afd_config.connector != AFD_ASYNC_CONNECTOR
+            and afd_config.connector not in ASYNC_ATTENTION_CONNECTORS
         ):
             raise RuntimeError("AFD NPU ModelRunnerV2 DBO requires Attention DP > 1")
         if parallel.num_ubatches != 2:
@@ -330,7 +330,7 @@ def assert_compatible_afd_stack(
     parallel_config = vllm_config.parallel_config
     async_expected_worker = (
         expected_npu_worker_qualname(config.role)
-        if config.connector == "CAMAsyncAFDConnector"
+        if config.connector in ASYNC_ATTENTION_CONNECTORS
         else None
     )
 

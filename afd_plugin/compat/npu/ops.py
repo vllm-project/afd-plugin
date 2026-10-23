@@ -40,12 +40,27 @@ def _prepend_env_path(name: str, path: Path) -> None:
     os.environ[name] = ":".join([path_str, *entries])
 
 
-def _ensure_afd_custom_opp_env() -> None:
+def _append_env_path(name: str, path: Path) -> None:
+    path_str = str(path)
+    entries = [
+        entry
+        for entry in os.environ.get(name, "").split(":")
+        if entry and entry != path_str
+    ]
+    os.environ[name] = ":".join([*entries, path_str])
+
+
+def bootstrap_afd_custom_op_env() -> None:
+    """Prepare vendor discovery before the first NPU/GE initialization."""
     vendor_dir = get_afd_cann_vendor_path()
     if not vendor_dir.exists():
         return
 
-    _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", vendor_dir)
+    # Native Ascend searches each vendor with dlsym, which also searches that
+    # library's dependencies. Our libopapi dependency can expose a CANN symbol
+    # with an older native GMM signature. Keep native vendors ahead of AFD;
+    # AFD's own bindings resolve their API through AFD_CUST_OPAPI_LIB_PATH.
+    _append_env_path("ASCEND_CUSTOM_OPP_PATH", vendor_dir)
     op_api_lib = vendor_dir / "op_api" / "lib"
     if op_api_lib.exists():
         _prepend_env_path("LD_LIBRARY_PATH", op_api_lib)
@@ -78,7 +93,7 @@ def ensure_cam_p2p_ops_available() -> None:
     in an Ascend environment unless ``AFD_BUILD_ASCEND_OPS=0`` is set.
     """
 
-    _ensure_afd_custom_opp_env()
+    bootstrap_afd_custom_op_env()
     try:
         import torch
 
@@ -129,6 +144,7 @@ __all__ = [
     "CAM_DISPATCH_RECV",
     "CAM_DISPATCH_SEND",
     "CAM_OP_NAMESPACE",
+    "bootstrap_afd_custom_op_env",
     "ensure_afd_ascend_ops_loaded",
     "ensure_cam_async_ops_available",
     "ensure_cam_p2p_ops_available",

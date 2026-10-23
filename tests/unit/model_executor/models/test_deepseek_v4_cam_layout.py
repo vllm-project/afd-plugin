@@ -22,6 +22,7 @@ def _make_proxy(monkeypatch, *, use_sequence_parallel: bool, in_profile_run: boo
     proxy = object.__new__(adapter.AFDDeepseekV4AttentionGateRemoteMoE)
     torch.nn.Module.__init__(proxy)
     proxy.use_sequence_parallel_moe = use_sequence_parallel
+    proxy.skip_padding_routes = False
     proxy.shared_experts = None
     proxy.layer_idx = 3
     connector = SimpleNamespace()

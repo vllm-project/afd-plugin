@@ -70,10 +70,14 @@ copy_ops_include() {
 # has already printed the error and exited non-zero, so set -e aborts.
 resolve_ops() {
     local soc=$1
+    local -a selection=()
+    if [ -n "${AFD_BUILD_OPS:-}" ]; then
+        selection=(--ops "$AFD_BUILD_OPS")
+    fi
     python3 "$SELECT_OPS_SCRIPT" \
         --registry "$REGISTRY_PATH" \
         --soc "$soc" \
-        --shmem "$shmem_installed" | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//'
+        --shmem "$shmem_installed" "${selection[@]}" | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//'
 }
 
 # Build the operator project and place its artifacts at the given location

@@ -64,6 +64,37 @@ def _assert_tensor_spec(
     assert tensor.device.type == device_type
 
 
+def test_vendor_bootstrap_preserves_inherited_paths_without_loading_ops(
+    tmp_path, monkeypatch
+) -> None:
+    from afd_plugin.compat.npu import ops
+
+    vendor = tmp_path / "vendor"
+    library = vendor / "op_api" / "lib"
+    library.mkdir(parents=True)
+    (library / "libcust_opapi.so").touch()
+    monkeypatch.setattr(ops, "get_afd_cann_vendor_path", lambda: vendor)
+    monkeypatch.setenv("ASCEND_CUSTOM_OPP_PATH", "/inherited/vendor")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/inherited/lib")
+    monkeypatch.setenv(ops.AFD_CUST_OPAPI_ENV, "/inherited/opapi.so")
+    ops.bootstrap_afd_custom_op_env()
+    ops.bootstrap_afd_custom_op_env()
+    assert os.environ["ASCEND_CUSTOM_OPP_PATH"].split(":") == [
+        "/inherited/vendor",
+        str(vendor),
+    ]
+    assert os.environ["LD_LIBRARY_PATH"].split(":") == [str(library), "/inherited/lib"]
+    assert os.environ[ops.AFD_CUST_OPAPI_ENV] == str(library / "libcust_opapi.so")
+
+    # Repair an inherited AFD-first ordering before native discovery caches it.
+    monkeypatch.setenv("ASCEND_CUSTOM_OPP_PATH", f"{vendor}:/native/vendor:{vendor}")
+    ops.bootstrap_afd_custom_op_env()
+    assert os.environ["ASCEND_CUSTOM_OPP_PATH"].split(":") == [
+        "/native/vendor",
+        str(vendor),
+    ]
+
+
 def test_a2e_e2a_meta_contracts() -> None:
     _load_ops_or_skip()
 

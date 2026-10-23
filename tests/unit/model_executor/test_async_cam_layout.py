@@ -45,6 +45,12 @@ def test_plain_tp_cam_boundary_shards_and_restores_replicated_tokens(monkeypatch
         assert payload.hidden_states.shape[0] == 3
         assert payload.topk_weights.shape[0] == 3
         assert payload.topk_ids.shape[0] == 3
+        expected_ids = (
+            topk_ids[:3]
+            if tp_rank == 0
+            else torch.cat((topk_ids[3:], topk_ids.new_zeros((1, 2))))
+        )
+        assert torch.equal(payload.topk_ids, expected_ids)
         assert payload.router_logits is not None
         assert payload.router_logits.shape[0] == 3
         assert payload.layout.parent_tokens == 5
@@ -57,3 +63,65 @@ def test_plain_tp_cam_boundary_shards_and_restores_replicated_tokens(monkeypatch
             payload.layout,
         )
         assert torch.equal(restored, padded_output[:5])
+
+
+@pytest.mark.parametrize("num_tokens,tp_size", [(13, 2), (1, 4), (0, 2)])
+@pytest.mark.parametrize("skip_padding_routes", [False, True])
+def test_padding_ids_preserve_real_zero_expert_routes(
+    monkeypatch, num_tokens, tp_size, skip_padding_routes
+):
+    tp_group = SimpleNamespace(world_size=tp_size, rank_in_group=0)
+    monkeypatch.setattr(async_cam_layout, "get_tp_group", lambda: tp_group)
+    # Expert 0, zero input and zero probability are legal for every real row.
+    hidden_states = torch.zeros(num_tokens, 2, dtype=torch.bfloat16)
+    probabilities = torch.zeros(num_tokens, 6)
+    ids = torch.zeros(num_tokens, 6, dtype=torch.int32)
+    local_tokens = (num_tokens + tp_size - 1) // tp_size
+    for rank in range(tp_size):
+        tp_group.rank_in_group = rank
+        payload = async_cam_layout.prepare_cam_dispatch_payload(
+            hidden_states,
+            probabilities,
+            ids,
+            None,
+            use_sequence_parallel=False,
+            skip_padding_routes=skip_padding_routes,
+        )
+        first_row = rank * local_tokens
+        real_rows = max(0, min(local_tokens, num_tokens - first_row))
+        expected = torch.zeros(local_tokens, 6, dtype=torch.int32)
+        if skip_padding_routes:
+            expected[real_rows:] = -1
+        assert torch.equal(payload.topk_ids, expected)
+        assert payload.hidden_states.shape[0] == local_tokens
+        assert torch.equal(payload.topk_weights, torch.zeros(local_tokens, 6))
+        assert payload.layout.parent_tokens == num_tokens
+        assert payload.layout.padded_tokens == local_tokens * tp_size
+
+
+@pytest.mark.parametrize(
+    "use_sequence_parallel,tp_size", [(False, 2), (True, 2), (False, 1)]
+)
+def test_unpadded_routes_share_input_storage(
+    monkeypatch, use_sequence_parallel, tp_size
+):
+    monkeypatch.setattr(
+        async_cam_layout,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=tp_size, rank_in_group=0),
+    )
+    hidden_states = torch.zeros(4, 2)
+    probabilities = torch.zeros(4, 6)
+    ids = torch.zeros(4, 6, dtype=torch.int32)
+    payload = async_cam_layout.prepare_cam_dispatch_payload(
+        hidden_states,
+        probabilities,
+        ids,
+        None,
+        use_sequence_parallel=use_sequence_parallel,
+        skip_padding_routes=True,
+    )
+    assert payload.hidden_states.data_ptr() == hidden_states.data_ptr()
+    assert payload.topk_weights.data_ptr() == probabilities.data_ptr()
+    assert payload.topk_ids.data_ptr() == ids.data_ptr()
+    assert torch.count_nonzero(payload.topk_ids) == 0
