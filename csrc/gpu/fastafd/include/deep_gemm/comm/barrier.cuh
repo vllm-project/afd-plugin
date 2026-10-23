@@ -1,0 +1,142 @@
+#pragma once
+
+#include <cutlass/arch/barrier.h>
+
+#include <deep_gemm/ptx/ld_st.cuh>
+#include <deep_gemm/layout/sym_buffer.cuh>
+#include <deep_gemm/layout/mega_moe.cuh>
+
+namespace deep_gemm::comm {
+
+CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {
+    // Perform cluster_sync with `barrier.cluster.arrive.relaxed`
+    // This is slightly faster than `cute::cluster_sync` but has weaker memory ordering guarantee
+    cute::cluster_arrive_relaxed();
+    cute::cluster_wait();
+}
+
+template <uint32_t kNumSMs, uint32_t kGridSyncIndex = 0, typename sync_scope_t, typename workspace_t = layout::Workspace>
+CUTLASS_DEVICE void grid_sync(const workspace_t& workspace,
+                              const uint32_t& sm_idx, const uint32_t& thread_idx,
+                              const sync_scope_t& sync_scope) {
+    // NOTES: the implementation idea is from `cooperative_groups::this_grid().sync()`
+    static constexpr uint32_t kFinishSumTag = 0x80000000u;
+    sync_scope();
+    if (thread_idx == 0) {
+        const auto count_ptr = workspace.template get_grid_sync_count_ptr<kGridSyncIndex>();
+        const auto old_value = ptx::atomic_add_rel(
+            count_ptr, sm_idx == 0 ? (kFinishSumTag - (kNumSMs - 1)) : 1);
+        uint32_t new_value;
+        do {
+            new_value = ptx::ld_acq(count_ptr);
+        } while (((new_value ^ old_value) & kFinishSumTag) == 0);
+    }
+    sync_scope();
+}
+
+template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kGridSyncIndex, uint32_t kTag, typename sync_scope_t, typename workspace_t = layout::Workspace>
+CUTLASS_DEVICE void nvlink_barrier(const workspace_t& workspace,
+                                   const layout::SymBuffer<kNumRanks>& sym_buffer,
+                                   const uint32_t& sm_idx, const uint32_t& thread_idx,
+                                   const sync_scope_t& sync_scope,
+                                   const bool& sync_prologue = true,
+                                   const bool& sync_epilogue = true) {
+    DG_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
+
+    // Grid sync before NVLink signaling
+    if (sync_prologue)
+        grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
+
+    // NVLink cross-rank barrier, only SM 0 participates
+    if (sm_idx == 0) {
+        auto* counter_ptr = workspace.get_nvl_barrier_counter_ptr();
+        const auto status = (*counter_ptr) & 3;
+        const auto signal_phase = status & 1, signal_sign = status >> 1;
+        auto* signal_ptr = workspace.get_nvl_barrier_signal_ptr(signal_phase);
+
+        // Send signals to remote ranks
+        if (thread_idx < kNumRanks)
+            ptx::red_add_rel_sys(sym_buffer.map(signal_ptr, thread_idx), signal_sign ? -1 : 1);
+        sync_scope();
+
+        // Update status and wait arrival (with 300s timeout, at 2 GHz)
+        constexpr int64_t kNumTimeoutCycles = 300ll * 2000000000ll;
+        if (thread_idx == 0) {
+            ptx::red_add(counter_ptr, 1);
+            const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);
+            const auto start_clock = clock64();
+            while (ptx::ld_acq_sys(signal_ptr) != target) {
+                if (clock64() - start_clock >= kNumTimeoutCycles) {
+                    printf("DeepGEMM NVLink barrier timeout (300s): rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
+                           sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
+                    DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
+                }
+            }
+        }
+    }
+
+    // Grid sync after NVLink completion
+    if (sync_epilogue)
+        grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
+}
+
+// Split NVLink barrier: `arrive` sends this phase's signals WITHOUT bumping
+// the phase counter; the matching `wait` (typically deferred into the next
+// kernel launch) spins on the same phase, bumps the counter, and grid-syncs.
+// Contract: at least one full `nvlink_barrier` must execute between two
+// consecutive arrive/wait pairs (so a reused signal slot cannot receive the
+// next round's signals before the previous round was consumed), and the
+// phase-0 signal word must be seeded with `kNumRanks` at buffer init so the
+// very first deferred wait observes a completed phase.
+template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kGridSyncIndex, uint32_t kTag, typename sync_scope_t, typename workspace_t = layout::Workspace>
+CUTLASS_DEVICE void nvlink_barrier_arrive(const workspace_t& workspace,
+                                          const layout::SymBuffer<kNumRanks>& sym_buffer,
+                                          const uint32_t& sm_idx, const uint32_t& thread_idx,
+                                          const sync_scope_t& sync_scope,
+                                          const bool& sync_prologue = true) {
+    DG_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
+
+    // Grid sync so every SM's prior work is ordered before the signals
+    if (sync_prologue)
+        grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
+
+    if (sm_idx == 0) {
+        const auto status = (*workspace.get_nvl_barrier_counter_ptr()) & 3;
+        const auto signal_phase = status & 1, signal_sign = status >> 1;
+        auto* signal_ptr = workspace.get_nvl_barrier_signal_ptr(signal_phase);
+        if (thread_idx < kNumRanks)
+            ptx::red_add_rel_sys(sym_buffer.map(signal_ptr, thread_idx), signal_sign ? -1 : 1);
+    }
+}
+
+template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kGridSyncIndex, uint32_t kTag, typename sync_scope_t, typename workspace_t = layout::Workspace>
+CUTLASS_DEVICE void nvlink_barrier_wait(const workspace_t& workspace,
+                                        const layout::SymBuffer<kNumRanks>& sym_buffer,
+                                        const uint32_t& sm_idx, const uint32_t& thread_idx,
+                                        const sync_scope_t& sync_scope,
+                                        const bool& sync_epilogue = true) {
+    if (sm_idx == 0 and thread_idx == 0) {
+        auto* counter_ptr = workspace.get_nvl_barrier_counter_ptr();
+        const auto status = (*counter_ptr) & 3;
+        const auto signal_phase = status & 1, signal_sign = status >> 1;
+        auto* signal_ptr = workspace.get_nvl_barrier_signal_ptr(signal_phase);
+
+        constexpr int64_t kNumTimeoutCycles = 300ll * 2000000000ll;
+        ptx::red_add(counter_ptr, 1);
+        const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);
+        const auto start_clock = clock64();
+        while (ptx::ld_acq_sys(signal_ptr) != target) {
+            if (clock64() - start_clock >= kNumTimeoutCycles) {
+                printf("DeepGEMM NVLink barrier-wait timeout (300s): rank=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
+                       sym_buffer.rank_idx, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
+                DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
+            }
+        }
+    }
+
+    // Grid sync so no SM proceeds before the phase completed
+    if (sync_epilogue)
+        grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
+}
+
+} // namespace deep_gemm::comm

@@ -11,11 +11,14 @@ repos:
         args: [--allow-multiple-documents]
       - id: check-merge-conflict
       - id: debug-statements
+      # Vendored FastAFD/DeepGEMM sources stay byte-identical to their pin.
       - id: end-of-file-fixer
+        exclude: ^csrc/gpu/fastafd/
       - id: mixed-line-ending
         args: [--fix=lf]
       - id: trailing-whitespace
         args: [--markdown-linebreak-ext=md]
+        exclude: ^csrc/gpu/fastafd/
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Keep in sync with the ruff version pinned in uv.lock

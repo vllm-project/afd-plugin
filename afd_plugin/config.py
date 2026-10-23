@@ -20,6 +20,9 @@ if TYPE_CHECKING:
 AFD_ADDITIONAL_CONFIG_KEY: Final[str] = "afd"
 AFD_ASYNC_CONNECTOR: Final[str] = "CAMAsyncAFDConnector"
 CAMP2P_CONNECTOR: Final[str] = "CAMP2pAFDConnector"
+FASTAFD_CONNECTOR: Final[str] = "FastAFDAFDConnector"
+# The FastAFD M2N kernels address at most this many union ranks.
+FASTAFD_MAX_UNION_RANKS: Final[int] = 72
 AFDRole = Literal["attention", "ffn"]
 
 SUPPORTED_AFD_ROLES: Final[tuple[str, ...]] = ("attention", "ffn")
@@ -27,6 +30,7 @@ SUPPORTED_AFD_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pNcclAFDConnector",
     CAMP2P_CONNECTOR,
     AFD_ASYNC_CONNECTOR,
+    FASTAFD_CONNECTOR,
 )
 
 _ALIASES: Final[dict[str, str]] = {
@@ -336,6 +340,17 @@ def validate_afd_config(
         from afd_plugin.distributed import validate_p2p_topology
 
         validate_p2p_topology(config)
+    if config.connector == FASTAFD_CONNECTOR:
+        if not config.compute_gate_on_attention:
+            raise ValueError(
+                f"{FASTAFD_CONNECTOR} routes on Attention; set "
+                "compute_gate_on_attention=true",
+            )
+        if config.num_attention_ranks + config.num_ffn_ranks > FASTAFD_MAX_UNION_RANKS:
+            raise ValueError(
+                f"{FASTAFD_CONNECTOR} supports at most {FASTAFD_MAX_UNION_RANKS} "
+                "Attention plus FFN ranks",
+            )
     if not config.host:
         raise ValueError("AFD host must be non-empty")
     if not 0 < config.port < 65536:
@@ -357,6 +372,8 @@ __all__ = [
     "AFD_ADDITIONAL_CONFIG_KEY",
     "AFDRole",
     "CAMP2P_CONNECTOR",
+    "FASTAFD_CONNECTOR",
+    "FASTAFD_MAX_UNION_RANKS",
     "SUPPORTED_AFD_CONNECTORS",
     "SUPPORTED_AFD_ROLES",
     "connector_extra_config_from_mapping",

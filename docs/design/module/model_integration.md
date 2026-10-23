@@ -60,6 +60,7 @@ make a backend-specific worker class the shared model API.
 | DeepSeek V4 CUDA role boundary | [`deepseek_v4.py`](../../../afd_plugin/model_executor/models/deepseek_v4.py) | [`test_deepseek_v4_construction.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_construction.py), [`test_deepseek_v4_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_proxy.py), [`test_deepseek_v4_weight_policy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_weight_policy.py) |
 | DeepSeek V4 Ascend Hash-id boundary | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py), [`npu/deepseek_v4_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_attention_gate.py) | [`test_deepseek_v4_hash_ids.py`](../../../tests/unit/model_executor/test_deepseek_v4_hash_ids.py), [`test_deepseek_v4_npu_weight_roles.py`](../../../tests/unit/model_executor/test_deepseek_v4_npu_weight_roles.py), ids-mode cases in [`test_camp2p_token_ids.py`](../../../tests/unit/connectors/test_camp2p_token_ids.py) |
 | Qwen3 MoE role-aware model and weight loading | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py), [`test_qwen3_moe_weight_policy.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_weight_policy.py) |
+| FastAFD dispatch/combine custom ops | [`fastafd_moe.py`](../../../afd_plugin/model_executor/models/fastafd_moe.py) | [`test_fastafd_moe.py`](../../../tests/unit/model_executor/models/test_fastafd_moe.py), [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py), [`test_qwen3_5_contract.py`](../../../tests/unit/model_executor/models/test_qwen3_5_contract.py) |
 | CUDA remote-experts boundary | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py), [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py) | [`test_p2p_experts_contract.py`](../../../tests/unit/connectors/test_p2p_experts_contract.py), [`test_deepseek_v2_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_proxy.py) |
 | Forward-context adapter | [`forward_context.py`](../../../afd_plugin/model_executor/models/forward_context.py) | [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
 | NPU Async CAM native DBO handoff | [`npu/async_cam_dbo.py`](../../../afd_plugin/model_executor/models/npu/async_cam_dbo.py), [`npu/ubatch_runner.py`](../../../afd_plugin/v1/worker/npu/ubatch_runner.py) | [`test_async_cam_dbo.py`](../../../tests/unit/model_executor/test_async_cam_dbo.py), [`test_npu_model_runner_v2.py`](../../../tests/unit/v1/worker/test_npu_model_runner_v2.py) |
@@ -177,8 +178,20 @@ packed parameter mapping, quantization paths, and weight loading remain owned
 by vLLM. Checkpoint weights are filtered once by layer-stage path before the
 native loader consumes them.
 
-This path is CUDA-only and requires `compute_gate_on_attention=false`. It fails
-during construction for sequence-parallel MoE, EPLB, pipeline parallelism,
+With `FastAFDAFDConnector` Attention also owns the gate
+(`AFDQwen3MoeAttentionRoutedMoE`): it computes native softmax top-k with
+`norm_topk_prob` renormalization and hands the routed experts to the
+connector through the shared `afd_fastafd_dispatch` and `afd_fastafd_combine`
+custom ops in `fastafd_moe.py`. The copy that dispatch returns feeds combine,
+so `torch.compile` keeps the two kernels in order. FFN loads its routed experts
+through `FastAFDFFNModelRunner` and does not build the model. Every layer must
+be a MoE layer, and the checkpoint must not have shared experts. DBO is
+rejected with this connector: the expert kernel serves every layer's lanes in
+order, which needs the two microbatches to alternate per layer.
+
+This path is CUDA-only. It requires `compute_gate_on_attention=false` with
+`P2pNcclAFDConnector` and `true` with `FastAFDAFDConnector`. It fails during
+construction for sequence-parallel MoE, EPLB, pipeline parallelism,
 speculative decoding, LoRA, or NPU.
 
 ### Qwen3.5/3.6 MoE CUDA boundary
@@ -188,8 +201,22 @@ native hybrid Qwen3.5/3.6 architecture. Attention owns embeddings, norms, and
 linear/full-attention state, then sends hidden states only. FFN owns the native
 gate, routed experts, shared expert, and shared-expert gate.
 
+With `FastAFDAFDConnector` the split moves: Attention also owns the gate, the
+shared expert and the shared-expert gate (`AFDQwen3_5AttentionRoutedMoE`),
+computes native softmax top-k with `norm_topk_prob` renormalization, and hands
+only routed experts to the connector: `dispatch` sends them, the shared expert
+runs while the FFN ranks compute, and `combine` returns the routed output that
+is added to it. Two custom ops (`afd_fastafd_dispatch`, `afd_fastafd_combine`)
+(shared with Qwen3 MoE, in `fastafd_moe.py`) carry data dependencies through
+the shared expert, so `torch.compile` keeps it
+between the two kernels while the shared expert itself stays compiled. FFN loads the routed experts itself through
+`FastAFDFFNModelRunner`. The routed experts then run in the kernel's per-32
+UE8M0 FP8 format (activations and the SwiGLU intermediate are quantized), so
+outputs differ from the native block-FP8 path at the level of that format.
+
 This path is CUDA-only, text-only, and requires `--language-model-only`,
-`compute_gate_on_attention=false`, and `pipeline_parallel_size=1`. It rejects
+`compute_gate_on_attention=false` (P2P) or `true` (FastAFD), and
+`pipeline_parallel_size=1`. It rejects
 multimodal execution, sequence-parallel MoE, EPLB, speculative decoding, and
 LoRA before language-model construction; NPU model-config resolution fails
 before model loading. GDN DBO is unsupported under native hybrid/multimodal

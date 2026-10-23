@@ -14,9 +14,14 @@ from vllm.config.multimodal import MultiModalConfig  # noqa: E402
 from vllm.model_executor.models import qwen3_5 as native  # noqa: E402
 from vllm.model_executor.models.utils import StageMissingLayer  # noqa: E402
 
+from afd_plugin.model_executor.models import fastafd_moe  # noqa: E402
 from afd_plugin.model_executor.models import qwen3_5 as adapter  # noqa: E402
 from afd_plugin.model_executor.models.deepseek_v2 import (  # noqa: E402
     AFDAttentionFusedMoE,
+)
+from tests.unit.fakes.fastafd import (  # noqa: E402
+    custom_ops_torch,
+    recording_connector,
 )
 
 
@@ -60,6 +65,54 @@ def test_qwen_remote_experts_proxy_preserves_completed_ffn_output_under_tp(
     output = remote_moe(hidden_states)
 
     assert torch.equal(output, hidden_states + 1)
+
+
+def _attention_routed_moe(monkeypatch, connector, events: list[object]):
+    def shared_expert(local_input):
+        events.append("shared")
+        return local_input + 1
+
+    moe = object.__new__(adapter.AFDQwen3_5AttentionRoutedMoE)
+    nn.Module.__init__(moe)
+    moe.gate = lambda hidden_states: (hidden_states[:, :4], None)
+    moe.shared_expert = shared_expert
+    moe.top_k = 2
+    moe.renormalize = True
+    monkeypatch.setattr(
+        adapter,
+        "fused_topk",
+        lambda hidden_states, logits, top_k, renormalize: (
+            torch.full((3, 2), 0.5),
+            torch.zeros(3, 2, dtype=torch.int32),
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        fastafd_moe,
+        "get_afd_metadata_from_forward_context",
+        lambda: SimpleNamespace(connector=connector, stage_idx=1),
+    )
+    monkeypatch.setattr(fastafd_moe, "get_forward_context", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        adapter,
+        "maybe_apply_dbo_yield",
+        lambda tensor, role: tensor,
+    )
+    monkeypatch.setattr(adapter, "torch", custom_ops_torch())
+    return moe
+
+
+def test_attention_routed_moe_overlaps_shared_expert_with_remote_experts(
+    monkeypatch,
+):
+    events: list[object] = []
+    moe = _attention_routed_moe(monkeypatch, recording_connector(events), events)
+    hidden_states = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+
+    output = moe(hidden_states)
+
+    assert events == [("dispatch", 1), "shared", ("combine", 1)]
+    assert torch.equal(output, hidden_states * 2 + hidden_states + 1)
 
 
 def test_ffn_compute_ffn_output_calls_native_internal_router():
@@ -114,6 +167,7 @@ def test_qwen_conditional_model_rejects_multimodal_before_visual_construction(
         "parse_optional_afd_config",
         lambda *_args, **_kwargs: SimpleNamespace(
             role="attention",
+            connector="P2pNcclAFDConnector",
             compute_gate_on_attention=False,
         ),
     )
@@ -147,8 +201,17 @@ def test_qwen_text_only_validation_exposes_missing_language_model_only():
         )
 
 
-def test_qwen_conditional_model_rejects_attention_side_gate_before_construction(
+@pytest.mark.parametrize(
+    ("connector", "compute_gate_on_attention"),
+    [
+        ("P2pNcclAFDConnector", True),
+        ("FastAFDAFDConnector", False),
+    ],
+)
+def test_qwen_conditional_model_rejects_mismatched_gate_owner_before_construction(
     monkeypatch,
+    connector,
+    compute_gate_on_attention,
 ):
     vllm_config = SimpleNamespace(
         lora_config=None,
@@ -162,7 +225,8 @@ def test_qwen_conditional_model_rejects_attention_side_gate_before_construction(
         "parse_optional_afd_config",
         lambda *_args, **_kwargs: SimpleNamespace(
             role="attention",
-            compute_gate_on_attention=True,
+            connector=connector,
+            compute_gate_on_attention=compute_gate_on_attention,
         ),
     )
     monkeypatch.setattr(
@@ -173,7 +237,7 @@ def test_qwen_conditional_model_rejects_attention_side_gate_before_construction(
 
     with pytest.raises(
         ValueError,
-        match="Qwen3.5/3.6 CUDA supports compute_gate_on_attention=False only",
+        match="routes on Attention exactly when the connector is FastAFDAFDConnector",
     ):
         adapter.AFDQwen3_5MoeForConditionalGeneration(vllm_config=vllm_config)
 
@@ -203,6 +267,7 @@ def test_qwen_conditional_model_rejects_unsupported_feature_before_construction(
         "parse_optional_afd_config",
         lambda *_args, **_kwargs: SimpleNamespace(
             role="attention",
+            connector="P2pNcclAFDConnector",
             compute_gate_on_attention=False,
         ),
     )
@@ -247,6 +312,7 @@ def test_qwen_rejects_unsupported_parallel_feature_before_construction(
         "parse_optional_afd_config",
         lambda *_args, **_kwargs: SimpleNamespace(
             role="attention",
+            connector="P2pNcclAFDConnector",
             compute_gate_on_attention=False,
         ),
     )
@@ -280,6 +346,7 @@ def test_qwen_conditional_model_rejects_pipeline_parallelism_before_construction
         "parse_optional_afd_config",
         lambda *_args, **_kwargs: SimpleNamespace(
             role="attention",
+            connector="P2pNcclAFDConnector",
             compute_gate_on_attention=False,
         ),
     )
@@ -329,6 +396,7 @@ def test_qwen_conditional_model_initializes_for_text_only(monkeypatch):
         "parse_optional_afd_config",
         lambda *_args, **_kwargs: SimpleNamespace(
             role="attention",
+            connector="P2pNcclAFDConnector",
             compute_gate_on_attention=False,
         ),
     )
@@ -407,6 +475,7 @@ def test_qwen_text_only_uses_upstream_missing_vision_tower_stage(monkeypatch):
         "parse_optional_afd_config",
         lambda *_args, **_kwargs: SimpleNamespace(
             role="attention",
+            connector="P2pNcclAFDConnector",
             compute_gate_on_attention=False,
         ),
     )

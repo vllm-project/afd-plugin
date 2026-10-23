@@ -460,7 +460,7 @@ _GPU_GRAPH = {
         pytest.param({"device_type": "npu"}, _err("requires CUDA"), id="reject-npu"),
         pytest.param(
             {"afd.connector": "CAMAsyncAFDConnector"},
-            _err("P2pNcclAFDConnector"),
+            _err("synchronous connectors"),
             id="reject-non-p2pnccl-connector",
         ),
         pytest.param(

@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
+from afd_plugin.config import AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import qwen3_moe as adapter  # noqa: E402
 from tests.unit.fakes.weights import OneShotWeights as _OneShotWeights  # noqa: E402
 
@@ -137,6 +138,7 @@ def test_load_weights_filters_once_and_delegates_to_native_loader(
     )
     model = object.__new__(adapter.AFDQwen3MoeForCausalLM)
     object.__setattr__(model, "afd_role", role)
+    object.__setattr__(model, "afd_config", AFDConfig(role=role))
 
     result = model.load_weights(weights)
 
@@ -146,6 +148,35 @@ def test_load_weights_filters_once_and_delegates_to_native_loader(
         weights.items[names.index(name)][1] for name in expected_names
     ]
     assert weights.iterations == 1
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_name", "roles"),
+    [
+        ("model.layers.0.mlp.gate.weight", ATTENTION_ROLE),
+        ("model.layers.0.mlp.experts.0.gate_proj.weight", FFN_ROLE),
+        ("model.layers.0.mlp.experts.0.down_proj.weight_scale_inv", FFN_ROLE),
+        ("model.layers.0.self_attn.q_proj.weight", ATTENTION_ROLE),
+    ],
+)
+def test_gate_on_attention_moves_only_the_router_to_attention(
+    checkpoint_name: str,
+    roles: frozenset[str],
+) -> None:
+    assert (
+        adapter._checkpoint_weight_roles(
+            checkpoint_name,
+            compute_gate_on_attention=True,
+        )
+        == roles
+    )
+
+
+def test_fastafd_expert_tensor_name_matches_checkpoint_layout() -> None:
+    assert (
+        adapter.fastafd_expert_tensor_name(3, 17, "up_proj", "weight_scale_inv")
+        == "model.layers.3.mlp.experts.17.up_proj.weight_scale_inv"
+    )
 
 
 def test_native_loader_and_mapping_remain_native_owned() -> None:
