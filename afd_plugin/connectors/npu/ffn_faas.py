@@ -16,7 +16,9 @@ import torch
 from afd_plugin.config import AFDConfig
 from afd_plugin.connectors.base import AFDConnectorBase, ConnectorExtraInfo
 from afd_plugin.connectors.metadata import AFDA2FTransferPayload, AFDTransferContext
+from afd_plugin.connectors.npu.async_cam import select_cam_experts
 from afd_plugin.ffn_faas.client import AttentionSession
+from afd_plugin.ffn_faas.model import CheckpointDescription
 from afd_plugin.ffn_faas.npu import (
     NativeDeviceError,
     NPUExecutor,
@@ -62,8 +64,7 @@ class FaaSAsyncAFDConnector(AFDConnectorBase):
         self._session: AttentionSession | None = None
         self._executor: NPUExecutor | None = None
         self._pending_context: AFDTransferContext | None = None
-        if vllm_config.model_config.hf_config.model_type != "deepseek_v4":
-            raise ValueError("FFN FaaS currently requires DeepSeek-V4 W4A8")
+        self._is_v4 = vllm_config.model_config.hf_config.model_type == "deepseek_v4"
 
     @property
     def is_initialized(self) -> bool:
@@ -77,7 +78,8 @@ class FaaSAsyncAFDConnector(AFDConnectorBase):
         tp = self.vllm_config.parallel_config.tensor_parallel_size
         if extra.attn_ranks_per_dp != tp:
             raise ValueError("attn_ranks_per_dp must equal Attention TP")
-        checkpoint = V4CheckpointDescription.read(self.vllm_config.model_config.model)
+        description = V4CheckpointDescription if self._is_v4 else CheckpointDescription
+        checkpoint = description.read(self.vllm_config.model_config.model)
         spec = checkpoint.session_spec(
             attention_ranks=self.attn_size,
             attention_tp=tp,
@@ -159,8 +161,17 @@ class FaaSAsyncAFDConnector(AFDConnectorBase):
             os._exit(1)
 
     def select_experts(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
-        # The V4 proxy owns Hash/sqrtsoftplus and the single probability scale.
-        raise RuntimeError("V4 FaaS requires the native Hash/sqrtsoftplus router")
+        if self._is_v4:
+            # V4's native proxy selects Hash/sqrtsoftplus routes from the FP32
+            # normalized input, including routed scaling. The generic CAM
+            # selector cannot express that contract.
+            raise RuntimeError("V4 FaaS requires the native Hash/sqrtsoftplus router")
+        probabilities, ids = select_cam_experts(**kwargs)
+        # The shared A router intentionally emits unscaled probabilities. CAM's
+        # old F adapter scales routed expert outputs; FaaS instead folds this
+        # model semantic into combine weights exactly once, before shared add.
+        scale = self.vllm_config.model_config.hf_config.routed_scaling_factor
+        return probabilities.float() * scale, ids
 
     def send_attn_output(
         self,
@@ -172,8 +183,14 @@ class FaaSAsyncAFDConnector(AFDConnectorBase):
             raise RuntimeError("FFN FaaS connector has not completed warmup")
         if self._pending_context is not None:
             raise RuntimeError("FFN FaaS v1 supports one outstanding model call")
-        # V4 routing already includes its scale; keep probabilities in FP32.
-        probabilities = kwargs["topk_weights"].float()
+        # Native V4 CAM combines the already scaled FP32 routing weights.
+        # V2's BF16 token-unpermute contract instead rounds them to the
+        # activation dtype before combine expands them to FP32 on Attention.
+        probabilities = (
+            kwargs["topk_weights"].float()
+            if self._is_v4
+            else kwargs["topk_weights"].to(hidden_states.dtype)
+        )
         try:
             self._session.send(
                 hidden_states,
@@ -207,7 +224,7 @@ class FaaSAsyncAFDConnector(AFDConnectorBase):
     def recv_attn_output(
         self, ubatch_idx: int = 0, **kwargs: Any
     ) -> AFDA2FTransferPayload:
-        raise RuntimeError("FFN uses the standalone service's executor")
+        raise RuntimeError("FFN uses the standalone service's fused executor")
 
     def send_ffn_output(
         self,
@@ -215,7 +232,7 @@ class FaaSAsyncAFDConnector(AFDConnectorBase):
         context: AFDTransferContext,
         **kwargs: Any,
     ) -> None:
-        raise RuntimeError("FFN result publication belongs to the standalone executor")
+        raise RuntimeError("FFN result writeback is inside the native megakernel")
 
     def close(self) -> None:
         try:

@@ -25,6 +25,7 @@ from afd_plugin.ffn_faas.npu import (
     MILLISECONDS_PER_SECOND,
     SCRATCH_HEADER_WORDS,
     NativeDeviceError,
+    NativeWeightView,
     NPUExecutor,
 )
 from afd_plugin.ffn_faas.protocol import Mode, Result, SessionSpec
@@ -70,12 +71,19 @@ class NativeW4A8Executor(NPUExecutor):
                 raise ValueError("native W4A8 weights differ from session semantics")
         if any(layer.signature() != weights[0].signature() for layer in weights):
             raise ValueError("native W4A8 backend requires homogeneous geometry")
+        layer_map = torch.full((spec.model_layers,), -1, dtype=torch.int32)
+        for compact, layer_id in enumerate(spec.layer_indices):
+            layer_map[layer_id] = compact
+        anchor = torch.zeros((1,), dtype=torch.bfloat16, device=target)
+        # The shared control op never projects with these tiny placeholders.
+        # Quantized weights remain owned by Model and are borrowed below.
         super().__init__(
             spec,
             rank=rank,
             device=device,
             host=host,
             port=port,
+            weights=NativeWeightView(anchor, anchor, layer_map.to(target)),
             timeout=timeout,
             window_mb=window_mb,
             startup_timeout=startup_timeout,
@@ -137,9 +145,13 @@ class NativeW4A8Executor(NPUExecutor):
         mode: Mode,
         config: list[int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if mode != Mode.EXECUTE:
+        if mode not in (Mode.EXECUTE, Mode.SERVE):
             return super()._submit_native(
                 x, expert_ids, probabilities, request, mode, config
+            )
+        if mode == Mode.SERVE:
+            raise ValueError(
+                "native W4A8 backend executes one transaction per submission"
             )
         prepared = super()._submit_native(
             x, expert_ids, probabilities, request, Mode.PREPARE, config

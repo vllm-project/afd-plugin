@@ -28,10 +28,14 @@ def control_inputs():
         capacity=8,
         slots=2,
     )
+    # The fused BF16 entry borrows the executor-owned weights for every mode.
+    # Control modes never project with them, so empty placeholders suffice.
     inputs = (
         torch.empty((2, 4096), dtype=torch.bfloat16, device="meta"),
         torch.empty((2, 6), dtype=torch.int32, device="meta"),
         torch.empty((2, 6), dtype=torch.float32, device="meta"),
+        torch.empty((0,), dtype=torch.bfloat16, device="meta"),
+        torch.empty((0,), dtype=torch.bfloat16, device="meta"),
         torch.empty((43,), dtype=torch.int32, device="meta"),
         torch.empty((3,), dtype=torch.int64, device="meta"),
         torch.empty((4,), dtype=torch.int64, device="meta"),
@@ -41,9 +45,7 @@ def control_inputs():
 
 
 @pytest.mark.parametrize("mode", [Mode.INITIALIZE, Mode.PREPARE, Mode.FINISH])
-def test_control_op_has_no_weight_inputs_and_preserves_result_shapes(
-    control_inputs, mode
-):
+def test_control_op_preserves_result_shapes_with_borrowed_weights(control_inputs, mode):
     inputs, config = control_inputs
     output, status = torch.ops.afd_ascend.ffn_faas(
         *inputs, int(mode), config, "meta-group"
@@ -54,8 +56,7 @@ def test_control_op_has_no_weight_inputs_and_preserves_result_shapes(
     assert status.dtype == torch.int64
 
 
-@pytest.mark.parametrize("mode", [2, 7])
-def test_control_op_rejects_removed_compute_modes(control_inputs, mode):
+def test_compute_modes_validate_borrowed_weight_layout(control_inputs):
     inputs, config = control_inputs
-    with pytest.raises(RuntimeError, match="unsupported FFN FaaS control mode"):
-        torch.ops.afd_ascend.ffn_faas(*inputs, mode, config, "meta-group")
+    with pytest.raises(RuntimeError, match="weights do not match"):
+        torch.ops.afd_ascend.ffn_faas(*inputs, int(Mode.EXECUTE), config, "meta-group")

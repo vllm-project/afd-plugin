@@ -112,7 +112,7 @@ def fail_if_unsupported_npu_afd_features(
 
 
 def validate_ffn_faas_attention(vllm_config: VllmConfig, afd_config: AFDConfig) -> None:
-    """Restrict the independent native FFN service to the V4 W4A8 contract."""
+    """Reject settings outside the two supported FaaS model contracts."""
     model, parallel = vllm_config.model_config, vllm_config.parallel_config
     if (
         not afd_config.is_attention_server
@@ -123,24 +123,31 @@ def validate_ffn_faas_attention(vllm_config: VllmConfig, afd_config: AFDConfig) 
             "FFN FaaS requires async Attention routing; launch F via its service CLI"
         )
     architectures = model.hf_config.architectures
-    # The connector's shared V4 checkpoint reader subsequently checks the real
-    # per-channel W4A8 tensors, compensation and activation limit before
-    # transport allocations. The Ascend plugin name alone is not that proof.
+    model_type = model.hf_config.model_type
+    is_v4 = model_type == "deepseek_v4" and architectures in (
+        ["DeepseekV4ForCausalLM"],
+        ["AFDDeepseekV4ForCausalLM"],
+    )
+    is_v2 = model_type == "deepseek_v2" and architectures in (
+        ["DeepseekV2ForCausalLM"],
+        ["AFDDeepseekV2ForCausalLM"],
+    )
+    # The shared checkpoint description and session fingerprint subsequently
+    # validate the exact routed W4A8 tensors, compensation and activation limit.
     if (
-        model.hf_config.model_type != "deepseek_v4"
-        or architectures
-        not in (["DeepseekV4ForCausalLM"], ["AFDDeepseekV4ForCausalLM"])
-        or model.quantization != "ascend"
+        not (is_v2 or is_v4)
+        or model.quantization != ("ascend" if is_v4 else None)
         or str(model.dtype) != "torch.bfloat16"
         or not model.enforce_eager
     ):
         raise RuntimeError(
-            "FFN FaaS supports only Ascend W4A8 DeepSeek-V4 with BF16 "
-            "activations in eager mode"
+            "FFN FaaS supports BF16 DeepSeek-V2 or Ascend W4A8 DeepSeek-V4 "
+            "in eager mode"
         )
     if (
         parallel.enable_dbo
         or parallel.use_ubatching
+        or (parallel.use_sequence_parallel_moe and not is_v4)
         or parallel.pipeline_parallel_size != 1
         or parallel.prefill_context_parallel_size != 1
         or parallel.decode_context_parallel_size != 1
@@ -150,7 +157,8 @@ def validate_ffn_faas_attention(vllm_config: VllmConfig, afd_config: AFDConfig) 
         or vllm_config.additional_config.get("mix_placement", False)
     ):
         raise RuntimeError(
-            "FFN FaaS requires static routed experts without DBO, PP, CP or speculation"
+            "FFN FaaS requires static routed experts without DBO, PP, CP "
+            "or speculation; SP requires DeepSeek-V4"
         )
     if async_cam_layered_gmm_enabled():
         raise RuntimeError("FFN FaaS does not use the Async CAM layered GMM backend")

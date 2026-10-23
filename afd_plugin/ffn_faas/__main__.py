@@ -12,6 +12,7 @@ import sys
 import traceback
 from pathlib import Path
 
+from afd_plugin.ffn_faas.model import CheckpointDescription, is_v4_checkpoint
 from afd_plugin.ffn_faas.runner import FFNModelRunner, WorkerConfig
 from afd_plugin.ffn_faas.service import FFNService
 from afd_plugin.ffn_faas.v4_model import V4CheckpointDescription
@@ -55,7 +56,11 @@ def main() -> int:
         parser.error("--devices must supply distinct allocated devices for local ranks")
     if args.timeout <= 0 or args.startup_timeout <= 0:
         parser.error("timeouts must be positive")
-    checkpoint = V4CheckpointDescription.read(args.model)
+    checkpoint: CheckpointDescription | V4CheckpointDescription = (
+        V4CheckpointDescription.read(args.model)
+        if is_v4_checkpoint(args.model)
+        else CheckpointDescription.read(args.model)
+    )
     spec = checkpoint.session_spec(
         attention_ranks=args.attention_ranks,
         attention_tp=args.attention_tp,

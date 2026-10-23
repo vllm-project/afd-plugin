@@ -18,6 +18,12 @@ constexpr uint64_t LINE_BYTES = 64;
 constexpr uint32_t STATUS_FIELDS = 8;
 constexpr uint32_t CONFIG_FIELDS = 13;
 constexpr uint32_t TILE_M = 16;
+constexpr uint32_t TILE_N = 128;
+constexpr uint32_t MAX_WORK_PER_SERVE = 8;
+constexpr uint16_t COMMAND_READY = 8;
+constexpr uint16_t GATE_DONE = 9;
+constexpr uint16_t DOWN_READY = 10;
+constexpr uint16_t DOWN_DONE = 11;
 enum ScratchField : uint32_t {
     WORK_CODE, WORK_ROWS, WEIGHT_BASE, WORK_SOURCE, WORK_SEQUENCE, WORK_LAYER
 };
@@ -47,6 +53,8 @@ struct AfdFfnFaasTilingData {
     Mc2InitTiling mc2InitTiling;
     Mc2CcTiling mc2CcTiling;
     FaaSInfo info;
+    AscendC::tiling::TCubeTiling gateUpTiling;
+    AscendC::tiling::TCubeTiling downTiling;
 };
 
 // Private, executor-owned scratch, reused only after the active submission

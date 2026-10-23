@@ -7,15 +7,10 @@
 #include "cam_async_comm_group.h"
 
 using namespace AscendC;
-
+#include "afd_ffn_faas_cube.h"
 
 namespace AfdFaas {
 constexpr uint32_t EXPERTS_PER_LINE = LINE_BYTES / sizeof(int32_t);
-
-__aicore__ inline void FlushScratch(const GlobalTensor<int32_t> &meta)
-{
-    DataCacheCleanAndInvalid<int32_t, CacheLine::ENTIRE_DATA_CACHE>(meta);
-}
 
 template <HardEvent Event>
 __aicore__ inline void Fence()
@@ -25,8 +20,8 @@ __aicore__ inline void Fence()
     WaitFlag<Event>(id);
 }
 
-// The control entry owns readiness, source/layer selection, packing and
-// result publication. The executor inserts model computation between phases.
+// One mixed entry owns readiness, layer selection, grouped Cube projections,
+// SwiGLU and remote publication. Host code does not dispatch expert GEMMs.
 class FaaSKernel {
 public:
     __aicore__ inline FaaSKernel(const FaaSInfo &info, TPipe &pipe)
@@ -40,21 +35,29 @@ public:
         pipe_.InitBuffer(copyBuffer_, width * sizeof(float));
         pipe_.InitBuffer(xBuffer_, width * sizeof(float));
         pipe_.InitBuffer(sumBuffer_, Layout::Align(c_[TOPK] * sizeof(float)));
+        pipe_.InitBuffer(gateBuffer_, c_[INTERMEDIATE] * sizeof(float));
+        pipe_.InitBuffer(upBuffer_, c_[INTERMEDIATE] * sizeof(float));
+        pipe_.InitBuffer(tempBuffer_, c_[INTERMEDIATE] * sizeof(float));
         pipe_.InitBuffer(outputBuffer_, c_[HIDDEN] * sizeof(float));
         meta_ = metaBuffer_.Get<int64_t>();
         copy_ = copyBuffer_.Get<bfloat16_t>();
         x_ = xBuffer_.Get<float>();
         sum_ = sumBuffer_.Get<float>();
+        gate_ = gateBuffer_.Get<float>();
+        up_ = upBuffer_.Get<float>();
+        temp_ = tempBuffer_.Get<float>();
         output_ = outputBuffer_.Get<float>();
     }
 
     __aicore__ inline void Bind(GM_ADDR x, GM_ADDR ids, GM_ADDR probabilities,
-                               GM_ADDR layers,
+                               GM_ADDR w13, GM_ADDR w2, GM_ADDR layers,
                                GM_ADDR request, GM_ADDR state, GM_ADDR scratch, GM_ADDR y, GM_ADDR status)
     {
         input_ = x;
         ids_ = ids;
         probabilities_ = probabilities;
+        w13_ = w13;
+        w2_ = w2;
         layers_ = layers;
         request_ = request;
         state_ = state;
@@ -64,10 +67,10 @@ public:
     }
 
     __aicore__ inline void Run(GM_ADDR x, GM_ADDR ids, GM_ADDR probabilities,
-                              GM_ADDR layers,
+                              GM_ADDR w13, GM_ADDR w2, GM_ADDR layers,
                               GM_ADDR request, GM_ADDR state, GM_ADDR scratch, GM_ADDR y, GM_ADDR status)
     {
-        Bind(x, ids, probabilities, layers, request, state, scratch, y, status);
+        Bind(x, ids, probabilities, w13, w2, layers, request, state, scratch, y, status);
         if (info_.mode == INITIALIZE) {
             Initialize();
         } else if (info_.mode == PUBLISH) {
@@ -99,12 +102,14 @@ public:
                 }
                 SyncAll<true>();
             }
-
+        } else if (info_.mode == EXECUTE) {
+            Execute();
         } else if (info_.mode == PREPARE) {
             Prepare();
         } else if (info_.mode == FINISH) {
             Finalize();
-
+        } else if (info_.mode == SERVE) {
+            Serve();
         } else if (info_.mode == COMBINE || info_.mode == PEEK_RESULTS) {
             Combine(info_.mode == PEEK_RESULTS);
         } else if (info_.mode == END_SOURCE || info_.mode == ABORT_SESSION) {
@@ -502,6 +507,35 @@ private:
             }
         }
     }
+    __aicore__ inline void Activate(const GlobalTensor<int32_t> &meta, const ScratchLayout &scratch)
+    {
+        const uint32_t n = c_[INTERMEDIATE];
+        GlobalTensor<bfloat16_t> gateUp, activation;
+        gateUp.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(scratch_ + scratch.gateUp));
+        activation.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(scratch_ + scratch.activation));
+        for (uint32_t row = block_; row < meta.GetValue(WORK_ROWS); row += info_.blocks) {
+            DataCopy(copy_, gateUp[row * 2 * n], 2 * n);
+            Fence<HardEvent::MTE2_V>();
+            Cast(gate_, copy_, RoundMode::CAST_NONE, n);
+            Cast(up_, copy_[n], RoundMode::CAST_NONE, n);
+            PipeBarrier<PIPE_V>();
+            Muls(temp_, gate_, -1.0f, n);
+            PipeBarrier<PIPE_V>();
+            Exp(temp_, temp_, n);
+            PipeBarrier<PIPE_V>();
+            Adds(temp_, temp_, 1.0f, n);
+            PipeBarrier<PIPE_V>();
+            Div(gate_, gate_, temp_, n);
+            PipeBarrier<PIPE_V>();
+            Mul(gate_, gate_, up_, n);
+            PipeBarrier<PIPE_V>();
+            Cast(copy_, gate_, RoundMode::CAST_RINT, n);
+            Fence<HardEvent::V_MTE3>();
+            DataCopy(activation[row * n], copy_, n);
+            Fence<HardEvent::MTE3_MTE2>();
+        }
+        Fence<HardEvent::MTE3_S>();
+    }
     __aicore__ inline void Scatter(const GlobalTensor<int32_t> &meta, const ScratchLayout &scratch,
                                   uint32_t source, uint32_t slot)
     {
@@ -589,6 +623,51 @@ public:
         return OK;
     }
 
+    __aicore__ inline void ReportServed(uint32_t completed, int64_t code)
+    {
+        if (block_ == 0) {
+            ReadLine(status_);
+            if (code == IDLE && completed > 0) {
+                meta_.SetValue(0, OK);
+            }
+            meta_.SetValue(5, completed);
+            WriteLine(status_);
+        }
+    }
+
+private:
+    __aicore__ inline int64_t Execute()
+    {
+        const int64_t code = Prepare();
+        // Idle/error also releases the paired Cube half of a bounded launch.
+        CrossCoreSetFlag<0x2, PIPE_MTE3>(COMMAND_READY);
+        if (code != OK) {
+            return code;
+        }
+        const ScratchLayout scratch(info_);
+        GlobalTensor<int32_t> meta;
+        meta.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(scratch_));
+        CrossCoreWaitFlag(GATE_DONE);
+        SyncAll<true>();
+        Activate(meta, scratch);
+        SyncAll<true>();
+        CrossCoreSetFlag<0x2, PIPE_MTE3>(DOWN_READY);
+        CrossCoreWaitFlag(DOWN_DONE);
+        SyncAll<true>();
+        return Finalize();
+    }
+    __aicore__ inline void Serve()
+    {
+        uint32_t completed = 0;
+        int64_t code = OK;
+        for (; completed < MAX_WORK_PER_SERVE; ++completed) {
+            code = Execute();
+            if (code != OK) {
+                break;
+            }
+        }
+        ReportServed(completed, code);
+    }
     __aicore__ inline void Combine(bool peek)
     {
         int64_t seq, layer, count;
@@ -762,6 +841,8 @@ public:
     GM_ADDR input_;
     GM_ADDR ids_;
     GM_ADDR probabilities_;
+    GM_ADDR w13_;
+    GM_ADDR w2_;
     GM_ADDR layers_;
     GM_ADDR request_;
     GM_ADDR state_;
@@ -769,10 +850,10 @@ public:
     GM_ADDR y_;
     GM_ADDR status_;
     TBuf<> metaBuffer_, copyBuffer_, xBuffer_, sumBuffer_;
-    TBuf<> outputBuffer_;
+    TBuf<> gateBuffer_, upBuffer_, tempBuffer_, outputBuffer_;
     LocalTensor<int64_t> meta_;
     LocalTensor<bfloat16_t> copy_;
-    LocalTensor<float> x_, sum_, output_;
+    LocalTensor<float> x_, sum_, gate_, up_, temp_, output_;
 };
 }  // namespace AfdFaas
 

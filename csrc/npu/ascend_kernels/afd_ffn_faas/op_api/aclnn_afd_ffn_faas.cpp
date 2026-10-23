@@ -8,12 +8,12 @@
 extern "C" void __attribute__((weak)) NnopbaseSetHcclServerType(void *executor, int32_t serverType);
 extern "C" aclnnStatus aclnnAfdFfnFaasGetWorkspaceSize(
     const aclTensor *x, const aclTensor *expertIds, const aclTensor *probabilities,
-    const aclTensor *layers,
+    const aclTensor *w13, const aclTensor *w2, const aclTensor *layers,
     const aclTensor *request, const aclTensor *state, const aclTensor *scratch,
     int64_t mode, const aclIntArray *config, char *group,
     const aclTensor *y, const aclTensor *status, uint64_t *workspaceSize, aclOpExecutor **executor)
 {
-    return aclnnInnerAfdFfnFaasGetWorkspaceSize(x, expertIds, probabilities,
+    return aclnnInnerAfdFfnFaasGetWorkspaceSize(x, expertIds, probabilities, w13, w2,
         layers, request, state, scratch, mode, config, group, y, status, workspaceSize, executor);
 }
 extern "C" aclnnStatus aclnnAfdFfnFaas(void *workspace, uint64_t workspaceSize,

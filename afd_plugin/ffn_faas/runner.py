@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from afd_plugin.ffn_faas.model import CheckpointDescription, FFNModel
 from afd_plugin.ffn_faas.protocol import Mode, Result, SessionSpec
 from afd_plugin.ffn_faas.service import FFNService, ServicePhase
 from afd_plugin.ffn_faas.v4_model import V4CheckpointDescription
@@ -35,12 +36,16 @@ class FFNModelRunner:
     def __init__(
         self,
         service: FFNService,
-        checkpoint: V4CheckpointDescription,
+        checkpoint: CheckpointDescription | V4CheckpointDescription,
         spec: SessionSpec,
         config: WorkerConfig,
     ) -> None:
         self.service, self.spec, self.config = service, spec, config
-        self.model = V4FFNModel(checkpoint, spec, config.ffn_rank)
+        self.model: FFNModel | V4FFNModel
+        if isinstance(checkpoint, V4CheckpointDescription):
+            self.model = V4FFNModel(checkpoint, spec, config.ffn_rank)
+        else:
+            self.model = FFNModel(checkpoint, spec, config.ffn_rank)
         self.executor: NPUExecutor | None = None
 
     def run(self) -> None:
@@ -58,7 +63,7 @@ class FFNModelRunner:
         bootstrap_custom_op_env()
         bootstrap_afd_custom_op_env()
 
-        from afd_plugin.ffn_faas.native_npu import NativeW4A8Executor
+        from afd_plugin.ffn_faas.npu import NPUExecutor
 
         c, service, spec = self.config, self.service, self.spec
         torch.npu.set_device(c.device)
@@ -71,18 +76,34 @@ class FFNModelRunner:
             self.model.load(c.device, service.loading_progress)
             service.phase(ServicePhase.CONNECTING)
             # Retain the executor before connecting, including partial failures.
-            self.executor = NativeW4A8Executor(
-                spec,
-                rank=spec.attention_ranks + c.ffn_rank,
-                device=c.device,
-                host=c.host,
-                port=c.port,
-                weights=self.model.native_view,
-                timeout=c.timeout,
-                startup_timeout=c.startup_timeout,
-                window_mb=c.window_mb,
-                auto_initialize=False,
-            )
+            if isinstance(self.model, V4FFNModel):
+                from afd_plugin.ffn_faas.native_npu import NativeW4A8Executor
+
+                self.executor = NativeW4A8Executor(
+                    spec,
+                    rank=spec.attention_ranks + c.ffn_rank,
+                    device=c.device,
+                    host=c.host,
+                    port=c.port,
+                    weights=self.model.native_view,
+                    timeout=c.timeout,
+                    startup_timeout=c.startup_timeout,
+                    window_mb=c.window_mb,
+                    auto_initialize=False,
+                )
+            else:
+                self.executor = NPUExecutor(
+                    spec,
+                    rank=spec.attention_ranks + c.ffn_rank,
+                    device=c.device,
+                    host=c.host,
+                    port=c.port,
+                    weights=self.model.native_view,
+                    timeout=c.timeout,
+                    startup_timeout=c.startup_timeout,
+                    window_mb=c.window_mb,
+                    auto_initialize=False,
+                )
             executor = self.executor
             executor.initialize(stop=service.stop_requested)
             try:
@@ -108,17 +129,39 @@ class FFNModelRunner:
                 if service.stop_requested.is_set():
                     raise InterruptedError("standalone FFN stop aborts the A/F session")
                 executor.check_peers()
-                completion = executor.submit(Mode.EXECUTE)
-                code = executor.retire(completion)
-                if code == Result.OK:
+                # Only the BF16 fused backend executes a bounded batch per
+                # launch; the V4 host backend retires one transaction.
+                mode = (
+                    Mode.SERVE
+                    if ready and not isinstance(self.model, V4FFNModel)
+                    else Mode.EXECUTE
+                )
+                completion = executor.submit(mode)
+                completed = 0
+                try:
+                    code = executor.retire(completion)
+                finally:
+                    # A valid receipt exists only after the stream completed.
+                    # Preserve a partial count even if retire raises on a peer
+                    # failure; a device/wait failure must not inspect storage.
+                    if mode == Mode.SERVE and completion.completed_work is not None:
+                        completed = completion.completed_work
+                        if completed:
+                            service.completed_work(completed)
+                if mode == Mode.EXECUTE and code == Result.OK:
+                    completed = 1
                     service.completed_work()
                 if code == Result.DRAINED:
                     if not ready:
                         raise RuntimeError("session drained before paired warmup")
                     service.phase(ServicePhase.DRAINING)
                     break
+                if code == Result.OK and not completed:
+                    raise RuntimeError("successful fused execution completed no work")
                 if code not in (Result.OK, Result.IDLE):
-                    raise RuntimeError(f"unexpected FFN execution result: {code.name}")
+                    raise RuntimeError(
+                        f"unexpected fused execution result: {code.name}"
+                    )
                 if not ready:
                     if store.check(warmup_keys):
                         store.set(f"ready/{c.ffn_rank}", "1")

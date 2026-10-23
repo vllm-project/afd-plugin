@@ -18,6 +18,7 @@ from vllm.forward_context import (
 )
 from vllm.sequence import IntermediateTensors
 
+from afd_plugin.config import FFN_FAAS_CONNECTOR
 from afd_plugin.connectors import (
     AFDForwardContextMetadata,
     AFDTransferContext,
@@ -167,6 +168,7 @@ def run_attention_gate_afd_forward(
             topk_ids,
             router_logits,
             use_sequence_parallel=layer.use_sequence_parallel_moe,
+            skip_padding_routes=model.afd_config.connector == FFN_FAAS_CONNECTOR,
         )
         metadata = AFDTransferMetadata.create_attention_metadata(
             layer_idx=layer.layer_idx,

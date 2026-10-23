@@ -107,12 +107,14 @@ def test_contract_import_needs_no_device_or_engine_runtime() -> None:
         from afd_plugin.compat.npu.ops import bootstrap_afd_custom_op_env
         bootstrap_afd_custom_op_env()
         from afd_plugin.ffn_faas import SessionSpec
+        from afd_plugin.ffn_faas.model import CheckpointDescription, FFNModel
         from afd_plugin.ffn_faas.v4_model import V4CheckpointDescription
         from afd_plugin.ffn_faas.v4_runtime import V4FFNModel
         from afd_plugin.ffn_faas.service import FFNService
         from afd_plugin.ffn_faas.runner import FFNModelRunner
         from afd_plugin.ffn_faas.__main__ import main
         assert SessionSpec.__name__ == 'SessionSpec'
+        assert FFNModel.__name__ == 'FFNModel'
         assert V4FFNModel.__name__ == 'V4FFNModel'
     """)
     subprocess.run([sys.executable, "-c", script], check=True)

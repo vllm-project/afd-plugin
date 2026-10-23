@@ -79,6 +79,18 @@ std::vector<int64_t> wait_many(const c10::List<at::Tensor> &statuses, int64_t ti
     return codes;
 }
 
+std::tuple<int64_t, int64_t> wait_served_work(const at::Tensor &status, int64_t timeout_ms)
+{
+    synchronize_completion(status, timeout_ms);
+    std::array<int64_t, STATUS_FIELDS> header{};
+    const auto error = aclrtMemcpy(header.data(), sizeof(header), status.data_ptr<int64_t>(),
+                                   sizeof(header), ACL_MEMCPY_DEVICE_TO_HOST);
+    TORCH_CHECK(error == ACL_SUCCESS, "FFN FaaS completion copy failed: ", error);
+    // Only result and aggregate work count are consumed by the host. Layer and
+    // source arbitration remain inside the device loop.
+    return {header[0], header[5]};
+}
+
 std::tuple<int64_t, int64_t, int64_t> wait_selected_work(const at::Tensor &status, int64_t timeout_ms)
 {
     synchronize_completion(status, timeout_ms);
@@ -95,15 +107,14 @@ std::tuple<int64_t, int64_t, int64_t> wait_selected_work(const at::Tensor &statu
 template <bool EXECUTE_NPU>
 std::tuple<at::Tensor, at::Tensor> run(
     const at::Tensor &x, const at::Tensor &expert_ids,
-    const at::Tensor &probabilities,
+    const at::Tensor &probabilities, const at::Tensor &w13, const at::Tensor &w2,
     const at::Tensor &layers, const at::Tensor &request, const at::Tensor &state,
     const at::Tensor &scratch,
     int64_t mode, at::IntArrayRef config, c10::string_view group_name)
 {
     TORCH_CHECK(config.size() == CONFIG_FIELDS, "FFN FaaS requires 13 configuration fields");
-    TORCH_CHECK(mode >= 0 && mode <= FINISH_MODE && mode != 2 && mode != 7,
-                "unsupported FFN FaaS control mode");
-    for (const auto &tensor : {x, expert_ids, probabilities, layers, request, state, scratch}) {
+    TORCH_CHECK(mode >= 0 && mode <= FINISH_MODE, "invalid FFN FaaS mode");
+    for (const auto &tensor : {x, expert_ids, probabilities, w13, w2, layers, request, state, scratch}) {
         TORCH_CHECK(tensor.device() == x.device() && tensor.is_contiguous(),
                     "FFN FaaS inputs must be contiguous on one device");
         TORCH_CHECK(!tensor.requires_grad(), "FFN FaaS supports inference only");
@@ -118,6 +129,8 @@ std::tuple<at::Tensor, at::Tensor> run(
                      probabilities.scalar_type() == at::kBFloat16) &&
                     probabilities.sizes() == expert_ids.sizes(),
                 "probabilities must be float32 or BF16[tokens, topk]");
+    TORCH_CHECK(w13.scalar_type() == at::kBFloat16 && w2.scalar_type() == at::kBFloat16,
+                "weights must be BF16");
     TORCH_CHECK(layers.scalar_type() == at::kInt && layers.numel() == config[MODEL_LAYERS],
                 "layer map must contain one int32 per model layer");
     TORCH_CHECK(request.scalar_type() == at::kLong && request.numel() >= 3,
@@ -127,12 +140,20 @@ std::tuple<at::Tensor, at::Tensor> run(
                 "executor state is too small");
     TORCH_CHECK(scratch.scalar_type() == at::kByte && scratch.dim() == 1,
                 "executor scratch must be a contiguous byte buffer");
+    if (mode == 2 || mode == 7) {
+        TORCH_CHECK(config[FFN_RANKS] > 0 && config[EXPERTS] % config[FFN_RANKS] == 0,
+                    "FFN expert placement must be even");
+        const int64_t local = config[LOADED_LAYERS] * config[EXPERTS] / config[FFN_RANKS];
+        TORCH_CHECK(w13.numel() == local * 2 * config[INTERMEDIATE] * config[HIDDEN] &&
+                        w2.numel() == local * config[HIDDEN] * config[INTERMEDIATE],
+                    "FFN weights do not match the loaded layer/expert layout");
+    }
     auto y = mode == 6 ? at::empty({x.size(0), config[TOPK], config[HIDDEN]}, x.options()) : at::empty_like(x);
     auto status = at::empty({STATUS_FIELDS}, x.options().dtype(at::kLong));
     if constexpr (EXECUTE_NPU) {
         std::string group(group_name.data(), group_name.size());
         char *group_ptr = group.data();
-        EXEC_NPU_CMD(aclnnAfdFfnFaas, x, expert_ids, probabilities,
+        EXEC_NPU_CMD(aclnnAfdFfnFaas, x, expert_ids, probabilities, w13, w2,
                      layers, request, state, scratch, mode, config, group_ptr, y, status);
         if (mode == PUBLISH_MODE || mode == EXCHANGE_MODE) {
             // Hand publication to ACL before the model enqueues shared-expert
@@ -146,7 +167,7 @@ std::tuple<at::Tensor, at::Tensor> run(
 }
 
 struct ScopedContext {
-    at::Tensor layers, state, scratch;
+    at::Tensor w13, w2, layers, state, scratch;
     std::vector<int64_t> config;
     std::string group;
 };
@@ -177,7 +198,7 @@ public:
         // Share ordinary native shape/dtype validation and output allocation.
         // This specialization does not enqueue the fused device operation.
         std::tie(output_, status_) = run<false>(
-            x, ids, probabilities, context_->layers,
+            x, ids, probabilities, context_->w13, context_->w2, context_->layers,
             request, context_->state, context_->scratch,
             SCOPED_EXCHANGE_MODE, config, context_->group);
         TORCH_CHECK(config[WORLD_RANK] < config[ATTENTION_RANKS] && sequence > 0 &&
@@ -194,7 +215,7 @@ public:
         const at::IntArrayRef native_config(config);
         char *group_ptr = context_->group.data();
         EXEC_NPU_CMD(aclnnAfdFfnFaas, x, ids, probabilities,
-                     context_->layers, request,
+                     context_->w13, context_->w2, context_->layers, request,
                      context_->state, context_->scratch, SCOPED_EXCHANGE_MODE,
                      native_config, group_ptr, output_, status_);
         done_.record(stream_);
@@ -224,7 +245,7 @@ private:
 
 class ScopedSubmitter {
 public:
-    ScopedSubmitter(const at::Tensor &layers,
+    ScopedSubmitter(const at::Tensor &w13, const at::Tensor &w2, const at::Tensor &layers,
                     const at::Tensor &state, const at::Tensor &scratch,
                     std::vector<int64_t> config, std::string group,
                     int64_t stream_id, int64_t device_index, int64_t device_type)
@@ -232,7 +253,7 @@ public:
               stream_id, static_cast<c10::DeviceIndex>(device_index),
               static_cast<c10::DeviceType>(device_type))),
           context_(std::make_shared<ScopedContext>(ScopedContext{
-              layers, state, scratch, std::move(config), std::move(group)}))
+              w13, w2, layers, state, scratch, std::move(config), std::move(group)}))
     {
         TORCH_CHECK(stream_.device().type() == c10::DeviceType::PrivateUse1,
                     "FFN FaaS scoped submission requires an NPU stream");
@@ -290,6 +311,7 @@ void register_scoped_submitter(pybind11::module_ &module)
         .def("consume", &ScopedWork::consume, pybind11::call_guard<pybind11::gil_scoped_release>());
     pybind11::class_<ScopedSubmitter>(module, "FFNFaasScopedSubmitter")
         .def(pybind11::init<const at::Tensor &, const at::Tensor &, const at::Tensor &,
+                           const at::Tensor &, const at::Tensor &,
                            std::vector<int64_t>, std::string, int64_t, int64_t, int64_t>())
         .def("submit", &ScopedSubmitter::submit, pybind11::call_guard<pybind11::gil_scoped_release>())
         .def("consume", &ScopedSubmitter::consume, pybind11::call_guard<pybind11::gil_scoped_release>());
@@ -299,16 +321,18 @@ void register_scoped_submitter(pybind11::module_ &module)
 TORCH_LIBRARY_FRAGMENT(afd_ascend, m)
 {
     m.def("ffn_faas_wait(Tensor status, int timeout_ms) -> int");
+    m.def("ffn_faas_wait_served(Tensor status, int timeout_ms) -> (int, int)");
     m.def("ffn_faas_wait_selected(Tensor status, int timeout_ms) -> (int, int, int)");
     m.def("ffn_faas_wait_many(Tensor[] statuses, int timeout_ms) -> int[]");
-    m.def("ffn_faas(Tensor x, Tensor expert_ids, Tensor probabilities, "
-          "Tensor layers, Tensor request, Tensor(a!) state, Tensor(b!) scratch, "
+    m.def("ffn_faas(Tensor x, Tensor expert_ids, Tensor probabilities, Tensor w13, "
+          "Tensor w2, Tensor layers, Tensor request, Tensor(a!) state, Tensor(b!) scratch, "
           "int mode, int[] config, str group_name) -> (Tensor, Tensor)");
 
 }
 TORCH_LIBRARY_IMPL(afd_ascend, PrivateUse1, m)
 {
     m.impl("ffn_faas_wait", &afd_plugin::faas::wait_completion);
+    m.impl("ffn_faas_wait_served", &afd_plugin::faas::wait_served_work);
     m.impl("ffn_faas_wait_selected", &afd_plugin::faas::wait_selected_work);
     m.impl("ffn_faas_wait_many", &afd_plugin::faas::wait_many);
     m.impl("ffn_faas", &afd_plugin::faas::run<true>);
@@ -316,6 +340,7 @@ TORCH_LIBRARY_IMPL(afd_ascend, PrivateUse1, m)
 TORCH_LIBRARY_IMPL(afd_ascend, AutogradPrivateUse1, m)
 {
     m.impl("ffn_faas_wait", &afd_plugin::faas::wait_completion);
+    m.impl("ffn_faas_wait_served", &afd_plugin::faas::wait_served_work);
     m.impl("ffn_faas_wait_selected", &afd_plugin::faas::wait_selected_work);
     m.impl("ffn_faas_wait_many", &afd_plugin::faas::wait_many);
     m.impl("ffn_faas", &afd_plugin::faas::run<true>);

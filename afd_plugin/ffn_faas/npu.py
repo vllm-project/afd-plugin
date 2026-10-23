@@ -24,7 +24,9 @@ from afd_plugin.ffn_faas.protocol import (
     DEFAULT_COMBINE_POLLS,
     DEFAULT_IDLE_POLLS,
     DEFAULT_SCOPED_COMBINE_POLLS,
+    DEFAULT_SERVE_POLLS,
     MAX_SCOPED_EXCHANGES,
+    MAX_WORK_PER_SERVE,
     Mode,
     Result,
     SessionSpec,
@@ -51,6 +53,15 @@ class NativeDeviceError(RuntimeError):
     """A native submission/wait failed; completion cannot be assumed."""
 
 
+@dataclass(frozen=True)
+class NativeWeightView:
+    """Borrowed tensors; their FFNModel owner outlives every submission."""
+
+    w13: torch.Tensor
+    w2: torch.Tensor
+    layer_map: torch.Tensor
+
+
 @dataclass
 class NativeCompletion:
     mode: Mode
@@ -59,14 +70,38 @@ class NativeCompletion:
     request: torch.Tensor
     retained: tuple[torch.Tensor, ...]
     stream: torch.npu.Stream
+    completed_work: int | None = None
     native: _ScopedNativeWork | None = None
 
     def wait(self, timeout: float) -> Result:
         try:
             with torch.npu.stream(self.stream):
                 milliseconds = math.ceil(timeout * MILLISECONDS_PER_SECOND)
-                code = torch.ops.afd_ascend.ffn_faas_wait(self.status, milliseconds)
+                if self.mode == Mode.SERVE:
+                    code, completed = torch.ops.afd_ascend.ffn_faas_wait_served(
+                        self.status, milliseconds
+                    )
+                else:
+                    code = torch.ops.afd_ascend.ffn_faas_wait(self.status, milliseconds)
             result = Result(code)
+            if self.mode == Mode.SERVE:
+                if (
+                    result
+                    not in (
+                        Result.OK,
+                        Result.IDLE,
+                        Result.DRAINED,
+                        Result.INVALID,
+                        Result.PEER_FAILED,
+                    )
+                    or not 0 <= completed <= MAX_WORK_PER_SERVE
+                    or (result == Result.OK and completed == 0)
+                    or (result == Result.IDLE and completed != 0)
+                ):
+                    raise NativeDeviceError(
+                        f"invalid fused receipt: {result.name}, completed={completed}"
+                    )
+                self.completed_work = completed
             return result
         except (RuntimeError, ValueError) as error:
             raise NativeDeviceError("native FFN FaaS completion failed") from error
@@ -106,6 +141,7 @@ class NPUExecutor:
         device: int,
         host: str,
         port: int,
+        weights: NativeWeightView | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         window_mb: int = DEFAULT_WINDOW_MB,
         startup_timeout: float | None = None,
@@ -202,10 +238,18 @@ class NPUExecutor:
             dtype=torch.uint8,
             device=self.device,
         )
-        layer_map = torch.full((spec.model_layers,), -1, dtype=torch.int32)
-        for compact, layer in enumerate(spec.layer_indices):
-            layer_map[layer] = compact
-        self.layer_map = layer_map.to(self.device)
+        if weights is None:
+            if self.is_ffn:
+                raise ValueError("FFN executor requires borrowed expert weights")
+            layer_map = torch.full((spec.model_layers,), -1, dtype=torch.int32)
+            for compact, layer in enumerate(spec.layer_indices):
+                layer_map[layer] = compact
+            weights = NativeWeightView(
+                torch.zeros((1,), dtype=torch.bfloat16, device=self.device),
+                torch.zeros((1,), dtype=torch.bfloat16, device=self.device),
+                layer_map.to(self.device),
+            )
+        self.weights: NativeWeightView | None = weights
         self.stream.wait_stream(torch.npu.current_stream(self.device))
         if auto_initialize:
             self.initialize()
@@ -256,13 +300,16 @@ class NPUExecutor:
             backend = self._pg._get_backend(self.device)
             self.group_name = str(backend.get_hccl_comm_name(rank))
             if not self.is_ffn:
-                # The communicator and layer/state handles must exist before
+                # The communicator and borrowed weights/state must exist before
                 # caching this immutable submission context. Construction only
                 # retains CPU handles; it does not enqueue device work.
                 from afd_plugin import _C_ascend
 
+                assert self.weights is not None
                 self._scoped_submitter = _C_ascend.FFNFaasScopedSubmitter(
-                    self.layer_map,
+                    self.weights.w13,
+                    self.weights.w2,
+                    self.weights.layer_map,
                     self.state,
                     self.scratch,
                     spec.native_config(rank, DEFAULT_SCOPED_COMBINE_POLLS),
@@ -431,8 +478,11 @@ class NPUExecutor:
         budget = DEFAULT_IDLE_POLLS
         if mode in (Mode.COMBINE, Mode.EXCHANGE, Mode.PEEK_RESULTS):
             budget = DEFAULT_COMBINE_POLLS
+        elif mode == Mode.SERVE:
+            budget = DEFAULT_SERVE_POLLS
         elif scoped:
             budget = DEFAULT_SCOPED_COMBINE_POLLS
+        assert self.weights is not None
         request_host, request_device = (
             self._scoped_requests[len(self._scoped)]
             if scoped
@@ -523,11 +573,14 @@ class NPUExecutor:
         mode: Mode,
         config: list[int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.weights is not None
         return torch.ops.afd_ascend.ffn_faas(
             x,
             expert_ids,
             probabilities,
-            self.layer_map,
+            self.weights.w13,
+            self.weights.w2,
+            self.weights.layer_map,
             request,
             self.state,
             self.scratch,
@@ -575,7 +628,7 @@ class NPUExecutor:
         code = completion.wait(self.timeout)
         self._active = None
         if (completion.mode == Mode.END_SOURCE and code == Result.OK) or (
-            completion.mode == Mode.EXECUTE and code == Result.DRAINED
+            completion.mode in (Mode.EXECUTE, Mode.SERVE) and code == Result.DRAINED
         ):
             self._drained = True
         if code == Result.PEER_FAILED:
@@ -630,6 +683,8 @@ class NPUExecutor:
                         [f"closed/{rank}" for rank in range(self.spec.world_size)],
                         timedelta(seconds=self.timeout),
                     )
+            # Drop borrowed model references only after all peer accesses end.
+            self.weights = None
             self._closed = True
         except BaseException as error:
             self.publish_failure(error)

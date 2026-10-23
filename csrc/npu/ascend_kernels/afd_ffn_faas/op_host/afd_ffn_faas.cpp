@@ -11,6 +11,31 @@
 
 namespace optiling {
 using namespace AfdFaas;
+static bool ProjectionTiling(platform_ascendc::PlatformAscendC &platform,
+                             uint32_t fullN, uint32_t fullK,
+                             AscendC::tiling::TCubeTiling &result)
+{
+    uint64_t l1 = 0, l0c = 0, ub = 0;
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L1, l1);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_C, l0c);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ub);
+    matmul_tiling::MatmulApiTiling tile(platform);
+    using matmul_tiling::TPosition;
+    using matmul_tiling::CubeFormat;
+    using matmul_tiling::DataType;
+    tile.SetAType(TPosition::GM, CubeFormat::ND, DataType::DT_BF16, false);
+    tile.SetBType(TPosition::GM, CubeFormat::ND, DataType::DT_BF16, true);
+    tile.SetCType(TPosition::GM, CubeFormat::ND, DataType::DT_BF16);
+    tile.SetBias(false);
+    const uint32_t n = std::min(TILE_N, fullN);
+    const uint32_t k = std::min(128U, fullK);
+    tile.SetOrgShape(TILE_M, fullN, fullK);
+    tile.SetShape(TILE_M, n, fullK);
+    tile.SetFixSplit(TILE_M, n, k);
+    tile.SetBufferSpace(l1, l0c, ub);
+    return tile.GetTiling(result) == 0;
+}
+
 static ge::graphStatus Tiling(gert::TilingContext *context)
 {
     auto *data = context->GetTilingData<AfdFfnFaasTilingData>();
@@ -24,10 +49,7 @@ static ge::graphStatus Tiling(gert::TilingContext *context)
         data->info.config[i] = c[i];
     }
     const auto mode = *attributes->GetInt(0);
-    const bool supported = mode == INITIALIZE || mode == PUBLISH || mode == COMBINE ||
-        mode == END_SOURCE || mode == ABORT_SESSION || mode == PEEK_RESULTS ||
-        mode == EXCHANGE || mode == SCOPED_EXCHANGE || mode == PREPARE || mode == FINISH;
-    if (!supported || c[HIDDEN] <= 0 || c[HIDDEN] > 4096 || c[HIDDEN] % 16 ||
+    if (mode < INITIALIZE || mode > FINISH || c[HIDDEN] <= 0 || c[HIDDEN] > 4096 || c[HIDDEN] % 16 ||
         c[INTERMEDIATE] <= 0 || c[INTERMEDIATE] > 4096 || c[INTERMEDIATE] % 16 ||
         c[ATTENTION_RANKS] <= 0 || c[FFN_RANKS] <= 0 || c[ATTENTION_TP] <= 0 ||
         c[ATTENTION_RANKS] % c[ATTENTION_TP] || c[SLOTS] <= 0 || c[SLOTS] > 8 ||
@@ -41,7 +63,7 @@ static ge::graphStatus Tiling(gert::TilingContext *context)
     if ((mode == PUBLISH || mode == COMBINE || mode == EXCHANGE || mode == SCOPED_EXCHANGE || mode == END_SOURCE || mode == PEEK_RESULTS) && c[WORLD_RANK] >= c[ATTENTION_RANKS]) {
         return ge::GRAPH_FAILED;
     }
-    if ((mode == PREPARE || mode == FINISH) && c[WORLD_RANK] < c[ATTENTION_RANKS]) {
+    if ((mode == EXECUTE || mode == SERVE || mode == PREPARE || mode == FINISH) && c[WORLD_RANK] < c[ATTENTION_RANKS]) {
         return ge::GRAPH_FAILED;
     }
     data->info.mode = mode;
@@ -57,12 +79,16 @@ static ge::graphStatus Tiling(gert::TilingContext *context)
     platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubBytes);
     const uint64_t width = std::max(c[HIDDEN], c[INTERMEDIATE]);
     const uint64_t requiredUb = 2 * width * sizeof(float) +
-        c[HIDDEN] * sizeof(float) +
+        3 * c[INTERMEDIATE] * sizeof(float) + c[HIDDEN] * sizeof(float) +
         LINE_BYTES + Layout::Align(c[TOPK] * sizeof(float));
     if (requiredUb > ubBytes) {
         return ge::GRAPH_FAILED;
     }
     data->info.blocks = platform.GetCoreNumAiv();
+    const uint32_t cubes = platform.GetCoreNumAic();
+    if (data->info.blocks != 2 * cubes) {
+        return ge::GRAPH_FAILED;
+    }
     if (mode == PUBLISH || mode == COMBINE || mode == EXCHANGE || mode == SCOPED_EXCHANGE || mode == PEEK_RESULTS) {
         // A parallelizes by token (or by route for a diagnostic peek). Small
         // decode payloads do not need a full-device barrier or every AIV while
@@ -72,12 +98,26 @@ static ge::graphStatus Tiling(gert::TilingContext *context)
     } else if (mode == END_SOURCE || mode == ABORT_SESSION) {
         data->info.blocks = 1;
     }
+    if (mode == EXECUTE || mode == SERVE) {
+        // The CANN mixed-kernel wrapper clears its Matmul system workspace
+        // before our entry, including idle work. Cube-only MatmulImpl avoids
+        // KFC execution, but does not remove that wrapper requirement.
+        context->GetWorkspaceSizes(1)[0] = platform.GetLibApiWorkSpaceSize();
+        const ScratchLayout scratch(data->info);
+        if (context->GetInputShape(8)->GetStorageShape().GetShapeSize() < scratch.bytes ||
+            !ProjectionTiling(platform, 2 * c[INTERMEDIATE], c[HIDDEN], data->gateUpTiling) ||
+            !ProjectionTiling(platform, c[HIDDEN], c[INTERMEDIATE], data->downTiling)) {
+            return ge::GRAPH_FAILED;
+        }
+    }
     if ((mode == PREPARE || mode == FINISH) &&
-        context->GetInputShape(6)->GetStorageShape().GetShapeSize() < ScratchLayout(data->info).bytes) {
+        context->GetInputShape(8)->GetStorageShape().GetShapeSize() < ScratchLayout(data->info).bytes) {
         return ge::GRAPH_FAILED;
     }
-    context->SetBlockDim(platform.CalcTschBlockDim(data->info.blocks, 0, data->info.blocks));
-    context->SetTilingKey(1);
+    const bool compute = mode == EXECUTE || mode == SERVE;
+    context->SetBlockDim(compute ? cubes :
+        platform.CalcTschBlockDim(data->info.blocks, 0, data->info.blocks));
+    context->SetTilingKey(compute ? 2 : 1);
     const char *group = attributes->GetAttrPointer<char>(2);
     AscendC::Mc2CcTilingConfig communication(group, 8U, "AlltoAll=level0:fullmesh;level1:pairwise");
     communication.GetTiling(data->mc2InitTiling);
@@ -121,6 +161,8 @@ public:
         this->Input("x").ParamType(REQUIRED).DataType({ge::DT_BF16, ge::DT_BF16}).Format({ge::FORMAT_ND, ge::FORMAT_ND}).AutoContiguous();
         this->Input("expertIds").ParamType(REQUIRED).DataType({ge::DT_INT32, ge::DT_INT32}).Format({ge::FORMAT_ND, ge::FORMAT_ND}).AutoContiguous();
         this->Input("probabilities").ParamType(REQUIRED).DataType({ge::DT_FLOAT, ge::DT_BF16}).Format({ge::FORMAT_ND, ge::FORMAT_ND}).AutoContiguous();
+        this->Input("w13").ParamType(REQUIRED).DataType({ge::DT_BF16, ge::DT_BF16}).Format({ge::FORMAT_ND, ge::FORMAT_ND}).AutoContiguous();
+        this->Input("w2").ParamType(REQUIRED).DataType({ge::DT_BF16, ge::DT_BF16}).Format({ge::FORMAT_ND, ge::FORMAT_ND}).AutoContiguous();
         this->Input("layers").ParamType(REQUIRED).DataType({ge::DT_INT32, ge::DT_INT32}).Format({ge::FORMAT_ND, ge::FORMAT_ND}).AutoContiguous();
         this->Input("request").ParamType(REQUIRED).DataType({ge::DT_INT64, ge::DT_INT64}).Format({ge::FORMAT_ND, ge::FORMAT_ND}).AutoContiguous();
         this->Input("state").ParamType(REQUIRED).DataType({ge::DT_INT64, ge::DT_INT64}).Format({ge::FORMAT_ND, ge::FORMAT_ND}).AutoContiguous();

@@ -21,7 +21,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.models import deepseek_v2 as native
 
-from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
+from afd_plugin.config import ASYNC_ATTENTION_CONNECTORS, parse_afd_config
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
     AFDF2ATransferPayload,
@@ -223,7 +223,7 @@ class GateOnlyRemoteMoE(RemoteFFNProxy):
             if (
                 config.n_shared_experts
                 and parse_afd_config(vllm_config, validate=False).connector
-                == AFD_ASYNC_CONNECTOR
+                in ASYNC_ATTENTION_CONNECTORS
             )
             else None
         )
@@ -528,7 +528,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                 if device_type == "npu":
                     native.FusedMoEFactory = fused_moe.FusedMoEFactory
                 moe_config = config
-                if afd_config.connector == AFD_ASYNC_CONNECTOR:
+                if afd_config.connector in ASYNC_ATTENTION_CONNECTORS:
                     moe_config = copy(config)
                     # HF validates this public field as int, but pinned native
                     # MoE uses only None to omit shared construction (0 builds
@@ -738,7 +738,7 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         if vllm_config.parallel_config.use_sequence_parallel_moe and not (
             native.current_platform.device_type == "npu"
             and afd_config.role == "attention"
-            and afd_config.connector == AFD_ASYNC_CONNECTOR
+            and afd_config.connector in ASYNC_ATTENTION_CONNECTORS
             and afd_config.compute_gate_on_attention
         ):
             raise RuntimeError(
@@ -843,7 +843,7 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         intermediate_tensors: native.IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | native.IntermediateTensors:
-        if self.afd_config.connector == AFD_ASYNC_CONNECTOR:
+        if self.afd_config.connector in ASYNC_ATTENTION_CONNECTORS:
             from afd_plugin.model_executor.models.npu import (
                 deepseek_v2_async_cam_forward,
             )
@@ -969,7 +969,7 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
                 config=self.config,
                 compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
                 attention_shared_experts=self.afd_config.connector
-                == AFD_ASYNC_CONNECTOR,
+                in ASYNC_ATTENTION_CONNECTORS,
             )
         )
 
