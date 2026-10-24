@@ -8,7 +8,7 @@
 
 ## 0. 只做性能验证时，从哪里开始
 
-**当前寻找性能收益时，必测场景以第 8.12 节为准。** 先在单机比较 A4F2/D4 的 BS24、BS48，再在两机比较 A4F4/D8 的相同总容量，核心共 8 个配置点；最后选择一对做 16K 确认。10-23 已收到 K1–K4，下一步先按第 8.12.6 节定位慢阶段，再决定是否恢复双机筛选。增大 batch 是必测主线，A4F2 双机重测、A8、TP2 和 DSpark 为条件补测。第 8.2–8.10 节保留为操作方法和原四组复现流程，不要求再叠加执行其完整矩阵；第 8.12 节提供独立环境加载和场景选择命令。
+**当前寻找性能收益时，必测场景以第 8.12 节为准。** 先在单机比较 A4F2/D4 的 BS24、BS48，再在两机比较 A4F4/D8 的相同总容量，核心共 8 个配置点；最后选择一对做 16K 确认。10-24 已收到 S1–S3 及 S2 runtime，S2 eager/U2 已出现约 250 ms 慢生成，**S4 暂不测试；当前只按第 8.12.7 节采集 S1/S2 timeline**，定位后再决定是否恢复拓扑筛选。增大 batch 是性能探索主线，A4F2 双机重测、A8、TP2 和 DSpark 为条件补测。第 8.2–8.10 节保留为操作方法和原四组复现流程，不要求再叠加执行其完整矩阵；第 8.12 节提供独立环境加载和场景选择命令。
 
 按第 8.2–8.10 节顺序执行：**准备环境 → 设置 Synthetic 参数 → 选择一组配置 → 启动 → 检查 → 预热和测量 → 停服 → 换组/扩展长度 → 计算收益**。
 
@@ -1919,6 +1919,8 @@ DSpark 只在筛出的 1–2 个拓扑上追加：双方冻结同一 target、dr
 
 #### 8.12.6 10-23 后的下一步：三个诊断点，定位快慢阶段后再扩拓扑
 
+**10-24 更新：本节保留上一轮 S1–S3 的执行定义。现场实际采用 BS48/C192，S2 runtime 已证实 overlap=0；S4 按用户要求暂不测试。当前操作转到第 8.12.7 节，不重新执行下面的 BS24 三点矩阵。**
+
 **先做下面三个 A4F2 点，不重跑 K1–K4 全矩阵。** 固定同一版本、同一台 A5、P0–1/A2–5/F6–7、TP1、BS24、C96、输入/输出 1024/1024，关闭 DSpark/MTP。每点先 smoke，再预热 96 条、测量 384 条、一轮；没有覆盖慢阶段时将本次对照的请求数统一增至 576。每个点重新冷启动全部角色，保持相同的预检/预热顺序。
 
 | 诊断点 | `EXECUTION_MODE` | `U_BATCHES` | eager overlap | 五个 Graph 优化开关 | 与上一点比较 |
@@ -1955,7 +1957,7 @@ export AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER="$GRAPH_OPTIMIZATIONS"
 export AFD_HCCL_STAGE_DIAGNOSTICS=0 AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS=0
 export AFD_NPU_ATTENTION_PROFILER_ENABLE=0 AFD_NPU_FFN_PROFILER_ENABLE=0
 export VLLM_LOGGING_LEVEL=INFO
-export PERF_CASE="K1-${DIAG_POINT}-b24-n96-diagnostic"
+export PERF_CASE="${SCENARIO}-${DIAG_POINT}-b${DECODE_BS}-n${CAPACITY}-${PERF_TIER}"
 export CASE="$PERF_CASE"
 export RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-single-$PERF_CASE"
 export RUN_ROOT="$RUN_BASE/$RUN_ID/$(hostname -s)"
@@ -2026,32 +2028,113 @@ cat "$RUN_ROOT/arrival-cohorts.txt"
 
 这些结果只用于选择下一处观测，不自动证明具体根因。S1 改变了 microbatch 大小，S2/S3 的 Graph 路径也包含编译/缓存等配套行为，不能将全部差值归给一个算子。
 
-**步骤 4：只对有差异的路径单独采 profile。** 上面三点先不带 profiler。随后选慢点和最接近的较快对照，各新建一个带 `-profile` 标记的 RUN_ID/RUN_ROOT，沿用相同负载与预热；不能向已启动服务 export 后期待它生效。本插件已提供 [profiler.py](../../afd_plugin/compat/npu/profiler.py)，在完成步骤 1 的目录创建后、启动 A/F 前增加：
-
-```bash
-# 初始候选窗口：期望跳过预热和前两组请求；必须用实际 trace 核对。
-export PROFILE_SKIP=3500
-export AFD_NPU_ATTENTION_PROFILER_ENABLE=1 AFD_NPU_FFN_PROFILER_ENABLE=1
-export AFD_NPU_ATTENTION_PROFILER_RANKS=all AFD_NPU_FFN_PROFILER_RANKS=all
-export AFD_NPU_ATTENTION_PROFILER_DIR="$RUN_ROOT/profile/attention"
-export AFD_NPU_FFN_PROFILER_DIR="$RUN_ROOT/profile/ffn"
-export AFD_NPU_ATTENTION_PROFILER_SKIP_FIRST="$PROFILE_SKIP"
-export AFD_NPU_FFN_PROFILER_SKIP_FIRST="$PROFILE_SKIP"
-export AFD_NPU_ATTENTION_PROFILER_WAIT=0 AFD_NPU_FFN_PROFILER_WAIT=0
-export AFD_NPU_ATTENTION_PROFILER_WARMUP=1 AFD_NPU_FFN_PROFILER_WARMUP=1
-export AFD_NPU_ATTENTION_PROFILER_ACTIVE=32 AFD_NPU_FFN_PROFILER_ACTIVE=32
-export AFD_NPU_ATTENTION_PROFILER_REPEAT=1 AFD_NPU_FFN_PROFILER_REPEAT=1
-export AFD_NPU_ATTENTION_PROFILER_WITH_STACK=0 AFD_NPU_FFN_PROFILER_WITH_STACK=0
-mkdir -p "$AFD_NPU_ATTENTION_PROFILER_DIR" "$AFD_NPU_FFN_PROFILER_DIR"
-```
-
-`SKIP_FIRST/ACTIVE` 的单位是 **runner 的 profiler.step 调用数**，不是请求数、层数或秒数。3500 只是按 1024 输出、一次预热加约两组请求估计的起点；A/F 的调用位置及启动/warmup 步数不同，相同数字不保证同时开始。32 个 active step 也不保证固定 5–10 秒。先确认日志有 `AFD NPU attention/ffn profiler enabled`、A/F 两侧 trace 均实际生成，并通过时间戳/通信配对确认它们覆盖同一在线慢窗口；trace 不重叠或只覆盖快阶段时，分别调整两侧 `SKIP_FIRST` 重采，不能据空 trace 推断设备空闲。此处选择 `RANKS=all`，核对四个 A、两个 F 的 trace/PID，以观察 DP/EP 不均衡；当前调用处传入的是 `get_world_group().rank`，筛选值不能直接当作物理卡号。
-
-第 8.6 节函数会保存每个 benchmark 的 `*.wallclock-begin/end.txt` UTC 墙钟与详细 JSON，用于区分预热、在线测量和随后排空。按同一步/stage 对齐 A 计算、A→F、F MoE/EP、F→A、Graph replay/回退和 CPU/stream 等待，提取代表性的关键路径；重叠区间不能重复相加。仅凭 NPU 利用率或 `is_graph_capturing=False` 不作上述归因。若当前 trace 缺 shape/key/实际 token 等字段，明确记录缺项，再做单独的路径日志诊断；不同时打开 DEBUG、强制 compute sync 和 profiler 去比较性能。
+**步骤 4：只对有差异的路径单独采 profile。** 当前改用第 8.12.7 节的 S1/S2 配置和窗口检查。旧候选 `SKIP_FIRST=3500/ACTIVE=32` 不再作为当前操作入口；本轮各 rank 步数存在偏差，短窗口可能互相错开。
 
 **步骤 5：按瓶颈选择一个后续拓扑点。** 若证据主要指向 Graph/U2，先修复或选定通过的配置，关闭 profiler/诊断后重跑同负载 K1/K3，再恢复 BS48 对照；不能只保留 S1 就宣布默认 Graph 性能通过。若证据主要指向 F 专家计算/权重读取，优先只做 K5/K7（A4F4 BS24 与 D8 BS12，均 C96），看增加 F 是否改善关键路径，随后才追加 BS48 的 K6/K8。三点均未定因时，先回传上述材料，不直接扩成完整拓扑矩阵。短输入没有收益但路径正常时，仍按第 8.12.3 节保留一对 16K 容量确认。
 
 回传每点的 `runtime.json`、最终开关/实际 argv、四角色日志、`warmup/measure-1` 的 JSON/console/metrics/drain、`arrival-cohorts.txt`、NPU 采样和正常停服证据；profile 点另附完整 trace、触发参数及在线墙钟范围。上述命令仅完成本地代码/语法核对，A5 现场执行与性能结论仍待本轮实测。
+
+#### 8.12.7 当前操作：暂停 S4，用 S1/S2 timeline 定位约两倍耗时
+
+**只新增两个带 profiler 的诊断 run：S1/U1 与 S2/U2。** 已有无 profiler 的测量保留作性能结果，不再重跑 S1–S3 全矩阵；S4、扩 F 卡和增 BS 暂不执行。本节沿用实际测试的 BS48/C192、预热192、测量768、输入/输出1024/1024、P0–1/A2–5/F6–7、TP1。S1/S2 runtime 中的源码和包一致，除运行标识外，仅 U_BATCHES 不同；eager overlap 和五个 Graph 开关均为 0。目标是找出一个完整 Decode step 增加的时间落在哪里，不把两个 U2 stage 当成两份输出 token。
+
+**1. 每个点先加载环境和 BS48 公共配置。** 每次新终端按第 8.12.3 节执行从 `set -euo pipefail` 到 `export no_proxy` 的完整代码块，填写本机实际 `SITE_FILE/NODE_FILE`，保留其中的 CANN/venv `source`。选择 `SCENARIO=K2`、`PHASE=measure`、`PERF_TIER=screen`、`SCREEN_WAVES=4`；K2 对应本轮实际 BS48，S1/S2 仍表示执行模式。先不执行旧的创建目录代码，也不执行第 8.12.6 节的 K1:24:96 检查。随后在同一终端、启动全部角色前执行：
+
+```bash
+export DIAG_POINT=S1       # 第二个 run 改为 S2，全部角色冷启动。
+case "$DIAG_POINT" in
+  S1) export U_BATCHES=1 ;;
+  S2) export U_BATCHES=2 ;;
+  *) printf 'Only S1/S2 profile runs are required\n' >&2; exit 2 ;;
+esac
+test "$SCENARIO:$TOPOLOGY:$USE_AFD:$DECODE_BS:$CAPACITY" = K2:single:1:48:192
+test "$FFN_SEQ_CAPACITY:$MAX_MODEL_LEN:$ISL:$OSL" = 96:2048:1024:1024
+export EXECUTION_MODE=eager PHASE=measure PERF_TIER=profile PERF_REPEATS=1
+export REQUEST_COUNT=$((4 * CAPACITY))
+export DBO_DECODE_TOKEN_THRESHOLD=2 DBO_PREFILL_TOKEN_THRESHOLD=12
+export AFD_HCCL_EAGER_U2_STREAM_OVERLAP=0
+export AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP=0 AFD_HCCL_GRAPH_U2_HYBRID_DAG=0
+export AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM=0
+export AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM=0 AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER=0
+export AFD_HCCL_STAGE_DIAGNOSTICS=0 AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS=0
+export VLLM_LOGGING_LEVEL=INFO
+export PERF_CASE="${SCENARIO}-${DIAG_POINT}-b${DECODE_BS}-n${CAPACITY}-${PERF_TIER}"
+export CASE="$PERF_CASE" CYCLE=1
+export RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-${TOPOLOGY}-${PERF_CASE}"
+export RUN_ROOT="$RUN_BASE/$RUN_ID/$(hostname -s)"
+mkdir -p "$RUN_BASE/$RUN_ID"
+mkdir "$RUN_ROOT"
+cp "$SITE_FILE" "$RUN_ROOT/site.env"
+cp "$NODE_FILE" "$RUN_ROOT/node.env"
+
+# 首轮留出足够窗口，随后只分析六个 rank 共同覆盖的 3–5 个完整 step。
+export PROFILE_SKIP=1500 PROFILE_ACTIVE=256
+for role in ATTENTION FFN; do
+  export "AFD_NPU_${role}_PROFILER_ENABLE=1"
+  export "AFD_NPU_${role}_PROFILER_RANKS=all"
+  export "AFD_NPU_${role}_PROFILER_SKIP_FIRST=$PROFILE_SKIP"
+  export "AFD_NPU_${role}_PROFILER_WAIT=0"
+  export "AFD_NPU_${role}_PROFILER_WARMUP=1"
+  export "AFD_NPU_${role}_PROFILER_ACTIVE=$PROFILE_ACTIVE"
+  export "AFD_NPU_${role}_PROFILER_REPEAT=1"
+  export "AFD_NPU_${role}_PROFILER_WITH_STACK=0"
+done
+export AFD_NPU_ATTENTION_PROFILER_DIR="$RUN_ROOT/profile/attention"
+export AFD_NPU_FFN_PROFILER_DIR="$RUN_ROOT/profile/ffn"
+mkdir -p "$AFD_NPU_ATTENTION_PROFILER_DIR" "$AFD_NPU_FFN_PROFILER_DIR"
+
+# 补充 runtime.json 未覆盖的最终 profiler/诊断变量，限定输出键名。
+for name in RUN_ID CASE SCENARIO DIAG_POINT TOPOLOGY EXECUTION_MODE U_BATCHES \
+  DECODE_BS CAPACITY REQUEST_COUNT ISL OSL MAX_NUM_SEQS FFN_SEQ_CAPACITY \
+  AFD_HCCL_EAGER_U2_STREAM_OVERLAP AFD_HCCL_GRAPH_U2_COMPUTE_OVERLAP \
+  AFD_HCCL_GRAPH_U2_HYBRID_DAG AFD_HCCL_GRAPH_U2_ATTENTION_THREE_STREAM \
+  AFD_HCCL_GRAPH_U2_FFN_RECV_STREAM AFD_HCCL_GRAPH_U2_FFN_CROSS_LAYER \
+  AFD_HCCL_STAGE_DIAGNOSTICS AFD_HCCL_FFN_COMPUTE_SYNC_DIAGNOSTICS \
+  ${!AFD_NPU_ATTENTION_PROFILER_@} ${!AFD_NPU_FFN_PROFILER_@}; do
+  printf '%s=%q\n' "$name" "${!name}"
+done > "$RUN_ROOT/profile.env"
+```
+
+当前 [profiler.py](../../afd_plugin/compat/npu/profiler.py)采 CPU+NPU、Level2、record_shapes=True，输出 Text 格式；没有开启 AI Core 带宽计数器。参数在 runner 初始化时读取，**必须在 A/F 启动前设置并重启进程**；这里不调用 `/start_profile`，也不向已启动的进程追加 export。`SKIP_FIRST/ACTIVE` 是各 runner 的 `profiler.step()` 调用数，不是请求数、stage 数或秒数；A 每次 execute_model 调一次，F 的入口位置不同，不能直接按相同 step 编号跨 rank 对齐。
+
+本轮预热结束时，S1 四个 A 的 iteration 计数约 1246/1075/1075/1075，S2 约 1170/1127/1059/1061。这些只是选择窗口的参考，**不是 profiler.step 的精确计数**。1500 是先采测量早期的候选，256 步用于容纳已观察到的 rank 偏差，采集时间和文件大小会增加；按原始 TPOT 粗估约 34/64 秒，不能保证此时长。最终以六卡共同有效区为准，不保证同值自动同时触发。若完全未覆盖在线测量或交集不足，先记录每侧实际时间窗，只调整相应 A/F `SKIP_FIRST` 重采；不同时改变执行开关。不要恢复默认只采 rank0，也不把这里的 rank 当物理卡号。
+
+**2. 启动、预热和发压。** 按第 4.4 节生成本点 `runtime.json`，按第 8.5 节 P→F+A→Proxy 启动；F 命令前缀仍用 `MAX_NUM_SEQS="$FFN_SEQ_CAPACITY"`、A 用48，P仍用48。检查 A/F 均 `enforce_eager=True`，日志有四个 A、两个 F 的 `profiler enabled`（以实际 rank/PID 为准）。服务 ready 后，按第 8.12.6 节步骤2执行同样的 smoke，通过后只定义第 8.6 节的 `run_perf_batch` 函数；然后执行第 8.7 节的采样/发压代码，得到一次 warmup192 和一次 measure768。不再执行旧 BS8 预检矩阵，不额外循环三轮。profile 点的 Q/TPOT 标为“带采集开销”，不替换现有无 profiler 的性能结果；若采集时快慢差异消失或发生设备错误，也按实际记录。
+
+测量和 drain 完成后检查产物，再按第 8.8 节正常停服；保留完整原始 profiler 目录，不仅拷贝几个 CSV：
+
+```bash
+rg -n 'profiler enabled|enforce_eager|role=|non-default args:' \
+  "$RUN_ROOT/attention.log" "$RUN_ROOT/ffn.log" > "$RUN_ROOT/profile-startup-check.txt"
+find "$RUN_ROOT/profile" -type f \
+  \( -name 'trace_view.json' -o -name 'kernel_details.csv' \
+     -o -name 'operator_details.csv' -o -name 'communication*.json' \
+     -o -name 'profiler_info*.json' \) -print > "$RUN_ROOT/profile-files.txt"
+cat "$RUN_ROOT/profile-files.txt"
+```
+
+预期有 A4/F2 对应的六组进程产物，通常各含 `*_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json`、kernel/operator CSV 和 profiler 元数据。用 PID、rank、Device ID 核对角色；只有目录存在、只有 CPU 事件或缺 NPU kernel 不能判为采集完成。若只有原始 PROF/FRAMEWORK 文件、尚无解析交付件，先检查解析错误并按现场 torch-npu 配套方法离线解析，不把空结果解释成设备空闲。
+
+**3. 打开并选择可比较窗口。** 在 MindStudio Insight 的系统调优中导入本 run 的完整 profile 数据，查看 Timeline；保留 A/F 原目录和时间戳，按工具版本支持的追加导入方式查看对应进程，不假定 A/F 不同通信域会自动合并成一个完整集群。文件说明和界面操作见[官方系统调优指南](https://github.com/Ascend/msinsight/blob/master/docs/zh/user_guide/system_tuning.md)。首轮按以下顺序检查：
+
+1. 对齐 `measure-1.wallclock-begin/end.txt` 与 profiler 元数据时间，排除启动、预热、trace 导出和最后排空。日志 running 是稀疏采样，还需结合 trace 的实际 token shapes；选择四个 A 持续接近48、无明显补充请求的区间。
+2. 六个 rank 必须在同一墙钟范围内有实际事件。截取共同覆盖区内至少3–5个完整 Decode step；S1 计一个 stage，S2 计 stage0+stage1 的完整 step。不要把不同请求平均 TPOT 当作单个 kernel 时间，也不要给 S2 除以2。
+3. 从 A 的计算→A→F send/recv→F MoE/EP→F→A→A 后续计算追一条依赖链，按通信对端、通信域、顺序和关联 ID 配对。`ProfilerStep#编号` 是本地编号；不能仅按相同编号或每卡各取第一个事件认定是同一步。跨流的 CPU/NPU flow 和发送/接收配对也要核对。
+4. 若 trace 没有 layer/stage/真实 token 字段且无法可靠配对，先标记缺项、回传原始 trace。必要时再做单独的 eager 边界打点诊断；不要凭算子总表补出不存在的 stage 毫秒数，不先打开 DEBUG 或强制 compute sync 改变时序。
+
+**4. 用新增时间归因，而不是只看哪一行最长。** 对每个完整 step 记录下表，在3–5步上报中位数和范围；S1/S2 使用同样的计时边界和采集设置。六卡总耗时、CPU父子事件以及重叠的通信/计算不能直接累加成一步墙钟时间。先用实际关键路径解释 S2 比 S1 增加的时间；原始无 profiler 的差值约117.82 ms，仅作背景。
+
+| 项目 | 如何观察 S1 与 S2 | 何种证据支持该方向 |
+|---|---|---|
+| A 本地计算 | Attention、Gate、norm等 NPU 算子的次数、shape、实际执行时长 | F 在等 A，且 A 的两段计算增加能够解释关键路径差值；不能只检查 F |
+| F 专家计算 | GroupedMatmul/量化/激活/重排等实际 NPU kernel，S2 两 stage 合起来与 S1 比 | 每段约半量 token，但每段专家算子时长仍接近 U1，且新增计算确实阻塞下一步；仅能定位到 FFN 执行，权重带宽是否饱和还需单独计数器/代表形状验证 |
+| F 内部 EP | dispatch/combine 的通信域及 F0/F1 的对应任务，区别于 A↔F P2P | F 内 EP 的未重叠传输/等待显著增长，或另一张 F 是持续落后的生产者；融合算子含计算/通信时保留混合归因 |
+| A↔F P2P | 按 A/F 对端识别 send/recv，核对传输量、次数、ready时间与未重叠区间 | 额外传输占据关键路径且对端已经 ready，才优先怀疑传输/消息粒度；recv 很长但发送方尚未完成计算，优先追发送方 |
+| Host/同步等待 | CPU下发空隙、synchronize/event/stream wait，与同一时刻所有相关 NPU 流对照 | 所需依赖已完成仍延迟下发/放行，或显式 barrier 形成关键路径空泡；CPU synchronize 覆盖设备正在计算的区间只是等待表象，不能再把同一时间算一遍 |
+
+建议回传一张表：`完整 step ms、A计算、F计算、F内部EP、A↔F、未解释空泡、重叠区间`，分别列 S1、S2、差值，以及每项的起止事件/依赖证据；这些是诊断统计项，未形成互斥关键路径划分前不强制相加等于总时长。`communication.json` 的传输与等待字段存在时辅助区分，字段缺失则明确记录；不能仅因 HCCL 总时长高就断定网络带宽差。现有 worker 每步有 `torch.npu.synchronize()`，S1/S2 都会执行，发现长 synchronize 本身不证明它就是新增开销的根因。
+
+**5. 回传和后续。** 按第 9 节归档两个完整 RUN_ROOT，至少含完整 profile、runtime.json、profile.env、实际 argv/四角色日志、smoke、warmup/measure JSON/metrics/drain/wallclock、NPU采样、共同窗口范围和正常停服记录。先完成这对证据；若结果主要是缺少重叠，再只追加一个 eager/U2 overlap=1 点与 S2 比，不重开 S4/拓扑矩阵。判断修复或调参收益时，关闭两个 profiler、stage diagnostics 和 DEBUG 后，复测选定配置；timeline 归因不替代无 profiler 的性能确认。本节仅核对本地接口和脚本语法，尚未在现场 A5 执行采集。
 
 ## 9. 【A5 手工执行】失败回传与最终交付表
 
