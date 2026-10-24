@@ -2134,7 +2134,41 @@ cat "$RUN_ROOT/profile-files.txt"
 
 建议回传一张表：`完整 step ms、A计算、F计算、F内部EP、A↔F、未解释空泡、重叠区间`，分别列 S1、S2、差值，以及每项的起止事件/依赖证据；这些是诊断统计项，未形成互斥关键路径划分前不强制相加等于总时长。`communication.json` 的传输与等待字段存在时辅助区分，字段缺失则明确记录；不能仅因 HCCL 总时长高就断定网络带宽差。现有 worker 每步有 `torch.npu.synchronize()`，S1/S2 都会执行，发现长 synchronize 本身不证明它就是新增开销的根因。
 
-**5. 回传和后续。** 按第 9 节归档两个完整 RUN_ROOT，至少含完整 profile、runtime.json、profile.env、实际 argv/四角色日志、smoke、warmup/measure JSON/metrics/drain/wallclock、NPU采样、共同窗口范围和正常停服记录。先完成这对证据；若结果主要是缺少重叠，再只追加一个 eager/U2 overlap=1 点与 S2 比，不重开 S4/拓扑矩阵。判断修复或调参收益时，关闭两个 profiler、stage diagnostics 和 DEBUG 后，复测选定配置；timeline 归因不替代无 profiler 的性能确认。本节仅核对本地接口和脚本语法，尚未在现场 A5 执行采集。
+**5. 回传和后续。** 按第 9 节归档两个完整 RUN_ROOT，至少含完整 profile、runtime.json、profile.env、实际 argv/四角色日志、smoke、warmup/measure JSON/metrics/drain/wallclock、NPU采样、共同窗口范围和正常停服记录。完整原始数据保留现场；trace 过大时先按第 8.12.8 节提取摘要分批回传。先完成这对证据；若结果主要是缺少重叠，再只追加一个 eager/U2 overlap=1 点与 S2 比，不重开 S4/拓扑矩阵。判断修复或调参收益时，关闭两个 profiler、stage diagnostics 和 DEBUG 后，复测选定配置；timeline 归因不替代无 profiler 的性能确认。本节仅核对本地接口和脚本语法，尚未在现场 A5 执行采集。
+
+#### 8.12.8 多 rank 解析、大 trace 精简与 A3 使用范围
+
+**四个 A 和两个 F 都先完成导出和摘要；不必同时打开六份完整 trace。** 若已生成各进程的 `kernel_details.csv` 和 `trace_view.json`，说明已有解析产物，不必再次调用 analyse。缺少导出时，先在采集端使用匹配版本的 torch-npu 解析对应 `*_ascend_pt` 原始目录。只看 A rank0 可能漏掉其他 DP 的下发/等待差异和两组 A→F 路径；先对六个进程的实际采集窗口、kernel次数、shape和耗时作概览，再选慢 rank 与对应 A/F 对端深入查看。A/F内部rank编号不能直接视为物理卡号，也不要直接用不同有效窗口的总耗时给rank排快慢。
+
+**第一批只传小摘要，不读取大 trace。** [summarize_afd_profile.py](../../tools/validation/summarize_afd_profile.py)仅用 Python 标准库流式读取已导出的 kernel CSV，逐进程保留来源路径、表头、次数、算子累计时长/平均时长、首末任务时间和 Top30；将 profiler 元数据、runtime/profile.env/墙钟一起打包。可在采集服务器运行，也可把 CSV/元数据目录复制到任意有 Python 3.10+ 的 Linux/Windows 主机运行，不需要 NPU、vLLM 或 torch。`RUN_ROOT` 指一个点的节点目录，分别对 S1/S2 执行：
+
+```bash
+# 若有现成 PYTHON_BIN 可沿用；离线摘要主机也可直接使用 python3。
+python3 "$AFD_PLUGIN_ROOT/tools/validation/summarize_afd_profile.py" \
+  --run-root "$RUN_ROOT" --output "$RUN_ROOT/profile-summary"
+```
+
+回传 `profile-summary/profile-summary.tar.gz`，内有 `summary.json`、`files.csv` 和按原相对路径保存的元数据。脚本不打开、不修改、不打包 `trace_view.json`；输出目录必须是新目录，避免覆盖上次结果。脚本按源目录识别进程，不声称自动确认 DP/rank/device 映射；检查 `profile_process_exports` 是否为预期6，并结合元数据核对 A4/F2。缺 kernel CSV、列名不识别、时间缺项都会显式报错或标记，不把缺项填成0。传输体积以实际压缩包大小为准。
+
+**第二批按需要补原始表，再定位短 timeline。** 若摘要不足，用新目录重跑并增加 `--include-tables`，包内额外保留 kernel/operator/step/API 等原始 CSV 和 communication JSON，仍排除 full trace、DB、原始 PROF/FRAMEWORK 和大压测JSON：
+
+```bash
+python3 "$AFD_PLUGIN_ROOT/tools/validation/summarize_afd_profile.py" \
+  --run-root "$RUN_ROOT" --output "$RUN_ROOT/profile-tables" --include-tables
+```
+
+先传压缩后的摘要，再按实际体积补传 `profile-tables/profile-summary.tar.gz`。常见输入有 `kernel_details.csv`、`operator_details.csv`、`step_trace_time.csv`、`communication.json`、`communication_matrix.json`；文件职责见[官方Profiler输出说明](https://github.com/Ascend/msinsight/blob/master/docs/zh/user_guide/system_tuning.md)。摘要保留全窗口算子累计值，包含跨流重叠，不等于step墙钟、设备忙碌时间或权重带宽；Host父子时长也不能简单相加。它可以筛查候选瓶颈，**不能单独证明通信等待由谁造成**。需要最终定因时，再在现场对齐六卡共同窗口，从原trace导出同一墙钟区间的3–5个完整step，保留CPU、NPU、通信、metadata及关联flow；不能按文件行数/head截断JSON，也不能只留几个最长kernel丢掉依赖。导出能力以现场Insight版本为准，暂不支持时先回传上述表及共同窗口时间，保留原trace供现场继续分析。
+
+**A3 可以做离线分析，也可以做条件复现，但不替代 A5 归因。**
+
+| 工作 | 本机 A3 是否适合 | 结论范围 |
+|---|---|---|
+| 已导出 CSV/JSON 的摘要、打包、查看 | 可以，只用CPU；同样可在普通PC执行 | 分析仍然来自原A5采集数据，不改变硬件证据 |
+| 原始 PROF/FRAMEWORK 离线解析 | 取决于是否安装匹配采集格式和950数据的解析组件 | 优先在采集端解析后搬运小表；A3本机有torch-npu不等于一定能解析另一版本A5原始数据 |
+| AFD U1/U2执行顺序、stage数量、Host控制路径复现 | 本机对应版本/权重/算子/内存可用后可以另建对照 | 作为软件机制旁证；没有复现也不能排除A5异常 |
+| 本轮132→250 ms、FFN/EP/P2P占比、HBM/通信带宽及修复收益验收 | 仍需A5同配置数据 | A3代际、量化kernel、内存、通信拓扑不同，不能把绝对时间和瓶颈比例迁移 |
+
+上游[DeepSeek-V4-Flash部署文档](https://docs.vllm.ai/projects/ascend/en/main/tutorials/models/DeepSeek-V4-Flash.html)列出A3的W8A8方案及950的MXFP低精度方案；该文档基于较新上游版本，不能据此认定本项目冻结的 vLLM 0.23/Ascend提交已验收A3。不要为复现本轮差异直接升级A5环境。若需在A3跑模型，另行记录权重格式、CANN/torch-npu/vLLM/插件版本、NPU可见逻辑设备及HBM，先原生smoke，再核验AFD eager/U1→U2；W8A8/BF16切换会改变专家权重占用，不能沿用A5 F2容量假设。A3不注入A5专用HIXL资源字段，不要求 `/etc/hixlep`；跨平台实验单独归档。
 
 ## 9. 【A5 手工执行】失败回传与最终交付表
 
