@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,7 @@ from afd_plugin.connectors import (  # noqa: E402
     AFDA2FTransferPayload,
     AFDConnectorBase,
     AFDConnectorFactory,
+    AFDRoutedExpertsConnector,
     AFDTransferContext,
     AFDTransferMetadata,
 )
@@ -61,8 +63,19 @@ def test_connector_metadata_validates_sequence_lengths():
         AFDTransferMetadata(
             layer_idx=0,
             stage_idx=0,
-            seq_lens=[0],
+            seq_lens=[-1],
         )
+
+
+def test_connector_metadata_allows_empty_receive():
+    metadata = AFDTransferMetadata.create_ffn_metadata(
+        layer_idx=0,
+        stage_idx=0,
+        seq_lens=[0],
+    )
+
+    assert metadata.total_tokens == 0
+    assert metadata.validate_tensor_shape((0, 16))
 
 
 def test_attn_output_carries_transfer_context():
@@ -180,3 +193,139 @@ def test_factory_resolves_role_rank_before_connector_construction(monkeypatch):
     )
 
     assert connector.role_rank == 1
+
+
+class _BootstrappingConnector(_MinimalConnector, AFDRoutedExpertsConnector):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.events: list[str] = []
+
+    def bootstrap(self):
+        self.events.append("bootstrap")
+        if self.vllm_config.fail_bootstrap:
+            raise RuntimeError("bootstrap failed")
+
+    def init_afd_connector(self, *, moe_layer_indices=None, local_experts=None):
+        return None
+
+    def run_experts(self, payload, weights):
+        return payload.hidden_states
+
+    def synchronize_lanes(self):
+        return None
+
+    def close(self):
+        self.events.append("close")
+
+
+def _register(monkeypatch, name, connector_cls):
+    monkeypatch.setitem(AFDConnectorFactory._registry, name, lambda: connector_cls)
+
+
+def _single_rank_config(
+    *, fail_bootstrap=False, data_parallel_size=1, data_parallel_rank=0, tp_size=1
+):
+    return SimpleNamespace(
+        additional_config={},
+        fail_bootstrap=fail_bootstrap,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=data_parallel_size,
+            data_parallel_rank=data_parallel_rank,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            tensor_parallel_size=tp_size,
+        ),
+    )
+
+
+def test_create_bootstrapped_connector_skips_other_connectors(monkeypatch):
+    """A connector that is not an ``AFDRoutedExpertsConnector`` is not
+    created before vLLM's distributed init; its runner creates it later.
+
+    Why: P2P and the NPU connectors keep their existing bring-up order.
+    """
+    _register(monkeypatch, "MinimalConnector", _MinimalConnector)
+
+    connector = AFDConnectorFactory.create_bootstrapped_connector(
+        0,
+        0,
+        _single_rank_config(),
+        AFDConfig(connector="MinimalConnector", role="ffn"),
+    )
+
+    assert connector is None
+
+
+def test_create_bootstrapped_connector_creates_and_bootstraps(monkeypatch):
+    """A routed-experts connector is created with the worker's ranks and
+    bootstrapped.
+
+    Why: workers call this before vLLM's distributed init so the connector's
+    NCCL environment precedes vLLM's NCCL groups.
+    """
+    _register(monkeypatch, "BootstrappingConnector", _BootstrappingConnector)
+
+    connector = AFDConnectorFactory.create_bootstrapped_connector(
+        3,
+        1,
+        _single_rank_config(),
+        AFDConfig(connector="BootstrappingConnector", role="ffn"),
+    )
+
+    assert isinstance(connector, _BootstrappingConnector)
+    assert (connector.rank, connector.local_rank, connector.role_rank) == (3, 1, 0)
+    assert connector.events == ["bootstrap"]
+
+
+def test_create_bootstrapped_connector_derives_tp_rank_from_worker_rank(
+    monkeypatch,
+):
+    """With TP > 1 the role rank's TP part comes from the worker rank.
+
+    Why: vLLM's TP group does not exist before its distributed init; reading
+    it there would fail. TP is vLLM's innermost rank dimension, so the worker
+    rank modulo the TP size is the TP rank.
+    """
+    _register(monkeypatch, "BootstrappingConnector", _BootstrappingConnector)
+    monkeypatch.setitem(sys.modules, "vllm.distributed.parallel_state", None)
+
+    connector = AFDConnectorFactory.create_bootstrapped_connector(
+        1,
+        1,
+        _single_rank_config(data_parallel_size=2, data_parallel_rank=1, tp_size=2),
+        AFDConfig(
+            connector="BootstrappingConnector",
+            role="attention",
+            num_attention_ranks=4,
+        ),
+    )
+
+    assert isinstance(connector, _BootstrappingConnector)
+    # DP rank 1, TP rank 1 of 2.
+    assert connector.role_rank == 3
+
+
+def test_create_bootstrapped_connector_closes_on_bootstrap_failure(monkeypatch):
+    """A failed bootstrap closes the connector before the error propagates.
+
+    Why: the worker never receives the connector, so nobody else closes it.
+    """
+    _register(monkeypatch, "BootstrappingConnector", _BootstrappingConnector)
+    created: list[_BootstrappingConnector] = []
+    original_init = _BootstrappingConnector.__init__
+
+    def recording_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        created.append(self)
+
+    monkeypatch.setattr(_BootstrappingConnector, "__init__", recording_init)
+
+    with pytest.raises(RuntimeError, match="bootstrap failed"):
+        AFDConnectorFactory.create_bootstrapped_connector(
+            0,
+            0,
+            _single_rank_config(fail_bootstrap=True),
+            AFDConfig(connector="BootstrappingConnector", role="ffn"),
+        )
+
+    assert created[0].events == ["bootstrap", "close"]

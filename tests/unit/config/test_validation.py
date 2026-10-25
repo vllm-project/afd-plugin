@@ -165,6 +165,21 @@ MRV2_BACKENDS = {
 }
 
 
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_routed_transport_preserves_runner_and_gate_policy(mrv2_config, role):
+    mrv2_config.additional_config["afd"].update(
+        role=role, connector="DeepEPM2NAFDConnector", compute_gate_on_attention=True
+    )
+    validate_gpu_model_runner_v2_config(
+        mrv2_config, expected_role=role, device_type="cuda"
+    )
+    mrv2_config.additional_config["afd"]["compute_gate_on_attention"] = False
+    with pytest.raises(RuntimeError, match="requires compute_gate_on_attention=true"):
+        validate_gpu_model_runner_v2_config(
+            mrv2_config, expected_role=role, device_type="cuda"
+        )
+
+
 def _symmetric_ranks(dp_size, tp_size):
     return {
         "parallel_config.data_parallel_size": dp_size,

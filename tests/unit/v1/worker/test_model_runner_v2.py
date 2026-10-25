@@ -40,6 +40,9 @@ from afd_plugin.v1.worker import (  # noqa: E402
     attention_worker,
     ffn_worker,
 )
+from afd_plugin.v1.worker import (  # noqa: E402
+    ffn_routed_experts_model_runner as routed_runner_module,
+)
 from afd_plugin.v1.worker.attention_model_runner_v2 import (  # noqa: E402
     AFDAttentionModelRunnerV2,
 )
@@ -47,6 +50,9 @@ from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
 from afd_plugin.validation import (  # noqa: E402
     validate_gpu_model_runner_v2_config,
     validate_npu_model_runner_v2_config,
+)
+from tests.unit.fakes.connector import (  # noqa: E402
+    FakeRoutedConnector,
 )
 from tests.unit.fakes.profiler import StepProfiler as _StepProfiler  # noqa: E402
 
@@ -129,6 +135,12 @@ def _v2_config(
     parallel_config = SimpleNamespace(
         data_parallel_size=data_parallel_size,
         data_parallel_rank=0,
+        data_parallel_rank_local=0,
+        data_parallel_index=0,
+        data_parallel_backend="mp",
+        distributed_executor_backend="mp",
+        nnodes_within_dp=1,
+        assigned_physical_gpu_ids=None,
         tensor_parallel_size=tensor_parallel_size,
         pipeline_parallel_size=1,
         prefill_context_parallel_size=prefill_context_parallel_size,
@@ -168,6 +180,7 @@ def _v2_config(
         parallel_config=parallel_config,
         compilation_config=compilation_config,
         cache_config=SimpleNamespace(enable_prefix_caching=False),
+        kernel_config=SimpleNamespace(moe_backend="auto"),
         scheduler_config=SimpleNamespace(
             enable_chunked_prefill=False,
             async_scheduling=False,
@@ -248,6 +261,8 @@ def _construct_like_native_worker(worker):
 
 def _prepare_worker(worker_cls, config, *, use_v2):
     worker = object.__new__(worker_cls)
+    worker.rank = 0
+    worker.local_rank = 0
     worker.vllm_config = config
     worker.model_config = config.model_config
     worker.use_v2_model_runner = use_v2
@@ -2029,6 +2044,47 @@ def test_v2_load_model_initializes_connector_after_native_load(monkeypatch):
     assert runner.connector.is_initialized
 
 
+def test_v2_load_model_reports_moe_layers_to_routed_connector(monkeypatch):
+    """An ``AFDRoutedExpertsConnector`` receives the MoE layers Attention
+    dispatches, which every rank checks against the FFN's.
+
+    Why: dispatch and combine run once per MoE layer on every rank.
+    """
+    connector = FakeRoutedConnector()
+    runner = object.__new__(AFDAttentionModelRunnerV2)
+    runner.connector = connector
+    runner.model = SimpleNamespace(get_experts_layer_indices=lambda: [1, 3])
+    monkeypatch.setattr(
+        native_v2.GPUModelRunner, "load_model", lambda self, *args, **kwargs: None
+    )
+    monkeypatch.setattr(AFDAttentionModelRunnerV2, "get_model", lambda self: self.model)
+
+    runner.load_model()
+
+    assert connector.init_kwargs == {
+        "moe_layer_indices": (1, 3),
+        "local_experts": None,
+    }
+
+
+def test_v2_runner_adopts_bootstrapped_connector_and_closes_placeholder():
+    """The worker's bootstrapped connector replaces the one built at
+    construction, which is closed.
+
+    Why: the native constructor signature stays unchanged.
+    """
+    events: list[str] = []
+    placeholder = SimpleNamespace(close=lambda: events.append("placeholder_close"))
+    bootstrapped = SimpleNamespace()
+    runner = object.__new__(AFDAttentionModelRunnerV2)
+    runner.connector = placeholder
+
+    runner.adopt_bootstrapped_connector(bootstrapped)
+
+    assert runner.connector is bootstrapped
+    assert events == ["placeholder_close"]
+
+
 def test_v2_constructor_rejects_missing_control_plane_and_cleans_native(
     monkeypatch,
 ):
@@ -2235,6 +2291,235 @@ def test_worker_runner_substitution_restores_on_constructor_exception(
     assert native_module.GPUModelRunner is _NativeRunnerSentinel
     _construct_like_native_worker(worker)
     assert _NativeRunnerSentinel.instances == 1
+
+
+class _ConnectorRunnerRecorder:
+    adopted: list[object] = []
+
+    def __init__(self, vllm_config, device):
+        pass
+
+    def adopt_bootstrapped_connector(self, connector):
+        type(self).adopted.append(connector)
+
+
+_ROUTED_WORKER_CASES = [
+    (
+        attention_worker,
+        attention_worker.AFDAttentionWorker,
+        attention_worker,
+        "AFDAttentionModelRunnerV2",
+    ),
+    # The FFN worker imports the routed runner lazily, from its own module.
+    (
+        ffn_worker,
+        AFDFFNWorker,
+        routed_runner_module,
+        "GPUFFNRoutedExpertsModelRunner",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("worker_module", "worker_cls", "runner_module", "runner_name"),
+    _ROUTED_WORKER_CASES,
+)
+def test_workers_bootstrap_connector_before_vllm_and_hand_it_to_runner(
+    monkeypatch, worker_module, worker_cls, runner_module, runner_name
+):
+    """An ``AFDRoutedExpertsConnector`` is created and bootstrapped before
+    vLLM's distributed init and adopted by the runner; the FFN picks the
+    routed-experts runner.
+
+    Why: NCCL reads its environment when vLLM creates the first communicator.
+    """
+    config = _v2_config(role="ffn" if worker_cls is AFDFFNWorker else "attention")
+    worker = _prepare_worker(worker_cls, config, use_v2=True)
+    events: list[str] = []
+    connector = SimpleNamespace(close=lambda: events.append("close"), local_rank=0)
+    _ConnectorRunnerRecorder.adopted = []
+
+    def create_bootstrapped_connector(rank, local_rank, vllm_config, afd_config):
+        events.append("bootstrap")
+        return connector
+
+    def vllm_init(current_worker):
+        events.append("vllm_init")
+        _fake_worker_init(current_worker)
+        current_worker.device = torch.device("cuda", 0)
+
+    factory = worker_module.AFDConnectorFactory
+    monkeypatch.setattr(
+        factory, "create_bootstrapped_connector", create_bootstrapped_connector
+    )
+    monkeypatch.setattr(
+        factory, "get_connector_class", lambda name: FakeRoutedConnector
+    )
+    monkeypatch.setattr(runner_module, runner_name, _ConnectorRunnerRecorder)
+    monkeypatch.setattr(native_v2, "GPUModelRunner", _NativeRunnerSentinel)
+    monkeypatch.setattr(worker_module.Worker, "init_device", vllm_init)
+    monkeypatch.setattr(
+        worker_module,
+        "assert_compatible_afd_stack",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(worker_module.torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        worker_module,
+        "check_connector_role_rank",
+        lambda checked, vllm_config: events.append("role_rank_check"),
+    )
+
+    worker.init_device()
+
+    assert events == ["bootstrap", "vllm_init", "role_rank_check"]
+    assert _ConnectorRunnerRecorder.adopted == [connector]
+    assert native_v2.GPUModelRunner is _NativeRunnerSentinel
+    # The routed FFN pins vLLM's MoE backend to one that keeps the expert layout.
+    expected_backend = "triton" if worker_cls is AFDFFNWorker else "auto"
+    assert config.kernel_config.moe_backend == expected_backend
+
+
+@pytest.mark.parametrize(
+    ("worker_module", "worker_cls", "runner_module", "runner_name"),
+    _ROUTED_WORKER_CASES,
+)
+def test_workers_close_bootstrapped_connector_when_vllm_init_fails(
+    monkeypatch, worker_module, worker_cls, runner_module, runner_name
+):
+    config = _v2_config(role="ffn" if worker_cls is AFDFFNWorker else "attention")
+    worker = _prepare_worker(worker_cls, config, use_v2=True)
+    events: list[str] = []
+    connector = SimpleNamespace(close=lambda: events.append("close"))
+
+    def failing_vllm_init(current_worker):
+        raise RuntimeError("vLLM init failed")
+
+    factory = worker_module.AFDConnectorFactory
+    monkeypatch.setattr(
+        factory, "create_bootstrapped_connector", lambda *args: connector
+    )
+    monkeypatch.setattr(
+        factory, "get_connector_class", lambda name: FakeRoutedConnector
+    )
+    monkeypatch.setattr(runner_module, runner_name, _ConnectorRunnerRecorder)
+    monkeypatch.setattr(native_v2, "GPUModelRunner", _NativeRunnerSentinel)
+    monkeypatch.setattr(worker_module.Worker, "init_device", failing_vllm_init)
+    monkeypatch.setattr(
+        worker_module,
+        "assert_compatible_afd_stack",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(RuntimeError, match="vLLM init failed"):
+        worker.init_device()
+
+    assert events == ["close"]
+    assert native_v2.GPUModelRunner is _NativeRunnerSentinel
+
+
+@pytest.mark.parametrize(
+    ("worker_module", "worker_cls", "runner_module", "runner_name"),
+    _ROUTED_WORKER_CASES,
+)
+def test_workers_reject_bootstrapped_connector_on_another_device(
+    monkeypatch, worker_module, worker_cls, runner_module, runner_name
+):
+    """A connector bootstrapped on a different GPU than vLLM's fails startup.
+
+    Why: the connector picks its device before vLLM does, by mirroring vLLM's
+    selection; a vLLM upgrade that changes the selection must fail here
+    rather than run the connector on another rank's GPU.
+    """
+    config = _v2_config(role="ffn" if worker_cls is AFDFFNWorker else "attention")
+    worker = _prepare_worker(worker_cls, config, use_v2=True)
+    events: list[str] = []
+    connector = SimpleNamespace(close=lambda: events.append("close"), local_rank=0)
+    _ConnectorRunnerRecorder.adopted = []
+
+    def vllm_init(current_worker):
+        _fake_worker_init(current_worker)
+        current_worker.device = torch.device("cuda", 4)
+
+    factory = worker_module.AFDConnectorFactory
+    monkeypatch.setattr(
+        factory, "create_bootstrapped_connector", lambda *args: connector
+    )
+    monkeypatch.setattr(
+        factory, "get_connector_class", lambda name: FakeRoutedConnector
+    )
+    monkeypatch.setattr(runner_module, runner_name, _ConnectorRunnerRecorder)
+    monkeypatch.setattr(native_v2, "GPUModelRunner", _NativeRunnerSentinel)
+    monkeypatch.setattr(worker_module.Worker, "init_device", vllm_init)
+    monkeypatch.setattr(
+        worker_module,
+        "assert_compatible_afd_stack",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(RuntimeError, match="uses cuda:0 but vLLM placed"):
+        worker.init_device()
+
+    assert events == ["close"]
+    assert _ConnectorRunnerRecorder.adopted == []
+    assert native_v2.GPUModelRunner is _NativeRunnerSentinel
+
+
+def _deepep_m2n_v2_config(**kwargs):
+    config = _v2_config(**kwargs)
+    config.additional_config["afd"]["connector"] = "DeepEPM2NAFDConnector"
+    config.additional_config["afd"]["compute_gate_on_attention"] = True
+    return config
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_v2_validator_accepts_deepep_m2n_attention_tp(tp_size):
+    """DeepEP M2N accepts Attention TP > 1.
+
+    Why: each Attention TP rank dispatches its own slice of the tokens, and
+    the bootstrap derives the TP rank from the worker rank before vLLM's
+    process groups exist.
+    """
+    validate_gpu_model_runner_v2_config(
+        _deepep_m2n_v2_config(
+            tensor_parallel_size=tp_size, num_attention_ranks=tp_size
+        ),
+        expected_role="attention",
+        device_type="cuda",
+    )
+
+
+def test_v2_validator_rejects_deepep_m2n_ffn_tp():
+    """DeepEP M2N FFN ranks must run TP = 1.
+
+    Why: DeepEP routes each token to the one FFN rank that owns the whole
+    expert; FFN experts are not TP-sharded.
+    """
+    config = _deepep_m2n_v2_config(role="ffn", tensor_parallel_size=2, num_ffn_ranks=2)
+    with pytest.raises(RuntimeError, match="requires FFN tensor_parallel_size=1"):
+        validate_gpu_model_runner_v2_config(
+            config,
+            expected_role="ffn",
+            device_type="cuda",
+        )
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_v2_validator_requires_gate_on_attention_for_deepep_m2n(role):
+    """DeepEP M2N without compute_gate_on_attention fails at validation.
+
+    Why: the connector routes on Attention, so a run without the gate there
+    cannot dispatch; failing here names the setting instead of failing later
+    in the connector handshake.
+    """
+    config = _deepep_m2n_v2_config(role=role)
+    config.additional_config["afd"]["compute_gate_on_attention"] = False
+    with pytest.raises(RuntimeError, match="requires compute_gate_on_attention=true"):
+        validate_gpu_model_runner_v2_config(
+            config,
+            expected_role=role,
+            device_type="cuda",
+        )
 
 
 @pytest.mark.parametrize("use_v2", [False, True])

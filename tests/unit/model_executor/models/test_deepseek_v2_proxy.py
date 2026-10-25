@@ -10,9 +10,16 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 from torch import nn  # noqa: E402
+from vllm.model_executor.layers.fused_moe.router import (  # noqa: E402
+    fused_topk_router,
+)
 
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
+
+ROUTING_HIDDEN_SIZE = 16
+ROUTING_NUM_EXPERTS = 8
+ROUTING_TOP_K = 2
 
 
 class _FakeConnector:
@@ -360,3 +367,288 @@ def test_attention_gate_balances_only_profile_routing(monkeypatch):
         torch.testing.assert_close(actual_ids, expected_ids.to(torch.int32))
         torch.testing.assert_close(actual_weights, weights)
         assert actual_logits is logits
+
+
+class _RecordingGate(nn.Module):
+    """Linear gate returning ``(logits, bias)`` like vLLM's ReplicatedLinear."""
+
+    def __init__(self, calls: list) -> None:
+        super().__init__()
+        self.calls = calls
+        self.weight = nn.Parameter(
+            torch.randn(ROUTING_NUM_EXPERTS, ROUTING_HIDDEN_SIZE)
+        )
+
+    def forward(self, hidden_states):
+        self.calls.append(hidden_states)
+        return hidden_states @ self.weight.t(), None
+
+
+def _routing_proxy(gate: nn.Module, *, renormalize: bool = True):
+    """A proxy that routes on Attention, configured as a model sets it up."""
+    proxy = adapter.RemoteFFNProxy(layer_idx=3)
+    proxy.gate = gate
+    proxy.top_k = ROUTING_TOP_K
+    proxy.renormalize = renormalize
+    return proxy
+
+
+def test_default_proxy_is_parameter_free_and_sends_no_routes(monkeypatch):
+    """Without a gate the proxy sends only hidden states.
+
+    Why: connectors other than M2N run the whole MoE block on FFN; adding the
+    routing settings to the base proxy must not change their payload.
+    """
+    events: list[tuple] = []
+    _install_fake_forward_context(monkeypatch, events)
+    proxy = adapter.RemoteFFNProxy(layer_idx=0)
+
+    proxy(torch.ones(2, 4))
+
+    assert list(proxy.parameters()) == []
+    assert proxy.tp_size == 1
+    assert events[0][3] == {}
+
+
+def test_routing_proxy_routes_on_attention_and_sends_topk(monkeypatch):
+    """Gate and top-k run once on Attention; only the routes go to the connector.
+
+    Why: DeepEP M2N dispatches by topk_ids/topk_weights and its combine returns
+    the weighted sum, so the proxy must not send logits or apply weights.
+    """
+    events: list[tuple] = []
+    _install_fake_forward_context(monkeypatch, events, stage_idx=1)
+    gate_calls: list = []
+    topk_calls: list[dict] = []
+    topk_weights = torch.tensor([[0.75, 0.25]])
+    topk_ids = torch.tensor([[1, 3]], dtype=torch.int32)
+
+    def fake_fused_topk(**kwargs):
+        topk_calls.append(kwargs)
+        return topk_weights, topk_ids, torch.zeros_like(topk_ids)
+
+    monkeypatch.setattr(adapter, "fused_topk", fake_fused_topk)
+    proxy = _routing_proxy(_RecordingGate(gate_calls), renormalize=False)
+    hidden_states = torch.ones(1, ROUTING_HIDDEN_SIZE)
+
+    output = proxy(hidden_states)
+
+    assert gate_calls == [hidden_states]
+    assert len(topk_calls) == 1
+    call = topk_calls[0]
+    assert call["hidden_states"] is hidden_states
+    assert torch.equal(call["gating_output"], hidden_states @ proxy.gate.weight.t())
+    assert call["topk"] == ROUTING_TOP_K
+    assert call["renormalize"] is False
+    assert [event[0] for event in events] == ["send", "yield", "recv"]
+    context = events[0][2]
+    assert context.metadata.layer_idx == 3
+    assert context.metadata.stage_idx == 1
+    assert events[0][3] == {"topk_ids": topk_ids, "topk_weights": topk_weights}
+    assert events[2][2] == 1
+    assert torch.equal(output, hidden_states * 0.25)
+
+
+def test_routing_proxy_owns_gate_at_native_checkpoint_path():
+    """The gate is the proxy's only parameter, under ``gate``.
+
+    Why: the proxy replaces ``mlp``, so ``model.layers.N.mlp.gate.weight``
+    from the checkpoint loads into it with no name mapping.
+    """
+    proxy = _routing_proxy(_RecordingGate([]))
+
+    assert set(dict(proxy.named_parameters())) == {"gate.weight"}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused top-k needs CUDA")
+@pytest.mark.parametrize("renormalize", [True, False])
+def test_routing_proxy_matches_native_router(monkeypatch, renormalize):
+    """On GPU the proxy's routes equal vLLM's native fused top-k router.
+
+    Why: the FFN applies the weights the Attention side computes; any drift
+    from native routing changes the model's output.
+    """
+    torch.manual_seed(0)
+    events: list[tuple] = []
+    _install_fake_forward_context(monkeypatch, events, stage_idx=0)
+    gate = _RecordingGate([]).cuda().to(torch.bfloat16)
+    proxy = _routing_proxy(gate, renormalize=renormalize)
+    hidden_states = torch.randn(
+        33, ROUTING_HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16
+    )
+
+    proxy(hidden_states)
+
+    sent = events[0][3]
+    router_logits, _ = gate(hidden_states)
+    native_weights, native_ids = fused_topk_router.FusedTopKRouter(
+        top_k=ROUTING_TOP_K,
+        global_num_experts=ROUTING_NUM_EXPERTS,
+        renormalize=renormalize,
+    )._compute_routing(hidden_states, router_logits, indices_type=None)
+    assert torch.equal(sent["topk_ids"], native_ids)
+    assert torch.equal(sent["topk_weights"], native_weights)
+
+    reference = torch.softmax(router_logits.float(), dim=-1)
+    reference_weights, reference_ids = reference.topk(ROUTING_TOP_K, dim=-1)
+    if renormalize:
+        reference_weights = reference_weights / reference_weights.sum(-1, keepdim=True)
+    assert torch.equal(
+        sent["topk_ids"].long().sort(-1).values, reference_ids.sort(-1).values
+    )
+    torch.testing.assert_close(
+        sent["topk_weights"].sort(-1).values,
+        reference_weights.sort(-1).values,
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+# Fake combine output scale of ``_FakeConnector.recv_ffn_output``.
+COMBINE_SCALE = 0.25
+# Added to the peer rank's rows by the fake all-gather, to tell them apart.
+PEER_OFFSET = 100.0
+
+
+class _TokenGate(nn.Module):
+    """Logits that make expert ``token % ROUTING_NUM_EXPERTS`` win per row."""
+
+    def forward(self, hidden_states):
+        logits = torch.zeros(hidden_states.shape[0], ROUTING_NUM_EXPERTS)
+        experts = hidden_states[:, 0].long() % ROUTING_NUM_EXPERTS
+        logits[torch.arange(hidden_states.shape[0]), experts] = 1.0
+        return logits, None
+
+
+def _torch_topk(*, hidden_states, gating_output, topk, renormalize):
+    weights, ids = torch.topk(gating_output.softmax(dim=-1), topk, dim=-1)
+    return weights, ids.to(torch.int32), None
+
+
+def _chunk_for_rank(tp_rank: int, tp_size: int):
+    """vLLM's ``sequence_parallel_chunk`` for one rank: pad, then slice."""
+
+    def chunk(x):
+        padded = torch.nn.functional.pad(x, (0, 0, 0, (-x.shape[0]) % tp_size))
+        rows = padded.shape[0] // tp_size
+        return padded[tp_rank * rows : (tp_rank + 1) * rows].clone()
+
+    return chunk
+
+
+def _tokens(num_tokens: int):
+    """Token ``i`` has value ``i`` in every channel."""
+    return torch.arange(num_tokens, dtype=torch.float32)[:, None].repeat(
+        1, ROUTING_HIDDEN_SIZE
+    )
+
+
+def _tp_routing_proxy(monkeypatch, tp_size: int):
+    monkeypatch.setattr(adapter, "fused_topk", _torch_topk)
+    proxy = _routing_proxy(_TokenGate())
+    proxy.tp_size = tp_size
+    return proxy
+
+
+def test_routing_proxy_tp1_dispatches_every_token(monkeypatch):
+    """Without Attention TP the proxy dispatches the whole batch unsplit.
+
+    Why: TP = 1 must keep the existing data path.
+    """
+
+    def no_split(x):
+        raise AssertionError("TP = 1 must not split")
+
+    events: list[tuple] = []
+    _install_fake_forward_context(monkeypatch, events)
+    monkeypatch.setattr(adapter.native, "sequence_parallel_chunk", no_split)
+    hidden_states = _tokens(3)
+
+    output = _tp_routing_proxy(monkeypatch, tp_size=1)(hidden_states)
+
+    sends = [event for event in events if event[0] == "send"]
+    assert len(sends) == 1
+    assert torch.equal(sends[0][1], hidden_states)
+    assert torch.equal(output, hidden_states * COMBINE_SCALE)
+
+
+@pytest.mark.parametrize(
+    ("tp_rank", "sent_tokens", "padding_rows"),
+    [(0, [0, 1], []), (1, [2, 0], [1])],
+)
+def test_routing_proxy_tp2_rank_dispatches_its_slice_and_gathers(
+    monkeypatch, tp_rank, sent_tokens, padding_rows
+):
+    """With TP 2 and 3 tokens, rank 0 dispatches tokens 0-1 and rank 1 token 2
+    plus one padding row whose experts are all ``UNROUTED_EXPERT_ID``; the
+    combined slices are all-gathered and trimmed back to 3 tokens.
+
+    Why: TP peers hold the same tokens; each must dispatch a disjoint slice
+    so every token reaches its experts exactly once.
+    """
+    tp_size = 2
+    events: list[tuple] = []
+    _install_fake_forward_context(monkeypatch, events)
+    monkeypatch.setattr(
+        adapter.native, "sequence_parallel_chunk", _chunk_for_rank(tp_rank, tp_size)
+    )
+    monkeypatch.setattr(
+        adapter.native, "get_tensor_model_parallel_rank", lambda: tp_rank
+    )
+    gathered_inputs = []
+
+    def all_gather(local_output, dim):
+        gathered_inputs.append(local_output.clone())
+        return torch.cat([local_output, local_output + PEER_OFFSET], dim=dim)
+
+    monkeypatch.setattr(adapter.native, "tensor_model_parallel_all_gather", all_gather)
+
+    output = _tp_routing_proxy(monkeypatch, tp_size)(_tokens(3))
+
+    (send,) = [event for event in events if event[0] == "send"]
+    sent_states, sent_kwargs = send[1], send[3]
+    assert sent_states[:, 0].tolist() == sent_tokens
+    topk_ids = sent_kwargs["topk_ids"]
+    unrouted = (topk_ids == adapter.UNROUTED_EXPERT_ID).all(dim=1)
+    assert unrouted.nonzero().flatten().tolist() == padding_rows
+    assert not (topk_ids[~unrouted] == adapter.UNROUTED_EXPERT_ID).any()
+    (local_output,) = gathered_inputs
+    assert torch.equal(local_output, sent_states * COMBINE_SCALE)
+    expected = torch.cat([local_output, local_output + PEER_OFFSET])[:3]
+    assert torch.equal(output, expected)
+
+
+def test_routing_proxy_tp4_with_one_token_routes_only_rank0(monkeypatch):
+    """One decode token over TP 4: rank 0 routes it, ranks 1-3 send one
+    unrouted padding row each.
+
+    Why: decode batches can be smaller than the TP size; padding must never
+    reach an expert.
+    """
+    tp_size = 4
+    events: list[tuple] = []
+    _install_fake_forward_context(monkeypatch, events)
+    monkeypatch.setattr(
+        adapter.native,
+        "tensor_model_parallel_all_gather",
+        lambda local, dim: torch.cat([local] * tp_size, dim=dim),
+    )
+    for tp_rank in range(tp_size):
+        monkeypatch.setattr(
+            adapter.native, "sequence_parallel_chunk", _chunk_for_rank(tp_rank, tp_size)
+        )
+        monkeypatch.setattr(
+            adapter.native,
+            "get_tensor_model_parallel_rank",
+            lambda rank=tp_rank: rank,
+        )
+
+        output = _tp_routing_proxy(monkeypatch, tp_size)(_tokens(1))
+
+        assert output.shape == (1, ROUTING_HIDDEN_SIZE)
+    unrouted = [
+        bool((event[3]["topk_ids"] == adapter.UNROUTED_EXPERT_ID).all())
+        for event in events
+        if event[0] == "send"
+    ]
+    assert unrouted == [False, True, True, True]

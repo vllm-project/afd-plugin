@@ -20,6 +20,7 @@ def test_gpu_runtime_exports_only_mrv2_attention_and_connector_ffn():
         "AFDAttentionModelRunnerV2",
         "AFDFFNWorker",
         "GPUFFNModelRunner",
+        "GPUFFNRoutedExpertsModelRunner",
     }
 
 

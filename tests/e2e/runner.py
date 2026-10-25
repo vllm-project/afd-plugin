@@ -67,6 +67,22 @@ V2_SCENARIOS = (
     "afd-v2-eager-dbo-dp2",
     "afd-v2-graph-dbo-dp2",
 )
+# DeepEP M2N routes on Attention (gate and top-k there) and dispatches each
+# token straight to the FFN ranks owning its experts.
+DEEPEP_M2N_CONNECTOR = "DeepEPM2NAFDConnector"
+DEEPEP_M2N_SCENARIOS = (
+    "afd-deepep-m2n-eager-2a2f",
+    "afd-deepep-m2n-graph-2a2f",
+    "afd-deepep-m2n-graph-dbo-2a2f",
+    "afd-deepep-m2n-eager-tp2-2a2f",
+    "afd-deepep-m2n-graph-tp2-2a2f",
+)
+# Attention runs DP1 x TP2: each TP rank dispatches its slice of the tokens.
+# FFN stays DP2 x TP1 (experts are not TP-sharded under DeepEP M2N).
+DEEPEP_M2N_ATTENTION_TP_SCENARIOS = frozenset(
+    ("afd-deepep-m2n-eager-tp2-2a2f", "afd-deepep-m2n-graph-tp2-2a2f"),
+)
+DEEPEP_M2N_ATTENTION_TP_SIZE = 2
 V2_DBO_COMPARISON_SCENARIOS = frozenset(
     ("afd-v2-eager-dp2", "afd-v2-eager-dbo-dp2", "afd-v2-graph-dbo-dp2"),
 )
@@ -327,6 +343,7 @@ def parse_args() -> argparse.Namespace:
             ASYNC_UBATCH_SCENARIO,
             *DSV4_SCENARIOS,
             *V2_SCENARIOS,
+            *DEEPEP_M2N_SCENARIOS,
         ],
         required=True,
         help="Fixed E2E scenario to run.",
@@ -477,6 +494,11 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-v2-graph-tp2": (False, True, False, 2, 2),
         "afd-v2-eager-dbo-dp2": (False, False, True, 2, 2),
         "afd-v2-graph-dbo-dp2": (False, True, True, 2, 2),
+        "afd-deepep-m2n-eager-2a2f": (False, False, False, 2, 2),
+        "afd-deepep-m2n-graph-2a2f": (False, True, False, 2, 2),
+        "afd-deepep-m2n-graph-dbo-2a2f": (False, True, True, 2, 2),
+        "afd-deepep-m2n-eager-tp2-2a2f": (False, False, False, 2, 2),
+        "afd-deepep-m2n-graph-tp2-2a2f": (False, True, False, 2, 2),
     }
     for sync_scenario, sync_profile in DSV4_SYNC_SHAPES.items():
         # The A5 script's native DBO stays off for these scenarios: a split batch
@@ -509,6 +531,8 @@ def configure_scenario(args: argparse.Namespace) -> None:
         args.attention_tp_size = ASYNC_UBATCH_ATTENTION_TP_SIZE
     elif args.scenario in V2_TENSOR_PARALLEL_SCENARIOS:
         args.attention_tp_size = 2
+    elif args.scenario in DEEPEP_M2N_ATTENTION_TP_SCENARIOS:
+        args.attention_tp_size = DEEPEP_M2N_ATTENTION_TP_SIZE
     else:
         args.attention_tp_size = 1
     if args.scenario in V2_TENSOR_PARALLEL_SCENARIOS:
@@ -556,6 +580,9 @@ def configure_scenario(args: argparse.Namespace) -> None:
             for arg in args.common_vllm_arg
         ):
             args.common_vllm_arg.extend(["--gpu-memory-utilization", "0.8"])
+    if args.scenario in DEEPEP_M2N_SCENARIOS:
+        args.afd_connector = DEEPEP_M2N_CONNECTOR
+        args.compute_gate_on_attention = True
     if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
         dsv4_config.configure_scenario(args)
     elif args.scenario in DSV4_SYNC_CAMP2P_SCENARIOS:
@@ -607,6 +634,8 @@ def validate_topology(
         return
     if args.scenario in V2_SCENARIOS and args.device_backend != "gpu":
         raise ValueError("ModelRunnerV2 E2E scenarios require GPU")
+    if args.scenario in DEEPEP_M2N_SCENARIOS and args.device_backend != "gpu":
+        raise ValueError("DeepEP M2N E2E scenarios require GPU")
     if (
         args.scenario in (ASYNC_CAM_SCENARIO, ASYNC_UBATCH_SCENARIO)
         and args.device_backend != "npu"
