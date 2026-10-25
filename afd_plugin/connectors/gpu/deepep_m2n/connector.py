@@ -40,12 +40,12 @@ Control plane:
     payload to every FFN rank over the AFD world's NCCL group.
 
 Transport:
-    Dispatch and combine run on afdEP's DeepEP-derived ``ElasticBuffer``
-    (https://github.com/ms-llmd/afdEP). By default it runs afdEP's AFD role
-    path: Attention ranks only send in dispatch and only receive in combine,
-    FFN ranks the reverse. It removes Masked DeepEP's entry barriers, union
-    count exchange and all-rank exits, and sizes buffers and kernels by role.
-    ``role_aware: false`` keeps afdEP's Masked DeepEP protocol for comparison.
+    Dispatch and combine run on afdEP-comm's DeepEP-derived ``ElasticBuffer``
+    (https://github.com/afdEP/afdEP-comm): Attention ranks only send in
+    dispatch and only receive in combine, FFN ranks the reverse. Compared with
+    FastAFD's DeepEP M2N (DeepEP V2 over one symmetric group with dummy expert
+    slots on Attention ranks), it drops the entry barriers, the all-rank count
+    exchange and exits, and sizes buffers and kernels by role.
 
 Scope: BF16 or FP8 (block-128, fp32 scales) payload; eager, ``torch.compile``
 (dispatch/combine are custom ops) and CUDA graphs; up to two lanes (DBO);
@@ -191,9 +191,6 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             (handshake, DeepEP communicator bootstrap, per-step control
             payload). ``gloo`` keeps it off the GPUs and the RDMA NICs, so
             DeepEP's communicator is the only RDMA user.
-        role_aware: Run afdEP's AFD role path (the default). ``False`` runs its
-            Masked DeepEP protocol. Every rank must use the same value; afdEP
-            rejects a mismatch when the buffers are created.
     """
 
     capacity_tokens_per_rank: int | None = None
@@ -209,7 +206,6 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
     gpu_timeout_s: int = DEFAULT_TIMEOUT_S
     cpu_sync_min_tokens: int = 0
     control_backend: str = "nccl"
-    role_aware: bool = True
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> DeepEPM2NConfig:
@@ -249,8 +245,6 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             raise ValueError("cpu_timeout_s and gpu_timeout_s must be positive")
         if self.control_backend not in CONTROL_BACKENDS:
             raise ValueError(f"control_backend must be one of {CONTROL_BACKENDS}")
-        if type(self.role_aware) is not bool:
-            raise ValueError("role_aware must be a boolean")
 
     def to_mapping(self) -> dict[str, Any]:
         return {**asdict(self), "network": self.network.to_mapping()}
@@ -1177,11 +1171,9 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self._initialized = True
 
     def _new_buffer(self, **kwargs: Any) -> ElasticBuffer:
-        """One lane's afdEP transport."""
-        # The DeepEP M2N layout puts FFN ranks first, as afdEP's role path expects.
-        return ElasticBuffer(
-            **kwargs, role_aware=self.config.role_aware, ffn_ranks=self.ffn_size
-        )
+        """One lane's afdEP-comm transport."""
+        # The DeepEP M2N layout puts FFN ranks first, as afdEP-comm expects.
+        return ElasticBuffer(**kwargs, ffn_ranks=self.ffn_size)
 
     def close(self) -> None:
         """Destroy DeepEP buffers; safe after partial init and on repeat calls."""

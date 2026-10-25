@@ -153,21 +153,17 @@ def test_connector_is_registered():
 
 
 def test_config_defaults_and_round_trip():
-    """An empty config gives DeepGEMM experts, a BF16 payload and afdEP's role
-    path, and the config survives to_mapping/from_mapping unchanged.
+    """An empty config gives DeepGEMM experts and a BF16 payload, and the config
+    survives to_mapping/from_mapping unchanged.
 
     Why: defaults are what deployments get, and the handshake compares
     serialized configs.
     """
     config = DeepEPM2NConfig.from_mapping(None)
-    masked = DeepEPM2NConfig.from_mapping({"role_aware": False})
 
     assert config.expert_backend == "deepgemm"
     assert config.payload_format == "bf16"
-    assert config.role_aware is True
-    assert masked.role_aware is False
     assert DeepEPM2NConfig.from_mapping(config.to_mapping()) == config
-    assert DeepEPM2NConfig.from_mapping(masked.to_mapping()) == masked
 
 
 @pytest.mark.parametrize(
@@ -188,14 +184,14 @@ def test_config_defaults_and_round_trip():
         ({"expert_num_sms": -2}, "expert_num_sms"),
         ({"expert_num_sms": 131}, "expert_num_sms"),
         ({"cpu_timeout_s": 0}, "cpu_timeout_s"),
-        ({"role_aware": "true"}, "role_aware must be a boolean"),
-        ({"role_aware": 1}, "role_aware must be a boolean"),
+        # afdEP-comm removed the switch: the transport is always role-specialized.
+        ({"role_aware": False}, "unknown DeepEPM2NAFDConnector options.*role_aware"),
     ],
 )
 def test_config_rejects_invalid_options(raw, message):
     """Each bad or stale option (unknown or removed key, bad enum, zero or
-    negative size, bad network preset, bad timeout, non-boolean protocol
-    switch) raises a ValueError naming the field.
+    negative size, bad network preset, bad timeout) raises a ValueError
+    naming the field.
 
     Why: typos and removed keys must fail at startup, not be ignored.
     """
@@ -1186,24 +1182,17 @@ def test_attention_init_rejects_local_experts_before_communicating():
 
 
 @pytest.mark.parametrize(("role", "role_rank"), [("attention", 2), ("ffn", 1)])
-@pytest.mark.parametrize("role_aware", [True, False])
-def test_lane_transport_is_afdep_with_the_protocol_and_ffn_rank_count(
-    monkeypatch, role, role_rank, role_aware
+def test_lane_transport_is_afdep_comm_with_the_ffn_rank_count(
+    monkeypatch, role, role_rank
 ):
-    """Each lane's transport is afdEP's ``ElasticBuffer``, built with the
-    selected protocol and the FFN rank count; the DeepEP M2N arguments pass
-    through unchanged.
+    """Each lane's transport is afdEP-comm's ``ElasticBuffer``, built with the
+    FFN rank count; the DeepEP M2N arguments pass through unchanged.
 
-    Why: afdEP's role path needs the FFN-first rank split, and every rank must
-    request the same protocol.
+    Why: ``ffn_ranks`` selects afdEP-comm's AFD transport (without it the
+    buffer is unspecialized DeepEP V2), and it needs the FFN-first rank split.
     """
     monkeypatch.setattr(connector_module, "ElasticBuffer", FakeElasticBuffer)
-    connector = _connector(
-        role,
-        role_rank,
-        M2NTopology(ffn_size=2, attn_size=3),
-        {"role_aware": role_aware},
-    )
+    connector = _connector(role, role_rank, M2NTopology(ffn_size=2, attn_size=3), {})
 
     buffer = connector._new_buffer(capacity_tokens_per_rank=64, top_k=4)
 
@@ -1211,9 +1200,9 @@ def test_lane_transport_is_afdep_with_the_protocol_and_ffn_rank_count(
     assert buffer.kwargs == {
         "capacity_tokens_per_rank": 64,
         "top_k": 4,
-        "role_aware": role_aware,
         "ffn_ranks": 2,
     }
+
 
 
 def test_attention_ops_take_the_stage_from_the_live_dbo_micro_batch(monkeypatch):

@@ -28,9 +28,9 @@ wheels = [
 ]
 
 [[package]]
-name = "afdep"
-version = "1.0.0.dev0"
-source = { git = "https://github.com/ms-llmd/afdEP.git?rev=e763e3189398beda24f592d2117e6ade135b0a7f#e763e3189398beda24f592d2117e6ade135b0a7f" }
+name = "afdep-comm"
+version = "1.1.0"
+source = { git = "https://github.com/afdEP/afdEP-comm.git?rev=2b74d574e9d25cc794de8d2359f815fcfb48955a#2b74d574e9d25cc794de8d2359f815fcfb48955a" }
 dependencies = [
     { name = "ninja" },
     { name = "packaging" },
@@ -5853,7 +5853,7 @@ source = { editable = "." }
 
 [package.optional-dependencies]
 afdep = [
-    { name = "afdep" },
+    { name = "afdep-comm" },
 ]
 vllm = [
     { name = "vllm" },
@@ -5875,7 +5875,7 @@ e2e-tests = [
 
 [package.metadata]
 requires-dist = [
-    { name = "afdep", marker = "extra == 'afdep'", git = "https://github.com/ms-llmd/afdEP.git?rev=e763e3189398beda24f592d2117e6ade135b0a7f" },
+    { name = "afdep-comm", marker = "extra == 'afdep'", git = "https://github.com/afdEP/afdEP-comm.git?rev=2b74d574e9d25cc794de8d2359f815fcfb48955a" },
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.30.0" },
 ]
 provides-extras = ["vllm", "afdep"]
