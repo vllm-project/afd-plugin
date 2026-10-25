@@ -56,7 +56,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-10-20
+last_reviewed: 2026-10-26
 ---
 
 # FFN runtime

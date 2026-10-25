@@ -213,9 +213,24 @@ EOS or independent hot restart. It is a finite integration and next-token
 correctness check, not a whole-model accuracy benchmark or a throughput/TTFT
 qualification.
 
-That result predates retained compute-group ownership. Changes to the platform
-environment require the affected real-model execution and exit paths to be
-requalified; older component results only carry forward where applicable.
+The adapter/environment revision at `9151609` requalified the affected execution
+and exit paths with the same original checkpoint and finite workload. All nine
+business token IDs, generated-token log probabilities and top-5 log
+probabilities again matched the mature reference exactly. All 12 A workers
+completed real DBO, and all four F ranks executed all 43 layers in FULL/two-stream
+mode. The F-only EP4 group and separate CAM16 group coexisted at readiness;
+the same native routed modules, expert-map managers and quantizers remained
+reachable through the failed/pending boundary. Each layer retained 64 local
+experts. Native CPU binding produced the intended F-thread affinities.
+
+The F-first functional teardown produced peer-error logs on Attention after
+the successful requests. All four F ranks retained owners and exited nonzero;
+whole-pair isolation left no owned or NPU processes. Attention's final zero
+exit code does not establish graceful teardown or successful drain. The CPU
+service suite passed 65 cases, including the actual injected host/backend
+interface and 12 real subprocess isolation cases. Applicable native numerical
+and pinned-stack qualification above was reused without rebuilding operators
+or rerunning unrelated model accuracy evaluations.
 
 Profiling-management APIs, cancellable receive, a uniform bounded-exit
 contract, migration of other connectors and independent A/F dependency pins
@@ -226,3 +241,51 @@ length, explicit prefix-cache disablement and runtime warmup comparable.
 Report batch elapsed time and mean/tail TTFT separately. Historical results
 for the separate FaaS transport are not measurements of this backend. This
 architecture change does not promise a speedup over the mature CAM backend.
+
+## Clean whole-service prefill comparison
+
+The candidate at `9151609` was compared with the mature `vllm serve` FFN
+path on the same source/common clamp fix, native binaries, original W4A8 model
+and single A3 node. Both used 12A/4F, A TP4/DP3 with native DBO, F FULL/two-stream
+(20/40 compute and 8 combine), explicit prefix-cache disablement and natural
+expert routing. Product CLIs loaded no functional observer or profiler.
+
+Each measured round replayed the same 36 requests from six six-turn sessions
+at C6, with one output token. Input lengths were 14,399–58,462 tokens
+(median 27,951.5), totaling 1,071,401 prompt tokens per round. Frozen priorities,
+dependencies, domain routing and request payloads were preserved; generated
+answers did not enter later prompts. One full workload warmup per deployment
+was excluded. The ordered blocks were A1/A2, B1/B2, B3/B4, A3/A4; both B blocks
+shared one standalone deployment.
+
+| Service / change | Batch (s) | Mean TTFT (s) | Mean of round p95 (s) |
+| --- | ---: | ---: | ---: |
+| Mature AFD | 51.301 | 7.839 | 11.814 |
+| Standalone CAM F | 50.270 | 7.875 | 11.804 |
+| Standalone vs mature | -2.01% | +0.46% | -0.09% |
+
+| Round | Service | Batch (s) | Mean TTFT (s) | Round p95 TTFT (s) |
+| --- | --- | ---: | ---: | ---: |
+| A1 | mature | 51.838 | 7.861 | 11.817 |
+| A2 | mature | 51.901 | 7.874 | 11.882 |
+| B1 | standalone | 50.484 | 7.900 | 11.823 |
+| B2 | standalone | 50.246 | 7.880 | 11.780 |
+| B3 | standalone | 50.139 | 7.885 | 11.830 |
+| B4 | standalone | 50.211 | 7.836 | 11.782 |
+| A3 | mature | 50.812 | 7.810 | 11.777 |
+| A4 | mature | 50.652 | 7.811 | 11.781 |
+
+Means above average four round metrics per arm. The p95 column is the mean
+of within-round 36-request linear percentiles, not a pooled p95. TTFT runs from
+client send start to the first generated token; dependency/admission waits are
+excluded. Batch time spans first send start to last completed stream. All
+requests succeeded and reported zero cached prompt tokens.
+
+Mature batch means drifted from 51.870 to
+50.732 s between brackets
+(-2.19%). The standalone batch advantage is therefore not a causal speedup
+claim. All three mean metrics, and their observed cross-round upper comparison
+bounds, remained below the 2% regression reference. This finite workload supports
+no material regression; four correlated rounds on one node do not establish
+universal statistical noninferiority. The measurement includes Attention and KV
+work and must not be reported as isolated FFN latency.
