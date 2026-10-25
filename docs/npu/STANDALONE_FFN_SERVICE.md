@@ -44,9 +44,9 @@ Keep the existing Attention launch and its `CAMAsyncAFDConnector` configuration.
 See the [connector guide](CAM_ASYNC_CONNECTOR_USER_GUIDE.md) and
 [eager/FULL runtime guide](ASYNC_FFN_RUNTIME.md) for its existing contract.
 It must use eager MRV2, Attention-side gating and dynamic quantization. Native
-Attention DBO is the intended existing integration contract; do not enable DBO
-on F. Real Attention with 12A/4F, A TP4/DP3 and DBO has not been qualified with
-this standalone entry point. The example below describes that intended setup.
+Attention DBO uses the existing integration contract; do not enable DBO on F.
+A finite real-model integration run has qualified 12A/4F with A TP4/DP3 and
+native DBO, plus F FULL/two-stream execution. See the validation scope below.
 
 For a single-node 12A/4F deployment, with A using logical devices 0–11 and a
 matching dispatch envelope of 2048 tokens:
@@ -58,6 +58,7 @@ afd_cam_vendor=/path/to/afd_plugin/_cann_ops_custom/vendors/afd-plugin
 ascend_native_vendor=/path/to/vllm_ascend/_cann_ops_custom/vendors/custom_transformer
 export ASCEND_CUSTOM_OPP_PATH="$ascend_native_vendor:$afd_cam_vendor${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
 export VLLM_USE_V2_MODEL_RUNNER=1
+# F-only setting: keep this unset or 0 in the Attention environment.
 export AFD_ASYNC_CAM_LAYERED_GMM=1
 export SOC_VERSION=910c
 export VLLM_PLUGINS=ascend,afd,ascend_model,ascend_model_loader,ascend_kv_connector
@@ -135,9 +136,30 @@ and exited through paired-process isolation.
 
 The [native A fixture](../../tests/npu/standalone_cam_attention.py) drives these
 independent layer inputs and can hold its communication owner for stop checks.
-This qualifies FFN/CAM behavior, not Attention, KV, HTTP inference, whole-model
-accuracy, production-topology throughput or latency. Reuse applicable existing
-qualification when the execution path is unchanged.
+This fixture qualifies FFN/CAM behavior, not Attention, KV or HTTP inference.
+Reuse applicable existing qualification when the execution path is unchanged.
+
+The additional real-model run used the original checkpoint, native Attention
+HTTP service, A TP4/DP3 with eager MRV2 and two nonempty DBO microbatches, and
+four independent F processes with FULL/two-stream execution (20 AIC/40 AIV for
+compute, 8 AIV for combine). Both comparison groups explicitly disabled prefix
+caching, used a 2048-token dispatch envelope and retained runtime warmup.
+After three warmup requests, each group processed six frozen prompts of
+14,399–14,935 tokens at concurrency six, followed by 17/31/257-token tail
+requests. Every request generated one token. The reference used the mature CAM
+FFN service and the same common clamp fix, rather than another mode of the
+standalone weight owner. All nine business-request token IDs and returned
+log probabilities matched exactly. CPU-only observers confirmed completed
+two-microbatch execution on all 12 A workers and 43-layer FULL/two-stream
+execution on all four F workers.
+
+At stop, all four standalone F ranks reported an outstanding receive with
+`resources_released=false` and failed closed; the whole paired deployment was
+then isolated. Attention exited successfully and no owned process or NPU
+process remained. This validates paired-process teardown, not normal drain,
+EOS or independent hot restart. It is a finite integration and next-token
+correctness check, not a whole-model accuracy benchmark or a throughput/TTFT
+qualification.
 
 Performance comparisons keep model/W4A8, topology, input, concurrency, output
 length, explicit prefix-cache disablement and runtime warmup comparable.
