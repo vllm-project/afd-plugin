@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 
 import torch
@@ -70,8 +71,8 @@ class AsyncCAMW4A8Executor:
         self.w13_bias = [layer.w13_bias for layer in layers]
         self.w2_bias = [layer.w2_bias for layer in layers]
         self.per_channel = first.per_channel
-        # Retain the declared model value in the static signature only.
-        # Like main, the layered operator does not apply this activation limit.
+        # The layered A8W4 epilogue applies the same pre-SwiGLU clamp as the
+        # native fused operator. Other backends retain unlimited activation.
         self.swiglu_limit = first.swiglu_limit
         self.output_dtype = first.output_dtype
         self.routed_scaling_factor = first.routed_scaling_factor
@@ -118,6 +119,10 @@ class AsyncCAMW4A8Executor:
     @staticmethod
     def _validate_layer(layer: W4A8LayerWeights) -> None:
         prefix = f"layered GMM layer {layer.layer_idx}: "
+        if not math.isfinite(layer.swiglu_limit) or layer.swiglu_limit < 0:
+            raise ValueError(prefix + "SwiGLU limit must be finite and nonnegative")
+        if layer.swiglu_limit and not layer.per_channel:
+            raise ValueError(prefix + "SwiGLU limit requires per-channel W4A8")
         if layer.w13.dim() != 3 or layer.w2.dim() != 3:
             raise ValueError(prefix + "weights must be packed [E, K, N/8] tensors")
         experts, hidden, packed_intermediate = layer.w13.shape
@@ -196,6 +201,7 @@ class AsyncCAMW4A8Executor:
             dequant_mode=0 if self.per_channel else 1,
             quant_mode=0,
             group_list_type=1,
+            swiglu_limit=self.swiglu_limit,
         )
         output = self.w2_op(
             [activation],

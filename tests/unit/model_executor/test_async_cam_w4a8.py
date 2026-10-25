@@ -128,7 +128,7 @@ def test_reject_incompatible_parameters_before_receive(operators, change, messag
     assert operators == []
 
 
-def test_nonzero_swiglu_limit_starts_without_passing_a_clamp(operators):
+def test_swiglu_limit_reaches_layered_operator(operators):
     executor = AsyncCAMW4A8Executor([replace(weights(), swiglu_limit=10.0)])
     executor(
         torch.ones(1, 32, dtype=torch.int8),
@@ -137,8 +137,26 @@ def test_nonzero_swiglu_limit_starts_without_passing_a_clamp(operators):
         torch.tensor([2, 0, 0, 1]),
     )
     assert len(operators) == 2
-    assert "clamp_value" not in operators[0][2]
-    assert "swiglu_limit" not in operators[0][2]
+    assert operators[0][2]["swiglu_limit"] == 10.0
+
+
+@pytest.mark.parametrize(
+    "limit,per_channel,message",
+    [
+        (-1.0, True, "finite and nonnegative"),
+        (float("nan"), True, "finite and nonnegative"),
+        (float("inf"), True, "finite and nonnegative"),
+        (1.0, False, "per-channel W4A8"),
+    ],
+)
+def test_invalid_swiglu_limit_rejected_before_receive(
+    operators, limit, per_channel, message
+):
+    with pytest.raises(ValueError, match=message):
+        AsyncCAMW4A8Executor(
+            [replace(weights(per_channel=per_channel), swiglu_limit=limit)]
+        )
+    assert operators == []
 
 
 def test_repeated_interleaved_layer_ids(operators):

@@ -18,6 +18,7 @@
  */
 
 #include <dlfcn.h>
+#include <cmath>
 #include <new>
 #include <memory>
 #include <unordered_map>
@@ -90,25 +91,27 @@ static aclnnStatus aclnnGroupedMatmulSwigluQuantGetWorkspaceSizeCommon(const cha
     return ACLNN_ERR_PARAM_INVALID;
 }
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-aclnnStatus aclnnGroupedMatmulSwigluQuantV2LayeredGetWorkspaceSize(
-    const aclTensor *x, const aclTensorList *allWeight, const aclTensorList *allWeightScale,
+static aclnnStatus LayeredGetWorkspaceSizeImpl(
+    const char *interfaceName, const aclTensor *x, const aclTensorList *allWeight, const aclTensorList *allWeightScale,
     const aclTensorList *allWeightAssistMatrix, const aclTensor *bias, const aclTensor *xScale,
     const aclTensor *smoothScale, const aclTensor *groupList, const aclTensor *layerIndex, int64_t dequantMode,
     int64_t dequantDtype, int64_t quantMode, int64_t groupListType, const aclIntArray *tuningConfigOptional,
-    aclTensor *output, aclTensor *outputScale, uint64_t *workspaceSize, aclOpExecutor **executor)
+    double swigluLimit, aclTensor *output, aclTensor *outputScale, uint64_t *workspaceSize, aclOpExecutor **executor)
 {
-    OP_CHECK_COMM_INPUT(workspaceSize, executor);
-    L2_DFX_PHASE_1(aclnnGroupedMatmulSwigluQuantV2Layered,
-                   DFX_IN(x, allWeight, allWeightScale, xScale, groupList, layerIndex), DFX_OUT(output, outputScale));
     CHECK_COND((output != nullptr), ACLNN_ERR_PARAM_INVALID,
                "Expected a proper Tensor but got null for argument output.");
     // layered: the layer id is validated here, against the caller's logical shape, so that both the
     // A8W4/A4W4 handler and the A8W8 fusion template are covered by one check (see CheckLayerIndex).
     CHECK_COND(CheckLayerIndex(layerIndex) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID, "Invalid layer_index.");
+    CHECK_COND(std::isfinite(swigluLimit) && swigluLimit >= 0.0, ACLNN_ERR_PARAM_INVALID,
+               "swiglu_limit must be finite and nonnegative.");
+    CHECK_COND(swigluLimit == 0.0 ||
+                   (x != nullptr && x->GetDataType() == ge::DT_INT8 && allWeight != nullptr &&
+                    allWeight->Size() > 0 &&
+                    ((*allWeight)[0]->GetDataType() == ge::DT_INT4 ||
+                     (*allWeight)[0]->GetDataType() == ge::DT_INT32) &&
+                    dequantMode == 0 && quantMode == 0),
+               ACLNN_ERR_PARAM_INVALID, "swiglu_limit requires per-channel A8W4.");
     GroupedMatmulSwigluQuantParamsBase params =
         GroupedMatmulSwigluQuantParamsBuilder::Create(x, allWeight, allWeightScale, output, outputScale)
             .SetXScale(xScale)
@@ -123,10 +126,49 @@ aclnnStatus aclnnGroupedMatmulSwigluQuantV2LayeredGetWorkspaceSize(
             .SetBias(bias)
             .SetScenario()
             .SetTuningConfig(tuningConfigOptional)
+            .SetSwigluLimit(static_cast<float>(swigluLimit))
             .Build();
 
     // Call the common interface
-    return aclnnGroupedMatmulSwigluQuantGetWorkspaceSizeCommon(__FUNCTION__, params, workspaceSize, executor);
+    return aclnnGroupedMatmulSwigluQuantGetWorkspaceSizeCommon(interfaceName, params, workspaceSize, executor);
+}
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Keep the original public ABI unlimited; clamp-aware callers use a distinct
+// symbol so mixing a new binding with an old CANN package fails at resolution.
+aclnnStatus aclnnGroupedMatmulSwigluQuantV2LayeredWithLimitGetWorkspaceSize(
+    const aclTensor *x, const aclTensorList *allWeight, const aclTensorList *allWeightScale,
+    const aclTensorList *allWeightAssistMatrix, const aclTensor *bias, const aclTensor *xScale,
+    const aclTensor *smoothScale, const aclTensor *groupList, const aclTensor *layerIndex, int64_t dequantMode,
+    int64_t dequantDtype, int64_t quantMode, int64_t groupListType, const aclIntArray *tuningConfigOptional,
+    double swigluLimit, aclTensor *output, aclTensor *outputScale, uint64_t *workspaceSize, aclOpExecutor **executor)
+{
+    OP_CHECK_COMM_INPUT(workspaceSize, executor);
+    L2_DFX_PHASE_1(aclnnGroupedMatmulSwigluQuantV2LayeredWithLimit,
+                   DFX_IN(x, allWeight, allWeightScale, xScale, groupList, layerIndex), DFX_OUT(output, outputScale));
+    return LayeredGetWorkspaceSizeImpl(
+        __FUNCTION__, x, allWeight, allWeightScale, allWeightAssistMatrix, bias, xScale, smoothScale, groupList,
+        layerIndex, dequantMode, dequantDtype, quantMode, groupListType, tuningConfigOptional,
+        swigluLimit, output, outputScale, workspaceSize, executor);
+}
+
+aclnnStatus aclnnGroupedMatmulSwigluQuantV2LayeredGetWorkspaceSize(
+    const aclTensor *x, const aclTensorList *allWeight, const aclTensorList *allWeightScale,
+    const aclTensorList *allWeightAssistMatrix, const aclTensor *bias, const aclTensor *xScale,
+    const aclTensor *smoothScale, const aclTensor *groupList, const aclTensor *layerIndex, int64_t dequantMode,
+    int64_t dequantDtype, int64_t quantMode, int64_t groupListType, const aclIntArray *tuningConfigOptional,
+    aclTensor *output, aclTensor *outputScale, uint64_t *workspaceSize, aclOpExecutor **executor)
+{
+    OP_CHECK_COMM_INPUT(workspaceSize, executor);
+    L2_DFX_PHASE_1(aclnnGroupedMatmulSwigluQuantV2Layered,
+                   DFX_IN(x, allWeight, allWeightScale, xScale, groupList, layerIndex), DFX_OUT(output, outputScale));
+    return LayeredGetWorkspaceSizeImpl(
+        __FUNCTION__, x, allWeight, allWeightScale, allWeightAssistMatrix, bias, xScale, smoothScale, groupList,
+        layerIndex, dequantMode, dequantDtype, quantMode, groupListType, tuningConfigOptional,
+        0.0, output, outputScale, workspaceSize, executor);
 }
 
 aclnnStatus aclnnGroupedMatmulSwigluQuantV2Layered(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
@@ -135,6 +177,15 @@ aclnnStatus aclnnGroupedMatmulSwigluQuantV2Layered(void *workspace, uint64_t wor
     L2_DFX_PHASE_2(aclnnGroupedMatmulSwigluQuantV2Layered);
     CHECK_COND(CommonOpExecutorRun(workspace, workspaceSize, executor, stream) == ACLNN_SUCCESS, ACLNN_ERR_INNER,
                "This is an error in GroupedMatmulSwigluQuantV2Layered launch aicore");
+    return ACLNN_SUCCESS;
+}
+
+aclnnStatus aclnnGroupedMatmulSwigluQuantV2LayeredWithLimit(
+    void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream)
+{
+    L2_DFX_PHASE_2(aclnnGroupedMatmulSwigluQuantV2LayeredWithLimit);
+    CHECK_COND(CommonOpExecutorRun(workspace, workspaceSize, executor, stream) == ACLNN_SUCCESS, ACLNN_ERR_INNER,
+               "This is an error in GroupedMatmulSwigluQuantV2LayeredWithLimit launch aicore");
     return ACLNN_SUCCESS;
 }
 

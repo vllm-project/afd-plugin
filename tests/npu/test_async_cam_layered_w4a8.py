@@ -15,10 +15,14 @@ import pytest
 pytestmark = pytest.mark.npu
 
 
-@pytest.mark.parametrize("per_channel", [True, False])
+@pytest.mark.parametrize(
+    "per_channel,swiglu_limit", [(True, 0.0), (True, 0.5), (False, 0.0)]
+)
 @pytest.mark.parametrize("counts", [(0, 0), (1, 0), (0, 7), (16, 16)])
 @pytest.mark.parametrize("layer_ids", [(0, 1), (2, 5)])
-def test_layered_w4a8_valid_rows_and_capacity_tail(per_channel, counts, layer_ids):
+def test_layered_w4a8_valid_rows_and_capacity_tail(
+    per_channel, swiglu_limit, counts, layer_ids
+):
     if os.environ.get("AFD_RUN_ASCEND_OP_RUNTIME") != "1":
         pytest.skip("requires opt-in 910C runtime")
     torch = pytest.importorskip("torch")
@@ -68,7 +72,9 @@ def test_layered_w4a8_valid_rows_and_capacity_tail(per_channel, counts, layer_id
         w13, s13, b13, ref13 = make_weight(hidden, 2 * intermediate, factor, True)
         w2, s2, b2, ref2 = make_weight(intermediate, hidden, factor, False)
         layers.append(
-            W4A8LayerWeights(idx, w13, w2, s13, s2, b13, b2, per_channel, 0.0, 1.0)
+            W4A8LayerWeights(
+                idx, w13, w2, s13, s2, b13, b2, per_channel, swiglu_limit, 1.0
+            )
         )
         reference.append((ref13, ref2))
     executor = AsyncCAMW4A8Executor(layers)
@@ -97,6 +103,9 @@ def test_layered_w4a8_valid_rows_and_capacity_tail(per_channel, counts, layer_id
                 * x_scale[offset : offset + count, None]
             )
             gate, up = (activation @ w13[expert]).chunk(2, dim=-1)
+            if swiglu_limit:
+                gate = gate.clamp(max=swiglu_limit)
+                up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
             swiglu = torch.nn.functional.silu(gate) * up
             scale = swiglu.abs().amax(dim=-1).clamp_min(1e-12) / 127
             quantized = (swiglu / scale[:, None]).round().clamp(-127, 127)

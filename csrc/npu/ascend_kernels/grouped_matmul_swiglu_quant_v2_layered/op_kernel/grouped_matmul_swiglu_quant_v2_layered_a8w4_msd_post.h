@@ -226,6 +226,17 @@ __aicore__ inline void GMMA8W4PostProcess::Swiglu(uint32_t loopIdx, VecConfig &v
         _inMMLocal[loopIdx * gmmSwigluQuantV2->tokenLen + gmmSwigluQuantV2->tokenLen / SWIGLU_REDUCE_FACTOR];
     LocalTensor<float> src1Local = _inMMLocal[loopIdx * gmmSwigluQuantV2->tokenLen];
 
+    // V4's native W4A8 contract clamps gate above and up on both sides,
+    // after FP32 MSD reconstruction and before SwiGLU/INT8 quantization.
+    const float limit = gmmSwigluQuantV2BaseParams->swigluLimit;
+    if (limit > 0.0f) {
+        const uint32_t width = gmmSwigluQuantV2->tokenLen / SWIGLU_REDUCE_FACTOR;
+        Mins(src1Local, src1Local, limit, width);
+        Mins(src0Local, src0Local, limit, width);
+        PipeBarrier<PIPE_V>();
+        Maxs(src0Local, src0Local, -limit, width);
+        PipeBarrier<PIPE_V>();
+    }
     SwiGLU<float, false>(workspaceLocal, src0Local, src1Local, beta, gmmSwigluQuantV2->tokenLen / SWIGLU_REDUCE_FACTOR);
     PipeBarrier<PIPE_V>();
     DataCopyParams repeatParams{
