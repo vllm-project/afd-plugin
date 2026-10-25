@@ -43,9 +43,10 @@ clamp-aware symbol rather than passing new arguments to an older library.
 Keep the existing Attention launch and its `CAMAsyncAFDConnector` configuration.
 See the [connector guide](CAM_ASYNC_CONNECTOR_USER_GUIDE.md) and
 [eager/FULL runtime guide](ASYNC_FFN_RUNTIME.md) for its existing contract.
-It must use eager MRV2, Attention-side gating and dynamic quantization. The
-documented native Attention DBO combination remains supported; do not enable
-DBO on F.
+It must use eager MRV2, Attention-side gating and dynamic quantization. Native
+Attention DBO is the intended existing integration contract; do not enable DBO
+on F. Real Attention with 12A/4F, A TP4/DP3 and DBO has not been qualified with
+this standalone entry point. The example below describes that intended setup.
 
 For a single-node 12A/4F deployment, with A using logical devices 0–11 and a
 matching dispatch envelope of 2048 tokens:
@@ -114,6 +115,12 @@ timeouts. An unresponsive startup also requires whole-deployment isolation.
 Stop or restart policies must account for CAM's potentially unbounded DR. A
 host signal, an HTTP response or a completed client request does not establish
 that the next pre-submitted receive has finished.
+
+Status output, status-file writes, traceback reporting and HTTP cleanup are
+best effort. Their exceptions cannot bypass the final unsafe-session exit.
+If resource release cannot be confirmed, the CLI fails closed and retains its
+runner/backend owners until process isolation. Confirmed release permits
+normal interpreter shutdown; diagnostic failures still return a nonzero code.
 
 ## Validation and performance reporting
 

@@ -10,12 +10,19 @@ import os
 import signal
 import sys
 import traceback
+from contextlib import suppress
 from pathlib import Path
 
 from afd_plugin.ffn_faas.runner import FFNModelRunner
 from afd_plugin.ffn_faas.service import FFNService
 from afd_plugin.ffn_faas.settings import FFNConfig
 from afd_plugin.ffn_faas.v4_model import V4CheckpointDescription
+
+
+def _report_exception() -> None:
+    """Diagnostics must not choose how an unsafe native session exits."""
+    with suppress(BaseException):
+        traceback.print_exc()
 
 
 def main() -> int:
@@ -103,26 +110,44 @@ def main() -> int:
     )
     runner = FFNModelRunner(service, checkpoint, settings)
     code = 0
+    resources_released = False
     try:
-        runner.run()
-    except BaseException:
-        traceback.print_exc()
-        code = 1
+        try:
+            runner.run()
+        except BaseException:
+            code = 1
+            _report_exception()
+        try:
+            snapshot = service.snapshot()
+            # Capture the release proof before fallible reporting. If querying
+            # it fails, retain the conservative default through finalization.
+            resources_released = snapshot["resources_released"] is True
+            status = json.dumps(snapshot, indent=2) + "\n"
+            print(status, flush=True)
+            if args.status_file is not None:
+                args.status_file.parent.mkdir(parents=True, exist_ok=True)
+                args.status_file.with_name(
+                    f"{args.status_file.stem}-rank-{rank}.json"
+                ).write_text(status)
+        except BaseException:
+            code = 1
+            _report_exception()
+        finally:
+            try:
+                service.close_http()
+            except BaseException:
+                code = 1
+                _report_exception()
     finally:
-        status = json.dumps(service.snapshot(), indent=2) + "\n"
-        print(status, flush=True)
-        if args.status_file is not None:
-            args.status_file.parent.mkdir(parents=True, exist_ok=True)
-            args.status_file.with_name(
-                f"{args.status_file.stem}-rank-{rank}.json"
-            ).write_text(status)
-        service.close_http()
-    if not service.snapshot()["resources_released"]:
-        # Process isolation, not Python destructors, owns a failed/pending CAM
-        # session. All backend owners remain reachable through runner here.
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(code or 1)
+        if not resources_released:
+            # Keep runner/backend owners reachable until process isolation,
+            # even if status writes, tracebacks, HTTP close or flush fail.
+            try:
+                for stream in (sys.stdout, sys.stderr):
+                    with suppress(BaseException):
+                        stream.flush()
+            finally:
+                os._exit(code or 1)
     return code
 
 

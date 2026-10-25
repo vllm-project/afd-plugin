@@ -4,9 +4,14 @@
 
 from __future__ import annotations
 
+import atexit
 import json
+import os
+import sys
 import threading
+from contextlib import ExitStack
 from pathlib import Path
+from unittest.mock import patch
 
 from afd_plugin.ffn_faas.service import FFNService, ServicePhase
 
@@ -91,3 +96,91 @@ class HostBackend:
         if not self.finished.is_set():
             raise RuntimeError("host receiver has not exited")
         self.released = True
+
+
+def run_cli_host_case(model: str, marker: str, fault: str, released: bool) -> int:
+    """Run the real CLI exit path in a child; no native backend is constructed.
+
+    The atexit marker distinguishes normal interpreter teardown from os._exit.
+    Faults start only after the host-only runner has reported its outcome.
+    """
+    from afd_plugin.ffn_faas import __main__ as cli
+
+    atexit.register(lambda: Path(marker).write_text("ordinary shutdown"))
+    os.environ.update(
+        RANK="0",
+        LOCAL_RANK="0",
+        WORLD_SIZE="1",
+        LOCAL_WORLD_SIZE="1",
+        VLLM_USE_V2_MODEL_RUNNER="1",
+        AFD_ASYNC_CAM_LAYERED_GMM="1",
+    )
+    args = [
+        "ffn_faas",
+        "serve",
+        model,
+        "--attention-ranks",
+        "1",
+        "--attention-tp",
+        "1",
+        "--ffn-ranks",
+        "1",
+        "--status-port",
+        "0",
+    ]
+    if fault == "status_file":
+        blocked = Path(marker).with_name("blocked-parent")
+        blocked.write_text("not a directory")
+        args += ["--status-file", str(blocked / "status.json")]
+
+    with ExitStack() as patches:
+
+        class FailedOutput:
+            def __init__(self, original, operation):
+                self.original, self.operation = original, operation
+
+            def write(self, text):
+                if self.operation == "write":
+                    raise BrokenPipeError("host-only reporting fault")
+                return self.original.write(text)
+
+            def flush(self):
+                if self.operation == "flush":
+                    raise BrokenPipeError("host-only flush fault")
+                return self.original.flush()
+
+        class HostService(FFNService):
+            def snapshot(self) -> dict[str, str | int | bool]:
+                if fault == "snapshot":
+                    raise OSError("host-only snapshot fault")
+                return super().snapshot()
+
+            def close_http(self) -> None:
+                super().close_http()
+                if fault == "close_http":
+                    raise OSError("host-only HTTP close fault")
+
+        class HostRunner:
+            def __init__(self, service, checkpoint, settings):
+                self.service = service
+
+            def run(self):
+                if released:
+                    self.service.phase(ServicePhase.STOPPED, resources_released=True)
+                else:
+                    self.service.phase(ServicePhase.FAILED, error="host-only failure")
+                if fault.startswith(("stdout_", "stderr_")):
+                    stream_name, operation = fault.split("_", 1)
+                    original = sys.stdout if stream_name == "stdout" else sys.stderr
+                    patches.enter_context(
+                        patch.object(
+                            sys, stream_name, FailedOutput(original, operation)
+                        )
+                    )
+                if not released and fault != "returned_unreleased":
+                    raise RuntimeError("host-only unreleased session")
+
+        patches.enter_context(patch.object(cli, "FFNService", HostService))
+        patches.enter_context(patch.object(cli, "FFNModelRunner", HostRunner))
+        patches.enter_context(patch.object(sys, "argv", args))
+        return cli.main()
