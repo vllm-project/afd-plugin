@@ -1112,22 +1112,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         )
         try:
             for _ in range(self.num_lanes):
-                self.lanes.append(
-                    self._new_buffer(
-                        group=self.bootstrap_group,
-                        capacity_tokens_per_rank=self.capacity_tokens_per_rank,
-                        hidden_size=self.hidden_size,
-                        num_experts=self.layout.deepep_num_experts,
-                        top_k=self.top_k,
-                        allow_hybrid_mode=self.network_plan.hybrid,
-                        use_fp8_dispatch=self.is_fp8_payload,
-                        num_sms=self.config.num_sms,
-                        num_qps=self.config.num_qps,
-                        rdma_traffic_class=self.network_plan.rdma_traffic_class,
-                        cpu_timeout_s=self.config.cpu_timeout_s,
-                        gpu_timeout_s=self.config.gpu_timeout_s,
-                    )
-                )
+                self.lanes.append(self._new_lane())
                 # One lane runs on the caller's stream: no fork/join cost.
                 if self.num_lanes > 1:
                     self.lane_streams.append(torch.cuda.Stream(self.device))
@@ -1146,10 +1131,26 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         _CONNECTORS[self._op_id] = self
         self._initialized = True
 
-    def _new_buffer(self, **kwargs: Any) -> ElasticBuffer:
+    def _new_lane(self) -> ElasticBuffer:
         """One lane's afdEP-comm transport."""
-        # The DeepEP M2N layout puts FFN ranks first, as afdEP-comm expects.
-        return ElasticBuffer(**kwargs, ffn_ranks=self.ffn_size)
+        assert self.bootstrap_group is not None and self.network_plan is not None
+        assert self.capacity_tokens_per_rank is not None
+        return ElasticBuffer(
+            group=self.bootstrap_group,
+            capacity_tokens_per_rank=self.capacity_tokens_per_rank,
+            hidden_size=self.hidden_size,
+            num_experts=self.layout.deepep_num_experts,
+            top_k=self.top_k,
+            allow_hybrid_mode=self.network_plan.hybrid,
+            use_fp8_dispatch=self.is_fp8_payload,
+            num_sms=self.config.num_sms,
+            num_qps=self.config.num_qps,
+            rdma_traffic_class=self.network_plan.rdma_traffic_class,
+            cpu_timeout_s=self.config.cpu_timeout_s,
+            gpu_timeout_s=self.config.gpu_timeout_s,
+            # The DeepEP M2N layout puts FFN ranks first, as afdEP-comm expects.
+            ffn_ranks=self.ffn_size,
+        )
 
     def close(self) -> None:
         """Destroy DeepEP buffers; safe after partial init and on repeat calls."""

@@ -1184,23 +1184,25 @@ def test_attention_init_rejects_local_experts_before_communicating():
 def test_lane_transport_is_afdep_comm_with_the_ffn_rank_count(
     monkeypatch, role, role_rank
 ):
-    """Each lane's transport is afdEP-comm's ``ElasticBuffer``, built with the
-    FFN rank count; the DeepEP M2N arguments pass through unchanged.
+    """Each lane's transport is afdEP-comm's ``ElasticBuffer``, built with every
+    argument its constructor requires and the FFN rank count.
 
     Why: ``ffn_ranks`` selects afdEP-comm's AFD transport (without it the
-    buffer is unspecialized DeepEP V2), and it needs the FFN-first rank split.
+    buffer is unspecialized DeepEP V2), and the stand-in fails on any argument
+    set the real constructor would refuse.
     """
     monkeypatch.setattr(connector_module, "ElasticBuffer", FakeElasticBuffer)
     connector = _connector(role, role_rank, M2NTopology(ffn_size=2, attn_size=3), {})
+    connector.bootstrap_group = SimpleNamespace()
+    connector.network_plan = SimpleNamespace(hybrid=True, rdma_traffic_class=0)
+    connector.capacity_tokens_per_rank = 64
 
-    buffer = connector._new_buffer(capacity_tokens_per_rank=64, top_k=4)
+    buffer = connector._new_lane()
 
     assert isinstance(buffer, FakeElasticBuffer)
-    assert buffer.kwargs == {
-        "capacity_tokens_per_rank": 64,
-        "top_k": 4,
-        "ffn_ranks": 2,
-    }
+    assert buffer.kwargs["ffn_ranks"] == 2
+    assert buffer.kwargs["capacity_tokens_per_rank"] == 64
+    assert buffer.kwargs["allow_hybrid_mode"] is True
 
 
 def test_attention_ops_take_the_stage_from_the_live_dbo_micro_batch(monkeypatch):
