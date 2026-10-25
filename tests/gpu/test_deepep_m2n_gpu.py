@@ -158,21 +158,6 @@ def test_transport_with_fused_experts_backend(payload_format, tmp_path):
 
 
 @pytest.mark.parametrize("payload_format", PAYLOADS, ids=["bf16", "fp8"])
-def test_transport_with_masked_protocol(payload_format, tmp_path):
-    """Standard cases on 2F2A with ``role_aware: false``: afdEP's Masked DeepEP
-    protocol instead of its AFD role path.
-
-    Why: the masked protocol is the comparison baseline for the role path and
-    must stay correct on its own.
-    """
-    _run(
-        M2NTopology(2, 2),
-        {"role_aware": False, "payload_format": payload_format},
-        tmp_path,
-    )
-
-
-@pytest.mark.parametrize("payload_format", PAYLOADS, ids=["bf16", "fp8"])
 def test_hot_ffn_rank_routing(payload_format, tmp_path):
     """Standard cases with every top-k choice on FFN rank 0's experts: rank 0
     receives every token ``top_k`` times, rank 1 receives nothing.

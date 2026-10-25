@@ -19,8 +19,7 @@ expert groups are quantized but never read by combine.
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
+from vllm.triton_utils import tl, triton
 
 from afd_plugin.connectors.routed_experts import FP8_DTYPE
 

@@ -43,7 +43,6 @@ from afd_plugin.connectors.gpu.deepep_m2n.connector import (  # noqa: E402
     tokens_per_attention_rank,
     validate_handshake,
     validate_model_infos,
-    worst_case_receive_rows,
 )
 from afd_plugin.connectors.gpu.deepep_m2n.experts import (  # noqa: E402
     expert_row_ranges,
@@ -153,21 +152,17 @@ def test_connector_is_registered():
 
 
 def test_config_defaults_and_round_trip():
-    """An empty config gives DeepGEMM experts, a BF16 payload and afdEP's role
-    path, and the config survives to_mapping/from_mapping unchanged.
+    """An empty config gives DeepGEMM experts and a BF16 payload, and the config
+    survives to_mapping/from_mapping unchanged.
 
     Why: defaults are what deployments get, and the handshake compares
     serialized configs.
     """
     config = DeepEPM2NConfig.from_mapping(None)
-    masked = DeepEPM2NConfig.from_mapping({"role_aware": False})
 
     assert config.expert_backend == "deepgemm"
     assert config.payload_format == "bf16"
-    assert config.role_aware is True
-    assert masked.role_aware is False
     assert DeepEPM2NConfig.from_mapping(config.to_mapping()) == config
-    assert DeepEPM2NConfig.from_mapping(masked.to_mapping()) == masked
 
 
 @pytest.mark.parametrize(
@@ -188,14 +183,14 @@ def test_config_defaults_and_round_trip():
         ({"expert_num_sms": -2}, "expert_num_sms"),
         ({"expert_num_sms": 131}, "expert_num_sms"),
         ({"cpu_timeout_s": 0}, "cpu_timeout_s"),
-        ({"role_aware": "true"}, "role_aware must be a boolean"),
-        ({"role_aware": 1}, "role_aware must be a boolean"),
+        # afdEP-comm removed the switch: the transport is always role-specialized.
+        ({"role_aware": False}, "unknown DeepEPM2NAFDConnector options.*role_aware"),
     ],
 )
 def test_config_rejects_invalid_options(raw, message):
     """Each bad or stale option (unknown or removed key, bad enum, zero or
-    negative size, bad network preset, bad timeout, non-boolean protocol
-    switch) raises a ValueError naming the field.
+    negative size, bad network preset, bad timeout) raises a ValueError
+    naming the field.
 
     Why: typos and removed keys must fail at startup, not be ignored.
     """
@@ -1186,34 +1181,28 @@ def test_attention_init_rejects_local_experts_before_communicating():
 
 
 @pytest.mark.parametrize(("role", "role_rank"), [("attention", 2), ("ffn", 1)])
-@pytest.mark.parametrize("role_aware", [True, False])
-def test_lane_transport_is_afdep_with_the_protocol_and_ffn_rank_count(
-    monkeypatch, role, role_rank, role_aware
+def test_lane_transport_is_afdep_comm_with_the_ffn_rank_count(
+    monkeypatch, role, role_rank
 ):
-    """Each lane's transport is afdEP's ``ElasticBuffer``, built with the
-    selected protocol and the FFN rank count; the DeepEP M2N arguments pass
-    through unchanged.
+    """Each lane's transport is afdEP-comm's ``ElasticBuffer``, built with every
+    argument its constructor requires and the FFN rank count.
 
-    Why: afdEP's role path needs the FFN-first rank split, and every rank must
-    request the same protocol.
+    Why: ``ffn_ranks`` selects afdEP-comm's AFD transport (without it the
+    buffer is unspecialized DeepEP V2), and the stand-in fails on any argument
+    set the real constructor would refuse.
     """
     monkeypatch.setattr(connector_module, "ElasticBuffer", FakeElasticBuffer)
-    connector = _connector(
-        role,
-        role_rank,
-        M2NTopology(ffn_size=2, attn_size=3),
-        {"role_aware": role_aware},
-    )
+    connector = _connector(role, role_rank, M2NTopology(ffn_size=2, attn_size=3), {})
+    connector.bootstrap_group = SimpleNamespace()
+    connector.network_plan = SimpleNamespace(hybrid=True, rdma_traffic_class=0)
+    connector.capacity_tokens_per_rank = 64
 
-    buffer = connector._new_buffer(capacity_tokens_per_rank=64, top_k=4)
+    buffer = connector._new_lane()
 
     assert isinstance(buffer, FakeElasticBuffer)
-    assert buffer.kwargs == {
-        "capacity_tokens_per_rank": 64,
-        "top_k": 4,
-        "role_aware": role_aware,
-        "ffn_ranks": 2,
-    }
+    assert buffer.kwargs["ffn_ranks"] == 2
+    assert buffer.kwargs["capacity_tokens_per_rank"] == 64
+    assert buffer.kwargs["allow_hybrid_mode"] is True
 
 
 def test_attention_ops_take_the_stage_from_the_live_dbo_micro_batch(monkeypatch):
@@ -1263,39 +1252,6 @@ DEEPGEMM_ALIGNMENT = 128
 
 
 @pytest.mark.parametrize(
-    ("num_ranks", "bucket", "top_k", "experts_per_rank", "alignment", "expected"),
-    [
-        # Qwen3-30B 2A2F at the default capacity, and at a 512 bucket.
-        (4, 8192, 8, 64, DEEPGEMM_ALIGNMENT, 270_336),
-        (4, 512, 8, 64, DEEPGEMM_ALIGNMENT, 24_576),
-        # Qwen3-235B 4A2F at a 512 bucket.
-        (6, 512, 8, 64, DEEPGEMM_ALIGNMENT, 32_768),
-        # No alignment (fused_experts backend): exactly ranks x bucket x top-k.
-        (4, 10, 8, 64, 1, 320),
-        # A token sends at most one route per local expert.
-        (4, 10, 8, 4, 1, 160),
-    ],
-)
-def test_worst_case_receive_rows_mirrors_deepep(
-    num_ranks, bucket, top_k, experts_per_rank, alignment, expected
-):
-    """Rows match DeepEP's worst-case receive without the host sync.
-
-    Why: the Attention-side zero buffer is sized with this; too few rows
-    would fail combine, and DeepEP's formula is the contract.
-    """
-    rows = worst_case_receive_rows(
-        num_ranks=num_ranks,
-        bucket=bucket,
-        top_k=top_k,
-        experts_per_rank=experts_per_rank,
-        expert_alignment=alignment,
-    )
-
-    assert rows == expected
-
-
-@pytest.mark.parametrize(
     ("capture", "tp", "granularity", "sync_min", "capacity", "expected"),
     [
         (512, 1, 1, 0, 8192, 512),  # graph buckets only
@@ -1310,8 +1266,8 @@ def test_no_sync_bucket_limit(capture, tp, granularity, sync_min, capacity, expe
     """The largest bucket that skips the host sync: the largest graph bucket or
     the largest eager bucket below cpu_sync_min_tokens, capped by capacity.
 
-    Why: only those dispatches give an Attention rank a worst-case receive;
-    sizing the zero buffer for capacity instead would waste ~1 GiB per GPU.
+    Why: it is the ladder's top rung, and dispatches up to it give FFN ranks
+    DeepEP's worst-case receive instead of a synced count.
     """
     limit = no_sync_bucket_limit(
         capacity_tokens_per_rank=capacity,
@@ -1324,45 +1280,39 @@ def test_no_sync_bucket_limit(capture, tp, granularity, sync_min, capacity, expe
     assert limit == expected
 
 
-def test_attention_combine_zeros_cover_the_largest_no_sync_receive():
-    """Attention allocates one zero buffer for its largest no-sync receive and
-    hands combine a contiguous view of its first rows.
+class _ReceivingLane(_RecordingLane):
+    """A transport that reports receive rows, which afdEP-comm never gives an
+    Attention rank."""
 
-    Why: a cache keyed by receive shape grew without bound when eager buckets
-    skipped the sync; a fixed buffer bounds memory and keeps one address for
-    captured graphs.
+    def dispatch(self, x, x_scale, topk_ids, topk_weights, **kwargs):
+        super().dispatch(x, x_scale, topk_ids, topk_weights, **kwargs)
+        return SimpleNamespace(handle=SimpleNamespace(recv_shape=(5, M2N_HIDDEN_SIZE)))
+
+
+def test_attention_combine_rejects_receive_rows(monkeypatch):
+    """An Attention rank's combine input is empty, so a transport that reports
+    receive rows for it raises instead of combining.
+
+    Why: afdEP-comm gives Attention ranks no receive rows, with or without the
+    host sync. The worst-case zero buffer this replaces took up to ~1 GiB per
+    Attention GPU before KV-cache sizing and was never read.
     """
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
     connector = _connector(
         "attention",
         0,
         M2NTopology(ffn_size=2, attn_size=2),
-        {"capacity_tokens_per_rank": 16},
+        {"capacity_tokens_per_rank": 64},
     )
     connector.device = torch.device("cpu")
+    connector.capacity_tokens_per_rank = 64
+    connector.bucket_ladder = (8,)
     connector.expert_alignment = DEEPGEMM_ALIGNMENT
-
+    connector.lanes = [_ReceivingLane()]
     connector._allocate_combine_zeros()
 
-    # Bucket min(16, 512 capture) = 16: 4 ranks x 16 x top-k 8 + 127 x 64.
-    expected_rows = worst_case_receive_rows(
-        num_ranks=4,
-        bucket=16,
-        top_k=8,
-        experts_per_rank=64,
-        expert_alignment=DEEPGEMM_ALIGNMENT,
-    )
-    zeros = connector._combine_zeros
-    assert zeros is not None
-    assert zeros.shape == (expected_rows, M2N_HIDDEN_SIZE)
-    view = connector._combine_zero_rows((5, M2N_HIDDEN_SIZE))
-    assert view.shape == (5, M2N_HIDDEN_SIZE) and view.is_contiguous()
-    assert view.data_ptr() == zeros.data_ptr()
-    assert connector._combine_zero_rows((0, M2N_HIDDEN_SIZE)).shape == (
-        0,
-        M2N_HIDDEN_SIZE,
-    )
-    with pytest.raises(RuntimeError, match="no_sync_bucket_limit"):
-        connector._combine_zero_rows((expected_rows + 1, M2N_HIDDEN_SIZE))
+    with pytest.raises(RuntimeError, match="receive rows"):
+        connector._precompile_dispatch_kernels()
 
 
 class _LoggedEvent:

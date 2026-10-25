@@ -40,12 +40,12 @@ Control plane:
     payload to every FFN rank over the AFD world's NCCL group.
 
 Transport:
-    Dispatch and combine run on afdEP's DeepEP-derived ``ElasticBuffer``
-    (https://github.com/ms-llmd/afdEP). By default it runs afdEP's AFD role
-    path: Attention ranks only send in dispatch and only receive in combine,
-    FFN ranks the reverse. It removes Masked DeepEP's entry barriers, union
-    count exchange and all-rank exits, and sizes buffers and kernels by role.
-    ``role_aware: false`` keeps afdEP's Masked DeepEP protocol for comparison.
+    Dispatch and combine run on afdEP-comm's DeepEP-derived ``ElasticBuffer``
+    (https://github.com/afdEP/afdEP-comm): Attention ranks only send in
+    dispatch and only receive in combine, FFN ranks the reverse. Compared with
+    FastAFD's DeepEP M2N (DeepEP V2 over one symmetric group with dummy expert
+    slots on Attention ranks), it drops the entry barriers, the all-rank count
+    exchange and exits, and sizes buffers and kernels by role.
 
 Scope: BF16 or FP8 (block-128, fp32 scales) payload; eager, ``torch.compile``
 (dispatch/combine are custom ops) and CUDA graphs; up to two lanes (DBO);
@@ -182,18 +182,12 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
         cpu_timeout_s / gpu_timeout_s: DeepEP host-wait and kernel-spin
             timeouts.
         cpu_sync_min_tokens: Eager steps whose bucket is below this skip the
-            host sync that reads receive counts; they allocate the worst-case
-            receive size instead. ``0`` always syncs in eager mode. Attention
-            ranks keep a zero buffer for the largest bucket that skips the
-            sync (the top rung of ``bucket_ladder``), so raising this costs
-            memory.
+            host sync that reads receive counts; FFN ranks then allocate the
+            worst-case receive size instead. ``0`` always syncs in eager mode.
         control_backend: Backend of the connector's own process group
             (handshake, DeepEP communicator bootstrap, per-step control
             payload). ``gloo`` keeps it off the GPUs and the RDMA NICs, so
             DeepEP's communicator is the only RDMA user.
-        role_aware: Run afdEP's AFD role path (the default). ``False`` runs its
-            Masked DeepEP protocol. Every rank must use the same value; afdEP
-            rejects a mismatch when the buffers are created.
     """
 
     capacity_tokens_per_rank: int | None = None
@@ -209,7 +203,6 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
     gpu_timeout_s: int = DEFAULT_TIMEOUT_S
     cpu_sync_min_tokens: int = 0
     control_backend: str = "nccl"
-    role_aware: bool = True
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> DeepEPM2NConfig:
@@ -249,8 +242,6 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             raise ValueError("cpu_timeout_s and gpu_timeout_s must be positive")
         if self.control_backend not in CONTROL_BACKENDS:
             raise ValueError(f"control_backend must be one of {CONTROL_BACKENDS}")
-        if type(self.role_aware) is not bool:
-            raise ValueError("role_aware must be a boolean")
 
     def to_mapping(self) -> dict[str, Any]:
         return {**asdict(self), "network": self.network.to_mapping()}
@@ -436,26 +427,6 @@ def precompile_buckets(
         )
         buckets += [(rung, False) for rung in ladder if rung <= covering]
     return tuple(dict.fromkeys(buckets))
-
-
-def worst_case_receive_rows(
-    *,
-    num_ranks: int,
-    bucket: int,
-    top_k: int,
-    experts_per_rank: int,
-    expert_alignment: int,
-) -> int:
-    """Rows DeepEP allocates for one rank's receive when it skips the host sync.
-
-    Mirrors DeepEP V2's worst case for expanded receives (``ElasticBuffer``
-    non-cached dispatch without CPU sync): every rank's bucket times the routes
-    one token can send to this rank, plus alignment padding for each local
-    expert.
-    """
-    rows = num_ranks * bucket * min(top_k, experts_per_rank)
-    rows += (expert_alignment - 1) * experts_per_rank
-    return -(-rows // expert_alignment) * expert_alignment
 
 
 @dataclass(frozen=True)
@@ -1010,8 +981,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self._step_fork: torch.cuda.Event | None = None
         self._step_fork_capturing = False
         self._lanes_joined: set[int] = set()
-        # Attention side: the zero rows combine takes from Attention ranks,
-        # sized for the largest receive (see _allocate_combine_zeros).
+        # Attention side: the empty combine input (see _allocate_combine_zeros).
         self._combine_zeros: torch.Tensor | None = None
         self._op_id = next(_CONNECTOR_IDS)
         self._initialized = False
@@ -1142,22 +1112,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         )
         try:
             for _ in range(self.num_lanes):
-                self.lanes.append(
-                    self._new_buffer(
-                        group=self.bootstrap_group,
-                        capacity_tokens_per_rank=self.capacity_tokens_per_rank,
-                        hidden_size=self.hidden_size,
-                        num_experts=self.layout.deepep_num_experts,
-                        top_k=self.top_k,
-                        allow_hybrid_mode=self.network_plan.hybrid,
-                        use_fp8_dispatch=self.is_fp8_payload,
-                        num_sms=self.config.num_sms,
-                        num_qps=self.config.num_qps,
-                        rdma_traffic_class=self.network_plan.rdma_traffic_class,
-                        cpu_timeout_s=self.config.cpu_timeout_s,
-                        gpu_timeout_s=self.config.gpu_timeout_s,
-                    )
-                )
+                self.lanes.append(self._new_lane())
                 # One lane runs on the caller's stream: no fork/join cost.
                 if self.num_lanes > 1:
                     self.lane_streams.append(torch.cuda.Stream(self.device))
@@ -1176,11 +1131,25 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         _CONNECTORS[self._op_id] = self
         self._initialized = True
 
-    def _new_buffer(self, **kwargs: Any) -> ElasticBuffer:
-        """One lane's afdEP transport."""
-        # The DeepEP M2N layout puts FFN ranks first, as afdEP's role path expects.
+    def _new_lane(self) -> ElasticBuffer:
+        """One lane's afdEP-comm transport."""
+        assert self.bootstrap_group is not None and self.network_plan is not None
+        assert self.capacity_tokens_per_rank is not None
         return ElasticBuffer(
-            **kwargs, role_aware=self.config.role_aware, ffn_ranks=self.ffn_size
+            group=self.bootstrap_group,
+            capacity_tokens_per_rank=self.capacity_tokens_per_rank,
+            hidden_size=self.hidden_size,
+            num_experts=self.layout.deepep_num_experts,
+            top_k=self.top_k,
+            allow_hybrid_mode=self.network_plan.hybrid,
+            use_fp8_dispatch=self.is_fp8_payload,
+            num_sms=self.config.num_sms,
+            num_qps=self.config.num_qps,
+            rdma_traffic_class=self.network_plan.rdma_traffic_class,
+            cpu_timeout_s=self.config.cpu_timeout_s,
+            gpu_timeout_s=self.config.gpu_timeout_s,
+            # The DeepEP M2N layout puts FFN ranks first, as afdEP-comm expects.
+            ffn_ranks=self.ffn_size,
         )
 
     def close(self) -> None:
@@ -1567,24 +1536,15 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         )
 
     def _allocate_combine_zeros(self) -> None:
-        """One zero buffer for every combine on this Attention rank.
+        """The empty input every combine on this Attention rank takes.
 
-        Combine takes one zero row per row this rank received. A synced
-        dispatch gives an Attention rank no rows; a dispatch that skips the
-        sync gets DeepEP's worst case for its bucket, so the buffer covers the
-        largest such bucket. Both lanes share it (combine only reads it), and
-        captured graphs keep one stable address.
+        Combine takes one zero row per row this rank received, and afdEP-comm
+        gives Attention ranks no receive rows on any dispatch, with or without
+        the host sync. One zero-row tensor serves both lanes and keeps a
+        stable address for captured graphs.
         """
-        assert self.bucket_ladder is not None
-        rows = worst_case_receive_rows(
-            num_ranks=self.layout.union_size,
-            bucket=self.bucket_ladder[-1] if self.bucket_ladder else 0,
-            top_k=self.top_k,
-            experts_per_rank=self.layout.experts_per_rank,
-            expert_alignment=self.expert_alignment,
-        )
         self._combine_zeros = torch.zeros(
-            (rows, self.hidden_size), dtype=self.dtype, device=self.device
+            (0, self.hidden_size), dtype=self.dtype, device=self.device
         )
 
     def _combine_zero_rows(self, shape: tuple[int, int]) -> torch.Tensor:
@@ -1595,8 +1555,8 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         if rows > zeros.shape[0] or shape[1] != zeros.shape[1]:
             raise RuntimeError(
                 f"combine needs zero rows of shape {shape} but the buffer holds "
-                f"{tuple(zeros.shape)}: a dispatch skipped the host sync with a "
-                "bucket above the ladder's top rung (no_sync_bucket_limit)"
+                f"{tuple(zeros.shape)}: afdEP-comm gave an Attention rank receive "
+                "rows, which its AFD transport never does"
             )
         return zeros[:rows]
 
