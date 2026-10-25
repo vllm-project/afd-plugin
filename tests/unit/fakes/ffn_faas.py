@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import atexit
+import builtins
 import json
 import os
 import sys
@@ -13,6 +14,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
+from afd_plugin.ffn_faas.interfaces import FFNLaunch
 from afd_plugin.ffn_faas.service import FFNService, ServicePhase
 
 
@@ -95,7 +97,59 @@ class HostBackend:
     def close(self) -> None:
         if not self.finished.is_set():
             raise RuntimeError("host receiver has not exited")
+        if self.fail == "close":
+            raise RuntimeError("host-only resource release failed")
         self.released = True
+
+
+class HostPlatformAdapter:
+    """An independent CPU host contract; it has no model/device requirements."""
+
+    def add_arguments(self, parser) -> None:
+        pass
+
+    def configure(self, args) -> FFNLaunch:
+        return FFNLaunch(
+            rank=3,
+            local_rank=0,
+            model_path=str(args.model),
+            backend_name="host-contract",
+            shutdown_timeout=args.shutdown_timeout,
+            backend_factory=HostBackend,
+        )
+
+
+def run_cpu_platform(model: str, status: str) -> int:
+    """Exercise the actual service/loop with another adapter and no tensor stack."""
+    from afd_plugin.ffn_faas import __main__ as cli
+
+    original_import = builtins.__import__
+
+    def cpu_import(name, *args, **kwargs):
+        if name.split(".", 1)[0] in ("torch", "torch_npu", "vllm", "vllm_ascend"):
+            raise AssertionError(f"CPU host contract imported {name}")
+        return original_import(name, *args, **kwargs)
+
+    args = [
+        "ffn_faas",
+        "serve",
+        model,
+        "--backend",
+        "host-contract",
+        "--status-port",
+        "0",
+        "--status-file",
+        status,
+        "--shutdown-timeout",
+        "0.1",
+    ]
+    with (
+        patch.object(cli, "SUPPORTED_BACKENDS", ("host-contract",)),
+        patch.object(cli, "get_platform_adapter", lambda _: HostPlatformAdapter()),
+        patch.object(builtins, "__import__", cpu_import),
+        patch.object(sys, "argv", args),
+    ):
+        return cli.main()
 
 
 def run_cli_host_case(model: str, marker: str, fault: str, released: bool) -> int:
@@ -161,7 +215,7 @@ def run_cli_host_case(model: str, marker: str, fault: str, released: bool) -> in
                     raise OSError("host-only HTTP close fault")
 
         class HostRunner:
-            def __init__(self, service, checkpoint, settings):
+            def __init__(self, service, backend_factory, *, shutdown_timeout):
                 self.service = service
 
             def run(self):

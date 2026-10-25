@@ -31,8 +31,10 @@ from afd_plugin.connectors.metadata import (  # noqa: E402
     AFDTransferMetadata,
 )
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector  # noqa: E402
-from afd_plugin.ffn_faas.settings import FFNConfig  # noqa: E402
-from afd_plugin.ffn_faas.v4_model import V4CheckpointDescription  # noqa: E402
+from afd_plugin.ffn_faas.platforms.npu.settings import FFNConfig  # noqa: E402
+from afd_plugin.ffn_faas.platforms.npu.v4_model import (  # noqa: E402
+    V4CheckpointDescription,
+)
 
 
 def attention_config(checkpoint, settings):

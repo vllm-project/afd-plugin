@@ -2,8 +2,9 @@
 
 The standalone entry point loads DeepSeek-V4 Flash per-channel ModelSlim W4A8
 routed experts in an external F-only process group. After native loading,
-sharding and packing complete, it retires the loading groups and lends the
-original parameter tensors to the existing Async CAM runtime. It does not
+sharding and packing complete, it retains the F-local compute environment and
+native expert modules while lending their tensors to the existing Async CAM
+runtime. It does not
 construct a complete CausalLM, vLLM Worker, upstream ModelRunner, EngineCore,
 request scheduler or KV cache.
 
@@ -38,6 +39,57 @@ include adaptive tiling, W2 `.out` or a new transport. The original ACLNN entry
 point keeps its unlimited-activation ABI; the new binding resolves a distinct
 clamp-aware symbol rather than passing new arguments to an older library.
 
+## Platform and ownership boundary
+
+The CPU-only CLI, `FFNService` and host `FFNModelRunner` use the narrow
+`FFNBackend` interface in `ffn_faas/interfaces.py`. The runner accepts a backend
+factory, retains its result before native preparation, and owns the receiving
+thread and failure boundary. It does not import Ascend, a V4 model or a CAM
+runtime. Platform launch options and metadata are supplied by the selected
+adapter; CAM readiness metadata belongs to the Ascend adapter.
+
+`ffn_faas/platforms/npu/` contains the implemented `ascend-cam` adapter,
+configuration, device/compute environment, V4 checkpoint description, native
+parameter owner and CAM composition. This is a small selection seam, not a
+GPU implementation, general plugin registry or synchronous ControlPlane.
+
+```text
+CPU Service / host runner -> FFNBackend
+  Ascend CAM backend
+    AscendFFNEnvironment: device, native F-only compute groups, CPU affinity
+    V4FFNModel: native routed modules, quantizer/expert-map state, borrowed views
+    mature Async CAM runtime: A/F group, DS/DR/CS/CR, Graph and streams
+```
+
+The environment initializes the selected device before native configuration
+and establishes F-only vLLM/Ascend groups before parameter construction. Its EP
+group and the original routed modules remain resident through readiness and
+execution. CAM creates a distinct A/F process group; it does not require
+destroying the F-only groups. The environment also reuses the native Worker's
+CPU affinity policy after warmup/capture, before creating the receiving thread.
+Its physical device mapping and Engram memory-migration guard follow the
+pinned native API. Performance comparisons must record actual affinity rather
+than infer success solely from a binding option.
+
+After proven receiver completion, shutdown orders CAM/Graph release before
+native compute-group teardown, and drops the routed owner last. Any failed or
+pending native boundary retains all these owners until whole-pair isolation.
+Group initialization and teardown are no longer weight-loader side effects.
+
+Static CAM expert placement remains a constraint. Native `routed_experts`,
+their expert-map manager and quantization state are retained, but EPLB, elastic
+EP, redundant experts and dynamic EPLB views are rejected explicitly. Keeping
+their context resident does not enable relocation or elastic membership. This
+constraint belongs to the current CAM/layout integration; the removed custom
+SessionSpec/window ABI is not its justification.
+
+The parameter container declares the pinned native factory's execution-only
+keyword contract and rejects unsupported execution modules. The V4 loader
+adapter delegates to the original native loader without copying its body; its
+marked adaptation documents the required HF config, layer range/container,
+named parameters and redundant-expert count. Dependency upgrades need actual
+factory/checkpoint-loading qualification, not just unchanged version strings.
+
 ## Launch
 
 Keep the existing Attention launch and its `CAMAsyncAFDConnector` configuration.
@@ -65,7 +117,7 @@ export VLLM_PLUGINS=ascend,afd,ascend_model,ascend_model_loader,ascend_kv_connec
 # Keep BATCH_SIZE_FACTOR, HCCL/network settings and receive capacity consistent
 # with the existing A launch and CAM runtime guide.
 torchrun --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29500 \
-  -m afd_plugin.ffn_faas serve /path/to/model \
+  -m afd_plugin.ffn_faas serve /path/to/model --backend ascend-cam \
   --host 127.0.0.1 --port 29600 \
   --attention-ranks 12 --attention-tp 4 --ffn-ranks 4 \
   --devices 12,13,14,15 --max-num-batched-tokens 2048 \
@@ -79,7 +131,7 @@ When F has a restricted visibility list, use `--devices 0,1,2,3` instead. The
 external launcher's `WORLD_SIZE` is F-only. CAM creates the separate
 `[A0 ... A11, F0 ... F3]` world using the same host, port, group name, topology,
 quantization, layer table and startup signatures as traditional F. Use a
-different rendezvous port for the F-only loading group and CAM.
+different rendezvous port for the F-only compute world and CAM.
 
 `--max-num-batched-tokens` must match A's dispatch envelope; it is not the
 maximum request context length. F creates configuration objects for native
@@ -139,7 +191,7 @@ independent layer inputs and can hold its communication owner for stop checks.
 This fixture qualifies FFN/CAM behavior, not Attention, KV or HTTP inference.
 Reuse applicable existing qualification when the execution path is unchanged.
 
-The additional real-model run used the original checkpoint, native Attention
+The additional real-model run at `d136157` used the original checkpoint, native Attention
 HTTP service, A TP4/DP3 with eager MRV2 and two nonempty DBO microbatches, and
 four independent F processes with FULL/two-stream execution (20 AIC/40 AIV for
 compute, 8 AIV for combine). Both comparison groups explicitly disabled prefix
@@ -160,6 +212,14 @@ process remained. This validates paired-process teardown, not normal drain,
 EOS or independent hot restart. It is a finite integration and next-token
 correctness check, not a whole-model accuracy benchmark or a throughput/TTFT
 qualification.
+
+That result predates retained compute-group ownership. Changes to the platform
+environment require the affected real-model execution and exit paths to be
+requalified; older component results only carry forward where applicable.
+
+Profiling-management APIs, cancellable receive, a uniform bounded-exit
+contract, migration of other connectors and independent A/F dependency pins
+remain separate work. The current management API exposes no profiling control.
 
 Performance comparisons keep model/W4A8, topology, input, concurrency, output
 length, explicit prefix-cache disablement and runtime warmup comparable.

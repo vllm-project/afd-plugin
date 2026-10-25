@@ -14,13 +14,13 @@ from vllm.config import set_current_vllm_config
 from vllm.engine.arg_utils import EngineArgs
 
 from afd_plugin.compat.npu import fix_all2all_backend_for_afd
-from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+from afd_plugin.ffn_faas.platforms.npu.environment import AscendFFNEnvironment
+from afd_plugin.ffn_faas.platforms.npu.settings import FFNConfig
+from afd_plugin.ffn_faas.platforms.npu.v4_model import V4CheckpointDescription
+from afd_plugin.ffn_faas.platforms.npu.v4_runtime import V4FFNModel
 from afd_plugin.ffn_faas.service import FFNService, ServicePhase
-from afd_plugin.ffn_faas.settings import FFNConfig
-from afd_plugin.ffn_faas.v4_model import V4CheckpointDescription
-from afd_plugin.ffn_faas.v4_runtime import V4FFNModel
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 
 
@@ -31,16 +31,13 @@ class CAMFFNBackend:
         self, checkpoint: V4CheckpointDescription, settings: FFNConfig
     ) -> None:
         self.settings = settings
-        self.device = torch.device(f"npu:{settings.device}")
+        self.environment = AscendFFNEnvironment(settings)
         self.model = V4FFNModel(checkpoint, settings.ffn_ranks, settings.rank)
         self.runtime: AsyncNPUFFNModelRunner | None = None
         self.connector: CAMAsyncAFDConnector | None = None
 
     def prepare(self, service: FFNService) -> None:
-        # Install the package-local OPP path before native packing initializes
-        # GE, and fail before loading parameters if this build is unavailable.
-        ensure_cam_async_ops_available()
-        torch.npu.set_device(self.device)
+        self.environment.initialize_device()
         args = EngineArgs(
             model=str(self.settings.model),
             trust_remote_code=True,
@@ -66,9 +63,10 @@ class CAMFFNBackend:
         # this loader belongs to the already launched F-only torchrun world.
         config.parallel_config.distributed_executor_backend = "external_launcher"
         fix_all2all_backend_for_afd(config)
+        self.environment.initialize_compute(config)
         with set_current_vllm_config(config):
             self.model.load(
-                self.settings.device, config, progress=service.loading_progress
+                self.environment.device, config, progress=service.loading_progress
             )
             service.phase(
                 ServicePhase.CONNECTING,
@@ -82,17 +80,25 @@ class CAMFFNBackend:
                 afd_config=parse_afd_config(config, expected_role="ffn"),
                 role_rank=self.settings.rank,
             )
-            self.runtime = AsyncNPUFFNModelRunner(config, self.device, self.connector)
+            self.runtime = AsyncNPUFFNModelRunner(
+                config, self.environment.device, self.connector
+            )
             self.runtime.attach_model(
                 self.model, parameter_bytes=self.model.parameter_bytes
             )
             # Reuse paired signatures, warmup, capture, Graph pools and two-slot
             # ready/done/FIFO ownership from the existing CAM implementation.
             self.runtime.initialize_afd_connector()
+            self.environment.bind_host_threads(config)
+            service.phase(
+                ServicePhase.CONNECTING,
+                cam_paired=True,
+                compute_ep_world_size=self.environment.ep_group.world_size,
+            )
 
     def start_receiver(self) -> None:
         """Select the device once on the receiving thread, as the Worker does."""
-        torch.npu.set_device(self.device)
+        self.environment.activate_thread()
 
     def execute_step(self) -> None:
         assert self.runtime is not None
@@ -110,4 +116,5 @@ class CAMFFNBackend:
         # The runtime rejects pending graphs before closing CAM. Only then may
         # its borrowed parameter views and the original owner be released.
         self.runtime.shutdown()
+        self.environment.close()
         self.model.close()

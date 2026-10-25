@@ -93,6 +93,6 @@ class FFNConfig:
             },
             "enable_prefill_mc2": False,
             "enable_force_eplb": False,
-            "enable_cpu_binding": False,
+            "enable_cpu_binding": True,
             "ascend_fusion_config": {"fusion_ops_gmmswigluquant": True},
         }

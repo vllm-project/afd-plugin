@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from afd_plugin.config import connector_extra_config_from_source, parse_afd_config
-from afd_plugin.ffn_faas.settings import FFNConfig
+from afd_plugin.ffn_faas.platforms.npu.settings import FFNConfig
 
 
 @pytest.fixture

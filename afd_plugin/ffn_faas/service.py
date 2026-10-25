@@ -8,6 +8,7 @@ import json
 import os
 import threading
 import time
+from collections.abc import Mapping
 from enum import Enum
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -55,22 +56,32 @@ class StopRequest(threading.Event):
 class FFNService:
     """Own lifecycle state; one external process owns one device runner."""
 
-    def __init__(self, *, rank: int, model_path: str) -> None:
+    def __init__(
+        self,
+        *,
+        rank: int,
+        model_path: str,
+        backend_name: str = "unconfigured",
+        initial_status: Mapping[str, str | int | bool] | None = None,
+    ) -> None:
         self.stop_requested = StopRequest()
         self._lock = threading.Lock()
         self._status: dict[str, str | int | bool] = {
             "rank": rank,
             "pid": os.getpid(),
             "model_path": model_path,
-            "backend": "CAMAsyncAFDConnector",
+            "backend": backend_name,
             "phase": ServicePhase.STARTING.value,
             "completed_batches": 0,
             "model_loaded": False,
-            "cam_paired": False,
             "loaded_experts": 0,
             "total_experts": 0,
             "resources_released": False,
         }
+        if initial_status:
+            if self._status.keys() & initial_status.keys():
+                raise ValueError("backend status cannot override service-owned fields")
+            self._status.update(initial_status)
         self._server: ThreadingHTTPServer | None = None
         self._http_thread: threading.Thread | None = None
 
@@ -110,8 +121,8 @@ class FFNService:
             )
 
     def request_stop(self) -> None:
-        # CAM has no cancellable receive or EOS. This requests a host-loop stop;
-        # it does not prove that device work or the paired session has drained.
+        # Request a host-loop stop. Backend completion, not this event, must
+        # establish device quiescence before resources can be released.
         self.stop_requested.set()
         with self._lock:
             if ServicePhase(self._status["phase"]) not in TERMINAL_PHASES:

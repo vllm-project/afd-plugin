@@ -48,3 +48,8 @@ def test_signal_stop_keeps_terminal_state():
         service.phase(ServicePhase.READY)
     service.phase(ServicePhase.STOPPED, resources_released=True)
     assert service.snapshot()["phase"] == "stopped"
+
+
+def test_backend_metadata_cannot_claim_service_readiness():
+    with pytest.raises(ValueError, match="service-owned fields"):
+        FFNService(rank=0, model_path="/model", initial_status={"phase": "ready"})

@@ -2,27 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Standalone V4 parameter lifetime using the pinned native routed loader.
 
-Metadata construction imports no tensor/runtime libraries. Loading creates
-F-local native groups only for parameter construction, sharding and packing;
-the completed tensor views survive their teardown. No CausalLM, EngineCore,
-upstream ModelRunner, forward, or per-request native collective is constructed here.
+Metadata construction imports no tensor/runtime libraries. The platform owner
+provides a live F-only compute environment before loading and retains it through
+execution. No CausalLM, EngineCore, upstream ModelRunner or forward is constructed.
 """
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from contextlib import ExitStack
-from datetime import timedelta
 from typing import TYPE_CHECKING
 
-from afd_plugin.ffn_faas.v4_model import V4CheckpointDescription
+from afd_plugin.ffn_faas.platforms.npu.v4_model import V4CheckpointDescription
 
 if TYPE_CHECKING:
     import torch
     from vllm.config import VllmConfig
 
-    from afd_plugin.ffn_faas.v4_weights import V4RoutedWeightOwner
+    from afd_plugin.ffn_faas.platforms.npu.v4_weights import V4RoutedWeightOwner
     from afd_plugin.model_executor.npu.async_cam_w4a8 import W4A8LayerWeights
 
 PACKED_WEIGHTS_PER_BYTE = 2
@@ -31,7 +28,6 @@ SOURCE_PARAMETERS_PER_PROJECTION = 4
 ENCODED_SCALE_BYTES = 8
 FLOAT_PARAMETER_BYTES = 4
 GATE_UP_PROJECTIONS = 2
-LOADING_GROUP_TIMEOUT_SECONDS = 180
 
 
 def validate_native_expert_map(
@@ -78,7 +74,6 @@ class V4FFNModel:
         self._owner: V4RoutedWeightOwner | None = None
         self._views: tuple[W4A8LayerWeights, ...] | None = None
         self._loading = False
-        self._loading_groups_owned = False
         self._loaded = False
 
         # Native ModelSlim retains offsets in addition to the six kernel views.
@@ -118,26 +113,20 @@ class V4FFNModel:
             raise RuntimeError("V4 FFN weights have not been loaded")
         return self._views
 
-    def _validate_launcher(self) -> None:
-        try:
-            world_size = int(os.environ["WORLD_SIZE"])
-            rank = int(os.environ["RANK"])
-        except (KeyError, ValueError) as error:
-            raise ValueError(
-                "V4 FFN loading requires an external F-only torchrun launcher"
-            ) from error
-        if world_size != self.ffn_ranks or rank != self.ffn_rank:
-            raise ValueError("V4 FFN loading requires the matching F-only world/rank")
+    @property
+    def native_owner(self) -> V4RoutedWeightOwner:
+        if not self._loaded or self._owner is None:
+            raise RuntimeError("native routed parameters have not finished loading")
+        return self._owner
 
     def load(
         self,
-        device: int,
+        device: torch.device,
         vllm_config: VllmConfig,
         progress: Callable[[int, int], None] | None = None,
     ) -> None:
         if self._loading or self._owner is not None or self._loaded:
             raise RuntimeError("V4 FFN weights are already loading or loaded")
-        self._validate_launcher()
         self._loading = True
         try:
             self._load_native(device, vllm_config, progress)
@@ -146,79 +135,25 @@ class V4FFNModel:
 
     def _load_native(
         self,
-        device: int,
+        device: torch.device,
         config: VllmConfig,
         progress: Callable[[int, int], None] | None,
     ) -> None:
-        # Prepare the native vendor search path before the first device init
-        # or imports of the parameter owner/engine configuration. This public
-        # bootstrap only updates OPP paths; extension loading remains below.
-        from vllm_ascend.utils import bootstrap_custom_op_env
-
-        bootstrap_custom_op_env()
-
-        # Runtime imports stay at the isolated worker-loading boundary.
-        # Inherited CANN Python/library search paths are left intact.
         import torch
-        import torch_npu  # noqa: F401
         from safetensors import safe_open
         from vllm.config import set_current_vllm_config
-        from vllm.distributed import (
-            init_distributed_environment,
-            initialize_model_parallel,
-        )
-        from vllm.distributed.parallel_state import (
-            get_ep_group,
-            model_parallel_is_initialized,
-        )
-        from vllm_ascend.ascend_config import init_ascend_config
-        from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
-        from vllm_ascend.utils import enable_custom_op, register_ascend_customop
+        from vllm.distributed.parallel_state import get_ep_group
 
-        from afd_plugin.ffn_faas.v4_weights import V4RoutedWeightOwner
+        from afd_plugin.ffn_faas.platforms.npu.v4_weights import V4RoutedWeightOwner
 
-        if torch.distributed.is_initialized() or model_parallel_is_initialized():
-            raise RuntimeError("V4 FFN loading cannot borrow existing native groups")
-        torch.npu.set_device(device)
-        # Pinned Ascend model_runner_v1.py:277 installs this worker policy at
-        # import time. The independent service bypasses that runner; preserving
-        # internal format is required by native W4A8 NZ packing and dtype views.
-        torch.npu.config.allow_internal_format = True
-        # Native Worker._init_device bootstraps OPP paths and loads the Ascend
-        # extension here, before any weight processing can initialize GE.
-        if not enable_custom_op():
-            raise RuntimeError("native V4 W4A8 custom operators are unavailable")
-        target = torch.device(f"npu:{device}")
+        group = get_ep_group()
+        if group.world_size != self.ffn_ranks or group.rank_in_group != self.ffn_rank:
+            raise ValueError("native V4 expert group differs from the F world")
+        target = device
         checkpoint = self.checkpoint
         total = len(checkpoint.layer_indices) * self.local_experts
         completed = 0
         with set_current_vllm_config(config):
-            # Native Worker registers Ascend routed/runner implementations
-            # before config initialization and any parameter construction.
-            register_ascend_customop(config)
-            init_ascend_config(config)
-            # Retain cleanup ownership before initialization can partially fail.
-            self._loading_groups_owned = True
-            init_distributed_environment(
-                world_size=self.ffn_ranks,
-                rank=self.ffn_rank,
-                local_rank=device,
-                distributed_init_method="env://",
-                backend="hccl",
-                timeout=timedelta(seconds=LOADING_GROUP_TIMEOUT_SECONDS),
-            )
-            initialize_model_parallel(
-                tensor_model_parallel_size=1,
-                pipeline_model_parallel_size=1,
-                backend="hccl",
-            )
-            init_ascend_model_parallel(config.parallel_config)
-            group = get_ep_group()
-            if (
-                group.world_size != self.ffn_ranks
-                or group.rank_in_group != self.ffn_rank
-            ):
-                raise ValueError("native V4 expert group differs from the F world")
             with torch.device(target):
                 owner = V4RoutedWeightOwner(self.checkpoint, config)
             self._owner = owner
@@ -284,10 +219,6 @@ class V4FFNModel:
                 storage_sizes[key] = storage.nbytes()
             self._parameter_bytes = sum(storage_sizes.values())
 
-        # Cached views contain only tensors and static layer semantics. No
-        # quantizer/loader call occurs after this point, so native F groups need
-        # not survive into the standalone CAM service's communication lifetime.
-        self._close_loading_groups()
         self._loaded = True
 
     def get_experts_layer_indices(self) -> tuple[int, ...]:
@@ -306,25 +237,10 @@ class V4FFNModel:
     ) -> torch.Tensor:
         raise RuntimeError("standalone V4 requires the native layered W4A8 executor")
 
-    def _close_loading_groups(self) -> None:
-        if not self._loading_groups_owned:
-            return
-        from vllm.distributed.parallel_state import (
-            destroy_distributed_environment,
-            destroy_model_parallel,
-        )
-        from vllm_ascend.distributed.parallel_state import destroy_ascend_model_parallel
-
-        destroy_ascend_model_parallel()
-        destroy_model_parallel()
-        destroy_distributed_environment()
-        self._loading_groups_owned = False
-
     def close(self) -> None:
-        """Called after executor completion; retain weights on group teardown error."""
+        """The backend retires execution and its compute environment first."""
         if self._loading:
             raise RuntimeError("cannot close V4 FFN weights during loading")
-        self._close_loading_groups()
         self._views = None
         self._owner = None
         self._loaded = False

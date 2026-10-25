@@ -91,6 +91,17 @@ EngineCore, scheduler or KV cache. The A connector, model data path and DBO
 hooks remain the mature CAM implementation. Configuration objects and native
 loader/quantization APIs remain vLLM/vLLM-Ascend dependencies.
 
+The standalone host loop accepts an injected `FFNBackend` factory through a
+CPU-only interface. Model/device-specific options, native construction and CAM
+composition live under `ffn_faas/platforms/npu/`. The Ascend environment owner
+binds the device, establishes and retains F-only native compute/EP groups, and
+applies the native post-warmup CPU affinity policy. Native routed modules and
+their expert-map/quantization state remain owned through execution. Current
+static CAM placement still rejects EPLB/EEP and redundant experts; residency
+does not enable those algorithms. Safe release orders the CAM runtime before
+compute groups and the parameter owner. Failed or pending work keeps all
+owners reachable until paired process isolation.
+
 The runtime accepts an independently loaded model through `attach_model` and
 releases its borrowed views only after receiver exit and device completion.
 The standalone process owns the original parameter container through that

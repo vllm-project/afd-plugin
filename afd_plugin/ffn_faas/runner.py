@@ -1,32 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Host lifecycle for one standalone CAM FFN process."""
+"""Host lifecycle for one injected standalone FFN backend."""
 
 from __future__ import annotations
 
+import math
 import threading
-from typing import TYPE_CHECKING
+from collections.abc import Callable
 
+from afd_plugin.ffn_faas.interfaces import FFNBackend
 from afd_plugin.ffn_faas.service import FFNService, ServicePhase
-from afd_plugin.ffn_faas.settings import FFNConfig
-from afd_plugin.ffn_faas.v4_model import V4CheckpointDescription
-
-if TYPE_CHECKING:
-    from afd_plugin.ffn_faas.backend import CAMFFNBackend
 
 HOST_STATUS_POLL_SECONDS = 0.1
-
-
-def create_backend(
-    checkpoint: V4CheckpointDescription, settings: FFNConfig
-) -> CAMFFNBackend:
-    # Match native startup ordering before importing torch-npu and the runner.
-    from vllm_ascend.utils import bootstrap_custom_op_env
-
-    bootstrap_custom_op_env()
-    from afd_plugin.ffn_faas.backend import CAMFFNBackend
-
-    return CAMFFNBackend(checkpoint, settings)
 
 
 class FFNModelRunner:
@@ -35,11 +20,16 @@ class FFNModelRunner:
     def __init__(
         self,
         service: FFNService,
-        checkpoint: V4CheckpointDescription,
-        settings: FFNConfig,
+        backend_factory: Callable[[], FFNBackend],
+        *,
+        shutdown_timeout: float,
     ) -> None:
-        self.service, self.checkpoint, self.settings = service, checkpoint, settings
-        self.backend: CAMFFNBackend | None = None
+        if not math.isfinite(shutdown_timeout) or shutdown_timeout <= 0:
+            raise ValueError("shutdown timeout must be finite and positive")
+        self.service = service
+        self.backend_factory = backend_factory
+        self.shutdown_timeout = shutdown_timeout
+        self.backend: FFNBackend | None = None
         self._thread: threading.Thread | None = None
         self._done = threading.Event()
         self._failure: BaseException | None = None
@@ -64,29 +54,29 @@ class FFNModelRunner:
                 return
             self.service.phase(ServicePhase.LOADING)
             # Retain the backend before any native initialization can fail.
-            self.backend = create_backend(self.checkpoint, self.settings)
+            self.backend = self.backend_factory()
             self.backend.prepare(self.service)
             try:
-                self.service.phase(ServicePhase.READY, cam_paired=True)
+                self.service.phase(ServicePhase.READY)
             except InterruptedError:
                 self.backend.receiver_exited()
             else:
                 self._thread = threading.Thread(
-                    target=self._serve, name="ffn-cam-receiver", daemon=True
+                    target=self._serve, name="ffn-receiver", daemon=True
                 )
                 self._thread.start()
                 while not self.service.stop_requested.wait(HOST_STATUS_POLL_SECONDS):
                     if self._done.is_set():
                         break
-                self._thread.join(timeout=self.settings.shutdown_timeout)
+                self._thread.join(timeout=self.shutdown_timeout)
                 if self._thread.is_alive():
                     raise RuntimeError(
-                        "CAM receive is pending; retain owners and terminate the "
-                        "paired process group. A host stop cannot cancel device DR."
+                        "FFN receive is pending; retain owners and isolate the "
+                        "deployment. A host stop cannot cancel backend device work."
                     )
                 if self._failure is not None:
                     raise RuntimeError(
-                        "CAM receiver failed; retain resources"
+                        "FFN receiver failed; retain resources"
                     ) from self._failure
             self.backend.close()
             self.service.phase(ServicePhase.STOPPED, resources_released=True)

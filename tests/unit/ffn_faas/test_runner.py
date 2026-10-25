@@ -8,29 +8,16 @@ import threading
 
 import pytest
 
-from afd_plugin.ffn_faas import runner as runner_module
 from afd_plugin.ffn_faas.runner import FFNModelRunner
 from afd_plugin.ffn_faas.service import FFNService
-from afd_plugin.ffn_faas.settings import FFNConfig
-from afd_plugin.ffn_faas.v4_model import V4CheckpointDescription
 from tests.unit.fakes.ffn_faas import HostBackend
 
 
 @pytest.fixture
-def make_runner(checkpoint_dir, monkeypatch):
+def make_runner(tmp_path):
     def build(backend):
-        monkeypatch.setattr(runner_module, "create_backend", lambda *_: backend)
-        service = FFNService(rank=0, model_path=str(checkpoint_dir))
-        settings = FFNConfig(
-            checkpoint_dir,
-            attention_ranks=1,
-            attention_tp=1,
-            ffn_ranks=1,
-            shutdown_timeout=0.01,
-        )
-        return FFNModelRunner(
-            service, V4CheckpointDescription.read(checkpoint_dir), settings
-        ), service
+        service = FFNService(rank=0, model_path=str(tmp_path), backend_name="host-test")
+        return FFNModelRunner(service, lambda: backend, shutdown_timeout=0.01), service
 
     return build
 
@@ -47,7 +34,7 @@ def test_successful_host_exit_releases_after_receiver_exit(
     assert backend.released
 
 
-@pytest.mark.parametrize("fail", ["prepare", "activate", "execute"])
+@pytest.mark.parametrize("fail", ["prepare", "activate", "execute", "close"])
 def test_failed_native_boundary_retains_owners(make_runner, fail):
     backend = HostBackend(fail=fail)
     runner, service = make_runner(backend)
@@ -78,10 +65,28 @@ def test_pending_host_receiver_is_not_closed(make_runner):
         assert backend.entered.wait(timeout=5)
         service.request_stop()
         assert done.wait(timeout=5)
-        assert errors and "CAM receive is pending" in errors[0]
+        assert errors and "FFN receive is pending" in errors[0]
         assert service.snapshot()["resources_released"] is False
         assert not backend.released
     finally:
         backend.release.set()
         thread.join()
         assert backend.finished.wait(timeout=5)
+
+
+def test_stop_before_backend_construction_needs_no_platform(tmp_path):
+    def unavailable():
+        raise RuntimeError("no device backend is available")
+
+    service = FFNService(rank=0, model_path=str(tmp_path))
+    service.request_stop()
+    FFNModelRunner(service, unavailable, shutdown_timeout=0.1).run()
+    assert service.snapshot()["phase"] == "stopped"
+    assert service.snapshot()["resources_released"] is True
+
+
+@pytest.mark.parametrize("timeout", [0.0, -1.0, float("nan"), float("inf")])
+def test_runner_rejects_unbounded_or_invalid_host_join(tmp_path, timeout):
+    service = FFNService(rank=0, model_path=str(tmp_path))
+    with pytest.raises(ValueError, match="finite and positive"):
+        FFNModelRunner(service, HostBackend, shutdown_timeout=timeout)

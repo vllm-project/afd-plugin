@@ -15,9 +15,15 @@ import torch
 from torch import nn
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from vllm.model_executor.layers.fused_moe.router.fused_moe_router import FusedMoERouter
 from vllm_ascend.models.deepseek_v4 import model as native
 
-from afd_plugin.ffn_faas.v4_model import V4CheckpointDescription
+from afd_plugin.ffn_faas.platforms.npu.v4_model import (
+    V4CheckpointDescription,
+    validate_static_experts,
+)
 from afd_plugin.model_executor.npu.async_cam_w4a8 import (
     AsyncCAMW4A8Executor,
     W4A8LayerWeights,
@@ -27,15 +33,44 @@ from afd_plugin.model_executor.npu.async_cam_w4a8 import (
 class RoutedParameterContainer(nn.Module):
     """Factory hook that retains native parameters without a forward runner.
 
-    The native factory supplies execution-only arguments alongside the routed
-    module. Accepting them here avoids constructing MoERunner's unused MC2 and
-    dispatcher resources in the standalone parameter owner.
+    The explicit keyword contract matches vLLM ced6857's FusedMoEFactory runner
+    hook. Changes fail at construction instead of disappearing in **kwargs.
+    No MoERunner, MC2 dispatcher or opposite-role module is constructed.
     """
 
     def __init__(
-        self, *, routed_experts: nn.Module, router: nn.Module, **execution_args: object
+        self,
+        *,
+        layer_name: str,
+        moe_config: FusedMoEConfig,
+        routed_experts: RoutedExperts,
+        router: FusedMoERouter,
+        enable_dbo: bool,
+        gate: nn.Module | None,
+        shared_expert_gate: nn.Module | None,
+        shared_experts: nn.Module | None,
+        routed_input_transform: nn.Module | None,
+        routed_output_transform: nn.Module | None,
+        routed_scaling_factor: float,
     ) -> None:
         super().__init__()
+        if (
+            enable_dbo
+            or routed_scaling_factor != 1.0
+            or any(
+                module is not None
+                for module in (
+                    gate,
+                    shared_expert_gate,
+                    shared_experts,
+                    routed_input_transform,
+                    routed_output_transform,
+                )
+            )
+        ):
+            raise ValueError("routed-only ownership cannot accept execution modules")
+        self.layer_name = layer_name
+        self.moe_config = moe_config
         self.routed_experts = routed_experts
         self.router = router
 
@@ -49,8 +84,14 @@ class V4RoutedWeightOwner(nn.Module):
         super().__init__()
         self.checkpoint = checkpoint
         self.config = vllm_config.model_config.hf_config
-        self.num_redundant_experts = 0
         self.vllm_config = vllm_config
+        parallel = vllm_config.parallel_config
+        validate_static_experts(
+            enable_eplb=parallel.enable_eplb,
+            enable_elastic_ep=parallel.enable_elastic_ep,
+            redundant_experts=parallel.eplb_config.num_redundant_experts,
+        )
+        self.num_redundant_experts = parallel.eplb_config.num_redundant_experts
         self.model = nn.Module()
         self.model.start_layer = 0
         self.model.end_layer = checkpoint.model_layers
@@ -86,8 +127,8 @@ class V4RoutedWeightOwner(nn.Module):
             routed_scaling_factor=1.0,
             swiglu_limit=config.swiglu_limit,
             e_score_correction_bias=None,
-            enable_eplb=False,
-            num_redundant_experts=0,
+            enable_eplb=self.vllm_config.parallel_config.enable_eplb,
+            num_redundant_experts=self.num_redundant_experts,
             is_sequence_parallel=False,
             n_shared_experts=0,
             hash_indices_table=None,
@@ -95,11 +136,19 @@ class V4RoutedWeightOwner(nn.Module):
         layers[key] = layer
         return layer
 
+    # Upstream: vLLM-Ascend 8d4409d6256d8a6729140ddcc0d1889e3f96cdd6,
+    # vllm_ascend/models/deepseek_v4/model.py, AscendDeepseekV4ForCausalLM.
+    # Adaptation reason: reuse its expert-aware name mapping/weight_loader
+    # without constructing a CausalLM. The receiver contract is hf config,
+    # model.start_layer/end_layer/layers, named_parameters and redundant-expert
+    # count. Native factory construction supplies RoutedExperts' own mapping.
+    # Delegation exception: do not copy the large native loader. Keep this
+    # exact-signature adapter until upstream exposes a routed-only loader API;
+    # qualify dependency upgrades with real checkpoint loading and numerics.
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Reuse the exact V4 raw-name mapping and expert-aware weight_loader.
-        # Its self contract is config, model.layers, named_parameters and the
-        # redundant-expert count, all supplied by this routed-only owner.
+        # ### PATCH START: use the native loader on the routed-only owner.
         return native.AscendDeepseekV4ForCausalLM.load_weights(self, weights)
+        # ### PATCH END: use the native loader on the routed-only owner.
 
     def finish_layer(self, layer_index: int) -> None:
         layer = self.model.layers[str(layer_index)]
@@ -112,6 +161,13 @@ class V4RoutedWeightOwner(nn.Module):
         weights = []
         for layer in self.model.layers.values():
             routed = layer.mlp.experts.routed_experts
+            parallel = self.vllm_config.parallel_config
+            validate_static_experts(
+                enable_eplb=parallel.enable_eplb,
+                enable_elastic_ep=parallel.enable_elastic_ep,
+                redundant_experts=parallel.eplb_config.num_redundant_experts,
+                dynamic_eplb=routed.dynamic_eplb,
+            )
             scheme = routed.quant_method.quant_method
             if scheme.quant_type != QuantType.W4A8:
                 raise ValueError("V4 FFN requires native W4A8 routed parameters")

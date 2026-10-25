@@ -5,15 +5,19 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from afd_plugin.ffn_faas.v4_model import V4CheckpointDescription
-from afd_plugin.ffn_faas.v4_runtime import V4FFNModel, validate_native_expert_map
-
-if TYPE_CHECKING:
-    from vllm.config import VllmConfig
+from afd_plugin.ffn_faas.platforms.npu.environment import AscendFFNEnvironment
+from afd_plugin.ffn_faas.platforms.npu.settings import FFNConfig
+from afd_plugin.ffn_faas.platforms.npu.v4_model import (
+    V4CheckpointDescription,
+    validate_static_experts,
+)
+from afd_plugin.ffn_faas.platforms.npu.v4_runtime import (
+    V4FFNModel,
+    validate_native_expert_map,
+)
 
 
 def test_main_routed_metadata_without_parameter_allocation(checkpoint_dir):
@@ -100,11 +104,43 @@ def test_missing_routed_source_rejected_before_loading(checkpoint_dir):
         V4CheckpointDescription.read(checkpoint_dir)
 
 
-def test_wrong_loading_world_rejected_before_native_imports(
+def test_wrong_compute_world_rejected_before_native_imports(
     checkpoint_dir, monkeypatch
 ):
-    model = V4FFNModel(V4CheckpointDescription.read(checkpoint_dir), 2, 0)
+    settings = FFNConfig(checkpoint_dir, attention_ranks=1, attention_tp=1, ffn_ranks=2)
+    environment = AscendFFNEnvironment(settings)
     monkeypatch.setenv("RANK", "0")
     monkeypatch.setenv("WORLD_SIZE", "1")
-    with pytest.raises(ValueError, match="matching F-only"):
-        model.load(0, cast("VllmConfig", None))
+    with pytest.raises(ValueError, match="differs from the F-only"):
+        environment.initialize_device()
+
+
+@pytest.mark.parametrize(
+    "eplb,elastic,redundant,dynamic",
+    [
+        (True, False, 0, False),
+        (False, True, 0, False),
+        (False, False, 1, False),
+        (False, False, 0, True),
+    ],
+)
+def test_static_cam_adapter_rejects_expert_relocation(
+    eplb, elastic, redundant, dynamic
+):
+    with pytest.raises(ValueError, match="static expert placement"):
+        validate_static_experts(
+            enable_eplb=eplb,
+            enable_elastic_ep=elastic,
+            redundant_experts=redundant,
+            dynamic_eplb=dynamic,
+        )
+
+
+def test_unused_compute_owner_can_close_without_importing_runtime(checkpoint_dir):
+    settings = FFNConfig(checkpoint_dir, attention_ranks=1, attention_tp=1, ffn_ranks=1)
+    environment = AscendFFNEnvironment(settings)
+    environment.close()
+    with pytest.raises(RuntimeError, match="device has not been initialized"):
+        _ = environment.device
+    with pytest.raises(RuntimeError, match="expert group has not been initialized"):
+        _ = environment.ep_group
