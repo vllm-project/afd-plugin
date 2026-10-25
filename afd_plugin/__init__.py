@@ -22,6 +22,7 @@ def __getattr__(name: str):
         "AFDAttentionWorker",
         "AFDFFNWorker",
         "GPUFFNModelRunner",
+        "GPUFFNRoutedExpertsModelRunner",
     }:
         from afd_plugin.v1 import worker
 
@@ -222,6 +223,7 @@ __all__ = [
     "AFDAttentionWorker",
     "AFDFFNWorker",
     "GPUFFNModelRunner",
+    "GPUFFNRoutedExpertsModelRunner",
     "assert_compatible_afd_stack",
     "parse_afd_config",
     "parse_optional_afd_config",

@@ -35,6 +35,9 @@ dependencies = []
 # Install the runtime extra only in environments with a compatible vLLM wheel.
 [project.optional-dependencies]
 vllm = ["vllm==0.30.0"]
+afdep = [
+    "afdep @ git+https://github.com/ms-llmd/afdEP.git@e763e3189398beda24f592d2117e6ade135b0a7f",
+]
 
 [project.urls]
 Homepage = "https://github.com/vllm-project/afd-plugin"
@@ -191,4 +194,6 @@ extend-ignore-identifiers-re = [
     "DataCopyPad2DA8W4NDNew",
     ".*isND2NZ.*",
     ".*enVecND2NZ.*",
+    # UE8M0: the FP8 unsigned-exponent scale format (DeepEP/DeepGEMM docs).
+    ".*[Uu][Ee]8[Mm]0.*",
 ]

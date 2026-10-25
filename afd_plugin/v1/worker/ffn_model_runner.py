@@ -25,6 +25,7 @@ from afd_plugin.compat.profiler import (
 )
 from afd_plugin.config import AFDConfig, parse_afd_config
 from afd_plugin.connectors import (
+    AFDConnectorBase,
     AFDConnectorFactory,
     AFDControlPayload,
     AFDControlPlane,
@@ -108,6 +109,15 @@ class GPUFFNModelRunner:
     def initialize_afd_connector(self) -> None:
         self.connector.init_afd_connector()
 
+    def adopt_bootstrapped_connector(self, connector: AFDConnectorBase) -> None:
+        """Use the connector the worker bootstrapped before vLLM's init.
+
+        Replaces the connector created at construction, which never
+        communicated.
+        """
+        self.connector.close()
+        self.connector = connector
+
     def load_model(self, *, load_dummy_weights: bool = False, **kwargs: Any) -> None:
         """Load the vLLM model."""
 
@@ -176,10 +186,14 @@ class GPUFFNModelRunner:
             self._cuda_graphs[graph_key]["graph"].replay()
             return None
 
+        # An eager fallback for a step Attention replays keeps the replay flag,
+        # so the connector plans the step the way Attention does (graph mode,
+        # no host sync).
         self._ffn_forward(
             dp_metadata_list=dp_metadata_list,
             is_graph_capturing=is_graph_capturing,
             is_warmup=is_warmup,
+            is_graph_replaying=is_graph_replaying,
         )
         return None
 
@@ -189,17 +203,15 @@ class GPUFFNModelRunner:
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
         is_graph_capturing: bool = False,
         is_warmup: bool = False,
+        is_graph_replaying: bool = False,
         update_connector_state: bool = True,
     ) -> torch.Tensor | None:
         if update_connector_state:
-            cast(
-                AFDControlPlane, self.connector.control_plane
-            ).update_state_from_dp_metadata(
-                _make_dp_metadata_payload(
-                    dp_metadata_list,
-                    is_graph_capturing=is_graph_capturing,
-                    is_warmup=is_warmup,
-                ),
+            self._update_connector_state(
+                dp_metadata_list,
+                is_graph_capturing=is_graph_capturing,
+                is_warmup=is_warmup,
+                is_graph_replaying=is_graph_replaying,
             )
 
         model = self.get_model()
@@ -267,6 +279,25 @@ class GPUFFNModelRunner:
                         )
                     self.connector.send_ffn_output(rank_ffn_output, context)
         return rank_ffn_output
+
+    def _update_connector_state(
+        self,
+        dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
+        *,
+        is_graph_capturing: bool,
+        is_warmup: bool,
+        is_graph_replaying: bool,
+    ) -> None:
+        cast(
+            AFDControlPlane, self.connector.control_plane
+        ).update_state_from_dp_metadata(
+            _make_dp_metadata_payload(
+                dp_metadata_list,
+                is_graph_capturing=is_graph_capturing,
+                is_warmup=is_warmup,
+                is_graph_replaying=is_graph_replaying,
+            ),
+        )
 
     def _execute_eager_mode(
         self,
@@ -472,11 +503,13 @@ def _make_dp_metadata_payload(
     *,
     is_graph_capturing: bool = False,
     is_warmup: bool = False,
+    is_graph_replaying: bool = False,
 ) -> AFDControlPayload:
     return AFDControlPayload(
         dp_metadata_list=dp_metadata_list,
         is_graph_capturing=is_graph_capturing,
         is_warmup=is_warmup,
+        is_graph_replaying=is_graph_replaying,
     )
 
 

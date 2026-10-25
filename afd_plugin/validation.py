@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
     CAMP2P_CONNECTOR,
+    DEEPEP_M2N_CONNECTORS,
     AFDConfig,
     parse_afd_config,
 )
@@ -29,6 +30,9 @@ ATTENTION_MODEL_RUNNER_FQCN: Final[str] = (
     "afd_plugin.v1.worker.AFDAttentionModelRunnerV2"
 )
 FFN_MODEL_RUNNER_FQCN: Final[str] = "afd_plugin.v1.worker.GPUFFNModelRunner"
+ROUTED_FFN_MODEL_RUNNER_FQCN: Final[str] = (
+    "afd_plugin.v1.worker.GPUFFNRoutedExpertsModelRunner"
+)
 NPU_ATTENTION_WORKER_FQCN: Final[str] = "afd_plugin.v1.worker.npu.AFDNPUAttentionWorker"
 NPU_FFN_WORKER_FQCN: Final[str] = "afd_plugin.v1.worker.npu.AFDNPUFFNWorker"
 NPU_ATTENTION_MODEL_RUNNER_FQCN: Final[str] = (
@@ -40,6 +44,10 @@ VLLM_ASCEND_NPU_WORKER_FQCN: Final[str] = "vllm_ascend.worker.worker.NPUWorker"
 VLLM_ASCEND_310P_WORKER_FQCN: Final[str] = "vllm_ascend._310p.worker_310p.NPUWorker310"
 VLLM_ASCEND_XLITE_WORKER_FQCN: Final[str] = "vllm_ascend.xlite.xlite_worker.XliteWorker"
 GPU_MRV2_NUM_UBATCHES: Final[int] = 2
+GPU_MRV2_CONNECTORS: Final[tuple[str, ...]] = (
+    "P2pNcclAFDConnector",
+    *DEEPEP_M2N_CONNECTORS,
+)
 
 
 CAM_MAX_RECEIVE_TOKENS = 262144
@@ -91,12 +99,29 @@ def validate_gpu_model_runner_v2_config(
         raise RuntimeError("AFD GPU requires ModelRunnerV2")
 
     afd_config = parse_afd_config(vllm_config, expected_role=expected_role)
-    if device_type != "cuda" or afd_config.connector != "P2pNcclAFDConnector":
+    if device_type != "cuda" or afd_config.connector not in GPU_MRV2_CONNECTORS:
         raise RuntimeError(
-            "AFD ModelRunnerV2 requires CUDA and synchronous P2pNcclAFDConnector",
+            "AFD ModelRunnerV2 requires CUDA and one of the synchronous "
+            f"connectors {GPU_MRV2_CONNECTORS}",
         )
 
     parallel = vllm_config.parallel_config
+    # DeepEP M2N bootstraps before vLLM's distributed init and derives the TP
+    # part of the role rank from the worker rank. Attention may run TP > 1:
+    # each TP rank dispatches its own slice of the tokens. FFN experts are not
+    # TP-sharded; that and the other deployment checks (expert placement,
+    # all2all backend, weight format) run in the connector handshake so that
+    # every rank fails together. It routes on Attention, so it requires the
+    # gate there.
+    if afd_config.connector in DEEPEP_M2N_CONNECTORS:
+        if expected_role == "ffn" and parallel.tensor_parallel_size != 1:
+            raise RuntimeError(
+                f"{afd_config.connector} requires FFN tensor_parallel_size=1"
+            )
+        if not afd_config.compute_gate_on_attention:
+            raise RuntimeError(
+                f"{afd_config.connector} requires compute_gate_on_attention=true"
+            )
     if (
         parallel.pipeline_parallel_size,
         parallel.prefill_context_parallel_size,
@@ -374,10 +399,12 @@ __all__ = [
     "ATTENTION_WORKER_FQCN",
     "FFN_MODEL_RUNNER_FQCN",
     "FFN_WORKER_FQCN",
+    "GPU_MRV2_CONNECTORS",
     "NPU_ATTENTION_MODEL_RUNNER_FQCN",
     "NPU_ATTENTION_WORKER_FQCN",
     "NPU_FFN_MODEL_RUNNER_FQCN",
     "NPU_FFN_WORKER_FQCN",
+    "ROUTED_FFN_MODEL_RUNNER_FQCN",
     "assert_compatible_afd_stack",
     "expected_npu_worker_qualname",
     "expected_worker_qualname",

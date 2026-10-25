@@ -58,12 +58,40 @@ def validate_p2p_topology(config: AFDConfig) -> None:
         )
 
 
-def resolve_role_rank(vllm_config: VllmConfig, config: AFDConfig) -> int:
+def tp_rank_before_distributed_init(vllm_config: VllmConfig, worker_rank: int) -> int:
+    """TP rank of a worker, before vLLM creates its TP group.
+
+    vLLM orders ranks ``[ExternalDP, DP, PP, PCP, TP]`` with TP innermost
+    (vLLM v0.30.0 ``initialize_model_parallel``), and AFD runs with PP = PCP =
+    1, so the TP rank is the worker rank modulo the TP size whether the worker
+    rank is DP-local or global. ``check_connector_role_rank`` compares the
+    result with vLLM's TP group once it exists.
+    """
+    parallel_config = vllm_config.parallel_config
+    if (
+        parallel_config.pipeline_parallel_size,
+        parallel_config.prefill_context_parallel_size,
+    ) != (1, 1):
+        raise ValueError("the TP rank before distributed init needs PP = PCP = 1")
+    return worker_rank % int(parallel_config.tensor_parallel_size)
+
+
+def resolve_role_rank(
+    vllm_config: VllmConfig,
+    config: AFDConfig,
+    *,
+    tp_rank: int | None = None,
+) -> int:
     """Resolve this worker's connector-independent AFD role rank.
 
     The resolver linearizes vLLM's global DP rank and local PCP/TP coordinates.
     Connectors receive the result as runtime state and map it to their own
     communication-world rank.
+
+    Args:
+        tp_rank: This worker's TP rank, for callers that run before vLLM's
+            distributed init (see ``tp_rank_before_distributed_init``).
+            ``None`` reads it from vLLM's TP group.
     """
 
     parallel_config = vllm_config.parallel_config
@@ -82,12 +110,14 @@ def resolve_role_rank(vllm_config: VllmConfig, config: AFDConfig) -> int:
         pcp_rank = int(get_pcp_group().rank_in_group)
     else:
         pcp_rank = 0
-    if tp_size > 1:
+    if tp_size == 1:
+        tp_rank = 0
+    elif tp_rank is None:
         from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
         tp_rank = int(get_tensor_model_parallel_rank())
-    else:
-        tp_rank = 0
+    elif not 0 <= tp_rank < tp_size:
+        raise ValueError(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
 
     role_rank = (dp_rank * pcp_size + pcp_rank) * tp_size + tp_rank
     if config.role == "attention":

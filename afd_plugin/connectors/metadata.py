@@ -182,7 +182,10 @@ class AFDTransferMetadata:
         seq_lens: Per-peer or per-split token lengths. The sum of this list is
             the expected leading dimension for tensors validated against this
             metadata. For one-to-one transfers this is usually a single-item
-            list; for fan-in/fan-out paths it can describe split sizes.
+            list; for fan-in/fan-out paths it can describe split sizes. An
+            entry may be ``0``: with expert-routed transports (DeepEP M2N) an
+            FFN rank can receive no rows for a layer while still taking part
+            in the collective.
     """
 
     layer_idx: int
@@ -192,8 +195,8 @@ class AFDTransferMetadata:
     def __post_init__(self) -> None:
         if not self.seq_lens:
             raise ValueError("seq_lens cannot be empty")
-        if any(length <= 0 for length in self.seq_lens):
-            raise ValueError("all sequence lengths must be positive")
+        if any(length < 0 for length in self.seq_lens):
+            raise ValueError("all sequence lengths must be non-negative")
 
     @property
     def total_tokens(self) -> int:
