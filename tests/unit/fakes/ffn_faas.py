@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+"""Metadata fixtures and host-only lifecycle stand-ins for standalone FFN."""
+
+from __future__ import annotations
+
+import json
+import threading
+from pathlib import Path
+
+from afd_plugin.ffn_faas.service import FFNService, ServicePhase
+
+
+def write_v4_checkpoint(root: Path, *, layers: int = 2, experts: int = 4) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    config = {
+        "architectures": ["DeepseekV4ForCausalLM"],
+        "hidden_act": "silu",
+        "scoring_func": "sqrtsoftplus",
+        "torch_dtype": "bfloat16",
+        "num_hidden_layers": layers,
+        "n_routed_experts": experts,
+        "num_experts_per_tok": 2,
+        "num_hash_layers": 1,
+        "hidden_size": 256,
+        "moe_intermediate_size": 256,
+        "routed_scaling_factor": 1.5,
+        "swiglu_limit": 10.0,
+    }
+    shard = "weights.safetensors"
+    weights = {
+        f"layers.{layer}.ffn.experts.{expert}.w{projection}.{suffix}": shard
+        for layer in range(layers)
+        for expert in range(experts)
+        for projection in (1, 2, 3)
+        for suffix in ("weight", "weight_scale", "weight_offset", "scale_bias")
+    }
+    (root / "config.json").write_text(json.dumps(config))
+    (root / "quant_model_weights.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weights})
+    )
+    (root / "quant_model_description.json").write_text(
+        json.dumps({"group_size": 0, **dict.fromkeys(weights, "W4A8_DYNAMIC")})
+    )
+    # Metadata tests never pass this placeholder to the native loader.
+    (root / "weights.safetensors").write_bytes(b"metadata-only fixture")
+    return root
+
+
+class HostBackend:
+    """Exercise host ownership rules, without simulating device completion."""
+
+    def __init__(
+        self, *, stop_during_prepare: bool = False, fail: str = "", block: bool = False
+    ) -> None:
+        self.stop_during_prepare = stop_during_prepare
+        self.fail = fail
+        self.block = block
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        self.released = False
+        self.service: FFNService | None = None
+
+    def prepare(self, service: FFNService) -> None:
+        self.service = service
+        if self.fail == "prepare":
+            raise RuntimeError("prepare failed")
+        service.phase(ServicePhase.CONNECTING, model_loaded=True)
+        if self.stop_during_prepare:
+            service.request_stop()
+
+    def start_receiver(self) -> None:
+        if self.fail == "activate":
+            raise RuntimeError("receiver activation failed")
+
+    def execute_step(self) -> None:
+        assert self.service is not None
+        self.entered.set()
+        if self.block:
+            self.release.wait()
+        if self.fail == "execute":
+            self.finished.set()
+            raise RuntimeError("execute failed")
+        self.service.request_stop()
+
+    def receiver_exited(self) -> None:
+        self.finished.set()
+
+    def close(self) -> None:
+        if not self.finished.is_set():
+            raise RuntimeError("host receiver has not exited")
+        self.released = True

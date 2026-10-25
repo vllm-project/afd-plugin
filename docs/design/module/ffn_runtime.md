@@ -6,6 +6,7 @@ owners:
   - "@hsliuustc0106"
   - "@jiangkuaixue123"
 primary_code_paths:
+  - "afd_plugin/ffn_faas/**"
   - "afd_plugin/v1/worker/ffn_metadata.py"
   - "afd_plugin/v1/worker/ffn_model_runner.py"
   - "afd_plugin/v1/worker/ffn_worker.py"
@@ -24,14 +25,17 @@ depends_on:
   - "execution_platforms.md"
   - "compatibility_and_patches.md"
 validation_paths:
+  - "tests/unit/ffn_faas/test_*.py"
   - "tests/unit/v1/worker/test_ffn_metadata.py"
   - "tests/unit/v1/worker/test_ffn_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
   - "tests/unit/v1/worker/test_async_ffn_two_stream.py"
+  - "tests/unit/v1/worker/test_async_ffn_runtime.py"
   - "tests/unit/test_async_cam_startup_wiring.py"
   - "tests/unit/connectors/test_async_cam_startup.py"
   - "tests/npu/async_cam_runtime.py"
+  - "tests/npu/standalone_cam_attention.py"
   - "tests/e2e/models/deepseek_v4_flash/ffn_graph.py"
   - "tests/unit/compat/patches/test_engine_core.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
@@ -74,10 +78,27 @@ on the FFN worker or runner implementation.
 
 ## Runtime selection
 
-FFN is launched as a `vllm serve` process, and AFD config normalization selects
+The traditional FFN is launched as a `vllm serve` process, and AFD config normalization selects
 its role-specific worker when `worker_cls="auto"`. It does not serve requests.
 Attention and FFN may be started in either order. Send API traffic only to
 Attention.
+
+DeepSeek-V4 Flash per-channel W4A8 also has a standalone F entry point,
+`python -m afd_plugin.ffn_faas serve`. It constructs routed-only native
+parameters and composes the existing `CAMAsyncAFDConnector` and
+`AsyncNPUFFNModelRunner`; it never constructs a vLLM Worker, upstream ModelRunner,
+EngineCore, scheduler or KV cache. The A connector, model data path and DBO
+hooks remain the mature CAM implementation. Configuration objects and native
+loader/quantization APIs remain vLLM/vLLM-Ascend dependencies.
+
+The runtime accepts an independently loaded model through `attach_model` and
+releases its borrowed views only after receiver exit and device completion.
+The standalone process owns the original parameter container through that
+release. Its management `/stop` requests a host-loop stop; an outstanding CAM
+DR is not cancellable. A pending or failed native boundary retains all owners
+until process isolation, and requires teardown of the paired A/F group.
+See [standalone FFN service](../../npu/STANDALONE_FFN_SERVICE.md) for the exact
+launch and shutdown contract.
 
 | Platform | Worker | Model runner | Current connectors |
 | --- | --- | --- | --- |

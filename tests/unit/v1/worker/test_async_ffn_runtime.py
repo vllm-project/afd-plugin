@@ -117,6 +117,32 @@ def payload(layer, rows):
     )
 
 
+def test_independent_model_attachment_exposes_original_owner(harness):
+    model = harness.runner.get_model()
+    harness.runner.model = None
+    harness.connector._initialized = False
+    harness.runner.attach_model(model, parameter_bytes=123)
+    assert harness.runner.get_model() is model
+
+
+@pytest.mark.parametrize("boundary", ["already_loaded", "paired", "negative_size"])
+def test_independent_attachment_rejects_invalid_lifetime(harness, boundary):
+    model = harness.runner.get_model()
+    if boundary != "already_loaded":
+        harness.runner.model = None
+    harness.connector._initialized = boundary == "paired"
+    with pytest.raises((RuntimeError, ValueError)):
+        harness.runner.attach_model(
+            model, parameter_bytes=-1 if boundary == "negative_size" else 123
+        )
+
+
+def test_receiver_exit_rejects_pending_graph_work(harness):
+    harness.runner._graph_pending = True
+    with pytest.raises(RuntimeError, match="pending work; retain resources"):
+        harness.runner.mark_receiver_exited()
+
+
 @pytest.mark.parametrize("layered", [False, True])
 def test_eager_preserves_layer_loop_device_metadata_and_return_headers(
     harness, layered

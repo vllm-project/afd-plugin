@@ -131,19 +131,35 @@ from afd_plugin.compat.npu import ensure_afd_ascend_ops_loaded
 ensure_afd_ascend_ops_loaded()
 ```
 
+Prepare native and AFD `ASCEND_CUSTOM_OPP_PATH` vendor entries before launching
+Python when using the layered operators. GE can initialize infer-shape
+registrations while importing native modules; adding the AFD path afterward
+cannot repair that process's missing registration. Preserve the CANN Python
+and library paths from the activated environment. The
+[standalone guide](../../docs/npu/STANDALONE_FFN_SERVICE.md#launch) shows the
+paired vendor setup.
+
 ## Current Scope
 
-A2E/E2A continue to serve the existing CAMP2P connector. The four 910C
-routed-only CAM operators are an experimental native integration and are not
-yet selected by `CAMAsyncAFDConnector`, which retains its external legacy CAM
-interface.
+A2E/E2A continue to serve the existing CAMP2P connector. With Attention-side
+gating, `CAMAsyncAFDConnector` selects the four 910C routed-only CAM operators.
+The standalone FFN entry point reuses this same protocol and connector; see
+[the standalone service guide](../../docs/npu/STANDALONE_FFN_SERVICE.md).
 
 `grouped_matmul_swiglu_quant_v2_layered` is a fused
 grouped-matmul + SiLU + dynamic-quantization CAM operator (A8W8 / A4W4 /
 A8W4-MSD variants) built for `ascend910_93`. It is registered as
 `torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered` (inference + Meta; no
-autograd grad) and is excluded from `ascend950` builds. Nothing selects it at
-runtime yet; switching a connector/model path to it is a separate follow-up.
+autograd grad) and is excluded from `ascend950` builds. The Async CAM layered
+W4A8 executor selects it with `AFD_ASYNC_CAM_LAYERED_GMM=1`.
+
+The optional `swiglu_limit` attribute supports per-channel A8W4-MSD: cap gate
+above the limit and clamp up symmetrically before SwiGLU and activation
+quantization. Zero keeps unlimited activation. Rebuild the CANN package and
+PyTorch extension together. The original ACLNN workspace/execute symbols keep
+their unlimited-activation ABI; the clamp-aware binding resolves the distinct
+`aclnnGroupedMatmulSwigluQuantV2LayeredWithLimit` entry points, so it cannot pass
+an expanded argument list to an older library.
 
 A8W8 accepts an NZ weight as either an explicit five-dimensional view or the
 three-dimensional logical view `npu_format_cast` produces over NZ storage; the
