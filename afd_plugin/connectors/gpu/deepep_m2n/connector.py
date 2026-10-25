@@ -182,11 +182,8 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
         cpu_timeout_s / gpu_timeout_s: DeepEP host-wait and kernel-spin
             timeouts.
         cpu_sync_min_tokens: Eager steps whose bucket is below this skip the
-            host sync that reads receive counts; they allocate the worst-case
-            receive size instead. ``0`` always syncs in eager mode. Attention
-            ranks keep a zero buffer for the largest bucket that skips the
-            sync (the top rung of ``bucket_ladder``), so raising this costs
-            memory.
+            host sync that reads receive counts; FFN ranks then allocate the
+            worst-case receive size instead. ``0`` always syncs in eager mode.
         control_backend: Backend of the connector's own process group
             (handshake, DeepEP communicator bootstrap, per-step control
             payload). ``gloo`` keeps it off the GPUs and the RDMA NICs, so
@@ -430,26 +427,6 @@ def precompile_buckets(
         )
         buckets += [(rung, False) for rung in ladder if rung <= covering]
     return tuple(dict.fromkeys(buckets))
-
-
-def worst_case_receive_rows(
-    *,
-    num_ranks: int,
-    bucket: int,
-    top_k: int,
-    experts_per_rank: int,
-    expert_alignment: int,
-) -> int:
-    """Rows DeepEP allocates for one rank's receive when it skips the host sync.
-
-    Mirrors DeepEP V2's worst case for expanded receives (``ElasticBuffer``
-    non-cached dispatch without CPU sync): every rank's bucket times the routes
-    one token can send to this rank, plus alignment padding for each local
-    expert.
-    """
-    rows = num_ranks * bucket * min(top_k, experts_per_rank)
-    rows += (expert_alignment - 1) * experts_per_rank
-    return -(-rows // expert_alignment) * expert_alignment
 
 
 @dataclass(frozen=True)
@@ -1004,8 +981,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self._step_fork: torch.cuda.Event | None = None
         self._step_fork_capturing = False
         self._lanes_joined: set[int] = set()
-        # Attention side: the zero rows combine takes from Attention ranks,
-        # sized for the largest receive (see _allocate_combine_zeros).
+        # Attention side: the empty combine input (see _allocate_combine_zeros).
         self._combine_zeros: torch.Tensor | None = None
         self._op_id = next(_CONNECTOR_IDS)
         self._initialized = False
@@ -1559,24 +1535,15 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         )
 
     def _allocate_combine_zeros(self) -> None:
-        """One zero buffer for every combine on this Attention rank.
+        """The empty input every combine on this Attention rank takes.
 
-        Combine takes one zero row per row this rank received. A synced
-        dispatch gives an Attention rank no rows; a dispatch that skips the
-        sync gets DeepEP's worst case for its bucket, so the buffer covers the
-        largest such bucket. Both lanes share it (combine only reads it), and
-        captured graphs keep one stable address.
+        Combine takes one zero row per row this rank received, and afdEP-comm
+        gives Attention ranks no receive rows on any dispatch, with or without
+        the host sync. One zero-row tensor serves both lanes and keeps a
+        stable address for captured graphs.
         """
-        assert self.bucket_ladder is not None
-        rows = worst_case_receive_rows(
-            num_ranks=self.layout.union_size,
-            bucket=self.bucket_ladder[-1] if self.bucket_ladder else 0,
-            top_k=self.top_k,
-            experts_per_rank=self.layout.experts_per_rank,
-            expert_alignment=self.expert_alignment,
-        )
         self._combine_zeros = torch.zeros(
-            (rows, self.hidden_size), dtype=self.dtype, device=self.device
+            (0, self.hidden_size), dtype=self.dtype, device=self.device
         )
 
     def _combine_zero_rows(self, shape: tuple[int, int]) -> torch.Tensor:
@@ -1587,8 +1554,8 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         if rows > zeros.shape[0] or shape[1] != zeros.shape[1]:
             raise RuntimeError(
                 f"combine needs zero rows of shape {shape} but the buffer holds "
-                f"{tuple(zeros.shape)}: a dispatch skipped the host sync with a "
-                "bucket above the ladder's top rung (no_sync_bucket_limit)"
+                f"{tuple(zeros.shape)}: afdEP-comm gave an Attention rank receive "
+                "rows, which its AFD transport never does"
             )
         return zeros[:rows]
 
