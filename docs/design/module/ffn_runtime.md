@@ -102,6 +102,18 @@ does not enable those algorithms. Safe release orders the CAM runtime before
 compute groups and the parameter owner. Failed or pending work keeps all
 owners reachable until paired process isolation.
 
+Here `FFNBackend` adapts a complete runtime lifecycle, composing the environment,
+routed parameter owner, CAM connector and mature Async runtime. The public host
+loop calls `backend.execute_step()`; communication, compute, Graph and two-stream
+scheduling remain inside that runtime. This is not RFC #391's pure
+`compute(item)`/facts backend or its cross-platform, cross-connector shared
+WorkItem/StepPlan/Graph Step Loop. This stage preserves the mature execution
+path. A common Step Loop can be evaluated when a real GPU or synchronous
+connector integration needs it; adding another adapter alone does not unify
+execution protocols. Device/compute ownership, composition and host-thread
+lifecycle belong to the environment, backend and host runner respectively;
+they do not require another `FFNWorker` wrapper.
+
 The runtime accepts an independently loaded model through `attach_model` and
 releases its borrowed views only after receiver exit and device completion.
 The standalone process owns the original parameter container through that
@@ -203,7 +215,10 @@ two slots, compute/send streams and ready/done events. FULL owns four private
 graph pools and four graphs; eager retires each slot only after its send is
 observed complete. Both modes retain the bounded batch fence. Enabled eager
 and FULL agree on executor, layer, capacity and core signatures before HCCL
-creation and reject Attention DBO/SP combinations. Shutdown requires receiver
+creation. Attention must use eager MRV2 with PP=PCP=DCP=1, MoE sequence
+parallelism and FlashComm1 disabled, and no speculative decoding. Attention DBO
+remains supported with exactly two native microbatches under the existing
+DP/TP constraints; FFN DBO stays disabled. Shutdown requires receiver
 exit and device completion before release. Partial native failures retain
 resources and remain visible to repeated health checks. Host tests do not
 qualify native window reuse, graph capture or stream overlap; see the

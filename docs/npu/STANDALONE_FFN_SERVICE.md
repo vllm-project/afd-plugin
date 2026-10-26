@@ -61,6 +61,17 @@ CPU Service / host runner -> FFNBackend
     mature Async CAM runtime: A/F group, DS/DR/CS/CR, Graph and streams
 ```
 
+`FFNBackend` here is a lifecycle adapter for that complete runtime. The public
+host loop calls `backend.execute_step()`, while the mature Async runtime keeps
+communication, compute, Graph and two-stream scheduling. This differs from
+RFC #391's pure `compute(item)`/facts backend: a cross-platform,
+cross-connector shared WorkItem/StepPlan/Graph Step Loop is not implemented.
+Composing the existing runtime deliberately preserves the qualified CAM path.
+A future GPU or synchronous connector integration should determine whether
+and how to share that loop; an adapter interface alone does not unify it.
+The environment, backend and host runner already own device/compute state,
+composition and host-thread lifecycle, without another `FFNWorker` wrapper.
+
 The environment initializes the selected device before native configuration
 and establishes F-only vLLM/Ascend groups before parameter construction. Its EP
 group and the original routed modules remain resident through readiness and
@@ -89,6 +100,11 @@ adapter delegates to the original native loader without copying its body; its
 marked adaptation documents the required HF config, layer range/container,
 named parameters and redundant-expert count. Dependency upgrades need actual
 factory/checkpoint-loading qualification, not just unchanged version strings.
+
+Known checkpoint/topology checks run on the CPU before loading, but actual CAM
+pairing still completes after native weights are loaded. A lightweight
+handshake before loading, as suggested in review, remains follow-up work;
+this stage retains the mature paired-startup sequence and signatures.
 
 ## Launch
 

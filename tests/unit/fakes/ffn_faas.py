@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import atexit
-import builtins
 import json
 import os
 import sys
@@ -120,15 +119,8 @@ class HostPlatformAdapter:
 
 
 def run_cpu_platform(model: str, status: str) -> int:
-    """Exercise the actual service/loop with another adapter and no tensor stack."""
+    """Run the actual service/loop after the child entry installed its import gate."""
     from afd_plugin.ffn_faas import __main__ as cli
-
-    original_import = builtins.__import__
-
-    def cpu_import(name, *args, **kwargs):
-        if name.split(".", 1)[0] in ("torch", "torch_npu", "vllm", "vllm_ascend"):
-            raise AssertionError(f"CPU host contract imported {name}")
-        return original_import(name, *args, **kwargs)
 
     args = [
         "ffn_faas",
@@ -146,7 +138,6 @@ def run_cpu_platform(model: str, status: str) -> int:
     with (
         patch.object(cli, "SUPPORTED_BACKENDS", ("host-contract",)),
         patch.object(cli, "get_platform_adapter", lambda _: HostPlatformAdapter()),
-        patch.object(builtins, "__import__", cpu_import),
         patch.object(sys, "argv", args),
     ):
         return cli.main()
