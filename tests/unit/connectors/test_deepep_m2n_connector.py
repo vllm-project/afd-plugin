@@ -100,6 +100,7 @@ def _handshake(
     overrides: dict | None = None,
     hosts: str | None = None,
     attn_tp_size: int = 1,
+    config: DeepEPM2NConfig | None = None,
 ) -> list[dict]:
     """Handshake infos; rank r runs on host hosts[r] (one NVLink domain per host).
 
@@ -114,7 +115,7 @@ def _handshake(
             role="ffn" if is_ffn else "attention",
             role_rank=world_rank if is_ffn else world_rank - layout.ffn_size,
             world_rank=world_rank,
-            config=DeepEPM2NConfig(),
+            config=config or DeepEPM2NConfig(),
             hidden_size=M2N_HIDDEN_SIZE,
             dtype=torch.bfloat16,
             num_experts=layout.num_experts,
@@ -722,6 +723,21 @@ def test_handshake_rejects_mismatched_network_config():
 
     with pytest.raises(RuntimeError, match="disagree on network"):
         validate_handshake(infos, layout, NetworkConfig())
+
+
+def test_handshake_rejects_mixed_control_backends():
+    """FFN on ``nccl`` and Attention on ``gloo``: the handshake raises.
+
+    Why: NCCL ranks would create a communicator that the gloo ranks never
+    join, so startup would hang until the timeout instead of failing.
+    """
+    layout = DeepEPM2NLayout(ffn_size=1, attn_size=1, num_experts=128)
+    nccl = _handshake(layout)
+    gloo = _handshake(layout, config=DeepEPM2NConfig(control_backend="gloo"))
+
+    validate_handshake(gloo, layout, NetworkConfig())
+    with pytest.raises(RuntimeError, match="disagree on control_backend"):
+        validate_handshake([nccl[0], gloo[1]], layout, NetworkConfig())
 
 
 def test_gloo_control_backend_stages_payloads_on_cpu():

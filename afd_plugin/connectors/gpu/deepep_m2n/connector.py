@@ -504,6 +504,7 @@ def local_handshake_info(
         "cpu_sync_min_tokens": config.cpu_sync_min_tokens,
         "attn_tp_size": attn_tp_size,
         "compute_gate_on_attention": compute_gate_on_attention,
+        "control_backend": config.control_backend,
         "network": str(config.network.to_mapping()),
         "expert_alignment": expert_alignment,
         "ffn_deployment": ffn_deployment,
@@ -520,6 +521,8 @@ _MUST_MATCH = (
     "top_k",
     "num_lanes",
     "compute_gate_on_attention",
+    # NCCL ranks create a communicator that gloo ranks would never join.
+    "control_backend",
     "network",
     "bucket_granularity",
     "cpu_sync_min_tokens",
