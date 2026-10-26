@@ -214,60 +214,50 @@ normal interpreter shutdown; diagnostic failures still return a nonzero code.
 
 ## Validation and performance reporting
 
-CPU tests cover metadata/configuration and host ownership decisions; they do
-not qualify native packing, HCCL, Graph capture or pending device work. Native
-qualification for this revision covered 24 clamp/unlimited and empty/tail
+The model-integration revision at `d3c6198` passes 79 CPU cases covering model
+selection/rejection, source metadata, local placement, CPU-only first imports
+and host ownership. This includes an independent metadata adapter contract and
+12 real subprocess isolation cases. The metadata adapter is a test seam, not
+evidence for a second model. CPU tests do not qualify native packing, HCCL,
+Graph capture or pending device work.
+
+Applicable lower-level evidence is reused: 24 clamp/unlimited and empty/tail
 numerical cases, finite synthetic eager/FULL CAM execution, and the original
-43-layer checkpoint with one A peer and four independent F processes. The
-FULL/two-stream outputs matched eager exactly. A final extra transaction proved
-the next F batch was pending before stop; all F processes retained their owners
-and exited through paired-process isolation.
+43-layer checkpoint with one A peer and four independent F processes. These
+are earlier checks of the unchanged operators and execution contract, rather
+than new candidate measurements. FULL/two-stream outputs matched eager exactly;
+an extra transaction exercised pending-receive isolation.
 
 The [native A fixture](../../tests/npu/standalone_cam_attention.py) drives these
 independent layer inputs and can hold its communication owner for stop checks.
 This fixture qualifies FFN/CAM behavior, not Attention, KV or HTTP inference.
 Reuse applicable existing qualification when the execution path is unchanged.
 
-The additional real-model run at `d136157` used the original checkpoint, native Attention
-HTTP service, A TP4/DP3 with eager MRV2 and two nonempty DBO microbatches, and
-four independent F processes with FULL/two-stream execution (20 AIC/40 AIV for
-compute, 8 AIV for combine). Both comparison groups explicitly disabled prefix
-caching, used a 2048-token dispatch envelope and retained runtime warmup.
-After three warmup requests, each group processed six frozen prompts of
-14,399–14,935 tokens at concurrency six, followed by 17/31/257-token tail
-requests. Every request generated one token. The reference used the mature CAM
-FFN service and the same common clamp fix, rather than another mode of the
-standalone weight owner. All nine business-request token IDs and returned
-log probabilities matched exactly. CPU-only observers confirmed completed
-two-microbatch execution on all 12 A workers and 43-layer FULL/two-stream
-execution on all four F workers.
+The real-model regression at `d3c6198` used the original checkpoint, native
+Attention HTTP service, A TP4/DP3 with eager MRV2 and two nonempty DBO
+microbatches, and four independent F processes with FULL/two-stream execution
+(20 AIC/40 AIV compute, 8 AIV combine). Prefix caching was explicitly disabled,
+with a 2048-token dispatch envelope and runtime warmup. Three short warmups
+preceded six frozen 14,399–14,935-token prompts at C6 and 17/31/257-token tails;
+each request generated one token. All nine business token IDs, generated-token
+log probabilities and top-5 log probabilities matched the existing mature CAM
+reference at `d136157` exactly. That reference was reused; the mature service
+was not rerun. The native binaries were also reused without rebuilding.
 
-At stop, all four standalone F ranks reported an outstanding receive with
-`resources_released=false` and failed closed; the whole paired deployment was
-then isolated. Attention exited successfully and no owned process or NPU
-process remained. This validates paired-process teardown, not normal drain,
-EOS or independent hot restart. It is a finite integration and next-token
-correctness check, not a whole-model accuracy benchmark or a throughput/TTFT
-qualification.
+CPU-only functional observers confirmed real DBO on all 12 A workers and
+43-layer FULL/two-stream execution on all four F workers, importing the new
+`CAMRoutedModel` resource. F-only EP4 and separate CAM16 groups coexisted;
+the same native routed owner, expert-map managers and quantizers remained
+reachable through the failed/pending boundary, with 64 local experts per layer.
 
-The adapter/environment revision at `9151609` requalified the affected execution
-and exit paths with the same original checkpoint and finite workload. All nine
-business token IDs, generated-token log probabilities and top-5 log
-probabilities again matched the mature reference exactly. All 12 A workers
-completed real DBO, and all four F ranks executed all 43 layers in FULL/two-stream
-mode. The F-only EP4 group and separate CAM16 group coexisted at readiness;
-the same native routed modules, expert-map managers and quantizers remained
-reachable through the failed/pending boundary. Each layer retained 64 local
-experts. Native CPU binding produced the intended F-thread affinities.
-
-The F-first functional teardown produced peer-error logs on Attention after
-the successful requests. All four F ranks retained owners and exited nonzero;
-whole-pair isolation left no owned or NPU processes. Attention's final zero
-exit code does not establish graceful teardown or successful drain. The CPU
-service suite passed 65 cases, including the actual injected host/backend
-interface and 12 real subprocess isolation cases. Applicable native numerical
-and pinned-stack qualification above was reused without rebuilding operators
-or rerunning unrelated model accuracy evaluations.
+All four F ranks failed closed at stop with `resources_released=false` and
+owners retained. Whole-pair isolation left no owned or NPU process. F exited
+nonzero; Attention logged peer errors after successful requests and exited
+zero. This proves paired-process teardown, not graceful drain, EOS or hot
+restart. The finite next-token regression is not a whole-model accuracy or
+throughput/TTFT benchmark. No GSM8K or performance matrix was rerun. The run
+used another A3 node after resource migration; it is not mixed with the earlier
+same-node performance comparison below.
 
 Profiling-management APIs, cancellable receive, a uniform bounded-exit
 contract, migration of other connectors and independent A/F dependency pins
