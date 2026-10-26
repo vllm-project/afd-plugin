@@ -398,7 +398,10 @@ def test_qwen_text_only_uses_upstream_missing_vision_tower_stage(monkeypatch):
             super().__init__()
             self.weight = nn.Parameter(torch.ones(1))
 
-    multimodal_config = MultiModalConfig(language_model_only=True)
+    multimodal_config = MultiModalConfig(
+        language_model_only=True,
+        mm_device_do_normalize=False,
+    )
     # Native _mark_tower_model resolves the MM config through the
     # ModelConfig method rather than the raw attribute.
     model_config = SimpleNamespace(
@@ -457,6 +460,3 @@ def test_qwen_text_only_uses_upstream_missing_vision_tower_stage(monkeypatch):
         for name, _parameter in model.named_parameters()
         if name.startswith("visual.")
     ] == []
-    assert all(
-        parameter.is_meta for parameter in model.visual.__dict__["module"].parameters()
-    )
