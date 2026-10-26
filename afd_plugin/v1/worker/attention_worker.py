@@ -4,9 +4,10 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from vllm.config import VllmConfig
-from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
 from vllm.v1.worker.gpu_worker import Worker
 
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
@@ -17,6 +18,9 @@ from afd_plugin.validation import (
     assert_compatible_afd_stack,
     validate_gpu_model_runner_v2_config,
 )
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
 class AFDAttentionWorker(Worker):
@@ -40,27 +44,20 @@ class AFDAttentionWorker(Worker):
             is_driver_worker,
         )
 
-    # Patch reason: vLLM 0.30.0 constructs its runner inside Worker.init_device
-    # after an internal module import, with no injectable runner factory.
-    # Patch functionality: validate the supported V2 contract, select the AFD model
-    # identity before construction, and scope the module-class substitution to
-    # the delegated native initialization window.
-    # Signature: matches vLLM v0.30.0 Worker.init_device exactly: (self).
+    # Patch reason: native device initialization does not validate the AFD role
+    # or select its model architecture before allocating GPU resources.
+    # Patch functionality: validate and select the AFD model before delegating
+    # native device, distributed, workspace and runner initialization.
+    # Signature: matches vLLM v0.32.0 Worker.init_device exactly: (self).
     # Upstream source: vllm/v1/worker/gpu_worker.py, Worker.init_device;
-    # runner local-import/construct seam; commit
-    # ced6857afa0ea7b2e3f0846a62e1394e90f15607. The 0.30.0 init_device still
-    # local-imports GPUModelRunner from vllm.v1.worker.gpu.model_runner before
-    # construction, so the module-attribute substitution stays effective.
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
     # Delegation exception: the large native device/distributed setup remains
-    # in super().init_device(); only this missing runner-factory seam is local.
-    # Removal/upstream plan: delete this substitution when vLLM adds runner
-    # factory/class injection; the upstream target is that factory seam.
-    # Concurrency invariant: Worker.init_device runs synchronously during startup,
-    # with no concurrent runner construction in the worker process.
+    # in super().init_device(); this override contains only AFD preflight.
+    # Removal plan: remove when native worker startup supports AFD preflight.
     def init_device(self):
         """Initialize the native GPU worker with the selected AFD runner."""
 
-        # ### PATCH START: select and directly construct the AFD runner.
+        # ### PATCH START: validate and select the AFD model.
         assert_compatible_afd_stack(
             self.vllm_config,
             caller="AFDAttentionWorker.init_device",
@@ -78,16 +75,16 @@ class AFDAttentionWorker(Worker):
         )
         self.vllm_config.model_config = afd_model_config
         self.model_config = afd_model_config
+        # ### PATCH END: validate and select the AFD model.
 
-        native_runner_cls = gpu_model_runner_v2.GPUModelRunner
-        gpu_model_runner_v2.GPUModelRunner = AFDAttentionModelRunnerV2
-        try:
-            super().init_device()
-        finally:
-            gpu_model_runner_v2.GPUModelRunner = native_runner_cls
-        # ### PATCH END: select and directly construct the AFD runner.
-
+        super().init_device()
         torch.accelerator.empty_cache()
+
+    # The native factory still annotates V1 and uses a local return-type
+    # exception for V2. Keep that signature and the same typing boundary.
+    def _make_model_runner(self) -> GPUModelRunner:
+        """Construct the AFD runner through the native worker factory hook."""
+        return AFDAttentionModelRunnerV2(self.vllm_config, self.device)  # type: ignore[return-value]
 
 
 __all__ = ["AFDAttentionWorker"]
