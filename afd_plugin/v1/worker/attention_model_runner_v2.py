@@ -367,10 +367,16 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
 
     afd_expected_role = "attention"
 
+    # Signature: native (vllm_config, device) plus a keyword-only
+    # ``connector``: the instance the worker created before vLLM's distributed
+    # init (see connector_lifecycle.py), which the worker keeps owning if
+    # construction fails. ``None`` creates the connector here.
     def __init__(
         self,
         vllm_config: VllmConfig,
         device: torch.device,
+        *,
+        connector: AFDConnectorBase | None = None,
     ):
         validate_gpu_model_runner_v2_config(
             vllm_config,
@@ -378,16 +384,17 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
             device_type=device.type,
         )
         super().__init__(vllm_config, device)
-        connector: AFDConnectorBase | None = None
+        owns_connector = connector is None
         try:
             self.afd_config = self.parse_config(self.vllm_config)
-            rank, local_rank = _resolve_world_ranks()
-            connector = AFDConnectorFactory.create_connector(
-                rank,
-                local_rank,
-                self.vllm_config,
-                self.afd_config,
-            )
+            if connector is None:
+                rank, local_rank = _resolve_world_ranks()
+                connector = AFDConnectorFactory.create_connector(
+                    rank,
+                    local_rank,
+                    self.vllm_config,
+                    self.afd_config,
+                )
             self.connector = connector
             # The connector rendezvous is deferred to the end of ``load_model()``
             # so Attention and FFN weight loading overlap, matching the V1
@@ -405,7 +412,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
             self.prof = create_afd_gpu_profiler("attention")
         except BaseException:
             try:
-                if connector is not None:
+                if owns_connector and connector is not None:
                     connector.close()
             finally:
                 super().shutdown()
@@ -446,15 +453,6 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
         return parse_afd_config(vllm_config, expected_role="attention")
-
-    def adopt_bootstrapped_connector(self, connector: AFDConnectorBase) -> None:
-        """Use the connector the worker bootstrapped before vLLM's init.
-
-        Replaces the connector created at construction, which never
-        communicated, so the native constructor signature stays unchanged.
-        """
-        self.connector.close()
-        self.connector = connector
 
     # Patch reason: native V2 load_model has no AFD connector lifecycle.
     # Patch functionality: initialize the AFD connector after native weight

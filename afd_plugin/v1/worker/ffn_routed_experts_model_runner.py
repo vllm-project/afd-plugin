@@ -116,16 +116,21 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
     (DeepEP M2N).
     """
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
-        super().__init__(vllm_config, device)
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        *,
+        connector: AFDConnectorBase | None = None,
+    ) -> None:
+        super().__init__(vllm_config, device, connector=connector)
         _require_routed(self.connector)
         self.moe_layer_indices: tuple[int, ...] = ()
         self.local_experts: dict[int, FFNLocalExperts] = {}
 
     @property
     def routed_connector(self) -> AFDRoutedExpertsConnector:
-        """The connector; the worker may replace it with the one it
-        bootstrapped, so it is checked where it is used."""
+        """The connector, typed as the routed-experts contract it must meet."""
         return _require_routed(self.connector)
 
     def load_model(self, *, load_dummy_weights: bool = False, **kwargs: Any) -> None:

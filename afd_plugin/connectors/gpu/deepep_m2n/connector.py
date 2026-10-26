@@ -892,9 +892,9 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
     once, also within one CUDA-graph capture: a capture holds about two
     layers' rows per lane, not every layer's.
 
-    Lifecycle: ``bootstrap`` (before vLLM's distributed init: handshake and
-    NCCL environment), then ``init_afd_connector`` (after weights load:
-    post-load checks, NCCL control group and DeepEP buffers).
+    Lifecycle: ``prepare_before_distributed_init`` (before vLLM's distributed
+    init: handshake and NCCL environment), then ``init_afd_connector`` (after
+    weights load: post-load checks, NCCL control group and DeepEP buffers).
     """
 
     @classmethod
@@ -933,7 +933,8 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             raise ValueError(f"FP8 payload needs hidden_size % {FP8_GROUP_SIZE} == 0")
         self.world_rank = self.layout.world_rank(afd_config.role, role_rank)
         # The FFN runs without TP and learns the Attention TP size and the
-        # resulting capacity in the handshake (``bootstrap``).
+        # resulting capacity in the handshake
+        # (``prepare_before_distributed_init``).
         self.attn_tp_size: int | None = (
             None if self.is_ffn else vllm_config.parallel_config.tensor_parallel_size
         )
@@ -994,7 +995,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
     # Lifecycle
     # ==============================
 
-    def bootstrap(self) -> None:
+    def prepare_before_distributed_init(self) -> None:
         """Collective: join the AFD world, check compatibility, set NCCL env.
 
         Workers call this before vLLM's distributed init, because NCCL reads
@@ -1059,7 +1060,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         if self.world_rank == 0:
             logger.info("DeepEP M2N network plan: %s", self.network_plan.summary())
         # Before any NCCL communicator in this process exists, when the worker
-        # bootstraps ahead of vLLM's distributed init.
+        # calls this ahead of vLLM's distributed init.
         apply_rank_environment(self.network_plan, self.config.network, self.world_rank)
         # DeepEP reads this when each buffer is created: with several lanes
         # each buffer needs its own communication stream.
@@ -1084,7 +1085,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             return
         if local_experts is not None and not self.is_ffn:
             raise ValueError("only FFN ranks hold local experts")
-        self.bootstrap()
+        self.prepare_before_distributed_init()
         torch.cuda.set_device(self.device)
         _register_custom_ops()
         assert self.bootstrap_group is not None and self.network_plan is not None
@@ -1593,7 +1594,9 @@ class DeepEPM2NAFDControlPlane(AFDControlPlane):
             or connector.capacity_tokens_per_rank is None
             or connector.bucket_ladder is None
         ):
-            raise RuntimeError("DeepEPM2N control plane used before bootstrap")
+            raise RuntimeError(
+                "DeepEPM2N control plane used before prepare_before_distributed_init"
+            )
         connector.stage_plans = {
             stage_idx: plan_stage(
                 dp_metadata,

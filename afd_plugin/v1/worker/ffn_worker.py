@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -17,10 +18,9 @@ from vllm.v1.worker.worker_base import CompilationTimes
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory, AFDRoutedExpertsConnector
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
-from afd_plugin.v1.worker.connector_device import (
-    check_connector_device,
-    check_connector_role_rank,
-    connector_device_index,
+from afd_plugin.v1.worker.connector_lifecycle import (
+    check_worker_connector,
+    create_worker_connector,
 )
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
 from afd_plugin.validation import (
@@ -70,10 +70,10 @@ class AFDFFNWorker(Worker):
     # Patch functionality: replace only the V2 construction seam with the
     # connector-driven FFN runner: GPUFFNRoutedExpertsModelRunner (imported
     # only then) for an AFDRoutedExpertsConnector, else GPUFFNModelRunner. A
-    # routed-experts connector is created and bootstrapped first, so its NCCL
-    # environment precedes vLLM's NCCL groups, and the runner adopts it after
-    # construction. The connector gets the device vLLM will select, checked
-    # once vLLM has selected it.
+    # connector that must join the AFD world before vLLM's distributed init is
+    # created first (connector_lifecycle.py), so its NCCL environment precedes
+    # vLLM's NCCL groups, handed to the runner through the seam, and checked
+    # against vLLM's device and ranks once vLLM has chosen them.
     # Signature: matches vLLM v0.30.0 Worker.init_device exactly: (self).
     # Upstream source: vllm/v1/worker/gpu_worker.py, Worker.init_device;
     # ced6857afa0ea7b2e3f0846a62e1394e90f15607. The 0.30.0 init_device still
@@ -114,29 +114,31 @@ class AFDFFNWorker(Worker):
             )
 
             runner_cls = GPUFFNRoutedExpertsModelRunner
-            # Before bootstrap: a rejected backend fails before any collective.
+            # Before the connector joins the AFD world: a rejected backend
+            # fails before any collective.
             select_routed_moe_backend(self.vllm_config)
-        connector = AFDConnectorFactory.create_bootstrapped_connector(
-            self.rank,
-            connector_device_index(self.vllm_config, self.local_rank),
+        connector = create_worker_connector(
             self.vllm_config,
             afd_config,
+            rank=self.rank,
+            local_rank=self.local_rank,
         )
         native_runner_cls = gpu_model_runner_v2.GPUModelRunner
-        gpu_model_runner_v2.GPUModelRunner = runner_cls
+        gpu_model_runner_v2.GPUModelRunner = (
+            runner_cls
+            if connector is None
+            else partial(runner_cls, connector=connector)
+        )
         try:
             super().init_device()
             if connector is not None:
-                check_connector_device(connector, self.device)
-                check_connector_role_rank(connector, self.vllm_config)
+                check_worker_connector(connector, self.vllm_config, self.device)
         except BaseException:
             if connector is not None:
                 connector.close()
             raise
         finally:
             gpu_model_runner_v2.GPUModelRunner = native_runner_cls
-        if connector is not None:
-            self.model_runner.adopt_bootstrapped_connector(connector)
         # ### PATCH END: construct the FFN runner through the V2 seam.
         torch.accelerator.empty_cache()
 

@@ -64,8 +64,8 @@ def tp_rank_before_distributed_init(vllm_config: VllmConfig, worker_rank: int) -
     vLLM orders ranks ``[ExternalDP, DP, PP, PCP, TP]`` with TP innermost
     (vLLM v0.30.0 ``initialize_model_parallel``), and AFD runs with PP = PCP =
     1, so the TP rank is the worker rank modulo the TP size whether the worker
-    rank is DP-local or global. ``check_connector_role_rank`` compares the
-    result with vLLM's TP group once it exists.
+    rank is DP-local or global. The worker compares the resulting role rank
+    with vLLM's TP group once it exists (``check_worker_connector``).
     """
     parallel_config = vllm_config.parallel_config
     if (

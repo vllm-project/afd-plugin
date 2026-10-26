@@ -2067,22 +2067,67 @@ def test_v2_load_model_reports_moe_layers_to_routed_connector(monkeypatch):
     }
 
 
-def test_v2_runner_adopts_bootstrapped_connector_and_closes_placeholder():
-    """The worker's bootstrapped connector replaces the one built at
-    construction, which is closed.
+def _patch_constructor_with_workers_connector(monkeypatch, events):
+    def native_init(self, vllm_config, device):
+        self.vllm_config = vllm_config
 
-    Why: the native constructor signature stays unchanged.
+    def unexpected_create(*args, **kwargs):
+        pytest.fail("the runner created a second connector")
+
+    monkeypatch.setattr(native_v2.GPUModelRunner, "__init__", native_init)
+    monkeypatch.setattr(
+        native_v2.GPUModelRunner,
+        "shutdown",
+        lambda self: events.append("native_shutdown"),
+    )
+    monkeypatch.setattr(
+        "afd_plugin.v1.worker.attention_model_runner_v2.create_afd_gpu_profiler",
+        lambda role: _StepProfiler(),
+    )
+    config = _patch_v2_constructor_dependencies(monkeypatch, None)
+    monkeypatch.setattr(
+        v2_runner_module.AFDConnectorFactory, "create_connector", unexpected_create
+    )
+    return config
+
+
+def test_v2_constructor_uses_the_workers_connector_without_creating_one(
+    monkeypatch,
+):
+    """A connector the worker created before vLLM's init is the runner's one
+    instance; the runner creates none.
+
+    Why: one connector instance per worker, with a single create, then
+    ``init_afd_connector`` lifecycle.
     """
     events: list[str] = []
-    placeholder = SimpleNamespace(close=lambda: events.append("placeholder_close"))
-    bootstrapped = SimpleNamespace()
-    runner = object.__new__(AFDAttentionModelRunnerV2)
-    runner.connector = placeholder
+    connector = SimpleNamespace(
+        control_plane=object(), close=lambda: events.append("close")
+    )
+    config = _patch_constructor_with_workers_connector(monkeypatch, events)
 
-    runner.adopt_bootstrapped_connector(bootstrapped)
+    runner = AFDAttentionModelRunnerV2(config, torch.device("cpu"), connector=connector)
 
-    assert runner.connector is bootstrapped
-    assert events == ["placeholder_close"]
+    assert runner.connector is connector
+    assert events == []
+
+
+def test_v2_constructor_failure_leaves_the_workers_connector_open(monkeypatch):
+    """A failed construction closes native state but not the worker's
+    connector.
+
+    Why: the worker still owns that connector and closes it itself.
+    """
+    events: list[str] = []
+    connector = SimpleNamespace(
+        control_plane=None, close=lambda: events.append("close")
+    )
+    config = _patch_constructor_with_workers_connector(monkeypatch, events)
+
+    with pytest.raises(RuntimeError, match="control-plane"):
+        AFDAttentionModelRunnerV2(config, torch.device("cpu"), connector=connector)
+
+    assert events == ["native_shutdown"]
 
 
 def test_v2_constructor_rejects_missing_control_plane_and_cleans_native(
@@ -2294,13 +2339,10 @@ def test_worker_runner_substitution_restores_on_constructor_exception(
 
 
 class _ConnectorRunnerRecorder:
-    adopted: list[object] = []
+    connectors: list[object] = []
 
-    def __init__(self, vllm_config, device):
-        pass
-
-    def adopt_bootstrapped_connector(self, connector):
-        type(self).adopted.append(connector)
+    def __init__(self, vllm_config, device, *, connector=None):
+        type(self).connectors.append(connector)
 
 
 _ROUTED_WORKER_CASES = [
@@ -2320,60 +2362,67 @@ _ROUTED_WORKER_CASES = [
 ]
 
 
-@pytest.mark.parametrize(
-    ("worker_module", "worker_cls", "runner_module", "runner_name"),
-    _ROUTED_WORKER_CASES,
-)
-def test_workers_bootstrap_connector_before_vllm_and_hand_it_to_runner(
-    monkeypatch, worker_module, worker_cls, runner_module, runner_name
-):
-    """An ``AFDRoutedExpertsConnector`` is created and bootstrapped before
-    vLLM's distributed init and adopted by the runner; the FFN picks the
-    routed-experts runner.
-
-    Why: NCCL reads its environment when vLLM creates the first communicator.
-    """
-    config = _v2_config(role="ffn" if worker_cls is AFDFFNWorker else "attention")
-    worker = _prepare_worker(worker_cls, config, use_v2=True)
-    events: list[str] = []
-    connector = SimpleNamespace(close=lambda: events.append("close"), local_rank=0)
-    _ConnectorRunnerRecorder.adopted = []
-
-    def create_bootstrapped_connector(rank, local_rank, vllm_config, afd_config):
-        events.append("bootstrap")
-        return connector
-
-    def vllm_init(current_worker):
-        events.append("vllm_init")
-        _fake_worker_init(current_worker)
-        current_worker.device = torch.device("cuda", 0)
-
-    factory = worker_module.AFDConnectorFactory
+def _patch_routed_worker(monkeypatch, worker_module, runner_module, runner_name):
+    """Select a routed-experts connector and record the runner construction."""
+    _ConnectorRunnerRecorder.connectors = []
+    # The FFN worker picks its runner from the connector class.
     monkeypatch.setattr(
-        factory, "create_bootstrapped_connector", create_bootstrapped_connector
-    )
-    monkeypatch.setattr(
-        factory, "get_connector_class", lambda name: FakeRoutedConnector
+        ffn_worker.AFDConnectorFactory,
+        "get_connector_class",
+        lambda name: FakeRoutedConnector,
     )
     monkeypatch.setattr(runner_module, runner_name, _ConnectorRunnerRecorder)
     monkeypatch.setattr(native_v2, "GPUModelRunner", _NativeRunnerSentinel)
-    monkeypatch.setattr(worker_module.Worker, "init_device", vllm_init)
     monkeypatch.setattr(
         worker_module,
         "assert_compatible_afd_stack",
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(worker_module.torch.accelerator, "empty_cache", lambda: None)
+
+
+@pytest.mark.parametrize(
+    ("worker_module", "worker_cls", "runner_module", "runner_name"),
+    _ROUTED_WORKER_CASES,
+)
+def test_workers_create_connector_before_vllm_and_construct_runner_with_it(
+    monkeypatch, worker_module, worker_cls, runner_module, runner_name
+):
+    """A connector that joins the AFD world before vLLM's distributed init is
+    created first and passed to the runner vLLM constructs, which uses that
+    one instance; the FFN picks the routed-experts runner.
+
+    Why: NCCL reads its environment when vLLM creates the first communicator,
+    and vLLM builds the runner only after that.
+    """
+    config = _v2_config(role="ffn" if worker_cls is AFDFFNWorker else "attention")
+    worker = _prepare_worker(worker_cls, config, use_v2=True)
+    events: list[str] = []
+    connector = SimpleNamespace(close=lambda: events.append("close"))
+
+    def create_worker_connector(vllm_config, afd_config, *, rank, local_rank):
+        events.append("create")
+        return connector
+
+    def vllm_init(current_worker):
+        events.append("vllm_init")
+        _fake_worker_init(current_worker)
+
+    _patch_routed_worker(monkeypatch, worker_module, runner_module, runner_name)
+    monkeypatch.setattr(
+        worker_module, "create_worker_connector", create_worker_connector
+    )
+    monkeypatch.setattr(worker_module.Worker, "init_device", vllm_init)
     monkeypatch.setattr(
         worker_module,
-        "check_connector_role_rank",
-        lambda checked, vllm_config: events.append("role_rank_check"),
+        "check_worker_connector",
+        lambda checked, vllm_config, device: events.append("check"),
     )
 
     worker.init_device()
 
-    assert events == ["bootstrap", "vllm_init", "role_rank_check"]
-    assert _ConnectorRunnerRecorder.adopted == [connector]
+    assert events == ["create", "vllm_init", "check"]
+    assert _ConnectorRunnerRecorder.connectors == [connector]
     assert native_v2.GPUModelRunner is _NativeRunnerSentinel
     # The routed FFN pins vLLM's MoE backend to one that keeps the expert layout.
     expected_backend = "triton" if worker_cls is AFDFFNWorker else "auto"
@@ -2384,7 +2433,7 @@ def test_workers_bootstrap_connector_before_vllm_and_hand_it_to_runner(
     ("worker_module", "worker_cls", "runner_module", "runner_name"),
     _ROUTED_WORKER_CASES,
 )
-def test_workers_close_bootstrapped_connector_when_vllm_init_fails(
+def test_workers_close_their_connector_when_vllm_init_fails(
     monkeypatch, worker_module, worker_cls, runner_module, runner_name
 ):
     config = _v2_config(role="ffn" if worker_cls is AFDFFNWorker else "attention")
@@ -2395,21 +2444,11 @@ def test_workers_close_bootstrapped_connector_when_vllm_init_fails(
     def failing_vllm_init(current_worker):
         raise RuntimeError("vLLM init failed")
 
-    factory = worker_module.AFDConnectorFactory
+    _patch_routed_worker(monkeypatch, worker_module, runner_module, runner_name)
     monkeypatch.setattr(
-        factory, "create_bootstrapped_connector", lambda *args: connector
+        worker_module, "create_worker_connector", lambda *args, **kwargs: connector
     )
-    monkeypatch.setattr(
-        factory, "get_connector_class", lambda name: FakeRoutedConnector
-    )
-    monkeypatch.setattr(runner_module, runner_name, _ConnectorRunnerRecorder)
-    monkeypatch.setattr(native_v2, "GPUModelRunner", _NativeRunnerSentinel)
     monkeypatch.setattr(worker_module.Worker, "init_device", failing_vllm_init)
-    monkeypatch.setattr(
-        worker_module,
-        "assert_compatible_afd_stack",
-        lambda *args, **kwargs: None,
-    )
 
     with pytest.raises(RuntimeError, match="vLLM init failed"):
         worker.init_device()
@@ -2422,10 +2461,10 @@ def test_workers_close_bootstrapped_connector_when_vllm_init_fails(
     ("worker_module", "worker_cls", "runner_module", "runner_name"),
     _ROUTED_WORKER_CASES,
 )
-def test_workers_reject_bootstrapped_connector_on_another_device(
+def test_workers_reject_connector_on_another_device(
     monkeypatch, worker_module, worker_cls, runner_module, runner_name
 ):
-    """A connector bootstrapped on a different GPU than vLLM's fails startup.
+    """A connector created on a different GPU than vLLM's fails startup.
 
     Why: the connector picks its device before vLLM does, by mirroring vLLM's
     selection; a vLLM upgrade that changes the selection must fail here
@@ -2435,33 +2474,21 @@ def test_workers_reject_bootstrapped_connector_on_another_device(
     worker = _prepare_worker(worker_cls, config, use_v2=True)
     events: list[str] = []
     connector = SimpleNamespace(close=lambda: events.append("close"), local_rank=0)
-    _ConnectorRunnerRecorder.adopted = []
 
     def vllm_init(current_worker):
         _fake_worker_init(current_worker)
         current_worker.device = torch.device("cuda", 4)
 
-    factory = worker_module.AFDConnectorFactory
+    _patch_routed_worker(monkeypatch, worker_module, runner_module, runner_name)
     monkeypatch.setattr(
-        factory, "create_bootstrapped_connector", lambda *args: connector
+        worker_module, "create_worker_connector", lambda *args, **kwargs: connector
     )
-    monkeypatch.setattr(
-        factory, "get_connector_class", lambda name: FakeRoutedConnector
-    )
-    monkeypatch.setattr(runner_module, runner_name, _ConnectorRunnerRecorder)
-    monkeypatch.setattr(native_v2, "GPUModelRunner", _NativeRunnerSentinel)
     monkeypatch.setattr(worker_module.Worker, "init_device", vllm_init)
-    monkeypatch.setattr(
-        worker_module,
-        "assert_compatible_afd_stack",
-        lambda *args, **kwargs: None,
-    )
 
     with pytest.raises(RuntimeError, match="uses cuda:0 but vLLM placed"):
         worker.init_device()
 
     assert events == ["close"]
-    assert _ConnectorRunnerRecorder.adopted == []
     assert native_v2.GPUModelRunner is _NativeRunnerSentinel
 
 
@@ -2477,7 +2504,7 @@ def test_v2_validator_accepts_deepep_m2n_attention_tp(tp_size):
     """DeepEP M2N accepts Attention TP > 1.
 
     Why: each Attention TP rank dispatches its own slice of the tokens, and
-    the bootstrap derives the TP rank from the worker rank before vLLM's
+    the worker derives the TP rank from the worker rank before vLLM's
     process groups exist.
     """
     validate_gpu_model_runner_v2_config(

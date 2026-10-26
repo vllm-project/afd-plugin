@@ -14,8 +14,7 @@ from afd_plugin.config import (
     parse_afd_config,
 )
 from afd_plugin.connectors.base import AFDConnectorBase, ConnectorExtraInfo
-from afd_plugin.connectors.routed_experts import AFDRoutedExpertsConnector
-from afd_plugin.distributed import resolve_role_rank, tp_rank_before_distributed_init
+from afd_plugin.distributed import resolve_role_rank
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -70,43 +69,6 @@ class AFDConnectorFactory:
             config,
             role_rank,
         )
-
-    @classmethod
-    def create_bootstrapped_connector(
-        cls,
-        rank: int,
-        local_rank: int,
-        vllm_config: VllmConfig,
-        afd_config: AFDConfig,
-    ) -> AFDRoutedExpertsConnector | None:
-        """Create and bootstrap a routed-experts connector ahead of vLLM.
-
-        Workers call this before vLLM's distributed init. Returns ``None`` for
-        connectors that are not ``AFDRoutedExpertsConnector``; their runner
-        creates them later, as before. vLLM's TP group does not exist yet, so
-        the TP part of the role rank comes from the worker ``rank``
-        (``tp_rank_before_distributed_init``); workers check it with
-        ``check_connector_role_rank`` after vLLM's init. ``local_rank`` is the
-        CUDA device index the connector uses; vLLM has not selected the
-        worker's device yet, so callers pass the index it will select.
-        """
-        connector_cls = cls.get_connector_class(afd_config.connector)
-        if not issubclass(connector_cls, AFDRoutedExpertsConnector):
-            return None
-        connector = cls.create_connector(
-            rank,
-            local_rank,
-            vllm_config,
-            afd_config,
-            tp_rank=tp_rank_before_distributed_init(vllm_config, rank),
-        )
-        assert isinstance(connector, AFDRoutedExpertsConnector)
-        try:
-            connector.bootstrap()
-        except BaseException:
-            connector.close()
-            raise
-        return connector
 
     @classmethod
     def get_connector_class(cls, connector_name: str) -> type[AFDConnectorBase]:

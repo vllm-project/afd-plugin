@@ -61,7 +61,15 @@ class GPUFFNModelRunner:
 
     afd_expected_role = "ffn"
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
+    # ``connector``: the instance the worker created before vLLM's distributed
+    # init (see connector_lifecycle.py); ``None`` creates the connector here.
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        *,
+        connector: AFDConnectorBase | None = None,
+    ) -> None:
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.load_config = vllm_config.load_config
@@ -77,13 +85,15 @@ class GPUFFNModelRunner:
             vllm_config,
             role="ffn",
         )
-        rank, local_rank = _resolve_world_ranks()
-        self.connector = AFDConnectorFactory.create_connector(
-            rank,
-            local_rank,
-            vllm_config,
-            self.afd_config,
-        )
+        if connector is None:
+            rank, local_rank = _resolve_world_ranks()
+            connector = AFDConnectorFactory.create_connector(
+                rank,
+                local_rank,
+                vllm_config,
+                self.afd_config,
+            )
+        self.connector = connector
         # TODO: Async GPU connector will be supported in the future
         assert self.connector.control_plane is not None, (
             "GPU model runner only supports control-plane-driven connectors"
@@ -108,15 +118,6 @@ class GPUFFNModelRunner:
 
     def initialize_afd_connector(self) -> None:
         self.connector.init_afd_connector()
-
-    def adopt_bootstrapped_connector(self, connector: AFDConnectorBase) -> None:
-        """Use the connector the worker bootstrapped before vLLM's init.
-
-        Replaces the connector created at construction, which never
-        communicated.
-        """
-        self.connector.close()
-        self.connector = connector
 
     def load_model(self, *, load_dummy_weights: bool = False, **kwargs: Any) -> None:
         """Load the vLLM model."""

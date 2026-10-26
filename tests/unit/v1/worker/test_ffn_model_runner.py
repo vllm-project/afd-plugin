@@ -179,7 +179,16 @@ def test_ffn_runner_owns_connector_execution_without_native_runner_inheritance()
     assert all(base.__name__ != "GPUModelRunner" for base in GPUFFNModelRunner.__mro__)
 
 
-def test_ffn_constructor_defers_connector_init_and_owns_model_and_graphs(monkeypatch):
+# A connector the worker created before vLLM's init is the runner's one
+# instance: the runner then creates none.
+@pytest.mark.parametrize(
+    ("workers_connector", "expected_events"),
+    [(False, ["validate", "connector"]), (True, ["validate"])],
+    ids=["runner-creates", "worker-passes"],
+)
+def test_ffn_constructor_defers_connector_init_and_owns_model_and_graphs(
+    monkeypatch, workers_connector, expected_events
+):
     config = SimpleNamespace(
         use_v2_model_runner=True,
         model_config=SimpleNamespace(
@@ -220,9 +229,13 @@ def test_ffn_constructor_defers_connector_init_and_owns_model_and_graphs(monkeyp
         ffn_model_runner_module, "create_afd_gpu_profiler", lambda _role: None
     )
 
-    runner = GPUFFNModelRunner(config, torch.device("cpu"))
+    runner = GPUFFNModelRunner(
+        config,
+        torch.device("cpu"),
+        connector=connector if workers_connector else None,
+    )
 
-    assert events == ["validate", "connector"]
+    assert events == expected_events
     assert runner.connector is connector
     assert runner.model is None
     assert runner.model_memory_usage == 0

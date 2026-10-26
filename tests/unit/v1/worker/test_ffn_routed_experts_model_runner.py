@@ -186,30 +186,36 @@ def test_initialize_passes_moe_layers_and_experts_to_the_connector():
     }
 
 
-def test_constructor_rejects_connectors_without_routed_rows(monkeypatch):
-    def base_init(self, vllm_config, device):
-        self.connector = SimpleNamespace(close=lambda: None)
+def _base_init_with(monkeypatch):
+    def base_init(self, vllm_config, device, *, connector=None):
+        self.connector = connector or SimpleNamespace(close=lambda: None)
 
     monkeypatch.setattr(GPUFFNModelRunner, "__init__", base_init)
+
+
+def test_constructor_rejects_connectors_without_routed_rows(monkeypatch):
+    _base_init_with(monkeypatch)
 
     with pytest.raises(TypeError, match="is not an AFDRoutedExpertsConnector"):
         GPUFFNRoutedExpertsModelRunner(SimpleNamespace(), torch.device("cpu"))
 
 
-def test_ffn_runner_adopts_bootstrapped_connector_and_closes_placeholder():
-    """The worker's bootstrapped connector replaces the one built at
-    construction, which is closed.
+def test_constructor_uses_the_workers_connector(monkeypatch):
+    """The routed runner runs on the connector the worker created before
+    vLLM's distributed init.
 
-    Why: bootstrap must precede vLLM's distributed init, construction cannot.
+    Why: that connector already joined the AFD world; a second instance
+    would never be initialized by its peers.
     """
-    events: list[str] = []
-    runner = _runner(SimpleNamespace(close=lambda: events.append("close")))
-    bootstrapped = FakeRoutedConnector()
+    connector = FakeRoutedConnector()
+    _base_init_with(monkeypatch)
 
-    runner.adopt_bootstrapped_connector(bootstrapped)
+    runner = GPUFFNRoutedExpertsModelRunner(
+        SimpleNamespace(), torch.device("cpu"), connector=connector
+    )
 
-    assert runner.connector is bootstrapped
-    assert events == ["close"]
+    assert runner.connector is connector
+    assert runner.routed_connector is connector
 
 
 def _routed_experts(*, fp8: bool, expert_ids=(4, 5), backend: str = "TRITON"):

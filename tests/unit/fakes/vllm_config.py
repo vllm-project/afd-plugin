@@ -54,6 +54,29 @@ def npu_parallel_config(**overrides):
     return SimpleNamespace(**values)
 
 
+def gpu_worker_vllm_config(**overrides):
+    """The ``parallel_config`` fields that worker device and role-rank
+    resolution read, for one GPU worker (mp executor, DP1 x TP1 by default).
+    """
+    values = {
+        "distributed_executor_backend": "mp",
+        "data_parallel_backend": "mp",
+        "nnodes_within_dp": 1,
+        "data_parallel_size": 1,
+        "data_parallel_rank": 0,
+        "data_parallel_rank_local": 0,
+        "data_parallel_index": 0,
+        "pipeline_parallel_size": 1,
+        "prefill_context_parallel_size": 1,
+        "tensor_parallel_size": 1,
+        "assigned_physical_gpu_ids": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(
+        additional_config={}, parallel_config=SimpleNamespace(**values)
+    )
+
+
 def npu_vllm_config(
     *,
     role="attention",

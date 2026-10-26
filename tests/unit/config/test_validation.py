@@ -209,8 +209,8 @@ def test_routed_transport_requires_model_that_routes_on_attention(
             mrv2_config, expected_role=role, device_type="cuda"
         )
         return
-    # Workers validate before the connector bootstrap; rejecting a model must
-    # not need the model runtime.
+    # Workers validate before the connector joins the AFD world; rejecting a
+    # model must not need the model runtime.
     monkeypatch.setitem(sys.modules, MODEL_UTILS_MODULE, None)
     with pytest.raises(RuntimeError, match="DeepEPM2NAFDConnector supports only"):
         validate_gpu_model_runner_v2_config(

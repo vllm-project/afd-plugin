@@ -158,7 +158,7 @@ def test_tp_rank_before_distributed_init_is_worker_rank_mod_tp(
     """TP is vLLM's innermost rank dimension, so the worker rank gives it.
 
     Why: this holds for DP-local and global worker ranks alike;
-    ``check_connector_role_rank`` re-checks it after vLLM's init.
+    ``check_worker_connector`` re-checks it after vLLM's init.
     """
     assert (
         tp_rank_before_distributed_init(_pre_init_config(tp_size=tp_size), worker_rank)

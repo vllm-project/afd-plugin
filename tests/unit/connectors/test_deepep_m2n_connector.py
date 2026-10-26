@@ -822,7 +822,7 @@ def test_control_plane_requires_the_handshake_on_ffn():
         is_warmup=False,
     )
 
-    with pytest.raises(RuntimeError, match="before bootstrap"):
+    with pytest.raises(RuntimeError, match="before prepare_before_distributed_init"):
         connector.control_plane.update_state_from_dp_metadata(payload)
 
 
