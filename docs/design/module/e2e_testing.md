@@ -29,13 +29,16 @@ validation_paths:
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
   - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
   - "tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_gpu.py"
+  - "tests/e2e/models/deepseek_v4_flash/gpu_config.py"
   - "tests/e2e/environment.py"
   - "tests/e2e/models/deepseek_v4_flash/config.py"
   - "tests/e2e/models/deepseek_v4_flash/completions.py"
   - "tests/e2e/models/qwen3_moe/test_qwen3_moe.py"
   - "tests/e2e/models/qwen3_6/test_qwen3_6.py"
 upstream_refs:
-  - "vLLM 0.30.0 serving and shutdown interfaces"
+  - "vLLM 0.32.0 CUDA serving, MRV2 execution and shutdown interfaces"
+  - "vLLM 0.30.0 Ascend serving and shutdown interfaces"
   - "lm-evaluation-harness GSM8K task and local-completions API"
   - "pytest parameterized test IDs"
 verified_platform_refs:
@@ -174,6 +177,42 @@ produces incorrect concurrent answers. A3 answer correctness remains
 unverified. These smoke cases do not qualify synchronous DSV4 accuracy; see
 the [profile limits](../../../tests/e2e/README.md#dsv4-flash-sync-camp2p-concurrent-requests-local-4-or-16-npus).
 The async case retains its exact-answer check.
+
+CUDA DSV4 Flash has a separate candidate qualification suite in
+`tests/e2e/models/deepseek_v4_flash/test_gpu.py`; it has no hardware support
+claim until the selected cases pass. Its four basic cells pair native MRV2
+eager/graph (DP2/TP1/EP2) with synchronous AFD eager/graph (2A2F, DP2/TP1 per
+role), using at most four devices. Four independent DBO cells pair the same
+native and AFD eager/graph modes. Native rejection is not bypassed. The native
+probe observes request-time microbatch slices and counts only successful
+parent execution with real tokens in both children; AFD probes observe both
+roles. Graph+DBO requires consecutive matching-layout replays.
+
+Each CUDA V4 case checks two rounds of ten distinct concurrent arithmetic
+requests, with the answer repeated eight times to exercise live decode, and
+then evaluates GSM8K. The fixed graph bucket is 8; the second round changes
+input IDs while keeping request shape. This stresses freshness of Hash-router
+IDs rather than replaying one identical prompt. Its checkpoint, quantization,
+seed, tokenizer, and per-role parallelism match the native control. It reuses
+the shared HTTP oracle, lm-eval, liveness, probes and owned-process cleanup;
+Ascend profiles and their smoke limits are unchanged. GPU full accuracy
+requires `AFD_GSM8K_LIMIT=all`, including for these new profiles. See the
+[CUDA qualification commands](../../../tests/e2e/README.md#dsv4-flash-cuda-qualification).
+
+Each concurrent round and GSM8K has an independent named reset/report window,
+including FFN re-arming. Graph/DBO evidence is checked on every participating
+rank immediately after that window. The concurrent AFD CUDA windows additionally
+pair native Attention InputBatch IDs with the actual input Tensor passed to the
+first local FFN Hash layer. Capture only retains references; after selected
+successful live execution it reads at most 16 small transactions per concurrent
+window, 8 IDs per stage/peer. Pairing uses the existing control order and subgroup
+peer order; native real token counts exclude padding. Both concurrent windows
+must independently match A/F, and samples must change across rounds at the
+same padded bucket and real size before GSM8K starts. This observation does
+not alter the production control payload or data plane.
+GSM8K does not require bounded Hash coverage. FFN health reporting defers while
+native execution or evidence submission is in flight; the publication lock
+never waits for GPU execution or the sampled ID copies.
 
 The 2A1F cases use three of the four devices (two Attention ranks and one
 FFN rank). DeepSeek-V2-Lite eager/graph remain local-only; its graph+DBO

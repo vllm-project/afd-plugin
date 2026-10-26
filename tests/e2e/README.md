@@ -242,6 +242,96 @@ For a full 1319-sample run, export `AFD_GSM8K_LIMIT=all` before invoking
 pytest. Without `AFD_GSM8K_LIMIT`, these scenarios evaluate the first 7
 samples, with the existing 24-sample floor for DBO.
 
+## DSV4 Flash CUDA qualification
+
+`models/deepseek_v4_flash/test_gpu.py` provides separate CUDA qualification
+profiles for the synchronous `P2pNcclAFDConnector`. These are candidate H20
+profiles; adding the cases does not establish GPU V4 support. They do not reuse
+Ascend W4A8, HCCL, or the NPU launch shapes.
+
+The basic test has four cases:
+
+| Scenario | Execution | Devices |
+| --- | --- | ---: |
+| `baseline-dsv4-flash-eager` | Native MRV2 eager, DP2/TP1/EP2 | first 2 |
+| `baseline-dsv4-flash-graph` | Native MRV2 `FULL_DECODE_ONLY`, DP2/TP1/EP2 | first 2 |
+| `afd-dsv4-flash-eager-2a2f` | AFD MRV2 eager, Attention DP2/TP1 and FFN DP2/TP1/EP2 | 4 |
+| `afd-dsv4-flash-graph-2a2f` | Same AFD topology with `FULL_DECODE_ONLY` | 4 |
+
+`test_deepseek_v4_flash_gpu_dbo` separately qualifies native and AFD eager/graph
+DBO: `baseline-dsv4-flash-eager-dbo`, `baseline-dsv4-flash-graph-dbo`,
+`afd-dsv4-flash-eager-dbo-2a2f`, and `afd-dsv4-flash-graph-dbo-2a2f`.
+Native feature rejection remains a failure; the harness does not bypass it.
+DBO must complete two nonempty live stages on every participating native or
+AFD rank. Graph+DBO also requires consecutive matching-layout replays. These
+cases do not infer DBO execution from the ten short concurrent requests.
+
+Every case first sends two rounds of ten distinct concurrent arithmetic
+requests. Each answer must contain its expected sum eight times and finish
+with `stop`; this exercises decode after the first answer token. Both rounds
+use the same request shape and fixed capture size 8 while changing input IDs,
+to expose stale Hash-router inputs across replay. Each round resets and closes
+its own named evidence window, then checks every participating rank before
+the next round starts. GSM8K uses a third independent window; its replays
+cannot satisfy a missing concurrent-round graph/DBO check. Prefix caching is off.
+The NPU profiles retain their own one-round oracle and existing smoke limits.
+After the concurrent check, each CUDA case evaluates GSM8K and checks service
+liveness and cleanup through the shared runner. Native graph/DBO probes observe
+the native runner; AFD graph/DBO probes require evidence from both roles.
+
+Both concurrent rounds of all four AFD CUDA cases compare actual token IDs.
+GSM8K has independent Graph/DBO checks without bounded Hash-coverage
+requirements. The test-only extension observes native Attention `InputBatch`
+inputs and retains the Tensor passed to
+`compute_ffn_output` at the first local Hash layer on FFN. During capture it
+only retains that reference; after selected successful live eager/replay
+transactions it samples at most 16 small transactions per concurrent window,
+at most 8 IDs per stage/peer. Samples pair by window, control order, stage and the
+connector's existing peer order, trimming FFN padding using Attention's real
+token count. Every A/F rank and nonempty DBO stage must match. Before GSM8K,
+the second round must contain changed IDs at the same bucket and real size
+on every peer/stage. Correct answers or receive-buffer shapes alone do not
+satisfy this check. Per-round HTTP diagnostics use `completions-round-1.json`
+and `completions-round-2.json`.
+
+FFN health reporting defers while a native call or its evidence submission is
+in flight, then publishes on the next existing health RPC after submission.
+GPU execution and bounded ID copies run outside the publication lock.
+
+The fixed text profile uses 4096 context, a 1024-token batch budget, up to 8
+sequences, chunked prefill, and `kv-cache-dtype=fp8`. It leaves weight
+quantization and the device-aware MoE kernel selection to the checkpoint and
+target vLLM. AFD keeps gating on FFN and does not enable MegaMoE. Provision the
+large Flash checkpoint explicitly with `AFD_GPU_E2E_MODEL`; there is no implicit
+model download. Model fit and kernel workspace still need H20 validation.
+
+Within a four-GPU scheduler allocation, use only its assigned device IDs and
+run cases sequentially:
+
+```bash
+export HF_HOME=/path/to/huggingface
+export AFD_E2E_BACKEND=gpu
+export AFD_E2E_DEVICES=0,1,2,3
+export AFD_GPU_E2E_MODEL=/path/to/DeepSeek-V4-Flash
+python -m pytest -q -s \
+  tests/e2e/models/deepseek_v4_flash/test_gpu.py::test_deepseek_v4_flash_gpu
+
+# Qualify DBO independently after the basic cases pass.
+python -m pytest -q -s \
+  tests/e2e/models/deepseek_v4_flash/test_gpu.py::test_deepseek_v4_flash_gpu_dbo
+
+# Final accuracy: all 1319 questions, rather than the default 7/24-sample smoke.
+AFD_GSM8K_LIMIT=all python -m pytest -q -s \
+  tests/e2e/models/deepseek_v4_flash/test_gpu.py
+```
+
+The baseline uses only the first two devices so its DP/TP/EP dimensions match
+each AFD role; it is a correctness control, not an equal-resource performance
+comparison. `AFD_GPU_DSV4_E2E_API_PORT`, `AFD_GPU_DSV4_E2E_AFD_PORT`, and
+`AFD_GPU_E2E_STARTUP_TIMEOUT` override the default ports (19480/6457) and
+1800-second startup timeout. The suite is not automatically added to weekly CI.
+Keep GPU/NPU/IPC and scheduler-release evidence with every hardware run.
+
 ## DSV4 Flash async CAM concurrent requests (local, 16 NPUs)
 
 `afd-dsv4-flash-async-cam-dp2tp4-ep8` runs Attention DP2/TP4 on the first
