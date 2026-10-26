@@ -447,15 +447,6 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
         return parse_afd_config(vllm_config, expected_role="attention")
 
-    def adopt_bootstrapped_connector(self, connector: AFDConnectorBase) -> None:
-        """Use the connector the worker bootstrapped before vLLM's init.
-
-        Replaces the connector created at construction, which never
-        communicated, so the native constructor signature stays unchanged.
-        """
-        self.connector.close()
-        self.connector = connector
-
     # Patch reason: native V2 load_model has no AFD connector lifecycle.
     # Patch functionality: initialize the AFD connector after native weight
     # loading so Attention and FFN model loading overlap across roles. A

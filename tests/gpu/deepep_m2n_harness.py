@@ -17,6 +17,7 @@ from __future__ import annotations
 import functools
 import gc
 import json
+import math
 import os
 import random
 import socket
@@ -344,6 +345,17 @@ def rel_err(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return diff / denom if denom > 0 else diff
 
 
+def update_worst_error(worst: float, key: str, value: float) -> float:
+    """The larger of ``worst`` and ``value``; a non-finite error fails at once.
+
+    ``max`` ignores NaN (every comparison with it is false), so a NaN output
+    would otherwise keep the previous worst and pass the tolerance check.
+    """
+    if not math.isfinite(value):
+        raise AssertionError(f"{key}={value} is not finite")
+    return max(worst, value)
+
+
 # ---------------------------------------------------------------------------
 # Process plumbing
 # ---------------------------------------------------------------------------
@@ -394,21 +406,17 @@ def make_connector(
     port: int,
     host: str,
 ) -> Any:
-    """The connector as the runtime constructs it (not yet initialized)."""
+    """The connector class the factory resolves, not yet initialized."""
     from afd_plugin.config import afd_config_from_mapping
     from afd_plugin.connectors import AFDConnectorFactory
 
     role, role_rank = topology.role(world_rank)
     vllm_config = m2n_vllm_config(topology, role, role_rank, extra_config, port, host)
     afd_config = afd_config_from_mapping(vllm_config.additional_config["afd"])
-    # No vLLM TP group here: pass the TP rank, as workers do before init.
-    return AFDConnectorFactory.create_connector(
-        world_rank,
-        local_rank,
-        vllm_config,
-        afd_config,
-        tp_rank=role_rank % vllm_config.parallel_config.tensor_parallel_size,
-    )
+    # No vLLM process groups here, so pass the role rank the topology gives
+    # instead of resolving it from vLLM's ranks as the factory does.
+    connector_cls = AFDConnectorFactory.get_connector_class(afd_config.connector)
+    return connector_cls(world_rank, local_rank, vllm_config, afd_config, role_rank)
 
 
 def control_step(
@@ -627,7 +635,7 @@ class Checker:
             self.w13_ref, self.w2_ref = make_expert_weights(range(M2N_NUM_EXPERTS))
 
     def record(self, key: str, value: float) -> None:
-        self.worst[key] = max(self.worst.get(key, 0.0), value)
+        self.worst[key] = update_worst_error(self.worst.get(key, 0.0), key, value)
 
     def check_ffn_receive(
         self,
@@ -785,10 +793,7 @@ class Checker:
 
     def network_plan_summary(self) -> str:
         plan = self.connector.network_plan
-        if plan is None:
-            return ""
-        nic = plan.nic_by_rank[self.connector.world_rank]
-        return f"{plan.summary()} this_rank_nic={nic or 'nccl'}"
+        return "" if plan is None else plan.summary()
 
 
 def attention_context(layer: int, stage: int, num_tokens: int) -> Any:

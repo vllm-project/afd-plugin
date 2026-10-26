@@ -37,9 +37,6 @@ class FakeRoutedConnector(AFDRoutedExpertsConnector):
     def close(self) -> None:
         self.events.append(("close",))
 
-    def bootstrap(self) -> None:
-        self.events.append(("bootstrap",))
-
     def init_afd_connector(self, *, moe_layer_indices=None, local_experts=None):
         self.init_kwargs = {
             "moe_layer_indices": moe_layer_indices,

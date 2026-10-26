@@ -84,9 +84,17 @@ template <class mmType> class GMMA8W4MidProcess {
     using bT = typename mmType::BT;
 
   public:
-    __aicore__ inline GMMA8W4MidProcess(typename mmType::MT &matmul) : mm(matmul)
+    // Patch reason: keep both MSD tile resources initialized without repeated TPipe allocations.
+    // Patch functionality: baseline starts active; preserve selection across workspace slices.
+    // Signature: adds adaptiveMatmul/adaptiveTiling; remove with upstream adaptive tiling.
+    // ### PATCH START: adaptive MSD tile
+    __aicore__ inline GMMA8W4MidProcess(typename mmType::MT &matmul, typename mmType::MT &adaptiveMatmul,
+                                       const TCubeTiling *adaptiveTiling)
+        : mm(matmul), adaptiveMm(adaptiveMatmul), activeMm(&matmul),
+          adaptiveBaseM(adaptiveTiling->baseM), adaptiveBaseN(adaptiveTiling->baseN)
     {
     }
+    // ### PATCH END: adaptive MSD tile
     __aicore__ inline void Init(const GMAddrParams gmAddrParams,
                                 const GMMSwigluQuantV2BaseParams *__restrict gmmSwigluQuantV2BaseParamsIN);
     __aicore__ inline void Process(WorkSpaceSplitConfig &workspaceSplitConfig, int64_t workspaceSplitLoopIdx);
@@ -98,6 +106,12 @@ template <class mmType> class GMMA8W4MidProcess {
 
   private:
     typename mmType::MT &mm;
+    // ### PATCH START: adaptive MSD tile
+    typename mmType::MT &adaptiveMm;
+    typename mmType::MT *activeMm;
+    uint32_t adaptiveBaseM;
+    uint32_t adaptiveBaseN;
+    // ### PATCH END: adaptive MSD tile
     const uint32_t HALF_ALIGN = 16;
     GlobalTensor<int4b_t> xGM;
     GlobalTensor<int4b_t> xGM1;
@@ -157,16 +171,52 @@ template <typename mmType> __aicore__ inline void GMMA8W4MidProcess<mmType>::Upd
     mnConfig.yBaseOffset += mnConfig.m * mnConfig.n;
 }
 
+// Patch reason: capacity does not describe an expert's intersection with the active slice.
+// Patch functionality: choose a tile only when modeled tail traffic and task count do not grow.
+// Signature: unchanged. Remove when upstream supports device adaptive MSD tiling.
 template <typename mmType>
 __aicore__ inline void GMMA8W4MidProcess<mmType>::SetMNConfig(const int32_t splitValue, MNConfig &mnConfig)
 {
     mnConfig.m = static_cast<int64_t>(splitValue);
-    mnConfig.baseM = gmmSwigluQuantV2BaseParams->baseM;
-    mnConfig.baseN = gmmSwigluQuantV2BaseParams->baseN;
-    mnConfig.singleM = gmmSwigluQuantV2BaseParams->baseM;
-    mnConfig.singleN = gmmSwigluQuantV2BaseParams->baseN;
+    // ### PATCH START: adaptive MSD tile
+    if (splitValue <= 0) {
+        return;
+    }
+    constexpr uint64_t MSD_M_ALIGNMENT = 16;
+    constexpr uint64_t MSD_N_ALIGNMENT = 64;
+    const uint64_t rows = static_cast<uint64_t>(splitValue);
+    const uint64_t columns = static_cast<uint64_t>(mnConfig.n);
+    const uint64_t baseM = gmmSwigluQuantV2BaseParams->baseM;
+    const uint64_t baseN = gmmSwigluQuantV2BaseParams->baseN;
+    const uint64_t baselineRows = (rows + baseM - 1) / baseM;
+    const uint64_t baselineColumns = (columns + baseN - 1) / baseN;
+    const uint64_t alternativeRows = (rows + adaptiveBaseM - 1) / adaptiveBaseM;
+    const uint64_t alternativeColumns = (columns + adaptiveBaseN - 1) / adaptiveBaseN;
+    const uint64_t alignedRows = (rows + MSD_M_ALIGNMENT - 1) / MSD_M_ALIGNMENT * MSD_M_ALIGNMENT;
+    const uint64_t alignedColumns = (columns + MSD_N_ALIGNMENT - 1) / MSD_N_ALIGNMENT * MSD_N_ALIGNMENT;
+    // Common K/2 cancels from the packed A+B byte comparison.
+    const uint64_t baselineCost = alignedRows * baselineColumns + alignedColumns * baselineRows;
+    const uint64_t alternativeCost = alignedRows * alternativeColumns + alignedColumns * alternativeRows;
+    const bool useAlternative = alternativeCost <= baselineCost &&
+        alternativeRows * alternativeColumns <= baselineRows * baselineColumns && alternativeRows < baselineRows;
+    auto *selectedMm = useAlternative ? &adaptiveMm : &mm;
+    if (selectedMm != activeMm) {
+        activeMm->End();
+        // End clears the shared ND/unit-flag layout state; restore it before reuse.
+        AscendC::SetMMRowMajor();
+        activeMm = selectedMm;
+    }
+    mnConfig.baseM = useAlternative ? adaptiveBaseM : baseM;
+    mnConfig.baseN = useAlternative ? adaptiveBaseN : baseN;
+    mnConfig.singleM = mnConfig.baseM;
+    mnConfig.singleN = mnConfig.baseN;
+    mnConfig.blockDimN = Ceil(mnConfig.n, mnConfig.singleN);
+    // ### PATCH END: adaptive MSD tile
 }
 
+// Patch reason: all AICs must select consistently even with no assigned tile.
+// Patch functionality: configure the selected object before the existing task loop.
+// Signature: unchanged; remove with upstream adaptive tiling.
 template <typename mmType>
 __aicore__ inline void GMMA8W4MidProcess<mmType>::Process(WorkSpaceSplitConfig &workspaceSplitConfig,
                                                           int64_t workspaceSplitLoopIdx)
@@ -214,7 +264,9 @@ __aicore__ inline void GMMA8W4MidProcess<mmType>::Process(WorkSpaceSplitConfig &
                 continue;
             }
             mnConfig.blockDimM = Ceil(mnConfig.m, mnConfig.singleM);
-            mm.SetOrgShape(mnConfig.m, mnConfig.n, mnConfig.k);
+            // ### PATCH START: adaptive MSD tile
+            activeMm->SetOrgShape(mnConfig.m, mnConfig.n, mnConfig.k);
+            // ### PATCH END: adaptive MSD tile
             uint32_t curCount = preCount + mnConfig.blockDimN * mnConfig.blockDimM;
             uint32_t curBlock = coreIdx >= preCount ? coreIdx : coreIdx + gmmSwigluQuantV2BaseParams->coreNum;
             while (curBlock < curCount) {
@@ -228,10 +280,16 @@ __aicore__ inline void GMMA8W4MidProcess<mmType>::Process(WorkSpaceSplitConfig &
     }
 }
 
+// Patch reason: task-grid and Matmul resource selection must agree.
+// Patch functionality: issue each tile through the active object.
+// Signature: unchanged; remove with upstream adaptive tiling.
 template <typename mmType>
 __aicore__ inline void GMMA8W4MidProcess<mmType>::MMCompute(uint32_t groupIdx, MNConfig &mnConfig,
                                                             WorkSpaceSplitConfig &workspaceSplitConfig)
 {
+    // ### PATCH START: adaptive MSD tile
+    auto &mm = *activeMm;
+    // ### PATCH END: adaptive MSD tile
     uint32_t tailN = mnConfig.nIdx * mnConfig.singleN;
     uint32_t curSingleN = mnConfig.singleN;
     if (unlikely(mnConfig.nIdx == mnConfig.blockDimN - 1)) {

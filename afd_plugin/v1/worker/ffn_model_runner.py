@@ -25,7 +25,6 @@ from afd_plugin.compat.profiler import (
 )
 from afd_plugin.config import AFDConfig, parse_afd_config
 from afd_plugin.connectors import (
-    AFDConnectorBase,
     AFDConnectorFactory,
     AFDControlPayload,
     AFDControlPlane,
@@ -108,15 +107,6 @@ class GPUFFNModelRunner:
 
     def initialize_afd_connector(self) -> None:
         self.connector.init_afd_connector()
-
-    def adopt_bootstrapped_connector(self, connector: AFDConnectorBase) -> None:
-        """Use the connector the worker bootstrapped before vLLM's init.
-
-        Replaces the connector created at construction, which never
-        communicated.
-        """
-        self.connector.close()
-        self.connector = connector
 
     def load_model(self, *, load_dummy_weights: bool = False, **kwargs: Any) -> None:
         """Load the vLLM model."""

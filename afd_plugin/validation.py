@@ -48,6 +48,9 @@ GPU_MRV2_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pNcclAFDConnector",
     *DEEPEP_M2N_CONNECTORS,
 )
+# Models whose Attention side computes the MoE gate and top-k and sends them
+# with the hidden states, as a routed-experts connector (DeepEP M2N) needs.
+ATTENTION_ROUTING_MODEL_ARCHITECTURES: Final[tuple[str, ...]] = ("Qwen3MoeForCausalLM",)
 
 
 CAM_MAX_RECEIVE_TOKENS = 262144
@@ -106,13 +109,14 @@ def validate_gpu_model_runner_v2_config(
         )
 
     parallel = vllm_config.parallel_config
-    # DeepEP M2N bootstraps before vLLM's distributed init and derives the TP
-    # part of the role rank from the worker rank. Attention may run TP > 1:
-    # each TP rank dispatches its own slice of the tokens. FFN experts are not
-    # TP-sharded; that and the other deployment checks (expert placement,
-    # all2all backend, weight format) run in the connector handshake so that
-    # every rank fails together. It routes on Attention, so it requires the
-    # gate there.
+    # DeepEP M2N: Attention may run TP > 1, each TP rank dispatching its own
+    # slice of the tokens. FFN experts are not TP-sharded; that and the other
+    # deployment checks (expert placement, all2all backend, weight format) run
+    # in the connector handshake so that every rank fails together. It routes
+    # on Attention, so it requires the gate there, and a model whose Attention
+    # side sends the top-k. Workers validate before the connector joins the AFD
+    # world, so both roles fail before any collective instead of one role
+    # timing out.
     if afd_config.connector in DEEPEP_M2N_CONNECTORS:
         if expected_role == "ffn" and parallel.tensor_parallel_size != 1:
             raise RuntimeError(
@@ -121,6 +125,16 @@ def validate_gpu_model_runner_v2_config(
         if not afd_config.compute_gate_on_attention:
             raise RuntimeError(
                 f"{afd_config.connector} requires compute_gate_on_attention=true"
+            )
+        # Runners validate the AFD-prefixed architecture of the wrapped model.
+        architectures = vllm_config.model_config.hf_config.architectures
+        if not any(
+            architecture.removeprefix("AFD") in ATTENTION_ROUTING_MODEL_ARCHITECTURES
+            for architecture in architectures
+        ):
+            raise RuntimeError(
+                f"{afd_config.connector} supports only "
+                f"{ATTENTION_ROUTING_MODEL_ARCHITECTURES}, got {architectures}"
             )
     if (
         parallel.pipeline_parallel_size,
@@ -396,6 +410,7 @@ def assert_compatible_afd_stack(
 
 __all__ = [
     "ATTENTION_MODEL_RUNNER_FQCN",
+    "ATTENTION_ROUTING_MODEL_ARCHITECTURES",
     "ATTENTION_WORKER_FQCN",
     "FFN_MODEL_RUNNER_FQCN",
     "FFN_WORKER_FQCN",

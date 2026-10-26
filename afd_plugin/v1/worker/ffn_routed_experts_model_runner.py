@@ -124,8 +124,7 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
 
     @property
     def routed_connector(self) -> AFDRoutedExpertsConnector:
-        """The connector; the worker may replace it with the one it
-        bootstrapped, so it is checked where it is used."""
+        """The connector, typed as the routed-experts contract it must meet."""
         return _require_routed(self.connector)
 
     def load_model(self, *, load_dummy_weights: bool = False, **kwargs: Any) -> None:

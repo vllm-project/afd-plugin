@@ -64,6 +64,9 @@ BEGIN_TILING_DATA_DEF(GMMSwigluQuantV2TilingData)
 TILING_DATA_FIELD_DEF_STRUCT(GMMSwigluQuantV2BaseParams, gmmSwigluQuantV2BaseParams);
 TILING_DATA_FIELD_DEF_STRUCT(GMMSwigluQuantV2, gmmSwigluQuantV2);
 TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, mmTilingData);
+// ### PATCH START: adaptive MSD tile
+TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, adaptiveMmTilingData);
+// ### PATCH END: adaptive MSD tile
 END_TILING_DATA_DEF;
 
 BEGIN_TILING_DATA_DEF(GMMSwigluQuantV2TilingFusionData)
@@ -157,6 +160,10 @@ constexpr int64_t COMMON_TILING_KEY_MODE = 0;
 constexpr int64_t A8W4_BASEM = 128;
 constexpr int64_t A8W4_BASEK = 256;
 constexpr int64_t A8W4_BASEN = 256;
+// ### PATCH START: adaptive MSD tile
+constexpr int64_t A8W4_MSD_ADAPTIVE_BASEM = 256;
+constexpr int64_t A8W4_MSD_ADAPTIVE_BASEN = 128;
+// ### PATCH END: adaptive MSD tile
 constexpr int64_t SIZE_OF_HALF_2 = 2;
 
 class GroupedMatmulSwigluQuantV2LayeredTiling : public Ops::Transformer::OpTiling::TilingBaseClass {

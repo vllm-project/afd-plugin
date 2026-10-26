@@ -61,13 +61,19 @@ template <class mmType> class GMMSwigluQuantPipelineSchedule {
                                                       int32_t workspaceSplitLoopIdx);
 
   public:
+    // Patch reason: MSD mid-stage chooses between two once-initialized Matmul objects.
+    // Patch functionality: forward the alternative object and its host-generated dimensions.
+    // Signature: adds adaptiveMm and adaptiveTiling; remove with upstream adaptive tiling.
+    // ### PATCH START: adaptive MSD tile
     __aicore__ inline GMMSwigluQuantPipelineSchedule(
-        typename mmType::MT &mm_, const GMMSwigluQuantV2BaseParams *__restrict gmmSwigluQuantV2BaseParamsIN,
+        typename mmType::MT &mm_, typename mmType::MT &adaptiveMm, const TCubeTiling *adaptiveTiling,
+        const GMMSwigluQuantV2BaseParams *__restrict gmmSwigluQuantV2BaseParamsIN,
         const GMMSwigluQuantV2 *__restrict gmmSwigluIN, TPipe *tPipeIN)
-        : mm(mm_), midProcess(mm), gmmSwigluQuantV2BaseParams(gmmSwigluQuantV2BaseParamsIN),
+        : mm(mm_), midProcess(mm, adaptiveMm, adaptiveTiling), gmmSwigluQuantV2BaseParams(gmmSwigluQuantV2BaseParamsIN),
           gmmSwigluQuantV2(gmmSwigluIN), pipe(tPipeIN)
     {
     }
+    // ### PATCH END: adaptive MSD tile
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR weight, GM_ADDR weightScale, GM_ADDR xScale,
                                 GM_ADDR weightAssistanceMatrix, GM_ADDR groupList, int64_t curLayer, GM_ADDR y,
                                 GM_ADDR yScale, GM_ADDR workspace);

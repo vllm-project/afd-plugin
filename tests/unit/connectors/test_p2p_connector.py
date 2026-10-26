@@ -20,6 +20,7 @@ from afd_plugin.connectors import (  # noqa: E402
     AFDConnectorFactory,
     AFDControlPayload,
     AFDDPMetadata,
+    AFDExpertRoutingSpec,
     AFDTransferContext,
     AFDTransferMetadata,
 )
@@ -311,19 +312,19 @@ def test_p2p_tp2_maps_shared_dp_payload_one_to_one(monkeypatch):
     for connector in ffn_connectors:
 
         def record_ffn_send(
-            hidden_states,
-            dst,
+            tensors,
+            dsts,
             process_group,
             comm_id,
             *,
             connector=connector,
         ):
-            assert dst == 1
+            assert dsts == [1]
             ffn_routes.append(
-                (connector.world_rank, connector.mapping.subgroup_ranks[dst]),
+                (connector.world_rank, connector.mapping.subgroup_ranks[dsts[0]]),
             )
 
-        monkeypatch.setattr(connector, "_send_hidden_states", record_ffn_send)
+        monkeypatch.setattr(connector, "_send_tensors", record_ffn_send)
         connector.send_ffn_output(ffn_output, ffn_context)
 
     assert ffn_routes == [(0, 2), (1, 3)]
@@ -549,14 +550,22 @@ def test_eager_state_does_not_cache_hidden_buffers(monkeypatch):
     }
 
 
-def test_p2p_custom_ops_register_send_recv_with_fake_impls(monkeypatch):
+@pytest.fixture
+def registered_p2p_ops(monkeypatch):
+    """Run the op registration against a capturing registrar.
+
+    Returns the P2P module and the ``direct_register_custom_op`` kwargs in
+    registration order, so tests can call the real op implementations.
+    """
     module = importlib.import_module("afd_plugin.connectors.gpu.p2p")
     calls = []
 
     # Empty ops namespace: the registration helper skips ops that already
     # exist on torch.ops.vllm, so the fake must report none registered.
     torch_module = SimpleNamespace(
-        Tensor=object, ops=SimpleNamespace(vllm=SimpleNamespace())
+        Tensor=object,
+        ops=SimpleNamespace(vllm=SimpleNamespace()),
+        cuda=SimpleNamespace(current_stream=lambda device: f"stream:{device}"),
     )
 
     vllm_module = types.ModuleType("vllm")
@@ -583,15 +592,71 @@ def test_p2p_custom_ops_register_send_recv_with_fake_impls(monkeypatch):
     monkeypatch.setattr(module, "_AFD_CUSTOM_OPS_REGISTERED", False)
 
     module._register_p2p_custom_ops()
+    return module, calls
 
-    assert [call["op_name"] for call in calls] == [
-        "afd_p2p_send",
-        "afd_p2p_recv",
+
+def test_p2p_custom_ops_register_send_recv_with_fake_impls(registered_p2p_ops):
+    _, calls = registered_p2p_ops
+
+    assert [(call["op_name"], call["mutates_args"]) for call in calls] == [
+        ("afd_p2p_send", ["tensor"]),
+        ("afd_p2p_recv", ["out"]),
+        ("afd_p2p_send_group", ["tensors"]),
+        ("afd_p2p_recv_group", ["outs"]),
     ]
-    assert calls[0]["mutates_args"] == ["tensor"]
-    assert calls[1]["mutates_args"] == ["out"]
-    assert callable(calls[0]["fake_impl"])
-    assert callable(calls[1]["fake_impl"])
+    assert all(callable(call["fake_impl"]) for call in calls)
+
+
+class _RecordingCommunicator:
+    """Stands in for PyNcclCommunicator and records the NCCL call sequence."""
+
+    def __init__(self):
+        self.events = []
+
+    def group_start(self):
+        self.events.append("group_start")
+
+    def group_end(self):
+        self.events.append("group_end")
+
+    def send(self, tensor, dst, stream):
+        self.events.append(("send", tensor, dst, stream))
+
+    def recv(self, tensor, src, stream):
+        self.events.append(("recv", tensor, src, stream))
+
+
+# The grouped ops are the FFN rank's whole transport: every transfer, for one
+# peer or several, must sit inside a single group_start()/group_end() pair, in
+# the order given.
+@pytest.mark.parametrize(
+    ("op_name", "transfer"),
+    [("afd_p2p_send_group", "send"), ("afd_p2p_recv_group", "recv")],
+)
+@pytest.mark.parametrize("peers", [[1], [1, 2], [1, 1, 2, 2]])
+def test_p2p_group_ops_issue_transfers_inside_one_nccl_group(
+    registered_p2p_ops,
+    monkeypatch,
+    op_name,
+    transfer,
+    peers,
+):
+    module, calls = registered_p2p_ops
+    op_func = next(call["op_func"] for call in calls if call["op_name"] == op_name)
+    communicator = _RecordingCommunicator()
+    monkeypatch.setitem(module._AFD_COMMUNICATORS, 7, communicator)
+    tensors = [SimpleNamespace(device="cuda:0") for _ in peers]
+
+    op_func(tensors, peers, 7)
+
+    assert communicator.events == [
+        "group_start",
+        *[
+            (transfer, tensor, peer, "stream:cuda:0")
+            for tensor, peer in zip(tensors, peers, strict=True)
+        ],
+        "group_end",
+    ]
 
 
 def test_p2p_hidden_state_send_uses_registered_custom_op(monkeypatch):
@@ -692,6 +757,139 @@ def test_p2p_recv_preserves_dynamic_ref_tensor_first_dim(monkeypatch):
 
     assert output is ref_tensor
     assert calls == [(ref_tensor, 0, 23)]
+
+
+def _ffn_connector_with_peers(monkeypatch, recorded, peer_tokens):
+    """FFN rank whose Attention peers send ``peer_tokens``; records wire calls."""
+    connector = AFDConnectorFactory.create_connector(
+        0,
+        0,
+        _fake_vllm_config(),
+        AFDConfig(
+            role="ffn",
+            connector="P2pNcclAFDConnector",
+            num_attention_ranks=len(peer_tokens),
+            num_ffn_ranks=1,
+        ),
+    )
+    connector.control_plane.update_state_from_dp_metadata(
+        AFDControlPayload(
+            dp_metadata_list={0: AFDDPMetadata(peer_tokens)},
+            is_graph_capturing=False,
+            is_warmup=False,
+        ),
+    )
+    connector.a2e_group = connector.e2a_group = SimpleNamespace(
+        world_size=len(peer_tokens) + 1,
+    )
+    connector.a2e_comm_id, connector.e2a_comm_id = 5, 6
+    real_empty = torch.empty
+    monkeypatch.setattr(
+        torch,
+        "empty",
+        lambda size, **kwargs: real_empty(size, **{**kwargs, "device": "meta"}),
+    )
+
+    def record(op_name):
+        def op(tensors, peers, comm_id):
+            recorded.append(
+                (
+                    op_name,
+                    [(tuple(tensor.shape), tensor.dtype) for tensor in tensors],
+                    list(peers),
+                    comm_id,
+                ),
+            )
+
+        return op
+
+    for op_name in ("afd_p2p_send_group", "afd_p2p_recv_group"):
+        monkeypatch.setattr(torch.ops.vllm, op_name, record(op_name), raising=False)
+    for op_name in ("afd_p2p_send", "afd_p2p_recv"):
+        monkeypatch.setattr(
+            torch.ops.vllm,
+            op_name,
+            lambda *args, op_name=op_name: pytest.fail(f"{op_name} bypassed the group"),
+            raising=False,
+        )
+    return connector
+
+
+# One NCCL group carries every peer's tensors, for one peer as well as several;
+# within a peer the receive order matches its wire order (hidden states, then
+# router logits).
+@pytest.mark.parametrize(
+    ("peer_tokens", "routing_spec", "expected_buffers", "expected_srcs"),
+    [
+        ([3], None, [((3, 16), torch.bfloat16)], [1]),
+        (
+            [3, 5],
+            None,
+            [((3, 16), torch.bfloat16), ((5, 16), torch.bfloat16)],
+            [1, 2],
+        ),
+        (
+            [3, 5],
+            "router_logits",
+            [
+                ((3, 16), torch.bfloat16),
+                ((3, 4), torch.float32),
+                ((5, 16), torch.bfloat16),
+                ((5, 4), torch.float32),
+            ],
+            [1, 1, 2, 2],
+        ),
+    ],
+)
+def test_p2p_ffn_receives_all_attention_peers_in_one_group(
+    monkeypatch,
+    peer_tokens,
+    routing_spec,
+    expected_buffers,
+    expected_srcs,
+):
+    recorded: list[tuple] = []
+    connector = _ffn_connector_with_peers(monkeypatch, recorded, peer_tokens)
+    recv_kwargs = (
+        {"routing_spec": AFDExpertRoutingSpec(4, torch.float32)} if routing_spec else {}
+    )
+
+    payload = connector.recv_attn_output(ubatch_idx=0, **recv_kwargs)
+
+    assert recorded == [("afd_p2p_recv_group", expected_buffers, expected_srcs, 5)]
+    assert tuple(payload.hidden_states.shape) == (sum(peer_tokens), 16)
+    assert payload.context.metadata.seq_lens == peer_tokens
+    if routing_spec:
+        assert tuple(payload.router_logits.shape) == (sum(peer_tokens), 4)
+
+
+@pytest.mark.parametrize(
+    ("peer_tokens", "expected_slices", "expected_dsts"),
+    [
+        ([8], [((8, 16), torch.bfloat16)], [1]),
+        ([3, 5], [((3, 16), torch.bfloat16), ((5, 16), torch.bfloat16)], [1, 2]),
+    ],
+)
+def test_p2p_ffn_sends_all_attention_peers_in_one_group(
+    monkeypatch,
+    peer_tokens,
+    expected_slices,
+    expected_dsts,
+):
+    recorded: list[tuple] = []
+    connector = _ffn_connector_with_peers(monkeypatch, recorded, peer_tokens)
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_ffn_metadata(
+            layer_idx=0,
+            stage_idx=0,
+            seq_lens=peer_tokens,
+        ),
+    )
+
+    ffn_output = torch.zeros((8, 16), dtype=torch.bfloat16, device="meta")
+    connector.send_ffn_output(ffn_output, context)
+
+    assert recorded == [("afd_p2p_send_group", expected_slices, expected_dsts, 6)]
 
 
 def test_p2p_recv_single_rank_requires_ref_tensor():

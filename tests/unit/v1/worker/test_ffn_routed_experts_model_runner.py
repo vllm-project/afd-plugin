@@ -196,22 +196,6 @@ def test_constructor_rejects_connectors_without_routed_rows(monkeypatch):
         GPUFFNRoutedExpertsModelRunner(SimpleNamespace(), torch.device("cpu"))
 
 
-def test_ffn_runner_adopts_bootstrapped_connector_and_closes_placeholder():
-    """The worker's bootstrapped connector replaces the one built at
-    construction, which is closed.
-
-    Why: bootstrap must precede vLLM's distributed init, construction cannot.
-    """
-    events: list[str] = []
-    runner = _runner(SimpleNamespace(close=lambda: events.append("close")))
-    bootstrapped = FakeRoutedConnector()
-
-    runner.adopt_bootstrapped_connector(bootstrapped)
-
-    assert runner.connector is bootstrapped
-    assert events == ["close"]
-
-
 def _routed_experts(*, fp8: bool, expert_ids=(4, 5), backend: str = "TRITON"):
     num_experts = len(expert_ids)
     dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16

@@ -566,11 +566,11 @@ def test_layered_swiglu_layer_selection_is_not_degenerate(scenario: str) -> None
     group_list, _counts = _group_list(torch, 1, counts_pattern)
     results = []
     for layer in range(_LAYERS):
-        assist = [] if assists[layer] is None else [assists[layer]]
+        assist = [] if assists[layer] is None else assists
         outputs = torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered(
             x.clone(),
-            [weights[layer]],
-            [scales[layer]],
+            weights,
+            scales,
             assist,
             x_scale,
             group_list,

@@ -100,6 +100,7 @@ def _handshake(
     overrides: dict | None = None,
     hosts: str | None = None,
     attn_tp_size: int = 1,
+    config: DeepEPM2NConfig | None = None,
 ) -> list[dict]:
     """Handshake infos; rank r runs on host hosts[r] (one NVLink domain per host).
 
@@ -114,7 +115,7 @@ def _handshake(
             role="ffn" if is_ffn else "attention",
             role_rank=world_rank if is_ffn else world_rank - layout.ffn_size,
             world_rank=world_rank,
-            config=DeepEPM2NConfig(),
+            config=config or DeepEPM2NConfig(),
             hidden_size=M2N_HIDDEN_SIZE,
             dtype=torch.bfloat16,
             num_experts=layout.num_experts,
@@ -131,7 +132,6 @@ def _handshake(
                 world_rank=world_rank,
                 host=hosts[world_rank],
                 nvlink_domain=f"host:{hosts[world_rank]}",
-                local_index=hosts[: world_rank + 1].count(hosts[world_rank]) - 1,
             ),
         )
         infos.append(info)
@@ -178,7 +178,9 @@ def test_config_defaults_and_round_trip():
         ({"bucket_granularity": 0}, "bucket_granularity"),
         ({"cpu_sync_min_tokens": -1}, "cpu_sync_min_tokens"),
         ({"control_backend": "mpi"}, "control_backend"),
-        ({"network": {"preset": "token-ring"}}, "network.preset"),
+        ({"network": {"gin": "maybe"}}, "network.gin"),
+        # The connector no longer plans NICs: NCCL picks them.
+        ({"network": {"nic_policy": "shared"}}, "unknown network options"),
         ({"num_qps": -1}, "num_qps"),
         ({"expert_num_sms": -2}, "expert_num_sms"),
         ({"expert_num_sms": 131}, "expert_num_sms"),
@@ -189,7 +191,7 @@ def test_config_defaults_and_round_trip():
 )
 def test_config_rejects_invalid_options(raw, message):
     """Each bad or stale option (unknown or removed key, bad enum, zero or
-    negative size, bad network preset, bad timeout) raises a ValueError
+    negative size, bad network option, bad timeout) raises a ValueError
     naming the field.
 
     Why: typos and removed keys must fail at startup, not be ignored.
@@ -724,6 +726,21 @@ def test_handshake_rejects_mismatched_network_config():
         validate_handshake(infos, layout, NetworkConfig())
 
 
+def test_handshake_rejects_mixed_control_backends():
+    """FFN on ``nccl`` and Attention on ``gloo``: the handshake raises.
+
+    Why: NCCL ranks would create a communicator that the gloo ranks never
+    join, so startup would hang until the timeout instead of failing.
+    """
+    layout = DeepEPM2NLayout(ffn_size=1, attn_size=1, num_experts=128)
+    nccl = _handshake(layout)
+    gloo = _handshake(layout, config=DeepEPM2NConfig(control_backend="gloo"))
+
+    validate_handshake(gloo, layout, NetworkConfig())
+    with pytest.raises(RuntimeError, match="disagree on control_backend"):
+        validate_handshake([nccl[0], gloo[1]], layout, NetworkConfig())
+
+
 def test_gloo_control_backend_stages_payloads_on_cpu():
     """With ``control_backend: gloo`` control payloads are staged on CPU.
 
@@ -740,21 +757,21 @@ def test_gloo_control_backend_stages_payloads_on_cpu():
 
 
 def test_config_parses_network_section_and_tunables():
-    """The ``network`` section (preset plus NIC), ``num_qps`` and timeouts
-    parse and survive a round trip.
+    """The ``network`` section, ``num_qps`` and timeouts parse and survive a
+    round trip.
 
-    Why: the Phase 4b options must reach the connector intact.
+    Why: the options must reach the connector intact.
     """
     config = DeepEPM2NConfig.from_mapping(
         {
-            "network": {"preset": "roce-rail-isolated", "nics": ["mlx5_0"]},
+            "network": {"gin": "on", "hybrid": "off", "rdma_traffic_class": 5},
             "num_qps": 33,
             "gpu_timeout_s": 60,
         }
     )
 
-    assert config.network.nic_policy == "shared"
-    assert config.network.nics == ("mlx5_0",)
+    assert (config.network.gin, config.network.hybrid) == ("on", "off")
+    assert config.network.rdma_traffic_class == 5
     assert (config.num_qps, config.gpu_timeout_s) == (33, 60)
     assert DeepEPM2NConfig.from_mapping(config.to_mapping()) == config
 
@@ -806,7 +823,7 @@ def test_control_plane_requires_the_handshake_on_ffn():
         is_warmup=False,
     )
 
-    with pytest.raises(RuntimeError, match="before bootstrap"):
+    with pytest.raises(RuntimeError, match="before the handshake"):
         connector.control_plane.update_state_from_dp_metadata(payload)
 
 

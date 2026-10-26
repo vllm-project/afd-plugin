@@ -8,7 +8,6 @@ from afd_plugin.distributed.topology import (
     resolve_role_rank,
     subgroup_attention_block,
     topology_from_config,
-    tp_rank_before_distributed_init,
     validate_p2p_topology,
 )
 
@@ -36,6 +35,5 @@ __all__ = [
     "resolve_role_rank",
     "subgroup_attention_block",
     "topology_from_config",
-    "tp_rank_before_distributed_init",
     "validate_p2p_topology",
 ]

@@ -9,7 +9,6 @@ import argparse
 import json
 import os
 import re
-import signal
 import subprocess
 import sys
 import tempfile
@@ -17,6 +16,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +25,7 @@ from tests.e2e.accuracy.gsm8k import (
     _extract_gsm8k_sample_count,
     _run_lm_eval,
 )
+from tests.e2e.cancellation import cancellable_run
 from tests.e2e.models.deepseek_v4_flash import config as dsv4_config
 from tests.e2e.models.deepseek_v4_flash.completions import evaluate_completions
 from tests.e2e.models.deepseek_v4_flash.config import (
@@ -38,6 +39,7 @@ from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_SYNC_SHAPES,
     sync_shape,
 )
+from tests.e2e.multi_pod.layout import RoleSlot
 from tests.e2e.process_utils import (
     kill_processes_matching_environment,
     terminate_process_groups,
@@ -164,24 +166,38 @@ def main() -> int:
     mrv2_execution_evidence: list[tuple[str, str]] = []
     mrv2_evidence_dir: tempfile.TemporaryDirectory[str] | None = None
     mrv2_evidence_start: Path | None = None
-    handled_signals = (signal.SIGTERM, signal.SIGINT)
-    previous_handlers = {signum: signal.getsignal(signum) for signum in handled_signals}
-    received_signal: int | None = None
-    cleanup_in_progress = False
 
-    def exit_after_cleanup(signum: int, _frame: Any) -> None:
-        nonlocal received_signal
-        if received_signal is not None:
-            return
-        received_signal = signum
-        if not cleanup_in_progress:
-            raise SystemExit(128 + signum)
-
-    for signum in handled_signals:
-        signal.signal(signum, exit_after_cleanup)
+    def cleanup() -> None:
+        ffn_process = processes_by_role.get("ffn")
+        deferred_sigkill_pgids = (
+            (ffn_process.pid,)
+            if use_npu_async_process_cleanup and ffn_process is not None
+            else ()
+        )
+        try:
+            terminate_processes(
+                processes,
+                termination_timeout_s=process_termination_timeout(args),
+                deferred_sigkill_pgids=deferred_sigkill_pgids,
+                force_kill_environment=(
+                    {
+                        E2E_RUN_ID_ENV: e2e_run_id,
+                        E2E_PROCESS_ROLE_ENV: "ffn",
+                    }
+                    if e2e_run_id is not None
+                    else None
+                ),
+            )
+        finally:
+            try:
+                for thread in log_threads:
+                    thread.join(timeout=LOG_THREAD_JOIN_TIMEOUT_S)
+            finally:
+                if mrv2_evidence_dir is not None:
+                    mrv2_evidence_dir.cleanup()
 
     launch_order: tuple[tuple[str, str], ...]
-    try:
+    with cancellable_run(cleanup):
         if needs_mrv2_execution_evidence(args):
             mrv2_evidence_dir = tempfile.TemporaryDirectory(prefix="afd-e2e-mrv2-")
             mrv2_evidence_start = Path(mrv2_evidence_dir.name) / "evaluation-start"
@@ -237,12 +253,7 @@ def main() -> int:
             mrv2_execution_evidence_rpc(args, "afd_reset_execution_evidence")
             assert mrv2_evidence_start is not None
             mrv2_evidence_start.touch()
-        if args.scenario == ASYNC_CAM_SCENARIO:
-            run_completion_evaluation(args)
-        elif args.scenario in DSV4_SCENARIOS:
-            run_concurrent_completion_evaluation(args)
-        else:
-            run_gsm8k_evaluation(args)
+        run_scenario_evaluation(args)
         if needs_mrv2_execution_evidence(args):
             mrv2_execution_evidence_rpc(args, "afd_log_execution_evidence")
             assert mrv2_evidence_start is not None
@@ -250,67 +261,6 @@ def main() -> int:
             wait_for_mrv2_execution_summaries(mrv2_execution_evidence, args, processes)
 
         ensure_processes_alive(processes)
-    finally:
-        body_error = sys.exc_info()[1]
-        cleanup_error: BaseException | None = None
-        cleanup_in_progress = True
-        ffn_process = processes_by_role.get("ffn")
-        deferred_sigkill_pgids = (
-            (ffn_process.pid,)
-            if use_npu_async_process_cleanup and ffn_process is not None
-            else ()
-        )
-        try:
-            try:
-                try:
-                    terminate_processes(
-                        processes,
-                        termination_timeout_s=(
-                            DSV4_PROCESS_TERMINATION_TIMEOUT_S
-                            if args.scenario in DSV4_SCENARIOS
-                            else PROCESS_TERMINATION_TIMEOUT_S
-                        ),
-                        deferred_sigkill_pgids=deferred_sigkill_pgids,
-                        force_kill_environment=(
-                            {
-                                E2E_RUN_ID_ENV: e2e_run_id,
-                                E2E_PROCESS_ROLE_ENV: "ffn",
-                            }
-                            if e2e_run_id is not None
-                            else None
-                        ),
-                    )
-                finally:
-                    try:
-                        for thread in log_threads:
-                            thread.join(timeout=LOG_THREAD_JOIN_TIMEOUT_S)
-                    finally:
-                        for signum, previous_handler in previous_handlers.items():
-                            # Preloaded native libraries can install handlers
-                            # unknown to Python (getsignal returns None). Python
-                            # cannot restore those; reset to the OS default.
-                            signal.signal(
-                                signum,
-                                signal.SIG_DFL
-                                if previous_handler is None
-                                else previous_handler,
-                            )
-                        if mrv2_evidence_dir is not None:
-                            mrv2_evidence_dir.cleanup()
-            except BaseException as exc:
-                cleanup_error = exc
-        finally:
-            cleanup_in_progress = False
-
-        if received_signal is not None:
-            signal_error = SystemExit(128 + received_signal)
-            if cleanup_error is not None:
-                raise signal_error from cleanup_error
-            raise signal_error
-        if cleanup_error is not None:
-            if body_error is not None:
-                raise body_error from cleanup_error
-            raise cleanup_error
 
     # FFN reports through its existing health RPC. Read all summaries after process
     # shutdown/join so stdout-reader scheduling cannot look like missing ranks.
@@ -324,6 +274,32 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a fixed baseline or AFD E2E scenario.",
     )
+    add_scenario_arguments(parser)
+    parser.add_argument(
+        "--attention-devices",
+        default="0",
+        help=(
+            "Comma-separated device IDs for the Attention serve process. "
+            "The number of devices must match Attention DP times TP."
+        ),
+    )
+    parser.add_argument(
+        "--ffn-devices",
+        default="",
+        help=(
+            "Comma-separated device IDs for the FFN serve process. "
+            "The number of devices must match FFN DP times TP."
+        ),
+    )
+    return parser.parse_args()
+
+
+def add_scenario_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the scenario options every runner shares.
+
+    Device selection is deliberately excluded: the single-host runner takes it
+    from the caller, while the multi-pod runner derives it from the pod layout.
+    """
     parser.add_argument(
         "--model",
         required=True,
@@ -360,22 +336,6 @@ def parse_args() -> argparse.Namespace:
         "--vllm-bin",
         default="vllm",
         help="vLLM executable to run. Defaults to 'vllm'.",
-    )
-    parser.add_argument(
-        "--attention-devices",
-        default="0",
-        help=(
-            "Comma-separated device IDs for the Attention serve process. "
-            "The number of devices must match Attention DP times TP."
-        ),
-    )
-    parser.add_argument(
-        "--ffn-devices",
-        default="",
-        help=(
-            "Comma-separated device IDs for the FFN serve process. "
-            "The number of devices must match FFN DP times TP."
-        ),
     )
     parser.add_argument("--api-host", default="127.0.0.1")
     parser.add_argument(
@@ -449,7 +409,6 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Extra single-token vLLM arg added only to FFN processes.",
     )
-    return parser.parse_args()
 
 
 def configure_scenario(args: argparse.Namespace) -> None:
@@ -519,6 +478,9 @@ def configure_scenario(args: argparse.Namespace) -> None:
     args.enable_dbo = enable_dbo
     args.num_attention_ranks = attention_ranks
     args.num_ffn_ranks = ffn_ranks
+    args.attention_data_parallel_address = None
+    # A runner that cannot drive the evidence window turns this off.
+    args.collect_mrv2_execution_evidence = True
     args.tp_size = 1
     active_sync_profile = sync_shape(args.scenario)
     if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
@@ -710,7 +672,13 @@ def build_vllm_command(
     args: argparse.Namespace,
     *,
     role: str,
+    slot: RoleSlot | None = None,
 ) -> list[str]:
+    """Build one role's ``vllm serve`` command.
+
+    ``slot`` carries this pod's share of a role in a multi-pod run. A role that
+    lives entirely in one pod produces the single-host command unchanged.
+    """
     tp_size = role_tp_size(args, role)
     role_total_ranks = (
         args.num_attention_ranks if role == "attention" else args.num_ffn_ranks
@@ -726,7 +694,7 @@ def build_vllm_command(
         "afd": {
             "role": role,
             "connector": connector,
-            "host": args.afd_host,
+            "host": args.afd_host if slot is None else slot.afd_host,
             "port": args.afd_port,
             "num_attention_ranks": args.num_attention_ranks,
             "num_ffn_ranks": args.num_ffn_ranks,
@@ -766,12 +734,47 @@ def build_vllm_command(
         # FFN DP2/TP1 with expert parallelism; the A3 profile uses Attention
         # DP2/TP4 and FFN DP8/TP1 with expert parallelism.
         cmd.append("--enable-expert-parallel")
+        # Skip non-local routed-expert weights before they are read; the
+        # Attention role discards routed experts, FFN keeps only its EP shard.
+        cmd.append("--enable-ep-weight-filter")
     cmd.extend(
         [
             "--additional-config",
             json.dumps(afd_config, separators=(",", ":")),
         ],
     )
+    if slot is not None and slot.spans_pods:
+        cmd.extend(
+            [
+                "--data-parallel-size-local",
+                str(slot.dp_size_local),
+                "--data-parallel-address",
+                slot.dp_address,
+                "--data-parallel-rpc-port",
+                str(slot.dp_rpc_port),
+            ],
+        )
+        # The leader always starts at DP rank 0, so it omits the flag: vLLM
+        # treats any explicit start rank on a non-headless engine as hybrid LB
+        # (external LB when its local size is 1), and then rejects the
+        # headless peers (vllm/engine/arg_utils.py:2262).
+        if slot.headless:
+            cmd.extend(
+                ["--data-parallel-start-rank", str(slot.dp_start_rank), "--headless"],
+            )
+    elif role == "attention" and args.attention_data_parallel_address is not None:
+        # A scenario-pinned Attention DP address is emitted exactly once; in a
+        # multi-pod run only the slot knows the pod that leads the role.
+        cmd.extend(
+            [
+                "--data-parallel-address",
+                (
+                    args.attention_data_parallel_address
+                    if slot is None
+                    else slot.dp_address
+                ),
+            ],
+        )
     if needs_mrv2_execution_evidence(args):
         cmd.extend(["--worker-extension-cls", "tests.e2e.mrv2_evidence.Worker"])
     if args.scenario in V2_DBO_COMPARISON_SCENARIOS:
@@ -840,17 +843,22 @@ def build_vllm_command(
             ],
         )
 
+    # A headless slot starts no API server (vllm/entrypoints/cli/serve.py:61),
+    # so binding one would only reserve a port it never uses.
+    serves_api = slot is None or not slot.headless
     if role == "attention":
-        cmd.extend(
-            ["--host", args.api_host, "--port", str(attention_api_port(args))],
-        )
+        if serves_api:
+            cmd.extend(
+                ["--host", args.api_host, "--port", str(attention_api_port(args))],
+            )
         if args.use_decode_bench_connector:
             cmd.extend(["--kv-transfer-config", decode_bench_connector_config()])
         cmd.extend(args.attention_vllm_arg)
     else:
-        cmd.extend(
-            ["--host", args.api_host, "--port", str(ffn_api_port(args))],
-        )
+        if serves_api:
+            cmd.extend(
+                ["--host", args.api_host, "--port", str(ffn_api_port(args))],
+            )
         cmd.extend(args.ffn_vllm_arg)
     cmd.extend(args.common_vllm_arg)
     return cmd
@@ -885,6 +893,23 @@ def uses_npu_async_process_cleanup(args: argparse.Namespace) -> bool:
         ASYNC_UBATCH_SCENARIO,
         DSV4_ASYNC_CAM_SCENARIO,
     )
+
+
+def process_termination_timeout(args: argparse.Namespace) -> float:
+    """Return the scenario's teardown budget, shared by every runner."""
+    if args.scenario in DSV4_SCENARIOS:
+        return DSV4_PROCESS_TERMINATION_TIMEOUT_S
+    return PROCESS_TERMINATION_TIMEOUT_S
+
+
+def run_scenario_evaluation(args: argparse.Namespace) -> None:
+    """Run the scenario's acceptance check, shared by every runner."""
+    if args.scenario == ASYNC_CAM_SCENARIO:
+        run_completion_evaluation(args)
+    elif args.scenario in DSV4_SCENARIOS:
+        run_concurrent_completion_evaluation(args)
+    else:
+        run_gsm8k_evaluation(args)
 
 
 def decode_bench_connector_config() -> str:
@@ -982,8 +1007,12 @@ def execution_evidence_roles(args: argparse.Namespace) -> tuple[str, ...]:
 
 
 def needs_mrv2_execution_evidence(args: argparse.Namespace) -> bool:
-    return not args.baseline and (
-        args.cuda_graph_full_decode_only or uses_dbo_execution(args)
+    # The opt-out is checked last: callers that build their own namespace
+    # (ffn_graph.py) never enable graph decode or DBO, so they need not set it.
+    return (
+        not args.baseline
+        and (args.cuda_graph_full_decode_only or uses_dbo_execution(args))
+        and args.collect_mrv2_execution_evidence
     )
 
 
@@ -1175,9 +1204,12 @@ def build_env(
     *,
     role: str | None = None,
     e2e_run_id: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
     mrv2_evidence_start: Path | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
     env.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "18000")
     env[visible_devices_env_name(args.device_backend)] = visible_devices
     env["VLLM_USE_V2_MODEL_RUNNER"] = "1"

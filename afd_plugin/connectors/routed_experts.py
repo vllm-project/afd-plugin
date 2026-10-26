@@ -74,17 +74,10 @@ class FFNLocalExperts:
 class AFDRoutedExpertsConnector(AFDConnectorBase):
     """A connector whose FFN side receives routed (token, local expert) rows.
 
-    Lifecycle: workers create the connector and call ``bootstrap`` before
-    vLLM's distributed init (it may set process-wide NCCL environment, which
-    NCCL reads when the process creates its first communicator); runners then
-    call ``init_afd_connector`` after weights load, with what they loaded.
-    The FFN worker selects the routed-experts runner for these connectors.
+    Lifecycle: as every connector, the runner creates it and calls
+    ``init_afd_connector`` after weights load, here with what it loaded. The
+    FFN worker selects the routed-experts runner for these connectors.
     """
-
-    @abstractmethod
-    def bootstrap(self) -> None:
-        """Collective: join the AFD world before vLLM's distributed init."""
-        raise NotImplementedError
 
     # Extends AFDConnectorBase.init_afd_connector with optional keywords only,
     # so calls through the base contract stay valid.

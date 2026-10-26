@@ -39,8 +39,10 @@ from tests.gpu.deepep_m2n_harness import (  # noqa: E402
     lane_cases,
     mixed_mode_cases,
     peer_exit_scenario,
+    rel_err,
     run_ranks,
     standard_cases,
+    update_worst_error,
 )
 from tests.unit.fakes.vllm_config import M2NTopology  # noqa: E402
 
@@ -97,6 +99,24 @@ def _run(
 
 def _cases(cases: list[Case]) -> list[dict[str, Any]]:
     return [asdict(case) for case in cases]
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf")], ids=["nan", "inf"])
+def test_non_finite_output_fails_the_numerical_checks(bad_value):
+    """An all-NaN or infinite output fails, even after a finite worst error.
+
+    Why: ``max`` ignores NaN, so without this check a broken expert or
+    combine output would keep the previous worst error and pass the suite.
+    """
+    expected = torch.ones(2, 4)
+    worst = update_worst_error(0.0, "combine_rel_err", 1e-3)
+
+    with pytest.raises(AssertionError, match="combine_rel_err=.* is not finite"):
+        update_worst_error(
+            worst,
+            "combine_rel_err",
+            rel_err(torch.full_like(expected, bad_value), expected),
+        )
 
 
 @pytest.mark.parametrize("payload_format", PAYLOADS, ids=["bf16", "fp8"])
