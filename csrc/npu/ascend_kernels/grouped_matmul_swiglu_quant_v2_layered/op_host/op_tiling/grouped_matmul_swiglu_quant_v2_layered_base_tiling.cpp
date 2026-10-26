@@ -377,6 +377,9 @@ ge::graphStatus GroupedMatmulSwigluQuantV2LayeredBaseTiling::DynamicTilingSingle
     return ge::GRAPH_SUCCESS;
 }
 
+// Patch reason: actual expert/slice rows require two valid MSD tile configurations.
+// Patch functionality: additionally prepare the fixed-area alternative for device selection.
+// Signature: unchanged. Remove when upstream supports adaptive MSD tiling.
 ge::graphStatus GroupedMatmulSwigluQuantV2LayeredBaseTiling::DoOpTiling()
 {
     OP_LOGD(context_->GetNodeName(), "Begin Run GMM Swiglu Tiling .");
@@ -411,6 +414,26 @@ ge::graphStatus GroupedMatmulSwigluQuantV2LayeredBaseTiling::DoOpTiling()
         tilingData_.mmTilingData.set_stepM(1);
         tilingData_.mmTilingData.set_stepN(1);
     }
+
+    // ### PATCH START: adaptive MSD tile
+    if (isA8W4MSD_) {
+        tiling.SetShape(A8W4_MSD_ADAPTIVE_BASEM, A8W4_MSD_ADAPTIVE_BASEN, k_);
+        tiling.SetFixSplit(A8W4_MSD_ADAPTIVE_BASEM, A8W4_MSD_ADAPTIVE_BASEN, A8W4_BASEK);
+        OP_CHECK_IF(tiling.GetTiling(tilingData_.adaptiveMmTilingData) == -1,
+                    OPS_REPORT_VECTOR_INNER_ERR(context_->GetNodeName(), "adaptive MSD tiling failed"),
+                    return ge::GRAPH_FAILED);
+        tilingData_.adaptiveMmTilingData.set_baseM(A8W4_MSD_ADAPTIVE_BASEM);
+        tilingData_.adaptiveMmTilingData.set_baseN(A8W4_MSD_ADAPTIVE_BASEN);
+        tilingData_.adaptiveMmTilingData.set_baseK(A8W4_BASEK);
+        tilingData_.adaptiveMmTilingData.set_dbL0B(DOUBLE_BUFFER);
+        tilingData_.adaptiveMmTilingData.set_stepKa(NUM_FOUR);
+        tilingData_.adaptiveMmTilingData.set_stepKb(NUM_FOUR);
+        tilingData_.adaptiveMmTilingData.set_depthA1(NUM_EIGHT);
+        tilingData_.adaptiveMmTilingData.set_depthB1(NUM_EIGHT);
+        tilingData_.adaptiveMmTilingData.set_stepM(1);
+        tilingData_.adaptiveMmTilingData.set_stepN(1);
+    }
+    // ### PATCH END: adaptive MSD tile
 
     usrWorkspaceLimit_ = USER_WORKSPACE_LIMIT;
     mLimit_ = 0;

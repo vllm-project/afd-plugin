@@ -57,6 +57,8 @@ def profile(args) -> SimpleNamespace:
         compute_gate_on_attention=True,
         afd_host=args.afd_host,
         afd_port=args.afd_port,
+        # attention_vllm_arg below pins --data-parallel-address itself.
+        attention_data_parallel_address=None,
         api_host="127.0.0.1",
         api_port_base=args.api_port,
         served_model_name_prefix="afd449-p4",

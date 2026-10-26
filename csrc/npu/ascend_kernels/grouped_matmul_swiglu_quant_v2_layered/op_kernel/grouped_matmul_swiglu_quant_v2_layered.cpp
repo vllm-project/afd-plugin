@@ -32,6 +32,9 @@
 using namespace AscendC;
 using namespace matmul;
 using namespace GroupedMatmulDequantSwigluQuant;
+// Patch reason: device MSD selection needs two tilings with bounded resource initialization.
+// Patch functionality: initialize both Matmul objects once and pass them to the MSD schedule.
+// Signature: unchanged. Remove when upstream provides adaptive MSD tiling.
 extern "C" __global__ __aicore__ void
 grouped_matmul_swiglu_quant_v2_layered(GM_ADDR x, GM_ADDR xScale, GM_ADDR groupList, GM_ADDR layerIndex,
                                        GM_ADDR allWeight, GM_ADDR allWeightScale, GM_ADDR allWeightAssistanceMatrix,
@@ -55,12 +58,19 @@ grouped_matmul_swiglu_quant_v2_layered(GM_ADDR x, GM_ADDR xScale, GM_ADDR groupL
         using weightType = MatmulType<TPosition::GM, wFormat, int4b_t, false>;
         using yType = MatmulType<TPosition::GM, CubeFormat::ND, half, false>;
         using matmulType = MMImplTypeCustom<xType, weightType, yType>;
+        // ### PATCH START: adaptive MSD tile
+        GET_TILING_DATA_MEMBER(GMMSwigluQuantV2TilingData, adaptiveMmTilingData, adaptiveMmTilingData_, tiling);
         matmulType::MT mm;
+        matmulType::MT adaptiveMm;
         if ASCEND_IS_AIC {
             mm.SetSubBlockIdx(0);
             mm.Init(&mmTilingData_);
+            adaptiveMm.SetSubBlockIdx(0);
+            adaptiveMm.Init(&adaptiveMmTilingData_);
         }
-        GMMSwigluQuantPipelineSchedule<matmulType> op(mm, &gmmSwigluQuantV2BaseParams_, &gmmSwiglu_, &tPipe);
+        GMMSwigluQuantPipelineSchedule<matmulType> op(
+            mm, adaptiveMm, &adaptiveMmTilingData_, &gmmSwigluQuantV2BaseParams_, &gmmSwiglu_, &tPipe);
+        // ### PATCH END: adaptive MSD tile
         op.Init(x, allWeight, allWeightScale, xScale, allWeightAssistanceMatrix, groupList, curLayer, y, yScale,
                 userWorkspace);
         op.Process();

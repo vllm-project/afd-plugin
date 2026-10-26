@@ -199,7 +199,10 @@ the A2E operator's ids channel, which the receiving FFN rank selects with
 `afd_requires_input_ids` declaration, because the operator only writes the ids
 slot in the mode the sender chose. FFN requests only the fields its
 model declares, concatenates them with the same per-peer token order as hidden
-states, and returns them in `AFDA2FTransferPayload`. The input-ID path supports
+states, and returns them in `AFDA2FTransferPayload`. A CUDA P2P FFN rank posts
+the receives for all of its Attention peers, each peer's tensors in wire order,
+as one NCCL group, and sends the output slices back as one NCCL group; each
+Attention rank still sends and receives its own tensors one at a time. The input-ID path supports
 DeepSeek V4's native hash router and has graph-stable receive buffers; it does
 not make input IDs mandatory for other models or connectors.
 

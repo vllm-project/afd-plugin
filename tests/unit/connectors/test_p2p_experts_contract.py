@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -55,6 +58,31 @@ def _ffn_connector(*, attention_ranks=1, enforce_eager=True):
         ),
         role_rank=0,
     )
+
+
+def _deliver_on_wire(monkeypatch, connector, payload):
+    """Fake the FFN receive ops: write ``payload`` into the buffers in wire order.
+
+    Returns the list of buffers the connector received into.
+    """
+    connector.a2e_group = SimpleNamespace(world_size=connector.group_size)
+    connector.a2e_comm_id = 0
+    incoming = iter(payload)
+    buffers = []
+
+    def recv_group(outs, srcs, comm_id):
+        for out in outs:
+            out.copy_(next(incoming))
+            buffers.append(out)
+
+    monkeypatch.setattr(torch.ops.vllm, "afd_p2p_recv_group", recv_group, raising=False)
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_p2p_recv",
+        lambda out, src, comm_id: recv_group([out], [src], comm_id),
+        raising=False,
+    )
+    return buffers
 
 
 def _context():
@@ -142,13 +170,10 @@ def test_attention_gate_fan_in_preserves_peer_order(monkeypatch):
     router_peer_1 = torch.full((2, 3), 10, dtype=torch.float32)
     hidden_peer_2 = torch.full((2, 4), 2, dtype=torch.bfloat16)
     router_peer_2 = torch.full((2, 3), 20, dtype=torch.float32)
-    received = iter(
-        [hidden_peer_1, router_peer_1, hidden_peer_2, router_peer_2],
-    )
-    monkeypatch.setattr(
+    _deliver_on_wire(
+        monkeypatch,
         connector,
-        "_recv_hidden_states",
-        lambda *args, **kwargs: next(received),
+        [hidden_peer_1, router_peer_1, hidden_peer_2, router_peer_2],
     )
 
     payload = connector.recv_attn_output(
@@ -184,18 +209,12 @@ def test_ffn_gate_receive_does_not_expect_router_logits(monkeypatch):
         0
     ]
     hidden_states = torch.ones((2, 4), dtype=torch.bfloat16)
-    received = []
-
-    def recv_hidden_states(*args, **kwargs):
-        received.append((args, kwargs))
-        return hidden_states
-
-    monkeypatch.setattr(connector, "_recv_hidden_states", recv_hidden_states)
+    received = _deliver_on_wire(monkeypatch, connector, [hidden_states])
 
     payload = connector.recv_attn_output()
 
     assert len(received) == 1
-    assert payload.hidden_states is hidden_states
+    assert torch.equal(payload.hidden_states, hidden_states)
     assert payload.router_logits is None
     assert payload.context.states is None
 
@@ -237,13 +256,10 @@ def test_ffn_fan_in_preserves_input_id_peer_order_and_dtype(monkeypatch):
     input_ids_peer_1 = torch.tensor([11, 13], dtype=torch.int32)
     hidden_peer_2 = torch.full((2, 4), 2, dtype=torch.bfloat16)
     input_ids_peer_2 = torch.tensor([17, 19], dtype=torch.int32)
-    received = iter(
-        [hidden_peer_1, input_ids_peer_1, hidden_peer_2, input_ids_peer_2],
-    )
-    monkeypatch.setattr(
+    _deliver_on_wire(
+        monkeypatch,
         connector,
-        "_recv_hidden_states",
-        lambda *args, **kwargs: next(received),
+        [hidden_peer_1, input_ids_peer_1, hidden_peer_2, input_ids_peer_2],
     )
 
     payload = connector.recv_attn_output(
@@ -276,13 +292,11 @@ def test_ffn_graph_receive_reuses_input_ids_buffer(monkeypatch):
     input_ids_ref = torch.empty(2, dtype=torch.int32)
     connector._recv_attn_buffers[(0, 1, (2, 4))] = hidden_ref
     connector._recv_attn_input_ids_buffers[(0, 1, (2,))] = input_ids_ref
-    refs = []
-
-    def recv_hidden_states(*args, ref_tensor=None, **kwargs):
-        refs.append(ref_tensor)
-        return ref_tensor
-
-    monkeypatch.setattr(connector, "_recv_hidden_states", recv_hidden_states)
+    refs = _deliver_on_wire(
+        monkeypatch,
+        connector,
+        [torch.ones((2, 4), dtype=torch.bfloat16), torch.tensor([3, 5])],
+    )
 
     payload = connector.recv_attn_output(recv_input_ids=True)
 
