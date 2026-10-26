@@ -25,7 +25,6 @@ from afd_plugin.compat.profiler import (
 )
 from afd_plugin.config import AFDConfig, parse_afd_config
 from afd_plugin.connectors import (
-    AFDConnectorBase,
     AFDConnectorFactory,
     AFDControlPayload,
     AFDControlPlane,
@@ -61,15 +60,7 @@ class GPUFFNModelRunner:
 
     afd_expected_role = "ffn"
 
-    # ``connector``: the instance the worker created before vLLM's distributed
-    # init (see connector_lifecycle.py); ``None`` creates the connector here.
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        device: torch.device,
-        *,
-        connector: AFDConnectorBase | None = None,
-    ) -> None:
+    def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.load_config = vllm_config.load_config
@@ -85,15 +76,13 @@ class GPUFFNModelRunner:
             vllm_config,
             role="ffn",
         )
-        if connector is None:
-            rank, local_rank = _resolve_world_ranks()
-            connector = AFDConnectorFactory.create_connector(
-                rank,
-                local_rank,
-                vllm_config,
-                self.afd_config,
-            )
-        self.connector = connector
+        rank, local_rank = _resolve_world_ranks()
+        self.connector = AFDConnectorFactory.create_connector(
+            rank,
+            local_rank,
+            vllm_config,
+            self.afd_config,
+        )
         # TODO: Async GPU connector will be supported in the future
         assert self.connector.control_plane is not None, (
             "GPU model runner only supports control-plane-driven connectors"

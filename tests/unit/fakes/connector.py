@@ -2,8 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """A recording ``AFDRoutedExpertsConnector`` for worker and runner tests.
 
-Constructed without arguments it skips ``AFDConnectorBase.__init__`` (no vLLM
-config needed); the factory constructs it with the base arguments.
+Constructed without ``AFDConnectorBase.__init__`` (no vLLM config needed).
 ``events`` records the lifecycle and data-path calls in order.
 """
 
@@ -20,12 +19,7 @@ from afd_plugin.connectors import (
 
 
 class FakeRoutedConnector(AFDRoutedExpertsConnector):
-    # Raised by prepare_before_distributed_init when set.
-    prepare_error: BaseException | None = None
-
-    def __init__(self, *base_args: Any) -> None:
-        if base_args:
-            super().__init__(*base_args)
+    def __init__(self) -> None:
         self.events: list[tuple] = []
         self.control_updates: list[Any] = []
         self.init_kwargs: dict[str, Any] | None = None
@@ -42,11 +36,6 @@ class FakeRoutedConnector(AFDRoutedExpertsConnector):
 
     def close(self) -> None:
         self.events.append(("close",))
-
-    def prepare_before_distributed_init(self) -> None:
-        self.events.append(("prepare",))
-        if self.prepare_error is not None:
-            raise self.prepare_error
 
     def init_afd_connector(self, *, moe_layer_indices=None, local_experts=None):
         self.init_kwargs = {

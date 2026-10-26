@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import logging
 import threading
-from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,10 +17,6 @@ from vllm.v1.worker.worker_base import CompilationTimes
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory, AFDRoutedExpertsConnector
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
-from afd_plugin.v1.worker.connector_lifecycle import (
-    check_worker_connector,
-    create_worker_connector,
-)
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
 from afd_plugin.validation import (
     assert_compatible_afd_stack,
@@ -69,11 +64,7 @@ class AFDFFNWorker(Worker):
     # symbol inside Worker.init_device and exposes no injectable runner factory.
     # Patch functionality: replace only the V2 construction seam with the
     # connector-driven FFN runner: GPUFFNRoutedExpertsModelRunner (imported
-    # only then) for an AFDRoutedExpertsConnector, else GPUFFNModelRunner. A
-    # connector that must join the AFD world before vLLM's distributed init is
-    # created first (connector_lifecycle.py), so its NCCL environment precedes
-    # vLLM's NCCL groups, handed to the runner through the seam, and checked
-    # against vLLM's device and ranks once vLLM has chosen them.
+    # only then) for an AFDRoutedExpertsConnector, else GPUFFNModelRunner.
     # Signature: matches vLLM v0.30.0 Worker.init_device exactly: (self).
     # Upstream source: vllm/v1/worker/gpu_worker.py, Worker.init_device;
     # ced6857afa0ea7b2e3f0846a62e1394e90f15607. The 0.30.0 init_device still
@@ -114,29 +105,12 @@ class AFDFFNWorker(Worker):
             )
 
             runner_cls = GPUFFNRoutedExpertsModelRunner
-            # Before the connector joins the AFD world: a rejected backend
-            # fails before any collective.
+            # Before vLLM builds the model, which reads the selected backend.
             select_routed_moe_backend(self.vllm_config)
-        connector = create_worker_connector(
-            self.vllm_config,
-            afd_config,
-            rank=self.rank,
-            local_rank=self.local_rank,
-        )
         native_runner_cls = gpu_model_runner_v2.GPUModelRunner
-        gpu_model_runner_v2.GPUModelRunner = (
-            runner_cls
-            if connector is None
-            else partial(runner_cls, connector=connector)
-        )
+        gpu_model_runner_v2.GPUModelRunner = runner_cls
         try:
             super().init_device()
-            if connector is not None:
-                check_worker_connector(connector, self.vllm_config, self.device)
-        except BaseException:
-            if connector is not None:
-                connector.close()
-            raise
         finally:
             gpu_model_runner_v2.GPUModelRunner = native_runner_cls
         # ### PATCH END: construct the FFN runner through the V2 seam.

@@ -109,15 +109,14 @@ def validate_gpu_model_runner_v2_config(
         )
 
     parallel = vllm_config.parallel_config
-    # DeepEP M2N joins the AFD world before vLLM's distributed init and derives
-    # the TP part of the role rank from the worker rank. Attention may run TP > 1:
-    # each TP rank dispatches its own slice of the tokens. FFN experts are not
-    # TP-sharded; that and the other deployment checks (expert placement,
-    # all2all backend, weight format) run in the connector handshake so that
-    # every rank fails together. It routes on Attention, so it requires the
-    # gate there, and a model whose Attention side sends the top-k. Workers
-    # validate before the connector joins the AFD world, so both roles fail before any
-    # collective instead of one role timing out.
+    # DeepEP M2N: Attention may run TP > 1, each TP rank dispatching its own
+    # slice of the tokens. FFN experts are not TP-sharded; that and the other
+    # deployment checks (expert placement, all2all backend, weight format) run
+    # in the connector handshake so that every rank fails together. It routes
+    # on Attention, so it requires the gate there, and a model whose Attention
+    # side sends the top-k. Workers validate before the connector joins the AFD
+    # world, so both roles fail before any collective instead of one role
+    # timing out.
     if afd_config.connector in DEEPEP_M2N_CONNECTORS:
         if expected_role == "ffn" and parallel.tensor_parallel_size != 1:
             raise RuntimeError(

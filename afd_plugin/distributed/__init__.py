@@ -2,17 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """AFD distributed helper namespace."""
 
-from afd_plugin.distributed.device import (
-    register_assigned_physical_gpu_ids,
-    resolve_worker_device_index,
-)
 from afd_plugin.distributed.topology import (
     AFDRankMapping,
     build_rank_mapping,
     resolve_role_rank,
     subgroup_attention_block,
     topology_from_config,
-    tp_rank_before_distributed_init,
     validate_p2p_topology,
 )
 
@@ -37,11 +32,8 @@ __all__ = [
     "build_rank_mapping",
     "create_hccl_process_group_options",
     "init_afd_process_group",
-    "register_assigned_physical_gpu_ids",
     "resolve_role_rank",
-    "resolve_worker_device_index",
     "subgroup_attention_block",
     "topology_from_config",
-    "tp_rank_before_distributed_init",
     "validate_p2p_topology",
 ]

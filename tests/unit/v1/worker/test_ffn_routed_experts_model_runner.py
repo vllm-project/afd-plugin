@@ -186,36 +186,14 @@ def test_initialize_passes_moe_layers_and_experts_to_the_connector():
     }
 
 
-def _base_init_with(monkeypatch):
-    def base_init(self, vllm_config, device, *, connector=None):
-        self.connector = connector or SimpleNamespace(close=lambda: None)
+def test_constructor_rejects_connectors_without_routed_rows(monkeypatch):
+    def base_init(self, vllm_config, device):
+        self.connector = SimpleNamespace(close=lambda: None)
 
     monkeypatch.setattr(GPUFFNModelRunner, "__init__", base_init)
 
-
-def test_constructor_rejects_connectors_without_routed_rows(monkeypatch):
-    _base_init_with(monkeypatch)
-
     with pytest.raises(TypeError, match="is not an AFDRoutedExpertsConnector"):
         GPUFFNRoutedExpertsModelRunner(SimpleNamespace(), torch.device("cpu"))
-
-
-def test_constructor_uses_the_workers_connector(monkeypatch):
-    """The routed runner runs on the connector the worker created before
-    vLLM's distributed init.
-
-    Why: that connector already joined the AFD world; a second instance
-    would never be initialized by its peers.
-    """
-    connector = FakeRoutedConnector()
-    _base_init_with(monkeypatch)
-
-    runner = GPUFFNRoutedExpertsModelRunner(
-        SimpleNamespace(), torch.device("cpu"), connector=connector
-    )
-
-    assert runner.connector is connector
-    assert runner.routed_connector is connector
 
 
 def _routed_experts(*, fp8: bool, expert_ids=(4, 5), backend: str = "TRITON"):

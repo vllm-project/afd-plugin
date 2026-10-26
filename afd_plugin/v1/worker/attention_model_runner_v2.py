@@ -367,16 +367,10 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
 
     afd_expected_role = "attention"
 
-    # Signature: native (vllm_config, device) plus a keyword-only
-    # ``connector``: the instance the worker created before vLLM's distributed
-    # init (see connector_lifecycle.py), which the worker keeps owning if
-    # construction fails. ``None`` creates the connector here.
     def __init__(
         self,
         vllm_config: VllmConfig,
         device: torch.device,
-        *,
-        connector: AFDConnectorBase | None = None,
     ):
         validate_gpu_model_runner_v2_config(
             vllm_config,
@@ -384,17 +378,16 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
             device_type=device.type,
         )
         super().__init__(vllm_config, device)
-        owns_connector = connector is None
+        connector: AFDConnectorBase | None = None
         try:
             self.afd_config = self.parse_config(self.vllm_config)
-            if connector is None:
-                rank, local_rank = _resolve_world_ranks()
-                connector = AFDConnectorFactory.create_connector(
-                    rank,
-                    local_rank,
-                    self.vllm_config,
-                    self.afd_config,
-                )
+            rank, local_rank = _resolve_world_ranks()
+            connector = AFDConnectorFactory.create_connector(
+                rank,
+                local_rank,
+                self.vllm_config,
+                self.afd_config,
+            )
             self.connector = connector
             # The connector rendezvous is deferred to the end of ``load_model()``
             # so Attention and FFN weight loading overlap, matching the V1
@@ -412,7 +405,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
             self.prof = create_afd_gpu_profiler("attention")
         except BaseException:
             try:
-                if owns_connector and connector is not None:
+                if connector is not None:
                     connector.close()
             finally:
                 super().shutdown()

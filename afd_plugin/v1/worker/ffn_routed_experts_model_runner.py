@@ -116,14 +116,8 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
     (DeepEP M2N).
     """
 
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        device: torch.device,
-        *,
-        connector: AFDConnectorBase | None = None,
-    ) -> None:
-        super().__init__(vllm_config, device, connector=connector)
+    def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
+        super().__init__(vllm_config, device)
         _require_routed(self.connector)
         self.moe_layer_indices: tuple[int, ...] = ()
         self.local_experts: dict[int, FFNLocalExperts] = {}

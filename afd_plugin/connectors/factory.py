@@ -53,15 +53,12 @@ class AFDConnectorFactory:
         local_rank: int,
         vllm_config: VllmConfig,
         afd_config: AFDConfig | None = None,
-        *,
-        tp_rank: int | None = None,
     ) -> AFDConnectorBase:
-        """Create a connector; ``tp_rank`` is passed to ``resolve_role_rank``."""
         config = afd_config or parse_afd_config(vllm_config)
         if config.connector not in cls._registry:
             raise ValueError(f"unsupported AFD connector type: {config.connector}")
         connector_cls = cls._registry[config.connector]()
-        role_rank = resolve_role_rank(vllm_config, config, tp_rank=tp_rank)
+        role_rank = resolve_role_rank(vllm_config, config)
         return connector_cls(
             rank,
             local_rank,

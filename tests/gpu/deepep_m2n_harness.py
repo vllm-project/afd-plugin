@@ -406,21 +406,17 @@ def make_connector(
     port: int,
     host: str,
 ) -> Any:
-    """The connector as the runtime constructs it (not yet initialized)."""
+    """The connector class the factory resolves, not yet initialized."""
     from afd_plugin.config import afd_config_from_mapping
     from afd_plugin.connectors import AFDConnectorFactory
 
     role, role_rank = topology.role(world_rank)
     vllm_config = m2n_vllm_config(topology, role, role_rank, extra_config, port, host)
     afd_config = afd_config_from_mapping(vllm_config.additional_config["afd"])
-    # No vLLM TP group here: pass the TP rank, as workers do before init.
-    return AFDConnectorFactory.create_connector(
-        world_rank,
-        local_rank,
-        vllm_config,
-        afd_config,
-        tp_rank=role_rank % vllm_config.parallel_config.tensor_parallel_size,
-    )
+    # No vLLM process groups here, so pass the role rank the topology gives
+    # instead of resolving it from vLLM's ranks as the factory does.
+    connector_cls = AFDConnectorFactory.get_connector_class(afd_config.connector)
+    return connector_cls(world_rank, local_rank, vllm_config, afd_config, role_rank)
 
 
 def control_step(
@@ -797,10 +793,7 @@ class Checker:
 
     def network_plan_summary(self) -> str:
         plan = self.connector.network_plan
-        if plan is None:
-            return ""
-        nic = plan.nic_by_rank[self.connector.world_rank]
-        return f"{plan.summary()} this_rank_nic={nic or 'nccl'}"
+        return "" if plan is None else plan.summary()
 
 
 def attention_context(layer: int, stage: int, num_tokens: int) -> Any:

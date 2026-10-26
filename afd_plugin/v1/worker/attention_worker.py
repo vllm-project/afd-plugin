@@ -4,21 +4,14 @@
 
 from __future__ import annotations
 
-from functools import partial
-
 import torch
 from vllm.config import VllmConfig
 from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
 from vllm.v1.worker.gpu_worker import Worker
 
-from afd_plugin.config import parse_afd_config
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.attention_model_runner_v2 import (
     AFDAttentionModelRunnerV2,
-)
-from afd_plugin.v1.worker.connector_lifecycle import (
-    check_worker_connector,
-    create_worker_connector,
 )
 from afd_plugin.validation import (
     assert_compatible_afd_stack,
@@ -51,10 +44,7 @@ class AFDAttentionWorker(Worker):
     # after an internal module import, with no injectable runner factory.
     # Patch functionality: validate the supported V2 contract, select the AFD model
     # identity before construction, and scope the module-class substitution to
-    # the delegated native initialization window. A connector that must join
-    # the AFD world before vLLM's distributed init is created first
-    # (connector_lifecycle.py), handed to the runner through the seam, and
-    # checked against vLLM's device and ranks once vLLM has chosen them.
+    # the delegated native initialization window.
     # Signature: matches vLLM v0.30.0 Worker.init_device exactly: (self).
     # Upstream source: vllm/v1/worker/gpu_worker.py, Worker.init_device;
     # runner local-import/construct seam; commit
@@ -89,28 +79,10 @@ class AFDAttentionWorker(Worker):
         self.vllm_config.model_config = afd_model_config
         self.model_config = afd_model_config
 
-        # Before vLLM's distributed init creates NCCL groups, so the
-        # connector's NCCL environment applies; the FFN worker does the same.
-        connector = create_worker_connector(
-            self.vllm_config,
-            parse_afd_config(self.vllm_config, expected_role="attention"),
-            rank=self.rank,
-            local_rank=self.local_rank,
-        )
         native_runner_cls = gpu_model_runner_v2.GPUModelRunner
-        gpu_model_runner_v2.GPUModelRunner = (
-            AFDAttentionModelRunnerV2
-            if connector is None
-            else partial(AFDAttentionModelRunnerV2, connector=connector)
-        )
+        gpu_model_runner_v2.GPUModelRunner = AFDAttentionModelRunnerV2
         try:
             super().init_device()
-            if connector is not None:
-                check_worker_connector(connector, self.vllm_config, self.device)
-        except BaseException:
-            if connector is not None:
-                connector.close()
-            raise
         finally:
             gpu_model_runner_v2.GPUModelRunner = native_runner_cls
         # ### PATCH END: select and directly construct the AFD runner.
