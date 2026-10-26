@@ -181,10 +181,23 @@ def validate_gpu_model_runner_v2_config(
     if (
         not parallel.enable_expert_parallel
         or parallel.enable_elastic_ep
-        or parallel.enable_eplb
         or parallel.use_sequence_parallel_moe
     ):
         raise RuntimeError("AFD ModelRunnerV2 requires static expert parallelism")
+    if parallel.enable_eplb:
+        # EPLB runs on the FFN role only: Attention holds no experts and no
+        # MoE routing, and its CUDA remote-expert shells reject EPLB.
+        if expected_role != "ffn":
+            raise RuntimeError(
+                "AFD ModelRunnerV2 supports EPLB only on the FFN role",
+            )
+        # The FFN-side record kernel selects its per-ubatch unpadded token
+        # tensor through vLLM's DBO thread context, which the FFN daemon loop
+        # never installs, so DBO steps would read the wrong token count.
+        if parallel.enable_dbo or parallel.use_ubatching:
+            raise RuntimeError(
+                "AFD ModelRunnerV2 FFN EPLB does not support DBO or ubatching",
+            )
     if (
         parallel.enable_dbo or parallel.use_ubatching
     ) and parallel.num_ubatches != GPU_MRV2_NUM_UBATCHES:

@@ -12,6 +12,31 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
 
 
+def _expand_counts_across_attention_ranks(
+    attention_counts: tuple[int, ...],
+    *,
+    attention_size: int,
+) -> tuple[int, ...]:
+    """Expand per-DP-rank counts to one count per Attention rank.
+
+    vLLM DP metadata carries one count per DP rank while the AFD Attention
+    role counts TP-derived worker ranks, so each count covers the TP peers
+    of its DP rank. Counts already covering every Attention rank are kept.
+    """
+
+    if (
+        attention_counts
+        and len(attention_counts) < attention_size
+        and attention_size % len(attention_counts) == 0
+    ):
+        attention_ranks_per_count = attention_size // len(attention_counts)
+        return tuple(
+            attention_counts[rank // attention_ranks_per_count]
+            for rank in range(attention_size)
+        )
+    return attention_counts
+
+
 def aggregate_ffn_token_counts(
     attention_counts: tuple[int, ...],
     *,
@@ -34,17 +59,10 @@ def aggregate_ffn_token_counts(
     if ffn_size <= 0 or attention_size < ffn_size:
         return fallback_counts
 
-    expanded_counts = attention_counts
-    if (
-        attention_counts
-        and len(attention_counts) < attention_size
-        and attention_size % len(attention_counts) == 0
-    ):
-        attention_ranks_per_count = attention_size // len(attention_counts)
-        expanded_counts = tuple(
-            attention_counts[rank // attention_ranks_per_count]
-            for rank in range(attention_size)
-        )
+    expanded_counts = _expand_counts_across_attention_ranks(
+        attention_counts,
+        attention_size=attention_size,
+    )
 
     # Each FFN rank sums the block that ``build_rank_mapping`` assigns to it.
     return tuple(
@@ -58,6 +76,28 @@ def aggregate_ffn_token_counts(
         )
         for ffn_rank in range(ffn_size)
     )
+
+
+def real_attention_token_total(
+    attention_counts: tuple[int, ...],
+    *,
+    attention_size: int,
+) -> int:
+    """Total real Attention tokens for one stage, excluding placeholder rows.
+
+    The connector transfers at least one row per Attention peer, so
+    zero-token peers contribute placeholder rows to the FFN batch. This
+    helper counts only real tokens: FFN-side EPLB uses the total as the
+    router's unpadded token count, because every FFN rank's router view
+    covers these tokens either through TP-replicated delivery or through
+    the MoE-level all-gather.
+    """
+
+    expanded_counts = _expand_counts_across_attention_ranks(
+        attention_counts,
+        attention_size=attention_size,
+    )
+    return sum(max(0, int(count)) for count in expanded_counts)
 
 
 def project_ffn_token_counts_to_dp(
@@ -78,7 +118,11 @@ def project_ffn_token_counts_to_dp(
     return tuple(ffn_counts[rank * ffn_ranks_per_dp] for rank in range(dp_size))
 
 
-__all__ = ["aggregate_ffn_token_counts", "project_ffn_token_counts_to_dp"]
+__all__ = [
+    "aggregate_ffn_token_counts",
+    "project_ffn_token_counts_to_dp",
+    "real_attention_token_total",
+]
 
 
 def _set_moe_layer_index(forward_context: ForwardContext, layer_idx: int) -> None:

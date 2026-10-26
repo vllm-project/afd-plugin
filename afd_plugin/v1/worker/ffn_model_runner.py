@@ -16,6 +16,7 @@ from vllm.forward_context import DPMetadata, get_forward_context, set_forward_co
 from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.utils.mem_utils import DeviceMemoryProfiler
+from vllm.v1.worker.gpu.eplb_utils import EPLBController
 from vllm.v1.worker.workspace import reset_workspace_manager
 
 from afd_plugin.compat.profiler import (
@@ -40,6 +41,7 @@ from afd_plugin.v1.worker.ffn_metadata import (
     _set_moe_layer_index,
     aggregate_ffn_token_counts,
     project_ffn_token_counts_to_dp,
+    real_attention_token_total,
 )
 from afd_plugin.validation import validate_gpu_model_runner_v2_config
 
@@ -91,6 +93,10 @@ class GPUFFNModelRunner:
         self.model: Any | None = None
         self.model_memory_usage = 0
         self.num_layers = int(self.model_config.hf_text_config.num_hidden_layers)
+        # Expert parallelism load balancer. EPLB runs on the FFN role only:
+        # the Attention role holds no experts and no MoE routing. The
+        # controller no-ops unless ``parallel_config.enable_eplb`` is set.
+        self.eplb = EPLBController(vllm_config.parallel_config, device)
         self.use_cuda_graph = bool(
             self.afd_cudagraph_policy.enable_ffn_graph_cache,
         )
@@ -109,9 +115,10 @@ class GPUFFNModelRunner:
         self.connector.init_afd_connector()
 
     def load_model(self, *, load_dummy_weights: bool = False, **kwargs: Any) -> None:
-        """Load the vLLM model."""
+        """Load the vLLM model and register it with FFN-side EPLB."""
 
         model_loader = get_model_loader(self.load_config)
+        self.eplb.prepare_load()
         with DeviceMemoryProfiler() as profiler:
             if self.model is None:
                 self.model = model_loader.load_model(
@@ -124,6 +131,12 @@ class GPUFFNModelRunner:
                     model_config=self.model_config,
                 )
         self.model_memory_usage = profiler.consumed_memory
+        eplb_models_added = self.eplb.maybe_register_model(
+            self.model,
+            self.model_config,
+            load_dummy_weights,
+        )
+        self.eplb.maybe_start_async_loop(eplb_models_added)
 
     def profile_run(self) -> None:
         pass
@@ -163,6 +176,7 @@ class GPUFFNModelRunner:
         step_afd_gpu_profiler(self.prof)
         if dp_metadata_list is None:
             raise RuntimeError("GPUFFNModelRunner requires dp_metadata_list")
+        self._eplb_prepare_forward(dp_metadata_list)
         graph_key = make_ffn_graph_key(dp_metadata_list)
         cuda_graph_info = self._cuda_graphs.get(graph_key)
         run_mode = graph_run_mode(
@@ -174,6 +188,7 @@ class GPUFFNModelRunner:
         )
         if run_mode is AFDGraphRunMode.REPLAY:
             self._cuda_graphs[graph_key]["graph"].replay()
+            self.eplb_step(is_dummy=is_warmup or is_graph_capturing)
             return None
 
         # An eager fallback for a step Attention replays keeps the replay flag,
@@ -185,7 +200,54 @@ class GPUFFNModelRunner:
             is_warmup=is_warmup,
             is_graph_replaying=is_graph_replaying,
         )
+        self.eplb_step(is_dummy=is_warmup or is_graph_capturing)
         return None
+
+    # Patch reason: vLLM 0.30.0 steps EPLB from GPUModelRunner methods
+    # (sample_tokens/pool/dummy_run via step_eplb_after); the FFN runner is
+    # connector-driven and has no native runner methods to decorate, so the
+    # connector step paths call this seam directly after each forward.
+    # Patch functionality: step the FFN-side EPLB state once per connector
+    # step. Warmup and graph-capture steps are dummy steps: they keep the
+    # rearrangement counters of all FFN ranks in lockstep without recording
+    # their (garbage) expert load.
+    # Signature: mirrors GPUModelRunner.eplb_step; no added parameters.
+    # Upstream: vLLM v0.30.0, vllm/v1/worker/gpu/eplb_utils.py,
+    # step_eplb_after; commit ced6857afa0ea7b2e3f0846a62e1394e90f15607.
+    def eplb_step(self, is_dummy: bool = False) -> None:
+        """Step the FFN-side EPLB state after one connector-driven step."""
+
+        self.eplb.step(is_dummy=is_dummy)
+
+    def _eplb_prepare_forward(
+        self,
+        dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
+    ) -> None:
+        """Fill the EPLB unpadded token count for the router's record kernel.
+
+        The count is the total real Attention tokens of the step: each FFN
+        rank's router view covers those tokens either through TP-replicated
+        delivery or through the MoE-level all-gather, so the total matches
+        the rows the map-and-record kernel processes. Placeholder rows that
+        idle Attention peers transfer are excluded.
+        """
+
+        if not self.vllm_config.parallel_config.enable_eplb:
+            return
+        if len(dp_metadata_list) != 1:
+            raise RuntimeError(
+                "AFD FFN EPLB supports exactly one stage per step; DBO and "
+                f"ubatching are not supported, got stages {sorted(dp_metadata_list)}",
+            )
+        stage_metadata = next(iter(dp_metadata_list.values()))
+        attention_counts = tuple(
+            int(count) for count in stage_metadata.num_tokens_across_dp_cpu
+        )
+        num_unpadded_tokens = real_attention_token_total(
+            attention_counts,
+            attention_size=int(self.connector.attn_size),
+        )
+        self.eplb.prepare_forward(self.model_config, num_unpadded_tokens)
 
     def _ffn_forward(
         self,
@@ -394,6 +456,7 @@ class GPUFFNModelRunner:
             return 0
         if dp_metadata_list is None:
             raise RuntimeError("GPUFFNModelRunner.capture_model requires metadata")
+        self._eplb_prepare_forward(dp_metadata_list)
 
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
         if self._graph_memory_pool is None:
@@ -429,6 +492,7 @@ class GPUFFNModelRunner:
 
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
         cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        self.eplb_step(is_dummy=True)
         return int(cuda_graph_size)
 
     def sample_tokens(self, grammar_output: Any = None) -> Any:

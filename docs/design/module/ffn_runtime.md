@@ -232,7 +232,10 @@ does not adopt native V2 request state or scheduler-driven execution:
   Attention role before constructing communication resources.
 
 The V2 pair requires PP/PCP/DCP size 1, configured role ranks equal to DP x TP,
-static EP, and a registered AFD model. CUDA uses `P2pNcclAFDConnector` with
+static EP on Attention, and a registered AFD model. The FFN role may enable
+vLLM's expert-parallel load balancing (`--enable-eplb`): EPLB is FFN-only
+because Attention holds no experts and no MoE routing, and FFN EPLB rejects
+DBO/ubatching (see below). CUDA uses `P2pNcclAFDConnector` with
 model-specific gate placement and supports two native microbatches with
 Attention DP1 or DP > 1. See the
 [runtime matrix](../../support.md#tested-runtime-matrix) for tested
@@ -374,6 +377,38 @@ runs `connector.run_experts()`, and sends the weighted rows back; at the end
 of the step it calls `connector.synchronize_lanes()`. vLLM's MoE forward never
 runs on this runner. Dense (non-MoE) layers and shared experts have no owner
 on this path, so the model adapters reject them.
+
+## FFN-side EPLB
+
+The FFN role can enable vLLM's expert-parallel load balancing
+(`--enable-eplb` plus `--eplb-config`). `GPUFFNModelRunner` owns the native
+`EPLBController` and follows the upstream `GPUModelRunner` wiring:
+
+- `load_model` calls `prepare_load`, registers the loaded model through
+  `maybe_register_model` (the AFD FFN model inherits the native
+  `MixtureOfExperts` protocol, so the native `DeepseekV2MoE` layers receive
+  `EplbLayerState` maps and buffers), and starts the async transfer loop.
+- Every connector step prepares the router's unpadded token count and then
+  steps the EPLB state: eager steps and graph replays are real steps that
+  record expert load; warmup and graph-capture steps are dummy steps that
+  keep every FFN rank's rearrangement counter in lockstep.
+- Rearrangement runs entirely inside the native `EplbState`: load windows
+  are all-reduced across the FFN EP group, new maps are committed in place
+  (CUDA-graph compatible), and expert weights move over the EPLB
+  communicator (auto-selected: nixl, falling back to torch_gloo).
+
+The unpadded token count is the step's total real Attention tokens
+(`real_attention_token_total` in `ffn_metadata.py`), excluding the
+placeholder rows idle Attention peers transfer. Every FFN rank's router
+view covers those tokens, either through TP-replicated delivery or through
+the MoE-level all-gather, so the count matches the rows the router's
+map-and-record kernel processes.
+
+Limits: EPLB is rejected on the Attention role (its CUDA remote-expert
+shells hold no experts), and FFN EPLB rejects DBO/ubatching because the
+FFN daemon loop never installs vLLM's DBO thread context, so the record
+kernel could not select the per-ubatch token count. EPLB recipes live under
+`recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_colocation/`.
 
 ## Role-aware model loading
 

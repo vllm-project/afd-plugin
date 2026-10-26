@@ -607,7 +607,38 @@ _GPU_GRAPH = {
             {"par.enable_elastic_ep": True}, _err("static expert"), id="reject-elastic"
         ),
         pytest.param(
-            {"par.enable_eplb": True}, _err("static expert"), id="reject-eplb"
+            {"par.enable_eplb": True},
+            _err("EPLB only on the FFN role"),
+            id="reject-attention-eplb",
+        ),
+        pytest.param(
+            {
+                "afd.role": "ffn",
+                "hf.architectures": ["AFDDeepseekV2ForCausalLM"],
+                "par.enable_eplb": True,
+            },
+            None,
+            id="accept-ffn-eplb",
+        ),
+        pytest.param(
+            {
+                "afd.role": "ffn",
+                "hf.architectures": ["AFDDeepseekV2ForCausalLM"],
+                "par.enable_eplb": True,
+                "par.enable_dbo": True,
+            },
+            _err("DBO or ubatching"),
+            id="reject-ffn-eplb-dbo",
+        ),
+        pytest.param(
+            {
+                "afd.role": "ffn",
+                "hf.architectures": ["AFDDeepseekV2ForCausalLM"],
+                "par.enable_eplb": True,
+                "par.use_ubatching": True,
+            },
+            _err("DBO or ubatching"),
+            id="reject-ffn-eplb-ubatching",
         ),
         pytest.param(
             {"par.use_sequence_parallel_moe": True},
