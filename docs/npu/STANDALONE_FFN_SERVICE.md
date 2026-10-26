@@ -64,6 +64,11 @@ native routed modules and delegates the same native V4 loader and quantizer.
 Native module paths and V4's A-side scaling/clamp contract stay in that adapter.
 CAM static-placement constraints belong to platform settings, not V4 metadata.
 
+The CPU-only `v4_model.py` keeps `V4CheckpointDescription` and
+`V4ModelAdapter` together. `v4_weights.py` holds the native parameter owner
+and is imported only when loading begins. The shared `model.py` manages
+loading and resource lifetime; V4 has no separate execution runtime.
+
 Selection and loading hooks run before execution. The runtime still consumes
 `get_experts_layer_indices()`, `get_async_cam_w4a8_layers()` and the existing
 `W4A8LayerWeights`; no model dispatch, tensor transfer or synchronization is

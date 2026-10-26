@@ -15,8 +15,8 @@ from afd_plugin.ffn_faas.platforms.npu.settings import (
 )
 from afd_plugin.ffn_faas.platforms.npu.v4_model import (
     V4CheckpointDescription,
+    V4ModelAdapter,
 )
-from afd_plugin.ffn_faas.platforms.npu.v4_runtime import V4ModelAdapter
 
 
 def test_main_routed_metadata_without_parameter_allocation(checkpoint_dir):
