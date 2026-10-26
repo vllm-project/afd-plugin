@@ -37,6 +37,7 @@ validation_paths:
   - "tests/e2e/models/deepseek_v4_flash/config.py"
   - "tests/e2e/models/deepseek_v4_flash/completions.py"
   - "tests/e2e/models/qwen3_moe/test_qwen3_moe.py"
+  - "tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py"
   - "tests/e2e/models/qwen3_6/test_qwen3_6.py"
 upstream_refs:
   - "vLLM 0.30.0 serving and shutdown interfaces"

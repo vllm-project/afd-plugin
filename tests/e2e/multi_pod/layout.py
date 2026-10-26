@@ -22,9 +22,11 @@ ROLE_KINDS = (ATTENTION_ROLE, FFN_ROLE)
 ASYNC_AFD_CONNECTOR = "CAMAsyncAFDConnector"
 # docs/gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.md:88 - the synchronous connectors
 # rendezvous at the first FFN rank. The async CAM connector rendezvous at the
-# Attention side instead (tools/itask/launch_dsv4_afd_cross_node.sh).
+# Attention side instead (tools/itask/launch_dsv4_afd_cross_node.sh). DeepEP M2N
+# puts FFN ranks first, so its world rank 0 (the gloo store) is the first FFN rank.
 RENDEZVOUS_ROLE_BY_CONNECTOR = {
     "P2pNcclAFDConnector": FFN_ROLE,
+    "DeepEPM2NAFDConnector": FFN_ROLE,
     "CAMP2pAFDConnector": FFN_ROLE,
     ASYNC_AFD_CONNECTOR: ATTENTION_ROLE,
 }
