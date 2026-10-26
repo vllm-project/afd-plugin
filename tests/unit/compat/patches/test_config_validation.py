@@ -26,7 +26,7 @@ from afd_plugin.validation import (
 
 def _install_fake_vllm_config(monkeypatch):
     vllm_module = types.ModuleType("vllm")
-    vllm_module.__dict__["__version__"] = "0.30.0"
+    vllm_module.__dict__["__version__"] = "0.32.0"
     config_package = types.ModuleType("vllm.config")
     config_module = types.ModuleType("vllm.config.vllm")
     engine_package = types.ModuleType("vllm.engine")
@@ -306,7 +306,7 @@ def _cuda_case(
     case_id,
     *,
     platform=_CUDA,
-    version="0.30.0",
+    version="0.32.0",
     revalidate=False,
     worker=None,
     post_init_backend="deepep_low_latency",

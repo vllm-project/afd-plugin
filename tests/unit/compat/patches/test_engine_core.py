@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.unit.fakes.kv_cache import KVCacheExecutor
+
 
 class _EngineShutdownState(IntEnum):
     RUNNING = 0
@@ -60,6 +62,12 @@ def _install_fake_vllm_core(monkeypatch: pytest.MonkeyPatch):
         def step_with_batch_queue(self):
             return None
 
+        def collective_rpc(self, _method, *args, **kwargs):
+            return []
+
+        def _initialize_effective_attention_block_size(self):
+            return None
+
     class EngineCoreProc(EngineCore):
         last_counts: tuple[int, int]
 
@@ -89,10 +97,6 @@ def _install_fake_vllm_core(monkeypatch: pytest.MonkeyPatch):
 
         def clear_backend(self):
             self.backend_cleared = True
-
-    class _MMRegistry:
-        def engine_receiver_cache_from_config(self, vllm_config):
-            return ("mm-cache", vllm_config)
 
     class _SchedulerStats:
         def __init__(
@@ -169,12 +173,13 @@ def _install_fake_vllm_core(monkeypatch: pytest.MonkeyPatch):
     core_module.EngineCoreProc = EngineCoreProc
     core_module.DPEngineCoreProc = DPEngineCoreProc
     core_module.EngineShutdownState = _EngineShutdownState
-    core_module.VLLM_VERSION = "0.30.0"
+    core_module.VLLM_VERSION = "0.32.0"
     core_module.logger = logging.getLogger("fake-vllm-core")
     core_module.logger.info_once = lambda *args, **kwargs: None
     core_module.envs = SimpleNamespace(VLLM_ELASTIC_EP_SCALE_UP_LAUNCH=False)
     core_module.StructuredOutputManager = _StructuredOutputManager
-    core_module.MULTIMODAL_REGISTRY = _MMRegistry()
+    core_module.engine_receiver_cache_from_config = lambda config: ("mm-cache", config)
+    core_module.measure_encoder_output_widths = lambda _config, _rpc: None
     core_module.SchedulerStats = _SchedulerStats
     core_module.instrument = instrument
     core_module.fault_tolerant_wrapper = fault_tolerant_wrapper
@@ -187,6 +192,7 @@ def _install_fake_vllm_core(monkeypatch: pytest.MonkeyPatch):
     core_module.get_request_block_hasher = get_request_block_hasher
     core_module.register_all_kvcache_specs = register_all_kvcache_specs
     core_module.resolve_kv_cache_block_sizes = resolve_kv_cache_block_sizes
+    core_module.resolve_cache_hit_alignment_tokens = lambda *_args: 32
     core_module.freeze_gc_heap = lambda: None
     core_module.maybe_attach_gc_debug_callback = lambda: None
     core_module.enable_envs_cache = lambda: None
@@ -272,6 +278,7 @@ def _config(role: str, *, async_dp: bool = False):
         model_config=model_config,
         speculative_config=None,
         ec_transfer_config=None,
+        is_mm_encoder_only=False,
         max_concurrent_batches=1,
         compilation_config=SimpleNamespace(
             compilation_time=0.0,
@@ -357,38 +364,12 @@ def test_engine_core_patch_leaves_cuda_non_ffn_path_untouched(monkeypatch):
     _load_patch_module()
     monkeypatch.setitem(sys.modules, "vllm_ascend", None)
 
-    class Executor:
-        max_concurrent_batches = 1
-
-        def __init__(self, vllm_config):
-            self.vllm_config = vllm_config
-            self.warmup_called = False
-            self.kv_cache_layout = None
-
-        def get_kv_cache_specs(self):
-            return []
-
-        def get_supported_kv_cache_layouts(self):
-            return ["layered"]
-
-        def set_kv_cache_layout(self, layout_name):
-            self.kv_cache_layout = layout_name
-
-        def initialize_from_config(self, kv_cache_configs):
-            self.kv_cache_configs = kv_cache_configs
-
-        def compile_or_warm_up_model(self):
-            self.warmup_called = True
-
-        def shutdown(self):
-            self.shutdown_called = True
-
     config = _config("attention")
     config.device_config = SimpleNamespace(device_type="cuda")
-    engine = core_module.EngineCore(config, Executor, log_stats=False)
+    engine = core_module.EngineCore(config, KVCacheExecutor, log_stats=False)
 
     assert not hasattr(engine, "original_init_called")
-    assert isinstance(engine.model_executor, Executor)
+    assert isinstance(engine.model_executor, KVCacheExecutor)
     assert engine.scheduler is not None
     assert engine.available_gpu_memory_for_kv_cache == -1
     # vLLM 0.30.0 split warmup out of Executor.initialize_from_config; the
@@ -398,6 +379,25 @@ def test_engine_core_patch_leaves_cuda_non_ffn_path_untouched(monkeypatch):
     # vLLM 0.30.0 resolves the KV cache layout before memory profiling and
     # pushes it onto the workers; the AFD copy must preserve that.
     assert engine.model_executor.kv_cache_layout == "layered"
+
+
+def test_native_kv_config_preserves_worker_and_scheduler_alignment(monkeypatch):
+    core = _install_fake_vllm_core(monkeypatch)
+    patch = _load_patch_module()
+    config = _config("attention")
+    worker_config = SimpleNamespace(kv_cache_groups=[], num_blocks=0)
+    monkeypatch.setattr(core, "get_kv_cache_configs", lambda *_args: [worker_config])
+    executor = KVCacheExecutor(config)
+    executor.kv_cache_specs = [{}]
+
+    result = patch._initialize_kv_caches(
+        SimpleNamespace(model_executor=executor), config
+    )
+
+    assert result.hash_block_size == 16
+    assert result.cache_hit_alignment_tokens == 32
+    assert executor.kv_cache_configs[0].hash_block_size == 16
+    assert executor.kv_cache_configs[0].cache_hit_alignment_tokens == 32
 
 
 def test_engine_core_patch_imports_ascend_kv_cache_patch_on_npu(monkeypatch):
@@ -414,33 +414,9 @@ def test_engine_core_patch_imports_ascend_kv_cache_patch_on_npu(monkeypatch):
 
     monkeypatch.setattr("builtins.__import__", tracking_import)
 
-    class Executor:
-        max_concurrent_batches = 1
-
-        def __init__(self, vllm_config):
-            self.vllm_config = vllm_config
-
-        def get_kv_cache_specs(self):
-            return []
-
-        def get_supported_kv_cache_layouts(self):
-            return ["layered"]
-
-        def set_kv_cache_layout(self, layout_name):
-            return None
-
-        def initialize_from_config(self, kv_cache_configs):
-            self.kv_cache_configs = kv_cache_configs
-
-        def compile_or_warm_up_model(self):
-            return None
-
-        def shutdown(self):
-            self.shutdown_called = True
-
     config = _config("attention")
     config.device_config = SimpleNamespace(device_type="npu")
-    engine = core_module.EngineCore(config, Executor, log_stats=False)
+    engine = core_module.EngineCore(config, KVCacheExecutor, log_stats=False)
 
     assert imported == ["vllm_ascend.patch.platform.patch_kv_cache_utils"]
     assert engine.scheduler is not None
