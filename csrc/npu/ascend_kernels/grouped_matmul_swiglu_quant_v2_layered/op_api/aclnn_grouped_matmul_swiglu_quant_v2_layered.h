@@ -76,17 +76,6 @@ __attribute__((visibility("default"))) aclnnStatus aclnnGroupedMatmulSwigluQuant
     int64_t dequantDtype, int64_t quantMode, int64_t groupListType, const aclIntArray *tuningConfigOptional,
     aclTensor *output, aclTensor *outputScale, uint64_t *workspaceSize, aclOpExecutor **executor);
 
-/** Clamp-aware ABI. Zero is unlimited; nonzero requires per-channel A8W4.
- * Gate is capped above and up symmetrically before SwiGLU and quantization.
- * A distinct symbol prevents an old CANN package from misreading new arguments.
- */
-__attribute__((visibility("default"))) aclnnStatus aclnnGroupedMatmulSwigluQuantV2LayeredWithLimitGetWorkspaceSize(
-    const aclTensor *x, const aclTensorList *allWeight, const aclTensorList *allWeightScale,
-    const aclTensorList *allWeightAssistMatrix, const aclTensor *bias, const aclTensor *xScale,
-    const aclTensor *smoothScale, const aclTensor *groupList, const aclTensor *layerIndex, int64_t dequantMode,
-    int64_t dequantDtype, int64_t quantMode, int64_t groupListType, const aclIntArray *tuningConfigOptional,
-    double swigluLimit, aclTensor *output, aclTensor *outputScale, uint64_t *workspaceSize, aclOpExecutor **executor);
-
 /**
  * @brief Second stage interface of aclnnGroupedMatmulSwigluQuantV2Layered, used to execute the computation.
  * @param [in] workspace: The starting address of the workspace allocated on the npu device side.
@@ -100,9 +89,6 @@ __attribute__((visibility("default"))) aclnnStatus aclnnGroupedMatmulSwigluQuant
                                                                                           uint64_t workspaceSize,
                                                                                           aclOpExecutor *executor,
                                                                                           aclrtStream stream);
-
-__attribute__((visibility("default"))) aclnnStatus aclnnGroupedMatmulSwigluQuantV2LayeredWithLimit(
-    void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream);
 
 #ifdef __cplusplus
 }

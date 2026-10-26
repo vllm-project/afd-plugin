@@ -211,8 +211,6 @@ ge::graphStatus GroupedMatmulSwigluQuantV2LayeredBaseTiling::ParseInputAndAttr()
     OP_CHECK_NULL_WITH_CONTEXT(context_, attr); // check attr is not null
     const int64_t *dequantModePtr = attr->GetAttrPointer<int64_t>(ATTR_INDEX_DEQUANT_MODE);
     auto dequantMode = dequantModePtr != nullptr ? *dequantModePtr : 0;
-    const float *limit = attr->GetAttrPointer<float>(ATTR_INDEX_SWIGLU_LIMIT);
-    swigluLimit_ = limit != nullptr ? *limit : 0.0f;
     OP_CHECK_IF(!(dequantMode == 0 || dequantMode == 1),
                 OP_LOGE(context_->GetNodeName(), "dequantMode must be 0 or 1, but actual value is %ld.", dequantMode),
                 return ge::GRAPH_FAILED);
@@ -481,7 +479,6 @@ void GroupedMatmulSwigluQuantV2LayeredBaseTiling::FillTilingData()
     tilingData_.gmmSwigluQuantV2BaseParams.set_groupListType(groupListType_);
     tilingData_.gmmSwigluQuantV2BaseParams.set_smoothScaleDimNum(smoothScaleDimNum_);
     tilingData_.gmmSwigluQuantV2BaseParams.set_layerNum(layerNum_);
-    tilingData_.gmmSwigluQuantV2BaseParams.set_swigluLimit(swigluLimit_);
     tilingData_.gmmSwigluQuantV2.set_maxProcessRowNum(maxProcessRowNum_);
     tilingData_.gmmSwigluQuantV2.set_groupListLen(groupNum_);
     tilingData_.gmmSwigluQuantV2.set_tokenLen(n_);

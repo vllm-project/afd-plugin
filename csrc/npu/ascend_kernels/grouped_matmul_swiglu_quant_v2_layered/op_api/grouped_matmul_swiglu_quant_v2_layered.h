@@ -28,7 +28,7 @@ const std::tuple<aclTensor *, aclTensor *> GroupedMatmulSwigluQuantV2Layered(
     const aclTensorList *weightAssistanceMatrix, const aclTensor *bias, const aclTensor *smoothScale,
     const aclTensor *groupList, const aclTensor *layerIndex, int64_t dequantMode, int64_t dequantDtype,
     int64_t quantMode, int64_t quantDtype, bool transposeWeight, int64_t groupListType,
-    const aclIntArray *tuningConfigOptional, float swigluLimit, aclOpExecutor *executor);
+    const aclIntArray *tuningConfigOptional, aclOpExecutor *executor);
 }
 
 #endif

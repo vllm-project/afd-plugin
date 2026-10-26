@@ -69,7 +69,7 @@ const std::tuple<aclTensor *, aclTensor *> GroupedMatmulSwigluQuantV2Layered(
     const aclTensor *bias, const aclTensor *smoothScale, const aclTensor *groupList,
     const aclTensor *layerIndex, int64_t dequantMode, int64_t dequantDtype,
     int64_t quantMode, int64_t quantDtype, bool transposeWeight, int64_t groupListType,
-    const aclIntArray *tuningConfigOptional, float swigluLimit, aclOpExecutor *executor)
+    const aclIntArray *tuningConfigOptional, aclOpExecutor *executor)
 {
     [[maybe_unused]] static const bool configRegistered = []() {
         op::BinConfigJsonDict::UpdateConfigJsonPath(
@@ -99,7 +99,7 @@ const std::tuple<aclTensor *, aclTensor *> GroupedMatmulSwigluQuantV2Layered(
         OP_INPUT(x, xScale, groupList, layerIndex, weight, weightScale, weightAssistanceMatrix, bias, smoothScale),
         OP_OUTPUT(out, scaleOut),
         OP_ATTR(dequantMode, dequantDtype, quantMode, quantDtype, transposeWeight, groupListType,
-                tuningConfigOptional, swigluLimit));
+                tuningConfigOptional));
     if (ret != ACLNN_SUCCESS) {
         OP_LOGE(ACLNN_ERR_PARAM_INVALID, "InferShape failed.");
         return std::tuple(nullptr, nullptr);
@@ -110,7 +110,7 @@ const std::tuple<aclTensor *, aclTensor *> GroupedMatmulSwigluQuantV2Layered(
         OP_INPUT(x, xScale, groupList, layerIndex, weight, weightScale, weightAssistanceMatrix, bias, smoothScale),
         OP_OUTPUT(out, scaleOut),
         OP_ATTR(dequantMode, dequantDtype, quantMode, quantDtype, transposeWeight, groupListType,
-                tuningConfigOptional, swigluLimit));
+                tuningConfigOptional));
     if (ret != ACLNN_SUCCESS) {
         OP_LOGE(ACLNN_ERR_PARAM_INVALID, "ADD_TO_LAUNCHER_LIST_AICORE failed.");
         return std::tuple(nullptr, nullptr);

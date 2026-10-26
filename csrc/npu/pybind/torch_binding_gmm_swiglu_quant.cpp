@@ -9,7 +9,6 @@
 
 #include <torch/extension.h>
 #include <torch/library.h>
-#include <cmath>
 
 #include "pytorch_extension/op_api_common.h"
 #include "grouped_matmul_swiglu_quant_v2_layered/op_api/aclnn_grouped_matmul_swiglu_quant_v2_layered.h"
@@ -18,17 +17,6 @@ namespace afd_plugin::gmm_swiglu_quant {
 namespace {
 
 using tensor_list = std::vector<at::Tensor>;
-
-void check_swiglu_limit(const at::Tensor &x, const at::TensorList &weight,
-                        int64_t dequantMode, int64_t quantMode, double limit) {
-  TORCH_CHECK(std::isfinite(limit) && limit >= 0.0,
-              "swiglu_limit must be finite and nonnegative");
-  TORCH_CHECK(limit == 0.0 ||
-                  (x.scalar_type() == at::kChar && !weight.empty() &&
-                   weight[0].scalar_type() == at::kInt &&
-                   dequantMode == 0 && quantMode == 0),
-              "swiglu_limit requires per-channel A8W4");
-}
 
 // quantMode == 2 selects mx-style quantization (per-64-block scale pairs).
 constexpr int64_t QUANT_MODE_MX = 2;
@@ -95,10 +83,8 @@ tensor_list impl_npu(
     const at::Tensor &groupList, const at::Tensor &layerIndex,
     const int64_t dequantMode, const int64_t quantMode,
     const int64_t groupListType,
-    const c10::optional<std::vector<int64_t>> &tuningConfigOptional,
-    const double swigluLimit) {
+    const c10::optional<std::vector<int64_t>> &tuningConfigOptional) {
   check_lists(allWeight, allWeightScale, allWeightAssistMatrix, layerIndex);
-  check_swiglu_limit(x, allWeight, dequantMode, quantMode, swigluLimit);
   // Pin the NPU device to the one the tensors live on, before the first device
   // operation below (the output allocation and the kernel launch both touch the
   // device). Without this the current device stays at the process default even
@@ -128,11 +114,11 @@ tensor_list impl_npu(
   // attrs. The aclnn API has no quant_dtype argument -- the op_api derives it
   // from the output tensor's dtype via output->GetDataType().
   int64_t dequantDtype = static_cast<int64_t>(at::kFloat);
-  EXEC_NPU_CMD(aclnnGroupedMatmulSwigluQuantV2LayeredWithLimit,
+  EXEC_NPU_CMD(aclnnGroupedMatmulSwigluQuantV2Layered,
                x, allWeight, allWeightScale, allWeightAssistMatrix,
                biasPlaceholder, xScale, smoothScalePlaceholder, groupList,
                layerIndex, dequantMode, dequantDtype, quantMode, groupListType,
-               tuningConfigRef, swigluLimit, yOut, yScaleOut);
+               tuningConfigRef, yOut, yScaleOut);
   return {yOut, yScaleOut};
 }
 
@@ -144,12 +130,10 @@ tensor_list impl_meta(
     const at::Tensor &groupList, const at::Tensor &layerIndex,
     const int64_t dequantMode, const int64_t quantMode,
     const int64_t groupListType,
-    const c10::optional<std::vector<int64_t>> &tuningConfigOptional,
-    const double swigluLimit) {
+    const c10::optional<std::vector<int64_t>> &tuningConfigOptional) {
   // Meta dispatch never reaches the op_api, so the binding is the only layer
   // that can enforce the layered list contract on this path.
   check_lists(allWeight, allWeightScale, allWeightAssistMatrix, layerIndex);
-  check_swiglu_limit(x, allWeight, dequantMode, quantMode, swigluLimit);
   at::Tensor yOut;
   at::Tensor yScaleOut;
   AllocSwigluQuantOutputs(xScale, allWeightScale, quantMode, yOut, yScaleOut);
@@ -164,15 +148,14 @@ tensor_list impl_dispatch(
     const at::Tensor &groupList, const at::Tensor &layerIndex,
     const int64_t dequantMode, const int64_t quantMode,
     const int64_t groupListType,
-    const c10::optional<std::vector<int64_t>> &tuningConfigOptional,
-    const double swigluLimit) {
+    const c10::optional<std::vector<int64_t>> &tuningConfigOptional) {
   static auto op = torch::Dispatcher::singleton()
                        .findSchemaOrThrow(
                            "afd_ascend::gmm_swiglu_quant_v2_layered", "")
                        .typed<decltype(impl_dispatch)>();
   return op.call(x, allWeight, allWeightScale, allWeightAssistMatrix, xScale,
                  groupList, layerIndex, dequantMode, quantMode, groupListType,
-                 tuningConfigOptional, swigluLimit);
+                 tuningConfigOptional);
 }
 
 // Source: gmm_swiglu_quant_v2_layered.cpp::ExtCamGmmSwigluQuantV2Layered.
@@ -188,14 +171,13 @@ class ExtGmmSwigluQuantV2Layered
       const at::Tensor &groupList, const at::Tensor &layerIndex,
       const int64_t dequantMode, const int64_t quantMode,
       const int64_t groupListType,
-      const c10::optional<std::vector<int64_t>> &tuningConfigOptional,
-    const double swigluLimit) {
+      const c10::optional<std::vector<int64_t>> &tuningConfigOptional) {
     at::AutoDispatchBelowADInplaceOrView guard;
 
     auto result = impl_dispatch(x, allWeight, allWeightScale,
                                 allWeightAssistMatrix, xScale, groupList,
                                 layerIndex, dequantMode, quantMode,
-                                groupListType, tuningConfigOptional, swigluLimit);
+                                groupListType, tuningConfigOptional);
     return result;
   }
 
@@ -203,7 +185,7 @@ class ExtGmmSwigluQuantV2Layered
                               tensor_list grad_outputs) {
     return {at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor(),
             at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor(),
-            at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor()};
+            at::Tensor(), at::Tensor(), at::Tensor()};
   }
 };
 
@@ -215,11 +197,10 @@ tensor_list impl_autograd(
     const at::Tensor &groupList, const at::Tensor &layerIndex,
     const int64_t dequantMode, const int64_t quantMode,
     const int64_t groupListType,
-    const c10::optional<std::vector<int64_t>> &tuningConfigOptional,
-    const double swigluLimit) {
+    const c10::optional<std::vector<int64_t>> &tuningConfigOptional) {
   auto result = ExtGmmSwigluQuantV2Layered::apply(
       x, allWeight, allWeightScale, allWeightAssistMatrix, xScale, groupList,
-      layerIndex, dequantMode, quantMode, groupListType, tuningConfigOptional, swigluLimit);
+      layerIndex, dequantMode, quantMode, groupListType, tuningConfigOptional);
   return result;
 }
 
@@ -231,7 +212,7 @@ TORCH_LIBRARY_FRAGMENT(afd_ascend, ops) {
           "Tensor[] all_weight_scale, Tensor[] all_weight_assist_matrix, "
           "Tensor x_scale, Tensor group_list, Tensor layer_index, "
           "int dequant_mode=0, int quant_mode=0, int group_list_type=0, "
-          "int[]? tuning_config=None, float swiglu_limit=0.) -> Tensor[]");
+          "int[]? tuning_config=None) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(afd_ascend, PrivateUse1, ops) {

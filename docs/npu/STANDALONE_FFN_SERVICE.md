@@ -29,16 +29,6 @@ model MoE layers are loaded; MTP layers, gates, shared experts and Attention
 weights are not instantiated. The native ModelSlim factory, checkpoint loader
 and quantizer own expert mapping, NZ packing, encoded scales and compensation.
 
-Layered V4 execution requires the separate common SwiGLU clamp correctness
-fix: gate is capped above, up is clamped symmetrically, and both clamps precede
-SwiGLU and activation quantization. A zero limit preserves unlimited activation.
-Rebuild the plugin extension and CANN package together after this API change;
-an older binary cannot implement the new `swiglu_limit` argument. This
-dependency applies to traditional CAM and standalone F equally. It does not
-include adaptive tiling, W2 `.out` or a new transport. The original ACLNN entry
-point keeps its unlimited-activation ABI; the new binding resolves a distinct
-clamp-aware symbol rather than passing new arguments to an older library.
-
 ## Platform and ownership boundary
 
 The CPU-only CLI, `FFNService` and host `FFNModelRunner` use the narrow
@@ -226,10 +216,10 @@ and host ownership. This includes an independent metadata adapter contract and
 evidence for a second model. CPU tests do not qualify native packing, HCCL,
 Graph capture or pending device work.
 
-Applicable lower-level evidence is reused: 24 clamp/unlimited and empty/tail
+Earlier lower-level qualification covered 24 clamp/unlimited and empty/tail
 numerical cases, finite synthetic eager/FULL CAM execution, and the original
 43-layer checkpoint with one A peer and four independent F processes. These
-are earlier checks of the unchanged operators and execution contract, rather
+are earlier checks of the operators and execution contract, rather
 than new candidate measurements. FULL/two-stream outputs matched eager exactly;
 an extra transaction exercised pending-receive isolation.
 

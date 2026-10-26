@@ -48,7 +48,6 @@ TILING_DATA_FIELD_DEF(int64_t, groupListType);
 TILING_DATA_FIELD_DEF(int64_t, smoothScaleDimNum);
 TILING_DATA_FIELD_DEF(int64_t, singleN);
 TILING_DATA_FIELD_DEF(uint32_t, layerNum);  // layered: all_* list length, bounds-checks the device layer index
-TILING_DATA_FIELD_DEF(float, swigluLimit);
 END_TILING_DATA_DEF;
 REGISTER_TILING_DATA_CLASS(GMMSwigluQuantV2BaseParamsOp, GMMSwigluQuantV2BaseParams)
 
@@ -127,7 +126,6 @@ constexpr uint32_t BATCH_MODE_SCHEDULE = 1;
 constexpr uint32_t ATTR_INDEX_DEQUANT_MODE = 0;
 constexpr uint32_t ATTR_INDEX_GROUPLIST_TYPE = 5;
 constexpr uint32_t ATTR_INDEX_TUNING_CONFIG = 6;
-constexpr uint32_t ATTR_INDEX_SWIGLU_LIMIT = 7;
 constexpr uint32_t ATTR_INDEX_TRANSPOSE_WEIGHT = 4;
 constexpr uint32_t DIM_0 = 0;
 constexpr uint32_t DIM_1 = 1;

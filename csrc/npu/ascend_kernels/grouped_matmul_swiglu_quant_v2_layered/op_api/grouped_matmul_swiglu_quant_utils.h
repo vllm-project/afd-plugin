@@ -61,7 +61,6 @@ struct GroupedMatmulSwigluQuantParamsBase {
     int64_t quantMode = 0;
     int64_t quantDtype = 0;
     int64_t groupListType = 0;
-    float swigluLimit = 0.0f;
     bool transposeWeight = false;
     bool isA8W4 = false;
     bool isA4W4 = false;
@@ -127,12 +126,6 @@ class GroupedMatmulSwigluQuantParamsBuilder {
     GroupedMatmulSwigluQuantParamsBuilder &SetTuningConfig(const aclIntArray *tuningConfig)
     {
         p_.tuningConfig = tuningConfig;
-        return *this;
-    }
-
-    GroupedMatmulSwigluQuantParamsBuilder &SetSwigluLimit(float limit)
-    {
-        p_.swigluLimit = limit;
         return *this;
     }
 
@@ -437,7 +430,7 @@ class GroupedMatmulSwigluQuantHandler {
             gmmDsqParams_.weightAssistMatrix, gmmDsqParams_.bias, gmmDsqParams_.smoothScale, gmmDsqParams_.groupList,
             gmmDsqParams_.layerIndex, gmmDsqParams_.dequantMode, gmmDsqParams_.dequantDtype, gmmDsqParams_.quantMode,
             gmmDsqParams_.quantDtype, gmmDsqParams_.transposeWeight, gmmDsqParams_.groupListType,
-            gmmDsqParams_.tuningConfig, gmmDsqParams_.swigluLimit, uniqueExecutor.get());
+            gmmDsqParams_.tuningConfig, uniqueExecutor.get());
         CHECK_RET(ret0 != std::tuple(nullptr, nullptr), ACLNN_ERR_INNER_NULLPTR);
 
         auto out0 = std::get<OUTPUT_IDX_0>(ret0);

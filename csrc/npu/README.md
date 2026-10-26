@@ -153,14 +153,6 @@ A8W4-MSD variants) built for `ascend910_93`. It is registered as
 autograd grad) and is excluded from `ascend950` builds. The Async CAM layered
 W4A8 executor selects it with `AFD_ASYNC_CAM_LAYERED_GMM=1`.
 
-The optional `swiglu_limit` attribute supports per-channel A8W4-MSD: cap gate
-above the limit and clamp up symmetrically before SwiGLU and activation
-quantization. Zero keeps unlimited activation. Rebuild the CANN package and
-PyTorch extension together. The original ACLNN workspace/execute symbols keep
-their unlimited-activation ABI; the clamp-aware binding resolves the distinct
-`aclnnGroupedMatmulSwigluQuantV2LayeredWithLimit` entry points, so it cannot pass
-an expanded argument list to an older library.
-
 A8W8 accepts an NZ weight as either an explicit five-dimensional view or the
 three-dimensional logical view `npu_format_cast` produces over NZ storage; the
 dimension and shape checks accept both, as the A8W4/A4W4 path already did.
