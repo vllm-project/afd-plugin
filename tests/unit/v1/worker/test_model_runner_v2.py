@@ -2466,7 +2466,7 @@ def test_workers_reject_bootstrapped_connector_on_another_device(
 
 
 def _deepep_m2n_v2_config(**kwargs):
-    config = _v2_config(**kwargs)
+    config = _v2_config(architecture="Qwen3MoeForCausalLM", **kwargs)
     config.additional_config["afd"]["connector"] = "DeepEPM2NAFDConnector"
     config.additional_config["afd"]["compute_gate_on_attention"] = True
     return config

@@ -145,7 +145,10 @@ def mrv2_config(monkeypatch):
             use_ubatching=True,
             num_ubatches=2,
         ),
-        model_config=SimpleNamespace(enforce_eager=True),
+        model_config=SimpleNamespace(
+            enforce_eager=True,
+            hf_config=SimpleNamespace(architectures=["Qwen3MoeForCausalLM"]),
+        ),
         compilation_config=SimpleNamespace(
             cudagraph_mode="FULL_DECODE_ONLY",
             pass_config=SimpleNamespace(enable_sp=False),
@@ -175,6 +178,41 @@ def test_routed_transport_preserves_runner_and_gate_policy(mrv2_config, role):
     )
     mrv2_config.additional_config["afd"]["compute_gate_on_attention"] = False
     with pytest.raises(RuntimeError, match="requires compute_gate_on_attention=true"):
+        validate_gpu_model_runner_v2_config(
+            mrv2_config, expected_role=role, device_type="cuda"
+        )
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+@pytest.mark.parametrize(
+    "architecture, accepted",
+    [
+        pytest.param("Qwen3MoeForCausalLM", True, id="qwen3-moe"),
+        # Runners validate the wrapped model's AFD-prefixed architecture.
+        pytest.param("AFDQwen3MoeForCausalLM", True, id="afd-qwen3-moe"),
+        pytest.param("DeepseekV2ForCausalLM", False, id="deepseek-v2"),
+        pytest.param("DeepseekV3ForCausalLM", False, id="deepseek-v3"),
+        pytest.param("AFDDeepseekV3ForCausalLM", False, id="afd-deepseek-v3"),
+        pytest.param("Qwen3_5MoeForConditionalGeneration", False, id="qwen3-5-moe"),
+    ],
+)
+def test_routed_transport_requires_model_that_routes_on_attention(
+    monkeypatch, mrv2_config, role, architecture, accepted
+):
+    mrv2_config.additional_config["afd"].update(
+        role=role, connector="DeepEPM2NAFDConnector", compute_gate_on_attention=True
+    )
+    mrv2_config.model_config.hf_config.architectures = [architecture]
+
+    if accepted:
+        validate_gpu_model_runner_v2_config(
+            mrv2_config, expected_role=role, device_type="cuda"
+        )
+        return
+    # Workers validate before the connector bootstrap; rejecting a model must
+    # not need the model runtime.
+    monkeypatch.setitem(sys.modules, MODEL_UTILS_MODULE, None)
+    with pytest.raises(RuntimeError, match="DeepEPM2NAFDConnector supports only"):
         validate_gpu_model_runner_v2_config(
             mrv2_config, expected_role=role, device_type="cuda"
         )
