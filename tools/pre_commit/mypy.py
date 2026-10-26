@@ -10,7 +10,7 @@ Usage:
     python tools/pre_commit/mypy.py <python_version> <changed_files...>
 
 Args:
-    python_version: Python version to use (e.g. "3.10") or "local" to use
+    python_version: Python version to use (e.g. "3.11") or "local" to use
         the interpreter running this script.
     changed_files: List of changed files to check.
 """

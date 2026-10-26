@@ -310,6 +310,7 @@ def test_entry_point_is_registered():
 
 
 def test_vllm_version_support_is_exact_target():
-    assert is_vllm_version_supported("0.30.0")
+    assert is_vllm_version_supported("0.32.0")
+    assert not is_vllm_version_supported("0.30.0")
     assert not is_vllm_version_supported("0.29.0")
     assert not is_vllm_version_supported("0.30.1")
