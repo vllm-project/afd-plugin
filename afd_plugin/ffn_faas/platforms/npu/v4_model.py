@@ -18,21 +18,6 @@ from pathlib import Path
 from types import MappingProxyType
 
 
-def validate_static_experts(
-    *,
-    enable_eplb: bool,
-    enable_elastic_ep: bool,
-    redundant_experts: int,
-    dynamic_eplb: bool = False,
-) -> None:
-    """Keep native expert state resident without enabling unsupported relocation."""
-    if enable_eplb or enable_elastic_ep or redundant_experts != 0 or dynamic_eplb:
-        raise ValueError(
-            "standalone CAM requires static expert placement; EPLB, elastic EP "
-            "and redundant experts are not supported"
-        )
-
-
 @dataclass(frozen=True)
 class V4CheckpointDescription:
     root: Path

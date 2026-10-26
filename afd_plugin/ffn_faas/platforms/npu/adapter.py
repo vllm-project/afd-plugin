@@ -10,22 +10,21 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 from afd_plugin.ffn_faas.interfaces import FFNLaunch
+from afd_plugin.ffn_faas.platforms.npu import get_model
 from afd_plugin.ffn_faas.platforms.npu.settings import FFNConfig
-from afd_plugin.ffn_faas.platforms.npu.v4_model import V4CheckpointDescription
 
 if TYPE_CHECKING:
     from afd_plugin.ffn_faas.interfaces import FFNBackend
+    from afd_plugin.ffn_faas.platforms.npu.model import CAMRoutedModel
 
 
-def create_backend(
-    checkpoint: V4CheckpointDescription, settings: FFNConfig
-) -> FFNBackend:
+def create_backend(model: CAMRoutedModel, settings: FFNConfig) -> FFNBackend:
     from vllm_ascend.utils import bootstrap_custom_op_env
 
     bootstrap_custom_op_env()
     from afd_plugin.ffn_faas.platforms.npu.backend import CAMFFNBackend
 
-    return CAMFFNBackend(checkpoint, settings)
+    return CAMFFNBackend(model, settings)
 
 
 class AscendCAMAdapter:
@@ -94,13 +93,13 @@ class AscendCAMAdapter:
             hccl_buffer_size=args.hccl_buffer_size,
             shutdown_timeout=args.shutdown_timeout,
         )
-        checkpoint = V4CheckpointDescription.read(args.model)
+        model = get_model(args.model, settings.ffn_ranks, settings.rank)
         return FFNLaunch(
             rank=rank,
             local_rank=local_rank,
-            model_path=str(checkpoint.root),
+            model_path=str(model.root),
             backend_name="CAMAsyncAFDConnector",
             shutdown_timeout=settings.shutdown_timeout,
-            backend_factory=partial(create_backend, checkpoint, settings),
+            backend_factory=partial(create_backend, model, settings),
             initial_status={"cam_paired": False},
         )

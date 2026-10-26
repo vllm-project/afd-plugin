@@ -131,6 +131,22 @@ def test_real_cli_accepts_an_independent_cpu_adapter(cpu_platform_case):
     assert snapshot["resources_released"] is True
 
 
+def test_supported_model_selection_keeps_cpu_import_boundary(
+    cpu_platform_case, checkpoint_dir, tmp_path
+):
+    probe = tmp_path / "select_model.py"
+    probe.write_text(
+        "from pathlib import Path\n"
+        "from afd_plugin.ffn_faas.platforms.npu import get_model\n"
+        f"model = get_model(Path({str(checkpoint_dir)!r}), 2, 1)\n"
+        "assert model.get_experts_layer_indices() == (0, 1)\n"
+        "assert model.parameter_bytes > 0\n"
+        "model.close()\n"
+    )
+    result, _, _ = cpu_platform_case(probe)
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize(
     ("package", "statement"),
     [

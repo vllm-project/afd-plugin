@@ -96,3 +96,44 @@ class FFNConfig:
             "enable_cpu_binding": True,
             "ascend_fusion_config": {"fusion_ops_gmmswigluquant": True},
         }
+
+
+def validate_static_experts(
+    *,
+    enable_eplb: bool,
+    enable_elastic_ep: bool,
+    redundant_experts: int,
+    dynamic_eplb: bool = False,
+) -> None:
+    """Keep native expert state resident without enabling unsupported relocation."""
+    if enable_eplb or enable_elastic_ep or redundant_experts != 0 or dynamic_eplb:
+        raise ValueError(
+            "standalone CAM requires static expert placement; EPLB, elastic EP "
+            "and redundant experts are not supported"
+        )
+
+
+def validate_native_expert_map(
+    *, num_experts: int, ffn_ranks: int, ffn_rank: int, expert_map: list[int] | None
+) -> frozenset[int]:
+    """Require the native sharding to match CAM's contiguous expert placement."""
+    if ffn_ranks <= 0 or num_experts % ffn_ranks or not 0 <= ffn_rank < ffn_ranks:
+        raise ValueError("CAM experts require a divisible, valid F topology")
+    local_experts = num_experts // ffn_ranks
+    if expert_map is None:
+        if ffn_ranks != 1:
+            raise ValueError("sharded native experts require an explicit map")
+        # The native factory omits the map when every expert is local.
+        return frozenset(range(num_experts))
+    if len(expert_map) != num_experts:
+        raise ValueError("native expert map has the wrong global expert count")
+    owned = frozenset(expert for expert, local in enumerate(expert_map) if local >= 0)
+    if sorted(expert_map[expert] for expert in owned) != list(range(local_experts)):
+        raise ValueError("native expert map is not a local bijection")
+    first = ffn_rank * local_experts
+    end = first + local_experts
+    if owned != frozenset(range(first, end)) or expert_map[first:end] != list(
+        range(local_experts)
+    ):
+        raise ValueError("native placement differs from contiguous CAM routing")
+    return owned

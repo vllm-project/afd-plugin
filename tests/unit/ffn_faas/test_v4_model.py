@@ -8,72 +8,26 @@ import json
 
 import pytest
 
+from afd_plugin.ffn_faas.platforms.npu import get_model
 from afd_plugin.ffn_faas.platforms.npu.environment import AscendFFNEnvironment
-from afd_plugin.ffn_faas.platforms.npu.settings import FFNConfig
+from afd_plugin.ffn_faas.platforms.npu.settings import (
+    FFNConfig,
+)
 from afd_plugin.ffn_faas.platforms.npu.v4_model import (
     V4CheckpointDescription,
-    validate_static_experts,
 )
-from afd_plugin.ffn_faas.platforms.npu.v4_runtime import (
-    V4FFNModel,
-    validate_native_expert_map,
-)
+from afd_plugin.ffn_faas.platforms.npu.v4_runtime import V4ModelAdapter
 
 
 def test_main_routed_metadata_without_parameter_allocation(checkpoint_dir):
     checkpoint = V4CheckpointDescription.read(checkpoint_dir)
     assert checkpoint.layer_indices == (0, 1)
     assert len(checkpoint.routed_weight_map) == 2 * 4 * 3 * 4
-    model = V4FFNModel(checkpoint, ffn_ranks=2, ffn_rank=1)
+    model = get_model(checkpoint_dir, ffn_ranks=2, ffn_rank=1)
     assert model.get_experts_layer_indices() == (0, 1)
     assert model.parameter_bytes > 0
     with pytest.raises(RuntimeError, match="not been loaded"):
         _ = model.native_view
-
-
-@pytest.mark.parametrize(
-    "rank,entries,owned",
-    [
-        (0, [0, 1, -1, -1], {0, 1}),
-        (1, [-1, -1, 0, 1], {2, 3}),
-    ],
-)
-def test_native_expert_map_matches_cam(rank, entries, owned):
-    assert (
-        validate_native_expert_map(
-            num_experts=4, ffn_ranks=2, ffn_rank=rank, expert_map=entries
-        )
-        == owned
-    )
-
-
-@pytest.mark.parametrize(
-    "entries",
-    [
-        [0, 0, -1, -1],
-        [-1, -1, 0, 1],
-        [1, 0, -1, -1],
-        [0, 1],
-    ],
-)
-def test_native_expert_map_mismatch_rejected(entries):
-    with pytest.raises(ValueError):
-        validate_native_expert_map(
-            num_experts=4, ffn_ranks=2, ffn_rank=0, expert_map=entries
-        )
-
-
-@pytest.mark.parametrize("ffn_ranks", [1, 2])
-def test_implicit_native_map_only_when_all_experts_are_local(ffn_ranks):
-    if ffn_ranks == 1:
-        assert validate_native_expert_map(
-            num_experts=4, ffn_ranks=1, ffn_rank=0, expert_map=None
-        ) == frozenset(range(4))
-    else:
-        with pytest.raises(ValueError, match="explicit map"):
-            validate_native_expert_map(
-                num_experts=4, ffn_ranks=2, ffn_rank=0, expert_map=None
-            )
 
 
 @pytest.mark.parametrize(
@@ -104,6 +58,36 @@ def test_missing_routed_source_rejected_before_loading(checkpoint_dir):
         V4CheckpointDescription.read(checkpoint_dir)
 
 
+def test_v4_adapter_selects_only_local_checkpoint_sources(checkpoint_dir):
+    adapter = V4ModelAdapter(V4CheckpointDescription.read(checkpoint_dir))
+    sources = adapter.local_sources(1, frozenset({2, 3}))
+    assert len(sources) == 24
+    assert ("layers.1.ffn.experts.2.w1.weight_scale", "weights.safetensors") in sources
+    assert all(name.startswith("layers.1.ffn.experts.") for name, _ in sources)
+    assert not any("experts.0." in name or "experts.1." in name for name, _ in sources)
+
+
+@pytest.mark.parametrize("architecture", ["DeepseekV3ForCausalLM", "UnknownModel"])
+def test_model_selection_rejects_unqualified_architectures(
+    checkpoint_dir, architecture
+):
+    config_path = checkpoint_dir / "config.json"
+    config = json.loads(config_path.read_text())
+    config["architectures"] = [architecture]
+    config_path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="DeepseekV4ForCausalLM"):
+        get_model(checkpoint_dir, ffn_ranks=2, ffn_rank=0)
+
+
+def test_model_selection_rejects_other_quantization_before_loading(checkpoint_dir):
+    quant_path = checkpoint_dir / "quant_model_description.json"
+    quant = json.loads(quant_path.read_text())
+    quant["group_size"] = 128
+    quant_path.write_text(json.dumps(quant))
+    with pytest.raises(ValueError, match="per-channel"):
+        get_model(checkpoint_dir, ffn_ranks=2, ffn_rank=0)
+
+
 def test_wrong_compute_world_rejected_before_native_imports(
     checkpoint_dir, monkeypatch
 ):
@@ -113,27 +97,6 @@ def test_wrong_compute_world_rejected_before_native_imports(
     monkeypatch.setenv("WORLD_SIZE", "1")
     with pytest.raises(ValueError, match="differs from the F-only"):
         environment.initialize_device()
-
-
-@pytest.mark.parametrize(
-    "eplb,elastic,redundant,dynamic",
-    [
-        (True, False, 0, False),
-        (False, True, 0, False),
-        (False, False, 1, False),
-        (False, False, 0, True),
-    ],
-)
-def test_static_cam_adapter_rejects_expert_relocation(
-    eplb, elastic, redundant, dynamic
-):
-    with pytest.raises(ValueError, match="static expert placement"):
-        validate_static_experts(
-            enable_eplb=eplb,
-            enable_elastic_ep=elastic,
-            redundant_experts=redundant,
-            dynamic_eplb=dynamic,
-        )
 
 
 def test_unused_compute_owner_can_close_without_importing_runtime(checkpoint_dir):

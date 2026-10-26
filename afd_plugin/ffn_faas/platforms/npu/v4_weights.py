@@ -20,10 +20,8 @@ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import FusedMoERouter
 from vllm_ascend.models.deepseek_v4 import model as native
 
-from afd_plugin.ffn_faas.platforms.npu.v4_model import (
-    V4CheckpointDescription,
-    validate_static_experts,
-)
+from afd_plugin.ffn_faas.platforms.npu.settings import validate_static_experts
+from afd_plugin.ffn_faas.platforms.npu.v4_model import V4CheckpointDescription
 from afd_plugin.model_executor.npu.async_cam_w4a8 import (
     AsyncCAMW4A8Executor,
     W4A8LayerWeights,
@@ -151,9 +149,12 @@ class V4RoutedWeightOwner(nn.Module):
         # ### PATCH END: use the native loader on the routed-only owner.
 
     def finish_layer(self, layer_index: int) -> None:
-        layer = self.model.layers[str(layer_index)]
-        routed = layer.mlp.experts.routed_experts
+        routed = self.routed_experts(layer_index)
         routed.quant_method.process_weights_after_loading(routed)
+
+    def routed_experts(self, layer_index: int) -> RoutedExperts:
+        """Keep the native V4 module path inside the model adapter."""
+        return self.model.layers[str(layer_index)].mlp.experts.routed_experts
 
     def weight_views(self) -> tuple[W4A8LayerWeights, ...]:
         from vllm_ascend.quantization.quant_type import QuantType

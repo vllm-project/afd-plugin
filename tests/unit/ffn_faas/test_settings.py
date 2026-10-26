@@ -10,7 +10,11 @@ from pathlib import Path
 import pytest
 
 from afd_plugin.config import connector_extra_config_from_source, parse_afd_config
-from afd_plugin.ffn_faas.platforms.npu.settings import FFNConfig
+from afd_plugin.ffn_faas.platforms.npu.settings import (
+    FFNConfig,
+    validate_native_expert_map,
+    validate_static_experts,
+)
 
 
 @pytest.fixture
@@ -74,3 +78,69 @@ def test_explicit_native_stream_budgets(settings):
 def test_invalid_launch_rejected_before_native_runtime(settings, change):
     with pytest.raises(ValueError):
         replace(settings, **change)
+
+
+@pytest.mark.parametrize(
+    "rank,entries,owned",
+    [
+        (0, [0, 1, -1, -1], {0, 1}),
+        (1, [-1, -1, 0, 1], {2, 3}),
+    ],
+)
+def test_native_expert_map_matches_cam(rank, entries, owned):
+    assert (
+        validate_native_expert_map(
+            num_experts=4, ffn_ranks=2, ffn_rank=rank, expert_map=entries
+        )
+        == owned
+    )
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [0, 0, -1, -1],
+        [-1, -1, 0, 1],
+        [1, 0, -1, -1],
+        [0, 1],
+    ],
+)
+def test_native_expert_map_mismatch_rejected(entries):
+    with pytest.raises(ValueError):
+        validate_native_expert_map(
+            num_experts=4, ffn_ranks=2, ffn_rank=0, expert_map=entries
+        )
+
+
+@pytest.mark.parametrize("ffn_ranks", [1, 2])
+def test_implicit_native_map_only_when_all_experts_are_local(ffn_ranks):
+    if ffn_ranks == 1:
+        assert validate_native_expert_map(
+            num_experts=4, ffn_ranks=1, ffn_rank=0, expert_map=None
+        ) == frozenset(range(4))
+    else:
+        with pytest.raises(ValueError, match="explicit map"):
+            validate_native_expert_map(
+                num_experts=4, ffn_ranks=2, ffn_rank=0, expert_map=None
+            )
+
+
+@pytest.mark.parametrize(
+    "eplb,elastic,redundant,dynamic",
+    [
+        (True, False, 0, False),
+        (False, True, 0, False),
+        (False, False, 1, False),
+        (False, False, 0, True),
+    ],
+)
+def test_static_cam_adapter_rejects_expert_relocation(
+    eplb, elastic, redundant, dynamic
+):
+    with pytest.raises(ValueError, match="static expert placement"):
+        validate_static_experts(
+            enable_eplb=eplb,
+            enable_elastic_ep=elastic,
+            redundant_experts=redundant,
+            dynamic_eplb=dynamic,
+        )

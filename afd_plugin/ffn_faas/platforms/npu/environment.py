@@ -13,8 +13,10 @@ import os
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
-from afd_plugin.ffn_faas.platforms.npu.settings import FFNConfig
-from afd_plugin.ffn_faas.platforms.npu.v4_model import validate_static_experts
+from afd_plugin.ffn_faas.platforms.npu.settings import (
+    FFNConfig,
+    validate_static_experts,
+)
 
 if TYPE_CHECKING:
     import torch

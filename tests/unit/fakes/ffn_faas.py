@@ -10,11 +10,30 @@ import os
 import sys
 import threading
 from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
 from afd_plugin.ffn_faas.interfaces import FFNLaunch
 from afd_plugin.ffn_faas.service import FFNService, ServicePhase
+
+
+@dataclass(frozen=True)
+class MetadataModelAdapter:
+    """CPU loading-boundary facts, never a qualified model or device stand-in."""
+
+    root: Path
+    layer_indices: tuple[int, ...] = (2, 7)
+    num_experts: int = 4
+
+    def estimated_parameter_bytes(self, local_experts: int) -> int:
+        return 1024 * local_experts
+
+    def local_sources(self, layer_index, owned):
+        raise RuntimeError("metadata-only adapter has no checkpoint tensors")
+
+    def create_owner(self, config):
+        raise RuntimeError("metadata-only adapter has no native parameter owner")
 
 
 def write_v4_checkpoint(root: Path, *, layers: int = 2, experts: int = 4) -> Path:

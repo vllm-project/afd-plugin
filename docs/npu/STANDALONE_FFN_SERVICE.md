@@ -53,11 +53,32 @@ configuration, device/compute environment, V4 checkpoint description, native
 parameter owner and CAM composition. This is a small selection seam, not a
 GPU implementation, general plugin registry or synchronous ControlPlane.
 
+Startup selects the currently qualified V4 Flash ModelSlim per-channel W4A8
+adapter explicitly. The CAM backend receives a `CAMRoutedModel`, without a V4
+checkpoint or model type. This resource owns native loading, local expert-map
+validation, progress, storage accounting and cached-view lifetime. Its narrow
+`RoutedModelAdapter` hooks provide source names and native owner construction;
+`V4ModelAdapter` keeps V4 names, tensor-count checks and loading estimates in the
+model integration. The original `V4RoutedWeightOwner` still constructs the same
+native routed modules and delegates the same native V4 loader and quantizer.
+Native module paths and V4's A-side scaling/clamp contract stay in that adapter.
+CAM static-placement constraints belong to platform settings, not V4 metadata.
+
+Selection and loading hooks run before execution. The runtime still consumes
+`get_experts_layer_indices()`, `get_async_cam_w4a8_layers()` and the existing
+`W4A8LayerWeights`; no model dispatch, tensor transfer or synchronization is
+added per step. The loading fence and CAM-before-compute-before-owner release
+order are preserved. The unsupported legacy FFN-forward fallback still raises.
+These boundaries do not qualify a second model, another quantization scheme or
+arbitrary layer layouts. The existing CAM connector also continues to require
+its native HF configuration fields; this change does not generalize it.
+
 ```text
 CPU Service / host runner -> FFNBackend
   Ascend CAM backend
     AscendFFNEnvironment: device, native F-only compute groups, CPU affinity
-    V4FFNModel: native routed modules, quantizer/expert-map state, borrowed views
+    CAMRoutedModel: loading, native owner and cached views
+      V4ModelAdapter / V4RoutedWeightOwner: V4 names and native loading hooks
     mature Async CAM runtime: A/F group, DS/DR/CS/CR, Graph and streams
 ```
 

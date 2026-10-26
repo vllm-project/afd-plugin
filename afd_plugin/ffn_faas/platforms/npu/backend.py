@@ -17,9 +17,8 @@ from afd_plugin.compat.npu import fix_all2all_backend_for_afd
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
 from afd_plugin.ffn_faas.platforms.npu.environment import AscendFFNEnvironment
+from afd_plugin.ffn_faas.platforms.npu.model import CAMRoutedModel
 from afd_plugin.ffn_faas.platforms.npu.settings import FFNConfig
-from afd_plugin.ffn_faas.platforms.npu.v4_model import V4CheckpointDescription
-from afd_plugin.ffn_faas.platforms.npu.v4_runtime import V4FFNModel
 from afd_plugin.ffn_faas.service import FFNService, ServicePhase
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 
@@ -27,12 +26,10 @@ from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunn
 class CAMFFNBackend:
     """Keep weights and communication owners until receiver exit is proven."""
 
-    def __init__(
-        self, checkpoint: V4CheckpointDescription, settings: FFNConfig
-    ) -> None:
+    def __init__(self, model: CAMRoutedModel, settings: FFNConfig) -> None:
         self.settings = settings
         self.environment = AscendFFNEnvironment(settings)
-        self.model = V4FFNModel(checkpoint, settings.ffn_ranks, settings.rank)
+        self.model = model
         self.runtime: AsyncNPUFFNModelRunner | None = None
         self.connector: CAMAsyncAFDConnector | None = None
 

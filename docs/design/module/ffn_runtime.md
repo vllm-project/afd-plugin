@@ -102,6 +102,16 @@ does not enable those algorithms. Safe release orders the CAM runtime before
 compute groups and the parameter owner. Failed or pending work keeps all
 owners reachable until paired process isolation.
 
+Model selection is confined to startup. The backend receives `CAMRoutedModel`;
+the selected adapter explains checkpoint names and constructs the native owner,
+while the resource manages loading, local placement, storage accounting and
+view lifetime. V4 configuration, native module paths, ModelSlim source counts,
+loader adaptation and computation semantics remain in its model-specific code.
+Static CAM placement validation belongs to platform settings. The original
+native owner/loader/quantizer and existing `W4A8LayerWeights` execution seam are
+reused. This boundary introduces no per-step model selection or forward fallback
+and does not establish support for a second model or another quantization.
+
 Here `FFNBackend` adapts a complete runtime lifecycle, composing the environment,
 routed parameter owner, CAM connector and mature Async runtime. The public host
 loop calls `backend.execute_step()`; communication, compute, Graph and two-stream
