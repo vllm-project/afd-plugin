@@ -84,54 +84,48 @@ Attention and FFN may be started in either order. Send API traffic only to
 Attention.
 
 DeepSeek-V4 Flash per-channel W4A8 also has a standalone F entry point,
-`python -m afd_plugin.ffn_faas serve`. It constructs routed-only native
-parameters and composes the existing `CAMAsyncAFDConnector` and
-`AsyncNPUFFNModelRunner`; it never constructs a vLLM Worker, upstream ModelRunner,
-EngineCore, scheduler or KV cache. The A connector, model data path and DBO
-hooks remain the mature CAM implementation. Configuration objects and native
-loader/quantization APIs remain vLLM/vLLM-Ascend dependencies.
+`python -m afd_plugin.ffn_faas serve`, implementing independent-service
+ownership under [RFC #391](https://github.com/vllm-project/afd-plugin/issues/391).
+It composes `CAMAsyncAFDConnector` and `AsyncNPUFFNModelRunner` without creating
+a vLLM Worker, upstream ModelRunner, EngineCore, scheduler or KV cache.
+Attention retains its existing model, connector and DBO path. Configuration,
+parameter loading and quantization remain vLLM/vLLM-Ascend dependencies.
 
-The standalone host loop accepts an injected `FFNBackend` factory through a
-CPU-only interface. Model/device-specific options, native construction and CAM
-composition live under `ffn_faas/platforms/npu/`. The Ascend environment owner
-binds the device, establishes and retains F-only native compute/EP groups, and
-applies the native post-warmup CPU affinity policy. Native routed modules and
-their expert-map/quantization state remain owned through execution. Current
-static CAM placement still rejects EPLB/EEP and redundant experts; residency
-does not enable those algorithms. Safe release orders the CAM runtime before
-compute groups and the parameter owner. Failed or pending work keeps all
-owners reachable until paired process isolation.
+The CPU-only host `FFNModelRunner` accepts an `FFNBackend` factory, retains
+the backend before preparation, and owns the receiving thread and failure
+boundary. `FFNService` manages host status and stop requests. Platform options
+and native composition live under `ffn_faas/platforms/npu/`:
 
-Model selection is confined to startup. The backend receives `CAMRoutedModel`;
-the selected adapter explains checkpoint names and constructs the native owner,
-while the resource manages loading, local placement, storage accounting and
-view lifetime. V4 configuration, native module paths, ModelSlim source counts,
-loader adaptation and computation semantics remain in its model-specific code.
-Static CAM placement validation belongs to platform settings. The original
-native owner/loader/quantizer and existing `W4A8LayerWeights` execution seam are
-reused. This boundary introduces no per-step model selection or forward fallback
-and does not establish support for a second model or another quantization.
+- `AscendFFNEnvironment` owns device initialization, F-only compute/EP groups
+  and native post-warmup CPU affinity. These groups coexist with the separate
+  A/F CAM group throughout execution.
+- `CAMRoutedModel` manages parameter loading, local placement checks, storage
+  accounting and cached-view lifetime. Startup selects a `RoutedModelAdapter`
+  to provide checkpoint metadata and native owner construction. The backend
+  uses the common resource without model-specific branching.
+- `v4_model.py` contains V4 checkpoint metadata and `V4ModelAdapter`;
+  `v4_weights.py` contains the lazily imported native parameter owner. Native
+  routed modules, expert-map managers and quantizers remain resident. The
+  loader adapter delegates to the native V4 loader; dependency upgrades must
+  preserve its documented receiver and factory contracts.
+- Platform settings enforce static CAM placement and reject EPLB, elastic EP
+  and redundant experts. Retaining native expert state does not enable these
+  algorithms.
 
-Here `FFNBackend` adapts a complete runtime lifecycle, composing the environment,
-routed parameter owner, CAM connector and mature Async runtime. The public host
-loop calls `backend.execute_step()`; communication, compute, Graph and two-stream
-scheduling remain inside that runtime. This is not RFC #391's pure
-`compute(item)`/facts backend or its cross-platform, cross-connector shared
-WorkItem/StepPlan/Graph Step Loop. This stage preserves the mature execution
-path. A common Step Loop can be evaluated when a real GPU or synchronous
-connector integration needs it; adding another adapter alone does not unify
-execution protocols. Device/compute ownership, composition and host-thread
-lifecycle belong to the environment, backend and host runner respectively;
-they do not require another `FFNWorker` wrapper.
+`FFNBackend` is a runtime lifecycle interface. Its `execute_step()` delegates
+communication, computation, Graph and two-stream scheduling to the Async CAM
+runtime. A shared cross-platform, cross-connector Step Loop and a pure
+`compute(item)` backend are not implemented. The runtime consumes the existing
+`W4A8LayerWeights` interface without per-step model selection; there is no
+separate V4 execution runtime.
 
-The runtime accepts an independently loaded model through `attach_model` and
-releases its borrowed views only after receiver exit and device completion.
-The standalone process owns the original parameter container through that
-release. Its management `/stop` requests a host-loop stop; an outstanding CAM
-DR is not cancellable. A pending or failed native boundary retains all owners
-until process isolation, and requires teardown of the paired A/F group.
-See [standalone FFN service](../../npu/STANDALONE_FFN_SERVICE.md) for the exact
-launch and shutdown contract.
+`attach_model` lends independently loaded parameters to the runtime. After
+receiver exit and device completion, shutdown releases CAM/Graph resources,
+then native compute groups, and finally the routed owner. Failed or pending
+native work retains all owners until whole-pair process isolation. A host
+`/stop` request cannot cancel an outstanding CAM DR.
+See the [standalone service guide](../../npu/STANDALONE_FFN_SERVICE.md) for
+supported configuration, launch and shutdown behavior.
 
 | Platform | Worker | Model runner | Current connectors |
 | --- | --- | --- | --- |
