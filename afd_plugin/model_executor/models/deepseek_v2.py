@@ -283,9 +283,9 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
     # constructing only the gate owned by Attention and a parameter-free proxy.
     # Signature: AFD-owned; adds layer_idx and compute_gate_on_attention and omits
     # quant_config because no local expert kernel is constructed.
-    # Upstream: vLLM v0.30.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
-    # In v0.30.0 the native forward always delegates routing to the experts
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
+    # In v0.32.0 the native forward always delegates routing to the experts
     # runner, so forward() below computes the Attention-side gate first when
     # this shell owns one.
     def __init__(
@@ -335,15 +335,15 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         )
         # ### PATCH END: construct a remote-experts native MoE shell.
 
-    # Patch reason: v0.30.0's native forward always delegates routing to the
+    # Patch reason: v0.32.0's native forward always delegates routing to the
     # experts runner (router_logits=hidden_states), so a shell that owns a
     # gate would never compute it and Attention would ship hidden states as
     # router logits.
     # Patch functionality: compute the Attention-side gate before transport;
     # gate-less shells keep the native delegation unchanged.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.30.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -378,8 +378,8 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
     # Patch reason: native DeepSeek constructs both Attention and FFN modules.
     # Patch functionality: construct only the modules owned by the active AFD role.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.30.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -549,7 +549,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                     # Keep the gate weights loadable, but with the runner's
                     # gate cleared it consumes the Attention-side router
                     # logits instead of computing its own (gate is None means
-                    # external routing in the v0.30 runner contract).
+                    # external routing in the v0.32 runner contract).
                     self.mlp.experts.gate = None
             else:
                 self.mlp = native.DeepseekV2MLP(
@@ -569,7 +569,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
-    # Target: vLLM ced6857, DeepseekV2DecoderLayer.forward attention fragment.
+    # Target: vLLM 5df63a7, DeepseekV2DecoderLayer.forward attention fragment.
     # AFD splits execution before the remote FFN and computes routing locally.
     # This AFD-owned method adds already_sequence_parallel because a one-token
     # stage can have equal global/local row counts; shape alone is ambiguous.
@@ -711,7 +711,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
             )
         if not isinstance(self.mlp, native.DeepseekV2MoE):
             raise RuntimeError("FFN role does not own a native DeepSeek MoE")
-        # v0.30 runner contract: gate is None means the runner consumes the
+        # v0.32 runner contract: gate is None means the runner consumes the
         # router logits transported from Attention (external routing).
         if self.mlp.experts.gate is not None:
             raise RuntimeError("FFN native runner must use external routing")
@@ -730,8 +730,8 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
     # Patch reason: native DeepSeek always creates native Decoder layers.
     # Patch functionality: create role-aware AFD layers without full allocation.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.30.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # ### PATCH START: require AFD activation and avoid native allocation.
         afd_config = parse_afd_config(vllm_config, validate=False)
