@@ -129,6 +129,13 @@ follow_imports = "silent"
 [tool.ty.analysis]
 allowed-unresolved-imports = ["torch.**", "vllm.**"]
 
+[tool.typos.files]
+extend-exclude = [
+    # Vendored FastAFD/DeepGEMM kernel sources stay identical to their pinned
+    # revision; PTX mnemonics such as setp read as misspellings.
+    "csrc/gpu/fastafd/",
+]
+
 [tool.typos.default]
 extend-ignore-words-re = [
     # Ascend domain terms checked as plain words in docs/comments.
@@ -191,4 +198,7 @@ extend-ignore-identifiers-re = [
     "DataCopyPad2DA8W4NDNew",
     ".*isND2NZ.*",
     ".*enVecND2NZ.*",
+    # UE8M0 (unsigned 8-bit exponent) scale format in the FastAFD M2N kernels
+    # and their helpers.
+    ".*[Uu][Ee]8[Mm]0.*",
 ]

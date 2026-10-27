@@ -100,6 +100,11 @@ AFDConnectorFactory.register_connector(
     "afd_plugin.connectors.npu.async_cam",
     "CAMAsyncAFDConnector",
 )
+AFDConnectorFactory.register_connector(
+    "FastAFDAFDConnector",
+    "afd_plugin.connectors.gpu.fastafd",
+    "FastAFDAFDConnector",
+)
 
 
 __all__ = ["AFDConnectorFactory"]

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -12,11 +15,12 @@ from vllm.model_executor.models import qwen3_5 as native  # noqa: E402
 from afd_plugin.model_executor.models.qwen3_5 import (  # noqa: E402
     AFDQwen3_5MoeForConditionalGeneration,
     _checkpoint_weight_roles,
+    fastafd_expert_tensor_name,
 )
 
 ATTENTION = frozenset(("attention",))
 FFN = frozenset(("ffn",))
-NONE = frozenset()
+NONE: frozenset[str] = frozenset()
 
 
 @pytest.mark.parametrize(
@@ -52,13 +56,43 @@ NONE = frozenset()
     ],
 )
 def test_qwen_checkpoint_weight_roles(name, roles):
-    assert _checkpoint_weight_roles(name) == roles
+    assert _checkpoint_weight_roles(name, compute_gate_on_attention=False) == roles
 
 
 def test_qwen_ffn_gate_owns_router_checkpoint_weight():
     name = "model.language_model.model.layers.0.mlp.gate.weight"
 
-    assert _checkpoint_weight_roles(name) == FFN
+    assert _checkpoint_weight_roles(name, compute_gate_on_attention=False) == FFN
+
+
+@pytest.mark.parametrize(
+    ("name", "roles"),
+    [
+        ("model.language_model.model.layers.0.mlp.gate.weight", ATTENTION),
+        (
+            "model.language_model.model.layers.0.mlp.shared_expert.gate_proj.weight",
+            ATTENTION,
+        ),
+        (
+            "model.language_model.model.layers.0.mlp.shared_expert_gate.weight",
+            ATTENTION,
+        ),
+        (
+            "model.language_model.model.layers.0.mlp.experts.0.down_proj.weight",
+            FFN,
+        ),
+        ("model.language_model.model.layers.0.input_layernorm.weight", ATTENTION),
+    ],
+)
+def test_qwen_attention_gate_moves_router_and_shared_expert(name, roles):
+    assert _checkpoint_weight_roles(name, compute_gate_on_attention=True) == roles
+
+
+def test_fastafd_expert_tensor_name_matches_checkpoint_layout():
+    assert (
+        fastafd_expert_tensor_name(3, 17, "up_proj", "weight_scale_inv")
+        == "model.language_model.layers.3.mlp.experts.17.up_proj.weight_scale_inv"
+    )
 
 
 def test_qwen_load_weights_filters_one_shot_iterator(monkeypatch):
@@ -78,7 +112,7 @@ def test_qwen_load_weights_filters_one_shot_iterator(monkeypatch):
             raise AssertionError("checkpoint iterator consumed more than once")
         yield from ((name, torch.tensor([index])) for index, name in enumerate(names))
 
-    seen = []
+    seen: list[str] = []
     expected = {"native.loaded"}
 
     def native_load_weights(self, weights):
@@ -111,7 +145,7 @@ def test_qwen_ffn_gate_loads_router_with_experts(monkeypatch):
         "model.language_model.model.layers.0.mlp.experts.0.down_proj.weight",
         "model.language_model.model.layers.0.mlp.shared_expert_gate.weight",
     ]
-    seen = []
+    seen: list[str] = []
 
     def native_load_weights(self, weights):
         seen.extend(name for name, _ in weights)

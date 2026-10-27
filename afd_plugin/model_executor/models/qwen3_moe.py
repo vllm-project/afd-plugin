@@ -4,8 +4,10 @@
 
 The wrapper keeps the native vLLM Qwen3 MoE lifecycle and injects a
 role-aware decoder layer through the native ``decoder_layer_type`` hook.
-Attention executes the native Attention, residual, and normalization path;
-FFN executes the complete native dense MLP or MoE block.
+Attention executes the native Attention, residual, and normalization path.
+With ``P2pNcclAFDConnector`` FFN executes the complete native dense MLP or MoE
+block. With ``FastAFDAFDConnector`` Attention also runs the router and sends
+each token to the FFN ranks that own its experts.
 """
 
 from collections.abc import Iterable, Iterator
@@ -14,10 +16,14 @@ import torch
 import torch.nn as nn
 from transformers import Qwen3MoeConfig
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.models import qwen3_moe as native
 from vllm.platforms import current_platform
 
-from afd_plugin.config import AFDConfig, parse_afd_config
+from afd_plugin.config import FASTAFD_CONNECTOR, AFDConfig, parse_afd_config
+
+# Registers torch.ops.vllm.afd_fastafd_dispatch and afd_fastafd_combine.
+from afd_plugin.model_executor.models import fastafd_moe  # noqa: F401
 from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
 
 _ATTENTION_ROLE = frozenset(("attention",))
@@ -48,14 +54,24 @@ def _weight_layer_path(name: str) -> tuple[int, str] | None:
     return None
 
 
-def _checkpoint_weight_roles(name: str) -> frozenset[str]:
-    """Classify one native checkpoint path by its AFD execution owner."""
+def _checkpoint_weight_roles(
+    name: str,
+    *,
+    compute_gate_on_attention: bool = False,
+) -> frozenset[str]:
+    """Classify one native checkpoint path by its AFD execution owner.
+
+    With the gate on Attention, the router weight belongs to Attention and
+    only the experts belong to FFN.
+    """
     layer_path = _weight_layer_path(name)
     if layer_path is None:
         return _BOTH_ROLES
 
     _layer_idx, stage = layer_path
     if stage == "mlp":
+        if compute_gate_on_attention and ".mlp.gate." in name:
+            return _ATTENTION_ROLE
         return _FFN_ROLE
     if stage in {"self_attn", "input_layernorm", "post_attention_layernorm"}:
         return _ATTENTION_ROLE
@@ -66,11 +82,29 @@ def _iter_role_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
     *,
     role: str,
+    compute_gate_on_attention: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Consume a checkpoint iterator once and retain this role's paths."""
     for name, loaded_weight in weights:
-        if role in _checkpoint_weight_roles(name):
+        if role in _checkpoint_weight_roles(
+            name,
+            compute_gate_on_attention=compute_gate_on_attention,
+        ):
             yield name, loaded_weight
+
+
+def fastafd_expert_tensor_name(
+    layer_idx: int,
+    expert: int,
+    projection: str,
+    kind: str,
+) -> str:
+    """Checkpoint name of one routed-expert tensor of a Qwen3 MoE checkpoint.
+
+    ``projection`` is ``gate_proj``, ``up_proj`` or ``down_proj``; ``kind`` is
+    ``weight`` or ``weight_scale_inv``.
+    """
+    return f"model.layers.{layer_idx}.mlp.experts.{expert}.{projection}.{kind}"
 
 
 def _validate_supported_config(
@@ -81,9 +115,20 @@ def _validate_supported_config(
     parallel_config = vllm_config.parallel_config
     if not current_platform.is_cuda():
         raise RuntimeError("AFD Qwen3 MoE currently supports CUDA only")
-    if afd_config.compute_gate_on_attention:
+    if afd_config.compute_gate_on_attention != (
+        afd_config.connector == FASTAFD_CONNECTOR
+    ):
         raise RuntimeError(
-            "AFD Qwen3 MoE requires compute_gate_on_attention=false",
+            "AFD Qwen3 MoE routes on Attention exactly when the connector is "
+            f"{FASTAFD_CONNECTOR}",
+        )
+    if afd_config.connector == FASTAFD_CONNECTOR and (
+        parallel_config.enable_dbo or parallel_config.use_ubatching
+    ):
+        # The expert kernel serves every layer's lanes in order, so DBO needs
+        # the microbatches to alternate per layer; this layer does not yield.
+        raise RuntimeError(
+            f"AFD Qwen3 MoE does not support DBO with {FASTAFD_CONNECTOR}",
         )
     if parallel_config.use_sequence_parallel_moe:
         raise RuntimeError(
@@ -97,6 +142,57 @@ def _validate_supported_config(
         raise RuntimeError("AFD Qwen3 MoE does not support speculative decoding")
     if vllm_config.lora_config is not None:
         raise RuntimeError("AFD Qwen3 MoE does not support LoRA")
+
+
+class AFDQwen3MoeAttentionRoutedMoE(nn.Module):
+    """Attention-side Qwen3 MoE for M2N connectors such as FastAFDAFDConnector.
+
+    The router runs locally with the native gate and top-k. Routed experts run
+    on the FFN ranks through the connector's dispatch and combine kernels, one
+    pair per layer and microbatch lane.
+    """
+
+    def __init__(self, *, vllm_config: VllmConfig, layer_idx: int, prefix: str):
+        super().__init__()
+        config = vllm_config.model_config.hf_text_config
+        if getattr(config, "shared_expert_intermediate_size", 0):
+            raise RuntimeError(
+                f"{FASTAFD_CONNECTOR} does not support Qwen3 MoE shared experts",
+            )
+        self.layer_idx = layer_idx
+        self.top_k = int(config.num_experts_per_tok)
+        self.renormalize = bool(config.norm_topk_prob)
+        # Same construction as the native router; FP8 checkpoints list the
+        # gate in modules_to_not_convert, so it loads unquantized.
+        self.gate = native.ReplicatedLinear(
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.gate",
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        router_logits, _ = self.gate(hidden_states)
+        topk_weights, topk_ids, _ = fused_topk(
+            hidden_states,
+            router_logits,
+            self.top_k,
+            self.renormalize,
+        )
+        # The copy that dispatch returns feeds combine, so torch.compile keeps
+        # dispatch before combine.
+        dispatched = torch.ops.vllm.afd_fastafd_dispatch(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+        )
+        return torch.ops.vllm.afd_fastafd_combine(
+            dispatched,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+        )
 
 
 class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
@@ -154,7 +250,18 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
                 prefix=f"{prefix}.self_attn",
                 dual_chunk_attention_config=dual_chunk_attention_config,
             )
-            self.mlp = RemoteFFNProxy(layer_idx=layer_idx)
+            if afd_config.connector == FASTAFD_CONNECTOR:
+                if not self.is_moe_layer:
+                    raise RuntimeError(
+                        f"{FASTAFD_CONNECTOR} needs a MoE block in every layer",
+                    )
+                self.mlp = AFDQwen3MoeAttentionRoutedMoE(
+                    vllm_config=vllm_config,
+                    layer_idx=layer_idx,
+                    prefix=f"{prefix}.mlp",
+                )
+            else:
+                self.mlp = RemoteFFNProxy(layer_idx=layer_idx)
             self.input_layernorm = native.RMSNorm(
                 config.hidden_size,
                 eps=config.rms_norm_eps,
@@ -325,9 +432,13 @@ class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
     # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # ### PATCH START: filter the checkpoint stream by AFD execution role.
-        role_weights = _iter_role_weights(weights, role=self.afd_role)
+        role_weights = _iter_role_weights(
+            weights,
+            role=self.afd_role,
+            compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
+        )
         # ### PATCH END: filter the checkpoint stream by AFD execution role.
         return super().load_weights(role_weights)
 
 
-__all__ = ["AFDQwen3MoeForCausalLM"]
+__all__ = ["AFDQwen3MoeForCausalLM", "fastafd_expert_tensor_name"]
