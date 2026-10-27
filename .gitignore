@@ -228,3 +228,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# FastAFD JIT kernel headers installed by in-place builds.
+afd_plugin/_fastafd/

@@ -8,11 +8,19 @@ from typing import Any
 import torch
 import torch.nn as nn
 from vllm.config import ModelConfig, VllmConfig
+from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.models import qwen3_5 as native
 from vllm.model_executor.models import qwen3_next as next_native
+from vllm.utils.torch_utils import direct_register_custom_op
 
-from afd_plugin.config import parse_optional_afd_config
+from afd_plugin.config import FASTAFD_CONNECTOR, parse_optional_afd_config
+from afd_plugin.connectors.gpu.fastafd import FastAFDAFDConnector
 from afd_plugin.model_executor.models.deepseek_v2 import AFDAttentionFusedMoE
+from afd_plugin.model_executor.models.forward_context import (
+    get_afd_metadata_from_forward_context,
+)
+from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
@@ -45,8 +53,14 @@ def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
 
 def _checkpoint_weight_roles(
     name: str,
+    *,
+    compute_gate_on_attention: bool,
 ) -> frozenset[str]:
-    """Classify one native Qwen3.5/3.6 checkpoint path by AFD owner."""
+    """Classify one native Qwen3.5/3.6 checkpoint path by AFD owner.
+
+    With the gate on Attention, Attention also owns the gated shared expert;
+    only the routed experts belong to FFN.
+    """
     parts = name.split(".")
     if "visual" in parts or "mtp" in parts:
         return _NO_ROLES
@@ -61,13 +75,9 @@ def _checkpoint_weight_roles(
         return _ATTENTION_ROLE
     if stage != "mlp":
         return _ATTENTION_ROLE
-    if remainder and remainder[0] == "gate":
-        return _FFN_ROLE
-    if remainder and remainder[0] in (
-        "experts",
-        "shared_expert",
-        "shared_expert_gate",
-    ):
+    if remainder and remainder[0] in ("gate", "shared_expert", "shared_expert_gate"):
+        return _ATTENTION_ROLE if compute_gate_on_attention else _FFN_ROLE
+    if remainder and remainder[0] == "experts":
         return _FFN_ROLE
     raise RuntimeError(f"unclassified Qwen MoE checkpoint weight: {name}")
 
@@ -76,13 +86,32 @@ def _iter_role_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
     *,
     role: str | None,
+    compute_gate_on_attention: bool,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Consume a checkpoint iterator once and retain only this role's paths."""
     for name, loaded_weight in weights:
         if role is None or role in _checkpoint_weight_roles(
             name,
+            compute_gate_on_attention=compute_gate_on_attention,
         ):
             yield name, loaded_weight
+
+
+def fastafd_expert_tensor_name(
+    layer_idx: int,
+    expert: int,
+    projection: str,
+    kind: str,
+) -> str:
+    """Checkpoint name of one routed-expert tensor of a Qwen3.5/3.6 checkpoint.
+
+    ``projection`` is ``gate_proj``, ``up_proj`` or ``down_proj``; ``kind`` is
+    ``weight`` or ``weight_scale_inv``.
+    """
+    return (
+        f"model.language_model.layers.{layer_idx}.mlp.experts.{expert}."
+        f"{projection}.{kind}"
+    )
 
 
 class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
@@ -126,14 +155,158 @@ class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
         self.n_redundant_experts = 0
         self.n_physical_experts = self.n_logical_experts
         self.n_local_physical_experts = self.n_physical_experts // self.ep_size
-        self.gate = None
-        self.shared_expert = None
-        self.shared_expert_gate = None
+        self.gate: nn.Module | None = None
+        self.shared_expert: nn.Module | None = None
+        self.shared_expert_gate: nn.Module | None = None
         self.experts = AFDAttentionFusedMoE(
             layer_idx=layer_idx,
             external_routing=False,
         )
         # ### PATCH END: construct a remote-experts native MoE shell.
+
+
+class AFDQwen3_5AttentionRoutedMoE(AFDQwen3_5RemoteExpertsMoE):  # noqa: N801
+    """Attention-side Qwen MoE for M2N connectors such as FastAFDAFDConnector.
+
+    The router and the gated shared expert run locally with the native
+    modules. Routed experts run on the FFN ranks through the connector's
+    dispatch and combine kernels, one pair per layer and microbatch lane; the
+    shared expert runs between them.
+    """
+
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        layer_idx: int,
+        prefix: str,
+    ) -> None:
+        super().__init__(vllm_config=vllm_config, layer_idx=layer_idx, prefix=prefix)
+        config = vllm_config.model_config.hf_text_config
+        self.layer_idx = layer_idx
+        self.top_k = int(config.num_experts_per_tok)
+        # Same default as the native Qwen3NextSparseMoeBlock router.
+        self.renormalize = getattr(config, "norm_topk_prob", True)
+        self.gate = next_native.ReplicatedLinear(
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.gate",
+        )
+        self.shared_expert_gate = next_native.ReplicatedLinear(
+            config.hidden_size,
+            1,
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.shared_expert_gate",
+        )
+        self.shared_expert = next_native.Qwen3NextMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.shared_expert_intermediate_size,
+            hidden_act=config.hidden_act,
+            quant_config=vllm_config.quant_config,
+            expert_gate=self.shared_expert_gate,
+            prefix=f"{prefix}.shared_expert",
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        already_sequence_parallel: bool = False,
+    ) -> torch.Tensor:
+        assert self.gate is not None and self.shared_expert is not None
+        router_logits, _ = self.gate(hidden_states)
+        topk_weights, topk_ids, _ = fused_topk(
+            hidden_states,
+            router_logits,
+            self.top_k,
+            self.renormalize,
+        )
+        # Data dependencies order the three steps for torch.compile: the
+        # shared expert reads the copy that dispatch returns, and combine
+        # takes the shared output, so the shared expert runs while the FFN
+        # ranks compute the routed experts.
+        local_input = torch.ops.vllm.afd_fastafd_dispatch(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+        )
+        shared_output = self.shared_expert(local_input)
+        routed_output = torch.ops.vllm.afd_fastafd_combine(
+            shared_output,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+        )
+        routed_output = maybe_apply_dbo_yield(routed_output, role="attention")
+        return routed_output + shared_output
+
+
+def _fastafd_connector_and_lane() -> tuple[FastAFDAFDConnector, int]:
+    afd_metadata = get_afd_metadata_from_forward_context()
+    if afd_metadata is None:
+        raise RuntimeError("Attention-routed Qwen MoE needs AFD forward metadata")
+    connector = afd_metadata.connector
+    if not isinstance(connector, FastAFDAFDConnector):
+        raise RuntimeError(
+            f"Attention-routed Qwen MoE requires {FASTAFD_CONNECTOR}, got "
+            f"{type(connector).__name__}",
+        )
+    lane = int(getattr(get_forward_context(), "ubatch_idx", afd_metadata.stage_idx))
+    return connector, lane
+
+
+def _fastafd_dispatch(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Send the routed tokens; return a copy of the input for local work."""
+    connector, lane = _fastafd_connector_and_lane()
+    connector.dispatch(hidden_states, topk_ids, topk_weights, lane)
+    return hidden_states.clone()
+
+
+def _fastafd_dispatch_fake(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+def _fastafd_combine(
+    local_output: torch.Tensor,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Wait for the routed-expert outputs; ``local_output`` only orders it."""
+    connector, lane = _fastafd_connector_and_lane()
+    return connector.combine(hidden_states, topk_ids, topk_weights, lane)
+
+
+def _fastafd_combine_fake(
+    local_output: torch.Tensor,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+for _op_name, _op_func, _fake_impl in (
+    ("afd_fastafd_dispatch", _fastafd_dispatch, _fastafd_dispatch_fake),
+    ("afd_fastafd_combine", _fastafd_combine, _fastafd_combine_fake),
+):
+    if not hasattr(torch.ops.vllm, _op_name):
+        direct_register_custom_op(
+            op_name=_op_name,
+            op_func=_op_func,
+            mutates_args=[],
+            fake_impl=_fake_impl,
+        )
 
 
 class MissingAttentionStage(nn.Module):
@@ -215,7 +388,12 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
                 )
             else:
                 raise ValueError(f"Invalid layer_type {self.layer_type}")
-            self.mlp = AFDQwen3_5RemoteExpertsMoE(
+            moe_cls = (
+                AFDQwen3_5AttentionRoutedMoE
+                if afd_config.connector == FASTAFD_CONNECTOR
+                else AFDQwen3_5RemoteExpertsMoE
+            )
+            self.mlp = moe_cls(
                 vllm_config=vllm_config,
                 layer_idx=self.layer_idx,
                 prefix=f"{prefix}.mlp",
@@ -457,9 +635,12 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
         afd_config = parse_optional_afd_config(vllm_config, validate=False)
         if afd_config is None:
             raise RuntimeError("AFD Qwen conditional model requires AFD activation")
-        if afd_config.compute_gate_on_attention:
+        if afd_config.compute_gate_on_attention != (
+            afd_config.connector == FASTAFD_CONNECTOR
+        ):
             raise ValueError(
-                "AFD Qwen3.5/3.6 CUDA supports compute_gate_on_attention=False only",
+                "AFD Qwen3.5/3.6 CUDA routes on Attention exactly when the "
+                f"connector is {FASTAFD_CONNECTOR}",
             )
         if vllm_config.speculative_config is not None:
             raise ValueError(
@@ -545,10 +726,14 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
             _iter_role_weights(
                 weights,
                 role=self.afd_role,
+                compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
             ),
         )
         # ### PATCH END
         return loaded
 
 
-__all__ = ["AFDQwen3_5MoeForConditionalGeneration"]
+__all__ = [
+    "AFDQwen3_5MoeForConditionalGeneration",
+    "fastafd_expert_tensor_name",
+]

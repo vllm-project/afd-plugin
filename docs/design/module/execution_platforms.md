@@ -102,8 +102,8 @@ the corresponding runtime stack.
 | Graph policy/keying | `v1/worker/cuda_graph.py` | shared policy/keying plus ACL/NPUGraph integration |
 | Native ubatching | native `UBatchRunner` with scoped AFD metadata preparation | `NPUUBatchRunner` adapting native child inputs, contexts and streams |
 | Profiling | `compat/profiler.py` | `compat/npu/profiler.py` |
-| Native operators | PyTorch/vLLM CUDA runtime used by NCCL P2P | plugin CANN A2E/E2A and routed-only async CAM ops |
-| Build/packaging | no plugin CUDA extension | `setup.py`, `csrc/npu/**`, packaged `_cann_ops_custom` vendor tree |
+| Native operators | PyTorch/vLLM CUDA runtime used by NCCL P2P; FastAFD M2N MegaMoE kernels (SM100) | plugin CANN A2E/E2A and routed-only async CAM ops |
+| Build/packaging | opt-in `afd_plugin._C_fastafd` (`AFD_BUILD_FASTAFD_OPS=1`, `csrc/gpu/fastafd/**`) | `setup.py`, `csrc/npu/**`, packaged `_cann_ops_custom` vendor tree |
 
 ```mermaid
 flowchart TB
@@ -186,6 +186,32 @@ six-cell recurrent-state/CUDA Graph parity results describe the removed adapter
 and are historical evidence only. The DP1 path has H20
 DeepSeek-V2-Lite DP1/TP2 Graph + DBO validation with 128 GSM8K samples
 and live two-stage/full-replay assertions.
+
+### FastAFD kernels and packaging
+
+`FastAFDAFDConnector` uses the FastAFD M2N MegaMoE kernels, vendored as a
+minimal subset under `csrc/gpu/fastafd` from FastAFD
+`3c7161949310b6d59d6b4cf9bf997a4935c8113b` (MIT; DeepGEMM MIT notices kept).
+Local differences from the pin: two environment variable names
+(`AFD_FASTAFD_AG_SMS`, `AFD_FASTAFD_HOST_DEBUG`), the pybind registration file
+`csrc/python_api.cpp`, and a system-scope release atomic
+(`ptx::atomic_add_rel_sys`) for the dispatch expert-count push, so the
+per-source counts are visible before the ready bits the expert kernel waits on.
+`AFD_BUILD_FASTAFD_OPS=1` builds the host extension `afd_plugin._C_fastafd`
+and installs the device headers under `afd_plugin/_fastafd/include`. The build
+fetches CUTLASS v4.2.1 and fmt 11.2.0 headers and checks their SHA-256;
+`AFD_FASTAFD_CUTLASS_DIR` / `AFD_FASTAFD_FMT_DIR` point at local copies
+instead. The FastAFD and Ascend builds are mutually exclusive.
+
+The kernels compile with nvcc on first use (`CUDA_HOME` must be set) and cache
+under `DG_JIT_CACHE_DIR`, `~/.cache/afd_plugin/fastafd_jit` by default. They
+run on SM100 only. The package imports without the extension; the connector
+fails at initialization with a reinstall hint when it is missing.
+
+Each role process usually sees only its own GPUs, so symmetric-memory ranks
+can share a device index. The connector checks that every rank has a distinct
+GPU UUID and then sets `TORCH_SYMM_MEM_ALLOW_OVERLAPPING_DEVICES=1` (unless the
+user set it) to lift torch's device-index check.
 
 ### CUDA profiling
 
