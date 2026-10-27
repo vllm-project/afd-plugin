@@ -25,6 +25,7 @@ def _config(
     async_dp: bool = True,
     is_moe: bool = True,
     data_parallel_size: int = 2,
+    device_type: str = "cuda",
 ):
     return SimpleNamespace(
         additional_config={
@@ -50,6 +51,7 @@ def _config(
         kv_transfer_config=None,
         needs_dp_coordinator=True,
         cache_config=SimpleNamespace(),
+        device_config=SimpleNamespace(device_type=device_type),
         logging_config=None,
     )
 
@@ -369,6 +371,44 @@ def test_non_afd_launch_keeps_upstream_wave_coordination(monkeypatch):
         addresses,
     ) as launch:
         assert launch.coordinator.enable_wave_coordination is True
+
+
+@pytest.mark.parametrize("async_dp", [False, True])
+def test_npu_launch_keeps_v030_coordinator_contract(monkeypatch, async_dp):
+    patch = _load_patch_module(monkeypatch)
+    utils = sys.modules["vllm.v1.engine.utils"]
+
+    class NPUCoordinator(utils.DPCoordinator):  # type: ignore[name-defined]
+        def __init__(self, parallel_config, enable_wave_coordination=True):
+            super().__init__(parallel_config, enable_wave_coordination)
+
+    def unexpected_store(*_args, **_kwargs):
+        pytest.fail("v0.30 must retain its existing coordinator port lifecycle")
+
+    monkeypatch.setattr(utils, "DPCoordinator", NPUCoordinator)
+    monkeypatch.setattr(
+        sys.modules["vllm.distributed.utils"], "create_tcp_store", unexpected_store
+    )
+    config = _config(async_dp=async_dp, device_type="npu")
+    del config.logging_config
+    addresses = SimpleNamespace()
+    with patch.launch_core_engines(config, object, False, addresses) as launch:
+        assert launch.coordinator.enable_wave_coordination is not async_dp
+        assert launch.addresses.coordinator_input == "coord-input"
+        assert launch.addresses.coordinator_output == "coord-output"
+        assert launch.addresses.frontend_stats_publish_address == "stats-pub"
+
+
+def test_npu_engine_starts_without_v032_logging_config(monkeypatch):
+    patch = _load_patch_module(monkeypatch)
+    core = sys.modules["vllm.v1.engine.core"]
+    config = _config(device_type="npu")
+    del config.logging_config
+
+    patch.run_engine_core(vllm_config=config)
+
+    assert core.last_engine.kind == "engine"
+    assert core.last_engine.shutdown_called is True
 
 
 @pytest.mark.parametrize("async_dp", [False, True])

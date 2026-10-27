@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 import vllm.v1.engine.core as core_module
 
 from afd_plugin.compat.vllm import (
-    TARGET_VLLM_VERSION,
+    get_target_vllm_version,
 )
 from afd_plugin.compat.vllm import (
     is_target_vllm_compatible as _is_target_vllm_compatible,
@@ -47,6 +47,8 @@ if TYPE_CHECKING:
 # configs while preserving the target upstream tag's normal EngineCore startup
 # logic for non-AFD configs.
 # Signature: matches upstream; no added parameters.
+# NPU source: vLLM v0.30.0 (ced6857afa0ea7b2e3f0846a62e1394e90f15607).
+# Backend-specific sections retain that release's initialization contract.
 def __init__(
     self,
     vllm_config: VllmConfig,
@@ -69,6 +71,10 @@ def __init__(
         )
         return
     # ### PATCH END: AFD FFN EngineCore daemon initialization
+
+    # ### PATCH START: select the pinned NPU initialization contract.
+    uses_npu_runtime = vllm_config.device_config.device_type == "npu"
+    # ### PATCH END: select the pinned NPU initialization contract.
 
     # plugins need to be loaded at the engine/scheduler level too
     from vllm.plugins import load_general_plugins
@@ -98,7 +104,10 @@ def __init__(
     if core_module.envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
         self._eep_scale_up_before_kv_init()
 
-    core_module.measure_encoder_output_widths(vllm_config, self.collective_rpc)
+    # ### PATCH START: preserve v0.30 NPU encoder initialization.
+    if not uses_npu_runtime:
+        core_module.measure_encoder_output_widths(vllm_config, self.collective_rpc)
+    # ### PATCH END: preserve v0.30 NPU encoder initialization.
 
     # Setup KV Caches and update CacheConfig after profiling.
     kv_cache_config = self._initialize_kv_caches(vllm_config)
@@ -129,7 +138,10 @@ def __init__(
         block_size=scheduler_block_size,
         hash_block_size=hash_block_size,
     )
-    self._initialize_effective_attention_block_size()
+    # ### PATCH START: preserve v0.30 NPU attention block initialization.
+    if not uses_npu_runtime:
+        self._initialize_effective_attention_block_size()
+    # ### PATCH END: preserve v0.30 NPU attention block initialization.
     self.use_spec_decode = vllm_config.speculative_config is not None
     self.check_for_draft_tokens = (
         self.use_spec_decode or vllm_config.model_config.is_diffusion
@@ -139,7 +151,18 @@ def __init__(
     if self.scheduler.ec_connector is not None:  # type: ignore
         self.model_executor.init_ec_output_aggregator()
 
-    self.mm_receiver_cache = core_module.engine_receiver_cache_from_config(vllm_config)
+    # ### PATCH START: use the pinned backend's multimodal cache factory.
+    if uses_npu_runtime:
+        self.mm_receiver_cache = (
+            core_module.MULTIMODAL_REGISTRY.engine_receiver_cache_from_config(
+                vllm_config
+            )
+        )
+    else:
+        self.mm_receiver_cache = core_module.engine_receiver_cache_from_config(
+            vllm_config
+        )
+    # ### PATCH END: use the pinned backend's multimodal cache factory.
 
     # If a KV connector is initialized for scheduler, we want to collect
     # handshake metadata from all workers so the connector in the scheduler
@@ -183,7 +206,15 @@ def __init__(
         )
         self.batch_queue = deque(maxlen=self.batch_queue_size)
 
-    self.is_mm_encoder_only = vllm_config.is_mm_encoder_only
+    # ### PATCH START: retain the state consumed by each pinned scheduler.
+    if uses_npu_runtime:
+        self.is_ec_consumer = (
+            vllm_config.ec_transfer_config is None
+            or vllm_config.ec_transfer_config.is_ec_consumer
+        )
+    else:
+        self.is_mm_encoder_only = vllm_config.is_mm_encoder_only
+    # ### PATCH END: retain the state consumed by each pinned scheduler.
     self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
 
     self.request_block_hasher: (
@@ -266,6 +297,8 @@ def shutdown(self):
 # Patch functionality: returns a minimal KV-cache-shaped result for AFD FFN
 # configs while preserving upstream KV cache initialization for non-AFD configs.
 # Signature: matches upstream; no added parameters.
+# NPU source: vLLM v0.30.0 (ced6857afa0ea7b2e3f0846a62e1394e90f15607).
+# Its KV-cache contract predates cache-hit-alignment propagation.
 @core_module.instrument(span_name="Prepare model")
 def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
     # ### PATCH START: AFD FFN late-loaded KV cache bypass
@@ -382,21 +415,24 @@ def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
 
     vllm_config.validate_block_size()
 
-    scheduler_block_size, hash_block_size = core_module.resolve_kv_cache_block_sizes(
-        scheduler_kv_cache_config, vllm_config
-    )
-    cache_hit_alignment_tokens = core_module.resolve_cache_hit_alignment_tokens(
-        scheduler_kv_cache_config,
-        vllm_config,
-        scheduler_block_size,
-        hash_block_size,
-    )
-    # The scheduler's config is a deep copy taken before these are resolved,
-    # so set them there too: the KV connector's scheduler side reads the same
-    # fields as its workers.
-    for kv_cache_config in (*kv_cache_configs, scheduler_kv_cache_config):
-        kv_cache_config.hash_block_size = hash_block_size
-        kv_cache_config.cache_hit_alignment_tokens = cache_hit_alignment_tokens
+    # ### PATCH START: keep v0.32 cache alignment out of the NPU v0.30 path.
+    if vllm_config.device_config.device_type != "npu":
+        scheduler_block_size, hash_block_size = (
+            core_module.resolve_kv_cache_block_sizes(
+                scheduler_kv_cache_config, vllm_config
+            )
+        )
+        cache_hit_alignment_tokens = core_module.resolve_cache_hit_alignment_tokens(
+            scheduler_kv_cache_config,
+            vllm_config,
+            scheduler_block_size,
+            hash_block_size,
+        )
+        # The scheduler's config was copied before these fields were resolved.
+        for kv_cache_config in (*kv_cache_configs, scheduler_kv_cache_config):
+            kv_cache_config.hash_block_size = hash_block_size
+            kv_cache_config.cache_hit_alignment_tokens = cache_hit_alignment_tokens
+    # ### PATCH END: keep v0.32 cache alignment out of the NPU v0.30 path.
 
     self.model_executor.initialize_from_config(kv_cache_configs)
     if not core_module.envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
@@ -761,7 +797,7 @@ else:
     core_module.logger.warning(
         "Skipping AFD EngineCore patch: vLLM %s does not match target %s",
         getattr(core_module, "VLLM_VERSION", "unknown"),
-        TARGET_VLLM_VERSION,
+        get_target_vllm_version(),
     )
 
 

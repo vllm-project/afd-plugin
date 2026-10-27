@@ -25,8 +25,13 @@ def _engine_core_outputs(**kwargs):
     return SimpleNamespace(**kwargs)
 
 
-def _install_fake_vllm_core(monkeypatch: pytest.MonkeyPatch):
+def _install_fake_vllm_core(
+    monkeypatch: pytest.MonkeyPatch, *, device_type: str = "cuda"
+):
     vllm_module = types.ModuleType("vllm")
+    vllm_module.__version__ = "0.30.0" if device_type == "npu" else "0.32.0"
+    platforms_module = types.ModuleType("vllm.platforms")
+    platforms_module.current_platform = SimpleNamespace(device_type=device_type)
     vllm_v1_module = types.ModuleType("vllm.v1")
     vllm_engine_module = types.ModuleType("vllm.v1.engine")
     core_module = types.ModuleType("vllm.v1.engine.core")
@@ -178,8 +183,17 @@ def _install_fake_vllm_core(monkeypatch: pytest.MonkeyPatch):
     core_module.logger.info_once = lambda *args, **kwargs: None
     core_module.envs = SimpleNamespace(VLLM_ELASTIC_EP_SCALE_UP_LAUNCH=False)
     core_module.StructuredOutputManager = _StructuredOutputManager
-    core_module.engine_receiver_cache_from_config = lambda config: ("mm-cache", config)
-    core_module.measure_encoder_output_widths = lambda _config, _rpc: None
+    if device_type == "npu":
+        del EngineCore._initialize_effective_attention_block_size
+        core_module.MULTIMODAL_REGISTRY = SimpleNamespace(
+            engine_receiver_cache_from_config=lambda config: ("npu-mm-cache", config)
+        )
+    else:
+        core_module.engine_receiver_cache_from_config = lambda config: (
+            "mm-cache",
+            config,
+        )
+        core_module.measure_encoder_output_widths = lambda _config, _rpc: None
     core_module.SchedulerStats = _SchedulerStats
     core_module.instrument = instrument
     core_module.fault_tolerant_wrapper = fault_tolerant_wrapper
@@ -192,13 +206,15 @@ def _install_fake_vllm_core(monkeypatch: pytest.MonkeyPatch):
     core_module.get_request_block_hasher = get_request_block_hasher
     core_module.register_all_kvcache_specs = register_all_kvcache_specs
     core_module.resolve_kv_cache_block_sizes = resolve_kv_cache_block_sizes
-    core_module.resolve_cache_hit_alignment_tokens = lambda *_args: 32
+    if device_type != "npu":
+        core_module.resolve_cache_hit_alignment_tokens = lambda *_args: 32
     core_module.freeze_gc_heap = lambda: None
     core_module.maybe_attach_gc_debug_callback = lambda: None
     core_module.enable_envs_cache = lambda: None
     core_module.EngineCoreOutputs = _engine_core_outputs
 
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    monkeypatch.setitem(sys.modules, "vllm.platforms", platforms_module)
     monkeypatch.setitem(sys.modules, "vllm.v1", vllm_v1_module)
     monkeypatch.setitem(sys.modules, "vllm.v1.engine", vllm_engine_module)
     monkeypatch.setitem(sys.modules, "vllm.v1.engine.core", core_module)
@@ -400,8 +416,9 @@ def test_native_kv_config_preserves_worker_and_scheduler_alignment(monkeypatch):
     assert executor.kv_cache_configs[0].cache_hit_alignment_tokens == 32
 
 
-def test_engine_core_patch_imports_ascend_kv_cache_patch_on_npu(monkeypatch):
-    core_module = _install_fake_vllm_core(monkeypatch)
+@pytest.mark.parametrize("is_ec_consumer", [False, True])
+def test_engine_core_preserves_v030_npu_initialization(monkeypatch, is_ec_consumer):
+    core_module = _install_fake_vllm_core(monkeypatch, device_type="npu")
     _load_patch_module()
     imported = []
     real_import = __import__
@@ -416,10 +433,13 @@ def test_engine_core_patch_imports_ascend_kv_cache_patch_on_npu(monkeypatch):
 
     config = _config("attention")
     config.device_config = SimpleNamespace(device_type="npu")
+    config.ec_transfer_config = SimpleNamespace(is_ec_consumer=is_ec_consumer)
     engine = core_module.EngineCore(config, KVCacheExecutor, log_stats=False)
 
     assert imported == ["vllm_ascend.patch.platform.patch_kv_cache_utils"]
     assert engine.scheduler is not None
+    assert engine.mm_receiver_cache == ("npu-mm-cache", config)
+    assert engine.is_ec_consumer is is_ec_consumer
 
 
 def test_async_attention_loop_publishes_counts_via_upstream_hook(monkeypatch):
