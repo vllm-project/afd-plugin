@@ -5,6 +5,7 @@
 from afd_plugin.connectors.base import (
     AFDConnectorBase,
     AFDControlPlane,
+    AFDRoutedExpertsConnector,
     ConnectorExtraInfo,
 )
 from afd_plugin.connectors.factory import AFDConnectorFactory
@@ -19,9 +20,6 @@ from afd_plugin.connectors.metadata import (
     AFDTransferContext,
     AFDTransferMetadata,
     AFDTransferState,
-)
-from afd_plugin.connectors.routed_experts import (
-    AFDRoutedExpertsConnector,
     FFNLocalExperts,
     LocalExpertWeights,
 )

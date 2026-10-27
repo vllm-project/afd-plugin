@@ -58,7 +58,7 @@ from afd_plugin.connectors.gpu.deepep_m2n.network import (  # noqa: E402
     NetworkConfig,
     RankTopology,
 )
-from afd_plugin.connectors.routed_experts import (  # noqa: E402
+from afd_plugin.connectors.metadata import (  # noqa: E402
     FFNLocalExperts,
     LocalExpertWeights,
 )

@@ -75,7 +75,11 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id, dbo_enabled
 
 from afd_plugin.config import AFDConfig
-from afd_plugin.connectors.base import AFDControlPlane, ConnectorExtraInfo
+from afd_plugin.connectors.base import (
+    AFDControlPlane,
+    AFDRoutedExpertsConnector,
+    ConnectorExtraInfo,
+)
 from afd_plugin.connectors.gpu.deepep_m2n.experts import (
     EXPERT_BACKENDS,
     DeepEPM2NExperts,
@@ -91,20 +95,17 @@ from afd_plugin.connectors.gpu.deepep_m2n.network import (
     plan_network,
 )
 from afd_plugin.connectors.metadata import (
+    FP8_DTYPE,
     AFDA2FTransferPayload,
     AFDControlPayload,
     AFDDPMetadata,
     AFDTransferContext,
     AFDTransferMetadata,
     AFDTransferState,
-    recv_control_payload,
-    send_control_payload,
-)
-from afd_plugin.connectors.routed_experts import (
-    FP8_DTYPE,
-    AFDRoutedExpertsConnector,
     FFNLocalExperts,
     LocalExpertWeights,
+    recv_control_payload,
+    send_control_payload,
 )
 from afd_plugin.distributed import init_afd_process_group
 

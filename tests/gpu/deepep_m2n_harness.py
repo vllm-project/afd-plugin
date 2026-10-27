@@ -578,7 +578,7 @@ def local_weights(experts: range, payload_format: str) -> tuple[Any, Any, Any]:
         dequantize_fp8_block128,
         quantize_fp8_block128,
     )
-    from afd_plugin.connectors.routed_experts import LocalExpertWeights
+    from afd_plugin.connectors.metadata import LocalExpertWeights
 
     w13, w2 = make_expert_weights(experts)
     if payload_format == "bf16":
