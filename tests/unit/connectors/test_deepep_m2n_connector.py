@@ -13,6 +13,8 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
+from vllm.platforms.interface import set_assigned_physical_gpu_ids  # noqa: E402
+
 from tests.unit.fakes.afdep import FakeElasticBuffer, install_fake_afdep  # noqa: E402
 
 # The connector module imports afdEP's transport when it loads.
@@ -56,10 +58,11 @@ from afd_plugin.connectors.gpu.deepep_m2n.network import (  # noqa: E402
     NetworkConfig,
     RankTopology,
 )
-from afd_plugin.connectors.routed_experts import (  # noqa: E402
+from afd_plugin.connectors.metadata import (  # noqa: E402
     FFNLocalExperts,
     LocalExpertWeights,
 )
+from tests.unit.fakes.platform import cuda_like_platform  # noqa: E402
 from tests.unit.fakes.vllm_config import (  # noqa: E402
     M2N_HIDDEN_SIZE,
     M2NTopology,
@@ -75,11 +78,15 @@ def _dp(*tokens: int) -> AFDDPMetadata:
 
 
 def _connector(
-    role: str, role_rank: int, topology: M2NTopology, extra: dict | None = None
+    role: str,
+    role_rank: int,
+    topology: M2NTopology,
+    extra: dict | None = None,
+    local_rank: int = 0,
 ):
     vllm_config = m2n_vllm_config(topology, role, role_rank, extra or {}, port=12345)
     afd_config = afd_config_from_mapping(vllm_config.additional_config["afd"])
-    return AFDConnectorFactory.create_connector(0, 0, vllm_config, afd_config)
+    return AFDConnectorFactory.create_connector(0, local_rank, vllm_config, afd_config)
 
 
 def _ffn_deployment(layout: DeepEPM2NLayout, weight_format: str = "bf16") -> dict:
@@ -809,6 +816,42 @@ def test_connector_constructs_without_initialization():
     assert ffn.world_rank == 1
     assert (ffn.attn_tp_size, ffn.capacity_tokens_per_rank) == (None, None)
     assert explicit_ffn.capacity_tokens_per_rank == 64
+
+
+@pytest.mark.parametrize(
+    ("visible_devices", "assigned_ids", "expected_indices"),
+    [
+        (None, None, (0, 1)),
+        ("2,3", None, (0, 1)),
+        (None, [4, 5], (4, 5)),
+        ("4,5", [5, 4], (1, 0)),
+    ],
+)
+def test_connector_uses_the_device_vllm_gives_the_worker(
+    monkeypatch, visible_devices, assigned_ids, expected_indices
+):
+    """The runner passes vLLM's logical local rank; the connector runs on the
+    visible CUDA ordinal vLLM's ``Worker.init_device`` maps it to.
+
+    Why: with ``--device-ids 4,5`` (registered by vLLM before the runner is
+    built) or a reordered CUDA_VISIBLE_DEVICES, the logical rank names another
+    worker's GPU, so the buffers would sit apart from the model's tensors.
+    """
+    monkeypatch.setattr(
+        connector_module, "current_platform", cuda_like_platform(monkeypatch)
+    )
+    if visible_devices is not None:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible_devices)
+    if assigned_ids is not None:
+        set_assigned_physical_gpu_ids(assigned_ids)
+    topology = M2NTopology(ffn_size=1, attn_size=2)
+
+    devices = tuple(
+        _connector("attention", rank, topology, local_rank=rank).device
+        for rank in range(2)
+    )
+
+    assert devices == tuple(torch.device("cuda", i) for i in expected_indices)
 
 
 def test_control_plane_requires_the_handshake_on_ffn():

@@ -42,7 +42,7 @@ from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (
     dequantize_fp8_rows,
     silu_mul_fp8_quant,
 )
-from afd_plugin.connectors.routed_experts import FP8_DTYPE, LocalExpertWeights
+from afd_plugin.connectors.metadata import FP8_DTYPE, LocalExpertWeights
 
 ExpertBackend = Literal["deepgemm", "fused_experts"]
 EXPERT_BACKENDS: tuple[ExpertBackend, ...] = ("deepgemm", "fused_experts")

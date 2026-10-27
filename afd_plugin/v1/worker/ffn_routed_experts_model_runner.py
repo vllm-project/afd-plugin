@@ -18,7 +18,7 @@ from afd_plugin.connectors import (
     FFNLocalExperts,
     LocalExpertWeights,
 )
-from afd_plugin.connectors.routed_experts import FP8_DTYPE
+from afd_plugin.connectors.metadata import FP8_DTYPE
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
 
 if TYPE_CHECKING:

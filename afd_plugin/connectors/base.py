@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +16,8 @@ from afd_plugin.connectors.metadata import (
     AFDA2FTransferPayload,
     AFDControlPayload,
     AFDTransferContext,
+    FFNLocalExperts,
+    LocalExpertWeights,
 )
 
 if TYPE_CHECKING:
@@ -255,6 +257,61 @@ class AFDConnectorBase(ABC):
         raise NotImplementedError
 
 
+class AFDRoutedExpertsConnector(AFDConnectorBase):
+    """A connector whose FFN side receives routed (token, local expert) rows.
+
+    Routing (gate and top-k) runs on Attention. The FFN receives one row per
+    (token, local expert) pair, runs only its local experts and sends the
+    weighted rows back. Workers and runners use this interface and the
+    ``FFNLocalExperts``/``LocalExpertWeights`` types from ``metadata.py``
+    instead of any specific connector, so they stay connector-agnostic. It
+    extends ``AFDConnectorBase`` rather than adding to it, so connectors
+    without routed experts implement none of this.
+
+    Lifecycle: as every connector, the runner creates it and calls
+    ``init_afd_connector`` after weights load, here with what it loaded. The
+    FFN worker selects the routed-experts runner for these connectors.
+    """
+
+    # Extends AFDConnectorBase.init_afd_connector with optional keywords only,
+    # so calls through the base contract stay valid.
+    @abstractmethod
+    def init_afd_connector(
+        self,
+        *,
+        moe_layer_indices: Sequence[int] | None = None,
+        local_experts: Mapping[int, FFNLocalExperts] | None = None,
+    ) -> None:
+        """Collective: check what every rank loaded, then create resources.
+
+        Args:
+            moe_layer_indices: MoE layers this rank's model runs, in order.
+                ``None`` skips the post-load checks for this rank.
+            local_experts: FFN only: this rank's experts per MoE layer, as
+                vLLM loaded them.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def run_experts(
+        self,
+        payload: AFDA2FTransferPayload,
+        weights: LocalExpertWeights,
+    ) -> torch.Tensor:
+        """Run this rank's experts on the rows ``recv_attn_output`` returned;
+        the result is what ``send_ffn_output`` sends back."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def synchronize_lanes(self) -> None:
+        """Join the streams the connector forked into the caller's stream.
+
+        FFN runners call this at the end of each step, before a CUDA-graph
+        capture ends.
+        """
+        raise NotImplementedError
+
+
 class AFDControlPlane(ABC):
     """DP metadata control plane"""
 
@@ -307,4 +364,9 @@ class AFDControlPlane(ABC):
         raise NotImplementedError
 
 
-__all__ = ["AFDConnectorBase", "AFDControlPlane", "ConnectorExtraInfo"]
+__all__ = [
+    "AFDConnectorBase",
+    "AFDControlPlane",
+    "AFDRoutedExpertsConnector",
+    "ConnectorExtraInfo",
+]

@@ -21,7 +21,7 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import tl, triton
 
-from afd_plugin.connectors.routed_experts import FP8_DTYPE
+from afd_plugin.connectors.metadata import FP8_DTYPE
 
 FP8_MAX = torch.finfo(FP8_DTYPE).max
 FP8_MIN = torch.finfo(FP8_DTYPE).min
