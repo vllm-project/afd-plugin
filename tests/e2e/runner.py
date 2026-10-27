@@ -71,6 +71,7 @@ V2_SCENARIOS = (
     "afd-v2-graph-tp2",
     "afd-v2-eager-dbo-dp2",
     "afd-v2-graph-dbo-dp2",
+    "afd-v2-graph-dbo-tp2",
 )
 V2_DBO_COMPARISON_SCENARIOS = frozenset(
     ("afd-v2-eager-dp2", "afd-v2-eager-dbo-dp2", "afd-v2-graph-dbo-dp2"),
@@ -81,7 +82,7 @@ V2_SINGLE_RANK_SCENARIOS = frozenset(
     ("afd-v2-eager-1a1f", "afd-v2-graph-1a1f"),
 )
 V2_TENSOR_PARALLEL_SCENARIOS = frozenset(
-    ("afd-v2-eager-tp2", "afd-v2-graph-tp2"),
+    ("afd-v2-eager-tp2", "afd-v2-graph-tp2", "afd-v2-graph-dbo-tp2"),
 )
 E2E_RUN_ID_ENV = "AFD_E2E_RUN_ID"
 E2E_PROCESS_ROLE_ENV = "AFD_E2E_PROCESS_ROLE"
@@ -506,6 +507,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-v2-graph-tp2": (False, True, False, 2, 2),
         "afd-v2-eager-dbo-dp2": (False, False, True, 2, 2),
         "afd-v2-graph-dbo-dp2": (False, True, True, 2, 2),
+        "afd-v2-graph-dbo-tp2": (False, True, True, 2, 2),
         **DSV4_GPU_SCENARIO_SETTINGS,
     }
     for sync_scenario, sync_profile in DSV4_SYNC_SHAPES.items():
