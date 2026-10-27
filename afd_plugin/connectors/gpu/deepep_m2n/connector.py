@@ -70,6 +70,7 @@ from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id, dbo_enabled
 
@@ -957,7 +958,13 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
                 cpu_sync_min_tokens=self.config.cpu_sync_min_tokens,
             )
         self.num_lanes = resolve_num_lanes(self.config, vllm_config)
-        self.device = torch.device("cuda", local_rank)
+        # ``local_rank`` is vLLM's logical local rank (the world group's). The
+        # worker runs on its visible ordinal, which differs under
+        # ``--device-ids`` or a reordered CUDA_VISIBLE_DEVICES; vLLM has
+        # registered the assigned ids by the time the runner builds us.
+        self.device = torch.device(
+            "cuda", current_platform.logical_device_id_to_visible_device_id(local_rank)
+        )
         # Where control payloads are staged: gloo moves CPU tensors.
         self.control_device = (
             torch.device("cpu")
