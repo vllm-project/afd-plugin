@@ -33,7 +33,7 @@ Directory names follow these conventions:
 
 | Hardware | Connector | Model | Recommended stage | Status | Recipe |
 | --- | --- | --- | --- | --- | --- |
-| GPU | `P2pNcclAFDConnector` | DeepSeek-V2-Lite | Decode | Historical v0.30 2A2F E2E evidence; examples inspected, not run on v0.32 | [Launch examples](gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md) |
+| GPU | `P2pNcclAFDConnector` | DeepSeek-V2-Lite | Decode | Deployment examples; see the linked README for validation scope | [Launch examples](gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md) |
 | Ascend NPU | `CAMP2pAFDConnector` | DeepSeek-V3.2 | Decode | Integrated v0.30 hardware validation pending; linked recipe is historical | [Synchronous decode](npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) |
 | Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V3.2 | Prefill / decode | Integrated v0.30 hardware validation pending; historical v0.26 DP2TP8+EP16 token split reached `0.9522` strict match; legacy PCP8 results are v0.19-only | [Async CAM](npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) |
 

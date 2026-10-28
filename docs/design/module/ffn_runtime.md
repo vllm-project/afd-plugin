@@ -155,10 +155,9 @@ does not adopt native V2 request state or scheduler-driven execution:
 The V2 pair requires PP/PCP/DCP size 1, configured role ranks equal to DP x TP,
 static EP, and a registered AFD model. CUDA uses `P2pNcclAFDConnector` with
 model-specific gate placement and supports two native microbatches with
-Attention DP1 or DP > 1. Earlier vLLM 0.30 H20 validation covered
-DeepSeek-V2-Lite DP1/TP2 Graph + DBO with 128 GSM8K samples and live
-two-stage/full-replay assertions. On vLLM 0.32 inference passed, but graceful
-shutdown failed; see the [runtime matrix](execution_platforms.md#tested-runtime-matrix).
+Attention DP1 or DP > 1. See the
+[runtime matrix](execution_platforms.md#tested-runtime-matrix) for tested
+configurations and known DeepSeek-V2-Lite DBO shutdown failures.
 Ascend supports synchronous CAMP2P with FFN-side gating, or eager Async CAM
 with Attention-side gating. CAMP2P supports eager and graph DBO with
 Attention DP > 1 and matching two-stage FFN control metadata. Async CAM

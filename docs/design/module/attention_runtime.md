@@ -169,17 +169,10 @@ Both platforms require V2. The paired deployment constraints are:
 
 Both roles validate the paired V2 topology, but only Attention uses the native
 V2 model runner. FFN remains connector-driven and uses its existing AFD runner
-surface. Earlier CUDA V2 revisions have DP2/TP2 eager and graph E2E evidence;
-this upgrade-only baseline has not been hardware-qualified. Qwen3.5/3.6 GDN
-DBO is unsupported; native hybrid/multimodal DBO validation applies. Qwen3 MoE
-DBO remains supported.
-Earlier vLLM 0.30 H20 validation of the GPU DP1 path covered DeepSeek-V2-Lite
-DP1/TP2 Graph + DBO with 128 GSM8K samples and live two-stage/full-replay
-assertions. On vLLM 0.32 inference passed, but graceful shutdown failed; see the
-[runtime matrix](execution_platforms.md#tested-runtime-matrix).
-Earlier Ascend V2 baseline runs covered V2-Lite 2A1F eager/graph and a 2A2F
-FULL 300-question run; see the [NPU validation record](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923).
-This upgrade branch has not been tested on NPU hardware.
+surface. Qwen3.5/3.6 GDN DBO is unsupported; native hybrid/multimodal
+DBO validation applies. Qwen3 MoE DBO remains supported. See the
+[runtime matrix](execution_platforms.md#tested-runtime-matrix) for tested
+configurations and known shutdown limitations.
 The generic V2 E2E harness remains CUDA-only.
 
 For Ascend V2 Async CAM, the supported contract and launch settings are in the

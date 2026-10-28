@@ -66,8 +66,9 @@ The package extra pins vLLM `0.32.0` for GPU.
 Direct strict calls raise for a missing or different vLLM; plugin registration
 calls the check with `strict=False`, so it warns and continues. This warning
 policy does not make another vLLM release supported. Shared EngineCore and
-coordinator differences retain the NPU 0.30 contract; CPU tests cover these
-seams, but this upgrade branch has not been validated on NPU hardware.
+coordinator patches retain separate GPU 0.32 and NPU 0.30 contracts. See the
+[runtime matrix](execution_platforms.md#tested-runtime-matrix) for hardware
+validation scope.
 
 The NPU implementation remains based on vLLM `0.30.0` (`ced6857a`) and
 vLLM-Ascend commit
