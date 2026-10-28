@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 #
-# Drive load against a running AFD instance (e.g. the attention endpoint started
-# by decode_bench_server.sh). Thin wrapper around `vllm bench serve`; every knob
-# is overridable via an environment variable.
+# Drive load against a running AFD instance (e.g. the attention endpoint of a
+# recipe under recipe/gpu/). Thin wrapper around `vllm bench serve`; every knob
+# is overridable via an environment variable. For a decode-only run over a
+# warmed prompt pool, use decode_bench_client.py instead.
 #
 # Usage:
 #   MODEL_PATH=/path/to/weights tools/benchmarks/request_generator.sh

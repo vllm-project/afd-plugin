@@ -44,7 +44,8 @@ than one pod) -- callers never talk to these directly. See
   `# For pod N: POD=...` line per pod, but the comment isn't guaranteed to
   use that exact grammar going forward. See
   [resolve-recipe.md](references/resolve-recipe.md).
-- Not for `tools/benchmarks/decode_bench_server.sh` (local, non-k8s).
+- Not for the local decode-only benchmark (`tools/benchmarks/decode_bench_client.py`
+  against `recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/`, non-k8s).
 
 ## Requirements
 

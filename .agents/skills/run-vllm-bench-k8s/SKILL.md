@@ -15,8 +15,9 @@ One invocation = one run = one `RUN_ID` = one report.
 ## Scope
 
 - GPU colocation recipes only -- whatever `deploy-afd-k8s` supports.
-- Not for local benchmarking (run `request_generator.sh` directly against
-  `decode_bench_server.sh` for that) or correctness E2E (`run-e2e`).
+- Not for local benchmarking (run `request_generator.sh` or
+  `decode_bench_client.py` directly against a local recipe for that) or
+  correctness E2E (`run-e2e`).
 - Requires everything `deploy-afd-k8s` requires. No extra image: the bench
   pod runs `AFD_PLUGIN_IMAGE`, which already carries the repo at
   `/opt/afd-plugin` and vLLM's `bench` CLI.
