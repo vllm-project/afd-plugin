@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
+import threading
 from collections import deque
+from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -135,3 +138,51 @@ def test_eager_preserves_layer_loop_device_metadata_and_return_headers(harness):
     ):
         torch.testing.assert_close(sent[1], hidden.to(torch.bfloat16), rtol=0, atol=0)
         assert sent[2] is received_payload.context.states.token_nums_rankid_layeridx
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_full_receiver_exit_requires_success_even_during_shutdown(harness, fail):
+    worker = AFDNPUFFNWorker.__new__(AFDNPUFFNWorker)
+    worker.model_runner = harness.runner
+    harness.runner.effective_mode = "full"
+    worker._ffn_thread = None
+    worker._ffn_loop_error = None
+    worker._bind_cpus_once = lambda: None
+
+    def serve():
+        worker._ffn_shutdown_event.set()
+        if fail:
+            raise RuntimeError("partial device completion")
+
+    worker._run_ffn_server_loop = serve
+    worker.start_ffn_server_loop()
+    assert isinstance(worker._ffn_thread, threading.Thread)
+    worker._ffn_thread.join(3)
+    assert not worker._ffn_thread.is_alive()
+    assert harness.runner._graph_receiver_exited is not fail
+    assert (worker._ffn_loop_error is not None) is fail
+
+
+@pytest.mark.parametrize("drains", [True, False])
+def test_pull_shutdown_finishes_only_selected_source(harness, monkeypatch, drains):
+    h = harness
+    monkeypatch.setenv("BATCH_SIZE_FACTOR", str(8 / 262144))
+    h.connector.extra_info = replace(
+        h.connector.extra_info, dispatch_mode="pull_v1", dynamic_quant=1
+    )
+    active = iter((True, True, False) if drains else (True,) * 8)
+    monkeypatch.setattr(h.connector, "pull_has_active_source", lambda: next(active))
+    monkeypatch.setattr(h.connector, "check_pull_status", lambda: None)
+    monkeypatch.setattr(torch.npu, "synchronize", lambda: None)
+    calls = []
+    monkeypatch.setattr(
+        h.runner,
+        "_ffn_forward_connector_driven",
+        lambda *, single: calls.append(single),
+    )
+    if drains:
+        h.runner.drain_pull_source()
+    else:
+        with pytest.raises(RuntimeError, match="retain resources"):
+            h.runner.drain_pull_source()
+    assert calls == [True, True]

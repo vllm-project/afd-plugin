@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import weakref
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -94,6 +95,11 @@ class _FakeCamOps:
         hidden_size = args[6]
         return _FakeTensor((batch_size, hidden_size))
 
+    afd_mega_dispatch_send = afd_async_dispatch_send
+    afd_mega_dispatch_recv = afd_async_dispatch_recv
+    afd_mega_combine_send = afd_async_combine_send
+    afd_mega_combine_recv = afd_async_combine_recv
+
 
 class _FakeTorch:
     def __init__(self):
@@ -171,6 +177,47 @@ def test_async_extra_info_rejects_unknown_and_invalid_fields():
         AFDAsyncExtraInfo.from_mapping({"core_num": 8})
     with pytest.raises(ValueError, match="attn_ranks_per_dp must be positive"):
         AFDAsyncExtraInfo.from_mapping({"attn_ranks_per_dp": 0})
+
+
+def test_pull_config_round_trips_protocol_and_normalized_quantization():
+    info = AFDAsyncExtraInfo.from_mapping(
+        {"dispatch_mode": "pull_v1", "dynamicQuant": "1", "ffn_two_stream": "false"}
+    )
+    assert info.dispatch_mode == "pull_v1" and info.dynamic_quant == 1
+    assert AFDAsyncExtraInfo.from_mapping(info.to_mapping()) == info
+    mega = AFDAsyncExtraInfo.from_mapping(
+        {"dispatch_mode": "pull_v1", "dynamicQuant": 1, "ffn_mega_moe": "true"}
+    )
+    assert mega.ffn_mega_moe
+    assert AFDAsyncExtraInfo.from_mapping(mega.to_mapping()) == mega
+    with pytest.raises(ValueError, match="ffn_mega_moe"):
+        AFDAsyncExtraInfo.from_mapping({"ffn_mega_moe": True})
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"dispatch_mode": "other"},
+        {"dispatch_mode": "pull_v1"},
+        {"dispatch_mode": "pull_v1", "dynamicQuant": 1, "ffn_two_stream": True},
+    ],
+)
+def test_pull_rejects_incompatible_configuration(raw):
+    with pytest.raises(ValueError, match="dispatch_mode|pull_v1"):
+        AFDAsyncExtraInfo.from_mapping(raw)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "async_moe_ubatching",
+        "async_moe_num_ubatches",
+        "async_moe_split",
+    ],
+)
+def test_async_extra_info_rejects_removed_fields(field):
+    with pytest.raises(ValueError, match="unknown AFD async connector_extra_config"):
+        AFDAsyncExtraInfo.from_mapping({field: True})
 
 
 def test_async_connector_factory_creates_import_safe_connector():
@@ -453,6 +500,100 @@ def test_async_receive_anchor_uses_model_dtype(monkeypatch, dtype):
 def test_async_rejects_nondivisible_expert_placement():
     with pytest.raises(ValueError, match="divisible"):
         build_async_topology(_afd_config(role="ffn"), 0, num_routed_experts=7)
+
+
+def test_async_rejects_fused_shared_expert_ids():
+    from afd_plugin.compat.npu.feature_validation import (
+        _fail_if_unsupported_npu_afd_async_features,
+    )
+
+    config = _vllm_config()
+    config.additional_config["mix_placement"] = True
+    with pytest.raises(RuntimeError, match="routed-only.*mix_placement"):
+        _fail_if_unsupported_npu_afd_async_features(
+            config,
+            _afd_config(role="attention"),
+            AFDAsyncExtraInfo(),
+        )
+
+
+@pytest.mark.parametrize("mode", ["push_compact_v2", "pull_v1"])
+def test_dispatch_failure_preserves_protocol_window_ownership(monkeypatch, mode):
+    fake_torch = _FakeTorch()
+    monkeypatch.setattr(async_cam_module, "torch", fake_torch)
+    connector = CAMAsyncAFDConnector(
+        0,
+        0,
+        _vllm_config(),
+        _afd_config(role="attention"),
+        0,
+    )
+    connector._initialized = True
+    connector.extra_info = replace(connector.extra_info, dispatch_mode=mode)
+    connector.comm_args = _FakeTensor((1,), dtype="fp16")
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=2,
+            stage_idx=0,
+            seq_len=3,
+        )
+    )
+
+    def fail_dispatch(*_args):
+        raise RuntimeError("dispatch failed")
+
+    monkeypatch.setattr(
+        fake_torch.ops.afd_ascend,
+        "afd_mega_dispatch_send" if mode == "pull_v1" else "afd_async_dispatch_send",
+        fail_dispatch,
+    )
+    with pytest.raises(RuntimeError, match="dispatch failed"):
+        connector.send_attn_output(_FakeTensor((3, 16)), context, **_topk_payload(3))
+    if mode == "pull_v1":
+        with pytest.raises(RuntimeError, match="pending"):
+            connector.close()
+    else:
+        connector.close()
+        assert not connector.is_initialized
+
+
+@pytest.mark.parametrize("phase", ["launch", "status"])
+def test_pull_combine_failure_retains_window_until_completion(monkeypatch, phase):
+    fake_torch = _FakeTorch()
+    monkeypatch.setattr(async_cam_module, "torch", fake_torch)
+    connector = CAMAsyncAFDConnector(
+        0, 0, _vllm_config(), _afd_config(role="attention"), 0
+    )
+    connector._initialized = True
+    connector.comm_args = _FakeTensor((1,), dtype="fp16")
+    hidden = _FakeTensor((3, 16))
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=2, stage_idx=0, seq_len=3
+        )
+    )
+    connector.send_attn_output(hidden, context, **_topk_payload(3))
+    connector.extra_info = replace(connector.extra_info, dispatch_mode="pull_v1")
+    monkeypatch.setattr(connector.graph_startup, "close_pull_attention", lambda: None)
+
+    def fail(*_args):
+        raise RuntimeError("combine failed")
+
+    combine = fake_torch.ops.afd_ascend.afd_mega_combine_recv
+    monkeypatch.setattr(
+        connector, "check_pull_status", fail if phase == "status" else lambda: None
+    )
+    if phase == "launch":
+        monkeypatch.setattr(fake_torch.ops.afd_ascend, "afd_mega_combine_recv", fail)
+    with pytest.raises(RuntimeError, match="combine failed"):
+        connector.recv_ffn_output(hidden, context=context)
+    with pytest.raises(RuntimeError, match="pending"):
+        connector.close()
+    monkeypatch.setattr(fake_torch.ops.afd_ascend, "afd_mega_combine_recv", combine)
+    monkeypatch.setattr(connector, "check_pull_status", lambda: None)
+    connector.recv_ffn_output(hidden, context=context)
+    connector.close()
+    assert not connector.is_initialized
 
 
 def test_close_releases_every_stage_routing(monkeypatch):

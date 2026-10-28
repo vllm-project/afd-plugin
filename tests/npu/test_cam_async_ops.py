@@ -43,6 +43,10 @@ def _dispatch_recv(torch: ModuleType, *, dynamic_quant: int = 0, moe_rank_id: in
         "afd_async_dispatch_recv",
         "afd_async_combine_send",
         "afd_async_combine_recv",
+        "afd_mega_dispatch_send",
+        "afd_mega_dispatch_recv",
+        "afd_mega_combine_send",
+        "afd_mega_combine_recv",
     ),
 )
 def test_cam_dispatcher_registers_inference_and_meta_kernels(
@@ -54,6 +58,81 @@ def test_cam_dispatcher_registers_inference_and_meta_kernels(
         )
     schema = getattr(ascend_ops_runtime.ops.afd_ascend, name).default._schema
     assert all("shared" not in argument.name for argument in schema.arguments)
+
+
+def test_pull_meta_carries_epoch_and_sequence(cam_runtime, monkeypatch):
+    torch = cam_runtime
+    monkeypatch.setenv("BATCH_SIZE_FACTOR", str(3 / 262144))
+    anchor = torch.empty(1, dtype=torch.bfloat16, device="meta")
+    state = torch.ops.afd_ascend.afd_mega_pull_init(
+        anchor, [8, 256, 2, 2, 1, 4, 1, 1], [2, 5], 1, "meta_only"
+    )
+    hidden, scales, batch, counts = torch.ops.afd_ascend.afd_mega_dispatch_recv(
+        anchor, state, 0x41464401, 8, 256, 2, 2, 1, 4, 1, 3, 1, 1, "meta_only"
+    )
+    assert hidden.shape == (3, 256) and hidden.dtype == torch.int8
+    assert scales.shape == (3,) and counts.shape == (4,)
+    assert batch.shape == (12,) and batch.dtype == torch.int64
+    with pytest.raises(RuntimeError, match="protocol layout"):
+        torch.ops.afd_ascend.afd_mega_combine_send(
+            torch.empty((3, 256), dtype=torch.bfloat16, device="meta"),
+            state,
+            batch[:-2],
+            0x41464401,
+            8,
+            256,
+            2,
+            2,
+            1,
+            4,
+            1,
+            3,
+            1,
+            "meta_only",
+        )
+    schema = torch.ops.afd_ascend.afd_mega_dispatch_recv.default._schema
+    comm_arg = next(arg for arg in schema.arguments if arg.name == "comm_args")
+    assert comm_arg.alias_info.is_write
+
+
+def test_pull_empty_combine_preserves_logical_shape(cam_runtime):
+    torch = cam_runtime
+    anchor = torch.empty(1, dtype=torch.bfloat16, device="meta")
+    state = torch.ops.afd_ascend.afd_mega_pull_init(
+        anchor, [8, 256, 2, 2, 1, 4, 0, 1], [], 1, "meta_only"
+    )
+    output = torch.ops.afd_ascend.afd_mega_combine_recv(
+        anchor,
+        torch.empty((0, 2), dtype=torch.int32, device="meta"),
+        torch.empty((0, 2), dtype=torch.float32, device="meta"),
+        state,
+        0x41464401,
+        0,
+        256,
+        2,
+        2,
+        1,
+        4,
+        0,
+        3,
+        "meta_only",
+        8,
+        1,
+    )
+    assert output.shape == (0, 256) and output.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("layers", [(2, 2), (-1,), (65536,), (2**63 - 1,)])
+def test_pull_init_rejects_invalid_layer_map(cam_runtime, layers):
+    torch = cam_runtime
+    with pytest.raises(RuntimeError, match="layer"):
+        torch.ops.afd_ascend.afd_mega_pull_init(
+            torch.empty(1, dtype=torch.bfloat16, device="meta"),
+            [8, 256, 2, 2, 1, 4, 1, 1],
+            list(layers),
+            1,
+            "meta_only",
+        )
 
 
 @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])

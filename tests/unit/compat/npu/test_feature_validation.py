@@ -291,6 +291,7 @@ def test_npu_afd_num_ubatches_reads_two_ubatch_dbo():
 
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])
+@pytest.mark.parametrize("dispatch_mode", ["push_compact_v2", "pull_v1"])
 @pytest.mark.parametrize(
     ("factor", "max_num_batched_tokens", "rejected"),
     [
@@ -302,11 +303,13 @@ def test_npu_afd_num_ubatches_reads_two_ubatch_dbo():
         ("nan", 16, True),
         ("invalid", 16, True),
         ("0.01_5625", 4096, True),
+        ("0.00000001", 16, True),
     ],
 )
 def test_npu_async_feature_validation_checks_receive_capacity(
     monkeypatch,
     role,
+    dispatch_mode,
     factor,
     max_num_batched_tokens,
     rejected,
@@ -324,10 +327,16 @@ def test_npu_async_feature_validation_checks_receive_capacity(
         use_v2_model_runner=True,
         num_attention_ranks=2,
         tensor_parallel_size=2 if role == "attention" else 1,
-        extra_config={"attn_ranks_per_dp": 2, "dynamicQuant": 1},
+        extra_config={
+            "attn_ranks_per_dp": 2,
+            "dispatch_mode": dispatch_mode,
+            "dynamicQuant": 1,
+        },
     )
     config.model_config.hf_text_config.model_type = "deepseek_v4"
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
+    if dispatch_mode == "pull_v1" and factor == "0.015625":
+        rejected = False
     if rejected:
         with pytest.raises(RuntimeError, match="BATCH_SIZE_FACTOR"):
             fail_if_unsupported_npu_afd_features(config)

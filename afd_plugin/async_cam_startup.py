@@ -70,15 +70,19 @@ class AsyncCAMGraphStartup:
         self.plan = FFNGraphPlan()
         self.mode = "eager"
         self.warmup_layer_id: int | None = None
+        self.session_epoch = 0
         self._store: Store | None = None
         self._prefix = ""
+        self._pull_receiver_finished = False
         self.validate_attention_streams: Callable[[], None] | None = None
 
     def initialize(self, store: Store, transport_signature: str) -> None:
         self._store = store
         if self.world_rank == 0:
             store.set("ffn_graph/nonce", uuid.uuid4().hex)
-        self._prefix = f"ffn_graph/{store.get('ffn_graph/nonce').decode()}/"
+        nonce = store.get("ffn_graph/nonce").decode()
+        self.session_epoch = int(nonce[:15], 16) or 1
+        self._prefix = f"ffn_graph/{nonce}/"
         self._negotiate(
             self.plan if self.world_rank >= self.attn_size else None,
             transport_signature,
@@ -118,6 +122,23 @@ class AsyncCAMGraphStartup:
         self._publish(stage)
         self._wait(self._keys(stage, range(self.world_size)))
 
+    def pull_stop_requested(self) -> bool:
+        assert self._store is not None
+        self.check_failure()
+        return self._store.check(self._keys("pull_quiet", range(self.attn_size)))
+
+    def finish_pull_receiver(self) -> None:
+        if self._pull_receiver_finished:
+            return
+        # Every A must stop publishing before any F releases its peer windows.
+        self._wait(self._keys("pull_quiet", range(self.attn_size)))
+        self._publish("pull_stopped")
+        self._pull_receiver_finished = True
+
+    def close_pull_attention(self) -> None:
+        self._publish("pull_quiet")
+        self._wait(self._keys("pull_stopped", range(self.attn_size, self.world_size)))
+
     def _negotiate(self, plan: FFNGraphPlan | None, transport_signature: str) -> None:
         assert self._store is not None
         try:
@@ -141,12 +162,27 @@ class AsyncCAMGraphStartup:
             self.mode = resolve_ffn_mode(plans)
             ffn_plan = plans[0]
             two_stream = bool(ffn_plan.stream_signature)
-            validate_transport = self.mode == "full" or two_stream
+            validate_transport = (
+                self.mode == "full"
+                or two_stream
+                or any(entry["transport"].startswith("pull_v1:") for entry in entries)
+            )
             if (
                 validate_transport
                 and len({entry["transport"] for entry in entries}) != 1
             ):
                 raise ValueError("Async CAM graph transport signatures differ")
+            if transport_signature.startswith("pull_v1:"):
+                if any(
+                    p.executor_error or not p.signature or not p.layer_ids for p in plans
+                ):
+                    raise ValueError(
+                        "Pull requires a loaded W4A8 executor on every FFN rank"
+                    )
+                if len({(p.signature, p.layer_ids) for p in plans}) != 1:
+                    raise ValueError(
+                        "Pull FFN executor signatures or layer tables differ"
+                    )
             if two_stream:
                 if (
                     self.world_rank < self.attn_size

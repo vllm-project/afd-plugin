@@ -211,6 +211,33 @@ def test_graph_accepts_conservative_uint16_boundary():
     validate_graph_capacity(65536, 2, 65536)
 
 
+def test_pull_row_slicing_accepts_capacity_below_dispatch_envelope():
+    validate_graph_capacity(32, 2, 3, allow_row_slicing=True)
+    with pytest.raises(ValueError, match="smaller"):
+        validate_graph_capacity(32, 2, 3)
+    with pytest.raises(ValueError, match="uint16"):
+        validate_graph_capacity(65536, 1, 3, allow_row_slicing=True)
+
+
+def test_pull_requires_matching_transport_even_in_eager_mode():
+    owners = startup_world(1, 1)
+    errors = negotiate(owners, [None, FFNGraphPlan()], ["pull_v1:layout", "push"])
+    assert all("transport signatures" in str(error) for error in errors)
+
+
+@pytest.mark.parametrize(
+    "bad", [FFNGraphPlan(), full_plan(requested="eager", layer_ids=(3,))]
+)
+def test_pull_eager_validates_executor_and_layer_tables(bad):
+    owners = startup_world(1, 2)
+    errors = negotiate(
+        owners,
+        [None, full_plan(requested="eager"), bad],
+        ["pull_v1:layout"] * 3,
+    )
+    assert all("Pull" in str(error) for error in errors), errors
+
+
 @pytest.mark.parametrize("stage", ["validated", "warmup", "captured"])
 def test_phase_requires_all_ranks_and_failure_wins_over_ready(monkeypatch, stage):
     owners = startup_world()
@@ -238,6 +265,31 @@ def test_attention_waits_for_every_ffn_service(monkeypatch):
     last_ffn.fail(RuntimeError("receiver failed"))
     with pytest.raises(RuntimeError, match="receiver failed"):
         attention.wait_service_ready()
+
+
+def test_pull_close_waits_for_all_attention_and_drained_receivers(monkeypatch):
+    first_a, last_a, first_f, last_f = startup_world()
+    monkeypatch.setattr(startup_module, "GRAPH_STARTUP_TIMEOUT_SECONDS", 0)
+    with pytest.raises(TimeoutError):
+        first_a.close_pull_attention()
+    assert not first_f.pull_stop_requested()
+    with pytest.raises(TimeoutError):
+        first_f.finish_pull_receiver()
+    with pytest.raises(TimeoutError):
+        last_a.close_pull_attention()
+    assert first_f.pull_stop_requested()
+    first_f.finish_pull_receiver()
+    with pytest.raises(TimeoutError):
+        first_a.close_pull_attention()
+    last_f.finish_pull_receiver()
+    first_a.close_pull_attention()
+    last_a.close_pull_attention()
+    first_f._store.closed = True
+    first_f.finish_pull_receiver()
+    first_f._store.closed = False
+    last_f.fail(RuntimeError("drain failed"))
+    with pytest.raises(RuntimeError, match="drain failed"):
+        first_a.close_pull_attention()
 
 
 def test_initialize_owns_nonce_and_plan_negotiation():

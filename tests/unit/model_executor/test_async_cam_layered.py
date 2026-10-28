@@ -19,6 +19,9 @@ from afd_plugin.model_executor.npu.async_cam_layered import (  # noqa: E402
     AsyncCAMLayeredExecutor,
     LayeredFFNWeights,
 )
+from afd_plugin.model_executor.npu.async_cam_mega import (  # noqa: E402
+    AsyncCAMMegaExecutor,
+)
 
 
 def weights(layer_idx=0, per_channel=True, quantization="W4A8"):
@@ -56,6 +59,69 @@ def weights(layer_idx=0, per_channel=True, quantization="W4A8"):
         swiglu_limit=0.0,
         routed_scaling_factor=2.0,
     )
+
+
+def test_native_executor_reuses_weights_state_and_workspace(monkeypatch, operators):
+    layers = []
+    for layer in (5, 2):
+        layers.append(
+            LayeredFFNWeights(
+                layer,
+                torch.empty(2, 256, 64, dtype=torch.int32),
+                torch.empty(2, 256, 32, dtype=torch.int32),
+                torch.empty(2, 512, dtype=torch.int64),
+                torch.empty(2, 1, 256, dtype=torch.int64),
+                torch.empty(2, 512),
+                torch.empty(2, 256),
+                True,
+                0.0,
+                1.0,
+            )
+        )
+    weights_executor = AsyncCAMLayeredExecutor(layers)
+    calls = []
+
+    def execute(*args):
+        calls.append(args)
+        return torch.empty(1, dtype=torch.int64)
+
+    monkeypatch.setenv("BATCH_SIZE_FACTOR", str(16 / 262144))
+    monkeypatch.setattr(
+        torch.ops.afd_ascend,
+        "afd_mega_moe_pull_workspace_size",
+        lambda *args: 65536,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.afd_ascend, "afd_mega_moe_pull_native", execute, raising=False
+    )
+    connector = SimpleNamespace(
+        max_num_batched_tokens=8,
+        topk=2,
+        ffn_size=2,
+        attn_size=1,
+        world_rank=1,
+        topology=SimpleNamespace(world_size=3),
+        tp_size=1,
+        comm_args=torch.empty(512, dtype=torch.float16),
+        group_name="test-pull",
+    )
+    executor = AsyncCAMMegaExecutor(weights_executor, connector)
+    assert executor.layer_map.tolist() == [-1, -1, 0, -1, -1, 1]
+    for _ in range(2):
+        executor()
+    assert calls[0][1] is calls[1][1] is connector.comm_args
+    assert calls[0][3] is calls[1][3] is executor.scratch
+    assert calls[0][4] is weights_executor.w13
+    assert calls[0][10] == [8, 256, 256, 2, 2, 1, 2, 1, 3, 1, 16, 1, 1, 2]
+    assert executor.batch_info.numel() == 10
+    assert executor.group_list.data_ptr() == executor.scratch.data_ptr() + 512
+
+
+def test_native_rejects_grouped_scale_before_receiving(operators):
+    executor = AsyncCAMLayeredExecutor([weights(per_channel=False)])
+    with pytest.raises(ValueError, match="per-channel"):
+        AsyncCAMMegaExecutor(executor, None)
 
 
 @pytest.fixture
@@ -201,6 +267,236 @@ def test_repeated_interleaved_layer_ids(operators):
             torch.tensor([99, 0, idx, 3]),
         )
     assert [call[1][6].item() for call in operators[::2]] == [1, 0, 1, 1]
+
+
+def runner_method(name, namespace):
+    tree = ast.parse(
+        Path("afd_plugin/v1/worker/npu/async_ffn_model_runner.py").read_text()
+    )
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "AsyncNPUFFNModelRunner"
+    )
+    method = next(
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            method,
+        ],
+        type_ignores=[],
+    )
+    exec(
+        compile(ast.fix_missing_locations(module), "<runner-contract>", "exec"),
+        namespace,
+    )
+    return namespace[name]
+
+
+def test_runner_preserves_raw_context_and_chunk_capacity():
+    payloads = [
+        SimpleNamespace(
+            hidden_states=torch.empty(8, 32),
+            context=SimpleNamespace(
+                states=SimpleNamespace(
+                    dynamic_scales=torch.ones(8),
+                    group_list=torch.tensor([0, 0]),
+                    token_nums_rankid_layeridx=torch.tensor([99, 1, 5, 0]),
+                )
+            ),
+        )
+        for _ in range(2)
+    ]
+    received = iter(payloads)
+    sent = []
+    computed = []
+    connector = SimpleNamespace(
+        recv_attn_output=lambda: next(received),
+        send_ffn_output=lambda result, ctx: sent.append((result, ctx)),
+    )
+
+    def compute(*args):
+        computed.append(args)
+        return torch.empty(8, 32, dtype=torch.bfloat16)
+
+    runner = SimpleNamespace(
+        model=object(),
+        connector=connector,
+        _two_stream=None,
+        _mega_executor=None,
+        _layered_executor=compute,
+        layer_ids=(2, 5),
+    )
+    method = runner_method(
+        "_ffn_forward_connector_driven",
+        {
+            "cast": cast,
+            "CAMAsyncAFDConnector": SimpleNamespace,
+            "AFDAsyncTransferState": SimpleNamespace,
+        },
+    )
+    method(runner)
+    assert [ctx for _, ctx in sent] == [p.context for p in payloads]
+    for args, payload in zip(computed, payloads, strict=True):
+        assert args[0] is payload.hidden_states
+        assert args[3] is payload.context.states.token_nums_rankid_layeridx
+
+
+def test_runner_switch_off_does_not_touch_model_or_ops():
+    runner = SimpleNamespace(
+        model=object(),
+        _layered_gmm_requested=False,
+        connector=SimpleNamespace(extra_info=SimpleNamespace(ffn_mega_moe=False)),
+    )
+    method = runner_method(
+        "_initialize_layered_executor",
+        {"logger": SimpleNamespace(info=lambda *args: None)},
+    )
+    method(runner)
+
+
+@pytest.mark.parametrize(
+    ("role", "connector", "is_dsv4", "message"),
+    [
+        ("attention", "CAMAsyncAFDConnector", True, "FFN role"),
+        ("ffn", "CAMP2pAFDConnector", True, "async CAM"),
+        ("ffn", "CAMAsyncAFDConnector", False, "only DeepSeek V4"),
+    ],
+)
+def test_layered_switch_rejects_other_roles_connectors_and_models(
+    role, connector, is_dsv4, message
+):
+    source = Path("afd_plugin/compat/npu/feature_validation.py").read_text()
+    function = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "fail_if_unsupported_npu_afd_features"
+    )
+    namespace = {
+        "AFD_ASYNC_CONNECTOR": "CAMAsyncAFDConnector",
+        "async_cam_layered_gmm_enabled": lambda: True,
+        "_is_dsv4_target": lambda config: is_dsv4,
+    }
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            function,
+        ],
+        type_ignores=[],
+    )
+    exec(
+        compile(ast.fix_missing_locations(module), "<feature-validation>", "exec"),
+        namespace,
+    )
+    afd_config = SimpleNamespace(role=role, connector=connector)
+    with pytest.raises(RuntimeError, match=message):
+        cast(Callable[..., None], namespace["fail_if_unsupported_npu_afd_features"])(
+            SimpleNamespace(), afd_config=afd_config
+        )
+
+
+@pytest.mark.parametrize(
+    "eligible,draft_ids,layer_ids,error,enabled",
+    [
+        (False, None, (0,), None, False),
+        (True, None, (0,), None, True),
+        (True, None, (2,), "remote MoE layer IDs", False),
+        (True, (43, 44, 45), (0, 43, 44, 45), None, True),
+        (True, (43,), (0, 43, 44, 45), "remote MoE layer IDs", False),
+        (True, (), (0, 43, 44, 45), None, False),
+    ],
+)
+@pytest.mark.parametrize("quantization", ["W4A8", "W8A8"])
+def test_runner_requires_complete_layered_target_and_draft_coverage(
+    operators, eligible, draft_ids, layer_ids, error, enabled, quantization
+):
+    class Connector:
+        dynamic_quant = 1
+        layered_gmm_enabled = False
+
+    layer = weights(quantization=quantization)
+    runner = SimpleNamespace(
+        _layered_gmm_requested=True,
+        connector=Connector(),
+        afd_config=SimpleNamespace(compute_gate_on_attention=True),
+        model=SimpleNamespace(
+            get_async_cam_layered_weights=lambda: (
+                ([layer], "") if eligible else ([], "mixed quantization")
+            )
+        ),
+        draft_model=SimpleNamespace(
+            get_async_cam_layered_weights=lambda: (
+                [weights(idx, quantization=quantization) for idx in draft_ids],
+                "draft quantization is unsupported" if not draft_ids else "",
+            )
+        )
+        if draft_ids is not None
+        else None,
+        layer_ids=layer_ids,
+        _layered_executor=None,
+    )
+
+    method = runner_method(
+        "_initialize_layered_executor",
+        {
+            "CAMAsyncAFDConnector": Connector,
+            "AscendDeviceType": SimpleNamespace(A3="A3"),
+            "get_ascend_device_type": lambda: "A3",
+            "ensure_cam_async_ops_available": lambda: None,
+            "AsyncCAMLayeredExecutor": AsyncCAMLayeredExecutor,
+            "logger": SimpleNamespace(info=lambda *args: None),
+        },
+    )
+    if error:
+        with pytest.raises(ValueError, match=error):
+            method(runner)
+    else:
+        method(runner)
+    assert runner.connector.layered_gmm_enabled == enabled
+
+
+def test_layered_debug_logging_does_not_read_metadata(monkeypatch):
+    source = Path("afd_plugin/connectors/npu/async_cam.py").read_text()
+    function = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_log_cam_op_values"
+    )
+    messages = []
+    namespace = {
+        "os": os,
+        "Tensor": torch.Tensor,
+        "_CAM_OP_IO_LOG_ENV": "AFD_CAM_OP_IO_LOG",
+        "_CAM_LOG_SKIPPED_ARGS": frozenset(),
+        "logger": SimpleNamespace(warning=lambda *args: messages.append(args)),
+    }
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), "<cam-log>", "exec"),
+        namespace,
+    )
+    monkeypatch.setenv("AFD_CAM_OP_IO_LOG", "1")
+
+    def reject(*args, **kwargs):
+        raise AssertionError("metadata D2H")
+
+    monkeypatch.setattr(torch.Tensor, "cpu", reject)
+    namespace["_log_cam_op_values"](
+        "combine",
+        "inputs",
+        metadata_values=False,
+        token_nums_rankid_layeridx=torch.tensor([10, 1, 3]),
+    )
+    assert "first5" not in messages[0][-1]
+    assert "shape=(3,)" in messages[0][-1]
 
 
 def model_weights_method(monkeypatch):
