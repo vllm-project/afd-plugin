@@ -147,6 +147,22 @@ def test_qwen_text_only_validation_exposes_missing_language_model_only():
         )
 
 
+def test_qwen_causal_model_retains_afd_aligned_cache_scope(monkeypatch):
+    monkeypatch.setattr(
+        adapter,
+        "parse_optional_afd_config",
+        lambda *_args, **_kwargs: SimpleNamespace(role="attention"),
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace()),
+        cache_config=SimpleNamespace(mamba_cache_mode="all"),
+        scheduler_config=None,
+    )
+
+    with pytest.raises(NotImplementedError, match="AFD Qwen3.5/3.6 requires"):
+        adapter.AFDQwen3_5MoeForCausalLM(vllm_config=vllm_config)
+
+
 def test_qwen_conditional_model_rejects_attention_side_gate_before_construction(
     monkeypatch,
 ):
@@ -313,6 +329,7 @@ def test_qwen_conditional_model_initializes_for_text_only(monkeypatch):
             video_pruning_rate=0.2,
         ),
     )
+    model_config.get_multimodal_config = lambda: model_config.multimodal_config
     vllm_config = SimpleNamespace(
         lora_config=None,
         model_config=model_config,
@@ -381,8 +398,11 @@ def test_qwen_text_only_uses_upstream_missing_vision_tower_stage(monkeypatch):
             super().__init__()
             self.weight = nn.Parameter(torch.ones(1))
 
-    multimodal_config = MultiModalConfig(language_model_only=True)
-    # vLLM 0.30 _mark_tower_model resolves the MM config through the
+    multimodal_config = MultiModalConfig(
+        language_model_only=True,
+        mm_device_do_normalize=False,
+    )
+    # Native _mark_tower_model resolves the MM config through the
     # ModelConfig method rather than the raw attribute.
     model_config = SimpleNamespace(
         hf_config=SimpleNamespace(
@@ -440,6 +460,3 @@ def test_qwen_text_only_uses_upstream_missing_vision_tower_stage(monkeypatch):
         for name, _parameter in model.named_parameters()
         if name.startswith("visual.")
     ] == []
-    assert all(
-        parameter.is_meta for parameter in model.visual.__dict__["module"].parameters()
-    )

@@ -8,11 +8,10 @@ AFD connector implementations are grouped by backend:
   by `afd_plugin.connectors.npu.camp2p`, and `CAMAsyncAFDConnector` is implemented
   by `afd_plugin.connectors.npu.async_cam`.
 
-The vLLM 0.30 integration has GPU hardware evidence for
-`P2pNcclAFDConnector`. On vLLM-Ascend `8d4409d6`, NPU
-`CAMP2pAFDConnector` and `CAMAsyncAFDConnector` have representative V2-Lite
-and DSV4 Flash W4A8 functional and 300-question accuracy evidence; see the
-[runtime matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix).
+The GPU backend targets vLLM `0.32.0`; Ascend retains vLLM `0.30.0`
+and vLLM-Ascend `8d4409d6`. See the
+[runtime matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix)
+for tested configurations and backend-specific validation limits.
 
 Shared connector contracts, metadata containers, factory registration, and
 backend-neutral helpers stay in `afd_plugin.connectors`.

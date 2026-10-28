@@ -34,6 +34,14 @@ class _BatchDescriptor:
     num_ubatches: int = 1
 
 
+@dataclass(frozen=True)
+class _DPSyncState:
+    num_tokens_across_dp: list[int]
+    uniform_token_count: int | None
+    eager: bool
+    num_reqs: int
+
+
 class _GraphManager:
     def __init__(self, capture_tokens: int | None = None):
         self.capture_tokens = capture_tokens
@@ -322,6 +330,47 @@ def test_dp2_keeps_native_coordination_and_all_dispatch_arguments(patches):
         "uniform_decode": False,
     }
     assert manager.calls == [1]
+
+
+@pytest.mark.parametrize(
+    "eager, capture_tokens, expected_mode, expected_tokens",
+    [
+        (True, 16, _CUDAGraphMode.NONE, 8),
+        (False, None, _CUDAGraphMode.NONE, 8),
+        (False, 16, _CUDAGraphMode.FULL, 16),
+    ],
+)
+def test_dp2_reused_sync_preserves_eager_agreement_and_graph_padding(
+    patches, eager, capture_tokens, expected_mode, expected_tokens
+):
+    prior_sync = _DPSyncState([8, 8], 1, eager, 8)
+    manager = None if eager else _GraphManager(capture_tokens)
+
+    descriptor, sync = patches.dispatch_cg_and_sync_dp(
+        manager, 8, 8, 1, 2, 1, dp_sync_state=prior_sync
+    )
+
+    assert descriptor.cg_mode is expected_mode
+    assert descriptor.num_tokens == expected_tokens
+    assert sync.num_tokens_across_dp == [expected_tokens, expected_tokens]
+    assert sync.uniform_token_count == 1
+    assert sync.eager is eager
+    assert prior_sync.num_tokens_across_dp == [8, 8]
+
+
+@pytest.mark.parametrize(
+    "token_counts, uniform_token_count",
+    [([8, 7], 1), ([8, 8], 2)],
+)
+def test_dp2_reused_sync_rejects_a_different_batch(
+    patches, token_counts, uniform_token_count
+):
+    prior_sync = _DPSyncState(token_counts, uniform_token_count, False, 8)
+
+    with pytest.raises(AssertionError, match="different batch"):
+        patches.dispatch_cg_and_sync_dp(
+            _GraphManager(), 8, 8, 1, 2, 1, dp_sync_state=prior_sync
+        )
 
 
 @pytest.mark.parametrize(

@@ -44,12 +44,21 @@ class AFDDPMetadata:
             )
 
     @contextmanager
-    def sp_local_sizes(self, sequence_parallel_size: int) -> Generator[list[int]]:
-        local_sizes: list[int] = (
-            (
-                (self.num_tokens_across_dp_cpu + sequence_parallel_size - 1)
-                // sequence_parallel_size
+    def sp_local_sizes(
+        self,
+        sequence_parallel_size: int,
+        pcp_size: int = 1,
+        use_ep: bool = False,
+    ) -> Generator[list[int]]:
+        num_tokens = self.num_tokens_across_dp_cpu
+        if pcp_size > 1:
+            num_tokens = (
+                num_tokens.repeat_interleave(pcp_size)
+                if use_ep
+                else num_tokens * pcp_size
             )
+        local_sizes: list[int] = (
+            ((num_tokens + sequence_parallel_size - 1) // sequence_parallel_size)
             .repeat_interleave(sequence_parallel_size)
             .tolist()
         )

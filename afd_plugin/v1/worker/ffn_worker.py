@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import VllmConfig
-from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
 from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.worker_base import CompilationTimes
 
@@ -25,6 +24,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
     from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 logger = logging.getLogger(__name__)
 
@@ -58,27 +58,25 @@ class AFDFFNWorker(Worker):
         self._ffn_shutdown_event: threading.Event | None = None
         self._ffn_loop_error: BaseException | None = None
 
-    # Patch reason: vLLM 0.30.0 selects its V2 runner from a module-level
-    # symbol inside Worker.init_device and exposes no injectable runner factory.
-    # Patch functionality: replace only the V2 construction seam with the
-    # connector-driven GPUFFNModelRunner, the sole GPU FFN runtime.
-    # Signature: matches vLLM v0.30.0 Worker.init_device exactly: (self).
+    # Patch reason: native device initialization does not validate the AFD role
+    # or select its model architecture before allocating GPU resources.
+    # Patch functionality: validate and select the AFD model before delegating
+    # native device, distributed, workspace and runner initialization.
+    # Signature: matches vLLM v0.32.0 Worker.init_device exactly: (self).
     # Upstream source: vllm/v1/worker/gpu_worker.py, Worker.init_device;
-    # ced6857afa0ea7b2e3f0846a62e1394e90f15607. The 0.30.0 init_device still
-    # local-imports ``GPUModelRunner`` from vllm.v1.worker.gpu.model_runner and
-    # constructs it there, so the module-attribute substitution stays effective.
-    # Delegation exception: native device and distributed setup remain in
-    # super().init_device(). Remove this branch when vLLM exposes runner injection.
-    # Worker initialization is synchronous within each worker process.
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # Delegation exception: the large native device/distributed setup remains
+    # in super().init_device(); this override contains only AFD preflight.
+    # Removal plan: remove when native worker startup supports AFD preflight.
     def init_device(self):
-        """Initialize the native GPU worker and swap in the FFN runner."""
+        """Initialize the native GPU worker with the connector-driven runner."""
 
+        # ### PATCH START: validate and select the AFD model.
         assert_compatible_afd_stack(
             self.vllm_config,
             caller="AFDFFNWorker.init_device",
             expected_role="ffn",
         )
-        # ### PATCH START: construct the FFN runner through the V2 seam.
         validate_gpu_model_runner_v2_config(
             self.vllm_config,
             expected_role="ffn",
@@ -90,14 +88,16 @@ class AFDFFNWorker(Worker):
         )
         self.vllm_config.model_config = afd_model_config
         self.model_config = afd_model_config
-        native_runner_cls = gpu_model_runner_v2.GPUModelRunner
-        gpu_model_runner_v2.GPUModelRunner = GPUFFNModelRunner
-        try:
-            super().init_device()
-        finally:
-            gpu_model_runner_v2.GPUModelRunner = native_runner_cls
-        # ### PATCH END: construct the FFN runner through the V2 seam.
+        # ### PATCH END: validate and select the AFD model.
+
+        super().init_device()
         torch.accelerator.empty_cache()
+
+    # The native factory still annotates V1 and uses a local return-type
+    # exception for V2. The connector-driven FFN runner shares that boundary.
+    def _make_model_runner(self) -> GPUModelRunner:
+        """Construct the connector-driven runner via the native factory hook."""
+        return GPUFFNModelRunner(self.vllm_config, self.device)  # type: ignore[return-value]
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """FFN workers do not allocate KV cache."""

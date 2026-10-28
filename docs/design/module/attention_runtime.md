@@ -30,10 +30,12 @@ validation_paths:
   - "tests/unit/model_executor/test_async_cam_dbo.py"
   - "tests/npu/test_mrv2_dbo.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_gpu.py"
   - "tests/e2e/accuracy/**"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
 upstream_refs:
-  - "vLLM 0.30.0 ced6857afa0ea7b2e3f0846a62e1394e90f15607"
+  - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "NPU: vLLM 0.30.0 ced6857afa0ea7b2e3f0846a62e1394e90f15607"
   - "vLLM vllm.v1.worker.gpu_worker.Worker"
   - "vLLM vllm.v1.worker.gpu.model_runner.GPUModelRunner"
   - "vLLM-Ascend vllm_ascend.worker.worker.NPUWorker (tested environment evidence only)"
@@ -128,9 +130,9 @@ execution, sleep/wake, and normal output handling. The model runner owns its
 connector, AFD profiler, pending request metadata, and graph/ubatch
 coordination state. It closes the connector and profiler during shutdown.
 
-CUDA scopes a native runner-class substitution around `Worker.init_device()`
-and requires the upstream `use_v2_model_runner` setting to construct
-`AFDAttentionModelRunnerV2`; there is no GPU V1 fallback. NPU applies the
+CUDA overrides the native `Worker._make_model_runner()` factory to construct
+`AFDAttentionModelRunnerV2` and requires the upstream `use_v2_model_runner`
+setting; there is no GPU V1 fallback. NPU applies the
 AFD-scoped vLLM-Ascend patches, fixes the all-to-all backend when required, initializes
 the vLLM workspace manager, and directly constructs the NPU V2 runner. Their exact inheritance and device mechanisms are specified in
 [execution platforms](execution_platforms.md).
@@ -167,13 +169,10 @@ Both platforms require V2. The paired deployment constraints are:
 
 Both roles validate the paired V2 topology, but only Attention uses the native
 V2 model runner. FFN remains connector-driven and uses its existing AFD runner
-surface. CUDA V2 has DP2/TP2 eager and graph E2E evidence. Qwen3.5/3.6 GDN
-DBO is unsupported; native hybrid/multimodal DBO validation applies. Qwen3 MoE
-DBO remains supported.
-The GPU DP1 path has H20 DeepSeek-V2-Lite DP1/TP2 Graph + DBO validation:
-128 GSM8K samples and live two-stage/full-replay assertions.
-Ascend V2 has V2-Lite 2A1F eager/graph functional checks and a 2A2F FULL 300-question run;
-see the [NPU validation record](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923).
+surface. Qwen3.5/3.6 GDN DBO is unsupported; native hybrid/multimodal
+DBO validation applies. Qwen3 MoE DBO remains supported. See the
+[runtime matrix](execution_platforms.md#tested-runtime-matrix) for tested
+configurations and known shutdown limitations.
 The generic V2 E2E harness remains CUDA-only.
 
 For Ascend V2 Async CAM, the supported contract and launch settings are in the

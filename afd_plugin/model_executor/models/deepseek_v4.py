@@ -129,8 +129,8 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
     # for AFD DP>1 layouts, which the synchronous AFD boundary does not
     # support).
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.30.0, vllm/models/deepseek_v4/nvidia/model.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/models/deepseek_v4/nvidia/model.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def __init__(
         self,
         vllm_config,
@@ -261,11 +261,11 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
     # Patch reason: native forward directly invokes its locally allocated FFN.
     # Patch functionality: preserve native mHC state locally while the proxy
     # transfers only the two-dimensional FFN activation and input IDs. The
-    # v0.30.0 native sequence-parallel gather/scatter branches around the
+    # v0.32.0 native sequence-parallel gather/scatter branches around the
     # attention call are omitted because AFD pins use_sequence_parallel off.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.30.0, vllm/models/deepseek_v4/nvidia/model.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/models/deepseek_v4/nvidia/model.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def forward(
         self,
         x: torch.Tensor,
@@ -274,6 +274,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         post_mix: torch.Tensor | None = None,
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
+        mega_gate_metadata: native.MegaGateRoutingMetadata | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # ### PATCH START: prohibit accidental execution on the FFN worker.
         if isinstance(self.attn, native.PPMissingLayer):
@@ -356,6 +357,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         )
 
         # ### PATCH START: this call enters the synchronous remote FFN proxy.
+        # MegaMoE is excluded, so only activations and token IDs cross the wire.
         x = self.ffn(x, input_ids)
         # ### PATCH END
         return x, residual, post_mix, res_mix
@@ -383,8 +385,8 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
     # for AFD DP>1 layouts, which the synchronous AFD boundary does not
     # support).
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.30.0, vllm/models/deepseek_v4/nvidia/model.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/models/deepseek_v4/nvidia/model.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # ### PATCH START: validate the deliberately narrow first release.
         nn.Module.__init__(self)
@@ -412,12 +414,12 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
-        self.parallel_config = parallel_config
-        self.use_mega_moe = (
-            vllm_config.kernel_config.moe_backend in native.MEGA_MOE_BACKENDS
+        self.parallel_config = vllm_config.parallel_config
+        self.use_native_mega_moe = (
+            vllm_config.kernel_config.moe_backend in native.NATIVE_MEGA_MOE_BACKENDS
         )
         # ### PATCH START: MegaMoE has unproven role-local finalization semantics.
-        if self.use_mega_moe:
+        if vllm_config.kernel_config.moe_backend in native.MEGA_MOE_BACKENDS:
             raise RuntimeError("AFD DeepSeek-V4 does not support MegaMoE")
         # Native derives SP from the EP/TP/DP layout; AFD splits roles across
         # dedicated workers and requires full-token boundary payloads.
@@ -466,6 +468,9 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
             prefix=f"{prefix}.layers",
         )
         # ### PATCH END
+        self.has_local_hash_moe = self.start_layer < min(
+            self.end_layer, config.num_hash_layers
+        )
 
         if native.get_pp_group().is_last_rank:
             self.norm = native.RMSNorm(config.hidden_size, self.rms_norm_eps)

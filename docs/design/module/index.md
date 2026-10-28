@@ -17,7 +17,7 @@ validation_paths:
   - "tests/unit/**"
   - "tests/e2e/**"
 upstream_refs:
-  - "vLLM 0.30.0"
+  - "GPU vLLM 0.32.0; NPU vLLM 0.30.0"
   - "vLLM-Ascend target 8d4409d6256d8a6729140ddcc0d1889e3f96cdd6; representative NPU validation in PR #425"
 verified_platform_refs:
   - "CUDA: tests/e2e marked e2e with AFD_E2E_BACKEND=gpu; no canonical image is recorded"

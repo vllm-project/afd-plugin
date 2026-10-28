@@ -37,7 +37,8 @@ validation_paths:
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
 upstream_refs:
-  - "vLLM 0.30.0 ced6857afa0ea7b2e3f0846a62e1394e90f15607"
+  - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "NPU: vLLM 0.30.0 ced6857afa0ea7b2e3f0846a62e1394e90f15607"
   - "vLLM vllm.v1.worker.gpu_worker.Worker"
   - "vLLM vllm.v1.worker.gpu.model_runner.GPUModelRunner construction seam"
   - "vLLM vllm.v1.engine.core.EngineCore"
@@ -143,9 +144,8 @@ connector owns transport/process-group resources.
 CUDA and Ascend require ModelRunnerV2 on both roles. FFN remains connector-driven and
 does not adopt native V2 request state or scheduler-driven execution:
 
-- CUDA temporarily substitutes `GPUFFNModelRunner` at the native V2
-  construction seam inside `Worker.init_device()`; the existing AFD runner is
-  still the runtime object.
+- CUDA overrides `Worker._make_model_runner()` to construct the
+  connector-driven `GPUFFNModelRunner`.
 - Ascend constructs `AFDNPUFFNModelRunner` for CAMP2P or
   `AsyncNPUFFNModelRunner` for Async CAM. Both use the native MRV2
   forward-context shape and install Ascend state in `additional_kwargs`.
@@ -155,8 +155,9 @@ does not adopt native V2 request state or scheduler-driven execution:
 The V2 pair requires PP/PCP/DCP size 1, configured role ranks equal to DP x TP,
 static EP, and a registered AFD model. CUDA uses `P2pNcclAFDConnector` with
 model-specific gate placement and supports two native microbatches with
-Attention DP1 or DP > 1. H20 validation covers DeepSeek-V2-Lite DP1/TP2
-Graph + DBO with 128 GSM8K samples and live two-stage/full-replay assertions.
+Attention DP1 or DP > 1. See the
+[runtime matrix](execution_platforms.md#tested-runtime-matrix) for tested
+configurations and known DeepSeek-V2-Lite DBO shutdown failures.
 Ascend supports synchronous CAMP2P with FFN-side gating, or eager Async CAM
 with Attention-side gating. CAMP2P supports eager and graph DBO with
 Attention DP > 1 and matching two-stage FFN control metadata. Async CAM

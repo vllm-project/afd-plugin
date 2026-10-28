@@ -165,6 +165,14 @@ MRV2_BACKENDS = {
 }
 
 
+def test_gpu_validator_accepts_target_config_without_removed_enable_sp(mrv2_config):
+    del mrv2_config.compilation_config.pass_config
+
+    validate_gpu_model_runner_v2_config(
+        mrv2_config, expected_role="attention", device_type="cuda"
+    )
+
+
 def _symmetric_ranks(dp_size, tp_size):
     return {
         "parallel_config.data_parallel_size": dp_size,
