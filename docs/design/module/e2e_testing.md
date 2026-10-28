@@ -123,9 +123,8 @@ and the 0.27 accuracy threshold. The backend-neutral 2A2F IDs remain available
 for NPU. The GPU module collects 13 cases, including 1A1F and 2A1F coverage
 and the local-only `afd-v2-graph-dbo-tp2`; the NPU module collects seven.
 Across the three GPU model suites, there are 20 cases: DeepSeek 13, Qwen3
-MoE four, and Qwen3.6 MoE three. The earlier suite fell from 23 to 19 after
-three duplicate DeepSeek cases were replaced and Qwen3.6 GDN DBO coverage
-was withdrawn; the local-only TP2 Graph + DBO scenario adds one.
+MoE four, and Qwen3.6 MoE three. The local-only TP2 Graph + DBO case is
+outside the seven-case ready/merge CI gate.
 
 GPU cases gate accuracy, service liveness and cleanup. AFD GPU graph/DBO
 cases additionally use a test-only worker extension to collect bounded per-rank
@@ -180,15 +179,12 @@ the [profile limits](../../../tests/e2e/README.md#dsv4-flash-sync-camp2p-concurr
 The async case retains its exact-answer check.
 
 CUDA DSV4 Flash has a separate suite in
-`tests/e2e/models/deepseek_v4_flash/test_gpu.py`. On vLLM 0.32 H20, the AFD
-2A2F eager and Graph DBO cases passed within the scope in the
-[runtime matrix](execution_platforms.md#tested-runtime-matrix). Its four basic
-cells pair native MRV2
+`tests/e2e/models/deepseek_v4_flash/test_gpu.py`. Its four basic cells pair
+native MRV2
 eager/graph (DP2/TP1/EP2) with synchronous AFD eager/graph (2A2F, DP2/TP1 per
 role), using at most four devices. Four independent DBO cells pair the same
-native and AFD eager/graph modes. Native rejection is not bypassed; native DBO
-was excluded from this upgrade's H20 qualification after upstream rejected its
-backend configuration. The native
+native and AFD eager/graph modes. Native DBO requires a compatible upstream
+communication backend; the harness preserves configuration rejection. The native
 probe observes request-time microbatch slices and counts only successful
 parent execution with real tokens in both children; AFD probes observe both
 roles. Graph+DBO requires consecutive matching-layout replays.

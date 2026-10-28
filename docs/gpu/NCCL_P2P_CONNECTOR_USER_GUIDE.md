@@ -130,14 +130,9 @@ the native V2 runner; FFN remains connector-driven. GPU V1 is unavailable.
 export VLLM_USE_V2_MODEL_RUNNER=1
 ```
 
-The minimal DP1/TP1 commands below illustrate the launch shape; they are
-not an exact target-runtime test. On vLLM 0.32, H20 E2E runs exercised
-DeepSeek-V2-Lite DP2/TP1 Graph + DBO and DeepSeek-V4 DP2/TP1 eager and
-Graph + DBO; see the [runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix)
-for scope. Historical vLLM 0.30 H20 validation in
-[PR #454](https://github.com/vllm-project/afd-plugin/pull/454) covered
-DeepSeek-V2-Lite DP1/TP2 Graph + DBO with 128 GSM8K samples and live
-two-stage/full-replay assertions.
+The commands below illustrate a DP1/TP1 launch. See the
+[runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix)
+for tested configurations and known shutdown limitations.
 
 Attention side:
 
@@ -187,11 +182,9 @@ Eager and `FULL_DECODE_ONLY` graph execution are accepted. V2 DBO requires
 exactly two microbatches and accepts Attention DP1 or DP > 1. The generic
 [GPU E2E runner](../../tests/e2e/runner.py) defines eager/graph DP2 and TP2
 scenarios, including `afd-v2-eager-dbo-dp2` and
-`afd-v2-graph-dbo-dp2`. In vLLM 0.32 H20 tests, DeepSeek-V2-Lite TP2
-Graph + DBO and DP2 eager + DBO passed inference and their oracles, but
-graceful shutdown failed and processes required force killing; the shutdown
-symptom was also reproduced on vLLM 0.30. These results do not qualify the
-checked-in recipe itself. Model-specific exclusions still apply; a
+`afd-v2-graph-dbo-dp2`. See the
+[runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix)
+for the tested scope and known DeepSeek-V2-Lite shutdown failures. A
 registered model does not qualify every topology.
 
 ## Receive buffers and memory
@@ -220,5 +213,5 @@ alone does not authorize replay. These behaviors are covered by the
 - Current GPU CUDA graph support is `FULL_DECODE_ONLY`; GPU DBO plus CUDA graph is limited to exactly two ubatches.
 - CUDA remote experts do not currently support EPLB on the Attention role.
 - To enable DBO, set `--enable-dbo`, and configure the threshold with `--dbo-decode-token-threshold` and `--dbo-prefill-token-threshold`. See `recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite` for examples.
-- Historical documentation reported cross-node DeepSeek-V2-Lite `2A2F` with the FFN ranks on separate hosts over TCP (ENA) and EFA. These placements and transports were not revalidated during the vLLM 0.32 upgrade. Some checked-in recipes were only statically inspected for the target runtime; see the recipe documentation for their scope.
+- Cross-node DeepSeek-V2-Lite `2A2F` over TCP (ENA) and EFA has historical evidence only; see the recipe documentation for current validation scope.
 - There is no automatic fallback from this connector to another transport. Select an NPU connector explicitly on Ascend.

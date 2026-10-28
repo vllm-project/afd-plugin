@@ -46,7 +46,7 @@ upstream_refs:
   - "vLLM-Ascend ACL graph, forward-context, and model-runner V1/V2 APIs in the tested environment"
   - "PyTorch CUDA, torch_npu, CMake, and Ascend CANN build interfaces used by the repository"
 verified_platform_refs:
-  - "CUDA eager, graph, DBO, and ModelRunnerV2 E2E paths; no canonical CUDA image is recorded"
+  - "CUDA eager, graph, DBO, and ModelRunnerV2 E2E paths; see runtime matrix for tested scope"
   - "Ascend E2E environment recorded in the installation and NPU guides"
 related_issues:
   - "#86"
@@ -185,10 +185,8 @@ as well as DP > 1. AFD accepts exactly two native ubatches.
 Qwen3.5/3.6 GDN DBO is unsupported; native hybrid/multimodal DBO validation
 applies. Qwen3 MoE DBO remains supported. Earlier Qwen GDN Graph + DBO and
 six-cell recurrent-state/CUDA Graph parity results describe the removed adapter
-and are historical evidence only. Earlier vLLM 0.30 H20 validation of the
-DP1 path covered DeepSeek-V2-Lite DP1/TP2 Graph + DBO with 128 GSM8K samples
-and live two-stage/full-replay assertions. On vLLM 0.32 inference passed, but
-graceful shutdown failed; see the [runtime matrix](#tested-runtime-matrix).
+and are historical evidence only. See the [runtime matrix](#tested-runtime-matrix)
+for tested configurations and known DeepSeek-V2-Lite DBO shutdown failures.
 
 ### CUDA profiling
 
@@ -367,7 +365,7 @@ does not expand the supported runtime contract.
 | Platform/path | Execution | Ubatching | Routing/quantization limits | Evidence |
 | --- | --- | --- | --- | --- |
 | Historical CUDA V1 (removed) + `P2pNcclAFDConnector` | Eager or `FULL_DECODE_ONLY` CUDA Graph | Native DBO, exactly two ubatches | Registered CUDA model boundaries; Attention-side or FFN-side gate where the model supports it | DeepSeek-V2-Lite eager/graph/DBO accuracy E2E; model, graph, connector, and profiler unit tests |
-| CUDA V2 + `P2pNcclAFDConnector` | Eager or `FULL_DECODE_ONLY` native V2 CUDA Graph | Exactly two native microbatches; Attention DP1 or DP > 1 | Model-specific gate placement; PP/CP, elastic EP, EPLB, SP MoE, and compile SP rejected; role ranks equal DP x TP | Historical vLLM 0.30 H20 evidence: DeepSeek-V2-Lite eager/graph DP2 and TP2 E2E, live two-stage execution, representative 300-question comparisons, and TP2 Graph + DBO with 128 samples. Numerical equivalence is not established. vLLM 0.32 H20 V4 Flash AFD 2A2F eager/Graph DBO and first-300 comparison evidence is detailed below; V2 TP2 Graph + DBO has a shutdown failure. Qwen3.5/3.6 GDN DBO is unsupported. |
+| CUDA V2 + `P2pNcclAFDConnector` | Eager or `FULL_DECODE_ONLY` native V2 CUDA Graph | Exactly two native microbatches; Attention DP1 or DP > 1 | Model-specific gate placement; PP/CP, elastic EP, EPLB, SP MoE, and compile SP rejected; role ranks equal DP x TP | Source-specific GPU validation is linked below; coverage is limited to the recorded model/topology combinations. DeepSeek-V2-Lite has known DBO shutdown failures. Qwen3.5/3.6 GDN DBO is unsupported. |
 | Historical Ascend V1 (removed) + `CAMP2pAFDConnector` | Eager or current ACL Graph path | Native DBO, exactly two ubatches | Common and connector-local `compute_gate_on_attention=false`; `connector_extra_config.quant_mode=0`; plugin CANN ops required | V2-Lite 2A2F graph 300-question comparison, 2A1F/2A2F functional checks, and Legacy DBO regressions; runtime, graph, ops, connector, and profiler unit tests |
 | Ascend V2 + `CAMP2pAFDConnector` | Eager, `FULL`, or `FULL_DECODE_ONLY` native V2 ACL Graph | Eager or graph native DBO with two ubatches and Attention DP > 1; plain MLA graph DBO requires `FULL_DECODE_ONLY` | `compute_gate_on_attention=false`; PP/CP, elastic EP and EPLB rejected; model-specific SP policy; role ranks equal DP x TP | V2-Lite 2A2F FULL 300-question comparison and 2A1F eager/FULL_DECODE_ONLY/FULL functional checks; focused runner, context, validation, and device-contract unit tests |
 | Ascend V2 + `CAMAsyncAFDConnector` | Eager Attention; independent FFN eager or narrow W4A8 FULL | Two native DBO microbatches on Attention, including DP1 and with FFN FULL; FFN stays outside the native DBO schedule; legacy split selector is ignored | Experimental async path; `async=true`; documented path uses common `compute_gate_on_attention=true`; prefill and decode context parallelism are unsupported; `connector_extra_config.dynamicQuant` is 0 or 1; plugin-owned async CAM ops required | Earlier V2-Lite and DSV4 layered comparisons retain their original scope; recorded eager/FULL fixture results use DBO-off; see the [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md) |
@@ -386,50 +384,27 @@ its local token rows. Attention TP/SP and routed-expert parallelism are unchange
 Without model SP, the user's shared-expert DP setting is preserved. MRV2's
 existing rejection of explicit shared-expert DP configuration is unchanged.
 
-The current GPU target is vLLM `0.32.0` (`5df63a72`); Ascend remains on
-vLLM `0.30.0` (`ced6857a`) and vLLM-Ascend `8d4409d6`. GPU results
-recorded before the upgrade are vLLM 0.30 evidence, not 0.32 qualification.
-On vLLM 0.32 H20, DeepSeek-V2-Lite TP2 Graph + DBO inference passed a
-24-sample check, but graceful shutdown failed and remains under investigation.
-A DeepSeek-V2-Lite DP2 eager DBO check also passed inference but failed
-graceful shutdown.
+The GPU target is vLLM `0.32.0` (`5df63a72`); Ascend remains on
+vLLM `0.30.0` (`ced6857a`) and vLLM-Ascend `8d4409d6`. Source-specific
+H20 model, topology, execution-mode and accuracy results are recorded in
+the [GPU upgrade validation matrix](https://github.com/vllm-project/afd-plugin/pull/501)
+and [runtime-fix validation matrix](https://github.com/vllm-project/afd-plugin/pull/502).
+Those records identify the exact tested revisions. Earlier GPU results on
+vLLM 0.30 do not establish vLLM 0.32 hardware qualification.
 
-Earlier H20 runs in this upgrade used AFD revisions `1c1daa0` and `808a432`.
-Their representative GSM8K results use the same first 300 questions per model:
+Validation limits:
 
-| Model | Native Graph | AFD result |
-| --- | --- | --- |
-| DeepSeek-V2-Lite | 114/300 | DP2 eager 111/300; DP2 Graph DBO 107/300 |
-| Qwen3 MoE | 284/300 | Graph DBO 278/300 |
-| Qwen3.6 MoE | 146/300 | Graph 157/300 |
+- GPU accuracy evidence covers selected first-300 GSM8K comparisons, not
+  full-dataset accuracy, numerical equivalence, or performance improvement.
+- DeepSeek-V2-Lite TP2 Graph + DBO and DP2 eager DBO can require force
+  killing during shutdown. Inference success does not imply graceful exit.
+- Native V4 DBO requires a compatible upstream communication backend. The
+  recorded native V4 accuracy reference uses Graph without DBO.
+- Shared NPU compatibility changes have CPU contract coverage but no NPU
+  hardware validation from this GPU upgrade. Historical NPU results do not
+  validate those shared changes.
 
-Some runs used a private test-runner overlay issuing up to 12 concurrent
-requests. These are sample comparisons, not numerical equivalence or full
-GSM8K accuracy. Changes after `808a432` were V4-scoped; these other models
-were not rerun on revision `972d8842`.
-
-On H20-3e, AFD revision `972d8842` with vLLM `5df63a72`, PyTorch
-`2.13.0+cu130`, CUDA 13.0 and driver `580.105.08`, DeepSeek-V4 Flash
-`P2pNcclAFDConnector` 2A2F DP2/TP1 eager and `FULL_DECODE_ONLY` Graph DBO
-cases each passed with 23/24 GSM8K strict matches (job 3288). Both exercised
-live two-stage execution and matching, refreshed Hash inputs on Attention and
-FFN; Graph replay checks ran in the Graph case. A first-300 GSM8K comparison
-scored 289/300 for AFD Graph DBO (job 3290) and 288/300 for native Graph
-without DBO (job 3196). Job 3291 verified matching question and target hashes:
-286 were correct in both, 2 only in native, 3 only in AFD, and 9 in neither.
-These results do not establish full 1319-question accuracy or numerical
-output equivalence. Native V4 DBO was excluded from this upgrade's required
-scope after the available upstream backend rejected its configuration. The
-native control's workload and graceful shutdown passed, but its raw cleanup
-verdict failed on an unrelated host-health signal; its resources were later
-verified clear and released. The AFD jobs' cleanup and scheduler release
-passed. Jobs 3288 and 3290 ran the original, uninstrumented test paths;
-their raw controller metadata retains `diagnostic_only=true`.
-
-Shared NPU compatibility changes have CPU contract coverage, but have not
-been tested on NPU hardware in this upgrade branch; the historical results
-below do not validate its changed shared code. The
-[NPU validation record](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923)
+The [NPU validation record](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923)
 covers five representative configurations with the same first 300 GSM8K
 questions: V2-Lite MRV1 graph, MRV2 FULL, ordinary Async CAM, and DSV4 Flash
 W4A8 layered off/on. The [Legacy DBO repair](https://github.com/vllm-project/afd-plugin/pull/430#issuecomment-6063840311)

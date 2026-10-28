@@ -13,28 +13,14 @@ baseline and AFD eager, graph, and graph+DBO on 2A1F. Qwen3.6 MoE retains
 three: baseline and AFD eager and graph on 2A1F. GDN DBO is unsupported.
 
 The DeepSeek-V2-Lite, Qwen3 MoE, and Qwen3.6 MoE GPU model suites collect
-20 cases. The earlier suite fell from 23 to 19 after GPU V1 retirement: three
-duplicate DeepSeek cases were replaced, and Qwen3.6 GDN graph+DBO support was
-withdrawn. The local-only `afd-v2-graph-dbo-tp2` adds one case; it is not
-part of the seven-case ready/merge CI gate. The separate DSV4 Flash CUDA
-suite is described below. The three duplicate cases have retained counterparts
-with the same 2A2F DP2/TP1 topology and execution mode:
-
-| Removed GPU case | Retained GPU case |
-| --- | --- |
-| `afd-eager-2a2f` | `afd-v2-eager-dp2` |
-| `afd-graph-2a2f` | `afd-v2-graph-dp2` |
-| `afd-graph-dbo-2a2f` | `afd-v2-graph-dbo-dp2` |
+20 cases. The seven-case ready/merge CI gate excludes local-only cases such
+as `afd-v2-graph-dbo-tp2`. The separate DSV4 Flash CUDA suite is described
+below.
 
 The current suite has 13 DeepSeek cases, four Qwen3 MoE cases, and three
 Qwen3.6 MoE cases.
-DeepSeek and Qwen3 MoE scenario coverage remains; Qwen3.6 retains ordinary
-eager/graph coverage but loses its GDN DBO case. The current suite therefore
-does not preserve all historical functional coverage. Workloads are not
-identical: the retained DP2 eager/DBO comparison already uses 128 samples
-instead of the removed eager case's
-seven or graph+DBO case's 24-sample minimum. Ready/merge CI keeps the baseline
-and six V2 cases; weekly CI includes Qwen3 MoE graph+DBO, but no Qwen3.6 DBO case.
+Qwen3.6 GDN DBO is unsupported. Workload and threshold settings are
+scenario-specific; see the scenario sections below.
 
 Ordinary cases evaluate the first 7 GSM8K samples; DBO cases have a
 24-sample minimum and 12 concurrent requests. The GPU DP2 eager/eager-DBO/
@@ -208,11 +194,9 @@ and graph mode change; the graph row uses `FULL_DECODE_ONLY` with capture size 8
 (with a shared minimum of 24 for diagnostics).
 
 The GPU validator accepts exactly two microbatches at Attention DP1 or
-DP > 1; FFN remains connector-driven. Earlier vLLM 0.30 H20 validation of
-the DP1 path covered DeepSeek-V2-Lite DP1/TP2 Graph + DBO with 128 GSM8K
-samples, recorded in [PR #454](https://github.com/vllm-project/afd-plugin/pull/454).
-On vLLM 0.32 inference passed, but graceful shutdown failed; see the
-[runtime matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix).
+DP > 1; FFN remains connector-driven. See the
+[runtime matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix)
+for tested configurations and known DeepSeek-V2-Lite shutdown failures.
 NPU retains the separate eager DBO and graph
 constraints documented in the [execution-platform matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix).
 The GPU harness collects bounded per-rank summaries of actual two-stage and
@@ -254,11 +238,10 @@ samples, with the existing 24-sample floor for DBO.
 ## DSV4 Flash CUDA qualification
 
 `models/deepseek_v4_flash/test_gpu.py` provides separate CUDA qualification
-profiles for the synchronous `P2pNcclAFDConnector`. The vLLM 0.32 H20 AFD
-2A2F eager and Graph DBO runs are recorded in the
-[runtime matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix);
-other profiles require their own hardware evidence. They do not reuse Ascend
-W4A8, HCCL, or the NPU launch shapes.
+profiles for the synchronous `P2pNcclAFDConnector`. They use CUDA launch
+shapes independently of the Ascend W4A8 and HCCL profiles. See the
+[runtime matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix)
+for source-specific hardware validation.
 
 The basic test has four cases:
 
@@ -314,12 +297,10 @@ sequences, chunked prefill, and `kv-cache-dtype=fp8`. It leaves weight
 quantization and the device-aware MoE kernel selection to the checkpoint and
 target vLLM. AFD keeps gating on FFN and does not enable MegaMoE. Provision the
 large Flash checkpoint explicitly with `AFD_GPU_E2E_MODEL`; there is no implicit
-model download. Model fit and kernel workspace were exercised for the recorded
-H20 2A2F profile; other configurations require their own validation.
+model download. See the runtime matrix for tested configurations.
 
-Native DBO was excluded from the vLLM 0.32 H20 upgrade qualification after the
-configured upstream backend rejected it. The all-DBO and full-module commands
-below include native DBO cases and require a compatible backend.
+The all-DBO and full-module commands below include native DBO cases,
+which require a compatible upstream communication backend.
 
 Within a four-GPU scheduler allocation, use only its assigned device IDs and
 run cases sequentially:
@@ -336,7 +317,7 @@ python -m pytest -q -s \
 python -m pytest -q -s \
   tests/e2e/models/deepseek_v4_flash/test_gpu.py::test_deepseek_v4_flash_gpu_dbo
 
-# Final accuracy: all 1319 questions, rather than the default 7/24-sample smoke.
+# Optional full-dataset evaluation instead of the default 7/24-sample smoke.
 AFD_GSM8K_LIMIT=all python -m pytest -q -s \
   tests/e2e/models/deepseek_v4_flash/test_gpu.py
 ```

@@ -1,9 +1,10 @@
 # DeepSeek-V2-Lite AFD Examples
 
 End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
-(Attention-FFN Disaggregation) plugin targeting vLLM `v0.32.0`. These scripts have been inspected but
-have not been run as recipes on v0.32; historical v0.30 E2E results do not
-qualify them on the new runtime.
+(Attention-FFN Disaggregation) plugin targeting vLLM `v0.32.0`. These are
+deployment examples, not v0.32 recipe validation. See the
+[runtime matrix](../../../../docs/design/module/execution_platforms.md#tested-runtime-matrix)
+for tested E2E configurations.
 
 > [!NOTE]
 > `P2pNcclAFDConnector` is an example connector implementation. Contributions
@@ -15,8 +16,7 @@ qualify them on the new runtime.
 - Install [NIXL](https://github.com/ai-dynamo/nixl).
 - Four GPUs for the `2a2f_*` and `2p1a1f_*` examples; the `4a4f_*`
   examples require eight GPUs. The multipod example uses two GPUs per pod
-  across two pods. Previous recipe documentation reported L20X testing;
-  that is not vLLM 0.32 recipe validation.
+  across two pods.
 - vLLM `v0.32.0` and the `afd-plugin` package installed in the same
   environment (see repository root `AGENTS.md`).
 - DeepSeek-V2-Lite weights on disk. Colocation scripts default to
