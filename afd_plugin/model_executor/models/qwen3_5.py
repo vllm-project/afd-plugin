@@ -111,7 +111,10 @@ class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
         if parallel_config.use_sequence_parallel_moe:
             raise RuntimeError("AFD Qwen3.5/3.6 does not support SP MoE")
         if parallel_config.enable_eplb:
-            raise RuntimeError("AFD Qwen3.5/3.6 does not support EPLB")
+            raise RuntimeError(
+                "AFD Qwen3.5/3.6 remote experts do not support EPLB on the "
+                "Attention role",
+            )
 
         self.tp_size = next_native.get_tensor_model_parallel_world_size()
         self.ep_group = next_native.get_ep_group().device_group
@@ -294,8 +297,8 @@ class AFDQwen3_5Model(native.Qwen3_5Model):  # noqa: N801
             raise RuntimeError("AFD Qwen model requires AFD activation")
         if vllm_config.parallel_config.use_sequence_parallel_moe:
             raise RuntimeError("AFD Qwen3.5/3.6 does not support SP MoE")
-        if vllm_config.parallel_config.enable_eplb:
-            raise RuntimeError("AFD Qwen3.5/3.6 does not support EPLB")
+        if vllm_config.parallel_config.enable_eplb and afd_config.role != "ffn":
+            raise RuntimeError("AFD Qwen3.5/3.6 supports EPLB only on the FFN role")
         self.afd_config = afd_config
         # ### PATCH END
 
@@ -304,8 +307,11 @@ class AFDQwen3_5Model(native.Qwen3_5Model):  # noqa: N801
         config = vllm_config.model_config.hf_text_config
         self.config = config
         self.quant_config = vllm_config.quant_config
-        # ### PATCH START: remote experts do not participate in EPLB.
-        self.num_redundant_experts = 0
+        # ### PATCH START: mirror the native loader-facing EPLB metadata; the
+        # Attention process runs without EPLB flags so its value stays zero.
+        self.num_redundant_experts = (
+            vllm_config.parallel_config.eplb_config.num_redundant_experts
+        )
         # ### PATCH END
         self.vocab_size = config.vocab_size
 
@@ -479,8 +485,8 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
         parallel_config = vllm_config.parallel_config
         if parallel_config.use_sequence_parallel_moe:
             raise ValueError("AFD Qwen3.5/3.6 CUDA does not support SP MoE")
-        if parallel_config.enable_eplb:
-            raise ValueError("AFD Qwen3.5/3.6 CUDA does not support EPLB")
+        if parallel_config.enable_eplb and afd_config.role != "ffn":
+            raise ValueError("AFD Qwen3.5/3.6 supports EPLB only on the FFN role")
         if parallel_config.pipeline_parallel_size != 1:
             raise ValueError(
                 "AFD Qwen3.5/3.6 CUDA supports pipeline_parallel_size=1 only",

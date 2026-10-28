@@ -144,8 +144,8 @@ def _validate_supported_config(
         raise RuntimeError(
             "AFD Qwen3 MoE does not support sequence-parallel MoE",
         )
-    if parallel_config.enable_eplb:
-        raise RuntimeError("AFD Qwen3 MoE does not support EPLB")
+    if parallel_config.enable_eplb and afd_config.role != "ffn":
+        raise RuntimeError("AFD Qwen3 MoE supports EPLB only on the FFN role")
     if parallel_config.pipeline_parallel_size != 1:
         raise RuntimeError("AFD Qwen3 MoE does not support pipeline parallelism")
     if vllm_config.speculative_config is not None:

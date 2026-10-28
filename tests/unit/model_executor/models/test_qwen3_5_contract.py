@@ -231,3 +231,18 @@ def test_qwen_rejects_unsupported_configuration_before_construction(
         adapter.AFDQwen3_5MoeForConditionalGeneration(
             vllm_config=conditional_config.config
         )
+
+
+def test_qwen_ffn_role_eplb_passes_feature_gates(conditional_config):
+    """FFN-role EPLB passes the gates that Attention-role EPLB fails.
+
+    Why: the fixture traps visual-tower construction, which only runs after
+    every unsupported-feature check, so reaching it proves the checks passed.
+    """
+    conditional_config.afd.role = "ffn"
+    conditional_config.config.parallel_config.enable_eplb = True
+
+    with pytest.raises(pytest.fail.Exception, match="visual path was constructed"):
+        adapter.AFDQwen3_5MoeForConditionalGeneration(
+            vllm_config=conditional_config.config
+        )

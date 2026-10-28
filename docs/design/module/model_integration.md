@@ -210,8 +210,11 @@ is required. With DeepEP M2N, Attention owns gate/top-k and FFN runs routed
 experts only; this requires `compute_gate_on_attention=true`, every layer to
 be MoE, and no shared expert. Native weight loading follows role-based filtering.
 
-Both paths are CUDA-only and reject sequence-parallel MoE, EPLB, pipeline
-parallelism, speculative decoding, and LoRA during construction.
+Both paths are CUDA-only and reject sequence-parallel MoE, EPLB on the
+Attention role, pipeline parallelism, speculative decoding, and LoRA during
+construction. The FFN role supports FFN-side EPLB (see
+[FFN runtime](ffn_runtime.md#ffn-side-eplb)) through the native
+`Qwen3MoeSparseMoeBlock` construction.
 
 ### Qwen3.5/3.6 MoE CUDA boundary
 
@@ -222,8 +225,11 @@ gate, routed experts, shared expert, and shared-expert gate.
 
 This path is CUDA-only, text-only, and requires `--language-model-only`,
 `compute_gate_on_attention=false`, and `pipeline_parallel_size=1`. It rejects
-multimodal execution, sequence-parallel MoE, EPLB, speculative decoding, and
-LoRA before language-model construction; NPU model-config resolution fails
+multimodal execution, sequence-parallel MoE, EPLB on the Attention role,
+speculative decoding, and LoRA before language-model construction; the FFN
+role supports FFN-side EPLB (see
+[FFN runtime](ffn_runtime.md#ffn-side-eplb)) through the native
+`Qwen3NextSparseMoeBlock` construction. NPU model-config resolution fails
 before model loading. GDN DBO is unsupported under native hybrid/multimodal
 DBO validation; ordinary eager and graph execution remain supported. The
 2A1F suite keeps static EP and PP1. Attention-side router transport, async
