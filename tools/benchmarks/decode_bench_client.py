@@ -1,80 +1,146 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Two-phase load generator for the decode benchmark's prompt-pool mode.
+"""Decode-only benchmark over the decode-bench prompt pool, run with vllm bench.
 
-Run it against an Attention instance whose ``AFDDecodeBenchConnector`` has
+Drives an Attention instance whose ``AFDDecodeBenchConnector`` has
 ``num_prompts`` > 0 (see ``tools/benchmarks/decode_bench.py``):
 
-1. Warmup: sends ``--num-prompts`` requests to every Attention DP rank, pinned
-   with the ``X-data-parallel-rank`` header, so each rank prefills and pins its
-   whole prompt pool. Their metrics are discarded.
-2. Measured: sends ``--num-requests`` requests through vLLM's load balancer.
-   The server remaps each onto a pool prompt, so the prompt sent here is only a
-   placeholder and every request decodes over real, prefix-cached KV.
+1. Warmup: one ``vllm bench serve`` run per Attention DP rank, each pinned to
+   its rank with the ``X-data-parallel-rank`` header, sends ``--pool-prompts``
+   requests, so every rank prefills and pins its whole prompt pool.
+2. Check: the server's prefix-cache counters must show each warmup request
+   looked up ``--prompt-len`` prompt tokens, i.e. the server's pool prompts are
+   as long as the measured prompts below.
+3. Measured: one ``vllm bench serve`` run with ``--random-input-len
+   --prompt-len``. Every argument after ``--`` goes to it unchanged (request
+   rate, concurrency, number of requests, output length, ...). The server remaps
+   each request onto a pool prompt, so the prompt text is only a placeholder.
+4. Check: over the measured run the server must have prefilled exactly one
+   token per finished request (the last prompt token), with no failed requests
+   and no preemptions; otherwise this script exits non-zero.
 
-The server's prefix-cache counters before and after the measured phase give the
-prompt tokens prefilled per measured request; a clean decode-only run prefills
-exactly one.
+vllm bench writes its usual result JSON for each run into ``--result-dir``;
+this script adds ``decode_bench_report.json`` with the checks.
 
 Usage:
-    python tools/benchmarks/decode_bench_client.py --num-prompts 1000 \
-        --num-requests 4000 --output-len 256 --max-concurrency 64
+    python tools/benchmarks/decode_bench_client.py --pool-prompts 1000 \
+        --prompt-len 1025 -- --num-prompts 4000 --random-output-len 256 \
+        --max-concurrency 64 --request-rate 20
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
-import math
-import random
+import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
-import aiohttp
-import numpy as np
-
 DATA_PARALLEL_RANK_HEADER = "X-data-parallel-rank"
-COMPLETIONS_PATH = "/v1/completions"
 MODELS_PATH = "/v1/models"
 METRICS_PATH = "/metrics"
 PREFIX_CACHE_QUERIES_METRIC = "vllm:prefix_cache_queries"
 PREFIX_CACHE_HITS_METRIC = "vllm:prefix_cache_hits"
-SSE_DATA_PREFIX = b"data: "
-SSE_DONE = b"[DONE]"
+REQUEST_SUCCESS_METRIC = "vllm:request_success"
+PREEMPTIONS_METRIC = "vllm:num_preemptions"
 HTTP_OK = 200
-# Placeholder prompt token ids stay below this, which every vocabulary covers.
-PLACEHOLDER_TOKEN_ID_LIMIT = 1000
+READY_POLL_INTERVAL_S = 5.0
 # The server forces warmup requests to one output token as well.
 WARMUP_OUTPUT_TOKENS = 1
-READY_POLL_INTERVAL_S = 5.0
-PERCENTILES = (50, 90, 99)
-MS_PER_S = 1000.0
-
-
-@dataclass
-class RequestResult:
-    """Timing of one streamed completion."""
-
-    ok: bool
-    ttft_s: float = 0.0
-    latency_s: float = 0.0
-    output_tokens: int = 0
-    itl_s: list[float] = field(default_factory=list)
-    error: str = ""
+# A decode-only request prefills only its last prompt token.
+DECODE_ONLY_PREFILLED_TOKENS = 1.0
+PREFILLED_TOKENS_TOLERANCE = 0.01
+PROMPT_LEN_TOLERANCE = 0.5
+# vllm bench flags this script sets for every run; overriding them would break
+# the prompt-length contract or lose the result file.
+CLIENT_OWNED_BENCH_FLAGS = frozenset(
+    {
+        "--host",
+        "--port",
+        "--base-url",
+        "--model",
+        "--tokenizer",
+        "--dataset-name",
+        "--random-input-len",
+        "--random-range-ratio",
+        "--random-prefix-len",
+        "--save-result",
+        "--result-dir",
+        "--result-filename",
+    }
+)
+# The warmup also owns how many requests each rank gets and where they go.
+WARMUP_OWNED_BENCH_FLAGS = CLIENT_OWNED_BENCH_FLAGS | {
+    "--num-prompts",
+    "--random-output-len",
+    "--header",
+    "--max-concurrency",
+}
+WARMUP_RESULT_FILENAME = "warmup-rank{rank}.json"
+WARMUP_LOG_FILENAME = "warmup-rank{rank}.log"
+MEASURED_RESULT_FILENAME = "measured.json"
+REPORT_FILENAME = "decode_bench_report.json"
+MEASURED_SUMMARY_KEYS = (
+    "completed",
+    "failed",
+    "duration",
+    "request_throughput",
+    "output_throughput",
+    "total_input_tokens",
+    "total_output_tokens",
+    "median_ttft_ms",
+    "p99_ttft_ms",
+    "median_tpot_ms",
+    "p99_tpot_ms",
+    "median_itl_ms",
+    "p99_itl_ms",
+)
 
 
 @dataclass(frozen=True)
-class PlannedRequest:
-    payload: dict[str, object]
-    headers: dict[str, str]
+class ServerCounters:
+    """Server-wide totals of the counters the checks need, summed over engines."""
+
+    prefix_cache_queries: float = 0.0
+    prefix_cache_hits: float = 0.0
+    finished_requests: float = 0.0
+    preemptions: float = 0.0
+
+    def __sub__(self, other: ServerCounters) -> ServerCounters:
+        return ServerCounters(
+            prefix_cache_queries=self.prefix_cache_queries - other.prefix_cache_queries,
+            prefix_cache_hits=self.prefix_cache_hits - other.prefix_cache_hits,
+            finished_requests=self.finished_requests - other.finished_requests,
+            preemptions=self.preemptions - other.preemptions,
+        )
+
+    @property
+    def prefilled_tokens(self) -> float:
+        return self.prefix_cache_queries - self.prefix_cache_hits
 
 
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+@dataclass(frozen=True)
+class Check:
+    name: str
+    passed: bool
+    detail: str
+
+
+def parse_args(argv: Sequence[str]) -> tuple[argparse.Namespace, list[str]]:
+    """Split ``argv`` at ``--``: client flags before, measured vllm bench after."""
+    argv = list(argv)
+    split = argv.index("--") if "--" in argv else len(argv)
+    client_argv, bench_argv = argv[:split], argv[split + 1 :]
+
+    parser = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0],
+        epilog="Arguments after `--` are passed to the measured `vllm bench serve`.",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18305)
     parser.add_argument(
@@ -83,91 +149,96 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Served model name; defaults to the first one in /v1/models.",
     )
     parser.add_argument(
+        "--tokenizer",
+        default=None,
+        help="Tokenizer vllm bench uses to build prompts; defaults to --model.",
+    )
+    parser.add_argument(
         "--dp-size",
         type=int,
         default=2,
-        help="Attention data-parallel ranks; each is warmed separately.",
+        help="Attention data-parallel ranks; each gets its own warmup run.",
     )
     parser.add_argument(
-        "--num-prompts",
+        "--pool-prompts",
         type=int,
         required=True,
         help="Pool prompts per Attention DP rank; must match the server's "
         "kv_connector_extra_config num_prompts.",
     )
     parser.add_argument(
-        "--num-requests",
+        "--prompt-len",
         type=int,
-        default=1000,
-        help="Measured requests.",
-    )
-    parser.add_argument("--output-len", type=int, default=128)
-    parser.add_argument("--max-concurrency", type=int, default=64)
-    parser.add_argument(
-        "--request-rate",
-        type=float,
-        default=math.inf,
-        help="Measured requests per second (Poisson); inf sends them as fast "
-        "as --max-concurrency allows.",
+        default=1025,
+        help="Prompt length of the warmup and measured runs; must equal the "
+        "server's pool prompt length (checked after the warmup).",
     )
     parser.add_argument(
         "--warmup-concurrency",
         type=int,
         default=64,
-        help="In-flight warmup requests across all ranks.",
+        help="In-flight requests of each rank's warmup run.",
     )
     parser.add_argument(
-        "--placeholder-prompt-len",
-        type=int,
-        default=8,
-        help="Tokens in each request's placeholder prompt; the server replaces "
-        "them with a pool prompt.",
-    )
-    parser.add_argument(
-        "--pin-measured-ranks",
-        action="store_true",
-        help="Spread measured requests round-robin over DP ranks with the "
-        f"{DATA_PARALLEL_RANK_HEADER} header instead of vLLM's load balancer.",
+        "--warmup-bench-args",
+        nargs=argparse.REMAINDER,
+        default=[],
+        help="Extra vllm bench arguments for the warmup runs; must come last "
+        "before `--`.",
     )
     parser.add_argument(
         "--skip-warmup",
         action="store_true",
         help="Measure only, against a server whose pool is already warm.",
     )
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--result-dir",
+        type=Path,
+        default=Path("decode_bench_results"),
+    )
     parser.add_argument("--ready-timeout-s", type=float, default=1800.0)
-    parser.add_argument("--result-file", type=Path, default=None)
-    return parser.parse_args(argv)
+    args = parser.parse_args(client_argv)
+    reject_owned_flags(args.warmup_bench_args, WARMUP_OWNED_BENCH_FLAGS, "warmup")
+    reject_owned_flags(bench_argv, CLIENT_OWNED_BENCH_FLAGS, "measured")
+    return args, bench_argv
 
 
-async def wait_for_model(
-    session: aiohttp.ClientSession,
-    base_url: str,
-    timeout_s: float,
-) -> str:
+def reject_owned_flags(
+    bench_args: Sequence[str], owned_flags: frozenset[str], phase: str
+) -> None:
+    for bench_arg in bench_args:
+        flag = bench_arg.split("=", 1)[0]
+        if flag in owned_flags:
+            raise SystemExit(
+                f"{flag} is set by decode_bench_client.py for the {phase} vllm "
+                f"bench run; drop it (owned: {', '.join(sorted(owned_flags))})"
+            )
+
+
+def wait_for_model(base_url: str, timeout_s: float) -> str:
     """Poll until the server answers /v1/models; return the first model id."""
     deadline = time.monotonic() + timeout_s
     while True:
         try:
-            async with session.get(f"{base_url}{MODELS_PATH}") as response:
+            with urllib.request.urlopen(f"{base_url}{MODELS_PATH}") as response:
                 if response.status == HTTP_OK:
-                    models = await response.json()
-                    return models["data"][0]["id"]
-        except aiohttp.ClientError:
+                    return json.loads(response.read())["data"][0]["id"]
+        except (urllib.error.URLError, ConnectionError):
             pass
         if time.monotonic() > deadline:
             raise TimeoutError(f"{base_url} not ready after {timeout_s:.0f}s")
-        await asyncio.sleep(READY_POLL_INTERVAL_S)
+        time.sleep(READY_POLL_INTERVAL_S)
 
 
-async def read_prefix_cache_counters(
-    session: aiohttp.ClientSession,
-    base_url: str,
-) -> tuple[float, float]:
-    """Return the (queries, hits) prefix-cache token counters, summed."""
-    async with session.get(f"{base_url}{METRICS_PATH}") as response:
-        text = await response.text()
-    totals = {PREFIX_CACHE_QUERIES_METRIC: 0.0, PREFIX_CACHE_HITS_METRIC: 0.0}
+def read_counters(base_url: str) -> ServerCounters:
+    with urllib.request.urlopen(f"{base_url}{METRICS_PATH}") as response:
+        text = response.read().decode()
+    totals = {
+        PREFIX_CACHE_QUERIES_METRIC: 0.0,
+        PREFIX_CACHE_HITS_METRIC: 0.0,
+        REQUEST_SUCCESS_METRIC: 0.0,
+        PREEMPTIONS_METRIC: 0.0,
+    }
     for line in text.splitlines():
         if not line or line.startswith("#"):
             continue
@@ -175,280 +246,239 @@ async def read_prefix_cache_counters(
         metric = sample.split("{", 1)[0].removesuffix("_total")
         if metric in totals:
             totals[metric] += float(value)
-    return totals[PREFIX_CACHE_QUERIES_METRIC], totals[PREFIX_CACHE_HITS_METRIC]
-
-
-async def send_request(
-    session: aiohttp.ClientSession,
-    url: str,
-    request: PlannedRequest,
-) -> RequestResult:
-    start = time.perf_counter()
-    first_chunk_time: float | None = None
-    last_chunk_time = start
-    itl_s: list[float] = []
-    output_tokens = 0
-    try:
-        async with session.post(
-            url, json=request.payload, headers=request.headers
-        ) as response:
-            if response.status != HTTP_OK:
-                body = await response.text()
-                return RequestResult(ok=False, error=f"HTTP {response.status}: {body}")
-            async for raw_line in response.content:
-                line = raw_line.strip()
-                if not line.startswith(SSE_DATA_PREFIX):
-                    continue
-                data = line.removeprefix(SSE_DATA_PREFIX)
-                if data == SSE_DONE:
-                    break
-                chunk = json.loads(data)
-                usage = chunk.get("usage")
-                if usage:
-                    output_tokens = usage["completion_tokens"]
-                if not chunk.get("choices"):
-                    continue
-                now = time.perf_counter()
-                if first_chunk_time is None:
-                    first_chunk_time = now
-                else:
-                    itl_s.append(now - last_chunk_time)
-                last_chunk_time = now
-    except aiohttp.ClientError as error:
-        return RequestResult(ok=False, error=repr(error))
-    if first_chunk_time is None:
-        return RequestResult(ok=False, error="stream ended without output")
-    return RequestResult(
-        ok=True,
-        ttft_s=first_chunk_time - start,
-        latency_s=last_chunk_time - start,
-        output_tokens=output_tokens,
-        itl_s=itl_s,
+    return ServerCounters(
+        prefix_cache_queries=totals[PREFIX_CACHE_QUERIES_METRIC],
+        prefix_cache_hits=totals[PREFIX_CACHE_HITS_METRIC],
+        finished_requests=totals[REQUEST_SUCCESS_METRIC],
+        preemptions=totals[PREEMPTIONS_METRIC],
     )
 
 
-async def run_phase(
-    session: aiohttp.ClientSession,
-    url: str,
-    requests: list[PlannedRequest],
-    max_concurrency: int,
-    request_rate: float,
-    rng: random.Random,
-) -> tuple[list[RequestResult], float]:
-    """Send ``requests``; return their results and the phase duration."""
-    semaphore = asyncio.Semaphore(max_concurrency)
-
-    async def limited(request: PlannedRequest) -> RequestResult:
-        async with semaphore:
-            return await send_request(session, url, request)
-
-    start = time.perf_counter()
-    tasks = []
-    for request in requests:
-        tasks.append(asyncio.create_task(limited(request)))
-        if not math.isinf(request_rate):
-            await asyncio.sleep(rng.expovariate(request_rate))
-    results = await asyncio.gather(*tasks)
-    return list(results), time.perf_counter() - start
-
-
-def build_payload(
+def bench_command(
+    args: argparse.Namespace,
     model: str,
-    prompt_token_ids: list[int],
-    max_tokens: int,
-) -> dict[str, object]:
-    return {
-        "model": model,
-        "prompt": prompt_token_ids,
-        "max_tokens": max_tokens,
-        "ignore_eos": True,
-        "temperature": 0.0,
-        "stream": True,
-        # Per-chunk usage gives the exact output token count even when one
-        # chunk carries several tokens.
-        "stream_options": {"include_usage": True, "continuous_usage_stats": True},
-    }
-
-
-def placeholder_prompt(rng: random.Random, length: int) -> list[int]:
-    return [rng.randrange(PLACEHOLDER_TOKEN_ID_LIMIT) for _ in range(length)]
-
-
-def plan_warmup(
-    args: argparse.Namespace, model: str, rng: random.Random
-) -> list[PlannedRequest]:
-    # Interleave ranks so every rank warms its pool concurrently.
+    result_filename: str,
+    bench_args: Sequence[str],
+) -> list[str]:
+    """A ``vllm bench serve`` command over --prompt-len random prompts."""
     return [
-        PlannedRequest(
-            payload=build_payload(
-                model,
-                placeholder_prompt(rng, args.placeholder_prompt_len),
-                WARMUP_OUTPUT_TOKENS,
-            ),
-            headers={DATA_PARALLEL_RANK_HEADER: str(rank)},
-        )
-        for _ in range(args.num_prompts)
-        for rank in range(args.dp_size)
+        sys.executable,
+        "-m",
+        "vllm.entrypoints.cli.main",
+        "bench",
+        "serve",
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        "--model",
+        model,
+        "--tokenizer",
+        args.tokenizer or model,
+        "--dataset-name",
+        "random",
+        "--random-input-len",
+        str(args.prompt_len),
+        "--random-range-ratio",
+        "0",
+        "--random-prefix-len",
+        "0",
+        "--ignore-eos",
+        "--save-result",
+        "--result-dir",
+        str(args.result_dir),
+        "--result-filename",
+        result_filename,
+        *bench_args,
     ]
 
 
-def plan_measured(
-    args: argparse.Namespace, model: str, rng: random.Random
-) -> list[PlannedRequest]:
+def read_bench_result(args: argparse.Namespace, filename: str) -> dict[str, object]:
+    return json.loads((args.result_dir / filename).read_text())
+
+
+def run_warmup(args: argparse.Namespace, model: str) -> list[dict[str, object]]:
+    """Run one pinned vllm bench per rank in parallel; return their results."""
+    processes = []
+    for rank in range(args.dp_size):
+        command = bench_command(
+            args,
+            model,
+            WARMUP_RESULT_FILENAME.format(rank=rank),
+            [
+                "--num-prompts",
+                str(args.pool_prompts),
+                "--random-output-len",
+                str(WARMUP_OUTPUT_TOKENS),
+                "--max-concurrency",
+                str(args.warmup_concurrency),
+                "--header",
+                f"{DATA_PARALLEL_RANK_HEADER}={rank}",
+                *args.warmup_bench_args,
+            ],
+        )
+        log_path = args.result_dir / WARMUP_LOG_FILENAME.format(rank=rank)
+        with log_path.open("w") as log:
+            processes.append(
+                (rank, log_path, subprocess.Popen(command, stdout=log, stderr=log))
+            )
+    results = []
+    for rank, log_path, process in processes:
+        if process.wait() != 0:
+            raise RuntimeError(
+                f"warmup vllm bench for rank {rank} exited {process.returncode}; "
+                f"see {log_path}"
+            )
+        results.append(
+            read_bench_result(args, WARMUP_RESULT_FILENAME.format(rank=rank))
+        )
+    return results
+
+
+def check_warmup(
+    args: argparse.Namespace,
+    results: list[dict[str, object]],
+    delta: ServerCounters,
+) -> list[Check]:
+    num_failed = sum(int(str(result["failed"])) for result in results)
+    checks = [
+        Check(
+            "warmup requests succeeded",
+            num_failed == 0,
+            f"{num_failed} failed; a failed warmup request leaves its pool entry "
+            "for a later request to prefill",
+        )
+    ]
+    min_requests = args.dp_size * args.pool_prompts
+    checks.append(
+        Check(
+            "every rank received a full pool of warmup requests",
+            delta.finished_requests >= min_requests,
+            f"{delta.finished_requests:.0f} finished, need >= {min_requests}",
+        )
+    )
+    tokens_per_request = (
+        delta.prefix_cache_queries / delta.finished_requests
+        if delta.finished_requests
+        else 0.0
+    )
+    prompt_len_matches = (
+        abs(tokens_per_request - args.prompt_len) <= PROMPT_LEN_TOLERANCE
+    )
+    checks.append(
+        Check(
+            "server pool prompts match --prompt-len",
+            prompt_len_matches,
+            f"{tokens_per_request:.2f} prompt tokens per warmup request, "
+            f"--prompt-len {args.prompt_len}"
+            + (
+                ""
+                if prompt_len_matches
+                else "; set the server's prompt_len to one token past a block "
+                "boundary and pass the same value here"
+            ),
+        )
+    )
+    return checks
+
+
+def check_measured(result: dict[str, object], delta: ServerCounters) -> list[Check]:
+    prefilled_per_request = (
+        delta.prefilled_tokens / delta.finished_requests
+        if delta.finished_requests
+        else 0.0
+    )
     return [
-        PlannedRequest(
-            payload=build_payload(
-                model,
-                placeholder_prompt(rng, args.placeholder_prompt_len),
-                args.output_len,
-            ),
-            headers=(
-                {DATA_PARALLEL_RANK_HEADER: str(index % args.dp_size)}
-                if args.pin_measured_ranks
-                else {}
-            ),
-        )
-        for index in range(args.num_requests)
-    ]
-
-
-def distribution_ms(values_s: list[float]) -> dict[str, float]:
-    if not values_s:
-        return {}
-    values_ms = np.asarray(values_s) * MS_PER_S
-    summary = {"mean": float(values_ms.mean())}
-    for percentile in PERCENTILES:
-        summary[f"p{percentile}"] = float(np.percentile(values_ms, percentile))
-    return summary
-
-
-def summarize(results: list[RequestResult], duration_s: float) -> dict[str, object]:
-    completed = [result for result in results if result.ok]
-    output_tokens = sum(result.output_tokens for result in completed)
-    tpot_s = [
-        (result.latency_s - result.ttft_s) / (result.output_tokens - 1)
-        for result in completed
-        if result.output_tokens > 1
-    ]
-    return {
-        "completed": len(completed),
-        "failed": len(results) - len(completed),
-        "duration_s": duration_s,
-        "request_throughput": len(completed) / duration_s,
-        "output_token_throughput": output_tokens / duration_s,
-        "total_output_tokens": output_tokens,
-        "ttft_ms": distribution_ms([result.ttft_s for result in completed]),
-        "tpot_ms": distribution_ms(tpot_s),
-        "itl_ms": distribution_ms(
-            [itl for result in completed for itl in result.itl_s]
+        Check(
+            "measured requests succeeded",
+            int(str(result["failed"])) == 0,
+            f"{result['failed']} failed of {result['completed']} completed",
         ),
-        "e2el_ms": distribution_ms([result.latency_s for result in completed]),
-    }
+        Check(
+            "decode only: one prefilled token per request",
+            abs(prefilled_per_request - DECODE_ONLY_PREFILLED_TOKENS)
+            <= PREFILLED_TOKENS_TOLERANCE,
+            f"{prefilled_per_request:.4f} prefilled tokens per finished request "
+            f"({delta.prefilled_tokens:.0f} tokens, "
+            f"{delta.finished_requests:.0f} requests)",
+        ),
+        Check(
+            "no preemptions",
+            delta.preemptions == 0,
+            f"{delta.preemptions:.0f} preemptions; a preempted request recomputes "
+            "its context",
+        ),
+    ]
 
 
-def first_error(results: list[RequestResult]) -> str:
-    return next((result.error for result in results if not result.ok), "")
-
-
-async def run(args: argparse.Namespace) -> dict[str, object]:
-    base_url = f"http://{args.host}:{args.port}"
-    url = f"{base_url}{COMPLETIONS_PATH}"
-    rng = random.Random(args.seed)
-    timeout = aiohttp.ClientTimeout(total=None)
-    connector = aiohttp.TCPConnector(limit=0)
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        served_model = await wait_for_model(session, base_url, args.ready_timeout_s)
-        model = args.model or served_model
-        report: dict[str, object] = {"config": vars(args) | {"model": model}}
-
-        if not args.skip_warmup:
-            warmup = plan_warmup(args, model, rng)
-            print(
-                f"Warmup: {args.num_prompts} prompts x {args.dp_size} ranks",
-                flush=True,
-            )
-            warmup_results, warmup_duration_s = await run_phase(
-                session, url, warmup, args.warmup_concurrency, math.inf, rng
-            )
-            num_failed = sum(not result.ok for result in warmup_results)
-            if num_failed:
-                raise RuntimeError(
-                    f"{num_failed} warmup requests failed; first error: "
-                    f"{first_error(warmup_results)}"
-                )
-            report["warmup"] = {
-                "requests": len(warmup_results),
-                "duration_s": warmup_duration_s,
-            }
-            print(f"Warmup done in {warmup_duration_s:.1f}s", flush=True)
-
-        queries_before, hits_before = await read_prefix_cache_counters(
-            session, base_url
-        )
-        print(f"Measured: {args.num_requests} requests", flush=True)
-        measured_results, measured_duration_s = await run_phase(
-            session,
-            url,
-            plan_measured(args, model, rng),
-            args.max_concurrency,
-            args.request_rate,
-            rng,
-        )
-        queries_after, hits_after = await read_prefix_cache_counters(session, base_url)
-
-        measured = summarize(measured_results, measured_duration_s)
-        if measured["failed"]:
-            measured["first_error"] = first_error(measured_results)
-        num_completed = sum(result.ok for result in measured_results)
-        prompt_tokens = queries_after - queries_before
-        hit_tokens = hits_after - hits_before
-        measured["prefix_cache"] = {
-            "queried_tokens": prompt_tokens,
-            "hit_tokens": hit_tokens,
-            "hit_rate": hit_tokens / prompt_tokens if prompt_tokens else 0.0,
-            # 1.0 when every measured request prefilled only its last token.
-            "prefilled_tokens_per_request": (
-                (prompt_tokens - hit_tokens) / num_completed if num_completed else 0.0
-            ),
-        }
-        report["measured"] = measured
-        return report
-
-
-def print_summary(measured: dict[str, object]) -> None:
-    prefix_cache = measured["prefix_cache"]
-    assert isinstance(prefix_cache, dict)
-    print(
-        f"completed={measured['completed']} failed={measured['failed']} "
-        f"duration={measured['duration_s']:.1f}s"
-    )
-    print(
-        f"request throughput={measured['request_throughput']:.2f} req/s "
-        f"output throughput={measured['output_token_throughput']:.1f} tok/s"
-    )
-    for metric in ("ttft_ms", "tpot_ms", "itl_ms", "e2el_ms"):
-        values = measured[metric]
-        assert isinstance(values, dict)
-        formatted = " ".join(f"{key}={value:.2f}" for key, value in values.items())
-        print(f"{metric}: {formatted}")
-    print(
-        f"prefix cache hit rate={prefix_cache['hit_rate']:.4f} "
-        f"prefilled tokens/request={prefix_cache['prefilled_tokens_per_request']:.2f} "
-        "(1.00 = decode only)"
-    )
+def print_checks(phase: str, checks: list[Check]) -> None:
+    for check in checks:
+        verdict = "PASS" if check.passed else "FAIL"
+        print(f"[{phase}] {verdict} {check.name}: {check.detail}", flush=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
-    report = asyncio.run(run(args))
-    measured = report["measured"]
-    assert isinstance(measured, dict)
-    print_summary(measured)
-    if args.result_file is not None:
-        args.result_file.parent.mkdir(parents=True, exist_ok=True)
-        args.result_file.write_text(json.dumps(report, indent=2, default=str))
-        print(f"Saved {args.result_file}")
-    return 0
+    args, measured_bench_args = parse_args(sys.argv[1:] if argv is None else argv)
+    args.result_dir.mkdir(parents=True, exist_ok=True)
+    base_url = f"http://{args.host}:{args.port}"
+    served_model = wait_for_model(base_url, args.ready_timeout_s)
+    model = args.model or served_model
+    report: dict[str, object] = {
+        "config": {key: str(value) for key, value in vars(args).items()}
+        | {"model": model, "measured_bench_args": measured_bench_args},
+    }
+    checks: list[Check] = []
+
+    if not args.skip_warmup:
+        print(
+            f"Warmup: vllm bench x {args.dp_size} ranks, {args.pool_prompts} "
+            f"prompts of {args.prompt_len} tokens each",
+            flush=True,
+        )
+        before = read_counters(base_url)
+        warmup_results = run_warmup(args, model)
+        warmup_delta = read_counters(base_url) - before
+        warmup_checks = check_warmup(args, warmup_results, warmup_delta)
+        print_checks("warmup", warmup_checks)
+        checks += warmup_checks
+        report["warmup"] = {
+            "server_counters": asdict(warmup_delta),
+            "checks": [asdict(check) for check in warmup_checks],
+        }
+        if not all(check.passed for check in warmup_checks):
+            write_report(args, report, checks)
+            return 1
+
+    print(f"Measured: vllm bench serve {' '.join(measured_bench_args)}", flush=True)
+    before = read_counters(base_url)
+    completed = subprocess.run(
+        bench_command(args, model, MEASURED_RESULT_FILENAME, measured_bench_args)
+    )
+    if completed.returncode != 0:
+        print(f"measured vllm bench exited {completed.returncode}", flush=True)
+        return completed.returncode
+    measured_delta = read_counters(base_url) - before
+    measured_result = read_bench_result(args, MEASURED_RESULT_FILENAME)
+    measured_checks = check_measured(measured_result, measured_delta)
+    print_checks("measured", measured_checks)
+    checks += measured_checks
+    report["measured"] = {
+        "vllm_bench_result": str(args.result_dir / MEASURED_RESULT_FILENAME),
+        "summary": {key: measured_result.get(key) for key in MEASURED_SUMMARY_KEYS},
+        "server_counters": asdict(measured_delta),
+        "checks": [asdict(check) for check in measured_checks],
+    }
+    write_report(args, report, checks)
+    return 0 if all(check.passed for check in checks) else 1
+
+
+def write_report(
+    args: argparse.Namespace, report: dict[str, object], checks: list[Check]
+) -> None:
+    report["passed"] = all(check.passed for check in checks)
+    path = args.result_dir / REPORT_FILENAME
+    path.write_text(json.dumps(report, indent=2))
+    print(f"{'PASS' if report['passed'] else 'FAIL'}: report saved to {path}")
 
 
 if __name__ == "__main__":

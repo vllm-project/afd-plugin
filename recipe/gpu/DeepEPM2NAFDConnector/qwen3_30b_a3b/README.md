@@ -67,7 +67,8 @@ and `EXTRA_ARGS` for anything else.
    boundary), so the request prefills one token and decodes over real KV, on
    whichever rank serves it.
 
-Start the server, then drive it with the two-phase client:
+Start the server, then drive it with `tools/benchmarks/decode_bench_client.py`,
+which runs every phase with `vllm bench serve`:
 
 ```bash
 export MODEL_PATH=/path/model_weights/Qwen3-30B-A3B
@@ -78,18 +79,34 @@ DECODE_BENCH_MAX_OUTPUT_LEN=256 \
     bash recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/prefill_decode_colocation/2a2f_graph_dp2tp1.sh
 
 python tools/benchmarks/decode_bench_client.py \
-    --port 18305 --dp-size 2 --num-prompts 1000 \
-    --num-requests 4000 --output-len 256 --max-concurrency 64 \
-    --result-file /tmp/results/decode_bench.json
+    --port 18305 --dp-size 2 --pool-prompts 1000 --prompt-len 1025 \
+    --result-dir /tmp/results/decode_bench \
+    -- --num-prompts 4000 --random-output-len 256 \
+       --max-concurrency 64 --request-rate 20
 ```
 
-The client warms every rank with `--num-prompts` requests pinned by the
-`X-data-parallel-rank` header, then sends the measured requests through vLLM's
-load balancer and reports TTFT, TPOT, ITL, and throughput. It also reports
-`prefilled tokens/request` from the server's prefix-cache counters: `1.00`
-means every measured request was decode-only. `--num-prompts` must match
-`DECODE_BENCH_NUM_PROMPTS`, and `--output-len` must not exceed
-`DECODE_BENCH_MAX_OUTPUT_LEN`.
+1. **Warmup.** One `vllm bench serve` run per Attention rank, pinned with the
+   `X-data-parallel-rank` header, sends `--pool-prompts` requests to that rank.
+   `--warmup-concurrency` sets their concurrency; `--warmup-bench-args` (last
+   before `--`) passes anything else to these runs.
+2. **Pre-check.** From the server's prefix-cache counters, every warmup
+   request must have looked up `--prompt-len` prompt tokens, so the pool
+   prompts are as long as the measured prompts.
+3. **Measured run.** `vllm bench serve --dataset-name random --random-input-len
+   <prompt-len>` plus every argument after `--`: request rate, concurrency,
+   number of requests, output length, burstiness, percentiles, and so on. The
+   client sets the dataset, input length, endpoint, and result file itself and
+   rejects them after `--`.
+4. **Post-check.** Over the measured run the server must have prefilled one
+   token per finished request (decode only), with no failed requests and no
+   preemptions. Otherwise the client exits non-zero.
+
+`--result-dir` receives vllm bench's own result JSON for each run
+(`warmup-rank<N>.json`, `measured.json`) plus `decode_bench_report.json` with
+the checks. `--pool-prompts` must match `DECODE_BENCH_NUM_PROMPTS`,
+`--prompt-len` must match `DECODE_BENCH_PROMPT_LEN`, and `--random-output-len`
+must not exceed `DECODE_BENCH_MAX_OUTPUT_LEN`. The client needs vLLM and the
+model's tokenizer installed, as vllm bench does.
 
 ### Sizing the pool
 

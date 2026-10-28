@@ -5,7 +5,7 @@
 # Drive load against a running AFD instance (e.g. the attention endpoint of a
 # recipe under recipe/gpu/). Thin wrapper around `vllm bench serve`; every knob
 # is overridable via an environment variable. For a decode-only run over a
-# warmed prompt pool, use decode_bench_client.py instead.
+# warmed prompt pool, use decode_bench_client.py, which wraps vllm bench too.
 #
 # Usage:
 #   MODEL_PATH=/path/to/weights tools/benchmarks/request_generator.sh
