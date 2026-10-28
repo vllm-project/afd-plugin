@@ -24,9 +24,8 @@ qualify them on the new runtime.
   `/home/models/hub/models--deepseek-ai--DeepSeek-V2-Lite/snapshots/604d5664dddd88a0433dbae533b7fe9472482de0`.
   Set `MODEL_PATH=...` to the local weights when launching.
 - A free TCP port `6269` on `127.0.0.1` for the AFD p2p connector, and
-  HTTP ports `18301`–`18305` for the vLLM HTTP servers. The current
-  same-host colocation scripts configure both roles on `18305`, causing a
-  port collision unless their HTTP ports are made distinct.
+  HTTP ports `18305` and `18306` for local colocation, or
+  `18301`–`18305` for prefill/decode disaggregation.
 
 ## Directory layout
 
@@ -64,13 +63,15 @@ qualify them on the new runtime.
 | GPUs | Role      | Port  |
 |------|-----------|-------|
 | 0, 1 | Attention | 18305 |
-| 2, 3 | FFN       | 18305 |
+| 2, 3 | FFN       | 18306 |
 
 The four `2a2f_*` variants cover the TP/DP cross product; `4a4f_*` doubles
 both attention and FFN ranks (DP=2 on each side); `multipod_2a_2f_graph_dbo_dp1tp2.sh`
 is the same `2a2f_graph_dbo_dp1tp2` config, but gated on a `POD` env var
 (`ATTENTION_0` or `FFN_0`) for the `deploy-afd-k8s` skill to deploy it
-across 2 pods (see repo-root `recipe/gpu/P2pNcclAFDConnector/README.md`) --
+across 2 pods (see repo-root `recipe/gpu/P2pNcclAFDConnector/README.md`);
+its Attention and FFN HTTP ports can both be 18305 because they are in
+separate pods --
 unlike the scripts above, it is **not** meant to be run directly: with
 `POD` unset, neither `vllm serve` block executes, and its
 `AFD_CONNECTOR_HOST` default (`vllm-ffn-p2p-service`) only resolves inside

@@ -169,8 +169,7 @@ Both platforms require V2. The paired deployment constraints are:
 
 Both roles validate the paired V2 topology, but only Attention uses the native
 V2 model runner. FFN remains connector-driven and uses its existing AFD runner
-surface. Earlier CUDA V2 revisions have DP2/TP2 eager and graph E2E evidence;
-this upgrade-only baseline has not been hardware-qualified. Qwen3.5/3.6 GDN
+surface. CUDA V2 has DP2/TP2 eager and graph E2E evidence. Qwen3.5/3.6 GDN
 DBO is unsupported; native hybrid/multimodal DBO validation applies. Qwen3 MoE
 DBO remains supported.
 Earlier vLLM 0.30 H20 validation of the GPU DP1 path covered DeepSeek-V2-Lite
@@ -350,6 +349,20 @@ stream, and wrapper implementation details are owned by
 [execution platforms](execution_platforms.md).
 
 CUDA V2 accepts exactly two native microbatches with Attention DP1 or DP > 1.
+For DeepSeek-V4, the Attention runner owns stable per-stage position and
+slot-mapping buffers so that compressor inputs remain 64-byte aligned. Native
+metadata builders and model forward consume the same refreshed stage inputs;
+the addresses also remain stable across FULL graph replay. Other model families
+continue to use native stage inputs. This V4 input adapter is CUDA-only;
+Ascend retains native stage preparation and AFD metadata handling.
+
+For CUDA V4 with ubatching enabled, before the native memory profile the
+runner visits the FlashMLA attention layers and reserves each configured
+ubatch/lane workspace using the native no-metadata prefill path. The native
+workspace manager retains ownership and locking; the allocations stay resident
+during the native profile so KV-cache sizing accounts for them. Other models
+and non-ubatched runs retain the native profile.
+
 Ascend V2 supports exactly two native microbatches in eager execution:
 synchronous CAMP2P requires Attention DP > 1, while Async CAM also supports
 Attention DP1. Ascend V2 DBO graph capture and replay remain unsupported.

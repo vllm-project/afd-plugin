@@ -180,9 +180,10 @@ the [profile limits](../../../tests/e2e/README.md#dsv4-flash-sync-camp2p-concurr
 The async case retains its exact-answer check.
 
 CUDA DSV4 Flash has a separate suite in
-`tests/e2e/models/deepseek_v4_flash/test_gpu.py`. H20 runs used a later
-revision containing fixes absent from this upgrade-only baseline; this baseline
-has not been GPU-qualified. Its four basic cells pair native MRV2
+`tests/e2e/models/deepseek_v4_flash/test_gpu.py`. On vLLM 0.32 H20, the AFD
+2A2F eager and Graph DBO cases passed within the scope in the
+[runtime matrix](execution_platforms.md#tested-runtime-matrix). Its four basic
+cells pair native MRV2
 eager/graph (DP2/TP1/EP2) with synchronous AFD eager/graph (2A2F, DP2/TP1 per
 role), using at most four devices. Four independent DBO cells pair the same
 native and AFD eager/graph modes. Native rejection is not bypassed; native DBO

@@ -131,10 +131,9 @@ export VLLM_USE_V2_MODEL_RUNNER=1
 ```
 
 The minimal DP1/TP1 commands below illustrate the launch shape; they are
-not an exact target-runtime test. vLLM 0.32 H20 E2E runs exercised
+not an exact target-runtime test. On vLLM 0.32, H20 E2E runs exercised
 DeepSeek-V2-Lite DP2/TP1 Graph + DBO and DeepSeek-V4 DP2/TP1 eager and
-Graph + DBO on other revisions with additional fixes, not this upgrade-only
-baseline; see the [runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix)
+Graph + DBO; see the [runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix)
 for scope. Historical vLLM 0.30 H20 validation in
 [PR #454](https://github.com/vllm-project/afd-plugin/pull/454) covered
 DeepSeek-V2-Lite DP1/TP2 Graph + DBO with 128 GSM8K samples and live

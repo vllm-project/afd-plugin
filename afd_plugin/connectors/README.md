@@ -8,11 +8,10 @@ AFD connector implementations are grouped by backend:
   by `afd_plugin.connectors.npu.camp2p`, and `CAMAsyncAFDConnector` is implemented
   by `afd_plugin.connectors.npu.async_cam`.
 
-H20 GPU `P2pNcclAFDConnector` results for selected vLLM 0.32
-configurations used other revisions containing additional fixes; they do not
-qualify this upgrade-only baseline. See the
-[runtime matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix)
-for their scope. Earlier NPU baseline runs on vLLM-Ascend `8d4409d6`
+GPU `P2pNcclAFDConnector` has hardware evidence on H20 for selected
+vLLM 0.32 configurations, including DeepSeek-V2-Lite and DeepSeek-V4; see
+the [runtime matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix)
+for the tested scope. Earlier NPU baseline runs on vLLM-Ascend `8d4409d6`
 have representative V2-Lite and DSV4 Flash W4A8 functional and
 300-question accuracy evidence for `CAMP2pAFDConnector` and
 `CAMAsyncAFDConnector`. Shared changes in this GPU upgrade were CPU-tested;

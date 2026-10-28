@@ -9,13 +9,17 @@ FFN activation is the sole FFN-to-Attention tensor.
 """
 
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+from types import MethodType
 from typing import Any
 
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.models.deepseek_v4.nvidia import model as native
+from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
+from vllm.v1.worker.workspace import WorkspaceManager, current_workspace_manager
 
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
@@ -25,6 +29,69 @@ from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
 _BOTH_ROLES = frozenset(("attention", "ffn"))
+_FLASHMLA_PROFILE_TOKENS = 1
+
+
+@contextmanager
+def _use_flashmla_workspace_slot(
+    manager: WorkspaceManager, slot: int
+) -> Iterator[None]:
+    """Select one real workspace owner only during startup reservation."""
+    state = vars(manager)
+    had_override = "_get_workspace_id" in state
+    previous_override = state.get("_get_workspace_id")
+
+    # Patch reason: native pre-KV profiling has no UBatch context and no public
+    # workspace-slot selector. A real UBatch context would start handoff threads.
+    # Patch functionality: route only this manager's allocation-only reservation
+    # to a configured slot, then restore its exact instance/class lookup.
+    # Signature: matches WorkspaceManager._get_workspace_id(self) -> int in
+    # vllm/v1/worker/workspace.py, 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # Remove this pin-local exception when native offers per-owner reservation.
+    def _get_workspace_id(self) -> int:
+        return slot
+
+    # ### PATCH START: select one startup workspace slot without DBO threads.
+    manager._get_workspace_id = MethodType(_get_workspace_id, manager)
+    try:
+        yield
+    finally:
+        if had_override:
+            manager._get_workspace_id = previous_override
+        else:
+            del manager._get_workspace_id
+    # ### PATCH END: select one startup workspace slot without DBO threads.
+
+
+def _reserve_flashmla_ubatch_workspace(model: nn.Module, config: VllmConfig) -> None:
+    """Reserve native V4 prefill scratch before the normal profile peak."""
+    attention_layers = [
+        layer
+        for layer in model.modules()
+        if isinstance(layer, DeepseekV4FlashMLAAttention)
+    ]
+    if not attention_layers:
+        return
+    manager = current_workspace_manager()
+    # Native forward_mqa's NoMeta branch (nvidia/flashmla.py:105-131, vLLM
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be) reserves its configured bound,
+    # zeros only this small output, and returns before KV/kernels/Indexer/FFN.
+    # Visit all real layers: the first SWA-only layer does not bound C4 demand.
+    # Known manager geometry is the pin-local exception above, not a new policy.
+    with set_forward_context(None, config):
+        for layer in attention_layers:
+            q = layer.attn_sink.new_empty(
+                (_FLASHMLA_PROFILE_TOKENS, layer.padded_heads, layer.head_dim),
+                dtype=torch.bfloat16,
+            )
+            output = torch.empty_like(q)
+            kv = q.new_empty((_FLASHMLA_PROFILE_TOKENS, layer.head_dim))
+            positions = torch.empty(
+                (_FLASHMLA_PROFILE_TOKENS,), dtype=torch.int64, device=q.device
+            )
+            for slot in range(manager._num_ubatches * manager._num_lanes):
+                with _use_flashmla_workspace_slot(manager, slot):
+                    layer.forward_mqa(q, kv, positions, output)
 
 
 def _weight_layer_path(name: str) -> tuple[int, str] | None:
@@ -263,6 +330,12 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
     # transfers only the two-dimensional FFN activation and input IDs. The
     # v0.32.0 native sequence-parallel gather/scatter branches around the
     # attention call are omitted because AFD pins use_sequence_parallel off.
+    # Padding-only AFD ubatches use zero attention output while retaining all
+    # mHC and remote FFN work. Native FlashMLA's zero-token decode metadata has
+    # no scheduler tile, so entering its forward consumer would assert.
+    # Removal plan: drop this branch when native V4 attention supports zero
+    # actual tokens in a nonempty padded ubatch. Capture retains full attention
+    # because native dummy inputs publish a positive real extent for each stage.
     # Signature: matches upstream; no added parameters.
     # Upstream: vLLM v0.32.0, vllm/models/deepseek_v4/nvidia/model.py
     # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
@@ -334,7 +407,17 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 norm_eps=attn_norm_eps,
             )
 
-        x = self.attn(positions, x, None)
+        # ### PATCH START: preserve padded-stage protocol with zero attention.
+        afd_metadata = get_afd_metadata_from_forward_context()
+        if (
+            afd_metadata is not None
+            and afd_metadata.num_stages > 1
+            and afd_metadata.tokens_unpadded_lens == [0]
+        ):
+            x = torch.zeros_like(x)
+        else:
+            x = self.attn(positions, x, None)
+        # ### PATCH END: preserve padded-stage protocol with zero attention.
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
         residual, post_mix, res_mix, x = native.mhc_fused_post_pre_tilelang(

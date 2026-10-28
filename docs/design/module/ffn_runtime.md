@@ -340,19 +340,23 @@ The daemon catches failures, stores the original exception, logs it, and makes
 the error visible through `raise_ffn_loop_error_if_any()`. Re-entering startup
 or completing shutdown therefore surfaces an earlier background failure.
 
-Shutdown ordering is:
+CUDA shutdown ordering is:
 
 ```text
-signal daemon event
-  -> runner stops profiler and closes connector
+signal daemon event and close the control plane
   -> join daemon thread with a bounded timeout
   -> surface stored loop error
-  -> delegate remaining worker/runner shutdown upstream
+  -> after the thread has exited, delegate worker/runner shutdown upstream
+  -> runner stops profiler, releases its GPU state and closes the connector
 ```
 
-Connector receive calls may be blocking; the connector's `close()` behavior
-is responsible for releasing its communication resources so shutdown can
-complete.
+Connector receive calls may be blocking. The GPU control plane aborts its
+owned metadata process group to unblock the receiver before joining it. If the
+thread does not exit, native resources are not released underneath it. The
+connector then releases its remaining communication resources during runner
+shutdown. An earlier daemon failure is still surfaced after the join. Ascend
+uses its own connector close or asynchronous drain path before joining the
+daemon; see the [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md).
 
 ## Candidate invariants
 

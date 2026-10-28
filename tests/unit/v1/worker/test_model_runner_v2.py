@@ -22,6 +22,7 @@ from vllm.forward_context import (  # noqa: E402
 from vllm.v1.worker import gpu_model_runner as native_v1  # noqa: E402
 from vllm.v1.worker.gpu import cudagraph_utils, dp_utils  # noqa: E402
 from vllm.v1.worker.gpu import model_runner as native_v2  # noqa: E402
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers  # noqa: E402
 from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector  # noqa: E402
 from vllm.v1.worker.gpu.ubatch_utils import UBatchState  # noqa: E402
 from vllm.v1.worker.ubatch_utils import UBatchSlice  # noqa: E402
@@ -47,7 +48,22 @@ from afd_plugin.validation import (  # noqa: E402
     validate_gpu_model_runner_v2_config,
     validate_npu_model_runner_v2_config,
 )
+from tests.unit.fakes.deepseek_v4 import (  # noqa: E402
+    CPU_PROFILE_BUDGET_BYTES,
+    CPU_PROFILE_TRANSIENT_BYTES,
+    OVERBOUND_WORKSPACE_BYTES,
+    WorkspaceCase,
+    profile_workspace_peak,
+)
 from tests.unit.fakes.profiler import StepProfiler as _StepProfiler  # noqa: E402
+from tests.unit.fakes.ubatching import (  # noqa: E402
+    TEST_COMPUTE_SMS,
+    TEST_PHYSICAL_SMS,
+    AttentionMetadataState,
+    LegacyNPUAttentionMetadataState,
+    LegacyNPUUBatchRunner,
+    PreparedUBatchRunner,
+)
 
 TEST_MODEL_MAX_LEN = 163840
 TEST_HIDDEN_SIZE = 2048
@@ -791,6 +807,86 @@ def test_mrv2_prepare_sends_one_complete_payload_and_restores_instance(graph, dp
     assert [
         m.num_tokens_across_dp_cpu.tolist() for m in payload.dp_metadata_list.values()
     ] == [[4] * dp_size, [4] * dp_size]
+
+
+@pytest.fixture
+def npu_v4_ubatch_case():
+    events: list[str] = []
+    runner = _runner_for_metadata(events, data_parallel_size=2)
+    runner.device = SimpleNamespace(type="npu")
+    runner.vllm_config.model_config.hf_config.model_type = "deepseek_v4"
+    runner.model_state = LegacyNPUAttentionMetadataState()
+    runner.kv_cache_config = SimpleNamespace()
+    runner.ubatch_runner = LegacyNPUUBatchRunner(
+        runner.model_state, runner.kv_cache_config
+    )
+    input_buffers = InputBuffers(4, 8, torch.device("cpu"))
+    batch = InputBatch.make_dummy(2, 8, input_buffers)
+    batch.positions.copy_(torch.arange(8))
+    return runner, batch, torch.arange(8).reshape(1, 8), events
+
+
+@pytest.mark.parametrize(
+    "has_control_plane", [False, True], ids=["async", "control-plane"]
+)
+def test_npu_v4_ubatch_preparation_preserves_native_context_and_control(
+    npu_v4_ubatch_case, has_control_plane
+):
+    runner, batch, slots, events = npu_v4_ubatch_case
+    if not has_control_plane:
+        runner.connector.control_plane = None
+
+    with v2_runner_module._use_afd_ubatch_preparation(runner):
+        prepared = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+
+    for stage, context in enumerate(prepared.forward_contexts):
+        metadata = context.additional_kwargs["afd_metadata"]
+        assert context.additional_kwargs["platform_stage"] == stage
+        assert metadata.stage_idx == stage
+        assert metadata.tokens_lens == [4]
+        assert metadata.tokens_unpadded_lens == [4]
+        assert context.attn_metadata["kv0"].stage == stage
+        assert torch.equal(
+            context.attn_metadata["kv0"].positions,
+            batch.positions[stage * 4 : (stage + 1) * 4],
+        )
+        assert torch.equal(
+            context.slot_mapping["kv0"], slots[0, stage * 4 : (stage + 1) * 4]
+        )
+    expected_events = ["control_update", "control_send"] if has_control_plane else []
+    assert events == expected_events
+    if has_control_plane:
+        payload = runner.connector.last_payload
+        assert list(payload.dp_metadata_list) == [0, 1]
+        assert [
+            m.num_tokens_across_dp_cpu.tolist()
+            for m in payload.dp_metadata_list.values()
+        ] == [[4, 4], [4, 4]]
+
+    native = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    assert [context.additional_kwargs for context in native.forward_contexts] == [
+        {"platform_stage": 0},
+        {"platform_stage": 1},
+    ]
+    assert events == expected_events
+
+
+def test_npu_v4_ubatch_prepare_error_restores_native_preparation(npu_v4_ubatch_case):
+    runner, batch, slots, events = npu_v4_ubatch_case
+    runner.model_state.prepare_error = ValueError("native preparation failed")
+    with (
+        pytest.raises(ValueError, match="native preparation failed"),
+        v2_runner_module._use_afd_ubatch_preparation(runner),
+    ):
+        runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    runner.model_state.prepare_error = None
+
+    native = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    assert [context.additional_kwargs for context in native.forward_contexts] == [
+        {"platform_stage": 0},
+        {"platform_stage": 1},
+    ]
+    assert events == []
 
 
 def test_mrv2_capture_tracker_distinguishes_equal_size_stage_layouts():
@@ -2170,3 +2266,287 @@ def test_non_afd_model_config_and_native_runner_identity_are_unchanged(
 
     assert get_afd_model_config(model_config, device_type="cuda") is model_config
     assert type(_construct_like_native_worker(worker)) is _NativeRunnerSentinel
+
+
+@pytest.fixture
+def stage_input_runner(monkeypatch):
+    def build(stage=1, model_type="deepseek_v4"):
+        runner = _runner_for_metadata([])
+        runner.vllm_config.model_config.hf_config.model_type = model_type
+        runner.device = torch.device("cuda")
+        runner._afd_v4_ubatch_inputs = None
+        runner.input_buffers = InputBuffers(8, 35, torch.device("cpu"))
+        runner.kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(layer_names=["kv0"]),
+                SimpleNamespace(layer_names=["kv1", "kv1-shared-layer"]),
+            ]
+        )
+        runner.model_state = AttentionMetadataState()
+        runner.ubatch_runner = PreparedUBatchRunner(
+            runner.model_state,
+            runner.kv_cache_config,
+            stage,
+        )
+        monkeypatch.setattr(v2_runner_module, "dbo_current_ubatch_id", lambda: stage)
+        return runner
+
+    return build
+
+
+@pytest.mark.parametrize("stage", [0, 1])
+@pytest.mark.parametrize(
+    "mode,for_capture",
+    [
+        (CUDAGraphMode.NONE, False),
+        (CUDAGraphMode.FULL, False),
+        (CUDAGraphMode.FULL, True),
+    ],
+    ids=["eager", "live-full", "capture"],
+)
+def test_v4_ubatch_metadata_and_model_share_refreshed_stage_views(
+    stage_input_runner,
+    stage,
+    mode,
+    for_capture,
+):  # long-test: stage inputs and fresh SM plans share one prepare ownership contract.
+    runner = stage_input_runner(stage)
+    batch = InputBatch.make_dummy(2, 28, runner.input_buffers)
+    batch.positions.copy_(torch.arange(28))
+    slots = torch.arange(56).reshape(2, 28)
+    with v2_runner_module._use_afd_ubatch_preparation(runner):
+        first = runner.ubatch_runner.prepare(
+            batch, (), slots, mode, for_capture=for_capture
+        )
+        first_finish = runner.ubatch_runner.begin_capturable_run(
+            lambda **kwargs: kwargs["positions"],
+            {"positions": batch.positions},
+            first,
+            for_capture=for_capture,
+        )
+        # Retain the returned view; each native finish is called exactly once.
+        positions = first_finish()
+        context = first.forward_contexts[stage]
+        saved_slots = dict(context.slot_mapping)
+        row_distance = saved_slots["kv1"].data_ptr() - saved_slots["kv0"].data_ptr()
+        # Relative row pitch checks the ABI layout, not CUDA allocator alignment.
+        assert row_distance > 0 and row_distance % 64 == 0
+        start = stage * 14
+        assert positions.tolist() == list(range(start, start + 14))
+        schedule = context.attn_metadata["kv0"].decode.schedule_metadata
+        assert schedule.shape == (TEST_COMPUTE_SMS + 1, 2)
+        assert schedule[:, 0].tolist() == list(range(TEST_COMPUTE_SMS + 1))
+        assert schedule[:, 1].tolist() == [start] * (TEST_COMPUTE_SMS + 1)
+        for layer in ("kv0", "kv1", "kv1-shared-layer"):
+            assert torch.equal(
+                context.attn_metadata[layer].decode.schedule_metadata, schedule
+            )
+            assert (
+                context.attn_metadata[layer].positions.data_ptr()
+                == positions.data_ptr()
+            )
+            assert (
+                context.attn_metadata[layer].slot_mapping.data_ptr()
+                == saved_slots[layer].data_ptr()
+            )
+        wider_batch = InputBatch.make_dummy(2, 34, runner.input_buffers)
+        wider_batch.positions.copy_(torch.arange(34) + 100)
+        wider_slots = torch.arange(68).reshape(2, 34) + 200
+        second = runner.ubatch_runner.prepare(
+            wider_batch, (), wider_slots, mode, for_capture=for_capture
+        )
+        second_finish = runner.ubatch_runner.begin_capturable_run(
+            lambda **kwargs: kwargs["positions"],
+            {"positions": wider_batch.positions},
+            second,
+            for_capture=for_capture,
+        )
+        wider_positions = second_finish()
+        start = stage * 17
+        expected_positions = wider_batch.positions[start : start + 17]
+        assert wider_positions.data_ptr() == positions.data_ptr()
+        assert torch.equal(wider_positions, expected_positions)
+        assert torch.equal(positions, expected_positions[:14])
+        refreshed = (
+            second.forward_contexts[stage].attn_metadata["kv0"].decode.schedule_metadata
+        )
+        for layer, group in (("kv0", 0), ("kv1", 1), ("kv1-shared-layer", 1)):
+            current = second.forward_contexts[stage]
+            assert torch.equal(
+                current.attn_metadata[layer].decode.schedule_metadata, refreshed
+            )
+            assert (
+                current.slot_mapping[layer].data_ptr() == saved_slots[layer].data_ptr()
+            )
+            assert torch.equal(
+                current.slot_mapping[layer], wider_slots[group, start : start + 17]
+            )
+            assert torch.equal(
+                saved_slots[layer], wider_slots[group, start : start + 14]
+            )
+            assert (
+                current.attn_metadata[layer].slot_mapping.data_ptr()
+                == saved_slots[layer].data_ptr()
+            )
+            assert torch.equal(
+                current.attn_metadata[layer].slot_mapping, current.slot_mapping[layer]
+            )
+            assert torch.equal(current.attn_metadata[layer].positions, wider_positions)
+        assert refreshed.data_ptr() == schedule.data_ptr()
+        assert refreshed.shape == (TEST_COMPUTE_SMS + 1, 2)
+        assert refreshed[:, 0].tolist() == list(range(TEST_COMPUTE_SMS + 1))
+        assert refreshed[:, 1].tolist() == [start + 100] * (TEST_COMPUTE_SMS + 1)
+        # Ordinary prepare inside the same V4 scope must still plan for physical
+        # SMs; leasing ModelState.prepare_attn would incorrectly shrink it too.
+        ordinary = runner.model_state.prepare_attn(
+            wider_batch,
+            mode,
+            (),
+            wider_slots,
+            runner.ubatch_runner.attn_groups,
+            runner.kv_cache_config,
+            ubatch_idx=stage,
+        )["kv0"].decode.schedule_metadata
+        assert ordinary.data_ptr() == schedule.data_ptr()
+        assert ordinary.shape == (TEST_PHYSICAL_SMS + 1, 2)
+        assert ordinary[:, 0].tolist() == list(range(TEST_PHYSICAL_SMS + 1))
+        assert ordinary[:, 1].tolist() == [100] * (TEST_PHYSICAL_SMS + 1)
+
+
+@pytest.mark.parametrize("model_type", ["deepseek_v4", "deepseek_v2", "qwen3_moe"])
+@pytest.mark.parametrize("failure", ["model", "prepare"])
+def test_ubatch_failure_restores_native_input_binding_and_indexer_plan(
+    stage_input_runner, model_type, failure
+):  # long-test: both failure exits must restore ordinary input and plan ownership.
+    runner = stage_input_runner(model_type=model_type)
+    batch = InputBatch.make_dummy(2, 28, runner.input_buffers)
+    slots = torch.arange(56).reshape(2, 28)
+    batch.positions.copy_(torch.arange(28))
+    error = ValueError("step failed")
+    if failure == "prepare":
+        runner.model_state.prepare_error = error
+
+    def fail(**kwargs):
+        raise error
+
+    with (
+        pytest.raises(ValueError, match="step failed") as caught,
+        v2_runner_module._use_afd_ubatch_preparation(runner),
+    ):
+        prepared = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+        expected_sms = (
+            TEST_COMPUTE_SMS if model_type == "deepseek_v4" else TEST_PHYSICAL_SMS
+        )
+        for context in prepared.forward_contexts:
+            assert context.attn_metadata["kv0"].decode.schedule_metadata.shape == (
+                expected_sms + 1,
+                2,
+            )
+        runner.ubatch_runner.begin_capturable_run(
+            fail,
+            {"positions": batch.positions},
+            prepared,
+        )()
+    assert caught.value is error
+    runner.model_state.prepare_error = None
+    metadata = runner.model_state.prepare_attn(
+        batch,
+        CUDAGraphMode.NONE,
+        (),
+        slots,
+        runner.ubatch_runner.attn_groups,
+        runner.kv_cache_config,
+    )
+    schedule = metadata["kv0"].decode.schedule_metadata
+    assert schedule.shape == (TEST_PHYSICAL_SMS + 1, 2)
+    assert schedule[:, 0].tolist() == list(range(TEST_PHYSICAL_SMS + 1))
+    assert schedule[:, 1].tolist() == [0] * (TEST_PHYSICAL_SMS + 1)
+    assert metadata["kv0"].positions is batch.positions
+    assert metadata["kv1"].slot_mapping.data_ptr() == slots[1].data_ptr()
+    prepared = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    positions = runner.ubatch_runner.begin_capturable_run(
+        lambda **kwargs: kwargs["positions"],
+        {"positions": batch.positions},
+        prepared,
+    )()
+    assert positions.data_ptr() == batch.positions[14:].data_ptr()
+    for stage, context in enumerate(prepared.forward_contexts):
+        schedule = context.attn_metadata["kv0"].decode.schedule_metadata
+        assert schedule.shape == (TEST_PHYSICAL_SMS + 1, 2)
+        assert schedule[:, 1].tolist() == [stage * 14] * (TEST_PHYSICAL_SMS + 1)
+
+
+@pytest.fixture
+def workspace_profile_case(monkeypatch):
+    def build(
+        *,
+        num_lanes=1,
+        device="cuda",
+        model_type="deepseek_v4",
+        use_ubatching=True,
+        backend=True,
+    ):
+        case = WorkspaceCase(monkeypatch, num_lanes=num_lanes, backend=backend)
+        case.config.model_config.hf_config.model_type = model_type
+        case.config.parallel_config.use_ubatching = use_ubatching
+        runner = object.__new__(AFDAttentionModelRunnerV2)
+        runner.vllm_config = case.config
+        runner.parallel_config = case.config.parallel_config
+        runner.device = torch.device(device)
+        runner.model = case.model
+        runner.workspace_case = case
+        monkeypatch.setattr(
+            native_v2.GPUModelRunner, "profile_run", profile_workspace_peak
+        )
+        return runner, case
+
+    return build
+
+
+@pytest.mark.parametrize("num_lanes", [1, 2])
+def test_v4_profile_accounts_for_each_locked_workspace_owner(
+    workspace_profile_case, num_lanes
+):
+    runner, case = workspace_profile_case(num_lanes=num_lanes)
+
+    assert runner.profile_run(randomize_inputs=True) is None
+
+    views = case.profile_views
+    assert len({view.data_ptr() for view in views}) == case.num_ubatches * num_lanes
+    resident = sum(view.untyped_storage().nbytes() for view in views)
+    assert (
+        case.remaining_budget
+        == CPU_PROFILE_BUDGET_BYTES - resident - CPU_PROFILE_TRANSIENT_BYTES
+    )
+    with torch.inference_mode():
+        for owner, view in enumerate(views):
+            view.fill_(owner + 1)
+    assert [view.item() for view in views] == list(range(1, len(views) + 1))
+    # Native NoMeta consumers were exercised after lock inside the peak seam.
+    # Keep the genuine native locked-growth error for a larger unsupported set.
+    with pytest.raises(AssertionError, match="Workspace growth is not allowed"):
+        case.manager.get_simultaneous(((OVERBOUND_WORKSPACE_BYTES,), torch.uint8))
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        dict(device="cpu"),
+        dict(model_type="deepseek_v2"),
+        dict(use_ubatching=False),
+        dict(backend=False),
+    ],
+    ids=["non-cuda", "non-v4", "non-ubatch", "other-attention"],
+)
+def test_profile_keeps_unaffected_workspace_owners_unreserved(
+    workspace_profile_case, options
+):
+    runner, case = workspace_profile_case(**options)
+    case.require_all_slots = False
+
+    assert runner.profile_run() is None
+
+    assert case.remaining_budget > 0
+    case.ubatch = 1
+    with pytest.raises(AssertionError, match="Workspace growth is not allowed"):
+        case.manager.get_simultaneous(((1,), torch.uint8))

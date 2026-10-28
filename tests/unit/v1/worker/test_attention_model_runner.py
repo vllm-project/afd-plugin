@@ -697,8 +697,6 @@ def test_afd_rank_raises_for_out_of_range_dp2_tp2(monkeypatch):
         resolve_role_rank(vllm_config, config)
 
 
-def test_attention_runner_delegates_native_profile_and_dummy_execution():
-    # MRV2 owns input preparation and microbatching; AFD wraps execute_model's
-    # provider seam rather than retaining V1 dummy/profile implementations.
-    assert AFDAttentionModelRunnerV2.profile_run is GPUModelRunner.profile_run
+def test_attention_runner_delegates_native_dummy_execution():
+    # MRV2 owns dummy input preparation and microbatching.
     assert AFDAttentionModelRunnerV2._dummy_run is GPUModelRunner._dummy_run

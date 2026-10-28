@@ -254,11 +254,11 @@ samples, with the existing 24-sample floor for DBO.
 ## DSV4 Flash CUDA qualification
 
 `models/deepseek_v4_flash/test_gpu.py` provides separate CUDA qualification
-profiles for the synchronous `P2pNcclAFDConnector`. These are candidate H20
-profiles; this upgrade-only baseline has not been GPU-qualified. Later H20
-runs used revisions with additional fixes, as distinguished in the
-[runtime matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix).
-They do not reuse Ascend W4A8, HCCL, or the NPU launch shapes.
+profiles for the synchronous `P2pNcclAFDConnector`. The vLLM 0.32 H20 AFD
+2A2F eager and Graph DBO runs are recorded in the
+[runtime matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix);
+other profiles require their own hardware evidence. They do not reuse Ascend
+W4A8, HCCL, or the NPU launch shapes.
 
 The basic test has four cases:
 
@@ -314,8 +314,8 @@ sequences, chunked prefill, and `kv-cache-dtype=fp8`. It leaves weight
 quantization and the device-aware MoE kernel selection to the checkpoint and
 target vLLM. AFD keeps gating on FFN and does not enable MegaMoE. Provision the
 large Flash checkpoint explicitly with `AFD_GPU_E2E_MODEL`; there is no implicit
-model download. Model fit and kernel workspace require H20 validation on this
-upgrade-only baseline.
+model download. Model fit and kernel workspace were exercised for the recorded
+H20 2A2F profile; other configurations require their own validation.
 
 Native DBO was excluded from the vLLM 0.32 H20 upgrade qualification after the
 configured upstream backend rejected it. The all-DBO and full-module commands
