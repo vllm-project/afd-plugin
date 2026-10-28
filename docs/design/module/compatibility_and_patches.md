@@ -26,6 +26,8 @@ validation_paths:
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
 upstream_refs:
+  - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "NPU: vLLM 0.30.0 ced6857afa0ea7b2e3f0846a62e1394e90f15607"
   - "vLLM vllm.v1.engine.core.EngineCore and EngineCoreProc"
   - "vLLM vllm.v1.engine.core_client.DPAsyncMPClient"
   - "vLLM vllm.forward_context.set_forward_context"
@@ -58,13 +60,17 @@ patch modules must not become a general home for AFD-owned functionality.
 
 ## Supported upstream boundary
 
-The package extra pins vLLM `0.30.0`, and
-[`compat/vllm.py`](../../../afd_plugin/compat/vllm.py) enforces the same target.
+The package extra pins vLLM `0.32.0` for GPU.
+[`compat/vllm.py`](../../../afd_plugin/compat/vllm.py) selects the GPU
+`0.32.0` or NPU `0.30.0` target using the active platform.
 Direct strict calls raise for a missing or different vLLM; plugin registration
 calls the check with `strict=False`, so it warns and continues. This warning
-policy does not make another vLLM release supported.
+policy does not make another vLLM release supported. Shared EngineCore and
+coordinator differences retain the NPU 0.30 contract; CPU tests cover these
+seams, but this upgrade branch has not been validated on NPU hardware.
 
-The NPU implementation is based on vLLM-Ascend commit
+The NPU implementation remains based on vLLM `0.30.0` (`ced6857a`) and
+vLLM-Ascend commit
 [`8d4409d62`](https://github.com/vllm-project/vllm-ascend/commit/8d4409d6256d8a6729140ddcc0d1889e3f96cdd6).
 The repository does not declare a vLLM-Ascend package dependency in
 `pyproject.toml`, so this source commit and the recorded NPU validation are the
@@ -144,9 +150,9 @@ These modules adapt upstream behavior without replacing a global symbol:
 
 Several scoped upstream adaptations live with their semantic owners rather
 than this patch directory. Model dummy runs and V2 execution temporarily wrap
-`create_forward_context`; CUDA worker startup temporarily substitutes the
-native V2 runner symbol; V2 graph capture temporarily wraps native input
+`create_forward_context`; V2 graph capture temporarily wraps native input
 preparation; and full-graph replay installs an instance-local manager hook.
+CUDA workers select AFD runners through the native `_make_model_runner` factory.
 Every scope restores symbols and runner state in `finally`. Connector process
 groups also call private PyTorch/vLLM helpers as described in
 [connector contracts](connector_contracts.md). All of these seams must be
@@ -164,8 +170,8 @@ ordinary `EngineCoreProc`, retains the native coordinator/stat channels, and
 disables wave coordination. Existing DPLB tests exercise native routing with
 supplied counts;
 they do not prove end-to-end publication from a running async Attention
-scheduler. Audit the v0.30 publisher path before adding another queue-statistics
-patch.
+scheduler. Audit the applicable pinned publisher path before adding another
+queue-statistics patch.
 
 ## Patch review and refresh procedure
 

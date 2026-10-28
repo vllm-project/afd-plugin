@@ -6,7 +6,7 @@ P2pNcclAFDConnector (implemented with vLLM's PyNcclCommunicator) is a GPU-backed
 
 Use this connector for CUDA deployments that disaggregate Attention and FFN
 workers and exchange hidden states synchronously through NCCL point-to-point
-communication. On vLLM 0.30, DeepSeek MoE layers keep the native MoE forward
+communication. On the GPU target vLLM 0.32, DeepSeek MoE layers keep the native MoE forward
 contract and replace only the local experts with an AFD remote-experts proxy.
 The MoE gate may run on Attention or FFN.
 
@@ -130,10 +130,15 @@ the native V2 runner; FFN remains connector-driven. GPU V1 is unavailable.
 export VLLM_USE_V2_MODEL_RUNNER=1
 ```
 
-The minimal DP1/TP1 commands below illustrate the launch shape. H20
-hardware validation covers DeepSeek-V2-Lite DP1/TP2 Graph + DBO with 128
-GSM8K samples and live two-stage/full-replay assertions; see the
-[PR #454](https://github.com/vllm-project/afd-plugin/pull/454).
+The minimal DP1/TP1 commands below illustrate the launch shape; they are
+not an exact target-runtime test. vLLM 0.32 H20 E2E runs exercised
+DeepSeek-V2-Lite DP2/TP1 Graph + DBO and DeepSeek-V4 DP2/TP1 eager and
+Graph + DBO on other revisions with additional fixes, not this upgrade-only
+baseline; see the [runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix)
+for scope. Historical vLLM 0.30 H20 validation in
+[PR #454](https://github.com/vllm-project/afd-plugin/pull/454) covered
+DeepSeek-V2-Lite DP1/TP2 Graph + DBO with 128 GSM8K samples and live
+two-stage/full-replay assertions.
 
 Attention side:
 
@@ -181,11 +186,14 @@ EP, EPLB, sequence-parallel MoE and compile SP are rejected.
 
 Eager and `FULL_DECODE_ONLY` graph execution are accepted. V2 DBO requires
 exactly two microbatches and accepts Attention DP1 or DP > 1. The generic
-[GPU E2E runner](../../tests/e2e/runner.py) covers eager/graph DP2 and TP2,
-including `afd-v2-eager-dbo-dp2` and `afd-v2-graph-dbo-dp2`. H20 validation
-also covers the existing DeepSeek-V2-Lite DP1/TP2 Graph + DBO recipe with
-128 GSM8K samples and live two-stage/full-replay assertions. Model-specific
-exclusions still apply; a registered model does not qualify every topology.
+[GPU E2E runner](../../tests/e2e/runner.py) defines eager/graph DP2 and TP2
+scenarios, including `afd-v2-eager-dbo-dp2` and
+`afd-v2-graph-dbo-dp2`. In vLLM 0.32 H20 tests, DeepSeek-V2-Lite TP2
+Graph + DBO and DP2 eager + DBO passed inference and their oracles, but
+graceful shutdown failed and processes required force killing; the shutdown
+symptom was also reproduced on vLLM 0.30. These results do not qualify the
+checked-in recipe itself. Model-specific exclusions still apply; a
+registered model does not qualify every topology.
 
 ## Receive buffers and memory
 
@@ -213,5 +221,5 @@ alone does not authorize replay. These behaviors are covered by the
 - Current GPU CUDA graph support is `FULL_DECODE_ONLY`; GPU DBO plus CUDA graph is limited to exactly two ubatches.
 - CUDA remote experts do not currently support EPLB on the Attention role.
 - To enable DBO, set `--enable-dbo`, and configure the threshold with `--dbo-decode-token-threshold` and `--dbo-prefill-token-threshold`. See `recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite` for examples.
-- The repository recipes currently validate specific GPU layouts (including DeepSeek V2 Lite and tested A/H-class hardware). Cross-node placement is verified for DeepSeek-V2-Lite `2A2F` with the FFN ranks on separate hosts, over TCP (ENA) and over EFA; other topologies and hardware should be treated as unverified.
+- Historical documentation reported cross-node DeepSeek-V2-Lite `2A2F` with the FFN ranks on separate hosts over TCP (ENA) and EFA. These placements and transports were not revalidated during the vLLM 0.32 upgrade. Some checked-in recipes were only statically inspected for the target runtime; see the recipe documentation for their scope.
 - There is no automatic fallback from this connector to another transport. Select an NPU connector explicitly on Ascend.

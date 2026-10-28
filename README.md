@@ -18,8 +18,14 @@ tests for GPU and Ascend NPU deployments.
 > This project is still experimental and needs more large-scale testing across
 > different hardware backends.
 
-The target runtime is **vLLM `v0.30.0`** at commit `ced6857a`; the Ascend
-integration targets vLLM-Ascend `8d4409d6`. The plugin does not modify the vLLM
+This upgrade-only baseline has not been qualified on GPU hardware. The vLLM
+0.32 H20 results referenced below used different revisions that include
+additional fixes; they do not validate this baseline.
+
+The GPU target is **vLLM `v0.32.0`** at commit `5df63a72`. The Ascend
+integration is based on vLLM `v0.30.0` at `ced6857a` and vLLM-Ascend
+`8d4409d6`. Shared compatibility changes have CPU contract coverage; this
+upgrade branch has not been validated on NPU hardware. The plugin does not modify the vLLM
 source tree. AFD behavior is installed through the `vllm.general_plugins` entry
 point, `--additional-config`, automatically selected role workers, plugin-owned
 model wrappers, and narrow version-scoped compatibility shims.
@@ -47,6 +53,7 @@ Model support:
 | Model family | Registered architectures | Plugin model wrappers | Notes |
 | --- | --- | --- | --- |
 | DeepSeekV2 / DeepSeekV3 / DeepSeekV3.2 | `DeepseekForCausalLM`, `DeepseekV2ForCausalLM`, `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | `AFDDeepseekForCausalLM`, `AFDDeepseekV2ForCausalLM`, `AFDDeepseekV3ForCausalLM` | DeepSeekV3.2 uses `AFDDeepseekV3ForCausalLM`. Each AFD role constructs and loads only its role-required model components, while shared embedding, normalization, and output components remain available where required by the model lifecycle. |
+| DeepSeek V4 Flash | `DeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` | CUDA is not hardware-qualified on this upgrade-only baseline; Ascend evidence has separate limits. |
 | Qwen3 MoE | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | CUDA with `compute_gate_on_attention=false`. |
 | Qwen3.5 / Qwen3.6 MoE | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | CUDA text-only Qwen3.6-35B-A3B with `--language-model-only`, native DP4/TP1/EP4, and synchronous AFD 2A1F. Eager and graph execution remain supported; GDN DBO is temporarily withdrawn; native hybrid/multimodal validation applies. Earlier DBO experiments are historical evidence only; see the [E2E limits](docs/design/module/e2e_testing.md). |
 
@@ -66,9 +73,9 @@ Connector implementations are grouped by backend package:
 
 Known gaps:
 
-- The GPU target is exactly vLLM `0.30.0`; other vLLM versions are not
+- The GPU target is exactly vLLM `0.32.0`; other vLLM versions are not
   claimed as supported on GPU.
-- NPU hardware evidence covers representative DeepSeek-V2-Lite and DSV4
+- Historical NPU hardware evidence covers representative DeepSeek-V2-Lite and DSV4
   Flash W4A8 deployments; see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix).
   Other models and topologies remain unverified.
 - Synchronous DSV4 E2E profiles are smoke cases; A5 concurrent answers remain
@@ -76,12 +83,17 @@ Known gaps:
 - GPU Attention requires native ModelRunnerV2; there is no GPU V1 fallback.
   FFN remains connector-driven. Synchronous `P2pNcclAFDConnector` supports
   two-microbatch DBO and `FULL_DECODE_ONLY`, with model-specific gate placement.
-  H20 validation covers DeepSeek-V2-Lite DP1/TP2 Graph + DBO with 128
-  GSM8K samples and live two-stage/full-replay assertions.
-  Earlier H20 validation covers DeepSeek-V2-Lite, 2A2F DP2/TP1;
+  Earlier vLLM 0.30 H20 validation covers DeepSeek-V2-Lite DP1/TP2 Graph +
+  DBO with 128 GSM8K samples and live two-stage/full-replay assertions, and
+  DeepSeek-V2-Lite 2A2F DP2/TP1. On vLLM 0.32, TP2 Graph + DBO
+  inference passed a 24-sample check but graceful shutdown failed; investigation
+  is ongoing. These are distinct runtime results;
   see the [MRV2 DBO scenarios](tests/e2e/README.md#gpu-mrv2-dbo-development-comparison).
   Representative 300-question comparisons do not establish numerical
   equivalence; see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix) for the recorded GPU evidence and separate NPU DBO constraints.
+- DeepSeek-V4 Flash CUDA DBO has not been qualified on this upgrade-only
+  baseline. H20 runs on a later revision are distinguished in the
+  [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix).
 - GPU and NPU E2E tests are opt-in and require real hardware plus model weights.
 - GPU CUDA graph support is limited to `FULL_DECODE_ONLY`.
 - Native DBO is limited to exactly two ubatches. NPU CAMP2P supports eager
@@ -91,7 +103,7 @@ Known gaps:
 - Qwen3 MoE currently rejects Attention-side gate placement, sequence-parallel
   MoE, EPLB, pipeline parallelism, speculative decoding, LoRA, and NPU.
 - Qwen3.5/Qwen3.6 MoE adapter-family support is limited to the CUDA text-only
-  lane; repository hardware E2E evidence currently covers Qwen3.6-35B-A3B.
+  lane; earlier repository hardware E2E evidence covers Qwen3.6-35B-A3B.
   GDN DBO is unsupported; upstream hybrid/multimodal DBO validation applies.
   NPU and multimodal execution are unsupported/unverified;
   `compute_gate_on_attention=true`, pipeline parallelism, asynchronous and
@@ -100,7 +112,7 @@ Known gaps:
 
 ## Install
 
-Requires Python **3.10-3.13** and [uv](https://docs.astral.sh/uv/).
+Requires Python **3.11-3.13** and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 git clone https://github.com/vllm-project/afd-plugin.git
@@ -120,18 +132,20 @@ command:
 uv sync --group dev --extra vllm
 ```
 
-The optional extra pins `vllm==0.30.0`.
+The optional GPU extra pins `vllm==0.32.0`.
 
 ### Ascend NPU installation
 
-The Ascend target uses the source pair below. Representative v0.30 validation
+The Ascend integration is based on the source pair below. Shared GPU-upgrade
+changes have CPU contract coverage, but this branch has not been qualified on
+NPU hardware. Representative v0.30 validation on the earlier code
 uses Ascend 910C / Atlas A3; see the [recorded environment and results](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923).
 Install a compatible driver and firmware, and confirm the devices with
 `npu-smi info`.
 
 | Component | Version |
 | --- | --- |
-| Python | `3.10` or `3.11` |
+| Python | `3.11` (the current package requires Python 3.11 or newer) |
 | vLLM | `0.30.0`, commit `ced6857afa0ea7b2e3f0846a62e1394e90f15607` |
 | vLLM-Ascend | commit [`8d4409d6`](https://github.com/vllm-project/vllm-ascend/commit/8d4409d6256d8a6729140ddcc0d1889e3f96cdd6) |
 | CANN / torch / torch-npu | Use the mutually compatible versions required by that vLLM-Ascend source snapshot. |
@@ -204,8 +218,9 @@ interfaces.
 GPU and NPU launches require `VLLM_USE_V2_MODEL_RUNNER=1` on both roles.
 Attention uses native ModelRunnerV2; FFN keeps its connector-driven runner.
 Neither backend has a V1 fallback. GPU DBO requires two microbatches and accepts Attention
-DP1 or DP > 1. The DP1 path has H20 DeepSeek-V2-Lite DP1/TP2 Graph + DBO
-validation recorded in [PR #454](https://github.com/vllm-project/afd-plugin/pull/454).
+DP1 or DP > 1. Earlier vLLM 0.30 H20 validation of DeepSeek-V2-Lite DP1/TP2
+Graph + DBO is recorded in [PR #454](https://github.com/vllm-project/afd-plugin/pull/454);
+on vLLM 0.32 inference passed but graceful shutdown failed.
 See the [dedicated E2E scenarios](tests/e2e/README.md#gpu-mrv2-dbo-development-comparison).
 
 ```bash
