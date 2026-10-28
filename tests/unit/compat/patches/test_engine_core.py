@@ -28,6 +28,15 @@ def _engine_core_outputs(**kwargs):
 def _install_fake_vllm_core(
     monkeypatch: pytest.MonkeyPatch, *, device_type: str = "cuda"
 ):
+    # Reload a fresh patch module against the fake, leaving any existing real
+    # module and its already-imported references untouched. Undo restores both
+    # the sys.modules entry and the package attribute, including when absent.
+    patch_name = "afd_plugin.compat.patches.engine_core"
+    patch_package = importlib.import_module("afd_plugin.compat.patches")
+    monkeypatch.setitem(sys.modules, patch_name, None)
+    monkeypatch.delitem(sys.modules, patch_name)
+    monkeypatch.setattr(patch_package, "engine_core", None, raising=False)
+
     vllm_module = types.ModuleType("vllm")
     vllm_module.__version__ = "0.30.0" if device_type == "npu" else "0.32.0"
     platforms_module = types.ModuleType("vllm.platforms")
@@ -334,7 +343,7 @@ def test_engine_core_patch_skips_kv_scheduler_init_for_ffn(monkeypatch):
     assert isinstance(engine.model_executor, Executor)
 
 
-def test_ffn_noop_scheduler_tolerates_late_patch_load():
+def test_ffn_noop_scheduler_tolerates_late_patch_load(monkeypatch):
     """A cold FFN engine loads the patches mid-native-init.
 
     The native frame then runs on with the noop scheduler returned by the
@@ -343,6 +352,8 @@ def test_ffn_noop_scheduler_tolerates_late_patch_load():
     the ``ec_connector`` output-aggregator check and the ready handshake's
     ``get_kv_event_publisher_config()`` probe.
     """
+    _install_fake_vllm_core(monkeypatch)
+    _load_patch_module()
     from afd_plugin.compat.patches.engine_core import _AFDFFNNoopScheduler
 
     scheduler = _AFDFFNNoopScheduler()
@@ -353,7 +364,7 @@ def test_ffn_noop_scheduler_tolerates_late_patch_load():
     assert scheduler.has_requests() is False
 
 
-def test_ffn_early_init_satisfies_native_ready_handshake():
+def test_ffn_early_init_satisfies_native_ready_handshake(monkeypatch):
     """Both plugin-loading orders must survive the native ready handshake.
 
     When the patches are installed before FFN EngineCore construction (fork
@@ -363,6 +374,8 @@ def test_ffn_early_init_satisfies_native_ready_handshake():
     early-loaded path therefore needs the same noop scheduler the
     late-loaded path already gets.
     """
+    _install_fake_vllm_core(monkeypatch)
+    _load_patch_module()
     from afd_plugin.compat.patches.engine_core import _AFDFFNNoopScheduler
 
     noop = _AFDFFNNoopScheduler()
