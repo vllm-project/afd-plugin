@@ -2270,6 +2270,9 @@ def test_non_afd_model_config_and_native_runner_identity_are_unchanged(
 
 @pytest.fixture
 def stage_input_runner(monkeypatch):
+    # Load the CUDA model adapter only for stage-input cases.
+    from afd_plugin.model_executor.models import deepseek_v4
+
     def build(stage=1, model_type="deepseek_v4", capacity=35, groups=2):
         runner = _runner_for_metadata([])
         runner.vllm_config.model_config.hf_config.model_type = model_type
@@ -2291,7 +2294,7 @@ def stage_input_runner(monkeypatch):
             runner.kv_cache_config,
             stage,
         )
-        monkeypatch.setattr(v2_runner_module, "dbo_current_ubatch_id", lambda: stage)
+        monkeypatch.setattr(deepseek_v4, "dbo_current_ubatch_id", lambda: stage)
         return runner
 
     return build

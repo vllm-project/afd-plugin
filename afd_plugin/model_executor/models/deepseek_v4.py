@@ -8,17 +8,27 @@ and token-aligned input IDs cross the Attention-to-FFN boundary. The returned
 FFN activation is the sole FFN-to-Attention tensor.
 """
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from types import MethodType
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.models.deepseek_v4.nvidia import model as native
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
+from vllm.v1.worker.gpu.ubatch_utils import UBatchState
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+from vllm.v1.worker.utils import AttentionGroup
 from vllm.v1.worker.workspace import WorkspaceManager, current_workspace_manager
 
 from afd_plugin.config import parse_afd_config
@@ -26,10 +36,214 @@ from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetada
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
+if TYPE_CHECKING:
+    from afd_plugin.v1.worker.attention_model_runner_v2 import AFDAttentionModelRunnerV2
+
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
 _BOTH_ROLES = frozenset(("attention", "ffn"))
 _FLASHMLA_PROFILE_TOKENS = 1
+# V4 CuTe compressor positions/slot pointers require eight int64 elements.
+_V4_INPUT_ALIGNMENT_ELEMENTS = 8
+
+
+class _AFDV4UBatchInputs:
+    """Stable aligned prefixes shared by every layer in each V4 stage."""
+
+    def __init__(
+        self,
+        input_buffers: InputBuffers,
+        native_slot_mappings: torch.Tensor,
+        num_ubatches: int,
+    ) -> None:
+        capacity = input_buffers.max_num_tokens
+        num_kv_groups = native_slot_mappings.shape[0]
+        pitch = (
+            (capacity + _V4_INPUT_ALIGNMENT_ELEMENTS - 1)
+            // _V4_INPUT_ALIGNMENT_ELEMENTS
+            * _V4_INPUT_ALIGNMENT_ELEMENTS
+        )
+        # Native dummy and live inputs share these buffers, and stage 0 starts
+        # at token 0. Choose slot borrowing once before graph capture.
+        self.positions = (input_buffers.positions,) + tuple(
+            input_buffers.positions.new_empty((capacity,))
+            for _ in range(1, num_ubatches)
+        )
+        borrow_first_slots = (
+            num_kv_groups <= 1
+            or native_slot_mappings.stride(0) % _V4_INPUT_ALIGNMENT_ELEMENTS == 0
+        )
+        self.slot_mappings = tuple(
+            None
+            if stage == 0 and borrow_first_slots
+            else input_buffers.positions.new_empty((num_kv_groups, pitch))
+            for stage in range(num_ubatches)
+        )
+
+
+@contextmanager
+def _use_v4_ubatch_preparation(
+    runner: "AFDAttentionModelRunnerV2",
+) -> Iterator[None]:
+    """Prepare CUDA V4 stage inputs and indexer plans for native ubatching."""
+    ubatch_runner = runner.ubatch_runner
+    assert ubatch_runner is not None
+    if runner._afd_v4_ubatch_inputs is None:
+        runner._afd_v4_ubatch_inputs = _AFDV4UBatchInputs(
+            runner.input_buffers,
+            runner.block_tables.slot_mappings,
+            ubatch_runner.num_ubatches,
+        )
+    inputs = runner._afd_v4_ubatch_inputs
+    model_state = runner.model_state
+    state = vars(model_state)
+    had_prepare = "prepare_attn" in state
+    previous_prepare = state.get("prepare_attn")
+    # V4 uses the pinned DefaultModelState, whose concrete signature includes
+    # the optional model-specific metadata argument absent on its base class.
+    original_prepare_attn = cast(DefaultModelState, model_state).prepare_attn
+    ubatch_state = vars(ubatch_runner)
+    had_ubatch_prepare = "prepare" in ubatch_state
+    previous_ubatch_prepare = ubatch_state.get("prepare")
+    original_ubatch_prepare = ubatch_runner.prepare
+    had_begin = "begin_capturable_run" in ubatch_state
+    previous_begin = ubatch_state.get("begin_capturable_run")
+    original_begin = ubatch_runner.begin_capturable_run
+
+    # Patch reason: native ubatch views can start at a non-64-byte boundary.
+    # Patch functionality: retain native stage-zero inputs where their fixed
+    # layout is aligned; stage other inputs before native metadata builders.
+    # Stable addresses are refreshed before FULL replay as well as eager/capture.
+    # Signature: matches DefaultModelState.prepare_attn at vLLM 5df63a7,
+    # vllm/v1/worker/gpu/model_states/default.py. Delegation retains native
+    # metadata construction; remove when native stage buffers meet V4's ABI.
+    def prepare_attn(
+        self,
+        input_batch: InputBatch,
+        cudagraph_mode: CUDAGraphMode,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+        for_capture: bool = False,
+        ubatch_idx: int = 0,
+        model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
+    ) -> dict[str, Any]:
+        # ### PATCH START: stable aligned V4 stage metadata inputs.
+        if ubatch_idx:
+            positions = inputs.positions[ubatch_idx][: input_batch.positions.shape[0]]
+            positions.copy_(input_batch.positions)
+            input_batch = replace(input_batch, positions=positions)
+        slots = inputs.slot_mappings[ubatch_idx]
+        if slots is None:
+            slots = slot_mappings
+        else:
+            slots = slots[:, : slot_mappings.shape[1]]
+            slots.copy_(slot_mappings)
+        return original_prepare_attn(
+            input_batch,
+            cudagraph_mode,
+            block_tables,
+            slots,
+            attn_groups,
+            kv_cache_config,
+            for_capture=for_capture,
+            ubatch_idx=ubatch_idx,
+            model_specific_attn_metadata=model_specific_attn_metadata,
+        )
+        # ### PATCH END: stable aligned V4 stage metadata inputs.
+
+    # Patch reason: native model-input slicing recreates the unaligned view.
+    # Patch functionality: bind the model call to the same persistent positions
+    # prepared for this stage; native threads, streams and finish stay intact.
+    # Signature: matches UBatchRunner.begin_capturable_run at vLLM 5df63a7,
+    # vllm/v1/worker/gpu/ubatch_utils.py. The callable accepts the native open
+    # model-input dictionary. Remove with the aligned V4 preparation adapter.
+    def begin_capturable_run(
+        self,
+        model: Any,
+        model_inputs: dict[str, Any],
+        ubatch_state: UBatchState,
+        for_capture: bool = False,
+    ) -> Callable[[], Any]:
+        # ### PATCH START: bind V4 model positions without changing scheduling.
+        def aligned_model(**model_kwargs: Any) -> Any:
+            stage = dbo_current_ubatch_id()
+            model_kwargs["positions"] = inputs.positions[stage][
+                : ubatch_state.slices[stage].num_tokens
+            ]
+            return model(**model_kwargs)
+
+        return original_begin(
+            aligned_model, model_inputs, ubatch_state, for_capture=for_capture
+        )
+        # ### PATCH END: bind V4 model positions without changing scheduling.
+
+    # Patch reason: native preparation uses physical-SM indexer plans and
+    # rebuilds context slots from potentially unaligned microbatch views.
+    # Patch functionality: lease the UBatchRunner compute budget to the native
+    # indexer builders, restore it even on failure, and bind aligned live/capture
+    # slots. Native slicing, metadata construction and FULL replay stay native.
+    # Signature: matches UBatchRunner.prepare in vllm/v1/worker/gpu/ubatch_utils.py
+    # at vLLM 5df63a7203cdb9328d824a27b682e77c7b9928be; indexer.py at the same pin
+    # owns the physical-capacity buffers and planner refill. Delegation avoids
+    # copying the full native preparation. Remove when native propagates its SM
+    # budget and provides stable aligned V4 stage inputs.
+    def prepare(
+        self,
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        cg_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        for_capture: bool = False,
+    ) -> UBatchState:
+        # ### PATCH START: V4 stage input and indexer preparation.
+        indexer_budgets: list[tuple[DeepseekV32IndexerMetadataBuilder, int]] = []
+        try:
+            for groups in self.attn_groups:
+                for group in groups:
+                    for stage in range(self.num_ubatches):
+                        builder = group.get_metadata_builder(stage)
+                        if isinstance(builder, DeepseekV32IndexerMetadataBuilder):
+                            indexer_budgets.append((builder, builder.num_sms))
+                            builder.num_sms = self.sm_control.compute_sms
+            prepared = original_ubatch_prepare(
+                input_batch, block_tables, slot_mappings, cg_mode, for_capture
+            )
+        finally:
+            # Reverse order also restores correctly if groups share a builder.
+            for builder, num_sms in reversed(indexer_budgets):
+                builder.num_sms = num_sms
+        # FULL replay uses the context captured by the graph, not this fresh one.
+        if cg_mode != CUDAGraphMode.FULL or for_capture:
+            for stage, context in enumerate(prepared.forward_contexts):
+                slots = inputs.slot_mappings[stage]
+                if slots is not None:
+                    context.slot_mapping = build_slot_mappings_by_layer(
+                        slots[:, : prepared.slices[stage].num_tokens],
+                        runner.kv_cache_config,
+                    )
+        return prepared
+        # ### PATCH END: V4 stage input and indexer preparation.
+
+    model_state.prepare_attn = MethodType(prepare_attn, model_state)
+    ubatch_runner.begin_capturable_run = MethodType(begin_capturable_run, ubatch_runner)
+    ubatch_runner.prepare = MethodType(prepare, ubatch_runner)
+    try:
+        yield
+    finally:
+        if had_ubatch_prepare:
+            ubatch_runner.prepare = previous_ubatch_prepare
+        else:
+            del ubatch_runner.prepare
+        if had_begin:
+            ubatch_runner.begin_capturable_run = previous_begin
+        else:
+            del ubatch_runner.begin_capturable_run
+        if had_prepare:
+            model_state.prepare_attn = previous_prepare
+        else:
+            del model_state.prepare_attn
 
 
 @contextmanager

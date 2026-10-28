@@ -343,10 +343,12 @@ stream, and wrapper implementation details are owned by
 [execution platforms](execution_platforms.md).
 
 CUDA V2 accepts exactly two native microbatches with Attention DP1 or DP > 1.
-For DeepSeek-V4, the Attention runner uses stable position and slot-mapping
-buffers so compressor inputs remain 64-byte aligned. The first stage borrows
-the native position buffer and also borrows native slots when their fixed row
-spacing is aligned (or there is one KV group). Other inputs use aligned runner
+DeepSeek-V4's model module owns its stage-input and Indexer-SM preparation
+adapter; the shared Attention runner scopes it around native ubatch work.
+The runner retains the stable position and slot-mapping buffers until native
+graph/thread shutdown, so compressor inputs remain 64-byte aligned. The first
+stage borrows the native position buffer and also borrows native slots when
+their fixed row spacing is aligned (or there is one KV group). Other inputs use aligned runner
 buffers. Native metadata builders and model forward consume the same refreshed
 inputs, whose addresses remain stable across FULL graph replay. Aligned context
 slot mappings are prepared for eager execution and capture; live FULL replay
