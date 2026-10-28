@@ -2270,17 +2270,20 @@ def test_non_afd_model_config_and_native_runner_identity_are_unchanged(
 
 @pytest.fixture
 def stage_input_runner(monkeypatch):
-    def build(stage=1, model_type="deepseek_v4"):
+    def build(stage=1, model_type="deepseek_v4", capacity=35, groups=2):
         runner = _runner_for_metadata([])
         runner.vllm_config.model_config.hf_config.model_type = model_type
         runner.device = torch.device("cuda")
         runner._afd_v4_ubatch_inputs = None
-        runner.input_buffers = InputBuffers(8, 35, torch.device("cpu"))
+        runner.input_buffers = InputBuffers(8, capacity, torch.device("cpu"))
+        runner.block_tables = SimpleNamespace(
+            slot_mappings=torch.empty((groups, capacity), dtype=torch.int64)
+        )
         runner.kv_cache_config = SimpleNamespace(
             kv_cache_groups=[
                 SimpleNamespace(layer_names=["kv0"]),
                 SimpleNamespace(layer_names=["kv1", "kv1-shared-layer"]),
-            ]
+            ][:groups]
         )
         runner.model_state = AttentionMetadataState()
         runner.ubatch_runner = PreparedUBatchRunner(
@@ -2294,15 +2297,22 @@ def stage_input_runner(monkeypatch):
     return build
 
 
+def _stage_test_inputs(runner, num_tokens, offset=0):
+    batch = InputBatch.make_dummy(2, num_tokens, runner.input_buffers)
+    batch.positions.copy_(torch.arange(num_tokens) + offset)
+    slots = runner.block_tables.slot_mappings[:, :num_tokens]
+    slots.copy_(torch.arange(slots.numel()).reshape(slots.shape) + offset)
+    return batch, slots
+
+
 @pytest.mark.parametrize("stage", [0, 1])
 @pytest.mark.parametrize(
     "mode,for_capture",
     [
         (CUDAGraphMode.NONE, False),
-        (CUDAGraphMode.FULL, False),
         (CUDAGraphMode.FULL, True),
     ],
-    ids=["eager", "live-full", "capture"],
+    ids=["eager", "capture"],
 )
 def test_v4_ubatch_metadata_and_model_share_refreshed_stage_views(
     stage_input_runner,
@@ -2313,7 +2323,8 @@ def test_v4_ubatch_metadata_and_model_share_refreshed_stage_views(
     runner = stage_input_runner(stage)
     batch = InputBatch.make_dummy(2, 28, runner.input_buffers)
     batch.positions.copy_(torch.arange(28))
-    slots = torch.arange(56).reshape(2, 28)
+    slots = runner.block_tables.slot_mappings[:, :28]
+    slots.copy_(torch.arange(56).reshape(2, 28))
     with v2_runner_module._use_afd_ubatch_preparation(runner):
         first = runner.ubatch_runner.prepare(
             batch, (), slots, mode, for_capture=for_capture
@@ -2351,7 +2362,8 @@ def test_v4_ubatch_metadata_and_model_share_refreshed_stage_views(
             )
         wider_batch = InputBatch.make_dummy(2, 34, runner.input_buffers)
         wider_batch.positions.copy_(torch.arange(34) + 100)
-        wider_slots = torch.arange(68).reshape(2, 34) + 200
+        wider_slots = runner.block_tables.slot_mappings[:, :34]
+        wider_slots.copy_(torch.arange(68).reshape(2, 34) + 200)
         second = runner.ubatch_runner.prepare(
             wider_batch, (), wider_slots, mode, for_capture=for_capture
         )
@@ -2413,6 +2425,132 @@ def test_v4_ubatch_metadata_and_model_share_refreshed_stage_views(
         assert ordinary[:, 1].tolist() == [100] * (TEST_PHYSICAL_SMS + 1)
 
 
+@pytest.mark.parametrize("stage", [0, 1])
+@pytest.mark.parametrize("capacity,groups", [(40, 2), (35, 2), (35, 1)])
+def test_v4_full_replay_refreshes_captured_inputs_for_new_request(
+    stage_input_runner, stage, capacity, groups
+):  # long-test: capture and replay must preserve addresses and refresh all groups.
+    runner = stage_input_runner(stage, capacity=capacity, groups=groups)
+    batch, slots = _stage_test_inputs(runner, 28)
+    with v2_runner_module._use_afd_ubatch_preparation(runner):
+        captured = runner.ubatch_runner.prepare(
+            batch, (), slots, CUDAGraphMode.FULL, for_capture=True
+        )
+        capture_context = captured.forward_contexts[stage]
+        capture_positions = runner.ubatch_runner.begin_capturable_run(
+            lambda **kwargs: kwargs["positions"],
+            {"positions": batch.positions},
+            captured,
+            for_capture=True,
+        )()
+        captured_slots = {
+            f"kv{i}": capture_context.attn_metadata[f"kv{i}"].slot_mapping
+            for i in range(groups)
+        }
+        for name, tensor in captured_slots.items():
+            assert capture_context.slot_mapping[name].data_ptr() == tensor.data_ptr()
+
+        live_batch, live_slots = _stage_test_inputs(runner, 33, offset=100)
+        live = runner.ubatch_runner.prepare(
+            live_batch, (), live_slots, CUDAGraphMode.FULL
+        )
+        current = live.forward_contexts[stage]
+        positions = runner.ubatch_runner.begin_capturable_run(
+            lambda **kwargs: kwargs["positions"],
+            {"positions": live_batch.positions},
+            live,
+        )()
+        token_slice = live.slices[stage].token_slice
+        assert positions.data_ptr() == capture_positions.data_ptr()
+        assert torch.equal(positions, live_batch.positions[token_slice])
+        assert torch.equal(capture_positions, positions[: capture_positions.numel()])
+        assert (positions.data_ptr() == live_batch.positions.data_ptr()) == (stage == 0)
+        for group, (name, saved) in enumerate(captured_slots.items()):
+            metadata_slot = current.attn_metadata[name].slot_mapping
+            assert metadata_slot.data_ptr() == saved.data_ptr()
+            assert torch.equal(metadata_slot, live_slots[group, token_slice])
+            assert torch.equal(saved, metadata_slot[: saved.numel()])
+            # Live FULL uses the captured metadata, not this new context mapping.
+            assert (
+                current.slot_mapping[name].data_ptr()
+                == live_slots[group, token_slice].data_ptr()
+            )
+            if stage == 0:
+                borrowed = capacity % 8 == 0 or groups == 1
+                assert (saved.data_ptr() == live_slots[group].data_ptr()) == borrowed
+        assert current.additional_kwargs["afd_metadata"].stage_idx == stage
+        assert runner.connector.last_payload.is_graph_replaying
+
+
+@pytest.mark.parametrize("stage", [0, 1])
+def test_v4_eager_odd_tokens_use_aligned_stage_inputs(stage_input_runner, stage):
+    runner = stage_input_runner(stage, capacity=35, groups=2)
+    batch, slots = _stage_test_inputs(runner, 33, offset=100)
+    with v2_runner_module._use_afd_ubatch_preparation(runner):
+        prepared = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+        context = prepared.forward_contexts[stage]
+        token_slice = prepared.slices[stage].token_slice
+        positions = runner.ubatch_runner.begin_capturable_run(
+            lambda **kwargs: kwargs["positions"],
+            {"positions": batch.positions},
+            prepared,
+        )()
+        assert torch.equal(positions, batch.positions[token_slice])
+        for group in range(2):
+            metadata = context.attn_metadata[f"kv{group}"]
+            assert metadata.positions.data_ptr() == positions.data_ptr()
+            assert torch.equal(metadata.slot_mapping, slots[group, token_slice])
+            assert (
+                metadata.slot_mapping.data_ptr()
+                == context.slot_mapping[f"kv{group}"].data_ptr()
+            )
+        assert (
+            context.slot_mapping["kv1"].data_ptr()
+            - context.slot_mapping["kv0"].data_ptr()
+        ) % 64 == 0
+
+
+@pytest.mark.parametrize("capacity,groups", [(40, 2), (35, 2), (35, 1)])
+@pytest.mark.parametrize("dbo_enabled", [False, True])
+def test_v4_single_stage_preparation_refreshes_native_or_aligned_inputs(
+    stage_input_runner, capacity, groups, dbo_enabled
+):
+    runner = stage_input_runner(stage=0, capacity=capacity, groups=groups)
+    attn_groups = runner.ubatch_runner.attn_groups
+    if not dbo_enabled:
+        runner.ubatch_runner = None
+    batch, slots = _stage_test_inputs(runner, 15)
+    with v2_runner_module._use_afd_ubatch_preparation(runner):
+        capture = runner.model_state.prepare_attn(
+            batch,
+            CUDAGraphMode.FULL,
+            (),
+            slots,
+            attn_groups,
+            runner.kv_cache_config,
+            for_capture=True,
+        )
+        live_batch, live_slots = _stage_test_inputs(runner, 17, offset=100)
+        live = runner.model_state.prepare_attn(
+            live_batch,
+            CUDAGraphMode.FULL,
+            (),
+            live_slots,
+            attn_groups,
+            runner.kv_cache_config,
+        )
+        for group in range(groups):
+            name = f"kv{group}"
+            saved = capture[name].slot_mapping
+            current = live[name].slot_mapping
+            assert current.data_ptr() == saved.data_ptr()
+            assert torch.equal(saved, live_slots[group, :15])
+            assert torch.equal(current, live_slots[group])
+            borrow = not dbo_enabled or groups == 1 or capacity % 8 == 0
+            assert (current.data_ptr() == live_slots[group].data_ptr()) == borrow
+            assert live[name].positions.data_ptr() == live_batch.positions.data_ptr()
+
+
 @pytest.mark.parametrize("model_type", ["deepseek_v4", "deepseek_v2", "qwen3_moe"])
 @pytest.mark.parametrize("failure", ["model", "prepare"])
 def test_ubatch_failure_restores_native_input_binding_and_indexer_plan(
@@ -2420,7 +2558,8 @@ def test_ubatch_failure_restores_native_input_binding_and_indexer_plan(
 ):  # long-test: both failure exits must restore ordinary input and plan ownership.
     runner = stage_input_runner(model_type=model_type)
     batch = InputBatch.make_dummy(2, 28, runner.input_buffers)
-    slots = torch.arange(56).reshape(2, 28)
+    slots = runner.block_tables.slot_mappings[:, :28]
+    slots.copy_(torch.arange(56).reshape(2, 28))
     batch.positions.copy_(torch.arange(28))
     error = ValueError("step failed")
     if failure == "prepare":

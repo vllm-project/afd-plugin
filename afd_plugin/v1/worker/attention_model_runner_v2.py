@@ -67,23 +67,36 @@ _V4_INPUT_ALIGNMENT_ELEMENTS = 8
 
 
 class _AFDV4UBatchInputs:
-    """Runner-owned aligned prefixes shared by every layer in each V4 stage."""
+    """Stable aligned prefixes shared by every layer in each V4 stage."""
 
     def __init__(
-        self, input_buffers: InputBuffers, num_kv_groups: int, num_ubatches: int
+        self,
+        input_buffers: InputBuffers,
+        native_slot_mappings: torch.Tensor,
+        num_ubatches: int,
     ) -> None:
         capacity = input_buffers.max_num_tokens
+        num_kv_groups = native_slot_mappings.shape[0]
         pitch = (
             (capacity + _V4_INPUT_ALIGNMENT_ELEMENTS - 1)
             // _V4_INPUT_ALIGNMENT_ELEMENTS
             * _V4_INPUT_ALIGNMENT_ELEMENTS
         )
-        self.positions = tuple(
-            input_buffers.positions.new_empty((capacity,)) for _ in range(num_ubatches)
+        # Native dummy and live inputs share these buffers, and stage 0 starts
+        # at token 0. Choose slot borrowing once before graph capture.
+        self.positions = (input_buffers.positions,) + tuple(
+            input_buffers.positions.new_empty((capacity,))
+            for _ in range(1, num_ubatches)
+        )
+        borrow_first_slots = (
+            num_kv_groups <= 1
+            or native_slot_mappings.stride(0) % _V4_INPUT_ALIGNMENT_ELEMENTS == 0
         )
         self.slot_mappings = tuple(
-            input_buffers.positions.new_empty((num_kv_groups, pitch))
-            for _ in range(num_ubatches)
+            None
+            if stage == 0 and borrow_first_slots
+            else input_buffers.positions.new_empty((num_kv_groups, pitch))
+            for stage in range(num_ubatches)
         )
 
 
@@ -103,7 +116,7 @@ def _use_v4_ubatch_inputs(
     if runner._afd_v4_ubatch_inputs is None:
         runner._afd_v4_ubatch_inputs = _AFDV4UBatchInputs(
             runner.input_buffers,
-            len(runner.kv_cache_config.kv_cache_groups),
+            runner.block_tables.slot_mappings,
             ubatch_runner.num_ubatches,
         )
     inputs = runner._afd_v4_ubatch_inputs
@@ -120,9 +133,9 @@ def _use_v4_ubatch_inputs(
     original_begin = ubatch_runner.begin_capturable_run
 
     # Patch reason: native ubatch views can start at a non-64-byte boundary.
-    # Patch functionality: copy V4 positions and all KV-group slots once per
-    # stage, before native metadata builders receive them. Stable allocation
-    # addresses are refreshed before FULL replay as well as eager/capture.
+    # Patch functionality: retain native stage-zero inputs where their fixed
+    # layout is aligned; stage other inputs before native metadata builders.
+    # Stable addresses are refreshed before FULL replay as well as eager/capture.
     # Signature: matches DefaultModelState.prepare_attn at vLLM 5df63a7,
     # vllm/v1/worker/gpu/model_states/default.py. Delegation retains native
     # metadata construction; remove when native stage buffers meet V4's ABI.
@@ -139,12 +152,18 @@ def _use_v4_ubatch_inputs(
         model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     ) -> dict[str, Any]:
         # ### PATCH START: stable aligned V4 stage metadata inputs.
-        positions = inputs.positions[ubatch_idx][: input_batch.positions.shape[0]]
-        slots = inputs.slot_mappings[ubatch_idx][:, : slot_mappings.shape[1]]
-        positions.copy_(input_batch.positions)
-        slots.copy_(slot_mappings)
+        if ubatch_idx:
+            positions = inputs.positions[ubatch_idx][: input_batch.positions.shape[0]]
+            positions.copy_(input_batch.positions)
+            input_batch = replace(input_batch, positions=positions)
+        slots = inputs.slot_mappings[ubatch_idx]
+        if slots is None:
+            slots = slot_mappings
+        else:
+            slots = slots[:, : slot_mappings.shape[1]]
+            slots.copy_(slot_mappings)
         return original_prepare(
-            replace(input_batch, positions=positions),
+            input_batch,
             cudagraph_mode,
             block_tables,
             slots,
@@ -306,14 +325,15 @@ def _use_afd_ubatch_preparation(
             for builder, num_sms in reversed(indexer_budgets):
                 builder.num_sms = num_sms
         # ### PATCH END: generate V4 index schedules for the ubatch SM budget.
-        if stage_inputs is not None:
+        # FULL replay uses the context captured by the graph, not this fresh one.
+        if stage_inputs is not None and (cg_mode != CUDAGraphMode.FULL or for_capture):
             for stage, context in enumerate(prepared.forward_contexts):
-                context.slot_mapping = build_slot_mappings_by_layer(
-                    stage_inputs.slot_mappings[stage][
-                        :, : prepared.slices[stage].num_tokens
-                    ],
-                    runner.kv_cache_config,
-                )
+                slots = stage_inputs.slot_mappings[stage]
+                if slots is not None:
+                    context.slot_mapping = build_slot_mappings_by_layer(
+                        slots[:, : prepared.slices[stage].num_tokens],
+                        runner.kv_cache_config,
+                    )
         if event_tracker is not None:
             desc, is_warmup = event_tracker.consume(
                 input_batch.num_reqs,
