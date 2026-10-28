@@ -258,6 +258,15 @@ def test_patch_preserves_upstream_signature(
         patched = getattr(binding if scope_name else adapter, symbol)
         callable_patch = patched.__func__ if inspect.ismethod(patched) else patched
         namespace = vars(target) | vars(adapter) | locals()
+        if target_module == ENGINE_CORE and symbol == "run_busy_loop":
+            # The pinned native decorator has no __wrapped__; compare both its
+            # exposed signature and the original function retained in its closure.
+            wrapped = callable_patch
+            callable_patch = inspect.getclosurevars(wrapped).nonlocals["busy_loop_func"]
+            native_wrapper = target.fault_tolerant_wrapper(callable_patch)
+            assert _resolved_signature(wrapped, namespace) == _resolved_signature(
+                native_wrapper, namespace
+            )
         assert _resolved_signature(callable_patch, namespace) == expected
         if scope_name:
             assert patched is not original
