@@ -50,7 +50,7 @@ from afd_plugin.validation import validate_gpu_model_runner_v2_config
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
-    from afd_plugin.model_executor.models.deepseek_v4 import _AFDV4UBatchInputs
+    from afd_plugin.compat.patches.gpu_deepseek_v4_dbo import _AFDV4UBatchInputs
 
 _AFD_FULLGRAPH_HOOK_MARKER = "_afd_fullgraph_replay_hook_active"
 
@@ -119,8 +119,8 @@ def _use_afd_ubatch_preparation(
         runner.vllm_config.model_config.hf_config.model_type == "deepseek_v4"
         and runner.device.type == "cuda"
     ):
-        # Load the CUDA model adapter only after the shared NPU boundary.
-        from afd_plugin.model_executor.models.deepseek_v4 import (
+        # Load the CUDA compatibility patches after the shared NPU boundary.
+        from afd_plugin.compat.patches.gpu_deepseek_v4_dbo import (
             _use_v4_ubatch_preparation,
         )
 
@@ -503,7 +503,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
             and self.parallel_config.use_ubatching
         ):
             # GPU-only backend import must not extend the shared NPU boundary.
-            from afd_plugin.model_executor.models.deepseek_v4 import (
+            from afd_plugin.compat.patches.gpu_deepseek_v4_dbo import (
                 _reserve_flashmla_ubatch_workspace,
             )
 

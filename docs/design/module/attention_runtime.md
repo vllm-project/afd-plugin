@@ -343,8 +343,9 @@ stream, and wrapper implementation details are owned by
 [execution platforms](execution_platforms.md).
 
 CUDA V2 accepts exactly two native microbatches with Attention DP1 or DP > 1.
-DeepSeek-V4's model module owns its stage-input and Indexer-SM preparation
-adapter; the shared Attention runner scopes it around native ubatch work.
+The GPU [V4 compatibility patch](../../../afd_plugin/compat/patches/gpu_deepseek_v4_dbo.py)
+owns stage-input and Indexer-SM preparation; the shared Attention runner scopes
+it around native ubatch work.
 The runner retains the stable position and slot-mapping buffers until native
 graph/thread shutdown, so compressor inputs remain 64-byte aligned. The first
 stage borrows the native position buffer and also borrows native slots when

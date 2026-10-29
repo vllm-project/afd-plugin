@@ -246,7 +246,7 @@ def test_patch_preserves_upstream_signature(
 
         scope = adapter._use_camp2p_dp_padding(4, 2)
     elif scope_name == "v4-workspace-slot":
-        from afd_plugin.model_executor.models import deepseek_v4 as adapter
+        from afd_plugin.compat.patches import gpu_deepseek_v4_dbo as adapter
 
         native_class = getattr(target, owner)
         binding = native_class.__new__(native_class)

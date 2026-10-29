@@ -137,6 +137,29 @@ not the package dependency policy.
 | [`npu/mla_graph.py`](../../../afd_plugin/compat/patches/npu/mla_graph.py): `vllm_ascend.attention.mla_v1.get_graph_params` | Resolves an AFD ubatch-owned `GraphParams` registry from the active forward context and otherwise delegates to the saved upstream process-global resolver. | Called through `apply_afd_ascend_patches_if_needed` during NPU worker startup; no version guard. Saves the original on the upstream module and uses a module sentinel. | [`test_runtime.py`](../../../tests/unit/compat/test_runtime.py) covers AFD-context resolution, upstream fallback, and idempotence; [`test_npu_mla_graph.py`](../../../tests/unit/v1/worker/test_npu_mla_graph.py) covers the owning graph lifecycle. | Remove when vLLM-Ascend accepts a forward-context-local MLA graph registry or exposes an equivalent resolver hook. |
 | [`npu/mrv2_ubatching.py`](../../../afd_plugin/compat/patches/npu/mrv2_ubatching.py): native ubatch factory, dispatch, child DP metadata, input slicing, context and stream aliases | Builds `NPUUBatchRunner`, enables Async CAM DBO at DP1, omits Async child DP coordination, applies native truncation to Ascend CPU sequence lengths, preserves model-specific PP slices/nested auxiliary outputs, and provides NPU stream/failure handling during eager and capture. Native MRV2 owns execution and graph lifecycle. | Scoped to AFD initialization, preparation or execution; every replaced alias is restored in `finally`. The scope temporarily changes module symbols, so it is not an independent concurrent-runner API. | [`test_npu_model_runner_v2.py`](../../../tests/unit/v1/worker/test_npu_model_runner_v2.py), [`test_async_cam_dbo.py`](../../../tests/unit/model_executor/test_async_cam_dbo.py), [`test_mrv2_dbo.py`](../../../tests/npu/test_mrv2_dbo.py). | Remove when native vLLM/Ascend supports NPU child builders and streams, optional child DP metadata, DP1 DBO and peer cancellation. |
 
+## Temporary CUDA DeepSeek-V4 DBO fixes
+
+[`gpu_deepseek_v4_dbo.py`](../../../afd_plugin/compat/patches/gpu_deepseek_v4_dbo.py)
+collects the temporary workarounds for vLLM 0.32.0 (`5df63a7`). The Attention
+runner scopes input/indexer preparation and calls pre-profile reservation at the
+existing CUDA-only entry points. The V4 decoder calls the padding-aware
+attention adapter and retains ownership of mHC, Hash IDs and the remote FFN
+protocol. Native per-instance bindings are restored on scope exit.
+
+| Workaround | Upstream tracking | Removal condition |
+| --- | --- | --- |
+| Aligned, persistent microbatch positions and slots | No published corresponding PR | Native compressor metadata accepts naturally aligned views and the input/replay regressions pass. |
+| Zero-real-token Attention stage | [#63823](https://github.com/vllm-project/vllm/pull/63823) is related FULL-graph layout work | Native attention supports padding-only stages in eager and the supported graph paths; the A/F protocol regressions pass. #63823 alone is insufficient. |
+| Indexer planner/compute SM budget agreement | [#60732](https://github.com/vllm-project/vllm/pull/60732) | The pinned runtime replans for the actual DBO compute budget and the preparation/restoration regressions pass. |
+| FlashMLA workspace accounted across microbatches/lanes | [#61584](https://github.com/vllm-project/vllm/pull/61584) provides the all-slot reservation API | V4 uses that API for its own FlashMLA scratch before profiling, and the per-owner capacity regressions pass. The API alone is insufficient. |
+
+A merged upstream PR does not retire a workaround: the upgraded pinned runtime
+must contain the complete fix and pass its affected regression. Focused CPU
+contracts live in
+[`test_gpu_deepseek_v4_dbo.py`](../../../tests/unit/compat/patches/test_gpu_deepseek_v4_dbo.py),
+[`test_model_runner_v2.py`](../../../tests/unit/v1/worker/test_model_runner_v2.py)
+and [`test_deepseek_v4_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_proxy.py).
+
 ## Non-patch compatibility adapters
 
 These modules adapt upstream behavior without replacing a global symbol:

@@ -2271,7 +2271,7 @@ def test_non_afd_model_config_and_native_runner_identity_are_unchanged(
 @pytest.fixture
 def stage_input_runner(monkeypatch):
     # Load the CUDA model adapter only for stage-input cases.
-    from afd_plugin.model_executor.models import deepseek_v4
+    from afd_plugin.compat.patches import gpu_deepseek_v4_dbo as deepseek_v4
 
     def build(stage=1, model_type="deepseek_v4", capacity=35, groups=2):
         runner = _runner_for_metadata([])
