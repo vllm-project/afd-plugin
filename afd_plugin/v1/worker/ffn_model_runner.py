@@ -250,7 +250,9 @@ class GPUFFNModelRunner:
         if not self.vllm_config.parallel_config.eplb_config.log_balancedness:
             return None
         # Every FFN EP rank holds the same global map; only rank 0 logs.
-        if get_ep_group().rank() != 0:
+        # ``rank_in_group`` is an attribute in vLLM 0.30's GroupCoordinator,
+        # the rank inside the EP group.
+        if get_ep_group().rank_in_group != 0:
             return None
         boundary_due = (
             state.expert_rearrangement_step + 1
