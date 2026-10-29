@@ -3,8 +3,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 #
 # Qwen3-235B-A22B-FP8 4A2F prefill/decode colocation on one node with 6 GPUs:
-# Attention DP4/TP1 and FFN DP2/TP1 (expert parallel), FULL_DECODE_ONLY CUDA
-# graphs. Every knob is an environment variable (default in parentheses):
+# Attention DP4/TP1 (or DP1/TP4 with ATTN_TP=4) and FFN DP2/TP1 (expert
+# parallel), FULL_DECODE_ONLY CUDA graphs. Every knob is an environment
+# variable (default in parentheses):
 #
 #   MODEL_PATH               weights dir or HF id (/path/model_weights/Qwen3-235B-A22B-FP8)
 #   AFD_CONNECTOR            DeepEPM2NAFDConnector | P2pNcclAFDConnector
@@ -18,12 +19,14 @@
 #   ENABLE_PREFIX_CACHING    1 | 0 (1)
 #   ENABLE_DBO               1 | 0 (0)
 #   DBO_DECODE_TOKEN_THRESHOLD / DBO_PREFILL_TOKEN_THRESHOLD (2 / 8)
-#   MAX_NUM_SEQS             per Attention rank (128)
+#   MAX_NUM_SEQS             per Attention DP rank (128)
 #   MAX_NUM_BATCHED_TOKENS   prefill chunk per step (3072)
 #   CUDAGRAPH_CAPTURE_SIZES  comma-separated decode graph sizes (8,16,32,64,96,128)
 #   MAX_MODEL_LEN            (4096)
 #   GPU_MEMORY_UTILIZATION   (unset: vLLM default)
 #   ATTN_DEVICES / FFN_DEVICES (0,1,2,3 / 4,5)
+#   ATTN_TP                  Attention tensor-parallel size; Attention DP is the
+#                            number of ATTN_DEVICES divided by it (1)
 #   AFD_HOST / AFD_PORT      AFD connector rendezvous (127.0.0.1 / 6269)
 #   AFD_PROCESS_GROUP_TIMEOUT_S  AFD join timeout; the roles can finish
 #                            loading minutes apart (7200)
@@ -58,6 +61,7 @@ MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-}
 ATTN_DEVICES=${ATTN_DEVICES:-0,1,2,3}
 FFN_DEVICES=${FFN_DEVICES:-4,5}
+ATTN_TP=${ATTN_TP:-1}
 AFD_HOST=${AFD_HOST:-127.0.0.1}
 AFD_PORT=${AFD_PORT:-6269}
 AFD_PROCESS_GROUP_TIMEOUT_S=${AFD_PROCESS_GROUP_TIMEOUT_S:-7200}
@@ -75,6 +79,11 @@ export VLLM_USE_V2_MODEL_RUNNER=1
 
 NUM_ATTN_RANKS=$(tr ',' '\n' <<<"$ATTN_DEVICES" | wc -l | tr -d ' ')
 NUM_FFN_RANKS=$(tr ',' '\n' <<<"$FFN_DEVICES" | wc -l | tr -d ' ')
+if ((NUM_ATTN_RANKS % ATTN_TP)); then
+    echo "ATTN_TP=${ATTN_TP} does not divide the ${NUM_ATTN_RANKS} Attention devices" >&2
+    exit 1
+fi
+ATTN_DP=$((NUM_ATTN_RANKS / ATTN_TP))
 
 case "$AFD_CONNECTOR" in
     # DeepEP M2N routes on Attention and sends FP8 tokens to the FFN experts.
@@ -123,7 +132,6 @@ JSON
 
 MAX_CUDAGRAPH_CAPTURE_SIZE=$(tr ',' '\n' <<<"$CUDAGRAPH_CAPTURE_SIZES" | sort -n | tail -n 1)
 COMMON_ARGS=(
-    --tensor-parallel-size 1
     --enable-expert-parallel
     --enable-ep-weight-filter
     --max-num-seqs "$MAX_NUM_SEQS"
@@ -149,7 +157,7 @@ fi
 # shellcheck disable=SC2206
 COMMON_ARGS+=($EXTRA_ARGS)
 
-ATTN_ARGS=(--data-parallel-size "$NUM_ATTN_RANKS")
+ATTN_ARGS=(--data-parallel-size "$ATTN_DP" --tensor-parallel-size "$ATTN_TP")
 if [[ "$ENABLE_PREFIX_CACHING" == 1 ]]; then
     ATTN_ARGS+=(--enable-prefix-caching)
 else
@@ -161,7 +169,7 @@ fi
 # shellcheck disable=SC2206
 ATTN_ARGS+=($ATTN_EXTRA_ARGS)
 
-FFN_ARGS=(--data-parallel-size "$NUM_FFN_RANKS")
+FFN_ARGS=(--data-parallel-size "$NUM_FFN_RANKS" --tensor-parallel-size 1)
 # shellcheck disable=SC2206
 FFN_ARGS+=($FFN_EXTRA_ARGS)
 

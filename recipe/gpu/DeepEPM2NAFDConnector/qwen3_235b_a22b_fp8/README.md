@@ -24,6 +24,10 @@ benchmark over real KV, exactly like the
 | 0, 1, 2, 3 | Attention | DP4 / TP1            | 18305 |
 | 4, 5       | FFN       | DP2 / TP1, EP2       | 18306 |
 
+`ATTN_TP=4` runs Attention as one DP1/TP4 engine on the same four GPUs instead
+(`num_attention_ranks` stays 4); raise `MAX_NUM_SEQS` and the capture sizes
+with it, since one engine then holds every running request.
+
 Both roles run `FULL_DECODE_ONLY` CUDA graphs (sizes 8 to 128 by default);
 prefill runs eager in chunks of `MAX_NUM_BATCHED_TOKENS`. Send traffic to the
 Attention port. `DeepEPM2NAFDConnector` routes on Attention and dispatches FP8
