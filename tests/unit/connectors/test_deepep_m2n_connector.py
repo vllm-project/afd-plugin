@@ -101,14 +101,23 @@ def _connector(
     return AFDConnectorFactory.create_connector(0, local_rank, vllm_config, afd_config)
 
 
-def _ffn_deployment(layout: DeepEPM2NLayout, weight_format: str = "bf16") -> dict:
+def _ffn_deployment(
+    layout: DeepEPM2NLayout,
+    weight_format: str = "bf16",
+    *,
+    eplb: bool = False,
+    num_physical_experts: int | None = None,
+) -> dict:
     """A valid FFN deployment: linear EP over the FFN ranks, idle all2all."""
     return {
         "expert_parallel": True,
         "ep_size": layout.ffn_size,
         "tensor_parallel_size": 1,
         "expert_placement_strategy": "linear",
-        "eplb": False,
+        "eplb": eplb,
+        "num_physical_experts": (
+            layout.num_experts if num_physical_experts is None else num_physical_experts
+        ),
         "all2all_backend": "allgather_reducescatter",
         "weight_format": weight_format,
     }
@@ -1064,7 +1073,6 @@ def test_expert_weight_format_names_what_vllm_loads():
         ("ep_size", 4),
         ("tensor_parallel_size", 2),
         ("expert_placement_strategy", "round_robin"),
-        ("eplb", True),
         ("all2all_backend", "deepep_low_latency"),
         ("weight_format", "fp8_block128"),
     ],
@@ -1083,6 +1091,50 @@ def test_handshake_rejects_ffn_deployments_that_misplace_experts(key, value):
     with pytest.raises(
         RuntimeError, match=f"FFN world rank 1 is deployed with .*{key}"
     ):
+        validate_handshake(infos, layout, NetworkConfig())
+
+
+def test_handshake_accepts_eplb_ffn_deployment():
+    """EPLB on the FFN is valid when every FFN rank reports the same,
+    evenly splitting physical expert count.
+
+    Why: DeepEP routes by physical slot id, so the deployment is consistent
+    as long as the slot count matches what the FFN loads.
+    """
+    layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
+    infos = _handshake(layout)
+    for rank in range(layout.ffn_size):
+        infos[rank]["ffn_deployment"] = _ffn_deployment(
+            layout, eplb=True, num_physical_experts=160
+        )
+
+    result = validate_handshake(infos, layout, NetworkConfig())
+
+    assert result.enable_eplb is True
+    assert result.num_physical_experts == 160
+
+
+@pytest.mark.parametrize(
+    ("num_physical", "match"),
+    [
+        (127, "physical experts for 128 logical experts"),
+        (129, "does not split evenly"),
+    ],
+)
+def test_handshake_rejects_broken_eplb_slot_counts(num_physical, match):
+    """EPLB with fewer slots than logical experts, or a slot count that does
+    not split over the FFN ranks, fails the handshake.
+
+    Why: DeepEP's slot-to-rank routing requires contiguous, even blocks.
+    """
+    layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
+    infos = _handshake(layout)
+    for rank in range(layout.ffn_size):
+        infos[rank]["ffn_deployment"] = _ffn_deployment(
+            layout, eplb=True, num_physical_experts=num_physical
+        )
+
+    with pytest.raises(RuntimeError, match=match):
         validate_handshake(infos, layout, NetworkConfig())
 
 

@@ -133,6 +133,26 @@ def test_eager_fallback_keeps_attention_replay_flag():
     assert payload.is_graph_capturing is False
 
 
+def test_eplb_step_delegates_to_the_connector():
+    """The routed runner's EPLB step is the connector's FFN EPLB driver.
+
+    Why: the FFN never routes on this path, so the connector, not vLLM's
+    EPLBController, owns the rearrangement cadence.
+    """
+
+    class _SteppingConnector(FakeRoutedConnector):
+        def step_ffn_eplb(self) -> None:
+            self.events.append(("eplb_step",))
+
+    connector = _SteppingConnector()
+    runner = _runner(connector)
+
+    runner.eplb_step(is_dummy=True)
+    runner.eplb_step()
+
+    assert connector.events == [("eplb_step",), ("eplb_step",)]
+
+
 def test_constructor_rejects_connectors_without_routed_rows(monkeypatch):
     def base_init(self, vllm_config, device):
         self.connector = SimpleNamespace(close=lambda: None)

@@ -378,6 +378,18 @@ of the step it calls `connector.synchronize_lanes()`. vLLM's MoE forward never
 runs on this runner. Dense (non-MoE) layers and shared experts have no owner
 on this path, so the model adapters reject them.
 
+With EPLB the routed runner replaces the base EPLB step: nothing on this
+FFN routes tokens, so no load is recorded on it. Its `eplb_step` delegates
+to the connector's FFN EPLB driver
+(`afd_plugin/connectors/gpu/deepep_m2n/eplb.py`), which counts every
+connector step, and at each rearrangement boundary collects the
+Attention-recorded load window over the connector's bootstrap group, runs
+`EplbState.rearrange` directly and broadcasts the committed maps; Attention
+adopts them before it routes the next step. The Attention side of that
+module owns the recorder: it maps logical top-k ids to physical slots in the
+model proxy's routing path and records load with stable-address tensors
+CUDA graphs capture.
+
 ## FFN-side EPLB
 
 The FFN role can enable vLLM's expert-parallel load balancing

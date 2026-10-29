@@ -141,9 +141,16 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
         }
 
     def initialize_afd_connector(self) -> None:
+        """Collective: share the loaded experts and, with EPLB, the expert
+        maps and rearrangement schedule the whole world routes by."""
         self.routed_connector.init_afd_connector(
             moe_layer_indices=self.moe_layer_indices,
             local_experts=self.local_experts,
+            eplb_state=(
+                self.eplb.state
+                if self.vllm_config.parallel_config.enable_eplb
+                else None
+            ),
         )
 
     def _ffn_forward(
@@ -187,6 +194,18 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
         # stream before a CUDA-graph capture ends.
         connector.synchronize_lanes()
         return ffn_output
+
+    # The FFN role of an EPLB deployment never routes tokens, so nothing on
+    # this side records expert load and EplbState.step has no input. Instead
+    # the connector's FFN EPLB driver steps the rearrangement counter (every
+    # connector step, real or dummy, exactly like the Attention recorder) and
+    # at each boundary exchanges the Attention-recorded load window, runs
+    # EplbState.rearrange and broadcasts the committed expert maps. Without
+    # EPLB there is nothing to step. `is_dummy` is part of the base seam's
+    # signature; the counter advances on dummy steps too, so it is unused.
+    def eplb_step(self, is_dummy: bool = False) -> None:
+        """Step FFN-side EPLB for the routed-experts path."""
+        self.routed_connector.step_ffn_eplb()
 
 
 __all__ = ["GPUFFNRoutedExpertsModelRunner", "local_experts_from_vllm"]

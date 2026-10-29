@@ -13,8 +13,11 @@ from torch import nn  # noqa: E402
 
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
+from tests.unit.fakes.connector import (  # noqa: E402
+    FakeRoutedConnector,
+    install_proxy_context,
+)
 from tests.unit.fakes.connector import ProxyConnector as _FakeConnector  # noqa: E402
-from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
 from tests.unit.fakes.model_layers import GateLinear  # noqa: E402
 
 ROUTING_HIDDEN_SIZE = 16
@@ -277,6 +280,59 @@ def test_remote_proxy_requires_forward_metadata(monkeypatch):
 
     with pytest.raises(RuntimeError, match="requires AFD forward metadata"):
         adapter.RemoteFFNProxy(layer_idx=0)(torch.ones(1, 4))
+
+
+class _EplbRoutedConnector(FakeRoutedConnector):
+    """A routed connector whose FFN runs EPLB: dispatch carries physical ids."""
+
+    def apply_eplb_routing(self, topk_ids, layer_idx):
+        self.events.append(("eplb_route", layer_idx))
+        return topk_ids + 100
+
+
+def test_gate_proxy_maps_topk_ids_through_connector_eplb_routing(monkeypatch):
+    """A gate-bearing proxy on a routed-experts connector maps its logical
+    top-k ids through the connector's EPLB placement before dispatch.
+
+    Why: with EPLB the FFN's experts sit in physical slots, so dispatch by
+    logical id would reach the wrong experts with no error.
+    """
+    connector = _EplbRoutedConnector()
+    afd_metadata = SimpleNamespace(connector=connector, stage_idx=0)
+    monkeypatch.setattr(
+        adapter,
+        "get_afd_metadata_from_forward_context",
+        lambda: afd_metadata,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "get_forward_context",
+        lambda: SimpleNamespace(ubatch_idx=0),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "maybe_apply_dbo_yield",
+        lambda hidden_states, *, role: hidden_states,
+    )
+    topk_weights = torch.tensor([[0.6, 0.4]])
+    topk_ids = torch.tensor([[1, 3]])
+
+    def fake_fused_topk(**kwargs):
+        return topk_weights, topk_ids, None
+
+    monkeypatch.setattr(adapter, "fused_topk", fake_fused_topk)
+    proxy = adapter.RemoteFFNProxy(layer_idx=5)
+    proxy.gate = nn.Linear(4, 8, bias=False)
+    proxy.top_k = 2
+    proxy.renormalize = False
+    proxy.tp_size = 1
+
+    proxy(torch.ones(2, 4))
+
+    assert ("eplb_route", 5) in connector.events
+    send = next(event for event in connector.events if event[0] == "send_attn")
+    assert torch.equal(send[1]["topk_ids"], topk_ids + 100)
+    assert send[1]["topk_weights"] is topk_weights
 
 
 def test_remote_proxy_exchanges_cam_during_profile(monkeypatch):

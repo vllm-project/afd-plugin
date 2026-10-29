@@ -9,6 +9,7 @@ the model.
 prefill_decode_colocation/
 ├── 2a2f_eager_dp2tp1.sh       # eager, FFN DP2/TP1, Attention DP2/TP1
 ├── 2a2f_graph_dp2tp1.sh       # graph, FFN DP2/TP1, Attention DP2/TP1
+├── 2a2f_graph_eplb_dp2tp1.sh  # graph + FFN EPLB, Attention DP2/TP1
 ├── 2a2f_graph_dbo_dp2tp1.sh   # graph + DBO, FFN DP2/TP1, Attention DP2/TP1
 └── 2a2f_eager_dp1tp2.sh       # eager, FFN DP2/TP1, Attention DP1/TP2
 ```
@@ -23,6 +24,14 @@ prefill_decode_colocation/
 | `--max-model-len` | 4096 |
 | `CUDAGRAPH_CAPTURE_SIZES` | 8,16,32,64 |
 | Payload | BF16 (no `connector_extra_config`); the FFN runs DeepGEMM experts |
+
+The EPLB script enables `--enable-eplb` on the FFN server only, with 32
+redundant experts (160 physical experts, 80 per FFN rank). Attention needs
+no EPLB flags: it records expert load while routing and adopts the FFN's
+expert placement. Async EPLB (`use_async`) and DBO are not supported with
+EPLB on this connector; the first rearrangement happens after
+`step_interval - step_interval // 4` steps (vLLM's `--eplb-config`
+defaults: 2250 steps).
 
 These match the Qwen3 MoE DeepEP M2N E2E cases (`afd-deepep-m2n-*-2a2f` and
 the two-pod `2A0F,0A2F` and `1A1F,1A1F` cases in

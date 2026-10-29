@@ -85,10 +85,12 @@ Before allocating transport buffers, all ranks exchange a handshake and fail
 together if they disagree. The handshake checks the payload format, model
 shapes, lane count (DBO), `network`, bucket settings, GPU
 architecture (SM90 or newer), and the FFN deployment (expert parallel, EP
-size, FFN TP=1, linear expert placement, no EPLB, all2all backend and expert
+size, FFN TP=1, linear expert placement, EPLB off or on with a matching physical
+expert count, all2all backend and expert
 weight format), and the placement of the ranks over NVLink domains. The FFN
 adopts the Attention TP size, dispatch capacity and bucket ladder reported by
-the Attention ranks.
+the Attention ranks; with EPLB, Attention adopts the FFN's physical
+expert count and expert maps.
 
 ## Installation
 
@@ -224,7 +226,7 @@ that sets `capacity_tokens_per_rank` explicitly must agree with Attention.
 | Expert placement | FFN | `linear` (vLLM's default `--expert-placement-strategy`). |
 | `--all2all-backend` | FFN | `allgather_reducescatter` (vLLM's default). The connector moves the rows itself, so vLLM's MoE all-to-all never runs; this backend allocates no buffers and keeps vLLM's own DeepEP out of the process. |
 | `--moe-backend` | FFN | `triton` or `auto`. `auto` is pinned to `triton`; any other backend is rejected because it reorders the expert weights that the connector reads. |
-| `--enable-eplb` | Both | Not supported. |
+| `--enable-eplb` | FFN | Optional (see [EPLB](#eplb)). Async EPLB (`use_async`) is not supported. Attention runs no EPLB flags. |
 | `--enable-dbo` | Both | Optional, but must match on both roles. DBO uses exactly two micro-batches. |
 | CUDA graphs | Both | Eager or `FULL_DECODE_ONLY`. |
 | Pipeline / context parallelism, sequence-parallel MoE | Both | Not supported. |
@@ -355,12 +357,42 @@ and FP8 examples, see the
 
 - SM90 or newer on every rank; the handshake rejects older GPUs.
 - Qwen3 MoE with every layer MoE and no shared expert, or DeepSeek-V2.
-- `compute_gate_on_attention=true` on both roles; EPLB is not supported.
+- `compute_gate_on_attention=true` on both roles; EPLB is supported on the FFN role
+  (see [EPLB](#eplb)).
 - FFN TP must be 1; FFN EP size equals `num_ffn_ranks`.
-- `num_experts` must be divisible by `num_ffn_ranks`.
+- `num_experts` must be divisible by `num_ffn_ranks` (with EPLB,
+  `num_experts + num_redundant_experts` must be).
 - CUDA graphs are limited to `FULL_DECODE_ONLY`; DBO uses exactly two
   micro-batches and must be enabled on both roles or neither.
 - Every rank must take part in every MoE layer and stage. Missing ranks,
   mismatched settings, or a crashed peer fail at the handshake or after the
   transport timeouts (`cpu_timeout_s`, `gpu_timeout_s`).
 - There is no fallback to another transport.
+
+## EPLB
+
+The FFN server may run vLLM's expert-parallel load balancing
+(`--enable-eplb` plus `--eplb-config`). Because routing runs on Attention,
+the two EPLB duties split across the roles:
+
+- Attention maps its logical top-k ids through the FFN's expert placement
+  before dispatch and records the per-expert load of its rows. It needs no
+  EPLB flags; the placement and schedule arrive over the connector's
+  handshake and control plane.
+- The FFN owns the experts and vLLM's `EplbState`: at each rearrangement it
+  collects the Attention-recorded load, moves the expert weights, and
+  publishes the new placement, which Attention adopts before it routes the
+  next step. Captured CUDA graphs follow the placement because the maps are
+  updated in place.
+
+Constraints: async EPLB (`use_async`) and DBO are rejected with EPLB, and
+`log_balancedness` has no effect (no FFN-side step runs). EPLB exchanges run
+on the connector's CPU bootstrap group at each rearrangement boundary, so a
+rearrangement adds a host sync on every rank.
+
+Run the recipe from the repository root:
+
+```bash
+export MODEL_PATH=/path/model_weights/Qwen3-30B-A3B
+bash recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/prefill_decode_colocation/2a2f_graph_eplb_dp2tp1.sh
+```

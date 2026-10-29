@@ -105,12 +105,21 @@ class AFDMetadataProviderMixin:
         # callers compatible with runners created before this mixin existed.
         is_graph_capturing = getattr(self, "_afd_is_graph_capturing", False)
         is_graph_replaying = getattr(self, "_afd_is_graph_replaying", False)
+        # Graph capture and replay payloads carry padded DP counts; the real
+        # count of this rank's transaction lives on the pending sidecar.
+        # Connectors that record per-expert load (DeepEP M2N EPLB) read it.
+        num_real_tokens = 0
+        if self._afd_pending_metadata is not None:
+            unpadded = self._afd_pending_metadata.tokens_unpadded_lens
+            if unpadded:
+                num_real_tokens = int(unpadded[0])
         payload = AFDControlPayload(
             dp_metadata_list=dp_metadata_list,
             is_graph_capturing=is_graph_capturing,
             is_warmup=is_warmup,
             is_graph_replaying=is_graph_replaying,
             is_profile=self._afd_is_profile,
+            num_real_tokens=num_real_tokens,
         )
         self.connector.control_plane.update_state_from_dp_metadata(payload)
         self.connector.control_plane.send_dp_metadata_list(payload)

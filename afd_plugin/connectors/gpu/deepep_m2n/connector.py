@@ -93,6 +93,11 @@ from afd_plugin.connectors.base import (
     AFDRoutedExpertsConnector,
     ConnectorExtraInfo,
 )
+from afd_plugin.connectors.gpu.deepep_m2n.eplb import (
+    DeepEPM2NAttentionEplb,
+    DeepEPM2NFFNEplb,
+    recv_initial_eplb_state,
+)
 from afd_plugin.connectors.gpu.deepep_m2n.experts import (
     EXPERT_BACKENDS,
     DeepEPM2NExperts,
@@ -452,6 +457,10 @@ class HandshakeResult:
     capacity_tokens_per_rank: int
     bucket_ladder: tuple[int, ...]
     transport: TransportLayout
+    # Reported by the FFN ranks; Attention adopts it (EPLB adds redundant
+    # physical expert slots on top of the model's logical experts).
+    num_physical_experts: int
+    enable_eplb: bool
 
 
 def expert_weight_format(quant_config: QuantizationConfig | None) -> str:
@@ -469,6 +478,7 @@ def expert_weight_format(quant_config: QuantizationConfig | None) -> str:
 def ffn_deployment_info(vllm_config: VllmConfig) -> dict[str, Any]:
     """FFN-side vLLM settings that decide which experts each rank loads."""
     parallel_config = vllm_config.parallel_config
+    num_physical_experts = _ffn_num_physical_experts(vllm_config)
     return {
         "expert_parallel": parallel_config.enable_expert_parallel,
         "ep_size": parallel_config.data_parallel_size
@@ -476,9 +486,23 @@ def ffn_deployment_info(vllm_config: VllmConfig) -> dict[str, Any]:
         "tensor_parallel_size": parallel_config.tensor_parallel_size,
         "expert_placement_strategy": parallel_config.expert_placement_strategy,
         "eplb": parallel_config.enable_eplb,
+        "num_physical_experts": num_physical_experts,
         "all2all_backend": parallel_config.all2all_backend,
         "weight_format": expert_weight_format(vllm_config.quant_config),
     }
+
+
+def _ffn_num_physical_experts(vllm_config: VllmConfig) -> int:
+    """Physical expert slots the FFN loads: logical experts plus EPLB
+    redundant copies. DeepEP routes rows to slots, so every rank must agree
+    on this count."""
+    text_config = vllm_config.model_config.hf_text_config
+    num_experts = int(text_config.num_experts)
+    if not vllm_config.parallel_config.enable_eplb:
+        return num_experts
+    return num_experts + int(
+        vllm_config.parallel_config.eplb_config.num_redundant_experts
+    )
 
 
 def local_handshake_info(
@@ -546,11 +570,15 @@ def _check_ffn_deployment(
     deployment: dict[str, Any] | None,
     layout: DeepEPM2NLayout,
     payload_format: str,
+    num_logical_experts: int,
 ) -> None:
     """vLLM must place experts on FFN ranks exactly as DeepEP routes them.
 
     Otherwise rows reach a rank that holds other experts and the results are
     silently wrong. Every rank runs this, so Attention fails with the FFN.
+    With EPLB the FFN loads ``num_physical_experts`` slots (logical experts
+    plus redundant copies), and DeepEP routes by slot id, so Attention adopts
+    that count for its own layout after the handshake.
     """
     if deployment is None:
         raise RuntimeError(f"FFN world rank {world_rank} sent no deployment info")
@@ -559,7 +587,6 @@ def _check_ffn_deployment(
         "ep_size": layout.ffn_size,
         "tensor_parallel_size": 1,
         "expert_placement_strategy": "linear",
-        "eplb": False,
         "all2all_backend": IDLE_ALL2ALL_BACKEND,
         "weight_format": PAYLOAD_WEIGHT_FORMATS[payload_format],
     }
@@ -573,6 +600,19 @@ def _check_ffn_deployment(
         raise RuntimeError(
             f"FFN world rank {world_rank} is deployed with {mismatches}; "
             f"DeepEP M2N with payload_format={payload_format!r} needs {required}"
+        )
+    num_physical = int(deployment["num_physical_experts"])
+    if deployment["eplb"]:
+        if num_physical < num_logical_experts:
+            raise RuntimeError(
+                f"FFN world rank {world_rank} enables EPLB with "
+                f"{num_physical} physical experts for {num_logical_experts} "
+                "logical experts"
+            )
+    elif num_physical != num_logical_experts:
+        raise RuntimeError(
+            f"FFN world rank {world_rank} reports {num_physical} physical "
+            f"experts for {num_logical_experts} logical experts without EPLB"
         )
 
 
@@ -607,11 +647,36 @@ def validate_handshake(
         )
     for world_rank, info in enumerate(infos[: layout.ffn_size]):
         _check_ffn_deployment(
-            world_rank, info["ffn_deployment"], layout, info["payload_format"]
+            world_rank,
+            info["ffn_deployment"],
+            layout,
+            info["payload_format"],
+            int(info["num_experts"]),
         )
     alignments = {info["expert_alignment"] for info in infos[: layout.ffn_size]}
     if len(alignments) != 1 or None in alignments:
         raise RuntimeError(f"FFN ranks disagree on expert_alignment: {alignments}")
+    # EPLB adds redundant physical expert slots; every FFN rank must load the
+    # same count, and it must split evenly over the FFN ranks so DeepEP's
+    # slot-to-rank routing stays contiguous.
+    deployments = [info["ffn_deployment"] for info in infos[: layout.ffn_size]]
+    enable_eplb = {bool(deployment["eplb"]) for deployment in deployments}
+    if len(enable_eplb) != 1:
+        raise RuntimeError(f"FFN ranks disagree on EPLB: {sorted(enable_eplb)}")
+    num_physical_experts = {
+        int(deployment["num_physical_experts"]) for deployment in deployments
+    }
+    if len(num_physical_experts) != 1:
+        raise RuntimeError(
+            f"FFN ranks disagree on num_physical_experts: {num_physical_experts}"
+        )
+    num_physical_experts_value = num_physical_experts.pop()
+    if num_physical_experts_value % layout.ffn_size != 0:
+        raise RuntimeError(
+            f"EPLB gives {num_physical_experts_value} physical experts, which "
+            f"does not split evenly over {layout.ffn_size} FFN ranks; adjust "
+            "num_redundant_experts"
+        )
     attn_infos = infos[layout.ffn_size :]
     tp_sizes = {info["attn_tp_size"] for info in attn_infos}
     if len(tp_sizes) != 1 or None in tp_sizes:
@@ -673,6 +738,8 @@ def validate_handshake(
         capacity_tokens_per_rank=int(capacities.pop()),
         bucket_ladder=ladders.pop() or (),
         transport=transport,
+        num_physical_experts=num_physical_experts_value,
+        enable_eplb=enable_eplb.pop(),
     )
 
 
@@ -952,11 +1019,38 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self.layout = DeepEPM2NLayout(
             ffn_size=afd_config.num_ffn_ranks,
             attn_size=afd_config.num_attention_ranks,
-            num_experts=vllm_config.model_config.get_num_experts(),
+            # FFN knows its own EPLB slot count up front; Attention adopts
+            # the FFN's count from the handshake below.
+            num_experts=(
+                _ffn_num_physical_experts(vllm_config)
+                if afd_config.role == "ffn"
+                else vllm_config.model_config.get_num_experts()
+            ),
         )
+        # EPLB coordination (see deepep_m2n/eplb.py): an Attention-side load
+        # recorder or an FFN-side rearrangement driver, built during
+        # ``init_afd_connector`` once the handshake reports the FFN's EPLB
+        # deployment. ``None`` when the FFN runs without EPLB.
+        self.eplb: DeepEPM2NAttentionEplb | DeepEPM2NFFNEplb | None = None
+        self._handshake_enable_eplb = False
+        if (
+            afd_config.role == "ffn"
+            and vllm_config.parallel_config.enable_eplb
+            and vllm_config.parallel_config.eplb_config.use_async
+        ):
+            raise RuntimeError(
+                "DeepEP M2N EPLB does not support async EPLB: the async "
+                "worker commits new expert maps outside the connector step "
+                "boundary the Attention ranks adopt them at. Pass "
+                "use_async=false in --eplb-config."
+            )
         self.attn_size = self.layout.attn_size
         self.ffn_size = self.layout.ffn_size
         self.is_ffn = afd_config.role == "ffn"
+        # The model's logical expert count, unlike the layout's physical slot
+        # count when EPLB adds redundant experts: the handshake compares this
+        # across roles, and both roles know it from the model config.
+        self.num_logical_experts = int(text_config.num_experts)
         self.is_fp8_payload = self.config.payload_format == FP8_PAYLOAD
         self.payload_dtype = FP8_DTYPE if self.is_fp8_payload else self.dtype
         if self.is_fp8_payload and self.hidden_size % FP8_GROUP_SIZE != 0:
@@ -1055,7 +1149,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             config=self.config,
             hidden_size=self.hidden_size,
             dtype=self.dtype,
-            num_experts=self.layout.num_experts,
+            num_experts=self.num_logical_experts,
             top_k=self.top_k,
             num_lanes=self.num_lanes,
             capacity_tokens_per_rank=self.capacity_tokens_per_rank,
@@ -1097,6 +1191,16 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
                 group_name=TRANSPORT_GROUP_NAME,
                 timeout=self._timeout,
             )
+        self._handshake_enable_eplb = result.enable_eplb
+        # With EPLB the FFN loads physical expert slots (logical experts plus
+        # redundant copies) and DeepEP routes by slot id, so Attention adopts
+        # the FFN's slot count for its own routing layout.
+        if not self.is_ffn and self.layout.num_experts != result.num_physical_experts:
+            self.layout = DeepEPM2NLayout(
+                ffn_size=self.layout.ffn_size,
+                attn_size=self.layout.attn_size,
+                num_experts=result.num_physical_experts,
+            )
         if self.world_rank == 0:
             logger.info("DeepEP M2N network plan: %s", self.network_plan.summary())
             logger.info("DeepEP M2N transport: %s", self.transport.summary())
@@ -1111,6 +1215,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         *,
         moe_layer_indices: Sequence[int] | None = None,
         local_experts: Mapping[int, FFNLocalExperts] | None = None,
+        eplb_state: Any | None = None,
     ) -> None:
         """Collective: check what every rank loaded, then create buffers.
 
@@ -1119,6 +1224,9 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
                 ``None`` skips the post-load checks for this rank.
             local_experts: FFN only: this rank's experts per MoE layer, as
                 vLLM loaded them.
+            eplb_state: FFN only, EPLB deployments: the runner's registered
+                ``EplbState``. Its expert maps and rearrangement schedule are
+                shared with the Attention ranks (see ``deepep_m2n/eplb.py``).
         """
         if self._initialized:
             return
@@ -1141,6 +1249,29 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             hidden_size=self.hidden_size,
             payload_format=self.config.payload_format,
         )
+        if self._handshake_enable_eplb:
+            if self.is_ffn:
+                if eplb_state is None:
+                    raise RuntimeError(
+                        "DeepEP M2N EPLB needs the FFN runner's EplbState; "
+                        "pass it to init_afd_connector(eplb_state=...)"
+                    )
+                self.eplb = DeepEPM2NFFNEplb(self, eplb_state)
+                self.eplb.broadcast_initial_state()
+            else:
+                if moe_layer_indices is None:
+                    raise RuntimeError(
+                        "DeepEP M2N EPLB needs the Attention model's MoE layer "
+                        "indices at init_afd_connector"
+                    )
+                schedule, initial_map, initial_count = recv_initial_eplb_state(self)
+                self.eplb = DeepEPM2NAttentionEplb(
+                    self,
+                    schedule,
+                    tuple(moe_layer_indices),
+                    initial_map,
+                    initial_count,
+                )
         # Never the lanes' bootstrap group: the control plane's close() aborts
         # this group to cancel a pending receive.
         self.group = init_afd_process_group(
@@ -1220,6 +1351,14 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
     @property
     def is_initialized(self) -> bool:
         return self._initialized
+
+    @property
+    def attention_tp_rank(self) -> int:
+        """This rank's position inside its Attention TP group."""
+        if self.is_ffn:
+            raise RuntimeError("FFN ranks have no Attention TP rank")
+        assert self.attn_tp_size is not None
+        return (self.world_rank - self.ffn_size) % self.attn_tp_size
 
     @property
     def domain(self) -> tuple[int, int]:
@@ -1443,6 +1582,28 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             done.record(lane_stream)
         self._lane_done[state.lane] = done
 
+    def apply_eplb_routing(
+        self,
+        topk_ids: torch.Tensor,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        """Map logical top-k ids to physical expert ids and record the load.
+
+        Identity without EPLB; with EPLB the Attention-side recorder maps
+        through the placement the FFN committed and counts rows per physical
+        expert (see ``deepep_m2n/eplb.py``).
+        """
+        self._check_initialized()
+        if not isinstance(self.eplb, DeepEPM2NAttentionEplb):
+            return topk_ids
+        return self.eplb.apply_routing(topk_ids, layer_idx)
+
+    def step_ffn_eplb(self) -> None:
+        """Advance the FFN-side rearrangement counter; see ``eplb.py``."""
+        self._check_initialized()
+        if isinstance(self.eplb, DeepEPM2NFFNEplb):
+            self.eplb.step()
+
     def synchronize_lanes(self) -> None:
         """Make the caller's stream wait for every lane's outstanding combine.
 
@@ -1652,6 +1813,13 @@ class DeepEPM2NAFDControlPlane(AFDControlPlane):
                 f"{len(payload.dp_metadata_list)} stages exceed "
                 f"num_lanes={connector.num_lanes}"
             )
+        # EPLB recording runs where routing runs, on Attention: step the
+        # recorder for the transaction that just finished (this rank's
+        # previous payload) and prepare the recording state for the one about
+        # to run. The FFN steps its side after its forward, so both roles
+        # reach each rearrangement boundary together.
+        if isinstance(connector.eplb, DeepEPM2NAttentionEplb):
+            connector.eplb.on_control_step(payload)
         graph_mode = payload.is_graph_capturing or payload.is_graph_replaying
         if (
             connector.attn_tp_size is None

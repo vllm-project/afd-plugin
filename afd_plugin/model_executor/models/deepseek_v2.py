@@ -34,6 +34,7 @@ from afd_plugin.config import (
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
     AFDForwardContextMetadata,
+    AFDRoutedExpertsConnector,
     AFDTransferContext,
     AFDTransferMetadata,
 )
@@ -153,9 +154,11 @@ class RemoteFFNProxy(nn.Module):
     on Attention (an M2N routed-experts connector such as DeepEP M2N) sets
     ``gate``, ``top_k``, ``renormalize`` and ``tp_size`` after construction,
     from its model and parallel config. The proxy then computes the gate and
-    vLLM's default fused top-k (``FusedTopKRouter``; EPLB is not supported)
-    and sends ``topk_ids`` and ``topk_weights``; combine returns the top-k
-    weighted sum, which replaces the native MoE block's output.
+    vLLM's default fused top-k (``FusedTopKRouter``) and sends ``topk_ids``
+    and ``topk_weights``; combine returns the top-k weighted sum, which
+    replaces the native MoE block's output. When the FFN runs EPLB, the
+    connector maps the logical top-k ids to physical expert ids here
+    (``AFDRoutedExpertsConnector.apply_eplb_routing``).
 
     With Attention TP > 1 every TP rank holds the same tokens after the
     attention all-reduce; dispatching them from every rank would make the FFN
@@ -218,6 +221,15 @@ class RemoteFFNProxy(nn.Module):
     ) -> int:
         """Send this layer's Attention output; return the stage to receive."""
         afd_metadata = self._afd_metadata()
+        # With EPLB the connector places experts dynamically: map the logical
+        # top-k ids to physical slots (and record load) before dispatch.
+        if "topk_ids" in send_kwargs:
+            connector = afd_metadata.connector
+            if isinstance(connector, AFDRoutedExpertsConnector):
+                send_kwargs["topk_ids"] = connector.apply_eplb_routing(
+                    send_kwargs["topk_ids"],
+                    self.layer_idx,
+                )
         forward_context = get_forward_context()
         stage_idx = int(
             getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),

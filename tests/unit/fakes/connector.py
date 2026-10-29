@@ -74,10 +74,17 @@ class FakeRoutedConnector(AFDRoutedExpertsConnector):
     def close(self) -> None:
         self.events.append(("close",))
 
-    def init_afd_connector(self, *, moe_layer_indices=None, local_experts=None):
+    def init_afd_connector(
+        self,
+        *,
+        moe_layer_indices=None,
+        local_experts=None,
+        eplb_state=None,
+    ):
         self.init_kwargs = {
             "moe_layer_indices": moe_layer_indices,
             "local_experts": local_experts,
+            "eplb_state": eplb_state,
         }
         self.initialized = True
 
@@ -86,7 +93,7 @@ class FakeRoutedConnector(AFDRoutedExpertsConnector):
         self.control_updates.append(payload)
 
     def send_attn_output(self, hidden_states, context, **kwargs) -> None:
-        self.events.append(("send_attn",))
+        self.events.append(("send_attn", dict(kwargs)))
 
     def recv_ffn_output(self, ref_tensor, ubatch_idx=0, **kwargs):
         return ref_tensor
