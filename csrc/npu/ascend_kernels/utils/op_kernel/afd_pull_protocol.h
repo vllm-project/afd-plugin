@@ -207,10 +207,9 @@ public:
         return total;
     }
 
-    __aicore__ void Receive(GM_ADDR output, GM_ADDR scales, GM_ADDR batch, GM_ADDR groupCounts,
-                           uint64_t capacity, bool copyPayload = true, bool synchronize = true) {
+    // Mega's fused pipeline owns payload DMA; this prepares only control metadata.
+    __aicore__ void PrepareRound(GM_ADDR batch, GM_ADDR groupCounts, uint64_t capacity) {
         if (id_ == 0) Select();
-        if (synchronize) AscendC::SyncAll<true>();
         auto meta = metadata_.Get<int64_t>();
         auto groups = groups_.Get<int64_t>();
         if (ReadState(FAILURE) || ReadState(SOURCE) < 0) {
@@ -219,7 +218,6 @@ public:
             return;
         }
         const uint64_t total = LoadMetadata();
-        if (synchronize) AscendC::SyncAll<true>();
         if (ReadState(FAILURE)) {
             ClearMetadata();
             SaveMetadata(batch, groupCounts);
@@ -239,25 +237,6 @@ public:
             for (uint32_t s = 0; s < shape_.tp; ++s) {
                 const uint64_t count = meta.GetValue(5 + shape_.tp + s * shape_.experts + e);
                 const auto slice = Intersect(block, count, begin, capacity);
-                uint64_t prefix = meta.GetValue(5 + s);
-                for (uint32_t g = 0; g < e; ++g)
-                    prefix += meta.GetValue(5 + shape_.tp + s * shape_.experts + g);
-                AscendC::GlobalTensor<int8_t> src, dst;
-                AscendC::GlobalTensor<float> dstScale;
-                src.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(
-                    Peer(uint32_t(meta.GetValue(1)) + s) + layout_.payload));
-                dst.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(output));
-                dstScale.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scales));
-                auto row = row_.Get<int8_t>();
-                auto scale = row_.GetWithOffset<float>(1, shape_.hidden);
-                for (uint64_t r = id_; copyPayload && r < slice.count; r += cores_) {
-                    AscendC::DataCopyPad(row, src[(prefix + slice.skip + r) * layout_.rowStride],
-                        {1U, uint32_t(shape_.hidden + sizeof(float)), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-                    Fence<AscendC::HardEvent::MTE2_MTE3>();
-                    AscendC::DataCopy(dst[(slice.local + r) * shape_.hidden], row, shape_.hidden);
-                    AscendC::DataCopyPad(dstScale[slice.local + r], scale, {1U, 4U, 0U, 0U, 0U});
-                    Fence<AscendC::HardEvent::MTE3_MTE2>();
-                }
                 group += slice.count;
                 block += count;
             }
@@ -265,7 +244,6 @@ public:
         }
         SaveMetadata(batch, groupCounts);
         Fence<AscendC::HardEvent::MTE3_S>();
-        if (synchronize) AscendC::SyncAll<true>();
     }
 
     __aicore__ bool ValidateReturn(GM_ADDR batch, uint64_t inputRows) {
@@ -296,32 +274,11 @@ public:
         return true;
     }
 
-    __aicore__ void Return(GM_ADDR output, GM_ADDR batch, uint64_t inputRows, bool copyPayload = true) {
+    __aicore__ void CompleteRound(GM_ADDR batch, uint64_t inputRows) {
         if (!ValidateReturn(batch, inputRows)) return;
         auto meta = metadata_.Get<int64_t>();
-        const uint64_t begin = meta.GetValue(3), end = meta.GetValue(4);
+        const uint64_t end = meta.GetValue(4);
         const uint32_t source = meta.GetValue(1);
-        uint64_t block = 0;
-        for (uint32_t e = 0; e < shape_.experts; ++e) {
-            for (uint32_t s = 0; s < shape_.tp; ++s) {
-                const uint64_t count = meta.GetValue(5 + shape_.tp + s * shape_.experts + e);
-                const auto slice = Intersect(block, count, begin, end - begin);
-                uint64_t prefix = meta.GetValue(5 + s);
-                for (uint32_t g = 0; g < e; ++g)
-                    prefix += meta.GetValue(5 + shape_.tp + s * shape_.experts + g);
-                AscendC::GlobalTensor<bfloat16_t> src, dst;
-                src.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(output));
-                dst.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(Peer(source + s) + layout_.returned));
-                auto row = row_.Get<bfloat16_t>();
-                for (uint64_t r = id_; copyPayload && r < slice.count; r += cores_) {
-                    AscendC::DataCopy(row, src[(slice.local + r) * shape_.hidden], shape_.hidden);
-                    Fence<AscendC::HardEvent::MTE2_MTE3>();
-                    AscendC::DataCopy(dst[(prefix + slice.skip + r) * shape_.hidden], row, shape_.hidden);
-                    Fence<AscendC::HardEvent::MTE3_MTE2>();
-                }
-                block += count;
-            }
-        }
         Fence<AscendC::HardEvent::MTE3_S>();
         AscendC::SyncAll<true>();
         if (id_ != 0) return;

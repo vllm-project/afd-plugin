@@ -166,7 +166,7 @@ extern "C" __global__ __aicore__ void afd_mega_moe_pull_native(
             if ASCEND_IS_AIV {
                 if (id == 0) {
                     Cam::Pull::Transport rx(state, PullShape(t), c[7], t.aivNum, pipe, 0);
-                    rx.Receive(nullptr, nullptr, scratch + w.batch, scratch + w.counts, c[10], false, false);
+                    rx.PrepareRound(scratch + w.batch, scratch + w.counts, c[10]);
                     const auto modelLayer = rx.Read(scratch + w.batch + 16);
                     int64_t slot = -1;
                     if (rx.ReadState(Cam::Pull::SOURCE) >= 0 && !rx.ReadState(Cam::Pull::FAILURE)) {
@@ -206,7 +206,7 @@ extern "C" __global__ __aicore__ void afd_mega_moe_pull_native(
             if ASCEND_IS_AIV { pipe.Reset(); }
             if ASCEND_IS_AIV {
                 Cam::Pull::Transport tx(state, PullShape(t), c[7], t.aivNum, pipe, id);
-                if (layer >= 0 && layer < c[13]) tx.Return(nullptr, scratch + w.batch, c[10], false);
+                if (layer >= 0 && layer < c[13]) tx.CompleteRound(scratch + w.batch, c[10]);
                 if (id == 0) tx.Write(completion, tx.ReadState(Cam::Pull::FAILURE));
             }
             // All GMM/epilogue events have drained before scratch and flag slots are reused.

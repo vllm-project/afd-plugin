@@ -524,10 +524,10 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         if self.extra_info.ffn_mega_moe and self._initialized:
             if self.world_rank < self.attn_size:
                 self.graph_startup.close_pull_attention()
-            else:
-                if not pull_receiver_stopped:
-                    raise RuntimeError("Pull receiver must stop; retain resources")
+            elif pull_receiver_stopped:
                 self.graph_startup.finish_pull_receiver()
+            else:
+                raise RuntimeError("Pull receiver must stop; retain resources")
         if self.cam_pg is not None:
             import torch.distributed as dist
 

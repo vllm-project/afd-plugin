@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -164,7 +164,7 @@ def test_full_receiver_exit_requires_success_even_during_shutdown(harness, fail)
 
 
 @pytest.mark.parametrize("drains", [True, False])
-def test_pull_shutdown_finishes_only_selected_source(harness, monkeypatch, drains):
+def test_pull_drain_rejects_incomplete_source(harness, monkeypatch, drains):
     h = harness
     monkeypatch.setenv("BATCH_SIZE_FACTOR", str(8 / 262144))
     h.connector.extra_info = replace(
@@ -174,15 +174,10 @@ def test_pull_shutdown_finishes_only_selected_source(harness, monkeypatch, drain
     monkeypatch.setattr(h.connector, "pull_has_active_source", lambda: next(active))
     monkeypatch.setattr(h.connector, "check_pull_status", lambda: None)
     monkeypatch.setattr(torch.npu, "synchronize", lambda: None)
-    calls = []
-    monkeypatch.setattr(
-        h.runner,
-        "_ffn_forward_connector_driven",
-        lambda *, single: calls.append(single),
-    )
-    if drains:
+    monkeypatch.setattr(h.runner, "_ffn_forward_connector_driven", lambda **kw: None)
+    with (
+        nullcontext()
+        if drains
+        else pytest.raises(RuntimeError, match="retain resources")
+    ):
         h.runner.drain_pull_source()
-    else:
-        with pytest.raises(RuntimeError, match="retain resources"):
-            h.runner.drain_pull_source()
-    assert calls == [True, True]

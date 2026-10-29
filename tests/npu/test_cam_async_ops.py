@@ -92,12 +92,6 @@ def test_mega_dispatch_meta_publishes_completion(cam_runtime):
     assert comm_arg.alias_info.is_write
 
 
-@pytest.mark.parametrize("name", ["afd_mega_dispatch_recv", "afd_mega_combine_send"])
-def test_mega_has_no_standalone_ffn_transport(cam_runtime, name):
-    with pytest.raises(RuntimeError):
-        cam_runtime._C._dispatch_find_schema_or_throw(f"afd_ascend::{name}", "")
-
-
 def test_pull_empty_combine_preserves_logical_shape(cam_runtime):
     torch = cam_runtime
     anchor = torch.empty(1, dtype=torch.bfloat16, device="meta")

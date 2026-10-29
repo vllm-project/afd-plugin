@@ -9,12 +9,10 @@ import os
 import time
 from functools import wraps
 from pathlib import Path
-from types import SimpleNamespace
 
 import torch
 
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
-from afd_plugin.model_executor.npu.async_cam_mega import AsyncCAMMegaExecutor
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 from afd_plugin.v1.worker.npu.attention_model_runner_v2 import (
     AFDNPUAttentionModelRunnerV2,
@@ -33,11 +31,6 @@ def snapshot(runner) -> dict:
     if isinstance(runner, AsyncNPUFFNModelRunner):
         result.update(
             mode=runner.effective_mode,
-            compute_backend="native"
-            if runner._mega_executor is not None
-            else "layered"
-            if runner._layered_executor is not None
-            else "legacy",
             requested=runner.requested_mode,
             capture_count=runner._graph_capture_count
             if runner._graph is not None
@@ -84,15 +77,12 @@ def install_observers() -> None:
     shutdown_ffn = AsyncNPUFFNModelRunner.shutdown
     health_check = AFDNPUFFNWorker.raise_ffn_loop_error_if_any
     stop_ffn = AFDNPUFFNWorker.stop_ffn_server_loop
-    mega_call = AsyncCAMMegaExecutor.__call__
 
-    def observe(connector, state):
+    def observe(connector, context):
         # Only called after DR/FFN/CS completion on the execution thread.
         # RPC snapshots read this host copy without touching device buffers.
+        state = context.states
         header = state.token_nums_rankid_layeridx.cpu().tolist()
-        # Idle uses a valid layer for layered GMM, but has no transaction footer.
-        if connector.extra_info.ffn_mega_moe and (header[-2] <= 0 or header[-1] <= 0):
-            return
         rows = int(state.group_list.sum().item())
         previous = getattr(connector, "_e2e_completion", {})
         layers = dict(previous.get("layers", {}))
@@ -110,14 +100,7 @@ def install_observers() -> None:
     def completed(self):
         result = complete(self)
         if result:
-            if self._mega_executor is None:
-                state = self._graph_payload.context.states
-            else:
-                state = SimpleNamespace(
-                    token_nums_rankid_layeridx=self._mega_executor.batch_info,
-                    group_list=self._mega_executor.group_list,
-                )
-            observe(self.connector, state)
+            observe(self.connector, self._graph_payload.context)
         return result
 
     @wraps(send_eager)
@@ -127,21 +110,7 @@ def install_observers() -> None:
             # Functional coverage only. This fixture adds an eager event fence
             # for observations and must not be used for performance reporting.
             torch.npu.current_stream().synchronize()
-            observe(self, context.states)
-        return result
-
-    @wraps(mega_call)
-    def mega_called(self):
-        result = mega_call(self)
-        if self.connector.graph_startup.mode == "eager":
-            torch.npu.current_stream().synchronize()
-            observe(
-                self.connector,
-                SimpleNamespace(
-                    token_nums_rankid_layeridx=self.batch_info,
-                    group_list=self.group_list,
-                ),
-            )
+            observe(self, context)
         return result
 
     @wraps(execute)
@@ -198,7 +167,6 @@ def install_observers() -> None:
         return result
 
     AsyncNPUFFNModelRunner._complete_graph = completed
-    AsyncCAMMegaExecutor.__call__ = mega_called
     CAMAsyncAFDConnector.send_ffn_output = sent
     AFDNPUAttentionModelRunnerV2.execute_model = executed
     AFDNPUAttentionModelRunnerV2.shutdown = attention_closed

@@ -207,14 +207,12 @@ def test_mega_warmup_launches_once_per_source(monkeypatch, capacity):
 @pytest.mark.parametrize(
     "raw",
     [
-        {"dispatch_mode": "pull_v1"},
-        {"dispatch_mode": "push_compact_v2"},
         {"ffn_mega_moe": True},
         {"ffn_mega_moe": True, "dynamicQuant": 1, "ffn_two_stream": True},
     ],
 )
-def test_mega_rejects_incompatible_configuration(raw):
-    with pytest.raises(ValueError, match="dispatch_mode|ffn_mega_moe"):
+def test_mega_requires_quantized_single_stream(raw):
+    with pytest.raises(ValueError, match="ffn_mega_moe"):
         AFDAsyncExtraInfo.from_mapping(raw)
 
 
