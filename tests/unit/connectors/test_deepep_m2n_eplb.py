@@ -10,6 +10,7 @@ reduced, which are adopted), not the transport.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -89,8 +90,8 @@ class _FakeDist:
     receiving tensor so adoption is observable."""
 
     def __init__(self, *, map_value: int = 7) -> None:
-        self.reduces: list[tuple[torch.Tensor, int]] = []
-        self.broadcasts: list[torch.Tensor] = []
+        self.reduces: list[tuple[Any, int]] = []
+        self.broadcasts: list[Any] = []
         self._map_value = map_value
 
     def reduce(self, tensor, dst, group):
