@@ -42,6 +42,29 @@ The supported SOC generations and the operators compiled for each are declared
 in `ascend_kernels/operator_registry.json`; `scripts/select_ops.py` resolves the
 operator list from that registry for a given SOC.
 
+## Pull Mega MC2 dependency
+
+The A3 `AfdMegaMoePullNative` kernel directly includes CANN 9.1's W4A8
+`BlockMmad` from `ops_transformer/ascendc/mega_moe/arch22`. Set
+`ASCEND_CANN_PACKAGE_PATH` or `ASCEND_HOME_PATH` to the CANN installation.
+When this operator is selected, configuration fails if its MC2 headers are
+missing; builds that exclude it do not need this dependency. The dependency
+tree is not copied into this repository.
+
+One native launch selects a layer and drains one source transaction. Receive
+capacity follows ordinary CAM: `int(262144 * BATCH_SIZE_FACTOR)`, default 262144
+rows. Only transactions exceeding this capacity use multiple device rounds;
+capacity is independent of the MC2 matrix tile size. Callers must not launch
+once per receive round. The workspace allocation ABI and Attention Combine
+interface are unchanged. The path supports A3 per-channel W4A8 with SwiGLU.
+
+For intermediate widths up to 3072, ACT directly uses the installed MC2 W4A8
+two-stage UB epilogue and expert-group synchronization. Wider supported rows
+retain the bounded column implementation. Return-address caching is bounded
+independently of receive capacity. Large capacity reserves HBM scratch without
+computing padded rows; for H4096/I2048 the default capacity needs about 10.5 GiB
+per FFN executor, excluding weights and communication windows.
+
 ## Default Behavior
 
 Ascend custom ops build by default. Set `AFD_BUILD_ASCEND_OPS=0` only when

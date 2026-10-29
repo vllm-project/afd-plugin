@@ -30,6 +30,16 @@ int main() {
     assert(native.bytes - native.c2 >= 4ULL * 512 * 4096);
     assert(native.layer - native.tileCounts >= 8ULL * 128 * (512 / Cam::NATIVE_TILE_ROWS));
     assert(native.a1 - native.x >= 512ULL * 4096);
+    static_assert(Cam::NATIVE_MAX_ROWS == MAX_CAPACITY);
+    for (uint64_t capacity : {uint64_t(4096), uint64_t(65536), uint64_t(MAX_CAPACITY)}) {
+        const Cam::NativeMegaWorkspace large(capacity, 8192, 8192, 128, 4);
+        assert(large.a2 - large.a1 >= capacity * 8192);
+        assert(large.c1 - large.a2 >= capacity * 8192);
+        assert(large.c2 - large.c1 >= 8 * capacity * 8192);
+        assert(large.bytes - large.c2 >= 4 * capacity * 8192);
+        assert(Rounds(capacity, capacity) == 1);
+        assert(Rounds(capacity + 1, capacity) == 2);
+    }
     std::mt19937 random(20261027);
     for (uint32_t trial = 0; trial < 1000; ++trial) {
         const uint32_t sources = 1 + random() % 4, experts = 1 + random() % 8;

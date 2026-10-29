@@ -5,32 +5,12 @@
 #include <cstring>
 #include "register/op_def_registry.h"
 #include "tiling/platform/platform_ascendc.h"
-#include "tiling/tiling_api.h"
 #include "tiling/hccl/hccl_tiling.h"
 #include "../op_kernel/afd_mega_moe_pull_native_tiling.h"
 #include "../op_kernel/afd_pull_layout.h"
 #include "ops_log.h"
 
 namespace optiling {
-static bool CubeTiling(platform_ascendc::PlatformAscendC &platform, int64_t k, uint8_t *dest) {
-    matmul_tiling::MatmulApiTiling mm(platform);
-    mm.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_INT4);
-    mm.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::NZ, matmul_tiling::DataType::DT_INT4);
-    mm.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
-    mm.SetBias(false);
-    mm.SetShape(128, 256, k);
-    mm.SetOrgShape(128, 256, k);
-    mm.SetFixSplit(128, 256, 256);
-    mm.SetBufferSpace(-1, -1, -1);
-    TCubeTiling data;
-    if (mm.GetTiling(data) == -1 || data.GetDataSize() > 1024) return false;
-    // MC2's K1024 L1 tile and K256 L0 tile; reuse the main MSD double-buffer contract.
-    data.set_stepKa(4); data.set_stepKb(4);
-    data.set_depthA1(8); data.set_depthB1(8);
-    data.set_dbL0B(2); data.set_stepM(1); data.set_stepN(1);
-    data.SaveToBuffer(dest, 1024);
-    return true;
-}
 static ge::graphStatus NativeMegaTiling(gert::TilingContext *ctx) {
     const auto attrs = ctx->GetAttrs();
     const auto config = attrs->GetListInt(0);
@@ -54,7 +34,12 @@ static ge::graphStatus NativeMegaTiling(gert::TilingContext *ctx) {
     platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ub);
     if (aic == 0 || aiv != 2 * aic || aiv > Cam::NATIVE_MAX_AIVS ||
         Cam::Pull::TransportUbBytes(shape) > ub ||
-        29ULL * c[2] + 1024 > ub || 7ULL * c[1] + 256 > ub) return ge::GRAPH_FAILED;
+        Cam::Pull::Align(8 * Cam::Pull::MetadataWords(shape.tp, shape.experts)) +
+            10ULL * c[1] + 1280 > ub ||
+        184ULL * 1024 + 8ULL * Cam::NATIVE_METADATA_ROWS > ub) return ge::GRAPH_FAILED;
+    // MC2 full-row ACT uses 54 bytes per intermediate column plus per-core scales.
+    if (c[2] <= 3072 && 54ULL * c[2] + 256 + 4ULL * ((c[10] + aiv - 1) / aiv) > ub)
+        return ge::GRAPH_FAILED;
     const Cam::NativeMegaWorkspace w(c[10], c[1], c[2], c[6], c[9]);
     if (ctx->GetInputShape(3)->GetStorageShape().GetDim(0) != int64_t(w.bytes))
         return ge::GRAPH_FAILED;
@@ -63,8 +48,8 @@ static ge::graphStatus NativeMegaTiling(gert::TilingContext *ctx) {
     std::copy(c, c + 14, data->config);
     data->aicNum = aic;
     data->aivNum = aiv;
-    data->commAivNum = std::max(1U, aiv / 4);
-    if (!CubeTiling(platform, std::max(c[1], c[2]), data->cube)) return ge::GRAPH_FAILED;
+    // All AIVs take part in MC2 dispatch/MSD, activation and paired output.
+    data->commAivNum = 0;
     data->layerMapSize = ctx->GetInputShape(2)->GetStorageShape().GetDim(0);
     if (data->layerMapSize == 0 || data->layerMapSize > 65536) return ge::GRAPH_FAILED;
     data->routedScale = *attrs->GetFloat(2);

@@ -14,7 +14,8 @@
 namespace Cam {
 constexpr uint32_t NATIVE_MAX_AIVS = 48;
 constexpr uint32_t NATIVE_STAGES = 5;
-constexpr uint32_t NATIVE_MAX_ROWS = 512;
+constexpr uint32_t NATIVE_MAX_ROWS = Pull::MAX_CAPACITY;
+constexpr uint32_t NATIVE_METADATA_ROWS = 512;
 constexpr uint32_t NATIVE_TILE_ROWS = 64;
 AFD_NATIVE_DEVICE constexpr uint64_t NativeAlign(uint64_t n) { return (n + 511) / 512 * 512; }
 

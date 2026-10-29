@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""One MC2 W4A8 launch owns a pull round, layer selection, and return writes."""
+"""One MC2 W4A8 launch drains a transaction, splitting only on receive overflow."""
 
 from __future__ import annotations
 
