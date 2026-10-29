@@ -133,7 +133,6 @@ class SyntheticModel(torch.nn.Module):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--per-group", action="store_true")
-    parser.add_argument("--pull", action="store_true")
     parser.add_argument("--mega", action="store_true")
     parser.add_argument("--idle-probe", action="store_true")
     parser.add_argument(
@@ -158,10 +157,10 @@ def main():
         parser.error("capacity must be in [1,512], boundary tokens in [7,512]")
     if args.attn_ranks % args.attention_tp:
         parser.error("Attention rank count must be divisible by TP")
-    if args.idle_shutdown and not args.pull:
-        parser.error("idle shutdown requires --pull")
-    if args.mega and (not args.pull or args.per_group):
-        parser.error("native Mega requires --pull and per-channel weights")
+    if (args.idle_shutdown or args.idle_probe) and not args.mega:
+        parser.error("idle shutdown/probe requires --mega")
+    if args.mega and args.per_group:
+        parser.error("native Mega requires per-channel weights")
     if args.full_graph and not args.reference_outputs:
         parser.error("FULL replay requires saved matching eager outputs")
     faulthandler.dump_traceback_later(60)
@@ -198,8 +197,7 @@ def main():
                 "port": port[0],
                 "connector_extra_config": {
                     "dynamicQuant": 1,
-                    "dispatch_mode": "pull_v1" if args.pull else "push_compact_v2",
-                    "ffn_mega_moe": args.mega and is_ffn,
+                    "ffn_mega_moe": args.mega,
                     "attn_ranks_per_dp": args.attention_tp,
                     "hccl_buffer_size": 64,
                 },
@@ -250,7 +248,6 @@ def main():
     report = {
         "rank": rank,
         "per_group": args.per_group,
-        "pull": args.pull,
         "mega": args.mega,
         "hidden": args.hidden_size,
         "intermediate": args.intermediate_size,
@@ -377,7 +374,7 @@ def main():
         dist.barrier()
     print(json.dumps({"rank": rank, "stage": "transport_ready"}), flush=True)
     if args.idle_probe:
-        assert args.pull
+        assert args.mega
         if is_ffn:
             pull_state = connector.comm_args.view(torch.int64)
             before = int(pull_state[96].item())
@@ -421,6 +418,11 @@ def main():
         )
         rows *= args.attention_tp
         for source in range(0, args.attn_ranks, args.attention_tp):
+            if args.mega:
+                # The exposed metadata is the final slice of one fused transaction.
+                last_rows = (rows - 1) % args.receive_capacity + 1 if rows else 0
+                expected.append((source, layer_id, last_rows))
+                continue
             for start in range(0, max(1, rows), args.receive_capacity):
                 expected.append(
                     (source, layer_id, min(args.receive_capacity, rows - start))

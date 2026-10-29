@@ -99,19 +99,7 @@ def main() -> None:
     parser.add_argument("--experts-per-rank", type=int, default=EXPERTS_PER_RANK)
     parser.add_argument("--hidden-size", type=int, default=HIDDEN_SIZE)
     parser.add_argument("--top-k", type=int, default=TOP_K)
-    parser.add_argument("--pull", action="store_true")
-    parser.add_argument("--receive-capacity", type=int)
-    parser.add_argument("--zero-shards", action="store_true")
-    parser.add_argument(
-        "--fault", choices=("return-epoch", "return-counts", "return-rows")
-    )
     args = parser.parse_args()
-    if args.pull and (args.dtype != "bfloat16" or args.dynamic_quant != 1):
-        parser.error("pull requires bfloat16 and dynamic-quant=1")
-    if args.zero_shards and not args.pull:
-        parser.error("zero shards require --pull")
-    if args.fault and not args.pull:
-        parser.error("fault injection requires --pull")
     assert args.attention_dp > 0 and args.ffn_ranks > 0 and args.experts_per_rank > 0
     assert args.hidden_size > 0 and 1 < args.top_k <= args.experts_per_rank
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -122,9 +110,7 @@ def main() -> None:
     torch.npu.set_device(local_rank)
     dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
     # One expert fits; two fully populated experts require separate chunks.
-    max_seq_len = args.tp * BATCH_SIZE
-    capacity = args.receive_capacity or max_seq_len
-    assert 0 < capacity <= MAX_CAPACITY
+    capacity = args.tp * BATCH_SIZE
     os.environ["BATCH_SIZE_FACTOR"] = str(capacity / MAX_CAPACITY)
     ensure_cam_async_ops_available()
     dist.init_process_group("hccl", timeout=timedelta(minutes=5))
@@ -134,36 +120,10 @@ def main() -> None:
     comm = torch.empty(1, dtype=torch.float16, device="npu")
     anchor = torch.empty(1, dtype=dtype, device="npu")
     ops = torch.ops.afd_ascend
-    cases = CASES + (("zero-shard", "all-zero") if args.zero_shards else ())
-    if args.fault:
-        cases = ("edge",)
-    comm_id = 0
-    if args.pull:
-        comm_id = 0x41464401
-        comm = ops.afd_mega_pull_init(
-            anchor,
-            [
-                BATCH_SIZE,
-                args.hidden_size,
-                args.top_k,
-                args.ffn_ranks,
-                attention_ranks,
-                args.experts_per_rank,
-                rank,
-                args.tp,
-            ],
-            list(range(len(cases) * REPETITIONS)) if rank >= attention_ranks else [],
-            1,
-            group_name,
-        )
-        torch.npu.synchronize()
-        dist.barrier()
     reports = []
     try:
         with torch.inference_mode():
-            for iteration, case in enumerate(
-                cases * (1 if args.fault else REPETITIONS)
-            ):
+            for iteration, case in enumerate(CASES * REPETITIONS):
                 dist.barrier()
                 if rank < attention_ranks:
                     x_cpu, ids_cpu, weights_cpu = make_input(
@@ -175,25 +135,13 @@ def main() -> None:
                         hidden_size=args.hidden_size,
                         top_k=args.top_k,
                     )
-                    if case == "all-zero" or (
-                        case == "zero-shard" and rank % args.tp == 0
-                    ):
-                        x_cpu, ids_cpu, weights_cpu = (
-                            x_cpu[:0],
-                            ids_cpu[:0],
-                            weights_cpu[:0],
-                        )
                     x, ids, weights = x_cpu.npu(), ids_cpu.npu(), weights_cpu.npu()
-                    (
-                        ops.afd_mega_dispatch_send
-                        if args.pull
-                        else ops.afd_async_dispatch_send
-                    )(
+                    ops.afd_async_dispatch_send(
                         x,
                         ids,
                         comm,
-                        comm_id,
-                        max_seq_len,
+                        0,
+                        capacity,
                         x.shape[0],
                         args.hidden_size,
                         args.top_k,
@@ -207,16 +155,12 @@ def main() -> None:
                         args.dynamic_quant,
                         group_name,
                     )
-                    output = (
-                        ops.afd_mega_combine_recv
-                        if args.pull
-                        else ops.afd_async_combine_recv
-                    )(
+                    output = ops.afd_async_combine_recv(
                         anchor,
                         ids,
                         weights,
                         comm,
-                        comm_id,
+                        0,
                         x.shape[0],
                         args.hidden_size,
                         args.top_k,
@@ -226,30 +170,20 @@ def main() -> None:
                         rank,
                         world_size,
                         group_name,
-                        *((max_seq_len, args.tp) if args.pull else ()),
                     ).cpu()
                     expected = reference_output(
                         x_cpu, ids_cpu, weights_cpu, args.dynamic_quant
                     )
                     atol, rtol = TOLERANCES[args.dtype]
-                    if args.fault:
-                        assert comm.view(torch.int64)[24].item() == -9
-                    else:
-                        torch.testing.assert_close(
-                            output, expected, atol=atol, rtol=rtol
-                        )
+                    torch.testing.assert_close(output, expected, atol=atol, rtol=rtol)
                     reports.append(
                         {
                             "case": case,
                             "iteration": iteration,
-                            "fault": args.fault,
-                            "max_abs_error": None
-                            if args.fault
-                            else (
-                                (output.float() - expected.float()).abs().max().item()
-                                if output.numel()
-                                else 0.0
-                            ),
+                            "max_abs_error": (output.float() - expected.float())
+                            .abs()
+                            .max()
+                            .item(),
                         }
                     )
                 else:
@@ -257,33 +191,26 @@ def main() -> None:
                     completed_dp_groups = 0
                     while completed_dp_groups < args.attention_dp:
                         expanded, scales, batch_info, counts = (
-                            ops.afd_mega_dispatch_recv
-                            if args.pull
-                            else ops.afd_async_dispatch_recv
-                        )(
-                            anchor,
-                            comm,
-                            comm_id,
-                            max_seq_len,
-                            args.hidden_size,
-                            args.top_k,
-                            args.ffn_ranks,
-                            attention_ranks,
-                            args.experts_per_rank,
-                            rank,
-                            world_size,
-                            args.tp,
-                            args.dynamic_quant,
-                            group_name,
+                            ops.afd_async_dispatch_recv(
+                                anchor,
+                                comm,
+                                0,
+                                capacity,
+                                args.hidden_size,
+                                args.top_k,
+                                args.ffn_ranks,
+                                attention_ranks,
+                                args.experts_per_rank,
+                                rank,
+                                world_size,
+                                args.tp,
+                                args.dynamic_quant,
+                                group_name,
+                            )
                         )
                         count_list = counts.cpu().tolist()
                         header = batch_info[:5].cpu().tolist()
-                        assert header[2] == iteration, (
-                            rank,
-                            iteration,
-                            header,
-                            count_list,
-                        )
+                        assert header[2] == iteration
                         num_tokens = sum(count_list)
                         values = expanded[:num_tokens].float()
                         if args.dynamic_quant:
@@ -302,24 +229,12 @@ def main() -> None:
                             result = torch.zeros(
                                 (1, args.hidden_size), dtype=dtype, device="npu"
                             )
-                        inject = args.fault and rank == attention_ranks
-                        if inject:
-                            if args.fault == "return-epoch":
-                                batch_info[-2].add_(1)
-                            elif args.fault == "return-counts":
-                                batch_info[5 + args.tp].add_(1)
-                            else:
-                                result = result[:1]
-                        (
-                            ops.afd_mega_combine_send
-                            if args.pull
-                            else ops.afd_async_combine_send
-                        )(
+                        ops.afd_async_combine_send(
                             result,
                             comm,
                             batch_info,
-                            comm_id,
-                            max_seq_len,
+                            0,
+                            capacity,
                             args.hidden_size,
                             args.top_k,
                             args.ffn_ranks,
@@ -331,15 +246,7 @@ def main() -> None:
                             group_name,
                         )
                         chunks += 1
-                        if inject:
-                            assert comm.view(torch.int64)[24].item() == -9
-                            break
-                        complete = (
-                            header[4] >= header[0]
-                            if args.pull
-                            else header[4] == args.experts_per_rank - 1
-                        )
-                        if complete:
+                        if header[4] == args.experts_per_rank - 1:
                             completed_dp_groups += 1
                     if case == "empty-rank-multichunk" and rank == attention_ranks:
                         assert chunks > 1

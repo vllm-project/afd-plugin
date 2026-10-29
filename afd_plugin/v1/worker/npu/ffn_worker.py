@@ -203,7 +203,7 @@ class AFDNPUFFNWorker(NPUWorker):
         torch.npu.set_device(self.device)
         pull = (
             isinstance(self.model_runner, AsyncNPUFFNModelRunner)
-            and self.model_runner.connector.extra_info.dispatch_mode == "pull_v1"
+            and self.model_runner.connector.extra_info.ffn_mega_moe
         )
         # Pull must keep serving committed, unselected work until every A is quiet.
         while not event.is_set() or pull:
@@ -236,14 +236,14 @@ class AFDNPUFFNWorker(NPUWorker):
 
         if isinstance(self.model_runner, AsyncNPUFFNModelRunner):
             self.model_runner.drain_pull_source()
-            if self.model_runner.connector.extra_info.dispatch_mode == "pull_v1":
+            if self.model_runner.connector.extra_info.ffn_mega_moe:
                 self.model_runner.connector.graph_startup.finish_pull_receiver()
 
     def _requires_async_drain(self) -> bool:
         return isinstance(self.model_runner, AsyncNPUFFNModelRunner) and (
             self.model_runner.effective_mode == "full"
             or self.model_runner._two_stream is not None
-            or self.model_runner.connector.extra_info.dispatch_mode == "pull_v1"
+            or self.model_runner.connector.extra_info.ffn_mega_moe
         )
 
     def raise_ffn_loop_error_if_any(self) -> None:

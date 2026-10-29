@@ -121,10 +121,8 @@ def command_for(args, settings, role: str) -> list[str]:
     offset = command.index("--additional-config") + 1
     config = json.loads(command[offset])
     config.update(additional_config(role, async_cam=True))
-    if args.pull:
-        config["afd"]["connector_extra_config"].update(
-            dispatch_mode="pull_v1", ffn_mega_moe=args.mega and role == "ffn"
-        )
+    if args.mega:
+        config["afd"]["connector_extra_config"].update(ffn_mega_moe=True)
     command[offset] = json.dumps(config)
     if role == "ffn" and args.mode == "full":
         command.remove("--enforce-eager")
@@ -224,7 +222,7 @@ def validate_reference(args, plans: dict[str, LaunchPlan]) -> str:
             config = json.loads(command[command.index("--additional-config") + 1])
             afd = config["afd"]
             mega = afd["connector_extra_config"].pop("ffn_mega_moe", False)
-            if command is previous and role == "ffn" and mega != expected_mega:
+            if command is previous and mega != expected_mega:
                 raise ValueError("Reference compute backend does not match")
             for key in ("host", "port"):
                 afd.pop(key, None)
@@ -383,7 +381,6 @@ def audit_execution(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", required=True, choices=("eager", "full"))
-    parser.add_argument("--pull", action="store_true")
     parser.add_argument("--mega", action="store_true")
     parser.add_argument("--model", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -397,8 +394,6 @@ def main() -> None:
     parser.add_argument("--startup-timeout", type=float, default=1800)
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
-    if args.mega and not args.pull:
-        parser.error("native Mega requires --pull")
     devices = args.devices.split(",")
     if (
         len(devices) != ATTENTION_RANKS + args.ffn_ranks

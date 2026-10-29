@@ -96,8 +96,6 @@ class _FakeCamOps:
         return _FakeTensor((batch_size, hidden_size))
 
     afd_mega_dispatch_send = afd_async_dispatch_send
-    afd_mega_dispatch_recv = afd_async_dispatch_recv
-    afd_mega_combine_send = afd_async_combine_send
     afd_mega_combine_recv = afd_async_combine_recv
 
 
@@ -179,31 +177,44 @@ def test_async_extra_info_rejects_unknown_and_invalid_fields():
         AFDAsyncExtraInfo.from_mapping({"attn_ranks_per_dp": 0})
 
 
-def test_pull_config_round_trips_protocol_and_normalized_quantization():
+def test_mega_config_round_trips_protocol_and_normalized_quantization():
     info = AFDAsyncExtraInfo.from_mapping(
-        {"dispatch_mode": "pull_v1", "dynamicQuant": "1", "ffn_two_stream": "false"}
+        {"ffn_mega_moe": "true", "dynamicQuant": "1", "ffn_two_stream": "false"}
     )
-    assert info.dispatch_mode == "pull_v1" and info.dynamic_quant == 1
+    assert info.ffn_mega_moe and info.dynamic_quant == 1
     assert AFDAsyncExtraInfo.from_mapping(info.to_mapping()) == info
-    mega = AFDAsyncExtraInfo.from_mapping(
-        {"dispatch_mode": "pull_v1", "dynamicQuant": 1, "ffn_mega_moe": "true"}
+
+
+@pytest.mark.parametrize("capacity", [1, 16])
+def test_mega_warmup_launches_once_per_source(monkeypatch, capacity):
+    monkeypatch.setenv("BATCH_SIZE_FACTOR", str(capacity / 262144))
+    connector = CAMAsyncAFDConnector(
+        0,
+        0,
+        _vllm_config(
+            extra_config={
+                "ffn_mega_moe": True,
+                "dynamicQuant": 1,
+                "attn_ranks_per_dp": 4,
+            }
+        ),
+        _afd_config(role="ffn"),
+        0,
     )
-    assert mega.ffn_mega_moe
-    assert AFDAsyncExtraInfo.from_mapping(mega.to_mapping()) == mega
-    with pytest.raises(ValueError, match="ffn_mega_moe"):
-        AFDAsyncExtraInfo.from_mapping({"ffn_mega_moe": True})
+    assert connector.graph_startup_chunks() == 1
 
 
 @pytest.mark.parametrize(
     "raw",
     [
-        {"dispatch_mode": "other"},
         {"dispatch_mode": "pull_v1"},
-        {"dispatch_mode": "pull_v1", "dynamicQuant": 1, "ffn_two_stream": True},
+        {"dispatch_mode": "push_compact_v2"},
+        {"ffn_mega_moe": True},
+        {"ffn_mega_moe": True, "dynamicQuant": 1, "ffn_two_stream": True},
     ],
 )
-def test_pull_rejects_incompatible_configuration(raw):
-    with pytest.raises(ValueError, match="dispatch_mode|pull_v1"):
+def test_mega_rejects_incompatible_configuration(raw):
+    with pytest.raises(ValueError, match="dispatch_mode|ffn_mega_moe"):
         AFDAsyncExtraInfo.from_mapping(raw)
 
 
@@ -517,8 +528,8 @@ def test_async_rejects_fused_shared_expert_ids():
         )
 
 
-@pytest.mark.parametrize("mode", ["push_compact_v2", "pull_v1"])
-def test_dispatch_failure_preserves_protocol_window_ownership(monkeypatch, mode):
+@pytest.mark.parametrize("mega", [False, True])
+def test_dispatch_failure_preserves_protocol_window_ownership(monkeypatch, mega):
     fake_torch = _FakeTorch()
     monkeypatch.setattr(async_cam_module, "torch", fake_torch)
     connector = CAMAsyncAFDConnector(
@@ -529,7 +540,7 @@ def test_dispatch_failure_preserves_protocol_window_ownership(monkeypatch, mode)
         0,
     )
     connector._initialized = True
-    connector.extra_info = replace(connector.extra_info, dispatch_mode=mode)
+    connector.extra_info = replace(connector.extra_info, ffn_mega_moe=mega)
     connector.comm_args = _FakeTensor((1,), dtype="fp16")
     context = AFDTransferContext(
         metadata=AFDTransferMetadata.create_attention_metadata(
@@ -544,12 +555,12 @@ def test_dispatch_failure_preserves_protocol_window_ownership(monkeypatch, mode)
 
     monkeypatch.setattr(
         fake_torch.ops.afd_ascend,
-        "afd_mega_dispatch_send" if mode == "pull_v1" else "afd_async_dispatch_send",
+        "afd_mega_dispatch_send" if mega else "afd_async_dispatch_send",
         fail_dispatch,
     )
     with pytest.raises(RuntimeError, match="dispatch failed"):
         connector.send_attn_output(_FakeTensor((3, 16)), context, **_topk_payload(3))
-    if mode == "pull_v1":
+    if mega:
         with pytest.raises(RuntimeError, match="pending"):
             connector.close()
     else:
@@ -566,6 +577,7 @@ def test_pull_combine_failure_retains_window_until_completion(monkeypatch, phase
     )
     connector._initialized = True
     connector.comm_args = _FakeTensor((1,), dtype="fp16")
+    connector.extra_info = replace(connector.extra_info, ffn_mega_moe=True)
     hidden = _FakeTensor((3, 16))
     context = AFDTransferContext(
         metadata=AFDTransferMetadata.create_attention_metadata(
@@ -573,7 +585,6 @@ def test_pull_combine_failure_retains_window_until_completion(monkeypatch, phase
         )
     )
     connector.send_attn_output(hidden, context, **_topk_payload(3))
-    connector.extra_info = replace(connector.extra_info, dispatch_mode="pull_v1")
     monkeypatch.setattr(connector.graph_startup, "close_pull_attention", lambda: None)
 
     def fail(*_args):

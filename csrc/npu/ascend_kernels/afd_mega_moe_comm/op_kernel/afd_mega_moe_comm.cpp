@@ -165,8 +165,7 @@ __aicore__ inline bool WaitCombine(GM_ADDR state, const Cam::AfdMegaMoeCommTilin
 } // namespace AfdMegaComm
 
 extern "C" __global__ __aicore__ void afd_mega_moe_comm(
-    GM_ADDR x, GM_ADDR ids, GM_ADDR probabilities, GM_ADDR state, GM_ADDR batch,
-    GM_ADDR packed, GM_ADDR scales, GM_ADDR metadata, GM_ADDR counts, GM_ADDR combined,
+    GM_ADDR x, GM_ADDR ids, GM_ADDR probabilities, GM_ADDR state, GM_ADDR combined,
     GM_ADDR completion, GM_ADDR workspace, GM_ADDR tiling) {
     using namespace AfdMegaComm;
     REGISTER_TILING_DEFAULT(Cam::AfdMegaMoeCommTilingData);
@@ -185,8 +184,6 @@ extern "C" __global__ __aicore__ void afd_mega_moe_comm(
             if (transport.ReadState(Cam::Pull::FAILURE)) {}
             else if (c[0] == 0) transport.Initialize();
             else if (c[0] == 1) Publish(x, ids, state, t, pipe, transport, layout);
-            else if (c[0] == 2) transport.Receive(packed, scales, metadata, counts, c[11]);
-            else if (c[0] == 3) transport.Return(x, batch, c[9]);
             else if (c[0] == 4 && WaitCombine(state, t, layout, transport)) {
                 SyncAll<true>();
                 if (c[9]) {

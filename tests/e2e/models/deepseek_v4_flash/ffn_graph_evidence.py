@@ -91,9 +91,7 @@ def install_observers() -> None:
         # RPC snapshots read this host copy without touching device buffers.
         header = state.token_nums_rankid_layeridx.cpu().tolist()
         # Idle uses a valid layer for layered GMM, but has no transaction footer.
-        if connector.extra_info.dispatch_mode == "pull_v1" and (
-            header[-2] <= 0 or header[-1] <= 0
-        ):
+        if connector.extra_info.ffn_mega_moe and (header[-2] <= 0 or header[-1] <= 0):
             return
         rows = int(state.group_list.sum().item())
         previous = getattr(connector, "_e2e_completion", {})

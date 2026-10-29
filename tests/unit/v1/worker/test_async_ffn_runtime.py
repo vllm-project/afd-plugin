@@ -168,7 +168,7 @@ def test_pull_shutdown_finishes_only_selected_source(harness, monkeypatch, drain
     h = harness
     monkeypatch.setenv("BATCH_SIZE_FACTOR", str(8 / 262144))
     h.connector.extra_info = replace(
-        h.connector.extra_info, dispatch_mode="pull_v1", dynamic_quant=1
+        h.connector.extra_info, ffn_mega_moe=True, dynamic_quant=1
     )
     active = iter((True, True, False) if drains else (True,) * 8)
     monkeypatch.setattr(h.connector, "pull_has_active_source", lambda: next(active))

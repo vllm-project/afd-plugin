@@ -172,10 +172,11 @@ class AsyncNPUFFNModelRunner:
         except Exception as exc:
             executor_error = str(exc) or type(exc).__name__
         executor = self._layered_executor
-        if config.dispatch_mode == "pull_v1" and executor is None:
-            raise ValueError("pull_v1 requires homogeneous layered W4A8 weights")
         if config.ffn_mega_moe:
-            assert executor is not None
+            if executor is None:
+                raise ValueError(
+                    "ffn_mega_moe requires homogeneous layered W4A8 weights"
+                )
             self._mega_executor = AsyncCAMMegaExecutor(executor, self.connector)
         if config.ffn_two_stream:
             stream_signature = repr(
@@ -406,14 +407,11 @@ class AsyncNPUFFNModelRunner:
     def execute_connector_driven_step(self) -> bool:
         step_afd_npu_profiler(self.prof)
         if (
-            self.connector.extra_info.dispatch_mode == "pull_v1"
+            self.connector.extra_info.ffn_mega_moe
             and self.connector.graph_startup.pull_stop_requested()
         ):
             return False
-        if (
-            self.connector.extra_info.dispatch_mode == "pull_v1"
-            and not self._pull_idle_enabled
-        ):
+        if self.connector.extra_info.ffn_mega_moe and not self._pull_idle_enabled:
             self.connector.enable_pull_idle_returns()
             if self._graph is not None:
                 self._graph_stream.wait_stream(torch.npu.current_stream(self.device))
@@ -433,7 +431,7 @@ class AsyncNPUFFNModelRunner:
 
     def drain_pull_source(self) -> None:
         """Finish a selected source before the worker releases its resources."""
-        if self.connector.extra_info.dispatch_mode != "pull_v1":
+        if not self.connector.extra_info.ffn_mega_moe:
             return
         rounds = (
             self.max_num_tokens * self.connector.topk + cam_receive_capacity() - 1
@@ -502,7 +500,7 @@ class AsyncNPUFFNModelRunner:
             raise RuntimeError(
                 "Failed graph startup retains resources"
             ) from self._failure
-        if self.connector.extra_info.dispatch_mode == "pull_v1":
+        if self.connector.extra_info.ffn_mega_moe:
             if (
                 not self._graph_receiver_exited
                 or self.connector.pull_has_active_source()
@@ -517,7 +515,7 @@ class AsyncNPUFFNModelRunner:
         elif self._graph is not None:
             self._close_graph()
         stop_afd_npu_profiler(self.prof)
-        if self.connector.extra_info.dispatch_mode == "pull_v1":
+        if self.connector.extra_info.ffn_mega_moe:
             self.connector.close(pull_receiver_stopped=True)
         else:
             self.connector.close()

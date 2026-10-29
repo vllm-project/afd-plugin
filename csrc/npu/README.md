@@ -44,6 +44,13 @@ operator list from that registry for a given SOC.
 
 ## Pull Mega MC2 dependency
 
+Set `connector_extra_config.ffn_mega_moe=true` on every Attention and FFN
+rank to enable MegaMoE and its dedicated pull protocol. With the switch off,
+CAM retains its original push Dispatch/Combine and FFN execution path.
+Pull is not a standalone transport option: there is no `dispatch_mode`
+setting or separate pull DispatchRecv/CombineSend operator. MegaMoE requires
+`dynamicQuant=1`, per-channel W4A8 and `ffn_two_stream=false`.
+
 The A3 `AfdMegaMoePullNative` kernel directly includes CANN 9.1's W4A8
 `BlockMmad` from `ops_transformer/ascendc/mega_moe/arch22`. Set
 `ASCEND_CANN_PACKAGE_PATH` or `ASCEND_HOME_PATH` to the CANN installation.

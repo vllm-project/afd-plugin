@@ -5,12 +5,11 @@
 extern "C" void __attribute__((weak)) NnopbaseSetHcclServerType(void *, int32_t);
 extern "C" aclnnStatus aclnnAfdMegaMoeCommGetWorkspaceSize(
     const aclTensor *x, const aclTensor *expertIds, const aclTensor *expertScales,
-    const aclTensor *state, const aclTensor *batch, const aclIntArray *config, char *hcclGroupName,
-    const aclTensor *packed, const aclTensor *scales, const aclTensor *metadata,
-    const aclTensor *counts, const aclTensor *combined, const aclTensor *completion,
+    const aclTensor *state, const aclIntArray *config, char *hcclGroupName,
+    const aclTensor *combined, const aclTensor *completion,
     uint64_t *workspaceSize, aclOpExecutor **executor) {
-    return aclnnInnerAfdMegaMoeCommGetWorkspaceSize(x, expertIds, expertScales, state, batch,
-        config, hcclGroupName, packed, scales, metadata, counts, combined, completion, workspaceSize, executor);
+    return aclnnInnerAfdMegaMoeCommGetWorkspaceSize(x, expertIds, expertScales, state,
+        config, hcclGroupName, combined, completion, workspaceSize, executor);
 }
 extern "C" aclnnStatus aclnnAfdMegaMoeComm(void *workspace, uint64_t workspaceSize,
                                         aclOpExecutor *executor, aclrtStream stream) {

@@ -85,7 +85,6 @@ ATTN_RANKS_PER_DP_CONFIG_KEY = "attn_ranks_per_dp"
 _AFD_ASYNC_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "dynamicQuant",
-        "dispatch_mode",
         "ffn_mega_moe",
         "attn_ranks_per_dp",
         "hccl_buffer_size",
@@ -156,9 +155,9 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
         dynamic_quant: Dynamic quantization mode accepted by CAM operators.
         attn_ranks_per_dp: Number of Attention ranks in each data-parallel group.
         hccl_buffer_size: Optional buffer size in MB for the CAM HCCL domain.
+        ffn_mega_moe: Enable Mega FFN and its pull protocol on every A/F rank.
     """
 
-    dispatch_mode: str = "push_compact_v2"
     ffn_mega_moe: bool = False
     dynamic_quant: int = 0
     attn_ranks_per_dp: int = 1
@@ -186,11 +185,7 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
                 + ", ".join(unknown),
             )
 
-        mode = raw.get("dispatch_mode", "push_compact_v2")
-        if mode not in ("push_compact_v2", "pull_v1"):
-            raise ValueError("dispatch_mode must be push_compact_v2 or pull_v1")
         result = cls(
-            dispatch_mode=mode,
             ffn_mega_moe=coerce_extra_bool(
                 raw.get("ffn_mega_moe", False), field_name="ffn_mega_moe"
             ),
@@ -220,10 +215,10 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
             ),
         )
 
-        if mode == "pull_v1" and (result.dynamic_quant != 1 or result.ffn_two_stream):
-            raise ValueError("pull_v1 requires dynamicQuant=1 and ffn_two_stream=false")
-        if result.ffn_mega_moe and mode != "pull_v1":
-            raise ValueError("ffn_mega_moe requires dispatch_mode=pull_v1")
+        if result.ffn_mega_moe and (result.dynamic_quant != 1 or result.ffn_two_stream):
+            raise ValueError(
+                "ffn_mega_moe requires dynamicQuant=1 and ffn_two_stream=false"
+            )
         return result
 
     def to_mapping(self) -> dict[str, Any]:
@@ -231,8 +226,6 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
             "dynamicQuant": self.dynamic_quant,
             "attn_ranks_per_dp": self.attn_ranks_per_dp,
         }
-        if self.dispatch_mode != "push_compact_v2":
-            result["dispatch_mode"] = self.dispatch_mode
         if self.ffn_mega_moe:
             result["ffn_mega_moe"] = True
         if self.hccl_buffer_size is not None:
@@ -384,7 +377,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         backend = self.cam_pg._get_backend(torch.device("npu"))
         self.group_name = str(backend.get_hccl_comm_name(self.world_rank))
         device = f"npu:{self.local_rank}"
-        if self.extra_info.dispatch_mode == "pull_v1":
+        if self.extra_info.ffn_mega_moe:
             self.comm_id = PULL_COMM_ID
             self.comm_args = torch.ops.afd_ascend.afd_mega_pull_init(
                 torch.empty(1, dtype=torch.bfloat16, device=device),
@@ -437,7 +430,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
                 self.max_num_batched_tokens,
             )
         )
-        if self.extra_info.dispatch_mode == "pull_v1":
+        if self.extra_info.ffn_mega_moe:
             signature = "pull_v1:" + signature
         self.graph_startup.initialize(store, signature)
         if self.graph_startup.mode == "full":
@@ -448,7 +441,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
                     self.max_num_batched_tokens,
                     self.tp_size,
                     cam_receive_capacity(),
-                    allow_row_slicing=self.extra_info.dispatch_mode == "pull_v1",
+                    allow_row_slicing=self.extra_info.ffn_mega_moe,
                 )
                 self.graph_startup.phase("validated")
             except Exception as exc:
@@ -483,6 +476,9 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
 
     def graph_startup_chunks(self) -> int:
         """Every A TP rank sends one row to experts [0, topk)."""
+        if self.extra_info.ffn_mega_moe:
+            # A fused launch drains every receive round of the selected source.
+            return 1
         local_experts = max(
             0,
             min(
@@ -490,9 +486,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
                 self.topk - (self.world_rank - self.attn_size) * self.expert_per_rank,
             ),
         )
-        if self.extra_info.dispatch_mode == "pull_v1":
-            rows = self.tp_size * local_experts
-            return max(1, (rows + cam_receive_capacity() - 1) // cam_receive_capacity())
         experts_per_chunk = cam_receive_capacity() // self.tp_size
         return max(1, (local_experts + experts_per_chunk - 1) // experts_per_chunk)
 
@@ -524,14 +517,11 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
 
     def close(self, *, pull_receiver_stopped: bool = False) -> None:
         """Destroy the HCCL process group and clear pending transfer states."""
-        if (
-            self.extra_info.dispatch_mode == "pull_v1"
-            and self._pending_attention_payloads
-        ):
+        if self.extra_info.ffn_mega_moe and self._pending_attention_payloads:
             raise RuntimeError(
                 "Pull dispatch is pending; retain communication resources"
             )
-        if self.extra_info.dispatch_mode == "pull_v1" and self._initialized:
+        if self.extra_info.ffn_mega_moe and self._initialized:
             if self.world_rank < self.attn_size:
                 self.graph_startup.close_pull_attention()
             else:
@@ -597,7 +587,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
                 "Async CAM batch exceeds max_num_batched_tokens / TP capacity"
             )
         hidden_states = hidden_states.contiguous()
-        pull = self.extra_info.dispatch_mode == "pull_v1"
+        pull = self.extra_info.ffn_mega_moe
         if pull:
             if self._pending_attention_payloads:
                 raise RuntimeError(
@@ -631,7 +621,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         )
         (
             torch.ops.afd_ascend.afd_mega_dispatch_send
-            if self.extra_info.dispatch_mode == "pull_v1"
+            if self.extra_info.ffn_mega_moe
             else torch.ops.afd_ascend.afd_async_dispatch_send
         )(
             hidden_states,
@@ -722,7 +712,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         )
         output = (
             torch.ops.afd_ascend.afd_mega_combine_recv
-            if self.extra_info.dispatch_mode == "pull_v1"
+            if self.extra_info.ffn_mega_moe
             else torch.ops.afd_ascend.afd_async_combine_recv
         )(
             placeholder,
@@ -741,7 +731,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             self.group_name,
             *(
                 (self.max_num_batched_tokens, self.tp_size)
-                if self.extra_info.dispatch_mode == "pull_v1"
+                if self.extra_info.ffn_mega_moe
                 else ()
             ),
         )
@@ -753,7 +743,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         return output
 
     def check_pull_status(self) -> None:
-        if self.extra_info.dispatch_mode == "pull_v1":
+        if self.extra_info.ffn_mega_moe:
             assert self.comm_args is not None
             # shortcut: A-side host fence; replace after device errors are verified.
             status = int(self.comm_args.view(torch.int64)[PULL_FAILURE_INDEX].item())
@@ -812,11 +802,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dynamic_quant=self.dynamic_quant,
             group_name=self.group_name,
         )
-        outputs = (
-            torch.ops.afd_ascend.afd_mega_dispatch_recv
-            if self.extra_info.dispatch_mode == "pull_v1"
-            else torch.ops.afd_ascend.afd_async_dispatch_recv
-        )(
+        outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(
             placeholder,
             self.comm_args,
             self.comm_id,
@@ -890,11 +876,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             tp_size=self.tp_size,
             group_name=self.group_name,
         )
-        states.send_completion = (
-            torch.ops.afd_ascend.afd_mega_combine_send
-            if self.extra_info.dispatch_mode == "pull_v1"
-            else torch.ops.afd_ascend.afd_async_combine_send
-        )(
+        states.send_completion = torch.ops.afd_ascend.afd_async_combine_send(
             ffn_output,
             self.comm_args,
             token_nums_rankid_layeridx,
