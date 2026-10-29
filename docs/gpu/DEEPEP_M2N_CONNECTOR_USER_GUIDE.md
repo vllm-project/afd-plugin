@@ -385,10 +385,17 @@ the two EPLB duties split across the roles:
   next step. Captured CUDA graphs follow the placement because the maps are
   updated in place.
 
-Constraints: async EPLB (`use_async`) and DBO are rejected with EPLB, and
-`log_balancedness` has no effect (no FFN-side step runs). EPLB exchanges run
-on the connector's CPU bootstrap group at each rearrangement boundary, so a
-rearrangement adds a host sync on every rank.
+Constraints: async EPLB (`use_async`) and DBO are rejected with EPLB. EPLB
+exchanges run on the connector's CPU bootstrap group at each rearrangement
+boundary, so a rearrangement adds a host sync on every rank.
+
+To see which experts EPLB chose, set `"log_balancedness": true` in the FFN's
+`--eplb-config`: at every rearrangement the FFN then logs, per MoE layer,
+which logical experts each FFN rank holds, which are replicated, and the
+recorded token load per rank that drove the choice. The placement also lives
+in tensors at runtime: the FFN's `EplbState.physical_to_logical_map` (via the
+runner's `eplb.state`), and on Attention the connector's
+`logical_to_physical_map` (the same map, adopted from the FFN).
 
 Run the recipe from the repository root:
 

@@ -9,6 +9,7 @@ reduced, which are adopted), not the transport.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from typing import Any
 
@@ -22,6 +23,7 @@ from afd_plugin.connectors.gpu.deepep_m2n import eplb as eplb_module  # noqa: E4
 from afd_plugin.connectors.gpu.deepep_m2n.eplb import (  # noqa: E402
     DeepEPM2NAttentionEplb,
     DeepEPM2NFFNEplb,
+    describe_eplb_placement,
     real_rows_in_tp_slice,
 )
 from tests.unit.fakes.connector import FakeRoutedConnector  # noqa: E402
@@ -202,9 +204,15 @@ def _ffn_state():
         num_logical_experts=NUM_LOGICAL,
         num_physical_experts=NUM_PHYSICAL,
     )
+    # Two layers of a 12-slot world over 2 FFN ranks: layer 0 keeps the
+    # identity placement with logical 8 replicated in a redundant slot,
+    # layer 1 swaps logical 5 and 6 across the ranks.
+    layer0 = [0, 1, 2, 3, 4, 8, 6, 7, 8, 9, 10, 11]
+    layer1 = [0, 1, 2, 3, 4, 6, 5, 7, 8, 9, 10, 11]
     model_state = SimpleNamespace(
         model=model,
         expert_load_window=torch.zeros((WINDOW_SIZE, len(MOE_LAYERS), NUM_PHYSICAL)),
+        physical_to_logical_map=torch.tensor([layer0, layer1]),
         logical_to_physical_map=torch.zeros((len(MOE_LAYERS), NUM_LOGICAL, 4)),
         logical_replica_count=torch.zeros((len(MOE_LAYERS), NUM_LOGICAL)),
     )
@@ -222,6 +230,19 @@ def _ffn_state():
     return state, model_state, rearrangements
 
 
+def _ffn_connector(world_rank: int, *, log_placement: bool = False):
+    return SimpleNamespace(
+        bootstrap_group=object(),
+        world_rank=world_rank,
+        ffn_size=2,
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                eplb_config=SimpleNamespace(log_balancedness=log_placement),
+            ),
+        ),
+    )
+
+
 def test_ffn_driver_rearranges_only_at_the_boundary(monkeypatch: pytest.MonkeyPatch):
     """The FFN driver counts every step and runs the exchange (reduce,
     EplbState.rearrange, map broadcasts) only when the counter reaches the
@@ -231,7 +252,7 @@ def test_ffn_driver_rearranges_only_at_the_boundary(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(eplb_module.dist, "broadcast", fake_dist.broadcast)
     state, model_state, rearrangements = _ffn_state()
     state.expert_rearrangement_step_interval = 10
-    connector = SimpleNamespace(bootstrap_group=object(), world_rank=1)
+    connector = _ffn_connector(world_rank=1)
     driver = DeepEPM2NFFNEplb(connector, state)
 
     for _ in range(10 - INITIAL_REARRANGE_STEP - 1):
@@ -265,7 +286,7 @@ def test_ffn_driver_rank_zero_adopts_the_reduced_window(
     monkeypatch.setattr(eplb_module.dist, "broadcast", _FakeDist().broadcast)
     state, model_state, rearrangements = _ffn_state()
     state.expert_rearrangement_step_interval = 10
-    connector = SimpleNamespace(bootstrap_group=object(), world_rank=0)
+    connector = _ffn_connector(world_rank=0)
     driver = DeepEPM2NFFNEplb(connector, state)
 
     for _ in range(10 - INITIAL_REARRANGE_STEP):
@@ -287,3 +308,69 @@ def test_routed_connector_base_seams_default_to_no_op():
     assert torch.equal(connector.apply_eplb_routing(ids, 0), ids)
     connector.step_ffn_eplb()
     assert connector.events == []
+
+
+def test_describe_eplb_placement_lists_experts_per_rank():
+    """The placement description names each rank's logical experts and the
+    replicated ones, per MoE layer."""
+    _state, model_state, _rearrangements = _ffn_state()
+
+    lines = describe_eplb_placement(
+        model_state.physical_to_logical_map,
+        ffn_size=2,
+    )
+
+    assert len(lines) == 2
+    assert lines[0] == (
+        "layer 0: rank 0=[0, 1, 2, 3, 4, 8] | rank 1=[6, 7, 8, 9, 10, 11] "
+        "| replicas: 8x2"
+    )
+    # Layer 1 swaps logical 5 and 6 between the ranks and drops the replica.
+    assert lines[1] == (
+        "layer 1: rank 0=[0, 1, 2, 3, 4, 6] | rank 1=[5, 7, 8, 9, 10, 11] "
+        "| replicas: none"
+    )
+
+
+def test_ffn_driver_logs_chosen_experts_when_balancedness_logging_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """With log_balancedness the FFN world rank 0 logs the committed
+    placement and the recorded load that chose it at each boundary."""
+    fake_dist = _FakeDist()
+    monkeypatch.setattr(eplb_module.dist, "reduce", fake_dist.reduce)
+    monkeypatch.setattr(eplb_module.dist, "broadcast", fake_dist.broadcast)
+    state, model_state, rearrangements = _ffn_state()
+    state.expert_rearrangement_step_interval = 10
+    driver = DeepEPM2NFFNEplb(_ffn_connector(0, log_placement=True), state)
+
+    with caplog.at_level(logging.INFO, logger=eplb_module.logger.name):
+        for _ in range(10 - INITIAL_REARRANGE_STEP):
+            driver.step()
+
+    assert len(rearrangements) == 1
+    message = caplog.messages[0]
+    assert "EPLB chose experts" in message
+    assert "rank 0=0 tokens, rank 1=0 tokens" in message
+    assert "layer 0: rank 0=[0, 1, 2, 3, 4, 8]" in message
+
+
+def test_ffn_driver_stays_silent_without_balancedness_logging(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """Without log_balancedness no placement is logged, on any rank."""
+    fake_dist = _FakeDist()
+    monkeypatch.setattr(eplb_module.dist, "reduce", fake_dist.reduce)
+    monkeypatch.setattr(eplb_module.dist, "broadcast", fake_dist.broadcast)
+    for world_rank in (0, 1):
+        state, _model_state, _rearrangements = _ffn_state()
+        state.expert_rearrangement_step_interval = 10
+        driver = DeepEPM2NFFNEplb(_ffn_connector(world_rank), state)
+
+        with caplog.at_level(logging.INFO, logger=eplb_module.logger.name):
+            for _ in range(10 - INITIAL_REARRANGE_STEP):
+                driver.step()
+
+    assert caplog.messages == []
