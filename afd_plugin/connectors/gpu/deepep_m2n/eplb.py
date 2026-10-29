@@ -52,6 +52,10 @@ from vllm.model_executor.layers.fused_moe.router.base_router import (
 )
 
 from afd_plugin.connectors.metadata import AFDControlPayload
+from afd_plugin.distributed.eplb import (
+    describe_eplb_placement,
+    describe_eplb_rank_load,
+)
 
 if TYPE_CHECKING:
     from afd_plugin.connectors.gpu.deepep_m2n.connector import DeepEPM2NAFDConnector
@@ -122,48 +126,6 @@ def real_rows_in_tp_slice(
     """
     chunk = -(-num_real_tokens // tp_size)
     return min(max(num_real_tokens - tp_rank * chunk, 0), chunk)
-
-
-def describe_eplb_placement(
-    physical_to_logical_map: torch.Tensor,
-    *,
-    ffn_size: int,
-) -> list[str]:
-    """One line per MoE layer describing the placement EPLB committed.
-
-    Each line names, per FFN rank, the logical experts its physical slots
-    hold, and which logical experts are replicated (hold more than one slot).
-    ``physical_to_logical_map`` is the committed map, shape
-    ``(num_moe_layers, num_physical_experts)``; FFN rank ``g`` owns the
-    contiguous slot block ``[g * P / F, (g + 1) * P / F)``.
-    """
-    num_physical = physical_to_logical_map.shape[1]
-    slots_per_rank = num_physical // ffn_size
-    lines: list[str] = []
-    for layer_idx, layer_map in enumerate(physical_to_logical_map.tolist()):
-        parts = []
-        for rank in range(ffn_size):
-            slots = layer_map[rank * slots_per_rank : (rank + 1) * slots_per_rank]
-            experts = ", ".join(map(str, sorted(slots)))
-            parts.append(f"rank {rank}=[{experts}]")
-        replica_counts: dict[int, int] = {}
-        for logical in layer_map:
-            if logical >= 0:
-                replica_counts[logical] = replica_counts.get(logical, 0) + 1
-        replicated = {
-            logical: count
-            for logical, count in sorted(replica_counts.items())
-            if count > 1
-        }
-        replicas = (
-            "none"
-            if not replicated
-            else ", ".join(
-                f"{logical}x{count}" for logical, count in replicated.items()
-            )
-        )
-        lines.append(f"layer {layer_idx}: {' | '.join(parts)} | replicas: {replicas}")
-    return lines
 
 
 def _single_model_state(eplb_state: EplbState) -> EplbModelState:
@@ -412,13 +374,6 @@ class DeepEPM2NFFNEplb:
         ``(window_size, num_moe_layers, num_physical_experts)``.
         """
         ffn_size = self._connector.ffn_size
-        slots_per_rank = load_window.shape[2] // ffn_size
-        rank_loads = load_window.sum(dim=(0, 1)).tolist()
-        per_rank_parts = []
-        for rank in range(ffn_size):
-            slots = rank_loads[rank * slots_per_rank : (rank + 1) * slots_per_rank]
-            per_rank_parts.append(f"rank {rank}={int(sum(slots))} tokens")
-        per_rank = ", ".join(per_rank_parts)
         lines = describe_eplb_placement(
             self._model_state.physical_to_logical_map.cpu(),
             ffn_size=ffn_size,
@@ -426,7 +381,7 @@ class DeepEPM2NFFNEplb:
         logger.info(
             "DeepEP M2N EPLB chose experts (recorded load over %d steps: %s):\n%s",
             load_window.shape[0],
-            per_rank,
+            describe_eplb_rank_load(load_window, ffn_size=ffn_size),
             "\n".join(lines),
         )
 

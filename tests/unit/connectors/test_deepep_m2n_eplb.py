@@ -23,7 +23,6 @@ from afd_plugin.connectors.gpu.deepep_m2n import eplb as eplb_module  # noqa: E4
 from afd_plugin.connectors.gpu.deepep_m2n.eplb import (  # noqa: E402
     DeepEPM2NAttentionEplb,
     DeepEPM2NFFNEplb,
-    describe_eplb_placement,
     real_rows_in_tp_slice,
 )
 from tests.unit.fakes.connector import FakeRoutedConnector  # noqa: E402
@@ -308,28 +307,6 @@ def test_routed_connector_base_seams_default_to_no_op():
     assert torch.equal(connector.apply_eplb_routing(ids, 0), ids)
     connector.step_ffn_eplb()
     assert connector.events == []
-
-
-def test_describe_eplb_placement_lists_experts_per_rank():
-    """The placement description names each rank's logical experts and the
-    replicated ones, per MoE layer."""
-    _state, model_state, _rearrangements = _ffn_state()
-
-    lines = describe_eplb_placement(
-        model_state.physical_to_logical_map,
-        ffn_size=2,
-    )
-
-    assert len(lines) == 2
-    assert lines[0] == (
-        "layer 0: rank 0=[0, 1, 2, 3, 4, 8] | rank 1=[6, 7, 8, 9, 10, 11] "
-        "| replicas: 8x2"
-    )
-    # Layer 1 swaps logical 5 and 6 between the ranks and drops the replica.
-    assert lines[1] == (
-        "layer 1: rank 0=[0, 1, 2, 3, 4, 6] | rank 1=[5, 7, 8, 9, 10, 11] "
-        "| replicas: none"
-    )
 
 
 def test_ffn_driver_logs_chosen_experts_when_balancedness_logging_is_on(

@@ -11,8 +11,13 @@ import torch
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config import update_config as update_vllm_config
-from vllm.distributed.parallel_state import get_world_group, graph_capture
+from vllm.distributed.parallel_state import (
+    get_ep_group,
+    get_world_group,
+    graph_capture,
+)
 from vllm.forward_context import DPMetadata, get_forward_context, set_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.utils.mem_utils import DeviceMemoryProfiler
@@ -30,6 +35,10 @@ from afd_plugin.connectors import (
     AFDControlPayload,
     AFDControlPlane,
     AFDDPMetadata,
+)
+from afd_plugin.distributed.eplb import (
+    describe_eplb_placement,
+    describe_eplb_rank_load,
 )
 from afd_plugin.v1.worker.cuda_graph import (
     AFDGraphRunMode,
@@ -49,6 +58,8 @@ if TYPE_CHECKING:
     from vllm.sequence import IntermediateTensors
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+
+logger = init_logger(__name__)
 
 
 class GPUFFNModelRunner:
@@ -217,7 +228,67 @@ class GPUFFNModelRunner:
     def eplb_step(self, is_dummy: bool = False) -> None:
         """Step the FFN-side EPLB state after one connector-driven step."""
 
+        placement_before = self._snapshot_eplb_placement_if_due()
         self.eplb.step(is_dummy=is_dummy)
+        if placement_before is not None:
+            self._log_eplb_placement_if_changed(placement_before)
+
+    # Placement logging (log_balancedness): a rearrangement commits new
+    # expert maps inside EplbState.step, at a counter boundary in sync mode
+    # or from the async worker's results while a transfer is pending, so the
+    # map is snapshotted only on steps where either can happen and the
+    # placement is logged when the map actually changed. Every FFN EP rank
+    # holds the same global map, so only EP rank 0 logs.
+    def _snapshot_eplb_placement_if_due(self) -> dict[str, torch.Tensor] | None:
+        """CPU snapshots of the committed expert maps when this step may
+        commit a rearrangement; ``None`` keeps the common step sync-free."""
+        state = self.eplb.state
+        if state is None:
+            return None
+        # vLLM logs balancedness stats from EplbState.step with this flag;
+        # it also gates this runner's committed-placement log.
+        if not self.vllm_config.parallel_config.eplb_config.log_balancedness:
+            return None
+        # Every FFN EP rank holds the same global map; only rank 0 logs.
+        if get_ep_group().rank() != 0:
+            return None
+        boundary_due = (
+            state.expert_rearrangement_step + 1
+            >= state.expert_rearrangement_step_interval
+        )
+        async_pending = any(
+            model_state.rebalanced for model_state in state.model_states.values()
+        )
+        if not boundary_due and not async_pending:
+            return None
+        return {
+            key: model_state.physical_to_logical_map.cpu().clone()
+            for key, model_state in state.model_states.items()
+        }
+
+    def _log_eplb_placement_if_changed(
+        self,
+        placement_before: dict[str, torch.Tensor],
+    ) -> None:
+        state = self.eplb.state
+        assert state is not None
+        ep_size = self.vllm_config.parallel_config.data_parallel_size * (
+            self.vllm_config.parallel_config.tensor_parallel_size
+        )
+        for key, model_state in state.model_states.items():
+            current = model_state.physical_to_logical_map.cpu()
+            if torch.equal(placement_before[key], current):
+                continue
+            logger.info(
+                "AFD FFN EPLB chose experts for model %s (recorded load over "
+                "%d steps: %s):\n%s",
+                model_state.model_name,
+                model_state.expert_load_window.shape[0],
+                describe_eplb_rank_load(
+                    model_state.expert_load_window, ffn_size=ep_size
+                ),
+                "\n".join(describe_eplb_placement(current, ffn_size=ep_size)),
+            )
 
     def _eplb_prepare_forward(
         self,

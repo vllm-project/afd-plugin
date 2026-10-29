@@ -409,6 +409,15 @@ The FFN role can enable vLLM's expert-parallel load balancing
   (CUDA-graph compatible), and expert weights move over the EPLB
   communicator (auto-selected: nixl, falling back to torch_gloo).
 
+With `log_balancedness` in `--eplb-config`, vLLM logs its balancedness
+stats from `EplbState.step`, and the runner additionally logs the committed
+placement — which logical experts each FFN EP rank holds, per MoE layer, and
+the replicated ones — whenever a step commits a rearrangement (`eplb_step`
+snapshots the map only on steps where the counter boundary or a pending
+async transfer can commit, so ordinary steps stay sync-free). The same
+placement log runs on the DeepEP M2N path (see the routed-experts note
+below); the formatters live in `afd_plugin/distributed/eplb.py`.
+
 The unpadded token count is the step's total real Attention tokens
 (`real_attention_token_total` in `ffn_metadata.py`), excluding the
 placeholder rows idle Attention peers transfer. Every FFN rank's router

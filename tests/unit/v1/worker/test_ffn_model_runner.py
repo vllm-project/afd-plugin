@@ -240,6 +240,7 @@ class _FakeEplbController:
     """Records the EPLB calls the FFN runner makes per connector step."""
 
     def __init__(self):
+        self.state = None
         self.prepare_loads = 0
         self.registrations = []
         self.async_loop_starts = []
@@ -309,6 +310,7 @@ def _runner_with_connector_and_model(model, *, num_layers=1):
             data_parallel_size=1,
             enable_eplb=False,
             is_moe_model=True,
+            tensor_parallel_size=1,
             use_sequence_parallel_moe=False,
         ),
         compilation_config=SimpleNamespace(
@@ -818,6 +820,124 @@ def test_ffn_runner_capture_prepared_and_steps_eplb_as_dummy(monkeypatch):
     assert cuda_graph_size == 10
     assert runner.eplb.steps == [(True, False)]
     assert runner.eplb.prepared_forwards == [(runner.model_config, 2)]
+
+
+class _FakeEplbModelState:
+    """The EplbModelState fields the placement log reads."""
+
+    def __init__(self, placement: list[list[int]]):
+        self.physical_to_logical_map = torch.tensor(placement)
+        self.expert_load_window = torch.zeros(
+            (2, len(placement), len(placement[0])), dtype=torch.int32
+        )
+        self.model_name = "test-model"
+        self.rebalanced = False
+
+
+class _FakeEplbState:
+    """Steps the counter and commits a new placement at the boundary."""
+
+    def __init__(self, placements: list[list[list[int]]]):
+        self.model_states = {"model-hash": _FakeEplbModelState(placements[0])}
+        self.expert_rearrangement_step_interval = 2
+        self.expert_rearrangement_step = 0
+        self._placements = placements
+        self._rearrangements = 0
+
+    def step(self, is_dummy=False, is_profile=False):
+        self.expert_rearrangement_step += 1
+        if self.expert_rearrangement_step < self.expert_rearrangement_step_interval:
+            return
+        self.expert_rearrangement_step = 0
+        self._rearrangements += 1
+        self.model_states["model-hash"].physical_to_logical_map = torch.tensor(
+            self._placements[min(self._rearrangements, len(self._placements) - 1)]
+        )
+
+
+def _runner_for_placement_logging(state, *, log_placement: bool):
+    runner = _runner_with_connector_and_model(_FakeModel())
+    # The runner's EPLB seam needs only the state and its step; two FFN EP
+    # ranks split the four-slot placement.
+    runner.eplb = SimpleNamespace(state=state, step=state.step)
+    runner.vllm_config.parallel_config.data_parallel_size = 2
+    runner.vllm_config.parallel_config.eplb_config = SimpleNamespace(
+        log_balancedness=log_placement,
+    )
+    return runner
+
+
+def test_ffn_runner_logs_placement_when_a_rearrangement_commits(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """With log_balancedness the FFN logs the committed expert placement
+    when EplbState.step rearranges, and only then.
+
+    Why: vLLM's own log lists load stats, not which expert went where.
+    """
+    monkeypatch.setattr(
+        ffn_model_runner_module, "get_ep_group", lambda: SimpleNamespace(rank=lambda: 0)
+    )
+    state = _FakeEplbState(
+        [
+            [[0, 1, 2, 3], [0, 1, 2, 3]],
+            [[0, 2, 1, 3], [0, 2, 1, 3]],
+        ]
+    )
+    runner = _runner_for_placement_logging(state, log_placement=True)
+
+    with caplog.at_level(logging.INFO, logger=ffn_model_runner_module.logger.name):
+        runner.eplb_step()
+        # Not due yet: this step only advanced the counter.
+        assert caplog.messages == []
+        runner.eplb_step()
+
+    message = caplog.messages[0]
+    assert "AFD FFN EPLB chose experts for model test-model" in message
+    assert "rank 0=[0, 2] | rank 1=[1, 3]" in message
+    # A step without a further rearrangement stays silent.
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=ffn_model_runner_module.logger.name):
+        runner.eplb_step()
+    assert caplog.messages == []
+
+
+def test_ffn_runner_placement_logging_needs_balancedness_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """Without log_balancedness no placement is logged, even at a
+    rearrangement boundary."""
+    monkeypatch.setattr(
+        ffn_model_runner_module, "get_ep_group", lambda: SimpleNamespace(rank=lambda: 0)
+    )
+    state = _FakeEplbState([[[0, 1, 2, 3], [0, 1, 2, 3]]])
+    runner = _runner_for_placement_logging(state, log_placement=False)
+
+    with caplog.at_level(logging.INFO, logger=ffn_model_runner_module.logger.name):
+        runner.eplb_step()
+        runner.eplb_step()
+
+    assert caplog.messages == []
+
+
+def test_ffn_runner_placement_logging_only_on_ep_rank_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """Every FFN EP rank holds the same map; only EP rank 0 logs it."""
+    monkeypatch.setattr(
+        ffn_model_runner_module, "get_ep_group", lambda: SimpleNamespace(rank=lambda: 1)
+    )
+    state = _FakeEplbState([[[0, 1, 2, 3], [0, 1, 2, 3]]])
+    runner = _runner_for_placement_logging(state, log_placement=True)
+
+    with caplog.at_level(logging.INFO, logger=ffn_model_runner_module.logger.name):
+        runner.eplb_step()
+        runner.eplb_step()
+
+    assert caplog.messages == []
 
 
 def test_ffn_runner_releases_owned_runtime_state_on_shutdown(monkeypatch):
