@@ -343,26 +343,10 @@ stream, and wrapper implementation details are owned by
 [execution platforms](execution_platforms.md).
 
 CUDA V2 accepts exactly two native microbatches with Attention DP1 or DP > 1.
-The GPU [V4 compatibility patch](../../../afd_plugin/compat/patches/gpu_deepseek_v4_dbo.py)
-owns stage-input and Indexer-SM preparation; the shared Attention runner scopes
-it around native ubatch work.
-The runner retains the stable position and slot-mapping buffers until native
-graph/thread shutdown, so compressor inputs remain 64-byte aligned. The first
-stage borrows the native position buffer and also borrows native slots when
-their fixed row spacing is aligned (or there is one KV group). Other inputs use aligned runner
-buffers. Native metadata builders and model forward consume the same refreshed
-inputs, whose addresses remain stable across FULL graph replay. Aligned context
-slot mappings are prepared for eager execution and capture; live FULL replay
-uses the mappings captured in the graph. Other model families continue to use
-native stage inputs. This V4 input adapter is CUDA-only; Ascend retains native
-stage preparation and AFD metadata handling.
-
-For CUDA V4 with ubatching enabled, before the native memory profile the
-runner visits the FlashMLA attention layers and reserves each configured
-ubatch/lane workspace using the native no-metadata prefill path. The native
-workspace manager retains ownership and locking; the allocations stay resident
-during the native profile so KV-cache sizing accounts for them. Other models
-and non-ubatched runs retain the native profile.
+The CUDA-only [V4 compatibility patch](../../../afd_plugin/compat/patches/gpu_deepseek_v4_dbo.py)
+owns aligned, persistent stage inputs, Indexer SM planning and pre-profile
+FlashMLA workspace reservation. The runner retains input buffers until native
+shutdown; Ascend and other models keep native preparation and profiling.
 
 Ascend V2 supports exactly two native microbatches in eager execution:
 synchronous CAMP2P requires Attention DP > 1, while Async CAM also supports

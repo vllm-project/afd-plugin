@@ -17,6 +17,11 @@ from afd_plugin.connectors.metadata import (  # noqa: E402
     recv_control_payload,
 )
 
+UNREGISTERED_GROUP_MESSAGE = (
+    "Group p2p is not registered, please create group with "
+    "torch.distributed.new_group API"
+)
+
 
 @pytest.fixture
 def receive_control_payload(monkeypatch):
@@ -135,49 +140,34 @@ def test_control_payload_checks_close_after_payload_copy(
         receive(check_closed)
 
 
-@pytest.mark.parametrize("locally_closed", [False, True])
-def test_control_payload_unregister_race_preserves_original_cause(
-    monkeypatch, locally_closed
+@pytest.mark.parametrize(
+    "error,locally_closed,cancelled",
+    [
+        (ValueError(UNREGISTERED_GROUP_MESSAGE), False, False),
+        (ValueError(UNREGISTERED_GROUP_MESSAGE), True, True),
+        (ValueError("bad transport"), True, False),
+        (RuntimeError("NCCL"), True, False),
+    ],
+)
+def test_control_payload_only_translates_local_group_cancellation(
+    monkeypatch, error, locally_closed, cancelled
 ):
-    original = ValueError(
-        "Group p2p is not registered, please create group with "
-        "torch.distributed.new_group API"
-    )
-
-    def receive_unregistered(tensor, **kwargs):
-        raise original
+    def receive_failed(tensor, **kwargs):
+        raise error
 
     def check_closed():
         if locally_closed:
             raise AFDControlPlaneClosedError("local close")
 
-    monkeypatch.setattr(torch.distributed, "recv", receive_unregistered)
-    expected = AFDControlPlaneClosedError if locally_closed else ValueError
+    monkeypatch.setattr(torch.distributed, "recv", receive_failed)
+    expected = AFDControlPlaneClosedError if cancelled else type(error)
 
     with pytest.raises(expected) as caught:
         recv_control_payload(
             src=0, group=None, device=torch.device("cpu"), check_closed=check_closed
         )
 
-    if locally_closed:
-        assert caught.value.__cause__ is original
+    if cancelled:
+        assert caught.value.__cause__ is error
     else:
-        assert caught.value is original
-
-
-@pytest.mark.parametrize("error", [ValueError("bad transport"), RuntimeError("NCCL")])
-def test_control_payload_keeps_unknown_transport_errors_on_close(monkeypatch, error):
-    def receive_failed(tensor, **kwargs):
-        raise error
-
-    def check_closed():
-        raise AFDControlPlaneClosedError("local close")
-
-    monkeypatch.setattr(torch.distributed, "recv", receive_failed)
-
-    with pytest.raises(type(error)) as caught:
-        recv_control_payload(
-            src=0, group=None, device=torch.device("cpu"), check_closed=check_closed
-        )
-
-    assert caught.value is error
+        assert caught.value is error

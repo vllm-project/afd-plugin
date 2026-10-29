@@ -95,15 +95,10 @@ def test_ffn_worker_stops_receiver_before_native_resource_release(
 def test_ffn_worker_timeout_retains_resources_and_remains_a_failure(
     monkeypatch, loop_worker
 ):
-    class PendingThread:
-        def join(self, timeout):
-            pass
-
-        def is_alive(self):
-            return True
-
     worker = loop_worker(SimpleNamespace(close=lambda: None))
-    worker._ffn_thread = PendingThread()
+    worker._ffn_thread = SimpleNamespace(
+        join=lambda timeout: None, is_alive=lambda: True
+    )
 
     def native_shutdown(self):
         self.model_runner.model = None
@@ -146,17 +141,6 @@ def test_ffn_worker_only_consumes_explicit_receive_cancellation(
         assert caught.value is error
 
 
-def test_ffn_worker_preserves_loop_failure_across_stop_calls(loop_worker):
-    worker = loop_worker(SimpleNamespace(close=lambda: None))
-    original = RuntimeError("recorded FFN failure")
-    worker._ffn_loop_error = original
-
-    for _ in range(2):
-        with pytest.raises(RuntimeError, match="FFN worker loop failed") as caught:
-            worker.stop_ffn_server_loop()
-        assert caught.value.__cause__ is original
-
-
 def test_ffn_worker_releases_native_resources_while_reporting_loop_failure(
     monkeypatch, loop_worker
 ):
@@ -169,11 +153,11 @@ def test_ffn_worker_releases_native_resources_while_reporting_loop_failure(
 
     monkeypatch.setattr(gpu_worker_module.Worker, "shutdown", native_shutdown)
 
-    with pytest.raises(RuntimeError, match="FFN worker loop failed") as caught:
-        worker.shutdown()
-
-    assert caught.value.__cause__ is original
-    assert worker.model_runner.model is None
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="FFN worker loop failed") as caught:
+            worker.shutdown()
+        assert caught.value.__cause__ is original
+        assert worker.model_runner.model is None
 
 
 def test_native_weight_update_finishes_without_ffn_lora_state(monkeypatch):

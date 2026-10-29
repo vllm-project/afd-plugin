@@ -45,12 +45,18 @@ def lifecycle_connector():
     return module, connector
 
 
-def test_p2p_control_plane_close_is_local_and_idempotent(
+def test_p2p_close_cancels_receive_and_releases_owned_resources_idempotently(
     monkeypatch, lifecycle_connector
 ):
     module, connector = lifecycle_connector
     owned = SimpleNamespace(active=True)
     connector.p2p_pg = owned
+    communicators = [SimpleNamespace(active=True) for _ in range(2)]
+    for communicator in communicators:
+        communicator.destroy = lambda owner=communicator: setattr(
+            owner, "active", False
+        )
+    connector.a2e_pynccl, connector.e2a_pynccl = communicators
 
     def abort(group):
         if not group.active:
@@ -60,9 +66,12 @@ def test_p2p_control_plane_close_is_local_and_idempotent(
     monkeypatch.setattr(module, "_abort_process_group", abort)
 
     connector.control_plane.close()
-    connector.control_plane.close()
+    connector.close()
+    connector.close()
 
     assert not owned.active
+    assert all(not communicator.active for communicator in communicators)
+    assert not connector.is_initialized
     with pytest.raises(AFDControlPlaneClosedError):
         connector.control_plane.recv_dp_metadata_list()
 
@@ -72,23 +81,6 @@ def test_p2p_control_plane_receive_requires_initialized_group(lifecycle_connecto
 
     with pytest.raises(RuntimeError, match="process group is not initialized"):
         connector.control_plane.recv_dp_metadata_list()
-
-
-def test_p2p_connector_close_destroys_owned_communicators(lifecycle_connector):
-    _, connector = lifecycle_connector
-    attention_comm = SimpleNamespace(active=True)
-    ffn_comm = SimpleNamespace(active=True)
-    attention_comm.destroy = lambda: setattr(attention_comm, "active", False)
-    ffn_comm.destroy = lambda: setattr(ffn_comm, "active", False)
-    connector.a2e_pynccl = attention_comm
-    connector.e2a_pynccl = ffn_comm
-
-    connector.close()
-    connector.close()
-
-    assert not attention_comm.active
-    assert not ffn_comm.active
-    assert not connector.is_initialized
 
 
 def _fake_vllm_config(

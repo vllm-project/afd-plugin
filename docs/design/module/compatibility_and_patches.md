@@ -140,25 +140,12 @@ not the package dependency policy.
 ## Temporary CUDA DeepSeek-V4 DBO fixes
 
 [`gpu_deepseek_v4_dbo.py`](../../../afd_plugin/compat/patches/gpu_deepseek_v4_dbo.py)
-collects the temporary workarounds for vLLM 0.32.0 (`5df63a7`). The Attention
-runner scopes input/indexer preparation and calls pre-profile reservation at the
-existing CUDA-only entry points. The V4 decoder calls the padding-aware
-attention adapter and retains ownership of mHC, Hash IDs and the remote FFN
-protocol. Native per-instance bindings are restored on scope exit.
-
-| Workaround | Upstream tracking | Removal condition |
-| --- | --- | --- |
-| Aligned, persistent microbatch positions and slots | No published corresponding PR | Native compressor metadata accepts naturally aligned views and the input/replay regressions pass. |
-| Zero-real-token Attention stage | [#63823](https://github.com/vllm-project/vllm/pull/63823) is related FULL-graph layout work | Native attention supports padding-only stages in eager and the supported graph paths; the A/F protocol regressions pass. #63823 alone is insufficient. |
-| Indexer planner/compute SM budget agreement | [#60732](https://github.com/vllm-project/vllm/pull/60732) | The pinned runtime replans for the actual DBO compute budget and the preparation/restoration regressions pass. |
-| FlashMLA workspace accounted across microbatches/lanes | [#61584](https://github.com/vllm-project/vllm/pull/61584) provides the all-slot reservation API | V4 uses that API for its own FlashMLA scratch before profiling, and the per-owner capacity regressions pass. The API alone is insufficient. |
-
-A merged upstream PR does not retire a workaround: the upgraded pinned runtime
-must contain the complete fix and pass its affected regression. Focused CPU
-contracts live in
-[`test_gpu_deepseek_v4_dbo.py`](../../../tests/unit/compat/patches/test_gpu_deepseek_v4_dbo.py),
-[`test_model_runner_v2.py`](../../../tests/unit/v1/worker/test_model_runner_v2.py)
-and [`test_deepseek_v4_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_proxy.py).
+records the pinned source, four workarounds, upstream PRs and removal conditions.
+The CUDA runner scopes input/indexer preparation and reserves workspace before
+profiling; the V4 decoder calls the padding guard. Instance bindings are restored
+on exit. Regressions live in
+[`test_gpu_deepseek_v4_dbo.py`](../../../tests/unit/compat/patches/test_gpu_deepseek_v4_dbo.py)
+and [`test_model_runner_v2.py`](../../../tests/unit/v1/worker/test_model_runner_v2.py).
 
 ## Non-patch compatibility adapters
 
