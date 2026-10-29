@@ -22,6 +22,7 @@ from vllm.forward_context import (  # noqa: E402
 from vllm.v1.worker import gpu_model_runner as native_v1  # noqa: E402
 from vllm.v1.worker.gpu import cudagraph_utils, dp_utils  # noqa: E402
 from vllm.v1.worker.gpu import model_runner as native_v2  # noqa: E402
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers  # noqa: E402
 from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector  # noqa: E402
 from vllm.v1.worker.gpu.ubatch_utils import UBatchState  # noqa: E402
 from vllm.v1.worker.ubatch_utils import UBatchSlice  # noqa: E402
@@ -47,7 +48,14 @@ from afd_plugin.validation import (  # noqa: E402
     validate_gpu_model_runner_v2_config,
     validate_npu_model_runner_v2_config,
 )
+from tests.unit.fakes.deepseek_v4 import WorkspaceCase  # noqa: E402
 from tests.unit.fakes.profiler import StepProfiler as _StepProfiler  # noqa: E402
+from tests.unit.fakes.ubatching import (  # noqa: E402
+    TEST_COMPUTE_SMS,
+    TEST_PHYSICAL_SMS,
+    AttentionMetadataState,
+    PreparedUBatchRunner,
+)
 
 TEST_MODEL_MAX_LEN = 163840
 TEST_HIDDEN_SIZE = 2048
@@ -2170,3 +2178,194 @@ def test_non_afd_model_config_and_native_runner_identity_are_unchanged(
 
     assert get_afd_model_config(model_config, device_type="cuda") is model_config
     assert type(_construct_like_native_worker(worker)) is _NativeRunnerSentinel
+
+
+@pytest.fixture
+def stage_input_runner(monkeypatch):
+    from afd_plugin.compat.patches import gpu_deepseek_v4_dbo as patches
+
+    def build(capacity=35, groups=2, device="cuda"):
+        runner = _runner_for_metadata([])
+        runner.vllm_config.model_config.hf_config.model_type = "deepseek_v4"
+        runner.device = SimpleNamespace(type=device)
+        if device == "cuda":
+            runner._afd_v4_ubatch_inputs = None
+        runner.input_buffers = InputBuffers(8, capacity, torch.device("cpu"))
+        runner.block_tables = SimpleNamespace(
+            slot_mappings=torch.empty((groups, capacity), dtype=torch.int64)
+        )
+        runner.kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(layer_names=[f"kv{i}"]) for i in range(groups)
+            ]
+        )
+        runner.model_state = AttentionMetadataState()
+        runner.ubatch_runner = PreparedUBatchRunner(
+            runner.model_state, runner.kv_cache_config
+        )
+        monkeypatch.setattr(
+            patches, "dbo_current_ubatch_id", lambda: runner.ubatch_runner.stage
+        )
+        return runner
+
+    return build
+
+
+def _stage_test_inputs(runner, offset):
+    batch = InputBatch.make_dummy(2, 28, runner.input_buffers)
+    batch.positions.copy_(torch.arange(28) + offset)
+    slots = runner.block_tables.slot_mappings[:, :28]
+    slots.copy_(torch.arange(slots.numel()).reshape(slots.shape) + offset)
+    return batch, slots
+
+
+@pytest.mark.parametrize(
+    "mode,capacity,groups",
+    [
+        (CUDAGraphMode.NONE, 35, 2),
+        (CUDAGraphMode.FULL, 35, 2),
+        (CUDAGraphMode.FULL, 40, 2),
+        (CUDAGraphMode.FULL, 35, 1),
+    ],
+)
+def test_v4_stage_inputs_stay_aligned_and_refresh_for_eager_or_replay(
+    stage_input_runner, mode, capacity, groups
+):  # long-test: observe two requests through metadata and model-input boundaries.
+    runner = stage_input_runner(capacity, groups)
+    saved = []
+    for offset in (0, 100):
+        batch, slots = _stage_test_inputs(runner, offset)
+        with v2_runner_module._use_afd_ubatch_preparation(runner):
+            prepared = runner.ubatch_runner.prepare(
+                batch,
+                (),
+                slots,
+                mode,
+                for_capture=offset == 0 and mode == CUDAGraphMode.FULL,
+            )
+            for stage, context in enumerate(prepared.forward_contexts):
+                runner.ubatch_runner.stage = stage
+                positions = runner.ubatch_runner.begin_capturable_run(
+                    lambda **kwargs: kwargs["positions"],
+                    {"positions": batch.positions},
+                    prepared,
+                )()
+                token_slice = prepared.slices[stage].token_slice
+                assert torch.equal(positions, batch.positions[token_slice])
+                assert positions.data_ptr() % 64 == 0
+                tensors = [positions]
+                for group in range(groups):
+                    metadata = context.attn_metadata[f"kv{group}"]
+                    assert metadata.positions.data_ptr() == positions.data_ptr()
+                    assert torch.equal(metadata.slot_mapping, slots[group, token_slice])
+                    assert metadata.slot_mapping.data_ptr() % 64 == 0
+                    assert metadata.decode.schedule_metadata.shape == (
+                        TEST_COMPUTE_SMS + 1,
+                    )
+                    if mode == CUDAGraphMode.NONE or offset == 0:
+                        assert (
+                            context.slot_mapping[f"kv{group}"].data_ptr()
+                            == metadata.slot_mapping.data_ptr()
+                        )
+                    tensors.append(metadata.slot_mapping)
+                if offset == 0:
+                    saved.append(tensors)
+                else:
+                    for before, after in zip(saved[stage], tensors, strict=True):
+                        assert before.data_ptr() == after.data_ptr()
+                        assert torch.equal(before, after)
+
+
+@pytest.mark.parametrize("failure", ["prepare", "model"])
+def test_v4_ubatch_failure_restores_native_inputs_and_sm_budget(
+    stage_input_runner, failure
+):
+    runner = stage_input_runner()
+    batch, slots = _stage_test_inputs(runner, 0)
+    if failure == "prepare":
+        runner.model_state.prepare_error = ValueError("step failed")
+
+    def fail(**kwargs):
+        raise ValueError("step failed")
+
+    with (
+        pytest.raises(ValueError, match="step failed"),
+        v2_runner_module._use_afd_ubatch_preparation(runner),
+    ):
+        prepared = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+        runner.ubatch_runner.begin_capturable_run(
+            fail, {"positions": batch.positions}, prepared
+        )()
+    runner.model_state.prepare_error = None
+    prepared = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    for stage, context in enumerate(prepared.forward_contexts):
+        metadata = context.attn_metadata["kv0"]
+        assert metadata.decode.schedule_metadata.shape == (TEST_PHYSICAL_SMS + 1,)
+        assert (
+            metadata.positions.data_ptr()
+            == batch.positions[prepared.slices[stage].token_slice].data_ptr()
+        )
+        assert "afd_metadata" not in context.additional_kwargs
+    positions = runner.ubatch_runner.begin_capturable_run(
+        lambda **kwargs: kwargs["positions"], {"positions": batch.positions}, prepared
+    )()
+    assert (
+        positions.data_ptr()
+        == batch.positions[
+            prepared.slices[runner.ubatch_runner.stage].token_slice
+        ].data_ptr()
+    )
+
+
+def test_npu_v4_keeps_native_preparation_and_stage_inputs(stage_input_runner):
+    runner = stage_input_runner(device="npu")
+    batch, slots = _stage_test_inputs(runner, 0)
+    with v2_runner_module._use_afd_ubatch_preparation(runner):
+        prepared = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    for stage, context in enumerate(prepared.forward_contexts):
+        assert context.additional_kwargs["platform_stage"] == stage
+        assert context.additional_kwargs["afd_metadata"].tokens_lens == [14]
+        assert (
+            context.attn_metadata["kv0"].positions.data_ptr()
+            == batch.positions[prepared.slices[stage].token_slice].data_ptr()
+        )
+    native = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    assert [context.additional_kwargs for context in native.forward_contexts] == [
+        {"platform_stage": 0},
+        {"platform_stage": 1},
+    ]
+
+
+@pytest.mark.parametrize(
+    "device,model_type,use_ubatching",
+    [
+        ("cuda", "deepseek_v4", True),
+        ("cpu", "deepseek_v4", True),
+        ("cuda", "deepseek_v2", True),
+        ("cuda", "deepseek_v4", False),
+    ],
+)
+def test_profile_reserves_workspace_only_for_cuda_v4_ubatching(
+    monkeypatch, device, model_type, use_ubatching
+):
+    case = WorkspaceCase(monkeypatch)
+    case.config.model_config.hf_config.model_type = model_type
+    case.config.parallel_config.use_ubatching = use_ubatching
+    runner = object.__new__(AFDAttentionModelRunnerV2)
+    runner.vllm_config = case.config
+    runner.parallel_config = case.config.parallel_config
+    runner.device = torch.device(device)
+    runner.model = case.model
+    # The native profile locks capacity. Later owners must already be reserved.
+    monkeypatch.setattr(
+        native_v2.GPUModelRunner,
+        "profile_run",
+        lambda *args, **kwargs: case.manager.lock(),
+    )
+    runner.profile_run()
+    if device == "cuda" and model_type == "deepseek_v4" and use_ubatching:
+        views = [case.request(ubatch, lane) for ubatch in range(2) for lane in range(2)]
+        assert len({view.data_ptr() for view in views}) == 4
+    else:
+        with pytest.raises(AssertionError, match="Workspace growth is not allowed"):
+            case.request(1, 1)

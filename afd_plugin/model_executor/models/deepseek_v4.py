@@ -17,6 +17,7 @@ from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.nvidia import model as native
 
+from afd_plugin.compat.patches.gpu_deepseek_v4_dbo import forward_v4_attention
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
@@ -263,6 +264,12 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
     # transfers only the two-dimensional FFN activation and input IDs. The
     # v0.32.0 native sequence-parallel gather/scatter branches around the
     # attention call are omitted because AFD pins use_sequence_parallel off.
+    # Padding-only AFD ubatches use zero attention output while retaining all
+    # mHC and remote FFN work. Native FlashMLA's zero-token decode metadata has
+    # no scheduler tile, so entering its forward consumer would assert.
+    # Removal plan: drop this branch when native V4 attention supports zero
+    # actual tokens in a nonempty padded ubatch. Capture retains full attention
+    # because native dummy inputs publish a positive real extent for each stage.
     # Signature: matches upstream; no added parameters.
     # Upstream: vLLM v0.32.0, vllm/models/deepseek_v4/nvidia/model.py
     # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
@@ -334,7 +341,9 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 norm_eps=attn_norm_eps,
             )
 
-        x = self.attn(positions, x, None)
+        # ### PATCH START: preserve padded-stage protocol with zero attention.
+        x = forward_v4_attention(self.attn, positions, x)
+        # ### PATCH END: preserve padded-stage protocol with zero attention.
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
         residual, post_mix, res_mix, x = native.mhc_fused_post_pre_tilelang(

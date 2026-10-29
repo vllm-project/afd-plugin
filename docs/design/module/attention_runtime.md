@@ -343,6 +343,11 @@ stream, and wrapper implementation details are owned by
 [execution platforms](execution_platforms.md).
 
 CUDA V2 accepts exactly two native microbatches with Attention DP1 or DP > 1.
+The CUDA-only [V4 compatibility patch](../../../afd_plugin/compat/patches/gpu_deepseek_v4_dbo.py)
+owns aligned, persistent stage inputs, Indexer SM planning and pre-profile
+FlashMLA workspace reservation. The runner retains input buffers until native
+shutdown; Ascend and other models keep native preparation and profiling.
+
 Ascend V2 supports exactly two native microbatches in eager execution:
 synchronous CAMP2P requires Attention DP > 1, while Async CAM also supports
 Attention DP1. Ascend V2 DBO graph capture and replay remain unsupported.

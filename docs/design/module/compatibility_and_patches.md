@@ -137,6 +137,16 @@ not the package dependency policy.
 | [`npu/mla_graph.py`](../../../afd_plugin/compat/patches/npu/mla_graph.py): `vllm_ascend.attention.mla_v1.get_graph_params` | Resolves an AFD ubatch-owned `GraphParams` registry from the active forward context and otherwise delegates to the saved upstream process-global resolver. | Called through `apply_afd_ascend_patches_if_needed` during NPU worker startup; no version guard. Saves the original on the upstream module and uses a module sentinel. | [`test_runtime.py`](../../../tests/unit/compat/test_runtime.py) covers AFD-context resolution, upstream fallback, and idempotence; [`test_npu_mla_graph.py`](../../../tests/unit/v1/worker/test_npu_mla_graph.py) covers the owning graph lifecycle. | Remove when vLLM-Ascend accepts a forward-context-local MLA graph registry or exposes an equivalent resolver hook. |
 | [`npu/mrv2_ubatching.py`](../../../afd_plugin/compat/patches/npu/mrv2_ubatching.py): native ubatch factory, dispatch, child DP metadata, input slicing, context and stream aliases | Builds `NPUUBatchRunner`, enables Async CAM DBO at DP1, omits Async child DP coordination, applies native truncation to Ascend CPU sequence lengths, preserves model-specific PP slices/nested auxiliary outputs, and provides NPU stream/failure handling during eager and capture. Native MRV2 owns execution and graph lifecycle. | Scoped to AFD initialization, preparation or execution; every replaced alias is restored in `finally`. The scope temporarily changes module symbols, so it is not an independent concurrent-runner API. | [`test_npu_model_runner_v2.py`](../../../tests/unit/v1/worker/test_npu_model_runner_v2.py), [`test_async_cam_dbo.py`](../../../tests/unit/model_executor/test_async_cam_dbo.py), [`test_mrv2_dbo.py`](../../../tests/npu/test_mrv2_dbo.py). | Remove when native vLLM/Ascend supports NPU child builders and streams, optional child DP metadata, DP1 DBO and peer cancellation. |
 
+## Temporary CUDA DeepSeek-V4 DBO fixes
+
+[`gpu_deepseek_v4_dbo.py`](../../../afd_plugin/compat/patches/gpu_deepseek_v4_dbo.py)
+records the pinned source, four workarounds, upstream PRs and removal conditions.
+The CUDA runner scopes input/indexer preparation and reserves workspace before
+profiling; the V4 decoder calls the padding guard. Instance bindings are restored
+on exit. Regressions live in
+[`test_gpu_deepseek_v4_dbo.py`](../../../tests/unit/compat/patches/test_gpu_deepseek_v4_dbo.py)
+and [`test_model_runner_v2.py`](../../../tests/unit/v1/worker/test_model_runner_v2.py).
+
 ## Non-patch compatibility adapters
 
 These modules adapt upstream behavior without replacing a global symbol:
