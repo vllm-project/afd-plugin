@@ -1508,40 +1508,59 @@ def test_async_cam_dbo_configuration_preserves_thresholds(native_flag, dp_size):
 
 
 @pytest.mark.parametrize("dp_size", [1, 2])
-def test_native_dbo_initializes_two_workspace_lanes_before_runner(monkeypatch, dp_size):
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_worker_registers_fla_before_model(  # long-test: isolate native worker setup
+    monkeypatch, dp_size, role
+):
     _require_npu_runtime()
     from vllm.config import ParallelConfig
 
-    from afd_plugin.v1.worker.npu import attention_worker
+    from afd_plugin.v1.worker.npu import attention_worker, ffn_worker
+
+    worker_module = attention_worker if role == "attention" else ffn_worker
+    worker_class = (
+        attention_worker.AFDNPUAttentionWorker
+        if role == "attention"
+        else ffn_worker.AFDNPUFFNWorker
+    )
 
     parallel = object.__new__(ParallelConfig)
     parallel.enable_dbo = True
     parallel.ubatch_size = 1
     parallel.data_parallel_size = dp_size
     config = _vllm_config(
+        role=role,
         connector="CAMAsyncAFDConnector",
         async_dp=True,
     )
     config.parallel_config = parallel
-    worker = SimpleNamespace(vllm_config=config, _init_device=lambda: "device")
-    events = []
+    events: list[tuple[str, str | int]] = []
+
+    def select_device():
+        events.append(("device", "device"))
+        return "device"
+
+    worker = SimpleNamespace(vllm_config=config, _init_device=select_device)
     monkeypatch.setattr(
-        attention_worker, "assert_compatible_afd_stack", lambda *a, **k: None
+        worker_module, "assert_compatible_afd_stack", lambda *a, **k: None
     )
     monkeypatch.setattr(
-        attention_worker,
+        worker_module,
         "fail_if_unsupported_npu_afd_features",
         lambda cfg: events.append(("validate", cfg.parallel_config.enable_dbo)),
     )
+    monkeypatch.setattr(worker_module, "fix_all2all_backend_for_afd", lambda *a: None)
     monkeypatch.setattr(
-        attention_worker, "fix_all2all_backend_for_afd", lambda *a: None
+        worker_module, "validate_npu_model_runner_v2_config", lambda *a, **k: None
+    )
+    monkeypatch.setattr(worker_module, "get_afd_model_config", lambda cfg, **kw: cfg)
+    monkeypatch.setattr(
+        worker_module,
+        "register_ascend_fla_customop",
+        lambda: events.append(("fla", worker.device)),
     )
     monkeypatch.setattr(
-        attention_worker, "validate_npu_model_runner_v2_config", lambda *a, **k: None
-    )
-    monkeypatch.setattr(attention_worker, "get_afd_model_config", lambda cfg, **kw: cfg)
-    monkeypatch.setattr(
-        attention_worker,
+        worker_module,
         "init_workspace_manager",
         lambda device, lanes: events.append(("workspace", lanes)),
     )
@@ -1551,6 +1570,17 @@ def test_native_dbo_initializes_two_workspace_lanes_before_runner(monkeypatch, d
         events.append(("runner", cfg.parallel_config.num_ubatches))
         return object()
 
-    monkeypatch.setattr(attention_worker, "AFDNPUAttentionModelRunnerV2", runner)
-    attention_worker.AFDNPUAttentionWorker.init_device(worker)
-    assert events == [("validate", True), ("workspace", 2), ("runner", 2)]
+    runner_name = (
+        "AFDNPUAttentionModelRunnerV2"
+        if role == "attention"
+        else "create_npu_ffn_model_runner"
+    )
+    monkeypatch.setattr(worker_module, runner_name, runner)
+    worker_class.init_device(worker)
+    assert events == [
+        ("validate", True),
+        ("device", "device"),
+        ("fla", "device"),
+        ("workspace", 2),
+        ("runner", 2),
+    ]
