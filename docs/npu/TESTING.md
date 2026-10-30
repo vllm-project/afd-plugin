@@ -4,7 +4,7 @@ Configuration and source-contract tests can run on CPU; runtime contracts
 depend on vLLM/vLLM-Ascend, and device tests also need the matching Ascend
 runtime and hardware. Use vLLM 0.32.0 and the vLLM-Ascend source revision in
 the [installation guide](../../README.md#ascend-npu-installation).
-The [0.32 validation record](VLLM_032_VALIDATION.md) distinguishes measured
+The [0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507) distinguishes measured
 coverage from deferred qualification and records the graceful-exit failures.
 
 From the repository root, run:

@@ -168,7 +168,7 @@ The synchronous DSV4 E2E profiles check concurrent serving but disable answer
 checking; the A5 profile records incorrect concurrent answers. Async DSV4 has
 an exact-answer smoke case; V4 true native DBO still requires model accuracy
 qualification. Lite two-stage DBO has the limited result recorded in the
-[0.32 validation record](../../npu/VLLM_032_VALIDATION.md). See
+[0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507). See
 [E2E testing](e2e_testing.md) and the [layered guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-layered-gmm-experimental-disabled-by-default).
 
 ### Qwen3 MoE CUDA boundary

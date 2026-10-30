@@ -74,7 +74,7 @@ Known gaps:
 - The GPU target is exactly vLLM `0.32.0`; other vLLM versions are not
   claimed as supported on GPU.
 - NPU hardware evidence covers the specific single-Pod DeepSeek-V2-Lite and
-  DSV4 configurations in the [0.32 validation record](docs/npu/VLLM_032_VALIDATION.md).
+  DSV4 configurations in the [0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507).
   Other models and topologies remain unverified. AFD post-request shutdown
   failures remain open; successful inference does not imply graceful shutdown.
 - Synchronous DSV4 E2E profiles are smoke cases; A5 concurrent answers remain
@@ -142,7 +142,7 @@ uv sync --group dev --extra vllm --extra afdep
 ### Ascend NPU installation
 
 The Ascend integration uses the source pair below. See the
-[0.32 NPU validation record](docs/npu/VLLM_032_VALIDATION.md) for the tested
+[0.32 NPU validation record](https://github.com/vllm-project/afd-plugin/pull/507) for the tested
 scope and retained shutdown limitations. Earlier
 [0.30 results](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923)
 retain their historical environment and sample counts.
@@ -203,7 +203,7 @@ PY
 
 After `AFD_OPS_OK`, the environment is ready to run the NPU examples and E2E
 tests. See the
-[NPU validation and test entry points](docs/npu/VLLM_032_VALIDATION.md).
+[NPU testing guide](docs/npu/TESTING.md).
 For implementation details, see the
 [Attention runtime design](docs/design/module/attention_runtime.md) and
 [FFN runtime design](docs/design/module/ffn_runtime.md).

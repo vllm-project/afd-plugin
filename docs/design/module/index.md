@@ -18,7 +18,7 @@ validation_paths:
   - "tests/e2e/**"
 upstream_refs:
   - "GPU and NPU target vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
-  - "vLLM-Ascend target bd42eea01d8312c4df469fabaed45f77a12df4d3; see docs/npu/VLLM_032_VALIDATION.md"
+  - "vLLM-Ascend target bd42eea01d8312c4df469fabaed45f77a12df4d3"
 verified_platform_refs:
   - "CUDA: tests/e2e marked e2e with AFD_E2E_BACKEND=gpu; no canonical image is recorded"
   - "Ascend: current target in root installation instructions; V2-Lite and DSV4 Flash W4A8 evidence in the execution-platform matrix; older environments remain historical"
@@ -38,7 +38,7 @@ testing contracts; open interfaces remain explicitly draft.
 The 2026-10-13 source review used AFD `36dadb4`, vLLM `0.30.0`
 (`ced6857a`), and Ascend `8d4409d6`; it is historical, not qualification of
 the current pair. For the 0.32 upgrade, see the
-[NPU validation record](../../npu/VLLM_032_VALIDATION.md). Existing document
+[NPU validation record](https://github.com/vllm-project/afd-plugin/pull/507). Existing document
 statuses and historical measurements retain their scope. Each module records
 its remaining limitations and validation gaps.
 

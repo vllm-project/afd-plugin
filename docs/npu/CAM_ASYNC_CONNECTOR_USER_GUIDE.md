@@ -14,7 +14,7 @@ Current runtime constraints and validation evidence are summarized in the
 > CAM async is experimental. DeepSeek-V2-Lite native two-stage execution has
 > a 100-question target-device accuracy result, with a graceful-exit failure.
 > V4 true DBO boundary qualification and performance remain unverified. See
-> the [0.32 validation record](VLLM_032_VALIDATION.md) for the precise scope.
+> the [0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507) for the precise scope.
 
 ## When to use this connector
 

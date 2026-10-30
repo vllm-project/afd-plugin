@@ -20,7 +20,7 @@ Attention may enable native DBO under the
 existing two-microbatch constraints. Enable native DBO only on Attention; FFN
 consumes CAM work items without joining Attention's DBO thread schedule.
 The experimental two-stream option below uses the same Attention DBO contract.
-The [0.32 validation record](VLLM_032_VALIDATION.md) identifies the tested
+The [0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507) identifies the tested
 W4A8 eager/FULL fixture and its limits, including graceful-exit failures.
 
 On F, set `AFD_ASYNC_CAM_LAYERED_GMM=1`, omit `--enforce-eager`, and pass

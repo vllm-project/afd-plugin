@@ -407,7 +407,7 @@ connector and supports the two-microbatch path above. Ascend V2 supports eager
 native DBO with exactly two microbatches: synchronous CAMP2P requires Attention
 DP > 1 and supports graph DBO; Async CAM supports eager Attention at DP1 or
 DP > 1. Hardware evidence remains limited to the recorded model and
-configuration cells; see the [0.32 record](../../npu/VLLM_032_VALIDATION.md).
+configuration cells; see the [0.32 record](https://github.com/vllm-project/afd-plugin/pull/507).
 Platform/connector limits are intentionally centralized in
 [execution platforms](execution_platforms.md#tested-runtime-matrix).
 

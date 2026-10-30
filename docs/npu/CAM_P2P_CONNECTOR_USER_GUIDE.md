@@ -14,7 +14,7 @@ Ascend services. Use `P2pNcclAFDConnector` for CUDA deployments and
 `CAMP2pAFDConnector` supports prefill and decode in eager mode. The V2 path
 also accepts graph execution and native DBO with exactly two microbatches
 and Attention DP > 1. Plain MLA graph+DBO requires `FULL_DECODE_ONLY`.
-See the [0.32 validation record](VLLM_032_VALIDATION.md) for tested models,
+See the [0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507) for tested models,
 topologies and the known graceful-exit failures.
 
 ## Prerequisites
