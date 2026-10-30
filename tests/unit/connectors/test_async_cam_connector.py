@@ -605,6 +605,33 @@ def test_pull_combine_failure_retains_window_until_completion(monkeypatch, phase
     assert not connector.is_initialized
 
 
+def test_pull_model_step_reports_error_after_queued_combine(monkeypatch):
+    fake_torch = _FakeTorch()
+    fake_torch.int64 = torch.int64
+    monkeypatch.setattr(async_cam_module, "torch", fake_torch)
+    connector = CAMAsyncAFDConnector(
+        0, 0, _vllm_config(), _afd_config(role="attention"), 0
+    )
+    connector._initialized = True
+    connector.extra_info = replace(connector.extra_info, ffn_mega_moe=True)
+    state = torch.zeros(25, dtype=torch.int64)
+    connector.comm_args = state.view(torch.float16)
+    hidden = _FakeTensor((3, 16))
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=2, stage_idx=0, seq_len=3
+        )
+    )
+    with pytest.raises(RuntimeError, match="status -5"):
+        with connector.defer_pull_status():
+            connector.send_attn_output(hidden, context, **_topk_payload(3))
+            state[async_cam_module.PULL_FAILURE_INDEX] = -5
+            output = connector.recv_ffn_output(hidden, context=context)
+            assert output.shape == hidden.shape
+    with pytest.raises(RuntimeError, match="status -5"):
+        connector.check_pull_status()
+
+
 def test_close_releases_every_stage_routing(monkeypatch):
     fake_torch = _FakeTorch()
     monkeypatch.setattr(async_cam_module, "torch", fake_torch)

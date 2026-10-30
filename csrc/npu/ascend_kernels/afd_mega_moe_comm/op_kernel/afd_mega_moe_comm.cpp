@@ -3,7 +3,6 @@
 #include "kernel_operator.h"
 #include "afd_mega_moe_comm_tiling.h"
 #include "afd_pull_protocol.h"
-#include "afd_async_combine_recv.h"
 
 namespace AfdMegaComm {
 using namespace AscendC;
@@ -20,7 +19,8 @@ __aicore__ inline void Publish(GM_ADDR x, GM_ADDR ids, GM_ADDR state,
     const uint32_t end = begin + rows / cores + (id < rows % cores ? 1 : 0);
     const auto local = Cam::Pull::Window(c[7], c[7]);
     TBuf<TPosition::VECCALC> statsBuf, offsetsBuf, idsBuf, mathBuf;
-    pipe.InitBuffer(statsBuf, Cam::Pull::Align(4ULL * columns * cores));
+    pipe.InitBuffer(statsBuf, Cam::Pull::PublisherStatsBytes(
+        {uint64_t(c[1] / c[8]), h, k, uint64_t(c[4]), uint64_t(c[5]), uint64_t(c[6]), uint64_t(c[8])}, cores));
     pipe.InitBuffer(offsetsBuf, 2 * Cam::Pull::Align(4ULL * experts));
     pipe.InitBuffer(idsBuf, Cam::Pull::Align(4ULL * k));
     pipe.InitBuffer(mathBuf, 11ULL * h + 128);
@@ -41,7 +41,7 @@ __aicore__ inline void Publish(GM_ADDR x, GM_ADDR ids, GM_ADDR state,
     globalIds.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(ids));
     globalX.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(x));
     payload.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(local + layout.payload));
-    Duplicate(stats, uint32_t(0), columns * cores);
+    Duplicate(stats, uint32_t(0), columns);
     Fence<HardEvent::V_S>();
     int64_t error = 0;
     for (uint32_t token = begin; token < end; ++token) {
@@ -60,32 +60,48 @@ __aicore__ inline void Publish(GM_ADDR x, GM_ADDR ids, GM_ADDR state,
     DataCopyPad(globalStats[id * columns], stats, {1U, 4U * columns, 0U, 0U, 0U});
     Fence<HardEvent::MTE3_S>();
     SyncAll<true>();
-    if (id == 0) {
-        DataCopyPad(stats, globalStats, {1U, 4U * columns * cores, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+    // Each lane owns adjacent expert columns; UB rows are padded independently of GM rows.
+    const uint32_t firstExpert = id * (experts / cores) + (id < experts % cores ? id : experts % cores);
+    const uint32_t expertCount = experts / cores + (id < experts % cores);
+    if (expertCount) {
+        const uint32_t stride = Cam::Pull::Align32(4U * expertCount) / 4;
+        DataCopyPad(stats, globalStats[c[4] + firstExpert],
+            {uint16_t(cores), 4U * expertCount, 4U * (columns - expertCount), 0U, 0U},
+            {false, 0U, 0U, 0U});
         Fence<HardEvent::MTE2_S>();
         for (uint32_t lane = 1; lane < cores; ++lane)
-            for (uint32_t e = 0; e < experts; ++e) {
-                const auto pos = lane * columns + c[4] + e;
-                stats.SetValue(pos, stats.GetValue(pos) + stats.GetValue(pos - columns));
+            for (uint32_t e = 0; e < expertCount; ++e) {
+                const auto pos = lane * stride + e;
+                stats.SetValue(pos, stats.GetValue(pos) + stats.GetValue(pos - stride));
             }
         Fence<HardEvent::S_MTE3>();
-        DataCopyPad(globalStats, stats, {1U, 4U * columns * cores, 0U, 0U, 0U});
+        DataCopyPad(globalStats[c[4] + firstExpert], stats,
+            {uint16_t(cores), 4U * expertCount, 0U, 4U * (columns - expertCount), 0U});
         Fence<HardEvent::MTE3_S>();
+    }
+    if (id == 0) {
+        GlobalTensor<int64_t> errors;
+        errors.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(state) + lanes);
+        DataCopy(stats.ReinterpretCast<int64_t>(), errors, cores * Cam::Pull::WORDS_PER_LINE);
+        Fence<HardEvent::MTE2_S>();
         for (uint32_t lane = 0; lane < cores; ++lane) {
-            const auto failure = control.Read(state + (lanes + lane * Cam::Pull::WORDS_PER_LINE) * 8);
+            const auto failure = stats.ReinterpretCast<int64_t>().GetValue(lane * Cam::Pull::WORDS_PER_LINE);
             if (!error && failure) error = failure;
         }
         if (error) control.WriteState(Cam::Pull::FAILURE, error);
     }
     SyncAll<true>();
     error = control.ReadState(Cam::Pull::FAILURE);
-    DataCopyPad(stats, globalStats, {1U, 4U * columns * cores, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+    DataCopyPad(stats, globalStats[(cores - 1) * columns + c[4]],
+        {1U, 4U * experts, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+    if (id) DataCopyPad(starts, globalStats[(id - 1) * columns + c[4]],
+        {1U, 4U * experts, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
     Fence<HardEvent::MTE2_S>();
     uint32_t prefix = 0;
     for (uint32_t e = 0; e < experts; ++e) {
         prefixes.SetValue(e, prefix);
-        starts.SetValue(e, id ? stats.GetValue((id - 1) * columns + c[4] + e) : 0);
-        prefix += stats.GetValue((cores - 1) * columns + c[4] + e);
+        if (!id) starts.SetValue(e, 0);
+        prefix += stats.GetValue(e);
     }
     for (uint32_t token = begin; !error && token < end; ++token) {
         DataCopyPad(routes, globalIds[token * k], {1U, 4U * k, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
@@ -131,8 +147,13 @@ __aicore__ inline void Publish(GM_ADDR x, GM_ADDR ids, GM_ADDR state,
     if (id == 0) {
         const auto seq = control.ReadState(Cam::Pull::ACTIVE_SEQUENCE) + 1;
         control.WriteState(Cam::Pull::ACTIVE_SEQUENCE, seq);
-        for (uint32_t e = 0; e < experts; ++e)
-            control.Write(local + layout.counts + 8ULL * e, stats.GetValue((cores - 1) * columns + c[4] + e));
+        auto counts = offsetsBuf.Get<int64_t>();
+        for (uint32_t e = 0; e < experts; ++e) counts.SetValue(e, stats.GetValue(e));
+        GlobalTensor<int64_t> publishedCounts;
+        publishedCounts.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(local + layout.counts));
+        Fence<HardEvent::S_MTE3>();
+        DataCopyPad(publishedCounts, counts, {1U, 8U * experts, 0U, 0U, 0U});
+        Fence<HardEvent::MTE3_S>();
         const int64_t values[] = {seq, c[10], rows, prefix, seq, error};
         for (uint32_t field = Cam::Pull::SEQUENCE; field <= Cam::Pull::ERROR; ++field)
             if (field != Cam::Pull::COMMIT)
@@ -162,6 +183,92 @@ __aicore__ inline bool WaitCombine(GM_ADDR state, const Cam::AfdMegaMoeCommTilin
     SyncAll<true>();
     return !control.ReadState(Cam::Pull::FAILURE);
 }
+
+// Publish and Combine partition tokens identically; only the last and preceding
+// statistics rows are needed to recover each route's returned-row position.
+__aicore__ inline void Combine(GM_ADDR ids, GM_ADDR probabilities, GM_ADDR combined,
+                               const Cam::AfdMegaMoeCommTilingData &t,
+                               const Cam::Pull::Layout &layout, TPipe &pipe) {
+    const auto c = t.config;
+    const uint32_t id = GetBlockIdx(), cores = t.aivNum, h = c[2], k = c[3], rows = c[9];
+    const uint32_t experts = c[4] * c[6], columns = c[4] + experts;
+    const uint32_t begin = rows / cores * id + (id < rows % cores ? id : rows % cores);
+    const uint32_t end = begin + rows / cores + (id < rows % cores);
+    const auto local = Cam::Pull::Window(c[7], c[7]);
+    pipe.Reset();
+    TBuf<TPosition::VECCALC> offsetsBuf, routesBuf, mathBuf;
+    pipe.InitBuffer(offsetsBuf, 2 * Cam::Pull::Align(4ULL * experts));
+    pipe.InitBuffer(routesBuf, 2 * Cam::Pull::Align(4ULL * k));
+    pipe.InitBuffer(mathBuf, 14ULL * h);
+    auto offsets = offsetsBuf.Get<uint32_t>();
+    auto counts = offsetsBuf.GetWithOffset<uint32_t>(experts, Cam::Pull::Align(4ULL * experts));
+    auto routes = routesBuf.Get<int32_t>();
+    auto weights = routesBuf.GetWithOffset<float>(k, Cam::Pull::Align(4ULL * k));
+    auto input = mathBuf.Get<bfloat16_t>();
+    auto value = mathBuf.GetWithOffset<float>(h, 2 * h);
+    auto product = mathBuf.GetWithOffset<float>(h, 6 * h);
+    auto sum = mathBuf.GetWithOffset<float>(h, 10 * h);
+    GlobalTensor<uint32_t> stats;
+    GlobalTensor<int32_t> globalIds;
+    GlobalTensor<float> globalWeights;
+    GlobalTensor<bfloat16_t> returned, output;
+    stats.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t *>(local));
+    globalIds.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(ids));
+    globalWeights.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(probabilities));
+    returned.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(local + layout.returned));
+    output.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(combined));
+    if (begin < end) {
+        DataCopyPad(counts, stats[(cores - 1) * columns + c[4]],
+            {1U, 4U * experts, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+        if (id) DataCopyPad(offsets, stats[(id - 1) * columns + c[4]],
+            {1U, 4U * experts, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+        Fence<HardEvent::MTE2_S>();
+        uint32_t prefix = 0;
+        for (uint32_t e = 0; e < experts; ++e) {
+            offsets.SetValue(e, prefix + (id ? offsets.GetValue(e) : 0));
+            prefix += counts.GetValue(e);
+        }
+        for (uint32_t token = begin; token < end; ++token) {
+            DataCopyPad(routes, globalIds[token * k],
+                {1U, 4U * k, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+            DataCopyPad(weights, globalWeights[token * k],
+                {1U, 4U * k, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+            Duplicate(sum, 0.0f, h);
+            Fence<HardEvent::MTE2_S>();
+            for (uint32_t j = 0; j < k; ++j) {
+                const uint32_t expert = routes.GetValue(j), row = offsets.GetValue(expert);
+                const float weight = weights.GetValue(j);
+                DataCopy(input, returned[uint64_t(row) * h], h);
+                Fence<HardEvent::MTE2_V>();
+                // Keep the existing FP32 multiply/add and top-k accumulation order.
+                Cast(value, input, RoundMode::CAST_NONE, h);
+                PipeBarrier<PIPE_V>();
+                Muls(product, value, weight, h);
+                PipeBarrier<PIPE_V>();
+                Add(sum, sum, product, h);
+                Fence<HardEvent::V_MTE2>();
+                offsets.SetValue(expert, row + 1);
+            }
+            PipeBarrier<PIPE_V>();
+            Cast(input, sum, RoundMode::CAST_RINT, h);
+            Fence<HardEvent::V_MTE3>();
+            DataCopy(output[uint64_t(token) * h], input, h);
+            Fence<HardEvent::MTE3_V>();
+            Fence<HardEvent::MTE3_MTE2>();
+            Fence<HardEvent::S_MTE2>();
+        }
+    }
+    // All returned rows have been consumed before the single source window is reusable.
+    SyncAll<true>();
+    if (id == 0) {
+        GlobalTensor<uint32_t> flags;
+        flags.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t *>(local + layout.flags));
+        Duplicate(offsets, uint32_t(0), uint32_t(c[4]));
+        Fence<HardEvent::V_MTE3>();
+        DataCopyPad(flags, offsets, {1U, uint32_t(4 * c[4]), 0U, 0U, 0U});
+        Fence<HardEvent::MTE3_S>();
+    }
+}
 } // namespace AfdMegaComm
 
 extern "C" __global__ __aicore__ void afd_mega_moe_comm(
@@ -185,27 +292,15 @@ extern "C" __global__ __aicore__ void afd_mega_moe_comm(
             else if (c[0] == 0) transport.Initialize();
             else if (c[0] == 1) Publish(x, ids, state, t, pipe, transport, layout);
             else if (c[0] == 4 && WaitCombine(state, t, layout, transport)) {
-                SyncAll<true>();
-                if (c[9]) {
-                    Cam::AfdAsyncCombineRecvTilingData combine{};
-                    combine.moeDistributeCombineInfo = {0, uint32_t(c[9]), uint32_t(c[2]), uint32_t(c[3]),
-                        uint32_t(c[4]), uint32_t(c[5]), uint32_t(c[6]), uint32_t(c[7]),
-                        uint32_t(c[4] + c[5]), t.aivNum, t.ubSize, t.windowSize};
-                    MoeDistributeCombineRecvImpl::AfdAsyncCombineRecv<bfloat16_t, true> op;
-                    op.Init(x, ids, probabilities, combined, workspace, &pipe, &combine, state, 1);
-                    op.Process();
-                } else if (GetBlockIdx() == 0) {
-                    GlobalTensor<uint32_t> flags;
-                    flags.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t *>(Cam::Pull::Window(c[7], c[7]) + layout.flags));
-                    for (uint32_t f = 0; f < c[4]; ++f) flags.SetValue(f, 0);
-                    DataCacheCleanAndInvalid<uint32_t, CacheLine::ENTIRE_DATA_CACHE, DcciDst::CACHELINE_OUT>(flags);
-                }
+                Combine(ids, probabilities, combined, t, layout, pipe);
             }
         }
         SyncAll<true>();
         // Release phase buffers before allocating the final status transport.
         pipe.Reset();
-        Cam::Pull::Transport final(state, shape, c[7], t.aivNum, pipe);
-        if (GetBlockIdx() == 0) final.Write(completion, final.ReadState(Cam::Pull::FAILURE));
+        if (GetBlockIdx() == 0) {
+            Cam::Pull::Transport final(state, shape, c[7], t.aivNum, pipe);
+            final.Write(completion, final.ReadState(Cam::Pull::FAILURE));
+        }
     }
 }

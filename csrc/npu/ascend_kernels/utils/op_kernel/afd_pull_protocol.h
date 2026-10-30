@@ -111,6 +111,7 @@ public:
         const auto sources = shape_.attnRanks / shape_.tp;
         const auto first = uint32_t(ReadState(NEXT_SOURCE));
         const auto budget = ReadState(IDLE_BUDGET);
+        const auto session = ReadState(SESSION);
         uint64_t scans = 0;
         while (!ReadState(STOP)) {
             for (uint32_t n = 0; n < sources; ++n) {
@@ -123,12 +124,18 @@ public:
                     const auto header = Peer(source + s) + layout_.header;
                     const auto commit = Read(header + COMMIT * ALIGNMENT);
                     if (commit < expected) { ready = false; break; }
-                    if (commit != expected || Read(header + EPOCH * ALIGNMENT) != ReadState(SESSION)) {
+                    AscendC::GlobalTensor<int64_t> gm;
+                    gm.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(header));
+                    auto values = row_.Get<int64_t>();
+                    AscendC::DataCopy(values, gm, HEADER_LINES * WORDS_PER_LINE);
+                    Fence<AscendC::HardEvent::MTE2_S>();
+                    if (commit != expected || values.GetValue(EPOCH * WORDS_PER_LINE) != session) {
                         Fail(source, -2); return false;
                     }
-                    const auto currentLayer = Read(header + LAYER * ALIGNMENT);
-                    if (Read(header + ERROR * ALIGNMENT) ||
-                        Read(header + SEQUENCE * ALIGNMENT) != commit ||
+                    const auto currentLayer = values.GetValue(LAYER * WORDS_PER_LINE);
+                    if (values.GetValue(ERROR * WORDS_PER_LINE) ||
+                        values.GetValue(SEQUENCE * WORDS_PER_LINE) != commit ||
+                        values.GetValue(COMMIT * WORDS_PER_LINE) != commit ||
                         (layer >= 0 && layer != currentLayer)) {
                         Fail(source, -3); return false;
                     }
@@ -153,7 +160,7 @@ public:
     }
 
     // Load immutable original counts; slice counts are separate from return coordinates.
-    __aicore__ uint64_t LoadMetadata(bool verify = false) {
+    __aicore__ uint64_t LoadMetadata() {
         auto meta = metadata_.Get<int64_t>();
         const auto source = uint32_t(ReadState(SOURCE));
         const uint32_t ffn = rank_ - shape_.attnRanks;
@@ -177,8 +184,7 @@ public:
                 sourceTotal += count;
                 if (i / shape_.experts == ffn) {
                     const uint32_t index = 5 + shape_.tp + s * shape_.experts + i % shape_.experts;
-                    if (verify && meta.GetValue(index) != count) { Fail(source, -9); return 0; }
-                    if (!verify) meta.SetValue(index, count);
+                    meta.SetValue(index, count);
                     total += count;
                 }
             }
@@ -187,29 +193,21 @@ public:
                 if (id_ == 0) Fail(source, -5);
                 return 0;
             }
-            if (verify && meta.GetValue(5 + s) != int64_t(prefix)) { Fail(source, -9); return 0; }
-            if (!verify) meta.SetValue(5 + s, prefix);
+            meta.SetValue(5 + s, prefix);
             Fence<AscendC::HardEvent::S_MTE2>();
         }
-        if (verify) {
-            if (meta.GetValue(0) != int64_t(total) || meta.GetValue(1) != source ||
-                meta.GetValue(2) != ReadState(ACTIVE_LAYER) ||
-                meta.GetValue(MetadataWords(shape_.tp, shape_.experts) - 2) != ReadState(SESSION) ||
-                meta.GetValue(MetadataWords(shape_.tp, shape_.experts) - 1) != ReadState(ACTIVE_SEQUENCE))
-                Fail(source, -9);
-        } else {
-            meta.SetValue(0, total);
-            meta.SetValue(1, source);
-            meta.SetValue(2, ReadState(ACTIVE_LAYER));
-            meta.SetValue(MetadataWords(shape_.tp, shape_.experts) - 2, ReadState(SESSION));
-            meta.SetValue(MetadataWords(shape_.tp, shape_.experts) - 1, ReadState(ACTIVE_SEQUENCE));
-        }
+        meta.SetValue(0, total);
+        meta.SetValue(1, source);
+        meta.SetValue(2, ReadState(ACTIVE_LAYER));
+        meta.SetValue(MetadataWords(shape_.tp, shape_.experts) - 2, ReadState(SESSION));
+        meta.SetValue(MetadataWords(shape_.tp, shape_.experts) - 1, ReadState(ACTIVE_SEQUENCE));
         return total;
     }
 
     // Mega's fused pipeline owns payload DMA; this prepares only control metadata.
     __aicore__ void PrepareRound(GM_ADDR batch, GM_ADDR groupCounts, uint64_t capacity) {
-        if (id_ == 0) Select();
+        const bool continuing = ReadState(SOURCE) >= 0;
+        Select();
         auto meta = metadata_.Get<int64_t>();
         auto groups = groups_.Get<int64_t>();
         if (ReadState(FAILURE) || ReadState(SOURCE) < 0) {
@@ -217,13 +215,31 @@ public:
             SaveMetadata(batch, groupCounts);
             return;
         }
-        const uint64_t total = LoadMetadata();
+        // A retains the original counts until the last round has returned its output.
+        if (continuing) LoadSnapshot(batch);
+        else LoadMetadata();
+        const uint64_t total = meta.GetValue(0);
+        const auto source = ReadState(SOURCE);
+        const auto sequence = ReadState(ACTIVE_SEQUENCE);
+        if (!ReadState(FAILURE)) {
+            for (uint32_t s = 0; s < shape_.tp; ++s) {
+                if (Read(Peer(source + s) + layout_.header + COMMIT * ALIGNMENT) != sequence) {
+                    Fail(source, -9); break;
+                }
+            }
+        }
         if (ReadState(FAILURE)) {
             ClearMetadata();
             SaveMetadata(batch, groupCounts);
             return;
         }
         const uint64_t begin = ReadState(CURSOR);
+        if (begin > total) {
+            Fail(source, -9);
+            ClearMetadata();
+            SaveMetadata(batch, groupCounts);
+            return;
+        }
         const uint64_t end = begin + capacity < total ? begin + capacity : total;
         meta.SetValue(3, begin);
         meta.SetValue(4, end);
@@ -246,30 +262,25 @@ public:
         Fence<AscendC::HardEvent::MTE3_S>();
     }
 
+    // Called only by the control owner after the mixed-core output drain.
     __aicore__ bool ValidateReturn(GM_ADDR batch, uint64_t inputRows) {
-        AscendC::SyncAll<true>();
         if (ReadState(FAILURE) || ReadState(SOURCE) < 0) return false;
+        LoadSnapshot(batch);
         auto meta = metadata_.Get<int64_t>();
-        AscendC::GlobalTensor<int64_t> gm;
-        gm.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(batch));
-        AscendC::DataCopyPad(meta, gm,
-            {1U, uint32_t(8 * MetadataWords(shape_.tp, shape_.experts)), 0U, 0U, 0U},
-            {false, 0U, 0U, 0U});
-        Fence<AscendC::HardEvent::MTE2_S>();
-        if (id_ == 0) {
-            const auto source = ReadState(SOURCE);
-            if (source < 0 || uint64_t(source) + shape_.tp > shape_.attnRanks ||
-                source % shape_.tp || meta.GetValue(3) != ReadState(CURSOR) ||
-                meta.GetValue(3) != ReadState(ROUND_BEGIN) ||
-                meta.GetValue(4) != ReadState(ROUND_END) ||
-                meta.GetValue(4) < meta.GetValue(3) ||
-                uint64_t(meta.GetValue(4) - meta.GetValue(3)) > inputRows) {
-                Fail(source >= 0 && uint64_t(source) + shape_.tp <= shape_.attnRanks ? source : 0, -9);
-            } else {
-                LoadMetadata(true);
-            }
+        const auto source = ReadState(SOURCE);
+        if (source < 0 || uint64_t(source) + shape_.tp > shape_.attnRanks ||
+            source % shape_.tp || meta.GetValue(1) != source ||
+            meta.GetValue(2) != ReadState(ACTIVE_LAYER) ||
+            meta.GetValue(MetadataWords(shape_.tp, shape_.experts) - 2) != ReadState(SESSION) ||
+            meta.GetValue(MetadataWords(shape_.tp, shape_.experts) - 1) != ReadState(ACTIVE_SEQUENCE) ||
+            meta.GetValue(3) != ReadState(CURSOR) ||
+            meta.GetValue(3) != ReadState(ROUND_BEGIN) ||
+            meta.GetValue(4) != ReadState(ROUND_END) ||
+            meta.GetValue(3) < 0 || meta.GetValue(4) < meta.GetValue(3) ||
+            meta.GetValue(4) > meta.GetValue(0) ||
+            uint64_t(meta.GetValue(4) - meta.GetValue(3)) > inputRows) {
+            Fail(source >= 0 && uint64_t(source) + shape_.tp <= shape_.attnRanks ? source : 0, -9);
         }
-        AscendC::SyncAll<true>();
         if (ReadState(FAILURE)) return false;
         return true;
     }
@@ -279,9 +290,6 @@ public:
         auto meta = metadata_.Get<int64_t>();
         const uint64_t end = meta.GetValue(4);
         const uint32_t source = meta.GetValue(1);
-        Fence<AscendC::HardEvent::MTE3_S>();
-        AscendC::SyncAll<true>();
-        if (id_ != 0) return;
         if (end < uint64_t(meta.GetValue(0))) { WriteState(CURSOR, end); return; }
         const auto sequence = ReadState(ACTIVE_SEQUENCE);
         WriteState(LAST_SEQUENCE + source / shape_.tp * WORDS_PER_LINE, sequence);
@@ -303,6 +311,14 @@ public:
 
 private:
     __aicore__ GM_ADDR Peer(uint32_t rank) { return Window(rank, rank_); }
+    __aicore__ void LoadSnapshot(GM_ADDR batch) {
+        AscendC::GlobalTensor<int64_t> gm;
+        gm.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(batch));
+        AscendC::DataCopyPad(metadata_.Get<int64_t>(), gm,
+            {1U, uint32_t(8 * MetadataWords(shape_.tp, shape_.experts)), 0U, 0U, 0U},
+            {false, 0U, 0U, 0U});
+        Fence<AscendC::HardEvent::MTE2_S>();
+    }
     __aicore__ void ClearMetadata() {
         auto meta = metadata_.Get<int64_t>();
         auto groups = groups_.Get<int64_t>();

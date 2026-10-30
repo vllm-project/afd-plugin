@@ -85,20 +85,27 @@ AFD_PULL_DEVICE constexpr uint64_t TransportUbBytes(const Shape &s) {
 }
 
 // Publish retains these buffers alongside Transport for the entire phase.
+AFD_PULL_DEVICE inline uint64_t PublisherStatsBytes(const Shape &s, uint64_t cores) {
+    const auto stats = Align(4 * (s.ffnRanks + s.ffnRanks * s.experts) * cores);
+    // Reuse this buffer for the per-lane error lines before loading token offsets.
+    return stats > cores * ALIGNMENT ? stats : cores * ALIGNMENT;
+}
 AFD_PULL_DEVICE inline uint64_t PublisherUbBytes(const Shape &s, uint64_t cores) {
     const auto e = s.ffnRanks * s.experts;
-    return Align(4 * (s.ffnRanks + e) * cores) + 2 * Align(4 * e) +
+    return PublisherStatsBytes(s, cores) + 2 * Align(4 * e) +
         Align(4 * s.topK) + Align(11 * s.hidden + 128);
 }
 
-// The unchanged Combine reuses its statistics scratch after LoadPreProcess.
+// Retain the former admission bound while accounting for Mega's per-token routes.
 AFD_PULL_DEVICE inline uint64_t CombineUbBytes(const Shape &s, uint64_t cores) {
     const auto e = s.ffnRanks * s.experts;
     const auto base = 65536 + Align32(2 * e);
     const auto preprocess = base + Align32(4 * (s.ffnRanks + e) * cores);
     const auto retained = base + Align32(4 * e) + Align32(2 * e) +
         3 * Align32(4 * s.hidden) + Align32(2 * s.hidden) + Align32(4 * s.ffnRanks);
-    return preprocess > retained ? preprocess : retained;
+    const auto legacy = preprocess > retained ? preprocess : retained;
+    const auto mega = 2 * Align(4 * e) + 2 * Align(4 * s.topK) + Align(14 * s.hidden);
+    return legacy > mega ? legacy : mega;
 }
 
 struct Slice {

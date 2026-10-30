@@ -29,7 +29,8 @@ from __future__ import annotations
 
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Final, cast
@@ -338,6 +339,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         self.expert_per_rank = self.topology.expert_per_rank
         self.comm_args: Tensor | None = None
         self._placeholder: Tensor | None = None
+        self._defer_pull_status_check = False
         self._pending_attention_payloads: dict[
             int,
             list[tuple[AFDTransferContext, Tensor, Tensor]],
@@ -736,16 +738,29 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             ),
         )
         _log_cam_op_values("async_combine_recv", "outputs", output=output)
-        self.check_pull_status()
+        if not self._defer_pull_status_check:
+            self.check_pull_status()
         payloads.pop(0)
         if not payloads:
             self._pending_attention_payloads.pop(ubatch_idx, None)
         return output
 
+    @contextmanager
+    def defer_pull_status(self) -> Iterator[None]:
+        """Check sticky device errors before the model step returns, not per MoE."""
+        previous = self._defer_pull_status_check
+        self._defer_pull_status_check = True
+        try:
+            yield
+            if not previous:
+                self.check_pull_status()
+        finally:
+            self._defer_pull_status_check = previous
+
     def check_pull_status(self) -> None:
         if self.extra_info.ffn_mega_moe:
             assert self.comm_args is not None
-            # shortcut: A-side host fence; replace after device errors are verified.
+            # The model runner batches this fence outside the DBO receive hook.
             status = int(self.comm_args.view(torch.int64)[PULL_FAILURE_INDEX].item())
             if status:
                 raise RuntimeError(f"AFD pull transaction failed with status {status}")

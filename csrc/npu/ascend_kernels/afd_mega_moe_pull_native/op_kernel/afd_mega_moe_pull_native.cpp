@@ -183,31 +183,29 @@ extern "C" __global__ __aicore__ void afd_mega_moe_pull_native(
                 pipe.Reset();
             }
             SyncAll<false>();
-            if ASCEND_IS_AIV {
-                Cam::Pull::Transport check(state, PullShape(t), c[7], t.aivNum, pipe, id);
-                check.ValidateReturn(scratch + w.batch, c[10]);
-            }
-            SyncAll<false>();
             const auto layer = Load(state, Cam::Pull::FAILURE) ? -1 : Load(scratch + w.layer);
-            if ASCEND_IS_AIV { pipe.Reset(); }
             if (layer >= 0 && layer < c[13]) {
                 const ReceiveRound round(scratch, w, c[6]);
-                if ASCEND_IS_AIC {
-                    Compute(scratch, w, t, round, w13, s13, layer, false, resource);
-                    Compute(scratch, w, t, round, w2, s2, layer, true, resource);
-                }
-                if ASCEND_IS_AIV {
-                    PullAndPrepare(scratch, w, t, round, resource);
-                    Activate(scratch, w, t, round, b13, layer, resource);
-                    Combine(scratch, w, t, round, b2, layer, resource);
+                if (round.total) {
+                    if ASCEND_IS_AIC {
+                        Compute(scratch, w, t, round, w13, s13, layer, false, resource);
+                        Compute(scratch, w, t, round, w2, s2, layer, true, resource);
+                    }
+                    if ASCEND_IS_AIV {
+                        PullAndPrepare(scratch, w, t, round, resource);
+                        Activate(scratch, w, t, round, b13, layer, resource);
+                        Combine(scratch, w, t, round, b2, layer, resource);
+                    }
                 }
             }
             SyncAll<false>();
             if ASCEND_IS_AIV { pipe.Reset(); }
             if ASCEND_IS_AIV {
-                Cam::Pull::Transport tx(state, PullShape(t), c[7], t.aivNum, pipe, id);
-                if (layer >= 0 && layer < c[13]) tx.CompleteRound(scratch + w.batch, c[10]);
-                if (id == 0) tx.Write(completion, tx.ReadState(Cam::Pull::FAILURE));
+                if (id == 0) {
+                    Cam::Pull::Transport tx(state, PullShape(t), c[7], t.aivNum, pipe, 0);
+                    if (layer >= 0 && layer < c[13]) tx.CompleteRound(scratch + w.batch, c[10]);
+                    tx.Write(completion, tx.ReadState(Cam::Pull::FAILURE));
+                }
             }
             // All GMM/epilogue events have drained before scratch and flag slots are reused.
             SyncAll<false>();
