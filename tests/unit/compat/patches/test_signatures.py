@@ -195,6 +195,14 @@ def _upstream_signature(module, owner, symbol, extra_namespace):
             id="camp2p-dispatch",
         ),
         pytest.param(
+            "vllm.v1.worker.workspace",
+            "WorkspaceManager",
+            "_get_workspace_id",
+            None,
+            "v4-workspace-slot",
+            id="v4-workspace-slot",
+        ),
+        pytest.param(
             GPU_UBATCH,
             "UBatchRunner",
             "prepare",
@@ -237,14 +245,24 @@ def test_patch_preserves_upstream_signature(
         from afd_plugin.v1.worker.npu import attention_model_runner_v2 as adapter
 
         scope = adapter._use_camp2p_dp_padding(4, 2)
+    elif scope_name == "v4-workspace-slot":
+        from afd_plugin.compat.patches import gpu_deepseek_v4_dbo as adapter
+
+        native_class = getattr(target, owner)
+        binding = native_class.__new__(native_class)
+        scope = adapter._use_flashmla_workspace_slot(binding, 0)
     elif scope_name in {"ubatch-prepare", "fullgraph-replay"}:
         from afd_plugin.v1.worker import attention_model_runner_v2 as adapter
 
         native_class = getattr(target, owner)
         binding = native_class.__new__(native_class)
         if scope_name == "ubatch-prepare":
+            model = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v2"))
             scope = adapter._use_afd_ubatch_preparation(
-                SimpleNamespace(ubatch_runner=binding)
+                SimpleNamespace(
+                    ubatch_runner=binding,
+                    vllm_config=SimpleNamespace(model_config=model),
+                )
             )
         else:
             scope = adapter._use_afd_fullgraph_replay_hook(

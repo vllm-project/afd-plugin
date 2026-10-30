@@ -13,6 +13,7 @@ from vllm.config import VllmConfig
 from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.worker_base import CompilationTimes
 
+from afd_plugin.connectors.base import AFDControlPlaneClosedError
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
 from afd_plugin.validation import (
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 logger = logging.getLogger(__name__)
+FFN_LOOP_JOIN_TIMEOUT_S = 5
 
 
 class AFDFFNWorker(Worker):
@@ -166,14 +168,20 @@ class AFDFFNWorker(Worker):
             torch.cuda.set_device(self.device)
 
         while not event.is_set():
-            if self.model_runner.connector.control_plane is None:
+            control_plane = self.model_runner.connector.control_plane
+            if control_plane is None:
                 raise NotImplementedError(
                     "GPU FFN only supports control-plane-driven connectors; "
                     "connectors without a control plane (control_plane is None) "
                     "are not supported.",
                 )
 
-            payload = self.model_runner.connector.control_plane.recv_dp_metadata_list()
+            try:
+                payload = control_plane.recv_dp_metadata_list()
+            except AFDControlPlaneClosedError:
+                if not event.is_set():
+                    raise
+                break
             dp_metadata_list = payload.dp_metadata_list
             is_attn_graph_capturing = payload.is_graph_capturing
             is_warmup = payload.is_warmup
@@ -201,26 +209,41 @@ class AFDFFNWorker(Worker):
     def raise_ffn_loop_error_if_any(self) -> None:
         error = self._ffn_loop_error
         if error is not None:
-            self._ffn_loop_error = None
+            # EngineCore and Worker can both stop the loop; retain its failure.
             raise RuntimeError("AFD FFN worker loop failed") from error
 
     def stop_ffn_server_loop(self) -> None:
         event = self._ffn_shutdown_event
         if event is not None:
             event.set()
-        try:
-            self.model_runner.shutdown()
-        finally:
-            thread = self._ffn_thread
-            if thread is not None:
-                thread.join(timeout=5)
-            self._ffn_thread = None
-            self._ffn_shutdown_event = None
+        control_plane = self.model_runner.connector.control_plane
+        if control_plane is not None:
+            control_plane.close()
+        thread = self._ffn_thread
+        if thread is not None:
+            thread.join(timeout=FFN_LOOP_JOIN_TIMEOUT_S)
+            if thread.is_alive():
+                raise RuntimeError("AFD FFN worker loop did not stop before shutdown")
+        self._ffn_thread = None
+        self._ffn_shutdown_event = None
         self.raise_ffn_loop_error_if_any()
 
+    # Upstream source: vLLM v0.32.0, vllm/v1/worker/gpu_worker.py,
+    # Worker.shutdown; 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # Patch reason: the native worker does not own AFD's metadata receiver.
+    # Patch functionality: stop that receiver before releasing native resources,
+    # including when the joined loop reports an earlier failure.
+    # Signature: matches Worker.shutdown exactly: (self) -> None.
+    # Delegation exception: native cleanup stays in super().shutdown().
+    # Removal plan: remove when the native worker owns the AFD receiver lifecycle.
     def shutdown(self) -> None:
-        self.stop_ffn_server_loop()
-        super().shutdown()
+        # ### PATCH START: release native state only after the receiver exits.
+        try:
+            self.stop_ffn_server_loop()
+        finally:
+            if self._ffn_thread is None:
+                super().shutdown()
+        # ### PATCH END: release native state only after the receiver exits.
 
 
 __all__ = ["AFDFFNWorker"]

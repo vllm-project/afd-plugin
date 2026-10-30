@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import copy
 import json
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -414,19 +414,49 @@ def recv_control_payload(
     src: int,
     group: ProcessGroup,
     device: torch.device,
+    check_closed: Callable[[], None] | None = None,
 ) -> AFDControlPayload:
-    """Receive and decode a DP-metadata payload from ``src`` over ``group``."""
+    """Receive a payload, checking local cancellation after device waits."""
+
+    def recv_tensor(tensor: torch.Tensor) -> int:
+        try:
+            return torch.distributed.recv(tensor, src=src, group=group)
+        except ValueError as error:
+            # Torch's rank lookup can race the owned PG's local unregistration.
+            if (
+                check_closed is not None
+                and str(error).startswith("Group ")
+                and str(error).endswith(
+                    "is not registered, please create group with "
+                    "torch.distributed.new_group API"
+                )
+            ):
+                # The base contract imports this codec; defer the circular import.
+                from afd_plugin.connectors.base import AFDControlPlaneClosedError
+
+                try:
+                    check_closed()
+                except AFDControlPlaneClosedError as closed_error:
+                    raise closed_error from error
+            raise
+
     size_tensor = torch.empty(1, dtype=torch.long, device=device)
-    rank_size = torch.distributed.recv(size_tensor, src=src, group=group)
+    rank_size = recv_tensor(size_tensor)
+    raw_size = size_tensor.item()
+    if check_closed is not None:
+        check_closed()
     object_tensor = torch.empty(
-        int(size_tensor.item()),
+        int(raw_size),
         dtype=torch.uint8,
         device=device,
     )
-    rank_object = torch.distributed.recv(object_tensor, src=src, group=group)
+    rank_object = recv_tensor(object_tensor)
     if rank_object != rank_size:
         raise RuntimeError("received AFD DP metadata fragments from different ranks")
-    return decode_control_payload(object_tensor.cpu().numpy().tobytes())
+    object_tensor_cpu = object_tensor.cpu()
+    if check_closed is not None:
+        check_closed()
+    return decode_control_payload(object_tensor_cpu.numpy().tobytes())
 
 
 __all__ = [
