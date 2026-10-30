@@ -255,8 +255,16 @@ class AFDConnectorBase(ABC):
         raise NotImplementedError
 
 
+class AFDControlPlaneClosedError(RuntimeError):
+    """A receive was cancelled by an explicit local control-plane close."""
+
+
 class AFDControlPlane(ABC):
-    """DP metadata control plane"""
+    """DP metadata control plane."""
+
+    def close(self) -> None:
+        """Stop local receives when the backend supports cancellation."""
+        return None
 
     @abstractmethod
     def update_state_from_dp_metadata(
@@ -307,4 +315,9 @@ class AFDControlPlane(ABC):
         raise NotImplementedError
 
 
-__all__ = ["AFDConnectorBase", "AFDControlPlane", "ConnectorExtraInfo"]
+__all__ = [
+    "AFDConnectorBase",
+    "AFDControlPlane",
+    "AFDControlPlaneClosedError",
+    "ConnectorExtraInfo",
+]

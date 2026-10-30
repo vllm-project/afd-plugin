@@ -24,6 +24,7 @@ from afd_plugin.connectors import (  # noqa: E402
     AFDTransferContext,
     AFDTransferMetadata,
 )
+from afd_plugin.connectors.base import AFDControlPlaneClosedError  # noqa: E402
 from afd_plugin.model_executor.models.deepseek_v2 import (  # noqa: E402
     AFDDeepseekV2ForCausalLM,
 )
@@ -39,6 +40,124 @@ from tests.unit.fakes.dp_metadata import (  # noqa: E402
 from tests.unit.fakes.dp_metadata import dp_tokens as _tokens  # noqa: E402
 from tests.unit.fakes.graph import Graph as _FakeGraph  # noqa: E402
 from tests.unit.fakes.profiler import StepProfiler as _StepProfiler  # noqa: E402
+
+
+@pytest.fixture
+def loop_worker():
+    def make(control_plane):
+        worker = object.__new__(AFDFFNWorker)
+        worker._ffn_thread = None
+        worker._ffn_shutdown_event = threading.Event()
+        worker._ffn_loop_error = None
+        worker.device = SimpleNamespace(type="cpu")
+        worker.model_runner = SimpleNamespace(
+            connector=SimpleNamespace(control_plane=control_plane, is_initialized=True),
+            use_cuda_graph=False,
+            model="owned weights",
+        )
+        return worker
+
+    return make
+
+
+def test_ffn_worker_stops_receiver_before_native_resource_release(
+    monkeypatch, loop_worker
+):
+    receiving = threading.Event()
+    release = threading.Event()
+
+    def receive():
+        receiving.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("receiver was not cancelled")
+        raise AFDControlPlaneClosedError("local close")
+
+    plane = SimpleNamespace(recv_dp_metadata_list=receive, close=release.set)
+    worker = loop_worker(plane)
+    worker.start_ffn_server_loop()
+    thread = worker._ffn_thread
+
+    def native_shutdown(self):
+        if thread.is_alive():
+            raise RuntimeError("receiver still uses runner resources")
+        self.model_runner.model = None
+
+    monkeypatch.setattr(gpu_worker_module.Worker, "shutdown", native_shutdown)
+    try:
+        assert receiving.wait(timeout=5)
+        worker.shutdown()
+        assert worker.model_runner.model is None
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+
+def test_ffn_worker_timeout_retains_resources_and_remains_a_failure(
+    monkeypatch, loop_worker
+):
+    worker = loop_worker(SimpleNamespace(close=lambda: None))
+    worker._ffn_thread = SimpleNamespace(
+        join=lambda timeout: None, is_alive=lambda: True
+    )
+
+    def native_shutdown(self):
+        self.model_runner.model = None
+
+    monkeypatch.setattr(gpu_worker_module.Worker, "shutdown", native_shutdown)
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="did not stop"):
+            worker.shutdown()
+        assert worker.model_runner.model == "owned weights"
+
+
+@pytest.mark.parametrize(
+    "error, request_stop, cancelled",
+    [
+        (AFDControlPlaneClosedError("closed"), True, True),
+        (AFDControlPlaneClosedError("closed"), False, False),
+        (RuntimeError("NCCL failure"), True, False),
+        (ValueError("invalid metadata"), True, False),
+    ],
+)
+def test_ffn_worker_only_consumes_explicit_receive_cancellation(
+    loop_worker, error, request_stop, cancelled
+):
+    plane = SimpleNamespace()
+    worker = loop_worker(plane)
+
+    def receive():
+        if request_stop:
+            worker._ffn_shutdown_event.set()
+        raise error
+
+    plane.recv_dp_metadata_list = receive
+
+    if cancelled:
+        worker._run_ffn_server_loop()
+    else:
+        with pytest.raises(type(error)) as caught:
+            worker._run_ffn_server_loop()
+        assert caught.value is error
+
+
+def test_ffn_worker_releases_native_resources_while_reporting_loop_failure(
+    monkeypatch, loop_worker
+):
+    worker = loop_worker(SimpleNamespace(close=lambda: None))
+    original = RuntimeError("recorded FFN failure")
+    worker._ffn_loop_error = original
+
+    def native_shutdown(self):
+        self.model_runner.model = None
+
+    monkeypatch.setattr(gpu_worker_module.Worker, "shutdown", native_shutdown)
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="FFN worker loop failed") as caught:
+            worker.shutdown()
+        assert caught.value.__cause__ is original
+        assert worker.model_runner.model is None
 
 
 def test_native_weight_update_finishes_without_ffn_lora_state(monkeypatch):

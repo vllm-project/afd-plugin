@@ -55,7 +55,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 uv run vllm serve "$MODEL_PATH" \
         "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes":[64]
     }' \
     --host 127.0.0.1 \
-    --port 18305 \
+    --port 18306 \
     --trust-remote-code > ffn.log 2>&1 &
 
 wait
