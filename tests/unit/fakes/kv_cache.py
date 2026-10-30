@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Executor-side state for CPU KV-cache configuration contracts."""
 
+from copy import deepcopy
+
 
 class KVCacheExecutor:
     max_concurrent_batches = 1
@@ -23,7 +25,8 @@ class KVCacheExecutor:
         self.kv_cache_layout = layout_name
 
     def initialize_from_config(self, kv_cache_configs):
-        self.kv_cache_configs = kv_cache_configs
+        # Workers receive a serialized configuration, not a live scheduler reference.
+        self.kv_cache_configs = deepcopy(kv_cache_configs)
 
     def compile_or_warm_up_model(self):
         self.warmup_called = True

@@ -160,14 +160,10 @@ def _set_fake_platform(*, is_cuda, device_type):
         is_cuda=lambda: is_cuda,
         device_type=device_type,
     )
-    sys.modules["vllm"].__dict__["__version__"] = (
-        "0.30.0" if device_type == "npu" else "0.32.0"
-    )
 
 
 def _install_fake_npu_config(monkeypatch):
     arg_utils_module, config_module = _install_fake_vllm_config(monkeypatch)
-    sys.modules["vllm"].__dict__["__version__"] = "0.30.0"
     events: list[tuple[str, str] | tuple[str, str, str]] = []
 
     class FakeParallelConfig:
@@ -319,7 +315,7 @@ def _cuda_case(
 ):
     engine_args.setdefault("active", True)
     if version is None:
-        version = "0.30.0" if platform[2] == "npu" else "0.32.0"
+        version = "0.32.0"
     return pytest.param(
         platform,
         version,

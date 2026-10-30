@@ -38,7 +38,7 @@ validation_paths:
   - "tests/e2e/models/qwen3_6/test_qwen3_6.py"
 upstream_refs:
   - "vLLM 0.32.0 CUDA serving, MRV2 execution and shutdown interfaces"
-  - "vLLM 0.30.0 Ascend serving and shutdown interfaces"
+  - "vLLM 0.32.0 Ascend serving and shutdown interfaces"
   - "lm-evaluation-harness GSM8K task and local-completions API"
   - "pytest parameterized test IDs"
 verified_platform_refs:
@@ -156,7 +156,8 @@ should be removed when the runtime supports graceful cancellation.
 `afd-dsv4-flash-async-cam-dp2tp4-ep8` is a separate local-only DSV4 Flash
 W4A8 case using 16 Ascend NPUs: Attention DP2/TP4 and FFN DP8/TP1/EP8.
 It uses eager async CAM and MBT=8192. Its Attention-side `--enable-dbo` flag
-enables two native DBO children. Native DBO requires target-device validation. It validates
+enables native DBO when its threshold is met; the recorded short prompts do
+not establish two-stage execution. It validates
 ten simultaneous chat requests, records their outputs and overlapping
 request intervals, and checks service liveness and cleanup. Its cancellable
 async HTTP client saves per-request responses/errors even on failure or

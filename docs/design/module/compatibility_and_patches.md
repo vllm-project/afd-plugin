@@ -27,7 +27,7 @@ validation_paths:
   - "tests/unit/v1/worker/test_npu_runtime.py"
 upstream_refs:
   - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
-  - "NPU: vLLM 0.30.0 ced6857afa0ea7b2e3f0846a62e1394e90f15607"
+  - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "vLLM vllm.v1.engine.core.EngineCore and EngineCoreProc"
   - "vLLM vllm.v1.engine.core_client.DPAsyncMPClient"
   - "vLLM vllm.forward_context.set_forward_context"
@@ -60,19 +60,19 @@ patch modules must not become a general home for AFD-owned functionality.
 
 ## Supported upstream boundary
 
-The package extra pins vLLM `0.32.0` for GPU.
-[`compat/vllm.py`](../../../afd_plugin/compat/vllm.py) selects the GPU
-`0.32.0` or NPU `0.30.0` target using the active platform.
+The package extra pins vLLM `0.32.0` for both backends.
+[`compat/vllm.py`](../../../afd_plugin/compat/vllm.py) checks the shared
+`0.32.0` target.
 Direct strict calls raise for a missing or different vLLM; plugin registration
 calls the check with `strict=False`, so it warns and continues. This warning
 policy does not make another vLLM release supported. Shared EngineCore and
-coordinator patches retain separate GPU 0.32 and NPU 0.30 contracts. See the
+coordinator patches use the 0.32 contract. See the
 [runtime matrix](execution_platforms.md#tested-runtime-matrix) for hardware
 validation scope.
 
-The NPU implementation remains based on vLLM `0.30.0` (`ced6857a`) and
+The NPU implementation targets vLLM `0.32.0` (`5df63a72`) and
 vLLM-Ascend commit
-[`8d4409d62`](https://github.com/vllm-project/vllm-ascend/commit/8d4409d6256d8a6729140ddcc0d1889e3f96cdd6).
+[`bd42eea0`](https://github.com/vllm-project/vllm-ascend/commit/bd42eea01d8312c4df469fabaed45f77a12df4d3).
 The repository does not declare a vLLM-Ascend package dependency in
 `pyproject.toml`, so this source commit and the recorded NPU validation are the
 compatibility evidence rather than a released package or container tag.

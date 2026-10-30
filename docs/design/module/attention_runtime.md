@@ -27,6 +27,7 @@ validation_paths:
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
   - "tests/unit/v1/worker/test_npu_model_runner_v2.py"
+  - "tests/unit/v1/worker/npu/test_ubatch_runner.py"
   - "tests/unit/model_executor/test_async_cam_dbo.py"
   - "tests/npu/test_mrv2_dbo.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
@@ -35,12 +36,12 @@ validation_paths:
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
 upstream_refs:
   - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
-  - "NPU: vLLM 0.30.0 ced6857afa0ea7b2e3f0846a62e1394e90f15607"
+  - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "vLLM vllm.v1.worker.gpu_worker.Worker"
   - "vLLM vllm.v1.worker.gpu.model_runner.GPUModelRunner"
   - "vLLM-Ascend vllm_ascend.worker.worker.NPUWorker (tested environment evidence only)"
   - "vLLM-Ascend vllm_ascend.worker.model_runner_v1.NPUModelRunner (tested environment evidence only)"
-  - "vLLM-Ascend vllm_ascend.worker.v2.model_runner.NPUModelRunner at 8d4409d6"
+  - "vLLM-Ascend vllm_ascend.worker.v2.model_runner.NPUModelRunner at bd42eea0"
 verified_platform_refs:
   - "CUDA paths marked gpu in tests/e2e"
   - "CUDA ModelRunnerV2 DP2/TP2 eager and graph scenarios in tests/e2e"
@@ -348,9 +349,10 @@ owns aligned, persistent stage inputs, Indexer SM planning and pre-profile
 FlashMLA workspace reservation. The runner retains input buffers until native
 shutdown; Ascend and other models keep native preparation and profiling.
 
-Ascend V2 supports exactly two native microbatches in eager execution:
-synchronous CAMP2P requires Attention DP > 1, while Async CAM also supports
-Attention DP1. Ascend V2 DBO graph capture and replay remain unsupported.
+Ascend V2 supports exactly two native microbatches: synchronous CAMP2P
+requires Attention DP > 1 and supports graph DBO, while Async CAM uses eager
+Attention and also supports Attention DP1. Plain MLA graph DBO requires
+`FULL_DECODE_ONLY`.
 
 For full-graph capture, the V2 runner
 wraps native input preparation and publishes one warmup and one capture
@@ -399,17 +401,17 @@ the matching platform and connector tests as well.
 ## Limitations and open issues
 
 Current shared limits are the supported vLLM release and registered role-aware
-model integrations. Ascend V1 native ubatching accepts exactly two ubatches. V2
+model integrations. Historical Ascend V1 accepted exactly two ubatches. V2
 requires static EP and no PP/CP. CUDA V2 requires a synchronous control-plane
 connector and supports the two-microbatch path above. Ascend V2 supports eager
 native DBO with exactly two microbatches: synchronous CAMP2P requires Attention
-DP > 1, while Async CAM supports Attention DP1 or DP > 1. Ascend V2 DBO graphs
-remain unsupported. Hardware evidence remains limited to the recorded model and
-configuration cells.
+DP > 1 and supports graph DBO; Async CAM supports eager Attention at DP1 or
+DP > 1. Hardware evidence remains limited to the recorded model and
+configuration cells; see the [0.32 record](../../npu/VLLM_032_VALIDATION.md).
 Platform/connector limits are intentionally centralized in
 [execution platforms](execution_platforms.md#tested-runtime-matrix).
 
-Async CAM DBO has local contract coverage. The next hardware gate needs
+Async CAM DBO has a Lite two-stage hardware accuracy result; broader coverage needs
 DP1/DP > 1, plain TP/model SP, uneven
 prefill lengths, and requests crossing a child boundary, with live two-child
 execution evidence and baseline output comparison.

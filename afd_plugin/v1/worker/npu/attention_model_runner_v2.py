@@ -85,16 +85,16 @@ def _use_afd_fullgraph_replay_hook(
     # execute-scoped AFD provider cannot publish runtime control.
     # Patch functionality: wrap only this manager instance and publish one
     # ordinary padded control payload immediately before each native replay.
-    # Signature: matches vLLM v0.30.0 ModelCudaGraphManager.run_fullgraph exactly.
+    # Signature: matches vLLM v0.32.0 ModelCudaGraphManager.run_fullgraph exactly.
     # Upstream source: vllm/v1/worker/gpu/cudagraph_utils.py,
     # ModelCudaGraphManager.run_fullgraph; commit
-    # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
     # Delegation exception: native replay remains wholly in the saved bound
     # method; this scope owns only the AFD pre-replay control seam.
     # Removal/upstream plan: delete this hook when vLLM exposes a per-manager
     # callback immediately before FULL graph replay.
     def run_fullgraph(
-        self: v2_cudagraph_utils.ModelCudaGraphManager,
+        self,
         desc: v2_cudagraph_utils.BatchExecutionDescriptor,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
         # ### PATCH START: publish one AFD pre-replay payload.
@@ -147,9 +147,9 @@ def _use_camp2p_dp_padding(attention_size: int, ffn_size: int) -> Iterator[None]
     # Patch reason: native execute calls this module-level function before input
     # preparation; no runner method exposes that boundary.
     # Patch functionality: apply CAMP2P group padding to the agreed eager batch.
-    # Signature: matches vLLM v0.30.0 dispatch_cg_and_sync_dp exactly.
+    # Signature: matches vLLM v0.32.0 dispatch_cg_and_sync_dp exactly.
     # Upstream source: vllm/v1/worker/gpu/dp_utils.py;
-    # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
     # Delegation exception: preserve native graph selection and DP collectives.
     # Removal plan: replace when native dispatch exposes a padding callback.
     def dispatch_cg_and_sync_dp(
@@ -165,7 +165,7 @@ def _use_camp2p_dp_padding(attention_size: int, ffn_size: int) -> Iterator[None]
         parallel_config: ParallelConfig | None = None,
         allow_ubatching: bool = False,
         uniform_decode: bool = False,
-        dp_sync: DPSyncState | None = None,
+        dp_sync_state: DPSyncState | None = None,
     ) -> tuple[v2_cudagraph_utils.BatchExecutionDescriptor, DPSyncState | None]:
         desc, sync = original_dispatch(
             cudagraph_manager,
@@ -180,7 +180,7 @@ def _use_camp2p_dp_padding(attention_size: int, ffn_size: int) -> Iterator[None]
             parallel_config=parallel_config,
             allow_ubatching=allow_ubatching,
             uniform_decode=uniform_decode,
-            dp_sync=dp_sync,
+            dp_sync_state=dp_sync_state,
         )
         # ### PATCH START: equal CAMP2P strides for eager and graph fallback.
         if desc.cg_mode == CUDAGraphMode.NONE and sync is not None:
@@ -267,7 +267,8 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             raise
 
     def _afd_num_tokens_for_context(self, forward_context: ForwardContext) -> int:
-        # vLLM 0.30.0's token chain is
+        # Ascend bd42eea0 NPUModelRunner.execute_model delegates to the vLLM
+        # 5df63a72 GPUModelRunner.execute_model token chain:
         # scheduler_output.total_num_scheduled_tokens ->
         # dispatch_cg_and_sync_dp(..., need_eager=is_profile or skip_compiled)
         # -> ordinary ModelCudaGraphManager.dispatch() or the forced-eager
@@ -314,8 +315,11 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             self.connector.init_afd_connector()
 
     # Native MRV2 imports its factory by value; scope that exact binding while
-    # preserving Ascend's KV initialization (too large to copy). Eager DBO only.
-    # Signature matches Ascend 8d4409d6; restore the alias even on failure.
+    # preserving Ascend's KV initialization (too large to copy).
+    # Signature matches vllm_ascend/worker/v2/model_runner.py::
+    # NPUModelRunner.initialize_kv_cache at bd42eea0, which delegates to
+    # vllm/v1/worker/gpu/model_runner.py at 5df63a72.
+    # Restore the alias even on failure.
     def initialize_kv_cache(
         self,
         kv_cache_config: KVCacheConfig,
@@ -326,19 +330,21 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             super().initialize_kv_cache(kv_cache_config, kv_cache_allocation_context)
         # ### PATCH END: create the native NPU ubatch adapter.
 
-    # Patch reason: vLLM v0.30.0 prepares FULL graph inputs before each warmup
+    # Patch reason: vLLM 5df63a72 prepares FULL graph inputs before each warmup
     # and formal capture forward, outside torch.cuda.graph, but does not expose
     # that lifecycle to AFD's control plane.
     # Patch functionality: temporarily wrap the exact upstream input-preparation
     # symbol so each native FULL descriptor publishes one warmup and one capture
     # payload before its forward, while the provider installs the pending AFD
     # sidecar without sending control from inside torch.cuda.graph.
-    # Signature: matches vLLM v0.30.0 GPUModelRunner.capture_model exactly.
-    # Upstream source: vllm/v1/worker/gpu/model_runner.py,
-    # GPUModelRunner.capture_model; commit
-    # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
-    # Delegation exception: native capture remains wholly in super(); this
-    # wrapper owns only the temporary AFD lifecycle seam.
+    # Signature: matches Ascend NPUModelRunner.capture_model and its vLLM
+    # GPUModelRunner.capture_model delegate, including profile_only.
+    # Upstream: vllm_ascend/worker/v2/model_runner.py at
+    # bd42eea01d8312c4df469fabaed45f77a12df4d3; delegated
+    # vllm/v1/worker/gpu/model_runner.py at
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # Delegation exception: Ascend's wrappers and native capture remain in
+    # super(); this wrapper owns only the temporary AFD lifecycle seam.
     # Removal/upstream plan: delete this wrapper when vLLM exposes graph
     # warmup/capture metadata hooks around prepare_inputs_to_capture.
     def capture_model(self, *, profile_only: bool = False) -> int:
@@ -396,14 +402,16 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     # AFD must install its sidecar at that exact context-construction seam.
     # Patch functionality: delegate all request/input/Attention/KV/sampling/
     # output work to native V2 while temporarily installing AFD metadata.
-    # Signature: matches vLLM v0.30.0 GPUModelRunner.execute_model, including
+    # Signature: matches vLLM v0.32.0 GPUModelRunner.execute_model, including
     # the dummy-state parameters forwarded through Ascend NPUModelRunnerV2.
     # Upstream source: vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.execute_model; commit
-    # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be. Ascend delegates this contract
+    # in vllm_ascend/worker/v2/model_runner.py at
+    # bd42eea01d8312c4df469fabaed45f77a12df4d3.
     # Delegation exception: the upstream method is intentionally not copied;
     # only this narrow provider/profiler wrapper is AFD-specific.
-    # Async CAM uses the v0.30 native DP opt-out for requests and profile/dummy
+    # Async CAM uses the native DP opt-out for requests and profile/dummy
     # execution. The scope leaves TP collectives and the configured topology intact.
     # Removal/upstream plan: delete this wrapper when vLLM exposes a plugin
     # ForwardContext/set_forward_context sidecar/provider hook.
@@ -417,6 +425,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         is_profile: bool = False,
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
+        randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         # ### PATCH START: scope AFD metadata provider/replay and profiler step.
         step_afd_npu_profiler(self.prof)
@@ -468,6 +477,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                     is_profile=is_profile,
                     context_len=context_len,
                     valid_dummy_state_slots=valid_dummy_state_slots,
+                    randomize_inputs=randomize_inputs,
                 )
         finally:
             self._afd_pending_metadata = previous_metadata
@@ -482,12 +492,14 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     # connector, pending metadata sidecar, or stage-local graph inputs.
     # Patch functionality: preserve delegated native cleanup and guarantee all
     # AFD cleanup layers run when any earlier layer raises.
-    # Signature: matches vLLM v0.30.0 GPUModelRunner.shutdown exactly.
-    # Upstream source: vllm/v1/worker/gpu/model_runner.py,
-    # GPUModelRunner.shutdown; commit
-    # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
-    # Delegation exception: native resource release remains in super().shutdown;
-    # this override contains only AFD-specific finalizers.
+    # Signature: matches Ascend NPUModelRunner.shutdown and its vLLM
+    # GPUModelRunner.shutdown delegate.
+    # Upstream: vllm_ascend/worker/v2/model_runner.py at
+    # bd42eea01d8312c4df469fabaed45f77a12df4d3; delegated
+    # vllm/v1/worker/gpu/model_runner.py at
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # Delegation exception: super().shutdown retains Ascend's C8-view cleanup
+    # and native resource release; this override has only AFD-specific finalizers.
     # Removal/upstream plan: delete this wrapper if AFD-owned lifecycle moves
     # to a shared composition/factory owner; it never copies native cleanup.
     def shutdown(self) -> None:

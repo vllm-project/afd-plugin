@@ -168,9 +168,10 @@ class AFDAttentionFusedMoE(RemoteFFNProxy):
         external_routing: bool,
     ) -> None:
         super().__init__(layer_idx=layer_idx)
-        # v0.30 routing contract: the experts runner consumes transported
-        # router_logits only when its gate is None (external routing); a held
-        # gate routes internally and ignores the forwarded logits argument.
+        # vLLM 5df63a72 fused_moe/runner/moe_runner.py::MoERunner.forward
+        # enters _forward_impl, which consumes transported router_logits only
+        # when its gate is None (external routing); a held gate routes internally
+        # and ignores the forwarded logits argument.
         self.external_routing = external_routing
 
     # The native MoERunner boundary passes router_logits and input_ids; only
@@ -931,6 +932,23 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
         self.afd_config = parse_afd_config(vllm_config, validate=False)
         self.afd_role = self.afd_config.role
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+    # vLLM 5df63a7 model_loader/utils.py invokes this model hook after quant
+    # finalize. AFD's CAM GMM path still needs the scale that native MegaMoE drops.
+    def process_weights_after_loading(self) -> None:
+        # ### PATCH START: retain FFN gate-on-A W8A8 scales after quant finalize
+        if (
+            native.current_platform.device_type != "npu"
+            or self.afd_role != "ffn"
+            or not self.afd_config.compute_gate_on_attention
+        ):
+            return
+        from afd_plugin.model_executor.models.npu.deepseek_v2_attention_gate import (
+            prepare_attention_gate_w8a8_scales,
+        )
+
+        prepare_attention_gate_w8a8_scales(self.model.layers)
+        # ### PATCH END: retain FFN gate-on-A W8A8 scales after quant finalize
 
     def compute_ffn_output(
         self,

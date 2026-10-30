@@ -64,16 +64,11 @@ if TYPE_CHECKING:
 # Patch functionality: keep upstream startup flow while selecting EngineCoreProc
 # for AFD async Attention configs.
 # Signature: matches upstream; no added parameters.
-# NPU source: vLLM v0.30.0 (ced6857afa0ea7b2e3f0846a62e1394e90f15607).
-# Preserve its logging and post-construction signal-registration behavior.
 def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
     """Launch EngineCore busy loop in background process."""
     vllm_config: VllmConfig = kwargs["vllm_config"]
-    # ### PATCH START: retain the NPU v0.30 startup contract.
-    uses_npu_runtime = vllm_config.device_config.device_type == "npu"
-    if not uses_npu_runtime and (logging_config := vllm_config.logging_config):
+    if logging_config := getattr(vllm_config, "logging_config", None):
         engine_core_module.configure_logging(logging_config)
-    # ### PATCH END: retain the NPU v0.30 startup contract.
 
     # Ensure we can serialize transformer config after spawning
     engine_core_module.maybe_register_config_serialize_by_value()
@@ -151,24 +146,18 @@ def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
             if signal_callback is not None:
                 signal_callback.trigger()
 
-        # ### PATCH START: preserve the NPU v0.30 signal-registration boundary.
-        if not uses_npu_runtime:
-            engine_core_module.signal.signal(
-                engine_core_module.signal.SIGTERM, signal_handler
-            )
-            engine_core_module.signal.signal(
-                engine_core_module.signal.SIGINT, signal_handler
-            )
-        # ### PATCH END: preserve the NPU v0.30 signal-registration boundary.
+        engine_core_module.signal.signal(
+            engine_core_module.signal.SIGTERM, signal_handler
+        )
+        engine_core_module.signal.signal(
+            engine_core_module.signal.SIGINT, signal_handler
+        )
 
         parallel_config.data_parallel_index = dp_rank
         if data_parallel and vllm_config.model_config.is_moe:
             # Set data parallel rank for this engine process.
             parallel_config.data_parallel_rank = dp_rank
             # ### PATCH START: AFD async-DP Attention engine selection
-            # Async-DP Attention ranks are connector-driven, so use the regular
-            # EngineCoreProc instead of DPEngineCoreProc while keeping the
-            # original DP rank metadata.
             if _is_afd_async_attention_config(vllm_config):
                 engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
             else:
@@ -194,16 +183,6 @@ def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         # Arm the wakeup callback only now that input_queue exists, so a
         # later signal can still wake an idle busy loop.
         signal_callback = engine_core_module.SignalCallback(wakeup_engine)
-
-        # ### PATCH START: install NPU handlers after its engine exists.
-        if uses_npu_runtime:
-            engine_core_module.signal.signal(
-                engine_core_module.signal.SIGTERM, signal_handler
-            )
-            engine_core_module.signal.signal(
-                engine_core_module.signal.SIGINT, signal_handler
-            )
-        # ### PATCH END: install NPU handlers after its engine exists.
 
         engine_core.run_busy_loop()
 
@@ -253,8 +232,6 @@ def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
 # Patch functionality: preserve upstream engine launch behavior but disable wave
 # coordination for AFD async-DP configs.
 # Signature: matches upstream; no added parameters.
-# NPU source: vLLM v0.30.0 (ced6857afa0ea7b2e3f0846a62e1394e90f15607).
-# Its coordinator has no logging_config argument or bind-time port store.
 @contextmanager
 def launch_core_engines(
     vllm_config: VllmConfig,
@@ -264,9 +241,6 @@ def launch_core_engines(
 ) -> Iterator[CoreEngineLaunch]:
     """Launch engine and DP coordinator processes as needed."""
     parallel_config = vllm_config.parallel_config
-    # ### PATCH START: select the pinned backend's coordinator contract.
-    uses_npu_runtime = vllm_config.device_config.device_type == "npu"
-    # ### PATCH END: select the pinned backend's coordinator contract.
     dp_size = parallel_config.data_parallel_size
     local_engine_count = parallel_config.data_parallel_size_local
     local_start_index = parallel_config.data_parallel_rank_local
@@ -293,21 +267,15 @@ def launch_core_engines(
     )
 
     if run_coordinator:
-        # ### PATCH START: AFD wave policy with backend-pinned logging.
-        enable_wave_coordination = (
-            vllm_config.model_config.is_moe and not is_afd_async_dp(vllm_config)
+        coordinator = engine_utils_module.DPCoordinator(
+            parallel_config,
+            # ### PATCH START: AFD async-DP coordinator wave mode
+            enable_wave_coordination=(
+                vllm_config.model_config.is_moe and not is_afd_async_dp(vllm_config)
+            ),
+            # ### PATCH END: AFD async-DP coordinator wave mode
+            logging_config=vllm_config.logging_config,
         )
-        if uses_npu_runtime:
-            coordinator = engine_utils_module.DPCoordinator(
-                parallel_config, enable_wave_coordination=enable_wave_coordination
-            )
-        else:
-            coordinator = engine_utils_module.DPCoordinator(
-                parallel_config,
-                enable_wave_coordination=enable_wave_coordination,
-                logging_config=vllm_config.logging_config,
-            )
-        # ### PATCH END: AFD wave policy with backend-pinned logging.
 
         addresses.coordinator_input, addresses.coordinator_output = (
             coordinator.get_engine_socket_addresses()
@@ -325,10 +293,8 @@ def launch_core_engines(
     # Hold a coordination TCPStore (alive for this frame) so engines pick DP
     # master ports at bind time; pre-allocated ports can be taken before use.
     coord_store = None
-    # ### PATCH START: retain the NPU v0.30 coordinator port lifecycle.
     if (
-        not uses_npu_runtime
-        and dp_size > 1
+        dp_size > 1
         and not offline_mode
         and dp_rank == 0
         and local_engine_count > 0
@@ -340,7 +306,6 @@ def launch_core_engines(
             host, 0, is_master=True, world_size=-1, wait_for_workers=False
         )
         parallel_config._coord_store_port = coord_store.port
-    # ### PATCH END: retain the NPU v0.30 coordinator port lifecycle.
 
     if parallel_config.data_parallel_backend == "ray":
         engine_utils_module.logger.info("Starting ray-based data parallel backend")

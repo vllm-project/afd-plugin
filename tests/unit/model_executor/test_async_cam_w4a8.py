@@ -400,7 +400,7 @@ def model_weights_method(monkeypatch):
         ],
         type_ignores=[],
     )
-    namespace: dict[str, object] = {}
+    namespace: dict[str, object] = {"cast": cast, "torch": torch}
     exec(
         compile(ast.fix_missing_locations(module), "<model-weights>", "exec"), namespace
     )

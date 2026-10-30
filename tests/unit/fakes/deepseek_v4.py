@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import torch
 from torch import nn
+from vllm import forward_context
 from vllm.forward_context import set_forward_context
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.v1.worker import workspace
@@ -38,6 +39,11 @@ def profile_attention(compress_ratio, error=None):
 
 class WorkspaceCase:
     def __init__(self, monkeypatch, *, error=None):
+        monkeypatch.setattr(
+            forward_context.current_platform,
+            "set_additional_forward_context",
+            lambda *args, **kwargs: {},
+        )
         self.ubatch = 0
         self.manager = workspace.WorkspaceManager(torch.device("cpu"), 2, num_lanes=2)
         monkeypatch.setattr(workspace, "_manager", self.manager)
