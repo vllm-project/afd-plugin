@@ -50,6 +50,9 @@ from tests.e2e.process_utils import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ASYNC_AFD_CONNECTOR = "CAMAsyncAFDConnector"
+NPU_EAGER_DBO_SCENARIO = "afd-eager-dbo-2a2f"
+NPU_EAGER_DBO_DECODE_THRESHOLD = 32
+NPU_EAGER_DBO_PREFILL_THRESHOLD = 512
 ASYNC_CAM_SCENARIO = "afd-eager-async-cam"
 ASYNC_CAM_ATTENTION_RANKS = 2
 ASYNC_CAM_FFN_RANKS = 2
@@ -349,6 +352,7 @@ def parse_args() -> argparse.Namespace:
             "afd-graph-2a1f",
             "afd-graph-dbo-2a1f",
             "afd-eager-2a2f",
+            NPU_EAGER_DBO_SCENARIO,
             "afd-graph-2a2f",
             "afd-graph-dbo-2a2f",
             ASYNC_CAM_SCENARIO,
@@ -476,6 +480,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-graph-2a1f": (False, True, False, 2, 1),
         "afd-graph-dbo-2a1f": (False, True, True, 2, 1),
         "afd-eager-2a2f": (False, False, False, 2, 2),
+        NPU_EAGER_DBO_SCENARIO: (False, False, True, 2, 2),
         "afd-graph-2a2f": (False, True, False, 2, 2),
         "afd-graph-dbo-2a2f": (False, True, True, 2, 2),
         ASYNC_CAM_SCENARIO: (
@@ -602,7 +607,11 @@ def configure_scenario(args: argparse.Namespace) -> None:
             if is_dsv4_gpu
             else DEFAULT_CUDAGRAPH_CAPTURE_SIZE
         )
-    if enable_dbo:
+    if args.scenario == NPU_EAGER_DBO_SCENARIO:
+        # This opt-in eager cell qualifies DBO at the native 0.32 thresholds.
+        args.dbo_decode_token_threshold = NPU_EAGER_DBO_DECODE_THRESHOLD
+        args.dbo_prefill_token_threshold = NPU_EAGER_DBO_PREFILL_THRESHOLD
+    elif enable_dbo:
         # vLLM 0.30 validates that both DBO thresholds are at least the
         # microbatch count (2), so a decode threshold of 1 is rejected.
         args.dbo_decode_token_threshold = 2
@@ -649,6 +658,8 @@ def validate_topology(
         return
     if args.scenario in V2_SCENARIOS and args.device_backend != "gpu":
         raise ValueError("ModelRunnerV2 E2E scenarios require GPU")
+    if args.scenario == NPU_EAGER_DBO_SCENARIO and args.device_backend != "npu":
+        raise ValueError("Lite eager DBO scenario requires NPU")
     if (
         args.scenario in (ASYNC_CAM_SCENARIO, ASYNC_UBATCH_SCENARIO)
         and args.device_backend != "npu"
