@@ -74,8 +74,11 @@ __aicore__ inline bool SyncExpert(uint32_t expert, uint32_t experts) {
 }
 struct ReceiveRound {
     uint32_t begin[MAX_EXPERTS + 1];
+    uint32_t active[MAX_EXPERTS];
+    uint32_t activeCount = 0, expertCount;
     uint32_t source, offset, total;
     __aicore__ ReceiveRound(GM_ADDR scratch, const Cam::NativeMegaWorkspace &w, uint32_t experts) {
+        expertCount = experts;
         source = Load(scratch + w.batch, 1);
         offset = Load(scratch + w.batch, 3);
         total = Load(scratch + w.batch, 4) - offset;
@@ -85,9 +88,20 @@ struct ReceiveRound {
             // Invalidate once per cache line after the preceding receive round reused it.
             if (e % 8 == 0) Load(scratch + w.counts, e);
             begin[e + 1] = begin[e] + counts[e];
+            activeCount += begin[e + 1] != begin[e];
+        }
+        // Keep dense rounds on the original expert order without writing an index list.
+        if (activeCount != experts) {
+            uint32_t index = 0;
+            for (uint32_t e = 0; e < experts; ++e) {
+                if (Rows(e)) active[index++] = e;
+            }
         }
     }
     __aicore__ uint32_t Rows(uint32_t e) const { return begin[e + 1] - begin[e]; }
+    __aicore__ uint32_t Expert(uint32_t index) const {
+        return activeCount == expertCount ? index : active[index];
+    }
 };
 
 // Same Catlass block implementation, preload depth, K shuffle and expert swizzle as MC2.
@@ -107,12 +121,13 @@ __aicore__ inline void Compute(GM_ADDR scratch, const Cam::NativeMegaWorkspace &
     Mmad mm(resource);
     Scheduler scheduler;
     uint32_t startCore = 0, syncGroup = 0;
-    for (uint32_t e = 0; e < t.config[6]; ++e) {
+    for (uint32_t index = 0; index < round.activeCount; ++index) {
+        const uint32_t e = round.Expert(index);
         const uint32_t rows = 2 * round.Rows(e);
         if (second) {
-            if (e == 0 || SyncExpert(e - 1, t.config[6])) CrossCoreWaitFlag<2>(ACT_READY);
+            if (index == 0 || SyncExpert(index - 1, round.activeCount)) CrossCoreWaitFlag<2>(ACT_READY);
         } else {
-            CrossCoreWaitFlag<2>(e / FLAG_SETS);
+            CrossCoreWaitFlag<2>(index / FLAG_SETS);
         }
         scheduler.Update(Coord{rows, n, k}, Catlass::MatrixCoord{CUBE_M, CUBE_N});
         const auto jobs = scheduler.GetCoreLoops();
@@ -124,21 +139,21 @@ __aicore__ inline void Compute(GM_ADDR scratch, const Cam::NativeMegaWorkspace &
             const auto coord = scheduler.GetBlockCoord(job);
             const auto actual = scheduler.GetActualBlockShape(coord);
             const uint32_t m = coord.m() * CUBE_M, col = coord.n() * CUBE_N;
-            const int32_t done = second && job + t.aicNum >= jobs ? int32_t(e) : -1;
+            const int32_t done = second && job + t.aicNum >= jobs ? int32_t(index) : -1;
             mm(scale[e * n + col], VectorLayout{n},
                a[(2ULL * round.begin[e] + m) * k], layoutA,
                expertB[layoutB.GetOffset(Catlass::MatrixCoord{0, col})], layoutB,
                out[(2ULL * round.begin[e] + m) * n + col], layoutC, actual,
                ::Callback{}, ::Callback{}, done, 0);
         }
-        if (!second && SyncExpert(e, t.config[6])) {
+        if (!second && SyncExpert(index, round.activeCount)) {
             mm.SynchronizeBlock();
             mm.Finalize(syncGroup++, GMM1_READY);
         }
         startCore = (startCore + jobs) % t.aicNum;
     }
     mm.SynchronizeBlock();
-    if (second) mm.Finalize(t.config[6] - 1, 0);
+    if (second) mm.Finalize(int32_t(round.activeCount) - 1, 0);
 }
 } // namespace AfdNativeMega
 

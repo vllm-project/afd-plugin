@@ -80,6 +80,7 @@ __aicore__ inline void PullAndPrepare(GM_ADDR scratch, const Cam::NativeMegaWork
     // The old INT8 staging allocation now holds the per-row return address cache.
     routes.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(scratch + w.x));
     uint64_t block = 0;
+    uint32_t active = 0;
     for (uint32_t e = 0; e < experts; ++e) {
         const uint32_t rows = round.Rows(e), id = GetBlockIdx();
         const uint32_t perCore = rows / t.aivNum, tail = rows % t.aivNum;
@@ -89,7 +90,11 @@ __aicore__ inline void PullAndPrepare(GM_ADDR scratch, const Cam::NativeMegaWork
             const uint32_t index = 5 + tp + s * experts + e;
             const uint64_t sourceRows = meta.GetValue(index);
             const uint64_t prefix = meta.GetValue(5 + s);
-            const auto slice = Cam::Pull::Intersect(block, sourceRows, round.offset + first, count);
+            // Even an empty slice may precede this round's offset in the source window.
+            meta.SetValue(5 + s, prefix + sourceRows);
+            block += sourceRows;
+            if (!rows) continue;
+            const auto slice = Cam::Pull::Intersect(block - sourceRows, sourceRows, round.offset + first, count);
             if (slice.count) {
                 GlobalTensor<int8_t> remote;
                 const auto window = Cam::Pull::Window(round.source + s, t.config[7]);
@@ -120,11 +125,10 @@ __aicore__ inline void PullAndPrepare(GM_ADDR scratch, const Cam::NativeMegaWork
                     SetFlag<HardEvent::MTE3_MTE2>(stage);
                 }
             }
-            meta.SetValue(5 + s, prefix + sourceRows);
-            block += sourceRows;
         }
+        if (!rows) continue;
         SyncAll<true>();
-        CrossCoreSetFlag<2, PIPE_MTE3>(e / FLAG_SETS);
+        CrossCoreSetFlag<2, PIPE_MTE3>(active++ / FLAG_SETS);
     }
     for (uint32_t b = 0; b < 2; ++b) {
         WaitFlag<HardEvent::V_MTE2>(b);
@@ -320,8 +324,9 @@ __aicore__ inline void ActivateNative(GM_ADDR scratch, const Cam::NativeMegaWork
     out.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(scratch + w.a2));
     NativeActivation activation(resource, 2 * i);
     uint32_t begin = 0;
-    for (uint32_t e = 0; e < experts; ++e) {
-        if (!SyncExpert(e, experts)) continue;
+    for (uint32_t index = 0; index < round.activeCount; ++index) {
+        if (!SyncExpert(index, round.activeCount)) continue;
+        const uint32_t e = round.Expert(index);
         CrossCoreWaitFlag<2>(GMM1_READY);
         SyncAll<true>();
         if (begin == 0) {
@@ -356,8 +361,9 @@ __aicore__ inline void Activate(GM_ADDR scratch, const Cam::NativeMegaWorkspace 
     out.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(scratch + w.a2));
     Activation activation(resource, i);
     uint32_t groupBegin = 0, expert = 0, group = 0;
-    for (uint32_t e = 0; e < experts; ++e) {
-        if (!SyncExpert(e, experts)) continue;
+    for (uint32_t index = 0; index < round.activeCount; ++index) {
+        if (!SyncExpert(index, round.activeCount)) continue;
+        const uint32_t e = round.Expert(index);
         CrossCoreWaitFlag<2>(GMM1_READY);
         SyncAll<true>();
         const uint32_t rows = round.begin[e + 1] - groupBegin;
@@ -499,7 +505,8 @@ __aicore__ inline void Combine(GM_ADDR scratch, const Cam::NativeMegaWorkspace &
     Output output(resource, scratch + w.x, round.total);
     Scheduler scheduler;
     uint32_t startCore = 0, sync = 0;
-    for (uint32_t e = 0; e < t.config[6]; ++e) {
+    for (uint32_t index = 0; index < round.activeCount; ++index) {
+        const uint32_t e = round.Expert(index);
         scheduler.Update(Coord{2 * round.Rows(e), h, uint32_t(t.config[2])},
                          Catlass::MatrixCoord{CUBE_M, CUBE_N});
         const auto jobs = scheduler.GetCoreLoops();
@@ -507,7 +514,7 @@ __aicore__ inline void Combine(GM_ADDR scratch, const Cam::NativeMegaWorkspace &
         for (uint32_t job = first; job < jobs; job += t.aicNum) {
             const auto coord = scheduler.GetBlockCoord(job);
             const auto actual = scheduler.GetActualBlockShape(coord);
-            for (; sync <= e; ++sync) CrossCoreWaitFlag<2>(sync / FLAG_SETS);
+            for (; sync <= index; ++sync) CrossCoreWaitFlag<2>(sync / FLAG_SETS);
             // Identical AIC job ownership; each paired AIV handles 32 expanded MSD rows.
             const uint32_t blocks = (actual.m() + 31) / 32;
             const uint32_t half = blocks / 2;
@@ -521,7 +528,7 @@ __aicore__ inline void Combine(GM_ADDR scratch, const Cam::NativeMegaWorkspace &
         }
         startCore = (startCore + jobs) % t.aicNum;
     }
-    for (; sync < t.config[6]; ++sync) CrossCoreWaitFlag<2>(sync / FLAG_SETS);
+    for (; sync < round.activeCount; ++sync) CrossCoreWaitFlag<2>(sync / FLAG_SETS);
     output.Finalize();
 }
 } // namespace AfdNativeMega
