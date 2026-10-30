@@ -18,9 +18,8 @@ tests for GPU and Ascend NPU deployments.
 > This project is still experimental and needs more large-scale testing across
 > different hardware backends.
 
-The GPU target is **vLLM `v0.32.0`** at commit `5df63a72`. The Ascend
-integration is based on vLLM `v0.30.0` at `ced6857a` and vLLM-Ascend
-`8d4409d6`. The plugin does not modify the vLLM
+The GPU and Ascend target is **vLLM `v0.32.0`** at commit `5df63a72`.
+The Ascend integration also targets vLLM-Ascend `bd42eea0`. The plugin does not modify the vLLM
 source tree. AFD behavior is installed through the `vllm.general_plugins` entry
 point, `--additional-config`, automatically selected role workers, plugin-owned
 model wrappers, and narrow version-scoped compatibility shims.
@@ -48,7 +47,7 @@ Model support:
 | Model family | Registered architectures | Plugin model wrappers | Notes |
 | --- | --- | --- | --- |
 | DeepSeekV2 / DeepSeekV3 / DeepSeekV3.2 | `DeepseekForCausalLM`, `DeepseekV2ForCausalLM`, `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | `AFDDeepseekForCausalLM`, `AFDDeepseekV2ForCausalLM`, `AFDDeepseekV3ForCausalLM` | DeepSeekV3.2 uses `AFDDeepseekV3ForCausalLM`. Each AFD role constructs and loads only its role-required model components, while shared embedding, normalization, and output components remain available where required by the model lifecycle. |
-| DeepSeek V4 Flash | `DeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` | CUDA synchronous `P2pNcclAFDConnector`; see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix) for backend-specific validation limits. |
+| DeepSeek V4 Flash | `DeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` | CUDA synchronous and Ascend CAM paths; see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix) for backend-specific validation limits. |
 | Qwen3 MoE | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | CUDA with `compute_gate_on_attention=false`. |
 | Qwen3.5 / Qwen3.6 MoE | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | CUDA text-only Qwen3.6-35B-A3B with `--language-model-only`, native DP4/TP1/EP4, and synchronous AFD 2A1F. Eager and graph execution remain supported; GDN DBO is temporarily withdrawn; native hybrid/multimodal validation applies. Earlier DBO experiments are historical evidence only; see the [E2E limits](docs/design/module/e2e_testing.md). |
 
@@ -70,9 +69,10 @@ Known gaps:
 
 - The GPU target is exactly vLLM `0.32.0`; other vLLM versions are not
   claimed as supported on GPU.
-- Historical NPU hardware evidence covers representative DeepSeek-V2-Lite and DSV4
-  Flash W4A8 deployments; see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix).
-  Other models and topologies remain unverified.
+- NPU hardware evidence covers the specific single-Pod DeepSeek-V2-Lite and
+  DSV4 configurations in the [0.32 validation record](docs/npu/VLLM_032_VALIDATION.md).
+  Other models and topologies remain unverified. AFD post-request shutdown
+  failures remain open; successful inference does not imply graceful shutdown.
 - Synchronous DSV4 E2E profiles are smoke cases; A5 concurrent answers remain
   incorrect. See the [profile limits](tests/e2e/README.md#dsv4-flash-sync-camp2p-concurrent-requests-local-4-or-16-npus).
 - GPU Attention requires native ModelRunnerV2; there is no GPU V1 fallback.
@@ -122,20 +122,21 @@ The optional GPU extra pins `vllm==0.32.0`.
 
 ### Ascend NPU installation
 
-The Ascend integration uses the source pair below. Historical Ascend 910C /
-Atlas A3 validation is recorded in the
-[NPU validation results](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923);
-see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix)
-for the tested scope.
+The Ascend integration uses the source pair below. See the
+[0.32 NPU validation record](docs/npu/VLLM_032_VALIDATION.md) for the tested
+scope and retained shutdown limitations. Earlier
+[0.30 results](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923)
+retain their historical environment and sample counts.
 Install a compatible driver and firmware, and confirm the devices with
 `npu-smi info`.
 
 | Component | Version |
 | --- | --- |
-| Python | `3.11` (the current package requires Python 3.11 or newer) |
-| vLLM | `0.30.0`, commit `ced6857afa0ea7b2e3f0846a62e1394e90f15607` |
-| vLLM-Ascend | commit [`8d4409d6`](https://github.com/vllm-project/vllm-ascend/commit/8d4409d6256d8a6729140ddcc0d1889e3f96cdd6) |
-| CANN / torch / torch-npu | Use the mutually compatible versions required by that vLLM-Ascend source snapshot. |
+| Python | Package range `3.11–3.13`; tested `3.12.13` |
+| vLLM | `0.32.0`, commit `5df63a7203cdb9328d824a27b682e77c7b9928be` |
+| vLLM-Ascend | commit [`bd42eea0`](https://github.com/vllm-project/vllm-ascend/commit/bd42eea01d8312c4df469fabaed45f77a12df4d3) |
+| Tested CANN / torch / torch-npu | `9.2` / `2.10.0+cpu` / `2.10.0.post7` |
+| Tested Triton Ascend / CAM | `3.6` / `1.3` |
 
 > Hardware evidence is scoped to the recorded models, configurations, and
 > sample counts; it does not cover every NPU deployment or guarantee clean
@@ -143,11 +144,9 @@ Install a compatible driver and firmware, and confirm the devices with
 
 #### Environment
 
-The Ascend environment targets vLLM-Ascend commit `8d4409d6` and vLLM
-`0.30.0`. The recorded A3 environment uses CANN 9.1.0, torch 2.10.0+cpu,
-and torch-npu 2.10.0.post4. The repository does not claim a released container
-tag for either target. Use the
-[installation guide at that source snapshot](https://github.com/vllm-project/vllm-ascend/blob/8d4409d6256d8a6729140ddcc0d1889e3f96cdd6/docs/source/getting_started/installation.md)
+The recorded A3 environment uses the pinned pair and stack above. The
+repository does not claim a released container tag for the Ascend target. Use the
+[installation guide at that source snapshot](https://github.com/vllm-project/vllm-ascend/blob/bd42eea01d8312c4df469fabaed45f77a12df4d3/docs/source/getting_started/installation.md)
 to prepare a matching A3/openEuler environment, then install AFD from the
 repository root.
 
@@ -185,7 +184,7 @@ PY
 
 After `AFD_OPS_OK`, the environment is ready to run the NPU examples and E2E
 tests. See the
-[synchronous NPU recipe](recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md).
+[NPU validation and test entry points](docs/npu/VLLM_032_VALIDATION.md).
 For implementation details, see the
 [Attention runtime design](docs/design/module/attention_runtime.md) and
 [FFN runtime design](docs/design/module/ffn_runtime.md).

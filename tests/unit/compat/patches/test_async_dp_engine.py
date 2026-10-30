@@ -270,7 +270,10 @@ def test_async_dp_engine_patch_preserves_non_async_moe_dp(monkeypatch):
 
 
 @pytest.mark.parametrize("async_dp", [False, True])
-def test_engine_honors_shutdown_received_during_construction(monkeypatch, async_dp):
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+def test_engine_honors_shutdown_received_during_construction(
+    monkeypatch, async_dp, device_type
+):
     patch = _load_patch_module(monkeypatch)
     core = sys.modules["vllm.v1.engine.core"]
     handlers: dict[int, Callable[[int, None], None] | int] = {}
@@ -294,7 +297,9 @@ def test_engine_honors_shutdown_received_during_construction(monkeypatch, async_
         monkeypatch.setattr(patch, "EngineCoreProc", interrupted_engine)
     else:
         monkeypatch.setattr(core, "DPEngineCoreProc", interrupted_engine)
-    patch.run_engine_core(vllm_config=_config(async_dp=async_dp))
+    patch.run_engine_core(
+        vllm_config=_config(async_dp=async_dp, device_type=device_type)
+    )
 
     assert core.last_engine.shutdown_state == core.EngineShutdownState.REQUESTED
     assert core.last_engine.shutdown_called is True
@@ -374,35 +379,23 @@ def test_non_afd_launch_keeps_upstream_wave_coordination(monkeypatch):
 
 
 @pytest.mark.parametrize("async_dp", [False, True])
-def test_npu_launch_keeps_v030_coordinator_contract(monkeypatch, async_dp):
+def test_npu_launch_uses_target_coordinator_contract(monkeypatch, async_dp):
     patch = _load_patch_module(monkeypatch)
-    utils = sys.modules["vllm.v1.engine.utils"]
-
-    class NPUCoordinator(utils.DPCoordinator):  # type: ignore[name-defined]
-        def __init__(self, parallel_config, enable_wave_coordination=True):
-            super().__init__(parallel_config, enable_wave_coordination)
-
-    def unexpected_store(*_args, **_kwargs):
-        pytest.fail("v0.30 must retain its existing coordinator port lifecycle")
-
-    monkeypatch.setattr(utils, "DPCoordinator", NPUCoordinator)
-    monkeypatch.setattr(
-        sys.modules["vllm.distributed.utils"], "create_tcp_store", unexpected_store
-    )
     config = _config(async_dp=async_dp, device_type="npu")
-    del config.logging_config
     addresses = SimpleNamespace()
     with patch.launch_core_engines(config, object, False, addresses) as launch:
         assert launch.coordinator.enable_wave_coordination is not async_dp
         assert launch.addresses.coordinator_input == "coord-input"
         assert launch.addresses.coordinator_output == "coord-output"
         assert launch.addresses.frontend_stats_publish_address == "stats-pub"
+        assert config.parallel_config._coord_store_port == 41234
 
 
-def test_npu_engine_starts_without_v032_logging_config(monkeypatch):
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+def test_engine_starts_without_optional_logging_config(monkeypatch, device_type):
     patch = _load_patch_module(monkeypatch)
     core = sys.modules["vllm.v1.engine.core"]
-    config = _config(device_type="npu")
+    config = _config(device_type=device_type)
     del config.logging_config
 
     patch.run_engine_core(vllm_config=config)
@@ -412,8 +405,9 @@ def test_npu_engine_starts_without_v032_logging_config(monkeypatch):
 
 
 @pytest.mark.parametrize("async_dp", [False, True])
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
 def test_dp_launch_keeps_coordination_store_alive_until_context_exit(
-    monkeypatch, async_dp
+    monkeypatch, async_dp, device_type
 ):
     patch = _load_patch_module(monkeypatch)
     references = []
@@ -429,7 +423,7 @@ def test_dp_launch_keeps_coordination_store_alive_until_context_exit(
     monkeypatch.setattr(
         sys.modules["vllm.distributed.utils"], "create_tcp_store", create_store
     )
-    config = _config(async_dp=async_dp)
+    config = _config(async_dp=async_dp, device_type=device_type)
     with patch.launch_core_engines(config, object, False, SimpleNamespace()):
         assert config.parallel_config._coord_store_port == Store.port
         assert references[0]() is not None

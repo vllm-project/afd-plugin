@@ -6,7 +6,7 @@
 import ast
 import importlib
 import inspect
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import get_type_hints
@@ -66,6 +66,25 @@ def _upstream_signature(module, owner, symbol, extra_namespace):
         namespace,
     )
     return _resolved_signature(namespace[symbol], namespace)
+
+
+@contextmanager
+def _use_installed_patch(binding, symbol, marker_name, install):
+    """Exercise an installer while restoring its exact prior descriptor/marker."""
+    original = inspect.getattr_static(binding, symbol)
+    had_marker = marker_name in vars(binding)
+    previous_marker = vars(binding).get(marker_name)
+    if had_marker:
+        delattr(binding, marker_name)
+    try:
+        assert install()
+        yield
+    finally:
+        setattr(binding, symbol, original)
+        if had_marker:
+            setattr(binding, marker_name, previous_marker)
+        elif marker_name in vars(binding):
+            delattr(binding, marker_name)
 
 
 @pytest.mark.parametrize(
@@ -218,24 +237,116 @@ def _upstream_signature(module, owner, symbol, extra_namespace):
             "fullgraph-replay",
             id="fullgraph-replay",
         ),
+        pytest.param(
+            "vllm_ascend.ascend_config",
+            None,
+            "init_ascend_config",
+            "npu.ascend_config",
+            None,
+            id="npu-config-factory",
+        ),
+        pytest.param(
+            "vllm_ascend.patch.platform.patch_engine_core",
+            None,
+            "_run_engine_core_patch_func",
+            "npu.ascend_config:run_afd_ascend_engine_core",
+            None,
+            id="npu-child-engine",
+        ),
+        pytest.param(
+            GPU_RUNNER,
+            None,
+            "maybe_build_ubatch_runner",
+            None,
+            "npu-dbo-factory",
+            id="npu-dbo-factory",
+        ),
+        pytest.param(
+            GPU_RUNNER,
+            None,
+            "dispatch_cg_and_sync_dp",
+            None,
+            "npu-dbo-dispatch",
+            id="npu-dbo-dispatch",
+        ),
+        pytest.param(
+            GPU_UBATCH,
+            None,
+            "_slice_input_batch",
+            None,
+            "npu-dbo-slicing",
+            id="npu-dbo-slicing",
+        ),
+        pytest.param(
+            GPU_UBATCH,
+            None,
+            "merge_ubatch_outputs",
+            None,
+            "npu-dbo-output-merge",
+            id="npu-dbo-output-merge",
+        ),
+        pytest.param(
+            "vllm.v1.worker.gpu.cudagraph_utils",
+            "ModelCudaGraphManager",
+            "run_fullgraph",
+            None,
+            "npu-fullgraph-replay",
+            id="npu-fullgraph-replay",
+        ),
+        pytest.param(
+            "vllm_ascend.platform",
+            "NPUPlatform",
+            "check_and_update_config",
+            None,
+            "npu-platform-config",
+            id="npu-platform-config",
+        ),
+        pytest.param(
+            "vllm_ascend.attention.mla_v1",
+            None,
+            "get_graph_params",
+            None,
+            "npu-mla-graph-params",
+            id="npu-mla-graph-params",
+        ),
     ],
 )
-def test_patch_preserves_upstream_signature(
+def test_patch_preserves_upstream_signature(  # long-test: scoped table bindings.
     target_module, owner, symbol, adapter_module, scope_name
 ):
     pytest.importorskip("torch")
     pytest.importorskip("vllm")
-    if scope_name == "camp2p-dispatch":
+    # Ascend's platform module replaces TYPE_CHECKING-only config names with
+    # None at runtime. Resolve the source annotation against its real class.
+    from vllm.config import VllmConfig  # noqa: F401
+
+    if (
+        target_module.startswith("vllm_ascend.")
+        or adapter_module is not None
+        and adapter_module.startswith("npu.")
+        or scope_name is not None
+        and scope_name.startswith("npu-")
+        or scope_name == "camp2p-dispatch"
+    ):
         pytest.importorskip("torch_npu")
         pytest.importorskip("vllm_ascend")
     if scope_name == "capture-inputs":
         from vllm.v1.worker.gpu.pcp_manager import PCPManager  # noqa: F401
     target = importlib.import_module(target_module)
-    expected_module = (
-        importlib.import_module(GPU_DP) if scope_name == "camp2p-dispatch" else target
-    )
+    # These call sites import the native definition by value. Its defining
+    # module owns the AST, even if the call-site alias has already been patched.
+    if scope_name in {"camp2p-dispatch", "npu-dbo-dispatch"}:
+        expected_module = importlib.import_module(GPU_DP)
+    elif scope_name == "npu-dbo-factory":
+        expected_module = importlib.import_module(GPU_UBATCH)
+    elif scope_name == "npu-mla-graph-params":
+        expected_module = importlib.import_module("vllm_ascend.compilation.acl_graph")
+    else:
+        expected_module = target
     expected = _upstream_signature(expected_module, owner, symbol, locals())
     binding = target
+    patch_symbol = symbol
+    auxiliary_bindings = []
     if scope_name == "capture-inputs":
         from afd_plugin.v1.worker import attention_model_runner_v2 as adapter
 
@@ -251,8 +362,11 @@ def test_patch_preserves_upstream_signature(
         native_class = getattr(target, owner)
         binding = native_class.__new__(native_class)
         scope = adapter._use_flashmla_workspace_slot(binding, 0)
-    elif scope_name in {"ubatch-prepare", "fullgraph-replay"}:
-        from afd_plugin.v1.worker import attention_model_runner_v2 as adapter
+    elif scope_name in {"ubatch-prepare", "fullgraph-replay", "npu-fullgraph-replay"}:
+        if scope_name == "npu-fullgraph-replay":
+            from afd_plugin.v1.worker.npu import attention_model_runner_v2 as adapter
+        else:
+            from afd_plugin.v1.worker import attention_model_runner_v2 as adapter
 
         native_class = getattr(target, owner)
         binding = native_class.__new__(native_class)
@@ -268,12 +382,57 @@ def test_patch_preserves_upstream_signature(
             scope = adapter._use_afd_fullgraph_replay_hook(
                 SimpleNamespace(cudagraph_manager=binding), 1
             )
+    elif scope_name in {
+        "npu-dbo-factory",
+        "npu-dbo-dispatch",
+        "npu-dbo-slicing",
+        "npu-dbo-output-merge",
+    }:
+        from afd_plugin.compat.patches.npu import mrv2_ubatching as adapter
+
+        if scope_name == "npu-dbo-factory":
+            scope = adapter.use_npu_ubatch_factory(SimpleNamespace())
+            ubatch_module = importlib.import_module(GPU_UBATCH)
+            auxiliary_bindings.append(
+                (
+                    ubatch_module,
+                    "create_sm_control_context",
+                    ubatch_module.create_sm_control_context,
+                )
+            )
+        elif scope_name == "npu-dbo-dispatch":
+            scope = adapter.use_async_cam_dbo_dispatch()
+        elif scope_name == "npu-dbo-slicing":
+            scope = adapter.use_npu_input_batch_slicing()
+        else:
+            scope = adapter.use_npu_ubatch_output_merge()
+    elif scope_name == "npu-platform-config":
+        from afd_plugin.compat.patches.npu import ascend_platform as adapter
+
+        binding = target.NPUPlatform
+        scope = _use_installed_patch(
+            binding,
+            symbol,
+            adapter._ASCEND_PLATFORM_PATCH_ATTR,
+            adapter.apply_afd_ascend_dbo_config_patch,
+        )
+    elif scope_name == "npu-mla-graph-params":
+        from afd_plugin.compat.patches.npu import mla_graph as adapter
+
+        scope = _use_installed_patch(
+            binding,
+            symbol,
+            adapter._MLA_GRAPH_PATCH_ATTR,
+            adapter.apply_afd_mla_graph_patch,
+        )
     else:
-        adapter = importlib.import_module(f"{PATCHES}.{adapter_module}")
+        adapter_name, _, renamed_symbol = adapter_module.partition(":")
+        adapter = importlib.import_module(f"{PATCHES}.{adapter_name}")
+        patch_symbol = renamed_symbol or symbol
         scope = nullcontext()
     original = getattr(binding, symbol) if scope_name else None
     with scope:
-        patched = getattr(binding if scope_name else adapter, symbol)
+        patched = getattr(binding if scope_name else adapter, patch_symbol)
         callable_patch = patched.__func__ if inspect.ismethod(patched) else patched
         namespace = vars(target) | vars(adapter) | locals()
         if target_module == ENGINE_CORE and symbol == "run_busy_loop":
@@ -287,6 +446,11 @@ def test_patch_preserves_upstream_signature(
             )
         assert _resolved_signature(callable_patch, namespace) == expected
         if scope_name:
-            assert patched is not original
+            original_callable = (
+                original.__func__ if inspect.ismethod(original) else original
+            )
+            assert callable_patch is not original_callable
     if scope_name:
         assert getattr(binding, symbol) == original
+    for module, name, original_value in auxiliary_bindings:
+        assert getattr(module, name) == original_value

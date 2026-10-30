@@ -22,7 +22,7 @@ def _make_native_dplb_client(
 ) -> DPLBAsyncMPClient:
     """Build the smallest client state needed by vLLM's native DPLB method.
 
-    vLLM 0.30.0 tracks per-engine counts as ``[waiting, running,
+    vLLM 5df63a72 tracks per-engine counts as ``[waiting, running,
     kv_cache_usage]`` and optimistic in-flight requests in a Counter.
     """
 

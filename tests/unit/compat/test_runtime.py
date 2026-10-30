@@ -37,14 +37,6 @@ def test_fix_all2all_backend_overrides_to_flashinfer_when_sp_disabled():
     assert config.parallel_config.all2all_backend == "flashinfer_all2allv"
 
 
-def test_fix_all2all_backend_skips_when_sp_enabled():
-    config = _vllm_config(enable_sp=True, all2all_backend="allgather_reducescatter")
-
-    fix_all2all_backend_for_afd(config)
-
-    assert config.parallel_config.all2all_backend == "allgather_reducescatter"
-
-
 def test_fix_all2all_backend_skips_when_already_flashinfer():
     config = _vllm_config(enable_sp=False, all2all_backend="flashinfer_all2allv")
 

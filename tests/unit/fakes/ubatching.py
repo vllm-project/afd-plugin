@@ -134,3 +134,71 @@ class PreparedUBatchRunner:
             )
 
         return finish
+
+
+class LegacyNPUAttentionMetadataState:
+    """Expose the vLLM 0.30 attention-preparation signature on CPU."""
+
+    def __init__(self):
+        self.prepare_error = None
+
+    def prepare_attn(
+        self,
+        input_batch,
+        cudagraph_mode,
+        block_tables,
+        slot_mappings,
+        attn_groups,
+        kv_cache_config,
+        for_capture=False,
+        ubatch_idx=0,
+    ):
+        if self.prepare_error is not None:
+            raise self.prepare_error
+        return {
+            "kv0": SimpleNamespace(
+                positions=input_batch.positions,
+                slot_mapping=slot_mappings[0],
+                stage=ubatch_idx,
+            )
+        }
+
+
+class LegacyNPUUBatchRunner:
+    """Build native stage contexts without CUDA state or scheduling."""
+
+    num_ubatches = 2
+
+    def __init__(self, model_state, kv_cache_config):
+        self.model_state = model_state
+        self.kv_cache_config = kv_cache_config
+
+    def prepare(
+        self, input_batch, block_tables, slot_mappings, cg_mode, for_capture=False
+    ):
+        slices = create_ubatch_slices(input_batch, self.num_ubatches)
+        contexts = []
+        for stage, ubatch_slice in enumerate(slices):
+            slots = slot_mappings[:, ubatch_slice.token_slice]
+            metadata = self.model_state.prepare_attn(
+                replace(
+                    input_batch,
+                    positions=input_batch.positions[ubatch_slice.token_slice],
+                ),
+                cg_mode,
+                block_tables,
+                slots,
+                [],
+                self.kv_cache_config,
+                for_capture=for_capture,
+                ubatch_idx=stage,
+            )
+            contexts.append(
+                ForwardContext(
+                    no_compile_layers={},
+                    attn_metadata=metadata,
+                    slot_mapping={"kv0": slots[0]},
+                    additional_kwargs={"platform_stage": stage},
+                )
+            )
+        return UBatchState(slices, contexts)

@@ -8,8 +8,8 @@ AFD connector implementations are grouped by backend:
   by `afd_plugin.connectors.npu.camp2p`, and `CAMAsyncAFDConnector` is implemented
   by `afd_plugin.connectors.npu.async_cam`.
 
-The GPU backend targets vLLM `0.32.0`; Ascend retains vLLM `0.30.0`
-and vLLM-Ascend `8d4409d6`. See the
+Both backends target vLLM `0.32.0`; Ascend additionally targets
+vLLM-Ascend `bd42eea0`. See the
 [runtime matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix)
 for tested configurations and backend-specific validation limits.
 

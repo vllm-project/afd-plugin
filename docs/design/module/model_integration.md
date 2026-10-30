@@ -21,7 +21,7 @@ validation_paths:
   - "tests/e2e/accuracy/**"
 upstream_refs:
   - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
-  - "NPU: vLLM 0.30.0 ced6857afa0ea7b2e3f0846a62e1394e90f15607"
+  - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "vLLM vllm.model_executor.models.deepseek_v2"
   - "vLLM vllm.model_executor.models.qwen3_moe"
   - "vLLM vllm.forward_context.ForwardContext"
@@ -166,8 +166,9 @@ separate from the optional routed W4A8 layered executor's unresolved nonzero
 
 The synchronous DSV4 E2E profiles check concurrent serving but disable answer
 checking; the A5 profile records incorrect concurrent answers. Async DSV4 has
-an exact-answer smoke case; current native DBO still requires model accuracy
-qualification. See
+an exact-answer smoke case; V4 true native DBO still requires model accuracy
+qualification. Lite two-stage DBO has the limited result recorded in the
+[0.32 validation record](../../npu/VLLM_032_VALIDATION.md). See
 [E2E testing](e2e_testing.md) and the [layered guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-layered-gmm-experimental-disabled-by-default).
 
 ### Qwen3 MoE CUDA boundary
