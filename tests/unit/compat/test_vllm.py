@@ -3,7 +3,7 @@
 # mypy: disable-error-code="attr-defined"
 
 import sys
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
 
@@ -11,54 +11,61 @@ from afd_plugin.compat import vllm as compat
 
 
 @pytest.mark.parametrize(
-    ("device_type", "version", "supported"),
+    ("version", "supported"),
     [
-        ("cuda", "0.32.0", True),
-        ("cuda", "0.32.0.dev42+g5df63a7", True),
-        ("cuda", "0.30.0", False),
-        ("cuda", "0.30.1", False),
-        ("cuda", "0.29.0", False),
-        ("cuda", "0.30.0.dev42+gced6857", False),
-        ("npu", "0.30.0", True),
-        ("npu", "0.30.0.dev42+gced6857", True),
-        ("npu", "0.30.1", False),
-        ("npu", "0.32.0", False),
-        ("npu", "0.32.0.dev42+g5df63a7", False),
+        ("0.32.0", True),
+        ("0.32.0.dev42+g5df63a7", True),
+        ("0.32.1", False),
+        ("0.33.0", False),
+        ("0.30.0", False),
+        ("0.30.0.dev42+gced6857", False),
     ],
 )
-def test_version_support_matches_pinned_backend(device_type, version, supported):
-    assert (
-        compat.is_vllm_version_supported(version, device_type=device_type) is supported
-    )
+def test_version_support_matches_target_release(version, supported):
+    assert compat.is_vllm_version_supported(version) is supported
 
 
 @pytest.mark.parametrize(
-    ("device_type", "version", "compatible"),
+    ("version", "compatible"),
     [
-        ("cuda", "0.32.0", True),
-        ("cuda", "0.30.0", False),
-        ("npu", "0.30.0", True),
-        ("npu", "0.32.0", False),
-        ("npu", "0.32.0.dev42+g5df63a7", False),
+        ("0.32.0", True),
+        ("0.32.0.dev42+g5df63a7", True),
+        ("0.32.1", False),
+        ("0.30.0", False),
+        ("0.30.0.dev42+gced6857", False),
+        ("unknown", False),
     ],
 )
-def test_patch_gate_uses_active_platform(monkeypatch, device_type, version, compatible):
+def test_patch_gate_matches_target_release(monkeypatch, version, compatible):
     runtime = ModuleType("vllm")
     runtime.__version__ = version
-    platforms = ModuleType("vllm.platforms")
-    platforms.current_platform = SimpleNamespace(device_type=device_type)
     monkeypatch.setitem(sys.modules, "vllm", runtime)
-    monkeypatch.setitem(sys.modules, "vllm.platforms", platforms)
 
     assert compat.is_target_vllm_compatible() is compatible
 
 
-@pytest.mark.parametrize("device_type, target", [("cuda", "0.32.0"), ("npu", "0.30.0")])
-def test_version_error_reports_backend_pin(monkeypatch, device_type, target):
-    monkeypatch.setattr(compat, "get_installed_vllm_version", lambda: "0.29.0")
+@pytest.mark.parametrize("installed_version", ["0.29.0", None])
+def test_version_error_reports_target_pin(monkeypatch, installed_version):
+    monkeypatch.setattr(compat, "get_installed_vllm_version", lambda: installed_version)
 
-    with pytest.raises(RuntimeError, match=f"exactly vLLM {target}"):
-        compat.assert_vllm_version_supported(device_type=device_type)
+    with pytest.raises(RuntimeError) as error:
+        compat.assert_vllm_version_supported()
+    assert str(error.value) == (
+        "AFD plugin currently supports exactly vLLM 0.32.0; "
+        f"installed vLLM version is {installed_version or 'not installed'}"
+    )
+
+
+@pytest.mark.parametrize("installed_version", ["0.29.0", None])
+def test_version_warning_reports_target_pin(monkeypatch, installed_version):
+    monkeypatch.setattr(compat, "get_installed_vllm_version", lambda: installed_version)
+
+    with pytest.warns(RuntimeWarning) as recorded:
+        compat.assert_vllm_version_supported(strict=False)
+    assert str(recorded[0].message) == (
+        "AFD plugin currently supports exactly vLLM 0.32.0; "
+        f"installed vLLM version is {installed_version or 'not installed'}"
+    )
 
 
 def test_missing_runtime_keeps_cpu_safe_patch_imports(monkeypatch):
