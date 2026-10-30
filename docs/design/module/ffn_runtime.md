@@ -34,6 +34,7 @@ validation_paths:
   - "tests/unit/test_async_cam_startup_wiring.py"
   - "tests/unit/connectors/test_async_cam_startup.py"
   - "tests/npu/async_cam_runtime.py"
+  - "tests/e2e/operators/async_cam_stop.py"
   - "tests/e2e/models/deepseek_v4_flash/ffn_graph.py"
   - "tests/unit/compat/patches/test_engine_core.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
@@ -380,6 +381,16 @@ connector then releases its remaining communication resources during runner
 shutdown. An earlier daemon failure is still surfaced after the join. Ascend
 uses its own connector close or asynchronous drain path before joining the
 daemon; see the [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md).
+
+DSpark eager legacy uses an explicit cancellable receive protocol. Its startup
+plan opts every A/F participant into the same protocol. A drains before native
+runner teardown; F observes every A drain acknowledgement and writes a persistent
+stop flag on an independent DMA stream. The FFN daemon handles STOP before model
+selection or expert execution, confirms device completion, and publishes receiver
+exit. Shutdown joins the daemon before releasing target/draft weights or the
+communicator. A live thread, failed device completion, missing peer acknowledgement,
+or stored failure retains resources and reports incomplete shutdown. This opt-in
+does not change the existing layered eager, FULL, or two-stream receive policy.
 
 ## Candidate invariants
 

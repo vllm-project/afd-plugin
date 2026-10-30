@@ -204,6 +204,7 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         layer_idx: int,
         prefix: str,
         vllm_config: VllmConfig,
+        is_draft_layer: bool = False,
     ) -> None:
         super().__init__(layer_idx=layer_idx)
         self.use_sequence_parallel_moe = (
@@ -243,7 +244,7 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
             prefix=f"{prefix}.gate",
         )
         self.gate.precast_fp32_weight = True
-        if layer_idx < config.num_hash_layers:
+        if layer_idx < config.num_hash_layers and not is_draft_layer:
             self.gate.tid2eid = nn.Parameter(
                 (
                     torch.arange(config.vocab_size, dtype=torch.int32).unsqueeze(1)
@@ -336,8 +337,6 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         is_draft_layer: bool = False,
     ) -> None:
         # ### PATCH START: initialize role-local decoder
-        if is_draft_layer:
-            raise ValueError("AFD DSV4 decoder layers do not support draft layers")
         afd_config = parse_afd_config(vllm_config, validate=False)
         nn.Module.__init__(self)
         # ### PATCH END: initialize role-local decoder
@@ -369,7 +368,11 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         # DecoderLayers are created with `native.make_layers` which passes the prefix
         # with the layer's index.
         layer_idx = int(prefix.split(sep=".")[-1])
-        self.layer_idx = layer_idx
+        # ### PATCH START: distinguish CAM IDs from native draft checkpoint names
+        self.layer_idx = (
+            config.num_hidden_layers + layer_idx if is_draft_layer else layer_idx
+        )
+        # ### PATCH END: distinguish CAM IDs from native draft checkpoint names
         self.norm_eps = config.rms_norm_eps
         self.use_sequence_parallel_moe = parallel_config.use_sequence_parallel_moe
         self.enable_dsa_cp = (
@@ -397,9 +400,10 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             if self.compute_gate_on_attention:
                 self.mlp = AFDDeepseekV4AttentionGateRemoteMoE(
                     config=config,
-                    layer_idx=layer_idx,
+                    layer_idx=self.layer_idx,
                     prefix=f"{prefix}.mlp",
                     vllm_config=vllm_config,
+                    is_draft_layer=is_draft_layer,
                 )
             else:
                 self.mlp = AFDDeepseekV4RemoteMoE(layer_idx=layer_idx)
@@ -418,7 +422,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 parallel_config=parallel_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
-                is_draft_layer=False,
+                is_draft_layer=is_draft_layer,
             )
         else:  # pragma: no cover - parse_afd_config validates role values.
             raise ValueError(f"Unsupported AFD role: {afd_config.role!r}")

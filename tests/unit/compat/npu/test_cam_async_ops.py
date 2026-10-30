@@ -62,6 +62,7 @@ def _dispatch_recv(torch: ModuleType, *, dynamic_quant: int = 0, moe_rank_id: in
     (
         "afd_async_dispatch_send",
         "afd_async_dispatch_recv",
+        "afd_async_dispatch_recv_cancellable",
         "afd_async_combine_send",
         "afd_async_combine_recv",
     ),
@@ -174,6 +175,59 @@ def test_cam_four_phase_meta_contracts(
     assert tuple(output.shape) == (4, 64)
     assert output.dtype == dtype
     assert all(t.device.type == "meta" for t in (sent, *received, combined, output))
+
+
+@pytest.mark.parametrize("dynamic_quant", [0, 1])
+def test_cancellable_receive_retains_compact_metadata_and_separate_status(
+    cam_runtime, dynamic_quant
+):
+    torch = cam_runtime
+    outputs = torch.ops.afd_ascend.afd_async_dispatch_recv_cancellable(
+        torch.empty(1, device="meta", dtype=torch.bfloat16),
+        torch.empty(4, device="meta", dtype=torch.int64),
+        0,
+        64,
+        64,
+        2,
+        2,
+        2,
+        3,
+        2,
+        4,
+        2,
+        dynamic_quant,
+        "meta_only",
+    )
+    assert len(outputs) == 5
+    assert outputs[2].shape == (13,)
+    assert outputs[3].shape == (3,)
+    assert outputs[4].shape == (1,)
+    assert outputs[4].dtype == torch.int64
+    assert outputs[4].storage_offset() * outputs[4].element_size() % 32 == 0
+
+
+@pytest.mark.parametrize("shape,dtype", [((1,), "float16"), ((3,), "int64")])
+def test_cancellable_receive_rejects_legacy_or_incomplete_control(
+    cam_runtime, shape, dtype
+):
+    torch = cam_runtime
+    with pytest.raises(RuntimeError, match="recv_control"):
+        torch.ops.afd_ascend.afd_async_dispatch_recv_cancellable(
+            torch.empty(1, device="meta", dtype=torch.bfloat16),
+            torch.empty(shape, device="meta", dtype=getattr(torch, dtype)),
+            0,
+            64,
+            64,
+            2,
+            2,
+            2,
+            3,
+            2,
+            4,
+            2,
+            0,
+            "meta_only",
+        )
 
 
 @pytest.mark.parametrize(

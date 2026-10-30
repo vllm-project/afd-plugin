@@ -30,6 +30,15 @@ constexpr uint32_t LAYER_INDEX_INDEX = 2;
 constexpr uint32_t START_EXPERT_INDEX = 3;
 constexpr uint32_t END_EXPERT_INDEX = 4;
 constexpr uint32_t MOE_PRE_TOKEN_NUM_INDEX = 3;
+constexpr int64_t RECV_CONTROL_V1 = 1;
+constexpr int64_t RECV_DATA = 0;
+constexpr int64_t RECV_STOPPED = 1;
+constexpr int64_t RECV_ERROR = 2;
+constexpr int64_t RECV_IDLE = 3;
+// Return an empty receive periodically while the service is idle. Keeping a
+// device kernel resident indefinitely eventually trips the device watchdog.
+constexpr uint32_t RECV_IDLE_POLL_BUDGET = 4096;
+constexpr uint32_t RECV_CONTROL_ELEMENTS = UB_ALIGN / sizeof(int64_t);
 
 template<AscendC::HardEvent event>
 __aicore__ inline void SyncFunc() {
@@ -77,6 +86,8 @@ private:
                                                uint32_t startExpert, uint32_t endExpert);
 
     __aicore__ inline uint32_t WaitFromAttn();
+    __aicore__ inline uint32_t WaitFromAttnCancellable();
+    __aicore__ inline void PublishReceiveStatus(int64_t status, uint32_t attnRankId);
 
     __aicore__ inline void ClearFlags(uint32_t attnRankId);
 
@@ -102,6 +113,10 @@ private:
     GlobalTensor<float> quantScaleGMTensor_;
     GlobalTensor<int64_t> epRecvCountRoutedGMTensor_;
     GlobalTensor<int64_t> batchInfoGMTensor_;
+    GlobalTensor<int64_t> receiveControlGMTensor_;
+    GlobalTensor<int64_t> receiveStatusGMTensor_;
+    bool cancellable_{false};
+    bool receiverStopped_{false};
     __gm__ HcclOpResParam *epWinContext_{nullptr};
 
     uint64_t ubReuseSize_{0};
@@ -168,7 +183,16 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::Init(
     quantScaleGMTensor_.SetGlobalBuffer((__gm__ float *)dynamicScalesOut);
     epRecvCountRoutedGMTensor_.SetGlobalBuffer((__gm__ int64_t *)epRecvCountRoutedOut);
     batchInfoGMTensor_.SetGlobalBuffer((__gm__ int64_t *)batchInfoOut);
-    // commArgs is an ABI placeholder; MC2 initializes the HCCL resource context.
+    // Only the explicit V1 entry point gives commArgs a control layout. Legacy
+    // callers pass an uninitialized FP16 anchor, which must never be read.
+    cancellable_ = tilingData->moeDistributeDispatchInfo.magic == RECV_CONTROL_V1;
+    if (cancellable_) {
+        receiveControlGMTensor_.SetGlobalBuffer((__gm__ int64_t *)commArgs);
+        uint64_t infoBytes = sizeof(int64_t) * (INFO_NUM + tpSize_ + expertNumPerMoe_ * tpSize_);
+        uint64_t statusOffset = MathCeil(infoBytes, UB_ALIGN);
+        receiveStatusGMTensor_.SetGlobalBuffer((__gm__ int64_t *)(batchInfoOut + statusOffset));
+    }
+    // MC2 initializes the HCCL resource context for both entry points.
     epWinContext_ = (__gm__ HcclOpResParam *)AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
 
     tpipe_ = pipe;
@@ -233,6 +257,9 @@ template <TemplateMC2TypeClass>
 __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::Process()
 {
     if (isError_ == true) {
+        if (cancellable_ && aivId_ == 0) {
+            PublishReceiveStatus(RECV_ERROR, 0);
+        }
         return;
     }
 
@@ -242,7 +269,28 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::Process()
 template <TemplateMC2TypeClass>
 __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecv()
 {
-    uint32_t tpAttnRankId = WaitFromAttn();
+    uint32_t tpAttnRankId = cancellable_ ? WaitFromAttnCancellable() : WaitFromAttn();
+    if (receiverStopped_) {
+        // Host control reads the compact metadata and counts at the same
+        // completion boundary as the status. Publish deterministic empty
+        // metadata, never a fabricated model layer or a combine-send item.
+        if (aivId_ == 0) {
+            uint32_t infoCount = INFO_NUM + tpSize_ + expertNumPerMoe_ * tpSize_;
+            for (uint32_t i = 0; i < infoCount; ++i) {
+                tpBatchInfoTensor_(i) = 0;
+            }
+            for (uint32_t i = 0; i < expertNumPerMoe_; ++i) {
+                epRecvCountOutTensor_(i) = 0;
+            }
+            SyncFunc<HardEvent::S_MTE3>();
+            DataCopyPad(batchInfoGMTensor_, tpBatchInfoTensor_,
+                {1U, (uint32_t)(sizeof(int64_t) * infoCount), 0U, 0U, 0U});
+            DataCopyPad(epRecvCountRoutedGMTensor_, epRecvCountOutTensor_,
+                {1U, (uint32_t)(sizeof(int64_t) * expertNumPerMoe_), 0U, 0U, 0U});
+            SyncFunc<HardEvent::MTE3_S>();
+        }
+        return;
+    }
 
     tpBatchInfoTensor_(ATTN_RANK_ID_INDEX) = tpAttnRankId;  // attnRankId
     tpBatchInfoTensor_(LAYER_INDEX_INDEX) = batchInfoTensor_(LAYER_INDEX_INDEX);  // layerIndex
@@ -303,6 +351,9 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecv()
     // expert 0, read an invalid expert, or publish a completion for missing data.
     if (!foundExpert) {
         isError_ = true;
+        if (cancellable_ && aivId_ == 0) {
+            PublishReceiveStatus(RECV_ERROR, 0);
+        }
         return;
     }
     SyncAll<true>();
@@ -494,6 +545,89 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecvRo
     for (uint32_t i = startExpert; i <= endExpert; ++i) {
         tpExpertRecvTokenNumTensor_(expertNumPerMoe_ + i) += expertRecvTokenNumTensor_(i);
     }
+}
+
+template <TemplateMC2TypeClass>
+__aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::PublishReceiveStatus(
+    int64_t status, uint32_t attnRankId)
+{
+    batchInfoTensor_(0) = status;
+    batchInfoTensor_(1) = attnRankId;
+    batchInfoTensor_(2) = 0;
+    batchInfoTensor_(3) = 0;
+    SyncFunc<HardEvent::S_MTE3>();
+    DataCopy(receiveStatusGMTensor_, batchInfoTensor_, RECV_CONTROL_ELEMENTS);
+    SyncFunc<HardEvent::MTE3_S>();
+}
+
+template <TemplateMC2TypeClass>
+__aicore__ inline uint32_t AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::WaitFromAttnCancellable()
+{
+    GM_ADDR dstGM = GetPeerAddrByRankId(moeRankId_);
+    GlobalTensor<int64_t> sourceInfo;
+    if (aivId_ == 0) {
+        sourceInfo.SetGlobalBuffer((__gm__ int64_t *)(dstGM + totalWorkspaceSize_ - UB_ALIGN));
+        DataCopy(batchInfoTensor_, sourceInfo, RECV_CONTROL_ELEMENTS);
+        SyncFunc<HardEvent::MTE2_S>();
+        uint32_t firstRank = batchInfoTensor_(0);
+        SyncFunc<HardEvent::S_MTE2>();
+        bool decided = false;
+        uint32_t idlePolls = 0;
+        while (!decided) {
+            // A pinned-host DMA copy on a separate stream publishes STOP only
+            // after all A ranks have drained. No extra AIV kernel is needed.
+            DataCopy(batchInfoTensor_, receiveControlGMTensor_, RECV_CONTROL_ELEMENTS);
+            SyncFunc<HardEvent::MTE2_S>();
+            bool stopped = batchInfoTensor_(0) != 0;
+            SyncFunc<HardEvent::S_MTE2>();
+            if (stopped) {
+                PublishReceiveStatus(RECV_STOPPED, 0);
+                break;
+            }
+            for (uint32_t i = 0; i < attnRankNum_ / tpSize_; ++i) {
+                bool ready = true;
+                for (uint32_t j = tpSize_; j > 0; --j) {
+                    uint32_t rank = (firstRank + tpSize_ * i + j - 1) % attnRankNum_;
+                    sourceInfo.SetGlobalBuffer((__gm__ int64_t *)(dstGM + workspaceSizePerAttn_ * rank));
+                    DataCopyPad(batchInfoTensor_, sourceInfo,
+                        {1U, (uint32_t)(sizeof(int64_t) * BATCH_INFO_VAL_NUM), 0U, 0U, 0U},
+                        {false, 0U, 0U, 0U});
+                    SyncFunc<HardEvent::MTE2_S>();
+                    ready = batchInfoTensor_(TOKEN_NUM_INDEX) != 0;
+                    SyncFunc<HardEvent::S_MTE2>();
+                    if (!ready) {
+                        break;
+                    }
+                }
+                if (ready) {
+                    PublishReceiveStatus(RECV_DATA, (firstRank + tpSize_ * i) % attnRankNum_);
+                    decided = true;
+                    break;
+                }
+            }
+            if (!decided && ++idlePolls >= RECV_IDLE_POLL_BUDGET) {
+                PublishReceiveStatus(RECV_IDLE, 0);
+                break;
+            }
+        }
+    }
+    // Only the leader chooses DATA, IDLE or STOP. All AIVs take the same
+    // return/compute path around the later DispatchRecvRouted barriers.
+    SyncAll<true>();
+    DataCopy(batchInfoTensor_, receiveStatusGMTensor_, RECV_CONTROL_ELEMENTS);
+    SyncFunc<HardEvent::MTE2_S>();
+    receiverStopped_ = batchInfoTensor_(0) != RECV_DATA;
+    uint32_t attnRankId = batchInfoTensor_(1);
+    SyncFunc<HardEvent::S_MTE2>();
+    if (!receiverStopped_) {
+        sourceInfo.SetGlobalBuffer((__gm__ int64_t *)(dstGM + workspaceSizePerAttn_ * attnRankId));
+        DataCopyPad(batchInfoTensor_, sourceInfo,
+            {1U, (uint32_t)(sizeof(int64_t) * BATCH_INFO_VAL_NUM), 0U, 0U, 0U},
+            {false, 0U, 0U, 0U});
+        SyncFunc<HardEvent::MTE2_S>();
+        SyncFunc<HardEvent::S_MTE2>();
+    }
+    return attnRankId;
 }
 
 template <TemplateMC2TypeClass>

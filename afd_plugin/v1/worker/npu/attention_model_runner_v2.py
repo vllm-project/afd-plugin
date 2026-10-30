@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
 from types import MethodType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
@@ -52,6 +52,7 @@ from afd_plugin.v1.worker.attention_model_runner_v2 import (
     _use_afd_capture_input_preparation,
     _use_afd_ubatch_preparation,
 )
+from afd_plugin.v1.worker.npu.dspark_speculator import AFDDSparkSpeculator
 from afd_plugin.validation import validate_npu_model_runner_v2_config
 
 if TYPE_CHECKING:
@@ -258,6 +259,18 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             self._afd_suppress_metadata_send = False
             self._afd_transaction_counter = 0
             self.prof = create_afd_npu_profiler("attention")
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.use_dspark()
+            ):
+                # Replace the native speculator before load_model owns any
+                # draft weights/KV. Native sample_tokens remains unchanged.
+                self.speculator = AFDDSparkSpeculator(
+                    self.vllm_config,
+                    self.device,
+                    afd_context=self._afd_draft_context,
+                )
+                self.speculator.update_stream = self.update_stream
         except BaseException:
             try:
                 if connector is not None:
@@ -265,6 +278,28 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             finally:
                 super().shutdown()
             raise
+
+    @contextmanager
+    def _afd_draft_context(self, dummy_run: bool, is_profile: bool) -> Iterator[None]:
+        previous_metadata = self._afd_pending_metadata
+        previous_suppress_send = self._afd_suppress_metadata_send
+        previous_is_warmup = self._is_warmup
+        previous_is_profile = self._afd_is_profile
+        self._afd_pending_metadata = None
+        self._afd_suppress_metadata_send = False
+        self._is_warmup = dummy_run
+        self._afd_is_profile = is_profile
+        try:
+            with (
+                skip_dp_coordination(),
+                use_afd_metadata_provider(self.install_afd_metadata_on_forward_context),
+            ):
+                yield
+        finally:
+            self._afd_pending_metadata = previous_metadata
+            self._afd_suppress_metadata_send = previous_suppress_send
+            self._is_warmup = previous_is_warmup
+            self._afd_is_profile = previous_is_profile
 
     def _afd_num_tokens_for_context(self, forward_context: ForwardContext) -> int:
         # Ascend bd42eea0 NPUModelRunner.execute_model delegates to the vLLM
@@ -325,6 +360,24 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         kv_cache_config: KVCacheConfig,
         kv_cache_allocation_context: AbstractContextManager | None = None,
     ) -> None:
+        # ### PATCH START: bind the loaded draft before connector registration
+        if (
+            self.vllm_config.kv_transfer_config is not None
+            and self.vllm_config.kv_transfer_config.is_kv_consumer
+            and self.speculative_config is not None
+            and self.speculative_config.use_dspark()
+        ):
+            from vllm.distributed.kv_transfer import get_kv_transfer_group
+
+            from afd_plugin.distributed.kv_transfer.dspark_mooncake import (
+                AFDDSparkMooncakeConnector,
+            )
+
+            transfer = get_kv_transfer_group()
+            if not isinstance(transfer, AFDDSparkMooncakeConnector):
+                raise TypeError("DSpark PD requires AFDDSparkMooncakeConnector")
+            transfer.bind_draft_model(cast(AFDDSparkSpeculator, self.speculator))
+        # ### PATCH END: bind the loaded draft before connector registration
         # ### PATCH START: create the native NPU ubatch adapter.
         with use_npu_ubatch_factory(self):
             super().initialize_kv_cache(kv_cache_config, kv_cache_allocation_context)
@@ -503,6 +556,26 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     # Removal/upstream plan: delete this wrapper if AFD-owned lifecycle moves
     # to a shared composition/factory owner; it never copies native cleanup.
     def shutdown(self) -> None:
+        # Load the backend-specific type only inside this NPU worker teardown.
+        from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+
+        if (
+            isinstance(self.connector, CAMAsyncAFDConnector)
+            and self.connector.eager_receiver_shutdown
+        ):
+            # ### PATCH START: drain the eager DSpark session before freeing KV.
+            # Failure deliberately retains models, cache, communicator, and
+            # metadata. Process cleanup is distinct from orderly completion.
+            if self.ubatch_runner is not None:
+                self.ubatch_runner.abort_pending_run()
+            self.connector.drain_attention()
+            stop_afd_npu_profiler(self.prof)
+            self.connector.close()
+            super().shutdown()
+            self.ubatch_runner = None
+            self._afd_pending_metadata = None
+            return
+            # ### PATCH END: drain the eager DSpark session before freeing KV.
         # ### PATCH START: guarantee profiler/native/connector cleanup.
         try:
             stop_afd_npu_profiler(self.prof)

@@ -144,6 +144,36 @@ zero. Test reports distinguish successful inference from cleanup, and forced
 termination must not be described as normal shutdown. Single-stream eager and synchronous
 stopping policies retain their connector/process-level cleanup boundaries.
 
+DSpark eager legacy now opts into a separate cancellable receive entry point.
+Startup reuses the existing paired communication warmup: every A sends one
+synthetic routed item and F completes all matching returns before readiness.
+This initializes MC2 resources before an idle service waits for its first request.
+The existing batch-metadata CPU completion also reads its STOP status, adding
+no second per-call synchronization. After all A ranks seal and drain, F's Store
+watcher publishes a persistent stop flag through pinned-host DMA on a separate
+stream. The receive leader makes one DATA/IDLE/STOP decision for all AIVs.
+An idle poll budget returns an empty work item, without clearing peer flags,
+and the eager F loop rearms the receive. This prevents indefinite kernel
+residency from reaching the device execution watchdog. A STOP return bypasses
+expert computation and combine-send. F confirms device completion
+and publishes receiver exit before A releases model/KV/communication state; the
+F worker joins its receiver before releasing resources. Failure retains state.
+This protocol does not extend cancellation to incomplete data transfers or the
+original layered/graph receive entry point.
+
+The model-free real-device probe is:
+
+```bash
+torchrun --nproc-per-node=3 -m tests.e2e.operators.async_cam_stop \
+  --attention-ranks=1 --ffn-ranks=2
+# DP2 uses four processes and --attention-ranks=2.
+# Add --idle-seconds=660 to test traffic and exit after long idle.
+```
+
+It checks exact routed echo, idle exit, queued STOP returns, and normal cleanup.
+Run it on the source-built candidate before claiming device shutdown support;
+it is not a DSpark model accuracy or performance test.
+
 ## Computation semantics
 
 FULL uses the corresponding layered eager computation without activation

@@ -276,6 +276,7 @@ def test_ffn_warmup_capture_order_and_failure_propagation(
         requested_mode="full",
         device="npu:0",
         model=SimpleNamespace(get_experts_layer_indices=lambda: (5, 2)),
+        draft_model=None,
         _initialize_layered_executor=lambda: None,
         _layered_executor=SimpleNamespace(graph_signature=lambda capacity: "weights"),
         connector=SimpleNamespace(
@@ -283,6 +284,7 @@ def test_ffn_warmup_capture_order_and_failure_propagation(
             graph_startup=startup,
             extra_info=connector_module.AFDAsyncExtraInfo(ffn_two_stream=two_stream),
             init_afd_connector=initialize_connector,
+            eager_receiver_shutdown=False,
             attn_size=2,
             tp_size=1,
             graph_startup_chunks=lambda: 2,
@@ -373,7 +375,10 @@ def test_worker_retains_resources_until_clean_exit(ffn_owners, state, two_stream
     runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
     runner.effective_mode = "eager" if two_stream else "full"
     runner._two_stream = object() if two_stream else None
-    runner.connector = SimpleNamespace(close=lambda: calls.append("connector-close"))
+    runner.connector = SimpleNamespace(
+        close=lambda: calls.append("connector-close"),
+        eager_receiver_shutdown=False,
+    )
     runner.shutdown = lambda: calls.append("release")
     worker = module.AFDNPUFFNWorker.__new__(module.AFDNPUFFNWorker)
     worker.model_runner = runner
@@ -467,7 +472,7 @@ def test_separate_owners_construct_and_load_without_cross_graph_pool(
     config.load_config = object()
     if speculative_tokens is not None:
         config.speculative_config = SimpleNamespace(
-            num_speculative_tokens=speculative_tokens
+            method="mtp", num_speculative_tokens=speculative_tokens
         )
     monkeypatch.setattr(
         sync_runtime.current_platform, "get_global_graph_pool", calls.pool

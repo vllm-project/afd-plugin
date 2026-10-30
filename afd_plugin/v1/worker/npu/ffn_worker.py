@@ -28,7 +28,10 @@ from afd_plugin.compat.npu import (
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
-from afd_plugin.model_executor.models.model_utils import get_afd_model_config
+from afd_plugin.model_executor.models.model_utils import (
+    configure_afd_dspark,
+    get_afd_model_config,
+)
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
 from afd_plugin.validation import (
@@ -105,6 +108,7 @@ class AFDNPUFFNWorker(NPUWorker):
             self.vllm_config.model_config,
             device_type="npu",
         )
+        configure_afd_dspark(self.vllm_config)
         self.model_runner = create_npu_ffn_model_runner(self.vllm_config, self.device)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -145,6 +149,11 @@ class AFDNPUFFNWorker(NPUWorker):
         def ffn_worker_loop() -> None:
             try:
                 self._run_ffn_server_loop()
+                if (
+                    isinstance(self.model_runner, AsyncNPUFFNModelRunner)
+                    and self.model_runner.connector.eager_receiver_shutdown
+                ):
+                    self.model_runner.connector.finish_receiver_shutdown()
             except Exception as exc:
                 shutdown_event = self._ffn_shutdown_event
                 if (
@@ -158,6 +167,11 @@ class AFDNPUFFNWorker(NPUWorker):
                     )
                     return
                 self._ffn_loop_error = exc
+                if (
+                    isinstance(self.model_runner, AsyncNPUFFNModelRunner)
+                    and self.model_runner.connector.eager_receiver_shutdown
+                ):
+                    self.model_runner.connector.graph_startup.fail(exc)
                 logger.exception("AFD NPU FFN worker loop failed")
             else:
                 if self._requires_async_drain():
@@ -229,6 +243,7 @@ class AFDNPUFFNWorker(NPUWorker):
         return isinstance(self.model_runner, AsyncNPUFFNModelRunner) and (
             self.model_runner.effective_mode == "full"
             or self.model_runner._two_stream is not None
+            or self.model_runner.connector.eager_receiver_shutdown
         )
 
     def raise_ffn_loop_error_if_any(self) -> None:
@@ -240,6 +255,28 @@ class AFDNPUFFNWorker(NPUWorker):
 
     def stop_ffn_server_loop(self) -> None:
         event = self._ffn_shutdown_event
+        if (
+            isinstance(self.model_runner, AsyncNPUFFNModelRunner)
+            and self.model_runner.connector.eager_receiver_shutdown
+        ):
+            # A ranks must finish all target/draft exchanges before F stops.
+            # The Store watcher also handles an A-first service shutdown.
+            self.raise_ffn_loop_error_if_any()
+            self.model_runner.connector.request_receiver_stop()
+            if event is not None:
+                event.set()
+            thread = self._ffn_thread
+            if thread is not None:
+                thread.join(timeout=FFN_SHUTDOWN_TIMEOUT_SECONDS)
+                if thread.is_alive():
+                    raise RuntimeError(
+                        "Async CAM receiver did not exit; retain resources"
+                    )
+            self.raise_ffn_loop_error_if_any()
+            self.model_runner.shutdown()
+            self._ffn_thread = None
+            self._ffn_shutdown_event = None
+            return
         if self._requires_async_drain():
             if event is not None:
                 event.set()

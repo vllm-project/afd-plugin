@@ -12,6 +12,7 @@ primary_code_paths:
   - "afd_plugin/v1/worker/ubatch_wrapper.py"
   - "afd_plugin/v1/worker/npu/attention_model_runner_v2.py"
   - "afd_plugin/v1/worker/npu/attention_worker.py"
+  - "afd_plugin/v1/worker/npu/dspark_speculator.py"
 related_code_paths:
   - "afd_plugin/connectors/**"
   - "afd_plugin/model_executor/**"
@@ -28,6 +29,7 @@ validation_paths:
   - "tests/unit/v1/worker/test_npu_runtime.py"
   - "tests/unit/v1/worker/test_npu_model_runner_v2.py"
   - "tests/unit/v1/worker/npu/test_ubatch_runner.py"
+  - "tests/unit/v1/worker/npu/test_attention_model_runner_v2.py"
   - "tests/unit/model_executor/test_async_cam_dbo.py"
   - "tests/npu/test_mrv2_dbo.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"

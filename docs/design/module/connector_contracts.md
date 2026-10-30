@@ -23,6 +23,7 @@ validation_paths:
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
   - "tests/e2e/models/qwen3_moe/test_qwen3_moe.py"
   - "tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py"
+  - "tests/e2e/operators/async_cam_stop.py"
   - "tests/unit/distributed/**"
   - "tests/gpu/**"
 upstream_refs:
@@ -305,6 +306,28 @@ receive, FFN compute, FFN send, then Attention receive for each layer/stage.
 CAM async may queue Attention-side payload state and completes it in FIFO order
 for each stage; the concrete connector validates that required top-k/routing
 metadata is present.
+
+DSpark's eager legacy FFN plan additionally negotiates cancellable receive.
+Each F rank owns an initialized 32-byte device control tensor and an independent
+DMA stream. The explicit `afd_async_dispatch_recv_cancellable` entry point uses
+the existing CANN `commArgs` argument under a versioned `magic` attribute and
+returns a separate status view from an aligned metadata trailer. The original
+four-output entry point and FULL/two-stream paths keep their existing ABI.
+
+On normal service shutdown, A seals submission, finishes local exchanges and
+device work, and publishes a Store acknowledgement. F observes all A
+acknowledgements and writes STOP using pinned-host DMA. The receiving AIV leader
+chooses DATA, bounded IDLE or STOP for every AIV; IDLE rearms receive without
+clearing peer flags, and STOP produces no expert computation or
+combine-send. F publishes completion only after its host loop returns and its
+device work completes. A retains KV/model/communication resources until all F
+completion acknowledgements arrive. F retains resources until the receiving
+thread is joined. Failure or timeout is an incomplete shutdown; communicator
+destruction or process termination is not substituted for receiver completion.
+
+The [device stop probe](../../../tests/e2e/operators/async_cam_stop.py) covers
+real transport and idle/queued stop behavior without loading model weights.
+Passing host protocol tests alone does not establish device correctness.
 
 ## Topology and resource ownership
 

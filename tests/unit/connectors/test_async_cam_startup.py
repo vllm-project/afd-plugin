@@ -116,6 +116,71 @@ def test_empty_graph_signature_cannot_advertise_support():
         resolve_ffn_mode([full_plan(signature="")])
 
 
+def test_eager_cancellation_is_negotiated_by_all_ffn_ranks():
+    owners = startup_world()
+    plans = [None, None, FFNGraphPlan(cancellable_eager=True), FFNGraphPlan()]
+    errors = negotiate(owners, plans, ["wire"] * len(owners))
+    assert all(isinstance(error, (ValueError, RuntimeError)) for error in errors)
+    assert any("cancellation protocols differ" in str(error) for error in errors)
+
+
+def test_eager_cancellation_rejects_graph_execution():
+    owners = startup_world()
+    plan = full_plan(cancellable_eager=True)
+    errors = negotiate(owners, [None, None, plan, plan], ["wire"] * len(owners))
+    assert all(isinstance(error, (ValueError, RuntimeError)) for error in errors)
+    assert any("eager legacy" in str(error) for error in errors)
+
+
+def test_cancellable_eager_selects_a_shared_startup_layer():
+    owners = startup_world()
+    plan = FFNGraphPlan(cancellable_eager=True, layer_ids=(0, 43, 44, 45))
+    assert negotiate(owners, [None, None, plan, plan], ["wire"] * 4) == [None] * 4
+    assert all(owner.warmup_layer_id == 0 for owner in owners)
+
+
+@pytest.mark.parametrize("layer_ids", [(), (0, 43, 44)])
+def test_cancellable_eager_rejects_missing_or_mismatched_startup_layers(layer_ids):
+    owners = startup_world()
+    plan = FFNGraphPlan(cancellable_eager=True, layer_ids=(0, 43, 44, 45))
+    plans = [None, None, plan, replace(plan, layer_ids=layer_ids)]
+    errors = negotiate(owners, plans, ["wire"] * 4)
+    assert all(isinstance(error, (ValueError, RuntimeError)) for error in errors)
+    assert any("matching layer tables" in str(error) for error in errors)
+
+
+def test_shutdown_joins_every_attention_and_ffn_acknowledgement():
+    owners = startup_world()
+    owners[0].attention_drained()
+    assert not owners[2].all_attention_drained()
+    owners[1].attention_drained()
+    assert owners[2].all_attention_drained()
+    owners[2].wait_attention_drained()
+    owners[2].receiver_exited()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        completion = pool.submit(owners[0].wait_receivers_exited)
+        owners[3].receiver_exited()
+        completion.result(timeout=3)
+
+
+@pytest.mark.parametrize("stage", ["attention", "receiver"])
+def test_shutdown_rejects_acknowledgements_from_the_wrong_role(stage):
+    owners = startup_world()
+    if stage == "attention":
+        with pytest.raises(RuntimeError, match="Only Attention"):
+            owners[2].attention_drained()
+    else:
+        with pytest.raises(RuntimeError, match="Only FFN"):
+            owners[0].receiver_exited()
+
+
+def test_shutdown_reports_peer_failure_instead_of_completion():
+    owners = startup_world()
+    owners[2].fail(RuntimeError("receive failed"))
+    with pytest.raises(RuntimeError, match="receive failed"):
+        owners[0].wait_receivers_exited()
+
+
 @pytest.mark.parametrize("mode", ["eager", "full"])
 def test_two_stream_signature_and_failure_are_checked_in_both_modes(mode):
     plan = full_plan(requested=mode, stream_signature="2/12C/24V/24V")
