@@ -39,6 +39,7 @@ from afd_plugin.connectors import (
     AFDConnectorBase,
     AFDConnectorFactory,
     AFDForwardContextMetadata,
+    AFDRoutedExpertsConnector,
 )
 from afd_plugin.model_executor.models.forward_context import use_afd_metadata_provider
 from afd_plugin.v1.worker.attention_metadata import (
@@ -467,6 +468,8 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     # Patch reason: native V2 load_model has no AFD connector lifecycle.
     # Patch functionality: initialize the AFD connector after native weight
     # loading so Attention and FFN model loading overlap across roles.
+    # Routed-experts connectors receive the loaded MoE layer order for their
+    # cross-rank handshake.
     # Signature: matches vLLM v0.32.0 GPUModelRunnerV2.load_model exactly.
     # Upstream: vllm/v1/worker/gpu/model_runner.py, load_model;
     # 5df63a7203cdb9328d824a27b682e77c7b9928be.
@@ -482,7 +485,13 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     ) -> None:
         super().load_model(load_dummy_weights, *args, model=model, **kwargs)
         # ### PATCH START: connect after native loading.
-        if not self.connector.is_initialized:
+        if self.connector.is_initialized:
+            return
+        if isinstance(self.connector, AFDRoutedExpertsConnector):
+            self.connector.init_afd_connector(
+                moe_layer_indices=tuple(self.get_model().get_experts_layer_indices()),
+            )
+        else:
             self.connector.init_afd_connector()
         # ### PATCH END: connect after native loading.
 

@@ -13,6 +13,8 @@ from vllm.config import VllmConfig
 from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.worker_base import CompilationTimes
 
+from afd_plugin.config import parse_afd_config
+from afd_plugin.connectors import AFDConnectorFactory, AFDRoutedExpertsConnector
 from afd_plugin.connectors.base import AFDControlPlaneClosedError
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
@@ -95,10 +97,22 @@ class AFDFFNWorker(Worker):
         super().init_device()
         torch.accelerator.empty_cache()
 
-    # The native factory still annotates V1 and uses a local return-type
-    # exception for V2. The connector-driven FFN runner shares that boundary.
+    # Upstream: vLLM 5df63a72, gpu_worker.py::Worker._make_model_runner.
+    # Select the connector-driven runner before native model loading; routed
+    # executors also require the Triton expert-weight layout. The native factory
+    # annotates V1, so connector-driven V2 runners keep its return-type exception.
     def _make_model_runner(self) -> GPUModelRunner:
         """Construct the connector-driven runner via the native factory hook."""
+        afd_config = parse_afd_config(self.vllm_config, expected_role="ffn")
+        connector_cls = AFDConnectorFactory.get_connector_class(afd_config.connector)
+        if issubclass(connector_cls, AFDRoutedExpertsConnector):
+            from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (
+                GPUFFNRoutedExpertsModelRunner,
+                select_routed_moe_backend,
+            )
+
+            select_routed_moe_backend(self.vllm_config)
+            return GPUFFNRoutedExpertsModelRunner(self.vllm_config, self.device)  # type: ignore[return-value]
         return GPUFFNModelRunner(self.vllm_config, self.device)  # type: ignore[return-value]
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:

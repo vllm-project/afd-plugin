@@ -128,7 +128,7 @@ class GPUFFNModelRunner:
     def profile_run(self) -> None:
         pass
 
-    # Patch reason: vLLM 0.30.0 Worker.determine_available_memory calls
+    # Patch reason: vLLM 0.32.0 Worker.determine_available_memory calls
     # ``self.model_runner.profile_cudagraph_memory()`` on CUDA when the compile
     # config enables CUDA graphs (gpu_worker.py), and GPUFFNModelRunner does
     # not inherit that method from any native runner.
@@ -136,11 +136,11 @@ class GPUFFNModelRunner:
     # engine's memory planning is unchanged. The FFN runner captures its graphs
     # lazily from the connector loop after memory profiling, into its own
     # graph pool, so no graph memory belongs in the profiling estimate.
-    # Signature: matches vLLM v0.30.0 GPUModelRunner.profile_cudagraph_memory
+    # Signature: matches vLLM v0.32.0 GPUModelRunner.profile_cudagraph_memory
     # exactly: (self) -> int; 0 mirrors the upstream NONE-mode early return.
-    # Upstream: vLLM v0.30.0, vllm/v1/worker/gpu/model_runner.py,
+    # Upstream: vLLM v0.32.0, vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.profile_cudagraph_memory; commit
-    # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
     def profile_cudagraph_memory(self) -> int:
         return 0
 
@@ -176,10 +176,14 @@ class GPUFFNModelRunner:
             self._cuda_graphs[graph_key]["graph"].replay()
             return None
 
+        # An eager fallback for a step Attention replays keeps the replay flag,
+        # so the connector plans the step the way Attention does (graph mode,
+        # no host sync).
         self._ffn_forward(
             dp_metadata_list=dp_metadata_list,
             is_graph_capturing=is_graph_capturing,
             is_warmup=is_warmup,
+            is_graph_replaying=is_graph_replaying,
         )
         return None
 
@@ -189,17 +193,15 @@ class GPUFFNModelRunner:
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
         is_graph_capturing: bool = False,
         is_warmup: bool = False,
+        is_graph_replaying: bool = False,
         update_connector_state: bool = True,
     ) -> torch.Tensor | None:
         if update_connector_state:
-            cast(
-                AFDControlPlane, self.connector.control_plane
-            ).update_state_from_dp_metadata(
-                _make_dp_metadata_payload(
-                    dp_metadata_list,
-                    is_graph_capturing=is_graph_capturing,
-                    is_warmup=is_warmup,
-                ),
+            self._update_connector_state(
+                dp_metadata_list,
+                is_graph_capturing=is_graph_capturing,
+                is_warmup=is_warmup,
+                is_graph_replaying=is_graph_replaying,
             )
 
         model = self.get_model()
@@ -267,6 +269,25 @@ class GPUFFNModelRunner:
                         )
                     self.connector.send_ffn_output(rank_ffn_output, context)
         return rank_ffn_output
+
+    def _update_connector_state(
+        self,
+        dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
+        *,
+        is_graph_capturing: bool,
+        is_warmup: bool,
+        is_graph_replaying: bool,
+    ) -> None:
+        cast(
+            AFDControlPlane, self.connector.control_plane
+        ).update_state_from_dp_metadata(
+            _make_dp_metadata_payload(
+                dp_metadata_list,
+                is_graph_capturing=is_graph_capturing,
+                is_warmup=is_warmup,
+                is_graph_replaying=is_graph_replaying,
+            ),
+        )
 
     def _execute_eager_mode(
         self,
@@ -437,8 +458,8 @@ class GPUFFNModelRunner:
     # portable subset; the FFN runner owns no KV caches or attention groups)
     # and then close AFD-owned profiler and connector resources.
     # Signature: matches GPUModelRunner.shutdown; no added parameters.
-    # Upstream: vLLM v0.30.0, vllm/v1/worker/gpu_model_runner.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/v1/worker/gpu_model_runner.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def shutdown(self) -> None:
         # ### PATCH START: release native-equivalent and AFD-owned GPU state.
         stop_afd_gpu_profiler(self.prof)
@@ -472,11 +493,13 @@ def _make_dp_metadata_payload(
     *,
     is_graph_capturing: bool = False,
     is_warmup: bool = False,
+    is_graph_replaying: bool = False,
 ) -> AFDControlPayload:
     return AFDControlPayload(
         dp_metadata_list=dp_metadata_list,
         is_graph_capturing=is_graph_capturing,
         is_warmup=is_warmup,
+        is_graph_replaying=is_graph_replaying,
     )
 
 

@@ -40,6 +40,9 @@ from afd_plugin.v1.worker import (  # noqa: E402
     attention_worker,
     ffn_worker,
 )
+from afd_plugin.v1.worker import (  # noqa: E402
+    ffn_routed_experts_model_runner as routed_runner_module,
+)
 from afd_plugin.v1.worker.attention_model_runner_v2 import (  # noqa: E402
     AFDAttentionModelRunnerV2,
 )
@@ -47,6 +50,9 @@ from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
 from afd_plugin.validation import (  # noqa: E402
     validate_gpu_model_runner_v2_config,
     validate_npu_model_runner_v2_config,
+)
+from tests.unit.fakes.connector import (  # noqa: E402
+    FakeRoutedConnector,
 )
 from tests.unit.fakes.deepseek_v4 import WorkspaceCase  # noqa: E402
 from tests.unit.fakes.profiler import StepProfiler as _StepProfiler  # noqa: E402
@@ -137,6 +143,12 @@ def _v2_config(
     parallel_config = SimpleNamespace(
         data_parallel_size=data_parallel_size,
         data_parallel_rank=0,
+        data_parallel_rank_local=0,
+        data_parallel_index=0,
+        data_parallel_backend="mp",
+        distributed_executor_backend="mp",
+        nnodes_within_dp=1,
+        assigned_physical_gpu_ids=None,
         tensor_parallel_size=tensor_parallel_size,
         pipeline_parallel_size=1,
         prefill_context_parallel_size=prefill_context_parallel_size,
@@ -177,6 +189,7 @@ def _v2_config(
         parallel_config=parallel_config,
         compilation_config=compilation_config,
         cache_config=SimpleNamespace(enable_prefix_caching=False),
+        kernel_config=SimpleNamespace(moe_backend="auto"),
         scheduler_config=SimpleNamespace(
             enable_chunked_prefill=False,
             async_scheduling=False,
@@ -243,6 +256,8 @@ def _construct_like_native_worker(worker):
 
 def _prepare_worker(worker_cls, config, *, use_v2):
     worker = object.__new__(worker_cls)
+    worker.rank = 0
+    worker.local_rank = 0
     worker.vllm_config = config
     worker.model_config = config.model_config
     worker.use_v2_model_runner = use_v2
@@ -2015,6 +2030,29 @@ def test_v2_load_model_preserves_native_model_and_connects_after_load(
     assert runner.connector.is_initialized
 
 
+def test_v2_load_model_reports_moe_layers_to_routed_connector(monkeypatch):
+    """An ``AFDRoutedExpertsConnector`` receives the MoE layers Attention
+    dispatches, which every rank checks against the FFN's.
+
+    Why: dispatch and combine run once per MoE layer on every rank.
+    """
+    connector = FakeRoutedConnector()
+    runner = object.__new__(AFDAttentionModelRunnerV2)
+    runner.connector = connector
+    runner.model = SimpleNamespace(get_experts_layer_indices=lambda: [1, 3])
+    monkeypatch.setattr(
+        native_v2.GPUModelRunner, "load_model", lambda self, *args, **kwargs: None
+    )
+    monkeypatch.setattr(AFDAttentionModelRunnerV2, "get_model", lambda self: self.model)
+
+    runner.load_model()
+
+    assert connector.init_kwargs == {
+        "moe_layer_indices": (1, 3),
+        "local_experts": None,
+    }
+
+
 def test_v2_constructor_rejects_missing_control_plane_and_cleans_native(
     monkeypatch,
 ):
@@ -2159,6 +2197,92 @@ def test_worker_factory_failure_preserves_native_construction(
         worker.init_device()
 
     assert type(_construct_like_native_worker(worker)) is _NativeRunnerSentinel
+
+
+def test_ffn_worker_selects_routed_runner_for_routed_connector(monkeypatch):
+    """An ``AFDRoutedExpertsConnector`` gets the routed-experts runner, and
+    vLLM's MoE backend is pinned to one that keeps the expert layout.
+
+    Why: the routed runner runs the experts itself, from vLLM's layout.
+    """
+    config = _v2_config(role="ffn")
+    worker = _prepare_worker(AFDFFNWorker, config, use_v2=True)
+    monkeypatch.setattr(
+        ffn_worker.AFDConnectorFactory,
+        "get_connector_class",
+        lambda name: FakeRoutedConnector,
+    )
+    monkeypatch.setattr(
+        routed_runner_module, "GPUFFNRoutedExpertsModelRunner", _RunnerRecorder
+    )
+    monkeypatch.setattr(native_v2, "GPUModelRunner", _NativeRunnerSentinel)
+    monkeypatch.setattr(ffn_worker.Worker, "init_device", _fake_worker_init)
+    monkeypatch.setattr(
+        ffn_worker, "assert_compatible_afd_stack", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(ffn_worker.torch.accelerator, "empty_cache", lambda: None)
+
+    worker.init_device()
+
+    assert worker.model_runner.__class__ is _RunnerRecorder
+    assert config.kernel_config.moe_backend == "triton"
+
+
+def _deepep_m2n_v2_config(**kwargs):
+    config = _v2_config(architecture="Qwen3MoeForCausalLM", **kwargs)
+    config.additional_config["afd"]["connector"] = "DeepEPM2NAFDConnector"
+    config.additional_config["afd"]["compute_gate_on_attention"] = True
+    return config
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_v2_validator_accepts_deepep_m2n_attention_tp(tp_size):
+    """DeepEP M2N accepts Attention TP > 1.
+
+    Why: each Attention TP rank dispatches its own slice of the tokens, and
+    the worker derives the TP rank from the worker rank before vLLM's
+    process groups exist.
+    """
+    validate_gpu_model_runner_v2_config(
+        _deepep_m2n_v2_config(
+            tensor_parallel_size=tp_size, num_attention_ranks=tp_size
+        ),
+        expected_role="attention",
+        device_type="cuda",
+    )
+
+
+def test_v2_validator_rejects_deepep_m2n_ffn_tp():
+    """DeepEP M2N FFN ranks must run TP = 1.
+
+    Why: DeepEP routes each token to the one FFN rank that owns the whole
+    expert; FFN experts are not TP-sharded.
+    """
+    config = _deepep_m2n_v2_config(role="ffn", tensor_parallel_size=2, num_ffn_ranks=2)
+    with pytest.raises(RuntimeError, match="requires FFN tensor_parallel_size=1"):
+        validate_gpu_model_runner_v2_config(
+            config,
+            expected_role="ffn",
+            device_type="cuda",
+        )
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_v2_validator_requires_gate_on_attention_for_deepep_m2n(role):
+    """DeepEP M2N without compute_gate_on_attention fails at validation.
+
+    Why: the connector routes on Attention, so a run without the gate there
+    cannot dispatch; failing here names the setting instead of failing later
+    in the connector handshake.
+    """
+    config = _deepep_m2n_v2_config(role=role)
+    config.additional_config["afd"]["compute_gate_on_attention"] = False
+    with pytest.raises(RuntimeError, match="requires compute_gate_on_attention=true"):
+        validate_gpu_model_runner_v2_config(
+            config,
+            expected_role=role,
+            device_type="cuda",
+        )
 
 
 @pytest.mark.parametrize("use_v2", [False, True])

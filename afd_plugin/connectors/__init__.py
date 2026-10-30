@@ -5,6 +5,7 @@
 from afd_plugin.connectors.base import (
     AFDConnectorBase,
     AFDControlPlane,
+    AFDRoutedExpertsConnector,
     ConnectorExtraInfo,
 )
 from afd_plugin.connectors.factory import AFDConnectorFactory
@@ -19,9 +20,12 @@ from afd_plugin.connectors.metadata import (
     AFDTransferContext,
     AFDTransferMetadata,
     AFDTransferState,
+    FFNLocalExperts,
+    LocalExpertWeights,
 )
 
 __all__ = [
+    "AFDRoutedExpertsConnector",
     "AFDConnectorBase",
     "AFDControlPlane",
     "ConnectorExtraInfo",
@@ -36,4 +40,6 @@ __all__ = [
     "AFDForwardContextMetadata",
     "AFDA2FTransferPayload",
     "AFDSingleDPMetadata",
+    "FFNLocalExperts",
+    "LocalExpertWeights",
 ]

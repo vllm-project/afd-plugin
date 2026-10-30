@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import sys
@@ -50,10 +53,10 @@ def _install_parallel_state(
     distributed_module = ModuleType("vllm.distributed")
     distributed_module.__path__ = []
     parallel_state_module = ModuleType("vllm.distributed.parallel_state")
-    parallel_state_module.get_pcp_group = lambda: SimpleNamespace(
-        rank_in_group=pcp_rank,
+    vars(parallel_state_module).update(
+        get_pcp_group=lambda: SimpleNamespace(rank_in_group=pcp_rank),
+        get_tensor_model_parallel_rank=lambda: tp_rank,
     )
-    parallel_state_module.get_tensor_model_parallel_rank = lambda: tp_rank
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
     monkeypatch.setitem(sys.modules, "vllm.distributed", distributed_module)
     monkeypatch.setitem(

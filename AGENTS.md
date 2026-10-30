@@ -133,8 +133,8 @@ protocol, the test MUST stay green.
 - `tests/unit` MUST collect on a CPU-only host without `torch` or vLLM.
   Runtime imports are gated with `pytest.importorskip` before the guarded
   module is imported.
-- Device behavior is verified in `tests/npu` or `tests/e2e`. Never simulate
-  device behavior with fakes and then treat it as evidence.
+- Device behavior is verified in `tests/gpu`, `tests/npu` or `tests/e2e`.
+  Never simulate device behavior with fakes and then treat it as evidence.
 - Text artifacts (build manifests, patch markers, docs links) may be asserted
   as text. Production Python modules may not: no test reads
   `afd_plugin/**/*.py` and asserts on a substring.

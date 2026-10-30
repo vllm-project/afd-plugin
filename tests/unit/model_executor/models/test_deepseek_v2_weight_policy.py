@@ -244,3 +244,30 @@ def test_async_shared_weights_belong_to_attention(suffix):
         )
         == FFN_ROLES
     )
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("model.layers.3.mlp.shared_experts.gate_proj.weight", frozenset()),
+        ("model.layers.3.mlp.experts.0.down_proj.weight", FFN_ROLES),
+        ("model.layers.3.mlp.gate.weight", BOTH_ROLES),
+    ],
+    ids=["shared-experts", "routed-experts", "gate"],
+)
+def test_deepep_m2n_ffn_loads_routed_experts_only(name, expected):
+    """With ``ffn_skips_shared_experts`` the FFN loads no shared experts and
+    Attention does not take them either, until it builds them; routed
+    experts and the gate keep their gate-on-Attention owners.
+
+    Why: the DeepEP M2N FFN runs routed experts only.
+    """
+    assert (
+        _checkpoint_weight_roles(
+            name,
+            _config(),
+            compute_gate_on_attention=True,
+            ffn_skips_shared_experts=True,
+        )
+        == expected
+    )

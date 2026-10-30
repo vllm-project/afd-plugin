@@ -41,6 +41,9 @@ Core runtime support:
   recorded in the existing [NPU runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix).
 - DeepSeek MoE handoff at the remote-experts boundary on CUDA, with the gate
   placed on either Attention or FFN.
+- Expert-routed M:N exchange on CUDA (`DeepEPM2NAFDConnector`) for Qwen3 MoE:
+  Attention routes each token and dispatches it only to the FFN ranks that own
+  its experts.
 
 Model support:
 
@@ -48,7 +51,7 @@ Model support:
 | --- | --- | --- | --- |
 | DeepSeekV2 / DeepSeekV3 / DeepSeekV3.2 | `DeepseekForCausalLM`, `DeepseekV2ForCausalLM`, `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | `AFDDeepseekForCausalLM`, `AFDDeepseekV2ForCausalLM`, `AFDDeepseekV3ForCausalLM` | DeepSeekV3.2 uses `AFDDeepseekV3ForCausalLM`. Each AFD role constructs and loads only its role-required model components, while shared embedding, normalization, and output components remain available where required by the model lifecycle. |
 | DeepSeek V4 Flash | `DeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` | CUDA synchronous and Ascend CAM paths; see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix) for backend-specific validation limits. |
-| Qwen3 MoE | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | CUDA with `compute_gate_on_attention=false`. |
+| Qwen3 MoE | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | CUDA; DeepEP M2N routes on Attention, P2P routes on FFN. |
 | Qwen3.5 / Qwen3.6 MoE | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | CUDA text-only Qwen3.6-35B-A3B with `--language-model-only`, native DP4/TP1/EP4, and synchronous AFD 2A1F. Eager and graph execution remain supported; GDN DBO is temporarily withdrawn; native hybrid/multimodal validation applies. Earlier DBO experiments are historical evidence only; see the [E2E limits](docs/design/module/e2e_testing.md). |
 
 Connector support:
@@ -58,6 +61,7 @@ See the [recipe index](recipe/README.md) for deployment and benchmark examples.
 | Connector | Platform | Recommend Stage | Sync or Async | Graph Support | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `P2pNcclAFDConnector` | CUDA | Decode | Sync | `FULL_DECODE_ONLY` CUDA graph | FFN ranks are ordered before Attention ranks. `num_attention_ranks` must be greater than or equal to `num_ffn_ranks`; the Attention ranks are spread over the FFN ranks in blocks that differ in size by at most one. See the [DeepSeek V2 Lite recipe](recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md). |
+| `DeepEPM2NAFDConnector` | CUDA (SM90+) | Decode | Sync | `FULL_DECODE_ONLY` CUDA graph | Expert-routed M2N transport: Attention computes the gate and top-k and dispatches each token only to the FFN ranks that own its experts; the FFN runs only routed experts. Requires `compute_gate_on_attention=true`, FFN TP 1, and the same DBO setting on both roles; supports two-microbatch DBO, Attention TP, BF16 or block-128 FP8 payloads, and one or several nodes. Qwen3 MoE only. Dispatch and combine use [afdEP-comm](https://github.com/afdEP/afdEP-comm) (the `afdep` extra); the default expert backend needs [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) installed separately. See the [DeepEP M2N guide](docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md) and the [Qwen3 recipes](recipe/gpu/DeepEPM2NAFDConnector/README.md). |
 | `CAMP2pAFDConnector` | Ascend NPU | Decode | Sync | `FULL` or `FULL_DECODE_ONLY`; plain MLA graph DBO requires `FULL_DECODE_ONLY` | Uses HCCL/CAMP2P custom ops and native MRV2. DBO requires two ubatches and Attention DP > 1. See the [CAMP2P guide](docs/npu/CAM_P2P_CONNECTOR_USER_GUIDE.md). |
 | `CAMAsyncAFDConnector` | Ascend NPU | Prefill / decode | Async | FFN-only experimental `FULL` | Eager Attention supports DP+TP/SP and two native DBO microbatches, including DP1. FFN FULL requires the [W4A8 runtime contract](docs/npu/ASYNC_FFN_RUNTIME.md) and accepts eager Attention DBO; FFN does not join native DBO. PCP/DCP are unsupported. See the [Async CAM guide](docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md) for configuration and validation limits. |
 
@@ -80,14 +84,20 @@ Known gaps:
   two-microbatch DBO and `FULL_DECODE_ONLY`, with model-specific gate placement.
   See the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix)
   for tested configurations and known DeepSeek-V2-Lite DBO shutdown failures.
+- `DeepEPM2NAFDConnector` requires SM90 or newer GPUs, Attention-side
+  routing, and FFN TP 1, and supports only Qwen3 MoE models whose layers are
+  all MoE and have no shared expert. Its GPU device tests
+  ([`tests/gpu`](tests/gpu/README.md)) and E2E cases need SM90+ hardware and
+  run outside CI.
 - GPU and NPU E2E tests are opt-in and require real hardware plus model weights.
 - GPU CUDA graph support is limited to `FULL_DECODE_ONLY`.
 - Native DBO is limited to exactly two ubatches. NPU CAMP2P supports eager
   and graph DBO; Async CAM enables eager DBO only on Attention, including
   when FFN uses FULL. FFN stays outside Attention's native DBO thread schedule.
   Model evidence remains specific to its workload and topology.
-- Qwen3 MoE currently rejects Attention-side gate placement, sequence-parallel
-  MoE, EPLB, pipeline parallelism, speculative decoding, LoRA, and NPU.
+- Qwen3 MoE requires Attention-side gate placement for DeepEP M2N and
+  FFN-side gate placement for P2P. It rejects sequence-parallel MoE, EPLB,
+  pipeline parallelism, speculative decoding, LoRA, and NPU.
 - Qwen3.5/Qwen3.6 MoE adapter-family support is limited to the CUDA text-only
   lane; repository hardware E2E evidence covers Qwen3.6-35B-A3B.
   GDN DBO is unsupported; upstream hybrid/multimodal DBO validation applies.
@@ -119,6 +129,15 @@ uv sync --group dev --extra vllm
 ```
 
 The optional GPU extra pins `vllm==0.32.0`.
+
+`DeepEPM2NAFDConnector` also needs the `afdep` extra (afdEP-comm) and
+DeepGEMM, which is built from source; see
+[Installation](docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation) in
+the connector guide.
+
+```bash
+uv sync --group dev --extra vllm --extra afdep
+```
 
 ### Ascend NPU installation
 
@@ -299,8 +318,8 @@ The canonical config shape is:
 ```
 
 `role` must be `attention` or `ffn`. `connector` must be `P2pNcclAFDConnector`,
-`CAMP2pAFDConnector`, or `CAMAsyncAFDConnector`. AFD is active when
-`additional_config["afd"]` is present and passes common AFD config validation;
+`DeepEPM2NAFDConnector`, `CAMP2pAFDConnector`, or `CAMAsyncAFDConnector`.
+AFD is active when `additional_config["afd"]` is present and passes common AFD config validation;
 omit `additional_config["afd"]` to disable AFD. Connector-owned
 `connector_extra_config` is strictly validated by the selected connector parser
 when the connector/runtime is constructed. The plugin also accepts selected

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Benchmark AFD with vllm bench"
+  short_description: "Run a vllm bench serve sweep against an AFD recipe on k8s"
+  default_prompt: "Use $run-vllm-bench-k8s to benchmark an AFD GPU recipe on Kubernetes with vllm bench serve and report the results."

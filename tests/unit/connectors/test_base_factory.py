@@ -61,8 +61,19 @@ def test_connector_metadata_validates_sequence_lengths():
         AFDTransferMetadata(
             layer_idx=0,
             stage_idx=0,
-            seq_lens=[0],
+            seq_lens=[-1],
         )
+
+
+def test_connector_metadata_allows_empty_receive():
+    metadata = AFDTransferMetadata.create_ffn_metadata(
+        layer_idx=0,
+        stage_idx=0,
+        seq_lens=[0],
+    )
+
+    assert metadata.total_tokens == 0
+    assert metadata.validate_tensor_shape((0, 16))
 
 
 def test_attn_output_carries_transfer_context():

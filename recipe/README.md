@@ -14,6 +14,9 @@ Recipes are organized by hardware backend, connector, and model:
 ```text
 recipe/
 ├── gpu/
+│   ├── DeepEPM2NAFDConnector/
+│   │   ├── qwen3_235b_a22b_fp8/
+│   │   └── qwen3_30b_a3b/
 │   └── P2pNcclAFDConnector/
 │       └── deepseek_v2_lite/
 └── npu/
@@ -27,7 +30,7 @@ Directory names follow these conventions:
 
 - Hardware backend: `gpu` or `npu`.
 - Connector: the exact connector class name, such as `P2pNcclAFDConnector`,
-  `CAMP2pAFDConnector`, or `CAMAsyncAFDConnector`.
+  `DeepEPM2NAFDConnector`, `CAMP2pAFDConnector`, or `CAMAsyncAFDConnector`.
 - Model: the model family or variant in lowercase snake case, such as
   `deepseek_v2_lite` or `deepseek_v3_2`.
 
@@ -36,6 +39,8 @@ Directory names follow these conventions:
 | Hardware | Connector | Model | Recommended stage | Status | Recipe |
 | --- | --- | --- | --- | --- | --- |
 | GPU | `P2pNcclAFDConnector` | DeepSeek-V2-Lite | Decode | Deployment examples; see the linked README for validation scope | [Launch examples](gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md) |
+| GPU (SM90+) | `DeepEPM2NAFDConnector` | Qwen3-30B-A3B | Decode | Same 2A2F layouts as the Qwen3 MoE DeepEP M2N E2E cases | [Launch examples](gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/README.md) |
+| GPU (SM90+) | `DeepEPM2NAFDConnector` | Qwen3-235B-A22B-FP8 | Decode | 4A2F FP8-payload configuration run on H200 | [Launch examples](gpu/DeepEPM2NAFDConnector/qwen3_235b_a22b_fp8/README.md) |
 | Ascend NPU | `CAMP2pAFDConnector` | DeepSeek-V3.2 | Decode | Historical v0.19.1rc1 recipe; not qualified for the 0.32 target | [Synchronous decode](npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) |
 | Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V3.2 | Prefill / decode | Historical v0.19.1rc1/v0.26 recipes, not qualified for 0.32; v0.26 DP2TP8+EP16 token split reached `0.9522` strict match; legacy PCP8 results are v0.19-only | [Async CAM](npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) |
 
