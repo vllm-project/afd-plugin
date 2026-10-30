@@ -8,7 +8,7 @@ body:
     attributes:
       value: >
         Before submitting, please search existing issues and RFCs. Keep proposals
-        tied to the applicable GPU vLLM v0.32.0 or NPU vLLM v0.30.0 target unless the issue proposes a
+        tied to the applicable GPU or NPU vLLM v0.32.0 target unless the issue proposes a
         version expansion.
 
   - type: textarea

@@ -8,7 +8,7 @@ body:
     attributes:
       value: >
         Before submitting, please search existing issues to avoid duplicates.
-        afd-plugin targets vLLM v0.32.0 on GPU and v0.30.0 on NPU unless an issue says otherwise.
+        afd-plugin targets vLLM v0.32.0 on GPU and NPU unless an issue says otherwise.
 
   - type: markdown
     attributes:
@@ -27,7 +27,10 @@ body:
         OS:
         afd-plugin commit:
         vLLM version/checkout:
+        vLLM-Ascend version/checkout (NPU):
         PyTorch/build CUDA:
+        torch_npu / CANN / Triton Ascend (NPU):
+        NPU model / SoC / driver / firmware:
         GPU/driver/compute capability:
         CUDA toolkit/compiler/NCCL:
         Connector and topology:
