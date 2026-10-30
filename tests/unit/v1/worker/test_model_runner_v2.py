@@ -54,6 +54,8 @@ from tests.unit.fakes.ubatching import (  # noqa: E402
     TEST_COMPUTE_SMS,
     TEST_PHYSICAL_SMS,
     AttentionMetadataState,
+    LegacyNPUAttentionMetadataState,
+    LegacyNPUUBatchRunner,
     PreparedUBatchRunner,
 )
 
@@ -2369,3 +2371,83 @@ def test_profile_reserves_workspace_only_for_cuda_v4_ubatching(
     else:
         with pytest.raises(AssertionError, match="Workspace growth is not allowed"):
             case.request(1, 1)
+
+
+@pytest.fixture
+def npu_v4_ubatch_case():
+    events: list[str] = []
+    runner = _runner_for_metadata(events, data_parallel_size=2)
+    runner.device = SimpleNamespace(type="npu")
+    runner.vllm_config.model_config.hf_config.model_type = "deepseek_v4"
+    runner.model_state = LegacyNPUAttentionMetadataState()
+    runner.kv_cache_config = SimpleNamespace()
+    runner.ubatch_runner = LegacyNPUUBatchRunner(
+        runner.model_state, runner.kv_cache_config
+    )
+    input_buffers = InputBuffers(4, 8, torch.device("cpu"))
+    batch = InputBatch.make_dummy(2, 8, input_buffers)
+    batch.positions.copy_(torch.arange(8))
+    return runner, batch, torch.arange(8).reshape(1, 8), events
+
+
+@pytest.mark.parametrize(
+    "has_control_plane", [False, True], ids=["async", "control-plane"]
+)
+def test_npu_v4_ubatch_preparation_preserves_native_context_and_control(
+    npu_v4_ubatch_case, has_control_plane
+):
+    runner, batch, slots, events = npu_v4_ubatch_case
+    if not has_control_plane:
+        runner.connector.control_plane = None
+
+    with v2_runner_module._use_afd_ubatch_preparation(runner):
+        prepared = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+
+    for stage, context in enumerate(prepared.forward_contexts):
+        metadata = context.additional_kwargs["afd_metadata"]
+        assert context.additional_kwargs["platform_stage"] == stage
+        assert metadata.stage_idx == stage
+        assert metadata.tokens_lens == [4]
+        assert metadata.tokens_unpadded_lens == [4]
+        assert context.attn_metadata["kv0"].stage == stage
+        assert torch.equal(
+            context.attn_metadata["kv0"].positions,
+            batch.positions[stage * 4 : (stage + 1) * 4],
+        )
+        assert torch.equal(
+            context.slot_mapping["kv0"], slots[0, stage * 4 : (stage + 1) * 4]
+        )
+    expected_events = ["control_update", "control_send"] if has_control_plane else []
+    assert events == expected_events
+    if has_control_plane:
+        payload = runner.connector.last_payload
+        assert list(payload.dp_metadata_list) == [0, 1]
+        assert [
+            m.num_tokens_across_dp_cpu.tolist()
+            for m in payload.dp_metadata_list.values()
+        ] == [[4, 4], [4, 4]]
+
+    native = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    assert [context.additional_kwargs for context in native.forward_contexts] == [
+        {"platform_stage": 0},
+        {"platform_stage": 1},
+    ]
+    assert events == expected_events
+
+
+def test_npu_v4_ubatch_prepare_error_restores_native_preparation(npu_v4_ubatch_case):
+    runner, batch, slots, events = npu_v4_ubatch_case
+    runner.model_state.prepare_error = ValueError("native preparation failed")
+    with (
+        pytest.raises(ValueError, match="native preparation failed"),
+        v2_runner_module._use_afd_ubatch_preparation(runner),
+    ):
+        runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    runner.model_state.prepare_error = None
+
+    native = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    assert [context.additional_kwargs for context in native.forward_contexts] == [
+        {"platform_stage": 0},
+        {"platform_stage": 1},
+    ]
+    assert events == []
