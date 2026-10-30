@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Pure host negotiation tests; no device or model runner initialization."""
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from threading import Condition
@@ -86,6 +87,65 @@ def negotiate(owners, plans, signatures):
             for owner, plan, signature in zip(owners, plans, signatures, strict=True)
         ]
         return [future.exception(timeout=3) for future in futures]
+
+
+@pytest.mark.parametrize("world", [4, 16])
+def test_shared_failure_check_uses_one_store_request(world, monkeypatch):
+    owners = startup_world(attn=world - 2, ffn=2)
+    assert not any(
+        negotiate(owners, [None] * (world - 2) + [FFNGraphPlan()] * 2, ["wire"] * world)
+    )
+    calls = []
+    original = owners[0]._store.check
+
+    def check(keys):
+        calls.append(keys)
+        return original(keys)
+
+    monkeypatch.setattr(owners[0]._store, "check", check)
+    owners[-1].check_failure()
+    assert len(calls) == 1
+    owners[0].fail(RuntimeError("source failed"))
+    for owner in owners:
+        with pytest.raises(RuntimeError, match="source failed"):
+            owner.check_failure()
+
+
+def test_legacy_peer_keeps_per_rank_failure_detection(monkeypatch):
+    owners = startup_world()
+    original = owners[0]._publish
+
+    def legacy_publish(stage, value="ready"):
+        if stage == "plan":
+            fields = json.loads(value)
+            fields.pop("shared_errors")
+            value = json.dumps(fields)
+        original(stage, value)
+
+    monkeypatch.setattr(owners[0], "_publish", legacy_publish)
+    assert not any(
+        negotiate(owners, [None, None, FFNGraphPlan(), FFNGraphPlan()], ["wire"] * 4)
+    )
+    owners[0]._store.set(owners[0]._keys("error", range(1))[0], "legacy failure")
+    for owner in owners:
+        with pytest.raises(RuntimeError, match="legacy failure"):
+            owner.check_failure()
+
+
+def test_shared_failure_survives_compatibility_write_failure(monkeypatch):
+    owners = startup_world()
+    original = owners[0]._store.set
+
+    def fail_rank_error(key, value):
+        if key.endswith("error/0"):
+            raise ConnectionError("connection lost")
+        original(key, value)
+
+    monkeypatch.setattr(owners[0]._store, "set", fail_rank_error)
+    with pytest.raises(ConnectionError):
+        owners[0].fail(RuntimeError("original failure"))
+    with pytest.raises(RuntimeError, match="original failure"):
+        owners[-1].check_failure()
 
 
 def test_mixed_requested_modes_are_not_silently_downgraded():

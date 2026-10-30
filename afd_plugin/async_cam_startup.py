@@ -74,6 +74,7 @@ class AsyncCAMGraphStartup:
         self._store: Store | None = None
         self._prefix = ""
         self._pull_receiver_finished = False
+        self._shared_errors = False
         self.validate_attention_streams: Callable[[], None] | None = None
 
     def initialize(self, store: Store, transport_signature: str) -> None:
@@ -93,10 +94,19 @@ class AsyncCAMGraphStartup:
 
     def _publish(self, stage: str, value: str = "ready") -> None:
         assert self._store is not None
+        if stage == "error":
+            # Publish the shared signal first so new peers still fail if the
+            # compatibility publication below loses its Store connection.
+            self._store.set(f"{self._prefix}error", value)
         self._store.set(f"{self._prefix}{stage}/{self.world_rank}", value)
 
     def check_failure(self) -> None:
         assert self._store is not None
+        signal = f"{self._prefix}error"
+        if self._store.check([signal]):
+            raise RuntimeError(self._store.get(signal).decode())
+        if self._shared_errors:
+            return
         for key in self._keys("error", range(self.world_size)):
             if self._store.check([key]):
                 raise RuntimeError(self._store.get(key).decode())
@@ -147,6 +157,7 @@ class AsyncCAMGraphStartup:
                 json.dumps(
                     {
                         "transport": transport_signature,
+                        "shared_errors": True,
                         "ffn": asdict(plan) if plan else None,
                     }
                 ),
@@ -154,6 +165,10 @@ class AsyncCAMGraphStartup:
             keys = self._keys("plan", range(self.world_size))
             self._wait(keys)
             entries = [json.loads(self._store.get(key)) for key in keys]
+            # Old peers publish only per-rank errors; keep their original check path.
+            self._shared_errors = all(
+                entry.get("shared_errors", False) for entry in entries
+            )
             plans = []
             for entry in entries[self.attn_size :]:
                 fields = entry["ffn"]
