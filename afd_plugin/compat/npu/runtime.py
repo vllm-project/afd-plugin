@@ -90,8 +90,20 @@ def apply_afd_ascend_patches_if_needed() -> None:
     if _PATCHES_APPLIED:
         return
 
+    from afd_plugin.compat.patches.npu.mc2_dispatch_prequant import (
+        apply_afd_mc2_dispatch_prequant_patch,
+    )
+    from afd_plugin.compat.patches.npu.external_routing_mc2_prepare import (
+        apply_afd_external_routing_mc2_prepare_patch,
+    )
+    from afd_plugin.compat.patches.npu.external_routing_prepare import (
+        apply_afd_external_routing_prepare_patch,
+    )
     from afd_plugin.compat.patches.npu.mla_graph import (
         apply_afd_mla_graph_patch,
+    )
+    from afd_plugin.compat.patches.npu.profile_run_eager import (
+        apply_profile_run_eager_patch,
     )
 
     apply_afd_ascend_config_patch_if_needed()
@@ -99,6 +111,22 @@ def apply_afd_ascend_patches_if_needed() -> None:
         raise RuntimeError(
             "AFD NPU MLA graph patch requires the vLLM-Ascend MLA resolver",
         )
+    apply_profile_run_eager_patch()
+    # The routing patches replace the MoE prepare path, so they belong here rather
+    # than in the config stage: importing them pulls vLLM-Ascend's MoE internals,
+    # which a process that only builds and validates a config does not need. This
+    # runs from the worker constructor, before any model load, warm-up or forward,
+    # and the guard above keeps it to one install per process.
+    #
+    # Both installers are idempotent: the ALLGATHER one returns early when the class
+    # attribute already holds it, and the MC2 one assigns the same function again. An
+    # unusable target raises instead, and that must abort initialization rather than
+    # be caught here.
+    apply_afd_external_routing_prepare_patch()
+    apply_afd_external_routing_mc2_prepare_patch()
+    # The dispatcher reads the scale the prepare patch published; installing it here keeps
+    # the two halves of the pre-quantized MC2 path in one place.
+    apply_afd_mc2_dispatch_prequant_patch()
     _PATCHES_APPLIED = True
 
 

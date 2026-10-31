@@ -181,6 +181,32 @@ def validate_gpu_model_runner_v2_config(
     validate_cuda_graph_mode(vllm_config, role=expected_role)
 
 
+def _fail_if_unsupported_sync_gate_runtime(
+    vllm_config: VllmConfig,
+    afd_config: AFDConfig,
+) -> None:
+    """Mirror the sync gate-on-Attention limits enforced during NPU feature setup.
+
+    Both roles validate through here before the worker starts, so this has to agree
+    with ``feature_validation._fail_if_unsupported_sync_attention_gate``. A config
+    that passes one gate and fails the other would fail late, after weights or
+    communication setup.
+
+    The connector and target checks live in feature validation; the runtime-only
+    section is DBO/ubatching, which this module already inspects for other paths.
+    The sync shell does not call the DBO yield, so enabling DBO would interleave
+    microbatches against a transport that never yields.
+    """
+
+    del afd_config
+    parallel = vllm_config.parallel_config
+    if bool(parallel.enable_dbo) or bool(parallel.use_ubatching):
+        raise RuntimeError(
+            "Attention-side gate with the synchronous connector does not support "
+            "DBO or ubatching yet",
+        )
+
+
 def validate_npu_model_runner_v2_config(
     vllm_config: VllmConfig,
     *,
@@ -207,13 +233,16 @@ def validate_npu_model_runner_v2_config(
                     "on Attention"
                 )
             requested_ffn_mode(vllm_config)
-    elif (
-        afd_config.connector != CAMP2P_CONNECTOR or afd_config.compute_gate_on_attention
-    ):
+    elif afd_config.connector != CAMP2P_CONNECTOR:
         raise RuntimeError(
             "AFD NPU ModelRunnerV2 requires synchronous CAMP2pAFDConnector "
             "with compute_gate_on_attention=false, or Async CAM",
         )
+    elif afd_config.compute_gate_on_attention:
+        # The sync Attention-side gate prototype runs through this same runner
+        # validation on both roles. Its supported shape is narrow and mirrored in
+        # feature_validation so a config cannot pass one gate and fail the other.
+        _fail_if_unsupported_sync_gate_runtime(vllm_config, afd_config)
 
     parallel = vllm_config.parallel_config
     if (

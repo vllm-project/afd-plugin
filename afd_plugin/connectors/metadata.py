@@ -288,12 +288,26 @@ class AFDA2FTransferPayload:
         router_logits: Optional Attention-side routing tensor.
         input_ids: Optional token-aligned identifiers required by the remote
             FFN implementation.
+        topk_ids: Optional expert indices selected by an Attention-side gate,
+            shaped ``(tokens, topk)`` as ``int32``.
+        topk_weights: Optional routing weights paired with ``topk_ids``, shaped
+            ``(tokens, topk)`` as ``float32``. The two are present together or
+            not at all.
+        activation_scale: Optional MX block scale for a pre-quantized activation,
+            shaped ``(tokens, ceil(hidden_size / 32))`` as ``float8_e8m0fnu``.
+            Present only when the transport carried an MXFP8 activation, and then
+            ``hidden_states`` is that same activation in E4M3: the two fields describe one
+            tensor and travel together, so a consumer receives a usable pair and does not
+            dequantize on the way in.
     """
 
     hidden_states: torch.Tensor
     context: AFDTransferContext
     router_logits: torch.Tensor | None = None
     input_ids: torch.Tensor | None = None
+    topk_ids: torch.Tensor | None = None
+    topk_weights: torch.Tensor | None = None
+    activation_scale: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
