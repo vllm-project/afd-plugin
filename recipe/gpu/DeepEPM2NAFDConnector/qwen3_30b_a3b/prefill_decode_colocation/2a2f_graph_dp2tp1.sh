@@ -16,13 +16,13 @@
 #   ENABLE_DBO               1 | 0 (0)
 #   DBO_DECODE_TOKEN_THRESHOLD / DBO_PREFILL_TOKEN_THRESHOLD (2 / 12)
 #   MAX_NUM_SEQS             (64)
-#   MAX_NUM_BATCHED_TOKENS   prefill chunk per step (2048)
-#   CUDAGRAPH_CAPTURE_SIZES  comma-separated decode graph sizes (MAX_NUM_SEQS)
-#   MAX_MODEL_LEN            (unset: model default)
+#   MAX_NUM_BATCHED_TOKENS   prefill chunk per step (4096)
+#   CUDAGRAPH_CAPTURE_SIZES  comma-separated decode graph sizes (8,16,32,64)
+#   MAX_MODEL_LEN            (4096)
 #   GPU_MEMORY_UTILIZATION   (unset: vLLM default)
 #   ATTN_DEVICES / FFN_DEVICES (0,1 / 2,3)
-#   AFD_HOST / AFD_PORT      AFD connector rendezvous (127.0.0.1 / 6269)
-#   ATTN_PORT / FFN_PORT     HTTP ports (18305 / 18306)
+#   AFD_HOST / AFD_PORT      AFD connector rendezvous (127.0.0.1 / 6239)
+#   ATTN_PORT / FFN_PORT     HTTP ports (18000 / 18001)
 #   EXTRA_ARGS               extra `vllm serve` args for both roles (empty)
 #
 # KV_CONNECTOR=decode_bench only (tools/benchmarks/decode_bench.py):
@@ -44,16 +44,16 @@ ENABLE_DBO=${ENABLE_DBO:-0}
 DBO_DECODE_TOKEN_THRESHOLD=${DBO_DECODE_TOKEN_THRESHOLD:-2}
 DBO_PREFILL_TOKEN_THRESHOLD=${DBO_PREFILL_TOKEN_THRESHOLD:-12}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-64}
-MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-2048}
-CUDAGRAPH_CAPTURE_SIZES=${CUDAGRAPH_CAPTURE_SIZES:-$MAX_NUM_SEQS}
-MAX_MODEL_LEN=${MAX_MODEL_LEN:-}
+MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-4096}
+CUDAGRAPH_CAPTURE_SIZES=${CUDAGRAPH_CAPTURE_SIZES:-8,16,32,64}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-}
 ATTN_DEVICES=${ATTN_DEVICES:-0,1}
 FFN_DEVICES=${FFN_DEVICES:-2,3}
 AFD_HOST=${AFD_HOST:-127.0.0.1}
-AFD_PORT=${AFD_PORT:-6269}
-ATTN_PORT=${ATTN_PORT:-18305}
-FFN_PORT=${FFN_PORT:-18306}
+AFD_PORT=${AFD_PORT:-6239}
+ATTN_PORT=${ATTN_PORT:-18000}
+FFN_PORT=${FFN_PORT:-18001}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 DECODE_BENCH_NUM_PROMPTS=${DECODE_BENCH_NUM_PROMPTS:-1000}
 DECODE_BENCH_PROMPT_LEN=${DECODE_BENCH_PROMPT_LEN:-1025}
@@ -137,17 +137,17 @@ if [[ -n "$KV_TRANSFER_CONFIG" ]]; then
     ATTN_ARGS+=(--kv-transfer-config "$KV_TRANSFER_CONFIG")
 fi
 
-CUDA_VISIBLE_DEVICES=$ATTN_DEVICES uv run vllm serve "$MODEL_PATH" \
+CUDA_VISIBLE_DEVICES=$FFN_DEVICES vllm serve "$MODEL_PATH" \
+    --additional-config "$(afd_config ffn)" \
+    "${COMMON_ARGS[@]}" \
+    --host 127.0.0.1 \
+    --port "$FFN_PORT" > ffn.log 2>&1 &
+
+CUDA_VISIBLE_DEVICES=$ATTN_DEVICES vllm serve "$MODEL_PATH" \
     --additional-config "$(afd_config attention)" \
     "${COMMON_ARGS[@]}" \
     "${ATTN_ARGS[@]}" \
     --host 127.0.0.1 \
     --port "$ATTN_PORT" > attn.log 2>&1 &
-
-CUDA_VISIBLE_DEVICES=$FFN_DEVICES uv run vllm serve "$MODEL_PATH" \
-    --additional-config "$(afd_config ffn)" \
-    "${COMMON_ARGS[@]}" \
-    --host 127.0.0.1 \
-    --port "$FFN_PORT" > ffn.log 2>&1 &
 
 wait

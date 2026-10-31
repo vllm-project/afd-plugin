@@ -130,13 +130,11 @@ file(GLOB aclnn_src ${ASCEND_AUTOGEN_PATH}/aclnn*.cpp)
 npu_op_library(cust_opapi ACLNN
     ${aclnn_src}
 )
-# The grouped_matmul_swiglu_quant_v2_layered aclnn sources use the l0op
-# composite pattern (l0op::Contiguous / ReFormat / TransData / ViewCopy live in
-# the CANN built-in libopapi.so). The ACLNN target template only links
-# nnopbase/ascendcl, so add libopapi as a direct dependency: it becomes a
-# DT_NEEDED entry of libcust_opapi.so and the loader resolves the l0op builtins
-# from it no matter whether torch_npu has libopapi in the global dlopen scope.
-target_link_libraries(cust_opapi PRIVATE opapi)
+# The math component supplies the composite l0op helpers Contiguous, ReFormat,
+# TransData and ViewCopy. Linking aggregate opapi also exposes unrelated built-in
+# ACLNN functions through this custom library's handle, shadowing Ascend custom
+# implementations during operator lookup.
+target_link_libraries(cust_opapi PRIVATE opapi_math)
 target_compile_options(cust_opapi PRIVATE
     -fvisibility=hidden
 )

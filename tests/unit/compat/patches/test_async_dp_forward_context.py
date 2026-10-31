@@ -1,11 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
-import importlib
+import importlib.util
 import logging
 import sys
 import time
 import types
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -43,7 +47,7 @@ def _install_fake_vllm_forward_context(monkeypatch: pytest.MonkeyPatch):
     class CUDAGraphMode:
         NONE = "NONE"
 
-    config_module.CUDAGraphMode = CUDAGraphMode
+    vars(config_module)["CUDAGraphMode"] = CUDAGraphMode
 
     class DPMetadata:
         @staticmethod
@@ -60,21 +64,21 @@ def _install_fake_vllm_forward_context(monkeypatch: pytest.MonkeyPatch):
 
     @contextmanager
     def original_set_forward_context(*_args, **_kwargs):
-        forward_module.original_set_forward_context_called = True
+        vars(forward_module)["original_set_forward_context_called"] = True
         yield
 
     def original_coordinate_batch_across_dp(*_args, **_kwargs):
-        forward_module.original_coordinate_called = True
+        vars(forward_module)["original_coordinate_called"] = True
         return True, "tokens", CUDAGraphMode.NONE
 
     @contextmanager
     def override_forward_context(forward_context):
-        previous = forward_module.current_forward_context
-        forward_module.current_forward_context = forward_context
+        previous = vars(forward_module)["current_forward_context"]
+        vars(forward_module)["current_forward_context"] = forward_context
         try:
             yield
         finally:
-            forward_module.current_forward_context = previous
+            vars(forward_module)["current_forward_context"] = previous
 
     def create_forward_context(
         attn_metadata,
@@ -101,28 +105,31 @@ def _install_fake_vllm_forward_context(monkeypatch: pytest.MonkeyPatch):
             is_padding=is_padding,
         )
 
-    forward_module.DPMetadata = DPMetadata
-    forward_module.BatchDescriptor = BatchDescriptor
-    forward_module.set_forward_context = original_set_forward_context
-    forward_module.coordinate_batch_across_dp = original_coordinate_batch_across_dp
-    forward_module.override_forward_context = override_forward_context
-    forward_module.create_forward_context = create_forward_context
-    forward_module.current_forward_context = None
-    forward_module.original_set_forward_context_called = False
-    forward_module.original_coordinate_called = False
-    forward_module.track_batchsize = False
-    forward_module.forward_start_time = 0.0
-    forward_module.last_logging_time = 0.0
-    forward_module.batchsize_logging_interval = 1000.0
-    forward_module.batchsize_forward_time = {}
-    forward_module.time = time
-    forward_module.current_platform = SimpleNamespace(
-        set_additional_forward_context=lambda **kwargs: {"platform": kwargs},
-        synchronize=None,
+    vars(forward_module).update(
+        DPMetadata=DPMetadata,
+        BatchDescriptor=BatchDescriptor,
+        set_forward_context=original_set_forward_context,
+        coordinate_batch_across_dp=original_coordinate_batch_across_dp,
+        override_forward_context=override_forward_context,
+        create_forward_context=create_forward_context,
+        current_forward_context=None,
+        original_set_forward_context_called=False,
+        original_coordinate_called=False,
+        track_batchsize=False,
+        forward_start_time=0.0,
+        last_logging_time=0.0,
+        batchsize_logging_interval=1000.0,
+        batchsize_forward_time={},
+        time=time,
+        current_platform=SimpleNamespace(
+            set_additional_forward_context=lambda **kwargs: {"platform": kwargs},
+            synchronize=None,
+        ),
+        logger=logging.getLogger("fake-forward-context"),
     )
-    forward_module.logger = logging.getLogger("fake-forward-context")
-
-    dp_utils_module.coordinate_batch_across_dp = original_coordinate_batch_across_dp
+    vars(dp_utils_module)["coordinate_batch_across_dp"] = (
+        original_coordinate_batch_across_dp
+    )
 
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
     monkeypatch.setitem(sys.modules, "vllm.config", config_module)
@@ -135,17 +142,28 @@ def _install_fake_vllm_forward_context(monkeypatch: pytest.MonkeyPatch):
 
 def _load_patch_module(monkeypatch: pytest.MonkeyPatch):
     _install_fake_vllm_forward_context(monkeypatch)
-    module_name = "afd_plugin.compat.patches.async_dp_forward_context"
-    if module_name in sys.modules:
-        return importlib.reload(sys.modules[module_name])
-    return importlib.import_module(module_name)
+    # Keep fake forward contexts out of real consumers and the adapter cache.
+    for name in (
+        "vllm.v1.worker.gpu_model_runner",
+        "vllm.v1.worker.gpu.model_runner",
+        "vllm.v1.worker.kv_connector_model_runner_mixin",
+        "vllm_ascend.ascend_forward_context",
+    ):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    source = (
+        Path(__file__).resolve().parents[4]
+        / "afd_plugin/compat/patches/async_dp_forward_context.py"
+    )
+    spec = importlib.util.spec_from_file_location("_afd_test_forward_context", source)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_async_dp_forward_context_skips_dp_metadata(monkeypatch):
     _load_patch_module(monkeypatch)
     forward_module = sys.modules["vllm.forward_context"]
-    module_name = "afd_plugin.compat.patches.async_dp_forward_context"
-    importlib.reload(sys.modules[module_name])
 
     with forward_module.set_forward_context(
         attn_metadata=object(),

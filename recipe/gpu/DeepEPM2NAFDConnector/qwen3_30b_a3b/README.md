@@ -1,30 +1,61 @@
 # Qwen3-30B-A3B AFD Recipe
 
-One launch script for Qwen3-30B-A3B in a 2A2F prefill/decode colocation on a
-single 4-GPU node, with a selectable AFD connector and an optional KV
-connector. With the decode-bench KV connector it doubles as a decode-only
+Launch scripts for Qwen3-30B-A3B (BF16) in a 2A2F prefill/decode colocation on
+a single 4-GPU node with vLLM `v0.32.0`. They use the same layouts as the Qwen3
+MoE DeepEP M2N E2E cases (`afd-deepep-m2n-*-2a2f` in
+[`tests/e2e`](../../../../tests/e2e/README.md#deepep-m2n-scenarios)).
+`2a2f_graph_dp2tp1.sh` also takes a selectable AFD connector and an optional KV
+connector; with the decode-bench KV connector it doubles as a decode-only
 benchmark over real KV (see [Decode-only benchmark](#decode-only-benchmark)).
 
 ## Prerequisites
 
 - 4 GPUs on one node. `DeepEPM2NAFDConnector` needs SM90 or newer (H100, H200,
-  GB200) and DeepEP/DeepGEMM installed; `P2pNcclAFDConnector` runs on any
-  A/H-class GPU.
-- vLLM `v0.30.0` and the `afd-plugin` package in the same environment.
-- Qwen3-30B-A3B weights. The script defaults to
+  GB200) and the environment described in the
+  [connector recipes README](../README.md#prerequisites);
+  `P2pNcclAFDConnector` runs on any A/H-class GPU.
+- Qwen3-30B-A3B weights on disk. The scripts default to
   `/path/model_weights/Qwen3-30B-A3B`; override with `MODEL_PATH=...`.
-- Free ports: `6269` for the AFD connector, `18305`/`18306` for the Attention
-  and FFN HTTP servers.
+- Free ports `6239` (AFD rendezvous), `18000` (Attention API) and `18001`
+  (FFN).
 
-## Topology
+## Layout
+
+`2A2F`: Attention on GPUs 0,1 and FFN DP2 on GPUs 2,3. FFN rank 0 owns experts
+0-63 and FFN rank 1 owns experts 64-127.
 
 | GPUs | Role      | Parallelism          | Port  |
 |------|-----------|----------------------|-------|
-| 0, 1 | Attention | DP2 / TP1            | 18305 |
-| 2, 3 | FFN       | DP2 / TP1, EP2       | 18306 |
+| 0, 1 | Attention | DP2 / TP1            | 18000 |
+| 2, 3 | FFN       | DP2 / TP1, EP2       | 18001 |
 
-Both roles run `FULL_DECODE_ONLY` CUDA graphs; prefill runs eager in chunks of
-`MAX_NUM_BATCHED_TOKENS`. Send traffic to the Attention port.
+```text
+prefill_decode_colocation/
+├── 2a2f_eager_dp2tp1.sh       # Attention DP2 x TP1, eager
+├── 2a2f_graph_dp2tp1.sh       # Attention DP2 x TP1, FULL_DECODE_ONLY graph; every knob an env var
+├── 2a2f_graph_dbo_dp2tp1.sh   # Attention DP2 x TP1, graph + DBO
+└── 2a2f_graph_dp1tp2.sh       # Attention DP1 x TP2, FULL_DECODE_ONLY graph
+```
+
+The graph scripts run `FULL_DECODE_ONLY` CUDA graphs; prefill runs eager in
+chunks of `--max-num-batched-tokens`. Send traffic to the Attention port.
+
+## Configuration notes
+
+- Both roles set `compute_gate_on_attention: true` for `DeepEPM2NAFDConnector`
+  (`false` for `P2pNcclAFDConnector`), use the same rank counts, and run with
+  `--enable-expert-parallel`. The FFN runs TP 1.
+- `connector_extra_config` is left empty, so the payload is BF16 and the FFN
+  runs DeepGEMM experts.
+- The graph scripts capture batch sizes 8, 16, 32 and 64. The connector
+  derives its dispatch buckets from the capture sizes and compiles one
+  transport kernel set per bucket at startup.
+- In the DBO script, both roles pass `--enable-dbo` with the same thresholds;
+  the connector then uses two lanes. `2a2f_graph_dp2tp1.sh` does the same with
+  `ENABLE_DBO=1`.
+- The dispatch capacity is derived from `--max-num-batched-tokens` and the
+  largest capture size, so lowering `--max-num-batched-tokens` shrinks the
+  transport buffers.
 
 ## Running
 
@@ -42,11 +73,22 @@ The script backgrounds both roles, logs to `attn.log` and `ffn.log` in the
 current directory, and waits. Wait for `Application startup complete` in
 `attn.log` before sending traffic.
 
-Every knob is an environment variable documented at the top of the script:
-connector (`AFD_CONNECTOR`), KV connector (`KV_CONNECTOR`, or a raw
-`KV_TRANSFER_CONFIG` for any other connector), prefix caching, DBO,
-`MAX_NUM_SEQS`, `MAX_NUM_BATCHED_TOKENS`, graph capture sizes, devices, ports,
-and `EXTRA_ARGS` for anything else.
+Every knob of `2a2f_graph_dp2tp1.sh` is an environment variable documented at
+the top of the script: connector (`AFD_CONNECTOR`), KV connector
+(`KV_CONNECTOR`, or a raw `KV_TRANSFER_CONFIG` for any other connector), prefix
+caching, DBO, `MAX_NUM_SEQS`, `MAX_NUM_BATCHED_TOKENS`, graph capture sizes,
+devices, ports, and `EXTRA_ARGS` for anything else.
+
+## Checking a deployment
+
+```bash
+curl -s http://127.0.0.1:18000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"'"$MODEL_PATH"'","prompt":"The capital of France is","max_tokens":12,"temperature":0}'
+```
+
+For an accuracy check, run the matching E2E case, for example
+`afd-deepep-m2n-graph-2a2f`; see [`tests/e2e`](../../../../tests/e2e/README.md#deepep-m2n-scenarios).
 
 ## Decode-only benchmark
 
@@ -79,7 +121,7 @@ DECODE_BENCH_MAX_OUTPUT_LEN=256 \
     bash recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/prefill_decode_colocation/2a2f_graph_dp2tp1.sh
 
 python tools/benchmarks/decode_bench_client.py \
-    --port 18305 --dp-size 2 --pool-prompts 1000 --prompt-len 1025 \
+    --port 18000 --dp-size 2 --pool-prompts 1000 --prompt-len 1025 \
     --result-dir /tmp/results/decode_bench \
     -- --num-prompts 4000 --random-output-len 256 \
        --max-concurrency 64 --request-rate 20
@@ -136,3 +178,8 @@ than they are.
   pool.
 - `DECODE_BENCH_NUM_PROMPTS=0` keeps the older dummy-KV mode, which writes no
   KV at all.
+
+## Limitations
+
+- Qwen3 MoE only; see the connector guide for the full list of requirements.
+- `FULL_DECODE_ONLY` is the only CUDA graph mode.

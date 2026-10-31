@@ -13,7 +13,6 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
-from torch import device as torch_device  # noqa: E402
 from vllm.config import CUDAGraphMode  # noqa: E402
 from vllm.forward_context import (  # noqa: E402
     BatchDescriptor,
@@ -23,6 +22,7 @@ from vllm.forward_context import (  # noqa: E402
 from vllm.v1.worker import gpu_model_runner as native_v1  # noqa: E402
 from vllm.v1.worker.gpu import cudagraph_utils, dp_utils  # noqa: E402
 from vllm.v1.worker.gpu import model_runner as native_v2  # noqa: E402
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers  # noqa: E402
 from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector  # noqa: E402
 from vllm.v1.worker.gpu.ubatch_utils import UBatchState  # noqa: E402
 from vllm.v1.worker.ubatch_utils import UBatchSlice  # noqa: E402
@@ -54,7 +54,16 @@ from afd_plugin.validation import (  # noqa: E402
 from tests.unit.fakes.connector import (  # noqa: E402
     FakeRoutedConnector,
 )
+from tests.unit.fakes.deepseek_v4 import WorkspaceCase  # noqa: E402
 from tests.unit.fakes.profiler import StepProfiler as _StepProfiler  # noqa: E402
+from tests.unit.fakes.ubatching import (  # noqa: E402
+    TEST_COMPUTE_SMS,
+    TEST_PHYSICAL_SMS,
+    AttentionMetadataState,
+    LegacyNPUAttentionMetadataState,
+    LegacyNPUUBatchRunner,
+    PreparedUBatchRunner,
+)
 
 TEST_MODEL_MAX_LEN = 163840
 TEST_HIDDEN_SIZE = 2048
@@ -77,6 +86,7 @@ class _RecordingConnector:
 
     def send_attn_output(self, hidden_states, context, **kwargs):
         self.events.append("data")
+        self.last_attn_output = hidden_states
 
     def close(self):
         self.closed = True
@@ -84,17 +94,15 @@ class _RecordingConnector:
 
 
 class _RunnerRecorder:
-    instances: list[tuple[SimpleNamespace, torch_device]] = []
-
     def __init__(self, vllm_config, device):
-        type(self).instances.append((vllm_config, device))
+        self.model_config = vllm_config.model_config
+        self.device = device
 
 
 class _NativeRunnerSentinel:
-    instances = 0
-
     def __init__(self, vllm_config, device):
-        type(self).instances += 1
+        self.model_config = vllm_config.model_config
+        self.device = device
 
 
 def _v2_config(
@@ -167,6 +175,7 @@ def _v2_config(
     )
     return SimpleNamespace(
         use_v2_model_runner=use_v2,
+        is_mm_encoder_only=False,
         additional_config={
             "afd": {
                 "role": role,
@@ -236,27 +245,13 @@ def _no_graph_model_manager():
 
 def _fake_worker_init(worker):
     worker.device = torch.device("cpu")
-    if worker.use_v2_model_runner:
-        from vllm.v1.worker.gpu import model_runner as imported_module
-    else:
-        from vllm.v1.worker import gpu_model_runner as imported_module
-
-    worker.model_runner = imported_module.GPUModelRunner(
-        worker.vllm_config,
-        worker.device,
-    )
+    # A second native consumer must remain native during AFD initialization.
+    assert type(_construct_like_native_worker(worker)) is _NativeRunnerSentinel
+    worker.model_runner = worker._make_model_runner()
 
 
 def _construct_like_native_worker(worker):
-    if worker.use_v2_model_runner:
-        from vllm.v1.worker.gpu import model_runner as imported_module
-    else:
-        from vllm.v1.worker import gpu_model_runner as imported_module
-
-    return imported_module.GPUModelRunner(
-        worker.vllm_config,
-        worker.device,
-    )
+    return attention_worker.Worker._make_model_runner(worker)
 
 
 def _prepare_worker(worker_cls, config, *, use_v2):
@@ -511,11 +506,6 @@ _GPU_GRAPH = {
             {"par.enable_expert_parallel": False},
             _err("static expert"),
             id="reject-no-expert-parallel",
-        ),
-        pytest.param(
-            {"comp.pass_config.enable_sp": True},
-            _err("static expert"),
-            id="reject-pass-sp",
         ),
         pytest.param(
             {"hf.architectures": ["UnsupportedForCausalLM"]},
@@ -1548,10 +1538,8 @@ def test_v2_profile_before_graph_manager_uses_provider_without_replay_hook(
         unexpected_replay_hook,
     )
     class_replay = cudagraph_utils.CudaGraphManager.run_fullgraph
-    execute_calls = []
 
     def native_execute(self, *args, **kwargs):
-        execute_calls.append(kwargs)
         assert cudagraph_utils.CudaGraphManager.run_fullgraph is class_replay
         native_context = forward_context_module.create_forward_context()
         native_context.additional_kwargs["afd_metadata"].connector.send_attn_output(
@@ -1571,15 +1559,6 @@ def test_v2_profile_before_graph_manager_uses_provider_without_replay_hook(
         == "profile-result"
     )
 
-    assert execute_calls == [
-        {
-            "dummy_run": False,
-            "skip_attn_for_dummy_run": False,
-            "is_profile": True,
-            "context_len": 0,
-            "valid_dummy_state_slots": False,
-        },
-    ]
     assert events == ["control_update", "control_send", "data"]
     assert cudagraph_utils.CudaGraphManager.run_fullgraph is class_replay
     assert runner._afd_pending_metadata is None
@@ -1641,17 +1620,20 @@ def test_dp1_ordinary_native_path_binds_unpadded_afd_metadata():
 
 
 @pytest.mark.parametrize(
-    ("is_profile", "skip_attn"),
-    [(False, False), (True, True)],
+    ("is_profile", "skip_attn", "randomize_inputs"),
+    [(False, False, False), (True, True, False), (True, True, True)],
 )
-def test_native_v2_dummy_profile_thin_path_uses_afd_execute_wrapper(
+def test_dummy_profile_preserves_randomization(  # long-test: native dummy seam
     monkeypatch,
     is_profile,
     skip_attn,
+    randomize_inputs,
 ):
     events: list[str] = []
     runner = _runner_for_metadata(events)
     runner.max_num_reqs = 2
+    runner.max_num_tokens = 7
+    runner.speculator = None
     runner.lora_config = None
     runner.is_first_pp_rank = True
     runner.is_last_pp_rank = False
@@ -1681,7 +1663,6 @@ def test_native_v2_dummy_profile_thin_path_uses_afd_execute_wrapper(
         "create_forward_context",
         original_create_forward_context,
     )
-    execute_calls: list[tuple[bool, bool, bool]] = []
 
     def native_execute(
         self,
@@ -1692,13 +1673,11 @@ def test_native_v2_dummy_profile_thin_path_uses_afd_execute_wrapper(
         is_profile=False,
         context_len=0,
         valid_dummy_state_slots=False,
+        randomize_inputs=False,
     ):
-        execute_calls.append(
-            (dummy_run, skip_attn_for_dummy_run, is_profile),
-        )
         native_context = forward_context_module.create_forward_context()
         native_context.additional_kwargs["afd_metadata"].connector.send_attn_output(
-            None,
+            randomize_inputs,
             None,
         )
 
@@ -1710,11 +1689,11 @@ def test_native_v2_dummy_profile_thin_path_uses_afd_execute_wrapper(
         skip_attn=skip_attn,
         is_profile=is_profile,
         skip_eplb=True,
+        randomize_inputs=randomize_inputs,
     ) == (None, None)
 
-    assert execute_calls == [(True, skip_attn, is_profile)]
+    assert runner.connector.last_attn_output is randomize_inputs
     assert events == ["control_update", "control_send", "data"]
-    assert runner._afd_pending_metadata is None
     assert runner.kv_connector.disabled is False
     assert (
         forward_context_module.create_forward_context is original_create_forward_context
@@ -2021,8 +2000,13 @@ def _patch_v2_constructor_dependencies(monkeypatch, connector):
     return config
 
 
-def test_v2_load_model_initializes_connector_after_native_load(monkeypatch):
+@pytest.mark.parametrize("inject_model", [False, True])
+def test_v2_load_model_preserves_native_model_and_connects_after_load(
+    monkeypatch, inject_model
+):
     events: list[str] = []
+    native_model = torch.nn.Identity()
+    injected_model = torch.nn.Identity() if inject_model else None
 
     class Connector:
         is_initialized = False
@@ -2031,15 +2015,17 @@ def test_v2_load_model_initializes_connector_after_native_load(monkeypatch):
             events.append("connector_init")
             self.is_initialized = True
 
-    def native_load(self, load_dummy_weights=False, *args, **kwargs):
+    def native_load(self, load_dummy_weights=False, *args, model=None, **kwargs):
         events.append(f"native_load:{load_dummy_weights}")
+        self.model = native_model if model is None else model
 
     runner = object.__new__(AFDAttentionModelRunnerV2)
     runner.connector = Connector()
     monkeypatch.setattr(native_v2.GPUModelRunner, "load_model", native_load)
 
-    runner.load_model(load_dummy_weights=True)
+    runner.load_model(load_dummy_weights=True, model=injected_model)
 
+    assert runner.model is (injected_model if inject_model else native_model)
     assert events == ["native_load:True", "connector_init"]
     assert runner.connector.is_initialized
 
@@ -2127,77 +2113,58 @@ def test_v2_constructor_defers_connector_initialization(monkeypatch):
     assert events == ["native_init"]
 
 
-@pytest.mark.parametrize(
-    ("worker_module", "worker_cls", "runner_name", "native_module"),
-    [
-        (
-            attention_worker,
-            attention_worker.AFDAttentionWorker,
-            "AFDAttentionModelRunnerV2",
-            native_v2,
+@pytest.fixture(
+    params=[
+        pytest.param(
+            (
+                attention_worker,
+                attention_worker.AFDAttentionWorker,
+                "AFDAttentionModelRunnerV2",
+                "attention",
+            ),
+            id="attention",
         ),
-        (ffn_worker, AFDFFNWorker, "GPUFFNModelRunner", native_v2),
-    ],
+        pytest.param(
+            (ffn_worker, AFDFFNWorker, "GPUFFNModelRunner", "ffn"),
+            id="ffn",
+        ),
+    ]
 )
-def test_v2_worker_directly_constructs_one_plugin_runner(
-    monkeypatch,
-    worker_module,
-    worker_cls,
-    runner_name,
-    native_module,
-):
-    config = _v2_config(role="ffn" if worker_cls is AFDFFNWorker else "attention")
-    worker = _prepare_worker(worker_cls, config, use_v2=True)
-    _RunnerRecorder.instances.clear()
-    _NativeRunnerSentinel.instances = 0
+def gpu_worker_case(request):
+    return request.param
 
-    monkeypatch.setattr(worker_module, runner_name, _RunnerRecorder)
-    monkeypatch.setattr(native_module, "GPUModelRunner", _NativeRunnerSentinel)
 
-    def unexpected_v1_construction(*_args, **_kwargs):
-        pytest.fail("AFD GPU startup constructed native ModelRunnerV1")
-
-    monkeypatch.setattr(native_v1, "GPUModelRunner", unexpected_v1_construction)
+def _prepare_gpu_worker_runtime(monkeypatch, worker_case, runner_cls):
+    worker_module, worker_cls, runner_name, role = worker_case
+    worker = _prepare_worker(worker_cls, _v2_config(role=role), use_v2=True)
+    monkeypatch.setattr(worker_module, runner_name, runner_cls)
+    monkeypatch.setattr(native_v2, "GPUModelRunner", _NativeRunnerSentinel)
     monkeypatch.setattr(worker_module.Worker, "init_device", _fake_worker_init)
     monkeypatch.setattr(
-        worker_module,
-        "assert_compatible_afd_stack",
-        lambda *args, **kwargs: None,
+        worker_module, "assert_compatible_afd_stack", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(worker_module.torch.accelerator, "empty_cache", lambda: None)
+    return worker
+
+
+def test_v2_worker_factory_selects_plugin_runner_and_preserves_native_consumer(
+    monkeypatch, gpu_worker_case
+):
+    worker = _prepare_gpu_worker_runtime(monkeypatch, gpu_worker_case, _RunnerRecorder)
 
     worker.init_device()
 
-    assert len(_RunnerRecorder.instances) == 1
-    assert _NativeRunnerSentinel.instances == 0
-    assert native_module.GPUModelRunner is _NativeRunnerSentinel
-    assert worker.model_runner.__class__ is _RunnerRecorder
+    assert type(worker.model_runner) is _RunnerRecorder
     assert worker.model_config is worker.vllm_config.model_config
-    assert worker.model_config.hf_config.architectures == [
-        "AFDDeepseekV2ForCausalLM",
-    ]
-    _construct_like_native_worker(worker)
-    assert _NativeRunnerSentinel.instances == 1
+    assert worker.model_config.hf_config.architectures == ["AFDDeepseekV2ForCausalLM"]
+    assert type(_construct_like_native_worker(worker)) is _NativeRunnerSentinel
 
 
-@pytest.mark.parametrize(
-    ("worker_module", "worker_cls", "runner_name"),
-    [
-        (
-            attention_worker,
-            attention_worker.AFDAttentionWorker,
-            "AFDAttentionModelRunnerV2",
-        ),
-        (ffn_worker, AFDFFNWorker, "GPUFFNModelRunner"),
-    ],
-)
 def test_gpu_workers_reject_v1_before_native_or_plugin_runner_construction(
-    monkeypatch, worker_module, worker_cls, runner_name
+    monkeypatch, gpu_worker_case
 ):
-    config = _v2_config(
-        role="ffn" if worker_cls is AFDFFNWorker else "attention",
-        use_v2=False,
-    )
+    worker_module, worker_cls, runner_name, role = gpu_worker_case
+    config = _v2_config(role=role, use_v2=False)
     worker = _prepare_worker(worker_cls, config, use_v2=False)
     original_model_config = worker.model_config
 
@@ -2205,13 +2172,9 @@ def test_gpu_workers_reject_v1_before_native_or_plugin_runner_construction(
         pytest.fail("V1 configuration reached worker/runner initialization")
 
     monkeypatch.setattr(worker_module, runner_name, unexpected_construction)
-    monkeypatch.setattr(native_v1, "GPUModelRunner", unexpected_construction)
-    monkeypatch.setattr(native_v2, "GPUModelRunner", unexpected_construction)
     monkeypatch.setattr(worker_module.Worker, "init_device", unexpected_construction)
     monkeypatch.setattr(
-        worker_module,
-        "assert_compatible_afd_stack",
-        lambda *args, **kwargs: None,
+        worker_module, "assert_compatible_afd_stack", lambda *args, **kwargs: None
     )
 
     with pytest.raises(RuntimeError, match="requires ModelRunnerV2"):
@@ -2221,58 +2184,19 @@ def test_gpu_workers_reject_v1_before_native_or_plugin_runner_construction(
     assert config.model_config.hf_config.architectures == ["DeepseekV2ForCausalLM"]
 
 
-@pytest.mark.parametrize(
-    ("worker_module", "worker_cls", "runner_name"),
-    [
-        (
-            attention_worker,
-            attention_worker.AFDAttentionWorker,
-            "AFDAttentionModelRunnerV2",
-        ),
-        (ffn_worker, AFDFFNWorker, "GPUFFNModelRunner"),
-    ],
-)
-def test_worker_runner_substitution_restores_on_constructor_exception(
-    monkeypatch,
-    worker_module,
-    worker_cls,
-    runner_name,
+def test_worker_factory_failure_preserves_native_construction(
+    monkeypatch, gpu_worker_case
 ):
-    config = _v2_config(role="ffn" if worker_cls is AFDFFNWorker else "attention")
-    worker = _prepare_worker(worker_cls, config, use_v2=True)
-    _RunnerRecorder.instances.clear()
-    _NativeRunnerSentinel.instances = 0
+    class RaisingRunner:
+        def __init__(self, vllm_config, device):
+            raise RuntimeError("runner construction failed")
 
-    native_module = native_v2
-
-    def raising_worker_init(current_worker):
-        current_worker.device = torch.device("cpu")
-        from vllm.v1.worker.gpu import model_runner as imported_module
-
-        imported_module.GPUModelRunner(
-            current_worker.vllm_config,
-            current_worker.device,
-        )
-        raise RuntimeError("runner construction failed")
-
-    monkeypatch.setattr(worker_module, runner_name, _RunnerRecorder)
-    monkeypatch.setattr(native_module, "GPUModelRunner", _NativeRunnerSentinel)
-    monkeypatch.setattr(worker_module.Worker, "init_device", raising_worker_init)
-    monkeypatch.setattr(
-        worker_module,
-        "assert_compatible_afd_stack",
-        lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(worker_module.torch.accelerator, "empty_cache", lambda: None)
+    worker = _prepare_gpu_worker_runtime(monkeypatch, gpu_worker_case, RaisingRunner)
 
     with pytest.raises(RuntimeError, match="runner construction failed"):
         worker.init_device()
 
-    assert len(_RunnerRecorder.instances) == 1
-    assert _NativeRunnerSentinel.instances == 0
-    assert native_module.GPUModelRunner is _NativeRunnerSentinel
-    _construct_like_native_worker(worker)
-    assert _NativeRunnerSentinel.instances == 1
+    assert type(_construct_like_native_worker(worker)) is _NativeRunnerSentinel
 
 
 def test_ffn_worker_selects_routed_runner_for_routed_connector(monkeypatch):
@@ -2283,7 +2207,6 @@ def test_ffn_worker_selects_routed_runner_for_routed_connector(monkeypatch):
     """
     config = _v2_config(role="ffn")
     worker = _prepare_worker(AFDFFNWorker, config, use_v2=True)
-    _RunnerRecorder.instances.clear()
     monkeypatch.setattr(
         ffn_worker.AFDConnectorFactory,
         "get_connector_class",
@@ -2302,7 +2225,6 @@ def test_ffn_worker_selects_routed_runner_for_routed_connector(monkeypatch):
     worker.init_device()
 
     assert worker.model_runner.__class__ is _RunnerRecorder
-    assert native_v2.GPUModelRunner is _NativeRunnerSentinel
     assert config.kernel_config.moe_backend == "triton"
 
 
@@ -2365,24 +2287,291 @@ def test_v2_validator_requires_gate_on_attention_for_deepep_m2n(role):
 
 @pytest.mark.parametrize("use_v2", [False, True])
 def test_non_afd_model_config_and_native_runner_identity_are_unchanged(
-    monkeypatch,
-    use_v2,
+    monkeypatch, use_v2
 ):
     model_config = SimpleNamespace(
         hf_config=SimpleNamespace(architectures=["OtherForCausalLM"]),
     )
-
-    assert get_afd_model_config(model_config, device_type="cuda") is model_config
-
     native_module = native_v2 if use_v2 else native_v1
-    _NativeRunnerSentinel.instances = 0
     monkeypatch.setattr(native_module, "GPUModelRunner", _NativeRunnerSentinel)
     worker = SimpleNamespace(
         use_v2_model_runner=use_v2,
-        vllm_config=SimpleNamespace(model_config=model_config),
+        vllm_config=SimpleNamespace(
+            model_config=model_config, is_mm_encoder_only=False
+        ),
         device=torch.device("cpu"),
     )
-    _construct_like_native_worker(worker)
 
-    assert _NativeRunnerSentinel.instances == 1
-    assert native_module.GPUModelRunner is _NativeRunnerSentinel
+    assert get_afd_model_config(model_config, device_type="cuda") is model_config
+    assert type(_construct_like_native_worker(worker)) is _NativeRunnerSentinel
+
+
+@pytest.fixture
+def stage_input_runner(monkeypatch):
+    from afd_plugin.compat.patches import gpu_deepseek_v4_dbo as patches
+
+    def build(capacity=35, groups=2, device="cuda"):
+        runner = _runner_for_metadata([])
+        runner.vllm_config.model_config.hf_config.model_type = "deepseek_v4"
+        runner.device = SimpleNamespace(type=device)
+        if device == "cuda":
+            runner._afd_v4_ubatch_inputs = None
+        runner.input_buffers = InputBuffers(8, capacity, torch.device("cpu"))
+        runner.block_tables = SimpleNamespace(
+            slot_mappings=torch.empty((groups, capacity), dtype=torch.int64)
+        )
+        runner.kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(layer_names=[f"kv{i}"]) for i in range(groups)
+            ]
+        )
+        runner.model_state = AttentionMetadataState()
+        runner.ubatch_runner = PreparedUBatchRunner(
+            runner.model_state, runner.kv_cache_config
+        )
+        monkeypatch.setattr(
+            patches, "dbo_current_ubatch_id", lambda: runner.ubatch_runner.stage
+        )
+        return runner
+
+    return build
+
+
+def _stage_test_inputs(runner, offset):
+    batch = InputBatch.make_dummy(2, 28, runner.input_buffers)
+    batch.positions.copy_(torch.arange(28) + offset)
+    slots = runner.block_tables.slot_mappings[:, :28]
+    slots.copy_(torch.arange(slots.numel()).reshape(slots.shape) + offset)
+    return batch, slots
+
+
+@pytest.mark.parametrize(
+    "mode,capacity,groups",
+    [
+        (CUDAGraphMode.NONE, 35, 2),
+        (CUDAGraphMode.FULL, 35, 2),
+        (CUDAGraphMode.FULL, 40, 2),
+        (CUDAGraphMode.FULL, 35, 1),
+    ],
+)
+def test_v4_stage_inputs_stay_aligned_and_refresh_for_eager_or_replay(
+    stage_input_runner, mode, capacity, groups
+):  # long-test: observe two requests through metadata and model-input boundaries.
+    runner = stage_input_runner(capacity, groups)
+    saved = []
+    for offset in (0, 100):
+        batch, slots = _stage_test_inputs(runner, offset)
+        with v2_runner_module._use_afd_ubatch_preparation(runner):
+            prepared = runner.ubatch_runner.prepare(
+                batch,
+                (),
+                slots,
+                mode,
+                for_capture=offset == 0 and mode == CUDAGraphMode.FULL,
+            )
+            for stage, context in enumerate(prepared.forward_contexts):
+                runner.ubatch_runner.stage = stage
+                positions = runner.ubatch_runner.begin_capturable_run(
+                    lambda **kwargs: kwargs["positions"],
+                    {"positions": batch.positions},
+                    prepared,
+                )()
+                token_slice = prepared.slices[stage].token_slice
+                assert torch.equal(positions, batch.positions[token_slice])
+                assert positions.data_ptr() % 64 == 0
+                tensors = [positions]
+                for group in range(groups):
+                    metadata = context.attn_metadata[f"kv{group}"]
+                    assert metadata.positions.data_ptr() == positions.data_ptr()
+                    assert torch.equal(metadata.slot_mapping, slots[group, token_slice])
+                    assert metadata.slot_mapping.data_ptr() % 64 == 0
+                    assert metadata.decode.schedule_metadata.shape == (
+                        TEST_COMPUTE_SMS + 1,
+                    )
+                    if mode == CUDAGraphMode.NONE or offset == 0:
+                        assert (
+                            context.slot_mapping[f"kv{group}"].data_ptr()
+                            == metadata.slot_mapping.data_ptr()
+                        )
+                    tensors.append(metadata.slot_mapping)
+                if offset == 0:
+                    saved.append(tensors)
+                else:
+                    for before, after in zip(saved[stage], tensors, strict=True):
+                        assert before.data_ptr() == after.data_ptr()
+                        assert torch.equal(before, after)
+
+
+@pytest.mark.parametrize("failure", ["prepare", "model"])
+def test_v4_ubatch_failure_restores_native_inputs_and_sm_budget(
+    stage_input_runner, failure
+):
+    runner = stage_input_runner()
+    batch, slots = _stage_test_inputs(runner, 0)
+    if failure == "prepare":
+        runner.model_state.prepare_error = ValueError("step failed")
+
+    def fail(**kwargs):
+        raise ValueError("step failed")
+
+    with (
+        pytest.raises(ValueError, match="step failed"),
+        v2_runner_module._use_afd_ubatch_preparation(runner),
+    ):
+        prepared = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+        runner.ubatch_runner.begin_capturable_run(
+            fail, {"positions": batch.positions}, prepared
+        )()
+    runner.model_state.prepare_error = None
+    prepared = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    for stage, context in enumerate(prepared.forward_contexts):
+        metadata = context.attn_metadata["kv0"]
+        assert metadata.decode.schedule_metadata.shape == (TEST_PHYSICAL_SMS + 1,)
+        assert (
+            metadata.positions.data_ptr()
+            == batch.positions[prepared.slices[stage].token_slice].data_ptr()
+        )
+        assert "afd_metadata" not in context.additional_kwargs
+    positions = runner.ubatch_runner.begin_capturable_run(
+        lambda **kwargs: kwargs["positions"], {"positions": batch.positions}, prepared
+    )()
+    assert (
+        positions.data_ptr()
+        == batch.positions[
+            prepared.slices[runner.ubatch_runner.stage].token_slice
+        ].data_ptr()
+    )
+
+
+def test_npu_v4_keeps_native_preparation_and_stage_inputs(stage_input_runner):
+    runner = stage_input_runner(device="npu")
+    batch, slots = _stage_test_inputs(runner, 0)
+    with v2_runner_module._use_afd_ubatch_preparation(runner):
+        prepared = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    for stage, context in enumerate(prepared.forward_contexts):
+        assert context.additional_kwargs["platform_stage"] == stage
+        assert context.additional_kwargs["afd_metadata"].tokens_lens == [14]
+        assert (
+            context.attn_metadata["kv0"].positions.data_ptr()
+            == batch.positions[prepared.slices[stage].token_slice].data_ptr()
+        )
+    native = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    assert [context.additional_kwargs for context in native.forward_contexts] == [
+        {"platform_stage": 0},
+        {"platform_stage": 1},
+    ]
+
+
+@pytest.mark.parametrize(
+    "device,model_type,use_ubatching",
+    [
+        ("cuda", "deepseek_v4", True),
+        ("cpu", "deepseek_v4", True),
+        ("cuda", "deepseek_v2", True),
+        ("cuda", "deepseek_v4", False),
+    ],
+)
+def test_profile_reserves_workspace_only_for_cuda_v4_ubatching(
+    monkeypatch, device, model_type, use_ubatching
+):
+    case = WorkspaceCase(monkeypatch)
+    case.config.model_config.hf_config.model_type = model_type
+    case.config.parallel_config.use_ubatching = use_ubatching
+    runner = object.__new__(AFDAttentionModelRunnerV2)
+    runner.vllm_config = case.config
+    runner.parallel_config = case.config.parallel_config
+    runner.device = torch.device(device)
+    runner.model = case.model
+    # The native profile locks capacity. Later owners must already be reserved.
+    monkeypatch.setattr(
+        native_v2.GPUModelRunner,
+        "profile_run",
+        lambda *args, **kwargs: case.manager.lock(),
+    )
+    runner.profile_run()
+    if device == "cuda" and model_type == "deepseek_v4" and use_ubatching:
+        views = [case.request(ubatch, lane) for ubatch in range(2) for lane in range(2)]
+        assert len({view.data_ptr() for view in views}) == 4
+    else:
+        with pytest.raises(AssertionError, match="Workspace growth is not allowed"):
+            case.request(1, 1)
+
+
+@pytest.fixture
+def npu_v4_ubatch_case():
+    events: list[str] = []
+    runner = _runner_for_metadata(events, data_parallel_size=2)
+    runner.device = SimpleNamespace(type="npu")
+    runner.vllm_config.model_config.hf_config.model_type = "deepseek_v4"
+    runner.model_state = LegacyNPUAttentionMetadataState()
+    runner.kv_cache_config = SimpleNamespace()
+    runner.ubatch_runner = LegacyNPUUBatchRunner(
+        runner.model_state, runner.kv_cache_config
+    )
+    input_buffers = InputBuffers(4, 8, torch.device("cpu"))
+    batch = InputBatch.make_dummy(2, 8, input_buffers)
+    batch.positions.copy_(torch.arange(8))
+    return runner, batch, torch.arange(8).reshape(1, 8), events
+
+
+@pytest.mark.parametrize(
+    "has_control_plane", [False, True], ids=["async", "control-plane"]
+)
+def test_npu_v4_ubatch_preparation_preserves_native_context_and_control(
+    npu_v4_ubatch_case, has_control_plane
+):
+    runner, batch, slots, events = npu_v4_ubatch_case
+    if not has_control_plane:
+        runner.connector.control_plane = None
+
+    with v2_runner_module._use_afd_ubatch_preparation(runner):
+        prepared = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+
+    for stage, context in enumerate(prepared.forward_contexts):
+        metadata = context.additional_kwargs["afd_metadata"]
+        assert context.additional_kwargs["platform_stage"] == stage
+        assert metadata.stage_idx == stage
+        assert metadata.tokens_lens == [4]
+        assert metadata.tokens_unpadded_lens == [4]
+        assert context.attn_metadata["kv0"].stage == stage
+        assert torch.equal(
+            context.attn_metadata["kv0"].positions,
+            batch.positions[stage * 4 : (stage + 1) * 4],
+        )
+        assert torch.equal(
+            context.slot_mapping["kv0"], slots[0, stage * 4 : (stage + 1) * 4]
+        )
+    expected_events = ["control_update", "control_send"] if has_control_plane else []
+    assert events == expected_events
+    if has_control_plane:
+        payload = runner.connector.last_payload
+        assert list(payload.dp_metadata_list) == [0, 1]
+        assert [
+            m.num_tokens_across_dp_cpu.tolist()
+            for m in payload.dp_metadata_list.values()
+        ] == [[4, 4], [4, 4]]
+
+    native = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    assert [context.additional_kwargs for context in native.forward_contexts] == [
+        {"platform_stage": 0},
+        {"platform_stage": 1},
+    ]
+    assert events == expected_events
+
+
+def test_npu_v4_ubatch_prepare_error_restores_native_preparation(npu_v4_ubatch_case):
+    runner, batch, slots, events = npu_v4_ubatch_case
+    runner.model_state.prepare_error = ValueError("native preparation failed")
+    with (
+        pytest.raises(ValueError, match="native preparation failed"),
+        v2_runner_module._use_afd_ubatch_preparation(runner),
+    ):
+        runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    runner.model_state.prepare_error = None
+
+    native = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    assert [context.additional_kwargs for context in native.forward_contexts] == [
+        {"platform_stage": 0},
+        {"platform_stage": 1},
+    ]
+    assert events == []

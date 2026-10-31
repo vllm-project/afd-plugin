@@ -59,7 +59,7 @@ def construction_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(adapter.native, "RMSNorm", bind(_stage_type("norm")))
     monkeypatch.setattr(
         adapter.native,
-        "ReplicatedLinear",
+        "GateLinear",
         bind(_stage_type("gate")),
     )
     monkeypatch.setattr(adapter.native, "PPMissingLayer", _FakeMissingLayer)

@@ -92,7 +92,7 @@ def construction_env(monkeypatch):
     monkeypatch.setattr(adapter.native, "make_layers", fake_make_layers)
 
 
-def _make_model(monkeypatch, *, role: str):
+def _make_model(monkeypatch, *, role: str, vllm_config=None):
     afd_config = SimpleNamespace(
         compute_gate_on_attention=False,
         connector="P2pNcclAFDConnector",
@@ -103,7 +103,9 @@ def _make_model(monkeypatch, *, role: str):
         "parse_afd_config",
         lambda *_args, **_kwargs: afd_config,
     )
-    return adapter.AFDDeepseekV4Model(vllm_config=_vllm_config())
+    if vllm_config is None:
+        vllm_config = _vllm_config()
+    return adapter.AFDDeepseekV4Model(vllm_config=vllm_config)
 
 
 def _make_layer(monkeypatch, *, role: str, layer_idx: int):
@@ -139,6 +141,23 @@ def test_v4_model_constructs_only_role_owned_decoder_stages(
             assert not hasattr(layer, "attn_norm")
 
 
+@pytest.mark.parametrize("backend", sorted(adapter.native.MEGA_MOE_BACKENDS))
+def test_v4_model_rejects_native_and_flashinfer_mega_backends(
+    monkeypatch,
+    backend,
+):
+    monkeypatch.setattr(
+        adapter.native,
+        "current_platform",
+        SimpleNamespace(device_type="cuda"),
+    )
+    vllm_config = _vllm_config()
+    vllm_config.kernel_config.moe_backend = backend
+
+    with pytest.raises(RuntimeError, match="does not support MegaMoE"):
+        _make_model(monkeypatch, role="ffn", vllm_config=vllm_config)
+
+
 def test_v4_ffn_model_has_no_head_mhc_parameters_or_mtp_buffer(
     monkeypatch,
     construction_env,
@@ -161,7 +180,7 @@ def test_v4_attention_model_owns_head_mhc_parameters(
     parameter_names = {name for name, _ in model.named_parameters()}
 
     assert {"hc_head_fn", "hc_head_base", "hc_head_scale"} <= parameter_names
-    # The MTP buffer follows the 0.30 native contract: allocated only when
+    # The MTP buffer follows the native contract: allocated only when
     # speculative decoding needs target hidden states.
     assert model._mtp_hidden_buffer is None
 

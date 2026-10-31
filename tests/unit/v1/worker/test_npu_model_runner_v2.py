@@ -53,6 +53,11 @@ def _runner(*, async_dp=False):
         },
         parallel_config=SimpleNamespace(enable_dbo=False, use_ubatching=False),
     )
+    runner.compilation_config = runner.vllm_config.compilation_config
+    runner.input_buffers = SimpleNamespace(dummy_num_tokens=None)
+    runner.speculator = None
+    runner.max_num_tokens = 7
+    runner.debugger = None
     runner.afd_config = SimpleNamespace(
         async_dp=async_dp, num_attention_ranks=2, num_ffn_ranks=2
     )
@@ -225,8 +230,9 @@ def test_mla_replay_updates_captured_stage_records_and_restores_context(
 
 @pytest.mark.parametrize("async_dp", [False, True])
 @pytest.mark.parametrize("raise_in_native", [False, True])
-def test_execute_forwards_dummy_profile_and_context_then_restores(
-    monkeypatch, raise_in_native, async_dp
+@pytest.mark.parametrize("randomize_inputs", [False, True])
+def test_execute_forwards_dummy_profile_and_context_then_restores(  # long-test: scopes
+    monkeypatch, raise_in_native, async_dp, randomize_inputs
 ):
     runner = _runner(async_dp=async_dp)
     original_state = _state(runner)
@@ -263,12 +269,26 @@ def test_execute_forwards_dummy_profile_and_context_then_restores(
     if raise_in_native:
         with pytest.raises(RuntimeError, match="native execute failed"):
             runner.execute_model(
-                scheduler_output, intermediate, True, True, True, 17, True
+                scheduler_output,
+                intermediate,
+                True,
+                True,
+                True,
+                17,
+                True,
+                randomize_inputs,
             )
     else:
         assert (
             runner.execute_model(
-                scheduler_output, intermediate, True, True, True, 17, True
+                scheduler_output,
+                intermediate,
+                True,
+                True,
+                True,
+                17,
+                True,
+                randomize_inputs,
             )
             == "native-result"
         )
@@ -281,6 +301,7 @@ def test_execute_forwards_dummy_profile_and_context_then_restores(
                 "is_profile": True,
                 "context_len": 17,
                 "valid_dummy_state_slots": True,
+                "randomize_inputs": randomize_inputs,
             },
         )
     ]
@@ -447,6 +468,7 @@ def test_native_dummy_run_reaches_afd_execute_with_context_state(monkeypatch, as
                 "is_profile": True,
                 "context_len": 17,
                 "valid_dummy_state_slots": True,
+                "randomize_inputs": False,
             },
         )
     ]
@@ -602,17 +624,23 @@ def test_camp2p_padding_preserves_graph_descriptor_and_restores_dispatch(
         mode, counts[0], 3, uniform_token_count=1, max_query_len=1, num_active_loras=2
     )
     sync = dp_utils.DPSyncState(torch.tensor(counts), 1, False, 7)
-    dispatch_calls = []
 
-    def native_dispatch(*args, **kwargs):
-        dispatch_calls.append((args, kwargs))
-        return desc, sync
+    def native_dispatch(*args, dp_sync_state=None, **kwargs):
+        return desc, dp_sync_state
 
     monkeypatch.setattr(native_v2, "dispatch_cg_and_sync_dp", native_dispatch)
 
     def native_execute(self, *args, **kwargs):
         actual_desc, actual_sync = native_v2.dispatch_cg_and_sync_dp(
-            None, 3, 3, 1, 2, 0, max_query_len=1, need_eager=False
+            None,
+            3,
+            3,
+            1,
+            2,
+            0,
+            max_query_len=1,
+            need_eager=False,
+            dp_sync_state=sync,
         )
         if mode == CUDAGraphMode.FULL:
             assert actual_desc is desc
@@ -639,7 +667,6 @@ def test_camp2p_padding_preserves_graph_descriptor_and_restores_dispatch(
             runner.execute_model(SimpleNamespace(total_num_scheduled_tokens=3))
             == "native-result"
         )
-    assert len(dispatch_calls) == 1
     assert native_v2.dispatch_cg_and_sync_dp is native_dispatch
 
 

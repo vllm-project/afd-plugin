@@ -19,19 +19,19 @@
 #   ENABLE_PREFIX_CACHING    1 | 0 (1)
 #   ENABLE_DBO               1 | 0 (0)
 #   DBO_DECODE_TOKEN_THRESHOLD / DBO_PREFILL_TOKEN_THRESHOLD (2 / 2)
-#   MAX_NUM_SEQS             per Attention DP rank (128)
+#   MAX_NUM_SEQS             per Attention DP rank (256)
 #   MAX_NUM_BATCHED_TOKENS   prefill chunk per step (3072)
 #   CUDAGRAPH_CAPTURE_SIZES  comma-separated decode graph sizes
-#                            (8,16,32,48,64,96,112,128)
+#                            (8,16,32,48,64,96,112,128,192,256)
 #   MAX_MODEL_LEN            (4096)
 #   GPU_MEMORY_UTILIZATION   (unset: vLLM default)
 #   ATTN_DEVICES / FFN_DEVICES (0,1,2,3 / 4,5)
 #   ATTN_TP                  Attention tensor-parallel size; Attention DP is the
 #                            number of ATTN_DEVICES divided by it (1)
-#   AFD_HOST / AFD_PORT      AFD connector rendezvous (127.0.0.1 / 6269)
+#   AFD_HOST / AFD_PORT      AFD connector rendezvous (127.0.0.1 / 6239)
 #   AFD_PROCESS_GROUP_TIMEOUT_S  AFD join timeout; the roles can finish
-#                            loading minutes apart (7200)
-#   ATTN_PORT / FFN_PORT     HTTP ports (18305 / 18306)
+#                            loading minutes apart (3600)
+#   ATTN_PORT / FFN_PORT     HTTP ports (18000 / 18001)
 #   EXTRA_ARGS               extra `vllm serve` args for both roles (empty)
 #   ATTN_EXTRA_ARGS / FFN_EXTRA_ARGS  extra `vllm serve` args for one role (empty)
 #
@@ -55,19 +55,19 @@ ENABLE_PREFIX_CACHING=${ENABLE_PREFIX_CACHING:-1}
 ENABLE_DBO=${ENABLE_DBO:-0}
 DBO_DECODE_TOKEN_THRESHOLD=${DBO_DECODE_TOKEN_THRESHOLD:-2}
 DBO_PREFILL_TOKEN_THRESHOLD=${DBO_PREFILL_TOKEN_THRESHOLD:-2}
-MAX_NUM_SEQS=${MAX_NUM_SEQS:-128}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-256}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-3072}
-CUDAGRAPH_CAPTURE_SIZES=${CUDAGRAPH_CAPTURE_SIZES:-8,16,32,48,64,96,112,128}
+CUDAGRAPH_CAPTURE_SIZES=${CUDAGRAPH_CAPTURE_SIZES:-8,16,32,48,64,96,112,128,192,256}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-}
 ATTN_DEVICES=${ATTN_DEVICES:-0,1,2,3}
 FFN_DEVICES=${FFN_DEVICES:-4,5}
 ATTN_TP=${ATTN_TP:-1}
 AFD_HOST=${AFD_HOST:-127.0.0.1}
-AFD_PORT=${AFD_PORT:-6269}
-AFD_PROCESS_GROUP_TIMEOUT_S=${AFD_PROCESS_GROUP_TIMEOUT_S:-7200}
-ATTN_PORT=${ATTN_PORT:-18305}
-FFN_PORT=${FFN_PORT:-18306}
+AFD_PORT=${AFD_PORT:-6239}
+AFD_PROCESS_GROUP_TIMEOUT_S=${AFD_PROCESS_GROUP_TIMEOUT_S:-3600}
+ATTN_PORT=${ATTN_PORT:-18000}
+FFN_PORT=${FFN_PORT:-18001}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 ATTN_EXTRA_ARGS=${ATTN_EXTRA_ARGS:-}
 FFN_EXTRA_ARGS=${FFN_EXTRA_ARGS:-}
@@ -140,9 +140,9 @@ COMMON_ARGS=(
     --max-model-len "$MAX_MODEL_LEN"
     --max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE"
     --compilation-config "{\"cudagraph_mode\": \"FULL_DECODE_ONLY\", \"cudagraph_capture_sizes\": [${CUDAGRAPH_CAPTURE_SIZES}]}"
-    # A cold load of the 235B checkpoint can outlast vLLM's 1800 s gloo timeout
-    # between DP peers.
-    --cpu-distributed-timeout-seconds 7200
+    # Loading the weights can outlast the default timeouts, especially from
+    # cold storage.
+    --cpu-distributed-timeout-seconds 3600
     --trust-remote-code
 )
 if [[ "$ENABLE_DBO" == 1 ]]; then
@@ -174,14 +174,14 @@ FFN_ARGS=(--data-parallel-size "$NUM_FFN_RANKS" --tensor-parallel-size 1)
 # shellcheck disable=SC2206
 FFN_ARGS+=($FFN_EXTRA_ARGS)
 
-CUDA_VISIBLE_DEVICES=$FFN_DEVICES uv run vllm serve "$MODEL_PATH" \
+CUDA_VISIBLE_DEVICES=$FFN_DEVICES vllm serve "$MODEL_PATH" \
     --additional-config "$(afd_config ffn)" \
     "${COMMON_ARGS[@]}" \
     "${FFN_ARGS[@]}" \
     --host 127.0.0.1 \
     --port "$FFN_PORT" > ffn.log 2>&1 &
 
-CUDA_VISIBLE_DEVICES=$ATTN_DEVICES uv run vllm serve "$MODEL_PATH" \
+CUDA_VISIBLE_DEVICES=$ATTN_DEVICES vllm serve "$MODEL_PATH" \
     --additional-config "$(afd_config attention)" \
     "${COMMON_ARGS[@]}" \
     "${ATTN_ARGS[@]}" \

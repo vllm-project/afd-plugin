@@ -24,7 +24,63 @@ from afd_plugin.connectors import (  # noqa: E402
     AFDTransferContext,
     AFDTransferMetadata,
 )
+from afd_plugin.connectors.base import AFDControlPlaneClosedError  # noqa: E402
 from afd_plugin.distributed import build_rank_mapping  # noqa: E402
+
+
+@pytest.fixture
+def lifecycle_connector():
+    module = importlib.import_module("afd_plugin.connectors.gpu.p2p")
+    connector = AFDConnectorFactory.create_connector(
+        0,
+        0,
+        _fake_vllm_config(),
+        AFDConfig(
+            role="ffn",
+            connector="P2pNcclAFDConnector",
+            num_attention_ranks=1,
+            num_ffn_ranks=1,
+        ),
+    )
+    return module, connector
+
+
+def test_p2p_close_cancels_receive_and_releases_owned_resources_idempotently(
+    monkeypatch, lifecycle_connector
+):
+    module, connector = lifecycle_connector
+    owned = SimpleNamespace(active=True)
+    connector.p2p_pg = owned
+    communicators = [SimpleNamespace(active=True) for _ in range(2)]
+    for communicator in communicators:
+        communicator.destroy = lambda owner=communicator: setattr(
+            owner, "active", False
+        )
+    connector.a2e_pynccl, connector.e2a_pynccl = communicators
+
+    def abort(group):
+        if not group.active:
+            raise ValueError("group already unregistered")
+        group.active = False
+
+    monkeypatch.setattr(module, "_abort_process_group", abort)
+
+    connector.control_plane.close()
+    connector.close()
+    connector.close()
+
+    assert not owned.active
+    assert all(not communicator.active for communicator in communicators)
+    assert not connector.is_initialized
+    with pytest.raises(AFDControlPlaneClosedError):
+        connector.control_plane.recv_dp_metadata_list()
+
+
+def test_p2p_control_plane_receive_requires_initialized_group(lifecycle_connector):
+    _, connector = lifecycle_connector
+
+    with pytest.raises(RuntimeError, match="process group is not initialized"):
+        connector.control_plane.recv_dp_metadata_list()
 
 
 def _fake_vllm_config(

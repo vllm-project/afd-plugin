@@ -168,6 +168,14 @@ MRV2_BACKENDS = {
 }
 
 
+def test_gpu_validator_accepts_target_config_without_removed_enable_sp(mrv2_config):
+    del mrv2_config.compilation_config.pass_config
+
+    validate_gpu_model_runner_v2_config(
+        mrv2_config, expected_role="attention", device_type="cuda"
+    )
+
+
 @pytest.mark.parametrize("role", ["attention", "ffn"])
 def test_routed_transport_preserves_runner_and_gate_policy(mrv2_config, role):
     mrv2_config.additional_config["afd"].update(

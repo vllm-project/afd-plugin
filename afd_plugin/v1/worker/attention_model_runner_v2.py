@@ -10,6 +10,7 @@ from types import MethodType
 from typing import TYPE_CHECKING
 
 import torch
+from torch import nn
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import ForwardContext
 from vllm.sequence import IntermediateTensors
@@ -22,7 +23,7 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
 from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.worker.gpu.ubatch_utils import UBatchRunner, UBatchState
+from vllm.v1.worker.gpu.ubatch_utils import UBatchState
 
 from afd_plugin.compat.patches.gpu_mrv2_ubatching import (
     use_gpu_mrv2_dbo_dispatch,
@@ -49,6 +50,8 @@ from afd_plugin.validation import validate_gpu_model_runner_v2_config
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.pcp_manager import PCPManager
+
+    from afd_plugin.compat.patches.gpu_deepseek_v4_dbo import _AFDV4UBatchInputs
 
 _AFD_FULLGRAPH_HOOK_MARKER = "_afd_fullgraph_replay_hook_active"
 
@@ -112,61 +115,75 @@ def _use_afd_ubatch_preparation(
     if ubatch_runner is None:
         yield
         return
-    state = vars(ubatch_runner)
-    had_override = "prepare" in state
-    previous_override = state.get("prepare")
-    original_prepare = ubatch_runner.prepare
-
-    # Patch reason: native MRV2 creates stage contexts through an imported
-    # factory alias, bypassing the ordinary AFD context provider. Its graph
-    # branch also bypasses prepare_inputs_to_capture.
-    # Patch functionality: decorate native stage state and publish one complete
-    # A/F payload before threads start (or before FULL replay).
-    # Signature: matches UBatchRunner.prepare at vLLM ced6857.
-    # Delegation exception: keep native slicing/attention preparation in the
-    # bound method. Remove this seam when upstream offers a prepared-state
-    # callback; no runner class or module-global function is replaced here.
-    def prepare(
-        self: UBatchRunner,
-        input_batch: InputBatch,
-        block_tables: tuple[torch.Tensor, ...],
-        slot_mappings: torch.Tensor,
-        cg_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-        for_capture: bool = False,
-    ) -> UBatchState:
-        # ### PATCH START: bind AFD to native stage state outside graph execution.
-        prepared = original_prepare(
-            input_batch, block_tables, slot_mappings, cg_mode, for_capture
+    model_preparation: AbstractContextManager[None] = nullcontext()
+    if (
+        runner.vllm_config.model_config.hf_config.model_type == "deepseek_v4"
+        and runner.device.type == "cuda"
+    ):
+        # Load the CUDA compatibility patches after the shared NPU boundary.
+        from afd_plugin.compat.patches.gpu_deepseek_v4_dbo import (
+            _use_v4_ubatch_preparation,
         )
-        if event_tracker is not None:
-            desc, is_warmup = event_tracker.consume(
-                input_batch.num_reqs,
-                input_batch.num_tokens_after_padding,
-                len(prepared.slices),
+
+        model_preparation = _use_v4_ubatch_preparation(runner)
+    with model_preparation:
+        state = vars(ubatch_runner)
+        had_override = "prepare" in state
+        previous_override = state.get("prepare")
+        original_prepare = ubatch_runner.prepare
+
+        # Patch reason: native MRV2 creates stage contexts through an imported
+        # factory alias, bypassing the ordinary AFD context provider. Its graph
+        # branch also bypasses prepare_inputs_to_capture.
+        # Patch functionality: decorate native stage state and publish one complete
+        # A/F payload before threads start (or before FULL replay).
+        # Signature: matches UBatchRunner.prepare in
+        # vllm/v1/worker/gpu/ubatch_utils.py at vLLM
+        # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+        # Delegation exception: keep native slicing/attention preparation in the
+        # bound method. Remove this seam when upstream offers a prepared-state
+        # callback; no runner class or module-global function is replaced here.
+        def prepare(
+            self,
+            input_batch: InputBatch,
+            block_tables: tuple[torch.Tensor, ...],
+            slot_mappings: torch.Tensor,
+            cg_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+            for_capture: bool = False,
+        ) -> UBatchState:
+            # ### PATCH START: bind AFD to native stage state outside graph execution.
+            prepared = original_prepare(
+                input_batch, block_tables, slot_mappings, cg_mode, for_capture
             )
-            runner._is_warmup = is_warmup
-            runner._afd_is_graph_capturing = not is_warmup
-            runner._afd_is_graph_replaying = False
-            if capture_prepared is not None:
-                capture_prepared(desc, prepared, is_warmup)
-        else:
-            runner._afd_is_graph_replaying = cg_mode == CUDAGraphMode.FULL
-        runner.install_mrv2_ubatch_metadata(
-            prepared.slices, prepared.forward_contexts, input_batch.num_tokens
-        )
-        if runner.connector.control_plane is not None:
-            runner.send_dp_metadata(None, prepared.slices)
-        return prepared
-        # ### PATCH END: bind AFD to native stage state outside graph execution.
+            if event_tracker is not None:
+                desc, is_warmup = event_tracker.consume(
+                    input_batch.num_reqs,
+                    input_batch.num_tokens_after_padding,
+                    len(prepared.slices),
+                )
+                runner._is_warmup = is_warmup
+                runner._afd_is_graph_capturing = not is_warmup
+                runner._afd_is_graph_replaying = False
+                if capture_prepared is not None:
+                    capture_prepared(desc, prepared, is_warmup)
+            else:
+                runner._afd_is_graph_replaying = cg_mode == CUDAGraphMode.FULL
+            runner.install_mrv2_ubatch_metadata(
+                prepared.slices, prepared.forward_contexts, input_batch.num_tokens
+            )
+            if runner.connector.control_plane is not None:
+                runner.send_dp_metadata(None, prepared.slices)
+            return prepared
+            # ### PATCH END: bind AFD to native stage state outside graph execution.
 
-    ubatch_runner.prepare = MethodType(prepare, ubatch_runner)
-    try:
-        yield
-    finally:
-        if had_override:
-            ubatch_runner.prepare = previous_override
-        else:
-            del ubatch_runner.prepare
+        ubatch_runner.prepare = MethodType(prepare, ubatch_runner)
+        try:
+            yield
+        finally:
+            if had_override:
+                ubatch_runner.prepare = previous_override
+            else:
+                del ubatch_runner.prepare
 
 
 @contextmanager
@@ -182,11 +199,11 @@ def _use_afd_capture_input_preparation(
     # module symbol once before each warmup/formal-capture forward.
     # Patch functionality: preserve native preparation and publish the
     # matching AFD event before the forward starts.
-    # Signature: matches vLLM v0.30.0 prepare_inputs_to_capture exactly,
-    # including the 0.30.0 trailing pcp_manager parameter.
+    # Signature: matches vLLM v0.32.0 prepare_inputs_to_capture exactly,
+    # including the trailing pcp_manager parameter.
     # Upstream source: vllm/v1/worker/gpu/cudagraph_utils.py,
     # prepare_inputs_to_capture; commit
-    # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
     def prepare_inputs_to_capture(
         num_reqs: int,
         num_tokens: int,
@@ -260,16 +277,16 @@ def _use_afd_fullgraph_replay_hook(
     # execute-scoped AFD provider cannot publish runtime control.
     # Patch functionality: wrap only this manager instance and publish one
     # ordinary padded control payload immediately before each native replay.
-    # Signature: matches vLLM v0.30.0 ModelCudaGraphManager.run_fullgraph exactly.
+    # Signature: matches vLLM v0.32.0 ModelCudaGraphManager.run_fullgraph exactly.
     # Upstream source: vllm/v1/worker/gpu/cudagraph_utils.py,
     # ModelCudaGraphManager.run_fullgraph; commit
-    # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
     # Delegation exception: native replay remains wholly in the saved bound
     # method; this scope owns only the AFD pre-replay control seam.
     # Removal/upstream plan: delete this hook when vLLM exposes a per-manager
     # callback immediately before FULL graph replay.
     def run_fullgraph(
-        self: v2_cudagraph_utils.ModelCudaGraphManager,
+        self,
         desc: v2_cudagraph_utils.BatchExecutionDescriptor,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
         # ### PATCH START: publish one AFD pre-replay payload.
@@ -357,7 +374,7 @@ def _use_afd_execution_context(
 
 
 class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
-    """Thin AFD seam over native vLLM 0.30.0 GPU ModelRunnerV2.
+    """Thin AFD seam over native vLLM 0.32.0 GPU ModelRunnerV2.
 
     Native V2 retains request state, input preparation, Attention/KV handling,
     sampling, and output ownership. The inherited AFD metadata methods are
@@ -378,6 +395,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
             device_type=device.type,
         )
         super().__init__(vllm_config, device)
+        self._afd_v4_ubatch_inputs: _AFDV4UBatchInputs | None = None
         connector: AFDConnectorBase | None = None
         try:
             self.afd_config = self.parse_config(self.vllm_config)
@@ -412,7 +430,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
             raise
 
     def _afd_num_tokens_for_context(self, forward_context: ForwardContext) -> int:
-        # vLLM 0.30.0's token chain is
+        # vLLM 0.32.0's token chain is
         # scheduler_output.total_num_scheduled_tokens ->
         # dispatch_cg_and_sync_dp(..., need_eager=is_profile or skip_compiled)
         # -> ordinary ModelCudaGraphManager.dispatch() or the forced-eager
@@ -449,18 +467,24 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
 
     # Patch reason: native V2 load_model has no AFD connector lifecycle.
     # Patch functionality: initialize the AFD connector after native weight
-    # loading so Attention and FFN model loading overlap across roles. A
-    # connector that delivers routed expert rows also receives the MoE layers
-    # this model dispatches, which every rank checks against the FFN's.
-    # Signature: matches vLLM v0.30.0 GPUModelRunnerV2.load_model exactly,
-    # including the upstream *args/**kwargs pass-through.
+    # loading so Attention and FFN model loading overlap across roles.
+    # Routed-experts connectors receive the loaded MoE layer order for their
+    # cross-rank handshake.
+    # Signature: matches vLLM v0.32.0 GPUModelRunnerV2.load_model exactly.
+    # Upstream: vllm/v1/worker/gpu/model_runner.py, load_model;
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # Delegation exception: native loading and model injection remain in super;
+    # only the AFD connector handshake follows native loading.
+    # Removal plan: remove when native loading supports connector lifecycle hooks.
     def load_model(
         self,
         load_dummy_weights: bool = False,
         *args,
+        model: nn.Module | None = None,
         **kwargs,
     ) -> None:
-        super().load_model(load_dummy_weights, *args, **kwargs)
+        super().load_model(load_dummy_weights, *args, model=model, **kwargs)
+        # ### PATCH START: connect after native loading.
         if self.connector.is_initialized:
             return
         if isinstance(self.connector, AFDRoutedExpertsConnector):
@@ -469,6 +493,32 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
             )
         else:
             self.connector.init_afd_connector()
+        # ### PATCH END: connect after native loading.
+
+    # Patch reason: native skip-attention profiling visits only workspace slot0;
+    # later V4 UBatch prefill must not grow scratch after graph capture locks it.
+    # Patch functionality: reserve each real V4 FlashMLA owner's native bound
+    # before the unchanged profile so resident scratch overlaps its normal peak.
+    # Signature/decorator: GPUModelRunner.profile_run, vllm/v1/worker/gpu/
+    # model_runner.py, 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # Delegation keeps the full native activation/sampler profile exactly once.
+    # Remove when native profiling reserves scratch for all execution owners.
+    @torch.inference_mode()
+    def profile_run(self, randomize_inputs: bool = False) -> None:
+        # ### PATCH START: pre-reserve only CUDA V4 UBatch attention scratch.
+        if (
+            self.device.type == "cuda"
+            and self.vllm_config.model_config.hf_config.model_type == "deepseek_v4"
+            and self.parallel_config.use_ubatching
+        ):
+            # GPU-only backend import must not extend the shared NPU boundary.
+            from afd_plugin.compat.patches.gpu_deepseek_v4_dbo import (
+                _reserve_flashmla_ubatch_workspace,
+            )
+
+            _reserve_flashmla_ubatch_workspace(self.model, self.vllm_config)
+        # ### PATCH END: pre-reserve only CUDA V4 UBatch attention scratch.
+        super().profile_run(randomize_inputs=randomize_inputs)
 
     # Patch reason: native KV initialization excludes DP1 from UBatchRunner
     # construction, although AFD can coordinate its two microbatches locally.
@@ -476,7 +526,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     # adapter; native KV allocation, runner and CUDA graph setup stay upstream.
     # Signature: matches GPUModelRunner.initialize_kv_cache at the pinned commit.
     # Upstream: vllm/v1/worker/gpu/model_runner.py, initialize_kv_cache;
-    # ced6857afa0ea7b2e3f0846a62e1394e90f15607 (vLLM 0.30.0).
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be (vLLM 0.32.0).
     # Delegation exception: the large native KV/graph lifecycle remains in super;
     # only its factory seam is missing. Remove when upstream supports DP1 DBO.
     def initialize_kv_cache(
@@ -494,7 +544,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
             )
         # ### PATCH END: enable native DP1 UBatchRunner construction.
 
-    # Patch reason: vLLM 0.30.0 prepares FULL graph inputs before each warmup
+    # Patch reason: vLLM 0.32.0 prepares FULL graph inputs before each warmup
     # and formal capture forward, outside torch.cuda.graph, but does not expose
     # that lifecycle to AFD's control plane.
     # Patch functionality: temporarily wrap the exact upstream input-preparation
@@ -505,12 +555,12 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     # prepares inputs exactly twice per captured descriptor (warmup + capture);
     # profiling only truncates the descriptor list to
     # manager._max_full_descs_to_capture, which this wrapper mirrors.
-    # Signature: matches vLLM v0.30.0 GPUModelRunner.capture_model exactly
-    # (profile_only keyword-only parameter added in 0.30.0) and is forwarded
+    # Signature: matches vLLM v0.32.0 GPUModelRunner.capture_model exactly
+    # (including the keyword-only profile_only parameter) and is forwarded
     # unchanged to super().
     # Upstream source: vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.capture_model; commit
-    # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
     # Delegation exception: native capture remains wholly in super(); this
     # wrapper owns only the temporary AFD lifecycle seam.
     # Removal/upstream plan: delete this wrapper when vLLM exposes graph
@@ -565,12 +615,11 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     # AFD must install its sidecar at that exact context-construction seam.
     # Patch functionality: delegate all request/input/Attention/KV/sampling/
     # output work to native V2 while temporarily installing AFD metadata.
-    # Signature: matches vLLM v0.30.0 GPUModelRunnerV2.execute_model exactly,
-    # including the 0.30.0 trailing context_len and valid_dummy_state_slots
-    # parameters, which are forwarded by keyword.
+    # Signature: matches vLLM v0.32.0 GPUModelRunnerV2.execute_model exactly,
+    # including randomize_inputs, forwarded unchanged to native dummy execution.
     # Upstream source: vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.execute_model; commit
-    # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
     # Delegation exception: the upstream method is intentionally not copied;
     # only this narrow provider/profiler wrapper is AFD-specific.
     # Removal/upstream plan: delete this wrapper when vLLM exposes a plugin
@@ -585,6 +634,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
         is_profile: bool = False,
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
+        randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         # ### PATCH START: scope AFD metadata provider/replay and profiler step.
         step_afd_gpu_profiler(self.prof)
@@ -600,6 +650,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
                 is_profile=is_profile,
                 context_len=context_len,
                 valid_dummy_state_slots=valid_dummy_state_slots,
+                randomize_inputs=randomize_inputs,
             )
         # ### PATCH END: scope AFD metadata provider/replay and profiler step.
 
@@ -607,10 +658,10 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     # connector, or pending metadata sidecar.
     # Patch functionality: preserve delegated native cleanup and guarantee all
     # AFD cleanup layers run when any earlier layer raises.
-    # Signature: matches vLLM v0.30.0 GPUModelRunnerV2.shutdown exactly.
+    # Signature: matches vLLM v0.32.0 GPUModelRunnerV2.shutdown exactly.
     # Upstream source: vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.shutdown; commit
-    # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
     # Delegation exception: native resource release remains in super().shutdown;
     # this override contains only AFD-specific finalizers.
     # Removal/upstream plan: delete this wrapper if AFD-owned lifecycle moves
@@ -622,6 +673,8 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
         finally:
             try:
                 super().shutdown()
+                # Native graphs and threads no longer reference stage inputs.
+                self._afd_v4_ubatch_inputs = None
             finally:
                 self._afd_pending_metadata = None
                 self.connector.close()

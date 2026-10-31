@@ -159,7 +159,6 @@ def validate_gpu_model_runner_v2_config(
         or parallel.enable_elastic_ep
         or parallel.enable_eplb
         or parallel.use_sequence_parallel_moe
-        or vllm_config.compilation_config.pass_config.enable_sp
     ):
         raise RuntimeError("AFD ModelRunnerV2 requires static expert parallelism")
     if (

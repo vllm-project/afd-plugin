@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 # falls back to the root WARNING level and drops the prompt-pool INFO lines.
 logger = init_logger(f"vllm.{__name__}")
 
-KVCacheLayer = torch.Tensor | tuple[torch.Tensor, ...]
+KVCacheLayer: TypeAlias = torch.Tensor | tuple[torch.Tensor, ...]
 
 # A warmup request only has to prefill its pool prompt; one output token also
 # fixes how many blocks each pinned pool entry holds.

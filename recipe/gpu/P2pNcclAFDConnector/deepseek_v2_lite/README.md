@@ -1,7 +1,10 @@
 # DeepSeek-V2-Lite AFD Examples
 
 End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
-(Attention-FFN Disaggregation) plugin on vLLM `v0.30.0`.
+(Attention-FFN Disaggregation) plugin targeting vLLM `v0.32.0`. These are
+deployment examples, not v0.32 recipe validation. See the
+[runtime matrix](../../../../docs/design/module/execution_platforms.md#tested-runtime-matrix)
+for tested E2E configurations.
 
 > [!NOTE]
 > `P2pNcclAFDConnector` is an example connector implementation. Contributions
@@ -11,14 +14,18 @@ End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
 ## Prerequisites
 
 - Install [NIXL](https://github.com/ai-dynamo/nixl).
-- At least 4 GPUs(A/H-class, tested against L20X).
-- vLLM `v0.30.0` and the `afd-plugin` package installed in the same
+- Four GPUs for the `2a2f_*` and `2p1a1f_*` examples; the `4a4f_*`
+  examples require eight GPUs. The multipod example uses two GPUs per pod
+  across two pods.
+- vLLM `v0.32.0` and the `afd-plugin` package installed in the same
   environment (see repository root `AGENTS.md`).
-- DeepSeek-V2-Lite weights on disk. All scripts default to
-  `/path/model_weights/DeepSeek-V2-Lite`; override with
-  `MODEL_PATH=...` when launching.
+- DeepSeek-V2-Lite weights on disk. Colocation scripts default to
+  `/path/model_weights/DeepSeek-V2-Lite`; disaggregation scripts default to
+  `/home/models/hub/models--deepseek-ai--DeepSeek-V2-Lite/snapshots/604d5664dddd88a0433dbae533b7fe9472482de0`.
+  Set `MODEL_PATH=...` to the local weights when launching.
 - A free TCP port `6269` on `127.0.0.1` for the AFD p2p connector, and
-  ports `18301`/`18302`/`18303`/`18305` for the vLLM HTTP servers.
+  HTTP ports `18305` and `18306` for local colocation, or
+  `18301`–`18305` for prefill/decode disaggregation.
 
 ## Directory layout
 
@@ -56,13 +63,15 @@ End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
 | GPUs | Role      | Port  |
 |------|-----------|-------|
 | 0, 1 | Attention | 18305 |
-| 2, 3 | FFN       | 18305 |
+| 2, 3 | FFN       | 18306 |
 
 The four `2a2f_*` variants cover the TP/DP cross product; `4a4f_*` doubles
 both attention and FFN ranks (DP=2 on each side); `multipod_2a_2f_graph_dbo_dp1tp2.sh`
 is the same `2a2f_graph_dbo_dp1tp2` config, but gated on a `POD` env var
 (`ATTENTION_0` or `FFN_0`) for the `deploy-afd-k8s` skill to deploy it
-across 2 pods (see repo-root `recipe/gpu/P2pNcclAFDConnector/README.md`) --
+across 2 pods (see repo-root `recipe/gpu/P2pNcclAFDConnector/README.md`);
+its Attention and FFN HTTP ports can both be 18305 because they are in
+separate pods --
 unlike the scripts above, it is **not** meant to be run directly: with
 `POD` unset, neither `vllm serve` block executes, and its
 `AFD_CONNECTOR_HOST` default (`vllm-ffn-p2p-service`) only resolves inside
@@ -101,21 +110,20 @@ bash recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_disaggregati
 
 ### Running the benchmark
 
-Once the serving stack is up, run:
+Confirm the serving stack is ready before running:
 
 ```bash
 export MODEL_PATH=/path/model_weights/DeepSeek-V2-Lite
-export MODEL_NAME=$MODEL_PATH
 export RESULT_DIR=/tmp/results
 export RESULT_FILENAME=2a2f_graph_dbo_dp1tp2.json
-bash tools/benchmarks/benchmark.sh
+bash tools/benchmarks/request_generator.sh
 ```
 
-The script waits for `http://$HOST:$PORT/v1/models`, sends one completion
-smoke request, then runs `vllm bench serve`. By default it fires 1024 random
-requests (1024 input tokens / 128 output tokens) at request rate 5 with
-`--max-concurrency 32` against `127.0.0.1:18305`, and dumps the JSON result to
-`$RESULT_DIR/$RESULT_FILENAME`. Override `HOST`, `PORT`, `MODEL_NAME`,
+The script runs `vllm bench serve`; it does not wait for readiness or send a
+separate smoke request. By default it sends 1024 random requests (1024 input
+tokens / 128 output tokens) at request rate 5 with `--max-concurrency 32`
+against `127.0.0.1:18305`, and saves the JSON result to
+`$RESULT_DIR/$RESULT_FILENAME`. Override `HOST`, `PORT`, `MODEL_PATH`,
 `NUM_PROMPTS`, `REQUEST_RATE`, `MAX_CONCURRENCY`, `INPUT_LEN`, and `OUTPUT_LEN`
 for smaller smoke runs or larger throughput sweeps.
 

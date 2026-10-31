@@ -11,9 +11,10 @@ Current runtime constraints and validation evidence are summarized in the
 [runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix).
 
 > [!WARNING]
-> CAM async is experimental. The native DBO path requires target-device model
-> validation; configuration acceptance and executor tests alone do not qualify
-> model accuracy or performance.
+> CAM async is experimental. DeepSeek-V2-Lite native two-stage execution has
+> a 100-question target-device accuracy result, with a graceful-exit failure.
+> V4 true DBO boundary qualification and performance remain unverified. See
+> the [0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507) for the precise scope.
 
 ## When to use this connector
 

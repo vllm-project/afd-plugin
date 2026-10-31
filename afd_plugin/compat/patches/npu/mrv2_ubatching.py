@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Scoped Ascend seams for vLLM ced6857a's native UBatchRunner.
+"""Scoped Ascend seams for vLLM's native UBatchRunner.
 
-Ascend baseline: 8d4409d6256d8a6729140ddcc0d1889e3f96cdd6.
+Upstream: vllm/v1/worker/gpu/ubatch_utils.py at
+5df63a7203cdb9328d824a27b682e77c7b9928be.
+Ascend runtime: bd42eea01d8312c4df469fabaed45f77a12df4d3.
 MRV2 owns preparation, threads, handoff and graph lifecycle.
 All bindings are scoped to AFD runners and restored on exit.
 Remove when upstream supports Ascend child inputs, streams and cancellation.
@@ -113,7 +115,7 @@ def use_npu_ubatch_factory(runner: "AFDNPUAttentionModelRunnerV2") -> Iterator[N
 
     # This scope runs only during AFD NPU KV initialization. Keep the native
     # eligibility check, except Async CAM needs no DP handshake at DP=1.
-    # Signature matches maybe_build_ubatch_runner at ced6857a.
+    # Signature matches ubatch_utils.maybe_build_ubatch_runner at 5df63a72.
     def maybe_build_ubatch_runner(
         vllm_config: VllmConfig,
         device: torch.device,
@@ -159,7 +161,9 @@ def use_async_cam_dbo_dispatch() -> Iterator[None]:
     # Patch reason: native dispatch returns early at DP=1 before DBO selection.
     # Patch functionality: apply native eligibility and thresholds at DP=1;
     # native dispatch continues to own every DP>1 descriptor.
-    # Signature matches dispatch_cg_and_sync_dp at ced6857a.
+    # Upstream: vllm/v1/worker/gpu/dp_utils.py at
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # Signature matches dispatch_cg_and_sync_dp; no added parameters.
     # Delegation exception: native descriptor/threshold selection stays upstream.
     # Removal plan: remove when native dispatch supports local DP=1 DBO.
     def dispatch_cg_and_sync_dp(
@@ -175,7 +179,7 @@ def use_async_cam_dbo_dispatch() -> Iterator[None]:
         parallel_config: ParallelConfig | None = None,
         allow_ubatching: bool = False,
         uniform_decode: bool = False,
-        dp_sync: DPSyncState | None = None,
+        dp_sync_state: DPSyncState | None = None,
     ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
         desc, sync = original_dispatch(
             cudagraph_manager,
@@ -190,7 +194,7 @@ def use_async_cam_dbo_dispatch() -> Iterator[None]:
             parallel_config=parallel_config,
             allow_ubatching=allow_ubatching,
             uniform_decode=uniform_decode,
-            dp_sync=dp_sync,
+            dp_sync_state=dp_sync_state,
         )
         # ### PATCH START: native DBO eligibility without a DP handshake.
         if (
@@ -217,7 +221,8 @@ def use_async_cam_child_dp_metadata() -> Iterator[None]:
     original_metadata = ubatch_utils.DPMetadata
 
     class AsyncCamDPMetadata:
-        # Native ced6857a UBatchRunner calls DPMetadata.make unconditionally.
+        # Native ubatch_utils.UBatchRunner._make_forward_contexts at 5df63a72
+        # calls DPMetadata.make unconditionally.
         # Async FFN owns its own DP layout; DP1 without SP also fails that factory.
         # This factory alias is scoped to native child context construction;
         # the real forward_context.DPMetadata class remains untouched.
@@ -247,7 +252,7 @@ def use_npu_input_batch_slicing() -> Iterator[None]:
     # Native replace() retains the Ascend subtype but leaves seq_lens_np whole.
     # Delegation preserves native query/sequence truncation. Apply exactly its
     # CPU truncation delta to Ascend's exact lengths, including straddling requests.
-    # Signature matches _slice_input_batch at ced6857a.
+    # Signature matches ubatch_utils._slice_input_batch at 5df63a72.
     def _slice_input_batch(
         input_batch: InputBatch,
         ubatch_slice: UBatchSlice,
@@ -333,7 +338,8 @@ def use_npu_ubatch_output_merge() -> Iterator[None]:
     # Patch reason: Ascend auxiliary outputs are (Tensor, list[Tensor]), which
     # native torch.cat(parts) cannot concatenate. Preserve the tensor merge,
     # adapting only that nested contract. Signature matches
-    # merge_ubatch_outputs at ced6857. Remove when upstream handles nested aux.
+    # ubatch_utils.merge_ubatch_outputs at 5df63a72.
+    # Remove when upstream handles nested aux.
     def merge_ubatch_outputs(outputs: list[Any]) -> Any:
         # ### PATCH START: Ascend nested auxiliary outputs.
         return cat_ubatch_outputs(outputs)

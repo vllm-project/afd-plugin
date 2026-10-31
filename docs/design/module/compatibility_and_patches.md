@@ -26,6 +26,8 @@ validation_paths:
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
 upstream_refs:
+  - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "vLLM vllm.v1.engine.core.EngineCore and EngineCoreProc"
   - "vLLM vllm.v1.engine.core_client.DPAsyncMPClient"
   - "vLLM vllm.forward_context.set_forward_context"
@@ -58,14 +60,19 @@ patch modules must not become a general home for AFD-owned functionality.
 
 ## Supported upstream boundary
 
-The package extra pins vLLM `0.30.0`, and
-[`compat/vllm.py`](../../../afd_plugin/compat/vllm.py) enforces the same target.
+The package extra pins vLLM `0.32.0` for both backends.
+[`compat/vllm.py`](../../../afd_plugin/compat/vllm.py) checks the shared
+`0.32.0` target.
 Direct strict calls raise for a missing or different vLLM; plugin registration
 calls the check with `strict=False`, so it warns and continues. This warning
-policy does not make another vLLM release supported.
+policy does not make another vLLM release supported. Shared EngineCore and
+coordinator patches use the 0.32 contract. See the
+[runtime matrix](execution_platforms.md#tested-runtime-matrix) for hardware
+validation scope.
 
-The NPU implementation is based on vLLM-Ascend commit
-[`8d4409d62`](https://github.com/vllm-project/vllm-ascend/commit/8d4409d6256d8a6729140ddcc0d1889e3f96cdd6).
+The NPU implementation targets vLLM `0.32.0` (`5df63a72`) and
+vLLM-Ascend commit
+[`bd42eea0`](https://github.com/vllm-project/vllm-ascend/commit/bd42eea01d8312c4df469fabaed45f77a12df4d3).
 The repository does not declare a vLLM-Ascend package dependency in
 `pyproject.toml`, so this source commit and the recorded NPU validation are the
 compatibility evidence rather than a released package or container tag.
@@ -131,6 +138,16 @@ not the package dependency policy.
 | [`npu/mla_graph.py`](../../../afd_plugin/compat/patches/npu/mla_graph.py): `vllm_ascend.attention.mla_v1.get_graph_params` | Resolves an AFD ubatch-owned `GraphParams` registry from the active forward context and otherwise delegates to the saved upstream process-global resolver. | Called through `apply_afd_ascend_patches_if_needed` during NPU worker startup; no version guard. Saves the original on the upstream module and uses a module sentinel. | [`test_runtime.py`](../../../tests/unit/compat/test_runtime.py) covers AFD-context resolution, upstream fallback, and idempotence; [`test_npu_mla_graph.py`](../../../tests/unit/v1/worker/test_npu_mla_graph.py) covers the owning graph lifecycle. | Remove when vLLM-Ascend accepts a forward-context-local MLA graph registry or exposes an equivalent resolver hook. |
 | [`npu/mrv2_ubatching.py`](../../../afd_plugin/compat/patches/npu/mrv2_ubatching.py): native ubatch factory, dispatch, child DP metadata, input slicing, context and stream aliases | Builds `NPUUBatchRunner`, enables Async CAM DBO at DP1, omits Async child DP coordination, applies native truncation to Ascend CPU sequence lengths, preserves model-specific PP slices/nested auxiliary outputs, and provides NPU stream/failure handling during eager and capture. Native MRV2 owns execution and graph lifecycle. | Scoped to AFD initialization, preparation or execution; every replaced alias is restored in `finally`. The scope temporarily changes module symbols, so it is not an independent concurrent-runner API. | [`test_npu_model_runner_v2.py`](../../../tests/unit/v1/worker/test_npu_model_runner_v2.py), [`test_async_cam_dbo.py`](../../../tests/unit/model_executor/test_async_cam_dbo.py), [`test_mrv2_dbo.py`](../../../tests/npu/test_mrv2_dbo.py). | Remove when native vLLM/Ascend supports NPU child builders and streams, optional child DP metadata, DP1 DBO and peer cancellation. |
 
+## Temporary CUDA DeepSeek-V4 DBO fixes
+
+[`gpu_deepseek_v4_dbo.py`](../../../afd_plugin/compat/patches/gpu_deepseek_v4_dbo.py)
+records the pinned source, four workarounds, upstream PRs and removal conditions.
+The CUDA runner scopes input/indexer preparation and reserves workspace before
+profiling; the V4 decoder calls the padding guard. Instance bindings are restored
+on exit. Regressions live in
+[`test_gpu_deepseek_v4_dbo.py`](../../../tests/unit/compat/patches/test_gpu_deepseek_v4_dbo.py)
+and [`test_model_runner_v2.py`](../../../tests/unit/v1/worker/test_model_runner_v2.py).
+
 ## Non-patch compatibility adapters
 
 These modules adapt upstream behavior without replacing a global symbol:
@@ -145,9 +162,9 @@ These modules adapt upstream behavior without replacing a global symbol:
 
 Several scoped upstream adaptations live with their semantic owners rather
 than this patch directory. Model dummy runs and V2 execution temporarily wrap
-`create_forward_context`; CUDA worker startup temporarily substitutes the
-native V2 runner symbol; V2 graph capture temporarily wraps native input
+`create_forward_context`; V2 graph capture temporarily wraps native input
 preparation; and full-graph replay installs an instance-local manager hook.
+CUDA workers select AFD runners through the native `_make_model_runner` factory.
 Every scope restores symbols and runner state in `finally`. Connector process
 groups also call private PyTorch/vLLM helpers as described in
 [connector contracts](connector_contracts.md). All of these seams must be
@@ -165,8 +182,8 @@ ordinary `EngineCoreProc`, retains the native coordinator/stat channels, and
 disables wave coordination. Existing DPLB tests exercise native routing with
 supplied counts;
 they do not prove end-to-end publication from a running async Attention
-scheduler. Audit the v0.30 publisher path before adding another queue-statistics
-patch.
+scheduler. Audit the applicable pinned publisher path before adding another
+queue-statistics patch.
 
 ## Patch review and refresh procedure
 

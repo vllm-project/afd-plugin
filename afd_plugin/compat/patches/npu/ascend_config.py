@@ -38,7 +38,7 @@ _ASCEND_CONFIG_ALIAS_MODULES = (
 
 
 # Upstream: vllm_ascend/ascend_config.py at
-# 8d4409d6256d8a6729140ddcc0d1889e3f96cdd6.
+# bd42eea01d8312c4df469fabaed45f77a12df4d3.
 # Patch reason: strict AscendConfig construction rejects AFD's shared settings.
 # Patch functionality: exclude the AFD namespace from constructor kwargs,
 # preserving the source mapping, config identity and native singleton/cache.
@@ -108,6 +108,15 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     # pre-step; the resolved path is passed as the dump_config_path field.
     dump_config_path = AscendConfig._resolve_dump_config_path(additional_config)
 
+    from vllm_ascend.observability.runtime_config import (
+        ADDITIONAL_CONFIG_STRIP_KEYS as _RUNTIME_CONFIG_STRIP_KEYS,
+    )
+    from vllm_ascend.observability.runtime_config import (
+        build_runtime_config_from_additional,
+    )
+
+    runtime_boot = build_runtime_config_from_additional(additional_config)
+
     # Keys that must NOT flow from additional_config into AscendConfig.
     # These are stripped so that only user-configurable keys reach pydantic,
     # where extra="forbid" can reject unknown options.
@@ -137,11 +146,12 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         # replaced with the validated dump_config_path field below.
         "dump_config",
         "dump_config_path",
+        *_RUNTIME_CONFIG_STRIP_KEYS,
         # pure-derived fields (derive_and_validate computes them; user input would residualize)
-        # NOTE: enable_shared_expert_dp/enable_sparse_sfa_c8/enable_sparse_li_c8
-        # are NOT here — they are user-input fields that derive_and_validate
-        # augments (self.x = self.x and condition), so the user must be able to
-        # pass them. Only pure-derived fields (no user input) are stripped.
+        # enable_sparse_li_c4 is selected by attention_config.indexer_kv_dtype
+        # and the model's sparse-attention support,not additional config.
+        "enable_sparse_li_c4",
+        "enable_sparse_sfa_turboquant",
         "enable_sp_by_pass",
         "pd_tp_ratio",
         "pd_head_ratio",
@@ -149,7 +159,9 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         # private derived state (init=False, but listed for safety)
         "_sparse_li_c8_layer_ids",
         "_sparse_li_c8_layer_names",
-        "_sparse_li_c8_layer_filter_enabled",
+        "_sparse_li_c4_layer_ids",
+        "_sparse_li_c4_layer_names",
+        "_sparse_li_layer_filter_enabled",
         # SchedulerConfig-internal top-level legacy keys (resolved internally,
         # then replaced by the typed scheduler_config passed above).
         "enable_balance_scheduling",
@@ -178,6 +190,9 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         sparse_kv_offload_config=sparse_kv,
         kvpp_config=kvpp_config,
         dump_config_path=dump_config_path,
+        runtime_config_path=runtime_boot.path,
+        runtime_config_hot_reload=runtime_boot.hot_reload,
+        runtime_config=runtime_boot.runtime_config,
         **kwargs,
     )
     # Business validation (Plan B): pydantic did type/range/enum checks during
@@ -233,7 +248,7 @@ def apply_afd_ascend_config_patch() -> None:
 
 
 # Upstream: vllm_ascend/patch/platform/patch_engine_core.py at
-# 8d4409d6256d8a6729140ddcc0d1889e3f96cdd6.
+# bd42eea01d8312c4df469fabaed45f77a12df4d3.
 # Patch reason: DP EngineCore initializes AscendConfig before vLLM loads
 # general plugins in the spawned process, so AFD's config namespace fails
 # strict validation before register_afd can install the namespace factory.

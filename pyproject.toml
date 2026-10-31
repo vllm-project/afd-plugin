@@ -13,7 +13,7 @@ name = "vllm-afd-plugin"
 dynamic = ["version"]
 description = "vLLM external plugin for Attention-FFN Disaggregation (AFD)"
 readme = "README.md"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "AFD plugin contributors" }]
@@ -23,7 +23,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -34,7 +33,7 @@ dependencies = []
 # Keep vLLM optional so macOS and CPU-only development can run import/config tests.
 # Install the runtime extra only in environments with a compatible vLLM wheel.
 [project.optional-dependencies]
-vllm = ["vllm==0.30.0"]
+vllm = ["vllm==0.32.0"]
 afdep = [
     "afdep-comm @ git+https://github.com/afdEP/afdEP-comm.git@2b74d574e9d25cc794de8d2359f815fcfb48955a",
 ]
@@ -88,7 +87,7 @@ markers = [
 
 [tool.ruff]
 line-length = 88
-target-version = "py310"
+target-version = "py311"
 extend-exclude = [".venv", "venv", "build", "dist"]
 
 [tool.ruff.lint]
@@ -119,7 +118,7 @@ indent-style = "space"
 docstring-code-format = true
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 # Silent follow for library code; missing third-party stubs are ignored
 # everywhere (including tests). tests/ still get --follow-imports skip from
 # tools/pre_commit/mypy.py.

@@ -27,7 +27,8 @@ validation_paths:
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_runtime_classpaths.py"
 upstream_refs:
-  - "vLLM 0.30.0 ced6857afa0ea7b2e3f0846a62e1394e90f15607"
+  - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "vLLM vllm.general_plugins entry-point group"
   - "vLLM vllm.config.VllmConfig"
 verified_platform_refs:
@@ -177,8 +178,8 @@ communication resources are created. Both roles must use PP/PCP/DCP size 1,
 role ranks equal to DP x TP, static EP, and a registered AFD model; elastic EP
 and EPLB are rejected. CUDA V2 requires `P2pNcclAFDConnector`, model-specific
 gate placement, and exactly two microbatches with Attention DP1 or DP > 1.
-The DP1 path has H20 DeepSeek-V2-Lite DP1/TP2 Graph + DBO validation with
-128 GSM8K samples and live two-stage/full-replay assertions.
+See the [runtime matrix](execution_platforms.md#tested-runtime-matrix) for
+tested configurations and known DeepSeek-V2-Lite DBO shutdown failures.
 Ascend V2 accepts synchronous `CAMP2pAFDConnector` with FFN-side gating or
 eager `CAMAsyncAFDConnector` with async DP and Attention-side gating. Ascend
 native DBO requires exactly two microbatches and no speculative decoding.
@@ -207,7 +208,9 @@ runtime integration and are not stable third-party extension interfaces.
 and `AFD_ASYNC_CAM_LAYERED_GMM`. Profiling and connector diagnostics are read
 by their owning modules. Environment switches do not replace `additional_config["afd"]` as the
 activation or topology channel. The layered-GMM switch is FFN-only and
-validated for the DeepSeek-V4 Async CAM path.
+applies to the DeepSeek-V4 Async CAM path. See the
+[runtime matrix](execution_platforms.md#tested-runtime-matrix) for hardware
+validation scope.
 
 `AFD_FORCE_SPAWN_MULTIPROCESSING=1` is an opt-in package-import adaptation for
 the affected A3 Python 3.12 environment. It sets the default multiprocessing

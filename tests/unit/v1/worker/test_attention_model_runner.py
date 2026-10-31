@@ -13,7 +13,6 @@ pytest.importorskip("vllm")
 
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, ForwardContext
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 import afd_plugin.model_executor.models.forward_context as afd_forward_context
 from afd_plugin.config import AFDConfig
@@ -695,10 +694,3 @@ def test_afd_rank_raises_for_out_of_range_dp2_tp2(monkeypatch):
 
     with pytest.raises(ValueError, match="out of range"):
         resolve_role_rank(vllm_config, config)
-
-
-def test_attention_runner_delegates_native_profile_and_dummy_execution():
-    # MRV2 owns input preparation and microbatching; AFD wraps execute_model's
-    # provider seam rather than retaining V1 dummy/profile implementations.
-    assert AFDAttentionModelRunnerV2.profile_run is GPUModelRunner.profile_run
-    assert AFDAttentionModelRunnerV2._dummy_run is GPUModelRunner._dummy_run

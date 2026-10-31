@@ -20,6 +20,8 @@ validation_paths:
   - "tests/e2e/models/**"
   - "tests/e2e/accuracy/**"
 upstream_refs:
+  - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "vLLM vllm.model_executor.models.deepseek_v2"
   - "vLLM vllm.model_executor.models.qwen3_moe"
   - "vLLM vllm.forward_context.ForwardContext"
@@ -27,8 +29,8 @@ upstream_refs:
 verified_platform_refs:
   - "DeepSeek V2 Lite GPU and NPU model E2E paths"
   - "CAM async NPU model E2E path"
-  - "DeepSeek V4 CUDA boundary has focused unit coverage only"
-  - "DeepSeek V4 Ascend Hash-id boundary has focused unit coverage and a manual Ascend 950 run"
+  - "DeepSeek V4 CUDA contract tests and E2E profiles; see execution-platform matrix for hardware scope"
+  - "DeepSeek V4 Ascend Hash-id boundary has focused unit coverage and a historical manual Ascend 950 run"
 related_issues:
   - "#86"
   - "#88"
@@ -139,8 +141,9 @@ CUDA-only and requires synchronous `P2pNcclAFDConnector`,
 `compute_gate_on_attention=false`, and pipeline-parallel size 1. It rejects
 sequence-parallel MoE, EPLB, and the `deep_gemm_mega_moe` backend. The P2P
 connector validates one-dimensional `torch.int32` input IDs and preallocates
-their receive buffers for graph execution. This boundary currently has
-focused unit coverage but no repository model or accuracy E2E case.
+their receive buffers for graph execution. See the
+[runtime matrix](execution_platforms.md#tested-runtime-matrix) for tested
+CUDA configurations and validation limits.
 
 ### DeepSeek V4 Ascend boundary
 
@@ -163,8 +166,9 @@ separate from the optional routed W4A8 layered executor's unresolved nonzero
 
 The synchronous DSV4 E2E profiles check concurrent serving but disable answer
 checking; the A5 profile records incorrect concurrent answers. Async DSV4 has
-an exact-answer smoke case; current native DBO still requires model accuracy
-qualification. See
+an exact-answer smoke case; V4 true native DBO still requires model accuracy
+qualification. Lite two-stage DBO has the limited result recorded in the
+[0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507). See
 [E2E testing](e2e_testing.md) and the [layered guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-layered-gmm-experimental-disabled-by-default).
 
 ### Qwen3 MoE CUDA boundary
@@ -336,8 +340,8 @@ forward-context contract. Run model unit tests and the affected GPU/NPU model
 and accuracy E2E paths; weight-loading changes require role-specific evidence.
 Forward-context mutations require restoration/error-path tests, and an
 architecture registration change requires package registration plus checkpoint
-load evidence. A unit-only boundary such as the current CUDA DeepSeek V4 path
-must not be described as hardware-validated without new E2E evidence.
+load evidence. A unit-only boundary must not be described as
+hardware-validated without corresponding device E2E evidence.
 
 ## Limitations and open issues
 

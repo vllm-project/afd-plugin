@@ -21,6 +21,7 @@ import math
 import os
 import random
 import socket
+import threading
 import time
 import traceback
 from collections.abc import Callable, Mapping
@@ -1381,6 +1382,51 @@ def peer_exit_scenario(
         run_attention_step(connector, [(x, ids, w)], [torch.empty_like(x)])
     torch.cuda.synchronize()
     return {"completed_without_peer_s": time.monotonic() - start}
+
+
+def close_cancels_receive_scenario(
+    connector: Any, topology: M2NTopology, args: dict[str, Any]
+) -> dict[str, Any]:
+    """FFN ranks close the control plane while another thread waits for the
+    next step's payload, as the FFN worker's shutdown does; every rank then
+    meets on the bootstrap group the DeepEP lanes hold.
+
+    One step first brings the control group up, so the receive waits on an
+    idle group, as a serving FFN worker's does. FFN ranks return how the
+    receive ended, whether its thread outlived ``join_s``, and how long after
+    ``close()`` it stopped.
+    """
+    from afd_plugin.connectors.base import AFDControlPlaneClosedError
+
+    control_step(connector, [(args["tokens"],) * topology.attn_size])
+    metrics: dict[str, Any] = {}
+    if connector.is_ffn:
+        outcome = {"receive": "blocked"}
+
+        def receive() -> None:
+            torch.cuda.set_device(connector.device)
+            try:
+                connector.control_plane.recv_dp_metadata_list()
+                outcome["receive"] = "payload"
+            except AFDControlPlaneClosedError:
+                outcome["receive"] = "cancelled"
+            except Exception as error:
+                outcome["receive"] = repr(error)
+
+        thread = threading.Thread(target=receive, daemon=True)
+        thread.start()
+        time.sleep(args["block_s"])
+        start = time.monotonic()
+        connector.control_plane.close()
+        thread.join(args["join_s"])
+        metrics = {
+            **outcome,
+            "alive": thread.is_alive(),
+            "stopped_s": time.monotonic() - start,
+        }
+    # Fails on an FFN rank whose close() aborted the lanes' bootstrap group.
+    dist.barrier(group=connector.bootstrap_group)
+    return metrics
 
 
 def _timed(fn: Any, iters: int) -> float:

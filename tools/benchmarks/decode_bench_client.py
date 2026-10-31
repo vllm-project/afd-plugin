@@ -142,7 +142,7 @@ def parse_args(argv: Sequence[str]) -> tuple[argparse.Namespace, list[str]]:
         epilog="Arguments after `--` are passed to the measured `vllm bench serve`.",
     )
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=18305)
+    parser.add_argument("--port", type=int, default=18000)
     parser.add_argument(
         "--model",
         default=None,

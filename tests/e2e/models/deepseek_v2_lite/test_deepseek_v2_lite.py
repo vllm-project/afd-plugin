@@ -176,7 +176,11 @@ def test_deepseek_v2_lite(scenario: str, tmp_path: Path) -> None:
         else DEFAULT_GSM8K_SAMPLE_LIMIT
     )
     sample_limit = env.get(GSM8K_LIMIT_ENV, str(default_limit))
-    if sample_limit != "all" and int(sample_limit) <= SMOKE_MAX_SAMPLES:
+    if (
+        scenario != "afd-v2-graph-dbo-tp2"
+        and sample_limit != "all"
+        and int(sample_limit) <= SMOKE_MAX_SAMPLES
+    ):
         # Model smoke gates require 2/7 or 6/24 correct; larger runs keep 0.27.
         env.setdefault(GSM8K_THRESHOLD_ENV, str(SMOKE_MIN_ACCURACY))
     run_runner(command, env=env)

@@ -11,17 +11,17 @@ Use this connector when Attention and FFN workers run as separate synchronous
 Ascend services. Use `P2pNcclAFDConnector` for CUDA deployments and
 `CAMAsyncAFDConnector` for the asynchronous Ascend path.
 
-`CAMP2pAFDConnector` supports prefill and decode in eager mode. V1 ACL graph
-uses `FULL_DECODE_ONLY`; the implemented V2 path also accepts `FULL`.
-V2 accepts eager native DBO with exactly two microbatches and Attention
-DP > 1. V2 DBO graphs remain unsupported; other models and topologies require
-their own evidence.
+`CAMP2pAFDConnector` supports prefill and decode in eager mode. The V2 path
+also accepts graph execution and native DBO with exactly two microbatches
+and Attention DP > 1. Plain MLA graph+DBO requires `FULL_DECODE_ONLY`.
+See the [0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507) for tested models,
+topologies and the known graceful-exit failures.
 
 ## Prerequisites
 
-- vLLM `0.30.0` at `ced6857a` and an Ascend PyTorch/vLLM-Ascend environment
+- vLLM `0.32.0` at `5df63a72` and an Ascend PyTorch/vLLM-Ascend environment
   based on source commit
-  [`8d4409d6`](https://github.com/vllm-project/vllm-ascend/commit/8d4409d6256d8a6729140ddcc0d1889e3f96cdd6).
+  [`bd42eea0`](https://github.com/vllm-project/vllm-ascend/commit/bd42eea01d8312c4df469fabaed45f77a12df4d3).
 - The AFD Ascend custom operators must be built and available at runtime.
 - HCCL connectivity for the data path and Gloo connectivity for DP metadata.
 - Identical model hidden size, model dtype, AFD topology, rendezvous address,

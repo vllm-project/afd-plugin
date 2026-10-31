@@ -2,8 +2,10 @@
 
 Configuration and source-contract tests can run on CPU; runtime contracts
 depend on vLLM/vLLM-Ascend, and device tests also need the matching Ascend
-runtime and hardware. Use vLLM 0.30.0 and the vLLM-Ascend source revision in
+runtime and hardware. Use vLLM 0.32.0 and the vLLM-Ascend source revision in
 the [installation guide](../../README.md#ascend-npu-installation).
+The [0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507) distinguishes measured
+coverage from deferred qualification and records the graceful-exit failures.
 
 From the repository root, run:
 
@@ -47,8 +49,9 @@ ASCEND_RT_VISIBLE_DEVICES=0 python3 -m pytest -q -ra tests/npu/test_mrv2_dbo.py
 
 It checks native child handoff, stream/context restoration and peer failure
 wakeup. It does not validate CAMP2P/CAM transport, checkpoint output, or model
-accuracy. Before qualifying the current native-only Async CAM DBO path, run
-model comparisons at Attention DP1 and DP > 1, plain TP and model SP, with
+accuracy. The recorded Lite two-stage result does not qualify every Async CAM
+DBO configuration. For broader qualification, run model comparisons at
+Attention DP1 and DP > 1, plain TP and model SP, with
 uneven prefill lengths and requests crossing child boundaries. Enable DBO on
 Attention only and enable chunked prefill for DeepSeek-V2/V3. Keep two ubatches
 and eager execution.
@@ -65,7 +68,8 @@ teardown outcomes separately.
 
 The original DSV4 Async concurrent case keeps native DBO thresholds. Its ten
 short prompts can remain unsplit while satisfying its exact-answer, `stop`,
-overlap and cleanup contract. Qualify DSV4 DSA two-stage execution separately
+overlap and physical-cleanup checks; graceful exit failed in the recorded run.
+DSV4 DSA two-stage qualification remains deferred. Qualify it separately
 with an above-threshold workload, retaining native defaults and requiring
 completed nonempty stages on every Attention rank.
 

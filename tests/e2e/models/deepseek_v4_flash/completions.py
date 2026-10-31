@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Cancellable ten-request acceptance with per-request diagnostics."""
+"""Cancellable concurrent acceptance with per-request diagnostics."""
 
 from __future__ import annotations
 
@@ -26,8 +26,10 @@ def evaluate_completions(
     model: str,
     output_path: Path,
     check_answer: bool = True,
+    answer_repetitions: int = 1,
+    first_request_index: int = 0,
 ) -> None:
-    """Run the ten concurrent requests and check every response.
+    """Run one batch of ten concurrent requests and check every response.
 
     ``check_answer`` requires the content to be exactly the expected sum and the
     generation to finish with ``stop``, which is what the asynchronous case
@@ -35,18 +37,30 @@ def evaluate_completions(
     ``check_answer=False``: the ten requests must still be served together and
     each must return a nonempty answer that finished, which is the plumbing this
     smoke case exists to cover. The exact check stays on for every host that has
-    it.
+    it. CUDA replay qualification uses successive rounds of the same prompt
+    shape with different operands, so reusing stale Hash-router IDs cannot be
+    hidden by sending the same request again. Repeating the requested answer
+    exercises live decode after the answer's first token, rather than only
+    checking a one-token answer computed by the eager prefill.
     """
     results: list[dict] = [
         {
             "index": index,
             "prompt": (
                 f"Compute {DSV4_PROMPT_FIRST_OPERAND + index} + "
-                f"{DSV4_PROMPT_SECOND_OPERAND}. Reply with just the number."
+                f"{DSV4_PROMPT_SECOND_OPERAND}. "
+                + (
+                    "Reply with just the number."
+                    if answer_repetitions == 1
+                    else f"Reply with the result repeated {answer_repetitions} times, "
+                    "separated by single spaces and nothing else."
+                )
             ),
             "error": "Request cancelled before completion",
         }
-        for index in range(DSV4_CONCURRENT_REQUESTS)
+        for index in range(
+            first_request_index, first_request_index + DSV4_CONCURRENT_REQUESTS
+        )
     ]
 
     async def request(client: httpx.AsyncClient, item: dict) -> None:
@@ -71,10 +85,11 @@ def evaluate_completions(
             expected = (
                 DSV4_PROMPT_FIRST_OPERAND + item["index"] + DSV4_PROMPT_SECOND_OPERAND
             )
+            expected_content = " ".join([str(expected)] * answer_repetitions)
             content = item["response"]["choices"][0]["message"]["content"].strip()
-            if check_answer and content != str(expected):
+            if check_answer and content != expected_content:
                 raise RuntimeError(
-                    f"wrong answer: expected {expected}, got {content!r}"
+                    f"wrong answer: expected {expected_content!r}, got {content!r}"
                 )
             del item["error"]
         except (httpx.HTTPError, ValueError, RuntimeError) as exc:

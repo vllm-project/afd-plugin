@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """DeepEP M2N AFD connector: expert-routed Attention <-> FFN transport.
 
-Port of FastAFD's DeepEP M2N path (``3c71619``) to the plugin connector
-contract. Routing runs on the Attention side: each Attention rank sends only
+Based on DeepEP and DeepGEMM and inspired by FastAFD adaptations. Routing
+runs on the Attention side: each Attention rank sends only
 the routed copies of its tokens, straight to the FFN ranks that own the chosen
 experts; FFN ranks run their local experts on what they receive and send the
 weighted results back, where combine sums each token's top-k contributions.
@@ -49,7 +49,8 @@ Transport:
 
 Scope: BF16 or FP8 (block-128, fp32 scales) payload; eager, ``torch.compile``
 (dispatch/combine are custom ops) and CUDA graphs; up to two lanes (DBO);
-single node (multi-node needs RDMA pods).
+one or several nodes (ranks in different NVLink domains use NCCL GIN over
+RDMA; see ``network.py``).
 """
 
 from __future__ import annotations
@@ -65,6 +66,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.distributed as dist
 from afdep.deepep import DispatchHandle, ElasticBuffer, ReceiveResult
+from torch.distributed.distributed_c10d import _abort_process_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -77,6 +79,7 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id, dbo_enabled
 from afd_plugin.config import AFDConfig
 from afd_plugin.connectors.base import (
     AFDControlPlane,
+    AFDControlPlaneClosedError,
     AFDRoutedExpertsConnector,
     ConnectorExtraInfo,
 )
@@ -117,7 +120,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-PROTOCOL_VERSION = "deepep_m2n/1"
+PROTOCOL_VERSION = "deepep_m2n/2"
 BF16_PAYLOAD = "bf16"
 # FP8 e4m3 rows with one fp32 scale per row and 128 channels (SM90 recipe).
 FP8_PAYLOAD = "fp8_block128_fp32"
@@ -134,7 +137,6 @@ PAYLOAD_WEIGHT_FORMATS = {
 # vLLM's own MoE all-to-all never runs; this backend allocates no buffers and
 # keeps vLLM's DeepEP out of the process.
 IDLE_ALL2ALL_BACKEND = "allgather_reducescatter"
-CONTROL_BACKENDS = ("nccl", "gloo")
 # DeepEP V2 needs Hopper (SM90) or newer.
 MIN_SM_MAJOR = 9
 PROCESS_GROUP_NAME = "afd_deepep_m2n"
@@ -185,10 +187,6 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
         cpu_sync_min_tokens: Eager steps whose bucket is below this skip the
             host sync that reads receive counts; FFN ranks then allocate the
             worst-case receive size instead. ``0`` always syncs in eager mode.
-        control_backend: Backend of the connector's own process group
-            (handshake, DeepEP communicator bootstrap, per-step control
-            payload). ``gloo`` keeps it off the GPUs and the RDMA NICs, so
-            DeepEP's communicator is the only RDMA user.
     """
 
     capacity_tokens_per_rank: int | None = None
@@ -203,7 +201,6 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
     cpu_timeout_s: int = DEFAULT_TIMEOUT_S
     gpu_timeout_s: int = DEFAULT_TIMEOUT_S
     cpu_sync_min_tokens: int = 0
-    control_backend: str = "nccl"
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> DeepEPM2NConfig:
@@ -241,8 +238,6 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             raise ValueError("num_qps must be non-negative")
         if self.cpu_timeout_s <= 0 or self.gpu_timeout_s <= 0:
             raise ValueError("cpu_timeout_s and gpu_timeout_s must be positive")
-        if self.control_backend not in CONTROL_BACKENDS:
-            raise ValueError(f"control_backend must be one of {CONTROL_BACKENDS}")
 
     def to_mapping(self) -> dict[str, Any]:
         return {**asdict(self), "network": self.network.to_mapping()}
@@ -505,7 +500,6 @@ def local_handshake_info(
         "cpu_sync_min_tokens": config.cpu_sync_min_tokens,
         "attn_tp_size": attn_tp_size,
         "compute_gate_on_attention": compute_gate_on_attention,
-        "control_backend": config.control_backend,
         "network": str(config.network.to_mapping()),
         "expert_alignment": expert_alignment,
         "ffn_deployment": ffn_deployment,
@@ -522,8 +516,6 @@ _MUST_MATCH = (
     "top_k",
     "num_lanes",
     "compute_gate_on_attention",
-    # NCCL ranks create a communicator that gloo ranks would never join.
-    "control_backend",
     "network",
     "bucket_granularity",
     "cpu_sync_min_tokens",
@@ -966,12 +958,6 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self.device = torch.device(
             "cuda", current_platform.logical_device_id_to_visible_device_id(local_rank)
         )
-        # Where control payloads are staged: gloo moves CPU tensors.
-        self.control_device = (
-            torch.device("cpu")
-            if self.config.control_backend == "gloo"
-            else self.device
-        )
         self._rendezvous = f"tcp://{afd_config.host}:{afd_config.port}"
         self._timeout = timedelta(seconds=afd_config.afd_process_group_timeout_s)
         self.group: dist.ProcessGroup | None = None
@@ -995,7 +981,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self._combine_zeros: torch.Tensor | None = None
         self._op_id = next(_CONNECTOR_IDS)
         self._initialized = False
-        self.control_plane = DeepEPM2NAFDControlPlane(self)
+        self.control_plane: DeepEPM2NAFDControlPlane = DeepEPM2NAFDControlPlane(self)
 
     # ==============================
     # Lifecycle
@@ -1098,17 +1084,15 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             hidden_size=self.hidden_size,
             payload_format=self.config.payload_format,
         )
-        self.group = (
-            self.bootstrap_group
-            if self.config.control_backend == "gloo"
-            else init_afd_process_group(
-                backend="nccl",
-                init_method=self._rendezvous,
-                world_size=self.layout.union_size,
-                rank=self.world_rank,
-                group_name=PROCESS_GROUP_NAME,
-                timeout=self._timeout,
-            )
+        # Never the lanes' bootstrap group: the control plane's close() aborts
+        # this group to cancel a pending receive.
+        self.group = init_afd_process_group(
+            backend="nccl",
+            init_method=self._rendezvous,
+            world_size=self.layout.union_size,
+            rank=self.world_rank,
+            group_name=PROCESS_GROUP_NAME,
+            timeout=self._timeout,
         )
         try:
             for _ in range(self.num_lanes):
@@ -1153,7 +1137,9 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         )
 
     def close(self) -> None:
-        """Destroy DeepEP buffers; safe after partial init and on repeat calls."""
+        """Cancel the control receive and destroy DeepEP buffers; safe after
+        partial init and on repeat calls."""
+        self.control_plane.close()
         _CONNECTORS.pop(self._op_id, None)
         for lane in self.lanes:
             lane.destroy()
@@ -1576,6 +1562,21 @@ class DeepEPM2NAFDControlPlane(AFDControlPlane):
 
     def __init__(self, connector: DeepEPM2NAFDConnector) -> None:
         self.connector = connector
+        self._closed = False
+
+    def close(self) -> None:
+        """Cancel a pending receive by aborting the connector's control group."""
+        self._closed = True
+        group = self.connector.group
+        if group is not None:
+            # A graceful shutdown would wait for the idle unmatched receive.
+            # The group is the control plane's own, so the lanes keep theirs.
+            _abort_process_group(group)
+            self.connector.group = None
+
+    def _check_closed(self) -> None:
+        if self._closed:
+            raise AFDControlPlaneClosedError("DeepEPM2N control plane is closed")
 
     def update_state_from_dp_metadata(self, payload: AFDControlPayload) -> None:
         connector = self.connector
@@ -1615,15 +1616,29 @@ class DeepEPM2NAFDControlPlane(AFDControlPlane):
             payload,
             dst=list(range(connector.ffn_size)),
             group=connector.group,
-            device=connector.control_device,
+            device=connector.device,
         )
 
     def recv_dp_metadata_list(self) -> AFDControlPayload:
         connector = self.connector
-        if connector.group is None:
+        group = connector.group
+        self._check_closed()
+        if group is None:
             raise RuntimeError("DeepEPM2N control plane is not initialized")
-        return recv_control_payload(
-            src=connector.layout.world_rank("attention", CONTROL_SENDER_ATTN_RANK),
-            group=connector.group,
-            device=connector.control_device,
-        )
+        try:
+            return recv_control_payload(
+                src=connector.layout.world_rank("attention", CONTROL_SENDER_ATTN_RANK),
+                group=group,
+                device=connector.device,
+                check_closed=self._check_closed,
+            )
+        except AFDControlPlaneClosedError:
+            raise
+        except Exception as error:
+            # The abort fails the pending receive with an error that depends on
+            # where the receive was (NCCL, or torch's lookup of the group).
+            if self._closed:
+                raise AFDControlPlaneClosedError(
+                    "DeepEPM2N control plane is closed"
+                ) from error
+            raise

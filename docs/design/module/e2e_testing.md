@@ -33,6 +33,8 @@ validation_paths:
   - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
   - "tests/e2e/models/deepseek_v4_flash/test_deepseek_v4_flash_multi_pod.py"
   - "tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_gpu.py"
+  - "tests/e2e/models/deepseek_v4_flash/gpu_config.py"
   - "tests/e2e/environment.py"
   - "tests/e2e/models/deepseek_v4_flash/config.py"
   - "tests/e2e/models/deepseek_v4_flash/completions.py"
@@ -40,7 +42,8 @@ validation_paths:
   - "tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py"
   - "tests/e2e/models/qwen3_6/test_qwen3_6.py"
 upstream_refs:
-  - "vLLM 0.30.0 serving and shutdown interfaces"
+  - "vLLM 0.32.0 CUDA serving, MRV2 execution and shutdown interfaces"
+  - "vLLM 0.32.0 Ascend serving and shutdown interfaces"
   - "lm-evaluation-harness GSM8K task and local-completions API"
   - "pytest parameterized test IDs"
 verified_platform_refs:
@@ -122,11 +125,11 @@ CUDA ready/merge CI selects seven DeepSeek-V2-Lite cases: the native baseline
 and the six DP2/TP2/DBO V2 cases. The V2 DP2 cases replace the three duplicate
 GPU 2A2F cases; the eager/DBO comparison retains 128 samples, concurrency 12
 and the 0.27 accuracy threshold. The backend-neutral 2A2F IDs remain available
-for NPU. The GPU module collects 12 cases, including local 1A1F and 2A1F
-coverage; the NPU module collects its seven existing cases. Across the three
-GPU model suites, 19 cases remain: DeepSeek 12, Qwen3 MoE four, and Qwen3.6
-MoE three. Compared with the historical 23, three duplicate DeepSeek cases
-are replaced and Qwen3.6 GDN DBO coverage is explicitly withdrawn.
+for NPU. The GPU module collects 13 cases, including 1A1F and 2A1F coverage
+and the local-only `afd-v2-graph-dbo-tp2`; the NPU module collects seven.
+Across the three GPU model suites, there are 20 cases: DeepSeek 13, Qwen3
+MoE four, and Qwen3.6 MoE three. The local-only TP2 Graph + DBO case is
+outside the seven-case ready/merge CI gate.
 
 GPU cases gate accuracy, service liveness and cleanup. AFD GPU graph/DBO
 cases additionally use a test-only worker extension to collect bounded per-rank
@@ -158,7 +161,8 @@ should be removed when the runtime supports graceful cancellation.
 `afd-dsv4-flash-async-cam-dp2tp4-ep8` is a separate local-only DSV4 Flash
 W4A8 case using 16 Ascend NPUs: Attention DP2/TP4 and FFN DP8/TP1/EP8.
 It uses eager async CAM and MBT=8192. Its Attention-side `--enable-dbo` flag
-enables two native DBO children. Native DBO requires target-device validation. It validates
+enables native DBO when its threshold is met; the recorded short prompts do
+not establish two-stage execution. It validates
 ten simultaneous chat requests, records their outputs and overlapping
 request intervals, and checks service liveness and cleanup. Its cancellable
 async HTTP client saves per-request responses/errors even on failure or
@@ -179,6 +183,43 @@ produces incorrect concurrent answers. A3 answer correctness remains
 unverified. These smoke cases do not qualify synchronous DSV4 accuracy; see
 the [profile limits](../../../tests/e2e/README.md#dsv4-flash-sync-camp2p-concurrent-requests-local-4-or-16-npus).
 The async case retains its exact-answer check.
+
+CUDA DSV4 Flash has a separate suite in
+`tests/e2e/models/deepseek_v4_flash/test_gpu.py`. Its four basic cells pair
+native MRV2
+eager/graph (DP2/TP1/EP2) with synchronous AFD eager/graph (2A2F, DP2/TP1 per
+role), using at most four devices. Four independent DBO cells pair the same
+native and AFD eager/graph modes. Native DBO requires a compatible upstream
+communication backend; the harness preserves configuration rejection. The native
+probe observes request-time microbatch slices and counts only successful
+parent execution with real tokens in both children; AFD probes observe both
+roles. Graph+DBO requires consecutive matching-layout replays.
+
+Each CUDA V4 case checks two rounds of ten distinct concurrent arithmetic
+requests, with the answer repeated eight times to exercise live decode, and
+then evaluates GSM8K. The fixed graph bucket is 8; the second round changes
+input IDs while keeping request shape. This stresses freshness of Hash-router
+IDs rather than replaying one identical prompt. Its checkpoint, quantization,
+seed, tokenizer, and per-role parallelism match the native control. It reuses
+the shared HTTP oracle, lm-eval, liveness, probes and owned-process cleanup;
+Ascend profiles and their smoke limits are unchanged. GPU full accuracy
+requires `AFD_GSM8K_LIMIT=all`, including for these new profiles. See the
+[CUDA qualification commands](../../../tests/e2e/README.md#dsv4-flash-cuda-qualification).
+
+Each concurrent round and GSM8K has an independent named reset/report window,
+including FFN re-arming. Graph/DBO evidence is checked on every participating
+rank immediately after that window. The concurrent AFD CUDA windows additionally
+pair native Attention InputBatch IDs with the actual input Tensor passed to the
+first local FFN Hash layer. Capture only retains references; after selected
+successful live execution it reads at most 16 small transactions per concurrent
+window, 8 IDs per stage/peer. Pairing uses the existing control order and subgroup
+peer order; native real token counts exclude padding. Both concurrent windows
+must independently match A/F, and samples must change across rounds at the
+same padded bucket and real size before GSM8K starts. This observation does
+not alter the production control payload or data plane.
+GSM8K does not require bounded Hash coverage. FFN health reporting defers while
+native execution or evidence submission is in flight; the publication lock
+never waits for GPU execution or the sampled ID copies.
 
 The 2A1F cases use three of the four devices (two Attention ranks and one
 FFN rank). DeepSeek-V2-Lite eager/graph remain local-only; its graph+DBO
@@ -250,10 +291,9 @@ of 24; the lower threshold applies only at sample counts up to 24.
   Dummy/profile/capture work and empty second microbatches do not qualify.
   Pure eager and native baseline cases do not load the extension;
   performance comparisons omit it. There is no per-step execution logging.
-  `AFD_GSM8K_LIMIT=all` still bypasses the floor. On vLLM 0.30 the runner sets the DBO decode token
-  threshold to 2 because upstream validates both DBO thresholds against the
-  two-microbatch count; the prefill threshold stays at 8. `AFD_E2E_API_PORT_BASE`
-  (default `8000`) offsets the API server ports on shared machines, and
+  `AFD_GSM8K_LIMIT=all` still bypasses the floor. The runner sets the DBO decode
+  token threshold to 2 and the prefill threshold to 8. `AFD_E2E_API_PORT_BASE`
+  (default `8000`) offsets the API server ports on shared machines.
   Default and dedicated GPU V2 scenarios preserve the upstream
   chunked-prefill default and explicit caller choices. The MRV2 B/E/G
   comparison retains the native token budget.
