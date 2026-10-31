@@ -399,7 +399,7 @@ def main():
             report["idle_probe"] = "PASS"
         dist.barrier()
     errors = []
-    accuracy_failures = []
+    accuracy_failures: list[str] = []
     data_replays = 0
     if not is_ffn:
         runner = thread = None
@@ -629,12 +629,12 @@ def main():
         if errors:
             raise errors[0]
         assert len(report["work"]) == len(expected)
-        for observed, (source, layer, rows) in zip(
+        for observed, (source, layer, expected_rows) in zip(
             report["work"], expected, strict=True
         ):
             assert (observed["source"], observed["layer"]) == (source, layer)
-            if rows is not None:
-                assert observed["rows"] == rows, "zero work or chunk mismatch"
+            if expected_rows is not None:
+                assert observed["rows"] == expected_rows, "zero work or chunk mismatch"
         if args.full_graph:
             report["graph"] = {
                 "capture_count": runner._graph_capture_count,
@@ -655,7 +655,7 @@ def main():
         connector.close()
     assert not connector.is_initialized and connector.cam_pg is None
     report["cleanup_complete"] = True
-    reports = [None] * world_size
+    reports: list[dict] = [{} for _ in range(world_size)]
     dist.all_gather_object(reports, report)
     dist.destroy_process_group()
     faulthandler.cancel_dump_traceback_later()

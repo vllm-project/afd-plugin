@@ -589,9 +589,10 @@ def test_pull_combine_failure_retains_window_until_completion(monkeypatch, phase
         raise RuntimeError("combine failed")
 
     combine = fake_torch.ops.afd_ascend.afd_mega_combine_recv
-    monkeypatch.setattr(
-        connector, "check_pull_status", fail if phase == "status" else lambda: None
-    )
+    if phase == "status":
+        monkeypatch.setattr(connector, "check_pull_status", fail)
+    else:
+        monkeypatch.setattr(connector, "check_pull_status", lambda: None)
     if phase == "launch":
         monkeypatch.setattr(fake_torch.ops.afd_ascend, "afd_mega_combine_recv", fail)
     with pytest.raises(RuntimeError, match="combine failed"):
@@ -622,12 +623,11 @@ def test_pull_model_step_reports_error_after_queued_combine(monkeypatch):
             layer_idx=2, stage_idx=0, seq_len=3
         )
     )
-    with pytest.raises(RuntimeError, match="status -5"):
-        with connector.defer_pull_status():
-            connector.send_attn_output(hidden, context, **_topk_payload(3))
-            state[async_cam_module.PULL_FAILURE_INDEX] = -5
-            output = connector.recv_ffn_output(hidden, context=context)
-            assert output.shape == hidden.shape
+    with pytest.raises(RuntimeError, match="status -5"), connector.defer_pull_status():
+        connector.send_attn_output(hidden, context, **_topk_payload(3))
+        state[async_cam_module.PULL_FAILURE_INDEX] = -5
+        output = connector.recv_ffn_output(hidden, context=context)
+        assert output.shape == hidden.shape
     with pytest.raises(RuntimeError, match="status -5"):
         connector.check_pull_status()
 
