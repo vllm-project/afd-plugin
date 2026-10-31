@@ -131,6 +131,17 @@ def isolate_ascend_config_installer(monkeypatch):
     monkeypatch.setitem(sys.modules, module_name, config_patch)
 
 
+@pytest.fixture(autouse=True)
+def isolate_profile_run_eager_installer(monkeypatch):
+    # The profile-run patch resolves vLLM-Ascend worker modules that a CPU host
+    # does not have. These tests exercise the other installers; the profile patch
+    # has its own coverage in tests/unit/compat/patches/npu/.
+    module_name = "afd_plugin.compat.patches.npu.profile_run_eager"
+    profile_run_eager = ModuleType(module_name)
+    profile_run_eager.__dict__["apply_profile_run_eager_patch"] = lambda: True
+    monkeypatch.setitem(sys.modules, module_name, profile_run_eager)
+
+
 @pytest.mark.usefixtures("isolate_ascend_config_installer")
 def test_npu_afd_config_patch_restores_dbo_for_afd(monkeypatch):
     from afd_plugin.compat.patches.npu import mla_graph
@@ -350,3 +361,23 @@ def test_npu_patches_route_mla_graph_params_from_forward_context(monkeypatch):
 
     ascend_runtime.apply_afd_ascend_patches_if_needed()
     assert fake_mla.get_graph_params is patched_get_graph_params
+
+
+def test_npu_patch_installer_installs_profile_run_eager(monkeypatch):
+    from afd_plugin.compat.patches.npu import mla_graph
+
+    installed = []
+    monkeypatch.setattr(
+        sys.modules["afd_plugin.compat.patches.npu.profile_run_eager"],
+        "apply_profile_run_eager_patch",
+        lambda: installed.append(True) or True,
+    )
+    monkeypatch.setattr(
+        ascend_runtime, "apply_afd_ascend_config_patch_if_needed", lambda: None
+    )
+    monkeypatch.setattr(mla_graph, "apply_afd_mla_graph_patch", lambda: True)
+    monkeypatch.setattr(ascend_runtime, "_PATCHES_APPLIED", False)
+
+    ascend_runtime.apply_afd_ascend_patches_if_needed()
+
+    assert installed == [True]
