@@ -198,7 +198,8 @@ def test_routed_transport_preserves_runner_and_gate_policy(mrv2_config, role):
         pytest.param("Qwen3MoeForCausalLM", True, id="qwen3-moe"),
         # Runners validate the wrapped model's AFD-prefixed architecture.
         pytest.param("AFDQwen3MoeForCausalLM", True, id="afd-qwen3-moe"),
-        pytest.param("DeepseekV2ForCausalLM", False, id="deepseek-v2"),
+        pytest.param("DeepseekV2ForCausalLM", True, id="deepseek-v2"),
+        pytest.param("AFDDeepseekV2ForCausalLM", True, id="afd-deepseek-v2"),
         pytest.param("DeepseekV3ForCausalLM", False, id="deepseek-v3"),
         pytest.param("AFDDeepseekV3ForCausalLM", False, id="afd-deepseek-v3"),
         pytest.param("Qwen3_5MoeForConditionalGeneration", False, id="qwen3-5-moe"),

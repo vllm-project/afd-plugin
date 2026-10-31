@@ -22,7 +22,7 @@ pytest.importorskip("vllm")
 
 from vllm.config import CompilationMode  # noqa: E402
 
-from afd_plugin.config import AFDConfig  # noqa: E402
+from afd_plugin.config import DEEPEP_M2N_CONNECTOR, AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
 from tests.unit.fakes.model_layers import Stage as _FakeStage  # noqa: E402
 from tests.unit.fakes.model_layers import stage_type as _stage_type
@@ -138,9 +138,11 @@ def _make_layer(
     layer_idx: int,
     attention_gate: bool = False,
     vllm_config=None,
+    connector: str = "P2pNcclAFDConnector",
 ):
     afd_config = AFDConfig(
         role=role,
+        connector=connector,
         compute_gate_on_attention=attention_gate,
     )
     monkeypatch.setattr(
@@ -460,6 +462,101 @@ def test_cuda_ffn_gate_uses_parameter_free_external_router_shell(
     assert list(moe.mlp.experts.parameters()) == []
     assert list(moe.mlp.experts.buffers()) == []
     assert not any(name.startswith("mlp.") for name in _parameter_names(moe))
+
+
+def _use_cuda_remote_experts(monkeypatch) -> None:
+    monkeypatch.setattr(
+        adapter.native,
+        "current_platform",
+        SimpleNamespace(device_type="cuda"),
+    )
+    monkeypatch.setattr(
+        adapter.native,
+        "get_ep_group",
+        lambda: SimpleNamespace(
+            device_group=SimpleNamespace(size=lambda: 1),
+            rank_in_group=0,
+        ),
+    )
+    monkeypatch.setattr(adapter.native, "_get_moe_router_dtype", lambda _c: None)
+    monkeypatch.setattr(
+        adapter,
+        "create_fused_moe_router",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+
+
+def test_deepep_m2n_attention_owns_gate_and_shared_experts(
+    monkeypatch,
+    construction_env,
+):
+    """Under DeepEP M2N, Attention builds the gate and the native shared MLP at
+    their checkpoint paths and no routed experts.
+
+    Why: the DeepEP M2N FFN runs routed experts only, so the shared experts'
+    output must come from Attention.
+    """
+    _use_cuda_remote_experts(monkeypatch)
+    vllm_config = _vllm_config()
+    vllm_config.parallel_config.tensor_parallel_size = 1
+
+    layer = _make_layer(
+        monkeypatch,
+        role="attention",
+        layer_idx=1,
+        attention_gate=True,
+        vllm_config=vllm_config,
+        connector=DEEPEP_M2N_CONNECTOR,
+    )
+
+    assert type(layer.mlp) is adapter.AFDDeepseekV2RoutedExpertsMoE
+    assert construction_env["gate"] == ["model.layers.1.mlp.gate"]
+    assert construction_env["dense"] == ["model.layers.1.mlp.shared_experts"]
+    assert construction_env["moe"] == []
+    assert {name for name in _parameter_names(layer) if name.startswith("mlp.")} == {
+        "mlp.gate.weight",
+        "mlp.gate.e_score_correction_bias",
+        "mlp.shared_experts.weight",
+    }
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_deepep_m2n_shared_experts_replicated_under_attention_tp(
+    monkeypatch,
+    construction_env,
+    tp_size,
+):
+    """With Attention TP > 1 the shared MLP is built sequence-parallel
+    (replicated weights, no all-reduce); with TP 1 it is the plain native MLP.
+
+    Why: each TP rank runs the shared MLP on its own token slice; a TP-sharded
+    MLP would all-reduce partial sums of different tokens.
+    """
+    _use_cuda_remote_experts(monkeypatch)
+    shared_kwargs = []
+
+    class _RecordingMLP(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            shared_kwargs.append(kwargs)
+
+    monkeypatch.setattr(adapter.native, "DeepseekV2MLP", _RecordingMLP)
+    vllm_config = _vllm_config()
+    vllm_config.parallel_config.tensor_parallel_size = tp_size
+
+    layer = _make_layer(
+        monkeypatch,
+        role="attention",
+        layer_idx=1,
+        attention_gate=True,
+        vllm_config=vllm_config,
+        connector=DEEPEP_M2N_CONNECTOR,
+    )
+
+    assert layer.mlp.tp_size == tp_size
+    (kwargs,) = shared_kwargs
+    assert kwargs["prefix"] == "model.layers.1.mlp.shared_experts"
+    assert kwargs["is_sequence_parallel"] is (tp_size > 1)
 
 
 def test_ffn_constructs_no_real_attention(
@@ -915,7 +1012,12 @@ def test_sp_remains_rejected_outside_npu_async_attention(
     assert all(not calls for calls in construction_env.values())
 
 
-def test_async_ffn_omits_shared_with_real_hf_config(monkeypatch, construction_env):
+@pytest.mark.parametrize(
+    "connector", ["CAMAsyncAFDConnector", DEEPEP_M2N_CONNECTOR], ids=["async", "m2n"]
+)
+def test_ffn_omits_attention_owned_shared_with_real_hf_config(
+    monkeypatch, construction_env, connector
+):
     from transformers import DeepseekV2Config
 
     original = DeepseekV2Config(
@@ -939,7 +1041,7 @@ def test_async_ffn_omits_shared_with_real_hf_config(monkeypatch, construction_en
         "parse_afd_config",
         lambda *_args, **_kwargs: AFDConfig(
             role="ffn",
-            connector="CAMAsyncAFDConnector",
+            connector=connector,
             compute_gate_on_attention=True,
         ),
     )

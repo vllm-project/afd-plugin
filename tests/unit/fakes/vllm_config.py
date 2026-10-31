@@ -226,6 +226,7 @@ def m2n_vllm_config(
         model_config=SimpleNamespace(
             dtype=torch.bfloat16,
             enforce_eager=True,
+            get_num_experts=lambda: M2N_NUM_EXPERTS,
             hf_config=text_config,
             hf_text_config=text_config,
         ),
