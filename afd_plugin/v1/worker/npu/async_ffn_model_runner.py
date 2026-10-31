@@ -104,6 +104,21 @@ class AsyncNPUFFNModelRunner:
         self._failure: Exception | None = None
         self.prof = create_afd_npu_profiler("ffn")
 
+    def attach_model(self, model: FFNModel, *, parameter_bytes: int) -> None:
+        """Borrow an independently loaded model without constructing a Worker."""
+        if self.model is not None or self.connector.is_initialized:
+            raise RuntimeError("Async FFN model must be attached before CAM startup")
+        if parameter_bytes < 0:
+            raise ValueError("model parameter size must be nonnegative")
+        self.model = model
+        self.model_memory_usage = parameter_bytes
+
+    def mark_receiver_exited(self) -> None:
+        """Allow release only after the owner joined a successful receive loop."""
+        if self._graph_pending:
+            raise RuntimeError("Async FFN has pending work; retain resources")
+        self._graph_receiver_exited = True
+
     def load_model(self) -> None:
         # Import the loader only in the isolated, initialized NPU worker.
         from vllm.model_executor.model_loader import get_model_loader

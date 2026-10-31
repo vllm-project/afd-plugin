@@ -179,7 +179,9 @@ def main():
     print(json.dumps({"rank": rank, "stage": "connector_created"}), flush=True)
     if is_ffn:
         runner = AsyncNPUFFNModelRunner(config, device, connector)
-        runner.model = SyntheticModel(device, not args.per_group)
+        runner.attach_model(
+            SyntheticModel(device, not args.per_group), parameter_bytes=0
+        )
         print(json.dumps({"rank": rank, "stage": "weights_ready"}), flush=True)
         runner.initialize_afd_connector()
         assert runner._layered_executor is not None
@@ -344,7 +346,7 @@ def main():
                         session._graph_payload.hidden_states.fill_(113)
                         session._graph_payload.context.states.dynamic_scales.fill_(3)
                         session._graph_output.fill_(123)
-            runner._graph_receiver_exited = True
+            runner.mark_receiver_exited()
         except Exception as exc:
             errors.append(exc)
             print(json.dumps({"rank": rank, "service_error": repr(exc)}), flush=True)
