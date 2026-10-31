@@ -45,3 +45,30 @@ small outputs cannot pass merely because of the absolute tolerance. It checks
 MoE semantics independently of the transport test, but does not replace
 DP2/TP4/EP8 E2E or two-stage token-layout tests. A failed or unexecuted probe
 must be reported as such rather than treated as evidence of accuracy.
+
+## CUDA MoE reference probe
+
+Use one otherwise idle CUDA GPU with the pinned vLLM runtime:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m tests.e2e.operators.moe_reference_cuda \
+  --model /path/to/DeepSeek-V2-Lite --output /path/to/evidence/dsv2-moe-cuda
+```
+
+The probe truncates the checkpoint after each selected layer (the first MoE
+layer by default; `--layers` selects others) and runs fixed bfloat16 inputs of
+1, 7, 64 and 512 tokens through three paths: the native vLLM DeepSeek MoE
+layer, the FFN role's `compute_ffn_output`, and the Attention role's gate
+followed by the FFN role's `compute_experts_output`. Both AFD outputs must equal
+native bit for bit.
+
+An fp32 reference computed directly from the checkpoint tensors checks every
+path. The relative L2 error must stay within 0.02 on tokens whose top-k choice
+is not a near tie, meaning the k-th and (k+1)-th routing probabilities differ by
+at least 2%. Near-tie tokens are counted in the report and excluded from that
+bound, because bfloat16 logits may flip them. The probe saves inputs, logits
+and outputs for every case plus `report.json`.
+
+It checks one rank's FFN MoE semantics. It does not replace connector transport
+or topology E2E. A new FFN backend can be checked as another path against the
+same references.
