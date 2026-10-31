@@ -10,13 +10,14 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
-from afd_plugin.compat.npu import (
+from afd_plugin.compat.npu import (  # noqa: E402
     fail_if_unsupported_npu_afd_features,
     npu_afd_num_ubatches,
 )
-from afd_plugin.connectors import (
+from afd_plugin.config import AFDConfig  # noqa: E402
+from afd_plugin.connectors import (  # noqa: E402
     AFDA2FTransferPayload,
     AFDControlPayload,
     AFDF2ATransferPayload,
@@ -27,13 +28,14 @@ from afd_plugin.connectors import (
 )
 
 
-def _ffn_payload(hidden_states, metadata, states=None):
+def _ffn_payload(hidden_states, metadata, states=None, input_ids=None):
     return AFDA2FTransferPayload(
         hidden_states=hidden_states,
         context=AFDTransferContext(
             metadata=metadata,
             states=states if states is not None else AFDTransferState(),
         ),
+        input_ids=input_ids,
     )
 
 
@@ -97,7 +99,16 @@ class _AsyncRecordingConnector(_RecordingConnector):
 
 
 class _FakeFFNConnector:
-    def __init__(self, *, attn_size=1, ffn_size=1, role_rank=0, world_rank=0):
+    def __init__(
+        self,
+        *,
+        attn_size=1,
+        ffn_size=1,
+        role_rank=0,
+        world_rank=0,
+        requires_input_ids=False,
+        requires_mtp=True,
+    ):
         self.dp_metadata_list = {}
         self.attn_outputs = deque()
         self.ffn_outputs = []
@@ -105,6 +116,12 @@ class _FakeFFNConnector:
         self.attn_size = attn_size
         self.ffn_size = ffn_size
         self.world_rank = world_rank
+        self.requires_input_ids = requires_input_ids
+        self.requires_mtp = requires_mtp
+        self.received_input_ids = []
+        self.mtp_phase_ready = deque()
+        self.mtp_phase_control_enabled = True
+        self.mtp_phase_graph_replay = False
         self.topology = SimpleNamespace(role_rank=role_rank)
         # The runners reach the control plane through connector.control_plane;
         # the fake serves as both.
@@ -132,11 +149,27 @@ class _FakeFFNConnector:
             )
             if payload.context.metadata.stage_idx == ubatch_idx:
                 self.attn_outputs.remove(item)
+                preloaded_input_ids = kwargs.get("input_ids")
+                if preloaded_input_ids is not None and payload.input_ids is None:
+                    payload = _ffn_payload(
+                        payload.hidden_states,
+                        payload.context.metadata,
+                        states=payload.context.states,
+                        input_ids=preloaded_input_ids,
+                    )
                 return payload
         raise IndexError(ubatch_idx)
 
+    def recv_input_ids(self, num_tokens, *, ubatch_idx):
+        input_ids = torch.arange(num_tokens, dtype=torch.int32) + ubatch_idx * 10
+        self.received_input_ids.append((num_tokens, ubatch_idx, input_ids))
+        return input_ids
+
     def send_ffn_output(self, ffn_output, context, **kwargs):
         self.ffn_outputs.append((ffn_output, context.metadata, kwargs))
+
+    def recv_mtp_phase_ready(self):
+        return self.mtp_phase_ready.popleft() if self.mtp_phase_ready else True
 
     def close(self):
         return None
@@ -187,6 +220,97 @@ def _parallel_config(**overrides):
     return SimpleNamespace(**values)
 
 
+@pytest.mark.parametrize(
+    ("runner", "expected"),
+    [
+        (SimpleNamespace(use_dcp=True), True),
+        (SimpleNamespace(use_dcp=False), False),
+        (SimpleNamespace(use_cp=False), False),
+        (SimpleNamespace(), False),
+    ],
+)
+def test_npu_attention_legacy_dcp_manager_compatibility(runner, expected):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    assert attention_model_runner._uses_legacy_dcp_manager(runner) is expected
+
+
+def test_npu_attention_common_metadata_abi_is_supported():
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    fields = attention_model_runner._ASCEND_COMMON_METADATA_FIELDS
+    legacy_fields = {
+        "context_parallel_metadata",
+        "group_len",
+        "group_key_idx",
+        "group_key_cache_idx",
+    }
+    vllm_cann_fields = {
+        "prefill_context_parallel_metadata",
+        "slot_mapping_cpu",
+    }
+
+    assert legacy_fields <= fields or vllm_cann_fields <= fields
+
+
+def test_npu_ubatch_metadata_split_supports_runtime_abi():
+    _require_npu_runtime()
+    from vllm.v1.worker.ubatch_utils import UBatchSlice
+    from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+
+    from afd_plugin.v1.worker.npu import ubatch_utils
+
+    fields = ubatch_utils._ASCEND_COMMON_METADATA_FIELDS
+    metadata_kwargs = {
+        "query_start_loc": torch.tensor([0, 2, 4], dtype=torch.int32),
+        "query_start_loc_cpu": torch.tensor([0, 2, 4], dtype=torch.int32),
+        "seq_lens": torch.tensor([2, 2], dtype=torch.int32),
+        "seq_lens_cpu": torch.tensor([2, 2], dtype=torch.int32),
+        "num_computed_tokens_cpu": torch.tensor([0, 0], dtype=torch.int32),
+        "num_reqs": 2,
+        "num_actual_tokens": 4,
+        "max_query_len": 2,
+        "max_seq_len": 2,
+        "block_table_tensor": torch.zeros((2, 1), dtype=torch.int32),
+        "slot_mapping": torch.arange(4, dtype=torch.int32),
+        "actual_seq_lengths_q": [1, 2, 3, 4],
+        "positions": torch.arange(4, dtype=torch.int64),
+        "positions_cpu": torch.arange(4, dtype=torch.int64),
+        "num_input_tokens": 4,
+    }
+    if "slot_mapping_cpu" in fields:
+        metadata_kwargs["slot_mapping_cpu"] = torch.arange(4, dtype=torch.int32)
+    if "prefill_context_parallel_metadata" in fields:
+        metadata_kwargs["prefill_context_parallel_metadata"] = None
+    if "context_parallel_metadata" in fields:
+        metadata_kwargs["context_parallel_metadata"] = None
+    if "kvcomp_metadata" in fields:
+        metadata_kwargs["kvcomp_metadata"] = None
+    for field_name in (
+        "mm_req_doc_ranges",
+        "rswa_prefix_lens",
+        "group_len",
+        "group_key_idx",
+        "group_key_cache_idx",
+    ):
+        if field_name in fields:
+            metadata_kwargs[field_name] = None
+
+    metadata = AscendCommonAttentionMetadata(**metadata_kwargs)
+    result = ubatch_utils._make_metadata_with_slice(
+        UBatchSlice(slice(0, 1), slice(0, 2)),
+        metadata,
+    )
+
+    assert result.num_reqs == 1
+    assert result.num_actual_tokens == 2
+    assert result.slot_mapping.tolist() == [0, 1]
+    if "slot_mapping_cpu" in fields:
+        assert result.slot_mapping_cpu.tolist() == [0, 1]
+
+
 def _vllm_config(
     *,
     role="attention",
@@ -195,6 +319,8 @@ def _vllm_config(
     use_mla=False,
     cudagraph_mode="FULL",
     speculative_config=None,
+    architecture=None,
+    kv_transfer_config=None,
     **parallel_overrides,
 ):
     async_dp = bool(parallel_overrides.pop("async_dp", False))
@@ -214,6 +340,9 @@ def _vllm_config(
         parallel_config=_parallel_config(**parallel_overrides),
         model_config=SimpleNamespace(
             enforce_eager=True,
+            hf_config=SimpleNamespace(
+                architectures=[] if architecture is None else [architecture],
+            ),
             hf_text_config=SimpleNamespace(),
             use_mla=use_mla,
         ),
@@ -227,6 +356,7 @@ def _vllm_config(
             fast_moe_cold_start=False,
         ),
         speculative_config=speculative_config,
+        kv_transfer_config=kv_transfer_config,
     )
 
 
@@ -234,6 +364,9 @@ def _require_npu_runtime():
     pytest.importorskip("vllm", reason="NPU runtime tests require vLLM")
     pytest.importorskip("vllm_ascend", reason="NPU runtime tests require vLLM-Ascend")
     pytest.importorskip("torch_npu", reason="NPU runtime tests require torch-npu")
+    # The Ascend platform plugin loads the ops package before worker modules.
+    # Preserve that order when this test file runs in isolation.
+    importlib.import_module("vllm_ascend.ops")
 
 
 def _new_attention_runner():
@@ -242,7 +375,86 @@ def _new_attention_runner():
         AFDNPUAttentionModelRunner,
     )
 
-    return object.__new__(AFDNPUAttentionModelRunner)
+    runner = object.__new__(AFDNPUAttentionModelRunner)
+    runner._afd_transaction_counter = 0
+    runner.prof = None
+    return runner
+
+
+def test_npu_ubatch_dsa_ratio_metadata_is_stage_local():
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu.attention_model_runner import (
+        _new_ubatch_dsa_ratio_metadata,
+    )
+
+    stage_metadata = _new_ubatch_dsa_ratio_metadata(2)
+    stage_metadata[0][0]["num_prefill"] = 3
+    stage_metadata[0][1]["num_decode"] = 1
+    stage_metadata[0][2]["block_table_rows"] = 3
+
+    assert stage_metadata[1] == ({}, {}, {})
+    assert all(
+        id(stage_metadata[0][index]) != id(stage_metadata[1][index])
+        for index in range(3)
+    )
+
+
+def test_npu_dspark_uses_its_cache_group_without_step35_metadata(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    class FakeDSparkProposer:
+        kv_cache_gid = 2
+
+        def set_per_group_attn_metadata(self, *_args):
+            pytest.fail("DSpark does not implement Step3.5 per-group metadata")
+
+    monkeypatch.setattr(
+        attention_model_runner,
+        "AscendDSparkProposer",
+        FakeDSparkProposer,
+    )
+    drafter = FakeDSparkProposer()
+
+    attention_model_runner._set_speculative_group_metadata(
+        drafter,
+        2,
+        object(),
+        object(),
+    )
+
+    assert attention_model_runner._speculative_drafter_matches_cache_group(
+        drafter,
+        2,
+        {"draft.swa_cache"},
+    )
+    assert not attention_model_runner._speculative_drafter_matches_cache_group(
+        drafter,
+        1,
+        {"target.mla_cache"},
+    )
+
+
+@pytest.mark.parametrize(
+    ("request_slice", "num_reqs", "expected"),
+    [
+        (slice(0, 2), 3, 2),
+        (slice(1, 3), 3, 2),
+        (slice(2, 8), 3, 1),
+        (slice(4, 8), 3, 0),
+    ],
+)
+def test_npu_ubatch_actual_request_count_excludes_padding(
+    request_slice,
+    num_reqs,
+    expected,
+):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu.attention_model_runner import (
+        _num_actual_requests_for_ubatch,
+    )
+
+    assert _num_actual_requests_for_ubatch(request_slice, num_reqs) == expected
 
 
 def test_npu_attention_live_execution_scope_restores_on_success_and_error(
@@ -290,6 +502,42 @@ def test_npu_attention_live_execution_scope_restores_on_success_and_error(
     assert runner._afd_live_execution is False
 
 
+def test_npu_attention_logs_execute_and_sample_boundaries(monkeypatch, caplog):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    runner = _new_attention_runner()
+    runner.connector = SimpleNamespace(stage_diagnostics_enabled=True)
+    runner._afd_live_execution = False
+    monkeypatch.setattr(
+        attention_model_runner,
+        "step_afd_npu_profiler",
+        lambda _prof: None,
+    )
+    monkeypatch.setattr(
+        attention_model_runner.NPUModelRunner,
+        "execute_model",
+        lambda _runner, _scheduler_output, _intermediate_tensors=None: "executed",
+    )
+    monkeypatch.setattr(
+        attention_model_runner.NPUModelRunner,
+        "sample_tokens",
+        lambda _runner, _grammar_output: "sampled",
+    )
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="afd_plugin.v1.worker.npu.attention_model_runner",
+    ):
+        assert runner.execute_model(object()) == "executed"
+        assert runner.sample_tokens(None) == "sampled"
+
+    assert "step=1 event=execute_begin" in caplog.text
+    assert "step=1 event=execute_returned" in caplog.text
+    assert "step=1 event=sample_begin" in caplog.text
+    assert "step=1 event=sample_returned" in caplog.text
+
+
 def test_npu_attention_non_live_execution_disables_microbatching(monkeypatch):
     _require_npu_runtime()
     import numpy as np
@@ -300,6 +548,8 @@ def test_npu_attention_non_live_execution_disables_microbatching(monkeypatch):
 
     runner = _new_attention_runner()
     runner._afd_live_execution = False
+    runner._afd_in_mtp_proposal = False
+    runner._afd_mtp_phase_announced = False
     runner._pad_for_sequence_parallelism = lambda num_tokens: num_tokens
     runner.input_batch = SimpleNamespace(
         num_computed_tokens_cpu=np.ones(4, dtype=np.int32),
@@ -350,6 +600,119 @@ def test_npu_attention_non_live_execution_disables_microbatching(monkeypatch):
     assert result[2] is True
 
 
+@pytest.mark.parametrize("live_tokens", [1, 2, 3])
+@pytest.mark.parametrize("force_dp_padding", [False, True])
+def test_npu_attention_mixed_graph_modes_share_dp_token_counts(
+    monkeypatch,
+    live_tokens,
+    force_dp_padding,
+):
+    _require_npu_runtime()
+    import numpy as np
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import BatchDescriptor
+
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    counts = [live_tokens, 4, 4, 4]
+
+    def all_reduce(packed_tensor, *, group):
+        assert group == "cpu-group"
+        assert tuple(packed_tensor.shape) == (6, 4)
+        packed_tensor[0, :] = torch.tensor(counts)
+        packed_tensor[1, :] = torch.tensor(counts)
+        packed_tensor[2, :] = torch.tensor(
+            [
+                CUDAGraphMode.NONE.value,
+                *([CUDAGraphMode.FULL.value] * 3),
+            ]
+        )
+        packed_tensor[3, :] = torch.tensor([0, 1, 1, 1])
+        packed_tensor[5, :] = torch.tensor([0, 1, 1, 1])
+
+    def dispatch(*, num_tokens, uniform_decode, valid_modes=None, **_kwargs):
+        mode = CUDAGraphMode.FULL if uniform_decode else CUDAGraphMode.NONE
+        if valid_modes is not None:
+            mode = next(iter(valid_modes))
+        return mode, BatchDescriptor(num_tokens)
+
+    monkeypatch.setattr(attention_model_runner.dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(
+        attention_model_runner,
+        "get_dp_group",
+        lambda: SimpleNamespace(cpu_group="cpu-group"),
+    )
+    monkeypatch.setattr(
+        attention_model_runner,
+        "should_skip_allreduce_across_dp_group",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        attention_model_runner,
+        "check_enable_ubatch",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(attention_model_runner, "enable_sp", lambda _config: False)
+    monkeypatch.setattr(
+        attention_model_runner,
+        "oproj_tp_enable",
+        lambda: force_dp_padding,
+    )
+    monkeypatch.setattr(attention_model_runner, "embedding_tp_enable", lambda: False)
+
+    observed_counts = []
+    for rank, num_tokens in enumerate(counts):
+        runner = _new_attention_runner()
+        runner.dp_size = 4
+        runner.dp_rank = rank
+        runner._afd_live_execution = rank == 0
+        runner._afd_engine_idle_dummy = rank != 0
+        runner.connector = SimpleNamespace(
+            control_plane=object(),
+            is_window_connector=False,
+            requires_lockstep_dp_sync=False,
+        )
+        runner.vllm_config = _vllm_config(
+            data_parallel_size=4,
+            data_parallel_rank=rank,
+            tensor_parallel_size=1,
+            enable_dbo=True,
+            use_ubatching=True,
+            num_ubatches=2,
+        )
+        runner.vllm_config.observability_config = SimpleNamespace(
+            cudagraph_metrics=False
+        )
+        runner.parallel_config = runner.vllm_config.parallel_config
+        runner.model_config = SimpleNamespace(is_encoder_decoder=False)
+        runner.speculative_config = None
+        runner.uniform_decode_query_len = 4
+        runner.input_batch = SimpleNamespace(
+            num_computed_tokens_cpu=np.ones(1, dtype=np.int32),
+            lora_id_to_lora_request={},
+        )
+        runner._pad_for_sequence_parallelism = lambda tokens: tokens
+        runner.cudagraph_dispatcher = SimpleNamespace(dispatch=dispatch)
+
+        mode, descriptor, _, token_counts, _ = (
+            runner._determine_batch_execution_and_padding(
+                num_tokens=num_tokens,
+                num_reqs=1,
+                num_scheduled_tokens_np=np.array([num_tokens]),
+                max_num_scheduled_tokens=num_tokens,
+                use_cascade_attn=False,
+                force_uniform_decode=rank != 0,
+            )
+        )
+
+        assert mode is CUDAGraphMode.NONE
+        assert descriptor.num_tokens == (4 if force_dp_padding else num_tokens)
+        observed_counts.append(token_counts.tolist())
+
+    expected = [4, 4, 4, 4] if force_dp_padding else counts
+    assert observed_counts == [expected] * 4
+
+
 def _new_ffn_runner():
     _require_npu_runtime()
     from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
@@ -360,6 +723,11 @@ def _new_ffn_runner():
     runner.prof = None
     runner.device = SimpleNamespace(type="npu")
     runner._is_shutdown = False
+    runner.afd_config = AFDConfig(role="ffn")
+    runner._ffn_input_ids_cache = {}
+    runner._mtp_acl_graphs = {}
+    runner.ffn_stream_overlap_enabled = False
+    runner.max_num_tokens = 1
     return runner
 
 
@@ -415,8 +783,79 @@ def test_npu_attention_runner_skips_outer_update_only_for_owned_graph(
     updates = []
     runner._update_full_graph_params_if_needed = lambda *args: updates.append(args)
 
+    positions = object()
     result = runner._model_forward(
         8,
+        input_ids=None,
+        positions=positions,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+    )
+
+    assert result == "hidden_states"
+    assert len(updates) == expected_updates
+    if updates:
+        assert updates[0][2] is positions
+
+
+@pytest.mark.parametrize(
+    ("graph_exists", "expected_mode", "expected_updates"),
+    [(False, "NONE", 1), (True, "FULL", 0)],
+)
+def test_npu_attention_runner_live_graph_u2_miss_falls_back_eager(
+    monkeypatch,
+    graph_exists,
+    expected_mode,
+    expected_updates,
+):
+    _require_npu_runtime()
+    from vllm.config import CUDAGraphMode
+
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    observed_modes = []
+
+    class FakeUBatchWrapper:
+        def has_ubatch_full_graph(self, _forward_context):
+            return graph_exists
+
+        def owns_full_graph_update(self, forward_context):
+            return forward_context.cudagraph_runtime_mode is CUDAGraphMode.FULL
+
+        def __call__(self, **_model_inputs):
+            observed_modes.append(forward_context.cudagraph_runtime_mode.name)
+            return "hidden_states"
+
+    ubatch_slices = [object(), object()]
+    forward_context = SimpleNamespace(
+        dbo_enabled=False,
+        flash_comm_v1_enabled=False,
+        ubatch_slices=ubatch_slices,
+        cudagraph_runtime_mode=CUDAGraphMode.FULL,
+    )
+    monkeypatch.setattr(
+        attention_model_runner,
+        "AscendUBatchWrapper",
+        FakeUBatchWrapper,
+    )
+    monkeypatch.setattr(
+        attention_model_runner,
+        "get_forward_context",
+        lambda: forward_context,
+    )
+
+    runner = object.__new__(attention_model_runner.AFDNPUAttentionModelRunner)
+    runner.enable_enpu = False
+    runner.model = FakeUBatchWrapper()
+    runner.ubatch_slices = ubatch_slices
+    runner._afd_live_execution = True
+    runner._install_afd_metadata_on_forward_context = lambda _context: None
+    runner._install_async_moe_ubatch_metadata_on_forward_context = lambda _context: None
+    updates = []
+    runner._update_full_graph_params_if_needed = lambda *args: updates.append(args)
+
+    result = runner._model_forward(
+        6,
         input_ids=None,
         positions=object(),
         intermediate_tensors=None,
@@ -424,10 +863,185 @@ def test_npu_attention_runner_skips_outer_update_only_for_owned_graph(
     )
 
     assert result == "hidden_states"
+    assert observed_modes == [expected_mode]
     assert len(updates) == expected_updates
 
 
-def test_npu_attention_runner_installs_mla_graph_wrapper(monkeypatch):
+def test_npu_attention_runner_pretransfers_dsv4_ids_outside_model(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    events = []
+    forward_context = SimpleNamespace(
+        dbo_enabled=False,
+        flash_comm_v1_enabled=False,
+    )
+
+    class FakeModel:
+        def __call__(self, **_model_inputs):
+            events.append(
+                (
+                    "model",
+                    forward_context.afd_input_ids_pretransferred,
+                )
+            )
+            return "hidden_states"
+
+    class FakeConnector:
+        requires_input_ids = True
+
+        def send_input_ids(self, input_ids, *, ubatch_idx):
+            events.append(("ids", input_ids.clone(), ubatch_idx))
+
+    monkeypatch.setattr(
+        attention_model_runner,
+        "get_forward_context",
+        lambda: forward_context,
+    )
+    runner = object.__new__(attention_model_runner.AFDNPUAttentionModelRunner)
+    runner.enable_enpu = False
+    runner.model = FakeModel()
+    runner.connector = FakeConnector()
+    runner.ubatch_slices = None
+    runner._install_afd_metadata_on_forward_context = lambda _context: None
+    runner._install_async_moe_ubatch_metadata_on_forward_context = lambda _context: None
+    runner._update_full_graph_params_if_needed = lambda *_args: None
+    input_ids = torch.tensor([-1, 7], dtype=torch.int32)
+
+    result = runner._model_forward(2, input_ids=input_ids)
+
+    assert result == "hidden_states"
+    assert events[0][0] == "ids"
+    assert events[0][1].tolist() == [-1, 7]
+    assert events[0][2] == 0
+    assert events[1] == ("model", True)
+    assert forward_context.afd_input_ids_pretransferred is False
+
+
+def test_npu_attention_runner_defers_dsv4_ids_to_each_ubatch_layer_zero(
+    monkeypatch,
+):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    events = []
+    forward_context = SimpleNamespace(
+        dbo_enabled=False,
+        flash_comm_v1_enabled=False,
+    )
+
+    class FakeModel:
+        def __call__(self, **_model_inputs):
+            events.append(
+                ("model", forward_context.afd_input_ids_pretransferred),
+            )
+            return "hidden_states"
+
+    class FakeConnector:
+        requires_input_ids = True
+
+        def send_input_ids(self, input_ids, *, ubatch_idx):
+            events.append(("ids", input_ids.clone(), ubatch_idx))
+
+    monkeypatch.setattr(
+        attention_model_runner,
+        "get_forward_context",
+        lambda: forward_context,
+    )
+    runner = object.__new__(attention_model_runner.AFDNPUAttentionModelRunner)
+    runner.enable_enpu = False
+    runner.model = FakeModel()
+    runner.connector = FakeConnector()
+    runner.ubatch_slices = [
+        SimpleNamespace(token_slice=slice(0, 2), num_tokens=2),
+        SimpleNamespace(token_slice=slice(2, 5), num_tokens=3),
+    ]
+    runner._install_afd_metadata_on_forward_context = lambda _context: None
+    runner._install_async_moe_ubatch_metadata_on_forward_context = lambda _context: None
+    runner._update_full_graph_params_if_needed = lambda *_args: None
+    input_ids = torch.tensor([10, 11, 20, 21, -1], dtype=torch.int32)
+
+    result = runner._model_forward(5, input_ids=input_ids)
+
+    assert result == "hidden_states"
+    assert events == [("model", False)]
+    assert forward_context.afd_input_ids_pretransferred is False
+
+
+def test_npu_attention_runner_pretransfers_hccl_stream_ids_by_stage(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    events = []
+    forward_context = SimpleNamespace(
+        dbo_enabled=False,
+        flash_comm_v1_enabled=False,
+    )
+
+    class FakeModel:
+        def __call__(self, **_model_inputs):
+            events.append(
+                ("model", forward_context.afd_input_ids_pretransferred),
+            )
+            return "hidden_states"
+
+    connector = object.__new__(attention_model_runner.P2pHcclAFDConnector)
+    connector.stream_overlap_enabled = True
+    connector.afd_config = SimpleNamespace(role="attention")
+    connector.a2f_send_stream = object()
+    connector.f2a_recv_stream = object()
+    connector.attention_pipeline_events = {(0, 0): object()}
+    connector.requires_input_ids = True
+    connector.send_input_ids = lambda input_ids, *, ubatch_idx: events.append(
+        ("ids", input_ids.clone(), ubatch_idx),
+    )
+
+    monkeypatch.setattr(
+        attention_model_runner,
+        "get_forward_context",
+        lambda: forward_context,
+    )
+    runner = object.__new__(attention_model_runner.AFDNPUAttentionModelRunner)
+    runner.enable_enpu = False
+    runner.model = FakeModel()
+    runner.connector = connector
+    runner.ubatch_slices = [
+        SimpleNamespace(token_slice=slice(0, 2), num_tokens=2),
+        SimpleNamespace(token_slice=slice(2, 5), num_tokens=3),
+    ]
+    runner._install_afd_metadata_on_forward_context = lambda _context: None
+    runner._install_async_moe_ubatch_metadata_on_forward_context = lambda _context: None
+    runner._update_full_graph_params_if_needed = lambda *_args: None
+    input_ids = torch.tensor([10, 11, 20, 21, -1], dtype=torch.int32)
+
+    result = runner._model_forward(5, input_ids=input_ids)
+
+    assert result == "hidden_states"
+    assert events[0][0] == "ids"
+    assert events[0][1].tolist() == [10, 11]
+    assert events[0][2] == 0
+    assert events[1][0] == "ids"
+    assert events[1][1].tolist() == [20, 21, -1]
+    assert events[1][2] == 1
+    assert events[2] == ("model", True)
+    assert forward_context.afd_input_ids_pretransferred is False
+
+
+@pytest.mark.parametrize(
+    ("model_fields", "use_compress", "expected_mla_full_graph"),
+    [
+        ({}, False, True),
+        ({"hf_config": SimpleNamespace(index_topk=8)}, False, False),
+        ({"hf_text_config": SimpleNamespace(index_topk=8)}, False, False),
+        ({}, True, False),
+    ],
+)
+def test_npu_attention_runner_installs_mla_graph_wrapper(
+    monkeypatch,
+    model_fields,
+    use_compress,
+    expected_mla_full_graph,
+):
     _require_npu_runtime()
     from afd_plugin.v1.worker.npu import attention_model_runner
 
@@ -449,44 +1063,110 @@ def test_npu_attention_runner_installs_mla_graph_wrapper(monkeypatch):
     runner.model = "model"
     runner.device = "npu"
     runner.vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(use_mla=True),
+        model_config=SimpleNamespace(use_mla=True, **model_fields),
     )
     runner.compilation_config = SimpleNamespace(
         cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True),
+    )
+    runner.use_sparse = False
+    runner.use_compress = use_compress
+    runner.enable_enpu = False
+
+    runner._install_ascend_ubatch_wrapper()
+
+    assert captured["args"][:2] == ("model", runner.vllm_config)
+    assert captured["kwargs"]["mla_full_graph_enabled"] is expected_mla_full_graph
+    assert captured["kwargs"]["enable_enpu"] is False
+    assert captured["kwargs"]["enable_layer_major_eager_u2"] is False
+    updater = captured["kwargs"]["full_graph_params_updater"]
+    assert updater.__self__ is runner
+
+
+@pytest.mark.parametrize("has_full_cudagraphs", [False, True])
+@pytest.mark.parametrize("requires_mtp", [False, True])
+@pytest.mark.parametrize("eager_stream_overlap", [False, True])
+def test_npu_attention_runner_enables_p2p_layer_major_eager_u2_warmup(
+    monkeypatch,
+    has_full_cudagraphs,
+    requires_mtp,
+    eager_stream_overlap,
+):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    captured = {}
+
+    class RecordingUBatchWrapper:
+        def __init__(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+    class LayerMajorModel:
+        def forward_ubatches_layer_major(self, _metadata):
+            raise AssertionError("installation must not execute the model")
+
+    monkeypatch.setattr(
+        attention_model_runner,
+        "AscendUBatchWrapper",
+        RecordingUBatchWrapper,
+    )
+    connector = object.__new__(attention_model_runner.P2pHcclAFDConnector)
+    connector.stream_overlap_enabled = True
+    connector.eager_u2_stream_overlap_enabled = eager_stream_overlap
+    connector.requires_mtp = requires_mtp
+    runner = object.__new__(attention_model_runner.AFDNPUAttentionModelRunner)
+    runner.model = LayerMajorModel()
+    runner.connector = connector
+    runner.device = "npu"
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(use_mla=True),
+    )
+    runner.compilation_config = SimpleNamespace(
+        cudagraph_mode=SimpleNamespace(
+            has_full_cudagraphs=lambda: has_full_cudagraphs,
+        ),
     )
     runner.use_sparse = False
     runner.enable_enpu = False
 
     runner._install_ascend_ubatch_wrapper()
 
-    assert captured["args"][:2] == ("model", runner.vllm_config)
-    assert captured["kwargs"]["mla_full_graph_enabled"] is True
-    assert captured["kwargs"]["enable_enpu"] is False
-    updater = captured["kwargs"]["full_graph_params_updater"]
-    assert updater.__self__ is runner
+    assert captured["kwargs"]["enable_layer_major_eager_u2"] is True
 
 
-def test_npu_attention_runner_builds_and_sets_metadata():
+@pytest.mark.parametrize("graph_replay", [False, True])
+@pytest.mark.parametrize("execution", ["startup", "live", "dummy"])
+def test_npu_attention_runner_builds_and_sets_metadata(
+    monkeypatch, graph_replay, execution
+):
     runner = _new_attention_runner()
     runner.vllm_config = _vllm_config(role="attention")
     runner.connector = _RecordingConnector()
     runner._is_warmup = False
     runner._afd_is_graph_capturing = False
+    runner._afd_unpadded_tokens_across_dp = None
     runner._afd_pending_metadata = None
     runner._afd_transaction_counter = 0
+    runner._afd_live_execution = execution == "live"
+    runner._afd_live_dummy_execution = execution == "dummy"
     forward_context = SimpleNamespace(
         additional_kwargs={},
         dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=[1]),
         ubatch_slices=None,
         batch_descriptor=SimpleNamespace(num_tokens=5),
+        cudagraph_runtime_mode=SimpleNamespace(name="FULL" if graph_replay else "NONE"),
     )
+    sent = []
+    monkeypatch.setattr(runner.connector, "send_dp_metadata_list", sent.append)
 
     runner._install_afd_metadata_on_forward_context(forward_context)
 
     metadata = forward_context.additional_kwargs["afd_metadata"]
     assert metadata.tokens_lens == [1]
     assert len(runner.connector.dp_metadata_updates) == 1
-    assert len(runner.connector.sent_dp_metadata_lists) == 1
+    assert len(sent) == 1
+    assert sent[0].target_graph_replay is graph_replay
+    assert sent[0].mtp_phase_control_enabled is (execution != "startup")
 
 
 def test_npu_attention_async_connector_skips_dp_metadata_control_plane():
@@ -559,6 +1239,7 @@ def test_npu_attention_runner_sends_per_ubatch_dp_metadata():
     runner.connector = _RecordingConnector()
     runner._is_warmup = False
     runner._afd_is_graph_capturing = False
+    runner._afd_unpadded_tokens_across_dp = None
 
     ubatch_slices = [
         SimpleNamespace(
@@ -639,7 +1320,7 @@ def test_npu_attention_capture_microbatch_also_captures_single_stage():
         allow_microbatching=True,
     )
 
-    assert result is True
+    assert result is None
     assert [call[1]["allow_microbatching"] for call in dummy_calls] == [
         False,
         False,
@@ -670,6 +1351,290 @@ def test_npu_attention_capture_microbatch_also_captures_single_stage():
     assert runner._afd_is_graph_capturing is False
     assert runner._afd_suppress_metadata_send is False
     assert runner._afd_pending_metadata == "original"
+
+
+def test_npu_attention_target_graph_u2_capture_omits_eager_mtp_drafter():
+    _require_npu_runtime()
+    from vllm.config import CUDAGraphMode
+
+    runner = _new_attention_runner()
+    runner.compilation_config = SimpleNamespace(cudagraph_num_of_warmups=1)
+    runner.connector = SimpleNamespace(control_plane=None)
+    runner.speculative_config = _mtp_speculative_config(enforce_eager=True)
+    eager_drafter = object()
+    runner.drafter = eager_drafter
+    runner._is_warmup = False
+    runner._afd_is_graph_capturing = False
+    runner._afd_suppress_metadata_send = False
+    runner._afd_pending_metadata = None
+    calls = []
+
+    def dummy_run(num_tokens, **kwargs):
+        calls.append(
+            (
+                num_tokens,
+                kwargs["cudagraph_runtime_mode"],
+                runner._is_warmup,
+                runner.drafter,
+            )
+        )
+
+    runner._dummy_run = dummy_run
+    desc = SimpleNamespace(num_tokens=8, uniform=True, num_active_loras=0)
+
+    runner._warmup_and_capture(
+        desc,
+        CUDAGraphMode.FULL,
+        allow_microbatching=True,
+    )
+
+    assert calls == [
+        (8, CUDAGraphMode.NONE, True, eager_drafter),
+        (8, CUDAGraphMode.FULL, False, None),
+        (8, CUDAGraphMode.NONE, True, eager_drafter),
+        (8, CUDAGraphMode.FULL, False, None),
+    ]
+    assert runner.drafter is eager_drafter
+
+
+def test_npu_attention_full_draft_graph_capture_keeps_mtp_drafter():
+    _require_npu_runtime()
+    from vllm.config import CUDAGraphMode
+
+    runner = _new_attention_runner()
+    runner.compilation_config = SimpleNamespace(cudagraph_num_of_warmups=1)
+    runner.connector = SimpleNamespace(control_plane=None)
+    runner.speculative_config = _mtp_speculative_config(enforce_eager=False)
+    graph_drafter = object()
+    runner.drafter = graph_drafter
+    runner._is_warmup = False
+    runner._afd_is_graph_capturing = False
+    runner._afd_suppress_metadata_send = False
+    runner._afd_pending_metadata = None
+    calls = []
+
+    def dummy_run(num_tokens, **kwargs):
+        calls.append(
+            (
+                num_tokens,
+                kwargs["cudagraph_runtime_mode"],
+                runner.drafter,
+            )
+        )
+
+    runner._dummy_run = dummy_run
+    runner._warmup_and_capture(
+        SimpleNamespace(num_tokens=8, uniform=True, num_active_loras=0),
+        CUDAGraphMode.FULL,
+        allow_microbatching=False,
+    )
+
+    assert calls == [
+        (8, CUDAGraphMode.NONE, graph_drafter),
+        (8, CUDAGraphMode.FULL, graph_drafter),
+    ]
+
+
+def test_npu_attention_load_model_keeps_dspark_drafter_local(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    calls = []
+
+    class FakeDSparkProposer:
+        pass
+
+    monkeypatch.setattr(
+        attention_model_runner,
+        "AscendDSparkProposer",
+        FakeDSparkProposer,
+    )
+    monkeypatch.setattr(
+        attention_model_runner.NPUModelRunner,
+        "load_model",
+        lambda self: calls.append("parent"),
+    )
+    runner = object.__new__(attention_model_runner.AFDNPUAttentionModelRunner)
+    runner.speculative_config = _dspark_speculative_config()
+    runner.drafter = FakeDSparkProposer()
+    runner.connector = object()
+    runner.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(use_ubatching=False),
+    )
+    runner._configure_mtp_draft_graph = lambda: calls.append("configure_mtp")
+    runner._install_ascend_ubatch_wrapper = lambda: calls.append("install_ubatch")
+
+    runner.load_model()
+
+    assert calls == ["parent"]
+
+
+def test_npu_ffn_load_model_keeps_dspark_drafter_off_ffn(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    calls = []
+    monkeypatch.setattr(
+        ffn_model_runner.NPUModelRunner,
+        "load_model",
+        lambda self: calls.append(("parent", self.drafter)),
+    )
+    runner = object.__new__(ffn_model_runner.AFDNPUFFNModelRunner)
+    runner.speculative_config = _dspark_speculative_config()
+    runner.connector = SimpleNamespace(requires_mtp=False)
+    runner.drafter = SimpleNamespace(
+        _get_model=lambda: pytest.fail("FFN must not load the DSpark draft model"),
+    )
+    runner.mtp_ffn_model = None
+
+    drafter = runner.drafter
+    runner.load_model()
+
+    assert calls == [("parent", None)]
+    assert runner.drafter is drafter
+    assert runner.mtp_ffn_model is None
+
+
+def test_npu_attention_full_draft_graph_enables_replay_synchronization():
+    _require_npu_runtime()
+    from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+
+    runner = _new_attention_runner()
+    runner.speculative_config = _mtp_speculative_config(enforce_eager=False)
+    draft_graph = object.__new__(ACLGraphWrapper)
+    draft_graph.use_eagle = True
+    runner.drafter = SimpleNamespace(_runnable=draft_graph)
+
+    runner._configure_mtp_draft_graph()
+
+    assert draft_graph.use_eagle is False
+    assert runner.drafter._runnable._runnable is draft_graph
+
+
+def test_npu_attention_eager_draft_gets_phase_boundary_wrapper():
+    runner = _new_attention_runner()
+    runner.speculative_config = _mtp_speculative_config(enforce_eager=True)
+
+    def eager_runnable():
+        return None
+
+    runner.drafter = SimpleNamespace(_runnable=eager_runnable)
+
+    runner._configure_mtp_draft_graph()
+
+    assert runner.drafter._runnable._runnable is eager_runnable
+
+
+@pytest.mark.parametrize(
+    ("live_proposal", "online_dummy"),
+    [(True, False), (False, True), (False, False)],
+)
+def test_npu_attention_eager_draft_announces_phase_before_all_iterations(
+    monkeypatch, live_proposal, online_dummy
+):
+    from vllm.config import CUDAGraphMode
+
+    from afd_plugin.v1.worker.npu import attention_model_runner
+
+    runner = _new_attention_runner()
+    runner.speculative_config = _mtp_speculative_config(num_speculative_tokens=3)
+    runner._afd_in_mtp_proposal = live_proposal
+    runner._afd_live_dummy_execution = online_dummy
+    calls = []
+    runner.connector = SimpleNamespace(
+        control_plane=SimpleNamespace(
+            send_mtp_phase_ready=lambda **kwargs: calls.append(
+                ("ready", kwargs["graph_replay"])
+            )
+        )
+    )
+
+    def eager_runnable():
+        for step in range(3):
+            calls.append(("draft", step))
+
+    runner.drafter = SimpleNamespace(_runnable=eager_runnable)
+    # A target graph mode must not make the eager callable look like a graph.
+    monkeypatch.setattr(
+        attention_model_runner,
+        "get_forward_context",
+        lambda: SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL),
+    )
+
+    runner._configure_mtp_draft_graph()
+    runner.drafter._runnable()
+
+    expected = [("ready", False)] if live_proposal or online_dummy else []
+    assert calls == expected + [("draft", 0), ("draft", 1), ("draft", 2)]
+
+
+@pytest.mark.parametrize("online_dummy", [False, True])
+def test_npu_attention_announces_only_executed_live_mtp_phase(
+    monkeypatch, online_dummy
+):
+    _require_npu_runtime()
+    from vllm.config import CUDAGraphMode
+
+    from afd_plugin.v1.worker.npu import attention_model_runner
+    from afd_plugin.v1.worker.npu.attention_model_runner import (
+        _AFDMTPPhaseAwareRunnable,
+    )
+
+    runner = _new_attention_runner()
+    runner._afd_live_execution = False
+    calls = []
+    runner.connector = SimpleNamespace(
+        control_plane=SimpleNamespace(
+            send_mtp_phase_ready=lambda **kwargs: calls.append(
+                ("ready", kwargs["graph_replay"]),
+            ),
+        ),
+    )
+
+    class CallableDraftGraph:
+        runtime_mode = CUDAGraphMode.FULL
+        concrete_aclgraph_entries = {}
+
+        def __call__(self, value):
+            calls.append(("runnable", value))
+            return value + 1
+
+    graph_wrapper = CallableDraftGraph()
+    runnable = _AFDMTPPhaseAwareRunnable(
+        graph_wrapper,
+        runner._announce_live_mtp_phase,
+    )
+
+    forward_context = SimpleNamespace(
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        batch_descriptor="draft-batch",
+    )
+    monkeypatch.setattr(
+        attention_model_runner,
+        "get_forward_context",
+        lambda: forward_context,
+    )
+
+    assert runnable(3) == 4
+    runner._afd_in_mtp_proposal = not online_dummy
+    runner._afd_live_dummy_execution = online_dummy
+    forward_context.cudagraph_runtime_mode = CUDAGraphMode.FULL
+    assert runnable(5) == 6
+    assert forward_context.cudagraph_runtime_mode is CUDAGraphMode.FULL
+    graph_wrapper.concrete_aclgraph_entries["draft-batch"] = SimpleNamespace(
+        aclgraph=object(),
+    )
+    assert runnable(7) == 8
+
+    assert calls == [
+        ("runnable", 3),
+        ("ready", False),
+        ("runnable", 5),
+        ("ready", True),
+        ("runnable", 7),
+    ]
+    assert runner._afd_mtp_phase_announced is True
+    assert runner._afd_mtp_graph_replayed is True
 
 
 def test_npu_attention_metadata_positional_args_and_padded_slices():
@@ -779,8 +1744,21 @@ def test_npu_request_boundary_ubatch_slices_balance_tokens(monkeypatch):
             sys.modules[module_name] = original_module
 
 
-def test_npu_create_ascend_forward_context_marks_current_ubatch(monkeypatch):
+@pytest.mark.parametrize(
+    ("parent_graph_mode", "expected_graph_ubatching"),
+    [
+        (None, False),
+        (SimpleNamespace(name="FULL"), True),
+    ],
+)
+def test_npu_create_ascend_forward_context_marks_current_ubatch(
+    monkeypatch,
+    parent_graph_mode,
+    expected_graph_ubatching,
+):
     _require_npu_runtime()
+    import torch
+
     from afd_plugin.v1.worker.npu import forward_context as forward_context_module
 
     monkeypatch.setattr(
@@ -825,7 +1803,9 @@ def test_npu_create_ascend_forward_context_marks_current_ubatch(monkeypatch):
         draft_attn_metadatas=None,
         max_tokens_across_pcp=None,
         sinks=False,
-        input_ids=None,
+        input_ids=torch.tensor([10, 11, 12, 13, 20, 21, 22]),
+        afd_input_ids_pretransferred=True,
+        cudagraph_runtime_mode=parent_graph_mode,
         eplb_heat_collection_status=False,
         is_padding=None,
         mc2_mask=None,
@@ -858,6 +1838,9 @@ def test_npu_create_ascend_forward_context_marks_current_ubatch(monkeypatch):
     assert new_forward_context.ubatch_idx == 1
     assert new_forward_context.num_ubatches == 2
     assert new_forward_context.num_tokens == 3
+    assert new_forward_context.input_ids.tolist() == [20, 21, 22]
+    assert new_forward_context.afd_input_ids_pretransferred is True
+    assert new_forward_context.afd_graph_ubatching is expected_graph_ubatching
     assert child_metadata.stage_idx == 1
 
 
@@ -889,6 +1872,367 @@ def test_npu_ffn_runner_executes_eager_ffn_step(monkeypatch):
     ]
 
 
+def test_npu_ffn_runner_executes_decoder_then_mtp_phase(monkeypatch):
+    _patch_ffn_forward_context(monkeypatch)
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        connector="P2pHcclAFDConnector",
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens=1,
+            enforce_eager=True,
+        ),
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.model = _FakeModel()
+    runner.mtp_ffn_model = _FakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 2
+    runner.use_aclgraph = False
+    runner._acl_graphs = {}
+    decoder_metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0,
+        stage_idx=0,
+        seq_len=2,
+    )
+    mtp_metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0,
+        stage_idx=0,
+        seq_len=2,
+        phase="mtp",
+        speculative_step=0,
+    )
+    runner.connector.attn_outputs.extend(
+        [
+            ("decoder-hidden", decoder_metadata),
+            ("mtp-hidden", mtp_metadata),
+        ]
+    )
+    runner.connector.recv_mtp_header = lambda *, stage_idx: SimpleNamespace(
+        num_tokens=2,
+        speculative_step=0,
+        num_tokens_across_dp=torch.tensor([2], dtype=torch.int32),
+    )
+
+    runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([2])})
+
+    assert runner.connector.ffn_outputs == [
+        ("npu-ffn(decoder-hidden, layer=0)", decoder_metadata, {"ubatch_idx": 0}),
+        ("npu-ffn(mtp-hidden, layer=0)", mtp_metadata, {"ubatch_idx": 0}),
+    ]
+
+
+def test_npu_ffn_runner_dspark_does_not_enter_remote_mtp_phase(monkeypatch):
+    _patch_ffn_forward_context(monkeypatch)
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        connector="P2pHcclAFDConnector",
+        speculative_config=_dspark_speculative_config(),
+    )
+    runner.connector = _FakeFFNConnector(requires_mtp=False)
+    runner.model = _FakeModel()
+    runner.mtp_ffn_model = _FakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 1
+    runner.use_aclgraph = False
+    runner._acl_graphs = {}
+    decoder_metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0,
+        stage_idx=0,
+        seq_len=1,
+    )
+    runner.connector.attn_outputs.append(("decoder-hidden", decoder_metadata))
+    runner.connector.recv_mtp_header = lambda **_kwargs: pytest.fail(
+        "DSpark keeps its draft on Attention and must not receive an AFD MTP header",
+    )
+
+    runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([1])})
+
+    assert runner.connector.ffn_outputs == [
+        ("npu-ffn(decoder-hidden, layer=0)", decoder_metadata, {"ubatch_idx": 0}),
+    ]
+    assert runner._recv_mtp_phase_ready() is False
+
+
+def test_npu_ffn_runner_executes_all_configured_mtp_steps(monkeypatch):
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        connector="P2pHcclAFDConnector",
+        speculative_config=_mtp_speculative_config(
+            enforce_eager=True,
+            num_speculative_tokens=3,
+        ),
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.use_aclgraph = False
+    calls = []
+    monkeypatch.setattr(
+        runner,
+        "_mtp_ffn_forward",
+        lambda stage_ids, *, expected_speculative_step=None, **_kwargs: calls.append(
+            (tuple(stage_ids), expected_speculative_step)
+        ),
+    )
+
+    runner._execute_mtp_after_target({0: _FakeDPMetadata([8])})
+
+    assert calls == [((0,), 0), ((0,), 1), ((0,), 2)]
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3])
+@pytest.mark.parametrize("num_stages", [1, 2])
+@pytest.mark.parametrize("draft_enforce_eager", [True, False])
+@pytest.mark.parametrize("run_mode", ["eager", "target_replay", "warmup"])
+def test_npu_ffn_runner_services_complete_mtp_sequence(
+    monkeypatch, num_speculative_tokens, num_stages, draft_enforce_eager, run_mode
+):
+    _patch_ffn_forward_context(monkeypatch)
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        connector="P2pHcclAFDConnector",
+        speculative_config=_mtp_speculative_config(
+            enforce_eager=draft_enforce_eager,
+            num_speculative_tokens=num_speculative_tokens,
+        ),
+        use_ubatching=num_stages == 2,
+        num_ubatches=num_stages,
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.model = _FakeModel()
+    runner.mtp_ffn_model = _FakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 3
+    runner.use_aclgraph = run_mode != "eager"
+    runner._acl_graphs = {}
+    dp_metadata = {
+        stage_idx: _FakeDPMetadata([stage_idx + 1]) for stage_idx in range(num_stages)
+    }
+    total_tokens = sum(stage_idx + 1 for stage_idx in range(num_stages))
+    expected_outputs = []
+    target_graph = _FakeGraph()
+    if run_mode == "target_replay":
+        runner._acl_graphs[runner._make_graph_key(dp_metadata)] = {
+            "graph": target_graph,
+        }
+    else:
+        for stage_idx in range(num_stages):
+            metadata = AFDTransferMetadata.create_attention_metadata(
+                layer_idx=0, stage_idx=stage_idx, seq_len=stage_idx + 1
+            )
+            runner.connector.attn_outputs.append((f"decoder-{stage_idx}", metadata))
+            expected_outputs.append(metadata)
+
+    steps = [
+        step if draft_enforce_eager else 0 for step in range(num_speculative_tokens)
+    ]
+    for iteration, step in enumerate(steps):
+        metadata = AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=0,
+            seq_len=total_tokens,
+            phase="mtp",
+            speculative_step=step,
+        )
+        runner.connector.attn_outputs.append((f"draft-{iteration}", metadata))
+        expected_outputs.append(metadata)
+    received_headers = []
+
+    def recv_mtp_header(*, stage_idx):
+        # Each reply must finish before the next header, and all target replies
+        # precede the draft phase. This also checks U2 merges back to stage 0.
+        target_outputs = 0 if run_mode == "target_replay" else num_stages
+        assert len(runner.connector.ffn_outputs) == target_outputs + len(
+            received_headers
+        )
+        assert stage_idx == 0
+        step = steps[len(received_headers)]
+        received_headers.append(step)
+        return SimpleNamespace(
+            num_tokens=total_tokens,
+            speculative_step=step,
+            num_tokens_across_dp=torch.tensor([total_tokens], dtype=torch.int32),
+        )
+
+    runner.connector.recv_mtp_header = recv_mtp_header
+    if run_mode == "warmup":
+        monkeypatch.setattr(ffn_model_runner.torch.npu, "mem_get_info", lambda: (0, 0))
+        monkeypatch.setattr(
+            ffn_model_runner, "set_cudagraph_capturing_enabled", lambda enabled: None
+        )
+        runner.capture_model(dp_metadata, is_warmup=True, input_ids_by_stage={})
+    else:
+        runner.execute_model(dp_metadata_list=dp_metadata, input_ids_by_stage={})
+
+    assert received_headers == steps
+    assert not runner.connector.attn_outputs
+    assert [item[1] for item in runner.connector.ffn_outputs] == expected_outputs
+    assert target_graph.replay_count == int(run_mode == "target_replay")
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3])
+@pytest.mark.parametrize("num_stages", [1, 2])
+def test_npu_ffn_runner_captures_complete_mtp_sequence(
+    monkeypatch, num_speculative_tokens, num_stages
+):
+    _patch_ffn_forward_context(monkeypatch)
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        connector="P2pHcclAFDConnector",
+        speculative_config=_mtp_speculative_config(
+            enforce_eager=False, num_speculative_tokens=num_speculative_tokens
+        ),
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.mtp_ffn_model = _FakeModel()
+    runner.graph_pool = None
+    monkeypatch.setattr(ffn_model_runner.torch.npu, "NPUGraph", _FakeGraph)
+    monkeypatch.setattr(
+        ffn_model_runner.torch.npu, "graph", lambda graph, pool: nullcontext()
+    )
+    dp_metadata = {
+        stage_idx: _FakeDPMetadata([stage_idx + 1]) for stage_idx in range(num_stages)
+    }
+    total_tokens = sum(stage_idx + 1 for stage_idx in range(num_stages))
+    metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0, stage_idx=0, seq_len=total_tokens, phase="mtp", speculative_step=0
+    )
+    for iteration in range(num_speculative_tokens):
+        runner.connector.attn_outputs.append((f"draft-{iteration}", metadata))
+    received_headers = []
+
+    def recv_mtp_header_for_graph(*, stage_idx, attention_peer_counts):
+        assert len(runner.connector.ffn_outputs) == len(received_headers)
+        received_headers.append((stage_idx, attention_peer_counts))
+        return SimpleNamespace(
+            num_tokens=total_tokens,
+            speculative_step=0,
+            num_tokens_across_dp=torch.tensor([total_tokens], dtype=torch.int32),
+        )
+
+    runner.connector.recv_mtp_header_for_graph = recv_mtp_header_for_graph
+    runner._capture_mtp_graphs(dp_metadata)
+
+    assert received_headers == [(0, (total_tokens,))] * num_speculative_tokens
+    assert not runner.connector.attn_outputs
+    assert [item[1] for item in runner.connector.ffn_outputs] == [
+        metadata
+    ] * num_speculative_tokens
+    graph = runner._mtp_acl_graphs[runner._make_mtp_graph_key(dp_metadata)]["graph"]
+    assert graph.replay_count == 0
+
+    # One replay services the entire captured sequence, including duplicate capture.
+    runner._capture_mtp_graphs(dp_metadata)
+    assert graph.replay_count == 1
+    runner._replay_mtp_graph(dp_metadata)
+    assert graph.replay_count == 2
+    assert len(received_headers) == num_speculative_tokens
+
+
+@pytest.mark.parametrize("invalid_header", [True, False])
+def test_npu_ffn_runner_rejects_mismatched_mtp_steps(monkeypatch, invalid_header):
+    _patch_ffn_forward_context(monkeypatch)
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn", speculative_config=_mtp_speculative_config(num_speculative_tokens=3)
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.mtp_ffn_model = _FakeModel()
+    header = SimpleNamespace(
+        num_tokens=1,
+        speculative_step=0 if invalid_header else 1,
+        num_tokens_across_dp=torch.tensor([1], dtype=torch.int32),
+    )
+    metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0, stage_idx=0, seq_len=1, phase="mtp", speculative_step=0
+    )
+    runner.connector.attn_outputs.append(("draft", metadata))
+
+    with pytest.raises(
+        RuntimeError,
+        match="out-of-order MTP step" if invalid_header else "invalid MTP phase",
+    ):
+        runner._mtp_ffn_forward([0], header=header, expected_speculative_step=1)
+
+    assert runner.connector.ffn_outputs == []
+
+
+def test_npu_ffn_runner_executes_u2_decoder_then_one_merged_mtp_phase(
+    monkeypatch,
+):
+    _patch_ffn_forward_context(monkeypatch)
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        connector="P2pHcclAFDConnector",
+        speculative_config=_mtp_speculative_config(enforce_eager=True),
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.model = _FakeModel()
+    runner.mtp_ffn_model = _FakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 3
+    runner.use_aclgraph = False
+    runner._acl_graphs = {}
+    decoder_metadata = [
+        AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=stage_idx,
+            seq_len=stage_idx + 1,
+        )
+        for stage_idx in (0, 1)
+    ]
+    mtp_metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0,
+        stage_idx=0,
+        seq_len=3,
+        phase="mtp",
+        speculative_step=0,
+    )
+    runner.connector.attn_outputs.extend(
+        [
+            ("decoder-stage-0", decoder_metadata[0]),
+            ("decoder-stage-1", decoder_metadata[1]),
+            ("mtp-merged", mtp_metadata),
+        ]
+    )
+    header_stages = []
+
+    def recv_mtp_header(*, stage_idx):
+        header_stages.append(stage_idx)
+        return SimpleNamespace(
+            num_tokens=3,
+            speculative_step=0,
+            num_tokens_across_dp=torch.tensor([3], dtype=torch.int32),
+        )
+
+    runner.connector.recv_mtp_header = recv_mtp_header
+
+    runner.execute_model(
+        dp_metadata_list={
+            0: _FakeDPMetadata([1]),
+            1: _FakeDPMetadata([2]),
+        }
+    )
+
+    assert header_stages == [0]
+    assert [item[1] for item in runner.connector.ffn_outputs] == [
+        *decoder_metadata,
+        mtp_metadata,
+    ]
+
+
 def test_npu_ffn_runner_builds_forward_context_for_each_dbo_stage(monkeypatch):
     _require_npu_runtime()
     from afd_plugin.v1.worker.npu import ffn_model_runner
@@ -913,17 +2257,20 @@ def test_npu_ffn_runner_builds_forward_context_for_each_dbo_stage(monkeypatch):
     runner.vllm_config = _vllm_config(role="ffn")
     runner.connector = _FakeFFNConnector(attn_size=2, ffn_size=2)
     runner.model = _FakeModel()
-    runner.num_layers = 1
+    runner.num_layers = 3
     runner.max_num_tokens = 16
     runner.use_aclgraph = False
     runner._acl_graphs = {}
-    for stage_idx, num_tokens in enumerate((6, 7)):
-        metadata = AFDTransferMetadata.create_attention_metadata(
-            layer_idx=0,
-            stage_idx=stage_idx,
-            seq_len=num_tokens,
-        )
-        runner.connector.attn_outputs.append((f"hidden-{stage_idx}", metadata))
+    for layer_idx in range(runner.num_layers):
+        for stage_idx, num_tokens in enumerate((6, 7)):
+            metadata = AFDTransferMetadata.create_attention_metadata(
+                layer_idx=layer_idx,
+                stage_idx=stage_idx,
+                seq_len=num_tokens,
+            )
+            runner.connector.attn_outputs.append(
+                (f"hidden-{layer_idx}-{stage_idx}", metadata),
+            )
 
     runner.execute_model(
         dp_metadata_list={
@@ -937,6 +2284,601 @@ def test_npu_ffn_runner_builds_forward_context_for_each_dbo_stage(monkeypatch):
         [6],
         [7],
     ]
+    assert len(runner.connector.ffn_outputs) == 6
+
+
+def test_npu_ffn_runner_projects_attention_counts_to_ffn_fanout():
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    connector = SimpleNamespace(attn_size=2, ffn_size=4)
+    counts = ffn_model_runner._ffn_token_counts_across_ranks(
+        connector,
+        {0: _FakeDPMetadata([5, 1])},
+        0,
+        fallback=16,
+    )
+
+    assert counts.tolist() == [3, 2, 1, 1]
+
+
+@pytest.mark.parametrize(
+    (
+        "is_graph_capturing",
+        "graph_runtime",
+        "graph_overlap_enabled",
+        "graph_recv_enabled",
+        "graph_cross_layer_enabled",
+        "eager_overlap_enabled",
+    ),
+    [
+        (False, False, True, True, True, True),
+        (False, False, True, True, True, False),
+        (True, True, True, True, True, True),
+        (True, True, True, True, False, True),
+        (True, True, True, False, False, True),
+        (True, True, False, True, True, True),
+    ],
+    ids=[
+        "eager-streamed",
+        "eager-serial",
+        "graph-full-pipeline",
+        "graph-recv-layer-barrier",
+        "graph-parent-recv-layer-barrier",
+        "graph-capture-baseline",
+    ],
+)
+def test_npu_ffn_runner_stream_pipeline_orders_each_layer_and_stage(
+    monkeypatch,
+    is_graph_capturing,
+    graph_runtime,
+    graph_overlap_enabled,
+    graph_recv_enabled,
+    graph_cross_layer_enabled,
+    eager_overlap_enabled,
+):
+    _require_npu_runtime()
+    from vllm.config import CUDAGraphMode
+
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    _patch_ffn_forward_context(monkeypatch)
+    calls = []
+    active_stream = [None]
+    recv_stream = object()
+    compute_stream = object()
+    send_stream = object()
+    default_stream = object()
+
+    class FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            calls.append((self.name, "record", stream))
+
+        def wait(self, stream):
+            calls.append((self.name, "wait", stream))
+
+    @contextmanager
+    def use_stream(stream):
+        previous = active_stream[0]
+        active_stream[0] = stream
+        try:
+            yield
+        finally:
+            active_stream[0] = previous
+
+    class StreamConnector(_FakeFFNConnector):
+        stream_overlap_enabled = True
+
+        def recv_attn_output(self, *, ubatch_idx, **kwargs):
+            if active_stream[0] is not recv_stream:
+                calls.append(
+                    (
+                        "recv",
+                        kwargs["layer_idx"],
+                        ubatch_idx,
+                        ffn_model_runner.torch.npu.current_stream(),
+                    )
+                )
+            return super().recv_attn_output(ubatch_idx=ubatch_idx, **kwargs)
+
+        def send_ffn_output(self, ffn_output, context, *, ubatch_idx, **kwargs):
+            if active_stream[0] is not send_stream:
+                calls.append(
+                    (
+                        "send",
+                        context.metadata.layer_idx,
+                        ubatch_idx,
+                        active_stream[0] or ffn_model_runner.torch.npu.current_stream(),
+                    )
+                )
+            return super().send_ffn_output(
+                ffn_output,
+                context,
+                ubatch_idx=ubatch_idx,
+                **kwargs,
+            )
+
+        def recv_attn_output_streamed(
+            self,
+            *,
+            ubatch_idx,
+            recv_stream,
+            wait_event,
+            done_event,
+            **kwargs,
+        ):
+            with use_stream(recv_stream):
+                if wait_event is not None:
+                    wait_event.wait(recv_stream)
+                calls.append(("recv", kwargs["layer_idx"], ubatch_idx, recv_stream))
+                payload = self.recv_attn_output(ubatch_idx=ubatch_idx, **kwargs)
+                done_event.record(recv_stream)
+            return payload, done_event
+
+        def send_ffn_output_streamed(
+            self,
+            ffn_output,
+            context,
+            *,
+            ubatch_idx,
+            send_stream,
+            wait_event,
+            done_event,
+        ):
+            with use_stream(send_stream):
+                wait_event.wait(send_stream)
+                calls.append(
+                    ("send", context.metadata.layer_idx, ubatch_idx, send_stream),
+                )
+                self.send_ffn_output(
+                    ffn_output,
+                    context,
+                    ubatch_idx=ubatch_idx,
+                )
+                done_event.record(send_stream)
+            return done_event
+
+    class StreamModel:
+        def compute_ffn_output(self, hidden_states, layer_idx, **_kwargs):
+            stage_idx = int(hidden_states[0, 0].item())
+            calls.append(("compute", layer_idx, stage_idx, active_stream[0]))
+            return hidden_states + 1
+
+    monkeypatch.setattr(ffn_model_runner, "P2pHcclAFDConnector", StreamConnector)
+    monkeypatch.setattr(ffn_model_runner.torch.npu, "stream", use_stream)
+    monkeypatch.setattr(
+        ffn_model_runner.torch.npu,
+        "current_stream",
+        lambda: default_stream,
+    )
+
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        connector="P2pHcclAFDConnector",
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+    )
+    runner.connector = StreamConnector(attn_size=2, ffn_size=2)
+    runner.connector.eager_u2_stream_overlap_enabled = eager_overlap_enabled
+    runner.connector.graph_u2_compute_overlap_enabled = graph_overlap_enabled
+    runner.connector.graph_u2_ffn_recv_stream_enabled = graph_recv_enabled
+    runner.connector.graph_u2_ffn_cross_layer_enabled = graph_cross_layer_enabled
+    runner.model = StreamModel()
+    runner.num_layers = 2
+    runner.max_num_tokens = 2
+    runner.ffn_stream_overlap_enabled = True
+    runner.ffn_recv_stream = recv_stream
+    runner.ffn_compute_stream = compute_stream
+    runner.ffn_send_stream = send_stream
+    runner.ffn_graph_recv_ready_event = FakeEvent("graph-recv-ready")
+    event_keys = [
+        (layer_idx, stage_idx) for layer_idx in range(2) for stage_idx in range(2)
+    ]
+    runner.ffn_recv_events = {
+        key: FakeEvent(f"recv-{key[0]}-{key[1]}") for key in event_keys
+    }
+    runner.ffn_compute_events = {
+        key: FakeEvent(f"compute-{key[0]}-{key[1]}") for key in event_keys
+    }
+    runner.ffn_send_events = {
+        key: FakeEvent(f"send-{key[0]}-{key[1]}") for key in event_keys
+    }
+    for layer_idx in range(2):
+        for stage_idx in range(2):
+            metadata = AFDTransferMetadata.create_attention_metadata(
+                layer_idx=layer_idx,
+                stage_idx=stage_idx,
+                seq_len=1,
+            )
+            runner.connector.attn_outputs.append(
+                _ffn_payload(
+                    torch.full((1, 1), stage_idx, dtype=torch.float32),
+                    metadata,
+                ),
+            )
+
+    runner._ffn_forward(
+        dp_metadata_list={
+            0: _FakeDPMetadata([1]),
+            1: _FakeDPMetadata([1]),
+        },
+        is_graph_capturing=is_graph_capturing,
+        aclgraph_runtime_mode=CUDAGraphMode.FULL if graph_runtime else None,
+    )
+
+    eager_stream_overlap = not is_graph_capturing and eager_overlap_enabled
+    for layer_idx in range(2):
+        for stage_idx in range(2):
+            recv_marker = (
+                "recv",
+                layer_idx,
+                stage_idx,
+                (
+                    recv_stream
+                    if eager_stream_overlap
+                    or (
+                        is_graph_capturing
+                        and graph_overlap_enabled
+                        and graph_recv_enabled
+                    )
+                    else default_stream
+                ),
+            )
+            expected_compute_stream = (
+                compute_stream
+                if eager_stream_overlap
+                or (is_graph_capturing and graph_overlap_enabled)
+                else None
+            )
+            compute_marker = (
+                "compute",
+                layer_idx,
+                stage_idx,
+                expected_compute_stream,
+            )
+            send_marker = (
+                "send",
+                layer_idx,
+                stage_idx,
+                (
+                    send_stream
+                    if eager_stream_overlap
+                    or (is_graph_capturing and graph_overlap_enabled)
+                    else default_stream
+                ),
+            )
+            assert calls.index(recv_marker) < calls.index(compute_marker)
+            assert calls.index(compute_marker) < calls.index(send_marker)
+            if layer_idx > 0 and (
+                eager_stream_overlap
+                or (is_graph_capturing and graph_overlap_enabled and graph_recv_enabled)
+            ):
+                previous_send_wait = (
+                    f"send-{layer_idx - 1}-{stage_idx}",
+                    "wait",
+                    recv_stream,
+                )
+                assert calls.index(previous_send_wait) < calls.index(recv_marker)
+            if (
+                layer_idx == 0
+                and is_graph_capturing
+                and graph_overlap_enabled
+                and graph_recv_enabled
+            ):
+                assert calls.index(
+                    ("graph-recv-ready", "wait", recv_stream)
+                ) < calls.index(recv_marker)
+            if is_graph_capturing and graph_overlap_enabled:
+                compute_wait = (
+                    f"compute-{layer_idx}-{stage_idx}",
+                    "wait",
+                    send_stream,
+                )
+                assert calls.index(compute_wait) < calls.index(send_marker)
+    if is_graph_capturing:
+        graph_schedule = [
+            call[:3] for call in calls if call[0] in {"recv", "compute", "send"}
+        ]
+        if graph_overlap_enabled:
+            assert graph_schedule == [
+                ("recv", 0, 0),
+                ("compute", 0, 0),
+                ("send", 0, 0),
+                ("recv", 0, 1),
+                ("compute", 0, 1),
+                ("send", 0, 1),
+                ("recv", 1, 0),
+                ("compute", 1, 0),
+                ("send", 1, 0),
+                ("recv", 1, 1),
+                ("compute", 1, 1),
+                ("send", 1, 1),
+            ]
+        else:
+            assert graph_schedule == [
+                (op, layer_idx, stage_idx)
+                for layer_idx in range(2)
+                for stage_idx in range(2)
+                for op in ("recv", "compute", "send")
+            ]
+        if graph_overlap_enabled:
+            cross_layer_active = graph_recv_enabled and graph_cross_layer_enabled
+            joined_layers = (1,) if cross_layer_active else (0, 1)
+            for layer_idx in joined_layers:
+                for stage_idx in range(2):
+                    assert (
+                        f"send-{layer_idx}-{stage_idx}",
+                        "wait",
+                        default_stream,
+                    ) in calls
+            if cross_layer_active:
+                for stage_idx in range(2):
+                    assert (
+                        f"send-0-{stage_idx}",
+                        "wait",
+                        default_stream,
+                    ) not in calls
+            else:
+                for layer_idx in range(2):
+                    recv_stream_for_layer = (
+                        recv_stream if graph_recv_enabled else default_stream
+                    )
+                    assert calls.index(
+                        ("recv", layer_idx, 1, recv_stream_for_layer)
+                    ) < calls.index((f"send-{layer_idx}-0", "wait", default_stream))
+    else:
+        if eager_overlap_enabled:
+            assert ("send-1-0", "wait", default_stream) in calls
+            assert ("send-1-1", "wait", default_stream) in calls
+        else:
+            assert ("send-1-0", "wait", default_stream) not in calls
+            assert ("send-1-1", "wait", default_stream) not in calls
+
+
+def test_dsv4_ffn_eager_receives_ids_and_hidden_stage_by_stage(monkeypatch):
+    _patch_ffn_forward_context(monkeypatch)
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(role="ffn")
+    runner.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(num_hash_layers=1),
+    )
+    runner.model = _RecordingFakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 8
+    runner.use_aclgraph = False
+    runner._acl_graphs = {}
+    events = []
+
+    class StageOrderedConnector(_FakeFFNConnector):
+        requires_input_ids = True
+
+        def update_state_from_dp_metadata(self, payload):
+            events.append(("update", tuple(sorted(payload.dp_metadata_list))))
+            return super().update_state_from_dp_metadata(payload)
+
+        def recv_input_ids(self, num_tokens, *, ubatch_idx):
+            events.append(("ids", ubatch_idx))
+            return super().recv_input_ids(num_tokens, ubatch_idx=ubatch_idx)
+
+        def recv_attn_output(self, ubatch_idx=None, **kwargs):
+            events.append(("hidden", ubatch_idx))
+            return super().recv_attn_output(ubatch_idx=ubatch_idx, **kwargs)
+
+    runner.connector = StageOrderedConnector(
+        attn_size=2,
+        ffn_size=2,
+        requires_input_ids=True,
+    )
+    for stage_idx, num_tokens in enumerate((3, 2)):
+        metadata = AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=stage_idx,
+            seq_len=num_tokens,
+        )
+        runner.connector.attn_outputs.append((f"hidden-{stage_idx}", metadata))
+
+    runner.execute_ffn_step(
+        dp_metadata_list={
+            0: _FakeDPMetadata([3]),
+            1: _FakeDPMetadata([2]),
+        },
+    )
+
+    assert events == [
+        ("update", (0, 1)),
+        ("ids", 0),
+        ("ids", 1),
+        ("hidden", 0),
+        ("hidden", 1),
+    ]
+
+
+def test_dsv4_ffn_runner_clears_ids_cache_after_exception(monkeypatch):
+    _patch_ffn_forward_context(monkeypatch)
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(role="ffn")
+    runner.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(num_hash_layers=3),
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.num_layers = 2
+    runner.max_num_tokens = 2
+
+    class FailingModel:
+        def compute_ffn_output(self, hidden_states, layer_idx, **kwargs):
+            del hidden_states, kwargs
+            if layer_idx == 1:
+                raise RuntimeError("injected FFN failure")
+            return "layer-0-output"
+
+    runner.model = FailingModel()
+    for layer_idx in range(2):
+        metadata = AFDTransferMetadata.create_attention_metadata(
+            layer_idx=layer_idx,
+            stage_idx=0,
+            seq_len=2,
+        )
+        runner.connector.attn_outputs.append(
+            _ffn_payload(
+                f"hidden-{layer_idx}",
+                metadata,
+                input_ids=(
+                    torch.tensor([-1, 31], dtype=torch.int32)
+                    if layer_idx == 0
+                    else None
+                ),
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="injected FFN failure"):
+        runner._ffn_forward(dp_metadata_list={0: _FakeDPMetadata([2])})
+
+    assert runner._ffn_input_ids_cache == {}
+
+
+def test_dsv4_ffn_runner_logs_u1_stage_boundaries(monkeypatch, caplog):
+    _patch_ffn_forward_context(monkeypatch)
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(role="ffn")
+    runner.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(num_hash_layers=0),
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.connector.stage_diagnostics_enabled = True
+    runner.model = _RecordingFakeModel()
+    runner.num_layers = 2
+    runner.max_num_tokens = 1
+    for layer_idx in range(2):
+        metadata = AFDTransferMetadata.create_attention_metadata(
+            layer_idx=layer_idx,
+            stage_idx=0,
+            seq_len=1,
+        )
+        runner.connector.attn_outputs.append(
+            _ffn_payload(f"hidden-{layer_idx}", metadata),
+        )
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="afd_plugin.v1.worker.npu.ffn_model_runner",
+    ):
+        runner._ffn_forward(dp_metadata_list={0: _FakeDPMetadata([1])})
+
+    assert "event=recv_begin mode=serial layer=0 stage=0" in caplog.text
+    assert "event=compute_begin mode=serial layer=0 stage=0" in caplog.text
+    assert "event=send_returned mode=serial layer=1 stage=0" in caplog.text
+
+
+def test_dsv4_ffn_runner_compute_sync_diagnostics_run_before_send(
+    monkeypatch,
+    caplog,
+):
+    _patch_ffn_forward_context(monkeypatch)
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    events = []
+
+    class SyncDiagnosticConnector(_FakeFFNConnector):
+        def send_ffn_output(self, ffn_output, context, **kwargs):
+            events.append(("send", context.metadata.layer_idx))
+            return super().send_ffn_output(ffn_output, context, **kwargs)
+
+    class SyncDiagnosticModel:
+        def compute_ffn_output(self, hidden_states, layer_idx, **_kwargs):
+            events.append(("compute", layer_idx))
+            return f"npu-ffn({hidden_states}, layer={layer_idx})"
+
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(role="ffn")
+    runner.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(num_hash_layers=0),
+    )
+    runner.connector = SyncDiagnosticConnector()
+    runner.connector.ffn_compute_sync_diagnostics_enabled = True
+    runner.connector.is_warmup = False
+    runner.model = SyncDiagnosticModel()
+    runner.num_layers = 2
+    runner.max_num_tokens = 1
+    for layer_idx in range(2):
+        metadata = AFDTransferMetadata.create_attention_metadata(
+            layer_idx=layer_idx,
+            stage_idx=0,
+            seq_len=1,
+        )
+        runner.connector.attn_outputs.append(
+            _ffn_payload(f"hidden-{layer_idx}", metadata),
+        )
+
+    monkeypatch.setattr(
+        ffn_model_runner.torch.npu,
+        "synchronize",
+        lambda: events.append(("sync",)),
+    )
+    with caplog.at_level(
+        logging.WARNING,
+        logger="afd_plugin.v1.worker.npu.ffn_model_runner",
+    ):
+        runner._ffn_forward(dp_metadata_list={0: _FakeDPMetadata([1])})
+
+    assert events == [
+        ("compute", 0),
+        ("sync",),
+        ("send", 0),
+        ("compute", 1),
+        ("sync",),
+        ("send", 1),
+    ]
+    assert "event=compute_sync_begin mode=serial layer=0 stage=0" in caplog.text
+    assert "event=compute_sync_complete mode=serial layer=1 stage=0" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("is_graph_capturing", "is_warmup"),
+    [(True, False), (False, True)],
+)
+def test_dsv4_ffn_runner_compute_sync_diagnostics_skip_startup_paths(
+    monkeypatch,
+    is_graph_capturing,
+    is_warmup,
+):
+    _patch_ffn_forward_context(monkeypatch)
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(role="ffn")
+    runner.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(num_hash_layers=0),
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.connector.ffn_compute_sync_diagnostics_enabled = True
+    runner.connector.is_warmup = is_warmup
+    runner.model = _RecordingFakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 1
+    metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0,
+        stage_idx=0,
+        seq_len=1,
+    )
+    runner.connector.attn_outputs.append(_ffn_payload("hidden", metadata))
+    sync_calls = []
+    monkeypatch.setattr(
+        ffn_model_runner.torch.npu,
+        "synchronize",
+        lambda: sync_calls.append(True),
+    )
+
+    runner._ffn_forward(
+        dp_metadata_list={0: _FakeDPMetadata([1])},
+        is_graph_capturing=is_graph_capturing,
+    )
+
+    assert sync_calls == []
 
 
 def test_npu_ffn_runner_dp_path_invokes_model_with_hidden_states_and_layer(monkeypatch):
@@ -1145,14 +3087,235 @@ def test_npu_ffn_runner_replays_acl_graph_when_key_exists():
     assert runner.connector.ffn_outputs == []
 
 
-def test_npu_ffn_runner_graph_key_uses_ffn_aggregated_token_counts():
+def test_npu_ffn_runner_graph_key_uses_exact_attention_peer_token_counts():
     runner = _new_ffn_runner()
     runner.connector = _FakeFFNConnector(attn_size=8, ffn_size=4)
     runner.max_num_tokens = 24
 
     assert runner._make_graph_key({0: _FakeDPMetadata([12] * 8)}) == (
-        (0, (24, 24, 24, 24)),
+        "decoder",
+        "off",
+        0,
+        False,
+        (0, (12, 12, 12, 12, 12, 12, 12, 12)),
     )
+
+
+def test_npu_ffn_runner_graph_key_separates_mtp_configuration():
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        connector="P2pHcclAFDConnector",
+        speculative_config=_mtp_speculative_config(enforce_eager=True),
+    )
+    runner.connector = _FakeFFNConnector(attn_size=2, ffn_size=2)
+    runner.max_num_tokens = 16
+    assert runner._make_graph_key({0: _FakeDPMetadata([8, 12])}) == (
+        "decoder",
+        "mtp",
+        1,
+        True,
+        (0, (8, 12)),
+    )
+
+
+def test_npu_ffn_runner_replays_target_graph_then_runs_mtp_eager(monkeypatch):
+    _patch_ffn_forward_context(monkeypatch)
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        connector="P2pHcclAFDConnector",
+        speculative_config=_mtp_speculative_config(enforce_eager=True),
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.model = _FakeModel()
+    runner.mtp_ffn_model = _FakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 2
+    runner.use_aclgraph = True
+    dp_metadata = {0: _FakeDPMetadata([2])}
+    decoder_graph = _FakeGraph()
+    runner._acl_graphs = {
+        runner._make_graph_key(dp_metadata): {
+            "graph": decoder_graph,
+        },
+    }
+    header = SimpleNamespace(
+        num_tokens=2,
+        speculative_step=0,
+        num_tokens_across_dp=torch.tensor([2], dtype=torch.int32),
+    )
+    runner.connector.recv_mtp_header = lambda *, stage_idx: header
+    mtp_metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0,
+        stage_idx=0,
+        seq_len=2,
+        phase="mtp",
+        speculative_step=0,
+    )
+    runner.connector.attn_outputs.append(("mtp-hidden", mtp_metadata))
+
+    runner.execute_model(dp_metadata_list=dp_metadata)
+
+    assert decoder_graph.replay_count == 1
+    assert runner.connector.ffn_outputs == [
+        ("npu-ffn(mtp-hidden, layer=0)", mtp_metadata, {"ubatch_idx": 0}),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("num_speculative_tokens", "peer_tokens", "expected_sizes"),
+    [(1, 4, [2, 4, 8]), (2, 6, [3, 6]), (3, 8, [4, 8])],
+)
+def test_npu_ffn_mtp_graph_sizes_match_upstream_decode_capture(
+    num_speculative_tokens, peer_tokens, expected_sizes
+):
+    from vllm.config import CompilationConfig, CUDAGraphMode
+
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        tensor_parallel_size=1,
+        speculative_config=_mtp_speculative_config(
+            enforce_eager=False,
+            num_speculative_tokens=num_speculative_tokens,
+        ),
+    )
+    runner.connector = _FakeFFNConnector(attn_size=2, ffn_size=2)
+    runner.use_aclgraph = True
+    runner.uniform_decode_query_len = num_speculative_tokens + 1
+    runner.parallel_config = runner.vllm_config.parallel_config
+    runner.compilation_config = CompilationConfig(
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        cudagraph_capture_sizes=[1, 2, 4, 8],
+        max_cudagraph_capture_size=8,
+    )
+    runner.cudagraph_batch_sizes = [1, 2, 4, 8]
+
+    runner._initialize_mtp_graph_sizes()
+
+    assert runner.cudagraph_batch_sizes == expected_sizes
+    metadata = {0: _FakeDPMetadata([peer_tokens, peer_tokens])}
+    assert runner._make_mtp_graph_key(metadata)[-1] == (peer_tokens, peer_tokens)
+
+
+@pytest.mark.parametrize(
+    ("requires_mtp", "use_aclgraph", "enforce_eager"),
+    [(False, True, False), (True, False, False), (True, True, True)],
+)
+def test_npu_ffn_mtp_graph_sizes_skip_other_paths(
+    requires_mtp, use_aclgraph, enforce_eager
+):
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        speculative_config=_mtp_speculative_config(enforce_eager=enforce_eager),
+    )
+    runner.connector = SimpleNamespace(requires_mtp=requires_mtp)
+    runner.use_aclgraph = use_aclgraph
+    runner.cudagraph_batch_sizes = [1, 2, 4, 8]
+
+    runner._initialize_mtp_graph_sizes()
+
+    assert runner.cudagraph_batch_sizes == [1, 2, 4, 8]
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3])
+@pytest.mark.parametrize("control_enabled", [False, True])
+def test_npu_ffn_runner_replays_target_then_full_draft_graph(
+    num_speculative_tokens,
+    control_enabled,
+):
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        connector="P2pHcclAFDConnector",
+        speculative_config=_mtp_speculative_config(
+            enforce_eager=False,
+            num_speculative_tokens=num_speculative_tokens,
+        ),
+    )
+    runner.connector = _FakeFFNConnector(attn_size=2, ffn_size=2)
+    runner.connector.mtp_phase_control_enabled = control_enabled
+    runner.connector.mtp_phase_graph_replay = control_enabled
+    runner.model = _FakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 8
+    runner.use_aclgraph = True
+    dp_metadata = {0: _FakeDPMetadata([3, 5])}
+    target_graph = _FakeGraph()
+    mtp_graph = _FakeGraph()
+    runner._acl_graphs = {
+        runner._make_graph_key(dp_metadata): {"graph": target_graph},
+    }
+    runner._mtp_acl_graphs = {
+        runner._make_mtp_graph_key(dp_metadata): {"graph": mtp_graph},
+    }
+
+    runner.execute_model(dp_metadata_list=dp_metadata, input_ids_by_stage={})
+
+    assert target_graph.replay_count == 1
+    assert mtp_graph.replay_count == 1
+    assert runner.connector.ffn_outputs == []
+
+
+def test_npu_ffn_runner_replays_target_graph_u2_then_runs_one_mtp_phase(
+    monkeypatch,
+):
+    _patch_ffn_forward_context(monkeypatch)
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(
+        role="ffn",
+        connector="P2pHcclAFDConnector",
+        speculative_config=_mtp_speculative_config(enforce_eager=True),
+    )
+    runner.connector = _FakeFFNConnector()
+    runner.model = _FakeModel()
+    runner.mtp_ffn_model = _FakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 4
+    runner.use_aclgraph = True
+    dp_metadata = {
+        0: _FakeDPMetadata([2]),
+        1: _FakeDPMetadata([2]),
+    }
+    decoder_graph = _FakeGraph()
+    runner._acl_graphs = {
+        runner._make_graph_key(dp_metadata): {
+            "graph": decoder_graph,
+        },
+    }
+    header = SimpleNamespace(
+        num_tokens=4,
+        speculative_step=0,
+        num_tokens_across_dp=torch.tensor([4], dtype=torch.int32),
+    )
+    received_stages = []
+
+    def recv_mtp_header(*, stage_idx):
+        received_stages.append(stage_idx)
+        return header
+
+    runner.connector.recv_mtp_header = recv_mtp_header
+    mtp_metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0,
+        stage_idx=0,
+        seq_len=4,
+        phase="mtp",
+        speculative_step=0,
+    )
+    runner.connector.attn_outputs.append(("mtp-hidden", mtp_metadata))
+
+    runner.execute_model(
+        dp_metadata_list=dp_metadata,
+        input_ids_by_stage={},
+    )
+
+    assert decoder_graph.replay_count == 1
+    assert received_stages == [0]
+    assert runner.connector.ffn_outputs == [
+        ("npu-ffn(mtp-hidden, layer=0)", mtp_metadata, {"ubatch_idx": 0}),
+    ]
 
 
 def test_npu_ffn_runner_falls_back_to_eager_on_acl_graph_miss(monkeypatch):
@@ -1349,6 +3512,132 @@ def test_npu_ffn_worker_reports_zero_compilation_times():
     assert compilation_times.encoder == 0.0
 
 
+def test_npu_ffn_worker_stops_on_attention_shutdown_payload(monkeypatch, caplog):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_worker as ffn_worker_module
+
+    event = threading.Event()
+    worker = _new_ffn_worker()
+    worker._ffn_shutdown_event = event
+    worker.device = SimpleNamespace(type="npu")
+    control_plane = SimpleNamespace(
+        recv_dp_metadata_list=lambda: AFDControlPayload(
+            dp_metadata_list={},
+            is_graph_capturing=False,
+            is_warmup=False,
+            shutdown=True,
+        )
+    )
+    worker.model_runner = SimpleNamespace(
+        connector=SimpleNamespace(control_plane=control_plane),
+    )
+    monkeypatch.setattr(ffn_worker_module.torch.npu, "set_device", lambda _device: None)
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="afd_plugin.v1.worker.npu.ffn_worker",
+    ):
+        worker._run_ffn_server_loop()
+
+    assert event.is_set()
+    assert "AFD NPU FFN received Attention shutdown payload" in caplog.text
+
+
+def test_npu_ffn_worker_preserves_complete_control_payload(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_worker as ffn_worker_module
+
+    event = threading.Event()
+    payload = AFDControlPayload(
+        dp_metadata_list={0: _FakeDPMetadata([3, 5])},
+        is_graph_capturing=True,
+        is_warmup=True,
+        tensor_parallel_size=2,
+        mtp_phase_control_enabled=True,
+    )
+    updates = []
+    executions = []
+
+    def execute_ffn_step(**kwargs):
+        executions.append(kwargs)
+        event.set()
+
+    control_plane = SimpleNamespace(
+        recv_dp_metadata_list=lambda: payload,
+        update_state_from_dp_metadata=updates.append,
+    )
+    worker = _new_ffn_worker()
+    worker._ffn_shutdown_event = event
+    worker.device = SimpleNamespace(type="npu")
+    worker.model_runner = SimpleNamespace(
+        connector=SimpleNamespace(control_plane=control_plane),
+        execute_ffn_step=execute_ffn_step,
+    )
+    monkeypatch.setattr(ffn_worker_module.torch.npu, "set_device", lambda _device: None)
+    monkeypatch.setattr(ffn_worker_module.torch.npu, "synchronize", lambda: None)
+
+    worker._run_ffn_server_loop()
+
+    assert updates == [payload]
+    assert executions == [
+        {
+            "dp_metadata_list": payload.dp_metadata_list,
+            "is_graph_capturing": True,
+            "is_warmup": True,
+            "connector_state_prepared": True,
+        }
+    ]
+
+
+def test_npu_ffn_worker_logs_u1_execute_and_sync_boundaries(monkeypatch, caplog):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_worker as ffn_worker_module
+
+    event = threading.Event()
+    payload = AFDControlPayload(
+        dp_metadata_list={0: _FakeDPMetadata([1])},
+        is_graph_capturing=False,
+        is_warmup=False,
+        target_graph_replay=False,
+    )
+
+    def execute_ffn_step(**_kwargs):
+        event.set()
+
+    connector = SimpleNamespace(
+        control_plane=SimpleNamespace(
+            recv_dp_metadata_list=lambda: payload,
+            update_state_from_dp_metadata=lambda _payload: None,
+        ),
+        stage_diagnostics_enabled=True,
+    )
+    worker = _new_ffn_worker()
+    worker._ffn_shutdown_event = event
+    worker.device = SimpleNamespace(type="npu")
+    worker.model_runner = SimpleNamespace(
+        connector=connector,
+        execute_ffn_step=execute_ffn_step,
+    )
+    monkeypatch.setattr(ffn_worker_module.torch.npu, "set_device", lambda _device: None)
+    monkeypatch.setattr(ffn_worker_module.torch.npu, "synchronize", lambda: None)
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="afd_plugin.v1.worker.npu.ffn_worker",
+    ):
+        worker._run_ffn_server_loop()
+
+    assert "stages=(0,)" in caplog.text
+    assert "target_graph_replay=False" in caplog.text
+    for event_name in (
+        "execute_begin",
+        "execute_returned",
+        "device_sync_begin",
+        "device_sync_complete",
+    ):
+        assert f"event={event_name}" in caplog.text
+
+
 def test_npu_ffn_worker_loop_error_is_propagated(caplog):
     worker = _new_ffn_worker()
     worker._ffn_thread = None
@@ -1405,6 +3694,18 @@ def test_npu_ffn_worker_ignores_receive_error_during_shutdown(caplog):
 
     worker.raise_ffn_loop_error_if_any()
     assert "AFD NPU FFN worker loop failed" not in caplog.text
+
+
+def test_npu_ffn_worker_recognizes_control_plane_close_only():
+    from afd_plugin.connectors import AFDControlPlaneClosedError
+    from afd_plugin.v1.worker.npu.ffn_worker import (
+        _is_attention_control_plane_shutdown,
+    )
+
+    assert _is_attention_control_plane_shutdown(
+        AFDControlPlaneClosedError("peer closed")
+    )
+    assert not _is_attention_control_plane_shutdown(ValueError("bad payload"))
 
 
 def test_npu_ffn_worker_stops_loop_before_parent_shutdown(monkeypatch):
@@ -1531,6 +3832,430 @@ def test_npu_feature_validation_uses_selected_connector_extra_info_parser():
                 extra_config={"core_num": 8},
             ),
         )
+
+
+def _dsv4_config(**kwargs):
+    parallel_defaults = {
+        "tensor_parallel_size": 1,
+        "pipeline_parallel_size": 1,
+        "prefill_context_parallel_size": 1,
+        "decode_context_parallel_size": 1,
+        "use_sequence_parallel_moe": False,
+    }
+    parallel_defaults.update(kwargs)
+    config = _vllm_config(
+        architecture="DeepseekV4ForCausalLM",
+        **parallel_defaults,
+    )
+    config.additional_config["afd"].update(
+        num_attention_ranks=1,
+        num_ffn_ranks=1,
+    )
+    return config
+
+
+def _mtp_speculative_config(**overrides):
+    values = {
+        "method": "mtp",
+        "num_speculative_tokens": 1,
+        "enforce_eager": True,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _dspark_speculative_config(*, block_size=4, **overrides):
+    values = {
+        "method": "mtp",
+        "num_speculative_tokens": block_size,
+        "enforce_eager": True,
+        "draft_model_config": SimpleNamespace(
+            hf_config=SimpleNamespace(dspark_block_size=block_size),
+        ),
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _mooncake_pd_config(**overrides):
+    values = {
+        "kv_connector": "MooncakeHybridConnector",
+        "kv_role": "kv_consumer",
+        "engine_id": "dsv4-afd-decode",
+        "kv_port": 30100,
+        "kv_parallel_size": 1,
+        "kv_connector_extra_config": {
+            "prefill": {"dp_size": 2, "tp_size": 4},
+            "decode": {"dp_size": 1, "tp_size": 1},
+        },
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_dsv4_feature_validation_accepts_eager_u1_camp2p():
+    fail_if_unsupported_npu_afd_features(_dsv4_config())
+
+
+def test_dsv4_feature_validation_accepts_eager_u2_camp2p():
+    fail_if_unsupported_npu_afd_features(
+        _dsv4_config(
+            enable_dbo=True,
+            use_ubatching=True,
+            num_ubatches=2,
+            ubatch_size=2,
+        )
+    )
+
+
+@pytest.mark.parametrize("use_ubatching", [False, True])
+def test_dsv4_feature_validation_accepts_eager_hccl_p2p(use_ubatching):
+    config = _dsv4_config(
+        enable_dbo=use_ubatching,
+        use_ubatching=use_ubatching,
+        num_ubatches=2 if use_ubatching else 1,
+        ubatch_size=2,
+    )
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_accepts_eager_hccl_p2p_a2f1():
+    config = _dsv4_config()
+    config.additional_config["afd"].update(
+        connector="P2pHcclAFDConnector",
+        num_attention_ranks=2,
+        num_ffn_ranks=1,
+    )
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize(
+    ("enforce_eager", "use_ubatching", "with_mtp"),
+    [
+        (True, False, False),
+        (True, True, False),
+        (False, False, False),
+        (False, True, False),
+        (True, False, True),
+        (True, True, True),
+        (False, False, True),
+        (False, True, True),
+    ],
+)
+def test_dsv4_feature_validation_accepts_mooncake_pd_combinations(
+    enforce_eager,
+    use_ubatching,
+    with_mtp,
+):
+    config = _dsv4_config(
+        cudagraph_mode="FULL_DECODE_ONLY",
+        data_parallel_size=1,
+        enable_dbo=use_ubatching,
+        use_ubatching=use_ubatching,
+        num_ubatches=2 if use_ubatching else 1,
+        ubatch_size=2,
+        kv_transfer_config=_mooncake_pd_config(),
+    )
+    config.model_config.enforce_eager = enforce_eager
+    if with_mtp:
+        config.speculative_config = _mtp_speculative_config(enforce_eager=True)
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize(
+    ("cudagraph_mode", "enforce_eager"),
+    [("FULL", True), ("FULL_DECODE_ONLY", False)],
+)
+def test_dsv4_feature_validation_accepts_equal_hccl_tp2(
+    cudagraph_mode,
+    enforce_eager,
+):
+    config = _dsv4_config(
+        cudagraph_mode=cudagraph_mode,
+        tensor_parallel_size=2,
+        data_parallel_size=1,
+    )
+    config.model_config.enforce_eager = enforce_eager
+    config.additional_config["afd"].update(
+        connector="P2pHcclAFDConnector",
+        num_attention_ranks=2,
+        num_ffn_ranks=2,
+    )
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda config: config.additional_config["afd"].update(
+                connector="CAMP2pAFDConnector"
+            ),
+            "TP2 supports only P2pHcclAFDConnector",
+        ),
+        (
+            lambda config: config.additional_config["afd"].update(num_ffn_ranks=1),
+            "requires equal Attention and FFN ranks",
+        ),
+        (
+            lambda config: setattr(config.parallel_config, "data_parallel_size", 2),
+            "ranks to equal DP x TP",
+        ),
+    ],
+)
+def test_dsv4_feature_validation_rejects_unvalidated_tp2_topology(
+    mutation,
+    message,
+):
+    config = _dsv4_config(tensor_parallel_size=2, data_parallel_size=1)
+    config.additional_config["afd"].update(
+        connector="P2pHcclAFDConnector",
+        num_attention_ranks=2,
+        num_ffn_ranks=2,
+    )
+    mutation(config)
+
+    with pytest.raises(RuntimeError, match=message):
+        fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_accepts_hccl_p2p_full_decode_only_u2():
+    config = _dsv4_config(
+        cudagraph_mode="FULL_DECODE_ONLY",
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        ubatch_size=2,
+    )
+    config.model_config.enforce_eager = False
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3])
+def test_dsv4_feature_validation_accepts_mtp_m1_eager_u1_hccl_p2p(
+    num_speculative_tokens,
+):
+    config = _dsv4_config(
+        speculative_config=_mtp_speculative_config(
+            num_speculative_tokens=num_speculative_tokens,
+        )
+    )
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_accepts_mtp_m3_eager_u2_hccl_p2p():
+    config = _dsv4_config(
+        speculative_config=_mtp_speculative_config(),
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        ubatch_size=2,
+    )
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_accepts_matching_dspark_block_size():
+    config = _dsv4_config(
+        speculative_config=_dspark_speculative_config(block_size=4),
+    )
+    config.model_config.hf_config.num_nextn_predict_layers = 2
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda config: setattr(
+                config.speculative_config,
+                "num_speculative_tokens",
+                3,
+            ),
+            "num_speculative_tokens to match dspark_block_size",
+        ),
+        (
+            lambda config: setattr(
+                config.speculative_config,
+                "enforce_eager",
+                False,
+            ),
+            "DSpark eager execution requires draft enforce_eager=true",
+        ),
+    ],
+)
+def test_dsv4_feature_validation_rejects_invalid_dspark_modes(mutation, message):
+    config = _dsv4_config(
+        speculative_config=_dspark_speculative_config(block_size=4),
+    )
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+    mutation(config)
+
+    with pytest.raises(RuntimeError, match=message):
+        fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_accepts_graph_target_with_eager_mtp_draft():
+    config = _dsv4_config(
+        cudagraph_mode="FULL_DECODE_ONLY",
+        speculative_config=_mtp_speculative_config(enforce_eager=True),
+    )
+    config.model_config.enforce_eager = False
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_accepts_full_draft_mtp_graph():
+    config = _dsv4_config(
+        cudagraph_mode="FULL_DECODE_ONLY",
+        speculative_config=_mtp_speculative_config(enforce_eager=False),
+    )
+    config.model_config.enforce_eager = False
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_accepts_hccl_p2p_graph_a2f1():
+    config = _dsv4_config(cudagraph_mode="FULL_DECODE_ONLY")
+    config.model_config.enforce_eager = False
+    config.additional_config["afd"].update(
+        connector="P2pHcclAFDConnector",
+        num_attention_ranks=2,
+        num_ffn_ranks=1,
+    )
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda config: config.additional_config["afd"].update(
+                connector="P2pNcclAFDConnector"
+            ),
+            "only CAMP2pAFDConnector or P2pHcclAFDConnector",
+        ),
+        (
+            lambda config: config.additional_config["afd"].update(num_ffn_ranks=2),
+            "equal Attention and FFN",
+        ),
+        (
+            lambda config: setattr(config.parallel_config, "tensor_parallel_size", 3),
+            "tensor_parallel_size=1 or 2",
+        ),
+        (
+            lambda config: setattr(config.parallel_config, "pipeline_parallel_size", 2),
+            "pipeline_parallel_size=1",
+        ),
+        (
+            lambda config: setattr(
+                config.parallel_config, "prefill_context_parallel_size", 2
+            ),
+            "prefill context parallel",
+        ),
+        (
+            lambda config: setattr(
+                config.parallel_config, "decode_context_parallel_size", 2
+            ),
+            "decode context parallel",
+        ),
+        (
+            lambda config: setattr(
+                config.parallel_config, "use_sequence_parallel_moe", True
+            ),
+            "sequence-parallel MoE",
+        ),
+        (
+            lambda config: config.additional_config["afd"].update(
+                compute_gate_on_attention=True
+            ),
+            "FFN-side gate",
+        ),
+        (
+            lambda config: setattr(config.model_config, "enforce_eager", False),
+            "FULL_DECODE_ONLY",
+        ),
+        (
+            lambda config: setattr(config, "speculative_config", object()),
+            "MTP supports only P2pHcclAFDConnector",
+        ),
+    ],
+)
+def test_dsv4_feature_validation_rejects_unvalidated_modes(mutation, message):
+    config = _dsv4_config()
+    mutation(config)
+
+    with pytest.raises(RuntimeError, match=message):
+        fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_accepts_graph_mtp_a2f1():
+    config = _dsv4_config(
+        cudagraph_mode="FULL_DECODE_ONLY",
+        speculative_config=_mtp_speculative_config(enforce_eager=True),
+    )
+    config.model_config.enforce_eager = False
+    config.additional_config["afd"].update(
+        connector="P2pHcclAFDConnector",
+        num_attention_ranks=2,
+        num_ffn_ranks=1,
+    )
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_accepts_mtp_target_graph_u2():
+    config = _dsv4_config(
+        cudagraph_mode="FULL_DECODE_ONLY",
+        speculative_config=_mtp_speculative_config(),
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        ubatch_size=2,
+    )
+    config.model_config.enforce_eager = False
+    config.additional_config["afd"]["connector"] = "P2pHcclAFDConnector"
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize("cudagraph_mode", ["NONE", "FULL", "PIECEWISE"])
+def test_dsv4_feature_validation_rejects_other_graph_modes(cudagraph_mode):
+    config = _dsv4_config(cudagraph_mode=cudagraph_mode)
+    config.model_config.enforce_eager = False
+
+    with pytest.raises(RuntimeError, match="FULL_DECODE_ONLY"):
+        fail_if_unsupported_npu_afd_features(config)
+
+
+def test_dsv4_feature_validation_rejects_camp2p_graph_u2():
+    config = _dsv4_config(
+        cudagraph_mode="FULL_DECODE_ONLY",
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        ubatch_size=2,
+    )
+    config.model_config.enforce_eager = False
+
+    with pytest.raises(RuntimeError, match="graph U2 supports only P2pHccl"):
+        fail_if_unsupported_npu_afd_features(config)
 
 
 def test_npu_feature_validation_allows_two_ubatches_only():

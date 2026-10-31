@@ -108,29 +108,61 @@ def make_ffn_graph_key(
     ffn_size: int | None = None,
     fallback: int = 1,
 ) -> tuple[tuple[int, tuple]]:
-    """Extract the AFD FFN graph hashable key from DP metadata."""
+    """Extract the AFD FFN graph key, including exact Attention peer shapes."""
 
     key_parts: list[tuple[int, tuple]] = []
     for stage_idx, metadata in sorted(dp_metadata_list.items()):
         values = getattr(metadata, "num_tokens_across_dp_cpu", None)
         if values is None:
-            if _use_ffn_aggregated_key(attention_size, ffn_size):
+            if _use_ffn_peer_layout_key(attention_size, ffn_size):
                 values_tuple = tuple(
-                    max(1, int(fallback)) for _ in range(int(ffn_size))
+                    max(1, int(fallback)) for _ in range(int(attention_size))
                 )
             else:
                 values_tuple = (repr(metadata),)
         else:
             values_tuple = _metadata_values_tuple(values)
-            if _use_ffn_aggregated_key(attention_size, ffn_size):
-                values_tuple = _aggregate_ffn_values_tuple(
+            if _use_ffn_peer_layout_key(attention_size, ffn_size):
+                values_tuple = _expand_attention_values_tuple(
                     values_tuple,
                     attention_size=int(attention_size),
-                    ffn_size=int(ffn_size),
                     fallback=int(fallback),
                 )
         key_parts.append((int(stage_idx), values_tuple))
     return tuple(key_parts)
+
+
+def make_mtp_ffn_graph_key(
+    dp_metadata_list: Mapping[int, object],
+    *,
+    attention_size: int,
+    ffn_size: int,
+    fallback: int,
+) -> tuple[int, ...]:
+    """Return the merged MTP token layout for every Attention peer.
+
+    The target decoder may use one or two stages, but the upstream proposer
+    merges their hidden states into one draft phase.  Retain the exact peer
+    layout instead of only the per-FFN aggregate: two layouts with the same
+    sum capture different HCCL slices and must not share a graph.
+    """
+
+    decoder_key = make_ffn_graph_key(
+        dp_metadata_list,
+        attention_size=attention_size,
+        ffn_size=ffn_size,
+        fallback=fallback,
+    )
+    peer_totals = [0] * int(attention_size)
+    for _, stage_values in decoder_key:
+        if len(stage_values) != int(attention_size):
+            raise ValueError(
+                "MTP graph key requires one token count per Attention peer: "
+                f"{len(stage_values)} != {attention_size}",
+            )
+        for peer_index, value in enumerate(stage_values):
+            peer_totals[peer_index] += int(value)
+    return tuple(max(1, value) for value in peer_totals)
 
 
 def graph_run_mode(
@@ -161,23 +193,24 @@ def _metadata_values_tuple(values: object) -> tuple[int, ...]:
         return (int(values),)
 
 
-def _use_ffn_aggregated_key(
+def _use_ffn_peer_layout_key(
     attention_size: int | None,
     ffn_size: int | None,
 ) -> bool:
     return (
         attention_size is not None
         and ffn_size is not None
-        and int(attention_size) >= int(ffn_size)
-        and int(attention_size) % int(ffn_size) == 0
+        and min(int(attention_size), int(ffn_size)) > 0
+        and max(int(attention_size), int(ffn_size))
+        % min(int(attention_size), int(ffn_size))
+        == 0
     )
 
 
-def _aggregate_ffn_values_tuple(
+def _expand_attention_values_tuple(
     values: tuple[int, ...],
     *,
     attention_size: int,
-    ffn_size: int,
     fallback: int,
 ) -> tuple[int, ...]:
     # Expand DP-level values to AFD-level when TP > 1.
@@ -190,12 +223,10 @@ def _aggregate_ffn_values_tuple(
         tp_size = attention_size // len(values)
         expanded = tuple(values[i // tp_size] for i in range(attention_size))
     if len(expanded) < attention_size:
-        return tuple(max(1, int(fallback)) for _ in range(ffn_size))
-    group_size = attention_size // ffn_size
-    return tuple(
-        max(1, sum(expanded[idx * group_size : (idx + 1) * group_size]))
-        for idx in range(ffn_size)
-    )
+        return tuple(max(1, int(fallback)) for _ in range(attention_size))
+    # Graph capture records one HCCL recv/send per Attention peer. Retaining only
+    # the FFN aggregate would alias different peer slice shapes with equal sums.
+    return tuple(max(1, int(value)) for value in expanded[:attention_size])
 
 
 __all__ = [
@@ -205,5 +236,6 @@ __all__ = [
     "cudagraph_mode_name",
     "graph_run_mode",
     "make_ffn_graph_key",
+    "make_mtp_ffn_graph_key",
     "validate_cuda_graph_mode",
 ]

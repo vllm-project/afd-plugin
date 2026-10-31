@@ -73,6 +73,8 @@ def test_ascend_forward_context_installs_afd_metadata(monkeypatch):
         model_instance,
         num_tokens,
         num_tokens_across_dp,
+        input_ids,
+        is_draft_model,
     ):
         calls.append(
             {
@@ -83,6 +85,8 @@ def test_ascend_forward_context_installs_afd_metadata(monkeypatch):
                 "model_instance": model_instance,
                 "num_tokens": num_tokens,
                 "num_tokens_across_dp": num_tokens_across_dp,
+                "input_ids": input_ids,
+                "is_draft_model": is_draft_model,
             },
         )
         yield
@@ -125,6 +129,8 @@ def test_ascend_forward_context_installs_afd_metadata(monkeypatch):
             "model_instance": model_instance,
             "num_tokens": 3,
             "num_tokens_across_dp": None,
+            "input_ids": None,
+            "is_draft_model": False,
         },
     ]
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import queue
 import sys
 import types
 from enum import IntEnum
@@ -13,6 +14,13 @@ import pytest
 class _EngineShutdownState(IntEnum):
     RUNNING = 0
     REQUESTED = 1
+
+
+class _EngineCoreRequestType(IntEnum):
+    UTILITY = 0
+    WAKEUP = 1
+    EXECUTOR_FAILED = 2
+    ADD = 3
 
 
 def _install_fake_vllm_core(monkeypatch: pytest.MonkeyPatch):
@@ -97,6 +105,7 @@ def _install_fake_vllm_core(monkeypatch: pytest.MonkeyPatch):
     core_module.EngineCoreProc = EngineCoreProc
     core_module.DPEngineCoreProc = DPEngineCoreProc
     core_module.EngineShutdownState = _EngineShutdownState
+    core_module.EngineCoreRequestType = _EngineCoreRequestType
     core_module.VLLM_VERSION = "0.26.0"
     core_module.logger = logging.getLogger("fake-vllm-core")
     core_module.logger.info_once = lambda *args, **kwargs: None
@@ -234,10 +243,8 @@ def test_engine_core_patch_leaves_non_ffn_path_untouched(monkeypatch):
 
     engine = core_module.EngineCore(_config("attention"), Executor, log_stats=False)
 
-    assert not hasattr(engine, "original_init_called")
-    assert isinstance(engine.model_executor, Executor)
-    assert engine.scheduler is not None
-    assert engine.available_gpu_memory_for_kv_cache == -1
+    assert engine.original_init_called is True
+    assert not hasattr(engine, "model_executor")
 
 
 def test_engine_core_patch_runs_and_stops_ffn_loop(monkeypatch):
@@ -256,6 +263,7 @@ def test_engine_core_patch_runs_and_stops_ffn_loop(monkeypatch):
 
     engine = core_module.EngineCoreProc(_config("ffn"), Executor, log_stats=True)
     engine.shutdown_state = _EngineShutdownState.RUNNING
+    engine.input_queue = queue.Queue()
 
     from afd_plugin.compat.patches import engine_core as engine_core_patch
 
@@ -272,3 +280,28 @@ def test_engine_core_patch_runs_and_stops_ffn_loop(monkeypatch):
         "raise_ffn_loop_error_if_any",
         "stop_ffn_server_loop",
     ]
+
+
+def test_ffn_control_queue_processes_profile_and_failure_requests(monkeypatch, caplog):
+    core_module = _install_fake_vllm_core(monkeypatch)
+    patch = _load_patch_module()
+    requests = [
+        (_EngineCoreRequestType.UTILITY, "start_profile"),
+        (_EngineCoreRequestType.ADD, "unsupported-generation"),
+        (_EngineCoreRequestType.WAKEUP, None),
+        (_EngineCoreRequestType.UTILITY, "stop_profile"),
+        (_EngineCoreRequestType.EXECUTOR_FAILED, "worker-failure"),
+    ]
+    received = []
+    engine = SimpleNamespace(
+        input_queue=queue.Queue(),
+        _handle_client_request=lambda *args: received.append(args),
+    )
+    for request in requests:
+        engine.input_queue.put(request)
+
+    patch._process_ffn_utility_requests(engine, core_module)
+
+    assert received == [request for request in requests if request != requests[1]]
+    assert engine.input_queue.empty()
+    assert "Ignoring unsupported AFD FFN EngineCore request" in caplog.text

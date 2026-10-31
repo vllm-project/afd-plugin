@@ -17,13 +17,18 @@ if TYPE_CHECKING:
 
 AFD_ADDITIONAL_CONFIG_KEY: Final[str] = "afd"
 AFD_ASYNC_CONNECTOR: Final[str] = "CAMAsyncAFDConnector"
+AFD_ASYNC_DP_CONNECTORS: Final[frozenset[str]] = frozenset(
+    {AFD_ASYNC_CONNECTOR, "WindowAFDConnector"}
+)
 AFDRole = Literal["attention", "ffn"]
 
 SUPPORTED_AFD_ROLES: Final[tuple[str, ...]] = ("attention", "ffn")
 SUPPORTED_AFD_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pNcclAFDConnector",
+    "P2pHcclAFDConnector",
     "CAMP2pAFDConnector",
     AFD_ASYNC_CONNECTOR,
+    "WindowAFDConnector",
 )
 
 _ALIASES: Final[dict[str, str]] = {
@@ -61,6 +66,8 @@ class AFDConfig:
     num_ffn_ranks: int = 1
     # Whether Attention computes MoE gate outputs before sending to FFN.
     compute_gate_on_attention: bool = False
+    # Enable the Window FFN two-stream pipeline and operator core limits.
+    window_ffn_multistream_enabled: bool = True
 
     @property
     def afd_connector(self) -> str:
@@ -93,8 +100,10 @@ class AFDConfig:
             self.connector,
             self.async_dp,
             self.role,
+            self.window_ffn_multistream_enabled,
             self.num_attention_ranks,
             self.num_ffn_ranks,
+            self.compute_gate_on_attention,
         ]
         return hashlib.sha256(str(factors).encode()).hexdigest()
 
@@ -150,6 +159,12 @@ def _normalize_mapping(
         normalized["compute_gate_on_attention"] = _coerce_bool(
             normalized["compute_gate_on_attention"],
             field_name="compute_gate_on_attention",
+        )
+
+    if "window_ffn_multistream_enabled" in normalized:
+        normalized["window_ffn_multistream_enabled"] = _coerce_bool(
+            normalized["window_ffn_multistream_enabled"],
+            field_name="window_ffn_multistream_enabled",
         )
 
     return normalized, connector_extra_config or {}
@@ -272,7 +287,7 @@ def is_afd_active(source: Any) -> bool:
 
 
 def is_afd_async_dp(vllm_config: VllmConfig) -> bool:
-    """Return whether ``vllm_config`` selects AFD's async connector mode.
+    """Return whether CAM's global async-DP runtime patches are selected.
 
     This is a lightweight selector for import-time async-DP patches, not a full
     activation validator. Use ``is_afd_active`` or ``parse_afd_config`` when
@@ -307,11 +322,15 @@ def validate_afd_config(
             "AFD connector must be one of "
             f"{SUPPORTED_AFD_CONNECTORS!r}, got {config.connector!r}",
         )
-    if config.async_dp and config.connector != AFD_ASYNC_CONNECTOR:
+    if config.async_dp and config.connector not in AFD_ASYNC_DP_CONNECTORS:
         raise ValueError(
-            "AFD async mode requires connector='CAMAsyncAFDConnector'",
+            "AFD async mode requires an async-DP capable connector, got "
+            f"{config.connector!r}",
         )
-    if config.connector == "P2pNcclAFDConnector":
+    if config.connector in {
+        "P2pNcclAFDConnector",
+        "P2pHcclAFDConnector",
+    }:
         from afd_plugin.distributed import validate_p2p_topology
 
         validate_p2p_topology(config)
@@ -332,6 +351,7 @@ def validate_afd_config(
 __all__ = [
     "AFDConfig",
     "AFD_ASYNC_CONNECTOR",
+    "AFD_ASYNC_DP_CONNECTORS",
     "afd_config_from_mapping",
     "AFD_ADDITIONAL_CONFIG_KEY",
     "AFDRole",

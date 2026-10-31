@@ -50,6 +50,10 @@ def test_backend_connector_modules_are_registered_by_backend_package():
         AFDConnectorFactory.get_connector_class("CAMP2pAFDConnector").__module__
         == "afd_plugin.connectors.npu.camp2p"
     )
+    assert (
+        AFDConnectorFactory.get_connector_class("P2pHcclAFDConnector").__module__
+        == "afd_plugin.connectors.npu.p2p_hccl"
+    )
 
 
 def test_connector_metadata_validates_sequence_lengths():

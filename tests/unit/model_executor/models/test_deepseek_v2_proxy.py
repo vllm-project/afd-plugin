@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -13,8 +14,14 @@ from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E40
 
 
 class _FakeConnector:
-    def __init__(self, events: list[tuple]) -> None:
+    def __init__(
+        self,
+        events: list[tuple],
+        *,
+        yield_after_attn_send: bool = True,
+    ) -> None:
         self.events = events
+        self.yield_after_attn_send = yield_after_attn_send
 
     def send_attn_output(self, hidden_states, context, **kwargs) -> None:
         self.events.append(("send", hidden_states, context, kwargs))
@@ -36,8 +43,17 @@ class _FakeAttention(nn.Module):
         return hidden_states
 
 
-def _install_fake_forward_context(monkeypatch, events, *, stage_idx=2):
-    connector = _FakeConnector(events)
+def _install_fake_forward_context(
+    monkeypatch,
+    events,
+    *,
+    stage_idx=2,
+    yield_after_attn_send=True,
+):
+    connector = _FakeConnector(
+        events,
+        yield_after_attn_send=yield_after_attn_send,
+    )
     afd_metadata = SimpleNamespace(connector=connector, stage_idx=9)
     monkeypatch.setattr(
         adapter,
@@ -56,6 +72,28 @@ def _install_fake_forward_context(monkeypatch, events, *, stage_idx=2):
 
     monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", record_yield)
     return afd_metadata
+
+
+def test_remote_proxy_skips_send_yield_for_blocking_connector(monkeypatch):
+    events = []
+    _install_fake_forward_context(
+        monkeypatch,
+        events,
+        stage_idx=1,
+        yield_after_attn_send=False,
+    )
+    hidden_states = torch.ones(1, 4)
+
+    output = adapter.RemoteFFNProxy(layer_idx=0)(hidden_states)
+
+    assert [event[0] for event in events] == ["send", "recv"]
+    assert torch.equal(output, hidden_states * 0.25)
+
+
+def test_remote_proxy_compiled_path_contains_no_logging_calls():
+    source = inspect.getsource(adapter.RemoteFFNProxy)
+
+    assert "logger." not in source
 
 
 @pytest.mark.parametrize("layer_idx", [0, 1], ids=["dense", "moe"])

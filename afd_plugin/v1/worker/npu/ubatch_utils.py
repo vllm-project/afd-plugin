@@ -18,6 +18,10 @@ from vllm.v1.worker.ubatch_utils import (
 )
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 
+_ASCEND_COMMON_METADATA_FIELDS = frozenset(
+    getattr(AscendCommonAttentionMetadata, "__dataclass_fields__", {})
+)
+
 
 def is_last_ubatch_empty(
     orig_num_tokens: int,
@@ -262,7 +266,7 @@ def _make_metadata_with_slice(
     else:
         actual_seq_lengths_q = []
 
-    metadata = AscendCommonAttentionMetadata(
+    metadata_kwargs = dict(
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc_cpu,
         seq_lens=seq_lens,
@@ -316,29 +320,38 @@ def _make_metadata_with_slice(
             if attn_metadata.seq_lens_cpu_upper_bound is not None
             else None
         ),
-        mm_req_doc_ranges=attn_metadata.mm_req_doc_ranges,
-        rswa_prefix_lens=(
-            attn_metadata.rswa_prefix_lens[request_slice]
-            if attn_metadata.rswa_prefix_lens is not None
-            else None
-        ),
-        context_parallel_metadata=attn_metadata.context_parallel_metadata,
-        group_len=(
-            attn_metadata.group_len[request_slice]
-            if attn_metadata.group_len is not None
-            else None
-        ),
-        group_key_idx=(
-            attn_metadata.group_key_idx[request_slice]
-            if attn_metadata.group_key_idx is not None
-            else None
-        ),
-        group_key_cache_idx=(
-            attn_metadata.group_key_cache_idx[request_slice]
-            if attn_metadata.group_key_cache_idx is not None
-            else None
-        ),
     )
+    # ### PATCH START: vllm_cann attention metadata ABI
+    if "slot_mapping_cpu" in _ASCEND_COMMON_METADATA_FIELDS:
+        slot_mapping_cpu = attn_metadata.slot_mapping_cpu
+        metadata_kwargs["slot_mapping_cpu"] = (
+            slot_mapping_cpu[token_slice] if slot_mapping_cpu is not None else None
+        )
+    if "prefill_context_parallel_metadata" in _ASCEND_COMMON_METADATA_FIELDS:
+        metadata_kwargs["prefill_context_parallel_metadata"] = (
+            attn_metadata.prefill_context_parallel_metadata
+        )
+    elif "context_parallel_metadata" in _ASCEND_COMMON_METADATA_FIELDS:
+        metadata_kwargs["context_parallel_metadata"] = (
+            attn_metadata.context_parallel_metadata
+        )
+    if "kvcomp_metadata" in _ASCEND_COMMON_METADATA_FIELDS:
+        metadata_kwargs["kvcomp_metadata"] = attn_metadata.kvcomp_metadata
+    if "mm_req_doc_ranges" in _ASCEND_COMMON_METADATA_FIELDS:
+        metadata_kwargs["mm_req_doc_ranges"] = attn_metadata.mm_req_doc_ranges
+    if "rswa_prefix_lens" in _ASCEND_COMMON_METADATA_FIELDS:
+        rswa_prefix_lens = attn_metadata.rswa_prefix_lens
+        metadata_kwargs["rswa_prefix_lens"] = (
+            rswa_prefix_lens[request_slice] if rswa_prefix_lens is not None else None
+        )
+    if "group_len" in _ASCEND_COMMON_METADATA_FIELDS:
+        for field_name in ("group_len", "group_key_idx", "group_key_cache_idx"):
+            value = getattr(attn_metadata, field_name)
+            metadata_kwargs[field_name] = (
+                value[request_slice] if value is not None else None
+            )
+    # ### PATCH END: vllm_cann attention metadata ABI
+    metadata = AscendCommonAttentionMetadata(**metadata_kwargs)
     metadata.encoder_seq_lens = (
         attn_metadata.encoder_seq_lens[request_slice]
         if attn_metadata.encoder_seq_lens is not None

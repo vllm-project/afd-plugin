@@ -6,7 +6,12 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from afd_plugin.config import AFDConfig
-from afd_plugin.distributed import resolve_role_rank
+from afd_plugin.distributed import (
+    build_rank_mapping,
+    build_window_expert_layout,
+    build_window_rank_mapping,
+    resolve_role_rank,
+)
 
 
 def _vllm_config(
@@ -31,8 +36,10 @@ def _afd_config(
     role: str = "attention",
     num_attention_ranks: int = 1,
     num_ffn_ranks: int = 1,
+    connector: str = "P2pNcclAFDConnector",
 ):
     return AFDConfig(
+        connector=connector,
         role=role,
         num_attention_ranks=num_attention_ranks,
         num_ffn_ranks=num_ffn_ranks,
@@ -106,4 +113,113 @@ def test_resolve_role_rank_rejects_derived_rank_outside_role_size(monkeypatch):
         resolve_role_rank(
             _vllm_config(dp_size=2, dp_rank=1, tp_size=2),
             _afd_config(num_attention_ranks=2),
+        )
+
+
+def test_build_window_rank_mapping_connects_all_opposite_role_ranks():
+    attention_config = _afd_config(
+        role="attention",
+        num_attention_ranks=8,
+        num_ffn_ranks=16,
+        connector="WindowAFDConnector",
+    )
+    ffn_config = _afd_config(
+        role="ffn",
+        num_attention_ranks=8,
+        num_ffn_ranks=16,
+        connector="WindowAFDConnector",
+    )
+
+    attention = build_window_rank_mapping(attention_config, 7)
+    ffn = build_window_rank_mapping(ffn_config, 15)
+
+    assert attention.world_rank == 23
+    assert attention.peer_ranks == tuple(range(16))
+    assert ffn.world_rank == 15
+    assert ffn.peer_ranks == tuple(range(16, 24))
+
+
+@pytest.mark.parametrize(
+    ("ffn_rank", "kind", "start", "count"),
+    [
+        (0, "shared", 256, 1),
+        (1, "routed", 0, 18),
+        (2, "routed", 18, 17),
+        (15, "routed", 239, 17),
+    ],
+)
+def test_build_window_expert_layout_is_shared_first_and_balanced(
+    ffn_rank,
+    kind,
+    start,
+    count,
+):
+    layout = build_window_expert_layout(
+        routed_expert_num=256,
+        ffn_size=16,
+        ffn_rank=ffn_rank,
+    )
+
+    assert layout.kind == kind
+    assert layout.local_expert_start == start
+    assert layout.local_expert_count == count
+
+
+@pytest.mark.parametrize(
+    ("role", "role_rank", "subgroup_index", "ffn_peers", "attention_peers"),
+    [
+        ("attention", 0, 0, (0, 1), (4,)),
+        ("attention", 1, 1, (2, 3), (5,)),
+        ("ffn", 0, 0, (0, 1), (4,)),
+        ("ffn", 1, 0, (0, 1), (4,)),
+        ("ffn", 2, 1, (2, 3), (5,)),
+        ("ffn", 3, 1, (2, 3), (5,)),
+    ],
+)
+def test_build_rank_mapping_supports_integer_ffn_fanout(
+    role,
+    role_rank,
+    subgroup_index,
+    ffn_peers,
+    attention_peers,
+):
+    config = _afd_config(
+        role=role,
+        num_attention_ranks=2,
+        num_ffn_ranks=4,
+        connector="P2pHcclAFDConnector",
+    )
+
+    mapping = build_rank_mapping(config, role_rank)
+
+    assert mapping.ratio == 2
+    assert mapping.attention_fans_out is True
+    assert mapping.subgroup_index == subgroup_index
+    assert mapping.ffn_peer_ranks == ffn_peers
+    assert mapping.attention_peer_ranks == attention_peers
+    assert mapping.subgroup_ranks == (*ffn_peers, *attention_peers)
+    assert mapping.p2p_rank == mapping.world_rank
+
+
+def test_build_rank_mapping_rejects_ffn_fanout_for_nccl():
+    with pytest.raises(ValueError, match="other than P2pHcclAFDConnector"):
+        build_rank_mapping(
+            _afd_config(
+                num_attention_ranks=2,
+                num_ffn_ranks=4,
+                connector="P2pNcclAFDConnector",
+            ),
+            0,
+        )
+
+
+def test_build_rank_mapping_rejects_non_integer_ffn_fanout():
+    with pytest.raises(ValueError, match="num_ffn_ranks to be a multiple"):
+        build_rank_mapping(
+            _afd_config(
+                num_attention_ranks=2,
+                num_ffn_ranks=3,
+                connector="P2pHcclAFDConnector",
+            ),
+            0,
         )

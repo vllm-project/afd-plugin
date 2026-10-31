@@ -22,6 +22,63 @@ import vllm.v1.engine.core as core_module
 
 from afd_plugin.config import AFDConfig, parse_optional_afd_config
 
+_ORIGINAL_ENGINE_CORE_INIT_ATTR = "_afd_plugin_original_engine_core_init"
+_ORIGINAL_ENGINE_CORE_KV_INIT_ATTR = "_afd_plugin_original_engine_core_kv_init"
+_ORIGINAL_ENGINE_CORE_SHUTDOWN_ATTR = "_afd_plugin_original_engine_core_shutdown"
+_ORIGINAL_ENGINE_CORE_PROC_LOOP_ATTR = "_afd_plugin_original_engine_core_proc_loop"
+_ORIGINAL_DP_ENGINE_CORE_PROC_LOOP_ATTR = (
+    "_afd_plugin_original_dp_engine_core_proc_loop"
+)
+
+if not hasattr(core_module, _ORIGINAL_ENGINE_CORE_INIT_ATTR):
+    setattr(
+        core_module,
+        _ORIGINAL_ENGINE_CORE_INIT_ATTR,
+        core_module.EngineCore.__init__,
+    )
+if not hasattr(core_module, _ORIGINAL_ENGINE_CORE_KV_INIT_ATTR):
+    setattr(
+        core_module,
+        _ORIGINAL_ENGINE_CORE_KV_INIT_ATTR,
+        core_module.EngineCore._initialize_kv_caches,
+    )
+if not hasattr(core_module, _ORIGINAL_ENGINE_CORE_SHUTDOWN_ATTR):
+    setattr(
+        core_module,
+        _ORIGINAL_ENGINE_CORE_SHUTDOWN_ATTR,
+        core_module.EngineCore.shutdown,
+    )
+if not hasattr(core_module, _ORIGINAL_ENGINE_CORE_PROC_LOOP_ATTR):
+    setattr(
+        core_module,
+        _ORIGINAL_ENGINE_CORE_PROC_LOOP_ATTR,
+        core_module.EngineCoreProc.run_busy_loop,
+    )
+if not hasattr(core_module, _ORIGINAL_DP_ENGINE_CORE_PROC_LOOP_ATTR):
+    setattr(
+        core_module,
+        _ORIGINAL_DP_ENGINE_CORE_PROC_LOOP_ATTR,
+        core_module.DPEngineCoreProc.run_busy_loop,
+    )
+
+_original_engine_core_init = getattr(core_module, _ORIGINAL_ENGINE_CORE_INIT_ATTR)
+_original_engine_core_kv_init = getattr(
+    core_module,
+    _ORIGINAL_ENGINE_CORE_KV_INIT_ATTR,
+)
+_original_engine_core_shutdown = getattr(
+    core_module,
+    _ORIGINAL_ENGINE_CORE_SHUTDOWN_ATTR,
+)
+_original_engine_core_proc_loop = getattr(
+    core_module,
+    _ORIGINAL_ENGINE_CORE_PROC_LOOP_ATTR,
+)
+_original_dp_engine_core_proc_loop = getattr(
+    core_module,
+    _ORIGINAL_DP_ENGINE_CORE_PROC_LOOP_ATTR,
+)
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.executor import Executor
@@ -56,6 +113,15 @@ def __init__(
         )
         return
     # ### PATCH END: AFD FFN EngineCore daemon initialization
+
+    return _original_engine_core_init(
+        self,
+        vllm_config,
+        executor_class,
+        log_stats,
+        executor_fail_callback,
+        include_finished_set,
+    )
 
     # plugins need to be loaded at the engine/scheduler level too
     from vllm.plugins import load_general_plugins
@@ -213,6 +279,8 @@ def shutdown(self):
         return
     # ### PATCH END: AFD FFN EngineCore shutdown
 
+    return _original_engine_core_shutdown(self)
+
     core_module.logger.debug_once("[shutdown] EngineCore: tearing down local resources")
     self.structured_output_manager.clear_backend()
     if self.model_executor:
@@ -239,6 +307,8 @@ def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
         _prepare_late_loaded_ffn_engine_core(self, vllm_config)
         return _AFDFFNKVCacheConfig()
     # ### PATCH END: AFD FFN late-loaded KV cache bypass
+
+    return _original_engine_core_kv_init(self, vllm_config)
 
     start = time.time()
 
@@ -359,6 +429,10 @@ def run_busy_loop(self):
         result = _run_ffn_busy_loop(self, core_module)
         return result
     # ### PATCH END: AFD FFN connector busy loop
+
+    if isinstance(self, core_module.DPEngineCoreProc):
+        return _original_dp_engine_core_proc_loop(self)
+    return _original_engine_core_proc_loop(self)
 
     if isinstance(self, core_module.DPEngineCoreProc):
         """Core busy loop of the EngineCore for data parallel case."""
@@ -556,6 +630,27 @@ def _prepare_late_loaded_ffn_engine_core(
             scheduler_config.get_scheduler_cls = lambda: _AFDFFNNoopScheduler
 
 
+def _process_ffn_utility_requests(self, core_module: Any) -> None:
+    """Process control requests while FFN workers run the connector loop."""
+    supported_types = {
+        core_module.EngineCoreRequestType.UTILITY,
+        core_module.EngineCoreRequestType.WAKEUP,
+        core_module.EngineCoreRequestType.EXECUTOR_FAILED,
+    }
+    while True:
+        try:
+            request = self.input_queue.get_nowait()
+        except queue.Empty:
+            return
+        if request[0] not in supported_types:
+            core_module.logger.warning(
+                "Ignoring unsupported AFD FFN EngineCore request: %s",
+                request[0],
+            )
+            continue
+        self._handle_client_request(*request)
+
+
 def _run_ffn_busy_loop(self, core_module: Any) -> None:
     core_module.logger.info("AFD FFN EngineCore started; workers run connector loop.")
 
@@ -564,6 +659,7 @@ def _run_ffn_busy_loop(self, core_module: Any) -> None:
         self.model_executor.collective_rpc("start_ffn_server_loop")
         started = True
         while _is_running(self, core_module):
+            _process_ffn_utility_requests(self, core_module)
             self.model_executor.collective_rpc("raise_ffn_loop_error_if_any")
             time.sleep(0.5)
     except KeyboardInterrupt:

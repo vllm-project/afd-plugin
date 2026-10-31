@@ -52,9 +52,10 @@ def create_ascend_forward_context(
         parent_kwargs[AFD_MLA_GRAPH_PARAMS_KEY] = mla_graph_params
 
     ubatch_slice = ubatch_slices[ubatch_num]
+    parent_is_padding = getattr(cur_forward_context, "is_padding", None)
     is_padding = (
-        cur_forward_context.is_padding[ubatch_slice.token_slice]
-        if cur_forward_context.is_padding is not None
+        parent_is_padding[ubatch_slice.token_slice]
+        if parent_is_padding is not None
         else None
     )
     new_forward_context = ForwardContext(
@@ -68,8 +69,9 @@ def create_ascend_forward_context(
         ubatch_slices=ubatch_slices,
         skip_compiled=skip_compiled,
         additional_kwargs=parent_kwargs,
-        is_padding=is_padding,
     )
+    # vLLM 0.23 has no constructor field for this Ascend extension yet.
+    new_forward_context.is_padding = is_padding
 
     num_tokens = ubatch_slice.num_tokens
     tp_world_size = get_tensor_model_parallel_world_size()
@@ -87,6 +89,15 @@ def create_ascend_forward_context(
     new_forward_context.num_tokens = num_tokens
     new_forward_context.ubatch_idx = int(ubatch_num)
     new_forward_context.num_ubatches = len(ubatch_slices)
+    new_forward_context.afd_input_ids_pretransferred = bool(
+        getattr(cur_forward_context, "afd_input_ids_pretransferred", False)
+    )
+    parent_graph_mode = getattr(cur_forward_context, "cudagraph_runtime_mode", None)
+    parent_graph_mode_name = getattr(parent_graph_mode, "name", str(parent_graph_mode))
+    # Child contexts execute with mode NONE while their two interleaved forwards
+    # are captured into one parent FULL graph. Preserve that parent state so the
+    # HCCL connector does not enter its eager-only communication-stream path.
+    new_forward_context.afd_graph_ubatching = parent_graph_mode_name == "FULL"
     new_forward_context.flash_comm_v1_enabled = (
         cur_forward_context.flash_comm_v1_enabled
     )
@@ -109,7 +120,12 @@ def create_ascend_forward_context(
         cur_forward_context.max_tokens_across_pcp
     )
     new_forward_context.sinks = cur_forward_context.sinks
-    new_forward_context.input_ids = cur_forward_context.input_ids
+    parent_input_ids = cur_forward_context.input_ids
+    new_forward_context.input_ids = (
+        parent_input_ids[ubatch_slice.token_slice]
+        if parent_input_ids is not None
+        else None
+    )
     new_forward_context.eplb_heat_collection_status = (
         cur_forward_context.eplb_heat_collection_status
     )

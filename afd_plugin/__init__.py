@@ -57,6 +57,12 @@ _DEEPSEEK_MODEL_REGISTRATIONS = {
     "DeepseekV32ForCausalLM": (
         "afd_plugin.model_executor.models.deepseek_v2:AFDDeepseekV3ForCausalLM"
     ),
+    "DeepseekV4ForCausalLM": (
+        "afd_plugin.model_executor.models.deepseek_v4:AFDDeepseekV4ForCausalLM"
+    ),
+    "DeepSeekV4MTPModel": (
+        "afd_plugin.model_executor.models.deepseek_v4:AFDDeepSeekV4MTP"
+    ),
     "GlmMoeDsaForCausalLM": (
         "afd_plugin.model_executor.models.deepseek_v2:AFDGlmMoeDsaForCausalLM"
     ),
@@ -97,6 +103,16 @@ def register_afd() -> None:
         import afd_plugin.compat.patches.async_dp_forward_context  # noqa: F401
         import afd_plugin.compat.patches.config_validation  # noqa: F401
         import afd_plugin.compat.patches.engine_core  # noqa: F401
+        from afd_plugin.compat.patches.npu.mxfp_worker_resolution import (
+            apply_afd_mxfp_worker_resolution_patch,
+        )
+
+        apply_afd_mxfp_worker_resolution_patch()
+        from afd_plugin.compat.patches.npu.dspark_pd import (
+            apply_afd_dspark_pd_scheduler_patch,
+        )
+
+        apply_afd_dspark_pd_scheduler_patch()
     except Exception:
         _logger.debug(
             "AFD plugin: compatibility patches could not be applied",
@@ -113,8 +129,9 @@ def register_afd() -> None:
             exc_info=True,
         )
 
-    # NPU compatibility patches are applied during AFD config construction and
-    # worker startup, after vLLM-Ascend completes its platform initialization.
+    # Remaining NPU compatibility patches are applied during AFD config
+    # construction and worker startup, after vLLM-Ascend completes its platform
+    # initialization.
 
     from vllm.model_executor.models import ModelRegistry
 

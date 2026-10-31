@@ -96,9 +96,19 @@ AFDConnectorFactory.register_connector(
     "CAMP2pAFDConnector",
 )
 AFDConnectorFactory.register_connector(
+    "P2pHcclAFDConnector",
+    "afd_plugin.connectors.npu.p2p_hccl",
+    "P2pHcclAFDConnector",
+)
+AFDConnectorFactory.register_connector(
     "CAMAsyncAFDConnector",
     "afd_plugin.connectors.npu.async_cam",
     "CAMAsyncAFDConnector",
+)
+AFDConnectorFactory.register_connector(
+    "WindowAFDConnector",
+    "afd_plugin.connectors.npu.window",
+    "WindowAFDConnector",
 )
 
 

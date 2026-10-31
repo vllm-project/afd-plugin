@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 import vllm.config.vllm as config_module
 import vllm.engine.arg_utils as arg_utils_module
 
-from afd_plugin.compat.vllm import TARGET_VLLM_VERSION
+from afd_plugin.compat.vllm import is_vllm_version_supported
 from afd_plugin.config import parse_optional_afd_config
 from afd_plugin.validation import afd_worker_qualname_for_platform_default
 
@@ -192,7 +192,7 @@ def _is_target_vllm_compatible() -> bool:
     version_text = str(version_value)
     if "dev" in version_text:
         return True
-    return version_text.startswith(TARGET_VLLM_VERSION)
+    return is_vllm_version_supported(version_text)
 
 
 if _is_target_vllm_compatible():

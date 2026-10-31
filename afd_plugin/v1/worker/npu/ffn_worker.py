@@ -19,7 +19,12 @@ from afd_plugin.compat.npu import (
     fix_all2all_backend_for_afd,
     npu_afd_num_ubatches,
 )
-from afd_plugin.model_executor.models.model_utils import get_afd_model_config
+from afd_plugin.config import parse_afd_config
+from afd_plugin.connectors import AFDControlPlaneClosedError
+from afd_plugin.model_executor.models.model_utils import (
+    get_afd_model_config,
+    install_afd_speculative_model_config,
+)
 from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
 from afd_plugin.validation import NPU_FFN_WORKER_FQCN, assert_compatible_afd_stack
 
@@ -63,6 +68,17 @@ class AFDNPUFFNWorker(NPUWorker):
             raise RuntimeError("AFD NPU FFN supports only vllm-ascend MRv1")
 
         self.device = self._init_device()
+        afd_config = parse_afd_config(self.vllm_config, validate=False)
+        if afd_config.connector == "WindowAFDConnector":
+            # Materialize MC2 before Window ranks specialize by expert kind.
+            from vllm_ascend.distributed.parallel_state import get_mc2_group
+
+            mc2_device_group = get_mc2_group().device_group
+            mc2_rank = torch.distributed.get_rank(group=mc2_device_group)
+            mc2_backend = mc2_device_group._get_backend(torch.device("npu"))
+            logger.info("Materializing Window FFN MC2 communicator")
+            mc2_backend.get_hccl_comm_name(mc2_rank)
+            logger.info("Materialized Window FFN MC2 communicator")
         init_workspace_manager(
             self.device,
             npu_afd_num_ubatches(self.vllm_config),
@@ -70,7 +86,32 @@ class AFDNPUFFNWorker(NPUWorker):
         self.vllm_config.model_config = get_afd_model_config(
             self.vllm_config.model_config,
         )
+        install_afd_speculative_model_config(self.vllm_config)
         self.model_runner = AFDNPUFFNModelRunner(self.vllm_config, self.device)
+        if getattr(
+            self.model_runner.connector,
+            "stage_diagnostics_enabled",
+            False,
+        ):
+            try:
+                from afd_plugin.compat.patches.npu.mxfp_alltoallv import (
+                    get_afd_mxfp_alltoallv_patch_status,
+                )
+
+                patched, dispatcher_module = get_afd_mxfp_alltoallv_patch_status()
+                logger.warning(
+                    "AFD MXFP AllToAllV diagnostics: patched=%s "
+                    "dispatcher_module=%s worker=%s.%s",
+                    patched,
+                    dispatcher_module,
+                    type(self).__module__,
+                    type(self).__qualname__,
+                )
+            except Exception:
+                logger.warning(
+                    "AFD MXFP AllToAllV diagnostics unavailable",
+                    exc_info=True,
+                )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}
@@ -93,6 +134,20 @@ class AFDNPUFFNWorker(NPUWorker):
             "execute_model() is not supported.",
         )
 
+    # Upstream: vllm_ascend/worker/worker.py at 11ee45653.
+    # Patch reason: the AFD runner owns its profiler instead of NPUWorker.
+    # Patch functionality: route profile RPCs to the role-aware AFD profiler.
+    # Signature: matches upstream; no added parameters.
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+        """Control the plugin-owned profiler from vLLM's profile endpoint."""
+        # ### PATCH START: AFD profiler control
+        del profile_prefix
+        if is_start:
+            self.model_runner.start_afd_profiler()
+        else:
+            self.model_runner.stop_afd_profiler()
+        # ### PATCH END: AFD profiler control
+
     def start_ffn_server_loop(self) -> None:
         if self._ffn_thread is not None and self._ffn_thread.is_alive():
             self.raise_ffn_loop_error_if_any()
@@ -111,7 +166,10 @@ class AFDNPUFFNWorker(NPUWorker):
                 self._run_ffn_server_loop()
             except Exception as exc:
                 shutdown_event = self._ffn_shutdown_event
-                if shutdown_event is not None and shutdown_event.is_set():
+                if shutdown_event is not None and (
+                    shutdown_event.is_set() or _is_attention_control_plane_shutdown(exc)
+                ):
+                    shutdown_event.set()
                     logger.debug(
                         "AFD NPU FFN receive loop stopped during shutdown",
                         exc_info=True,
@@ -133,26 +191,71 @@ class AFDNPUFFNWorker(NPUWorker):
             return
 
         torch.npu.set_device(self.device)
+        diagnostic_step = 0
         while not event.is_set():
             if self.model_runner.connector.control_plane is None:
                 self.model_runner.execute_connector_driven_step()
-                torch.npu.synchronize()
+                if not self.model_runner.window_ffn_multistream_enabled:
+                    torch.npu.synchronize()
                 continue
 
             payload = self.model_runner.connector.control_plane.recv_dp_metadata_list()
+            if payload.shutdown:
+                logger.info("AFD NPU FFN received Attention shutdown payload")
+                event.set()
+                return
+            # Preserve the complete Attention-side control contract. Rebuilding
+            # a payload from only DP metadata drops TP and phase fields.
+            self.model_runner.connector.control_plane.update_state_from_dp_metadata(
+                payload,
+            )
             dp_metadata_list = payload.dp_metadata_list
             is_attn_graph_capturing = payload.is_graph_capturing
             is_warmup = payload.is_warmup
+            stage_diagnostics = bool(
+                getattr(
+                    self.model_runner.connector,
+                    "stage_diagnostics_enabled",
+                    False,
+                )
+            )
+            diagnostic_step += 1
+            if stage_diagnostics:
+                logger.warning(
+                    "AFD NPU FFN step progress: step=%s event=execute_begin "
+                    "stages=%s graph_capture=%s warmup=%s "
+                    "target_graph_replay=%s",
+                    diagnostic_step,
+                    tuple(sorted(dp_metadata_list)),
+                    is_attn_graph_capturing,
+                    is_warmup,
+                    payload.target_graph_replay,
+                )
 
             self.model_runner.execute_ffn_step(
                 dp_metadata_list=dp_metadata_list,
                 is_graph_capturing=is_attn_graph_capturing,
                 is_warmup=is_warmup,
+                connector_state_prepared=True,
             )
+            if stage_diagnostics:
+                logger.warning(
+                    "AFD NPU FFN step progress: step=%s event=execute_returned",
+                    diagnostic_step,
+                )
+                logger.warning(
+                    "AFD NPU FFN step progress: step=%s event=device_sync_begin",
+                    diagnostic_step,
+                )
             torch.npu.synchronize()
+            if stage_diagnostics:
+                logger.warning(
+                    "AFD NPU FFN step progress: step=%s event=device_sync_complete",
+                    diagnostic_step,
+                )
 
     def raise_ffn_loop_error_if_any(self) -> None:
-        error = self._ffn_loop_error
+        error = getattr(self, "_ffn_loop_error", None)
         if error is not None:
             self._ffn_loop_error = None
             raise RuntimeError("AFD NPU FFN worker loop failed") from error
@@ -182,6 +285,24 @@ class AFDNPUFFNWorker(NPUWorker):
         # runner and its tensors.
         self.stop_ffn_server_loop()
         super().shutdown()
+
+
+def _is_attention_control_plane_shutdown(error: BaseException) -> bool:
+    """Recognize the Gloo EOF produced when Attention workers stop first."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, AFDControlPlaneClosedError):
+            return True
+        message = str(current).lower()
+        if "gloo" in message and (
+            "connection closed by peer" in message
+            or "connection reset by peer" in message
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 __all__ = ["AFDNPUFFNWorker"]

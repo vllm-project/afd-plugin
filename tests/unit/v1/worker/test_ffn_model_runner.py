@@ -117,6 +117,7 @@ def _payload(hidden_states, metadata):
 def _runner_with_connector_and_model(model, *, num_layers=1):
     runner = object.__new__(GPUFFNModelRunner)
     runner.vllm_config = SimpleNamespace(
+        use_v2_model_runner=False,
         parallel_config=SimpleNamespace(
             data_parallel_size=1,
             is_moe_model=True,

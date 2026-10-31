@@ -14,6 +14,37 @@ class _QuantType:
     W8A8 = 1
 
 
+def _fake_upstream_apply(
+    self,
+    layer,
+    x,
+    router_logits,
+    top_k,
+    renormalize,
+    **kwargs,
+):
+    del self
+    _, topk_ids = globals()["select_experts"](
+        hidden_states=x,
+        router_logits=router_logits,
+        top_k=top_k,
+        use_grouped_topk=kwargs.get("use_grouped_topk", False),
+        renormalize=renormalize,
+        topk_group=kwargs.get("topk_group"),
+        num_expert_group=kwargs.get("num_expert_group"),
+        custom_routing_function=kwargs.get("custom_routing_function"),
+        scoring_func=kwargs.get("scoring_func", "softmax"),
+        routed_scaling_factor=kwargs.get("routed_scaling_factor", 1.0),
+        e_score_correction_bias=kwargs.get("e_score_correction_bias"),
+        mix_placement=getattr(layer, "mix_placement", False),
+        num_logical_experts=router_logits.shape[1],
+        num_shared_experts=getattr(layer, "n_shared_experts", 0) or 0,
+        num_experts=kwargs.get("num_experts", -1),
+        tid2eid=kwargs.get("tid2eid"),
+    )
+    return topk_ids
+
+
 def _install_fake_modules(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     def build_fused_experts_input(*args: object, **kwargs: object) -> torch.Tensor:
         """Fake builder: returns the possibly swapped topk_ids."""
@@ -23,6 +54,10 @@ def _install_fake_modules(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
 
     class AscendW8A8DynamicFusedMoEMethod:
         quant_type = _QuantType.W8A8
+
+        def __init__(self):
+            self.upstream_initialized = True
+            self.multistream_overlap_gate = False
 
     vllm = types.ModuleType("vllm")
     vllm_config = types.ModuleType("vllm.config")
@@ -104,6 +139,12 @@ def _install_fake_modules(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
 
     experts_selector_mod.select_experts = select_experts
     experts_selector_mod.zero_experts_compute = None
+    upstream_apply = types.FunctionType(
+        _fake_upstream_apply.__code__,
+        {"select_experts": select_experts},
+        name="apply",
+    )
+    AscendW8A8DynamicFusedMoEMethod.apply = upstream_apply
     fused_moe_mod = types.ModuleType("vllm_ascend.ops.fused_moe.fused_moe")
     fused_moe_mod.logger = SimpleNamespace(
         info=lambda *args, **kwargs: None,
@@ -438,6 +479,7 @@ def test_w8a8_apply_lazily_builds_and_swaps_topk_ids(
         "force_load_balance_topn_per_rank": 1,
     }
     method = force_lb_mod.AscendW8A8DynamicFusedMoEMethod()
+    assert method.upstream_initialized
     assert method.enable_force_load_balance
     assert method.force_load_balance_topn_per_rank == 1
     assert method.force_lb_fake_topk_buffer is None

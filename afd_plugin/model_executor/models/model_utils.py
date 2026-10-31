@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from afd_plugin import _DEEPSEEK_MODEL_REGISTRATIONS
 
 if TYPE_CHECKING:
-    from vllm.config import ModelConfig
+    from vllm.config import ModelConfig, VllmConfig
 
 
 def get_afd_model_config(model_config: ModelConfig) -> ModelConfig:
@@ -26,3 +26,16 @@ def get_afd_model_config(model_config: ModelConfig) -> ModelConfig:
             afd_model_config.hf_config.architectures = [f"AFD{model_arch}"]
             return afd_model_config
     return model_config
+
+
+def install_afd_speculative_model_config(vllm_config: VllmConfig) -> None:
+    """Resolve the draft model to its AFD role wrapper in-place."""
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if speculative_config is None:
+        return
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    if draft_model_config is None:
+        return
+    speculative_config.draft_model_config = get_afd_model_config(
+        draft_model_config,
+    )

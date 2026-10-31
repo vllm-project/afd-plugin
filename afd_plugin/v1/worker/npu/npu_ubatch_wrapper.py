@@ -27,13 +27,16 @@ from vllm.forward_context import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu_ubatch_wrapper import UbatchMetadata, UBatchWrapper
+from vllm_ascend.attention.dsa_v1 import AscendDSAMetadata
 from vllm_ascend.compilation.acl_graph import (
     ACLGraphWrapper,
     GraphParams,
     get_graph_params,
 )
+from vllm_ascend.ops.rope_dsv4 import RopeDataProxy
 from vllm_ascend.utils import enable_sp
 
+from afd_plugin.v1.worker.npu.dsa_rope import refresh_dsa_rope
 from afd_plugin.v1.worker.npu.forward_context import (
     create_ascend_forward_context,
 )
@@ -151,6 +154,7 @@ class AscendUBatchWrapper(UBatchWrapper):
         mla_full_graph_enabled: bool = False,
         full_graph_params_updater: FullGraphParamsUpdater | None = None,
         enable_enpu: bool = False,
+        enable_layer_major_eager_u2: bool = False,
     ):
         assert not enable_enpu, "AscendUBatchWrapper does not support ENPU"
         self.runnable = runnable
@@ -170,6 +174,7 @@ class AscendUBatchWrapper(UBatchWrapper):
         self.device = device
         self.mla_full_graph_enabled = mla_full_graph_enabled
         self.full_graph_params_updater = full_graph_params_updater
+        self.enable_layer_major_eager_u2 = enable_layer_major_eager_u2
 
     @property
     def graph_pool(self):
@@ -208,6 +213,26 @@ class AscendUBatchWrapper(UBatchWrapper):
                 "MLA DBO FULL graph does not support PCP execution",
             )
         return True
+
+    def has_ubatch_full_graph(self, forward_context: ForwardContext) -> bool:
+        """Return whether a synchronized startup capture covers this U2 shape."""
+        ubatch_slices = forward_context.ubatch_slices
+        if (
+            ubatch_slices is None
+            or forward_context.cudagraph_runtime_mode is not CUDAGraphMode.FULL
+            or len(ubatch_slices) != AFD_NPU_NUM_UBATCHES
+        ):
+            return False
+        batch_descriptor = forward_context.batch_descriptor
+        graph_key = AscendNPUGraphKey(
+            (
+                ubatch_slices[0].num_tokens,
+                ubatch_slices[1].num_tokens,
+            ),
+            batch_descriptor.has_lora,
+            batch_descriptor.num_active_loras,
+        )
+        return graph_key in self.cudagraphs
 
     def __call__(self, *args, **kwargs):
         forward_context = get_forward_context()
@@ -303,6 +328,51 @@ class AscendUBatchWrapper(UBatchWrapper):
                     positions,
                 )
             else:
+                # DSA ubatch splitting allocates new length tensors. Replay must
+                # retain capture addresses while refreshing their contents.
+                updated_metadata: set[int] = set()
+                updated_rope_tensors: set[int] = set()
+                for stage, saved_ubatch in enumerate(
+                    cudagraph_metadata.ubatch_metadata
+                ):
+                    saved_dict = saved_ubatch.context.forward_context.attn_metadata
+                    for layer, saved in (saved_dict or {}).items():
+                        if (
+                            not isinstance(saved, AscendDSAMetadata)
+                            or saved.decode is None
+                            or id(saved) in updated_metadata
+                        ):
+                            continue
+                        live_dict = (
+                            attn_metadata[stage] if stage < len(attn_metadata) else None
+                        )
+                        if not isinstance(live_dict, dict):
+                            continue
+                        live = live_dict.get(layer)
+                        if not isinstance(live, AscendDSAMetadata):
+                            continue
+                        assert live.decode is not None
+                        assert saved.num_decodes == live.num_decodes
+                        assert saved.num_decode_tokens == live.num_decode_tokens
+                        assert saved.num_prefills == live.num_prefills
+                        updated_metadata.add(id(saved))
+                        # ### PATCH START: refresh capture-owned DSV4 RoPE
+                        if isinstance(saved.decode.cos, RopeDataProxy):
+                            assert isinstance(live.decode.cos, RopeDataProxy)
+                            refresh_dsa_rope(
+                                saved.decode.cos,
+                                live.decode.cos,
+                                updated_rope_tensors,
+                            )
+                        # ### PATCH END: refresh capture-owned DSV4 RoPE
+                        for target, source in (
+                            (saved.decode.seq_lens, live.decode.seq_lens),
+                            (saved.decode.query_start_loc, live.decode.query_start_loc),
+                        ):
+                            assert target.shape == source.shape
+                            assert target.dtype == source.dtype
+                            if target.data_ptr() != source.data_ptr():
+                                target.copy_(source)
                 torch.npu.current_stream().synchronize()
                 cudagraph_metadata.aclgraph.replay()
             forward_context.dbo_enabled = True
@@ -546,6 +616,8 @@ class AscendUBatchWrapper(UBatchWrapper):
         ubatch_metadata: list[AscendUbatchMetadata],
         model,
     ) -> AscendModelOutput:
+        if self.enable_layer_major_eager_u2:
+            return self._run_ubatches_layer_major(ubatch_metadata, model)
         results: list[tuple[int, AscendModelOutput]] = []
         with override_forward_context(None):
             ubatch_threads = []
@@ -565,6 +637,25 @@ class AscendUBatchWrapper(UBatchWrapper):
         get_forward_context().dbo_enabled = True
         return self._merge_outputs(sorted_results, ubatch_metadata)
 
+    @torch.inference_mode()
+    def _run_ubatches_layer_major(
+        self,
+        ubatch_metadata: list[AscendUbatchMetadata],
+        model,
+    ) -> AscendModelOutput:
+        forward = getattr(model, "forward_ubatches_layer_major", None)
+        if not callable(forward):
+            raise RuntimeError("Ascend layer-major eager U2 requires model support")
+        with override_forward_context(None):
+            sorted_results = forward(ubatch_metadata)
+        if len(sorted_results) != len(ubatch_metadata):
+            raise RuntimeError(
+                "Ascend layer-major eager U2 returned an invalid stage count: "
+                f"{len(sorted_results)} != {len(ubatch_metadata)}"
+            )
+        get_forward_context().dbo_enabled = True
+        return self._merge_outputs(sorted_results, ubatch_metadata)
+
     def _capture_ubatches(
         self,
         ubatch_metadata: list[AscendUbatchMetadata],
@@ -575,6 +666,15 @@ class AscendUBatchWrapper(UBatchWrapper):
     ) -> AscendModelOutput:
         results: list[tuple[int, AscendModelOutput]] = []
         compute_stream = ubatch_metadata[0].context.compute_stream
+
+        if self.enable_layer_major_eager_u2:
+            return self._capture_ubatches_layer_major(
+                ubatch_metadata,
+                model,
+                graph_key=graph_key,
+                mla_graph_params=mla_graph_params,
+                compute_stream=compute_stream,
+            )
 
         with override_forward_context(None):
             ubatch_threads = []
@@ -606,6 +706,47 @@ class AscendUBatchWrapper(UBatchWrapper):
                     ubatch_metadata,
                 )
             self.cudagraphs[graph_key] = cudagraph_metadata
+        get_forward_context().dbo_enabled = True
+        assert cudagraph_metadata.outputs is not None
+        return cudagraph_metadata.outputs
+
+    def _capture_ubatches_layer_major(
+        self,
+        ubatch_metadata: list[AscendUbatchMetadata],
+        model,
+        *,
+        graph_key: AscendNPUGraphKey,
+        mla_graph_params: tuple[GraphParams, GraphParams] | None,
+        compute_stream,
+    ) -> AscendModelOutput:
+        """Capture HCCL U2 in the same layer-major order used by its warmup."""
+        forward = getattr(model, "forward_ubatches_layer_major", None)
+        if not callable(forward):
+            raise RuntimeError("Ascend layer-major Graph U2 requires model support")
+        cudagraph_metadata = AscendNPUGraphMetaData(
+            aclgraph=torch.npu.NPUGraph(),
+            ubatch_metadata=ubatch_metadata,
+            mla_graph_params=mla_graph_params,
+        )
+        with (
+            override_forward_context(None),
+            torch.npu.graph(
+                cudagraph_metadata.aclgraph,
+                stream=compute_stream,
+                pool=self.graph_pool,
+            ),
+        ):
+            sorted_results = forward(ubatch_metadata)
+            if len(sorted_results) != len(ubatch_metadata):
+                raise RuntimeError(
+                    "Ascend layer-major Graph U2 returned an invalid stage count: "
+                    f"{len(sorted_results)} != {len(ubatch_metadata)}"
+                )
+            cudagraph_metadata.outputs = self._merge_outputs(
+                sorted_results,
+                ubatch_metadata,
+            )
+        self.cudagraphs[graph_key] = cudagraph_metadata
         get_forward_context().dbo_enabled = True
         assert cudagraph_metadata.outputs is not None
         return cudagraph_metadata.outputs

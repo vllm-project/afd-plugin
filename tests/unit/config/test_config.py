@@ -41,6 +41,56 @@ def test_parse_canonical_additional_config_namespace():
     assert config.is_ffn_server
 
 
+def test_hccl_p2p_config_accepts_integer_multiple_attention_ranks():
+    config = parse_afd_config(
+        {
+            "afd": {
+                "role": "attention",
+                "connector": "P2pHcclAFDConnector",
+                "num_attention_ranks": 4,
+                "num_ffn_ranks": 2,
+            },
+        },
+    )
+
+    assert config.num_attention_ranks == 4
+    assert config.num_ffn_ranks == 2
+
+
+def test_hccl_p2p_config_accepts_integer_multiple_ffn_ranks():
+    config = parse_afd_config(
+        {
+            "afd": {
+                "role": "attention",
+                "connector": "P2pHcclAFDConnector",
+                "num_attention_ranks": 1,
+                "num_ffn_ranks": 2,
+            },
+        },
+    )
+
+    assert config.num_attention_ranks == 1
+    assert config.num_ffn_ranks == 2
+
+
+@pytest.mark.parametrize(
+    ("attention", "ffn"),
+    [(3, 2), (2, 3), (0, 1), (1, 0), (-1, 1), (1, -1)],
+)
+def test_hccl_p2p_config_rejects_unsupported_topology(attention, ffn):
+    with pytest.raises(ValueError, match="require"):
+        parse_afd_config(
+            {
+                "afd": {
+                    "role": "attention",
+                    "connector": "P2pHcclAFDConnector",
+                    "num_attention_ranks": attention,
+                    "num_ffn_ranks": ffn,
+                },
+            },
+        )
+
+
 def test_parse_vllm_like_config_object():
     vllm_config = SimpleNamespace(
         additional_config={
@@ -73,6 +123,16 @@ def test_compute_gate_on_attention_is_common_config():
     )
 
     assert config.compute_gate_on_attention is True
+
+
+@pytest.mark.parametrize("enabled", [False, True, "false", "true"])
+def test_window_multistream_config_parsing_and_graph_hash(enabled):
+    config = afd_config_from_mapping({"window_ffn_multistream_enabled": enabled})
+    expected = enabled in (True, "true")
+    assert config.window_ffn_multistream_enabled is expected
+    default = AFDConfig()
+    assert default.window_ffn_multistream_enabled is True
+    assert (config.compute_hash() == default.compute_hash()) is expected
 
 
 def test_common_config_coerces_integer_bool_values():
@@ -119,7 +179,7 @@ def test_parse_async_dp_config_from_async_alias():
 
 
 def test_async_dp_requires_async_connector():
-    with pytest.raises(ValueError, match="requires connector='CAMAsyncAFDConnector'"):
+    with pytest.raises(ValueError, match="requires an async-DP capable connector"):
         parse_afd_config(
             {
                 "afd": {
@@ -129,6 +189,22 @@ def test_async_dp_requires_async_connector():
                 },
             },
         )
+
+
+def test_window_connector_accepts_async_dp():
+    config = parse_afd_config(
+        {
+            "afd": {
+                "connector": "WindowAFDConnector",
+                "role": "attention",
+                "async": True,
+                "compute_gate_on_attention": True,
+            },
+        },
+    )
+
+    assert config.async_dp is True
+    assert config.connector == "WindowAFDConnector"
 
 
 def test_original_common_afd_field_aliases_are_supported():

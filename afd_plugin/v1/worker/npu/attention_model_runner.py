@@ -5,7 +5,11 @@
 from __future__ import annotations
 
 import copy
+import logging
+from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import fields as dataclass_fields
+from dataclasses import replace
 from functools import partial
 from typing import Any
 
@@ -28,18 +32,27 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec, KVCacheConfig
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.ubatch_utils import UBatchSlices
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import (
     AscendDSACPMetadataBuilder,
 )
-from vllm_ascend.attention.context_parallel.sfa_cp import (
-    AscendSFADCPMetadataBuilder,
-)
+
+try:
+    from vllm_ascend.attention.context_parallel.sfa_cp import (
+        AscendSFADCPMetadataBuilder,
+    )
+except ImportError:
+    # vllm-ascend rfc/vllm_cann folds PCP and DCP into one SFA-CP builder.
+    from vllm_ascend.attention.context_parallel.sfa_cp import (
+        AscendSFACPMetadataBuilder as AscendSFADCPMetadataBuilder,
+    )
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -85,23 +98,135 @@ from afd_plugin.connectors import (
     AFDForwardContextMetadata,
 )
 from afd_plugin.connectors.npu.async_cam import AFDAsyncExtraInfo
+from afd_plugin.connectors.npu.p2p_hccl import P2pHcclAFDConnector
 from afd_plugin.model_executor.models import ASYNC_MOE_UBATCH_METADATA_KEY
 from afd_plugin.v1.worker.attention_model_runner import (
     _forward_context_num_tokens,
     _full_cudagraph_padded_tokens,
     _resolve_world_ranks,
 )
+from afd_plugin.v1.worker.npu.dsa_rope import (
+    DSARopePair,
+    isolate_dsa_rope_metadata,
+)
 from afd_plugin.v1.worker.npu.npu_ubatch_wrapper import AscendUBatchWrapper
 from afd_plugin.v1.worker.npu.ubatch_utils import (
     check_enable_ubatch,
     create_request_boundary_ubatch_slices,
+    create_ubatch_slices,
     maybe_create_ubatch_slices,
     pad_out_ubatch_slices,
     split_attn_metadata,
 )
-from afd_plugin.v1.worker.ubatch_wrapper import build_ubatch_dp_metadata_list
 
 logger = init_logger(__name__)
+
+_ASCEND_COMMON_METADATA_FIELDS = frozenset(
+    field.name for field in dataclass_fields(AscendCommonAttentionMetadata)
+)
+
+
+class _AFDMTPPhaseAwareRunnable:
+    """Announce a live draft phase at the exact runnable boundary."""
+
+    def __init__(self, runnable: Callable[..., Any], callback: Any) -> None:
+        self._runnable = runnable
+        self._callback = callback
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        restore_runtime_mode = self._callback(self._runnable)
+        try:
+            return self._runnable(*args, **kwargs)
+        finally:
+            if restore_runtime_mode is not None:
+                get_forward_context().cudagraph_runtime_mode = restore_runtime_mode
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._runnable, name)
+
+
+def _new_ubatch_dsa_ratio_metadata(
+    num_ubatches: int,
+) -> list[tuple[dict[Any, Any], dict[Any, Any], dict[Any, Any]]]:
+    """Allocate DSA ratio caches that are isolated by execution stage."""
+    return [({}, {}, {}) for _ in range(num_ubatches)]
+
+
+def _uses_legacy_dcp_manager(model_runner: Any) -> bool:
+    """Return whether the runner owns the pre-vllm_cann DCP manager.
+
+    vllm-ascend 80d8c194f exposes ``use_dcp`` and ``dcp_manager``. The
+    rfc/vllm_cann branch folds PCP and DCP into ``use_cp``/``pcp_manager`` and
+    therefore has no ``use_dcp`` attribute. DeepSeek-V4 AFD rejects context
+    parallel sizes above one, so an absent legacy field means this branch is
+    disabled.
+    """
+
+    return bool(getattr(model_runner, "use_dcp", False))
+
+
+def _num_actual_requests_for_ubatch(
+    request_slice: slice,
+    num_reqs: int,
+) -> int:
+    """Count non-padding requests covered by an ubatch request slice."""
+    start = min(int(request_slice.start), num_reqs)
+    stop = min(int(request_slice.stop), num_reqs)
+    return max(stop - start, 0)
+
+
+def _build_ubatch_control_metadata(
+    dp_metadata: DPMetadata | AFDDPMetadata | None,
+    ubatch_slices: UBatchSlices,
+    *,
+    dp_size: int,
+) -> dict[int, AFDDPMetadata]:
+    """Project global DP token counts onto the local ubatch boundaries.
+
+    Ascend chooses the same padded split points on every DP rank, while each
+    rank can have a different number of real tokens.  The FFN control plane
+    must receive the resulting global per-stage vectors; repeating this rank's
+    local stage size makes non-uniform DP batches disagree inside CAMP2P.
+    """
+    if dp_metadata is None:
+        return {
+            stage_idx: _make_uniform_dp_metadata(dp_size, ubatch_slice.num_tokens)
+            for stage_idx, ubatch_slice in enumerate(ubatch_slices)
+        }
+
+    values = dp_metadata.num_tokens_across_dp_cpu
+    global_token_counts = torch.as_tensor(
+        values,
+        dtype=torch.int32,
+        device="cpu",
+    ).flatten()
+    if int(global_token_counts.numel()) != int(dp_size):
+        raise RuntimeError(
+            "DeepSeek-V4 AFD U2 expected one token count per DP rank; "
+            f"got {int(global_token_counts.numel())} for DP={int(dp_size)}"
+        )
+
+    stage_starts = [
+        int(ubatch_slice.token_slice.start) for ubatch_slice in ubatch_slices
+    ]
+    metadata: dict[int, AFDDPMetadata] = {}
+    for stage_idx, stage_start in enumerate(stage_starts):
+        if stage_idx + 1 < len(stage_starts):
+            stage_stop = stage_starts[stage_idx + 1]
+            stage_counts = (
+                global_token_counts.clamp(max=stage_stop) - stage_start
+            ).clamp(min=0)
+        else:
+            stage_counts = (global_token_counts - stage_start).clamp(min=0)
+        if torch.any(stage_counts == 0):
+            raise RuntimeError(
+                "DeepSeek-V4 AFD U2 does not support an empty stage on any DP "
+                f"rank; stage={stage_idx} counts={stage_counts.tolist()}"
+            )
+        metadata[stage_idx] = AFDDPMetadata(
+            num_tokens_across_dp_cpu=stage_counts,
+        )
+    return metadata
 
 
 class AFDNPUAttentionModelRunner(NPUModelRunner):
@@ -143,12 +268,117 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self._afd_transaction_counter = 0
         self._afd_async_moe_ubatch_metadata = None
         self._afd_live_execution = False
+        self._afd_in_mtp_proposal = False
+        self._afd_mtp_phase_announced = False
+        self._afd_mtp_graph_replayed = False
+        self._afd_engine_idle_dummy = False
         self.ubatch_slices = None
-        self.prof = create_afd_npu_profiler("attention")
+        self._afd_unpadded_tokens_across_dp: torch.Tensor | None = None
+        self._afd_request_boundary_stage_counts_across_dp: (
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+            ]
+            | None
+        ) = None
+        self._afd_logged_metadata_stage_counts: set[tuple[int, bool, bool]] = set()
+        self._profiler_rank = rank
+        self.prof = None
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
         return parse_afd_config(vllm_config, expected_role="attention")
+
+    def start_afd_profiler(self) -> None:
+        """Start the Attention profiler on an explicit profile request."""
+        if self.prof is None:
+            self.prof = create_afd_npu_profiler(
+                "attention", role_rank=self._profiler_rank
+            )
+
+    def stop_afd_profiler(self) -> None:
+        stop_afd_npu_profiler(self.prof)
+        self.prof = None
+
+    def _uses_fixed_window_u2(self) -> bool:
+        return bool(
+            getattr(self.connector, "is_window_connector", False)
+            and int(getattr(self.connector, "micro_batch_num", 1)) == 2
+        )
+
+    def _prepare_fixed_window_u2_dummy_padding(
+        self,
+        *,
+        num_tokens: int,
+        num_tokens_padded: int | None,
+        num_reqs: int,
+        num_reqs_padded: int | None,
+    ) -> None:
+        """Make padded Window U2 token/request slots structurally valid."""
+        if (
+            not self._uses_fixed_window_u2()
+            or num_tokens_padded is None
+            or num_reqs_padded is None
+            or num_tokens_padded == num_tokens
+        ):
+            return
+        if num_tokens_padded < num_tokens or num_reqs_padded < num_reqs:
+            raise RuntimeError(
+                "Window U2 padding capacity is smaller than the live batch; "
+                f"tokens={num_tokens}/{num_tokens_padded} "
+                f"requests={num_reqs}/{num_reqs_padded}"
+            )
+
+        num_dummy_tokens = num_tokens_padded - num_tokens
+        num_dummy_reqs = num_reqs_padded - num_reqs
+        if num_dummy_tokens == num_dummy_reqs and num_dummy_reqs > 0:
+            # Window owns both sides of this padding: pair each reserved dummy
+            # request with one dummy token.  The generic Ascend helper cannot
+            # infer this relationship when speculative decode has a uniform
+            # query length greater than one (notably the one-token PD handoff).
+            actual_token_boundary = int(self.query_start_loc.np[num_reqs])
+            if actual_token_boundary != num_tokens:
+                raise RuntimeError(
+                    "Window U2 dummy padding received an invalid live request "
+                    f"boundary: expected {num_tokens}, got "
+                    f"{actual_token_boundary}"
+                )
+            self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = (
+                self.arange_np[1 : num_dummy_reqs + 1] + actual_token_boundary
+            )
+            self.query_start_loc.copy_to_gpu()
+        else:
+            # Eager execution does not enter vLLM-Ascend's Graph/SP-only
+            # padding branch. Reuse its helper for padding shapes that Window
+            # does not own explicitly.
+            padded_reqs = self._pad_query_start_loc_for_fia(
+                self.query_start_loc,
+                num_tokens_padded,
+                num_reqs_padded,
+                num_reqs,
+                CUDAGraphMode.NONE,
+                num_reqs_padded,
+            )
+            if padded_reqs != num_reqs_padded:
+                raise RuntimeError(
+                    "Window U2 dummy padding unexpectedly changed the request "
+                    f"capacity: {num_reqs_padded} -> {padded_reqs}"
+                )
+
+        token_slice = slice(num_tokens, num_tokens_padded)
+        request_slice = slice(num_reqs, num_reqs_padded)
+        self.input_ids.gpu[token_slice].copy_(self.input_ids.gpu[:1])
+        self.positions[token_slice].fill_(127)
+        if self.use_compress:
+            self._dsa_positions_cpu_buf[token_slice].fill_(127)
+
+        # Keep every padded tail slot structurally valid for metadata slicing.
+        # Dummy requests are attention-free below, matching an idle DP rank's
+        # dummy run, while their U2 stages still execute Gate and Window.
+        self.optimistic_seq_lens_cpu[request_slice].fill_(0)
+        self.seq_lens[request_slice].fill_(0)
+        self.input_batch.num_computed_tokens_cpu_tensor[request_slice].fill_(0)
+        self.input_batch.num_prompt_tokens_cpu_tensor[request_slice].fill_(0)
 
     # Patch reason: vLLM-Ascend calls the execution/padding hook without opting
     # into microbatching, and AFD must keep that hook's upstream default intact.
@@ -161,6 +391,20 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         step_afd_npu_profiler(self.prof)
+        stage_diagnostics = bool(
+            getattr(
+                getattr(self, "connector", None),
+                "stage_diagnostics_enabled",
+                False,
+            )
+        )
+        diagnostic_step = int(getattr(self, "_afd_diagnostic_step", 0)) + 1
+        self._afd_diagnostic_step = diagnostic_step
+        if stage_diagnostics:
+            logger.warning(
+                "AFD NPU Attention step progress: step=%s event=execute_begin",
+                diagnostic_step,
+            )
         # ### PATCH START: AFD live execution scope
         self._afd_live_execution = True
         try:
@@ -168,6 +412,36 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         finally:
             self._afd_live_execution = False
         # ### PATCH END: AFD live execution scope
+        if stage_diagnostics:
+            logger.warning(
+                "AFD NPU Attention step progress: step=%s event=execute_returned",
+                diagnostic_step,
+            )
+        return result
+
+    def sample_tokens(
+        self,
+        grammar_output: GrammarOutput | None,
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        stage_diagnostics = bool(
+            getattr(
+                getattr(self, "connector", None),
+                "stage_diagnostics_enabled",
+                False,
+            )
+        )
+        diagnostic_step = int(getattr(self, "_afd_diagnostic_step", 0))
+        if stage_diagnostics:
+            logger.warning(
+                "AFD NPU Attention step progress: step=%s event=sample_begin",
+                diagnostic_step,
+            )
+        result = super().sample_tokens(grammar_output)
+        if stage_diagnostics:
+            logger.warning(
+                "AFD NPU Attention step progress: step=%s event=sample_returned",
+                diagnostic_step,
+            )
         return result
 
     # Upstream source: vllm-ascend commit 80d8c194f,
@@ -204,6 +478,25 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             **model_kwargs,
         }
         run_model = partial(self.model, **model_inputs)
+        # ### PATCH START: synchronized Graph/U2 online cache-miss fallback.
+        # The Attention ubatch wrapper discovers a missing stage-shape key only
+        # after FFN has received the step metadata. Capturing at that point would
+        # put Attention in Graph mode while FFN is already running eager. Only
+        # startup dummy runs may create new U2 graphs; live misses execute the
+        # same layer-major eager path on both roles.
+        if (
+            bool(getattr(self, "_afd_live_execution", False))
+            and isinstance(self.model, AscendUBatchWrapper)
+            and forward_context.ubatch_slices is not None
+            and forward_context.cudagraph_runtime_mode is CUDAGraphMode.FULL
+            and not self.model.has_ubatch_full_graph(forward_context)
+        ):
+            logger.debug(
+                "AFD NPU Attention falling back to eager for uncaptured "
+                "Graph/U2 stage shape"
+            )
+            forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+        # ### PATCH END: synchronized Graph/U2 online cache-miss fallback.
         wrapper_owns_full_graph_update = isinstance(
             self.model, AscendUBatchWrapper
         ) and self.model.owns_full_graph_update(forward_context)
@@ -212,12 +505,68 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             self._update_full_graph_params_if_needed(
                 forward_context,
                 num_tokens_padded,
+                positions,
             )
-        hidden_states = run_model()
+        # ### PATCH START: DSV4 graph-safe IDs side channel
+        # torch_npu lowers dist.send inside a compiled model to an op whose
+        # symbolic shape is incompatible with the pinned runtime. Send once in
+        # the Python runner so every graph replay sees the current IDs while the
+        # model-side layer-0 proxy only launches the hidden-state custom op.
+        connector = getattr(self, "connector", None)
+        uses_hccl_stream_pipeline = bool(
+            isinstance(connector, P2pHcclAFDConnector)
+            and connector.attention_stream_pipeline_ready
+            and self.ubatch_slices is not None
+        )
+        pretransfer_input_ids = bool(
+            connector is not None
+            and getattr(connector, "requires_input_ids", False)
+            and (self.ubatch_slices is None or uses_hccl_stream_pipeline)
+        )
+        if pretransfer_input_ids:
+            if input_ids is None:
+                raise RuntimeError("DSV4 Attention model forward requires input_ids")
+            stage_diagnostics = bool(
+                getattr(connector, "stage_diagnostics_enabled", False)
+            )
+            if stage_diagnostics:
+                logger.warning(
+                    "AFD NPU Attention step progress: step=%s "
+                    "event=input_ids_send_begin stages=%s",
+                    int(getattr(self, "_afd_diagnostic_step", 0)),
+                    len(self.ubatch_slices) if self.ubatch_slices is not None else 1,
+                )
+            if uses_hccl_stream_pipeline:
+                assert self.ubatch_slices is not None
+                for stage_idx, ubatch_slice in enumerate(self.ubatch_slices):
+                    connector.send_input_ids(
+                        input_ids[ubatch_slice.token_slice],
+                        ubatch_idx=stage_idx,
+                    )
+            else:
+                connector.send_input_ids(input_ids, ubatch_idx=0)
+            if stage_diagnostics:
+                logger.warning(
+                    "AFD NPU Attention step progress: step=%s "
+                    "event=input_ids_send_returned",
+                    int(getattr(self, "_afd_diagnostic_step", 0)),
+                )
+        previous_pretransfer = getattr(
+            forward_context,
+            "afd_input_ids_pretransferred",
+            False,
+        )
+        forward_context.afd_input_ids_pretransferred = pretransfer_input_ids
+        try:
+            hidden_states = run_model()
+        finally:
+            forward_context.afd_input_ids_pretransferred = previous_pretransfer
+        # ### PATCH END: DSV4 graph-safe IDs side channel
         if not self.enable_enpu and not wrapper_owns_full_graph_update:
             self._update_full_graph_params_if_needed(
                 forward_context,
                 num_tokens_padded,
+                positions,
             )
 
         # ### PATCH START: AFD defers FlashComm gather to the ubatch wrapper
@@ -253,11 +602,60 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         cascade_attn_prefix_lens: list[list[int]] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         # ### PATCH START: AFD NPU ubatch metadata routing
-        ubatch_slices = _normalize_metadata_ubatch_slices(
-            ubatch_slices,
-            num_tokens_padded,
-            num_reqs_padded,
+        self._prepare_fixed_window_u2_dummy_padding(
+            num_tokens=num_tokens,
+            num_tokens_padded=num_tokens_padded,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
         )
+        if (
+            self._uses_fixed_window_u2()
+            and ubatch_slices is not None
+            and num_tokens_padded is not None
+            and num_reqs_padded is not None
+            and num_tokens_padded != num_tokens
+        ):
+            # Window U2 must derive both token and request slices from the
+            # final padded query layout. Extending only the old token slice can
+            # leave its request slice pointing past the last live request.
+            padded_query_lens = np.diff(
+                self.query_start_loc.np[: num_reqs_padded + 1]
+            ).astype(np.int32, copy=False)
+            ubatch_slices = create_ubatch_slices(
+                padded_query_lens,
+                [num_tokens_padded // 2],
+            )
+        else:
+            ubatch_slices = _normalize_metadata_ubatch_slices(
+                ubatch_slices,
+                num_tokens_padded,
+                num_reqs_padded,
+                pad_token_capacity=self._uses_fixed_window_u2(),
+            )
+        # MTP target verification schedules the target token and its draft
+        # token as one request.  Splitting those two tokens across stages
+        # changes the quantized/sparse-attention kernel shape and can change
+        # exact token results.  Keep every request intact while retaining U2
+        # across independent requests.
+        mtp_request_boundary_u2 = bool(
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and isinstance(self.connector, P2pHcclAFDConnector)
+            and self.vllm_config.parallel_config.num_ubatches == 2
+        )
+        if mtp_request_boundary_u2 and ubatch_slices is not None:
+            if num_scheduled_tokens_np is None:
+                raise RuntimeError(
+                    "DSV4 HCCL MTP U2 requires per-request scheduled token counts"
+                )
+            request_boundary_slices = create_request_boundary_ubatch_slices(
+                num_scheduled_tokens_np,
+            )
+            if request_boundary_slices is None:
+                raise RuntimeError(
+                    "DSV4 HCCL MTP U2 requires at least two non-empty requests"
+                )
+            ubatch_slices = request_boundary_slices
         if self.afd_async_extra_info.async_moe_ubatching:
             self.ubatch_slices = None
             return self._build_attention_metadata_with_async_moe_ubatches(
@@ -430,7 +828,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             return {}, None
         # ### PATCH START: AFD per-ubatch metadata containers
         assert ubatch_slices is not None
-        attn_metadata: list[dict[str, Any]] = [
+        attn_metadata: list[dict[str, Any] | None] = [
             dict() for _ in range(len(ubatch_slices))
         ]
         # ### PATCH END: AFD per-ubatch metadata containers
@@ -445,7 +843,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
         def _get_dcp_metadata(block_table_tensor: torch.Tensor):
-            if not self.use_dcp:
+            if not _uses_legacy_dcp_manager(self):
                 return None, block_table_tensor
 
             fixed_decode_seq_lens_cpu = None
@@ -469,6 +867,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         def _get_block_table_and_slot_mapping(kv_cache_gid: int):
             assert num_reqs_padded is not None and num_tokens_padded is not None
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
+            slot_mapping_cpu = None
             if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
                 blk_table_tensor = torch.zeros(
                     (num_reqs_padded, 1),
@@ -483,6 +882,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             else:
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_padded]
+                slot_mapping_cpu = blk_table.slot_mapping.cpu[:num_tokens_padded]
                 blk_table_tensor = blk_table.get_device_tensor()[:num_reqs_padded]
                 slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
                 blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
@@ -495,9 +895,13 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 self.routed_experts_slot_mapping_device[:num_slots].copy_(
                     slot_mapping,
                 )
-            return blk_table_tensor, slot_mapping
+            return blk_table_tensor, slot_mapping, slot_mapping_cpu
 
-        block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
+        (
+            block_table_gid_0,
+            slot_mapping_gid_0,
+            slot_mapping_cpu_gid_0,
+        ) = _get_block_table_and_slot_mapping(0)
         self.long_seq_metadata, block_table_gid_0 = _get_dcp_metadata(
             block_table_gid_0,
         )
@@ -514,7 +918,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             seq_lens_cpu = None
             num_computed_tokens_cpu = None
 
-        cm_base = AscendCommonAttentionMetadata(
+        common_metadata_kwargs: dict[str, Any] = dict(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
             seq_lens=self.seq_lens[:num_reqs_padded],
@@ -536,11 +940,24 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             positions_cpu=self._dsa_positions_cpu_buf if self.use_compress else None,
             attn_state=self.attn_state,
             decode_token_per_req=self.decode_token_per_req,
-            context_parallel_metadata=self.long_seq_metadata,
-            group_len=self.group_len.gpu[:num_reqs_padded],
-            group_key_idx=self.group_key_idx.gpu[:num_reqs_padded],
-            group_key_cache_idx=self.group_key_cache_idx.gpu[:num_reqs_padded],
         )
+        # ### PATCH START: vllm_cann attention metadata ABI
+        if "slot_mapping_cpu" in _ASCEND_COMMON_METADATA_FIELDS:
+            common_metadata_kwargs["slot_mapping_cpu"] = slot_mapping_cpu_gid_0
+        if "prefill_context_parallel_metadata" in _ASCEND_COMMON_METADATA_FIELDS:
+            common_metadata_kwargs["prefill_context_parallel_metadata"] = (
+                self.long_seq_metadata
+            )
+        elif "context_parallel_metadata" in _ASCEND_COMMON_METADATA_FIELDS:
+            common_metadata_kwargs["context_parallel_metadata"] = self.long_seq_metadata
+        if "group_len" in _ASCEND_COMMON_METADATA_FIELDS:
+            common_metadata_kwargs.update(
+                group_len=self.group_len.gpu[:num_reqs_padded],
+                group_key_idx=self.group_key_idx.gpu[:num_reqs_padded],
+                group_key_cache_idx=self.group_key_cache_idx.gpu[:num_reqs_padded],
+            )
+        # ### PATCH END: vllm_cann attention metadata ABI
+        cm_base = AscendCommonAttentionMetadata(**common_metadata_kwargs)
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)
@@ -552,6 +969,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             kv_cache_gid: int,
             attn_gid: int,
             common_attn_metadata: CommonAttentionMetadata,
+            num_reqs_actual: int,
             prefill_ratio_to_sas_metadata: dict[Any, Any],
             decode_ratio_to_sas_metadata: dict[Any, Any],
             common_ratio_to_sas_metadata: dict[Any, Any],
@@ -584,7 +1002,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     decode_ratio_to_sas_metadata = {}
                     common_ratio_to_sas_metadata = {}
                 extra_attn_metadata_args = dict(
-                    num_reqs_actual=num_reqs,
+                    num_reqs_actual=num_reqs_actual,
                     prefill_ratio_to_sas_metadata=prefill_ratio_to_sas_metadata,
                     decode_ratio_to_sas_metadata=decode_ratio_to_sas_metadata,
                     common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
@@ -622,6 +1040,21 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 decode_ratio_to_sas_metadata = builder.decode_ratio_to_sas_metadata
                 common_ratio_to_sas_metadata = builder.common_ratio_to_sas_metadata
 
+                # ### PATCH START: DSV4 stage-local decode RoPE
+                assert ubid is not None
+                stage_rope = isolate_dsa_rope_metadata(
+                    attn_metadata_i,
+                    dsa_rope_by_ubatch[ubid],
+                )
+                if stage_rope is not None:
+                    dsa_rope_by_ubatch[ubid] = stage_rope
+                    common_ratio_to_sas_metadata["cos"] = stage_rope[0]
+                    common_ratio_to_sas_metadata["sin"] = stage_rope[1]
+                    assert attn_metadata_i.decode is not None
+                    decode_ratio_to_sas_metadata["cos"] = attn_metadata_i.decode.cos
+                    decode_ratio_to_sas_metadata["sin"] = attn_metadata_i.decode.sin
+                # ### PATCH END: DSV4 stage-local decode RoPE
+
             # ### PATCH START: AFD per-ubatch metadata assignment
             assert ubid is not None
             attn_metadata_dict = attn_metadata[ubid]
@@ -629,9 +1062,13 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 attn_metadata_dict[layer_name] = attn_metadata_i
             # ### PATCH END: AFD per-ubatch metadata assignment
 
-        prefill_ratio_to_sas_metadata: dict[Any, Any] = {}
-        decode_ratio_to_sas_metadata: dict[Any, Any] = {}
-        common_ratio_to_sas_metadata: dict[Any, Any] = {}
+        # DSA builders intentionally share these caches across attention groups
+        # with different compressor ratios.  Sharing them across ubatches is
+        # invalid because request counts and block tables differ per stage.
+        dsa_ratio_metadata_by_ubatch = _new_ubatch_dsa_ratio_metadata(
+            len(ubatch_slices),
+        )
+        dsa_rope_by_ubatch: list[DSARopePair | None] = [None for _ in ubatch_slices]
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(
             self.kv_cache_config.kv_cache_groups,
@@ -653,14 +1090,18 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                         : num_reqs_padded + 1
                     ]
             if kv_cache_gid > 0:
-                cm.block_table_tensor, cm.slot_mapping = (
-                    _get_block_table_and_slot_mapping(
-                        kv_cache_gid,
-                    )
+                (
+                    cm.block_table_tensor,
+                    cm.slot_mapping,
+                    slot_mapping_cpu,
+                ) = _get_block_table_and_slot_mapping(
+                    kv_cache_gid,
                 )
+                if "slot_mapping_cpu" in _ASCEND_COMMON_METADATA_FIELDS:
+                    cm.slot_mapping_cpu = slot_mapping_cpu
             if self.speculative_config and isinstance(
                 self.drafter,
-                AscendStep3p5MTPProposer | AscendDSparkProposer,
+                AscendStep3p5MTPProposer,
             ):
                 self.drafter.set_per_group_attn_metadata(
                     kv_cache_gid,
@@ -668,12 +1109,14 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     cm.slot_mapping,
                 )
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(
+                if isinstance(self.drafter, AscendDSparkProposer):
+                    if self.drafter.kv_cache_gid == kv_cache_gid:
+                        spec_decode_common_attn_metadata = cm
+                elif isinstance(
                     self.drafter,
                     AscendEagleProposer
                     | AscendDraftModelProposer
-                    | AscendDflashProposer
-                    | AscendDSparkProposer,
+                    | AscendDflashProposer,
                 ):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
@@ -687,10 +1130,33 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     num_tokens_padded,
                 )
                 for ubid, ubatch_cm in enumerate(ubatch_common_metadata):
+                    ubatch_slice = ubatch_slices[ubid]
+                    num_reqs_actual = _num_actual_requests_for_ubatch(
+                        ubatch_slice.request_slice,
+                        num_reqs,
+                    )
+                    token_start = min(
+                        int(ubatch_slice.token_slice.start),
+                        num_tokens,
+                    )
+                    token_stop = min(int(ubatch_slice.token_slice.stop), num_tokens)
+                    num_tokens_actual = max(token_stop - token_start, 0)
+                    if self._uses_fixed_window_u2() and num_tokens_actual == 0:
+                        # DSA treats stage-level attn_metadata=None as a dummy
+                        # run and returns zero Attention output.  The rest of
+                        # the model still advances protocol-only Window slot 1.
+                        attn_metadata[ubid] = None
+                        continue
+                    (
+                        prefill_ratio_to_sas_metadata,
+                        decode_ratio_to_sas_metadata,
+                        common_ratio_to_sas_metadata,
+                    ) = dsa_ratio_metadata_by_ubatch[ubid]
                     _build_attn_group_metadata(
                         kv_cache_gid,
                         attn_gid,
                         ubatch_cm,
+                        num_reqs_actual,
                         prefill_ratio_to_sas_metadata,
                         decode_ratio_to_sas_metadata,
                         common_ratio_to_sas_metadata,
@@ -780,10 +1246,19 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         previous = self._afd_is_graph_capturing
         self._afd_is_graph_capturing = bool(is_graph_capturing)
+        fixed_window_u2 = self._uses_fixed_window_u2()
+        previous_engine_idle_dummy = self._afd_engine_idle_dummy
+        self._afd_engine_idle_dummy = bool(
+            fixed_window_u2
+            and cudagraph_runtime_mode is None
+            and uniform_decode
+            and not is_profile
+            and not is_graph_capturing
+            and not self._is_warmup
+        )
         if not (
             bool(self.vllm_config.parallel_config.use_ubatching)
-            and allow_microbatching
-            and not is_profile
+            and (fixed_window_u2 or (allow_microbatching and not is_profile))
         ):
             try:
                 return super()._dummy_run(
@@ -804,6 +1279,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 )
             finally:
                 self._afd_is_graph_capturing = previous
+                self._afd_engine_idle_dummy = previous_engine_idle_dummy
                 self._afd_pending_metadata = None
                 self._afd_async_moe_ubatch_metadata = None
 
@@ -826,6 +1302,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             )
         finally:
             self._afd_is_graph_capturing = previous
+            self._afd_engine_idle_dummy = previous_engine_idle_dummy
             self._afd_pending_metadata = None
             self._afd_async_moe_ubatch_metadata = None
 
@@ -911,6 +1388,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         previous_metadata = self._afd_pending_metadata
         previous_suppress_send = self._afd_suppress_metadata_send
         previous_is_graph_capturing = self._afd_is_graph_capturing
+        eager_drafter = None
         try:
             self._afd_is_graph_capturing = True
             if allow_microbatching:
@@ -934,6 +1412,23 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     f"capture_{desc.num_tokens}_{cudagraph_runtime_mode.name}",
                 ),
             ):
+                # ### PATCH START: target-only capture with an eager MTP draft.
+                # Upstream commits 0fc695fc/3da28f94 run the target and drafter
+                # from the same dummy call. In AFD they live in separate
+                # services: a blocking eager HCCL draft exchange cannot cross
+                # the target graph context boundary. The eager draft has no
+                # graph to capture, so omit only that capture-time dummy call;
+                # warmup and live inference still execute the complete draft.
+                speculative_config = getattr(self, "speculative_config", None)
+                if (
+                    getattr(self, "drafter", None) is not None
+                    and speculative_config is not None
+                    and getattr(speculative_config, "method", None) == "mtp"
+                    and bool(getattr(speculative_config, "enforce_eager", False))
+                    and not isinstance(self.drafter, AscendDSparkProposer)
+                ):
+                    eager_drafter = self.drafter
+                    self.drafter = None
                 self._dummy_run(
                     desc.num_tokens,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -946,6 +1441,9 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     profile_seq_lens=profile_seq_lens,
                 )
         finally:
+            if eager_drafter is not None:
+                self.drafter = eager_drafter
+                # ### PATCH END: target-only capture with an eager MTP draft.
             self._afd_is_graph_capturing = previous_is_graph_capturing
             self._afd_suppress_metadata_send = previous_suppress_send
             self._afd_pending_metadata = previous_metadata
@@ -1025,13 +1523,14 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             allow_microbatching=allow_microbatching,
             force_eager=is_profile
             or (cudagraph_runtime_mode == CUDAGraphMode.NONE)
+            or self._afd_engine_idle_dummy
             or profile_cpp,
             force_uniform_decode=uniform_decode,
             force_has_lora=num_active_loras > 0,
             force_num_active_loras=num_active_loras,
         )
         # ### PATCH END: AFD dummy ubatch decision
-        if self.use_dcp:
+        if _uses_legacy_dcp_manager(self):
             self.dcp_manager.init_batch_info(
                 num_scheduled_tokens,
                 num_reqs,
@@ -1332,16 +1831,20 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         if forward_context.additional_kwargs is None:
             forward_context.additional_kwargs = {}
         forward_context.additional_kwargs["afd_metadata"] = self._afd_pending_metadata
-        if self.connector.control_plane is None:
-            return
-        if self._afd_suppress_metadata_send:
-            return
         dp_metadata = forward_context.dp_metadata
         ubatch_slices = forward_context.ubatch_slices
         padded_graph_tokens = _full_cudagraph_padded_tokens(forward_context)
         if padded_graph_tokens is not None and not ubatch_slices:
             dp_metadata = self._build_capture_dp_metadata(padded_graph_tokens)
-        self._send_dp_metadata(dp_metadata, ubatch_slices)
+        if self.connector.control_plane is None:
+            return
+        if getattr(self, "_afd_suppress_metadata_send", False):
+            return
+        self._send_dp_metadata(
+            dp_metadata,
+            ubatch_slices,
+            target_graph_replay=padded_graph_tokens is not None,
+        )
 
     def _install_async_moe_ubatch_metadata_on_forward_context(
         self,
@@ -1359,18 +1862,59 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self,
         dp_metadata: DPMetadata | AFDDPMetadata | None,
         ubatch_slices: UBatchSlices | None,
+        *,
+        target_graph_replay: bool | None = None,
     ) -> None:
         assert self.connector.control_plane is not None, (
             "_send_dp_metadata needs control plane driven connectors"
         )
 
         if ubatch_slices and len(ubatch_slices) > 1:
-            dp_metadata_list = {
-                idx: metadata
-                for idx, metadata in enumerate(
-                    build_ubatch_dp_metadata_list(self.vllm_config, ubatch_slices),
+            request_boundary_counts = getattr(
+                self,
+                "_afd_request_boundary_stage_counts_across_dp",
+                None,
+            )
+            if request_boundary_counts is not None:
+                dp_rank = int(self.vllm_config.parallel_config.data_parallel_rank)
+                for stage_idx, (ubatch_slice, stage_counts) in enumerate(
+                    zip(
+                        ubatch_slices,
+                        request_boundary_counts,
+                        strict=True,
+                    )
+                ):
+                    local_expected = int(stage_counts[dp_rank].item())
+                    if int(ubatch_slice.num_tokens) != local_expected:
+                        raise RuntimeError(
+                            "DSV4 HCCL MTP U2 request-boundary metadata mismatch: "
+                            f"stage={stage_idx} local={int(ubatch_slice.num_tokens)} "
+                            f"synced={local_expected}"
+                        )
+                dp_metadata_list = {
+                    stage_idx: AFDDPMetadata(
+                        num_tokens_across_dp_cpu=stage_counts,
+                    )
+                    for stage_idx, stage_counts in enumerate(request_boundary_counts)
+                }
+            else:
+                unpadded_counts = getattr(
+                    self,
+                    "_afd_unpadded_tokens_across_dp",
+                    None,
                 )
-            }
+                control_metadata = (
+                    AFDDPMetadata(num_tokens_across_dp_cpu=unpadded_counts)
+                    if unpadded_counts is not None
+                    else dp_metadata
+                )
+                dp_metadata_list = _build_ubatch_control_metadata(
+                    control_metadata,
+                    ubatch_slices,
+                    dp_size=int(
+                        self.vllm_config.parallel_config.data_parallel_size,
+                    ),
+                )
         else:
             dp_metadata = self._ensure_dp_metadata(dp_metadata)
             dp_metadata_list = {0: dp_metadata}
@@ -1380,16 +1924,55 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             dp_metadata_list=dp_metadata_list,
             is_graph_capturing=is_graph_capturing,
             is_warmup=is_warmup,
+            tensor_parallel_size=int(
+                getattr(
+                    self.vllm_config.parallel_config,
+                    "tensor_parallel_size",
+                    1,
+                ),
+            ),
+            mtp_phase_control_enabled=bool(
+                getattr(self, "_afd_live_execution", False)
+                or getattr(self, "_afd_live_dummy_execution", False),
+            ),
+            target_graph_replay=target_graph_replay,
         )
         self.connector.control_plane.update_state_from_dp_metadata(payload)
-        logger.warning(
-            "AFD NPU Attention send_dp_metadata decision; world_rank=%d "
-            "key=%s is_graph_capturing=%s is_warmup=%s",
-            self.connector.world_rank,
-            _dp_metadata_debug_key(dp_metadata_list),
-            is_graph_capturing,
-            is_warmup,
+        stage_count = len(dp_metadata_list)
+        logged_stage_counts = getattr(
+            self,
+            "_afd_logged_metadata_stage_counts",
+            set(),
         )
+        log_signature = (stage_count, is_graph_capturing, is_warmup)
+        debug_key = None
+        if log_signature not in logged_stage_counts:
+            debug_key = _dp_metadata_debug_key(dp_metadata_list)
+            logger.warning(
+                "AFD NPU Attention send_dp_metadata decision; world_rank=%d "
+                "stage_count=%d key=%s is_graph_capturing=%s is_warmup=%s",
+                self.connector.world_rank,
+                stage_count,
+                debug_key,
+                is_graph_capturing,
+                is_warmup,
+            )
+            # Capture, warmup and live requests can use the same number of
+            # stages. Keep one marker for each context so deployment tooling
+            # can prove that U2 reached real online execution.
+            logged_stage_counts.add(log_signature)
+            self._afd_logged_metadata_stage_counts = logged_stage_counts
+        if logger.isEnabledFor(logging.DEBUG):
+            debug_key = debug_key or _dp_metadata_debug_key(dp_metadata_list)
+            logger.debug(
+                "AFD NPU Attention send_dp_metadata decision; world_rank=%d "
+                "stage_count=%d key=%s is_graph_capturing=%s is_warmup=%s",
+                self.connector.world_rank,
+                stage_count,
+                debug_key,
+                is_graph_capturing,
+                is_warmup,
+            )
         self.connector.control_plane.send_dp_metadata_list(payload)
 
     def _ensure_dp_metadata(
@@ -1414,8 +1997,149 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
 
     def load_model(self) -> None:
         super().load_model()
+        if self.speculative_config is not None:
+            if self.speculative_config.method != "mtp" or self.drafter is None:
+                raise RuntimeError("DSV4 AFD supports only an initialized MTP drafter")
+            if isinstance(self.drafter, AscendDSparkProposer):
+                logger.info(
+                    "DeepSeek-V4 AFD keeps the complete DSpark draft model "
+                    "on the Attention worker"
+                )
+            else:
+                draft_model = self.drafter.get_model()
+                attach_connector = getattr(draft_model, "attach_afd_connector", None)
+                if not callable(attach_connector):
+                    raise RuntimeError("DSV4 AFD MTP draft model is not role-aware")
+                attach_connector(self.connector)
+                self._configure_mtp_draft_graph()
         if bool(self.vllm_config.parallel_config.use_ubatching):
             self._install_ascend_ubatch_wrapper()
+
+    def _configure_mtp_draft_graph(self) -> None:
+        if self.speculative_config is None:
+            return
+        draft_runnable = self.drafter._runnable
+        draft_enforce_eager = self.speculative_config.enforce_eager
+        if not draft_enforce_eager:
+            if not isinstance(draft_runnable, ACLGraphWrapper):
+                raise RuntimeError(
+                    "DSV4 AFD full draft Graph requires an ACLGraphWrapper",
+                )
+            # Upstream exempts Eagle graphs from pre-replay synchronization.
+            # Remote FFN graph updates require the previous HCCL to finish.
+            draft_runnable.use_eagle = False
+        # ### PATCH START: synchronize AFD draft graph replay.
+        # Both eager and graph drafts must announce the phase before any data
+        # transfers; FFN waits for that control message after target execution.
+        self.drafter._runnable = _AFDMTPPhaseAwareRunnable(
+            draft_runnable,
+            (
+                (lambda _runnable: self._announce_live_mtp_phase(None))
+                if draft_enforce_eager
+                else self._announce_live_mtp_phase
+            ),
+        )
+        # ### PATCH END: synchronize AFD draft graph replay.
+
+    def _announce_live_mtp_phase(
+        self,
+        draft_runnable: ACLGraphWrapper | None,
+    ) -> CUDAGraphMode | None:
+        # Idle DP ranks draft through dummy_run rather than propose_draft_token_ids.
+        # They must release their FFN peers before the shared MoE collective;
+        # the worker sets the dummy flag only for online execution.
+        if not (
+            bool(getattr(self, "_afd_in_mtp_proposal", False))
+            or bool(getattr(self, "_afd_live_dummy_execution", False))
+        ):
+            return None
+        forward_context = get_forward_context()
+        if isinstance(self.connector, P2pHcclAFDConnector):
+            draft_dp_metadata = forward_context.dp_metadata
+            if draft_dp_metadata is None:
+                draft_dp_metadata = _make_uniform_dp_metadata(
+                    self.dp_size,
+                    forward_context.num_tokens,
+                )
+            self.connector.prepare_mtp_header_for_graph({0: draft_dp_metadata})
+        runtime_mode = forward_context.cudagraph_runtime_mode
+        graph_requested = (
+            draft_runnable is not None
+            and runtime_mode != CUDAGraphMode.NONE
+            and runtime_mode.has_mode(draft_runnable.runtime_mode)
+        )
+        graph_entry = (
+            draft_runnable.concrete_aclgraph_entries.get(
+                forward_context.batch_descriptor,
+            )
+            if graph_requested
+            else None
+        )
+        graph_replay = bool(
+            graph_entry is not None and graph_entry.aclgraph is not None,
+        )
+        restore_runtime_mode = None
+        if graph_requested and not graph_replay:
+            # Dynamic live capture cannot be paired atomically with the remote
+            # FFN process. Fall back to eager on both roles for this descriptor.
+            restore_runtime_mode = runtime_mode
+            forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+        control_plane = self.connector.control_plane
+        send_phase_ready = getattr(control_plane, "send_mtp_phase_ready", None)
+        if not callable(send_phase_ready):
+            raise RuntimeError(
+                "DSV4 AFD MTP requires an explicit phase-aware control plane",
+            )
+        send_phase_ready(graph_replay=graph_replay)
+        self._afd_mtp_phase_announced = True
+        self._afd_mtp_graph_replayed = graph_replay
+        return restore_runtime_mode
+
+    # Upstream source: vLLM-Ascend commit 3da28f94,
+    # NPUModelRunner.propose_draft_token_ids.
+    # ### PATCH START: announce only draft phases that actually execute.
+    def propose_draft_token_ids(
+        self,
+        valid_sampled_token_ids: torch.Tensor | list[list[int]],
+        sampling_metadata: SamplingMetadata,
+        scheduler_output: SchedulerOutput,
+        spec_decode_metadata: SpecDecodeMetadata,
+        spec_decode_common_attn_metadata: AscendCommonAttentionMetadata,
+        positions: torch.Tensor,
+        num_scheduled_tokens: int,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: torch.Tensor | None = None,
+        sample_hidden_states: torch.Tensor | None = None,
+        target_model_batch_desc: BatchDescriptor | None = None,
+    ) -> list[list[int]] | None:
+        """Wait for live full-Graph draft HCCL before the next target step."""
+        self._afd_mtp_phase_announced = False
+        self._afd_mtp_graph_replayed = False
+        self._afd_in_mtp_proposal = True
+        try:
+            draft_token_ids = super().propose_draft_token_ids(
+                valid_sampled_token_ids,
+                sampling_metadata,
+                scheduler_output,
+                spec_decode_metadata,
+                spec_decode_common_attn_metadata,
+                positions,
+                num_scheduled_tokens,
+                hidden_states,
+                aux_hidden_states,
+                sample_hidden_states,
+                target_model_batch_desc,
+            )
+        finally:
+            self._afd_in_mtp_proposal = False
+        # A FULL draft graph enqueues its captured HCCL transfers asynchronously.
+        # If the following target step misses its graph and runs eager, its IDs
+        # can otherwise overtake the preceding draft header on the IDs group.
+        if self._afd_mtp_phase_announced and self._afd_mtp_graph_replayed:
+            torch.npu.current_stream().synchronize()
+        return draft_token_ids
+
+    # ### PATCH END: announce only draft phases that actually execute.
 
     def _install_ascend_ubatch_wrapper(self) -> None:
         if isinstance(self.model, AscendUBatchWrapper):
@@ -1427,16 +2151,41 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             runtime_mode = CUDAGraphMode.FULL
         elif self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             runtime_mode = CUDAGraphMode.FULL
+        connector = getattr(self, "connector", None)
+        enable_layer_major_eager_u2 = bool(
+            (
+                (
+                    isinstance(connector, P2pHcclAFDConnector)
+                    and connector.stream_overlap_enabled
+                )
+                or (
+                    getattr(connector, "is_window_connector", False)
+                    and connector.extra_info.micro_batch_num == 2
+                )
+            )
+            and callable(
+                getattr(model, "forward_ubatches_layer_major", None),
+            )
+        )
+        model_config = self.vllm_config.model_config
+        uses_sparse_attention = bool(
+            getattr(self, "use_sparse", False)
+            or hasattr(getattr(model_config, "hf_text_config", None), "index_topk")
+            or hasattr(getattr(model_config, "hf_config", None), "index_topk")
+        )
         self.model = AscendUBatchWrapper(
             model,
             self.vllm_config,
             runtime_mode,
             self.device,
             mla_full_graph_enabled=(
-                self.vllm_config.model_config.use_mla and not self.use_sparse
+                model_config.use_mla
+                and not uses_sparse_attention
+                and not getattr(self, "use_compress", False)
             ),
             full_graph_params_updater=self._update_full_graph_params_if_needed,
             enable_enpu=self.enable_enpu,
+            enable_layer_major_eager_u2=enable_layer_major_eager_u2,
         )
 
     def get_model(self) -> nn.Module:
@@ -1444,7 +2193,10 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             return self.model.unwrap()
         return super().get_model()
 
-    def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
+    def initialize_attn_backend(
+        self,
+        kv_cache_config: KVCacheConfig,
+    ) -> None:
         super().initialize_attn_backend(kv_cache_config)
         if (
             bool(
@@ -1455,6 +2207,13 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             self._ensure_two_metadata_builders()
 
     def _ensure_two_metadata_builders(self) -> None:
+        if self.use_compress:
+            # vLLM configures its own logger tree, while afd_plugin can inherit
+            # the root WARNING level. Keep this one-time audit marker visible.
+            logger.warning(
+                "AFD DSA U2 RoPE isolation active: stage-local snapshots "
+                "and in-place graph replay refresh",
+            )
         for attn_groups in self.attn_groups:
             for attn_group in attn_groups:
                 if len(attn_group.metadata_builders) >= 2:
@@ -1465,6 +2224,24 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     num_metadata_builders=2,
                 )
 
+    def _apply_local_request_boundary_gate(
+        self,
+        should_ubatch: bool,
+        *,
+        num_tokens: int,
+        stage0_tokens: int | None,
+    ) -> bool:
+        if stage0_tokens is None:
+            return should_ubatch
+        stage1_tokens = num_tokens - stage0_tokens
+        should_ubatch = bool(should_ubatch and stage0_tokens > 0 and stage1_tokens > 0)
+        if should_ubatch:
+            self._afd_request_boundary_stage_counts_across_dp = (
+                torch.full((self.dp_size,), stage0_tokens, dtype=torch.int32),
+                torch.full((self.dp_size,), stage1_tokens, dtype=torch.int32),
+            )
+        return should_ubatch
+
     def _sync_afd_metadata_across_dp(
         self,
         num_tokens_unpadded: int,
@@ -1473,22 +2250,42 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         is_draft_model: bool = False,
         cudagraph_mode: CUDAGraphMode | None = None,
         allow_dp_padding: bool = False,
+        request_boundary_stage0_tokens: int | None = None,
     ) -> tuple[bool, int, torch.Tensor | None, CUDAGraphMode]:
+        self._afd_unpadded_tokens_across_dp = None
+        self._afd_request_boundary_stage_counts_across_dp = None
         if cudagraph_mode is None:
             cudagraph_mode = CUDAGraphMode.NONE
         if num_tokens_padded is None:
             num_tokens_padded = num_tokens_unpadded
 
         if self.dp_size == 1:
+            self._afd_unpadded_tokens_across_dp = torch.tensor(
+                [num_tokens_unpadded],
+                dtype=torch.int32,
+                device="cpu",
+            )
             should_ubatch = check_enable_ubatch(
                 num_tokens_unpadded,
                 num_tokens_padded,
                 uniform_decode=uniform_decode,
                 vllm_config=self.vllm_config,
             )
+            should_ubatch = self._apply_local_request_boundary_gate(
+                should_ubatch,
+                num_tokens=num_tokens_unpadded,
+                stage0_tokens=request_boundary_stage0_tokens,
+            )
             return should_ubatch, num_tokens_padded, None, cudagraph_mode
 
-        if self.connector.control_plane is None:
+        if self.connector.control_plane is None and not bool(
+            getattr(self.connector, "requires_lockstep_dp_sync", False)
+        ):
+            self._afd_unpadded_tokens_across_dp = torch.tensor(
+                [num_tokens_unpadded] * self.dp_size,
+                dtype=torch.int32,
+                device="cpu",
+            )
             num_tokens_after_padding = torch.tensor(
                 [num_tokens_padded] * self.dp_size,
                 device="cpu",
@@ -1499,6 +2296,11 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 num_tokens_padded,
                 uniform_decode=uniform_decode,
                 vllm_config=self.vllm_config,
+            )
+            should_ubatch = self._apply_local_request_boundary_gate(
+                should_ubatch,
+                num_tokens=num_tokens_unpadded,
+                stage0_tokens=request_boundary_stage0_tokens,
             )
             return (
                 should_ubatch,
@@ -1514,6 +2316,11 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         )
         may_ubatch = bool(parallel_config.enable_dbo and parallel_config.use_ubatching)
         if can_skip_dp_sync and not may_ubatch:
+            self._afd_unpadded_tokens_across_dp = torch.tensor(
+                [num_tokens_unpadded] * self.dp_size,
+                dtype=torch.int32,
+                device="cpu",
+            )
             num_tokens_after_padding = torch.tensor(
                 [num_tokens_padded] * self.dp_size,
                 device="cpu",
@@ -1525,32 +2332,77 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 uniform_decode=uniform_decode,
                 vllm_config=self.vllm_config,
             )
+            should_ubatch = self._apply_local_request_boundary_gate(
+                should_ubatch,
+                num_tokens=num_tokens_unpadded,
+                stage0_tokens=request_boundary_stage0_tokens,
+            )
             return (
                 should_ubatch,
                 num_tokens_padded,
                 num_tokens_after_padding,
                 cudagraph_mode,
             )
-        packed_tensor = torch.zeros(3, self.dp_size, device="cpu", dtype=torch.int32)
+        packed_tensor = torch.zeros(6, self.dp_size, device="cpu", dtype=torch.int32)
         packed_tensor[0][self.dp_rank] = num_tokens_unpadded
         packed_tensor[1][self.dp_rank] = num_tokens_padded
         packed_tensor[2][self.dp_rank] = cudagraph_mode.value
+        # A mixed prefill/decode rank must make every EP peer use the prefill
+        # threshold so all ranks execute the same number of FFN stages.
+        packed_tensor[3][self.dp_rank] = int(uniform_decode)
+        packed_tensor[4][self.dp_rank] = int(request_boundary_stage0_tokens or 0)
+        packed_tensor[5][self.dp_rank] = int(self._afd_engine_idle_dummy)
         dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
 
         num_tokens_unpadded_across_dp = packed_tensor[0, :]
+        self._afd_unpadded_tokens_across_dp = (
+            num_tokens_unpadded_across_dp.cpu().clone()
+        )
         num_tokens_padded_across_dp = packed_tensor[1, :]
         max_tokens_across_dp = int(num_tokens_padded_across_dp.max().item())
         min_tokens_across_dp = int(num_tokens_unpadded_across_dp.min().item())
-        synced_cudagraph_mode = CUDAGraphMode(int(packed_tensor[-1, :].min().item()))
+        has_engine_idle_dummy = bool(packed_tensor[5, :].max().item())
+        window_async = bool(
+            getattr(self.connector, "is_window_connector", False)
+            and getattr(self.connector, "async_mode", False)
+        )
+        synced_cudagraph_mode = (
+            cudagraph_mode
+            if window_async and has_engine_idle_dummy
+            else CUDAGraphMode(int(packed_tensor[2, :].min().item()))
+        )
+        synced_uniform_decode = bool(packed_tensor[3, :].min().item())
+        request_boundary_ready = True
+        if request_boundary_stage0_tokens is not None:
+            stage0_counts = packed_tensor[4, :].cpu().clone()
+            stage1_counts = num_tokens_unpadded_across_dp.cpu() - stage0_counts
+            request_boundary_ready = bool(
+                torch.all(stage0_counts > 0).item()
+                and torch.all(stage1_counts > 0).item()
+            )
 
         should_ubatch = check_enable_ubatch(
             min_tokens_across_dp,
             max_tokens_across_dp,
-            uniform_decode=uniform_decode,
+            uniform_decode=synced_uniform_decode,
             vllm_config=self.vllm_config,
         )
+        should_ubatch = should_ubatch and request_boundary_ready
+        if should_ubatch and request_boundary_stage0_tokens is not None:
+            self._afd_request_boundary_stage_counts_across_dp = (
+                stage0_counts,
+                stage1_counts,
+            )
 
-        if allow_dp_padding or is_draft_model or should_ubatch:
+        # P2P peers must derive graph padding from the synchronized mode. A
+        # live prefill rank can select NONE while idle ranks select FULL; using
+        # those local modes gives FFN peers incompatible collective layouts.
+        if (
+            (not window_async and synced_cudagraph_mode != CUDAGraphMode.NONE)
+            or allow_dp_padding
+            or is_draft_model
+            or should_ubatch
+        ):
             num_tokens_after_padding = torch.tensor(
                 [max_tokens_across_dp] * self.dp_size,
                 device="cpu",
@@ -1594,6 +2446,14 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         CUDAGraphStat | None,
     ]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
+        fixed_window_u2 = self._uses_fixed_window_u2()
+        if fixed_window_u2:
+            # Window M=2 is a communication protocol, not an optional DBO
+            # optimization. Keep both Window slots active even for a
+            # single-token dummy or live step. Do not force eager here: the
+            # dispatcher must retain FULL during ACLGraph warmup/capture, while
+            # an enforce-eager launch already reaches this method with NONE.
+            num_tokens_padded = max(num_tokens_padded, 2)
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
         uniform_decode = (
             (
@@ -1644,6 +2504,28 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             )
 
         should_ubatch, num_tokens_across_dp = False, None
+        mtp_request_boundary_u2 = bool(
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and isinstance(self.connector, P2pHcclAFDConnector)
+            and self.vllm_config.parallel_config.num_ubatches == 2
+        )
+        request_boundary_slices = (
+            create_request_boundary_ubatch_slices(num_scheduled_tokens_np)
+            if mtp_request_boundary_u2
+            else None
+        )
+        request_boundary_stage0_tokens = (
+            int(request_boundary_slices[0].num_tokens)
+            if request_boundary_slices is not None
+            else (0 if mtp_request_boundary_u2 else None)
+        )
+        # Window async keeps its rank-local graph policy. P2P must defer graph
+        # padding until after the DP graph mode has been synchronized.
+        window_local_graph_padding = bool(
+            getattr(self.connector, "is_window_connector", False)
+            and cudagraph_mode != CUDAGraphMode.NONE
+        )
         # ### PATCH START: AFD DP metadata synchronization
         if self.vllm_config.parallel_config.data_parallel_size > 1:
             should_ubatch, _, num_tokens_across_dp, synced_cudagraph_mode = (
@@ -1652,10 +2534,11 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     num_tokens_padded=num_tokens_padded,
                     uniform_decode=uniform_decode,
                     cudagraph_mode=cudagraph_mode,
-                    allow_dp_padding=(cudagraph_mode != CUDAGraphMode.NONE)
+                    allow_dp_padding=window_local_graph_padding
                     or enable_sp(self.vllm_config)
                     or oproj_tp_enable()
                     or embedding_tp_enable(),
+                    request_boundary_stage0_tokens=request_boundary_stage0_tokens,
                 )
             )
             if num_tokens_across_dp is not None:
@@ -1673,9 +2556,29 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 uniform_decode=uniform_decode,
                 vllm_config=self.vllm_config,
             )
+            if mtp_request_boundary_u2:
+                stage0_tokens = int(request_boundary_stage0_tokens or 0)
+                should_ubatch = self._apply_local_request_boundary_gate(
+                    should_ubatch,
+                    num_tokens=num_tokens,
+                    stage0_tokens=stage0_tokens,
+                )
         # ### PATCH END: AFD DP metadata synchronization
         # ### PATCH START: AFD live NPU microbatching
-        if not (allow_microbatching or self._afd_live_execution):
+        if fixed_window_u2:
+            should_ubatch = True
+            padded_reqs = int(batch_descriptor.num_reqs or num_reqs)
+            if num_tokens < 2:
+                padded_reqs = max(padded_reqs, 2)
+            batch_descriptor = replace(
+                batch_descriptor,
+                num_tokens=max(int(batch_descriptor.num_tokens), 2),
+                num_reqs=padded_reqs,
+            )
+            num_tokens_padded = int(batch_descriptor.num_tokens)
+            if num_tokens_across_dp is not None:
+                num_tokens_across_dp = num_tokens_across_dp.clamp_min(2)
+        elif not (allow_microbatching or self._afd_live_execution):
             should_ubatch = False
         # ### PATCH END: AFD live NPU microbatching
 
@@ -1756,7 +2659,24 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         return result
 
     def shutdown(self) -> None:
-        stop_afd_npu_profiler(self.prof)
+        self.stop_afd_profiler()
+        control_plane = self.connector.control_plane
+        if control_plane is not None:
+            try:
+                control_plane.send_dp_metadata_list(
+                    AFDControlPayload(
+                        dp_metadata_list={},
+                        is_graph_capturing=False,
+                        is_warmup=False,
+                        shutdown=True,
+                    )
+                )
+            except Exception:
+                # A peer that has already exited must not prevent local cleanup.
+                logger.debug(
+                    "AFD NPU Attention could not send FFN shutdown payload",
+                    exc_info=True,
+                )
         self.connector.close()
         super().shutdown()
 
@@ -1781,9 +2701,10 @@ def _dp_metadata_debug_key(
 ) -> tuple[tuple[int, tuple]]:
     key_parts: list[tuple[int, tuple]] = []
     for stage_idx, metadata in sorted(dp_metadata_list.items()):
-        values_tuple = tuple(
-            int(value) for value in metadata.num_tokens_across_dp_cpu.tolist()
-        )
+        values = metadata.num_tokens_across_dp_cpu
+        if hasattr(values, "tolist"):
+            values = values.tolist()
+        values_tuple = tuple(int(value) for value in values)
         key_parts.append((int(stage_idx), values_tuple))
     return tuple(key_parts)
 
@@ -1792,6 +2713,8 @@ def _normalize_metadata_ubatch_slices(
     ubatch_slices: UBatchSlices | None,
     num_tokens_padded: int | None,
     num_reqs_padded: int | None,
+    *,
+    pad_token_capacity: bool = False,
 ) -> UBatchSlices | None:
     if not ubatch_slices:
         return ubatch_slices
@@ -1799,9 +2722,14 @@ def _normalize_metadata_ubatch_slices(
         return ubatch_slices
 
     last_slice = ubatch_slices[-1]
-    if int(last_slice.token_slice.stop) != int(num_tokens_padded) or int(
+    if int(last_slice.token_slice.stop) == int(num_tokens_padded) and int(
         last_slice.request_slice.stop
     ) == int(num_reqs_padded):
+        return ubatch_slices
+    if (
+        int(last_slice.token_slice.stop) != int(num_tokens_padded)
+        and not pad_token_capacity
+    ):
         return ubatch_slices
 
     return pad_out_ubatch_slices(

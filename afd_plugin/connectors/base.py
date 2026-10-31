@@ -60,6 +60,11 @@ class AFDConnectorBase(ABC):
     control_plane: AFDControlPlane | None = None
     attn_size: int = 0
     ffn_size: int = 0
+    # Connectors with nonblocking or internally scheduled sends let the DBO
+    # scheduler switch stages immediately after the Attention send. A blocking
+    # P2P transport can override this and yield after the matching receive so
+    # its send/receive order remains aligned with FFN's layer-major loop.
+    yield_after_attn_send: bool = True
 
     @classmethod
     @abstractmethod

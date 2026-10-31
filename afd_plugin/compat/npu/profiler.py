@@ -29,6 +29,7 @@ _DEFAULT_WAIT_STEPS: Final[int] = 2
 _DEFAULT_WARMUP_STEPS: Final[int] = 1
 _DEFAULT_REPEAT: Final[int] = 1
 _DEFAULT_SKIP_FIRST_STEPS: Final[int] = 1500
+_DEFAULT_PROFILE_RANKS: Final[frozenset[int]] = frozenset({0})
 _VLLM_TORCH_PROFILER_DIR_ENV: Final[str] = "VLLM_TORCH_PROFILER_DIR"
 
 
@@ -42,6 +43,7 @@ class AFDNPUProfilerConfig:
     skip_first: int
     trace_dir: str
     with_stack: bool
+    ranks: frozenset[int] | None
 
 
 class AFDNPUProfiler(Protocol):
@@ -66,14 +68,24 @@ def afd_npu_profiler_config(role: AFDNPUProfilerRole) -> AFDNPUProfilerConfig:
         ),
         trace_dir=_env_dir(f"{prefix}_DIR", default=_DEFAULT_DIR[role]),
         with_stack=_env_bool(f"{prefix}_WITH_STACK", default=False),
+        ranks=_env_ranks(
+            f"{prefix}_RANKS",
+            default=_DEFAULT_PROFILE_RANKS,
+        ),
     )
 
 
-def create_afd_npu_profiler(role: AFDNPUProfilerRole) -> AFDNPUProfiler | None:
-    """Create a torch-npu profiler when the plugin-owned env enables it."""
+def create_afd_npu_profiler(
+    role: AFDNPUProfilerRole,
+    *,
+    role_rank: int = 0,
+) -> AFDNPUProfiler | None:
+    """Create a torch-npu profiler for an enabled role-local rank."""
 
     config = afd_npu_profiler_config(role)
-    if not config.enabled:
+    if not config.enabled or (
+        config.ranks is not None and int(role_rank) not in config.ranks
+    ):
         return None
 
     import torch_npu
@@ -84,8 +96,10 @@ def create_afd_npu_profiler(role: AFDNPUProfilerRole) -> AFDNPUProfiler | None:
         aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
     )
     logger.info(
-        "AFD NPU %s profiler enabled. Traces will be saved to: %s; with_stack=%s",
+        "AFD NPU %s profiler enabled for role rank %d. Traces will be saved "
+        "to: %s; with_stack=%s",
         role,
+        role_rank,
         config.trace_dir,
         config.with_stack,
     )
@@ -147,6 +161,30 @@ def _env_int(name: str, *, default: int) -> int:
 
 def _env_dir(name: str, *, default: str) -> str:
     return os.getenv(name) or os.getenv(_VLLM_TORCH_PROFILER_DIR_ENV) or default
+
+
+def _env_ranks(
+    name: str,
+    *,
+    default: frozenset[int],
+) -> frozenset[int] | None:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized == "all":
+        return None
+    if not normalized:
+        raise ValueError(f"{name} must be 'all' or comma-separated ranks")
+    try:
+        ranks = frozenset(int(rank.strip()) for rank in normalized.split(","))
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be 'all' or comma-separated non-negative ranks, got {value!r}"
+        ) from exc
+    if any(rank < 0 for rank in ranks):
+        raise ValueError(f"{name} must contain non-negative ranks, got {value!r}")
+    return ranks
 
 
 __all__ = [

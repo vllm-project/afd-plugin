@@ -553,6 +553,8 @@ def test_async_send_ffn_work_item_output_preserves_all_shared_passthrough(
     monkeypatch,
 ):
     fake_torch = _FakeTorch()
+    # This test passes a real CPU tensor through the otherwise fake torch API.
+    fake_torch.int64 = torch.int64
     monkeypatch.setattr(async_cam_module, "torch", fake_torch)
     connector = CAMAsyncAFDConnector(
         0,

@@ -10,6 +10,7 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import Final
 
 TARGET_VLLM_VERSION: Final[str] = "0.26.0"
+SUPPORTED_VLLM_VERSIONS: Final[tuple[str, ...]] = ("0.23.0", TARGET_VLLM_VERSION)
 
 
 def _parse_release(value: str) -> tuple[int, int, int]:
@@ -32,7 +33,11 @@ def is_vllm_version_supported(installed_version: str | None = None) -> bool:
     if installed_version is None:
         return False
 
-    return _parse_release(installed_version) == _parse_release(TARGET_VLLM_VERSION)
+    installed_release = _parse_release(installed_version)
+    return any(
+        installed_release == _parse_release(supported_version)
+        for supported_version in SUPPORTED_VLLM_VERSIONS
+    )
 
 
 def assert_vllm_version_supported(*, strict: bool = True) -> None:
@@ -41,8 +46,8 @@ def assert_vllm_version_supported(*, strict: bool = True) -> None:
         return
 
     message = (
-        "AFD plugin currently supports exactly vLLM "
-        f"{TARGET_VLLM_VERSION}; installed vLLM version is "
+        "AFD plugin currently supports exactly vLLM versions "
+        f"{', '.join(SUPPORTED_VLLM_VERSIONS)}; installed vLLM version is "
         f"{installed_version or 'not installed'}"
     )
     if strict:
@@ -52,6 +57,7 @@ def assert_vllm_version_supported(*, strict: bool = True) -> None:
 
 __all__ = [
     "TARGET_VLLM_VERSION",
+    "SUPPORTED_VLLM_VERSIONS",
     "assert_vllm_version_supported",
     "get_installed_vllm_version",
     "is_vllm_version_supported",

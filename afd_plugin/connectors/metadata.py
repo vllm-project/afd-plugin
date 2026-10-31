@@ -123,11 +123,37 @@ class AFDControlPayload:
         is_warmup: Whether the payload belongs to a warmup step. This is
             separate from graph capture because warmup may prepare state without
             representing a real serving step.
+        shutdown: Whether Attention is intentionally closing the control plane.
+            Shutdown payloads contain no DP metadata and let FFN leave its
+            blocking receive loop before the Gloo process group is destroyed.
+        mtp_phase_ready: Whether Attention actually entered the MTP proposer for
+            the preceding target step.  A target step that finishes every
+            request may legitimately omit its draft phase.
+        mtp_phase_graph_replay: Whether that live draft phase will replay an
+            already captured graph. False means both roles must execute the
+            draft eagerly even when full draft Graph is configured.
+        mtp_phase_control_enabled: Whether the target step is live scheduler
+            work and therefore expects a following ``mtp_phase_ready`` marker.
+            Startup profile, warmup, and capture steps execute paired dummy
+            draft work directly and leave this disabled.
+        target_graph_replay: Attention's selected target execution mode. False
+            prevents FFN cache hits from overriding an eager target or its
+            paired dummy draft. None retains legacy shape-based selection for
+            callers that do not supply an execution mode.
+        tensor_parallel_size: Attention-side TP size. FFN validates this
+            against its local TP group before receiving AFD tensors so a
+            mismatched deployment fails before the HCCL message order drifts.
     """
 
     dp_metadata_list: dict[int, AFDDPMetadata]
     is_graph_capturing: bool
     is_warmup: bool
+    shutdown: bool = False
+    mtp_phase_ready: bool = False
+    mtp_phase_graph_replay: bool = False
+    mtp_phase_control_enabled: bool = False
+    tensor_parallel_size: int = 1
+    target_graph_replay: bool | None = None
 
     def __post_init__(self) -> None:
         self.dp_metadata_list = {
@@ -174,17 +200,26 @@ class AFDTransferMetadata:
             the expected leading dimension for tensors validated against this
             metadata. For one-to-one transfers this is usually a single-item
             list; for fan-in/fan-out paths it can describe split sizes.
+        phase: Logical execution phase. ``decoder`` is the ordinary target
+            model path; ``mtp`` is the speculative draft virtual layer.
+        speculative_step: Zero-based draft iteration within the MTP phase.
     """
 
     layer_idx: int
     stage_idx: int
     seq_lens: list[int]
+    phase: str = "decoder"
+    speculative_step: int = 0
 
     def __post_init__(self) -> None:
         if not self.seq_lens:
             raise ValueError("seq_lens cannot be empty")
         if any(length <= 0 for length in self.seq_lens):
             raise ValueError("all sequence lengths must be positive")
+        if self.phase not in {"decoder", "mtp"}:
+            raise ValueError(f"unsupported AFD transfer phase: {self.phase}")
+        if self.speculative_step < 0:
+            raise ValueError("speculative_step cannot be negative")
 
     @property
     def total_tokens(self) -> int:
@@ -197,11 +232,15 @@ class AFDTransferMetadata:
         layer_idx: int,
         stage_idx: int,
         seq_len: int,
+        phase: str = "decoder",
+        speculative_step: int = 0,
     ) -> AFDTransferMetadata:
         return cls(
             layer_idx=layer_idx,
             stage_idx=stage_idx,
             seq_lens=[seq_len],
+            phase=phase,
+            speculative_step=speculative_step,
         )
 
     @classmethod
@@ -211,11 +250,15 @@ class AFDTransferMetadata:
         layer_idx: int,
         stage_idx: int,
         seq_lens: list[int],
+        phase: str = "decoder",
+        speculative_step: int = 0,
     ) -> AFDTransferMetadata:
         return cls(
             layer_idx=layer_idx,
             stage_idx=stage_idx,
             seq_lens=list(seq_lens),
+            phase=phase,
+            speculative_step=speculative_step,
         )
 
     def validate_tensor_shape(self, tensor_shape: tuple[int, ...]) -> bool:
@@ -263,11 +306,13 @@ class AFDA2FTransferPayload:
         context: Transfer context describing the received transfer, including
             transfer metadata and backend-produced transfer state.
         router_logits: Optional Attention-side routing tensor.
+        input_ids: Optional one-shot DSV4 hash-router IDs for this stage.
     """
 
     hidden_states: torch.Tensor
     context: AFDTransferContext
     router_logits: torch.Tensor | None = None
+    input_ids: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -305,6 +350,10 @@ def _to_int(value: object) -> int:
     return int(item() if callable(item) else value)
 
 
+class AFDControlPlaneClosedError(RuntimeError):
+    """The peer closed while a control payload was being received."""
+
+
 def encode_control_payload(payload: AFDControlPayload) -> bytes:
     """Serialize an ``AFDControlPayload`` to a compact JSON byte string.
 
@@ -325,6 +374,12 @@ def encode_control_payload(payload: AFDControlPayload) -> bytes:
         "dp_metadata_list": metadata_payload,
         "is_graph_capturing": bool(payload.is_graph_capturing),
         "is_warmup": bool(payload.is_warmup),
+        "shutdown": bool(payload.shutdown),
+        "mtp_phase_ready": bool(payload.mtp_phase_ready),
+        "mtp_phase_graph_replay": bool(payload.mtp_phase_graph_replay),
+        "mtp_phase_control_enabled": bool(payload.mtp_phase_control_enabled),
+        "tensor_parallel_size": int(payload.tensor_parallel_size),
+        "target_graph_replay": payload.target_graph_replay,
     }
     return json.dumps(wire_payload, separators=(",", ":"), sort_keys=True).encode(
         "utf-8",
@@ -353,6 +408,16 @@ def decode_control_payload(payload_bytes: bytes) -> AFDControlPayload:
         dp_metadata_list=dp_metadata_list,
         is_graph_capturing=bool(payload.get("is_graph_capturing", False)),
         is_warmup=bool(payload.get("is_warmup", False)),
+        shutdown=bool(payload.get("shutdown", False)),
+        mtp_phase_ready=bool(payload.get("mtp_phase_ready", False)),
+        mtp_phase_graph_replay=bool(
+            payload.get("mtp_phase_graph_replay", False),
+        ),
+        mtp_phase_control_enabled=bool(
+            payload.get("mtp_phase_control_enabled", False),
+        ),
+        tensor_parallel_size=int(payload.get("tensor_parallel_size", 1)),
+        target_graph_replay=payload.get("target_graph_replay"),
     )
 
 
@@ -390,17 +455,39 @@ def recv_control_payload(
     device: torch.device,
 ) -> AFDControlPayload:
     """Receive and decode a DP-metadata payload from ``src`` over ``group``."""
-    size_tensor = torch.empty(1, dtype=torch.long, device=device)
+    # Gloo can return from recv without touching the destination after its peer
+    # closes. Zero initialization makes that state deterministic instead of
+    # interpreting allocator contents as a frame length or JSON body.
+    size_tensor = torch.zeros(1, dtype=torch.long, device=device)
     rank_size = torch.distributed.recv(size_tensor, src=src, group=group)
-    object_tensor = torch.empty(
-        int(size_tensor.item()),
+    if rank_size != src:
+        raise AFDControlPlaneClosedError(
+            "Attention control plane closed before the payload size arrived"
+        )
+    object_size = int(size_tensor.item())
+    if object_size <= 0:
+        raise AFDControlPlaneClosedError(
+            "Attention control plane closed before the payload size arrived"
+        )
+    object_tensor = torch.zeros(
+        object_size,
         dtype=torch.uint8,
         device=device,
     )
     rank_object = torch.distributed.recv(object_tensor, src=src, group=group)
-    if rank_object != rank_size:
-        raise RuntimeError("received AFD DP metadata fragments from different ranks")
-    return decode_control_payload(object_tensor.cpu().numpy().tobytes())
+    if rank_object != src:
+        raise AFDControlPlaneClosedError(
+            "Attention control plane closed before the payload body arrived"
+        )
+    object_bytes = object_tensor.cpu().numpy().tobytes()
+    # The Gloo receive can report the expected source after writing only part
+    # of the body when the sender exits concurrently. JSON control frames never
+    # contain NUL bytes, so zero-filled remainder marks an interrupted frame.
+    if b"\x00" in object_bytes:
+        raise AFDControlPlaneClosedError(
+            "Attention control plane closed before the payload body arrived"
+        )
+    return decode_control_payload(object_bytes)
 
 
 __all__ = [
@@ -410,6 +497,7 @@ __all__ = [
     "AFDTransferMetadata",
     "AFDDPMetadata",
     "AFDControlPayload",
+    "AFDControlPlaneClosedError",
     "AFDF2ATransferPayload",
     "AFDForwardContextMetadata",
     "AFDA2FTransferPayload",
