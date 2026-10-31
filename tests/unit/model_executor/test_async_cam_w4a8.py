@@ -17,6 +17,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from afd_plugin.model_executor.npu.async_cam_mega import (  # noqa: E402
+    AsyncCAMMegaExecutor,
+)
 from afd_plugin.model_executor.npu.async_cam_w4a8 import (  # noqa: E402
     AsyncCAMW4A8Executor,
     W4A8LayerWeights,
@@ -44,6 +47,12 @@ def weights(layer_idx=0, per_channel=True):
         swiglu_limit=0.0,
         routed_scaling_factor=2.0,
     )
+
+
+def test_native_rejects_grouped_scale_before_receiving(operators):
+    executor = AsyncCAMW4A8Executor([weights(per_channel=False)])
+    with pytest.raises(ValueError, match="per-channel"):
+        AsyncCAMMegaExecutor(executor, None)
 
 
 @pytest.fixture
@@ -213,6 +222,7 @@ def test_runner_preserves_raw_context_and_chunk_capacity():
         model=object(),
         connector=connector,
         _two_stream=None,
+        _mega_executor=None,
         _layered_executor=compute,
         layer_ids=(2, 5),
     )
@@ -232,7 +242,11 @@ def test_runner_preserves_raw_context_and_chunk_capacity():
 
 
 def test_runner_switch_off_does_not_touch_model_or_ops():
-    runner = SimpleNamespace(model=object(), _layered_gmm_requested=False)
+    runner = SimpleNamespace(
+        model=object(),
+        _layered_gmm_requested=False,
+        connector=SimpleNamespace(extra_info=SimpleNamespace(ffn_mega_moe=False)),
+    )
     method = runner_method(
         "_initialize_layered_executor",
         {"logger": SimpleNamespace(info=lambda *args: None)},

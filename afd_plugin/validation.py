@@ -73,10 +73,12 @@ def requested_ffn_mode(config: VllmConfig) -> Literal["eager", "full"]:
     return "full"
 
 
-def validate_graph_capacity(max_tokens: int, tp_size: int, capacity: int) -> None:
+def validate_graph_capacity(
+    max_tokens: int, tp_size: int, capacity: int, *, allow_row_slicing: bool = False
+) -> None:
     if min(max_tokens, tp_size, capacity) <= 0 or max_tokens % tp_size:
         raise ValueError("Graph dispatch envelope must be positive and divisible by TP")
-    if capacity < max_tokens:
+    if capacity < max_tokens and not allow_row_slicing:
         raise ValueError(
             "Async FFN graph capacity is smaller than the dispatch envelope"
         )

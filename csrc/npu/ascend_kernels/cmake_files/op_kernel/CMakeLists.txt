@@ -14,6 +14,19 @@ set(KERNEL_COMPILE_OPTS)
 # (resolves the shared utils/op_kernel headers copied next to the kernels).
 list(APPEND KERNEL_COMPILE_OPTS -I${CMAKE_CURRENT_SOURCE_DIR} -DASCENDC_DUMP=0 --cce-auto-sync=off -Wno-deprecated-declarations -Werror)
 
+# Mega uses CANN's W4A8 BlockMmad directly; ordinary operator builds do not need it.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/afd_mega_moe_pull_native.cpp")
+    find_path(AFD_MC2_INCLUDE_DIR
+        NAMES template_linear_algebra_v2/catlass.hpp
+        HINTS "${ASCEND_CANN_PACKAGE_PATH}" "$ENV{ASCEND_HOME_PATH}"
+        PATH_SUFFIXES opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/mega_moe/arch22
+        NO_DEFAULT_PATH)
+    if(NOT AFD_MC2_INCLUDE_DIR OR NOT EXISTS "${AFD_MC2_INCLUDE_DIR}/utils/block_mmad_w4a4.hpp")
+        message(FATAL_ERROR "AfdMegaMoePullNative requires the CANN 9.1 MC2 W4A8 headers in ASCEND_CANN_PACKAGE_PATH")
+    endif()
+    list(APPEND KERNEL_COMPILE_OPTS -I${AFD_MC2_INCLUDE_DIR})
+endif()
+
 # set custom compile options (single call to avoid overwriting)
 if ("${CMAKE_BUILD_TYPE}x" STREQUAL "Debugx")
     npu_op_kernel_options("" ALL OPTIONS -g -O0 ${KERNEL_COMPILE_OPTS})

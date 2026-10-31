@@ -258,9 +258,10 @@ def _fail_if_unsupported_npu_afd_async_features(
         raise RuntimeError("BATCH_SIZE_FACTOR must be a decimal number in (0, 1]")
     receive_capacity = cam_receive_capacity()
     max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-    # whole-expert chunks need a full TP group's batch; smaller
-    # buffers require native sub-expert chunking.
-    if receive_capacity < max_num_batched_tokens:
+    if receive_capacity < 1:
+        raise RuntimeError("BATCH_SIZE_FACTOR must allocate at least one receive row")
+    # Push chunks whole experts. Pull can split one expert across receive rounds.
+    if not extra_info.ffn_mega_moe and receive_capacity < max_num_batched_tokens:
         raise RuntimeError(
             "CAMAsyncAFDConnector requires BATCH_SIZE_FACTOR to allocate at least "
             f"max_num_batched_tokens={max_num_batched_tokens} "

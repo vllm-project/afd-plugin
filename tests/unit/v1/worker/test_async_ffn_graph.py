@@ -76,9 +76,12 @@ def session_harness(monkeypatch):
 
     connector.recv_attn_output = receive
     connector.send_ffn_output = send
+    connector.check_pull_status = lambda: None
     session = AsyncNPUFFNModelRunner.__new__(AsyncNPUFFNModelRunner)
     session.model = torch.nn.Linear(1, 1)
     session._layered_executor = execute
+    session._mega_executor = None
+    session._two_stream = None
     session.connector = connector
     session._graph = None
     session._graph_capture_count = session._graph_replay_count = 0

@@ -42,6 +42,7 @@ from afd_plugin.connectors import (
     AFDConnectorFactory,
     AFDForwardContextMetadata,
 )
+from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
 from afd_plugin.model_executor.models.forward_context import use_afd_metadata_provider
 from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
@@ -453,6 +454,10 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         )
         try:
             with (
+                self.connector.defer_pull_status()
+                if isinstance(self.connector, CAMAsyncAFDConnector)
+                and self.connector.extra_info.ffn_mega_moe
+                else nullcontext(),
                 skip_dp_coordination() if self.afd_config.async_dp else nullcontext(),
                 _use_camp2p_dp_padding(
                     self.afd_config.num_attention_ranks, self.afd_config.num_ffn_ranks

@@ -151,6 +151,7 @@ def test_static_validation_precedes_hccl_creation(
     )
     connector.__dict__.update(
         _initialized=False,
+        extra_info=connector_module.AFDAsyncExtraInfo(),
         afd_config=SimpleNamespace(host="localhost", port=1),
         topology=SimpleNamespace(world_size=2),
         world_rank=0,
@@ -226,7 +227,7 @@ def test_graph_dbo_keeps_existing_role_and_count_validation(
 
 
 def test_ffn_announces_service_only_on_receiver_execution(modules):
-    _, _, runtime = modules
+    _, connector_module, runtime = modules
     runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
     calls: list[str | tuple[str, str | int]] = []
     runner.__dict__.update(
@@ -235,7 +236,8 @@ def test_ffn_announces_service_only_on_receiver_execution(modules):
         _service_announced=False,
         layer_ids=(2, 5),
         connector=SimpleNamespace(
-            graph_startup=SimpleNamespace(service_ready=lambda: calls.append("ready"))
+            extra_info=connector_module.AFDAsyncExtraInfo(),
+            graph_startup=SimpleNamespace(service_ready=lambda: calls.append("ready")),
         ),
         _submit_graph=lambda count: calls.append(("submit", count)),
         _complete_graph=lambda: True,
@@ -278,6 +280,7 @@ def test_ffn_warmup_capture_order_and_failure_propagation(
         model=SimpleNamespace(get_experts_layer_indices=lambda: (5, 2)),
         _initialize_layered_executor=lambda: None,
         _layered_executor=SimpleNamespace(graph_signature=lambda capacity: "weights"),
+        _mega_executor=None,
         connector=SimpleNamespace(
             is_initialized=False,
             graph_startup=startup,

@@ -197,10 +197,15 @@ class AFDNPUFFNWorker(NPUWorker):
             return
 
         torch.npu.set_device(self.device)
-        while not event.is_set():
+        pull = (
+            isinstance(self.model_runner, AsyncNPUFFNModelRunner)
+            and self.model_runner.connector.extra_info.ffn_mega_moe
+        )
+        # Pull must keep serving committed, unselected work until every A is quiet.
+        while not event.is_set() or pull:
             if isinstance(self.model_runner, AsyncNPUFFNModelRunner):
                 if not self.model_runner.execute_connector_driven_step():
-                    return
+                    break
                 if (
                     self.model_runner.effective_mode == "eager"
                     and self.model_runner._two_stream is None
@@ -225,10 +230,16 @@ class AFDNPUFFNWorker(NPUWorker):
             )
             torch.npu.synchronize()
 
+        if isinstance(self.model_runner, AsyncNPUFFNModelRunner):
+            self.model_runner.drain_pull_source()
+            if self.model_runner.connector.extra_info.ffn_mega_moe:
+                self.model_runner.connector.graph_startup.finish_pull_receiver()
+
     def _requires_async_drain(self) -> bool:
         return isinstance(self.model_runner, AsyncNPUFFNModelRunner) and (
             self.model_runner.effective_mode == "full"
             or self.model_runner._two_stream is not None
+            or self.model_runner.connector.extra_info.ffn_mega_moe
         )
 
     def raise_ffn_loop_error_if_any(self) -> None:
