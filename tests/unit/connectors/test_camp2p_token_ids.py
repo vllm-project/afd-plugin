@@ -324,3 +324,189 @@ def test_recv_attn_output_mode_and_ids_follow_the_receiver_declaration(monkeypat
     ]
     assert calls[1][-1] == 0
     assert without_ids.input_ids is None
+
+def _routing(connector, rows, *, columns=None):
+    """Routing sized the way the operator is configured."""
+
+    topk = connector.num_experts_per_tok if columns is None else columns
+    ids = torch.arange(rows * topk, dtype=torch.int64).reshape(rows, topk)
+    weights = torch.full((rows, topk), 0.25, dtype=torch.bfloat16)
+    return ids, weights
+
+
+def test_prepare_routing_transfer_packs_int32_ids_and_float32_weights():
+    """The ids channel takes int32 ids and float32 weights, not the gate dtypes."""
+
+    ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
+    weights = torch.full((2, 2), 0.25, dtype=torch.bfloat16)
+
+    wire_ids, wire_weights = camp2p_module.prepare_routing_transfer(
+        ids,
+        weights,
+        expected_tokens=2,
+        top_k=2,
+    )
+
+    assert wire_ids.dtype == torch.int32
+    assert wire_ids.tolist() == [[0, 1], [2, 3]]
+    assert wire_weights.dtype == torch.float32
+    assert wire_weights.tolist() == [[0.25, 0.25], [0.25, 0.25]]
+
+
+def test_prepare_routing_transfer_rejects_expert_count_mismatch():
+    """The wire declares ``k``, so a narrower routing tensor must not be packed."""
+
+    ids = torch.zeros(3, 1, dtype=torch.int32)
+    weights = torch.zeros(3, 1, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="k=2"):
+        camp2p_module.prepare_routing_transfer(
+            ids,
+            weights,
+            expected_tokens=3,
+            top_k=2,
+        )
+
+
+def test_prepare_routing_transfer_rejects_token_count_mismatch():
+    ids = torch.zeros(2, 2, dtype=torch.int32)
+    weights = torch.zeros(2, 2, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="declares 3"):
+        camp2p_module.prepare_routing_transfer(
+            ids,
+            weights,
+            expected_tokens=3,
+            top_k=2,
+        )
+
+
+def test_received_routing_trims_operator_padded_capacity():
+    """Both channel tensors are cut together, so ids and weights stay paired."""
+
+    ids = torch.arange(12, dtype=torch.int32).reshape(4, 3)
+    weights = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+
+    topk_ids, topk_weights = camp2p_module.received_routing(
+        ids,
+        weights,
+        expected_tokens=2,
+    )
+
+    assert topk_ids.tolist() == [[0, 1, 2], [3, 4, 5]]
+    assert topk_weights.tolist() == [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]
+
+
+def test_received_routing_rejects_alignment_shortfall():
+    ids = torch.zeros(2, 3, dtype=torch.int32)
+    weights = torch.zeros(2, 3, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="routing rows"):
+        camp2p_module.received_routing(ids, weights, expected_tokens=3)
+
+
+def test_send_attn_output_puts_routing_on_the_operator_ids_channel(monkeypatch):
+    """Attention-side routing must select the operator's ids mode and fill it."""
+
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_camp2p_send_attn_output",
+        lambda *args: calls.append(args),
+        raising=False,
+    )
+    monkeypatch.setattr(camp2p_module, "get_forward_context", SimpleNamespace)
+    connector = _connector(role="attention", rank=0)
+    hidden_states = torch.zeros(3, connector.hidden_size)
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=0,
+            seq_len=3,
+        ),
+    )
+    ids, weights = _routing(connector, 3)
+
+    connector.send_attn_output(hidden_states, context, routing=(ids, weights))
+
+    sent = calls[0]
+    # Trailing operator arguments: aiv_num, compute_gate, ids, scales.
+    assert sent[-3] == 1
+    assert sent[-2].dtype == torch.int32
+    assert sent[-2].tolist() == ids.tolist()
+    assert sent[-1].dtype == torch.float32
+    assert sent[-1].tolist() == weights.to(torch.float32).tolist()
+
+
+def test_send_attn_output_rejects_ids_and_routing_together(monkeypatch):
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_camp2p_send_attn_output",
+        lambda *args: None,
+        raising=False,
+    )
+    monkeypatch.setattr(camp2p_module, "get_forward_context", SimpleNamespace)
+    connector = _connector(role="attention", rank=0)
+    hidden_states = torch.zeros(3, connector.hidden_size)
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=0,
+            seq_len=3,
+        ),
+    )
+    ids, weights = _routing(connector, 3)
+
+    with pytest.raises(ValueError, match="both token ids"):
+        connector.send_attn_output(
+            hidden_states,
+            context,
+            input_ids=torch.tensor([7, 11, 13], dtype=torch.int64),
+            routing=(ids, weights),
+        )
+
+
+def test_recv_attn_output_reads_the_routing_slot(monkeypatch):
+    """The routing mode exposes the ids slot as paired top-k ids and weights."""
+
+    calls: list[tuple[Any, ...]] = []
+
+    def fake_a2e(*args: Any) -> tuple[Any, ...]:
+        calls.append(args)
+        tokens, topk = int(args[3]), int(args[5])
+        ids = torch.arange(tokens * topk, dtype=torch.int32).reshape(tokens, topk)
+        weights = torch.full((tokens, topk), 0.5, dtype=torch.float32)
+        return ("hidden", ids, weights, "atten-batch", "active-mask")
+
+    monkeypatch.setattr(torch.ops.afd_ascend, "a2e", fake_a2e, raising=False)
+    monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
+    connector = _connector(role="ffn", rank=1)
+    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 5, 7])}
+
+    payload = connector.recv_attn_output(
+        ubatch_idx=0,
+        layer_idx=0,
+        recv_routing=True,
+    )
+
+    # 10 tokens reach this FFN rank, in the same column order the gate produced.
+    assert calls[0][-1] == 1
+    assert payload.input_ids is None
+    assert payload.topk_ids.shape == (10, connector.num_experts_per_tok)
+    assert payload.topk_ids[0].tolist() == list(
+        range(connector.num_experts_per_tok)
+    )
+    assert payload.topk_weights.shape == (10, connector.num_experts_per_tok)
+    assert payload.topk_weights[0].tolist() == [0.5] * connector.num_experts_per_tok
+
+
+def test_recv_attn_output_rejects_two_wire_slot_modes(monkeypatch):
+    connector = _connector(role="ffn", rank=1)
+
+    with pytest.raises(ValueError, match="exactly one"):
+        connector.recv_attn_output(
+            ubatch_idx=0,
+            layer_idx=0,
+            recv_input_ids=True,
+            recv_routing=True,
+        )

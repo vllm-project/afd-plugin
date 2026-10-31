@@ -220,7 +220,13 @@ class GPUFFNModelRunner:
             stage_idx: self._make_ffn_dp_metadata(dp_metadata_list[stage_idx])
             for stage_idx in stage_ids
         }
-        recv_input_ids = getattr(model, "afd_requires_input_ids", False)
+        # The wire slot carries one payload: either token ids or Attention-side
+        # routing. Routing wins when the model declares it, because a sync
+        # gate-on-Attention model does not need ids on the FFN side at all.
+        recv_routing = getattr(model, "afd_requires_attention_routing", False)
+        recv_input_ids = (
+            False if recv_routing else getattr(model, "afd_requires_input_ids", False)
+        )
         with _ffn_forward_context(self.vllm_config) as forward_context:
             for layer_idx in layer_indices:
                 uses_remote_experts = layer_idx in experts_layer_indices
@@ -233,7 +239,9 @@ class GPUFFNModelRunner:
                     recv_kwargs: dict[str, Any] = {}
                     if routing_spec is not None:
                         recv_kwargs["routing_spec"] = routing_spec
-                    if recv_input_ids:
+                    if recv_routing:
+                        recv_kwargs["recv_routing"] = True
+                    elif recv_input_ids:
                         recv_kwargs["recv_input_ids"] = True
                     payload = self.connector.recv_attn_output(
                         ubatch_idx=stage_idx,

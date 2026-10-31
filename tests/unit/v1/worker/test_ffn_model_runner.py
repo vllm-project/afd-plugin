@@ -273,6 +273,12 @@ def _runner_with_connector_and_model(model, *, num_layers=1):
     runner.vllm_config = SimpleNamespace(
         # FFN keeps connector-driven execution within a GPU MRV2 deployment.
         use_v2_model_runner=True,
+        # A real VllmConfig always carries a model config. The forward context asks
+        # it for the MX scale algorithm, which reads exactly two fields: the
+        # architecture list and the HF text config's model type. Supplying the two
+        # keeps this fixture honest about the contract instead of omitting the whole
+        # object; both default to "not MiniMax M3", which is what these tests are.
+        model_config=SimpleNamespace(architectures=None, hf_text_config=None),
         parallel_config=SimpleNamespace(
             data_parallel_size=1,
             is_moe_model=True,
