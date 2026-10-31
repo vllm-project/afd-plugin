@@ -63,20 +63,20 @@ Use the Attention port, not the FFN port.
 The client is not AFD-specific. It works with any vLLM server that has the
 decode-bench KV connector attached.
 
-For a single vanilla vLLM process on six GPUs, start the server with tensor
-parallelism 6 and the connector’s `--kv-transfer-config`:
+For a single vanilla vLLM process on four GPUs, start the server with tensor
+parallelism 4 and the connector’s `--kv-transfer-config`:
 
 ```bash
 export PYTHONPATH=$PWD
 export MODEL_PATH=/path/to/model
 
 vllm serve "$MODEL_PATH" \
-    --tensor-parallel-size 6 \
+    --tensor-parallel-size 4 \
     --trust-remote-code \
     --kv-transfer-config '{"kv_connector":"AFDDecodeBenchConnector","kv_connector_module_path":"tools.benchmarks.decode_bench","kv_role":"kv_both","kv_connector_extra_config":{"num_prompts":500,"prompt_len":1025,"seed":0,"max_output_len":256}}'
 ```
 
-Then run the benchmark client with `--dp-size 1`, because a vanilla TP6 server
+Then run the benchmark client with `--dp-size 1`, because a vanilla TP4 server
 has one logical engine:
 
 ```bash

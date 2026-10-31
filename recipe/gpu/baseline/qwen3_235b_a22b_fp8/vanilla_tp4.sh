@@ -2,18 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 #
-# Qwen3-235B-A22B-FP8 vanilla vLLM baseline on one 6-GPU node.
+# Qwen3-235B-A22B-FP8 vanilla vLLM baseline on one 4-GPU node.
 #
 # This is the no-AFD counterpart to
 # recipe/gpu/DeepEPM2NAFDConnector/qwen3_235b_a22b_fp8/prefill_decode_colocation/4a2f_graph_dp4tp1.sh.
-# It launches a single vLLM process with tensor parallelism 6 and no AFD
+# It launches a single vLLM process with tensor parallelism 4 and no AFD
 # connector, AFD additional config, or separate Attention/FFN roles.
 #
 # Every knob is an environment variable:
 #
 #   MODEL_PATH               weights dir or HF id (/path/model_weights/Qwen3-235B-A22B-FP8)
-#   TENSOR_PARALLEL_SIZE     tensor-parallel size (6)
-#   CUDA_VISIBLE_DEVICES     GPUs to use (0,1,2,3,4,5)
+#   TENSOR_PARALLEL_SIZE     tensor-parallel size (4)
+#   CUDA_VISIBLE_DEVICES     GPUs to use (0,1,2,3)
 #   HOST / PORT              HTTP bind address and port (127.0.0.1 / 18000)
 #   MAX_NUM_SEQS             maximum sequences (128)
 #   MAX_NUM_BATCHED_TOKENS   prefill chunk per step (3072)
@@ -23,14 +23,16 @@
 #   ENABLE_PREFIX_CACHING    1 | 0 (1)
 #   ENABLE_DBO               1 | 0 (0)
 #   DBO_DECODE_TOKEN_THRESHOLD / DBO_PREFILL_TOKEN_THRESHOLD (2 / 2)
+#   ALL2ALL_BACKEND          MoE all-to-all backend (allgather_reducescatter);
+#                            DBO requires DeepEP or NIXL instead
 #   GPU_MEMORY_UTILIZATION   optional GPU memory utilization fraction (unset)
 #   EXTRA_ARGS               extra `vllm serve` arguments (empty)
 
 set -euo pipefail
 
 MODEL_PATH=${MODEL_PATH:-/path/model_weights/Qwen3-235B-A22B-FP8}
-TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-6}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}
+TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-4}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-18000}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-128}
@@ -41,6 +43,7 @@ ENABLE_PREFIX_CACHING=${ENABLE_PREFIX_CACHING:-1}
 ENABLE_DBO=${ENABLE_DBO:-0}
 DBO_DECODE_TOKEN_THRESHOLD=${DBO_DECODE_TOKEN_THRESHOLD:-2}
 DBO_PREFILL_TOKEN_THRESHOLD=${DBO_PREFILL_TOKEN_THRESHOLD:-2}
+ALL2ALL_BACKEND=${ALL2ALL_BACKEND:-allgather_reducescatter}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 
@@ -53,6 +56,7 @@ ARGS=(
     --tensor-parallel-size "$TENSOR_PARALLEL_SIZE"
     --enable-expert-parallel
     --enable-ep-weight-filter
+    --all2all-backend "$ALL2ALL_BACKEND"
     --max-num-seqs "$MAX_NUM_SEQS"
     --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
     --max-model-len "$MAX_MODEL_LEN"
