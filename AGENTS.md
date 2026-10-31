@@ -75,6 +75,72 @@ consistent.
   only when they reduce meaningful complexity, avoid real duplication, or match
   an established local pattern.
 
+## ModelRunner and Worker Constraints
+
+Treat the ModelRunner and worker as a generic scheduling and execution
+surface, in the same way recent vLLM and SGLang AFD-style stacks and
+FastAFD and Dynamo hetero stacks keep model specialization in model layers
+and connector specialization in backends. This is an architectural
+invariant, not a matter of taste.
+
+### Layer ownership
+
+- Model-specific logic belongs in `afd_plugin/model_executor/models/**`.
+- Connector and transport specifics belong in `afd_plugin/connectors/**`.
+- Worker and ModelRunner code only orchestrates lifecycle. It calls
+  `AFDConnectorBase` plus optional capability interfaces (for example
+  `control_plane` and `AFDRoutedExpertsConnector`).
+
+### Forbidden in worker and runner paths
+
+Code under `afd_plugin/v1/worker/**`, including NPU equivalents under that
+tree, MUST NOT:
+
+- Branch on model architecture or family names (DeepSeek, Qwen, and others).
+- Branch on concrete connector class names, such as `P2pNcclAFDConnector`,
+  `DeepEPM2NAFDConnector`, or `CAMP2pAFDConnector`.
+
+Prefer capability or protocol checks and config flags (`AFDConfig`,
+`compute_gate_on_attention`, and similar).
+
+### New models and connectors
+
+- A new model MUST be added as an AFD wrapper or proxy, plus a validation
+  matrix in `afd_plugin/validation.py` and the design docs.
+- A new connector MUST be added through the factory, the allow-list, and
+  the `connector_extra_config` schema.
+- If the execution strategy differs, add a capability interface and a
+  dedicated runner subclass selected by that capability. Shared runners
+  MUST NOT branch with `if connector == …`. The existing pattern is
+  `ffn_worker` selecting `GPUFFNRoutedExpertsModelRunner` via
+  `AFDRoutedExpertsConnector`.
+
+### CUDA and NPU
+
+Keep platform-specific code in separate modules
+(`afd_plugin/v1/worker/npu/`). Do not put platform forks inside shared GPU
+runners.
+
+### Patches
+
+`compat/patches/**` only bridges upstream. Do not grow model or connector
+business logic there.
+
+### Design docs
+
+Changing these seams MUST update the owning docs under
+`docs/design/module/` when contracts change: `attention_runtime.md`,
+`ffn_runtime.md`, `connector_contracts.md`, and `model_integration.md`.
+
+### Tests
+
+Unit tests under worker and runner paths MUST NOT bind to concrete model
+names or concrete connector classes. Model customization is covered under
+`model_executor` and e2e model scenarios. Connector customization is
+covered under `tests/unit/connectors/**` and e2e as appropriate. Reviewers
+may flag existing debt, such as model-name traces in NPU ubatch and FFN
+paths, in a later change.
+
 ## Test Conventions
 
 Unit tests protect behavior at module seams. A test that cannot fail when the
