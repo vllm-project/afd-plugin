@@ -27,7 +27,9 @@ int main() {
     assert(native.a2 - native.a1 >= 512ULL * 4096);
     assert(native.c1 - native.a2 >= 512ULL * 2048);
     assert(native.c2 - native.c1 >= 8ULL * 512 * 2048);
-    assert(native.bytes - native.c2 >= 4ULL * 512 * 4096);
+    assert(native.output - native.c2 >= 4ULL * 512 * 4096);
+    assert(native.bytes - native.output == 2ULL * 512 * 4096);
+    assert(native.output % 512 == 0);
     assert(native.layer - native.tileCounts >= 8ULL * 128 * (512 / Cam::NATIVE_TILE_ROWS));
     assert(native.a1 - native.x >= 512ULL * 4096);
     static_assert(Cam::NATIVE_MAX_ROWS == MAX_CAPACITY);
@@ -36,10 +38,14 @@ int main() {
         assert(large.a2 - large.a1 >= capacity * 8192);
         assert(large.c1 - large.a2 >= capacity * 8192);
         assert(large.c2 - large.c1 >= 8 * capacity * 8192);
-        assert(large.bytes - large.c2 >= 4 * capacity * 8192);
+        assert(large.output - large.c2 >= 4 * capacity * 8192);
+        assert(large.bytes - large.output == 2 * capacity * 8192);
+        assert(large.output % 512 == 0);
         assert(Rounds(capacity, capacity) == 1);
         assert(Rounds(capacity + 1, capacity) == 2);
     }
+    const Cam::NativeMegaWorkspace model(262144, 4096, 2048, 64, 2);
+    assert(model.bytes - model.output == 2ULL * 1024 * 1024 * 1024);
     std::mt19937 random(20261027);
     for (uint32_t trial = 0; trial < 1000; ++trial) {
         const uint32_t sources = 1 + random() % 4, experts = 1 + random() % 8;

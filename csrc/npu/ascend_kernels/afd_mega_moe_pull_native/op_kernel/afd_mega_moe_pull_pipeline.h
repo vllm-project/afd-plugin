@@ -394,7 +394,7 @@ __aicore__ inline void Activate(GM_ADDR scratch, const Cam::NativeMegaWorkspace 
 class Output {
 public:
     static constexpr uint32_t ROWS = 16, COLS = CUBE_N, ELEMENTS = ROWS * COLS;
-    __aicore__ Output(Resource &resource, GM_ADDR routeBase, uint32_t rows) : totalRows_(rows) {
+    __aicore__ Output(Resource &resource, GM_ADDR routeBase, uint32_t rows, GM_ADDR staged) : totalRows_(rows) {
         uint32_t ub = 0;
         for (uint32_t b = 0; b < 2; ++b) {
             hi_[b] = resource.ubBuf.GetBufferByByte<half>(ub); ub += 2 * ELEMENTS;
@@ -411,6 +411,7 @@ public:
         temp_ = resource.ubBuf.GetBufferByByte<float>(ub);
         routes_ = resource.ubBuf.GetBufferByByte<uint64_t>(ROUTE_UB);
         routeGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(routeBase));
+        staged_ = reinterpret_cast<uint64_t>(staged);
     }
     __aicore__ void Tile(GlobalTensor<half> raw, GlobalTensor<float> bias, GlobalTensor<float> scale,
                          uint32_t row, uint32_t rows, uint32_t col, uint32_t hidden, float routedScale) {
@@ -463,10 +464,9 @@ public:
         SetFlag<HardEvent::V_MTE3>(b);
         WaitFlag<HardEvent::V_MTE3>(b);
         for (uint32_t r = 0; r < rows;) {
-            const uint64_t address = routes_.GetValue(row - routeBegin_ + r);
+            const uint64_t address = staged_ + uint64_t(row + r) * hidden * sizeof(bfloat16_t);
             uint32_t contiguous = 1;
-            while (r + contiguous < rows && routes_.GetValue(row - routeBegin_ + r + contiguous) ==
-                   address + uint64_t(contiguous) * hidden * sizeof(bfloat16_t)) ++contiguous;
+            while (r + contiguous < rows) ++contiguous;
             GlobalTensor<bfloat16_t> remote;
             remote.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(address));
             DataCopyPad(remote[col], y_[b][r * COLS],
@@ -475,6 +475,13 @@ public:
         }
         SetFlag<HardEvent::MTE3_V>(b);
         stage_ ^= 1;
+    }
+    __aicore__ void DrainLocal() {
+        // Observe every local MTE3 write; keep tokens seeded for next expert/finalize.
+        for (uint32_t b=0;b<2;++b) {
+            WaitFlag<HardEvent::MTE3_V>(b);
+            SetFlag<HardEvent::MTE3_V>(b);
+        }
     }
     __aicore__ void Finalize() {
         for (uint32_t b = 0; b < 2; ++b) {
@@ -485,11 +492,89 @@ public:
     }
 private:
     uint32_t stage_ = 0, scaleRow_[2], scaleRows_[2];
+    uint64_t staged_;
     uint32_t totalRows_, routeBegin_ = 0, routeCount_ = 0;
     LocalTensor<half> hi_[2], lo_[2];
     LocalTensor<float> bias_[2], scale_[2], value_, temp_;
     LocalTensor<bfloat16_t> y_[2];
     LocalTensor<uint64_t> routes_;
+    GlobalTensor<uint64_t> routeGm_;
+};
+
+
+// Independent UB and events keep TX in flight while subsequent output is produced.
+class ExpertRowTx {
+public:
+    static constexpr uint32_t BATCH=1, META_ROWS=256, PUMP_ROWS=1, READY_ROWS=512;
+    static constexpr uint32_t QUEUE_UB=84*1024, TX_UB=96*1024, EVENT_BASE=4;
+    __aicore__ ExpertRowTx(Resource &resource, GM_ADDR routeBase, GM_ADDR staged,
+                         uint32_t hidden, uint32_t cores) : h_(hidden),cores_(cores) {
+        local_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(staged));
+        routeGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(routeBase));
+        queue_=resource.ubBuf.GetBufferByByte<uint32_t>(QUEUE_UB);
+        for (uint32_t b=0;b<2;++b) {
+            value_[b]=resource.ubBuf.GetBufferByByte<bfloat16_t>(TX_UB+b*BATCH*h_*2);
+            SetFlag<HardEvent::MTE3_MTE2>(b+EVENT_BASE);
+        }
+        routes_=resource.ubBuf.GetBufferByByte<uint64_t>(TX_UB+2*BATCH*h_*2);
+    }
+    __aicore__ void Enqueue(uint32_t base,uint32_t rows,uint32_t expert) {
+        const uint32_t id=GetBlockIdx(),per=rows/cores_,rem=rows%cores_;
+        const uint32_t count=per+(id<rem);
+        if (!count) return;
+        queue_.SetValue(2*tail_,base+id*per+Min(id,rem));
+        queue_.SetValue(2*tail_+1,count);
+        ++tail_;
+    }
+    __aicore__ void Send(uint32_t base,uint32_t rows,uint32_t expert) {
+        Enqueue(base,rows,expert);
+        Pump(0x7fffffff);
+    }
+    __aicore__ void Pump(uint32_t quota) {
+        while (quota && head_<tail_) {
+            if (loaded_!=head_) {
+                first_=queue_.GetValue(2*head_);count_=queue_.GetValue(2*head_+1);
+                cursor_=0;cacheBegin_=UINT32_MAX;cacheEnd_=0;loaded_=head_;
+            }
+            if (cursor_==count_) {++head_;continue;}
+            if (cursor_<cacheBegin_ || cursor_>=cacheEnd_) {
+                cacheBegin_=cursor_;cacheEnd_=cursor_+Min(META_ROWS,count_-cursor_);
+                DataCopyPad(routes_,routeGm_[first_+cursor_],{1U,8*(cacheEnd_-cursor_),0U,0U,0U},{false,0U,0U,0U});
+                Fence<HardEvent::MTE2_S>();
+            }
+            uint32_t n=1;
+            const uint32_t limit=Min(BATCH,Min(quota,Min(count_-cursor_,cacheEnd_-cursor_)));
+            const uint64_t address=routes_.GetValue(cursor_-cacheBegin_);
+            // Never merge across a destination discontinuity or metadata-window boundary.
+            while (n<limit && routes_.GetValue(cursor_-cacheBegin_+n)==address+uint64_t(n)*h_*2) ++n;
+            const uint32_t b=stage_++%2;
+            WaitSlot(b);
+            DataCopyPad(value_[b],local_[uint64_t(first_+cursor_)*h_],{1U,2*h_*n,0U,0U,0U},{false,0U,0U,0U});
+            SetFlag<HardEvent::MTE2_MTE3>(b+EVENT_BASE);
+            WaitFlag<HardEvent::MTE2_MTE3>(b+EVENT_BASE);
+            GlobalTensor<bfloat16_t> remote;
+            remote.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(address));
+            DataCopyPad(remote,value_[b],{1U,2*h_*n,0U,0U,0U});
+            SetFlag<HardEvent::MTE3_MTE2>(b+EVENT_BASE);
+            cursor_+=n;quota-=n;
+        }
+    }
+    __aicore__ void Drain() {
+        Pump(0x7fffffff);
+        for (uint32_t b=0;b<2;++b) {WaitSlot(b);SetFlag<HardEvent::MTE3_MTE2>(b+EVENT_BASE);}
+    }
+    __aicore__ void Finalize() {
+        Pump(0x7fffffff);
+        for (uint32_t b=0;b<2;++b) WaitSlot(b);
+    }
+private:
+    __aicore__ void WaitSlot(uint32_t b) {WaitFlag<HardEvent::MTE3_MTE2>(b+EVENT_BASE);}
+    uint32_t h_,cores_,stage_=0,head_=0,tail_=0,loaded_=UINT32_MAX;
+    uint32_t first_=0,count_=0,cursor_=0,cacheBegin_=0,cacheEnd_=0;
+    LocalTensor<bfloat16_t> value_[2];
+    LocalTensor<uint64_t> routes_;
+    LocalTensor<uint32_t> queue_;
+    GlobalTensor<bfloat16_t> local_;
     GlobalTensor<uint64_t> routeGm_;
 };
 
@@ -502,9 +587,10 @@ __aicore__ inline void Combine(GM_ADDR scratch, const Cam::NativeMegaWorkspace &
     raw.SetGlobalBuffer(reinterpret_cast<__gm__ half *>(scratch + w.c2));
     bias.SetGlobalBuffer(GetLayerTensorAddr<float>(layer, t.config[13], biases));
     scales.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scratch + w.scale2));
-    Output output(resource, scratch + w.x, round.total);
+    Output output(resource, scratch + w.x, round.total, scratch + w.output);
+    ExpertRowTx rowTx(resource, scratch + w.x, scratch + w.output, h, t.aivNum);
     Scheduler scheduler;
-    uint32_t startCore = 0, sync = 0;
+    uint32_t startCore = 0, sync = 0, groupBegin = 0;
     for (uint32_t index = 0; index < round.activeCount; ++index) {
         const uint32_t e = round.Expert(index);
         scheduler.Update(Coord{2 * round.Rows(e), h, uint32_t(t.config[2])},
@@ -524,12 +610,23 @@ __aicore__ inline void Combine(GM_ADDR scratch, const Cam::NativeMegaWorkspace &
                 const uint32_t rows = Min(32, actual.m() - b * 32) / 2;
                 const uint32_t row = round.begin[e] + coord.m() * (CUBE_M / 2) + b * 16;
                 output.Tile(raw, bias[e * h], scales, row, rows, coord.n() * CUBE_N, h, t.routedScale);
+                rowTx.Pump(ExpertRowTx::PUMP_ROWS);
             }
+        }
+        const uint32_t groupRows=round.begin[e+1]-groupBegin;
+        if (groupRows>=ExpertRowTx::READY_ROWS || index+1==round.activeCount) {
+            output.DrainLocal();
+            SyncAll<true>();
+            rowTx.Enqueue(groupBegin,groupRows,e);
+            rowTx.Pump(ExpertRowTx::PUMP_ROWS);
+            groupBegin=round.begin[e+1];
         }
         startCore = (startCore + jobs) % t.aicNum;
     }
     for (; sync < round.activeCount; ++sync) CrossCoreWaitFlag<2>(sync / FLAG_SETS);
     output.Finalize();
+    rowTx.Finalize();
+
 }
 } // namespace AfdNativeMega
 #endif

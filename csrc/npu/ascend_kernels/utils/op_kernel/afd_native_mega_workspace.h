@@ -21,7 +21,7 @@ AFD_NATIVE_DEVICE constexpr uint64_t NativeAlign(uint64_t n) { return (n + 511) 
 
 struct NativeMegaWorkspace {
     uint64_t batch, counts, tileCounts, layer, flags, scale1, scale2;
-    uint64_t x, a1, a2, c1, c2, bytes;
+    uint64_t x, a1, a2, c1, c2, output, bytes;
     AFD_NATIVE_DEVICE NativeMegaWorkspace(uint64_t rows, uint64_t h, uint64_t i,
                                          uint64_t experts, uint64_t tp) {
         batch = 0;
@@ -36,7 +36,9 @@ struct NativeMegaWorkspace {
         a2 = a1 + NativeAlign(rows * h);
         c1 = a2 + NativeAlign(rows * i);
         c2 = c1 + NativeAlign(8 * rows * i);
-        bytes = c2 + NativeAlign(4 * rows * h);
+        output = c2 + NativeAlign(4 * rows * h);
+        // Full BF16 rows are published locally before asynchronous remote TX.
+        bytes = output + NativeAlign(2 * rows * h);
     }
 };
 } // namespace Cam
