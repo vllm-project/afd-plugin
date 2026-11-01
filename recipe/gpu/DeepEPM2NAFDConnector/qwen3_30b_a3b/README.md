@@ -99,15 +99,17 @@ For an accuracy check, run the matching E2E case, for example
    requests into a pool of seeded random prompts of `DECODE_BENCH_PROMPT_LEN`
    tokens (the same pool on every rank, whatever the requests carried) and
    prefills them for real, one output token each.
-2. **Pinning.** When a warmup request finishes, the connector keeps its KV
-   blocks allocated for the server's lifetime (it reports the blocks as still
-   being sent and never completes the send). Pinned blocks cannot be evicted
-   and stay in the prefix cache.
+2. **Pinning.** When a warmup request finishes, the connector takes a
+   reference of its own on the request's full prompt blocks and holds it for
+   the server's lifetime, while the request itself is freed as usual. Pinned
+   blocks cannot be evicted and stay in the prefix cache.
 3. **Measured requests.** Every later request is remapped round-robin onto a
-   pool prompt, whatever it asked for. The prefix cache covers every prompt
-   token but the last (the prompt length is rounded to one token past a block
-   boundary), so the request prefills one token and decodes over real KV, on
-   whichever rank serves it.
+   pinned pool prompt, whatever it asked for. The prefix cache covers every
+   prompt token but the last (the prompt length is rounded to one token past a
+   block boundary), so the request prefills one token and decodes over real KV,
+   on whichever rank serves it. A request that arrives before any prompt is
+   pinned may miss the cache; the connector logs it and the client's checks
+   fail the run.
 
 Start the server, then drive it with `tools/benchmarks/decode_bench_client.py`,
 which runs every phase with `vllm bench serve`:
