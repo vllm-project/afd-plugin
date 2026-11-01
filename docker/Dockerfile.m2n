@@ -1,0 +1,117 @@
+# Target vLLM version: keep VLLM_BASE_TAG aligned with
+# [project.optional-dependencies].vllm in pyproject.toml.
+#
+# Serving image for DeepEPM2NAFDConnector deployments (see
+# docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md): the AFD plugin on top of the
+# vLLM OpenAI image, plus the connector dependencies:
+#   - afdEP-comm, at the revision pinned by the plugin's `afdep` extra
+#     (uv.lock), and
+#   - DeepGEMM, built from source because it is not a plugin extra.
+#
+# Build from the repository root:
+#   docker build -f docker/Dockerfile.m2n -t afd-m2n .
+# Optionally pin DeepGEMM for a reproducible image:
+#   docker build -f docker/Dockerfile.m2n --build-arg DEEPGEMM_REF=<git ref> \
+#     -t afd-m2n .
+#
+# The afdEP-comm transport extension and the DeepGEMM kernels compile just in
+# time at first use on the GPUs (`python -m afdep doctor --build` needs a GPU,
+# so it cannot run here). This image ships their build inputs instead: nvcc
+# and the compilers from the base image, the NCCL wheel afdEP-comm builds
+# against, and the elfutils headers (libdw-dev) that DeepGEMM's JIT needs. The
+# first server start on a node therefore compiles kernels and is slower than
+# later starts.
+ARG VLLM_BASE_IMAGE=vllm/vllm-openai
+ARG VLLM_BASE_TAG=v0.30.0
+
+# deps stage: everything except the real project sources, so most PRs can
+# cache-hit on the heavy dependency layer.
+FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG} AS deps
+
+ARG APP_DIR=/opt/afd-plugin
+# DeepGEMM git ref to build (https://github.com/deepseek-ai/DeepGEMM). Empty
+# builds the default branch, as the user guide documents.
+ARG DEEPGEMM_REF=
+# GPU architectures the DeepGEMM extension is compiled for. The connector
+# requires SM90 or newer on every rank.
+ARG DEEPGEMM_TORCH_CUDA_ARCH_LIST=9.0a;10.0a
+WORKDIR ${APP_DIR}
+
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+# Placeholder package tree so editable install can register APP_DIR.
+# The final stage COPY --link fills this directory with the real sources.
+RUN mkdir -p afd_plugin && touch afd_plugin/__init__.py
+
+# libdw-dev: elfutils headers (libdwfl.h) for DeepGEMM's JIT, needed both to
+# build and at runtime. git: cloning DeepGEMM.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git libdw-dev && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml setup.py uv.lock README.md LICENSE ./
+
+# Docker build context has no .git (see .dockerignore), so setuptools-scm
+# cannot infer a version; pretend one for image installs.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    AFD_BUILD_ASCEND_OPS=0 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    UV_LINK_MODE=copy \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_AFD_PLUGIN=0.0.0+m2n \
+    SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0+m2n
+
+# afdEP-comm, at the revision pinned by the `afdep` extra in uv.lock.
+# --no-deps: its dependencies (torch, ninja, packaging, setuptools) are
+# already provided by the base image.
+RUN uv export --locked --extra afdep --no-group dev --no-group e2e-tests \
+      --no-emit-project --no-header -o /tmp/requirements-afdep.txt && \
+    uv pip install --system --no-deps \
+      "$(grep -m1 '^afdep-comm @' /tmp/requirements-afdep.txt)" && \
+    uv pip install --system -e . wheel
+
+# afdEP-comm builds against the NCCL wheel: point AFDEP_NCCL_ROOT at it and
+# keep its lib directory on LD_LIBRARY_PATH for the served processes, as the
+# user guide requires on both roles. The symlink keeps the path stable across
+# base image updates.
+RUN NCCL=$(python -c "import nvidia.nccl; print(nvidia.nccl.__path__[0])") && \
+    ln -s "$NCCL" /opt/nccl
+ENV AFDEP_NCCL_ROOT=/opt/nccl \
+    LD_LIBRARY_PATH=/opt/nccl/lib:${LD_LIBRARY_PATH}
+
+# torch pip headers include cusparse.h and other CUDA headers shipped by the
+# nvidia-* wheels; collect them once for the DeepGEMM build below and for
+# DeepGEMM's runtime JIT.
+RUN NVIDIA_DIR=$(python -c "import nvidia; print(nvidia.__path__[0])") && \
+    mkdir -p /opt/nvidia-include && \
+    cp -R "$NVIDIA_DIR"/*/include/. /opt/nvidia-include/
+ENV CPLUS_INCLUDE_PATH=/opt/nvidia-include \
+    C_INCLUDE_PATH=/opt/nvidia-include
+
+# DeepGEMM (the connector's default `deepgemm` expert backend).
+# --no-deps on install: DeepGEMM's own install path would reinstall torch.
+RUN git clone https://github.com/deepseek-ai/DeepGEMM.git /tmp/DeepGEMM && \
+    cd /tmp/DeepGEMM && \
+    if [ -n "$DEEPGEMM_REF" ]; then git checkout "$DEEPGEMM_REF"; fi && \
+    git submodule update --init --recursive && \
+    TORCH_CUDA_ARCH_LIST="${DEEPGEMM_TORCH_CUDA_ARCH_LIST}" \
+      python setup.py bdist_wheel && \
+    uv pip install --system --no-deps dist/*.whl && \
+    rm -rf /tmp/DeepGEMM
+
+# GPU-less build check: the packages import, afdEP-comm finds nvcc and the
+# NCCL wheel, and the elfutils headers DeepGEMM's JIT needs are present.
+RUN python -c "import afd_plugin, afdep, deep_gemm" && \
+    python -c "from afdep._build import nccl_paths, resolve_nvcc; \
+               nccl_paths(); resolve_nvcc()" && \
+    test -f /usr/include/elfutils/libdwfl.h
+
+# Final stage: overlay workspace sources onto the cached deps image.
+FROM deps
+ARG APP_DIR=/opt/afd-plugin
+WORKDIR ${APP_DIR}
+
+COPY --link . .
+
+ENTRYPOINT []

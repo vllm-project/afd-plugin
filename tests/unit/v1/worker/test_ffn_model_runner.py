@@ -877,7 +877,9 @@ def test_ffn_runner_logs_placement_when_a_rearrangement_commits(
     Why: vLLM's own log lists load stats, not which expert went where.
     """
     monkeypatch.setattr(
-        ffn_model_runner_module, "get_ep_group", lambda: SimpleNamespace(rank=lambda: 0)
+        ffn_model_runner_module,
+        "get_ep_group",
+        lambda: SimpleNamespace(rank_in_group=0),
     )
     state = _FakeEplbState(
         [
@@ -910,7 +912,9 @@ def test_ffn_runner_placement_logging_needs_balancedness_flag(
     """Without log_balancedness no placement is logged, even at a
     rearrangement boundary."""
     monkeypatch.setattr(
-        ffn_model_runner_module, "get_ep_group", lambda: SimpleNamespace(rank=lambda: 0)
+        ffn_model_runner_module,
+        "get_ep_group",
+        lambda: SimpleNamespace(rank_in_group=0),
     )
     state = _FakeEplbState([[[0, 1, 2, 3], [0, 1, 2, 3]]])
     runner = _runner_for_placement_logging(state, log_placement=False)
@@ -928,7 +932,9 @@ def test_ffn_runner_placement_logging_only_on_ep_rank_zero(
 ):
     """Every FFN EP rank holds the same map; only EP rank 0 logs it."""
     monkeypatch.setattr(
-        ffn_model_runner_module, "get_ep_group", lambda: SimpleNamespace(rank=lambda: 1)
+        ffn_model_runner_module,
+        "get_ep_group",
+        lambda: SimpleNamespace(rank_in_group=1),
     )
     state = _FakeEplbState([[[0, 1, 2, 3], [0, 1, 2, 3]]])
     runner = _runner_for_placement_logging(state, log_placement=True)
