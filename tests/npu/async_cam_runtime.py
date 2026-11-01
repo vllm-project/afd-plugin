@@ -139,7 +139,10 @@ def main():
         "--hidden-size", type=int, choices=(256, 512, 1024, 2048), default=HIDDEN
     )
     parser.add_argument(
-        "--intermediate-size", type=int, choices=(256, 512, 1024, 2048), default=HIDDEN
+        "--intermediate-size",
+        type=int,
+        choices=(256, 512, 1024, 2048, 3072, 3328, 4096, 8192),
+        default=HIDDEN,
     )
     parser.add_argument("--weight-seed", type=int)
     parser.add_argument("--routed-scale", type=float, default=1.0)
