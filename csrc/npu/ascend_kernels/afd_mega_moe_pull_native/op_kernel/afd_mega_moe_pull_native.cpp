@@ -7,12 +7,21 @@
 #include "layered/layered_tensor_addr.h"
 
 // Use the installed MC2 implementation; do not vendor its template dependency tree.
+#if defined(AFD_CANN_CATLASS_92)
+#include "catlass/arch/resource.hpp"
+#include "catlass/gemm/block/block_mmad.hpp"
+#include "catlass/gemm/block/block_swizzle.hpp"
+#include "catlass/epilogue/tile/tile_copy.hpp"
+#include "catlass/epilogue/tile/tile_elemwise_muls.hpp"
+#include "catlass/epilogue/block/block_epilogue.hpp"
+#else
 #include "template_linear_algebra_v2/arch/resource.hpp"
 #include "template_linear_algebra_v2/gemm/block/block_mmad.hpp"
 #include "template_linear_algebra_v2/gemm/block/block_swizzle.hpp"
 #include "template_linear_algebra_v2/epilogue/tile/tile_copy.hpp"
 #include "template_linear_algebra_v2/epilogue/tile/tile_elemwise_muls.hpp"
 #include "template_linear_algebra_v2/epilogue/block/block_epilogue.hpp"
+#endif
 #include "utils/block_mmad_w4a4.hpp"
 // The installed MC2 epilogue uses unqualified AscendC names inside this namespace.
 namespace Catlass::Epilogue::Block { using namespace AscendC; }

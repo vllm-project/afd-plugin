@@ -205,6 +205,7 @@ def execute_contract():
             skip_dp.reset(token)
 
     class NativeRunner:
+        connector: object
         vllm_config: SimpleNamespace
         afd_config: SimpleNamespace
         prof: None
@@ -256,6 +257,7 @@ def execute_contract():
     future = ast.parse("from __future__ import annotations").body
     namespace = {
         "NativeRunner": NativeRunner,
+        "CAMAsyncAFDConnector": type("CAMAsyncAFDConnector", (), {}),
         "CUDAGraphMode": _GraphMode,
         "nullcontext": nullcontext,
         "step_afd_npu_profiler": lambda profiler: None,
@@ -279,6 +281,7 @@ def execute_contract():
             Callable[[], NativeRunner], namespace["AFDNPUAttentionModelRunnerV2"]
         )
         runner = runner_factory()
+        runner.connector = None
         runner.vllm_config = SimpleNamespace(
             compilation_config=SimpleNamespace(cudagraph_mode=_GraphMode.NONE)
         )

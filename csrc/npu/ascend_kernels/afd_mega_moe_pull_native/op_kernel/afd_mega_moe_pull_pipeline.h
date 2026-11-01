@@ -335,7 +335,13 @@ __aicore__ inline void ActivateNative(GM_ADDR scratch, const Cam::NativeMegaWork
         const uint32_t rows = round.begin[e + 1] - begin;
         if (rows) activation(raw[4ULL * begin * i], Catlass::MatrixCoord{rows, 2 * i},
             s1[begin], reinterpret_cast<__gm__ float *>(descriptor), out[uint64_t(begin) * i],
-            counts, begin, s2[begin], experts, 1, 0, 1, resource, t.aivNum, 0.0f, 2 * i);
+            counts, begin, s2[begin], experts, 1, 0, 1, resource, t.aivNum, 0.0f,
+#if defined(AFD_CANN_CATLASS_92)
+            static_cast<uint32_t>(Catlass::Epilogue::GatedActivationMode::SWIGLU),
+            Catlass::Epilogue::SwigluOaiActivation::DEFAULT_ALPHA,
+            Catlass::Epilogue::SituActivation::DEFAULT_BETA,
+#endif
+            2 * i);
         SyncAll<true>();
         CrossCoreSetFlag<2, PIPE_MTE3>(ACT_READY);
         begin = round.begin[e + 1];

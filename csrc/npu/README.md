@@ -51,8 +51,9 @@ Pull is not a standalone transport option: there is no `dispatch_mode`
 setting or separate pull DispatchRecv/CombineSend operator. MegaMoE requires
 `dynamicQuant=1`, per-channel W4A8 and `ffn_two_stream=false`.
 
-The A3 `AfdMegaMoePullNative` kernel directly includes CANN 9.1's W4A8
-`BlockMmad` from `ops_transformer/ascendc/mega_moe/arch22`. Set
+The A3 `AfdMegaMoePullNative` kernel directly includes the installed CANN MC2
+W4A8 `BlockMmad`. The build supports the CANN 9.1 MegaMoE header layout and
+the CANN 9.2 layout with Catlass under `ascendc/common/catlass/include`. Set
 `ASCEND_CANN_PACKAGE_PATH` or `ASCEND_HOME_PATH` to the CANN installation.
 When this operator is selected, configuration fails if its MC2 headers are
 missing; builds that exclude it do not need this dependency. The dependency
