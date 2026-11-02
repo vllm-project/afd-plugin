@@ -64,6 +64,9 @@ DSPARK_CONFIG="{\"method\":\"dspark\",\"model\":\"$MODEL\",\"num_speculative_tok
 For DP2 set `NUM_A=2`, `A_DEVICES=0,1`, and retain the four F devices.
 Target and draft use eager execution. F supports legacy execution and the
 existing layered W4A8 executor, with one combined target/draft weight table.
+For DSpark eager calls, F reads the CAM layer ID and passes only the selected
+layer's tensors to the operators. Cached per-layer views share the preloaded
+expert weights and use the same F service loop.
 The example selects legacy F. To enable layered W4A8, prefix only the F command
 with `AFD_ASYNC_CAM_LAYERED_GMM=1`; keep it set to `0` for A and P.
 
