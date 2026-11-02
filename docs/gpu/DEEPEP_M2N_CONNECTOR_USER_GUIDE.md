@@ -19,9 +19,16 @@ and dispatches only the routed copies of each token to the FFN ranks that hold
 those experts. FFN ranks run only routed experts and send the weighted rows
 back; Attention sums each token's top-k contributions in combine.
 
-Supported models: Qwen3 MoE (`Qwen3MoeForCausalLM`) whose layers are all MoE
-and which has no shared expert. DeepSeek and Qwen3.5/Qwen3.6 MoE are rejected
-with this connector.
+Supported models:
+
+- Qwen3 MoE (`Qwen3MoeForCausalLM`) whose layers are all MoE and which has no
+  shared expert.
+- DeepSeek-V2 (`DeepseekV2ForCausalLM`, validated with DeepSeek-V2-Lite).
+  Attention runs the dense layers and the shared experts; the shared experts
+  overlap the dispatch and the FFN. With Attention TP > 1 each TP rank runs
+  them, with replicated weights, on the token slice it dispatches.
+
+DeepSeek-V3, GLM-DSA and Qwen3.5/Qwen3.6 MoE are rejected with this connector.
 
 ## How it works
 
@@ -271,13 +278,14 @@ and FP8 examples, see the
   dispatch, DeepGEMM experts and combine against references on one node.
 - Model E2E: the Qwen3 MoE cases `afd-deepep-m2n-*-2a2f` in
   [`tests/e2e`](../../tests/e2e/README.md#deepep-m2n-scenarios) (eager, graph,
-  graph + DBO, and Attention TP2) and the two-pod cases in
+  graph + DBO, and Attention TP2), the same five DeepSeek-V2-Lite cases and
+  the two-pod cases in
   `tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py`.
 
 ## Requirements and limitations
 
 - SM90 or newer on every rank; the handshake rejects older GPUs.
-- Qwen3 MoE only, with every layer MoE and no shared expert.
+- Qwen3 MoE with every layer MoE and no shared expert, or DeepSeek-V2.
 - `compute_gate_on_attention=true` on both roles; EPLB is not supported.
 - FFN TP must be 1; FFN EP size equals `num_ffn_ranks`.
 - `num_experts` must be divisible by `num_ffn_ranks`.
