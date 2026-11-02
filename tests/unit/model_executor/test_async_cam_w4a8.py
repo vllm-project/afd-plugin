@@ -284,18 +284,22 @@ def test_layered_switch_rejects_other_roles_connectors_and_models(
 
 
 @pytest.mark.parametrize(
-    "eligible,layer_ids,error",
+    "eligible,draft_ids,layer_ids,error,enabled",
     [
-        (False, (0,), None),
-        (True, (0,), None),
-        (True, (2,), "remote MoE layer IDs"),
+        (False, None, (0,), None, False),
+        (True, None, (0,), None, True),
+        (True, None, (2,), "remote MoE layer IDs", False),
+        (True, (43, 44, 45), (0, 43, 44, 45), None, True),
+        (True, (43,), (0, 43, 44, 45), "remote MoE layer IDs", False),
+        (True, (), (0, 43, 44, 45), None, False),
     ],
 )
-def test_runner_initializes_ops_before_executor(eligible, layer_ids, error):
-    events: list[str] = []
-
+def test_runner_requires_complete_layered_target_and_draft_coverage(
+    operators, eligible, draft_ids, layer_ids, error, enabled
+):
     class Connector:
         dynamic_quant = 1
+        layered_gmm_enabled = False
 
     layer = weights()
     runner = SimpleNamespace(
@@ -307,14 +311,17 @@ def test_runner_initializes_ops_before_executor(eligible, layer_ids, error):
                 ([layer], "") if eligible else ([], "mixed quantization")
             )
         ),
+        draft_model=SimpleNamespace(
+            get_async_cam_w4a8_layers=lambda: (
+                [weights(idx) for idx in draft_ids],
+                "draft quantization is unsupported" if not draft_ids else "",
+            )
+        )
+        if draft_ids is not None
+        else None,
         layer_ids=layer_ids,
         _layered_executor=None,
     )
-
-    def build(layers):
-        assert events == ["ops"]
-        events.append("executor")
-        return SimpleNamespace(layer_id_to_slot=None)
 
     method = runner_method(
         "_initialize_layered_executor",
@@ -322,20 +329,17 @@ def test_runner_initializes_ops_before_executor(eligible, layer_ids, error):
             "CAMAsyncAFDConnector": Connector,
             "AscendDeviceType": SimpleNamespace(A3="A3"),
             "get_ascend_device_type": lambda: "A3",
-            "ensure_cam_async_ops_available": lambda: events.append("ops"),
-            "AsyncCAMW4A8Executor": build,
+            "ensure_cam_async_ops_available": lambda: None,
+            "AsyncCAMW4A8Executor": AsyncCAMW4A8Executor,
             "logger": SimpleNamespace(info=lambda *args: None),
         },
     )
     if error:
         with pytest.raises(ValueError, match=error):
             method(runner)
-        assert events == []
-        assert runner._layered_executor is None
-        return
-    method(runner)
-    assert events == (["ops", "executor"] if eligible else [])
-    assert (runner._layered_executor is not None) == eligible
+    else:
+        method(runner)
+    assert runner.connector.layered_gmm_enabled == enabled
 
 
 def test_layered_debug_logging_does_not_read_metadata(monkeypatch):
