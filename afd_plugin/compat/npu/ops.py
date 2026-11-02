@@ -14,7 +14,6 @@ AFD_CUST_OPAPI_ENV = "AFD_CUST_OPAPI_LIB_PATH"
 CAM_OP_NAMESPACE = AFD_ASCEND_OPS_NAMESPACE
 CAM_DISPATCH_SEND = "afd_async_dispatch_send"
 CAM_DISPATCH_RECV = "afd_async_dispatch_recv"
-CAM_DISPATCH_RECV_CANCELLABLE = "afd_async_dispatch_recv_cancellable"
 CAM_COMBINE_SEND = "afd_async_combine_send"
 CAM_COMBINE_RECV = "afd_async_combine_recv"
 
@@ -66,7 +65,6 @@ def _assert_cam_namespace_registered(torch: object) -> None:
     _ = (
         ops.afd_ascend.afd_async_dispatch_send,
         ops.afd_ascend.afd_async_dispatch_recv,
-        ops.afd_ascend.afd_async_dispatch_recv_cancellable,
         ops.afd_ascend.afd_async_combine_send,
         ops.afd_ascend.afd_async_combine_recv,
     )
@@ -117,8 +115,8 @@ def ensure_cam_async_ops_available() -> None:
         _assert_cam_namespace_registered(torch)
     except AttributeError as exc:
         raise RuntimeError(
-            "Async CAM requires routed-only and cancellable receive operators "
-            "under torch.ops.afd_ascend. Rebuild AFD with AFD_BUILD_ASCEND_OPS=1."
+            "Async CAM requires all four torch.ops.afd_ascend.afd_async_* "
+            "operators. Rebuild AFD with AFD_BUILD_ASCEND_OPS=1."
         ) from exc
 
 
@@ -129,7 +127,6 @@ __all__ = [
     "CAM_COMBINE_RECV",
     "CAM_COMBINE_SEND",
     "CAM_DISPATCH_RECV",
-    "CAM_DISPATCH_RECV_CANCELLABLE",
     "CAM_DISPATCH_SEND",
     "CAM_OP_NAMESPACE",
     "ensure_afd_ascend_ops_loaded",

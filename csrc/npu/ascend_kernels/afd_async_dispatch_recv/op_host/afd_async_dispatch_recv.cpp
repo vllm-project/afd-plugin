@@ -39,9 +39,6 @@ constexpr static int OUTPUT_EXPAND_X = 0;
 constexpr static int OUTPUT_DYNAMIC_SCALES = 1;
 constexpr static int OUTPUT_BATCH_INFO = 2;
 constexpr static int OUTPUT_EP_RECV_COUNT_ROUTED = 3;
-constexpr static int64_t RECV_CONTROL_V1 = 1;
-constexpr static int64_t RECV_CONTROL_FP16_ELEMENTS = 16;
-constexpr static int64_t RECV_STATUS_ELEMENTS = 4;
 
 constexpr static int TILING_KEY_BF16 = 100;
 constexpr static int TILING_KEY_FP16 = 101;
@@ -89,15 +86,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 
     auto attrs = context->GetAttrs();
     int64_t magic = *(attrs->GetInt(ATTR_ENUM_MAGIC));
-    OPS_ERR_IF(magic != 0 && magic != RECV_CONTROL_V1,
-        OPS_LOG_E(nodeName, "Unsupported receive control version: %ld", magic), return ge::GRAPH_FAILED);
-    if (magic == RECV_CONTROL_V1) {
-        const gert::StorageShape *controlShape = context->GetInputShape(1);
-        OPS_ERR_IF(controlShape == nullptr || controlShape->GetStorageShape().GetDimNum() != ONE_DIM ||
-            controlShape->GetStorageShape().GetDim(0) != RECV_CONTROL_FP16_ELEMENTS,
-            OPS_LOG_E(nodeName, "Receive V1 requires an initialized 32-byte control tensor"),
-            return ge::GRAPH_FAILED);
-    }
     int64_t maxSeqLen = *(attrs->GetInt(ATTR_ENUM_MAX_SEQ_LEN));
     int64_t hiddenSize = *(attrs->GetInt(ATTR_ENUM_HIDDEN_SIZE));
     int64_t topk = *(attrs->GetInt(ATTR_ENUM_TOPK));
@@ -258,10 +246,6 @@ static ge::graphStatus InferShape(gert::InferShapeContext* context)
     }
 
     int64_t batchInfoNum = INFO_NUM + tpSize + routeExpertNumPerMoe * tpSize;
-    if (*(attrs->GetInt(ATTR_ENUM_MAGIC)) == RECV_CONTROL_V1) {
-        batchInfoNum = ((batchInfoNum + RECV_STATUS_ELEMENTS - 1) / RECV_STATUS_ELEMENTS + 1) *
-            RECV_STATUS_ELEMENTS;
-    }
     gert::Shape *batchInfoOutShape = context->GetOutputShape(OUTPUT_BATCH_INFO);
     batchInfoOutShape->SetDimNum(1);
     batchInfoOutShape->SetDim(0, batchInfoNum);

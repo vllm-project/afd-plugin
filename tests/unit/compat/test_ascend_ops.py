@@ -93,7 +93,6 @@ def test_ascend_ops_namespace_check_allows_vllm_ascend_coexistence():
     [
         "afd_async_dispatch_send",
         "afd_async_dispatch_recv",
-        "afd_async_dispatch_recv_cancellable",
         "afd_async_combine_send",
         "afd_async_combine_recv",
         None,
@@ -103,7 +102,6 @@ def test_async_loader_requires_all_source_ops(monkeypatch, missing):
     names = (
         "afd_async_dispatch_send",
         "afd_async_dispatch_recv",
-        "afd_async_dispatch_recv_cancellable",
         "afd_async_combine_send",
         "afd_async_combine_recv",
     )

@@ -284,7 +284,6 @@ def test_ffn_warmup_capture_order_and_failure_propagation(
             graph_startup=startup,
             extra_info=connector_module.AFDAsyncExtraInfo(ffn_two_stream=two_stream),
             init_afd_connector=initialize_connector,
-            eager_receiver_shutdown=False,
             attn_size=2,
             tp_size=1,
             graph_startup_chunks=lambda: 2,
@@ -375,10 +374,7 @@ def test_worker_retains_resources_until_clean_exit(ffn_owners, state, two_stream
     runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
     runner.effective_mode = "eager" if two_stream else "full"
     runner._two_stream = object() if two_stream else None
-    runner.connector = SimpleNamespace(
-        close=lambda: calls.append("connector-close"),
-        eager_receiver_shutdown=False,
-    )
+    runner.connector = SimpleNamespace(close=lambda: calls.append("connector-close"))
     runner.shutdown = lambda: calls.append("release")
     worker = module.AFDNPUFFNWorker.__new__(module.AFDNPUFFNWorker)
     worker.model_runner = runner

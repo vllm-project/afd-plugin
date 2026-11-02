@@ -8,7 +8,6 @@ import importlib
 import logging
 import sys
 import types
-from concurrent.futures import Future
 from enum import IntEnum
 from types import SimpleNamespace
 
@@ -63,7 +62,6 @@ def _install_fake_vllm_core(
         ):
             self.vllm_config = vllm_config
             self.original_init_called = True
-            self._pooler_config_logged = False
 
         def shutdown(self):
             self.original_shutdown_called = True
@@ -86,10 +84,6 @@ def _install_fake_vllm_core(
 
     class EngineCoreProc(EngineCore):
         last_counts: tuple[int, int]
-
-        def _process_input_queue(self):
-            for respond in self.__dict__.pop("pending_utilities", ()):
-                respond()
 
         def run_busy_loop(self):
             self.original_run_busy_loop_called = True
@@ -613,7 +607,7 @@ def test_async_attention_loop_publishes_counts_via_upstream_hook(monkeypatch):
     assert all(stats.kv_cache_usage == 0.0 for stats in published_stats)
 
 
-def test_ffn_loop_responds_to_native_utility_before_shutdown(monkeypatch):
+def test_engine_core_patch_runs_and_stops_ffn_loop(monkeypatch):
     core_module = _install_fake_vllm_core(monkeypatch)
     _load_patch_module()
 
@@ -629,8 +623,6 @@ def test_ffn_loop_responds_to_native_utility_before_shutdown(monkeypatch):
 
     engine = core_module.EngineCoreProc(_config("ffn"), Executor, log_stats=True)
     engine.shutdown_state = _EngineShutdownState.RUNNING
-    response: Future[tuple[str, ...]] = Future()
-    engine.pending_utilities = [lambda: response.set_result(())]
 
     from afd_plugin.compat.patches import engine_core as engine_core_patch
 
@@ -642,48 +634,11 @@ def test_ffn_loop_responds_to_native_utility_before_shutdown(monkeypatch):
     with pytest.raises(SystemExit):
         engine.run_busy_loop()
 
-    assert response.result(timeout=0) == ()
     assert engine.model_executor.calls == [
         "start_ffn_server_loop",
         "raise_ffn_loop_error_if_any",
         "stop_ffn_server_loop",
     ]
-
-
-@pytest.fixture
-def native_ffn_utility_engine(monkeypatch):
-    native = pytest.importorskip("vllm.v1.engine.core")
-    supported = native.EngineCore.get_supported_tasks
-    log_pooler = native.EngineCore._log_pooler_config
-    module = _install_fake_vllm_core(monkeypatch)
-    module.EngineCore.get_supported_tasks = supported
-    module.EngineCore._log_pooler_config = log_pooler
-
-    def executor(_):
-        return SimpleNamespace(supported_tasks=())
-
-    def create(preloaded):
-        config = _config("ffn")
-        config.model_config.runner_type = "generate"
-        config.model_config.pooler_config = None
-        if preloaded:
-            _load_patch_module()
-            return module.EngineCoreProc(config, executor, log_stats=False)
-        engine = module.EngineCoreProc(config, executor, log_stats=False)
-        engine.model_executor = executor(config)
-        patch = _load_patch_module()
-        patch._prepare_late_loaded_ffn_engine_core(engine, config)
-        return engine
-
-    return create
-
-
-@pytest.mark.parametrize("preloaded", [True, False], ids=("preloaded", "late-loaded"))
-def test_ffn_initialization_supports_actual_native_utility(
-    native_ffn_utility_engine, preloaded
-):
-    engine = native_ffn_utility_engine(preloaded)
-    assert engine.get_supported_tasks() == ()
 
 
 def test_engine_core_ffn_readiness_log_follows_start_rpc(monkeypatch):

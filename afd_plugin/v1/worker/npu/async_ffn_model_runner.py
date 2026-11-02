@@ -224,31 +224,10 @@ class AsyncNPUFFNModelRunner:
             layer_ids=self.layer_ids,
             stream_signature=stream_signature,
             stream_error=stream_error,
-            cancellable_eager=(
-                self.draft_model is not None
-                and self.requested_mode == "eager"
-                and executor is None
-                and not config.ffn_two_stream
-            ),
         )
         try:
             self.connector.init_afd_connector()
             self.effective_mode = self.connector.graph_startup.mode
-            if self.connector.eager_receiver_shutdown:
-                remaining = self.connector.graph_startup_chunks() * (
-                    self.connector.attn_size // self.connector.tp_size
-                )
-                deadline = time.monotonic() + GRAPH_STARTUP_TIMEOUT_SECONDS
-                while remaining:
-                    self.connector.graph_startup.check_failure()
-                    if time.monotonic() >= deadline:
-                        raise RuntimeError("Async CAM paired eager warmup timed out")
-                    if self._ffn_forward_connector_driven(single=True) is not None:
-                        remaining -= 1
-                done = torch.npu.Event()
-                done.record()
-                self._wait_graph_device(done)
-                self.connector.graph_startup.phase("eager-warmed")
             if self._two_stream is not None:
                 self._two_stream.compute.wait_stream(
                     torch.npu.current_stream(self.device)
@@ -449,7 +428,7 @@ class AsyncNPUFFNModelRunner:
         if self._graph is None and self._two_stream is None:
             # Preserve main's eager layer loop and synchronization policy.
             self._ffn_forward_connector_driven()
-            return not self.connector.receiver_stopped
+            return True
         if not self._service_announced:
             self.connector.graph_startup.service_ready()
             self._service_announced = True
@@ -489,8 +468,6 @@ class AsyncNPUFFNModelRunner:
                 stage_idx=stage_idx,
                 max_num_tokens=self.max_num_tokens,
             )
-            if work_item is None:
-                return None
             hidden_states = work_item.hidden_states
             metadata = work_item.context.metadata
             legacy_states = work_item.context.states

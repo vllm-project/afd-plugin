@@ -26,7 +26,6 @@ class FFNGraphPlan:
     layer_ids: tuple[int, ...] = ()
     stream_signature: str = ""
     stream_error: str = ""
-    cancellable_eager: bool = False
 
 
 def resolve_ffn_mode(plans: list[FFNGraphPlan]) -> str:
@@ -66,7 +65,6 @@ class AsyncCAMGraphStartup:
         self.plan = FFNGraphPlan()
         self.mode = "eager"
         self.warmup_layer_id: int | None = None
-        self.cancellable_eager = False
         self._store: Store | None = None
         self._prefix = ""
         self.validate_attention_streams: Callable[[], None] | None = None
@@ -138,20 +136,7 @@ class AsyncCAMGraphStartup:
             self.mode = resolve_ffn_mode(plans)
             ffn_plan = plans[0]
             two_stream = bool(ffn_plan.stream_signature)
-            if len({plan.cancellable_eager for plan in plans}) != 1:
-                raise ValueError(
-                    "FFN receive cancellation protocols differ across ranks"
-                )
-            self.cancellable_eager = ffn_plan.cancellable_eager
-            if self.cancellable_eager and (
-                self.mode != "eager" or two_stream or ffn_plan.signature
-            ):
-                raise ValueError(
-                    "Cancellable receive requires the eager legacy FFN path"
-                )
-            validate_transport = (
-                self.mode == "full" or two_stream or self.cancellable_eager
-            )
+            validate_transport = self.mode == "full" or two_stream
             if (
                 validate_transport
                 and len({entry["transport"] for entry in entries}) != 1
@@ -164,13 +149,7 @@ class AsyncCAMGraphStartup:
                 ):
                     self.validate_attention_streams()
                 self.phase("streams-validated")
-            if self.cancellable_eager and (
-                not ffn_plan.layer_ids or len({plan.layer_ids for plan in plans}) != 1
-            ):
-                raise ValueError(
-                    "Cancellable eager warmup requires matching layer tables"
-                )
-            if self.mode == "full" or self.cancellable_eager:
+            if self.mode == "full":
                 self.warmup_layer_id = ffn_plan.layer_ids[0]
         except Exception as exc:
             self.fail(exc)
@@ -182,30 +161,3 @@ class AsyncCAMGraphStartup:
 
     def wait_service_ready(self) -> None:
         self._wait(self._keys("service", range(self.attn_size, self.world_size)))
-
-    def attention_drained(self) -> None:
-        """Publish only after local submissions and device work have stopped."""
-        if self.world_rank >= self.attn_size:
-            raise RuntimeError(
-                "Only Attention ranks can publish a drained acknowledgement"
-            )
-        self._publish("attention-drained")
-
-    def all_attention_drained(self) -> bool:
-        self.check_failure()
-        assert self._store is not None
-        return self._store.check(self._keys("attention-drained", range(self.attn_size)))
-
-    def wait_attention_drained(self) -> None:
-        self._wait(self._keys("attention-drained", range(self.attn_size)))
-
-    def receiver_exited(self) -> None:
-        """Publish after the F host loop and its device work have completed."""
-        if self.world_rank < self.attn_size:
-            raise RuntimeError("Only FFN ranks can publish receiver completion")
-        self._publish("receiver-exited")
-
-    def wait_receivers_exited(self) -> None:
-        self._wait(
-            self._keys("receiver-exited", range(self.attn_size, self.world_size))
-        )

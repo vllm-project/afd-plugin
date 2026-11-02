@@ -3,11 +3,6 @@
 """Executor-side state for CPU KV-cache configuration contracts."""
 
 from copy import deepcopy
-from types import SimpleNamespace
-
-
-class KVTransferEngine(SimpleNamespace):
-    """Weak-referenceable SDK boundary with fixture-supplied operations."""
 
 
 class KVCacheExecutor:

@@ -163,10 +163,9 @@ then serves both from its existing receive loop. Each native draft proposal
 installs its own AFD metadata and opts out of cross-DP synchronization; native
 sampling, rejection, heads and context-KV updates are inherited. The
 [0.32 eager recipe](../../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md)
-covers colocated serving and target-only P handoff. The
-[PD contract](pd_dspark_context.md) defines auxiliary-state transfer and
-initialization of actual draft SWA slots before Decode admission. FULL graphs
-remain a separate phase.
+describes A/F serving. In PD deployments, Prefill uses the upstream complete
+draft model and KV connector; AFD does not add a Prefill runner, auxiliary-state
+carrier or Decode-side context initializer. FULL graphs remain a separate phase.
 
 Shared-expert layout is model-specific. DeepSeek-V2/V3 Async CAM forces
 replicated shared weights when effective model SP is enabled. DeepSeek-V4

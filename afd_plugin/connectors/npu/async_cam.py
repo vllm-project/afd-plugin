@@ -28,10 +28,8 @@ derivation, launch guidance, and the full limitations.
 from __future__ import annotations
 
 import os
-import threading
 import time
 from collections.abc import Mapping
-from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Final, cast
@@ -78,10 +76,6 @@ if TYPE_CHECKING:
 
 AFD_ASYNC_CAM_GROUP_NAME = "afd_async_cam"
 CAM_COMM_ID = 0
-RECV_CONTROL_ELEMENTS = 4
-RECV_DATA = 0
-RECV_STOPPED = 1
-RECV_IDLE = 3
 ATTN_RANKS_PER_DP_CONFIG_KEY = "attn_ranks_per_dp"
 
 _AFD_ASYNC_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
@@ -244,7 +238,6 @@ class AFDAsyncTransferState(AFDTransferState):
     group_list: Tensor | None = None
     dynamic_scales: Tensor | None = None
     send_completion: Tensor | None = None
-    recv_status: Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -342,17 +335,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         self.expert_per_rank = self.topology.expert_per_rank
         self.comm_args: Tensor | None = None
         self._placeholder: Tensor | None = None
-        self._closing = self._attention_drained = False
-        self._attention_submission_lock = threading.RLock()
-        self.receiver_stopped = False
-        self._receiver_exited = self._receiver_stop_requested = False
-        self._receiver_control: Tensor | None = None
-        self._receiver_stop_host: Tensor | None = None
-        self._receiver_control_stream: torch.npu.Stream | None = None
-        self._receiver_stop_thread: threading.Thread | None = None
-        self._receiver_stop_event = threading.Event()
-        self._receiver_stop_lock = threading.Lock()
-        self._receiver_stop_failure: Exception | None = None
         self._pending_attention_payloads: dict[
             int,
             list[tuple[AFDTransferContext, Tensor, Tensor]],
@@ -399,17 +381,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             device=device,
         )
         self._initialized = True
-        if self.eager_receiver_shutdown and self.world_rank >= self.attn_size:
-            self._initialize_receiver_shutdown()
         if self.graph_startup.mode == "full" and self.world_rank < self.attn_size:
             self._run_attention_graph_startup()
-        elif self.eager_receiver_shutdown and self.world_rank < self.attn_size:
-            try:
-                self._warm_up_attention_communication()
-                self.graph_startup.phase("eager-warmed")
-            except Exception as exc:
-                self.graph_startup.fail(exc)
-                raise
 
     def _initialize_graph_startup(self, store: Store) -> None:
         self.graph_startup.validate_attention_streams = (
@@ -479,7 +452,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         experts_per_chunk = cam_receive_capacity() // self.tp_size
         return max(1, (local_experts + experts_per_chunk - 1) // experts_per_chunk)
 
-    def _warm_up_attention_communication(self) -> None:
+    def _run_attention_graph_startup(self) -> None:
         assert self.graph_startup.warmup_layer_id is not None
         device = torch.device(f"npu:{self.local_rank}")
         hidden = torch.ones(
@@ -487,22 +460,17 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         )
         ids = torch.arange(self.topk, dtype=torch.int32, device=device).view(1, -1)
         weights = torch.full((1, self.topk), 1 / self.topk, device=device)
-        # Every A/F rank enters the first MC2 operator together. Deferring A's
-        # first send until a user request can time out F's resource allocation
-        # before its device receive kernel has even started.
-        context = AFDTransferContext(
-            AFDTransferMetadata(self.graph_startup.warmup_layer_id, 0, [1])
-        )
-        self.send_attn_output(hidden, context, topk_ids=ids, topk_weights=weights)
-        output = self.recv_ffn_output(hidden, context=context)
-        done = torch.npu.Event()
-        done.record()
-        self.wait_graph_device(done)
-        del output
-
-    def _run_attention_graph_startup(self) -> None:
         try:
-            self._warm_up_attention_communication()
+            # Every A/F rank participates in cold MC2 warmup before capture.
+            context = AFDTransferContext(
+                AFDTransferMetadata(self.graph_startup.warmup_layer_id, 0, [1])
+            )
+            self.send_attn_output(hidden, context, topk_ids=ids, topk_weights=weights)
+            output = self.recv_ffn_output(hidden, context=context)
+            done = torch.npu.Event()
+            done.record()
+            self.wait_graph_device(done)
+            del output
             self.graph_startup.phase("warmup")
             self.graph_startup.phase("captured")
             self.graph_startup.wait_service_ready()
@@ -511,27 +479,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             raise
 
     def close(self) -> None:
-        """Release eager DSpark resources only after the receiver has exited."""
-        if self._initialized and self.eager_receiver_shutdown:
-            if self.world_rank < self.attn_size:
-                self.drain_attention()
-            else:
-                self._check_receiver_shutdown_failure()
-                if not self._receiver_exited:
-                    raise RuntimeError(
-                        "Async CAM receiver has not exited; retain resources"
-                    )
-                self._receiver_stop_event.set()
-                thread = self._receiver_stop_thread
-                if thread is not None:
-                    thread.join(timeout=GRAPH_STARTUP_TIMEOUT_SECONDS)
-                    if thread.is_alive():
-                        raise RuntimeError(
-                            "Async CAM stop watcher did not exit; retain resources"
-                        )
-                stream = self._receiver_control_stream
-                if stream is not None:
-                    stream.synchronize()
+        """Destroy the HCCL process group and clear pending transfer states."""
         if self.cam_pg is not None:
             import torch.distributed as dist
 
@@ -539,105 +487,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         self.cam_pg = None
         self.comm_args = None
         self._placeholder = None
-        self._receiver_control = self._receiver_stop_host = None
-        self._receiver_control_stream = None
-        self._receiver_stop_thread = None
         self._pending_attention_payloads.clear()
         self._initialized = False
-
-    @property
-    def eager_receiver_shutdown(self) -> bool:
-        """The negotiated opt-in covers DSpark's eager legacy FFN path."""
-        return self.graph_startup.cancellable_eager
-
-    def _initialize_receiver_shutdown(self) -> None:
-        self._receiver_control = torch.zeros(
-            RECV_CONTROL_ELEMENTS, dtype=torch.int64, device=f"npu:{self.local_rank}"
-        )
-        self._receiver_stop_host = torch.zeros(
-            RECV_CONTROL_ELEMENTS, dtype=torch.int64, pin_memory=True
-        )
-        self._receiver_control_stream = torch.npu.Stream(device=self.local_rank)
-        # Finish initialization before the receiving thread or Store watcher can
-        # read/update this address. This synchronization is startup-only.
-        torch.npu.current_stream(self.local_rank).synchronize()
-
-        def observe_attention_drain() -> None:
-            try:
-                torch.npu.set_device(self.local_rank)
-                while not self._receiver_stop_event.wait(POLL_SECONDS):
-                    if self.graph_startup.all_attention_drained():
-                        self._publish_receiver_stop()
-                        return
-            except Exception as exc:
-                self._receiver_stop_failure = exc
-                self.graph_startup.fail(exc)
-
-        self._receiver_stop_thread = threading.Thread(
-            target=observe_attention_drain,
-            name="afd-cam-receiver-stop",
-            daemon=True,
-        )
-        self._receiver_stop_thread.start()
-
-    def _check_receiver_shutdown_failure(self) -> None:
-        if self._receiver_stop_failure is not None:
-            raise RuntimeError(
-                "Async CAM receiver shutdown failed; retain resources"
-            ) from self._receiver_stop_failure
-
-    def _publish_receiver_stop(self) -> None:
-        with self._receiver_stop_lock:
-            self._check_receiver_shutdown_failure()
-            if self._receiver_stop_requested:
-                return
-            assert self._receiver_control is not None
-            assert self._receiver_stop_host is not None
-            assert self._receiver_control_stream is not None
-            # CPU mutation followed by pinned H2D DMA does not need an AIV
-            # kernel: the idle receive may occupy every available AIV.
-            self._receiver_stop_host[0] = RECV_STOPPED
-            with torch.npu.stream(self._receiver_control_stream):
-                self._receiver_control.copy_(
-                    self._receiver_stop_host, non_blocking=True
-                )
-            self._receiver_stop_requested = True
-
-    def request_receiver_stop(self) -> None:
-        self._check_receiver_shutdown_failure()
-        if self._receiver_exited:
-            return
-        self.graph_startup.wait_attention_drained()
-        self._publish_receiver_stop()
-
-    def finish_receiver_shutdown(self) -> None:
-        """Called by the returning F loop, before its thread is joined."""
-        with self._receiver_stop_lock:
-            self._check_receiver_shutdown_failure()
-            if not self._receiver_stop_requested:
-                raise RuntimeError(
-                    "Async CAM receiver exited before drain; retain resources"
-                )
-        torch.npu.synchronize(self.local_rank)
-        self._receiver_exited = True
-        self.graph_startup.receiver_exited()
-        logger.info("AFD Async CAM F receiver device work completed")
-
-    def drain_attention(self) -> None:
-        """Seal submissions, finish A work, and wait for every F receiver."""
-        if self._attention_drained:
-            return
-        with self._attention_submission_lock:
-            self._closing = True
-            if any(self._pending_attention_payloads.values()):
-                raise RuntimeError(
-                    "Async CAM Attention has pending exchanges; retain resources"
-                )
-        torch.npu.synchronize(self.local_rank)
-        self.graph_startup.attention_drained()
-        self.graph_startup.wait_receivers_exited()
-        self._attention_drained = True
-        logger.info("AFD Async CAM A drained; all F receivers acknowledged exit")
 
     def select_experts(self, **kwargs: Any) -> tuple[Tensor, Tensor]:
         """Run the target vLLM-Ascend router on Attention."""
@@ -648,7 +499,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         *,
         stage_idx: int,
         max_num_tokens: int,
-    ) -> AFDAsyncFFNWorkItem | None:
+    ) -> AFDAsyncFFNWorkItem:
         """Receive and normalize one connector-driven FFN dispatch item.
 
         CAM metadata supplies the actual layer and routed token counts;
@@ -678,19 +529,9 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
                 token_nums_rankid_layeridx[0],
                 token_nums_rankid_layeridx[2],
                 expert_token_nums.sum(dtype=torch.int64),
-                *(() if states.recv_status is None else (states.recv_status[0],)),
             )
         )
-        values = control.cpu().tolist()
-        total_num_tokens, layer_idx, num_tokens = values[:3]
-        if states.recv_status is not None:
-            if values[3] == RECV_IDLE:
-                return None
-            if values[3] == RECV_STOPPED:
-                self.receiver_stopped = True
-                return None
-            if values[3] != RECV_DATA:
-                raise RuntimeError("Unknown Async CAM receive status; retain resources")
+        total_num_tokens, layer_idx, num_tokens = control.cpu().tolist()
         if not 0 <= num_tokens <= recv_output.hidden_states.shape[0]:
             raise RuntimeError(
                 "AFD async CAM routed chunk count is outside dispatch-recv capacity"
@@ -782,18 +623,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         context: AFDTransferContext,
         **kwargs: Any,
     ) -> None:
-        guard: AbstractContextManager[object] = nullcontext()
-        if self.eager_receiver_shutdown:
-            guard = self._attention_submission_lock
-        with guard:
-            self._send_attn_output(hidden_states, context, **kwargs)
-
-    def _send_attn_output(
-        self,
-        hidden_states: Tensor,
-        context: AFDTransferContext,
-        **kwargs: Any,
-    ) -> None:
         """Dispatch Attention activations and top-k routing to FFN ranks.
 
         The matching context and routing tensors are queued per async stage
@@ -801,10 +630,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         must match the transfer metadata and model configuration.
         """
         self._require_initialized()
-        if self._closing:
-            raise RuntimeError(
-                "Async CAM Attention is draining; new dispatch is closed"
-            )
         metadata = context.metadata
         if not metadata.validate_tensor_shape(tuple(hidden_states.shape)):
             raise ValueError(
@@ -887,18 +712,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         return None
 
     def recv_ffn_output(
-        self,
-        ref_tensor: Tensor,
-        ubatch_idx: int = 0,
-        **kwargs: Any,
-    ) -> Tensor:
-        guard: AbstractContextManager[object] = nullcontext()
-        if self.eager_receiver_shutdown:
-            guard = self._attention_submission_lock
-        with guard:
-            return self._recv_ffn_output(ref_tensor, ubatch_idx, **kwargs)
-
-    def _recv_ffn_output(
         self,
         ref_tensor: Tensor,
         ubatch_idx: int = 0,
@@ -1024,15 +837,9 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dynamic_quant=self.dynamic_quant,
             group_name=self.group_name,
         )
-        cancellable = self.eager_receiver_shutdown
-        operation = (
-            torch.ops.afd_ascend.afd_async_dispatch_recv_cancellable
-            if cancellable
-            else torch.ops.afd_ascend.afd_async_dispatch_recv
-        )
-        outputs = operation(
+        outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(
             placeholder,
-            self._receiver_control if cancellable else self.comm_args,
+            self.comm_args,
             self.comm_id,
             self.max_num_batched_tokens,
             states.hidden_size,
@@ -1046,9 +853,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             self.dynamic_quant,
             self.group_name,
         )
-        hidden_states, dynamic_scales, batch_info, expert_token_nums = outputs[:4]
-        if cancellable:
-            states.recv_status = outputs[4]
+        hidden_states, dynamic_scales, batch_info, expert_token_nums = outputs
         _log_cam_op_values(
             "async_dispatch_recv",
             "outputs",

@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
 from types import MethodType
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
@@ -360,24 +360,6 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         kv_cache_config: KVCacheConfig,
         kv_cache_allocation_context: AbstractContextManager | None = None,
     ) -> None:
-        # ### PATCH START: bind the loaded draft before connector registration
-        if (
-            self.vllm_config.kv_transfer_config is not None
-            and self.vllm_config.kv_transfer_config.is_kv_consumer
-            and self.speculative_config is not None
-            and self.speculative_config.use_dspark()
-        ):
-            from vllm.distributed.kv_transfer import get_kv_transfer_group
-
-            from afd_plugin.distributed.kv_transfer.dspark_mooncake import (
-                AFDDSparkMooncakeConnector,
-            )
-
-            transfer = get_kv_transfer_group()
-            if not isinstance(transfer, AFDDSparkMooncakeConnector):
-                raise TypeError("DSpark PD requires AFDDSparkMooncakeConnector")
-            transfer.bind_draft_model(cast(AFDDSparkSpeculator, self.speculator))
-        # ### PATCH END: bind the loaded draft before connector registration
         # ### PATCH START: create the native NPU ubatch adapter.
         with use_npu_ubatch_factory(self):
             super().initialize_kv_cache(kv_cache_config, kv_cache_allocation_context)
@@ -556,26 +538,6 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     # Removal/upstream plan: delete this wrapper if AFD-owned lifecycle moves
     # to a shared composition/factory owner; it never copies native cleanup.
     def shutdown(self) -> None:
-        # Load the backend-specific type only inside this NPU worker teardown.
-        from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
-
-        if (
-            isinstance(self.connector, CAMAsyncAFDConnector)
-            and self.connector.eager_receiver_shutdown
-        ):
-            # ### PATCH START: drain the eager DSpark session before freeing KV.
-            # Failure deliberately retains models, cache, communicator, and
-            # metadata. Process cleanup is distinct from orderly completion.
-            if self.ubatch_runner is not None:
-                self.ubatch_runner.abort_pending_run()
-            self.connector.drain_attention()
-            stop_afd_npu_profiler(self.prof)
-            self.connector.close()
-            super().shutdown()
-            self.ubatch_runner = None
-            self._afd_pending_metadata = None
-            return
-            # ### PATCH END: drain the eager DSpark session before freeing KV.
         # ### PATCH START: guarantee profiler/native/connector cleanup.
         try:
             stop_afd_npu_profiler(self.prof)

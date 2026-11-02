@@ -613,9 +613,6 @@ def _initialize_ffn_engine_core(
     self.vllm_config = vllm_config
     self.afd_config = afd_config
     self.log_stats = log_stats
-    # Native get_supported_tasks() reads this before checking runner type.
-    # Preserve it when the FFN fast initializer skips native __init__.
-    self._pooler_config_logged = False
 
     with suppress(Exception):
         vllm_config.afd_config = afd_config
@@ -690,12 +687,7 @@ def _run_ffn_busy_loop(self, core_module: Any) -> None:
         core_module.logger.info(
             "AFD FFN EngineCore started; workers run connector loop."
         )
-        # Native frontend initialization sends get_supported_tasks as a utility
-        # request. Keep servicing its control queue while experts run in the
-        # worker thread; blocking here would also suppress worker-health polls.
-        self.process_input_queue_block = False
         while _is_running(self, core_module):
-            self._process_input_queue()
             self.model_executor.collective_rpc("raise_ffn_loop_error_if_any")
             time.sleep(0.5)
     except KeyboardInterrupt:

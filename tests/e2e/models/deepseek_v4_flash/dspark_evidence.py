@@ -33,7 +33,6 @@ def snapshot(runner) -> dict:
             "rank": runner.connector.world_rank,
             "role": "ffn",
             "released": True,
-            "receiver_stopped": runner.connector.receiver_stopped,
         }
     names = tuple(name for name, _ in draft.named_parameters())
     kv_groups = []

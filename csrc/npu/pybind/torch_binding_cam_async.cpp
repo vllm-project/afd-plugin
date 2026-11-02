@@ -8,7 +8,6 @@
 // ACLNN calls, without the source's placeholder autograd implementation.
 
 #include <cstdlib>
-#include <cstdint>
 #include <exception>
 #include <string>
 #include <vector>
@@ -28,8 +27,6 @@ namespace {
 constexpr int64_t MAX_SEQUENCE_LENGTH = 1024 * 256;
 constexpr int64_t BATCH_INFO_FIELDS = 5;
 constexpr int64_t RESERVED_MAGIC = 0;
-constexpr int64_t RECV_CONTROL_V1 = 1;
-constexpr int64_t RECV_CONTROL_ELEMENTS = 4;
 constexpr float DEFAULT_BATCH_SIZE_FACTOR = 1.0f;
 
 void check_tensor(const at::Tensor &tensor, const at::Tensor &anchor,
@@ -142,7 +139,7 @@ at::Tensor dispatch_send(
 // Source: moe_dispatch_recv_async.cpp::cam_dispatch_recv_async_impl_npu/meta.
 // AFD adapter: one compact-v2 allocator for both backends, with inference checks.
 // Signature retains the source arguments; the template chooses execution only.
-template <bool EXECUTE_NPU, bool CANCELLABLE = false>
+template <bool EXECUTE_NPU>
 std::vector<at::Tensor> dispatch_recv(
     const at::Tensor &x, const at::Tensor &comm_args, const int64_t comm_id,
     const int64_t max_seq_len, const int64_t hidden_size, const int64_t top_k,
@@ -159,55 +156,29 @@ std::vector<at::Tensor> dispatch_recv(
   TORCH_CHECK(moe_rank_id >= attn_rank_num && moe_rank_id < world_size,
               "moe_rank_id must be the global rank of a MoE participant");
   TORCH_CHECK(x.dim() == 1 && x.size(0) == 1, "x must be a one-element anchor");
-  at::Tensor comm_input = comm_args;
-  if constexpr (CANCELLABLE) {
-    TORCH_CHECK(comm_args.scalar_type() == at::kLong &&
-                    comm_args.dim() == 1 &&
-                    comm_args.numel() == RECV_CONTROL_ELEMENTS &&
-                    comm_args.storage_offset() == 0,
-                "recv_control must be a base contiguous int64[4] tensor");
-    if constexpr (EXECUTE_NPU) {
-      TORCH_CHECK(reinterpret_cast<uintptr_t>(comm_args.data_ptr()) % 32 == 0,
-                  "recv_control must have a 32-byte-aligned base address");
-    }
-    // The versioned entry point owns this read-only control layout. The CANN
-    // ABI retains its FP16 commArgs parameter; legacy magic=0 never reads it.
-    comm_input = comm_args.view(at::kHalf);
-  } else {
-    TORCH_CHECK(comm_args.scalar_type() == at::kHalf,
-                "comm_args must have dtype float16");
-  }
+  TORCH_CHECK(comm_args.scalar_type() == at::kHalf,
+              "comm_args must have dtype float16");
   TORCH_CHECK(dynamic_quant == 0 || dynamic_quant == 1,
               "dynamic_quant must be 0 or 1");
   const int64_t capacity = dispatch_recv_capacity();
   const int64_t batch_info_size =
       BATCH_INFO_FIELDS + tp_size + route_expert_num_per_moe * tp_size;
-  const int64_t status_offset =
-      ((batch_info_size + RECV_CONTROL_ELEMENTS - 1) / RECV_CONTROL_ELEMENTS) *
-      RECV_CONTROL_ELEMENTS;
   at::Tensor expanded = at::empty(
       {capacity, hidden_size}, dynamic_quant == 1 ? x.options().dtype(at::kChar)
                                                   : x.options());
   at::Tensor scales = at::empty({dynamic_quant == 1 ? capacity : 1},
                                 x.options().dtype(at::kFloat));
-  at::Tensor batch_info = at::empty(
-      {CANCELLABLE ? status_offset + RECV_CONTROL_ELEMENTS : batch_info_size},
-      x.options().dtype(at::kLong));
+  at::Tensor batch_info = at::empty({batch_info_size}, x.options().dtype(at::kLong));
   at::Tensor counts = at::empty({route_expert_num_per_moe},
                                x.options().dtype(at::kLong));
   if constexpr (EXECUTE_NPU) {
     std::string group(group_name.data(), group_name.size());
     char *group_ptr = group.data();
-    EXEC_NPU_CMD(aclnnAfdAsyncDispatchRecv, x, comm_input,
-                 CANCELLABLE ? RECV_CONTROL_V1 : RESERVED_MAGIC,
-                 max_seq_len, hidden_size, top_k, moe_rank_num,
+    EXEC_NPU_CMD(aclnnAfdAsyncDispatchRecv, x, comm_args,
+                 RESERVED_MAGIC, max_seq_len, hidden_size, top_k, moe_rank_num,
                  attn_rank_num, route_expert_num_per_moe, moe_rank_id,
                  world_size, tp_size, dynamic_quant, group_ptr,
                  expanded, scales, batch_info, counts);
-  }
-  if constexpr (CANCELLABLE) {
-    return {expanded, scales, batch_info.narrow(0, 0, batch_info_size), counts,
-            batch_info.narrow(0, status_offset, 1)};
   }
   return {expanded, scales, batch_info, counts};
 }
@@ -314,11 +285,6 @@ TORCH_LIBRARY_FRAGMENT(afd_ascend, ops) {
           "int moe_rank_num, int attn_rank_num, int route_expert_num_per_moe, "
           "int moe_rank_id, int world_size, int tp_size, int dynamic_quant, "
           "str group_name) -> Tensor[]");
-  ops.def("afd_async_dispatch_recv_cancellable(Tensor x, Tensor recv_control, "
-          "int comm_id, int max_seq_len, int hidden_size, int top_k, "
-          "int moe_rank_num, int attn_rank_num, int route_expert_num_per_moe, "
-          "int moe_rank_id, int world_size, int tp_size, int dynamic_quant, "
-          "str group_name) -> Tensor[]");
   ops.def("afd_async_combine_send(Tensor expand_x, Tensor comm_args, Tensor batch_info, "
           "int comm_id, int max_seq_len, int hidden_size, int top_k, "
           "int moe_rank_num, int attn_rank_num, int route_expert_num_per_moe, "
@@ -333,8 +299,6 @@ TORCH_LIBRARY_FRAGMENT(afd_ascend, ops) {
 TORCH_LIBRARY_IMPL(afd_ascend, PrivateUse1, ops) {
   ops.impl("afd_async_dispatch_send", &afd_plugin::cam_async::dispatch_send<true>);
   ops.impl("afd_async_dispatch_recv", &afd_plugin::cam_async::dispatch_recv<true>);
-  ops.impl("afd_async_dispatch_recv_cancellable",
-           &afd_plugin::cam_async::dispatch_recv<true, true>);
   ops.impl("afd_async_combine_send", &afd_plugin::cam_async::combine_send<true>);
   ops.impl("afd_async_combine_recv", &afd_plugin::cam_async::combine_recv<true>);
 }
@@ -343,8 +307,6 @@ TORCH_LIBRARY_IMPL(afd_ascend, PrivateUse1, ops) {
 TORCH_LIBRARY_IMPL(afd_ascend, AutogradPrivateUse1, ops) {
   ops.impl("afd_async_dispatch_send", &afd_plugin::cam_async::dispatch_send<true>);
   ops.impl("afd_async_dispatch_recv", &afd_plugin::cam_async::dispatch_recv<true>);
-  ops.impl("afd_async_dispatch_recv_cancellable",
-           &afd_plugin::cam_async::dispatch_recv<true, true>);
   ops.impl("afd_async_combine_send", &afd_plugin::cam_async::combine_send<true>);
   ops.impl("afd_async_combine_recv", &afd_plugin::cam_async::combine_recv<true>);
 }
@@ -352,8 +314,6 @@ TORCH_LIBRARY_IMPL(afd_ascend, AutogradPrivateUse1, ops) {
 TORCH_LIBRARY_IMPL(afd_ascend, Meta, ops) {
   ops.impl("afd_async_dispatch_send", &afd_plugin::cam_async::dispatch_send<false>);
   ops.impl("afd_async_dispatch_recv", &afd_plugin::cam_async::dispatch_recv<false>);
-  ops.impl("afd_async_dispatch_recv_cancellable",
-           &afd_plugin::cam_async::dispatch_recv<false, true>);
   ops.impl("afd_async_combine_send", &afd_plugin::cam_async::combine_send<false>);
   ops.impl("afd_async_combine_recv", &afd_plugin::cam_async::combine_recv<false>);
 }
