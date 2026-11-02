@@ -405,9 +405,9 @@ class AsyncNPUFFNModelRunner:
         )
 
     @torch.inference_mode()
-    def execute_connector_driven_step(self) -> bool:
+    def execute_connector_driven_step(self, shutdown_requested: bool = False) -> bool:
         step_afd_npu_profiler(self.prof)
-        if not self.session.keep_serving(False):
+        if not self.session.keep_serving(shutdown_requested):
             return False
         if self._first_step:
             self.session.before_first_step()

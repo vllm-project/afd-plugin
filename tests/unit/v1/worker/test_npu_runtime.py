@@ -828,7 +828,9 @@ def test_npu_ffn_worker_uses_connector_driven_loop_for_async_connector(monkeypat
     event = threading.Event()
     calls: list[str | tuple[str, SimpleNamespace]] = []
 
-    def execute_connector_driven_step():
+    def execute_connector_driven_step(shutdown_requested):
+        if shutdown_requested:
+            return False
         calls.append("step")
         event.set()
         return True

@@ -396,6 +396,30 @@ def test_ffn_announces_service_only_on_receiver_execution(modules):
     assert calls == ["ready", ("submit", 2), ("submit", 2)]
 
 
+@pytest.mark.parametrize("session_serves", [False, True])
+def test_ffn_step_lets_session_decide_service_after_shutdown(modules, session_serves):
+    _, connector_module, runtime = modules
+    runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
+    submitted: list[int] = []
+    serving = [True] if session_serves else []
+    runner.__dict__.update(
+        prof=None,
+        _graph=object(),
+        _service_announced=True,
+        _first_step=False,
+        session=sys.modules["tests.unit.fakes.connector"].FakeFFNSession(
+            serving=serving
+        ),
+        layer_ids=(2, 5),
+        connector=SimpleNamespace(extra_info=connector_module.AFDAsyncExtraInfo()),
+        _submit_graph=submitted.append,
+        _complete_graph=lambda: True,
+    )
+    # Push stops on the shutdown request; Pull keeps serving until A is quiet.
+    assert runner.execute_connector_driven_step(True) is session_serves
+    assert submitted == ([2] if session_serves else [])
+
+
 @pytest.mark.parametrize("capture_fails", [False, True])
 @pytest.mark.parametrize("two_stream", [False, True])
 def test_ffn_warmup_capture_order_and_failure_propagation(

@@ -202,17 +202,16 @@ class AFDNPUFFNWorker(NPUWorker):
 
         torch.npu.set_device(self.device)
         if isinstance(self.model_runner, AsyncNPUFFNModelRunner):
-            session = self.model_runner.session
-            while session.keep_serving(event.is_set()):
-                if not self.model_runner.execute_connector_driven_step():
-                    break
+            # The runner consults the session once per step; a second
+            # predicate here would add Store round trips to the Pull hot path.
+            while self.model_runner.execute_connector_driven_step(event.is_set()):
                 if (
                     self.model_runner.effective_mode == "eager"
                     and self.model_runner._two_stream is None
                 ):
                     torch.npu.synchronize()
             self.model_runner.drain()
-            session.finish_receiver()
+            self.model_runner.session.finish_receiver()
             return
 
         while not event.is_set():
