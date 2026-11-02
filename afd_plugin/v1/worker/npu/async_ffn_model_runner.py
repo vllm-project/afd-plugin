@@ -12,11 +12,6 @@ import torch
 from vllm.logger import init_logger
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
-from afd_plugin.async_cam_startup import (
-    GRAPH_STARTUP_TIMEOUT_SECONDS,
-    POLL_SECONDS,
-    FFNGraphPlan,
-)
 from afd_plugin.compat.npu import fail_if_unsupported_npu_afd_features
 from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.compat.npu.profiler import (
@@ -29,6 +24,11 @@ from afd_plugin.connectors.metadata import AFDA2FTransferPayload
 from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
+)
+from afd_plugin.connectors.npu.async_cam_startup import (
+    GRAPH_STARTUP_TIMEOUT_SECONDS,
+    POLL_SECONDS,
+    FFNGraphPlan,
 )
 from afd_plugin.model_executor.npu.async_cam_layered import (
     AsyncCAMLayeredExecutor,

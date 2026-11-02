@@ -3,6 +3,8 @@
 """Pure host negotiation tests; no device or model runner initialization."""
 
 import json
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from threading import Condition
@@ -10,8 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from afd_plugin import async_cam_startup as startup_module
-from afd_plugin.async_cam_startup import (
+from afd_plugin.connectors.npu import async_cam_startup as startup_module
+from afd_plugin.connectors.npu.async_cam_startup import (
     AsyncCAMGraphStartup,
     FFNGraphPlan,
     resolve_ffn_mode,
@@ -21,6 +23,25 @@ from afd_plugin.validation import (
     requested_ffn_mode,
     validate_graph_capacity,
 )
+
+
+def test_startup_import_needs_no_torch_or_vllm_in_clean_process():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; "
+            "sys.modules.update(torch=None, vllm=None, "
+            "torch_npu=None, vllm_ascend=None); "
+            "from afd_plugin.connectors.npu.async_cam_startup "
+            "import AsyncCAMGraphStartup; "
+            "assert AsyncCAMGraphStartup(0, 1, 2).mode == 'eager'",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 class MemoryStore:

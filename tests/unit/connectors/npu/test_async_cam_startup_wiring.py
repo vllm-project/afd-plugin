@@ -11,12 +11,15 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
-from afd_plugin.async_cam_startup import AsyncCAMGraphStartup, resolve_ffn_mode
 from afd_plugin.compat.npu.feature_validation import (
     _fail_if_unsupported_npu_afd_async_features,
     fail_if_unsupported_npu_afd_features,
 )
 from afd_plugin.config import parse_afd_config
+from afd_plugin.connectors.npu.async_cam_startup import (
+    AsyncCAMGraphStartup,
+    resolve_ffn_mode,
+)
 from tests.unit.fakes.async_ffn import (
     load_async_modules,
     load_host_module,

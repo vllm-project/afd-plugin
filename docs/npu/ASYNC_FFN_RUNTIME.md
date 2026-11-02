@@ -178,11 +178,11 @@ A3/910C, 4A/4F, A TP4, F TP1, receive capacity 128 and DBO disabled. Select
 this topology still needs target-device validation. Synthetic per-group
 coverage does not qualify loading real per-group checkpoints.
 
-- Host contracts: `tests/unit/connectors/test_async_cam_startup.py`,
+- Host contracts: `tests/unit/connectors/npu/test_async_cam_startup.py`,
   `tests/unit/v1/worker/test_async_ffn_graph.py`, and
   `tests/unit/v1/worker/test_async_ffn_runtime.py`. CPU-safe two-stream coverage
   is in `tests/unit/v1/worker/test_async_ffn_two_stream.py` and
-  `tests/unit/test_async_cam_startup_wiring.py`; fakes verify host ordering and
+  `tests/unit/connectors/npu/test_async_cam_startup_wiring.py`; fakes verify host ordering and
   ownership, not device execution.
 - Finite native comparison: `tests/npu/async_cam_runtime.py`. Run eager with
   `--save-outputs PREFIX`, then FULL with `--full-graph --reference-outputs PREFIX`,

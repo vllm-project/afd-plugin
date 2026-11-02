@@ -39,11 +39,6 @@ import torch
 from torch import Tensor
 from vllm.logger import init_logger
 
-from afd_plugin.async_cam_startup import (
-    GRAPH_STARTUP_TIMEOUT_SECONDS,
-    POLL_SECONDS,
-    AsyncCAMGraphStartup,
-)
 from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.config import AFDConfig
 from afd_plugin.config_utils import (
@@ -61,6 +56,11 @@ from afd_plugin.connectors.metadata import (
     AFDTransferContext,
     AFDTransferMetadata,
     AFDTransferState,
+)
+from afd_plugin.connectors.npu.async_cam_startup import (
+    GRAPH_STARTUP_TIMEOUT_SECONDS,
+    POLL_SECONDS,
+    AsyncCAMGraphStartup,
 )
 from afd_plugin.distributed import (
     create_hccl_process_group_options,
