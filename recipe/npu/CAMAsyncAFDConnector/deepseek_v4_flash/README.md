@@ -112,6 +112,9 @@ P uses the upstream worker, complete DSpark model and upstream KV transfer
 configuration. Apply the upstream speculative configuration to P as required
 by that deployment. Configure A's native KV consumer through
 `--kv-transfer-config`; F has no request KV and is not a PD participant.
+The pinned Ascend DSV4-Flash A3 recipe uses `MooncakeHybridConnector`.
+If `VLLM_PLUGINS` is restricted, include `ascend_kv_connector` on both P and A
+to register the upstream connector.
 This change introduces no P-specific model loading, KV transport protocol or
 D-side context initializer. Upstream PD compatibility remains the responsibility
 of the selected vLLM/Ascend model and connector.
@@ -137,9 +140,11 @@ actual checkpoint, topology, input, sampling, cache and runtime settings.
 
 ## Evidence scope
 
-Historical records establish A/F ownership and dispatch with the same model
-adapters. Their target-only P protocol and cancellable receive have been removed.
-Those records do not qualify the native-P PD configuration or establish graceful
-shutdown for this revision. This change retains main's existing transport,
-startup and shutdown behavior. General lifecycle/EngineCore fixes, P model
-minimization and FULL graphs are outside this DSpark integration.
+Single-host eager checks used native full-draft P TP4, A DP1/DP2 TP1 and F EP4
+with upstream `MooncakeHybridConnector`. They verified A/F ownership, target and
+draft expert calls, external KV transfer, SWA/chunked prompts, concurrent requests,
+early stop and disconnect/reuse. Four shared greedy cases matched native TP4 for
+32 tokens each; all six PD cases matched between DP1 and DP2. These bounded checks
+do not establish a performance gain, broad accuracy or graceful shutdown.
+General lifecycle/EngineCore fixes, P model minimization and FULL graphs remain
+outside this DSpark integration.

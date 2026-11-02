@@ -43,7 +43,7 @@ Directory names follow these conventions:
 | GPU (SM90+) | `DeepEPM2NAFDConnector` | Qwen3-235B-A22B-FP8 | Decode | 4A2F FP8-payload configuration run on H200 | [Launch examples](gpu/DeepEPM2NAFDConnector/qwen3_235b_a22b_fp8/README.md) |
 | Ascend NPU | `CAMP2pAFDConnector` | DeepSeek-V3.2 | Decode | Historical v0.19.1rc1 recipe; not qualified for the 0.32 target | [Synchronous decode](npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) |
 | Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V3.2 | Prefill / decode | Historical v0.19.1rc1/v0.26 recipes, not qualified for 0.32; v0.26 DP2TP8+EP16 token split reached `0.9522` strict match; legacy PCP8 results are v0.19-only | [Async CAM](npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) |
-| Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V4-Flash W4A8 DSpark | Separate P / decode, or colocated | v0.32 eager: target-only P TP4, A DP1/DP2 TP1, F EP4; bounded single-host qualification; FULL separate | [Eager DSpark](npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md) |
+| Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V4-Flash W4A8 DSpark | Separate P / decode, or colocated | v0.32 eager: native P TP4 with the complete draft, A DP1/DP2 TP1, F EP4; bounded single-host functional validation; FULL separate | [Eager DSpark](npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md) |
 
 Open the model-level README before running a recipe. It documents the required
 hardware and runtime baseline, topology, environment variables, launch order,
