@@ -38,7 +38,6 @@ from afd_plugin.connectors.npu.async_cam import (
 )
 from afd_plugin.envs import async_cam_layered_gmm_enabled
 from afd_plugin.model_executor.npu.async_cam_w4a8 import (
-    CAM_LAYER_INDEX,
     AsyncCAMW4A8Executor,
     W4A8LayerWeights,
 )
@@ -95,7 +94,6 @@ class AsyncNPUFFNModelRunner:
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.layer_ids: tuple[int, ...] = ()
         self._layered_executor: AsyncCAMW4A8Executor | None = None
-        self._layered_eager_executors: dict[int, AsyncCAMW4A8Executor] | None = None
         self._layered_gmm_requested = async_cam_layered_gmm_enabled()
         self.requested_mode = requested_ffn_mode(vllm_config)
         self.effective_mode = "eager"
@@ -409,26 +407,16 @@ class AsyncNPUFFNModelRunner:
                         )
                     ensure_cam_async_ops_available()
                     self._layered_executor = AsyncCAMW4A8Executor(layers)
-                    if self.draft_model is not None and self.requested_mode == "eager":
-                        # Eager DSpark already has a host service loop. Submit
-                        # only the selected layer's tensor lists, avoiding the
-                        # repeated host marshalling of all target/draft tensors.
-                        # These executors reference the existing EP-local weights.
-                        self._layered_eager_executors = {
-                            layer.layer_idx: AsyncCAMW4A8Executor([layer])
-                            for layer in layers
-                        }
                     self.connector.layered_gmm_enabled = True
                     logger.info(
                         "AFD_ASYNC_CAM_LAYERED_GMM requested=1 actual=layered "
                         "quant=W4A8 layers=%d mode=%s layer_mapping=%s "
-                        "swiglu_limit=%s ignored=%s eager_single_layer=%s",
+                        "swiglu_limit=%s ignored=%s",
                         len(layers),
                         "per-channel" if layers[0].per_channel else "per-group",
                         self._layered_executor.layer_id_to_slot is not None,
                         layers[0].swiglu_limit,
                         layers[0].swiglu_limit != 0.0,
-                        self._layered_eager_executors is not None,
                     )
                     return
         logger.info(
@@ -469,13 +457,7 @@ class AsyncNPUFFNModelRunner:
             for _ in self.layer_ids[:1] if single else self.layer_ids:
                 payload = connector.recv_attn_output()
                 states = cast(AFDAsyncTransferState, payload.context.states)
-                executor = self._layered_executor
-                if self._layered_eager_executors is not None:
-                    batch_info = states.token_nums_rankid_layeridx
-                    assert batch_info is not None
-                    layer_idx = int(batch_info[CAM_LAYER_INDEX].item())
-                    executor = self._layered_eager_executors[layer_idx]
-                rank_ffn_output = executor(
+                rank_ffn_output = self._layered_executor(
                     payload.hidden_states,
                     states.dynamic_scales,
                     states.group_list,
@@ -568,7 +550,6 @@ class AsyncNPUFFNModelRunner:
             self._close_graph()
         stop_afd_npu_profiler(self.prof)
         self.connector.close()
-        self._layered_eager_executors = None
         self._layered_executor = None
         free_before_shutdown(self.vllm_config)
         self.model = None

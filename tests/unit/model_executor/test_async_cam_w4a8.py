@@ -9,7 +9,6 @@ import os
 import sys
 from collections.abc import Callable
 from dataclasses import replace
-from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -19,7 +18,6 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from afd_plugin.model_executor.npu.async_cam_w4a8 import (  # noqa: E402
-    CAM_LAYER_INDEX,
     AsyncCAMW4A8Executor,
     W4A8LayerWeights,
 )
@@ -185,50 +183,38 @@ def runner_method(name, namespace):
     return namespace[name]
 
 
-@pytest.fixture
-def layered_chunks():
-    return [
+def test_runner_preserves_raw_context_and_chunk_capacity():
+    payloads = [
         SimpleNamespace(
             hidden_states=torch.empty(8, 32),
             context=SimpleNamespace(
                 states=SimpleNamespace(
                     dynamic_scales=torch.ones(8),
                     group_list=torch.tensor([0, 0]),
-                    token_nums_rankid_layeridx=torch.tensor([99, 1, wire, 0]),
+                    token_nums_rankid_layeridx=torch.tensor([99, 1, 5, 0]),
                 )
             ),
         )
-        for wire in (43, 2, 45, 43)
+        for _ in range(2)
     ]
-
-
-@pytest.mark.parametrize("eager_selection", [False, True])
-def test_runner_preserves_chunk_context_with_layer_selection(
-    layered_chunks, eager_selection
-):
-    payloads = layered_chunks
     received = iter(payloads)
     sent = []
+    computed = []
     connector = SimpleNamespace(
         recv_attn_output=lambda: next(received),
         send_ffn_output=lambda result, ctx: sent.append((result, ctx)),
     )
 
-    def compute(hidden, scales, counts, header, *, wire=None):
-        value = int(header[CAM_LAYER_INDEX]) if wire is None else wire
-        return torch.full_like(hidden, value, dtype=torch.bfloat16)
+    def compute(*args):
+        computed.append(args)
+        return torch.empty(8, 32, dtype=torch.bfloat16)
 
     runner = SimpleNamespace(
         model=object(),
         connector=connector,
         _two_stream=None,
         _layered_executor=compute,
-        _layered_eager_executors={
-            wire: partial(compute, wire=wire) for wire in (0, 2, 43, 45)
-        }
-        if eager_selection
-        else None,
-        layer_ids=(0, 2, 43, 45),
+        layer_ids=(2, 5),
     )
     method = runner_method(
         "_ffn_forward_connector_driven",
@@ -236,16 +222,13 @@ def test_runner_preserves_chunk_context_with_layer_selection(
             "cast": cast,
             "CAMAsyncAFDConnector": SimpleNamespace,
             "AFDAsyncTransferState": SimpleNamespace,
-            "CAM_LAYER_INDEX": CAM_LAYER_INDEX,
         },
     )
     method(runner)
     assert [ctx for _, ctx in sent] == [p.context for p in payloads]
-    for (output, _), payload, expected in zip(
-        sent, payloads, (43, 2, 45, 43), strict=True
-    ):
-        assert output.shape == payload.hidden_states.shape
-        torch.testing.assert_close(output, torch.full_like(output, expected))
+    for args, payload in zip(computed, payloads, strict=True):
+        assert args[0] is payload.hidden_states
+        assert args[3] is payload.context.states.token_nums_rankid_layeridx
 
 
 def test_runner_switch_off_does_not_touch_model_or_ops():
@@ -338,8 +321,6 @@ def test_runner_requires_complete_layered_target_and_draft_coverage(
         else None,
         layer_ids=layer_ids,
         _layered_executor=None,
-        _layered_eager_executors=None,
-        requested_mode="eager",
     )
 
     method = runner_method(
