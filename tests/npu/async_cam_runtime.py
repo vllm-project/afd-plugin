@@ -396,7 +396,7 @@ def main():
                 torch.npu.synchronize()
             assert int(pull_state[96].item()) == before
             assert int(pull_state[32].item()) == -1
-            connector.check_pull_status()
+            connector.ffn_session().after_step()
             pull_state[64].zero_()
             torch.npu.synchronize()
             report["idle_probe"] = "PASS"
