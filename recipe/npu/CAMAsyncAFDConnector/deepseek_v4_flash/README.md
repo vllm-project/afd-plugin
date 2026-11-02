@@ -6,7 +6,7 @@ request KV and native speculative decoding. The FFN group loads one read-only
 draft expert set, sharded by EP, and serves target and draft from the same loop.
 
 Use the DSV4-Flash W4A8 checkpoint with three draft layers and a five-token
-draft block. The development baseline is vLLM
+draft block. The runtime baseline is vLLM
 `5df63a7203cdb9328d824a27b682e77c7b9928be` and vLLM-Ascend
 `bd42eea01d8312c4df469fabaed45f77a12df4d3` on Ascend 910C/A3.
 Install AFD using the repository NPU installation guide and initialize CANN.
@@ -62,8 +62,8 @@ DSPARK_CONFIG="{\"method\":\"dspark\",\"model\":\"$MODEL\",\"num_speculative_tok
 ```
 
 For DP2 set `NUM_A=2`, `A_DEVICES=0,1`, and retain the four F devices.
-The legacy W4A8 executor preserves the native SwiGLU clamp; layered W4A8 and
-FULL execution are outside this recipe.
+Use eager execution with `AFD_ASYNC_CAM_LAYERED_GMM=0`; layered W4A8 and FULL
+execution are not supported.
 
 Launch F and A with their usual Async CAM arguments, adding the same
 `--speculative-config "$DSPARK_CONFIG"` to both:
@@ -115,9 +115,6 @@ by that deployment. Configure A's native KV consumer through
 The pinned Ascend DSV4-Flash A3 recipe uses `MooncakeHybridConnector`.
 If `VLLM_PLUGINS` is restricted, include `ascend_kv_connector` on both P and A
 to register the upstream connector.
-This change introduces no P-specific model loading, KV transport protocol or
-D-side context initializer. Upstream PD compatibility remains the responsibility
-of the selected vLLM/Ascend model and connector.
 
 ## Verification
 
@@ -137,14 +134,3 @@ through the native worker-extension hook; disable observers when benchmarking.
 Remove `--speculative-config` on A/F for a speculation-disabled control, and
 use the corresponding upstream P configuration when testing PD. Record the
 actual checkpoint, topology, input, sampling, cache and runtime settings.
-
-## Evidence scope
-
-Single-host eager checks used native full-draft P TP4, A DP1/DP2 TP1 and F EP4
-with upstream `MooncakeHybridConnector`. They verified A/F ownership, target and
-draft expert calls, external KV transfer, SWA/chunked prompts, concurrent requests,
-early stop and disconnect/reuse. Four shared greedy cases matched native TP4 for
-32 tokens each; all six PD cases matched between DP1 and DP2. These bounded checks
-do not establish a performance gain, broad accuracy or graceful shutdown.
-General lifecycle/EngineCore fixes, P model minimization and FULL graphs remain
-outside this DSpark integration.

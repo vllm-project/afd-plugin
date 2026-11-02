@@ -164,8 +164,7 @@ installs its own AFD metadata and opts out of cross-DP synchronization; native
 sampling, rejection, heads and context-KV updates are inherited. The
 [0.32 eager recipe](../../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md)
 describes A/F serving. In PD deployments, Prefill uses the upstream complete
-draft model and KV connector; AFD does not add a Prefill runner, auxiliary-state
-carrier or Decode-side context initializer. FULL graphs remain a separate phase.
+draft model and KV connector. This adapter supports eager execution only.
 
 Shared-expert layout is model-specific. DeepSeek-V2/V3 Async CAM forces
 replicated shared weights when effective model SP is enabled. DeepSeek-V4
