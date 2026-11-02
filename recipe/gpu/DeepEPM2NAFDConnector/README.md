@@ -16,7 +16,8 @@ supported layouts.
 │   └── prefill_decode_colocation/   # 2A2F: eager, graph, graph + DBO, Attention TP2
 └── qwen3_235b_a22b_fp8/
     ├── README.md
-    └── prefill_decode_colocation/   # 4A2F FP8 payload: graph, graph + DBO
+    └── prefill_decode_colocation/   # 4A2F FP8 payload: graph, graph + DBO;
+                                     # 2 pods x 4A1F (multipod_4a1f_4a1f_graph.sh)
 ```
 
 Each model directory holds its own scripts; open its `README.md` before
@@ -61,6 +62,14 @@ slower than later starts.
 
 ## Deploying on Kubernetes
 
-The recipes have no placement header, so the
+The single-node recipes have no placement header, so the
 **`deploy-afd-k8s`** skill (`.agents/skills/deploy-afd-k8s/SKILL.md`) deploys
 each one as a single pod. The image must contain afdEP-comm and DeepGEMM.
+
+`multipod_4a1f_4a1f_graph.sh` carries a `POD=AFD_<index>` header, so the skill
+deploys it as one pod per entry, each running both roles. Every pod gets the
+same `NUM_PODS`, `ATTN_PER_POD` and `FFN_PER_POD` (2, 4 and 1 by default),
+which select any symmetric layout `N x <a>A<f>F`; the FFN uses each pod's
+first `f` GPUs. See
+[Multi-pod deployment](../../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#multi-pod-deployment)
+for the placements the connector accepts.

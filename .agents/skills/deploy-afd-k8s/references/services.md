@@ -39,6 +39,10 @@ AFD_CONNECTOR_PORT="$AFD_CONNECTOR_PORT" envsubst '${AFD_CONNECTOR_PORT}' \
 
 Only when **more than one** plan entry's `POD` carries the same role (i.e.
 that role is split across pods, not just placed in its own single pod).
+Every `POD=AFD_<index>` entry carries both roles, so a plan of two or more
+such entries needs both Services; read their ports (and the rendezvous port)
+as [resolve-recipe.md](resolve-recipe.md) describes for those recipes rather
+than with the `*_PORT:-N` greps below.
 Carries that role's DP-RPC coordination traffic to its head pod. One per
 split role, generic over role via `templates/service-dp-coord.yaml`:
 
