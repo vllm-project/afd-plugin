@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn as nn
@@ -257,8 +257,13 @@ class AFDDSparkDeepseekV4ForCausalLM(native.DSparkDeepseekV4ForCausalLM):
         return _extract_async_cam_w4a8_layers(self.model.layers.values())
 
     def compute_ffn_output(
-        self, hidden_states: torch.Tensor, layer_idx: int, **kwargs: Any
+        self,
+        hidden_states: torch.Tensor,
+        layer_idx: int,
+        *,
+        group_list: torch.Tensor | None = None,
+        dynamic_scales: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.model.layers[str(layer_idx)].compute_ffn_output(
-            hidden_states, **kwargs
+            hidden_states, group_list=group_list, dynamic_scales=dynamic_scales
         )

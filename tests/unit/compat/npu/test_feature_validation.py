@@ -35,8 +35,8 @@ ASYNC_CAM = dict(connector="CAMAsyncAFDConnector", async_dp=True)
     [
         ("attention", True, "deepseek_v4", False, None),
         ("ffn", True, "deepseek_v4", False, None),
-        ("attention", False, "deepseek_v4", False, "DSpark requires MRV2 eager"),
-        ("ffn", False, "deepseek_v4", False, "DSpark requires MRV2 eager"),
+        ("attention", False, "deepseek_v4", False, "DSpark requires eager"),
+        ("ffn", False, "deepseek_v4", False, "DSpark requires eager"),
         ("attention", True, "deepseek_v2", False, "DSpark supports only DeepSeek-V4"),
         ("ffn", True, "deepseek_v2", False, "DSpark supports only DeepSeek-V4"),
         ("ffn", True, "deepseek_v4", True, "requires legacy FFN execution"),

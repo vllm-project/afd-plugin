@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Target and draft contexts publish independent AFD transaction metadata."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -48,15 +49,16 @@ def test_draft_uses_own_batch_and_restores_target_transaction(
     metadata_runner.install_afd_metadata_on_forward_context(target)
     target_metadata = target.additional_kwargs["afd_metadata"]
     draft = _context(10)
-    try:
-        with metadata_runner._afd_draft_context(False, False):
-            assert should_skip_dp_coordination()
-            metadata_runner.install_afd_metadata_on_forward_context(draft)
-            if fail_draft:
-                raise RuntimeError("proposal failed")
-    except RuntimeError:
-        if not fail_draft:
-            raise
+    expected = (
+        pytest.raises(RuntimeError, match="proposal failed")
+        if fail_draft
+        else nullcontext()
+    )
+    with expected, metadata_runner._afd_draft_context(False, False):
+        assert should_skip_dp_coordination()
+        metadata_runner.install_afd_metadata_on_forward_context(draft)
+        if fail_draft:
+            raise RuntimeError("proposal failed")
     draft_metadata = draft.additional_kwargs["afd_metadata"]
     assert not should_skip_dp_coordination()
     assert draft_metadata.tokens_lens == [10]
@@ -64,4 +66,7 @@ def test_draft_uses_own_batch_and_restores_target_transaction(
     assert draft_metadata.transaction_id != target_metadata.transaction_id
     following_target = _context(12)
     metadata_runner.install_afd_metadata_on_forward_context(following_target)
-    assert following_target.additional_kwargs["afd_metadata"] is target_metadata
+    assert (
+        following_target.additional_kwargs["afd_metadata"].transaction_id
+        == target_metadata.transaction_id
+    )

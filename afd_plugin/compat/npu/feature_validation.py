@@ -243,20 +243,16 @@ def _fail_if_unsupported_npu_afd_async_features(
                     "AFD DSpark eager requires legacy FFN execution; layered "
                     "W4A8 SwiGLU-clamp parity is not qualified"
                 )
+            # The shared MRV2 validator owns PP/CP and static EP constraints.
+            # Keep only the additional target/draft restrictions here.
             if (
-                not vllm_config.use_v2_model_runner
-                or not vllm_config.model_config.enforce_eager
+                not vllm_config.model_config.enforce_eager
                 or not speculative_config.enforce_eager
                 or parallel_config.tensor_parallel_size != 1
                 or speculative_config.draft_parallel_config.tensor_parallel_size != 1
-                or parallel_config.pipeline_parallel_size != 1
-                or parallel_config.prefill_context_parallel_size != 1
-                or parallel_config.decode_context_parallel_size != 1
-                or parallel_config.enable_eplb
             ):
                 raise RuntimeError(
-                    "AFD DSpark requires MRV2 eager target/draft, TP=1, PP=1, "
-                    "CP=1 and EPLB disabled"
+                    "AFD DSpark requires eager target/draft and target/draft TP=1"
                 )
         elif afd_config.is_attention_server and (
             speculative_config.use_eagle() or speculative_config.uses_draft_model()

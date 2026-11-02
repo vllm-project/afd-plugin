@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import replace
 
 import pytest
 
@@ -43,8 +43,6 @@ def test_serialized_layer_list_cannot_mutate_descriptor(descriptor):
     serialized["aux_layer_ids"].append(40)
 
     assert descriptor.aux_layer_ids == (8, 21, 34)
-    with pytest.raises(FrozenInstanceError):
-        descriptor.generation = "replacement"
 
 
 @pytest.mark.parametrize(

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Check an already running DSpark service; save every raw response.
 
-Use the matching recipe's --evidence-dir for AFD ownership/dispatch checks.
+Use the recipe's worker extensions and --evidence-dir for ownership/dispatch checks.
 Omit it to run the same request cases against a native DSpark baseline.
 """
 

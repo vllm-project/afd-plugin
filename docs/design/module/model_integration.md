@@ -162,9 +162,11 @@ routing. F loads one set of target and draft expert shards before rendezvous,
 then serves both from its existing receive loop. Each native draft proposal
 installs its own AFD metadata and opts out of cross-DP synchronization; native
 sampling, rejection, heads and context-KV updates are inherited. The
-[0.30 recipe](../../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md)
-uses a single A service for prefill and decode. Separate-P auxiliary-state
-handoff and FULL graphs need subsequent integration.
+[0.32 eager recipe](../../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md)
+covers colocated serving and target-only P handoff. The
+[PD contract](pd_dspark_context.md) defines auxiliary-state transfer and
+initialization of actual draft SWA slots before Decode admission. FULL graphs
+remain a separate phase.
 
 Shared-expert layout is model-specific. DeepSeek-V2/V3 Async CAM forces
 replicated shared weights when effective model SP is enabled. DeepSeek-V4
