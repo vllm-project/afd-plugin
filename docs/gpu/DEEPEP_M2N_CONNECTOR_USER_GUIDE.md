@@ -81,9 +81,7 @@ architecture (SM90 or newer), and the FFN deployment (expert parallel, EP
 size, FFN TP=1, linear expert placement, no EPLB, all2all backend and expert
 weight format), and the placement of the ranks over NVLink domains. The FFN
 adopts the Attention TP size, dispatch capacity and bucket ladder reported by
-the Attention ranks. FFN rank 0 logs the network plan and the transport it
-picked, for example
-`DeepEP M2N transport: per_domain f=1 domains=2x5 placement=4A1F,4A1F`.
+the Attention ranks.
 
 ## Installation
 

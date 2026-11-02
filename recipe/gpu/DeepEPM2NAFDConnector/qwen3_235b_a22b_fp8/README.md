@@ -54,9 +54,8 @@ and `13355` (FFN DP). Pass the fabric's NCCL settings (for example
 (`2 x 6A2F`, ...); the tuning values (`MAX_NUM_SEQS`, `MAX_NUM_BATCHED_TOKENS`,
 `MAX_MODEL_LEN`, `CAPTURE_SIZES`, `PAYLOAD_FORMAT`) and DBO (`ENABLE_DBO=1`,
 `DBO_DECODE_TOKEN_THRESHOLD`, `DBO_PREFILL_TOKEN_THRESHOLD`) are environment
-variables with the 4A2F values as defaults. The connector logs the placement
-it found and the afdEP-comm mode it picked, for example
-`DeepEP M2N transport: per_domain f=1 domains=2x5 placement=4A1F,4A1F`.
+variables with the 4A2F values as defaults. A placement the connector cannot
+carry fails at startup with the pods' shapes in the error.
 
 ## Configuration notes
 
