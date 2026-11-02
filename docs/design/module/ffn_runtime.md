@@ -35,6 +35,7 @@ validation_paths:
   - "tests/unit/v1/worker/test_async_ffn_two_stream.py"
   - "tests/unit/connectors/npu/test_async_cam_startup_wiring.py"
   - "tests/unit/connectors/npu/test_async_cam_startup.py"
+  - "tests/unit/connectors/npu/test_async_cam_pull.py"
   - "tests/npu/async_cam_runtime.py"
   - "tests/e2e/models/deepseek_v4_flash/ffn_graph.py"
   - "tests/unit/compat/patches/test_engine_core.py"

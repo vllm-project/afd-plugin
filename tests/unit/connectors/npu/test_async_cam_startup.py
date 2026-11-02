@@ -7,7 +7,6 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from threading import Condition
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +22,7 @@ from afd_plugin.validation import (
     requested_ffn_mode,
     validate_graph_capacity,
 )
+from tests.unit.fakes.async_cam_startup import MemoryStore, startup_world
 
 
 def test_startup_import_needs_no_torch_or_vllm_in_clean_process():
@@ -42,41 +42,6 @@ def test_startup_import_needs_no_torch_or_vllm_in_clean_process():
         check=False,
     )
     assert result.returncode == 0, result.stderr
-
-
-class MemoryStore:
-    def __init__(self):
-        self.values = {}
-        self.condition = Condition()
-        self.closed = False
-
-    def set(self, key, value):
-        assert not self.closed, "Store used after release"
-        with self.condition:
-            self.values[key] = value.encode() if isinstance(value, str) else value
-            self.condition.notify_all()
-
-    def get(self, key):
-        assert not self.closed, "Store used after release"
-        with self.condition:
-            assert self.condition.wait_for(lambda: key in self.values, timeout=3)
-            return self.values[key]
-
-    def check(self, keys):
-        assert not self.closed, "Store used after release"
-        with self.condition:
-            return all(key in self.values for key in keys)
-
-
-def startup_world(attn=2, ffn=2, store=None):
-    store = store or MemoryStore()
-    owners = []
-    for rank in range(attn + ffn):
-        owner = AsyncCAMGraphStartup(rank, attn, attn + ffn)
-        owner._store = store
-        owner._prefix = "ffn_graph/test/"
-        owners.append(owner)
-    return owners
 
 
 def full_plan(**changes):
@@ -346,31 +311,6 @@ def test_attention_waits_for_every_ffn_service(monkeypatch):
     last_ffn.fail(RuntimeError("receiver failed"))
     with pytest.raises(RuntimeError, match="receiver failed"):
         attention.wait_service_ready()
-
-
-def test_pull_close_waits_for_all_attention_and_drained_receivers(monkeypatch):
-    first_a, last_a, first_f, last_f = startup_world()
-    monkeypatch.setattr(startup_module, "GRAPH_STARTUP_TIMEOUT_SECONDS", 0)
-    with pytest.raises(TimeoutError):
-        first_a.close_pull_attention()
-    assert not first_f.pull_stop_requested()
-    with pytest.raises(TimeoutError):
-        first_f.finish_pull_receiver()
-    with pytest.raises(TimeoutError):
-        last_a.close_pull_attention()
-    assert first_f.pull_stop_requested()
-    first_f.finish_pull_receiver()
-    with pytest.raises(TimeoutError):
-        first_a.close_pull_attention()
-    last_f.finish_pull_receiver()
-    first_a.close_pull_attention()
-    last_a.close_pull_attention()
-    first_f._store.closed = True
-    first_f.finish_pull_receiver()
-    first_f._store.closed = False
-    last_f.fail(RuntimeError("drain failed"))
-    with pytest.raises(RuntimeError, match="drain failed"):
-        first_a.close_pull_attention()
 
 
 def test_initialize_owns_nonce_and_plan_negotiation():

@@ -23,6 +23,7 @@ from afd_plugin.connectors import (
     AFDTransferMetadata,
     AFDTransferState,
 )
+from afd_plugin.connectors.base import DefaultFFNSession
 from tests.unit.fakes.dp_metadata import (  # noqa: E402
     DPMetadataValues as _FakeDPMetadata,
 )
@@ -836,6 +837,7 @@ def test_npu_ffn_worker_uses_connector_driven_loop_for_async_connector(monkeypat
     worker.device = SimpleNamespace(type="cpu")
     worker.model_runner = object.__new__(ffn_worker.AsyncNPUFFNModelRunner)
     worker.model_runner.connector = SimpleNamespace(control_plane=None)
+    worker.model_runner.session = DefaultFFNSession()
     worker.model_runner.effective_mode = "eager"
     worker.model_runner._two_stream = None
     worker.model_runner.execute_connector_driven_step = execute_connector_driven_step

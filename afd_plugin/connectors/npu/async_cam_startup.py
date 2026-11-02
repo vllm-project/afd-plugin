@@ -73,7 +73,6 @@ class AsyncCAMGraphStartup:
         self.session_epoch = 0
         self._store: Store | None = None
         self._prefix = ""
-        self._pull_receiver_finished = False
         self._shared_errors = False
         self.validate_attention_streams: Callable[[], None] | None = None
 
@@ -131,23 +130,6 @@ class AsyncCAMGraphStartup:
     def phase(self, stage: str) -> None:
         self._publish(stage)
         self._wait(self._keys(stage, range(self.world_size)))
-
-    def pull_stop_requested(self) -> bool:
-        assert self._store is not None
-        self.check_failure()
-        return self._store.check(self._keys("pull_quiet", range(self.attn_size)))
-
-    def finish_pull_receiver(self) -> None:
-        if self._pull_receiver_finished:
-            return
-        # Every A must stop publishing before any F releases its peer windows.
-        self._wait(self._keys("pull_quiet", range(self.attn_size)))
-        self._publish("pull_stopped")
-        self._pull_receiver_finished = True
-
-    def close_pull_attention(self) -> None:
-        self._publish("pull_quiet")
-        self._wait(self._keys("pull_stopped", range(self.attn_size, self.world_size)))
 
     def _negotiate(self, plan: FFNGraphPlan | None, transport_signature: str) -> None:
         assert self._store is not None

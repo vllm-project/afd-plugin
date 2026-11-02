@@ -6,8 +6,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from contextlib import contextmanager, nullcontext
-from dataclasses import replace
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +26,8 @@ from afd_plugin.connectors.npu.async_cam import (  # noqa: E402
     CAMAsyncAFDConnector,
 )
 from afd_plugin.v1.worker.npu import async_ffn_model_runner as runtime  # noqa: E402
+from afd_plugin.v1.worker.npu.ffn_worker import AFDNPUFFNWorker  # noqa: E402
+from tests.unit.fakes.connector import FakeFFNSession  # noqa: E402
 from tests.unit.fakes.vllm_config import npu_vllm_config  # noqa: E402
 
 
@@ -145,6 +146,7 @@ def test_full_receiver_exit_requires_success_even_during_shutdown(harness, fail)
     worker = AFDNPUFFNWorker.__new__(AFDNPUFFNWorker)
     worker.model_runner = harness.runner
     harness.runner.effective_mode = "full"
+    harness.runner.session = FakeFFNSession(requires_drain=True)
     worker._ffn_thread = None
     worker._ffn_loop_error = None
     worker._bind_cpus_once = lambda: None
@@ -164,20 +166,21 @@ def test_full_receiver_exit_requires_success_even_during_shutdown(harness, fail)
 
 
 @pytest.mark.parametrize("drains", [True, False])
-def test_pull_drain_rejects_incomplete_source(harness, monkeypatch, drains):
+def test_drain_propagates_session_result(harness, monkeypatch, drains):
     h = harness
-    monkeypatch.setenv("BATCH_SIZE_FACTOR", str(8 / 262144))
-    h.connector.extra_info = replace(
-        h.connector.extra_info, ffn_mega_moe=True, dynamic_quant=1
+    h.runner.session = FakeFFNSession(
+        transactions=1,
+        drain_error=None if drains else RuntimeError("retain resources"),
     )
-    active = iter((True, True, False) if drains else (True,) * 8)
-    monkeypatch.setattr(h.connector, "pull_has_active_source", lambda: next(active))
-    monkeypatch.setattr(h.connector, "check_pull_status", lambda: None)
+    h.payloads.append(payload(5, 3))
     monkeypatch.setattr(torch.npu, "synchronize", lambda: None)
-    monkeypatch.setattr(h.runner, "_ffn_forward_connector_driven", lambda **kw: None)
-    with (
-        nullcontext()
-        if drains
-        else pytest.raises(RuntimeError, match="retain resources")
-    ):
-        h.runner.drain_pull_source()
+    if drains:
+        h.runner.drain()
+    else:
+        with pytest.raises(RuntimeError, match="retain resources"):
+            h.runner.drain()
+    returned = [
+        call[1] for call in h.calls if isinstance(call, tuple) and call[0] == "send"
+    ]
+    assert len(returned) == 1
+    assert returned[0].tolist() == [3, 0, 5, 0, 1]

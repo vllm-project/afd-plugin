@@ -201,13 +201,9 @@ class AFDNPUFFNWorker(NPUWorker):
             return
 
         torch.npu.set_device(self.device)
-        pull = (
-            isinstance(self.model_runner, AsyncNPUFFNModelRunner)
-            and self.model_runner.connector.extra_info.ffn_mega_moe
-        )
-        # Pull must keep serving committed, unselected work until every A is quiet.
-        while not event.is_set() or pull:
-            if isinstance(self.model_runner, AsyncNPUFFNModelRunner):
+        if isinstance(self.model_runner, AsyncNPUFFNModelRunner):
+            session = self.model_runner.session
+            while session.keep_serving(event.is_set()):
                 if not self.model_runner.execute_connector_driven_step():
                     break
                 if (
@@ -215,7 +211,11 @@ class AFDNPUFFNWorker(NPUWorker):
                     and self.model_runner._two_stream is None
                 ):
                     torch.npu.synchronize()
-                continue
+            self.model_runner.drain()
+            session.finish_receiver()
+            return
+
+        while not event.is_set():
             control_plane = self.model_runner.connector.control_plane
             assert control_plane is not None
             payload = control_plane.recv_dp_metadata_list()
@@ -234,16 +234,11 @@ class AFDNPUFFNWorker(NPUWorker):
             )
             torch.npu.synchronize()
 
-        if isinstance(self.model_runner, AsyncNPUFFNModelRunner):
-            self.model_runner.drain_pull_source()
-            if self.model_runner.connector.extra_info.ffn_mega_moe:
-                self.model_runner.connector.graph_startup.finish_pull_receiver()
-
     def _requires_async_drain(self) -> bool:
         return isinstance(self.model_runner, AsyncNPUFFNModelRunner) and (
             self.model_runner.effective_mode == "full"
             or self.model_runner._two_stream is not None
-            or self.model_runner.connector.extra_info.ffn_mega_moe
+            or self.model_runner.session.requires_drain
         )
 
     def raise_ffn_loop_error_if_any(self) -> None:

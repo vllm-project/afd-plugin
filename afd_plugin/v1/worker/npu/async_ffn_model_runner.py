@@ -79,7 +79,8 @@ class AsyncNPUFFNModelRunner:
         self.layer_ids: tuple[int, ...] = ()
         self._layered_executor: AsyncCAMLayeredExecutor | None = None
         self._mega_executor: AsyncCAMMegaExecutor | None = None
-        self._pull_idle_enabled = False
+        self.session = self.connector.ffn_session()
+        self._first_step = True
         self.requested_mode = requested_ffn_mode(vllm_config)
         self.effective_mode = "eager"
         self._graph: torch.npu.NPUGraph | None = None
@@ -345,7 +346,7 @@ class AsyncNPUFFNModelRunner:
             # One fence per bounded batch. The original DR cannot be cancelled;
             # a blocked batch retains its graph, model and communication buffers.
             torch.npu.synchronize()
-            self.connector.check_pull_status()
+            self.session.after_step()
         except Exception as exc:
             self._graph_failure = exc
             raise
@@ -406,20 +407,17 @@ class AsyncNPUFFNModelRunner:
     @torch.inference_mode()
     def execute_connector_driven_step(self) -> bool:
         step_afd_npu_profiler(self.prof)
-        if (
-            self.connector.extra_info.ffn_mega_moe
-            and self.connector.graph_startup.pull_stop_requested()
-        ):
+        if not self.session.keep_serving(False):
             return False
-        if self.connector.extra_info.ffn_mega_moe and not self._pull_idle_enabled:
-            self.connector.enable_pull_idle_returns()
+        if self._first_step:
+            self.session.before_first_step()
             if self._graph is not None:
                 self._graph_stream.wait_stream(torch.npu.current_stream(self.device))
-            self._pull_idle_enabled = True
+            self._first_step = False
         if self._graph is None and self._two_stream is None:
             # Eager and graph modes use the same layered executor.
             self._ffn_forward_connector_driven()
-            self.connector.check_pull_status()
+            self.session.after_step()
             return True
         if not self._service_announced:
             self.connector.graph_startup.service_ready()
@@ -429,25 +427,17 @@ class AsyncNPUFFNModelRunner:
         self._submit_graph(len(self.layer_ids))
         return self._complete_graph()
 
-    def drain_pull_source(self) -> None:
-        """Finish a selected source before the worker releases its resources."""
-        if not self.connector.extra_info.ffn_mega_moe:
-            return
-        rounds = (
-            self.max_num_tokens * self.connector.topk + cam_receive_capacity() - 1
-        ) // cam_receive_capacity()
-        for _ in range(rounds):
-            if not self.connector.pull_has_active_source():
-                return
-            if self._graph is not None:
-                self._submit_graph(1)
-                self._complete_graph()
-            else:
-                self._ffn_forward_connector_driven(single=True)
-                torch.npu.synchronize()
-                self.connector.check_pull_status()
-        if self.connector.pull_has_active_source():
-            raise RuntimeError("Pull source did not drain; retain resources")
+    def drain(self) -> None:
+        self.session.drain(self._run_one_transaction)
+
+    def _run_one_transaction(self) -> None:
+        if self._graph is not None:
+            self._submit_graph(1)
+            self._complete_graph()
+        else:
+            self._ffn_forward_connector_driven(single=True)
+            torch.npu.synchronize()
+            self.session.after_step()
 
     def _ffn_forward_connector_driven(
         self,
@@ -500,13 +490,9 @@ class AsyncNPUFFNModelRunner:
             raise RuntimeError(
                 "Failed graph startup retains resources"
             ) from self._failure
-        if self.connector.extra_info.ffn_mega_moe:
-            if (
-                not self._graph_receiver_exited
-                or self.connector.pull_has_active_source()
-            ):
-                raise RuntimeError("Pull receiver has not drained; retain resources")
-            self.connector.check_pull_status()
+        if self.session.requires_drain and not self._graph_receiver_exited:
+            raise RuntimeError("Receiver has not exited; retain resources")
+        self.session.validate_shutdown()
         from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 
         if self._two_stream is not None:
@@ -515,10 +501,7 @@ class AsyncNPUFFNModelRunner:
         elif self._graph is not None:
             self._close_graph()
         stop_afd_npu_profiler(self.prof)
-        if self.connector.extra_info.ffn_mega_moe:
-            self.connector.close(pull_receiver_stopped=True)
-        else:
-            self.connector.close()
+        self.connector.close()
         self._mega_executor = None
         self._layered_executor = None
         free_before_shutdown(self.vllm_config)

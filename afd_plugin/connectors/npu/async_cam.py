@@ -30,7 +30,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Final, cast
@@ -50,6 +50,8 @@ from afd_plugin.config_utils import (
 from afd_plugin.connectors.base import (
     AFDConnectorBase,
     ConnectorExtraInfo,
+    DefaultFFNSession,
+    FFNExecutionSession,
 )
 from afd_plugin.connectors.metadata import (
     AFDA2FTransferPayload,
@@ -57,6 +59,7 @@ from afd_plugin.connectors.metadata import (
     AFDTransferMetadata,
     AFDTransferState,
 )
+from afd_plugin.connectors.npu.async_cam_pull import PullFFNSession
 from afd_plugin.connectors.npu.async_cam_startup import (
     GRAPH_STARTUP_TIMEOUT_SECONDS,
     POLL_SECONDS,
@@ -347,6 +350,10 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         self.graph_startup = AsyncCAMGraphStartup(
             self.world_rank, self.attn_size, self.topology.world_size
         )
+        if extra_info.ffn_mega_moe:
+            self._session: FFNExecutionSession = PullFFNSession(self)
+        else:
+            self._session = DefaultFFNSession()
 
     @property
     def is_initialized(self) -> bool:
@@ -399,7 +406,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             )
             try:
                 torch.npu.synchronize()
-                self.check_pull_status()
+                self._check_pull_status()
                 self.graph_startup.phase("pull-initialized")
             except Exception as exc:
                 self.graph_startup.fail(exc)
@@ -517,19 +524,26 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             self.graph_startup.fail(exc)
             raise
 
-    def close(self, *, pull_receiver_stopped: bool = False) -> None:
+    def ffn_session(self) -> FFNExecutionSession:
+        return self._session
+
+    def attention_step(self) -> AbstractContextManager[None]:
+        if self.extra_info.ffn_mega_moe:
+            return self._defer_pull_status()
+        return nullcontext()
+
+    def close(self) -> None:
         """Destroy the HCCL process group and clear pending transfer states."""
-        if self.extra_info.ffn_mega_moe and self._pending_attention_payloads:
-            raise RuntimeError(
-                "Pull dispatch is pending; retain communication resources"
-            )
-        if self.extra_info.ffn_mega_moe and self._initialized:
-            if self.world_rank < self.attn_size:
-                self.graph_startup.close_pull_attention()
-            elif pull_receiver_stopped:
-                self.graph_startup.finish_pull_receiver()
-            else:
-                raise RuntimeError("Pull receiver must stop; retain resources")
+        if isinstance(self._session, PullFFNSession):
+            if self._pending_attention_payloads:
+                raise RuntimeError(
+                    "Pull dispatch is pending; retain communication resources"
+                )
+            if self._initialized:
+                if self.world_rank < self.attn_size:
+                    self._session.close_attention()
+                else:
+                    self._session.validate_shutdown()
         if self.cam_pg is not None:
             import torch.distributed as dist
 
@@ -739,25 +753,25 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         )
         _log_cam_op_values("async_combine_recv", "outputs", output=output)
         if not self._defer_pull_status_check:
-            self.check_pull_status()
+            self._check_pull_status()
         payloads.pop(0)
         if not payloads:
             self._pending_attention_payloads.pop(ubatch_idx, None)
         return output
 
     @contextmanager
-    def defer_pull_status(self) -> Iterator[None]:
+    def _defer_pull_status(self) -> Iterator[None]:
         """Check sticky device errors before the model step returns, not per MoE."""
         previous = self._defer_pull_status_check
         self._defer_pull_status_check = True
         try:
             yield
             if not previous:
-                self.check_pull_status()
+                self._check_pull_status()
         finally:
             self._defer_pull_status_check = previous
 
-    def check_pull_status(self) -> None:
+    def _check_pull_status(self) -> None:
         if self.extra_info.ffn_mega_moe:
             assert self.comm_args is not None
             # The model runner batches this fence outside the DBO receive hook.
@@ -765,11 +779,11 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             if status:
                 raise RuntimeError(f"AFD pull transaction failed with status {status}")
 
-    def enable_pull_idle_returns(self) -> None:
+    def _enable_pull_idle_returns(self) -> None:
         assert self.comm_args is not None
         self.comm_args.view(torch.int64)[PULL_IDLE_BUDGET_INDEX].fill_(PULL_IDLE_SCANS)
 
-    def pull_has_active_source(self) -> bool:
+    def _pull_has_active_source(self) -> bool:
         assert self.comm_args is not None
         return int(self.comm_args.view(torch.int64)[PULL_SOURCE_INDEX].item()) >= 0
 
