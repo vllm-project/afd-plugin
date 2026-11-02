@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Opt-in eager DSpark evidence without adding device reads or fences.
+"""Opt-in eager DSpark ownership and remote-expert execution evidence.
 
-Legacy CAM already exposes a host layer ID in its FFN work item. Count the
-submitted returns at that seam, and read the counts only after HTTP requests
-complete. This fixture is functional evidence, not a performance benchmark.
+Legacy work items already expose a host layer ID. Layered execution requires
+reading the device header after each return, adding synchronization. Disable
+this fixture for performance measurements.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+from afd_plugin.model_executor.npu.async_cam_w4a8 import CAM_LAYER_INDEX
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 from afd_plugin.v1.worker.npu.ffn_worker import AFDNPUFFNWorker
 
@@ -56,6 +57,18 @@ def snapshot(runner) -> dict:
         "owns_attention": any(".self_attn." in name for name in names),
         "submitted_returns": dict(runner.connector.__dict__.get("_dspark_returns", {})),
         "draft_kv_groups": kv_groups,
+        **(
+            {
+                "ffn_execution": "layered"
+                if runner.connector.layered_gmm_enabled
+                else "legacy",
+                "executor_layer_ids": list(runner._layered_executor.layer_ids)
+                if runner._layered_executor is not None
+                else [],
+            }
+            if is_ffn
+            else {}
+        ),
     }
 
 
@@ -68,6 +81,7 @@ class DSparkEagerEvidence:
 
 def install_observers() -> None:
     send = CAMAsyncAFDConnector.send_ffn_work_item_output
+    send_layered = CAMAsyncAFDConnector.send_ffn_output
     check = AFDNPUFFNWorker.raise_ffn_loop_error_if_any
 
     @wraps(send)
@@ -76,6 +90,18 @@ def install_observers() -> None:
         counters = self.__dict__.setdefault("_dspark_returns", {})
         layer = str(work_item.layer_idx)
         counters[layer] = counters.get(layer, 0) + 1
+        return result
+
+    @wraps(send_layered)
+    def sent_layered(self, ffn_output, context, **kwargs):
+        result = send_layered(self, ffn_output, context, **kwargs)
+        if self.layered_gmm_enabled:
+            # Functional observer only: the header copy fences the return
+            # before a later receive can reuse this work item's metadata.
+            header = context.states.token_nums_rankid_layeridx.cpu().tolist()
+            counters = self.__dict__.setdefault("_dspark_returns", {})
+            layer = str(header[CAM_LAYER_INDEX])
+            counters[layer] = counters.get(layer, 0) + 1
         return result
 
     @wraps(check)
@@ -91,6 +117,7 @@ def install_observers() -> None:
         return result
 
     CAMAsyncAFDConnector.send_ffn_work_item_output = sent
+    CAMAsyncAFDConnector.send_ffn_output = sent_layered
     AFDNPUFFNWorker.raise_ffn_loop_error_if_any = checked
 
 
