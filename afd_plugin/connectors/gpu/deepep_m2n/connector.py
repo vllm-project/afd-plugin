@@ -1033,17 +1033,6 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         # deployment. ``None`` when the FFN runs without EPLB.
         self.eplb: DeepEPM2NAttentionEplb | DeepEPM2NFFNEplb | None = None
         self._handshake_enable_eplb = False
-        if (
-            afd_config.role == "ffn"
-            and vllm_config.parallel_config.enable_eplb
-            and vllm_config.parallel_config.eplb_config.use_async
-        ):
-            raise RuntimeError(
-                "DeepEP M2N EPLB does not support async EPLB: the async "
-                "worker commits new expert maps outside the connector step "
-                "boundary the Attention ranks adopt them at. Pass "
-                "use_async=false in --eplb-config."
-            )
         self.attn_size = self.layout.attn_size
         self.ffn_size = self.layout.ffn_size
         self.is_ffn = afd_config.role == "ffn"

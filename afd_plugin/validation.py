@@ -198,6 +198,18 @@ def validate_gpu_model_runner_v2_config(
             raise RuntimeError(
                 "AFD ModelRunnerV2 FFN EPLB does not support DBO or ubatching",
             )
+        # vLLM 0.32 async EPLB commits new expert maps from a background
+        # worker outside the connector step boundary: AFD steps EPLB from
+        # the connector loop, and the M2N exchange adopts the committed maps
+        # only at that boundary. Migration batching is async-only, so this
+        # gate covers it too.
+        if parallel.eplb_config.use_async:
+            raise RuntimeError(
+                "AFD ModelRunnerV2 FFN EPLB does not support async EPLB: "
+                "rearrangement commits expert maps from a background worker "
+                "outside the connector step boundary. Pass use_async=false "
+                "in --eplb-config.",
+            )
     if (
         parallel.enable_dbo or parallel.use_ubatching
     ) and parallel.num_ubatches != GPU_MRV2_NUM_UBATCHES:

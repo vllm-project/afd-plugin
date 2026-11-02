@@ -286,6 +286,24 @@ def test_routed_transport_preserves_runner_and_gate_policy(
         )
 
 
+def test_gpu_validator_rejects_async_eplb(mrv2_config):
+    mrv2_config.parallel_config.enable_eplb = True
+    mrv2_config.parallel_config.eplb_config = SimpleNamespace(use_async=False)
+    mrv2_config.parallel_config.enable_dbo = False
+    mrv2_config.parallel_config.use_ubatching = False
+    mrv2_config.additional_config["afd"]["role"] = "ffn"
+
+    validate_gpu_model_runner_v2_config(
+        mrv2_config, expected_role="ffn", device_type="cuda"
+    )
+
+    mrv2_config.parallel_config.eplb_config = SimpleNamespace(use_async=True)
+    with pytest.raises(RuntimeError, match="does not support async EPLB"):
+        validate_gpu_model_runner_v2_config(
+            mrv2_config, expected_role="ffn", device_type="cuda"
+        )
+
+
 @pytest.mark.parametrize("role", ["attention", "ffn"])
 @pytest.mark.parametrize(
     "architecture, accepted",
@@ -619,6 +637,16 @@ _GPU_GRAPH = {
             },
             None,
             id="accept-ffn-eplb",
+        ),
+        pytest.param(
+            {
+                "afd.role": "ffn",
+                "hf.architectures": ["AFDDeepseekV2ForCausalLM"],
+                "par.enable_eplb": True,
+                "par.eplb_config.use_async": True,
+            },
+            _err("async EPLB"),
+            id="reject-ffn-eplb-async",
         ),
         pytest.param(
             {

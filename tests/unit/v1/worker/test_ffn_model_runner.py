@@ -250,12 +250,12 @@ class _FakeEplbController:
     def prepare_load(self):
         self.prepare_loads += 1
 
-    def maybe_register_model(self, model, model_config, load_dummy_weights):
-        self.registrations.append((model, model_config, load_dummy_weights))
+    def maybe_register_model(self, model, model_config):
+        self.registrations.append((model, model_config))
         return True
 
-    def maybe_start_async_loop(self, eplb_models_added):
-        self.async_loop_starts.append(eplb_models_added)
+    def maybe_start_async_loop(self, eplb_models_added, load_dummy_weights=False):
+        self.async_loop_starts.append((eplb_models_added, load_dummy_weights))
 
     def step(self, is_dummy=False, is_profile=False):
         self.steps.append((is_dummy, is_profile))
@@ -727,8 +727,40 @@ def test_ffn_runner_loads_model_and_registers_eplb(monkeypatch):
 
     assert runner.model is model
     assert runner.eplb.prepare_loads == 1
-    assert runner.eplb.registrations == [(model, runner.model_config, False)]
-    assert runner.eplb.async_loop_starts == [True]
+    assert runner.eplb.registrations == [(model, runner.model_config)]
+    assert runner.eplb.async_loop_starts == [(True, False)]
+
+
+def test_fake_eplb_controller_matches_vllm_eplb_controller_api():
+    """The fake must mirror vLLM's EPLBController call surface.
+
+    A drifted fake hides upstream signature changes: vLLM 0.32 removed
+    ``load_dummy_weights`` from ``maybe_register_model`` and moved it to
+    ``maybe_start_async_loop``, and the stale fake kept the runner's broken
+    three-argument call green.
+    """
+    import inspect
+
+    from vllm.v1.worker.gpu.eplb_utils import EPLBController
+
+    for name in (
+        "prepare_load",
+        "maybe_register_model",
+        "maybe_start_async_loop",
+        "step",
+        "prepare_forward",
+    ):
+        real = inspect.signature(getattr(EPLBController, name))
+        fake = inspect.signature(getattr(_FakeEplbController, name))
+        real_params = [
+            (param.name, param.default is not inspect.Parameter.empty)
+            for param in real.parameters.values()
+        ]
+        fake_params = [
+            (param.name, param.default is not inspect.Parameter.empty)
+            for param in fake.parameters.values()
+        ]
+        assert fake_params == real_params, name
 
 
 def test_ffn_runner_steps_eplb_once_per_real_step():

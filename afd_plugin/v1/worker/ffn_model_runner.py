@@ -145,9 +145,8 @@ class GPUFFNModelRunner:
         eplb_models_added = self.eplb.maybe_register_model(
             self.model,
             self.model_config,
-            load_dummy_weights,
         )
-        self.eplb.maybe_start_async_loop(eplb_models_added)
+        self.eplb.maybe_start_async_loop(eplb_models_added, load_dummy_weights)
 
     def profile_run(self) -> None:
         pass
