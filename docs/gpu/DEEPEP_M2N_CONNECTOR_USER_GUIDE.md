@@ -42,6 +42,16 @@ owns real experts `[g * E/F, (g + 1) * E/F)`, so `num_experts` must be
 divisible by `F`; Attention ranks own dummy expert slots that routing never
 selects. Any Attention:FFN ratio works.
 
+The handshake, the model checks and the control plane use this order. The
+afdEP-comm transport sees the same ranks in physical order instead: NVLink
+domain by domain (DeepEP numbers ranks that way), with each domain's FFN ranks
+first. When the FFN ranks fill the first domains (one node, or FFN and
+Attention on separate pods) the two orders are equal. When every domain holds
+the same number of FFN ranks (`4A1F,4A1F`), the connector runs afdEP-comm's
+per-domain mode, which finds the FFN ranks at the start of every domain. The
+connector derives the order from where the ranks run; see
+[Supported layouts](#supported-layouts).
+
 ### Data path
 
 For every MoE layer and stage, in the same order on every rank:
@@ -69,8 +79,11 @@ together if they disagree. The handshake checks the payload format, model
 shapes, lane count (DBO), `network`, bucket settings, GPU
 architecture (SM90 or newer), and the FFN deployment (expert parallel, EP
 size, FFN TP=1, linear expert placement, no EPLB, all2all backend and expert
-weight format). The FFN adopts the Attention TP size, dispatch capacity and
-bucket ladder reported by the Attention ranks.
+weight format), and the placement of the ranks over NVLink domains. The FFN
+adopts the Attention TP size, dispatch capacity and bucket ladder reported by
+the Attention ranks. FFN rank 0 logs the network plan and the transport it
+picked, for example
+`DeepEP M2N transport: per_domain f=1 domains=2x5 placement=4A1F,4A1F`.
 
 ## Installation
 
@@ -219,7 +232,64 @@ that sets `capacity_tokens_per_rank` explicitly must agree with Attention.
 | Attention DP x TP | Supported, including TP > 1: each TP rank dispatches its slice of the DP rank's tokens and the TP group all-gathers the combined rows. |
 | FFN DP x TP1 | Required. FFN experts are not TP-sharded. |
 | One node | Supported; ranks reach each other over NVLink. |
-| Several nodes | Supported when every node (NVLink domain) holds an equal, contiguous block of world ranks, with FFN ranks first. Writing each node's ranks as `<A>A<F>F`, the layouts `2A0F,0A2F` (Attention on one node, FFN on another) and `4A0F,0A4F` are valid; `4A1F,4A1F` (FFN ranks not contiguous) and `4A0F,0A2F` (unequal blocks) are not. The fabric must route between the NICs NCCL picks. |
+| Several nodes or pods | Supported for the placements below. The fabric must route between the NICs NCCL picks. |
+
+Write each pod's ranks as `<a>A<f>F`, in pod order (on HGX every pod is one
+NVLink domain; on NVL72, pods in one NVLink clique form one domain). A
+placement is valid when:
+
+1. every pod holds the same number of GPUs;
+2. either the FFN ranks fill the first pods, or every pod holds the same
+   number of FFN ranks;
+3. FFN DP ranks rise in pod order, and so do Attention DP ranks;
+4. `num_experts % F == 0`, and Attention TP stays inside a pod.
+
+Inside a pod, put the FFN ranks on the same local GPUs in every pod
+(the recipes use the first ones): DeepEP's hybrid mode pairs ranks across pods
+by their position in the pod.
+
+| Placement | Accepted | afdEP-comm mode |
+| --- | --- | --- |
+| `4A2F` (one pod) | yes | FFN prefix |
+| `2A0F,0A2F`, `0A4F,4A0F` | yes | FFN prefix |
+| `3A2F,5A0F` | yes | FFN prefix (one mixed pod at the boundary) |
+| `0A1F,0A1F,1A0F,1A0F` | yes | FFN prefix, pods of one GPU |
+| `4A1F,4A1F`, `1A1F,1A1F`, `6A2F,6A2F` | yes | per-domain, `f` = FFN ranks per pod |
+| `4A1F,3A2F` | no | the FFN count varies from pod to pod |
+| `0A1F,0A1F,2A0F,2A0F`, `0A2F,4A0F` | no | pods of different sizes |
+
+The rejected placements usually have an equivalent with equal pods: for
+example `0A2F,2A0F,2A0F` instead of `0A2F,4A0F`. There is nothing to
+configure; the handshake rejects other placements with the pods' shapes in
+the message.
+
+## Multi-pod deployment
+
+Each pod starts one `vllm serve` per role it holds, with the AFD config
+(`num_attention_ranks = A`, `num_ffn_ranks = F`, `host:port` = the pod that
+holds FFN rank 0) the same on every rank. For each role, with `S` = the role's
+DP size, `L` = this pod's local DP size and `start` = the sum of the local
+sizes of the pods before it:
+
+| Flag | First pod holding the role | Other pods holding the role |
+| --- | --- | --- |
+| `--data-parallel-size` | `S` | `S` |
+| `--data-parallel-size-local` | `L` | `L` |
+| `--data-parallel-address` / `--data-parallel-rpc-port` | its own address | the first pod's address |
+| `--data-parallel-start-rank` | omitted | `start` |
+| `--headless` | no | yes |
+
+When one pod holds the whole role, pass only `--data-parallel-size`. Do not
+pass `--data-parallel-start-rank 0` on the first pod: vLLM reads an explicit
+start rank on a non-headless engine as hybrid load balancing and then rejects
+the headless pods. The FFN DP rank is the FFN's EP rank, so it decides which
+experts a pod loads; `--enable-ep-weight-filter` keeps each FFN from reading
+the other experts' weights.
+
+The recipe
+[`multipod_4a1f_4a1f_graph.sh`](../../recipe/gpu/DeepEPM2NAFDConnector/qwen3_235b_a22b_fp8/README.md#multi-pod-2-x-4a1f)
+derives all of these flags for symmetric placements `N x <a>A<f>F` from the
+pod index (`POD=AFD_<k>`).
 
 ## Minimal launch shape
 
@@ -266,13 +336,15 @@ and FP8 examples, see the
 
 - CPU unit tests:
   [`tests/unit/connectors/test_deepep_m2n_connector.py`](../../tests/unit/connectors/test_deepep_m2n_connector.py)
-  runs against a fake afdEP module when afdEP-comm is not installed.
+  runs against a fake afdEP module when afdEP-comm is not installed;
+  [`test_deepep_m2n_layout.py`](../../tests/unit/connectors/test_deepep_m2n_layout.py)
+  checks the placement table above.
 - GPU connector tests: [`tests/gpu`](../../tests/gpu/README.md) checks
   dispatch, DeepGEMM experts and combine against references on one node.
 - Model E2E: the Qwen3 MoE cases `afd-deepep-m2n-*-2a2f` in
   [`tests/e2e`](../../tests/e2e/README.md#deepep-m2n-scenarios) (eager, graph,
-  graph + DBO, and Attention TP2) and the two-pod cases in
-  `tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py`.
+  graph + DBO, and Attention TP2) and the two-pod cases (`2A0F,0A2F` and
+  `1A1F,1A1F`) in `tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py`.
 
 ## Requirements and limitations
 

@@ -1,7 +1,8 @@
 # 1. Resolve the recipe, its model, and its placement
 
 Take the recipe path from the user, or ask. It must be a colocation recipe
-under `recipe/gpu/P2pNcclAFDConnector/**/prefill_decode_colocation/` (GPU
+under `recipe/gpu/P2pNcclAFDConnector/**/prefill_decode_colocation/` or
+`recipe/gpu/DeepEPM2NAFDConnector/**/prefill_decode_colocation/` (GPU
 only; prefill/decode disaggregation recipes are out of scope -- see
 `SKILL.md` Scope).
 
@@ -88,3 +89,22 @@ For each entry, derive (used by [deploy.md](deploy.md) and
   which case `worker` if that line's `ATTENTION_HEADLESS` override is `1`,
   else `head`.
 - **`afd-ffn-node-role`**: symmetric, `none` unless `POD` starts with `FFN_`.
+
+### Pods that run both roles: `POD=AFD_<index>`
+
+DeepEP M2N multi-pod recipes (e.g.
+`DeepEPM2NAFDConnector/qwen3_235b_a22b_fp8/prefill_decode_colocation/multipod_4a1f_4a1f_graph.sh`)
+list `POD=AFD_0`, `POD=AFD_1`, ... with no other per-pod overrides. Every
+such pod runs one FFN and one Attention server and derives its DP flags
+(headless, start rank) from its own index, so:
+
+- **`afd-attn-node-role`** and **`afd-ffn-node-role`**: both `head` for
+  `AFD_0`, both `worker` for every other `AFD_<index>`.
+- The pod shape comes from the script's `NUM_PODS`, `ATTN_PER_POD` and
+  `FFN_PER_POD` defaults (`NUM_PODS` must equal the number of entries). If
+  the user overrides them, pass the same values to every pod as container
+  env.
+- Ports are literals in the script, not `*_PORT:-N` defaults: the AFD
+  rendezvous port is the `"port": N` of the `afd` JSON, and the FFN and
+  Attention DP RPC ports are the last argument of the `role_dp "$F" ...` and
+  `role_dp "$A" ...` lines.

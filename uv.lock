@@ -31,7 +31,7 @@ resolution-markers = [
 [[package]]
 name = "afdep-comm"
 version = "1.1.0"
-source = { git = "https://github.com/afdEP/afdEP-comm.git?rev=2b74d574e9d25cc794de8d2359f815fcfb48955a#2b74d574e9d25cc794de8d2359f815fcfb48955a" }
+source = { git = "https://github.com/afdEP/afdEP-comm.git?rev=fdff967f6f0a29c154175e0d5865955d347ec69a#fdff967f6f0a29c154175e0d5865955d347ec69a" }
 dependencies = [
     { name = "ninja" },
     { name = "packaging" },
@@ -5584,7 +5584,7 @@ e2e-tests = [
 
 [package.metadata]
 requires-dist = [
-    { name = "afdep-comm", marker = "extra == 'afdep'", git = "https://github.com/afdEP/afdEP-comm.git?rev=2b74d574e9d25cc794de8d2359f815fcfb48955a" },
+    { name = "afdep-comm", marker = "extra == 'afdep'", git = "https://github.com/afdEP/afdEP-comm.git?rev=fdff967f6f0a29c154175e0d5865955d347ec69a" },
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.32.0" },
 ]
 provides-extras = ["afdep", "vllm"]

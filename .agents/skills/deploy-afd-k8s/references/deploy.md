@@ -28,6 +28,14 @@ devices="$(role_block "$RECIPE_SCRIPT_PATH" "$ROLE" \
 GPU_COUNT=$(( $(grep -o ',' <<<"$devices" | wc -l) + 1 ))
 ```
 
+`POD=AFD_<index>` entries (both roles per pod, see
+[resolve-recipe.md](resolve-recipe.md)): every pod has the same shape,
+
+```bash
+default() { grep -oE "$1:-[0-9]+" "$RECIPE_SCRIPT_PATH" | grep -oE '[0-9]+$'; }
+GPU_COUNT=$(( ${ATTN_PER_POD:-$(default ATTN_PER_POD)} + ${FFN_PER_POD:-$(default FFN_PER_POD)} ))
+```
+
 ## 3. Confirm before touching the cluster
 
 State and confirm: target cluster/namespace, `AFD_PLUGIN_IMAGE`, `MODEL_ID`,
@@ -166,6 +174,13 @@ Placement-driven recipe, one call per entry parsed in
 deploy_pod vllm-pod-attention-0 2 head none "POD=ATTENTION_0"
 deploy_pod vllm-pod-attention-1 2 worker none "POD=ATTENTION_1 ATTENTION_HEADLESS=1 ATTENTION_DP_START_RANK=2"
 deploy_pod vllm-pod-ffn-0 2 none head "POD=FFN_0"
+```
+
+`POD=AFD_<index>` recipe, e.g. the DeepEP M2N 2 x 4A1F plan (5 GPUs per pod):
+
+```bash
+deploy_pod vllm-pod-afd-0 5 head head "POD=AFD_0"
+deploy_pod vllm-pod-afd-1 5 worker worker "POD=AFD_1"
 ```
 
 ## 4f. Wait for Running, then for each pod's own readiness line

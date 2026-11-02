@@ -54,7 +54,11 @@ from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (  # noqa: E402
     dequantize_fp8_block128,
     quantize_fp8_block128,
 )
-from afd_plugin.connectors.gpu.deepep_m2n.layout import DeepEPM2NLayout  # noqa: E402
+from afd_plugin.connectors.gpu.deepep_m2n.layout import (  # noqa: E402
+    DeepEPM2NLayout,
+    RankPlacement,
+    plan_transport_layout,
+)
 from afd_plugin.connectors.gpu.deepep_m2n.network import (  # noqa: E402
     NetworkConfig,
     RankTopology,
@@ -621,6 +625,8 @@ def test_handshake_accepts_consistent_ranks():
     assert result.expert_alignment == 128
     assert not result.network_plan.use_gin
     assert (result.attn_tp_size, result.capacity_tokens_per_rank) == (1, 256)
+    assert result.transport.is_identity
+    assert result.transport.ffn_ranks_per_domain == 0
 
 
 def test_handshake_gives_ffn_the_attention_tp_size_capacity_and_ladder():
@@ -696,9 +702,11 @@ def test_handshake_rejects_mismatches(overrides, message):
 
 
 def test_handshake_plans_gin_across_nvlink_domains():
-    """Ranks on hosts ``aabb`` give a plan of 2 domains of 2 ranks with GIN.
+    """Ranks on hosts ``aabb`` (role-split pods) give a plan of 2 domains of 2
+    ranks with GIN, and keep the role world as the transport order.
 
-    Why: the handshake must hand the network plan the right domains.
+    Why: the handshake must hand the network plan the right domains, and the
+    role-split layouts that run today must take the unchanged transport.
     """
     layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
 
@@ -711,18 +719,54 @@ def test_handshake_plans_gin_across_nvlink_domains():
         2,
         2,
     )
+    assert result.transport.is_identity
+
+
+def test_handshake_gives_interleaved_pods_the_per_domain_transport():
+    """FFN 0 and FFN 1 on hosts ``a`` and ``b``, each with one Attention rank
+    (``1A1F,1A1F``), give a per-domain transport ``[F0, A0, F1, A1]`` over 2
+    domains of 2 ranks.
+
+    Why: afdEP-comm's lanes must see the ranks domain by domain with each
+    domain's FFN rank first; the network plan is checked in that order.
+    """
+    layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
+
+    result = validate_handshake(
+        _handshake(layout, hosts="abab"), layout, NetworkConfig()
+    )
+
+    assert result.transport.order == (
+        ("ffn", 0),
+        ("attention", 0),
+        ("ffn", 1),
+        ("attention", 1),
+    )
+    assert result.transport.ffn_ranks_per_domain == 1
+    assert (result.network_plan.num_domains, result.network_plan.ranks_per_domain) == (
+        2,
+        2,
+    )
 
 
 @pytest.mark.parametrize(
-    ("hosts", "message"),
-    [("aaab", "different rank counts"), ("abab", "not contiguous")],
+    ("ffn_size", "attn_size", "hosts", "message"),
+    [
+        (2, 2, "aaab", "same number of ranks"),
+        # Host a holds F0, A0, A1 and host b F1, F2, A2.
+        (3, 3, "abbaab", "same number of FFN ranks"),
+    ],
 )
-def test_handshake_rejects_unsupported_domain_layouts(hosts, message):
-    """Hosts ``aaab`` (unequal counts) and ``abab`` (not contiguous) raise.
+def test_handshake_rejects_unsupported_domain_layouts(
+    ffn_size, attn_size, hosts, message
+):
+    """Hosts with unequal rank counts, or with FFN counts that differ while
+    the FFN ranks do not fill the first hosts, raise.
 
-    Why: DeepEP's hybrid mode needs equal, contiguous ranks per domain.
+    Why: DeepEP needs equal NVLink domains, and afdEP-comm finds FFN ranks
+    only as a prefix or as the same count in every domain.
     """
-    layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
+    layout = DeepEPM2NLayout(ffn_size=ffn_size, attn_size=attn_size, num_experts=96)
 
     with pytest.raises(RuntimeError, match=message):
         validate_handshake(_handshake(layout, hosts=hosts), layout, NetworkConfig())
@@ -1285,27 +1329,48 @@ def test_attention_init_rejects_local_experts_before_communicating():
     assert connector.bootstrap_group is None
 
 
-@pytest.mark.parametrize(("role", "role_rank"), [("attention", 2), ("ffn", 1)])
+@pytest.mark.parametrize(
+    ("role", "role_rank", "hosts", "ffn_ranks_per_domain"),
+    [
+        ("attention", 2, "aaaaaa", 0),
+        ("ffn", 1, "aaaaaa", 0),
+        # Hosts of F0 F1 A0 A1 A2 A3: 2A1F,2A1F.
+        ("ffn", 1, "ababab", 1),
+        ("attention", 3, "ababab", 1),
+    ],
+)
 def test_lane_transport_is_afdep_comm_with_the_ffn_rank_count(
-    monkeypatch, role, role_rank
+    monkeypatch, role, role_rank, hosts, ffn_ranks_per_domain
 ):
     """Each lane's transport is afdEP-comm's ``ElasticBuffer``, built with every
-    argument its constructor requires and the FFN rank count.
+    argument its constructor requires, the FFN rank count and the transport's
+    ``ffn_ranks_per_domain``, on the transport group.
 
     Why: ``ffn_ranks`` selects afdEP-comm's AFD transport (without it the
-    buffer is unspecialized DeepEP V2), and the stand-in fails on any argument
-    set the real constructor would refuse.
+    buffer is unspecialized DeepEP V2), ``ffn_ranks_per_domain`` tells it
+    where the FFN ranks sit, and the stand-in fails on any argument set the
+    real constructor would refuse.
     """
     monkeypatch.setattr(connector_module, "ElasticBuffer", FakeElasticBuffer)
-    connector = _connector(role, role_rank, M2NTopology(ffn_size=2, attn_size=3), {})
-    connector.bootstrap_group = SimpleNamespace()
+    topology = M2NTopology(ffn_size=2, attn_size=4)
+    connector = _connector(role, role_rank, topology, {})
+    connector.transport_group = SimpleNamespace()
+    connector.transport = plan_transport_layout(
+        [
+            RankPlacement(*topology.role(rank), f"host:{host}")
+            for rank, host in enumerate(hosts)
+        ],
+        ffn_size=topology.ffn_size,
+    )
     connector.network_plan = SimpleNamespace(hybrid=True, rdma_traffic_class=0)
     connector.capacity_tokens_per_rank = 64
 
     buffer = connector._new_lane()
 
     assert isinstance(buffer, FakeElasticBuffer)
+    assert buffer.kwargs["group"] is connector.transport_group
     assert buffer.kwargs["ffn_ranks"] == 2
+    assert buffer.kwargs["ffn_ranks_per_domain"] == ffn_ranks_per_domain
     assert buffer.kwargs["capacity_tokens_per_rank"] == 64
     assert buffer.kwargs["allow_hybrid_mode"] is True
 
