@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
@@ -88,6 +89,7 @@ class AsyncNPUFFNModelRunner:
         self.afd_config = parse_afd_config(vllm_config, expected_role="ffn")
         fail_if_unsupported_npu_afd_features(vllm_config, afd_config=self.afd_config)
         self.model: FFNModel | None = None
+        self.draft_model: FFNModel | None = None
         self.model_memory_usage = 0
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.layer_ids: tuple[int, ...] = ()
@@ -138,6 +140,20 @@ class AsyncNPUFFNModelRunner:
                     vllm_config=self.vllm_config, model_config=self.model_config
                 ),
             )
+            if speculative_config is not None and speculative_config.method == "dspark":
+                from vllm.model_executor.models.utils import get_draft_quant_config
+
+                # F has no draft attention or embedding/head to share. Use the
+                # native quantization/weight loader with its role-local model.
+                draft_config = replace(self.vllm_config)
+                draft_config.quant_config = get_draft_quant_config(self.vllm_config)
+                self.draft_model = cast(
+                    FFNModel,
+                    loader.load_model(
+                        vllm_config=draft_config,
+                        model_config=speculative_config.draft_model_config,
+                    ),
+                )
         self.model_memory_usage = profiler.consumed_memory
 
     def get_model(self) -> torch.nn.Module:
@@ -153,7 +169,15 @@ class AsyncNPUFFNModelRunner:
         if self.connector.is_initialized:
             return
         assert self.model is not None
-        self.layer_ids = tuple(sorted(self.model.get_experts_layer_indices()))
+        models = (self.model,) + (
+            (self.draft_model,) if self.draft_model is not None else ()
+        )
+        layer_ids = [
+            index for model in models for index in model.get_experts_layer_indices()
+        ]
+        if len(layer_ids) != len(set(layer_ids)):
+            raise ValueError("Target and draft remote MoE layer IDs overlap")
+        self.layer_ids = tuple(sorted(layer_ids))
         stream_signature = stream_error = ""
         config = self.connector.extra_info
         try:
@@ -452,6 +476,12 @@ class AsyncNPUFFNModelRunner:
                     "CAM async FFN work item requires AFDAsyncTransferState",
                 )
             layer_idx = work_item.layer_idx
+            model = (
+                self.draft_model
+                if self.draft_model is not None
+                and layer_idx in self.draft_model.get_experts_layer_indices()
+                else self.model
+            )
             num_tokens = work_item.num_tokens
             afd_metadata = AFDForwardContextMetadata(
                 tokens_start_loc=[0],
@@ -466,7 +496,7 @@ class AsyncNPUFFNModelRunner:
             with ascend_forward_context(
                 vllm_config=self.vllm_config,
                 afd_metadata=afd_metadata,
-                model_instance=self.model,
+                model_instance=model,
                 num_tokens=num_tokens,
                 skip_mc2_mask=self.afd_config.compute_gate_on_attention,
             ) as forward_context:
@@ -474,7 +504,7 @@ class AsyncNPUFFNModelRunner:
                 forward_context.additional_kwargs["afd_metadata"] = metadata
                 _set_moe_layer_index(forward_context, layer_idx)
 
-                rank_ffn_output = self.model.compute_ffn_output(
+                rank_ffn_output = model.compute_ffn_output(
                     hidden_states=hidden_states,
                     layer_idx=layer_idx,
                     group_list=legacy_states.group_list,
@@ -520,4 +550,5 @@ class AsyncNPUFFNModelRunner:
         self._layered_executor = None
         free_before_shutdown(self.vllm_config)
         self.model = None
+        self.draft_model = None
         self._is_shutdown = True

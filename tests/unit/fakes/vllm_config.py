@@ -44,6 +44,7 @@ def npu_parallel_config(**overrides):
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
         "use_sequence_parallel_moe": False,
+        "enable_eplb": False,
         "prefill_context_parallel_size": 1,
         "decode_context_parallel_size": 1,
         "dbo_decode_token_threshold": 1,
@@ -247,3 +248,33 @@ def m2n_vllm_config(
             max_num_batched_tokens=M2N_MAX_NUM_BATCHED_TOKENS
         ),
     )
+
+
+def npu_dspark_config(*, role="attention", draft_eager=True):
+    hf = SimpleNamespace(
+        architectures=["DSparkDraftModel"],
+        vocab_size=16,
+        hidden_size=8,
+        num_experts_per_tok=2,
+        n_routed_experts=8,
+    )
+    config = npu_vllm_config(
+        role=role,
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+        extra_config={"dynamicQuant": 1},
+        speculative_config=SimpleNamespace(
+            method="dspark",
+            enforce_eager=draft_eager,
+            num_speculative_tokens=5,
+            draft_parallel_config=SimpleNamespace(tensor_parallel_size=1),
+            draft_model_config=SimpleNamespace(hf_config=hf, hf_text_config=hf),
+        ),
+    )
+    config.model_config.hf_text_config.model_type = "deepseek_v4"
+    config.model_config.hf_text_config.hidden_size = hf.hidden_size
+    config.model_config.hf_text_config.num_experts_per_tok = hf.num_experts_per_tok
+    config.model_config.hf_text_config.n_routed_experts = hf.n_routed_experts
+    config.scheduler_config.max_num_seqs = 2
+    return config

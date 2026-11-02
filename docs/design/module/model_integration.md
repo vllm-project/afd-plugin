@@ -83,6 +83,7 @@ registers lazy AFD wrapper paths under `AFD`-prefixed aliases.
 | `DeepseekV3ForCausalLM` | `AFDDeepseekV3ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `DeepseekV32ForCausalLM` | `AFDDeepseekV32ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `DeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` |
+| `DSparkDraftModel` | Unsupported | `AFDDSparkDeepseekV4ForCausalLM` (eager Async CAM) |
 | `GlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` |
 | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` |
 | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` |
@@ -159,6 +160,17 @@ owns attention, mHC, normalization and finalization. Synchronous CAMP2P sends
 normalized hidden states and Hash-layer token IDs to FFN, which owns the
 native gate and MoE. Async CAM keeps the Hash/top-k router and shared experts
 on Attention and sends only routed-expert work; `dynamicQuant=1` is required.
+
+The eager DSpark adapter follows the same boundary. Native checkpoint names
+`mtp.0..2` and KV names are retained; its CAM layer IDs start at the target's
+`num_hidden_layers` to avoid collisions. Draft layers always use non-Hash
+routing. F loads one set of target and draft expert shards before rendezvous,
+then serves both from its existing receive loop. Each native draft proposal
+installs its own AFD metadata and opts out of cross-DP synchronization; native
+sampling, rejection, heads and context-KV updates are inherited. The
+[0.32 eager recipe](../../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md)
+describes A/F serving. In PD deployments, Prefill uses the upstream complete
+draft model and KV connector. This adapter supports eager execution only.
 
 Shared-expert layout is model-specific. DeepSeek-V2/V3 Async CAM forces
 replicated shared weights when effective model SP is enabled. DeepSeek-V4
