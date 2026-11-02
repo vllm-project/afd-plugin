@@ -66,6 +66,8 @@ Target and draft use eager execution. F supports legacy execution and the
 existing layered W4A8 executor, with one combined target/draft weight table.
 The example selects legacy F. To enable layered W4A8, prefix only the F command
 with `AFD_ASYNC_CAM_LAYERED_GMM=1`; keep it set to `0` for A and P.
+The existing layered eager path can be slower for small decode batches; use
+ordinary W4A8 eager when choosing this deployment for eager throughput.
 
 The existing layered W4A8 kernel does not apply nonzero `swiglu_limit` values.
 Use legacy F when the checkpoint's SwiGLU clamp behavior is required. FULL
