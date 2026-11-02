@@ -136,8 +136,16 @@ native DSpark comparison, exercises SWA boundaries and chunked prompts, and
 checks proposal/acceptance counters. Optional ownership evidence uses
 `tests.e2e.models.deepseek_v4_flash.dspark_evidence.DSparkEagerEvidence`
 through the native worker-extension hook; disable observers when benchmarking.
+For this check, enable `VLLM_SERVER_DEV_MODE=1` on A/F, add the extension with
+`--worker-extension-cls`, and set `AFD_DSPARK_EVIDENCE_DIR` to F's evidence
+directory. Pass that directory to the checker with `--evidence-dir`. In layered
+mode it requires all 46 target/draft layers to return work on each F rank.
 Layered execution observations read device headers and add synchronization;
 their timings are not performance measurements.
+
+For a layered/reference FFN performance comparison, keep DSpark enabled on P,
+A and F in both runs, toggle only F's `AFD_ASYNC_CAM_LAYERED_GMM`, and disable
+the evidence extension.
 
 Remove `--speculative-config` on A/F for a speculation-disabled control, and
 use the corresponding upstream P configuration when testing PD. Record the

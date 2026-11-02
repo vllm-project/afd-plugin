@@ -56,7 +56,10 @@ def assert_dispatch(before: dict, after: dict) -> None:
         assert not state["owns_attention"] and not state["owns_shared_experts"], state
         if state["ffn_execution"] == "layered":
             assert state["executor_layer_ids"] == list(range(46)), state
-        for layer in (43, 44, 45):
+        required_layers = (
+            range(46) if state["ffn_execution"] == "layered" else (43, 44, 45)
+        )
+        for layer in required_layers:
             key = str(layer)
             old = before[name]["submitted_returns"].get(key, 0)
             assert state["submitted_returns"].get(key, 0) > old, (name, layer, state)
