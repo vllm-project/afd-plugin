@@ -9,6 +9,16 @@ import torch
 from afd_plugin.model_executor.npu.async_cam_w4a8 import AsyncCAMW4A8Executor
 from afd_plugin.validation import cam_receive_capacity
 
+# Mirror Pull::MetadataWords in afd_pull_layout.h (all fields are int64_t):
+# [total, source, layer, round_begin, round_end], tp source prefixes,
+# tp * experts original counts, then [session, sequence].
+METADATA_WORD_BYTES = torch.int64.itemsize
+METADATA_FIXED_WORDS = 7
+METADATA_PREFIX_WORDS_PER_SOURCE = 1
+# NativeMegaWorkspace in afd_native_mega_workspace.h aligns scratch regions to
+# 512 bytes. Match its counts offset, including padding after batch metadata.
+WORKSPACE_ALIGNMENT_BYTES = 512
+
 
 class AsyncCAMMegaExecutor:
     def __init__(self, weights: AsyncCAMW4A8Executor, connector) -> None:
@@ -40,10 +50,18 @@ class AsyncCAMMegaExecutor:
             self.capacity, hidden, intermediate, experts, connector.tp_size
         )
         self.scratch = torch.empty(size, dtype=torch.uint8, device=device)
-        metadata_bytes = 8 * (7 + connector.tp_size * (1 + experts))
-        count_offset = (metadata_bytes + 511) // 512 * 512
+        metadata_words = METADATA_FIXED_WORDS + connector.tp_size * (
+            METADATA_PREFIX_WORDS_PER_SOURCE + experts
+        )
+        metadata_bytes = METADATA_WORD_BYTES * metadata_words
+        count_offset = (
+            (metadata_bytes + WORKSPACE_ALIGNMENT_BYTES - 1)
+            // WORKSPACE_ALIGNMENT_BYTES
+            * WORKSPACE_ALIGNMENT_BYTES
+        )
+        count_bytes = METADATA_WORD_BYTES * experts
         self.batch_info = self.scratch[:metadata_bytes].view(torch.int64)
-        self.group_list = self.scratch[count_offset : count_offset + 8 * experts].view(
+        self.group_list = self.scratch[count_offset : count_offset + count_bytes].view(
             torch.int64
         )
         self.anchor = torch.empty(1, dtype=torch.bfloat16, device=device)
