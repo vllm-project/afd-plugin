@@ -5,9 +5,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 
@@ -34,6 +35,41 @@ class ConnectorExtraInfo:
 
     def to_mapping(self) -> dict[str, Any]:
         return {}
+
+
+class FFNExecutionSession(Protocol):
+    """Backend-owned service and receiver lifecycle."""
+
+    requires_drain: bool
+
+    def keep_serving(self, shutdown_requested: bool) -> bool: ...
+    def before_first_step(self) -> None: ...
+    def after_step(self) -> None: ...
+    def drain(self, run_one: Callable[[], None]) -> None: ...
+    def finish_receiver(self) -> None: ...
+    def validate_shutdown(self) -> None: ...
+
+
+class DefaultFFNSession:
+    requires_drain = False
+
+    def keep_serving(self, shutdown_requested: bool) -> bool:
+        return not shutdown_requested
+
+    def before_first_step(self) -> None:
+        pass
+
+    def after_step(self) -> None:
+        pass
+
+    def drain(self, run_one: Callable[[], None]) -> None:
+        pass
+
+    def finish_receiver(self) -> None:
+        pass
+
+    def validate_shutdown(self) -> None:
+        pass
 
 
 class AFDConnectorBase(ABC):
@@ -111,6 +147,12 @@ class AFDConnectorBase(ABC):
     # ==============================
     # Lifecycle methods
     # ==============================
+
+    def attention_step(self) -> AbstractContextManager[None]:
+        return nullcontext()
+
+    def ffn_session(self) -> FFNExecutionSession:
+        return DefaultFFNSession()
 
     @abstractmethod
     def close(self) -> None:
@@ -378,4 +420,6 @@ __all__ = [
     "AFDControlPlaneClosedError",
     "AFDRoutedExpertsConnector",
     "ConnectorExtraInfo",
+    "DefaultFFNSession",
+    "FFNExecutionSession",
 ]
