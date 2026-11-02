@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import threading
+import weakref
 from collections import OrderedDict
 from types import SimpleNamespace
 
@@ -24,6 +25,7 @@ from afd_plugin.distributed.kv_transfer.dspark_mooncake import (  # noqa: E402
     _Worker,
     native,
 )
+from tests.unit.fakes.kv_cache import KVTransferEngine  # noqa: E402
 
 
 class Completion:
@@ -139,16 +141,27 @@ def shutdown_worker(request, monkeypatch, auxiliary_pool):
     worker.kv_recv_thread = worker.kv_send_thread = None
     auxiliary_pool.tensor = torch.empty(1)
     auxiliary_pool.registered = True
-    auxiliary_pool.engine = SimpleNamespace(unregister_memory=unregister_auxiliary)
+    auxiliary_pool.engine = KVTransferEngine(unregister_memory=unregister_auxiliary)
     worker.engine = auxiliary_pool.engine
+    weakref.finalize(worker.engine, events.append, "engine-released")
     if request.param:
         worker.engine.disconnect_all_peers = lambda: 0
-    monkeypatch.setattr(native.global_te, "is_register_buffer", True)
-    monkeypatch.setattr(native.global_te, "registered_buffers", [(target_pointer, 8)])
+
+    def unregister_target():
+        events.append("target-unregistered")
+        native.global_te.is_register_buffer = False
+
     monkeypatch.setattr(
-        native.global_te,
-        "unregister_buffer",
-        lambda: events.append("target-unregistered"),
+        native,
+        "global_te",
+        SimpleNamespace(
+            is_register_buffer=True,
+            registered_buffers=[(target_pointer, 8)],
+            register_buffer_lock=threading.Lock(),
+            transfer_engine_lock=threading.Lock(),
+            transfer_engine=worker.engine,
+            unregister_buffer=unregister_target,
+        ),
     )
     monkeypatch.setattr(
         torch.npu,
@@ -170,4 +183,5 @@ def test_shutdown_retires_registered_regions_once_after_device_completion(
         "device-complete",
         "target-unregistered",
         "auxiliary-unregistered",
+        "engine-released",
     ]

@@ -114,6 +114,10 @@ class _Destination:
 class _AuxPool:
     """Fixed registered storage with explicit transfer ownership."""
 
+    # Mooncake's compiled SDK has no Python type declarations. This owner is
+    # cleared after region retirement; native methods are used directly.
+    engine: Any
+
     def __init__(self, worker: _Worker, device: torch.device) -> None:
         shape = (worker.max_requests, worker.window, worker.feature_width)
         size = 2 * worker.max_requests * worker.window * worker.feature_width
@@ -452,6 +456,11 @@ def _thread_factories(owner: _Worker) -> Iterator[None]:
 
 
 class _Worker(native.MooncakeConnectorWorker):
+    # The compiled SDK is untyped and its owner is cleared after shutdown.
+    engine: Any
+    kv_recv_thread: native.KVCacheRecvingThread | None
+    kv_send_thread: native.KVCacheSendingThread | None
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         extra = self.vllm_config.kv_transfer_config.kv_connector_extra_config or {}
@@ -988,7 +997,23 @@ class _Worker(native.MooncakeConnectorWorker):
                                 "retain resources"
                             )
                     native.global_te.is_register_buffer = False
-        self.pool.close()
+        pool = self.pool
+        pool.close()
+        # Native MRV2 retains its KV adapter after worker shutdown. That keeps
+        # this worker, its stopped threads and the SDK alive until C++ process
+        # finalization. Retire every local SDK owner while the NPU runtime is
+        # still live, after all reads and registered regions have been retired.
+        # The qualified carrier owns the process's single Mooncake engine.
+        if isinstance(receiver, _ReceivingThread):
+            receiver.engine = None
+        with native.global_te.transfer_engine_lock:
+            if native.global_te.transfer_engine is self.engine:
+                native.global_te.transfer_engine = None
+        self.engine = None
+        pool.engine = None
+        self.draft = None
+        self.kv_recv_thread = self.kv_send_thread = None
+        self._pool = None
         self._shutdown_complete = True
         native.logger.info("AFD DSpark PD reads drained and registered memory released")
 

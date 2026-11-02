@@ -183,3 +183,19 @@ before native cache storage is freed. It uses native peer disconnection when
 the engine provides that interface. An incomplete read,
 write or receive prevents normal resource release and reports failure. Process
 termination after such a failure is cleanup, not an orderly-shutdown pass.
+
+## Qualification and limitations
+
+The pinned A3 runtime has been exercised with P TP4, Decode A DP1/DP2 and
+F EP4 on one host. Cases include SWA boundaries, chunked prefill, concurrent
+requests, cancellation/reuse and in-flight Decode/F shutdown. Four fixed
+native DSpark controls matched all 128 generated token IDs in each PD topology.
+This does not establish general model accuracy: colocated A TP1 can diverge
+from the native TP4 control at a quantized target-logit tie.
+
+Native Prefill finalization can still report heap corruption after its memory
+regions are unregistered. The same failure was reproduced with native
+Mooncake and speculation disabled. It remains a known limitation; successful
+Decode/F drain does not establish clean Prefill process exit. Multi-host
+placement, prefix reuse, general preemption stress and peer failure recovery
+also require separate qualification.
