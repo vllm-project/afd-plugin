@@ -160,11 +160,13 @@ stopping policies retain their connector/process-level cleanup boundaries.
 
 ## Computation semantics
 
-FULL uses the corresponding layered eager computation without activation
-clipping changes. `swiglu_limit` remains metadata; layered W13 preserves main's
-existing behavior. Ordinary non-layered eager may apply the limit differently.
-This change does not repair that difference, quantization behavior or checkpoint
-loading. The original native operators and their metadata contracts are reused.
+For W4A8, FULL and layered eager forward the same model `swiglu_limit` to W13.
+A positive `L` clamps gate above at `L` and up to `[-L, L]` before SiLU gating and output
+quantization. Zero disables clipping. DeepSeek-V4's configured `10.0` therefore
+applies on both execution paths. The limit is a host scalar fixed at graph
+capture; layer selection remains controlled by the device `layer_index` tensor.
+Layered W8A8 retains its unclipped computation and records the model limit as
+metadata only.
 
 ## Validation
 

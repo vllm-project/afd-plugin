@@ -89,12 +89,22 @@ def operators(monkeypatch):
 @pytest.mark.parametrize(
     "quantization,per_channel", [("W4A8", True), ("W4A8", False), ("W8A8", True)]
 )
+@pytest.mark.parametrize("swiglu_limit", [0.0, 10.0])
 @pytest.mark.parametrize("layer_ids", [(0, 1), (2, 5)])
 @pytest.mark.parametrize("via_graph", [False, True])
 def test_device_layer_selection_capacity_and_scaling(
-    monkeypatch, operators, quantization, per_channel, layer_ids, via_graph
+    monkeypatch,
+    operators,
+    quantization,
+    per_channel,
+    swiglu_limit,
+    layer_ids,
+    via_graph,
 ):
-    layers = [weights(idx, per_channel, quantization) for idx in reversed(layer_ids)]
+    layers = [
+        replace(weights(idx, per_channel, quantization), swiglu_limit=swiglu_limit)
+        for idx in reversed(layer_ids)
+    ]
     executor = AsyncCAMLayeredExecutor(layers)
     hidden = torch.ones(8, 32, dtype=torch.int8)
     scales = torch.ones(8)
@@ -123,6 +133,7 @@ def test_device_layer_selection_capacity_and_scaling(
     assert first[1][6] is second[1][4]
     assert first[1][6].tolist() == [1]
     assert first[2]["dequant_mode"] == (0 if per_channel else 1)
+    assert first[2]["swiglu_limit"] == (swiglu_limit if quantization == "W4A8" else 0.0)
     assert first[2]["group_list_type"] == second[2]["group_list_type"] == 1
     assert first[1][1][0] is layers[-1].w13
     if quantization == "W8A8":
@@ -180,19 +191,6 @@ def test_graph_signature_distinguishes_quantization(operators):
     assert w4.graph_signature(32) != w8.graph_signature(32)
     with pytest.raises(ValueError, match="homogeneous"):
         AsyncCAMLayeredExecutor([weights(0), weights(1, quantization="W8A8")])
-
-
-def test_nonzero_swiglu_limit_starts_without_passing_a_clamp(operators):
-    executor = AsyncCAMLayeredExecutor([replace(weights(), swiglu_limit=10.0)])
-    executor(
-        torch.ones(1, 32, dtype=torch.int8),
-        torch.ones(1),
-        torch.ones(2, dtype=torch.int64),
-        torch.tensor([2, 0, 0, 1]),
-    )
-    assert len(operators) == 2
-    assert "clamp_value" not in operators[0][2]
-    assert "swiglu_limit" not in operators[0][2]
 
 
 def test_repeated_interleaved_layer_ids(operators):

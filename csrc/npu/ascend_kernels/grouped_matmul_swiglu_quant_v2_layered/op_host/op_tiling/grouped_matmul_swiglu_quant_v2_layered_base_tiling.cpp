@@ -24,6 +24,7 @@
 #include "grouped_matmul_swiglu_quant_v2_layered_base_tiling.h"
 #include "util/math_util.h"
 #include "err/ops_err.h"
+#include <cmath>
 
 using namespace matmul_tiling;
 
@@ -209,6 +210,11 @@ ge::graphStatus GroupedMatmulSwigluQuantV2LayeredBaseTiling::ParseInputAndAttr()
 
     auto attr = context_->GetAttrs();
     OP_CHECK_NULL_WITH_CONTEXT(context_, attr); // check attr is not null
+    const float *swigluLimitPtr = attr->GetAttrPointer<float>(ATTR_INDEX_SWIGLU_LIMIT);
+    swigluLimit_ = swigluLimitPtr != nullptr ? *swigluLimitPtr : 0.0f;
+    OP_CHECK_IF(!std::isfinite(swigluLimit_) || swigluLimit_ < 0.0f,
+                OP_LOGE(context_->GetNodeName(), "swiglu_limit must be finite and nonnegative."),
+                return ge::GRAPH_FAILED);
     const int64_t *dequantModePtr = attr->GetAttrPointer<int64_t>(ATTR_INDEX_DEQUANT_MODE);
     auto dequantMode = dequantModePtr != nullptr ? *dequantModePtr : 0;
     OP_CHECK_IF(!(dequantMode == 0 || dequantMode == 1),
@@ -502,6 +508,7 @@ void GroupedMatmulSwigluQuantV2LayeredBaseTiling::FillTilingData()
     tilingData_.gmmSwigluQuantV2BaseParams.set_groupListType(groupListType_);
     tilingData_.gmmSwigluQuantV2BaseParams.set_smoothScaleDimNum(smoothScaleDimNum_);
     tilingData_.gmmSwigluQuantV2BaseParams.set_layerNum(layerNum_);
+    tilingData_.gmmSwigluQuantV2BaseParams.set_swigluLimit(swigluLimit_);
     tilingData_.gmmSwigluQuantV2.set_maxProcessRowNum(maxProcessRowNum_);
     tilingData_.gmmSwigluQuantV2.set_groupListLen(groupNum_);
     tilingData_.gmmSwigluQuantV2.set_tokenLen(n_);

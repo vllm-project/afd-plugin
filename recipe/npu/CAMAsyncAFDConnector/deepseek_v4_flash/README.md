@@ -72,9 +72,12 @@ with `AFD_ASYNC_CAM_LAYERED_GMM=1`; keep it set to `0` for A and P.
 The existing layered eager path can be slower for small decode batches; use
 ordinary GMM eager when choosing this deployment for eager throughput.
 
-The existing layered kernel does not apply nonzero `swiglu_limit` values.
-Use legacy F when the checkpoint's SwiGLU clamp behavior is required. FULL
-execution is outside this eager profile.
+Layered W4A8 forwards the model's `swiglu_limit` for both target and draft
+experts. A positive limit clamps gate above and up on both sides before SwiGLU;
+zero disables clipping. Rebuild the AFD native extension and CANN package
+together when upgrading this interface. Layered W8A8 retains its unclipped
+computation; use legacy F when W8A8 checkpoint clamp behavior is required.
+FULL execution is outside this eager profile.
 
 Launch F and A with their usual Async CAM arguments, adding the same
 `--speculative-config "$DSPARK_CONFIG"` to both:

@@ -419,7 +419,8 @@ class AsyncNPUFFNModelRunner:
                         "per-channel" if layers[0].per_channel else "per-group",
                         self._layered_executor.layer_id_to_slot is not None,
                         layers[0].swiglu_limit,
-                        layers[0].swiglu_limit != 0.0,
+                        layers[0].quantization == "W8A8"
+                        and bool(layers[0].swiglu_limit),
                     )
                     return
         logger.info(
