@@ -16,17 +16,20 @@ pytestmark = pytest.mark.npu
 
 
 @pytest.mark.parametrize("per_channel", [True, False])
+@pytest.mark.parametrize("swiglu_limit", [0.0, 10.0])
 @pytest.mark.parametrize("counts", [(0, 0), (1, 0), (0, 7), (16, 16)])
 @pytest.mark.parametrize("layer_ids", [(0, 1), (2, 5)])
-def test_layered_w4a8_valid_rows_and_capacity_tail(per_channel, counts, layer_ids):
+def test_layered_w4a8_valid_rows_and_capacity_tail(
+    per_channel, swiglu_limit, counts, layer_ids
+):
     if os.environ.get("AFD_RUN_ASCEND_OP_RUNTIME") != "1":
         pytest.skip("requires opt-in 910C runtime")
     torch = pytest.importorskip("torch")
     torch_npu = pytest.importorskip("torch_npu")
     from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
-    from afd_plugin.model_executor.npu.async_cam_w4a8 import (
-        AsyncCAMW4A8Executor,
-        W4A8LayerWeights,
+    from afd_plugin.model_executor.npu.async_cam_layered import (
+        AsyncCAMLayeredExecutor,
+        LayeredFFNWeights,
     )
 
     ensure_cam_async_ops_available()
@@ -38,6 +41,21 @@ def test_layered_w4a8_valid_rows_and_capacity_tail(per_channel, counts, layer_id
 
     def make_weight(k, n, factor, squeeze):
         values = torch.randint(-7, 8, (experts, k, n), dtype=torch.int32)
+        if swiglu_limit:
+            # Sparse exactly representable matmuls isolate the clamp contract
+            # from FP16 rounding and cancellation in a random two-GEMM chain.
+            values.zero_()
+            if n == 2 * intermediate:
+                targets = torch.tensor((-24, -12, -10, -1, 0, 1, 9, 10, 12, 24))
+                targets = targets.repeat((intermediate + 9) // 10)[:intermediate]
+                branches = torch.cat((targets, targets.roll(3)))
+                values[:, 0] = branches.div(4, rounding_mode="floor")
+                values[:, k // 2] = branches.remainder(4)
+                factor = 1.0 if factor == 0.01 else 1.5
+            else:
+                diagonal = torch.arange(min(k, n))
+                values[:, diagonal, diagonal] = 1
+                factor = 0.125
         groups = 1 if per_channel else 2
         scale = torch.full((experts, groups, n), factor, dtype=torch.float32)
         if not per_channel:
@@ -68,12 +86,18 @@ def test_layered_w4a8_valid_rows_and_capacity_tail(per_channel, counts, layer_id
         w13, s13, b13, ref13 = make_weight(hidden, 2 * intermediate, factor, True)
         w2, s2, b2, ref2 = make_weight(intermediate, hidden, factor, False)
         layers.append(
-            W4A8LayerWeights(idx, w13, w2, s13, s2, b13, b2, per_channel, 0.0, 1.0)
+            LayeredFFNWeights(
+                idx, w13, w2, s13, s2, b13, b2, per_channel, swiglu_limit, 1.0
+            )
         )
         reference.append((ref13, ref2))
-    executor = AsyncCAMW4A8Executor(layers)
+    executor = AsyncCAMLayeredExecutor(layers)
     x = torch.randint(-100, 101, (capacity, hidden), dtype=torch.int8)
-    x_scale = torch.full((capacity,), 0.005)
+    if swiglu_limit:
+        x.zero_()
+        x[:, 0], x[:, hidden // 2] = 4, 1
+    # Positive-limit cases must cross the clamp, including at single-row counts.
+    x_scale = torch.full((capacity,), 1.0 if swiglu_limit else 0.005)
     valid_rows = sum(counts)
     device_counts = torch.tensor(counts, dtype=torch.int64, device="npu")
     for slot in (1, 0, 1):
@@ -97,6 +121,11 @@ def test_layered_w4a8_valid_rows_and_capacity_tail(per_channel, counts, layer_id
                 * x_scale[offset : offset + count, None]
             )
             gate, up = (activation @ w13[expert]).chunk(2, dim=-1)
+            if swiglu_limit and count:
+                assert (gate > swiglu_limit).any()
+                assert (up.abs() > swiglu_limit).any()
+                gate = gate.clamp(max=swiglu_limit)
+                up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
             swiglu = torch.nn.functional.silu(gate) * up
             scale = swiglu.abs().amax(dim=-1).clamp_min(1e-12) / 127
             quantized = (swiglu / scale[:, None]).round().clamp(-127, 127)

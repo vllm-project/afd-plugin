@@ -19,6 +19,7 @@ from afd_plugin.compat.npu import (  # noqa: E402
 from tests.unit.fakes.vllm_config import (  # noqa: E402
     async_moe_config as _async_moe_config,
 )
+from tests.unit.fakes.vllm_config import npu_dspark_config  # noqa: E402
 from tests.unit.fakes.vllm_config import (  # noqa: E402
     npu_vllm_config as _vllm_config,
 )
@@ -27,6 +28,57 @@ TWO_UBATCH_DBO = dict(
     enable_dbo=True, use_ubatching=True, num_ubatches=2, ubatch_size=4
 )
 ASYNC_CAM = dict(connector="CAMAsyncAFDConnector", async_dp=True)
+
+
+@pytest.mark.parametrize(
+    "role,draft_eager,model_type,layered,error",
+    [
+        ("attention", True, "deepseek_v4", False, None),
+        ("ffn", True, "deepseek_v4", False, None),
+        ("attention", False, "deepseek_v4", False, "DSpark requires eager"),
+        ("ffn", False, "deepseek_v4", False, "DSpark requires eager"),
+        ("attention", True, "deepseek_v2", False, "DSpark supports only DeepSeek-V4"),
+        ("ffn", True, "deepseek_v2", False, "DSpark supports only DeepSeek-V4"),
+        ("ffn", True, "deepseek_v4", True, None),
+    ],
+)
+def test_dspark_feature_boundaries(
+    monkeypatch, role, draft_eager, model_type, layered, error
+):
+    monkeypatch.setenv("AFD_ASYNC_CAM_LAYERED_GMM", "1" if layered else "0")
+    config = npu_dspark_config(role=role, draft_eager=draft_eager)
+    config.model_config.hf_text_config.model_type = model_type
+    if error:
+        with pytest.raises(RuntimeError, match=error):
+            fail_if_unsupported_npu_afd_features(config)
+    else:
+        fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize(
+    "anchor,num_requests,capacity,allowed",
+    [
+        (True, 3, 15, True),
+        (True, 4, 15, False),
+        (False, 3, 18, True),
+        (False, 3, 17, False),
+    ],
+)
+def test_dspark_draft_queries_fit_native_capacity(
+    monkeypatch, anchor, num_requests, capacity, allowed
+):
+    monkeypatch.setenv("AFD_ASYNC_CAM_LAYERED_GMM", "0")
+    config = npu_dspark_config()
+    config.speculative_config.draft_model_config.hf_config.sample_from_anchor = anchor
+    config.scheduler_config.max_num_seqs = num_requests
+    config.scheduler_config.max_num_batched_tokens = capacity
+    expected = (
+        nullcontext()
+        if allowed
+        else pytest.raises(RuntimeError, match="draft query capacity")
+    )
+    with expected:
+        fail_if_unsupported_npu_afd_features(config)
 
 
 def _config_with(*, model=None, max_num_batched_tokens=None, **kwargs):

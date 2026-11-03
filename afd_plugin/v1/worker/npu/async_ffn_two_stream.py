@@ -18,7 +18,7 @@ if TYPE_CHECKING:
         AFDAsyncExtraInfo,
         CAMAsyncAFDConnector,
     )
-    from afd_plugin.model_executor.npu.async_cam_w4a8 import AsyncCAMW4A8Executor
+    from afd_plugin.model_executor.npu.async_cam_layered import AsyncCAMLayeredExecutor
 
 
 @dataclass
@@ -44,7 +44,7 @@ class AsyncFFNTwoStream:
         device: torch.device,
         config: AFDAsyncExtraInfo,
         connector: CAMAsyncAFDConnector,
-        executor: AsyncCAMW4A8Executor,
+        executor: AsyncCAMLayeredExecutor,
     ) -> None:
         self.connector, self.executor = connector, executor
         self.sequence = self.capture_count = self.replay_count = 0

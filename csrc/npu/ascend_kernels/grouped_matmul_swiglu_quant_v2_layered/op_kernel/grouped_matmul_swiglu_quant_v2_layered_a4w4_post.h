@@ -200,11 +200,20 @@ __aicore__ inline void GMMA4W4PostProcess::Swiglu(uint32_t loopIdx, VecConfig &v
         _inMMLocal[loopIdx * gmmSwigluQuantV2->tokenLen + gmmSwigluQuantV2->tokenLen / SWIGLU_REDUCE_FACTOR];
     LocalTensor<float> src1Local = _inMMLocal[loopIdx * gmmSwigluQuantV2->tokenLen];
 
+    // ### PATCH START: DSV4 clipped SwiGLU
+    ClampSwiGLUInputs(src1Local, src0Local, gmmSwigluQuantV2BaseParams->swigluLimit,
+                     gmmSwigluQuantV2->tokenLen / SWIGLU_REDUCE_FACTOR);
+    // ### PATCH END: DSV4 clipped SwiGLU
     SwiGLU<float, false>(workspaceLocal, src0Local, src1Local, beta, gmmSwigluQuantV2->tokenLen / SWIGLU_REDUCE_FACTOR);
     PipeBarrier<PIPE_V>();
     DataCopyParams repeatParams{
         1, static_cast<uint16_t>((gmmSwigluQuantV2->tokenLen / SWIGLU_REDUCE_FACTOR) / ALIGN_8_ELE), 0, 0};
     DataCopy(_inMMLocal[loopIdx * gmmSwigluQuantV2->tokenLen], workspaceLocal, repeatParams);
+    // ### PATCH START: finish activation write-back before quantization
+    // Quant reuses workspaceLocal. Complete this PIPE_V copy before its source
+    // is overwritten or the activation destination is read by Quant.
+    PipeBarrier<PIPE_V>();
+    // ### PATCH END: finish activation write-back before quantization
 
     mmOutQueue.EnQue(_inMMLocal);
 }

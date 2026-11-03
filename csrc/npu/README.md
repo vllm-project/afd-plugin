@@ -142,8 +142,15 @@ interface.
 grouped-matmul + SiLU + dynamic-quantization CAM operator (A8W8 / A4W4 /
 A8W4-MSD variants) built for `ascend910_93`. It is registered as
 `torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered` (inference + Meta; no
-autograd grad) and is excluded from `ascend950` builds. Nothing selects it at
-runtime yet; switching a connector/model path to it is a separate follow-up.
+autograd grad) and is excluded from `ascend950` builds. It is selected by the
+opt-in layered W4A8 executor.
+
+The trailing `swiglu_limit` argument defaults to `0.0` (no clipping). A finite
+positive `L` computes `SiLU(min(gate, L)) * clamp(up, -L, L)` before output
+quantization on A8W4 and A4W4. The gate has no lower clamp. Positive limits on
+A8W8 are rejected. The layered W4A8 executor forwards the model's limit, including
+DeepSeek-V4's `10.0`, in eager and graph execution. Rebuild both the native
+extension and CANN package together when upgrading this interface.
 
 A8W8 accepts an NZ weight as either an explicit five-dimensional view or the
 three-dimensional logical view `npu_format_cast` produces over NZ storage; the

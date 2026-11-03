@@ -52,6 +52,7 @@ from afd_plugin.v1.worker.attention_model_runner_v2 import (
     _use_afd_capture_input_preparation,
     _use_afd_ubatch_preparation,
 )
+from afd_plugin.v1.worker.npu.dspark_speculator import AFDDSparkSpeculator
 from afd_plugin.validation import validate_npu_model_runner_v2_config
 
 if TYPE_CHECKING:
@@ -258,6 +259,18 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             self._afd_suppress_metadata_send = False
             self._afd_transaction_counter = 0
             self.prof = create_afd_npu_profiler("attention")
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.use_dspark()
+            ):
+                # Replace the native speculator before load_model owns any
+                # draft weights/KV. Native sample_tokens remains unchanged.
+                self.speculator = AFDDSparkSpeculator(
+                    self.vllm_config,
+                    self.device,
+                    afd_context=self._afd_draft_context,
+                )
+                self.speculator.update_stream = self.update_stream
         except BaseException:
             try:
                 if connector is not None:
@@ -265,6 +278,28 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             finally:
                 super().shutdown()
             raise
+
+    @contextmanager
+    def _afd_draft_context(self, dummy_run: bool, is_profile: bool) -> Iterator[None]:
+        previous_metadata = self._afd_pending_metadata
+        previous_suppress_send = self._afd_suppress_metadata_send
+        previous_is_warmup = self._is_warmup
+        previous_is_profile = self._afd_is_profile
+        self._afd_pending_metadata = None
+        self._afd_suppress_metadata_send = False
+        self._is_warmup = dummy_run
+        self._afd_is_profile = is_profile
+        try:
+            with (
+                skip_dp_coordination(),
+                use_afd_metadata_provider(self.install_afd_metadata_on_forward_context),
+            ):
+                yield
+        finally:
+            self._afd_pending_metadata = previous_metadata
+            self._afd_suppress_metadata_send = previous_suppress_send
+            self._is_warmup = previous_is_warmup
+            self._afd_is_profile = previous_is_profile
 
     def _afd_num_tokens_for_context(self, forward_context: ForwardContext) -> int:
         # Ascend bd42eea0 NPUModelRunner.execute_model delegates to the vLLM

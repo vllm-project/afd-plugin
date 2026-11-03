@@ -915,7 +915,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self.layout = DeepEPM2NLayout(
             ffn_size=afd_config.num_ffn_ranks,
             attn_size=afd_config.num_attention_ranks,
-            num_experts=text_config.num_experts,
+            num_experts=vllm_config.model_config.get_num_experts(),
         )
         self.attn_size = self.layout.attn_size
         self.ffn_size = self.layout.ffn_size
