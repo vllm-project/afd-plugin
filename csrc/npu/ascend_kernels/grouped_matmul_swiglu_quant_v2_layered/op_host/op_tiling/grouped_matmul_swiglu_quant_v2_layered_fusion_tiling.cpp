@@ -75,6 +75,10 @@ ge::graphStatus GroupedMatmulSwigluQuantV2LayeredFusionTiling::ParseInputAndAttr
     layerNum_ = weightListLen;
     auto attr = context_->GetAttrs();
     OP_CHECK_NULL_WITH_CONTEXT(context_, attr); // check attr is not null
+    const float *swigluLimitPtr = attr->GetAttrPointer<float>(ATTR_INDEX_SWIGLU_LIMIT);
+    OP_CHECK_IF(swigluLimitPtr != nullptr && *swigluLimitPtr != 0.0f,
+                OP_LOGE(context_->GetNodeName(), "positive swiglu_limit supports A8W4/A4W4 only."),
+                return ge::GRAPH_FAILED);
     const int64_t *groupListTypePtr = attr->GetAttrPointer<int64_t>(ATTR_INDEX_GROUPLIST_TYPE);
     groupListType_ = groupListTypePtr != nullptr ? *groupListTypePtr : 0;
     OP_CHECK_IF(

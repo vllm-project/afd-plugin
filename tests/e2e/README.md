@@ -161,6 +161,10 @@ devices and FFN DP2 on the other two.
 | `afd-deepep-m2n-eager-tp2-2a2f` | DP1 x TP2 | Eager |
 | `afd-deepep-m2n-graph-tp2-2a2f` | DP1 x TP2 | `FULL_DECODE_ONLY` graph |
 
+`test_deepseek_v2_lite_deepep_m2n` in
+`tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py` runs
+DeepSeek-V2-Lite through the same five scenarios.
+
 They need four SM90 or newer GPUs, afdEP-comm and DeepGEMM; see
 [Installation](../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation)
 in the connector guide. CI does not run them.

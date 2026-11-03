@@ -185,6 +185,43 @@ def test_gmm_swiglu_quant_v2_layered_meta_contract(gmm_runtime: ModuleType) -> N
     assert all(tensor.device.type == "meta" for tensor in outputs)
 
 
+@pytest.mark.parametrize("swiglu_limit", [0.0, 10.0])
+def test_gmm_swiglu_quant_v2_layered_meta_accepts_activation_limit(
+    gmm_runtime: ModuleType, swiglu_limit: float
+) -> None:
+    torch = gmm_runtime
+    inputs = list(_build_pertoken_inputs(torch))
+    inputs[1] = [torch.empty((_E, _K, _N // 8), dtype=torch.int32, device="meta")]
+    outputs = torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered(
+        *inputs, swiglu_limit=swiglu_limit
+    )
+    assert [(tuple(t.shape), t.dtype, t.device.type) for t in outputs] == [
+        ((_M, _N // 2), torch.int8, "meta"),
+        ((_M,), torch.float32, "meta"),
+    ]
+
+
+def test_gmm_swiglu_quant_v2_layered_rejects_positive_a8w8_limit(
+    gmm_runtime: ModuleType,
+) -> None:
+    torch = gmm_runtime
+    with pytest.raises(RuntimeError, match="A8W4/A4W4"):
+        torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered(
+            *_build_pertoken_inputs(torch), swiglu_limit=10.0
+        )
+
+
+@pytest.mark.parametrize("swiglu_limit", [-1.0, float("nan"), float("inf"), 1e40])
+def test_gmm_swiglu_quant_v2_layered_meta_rejects_invalid_activation_limit(
+    gmm_runtime: ModuleType, swiglu_limit: float
+) -> None:
+    torch = gmm_runtime
+    with pytest.raises(RuntimeError, match="swiglu_limit"):
+        torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered(
+            *_build_pertoken_inputs(torch), swiglu_limit=swiglu_limit
+        )
+
+
 def test_gmm_swiglu_quant_v2_layered_rejects_bad_layer_index(
     gmm_runtime: ModuleType,
 ) -> None:

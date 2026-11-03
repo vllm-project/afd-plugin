@@ -25,6 +25,8 @@ depends_on:
   - "execution_platforms.md"
   - "compatibility_and_patches.md"
 validation_paths:
+  - "tests/unit/model_executor/test_async_cam_layered.py"
+  - "tests/npu/test_async_cam_layered_w8a8.py"
   - "tests/unit/v1/worker/test_ffn_metadata.py"
   - "tests/unit/v1/worker/test_ffn_model_runner.py"
   - "tests/unit/v1/worker/test_ffn_routed_experts_model_runner.py"
@@ -177,7 +179,7 @@ items independently of Attention's threads. These limits
 describe the pair even though only Attention inherits a native V2 runner.
 
 Async CAM also has an experimental, default-off `ffn_two_stream` mode for
-layered W4A8 eager/FULL. `AsyncFFNTwoStream`, owned by the Async runner, retains
+layered W4A8/W8A8 eager/FULL. `AsyncFFNTwoStream`, owned by the Async runner, retains
 two slots, compute/send streams and ready/done events. FULL owns four private
 graph pools and four graphs; eager retires each slot only after its send is
 observed complete. Both modes retain the bounded batch fence. Enabled eager
@@ -261,16 +263,16 @@ Async eager does not use the synchronous DP-metadata graph cache. Its FULL
 mode captures a complete original DR/FFN/CS transaction with device-side layer
 selection. The independent Async runner owns one graph and stable resources;
 see [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md) for startup, supported
-W4A8 configuration and the original receiver's process-cleanup boundary.
+W4A8/W8A8 configurations and the original receiver's process-cleanup boundary.
 
-With `AFD_ASYNC_CAM_LAYERED_GMM=1`, eligible DeepSeek-V4 W4A8 layers instead
-use `AsyncCAMW4A8Executor`: the runner passes capacity-sized payloads, device
+With `AFD_ASYNC_CAM_LAYERED_GMM=1`, eligible DeepSeek-V4 W4A8 or W8A8 layers instead
+use `AsyncCAMLayeredExecutor`: the runner passes capacity-sized payloads, device
 expert counts, and device layer IDs directly from receive through the layered
 GMMs to combine-send. The ordinary path above materializes the work item's
 layer/count information on the host. Both paths retain worker-level
 synchronization after a work-item group. MRV2 pairing does not prohibit the
 layered path. Its nonzero `swiglu_limit` limitation and validation scope are
-documented in the [CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-layered-gmm-experimental-disabled-by-default).
+documented in the [CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-and-w8a8-layered-gmm-experimental-disabled-by-default).
 
 ## Control-plane-driven forward
 
