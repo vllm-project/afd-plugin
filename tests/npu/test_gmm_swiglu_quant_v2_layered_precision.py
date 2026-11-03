@@ -498,12 +498,14 @@ def test_layered_swiglu_clamp_matches_golden_and_preserves_default(
             )
             torch.npu.synchronize()
             actual_y, actual_scale = (t.cpu() for t in actual)
+            expected_y, expected_scale = expected[limit or 0.0]
             reports.append(
                 _compare(
                     torch,
                     actual_y,
                     actual_scale,
-                    *expected[limit or 0.0],
+                    expected_y,
+                    expected_scale,
                     f"clamp variant={variant} layer={layer} limit={limit}",
                     scale_rtol=_A8W4_SCALE_RTOL,
                     rtol=_A8W4_RTOL,
@@ -543,12 +545,17 @@ def test_layered_swiglu_clamp_graph_uses_device_layer_index(clipped_swiglu_case)
             index.fill_(layer)
             graph.replay()
             torch.npu.synchronize()
-            golden = _a8w4_golden(torch, x_cpu, x_scale, dequants[layer], counts, 10.0)
+            actual_y, actual_scale = (t.cpu() for t in outputs)
+            expected_y, expected_scale = _a8w4_golden(
+                torch, x_cpu, x_scale, dequants[layer], counts, 10.0
+            )
             print(
                 _compare(
                     torch,
-                    *(t.cpu() for t in outputs),
-                    *golden,
+                    actual_y,
+                    actual_scale,
+                    expected_y,
+                    expected_scale,
                     f"clamp graph variant={variant} layer={layer}",
                     scale_rtol=_A8W4_SCALE_RTOL,
                     rtol=_A8W4_RTOL,
