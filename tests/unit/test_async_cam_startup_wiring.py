@@ -276,6 +276,7 @@ def test_ffn_warmup_capture_order_and_failure_propagation(
         requested_mode="full",
         device="npu:0",
         model=SimpleNamespace(get_experts_layer_indices=lambda: (5, 2)),
+        draft_model=None,
         _initialize_layered_executor=lambda: None,
         _layered_executor=SimpleNamespace(graph_signature=lambda capacity: "weights"),
         connector=SimpleNamespace(
@@ -467,7 +468,7 @@ def test_separate_owners_construct_and_load_without_cross_graph_pool(
     config.load_config = object()
     if speculative_tokens is not None:
         config.speculative_config = SimpleNamespace(
-            num_speculative_tokens=speculative_tokens
+            method="mtp", num_speculative_tokens=speculative_tokens
         )
     monkeypatch.setattr(
         sync_runtime.current_platform, "get_global_graph_pool", calls.pool

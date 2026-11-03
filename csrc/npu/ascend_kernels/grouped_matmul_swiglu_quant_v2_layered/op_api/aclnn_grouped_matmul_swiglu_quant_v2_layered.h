@@ -60,6 +60,9 @@ extern "C" {
  * of groupList.
  * @param [in] tuningConfig: Used to estimate the sizes of m/e for the operator, selecting different operator templates
  * to suit performance requirements of different scenarios.
+ * @param [in] swigluLimit: Nonnegative finite activation clamp. Zero disables clipping;
+ * a positive value clamps gate above and up on both sides before SwiGLU.
+ * Positive limits support A8W4/A4W4; A8W8 requires zero.
  * @param [out] quantOutput:
  * Represents out in the formula. Supported data types include INT8, FLOAT4_E2M1, FLOAT8_E4M3FN, FLOAT8_E5M2, and
  * HIFLOAT8; the data format supports ND.
@@ -74,6 +77,7 @@ __attribute__((visibility("default"))) aclnnStatus aclnnGroupedMatmulSwigluQuant
     const aclTensorList *allWeightAssistMatrix, const aclTensor *bias, const aclTensor *xScale,
     const aclTensor *smoothScale, const aclTensor *groupList, const aclTensor *layerIndex, int64_t dequantMode,
     int64_t dequantDtype, int64_t quantMode, int64_t groupListType, const aclIntArray *tuningConfigOptional,
+    double swigluLimit,
     aclTensor *output, aclTensor *outputScale, uint64_t *workspaceSize, aclOpExecutor **executor);
 
 /**

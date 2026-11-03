@@ -18,6 +18,7 @@ from tests.conftest import (
     run_runner,
 )
 from tests.e2e.runner import (
+    DEEPEP_M2N_SCENARIOS,
     DEFAULT_GSM8K_SAMPLE_LIMIT,
     GSM8K_LIMIT_ENV,
     GSM8K_THRESHOLD_ENV,
@@ -165,10 +166,7 @@ def _prepare_e2e_assets() -> Iterator[None]:
         yield
 
 
-@pytest.mark.e2e
-@pytest.mark.parametrize("scenario", SCENARIOS, ids=SCENARIOS)
-def test_deepseek_v2_lite(scenario: str, tmp_path: Path) -> None:
-    command = build_runner_command(scenario, tmp_path / scenario)
+def _runner_env(scenario: str) -> dict[str, str]:
     env = os.environ.copy()
     default_limit = (
         V2_DBO_SAMPLE_LIMIT
@@ -183,4 +181,21 @@ def test_deepseek_v2_lite(scenario: str, tmp_path: Path) -> None:
     ):
         # Model smoke gates require 2/7 or 6/24 correct; larger runs keep 0.27.
         env.setdefault(GSM8K_THRESHOLD_ENV, str(SMOKE_MIN_ACCURACY))
-    run_runner(command, env=env)
+    return env
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("scenario", SCENARIOS, ids=SCENARIOS)
+def test_deepseek_v2_lite(scenario: str, tmp_path: Path) -> None:
+    command = build_runner_command(scenario, tmp_path / scenario)
+    run_runner(command, env=_runner_env(scenario))
+
+
+@pytest.mark.e2e
+# DeepEP M2N (routing on Attention) runs 2A2F, including Attention TP2. The
+# cases need DeepEP and 4 GPUs; CI selects test ids explicitly and does not
+# run them.
+@pytest.mark.parametrize("scenario", DEEPEP_M2N_SCENARIOS, ids=DEEPEP_M2N_SCENARIOS)
+def test_deepseek_v2_lite_deepep_m2n(scenario: str, tmp_path: Path) -> None:
+    command = build_runner_command(scenario, tmp_path / scenario)
+    run_runner(command, env=_runner_env(scenario))

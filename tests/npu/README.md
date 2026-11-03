@@ -12,7 +12,8 @@ device, a multi-rank launch, or nothing but a standard Python interpreter.
 | `gmm_layered_performance.py` | 1 process, 1 device | Layered W13/W2 latency under eager and ACL graph |
 | `test_gmm_swiglu_quant_v2_layered_precision.py` | pytest, 1 device | Layered W13 numerics, both quantization scenarios |
 | `test_gmm_layered_device_group_list.py` | pytest, 1 device | Layered W2 with a device-produced group list |
-| `test_async_cam_layered_w4a8.py` | pytest, 1 device | The `AsyncCAMW4A8Executor` chain end to end |
+| `test_async_cam_layered_w4a8.py` | pytest, 1 device | The `AsyncCAMLayeredExecutor` chain end to end |
+| `test_async_cam_layered_w8a8.py` | pytest, 1 device | W8A8 chain versus native operators and exact eager/FULL replay |
 | `test_attention_gate_numerics.py` | pytest, 1 device | Gate, router, and activation components |
 | `__init__.py` | - | Package marker |
 
@@ -27,7 +28,7 @@ connector, model weights, or shared-expert tensors.
 The second group covers the layered routed-expert operators,
 `gmm_swiglu_quant_v2_layered` (W13) and `grouped_matmul_layered` (W2), which
 select their layer on device from a `layer_index` input. Those are the operators
-`AsyncCAMW4A8Executor` drives, and their `all_*` lists hold one element per layer
+`AsyncCAMLayeredExecutor` drives, and their `all_*` lists hold one element per layer
 rather than one per expert. Their validation entry points are in
 [docs/npu/TESTING.md](../../docs/npu/TESTING.md), and the two precision suites
 are described under [Layered operator precision](#layered-operator-precision)

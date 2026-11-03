@@ -28,6 +28,7 @@ upstream_refs:
   - "vLLM vllm.model_executor.model_loader"
 verified_platform_refs:
   - "DeepSeek V2 Lite GPU and NPU model E2E paths"
+  - "DeepSeek V2 Lite DeepEP M2N 2A2F E2E paths (eager, graph, graph + DBO, Attention TP2)"
   - "CAM async NPU model E2E path"
   - "DeepSeek V4 CUDA contract tests and E2E profiles; see execution-platform matrix for hardware scope"
   - "DeepSeek V4 Ascend Hash-id boundary has focused unit coverage and a historical manual Ascend 950 run"
@@ -36,7 +37,7 @@ related_issues:
   - "#88"
   - "#105"
   - "#129"
-last_reviewed: 2026-10-13
+last_reviewed: 2026-10-30
 ---
 
 # Model integration
@@ -82,6 +83,7 @@ registers lazy AFD wrapper paths under `AFD`-prefixed aliases.
 | `DeepseekV3ForCausalLM` | `AFDDeepseekV3ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `DeepseekV32ForCausalLM` | `AFDDeepseekV32ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `DeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` |
+| `DSparkDraftModel` | Unsupported | `AFDDSparkDeepseekV4ForCausalLM` (eager Async CAM) |
 | `GlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` |
 | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` |
 | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` |
@@ -107,15 +109,20 @@ needed by the split execution.
 | --- | --- | --- |
 | Attention module and KV-facing computation | Constructed and executed. | Not constructed. |
 | MoE with `compute_gate_on_attention=false` | CUDA constructs the native MoE shell with a parameter-free internal-router experts proxy; NPU sends after post-Attention normalization. | Native gate and experts are constructed and executed from connector input. |
-| MoE with `compute_gate_on_attention=true` | CUDA keeps the native gate and uses an external-router experts proxy; NPU uses its Attention-side gate helper. | Expert MLP is constructed and consumes transferred router logits or routed payloads without rerunning the gate. |
+| MoE with `compute_gate_on_attention=true`, non-routed connectors | CUDA keeps the native gate and uses an external-router experts proxy; NPU uses its Attention-side gate helper. | Expert MLP is constructed and consumes transferred router logits or routed payloads without rerunning the gate. |
+| MoE with `compute_gate_on_attention=true`, DeepEP M2N (CUDA) | `AFDDeepseekV2RoutedExpertsMoE` constructs the native gate, router, and shared-expert MLP. It selects top-k, dispatches routed rows, runs the shared MLP while dispatch and the FFN experts are in flight, and adds it to the combined output. With TP > 1, each TP rank routes its `sequence_parallel_chunk` slice and runs a replicated (`is_sequence_parallel`, no all-reduce) shared MLP on it; the TP group then all-gathers the output. | Native `DeepseekV2MoE` without shared experts; runs only the routed experts on the dispatched top-k IDs and weights. |
 | Dense MLP, normal mode | Not constructed; output is sent after post-Attention normalization. | Constructed and executed from connector input. |
 | Dense MLP with `compute_gate_on_attention=true` | Constructed and executed locally because there is no routed MoE handoff. | Not constructed and a dense-layer FFN compute request is rejected. |
 | Embedding, final norm, pipeline placeholders | Created according to the pinned pipeline-rank rules. | Same wrapper lifecycle rules; only role-required parameters are loaded. |
 
-CUDA MoE always splits at the remote-experts boundary while preserving native
+CUDA MoE splits at the remote-experts boundary. With gate-on-FFN, and with
+gate-on-Attention on non-routed connectors, Attention keeps native
 `DeepseekV2MoE.forward`. With gate-on-FFN, the proxy asks FFN to run its native
 internal-router MoE. With gate-on-Attention, Attention runs the native gate and
-FFN executes its external-router experts path. CUDA Attention-side remote
+FFN executes its external-router experts path. Routed-experts connectors
+(DeepEP M2N) use a third mode with an AFD-owned forward: Attention runs the
+gate, top-k selection, and shared experts; FFN runs only the routed experts,
+and combine returns each token's weighted top-k sum. CUDA Attention-side remote
 experts currently reject EPLB. The NPU gate helper supports unquantized and
 Ascend W8A8 MoE expert computation; unsupported devices or quantization fail
 explicitly.
@@ -154,6 +161,17 @@ normalized hidden states and Hash-layer token IDs to FFN, which owns the
 native gate and MoE. Async CAM keeps the Hash/top-k router and shared experts
 on Attention and sends only routed-expert work; `dynamicQuant=1` is required.
 
+The eager DSpark adapter follows the same boundary. Native checkpoint names
+`mtp.0..2` and KV names are retained; its CAM layer IDs start at the target's
+`num_hidden_layers` to avoid collisions. Draft layers always use non-Hash
+routing. F loads one set of target and draft expert shards before rendezvous,
+then serves both from its existing receive loop. Each native draft proposal
+installs its own AFD metadata and opts out of cross-DP synchronization; native
+sampling, rejection, heads and context-KV updates are inherited. The
+[0.32 eager recipe](../../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md)
+describes A/F serving. In PD deployments, Prefill uses the upstream complete
+draft model and KV connector. This adapter supports eager execution only.
+
 Shared-expert layout is model-specific. DeepSeek-V2/V3 Async CAM forces
 replicated shared weights when effective model SP is enabled. DeepSeek-V4
 instead uses `AFDDeepseekV4SharedExperts` to preserve the native policy:
@@ -169,7 +187,7 @@ checking; the A5 profile records incorrect concurrent answers. Async DSV4 has
 an exact-answer smoke case; V4 true native DBO still requires model accuracy
 qualification. Lite two-stage DBO has the limited result recorded in the
 [0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507). See
-[E2E testing](e2e_testing.md) and the [layered guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-layered-gmm-experimental-disabled-by-default).
+[E2E testing](e2e_testing.md) and the [layered guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-and-w8a8-layered-gmm-experimental-disabled-by-default).
 
 ### Qwen3 MoE CUDA boundary
 
@@ -296,6 +314,8 @@ filtering:
 - FFN loads the MLP/expert and required common parameters and skips unrelated
   Attention parameters. In gate-on-Attention mode it also skips dense MLP
   parameters because those layers execute on Attention.
+- With a routed-experts connector (DeepEP M2N), MoE `shared_experts`
+  parameters load on Attention only; FFN builds its MoE without shared experts.
 - Model-specific missing, fused, redundant, and pipeline parameters retain the
   upstream skip/mapping behavior instead of being treated as AFD errors.
 

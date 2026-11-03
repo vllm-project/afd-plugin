@@ -50,7 +50,10 @@ GPU_MRV2_CONNECTORS: Final[tuple[str, ...]] = (
 )
 # Models whose Attention side computes the MoE gate and top-k and sends them
 # with the hidden states, as a routed-experts connector (DeepEP M2N) needs.
-ATTENTION_ROUTING_MODEL_ARCHITECTURES: Final[tuple[str, ...]] = ("Qwen3MoeForCausalLM",)
+ATTENTION_ROUTING_MODEL_ARCHITECTURES: Final[tuple[str, ...]] = (
+    "Qwen3MoeForCausalLM",
+    "DeepseekV2ForCausalLM",
+)
 
 
 CAM_MAX_RECEIVE_TOKENS = 262144

@@ -50,12 +50,12 @@ The V2 Async CAM contract is:
   `async_dp=true` and `compute_gate_on_attention=true`;
 - on FFN, select eager with `--enforce-eager`; for FULL, omit `--enforce-eager`
   and pass `--compilation-config '{"cudagraph_mode":"FULL"}'`, following the narrow
-  W4A8/runtime contract in the linked Async FFN guide;
+  W4A8/W8A8 runtime contract in the linked Async FFN guide;
 - PP=PCP=DCP=1, static expert placement, and each role's configured rank count
   equal to its DP x TP size;
 - `attn_ranks_per_dp` equal to Attention TP, and Attention
   `--max-num-batched-tokens` divisible by that TP size;
-- `dynamicQuant=1` for DeepSeek-V4 Flash W4A8.
+- `dynamicQuant=1` for DeepSeek-V4 Flash W4A8 or W8A8.
 
 Attention-local FlashComm1/SP is supported. Set
 `VLLM_ASCEND_ENABLE_FLASHCOMM1=1` only on Attention and `0` on FFN.
@@ -203,7 +203,7 @@ including `async_dp`; enable DBO through the Attention CLI flags below.
 | `dynamicQuant` | `int` | `0` | Enables CAM dispatch/combine dynamic-quant metadata. Only `0` and `1` are accepted. With `1`, FFN receives quantized routed activations plus scale tensors and must return output compatible with combine-send. |
 | `attn_ranks_per_dp` | `int` | `1` | Positive Attention TP rank count per DP replica. It is the CAM Attention grouping width and is independent of the FFN process's local TP size. |
 | `hccl_buffer_size` | `int` | unset | Positive CAM HCCL buffer size in MB. The override applies only to the `afd_async_cam` communication domain. When unset, HCCL uses `HCCL_BUFFSIZE`, then its built-in default. Configure the same value on every Attention and FFN rank in the domain. |
-| `ffn_two_stream` | `bool` | `false` | Experimental FFN-only receive/compute and send streams with two slots. Requires layered MRV2 W4A8; eager and FULL are supported in code, with NPU qualification pending. |
+| `ffn_two_stream` | `bool` | `false` | Experimental FFN-only receive/compute and send streams with two slots. Requires an eligible layered MRV2 executor; eager and FULL are supported in code, with NPU qualification pending. |
 | `ffn_compute_aic_num` | `int` | `12` | Positive compute Cube limit, bounded by available AIC. |
 | `ffn_compute_aiv_num` | `int` | `24` | Positive compute Vector limit, at least twice the compute Cube count. |
 | `ffn_combine_aiv_num` | `int` | `24` | Positive send Vector limit; compute plus send Vector must fit available AIV. |
@@ -302,7 +302,7 @@ actual vendor library path. Missing source operators fail startup.
 
 ## Current limitations
 
-- Attention is eager. FFN FULL targets homogeneous W4A8 layers on A3/910C;
+- Attention is eager. FFN FULL targets homogeneous W4A8 or W8A8 layers on A3/910C;
   see [supported configuration](ASYNC_FFN_RUNTIME.md#selection-and-startup)
   and [validation commands](ASYNC_FFN_RUNTIME.md#validation).
   Broader models and topologies require separate validation.
@@ -319,10 +319,10 @@ actual vendor library path. Missing source operators fail startup.
 For startup, HCCL, CAM operator, and shutdown failures, see the
 [NPU troubleshooting guide](TROUBLESHOOTING.md).
 
-## W4A8 layered GMM (experimental, disabled by default)
+## W4A8 and W8A8 layered GMM (experimental, disabled by default)
 
 Set `AFD_ASYNC_CAM_LAYERED_GMM=1` on every FFN rank to use the two layered GMM
-operators for compatible W4A8 routed experts. Leave it unset on Attention
+operators for compatible W4A8 or W8A8 routed experts. Leave it unset on Attention
 ranks; enabling it on another role or connector fails at startup. The startup
 log must show `actual=layered` to confirm that the new path is active.
 
@@ -341,7 +341,10 @@ enabling the switch for another model fails at startup. All remote MoE layers mu
 SiLU activation, quantization layout, and scaling semantics. The extractor
 can represent per-channel and per-group parameters, but the pinned Ascend
 loader rejects positive `group_size`; the current target is limited to
-per-channel W4A8. DSV4 Flash has layered off/on 300-question comparisons and
+per-channel W4A8, or dynamic W8A8 with FP32 W13/BF16 W2 per-channel scales.
+W8A8 uses loaded INT8 NZ tensors and a single shared zero INT32 W2 bias;
+it does not require W4A8 compensation or duplicate expert weights.
+DSV4 Flash W4A8 has layered off/on 300-question comparisons and
 real INT8-activation/INT4-weight operator traces in the
 [runtime validation record](../design/module/execution_platforms.md#tested-runtime-matrix).
 Per-group operator coverage does not extend the checkpoint loader to
@@ -349,17 +352,17 @@ per-group weights.
 Shared experts remain on Attention. DSV4 applies routed scaling in top-k, so
 FFN does not apply it again.
 
-The graph change preserves the existing layered arithmetic: `swiglu_limit` is
-recorded but is not applied by layered W13. Ordinary eager may apply it, so
-FULL must be compared with corresponding layered eager, not treated as a fix
-for their pre-existing difference. FULL reuses the existing native DR and CS operators. See
+Layered W4A8 W13 applies the model's `swiglu_limit` in both eager and FULL execution.
+For positive `L`, it computes `SiLU(min(gate, L)) * clamp(up, -L, L)` before
+quantization; zero keeps clipping disabled. This restores DeepSeek-V4's configured
+limit of `10.0`. Layered W8A8 retains its unclipped computation. FULL reuses the
+existing native DR and CS operators. See
 [resource lifetime](ASYNC_FFN_RUNTIME.md#resource-lifetime) for completion and
 process-cleanup requirements.
-Missing `w13_scale_bias` or `w2_scale_bias`, dynamic EPLB, non-SiLU
-activation, or incompatible parameters fail before receiving work. Non-W4A8,
+Missing W4A8 `w13_scale_bias` or `w2_scale_bias`, dynamic EPLB, non-SiLU
+activation, or incompatible parameters fail before receiving work. Other quantizations,
 mixed-quantization, and heterogeneous layers stay on the legacy path with a
-startup reason. Do not fill absent compensation parameters with zeros merely
-to enable this path.
+startup reason. Do not synthesize missing W4A8 compensation parameters.
 
 The new path uses the full dispatch-recv capacity and device expert counts. A
 slice of the original metadata, or a device mapping, selects the layer; the

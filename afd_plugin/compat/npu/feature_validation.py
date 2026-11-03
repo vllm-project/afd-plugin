@@ -191,7 +191,7 @@ def _fail_if_unsupported_npu_afd_async_features(
             in ("1", "true")
         ):
             raise RuntimeError(
-                "FFN two-stream requires MRV2 layered W4A8, dynamicQuant=1, "
+                "FFN two-stream requires MRV2 layered GMM, dynamicQuant=1, "
                 "Attention-side gate, F TP=1 and SP disabled"
             )
     if not is_afd_async_dp(vllm_config):
@@ -234,15 +234,28 @@ def _fail_if_unsupported_npu_afd_async_features(
                 "Async CAM DBO requires DeepSeek-V2/V3 MLA or DeepSeek-V4"
             )
     speculative_config = vllm_config.speculative_config
-    # Native draft MoE still uses Attention-side cross-DP collectives.
-    if (
-        afd_config.is_attention_server
-        and speculative_config is not None
-        and (speculative_config.use_eagle() or speculative_config.uses_draft_model())
-    ):
-        raise RuntimeError(
-            "CAMAsyncAFDConnector does not support native draft models or MTP",
-        )
+    if speculative_config is not None:
+        if speculative_config.method == "dspark":
+            if vllm_config.model_config.hf_text_config.model_type != "deepseek_v4":
+                raise RuntimeError("AFD DSpark supports only DeepSeek-V4 on NPU")
+            # The shared MRV2 validator owns PP/CP and static EP constraints.
+            # Keep only the additional target/draft restrictions here.
+            if (
+                not vllm_config.model_config.enforce_eager
+                or not speculative_config.enforce_eager
+                or parallel_config.tensor_parallel_size != 1
+                or speculative_config.draft_parallel_config.tensor_parallel_size != 1
+            ):
+                raise RuntimeError(
+                    "AFD DSpark requires eager target/draft and target/draft TP=1"
+                )
+        elif afd_config.is_attention_server and (
+            speculative_config.use_eagle() or speculative_config.uses_draft_model()
+        ):
+            raise RuntimeError(
+                "CAMAsyncAFDConnector does not support native draft models or MTP; "
+                "only DSV4 DSpark eager is supported",
+            )
 
     factor_value = os.environ.get("BATCH_SIZE_FACTOR", "1")
     try:
@@ -258,6 +271,17 @@ def _fail_if_unsupported_npu_afd_async_features(
         raise RuntimeError("BATCH_SIZE_FACTOR must be a decimal number in (0, 1]")
     receive_capacity = cam_receive_capacity()
     max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+    if speculative_config is not None and speculative_config.method == "dspark":
+        draft_hf = speculative_config.draft_model_config.hf_config
+        query_rows_per_request = speculative_config.num_speculative_tokens + (
+            not getattr(draft_hf, "sample_from_anchor", True)
+        )
+        draft_rows = vllm_config.scheduler_config.max_num_seqs * query_rows_per_request
+        if draft_rows > max_num_batched_tokens:
+            raise RuntimeError(
+                "AFD DSpark draft query capacity exceeds max_num_batched_tokens: "
+                f"{draft_rows} > {max_num_batched_tokens}"
+            )
     # whole-expert chunks need a full TP group's batch; smaller
     # buffers require native sub-expert chunking.
     if receive_capacity < max_num_batched_tokens:

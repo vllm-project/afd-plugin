@@ -92,11 +92,11 @@ Run the CPU contract and path-selection tests first:
 
 ```bash
 pytest -q tests/unit/test_envs.py \
-  tests/unit/model_executor/test_async_cam_w4a8.py
+  tests/unit/model_executor/test_async_cam_layered.py
 ```
 
 In an environment with matching CANN and torch-npu versions, rebuild the AFD
-extension and run the device suites. All three need one device and issue no
+extension and run the device suites. All four need one device and issue no
 collective:
 
 ```bash
@@ -105,25 +105,31 @@ SOC_VERSION=910c pytest -q tests/unit/compat/npu/test_gmm_swiglu_quant_v2_layere
 AFD_RUN_ASCEND_OP_RUNTIME=1 SOC_VERSION=910c LOCAL_RANK=0 \
   pytest -o addopts= -v -ra -s \
   tests/npu/test_async_cam_layered_w4a8.py \
+  tests/npu/test_async_cam_layered_w8a8.py \
   tests/npu/test_gmm_swiglu_quant_v2_layered_precision.py \
   tests/npu/test_gmm_layered_device_group_list.py
 ```
 
-The three device suites answer different questions and none is redundant:
+The four device suites answer different questions and none is redundant:
 
 | Suite | Operator | Covers |
 | --- | --- | --- |
-| `test_async_cam_layered_w4a8.py` | W13 then W2 | The `AsyncCAMW4A8Executor` chain, 16 cases |
-| `test_gmm_swiglu_quant_v2_layered_precision.py` | W13 | Both quantization scenarios against a reference, 11 cases |
+| `test_async_cam_layered_w4a8.py` | W13 then W2 | The W4A8 `AsyncCAMLayeredExecutor` chain, limits 0 and 10 |
+| `test_async_cam_layered_w8a8.py` | W13 then W2 | Native W8A8 reference, device layer selection, sparse/empty/capacity rows, exact eager/FULL replay |
+| `test_gmm_swiglu_quant_v2_layered_precision.py` | W13 | Default A8W8/A8W4 precision and clipped A8W4/A4W4 |
 | `test_gmm_layered_device_group_list.py` | W2 | A device-produced group list, both scenarios, 4 cases |
 
 `test_async_cam_layered_w4a8.py` uses two layers with different nonzero INT4
 weights, nonzero compensation, per-channel and per-group scales, interleaved
 nonconsecutive layer IDs, and zero, single-row, uneven, and full-capacity expert
 counts. It compares valid rows with an FP32 reference and perturbs the capacity
-tail. It exercises only the `swiglu_limit=0` operator chain; nonzero limits are
-temporarily ignored by the layered path and are not precision-equivalent to the
-model. It does not check distributed CAM completion or compare actual checkpoint
+tail. The zero-limit cases retain the random FP32 reference. Positive-limit cases
+use sparse, exactly representable matmuls that cross the gate upper bound and
+both up bounds, avoiding FP16 rounding followed by cancellation in the W2
+reference. Both use the same output tolerance. The W13 precision suite also
+checks quantized codes, scales and dequantized outputs against an independent CPU
+golden, same-shape 0/10 switching, and graph replay with device-selected layers.
+These tests do not check distributed CAM completion or compare actual checkpoint
 results against the non-layered path. Recheck the tolerance and supported
 configurations against the project's precision standard when the operator
 changes.
