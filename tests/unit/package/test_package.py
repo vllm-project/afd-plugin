@@ -67,7 +67,23 @@ def test_qwen3_moe_afd_model_registration_path_is_lazy_string():
         **afd_plugin._DEEPSEEK_MODEL_REGISTRATIONS,
         **registrations,
         **afd_plugin._QWEN3_5_MODEL_REGISTRATIONS,
+        **afd_plugin._MINIMAX_MODEL_REGISTRATIONS,
     } == afd_plugin._MODEL_REGISTRATIONS
+
+
+def test_minimax_m3_afd_model_registration_paths_are_lazy_strings():
+    registrations = afd_plugin._MINIMAX_MODEL_REGISTRATIONS
+
+    assert registrations == {
+        "MiniMaxM3SparseForCausalLM": (
+            "afd_plugin.model_executor.models.npu.minimax_m3:"
+            "AFDMiniMaxM3SparseForCausalLM"
+        ),
+        "MiniMaxM3SparseForConditionalGeneration": (
+            "afd_plugin.model_executor.models.npu.minimax_m3:"
+            "AFDMiniMaxM3SparseForConditionalGeneration"
+        ),
+    }
 
 
 def test_qwen3_5_afd_model_registration_path_is_lazy_string():
@@ -272,6 +288,50 @@ def test_afd_model_config_rejects_qwen_architecture_on_npu():
     assert model_config.hf_config.architectures == [
         "Qwen3_5MoeForConditionalGeneration"
     ]
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    ],
+)
+def test_afd_model_config_rejects_minimax_m3_outside_npu(architecture):
+    pytest.importorskip("vllm")
+    from afd_plugin.model_executor.models.model_utils import get_afd_model_config
+
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=[architecture]),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="MiniMax-M3 supports Ascend NPU execution only",
+    ):
+        get_afd_model_config(model_config, device_type="cuda")
+
+    assert model_config.hf_config.architectures == [architecture]
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    ],
+)
+def test_afd_model_config_maps_minimax_m3_on_npu(architecture):
+    pytest.importorskip("vllm")
+    from afd_plugin.model_executor.models.model_utils import get_afd_model_config
+
+    hf_config = SimpleNamespace(architectures=[architecture])
+    model_config = SimpleNamespace(hf_config=hf_config, hf_text_config=hf_config)
+
+    afd_model_config = get_afd_model_config(model_config, device_type="npu")
+
+    assert afd_model_config.hf_config.architectures == [f"AFD{architecture}"]
+    assert model_config.hf_config.architectures == [architecture]
 
 
 def test_afd_model_config_preserves_unknown_architecture():
