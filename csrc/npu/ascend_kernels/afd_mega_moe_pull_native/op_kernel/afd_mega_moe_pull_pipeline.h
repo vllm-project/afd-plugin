@@ -190,7 +190,7 @@ public:
         Fence<HardEvent::V_S>();
         const float absMax = maximum_.GetValue(0);
         scaleOut.SetValue(scaleIndex, absMax / 127.0f);
-        const float multiplier = absMax > 0 ? 127.0f / absMax : 0.0f;
+        const float multiplier = absMax > 0 ? 1.0f / (absMax / 127.0f) : 0.0f;
         Fence<HardEvent::S_V>();
         if (i_ <= TILE) {
             Quantize(out, 0, i_, 0, multiplier);
@@ -268,12 +268,8 @@ private:
                              uint32_t b, float multiplier) {
         Muls(gate_, value_, multiplier, n);
         PipeBarrier<PIPE_V>();
-        auto integer = gate_.ReinterpretCast<int32_t>();
         auto fp16 = gate_.ReinterpretCast<half>();
-        Cast(integer, gate_, RoundMode::CAST_RINT, n);
-        PipeBarrier<PIPE_V>();
-        SetDeqScale(static_cast<half>(1));
-        Cast(fp16, integer, RoundMode::CAST_RINT, n);
+        Cast(fp16, gate_, RoundMode::CAST_RINT, n);
         PipeBarrier<PIPE_V>();
         Cast(quant_, fp16, RoundMode::CAST_RINT, n);
         PipeBarrier<PIPE_V>();
