@@ -190,7 +190,12 @@ def plan_network(topologies: list[RankTopology], config: NetworkConfig) -> Netwo
 
 
 def _domain_blocks(topologies: list[RankTopology]) -> list[list[int]]:
-    """Ranks grouped by NVLink domain; DeepEP needs equal, contiguous blocks."""
+    """Ranks grouped by NVLink domain; DeepEP needs equal, contiguous blocks.
+
+    The connector passes the ranks in transport order
+    (``plan_transport_layout``), which makes the blocks contiguous; this
+    checks that order.
+    """
     blocks: list[tuple[str, list[int]]] = []
     for topology in topologies:
         if blocks and blocks[-1][0] == topology.nvlink_domain:
