@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""CPU contracts for device-controlled layered W4A8 execution."""
+"""CPU contracts for device-controlled layered quantized execution."""
 
 from __future__ import annotations
 
@@ -17,15 +17,29 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from afd_plugin.model_executor.npu.async_cam_w4a8 import (  # noqa: E402
-    AsyncCAMW4A8Executor,
-    W4A8LayerWeights,
+from afd_plugin.model_executor.npu.async_cam_layered import (  # noqa: E402
+    AsyncCAMLayeredExecutor,
+    LayeredFFNWeights,
 )
 
 
-def weights(layer_idx=0, per_channel=True):
+def weights(layer_idx=0, per_channel=True, quantization="W4A8"):
     experts, hidden, intermediate = 2, 32, 16
-    return W4A8LayerWeights(
+    if quantization == "W8A8":
+        return LayeredFFNWeights(
+            layer_idx=layer_idx,
+            w13=torch.empty(experts, hidden, 2 * intermediate, dtype=torch.int8),
+            w2=torch.empty(experts, intermediate, hidden, dtype=torch.int8),
+            w13_scale=torch.ones(experts, 2 * intermediate),
+            w2_scale=torch.ones(experts, hidden, dtype=torch.bfloat16),
+            w13_bias=None,
+            w2_bias=None,
+            per_channel=True,
+            swiglu_limit=0.0,
+            routed_scaling_factor=2.0,
+            quantization="W8A8",
+        )
+    return LayeredFFNWeights(
         layer_idx=layer_idx,
         w13=torch.empty(experts, hidden, intermediate // 4, dtype=torch.int32),
         w2=torch.empty(experts, intermediate, hidden // 8, dtype=torch.int32),
@@ -72,18 +86,26 @@ def operators(monkeypatch):
     return calls
 
 
-@pytest.mark.parametrize("per_channel", [True, False])
+@pytest.mark.parametrize(
+    "quantization,per_channel", [("W4A8", True), ("W4A8", False), ("W8A8", True)]
+)
 @pytest.mark.parametrize("swiglu_limit", [0.0, 10.0])
 @pytest.mark.parametrize("layer_ids", [(0, 1), (2, 5)])
 @pytest.mark.parametrize("via_graph", [False, True])
 def test_device_layer_selection_capacity_and_scaling(
-    monkeypatch, operators, per_channel, swiglu_limit, layer_ids, via_graph
+    monkeypatch,
+    operators,
+    quantization,
+    per_channel,
+    swiglu_limit,
+    layer_ids,
+    via_graph,
 ):
     layers = [
-        replace(weights(idx, per_channel), swiglu_limit=swiglu_limit)
+        replace(weights(idx, per_channel, quantization), swiglu_limit=swiglu_limit)
         for idx in reversed(layer_ids)
     ]
-    executor = AsyncCAMW4A8Executor(layers)
+    executor = AsyncCAMLayeredExecutor(layers)
     hidden = torch.ones(8, 32, dtype=torch.int8)
     scales = torch.ones(8)
     counts = torch.tensor([0, 0], dtype=torch.int64)
@@ -111,9 +133,16 @@ def test_device_layer_selection_capacity_and_scaling(
     assert first[1][6] is second[1][4]
     assert first[1][6].tolist() == [1]
     assert first[2]["dequant_mode"] == (0 if per_channel else 1)
-    assert first[2]["swiglu_limit"] == swiglu_limit
+    assert first[2]["swiglu_limit"] == (swiglu_limit if quantization == "W4A8" else 0.0)
     assert first[2]["group_list_type"] == second[2]["group_list_type"] == 1
     assert first[1][1][0] is layers[-1].w13
+    if quantization == "W8A8":
+        assert first[1][3] == []
+        biases = second[1][2]
+        assert all(
+            t.dtype == torch.int32 and torch.count_nonzero(t) == 0 for t in biases
+        )
+        assert biases[0] is biases[1]
     if layer_ids == (0, 1):
         assert first[1][6].storage_offset() == 0
         assert first[1][6].untyped_storage().nbytes() == first[1][6].element_size()
@@ -129,12 +158,43 @@ def test_device_layer_selection_capacity_and_scaling(
 )
 def test_reject_incompatible_parameters_before_receive(operators, change, message):
     with pytest.raises(ValueError, match=message):
-        AsyncCAMW4A8Executor([replace(weights(), **change)])
+        AsyncCAMLayeredExecutor([replace(weights(), **change)])
     assert operators == []
 
 
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        ({"w2": torch.empty(2, 16, 32, dtype=torch.int32)}, "INT8"),
+        ({"w13_scale": torch.empty(2, 32, dtype=torch.bfloat16)}, "FP32"),
+        ({"w2_scale": torch.empty(2, 1, 32)}, "w2_scale"),
+        (
+            {
+                "w2_scale": torch.empty(2, 32, dtype=torch.float32),
+                "output_dtype": torch.float16,
+            },
+            "BF16 W2",
+        ),
+        ({"w2_bias": torch.empty(2, 32)}, "compensation"),
+        ({"per_channel": False}, "per-channel"),
+    ],
+)
+def test_w8a8_rejects_incompatible_layout_before_receive(operators, change, message):
+    with pytest.raises(ValueError, match=message):
+        AsyncCAMLayeredExecutor([replace(weights(quantization="W8A8"), **change)])
+    assert operators == []
+
+
+def test_graph_signature_distinguishes_quantization(operators):
+    w4 = AsyncCAMLayeredExecutor([weights()])
+    w8 = AsyncCAMLayeredExecutor([weights(quantization="W8A8")])
+    assert w4.graph_signature(32) != w8.graph_signature(32)
+    with pytest.raises(ValueError, match="homogeneous"):
+        AsyncCAMLayeredExecutor([weights(0), weights(1, quantization="W8A8")])
+
+
 def test_repeated_interleaved_layer_ids(operators):
-    executor = AsyncCAMW4A8Executor([weights(2), weights(5)])
+    executor = AsyncCAMLayeredExecutor([weights(2), weights(5)])
     for idx in (5, 2, 5, 5):
         executor(
             torch.empty(8, 32, dtype=torch.int8),
@@ -286,26 +346,27 @@ def test_layered_switch_rejects_other_roles_connectors_and_models(
         (True, (), (0, 43, 44, 45), None, False),
     ],
 )
+@pytest.mark.parametrize("quantization", ["W4A8", "W8A8"])
 def test_runner_requires_complete_layered_target_and_draft_coverage(
-    operators, eligible, draft_ids, layer_ids, error, enabled
+    operators, eligible, draft_ids, layer_ids, error, enabled, quantization
 ):
     class Connector:
         dynamic_quant = 1
         layered_gmm_enabled = False
 
-    layer = weights()
+    layer = weights(quantization=quantization)
     runner = SimpleNamespace(
         _layered_gmm_requested=True,
         connector=Connector(),
         afd_config=SimpleNamespace(compute_gate_on_attention=True),
         model=SimpleNamespace(
-            get_async_cam_w4a8_layers=lambda: (
+            get_async_cam_layered_weights=lambda: (
                 ([layer], "") if eligible else ([], "mixed quantization")
             )
         ),
         draft_model=SimpleNamespace(
-            get_async_cam_w4a8_layers=lambda: (
-                [weights(idx) for idx in draft_ids],
+            get_async_cam_layered_weights=lambda: (
+                [weights(idx, quantization=quantization) for idx in draft_ids],
                 "draft quantization is unsupported" if not draft_ids else "",
             )
         )
@@ -322,7 +383,7 @@ def test_runner_requires_complete_layered_target_and_draft_coverage(
             "AscendDeviceType": SimpleNamespace(A3="A3"),
             "get_ascend_device_type": lambda: "A3",
             "ensure_cam_async_ops_available": lambda: None,
-            "AsyncCAMW4A8Executor": AsyncCAMW4A8Executor,
+            "AsyncCAMLayeredExecutor": AsyncCAMLayeredExecutor,
             "logger": SimpleNamespace(info=lambda *args: None),
         },
     )
@@ -375,7 +436,7 @@ def model_weights_method(monkeypatch):
         node
         for node in ast.parse(source).body
         if isinstance(node, ast.FunctionDef)
-        and node.name == "_extract_async_cam_w4a8_layers"
+        and node.name == "_extract_async_cam_layered_weights"
     )
     monkeypatch.setitem(
         sys.modules,
@@ -385,7 +446,7 @@ def model_weights_method(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "vllm_ascend.quantization.quant_type",
-        SimpleNamespace(QuantType=SimpleNamespace(W4A8="w4a8")),
+        SimpleNamespace(QuantType=SimpleNamespace(W4A8="w4a8", W8A8="w8a8")),
     )
     module = ast.Module(
         body=[
@@ -400,11 +461,11 @@ def model_weights_method(monkeypatch):
     exec(
         compile(ast.fix_missing_locations(module), "<model-weights>", "exec"), namespace
     )
-    return namespace["_extract_async_cam_w4a8_layers"]
+    return namespace["_extract_async_cam_layered_weights"]
 
 
-def model_layer(idx):
-    spec = weights(idx)
+def model_layer(idx, quantization="W4A8"):
+    spec = weights(idx, quantization=quantization)
     parameters = dict(
         w13_weight=spec.w13,
         w2_weight=spec.w2,
@@ -413,6 +474,9 @@ def model_layer(idx):
         w13_scale_bias=spec.w13_bias,
         w2_scale_bias=spec.w2_bias,
     )
+    if quantization == "W8A8":
+        parameters.pop("w13_scale_bias")
+        parameters.pop("w2_scale_bias")
     owner = SimpleNamespace(
         **parameters,
         _parameters=parameters,
@@ -420,9 +484,10 @@ def model_layer(idx):
         quant_method=SimpleNamespace(
             quant_method=SimpleNamespace(is_per_channel_weight=True)
         ),
+        w13_weight_scale_fp32=spec.w13_scale,
     )
     experts = SimpleNamespace(
-        quant_type="w4a8",
+        quant_type=quantization.lower(),
         activation="silu",
         _shared_experts=None,
         routed_experts=owner,
@@ -436,26 +501,34 @@ def model_layer(idx):
     )
 
 
-def test_model_extraction_preserves_weights_and_topk_scaling(monkeypatch):
+@pytest.mark.parametrize("quantization", ["W4A8", "W8A8"])
+def test_model_extraction_preserves_weights_and_topk_scaling(monkeypatch, quantization):
     method = model_weights_method(monkeypatch)
-    layer = model_layer(3)
+    layer = model_layer(3, quantization)
     specs, reason = method([layer])
     assert reason == ""
     assert specs[0].layer_idx == 3
     assert specs[0].w13 is layer.mlp.experts.routed_experts.w13_weight
     assert specs[0].routed_scaling_factor == 1.0
+    assert specs[0].quantization == quantization
+    assert specs[0].output_dtype == torch.bfloat16
+    if quantization == "W8A8":
+        owner = layer.mlp.experts.routed_experts
+        assert specs[0].w13_scale is owner.w13_weight_scale_fp32
+        assert specs[0].w2_scale is owner.w2_weight_scale
+        assert specs[0].w13_bias is specs[0].w2_bias is None
 
 
 @pytest.mark.parametrize("mixed", [False, True])
 def test_model_extraction_skips_other_quantization(monkeypatch, mixed):
     method = model_weights_method(monkeypatch)
     layers = [model_layer(2), model_layer(5)]
-    layers[0].mlp.experts.quant_type = "w8a8"
+    layers[0].mlp.experts.quant_type = "w8a8" if mixed else "bf16"
     if not mixed:
-        layers[1].mlp.experts.quant_type = "w8a8"
+        layers[1].mlp.experts.quant_type = "bf16"
     specs, reason = method(layers)
     assert specs == []
-    assert "non-W4A8 or mixed" in reason
+    assert "homogeneous W4A8 or W8A8" in reason
 
 
 def test_model_extraction_rejects_missing_compensation(monkeypatch):

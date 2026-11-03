@@ -5,7 +5,7 @@ Async CAM transport. Attention retains attention, routing, shared experts,
 request KV and native speculative decoding. The FFN group loads one read-only
 draft expert set, sharded by EP, and serves target and draft from the same loop.
 
-Use the DSV4-Flash W4A8 checkpoint with three draft layers and a five-token
+Use a DSV4-Flash W4A8 or W8A8 checkpoint with three draft layers and a five-token
 draft block. The runtime baseline is vLLM
 `5df63a7203cdb9328d824a27b682e77c7b9928be` and vLLM-Ascend
 `bd42eea01d8312c4df469fabaed45f77a12df4d3` on Ascend 910C/A3.
@@ -35,6 +35,7 @@ MODEL=/absolute/path/to/dsv4-flash-dspark-w4a8
 LOCAL_IP=REPLACE_WITH_COMMUNICATION_IP
 INTERFACE=eth0
 NUM_A=1
+NUM_F=4
 A_DEVICES=0
 F_DEVICES=4,5,6,7
 
@@ -61,19 +62,22 @@ COMMON_ARGS=(
 DSPARK_CONFIG="{\"method\":\"dspark\",\"model\":\"$MODEL\",\"num_speculative_tokens\":5,\"enforce_eager\":true}"
 ```
 
-For DP2 set `NUM_A=2`, `A_DEVICES=0,1`, and retain the four F devices.
+For DP2 set `NUM_A=2` and `A_DEVICES=0,1`. The W4A8 example uses F EP4.
+For a W8A8 checkpoint, size F for its larger weights; the validated W8A8
+configuration uses `NUM_F=8` and `F_DEVICES=8,9,10,11,12,13,14,15`.
 Target and draft use eager execution. F supports legacy execution and the
-existing layered W4A8 executor, with one combined target/draft weight table.
-The example selects legacy F. To enable layered W4A8, prefix only the F command
+layered W4A8/W8A8 executor, with one combined target/draft weight table.
+The example selects legacy F. To enable layered GMM, prefix only the F command
 with `AFD_ASYNC_CAM_LAYERED_GMM=1`; keep it set to `0` for A and P.
 The existing layered eager path can be slower for small decode batches; use
-ordinary W4A8 eager when choosing this deployment for eager throughput.
+ordinary GMM eager when choosing this deployment for eager throughput.
 
 Layered W4A8 forwards the model's `swiglu_limit` for both target and draft
 experts. A positive limit clamps gate above and up on both sides before SwiGLU;
 zero disables clipping. Rebuild the AFD native extension and CANN package
-together when upgrading this interface. FULL execution is outside this eager
-profile.
+together when upgrading this interface. Layered W8A8 retains its unclipped
+computation; use legacy F when W8A8 checkpoint clamp behavior is required.
+FULL execution is outside this eager profile.
 
 Launch F and A with their usual Async CAM arguments, adding the same
 `--speculative-config "$DSPARK_CONFIG"` to both:
@@ -82,7 +86,7 @@ Launch F and A with their usual Async CAM arguments, adding the same
 ASCEND_RT_VISIBLE_DEVICES="$F_DEVICES" VLLM_PLUGINS=ascend,afd \
 vllm serve "$MODEL" "${COMMON_ARGS[@]}" \
   --port 7101 --data-parallel-rpc-port 17101 \
-  --tensor-parallel-size 1 --data-parallel-size 4 \
+  --tensor-parallel-size 1 --data-parallel-size "$NUM_F" \
   --all2all-backend flashinfer_all2allv --speculative-config "$DSPARK_CONFIG" \
   --additional-config "{
     \"enable_cpu_binding\":false,\"enable_force_eplb\":false,
@@ -90,7 +94,7 @@ vllm serve "$MODEL" "${COMMON_ARGS[@]}" \
     \"afd\":{
       \"role\":\"ffn\",\"connector\":\"CAMAsyncAFDConnector\",\"async_dp\":true,
       \"host\":\"$LOCAL_IP\",\"port\":12499,
-      \"num_attention_ranks\":$NUM_A,\"num_ffn_ranks\":4,
+      \"num_attention_ranks\":$NUM_A,\"num_ffn_ranks\":$NUM_F,
       \"compute_gate_on_attention\":true,
       \"connector_extra_config\":{\"dynamicQuant\":1,\"attn_ranks_per_dp\":1}
     }
@@ -109,7 +113,7 @@ vllm serve "$MODEL" "${COMMON_ARGS[@]}" \
     \"afd\":{
       \"role\":\"attention\",\"connector\":\"CAMAsyncAFDConnector\",\"async_dp\":true,
       \"host\":\"$LOCAL_IP\",\"port\":12499,
-      \"num_attention_ranks\":$NUM_A,\"num_ffn_ranks\":4,
+      \"num_attention_ranks\":$NUM_A,\"num_ffn_ranks\":$NUM_F,
       \"compute_gate_on_attention\":true,
       \"connector_extra_config\":{\"dynamicQuant\":1,\"attn_ranks_per_dp\":1}
     }

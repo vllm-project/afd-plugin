@@ -27,9 +27,9 @@ def test_layered_w4a8_valid_rows_and_capacity_tail(
     torch = pytest.importorskip("torch")
     torch_npu = pytest.importorskip("torch_npu")
     from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
-    from afd_plugin.model_executor.npu.async_cam_w4a8 import (
-        AsyncCAMW4A8Executor,
-        W4A8LayerWeights,
+    from afd_plugin.model_executor.npu.async_cam_layered import (
+        AsyncCAMLayeredExecutor,
+        LayeredFFNWeights,
     )
 
     ensure_cam_async_ops_available()
@@ -86,12 +86,12 @@ def test_layered_w4a8_valid_rows_and_capacity_tail(
         w13, s13, b13, ref13 = make_weight(hidden, 2 * intermediate, factor, True)
         w2, s2, b2, ref2 = make_weight(intermediate, hidden, factor, False)
         layers.append(
-            W4A8LayerWeights(
+            LayeredFFNWeights(
                 idx, w13, w2, s13, s2, b13, b2, per_channel, swiglu_limit, 1.0
             )
         )
         reference.append((ref13, ref2))
-    executor = AsyncCAMW4A8Executor(layers)
+    executor = AsyncCAMLayeredExecutor(layers)
     x = torch.randint(-100, 101, (capacity, hidden), dtype=torch.int8)
     if swiglu_limit:
         x.zero_()
