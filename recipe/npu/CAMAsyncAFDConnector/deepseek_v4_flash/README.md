@@ -62,8 +62,16 @@ DSPARK_CONFIG="{\"method\":\"dspark\",\"model\":\"$MODEL\",\"num_speculative_tok
 ```
 
 For DP2 set `NUM_A=2`, `A_DEVICES=0,1`, and retain the four F devices.
-Use eager execution with `AFD_ASYNC_CAM_LAYERED_GMM=0`; layered W4A8 and FULL
-execution are not supported.
+Target and draft use eager execution. F supports legacy execution and the
+existing layered W4A8 executor, with one combined target/draft weight table.
+The example selects legacy F. To enable layered W4A8, prefix only the F command
+with `AFD_ASYNC_CAM_LAYERED_GMM=1`; keep it set to `0` for A and P.
+The existing layered eager path can be slower for small decode batches; use
+ordinary W4A8 eager when choosing this deployment for eager throughput.
+
+The existing layered W4A8 kernel does not apply nonzero `swiglu_limit` values.
+Use legacy F when the checkpoint's SwiGLU clamp behavior is required. FULL
+execution is outside this eager profile.
 
 Launch F and A with their usual Async CAM arguments, adding the same
 `--speculative-config "$DSPARK_CONFIG"` to both:
@@ -130,6 +138,16 @@ native DSpark comparison, exercises SWA boundaries and chunked prompts, and
 checks proposal/acceptance counters. Optional ownership evidence uses
 `tests.e2e.models.deepseek_v4_flash.dspark_evidence.DSparkEagerEvidence`
 through the native worker-extension hook; disable observers when benchmarking.
+For this check, enable `VLLM_SERVER_DEV_MODE=1` on A/F, add the extension with
+`--worker-extension-cls`, and set `AFD_DSPARK_EVIDENCE_DIR` to F's evidence
+directory. Pass that directory to the checker with `--evidence-dir`. In layered
+mode it requires all 46 target/draft layers to return work on each F rank.
+Layered execution observations read device headers and add synchronization;
+their timings are not performance measurements.
+
+For a layered/reference FFN performance comparison, keep DSpark enabled on P,
+A and F in both runs, toggle only F's `AFD_ASYNC_CAM_LAYERED_GMM`, and disable
+the evidence extension.
 
 Remove `--speculative-config` on A/F for a speculation-disabled control, and
 use the corresponding upstream P configuration when testing PD. Record the

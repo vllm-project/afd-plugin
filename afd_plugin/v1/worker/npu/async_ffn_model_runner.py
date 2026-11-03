@@ -391,6 +391,9 @@ class AsyncNPUFFNModelRunner:
                 reason = "requires Attention-side gate"
             else:
                 layers, reason = self.model.get_async_cam_w4a8_layers()
+                if layers and self.draft_model is not None:
+                    draft_layers, reason = self.draft_model.get_async_cam_w4a8_layers()
+                    layers = [*layers, *draft_layers] if draft_layers else []
                 if layers:
                     if get_ascend_device_type() != AscendDeviceType.A3:
                         raise ValueError("layered W4A8 GMM requires Ascend 910C/A3")

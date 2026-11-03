@@ -238,11 +238,6 @@ def _fail_if_unsupported_npu_afd_async_features(
         if speculative_config.method == "dspark":
             if vllm_config.model_config.hf_text_config.model_type != "deepseek_v4":
                 raise RuntimeError("AFD DSpark supports only DeepSeek-V4 on NPU")
-            if async_cam_layered_gmm_enabled():
-                raise RuntimeError(
-                    "AFD DSpark eager requires legacy FFN execution; layered "
-                    "W4A8 SwiGLU-clamp parity is not qualified"
-                )
             # The shared MRV2 validator owns PP/CP and static EP constraints.
             # Keep only the additional target/draft restrictions here.
             if (
