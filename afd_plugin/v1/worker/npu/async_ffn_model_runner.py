@@ -37,9 +37,9 @@ from afd_plugin.connectors.npu.async_cam import (
     CAMAsyncAFDConnector,
 )
 from afd_plugin.envs import async_cam_layered_gmm_enabled
-from afd_plugin.model_executor.npu.async_cam_w4a8 import (
-    AsyncCAMW4A8Executor,
-    W4A8LayerWeights,
+from afd_plugin.model_executor.npu.async_cam_layered import (
+    AsyncCAMLayeredExecutor,
+    LayeredFFNWeights,
 )
 from afd_plugin.v1.worker.ffn_metadata import _set_moe_layer_index
 from afd_plugin.v1.worker.npu.async_ffn_two_stream import AsyncFFNTwoStream
@@ -68,7 +68,7 @@ class FFNModel(Protocol):
         dynamic_scales: torch.Tensor | None,
     ) -> torch.Tensor | AFDF2ATransferPayload: ...
     def get_experts_layer_indices(self) -> tuple[int, ...]: ...
-    def get_async_cam_w4a8_layers(self) -> tuple[list[W4A8LayerWeights], str]: ...
+    def get_async_cam_layered_weights(self) -> tuple[list[LayeredFFNWeights], str]: ...
 
 
 class AsyncNPUFFNModelRunner:
@@ -93,7 +93,7 @@ class AsyncNPUFFNModelRunner:
         self.model_memory_usage = 0
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.layer_ids: tuple[int, ...] = ()
-        self._layered_executor: AsyncCAMW4A8Executor | None = None
+        self._layered_executor: AsyncCAMLayeredExecutor | None = None
         self._layered_gmm_requested = async_cam_layered_gmm_enabled()
         self.requested_mode = requested_ffn_mode(vllm_config)
         self.effective_mode = "eager"
@@ -201,7 +201,7 @@ class AsyncNPUFFNModelRunner:
                 if stream_error:
                     raise ValueError(stream_error)
                 if executor is None:
-                    raise ValueError("FFN two-stream requires layered W4A8")
+                    raise ValueError("FFN two-stream requires layered W4A8/W8A8")
                 self._two_stream = AsyncFFNTwoStream(
                     self.device,
                     config,
@@ -211,7 +211,7 @@ class AsyncNPUFFNModelRunner:
             except Exception as exc:
                 stream_error = str(exc)
         graph_error = (
-            "requires layered W4A8 (AFD_ASYNC_CAM_LAYERED_GMM=1)"
+            "requires layered W4A8/W8A8 (AFD_ASYNC_CAM_LAYERED_GMM=1)"
             if executor is None
             else ""
         )
@@ -390,15 +390,17 @@ class AsyncNPUFFNModelRunner:
             elif not self.afd_config.compute_gate_on_attention:
                 reason = "requires Attention-side gate"
             else:
-                layers, reason = self.model.get_async_cam_w4a8_layers()
+                layers, reason = self.model.get_async_cam_layered_weights()
                 if layers and self.draft_model is not None:
-                    draft_layers, reason = self.draft_model.get_async_cam_w4a8_layers()
+                    draft_layers, reason = (
+                        self.draft_model.get_async_cam_layered_weights()
+                    )
                     layers = [*layers, *draft_layers] if draft_layers else []
                 if layers:
                     if get_ascend_device_type() != AscendDeviceType.A3:
-                        raise ValueError("layered W4A8 GMM requires Ascend 910C/A3")
+                        raise ValueError("layered GMM requires Ascend 910C/A3")
                     if self.connector.dynamic_quant != 1:
-                        raise ValueError("layered W4A8 GMM requires dynamicQuant=1")
+                        raise ValueError("layered GMM requires dynamicQuant=1")
                     if tuple(sorted(layer.layer_idx for layer in layers)) != tuple(
                         self.layer_ids
                     ):
@@ -406,12 +408,13 @@ class AsyncNPUFFNModelRunner:
                             "layered GMM weights do not cover the remote MoE layer IDs"
                         )
                     ensure_cam_async_ops_available()
-                    self._layered_executor = AsyncCAMW4A8Executor(layers)
+                    self._layered_executor = AsyncCAMLayeredExecutor(layers)
                     self.connector.layered_gmm_enabled = True
                     logger.info(
                         "AFD_ASYNC_CAM_LAYERED_GMM requested=1 actual=layered "
-                        "quant=W4A8 layers=%d mode=%s layer_mapping=%s "
+                        "quant=%s layers=%d mode=%s layer_mapping=%s "
                         "swiglu_limit=%s ignored=%s",
+                        layers[0].quantization,
                         len(layers),
                         "per-channel" if layers[0].per_channel else "per-group",
                         self._layered_executor.layer_id_to_slot is not None,

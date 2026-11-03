@@ -191,7 +191,7 @@ def _fail_if_unsupported_npu_afd_async_features(
             in ("1", "true")
         ):
             raise RuntimeError(
-                "FFN two-stream requires MRV2 layered W4A8, dynamicQuant=1, "
+                "FFN two-stream requires MRV2 layered GMM, dynamicQuant=1, "
                 "Attention-side gate, F TP=1 and SP disabled"
             )
     if not is_afd_async_dp(vllm_config):

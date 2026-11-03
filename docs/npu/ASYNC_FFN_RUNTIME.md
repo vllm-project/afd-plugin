@@ -1,7 +1,7 @@
 # MRV2 Async CAM FFN eager/FULL runtime
 
 AFD #449 captures one complete routed-expert transaction: original dispatch
-receive (DR), existing layered W4A8 FFN, and original combine send (CS).
+receive (DR), layered W4A8/W8A8 FFN, and original combine send (CS).
 Attention remains MRV2 eager. Issue #451 retires the separate MRV1 paths while
 preserving this runtime and its original transport/lifecycle boundary.
 
@@ -13,7 +13,7 @@ neither runner inherits MRV1 or owns Attention request/KV state.
 ## Selection and startup
 
 The target is the pinned vLLM 0.32 / vLLM-Ascend stack on A3/910C, with
-homogeneous DeepSeek-V4 W4A8 layers, dynamicQuant=1, static expert placement,
+homogeneous DeepSeek-V4 W4A8 or W8A8 layers, dynamicQuant=1, static expert placement,
 F TP=1 and Attention-side gating. Both roles select
 `VLLM_USE_V2_MODEL_RUNNER=1`. Attention keeps `--enforce-eager`.
 Attention may enable native DBO under the
@@ -28,6 +28,20 @@ On F, set `AFD_ASYNC_CAM_LAYERED_GMM=1`, omit `--enforce-eager`, and pass
 use `--enforce-eager`. Unsupported FULL configurations and mismatched transport
 parameters fail startup; there is no automatic eager fallback. Piecewise and
 decode-only graph modes are rejected.
+
+DeepSeek-V4 DSpark uses one W4A8 or W8A8 Layered table for target and draft
+routed experts and requires eager execution on both A and F
+(`--enforce-eager`). Target and draft must share the same quantization
+and tensor layout. See the
+[DSpark recipe](../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md).
+
+W8A8 reuses the loaded INT8 NZ weights, FP32 W13 scales and BF16 W2 scales.
+It needs no W4A8 compensation. The W2 binding requires per-layer bias entries,
+so the executor shares one zero INT32 bias across all layers; with 32 local
+experts and hidden size 4096 this is 0.5 MiB per F rank. The executor performs
+no host layer read or per-transaction weight conversion. W4A8 retains its
+existing packed INT4 weights and compensation path. Mixed quantizations do
+not form a single layered table.
 
 `BATCH_SIZE_FACTOR` determines the existing native receive capacity. It must
 cover the dispatched TP-group token envelope, and per-source indices must fit
@@ -99,7 +113,7 @@ only its Vector limit. Invalid budgets, inconsistent FFN layouts and unsupported
 Attention capabilities fail through pre-HCCL Store negotiation. Configuration
 hashing includes connector extras.
 
-This option requires the layered MRV2 W4A8 prerequisites above. Keep PP/PCP/DCP
+This option requires the layered MRV2 prerequisites above. Keep PP/PCP/DCP
 at 1, SP and FlashComm1 off on both roles, and speculative decoding off.
 
 Attention DBO, when enabled, uses exactly two native ubatches and the existing

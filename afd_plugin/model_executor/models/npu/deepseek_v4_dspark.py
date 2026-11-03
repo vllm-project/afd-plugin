@@ -33,11 +33,11 @@ from vllm_ascend.utils import get_rotation_path
 from afd_plugin.config import parse_afd_config
 from afd_plugin.model_executor.models.npu.deepseek_v4 import (
     AFDDeepseekV4DecoderLayer,
-    _extract_async_cam_w4a8_layers,
+    _extract_async_cam_layered_weights,
 )
 
 if TYPE_CHECKING:
-    from afd_plugin.model_executor.npu.async_cam_w4a8 import W4A8LayerWeights
+    from afd_plugin.model_executor.npu.async_cam_layered import LayeredFFNWeights
 
 
 def _iter_role_weights(
@@ -253,8 +253,8 @@ class AFDDSparkDeepseekV4ForCausalLM(native.DSparkDeepseekV4ForCausalLM):
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return tuple(int(index) for index in self.model.layers)
 
-    def get_async_cam_w4a8_layers(self) -> tuple[list[W4A8LayerWeights], str]:
-        return _extract_async_cam_w4a8_layers(self.model.layers.values())
+    def get_async_cam_layered_weights(self) -> tuple[list[LayeredFFNWeights], str]:
+        return _extract_async_cam_layered_weights(self.model.layers.values())
 
     def compute_ffn_output(
         self,

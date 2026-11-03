@@ -167,7 +167,7 @@ Both platforms require V2. The paired deployment constraints are:
 | Sequence parallelism | Unsupported | Model-specific; synchronous DeepSeek-V2/V3 SP is rejected | Attention-local FlashComm1/SP supported; disabled on FFN; no PCP/DCP |
 | Native DBO | Exactly two microbatches, Attention DP1 or DP > 1 | Eager or graph; exactly two microbatches, Attention DP > 1 | Eager only; exactly two microbatches at Attention DP1 or DP > 1 |
 | AFD async MoE ubatching | Not applicable | Not applicable | Legacy alias for native DBO; split selector is ignored |
-| Graph execution | Eager or `FULL_DECODE_ONLY` | Eager, `FULL`, or `FULL_DECODE_ONLY`; plain MLA graph DBO requires `FULL_DECODE_ONLY` | Eager Attention; independent FFN also supports the narrow W4A8 FULL contract |
+| Graph execution | Eager or `FULL_DECODE_ONLY` | Eager, `FULL`, or `FULL_DECODE_ONLY`; plain MLA graph DBO requires `FULL_DECODE_ONLY` | Eager Attention; independent FFN also supports the narrow W4A8/W8A8 FULL contract |
 | Model | Must resolve to a registered AFD architecture | Same | Registered DeepSeek-V2/V3 MLA or DeepSeek-V4; V4 requires `dynamicQuant=1` |
 
 Both roles validate the paired V2 topology, but only Attention uses the native
