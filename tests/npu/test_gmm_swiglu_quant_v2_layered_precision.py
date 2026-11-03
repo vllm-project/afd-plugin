@@ -722,3 +722,94 @@ def test_a8w8_group_list_type_is_independent_of_call_order(  # long-test: call o
     ]
 
     print("\n".join(reports))
+
+
+# A4W4 device-invocation shapes. int4 activations and weights are carried by an
+# int32 storage whose last axis holds eight packed int4 values per element, and
+# the op_api unpacks them to int4 before validation; the weight therefore keeps
+# K int4 values per row and N // 8 packed elements. Two layers are supplied so
+# the empty assist placeholder must match the per-layer list length.
+_A4W4_LAYERS = 2
+_A4W4_M = 128
+_A4W4_K = 256
+_A4W4_E = 8
+_A4W4_N = 256
+# fp32 1.0 in the low word of the wire-format uint64 per-channel scale.
+_A4W4_SCALE_ONE = 0x3F800000
+
+
+def _build_a4w4_inputs(torch) -> tuple:
+    """Return a two-layer A4W4 (int4 x int4) input set on the NPU.
+
+    The assist matrix is absent, which the ``Tensor[]`` schema can only express
+    as an empty list.
+    """
+    device = "npu"
+    x = torch.zeros(
+        (_A4W4_M, _A4W4_K // _INT4_PER_INT32), device=device, dtype=torch.int32
+    )
+    weight = torch.zeros(
+        (_A4W4_E, _A4W4_K, _A4W4_N // _INT4_PER_INT32),
+        device=device,
+        dtype=torch.int32,
+    )
+    # A4W4 per-channel scales are uint64 on the wire. torch int64 is the
+    # torch_npu-compatible spelling that the op_api converts in place.
+    weight_scale = torch.full(
+        (_A4W4_E, _A4W4_N), _A4W4_SCALE_ONE, device=device, dtype=torch.int64
+    )
+    x_scale = torch.ones((_A4W4_M,), device=device, dtype=torch.float32)
+    group_list = torch.full(
+        (_A4W4_E,), _A4W4_M // _A4W4_E, device=device, dtype=torch.int64
+    )
+    layer_index = torch.ones((1,), device=device, dtype=torch.int64)
+    return (
+        x,
+        [weight.clone() for _ in range(_A4W4_LAYERS)],
+        [weight_scale.clone() for _ in range(_A4W4_LAYERS)],
+        [],  # absent assist matrix: Tensor[] cannot express None
+        x_scale,
+        group_list,
+        layer_index,
+    )
+
+
+def test_gmm_swiglu_quant_v2_layered_a4w4_empty_assist_matrix_runtime() -> None:
+    """A4W4 must accept an empty assist list on the real CANN device path.
+
+    This is the only layer that reaches the op_api validation. It covers both
+    halves of the fix: an absent assist matrix must be normalized to nullptr
+    before the A4W4 check rejects it, and the empty placeholder must carry one
+    element per layer so the host tiling list-length check accepts a two-layer
+    call.
+    """
+    if os.environ.get("AFD_RUN_ASCEND_OP_RUNTIME") != "1":
+        pytest.skip(
+            "set AFD_RUN_ASCEND_OP_RUNTIME=1 on a 910C host with the AFD run package "
+            "installed to run the A4W4 device invocation",
+        )
+
+    soc = os.environ.get("SOC_VERSION", "").lower()
+    if soc != "910c" and not soc.startswith("ascend910_93"):
+        pytest.skip("requires SOC_VERSION=910c")
+    torch = pytest.importorskip("torch")
+    torch_npu = pytest.importorskip("torch_npu")
+    _runtime(torch, torch_npu)
+
+    outputs = torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered(
+        *_build_a4w4_inputs(torch), 0, 0, 0, None
+    )
+    torch.npu.synchronize()
+
+    assert len(outputs) == 2
+    y_out, y_scale_out = outputs
+
+    # y is the swiglu result quantized to int8: [M, N // 2].
+    assert tuple(y_out.shape) == (_A4W4_M, _A4W4_N // 2)
+    assert y_out.dtype == torch.int8
+
+    # Per-token output scale: [M] float32.
+    assert tuple(y_scale_out.shape) == (_A4W4_M,)
+    assert y_scale_out.dtype == torch.float32
+
+    assert all(tensor.device.type == "npu" for tensor in outputs)

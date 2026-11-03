@@ -27,16 +27,7 @@ contract are self-consistent for the Meta binding:
 Meta dispatch never reaches the op_api input validation, so the layered
 list-and-layer-index contract is enforced in the binding itself
 (``check_lists`` in ``torch_binding_gmm_swiglu_quant.cpp``) and is therefore
-observable on the Meta path. The A4W4 rule that rejects a non-null assist matrix
-is only observable on the device path:
-``test_gmm_swiglu_quant_v2_layered_a4w4_empty_assist_matrix_runtime`` covers it
-with a two-layer call and an empty assist list (the ``Tensor[]`` schema cannot
-express ``None``). It needs a 910C device and the AFD CANN run package, so it
-is opt-in::
-
-    SOC_VERSION=910c AFD_RUN_ASCEND_OP_RUNTIME=1 \\
-        pytest tests/unit/compat/npu/test_gmm_swiglu_quant_v2_layered.py
-
+observable on the Meta path.
 Numerical correctness is covered separately, against the built-in non-layered
 operator: ``tests/npu/test_gmm_swiglu_quant_v2_layered_precision.py``.
 """
@@ -55,25 +46,10 @@ from afd_plugin.compat.npu.ops import ensure_afd_ascend_ops_loaded
 pytestmark = pytest.mark.npu
 
 _OP_NAME = "afd_ascend::gmm_swiglu_quant_v2_layered"
-_RUNTIME_ENV_VAR = "AFD_RUN_ASCEND_OP_RUNTIME"
 _M = 4  # tokens
 _K = 32  # hidden / reduction dimension
 _E = 4  # experts
 _N = 64  # swiglu halves this into the output feature dimension
-
-# A4W4 device-invocation shapes. int4 activations and weights are carried by an
-# int32 storage whose last axis holds eight packed int4 values per element, and
-# the op_api unpacks them to int4 before validation; the weight therefore keeps
-# K int4 values per row and N // 8 packed elements. Two layers are supplied so
-# the empty assist placeholder must match the per-layer list length.
-_INT4_PER_INT32 = 8
-_A4W4_LAYERS = 2
-_A4W4_M = 128
-_A4W4_K = 256
-_A4W4_E = 8
-_A4W4_N = 256
-# fp32 1.0 in the low word of the wire-format uint64 per-channel scale.
-_A4W4_SCALE_ONE = 0x3F800000
 
 
 @pytest.fixture(scope="module")
@@ -101,42 +77,6 @@ def _build_pertoken_inputs(torch: ModuleType) -> tuple:
     group_list = torch.empty((_E,), device="meta", dtype=torch.int64)
     layer_index = torch.empty((1,), device="meta", dtype=torch.int64)
     return x, [weight], [weight_scale], [], x_scale, group_list, layer_index
-
-
-def _build_a4w4_inputs(torch: ModuleType) -> tuple:
-    """Return a two-layer A4W4 (int4 x int4) input set on the NPU.
-
-    The assist matrix is absent, which the ``Tensor[]`` schema can only express
-    as an empty list.
-    """
-    device = "npu"
-    x = torch.zeros(
-        (_A4W4_M, _A4W4_K // _INT4_PER_INT32), device=device, dtype=torch.int32
-    )
-    weight = torch.zeros(
-        (_A4W4_E, _A4W4_K, _A4W4_N // _INT4_PER_INT32),
-        device=device,
-        dtype=torch.int32,
-    )
-    # A4W4 per-channel scales are uint64 on the wire. torch int64 is the
-    # torch_npu-compatible spelling that the op_api converts in place.
-    weight_scale = torch.full(
-        (_A4W4_E, _A4W4_N), _A4W4_SCALE_ONE, device=device, dtype=torch.int64
-    )
-    x_scale = torch.ones((_A4W4_M,), device=device, dtype=torch.float32)
-    group_list = torch.full(
-        (_A4W4_E,), _A4W4_M // _A4W4_E, device=device, dtype=torch.int64
-    )
-    layer_index = torch.ones((1,), device=device, dtype=torch.int64)
-    return (
-        x,
-        [weight.clone() for _ in range(_A4W4_LAYERS)],
-        [weight_scale.clone() for _ in range(_A4W4_LAYERS)],
-        [],  # absent assist matrix: Tensor[] cannot express None
-        x_scale,
-        group_list,
-        layer_index,
-    )
 
 
 def _invoke_gmm(torch: ModuleType, inputs: tuple) -> list:
@@ -280,40 +220,3 @@ def test_gmm_swiglu_quant_v2_layered_meta_multi_layer_lists(
         ),
     )
     assert tuple(outputs[0].shape) == (_M, _N // 2)
-
-
-def test_gmm_swiglu_quant_v2_layered_a4w4_empty_assist_matrix_runtime(
-    gmm_runtime: ModuleType,
-) -> None:
-    """A4W4 must accept an empty assist list on the real CANN device path.
-
-    This is the only layer that reaches the op_api validation. It covers both
-    halves of the fix: an absent assist matrix must be normalized to nullptr
-    before the A4W4 check rejects it, and the empty placeholder must carry one
-    element per layer so the host tiling list-length check accepts a two-layer
-    call.
-    """
-    if os.environ.get(_RUNTIME_ENV_VAR) != "1":
-        pytest.skip(
-            f"set {_RUNTIME_ENV_VAR}=1 on a 910C host with the AFD run package "
-            "installed to run the A4W4 device invocation",
-        )
-
-    torch = gmm_runtime
-    torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
-
-    outputs = _invoke_gmm(torch, _build_a4w4_inputs(torch))
-    torch.npu.synchronize()
-
-    assert len(outputs) == 2
-    y_out, y_scale_out = outputs
-
-    # y is the swiglu result quantized to int8: [M, N // 2].
-    assert tuple(y_out.shape) == (_A4W4_M, _A4W4_N // 2)
-    assert y_out.dtype == torch.int8
-
-    # Per-token output scale: [M] float32.
-    assert tuple(y_scale_out.shape) == (_A4W4_M,)
-    assert y_scale_out.dtype == torch.float32
-
-    assert all(tensor.device.type == "npu" for tensor in outputs)

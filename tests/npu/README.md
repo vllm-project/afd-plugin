@@ -211,7 +211,7 @@ SOC_VERSION=910c AFD_RUN_ASCEND_OP_RUNTIME=1 LOCAL_RANK=0 \
   tests/npu/test_gmm_layered_device_group_list.py
 ```
 
-`test_gmm_swiglu_quant_v2_layered_precision.py` collects 11 cases against W13.
+`test_gmm_swiglu_quant_v2_layered_precision.py` covers W13 precision and the A4W4 empty-assist device path.
 It covers A8W8 and A8W4, and it needs two reference strategies because only one
 scenario has a usable built-in counterpart:
 

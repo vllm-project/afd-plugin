@@ -114,7 +114,7 @@ The three device suites answer different questions and none is redundant:
 | Suite | Operator | Covers |
 | --- | --- | --- |
 | `test_async_cam_layered_w4a8.py` | W13 then W2 | The `AsyncCAMW4A8Executor` chain, 16 cases |
-| `test_gmm_swiglu_quant_v2_layered_precision.py` | W13 | Both quantization scenarios against a reference, 11 cases |
+| `test_gmm_swiglu_quant_v2_layered_precision.py` | W13 | A8W8 and A8W4 reference comparisons, plus the A4W4 empty-assist device path |
 | `test_gmm_layered_device_group_list.py` | W2 | A device-produced group list, both scenarios, 4 cases |
 
 `test_async_cam_layered_w4a8.py` uses two layers with different nonzero INT4

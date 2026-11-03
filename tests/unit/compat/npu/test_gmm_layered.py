@@ -39,14 +39,6 @@ The A8W8 contract differs in the weight, bias and scale:
   which would hand back an int8 y (a different def column, packed uint64 dequant
   scale, cube-only kernel) rather than the quantized result under test.
 
-Meta dispatch never reaches the op_api input validation, so the layer-count and
-layer_index checks are only observable on the device path;
-``test_gmm_layered_runtime_multi_layer`` (A8W4) and
-``test_gmm_layered_runtime_a8w8`` cover that and need a 910C device plus the AFD
-CANN run package, so they are opt-in::
-
-    SOC_VERSION=910c AFD_RUN_ASCEND_OP_RUNTIME=1 \\
-        pytest tests/unit/compat/npu/test_gmm_layered.py
 """
 
 from __future__ import annotations
@@ -63,7 +55,6 @@ from afd_plugin.compat.npu.ops import ensure_afd_ascend_ops_loaded
 pytestmark = pytest.mark.npu
 
 _OP_NAME = "afd_ascend::grouped_matmul_layered"
-_RUNTIME_ENV_VAR = "AFD_RUN_ASCEND_OP_RUNTIME"
 
 # Meta shapes: deliberately small and dimension-true so the dispatcher contract
 # is what is being checked, not the arithmetic.
@@ -72,14 +63,7 @@ _K = 32  # reduction dimension
 _E = 4  # experts
 _N = 64  # output features
 _INT4_PER_INT32 = 8
-
-# Device shapes for the opt-in runtime test. Two layers are supplied so the
-# device-side layer_index has a real choice.
-_RUNTIME_LAYERS = 2
-_RUNTIME_M = 128
-_RUNTIME_K = 256
-_RUNTIME_E = 8
-_RUNTIME_N = 256
+_LAYERS = 2
 
 
 @pytest.fixture(scope="module")
@@ -209,7 +193,7 @@ def test_gmm_layered_meta_multi_layer_lists(gmm_runtime: ModuleType) -> None:
     with it.
     """
     torch = gmm_runtime
-    outputs = _invoke_gmm(torch, _build_meta_inputs(torch, layers=_RUNTIME_LAYERS))
+    outputs = _invoke_gmm(torch, _build_meta_inputs(torch, layers=_LAYERS))
 
     assert len(outputs) == 1
     y_out = outputs[0]
@@ -239,7 +223,7 @@ def test_gmm_layered_meta_contract_a8w8(gmm_runtime: ModuleType) -> None:
 def test_gmm_layered_meta_a8w8_multi_layer_lists(gmm_runtime: ModuleType) -> None:
     """The A8W8 per-layer TensorList indexing must accept a multi-layer list."""
     torch = gmm_runtime
-    inputs = _build_a8w8_meta_inputs(torch, layers=_RUNTIME_LAYERS)
+    inputs = _build_a8w8_meta_inputs(torch, layers=_LAYERS)
     y_out = torch.ops.afd_ascend.grouped_matmul_layered(
         **inputs,
         output_dtype=torch.bfloat16,
@@ -296,7 +280,7 @@ def test_gmm_layered_meta_a8w8_rejects_mismatched_list_lengths(
 ) -> None:
     """The per-layer list length contract is scenario-independent too."""
     torch = gmm_runtime
-    inputs = _build_a8w8_meta_inputs(torch, layers=_RUNTIME_LAYERS)
+    inputs = _build_a8w8_meta_inputs(torch, layers=_LAYERS)
     inputs["all_bias"] = inputs["all_bias"][:1]  # 1 vs 2 layers
 
     with pytest.raises(RuntimeError, match="same length"):
@@ -309,7 +293,7 @@ def test_gmm_layered_meta_a8w8_rejects_mismatched_list_lengths(
 def test_gmm_layered_rejects_mismatched_list_lengths(gmm_runtime: ModuleType) -> None:
     """all_weight / all_bias / all_scale must agree on the layer count."""
     torch = gmm_runtime
-    inputs = _build_meta_inputs(torch, layers=_RUNTIME_LAYERS)
+    inputs = _build_meta_inputs(torch, layers=_LAYERS)
     inputs["all_bias"] = inputs["all_bias"][:1]  # 1 vs 2 layers
 
     with pytest.raises(RuntimeError, match="same length"):
@@ -345,128 +329,6 @@ def test_gmm_layered_rejects_bad_split_item(gmm_runtime: ModuleType) -> None:
             9,  # split_item out of range
             None,
         )
-
-
-def test_gmm_layered_runtime_multi_layer(gmm_runtime: ModuleType) -> None:
-    """Run the A8W4 device path for two layers and check the output geometry.
-
-    This is the only layer that reaches the op_api validation and the kernel, so
-    it covers what Meta cannot: the per-layer TensorList indexing driven by the
-    device-side layer_index and group list. It needs a 910C
-    device and the AFD CANN run package, hence the opt-in gate.
-    """
-    if os.environ.get(_RUNTIME_ENV_VAR) != "1":
-        pytest.skip(
-            f"set {_RUNTIME_ENV_VAR}=1 on a 910C host with the AFD run package "
-            "installed to run the A8W4 device invocation",
-        )
-
-    torch = gmm_runtime
-    torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
-    device = "npu"
-
-    x = torch.zeros((_RUNTIME_M, _RUNTIME_K), dtype=torch.int8, device=device)
-    all_weight = [
-        torch.zeros(
-            (_RUNTIME_E, _RUNTIME_K, _RUNTIME_N // _INT4_PER_INT32),
-            dtype=torch.int32,
-            device=device,
-        )
-        for _ in range(_RUNTIME_LAYERS)
-    ]
-    all_bias = [
-        torch.zeros((_RUNTIME_E, _RUNTIME_N), dtype=torch.float32, device=device)
-        for _ in range(_RUNTIME_LAYERS)
-    ]
-    all_scale = [
-        torch.zeros((_RUNTIME_E, _RUNTIME_N), dtype=torch.int64, device=device)
-        for _ in range(_RUNTIME_LAYERS)
-    ]
-    per_token_scale = torch.ones((_RUNTIME_M,), dtype=torch.float32, device=device)
-    group_list = torch.full(
-        (_RUNTIME_E,), _RUNTIME_M // _RUNTIME_E, dtype=torch.int64, device=device
-    )
-
-    for layer in range(_RUNTIME_LAYERS):
-        outputs = torch.ops.afd_ascend.grouped_matmul_layered(
-            [x],
-            all_weight,
-            all_bias,
-            all_scale,
-            torch.tensor([layer], dtype=torch.int64, device=device),
-            group_list,
-            per_token_scale,
-            1,  # group_list_type: count
-            3,  # split_item: NO_SEPARATED
-            None,
-        )
-        torch.npu.synchronize()
-
-        assert len(outputs) == 1
-        y_out = outputs[0]
-        assert tuple(y_out.shape) == (_RUNTIME_M, _RUNTIME_N)
-        assert y_out.dtype == torch.bfloat16
-        assert y_out.device.type == "npu"
-
-
-def test_gmm_layered_runtime_a8w8(gmm_runtime: ModuleType) -> None:
-    """Run the A8W8 device path for two layers and check the output geometry.
-
-    The A8W8 counterpart of ``test_gmm_layered_runtime_multi_layer``. It is the
-    path that reaches ``GMMTiling::Init`` (the A8W4 MSD branch returns before it),
-    so it is what covers the layer_index validation that moved to the aclnn
-    entry. Needs a 910C device and the AFD CANN run package, hence the gate.
-    """
-    if os.environ.get(_RUNTIME_ENV_VAR) != "1":
-        pytest.skip(
-            f"set {_RUNTIME_ENV_VAR}=1 on a 910C host with the AFD run package "
-            "installed to run the A8W8 device invocation",
-        )
-
-    torch = gmm_runtime
-    torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
-    device = "npu"
-
-    x = torch.zeros((_RUNTIME_M, _RUNTIME_K), dtype=torch.int8, device=device)
-    all_weight = [
-        torch.zeros(
-            (_RUNTIME_E, _RUNTIME_K, _RUNTIME_N), dtype=torch.int8, device=device
-        )
-        for _ in range(_RUNTIME_LAYERS)
-    ]
-    all_bias = [
-        torch.zeros((_RUNTIME_E, _RUNTIME_N), dtype=torch.int32, device=device)
-        for _ in range(_RUNTIME_LAYERS)
-    ]
-    all_scale = [
-        torch.zeros((_RUNTIME_E, _RUNTIME_N), dtype=torch.bfloat16, device=device)
-        for _ in range(_RUNTIME_LAYERS)
-    ]
-    per_token_scale = torch.ones((_RUNTIME_M,), dtype=torch.float32, device=device)
-    group_list = torch.full(
-        (_RUNTIME_E,), _RUNTIME_M // _RUNTIME_E, dtype=torch.int64, device=device
-    )
-
-    for layer in range(_RUNTIME_LAYERS):
-        outputs = torch.ops.afd_ascend.grouped_matmul_layered(
-            [x],
-            all_weight,
-            all_bias,
-            all_scale,
-            torch.tensor([layer], dtype=torch.int64, device=device),
-            group_list,
-            per_token_scale,
-            1,  # group_list_type: count
-            3,  # split_item: NO_SEPARATED
-            torch.bfloat16,  # explicit: an int8 weight would otherwise derive int8
-        )
-        torch.npu.synchronize()
-
-        assert len(outputs) == 1
-        y_out = outputs[0]
-        assert tuple(y_out.shape) == (_RUNTIME_M, _RUNTIME_N)
-        assert y_out.dtype == torch.bfloat16
-        assert y_out.device.type == "npu"
 
 
 def test_gmm_layered_device_group_list_meta(gmm_runtime: ModuleType) -> None:
