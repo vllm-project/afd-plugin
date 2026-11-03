@@ -25,6 +25,8 @@ def registration(monkeypatch, request):
             "DeepseekV4ForCausalLM",
             "Qwen3MoeForCausalLM",
             "Qwen3_5MoeForConditionalGeneration",
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
         )
     }
     models = dict(native)
@@ -112,6 +114,14 @@ def test_register_afd_preserves_native_models_and_is_idempotent(registration):
         "AFDQwen3_5MoeForConditionalGeneration": (
             "afd_plugin.model_executor.models.qwen3_5:"
             "AFDQwen3_5MoeForConditionalGeneration"
+        ),
+        "AFDMiniMaxM3SparseForCausalLM": (
+            "afd_plugin.model_executor.models.npu.minimax_m3:"
+            "AFDMiniMaxM3SparseForCausalLM"
+        ),
+        "AFDMiniMaxM3SparseForConditionalGeneration": (
+            "afd_plugin.model_executor.models.npu.minimax_m3:"
+            "AFDMiniMaxM3SparseForConditionalGeneration"
         ),
     }
     registration.plugin.register_afd()
