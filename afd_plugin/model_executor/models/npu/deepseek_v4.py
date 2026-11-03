@@ -62,7 +62,7 @@ if TYPE_CHECKING:
         AscendW4A8DynamicFusedMoEMethod,
     )
 
-    from afd_plugin.model_executor.npu.async_cam_w4a8 import W4A8LayerWeights
+    from afd_plugin.model_executor.npu.async_cam_layered import LayeredFFNWeights
 
 
 _ATTENTION_ROLE = "attention"
@@ -726,8 +726,8 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         prepare_attention_gate_w8a8_scales(self.model.layers)
         # ### PATCH END: retain FFN gate-on-A W8A8 scales after quant finalize
 
-    def get_async_cam_w4a8_layers(self) -> "tuple[list[W4A8LayerWeights], str]":
-        return _extract_async_cam_w4a8_layers(self.model.layers)
+    def get_async_cam_layered_weights(self) -> "tuple[list[LayeredFFNWeights], str]":
+        return _extract_async_cam_layered_weights(self.model.layers)
 
     def compute_ffn_output(
         self,
@@ -771,14 +771,14 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         return loaded
 
 
-def _extract_async_cam_w4a8_layers(
+def _extract_async_cam_layered_weights(
     layers: Iterable[AFDDeepseekV4DecoderLayer],
-) -> "tuple[list[W4A8LayerWeights], str]":
+) -> "tuple[list[LayeredFFNWeights], str]":
     """Expose loaded DeepSeek V4 routed-expert weights to the layered executor."""
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm_ascend.quantization.quant_type import QuantType
 
-    from afd_plugin.model_executor.npu.async_cam_w4a8 import W4A8LayerWeights
+    from afd_plugin.model_executor.npu.async_cam_layered import LayeredFFNWeights
 
     layers = [layer for layer in layers if layer.is_moe_layer]
     # Only the FFN role exposes loaded experts; Ascend's factory returns its
@@ -786,8 +786,9 @@ def _extract_async_cam_w4a8_layers(
     quant_types = {
         cast("AscendMoERunner", layer.mlp.experts).quant_type for layer in layers
     }
-    if quant_types != {QuantType.W4A8}:
-        return [], f"non-W4A8 or mixed quantization: {quant_types}"
+    if quant_types not in ({QuantType.W4A8}, {QuantType.W8A8}):
+        return [], f"requires homogeneous W4A8 or W8A8 quantization: {quant_types}"
+    is_w4a8 = quant_types == {QuantType.W4A8}
     weights = []
     for layer in layers:
         moe = cast("native.DeepseekV4MoE", layer.mlp)
@@ -806,42 +807,48 @@ def _extract_async_cam_w4a8_layers(
                 f"layered GMM layer {layer.layer_idx}: "
                 "shared experts must run on Attention"
             )
-        for name in (
+        required_parameters: tuple[str, ...] = (
             "w13_weight",
             "w2_weight",
             "w13_weight_scale",
             "w2_weight_scale",
-            "w13_scale_bias",
-            "w2_scale_bias",
-        ):
+        )
+        if is_w4a8:
+            required_parameters += ("w13_scale_bias", "w2_scale_bias")
+        for name in required_parameters:
             if owner._parameters.get(name) is None:
                 raise ValueError(
                     f"layered GMM layer {layer.layer_idx}: missing loaded {name}"
                 )
         weights.append(
-            W4A8LayerWeights(
+            LayeredFFNWeights(
                 layer_idx=layer.layer_idx,
                 # The presence checks above establish these dynamically
                 # registered parameters as loaded tensors on the routed owner.
                 w13=cast(torch.Tensor, owner.w13_weight),
                 w2=cast(torch.Tensor, owner.w2_weight),
-                w13_scale=cast(torch.Tensor, owner.w13_weight_scale),
+                w13_scale=cast(
+                    torch.Tensor,
+                    owner.w13_weight_scale if is_w4a8 else owner.w13_weight_scale_fp32,
+                ),
                 w2_scale=cast(torch.Tensor, owner.w2_weight_scale),
-                w13_bias=cast(torch.Tensor, owner.w13_scale_bias),
-                w2_bias=cast(torch.Tensor, owner.w2_scale_bias),
-                per_channel=cast(
+                w13_bias=cast(torch.Tensor, owner.w13_scale_bias) if is_w4a8 else None,
+                w2_bias=cast(torch.Tensor, owner.w2_scale_bias) if is_w4a8 else None,
+                per_channel=not is_w4a8
+                or cast(
                     "AscendW4A8DynamicFusedMoEMethod",
                     cast("AscendFusedMoEMethod", owner.quant_method).quant_method,
                 ).is_per_channel_weight,
                 swiglu_limit=float(cast("float | None", moe.swiglu_limit) or 0.0),
                 # DSV4 already applies routed scaling in Attention top-k.
                 routed_scaling_factor=1.0,
+                quantization="W4A8" if is_w4a8 else "W8A8",
             )
         )
     # One layered call shares static geometry, quantization, and scaling
     # across every selectable layer; heterogeneous layers use the legacy path.
     if any(weight.signature() != weights[0].signature() for weight in weights):
-        return [], "heterogeneous W4A8 geometry, quantization or model semantics"
+        return [], "heterogeneous expert geometry, quantization or model semantics"
     return weights, ""
 
 

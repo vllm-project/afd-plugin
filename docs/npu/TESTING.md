@@ -92,11 +92,11 @@ Run the CPU contract and path-selection tests first:
 
 ```bash
 pytest -q tests/unit/test_envs.py \
-  tests/unit/model_executor/test_async_cam_w4a8.py
+  tests/unit/model_executor/test_async_cam_layered.py
 ```
 
 In an environment with matching CANN and torch-npu versions, rebuild the AFD
-extension and run the device suites. All three need one device and issue no
+extension and run the device suites. All four need one device and issue no
 collective:
 
 ```bash
@@ -105,15 +105,17 @@ SOC_VERSION=910c pytest -q tests/unit/compat/npu/test_gmm_swiglu_quant_v2_layere
 AFD_RUN_ASCEND_OP_RUNTIME=1 SOC_VERSION=910c LOCAL_RANK=0 \
   pytest -o addopts= -v -ra -s \
   tests/npu/test_async_cam_layered_w4a8.py \
+  tests/npu/test_async_cam_layered_w8a8.py \
   tests/npu/test_gmm_swiglu_quant_v2_layered_precision.py \
   tests/npu/test_gmm_layered_device_group_list.py
 ```
 
-The three device suites answer different questions and none is redundant:
+The four device suites answer different questions and none is redundant:
 
 | Suite | Operator | Covers |
 | --- | --- | --- |
-| `test_async_cam_layered_w4a8.py` | W13 then W2 | The `AsyncCAMW4A8Executor` chain, 16 cases |
+| `test_async_cam_layered_w4a8.py` | W13 then W2 | The `AsyncCAMLayeredExecutor` chain, 16 cases |
+| `test_async_cam_layered_w8a8.py` | W13 then W2 | Native W8A8 reference, device layer selection, sparse/empty/capacity rows, exact eager/FULL replay |
 | `test_gmm_swiglu_quant_v2_layered_precision.py` | W13 | Both quantization scenarios against a reference, 11 cases |
 | `test_gmm_layered_device_group_list.py` | W2 | A device-produced group list, both scenarios, 4 cases |
 
