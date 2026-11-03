@@ -99,13 +99,18 @@ aclnnStatus aclnnGroupedMatmulSwigluQuantV2LayeredGetWorkspaceSize(
     const aclTensorList *allWeightAssistMatrix, const aclTensor *bias, const aclTensor *xScale,
     const aclTensor *smoothScale, const aclTensor *groupList, const aclTensor *layerIndex, int64_t dequantMode,
     int64_t dequantDtype, int64_t quantMode, int64_t groupListType, const aclIntArray *tuningConfigOptional,
+    double swigluLimit,
     aclTensor *output, aclTensor *outputScale, uint64_t *workspaceSize, aclOpExecutor **executor)
 {
     OP_CHECK_COMM_INPUT(workspaceSize, executor);
     L2_DFX_PHASE_1(aclnnGroupedMatmulSwigluQuantV2Layered,
-                   DFX_IN(x, allWeight, allWeightScale, xScale, groupList, layerIndex), DFX_OUT(output, outputScale));
+                   DFX_IN(x, allWeight, allWeightScale, xScale, groupList, layerIndex, swigluLimit),
+                   DFX_OUT(output, outputScale));
     CHECK_COND((output != nullptr), ACLNN_ERR_PARAM_INVALID,
                "Expected a proper Tensor but got null for argument output.");
+    CHECK_COND(std::isfinite(swigluLimit) && swigluLimit >= 0.0 &&
+                   swigluLimit <= std::numeric_limits<float>::max(),
+               ACLNN_ERR_PARAM_INVALID, "swiglu_limit must be finite, nonnegative and representable as float32.");
     // layered: the layer id is validated here, against the caller's logical shape, so that both the
     // A8W4/A4W4 handler and the A8W8 fusion template are covered by one check (see CheckLayerIndex).
     CHECK_COND(CheckLayerIndex(layerIndex) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID, "Invalid layer_index.");
@@ -123,7 +128,10 @@ aclnnStatus aclnnGroupedMatmulSwigluQuantV2LayeredGetWorkspaceSize(
             .SetBias(bias)
             .SetScenario()
             .SetTuningConfig(tuningConfigOptional)
+            .SetSwigluLimit(swigluLimit)
             .Build();
+    CHECK_COND(swigluLimit == 0.0 || params.isA8W4 || params.isA4W4,
+               ACLNN_ERR_PARAM_INVALID, "positive swiglu_limit supports A8W4/A4W4 only.");
 
     // Call the common interface
     return aclnnGroupedMatmulSwigluQuantGetWorkspaceSizeCommon(__FUNCTION__, params, workspaceSize, executor);

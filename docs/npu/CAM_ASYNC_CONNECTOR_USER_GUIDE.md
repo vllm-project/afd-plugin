@@ -349,10 +349,10 @@ per-group weights.
 Shared experts remain on Attention. DSV4 applies routed scaling in top-k, so
 FFN does not apply it again.
 
-The graph change preserves the existing layered arithmetic: `swiglu_limit` is
-recorded but is not applied by layered W13. Ordinary eager may apply it, so
-FULL must be compared with corresponding layered eager, not treated as a fix
-for their pre-existing difference. FULL reuses the existing native DR and CS operators. See
+Layered W13 applies the model's `swiglu_limit` in both eager and FULL execution.
+For positive `L`, it computes `SiLU(min(gate, L)) * clamp(up, -L, L)` before
+quantization; zero keeps clipping disabled. This restores DeepSeek-V4's configured
+limit of `10.0`. FULL reuses the existing native DR and CS operators. See
 [resource lifetime](ASYNC_FFN_RUNTIME.md#resource-lifetime) for completion and
 process-cleanup requirements.
 Missing `w13_scale_bias` or `w2_scale_bias`, dynamic EPLB, non-SiLU

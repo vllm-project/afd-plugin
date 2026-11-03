@@ -411,12 +411,11 @@ class AsyncNPUFFNModelRunner:
                     logger.info(
                         "AFD_ASYNC_CAM_LAYERED_GMM requested=1 actual=layered "
                         "quant=W4A8 layers=%d mode=%s layer_mapping=%s "
-                        "swiglu_limit=%s ignored=%s",
+                        "swiglu_limit=%s",
                         len(layers),
                         "per-channel" if layers[0].per_channel else "per-group",
                         self._layered_executor.layer_id_to_slot is not None,
                         layers[0].swiglu_limit,
-                        layers[0].swiglu_limit != 0.0,
                     )
                     return
         logger.info(

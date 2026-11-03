@@ -70,8 +70,7 @@ class AsyncCAMW4A8Executor:
         self.w13_bias = [layer.w13_bias for layer in layers]
         self.w2_bias = [layer.w2_bias for layer in layers]
         self.per_channel = first.per_channel
-        # Retain the declared model value in the static signature only.
-        # Like main, the layered operator does not apply this activation limit.
+        # The model activation limit is static across these homogeneous layers.
         self.swiglu_limit = first.swiglu_limit
         self.output_dtype = first.output_dtype
         self.routed_scaling_factor = first.routed_scaling_factor
@@ -196,6 +195,7 @@ class AsyncCAMW4A8Executor:
             dequant_mode=0 if self.per_channel else 1,
             quant_mode=0,
             group_list_type=1,
+            swiglu_limit=self.swiglu_limit,
         )
         output = self.w2_op(
             [activation],
