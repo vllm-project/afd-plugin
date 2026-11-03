@@ -29,10 +29,11 @@ use `--enforce-eager`. Unsupported FULL configurations and mismatched transport
 parameters fail startup; there is no automatic eager fallback. Piecewise and
 decode-only graph modes are rejected.
 
-DeepSeek-V4 DSpark uses one W4A8 or W8A8 Layered table for target and draft
-routed experts and requires eager execution on both A and F
-(`--enforce-eager`). Target and draft must share the same quantization
-and tensor layout. See the
+DeepSeek-V4 DSpark uses this same F graph for target and draft routed experts.
+The combined layer table and startup agreement cover target0–42/draft43–45;
+all layers must share the same W4A8 or W8A8 layout. Native P loads the complete
+draft model. Target/draft Attention and the native speculative configuration
+remain eager. DSpark excludes DBO and FFN two-stream; see the
 [DSpark recipe](../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md).
 
 W8A8 reuses the loaded INT8 NZ weights, FP32 W13 scales and BF16 W2 scales.

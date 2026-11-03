@@ -56,6 +56,11 @@ def assert_dispatch(before: dict, after: dict) -> None:
         assert not state["owns_attention"] and not state["owns_shared_experts"], state
         if state["ffn_execution"] == "layered":
             assert state["executor_layer_ids"] == list(range(46)), state
+        if state["ffn_mode"] == "full":
+            assert state["graph_capture_count"] == 1, state
+            assert state["graph_replay_count"] > before[name]["graph_replay_count"], (
+                state
+            )
         required_layers = (
             range(46) if state["ffn_execution"] == "layered" else (43, 44, 45)
         )
