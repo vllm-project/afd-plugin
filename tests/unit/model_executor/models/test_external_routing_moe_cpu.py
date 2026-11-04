@@ -35,7 +35,9 @@ _MODULE_PATH = (
     / "npu"
     / "external_routing_moe.py"
 )
-_ROUTING_PATH = _REPO_ROOT / "afd_plugin" / "connectors" / "npu" / "external_routing.py"
+_ROUTING_PATH = (
+    _REPO_ROOT / "afd_plugin" / "connectors" / "npu" / "camp2p" / "external_routing.py"
+)
 
 
 class _MoECommType:
@@ -154,7 +156,7 @@ def _install_stub_modules():
         max_tokens_across_pcp=0,
     )
 
-    afd_routing = types.ModuleType("afd_plugin.connectors.npu.external_routing")
+    afd_routing = types.ModuleType("afd_plugin.connectors.npu.camp2p.external_routing")
     afd_routing.AFDExternalRoutingInputs = routing_module.AFDExternalRoutingInputs
 
     modules = {
@@ -177,7 +179,7 @@ def _install_stub_modules():
         "afd_plugin": types.ModuleType("afd_plugin"),
         "afd_plugin.connectors": types.ModuleType("afd_plugin.connectors"),
         "afd_plugin.connectors.npu": types.ModuleType("afd_plugin.connectors.npu"),
-        "afd_plugin.connectors.npu.external_routing": afd_routing,
+        "afd_plugin.connectors.npu.camp2p.external_routing": afd_routing,
     }
     for name, module in modules.items():
         sys.modules[name] = module

@@ -31,7 +31,9 @@ from vllm_ascend.ops.fused_moe.prepare_finalize import (
 )
 from vllm_ascend.quantization.quant_type import QuantType
 
-from afd_plugin.connectors.npu.external_routing import AFDExternalRoutingInputs
+from afd_plugin.connectors.npu.camp2p.external_routing import (
+    AFDExternalRoutingInputs,
+)
 
 
 class AFDPrepareAndFinalizeWithAllGather(PrepareAndFinalizeWithAllGather):
