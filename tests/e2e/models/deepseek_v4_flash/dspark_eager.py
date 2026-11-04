@@ -3,6 +3,7 @@
 """Check an already running DSpark service; save every raw response.
 
 Use the recipe's worker extensions and --evidence-dir for ownership/dispatch checks.
+Add --verify-graph-numerics for complete per-rank graph/eager comparisons.
 Omit it to run the same request cases against a native DSpark baseline.
 """
 
@@ -48,8 +49,8 @@ def worker_records(directory: Path) -> dict:
     }
 
 
-def assert_dispatch(before: dict, after: dict) -> None:
-    assert len(after) == 4, after
+def assert_dispatch(before: dict, after: dict, ffn_ranks: int = 4) -> None:
+    assert len(after) == ffn_ranks and set(after) == set(before), after
     for name, state in after.items():
         assert state["draft_wire_layer_ids"] == [43, 44, 45], state
         assert state["owns_routed_experts"], state
@@ -70,6 +71,38 @@ def assert_dispatch(before: dict, after: dict) -> None:
             assert state["submitted_returns"].get(key, 0) > old, (name, layer, state)
 
 
+def assert_graph_numerics(directory: Path, workers: dict) -> dict:
+    proofs = worker_records(directory / "graph-proof")
+    assert set(proofs) == set(workers), (
+        "graph numerical rank coverage",
+        sorted(workers),
+        sorted(proofs),
+    )
+    for name, state in workers.items():
+        proof = proofs[name]
+        assert proof["rank"] == state["rank"], (name, proof)
+        assert state["ffn_mode"] == proof["mode"] == "full", (name, proof)
+        assert proof["capture_count"] == 1 and proof["replay_count"] > 0, (name, proof)
+        assert proof["submission_unit"] == 1, (name, proof)
+        expected = set(state["executor_layer_ids"])
+        draft = set(state["draft_wire_layer_ids"])
+        assert draft and draft < expected, (name, "target/draft layer table", state)
+        records = proof["records"]
+        layers = [record["layer"] for record in records]
+        assert proof["complete"] is True and set(layers) == expected, (
+            name,
+            "graph numerical layer coverage",
+            sorted(expected - set(layers)),
+            layers,
+        )
+        assert len(layers) == len(expected), (name, "duplicate graph numerical layers")
+        for record in records:
+            assert record["rows"] > 0, (name, "empty numerical comparison", record)
+            if record["bitwise_equal"] is not True or record["max_abs_error"] != 0:
+                raise ValueError(f"{name}: graph/eager numerical mismatch: {record}")
+    return proofs
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:7100")
@@ -78,15 +111,31 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument("--attention-dp", type=int, default=1)
+    parser.add_argument("--ffn-ranks", type=int, default=4)
+    parser.add_argument(
+        "--verify-graph-numerics",
+        action="store_true",
+        help="Require complete graph/eager comparisons on every FFN rank",
+    )
     parser.add_argument("--pd", action="store_true", help="Use single-prompt PD cases")
     args = parser.parse_args()
+    if args.ffn_ranks < 1:
+        parser.error("--ffn-ranks must be positive")
+    if args.verify_graph_numerics and args.evidence_dir is None:
+        parser.error("--verify-graph-numerics requires --evidence-dir")
     control = args.control_url or args.url
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
+    save(output / "result.json", {"passed": False})
+    verify_graph_numerics = args.verify_graph_numerics or (
+        args.evidence_dir is not None
+        and (args.evidence_dir / "graph-proof" / "enable").is_file()
+    )
+    graph_proofs = {}
     before = {}
     if args.evidence_dir is not None:
         before = worker_records(args.evidence_dir)
-        assert len(before) == 4, before
+        assert len(before) == args.ffn_ranks, before
         save(output / "ffn-before.json", before)
         attention = post(
             control,
@@ -212,16 +261,25 @@ def main() -> None:
         while True:
             after = worker_records(args.evidence_dir)
             try:
-                assert_dispatch(before, after)
+                assert_dispatch(before, after, args.ffn_ranks)
+                if verify_graph_numerics:
+                    graph_proofs = assert_graph_numerics(args.evidence_dir, after)
                 break
             except AssertionError:
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(0.5)
         save(output / "ffn-after.json", after)
+    if verify_graph_numerics:
+        save(output / "graph-proof.json", graph_proofs)
     save(
         output / "result.json",
-        {"passed": True, "draft_rounds": drafts, "accepted_tokens": accepted},
+        {
+            "passed": True,
+            "draft_rounds": drafts,
+            "accepted_tokens": accepted,
+            "graph_numerics_verified": verify_graph_numerics,
+        },
     )
     print("DSpark eager functional checks passed", flush=True)
 

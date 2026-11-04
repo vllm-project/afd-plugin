@@ -151,7 +151,8 @@ to register the upstream connector.
 ```bash
 python3 tests/e2e/models/deepseek_v4_flash/dspark_eager.py \
   --url http://127.0.0.1:7100 \
-  --output-dir /absolute/path/to/dspark-results --attention-dp "$NUM_A"
+  --output-dir /absolute/path/to/dspark-results \
+  --attention-dp "$NUM_A" --ffn-ranks "$NUM_F"
 ```
 
 For a native PD deployment, point `--url` at its proxy and add
@@ -173,7 +174,15 @@ on F and the ordinary evidence extension on A. After startup, create
 `$AFD_DSPARK_EVIDENCE_DIR/graph-proof` and its empty `enable` marker. This functional-only
 extension submits one replay per completion fence and compares each completed
 layer with the original layered eager tables, saving inputs and outputs. It
-also checks capture/replay and dispatch evidence. Run ordinary bounded-group
+also collects capture/replay and dispatch evidence. Add `--evidence-dir` and
+`--verify-graph-numerics` to the checker command. The checker requires complete
+target/draft layer coverage and successful nonempty bitwise comparisons on every
+declared F rank before reporting success. Missing or incomplete evidence fails
+after the bounded evidence wait; a numerical mismatch fails immediately.
+The `graph-proof/enable` marker also enables this validation automatically.
+Use a fresh evidence directory for each deployment. The checker copies the
+validated records to `graph-proof.json` in its output directory and records
+`graph_numerics_verified` in `result.json`. Run ordinary bounded-group
 liveness checks and every performance comparison without either extension.
 
 For a layered/reference FFN performance comparison, keep DSpark enabled on P,
