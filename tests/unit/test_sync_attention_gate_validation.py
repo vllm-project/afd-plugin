@@ -18,7 +18,6 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from afd_plugin import validation
-from afd_plugin.validation import _fail_if_unsupported_sync_gate_runtime
 
 
 def _runner_config(*, enable_dbo=False, use_ubatching=False):

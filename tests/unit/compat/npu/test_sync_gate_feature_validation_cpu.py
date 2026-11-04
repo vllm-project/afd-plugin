@@ -1,3 +1,4 @@
+# mypy: disable-error-code="attr-defined, name-defined"
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """CPU coverage for the sync gate-on-Attention feature contract.
@@ -119,12 +120,14 @@ def test_gate_on_ffn_keeps_its_previous_behaviour(extra_info):
 
     assert extra_info.validated == 1
 
-def _real_extra_info():
-    """The connector's own type, which needs vLLM to import.
 
-    ``camp2p`` pulls ``vllm.forward_context`` at module scope, so this file can only reach the
-    real class where vLLM is installed. The validator cases above keep using a stand-in and
-    run everywhere; these two cover the class itself and skip on a bare CPU host.
+def _real_extra_info():
+    """The connector's own type; importing it needs vLLM.
+
+    ``camp2p`` pulls ``vllm.forward_context`` at module scope, so the real
+    class is only reachable where vLLM is installed. The validator cases
+    above use a stand-in and run everywhere; these two cover the class
+    itself and skip on a bare CPU host.
     """
 
     pytest.importorskip("torch")
@@ -137,12 +140,15 @@ def _real_extra_info():
 def test_a_connector_level_gate_flag_does_not_block():
     """The switch is read from ``afd``; the connector-local copy has no say.
 
-    Regression test for a rejection that used to live in ``validate_supported``: a supported
-    shape was refused at startup whenever the flag also appeared under
-    ``connector_extra_config``.
+    Regression test for a rejection that used to live in ``validate_supported``: a
+    supported
+        shape was refused at startup whenever the flag also appeared under
+        ``connector_extra_config``.
     """
 
-    _real_extra_info().from_mapping({"compute_gate_on_attention": True}).validate_supported()
+    _real_extra_info().from_mapping(
+        {"compute_gate_on_attention": True}
+    ).validate_supported()
 
 
 def test_quant_mode_is_still_rejected():
