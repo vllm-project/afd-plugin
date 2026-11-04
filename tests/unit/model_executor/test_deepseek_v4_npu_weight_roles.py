@@ -220,3 +220,49 @@ def test_async_shared_weights_follow_attention_for_checkpoint_and_runtime_names(
         attention_shared_experts=True,
     ) == frozenset({"attention"})
     assert _checkpoint_weight_roles(name) == frozenset({"ffn"})
+
+
+# The sync connector now moves the shared experts to Attention too, driven by
+# compute_gate_on_attention rather than the connector name. Both connectors share
+# one ownership rule, so the same flag must move the same weights.
+@pytest.mark.parametrize("stage", ["ffn", "mlp"])
+@pytest.mark.parametrize(
+    "remainder",
+    [
+        "shared_experts.gate_proj.weight",
+        "shared_experts.down_proj.weight_scale",
+    ],
+)
+def test_sync_shared_weights_follow_attention_when_attention_owns_the_gate(
+    stage,
+    remainder,
+):
+    name = f"model.layers.0.{stage}.{remainder}"
+    # Sync gate-on-Attention passes attention_shared_experts=True.
+    assert _checkpoint_weight_roles(
+        name,
+        attn_owns_gate=True,
+        attention_shared_experts=True,
+    ) == frozenset({"attention"})
+
+
+@pytest.mark.parametrize("stage", ["ffn", "mlp"])
+def test_routed_experts_stay_on_ffn_for_the_sync_gate_configuration(stage):
+    """Only the shared experts move; the routed experts stay where they are computed."""
+
+    name = f"model.layers.0.{stage}.experts.0.gate_proj.weight"
+    assert _checkpoint_weight_roles(
+        name,
+        attn_owns_gate=True,
+        attention_shared_experts=True,
+    ) == frozenset({"ffn"})
+
+
+def test_gate_weights_reach_both_roles_when_attention_owns_the_gate():
+    """The FFN MoE still builds its own gate, so both roles register the weights."""
+
+    assert _checkpoint_weight_roles(
+        "model.layers.0.ffn.gate.weight",
+        attn_owns_gate=True,
+        attention_shared_experts=True,
+    ) == frozenset({"attention", "ffn"})

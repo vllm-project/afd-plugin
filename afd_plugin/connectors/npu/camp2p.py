@@ -27,7 +27,11 @@ from vllm.forward_context import DPMetadata, get_forward_context
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from afd_plugin.compat.npu import ensure_cam_p2p_ops_available
+from afd_plugin.compat.npu import (
+    a2e_accepts_mxfp8_arguments,
+    ensure_cam_p2p_ops_available,
+)
+from afd_plugin.envs import A2E_QUANT_MODE_BF16, A2E_QUANT_MODE_MXFP8
 from afd_plugin.config import AFDConfig
 from afd_plugin.config_utils import (
     coerce_extra_bool,
@@ -74,6 +78,46 @@ _CAMP2P_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
 )
 
 
+# A2E transport quantization modes the operator understands. ``BF16`` is the original
+# five-output contract; ``MXFP8`` moves a pre-quantized E4M3 activation plus its E8M0 MX
+# scale, so the FFN side never dequantizes on the way in.
+_A2E_QUANT_MODES: Final[frozenset[int]] = frozenset(
+    (A2E_QUANT_MODE_BF16, A2E_QUANT_MODE_MXFP8)
+)
+
+#: MX block size the A2E MXFP8 contract is defined against; the scale row is
+#: ``ceil(hidden_size / group)`` wide.
+A2E_MX_GROUP_SIZE: Final[int] = 32
+
+#: Activation dtype carried end to end in MXFP8 mode.
+_A2E_MX_ACTIVATION_DTYPE: Final[torch.dtype] = torch.float8_e4m3fn
+
+#: Scale dtype the A2E operator validates. This is the PyTorch dtype, not the torch_npu
+#: ScalarType enum, because the operator schema is expressed in torch dtypes.
+_A2E_MX_SCALE_DTYPE: Final[torch.dtype] = torch.float8_e8m0fnu
+
+#: Topology the A5 A2E MXFP8 transport contract is defined for.
+A2E_MX_MAX_TOTAL_RANKS: Final[int] = 64
+
+#: Neutral E8M0 exponent: byte 127 encodes 2**0, which leaves a zeroed activation row at
+#: zero. Padding with byte 0 would scale it by 2**-127 instead.
+_E8M0_NEUTRAL_BYTE: Final[int] = 127
+
+#: The MXFP8 path issues more blocks per rank than the BF16 one, so the AIV core count has a
+#: floor. It applies only to ``quant_mode=4``.
+_A2E_MX_MIN_AIV_NUM: Final[int] = 3
+
+
+def _check_quant_mode(quant_mode: int) -> None:
+    """Reject an A2E transport mode the runtime does not implement."""
+
+    if quant_mode not in _A2E_QUANT_MODES:
+        raise ValueError(
+            "AFD NPU runtime supports quant_mode 0 (BF16) or 4 (MXFP8 A2E), "
+            f"got {quant_mode}",
+        )
+
+
 @dataclass(frozen=True)
 class CAMP2PExtraInfo(ConnectorExtraInfo):
     """Typed CAMP2P connector configuration.
@@ -84,7 +128,10 @@ class CAMP2PExtraInfo(ConnectorExtraInfo):
         ffn_core_num: Optional FFN-role override for ``core_num``.
         compute_gate_on_attention: Whether Attention computes MoE gate outputs.
         hccl_buffer_size: Optional buffer size in MB for CAMP2P HCCL domains.
-        quant_mode: CAM quantization mode; the current runtime supports only 0.
+        quant_mode: A2E transport quantization. ``0`` keeps the original BF16
+            activation; ``4`` carries a pre-quantized FP8 activation plus its E8M0 MX
+            scale. Both roles must be configured the same way; only this side's value
+            is checked here, since there is no cross-rank consistency detection.
     """
 
     core_num: int = 8
@@ -92,7 +139,7 @@ class CAMP2PExtraInfo(ConnectorExtraInfo):
     ffn_core_num: int | None = None
     compute_gate_on_attention: bool = False
     hccl_buffer_size: int | None = None
-    quant_mode: int = 0
+    quant_mode: int = A2E_QUANT_MODE_BF16
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> CAMP2PExtraInfo:
@@ -133,10 +180,13 @@ class CAMP2PExtraInfo(ConnectorExtraInfo):
                 field_name="hccl_buffer_size",
             ),
             quant_mode=coerce_extra_int(
-                raw.get("quant_mode", 0),
+                raw.get("quant_mode", A2E_QUANT_MODE_BF16),
                 field_name="quant_mode",
             ),
         )
+
+    def __post_init__(self) -> None:
+        _check_quant_mode(self.quant_mode)
 
     def aiv_num_for_role(self, role: str) -> int:
         if role == "attention" and self.attn_core_num is not None:
@@ -146,12 +196,11 @@ class CAMP2PExtraInfo(ConnectorExtraInfo):
         return self.core_num
 
     def validate_supported(self) -> None:
-        if self.compute_gate_on_attention:
-            raise RuntimeError(
-                "AFD NPU runtime does not support compute_gate_on_attention=true yet",
-            )
-        if self.quant_mode != 0:
-            raise RuntimeError("AFD NPU runtime currently supports only quant_mode=0")
+        # The gate switch is read from ``additional_config["afd"]``; the copy in
+        # ``connector_extra_config`` is parsed for compatibility and deliberately has no
+        # say here. feature_validation owns the supported shapes, so a second opinion in
+        # this class could only disagree with it.
+        _check_quant_mode(self.quant_mode)
 
     def to_mapping(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -308,6 +357,112 @@ def received_token_ids(
     return sim_expert_ids[:expected_tokens, 0].contiguous()
 
 
+def prepare_routing_transfer(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    expected_tokens: int,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack an Attention-side gate result for the A2E routing channel.
+
+    The A2E ids channel transports an ``int32`` ids tensor and a ``float32``
+    scales tensor of shape ``(batch, topk)``. It was opened to carry token
+    identity for a token-keyed router; a gate that ran on the Attention ranks
+    fills the same two slots with the routing it already computed, so the FFN
+    rank selects experts without running the gate a second time.
+
+    Args:
+        topk_ids: Expert indices chosen by the Attention-side gate, shaped
+            ``(tokens, topk)``.
+        topk_weights: Routing weights for those indices, same shape.
+        expected_tokens: Token count the transfer metadata declares.
+        top_k: Experts per token the operator is configured with. The wire
+            declares this column count, so a routing tensor of another width
+            would be read with the wrong stride.
+
+    Returns:
+        The ``(ids, scales)`` pair to hand to the operator, already in the
+        channel's ``int32`` and ``float32`` layouts.
+
+    Raises:
+        ValueError: If the routing tensors are not two-dimensional, disagree on
+            shape, do not describe exactly ``expected_tokens`` tokens, or their
+            column count differs from ``top_k``.
+    """
+
+    if topk_ids.dim() != 2 or topk_weights.dim() != 2:
+        raise ValueError(
+            "A2E routing transfer needs two-dimensional (tokens, topk) tensors, "
+            f"got shapes {tuple(topk_ids.shape)!r} and {tuple(topk_weights.shape)!r}",
+        )
+    if topk_ids.shape != topk_weights.shape:
+        raise ValueError(
+            "A2E routing transfer needs ids and weights of the same shape, got "
+            f"{tuple(topk_ids.shape)!r} and {tuple(topk_weights.shape)!r}",
+        )
+    if int(topk_ids.shape[1]) != top_k:
+        raise ValueError(
+            f"A2E routing transfer carries {int(topk_ids.shape[1])} experts per "
+            f"token but the operator is configured with k={top_k}",
+        )
+    num_tokens = int(topk_ids.shape[0])
+    if num_tokens != expected_tokens:
+        raise ValueError(
+            f"A2E routing transfer covers {num_tokens} tokens but the AFD "
+            f"transfer declares {expected_tokens}",
+        )
+    return (
+        topk_ids.to(dtype=torch.int32).contiguous(),
+        topk_weights.to(dtype=torch.float32).contiguous(),
+    )
+
+
+def received_routing(
+    sim_expert_ids: torch.Tensor,
+    sim_expert_scales: torch.Tensor,
+    *,
+    expected_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Trim the received routing channel to the tokens this FFN rank computes on.
+
+    The operator sizes the ids and scales outputs to the capacity it was given,
+    so rows past the FFN rank's token count are padding the MoE must not route.
+    Both tensors are sliced together so ids and weights stay aligned.
+
+    Args:
+        sim_expert_ids: The operator's ids output, shaped ``(N, topk)``.
+        sim_expert_scales: The operator's scales output, shaped ``(N, topk)``.
+            The channel reuses the scales slot for the routing weights.
+        expected_tokens: Token count derived from the FFN rank's DP metadata,
+            which is what the FFN compute will actually run on.
+
+    Returns:
+        The ``(topk_ids, topk_weights)`` pair restricted to ``expected_tokens``.
+
+    Raises:
+        ValueError: If either tensor arrives with fewer rows than the FFN rank
+            computes on, which would misroute tokens.
+    """
+
+    received_tokens = int(sim_expert_ids.shape[0])
+    if received_tokens < expected_tokens:
+        raise ValueError(
+            f"received {received_tokens} routing rows but the FFN rank computes "
+            f"on {expected_tokens} tokens; the routing channel is not aligned "
+            "with the FFN token layout",
+        )
+    if int(sim_expert_scales.shape[0]) < expected_tokens:
+        raise ValueError(
+            f"received {int(sim_expert_scales.shape[0])} routing scale rows but "
+            f"the FFN rank computes on {expected_tokens} tokens",
+        )
+    return (
+        sim_expert_ids[:expected_tokens].contiguous(),
+        sim_expert_scales[:expected_tokens].contiguous(),
+    )
+
+
 class CAMP2pAFDConnector(AFDConnectorBase):
     """Move model data between Attention and FFN workers on Ascend NPU.
 
@@ -378,11 +533,43 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         extra_info = cast(CAMP2PExtraInfo, self.extra_info)
         self.aiv_num = extra_info.aiv_num_for_role(afd_config.role)
         self.hccl_buffer_size_mb = extra_info.hccl_buffer_size
+        self.quant_mode = extra_info.quant_mode
+        if self.quant_mode == A2E_QUANT_MODE_MXFP8:
+            self._fail_if_mxfp8_transport_unsupported(afd_config.role)
         hf_config = vllm_config.model_config.hf_config
         self.hidden_size = hf_config.hidden_size
         self.num_experts_per_tok = hf_config.num_experts_per_tok
         self.num_routed_experts = hf_config.n_routed_experts
         self.control_plane = CAMP2pAFDControlPlane(self)
+
+    def _fail_if_mxfp8_transport_unsupported(self, role: str) -> None:
+        """Refuse the quantized transport at construction when it cannot work.
+
+        The check is limited to ``quant_mode=4``: the BF16 path keeps its previous behaviour
+        and does not require the operator to declare anything new. The operators are loaded
+        before the schema is read, so a build that registers on first use is not mistaken for
+        one that lacks the arguments.
+        """
+
+        if self.aiv_num < _A2E_MX_MIN_AIV_NUM:
+            raise RuntimeError(
+                f"A2E MXFP8 requires at least {_A2E_MX_MIN_AIV_NUM} AIV cores, got "
+                f"{self.aiv_num} for the {role} role",
+            )
+        accepted = a2e_accepts_mxfp8_arguments()
+        if accepted is False:
+            raise RuntimeError(
+                "A2E MXFP8 needs an a2e operator that accepts x_scale and quant_mode "
+                '(afd-plugin PR #444, "support MXFP8 datatype for A2E operator"); this '
+                "build does not provide one",
+            )
+        if accepted is None:
+            raise RuntimeError(
+                "A2E MXFP8 cannot confirm that the loaded a2e operator accepts x_scale and "
+                "quant_mode; refusing to enable the quantized transport rather than falling "
+                'back to BF16 (expected afd-plugin PR #444, "support MXFP8 datatype for A2E '
+                'operator")',
+            )
 
     @property
     def is_initialized(self) -> bool:
@@ -513,17 +700,22 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             hidden_states: Model data with shape ``(tokens, hidden_size)``.
             context: Transfer context whose ``metadata`` supplies the layer
                 number, ubatch number, and token count for this transfer.
-            **kwargs: An optional token-aligned ``input_ids`` tensor. When it is
-                supplied, the transfer runs with ``compute_gate=1`` so the ids
-                reach the FFN rank through the operator's ids channel, and the
-                matching ``recv_attn_output(recv_input_ids=True)`` returns them
-                on the payload's ``input_ids`` field.
+            **kwargs: Either an optional token-aligned ``input_ids`` tensor or an
+                optional ``routing`` pair ``(topk_ids, topk_weights)`` produced
+                by an Attention-side gate; at most one may be supplied because
+                they share the operator's ids channel. Either one makes the
+                transfer run with ``compute_gate=1``, and the matching
+                ``recv_attn_output(recv_input_ids=True)`` or
+                ``recv_attn_output(recv_routing=True)`` reads the slot back. In
+                MXFP8 mode (``quant_mode=4``) the activation is quantized here and
+                travels with its E8M0 MX scale; the BF16 call is unchanged.
 
         Raises:
             RuntimeError: If the communication groups are not ready.
             ValueError: If the number of tokens in ``hidden_states`` does not
-                match ``context.metadata`` outside a ``torch.compile`` trace, or
-                if a supplied ``input_ids`` tensor is malformed.
+                match ``context.metadata`` outside a ``torch.compile`` trace, if
+                both wire-slot payloads were supplied, or if a supplied
+                ``input_ids``/``routing`` value is malformed.
         """
         if not self._initialized:
             raise RuntimeError("CAMP2P connector is not initialized")
@@ -536,6 +728,15 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 f"CAMP2P metadata token count {metadata.total_tokens}",
             )
         input_ids = cast(torch.Tensor | None, kwargs.get("input_ids"))
+        routing = cast(
+            tuple[torch.Tensor, torch.Tensor] | None,
+            kwargs.get("routing"),
+        )
+        if input_ids is not None and routing is not None:
+            raise ValueError(
+                "CAMP2P send cannot put both token ids and Attention-side "
+                "routing on the operator's ids channel",
+            )
         expert_ids: torch.Tensor | None = None
         expert_scales: torch.Tensor | None = None
         compute_gate = 0
@@ -544,6 +745,14 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 input_ids,
                 topk=self.num_experts_per_tok,
                 expected_tokens=metadata.total_tokens,
+            )
+            compute_gate = 1
+        elif routing is not None:
+            expert_ids, expert_scales = prepare_routing_transfer(
+                routing[0],
+                routing[1],
+                expected_tokens=metadata.total_tokens,
+                top_k=self.num_experts_per_tok,
             )
             compute_gate = 1
         transfer_state = CAMP2PTransferState(
@@ -572,6 +781,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             compute_gate,
             expert_ids,
             expert_scales,
+            self.quant_mode,
         )
         return None
 
@@ -631,27 +841,46 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 number needed to create it. ``recv_input_ids`` states that this
                 FFN rank expects token ids on the transfer, which selects the
                 operator's ids mode and makes the connector validate and expose
-                the operator's ids slot on the payload. The sending rank has to
-                select the same mode, so only request ids for a run whose
-                Attention role transports them.
+                the operator's ids slot on the payload. ``recv_routing`` states
+                that the same slot carries an Attention-side gate result
+                instead, exposed as ``topk_ids``/``topk_weights``. The two are
+                mutually exclusive because they share one wire slot, and the
+                sending rank has to select the matching mode.
 
         Returns:
             The received hidden states, the information FFN needs to process them
-            and send the result back, and the transported ``input_ids`` when the
-            ids mode was selected.
+            and send the result back, and whichever of the transported
+            ``input_ids`` or gate result the selected mode carries.
 
         Raises:
             RuntimeError: If communication is not ready, transfer information
                 is missing, or the requested ubatch group does not exist.
-            ValueError: If ids were requested but do not align with the FFN
-                rank's token layout.
+            ValueError: If both wire-slot modes were requested, or if the
+                transported slot does not align with the FFN rank's token
+                layout.
         """
         if not self._initialized:
             raise RuntimeError("CAMP2P connector is not initialized")
         layer_idx: int = kwargs.get("layer_idx", 0)
         max_num_tokens: int = kwargs.get("max_num_tokens", 0)
         recv_input_ids: bool = bool(kwargs.get("recv_input_ids", False))
-        compute_gate_mode = 1 if recv_input_ids else 0
+        recv_routing: bool = bool(kwargs.get("recv_routing", False))
+        if recv_input_ids and recv_routing:
+            raise ValueError(
+                "CAMP2P receive cannot read the wire slot as both token ids and "
+                "Attention-side routing; request exactly one",
+            )
+        if self.quant_mode == A2E_QUANT_MODE_MXFP8 and not recv_routing:
+            # Direct pass-through only: the Attention side computed the routing, so nothing
+            # here reads the activation except the MoE, which takes the quantized form
+            # together with its scale. The token-ids path still runs the router and the
+            # shared experts on this side, and those need the model dtype. Refusing here
+            # keeps the transport from starting a receive it cannot finish.
+            raise ValueError(
+                "CAMP2P MXFP8 transport requires recv_routing; the token-ids path has no "
+                "consumer for a pre-quantized activation",
+            )
+        compute_gate_mode = 1 if (recv_input_ids or recv_routing) else 0
         batch_size = _num_tokens_for_ffn_rank(
             self.dp_metadata_list,
             ubatch_idx,
@@ -682,20 +911,46 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             self.hccl_comm_name2,
             self.hccl_comm_name3,
         )
-        outputs = torch.ops.afd_ascend.a2e(
-            torch.tensor([], dtype=torch.bfloat16, device="npu"),
-            torch.tensor([], dtype=torch.int32, device="npu"),
-            torch.tensor([], dtype=torch.float32, device="npu"),
-            custom_states.batch_size,
-            custom_states.h,
-            custom_states.k,
-            self.ffn_size,
-            self.attn_size,
-            self.world_rank,
-            group_ep,
-            custom_states.aiv_num,
-            compute_gate_mode,
-        )
+        if self.quant_mode == A2E_QUANT_MODE_MXFP8:
+            # The FFN rank receives both payloads from its paired Attention rank, so it
+            # supplies an empty FP8 activation placeholder and omits ``x_scale``: the
+            # operator returns the received activation in ``outputs[0]`` and the received
+            # E8M0 MX scale in ``outputs[5]``.
+            outputs = torch.ops.afd_ascend.a2e(
+                torch.empty(
+                    (0, custom_states.h),
+                    dtype=_A2E_MX_ACTIVATION_DTYPE,
+                    device="npu",
+                ),
+                torch.tensor([], dtype=torch.int32, device="npu"),
+                torch.tensor([], dtype=torch.float32, device="npu"),
+                custom_states.batch_size,
+                custom_states.h,
+                custom_states.k,
+                self.ffn_size,
+                self.attn_size,
+                self.world_rank,
+                group_ep,
+                custom_states.aiv_num,
+                compute_gate_mode,
+                None,
+                A2E_QUANT_MODE_MXFP8,
+            )
+        else:
+            outputs = torch.ops.afd_ascend.a2e(
+                torch.tensor([], dtype=torch.bfloat16, device="npu"),
+                torch.tensor([], dtype=torch.int32, device="npu"),
+                torch.tensor([], dtype=torch.float32, device="npu"),
+                custom_states.batch_size,
+                custom_states.h,
+                custom_states.k,
+                self.ffn_size,
+                self.attn_size,
+                self.world_rank,
+                group_ep,
+                custom_states.aiv_num,
+                compute_gate_mode,
+            )
         custom_states.atten_batch_size = outputs[3]
         custom_states.x_active_mask = outputs[4]
         custom_states.cam_p2p_ep_name = self.hccl_comm_name1
@@ -706,16 +961,31 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         # indistinguishable from the operator's placeholder. Reading the slot in
         # the other mode would hand the model uninitialised device memory as token
         # ids, which a token-keyed router turns into an out-of-range table read.
+        received_activation = outputs[0]
+        received_activation_scale: torch.Tensor | None = None
+        if self.quant_mode == A2E_QUANT_MODE_MXFP8:
+            received_activation_scale = outputs[5]
         received_ids: torch.Tensor | None = None
-        if compute_gate_mode == 1:
+        received_topk_ids: torch.Tensor | None = None
+        received_topk_weights: torch.Tensor | None = None
+        if recv_input_ids:
             received_ids = received_token_ids(
                 outputs[1],
                 expected_tokens=batch_size,
             )
+        elif recv_routing:
+            received_topk_ids, received_topk_weights = received_routing(
+                outputs[1],
+                outputs[2],
+                expected_tokens=batch_size,
+            )
         return AFDA2FTransferPayload(
-            hidden_states=outputs[0],
+            hidden_states=received_activation,
             context=context,
             input_ids=received_ids,
+            topk_ids=received_topk_ids,
+            topk_weights=received_topk_weights,
+            activation_scale=received_activation_scale,
         )
 
     def send_ffn_output(
@@ -953,6 +1223,119 @@ def _num_tokens_for_ffn_rank(
     return max(1, fallback)
 
 
+def _pad_e8m0_rows(scale: torch.Tensor, rows: int) -> torch.Tensor:
+    """Neutral E8M0 rows for padding, built in byte space."""
+
+    neutral = torch.full(
+        (rows, scale.shape[1]),
+        _E8M0_NEUTRAL_BYTE,
+        dtype=torch.uint8,
+        device=scale.device,
+    )
+    return neutral.view(torch.float8_e8m0fnu)
+
+
+def _pad_wire_activation(
+    wire_hidden_states: torch.Tensor,
+    wire_x_scale: torch.Tensor | None,
+    padding: int,
+    hidden_size: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Pad the wire activation and, in MXFP8 mode, its scale, consistently.
+
+    The activation is padded in whatever dtype it already has -- quantizing first and then
+    replacing it with the model-dtype tensor would ship a BF16 activation next to an E8M0
+    scale. The scale is padded with the neutral exponent, not with zero bytes.
+    """
+
+    wire_hidden_states = torch.cat(
+        (
+            wire_hidden_states,
+            wire_hidden_states.new_zeros((padding, hidden_size)),
+        ),
+    )
+    if wire_x_scale is not None:
+        wire_x_scale = torch.cat((wire_x_scale, _pad_e8m0_rows(wire_x_scale, padding)))
+    return wire_hidden_states, wire_x_scale
+
+
+def _check_a2e_mx_transport_pair(
+    quantized: torch.Tensor,
+    scale: torch.Tensor,
+    hidden_size: int,
+) -> None:
+    """Mirror the A2E operator's ``x_scale`` contract and name both sides.
+
+    The operator reports one opaque check for six conditions, which says nothing about what
+    actually arrived; checking here turns it into a message carrying the observed shapes and
+    dtypes.
+    """
+
+    groups = (hidden_size + A2E_MX_GROUP_SIZE - 1) // A2E_MX_GROUP_SIZE
+    problems: list[str] = []
+
+    if quantized.dtype != _A2E_MX_ACTIVATION_DTYPE:
+        problems.append(
+            f"activation dtype {quantized.dtype} != {_A2E_MX_ACTIVATION_DTYPE}",
+        )
+    if scale.dtype != _A2E_MX_SCALE_DTYPE:
+        problems.append(f"scale dtype {scale.dtype} != {_A2E_MX_SCALE_DTYPE}")
+    if scale.dim() != 2:
+        problems.append(f"scale dim {scale.dim()} != 2")
+    if not scale.is_contiguous():
+        problems.append("scale is not contiguous")
+    if scale.shape[0] != quantized.shape[0]:
+        problems.append(
+            f"scale rows {scale.shape[0]} != activation rows {quantized.shape[0]}",
+        )
+    if scale.dim() == 2 and scale.shape[1] != groups:
+        problems.append(
+            f"scale cols {scale.shape[1]} != "
+            f"ceil({hidden_size}/{A2E_MX_GROUP_SIZE})={groups}",
+        )
+
+    if problems:
+        raise RuntimeError(
+            "npu_dynamic_mx_quant output violates the A2E MXFP8 transport contract: "
+            f"{'; '.join(problems)}"
+            f" | activation {tuple(quantized.shape)} {quantized.dtype}"
+            f" | scale {tuple(scale.shape)} {scale.dtype}",
+        )
+
+
+def mx_quantize_a2e_activation(
+    hidden_states: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize an Attention activation into the A2E MXFP8 transport pair.
+
+    Returns the E4M3 activation and its E8M0 MX scale, shaped
+    ``[tokens, ceil(hidden_size / A2E_MX_GROUP_SIZE)]``. The FFN side receives both and
+    hands them to the experts without dequantizing, so the row count of the two must agree.
+
+    ``npu_dynamic_mx_quant`` returns the scale with its group axis split into
+    ``[tokens, num_groups // 2, 2]``, the layout the fused GMM ops consume; the A2E packet is
+    two-dimensional, so the trailing pair is collapsed here and re-split on the FFN side.
+
+    It also returns the scale as ``uint8``, while the operator checks for a
+    ``float8_e8m0fnu`` tensor. E8M0 is one byte wide, so the bits are reinterpreted rather
+    than converted. The algorithm is read from vLLM-Ascend so both sides round the same way.
+    """
+
+    import torch_npu
+    from vllm_ascend.quantization.utils import get_dynamic_mx_quant_scale_alg
+
+    quantized, scale = torch_npu.npu_dynamic_mx_quant(
+        hidden_states,
+        dst_type=_A2E_MX_ACTIVATION_DTYPE,
+        scale_alg=get_dynamic_mx_quant_scale_alg(),
+    )
+    scale = scale.flatten(-2)
+    if scale.dtype != _A2E_MX_SCALE_DTYPE:
+        scale = scale.view(_A2E_MX_SCALE_DTYPE)
+    _check_a2e_mx_transport_pair(quantized, scale, int(hidden_states.shape[-1]))
+    return quantized, scale
+
+
 def _get_group_ep(
     ubatch_idx: int,
     hccl_comm_name1: str,
@@ -995,6 +1378,7 @@ def _register_camp2p_custom_ops() -> None:
         compute_gate: int,
         expert_ids: torch.Tensor | None,
         expert_scales: torch.Tensor | None,
+        quant_mode: int,
     ) -> torch.Tensor:
         forward_context = get_forward_context()
         transfer_state = getattr(forward_context, "cam_afdtransfer_state", None)
@@ -1011,7 +1395,13 @@ def _register_camp2p_custom_ops() -> None:
             hccl_comm_name3,
         )
 
-        wire_hidden_states = hidden_states
+        # MXFP8 moves a pre-quantized activation plus its E8M0 MX scale. Quantize before
+        # padding so the rows added below are zero in both tensors and stay inert.
+        wire_x_scale: torch.Tensor | None = None
+        if quant_mode == A2E_QUANT_MODE_MXFP8:
+            wire_hidden_states, wire_x_scale = mx_quantize_a2e_activation(hidden_states)
+        else:
+            wire_hidden_states = hidden_states
         if attn_size > ffn_size:
             connector = forward_context.additional_kwargs["afd_metadata"].connector
             if len(connector.dp_metadata_list) > 1:
@@ -1022,11 +1412,11 @@ def _register_camp2p_custom_ops() -> None:
                 # This runs inside the opaque op: model compilation must not
                 # freeze padding from the profile/warmup metadata into its graph.
                 if padding:
-                    wire_hidden_states = torch.cat(
-                        (
-                            hidden_states,
-                            hidden_states.new_zeros((padding, hidden_size)),
-                        ),
+                    wire_hidden_states, wire_x_scale = _pad_wire_activation(
+                        wire_hidden_states,
+                        wire_x_scale,
+                        padding,
+                        hidden_size,
                     )
                     if expert_ids is not None:
                         expert_ids = torch.cat(
@@ -1038,20 +1428,40 @@ def _register_camp2p_custom_ops() -> None:
                         )
                 transfer_state.batch_size = physical_tokens
 
-        outputs = torch.ops.afd_ascend.a2e(
-            wire_hidden_states,
-            expert_ids,
-            expert_scales,
-            transfer_state.batch_size,
-            transfer_state.h,
-            transfer_state.k,
-            ffn_size,
-            attn_size,
-            world_rank,
-            group_ep,
-            transfer_state.aiv_num,
-            compute_gate,
-        )
+        if quant_mode == A2E_QUANT_MODE_MXFP8:
+            outputs = torch.ops.afd_ascend.a2e(
+                wire_hidden_states,
+                expert_ids,
+                expert_scales,
+                transfer_state.batch_size,
+                transfer_state.h,
+                transfer_state.k,
+                ffn_size,
+                attn_size,
+                world_rank,
+                group_ep,
+                transfer_state.aiv_num,
+                compute_gate,
+                wire_x_scale,
+                quant_mode,
+            )
+        else:
+            # The BF16 transport keeps the original twelve-argument call, so it also runs
+            # against an operator build that predates the MXFP8 arguments.
+            outputs = torch.ops.afd_ascend.a2e(
+                wire_hidden_states,
+                expert_ids,
+                expert_scales,
+                transfer_state.batch_size,
+                transfer_state.h,
+                transfer_state.k,
+                ffn_size,
+                attn_size,
+                world_rank,
+                group_ep,
+                transfer_state.aiv_num,
+                compute_gate,
+            )
         transfer_state.atten_batch_size = outputs[3]
         forward_context = get_forward_context()
         forward_context.cam_afdtransfer_state = transfer_state
@@ -1072,6 +1482,7 @@ def _register_camp2p_custom_ops() -> None:
         compute_gate: int,
         expert_ids: torch.Tensor | None,
         expert_scales: torch.Tensor | None,
+        quant_mode: int,
     ) -> torch.Tensor:
         """Return the input unchanged while PyTorch inspects the send operation."""
         return hidden_states
@@ -1147,6 +1558,7 @@ def _register_camp2p_custom_ops() -> None:
         "compute_gate": int,
         "expert_ids": torch.Tensor | None,
         "expert_scales": torch.Tensor | None,
+        "quant_mode": int,
         "return": torch.Tensor,
     }
     recv_annotations = {

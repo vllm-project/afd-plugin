@@ -63,8 +63,15 @@ def fail_if_unsupported_npu_afd_features(
         return
 
     if afd_config.compute_gate_on_attention:
-        raise RuntimeError(
-            "AFD NPU runtime does not support compute_gate_on_attention=true yet",
+        # The sync Attention-side gate prototype is deliberately narrow: one
+        # connector, the target model and BF16 transport. Widening it without the
+        # corresponding transport work would produce wrong numerics instead of an
+        # error, so anything outside that shape stays rejected.
+        _fail_if_unsupported_sync_attention_gate(
+            vllm_config,
+            afd_config,
+            extra_info,
+            is_dsv4=is_dsv4,
         )
     if afd_config.connector == CAMP2P_CONNECTOR:
         from afd_plugin.connectors.npu.camp2p import CAMP2PExtraInfo
@@ -155,6 +162,53 @@ def _fail_if_unsupported_dsv4_connector(afd_config: AFDConfig) -> None:
         raise RuntimeError(
             "DSV4 NPU AFD supports only CAMAsyncAFDConnector and "
             f"CAMP2pAFDConnector; got {afd_config.connector!r}",
+        )
+
+
+def _fail_if_unsupported_sync_attention_gate(
+    vllm_config: VllmConfig,
+    afd_config: AFDConfig,
+    extra_info: object,
+    *,
+    is_dsv4: bool,
+) -> None:
+    """Restrict the sync Attention-side gate prototype to what it supports today.
+
+    DBO and ubatching are rejected rather than merely unused: the sync shell does not
+    call the DBO yield, so enabling DBO here would interleave microbatches against a
+    transport that never yields. Not calling the yield is not the same as forbidding
+    the feature.
+    """
+
+    parallel = vllm_config.parallel_config
+    # The routing travels on each rank's own activation, and only the TP=1 shape has
+    # been verified end to end; a wider TP would split the activation without a
+    # matching routing split on the Attention side.
+    if int(parallel.tensor_parallel_size) != 1:
+        raise RuntimeError(
+            "Attention-side gate is only supported at tensor-parallel size 1; got "
+            f"TP={int(parallel.tensor_parallel_size)}",
+        )
+    if bool(parallel.enable_dbo) or bool(parallel.use_ubatching):
+        raise RuntimeError(
+            "Attention-side gate with the synchronous connector does not support "
+            "DBO or ubatching yet",
+        )
+    if afd_config.connector != CAMP2P_CONNECTOR:
+        raise RuntimeError(
+            "Attention-side gate is only supported with "
+            f"{CAMP2P_CONNECTOR}, got {afd_config.connector!r}",
+        )
+    if not is_dsv4:
+        raise RuntimeError(
+            "Attention-side gate is only supported for the DeepSeek V4 target",
+        )
+    from afd_plugin.connectors.npu.camp2p import CAMP2PExtraInfo
+
+    if not isinstance(extra_info, CAMP2PExtraInfo):
+        raise TypeError(
+            "CAMP2pAFDConnector requires CAMP2PExtraInfo, got "
+            f"{type(extra_info).__name__}",
         )
 
 

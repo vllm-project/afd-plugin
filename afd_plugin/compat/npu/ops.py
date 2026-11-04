@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Final
 
 AFD_ASCEND_OPS_NAMESPACE = "afd_ascend"
 AFD_ASCEND_VENDOR_NAME = "afd-plugin"
@@ -58,6 +59,51 @@ def _assert_afd_namespace_registered(torch: object) -> None:
     ops = vars(torch)["ops"]
     _ = ops.afd_ascend.a2e
     _ = ops.afd_ascend.e2a
+
+
+#: A2E arguments the MXFP8 transport needs. An operator build older than the one that
+#: added them accepts the call shape at the Python level and then fails inside the kernel,
+#: so the connector inspects the schema instead of trusting the call to raise.
+A2E_MXFP8_ARGUMENTS: Final = ("x_scale", "quant_mode")
+
+
+def a2e_accepts_mxfp8_arguments() -> bool | None:
+    """Whether the loaded ``a2e`` operator takes ``x_scale`` and ``quant_mode``.
+
+    Three answers rather than two, because the reasons differ and so do the messages a
+    caller should print:
+
+    ``False``
+        The operators could not be loaded, or the loaded schema does not list both
+        arguments. Either way this build cannot run the quantized transport.
+    ``None``
+        The operators loaded but their schema is not readable. Treating that as
+        "unsupported" would hide a working build; treating it as "supported" would enable a
+        transport nobody verified. The caller refuses and says it cannot confirm.
+    ``True``
+        The schema lists both arguments. This is a statement about the *interface* only:
+        whether the kernel executes a pre-quantized transport is a device question.
+
+    The operators are loaded before the schema is read, so a build that registers on first
+    use is not mistaken for one that does not accept the arguments.
+    """
+
+    try:
+        ensure_cam_p2p_ops_available()
+        import torch
+    except (ImportError, OSError, RuntimeError):
+        # Missing extension, missing torch, or a torch that cannot load its own libraries.
+        # All three mean this build cannot run the quantized transport.
+        return False
+    try:
+        packet = torch.ops.afd_ascend.a2e.default
+    except (AttributeError, RuntimeError):
+        return False
+    schema = getattr(packet, "_schema", None)
+    if schema is None:
+        return None
+    names = {argument.name for argument in schema.arguments}
+    return all(argument in names for argument in A2E_MXFP8_ARGUMENTS)
 
 
 def _assert_cam_namespace_registered(torch: object) -> None:
@@ -121,6 +167,7 @@ def ensure_cam_async_ops_available() -> None:
 
 
 __all__ = [
+    "A2E_MXFP8_ARGUMENTS",
     "AFD_ASCEND_OPS_NAMESPACE",
     "AFD_ASCEND_VENDOR_NAME",
     "AFD_CUST_OPAPI_ENV",
@@ -129,6 +176,7 @@ __all__ = [
     "CAM_DISPATCH_RECV",
     "CAM_DISPATCH_SEND",
     "CAM_OP_NAMESPACE",
+    "a2e_accepts_mxfp8_arguments",
     "ensure_afd_ascend_ops_loaded",
     "ensure_cam_async_ops_available",
     "ensure_cam_p2p_ops_available",

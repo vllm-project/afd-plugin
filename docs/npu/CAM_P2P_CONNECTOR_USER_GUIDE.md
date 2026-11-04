@@ -143,7 +143,7 @@ Pass AFD configuration through vLLM's `--additional-config` option under the
 | `afd_process_group_timeout_s` | `int` | `120` | Positive AFD group rendezvous timeout in seconds; also used by the native NPU DBO startup barrier. It does not bound a polling device kernel. |
 | `num_attention_ranks` | `int` | `1` | Total number of Attention worker ranks. Must be positive. |
 | `num_ffn_ranks` | `int` | `1` | Total number of FFN worker ranks. Must be positive. |
-| `compute_gate_on_attention` | `bool` | `false` | Controls whether the MoE gate is computed on the Attention side or the FFN side. Currently only `false` is supported. |
+| `compute_gate_on_attention` | `bool` | `false` | Controls whether the MoE gate runs on the Attention side. `true` is supported only with the synchronous `CAMP2pAFDConnector`, a DeepSeek V4 target and TP=1, and it rejects DBO and ubatching. Set it at this level, not in `connector_extra_config`. |
 | `connector_extra_config` | `dict` | `{}` | CAMP2P-specific settings such as role-specific core counts and `quant_mode`. Unknown fields are rejected. |
 | `async` / `async_dp` | `bool` | `false` | Must remain `false` for the current synchronous; Ascend async mode requires `CAMAsyncAFDConnector`. |
 
@@ -160,12 +160,36 @@ role rank.
 | --- | --- | --- | --- |
 | `core_num` | `int` | `8` | Positive default AIV core count for both roles. |
 | `attn_core_num` / `ffn_core_num` | `int` | unset | Positive role-specific override for `core_num`. |
-| `quant_mode` | `int` | `0` | CAM quantization mode. The current runtime supports only `0`. |
-| `compute_gate_on_attention` | `bool` | `false` | Connector-local operator option; must remain `false`, as must the common AFD field. |
+| `quant_mode` | `int` | `0` | A2E transport format. `0` carries BF16 activations. `4` carries a pre-quantized E4M3 activation plus its E8M0 MX scale and needs an `a2e` operator that declares `x_scale` and `quant_mode` (afd-plugin PR #444); the connector refuses to construct otherwise rather than falling back to BF16. **Both roles must be configured the same way**; only this process's value is checked, so a mismatch is not detected across ranks. |
+| `compute_gate_on_attention` | `bool` | `false` | Legacy connector-local copy. Keep it `false` and set the common `afd.compute_gate_on_attention` instead: this copy is parsed for compatibility and has no effect. |
 | `hccl_buffer_size` | `int` | unset | Positive CAMP2P HCCL buffer size in MB. The override applies to every connector-owned `afd*` communication domain and the FFN-side `afd_moe` domain; the Gloo control group is unaffected. When unset, HCCL uses `HCCL_BUFFSIZE`, then its built-in default. Use the same value on all members of each HCCL domain. |
+
 
 The per-domain setting avoids increasing buffers for unrelated TP, DP, or EP
 process groups. `HCCL_BUFFSIZE` remains a process-wide fallback.
+
+### MXFP8 transport (`quant_mode: 4`)
+
+The A2E channel can carry a pre-quantized activation instead of BF16. The Attention role
+quantizes locally, sends an E4M3 activation together with its E8M0 MX scale, and the FFN side
+hands both to the experts without dequantizing. The scale rides in the same routing object the
+Attention-side gate already publishes, so it is padded, gathered or sharded by exactly the rule
+the activation takes.
+
+| Requirement | Detail |
+| --- | --- |
+| Both roles | The same `quant_mode` in `additional_config["afd"]["connector_extra_config"]`. Only this process's value is validated; there is no cross-rank check. |
+| Attention-side gate | The pass-through path requires an Attention-computed routing (`compute_gate_on_attention: true`). The token-ids path runs the router on the FFN side, which needs the model dtype, so `quant_mode: 4` with token ids is refused. |
+| Operator | An `a2e` build that declares `x_scale` and `quant_mode` (afd-plugin PR #444). The connector probes the operator schema at construction and refuses with a message naming the missing capability, rather than running a BF16 transport under a mode-4 label. |
+| Activation | E4M3 only. `float8_e5m2` is rejected instead of being carried into the operator. |
+| Scale | Two-dimensional, one row per token, `ceil(hidden_size / 32)` columns, `float8_e8m0fnu`. Padding rows carry exponent byte 127 (2**0), not zero. |
+| MC2 | The dispatch kwargs forward the scale and select `quant_mode=0`, telling the operator the activation is already quantized. Without a scale the dispatch resolves exactly as upstream. |
+
+**Validation status of this branch.** The configuration above is wired and covered by CPU tests
+only. There is no NPU run, no numerics comparison and no graph-capture check on this branch, and
+the device smoke that established the operator contract lives on the experiment branch (see
+`docs/operations/data-a5-mxfp8-measurements.md`). Treat mode 4 as unverified on device until
+that measurement is recorded here.
 
 ## Single-node `4A2F` example
 
