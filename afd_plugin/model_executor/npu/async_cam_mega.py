@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""One MC2 W4A8 launch drains a transaction, splitting only on receive overflow."""
+"""One native MC2 launch drains an exclusive W4A8 transaction per layer."""
 
 from __future__ import annotations
 
 import torch
 
-from afd_plugin.model_executor.npu.async_cam_w4a8 import AsyncCAMW4A8Executor
+from afd_plugin.model_executor.npu.async_cam_layered import AsyncCAMLayeredExecutor
 from afd_plugin.validation import cam_receive_capacity
 
 # Mirror Pull::MetadataWords in afd_pull_layout.h (all fields are int64_t):
@@ -21,7 +21,13 @@ WORKSPACE_ALIGNMENT_BYTES = 512
 
 
 class AsyncCAMMegaExecutor:
-    def __init__(self, weights: AsyncCAMW4A8Executor, connector) -> None:
+    """Native MC2 W4A8 only; the layered executor owns W8A8 execution."""
+
+    def __init__(self, weights: AsyncCAMLayeredExecutor, connector) -> None:
+        # The native MC2 epilogue dequantizes packed INT4 weights and applies
+        # A8W4 postprocessing, so a W8A8 table cannot share this launch.
+        if weights.quantization != "W4A8":
+            raise ValueError("native MC2 Mega requires homogeneous W4A8 weights")
         if not weights.per_channel:
             raise ValueError("native MC2 Mega requires per-channel W4A8 weights")
         self.weights = weights
@@ -87,4 +93,5 @@ class AsyncCAMMegaExecutor:
             self.config,
             c.group_name,
             w.routed_scaling_factor,
+            w.applied_swiglu_limit,
         )

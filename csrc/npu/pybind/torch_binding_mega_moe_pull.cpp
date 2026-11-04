@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 #include <cmath>
+#include <limits>
 #include <torch/extension.h>
 #include <torch/library.h>
 #include "pytorch_extension/op_api_common.h"
@@ -23,12 +24,15 @@ at::Tensor native_mega(const at::Tensor &anchor, const at::Tensor &state,
     const at::Tensor &layer_map, const at::Tensor &scratch,
     at::TensorList w13, at::TensorList w2, at::TensorList s13, at::TensorList s2,
     at::TensorList b13, at::TensorList b2, at::IntArrayRef c,
-    c10::string_view group_name, double routed_scale) {
+    c10::string_view group_name, double routed_scale, double swiglu_limit) {
     TORCH_CHECK(c.size() == 14, "native Mega config requires 14 fields");
     for (auto n : c) TORCH_CHECK(n > 0 && n <= 262144, "native Mega config out of range");
     TORCH_CHECK(c[8] == c[4] + c[5] && c[7] >= c[5] && c[7] < c[8] &&
         c[0] % c[9] == 0 && c[5] % c[9] == 0 && c[11] == 1 && c[12] == 1 &&
         std::isfinite(routed_scale), "native Mega requires a valid F rank and per-channel weights");
+    TORCH_CHECK(std::isfinite(swiglu_limit) && swiglu_limit >= 0.0 &&
+        swiglu_limit <= std::numeric_limits<float>::max(),
+        "native Mega swiglu_limit must be finite, nonnegative and representable as float32");
     Cam::Pull::Shape shape{uint64_t(c[0] / c[9]), uint64_t(c[1]), uint64_t(c[3]),
         uint64_t(c[4]), uint64_t(c[5]), uint64_t(c[6]), uint64_t(c[9])};
     Cam::Pull::Layout layout{};
@@ -72,7 +76,7 @@ at::Tensor native_mega(const at::Tensor &anchor, const at::Tensor &state,
         std::string group(group_name.data(), group_name.size());
         auto group_ptr = group.data();
         EXEC_NPU_CMD(aclnnAfdMegaMoePullNative, anchor, state, layer_map, scratch,
-            w13, w2, s13, s2, b13, b2, c, group_ptr, routed_scale, completion);
+            w13, w2, s13, s2, b13, b2, c, group_ptr, routed_scale, swiglu_limit, completion);
     }
     return completion;
 }
@@ -83,7 +87,7 @@ TORCH_LIBRARY_FRAGMENT(afd_ascend, m) {
           &workspace_size);
     m.def("afd_mega_moe_pull_native(Tensor anchor, Tensor(a!) state, Tensor layer_map, Tensor(b!) scratch, "
           "Tensor[] w13, Tensor[] w2, Tensor[] s13, Tensor[] s2, Tensor[] b13, Tensor[] b2, "
-          "int[] config, str group_name, float routed_scale) -> Tensor");
+          "int[] config, str group_name, float routed_scale, float swiglu_limit=0.0) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(afd_ascend, PrivateUse1, m) {
     m.impl("afd_mega_moe_pull_native", &native_mega<true>);

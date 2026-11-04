@@ -143,7 +143,8 @@ __aicore__ inline void PullAndPrepare(GM_ADDR scratch, const Cam::NativeMegaWork
 class Activation {
 public:
     static constexpr uint32_t TILE = 3072, SCALE_BATCH = 256;
-    __aicore__ Activation(Resource &resource, uint32_t intermediate) : i_(intermediate) {
+    __aicore__ Activation(Resource &resource, uint32_t intermediate, float limit)
+        : i_(intermediate), limit_(limit) {
         uint32_t ub = 0;
         for (uint32_t b = 0; b < 2; ++b) {
             raw_[b] = resource.ubBuf.GetBufferByByte<half>(ub); ub += 8 * TILE;
@@ -253,6 +254,15 @@ private:
         Muls(gate_, gate_, scale, n);
         Muls(up_, up_, scale, n);
         PipeBarrier<PIPE_V>();
+        // Model swiglu_limit: SiLU(min(gate, L)) * clamp(up, -L, L). Zero keeps
+        // clipping disabled, matching the layered W4A8 operator's contract.
+        if (limit_ > 0.0f) {
+            Mins(gate_, gate_, limit_, n);
+            Mins(up_, up_, limit_, n);
+            PipeBarrier<PIPE_V>();
+            Maxs(up_, up_, -limit_, n);
+            PipeBarrier<PIPE_V>();
+        }
         Muls(value_, gate_, -1.0f, n);
         PipeBarrier<PIPE_V>();
         Exp(value_, value_, n);
@@ -282,6 +292,7 @@ private:
         SetFlag<HardEvent::MTE3_V>(b);
     }
     uint32_t i_;
+    float limit_;
     LocalTensor<half> raw_[2], msdWork_;
     LocalTensor<int4b_t> packed_[2];
     LocalTensor<int8_t> quant_;
@@ -331,7 +342,7 @@ __aicore__ inline void ActivateNative(GM_ADDR scratch, const Cam::NativeMegaWork
         const uint32_t rows = round.begin[e + 1] - begin;
         if (rows) activation(raw[4ULL * begin * i], Catlass::MatrixCoord{rows, 2 * i},
             s1[begin], reinterpret_cast<__gm__ float *>(descriptor), out[uint64_t(begin) * i],
-            counts, begin, s2[begin], experts, 1, 0, 1, resource, t.aivNum, 0.0f,
+            counts, begin, s2[begin], experts, 1, 0, 1, resource, t.aivNum, t.swigluLimit,
 #if defined(AFD_CANN_CATLASS_92)
             static_cast<uint32_t>(Catlass::Epilogue::GatedActivationMode::SWIGLU),
             Catlass::Epilogue::SwigluOaiActivation::DEFAULT_ALPHA,
@@ -361,7 +372,7 @@ __aicore__ inline void Activate(GM_ADDR scratch, const Cam::NativeMegaWorkspace 
     s1.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scratch + w.scale1));
     s2.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scratch + w.scale2));
     out.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(scratch + w.a2));
-    Activation activation(resource, i);
+    Activation activation(resource, i, t.swigluLimit);
     uint32_t groupBegin = 0, expert = 0, group = 0;
     for (uint32_t index = 0; index < round.activeCount; ++index) {
         if (!SyncExpert(index, round.activeCount)) continue;

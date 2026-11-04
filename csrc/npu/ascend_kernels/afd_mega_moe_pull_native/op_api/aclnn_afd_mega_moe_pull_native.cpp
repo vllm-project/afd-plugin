@@ -8,10 +8,11 @@ extern "C" aclnnStatus aclnnAfdMegaMoePullNativeGetWorkspaceSize(
     const aclTensor *scratch, const aclTensorList *w13, const aclTensorList *w2,
     const aclTensorList *s13, const aclTensorList *s2, const aclTensorList *b13,
     const aclTensorList *b2, const aclIntArray *config, char *hcclGroupName, double routedScale,
-    const aclTensor *completion, uint64_t *workspaceSize, aclOpExecutor **executor) {
+    double swigluLimit, const aclTensor *completion, uint64_t *workspaceSize,
+    aclOpExecutor **executor) {
     return aclnnInnerAfdMegaMoePullNativeGetWorkspaceSize(
         anchor, commArgs, layerMap, scratch, w13, w2, s13, s2, b13, b2, config, hcclGroupName,
-        routedScale, completion, workspaceSize, executor);
+        routedScale, swigluLimit, completion, workspaceSize, executor);
 }
 extern "C" aclnnStatus aclnnAfdMegaMoePullNative(void *workspace, uint64_t workspaceSize,
                                           aclOpExecutor *executor, aclrtStream stream) {

@@ -23,6 +23,10 @@ static ge::graphStatus NativeMegaTiling(gert::TilingContext *ctx) {
         c[2] % 256 || c[2] > 8192 || c[6] > 128 ||
         c[10] > Cam::NATIVE_MAX_ROWS || c[11] != 1 || c[12] != 1 ||
         !std::isfinite(*attrs->GetFloat(2))) return ge::GRAPH_FAILED;
+    // Zero keeps clipping disabled, matching the layered W4A8 operator.
+    const float *swigluLimitPtr = attrs->GetFloat(3);
+    const float swigluLimit = swigluLimitPtr != nullptr ? *swigluLimitPtr : 0.0f;
+    if (!std::isfinite(swigluLimit) || swigluLimit < 0.0f) return ge::GRAPH_FAILED;
     Cam::Pull::Shape shape{uint64_t(c[0] / c[9]), uint64_t(c[1]), uint64_t(c[3]),
         uint64_t(c[4]), uint64_t(c[5]), uint64_t(c[6]), uint64_t(c[9])};
     Cam::Pull::Layout layout{};
@@ -53,6 +57,7 @@ static ge::graphStatus NativeMegaTiling(gert::TilingContext *ctx) {
     data->layerMapSize = ctx->GetInputShape(2)->GetStorageShape().GetDim(0);
     if (data->layerMapSize == 0 || data->layerMapSize > 65536) return ge::GRAPH_FAILED;
     data->routedScale = *attrs->GetFloat(2);
+    data->swigluLimit = swigluLimit;
     AscendC::Mc2CcTilingConfig comm(attrs->GetAttrPointer<char>(1), 8U,
                                    "AlltoAll=level0:fullmesh;level1:pairwise");
     comm.GetTiling(data->mc2InitTiling);
@@ -83,6 +88,7 @@ public:
         Attr("config").ListInt();
         Attr("hccl_group_name").String();
         Attr("routed_scale").Float();
+        Attr("swiglu_limit").Float();
         SetInferShape([](gert::InferShapeContext *ctx) {
             auto shape = ctx->GetOutputShape(0);
             shape->SetDimNum(1); shape->SetDim(0, 1);

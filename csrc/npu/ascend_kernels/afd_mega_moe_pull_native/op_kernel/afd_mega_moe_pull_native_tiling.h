@@ -14,6 +14,8 @@ struct AfdMegaMoePullNativeTilingData {
     uint32_t aicNum, aivNum, commAivNum, layerMapSize;
     alignas(8) uint8_t cube[1024];
     float routedScale;
+    // Model swiglu_limit; zero disables clipping, matching the layered W4A8 op.
+    float swigluLimit;
 };
 }
 #endif

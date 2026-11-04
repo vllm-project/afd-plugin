@@ -67,6 +67,48 @@ def test_native_rejects_grouped_scale_before_receiving(operators):
         AsyncCAMMegaExecutor(executor, None)
 
 
+def test_native_rejects_w8a8_before_receiving(operators):
+    executor = AsyncCAMLayeredExecutor([weights(quantization="W8A8")])
+    with pytest.raises(ValueError, match="W4A8"):
+        AsyncCAMMegaExecutor(executor, None)
+    assert operators == []
+
+
+def test_native_forwards_the_applied_swiglu_limit(monkeypatch):
+    calls = []
+
+    def execute(*args):
+        calls.append(args)
+        return torch.empty(1, dtype=torch.int64)
+
+    monkeypatch.setenv("BATCH_SIZE_FACTOR", str(16 / 262144))
+    monkeypatch.setattr(
+        torch.ops.afd_ascend,
+        "afd_mega_moe_pull_workspace_size",
+        lambda *args: 65536,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.afd_ascend, "afd_mega_moe_pull_native", execute, raising=False
+    )
+    executor = AsyncCAMMegaExecutor(
+        AsyncCAMLayeredExecutor([replace(weights(), swiglu_limit=10.0)]),
+        SimpleNamespace(
+            max_num_batched_tokens=8,
+            topk=2,
+            ffn_size=2,
+            attn_size=1,
+            world_rank=1,
+            topology=SimpleNamespace(world_size=3),
+            tp_size=1,
+            comm_args=torch.empty(512, dtype=torch.float16),
+            group_name="test-pull",
+        ),
+    )
+    executor()
+    assert calls[0][-1] == 10.0
+
+
 @pytest.fixture
 def operators(monkeypatch):
     calls = []

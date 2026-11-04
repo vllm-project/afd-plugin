@@ -178,7 +178,9 @@ quantization. Zero disables clipping. DeepSeek-V4's configured `10.0` therefore
 applies on both execution paths. The limit is a host scalar fixed at graph
 capture; layer selection remains controlled by the device `layer_index` tensor.
 Layered W8A8 retains its unclipped computation and records the model limit as
-metadata only.
+metadata only. Native Mega W4A8 applies the same limit in both its MC2 ACT
+epilogue and its bounded-column fallback, and rejects layered W8A8 weights
+instead of silently ignoring the declared limit.
 
 ## Validation
 

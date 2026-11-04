@@ -49,7 +49,8 @@ rank to enable MegaMoE and its dedicated pull protocol. With the switch off,
 CAM retains its original push Dispatch/Combine and FFN execution path.
 Pull is not a standalone transport option: there is no `dispatch_mode`
 setting or separate pull DispatchRecv/CombineSend operator. MegaMoE requires
-`dynamicQuant=1`, per-channel W4A8 and `ffn_two_stream=false`.
+`dynamicQuant=1`, per-channel W4A8 and `ffn_two_stream=false`. Layered W8A8
+weights are rejected at startup rather than executed through this kernel.
 
 The A3 `AfdMegaMoePullNative` kernel directly includes the installed CANN MC2
 W4A8 `BlockMmad`. The build supports the CANN 9.1 MegaMoE header layout and
@@ -65,6 +66,8 @@ rows. Only transactions exceeding this capacity use multiple device rounds;
 capacity is independent of the MC2 matrix tile size. Callers must not launch
 once per receive round. The workspace allocation ABI and Attention Combine
 interface are unchanged. The path supports A3 per-channel W4A8 with SwiGLU.
+The model `swiglu_limit` is applied in both ACT paths as
+`SiLU(min(gate, L)) * clamp(up, -L, L)`; zero, the default, disables clipping.
 
 For intermediate widths up to 3072, ACT directly uses the installed MC2 W4A8
 two-stage UB epilogue and expert-group synchronization. Wider supported rows
