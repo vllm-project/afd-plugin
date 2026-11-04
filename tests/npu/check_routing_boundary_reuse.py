@@ -96,10 +96,15 @@ def check_acl_graph_reuse():
         out = static_in.clone()
         torch.npu.synchronize()
 
-        graph.capture_begin()
-        op(static_in, NUM_EXPERTS, False)
-        out.copy_(static_in)
-        graph.capture_end()
+        # NPU graphs must be captured on a non-default stream.
+        torch.npu.synchronize()
+        capture_stream = torch.npu.Stream()
+        with torch.npu.stream(capture_stream):
+            graph.capture_begin()
+            op(static_in, NUM_EXPERTS, False)
+            out.copy_(static_in)
+            graph.capture_end()
+        torch.npu.synchronize()
 
         for offset in (5, 11):
             expected = _ids(offset)
