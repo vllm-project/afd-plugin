@@ -22,6 +22,7 @@ validation_paths:
 upstream_refs:
   - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "NPU MiniMax-M3: vLLM-Ascend bd42eea01d8312c4df469fabaed45f77a12df4d3"
   - "vLLM vllm.model_executor.models.deepseek_v2"
   - "vLLM vllm.model_executor.models.qwen3_moe"
   - "vLLM vllm.forward_context.ForwardContext"
@@ -32,12 +33,13 @@ verified_platform_refs:
   - "CAM async NPU model E2E path"
   - "DeepSeek V4 CUDA contract tests and E2E profiles; see execution-platform matrix for hardware scope"
   - "DeepSeek V4 Ascend Hash-id boundary has focused unit coverage and a historical manual Ascend 950 run"
+  - "MiniMax-M3 Ascend boundary has CPU contract coverage only; no hardware E2E run yet"
 related_issues:
   - "#86"
   - "#88"
   - "#105"
   - "#129"
-last_reviewed: 2026-10-30
+last_reviewed: 2026-11-03
 ---
 
 # Model integration
@@ -63,6 +65,7 @@ make a backend-specific worker class the shared model API.
 | DeepSeek V4 CUDA role boundary | [`deepseek_v4.py`](../../../afd_plugin/model_executor/models/deepseek_v4.py) | [`test_deepseek_v4_construction.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_construction.py), [`test_deepseek_v4_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_proxy.py), [`test_deepseek_v4_weight_policy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_weight_policy.py) |
 | DeepSeek V4 Ascend Hash-id boundary | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py), [`npu/deepseek_v4_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_attention_gate.py) | [`test_deepseek_v4_hash_ids.py`](../../../tests/unit/model_executor/test_deepseek_v4_hash_ids.py), [`test_deepseek_v4_npu_weight_roles.py`](../../../tests/unit/model_executor/test_deepseek_v4_npu_weight_roles.py), ids-mode cases in [`test_camp2p_token_ids.py`](../../../tests/unit/connectors/test_camp2p_token_ids.py) |
 | Qwen3 MoE role-aware model and weight loading | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py), [`test_qwen3_moe_weight_policy.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_weight_policy.py) |
+| MiniMax-M3 Ascend role boundary | [`npu/minimax_m3.py`](../../../afd_plugin/model_executor/models/npu/minimax_m3.py) | [`test_minimax_m3_weight_policy.py`](../../../tests/unit/model_executor/models/test_minimax_m3_weight_policy.py) |
 | CUDA remote-experts boundary | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py), [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py) | [`test_p2p_experts_contract.py`](../../../tests/unit/connectors/test_p2p_experts_contract.py), [`test_deepseek_v2_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_proxy.py) |
 | Forward-context adapter | [`forward_context.py`](../../../afd_plugin/model_executor/models/forward_context.py) | [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
 | NPU Async CAM native DBO handoff | [`npu/async_cam_dbo.py`](../../../afd_plugin/model_executor/models/npu/async_cam_dbo.py), [`npu/ubatch_runner.py`](../../../afd_plugin/v1/worker/npu/ubatch_runner.py) | [`test_async_cam_dbo.py`](../../../tests/unit/model_executor/test_async_cam_dbo.py), [`test_npu_model_runner_v2.py`](../../../tests/unit/v1/worker/test_npu_model_runner_v2.py) |
@@ -87,16 +90,20 @@ registers lazy AFD wrapper paths under `AFD`-prefixed aliases.
 | `GlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` |
 | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` |
 | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` |
+| `MiniMaxM3SparseForCausalLM` | `AFDMiniMaxM3SparseForCausalLM` | `AFDMiniMaxM3SparseForCausalLM` (NPU only) |
+| `MiniMaxM3SparseForConditionalGeneration` | `AFDMiniMaxM3SparseForConditionalGeneration` | `AFDMiniMaxM3SparseForConditionalGeneration` (NPU only) |
 
 Only AFD workers switch their worker-local model configuration to the matching
 alias before constructing the AFD model runner. Non-AFD workers keep the
 checkpoint architecture and resolve to vLLM's native model class.
 
 The DeepSeek, DeepSeek V2/V3/V3.2, and GLM aliases share the DeepSeek
-V2-derived implementation. DeepSeek V4, Qwen3 MoE, and Qwen3.5/3.6 each have a
-separate wrapper around their matching native architecture. These aliases
-express known compatible architecture families; they do not make any wrapper
-a generic MoE model API.
+V2-derived implementation. DeepSeek V4, Qwen3 MoE, Qwen3.5/3.6, and MiniMax-M3
+each have a separate wrapper around their matching native architecture. These
+aliases express known compatible architecture families; they do not make any
+wrapper a generic MoE model API. MiniMax-M3 has no native CUDA implementation,
+so its alias resolves only on Ascend NPU and model-config resolution rejects
+other device types before model loading.
 
 ## Role-aware module construction
 
@@ -224,6 +231,35 @@ removed adapter and do not qualify the current implementation. The current
 2A1F suite keeps static EP and PP1. Attention-side router transport, async
 communication, multi-node, quantization, and performance remain outside the
 validated scope.
+
+### MiniMax-M3 Ascend boundary
+
+[`npu/minimax_m3.py`](../../../afd_plugin/model_executor/models/npu/minimax_m3.py)
+wraps vLLM-Ascend's native MiniMax-M3 implementation. The native model builds
+its decoder layers through a hard-coded factory, so the adapter copies the
+model, causal-LM, and multimodal constructors and injects an AFD layer class.
+Attention owns Attention, both Gemma RMS norms, embeddings, and finalization,
+and replaces the FFN slot (`block_sparse_moe` or `mlp`) with a parameter-free
+`RemoteFFNProxy`. FFN constructs the native `MiniMaxM3MoE` or prefill/dense
+`MiniMaxM3MLP` and serves it through `compute_ffn_output()`; native forward,
+attention backends, quantization, and parameter mapping stay upstream-owned.
+
+Checkpoint weights are filtered once by layer-stage path before the native
+loader runs: `self_attn` and the two layer norms load on Attention,
+`block_sparse_moe` and `mlp` load on FFN, shared non-layer paths load on both
+roles, and vision-tower, projector, and MTP paths are dropped. An unclassified
+layer path raises instead of silently loading on both roles. On the Attention
+role the adapter overrides `_set_moe_parameters()` because the role builds no
+local MoE.
+
+The multimodal checkpoint is text-only in AFD: the VL wrapper keeps the native
+vision tower construction for pipeline bookkeeping but requires
+`--language-model-only`, and the LM class is swapped for the AFD causal-LM
+wrapper. This path requires Ascend NPU, synchronous `CAMP2pAFDConnector`,
+`compute_gate_on_attention=false`, and pipeline-parallel size 1. It rejects
+sequence-parallel MoE, EPLB, speculative decoding, and LoRA during
+construction. Native graph/DBO execution and hardware accuracy are not yet
+validated.
 
 ## Forward-context contract
 

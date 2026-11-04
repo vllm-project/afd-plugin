@@ -135,11 +135,28 @@ _QWEN3_5_MODEL_REGISTRATIONS = MappingProxyType(
     }
 )
 
+# The native MiniMax-M3 implementation is Ascend-only, so both architectures
+# resolve to the NPU adapter. Non-NPU hosts are rejected when the AFD model
+# config is built, before any model module is imported.
+_MINIMAX_MODEL_REGISTRATIONS = MappingProxyType(
+    {
+        "MiniMaxM3SparseForCausalLM": (
+            "afd_plugin.model_executor.models.npu.minimax_m3:"
+            "AFDMiniMaxM3SparseForCausalLM"
+        ),
+        "MiniMaxM3SparseForConditionalGeneration": (
+            "afd_plugin.model_executor.models.npu.minimax_m3:"
+            "AFDMiniMaxM3SparseForConditionalGeneration"
+        ),
+    }
+)
+
 _MODEL_REGISTRATIONS = MappingProxyType(
     {
         **_DEEPSEEK_MODEL_REGISTRATIONS,
         **_QWEN_MODEL_REGISTRATIONS,
         **_QWEN3_5_MODEL_REGISTRATIONS,
+        **_MINIMAX_MODEL_REGISTRATIONS,
     }
 )
 
@@ -233,6 +250,7 @@ __all__ = [
     "parse_optional_afd_config",
     "__version__",
     "_DEEPSEEK_MODEL_REGISTRATIONS",
+    "_MINIMAX_MODEL_REGISTRATIONS",
     "_MODEL_REGISTRATIONS",
     "_QWEN_MODEL_REGISTRATIONS",
     "_QWEN3_5_MODEL_REGISTRATIONS",
