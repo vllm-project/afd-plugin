@@ -38,28 +38,29 @@ op = torch.ops.vllm.afd_balance_routing_ids_
 
 @contextlib.contextmanager
 def _forward_context(in_profile_run: bool):
-    """Real context plus the marker the pinned Ascend actually reads.
+    """Real context with the flag written through the same proxy the op reads.
 
-    The stack exposes the flag through the V2 contextvar, so use the production
-    entry point instead of writing additional_kwargs alone.
+    The proxy chooses between additional_kwargs and a plain attribute depending
+    on the stack's mode; writing through it keeps set and read consistent.
     """
     from vllm.forward_context import ForwardContext, override_forward_context
-    from vllm_ascend.ascend_forward_context import (
-        get_mrv2_in_profile_run,
-        override_mrv2_in_profile_run,
-    )
+    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
     ctx = ForwardContext(
         no_compile_layers={},
         attn_metadata={},
         slot_mapping={},
-        additional_kwargs={"in_profile_run": in_profile_run},
+        additional_kwargs={},
     )
     with override_forward_context(ctx):
-        with override_mrv2_in_profile_run(in_profile_run):
-            seen = get_mrv2_in_profile_run()
-            assert seen is in_profile_run, f"marker reads {seen}, expected {in_profile_run}"
+        _EXTRA_CTX.in_profile_run = in_profile_run
+        try:
+            assert bool(_EXTRA_CTX.in_profile_run) is in_profile_run, (
+                f"proxy reads {_EXTRA_CTX.in_profile_run}, expected {in_profile_run}"
+            )
             yield
+        finally:
+            _EXTRA_CTX.in_profile_run = False
 
 
 def _ids(offset):
