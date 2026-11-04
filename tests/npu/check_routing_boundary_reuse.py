@@ -16,6 +16,8 @@ Assertions:
 
 from __future__ import annotations
 
+import contextlib
+
 import os
 
 # The pinned Ascend resolves _EXTRA_CTX.* out of additional_kwargs only in V2
@@ -34,19 +36,30 @@ TOPK = 2
 op = torch.ops.vllm.afd_balance_routing_ids_
 
 
+@contextlib.contextmanager
 def _forward_context(in_profile_run: bool):
-    """Real forward context; the flag is the attribute set_forward_context sets."""
-    from vllm.forward_context import ForwardContext
+    """Real context plus the marker the pinned Ascend actually reads.
 
-    # V2 layout: the pinned Ascend reads the marker out of additional_kwargs, so
-    # set it there rather than as a plain context attribute.
+    The stack exposes the flag through the V2 contextvar, so use the production
+    entry point instead of writing additional_kwargs alone.
+    """
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm_ascend.ascend_forward_context import (
+        get_mrv2_in_profile_run,
+        override_mrv2_in_profile_run,
+    )
+
     ctx = ForwardContext(
         no_compile_layers={},
         attn_metadata={},
         slot_mapping={},
         additional_kwargs={"in_profile_run": in_profile_run},
     )
-    return override_forward_context(ctx)
+    with override_forward_context(ctx):
+        with override_mrv2_in_profile_run(in_profile_run):
+            seen = get_mrv2_in_profile_run()
+            assert seen is in_profile_run, f"marker reads {seen}, expected {in_profile_run}"
+            yield
 
 
 def _ids(offset):
@@ -84,13 +97,6 @@ def _compile_once(module):
 
 
 def check_compiled_reuse():
-    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-
-    with _forward_context(True):
-        assert _EXTRA_CTX.in_profile_run is True, "V2 layout did not expose the profile flag"
-    with _forward_context(False):
-        assert _EXTRA_CTX.in_profile_run is not True, "V2 layout leaked the profile flag"
-
     with torch.no_grad(), _forward_context(True):
         profile_ids = _ids(3)
         op(profile_ids, NUM_EXPERTS, False)
