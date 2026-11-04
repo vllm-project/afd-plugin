@@ -5,7 +5,7 @@
 # Qwen3-235B-A22B-FP8 vanilla vLLM baseline on one 4-GPU node.
 #
 # This is the no-AFD counterpart to
-# recipe/gpu/DeepEPM2NAFDConnector/qwen3_235b_a22b_fp8/prefill_decode_colocation/4a2f_graph_dp4tp1.sh.
+# recipe/gpu/DeepEPM2NAFDConnector/qwen3_235b_a22b_fp8/prefill_decode_colocation/graph.sh.
 # It launches a single vLLM process with tensor parallelism 4 and no AFD
 # connector, AFD additional config, or separate Attention/FFN roles.
 #

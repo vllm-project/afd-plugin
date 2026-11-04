@@ -291,10 +291,9 @@ the headless pods. The FFN DP rank is the FFN's EP rank, so it decides which
 experts a pod loads; `--enable-ep-weight-filter` keeps each FFN from reading
 the other experts' weights.
 
-The recipe
-[`multipod_4a1f_4a1f_graph.sh`](../../recipe/gpu/DeepEPM2NAFDConnector/qwen3_235b_a22b_fp8/README.md#multi-pod-2-x-4a1f)
-derives all of these flags for symmetric placements `N x <a>A<f>F` from the
-pod index (`POD=AFD_<k>`).
+The [DeepEP M2N recipes](../../recipe/gpu/DeepEPM2NAFDConnector/README.md#layout)
+derive all of these flags from a `LAYOUT` such as `2A0F,0A2F` or `4A1F,4A1F`
+and the pod index (`POD=AFD_<k>`).
 
 ## Minimal launch shape
 

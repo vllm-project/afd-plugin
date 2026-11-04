@@ -46,8 +46,12 @@ than one pod) -- callers never talk to these directly. See
   `# For pod N: POD=...` line per pod, but the comment isn't guaranteed to
   use that exact grammar going forward. See
   [resolve-recipe.md](references/resolve-recipe.md).
-- Not for the local decode-only benchmark (`tools/benchmarks/decode_bench_client.py`
-  against `recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/`, non-k8s).
+- `DeepEPM2NAFDConnector` recipes take their placement from `LAYOUT` (one
+  pod per `<a>A<f>F` entry) and run-specific settings as env (`VLLM_ARGS`,
+  `DECODE_BENCH`, ...); see [resolve-recipe.md](references/resolve-recipe.md).
+  This skill only serves; the decode-only benchmark's client
+  (`tools/benchmarks/decode_bench_client.py`) is run separately against the
+  endpoint.
 
 ## Requirements
 

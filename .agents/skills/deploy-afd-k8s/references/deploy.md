@@ -28,12 +28,13 @@ devices="$(role_block "$RECIPE_SCRIPT_PATH" "$ROLE" \
 GPU_COUNT=$(( $(grep -o ',' <<<"$devices" | wc -l) + 1 ))
 ```
 
-`POD=AFD_<index>` entries (both roles per pod, see
-[resolve-recipe.md](resolve-recipe.md)): every pod has the same shape,
+`LAYOUT` recipes (see [resolve-recipe.md](resolve-recipe.md)): each entry's
+GPU count is its `a + f`:
 
 ```bash
-default() { grep -oE "$1:-[0-9]+" "$RECIPE_SCRIPT_PATH" | grep -oE '[0-9]+$'; }
-GPU_COUNT=$(( ${ATTN_PER_POD:-$(default ATTN_PER_POD)} + ${FFN_PER_POD:-$(default FFN_PER_POD)} ))
+LAYOUT=${LAYOUT:-$(grep -oE 'LAYOUT:-[0-9AF,]+' "$RECIPE_SCRIPT_PATH" | cut -d- -f2)}
+IFS=, read -ra ENTRIES <<<"$LAYOUT"
+for e in "${ENTRIES[@]}"; do f=${e#*A}; echo "$e -> $(( ${e%%A*} + ${f%F} )) GPUs"; done
 ```
 
 ## 3. Confirm before touching the cluster
@@ -138,17 +139,19 @@ recipe) against the one shared `templates/pod.yaml`:
 ```bash
 deploy_pod() {
   local pod_name="$1" gpu="$2" attn_role="$3" ffn_role="$4" extra_env_pairs="$5"
-  # extra_env_pairs: space-separated VAR=value tokens straight off this
-  # plan entry's header line (including POD=... itself), empty for a plain
-  # recipe. Build the spliced env-entries block for templates/pod.yaml.
-  # Leading (not trailing) newlines keep the `# ${TEMPLATE_EXTRA_ENV}`
-  # placeholder line a harmless comment when this is empty, and valid
-  # sibling list items when it isn't.
-  local extra_env=""
-  for pair in $extra_env_pairs; do
+  # extra_env_pairs: one VAR=value per line -- this plan entry's overrides
+  # (including POD=... itself) plus the caller's settings -- empty for a plain
+  # recipe. Values may hold spaces and JSON (VLLM_ARGS, DECODE_BENCH); they
+  # become single-quoted YAML strings. Leading (not trailing) newlines keep
+  # the `# ${TEMPLATE_EXTRA_ENV}` placeholder line a harmless comment when
+  # this is empty, and valid sibling list items when it isn't.
+  local extra_env="" pair val q="'"
+  while IFS= read -r pair; do
+    [ -n "$pair" ] || continue
+    val=${pair#*=}
     extra_env="$extra_env
-        - {name: ${pair%%=*}, value: \"${pair#*=}\"}"
-  done
+        - {name: ${pair%%=*}, value: '${val//$q/$q$q}'}"
+  done <<<"$extra_env_pairs"
 
   kubectl delete pod "$pod_name" --ignore-not-found
 
@@ -172,16 +175,24 @@ Placement-driven recipe, one call per entry parsed in
 
 ```bash
 deploy_pod vllm-pod-attention-0 2 head none "POD=ATTENTION_0"
-deploy_pod vllm-pod-attention-1 2 worker none "POD=ATTENTION_1 ATTENTION_HEADLESS=1 ATTENTION_DP_START_RANK=2"
+deploy_pod vllm-pod-attention-1 2 worker none $'POD=ATTENTION_1\nATTENTION_HEADLESS=1\nATTENTION_DP_START_RANK=2'
 deploy_pod vllm-pod-ffn-0 2 none head "POD=FFN_0"
 ```
 
-`POD=AFD_<index>` recipe, e.g. the DeepEP M2N 2 x 4A1F plan (5 GPUs per pod):
+`LAYOUT` recipe, e.g. `LAYOUT=2A0F,0A2F` (2 GPUs per pod) with the
+decode-only benchmark, or `LAYOUT=4A1F,4A1F` (5 GPUs per pod):
 
 ```bash
-deploy_pod vllm-pod-afd-0 5 head head "POD=AFD_0"
-deploy_pod vllm-pod-afd-1 5 worker worker "POD=AFD_1"
+SETTINGS=$'LAYOUT=2A0F,0A2F\nDECODE_BENCH={"num_prompts": 500, "max_output_len": 256}\nAFD_REPO=/opt/afd-plugin'
+deploy_pod vllm-pod-afd-0 2 head none $'POD=AFD_0\n'"$SETTINGS"
+deploy_pod vllm-pod-afd-1 2 none head $'POD=AFD_1\n'"$SETTINGS"
+
+deploy_pod vllm-pod-afd-0 5 head head $'POD=AFD_0\nLAYOUT=4A1F,4A1F'
+deploy_pod vllm-pod-afd-1 5 worker worker $'POD=AFD_1\nLAYOUT=4A1F,4A1F'
 ```
+
+A one-entry `LAYOUT` with settings is a plain pod with env, e.g.
+`deploy_pod vllm-pod 4 head head $'VLLM_ARGS=--max-num-seqs 32'`.
 
 ## 4f. Wait for Running, then for each pod's own readiness line
 
