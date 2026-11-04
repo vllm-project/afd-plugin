@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import types
 from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 
@@ -49,6 +50,13 @@ def test_fix_all2all_backend_preserves_model_owned_sp():
     config = _vllm_config(use_sequence_parallel_moe=True)
     fix_all2all_backend_for_afd(config)
     assert config.parallel_config.all2all_backend == "allgather_reducescatter"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_routing_id_op(monkeypatch):
+    """The installer registers the routing-id op; CPU runs stub that module."""
+    stub = types.ModuleType("afd_plugin.compat.npu.routing_ids")
+    monkeypatch.setitem(sys.modules, "afd_plugin.compat.npu.routing_ids", stub)
 
 
 @pytest.fixture

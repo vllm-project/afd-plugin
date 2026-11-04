@@ -418,3 +418,24 @@ Some native kernels poll device flags without a process-group timeout; a stuck
 round terminates its worker rather than trying to synchronize it during cleanup.
 The external Linux `timeout` in the examples also bounds startup and teardown.
 Device cleanup after failure still requires validation on the target stack.
+
+## check_routing_boundary_reuse.py
+
+Device check for the opaque routing-id boundary. Requires an Ascend host with the pinned stack
+(`vllm`, `vllm-ascend`). Run it directly:
+
+```bash
+cd <repo root>
+python tests/npu/check_routing_boundary_reuse.py
+```
+
+It compiles once with the profile flag set, asserts that call produced balanced IDs, then clears the
+flag and reuses the same compiled callable for two distinct non-balanced inputs (asserting a single
+compilation). It then captures an ACL graph with the flag cleared and replays it twice over the same
+static buffer, checking each replay's IDs outside the captured region. Expected output:
+
+```text
+eager compiled reuse: OK
+acl graph reuse: OK
+ALL CHECKS PASSED
+```

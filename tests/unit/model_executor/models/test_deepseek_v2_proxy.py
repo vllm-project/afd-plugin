@@ -405,6 +405,7 @@ def test_decoder_inherits_native_forward_without_override():
     )
 
 
+@pytest.mark.usefixtures("registered_routing_ids_op")
 def test_attention_gate_balances_only_profile_routing(monkeypatch):
     pytest.importorskip("vllm_ascend")
     from vllm.forward_context import override_forward_context

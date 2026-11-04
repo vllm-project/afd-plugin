@@ -120,7 +120,6 @@ def compute_gate_topk(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute routing payloads for a native-path gate proxy."""
     # Keep optional Ascend imports at the NPU execution boundary.
-    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
     router_logits, _ = gate(hidden_states)
     afd_metadata = get_afd_metadata_from_forward_context()
@@ -165,11 +164,13 @@ def compute_gate_topk(
     )
     # This proxy bypasses AscendRoutedExperts, which balances dummy profile
     # routing. Reuse the logical-ID layout without changing live routing.
-    if force_balanced_topk_ids_enabled() or _EXTRA_CTX.in_profile_run:
-        topk_ids = _force_balanced_topk_ids(
-            topk_ids,
-            num_logical_experts=router_logits.shape[1],
-        )
+    # The profile flag is read inside the custom op so tracing cannot
+    # specialize the branch on the profile-time value.
+    torch.ops.vllm.afd_balance_routing_ids_(
+        topk_ids,
+        router_logits.shape[1],
+        force_balanced_topk_ids_enabled(),
+    )
     topk_weights = topk_weights.to(torch.float32)
     return topk_weights, topk_ids, router_logits
 
@@ -454,23 +455,6 @@ def _gmmswigluquant_fusion_enabled() -> bool:
     ascend_config = get_ascend_config()
     fusion_config = getattr(ascend_config, "ascend_fusion_config", None)
     return bool(getattr(fusion_config, "fusion_ops_gmmswigluquant", False))
-
-
-def _force_balanced_topk_ids(
-    topk_ids: torch.Tensor,
-    *,
-    num_logical_experts: int,
-) -> torch.Tensor:
-    balanced_topk_ids = torch.arange(
-        topk_ids.numel(),
-        device=topk_ids.device,
-        dtype=torch.int64,
-    ).reshape(topk_ids.shape)
-    balanced_topk_ids = balanced_topk_ids.remainder(num_logical_experts).to(
-        dtype=topk_ids.dtype,
-    )
-    topk_ids.copy_(balanced_topk_ids)
-    return topk_ids
 
 
 __all__ = [
