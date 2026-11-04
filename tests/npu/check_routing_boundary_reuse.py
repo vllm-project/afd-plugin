@@ -16,6 +16,12 @@ Assertions:
 
 from __future__ import annotations
 
+import os
+
+# The pinned Ascend resolves _EXTRA_CTX.* out of additional_kwargs only in V2
+# mode; set it before any vllm import so this check exercises that path.
+os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "1")
+
 import torch
 import torch_npu  # noqa: F401  registers the device
 from vllm.forward_context import override_forward_context
