@@ -43,7 +43,7 @@ Directory names follow these conventions:
 | GPU (SM90+) | `DeepEPM2NAFDConnector` | Qwen3-235B-A22B-FP8 | Decode | 4A2F FP8-payload configuration run on H200 | [Launch examples](gpu/DeepEPM2NAFDConnector/qwen3_235b_a22b_fp8/README.md) |
 | Ascend NPU | `CAMP2pAFDConnector` | DeepSeek-V3.2 | Decode | Historical v0.19.1rc1 recipe; not qualified for the 0.32 target | [Synchronous decode](npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) |
 | Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V3.2 | Prefill / decode | Historical v0.19.1rc1/v0.26 recipes; standard V3.2 is unsupported by the current Async CAM path | [Async CAM](npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) |
-| Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V4-Flash W4A8/W8A8 DSpark | Separate P / decode, or colocated | v0.32; eager A TP1, F layered eager/FULL. W4A8 PD: native full-draft P TP4, A DP2, F EP4. W8A8 A/F: A DP2, F EP8; PD not qualified | [DSpark A/F](npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md) |
+| Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V4-Flash W4A8/W8A8 DSpark | Separate P / decode, or colocated | v0.32; F layered eager/FULL. W4A8 A/F: target/draft native decode Graph at A DP1/TP4, F EP4. Eager W4A8 PD: native full-draft P TP4, A DP2/TP1, F EP4. W8A8 eager A/F: A DP2/TP1, F EP8; A Graph and PD not qualified | [DSpark A/F](npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md) |
 
 Open the model-level README before running a recipe. It documents the required
 hardware and runtime baseline, topology, environment variables, launch order,

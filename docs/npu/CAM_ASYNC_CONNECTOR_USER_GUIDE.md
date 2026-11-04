@@ -17,11 +17,12 @@ Current runtime constraints and validation evidence are summarized in the
 
 ## When to use this connector
 
-Use this connector for eager asynchronous Ascend inference with these requirements:
+Use this connector for asynchronous Ascend inference with these requirements:
 
 - plugin-owned Ascend operators are built and installed on every node;
 - Attention performs MoE gating before dispatch to FFN ranks;
-- Attention execution is eager and AFD async-DP is enabled; **`async_dp=true` is required**;
+- Attention uses eager execution or the DeepSeek-V4 graph profile below;
+  **`async_dp=true` is required**;
 - regular prefill and autoregressive decode steps use the same CAM path;
 - optional ubatching uses exactly two native MRV2 DBO microbatches,
   including Attention DP1.
@@ -33,8 +34,8 @@ Attention DP replicas make that decision independently; FFN is connector-driven.
 
 FFN also supports the experimental complete-transaction FULL mode described in
 [Async FFN runtime](ASYNC_FFN_RUNTIME.md#selection-and-startup).
-FULL requires MRV2 on both roles and accepts Attention-side DBO under the
-existing constraints. Attention graph execution remains unsupported.
+FULL requires MRV2 on both roles and accepts eager Attention-side DBO under
+the existing constraints. The target Attention graph profile is described below.
 
 ## ModelRunnerV2 deployment
 
@@ -45,7 +46,7 @@ Attention uses native Ascend ModelRunnerV2; FFN uses the independent
 The V2 Async CAM contract is:
 
 - DeepSeek-V4 with homogeneous W4A8 or W8A8 routed experts on Ascend 910C/A3;
-- `--enforce-eager` on Attention and `--enable-expert-parallel` on both roles, with
+- eager Attention or the target graph profile below, and `--enable-expert-parallel` on both roles, with
   `async_dp=true` and `compute_gate_on_attention=true`;
 - on FFN, select eager with `--enforce-eager`; for FULL, omit `--enforce-eager`
   and pass `--compilation-config '{"cudagraph_mode":"FULL"}'`, following the narrow
@@ -66,6 +67,37 @@ At every Attention DP size, `--enable-dbo` uses native child preparation,
 per-ubatch model forwards, and output merge. Native
 splitting can divide one request across microbatches. Native draft-model/MTP
 paths other than DeepSeek-V4 DSpark are unsupported.
+
+### DeepSeek-V4 target Attention graph
+
+For a DeepSeek-V4 deployment, replace Attention's `--enforce-eager`
+with native ACL decode graph selection:
+
+```bash
+--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'
+```
+
+The profile requires PP=PCP=DCP=1, static expert placement,
+and SP/FlashComm1 and DBO/ubatching disabled. DSpark may stay enabled: `speculative_config.enforce_eager=true` keeps the
+draft eager; `false` enables its native query Graph alongside target Graph. Target and draft use matching
+TP widths. Other speculative methods and KV-transfer connectors are outside this
+profile; PD is not enabled by this option. Draft Graph requires target Graph because
+native target capture owns the draft capture lifecycle.
+Attention DPs remain independent. Each Attention TP group uses the existing
+CAM token split and output gather; set `attn_ranks_per_dp` to Attention TP
+on both roles. Existing eager Attention TP/SP support is unchanged.
+
+Native Ascend owns graph inputs, batch buckets, attention-parameter updates and
+replay. Ineligible batches, including prefill, retain native eager fallback.
+Compilation mode 0 disables Dynamo while retaining ACL graph capture.
+AFD stages local real/padded token metadata before capture/replay; Async CAM
+does not send synchronous DP control messages. Existing synchronous connectors
+retain their control-plane behavior.
+
+Keep the existing FFN execution settings. FFN two-stream still requires eager
+Attention and is not supported with this profile. Transport warmup and F
+service readiness use the existing startup protocol. This option introduces no
+new graph owner, native kernel or shutdown protocol.
 
 ## CAM async data flow
 
@@ -292,7 +324,8 @@ actual vendor library path. Missing source operators fail startup.
 
 ## Current limitations
 
-- Attention is eager. FFN FULL targets homogeneous W4A8 or W8A8 layers on A3/910C;
+- Attention is eager except for the DeepSeek-V4 native decode graph profile above.
+  FFN FULL targets homogeneous W4A8 or W8A8 layers on A3/910C;
   see [supported configuration](ASYNC_FFN_RUNTIME.md#selection-and-startup)
   and [validation commands](ASYNC_FFN_RUNTIME.md#validation).
   Broader models and topologies require separate validation.

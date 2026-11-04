@@ -34,11 +34,14 @@ and network interface. A TP1/DP1 and F EP4 use five distinct DIEs.
 MODEL=/absolute/path/to/dsv4-flash-dspark-w4a8
 LOCAL_IP=REPLACE_WITH_COMMUNICATION_IP
 INTERFACE=eth0
-NUM_A=1
+A_DP=1
+A_TP=1
+NUM_A=$((A_DP * A_TP))
 NUM_F=4
 A_DEVICES=0
 F_DEVICES=4,5,6,7
 FFN_EXEC_ARGS=(--enforce-eager)
+A_EXEC_ARGS=(--enforce-eager)
 
 export VLLM_USE_V2_MODEL_RUNNER=1 VLLM_ASCEND_ENABLE_FLASHCOMM1=0
 export BATCH_SIZE_FACTOR=0.00390625
@@ -61,14 +64,30 @@ COMMON_ARGS=(
   --no-disable-hybrid-kv-cache-manager
 )
 DSPARK_CONFIG="{\"method\":\"dspark\",\"model\":\"$MODEL\",\"num_speculative_tokens\":5,\"enforce_eager\":true}"
+A_DSPARK_CONFIG="$DSPARK_CONFIG"
 ```
 
-For DP2 set `NUM_A=2` and `A_DEVICES=0,1`. The W4A8 example uses F EP4.
+For DP2/TP1 set `A_DP=2`, recompute `NUM_A`, and use `A_DEVICES=0,1`. The W4A8 example uses F EP4.
 For a W8A8 checkpoint, size F for its larger weights; the validated W8A8
 configuration uses `NUM_F=8` and `F_DEVICES=8,9,10,11,12,13,14,15`.
-Target and draft Attention use eager execution. F uses layered eager or layered
-FULL, with one combined target/draft weight table. Layered eager can be slower
-for small decode batches, so measure the chosen deployment.
+Target and draft use matching Attention TP widths; F remains TP1 with EP.
+Target Attention may use eager execution or the native decode graph.
+`A_DSPARK_CONFIG` selects native draft eager/Graph execution on A; F's
+`DSPARK_CONFIG` and expert execution settings remain independent. To enable both
+Attention graphs, set the following before launching. Keep `enforce_eager=true`
+in `A_DSPARK_CONFIG` when only the target graph is wanted.
+
+```bash
+A_EXEC_ARGS=(--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}')
+A_DSPARK_CONFIG="{\"method\":\"dspark\",\"model\":\"$MODEL\",\"num_speculative_tokens\":5,\"enforce_eager\":false}"
+```
+
+Native capture buckets are normalized separately for target verification and
+draft queries; choose buckets covering both query widths and `max-num-seqs`.
+For A TP4, set `A_TP=4`, `A_DP=1`, recompute `NUM_A`, and use four distinct
+A devices. Both roles use the same A TP width for CAM topology. F uses layered eager or layered FULL,
+with one combined target/draft weight table. Layered eager can be slower for
+small decode batches, so measure the chosen deployment.
 
 For F FULL, replace the F settings above before launching:
 
@@ -78,8 +97,8 @@ FFN_EXEC_ARGS=(--compilation-config '{"cudagraph_mode":"FULL"}')
 
 F captures one DR → layered FFN → CS transaction and repeatedly replays it for
 both target and draft layers. The bounded replay group is independent of request
-and target/draft phase boundaries. A and the native draft configuration retain
-eager execution. FULL requires matching W4A8 or W8A8 layouts on all layers; unsupported
+and target/draft phase boundaries. Attention target/draft graph choices are
+independent of F's execution mode. FULL requires matching W4A8 or W8A8 layouts on all layers; unsupported
 graph modes fail startup. DSpark does not support DBO or FFN two-stream.
 
 Layered W4A8 forwards the model's `swiglu_limit` for both target and draft
@@ -106,17 +125,17 @@ vllm serve "$MODEL" "${COMMON_ARGS[@]}" "${FFN_EXEC_ARGS[@]}" \
       \"host\":\"$LOCAL_IP\",\"port\":12499,
       \"num_attention_ranks\":$NUM_A,\"num_ffn_ranks\":$NUM_F,
       \"compute_gate_on_attention\":true,
-      \"connector_extra_config\":{\"dynamicQuant\":1,\"attn_ranks_per_dp\":1}
+      \"connector_extra_config\":{\"dynamicQuant\":1,\"attn_ranks_per_dp\":$A_TP}
     }
   }" >ffn.log 2>&1 &
 ```
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES="$A_DEVICES" VLLM_PLUGINS=ascend,afd \
-vllm serve "$MODEL" "${COMMON_ARGS[@]}" --enforce-eager \
+vllm serve "$MODEL" "${COMMON_ARGS[@]}" "${A_EXEC_ARGS[@]}" \
   --port 7100 --data-parallel-rpc-port 17100 \
-  --tensor-parallel-size 1 --data-parallel-size "$NUM_A" \
-  --all2all-backend allgather_reducescatter --speculative-config "$DSPARK_CONFIG" \
+  --tensor-parallel-size "$A_TP" --data-parallel-size "$A_DP" \
+  --all2all-backend allgather_reducescatter --speculative-config "$A_DSPARK_CONFIG" \
   --additional-config "{
     \"enable_cpu_binding\":false,\"enable_force_eplb\":false,
     \"enable_dsa_cp\":false,\"multistream_dsv4_dsa_overlap\":false,
@@ -125,7 +144,7 @@ vllm serve "$MODEL" "${COMMON_ARGS[@]}" --enforce-eager \
       \"host\":\"$LOCAL_IP\",\"port\":12499,
       \"num_attention_ranks\":$NUM_A,\"num_ffn_ranks\":$NUM_F,
       \"compute_gate_on_attention\":true,
-      \"connector_extra_config\":{\"dynamicQuant\":1,\"attn_ranks_per_dp\":1}
+      \"connector_extra_config\":{\"dynamicQuant\":1,\"attn_ranks_per_dp\":$A_TP}
     }
   }" >attention.log 2>&1 &
 ```

@@ -297,7 +297,9 @@ register no FIA workspace, so those models, DeepSeek V4 among them, take the
 generic two-stage path with no MLA registries.
 
 With synchronous CAMP2P, the NPU V2 runner supports eager, `FULL`, and
-`FULL_DECODE_ONLY`; Async CAM is eager-only. Like CUDA V2,
+`FULL_DECODE_ONLY`; Async CAM additionally admits DSV4 target native
+`FULL_DECODE_ONLY` with compilation mode 0 and no SP/DBO or PD; DSpark draft may be eager or native Graph.
+Like CUDA V2,
 it publishes descriptor-matched warmup/capture control outside formal graph
 capture and installs an instance-scoped pre-replay hook because native full
 replay creates no `ForwardContext`. V2 does not use `AscendUBatchWrapper` and
@@ -369,7 +371,7 @@ does not expand the supported runtime contract.
 | CUDA V2 + `DeepEPM2NAFDConnector` | Eager or `FULL_DECODE_ONLY` native V2 CUDA Graph; SM90 or newer | Exactly two native microbatches, enabled on both roles; Attention DP1 or DP > 1, TP1 or TP2 | Qwen3 MoE only (all layers MoE, no shared expert); `compute_gate_on_attention=true`; FFN TP1 with EP over all FFN ranks, linear placement, `allgather_reducescatter` all2all and the Triton MoE weight layout; BF16 or block-128 FP8 payload; EPLB, PP/CP and SP MoE rejected | Historical vLLM 0.30 Qwen3-30B-A3B 2A2F GSM8K E2E for eager, graph, graph + DBO, and Attention TP2 eager/graph on H100 and H200, and for eager, graph and graph + DBO on GB200; two-node 2A2F eager, graph and graph + DBO with Attention and FFN on separate nodes; [GPU connector device tests](../../../tests/gpu/README.md) |
 | Historical Ascend V1 (removed) + `CAMP2pAFDConnector` | Eager or current ACL Graph path | Native DBO, exactly two ubatches | Common and connector-local `compute_gate_on_attention=false`; `connector_extra_config.quant_mode=0`; plugin CANN ops required | V2-Lite 2A2F graph 300-question comparison, 2A1F/2A2F functional checks, and Legacy DBO regressions; runtime, graph, ops, connector, and profiler unit tests |
 | Ascend V2 + `CAMP2pAFDConnector` | Eager, `FULL`, or `FULL_DECODE_ONLY` native V2 ACL Graph | Eager or graph native DBO with two ubatches and Attention DP > 1; plain MLA graph DBO requires `FULL_DECODE_ONLY` | `compute_gate_on_attention=false`; PP/CP, elastic EP and EPLB rejected; model-specific SP policy; role ranks equal DP x TP | Historical 0.30 V2-Lite 2A2F FULL 300-question comparison and 2A1F functional checks; current 0.32 Lite evidence is in the [validation record](https://github.com/vllm-project/afd-plugin/pull/507) |
-| Ascend V2 + `CAMAsyncAFDConnector` | Eager Attention; layered FFN eager or FULL | Two native DBO microbatches on Attention, including DP1 and with FFN FULL; FFN stays outside the native DBO schedule | Experimental DeepSeek-V4 W4A8/W8A8 on A3/910C; `async=true`, `compute_gate_on_attention=true`, and `dynamicQuant=1`; PP/CP unsupported; plugin-owned async CAM ops required | Historical DSV4 layered comparisons and limitations are in the [validation record](https://github.com/vllm-project/afd-plugin/pull/507); they predate removal of the legacy path |
+| Ascend V2 + `CAMAsyncAFDConnector` | Eager Attention or DSV4 target native decode graph; layered FFN eager or FULL | Two native DBO microbatches on eager Attention, including DP1 and with FFN FULL; target-A graph excludes DBO; FFN stays outside the native DBO schedule | Experimental DeepSeek-V4 W4A8/W8A8 on A3/910C; `async=true`, `compute_gate_on_attention=true`, and `dynamicQuant=1`; target-A graph requires SP off, mode 0, DSpark or no speculation, no PD; PP/CP unsupported; plugin-owned async CAM ops required | Historical DSV4 layered comparisons and limitations are in the [validation record](https://github.com/vllm-project/afd-plugin/pull/507); they predate removal of the legacy path; target graph requires its own capture/replay validation |
 
 The 300-question Ascend evidence in this table is historical. The 0.32
 [validation record](https://github.com/vllm-project/afd-plugin/pull/507) separately lists the

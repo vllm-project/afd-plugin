@@ -84,7 +84,7 @@ registers lazy AFD wrapper paths under `AFD`-prefixed aliases.
 | `DeepseekV3ForCausalLM` | `AFDDeepseekV3ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `DeepseekV32ForCausalLM` | `AFDDeepseekV32ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `DeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` |
-| `DSparkDraftModel` | Unsupported | `AFDDSparkDeepseekV4ForCausalLM` (Async CAM: eager A, eager/FULL F) |
+| `DSparkDraftModel` | Unsupported | `AFDDSparkDeepseekV4ForCausalLM` (Async CAM: eager/native decode Graph A, eager/FULL F) |
 | `GlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` |
 | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` |
 | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` |
@@ -171,8 +171,11 @@ installs its own AFD metadata and opts out of cross-DP synchronization; native
 sampling, rejection, heads and context-KV updates are inherited. The
 [0.32 recipe](../../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md)
 describes A/F serving. In PD deployments, Prefill uses the upstream complete
-draft model and KV connector. Attention and native draft proposal execution stay
-eager. F may use the existing FULL transaction graph with one homogeneous W4A8 or W8A8
+draft model and KV connector. Without PD, Attention may use the native
+`FULL_DECODE_ONLY` graph with compilation mode 0, SP and DBO disabled, and
+matching target/draft TP. The draft can remain eager or use its own native graph
+alongside the target graph. PD keeps eager Attention and draft execution.
+F may use the existing FULL transaction graph with one homogeneous W4A8 or W8A8
 table covering target and draft; selection remains on device. DSpark excludes
 DBO and FFN two-stream.
 
