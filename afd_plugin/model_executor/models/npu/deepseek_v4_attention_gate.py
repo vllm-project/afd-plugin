@@ -55,6 +55,7 @@ def compute_attention_gate_topk(
     result and the precast gate weights, then call the CANN selectors on those
     local tokens without entering the native MoE runner's EP communication.
     """
+    assert moe.gate is not None
     router_input = (
         hidden_states.float() if hidden_states_fp32 is None else hidden_states_fp32
     )
@@ -90,6 +91,7 @@ def _compute_sqrtsoftplus_topk(
             f"{moe.scoring_func!r}",
         )
 
+    assert moe.gate is not None
     tid2eid = moe.gate.tid2eid
     if tid2eid is not None:
         from vllm.forward_context import get_forward_context
@@ -132,6 +134,7 @@ def _compute_standard_topk(
 
     from vllm_ascend.device.device_op import DeviceOperator
 
+    assert moe.gate is not None
     norm_type_by_scoring_func = {"softmax": 0, "sigmoid": 1}
     try:
         norm_type = norm_type_by_scoring_func[moe.scoring_func]

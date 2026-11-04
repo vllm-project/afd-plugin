@@ -434,7 +434,7 @@ flag and reuses the same compiled callable for two distinct non-balanced inputs 
 compilation). It then captures an ACL graph with the flag cleared and replays it twice over the same
 static buffer, checking each replay's IDs outside the captured region. Expected output:
 
-```
+```text
 eager compiled reuse: OK
 acl graph reuse: OK
 ALL CHECKS PASSED

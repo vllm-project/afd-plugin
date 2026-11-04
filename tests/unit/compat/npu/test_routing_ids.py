@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import pytest
 
-torch = pytest.importorskip("torch")
+pytest.importorskip("torch")
+import torch  # noqa: E402
 
 NUM_EXPERTS = 8
 TOKENS = 4
