@@ -55,8 +55,6 @@ def compute_attention_gate_topk(
     result and the precast gate weights, then call the CANN selectors on those
     local tokens without entering the native MoE runner's EP communication.
     """
-    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-
     router_input = (
         hidden_states.float() if hidden_states_fp32 is None else hidden_states_fp32
     )
@@ -67,15 +65,14 @@ def compute_attention_gate_topk(
         )
     else:
         topk_weights, topk_ids = _compute_standard_topk(moe, router_logits)
-    if _EXTRA_CTX.in_profile_run:
-        from afd_plugin.model_executor.models.npu.deepseek_v2_attention_gate import (
-            _force_balanced_topk_ids,
-        )
-
-        # The proxy bypasses AscendRoutedExperts' dummy-profile balancing.
-        topk_ids = _force_balanced_topk_ids(
-            topk_ids, num_logical_experts=router_logits.shape[1]
-        )
+    # The proxy bypasses AscendRoutedExperts' dummy-profile balancing. The flag
+    # read lives inside the custom op so tracing records an op call instead of
+    # specializing the branch on the profile-time value.
+    torch.ops.vllm.afd_balance_routing_ids_(
+        topk_ids,
+        router_logits.shape[1],
+        False,
+    )
     return topk_weights.to(torch.float32), topk_ids
 
 

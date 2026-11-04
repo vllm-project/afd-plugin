@@ -90,6 +90,10 @@ def apply_afd_ascend_patches_if_needed() -> None:
     if _PATCHES_APPLIED:
         return
 
+    # Registration-only import: defines torch.ops.vllm.afd_balance_routing_ids_
+    # before the first Attention-side gate runs.
+    from afd_plugin.compat.npu import routing_ids  # noqa: F401
+
     from afd_plugin.compat.patches.npu.mla_graph import (
         apply_afd_mla_graph_patch,
     )
