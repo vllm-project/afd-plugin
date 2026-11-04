@@ -46,8 +46,10 @@ __aicore__ inline void FetchRow(LocalTensor<int8_t> input, GlobalTensor<int8_t> 
     SetFlag<HardEvent::MTE2_V>(stage);
 }
 
+template <class Plan>
 __aicore__ inline void PullAndPrepare(GM_ADDR scratch, const Cam::NativeMegaWorkspace &w,
     const Cam::AfdMegaMoePullNativeTilingData &t, const ReceiveRound &round, Resource &resource) {
+    using Element = typename Plan::Element;
     const uint32_t h = t.config[1], experts = t.config[6], tp = t.config[9];
     const auto shape = PullShape(t);
     Cam::Pull::Layout layout{};
@@ -60,11 +62,11 @@ __aicore__ inline void PullAndPrepare(GM_ADDR scratch, const Cam::NativeMegaWork
     Fence<HardEvent::MTE2_S>();
     uint32_t ub = Cam::Pull::Align(metadataBytes);
     LocalTensor<int8_t> input[2];
-    LocalTensor<int4b_t> packed[2];
+    LocalTensor<Element> packed[2];
     for (uint32_t b = 0; b < 2; ++b) {
         input[b] = resource.ubBuf.GetBufferByByte<int8_t>(ub);
         ub += h + Cam::Pull::ROW_PADDING;
-        packed[b] = resource.ubBuf.GetBufferByByte<int4b_t>(ub);
+        packed[b] = resource.ubBuf.GetBufferByByte<Element>(ub);
         ub += h;
         SetFlag<HardEvent::V_MTE2>(b);
         SetFlag<HardEvent::MTE3_MTE2>(b);
@@ -111,7 +113,7 @@ __aicore__ inline void PullAndPrepare(GM_ADDR scratch, const Cam::NativeMegaWork
                     SetFlag<HardEvent::V_MTE3>(stage);
                     WaitFlag<HardEvent::V_MTE3>(stage);
                     const uint32_t row = first + slice.local + r;
-                    DataCopy(out[uint64_t(row) * h], packed[stage].ReinterpretCast<int8_t>(), h);
+                    DataCopy(out[uint64_t(row) * h], packed[stage].template ReinterpretCast<int8_t>(), h);
                     SetFlag<HardEvent::MTE3_V>(stage);
                     DataCopyPad(scales[row], input[stage][h].ReinterpretCast<float>(), {1U, 4U, 0U, 0U, 0U});
                     auto address = input[stage][h + 32].ReinterpretCast<uint64_t>();
@@ -140,8 +142,10 @@ __aicore__ inline void PullAndPrepare(GM_ADDR scratch, const Cam::NativeMegaWork
 
 // The current MC2 epilogue's bounded column tiles also support I > UB capacity.
 // For a multi-tile row, pass one reduces a global maximum and pass two quantizes.
+template <class Plan>
 class Activation {
 public:
+    using Element = typename Plan::Element;
     static constexpr uint32_t TILE = 3072, SCALE_BATCH = 256;
     __aicore__ Activation(Resource &resource, uint32_t intermediate, float limit)
         : i_(intermediate), limit_(limit) {
@@ -149,7 +153,7 @@ public:
         for (uint32_t b = 0; b < 2; ++b) {
             raw_[b] = resource.ubBuf.GetBufferByByte<half>(ub); ub += 8 * TILE;
             bias_[b] = resource.ubBuf.GetBufferByByte<float>(ub); ub += 8 * TILE;
-            packed_[b] = resource.ubBuf.GetBufferByByte<int4b_t>(ub); ub += TILE;
+            packed_[b] = resource.ubBuf.GetBufferByByte<Element>(ub); ub += TILE;
             SetFlag<HardEvent::V_MTE2>(b);
             SetFlag<HardEvent::MTE3_V>(b);
         }
@@ -280,18 +284,19 @@ private:
         Msd(quant_, msdWork_, packed_[b], n);
         SetFlag<HardEvent::V_MTE3>(b);
         WaitFlag<HardEvent::V_MTE3>(b);
-        DataCopy(out[col / 2], packed_[b].ReinterpretCast<int8_t>(), n / 2);
-        DataCopy(out[i_ / 2 + col / 2], packed_[b][n].ReinterpretCast<int8_t>(), n / 2);
+        DataCopy(out[col / 2], packed_[b].template ReinterpretCast<int8_t>(), n / 2);
+        DataCopy(out[i_ / 2 + col / 2], packed_[b][n].template ReinterpretCast<int8_t>(), n / 2);
         SetFlag<HardEvent::MTE3_V>(b);
     }
     uint32_t i_;
     float limit_;
     LocalTensor<half> raw_[2], msdWork_;
-    LocalTensor<int4b_t> packed_[2];
+    LocalTensor<Element> packed_[2];
     LocalTensor<int8_t> quant_;
     LocalTensor<float> bias_[2], gate_, up_, value_, maximum_, scales_, scaleOut_[2];
 };
 
+template <class Plan>
 __aicore__ inline void ActivateNative(GM_ADDR scratch, const Cam::NativeMegaWorkspace &w,
     const Cam::AfdMegaMoePullNativeTilingData &t, const ReceiveRound &round, GM_ADDR biases,
     int64_t layer, Resource &resource) {
@@ -322,7 +327,7 @@ __aicore__ inline void ActivateNative(GM_ADDR scratch, const Cam::NativeMegaWork
     s1.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scratch + w.scale1));
     s2.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scratch + w.scale2));
     out.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(scratch + w.a2));
-    NativeActivation activation(resource, 2 * i);
+    typename Plan::NativeActivation activation(resource, 2 * i);
     uint32_t begin = 0;
     for (uint32_t index = 0; index < round.activeCount; ++index) {
         if (!SyncExpert(index, round.activeCount)) continue;
@@ -349,11 +354,12 @@ __aicore__ inline void ActivateNative(GM_ADDR scratch, const Cam::NativeMegaWork
     activation.Finalize();
 }
 
+template <class Plan>
 __aicore__ inline void Activate(GM_ADDR scratch, const Cam::NativeMegaWorkspace &w,
     const Cam::AfdMegaMoePullNativeTilingData &t, const ReceiveRound &round, GM_ADDR biases,
     int64_t layer, Resource &resource) {
-    if (t.config[2] <= Activation::TILE) {
-        ActivateNative(scratch, w, t, round, biases, layer, resource);
+    if (t.config[2] <= Activation<Plan>::TILE) {
+        ActivateNative<Plan>(scratch, w, t, round, biases, layer, resource);
         return;
     }
     const uint32_t i = t.config[2], experts = t.config[6], id = GetBlockIdx();
@@ -365,7 +371,7 @@ __aicore__ inline void Activate(GM_ADDR scratch, const Cam::NativeMegaWorkspace 
     s1.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scratch + w.scale1));
     s2.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scratch + w.scale2));
     out.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(scratch + w.a2));
-    Activation activation(resource, i, t.swigluLimit);
+    Activation<Plan> activation(resource, i, t.swigluLimit);
     uint32_t groupBegin = 0, expert = 0, group = 0;
     for (uint32_t index = 0; index < round.activeCount; ++index) {
         if (!SyncExpert(index, round.activeCount)) continue;
@@ -377,8 +383,8 @@ __aicore__ inline void Activate(GM_ADDR scratch, const Cam::NativeMegaWorkspace 
         const uint32_t first = groupBegin + id * each + Min(id, tail);
         const uint32_t count = each + (id < tail);
         // Bound UB usage even when one expert consumes the entire receive capacity.
-        for (uint32_t offset = 0; offset < count; offset += Activation::SCALE_BATCH) {
-            const uint32_t length = Min(Activation::SCALE_BATCH, count - offset);
+        for (uint32_t offset = 0; offset < count; offset += Activation<Plan>::SCALE_BATCH) {
+            const uint32_t length = Min(Activation<Plan>::SCALE_BATCH, count - offset);
             const uint32_t stage = group++ % 2;
             auto scaleOut = activation.BeginScale(stage);
             activation.LoadScales(s1[first + offset], length);
@@ -584,6 +590,7 @@ private:
     GlobalTensor<uint64_t> routeGm_;
 };
 
+template <class Plan>
 __aicore__ inline void Combine(GM_ADDR scratch, const Cam::NativeMegaWorkspace &w,
     const Cam::AfdMegaMoePullNativeTilingData &t, const ReceiveRound &round, GM_ADDR biases,
     int64_t layer, Resource &resource) {
@@ -595,7 +602,7 @@ __aicore__ inline void Combine(GM_ADDR scratch, const Cam::NativeMegaWorkspace &
     scales.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scratch + w.scale2));
     Output output(resource, scratch + w.x, round.total, scratch + w.output);
     ExpertRowTx rowTx(resource, scratch + w.x, scratch + w.output, h, t.aivNum);
-    Scheduler scheduler;
+    typename Plan::Scheduler scheduler;
     uint32_t startCore = 0, sync = 0, groupBegin = 0;
     for (uint32_t index = 0; index < round.activeCount; ++index) {
         const uint32_t e = round.Expert(index);

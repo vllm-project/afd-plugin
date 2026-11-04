@@ -30,30 +30,18 @@ namespace Catlass::Epilogue::Block { using namespace AscendC; }
 
 namespace AfdNativeMega {
 using namespace AscendC;
+// Shared Catlass aliases. The per-quantization plan header below consumes these.
 using Arch = Catlass::Arch::AtlasA2;
 using Resource = Catlass::Arch::Resource<Arch>;
 using RowMajor = Catlass::layout::RowMajor;
 using Nz = Catlass::layout::zN;
 using VectorLayout = Catlass::layout::VectorLayout;
 using Coord = Catlass::GemmCoord;
-using A = Catlass::Gemm::GemmType<int4b_t, RowMajor>;
-using B = Catlass::Gemm::GemmType<int4b_t, Nz>;
-using C = Catlass::Gemm::GemmType<half, RowMajor>;
-using ActOutput = Catlass::Gemm::GemmType<int8_t, RowMajor>;
-using ActScale = Catlass::Gemm::GemmType<float, VectorLayout>;
-using ActCopy = Catlass::Epilogue::Tile::TileCopy<Arch, C,
-    Catlass::Gemm::GemmType<uint64_t, VectorLayout>, ActScale, ActOutput>;
-using ActMuls = Catlass::Epilogue::Tile::TileElemWiseMuls<Arch,
-    Catlass::Gemm::GemmType<float, RowMajor>, 0>;
-using NativeActivation = Catlass::Epilogue::Block::BlockEpilogue<
-    Catlass::Epilogue::EpilogueAtlasA2W4A8PostPerTokenDequantSwigluQuant<2>,
-    C, ActScale, ActOutput, ActMuls, ActCopy>;
-using Copy = Catlass::Gemm::Tile::QuantTileCopy<Arch, A, B, C, void,
-    Catlass::Gemm::Tile::ScaleGranularity::PER_CHANNEL>;
-using Policy = Catlass::Gemm::MmadAtlasA2W4A4MatmulPerChannelDequant<1, 2, 2, 2, 1, false, true>;
-using Mmad = Catlass::Gemm::Block::BlockMmad<Policy, Catlass::GemmShape<128, 256, 1024>,
-    Catlass::GemmShape<128, 256, 256>, A, B, C, void, Copy>;
-using Scheduler = Catlass::Gemm::Block::GemmIdentityBlockSwizzle<9, 1>;
+} // namespace AfdNativeMega
+
+#include "afd_mega_moe_plan_w4a8.h"
+
+namespace AfdNativeMega {
 constexpr uint32_t CUBE_M = 128, CUBE_N = 256;
 constexpr uint32_t FLAG_SETS = 15, GMM1_READY = 10, ACT_READY = 11;
 constexpr uint32_t MAX_EXPERTS = 128;
@@ -115,21 +103,26 @@ struct ReceiveRound {
 };
 
 // Same Catlass block implementation, preload depth, K shuffle and expert swizzle as MC2.
+// The plan supplies the operand element type, GEMM tiling and scheduler; the
+// receive/round/flag structure below is identical for every quantization.
+template <class Plan>
 __aicore__ inline void Compute(GM_ADDR scratch, const Cam::NativeMegaWorkspace &w,
     const Cam::AfdMegaMoePullNativeTilingData &t, const ReceiveRound &round, GM_ADDR weights,
     GM_ADDR scales, int64_t layer, bool second, Resource &resource) {
+    using Element = typename Plan::Element;
     const uint32_t k = second ? t.config[2] : t.config[1];
     const uint32_t n = second ? t.config[1] : 2 * t.config[2];
-    GlobalTensor<int4b_t> a, b;
-    GlobalTensor<uint64_t> scale;
+    GlobalTensor<Element> a, b;
+    GlobalTensor<typename Plan::WeightScale> scale;
     GlobalTensor<half> out;
-    a.SetGlobalBuffer(reinterpret_cast<__gm__ int4b_t *>(scratch + (second ? w.a2 : w.a1)));
-    b.SetGlobalBuffer(GetLayerTensorAddr<int4b_t>(layer, t.config[13], weights));
-    scale.SetGlobalBuffer(GetLayerTensorAddr<uint64_t>(layer, t.config[13], scales));
+    a.SetGlobalBuffer(reinterpret_cast<__gm__ Element *>(scratch + (second ? w.a2 : w.a1)));
+    b.SetGlobalBuffer(GetLayerTensorAddr<Element>(layer, t.config[13], weights));
+    scale.SetGlobalBuffer(
+        GetLayerTensorAddr<typename Plan::WeightScale>(layer, t.config[13], scales));
     out.SetGlobalBuffer(reinterpret_cast<__gm__ half *>(scratch + (second ? w.c2 : w.c1)));
-    const auto layoutB = Nz::MakeLayout<int4b_t>(k, n);
-    Mmad mm(resource);
-    Scheduler scheduler;
+    const auto layoutB = Nz::MakeLayout<Element>(k, n);
+    typename Plan::Mmad mm(resource);
+    typename Plan::Scheduler scheduler;
     uint32_t startCore = 0, syncGroup = 0;
     for (uint32_t index = 0; index < round.activeCount; ++index) {
         const uint32_t e = round.Expert(index);
@@ -174,6 +167,7 @@ extern "C" __global__ __aicore__ void afd_mega_moe_pull_native(
     GM_ADDR s13, GM_ADDR s2, GM_ADDR b13, GM_ADDR b2, GM_ADDR completion,
     GM_ADDR workspace, GM_ADDR tiling) {
     using namespace AfdNativeMega;
+    using Plan = W4A8Plan;
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     REGISTER_TILING_DEFAULT(Cam::AfdMegaMoePullNativeTilingData);
     REGISTER_TILING_FOR_TILINGKEY("TILING_KEY_VAR == 1", Cam::AfdMegaMoePullNativeTilingData);
@@ -213,13 +207,13 @@ extern "C" __global__ __aicore__ void afd_mega_moe_pull_native(
                 const ReceiveRound round(scratch, w, c[6]);
                 if (round.total) {
                     if ASCEND_IS_AIC {
-                        Compute(scratch, w, t, round, w13, s13, layer, false, resource);
-                        Compute(scratch, w, t, round, w2, s2, layer, true, resource);
+                        Compute<Plan>(scratch, w, t, round, w13, s13, layer, false, resource);
+                        Compute<Plan>(scratch, w, t, round, w2, s2, layer, true, resource);
                     }
                     if ASCEND_IS_AIV {
-                        PullAndPrepare(scratch, w, t, round, resource);
-                        Activate(scratch, w, t, round, b13, layer, resource);
-                        Combine(scratch, w, t, round, b2, layer, resource);
+                        PullAndPrepare<Plan>(scratch, w, t, round, resource);
+                        Activate<Plan>(scratch, w, t, round, b13, layer, resource);
+                        Combine<Plan>(scratch, w, t, round, b2, layer, resource);
                     }
                 }
             }
