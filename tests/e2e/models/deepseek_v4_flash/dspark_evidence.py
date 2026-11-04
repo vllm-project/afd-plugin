@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Opt-in eager DSpark ownership and remote-expert execution evidence.
+"""Opt-in DSpark ownership and remote-expert execution evidence.
 
 Legacy work items already expose a host layer ID. Layered execution requires
-reading the device header after each return, adding synchronization. Disable
-this fixture for performance measurements.
+reading the device header after each eager return, adding synchronization.
+FULL observations use the separate completion-boundary extension. Disable
+these fixtures for performance measurements.
 """
 
 from __future__ import annotations
@@ -65,6 +66,9 @@ def snapshot(runner) -> dict:
                 "executor_layer_ids": list(runner._layered_executor.layer_ids)
                 if runner._layered_executor is not None
                 else [],
+                "ffn_mode": runner.effective_mode,
+                "graph_capture_count": runner._graph_capture_count,
+                "graph_replay_count": runner._graph_replay_count,
             }
             if is_ffn
             else {}
@@ -95,7 +99,7 @@ def install_observers() -> None:
     @wraps(send_layered)
     def sent_layered(self, ffn_output, context, **kwargs):
         result = send_layered(self, ffn_output, context, **kwargs)
-        if self.layered_gmm_enabled:
+        if self.layered_gmm_enabled and self.graph_startup.mode == "eager":
             # Functional observer only: the header copy fences the return
             # before a later receive can reuse this work item's metadata.
             header = context.states.token_nums_rankid_layeridx.cpu().tolist()

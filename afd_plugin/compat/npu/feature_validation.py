@@ -238,16 +238,23 @@ def _fail_if_unsupported_npu_afd_async_features(
         if speculative_config.method == "dspark":
             if vllm_config.model_config.hf_text_config.model_type != "deepseek_v4":
                 raise RuntimeError("AFD DSpark supports only DeepSeek-V4 on NPU")
+            if extra_info.ffn_two_stream:
+                raise RuntimeError("AFD DSpark does not support FFN two-stream")
             # The shared MRV2 validator owns PP/CP and static EP constraints.
             # Keep only the additional target/draft restrictions here.
+            # F may replay its expert transaction in FULL; Attention and native
+            # draft proposal execution stay eager.
             if (
-                not vllm_config.model_config.enforce_eager
+                (
+                    afd_config.is_attention_server
+                    and not vllm_config.model_config.enforce_eager
+                )
                 or not speculative_config.enforce_eager
                 or parallel_config.tensor_parallel_size != 1
                 or speculative_config.draft_parallel_config.tensor_parallel_size != 1
             ):
                 raise RuntimeError(
-                    "AFD DSpark requires eager target/draft and target/draft TP=1"
+                    "AFD DSpark requires eager Attention/draft and target/draft TP=1"
                 )
         elif afd_config.is_attention_server and (
             speculative_config.use_eagle() or speculative_config.uses_draft_model()
