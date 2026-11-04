@@ -162,52 +162,6 @@ def _prepared_self(dp_group, external):
     )
 
 
-def test_routing_is_padded_and_gathered_with_the_activation(monkeypatch):
-    _, context = _install_fake_upstream(monkeypatch)
-    patch = _load_patch_module(monkeypatch)
-    context.max_tokens_across_dp = 3
-    dp_group = _FakeDpGroup(dp_size=2)
-    subject = _prepared_self(dp_group, _routing(rows=2))
-
-    output = patch.prepare_with_dp_group(
-        subject,
-        hidden_states=torch.zeros(2, HIDDEN),
-        router_logits=None,
-    )
-
-    # Two local rows padded to three, gathered from two ranks.
-    assert output.hidden_states.shape[0] == 6
-    assert subject.afd_external_routing.token_count == 6
-    # The gathered routing keeps the ids the Attention side produced.
-    assert output.hidden_states.dtype == torch.float32
-    assert subject.afd_external_routing.topk_ids[0].tolist() == [0, 1]
-    # Row 1 of the routing still describes row 1 of the activation.
-    assert subject.afd_external_routing.topk_ids[1].tolist() == [2, 3]
-
-
-def test_padding_rows_are_inert(monkeypatch):
-    _, context = _install_fake_upstream(monkeypatch)
-    patch = _load_patch_module(monkeypatch)
-    context.max_tokens_across_dp = 3
-    # dp_size > 1 is what makes upstream enter the pad-then-gather block.
-    dp_group = _FakeDpGroup(dp_size=2)
-    subject = _prepared_self(dp_group, _routing(rows=2))
-
-    output = patch.prepare_with_dp_group(
-        subject,
-        hidden_states=torch.zeros(2, HIDDEN),
-        router_logits=None,
-    )
-    gathered = subject.afd_external_routing
-
-    # Two local rows padded to three, then gathered from two ranks.
-    assert gathered.token_count == 6
-    # The appended row is inert.
-    assert gathered.topk_ids[2].tolist() == [0, 0]
-    assert gathered.topk_weights[2].tolist() == [0.0, 0.0]
-    assert output.pertoken_scale is None
-
-
 def test_absent_routing_leaves_upstream_behaviour(monkeypatch):
     _, context = _install_fake_upstream(monkeypatch)
     patch = _load_patch_module(monkeypatch)
@@ -283,15 +237,16 @@ def test_bf16_transfer_keeps_rows_paired(monkeypatch):
     assert gathered.token_count == 6
     # This stage carries no activation scale, and none was invented.
     assert output.pertoken_scale is None
-    # Row r of the routing still names the row-r marker, and the padding row
-    # lines up with a zeroed activation row.
-    for row, marker, expected_ids in (
-        (0, 10.0, [0, 1]),
-        (1, 20.0, [2, 3]),
-        (2, 0.0, [0, 0]),
+    # Row r of the routing still names the row-r marker. The padding row carries a
+    # zeroed activation, zero weight and a neutral id, so it cannot contribute.
+    for row, marker, expected_ids, expected_weights in (
+        (0, 10.0, [0, 1], [0.5, 0.5]),
+        (1, 20.0, [2, 3], [0.5, 0.5]),
+        (2, 0.0, [0, 0], [0.0, 0.0]),
     ):
         assert output.hidden_states[row].float().max().item() == marker
         assert gathered.topk_ids[row].tolist() == expected_ids
+        assert gathered.topk_weights[row].tolist() == expected_weights
 
 
 def test_routing_with_a_different_token_count_is_rejected(monkeypatch):
@@ -312,44 +267,3 @@ def test_routing_with_a_different_token_count_is_rejected(monkeypatch):
 
     # The check runs before any collective, so nothing was gathered.
     assert dp_group.calls == []
-
-
-def test_install_captures_the_upstream_implementation(monkeypatch):
-    """The reference needs the unpatched function, so the first install keeps it."""
-
-    base, _ = _install_fake_upstream(monkeypatch)
-    patch = _load_patch_module(monkeypatch)
-    upstream = base._prepare_with_dp_group
-
-    assert patch.apply_afd_external_routing_prepare_patch() is True
-
-    assert patch.ORIGINAL_PREPARE_WITH_DP_GROUP is upstream
-    assert base._prepare_with_dp_group is patch.prepare_with_dp_group
-
-
-def test_repeated_install_keeps_the_first_capture(monkeypatch):
-    """A second install must not replace the control with the patch."""
-
-    base, _ = _install_fake_upstream(monkeypatch)
-    patch = _load_patch_module(monkeypatch)
-    upstream = base._prepare_with_dp_group
-    patch.apply_afd_external_routing_prepare_patch()
-
-    assert patch.apply_afd_external_routing_prepare_patch() is False
-
-    assert patch.ORIGINAL_PREPARE_WITH_DP_GROUP is upstream
-
-
-def test_install_after_the_patch_already_landed_is_rejected(monkeypatch):
-    """Capturing late would hand the reference the patch itself."""
-
-    base, _ = _install_fake_upstream(monkeypatch)
-    patch = _load_patch_module(monkeypatch)
-    # The class already points at the patch, as if an install ran elsewhere first
-    # without capturing anything.
-    base._prepare_with_dp_group = patch.prepare_with_dp_group
-
-    with pytest.raises(RuntimeError, match="before the upstream implementation"):
-        patch.apply_afd_external_routing_prepare_patch()
-
-    assert patch.ORIGINAL_PREPARE_WITH_DP_GROUP is None

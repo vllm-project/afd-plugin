@@ -93,7 +93,6 @@ def test_the_supported_shape_is_accepted_for_both_roles(extra_info, role):
         ({"dbo": True}, "DBO or ubatching"),
         ({"ubatching": True}, "DBO or ubatching"),
         ({"tp": 2}, "tensor-parallel size 1"),
-        ({"tp": 4}, "tensor-parallel size 1"),
     ],
 )
 def test_unsupported_shapes_are_rejected(extra_info, kwargs, match):
@@ -119,3 +118,35 @@ def test_gate_on_ffn_keeps_its_previous_behaviour(extra_info):
     )
 
     assert extra_info.validated == 1
+
+def _real_extra_info():
+    """The connector's own type, which needs vLLM to import.
+
+    ``camp2p`` pulls ``vllm.forward_context`` at module scope, so this file can only reach the
+    real class where vLLM is installed. The validator cases above keep using a stand-in and
+    run everywhere; these two cover the class itself and skip on a bare CPU host.
+    """
+
+    pytest.importorskip("torch")
+    pytest.importorskip("vllm")
+    from afd_plugin.connectors.npu.camp2p import CAMP2PExtraInfo
+
+    return CAMP2PExtraInfo
+
+
+def test_a_connector_level_gate_flag_does_not_block():
+    """The switch is read from ``afd``; the connector-local copy has no say.
+
+    Regression test for a rejection that used to live in ``validate_supported``: a supported
+    shape was refused at startup whenever the flag also appeared under
+    ``connector_extra_config``.
+    """
+
+    _real_extra_info().from_mapping({"compute_gate_on_attention": True}).validate_supported()
+
+
+def test_quant_mode_is_still_rejected():
+    """The transport mode really is unsupported, so that check has to stay."""
+
+    with pytest.raises(RuntimeError, match="only quant_mode=0"):
+        _real_extra_info().from_mapping({"quant_mode": 4}).validate_supported()
