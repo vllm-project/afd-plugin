@@ -25,7 +25,7 @@ from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
 )
-from afd_plugin.connectors.npu.async_cam_startup import (
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup import (
     GRAPH_STARTUP_TIMEOUT_SECONDS,
     POLL_SECONDS,
     FFNGraphPlan,

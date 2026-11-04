@@ -6,8 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from afd_plugin.connectors.npu import async_cam_startup as startup_module
-from afd_plugin.connectors.npu.async_cam_pull import PullFFNSession
+from afd_plugin.connectors.npu.async_cam_runtime import (
+    async_cam_startup as startup_module,
+)
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_pull import PullFFNSession
 from tests.unit.fakes.async_cam_startup import MemoryStore, startup_world
 
 

@@ -15,8 +15,8 @@ primary_code_paths:
   - "afd_plugin/v1/worker/npu/async_ffn_two_stream.py"
   - "afd_plugin/v1/worker/npu/ffn_worker.py"
 related_code_paths:
-  - "afd_plugin/connectors/npu/async_cam_startup.py"
-  - "afd_plugin/connectors/npu/async_cam_pull.py"
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_startup.py"
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_pull.py"
   - "afd_plugin/connectors/**"
   - "afd_plugin/model_executor/**"
   - "afd_plugin/compat/patches/engine_core.py"

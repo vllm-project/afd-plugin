@@ -4,7 +4,9 @@
 
 from threading import Condition
 
-from afd_plugin.connectors.npu.async_cam_startup import AsyncCAMGraphStartup
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup import (
+    AsyncCAMGraphStartup,
+)
 
 
 class MemoryStore:

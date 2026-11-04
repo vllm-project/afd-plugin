@@ -59,8 +59,8 @@ from afd_plugin.connectors.metadata import (
     AFDTransferMetadata,
     AFDTransferState,
 )
-from afd_plugin.connectors.npu.async_cam_pull import PullFFNSession
-from afd_plugin.connectors.npu.async_cam_startup import (
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_pull import PullFFNSession
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup import (
     GRAPH_STARTUP_TIMEOUT_SECONDS,
     POLL_SECONDS,
     AsyncCAMGraphStartup,

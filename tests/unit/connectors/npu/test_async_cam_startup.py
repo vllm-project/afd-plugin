@@ -11,8 +11,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from afd_plugin.connectors.npu import async_cam_startup as startup_module
-from afd_plugin.connectors.npu.async_cam_startup import (
+from afd_plugin.connectors.npu.async_cam_runtime import (
+    async_cam_startup as startup_module,
+)
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup import (
     AsyncCAMGraphStartup,
     FFNGraphPlan,
     resolve_ffn_mode,
@@ -33,9 +35,12 @@ def test_startup_import_needs_no_torch_or_vllm_in_clean_process():
             "import sys; "
             "sys.modules.update(torch=None, vllm=None, "
             "torch_npu=None, vllm_ascend=None); "
-            "from afd_plugin.connectors.npu.async_cam_startup "
+            "from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup "
             "import AsyncCAMGraphStartup; "
-            "assert AsyncCAMGraphStartup(0, 1, 2).mode == 'eager'",
+            "from afd_plugin.connectors.npu.async_cam_runtime.async_cam_pull "
+            "import PullFFNSession; "
+            "assert AsyncCAMGraphStartup(0, 1, 2).mode == 'eager'; "
+            "assert PullFFNSession.requires_drain",
         ],
         capture_output=True,
         text=True,

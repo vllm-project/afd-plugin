@@ -16,7 +16,7 @@ from afd_plugin.compat.npu.feature_validation import (
     fail_if_unsupported_npu_afd_features,
 )
 from afd_plugin.config import parse_afd_config
-from afd_plugin.connectors.npu.async_cam_startup import (
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup import (
     AsyncCAMGraphStartup,
     resolve_ffn_mode,
 )
