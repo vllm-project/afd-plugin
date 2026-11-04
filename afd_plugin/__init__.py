@@ -135,11 +135,24 @@ _QWEN3_5_MODEL_REGISTRATIONS = MappingProxyType(
     }
 )
 
+# The native DeepSeek-V4.1 implementation is Ascend-only, so the architecture
+# resolves to the NPU adapter. Non-NPU hosts are rejected when the AFD model
+# config is built, before any model module is imported.
+_DEEPSEEK_V41_MODEL_REGISTRATIONS = MappingProxyType(
+    {
+        "DeepseekV41ForCausalLM": (
+            "afd_plugin.model_executor.models.npu.deepseek_v41:"
+            "AFDDeepseekV41ForCausalLM"
+        ),
+    }
+)
+
 _MODEL_REGISTRATIONS = MappingProxyType(
     {
         **_DEEPSEEK_MODEL_REGISTRATIONS,
         **_QWEN_MODEL_REGISTRATIONS,
         **_QWEN3_5_MODEL_REGISTRATIONS,
+        **_DEEPSEEK_V41_MODEL_REGISTRATIONS,
     }
 )
 
@@ -233,6 +246,7 @@ __all__ = [
     "parse_optional_afd_config",
     "__version__",
     "_DEEPSEEK_MODEL_REGISTRATIONS",
+    "_DEEPSEEK_V41_MODEL_REGISTRATIONS",
     "_MODEL_REGISTRATIONS",
     "_QWEN_MODEL_REGISTRATIONS",
     "_QWEN3_5_MODEL_REGISTRATIONS",
