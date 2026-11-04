@@ -102,16 +102,6 @@ def apply_afd_ascend_patches_if_needed() -> None:
         raise RuntimeError(
             "AFD NPU MLA graph patch requires the vLLM-Ascend MLA resolver",
         )
-    # The routing patches replace the MoE prepare path, so they belong here rather
-    # than in the config stage: importing them pulls vLLM-Ascend's MoE internals,
-    # which a process that only builds and validates a config does not need. This
-    # runs from the worker constructor, before any model load, warm-up or forward,
-    # and the guard above keeps it to one install per process.
-    #
-    # Both installers are idempotent: the ALLGATHER one returns early when the class
-    # attribute already holds it, and the MC2 one assigns the same function again. An
-    # unusable target raises instead, and that must abort initialization rather than
-    # be caught here.
     _PATCHES_APPLIED = True
 
 

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 from __future__ import annotations
 
-import functools
 import sys
 import types
 from contextlib import contextmanager
@@ -98,8 +97,6 @@ def isolate_ascend_config_installer(monkeypatch):
     config_patch = ModuleType(module_name)
     config_patch.__dict__["apply_afd_ascend_config_patch"] = lambda: None
     monkeypatch.setitem(sys.modules, module_name, config_patch)
-
-
 
 
 @pytest.mark.usefixtures("isolate_ascend_config_installer")

@@ -213,25 +213,6 @@ class AFDMC2CommImpl(MC2CommImpl):
         return AFDPrepareAndFinalizeWithMC2(self.moe_config)
 
 
-def _afd_comm_for(native_comm, cache: dict):
-    """Map the native comm instance to its cached AFD counterpart."""
-    key = id(native_comm)
-    afd_comm = cache.get(key)
-    if afd_comm is None:
-        if isinstance(native_comm, MC2CommImpl):
-            afd_comm = AFDMC2CommImpl(native_comm.moe_config)
-        elif isinstance(native_comm, AllGatherCommImpl):
-            afd_comm = AFDAllGatherCommImpl(native_comm.moe_config)
-        else:
-            raise RuntimeError(
-                "DSV4 external routing is wired for the ALLGATHER and MC2 MoE paths; "
-                f"got {type(native_comm).__name__}. The all-to-all and fused-MC2 paths "
-                "shard differently and are not supported.",
-            )
-        cache[key] = afd_comm
-    return afd_comm
-
-
 # Native comm types the external-routing FFN path supports, and the AFD
 # counterparts that own the external-routing prepare/finalize.
 _AFD_COMM_BY_NATIVE: dict[type, type] = {
@@ -246,17 +227,21 @@ _NATIVE_COMM_BY_AFD: dict[type, type] = {
 def _prebuilt_comms(moe_config) -> dict[type, object]:
     """Build the AFD comm instances the native selector can pick from.
 
-    Construction happens here, in the caller's config context, so the first forward
-    onto MC2 builds nothing. Which types exist comes from the native selection
-    surface; a type the stack was not initialised with is simply absent.
+    The native selector is keyed by ``MoECommType`` and returns ``None`` when this
+    configuration was not initialised with that method, so a missing candidate means
+    the type is simply absent here. Construction happens in the caller's config
+    context, which is why it runs at component creation and not per forward.
     """
+    from vllm_ascend.ascend_forward_context import MoECommType
     from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
     candidates: dict[type, object] = {}
-    for native_type, afd_type in _AFD_COMM_BY_NATIVE.items():
-        try:
-            native = get_moe_comm_method(native_type, moe_config)
-        except Exception:
+    for comm_type, afd_type in (
+        (MoECommType.ALLGATHER, AFDAllGatherCommImpl),
+        (MoECommType.MC2, AFDMC2CommImpl),
+    ):
+        native = get_moe_comm_method(comm_type, moe_config)
+        if native is None:
             continue
         candidates[afd_type] = afd_type(native.moe_config)
     return candidates

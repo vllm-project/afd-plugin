@@ -38,6 +38,13 @@ _MODULE_PATH = (
 _ROUTING_PATH = _REPO_ROOT / "afd_plugin" / "connectors" / "npu" / "external_routing.py"
 
 
+class _MoECommType:
+    ALLGATHER = "ALLGATHER"
+    MC2 = "MC2"
+    ALLTOALL = "ALLTOALL"
+    FUSED_MC2 = "FUSED_MC2"
+
+
 @dataclass(frozen=True)
 class _PrepareOutput:
     hidden_states: torch.Tensor
@@ -116,9 +123,18 @@ def _install_stub_modules():
     comm_module = types.ModuleType("vllm_ascend.ops.fused_moe.moe_comm_method")
     comm_module.AllGatherCommImpl = _AllGatherComm
     comm_module.MC2CommImpl = _MC2Comm
-    comm_module.get_moe_comm_method = lambda native_type, moe_config: native_type(
-        moe_config
-    )
+    # The native selector is keyed by MoECommType and returns None when this
+    # configuration was not initialised with that method.
+    comm_by_type = {
+        _MoECommType.ALLGATHER: _AllGatherComm,
+        _MoECommType.MC2: _MC2Comm,
+    }
+
+    def get_moe_comm_method(comm_type, moe_config=None):
+        impl = comm_by_type.get(comm_type)
+        return None if impl is None else impl(moe_config)
+
+    comm_module.get_moe_comm_method = get_moe_comm_method
 
     moe_utils = types.ModuleType("vllm_ascend.ops.fused_moe.moe_utils")
     moe_utils._pad_tokens_with_cat = lambda tensor, length: tensor
@@ -126,7 +142,10 @@ def _install_stub_modules():
     parallel = types.ModuleType("vllm.distributed.parallel_state")
     parallel.get_pcp_group = lambda: None
 
-    context = types.ModuleType("vllm_ascend.ascend_forward_context")
+    enum_module = types.ModuleType("vllm_ascend.ascend_forward_context")
+    enum_module.MoECommType = _MoECommType
+
+    context = enum_module
     context._EXTRA_CTX = types.SimpleNamespace(
         moe_comm_method=_AllGatherComm(_moe_config()),
         mc2_mask=torch.ones(8, dtype=torch.bool),
@@ -363,3 +382,26 @@ def test_a_failure_during_prepare_clears_state_and_restores_comm(loaded):
     assert experts.ascend_pertoken_scale is None
     assert experts.ascend_mc2_mask is None
     assert context._EXTRA_CTX.moe_comm_method is native, "the comm was not restored"
+
+
+def test_a_missing_mc2_candidate_still_serves_allgather(loaded):
+    """A configuration initialised without MC2 must not need an MC2 candidate."""
+    module, context, comm_module = loaded
+    original = comm_module.get_moe_comm_method
+    comm_module.get_moe_comm_method = lambda comm_type, moe_config=None: (
+        None if comm_type == _MoECommType.MC2 else original(comm_type, moe_config)
+    )
+    try:
+        experts = _Experts()
+        native = _AllGatherComm(experts.moe_config)
+        context._EXTRA_CTX.moe_comm_method = native
+        component = module.AFDExternalRoutingMoE(experts)
+        assert module.AFDMC2CommImpl not in component._candidates
+        component.forward(
+            torch.zeros(4, 2),
+            topk_ids=torch.zeros(4, 1, dtype=torch.int32),
+            topk_weights=torch.ones(4, 1),
+        )
+        assert experts.seen, "the allgather candidate was not used"
+    finally:
+        comm_module.get_moe_comm_method = original
