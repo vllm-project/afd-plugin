@@ -28,7 +28,7 @@ at::Tensor native_mega(const at::Tensor &anchor, const at::Tensor &state,
     TORCH_CHECK(c.size() == 14, "native Mega config requires 14 fields");
     for (auto n : c) TORCH_CHECK(n > 0 && n <= 262144, "native Mega config out of range");
     TORCH_CHECK(c[8] == c[4] + c[5] && c[7] >= c[5] && c[7] < c[8] &&
-        c[0] % c[9] == 0 && c[5] % c[9] == 0 && c[11] == 1 && c[12] == 1 &&
+        c[0] % c[9] == 0 && c[5] % c[9] == 0 && (c[11] == 1 || c[11] == 2) && c[12] == 1 &&
         std::isfinite(routed_scale), "native Mega requires a valid F rank and per-channel weights");
     TORCH_CHECK(std::isfinite(swiglu_limit) && swiglu_limit >= 0.0 &&
         swiglu_limit <= std::numeric_limits<float>::max(),
@@ -52,12 +52,20 @@ at::Tensor native_mega(const at::Tensor &anchor, const at::Tensor &state,
     check(scratch, at::kByte);
     TORCH_CHECK(scratch.dim() == 1 && scratch.numel() == workspace_size(c[10], c[1], c[2], c[6], c[9]),
         "native Mega scratch has the wrong size");
+    const bool packed = c[11] == 1;
+    TORCH_CHECK(packed || (b13.empty() && b2.empty()), "native Mega W8A8 requires empty compensation lists");
     const std::vector<std::pair<at::TensorList, at::ScalarType>> lists{
-        {w13, at::kInt}, {w2, at::kInt}, {s13, at::kLong}, {s2, at::kLong},
-        {b13, at::kFloat}, {b2, at::kFloat}};
+        {w13, packed ? at::kInt : at::kChar}, {w2, packed ? at::kInt : at::kChar},
+        {s13, packed ? at::kLong : at::kFloat}, {s2, packed ? at::kLong : at::kBFloat16}};
     for (const auto &list : lists) {
         TORCH_CHECK(int64_t(list.first.size()) == c[13], "native Mega layer list length mismatch");
         for (const auto &tensor : list.first) check(tensor, list.second);
+    }
+    if (packed) {
+        for (const auto list : {b13, b2}) {
+            TORCH_CHECK(int64_t(list.size()) == c[13], "native Mega layer list length mismatch");
+            for (const auto &tensor : list) check(tensor, at::kFloat);
+        }
     }
     for (int64_t l = 0; l < c[13]; ++l) {
         if constexpr (EXECUTE) {
@@ -65,18 +73,25 @@ at::Tensor native_mega(const at::Tensor &anchor, const at::Tensor &state,
                 vllm_ascend::NPUBridge::GetNpuStorageImplDesc(w2[l]).npu_format_ == ACL_FORMAT_FRACTAL_NZ,
                 "native Mega requires physically NZ packed weights");
         }
-        TORCH_CHECK(w13[l].sizes() == at::IntArrayRef({c[6], c[1], c[2] / 4}) &&
-            w2[l].sizes() == at::IntArrayRef({c[6], c[2], c[1] / 8}), "native Mega packed weights mismatch");
-        TORCH_CHECK(s13[l].numel() == c[6] * 2 * c[2] && s2[l].numel() == c[6] * c[1] &&
-            b13[l].numel() == c[6] * 2 * c[2] && b2[l].numel() == c[6] * c[1],
-            "native Mega scale/compensation dimensions mismatch");
+        TORCH_CHECK(w13[l].sizes() == at::IntArrayRef({c[6], c[1], packed ? c[2] / 4 : 2 * c[2]}) &&
+            w2[l].sizes() == at::IntArrayRef({c[6], c[2], packed ? c[1] / 8 : c[1]}),
+            "native Mega weights mismatch");
+        TORCH_CHECK(s13[l].numel() == c[6] * 2 * c[2] && s2[l].numel() == c[6] * c[1],
+            "native Mega scale dimensions mismatch");
+        if (packed) TORCH_CHECK(b13[l].numel() == c[6] * 2 * c[2] && b2[l].numel() == c[6] * c[1],
+            "native Mega compensation dimensions mismatch");
     }
     auto completion = at::empty({1}, anchor.options().dtype(at::kLong));
     if constexpr (EXECUTE) {
         std::string group(group_name.data(), group_name.size());
         auto group_ptr = group.data();
+        // CANN matches dynamic inputs by dtype even when the W8A8 plan never reads them.
+        std::vector<at::Tensor> empty;
+        if (!packed) empty.push_back(s13[0].slice(0, 0, 0));
+        const at::TensorList compensation13 = packed ? b13 : at::TensorList(empty);
+        const at::TensorList compensation2 = packed ? b2 : at::TensorList(empty);
         EXEC_NPU_CMD(aclnnAfdMegaMoePullNative, anchor, state, layer_map, scratch,
-            w13, w2, s13, s2, b13, b2, c, group_ptr, routed_scale, swiglu_limit, completion);
+            w13, w2, s13, s2, compensation13, compensation2, c, group_ptr, routed_scale, swiglu_limit, completion);
     }
     return completion;
 }

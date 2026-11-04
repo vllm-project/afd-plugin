@@ -108,12 +108,14 @@ __aicore__ inline void PullAndPrepare(GM_ADDR scratch, const Cam::NativeMegaWork
                         FetchRow(input[1 - stage], remote[(prefix + slice.skip + r + 1) * layout.rowStride], h, 1 - stage);
                     WaitFlag<HardEvent::MTE2_V>(stage);
                     WaitFlag<HardEvent::MTE3_V>(stage);
-                    Msd(input[stage], work, packed[stage], h);
+                    if constexpr (Plan::kPackedInt4) Msd(input[stage], work, packed[stage], h);
                     SetFlag<HardEvent::V_MTE2>(stage);
                     SetFlag<HardEvent::V_MTE3>(stage);
                     WaitFlag<HardEvent::V_MTE3>(stage);
                     const uint32_t row = first + slice.local + r;
-                    DataCopy(out[uint64_t(row) * h], packed[stage].template ReinterpretCast<int8_t>(), h);
+                    if constexpr (Plan::kPackedInt4)
+                        DataCopy(out[uint64_t(row) * h], packed[stage].template ReinterpretCast<int8_t>(), h);
+                    else DataCopy(out[uint64_t(row) * h], input[stage], h);
                     SetFlag<HardEvent::MTE3_V>(stage);
                     DataCopyPad(scales[row], input[stage][h].ReinterpretCast<float>(), {1U, 4U, 0U, 0U, 0U});
                     auto address = input[stage][h + 32].ReinterpretCast<uint64_t>();
@@ -146,12 +148,13 @@ template <class Plan>
 class Activation {
 public:
     using Element = typename Plan::Element;
+    using Raw = typename Plan::OutputElement;
     static constexpr uint32_t TILE = 3072, SCALE_BATCH = 256;
     __aicore__ Activation(Resource &resource, uint32_t intermediate, float limit)
         : i_(intermediate), limit_(limit) {
         uint32_t ub = 0;
         for (uint32_t b = 0; b < 2; ++b) {
-            raw_[b] = resource.ubBuf.GetBufferByByte<half>(ub); ub += 8 * TILE;
+            raw_[b] = resource.ubBuf.GetBufferByByte<Raw>(ub); ub += 8 * TILE;
             bias_[b] = resource.ubBuf.GetBufferByByte<float>(ub); ub += 8 * TILE;
             packed_[b] = resource.ubBuf.GetBufferByByte<Element>(ub); ub += TILE;
             SetFlag<HardEvent::V_MTE2>(b);
@@ -174,7 +177,7 @@ public:
         if (rows) DataCopyPad(scales_, source, {1U, 4 * rows, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
         Fence<HardEvent::MTE2_S>();
     }
-    __aicore__ void Row(GlobalTensor<half> raw, GlobalTensor<float> bias,
+    __aicore__ void Row(GlobalTensor<Raw> raw, GlobalTensor<float> bias,
                        GlobalTensor<int8_t> out, LocalTensor<float> scaleOut,
                        uint32_t scaleIndex) {
         const float scale = scales_.GetValue(scaleIndex);
@@ -194,8 +197,9 @@ public:
         }
         Fence<HardEvent::V_S>();
         const float absMax = maximum_.GetValue(0);
-        scaleOut.SetValue(scaleIndex, absMax / 127.0f);
-        const float multiplier = absMax > 0 ? 1.0f / (absMax / 127.0f) : 0.0f;
+        const float quantScale = Plan::kPackedInt4 ? absMax / 127.0f : absMax * (1.0f / 127.0f);
+        scaleOut.SetValue(scaleIndex, quantScale);
+        const float multiplier = Plan::kPackedInt4 ? (absMax > 0 ? 1.0f / quantScale : 0.0f) : quantScale;
         Fence<HardEvent::S_V>();
         if (i_ <= TILE) {
             Quantize(out, 0, i_, 0, multiplier);
@@ -226,10 +230,10 @@ public:
         }
     }
 private:
-    __aicore__ void Fetch(GlobalTensor<half> raw, GlobalTensor<float> bias, uint32_t col, uint32_t b) {
+    __aicore__ void Fetch(GlobalTensor<Raw> raw, GlobalTensor<float> bias, uint32_t col, uint32_t b) {
         WaitFlag<HardEvent::V_MTE2>(b);
         const uint32_t n = Min(TILE, i_ - col);
-        for (uint32_t part = 0; part < 4; ++part)
+        for (uint32_t part = 0; part < 2 * Plan::kRows; ++part)
             DataCopy(raw_[b][part * TILE], raw[part * i_ + col], n);
         DataCopy(bias_[b], bias[col], n);
         DataCopy(bias_[b][TILE], bias[i_ + col], n);
@@ -238,28 +242,35 @@ private:
     __aicore__ void Evaluate(uint32_t b, uint32_t n, float scale) {
         WaitFlag<HardEvent::MTE2_V>(b);
         Cast(gate_, raw_[b], RoundMode::CAST_NONE, n);
-        Cast(value_, raw_[b][2 * TILE], RoundMode::CAST_NONE, n);
-        PipeBarrier<PIPE_V>();
-        Muls(gate_, gate_, 16.0f, n);
-        PipeBarrier<PIPE_V>();
-        Add(gate_, gate_, value_, n);
-        PipeBarrier<PIPE_V>();
-        Cast(up_, raw_[b][TILE], RoundMode::CAST_NONE, n);
-        Cast(value_, raw_[b][3 * TILE], RoundMode::CAST_NONE, n);
-        PipeBarrier<PIPE_V>();
-        Muls(up_, up_, 16.0f, n);
-        PipeBarrier<PIPE_V>();
-        Add(up_, up_, value_, n);
-        PipeBarrier<PIPE_V>();
-        Add(gate_, gate_, bias_[b], n);
-        Add(up_, up_, bias_[b][TILE], n);
+        if constexpr (Plan::kPackedInt4) {
+            Cast(value_, raw_[b][2 * TILE], RoundMode::CAST_NONE, n);
+            PipeBarrier<PIPE_V>();
+            Muls(gate_, gate_, 16.0f, n);
+            PipeBarrier<PIPE_V>();
+            Add(gate_, gate_, value_, n);
+            PipeBarrier<PIPE_V>();
+            Cast(up_, raw_[b][TILE], RoundMode::CAST_NONE, n);
+            Cast(value_, raw_[b][3 * TILE], RoundMode::CAST_NONE, n);
+            PipeBarrier<PIPE_V>();
+            Muls(up_, up_, 16.0f, n);
+            PipeBarrier<PIPE_V>();
+            Add(up_, up_, value_, n);
+            PipeBarrier<PIPE_V>();
+            Add(gate_, gate_, bias_[b], n);
+            Add(up_, up_, bias_[b][TILE], n);
+        } else {
+            Cast(up_, raw_[b][TILE], RoundMode::CAST_NONE, n);
+            PipeBarrier<PIPE_V>();
+            Mul(gate_, gate_, bias_[b], n);
+            Mul(up_, up_, bias_[b][TILE], n);
+        }
         SetFlag<HardEvent::V_MTE2>(b);
         PipeBarrier<PIPE_V>();
         Muls(gate_, gate_, scale, n);
         Muls(up_, up_, scale, n);
         PipeBarrier<PIPE_V>();
-        // Model swiglu_limit, shared with the layered W4A8/A4W4 postprocessors.
-        ClampSwiGLUInputs(gate_, up_, limit_, n);
+        // Match Layered: only W4A8 applies the model limit.
+        if constexpr (Plan::kPackedInt4) ClampSwiGLUInputs(gate_, up_, limit_, n);
         Muls(value_, gate_, -1.0f, n);
         PipeBarrier<PIPE_V>();
         Exp(value_, value_, n);
@@ -273,24 +284,45 @@ private:
     }
     __aicore__ void Quantize(GlobalTensor<int8_t> out, uint32_t col, uint32_t n,
                              uint32_t b, float multiplier) {
-        Muls(gate_, value_, multiplier, n);
-        PipeBarrier<PIPE_V>();
-        auto fp16 = gate_.ReinterpretCast<half>();
-        Cast(fp16, gate_, RoundMode::CAST_RINT, n);
-        PipeBarrier<PIPE_V>();
-        Cast(quant_, fp16, RoundMode::CAST_RINT, n);
-        PipeBarrier<PIPE_V>();
-        WaitFlag<HardEvent::MTE3_V>(b);
-        Msd(quant_, msdWork_, packed_[b], n);
-        SetFlag<HardEvent::V_MTE3>(b);
-        WaitFlag<HardEvent::V_MTE3>(b);
-        DataCopy(out[col / 2], packed_[b].template ReinterpretCast<int8_t>(), n / 2);
-        DataCopy(out[i_ / 2 + col / 2], packed_[b][n].template ReinterpretCast<int8_t>(), n / 2);
+        if constexpr (Plan::kPackedInt4) {
+            Muls(gate_, value_, multiplier, n);
+            PipeBarrier<PIPE_V>();
+            auto fp16 = gate_.ReinterpretCast<half>();
+            Cast(fp16, gate_, RoundMode::CAST_RINT, n);
+            PipeBarrier<PIPE_V>();
+            Cast(quant_, fp16, RoundMode::CAST_RINT, n);
+            PipeBarrier<PIPE_V>();
+            WaitFlag<HardEvent::MTE3_V>(b);
+            Msd(quant_, msdWork_, packed_[b], n);
+            SetFlag<HardEvent::V_MTE3>(b);
+            WaitFlag<HardEvent::V_MTE3>(b);
+            DataCopy(out[col / 2], packed_[b].template ReinterpretCast<int8_t>(), n / 2);
+            DataCopy(out[i_ / 2 + col / 2], packed_[b][n].template ReinterpretCast<int8_t>(), n / 2);
+        } else {
+            Duplicate(gate_, multiplier, n);
+            PipeBarrier<PIPE_V>();
+            Div(gate_, value_, gate_, n);
+            PipeBarrier<PIPE_V>();
+            auto integer = gate_.template ReinterpretCast<int32_t>();
+            Cast(integer, gate_, RoundMode::CAST_RINT, n);
+            PipeBarrier<PIPE_V>();
+            SetDeqScale(half(1.0f));
+            auto fp16 = up_.template ReinterpretCast<half>();
+            Cast(fp16, integer, RoundMode::CAST_ROUND, n);
+            PipeBarrier<PIPE_V>();
+            WaitFlag<HardEvent::MTE3_V>(b);
+            Cast(packed_[b], fp16, RoundMode::CAST_TRUNC, n);
+            PipeBarrier<PIPE_V>();
+            SetFlag<HardEvent::V_MTE3>(b);
+            WaitFlag<HardEvent::V_MTE3>(b);
+            DataCopy(out[col], packed_[b], n);
+        }
         SetFlag<HardEvent::MTE3_V>(b);
     }
     uint32_t i_;
     float limit_;
-    LocalTensor<half> raw_[2], msdWork_;
+    LocalTensor<Raw> raw_[2];
+    LocalTensor<half> msdWork_;
     LocalTensor<Element> packed_[2];
     LocalTensor<int8_t> quant_;
     LocalTensor<float> bias_[2], gate_, up_, value_, maximum_, scales_, scaleOut_[2];
@@ -358,15 +390,17 @@ template <class Plan>
 __aicore__ inline void Activate(GM_ADDR scratch, const Cam::NativeMegaWorkspace &w,
     const Cam::AfdMegaMoePullNativeTilingData &t, const ReceiveRound &round, GM_ADDR biases,
     int64_t layer, Resource &resource) {
-    if (t.config[2] <= Activation<Plan>::TILE) {
-        ActivateNative<Plan>(scratch, w, t, round, biases, layer, resource);
-        return;
+    if constexpr (Plan::kPackedInt4) {
+        if (t.config[2] <= Activation<Plan>::TILE) {
+            ActivateNative<Plan>(scratch, w, t, round, biases, layer, resource);
+            return;
+        }
     }
     const uint32_t i = t.config[2], experts = t.config[6], id = GetBlockIdx();
-    GlobalTensor<half> raw;
+    GlobalTensor<typename Plan::OutputElement> raw;
     GlobalTensor<float> bias, s1, s2;
     GlobalTensor<int8_t> out;
-    raw.SetGlobalBuffer(reinterpret_cast<__gm__ half *>(scratch + w.c1));
+    raw.SetGlobalBuffer(reinterpret_cast<__gm__ typename Plan::OutputElement *>(scratch + w.c1));
     bias.SetGlobalBuffer(GetLayerTensorAddr<float>(layer, t.config[13], biases));
     s1.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scratch + w.scale1));
     s2.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scratch + w.scale2));
@@ -391,7 +425,7 @@ __aicore__ inline void Activate(GM_ADDR scratch, const Cam::NativeMegaWorkspace 
             for (uint32_t r = 0; r < length; ++r) {
                 const uint32_t row = first + offset + r;
                 while (expert < e && row >= round.begin[expert + 1]) ++expert;
-                activation.Row(raw[4ULL * row * i], bias[2ULL * expert * i],
+                activation.Row(raw[2ULL * Plan::kRows * row * i], bias[2ULL * expert * i],
                                out[uint64_t(row) * i], scaleOut, r);
             }
             activation.EndScale(s2[first + offset], stage, length);
@@ -403,14 +437,19 @@ __aicore__ inline void Activate(GM_ADDR scratch, const Cam::NativeMegaWorkspace 
     activation.Finalize();
 }
 
+template <class Plan>
 class Output {
 public:
+    using Raw = typename Plan::OutputElement;
+    using Scale = typename Plan::OutputScale;
     static constexpr uint32_t ROWS = 16, COLS = CUBE_N, ELEMENTS = ROWS * COLS;
     __aicore__ Output(Resource &resource, GM_ADDR routeBase, uint32_t rows, GM_ADDR staged) : totalRows_(rows) {
         uint32_t ub = 0;
         for (uint32_t b = 0; b < 2; ++b) {
-            hi_[b] = resource.ubBuf.GetBufferByByte<half>(ub); ub += 2 * ELEMENTS;
-            lo_[b] = resource.ubBuf.GetBufferByByte<half>(ub); ub += 2 * ELEMENTS;
+            hi_[b] = resource.ubBuf.GetBufferByByte<Raw>(ub); ub += sizeof(Raw) * ELEMENTS;
+            if constexpr (Plan::kPackedInt4) {
+                lo_[b] = resource.ubBuf.GetBufferByByte<half>(ub); ub += 2 * ELEMENTS;
+            }
             bias_[b] = resource.ubBuf.GetBufferByByte<float>(ub); ub += 4 * COLS;
             y_[b] = resource.ubBuf.GetBufferByByte<bfloat16_t>(ub); ub += 2 * ELEMENTS;
             scale_[b] = resource.ubBuf.GetBufferByByte<float>(ub); ub += 4 * ROWS;
@@ -425,15 +464,21 @@ public:
         routeGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(routeBase));
         staged_ = reinterpret_cast<uint64_t>(staged);
     }
-    __aicore__ void Tile(GlobalTensor<half> raw, GlobalTensor<float> bias, GlobalTensor<float> scale,
+    __aicore__ void Tile(GlobalTensor<Raw> raw, GlobalTensor<Scale> bias, GlobalTensor<float> scale,
                          uint32_t row, uint32_t rows, uint32_t col, uint32_t hidden, float routedScale) {
         const uint32_t b = stage_;
         WaitFlag<HardEvent::V_MTE2>(b);
-        DataCopyPad(hi_[b], raw[2ULL * row * hidden + col],
-            {uint16_t(rows), COLS * 2, (2 * hidden - COLS) * 2, 0U, 0U}, {false, 0U, 0U, 0U});
-        DataCopyPad(lo_[b], raw[(2ULL * row + 1) * hidden + col],
-            {uint16_t(rows), COLS * 2, (2 * hidden - COLS) * 2, 0U, 0U}, {false, 0U, 0U, 0U});
-        DataCopy(bias_[b], bias[col], COLS);
+        DataCopyPad(hi_[b], raw[uint64_t(Plan::kRows) * row * hidden + col],
+            {uint16_t(rows), COLS * uint32_t(sizeof(Raw)),
+             (Plan::kRows * hidden - COLS) * uint32_t(sizeof(Raw)), 0U, 0U},
+            {false, 0U, 0U, 0U});
+        if constexpr (Plan::kPackedInt4) {
+            DataCopyPad(lo_[b], raw[(2ULL * row + 1) * hidden + col],
+                {uint16_t(rows), COLS * 2, (2 * hidden - COLS) * 2, 0U, 0U}, {false, 0U, 0U, 0U});
+            DataCopy(bias_[b], bias[col], COLS);
+        } else {
+            DataCopy(bias_[b].template ReinterpretCast<bfloat16_t>(), bias[col], COLS);
+        }
         SetFlag<HardEvent::MTE2_V>(b);
         WaitFlag<HardEvent::V_MTE2>(b + 2);
         if (scaleRow_[b] != row || scaleRows_[b] != rows) {
@@ -451,13 +496,19 @@ public:
         WaitFlag<HardEvent::MTE2_V>(b);
         const uint32_t length = rows * COLS;
         Cast(value_, hi_[b], RoundMode::CAST_NONE, length);
-        Cast(temp_, lo_[b], RoundMode::CAST_NONE, length);
-        PipeBarrier<PIPE_V>();
-        Muls(value_, value_, 16.0f, length);
-        PipeBarrier<PIPE_V>();
-        Add(value_, value_, temp_, length);
-        PipeBarrier<PIPE_V>();
-        for (uint32_t r = 0; r < rows; ++r) Add(value_[r * COLS], value_[r * COLS], bias_[b], COLS);
+        if constexpr (Plan::kPackedInt4) {
+            Cast(temp_, lo_[b], RoundMode::CAST_NONE, length);
+            PipeBarrier<PIPE_V>();
+            Muls(value_, value_, 16.0f, length);
+            PipeBarrier<PIPE_V>();
+            Add(value_, value_, temp_, length);
+            PipeBarrier<PIPE_V>();
+            for (uint32_t r = 0; r < rows; ++r) Add(value_[r * COLS], value_[r * COLS], bias_[b], COLS);
+        } else {
+            Cast(temp_, bias_[b].template ReinterpretCast<bfloat16_t>(), RoundMode::CAST_NONE, COLS);
+            PipeBarrier<PIPE_V>();
+            for (uint32_t r = 0; r < rows; ++r) Mul(value_[r * COLS], value_[r * COLS], temp_, COLS);
+        }
         SetFlag<HardEvent::V_MTE2>(b);
         PipeBarrier<PIPE_V>();
         for (uint32_t r = 0; r < rows; ++r) Muls(value_[r * COLS], value_[r * COLS], scale_[b].GetValue(r), COLS);
@@ -506,7 +557,8 @@ private:
     uint32_t stage_ = 0, scaleRow_[2], scaleRows_[2];
     uint64_t staged_;
     uint32_t totalRows_, routeBegin_ = 0, routeCount_ = 0;
-    LocalTensor<half> hi_[2], lo_[2];
+    LocalTensor<Raw> hi_[2];
+    LocalTensor<half> lo_[2];
     LocalTensor<float> bias_[2], scale_[2], value_, temp_;
     LocalTensor<bfloat16_t> y_[2];
     LocalTensor<uint64_t> routes_;
@@ -595,18 +647,19 @@ __aicore__ inline void Combine(GM_ADDR scratch, const Cam::NativeMegaWorkspace &
     const Cam::AfdMegaMoePullNativeTilingData &t, const ReceiveRound &round, GM_ADDR biases,
     int64_t layer, Resource &resource) {
     const uint32_t h = t.config[1];
-    GlobalTensor<half> raw;
-    GlobalTensor<float> bias, scales;
-    raw.SetGlobalBuffer(reinterpret_cast<__gm__ half *>(scratch + w.c2));
-    bias.SetGlobalBuffer(GetLayerTensorAddr<float>(layer, t.config[13], biases));
+    GlobalTensor<typename Plan::OutputElement> raw;
+    GlobalTensor<typename Plan::OutputScale> bias;
+    GlobalTensor<float> scales;
+    raw.SetGlobalBuffer(reinterpret_cast<__gm__ typename Plan::OutputElement *>(scratch + w.c2));
+    bias.SetGlobalBuffer(GetLayerTensorAddr<typename Plan::OutputScale>(layer, t.config[13], biases));
     scales.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scratch + w.scale2));
-    Output output(resource, scratch + w.x, round.total, scratch + w.output);
+    Output<Plan> output(resource, scratch + w.x, round.total, scratch + w.output);
     ExpertRowTx rowTx(resource, scratch + w.x, scratch + w.output, h, t.aivNum);
     typename Plan::Scheduler scheduler;
     uint32_t startCore = 0, sync = 0, groupBegin = 0;
     for (uint32_t index = 0; index < round.activeCount; ++index) {
         const uint32_t e = round.Expert(index);
-        scheduler.Update(Coord{2 * round.Rows(e), h, uint32_t(t.config[2])},
+        scheduler.Update(Coord{Plan::kRows * round.Rows(e), h, uint32_t(t.config[2])},
                          Catlass::MatrixCoord{CUBE_M, CUBE_N});
         const auto jobs = scheduler.GetCoreLoops();
         const auto first = (get_block_idx() + t.aicNum - startCore) % t.aicNum;
@@ -614,14 +667,15 @@ __aicore__ inline void Combine(GM_ADDR scratch, const Cam::NativeMegaWorkspace &
             const auto coord = scheduler.GetBlockCoord(job);
             const auto actual = scheduler.GetActualBlockShape(coord);
             for (; sync <= index; ++sync) CrossCoreWaitFlag<2>(sync / FLAG_SETS);
-            // Identical AIC job ownership; each paired AIV handles 32 expanded MSD rows.
-            const uint32_t blocks = (actual.m() + 31) / 32;
+            // Each paired AIV handles bounded groups of logical output rows.
+            constexpr uint32_t physicalRows = Plan::kRows * Output<Plan>::ROWS;
+            const uint32_t blocks = (actual.m() + physicalRows - 1) / physicalRows;
             const uint32_t half = blocks / 2;
             const uint32_t begin = get_subblockid() == 0 ? 0 : half;
             const uint32_t end = get_subblockid() == 0 ? half : blocks;
             for (uint32_t b = begin; b < end; ++b) {
-                const uint32_t rows = Min(32, actual.m() - b * 32) / 2;
-                const uint32_t row = round.begin[e] + coord.m() * (CUBE_M / 2) + b * 16;
+                const uint32_t rows = Min(physicalRows, actual.m() - b * physicalRows) / Plan::kRows;
+                const uint32_t row = round.begin[e] + coord.m() * (CUBE_M / Plan::kRows) + b * Output<Plan>::ROWS;
                 output.Tile(raw, bias[e * h], scales, row, rows, coord.n() * CUBE_N, h, t.routedScale);
                 rowTx.Pump(ExpertRowTx::PUMP_ROWS);
             }

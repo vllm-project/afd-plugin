@@ -58,6 +58,63 @@ def test_cam_dispatcher_registers_inference_and_meta_kernels(
     assert all("shared" not in argument.name for argument in schema.arguments)
 
 
+def _native_mega_inputs(torch, mode):
+    packed = mode == 1
+
+    def make(shape, dtype):
+        return torch.empty(shape, dtype=dtype, device="meta")
+
+    anchor = make((1,), torch.bfloat16)
+    size = torch.ops.afd_ascend.afd_mega_moe_pull_workspace_size(16, 256, 256, 2, 1)
+    return [
+        anchor,
+        make((4096,), torch.float16),
+        make((6,), torch.int64),
+        make((size,), torch.uint8),
+        [make((2, 256, 64 if packed else 512), torch.int32 if packed else torch.int8)],
+        [make((2, 256, 32 if packed else 256), torch.int32 if packed else torch.int8)],
+        [make((2, 512), torch.int64 if packed else torch.float32)],
+        [make((2, 256), torch.int64 if packed else torch.bfloat16)],
+        [make((2, 512), torch.float32)] if packed else [],
+        [make((2, 256), torch.float32)] if packed else [],
+        [8, 256, 256, 2, 2, 1, 2, 1, 3, 1, 16, mode, 1, 1],
+        "meta_only",
+        1.0,
+    ]
+
+
+@pytest.mark.parametrize("mode", [1, 2])
+def test_native_mega_meta_quantization_contract(cam_runtime, mode):
+    torch = cam_runtime
+    completion = torch.ops.afd_ascend.afd_mega_moe_pull_native(
+        *_native_mega_inputs(torch, mode), swiglu_limit=10.0
+    )
+    assert completion.shape == (1,) and completion.dtype == torch.int64
+    assert completion.device.type == "meta"
+
+
+@pytest.mark.parametrize(
+    "invalid", ["mode", "weight", "scale", "bias", "shape", "layers"]
+)
+def test_native_mega_meta_rejects_invalid_w8a8(cam_runtime, invalid):
+    torch = cam_runtime
+    inputs = _native_mega_inputs(torch, 2)
+    if invalid == "mode":
+        inputs[10][11] = 3
+    elif invalid == "weight":
+        inputs[4][0] = inputs[4][0].to(torch.int32)
+    elif invalid == "scale":
+        inputs[7][0] = inputs[7][0].to(torch.float32)
+    elif invalid == "bias":
+        inputs[9] = [torch.empty((2, 256), dtype=torch.int32, device="meta")]
+    elif invalid == "shape":
+        inputs[4][0] = inputs[4][0].reshape(2, 512, 256)
+    else:
+        inputs[10][13] = 2
+    with pytest.raises(RuntimeError, match="native Mega"):
+        torch.ops.afd_ascend.afd_mega_moe_pull_native(*inputs)
+
+
 def test_mega_dispatch_meta_publishes_completion(cam_runtime):
     torch = cam_runtime
     state = torch.ops.afd_ascend.afd_mega_pull_init(

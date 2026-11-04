@@ -67,14 +67,8 @@ def test_native_rejects_grouped_scale_before_receiving(operators):
         AsyncCAMMegaExecutor(executor, None)
 
 
-def test_native_rejects_w8a8_before_receiving(operators):
-    executor = AsyncCAMLayeredExecutor([weights(quantization="W8A8")])
-    with pytest.raises(ValueError, match="W4A8"):
-        AsyncCAMMegaExecutor(executor, None)
-    assert operators == []
-
-
-def test_native_forwards_the_applied_swiglu_limit(monkeypatch):
+@pytest.mark.parametrize("quantization", ["W4A8", "W8A8"])
+def test_native_forwards_the_applied_swiglu_limit(monkeypatch, operators, quantization):
     calls = []
 
     def execute(*args):
@@ -92,7 +86,9 @@ def test_native_forwards_the_applied_swiglu_limit(monkeypatch):
         torch.ops.afd_ascend, "afd_mega_moe_pull_native", execute, raising=False
     )
     executor = AsyncCAMMegaExecutor(
-        AsyncCAMLayeredExecutor([replace(weights(), swiglu_limit=10.0)]),
+        AsyncCAMLayeredExecutor(
+            [replace(weights(quantization=quantization), swiglu_limit=10.0)]
+        ),
         SimpleNamespace(
             max_num_batched_tokens=8,
             topk=2,
@@ -106,7 +102,13 @@ def test_native_forwards_the_applied_swiglu_limit(monkeypatch):
         ),
     )
     executor()
-    assert calls[0][-1] == 10.0
+    assert calls[0][-1] == (10.0 if quantization == "W4A8" else 0.0)
+    assert calls[0][10][11] == (1 if quantization == "W4A8" else 2)
+    assert calls[0][4][0].dtype == (
+        torch.int32 if quantization == "W4A8" else torch.int8
+    )
+    if quantization == "W8A8":
+        assert calls[0][8] == calls[0][9] == []
 
 
 @pytest.fixture

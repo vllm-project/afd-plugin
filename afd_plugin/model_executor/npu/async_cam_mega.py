@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""One native MC2 launch drains an exclusive W4A8 transaction per layer."""
+"""One native launch drains an exclusive quantized transaction per layer."""
 
 from __future__ import annotations
 
@@ -21,20 +21,11 @@ WORKSPACE_ALIGNMENT_BYTES = 512
 
 
 class AsyncCAMMegaExecutor:
-    """Native MC2 W4A8 only; the layered executor owns W8A8 execution."""
+    """Pull transport with a compiled W4A8 or W8A8 execution plan."""
 
     def __init__(self, weights: AsyncCAMLayeredExecutor, connector) -> None:
-        # The INT8 fixpipe block this CANN ships is an AtlasA3 tile-copy family,
-        # while the native Mega kernel runs on the AtlasA2 W4A4 path Catlass
-        # specializes here. W8A8 tables therefore stay on the layered executor.
-        if weights.quantization != "W4A8":
-            raise ValueError(
-                "native MC2 Mega requires homogeneous W4A8 weights; "
-                f"got {weights.quantization}. Disable ffn_mega_moe to use the "
-                "layered executor for this table."
-            )
         if not weights.per_channel:
-            raise ValueError("native MC2 Mega requires per-channel W4A8 weights")
+            raise ValueError("native Mega requires per-channel W4A8/W8A8 weights")
         self.weights = weights
         self.connector = connector
         self.capacity = cam_receive_capacity()
@@ -51,7 +42,7 @@ class AsyncCAMMegaExecutor:
             connector.topology.world_size,
             connector.tp_size,
             self.capacity,
-            1,
+            1 if weights.quantization == "W4A8" else 2,
             1,
             len(weights.layer_ids),
         ]
@@ -92,8 +83,8 @@ class AsyncCAMMegaExecutor:
             w.w2,
             w.w13_scale,
             w.w2_scale,
-            w.w13_bias,
-            w.w2_bias,
+            w.w13_bias if w.quantization == "W4A8" else [],
+            w.w2_bias if w.quantization == "W4A8" else [],
             self.config,
             c.group_name,
             w.routed_scaling_factor,

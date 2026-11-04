@@ -17,6 +17,10 @@
 namespace AfdNativeMega {
 
 struct W4A8Plan {
+    static constexpr bool kPackedInt4 = true;
+    static constexpr uint32_t kRows = 2;
+    using OutputElement = half;
+    using OutputScale = float;
     // Packed INT4 weights. An INT8 activation row of h elements is MSD-split
     // into 2*h INT4 halves, so GMM1 rows are twice the logical row count.
     using Element = AscendC::int4b_t;

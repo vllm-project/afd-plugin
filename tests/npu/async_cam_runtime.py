@@ -50,13 +50,24 @@ class SyntheticModel(torch.nn.Module):
         intermediate=HIDDEN,
         weight_seed=None,
         routed_scale=1.0,
+        quantization="W4A8",
+        swiglu_limit=LIMIT,
+        experts=EXPERTS,
     ):
         super().__init__()
         self.layers = []
         for slot, layer_id in enumerate(LAYERS):
             seed = None if weight_seed is None else weight_seed + slot * 2
             w13, s13, b13 = self.make_weight(
-                device, per_channel, slot + 1, True, hidden, intermediate, seed
+                device,
+                per_channel,
+                slot + 1,
+                True,
+                hidden,
+                intermediate,
+                seed,
+                quantization,
+                experts,
             )
             w2, s2, b2 = self.make_weight(
                 device,
@@ -66,6 +77,8 @@ class SyntheticModel(torch.nn.Module):
                 hidden,
                 intermediate,
                 None if seed is None else seed + 1,
+                quantization,
+                experts,
             )
             self.layers.append(
                 LayeredFFNWeights(
@@ -77,8 +90,9 @@ class SyntheticModel(torch.nn.Module):
                     b13,
                     b2,
                     per_channel,
-                    LIMIT,
+                    swiglu_limit,
                     routed_scale,
+                    quantization=quantization,
                 )
             )
 
@@ -91,11 +105,13 @@ class SyntheticModel(torch.nn.Module):
         hidden=HIDDEN,
         intermediate=HIDDEN,
         seed=None,
+        quantization="W4A8",
+        experts=EXPERTS,
     ):
         k = hidden if gate_up else intermediate
         width = 2 * intermediate if gate_up else hidden
         if seed is None:
-            values = torch.zeros(EXPERTS, k, width, dtype=torch.int8)
+            values = torch.zeros(experts, k, width, dtype=torch.int8)
             diagonal = torch.arange(min(k, intermediate if gate_up else width))
             values[:, diagonal, diagonal] = 1
             if gate_up:
@@ -103,19 +119,29 @@ class SyntheticModel(torch.nn.Module):
         else:
             generator = torch.Generator().manual_seed(seed)
             values = torch.randint(
-                -3, 4, (EXPERTS, k, width), dtype=torch.int8, generator=generator
+                -3 if quantization == "W4A8" else -127,
+                4 if quantization == "W4A8" else 128,
+                (experts, k, width),
+                dtype=torch.int8,
+                generator=generator,
             )
         groups = 1 if per_channel else 2
-        scale = torch.full((EXPERTS, groups, width), float(factor))
+        scale = torch.full((experts, groups, width), float(factor))
         if seed is not None:
             scale *= 0.01 + 0.02 * torch.rand(scale.shape, generator=generator)
         if not per_channel:
             scale[:, 1] *= 2
+        if quantization == "W8A8":
+            weight = torch_npu.npu_format_cast(values.to(device), 29)
+            weight_scale = scale.squeeze(1)
+            if not gate_up:
+                weight_scale = weight_scale.bfloat16()
+            return weight, weight_scale.to(device), None
         dequant = values.float() * scale.repeat_interleave(k // groups, 1)
         bias = (8 * dequant.sum(1)).to(device)
         packed = values.reshape(-1, 2)
         packed = ((packed[:, 1] << 4) | (packed[:, 0] & 15)).reshape(
-            EXPERTS, k, width // 2
+            experts, k, width // 2
         )
         weight = torch_npu.npu_format_cast(packed.to(device), 29).view(torch.int32)
         encoded = scale.view(torch.int32).to(torch.int64)
@@ -134,6 +160,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--per-group", action="store_true")
     parser.add_argument("--mega", action="store_true")
+    parser.add_argument("--quantization", choices=("W4A8", "W8A8"), default="W4A8")
+    parser.add_argument("--swiglu-limit", type=float, default=LIMIT)
+    parser.add_argument(
+        "--experts-per-rank", type=int, choices=(4, 32, 64), default=EXPERTS
+    )
     parser.add_argument("--idle-probe", action="store_true")
     parser.add_argument(
         "--hidden-size", type=int, choices=(256, 512, 1024, 2048), default=HIDDEN
@@ -162,7 +193,7 @@ def main():
         parser.error("Attention rank count must be divisible by TP")
     if (args.idle_shutdown or args.idle_probe) and not args.mega:
         parser.error("idle shutdown/probe requires --mega")
-    if args.mega and args.per_group:
+    if args.per_group and (args.mega or args.quantization == "W8A8"):
         parser.error("native Mega requires per-channel weights")
     if args.full_graph and not args.reference_outputs:
         parser.error("FULL replay requires saved matching eager outputs")
@@ -212,7 +243,7 @@ def main():
             hf_config=SimpleNamespace(
                 hidden_size=args.hidden_size,
                 num_experts_per_tok=2,
-                n_routed_experts=8,
+                n_routed_experts=2 * args.experts_per_rank,
                 num_hidden_layers=max(LAYERS) + 1,
                 architectures=["DeepseekV4ForCausalLM"],
                 model_type="deepseek_v4",
@@ -252,6 +283,9 @@ def main():
         "rank": rank,
         "per_group": args.per_group,
         "mega": args.mega,
+        "quantization": args.quantization,
+        "swiglu_limit": args.swiglu_limit,
+        "experts_per_rank": args.experts_per_rank,
         "hidden": args.hidden_size,
         "intermediate": args.intermediate_size,
         "weight_seed": args.weight_seed,
@@ -269,6 +303,9 @@ def main():
             args.intermediate_size,
             None if args.weight_seed is None else args.weight_seed + rank * 10000,
             args.routed_scale,
+            args.quantization,
+            args.swiglu_limit,
+            args.experts_per_rank,
         )
         print(json.dumps({"rank": rank, "stage": "weights_ready"}), flush=True)
         runner.initialize_afd_connector()
@@ -414,22 +451,34 @@ def main():
         )
     expected: list[tuple[int, int, int | None]] = []
     for layer_id, sparse, tokens in cases:
-        ids = torch.arange(tokens * 2).remainder(2 if sparse else 8)
+        ids = torch.arange(tokens * 2).remainder(
+            2 if sparse else 2 * args.experts_per_rank
+        )
         local_ffn = rank - args.attn_ranks
         rows = int(
-            ((ids >= local_ffn * EXPERTS) & (ids < (local_ffn + 1) * EXPERTS)).sum()
+            (
+                (ids >= local_ffn * args.experts_per_rank)
+                & (ids < (local_ffn + 1) * args.experts_per_rank)
+            ).sum()
         )
         rows *= args.attention_tp
+        # Layered DR packs whole experts; Mega Pull slices individual rows.
+        chunks = [0]
+        for expert in range(
+            local_ffn * args.experts_per_rank, (local_ffn + 1) * args.experts_per_rank
+        ):
+            count = int((ids == expert).sum()) * args.attention_tp
+            assert count <= args.receive_capacity
+            if chunks[-1] + count > args.receive_capacity:
+                chunks.append(0)
+            chunks[-1] += count
         for source in range(0, args.attn_ranks, args.attention_tp):
             if args.mega:
                 # The exposed metadata is the final slice of one fused transaction.
                 last_rows = (rows - 1) % args.receive_capacity + 1 if rows else 0
                 expected.append((source, layer_id, last_rows))
                 continue
-            for start in range(0, max(1, rows), args.receive_capacity):
-                expected.append(
-                    (source, layer_id, min(args.receive_capacity, rows - start))
-                )
+            expected.extend((source, layer_id, count) for count in chunks)
 
     def observe(context):
         # Test-only host inspection after the matching DR/FFN/CS fence.
@@ -566,7 +615,7 @@ def main():
                 ids = (
                     torch.arange(tokens * 2)
                     .reshape(tokens, 2)
-                    .remainder(2 if sparse else 8)
+                    .remainder(2 if sparse else 2 * args.experts_per_rank)
                 )
                 hidden = inputs.to(device)
                 context = AFDTransferContext(AFDTransferMetadata(layer_id, 0, [tokens]))
@@ -637,7 +686,9 @@ def main():
         ):
             assert (observed["source"], observed["layer"]) == (source, layer)
             if expected_rows is not None:
-                assert observed["rows"] == expected_rows, "zero work or chunk mismatch"
+                assert observed["rows"] == expected_rows, (
+                    f"zero work or chunk mismatch: {report['work']=}, {expected=}"
+                )
         if args.full_graph:
             report["graph"] = {
                 "capture_count": runner._graph_capture_count,

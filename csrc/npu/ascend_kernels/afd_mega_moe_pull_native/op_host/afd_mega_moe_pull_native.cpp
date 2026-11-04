@@ -21,7 +21,7 @@ static ge::graphStatus NativeMegaTiling(gert::TilingContext *ctx) {
     if (c[8] != c[4] + c[5] || c[7] < c[5] || c[7] >= c[8] ||
         c[9] == 0 || c[0] % c[9] || c[5] % c[9] ||
         c[2] % 256 || c[2] > 8192 || c[6] > 128 ||
-        c[10] > Cam::NATIVE_MAX_ROWS || c[11] != 1 || c[12] != 1 ||
+        c[10] > Cam::NATIVE_MAX_ROWS || (c[11] != 1 && c[11] != 2) || c[12] != 1 ||
         !std::isfinite(*attrs->GetFloat(2))) return ge::GRAPH_FAILED;
     // Zero keeps clipping disabled, matching the layered W4A8 operator.
     const float *swigluLimitPtr = attrs->GetFloat(3);
@@ -42,7 +42,7 @@ static ge::graphStatus NativeMegaTiling(gert::TilingContext *ctx) {
             10ULL * c[1] + 1280 > ub ||
         184ULL * 1024 + 8ULL * Cam::NATIVE_METADATA_ROWS > ub) return ge::GRAPH_FAILED;
     // MC2 full-row ACT uses 54 bytes per intermediate column plus per-core scales.
-    if (c[2] <= 3072 && 54ULL * c[2] + 256 + 4ULL * ((c[10] + aiv - 1) / aiv) > ub)
+    if (c[11] == 1 && c[2] <= 3072 && 54ULL * c[2] + 256 + 4ULL * ((c[10] + aiv - 1) / aiv) > ub)
         return ge::GRAPH_FAILED;
     const Cam::NativeMegaWorkspace w(c[10], c[1], c[2], c[6], c[9]);
     if (ctx->GetInputShape(3)->GetStorageShape().GetDim(0) != int64_t(w.bytes))
@@ -63,7 +63,7 @@ static ge::graphStatus NativeMegaTiling(gert::TilingContext *ctx) {
     comm.GetTiling(data->mc2InitTiling);
     comm.GetTiling(data->mc2CcTiling1);
     ctx->SetBlockDim(aic);
-    ctx->SetTilingKey(1);
+    ctx->SetTilingKey(c[11]);
     ctx->SetScheduleMode(1);
     ctx->GetWorkspaceSizes(1)[0] = 16 * 1024 * 1024;
     return ge::GRAPH_SUCCESS;
@@ -74,17 +74,17 @@ namespace ops {
 class AfdMegaMoePullNative : public OpDef {
 public:
     explicit AfdMegaMoePullNative(const char *name) : OpDef(name) {
-        Input("anchor").ParamType(REQUIRED).DataType({ge::DT_BF16}).Format({ge::FORMAT_ND});
-        Input("commArgs").ParamType(REQUIRED).DataType({ge::DT_FLOAT16}).Format({ge::FORMAT_ND});
-        Input("layerMap").ParamType(REQUIRED).DataType({ge::DT_INT64}).Format({ge::FORMAT_ND});
-        Input("scratch").ParamType(REQUIRED).DataType({ge::DT_UINT8}).Format({ge::FORMAT_ND});
+        Input("anchor").ParamType(REQUIRED).DataType({ge::DT_BF16, ge::DT_BF16}).Format({ge::FORMAT_ND, ge::FORMAT_ND});
+        Input("commArgs").ParamType(REQUIRED).DataType({ge::DT_FLOAT16, ge::DT_FLOAT16}).Format({ge::FORMAT_ND, ge::FORMAT_ND});
+        Input("layerMap").ParamType(REQUIRED).DataType({ge::DT_INT64, ge::DT_INT64}).Format({ge::FORMAT_ND, ge::FORMAT_ND});
+        Input("scratch").ParamType(REQUIRED).DataType({ge::DT_UINT8, ge::DT_UINT8}).Format({ge::FORMAT_ND, ge::FORMAT_ND});
         for (const char *w : {"w13", "w2"})
-            Input(w).ParamType(DYNAMIC).DataType({ge::DT_INT32}).Format({ge::FORMAT_FRACTAL_NZ});
-        for (const char *s : {"s13", "s2"})
-            Input(s).ParamType(DYNAMIC).DataType({ge::DT_INT64}).Format({ge::FORMAT_ND});
+            Input(w).ParamType(DYNAMIC).DataType({ge::DT_INT32, ge::DT_INT8}).Format({ge::FORMAT_FRACTAL_NZ, ge::FORMAT_FRACTAL_NZ});
+        Input("s13").ParamType(DYNAMIC).DataType({ge::DT_INT64, ge::DT_FLOAT}).Format({ge::FORMAT_ND, ge::FORMAT_ND});
+        Input("s2").ParamType(DYNAMIC).DataType({ge::DT_INT64, ge::DT_BF16}).Format({ge::FORMAT_ND, ge::FORMAT_ND});
         for (const char *b : {"b13", "b2"})
-            Input(b).ParamType(DYNAMIC).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND});
-        Output("completion").ParamType(REQUIRED).DataType({ge::DT_INT64}).Format({ge::FORMAT_ND});
+            Input(b).ParamType(DYNAMIC).DataType({ge::DT_FLOAT, ge::DT_FLOAT}).Format({ge::FORMAT_ND, ge::FORMAT_ND});
+        Output("completion").ParamType(REQUIRED).DataType({ge::DT_INT64, ge::DT_INT64}).Format({ge::FORMAT_ND, ge::FORMAT_ND});
         Attr("config").ListInt();
         Attr("hccl_group_name").String();
         Attr("routed_scale").Float();

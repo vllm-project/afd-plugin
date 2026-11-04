@@ -176,7 +176,7 @@ class AsyncNPUFFNModelRunner:
         if config.ffn_mega_moe:
             if executor is None:
                 raise ValueError(
-                    "ffn_mega_moe requires homogeneous layered W4A8 weights"
+                    "ffn_mega_moe requires homogeneous layered W4A8/W8A8 weights"
                 )
             self._mega_executor = AsyncCAMMegaExecutor(executor, self.connector)
         if config.ffn_two_stream:

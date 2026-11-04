@@ -177,10 +177,20 @@ A positive `L` clamps gate above at `L` and up to `[-L, L]` before SiLU gating a
 quantization. Zero disables clipping. DeepSeek-V4's configured `10.0` therefore
 applies on both execution paths. The limit is a host scalar fixed at graph
 capture; layer selection remains controlled by the device `layer_index` tensor.
-Layered W8A8 retains its unclipped computation and records the model limit as
-metadata only. Native Mega W4A8 applies the same limit in both its MC2 ACT
-epilogue and its bounded-column fallback, and rejects layered W8A8 weights
-instead of silently ignoring the declared limit.
+Layered and Mega W8A8 retain unclipped computation regardless of the model
+`swiglu_limit`; the executors pass zero and the native W8A8 Plan skips clamp.
+Native Mega W4A8 applies the limit in its MC2 ACT epilogue and bounded-column
+fallback. Native W8A8 uses an INT8 GEMM with INT32 intermediate results and a
+bounded-column activation; weight scales stay FP32 for W13 and BF16 for W2.
+Both plans share Pull transport and the BF16 return path. W8A8 applies weight
+and token scales in Vector before activation, preserving the Layered rounding
+sequence. The mode is selected once through `config[11]` (1=W4A8, 2=W8A8).
+
+The synthetic transport fixture accepts `--quantization W8A8 --swiglu-limit 0`
+or `--swiglu-limit 10`; W8A8 ignores either model limit. Save matching Layered
+eager outputs with `--save-outputs`,
+then compare Mega eager and `--full-graph` using `--reference-outputs`; add
+`--boundary` to exercise receive rounds, sparse experts and poisoned scratch.
 
 ## Validation
 
