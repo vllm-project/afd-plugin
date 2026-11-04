@@ -14,7 +14,13 @@ One invocation = one run = one `RUN_ID` = one report.
 
 ## Scope
 
-- GPU colocation recipes only -- whatever `deploy-afd-k8s` supports.
+- GPU colocation recipes only -- whatever `deploy-afd-k8s` supports,
+  including multi-pod plans: one pod per role, or one role split across
+  pods. On a split-role plan the attention head pod is the only replica
+  serving the client, and its loss does not self-heal (see the recovery
+  scope in `deploy-afd-k8s`); mid-sweep that looks like `completed <
+  num_prompts`, not saturation. Such a run is also not comparable to the
+  single-pod recipe of the same model -- say so in the report.
 - Not for local benchmarking (run `request_generator.sh` directly against
   `decode_bench_server.sh` for that) or correctness E2E (`run-e2e`).
 - Requires everything `deploy-afd-k8s` requires. No extra image: the bench
@@ -41,13 +47,43 @@ folder as the list of possible recipes.
 ### 2. Deploy the recipe
 
 Follow **`deploy-afd-k8s`** with `RECIPE_SCRIPT_PATH`. It returns
-`MODEL_ID`, `PVC_NAME`, `GPU_COUNT`, the serving node, the recipe's
-`--max-num-batched-tokens`, and an endpoint at `http://vllm-service:18305`.
+`DEPLOY_NAME` (default `vllm`), `NAMESPACE`, `MODEL_ID`, `PVC_NAME`,
+`GPU_COUNT`, the node(s) the pods landed on, the recipe's
+`--max-num-batched-tokens`, and an endpoint at
+`http://${DEPLOY_NAME}-service:${CLIENT_PORT}`, where `CLIENT_PORT` is the
+recipe's attention `--port` (default 18305). `GPU_COUNT` is one number for a
+plain recipe and a per-role value when the plan spans pods.
 
-`vllm bench serve` is pointed at that endpoint with `HOST=vllm-service`
-`PORT=18305`, and `MODEL_PATH=${MODEL_ID}` -- it must name exactly what the
-pod serves, since the model id is sent in each request and used to load the
-tokenizer.
+Carry `DEPLOY_NAME`, `NAMESPACE`, and `CLIENT_PORT` into every later step:
+the endpoint name and port belong to the deployment, so a hard-coded
+`vllm-service:18305` only works while both defaults happen to match.
+
+The bench pod runs the same image the deployment does -- `AFD_PLUGIN_IMAGE`,
+the value you passed to `deploy-afd-k8s`. That skill only uses it as a prefix
+assignment on its own `envsubst`, so it sets nothing you can read back later;
+the manifest's `TEMPLATE_IMAGE` is initialised from it in step 4.
+
+```bash
+export DEPLOY_NAME=${DEPLOY_NAME:-vllm}
+export NAMESPACE="<namespace reported by deploy-afd-k8s>"
+export CLIENT_PORT="<the recipe's attention --port>"      # default 18305
+export GPU_COUNT="<n>"                                     # or per role, see above
+export DEPLOY_NODES="$(kubectl -n "$NAMESPACE" get pods \
+  -l "afd-deployment=$DEPLOY_NAME" \
+  -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' \
+  | sort -u | paste -sd,)"
+```
+
+`vllm bench serve` is pointed at that endpoint with
+`HOST=${DEPLOY_NAME}-service` `PORT=${CLIENT_PORT}`, and
+`MODEL_PATH=${MODEL_ID}` -- it must name exactly what the pod serves, since
+the model id is sent in each request and used to load the tokenizer.
+
+On a multi-pod plan the client reaches the **attention head pod**, so the
+attention role's `--max-num-batched-tokens` is the budget that governs
+backpressure in step 3. The roles can differ (attention `64`, FFN unset, in
+the `2a2f`/`2a2a2f` plans) -- use the attention role's, not an average and
+not the FFN role's.
 
 ### 3. Choose the workload
 
@@ -109,11 +145,12 @@ controllable and therefore reproducible.
 
 #### Sizing the sweep against the recipe
 
-Match offered load to the recipe's `--max-num-batched-tokens` from step 2. A
-recipe pinned at 64 absorbs a 1024-token prompt in ~16 chunked-prefill
-steps, so a high rate puts it in permanent backpressure and the report
-measures queueing rather than the recipe. Long-context makes this sharper:
-an 8192-token prompt at that budget needs ~128 steps.
+Match offered load to the recipe's `--max-num-batched-tokens` from step 2 --
+on a multi-pod plan, the attention role's, since that is the pod the client
+talks to. A recipe pinned at 64 absorbs a 1024-token prompt in ~16
+chunked-prefill steps, so a high rate puts it in permanent backpressure and
+the report measures queueing rather than the recipe. Long-context makes this
+sharper: an 8192-token prompt at that budget needs ~128 steps.
 
 Sweep until at least one point saturates -- TTFT climbing, or `completed`
 below `NUM_PROMPTS`. A sweep where nothing saturates measured headroom, not
@@ -135,11 +172,20 @@ The pod runs the AFD image, so the wrapper is already on disk at
 
 Export the workload chosen in step 3 -- these are the `balanced` defaults.
 `envsubst` only sees **exported** variables -- an unexported name
-substitutes as empty with no error, so `export` every name in the list
-below, including `TEMPLATE_IMAGE`/`MODEL_ID`/`RUN_ID`/`PVC_NAME` carried
-over from step 2, and `VLLM_NODE` too if you will pin the pod (see below):
+substitutes as empty with no error -- so the block below re-exports every
+name it interpolates, including step 1's `RUN_ID` and the values carried
+over from step 2:
 
 ```bash
+# deploy-afd-k8s passes its image as a prefix assignment to its own envsubst,
+# so TEMPLATE_IMAGE is never left set in this shell -- initialise it from the
+# deployment's image. envsubst skips unexported names silently, and an empty
+# RUN_ID, MODEL_ID or PVC_NAME gives a pod that honours none of the run.
+export TEMPLATE_IMAGE="${TEMPLATE_IMAGE:-$AFD_PLUGIN_IMAGE}"
+[ -n "$TEMPLATE_IMAGE" ] || { echo "set AFD_PLUGIN_IMAGE to the image deploy-afd-k8s used"; exit 1; }
+export MODEL_ID PVC_NAME RUN_ID DEPLOY_NAME CLIENT_PORT
+export VLLM_NODE          # empty is fine when you are not pinning
+
 export DATASET_NAME=random
 export INPUT_LEN=1024
 export OUTPUT_LEN=256
@@ -149,7 +195,7 @@ export WORKLOAD_ARGS=""                  # e.g. the --prefix-repetition-* flags
 
 kubectl delete pod vllm-bench --ignore-not-found
 
-envsubst '${TEMPLATE_IMAGE} ${MODEL_ID} ${RUN_ID} ${SWEEP} ${DATASET_NAME} ${INPUT_LEN} ${OUTPUT_LEN} ${NUM_PROMPTS} ${WORKLOAD_ARGS} ${PVC_NAME} ${VLLM_NODE}' <<'EOF' | kubectl apply -f -
+envsubst '${TEMPLATE_IMAGE} ${MODEL_ID} ${RUN_ID} ${SWEEP} ${DATASET_NAME} ${INPUT_LEN} ${OUTPUT_LEN} ${NUM_PROMPTS} ${WORKLOAD_ARGS} ${PVC_NAME} ${VLLM_NODE} ${DEPLOY_NAME} ${CLIENT_PORT}' <<'EOF' | kubectl apply -f -
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -195,7 +241,7 @@ spec:
             conc="${point##*:}"
             echo "=== sweep point rate=${rate} concurrency=${conc} ==="
             MODEL_PATH="${MODEL_ID}" \
-            HOST=vllm-service PORT=18305 \
+            HOST="${DEPLOY_NAME}-service" PORT="${CLIENT_PORT}" \
             DATASET_NAME="${DATASET_NAME}" \
             INPUT_LEN="${INPUT_LEN}" OUTPUT_LEN="${OUTPUT_LEN}" \
             NUM_PROMPTS="${NUM_PROMPTS}" \
@@ -262,18 +308,21 @@ it, `vllm bench serve` resolves `--model` as a HF repo id and fails with
 the tokenizer from a path that doesn't exist in the bench pod. If `MODEL_ID`
 is a genuine HF repo id instead, the mount is harmless to leave in place.
 
-**Pin the pod to the serving node only if the model PVC is `ReadWriteOnce`**:
+**Pin the pod to a node holding the model PVC, only if that PVC is
+`ReadWriteOnce`**:
 
 ```bash
 kubectl get pvc "${PVC_NAME}" -o jsonpath='{.spec.accessModes[0]}'
 ```
 
 If that prints `ReadWriteOnce`, a second pod can only attach the PVC from
-the node that already holds it. `export VLLM_NODE=<serving node from step
-2>`, add `${VLLM_NODE}` to the `envsubst` variable list above, and add
+the node that already holds it. `export VLLM_NODE=<one of DEPLOY_NODES from
+step 2>` -- a plain recipe has exactly one, so there is nothing to choose --
+add `${VLLM_NODE}` to the `envsubst` variable list above, and add
 `nodeName: ${VLLM_NODE}` at the pod spec level (sibling of `restartPolicy`)
 -- otherwise the pod leaves `Pending` with `Multi-Attach error for volume
-...`. If it prints `ReadWriteMany`, skip `nodeName` entirely -- no pinning
+...`. If it prints `ReadWriteMany` (which `deploy-afd-k8s` derives for every
+plan spanning more than one pod), skip `nodeName` entirely -- no pinning
 needed, any node can attach it.
 
 ### 5. Wait for completion, then collect
@@ -282,7 +331,12 @@ The pod holds after the sweep, so completion is the sentinel file, not a
 `Succeeded` phase -- which also preserves the exit code:
 
 ```bash
-kubectl logs -f pod/vllm-bench 2>/dev/null || true
+# Never foreground-follow the log: the container holds with `sleep infinity`
+# until activeDeadlineSeconds (4h), so `kubectl logs -f` never returns and
+# the sentinel polling below would never run. Read progress without -f, or
+# follow it in the background.
+kubectl logs pod/vllm-bench --tail=200 2>/dev/null || true
+# kubectl logs -f pod/vllm-bench > "/tmp/${RUN_ID}.log" 2>&1 &
 
 deadline=$(( $(date +%s) + 7200 ))
 RC=""
@@ -292,7 +346,9 @@ while true; do
     "")      echo "vllm-bench pod is gone"; exit 1 ;;
     Failed)  echo "vllm-bench Failed (OOM, or activeDeadlineSeconds hit)"
              kubectl describe pod vllm-bench | tail -20
-             kubectl logs vllm-bench --tail=100; exit 1 ;;
+             kubectl logs vllm-bench --tail=100
+             echo "finished points are still on vllm-bench-reports -- see references/fetching-past-reports.md"
+             exit 1 ;;
   esac
   RC="$(kubectl exec vllm-bench -- cat "/reports/${RUN_ID}/.exit_code" 2>/dev/null || true)"
   [ -n "$RC" ] && break
@@ -329,9 +385,9 @@ cat > "${LOCAL_DIR}/run.json" <<EOF
   "harness": "vllm-bench-serve",
   "recipe": "${RECIPE_SCRIPT_PATH}",
   "model_id": "${MODEL_ID}",
-  "image": "${AFD_PLUGIN_IMAGE}",
-  "gpu_count": ${GPU_COUNT},
-  "max_num_batched_tokens": <from deploy step 2>,
+  "image": "${TEMPLATE_IMAGE}",
+  "gpu_count": "${GPU_COUNT}",
+  "max_num_batched_tokens": <the attention role's, from deploy step 2>,
   "workload": "<balanced|max-throughput|prefix-heavy|long-context|smoke|custom>",
   "dataset": "${DATASET_NAME}",
   "workload_args": "${WORKLOAD_ARGS}",
@@ -339,7 +395,7 @@ cat > "${LOCAL_DIR}/run.json" <<EOF
   "output_len": ${OUTPUT_LEN},
   "num_prompts": ${NUM_PROMPTS},
   "sweep": "${SWEEP}",
-  "node": "${VLLM_NODE}",
+  "nodes": "${DEPLOY_NODES}",
   "finished_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
@@ -348,6 +404,12 @@ EOF
 Recording the workload and sweep next to the numbers is what keeps the
 report interpretable after the cluster is torn down, and lets
 `comparing-runs.md` check that two runs are actually comparable.
+
+`gpu_count` stays quoted so both shapes are valid JSON: a single number for
+a plain recipe, `attention=<n>,ffn=<n>` when the plan spans pods. `nodes`
+lists every node of the deployment, not only the one the bench pod used --
+that is what a later run compares to tell whether it reused the same
+hardware.
 
 ### 7. Report this run
 
@@ -375,8 +437,8 @@ reports throughput in tokens/s. State units once and stay consistent.
 ```
 Run:      <RUN_ID>
 Harness:  vllm bench serve (random ISL <n> / OSL <n>, <num_prompts> prompts/point)
-Recipe:   <path>   (GPUs: <n>, max-num-batched-tokens: <n>)
-Model:    <MODEL_ID>
+Recipe:   <path>   (GPUs: <n or per role>, max-num-batched-tokens: <attention role's>)
+Model:    <MODEL_ID>   (nodes: <from run.json>)
 Profile:  <name> -- sweep <rate:conc ...>
 
 | Rate | Conc | Output tok/s | TTFT mean | TTFT p99 | TPOT mean | TPOT p99 | E2EL mean | Completed |
@@ -389,6 +451,20 @@ from flat (it moves before end-to-end latency) or `completed` drops below
 saturated, say so: the sweep measured headroom and the ceiling is above what
 was offered.
 
+Before calling a low `completed` a capacity ceiling, check it is not the
+deployment falling over: on a split-role plan the attention head pod is a
+single replica whose loss does not self-heal (see Scope), and it surfaces as
+dropped requests rather than as a crash of the bench pod. This prints
+`name<TAB>node<TAB>restarts` per pod:
+
+```bash
+kubectl -n "$NAMESPACE" get pods -l "afd-deployment=$DEPLOY_NAME" \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\t"}{.status.containerStatuses[0].restartCount}{"\n"}{end}'
+```
+
+A restart count that moved during the sweep makes that point an outage, not
+a measurement -- rerun it and say so.
+
 ### 8. Comparing several runs
 
 See [references/comparing-runs.md](references/comparing-runs.md) --
@@ -396,17 +472,24 @@ confirming two runs are comparable and reporting per-point deltas. Both
 recipes being compared (e.g. an AFD recipe and its non-AFD baseline) must be
 given explicitly by the user; never derive one from the other.
 
-### 9. Tear down the cluster
+### 9. Tear down the deployment
 
-`deploy-afd-k8s` leaves `vllm-pod`/`vllm-service` running by default so a
-*follow-up* run can skip the model download and graph capture, but this
-skill's own run is done once the report is produced -- tear both down at the
-end, every time, without waiting to be asked:
+`deploy-afd-k8s` leaves the serving StatefulSet(s) and Service(s) running by
+default so a *follow-up* run can skip the model download and graph capture,
+but this skill's own run is done once the report is produced -- tear the
+whole deployment down at the end, every time, without waiting to be asked.
+Delete by label: a multi-pod plan has no `vllm-pod` to name, and the
+single-pod case is a StatefulSet `${DEPLOY_NAME}-pod` whose pod the
+StatefulSet would recreate anyway:
 
 ```bash
 kubectl delete pod vllm-bench --ignore-not-found   # already deleted in step 5 on the happy path
-kubectl delete pod vllm-pod --ignore-not-found
-kubectl delete svc vllm-service --ignore-not-found
+kubectl -n "$NAMESPACE" delete sts -l "afd-deployment=$DEPLOY_NAME"
+kubectl -n "$NAMESPACE" delete svc,configmap -l "afd-deployment=$DEPLOY_NAME"
+kubectl -n "$NAMESPACE" get pods -l "afd-deployment=$DEPLOY_NAME"   # must print nothing
 ```
 
-Keep `vllm-bench-reports` until every run of interest has been copied out.
+That removes every role's StatefulSet and pods together -- deleting one role
+on its own strands the peers' collectives. Keep `vllm-bench-reports` and the
+model PVC (`PVC_NAME`, deliberately unlabeled) until every run of interest
+has been copied out.

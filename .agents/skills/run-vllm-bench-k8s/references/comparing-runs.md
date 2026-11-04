@@ -41,15 +41,26 @@ files in place and the delta is computed against stale data.
 
 ## 2. Run the set
 
-Run the main skill once per recipe, **sequentially** -- each run tears down
-`vllm-pod`/`vllm-service` in its own step 9, so a second run cannot start
-until the first has finished and the previous recipe's pod/service are gone.
-Keep `MODEL_ID`, `PVC_NAME`, `GPU_COUNT`, the image, and the whole workload
-(dataset, ISL/OSL, `NUM_PROMPTS`, `SWEEP`) fixed; change only
-`RECIPE_SCRIPT_PATH` (and therefore `RUN_ID`).
+Run the main skill once per recipe, **sequentially** -- each run tears its
+own deployment down by the `afd-deployment` label in its own step 9, so a
+second run cannot start until the first has finished and the previous
+deployment's StatefulSets, pods and Services are gone. Keep `MODEL_ID`,
+`PVC_NAME`, `GPU_COUNT`, the image, and the whole workload (dataset,
+ISL/OSL, `NUM_PROMPTS`, `SWEEP`) fixed; change only `RECIPE_SCRIPT_PATH`
+(and therefore `RUN_ID`).
+
+A plan that spans pods and one that does not are different deployments, not
+two settings of the same one: `GPU_COUNT` differs per role, the client
+endpoint moves to whichever pod holds the attention head, and the split-role
+case serves from a single replica. Treat a change of plan shape as a change
+of the thing being measured, and say so rather than tabulating it as a
+variant.
 
 Reuse the same model PVC throughout so weights download once. Prefer running
 back to back on the same node: a node change between runs is a confound.
+Compare `nodes` in each `run.json` for that -- it is the full list, so an
+overlap between a multi-pod and a single-pod run is expected and not a
+match.
 
 ## 3. Compare
 

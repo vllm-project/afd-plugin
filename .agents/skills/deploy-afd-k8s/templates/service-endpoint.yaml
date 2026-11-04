@@ -1,0 +1,23 @@
+# A named DNS pointer at one specific recipe pod -- always the role's head
+# pod (StatefulSet ordinal 0).
+#
+# ExternalName, not a selector-based Service: every pod of a role shares
+# one StatefulSet template, so "the head pod" cannot be expressed as a
+# label selector when the role is split across replicas. The head pod's
+# DNS name (<pod>.<governing-service>.<namespace>.svc.cluster.local) is
+# stable across pod recreation, resolves through the governing Service's
+# publishNotReadyAddresses: true (so startup-time binds/connections work
+# before readiness), and tracks the pod's current IP automatically.
+#
+# Clients connect to <service-name>:<port> as before; the port is whatever
+# the target pod serves (no ports are declared on an ExternalName Service).
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${TEMPLATE_SVC_NAME}
+  labels:
+    app: afd-recipe
+    afd-deployment: ${TEMPLATE_DEPLOY_NAME}
+spec:
+  type: ExternalName
+  externalName: ${TEMPLATE_ENDPOINT}

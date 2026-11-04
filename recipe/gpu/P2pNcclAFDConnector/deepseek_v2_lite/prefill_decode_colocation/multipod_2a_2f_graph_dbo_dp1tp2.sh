@@ -2,17 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 
 # Use .agents/skills/deploy-afd-k8s/SKILL.md to deploy this recipe
-# on 2 pods using the setup below.
-# For pod 1: POD=ATTENTION_0
-# For pod 2: POD=FFN_0
+# on 2 pods: one attention pod and one FFN pod. The deployment layer
+# places each role in its own StatefulSet; AFD_ROLE selects the role and
+# POD is the pod's zero-based ordinal within it (0 for both pods here).
 
 MODEL_PATH=${MODEL_PATH:-/path/model_weights/DeepSeek-V2-Lite}
 export VLLM_USE_V2_MODEL_RUNNER=1
 
-AFD_CONNECTOR_HOST=${AFD_CONNECTOR_HOST:-vllm-ffn-p2p-service}
+: "${AFD_CONNECTOR_HOST:?not set -- deploy via the deploy-afd-k8s skill, which provides this pod env}"
 AFD_CONNECTOR_PORT=${AFD_CONNECTOR_PORT:-6269}
 
-if [ "$POD" == "ATTENTION_0" ]; then
+if [ "$AFD_ROLE" == "attention" ]; then
   CUDA_VISIBLE_DEVICES=0,1 uv run vllm serve "$MODEL_PATH" \
       --data-parallel-size 1 \
       --tensor-parallel-size 2 \
@@ -41,7 +41,7 @@ if [ "$POD" == "ATTENTION_0" ]; then
       --trust-remote-code > attn.log 2>&1 &
 fi
 
-if [ "$POD" == "FFN_0" ]; then
+if [ "$AFD_ROLE" == "ffn" ]; then
   CUDA_VISIBLE_DEVICES=0,1 uv run vllm serve "$MODEL_PATH" \
       --data-parallel-size 1 \
       --tensor-parallel-size 2 \

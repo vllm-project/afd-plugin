@@ -1,0 +1,27 @@
+# Governing (identity) Service for every StatefulSet of one deployment.
+#
+# Headless with publishNotReadyAddresses: true, selecting this deployment's
+# pods by the afd-deployment label. Load-bearing, not a k8s formality:
+# every ExternalName endpoint (service-endpoint.yaml -- the client,
+# rendezvous, and DP-coordination Services) points at a head pod's DNS
+# name under this Service (<pod>.<governing>.<namespace>.svc.<domain>),
+# and that name only resolves -- including before the pod is Ready --
+# because this Service exists with publishNotReadyAddresses. Deleting or
+# narrowing it breaks all of those endpoints. One Service per deployment
+# also satisfies every StatefulSet's serviceName at once (recipes
+# themselves rendezvous through the named Services, never raw pod DNS).
+# Must exist before any StatefulSet is applied (step 4d, like every other
+# Service -- see services.md).
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${TEMPLATE_DEPLOY_NAME}-recipe-sts
+  labels:
+    app: afd-recipe
+    afd-deployment: ${TEMPLATE_DEPLOY_NAME}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: afd-recipe
+    afd-deployment: ${TEMPLATE_DEPLOY_NAME}

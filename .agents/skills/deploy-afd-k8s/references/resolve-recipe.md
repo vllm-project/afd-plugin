@@ -26,7 +26,7 @@ literal `/path/` stand-in today, regardless of what's actually staged on any
 given cluster's PVC. Never pass this through verbatim: it names only the
 model directory (`<name>`), not a real in-container path. Derive the real
 `MODEL_ID` as `<MOUNT_PATH>/<name>`, where `<MOUNT_PATH>` is the PVC mount
-point fixed by `templates/pod.yaml` (`/models`) -- e.g.
+point fixed by `templates/statefulset.yaml` (`/models`) -- e.g.
 `/path/model_weights/Qwen3.5-122B-A10B-FP8` resolves to
 `/models/Qwen3.5-122B-A10B-FP8`. Before deploying, confirm that directory
 actually exists on the target `PVC_NAME` (if it already exists, `kubectl
@@ -38,53 +38,55 @@ HF-repo-id validation error instead of a clear message.
 Tell the caller which form it is, and the resolved value if derived.
 
 Set `CLIENT_PORT` to the `--port` value on the attention (or sole, for a
-single-pod recipe) `vllm serve` block -- `templates/pod.yaml` rebinds this
-port off loopback and `vllm-service` (step 4d, see
+single-pod recipe) `vllm serve` block -- `templates/statefulset.yaml` rebinds this
+port off loopback and `${DEPLOY_NAME}-service` (step 4d, see
 [services.md](services.md)) exposes it, whatever value is actually there.
 
 ## Read the placement plan -- never ask
 
 Look at the top-of-file comment block (above the first `vllm serve`/env-var
 line). If it says nothing about per-pod placement, this is a plain
-single-pod recipe: one pod, `POD` unset, both roles run unconditionally --
-continue to [deploy.md](deploy.md) with no plan.
+single-pod recipe: one pod, both roles run unconditionally (`AFD_ROLE`
+is `both`, `POD` is `0`) -- continue to [deploy.md](deploy.md) with no
+plan (`PLAN_IS_PLAIN=1`).
 
 If it does describe a placement across multiple pods, read and interpret
-that description directly.
+that description directly. Today's recipes describe per-role pod counts:
 
-Example of a placement description:
 ```
-# For pod 1: POD=ATTENTION_0
-# For pod 2: POD=ATTENTION_1, ATTENTION_HEADLESS=1, ATTENTION_DP_START_RANK=2
-# For pod 3: POD=FFN_0
+# on 3 pods: two attention pods and one FFN pod. [...] Attention shards
+# with POD>0 run headless with a data-parallel start rank of POD*2.
 ```
 
-Or
-```
-"runs
-on 3 pods: the first two run ATTENTION_0 and ATTENTION_1 -- the second one
-headless, starting at data-parallel rank 2 -- and the third runs FFN_0"
-```
+Whatever the phrasing, extract the only two facts the deployment needs:
 
-Whatever the phrasing, read it and extract, per pod, in the order the
-comment presents them:
+- **per-role pod counts** (how many attention pods, how many FFN pods)
+- whether either role is split across more than one pod (that alone
+  decides the optional DP-coordination Services)
 
-- that pod's `POD=<value>` identity
-- any further container-env overrides for that pod only (e.g.
-  `ATTENTION_HEADLESS=1`, `ATTENTION_DP_START_RANK=2`)
-
-The recipe already states ranks/ordering per pod -- there is nothing to
-derive or ask about, regardless of how it's phrased. (A quick
-`grep -E '^# For pod [0-9]+: '` is a fine way to spot today's convention at
-a glance, but its absence doesn't mean "no plan" -- check the comment block
-itself before concluding this is a plain single-pod recipe.)
+and expose the plan to later steps as shell variables (deploy.md step 4d
+gates the optional Services on them): `PLAN_IS_PLAIN=1` for a single-pod
+recipe; otherwise `TOTAL_PODS` (sum of the per-role pod counts) and
+`ATTN_SPLIT=1` iff the attention role itself spans more than one pod.
 
 For each entry, derive (used by [deploy.md](deploy.md) and
 [services.md](services.md)):
 
-- **k8s Pod name**: `vllm-pod-$(echo "$POD" | tr 'A-Z_' 'a-z-')`, e.g.
-  `vllm-pod-attention-0`.
-- **`afd-attn-node-role`**: `none` unless `POD` starts with `ATTENTION_`, in
-  which case `worker` if that line's `ATTENTION_HEADLESS` override is `1`,
-  else `head`.
-- **`afd-ffn-node-role`**: symmetric, `none` unless `POD` starts with `FFN_`.
+- **k8s StatefulSet name**: `${DEPLOY_NAME}-pod-<role>` (e.g. with the
+default `DEPLOY_NAME=vllm`, the attention StatefulSet is
+`vllm-pod-attention`), with `replicas` = that role's pod count.
+`DEPLOY_NAME` (default `vllm`) prefixes every resource the deployment
+creates -- StatefulSets, Services, ConfigMap -- and labels every object
+it creates with `afd-deployment: <DEPLOY_NAME>`, so two deployments with
+different names coexist in one namespace without colliding (and the whole
+deployment can be selected, reported, and torn down as a unit with `-l
+afd-deployment=<DEPLOY_NAME>`). Kubernetes appends the pod
+ordinal itself, so pods are `<statefulset-name>-<ordinal>` (e.g.
+`vllm-pod-attention-0`, `vllm-pod-attention-1`) -- the ordinal suffix is
+a StatefulSet invariant and cannot be removed.
+- **POD**: the pod's zero-based index within its role's StatefulSet,
+self-derived by the wrapper from the pod's hostname -- never injected as
+k8s env. Recipes gate their blocks on `AFD_ROLE` (attention/ffn) and
+derive per-index conventions themselves (e.g. headless attention shards
+at `POD>0`, DP start ranks from `POD`), so there are no per-pod env
+overrides to carry from the plan.

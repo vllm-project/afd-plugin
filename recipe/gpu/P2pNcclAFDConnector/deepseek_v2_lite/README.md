@@ -67,15 +67,16 @@ for tested E2E configurations.
 
 The four `2a2f_*` variants cover the TP/DP cross product; `4a4f_*` doubles
 both attention and FFN ranks (DP=2 on each side); `multipod_2a_2f_graph_dbo_dp1tp2.sh`
-is the same `2a2f_graph_dbo_dp1tp2` config, but gated on a `POD` env var
-(`ATTENTION_0` or `FFN_0`) for the `deploy-afd-k8s` skill to deploy it
-across 2 pods (see repo-root `recipe/gpu/P2pNcclAFDConnector/README.md`);
-its Attention and FFN HTTP ports can both be 18305 because they are in
-separate pods --
+is the same `2a2f_graph_dbo_dp1tp2` config, but gated on the `AFD_ROLE`
+env var (`attention` or `ffn`) for the `deploy-afd-k8s` skill to deploy it
+across 2 pods, one StatefulSet per role (see repo-root
+`recipe/gpu/P2pNcclAFDConnector/README.md`); its Attention and FFN HTTP
+ports can both be 18305 because they are in separate pods --
 unlike the scripts above, it is **not** meant to be run directly: with
-`POD` unset, neither `vllm serve` block executes, and its
-`AFD_CONNECTOR_HOST` default (`vllm-ffn-p2p-service`) only resolves inside
-the cluster the skill deploys it to:
+`AFD_ROLE` unset, neither `vllm serve` block executes, and its required
+`AFD_CONNECTOR_HOST` (provided as pod env by the skill, pointing at the
+deployment's rendezvous Service) only resolves inside the cluster the
+skill deploys it to:
 
 | File                                  | DP | TP |
 |---------------------------------------|----|----|

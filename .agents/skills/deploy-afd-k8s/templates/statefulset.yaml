@@ -1,0 +1,344 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ${TEMPLATE_POD}
+  labels:
+    app: afd-recipe
+    role: serve
+    # Every object of the deployment carries this label so report, teardown,
+    # and pre-deploy cleanup can select the whole deployment with
+    # `-l afd-deployment=<name>` instead of listing names by hand (and so a
+    # plan switch from single-pod to split-role doesn't leave an old
+    # differently-named StatefulSet behind, still holding GPUs).
+    afd-deployment: ${TEMPLATE_DEPLOY_NAME}
+spec:
+  # Parallel, not the default OrderedReady: AFD connector init is a
+  # collective across every pod, and a split role's higher ordinals must
+  # exist before the lower ones can complete init and become Ready --
+  # OrderedReady (create ordinal N+1 only after N is Ready) deadlocks
+  # split-role recipes. Slow starters are handled by restartPolicy:
+  # Always crash-looping until their peers' rendezvous is up.
+  podManagementPolicy: Parallel
+  # One replica per pod of this role: recipes read AFD_ROLE (which
+  # StatefulSet the pod belongs to) and POD (the pod's ordinal below),
+  # so a split role scales as replicas instead of per-pod StatefulSets.
+  replicas: ${TEMPLATE_REPLICAS}
+  # Required identity Service; created by templates/service-governing.yaml.
+  # Shared by every StatefulSet of this deployment, and load-bearing, not a
+  # formality: the ExternalName endpoints (${DEPLOY_NAME}-service and the
+  # rendezvous/DP Services) point at head pods through this Service's DNS
+  # (<pod>.<governing>.<namespace>.svc), which resolves before the pod is
+  # Ready (publishNotReadyAddresses: true). Recipes themselves rendezvous
+  # through the named Services, never raw pod DNS.
+  serviceName: ${TEMPLATE_DEPLOY_NAME}-recipe-sts
+  # OnDelete, not RollingUpdate: AFD connector init is a collective
+  # across every pod of the deployment, so pods must restart together. A
+  # RollingUpdate restarts one pod at a time (highest ordinal first) and
+  # waits for it to become Ready -- a restarted shard cannot rejoin the
+  # surviving pods' DP world alone, so the rollout stalls forever. Template
+  # and ConfigMap changes therefore never restart pods on their own:
+  # restart every pod of the deployment together (see deploy.md step 4e)
+  # with `kubectl delete pod -l afd-deployment=<name>` -- never a single
+  # role or shard on its own.
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app: afd-recipe
+      afd-deployment: ${TEMPLATE_DEPLOY_NAME}
+      afd-sts: ${TEMPLATE_POD}
+  template:
+    metadata:
+      labels:
+        app: afd-recipe
+        role: serve
+        afd-deployment: ${TEMPLATE_DEPLOY_NAME}
+        afd-sts: ${TEMPLATE_POD}
+        afd-role: ${TEMPLATE_ROLE}
+    spec:
+      # restartPolicy is Always (the only value StatefulSets allow): a dead
+      # engine (detected via the livenessProbe below, e.g. after a peer pod
+      # crashes and NCCL tears this pod's workers down) restarts the
+      # container in place, and a deleted pod or dead node is recreated by
+      # the StatefulSet controller.
+      securityContext:
+        fsGroup: ${TEMPLATE_FSGROUP}
+      volumes:
+        - name: model-storage
+          persistentVolumeClaim:
+            claimName: ${TEMPLATE_PVC}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: work
+          emptyDir: {}
+        - name: recipe-script
+          configMap:
+            name: ${TEMPLATE_DEPLOY_NAME}-recipe-script
+      containers:
+        - name: afd
+          image: ${TEMPLATE_IMAGE}
+          imagePullPolicy: Always
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              RECIPE_SCRIPT=/recipe/recipe.sh
+              mkdir -p /work/bin
+              # Recipes only ever call `uv run <cmd>`; drop the `run` and exec
+              # the rest directly instead of invoking uv at all.
+              printf '#!/bin/bash\nshift\nexec "$@"\n' > /work/bin/uv
+              chmod +x /work/bin/uv
+              export PATH="/work/bin:$PATH"
+
+              # Pod identity is self-derived, never injected: the ordinal
+              # comes from this pod's hostname (<statefulset>-<ordinal>) and
+              # the role from the StatefulSet template. Recipes gate their
+              # blocks on AFD_ROLE and derive per-index conventions (headless
+              # shards, DP start ranks) from the numeric POD.
+              POD="${HOSTNAME##*-}"
+              export POD
+              echo "=== launching $(basename "$RECIPE_SCRIPT") (role=${AFD_ROLE} POD=${POD}) ==="
+
+              # Rebind the client-facing port off loopback: every `--host
+              # 127.0.0.1` on the branch is an API-server flag (the recipe binds
+              # :${TEMPLATE_CLIENT_PORT} on 127.0.0.1), but the Service needs
+              # 0.0.0.0.
+              RECIPE_BASENAME="$(basename "$RECIPE_SCRIPT" .sh)"
+              PATCHED_SCRIPT="/work/${RECIPE_BASENAME}.patched.sh"
+              sed 's/--host 127\.0\.0\.1/--host 0.0.0.0/' "$RECIPE_SCRIPT" > "$PATCHED_SCRIPT"
+
+              cd /work
+              # emptyDir volumes persist across container restarts: markers and
+              # logs from a previous incarnation would immediately satisfy (or
+              # fail) this restart's probes. Clear them; the previous
+              # container's wrapper output stays available via
+              # `kubectl logs --previous`.
+              rm -f /work/ready /work/heartbeat
+              for log in attn.log ffn.log; do
+                [ -f "/work/$log" ] && mv "/work/$log" "/work/$log.previous"
+              done
+              bash "$PATCHED_SCRIPT" &
+              RECIPE_PID=$!
+              echo "$RECIPE_PID" > /work/recipe.pid
+
+              # Liveness heartbeat: touched on every wait-loop iteration
+              # below (startup marker waits, the /health wait, and the
+              # monitor loop), so it stays under a minute old for as long as
+              # the wrapper itself is making progress -- see the
+              # livenessProbe below. A dead engine needs no marker removal:
+              # the monitor loop's engine_died / process-exit checks end in
+              # fail(), which exits PID 1 and restarts the container without
+              # any probe. The heartbeat's one job is the case fail() cannot
+              # reach: a wrapper hung mid-loop.
+              touch /work/heartbeat
+
+              # Which log(s) this pod will actually produce, keyed on the
+              # role this StatefulSet serves. Fixed to the attn.log/ffn.log
+              # names every colocation recipe uses today.
+              LOGS=""
+              [ "$AFD_ROLE" = "attention" ] || [ "$AFD_ROLE" = "both" ] && LOGS="$LOGS attn.log"
+              [ "$AFD_ROLE" = "ffn" ] || [ "$AFD_ROLE" = "both" ] && LOGS="$LOGS ffn.log"
+
+              fail() {
+                echo "ERROR: $*"
+                rm -f /work/ready /work/heartbeat
+                for log in $LOGS; do
+                  echo "----- tail $log -----"
+                  tail -n 100 "/work/$log" 2>/dev/null || echo "(missing)"
+                done
+                exit 1
+              }
+
+              [ -n "$LOGS" ] || fail "this pod's AFD_ROLE is neither attention, ffn, nor both -- nothing to run"
+
+              # Fatal signatures that mean the serving engine died even though
+              # the recipe process is still alive. The NCCL watchdog line fires
+              # when a peer pod dies and torch tears this pod's workers down;
+              # the rest are the engine's own fatal-error reports. Scoped to
+              # this pod's own logs (attn.log / ffn.log), never the wrapper's
+              # own output. Checked during startup (a peer dying during
+              # rendezvous, or an init failure that leaves the process
+              # running) as well as after READY, so it is defined before the
+              # first use below.
+              engine_died() {
+                for log in $LOGS; do
+                  if [ -f "/work/$log" ] && grep -qE \
+                    'EngineDeadError|encountered a fatal error|Engine core initialization failed|taking the entire process down' \
+                    "/work/$log"; then
+                    return 0
+                  fi
+                done
+                return 1
+              }
+
+              # A headless shard of a split attention role never starts an
+              # API server, so it never logs "Application startup complete"
+              # -- its readiness shows as the EngineCore's own init-complete
+              # line. Headless-ness is recipe-internal (derived from POD),
+              # so accept either marker.
+              ready_marker() {
+                case "$1" in
+                  ffn.log) echo "AFD FFN EngineCore started" ;;
+                  attn.log) echo "Application startup complete|init engine \(profile, create kv cache, warmup model\) took" ;;
+                esac
+              }
+
+              echo "=== wait for every worker to report startup ==="
+              for log in $LOGS; do
+                marker="$(ready_marker "$log")"
+                echo "--- waiting on $log (marker: $marker) ---"
+                ready=0
+                for i in $(seq 1 240); do
+                  if [ -f "/work/$log" ] && grep -qE "$marker" "/work/$log"; then
+                    echo "$log: ready"
+                    ready=1
+                    break
+                  fi
+                  kill -0 "$RECIPE_PID" 2>/dev/null || fail "recipe process exited before $log came up"
+                  # Startup can take tens of minutes; a fatal engine error
+                  # during it must fail the pod now, not at the timeout.
+                  engine_died && fail "serving engine died during startup (fatal error in $LOGS)"
+                  touch /work/heartbeat
+                  sleep 10
+                done
+                [ "$ready" = "1" ] || fail "timed out waiting for $log"
+              done
+
+              # Only the attention pod at ordinal 0 runs a client-facing
+              # API server; headless shards at higher ordinals do not.
+              if [ "$AFD_ROLE" = "attention" ] || [ "$AFD_ROLE" = "both" ]; then
+                if [ "$POD" != "0" ]; then
+                  echo "--- headless attention shard (POD=$POD): skipping API /health wait ---"
+                else
+                  echo "--- waiting on attention server /health (127.0.0.1:${TEMPLATE_CLIENT_PORT}) ---"
+                  endpoint_ready=0
+                  for i in $(seq 1 60); do
+                    # -m 5: an API server that accepts the connection but never
+                    # answers must not block this loop forever.
+                    if curl -fsS -m 5 "http://127.0.0.1:${TEMPLATE_CLIENT_PORT}/health" >/dev/null 2>&1; then
+                      echo "attention server: ready"
+                      endpoint_ready=1
+                      break
+                    fi
+                    engine_died && fail "serving engine died while waiting for /health (fatal error in $LOGS)"
+                    touch /work/heartbeat
+                    sleep 5
+                  done
+                  [ "$endpoint_ready" = "1" ] || fail "attention server did not answer /health"
+                fi
+              fi
+
+              echo "=== pod ${HOSTNAME} READY ==="
+              touch /work/ready
+
+              # Consecutive /health misses tolerated before failing the pod:
+              # a single miss (a short event-loop stall under load) must not
+              # restart the container -- that would tear the FFN peer's NCCL
+              # connection down and restart the whole world.
+              HEALTH_MISS_LIMIT=3
+              health_misses=0
+
+              echo "=== monitoring serving process (pid $RECIPE_PID) ==="
+              while true; do
+                sleep 10
+                touch /work/heartbeat
+                kill -0 "$RECIPE_PID" 2>/dev/null || fail "serving process exited unexpectedly"
+                engine_died && fail "serving engine died (fatal error in $LOGS)"
+                if [ "$AFD_ROLE" = "attention" ] || [ "$AFD_ROLE" = "both" ]; then
+                  if [ "$POD" = "0" ]; then
+                    # -m 5: an API server that accepts the connection but
+                    # never answers must not block this loop forever -- a
+                    # blocked loop stops touching the heartbeat and the pod
+                    # would sit Running/Ready as a zombie.
+                    if curl -fsS -m 5 "http://127.0.0.1:${TEMPLATE_CLIENT_PORT}/health" >/dev/null 2>&1; then
+                      health_misses=0
+                    else
+                      health_misses=$((health_misses + 1))
+                      if [ "$health_misses" -ge "$HEALTH_MISS_LIMIT" ]; then
+                        fail "attention server health check failed ($HEALTH_MISS_LIMIT consecutive misses)"
+                      fi
+                      echo "WARNING: /health miss $health_misses/$HEALTH_MISS_LIMIT"
+                    fi
+                  fi
+                fi
+              done
+          env:
+            - name: USER
+              value: "vllm"
+            - name: HOME
+              value: "/work/home"
+            - name: MODEL_PATH
+              value: "${TEMPLATE_MODEL}"
+            - name: HF_HOME
+              value: "/models/.hf_home"
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: "/work/inductor"
+            - name: AFD_ROLE
+              value: "${TEMPLATE_ROLE}"
+            - name: AFD_CONNECTOR_HOST
+              value: "${TEMPLATE_DEPLOY_NAME}-ffn-p2p-service"
+            - name: ATTENTION_DP_ADDRESS
+              value: "${TEMPLATE_DEPLOY_NAME}-attn-dp-service"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: token
+                  optional: true
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  [ -f /work/ready ] || exit 1
+                  kill -0 "$(cat /work/recipe.pid)" 2>/dev/null || exit 1
+                  if [ "$AFD_ROLE" = "attention" ] || [ "$AFD_ROLE" = "both" ]; then
+                    if [ "${HOSTNAME##*-}" = "0" ]; then
+                      curl -fsS -m 5 "http://127.0.0.1:${TEMPLATE_CLIENT_PORT}/health" >/dev/null 2>&1
+                    fi
+                  fi
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Heartbeat freshness, not marker existence: the wrapper touches
+          # /work/heartbeat on every wait/monitor iteration, and this probe
+          # fails once the file is older than a minute -- i.e. when the
+          # wrapper itself is hung (an engine death or process exit already
+          # ends in fail(), which exits PID 1 and restarts the container
+          # without any probe). Without this, a hung wrapper leaves the pod
+          # Running/Ready forever -- a zombie kubelet will never restart,
+          # deadlocking the deployment whose peer is crash-looping.
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - '[ -n "$(find /work/heartbeat -mmin -1)" ]'
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              nvidia.com/gpu: "${TEMPLATE_GPU}"
+              cpu: "16"
+              memory: 128Gi
+            limits:
+              nvidia.com/gpu: "${TEMPLATE_GPU}"
+              cpu: "32"
+              memory: 200Gi
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+            - name: dshm
+              mountPath: /dev/shm
+            - name: work
+              mountPath: /work
+            - name: recipe-script
+              mountPath: /recipe
+              readOnly: true

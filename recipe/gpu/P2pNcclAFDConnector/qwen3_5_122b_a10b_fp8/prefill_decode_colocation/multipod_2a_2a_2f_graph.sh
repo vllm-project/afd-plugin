@@ -2,20 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 
 # Use .agents/skills/deploy-afd-k8s/SKILL.md to deploy this recipe
-# on 3 pods using the setup below.
-# For pod 1: POD=ATTENTION_0
-# For pod 2: POD=ATTENTION_1, ATTENTION_HEADLESS=1, ATTENTION_DP_START_RANK=2
-# For pod 3: POD=FFN_0
+# on 3 pods: two attention pods and one FFN pod. The deployment layer
+# places each role in its own StatefulSet; AFD_ROLE selects the role and
+# POD is the pod's zero-based ordinal within it. Attention shards with
+# POD>0 run headless with a data-parallel start rank of POD*2.
 
 MODEL_PATH=${MODEL_PATH:-/path/model_weights/Qwen3.5-122B-A10B-FP8}
 export VLLM_USE_V2_MODEL_RUNNER=1
 
-AFD_CONNECTOR_HOST=${AFD_CONNECTOR_HOST:-vllm-ffn-p2p-service}
+: "${AFD_CONNECTOR_HOST:?not set -- deploy via the deploy-afd-k8s skill, which provides this pod env}"
 AFD_CONNECTOR_PORT=${AFD_CONNECTOR_PORT:-1239}
 
-ATTENTION_DP_START_RANK=${ATTENTION_DP_START_RANK:-0}
-ATTENTION_HEADLESS=${ATTENTION_HEADLESS:-0}
-ATTENTION_DP_ADDRESS=${ATTENTION_DP_ADDRESS:-vllm-attn-dp-service}
+# Per-ordinal conventions, derived from the pod's StatefulSet ordinal:
+# POD>0 shards run headless and start at data-parallel rank
+# POD*ATTENTION_DP_RANKS_PER_POD.
+ATTENTION_DP_RANKS_PER_POD=2
+ATTENTION_DP_START_RANK=${ATTENTION_DP_START_RANK:-$(( ${POD:-0} * ATTENTION_DP_RANKS_PER_POD ))}
+ATTENTION_HEADLESS=${ATTENTION_HEADLESS:-$([ "${POD:-0}" -gt 0 ] && echo 1 || echo 0)}
+: "${ATTENTION_DP_ADDRESS:?not set -- deploy via the deploy-afd-k8s skill, which provides this pod env}"
 ATTENTION_DP_RPC_PORT=${ATTENTION_DP_RPC_PORT:-13345}
 
 HEADLESS_ARGS=()
@@ -28,10 +32,10 @@ if [[ "$ATTENTION_DP_START_RANK" != "0" ]]; then
   DP_START_RANK_ARGS=(--data-parallel-start-rank "$ATTENTION_DP_START_RANK")
 fi
 
-if [[ "$POD" == ATTENTION_* ]]; then
+if [ "$AFD_ROLE" == "attention" ]; then
   CUDA_VISIBLE_DEVICES=0,1 uv run vllm serve "$MODEL_PATH" \
       --data-parallel-size 4 \
-      --data-parallel-size-local 2 \
+      --data-parallel-size-local "$ATTENTION_DP_RANKS_PER_POD" \
       "${DP_START_RANK_ARGS[@]}" \
       --data-parallel-address "$ATTENTION_DP_ADDRESS" \
       --data-parallel-rpc-port "$ATTENTION_DP_RPC_PORT" \
@@ -65,7 +69,7 @@ if [[ "$POD" == ATTENTION_* ]]; then
       --port 18305 > attn.log 2>&1 &
 fi
 
-if [[ "$POD" == FFN_* ]]; then
+if [ "$AFD_ROLE" == "ffn" ]; then
   CUDA_VISIBLE_DEVICES=0,1 uv run vllm serve "$MODEL_PATH" \
       --data-parallel-size 2 \
       --tensor-parallel-size 1 \
