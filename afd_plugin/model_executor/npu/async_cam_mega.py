@@ -24,17 +24,21 @@ class AsyncCAMMegaExecutor:
     """Native MC2 W4A8 only; the layered executor owns W8A8 execution."""
 
     def __init__(self, weights: AsyncCAMLayeredExecutor, connector) -> None:
-        # The native MC2 epilogue dequantizes packed INT4 weights and applies
-        # A8W4 postprocessing, so a W8A8 table cannot share this launch.
+        # The INT8 fixpipe block this CANN ships is an AtlasA3 tile-copy family,
+        # while the native Mega kernel runs on the AtlasA2 W4A4 path Catlass
+        # specializes here. W8A8 tables therefore stay on the layered executor.
         if weights.quantization != "W4A8":
-            raise ValueError("native MC2 Mega requires homogeneous W4A8 weights")
+            raise ValueError(
+                "native MC2 Mega requires homogeneous W4A8 weights; "
+                f"got {weights.quantization}. Disable ffn_mega_moe to use the "
+                "layered executor for this table."
+            )
         if not weights.per_channel:
             raise ValueError("native MC2 Mega requires per-channel W4A8 weights")
         self.weights = weights
         self.connector = connector
         self.capacity = cam_receive_capacity()
-        experts, hidden, packed = weights.w13[0].shape
-        intermediate = packed * 4
+        experts, hidden, intermediate = weights.geometry()
         self.config = [
             connector.max_num_batched_tokens,
             hidden,
