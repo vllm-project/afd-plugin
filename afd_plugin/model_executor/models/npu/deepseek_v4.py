@@ -517,8 +517,12 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         # The external-routing component is built here, while a vLLM config context
         # exists, so the first forward onto MC2 never constructs a comm.
         self.afd_external_routing_moe = None
-        if getattr(afd_config, "compute_gate_on_attention", False) and isinstance(
-            self.mlp, native.DeepseekV4MoE
+        # Synchronous external routing only: the async CAM connector keeps its own
+        # FFN path, even though it also computes the gate on the Attention side.
+        if (
+            self.uses_external_routing
+            and afd_config.role == _FFN_ROLE
+            and isinstance(self.mlp, native.DeepseekV4MoE)
         ):
             from afd_plugin.model_executor.models.npu.external_routing_moe import (
                 AFDExternalRoutingMoE,
