@@ -146,10 +146,10 @@ class CAMP2PExtraInfo(ConnectorExtraInfo):
         return self.core_num
 
     def validate_supported(self) -> None:
-        if self.compute_gate_on_attention:
-            raise RuntimeError(
-                "AFD NPU runtime does not support compute_gate_on_attention=true yet",
-            )
+        # The gate switch is read from ``additional_config["afd"]``; the copy in
+        # ``connector_extra_config`` is parsed for compatibility and deliberately has no
+        # say here. feature_validation owns the supported shapes, so a second opinion in
+        # this class could only disagree with it.
         if self.quant_mode != 0:
             raise RuntimeError("AFD NPU runtime currently supports only quant_mode=0")
 

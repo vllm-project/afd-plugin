@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 from __future__ import annotations
 
+import functools
 import sys
 import types
 from contextlib import contextmanager
@@ -97,6 +98,25 @@ def isolate_ascend_config_installer(monkeypatch):
     config_patch = ModuleType(module_name)
     config_patch.__dict__["apply_afd_ascend_config_patch"] = lambda: None
     monkeypatch.setitem(sys.modules, module_name, config_patch)
+
+
+@pytest.fixture(autouse=True)
+def isolate_worker_installers(monkeypatch):
+    # These installers resolve vLLM-Ascend worker modules that a CPU host does not
+    # have. These tests exercise the installer wiring; each patch has its own
+    # coverage next to it.
+    installed: list[str] = []
+    for stem, attribute in (
+        ("external_routing_prepare", "apply_afd_external_routing_prepare_patch"),
+        (
+            "external_routing_mc2_prepare",
+            "apply_afd_external_routing_mc2_prepare_patch",
+        ),
+    ):
+        module = ModuleType(f"afd_plugin.compat.patches.npu.{stem}")
+        module.__dict__[attribute] = functools.partial(installed.append, stem)
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    return installed
 
 
 @pytest.mark.usefixtures("isolate_ascend_config_installer")

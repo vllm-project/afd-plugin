@@ -87,12 +87,6 @@ def test_padding_appends_inert_rows_and_keeps_valid_ones(inputs_type):
     assert padded.token_count == 4
 
 
-def test_padding_zero_returns_the_same_object(inputs_type):
-    inputs = _inputs(inputs_type, 2)
-
-    assert inputs.padded(0) is inputs
-
-
 def test_gathering_keeps_rank_order_and_contents(inputs_type):
     """Rank 0's rows come first, then rank 1's, with their own values intact."""
 

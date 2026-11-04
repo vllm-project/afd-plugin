@@ -171,7 +171,7 @@ def prepare(
     )
 
 
-def apply_afd_external_routing_mc2_prepare_patch() -> bool:
+def apply_afd_external_routing_mc2_prepare_patch() -> None:
     """Install the MC2 prepare patch.
 
     Call once during runtime initialisation, not per forward. The FFN-side
@@ -180,7 +180,6 @@ def apply_afd_external_routing_mc2_prepare_patch() -> bool:
     """
 
     PrepareAndFinalizeWithMC2.prepare = prepare
-    return True
 
 
 __all__ = [

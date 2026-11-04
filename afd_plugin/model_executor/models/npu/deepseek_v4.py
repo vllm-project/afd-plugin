@@ -897,7 +897,8 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
         raise NotImplementedError(
-            "DSV4 AFD does not support compute_gate_on_attention yet"
+            "DSV4 AFD never returns gate outputs through this method; the "
+            "Attention-side gate keeps its top-k inside the gate shell"
         )
 
 

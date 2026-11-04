@@ -154,33 +154,16 @@ def test_non_sp_branch_pads_activation_and_routing_together(monkeypatch):
 
     output = patch.prepare(
         subject,
-        hidden_states=torch.zeros(2, HIDDEN),
-        router_logits=None,
-    )
-
-    assert output.hidden_states.shape[0] == 3
-    assert subject.afd_external_routing.token_count == 3
-    # The appended row is inert.
-    assert subject.afd_external_routing.topk_ids[2].tolist() == [0, 0]
-    assert output.pertoken_scale is None
-
-
-def test_bf16_leaves_pertoken_scale_none(monkeypatch):
-    """This stage carries no activation scale, and none is invented."""
-
-    _, context = _install_fake_upstream(monkeypatch)
-    patch = _load_patch_module(monkeypatch)
-    context.padded_num_tokens = 3
-    subject = _subject(external=_routing(rows=2))
-
-    output = patch.prepare(
-        subject,
         hidden_states=torch.zeros(2, HIDDEN, dtype=torch.bfloat16),
         router_logits=None,
     )
 
+    # This stage carries BF16 with no activation scale, and none was invented.
     assert output.hidden_states.dtype == torch.bfloat16
     assert output.hidden_states.shape[0] == 3
+    assert subject.afd_external_routing.token_count == 3
+    # The appended row is inert.
+    assert subject.afd_external_routing.topk_ids[2].tolist() == [0, 0]
     assert output.pertoken_scale is None
 
 
@@ -210,33 +193,14 @@ def test_tp_sharding_takes_the_same_slice_for_routing(monkeypatch):
     assert output.mc2_mask.tolist() == [True, False]
 
 
-def test_sp_branch_keeps_the_mask_bits_it_owns(monkeypatch):
-    """In the SP branch the mask is sliced by shard, then padded with False."""
-
-    _, context = _install_fake_upstream(monkeypatch)
-    patch = _load_patch_module(monkeypatch)
-    context.padded_num_tokens = 4
-    context.mc2_mask = torch.tensor([True, False, True, True])
-    subject = _subject(tp_size=2, tp_rank=0, external=_routing(rows=1))
-
-    output = patch.prepare(
-        subject,
-        hidden_states=torch.zeros(1, HIDDEN),
-        router_logits=None,
-        replace_allreduce=True,
-    )
-
-    # One local row from shard 0 is [True]; the padding row is False.
-    assert output.mc2_mask.tolist() == [True, False]
-
-
 def test_replace_allreduce_pads_the_local_shard(monkeypatch):
     """The SP branch pads only its own shard, and the routing follows."""
 
     _, context = _install_fake_upstream(monkeypatch)
     patch = _load_patch_module(monkeypatch)
     context.padded_num_tokens = 4
-    context.mc2_mask = torch.ones(4, dtype=torch.bool)
+    # Explicit bits, so a wrong shard or a lost padding shows up in the contents.
+    context.mc2_mask = torch.tensor([True, False, True, True])
     subject = _subject(tp_size=2, tp_rank=0, external=_routing(rows=1))
 
     output = patch.prepare(
@@ -250,7 +214,8 @@ def test_replace_allreduce_pads_the_local_shard(monkeypatch):
     assert output.hidden_states.shape[0] == 2
     assert subject.afd_external_routing.token_count == 2
     assert subject.afd_external_routing.topk_ids[1].tolist() == [0, 0]
-    assert output.mc2_mask.numel() == 2
+    # Shard 0 owns the first bit; the padding row is False.
+    assert output.mc2_mask.tolist() == [True, False]
 
 
 def test_absent_routing_keeps_upstream_behaviour(monkeypatch):

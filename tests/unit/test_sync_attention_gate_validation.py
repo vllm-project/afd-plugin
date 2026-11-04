@@ -21,33 +21,7 @@ from afd_plugin import validation
 from afd_plugin.validation import _fail_if_unsupported_sync_gate_runtime
 
 
-def _config(*, enable_dbo=False, use_ubatching=False):
-    return SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            enable_dbo=enable_dbo,
-            use_ubatching=use_ubatching,
-        ),
-    )
-
-
-def test_plain_sync_gate_config_is_accepted():
-    _fail_if_unsupported_sync_gate_runtime(_config(), SimpleNamespace())
-
-
-def test_dbo_is_rejected():
-    with pytest.raises(RuntimeError, match="DBO or ubatching"):
-        _fail_if_unsupported_sync_gate_runtime(_config(enable_dbo=True), SimpleNamespace())
-
-
-def test_ubatching_is_rejected():
-    with pytest.raises(RuntimeError, match="DBO or ubatching"):
-        _fail_if_unsupported_sync_gate_runtime(
-            _config(use_ubatching=True),
-            SimpleNamespace(),
-        )
-
-
-def _runner_config(*, enable_dbo=False):
+def _runner_config(*, enable_dbo=False, use_ubatching=False):
     """A ``VllmConfig`` surface complete enough for a clean return.
 
     Every field the validator reads on the accepted path is present, so the
@@ -60,7 +34,7 @@ def _runner_config(*, enable_dbo=False):
         speculative_config=None,
         parallel_config=SimpleNamespace(
             enable_dbo=enable_dbo,
-            use_ubatching=False,
+            use_ubatching=use_ubatching,
             num_ubatches=2,
             pipeline_parallel_size=1,
             prefill_context_parallel_size=1,
@@ -115,12 +89,16 @@ def sync_gate_afd_config(monkeypatch):
 
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])
-def test_validator_rejects_dbo_for_each_role(sync_gate_afd_config, role):
-    """Both roles run this validator, so both must refuse DBO."""
+@pytest.mark.parametrize("unsupported", ["dbo", "ubatching"])
+def test_validator_rejects_unsupported_parallel_features(
+    sync_gate_afd_config, role, unsupported
+):
+    """Both roles refuse DBO and ubatching: the sync shell never yields."""
 
+    settings = {"enable_dbo": True} if unsupported == "dbo" else {"use_ubatching": True}
     with pytest.raises(RuntimeError, match="DBO or ubatching"):
         validation.validate_npu_model_runner_v2_config(
-            _runner_config(enable_dbo=True),
+            _runner_config(**settings),
             expected_role=role,
             device_type="npu",
         )

@@ -38,7 +38,7 @@ SUPPORTED_INDEX_DTYPES: Final[tuple[torch.dtype, ...]] = (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class AFDExternalRoutingInputs:
     """Routing computed on the Attention side, in the FFN rank's local row order.
 
