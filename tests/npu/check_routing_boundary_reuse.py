@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 """Focused device check: one compiled artifact reused with live routing.
 
 Run on the NPU host with the pinned stack. Uses the production op registration
@@ -25,10 +28,9 @@ TOPK = 2
 op = torch.ops.vllm.afd_balance_routing_ids_
 
 
-
 def _forward_context(in_profile_run: bool):
     """Real forward context; the flag is the attribute set_forward_context sets."""
-    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.forward_context import ForwardContext
 
     ctx = ForwardContext(
         no_compile_layers={},
@@ -78,17 +80,20 @@ def check_compiled_reuse():
     with torch.no_grad(), _forward_context(True):
         profile_ids = _ids(3)
         op(profile_ids, NUM_EXPERTS, False)
-        assert profile_ids.flatten().tolist() == _balanced(), "profile state is not balanced"
+        assert profile_ids.flatten().tolist() == _balanced(), (
+            "profile state is not balanced"
+        )
         # The original failure compiles while profiling; keep that order.
         compiled_fn, example_inputs = _compile_once(_Gate())
 
     with torch.no_grad(), _forward_context(False):
-
         for offset in (5, 11):
             live = _ids(offset)
             expected = live.clone()
             compiled_fn(live, *example_inputs[1:])
-            assert torch.equal(live, expected), f"live ids changed for offset {offset}: {live.tolist()}"
+            assert torch.equal(live, expected), (
+                f"live ids changed for offset {offset}: {live.tolist()}"
+            )
     print("eager compiled reuse: OK")
 
 
@@ -117,7 +122,9 @@ def check_acl_graph_reuse():
             out.zero_()
             graph.replay()
             torch.npu.synchronize()
-            assert torch.equal(out, expected), f"acl graph replay {offset} produced {out.tolist()}"
+            assert torch.equal(out, expected), (
+                f"acl graph replay {offset} produced {out.tolist()}"
+            )
     print("acl graph reuse: OK")
 
 

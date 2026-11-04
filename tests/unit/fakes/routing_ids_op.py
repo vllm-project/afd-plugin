@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 """CPU registration of the routing-id op for tests that call the gate directly.
 
 The op is normally registered by the AFD worker installer; gate unit tests and
@@ -12,6 +15,7 @@ import sys
 import types
 
 import pytest
+
 
 @pytest.fixture
 def registered_routing_ids_op(monkeypatch):
@@ -51,7 +55,7 @@ def registered_routing_ids_op(monkeypatch):
             else:
                 sys.modules[module_name] = saved_module
             if had_attr:
-                setattr(afd_npu_package, "routing_ids", saved_attr)
+                afd_npu_package.routing_ids = saved_attr
             else:
                 afd_npu_package.__dict__.pop("routing_ids", None)
 
@@ -60,4 +64,5 @@ def registered_routing_ids_op(monkeypatch):
         afd_npu_package.__dict__.pop("routing_ids", None)
 
         import afd_plugin.compat.npu.routing_ids  # noqa: F401  registers the op
+
         yield afd_plugin.compat.npu.routing_ids, torch.ops.vllm.afd_balance_routing_ids_

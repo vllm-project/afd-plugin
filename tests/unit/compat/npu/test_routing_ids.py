@@ -1,10 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 """The profile flag must be read inside the custom op, not traced."""
 
 from __future__ import annotations
-
-import contextlib
-import sys
-import types
 
 import pytest
 
@@ -25,7 +24,9 @@ def _balanced() -> list[int]:
     return [i % NUM_EXPERTS for i in range(TOKENS * TOPK)]
 
 
-def test_balances_in_profile_and_is_inert_otherwise(registered_routing_ids_op, monkeypatch):
+def test_balances_in_profile_and_is_inert_otherwise(
+    registered_routing_ids_op, monkeypatch
+):
     balance_op, _op = registered_routing_ids_op
     monkeypatch.setattr(balance_op, "_afd_in_profile_run", lambda: True)
     profile_ids = _ids(3)
@@ -44,7 +45,9 @@ def test_balances_in_profile_and_is_inert_otherwise(registered_routing_ids_op, m
     assert torch.equal(second, expected_second)
 
 
-def test_explicit_force_balances_outside_profile(registered_routing_ids_op, monkeypatch):
+def test_explicit_force_balances_outside_profile(
+    registered_routing_ids_op, monkeypatch
+):
     balance_op, _op = registered_routing_ids_op
     monkeypatch.setattr(balance_op, "_afd_in_profile_run", lambda: False)
     forced = _ids(5)
@@ -57,8 +60,11 @@ def test_opcheck_contract(registered_routing_ids_op, monkeypatch):
     # Profile mode is the branch that actually mutates topk_ids, so the declared
     # mutation is exercised; a schema claiming no mutation must fail here.
     monkeypatch.setattr(balance_op, "_afd_in_profile_run", lambda: True)
-    torch.library.opcheck(_op, (_ids(1), NUM_EXPERTS, False),
-                          test_utils=("test_schema", "test_faketensor"))
+    torch.library.opcheck(
+        _op,
+        (_ids(1), NUM_EXPERTS, False),
+        test_utils=("test_schema", "test_faketensor"),
+    )
 
 
 class _ThroughOp(torch.nn.Module):
@@ -97,7 +103,9 @@ def _compile_once(module):
 
 
 @pytest.mark.parametrize("case", ["through_op", "plain_python"])
-def test_reuse_without_guards_keeps_live_routing(registered_routing_ids_op, monkeypatch, case):
+def test_reuse_without_guards_keeps_live_routing(
+    registered_routing_ids_op, monkeypatch, case
+):
     balance_op, _op = registered_routing_ids_op
     _PLAIN_FLAG["profile"] = True
     monkeypatch.setattr(balance_op, "_afd_in_profile_run", lambda: True)
@@ -123,7 +131,9 @@ def _inductor_available() -> bool:
     return True
 
 
-@pytest.mark.skipif(not _inductor_available(), reason="inductor unavailable on this CPU host")
+@pytest.mark.skipif(
+    not _inductor_available(), reason="inductor unavailable on this CPU host"
+)
 def test_inductor_backend_keeps_live_routing(registered_routing_ids_op, monkeypatch):
     balance_op, _op = registered_routing_ids_op
     monkeypatch.setattr(balance_op, "_afd_in_profile_run", lambda: True)

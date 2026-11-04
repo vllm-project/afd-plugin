@@ -457,8 +457,6 @@ def _gmmswigluquant_fusion_enabled() -> bool:
     return bool(getattr(fusion_config, "fusion_ops_gmmswigluquant", False))
 
 
-
-
 __all__ = [
     "compute_attention_gate_moe_ffn",
     "compute_attention_gate_topk",

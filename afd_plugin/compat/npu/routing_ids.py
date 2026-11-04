@@ -1,9 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 """Opaque boundary for the profile-dependent expert-ID balancing."""
 
 from __future__ import annotations
 
 import torch
-
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
@@ -15,10 +17,16 @@ def _afd_in_profile_run() -> bool:
     return bool(_EXTRA_CTX.in_profile_run)
 
 
-def _force_balanced_topk_ids(topk_ids: torch.Tensor, *, num_logical_experts: int) -> torch.Tensor:
+def _force_balanced_topk_ids(
+    topk_ids: torch.Tensor, *, num_logical_experts: int
+) -> torch.Tensor:
     """Overwrite ``topk_ids`` with a balanced logical-ID layout, in place."""
     balanced = torch.arange(topk_ids.numel(), device=topk_ids.device, dtype=torch.int64)
-    topk_ids.copy_(balanced.reshape(topk_ids.shape).remainder(num_logical_experts).to(topk_ids.dtype))
+    topk_ids.copy_(
+        balanced.reshape(topk_ids.shape)
+        .remainder(num_logical_experts)
+        .to(topk_ids.dtype)
+    )
     return topk_ids
 
 
