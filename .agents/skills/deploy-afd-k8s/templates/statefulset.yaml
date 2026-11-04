@@ -145,6 +145,9 @@ spec:
               fail() {
                 echo "ERROR: $*"
                 rm -f /work/ready /work/heartbeat
+                # local: the callers of fail() loop over `log` too, and bash
+                # function variables are global unless declared.
+                local log
                 for log in $LOGS; do
                   echo "----- tail $log -----"
                   tail -n 100 "/work/$log" 2>/dev/null || echo "(missing)"
@@ -164,6 +167,12 @@ spec:
               # running) as well as after READY, so it is defined before the
               # first use below.
               engine_died() {
+                # local: this is called from inside the startup marker loop,
+                # which iterates over its own `log`; without this the
+                # function's last iteration would overwrite the caller's
+                # loop variable and the caller would then test a different
+                # role's log for the current role's marker.
+                local log
                 for log in $LOGS; do
                   if [ -f "/work/$log" ] && grep -qE \
                     'EngineDeadError|encountered a fatal error|Engine core initialization failed|taking the entire process down' \
