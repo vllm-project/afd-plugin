@@ -17,7 +17,6 @@ Assertions:
 from __future__ import annotations
 
 import contextlib
-
 import os
 
 # The pinned Ascend resolves _EXTRA_CTX.* out of additional_kwargs only in V2
@@ -43,12 +42,11 @@ def _forward_context(in_profile_run: bool):
     The proxy chooses between additional_kwargs and a plain attribute depending
     on the stack's mode; writing through it keeps set and read consistent.
     """
-    from vllm.forward_context import ForwardContext, override_forward_context
-    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-
     # Switch the stack's cache through its production entry so additional_kwargs
     # is the storage the proxy reads and writes.
     import vllm_ascend.ascend_forward_context as afc
+    from vllm.forward_context import ForwardContext
+    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
     if not afc._USE_V2_EXTRA_KWARGS:
         from vllm.config import VllmConfig
