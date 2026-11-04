@@ -22,6 +22,10 @@ from typing import Any
 
 import pytest
 
+# The gate calls torch.ops.vllm.afd_balance_routing_ids_; this module runs
+# without the AFD worker installer, so the op is registered here.
+pytestmark = pytest.mark.usefixtures("registered_routing_ids_op")
+
 torch = pytest.importorskip("torch")
 
 _STUB_MODULES = (

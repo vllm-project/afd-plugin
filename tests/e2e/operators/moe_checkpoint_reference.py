@@ -172,6 +172,9 @@ def main() -> None:
     )
     with set_current_vllm_config(config):
         worker.init_device()
+    # The gate calls torch.ops.vllm.afd_balance_routing_ids_; importing the
+    # module registers it outside the AFD worker installer path.
+    from afd_plugin.compat.npu import routing_ids  # noqa: F401
     hf = config.model_config.hf_config
     dtype = config.model_config.dtype
     layers = args.layers or (
