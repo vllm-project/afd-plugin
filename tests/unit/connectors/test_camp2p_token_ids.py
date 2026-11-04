@@ -327,6 +327,7 @@ def test_recv_attn_output_mode_and_ids_follow_the_receiver_declaration(
     assert calls[1][-1] == 0
     assert without_ids.input_ids is None
 
+
 def _routing(connector, rows, *, columns=None):
     """Routing sized the way the operator is configured."""
 
@@ -495,9 +496,7 @@ def test_recv_attn_output_reads_the_routing_slot(monkeypatch):
     assert calls[0][-1] == 1
     assert payload.input_ids is None
     assert payload.topk_ids.shape == (10, connector.num_experts_per_tok)
-    assert payload.topk_ids[0].tolist() == list(
-        range(connector.num_experts_per_tok)
-    )
+    assert payload.topk_ids[0].tolist() == list(range(connector.num_experts_per_tok))
     assert payload.topk_weights.shape == (10, connector.num_experts_per_tok)
     assert payload.topk_weights[0].tolist() == [0.5] * connector.num_experts_per_tok
 

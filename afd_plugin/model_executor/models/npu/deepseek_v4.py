@@ -344,13 +344,11 @@ class AFDDeepseekV4SyncAttentionGateRemoteMoE(AFDDeepseekV4AttentionGateRemoteMo
     ) -> torch.Tensor:
         from afd_plugin.model_executor.models.npu import deepseek_v4_attention_gate
 
-        topk_weights, topk_ids = (
-            deepseek_v4_attention_gate.compute_attention_gate_topk(
-                self,
-                hidden_states,
-                input_ids=input_ids,
-                hidden_states_fp32=hidden_states_fp32,
-            )
+        topk_weights, topk_ids = deepseek_v4_attention_gate.compute_attention_gate_topk(
+            self,
+            hidden_states,
+            input_ids=input_ids,
+            hidden_states_fp32=hidden_states_fp32,
         )
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
@@ -381,23 +379,6 @@ class AFDDeepseekV4SyncAttentionGateRemoteMoE(AFDDeepseekV4AttentionGateRemoteMo
         if shared_output is not None:
             output = output + shared_output
         return output
-
-
-def _routed_experts_of(moe: Any) -> Any:
-    """Return the routed-experts module that owns apply and finalize state.
-
-    The path is ``moe.experts.routed_experts`` in the pinned tag. Reaching it through
-    a helper keeps the failure readable if upstream changes the nesting, instead of
-    an AttributeError from deep inside the MoE.
-    """
-
-    try:
-        return moe.experts.routed_experts
-    except AttributeError as exc:
-        raise RuntimeError(
-            "DSV4 external routing needs the routed-experts module at "
-            f"mlp.experts.routed_experts, which {type(moe).__name__} does not expose",
-        ) from exc
 
 
 class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
@@ -533,6 +514,19 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             raise ValueError(f"Unsupported AFD role: {afd_config.role!r}")
 
         # ### PATCH END: role-local Attention and remote experts
+        # The external-routing component is built here, while a vLLM config context
+        # exists, so the first forward onto MC2 never constructs a comm.
+        self.afd_external_routing_moe = None
+        if getattr(afd_config, "compute_gate_on_attention", False) and isinstance(
+            self.mlp, native.DeepseekV4MoE
+        ):
+            from afd_plugin.model_executor.models.npu.external_routing_moe import (
+                AFDExternalRoutingMoE,
+            )
+
+            self.afd_external_routing_moe = AFDExternalRoutingMoE(
+                self.mlp.experts.routed_experts,
+            )
 
         self.input_layernorm = native.RMSNorm(config.hidden_size, eps=self.norm_eps)
         self.post_attention_layernorm = native.RMSNorm(
@@ -621,78 +615,13 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         these routes.
         """
 
-        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-        from vllm_ascend.ops.fused_moe.moe_comm_method import (
-            AllGatherCommImpl,
-            MC2CommImpl,
-        )
-
-        from afd_plugin.connectors.npu.external_routing import (
-            AFDExternalRoutingInputs,
-        )
-
-        routed_experts = _routed_experts_of(self.mlp)
-        comm_method = _EXTRA_CTX.moe_comm_method
-        if not isinstance(comm_method, (AllGatherCommImpl, MC2CommImpl)):
-            raise RuntimeError(
-                "DSV4 external routing is wired for the ALLGATHER and MC2 MoE paths; "
-                f"got {type(comm_method).__name__}. The all-to-all paths shard "
-                "differently and are not verified yet.",
-            )
-
-        # The ALLGATHER prepare patch is installed once during runtime start-up, not
-        # here: re-installing it per layer forward only repeats work, since the patch
-        # already behaves exactly like upstream when no routing was published.
-
-        # The prepare patch reads the routing from this attribute and writes the
-        # padded/gathered version back, so the two must be the same object.
-        prepare_finalize = comm_method.prepare_finalize
-        prepare_finalize.afd_external_routing = AFDExternalRoutingInputs(
+        component = self.afd_external_routing_moe
+        assert component is not None, "external routing component was not built at init"
+        return component.forward(
+            hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
         )
-        try:
-            prepare_output = comm_method.prepare(
-                hidden_states=hidden_states,
-                # The FFN side owns no router in this configuration.
-                router_logits=None,
-                replace_allreduce=routed_experts.moe_config.is_sequence_parallel,
-                quant_type=routed_experts.quant_type,
-            )
-            aligned = prepare_finalize.afd_external_routing
-            if aligned is None:
-                raise RuntimeError(
-                    "DSV4 external routing vanished during prepare; the ALLGATHER "
-                    "prepare patch did not run",
-                )
-            # The scale and mask belong to the experts module, which apply reads back.
-            routed_experts.ascend_pertoken_scale = prepare_output.pertoken_scale
-            routed_experts.ascend_mc2_mask = prepare_output.mc2_mask
-            try:
-                fused = routed_experts.quant_method.apply(
-                    layer=routed_experts,
-                    x=prepare_output.hidden_states,
-                    topk_weights=aligned.topk_weights,
-                    topk_ids=aligned.topk_ids,
-                    shared_experts=None,
-                    shared_experts_input=None,
-                )
-            finally:
-                routed_experts.ascend_pertoken_scale = None
-                routed_experts.ascend_mc2_mask = None
-            return comm_method.finalize(
-                hidden_states=fused.routed_out,
-                reduce_results=isinstance(comm_method, AllGatherCommImpl),
-                padded_hidden_states_shape=prepare_output.padded_hidden_states_shape,
-            )
-        finally:
-            # The inner finally already clears these before finalize runs, matching
-            # the native path's ordering. Clearing again here covers the paths that
-            # never reach it: if prepare raises, no other block cleans up, and the
-            # next call would start with another call's per-token state.
-            prepare_finalize.afd_external_routing = None
-            routed_experts.ascend_pertoken_scale = None
-            routed_experts.ascend_mc2_mask = None
 
 
 @native.support_torch_compile

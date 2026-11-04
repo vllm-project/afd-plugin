@@ -1,3 +1,4 @@
+# mypy: disable-error-code="attr-defined, name-defined"
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 
@@ -58,15 +59,18 @@ def _fake_gate_topk(monkeypatch, events: list[tuple], topk_ids, topk_weights):
 
     import afd_plugin.model_executor.models.npu as npu_package
 
-    helper = ModuleType("afd_plugin.model_executor.models.npu.deepseek_v4_attention_gate")
+    helper = ModuleType(
+        "afd_plugin.model_executor.models.npu.deepseek_v4_attention_gate"
+    )
 
-    def compute_attention_gate_topk(moe, hidden_states, *, input_ids=None,
-                                    hidden_states_fp32=None):
+    def compute_attention_gate_topk(
+        moe, hidden_states, *, input_ids=None, hidden_states_fp32=None
+    ):
         del moe, input_ids, hidden_states_fp32
         events.append(("gate", int(hidden_states.shape[0])))
         return topk_weights, topk_ids
 
-    helper.compute_attention_gate_topk = compute_attention_gate_topk
+    helper.compute_attention_gate_topk = compute_attention_gate_topk  # type: ignore[attr-defined]
     monkeypatch.setitem(
         sys.modules,
         "afd_plugin.model_executor.models.npu.deepseek_v4_attention_gate",
@@ -97,7 +101,7 @@ def _shell(*, events, connector, shared_experts):
     shell.shared_experts = None
     if shared_experts:
 
-        class _Shared(torch.nn.Module):
+        class _Shared(torch.nn.Module):  # type: ignore[name-defined]
             def forward(self, hidden_states):
                 events.append(("shared", int(hidden_states.shape[0])))
                 return torch.full_like(hidden_states, 2.0)
@@ -176,7 +180,9 @@ def test_forward_refuses_a_context_without_afd_metadata(monkeypatch):
         torch.zeros((2, TOP_K), dtype=torch.int32),
         torch.ones((2, TOP_K), dtype=torch.float32),
     )
-    shell = _shell(events=events, connector=_RecordingConnector(events), shared_experts=False)
+    shell = _shell(
+        events=events, connector=_RecordingConnector(events), shared_experts=False
+    )
 
     with pytest.raises(RuntimeError, match="AFD forward metadata"):
         shell(torch.zeros(2, HIDDEN, dtype=torch.bfloat16))
