@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import torch
 import torch_npu  # noqa: F401  registers the device
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm.forward_context import override_forward_context
 
 from afd_plugin.compat.npu import routing_ids  # noqa: F401  registers the op
 
@@ -23,6 +23,16 @@ NUM_EXPERTS = 8
 TOKENS = 8
 TOPK = 2
 op = torch.ops.vllm.afd_balance_routing_ids_
+
+
+
+def _forward_context(in_profile_run: bool):
+    """Real forward context with only the flag this check needs set."""
+    from vllm.forward_context import ForwardContext, create_forward_context
+
+    ctx = create_forward_context(attn_metadata=None)
+    ctx.in_profile_run = in_profile_run
+    return override_forward_context(ctx)
 
 
 def _ids(offset):
@@ -56,15 +66,14 @@ def _compile_once(module):
 
 
 def check_compiled_reuse():
-    with torch.no_grad():
-        _EXTRA_CTX.in_profile_run = True
+    with torch.no_grad(), _forward_context(True):
         profile_ids = _ids(3)
         op(profile_ids, NUM_EXPERTS, False)
         assert profile_ids.flatten().tolist() == _balanced(), "profile state is not balanced"
 
+    with torch.no_grad(), _forward_context(False):
         compiled_fn, example_inputs = _compile_once(_Gate())
 
-        _EXTRA_CTX.in_profile_run = False
         for offset in (5, 11):
             live = _ids(offset)
             expected = live.clone()
@@ -74,8 +83,7 @@ def check_compiled_reuse():
 
 
 def check_acl_graph_reuse():
-    with torch.no_grad():
-        _EXTRA_CTX.in_profile_run = False
+    with torch.no_grad(), _forward_context(False):
         buffer = _ids(1)
         graph = torch.npu.NPUGraph()
         static_in = buffer.clone()
