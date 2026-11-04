@@ -60,4 +60,4 @@ def registered_routing_ids_op(monkeypatch):
         afd_npu_package.__dict__.pop("routing_ids", None)
 
         import afd_plugin.compat.npu.routing_ids  # noqa: F401  registers the op
-        yield torch.ops.vllm.afd_balance_routing_ids_
+        yield afd_plugin.compat.npu.routing_ids, torch.ops.vllm.afd_balance_routing_ids_
