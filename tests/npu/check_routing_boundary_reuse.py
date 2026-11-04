@@ -27,10 +27,15 @@ op = torch.ops.vllm.afd_balance_routing_ids_
 
 
 def _forward_context(in_profile_run: bool):
-    """Real forward context with only the flag this check needs set."""
-    from vllm.forward_context import ForwardContext, create_forward_context
+    """Real forward context; the flag is the attribute set_forward_context sets."""
+    from vllm.forward_context import ForwardContext, override_forward_context
 
-    ctx = create_forward_context(attn_metadata=None)
+    ctx = ForwardContext(
+        no_compile_layers={},
+        attn_metadata={},
+        slot_mapping={},
+        additional_kwargs={},
+    )
     ctx.in_profile_run = in_profile_run
     return override_forward_context(ctx)
 
