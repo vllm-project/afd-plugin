@@ -29,6 +29,7 @@ def _module_path() -> Path:
         / "afd_plugin"
         / "connectors"
         / "npu"
+        / "camp2p"
         / "external_routing.py"
     )
 
