@@ -65,8 +65,12 @@ def _compile_once(module):
         compiled.append((fn, example_inputs))
         return fn
 
-    torch.compile(module, backend=backend)(_ids(9))
+    first = _ids(9)
+    torch.compile(module, backend=backend)(first)
     assert len(compiled) == 1, f"expected one compilation, saw {len(compiled)}"
+    assert first.flatten().tolist() == _balanced(), (
+        f"first compiled call under profile mode produced {first.tolist()}"
+    )
     return compiled[0]
 
 
@@ -75,9 +79,10 @@ def check_compiled_reuse():
         profile_ids = _ids(3)
         op(profile_ids, NUM_EXPERTS, False)
         assert profile_ids.flatten().tolist() == _balanced(), "profile state is not balanced"
+        # The original failure compiles while profiling; keep that order.
+        compiled_fn, example_inputs = _compile_once(_Gate())
 
     with torch.no_grad(), _forward_context(False):
-        compiled_fn, example_inputs = _compile_once(_Gate())
 
         for offset in (5, 11):
             live = _ids(offset)
