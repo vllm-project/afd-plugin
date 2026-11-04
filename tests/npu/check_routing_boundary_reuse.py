@@ -32,13 +32,14 @@ def _forward_context(in_profile_run: bool):
     """Real forward context; the flag is the attribute set_forward_context sets."""
     from vllm.forward_context import ForwardContext
 
+    # V2 layout: the pinned Ascend reads the marker out of additional_kwargs, so
+    # set it there rather than as a plain context attribute.
     ctx = ForwardContext(
         no_compile_layers={},
         attn_metadata={},
         slot_mapping={},
-        additional_kwargs={},
+        additional_kwargs={"in_profile_run": in_profile_run},
     )
-    ctx.in_profile_run = in_profile_run
     return override_forward_context(ctx)
 
 
@@ -77,6 +78,13 @@ def _compile_once(module):
 
 
 def check_compiled_reuse():
+    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+    with _forward_context(True):
+        assert _EXTRA_CTX.in_profile_run is True, "V2 layout did not expose the profile flag"
+    with _forward_context(False):
+        assert _EXTRA_CTX.in_profile_run is not True, "V2 layout leaked the profile flag"
+
     with torch.no_grad(), _forward_context(True):
         profile_ids = _ids(3)
         op(profile_ids, NUM_EXPERTS, False)
