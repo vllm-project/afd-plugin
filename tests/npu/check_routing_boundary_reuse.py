@@ -55,6 +55,12 @@ def _forward_context(in_profile_run: bool):
     with override_forward_context(ctx):
         _EXTRA_CTX.in_profile_run = in_profile_run
         try:
+            # First: the write landed in the V2 storage location. Second: the op's
+            # read path agrees. Both are needed; either one alone proves little.
+            assert ctx.additional_kwargs["in_profile_run"] is in_profile_run, (
+                f"V2 storage holds {ctx.additional_kwargs.get('in_profile_run')}, "
+                f"expected {in_profile_run}; this stack is not using the V2 layout"
+            )
             assert bool(_EXTRA_CTX.in_profile_run) is in_profile_run, (
                 f"proxy reads {_EXTRA_CTX.in_profile_run}, expected {in_profile_run}"
             )
