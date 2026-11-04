@@ -193,9 +193,13 @@ export NUM_PROMPTS=512
 export SWEEP="2:64 4:64 8:64 16:64"      # rate:concurrency
 export WORKLOAD_ARGS=""                  # e.g. the --prefix-repetition-* flags
 
-kubectl delete pod vllm-bench --ignore-not-found
+# Every bench-pod command below is namespaced with -n "$NAMESPACE" (exported
+# in step 2): the deployment's Services only exist there, so an un-namespaced
+# create would leave the pod in the kubeconfig context's namespace, where
+# ${DEPLOY_NAME}-service does not resolve.
+kubectl -n "$NAMESPACE" delete pod vllm-bench --ignore-not-found
 
-envsubst '${TEMPLATE_IMAGE} ${MODEL_ID} ${RUN_ID} ${SWEEP} ${DATASET_NAME} ${INPUT_LEN} ${OUTPUT_LEN} ${NUM_PROMPTS} ${WORKLOAD_ARGS} ${PVC_NAME} ${VLLM_NODE} ${DEPLOY_NAME} ${CLIENT_PORT}' <<'EOF' | kubectl apply -f -
+envsubst '${TEMPLATE_IMAGE} ${MODEL_ID} ${RUN_ID} ${SWEEP} ${DATASET_NAME} ${INPUT_LEN} ${OUTPUT_LEN} ${NUM_PROMPTS} ${WORKLOAD_ARGS} ${PVC_NAME} ${VLLM_NODE} ${DEPLOY_NAME} ${CLIENT_PORT}' <<'EOF' | kubectl -n "$NAMESPACE" apply -f -
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -312,7 +316,7 @@ is a genuine HF repo id instead, the mount is harmless to leave in place.
 `ReadWriteOnce`**:
 
 ```bash
-kubectl get pvc "${PVC_NAME}" -o jsonpath='{.spec.accessModes[0]}'
+kubectl -n "$NAMESPACE" get pvc "${PVC_NAME}" -o jsonpath='{.spec.accessModes[0]}'
 ```
 
 If that prints `ReadWriteOnce`, a second pod can only attach the PVC from
@@ -335,26 +339,26 @@ The pod holds after the sweep, so completion is the sentinel file, not a
 # until activeDeadlineSeconds (4h), so `kubectl logs -f` never returns and
 # the sentinel polling below would never run. Read progress without -f, or
 # follow it in the background.
-kubectl logs pod/vllm-bench --tail=200 2>/dev/null || true
-# kubectl logs -f pod/vllm-bench > "/tmp/${RUN_ID}.log" 2>&1 &
+kubectl -n "$NAMESPACE" logs pod/vllm-bench --tail=200 2>/dev/null || true
+# kubectl -n "$NAMESPACE" logs -f pod/vllm-bench > "/tmp/${RUN_ID}.log" 2>&1 &
 
 deadline=$(( $(date +%s) + 7200 ))
 RC=""
 while true; do
-  phase="$(kubectl get pod vllm-bench -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  phase="$(kubectl -n "$NAMESPACE" get pod vllm-bench -o jsonpath='{.status.phase}' 2>/dev/null || true)"
   case "$phase" in
     "")      echo "vllm-bench pod is gone"; exit 1 ;;
     Failed)  echo "vllm-bench Failed (OOM, or activeDeadlineSeconds hit)"
-             kubectl describe pod vllm-bench | tail -20
-             kubectl logs vllm-bench --tail=100
+             kubectl -n "$NAMESPACE" describe pod vllm-bench | tail -20
+             kubectl -n "$NAMESPACE" logs vllm-bench --tail=100
              echo "finished points are still on vllm-bench-reports -- see references/fetching-past-reports.md"
              exit 1 ;;
   esac
-  RC="$(kubectl exec vllm-bench -- cat "/reports/${RUN_ID}/.exit_code" 2>/dev/null || true)"
+  RC="$(kubectl -n "$NAMESPACE" exec vllm-bench -- cat "/reports/${RUN_ID}/.exit_code" 2>/dev/null || true)"
   [ -n "$RC" ] && break
   if [ "$(date +%s)" -ge "$deadline" ]; then
     echo "timed out after 2h waiting for the sweep (phase=${phase})"
-    kubectl logs vllm-bench --tail=50; exit 1
+    kubectl -n "$NAMESPACE" logs vllm-bench --tail=50; exit 1
   fi
   sleep 10
 done
@@ -363,10 +367,10 @@ done
 echo "=== sweep finished, exit=${RC} ==="
 
 mkdir -p "${LOCAL_DIR}"
-kubectl cp "vllm-bench:/reports/${RUN_ID}/." "${LOCAL_DIR}"
+kubectl -n "$NAMESPACE" cp "vllm-bench:/reports/${RUN_ID}/." "${LOCAL_DIR}"
 ls "${LOCAL_DIR}"
 
-kubectl delete pod vllm-bench
+kubectl -n "$NAMESPACE" delete pod vllm-bench
 ```
 
 Delete only **after** confirming the files are local -- that is the whole
@@ -483,7 +487,7 @@ single-pod case is a StatefulSet `${DEPLOY_NAME}-pod` whose pod the
 StatefulSet would recreate anyway:
 
 ```bash
-kubectl delete pod vllm-bench --ignore-not-found   # already deleted in step 5 on the happy path
+kubectl -n "$NAMESPACE" delete pod vllm-bench --ignore-not-found   # already deleted in step 5 on the happy path
 kubectl -n "$NAMESPACE" delete sts -l "afd-deployment=$DEPLOY_NAME"
 kubectl -n "$NAMESPACE" delete svc,configmap -l "afd-deployment=$DEPLOY_NAME"
 kubectl -n "$NAMESPACE" get pods -l "afd-deployment=$DEPLOY_NAME"   # must print nothing

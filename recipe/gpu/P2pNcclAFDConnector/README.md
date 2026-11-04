@@ -46,18 +46,22 @@ weights, ports) and the benchmark command for that model.
 
 Use the **`deploy-afd-k8s`** skill (`.agents/skills/deploy-afd-k8s/SKILL.md`)
 to stand up a recipe from this folder on a Kubernetes/OpenShift cluster --
-see that skill for the full contract (PVC/ConfigMap/pod/Service lifecycle,
-scope, and requirements).
+see that skill for the full contract (PVC/ConfigMap/StatefulSet/Service
+lifecycle, scope, and requirements).
 
 The skill requires the recipe path (e.g.
 `recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_colocation/2a2f_graph_dbo_dp1tp2.sh`)
 plus the image, model id, and PVC name it needs. Placement is never asked
 for: a recipe without a top-of-file placement comment deploys as a single
-pod; a recipe whose header describes a per-pod placement (e.g.
+pod; a recipe whose header describes a per-role placement (e.g.
 `qwen3_5_122b_a10b_fp8/prefill_decode_colocation/multipod_2a_2a_2f_graph.sh`,
 `deepseek_v2_lite/prefill_decode_colocation/multipod_2a_2f_graph_dbo_dp1tp2.sh`)
-deploys exactly that many pods with exactly that per-pod setup -- see the
-skill's `resolve-recipe.md` for the header convention.
+ranks its roles into one StatefulSet per role, whose `replicas` is that
+role's pod count. Each pod reads its role from `AFD_ROLE` and its
+zero-based index from its own StatefulSet ordinal (`POD`), and the recipe
+derives its per-index conventions from those -- no per-pod env is applied,
+so do not expect `POD=...`/`ATTENTION_*` overrides from the header to reach
+the pod. See the skill's `resolve-recipe.md` for the header convention.
 `prefill_decode_disaggregation` recipes are out of scope for the skill; run
 those locally instead.
 

@@ -57,10 +57,10 @@ governing Service are ExternalName pointers at head pods -- callers never talk t
   generator step and no manifest to read.
 - A recipe is **placement-driven** (more than one pod) exactly when its
   top-of-file comment block describes a per-pod placement -- read that
-  block, don't infer shape from flags. Today's recipes spell it as one
-  `# For pod N: POD=...` line per pod, but the comment isn't guaranteed to
-  use that exact grammar going forward. See
-  [resolve-recipe.md](references/resolve-recipe.md).
+  block, don't infer shape from flags. The two facts to extract are the
+  per-role pod counts and whether a role is split across pods; the recipes
+  themselves take no per-pod env, so never carry a per-pod override out of
+  the header. See [resolve-recipe.md](references/resolve-recipe.md).
 - Not for `tools/benchmarks/decode_bench_server.sh` (local, non-k8s).
 
 ## Requirements
@@ -97,7 +97,7 @@ exist **before** any Pod is deployed -- see
 | Reference | Covers |
 |---|---|
 | [resolve-recipe.md](references/resolve-recipe.md) | Step 1: read the recipe's serve-block fields and model id; read its placement (or lack of one) from its header comment -- never ask. |
-| [deploy.md](references/deploy.md) | Steps 2-4f: GPU_COUNT, confirm, PVC, ConfigMap, fsGroup, Services (step 4d -- which of the four, see [services.md](references/services.md)), StatefulSet(s) via `templates/statefulset.yaml`, wait with `kubectl rollout status`. |
+| [deploy.md](references/deploy.md) | Steps 2-4f: GPU_COUNT, confirm, PVC, ConfigMap, fsGroup, Services (step 4d -- which of the four, see [services.md](references/services.md)), StatefulSet(s) via `templates/statefulset.yaml`, wait for every plan pod to report `Ready` (not `kubectl rollout status`, see step 4f). |
 | [report-and-teardown.md](references/report-and-teardown.md) | Step 5: report the endpoint/model/nodes. Step 6: teardown (pods/Services only -- never the PVC unless asked). |
 
 All k8s manifests live in `templates/*.yaml`, applied via `envsubst | kubectl

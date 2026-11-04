@@ -44,9 +44,13 @@ Both are exported because `envsubst` only reads **exported** variables: an
 unexported name substitutes as empty with no error, which would render an
 empty `metadata.name` and make `kubectl apply` reject the helper pod.
 
+`NAMESPACE` is the one exported by the main skill's step 2; every helper-pod
+command below is namespaced with it so the helper attaches to the same
+namespace's `vllm-bench-reports` claim.
+
 ```bash
-kubectl delete pod "${HELPER}" --ignore-not-found
-envsubst '${HELPER} ${VLLM_NODE}' <<'EOF' | kubectl apply -f -
+kubectl -n "$NAMESPACE" delete pod "${HELPER}" --ignore-not-found
+envsubst '${HELPER} ${VLLM_NODE}' <<'EOF' | kubectl -n "$NAMESPACE" apply -f -
 apiVersion: v1
 kind: Pod
 metadata:
@@ -73,21 +77,21 @@ spec:
 EOF
 
 deadline=$(( $(date +%s) + 300 ))
-until [ "$(kubectl get pod "${HELPER}" -o jsonpath='{.status.phase}' 2>/dev/null)" = "Running" ]; do
-  phase="$(kubectl get pod "${HELPER}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+until [ "$(kubectl -n "$NAMESPACE" get pod "${HELPER}" -o jsonpath='{.status.phase}' 2>/dev/null)" = "Running" ]; do
+  phase="$(kubectl -n "$NAMESPACE" get pod "${HELPER}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
   if [ "$phase" = "Failed" ] || [ "$(date +%s)" -ge "$deadline" ]; then
     echo "helper pod not Running (phase=${phase:-<none>})"
-    kubectl describe pod "${HELPER}" | tail -30
-    kubectl delete pod "${HELPER}" --ignore-not-found
+    kubectl -n "$NAMESPACE" describe pod "${HELPER}" | tail -30
+    kubectl -n "$NAMESPACE" delete pod "${HELPER}" --ignore-not-found
     exit 1
   fi
   sleep 5
 done
 
-kubectl exec "${HELPER}" -- ls /reports          # which RUN_IDs are on the PVC
+kubectl -n "$NAMESPACE" exec "${HELPER}" -- ls /reports   # which RUN_IDs are on the PVC
 mkdir -p "${LOCAL_DIR}"
-kubectl cp "${HELPER}:/reports/${RUN_ID}/." "${LOCAL_DIR}"
-kubectl delete pod "${HELPER}" --ignore-not-found
+kubectl -n "$NAMESPACE" cp "${HELPER}:/reports/${RUN_ID}/." "${LOCAL_DIR}"
+kubectl -n "$NAMESPACE" delete pod "${HELPER}" --ignore-not-found
 ```
 
 `kubectl exec ... -- ls /reports` is the cheap way to see what is on the PVC
