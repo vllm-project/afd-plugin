@@ -46,6 +46,19 @@ def _forward_context(in_profile_run: bool):
     from vllm.forward_context import ForwardContext, override_forward_context
     from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
+    # Switch the stack's cache through its production entry so additional_kwargs
+    # is the storage the proxy reads and writes.
+    import vllm_ascend.ascend_forward_context as afc
+
+    if not afc._USE_V2_EXTRA_KWARGS:
+        from vllm.config import VllmConfig
+
+        afc.sync_v2_extra_kwargs(VllmConfig())
+    assert afc._USE_V2_EXTRA_KWARGS is True, (
+        "the pinned stack cannot be put into V2 extra-kwargs mode in a standalone "
+        "process; run this check inside a served process instead"
+    )
+
     ctx = ForwardContext(
         no_compile_layers={},
         attn_metadata={},
