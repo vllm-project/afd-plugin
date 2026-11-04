@@ -26,6 +26,7 @@
 // The installed MC2 epilogue uses unqualified AscendC names inside this namespace.
 namespace Catlass::Epilogue::Block { using namespace AscendC; }
 #include "afd_mega_moe_activation.h"
+#include "afd_swiglu_limit.h"
 
 namespace AfdNativeMega {
 using namespace AscendC;

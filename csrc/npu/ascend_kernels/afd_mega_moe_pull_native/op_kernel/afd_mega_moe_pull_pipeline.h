@@ -254,15 +254,8 @@ private:
         Muls(gate_, gate_, scale, n);
         Muls(up_, up_, scale, n);
         PipeBarrier<PIPE_V>();
-        // Model swiglu_limit: SiLU(min(gate, L)) * clamp(up, -L, L). Zero keeps
-        // clipping disabled, matching the layered W4A8 operator's contract.
-        if (limit_ > 0.0f) {
-            Mins(gate_, gate_, limit_, n);
-            Mins(up_, up_, limit_, n);
-            PipeBarrier<PIPE_V>();
-            Maxs(up_, up_, -limit_, n);
-            PipeBarrier<PIPE_V>();
-        }
+        // Model swiglu_limit, shared with the layered W4A8/A4W4 postprocessors.
+        ClampSwiGLUInputs(gate_, up_, limit_, n);
         Muls(value_, gate_, -1.0f, n);
         PipeBarrier<PIPE_V>();
         Exp(value_, value_, n);
