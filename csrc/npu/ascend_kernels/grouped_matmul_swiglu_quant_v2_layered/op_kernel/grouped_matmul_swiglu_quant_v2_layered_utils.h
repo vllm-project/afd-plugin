@@ -72,13 +72,6 @@ constexpr int64_t SIZE_OF_HALF_2 = 2;
 constexpr uint8_t NUM_8 = 8;
 constexpr float QUANT_SCALE_INT8 = 127.0f;
 
-// ### PATCH START: DSV4 clipped SwiGLU
-// Patch reason: the model limit applies to the dequantized branches before SiLU.
-// Patch functionality: ClampSwiGLUInputs is shared with the native MegaMoE
-// activation through utils/op_kernel/afd_swiglu_limit.h so both paths clamp
-// identically without a second UB sequence.
-// ### PATCH END: DSV4 clipped SwiGLU
-
 constexpr MatmulConfig matmulCFGUnitFlag{false, false, true, 0, 0, 0, false, false, false, false,
                                          false, 0,     0,    0, 0, 0, 0,     0,     false};
 constexpr MatmulConfig NZ_CFG_MDL = GetMDLConfig(false, false, 0, true, false, false, false);
