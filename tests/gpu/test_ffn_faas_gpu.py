@@ -378,12 +378,18 @@ def _start_ffn_service(
 
 
 def _management_ports(log_path: Path) -> dict[int, int]:
-    """Management port per FFN rank, from the line each rank prints at start."""
+    """Management port per FFN rank, from the object each rank prints at start.
+
+    Both ranks share one log, so their announcements can land on one line.
+    """
+    text = log_path.read_text(errors="replace")
+    decoder = json.JSONDecoder()
     ports = {}
-    for line in log_path.read_text(errors="replace").splitlines():
-        if line.startswith(MANAGEMENT_PREFIX):
-            announced = json.loads(line)
-            ports[int(announced["rank"])] = int(announced["management"][1])
+    start = text.find(MANAGEMENT_PREFIX)
+    while start >= 0:
+        announced, end = decoder.raw_decode(text, start)
+        ports[int(announced["rank"])] = int(announced["management"][1])
+        start = text.find(MANAGEMENT_PREFIX, end)
     return ports
 
 
@@ -415,11 +421,31 @@ def _status_files(status_file: Path) -> dict[int, dict[str, Any]]:
     return files
 
 
+def _descendants(pid: int) -> list[int]:
+    """Every live descendant of ``pid``, read from ``/proc`` (Linux only).
+
+    torchrun's workers are not in the launcher's process group, so killing
+    the group alone leaves them holding GPUs.
+    """
+    children: dict[int, list[int]] = {}
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        with contextlib.suppress(OSError, ValueError, IndexError):
+            fields = stat.read_text().rsplit(")", 1)[1].split()
+            children.setdefault(int(fields[1]), []).append(int(stat.parent.name))
+    found, pending = [], [pid]
+    while pending:
+        for child in children.get(pending.pop(), []):
+            found.append(child)
+            pending.append(child)
+    return found
+
+
 def _kill(service: subprocess.Popen[bytes], attention: list[Any]) -> None:
     """Best-effort teardown so a failed test does not leak GPU processes."""
     if service.poll() is None:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(service.pid, signal.SIGKILL)
+        for pid in [*_descendants(service.pid), service.pid]:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
         service.wait(timeout=30)
     for proc in attention:
         if proc.is_alive():

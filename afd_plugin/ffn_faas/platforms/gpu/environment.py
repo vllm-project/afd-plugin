@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 AFDEP_TRANSPORT_MODULE = "afdep.deepep"
 DEEPGEMM_MODULE = "deep_gemm"
 FUSED_EXPERTS_BACKEND = "fused_experts"
+# Set by torchrun: rendezvous in its workers join the agent's TCP store.
+TORCHELASTIC_AGENT_STORE_ENV = "TORCHELASTIC_USE_AGENT_STORE"
 # vLLM's GPU Worker gives DBO two workspace slots.
 DBO_WORKSPACE_UBATCHES = 2
 
@@ -159,9 +161,10 @@ class GPUFFNEnvironment:
         size and rank, so EP spans exactly the F ranks; this is re-checked
         because the connector's handshake assumes contiguous expert ranges
         over that world. Ownership is recorded before the first collective so
-        a partial initialization is still torn down by ``close``. Finally
-        initializes vLLM's workspace manager with the Worker's micro-batch
-        count (two under DBO).
+        a partial initialization is still torn down by ``close``. Then stops
+        later rendezvous from joining the torchrun agent's store, so the M2N
+        world can host its own, and initializes vLLM's workspace manager with
+        the Worker's micro-batch count (two under DBO).
         """
         if self._device is None or self._groups_owned:
             raise RuntimeError("GPU FFN compute initialization requires its device")
@@ -187,6 +190,13 @@ class GPUFFNEnvironment:
                 or self._ep_group.rank_in_group != settings.rank
             ):
                 raise ValueError("vLLM expert group differs from the F-only world")
+        # torchrun asks every ``tcp://``/``env://`` rendezvous in its workers
+        # to join the agent's store. That is right for the F-only world above,
+        # but the connector's M2N rendezvous at ``--host:--port`` must be
+        # hosted by M2N world rank 0 (F rank 0), as in a ``vllm serve`` FFN;
+        # with the flag set, every rank would wait as a client and nobody
+        # would listen. vLLM's groups are already created, so drop it.
+        os.environ.pop(TORCHELASTIC_AGENT_STORE_ENV, None)
         # Same slot count as Worker._init_workspace_and_model_runner.
         init_workspace_manager(
             self._device,

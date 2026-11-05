@@ -612,7 +612,9 @@ def test_connector_driven_step_executes_the_received_payload():
     metadata = _metadata()
     runner.connector.attn_outputs.append(_payload("hidden", metadata))
     runner.connector.recv_dp_metadata_list = lambda: AFDControlPayload(
-        dp_metadata_list={0: _FakeDPMetadata([1])}
+        dp_metadata_list={0: _FakeDPMetadata([1])},
+        is_graph_capturing=False,
+        is_warmup=False,
     )
 
     assert runner.execute_connector_driven_step(cancel_requested=lambda: False)
