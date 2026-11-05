@@ -375,7 +375,9 @@ def test_a_failure_during_prepare_clears_state_and_restores_comm(loaded):
     def exploding_prepare(*args, **kwargs):
         raise RuntimeError("prepare failed")
 
-    component._comm_for(context._EXTRA_CTX.moe_comm_type, native).prepare_finalize.prepare_external = exploding_prepare
+    component._comm_for(
+        context._EXTRA_CTX.moe_comm_type, native
+    ).prepare_finalize.prepare_external = exploding_prepare
     with pytest.raises(RuntimeError, match="prepare failed"):
         component.forward(
             torch.zeros(4, 2),
@@ -424,4 +426,6 @@ def test_the_comm_type_resolves_when_the_context_instance_is_unset(loaded):
         topk_weights=torch.ones(4, 1),
     )
     assert experts.seen, "expert execution did not run"
-    assert context._EXTRA_CTX.moe_comm_method is None, "the unset instance was not restored"
+    assert context._EXTRA_CTX.moe_comm_method is None, (
+        "the unset instance was not restored"
+    )
