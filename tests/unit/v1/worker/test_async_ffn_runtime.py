@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -172,7 +171,9 @@ def test_drain_propagates_session_result(harness, monkeypatch, drains):
         transactions=1,
         drain_error=None if drains else RuntimeError("retain resources"),
     )
-    h.payloads.append(payload(5, 3))
+    h.runner._layered_executor = lambda hidden, *_args: hidden.to(torch.bfloat16)
+    request = payload(5, 3)
+    h.payloads.append(request)
     monkeypatch.setattr(torch.npu, "synchronize", lambda: None)
     if drains:
         h.runner.drain()
@@ -180,7 +181,8 @@ def test_drain_propagates_session_result(harness, monkeypatch, drains):
         with pytest.raises(RuntimeError, match="retain resources"):
             h.runner.drain()
     returned = [
-        call[1] for call in h.calls if isinstance(call, tuple) and call[0] == "send"
+        call for call in h.calls if isinstance(call, tuple) and call[0] == "send"
     ]
     assert len(returned) == 1
-    assert returned[0].tolist() == [3, 0, 5, 0, 1]
+    torch.testing.assert_close(returned[0][1], request.hidden_states.to(torch.bfloat16))
+    assert returned[0][2] is request.context.states.token_nums_rankid_layeridx

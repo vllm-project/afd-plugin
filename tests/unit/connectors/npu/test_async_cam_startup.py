@@ -84,7 +84,11 @@ def negotiate(owners, plans, signatures):
 def test_shared_failure_check_uses_one_store_request(world, monkeypatch):
     owners = startup_world(attn=world - 2, ffn=2)
     assert not any(
-        negotiate(owners, [None] * (world - 2) + [FFNGraphPlan()] * 2, ["wire"] * world)
+        negotiate(
+            owners,
+            [None] * (world - 2) + [full_plan(requested="eager")] * 2,
+            ["wire"] * world,
+        )
     )
     calls = []
     original = owners[0]._store.check
@@ -115,7 +119,9 @@ def test_legacy_peer_keeps_per_rank_failure_detection(monkeypatch):
 
     monkeypatch.setattr(owners[0], "_publish", legacy_publish)
     assert not any(
-        negotiate(owners, [None, None, FFNGraphPlan(), FFNGraphPlan()], ["wire"] * 4)
+        negotiate(
+            owners, [None, None] + [full_plan(requested="eager")] * 2, ["wire"] * 4
+        )
     )
     owners[0]._store.set(owners[0]._keys("error", range(1))[0], "legacy failure")
     for owner in owners:
@@ -272,21 +278,27 @@ def test_pull_row_slicing_accepts_capacity_below_dispatch_envelope():
 
 def test_pull_requires_matching_transport_even_in_eager_mode():
     owners = startup_world(1, 1)
-    errors = negotiate(owners, [None, FFNGraphPlan()], ["pull_v1:layout", "push"])
+    errors = negotiate(
+        owners, [None, full_plan(requested="eager")], ["pull_v1:layout", "push"]
+    )
     assert all("transport signatures" in str(error) for error in errors)
 
 
 @pytest.mark.parametrize(
-    "bad", [FFNGraphPlan(), full_plan(requested="eager", layer_ids=(3,))]
+    ("bad", "message"),
+    [
+        (FFNGraphPlan(), "signatures differ"),
+        (full_plan(requested="eager", layer_ids=(3,)), "layer tables"),
+    ],
 )
-def test_pull_eager_validates_executor_and_layer_tables(bad):
+def test_pull_eager_validates_executor_and_layer_tables(bad, message):
     owners = startup_world(1, 2)
     errors = negotiate(
         owners,
         [None, full_plan(requested="eager"), bad],
         ["pull_v1:layout"] * 3,
     )
-    assert all("Pull" in str(error) for error in errors), errors
+    assert all(message in str(error) for error in errors), errors
 
 
 @pytest.mark.parametrize("stage", ["validated", "warmup", "captured"])

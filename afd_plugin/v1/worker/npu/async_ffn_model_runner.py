@@ -170,15 +170,14 @@ class AsyncNPUFFNModelRunner:
             self._initialize_layered_executor()
             assert self._layered_executor is not None
             signature = self._layered_executor.graph_signature(cam_receive_capacity())
+            if config.ffn_mega_moe:
+                self._mega_executor = AsyncCAMMegaExecutor(
+                    self._layered_executor, self.connector
+                )
+                signature = "native_mc2:" + signature
         except Exception as exc:
             executor_error = str(exc) or type(exc).__name__
         executor = self._layered_executor
-        if config.ffn_mega_moe:
-            if executor is None:
-                raise ValueError(
-                    "ffn_mega_moe requires homogeneous layered W4A8/W8A8 weights"
-                )
-            self._mega_executor = AsyncCAMMegaExecutor(executor, self.connector)
         if config.ffn_two_stream:
             stream_signature = repr(
                 (
@@ -203,8 +202,7 @@ class AsyncNPUFFNModelRunner:
         self.connector.graph_startup.plan = FFNGraphPlan(
             requested=self.requested_mode,
             executor_error=executor_error,
-            signature=("native_mc2:" if self._mega_executor is not None else "")
-            + signature,
+            signature=signature,
             layer_ids=self.layer_ids,
             stream_signature=stream_signature,
             stream_error=stream_error,
@@ -453,7 +451,6 @@ class AsyncNPUFFNModelRunner:
             for _ in self.layer_ids[:1] if single else self.layer_ids:
                 rank_ffn_output = self._mega_executor()
             return rank_ffn_output
-        stage_idx = 0
         rank_ffn_output = None
         assert self._layered_executor is not None
         for _ in self.layer_ids[:1] if single else self.layer_ids:

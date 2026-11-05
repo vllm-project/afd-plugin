@@ -169,17 +169,6 @@ class AsyncCAMGraphStartup:
                 and len({entry["transport"] for entry in entries}) != 1
             ):
                 raise ValueError("Async CAM graph transport signatures differ")
-            if transport_signature.startswith("pull_v1:"):
-                if any(
-                    p.executor_error or not p.signature or not p.layer_ids for p in plans
-                ):
-                    raise ValueError(
-                        "Pull requires a loaded W4A8 executor on every FFN rank"
-                    )
-                if len({(p.signature, p.layer_ids) for p in plans}) != 1:
-                    raise ValueError(
-                        "Pull FFN executor signatures or layer tables differ"
-                    )
             if two_stream:
                 if (
                     self.world_rank < self.attn_size

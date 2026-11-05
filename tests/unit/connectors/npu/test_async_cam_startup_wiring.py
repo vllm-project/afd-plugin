@@ -136,7 +136,7 @@ def layered_startup_runner(modules, monkeypatch, mode, invalid):
     connector = SimpleNamespace(
         is_initialized=False,
         dynamic_quant=1,
-        extra_info=SimpleNamespace(ffn_two_stream=False),
+        extra_info=SimpleNamespace(ffn_two_stream=False, ffn_mega_moe=False),
         graph_startup=AsyncCAMGraphStartup(1, 1, 2),
     )
     connector.init_afd_connector = lambda: resolve_ffn_mode(
@@ -175,6 +175,38 @@ def test_ffn_startup_validates_target_and_draft_weights(
         runner.initialize_afd_connector()
         assert runner.effective_mode == "eager"
         assert connector.graph_startup.plan.signature == "(2, 5)"
+
+
+@pytest.mark.parametrize("mode", ["eager", "full"])
+def test_mega_executor_failure_is_published_during_startup(modules, monkeypatch, mode):
+    _, _, runtime = modules
+    runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
+    runner.model = SimpleNamespace(get_experts_layer_indices=lambda: (2,))
+    runner.draft_model = None
+    runner._failure = runner._layered_executor = runner._mega_executor = None
+    runner.requested_mode = mode
+    connector = SimpleNamespace(
+        is_initialized=False,
+        extra_info=SimpleNamespace(ffn_two_stream=False, ffn_mega_moe=True),
+        graph_startup=AsyncCAMGraphStartup(1, 1, 2),
+    )
+    connector.init_afd_connector = lambda: resolve_ffn_mode(
+        [connector.graph_startup.plan]
+    )
+    runner.connector = connector
+    runner._initialize_layered_executor = lambda: setattr(
+        runner,
+        "_layered_executor",
+        SimpleNamespace(graph_signature=lambda _: "layered"),
+    )
+
+    def fail_executor(*_args):
+        raise ValueError("unsupported Mega weights")
+
+    monkeypatch.setattr(runtime, "AsyncCAMMegaExecutor", fail_executor)
+    with pytest.raises(ValueError, match="unsupported Mega weights"):
+        runner.initialize_afd_connector()
+    assert connector.graph_startup.plan.executor_error == "unsupported Mega weights"
 
 
 @pytest.mark.parametrize("value", [True, 0, -1, 1.5])
@@ -562,6 +594,7 @@ def receiver_graph_worker(ffn_owners, monkeypatch):
     )
     connector = SimpleNamespace(
         is_initialized=True,
+        ffn_session=sys.modules["afd_plugin.connectors.base"].DefaultFFNSession,
         close=lambda: None,
         recv_attn_output=lambda: SimpleNamespace(
             hidden_states=object(), context=SimpleNamespace(states=state)
