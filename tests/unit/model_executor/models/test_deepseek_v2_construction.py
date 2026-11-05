@@ -764,7 +764,6 @@ def test_model_constructor_rejects_sequence_parallel_moe_before_allocation(
 def test_npu_async_attention_allows_model_owned_sp(
     monkeypatch,
     construction_env,
-    pp_size,
 ):
     vllm_config = _vllm_config()
     vllm_config.parallel_config.use_sequence_parallel_moe = True
