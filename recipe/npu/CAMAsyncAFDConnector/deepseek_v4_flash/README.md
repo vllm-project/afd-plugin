@@ -82,6 +82,12 @@ A_EXEC_ARGS=(--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"
 A_DSPARK_CONFIG="{\"method\":\"dspark\",\"model\":\"$MODEL\",\"num_speculative_tokens\":5,\"enforce_eager\":false}"
 ```
 
+Attention-local FlashComm1/SP and native PD may remain enabled with both graphs.
+For PD, keep the native full-draft P and KV-transfer configuration described
+below. The W4A8 graph comparison covers A DP1/TP4, F EP4, and native P TP4 when
+using `MooncakeHybridConnector`. Compilation mode 0 is the qualified example;
+other compilation modes have not been validated here.
+
 Native capture buckets are normalized separately for target verification and
 draft queries; choose buckets covering both query widths and `max-num-seqs`.
 For A TP4, set `A_TP=4`, `A_DP=1`, recompute `NUM_A`, and use four distinct

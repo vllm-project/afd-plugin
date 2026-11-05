@@ -78,18 +78,23 @@ with native ACL decode graph selection:
 ```
 
 The profile requires PP=PCP=DCP=1, static expert placement,
-and SP/FlashComm1 and DBO/ubatching disabled. DSpark may stay enabled: `speculative_config.enforce_eager=true` keeps the
+and DBO/ubatching disabled. Attention-local FlashComm1/SP and native PD may remain
+enabled. DSpark may stay enabled: `speculative_config.enforce_eager=true` keeps the
 draft eager; `false` enables its native query Graph alongside target Graph. Target and draft use matching
-TP widths. Other speculative methods and KV-transfer connectors are outside this
-profile; PD is not enabled by this option. Draft Graph requires target Graph because
+TP widths. Other model-based drafts and MTP remain unsupported. PD uses the
+existing upstream KV connector; the W4A8 device comparison covers
+`MooncakeHybridConnector` with a native full-draft P. Draft Graph requires target Graph because
 native target capture owns the draft capture lifecycle.
 Attention DPs remain independent. Each Attention TP group uses the existing
 CAM token split and output gather; set `attn_ranks_per_dp` to Attention TP
-on both roles. Existing eager Attention TP/SP support is unchanged.
+on both roles.
 
 Native Ascend owns graph inputs, batch buckets, attention-parameter updates and
 replay. Ineligible batches, including prefill, retain native eager fallback.
-Compilation mode 0 disables Dynamo while retaining ACL graph capture.
+`FULL` is also accepted and resolved by the native attention backend; the
+current DSV4 backend resolves it to `FULL_DECODE_ONLY`. The device qualification
+uses compilation mode 0, which disables Dynamo while retaining ACL graph
+capture. Other compilation modes have not been validated by this qualification.
 AFD stages local real/padded token metadata before capture/replay; Async CAM
 does not send synchronous DP control messages. Existing synchronous connectors
 retain their control-plane behavior.

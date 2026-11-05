@@ -58,7 +58,6 @@ ATTENTION_ROUTING_MODEL_ARCHITECTURES: Final[tuple[str, ...]] = (
 
 CAM_MAX_RECEIVE_TOKENS = 262144
 CAM_MAX_SOURCE_ROWS = (1 << 16) - 1
-NPU_ACL_GRAPH_COMPILATION_MODE = 0  # vLLM CompilationMode.NONE
 
 
 def cam_receive_capacity() -> int:
@@ -89,24 +88,14 @@ def validate_graph_capacity(max_tokens: int, tp_size: int, capacity: int) -> Non
 
 
 def validate_async_cam_attention_graph(vllm_config: VllmConfig) -> None:
-    """Keep the initial Async CAM target graph on the native ACL decode path."""
+    """Validate AFD dependencies for native Async CAM Attention graphs."""
     model = vllm_config.model_config
     parallel = vllm_config.parallel_config
-    compilation = vllm_config.compilation_config
     if (
         not vllm_config.use_v2_model_runner
         or model.hf_text_config.model_type != "deepseek_v4"
     ):
         raise RuntimeError("Async CAM Attention graph requires MRV2 DeepSeek-V4")
-    speculative = vllm_config.speculative_config
-    if speculative is not None and speculative.method != "dspark":
-        raise RuntimeError("Async CAM Attention graph supports DSpark speculation only")
-    if vllm_config.kv_transfer_config is not None:
-        raise RuntimeError("Async CAM Attention graph does not support PD")
-    if parallel.use_sequence_parallel_moe or os.environ.get(
-        "VLLM_ASCEND_ENABLE_FLASHCOMM1", "0"
-    ).strip().lower() in ("1", "true"):
-        raise RuntimeError("Async CAM Attention graph requires SP disabled")
     if parallel.enable_dbo or parallel.use_ubatching:
         raise RuntimeError("Async CAM Attention graph does not support DBO/ubatching")
     if (
@@ -115,13 +104,6 @@ def validate_async_cam_attention_graph(vllm_config: VllmConfig) -> None:
         parallel.decode_context_parallel_size,
     ) != (1, 1, 1):
         raise RuntimeError("Async CAM Attention graph does not support PP or CP")
-    if cudagraph_mode_name(vllm_config) != "FULL_DECODE_ONLY":
-        raise RuntimeError("Async CAM Attention graph requires FULL_DECODE_ONLY")
-    if compilation.mode != NPU_ACL_GRAPH_COMPILATION_MODE:
-        raise RuntimeError(
-            "Async CAM Attention graph requires compilation mode=0 "
-            "(native ACL without Dynamo)"
-        )
 
 
 def validate_gpu_model_runner_v2_config(

@@ -171,10 +171,11 @@ installs its own AFD metadata and opts out of cross-DP synchronization; native
 sampling, rejection, heads and context-KV updates are inherited. The
 [0.32 recipe](../../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md)
 describes A/F serving. In PD deployments, Prefill uses the upstream complete
-draft model and KV connector. Without PD, Attention may use the native
-`FULL_DECODE_ONLY` graph with compilation mode 0, SP and DBO disabled, and
-matching target/draft TP. The draft can remain eager or use its own native graph
-alongside the target graph. PD keeps eager Attention and draft execution.
+draft model and KV connector. Attention may use native graphs with or without
+PD and Attention-local FlashComm1/SP, with matching target/draft TP and DBO
+disabled. The draft can remain eager or use its own native graph alongside the
+target graph. Native resolution selects the effective mode for `FULL` or
+`FULL_DECODE_ONLY`; device qualification uses compilation mode 0.
 F may use the existing FULL transaction graph with one homogeneous W4A8 or W8A8
 table covering target and draft; selection remains on device. DSpark excludes
 DBO and FFN two-stream.

@@ -308,33 +308,35 @@ def test_async_cam_rejects_models_without_layered_ffn(role, model_type):
 @pytest.mark.parametrize("dp_size", [1, 2])
 @pytest.mark.parametrize("tp_size", [1, 2])
 def test_async_cam_target_graph_feature_admission(monkeypatch, dp_size, tp_size):
-    monkeypatch.setenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0")
+    monkeypatch.setenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "1")
     config = npu_async_cam_target_graph_config(
         data_parallel_size=dp_size,
         tensor_parallel_size=tp_size,
         num_attention_ranks=dp_size * tp_size,
     )
+    config.kv_transfer_config = object()
+    config.parallel_config.use_sequence_parallel_moe = True
     fail_if_unsupported_npu_afd_features(config)
 
 
 @pytest.mark.parametrize(
-    "field,value,error",
+    "method,uses_draft,error",
     [
-        (
-            "speculative_config",
-            SimpleNamespace(method="mtp"),
-            "DSpark speculation only",
-        ),
-        ("kv_transfer_config", object(), "does not support PD"),
+        ("mtp", True, "native draft models or MTP"),
+        ("ngram", False, None),
     ],
 )
-def test_async_cam_target_graph_feature_excludes_other_speculation_and_pd(
-    monkeypatch, field, value, error
+def test_async_cam_target_graph_feature_preserves_draft_model_boundary(
+    monkeypatch, method, uses_draft, error
 ):
     monkeypatch.setenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0")
     config = npu_async_cam_target_graph_config()
-    setattr(config, field, value)
-    with pytest.raises(RuntimeError, match=error):
+    config.speculative_config = SimpleNamespace(
+        method=method,
+        use_eagle=lambda: False,
+        uses_draft_model=lambda: uses_draft,
+    )
+    with pytest.raises(RuntimeError, match=error) if error else nullcontext():
         fail_if_unsupported_npu_afd_features(config)
 
 

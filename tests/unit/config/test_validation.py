@@ -197,25 +197,20 @@ def test_async_cam_target_graph_accepts_dspark_tp4(
     [
         ("use_v2_model_runner", False, "ModelRunnerV2"),
         ("model_config.hf_text_config.model_type", "deepseek_v2", "DeepSeek-V4"),
-        (
-            "speculative_config",
-            SimpleNamespace(method="mtp"),
-            "DSpark speculation only",
-        ),
-        ("kv_transfer_config", object(), "does not support PD"),
-        ("parallel_config.use_sequence_parallel_moe", True, "SP disabled"),
         ("parallel_config.enable_dbo", True, "DBO/ubatching"),
         ("parallel_config.use_ubatching", True, "DBO/ubatching"),
         ("parallel_config.pipeline_parallel_size", 2, "PP or CP"),
         ("parallel_config.prefill_context_parallel_size", 2, "PP or CP"),
         ("parallel_config.decode_context_parallel_size", 2, "PP or CP"),
-        ("compilation_config.cudagraph_mode.name", "FULL", "FULL_DECODE_ONLY"),
-        ("compilation_config.cudagraph_mode.name", "NONE", "FULL_DECODE_ONLY"),
-        ("compilation_config.cudagraph_mode.name", "PIECEWISE", "FULL_DECODE_ONLY"),
-        ("compilation_config.mode", 3, "compilation mode=0"),
+        ("compilation_config.cudagraph_mode.name", "NONE", "supports ACL graph modes"),
+        (
+            "compilation_config.cudagraph_mode.name",
+            "PIECEWISE",
+            "supports ACL graph modes",
+        ),
     ],
 )
-def test_async_cam_target_graph_rejects_unqualified_profiles(
+def test_async_cam_target_graph_rejects_unsupported_configuration(
     monkeypatch, mrv2_config, path, value, error
 ):
     monkeypatch.setenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0")
@@ -231,14 +226,29 @@ def test_async_cam_target_graph_rejects_unqualified_profiles(
         )
 
 
-def test_async_cam_target_graph_rejects_flashcomm_environment(monkeypatch, mrv2_config):
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        ("kv_transfer_config", object()),
+        ("parallel_config.use_sequence_parallel_moe", True),
+        ("speculative_config", SimpleNamespace(method="ngram")),
+        ("compilation_config.cudagraph_mode.name", "FULL"),
+        ("compilation_config.mode", 3),
+    ],
+)
+def test_async_cam_target_graph_preserves_native_options(
+    monkeypatch, mrv2_config, path, value
+):
     monkeypatch.setenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "1")
-    with pytest.raises(RuntimeError, match="SP disabled"):
-        validate_npu_model_runner_v2_config(
-            npu_async_cam_target_graph_config(),
-            expected_role="attention",
-            device_type="npu",
-        )
+    config = npu_async_cam_target_graph_config()
+    *parents, name = path.split(".")
+    target = config
+    for parent in parents:
+        target = getattr(target, parent)
+    setattr(target, name, value)
+    validate_npu_model_runner_v2_config(
+        config, expected_role="attention", device_type="npu"
+    )
 
 
 @pytest.mark.parametrize(
