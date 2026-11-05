@@ -468,6 +468,12 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         self.ratio = self.attn_size // self.ffn_size
         self.dst_list = list(self.topology.dp_metadata_destinations)
         self.dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] = {}
+        # Uniform per-Attention-rank row count per ubatch, derived from
+        # dp_metadata_list in eager Python. The traced forward only reads this
+        # int: the per-rank counts live in a CPU tensor, and converting one to a
+        # list inside a capture makes the row count data-dependent, which dynamo
+        # cannot bound (and which static ACL graphs freeze anyway).
+        self.uniform_tokens: dict[int, int] = {}
         self.is_graph_capturing = False
         self.is_warmup = False
         self.scheduler_config = vllm_config.scheduler_config
@@ -519,6 +525,15 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         _register_camp2p_custom_ops()
 
         num_ubatches = max(1, self.vllm_config.parallel_config.num_ubatches)
+        # The a2e/e2a custom ops resolve their HCCL communicator from the
+        # process-group *name* (get_hccl_comm_name returns a name derived from
+        # it alone). Static names would make a rebuilt connector collide with
+        # the retired generation's registry entries and silently exchange data
+        # through the old, wrong-topology communicators. Every elastic resize
+        # allocates a fresh rendezvous port shared by both roles via the afd
+        # config, so embedding it keeps the names unique per generation yet
+        # identical across all participating processes.
+        generation_suffix = f"_{self.afd_config.port}"
         self.afd_pg_list = []
         self.hccl_comm_name_list = []
         for ubatch_idx in range(num_ubatches):
@@ -528,7 +543,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 init_method=f"tcp://{self.afd_config.host}:{self.afd_config.port}",
                 world_size=self.ffn_size + self.attn_size,
                 rank=self.world_rank,
-                group_name=group_name,
+                group_name=f"{group_name}{generation_suffix}",
                 timeout=timedelta(minutes=30),
                 pg_options=create_hccl_process_group_options(
                     self.hccl_buffer_size_mb,
@@ -552,7 +567,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 init_method=f"tcp://{self.afd_config.host}:{self.afd_config.port}",
                 world_size=self.ffn_size,
                 rank=self.world_rank,
-                group_name="afd_moe",
+                group_name=f"afd_moe{generation_suffix}",
                 timeout=timedelta(minutes=30),
                 pg_options=create_hccl_process_group_options(
                     self.hccl_buffer_size_mb,
@@ -569,7 +584,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 init_method=f"tcp://{self.afd_config.host}:{self.afd_config.port}",
                 world_size=self.topology.p2p_world_size,
                 rank=self.p2p_rank,
-                group_name="p2p",
+                group_name=f"p2p{generation_suffix}",
                 timeout=timedelta(minutes=30),
             )
 
@@ -644,6 +659,30 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 f"hidden_states shape {hidden_states.shape!r} does not match "
                 f"CAMP2P metadata token count {metadata.total_tokens}",
             )
+        ubatch_idx = metadata.stage_idx
+        # When several Attention ranks feed one FFN rank the CAMP2p kernels
+        # move an equal share of rows per Attention rank, so every Attention
+        # rank must publish the same row count this step.  Pad the real tokens
+        # up to the largest count across ranks; the extra rows are dropped on
+        # the return path.
+        send_tokens = metadata.total_tokens
+        # The uniform publication applies to the single-stage step only. Under
+        # ubatching, send_attn_output_impl recomputes this rank's own physical
+        # count from the per-group payload and overrides both the row count and
+        # transfer_state.batch_size with it, so padding to the cross-rank
+        # maximum here would leave that step subtracting a larger number from a
+        # smaller one (negative padding) and allocate a negative-sized tensor.
+        # The two conventions must not both act on the same step.  The count is
+        # looked up, not computed: converting the DP tensor here would put a
+        # data-dependent value inside a traced forward.
+        if self.attn_size > self.ffn_size and len(self.dp_metadata_list) <= 1:
+            uniform = self.uniform_tokens.get(ubatch_idx)
+            if uniform is not None:
+                send_tokens = max(send_tokens, uniform)
+        if hidden_states.shape[0] < send_tokens:
+            hidden_states = torch.nn.functional.pad(
+                hidden_states, (0, 0, 0, send_tokens - hidden_states.shape[0])
+            )
         input_ids = cast(torch.Tensor | None, kwargs.get("input_ids"))
         routing = cast(
             tuple[torch.Tensor, torch.Tensor] | None,
@@ -658,27 +697,47 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         expert_scales: torch.Tensor | None = None
         compute_gate = 0
         if input_ids is not None:
+            # The ids channel must cover the same rows as the padded hidden
+            # states; zero ids address a valid expert and land only on rows
+            # the return path drops.
+            if input_ids.numel() < send_tokens:
+                input_ids = torch.nn.functional.pad(
+                    input_ids, (0, send_tokens - input_ids.numel())
+                )
             expert_ids, expert_scales = prepare_token_id_transfer(
                 input_ids,
                 topk=self.num_experts_per_tok,
-                expected_tokens=metadata.total_tokens,
+                expected_tokens=send_tokens,
             )
             compute_gate = 1
         elif routing is not None:
+            # The routing channel must cover exactly the padded rows the
+            # activation publishes: a2e indexes ids and scales by the declared
+            # batch size, so routing sized to the real token count is read past
+            # its end whenever padding made send_tokens larger. Padding rows
+            # carry expert 0 with weight 0, which routes nothing, matching the
+            # ids branch above and AFDExternalRoutingInputs.padded.
+            routing_ids = routing[0]
+            routing_weights = routing[1]
+            if routing_ids.shape[0] < send_tokens:
+                pad_rows = send_tokens - int(routing_ids.shape[0])
+                routing_ids = torch.nn.functional.pad(routing_ids, (0, 0, 0, pad_rows))
+                routing_weights = torch.nn.functional.pad(
+                    routing_weights, (0, 0, 0, pad_rows)
+                )
             expert_ids, expert_scales = prepare_routing_transfer(
-                routing[0],
-                routing[1],
-                expected_tokens=metadata.total_tokens,
+                routing_ids,
+                routing_weights,
+                expected_tokens=send_tokens,
                 top_k=self.num_experts_per_tok,
             )
             compute_gate = 1
         transfer_state = CAMP2PTransferState(
             aiv_num=self.aiv_num,
-            batch_size=metadata.total_tokens,
+            batch_size=send_tokens,
             h=self.hidden_size,
             k=self.num_experts_per_tok,
         )
-        ubatch_idx = metadata.stage_idx
         forward_context = get_forward_context()
         forward_context.cam_afdtransfer_state = transfer_state
         forward_context.ubatch_idx = ubatch_idx
@@ -728,7 +787,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         if transfer_state is None:
             raise RuntimeError("CAMP2P Attention side is missing connector data")
         get_forward_context().ubatch_idx = ubatch_idx
-        return torch.ops.vllm.afd_camp2p_recv_ffn_output(
+        received = torch.ops.vllm.afd_camp2p_recv_ffn_output(
             ref_tensor,
             self.hccl_comm_name,
             self.hccl_comm_name2,
@@ -741,6 +800,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             self.world_rank,
             transfer_state.aiv_num,
         )
+        return received
 
     def recv_attn_output(
         self, ubatch_idx: int = 0, **kwargs: Any
@@ -930,6 +990,18 @@ class CAMP2pAFDControlPlane(AFDControlPlane):
         connector.dp_metadata_list = self._physical_payload(payload).dp_metadata_list
         connector.is_graph_capturing = payload.is_graph_capturing
         connector.is_warmup = payload.is_warmup
+        # Resolve the uniform row count here, in eager Python, so the traced
+        # forward never converts a DP tensor to a Python list. This runs on every
+        # step, including the capture and replay warm-ups that publish metadata
+        # immediately before the graph runs.
+        uniform: dict[int, int] = {}
+        for stage in connector.dp_metadata_list:
+            count = _camp2p_uniform_batch(
+                connector.dp_metadata_list, stage, connector.attn_size
+            )
+            if count is not None:
+                uniform[stage] = count
+        connector.uniform_tokens = uniform
 
     def send_dp_metadata_list(
         self,
@@ -1052,6 +1124,40 @@ def build_camp2p_topology(
     )
 
 
+def _dp_token_counts(
+    dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
+    stage_idx: int,
+    attention_size: int,
+) -> list[int] | None:
+    """Per-Attention-rank token counts for one ubatch, or None if unknown.
+
+    ``num_tokens_across_dp_cpu`` carries one entry per DP rank; when TP > 1
+    each DP rank's count is replicated to its TP workers.
+    """
+    dp_metadata = dp_metadata_list.get(stage_idx)
+    if dp_metadata is None:
+        return None
+    counts = dp_metadata.num_tokens_across_dp_cpu.flatten().tolist()
+    if len(counts) < attention_size and attention_size % len(counts) == 0:
+        tp_size = attention_size // len(counts)
+        counts = [counts[i // tp_size] for i in range(attention_size)]
+    if len(counts) < attention_size:
+        return None
+    return counts
+
+
+def _camp2p_uniform_batch(
+    dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
+    stage_idx: int,
+    attention_size: int,
+) -> int | None:
+    """Largest per-Attention-rank token count for this step, or None."""
+    counts = _dp_token_counts(dp_metadata_list, stage_idx, attention_size)
+    if counts is None:
+        return None
+    return max(1, max(counts))
+
+
 def _num_tokens_for_ffn_rank(
     dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
     stage_idx: int,
@@ -1063,10 +1169,14 @@ def _num_tokens_for_ffn_rank(
 ) -> int:
     """Count the tokens that one FFN rank will receive from Attention.
 
-    FFN rank f receives Attention ranks f, f + ffn_size, and so on, matching
-    the A2E/E2A kernel strides. This function adds their token counts. When TP
-    creates several Attention workers for one DP rank, it first copies the DP
-    token count to those TP workers.
+    The CAMP2p a2e/e2a kernels move ``batch_size / (attention_size /
+    ffn_size)`` rows to or from every Attention rank's shared-memory window, so
+    this must mirror exactly what the sender published. Under N:1 fanout the
+    sender uses two conventions: a single-stage step pads every Attention rank
+    up to one uniform count (``send_attn_output``), while a ubatched step keeps
+    the per-group physical count of each source rank. Both are handled below;
+    when TP creates several Attention workers for one DP rank,
+    ``_dp_token_counts`` replicates the DP counts first.
 
     Args:
         dp_metadata_list: Token counts received from Attention for each ubatch.
@@ -1079,22 +1189,27 @@ def _num_tokens_for_ffn_rank(
     Returns:
         The number of tokens this FFN rank should receive, always at least one.
     """
-    dp_metadata = dp_metadata_list[stage_idx]
-    if dp_metadata is None:
+    counts = _dp_token_counts(dp_metadata_list, stage_idx, attention_size)
+    if counts is None:
         return max(1, fallback)
-    token_counts = dp_metadata.num_tokens_across_dp_cpu
-    counts = token_counts.flatten().tolist()
-    # Expand DP-level counts to AFD-level when TP > 1.
-    # num_tokens_across_dp_cpu has dp_size entries, but attention_size
-    # = num_attention_ranks includes TP workers.  Each DP rank's count
-    # is replicated tp_size times.
-    if len(counts) < attention_size and attention_size % len(counts) == 0:
-        tp_size = attention_size // len(counts)
-        counts = [counts[i // tp_size] for i in range(attention_size)]
-    if len(counts) < attention_size:
-        return max(1, fallback)
-    if attention_size >= ffn_size and attention_size % ffn_size == 0:
-        return max(1, sum(counts[ffn_rank:attention_size:ffn_size]))
+    if attention_size == ffn_size:
+        # 1:1 mapping: no padding happens on the Attention side.
+        return max(1, counts[ffn_rank])
+    if attention_size > ffn_size and attention_size % ffn_size == 0:
+        # N:1 mapping. This must match the sender exactly: the kernel writes a
+        # fixed share per source into expand_x, and a smaller value here means
+        # out-of-bounds writes. The two multi-rank cases publish differently:
+        if len(dp_metadata_list) > 1:
+            # Ubatched traffic. send_attn_output skips the uniform publication
+            # there (it would fight send_attn_output_impl's own per-group
+            # count), so each Attention rank sends its own physical count, and
+            # _physical_payload has already equalised those within each
+            # receiving group. Sum this rank's own strided sources.
+            return max(1, sum(counts[ffn_rank::ffn_size]))
+        # Single stage: every Attention rank padded up to one uniform count
+        # (see send_attn_output), so this rank receives that count from each of
+        # attention_size / ffn_size sources.
+        return max(1, max(counts)) * (attention_size // ffn_size)
     return max(1, fallback)
 
 

@@ -41,6 +41,7 @@ from afd_plugin.connectors import (
     AFDForwardContextMetadata,
     AFDRoutedExpertsConnector,
 )
+from afd_plugin.elastic.config import is_elastic_attention
 from afd_plugin.model_executor.models.forward_context import use_afd_metadata_provider
 from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
@@ -484,6 +485,16 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
         **kwargs,
     ) -> None:
         super().load_model(load_dummy_weights, *args, model=model, **kwargs)
+        # ### PATCH START: elastic attention defers the connector rendezvous.
+        # Mechanism: the elastic launcher waits for the A engine to build
+        # synchronously, while init_afd_connector() collectively waits for F,
+        # which the client only pulls after this returns — boot deadlocks.
+        # The elastic lifecycle (connect() in afd_plugin/elastic/gpu.py)
+        # rebuilds the connector once roles are up. A runner built without a
+        # VllmConfig (constructor-bypassing tests) is never elastic.
+        if is_elastic_attention(getattr(self, "vllm_config", None)):
+            return
+        # ### PATCH END: elastic attention defers the connector rendezvous.
         # ### PATCH START: connect after native loading.
         if self.connector.is_initialized:
             return
@@ -615,8 +626,9 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     # AFD must install its sidecar at that exact context-construction seam.
     # Patch functionality: delegate all request/input/Attention/KV/sampling/
     # output work to native V2 while temporarily installing AFD metadata.
-    # Signature: matches vLLM v0.32.0 GPUModelRunnerV2.execute_model exactly,
-    # including randomize_inputs, forwarded unchanged to native dummy execution.
+    # Signature: matches vLLM v0.32.0 GPUModelRunnerV2.execute_model, with a
+    # **kwargs pass-through so neighbouring generations (e.g. main@544f182d9)
+    # forward unchanged to native execution.
     # Upstream source: vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.execute_model; commit
     # 5df63a7203cdb9328d824a27b682e77c7b9928be.
@@ -635,6 +647,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
+        **kwargs,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         # ### PATCH START: scope AFD metadata provider/replay and profiler step.
         step_afd_gpu_profiler(self.prof)
@@ -651,6 +664,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
                 context_len=context_len,
                 valid_dummy_state_slots=valid_dummy_state_slots,
                 randomize_inputs=randomize_inputs,
+                **kwargs,
             )
         # ### PATCH END: scope AFD metadata provider/replay and profiler step.
 
