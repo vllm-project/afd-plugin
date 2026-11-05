@@ -553,6 +553,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         self,
         hidden_states: torch.Tensor,
         *,
+        group_list: torch.Tensor | None = None,
         topk_ids: torch.Tensor | None = None,
         topk_weights: torch.Tensor | None = None,
         **_: Any,
@@ -567,6 +568,14 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         routing_payload_present = topk_ids is not None or topk_weights is not None
 
         if self.uses_external_routing:
+            # CAM dispatch data belongs to the async connector. Keep rejecting it
+            # instead of letting ``**_`` absorb it silently: a layer speaks one
+            # protocol, and a mixed payload would otherwise run half-initialized.
+            if group_list is not None:
+                raise RuntimeError(
+                    "DSV4 sync external routing received CAM dispatch data as well; "
+                    "a layer speaks one protocol",
+                )
             if topk_ids is None or topk_weights is None:
                 raise RuntimeError(
                     "DSV4 sync external routing requires both topk_ids and "
