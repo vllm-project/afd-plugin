@@ -50,11 +50,14 @@ def loop_worker():
         worker._ffn_shutdown_event = threading.Event()
         worker._ffn_loop_error = None
         worker.device = SimpleNamespace(type="cpu")
-        worker.model_runner = SimpleNamespace(
-            connector=SimpleNamespace(control_plane=control_plane, is_initialized=True),
-            use_cuda_graph=False,
-            model="owned weights",
+        runner = object.__new__(GPUFFNModelRunner)
+        runner.connector = SimpleNamespace(
+            control_plane=control_plane, is_initialized=True
         )
+        runner.use_cuda_graph = False
+        runner.model = "owned weights"
+        runner.device = SimpleNamespace(type="cpu")
+        worker.model_runner = runner
         return worker
 
     return make
@@ -603,6 +606,49 @@ def test_experts_pass_static_routing_spec_for_each_stage(
     ]
 
 
+def test_connector_driven_step_executes_the_received_payload():
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.device = SimpleNamespace(type="cpu")
+    metadata = _metadata()
+    runner.connector.attn_outputs.append(_payload("hidden", metadata))
+    runner.connector.recv_dp_metadata_list = lambda: AFDControlPayload(
+        dp_metadata_list={0: _FakeDPMetadata([1])}
+    )
+
+    assert runner.execute_connector_driven_step(cancel_requested=lambda: False)
+    assert runner.connector.ffn_outputs == [("ffn(hidden, layer=0)", metadata)]
+
+
+@pytest.mark.parametrize(
+    "error, cancel_requested, returns_false",
+    [
+        (AFDControlPlaneClosedError("closed"), True, True),
+        (AFDControlPlaneClosedError("closed"), False, False),
+        (RuntimeError("NCCL failure"), True, False),
+    ],
+)
+def test_connector_driven_step_reports_only_requested_cancellation(
+    error, cancel_requested, returns_false
+):
+    def receive():
+        raise error
+
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.device = SimpleNamespace(type="cpu")
+    runner.connector.recv_dp_metadata_list = receive
+
+    if returns_false:
+        assert not runner.execute_connector_driven_step(
+            cancel_requested=lambda: cancel_requested
+        )
+    else:
+        with pytest.raises(type(error)) as caught:
+            runner.execute_connector_driven_step(
+                cancel_requested=lambda: cancel_requested
+            )
+        assert caught.value is error
+
+
 def test_ffn_runner_requires_dp_metadata_list():
     runner = object.__new__(GPUFFNModelRunner)
     runner.prof = None
@@ -751,9 +797,8 @@ def test_ffn_worker_loop_rejects_connector_without_control_plane():
 
     worker._ffn_shutdown_event = event
     worker.device = SimpleNamespace(type="cpu")
-    worker.model_runner = SimpleNamespace(
-        connector=_ConnectorDrivenFakeConnector(),
-    )
+    worker.model_runner = object.__new__(GPUFFNModelRunner)
+    worker.model_runner.connector = _ConnectorDrivenFakeConnector()
 
     with pytest.raises(NotImplementedError, match="control-plane-driven"):
         worker._run_ffn_server_loop()

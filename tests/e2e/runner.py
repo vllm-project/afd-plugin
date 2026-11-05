@@ -81,10 +81,32 @@ DEEPEP_M2N_SCENARIOS = (
 )
 # Attention runs DP1 x TP2: each TP rank dispatches its slice of the tokens.
 # FFN stays DP2 x TP1 (experts are not TP-sharded under DeepEP M2N).
+# The same DeepEP M2N deployments with the FFN side served by the standalone
+# FFN service (torchrun -m afd_plugin.ffn_faas serve --backend gpu-deepep-m2n)
+# instead of `vllm serve`. Attention launches exactly as in the mirrored case.
+DEEPEP_M2N_FAAS_SCENARIOS = (
+    "afd-deepep-m2n-faas-eager-2a2f",
+    "afd-deepep-m2n-faas-graph-2a2f",
+    "afd-deepep-m2n-faas-graph-dbo-2a2f",
+    "afd-deepep-m2n-faas-graph-tp2-2a2f",
+)
 DEEPEP_M2N_ATTENTION_TP_SCENARIOS = frozenset(
-    ("afd-deepep-m2n-eager-tp2-2a2f", "afd-deepep-m2n-graph-tp2-2a2f"),
+    (
+        "afd-deepep-m2n-eager-tp2-2a2f",
+        "afd-deepep-m2n-graph-tp2-2a2f",
+        "afd-deepep-m2n-faas-graph-tp2-2a2f",
+    ),
 )
 DEEPEP_M2N_ATTENTION_TP_SIZE = 2
+FFN_FAAS_BACKEND = "gpu-deepep-m2n"
+# Independently started services must pair within the M2N rendezvous timeout
+# on both roles; the standalone F loads its experts while Attention loads.
+FFN_FAAS_AFD_TIMEOUT_S = 600
+FFN_FAAS_SHUTDOWN_TIMEOUT_S = 10
+FFN_FAAS_STOP_TIMEOUT_S = 120
+FFN_FAAS_STATUS_TIMEOUT_S = 5
+# The F-only torchrun world listens next to the AFD rendezvous port.
+FFN_FAAS_MASTER_PORT_OFFSET = 1
 V2_DBO_COMPARISON_SCENARIOS = frozenset(
     ("afd-v2-eager-dp2", "afd-v2-eager-dbo-dp2", "afd-v2-graph-dbo-dp2"),
 )
@@ -141,6 +163,8 @@ def main() -> int:
     mrv2_execution_evidence: list[tuple[str, str]] = []
     mrv2_evidence_dir: tempfile.TemporaryDirectory[str] | None = None
     mrv2_evidence_start: Path | None = None
+    ffn_faas_dir: tempfile.TemporaryDirectory[str] | None = None
+    ffn_faas_status_file: Path | None = None
 
     def cleanup() -> None:
         ffn_process = processes_by_role.get("ffn")
@@ -170,12 +194,17 @@ def main() -> int:
             finally:
                 if mrv2_evidence_dir is not None:
                     mrv2_evidence_dir.cleanup()
+                if ffn_faas_dir is not None:
+                    ffn_faas_dir.cleanup()
 
     launch_order: tuple[tuple[str, str], ...]
     with cancellable_run(cleanup):
         if needs_mrv2_execution_evidence(args):
             mrv2_evidence_dir = tempfile.TemporaryDirectory(prefix="afd-e2e-mrv2-")
             mrv2_evidence_start = Path(mrv2_evidence_dir.name) / "evaluation-start"
+        if uses_ffn_faas(args):
+            ffn_faas_dir = tempfile.TemporaryDirectory(prefix="afd-e2e-ffn-faas-")
+            ffn_faas_status_file = Path(ffn_faas_dir.name) / "ffn.json"
         if args.baseline:
             role_devices = {"baseline": attention_devices}
             launch_order = (("baseline", "BASELINE"),)
@@ -192,11 +221,16 @@ def main() -> int:
                 launch_order = tuple(reversed(launch_order))
 
         for role, label in launch_order:
-            command = (
-                build_baseline_command(args)
-                if role == "baseline"
-                else build_vllm_command(args, role=role)
-            )
+            if role == "baseline":
+                command = build_baseline_command(args)
+            elif role == "ffn" and ffn_faas_status_file is not None:
+                command = build_ffn_faas_command(
+                    args,
+                    ffn_faas_status_file,
+                    args.afd_port + FFN_FAAS_MASTER_PORT_OFFSET,
+                )
+            else:
+                command = build_vllm_command(args, role=role)
             visible_devices = ",".join(role_devices[role])
             process_env = build_env(
                 visible_devices,
@@ -221,6 +255,8 @@ def main() -> int:
             log_threads.append(stream_output(role, process, mrv2_execution_evidence))
             ensure_alive(process, f"{label} process exited during startup")
 
+        if ffn_faas_status_file is not None:
+            wait_for_ffn_faas_ready(args, processes)
         wait_for_openai_api(args, processes)
         ensure_processes_alive(processes)
 
@@ -262,6 +298,14 @@ def main() -> int:
             )
 
         ensure_processes_alive(processes)
+        if ffn_faas_status_file is not None:
+            # Recommended order: stop the idle FFN service, then Attention.
+            stop_ffn_faas(
+                args,
+                processes_by_role["ffn"],
+                processes_by_role["attention"],
+                ffn_faas_status_file,
+            )
 
     print(f"\nE2E SCENARIO {args.scenario} PASSED")
     return 0
@@ -317,6 +361,7 @@ def add_scenario_arguments(parser: argparse.ArgumentParser) -> None:
             *DSV4_GPU_SCENARIOS,
             *V2_SCENARIOS,
             *DEEPEP_M2N_SCENARIOS,
+            *DEEPEP_M2N_FAAS_SCENARIOS,
         ],
         required=True,
         help="Fixed E2E scenario to run.",
@@ -443,6 +488,10 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-deepep-m2n-graph-dbo-2a2f": (False, True, True, 2, 2),
         "afd-deepep-m2n-eager-tp2-2a2f": (False, False, False, 2, 2),
         "afd-deepep-m2n-graph-tp2-2a2f": (False, True, False, 2, 2),
+        "afd-deepep-m2n-faas-eager-2a2f": (False, False, False, 2, 2),
+        "afd-deepep-m2n-faas-graph-2a2f": (False, True, False, 2, 2),
+        "afd-deepep-m2n-faas-graph-dbo-2a2f": (False, True, True, 2, 2),
+        "afd-deepep-m2n-faas-graph-tp2-2a2f": (False, True, False, 2, 2),
     }
     for sync_scenario, sync_profile in DSV4_SYNC_SHAPES.items():
         # The A5 script's native DBO stays off for these scenarios: a split batch
@@ -489,7 +538,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
         args.ffn_tp_size = 1
     if not is_dsv4 and args.gsm8k_output_path is None:
         raise ValueError("--gsm8k-output-path is required for GSM8K scenarios")
-    if args.scenario in DEEPEP_M2N_SCENARIOS:
+    if args.scenario in DEEPEP_M2N_SCENARIOS or uses_ffn_faas(args):
         args.afd_connector = DEEPEP_M2N_CONNECTOR
         args.compute_gate_on_attention = True
     if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
@@ -559,7 +608,9 @@ def validate_topology(
         raise ValueError("ModelRunnerV2 E2E scenarios require GPU")
     if args.scenario == NPU_EAGER_DBO_SCENARIO and args.device_backend != "npu":
         raise ValueError("Lite eager DBO scenario requires NPU")
-    if args.scenario in DEEPEP_M2N_SCENARIOS and args.device_backend != "gpu":
+    if (
+        args.scenario in DEEPEP_M2N_SCENARIOS or uses_ffn_faas(args)
+    ) and args.device_backend != "gpu":
         raise ValueError("DeepEP M2N E2E scenarios require GPU")
     if args.scenario in DSV4_SCENARIOS and args.device_backend != "npu":
         raise ValueError("DSV4 scenarios require NPU")
@@ -672,6 +723,10 @@ def build_vllm_command(
         afd_config["afd"]["async"] = True
     if args.compute_gate_on_attention:
         afd_config["afd"]["compute_gate_on_attention"] = True
+    if uses_ffn_faas(args):
+        # Attention pairs with an independently started FFN service; keep
+        # its rendezvous timeout equal to the FFN service's --afd-timeout.
+        afd_config["afd"]["afd_process_group_timeout_s"] = FFN_FAAS_AFD_TIMEOUT_S
     connector_extra_config = parse_afd_connector_extra_config(
         args.afd_connector_extra_config,
     )
@@ -858,6 +913,150 @@ def uses_async_connector(args: argparse.Namespace) -> bool:
     return args.afd_connector == ASYNC_AFD_CONNECTOR
 
 
+def uses_ffn_faas(args: argparse.Namespace) -> bool:
+    """Whether the FFN side runs as the standalone FFN service."""
+    return args.scenario in DEEPEP_M2N_FAAS_SCENARIOS
+
+
+def ffn_faas_status_port(args: argparse.Namespace) -> int:
+    """Management port of FFN service rank 0; rank r listens on this + r."""
+    return ffn_api_port(args)
+
+
+def build_ffn_faas_command(
+    args: argparse.Namespace, status_file: Path, master_port: int
+) -> list[str]:
+    """Build the ``torchrun`` command of the standalone GPU FFN service.
+
+    One process per FFN rank on this host (DP = FFN ranks, TP = 1). The AFD
+    rendezvous, rank counts, connector options, graph mode and DBO mirror the
+    FFN half ``build_vllm_command`` would produce for the same scenario, so
+    the unchanged Attention command pairs with it. The torchrun master port
+    is the F-only world; the AFD port is the M2N world.
+    """
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        f"--nproc-per-node={args.num_ffn_ranks}",
+        "--nnodes=1",
+        f"--master-addr={args.afd_host}",
+        f"--master-port={master_port}",
+        "-m",
+        "afd_plugin.ffn_faas",
+        "serve",
+        args.model,
+        "--backend",
+        FFN_FAAS_BACKEND,
+        "--host",
+        args.afd_host,
+        "--port",
+        str(args.afd_port),
+        "--attention-ranks",
+        str(args.num_attention_ranks),
+        "--ffn-ranks",
+        str(args.num_ffn_ranks),
+        "--connector-extra-config",
+        json.dumps(
+            parse_afd_connector_extra_config(args.afd_connector_extra_config),
+            separators=(",", ":"),
+        ),
+        "--afd-timeout",
+        str(FFN_FAAS_AFD_TIMEOUT_S),
+        "--shutdown-timeout",
+        str(FFN_FAAS_SHUTDOWN_TIMEOUT_S),
+        "--status-host",
+        args.api_host,
+        "--status-port",
+        str(ffn_faas_status_port(args)),
+        "--status-file",
+        str(status_file),
+    ]
+    if args.cuda_graph_full_decode_only:
+        command.append("--graph")
+    if args.enable_dbo:
+        command.append("--dbo")
+    return command
+
+
+def ffn_faas_status(args: argparse.Namespace, rank: int, path: str) -> int:
+    """HTTP status code of one FFN service rank's management endpoint."""
+    url = f"http://{args.api_host}:{ffn_faas_status_port(args) + rank}{path}"
+    try:
+        with urllib.request.urlopen(url, timeout=FFN_FAAS_STATUS_TIMEOUT_S) as reply:
+            return int(reply.status)
+    except urllib.error.HTTPError as error:
+        return int(error.code)
+
+
+def wait_for_ffn_faas_ready(
+    args: argparse.Namespace, processes: list[subprocess.Popen[str]]
+) -> None:
+    """Wait until every FFN service rank reports ``/ready`` (paired with A).
+
+    ``/ready`` means paired and receiving; CUDA graphs are captured later,
+    driven by Attention, whose API comes up only after that.
+    """
+    deadline = time.monotonic() + args.startup_timeout
+    pending = set(range(args.num_ffn_ranks))
+    last_error: BaseException | None = None
+    while pending and time.monotonic() < deadline:
+        ensure_processes_alive(processes)
+        for rank in sorted(pending):
+            try:
+                if ffn_faas_status(args, rank, "/ready") == 200:
+                    pending.discard(rank)
+            except (OSError, urllib.error.URLError) as error:
+                last_error = error
+        time.sleep(PROCESS_POLL_INTERVAL_S)
+    if pending:
+        raise TimeoutError(
+            f"FFN service ranks {sorted(pending)} were not ready; "
+            f"last error={last_error!r}"
+        )
+    print("\nFFN service ranks are ready")
+
+
+def stop_ffn_faas(
+    args: argparse.Namespace,
+    process: subprocess.Popen[str],
+    attention_process: subprocess.Popen[str],
+    status_file: Path,
+) -> None:
+    """Stop the idle pair, FFN service first, and require released resources.
+
+    Posts ``/stop`` to every FFN rank while Attention is idle, which cancels
+    each rank's idle control receive; then shuts Attention down right away.
+    Releasing a DeepEP lane (``ElasticBuffer.destroy``) is a barrier over
+    every M2N rank, so the FFN service's release completes only once
+    Attention's shutdown destroys its lanes too. The launcher must then exit
+    0 and every rank's status file must report ``stopped`` with
+    ``resources_released=true``.
+    """
+    for rank in range(args.num_ffn_ranks):
+        request = urllib.request.Request(
+            f"http://{args.api_host}:{ffn_faas_status_port(args) + rank}/stop",
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=FFN_FAAS_STATUS_TIMEOUT_S):
+            pass
+    terminate_processes(
+        [attention_process],
+        termination_timeout_s=process_termination_timeout(args),
+    )
+    returncode = process.wait(timeout=FFN_FAAS_STOP_TIMEOUT_S)
+    if returncode != 0:
+        raise RuntimeError(f"FFN service exited with returncode={returncode}")
+    for rank in range(args.num_ffn_ranks):
+        rank_file = status_file.with_name(f"{status_file.stem}-rank-{rank}.json")
+        status = json.loads(rank_file.read_text())
+        if status["phase"] != "stopped" or status["resources_released"] is not True:
+            raise RuntimeError(
+                f"FFN service rank {rank} did not stop cleanly: {status}"
+            )
+    print("\nFFN service stopped cleanly with resources released")
+
+
 def uses_npu_async_process_cleanup(args: argparse.Namespace) -> bool:
     """Return whether E2E teardown must find and kill every FFN process."""
     return args.device_backend == "npu" and args.scenario == DSV4_ASYNC_CAM_SCENARIO
@@ -964,7 +1163,13 @@ def execution_evidence_roles(args: argparse.Namespace) -> tuple[str, ...]:
         return ("baseline",)
     # Async CAM stages belong to Attention; FFN consumes independent native
     # work items. Sync graph/DBO must prove the matching path on both roles.
-    return ("attention",) if uses_async_connector(args) else ("attention", "ffn")
+    # The standalone FFN service has no vLLM Worker to host the evidence
+    # extension; Attention's evidence covers the paired graph/DBO path.
+    return (
+        ("attention",)
+        if uses_async_connector(args) or uses_ffn_faas(args)
+        else ("attention", "ffn")
+    )
 
 
 def needs_mrv2_execution_evidence(args: argparse.Namespace) -> bool:

@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 from vllm.config import VllmConfig
@@ -92,6 +92,18 @@ def local_experts_from_vllm(routed_experts: RoutedExperts) -> FFNLocalExperts:
     )
 
 
+class RoutedExpertsModel(Protocol):
+    """What the routed runner reads from a model: MoE layers and their experts.
+
+    Implemented by the AFD CausalLM models the Worker path loads and by the
+    standalone FFN service's FFN-only model shells.
+    """
+
+    def get_experts_layer_indices(self) -> tuple[int, ...]: ...
+
+    def get_routed_experts(self, layer_idx: int) -> RoutedExperts: ...
+
+
 def _require_routed(connector: AFDConnectorBase) -> AFDRoutedExpertsConnector:
     if not isinstance(connector, AFDRoutedExpertsConnector):
         raise TypeError(
@@ -121,11 +133,17 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
         _require_routed(self.connector)
         self.moe_layer_indices: tuple[int, ...] = ()
         self.local_experts: dict[int, FFNLocalExperts] = {}
+        self._receiver_exited = False
 
     @property
     def routed_connector(self) -> AFDRoutedExpertsConnector:
         """The connector, typed as the routed-experts contract it must meet."""
         return _require_routed(self.connector)
+
+    @property
+    def receiver_exited(self) -> bool:
+        """Whether ``mark_receiver_exited`` proved the receive loop finished."""
+        return self._receiver_exited
 
     def load_model(self, *, load_dummy_weights: bool = False, **kwargs: Any) -> None:
         """Load with the native loader, then take each MoE layer's experts.
@@ -133,12 +151,61 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
         Runs again on ``reload_weights``, whose parameters replace the old ones.
         """
         super().load_model(load_dummy_weights=load_dummy_weights, **kwargs)
-        model = self.get_model()
+        self._take_local_experts(self.get_model())
+
+    # NPU parallel: afd_plugin/v1/worker/npu/async_ffn_model_runner.py::
+    #   AsyncNPUFFNModelRunner.attach_model (same guard: before connector
+    #   startup and at most once; NPU borrows layered W4A8 weight views).
+    # Reuse: PARTIAL - the attach-once/before-init guard is identical; the
+    #   expert extraction is GPU-specific (FusedMoE Triton layout views).
+    #   REFACTOR-CANDIDATE(R5): a shared attach guard for both runners.
+    def attach_model(
+        self, model: RoutedExpertsModel, *, model_memory_usage: int
+    ) -> None:
+        """Adopt a model loaded outside this runner, as ``load_model`` would.
+
+        The standalone FFN service builds and loads its own FFN-only model.
+        This hands it to the runner and builds the per-layer local-expert
+        views the connector reads, through the same
+        ``local_experts_from_vllm`` check ``load_model`` uses (Triton layout).
+        Must run before ``initialize_afd_connector`` because the connector
+        all-gathers these views in its startup collective, and only once,
+        because the connector keeps no way to swap them afterwards.
+        """
+        if self.model is not None or self.connector.is_initialized:
+            raise RuntimeError(
+                "a routed FFN model must be attached once, before connector startup"
+            )
+        if model_memory_usage < 0:
+            raise ValueError("model memory usage must be non-negative")
+        self.model = model
+        self.model_memory_usage = model_memory_usage
+        self._take_local_experts(model)
+
+    def _take_local_experts(self, model: RoutedExpertsModel) -> None:
+        """Record the model's MoE layers and this rank's expert views per layer."""
         self.moe_layer_indices = tuple(model.get_experts_layer_indices())
         self.local_experts = {
             layer_idx: local_experts_from_vllm(model.get_routed_experts(layer_idx))
             for layer_idx in self.moe_layer_indices
         }
+
+    # NPU parallel: afd_plugin/v1/worker/npu/async_ffn_model_runner.py::
+    #   AsyncNPUFFNModelRunner.mark_receiver_exited (records the same proof;
+    #   NPU rejects pending graph work, GPU fences the device instead).
+    # Reuse: PARTIAL - same contract, device-specific completion check.
+    def mark_receiver_exited(self) -> None:
+        """Record that the receive loop ended cleanly and its device work is done.
+
+        Called on the receiver thread after its last step. Each step already
+        ends with a synchronize; the extra fence here also covers a step that
+        returned early because a stop cancelled its receive. The standalone FFN
+        backend releases weights, CUDA graphs and DeepEP buffers only after
+        this proof.
+        """
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        self._receiver_exited = True
 
     def initialize_afd_connector(self) -> None:
         self.routed_connector.init_afd_connector(
@@ -189,4 +256,8 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
         return ffn_output
 
 
-__all__ = ["GPUFFNRoutedExpertsModelRunner", "local_experts_from_vllm"]
+__all__ = [
+    "GPUFFNRoutedExpertsModelRunner",
+    "RoutedExpertsModel",
+    "local_experts_from_vllm",
+]

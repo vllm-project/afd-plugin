@@ -97,12 +97,25 @@ class CAMFFNBackend:
         """Select the device once on the receiving thread, as the Worker does."""
         self.environment.activate_thread()
 
-    def execute_step(self) -> None:
+    def execute_step(self) -> bool:
+        """Run one CAM submission batch; a CAM receive never reports a cancel.
+
+        The return value follows ``FFNBackend.execute_step``: CAM cannot end a
+        pending receive, so a completed batch always returns ``True``.
+        """
         assert self.runtime is not None
         self.runtime.execute_connector_driven_step()
         if not self.settings.full_graph and not self.settings.ffn_two_stream:
             # Preserve the mature eager loop's completion fence.
             torch.npu.synchronize()
+        return True
+
+    def cancel_receive(self) -> None:
+        """No-op: a pending CAM receive cannot be cancelled.
+
+        The host join then times out, reports the pending receive and retains
+        every owner, exactly as before ``cancel_receive`` existed.
+        """
 
     def receiver_exited(self) -> None:
         assert self.runtime is not None

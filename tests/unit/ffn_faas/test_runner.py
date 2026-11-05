@@ -74,6 +74,41 @@ def test_pending_host_receiver_is_not_closed(make_runner):
         assert backend.finished.wait(timeout=5)
 
 
+def test_stop_cancels_idle_receive_and_releases(make_runner):
+    backend = HostBackend(block=True, cancellable=True)
+    runner, service = make_runner(backend)
+    done = threading.Event()
+
+    def run():
+        try:
+            runner.run()
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert backend.entered.wait(timeout=5)
+        service.request_stop()
+        assert done.wait(timeout=5)
+        assert service.snapshot()["phase"] == "stopped"
+        assert service.snapshot()["resources_released"] is True
+        assert backend.released
+    finally:
+        backend.release.set()
+        thread.join()
+
+
+def test_backend_ended_receive_exits_loop_and_releases(make_runner):
+    backend = HostBackend(end_receive=True)
+    runner, service = make_runner(backend)
+    runner.run()
+    assert service.snapshot()["phase"] == "stopped"
+    assert service.snapshot()["resources_released"] is True
+    assert service.snapshot()["completed_batches"] == 0
+    assert backend.released
+
+
 def test_stop_before_backend_construction_needs_no_platform(tmp_path):
     def unavailable():
         raise RuntimeError("no device backend is available")
