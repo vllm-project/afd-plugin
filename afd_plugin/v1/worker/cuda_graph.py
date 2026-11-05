@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -21,7 +21,7 @@ FULL_DECODE_ONLY = "FULL_DECODE_ONLY"
 _SUPPORTED_GRAPH_MODES = {FULL_DECODE_ONLY}
 
 
-class AFDGraphRunMode(str, Enum):
+class AFDGraphRunMode(StrEnum):
     EAGER = "eager"
     WARMUP = "warmup"
     CAPTURE = "capture"
@@ -107,27 +107,44 @@ def make_ffn_graph_key(
     attention_size: int | None = None,
     ffn_size: int | None = None,
     fallback: int = 1,
-) -> tuple[tuple[int, tuple]]:
-    """Extract the AFD FFN graph hashable key from DP metadata."""
+    uniform_padding: bool = False,
+) -> tuple[tuple[int, tuple[object, ...]], ...]:
+    """Extract the AFD FFN graph hashable key from DP metadata.
 
-    key_parts: list[tuple[int, tuple]] = []
+    ``uniform_padding`` selects the NPU CAMP2p row-count semantics: the
+    Attention side pads every rank to the largest count, so each FFN rank
+    receives ``uniform * group_size`` rows.  The default keeps the GPU
+    contiguous-grouping sum.
+    """
+
+    key_parts: list[tuple[int, tuple[object, ...]]] = []
     for stage_idx, metadata in sorted(dp_metadata_list.items()):
         values = getattr(metadata, "num_tokens_across_dp_cpu", None)
+        values_tuple: tuple[object, ...]
         if values is None:
-            if _use_ffn_aggregated_key(attention_size, ffn_size):
+            if (
+                _use_ffn_aggregated_key(attention_size, ffn_size)
+                and ffn_size is not None
+            ):
                 values_tuple = tuple(
                     max(1, int(fallback)) for _ in range(int(ffn_size))
                 )
             else:
                 values_tuple = (repr(metadata),)
         else:
-            values_tuple = _metadata_values_tuple(values)
-            if _use_ffn_aggregated_key(attention_size, ffn_size):
+            counts = _metadata_values_tuple(values)
+            values_tuple = counts
+            if (
+                _use_ffn_aggregated_key(attention_size, ffn_size)
+                and attention_size is not None
+                and ffn_size is not None
+            ):
                 values_tuple = _aggregate_ffn_values_tuple(
-                    values_tuple,
-                    attention_size=int(attention_size),
-                    ffn_size=int(ffn_size),
+                    counts,
+                    attention_size=attention_size,
+                    ffn_size=ffn_size,
                     fallback=int(fallback),
+                    uniform_padding=uniform_padding,
                 )
         key_parts.append((int(stage_idx), values_tuple))
     return tuple(key_parts)
@@ -157,9 +174,9 @@ def _metadata_values_tuple(values: object) -> tuple[int, ...]:
     elif hasattr(values, "item"):
         values = [values.item()]
     try:
-        return tuple(int(value) for value in values)
+        return tuple(int(value) for value in values)  # type: ignore[attr-defined]
     except TypeError:
-        return (int(values),)
+        return (int(values),)  # type: ignore[call-overload]
 
 
 def _use_ffn_aggregated_key(
@@ -180,6 +197,7 @@ def _aggregate_ffn_values_tuple(
     attention_size: int,
     ffn_size: int,
     fallback: int,
+    uniform_padding: bool = False,
 ) -> tuple[int, ...]:
     # Expand DP-level values to AFD-level when TP > 1.
     # With TP > 1, attention_size = num_attention_ranks includes TP workers
@@ -193,6 +211,15 @@ def _aggregate_ffn_values_tuple(
     if len(expanded) < attention_size:
         return tuple(max(1, int(fallback)) for _ in range(ffn_size))
     group_size = attention_size // ffn_size
+    if uniform_padding and group_size > 1:
+        # N:1 mapping with uniform padding (NPU CAMP2p): the Attention side
+        # pads every rank up to the largest count across all Attention
+        # ranks, so every FFN rank receives ``uniform * group_size`` rows.
+        # Must stay in sync with the NPU runner's token aggregation: a
+        # replayed graph must have been captured for exactly the row count
+        # the current step produces.
+        uniform = max(1, max(expanded))
+        return tuple(uniform * group_size for _ in range(ffn_size))
     return tuple(
         max(1, sum(expanded[idx * group_size : (idx + 1) * group_size]))
         for idx in range(ffn_size)

@@ -467,7 +467,20 @@ def apply_async_dp_engine_patch() -> bool:
     EngineCoreProc.run_engine_core = staticmethod(run_engine_core)
     engine_utils_module.launch_core_engines = launch_core_engines
     core_client_module.launch_core_engines = launch_core_engines
-    DPAsyncMPClient.add_request_async = add_request_async
+    # Re-anchor main@544f182d: the newer DP client dropped the FIRST_REQ
+    # wave wakeup from add_request_async entirely (route-and-forward only),
+    # so stock behavior already matches AFD's skip requirement — and the
+    # 0.30-generation override would break every request on a socket
+    # attribute that no longer exists. Install it only where the wakeup
+    # still lives.
+    import inspect
+
+    try:
+        _stock_src = inspect.getsource(DPAsyncMPClient.add_request_async)
+    except (OSError, TypeError):
+        _stock_src = ""
+    if "FIRST_REQ" in _stock_src:
+        DPAsyncMPClient.add_request_async = add_request_async
     engine_core_module.logger.debug("AFD async-DP engine patch applied")
     return True
 

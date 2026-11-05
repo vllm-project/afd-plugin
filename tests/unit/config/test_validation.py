@@ -509,7 +509,13 @@ _GPU_GRAPH = {
             {"par.decode_context_parallel_size": 2}, _err("PP or CP"), id="reject-dcp"
         ),
         pytest.param(
-            {"par.enable_elastic_ep": True}, _err("static expert"), id="reject-elastic"
+            # Elastic AFD attention is the PR's supported configuration; the
+            # validator gates on the same predicate as the boot/executor
+            # seams. Full topology validity still fails fast earlier, in
+            # create_engine_config's validate_elastic_config.
+            {"par.enable_elastic_ep": True},
+            None,
+            id="accept-elastic-attention",
         ),
         pytest.param(
             {"par.enable_eplb": True}, _err("static expert"), id="reject-eplb"
@@ -687,6 +693,12 @@ _NPU_GRAPH = {
             {**_NPU_ASYNC, "par.enable_elastic_ep": True},
             _err("static expert"),
             id="reject-async-cam-elastic",
+        ),
+        pytest.param(
+            # Elastic EP is supported on the sync CAMP2p data plane.
+            {**_NPU_SYNC, "par.enable_elastic_ep": True},
+            None,
+            id="accept-sync-elastic",
         ),
         pytest.param(
             {**_NPU_ASYNC, "par.enable_eplb": True},

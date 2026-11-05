@@ -136,6 +136,36 @@ def test_make_ffn_graph_key_can_aggregate_attention_counts_to_ffn_counts():
     ) == ((0, (24, 24, 24, 24)),)
 
 
+def test_make_ffn_graph_key_uniform_padding_matches_camp2p_rows():
+    """NPU CAMP2p: every FFN rank receives uniform * group_size rows.
+
+    The Attention side pads every rank to the largest count, so uneven
+    counts (1, 5, 1, 5) give every FFN rank 5 * 2 = 10 rows, not the
+    contiguous-group sums (6, 6) used by the GPU mapping.
+    """
+    metadata = SimpleNamespace(num_tokens_across_dp_cpu=[1, 5, 1, 5])
+
+    assert make_ffn_graph_key(
+        {0: metadata},
+        attention_size=4,
+        ffn_size=2,
+        fallback=24,
+        uniform_padding=True,
+    ) == ((0, (10, 10)),)
+
+
+def test_make_ffn_graph_key_uniform_padding_keeps_ratio_one_identity():
+    metadata = SimpleNamespace(num_tokens_across_dp_cpu=[3, 7])
+
+    assert make_ffn_graph_key(
+        {0: metadata},
+        attention_size=2,
+        ffn_size=2,
+        fallback=24,
+        uniform_padding=True,
+    ) == ((0, (3, 7)),)
+
+
 # --- TP expansion tests ---
 
 

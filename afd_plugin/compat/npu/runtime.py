@@ -102,6 +102,21 @@ def apply_afd_ascend_patches_if_needed() -> None:
         raise RuntimeError(
             "AFD NPU MLA graph patch requires the vLLM-Ascend MLA resolver",
         )
+    # Imported only once the earlier patches have succeeded: the stateless-PG
+    # module binds torch at import, and the CPU-only unit host must still be
+    # able to exercise the config and MLA seams above (see the ImportError
+    # retry contract in tests/unit/compat/test_runtime.py).
+    from afd_plugin.compat.patches.npu.stateless_pg import (
+        apply_afd_stateless_pg_patches,
+    )
+
+    # Elastic AFD on an unmodified ascend tree: stateless HCCL PG hook,
+    # communicator routing, parallel-state guard and worker seams.
+    if not apply_afd_stateless_pg_patches():
+        raise RuntimeError(
+            "AFD NPU stateless-PG patches require the vLLM-Ascend "
+            "NPUWorker/NPUCommunicator seams (see stateless_pg.py anchors)",
+        )
     _PATCHES_APPLIED = True
 
 

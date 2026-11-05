@@ -201,12 +201,16 @@ def test_npu_ffn_runner_executes_eager_ffn_step(monkeypatch):
     ("attention_counts", "ffn_counts"),
     [
         ([[6], [7]], [[6], [7]]),
-        ([[2, 3, 5, 7], [3, 8, 1, 7]], [[7, 10], [4, 15]]),
+        # Elastic CAMP2p uniform-row contract: the Attention side pads every
+        # rank to the group max (send_attn_output), so each FFN rank consumes
+        # fan-in * max rows per stage -- not the old strided pairwise sum.
+        # Hardware-verified on 4A2F (attention 2->4, N:1=2:1 fanout).
+        ([[2, 3, 5, 7], [3, 8, 1, 7]], [[14, 14], [16, 16]]),
     ],
 )
 def test_npu_ffn_runner_builds_forward_context_for_each_dbo_stage(
     monkeypatch, attention_counts, ffn_counts
-):  # long-test: native Ascend context consumes distinct stage token counts
+):  # long-test: native Ascend context consumes per-stage uniform row counts
     _require_npu_runtime()
     from afd_plugin.v1.worker.npu import ffn_model_runner
 
