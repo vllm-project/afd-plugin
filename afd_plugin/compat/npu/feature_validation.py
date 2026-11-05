@@ -254,7 +254,7 @@ def _fail_if_unsupported_npu_afd_async_features(
         ):
             raise RuntimeError(
                 "CAMAsyncAFDConnector does not support native draft models or MTP; "
-                "only DSV4 DSpark eager is supported",
+                "only DSV4 DSpark is supported",
             )
 
     factor_value = os.environ.get("BATCH_SIZE_FACTOR", "1")
