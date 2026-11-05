@@ -226,6 +226,16 @@ _NATIVE_COMM_BY_AFD: dict[type, type] = {
 }
 
 
+def _afd_types_by_comm_type() -> dict[object, type]:
+    """Map the runtime comm type to the AFD class that owns its prepare stage."""
+    from vllm_ascend.ascend_forward_context import MoECommType
+
+    return {
+        MoECommType.ALLGATHER: AFDAllGatherCommImpl,
+        MoECommType.MC2: AFDMC2CommImpl,
+    }
+
+
 def _prebuilt_comms(moe_config) -> dict[type, object]:
     """Build the AFD comm instances the native selector can pick from.
 
@@ -266,7 +276,19 @@ class AFDExternalRoutingMoE:
                 "configuration; the ALLGATHER and MC2 paths are the supported ones",
             )
 
-    def _comm_for(self, native_comm):
+    def _comm_for(self, comm_type, native_comm):
+        if native_comm is None:
+            # The MRV2 hook resolves the method without a config, which misses the
+            # (type, expert-count) registry key and leaves the instance unset. The
+            # comm type is always present, so fall back to it.
+            afd_type = _afd_types_by_comm_type().get(comm_type)
+            afd_comm = self._candidates.get(afd_type) if afd_type is not None else None
+            if afd_comm is not None:
+                return afd_comm
+            raise RuntimeError(
+                "DSV4 external routing could not resolve the MoE comm method for "
+                f"{comm_type} with this layer's config; no AFD candidate was built",
+            )
         for afd_type, afd_comm in self._candidates.items():
             if isinstance(native_comm, _NATIVE_COMM_BY_AFD[afd_type]):
                 return afd_comm
@@ -285,9 +307,9 @@ class AFDExternalRoutingMoE:
         from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
         experts = self.routed_experts
-        comm = self._comm_for(_EXTRA_CTX.moe_comm_method)
-        prepare_finalize = comm.prepare_finalize
         previous_comm = _EXTRA_CTX.moe_comm_method
+        comm = self._comm_for(_EXTRA_CTX.moe_comm_type, previous_comm)
+        prepare_finalize = comm.prepare_finalize
 
         try:
             # Scope switch, not a registry change: expert execution reads the comm

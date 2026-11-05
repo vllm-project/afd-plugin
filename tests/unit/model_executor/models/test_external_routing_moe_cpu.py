@@ -150,6 +150,7 @@ def _install_stub_modules():
     context = enum_module
     context._EXTRA_CTX = types.SimpleNamespace(
         moe_comm_method=_AllGatherComm(_moe_config()),
+        moe_comm_type=_MoECommType.ALLGATHER,
         mc2_mask=torch.ones(8, dtype=torch.bool),
         padded_num_tokens=0,
         max_tokens_across_dp=0,
@@ -261,7 +262,7 @@ def test_only_allgather_reduces_during_finalize(loaded, comm_cls, reduces):
         topk_ids=torch.zeros(4, 1, dtype=torch.int32),
         topk_weights=torch.ones(4, 1),
     )
-    afd_comm = component._comm_for(comm)
+    afd_comm = component._comm_for(context._EXTRA_CTX.moe_comm_type, comm)
     assert afd_comm.finalized[-1]["reduce_results"] is reduces
 
     # finalize runs after the per-token state is cleared; record what it saw
@@ -374,7 +375,7 @@ def test_a_failure_during_prepare_clears_state_and_restores_comm(loaded):
     def exploding_prepare(*args, **kwargs):
         raise RuntimeError("prepare failed")
 
-    component._comm_for(native).prepare_finalize.prepare_external = exploding_prepare
+    component._comm_for(context._EXTRA_CTX.moe_comm_type, native).prepare_finalize.prepare_external = exploding_prepare
     with pytest.raises(RuntimeError, match="prepare failed"):
         component.forward(
             torch.zeros(4, 2),
@@ -407,3 +408,20 @@ def test_a_missing_mc2_candidate_still_serves_allgather(loaded):
         assert experts.seen, "the allgather candidate was not used"
     finally:
         comm_module.get_moe_comm_method = original
+
+
+def test_the_comm_type_resolves_when_the_context_instance_is_unset(loaded):
+    """MRV2 can leave moe_comm_method unset; the comm type is always present."""
+    module, context, _ = loaded
+    experts = _Experts()
+    context._EXTRA_CTX.moe_comm_type = _MoECommType.ALLGATHER
+    context._EXTRA_CTX.moe_comm_method = None
+
+    component = module.AFDExternalRoutingMoE(experts)
+    component.forward(
+        torch.zeros(4, 2),
+        topk_ids=torch.zeros(4, 1, dtype=torch.int32),
+        topk_weights=torch.ones(4, 1),
+    )
+    assert experts.seen, "expert execution did not run"
+    assert context._EXTRA_CTX.moe_comm_method is None, "the unset instance was not restored"
