@@ -14,7 +14,6 @@ from afd_plugin.config import (
     is_afd_async_dp,
     parse_afd_config,
 )
-from afd_plugin.envs import async_cam_layered_gmm_enabled
 from afd_plugin.validation import cam_receive_capacity, requested_ffn_mode
 
 if TYPE_CHECKING:
@@ -31,17 +30,11 @@ def fail_if_unsupported_npu_afd_features(
     """Fail fast for NPU AFD settings that are not currently supported."""
 
     afd_config = afd_config or parse_afd_config(vllm_config)
-    layered_gmm_requested = async_cam_layered_gmm_enabled()
-    if layered_gmm_requested and (
-        afd_config.role != "ffn" or afd_config.connector != AFD_ASYNC_CONNECTOR
-    ):
-        raise RuntimeError(
-            "AFD_ASYNC_CAM_LAYERED_GMM requires the async CAM FFN role; "
-            f"got role={afd_config.role!r}, connector={afd_config.connector!r}"
-        )
     is_dsv4 = _is_dsv4_target(vllm_config)
-    if layered_gmm_requested and not is_dsv4:
-        raise RuntimeError("AFD_ASYNC_CAM_LAYERED_GMM supports only DeepSeek V4")
+    if afd_config.connector == AFD_ASYNC_CONNECTOR and not is_dsv4:
+        raise RuntimeError(
+            "Async CAM requires DeepSeek V4 with layered W4A8/W8A8 FFN experts"
+        )
     from afd_plugin.connectors.factory import AFDConnectorFactory
 
     extra_info = AFDConnectorFactory.parse_connector_extra_info(
@@ -182,7 +175,6 @@ def _fail_if_unsupported_npu_afd_async_features(
             raise RuntimeError("ffn_two_stream may only be enabled on the FFN role")
         if (
             not vllm_config.use_v2_model_runner
-            or not async_cam_layered_gmm_enabled()
             or not afd_config.compute_gate_on_attention
             or extra_info.dynamic_quant != 1
             or parallel_config.tensor_parallel_size != 1
@@ -224,14 +216,6 @@ def _fail_if_unsupported_npu_afd_async_features(
         ):
             raise RuntimeError(
                 "Async CAM DBO does not support PP, CP or speculative decoding"
-            )
-        if not _is_dsv4_target(vllm_config) and (
-            vllm_config.model_config.hf_text_config.model_type
-            not in {"deepseek_v2", "deepseek_v3"}
-            or not vllm_config.model_config.use_mla
-        ):
-            raise RuntimeError(
-                "Async CAM DBO requires DeepSeek-V2/V3 MLA or DeepSeek-V4"
             )
     speculative_config = vllm_config.speculative_config
     if speculative_config is not None:
@@ -307,15 +291,6 @@ def _fail_if_unsupported_npu_afd_async_features(
             raise RuntimeError(
                 "AFD NPU ModelRunnerV2 Async CAM requires max_num_batched_tokens "
                 "divisible by attn_ranks_per_dp",
-            )
-        model_config = vllm_config.model_config
-        if not _is_dsv4_target(vllm_config) and (
-            model_config.hf_text_config.model_type not in {"deepseek_v2", "deepseek_v3"}
-            or not model_config.use_mla
-        ):
-            raise RuntimeError(
-                "AFD NPU ModelRunnerV2 Async CAM requires DeepSeek-V2/V3 MLA "
-                "or DeepSeek-V4",
             )
         additional_config = vllm_config.additional_config
         if additional_config.get("enable_shared_expert_dp", False) or any(

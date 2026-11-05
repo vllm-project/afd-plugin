@@ -204,11 +204,10 @@ runtime integration and are not stable third-party extension interfaces.
 
 ## Environment boundary
 
-`afd_plugin.envs` exports boolean helpers for `AFD_FORCE_BALANCED_TOPK_IDS`
-and `AFD_ASYNC_CAM_LAYERED_GMM`. Profiling and connector diagnostics are read
+`afd_plugin.envs` exports a boolean helper for `AFD_FORCE_BALANCED_TOPK_IDS`.
+Profiling and connector diagnostics are read
 by their owning modules. Environment switches do not replace `additional_config["afd"]` as the
-activation or topology channel. The layered-GMM switch is FFN-only and
-applies to the DeepSeek-V4 Async CAM path. See the
+activation or topology channel. See the
 [runtime matrix](execution_platforms.md#tested-runtime-matrix) for hardware
 validation scope.
 

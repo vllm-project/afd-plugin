@@ -53,8 +53,7 @@ accuracy. The recorded Lite two-stage result does not qualify every Async CAM
 DBO configuration. For broader qualification, run model comparisons at
 Attention DP1 and DP > 1, plain TP and model SP, with
 uneven prefill lengths and requests crossing child boundaries. Enable DBO on
-Attention only and enable chunked prefill for DeepSeek-V2/V3. Keep two ubatches
-and eager execution.
+Attention only. Keep two ubatches and eager execution.
 
 For synchronous MRV2 CAMP2P, include eager two-stage execution at Attention
 DP > 1, many-to-one padding, and graph+DBO. Plain MLA graph+DBO requires
@@ -141,8 +140,9 @@ own activation shape. Read that section before changing a tolerance or adding a
 case: the tiling cache is keyed on shape and tiling key, and the two attributes
 reach the tiling only as data.
 
-For end-to-end validation, toggle `AFD_ASYNC_CAM_LAYERED_GMM=0/1` with the same
-W4A8 checkpoint and deployment configuration. Record the processed parameter
+For end-to-end validation, compare the layered path with a recorded legacy-path
+baseline from an earlier revision, using the same W4A8 or W8A8 checkpoint and
+deployment configuration. Record the processed parameter
 shapes, dtypes, and formats; software versions; actual-path startup logs;
 accuracy; peak memory; and profiler traces. Cover completion on empty ranks,
 multiple chunks of one layer, interleaved DP work, and async CAM ubatching.

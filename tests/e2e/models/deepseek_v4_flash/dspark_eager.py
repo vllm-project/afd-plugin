@@ -55,17 +55,14 @@ def assert_dispatch(before: dict, after: dict, ffn_ranks: int = 4) -> None:
         assert state["draft_wire_layer_ids"] == [43, 44, 45], state
         assert state["owns_routed_experts"], state
         assert not state["owns_attention"] and not state["owns_shared_experts"], state
-        if state["ffn_execution"] == "layered":
-            assert state["executor_layer_ids"] == list(range(46)), state
+        assert state["ffn_execution"] == "layered", state
+        assert state["executor_layer_ids"] == list(range(46)), state
         if state["ffn_mode"] == "full":
             assert state["graph_capture_count"] == 1, state
             assert state["graph_replay_count"] > before[name]["graph_replay_count"], (
                 state
             )
-        required_layers = (
-            range(46) if state["ffn_execution"] == "layered" else (43, 44, 45)
-        )
-        for layer in required_layers:
+        for layer in range(46):
             key = str(layer)
             old = before[name]["submitted_returns"].get(key, 0)
             assert state["submitted_returns"].get(key, 0) > old, (name, layer, state)

@@ -11,10 +11,9 @@ Current runtime constraints and validation evidence are summarized in the
 [runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix).
 
 > [!WARNING]
-> CAM async is experimental. DeepSeek-V2-Lite native two-stage execution has
-> a 100-question target-device accuracy result, with a graceful-exit failure.
-> V4 true DBO boundary qualification and performance remain unverified. See
-> the [0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507) for the precise scope.
+> CAM async is experimental. V4 true DBO boundary qualification and performance
+> remain unverified. The [0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507)
+> describes historical results and their limitations.
 
 ## When to use this connector
 
@@ -45,7 +44,7 @@ Attention uses native Ascend ModelRunnerV2; FFN uses the independent
 
 The V2 Async CAM contract is:
 
-- registered DeepSeek-V2/V3 MLA or DeepSeek-V4 models;
+- DeepSeek-V4 with homogeneous W4A8 or W8A8 routed experts on Ascend 910C/A3;
 - `--enforce-eager` on Attention and `--enable-expert-parallel` on both roles, with
   `async_dp=true` and `compute_gate_on_attention=true`;
 - on FFN, select eager with `--enforce-eager`; for FULL, omit `--enforce-eager`
@@ -59,21 +58,14 @@ The V2 Async CAM contract is:
 
 Attention-local FlashComm1/SP is supported. Set
 `VLLM_ASCEND_ENABLE_FLASHCOMM1=1` only on Attention and `0` on FFN.
-DeepSeek-V2/V3 Attention with effective model SP automatically selects Ascend
-shared-expert DP: shared weights are replicated per rank, which computes its
-local tokens. Without model SP, this automatic override is not applied.
-Attention TP/SP and routed-expert parallelism are unchanged. MRV2 rejects
-explicit `enable_shared_expert_dp=true` and finegrained TP configuration.
-Use `--block-size=128` for V2-Lite MLA Attention; for V4,
-use the model-specific settings in the
+MRV2 rejects explicit `enable_shared_expert_dp=true` and finegrained TP
+configuration. Use the model-specific settings in the
 [DSV4 E2E profiles](../../tests/e2e/models/deepseek_v4_flash/config.py).
 
 At every Attention DP size, `--enable-dbo` uses native child preparation,
 per-ubatch model forwards, and output merge. Native
-splitting can divide one request across microbatches. For DeepSeek-V2/V3, pass
-`--enable-chunked-prefill` so a request crossing the microbatch boundary can
-attend to its prefix KV. Native draft-model/MTP paths are also
-unsupported.
+splitting can divide one request across microbatches. Native draft-model/MTP
+paths other than DeepSeek-V4 DSpark are unsupported.
 
 ## CAM async data flow
 
@@ -200,7 +192,7 @@ including `async_dp`; enable DBO through the Attention CLI flags below.
 
 | Field | Type | Default | Meaning and constraint |
 | --- | --- | --- | --- |
-| `dynamicQuant` | `int` | `0` | Enables CAM dispatch/combine dynamic-quant metadata. Only `0` and `1` are accepted. With `1`, FFN receives quantized routed activations plus scale tensors and must return output compatible with combine-send. |
+| `dynamicQuant` | `int` | `0` | Set to `1`: FFN receives dynamically quantized routed activations and scale tensors. The default `0` is not supported by the layered FFN path. |
 | `attn_ranks_per_dp` | `int` | `1` | Positive Attention TP rank count per DP replica. It is the CAM Attention grouping width and is independent of the FFN process's local TP size. |
 | `hccl_buffer_size` | `int` | unset | Positive CAM HCCL buffer size in MB. The override applies only to the `afd_async_cam` communication domain. When unset, HCCL uses `HCCL_BUFFSIZE`, then its built-in default. Configure the same value on every Attention and FFN rank in the domain. |
 | `ffn_two_stream` | `bool` | `false` | Experimental FFN-only receive/compute and send streams with two slots. Requires an eligible layered MRV2 executor; eager and FULL are supported in code, with NPU qualification pending. |
@@ -224,8 +216,7 @@ consumes expert-routed CAM work items and may independently use TP1.
 
 ### vLLM native DBO
 
-For eager DeepSeek-V2/V3 MLA or DeepSeek-V4 Attention at any DP size, enable
-native DBO explicitly:
+For eager DeepSeek-V4 Attention at any DP size, enable native DBO explicitly:
 
 ```text
 --enable-dbo
@@ -277,8 +268,7 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 The loader configures the packaged `afd-plugin` vendor directory and loads
 `afd_plugin._C_ascend`. No external CAM wheel or vendor library is required.
 Async CAM sends routed experts only. Attention owns shared MLP weights and
-computes shared outputs in the model's token layout. DeepSeek-V2/V3 with
-effective model SP selects replicated shared weights. DeepSeek-V4 preserves
+computes shared outputs in the model's token layout. DeepSeek-V4 preserves
 the native shared-expert policy through `AFDDeepseekV4SharedExperts`, including
 all-gather/reduce-scatter for TP-sharded weights with SP and all-reduce without
 SP. Replicated weights use local SP tokens or split/gather full tokens. Shared
@@ -319,25 +309,27 @@ actual vendor library path. Missing source operators fail startup.
 For startup, HCCL, CAM operator, and shutdown failures, see the
 [NPU troubleshooting guide](TROUBLESHOOTING.md).
 
-## W4A8 and W8A8 layered GMM (experimental, disabled by default)
+## W4A8 and W8A8 layered GMM
 
-Set `AFD_ASYNC_CAM_LAYERED_GMM=1` on every FFN rank to use the two layered GMM
-operators for compatible W4A8 or W8A8 routed experts. Leave it unset on Attention
-ranks; enabling it on another role or connector fails at startup. The startup
-log must show `actual=layered` to confirm that the new path is active.
+Async CAM FFN always uses the two layered GMM operators. FFN startup logs the
+quantization, layer count and layout as `Async CAM layered GMM`.
 
-```bash
-# Use the same checkpoint, topology, capacity, and requests for both runs.
-AFD_ASYNC_CAM_LAYERED_GMM=0 bash /path/to/W4A8-FFN-launch-script.sh
-AFD_ASYNC_CAM_LAYERED_GMM=1 bash /path/to/W4A8-FFN-launch-script.sh
-```
+### Migration from the legacy FFN path
+
+Remove `AFD_ASYNC_CAM_LAYERED_GMM` from all launch environments; the selector
+has been removed and setting it to `0` no longer selects the old path.
+DeepSeek-V2 and V2-Lite, including BF16 checkpoints, no longer support Async
+CAM because their FFN weights do not implement the layered contract. The
+standard DeepSeek-V3.2 architecture was already rejected by model validation and
+remains unsupported. Other connectors keep their own model support boundaries.
+Deployments needing the old Async CAM path must remain on an earlier revision.
 
 The intended configuration is Ascend 910C / `ascend910_93`, async CAM FFN,
 Attention-side gate, `dynamicQuant=1`, eager execution (or the separately
 qualified FFN FULL mode), and static expert
 placement. `VLLM_USE_V2_MODEL_RUNNER=1` is required on both roles; FFN uses
 its independent connector-driven runner. This path applies only to Ascend DeepSeek V4;
-enabling the switch for another model fails at startup. All remote MoE layers must share geometry,
+other models fail validation. All remote MoE layers must share geometry,
 SiLU activation, quantization layout, and scaling semantics. The extractor
 can represent per-channel and per-group parameters, but the pinned Ascend
 loader rejects positive `group_size`; the current target is limited to
@@ -360,14 +352,14 @@ existing native DR and CS operators. See
 [resource lifetime](ASYNC_FFN_RUNTIME.md#resource-lifetime) for completion and
 process-cleanup requirements.
 Missing W4A8 `w13_scale_bias` or `w2_scale_bias`, dynamic EPLB, non-SiLU
-activation, or incompatible parameters fail before receiving work. Other quantizations,
-mixed-quantization, and heterogeneous layers stay on the legacy path with a
-startup reason. Do not synthesize missing W4A8 compensation parameters.
+activation, incompatible parameters, other quantizations, mixed quantization,
+and heterogeneous layers fail startup with a reason. Do not synthesize missing
+W4A8 compensation parameters.
 
-The new path uses the full dispatch-recv capacity and device expert counts. A
+The layered path uses the full dispatch-recv capacity and device expert counts. A
 slice of the original metadata, or a device mapping, selects the layer; the
 original metadata goes to combine-send. Empty ranks, chunks, and ubatches use
-the existing communication protocol. With `AFD_CAM_OP_IO_LOG` enabled, the new
+the existing communication protocol. With `AFD_CAM_OP_IO_LOG` enabled, the
 path logs only Tensor shape, dtype, and device without reading metadata values.
 The Async eager worker synchronizes after each complete FFN layer loop; FULL
 submits a bounded batch on one stream and waits once for that batch. These
@@ -377,16 +369,15 @@ enough for every whole-expert chunk.
 
 CPU contract tests cover layer mapping, repeated layer IDs, capacity, zero
 counts, parameter rejection, startup selection, and the absence of explicit
-metadata D2H in the new Python path. They do not establish NPU numerical
+metadata D2H in the Python path. They do not establish NPU numerical
 accuracy, empty-work completion, hidden synchronization, or a performance gain.
 Run the compiled Meta and NPU numerical tests described in the
 [testing guide](TESTING.md#layered-w4a8-validation) and the
 [FULL runtime checks](ASYNC_FFN_RUNTIME.md#validation). Deployments require
 target-device validation of completion, checkpoint accuracy and performance.
 
-To revert, set `AFD_ASYNC_CAM_LAYERED_GMM=0` and restart the FFN processes.
-When switching from FULL to legacy eager, also pass `--enforce-eager` explicitly
-before restarting FFN.
+To switch from FULL to layered eager, pass `--enforce-eager` before restarting
+FFN.
 For performance runs, disable `AFD_CAM_OP_IO_LOG` and
 `AFD_FORCE_BALANCED_TOPK_IDS`, retain the actual-path startup log, and measure
 the existing group synchronization separately.

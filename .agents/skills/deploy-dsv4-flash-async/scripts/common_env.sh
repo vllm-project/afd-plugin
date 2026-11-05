@@ -347,7 +347,7 @@ configure_bench_identity() {
     legacy | afd_*)
       attention_dbo=${PREFILL_ENABLE_DBO}
       ffn_graph=${PREFILL_FFN_GRAPH_MODE}
-      layered_gmm=${AFD_ASYNC_CAM_LAYERED_GMM:-0}
+      layered_gmm=1
       prefill_threshold=${PREFILL_DBO_PREFILL_TOKEN_THRESHOLD:-native-default}
       decode_threshold=${PREFILL_DBO_DECODE_TOKEN_THRESHOLD:-native-default}
       ;;

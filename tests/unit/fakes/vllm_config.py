@@ -117,7 +117,7 @@ def async_moe_config(
     num_ubatches=2,
     **extra_config,
 ):
-    return npu_vllm_config(
+    config = npu_vllm_config(
         role=role,
         connector="CAMAsyncAFDConnector",
         use_mla=True,
@@ -132,9 +132,12 @@ def async_moe_config(
         num_ubatches=num_ubatches,
         extra_config={
             "attn_ranks_per_dp": tensor_parallel_size,
+            "dynamicQuant": 1,
             **extra_config,
         },
     )
+    config.model_config.hf_text_config.model_type = "deepseek_v4"
+    return config
 
 
 # DeepEP M2N connector tests: Qwen3-30B-A3B MoE shapes.

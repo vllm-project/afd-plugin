@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -73,7 +72,6 @@ def harness(monkeypatch):
         0,
     )
     connector._initialized = True
-    monkeypatch.setenv("AFD_ASYNC_CAM_LAYERED_GMM", "0")
     monkeypatch.setattr(runtime, "create_afd_npu_profiler", lambda role: None)
     runner = runtime.AsyncNPUFFNModelRunner(cfg, torch.device("cpu"), connector)
     runner.layer_ids = (2, 5)
@@ -84,22 +82,12 @@ def harness(monkeypatch):
         calls.append("receive")
         return payloads.popleft()
 
-    def compute(**kwargs):
-        calls.append(("compute", kwargs["layer_idx"], kwargs["hidden_states"].shape[0]))
-        return kwargs["hidden_states"].to(torch.bfloat16)
-
     def send(output, context, **kwargs):
         calls.append(("send", context.states.token_nums_rankid_layeridx))
 
-    @contextmanager
-    def forward(**kwargs):
-        yield SimpleNamespace(dp_metadata=None, additional_kwargs={})
-
     monkeypatch.setattr(connector, "recv_attn_output", receive)
     monkeypatch.setattr(connector, "send_ffn_output", send)
-    monkeypatch.setattr(runtime, "ascend_forward_context", forward)
-    monkeypatch.setattr(runtime, "_set_moe_layer_index", lambda *args: None)
-    runner.model = SimpleNamespace(compute_ffn_output=compute)
+    runner.model = SimpleNamespace()
     return SimpleNamespace(
         runner=runner, connector=connector, calls=calls, payloads=payloads
     )
@@ -117,34 +105,27 @@ def payload(layer, rows):
     )
 
 
-@pytest.mark.parametrize("layered", [False, True])
-def test_eager_preserves_layer_loop_device_metadata_and_return_headers(
-    harness, layered
-):
+def test_eager_preserves_layer_loop_device_metadata_and_return_headers(harness):
     h = harness
     first, zero = payload(5, 3), payload(2, 0)
     h.payloads.extend((first, zero))
     observed = []
-    if layered:
 
-        def execute(hidden, scales, groups, header):
-            observed.append((groups, header))
-            return hidden.to(torch.bfloat16)
+    def execute(hidden, scales, groups, header):
+        observed.append((hidden.shape[0], groups, header))
+        return hidden.to(torch.bfloat16)
 
-        h.runner._layered_executor = execute
+    h.runner._layered_executor = execute
     assert h.runner.execute_connector_driven_step()
-    computed = [
-        call for call in h.calls if isinstance(call, tuple) and call[0] == "compute"
+    assert [(rows, int(header[2])) for rows, _, header in observed] == [
+        (8, 5),
+        (8, 2),
     ]
-    assert computed == ([] if layered else [("compute", 5, 3), ("compute", 2, 0)])
-    if layered:
-        assert [int(header[2]) for _, header in observed] == [5, 2]
     returned = [
         call[1] for call in h.calls if isinstance(call, tuple) and call[0] == "send"
     ]
     assert returned[0] is first.context.states.token_nums_rankid_layeridx
     assert returned[1] is zero.context.states.token_nums_rankid_layeridx
-    assert h.runner._graph is None
 
 
 @pytest.mark.parametrize("fail", [False, True])

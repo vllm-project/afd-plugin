@@ -93,9 +93,24 @@ def test_mixed_requested_modes_are_not_silently_downgraded():
         resolve_ffn_mode([full_plan(), FFNGraphPlan()])
 
 
-def test_unsupported_full_rejects_without_automatic_fallback():
+@pytest.mark.parametrize("mode", ["eager", "full"])
+def test_unsupported_executor_rejects_without_automatic_fallback(mode):
+    plan = full_plan(requested=mode)
     with pytest.raises(ValueError, match="unsupported executor"):
-        resolve_ffn_mode([full_plan(), full_plan(graph_error="unsupported executor")])
+        resolve_ffn_mode([plan, replace(plan, executor_error="unsupported executor")])
+
+
+@pytest.mark.parametrize("mode", ["eager", "full"])
+def test_executor_error_reaches_all_attention_and_ffn_ranks(mode):
+    owners = startup_world()
+    plan = full_plan(requested=mode)
+    failed = replace(plan, executor_error="unsupported FFN weights")
+    errors = negotiate(owners, [None, None, plan, failed], ["same-wire"] * 4)
+    assert all(
+        isinstance(error, (ValueError, RuntimeError))
+        and "unsupported FFN weights" in str(error)
+        for error in errors
+    ), errors
 
 
 @pytest.mark.parametrize(
@@ -105,15 +120,17 @@ def test_unsupported_full_rejects_without_automatic_fallback():
         ({"layer_ids": (2, 6)}, "layer tables"),
     ],
 )
-def test_full_rejects_incompatible_layout(changes, message):
+@pytest.mark.parametrize("mode", ["eager", "full"])
+def test_rejects_incompatible_layout_in_both_execution_modes(changes, message, mode):
+    plan = full_plan(requested=mode)
     with pytest.raises(ValueError, match=message):
-        resolve_ffn_mode([full_plan(), full_plan(**changes)])
-    assert resolve_ffn_mode([FFNGraphPlan(graph_error="not graph capable")]) == "eager"
+        resolve_ffn_mode([plan, replace(plan, **changes)])
 
 
-def test_empty_graph_signature_cannot_advertise_support():
+@pytest.mark.parametrize("mode", ["eager", "full"])
+def test_empty_executor_signature_cannot_advertise_support(mode):
     with pytest.raises(ValueError, match="loaded executor"):
-        resolve_ffn_mode([full_plan(signature="")])
+        resolve_ffn_mode([full_plan(requested=mode, signature="")])
 
 
 @pytest.mark.parametrize("mode", ["eager", "full"])

@@ -39,7 +39,7 @@ validation_paths:
   - "tests/e2e/models/deepseek_v4_flash/ffn_graph.py"
   - "tests/unit/compat/patches/test_engine_core.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
-  - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
 upstream_refs:
   - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
@@ -213,10 +213,10 @@ flowchart TD
     CONTROL --> FLAGS{"Profile, warmup, capture, replay, or eager?"}
     FLAGS --> GRAPH["Prepare graph state or eager context"]
     GRAPH --> RECEIVE["Receive Attention payload"]
-    CONTROL_PLANE -->|is None| WORK["Block on AFDAsyncFFNWorkItem"]
-    WORK --> CONTEXT["Build minimal forward context"]
+    CONTROL_PLANE -->|is None| WORK["Receive CAM payload"]
     RECEIVE --> COMPUTE["Role-aware FFN compute"]
-    CONTEXT --> COMPUTE
+    WORK --> LAYERED["Layered FFN compute on device"]
+    LAYERED --> SEND
     COMPUTE --> SEND["Send result to Attention"]
     SEND --> START
 ```
@@ -243,21 +243,12 @@ The Ascend worker checks `connector.control_plane`. When it is `None`, as for
 CAM async, the worker calls `execute_connector_driven_step()` instead of a
 control-plane receive. For each layer, the runner:
 
-1. receives a normalized `AFDAsyncFFNWorkItem` from
-   `connector.recv_ffn_work_item(...)`; CAM metadata supplies the actual layer
-   index and compact expert interval; counts.sum() supplies this chunk’s routed token count, and the connector slices tensors
-   from operator capacity down to those counts;
-2. builds a single-stage forward context sized to the work item's token count,
-   with `dp_metadata = None`;
-3. installs the work item's `AFDTransferContext.metadata` as `afd_metadata`;
-4. calls the role-aware FFN compute, forwarding the routed MoE compute
-   payloads (`group_list`, `dynamic_scales`) from the work item's `AFDAsyncTransferState` on
-   `AFDTransferContext.states`;
-5. returns the routed outputs through
-   `connector.send_ffn_work_item_output(...)`, which also handles the
-   floating zero-routed-token placeholder required by CAM combine-send.
-   A layer is complete only when the received interval ends at the final
-   local expert; earlier intervals continue the receive loop.
+1. receives a capacity-sized payload and its original CAM metadata through
+   `connector.recv_attn_output()`;
+2. passes activations, dynamic scales, expert counts and the device layer ID
+   to `AsyncCAMLayeredExecutor`;
+3. returns the routed output and original context with
+   `connector.send_ffn_output()`.
 
 Async eager does not use the synchronous DP-metadata graph cache. Its FULL
 mode captures a complete original DR/FFN/CS transaction with device-side layer
@@ -265,14 +256,11 @@ selection. The independent Async runner owns one graph and stable resources;
 see [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md) for startup, supported
 W4A8/W8A8 configurations and the original receiver's process-cleanup boundary.
 
-With `AFD_ASYNC_CAM_LAYERED_GMM=1`, eligible DeepSeek-V4 W4A8 or W8A8 layers instead
-use `AsyncCAMLayeredExecutor`: the runner passes capacity-sized payloads, device
-expert counts, and device layer IDs directly from receive through the layered
-GMMs to combine-send. The ordinary path above materializes the work item's
-layer/count information on the host. Both paths retain worker-level
-synchronization after a work-item group. MRV2 pairing does not prohibit the
-layered path. Its nonzero `swiglu_limit` limitation and validation scope are
-documented in the [CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-and-w8a8-layered-gmm-experimental-disabled-by-default).
+DeepSeek-V4 W4A8 and W8A8 use layered GMM for both eager and FULL. Incompatible
+weights fail startup rather than selecting another FFN path. Worker-level
+synchronization remains after a work-item group. The `swiglu_limit` behavior
+and validation scope are documented in the
+[CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-and-w8a8-layered-gmm).
 
 ## Control-plane-driven forward
 
