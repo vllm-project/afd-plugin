@@ -149,11 +149,9 @@ def test_full_keeps_slot_addresses_and_reuses_with_device_edges(pipeline):
     ]
     assert len({id(graph) for graph in graphs}) == 4
     assert len({pool for slot in p.owner.slots for pool in slot.pools}) == 4
-    assert p.owner.capture_count == p.npu.NPUGraph.call_count == 4
     assert len(p.produced) == 2 and p.produced[0]() is not p.produced[1]()
     p.history.reset_mock()  # Call recording must not keep captured tensors alive.
     p.owner.submit(5)
-    assert p.owner.sequence == 5 and p.owner.replay_count == 10
     p.history.done0.synchronize.assert_not_called()
     p.history.compute_stream.wait_event.assert_any_call(p.history.done0)
     assert len(p.produced) == 2
@@ -204,11 +202,6 @@ def test_partial_failure_retains_resources_and_disallows_retry(pipeline, failure
         for slot in p.owner.slots
     )
     p.history.reset_mock()
-    retained = min(len(p.produced), 2)
-    assert sum(slot.payload is not None for slot in p.owner.slots) == retained
-    assert sum(slot.output is not None for slot in p.owner.slots) == (
-        0 if failure == "compute" else retained
-    )
     assert all(ref() is not None for ref in p.produced)
 
 

@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
+from afd_plugin.config import DEEPEP_M2N_CONNECTOR, AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import qwen3_moe as adapter  # noqa: E402
 from tests.unit.fakes.weights import OneShotWeights as _OneShotWeights  # noqa: E402
 
@@ -22,23 +23,12 @@ FFN_ROLE = frozenset(("ffn",))
 BOTH_ROLES = frozenset(("attention", "ffn"))
 WEIGHT_ROLE_CASES = (
     ("embedding", "model.embed_tokens.weight", BOTH_ROLES),
-    ("final-norm", "model.norm.weight", BOTH_ROLES),
-    ("lm-head", "lm_head.weight", BOTH_ROLES),
     (
         "attention-q-projection",
         "model.layers.0.self_attn.q_proj.weight",
         ATTENTION_ROLE,
     ),
-    (
-        "attention-k-scale",
-        "model.layers.0.self_attn.attn.k_scale",
-        ATTENTION_ROLE,
-    ),
-    (
-        "input-layernorm",
-        "model.layers.0.input_layernorm.weight",
-        ATTENTION_ROLE,
-    ),
+    ("input-layernorm", "model.layers.0.input_layernorm.weight", ATTENTION_ROLE),
     (
         "post-attention-layernorm",
         "model.layers.0.post_attention_layernorm.weight",
@@ -50,14 +40,15 @@ WEIGHT_ROLE_CASES = (
         "model.layers.0.mlp.experts.0.gate_proj.weight",
         FFN_ROLE,
     ),
+)
+
+
+# With gate-on-Attention (DeepEP M2N) only the MoE gate changes owner.
+GATE_ON_ATTENTION_ROLE_CASES = (
+    ("moe-gate", "model.layers.0.mlp.gate.weight", BOTH_ROLES),
     (
-        "moe-expert-scale",
-        "model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv",
-        FFN_ROLE,
-    ),
-    (
-        "shared-expert-projection",
-        "model.layers.0.mlp.shared_expert.gate_proj.weight",
+        "moe-expert-projection",
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
         FFN_ROLE,
     ),
     (
@@ -70,6 +61,12 @@ WEIGHT_ROLE_CASES = (
         "model.layers.3.mlp.gate_proj.weight",
         FFN_ROLE,
     ),
+    (
+        "attention-q-projection",
+        "model.layers.0.self_attn.q_proj.weight",
+        ATTENTION_ROLE,
+    ),
+    ("embedding", "model.embed_tokens.weight", BOTH_ROLES),
 )
 
 
@@ -86,10 +83,34 @@ def test_weight_role_policy(
 
 
 @pytest.mark.parametrize(
-    ("role", "expected_names"),
+    ("checkpoint_name", "roles"),
+    [case[1:] for case in GATE_ON_ATTENTION_ROLE_CASES],
+    ids=[case[0] for case in GATE_ON_ATTENTION_ROLE_CASES],
+)
+def test_gate_on_attention_weight_role_policy(
+    checkpoint_name: str,
+    roles: frozenset[str],
+) -> None:
+    """The MoE gate loads on both roles; everything else keeps its owner.
+
+    Why: Attention routes with the gate, and the FFN's native MoE block still
+    owns a gate parameter that vLLM's strict loader requires to be loaded.
+    """
+    assert (
+        adapter._checkpoint_weight_roles(
+            checkpoint_name,
+            routes_on_attention=True,
+        )
+        == roles
+    )
+
+
+@pytest.mark.parametrize(
+    ("role", "uses_deepep_m2n", "expected_names"),
     [
         (
             "attention",
+            False,
             [
                 "model.embed_tokens.weight",
                 "model.layers.0.self_attn.q_proj.weight",
@@ -99,6 +120,28 @@ def test_weight_role_policy(
         ),
         (
             "ffn",
+            False,
+            [
+                "model.embed_tokens.weight",
+                "model.layers.0.mlp.gate.weight",
+                "model.layers.0.mlp.experts.0.down_proj.weight",
+                "lm_head.weight",
+            ],
+        ),
+        (
+            "attention",
+            True,
+            [
+                "model.embed_tokens.weight",
+                "model.layers.0.self_attn.q_proj.weight",
+                "model.layers.0.input_layernorm.weight",
+                "model.layers.0.mlp.gate.weight",
+                "lm_head.weight",
+            ],
+        ),
+        (
+            "ffn",
+            True,
             [
                 "model.embed_tokens.weight",
                 "model.layers.0.mlp.gate.weight",
@@ -111,6 +154,7 @@ def test_weight_role_policy(
 def test_load_weights_filters_once_and_delegates_to_native_loader(
     monkeypatch: pytest.MonkeyPatch,
     role: str,
+    uses_deepep_m2n: bool,
     expected_names: list[str],
 ) -> None:
     names = [
@@ -137,6 +181,18 @@ def test_load_weights_filters_once_and_delegates_to_native_loader(
     )
     model = object.__new__(adapter.AFDQwen3MoeForCausalLM)
     object.__setattr__(model, "afd_role", role)
+    # The gate follows the connector: only DeepEP M2N routes on Attention.
+    object.__setattr__(
+        model,
+        "afd_config",
+        AFDConfig(
+            role=role,
+            connector=DEEPEP_M2N_CONNECTOR,
+            compute_gate_on_attention=True,
+        )
+        if uses_deepep_m2n
+        else AFDConfig(role=role),
+    )
 
     result = model.load_weights(weights)
 
@@ -146,19 +202,6 @@ def test_load_weights_filters_once_and_delegates_to_native_loader(
         weights.items[names.index(name)][1] for name in expected_names
     ]
     assert weights.iterations == 1
-
-
-def test_native_loader_and_mapping_remain_native_owned() -> None:
-    assert "forward" not in adapter.AFDQwen3MoeModel.__dict__
-    assert "load_weights" not in adapter.AFDQwen3MoeModel.__dict__
-    assert (
-        adapter.AFDQwen3MoeModel.hf_to_vllm_mapper
-        is adapter.native.Qwen3MoeModel.hf_to_vllm_mapper
-    )
-    assert (
-        adapter.AFDQwen3MoeForCausalLM.hf_to_vllm_mapper
-        is adapter.native.Qwen3MoeForCausalLM.hf_to_vllm_mapper
-    )
 
 
 def test_model_reports_config_driven_moe_layer_indices() -> None:

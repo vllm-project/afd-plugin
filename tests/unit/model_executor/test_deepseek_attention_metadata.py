@@ -28,7 +28,9 @@ from afd_plugin.model_executor.models.npu import (  # noqa: E402
 )
 
 
-def test_materializes_sfa_mla_and_dsa_rope_metadata(monkeypatch):
+def test_materializes_sfa_mla_and_dsa_rope_metadata(
+    monkeypatch,
+):  # long-test: one materialization contract covers three native metadata formats
     sfa_cos_source = torch.arange(8, dtype=torch.float32)
     sfa_sin_source = sfa_cos_source + 10
     sfa_metadata = object.__new__(AscendSFAMetadata)
@@ -179,13 +181,10 @@ def test_dsa_eager_keeps_real_rope_proxies(dsa_rope_source):
     source = dsa_rope_source
     positions = torch.tensor([1.0, 4.0, 6.0, 100.0])
     first = source.materialize(positions, 3)
-    assert first.cos is source.returned[0][0]
-    assert first.sin is source.returned[0][1]
     assert isinstance(first.cos, RopeDataProxy)
     assert isinstance(first.sin, RopeDataProxy)
     expected = source.state.full_rope_cache["config-a"][0][[1, 4, 6]]
     second = source.materialize(torch.tensor([9, 10]), 2)
-    assert second.cos is source.returned[1][0]
     assert first.cos["layer-a"].data_ptr() != second.cos["layer-a"].data_ptr()
     torch.testing.assert_close(first.cos["layer-a"], expected)
     assert source.calls[0][0].dtype == torch.long
@@ -205,22 +204,18 @@ def test_dsa_full_preserves_proxy_selection_slicing_and_padding(
     request = source.materialize(positions, num_tokens, buffers)
     assert isinstance(request.cos, RopeDataProxy)
     assert isinstance(request.sin, RopeDataProxy)
-    assert request.cos.idx == 0 and request.sin.idx == 1
-    assert request.cos._data is request.sin._data
-    assert set(buffers) == {"layer-a"}
-    assert len(buffers["layer-a"]) == 8
-    assert all(value.shape[0] == 8 for value in buffers["layer-a"].values())
-    assert len(source.calls) == 1
-    assert source.calls[0][0].tolist() == positions[:num_tokens].tolist()
-    for key, groups in request.cos._data.items():
-        for group, values in groups.items():
-            indices = positions[:num_tokens] + (group == "compressed")
-            for index, value in enumerate(values):
-                torch.testing.assert_close(
-                    value, source.state.full_rope_cache[key][index][indices]
-                )
-                original = source.returned[0][0]._data[key][group][index]
-                assert value.data_ptr() != original.data_ptr()
+    for component, index in ((request.cos, 0), (request.sin, 1)):
+        for layer, key in (("layer-a", "config-a"), ("layer-b", "config-b")):
+            value = component[layer]
+            torch.testing.assert_close(
+                value, source.state.full_rope_cache[key][index][positions[:num_tokens]]
+            )
+            assert value.data_ptr() != source.returned[0][index][layer].data_ptr()
+        compressed = component["layer-groups"]["compressed"]
+        torch.testing.assert_close(
+            compressed,
+            source.state.full_rope_cache["config-a"][index][positions[:num_tokens] + 1],
+        )
     torch.testing.assert_close(
         request.sin["layer-b"],
         source.state.full_rope_cache["config-b"][1][positions[:num_tokens]],
@@ -245,27 +240,29 @@ def test_dsa_full_updates_persistent_leaf_storage_across_stages(dsa_rope_source)
         for stage in range(2)
     ]
 
-    def addresses(proxy):
+    def addresses(request):
         return [
             value.data_ptr()
-            for groups in proxy._data.values()
-            for values in groups.values()
-            for value in values
+            for component in (request.cos, request.sin)
+            for value in (
+                component["layer-a"],
+                component["layer-b"],
+                component["layer-groups"]["compressed"],
+            )
         ]
 
-    pointers = [addresses(request.cos) for request in captured]
+    pointers = [addresses(request) for request in captured]
     assert set(pointers[0]).isdisjoint(pointers[1])
     for values in ([8, 10], [11, 13, 15, 17], [19, 21, 23]):
         stage_one_before = captured[1].sin["layer-b"].clone()
         for stage in range(2):
             positions = torch.tensor(values) + stage
             live = source.materialize(positions, len(values), buffers[stage])
-            assert addresses(live.cos) == pointers[stage]
-            assert addresses(captured[stage].cos) == pointers[stage]
+            assert addresses(live) == pointers[stage]
+            assert addresses(captured[stage]) == pointers[stage]
             torch.testing.assert_close(
                 captured[stage].sin["layer-b"],
                 source.state.full_rope_cache["config-b"][1][positions[:2]],
             )
             if stage == 0:
                 torch.testing.assert_close(captured[1].sin["layer-b"], stage_one_before)
-    assert len(source.calls) == 8

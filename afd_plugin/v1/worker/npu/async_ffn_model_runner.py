@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
@@ -16,10 +17,7 @@ from afd_plugin.async_cam_startup import (
     POLL_SECONDS,
     FFNGraphPlan,
 )
-from afd_plugin.compat.npu import (
-    ascend_forward_context,
-    fail_if_unsupported_npu_afd_features,
-)
+from afd_plugin.compat.npu import fail_if_unsupported_npu_afd_features
 from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.compat.npu.profiler import (
     create_afd_npu_profiler,
@@ -27,20 +25,14 @@ from afd_plugin.compat.npu.profiler import (
     stop_afd_npu_profiler,
 )
 from afd_plugin.config import parse_afd_config
-from afd_plugin.connectors.metadata import (
-    AFDF2ATransferPayload,
-    AFDForwardContextMetadata,
-)
 from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
 )
-from afd_plugin.envs import async_cam_layered_gmm_enabled
-from afd_plugin.model_executor.npu.async_cam_w4a8 import (
-    AsyncCAMW4A8Executor,
-    W4A8LayerWeights,
+from afd_plugin.model_executor.npu.async_cam_layered import (
+    AsyncCAMLayeredExecutor,
+    LayeredFFNWeights,
 )
-from afd_plugin.v1.worker.ffn_metadata import _set_moe_layer_index
 from afd_plugin.v1.worker.npu.async_ffn_two_stream import AsyncFFNTwoStream
 from afd_plugin.validation import (
     cam_receive_capacity,
@@ -58,16 +50,8 @@ logger = init_logger(__name__)
 
 
 class FFNModel(Protocol):
-    def compute_ffn_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-        *,
-        group_list: torch.Tensor | None,
-        dynamic_scales: torch.Tensor | None,
-    ) -> torch.Tensor | AFDF2ATransferPayload: ...
     def get_experts_layer_indices(self) -> tuple[int, ...]: ...
-    def get_async_cam_w4a8_layers(self) -> tuple[list[W4A8LayerWeights], str]: ...
+    def get_async_cam_layered_weights(self) -> tuple[list[LayeredFFNWeights], str]: ...
 
 
 class AsyncNPUFFNModelRunner:
@@ -88,11 +72,10 @@ class AsyncNPUFFNModelRunner:
         self.afd_config = parse_afd_config(vllm_config, expected_role="ffn")
         fail_if_unsupported_npu_afd_features(vllm_config, afd_config=self.afd_config)
         self.model: FFNModel | None = None
+        self.draft_model: FFNModel | None = None
         self.model_memory_usage = 0
-        self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.layer_ids: tuple[int, ...] = ()
-        self._layered_executor: AsyncCAMW4A8Executor | None = None
-        self._layered_gmm_requested = async_cam_layered_gmm_enabled()
+        self._layered_executor: AsyncCAMLayeredExecutor | None = None
         self.requested_mode = requested_ffn_mode(vllm_config)
         self.effective_mode = "eager"
         self._graph: torch.npu.NPUGraph | None = None
@@ -153,6 +136,20 @@ class AsyncNPUFFNModelRunner:
                     vllm_config=self.vllm_config, model_config=self.model_config
                 ),
             )
+            if speculative_config is not None and speculative_config.method == "dspark":
+                from vllm.model_executor.models.utils import get_draft_quant_config
+
+                # F has no draft attention or embedding/head to share. Use the
+                # native quantization/weight loader with its role-local model.
+                draft_config = replace(self.vllm_config)
+                draft_config.quant_config = get_draft_quant_config(self.vllm_config)
+                self.draft_model = cast(
+                    FFNModel,
+                    loader.load_model(
+                        vllm_config=draft_config,
+                        model_config=speculative_config.draft_model_config,
+                    ),
+                )
         self.model_memory_usage = profiler.consumed_memory
 
     def get_model(self) -> torch.nn.Module:
@@ -168,15 +165,23 @@ class AsyncNPUFFNModelRunner:
         if self.connector.is_initialized:
             return
         assert self.model is not None
-        self.layer_ids = tuple(sorted(self.model.get_experts_layer_indices()))
-        stream_signature = stream_error = ""
+        stream_signature = stream_error = executor_error = signature = ""
         config = self.connector.extra_info
         try:
+            models = (self.model,) + (
+                (self.draft_model,) if self.draft_model is not None else ()
+            )
+            layer_ids = [
+                index for model in models for index in model.get_experts_layer_indices()
+            ]
+            if len(layer_ids) != len(set(layer_ids)):
+                raise ValueError("Target and draft remote MoE layer IDs overlap")
+            self.layer_ids = tuple(sorted(layer_ids))
             self._initialize_layered_executor()
+            assert self._layered_executor is not None
+            signature = self._layered_executor.graph_signature(cam_receive_capacity())
         except Exception as exc:
-            if not config.ffn_two_stream:
-                raise
-            stream_error = str(exc)
+            executor_error = str(exc) or type(exc).__name__
         executor = self._layered_executor
         if config.ffn_two_stream:
             stream_signature = repr(
@@ -189,29 +194,20 @@ class AsyncNPUFFNModelRunner:
                 )
             )
             try:
-                if stream_error:
-                    raise ValueError(stream_error)
-                if executor is None:
-                    raise ValueError("FFN two-stream requires layered W4A8")
-                self._two_stream = AsyncFFNTwoStream(
-                    self.device,
-                    config,
-                    self.connector,
-                    executor,
-                )
+                if not executor_error:
+                    assert executor is not None
+                    self._two_stream = AsyncFFNTwoStream(
+                        self.device,
+                        config,
+                        self.connector,
+                        executor,
+                    )
             except Exception as exc:
-                stream_error = str(exc)
-        graph_error = (
-            "requires layered W4A8 (AFD_ASYNC_CAM_LAYERED_GMM=1)"
-            if executor is None
-            else ""
-        )
+                stream_error = str(exc) or type(exc).__name__
         self.connector.graph_startup.plan = FFNGraphPlan(
             requested=self.requested_mode,
-            graph_error=graph_error,
-            signature=executor.graph_signature(cam_receive_capacity())
-            if executor
-            else "",
+            executor_error=executor_error,
+            signature=signature,
             layer_ids=self.layer_ids,
             stream_signature=stream_signature,
             stream_error=stream_error,
@@ -374,50 +370,40 @@ class AsyncNPUFFNModelRunner:
 
     def _initialize_layered_executor(self) -> None:
         assert self.model is not None
-        reason = "switch disabled"
-        if self._layered_gmm_requested:
-            if not isinstance(self.connector, CAMAsyncAFDConnector):
-                reason = "requires CAMAsyncAFDConnector"
-            elif not self.afd_config.compute_gate_on_attention:
-                reason = "requires Attention-side gate"
-            else:
-                layers, reason = self.model.get_async_cam_w4a8_layers()
-                if layers:
-                    if get_ascend_device_type() != AscendDeviceType.A3:
-                        raise ValueError("layered W4A8 GMM requires Ascend 910C/A3")
-                    if self.connector.dynamic_quant != 1:
-                        raise ValueError("layered W4A8 GMM requires dynamicQuant=1")
-                    if tuple(sorted(layer.layer_idx for layer in layers)) != tuple(
-                        self.layer_ids
-                    ):
-                        raise ValueError(
-                            "layered GMM weights do not cover the remote MoE layer IDs"
-                        )
-                    ensure_cam_async_ops_available()
-                    self._layered_executor = AsyncCAMW4A8Executor(layers)
-                    self.connector.layered_gmm_enabled = True
-                    logger.info(
-                        "AFD_ASYNC_CAM_LAYERED_GMM requested=1 actual=layered "
-                        "quant=W4A8 layers=%d mode=%s layer_mapping=%s "
-                        "swiglu_limit=%s ignored=%s",
-                        len(layers),
-                        "per-channel" if layers[0].per_channel else "per-group",
-                        self._layered_executor.layer_id_to_slot is not None,
-                        layers[0].swiglu_limit,
-                        layers[0].swiglu_limit != 0.0,
-                    )
-                    return
+        layers, reason = self.model.get_async_cam_layered_weights()
+        if not layers:
+            raise ValueError(f"layered GMM target weights are unsupported: {reason}")
+        if self.draft_model is not None:
+            draft_layers, reason = self.draft_model.get_async_cam_layered_weights()
+            if not draft_layers:
+                raise ValueError(f"layered GMM draft weights are unsupported: {reason}")
+            layers = [*layers, *draft_layers]
+        if get_ascend_device_type() != AscendDeviceType.A3:
+            raise ValueError("layered GMM requires Ascend 910C/A3")
+        if self.connector.dynamic_quant != 1:
+            raise ValueError("layered GMM requires dynamicQuant=1")
+        if tuple(sorted(layer.layer_idx for layer in layers)) != self.layer_ids:
+            raise ValueError(
+                "layered GMM weights do not cover the remote MoE layer IDs"
+            )
+        ensure_cam_async_ops_available()
+        self._layered_executor = AsyncCAMLayeredExecutor(layers)
         logger.info(
-            "AFD_ASYNC_CAM_LAYERED_GMM requested=%s actual=legacy reason=%s",
-            self._layered_gmm_requested,
-            reason,
+            "Async CAM layered GMM quant=%s layers=%d mode=%s layer_mapping=%s "
+            "swiglu_limit=%s ignored=%s",
+            layers[0].quantization,
+            len(layers),
+            "per-channel" if layers[0].per_channel else "per-group",
+            self._layered_executor.layer_id_to_slot is not None,
+            layers[0].swiglu_limit,
+            layers[0].quantization == "W8A8" and bool(layers[0].swiglu_limit),
         )
 
     @torch.inference_mode()
     def execute_connector_driven_step(self) -> bool:
         step_afd_npu_profiler(self.prof)
         if self._graph is None and self._two_stream is None:
-            # Preserve main's eager layer loop and synchronization policy.
+            # Eager and graph modes use the same layered executor.
             self._ffn_forward_connector_driven()
             return True
         if not self._service_announced:
@@ -432,73 +418,24 @@ class AsyncNPUFFNModelRunner:
         self,
         *,
         single: bool = False,
-    ) -> torch.Tensor | AFDF2ATransferPayload | None:
+    ) -> torch.Tensor | None:
         assert self.model is not None
         if self._two_stream is not None:
             self._two_stream.submit(1 if single else len(self.layer_ids))
             self._two_stream.complete(wait=self._wait_graph_device if single else None)
             return None
-        stage_idx = 0
         rank_ffn_output = None
-        connector = cast(CAMAsyncAFDConnector, self.connector)
-        if self._layered_executor is not None:
-            for _ in self.layer_ids[:1] if single else self.layer_ids:
-                payload = connector.recv_attn_output()
-                states = cast(AFDAsyncTransferState, payload.context.states)
-                rank_ffn_output = self._layered_executor(
-                    payload.hidden_states,
-                    states.dynamic_scales,
-                    states.group_list,
-                    states.token_nums_rankid_layeridx,
-                )
-                connector.send_ffn_output(rank_ffn_output, payload.context)
-            return rank_ffn_output
-
+        assert self._layered_executor is not None
         for _ in self.layer_ids[:1] if single else self.layer_ids:
-            work_item = connector.recv_ffn_work_item(
-                stage_idx=stage_idx,
-                max_num_tokens=self.max_num_tokens,
+            payload = self.connector.recv_attn_output()
+            states = cast(AFDAsyncTransferState, payload.context.states)
+            rank_ffn_output = self._layered_executor(
+                payload.hidden_states,
+                states.dynamic_scales,
+                states.group_list,
+                states.token_nums_rankid_layeridx,
             )
-            hidden_states = work_item.hidden_states
-            metadata = work_item.context.metadata
-            legacy_states = work_item.context.states
-            if not isinstance(legacy_states, AFDAsyncTransferState):
-                raise RuntimeError(
-                    "CAM async FFN work item requires AFDAsyncTransferState",
-                )
-            layer_idx = work_item.layer_idx
-            num_tokens = work_item.num_tokens
-            afd_metadata = AFDForwardContextMetadata(
-                tokens_start_loc=[0],
-                requests_start_loc=[0],
-                stage_idx=stage_idx,
-                connector=self.connector,
-                tokens_lens=[num_tokens],
-                num_stages=1,
-                tokens_unpadded_lens=[num_tokens],
-            )
-
-            with ascend_forward_context(
-                vllm_config=self.vllm_config,
-                afd_metadata=afd_metadata,
-                model_instance=self.model,
-                num_tokens=num_tokens,
-                skip_mc2_mask=self.afd_config.compute_gate_on_attention,
-            ) as forward_context:
-                forward_context.dp_metadata = None
-                forward_context.additional_kwargs["afd_metadata"] = metadata
-                _set_moe_layer_index(forward_context, layer_idx)
-
-                rank_ffn_output = self.model.compute_ffn_output(
-                    hidden_states=hidden_states,
-                    layer_idx=layer_idx,
-                    group_list=legacy_states.group_list,
-                    dynamic_scales=legacy_states.dynamic_scales,
-                )
-                rank_ffn_output = connector.send_ffn_work_item_output(
-                    work_item,
-                    rank_ffn_output,
-                )
+            self.connector.send_ffn_output(rank_ffn_output, payload.context)
         return rank_ffn_output
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -535,4 +472,5 @@ class AsyncNPUFFNModelRunner:
         self._layered_executor = None
         free_before_shutdown(self.vllm_config)
         self.model = None
+        self.draft_model = None
         self._is_shutdown = True

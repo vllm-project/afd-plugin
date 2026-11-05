@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Bounded 4A/4F MRV2 generation regression: layered eager versus FFN FULL.
+"""Bounded MRV2 generation regression: layered eager versus FFN FULL.
 
 Functional coverage only: test observers fence eager transactions. Do not use
 this fixture for performance comparisons. Inference and process cleanup are
 recorded separately.
 
-This has its own fixed DBO-disabled profile, separate from the existing
-16-die eager Attention DBO case. It reuses common command/cleanup code.
+The DBO-disabled profile defaults to 4A/4F and also accepts 4A/8F for larger
+checkpoints. It reuses common command/cleanup code.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from tests.e2e.models.deepseek_v4_flash.config import additional_config
 from tests.e2e.process_utils import terminate_process_groups
 
 CAPACITY = 128
+ATTENTION_RANKS = 4
 GENERATED_TOKENS = 8
 WORKER_SHUTDOWN_TIMEOUT = 60
 SERVICE_SHUTDOWN_TIMEOUT = 90
@@ -47,8 +48,8 @@ def profile(args) -> SimpleNamespace:
         vllm_bin=args.vllm_bin,
         device_backend="npu",
         baseline=False,
-        num_attention_ranks=4,
-        num_ffn_ranks=4,
+        num_attention_ranks=ATTENTION_RANKS,
+        num_ffn_ranks=args.ffn_ranks,
         attention_tp_size=4,
         ffn_tp_size=1,
         tp_size=1,
@@ -57,6 +58,8 @@ def profile(args) -> SimpleNamespace:
         compute_gate_on_attention=True,
         afd_host=args.afd_host,
         afd_port=args.afd_port,
+        # attention_vllm_arg below pins --data-parallel-address itself.
+        attention_data_parallel_address=None,
         api_host="127.0.0.1",
         api_port_base=args.api_port,
         served_model_name_prefix="afd449-p4",
@@ -127,7 +130,10 @@ def command_for(args, settings, role: str) -> list[str]:
 
 def environment_for(args, settings, role: str) -> dict[str, str]:
     devices = args.devices.split(",")
-    visible = ",".join(devices[:4] if role == "attention" else devices[4:])
+    boundary = settings.num_attention_ranks
+    visible = ",".join(
+        devices[:boundary] if role == "attention" else devices[boundary:]
+    )
     env = runner.build_env(
         visible, settings, role=role, e2e_run_id=args.output_dir.name
     )
@@ -137,7 +143,6 @@ def environment_for(args, settings, role: str) -> dict[str, str]:
             "VLLM_PLUGINS": (
                 "ascend,afd,ascend_model,ascend_model_loader,ascend_kv_connector"
             ),
-            "AFD_ASYNC_CAM_LAYERED_GMM": "1" if role == "ffn" else "0",
             "BATCH_SIZE_FACTOR": str(CAPACITY / 262144),
             "OMP_NUM_THREADS": "4",
             "OMP_PROC_BIND": "false",
@@ -270,27 +275,29 @@ def snapshots(client, args) -> dict:
     deadline = time.monotonic() + 10
     while True:
         records = []
-        for rank in range(4, 8):
+        for rank in range(ATTENTION_RANKS, ATTENTION_RANKS + args.ffn_ranks):
             path = args.output_dir / "workers" / f"latest-ffn-{rank}.json"
             if path.exists():
                 record = json.loads(path.read_text())
                 if record["observed_ns"] >= floor:
                     records.append(record)
-        if len(records) == 4:
+        if len(records) == args.ffn_ranks:
             return {"attention": attention, "ffn": {"results": records}}
         if time.monotonic() >= deadline:
             raise TimeoutError("Missing fresh FFN health snapshots")
         time.sleep(0.1)
 
 
-def audit_execution(before: dict, after: dict, mode: str) -> None:
+def audit_execution(before: dict, after: dict, mode: str, ffn_ranks: int) -> None:
     attention = after["attention"]["results"]
     attention_before = {r["rank"]: r for r in before["attention"]["results"]}
     ffn_before = {r["rank"]: r for r in before["ffn"]["results"]}
     ffn_after = after["ffn"]["results"]
-    if {r["rank"] for r in attention} != set(range(4)):
+    if {r["rank"] for r in attention} != set(range(ATTENTION_RANKS)):
         raise AssertionError("Missing Attention rank evidence")
-    if {r["rank"] for r in ffn_after} != set(range(4, 8)):
+    if {r["rank"] for r in ffn_after} != set(
+        range(ATTENTION_RANKS, ATTENTION_RANKS + ffn_ranks)
+    ):
         raise AssertionError("Missing FFN rank evidence")
     for record in attention:
         if record["runner"] != "AFDNPUAttentionModelRunnerV2":
@@ -329,19 +336,33 @@ def main() -> None:
     parser.add_argument("--reference-dir", type=Path)
     parser.add_argument("--vllm-bin", default="vllm")
     parser.add_argument("--devices", default="0,1,2,3,4,5,6,7")
+    parser.add_argument("--ffn-ranks", type=int, choices=(4, 8), default=4)
     parser.add_argument("--afd-host", required=True)
     parser.add_argument("--afd-port", type=int, default=29880)
     parser.add_argument("--api-port", type=int, default=19280)
     parser.add_argument("--startup-timeout", type=float, default=1800)
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
-    if len(set(args.devices.split(","))) != 8:
-        parser.error("exactly eight distinct devices required")
+    devices = args.devices.split(",")
+    if (
+        len(devices) != ATTENTION_RANKS + args.ffn_ranks
+        or len(set(devices)) != len(devices)
+        or any(not device for device in devices)
+    ):
+        parser.error("devices must contain one distinct ID per Attention and FFN rank")
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=False)
     if args.mode == "full" and args.reference_dir is None:
         parser.error("FULL requires the completed layered eager reference")
     settings = profile(args)
+    identity = {
+        "model": str(Path(args.model).resolve()),
+        "attention_ranks": settings.num_attention_ranks,
+        "ffn_ranks": settings.num_ffn_ranks,
+        "devices": devices,
+        "capacity": CAPACITY,
+    }
+    save(args.output_dir / "profile.json", identity)
     plans: dict[str, LaunchPlan] = {
         role: {
             "command": command_for(args, settings, role),
@@ -365,6 +386,11 @@ def main() -> None:
         accepted = json.loads((args.reference_dir / "passed.json").read_text())
         if accepted != {"mode": "eager", "passed": True}:
             raise ValueError("Reference must be a completed layered eager run")
+        reference_identity = json.loads(
+            (args.reference_dir / "profile.json").read_text()
+        )
+        if reference_identity != identity:
+            raise ValueError("Eager reference model, topology or capacity differs")
 
     received_signal: int | None = None
     cleanup_in_progress = False
@@ -425,7 +451,7 @@ def main() -> None:
             results = run_requests(client, base, cases, args.output_dir)
             after = snapshots(client, args)
             save(args.output_dir / "after.json", after)
-            audit_execution(before, after, args.mode)
+            audit_execution(before, after, args.mode, args.ffn_ranks)
             if args.reference_dir:
                 reference = json.loads(
                     (args.reference_dir / "responses.json").read_text()

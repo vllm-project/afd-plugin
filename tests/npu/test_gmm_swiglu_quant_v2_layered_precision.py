@@ -16,6 +16,13 @@ weight, scale and assist matrix as a single-element list. Both are ACLNN
 operators of the same family driven with byte-identical inputs, so a direct
 comparison is a valid differential precision test.
 
+The built-in reference runs as one ordered batch in a fresh process per case.
+Its custom vendor paths are cleared before torch_npu loads: vLLM-Ascend exports
+the same WeightNz API name with a different contract, so calling torch_npu in
+the AFD process can select that custom API instead of the CANN built-in. The
+AFD side retains its original vendor environment. Child logs and a checked
+native-provider report are retained in the case's pytest temporary directory.
+
 ``a8w4`` compares against a CPU golden implemented in this file, following the
 formula already exercised on device by
 ``tests/npu/test_async_cam_layered_w4a8.py``: dequantize the int4 weights,
@@ -69,8 +76,14 @@ re-runs both values in both orders so a regression fails either way.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
+
+from tests.npu._gmm_native_reference import (
+    builtin_a8w8_references,
+    capture_a8w8_request,
+)
 
 pytestmark = pytest.mark.npu
 
@@ -200,6 +213,13 @@ def _pack_int4_to_nz_int32(torch, torch_npu, values):
     )
 
 
+def _pack_int4_nd(torch, values):
+    pairs = values.to(torch.int8).reshape(-1, 2)
+    packed = (pairs[:, 0] & 15) | (pairs[:, 1] << 4)
+    shape = (*values.shape[:-1], values.shape[-1] // 2)
+    return packed.reshape(shape).contiguous().view(torch.int32).npu()
+
+
 def _build_a8w4(torch, torch_npu, generator, dequant_mode: int, rows: int):
     """Return the A8W4 inputs plus the dequantized weights for the golden.
 
@@ -267,7 +287,7 @@ def _build_a8w8(torch, torch_npu, generator, rows: int):
     return x, x_scale, weights, scales, assists
 
 
-def _a8w4_golden(torch, x_cpu, x_scale_cpu, dequant_weight, counts):
+def _a8w4_golden(torch, x_cpu, x_scale_cpu, dequant_weight, counts, swiglu_limit=0.0):
     """Return the golden (y, y_scale) as CPU int8 and float32 tensors.
 
     The formula is the one validated on device by
@@ -283,6 +303,9 @@ def _a8w4_golden(torch, x_cpu, x_scale_cpu, dequant_weight, counts):
         rows = slice(offset, offset + count)
         activation = x_cpu[rows].float() * x_scale_cpu[rows, None]
         gate, up = (activation @ dequant_weight[expert]).chunk(2, dim=-1)
+        if swiglu_limit > 0.0:
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
         swiglu = torch.nn.functional.silu(gate) * up
         scale = swiglu.abs().amax(dim=-1).clamp_min(1e-12) / 127
         quantized = (swiglu / scale[:, None]).round().clamp(-127, 127)
@@ -378,8 +401,173 @@ def _runtime(torch, torch_npu) -> None:
     torch.npu.config.allow_internal_format = True
 
 
+@pytest.fixture(
+    params=[
+        (scenario, dequant_mode, group_list_type)
+        for scenario, dequant_mode in (
+            ("a8w4", 0),
+            ("a8w4", 1),
+            ("a4w4", 0),
+            ("a4w4", 1),
+        )
+        for group_list_type in (0, 1)
+    ]
+)
+def clipped_swiglu_case(request):
+    """Exact sparse matmuls cross both clamp boundaries in every layer."""
+    if os.environ.get("AFD_RUN_ASCEND_OP_RUNTIME") != "1":
+        pytest.skip("requires opt-in 910C runtime")
+    torch = pytest.importorskip("torch")
+    torch_npu = pytest.importorskip("torch_npu")
+    _runtime(torch, torch_npu)
+    scenario, dequant_mode, group_list_type = request.param
+    variant = 0 if scenario == "a8w4" else 4
+    variant += dequant_mode * 2 + group_list_type
+    counts = tuple(n + variant for n in (19, 27, 35, 43))
+    rows = sum(counts)
+    x_cpu = torch.zeros((rows, _K), dtype=torch.int8)
+    x_cpu[:, 0], x_cpu[:, _K // 2] = 4, 1
+    # Negative-only rows make a forbidden gate lower clamp observable in the
+    # output scale; a large positive gate would hide it below one INT8 step.
+    x_cpu[::4] = 0
+    x_cpu[::4, 2] = 4
+    x_scale_cpu = torch.ones(rows, dtype=torch.float32)
+    targets = torch.tensor((-24, -12, -11, -10, -9, -1, 0, 1, 9, 10, 11, 12, 20, 24))
+    targets = targets.repeat((_N // 2 + len(targets) - 1) // len(targets))[: _N // 2]
+    weights, scales, assists, dequants = [], [], [], []
+    for layer in range(_LAYERS):
+        values = torch.zeros((_E, _K, _N), dtype=torch.int32)
+        for expert in range(_E):
+            branches = torch.cat(
+                (targets.roll(layer + expert), targets.roll(4 + 2 * layer + expert))
+            )
+            values[expert, 0] = branches.div(4, rounding_mode="floor")
+            values[expert, _K // 2] = branches.remainder(4)
+            values[expert, 2, : _N // 2] = -3
+            values[expert, 2, _N // 2 :] = targets.abs().clamp(1, 7)
+        groups = 1 if dequant_mode == 0 else _K_GROUPS
+        scale = torch.ones((_E, groups, _N), dtype=torch.float32)
+        scale *= 1 + layer * 0.5
+        scale *= 1 + torch.arange(_E)[:, None, None] * 0.25
+        if groups > 1:
+            scale[:, 1] *= 2
+        dequant = values.float() * scale.repeat_interleave(_K // groups, dim=1)
+        dequants.append(dequant)
+        weights.append(
+            _pack_int4_nd(torch, values)
+            if scenario == "a4w4"
+            else _pack_int4_to_nz_int32(torch, torch_npu, values)
+        )
+        encoded = scale.view(torch.int32).to(torch.int64)
+        scales.append((encoded.squeeze(1) if groups == 1 else encoded).npu())
+        if scenario == "a8w4":
+            assists.append((_ASSIST_FACTOR * dequant.sum(dim=1)).npu())
+    x = x_cpu.npu()
+    if scenario == "a4w4":
+        x = _pack_int4_nd(torch, x_cpu)
+    group_list, _ = _group_list(torch, group_list_type, counts)
+    inputs = (x, weights, scales, assists, x_scale_cpu.npu(), group_list)
+    return torch, inputs, x_cpu, x_scale_cpu, dequants, counts, request.param
+
+
+def test_layered_swiglu_clamp_matches_golden_and_preserves_default(
+    clipped_swiglu_case,
+) -> None:  # long-test: real device outputs for two layers and both attr call orders
+    torch, inputs, x_cpu, x_scale, dequants, counts, variant = clipped_swiglu_case
+    reports, clamped_layers = [], []
+    for layer in range(_LAYERS):
+        index = torch.tensor([layer], dtype=torch.int64, device="npu")
+        branches = x_cpu[1:2].float() @ dequants[layer][0]
+        gate, up = branches.chunk(2, dim=-1)
+        assert (gate > 10).any() and (gate < -10).any()
+        assert (up > 10).any() and (up < -10).any()
+        expected = {
+            limit: _a8w4_golden(torch, x_cpu, x_scale, dequants[layer], counts, limit)
+            for limit in (0.0, 10.0)
+        }
+        assert not torch.equal(expected[0.0][1], expected[10.0][1])
+        for limit in (None, 10.0, 0.0, 10.0, None):
+            kwargs = {} if limit is None else {"swiglu_limit": limit}
+            actual = torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered(
+                inputs[0].clone(),
+                *inputs[1:],
+                index,
+                dequant_mode=variant[1],
+                group_list_type=variant[2],
+                **kwargs,
+            )
+            torch.npu.synchronize()
+            actual_y, actual_scale = (t.cpu() for t in actual)
+            expected_y, expected_scale = expected[limit or 0.0]
+            reports.append(
+                _compare(
+                    torch,
+                    actual_y,
+                    actual_scale,
+                    expected_y,
+                    expected_scale,
+                    f"clamp variant={variant} layer={layer} limit={limit}",
+                    scale_rtol=_A8W4_SCALE_RTOL,
+                    rtol=_A8W4_RTOL,
+                    atol=_A8W4_ATOL,
+                )
+            )
+        clamped_layers.append(expected[10.0][0])
+    assert not torch.equal(*clamped_layers)
+    print("\n".join(reports))
+
+
+def test_layered_swiglu_clamp_graph_uses_device_layer_index(clipped_swiglu_case):
+    torch, inputs, x_cpu, x_scale, dequants, counts, variant = clipped_swiglu_case
+    work = inputs[0].clone()
+    index = torch.zeros(1, dtype=torch.int64, device="npu")
+
+    def run():
+        return torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered(
+            work,
+            *inputs[1:],
+            index,
+            dequant_mode=variant[1],
+            group_list_type=variant[2],
+            swiglu_limit=10.0,
+        )
+
+    with torch.inference_mode():
+        run()
+        work.copy_(inputs[0])
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            outputs = run()
+        torch.npu.synchronize()
+        for layer in (1, 0, 1):
+            work.copy_(inputs[0])
+            index.fill_(layer)
+            graph.replay()
+            torch.npu.synchronize()
+            actual_y, actual_scale = (t.cpu() for t in outputs)
+            expected_y, expected_scale = _a8w4_golden(
+                torch, x_cpu, x_scale, dequants[layer], counts, 10.0
+            )
+            print(
+                _compare(
+                    torch,
+                    actual_y,
+                    actual_scale,
+                    expected_y,
+                    expected_scale,
+                    f"clamp graph variant={variant} layer={layer}",
+                    scale_rtol=_A8W4_SCALE_RTOL,
+                    rtol=_A8W4_RTOL,
+                    atol=_A8W4_ATOL,
+                )
+            )
+
+
 @pytest.mark.parametrize("group_list_type", [0, 1])
-def test_layered_swiglu_a8w8_matches_builtin(group_list_type: int) -> None:
+def test_layered_swiglu_a8w8_matches_builtin(  # long-test: layer/repeat device matrix
+    group_list_type: int, tmp_path: Path
+) -> None:
     """Compare every layer against the built-in non-layered operator.
 
     Each ``group_list_type`` uses its own activation row count so the tiling is
@@ -399,10 +587,19 @@ def test_layered_swiglu_a8w8_matches_builtin(group_list_type: int) -> None:
         torch, torch_npu, generator, rows
     )
     group_list, _counts = _group_list(torch, group_list_type, counts_pattern)
-    reports = []
+    requests, actuals, contexts = [], [], []
 
     for layer in range(_LAYERS):
         layer_index = torch.full((1,), layer, dtype=torch.int64, device="npu")
+        request = capture_a8w8_request(
+            torch_npu,
+            x,
+            x_scale,
+            weights[layer],
+            scales[layer],
+            group_list,
+            group_list_type,
+        )
         for repeat in range(_REPEATS):
             context = (
                 f"scenario=a8w8 dequant_mode=0 group_list_type={group_list_type} "
@@ -426,32 +623,27 @@ def test_layered_swiglu_a8w8_matches_builtin(group_list_type: int) -> None:
                 None,  # tuning_config
             )
             torch.npu.synchronize()
+            requests.append(request)
+            actuals.append(tuple(tensor.cpu() for tensor in actual))
+            contexts.append(context)
 
-            reference = torch_npu.npu_grouped_matmul_swiglu_quant_v2(
-                x.clone(),
-                [weights[layer]],
-                [scales[layer]],
-                x_scale,
-                group_list,
-                dequant_mode=0,
-                quant_mode=0,
-                group_list_type=group_list_type,
-            )
-            torch.npu.synchronize()
-
-            reports.append(
-                _compare(
-                    torch,
-                    actual[0].cpu(),
-                    actual[1].cpu(),
-                    reference[0].cpu(),
-                    reference[1].cpu(),
-                    context,
-                    rtol=_A8W8_RTOL,
-                    atol=_A8W8_ATOL,
-                    scale_rtol=_A8W8_SCALE_RTOL,
-                )
-            )
+    references = builtin_a8w8_references(torch, requests, tmp_path, _NZ_FORMAT)
+    reports = [
+        _compare(
+            torch,
+            actual[0],
+            actual[1],
+            reference[0],
+            reference[1],
+            context,
+            rtol=_A8W8_RTOL,
+            atol=_A8W8_ATOL,
+            scale_rtol=_A8W8_SCALE_RTOL,
+        )
+        for actual, reference, context in zip(
+            actuals, references, contexts, strict=True
+        )
+    ]
 
     # Surface the per-case numbers even when every case passes; a silent pass
     # would not satisfy the issue's reporting clause.
@@ -566,11 +758,11 @@ def test_layered_swiglu_layer_selection_is_not_degenerate(scenario: str) -> None
     group_list, _counts = _group_list(torch, 1, counts_pattern)
     results = []
     for layer in range(_LAYERS):
-        assist = [] if assists[layer] is None else [assists[layer]]
+        assist = [] if assists[layer] is None else assists
         outputs = torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered(
             x.clone(),
-            [weights[layer]],
-            [scales[layer]],
+            weights,
+            scales,
             assist,
             x_scale,
             group_list,
@@ -622,8 +814,8 @@ def test_variant_shapes_are_distinct() -> None:
 
 
 @pytest.mark.parametrize("first,second", [(1, 0), (0, 1)])
-def test_a8w8_group_list_type_is_independent_of_call_order(
-    first: int, second: int
+def test_a8w8_group_list_type_is_independent_of_call_order(  # long-test: call order
+    first: int, second: int, tmp_path: Path
 ) -> None:
     """Both ``group_list_type`` values must be correct in either call order.
 
@@ -642,7 +834,7 @@ def test_a8w8_group_list_type_is_independent_of_call_order(
     _runtime(torch, torch_npu)
 
     layer_index = torch.zeros((1,), dtype=torch.int64, device="npu")
-    reports = []
+    requests, actuals, contexts = [], [], []
 
     for group_list_type in (first, second):
         rows, counts_pattern = _variant(0, group_list_type)
@@ -654,6 +846,17 @@ def test_a8w8_group_list_type_is_independent_of_call_order(
         context = (
             f"order={first}-then-{second} group_list_type={group_list_type} "
             f"rows={rows} seed={_SEED}"
+        )
+        requests.append(
+            capture_a8w8_request(
+                torch_npu,
+                x,
+                x_scale,
+                weights[0],
+                scales[0],
+                group_list,
+                group_list_type,
+            )
         )
 
         actual = torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered(
@@ -670,31 +873,25 @@ def test_a8w8_group_list_type_is_independent_of_call_order(
             None,
         )
         torch.npu.synchronize()
+        actuals.append(tuple(tensor.cpu() for tensor in actual))
+        contexts.append(context)
 
-        reference = torch_npu.npu_grouped_matmul_swiglu_quant_v2(
-            x.clone(),
-            [weights[0]],
-            [scales[0]],
-            x_scale,
-            group_list,
-            dequant_mode=0,
-            quant_mode=0,
-            group_list_type=group_list_type,
+    references = builtin_a8w8_references(torch, requests, tmp_path, _NZ_FORMAT)
+    reports = [
+        _compare(
+            torch,
+            actual[0],
+            actual[1],
+            reference[0],
+            reference[1],
+            context,
+            rtol=_A8W8_RTOL,
+            atol=_A8W8_ATOL,
+            scale_rtol=_A8W8_SCALE_RTOL,
         )
-        torch.npu.synchronize()
-
-        reports.append(
-            _compare(
-                torch,
-                actual[0].cpu(),
-                actual[1].cpu(),
-                reference[0].cpu(),
-                reference[1].cpu(),
-                context,
-                rtol=_A8W8_RTOL,
-                atol=_A8W8_ATOL,
-                scale_rtol=_A8W8_SCALE_RTOL,
-            )
+        for actual, reference, context in zip(
+            actuals, references, contexts, strict=True
         )
+    ]
 
     print("\n".join(reports))

@@ -67,12 +67,12 @@ repos:
         verbose: true
         stages: [commit-msg]
 
-      # mypy-3.10 runs on git commit / CI for changed files only.
+      # mypy-3.11 runs on git commit / CI for changed files only.
       # Extra versions are manual-stage only (not in default `pre-commit run`):
       #   pre-commit run --hook-stage manual mypy-3.12
-      - id: mypy-3.10
-        name: Run mypy for Python 3.10
-        entry: python tools/pre_commit/mypy.py "3.10"
+      - id: mypy-3.11
+        name: Run mypy for Python 3.11
+        entry: python tools/pre_commit/mypy.py "3.11"
         <<: &mypy_common
           language: python
           types_or: [python, pyi]
@@ -83,11 +83,6 @@ repos:
             - types-PyYAML
             - types-requests
             - types-setuptools
-      - id: mypy-3.11
-        name: Run mypy for Python 3.11
-        entry: python tools/pre_commit/mypy.py "3.11"
-        <<: *mypy_common
-        stages: [manual]
       - id: mypy-3.12
         name: Run mypy for Python 3.12
         entry: python tools/pre_commit/mypy.py "3.12"

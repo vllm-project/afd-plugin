@@ -8,7 +8,7 @@ body:
     attributes:
       value: >
         Before submitting, please search existing issues and RFCs. Keep proposals
-        tied to vLLM v0.30.0 compatibility unless the issue explicitly proposes a
+        tied to the applicable GPU or NPU vLLM v0.32.0 target unless the issue proposes a
         version expansion.
 
   - type: textarea
@@ -31,7 +31,7 @@ body:
     id: compatibility
     attributes:
       label: vLLM compatibility and extension points
-      description: Explain how this should work without modifying the vLLM v0.30.0 source tree.
+      description: Explain how this should work without modifying the applicable vLLM source tree.
       placeholder: |
         Preferred extension point:
         Compat shim needed:

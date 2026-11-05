@@ -56,6 +56,14 @@ constexpr MatmulConfig matmulCFG = CFG_MDL;
 
 #if defined(GMM_ANTI_QUANT_A8W4_MSD)
 constexpr MatmulConfig A8W4_GMM_CFG_MDL = GetNormalConfig();
+// ### PATCH START: old API dequant MDL scheduling
+// Patch reason: the old API dequant route uses normal, small-block loading.
+// Patch functionality: test MDL loading with the existing unit-flag contract.
+// Signature: no function or operator ABI changes. Remove when upstream adopts
+// the selected scheduling policy for this route.
+constexpr MatmulConfig A8W4_API_DEQUANT_CFG_MDL =
+    GetMDLConfig(false, false, 0, false, false, false, true);
+// ### PATCH END: old API dequant MDL scheduling
 constexpr auto GetMmCFG() {
     auto CFG = CFG_MDL;
     CFG.isPartialOutput = true;
@@ -350,6 +358,9 @@ namespace {
         op.Process(workspace, &tPipe);                                                                 \
     } while (0)
 
+// Patch reason: profile shows sustained MTE2/scalar activity in old API dequant.
+// Patch functionality: select MDL loading only for that route; retain unit flags.
+// Signature: unchanged. Remove this specialization when upstream adopts the policy.
 template <int D_T_A, int D_T_B, int D_T_Y, int TRANS_A, int TRANS_B, int GROUP_LIST_TYPE,
           int IS_STATIC_TILING_API, int A8W4_KERNEL_TEMPLATE, int A16W8_KERNEL_TEMPLATE, int AIV_AIC_RATIO, bool IS_ENABLE_FIXED_AXIS>
 __global__ __aicore__ void grouped_matmul_layered(GM_ADDR x, GM_ADDR weight, GM_ADDR bias, GM_ADDR scale,
@@ -370,7 +381,9 @@ __global__ __aicore__ void grouped_matmul_layered(GM_ADDR x, GM_ADDR weight, GM_
     // ANTIQUANT_A8W4
     if constexpr (D_T_A == GMM_TPL_INT8 && D_T_B == GMM_TPL_INT4) {
         if constexpr (A8W4_KERNEL_TEMPLATE == GROUPED_MATMUL_A8W4_KERNEL_TEMPLATE_MSD_API_DEQUANT) {
-            GMM_CV_SPLIT_IMP_A8W4_MSD(GMMA8W4MSDCompute, A8W4_GMM_CFG_MDL);
+            // ### PATCH START: old API dequant MDL scheduling
+            GMM_CV_SPLIT_IMP_A8W4_MSD(GMMA8W4MSDCompute, A8W4_API_DEQUANT_CFG_MDL);
+            // ### PATCH END: old API dequant MDL scheduling
         } else if constexpr (A8W4_KERNEL_TEMPLATE == GROUPED_MATMUL_A8W4_KERNEL_TEMPLATE_MSD_VECTOR_DEQUANT) {
             GMM_CV_SPLIT_IMP_A8W4_MSD(GMMA8W4MSDComputeNew, A8W4_GMM_CFG_MDL_NEW);
         } else if constexpr (A8W4_KERNEL_TEMPLATE == GROUPED_MATMUL_A8W4_KERNEL_TEMPLATE_PERCHANNEL_ANTIQUANT) {

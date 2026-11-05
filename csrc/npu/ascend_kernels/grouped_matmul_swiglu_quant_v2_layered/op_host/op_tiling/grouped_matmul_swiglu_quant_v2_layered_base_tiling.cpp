@@ -24,6 +24,7 @@
 #include "grouped_matmul_swiglu_quant_v2_layered_base_tiling.h"
 #include "util/math_util.h"
 #include "err/ops_err.h"
+#include <cmath>
 
 using namespace matmul_tiling;
 
@@ -209,6 +210,11 @@ ge::graphStatus GroupedMatmulSwigluQuantV2LayeredBaseTiling::ParseInputAndAttr()
 
     auto attr = context_->GetAttrs();
     OP_CHECK_NULL_WITH_CONTEXT(context_, attr); // check attr is not null
+    const float *swigluLimitPtr = attr->GetAttrPointer<float>(ATTR_INDEX_SWIGLU_LIMIT);
+    swigluLimit_ = swigluLimitPtr != nullptr ? *swigluLimitPtr : 0.0f;
+    OP_CHECK_IF(!std::isfinite(swigluLimit_) || swigluLimit_ < 0.0f,
+                OP_LOGE(context_->GetNodeName(), "swiglu_limit must be finite and nonnegative."),
+                return ge::GRAPH_FAILED);
     const int64_t *dequantModePtr = attr->GetAttrPointer<int64_t>(ATTR_INDEX_DEQUANT_MODE);
     auto dequantMode = dequantModePtr != nullptr ? *dequantModePtr : 0;
     OP_CHECK_IF(!(dequantMode == 0 || dequantMode == 1),
@@ -377,6 +383,9 @@ ge::graphStatus GroupedMatmulSwigluQuantV2LayeredBaseTiling::DynamicTilingSingle
     return ge::GRAPH_SUCCESS;
 }
 
+// Patch reason: actual expert/slice rows require two valid MSD tile configurations.
+// Patch functionality: additionally prepare the fixed-area alternative for device selection.
+// Signature: unchanged. Remove when upstream supports adaptive MSD tiling.
 ge::graphStatus GroupedMatmulSwigluQuantV2LayeredBaseTiling::DoOpTiling()
 {
     OP_LOGD(context_->GetNodeName(), "Begin Run GMM Swiglu Tiling .");
@@ -411,6 +420,26 @@ ge::graphStatus GroupedMatmulSwigluQuantV2LayeredBaseTiling::DoOpTiling()
         tilingData_.mmTilingData.set_stepM(1);
         tilingData_.mmTilingData.set_stepN(1);
     }
+
+    // ### PATCH START: adaptive MSD tile
+    if (isA8W4MSD_) {
+        tiling.SetShape(A8W4_MSD_ADAPTIVE_BASEM, A8W4_MSD_ADAPTIVE_BASEN, k_);
+        tiling.SetFixSplit(A8W4_MSD_ADAPTIVE_BASEM, A8W4_MSD_ADAPTIVE_BASEN, A8W4_BASEK);
+        OP_CHECK_IF(tiling.GetTiling(tilingData_.adaptiveMmTilingData) == -1,
+                    OPS_REPORT_VECTOR_INNER_ERR(context_->GetNodeName(), "adaptive MSD tiling failed"),
+                    return ge::GRAPH_FAILED);
+        tilingData_.adaptiveMmTilingData.set_baseM(A8W4_MSD_ADAPTIVE_BASEM);
+        tilingData_.adaptiveMmTilingData.set_baseN(A8W4_MSD_ADAPTIVE_BASEN);
+        tilingData_.adaptiveMmTilingData.set_baseK(A8W4_BASEK);
+        tilingData_.adaptiveMmTilingData.set_dbL0B(DOUBLE_BUFFER);
+        tilingData_.adaptiveMmTilingData.set_stepKa(NUM_FOUR);
+        tilingData_.adaptiveMmTilingData.set_stepKb(NUM_FOUR);
+        tilingData_.adaptiveMmTilingData.set_depthA1(NUM_EIGHT);
+        tilingData_.adaptiveMmTilingData.set_depthB1(NUM_EIGHT);
+        tilingData_.adaptiveMmTilingData.set_stepM(1);
+        tilingData_.adaptiveMmTilingData.set_stepN(1);
+    }
+    // ### PATCH END: adaptive MSD tile
 
     usrWorkspaceLimit_ = USER_WORKSPACE_LIMIT;
     mLimit_ = 0;
@@ -479,6 +508,7 @@ void GroupedMatmulSwigluQuantV2LayeredBaseTiling::FillTilingData()
     tilingData_.gmmSwigluQuantV2BaseParams.set_groupListType(groupListType_);
     tilingData_.gmmSwigluQuantV2BaseParams.set_smoothScaleDimNum(smoothScaleDimNum_);
     tilingData_.gmmSwigluQuantV2BaseParams.set_layerNum(layerNum_);
+    tilingData_.gmmSwigluQuantV2BaseParams.set_swigluLimit(swigluLimit_);
     tilingData_.gmmSwigluQuantV2.set_maxProcessRowNum(maxProcessRowNum_);
     tilingData_.gmmSwigluQuantV2.set_groupListLen(groupNum_);
     tilingData_.gmmSwigluQuantV2.set_tokenLen(n_);

@@ -8,7 +8,7 @@ body:
     attributes:
       value: >
         Before submitting, please search existing issues to avoid duplicates.
-        afd-plugin targets vLLM v0.30.0 unless an issue explicitly says otherwise.
+        afd-plugin targets vLLM v0.32.0 on GPU and NPU unless an issue says otherwise.
 
   - type: markdown
     attributes:
@@ -20,14 +20,21 @@ body:
     id: environment
     attributes:
       label: Current environment
-      description: Include Python version, platform, afd-plugin commit, vLLM version or checkout, CUDA/GPU details if relevant, and install command.
+      description: Include the exact runtime revisions and the relevant backend, topology, and execution settings.
       value: |
         ```text
         Python:
         OS:
         afd-plugin commit:
         vLLM version/checkout:
-        CUDA/GPU:
+        vLLM-Ascend version/checkout (NPU):
+        PyTorch/build CUDA:
+        torch_npu / CANN / Triton Ascend (NPU):
+        NPU model / SoC / driver / firmware:
+        GPU/driver/compute capability:
+        CUDA toolkit/compiler/NCCL:
+        Connector and topology:
+        Graph/DBO mode:
         Install command:
         ```
     validations:
@@ -76,5 +83,5 @@ body:
       options:
         - label: I searched existing issues for related reports.
           required: true
-        - label: I confirmed whether this reproduces against vLLM v0.30.0 or explained why not.
+        - label: I confirmed whether this reproduces against the applicable GPU or NPU vLLM target, or explained why not.
           required: true

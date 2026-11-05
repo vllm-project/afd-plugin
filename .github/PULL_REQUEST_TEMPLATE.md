@@ -28,7 +28,7 @@ or any behavior that intentionally differs from the original AFD commit.
 
 ## Test Result
 
-<!-- Paste command results, skip reasons, links to GPU validation, or a short explanation if not run. -->
+<!-- Include exact upstream revisions, backend-scoped results, native build/ABI status when relevant, skips, and GPU cleanup evidence. -->
 
 ## Docs Impact
 
@@ -42,7 +42,7 @@ or any behavior that intentionally differs from the original AFD commit.
 
 - [ ] Purpose is clear and linked to public context when possible.
 - [ ] Scope is bounded.
-- [ ] Compatibility with vLLM v0.30.0 is considered.
+- [ ] Compatibility with vLLM v0.32.0 and, for NPU changes, the pinned vLLM-Ascend source is considered, as applicable.
 - [ ] No changes are made to the vLLM source checkout.
 - [ ] Plugin-owned classes or explicit dotted class paths are preferred over monkey patches.
 - [ ] Any compat shim or monkey patch is isolated, idempotent, version-guarded, documented, and tested.

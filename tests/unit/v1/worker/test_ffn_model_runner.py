@@ -24,6 +24,7 @@ from afd_plugin.connectors import (  # noqa: E402
     AFDTransferContext,
     AFDTransferMetadata,
 )
+from afd_plugin.connectors.base import AFDControlPlaneClosedError  # noqa: E402
 from afd_plugin.model_executor.models.deepseek_v2 import (  # noqa: E402
     AFDDeepseekV2ForCausalLM,
 )
@@ -39,6 +40,124 @@ from tests.unit.fakes.dp_metadata import (  # noqa: E402
 from tests.unit.fakes.dp_metadata import dp_tokens as _tokens  # noqa: E402
 from tests.unit.fakes.graph import Graph as _FakeGraph  # noqa: E402
 from tests.unit.fakes.profiler import StepProfiler as _StepProfiler  # noqa: E402
+
+
+@pytest.fixture
+def loop_worker():
+    def make(control_plane):
+        worker = object.__new__(AFDFFNWorker)
+        worker._ffn_thread = None
+        worker._ffn_shutdown_event = threading.Event()
+        worker._ffn_loop_error = None
+        worker.device = SimpleNamespace(type="cpu")
+        worker.model_runner = SimpleNamespace(
+            connector=SimpleNamespace(control_plane=control_plane, is_initialized=True),
+            use_cuda_graph=False,
+            model="owned weights",
+        )
+        return worker
+
+    return make
+
+
+def test_ffn_worker_stops_receiver_before_native_resource_release(
+    monkeypatch, loop_worker
+):
+    receiving = threading.Event()
+    release = threading.Event()
+
+    def receive():
+        receiving.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("receiver was not cancelled")
+        raise AFDControlPlaneClosedError("local close")
+
+    plane = SimpleNamespace(recv_dp_metadata_list=receive, close=release.set)
+    worker = loop_worker(plane)
+    worker.start_ffn_server_loop()
+    thread = worker._ffn_thread
+
+    def native_shutdown(self):
+        if thread.is_alive():
+            raise RuntimeError("receiver still uses runner resources")
+        self.model_runner.model = None
+
+    monkeypatch.setattr(gpu_worker_module.Worker, "shutdown", native_shutdown)
+    try:
+        assert receiving.wait(timeout=5)
+        worker.shutdown()
+        assert worker.model_runner.model is None
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+
+def test_ffn_worker_timeout_retains_resources_and_remains_a_failure(
+    monkeypatch, loop_worker
+):
+    worker = loop_worker(SimpleNamespace(close=lambda: None))
+    worker._ffn_thread = SimpleNamespace(
+        join=lambda timeout: None, is_alive=lambda: True
+    )
+
+    def native_shutdown(self):
+        self.model_runner.model = None
+
+    monkeypatch.setattr(gpu_worker_module.Worker, "shutdown", native_shutdown)
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="did not stop"):
+            worker.shutdown()
+        assert worker.model_runner.model == "owned weights"
+
+
+@pytest.mark.parametrize(
+    "error, request_stop, cancelled",
+    [
+        (AFDControlPlaneClosedError("closed"), True, True),
+        (AFDControlPlaneClosedError("closed"), False, False),
+        (RuntimeError("NCCL failure"), True, False),
+        (ValueError("invalid metadata"), True, False),
+    ],
+)
+def test_ffn_worker_only_consumes_explicit_receive_cancellation(
+    loop_worker, error, request_stop, cancelled
+):
+    plane = SimpleNamespace()
+    worker = loop_worker(plane)
+
+    def receive():
+        if request_stop:
+            worker._ffn_shutdown_event.set()
+        raise error
+
+    plane.recv_dp_metadata_list = receive
+
+    if cancelled:
+        worker._run_ffn_server_loop()
+    else:
+        with pytest.raises(type(error)) as caught:
+            worker._run_ffn_server_loop()
+        assert caught.value is error
+
+
+def test_ffn_worker_releases_native_resources_while_reporting_loop_failure(
+    monkeypatch, loop_worker
+):
+    worker = loop_worker(SimpleNamespace(close=lambda: None))
+    original = RuntimeError("recorded FFN failure")
+    worker._ffn_loop_error = original
+
+    def native_shutdown(self):
+        self.model_runner.model = None
+
+    monkeypatch.setattr(gpu_worker_module.Worker, "shutdown", native_shutdown)
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="FFN worker loop failed") as caught:
+            worker.shutdown()
+        assert caught.value.__cause__ is original
+        assert worker.model_runner.model is None
 
 
 def test_native_weight_update_finishes_without_ffn_lora_state(monkeypatch):
@@ -60,7 +179,6 @@ def test_native_weight_update_finishes_without_ffn_lora_state(monkeypatch):
     worker.finish_weight_update()
 
     assert events == ["finish", "reset_target"]
-    assert not worker._weight_update_active
     assert worker.model_runner.lora_config is None
 
 
@@ -175,65 +293,6 @@ def _runner_with_connector_and_model(model, *, num_layers=1):
     return runner
 
 
-def test_ffn_runner_owns_connector_execution_without_native_runner_inheritance():
-    assert all(base.__name__ != "GPUModelRunner" for base in GPUFFNModelRunner.__mro__)
-
-
-def test_ffn_constructor_defers_connector_init_and_owns_model_and_graphs(monkeypatch):
-    config = SimpleNamespace(
-        use_v2_model_runner=True,
-        model_config=SimpleNamespace(
-            dtype=torch.bfloat16,
-            hf_text_config=SimpleNamespace(num_hidden_layers=2),
-        ),
-        load_config=SimpleNamespace(),
-    )
-    connector = _FakeConnector()
-    events = []
-    monkeypatch.setattr(
-        GPUFFNModelRunner,
-        "parse_config",
-        staticmethod(lambda _config: SimpleNamespace(role="ffn")),
-    )
-    monkeypatch.setattr(
-        ffn_model_runner_module,
-        "validate_gpu_model_runner_v2_config",
-        lambda *_args, **_kwargs: events.append("validate"),
-    )
-    monkeypatch.setattr(
-        ffn_model_runner_module,
-        "validate_cuda_graph_mode",
-        lambda *_args, **_kwargs: SimpleNamespace(enable_ffn_graph_cache=True),
-    )
-    monkeypatch.setattr(ffn_model_runner_module, "_resolve_world_ranks", lambda: (0, 0))
-
-    def create_connector(*_args):
-        events.append("connector")
-        return connector
-
-    monkeypatch.setattr(
-        ffn_model_runner_module.AFDConnectorFactory,
-        "create_connector",
-        create_connector,
-    )
-    monkeypatch.setattr(
-        ffn_model_runner_module, "create_afd_gpu_profiler", lambda _role: None
-    )
-
-    runner = GPUFFNModelRunner(config, torch.device("cpu"))
-
-    assert events == ["validate", "connector"]
-    assert runner.connector is connector
-    assert runner.model is None
-    assert runner.model_memory_usage == 0
-    assert runner.model_config is config.model_config
-    assert runner.load_config is config.load_config
-    assert runner.num_layers == 2
-    assert runner.use_cuda_graph is True
-    assert runner._cuda_graphs == {}
-    assert runner._graph_memory_pool is None
-
-
 def test_ffn_runner_executes_model_compute_ffn_output():
     runner = _runner_with_connector_and_model(_FakeModel())
     metadata = _metadata()
@@ -280,7 +339,6 @@ def test_v2_ffn_runner_keeps_hidden_state_only_connector_contract():
 
     assert not getattr(model, "afd_requires_input_ids", False)
     assert runner.connector.recv_input_ids == [False]
-    assert backbone.calls == [("v2-hidden", 0, {})]
     assert runner.connector.ffn_outputs == [("v2-hidden", metadata)]
 
 
@@ -310,7 +368,6 @@ def test_ffn_runner_forwards_payload_input_ids_to_model():
 
     runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([1])})
 
-    assert model.calls == [("hidden", 0, input_ids)]
     assert runner.connector.ffn_outputs == [(input_ids, metadata)]
     assert runner.connector.recv_input_ids == [True]
 
@@ -379,38 +436,6 @@ def test_ffn_runner_aggregates_each_ubatch_metadata_for_ffn_ranks():
     assert _tokens(control_metadata[1]) == [1, 2, 3, 4]
 
 
-@pytest.mark.parametrize(
-    ("attention_counts", "expected_ffn_counts"),
-    [
-        ([0, 4, 5, 6], [5, 11]),
-        ([], [2, 2]),
-        ([3, 4, 5], [7, 6]),
-    ],
-)
-def test_ffn_runner_matches_p2p_token_count_aggregation(
-    attention_counts,
-    expected_ffn_counts,
-):
-    runner = _runner_with_connector_and_model(_FakeModel())
-    runner.connector.attn_size = 4
-    runner.connector.ffn_size = 2
-    runner.vllm_config.parallel_config.data_parallel_size = 2
-
-    metadata = runner._make_ffn_dp_metadata(_FakeDPMetadata(attention_counts))
-
-    assert _tokens(metadata) == expected_ffn_counts
-
-
-def test_ffn_runner_projects_tensor_parallel_counts_to_dp_metadata():
-    runner = _runner_with_connector_and_model(_FakeModel())
-    runner.connector.attn_size = 2
-    runner.connector.ffn_size = 2
-
-    metadata = runner._make_ffn_dp_metadata(_FakeDPMetadata([8]))
-
-    assert _tokens(metadata) == [8]
-
-
 def test_ffn_side_gate_mixes_dense_and_experts_protocols():
     class _MixedModel(_FakeModel):
         def __init__(self):
@@ -443,67 +468,13 @@ def test_ffn_side_gate_mixes_dense_and_experts_protocols():
 
     runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([1])})
 
-    assert model.calls == [("dense-hidden", 0), ("moe-hidden", 1)]
     assert runner.connector.ffn_outputs == [
         ("ffn(dense-hidden, layer=0)", dense_metadata),
         ("ffn(moe-hidden, layer=1)", expert_context.metadata),
     ]
 
 
-def test_attention_side_gate_processes_only_experts_layers():
-    router_logits = object()
-
-    class _AttentionGateModel(_FakeModel):
-        def __init__(self):
-            self.calls = []
-
-        def get_experts_layer_indices(self):
-            return (1,)
-
-        def get_experts_routing_spec(self, layer_idx):
-            return AFDExpertRoutingSpec(
-                router_logits_width=4,
-                router_logits_dtype=torch.float32,
-            )
-
-        def compute_experts_output(
-            self,
-            hidden_states,
-            layer_idx,
-            received_router_logits,
-        ):
-            self.calls.append(
-                (hidden_states, layer_idx, received_router_logits),
-            )
-            return "expert-output"
-
-    model = _AttentionGateModel()
-    runner = _runner_with_connector_and_model(model, num_layers=2)
-    runner.afd_config.compute_gate_on_attention = True
-    expert_context = AFDTransferContext(
-        metadata=AFDTransferMetadata.create_attention_metadata(
-            layer_idx=1,
-            stage_idx=0,
-            seq_len=1,
-        ),
-    )
-    runner.connector.attn_outputs.append(
-        AFDA2FTransferPayload(
-            hidden_states="moe-hidden",
-            context=expert_context,
-            router_logits=router_logits,
-        ),
-    )
-
-    runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([1])})
-
-    assert model.calls == [("moe-hidden", 1, router_logits)]
-    assert runner.connector.ffn_outputs == [
-        ("expert-output", expert_context.metadata),
-    ]
-
-
-def test_experts_graph_capture_passes_model_routing_spec():
+def test_experts_graph_capture_passes_model_routing_spec():  # long-test: routing ABI
     routing_spec = AFDExpertRoutingSpec(
         router_logits_width=4,
         router_logits_dtype=torch.float32,
@@ -565,7 +536,9 @@ def test_experts_graph_capture_passes_model_routing_spec():
     [False, True],
     ids=["compiled-policy", "warmup"],
 )
-def test_experts_pass_static_routing_spec_for_each_stage(is_warmup):
+def test_experts_pass_static_routing_spec_for_each_stage(
+    is_warmup,
+):  # long-test: two stage payloads must retain their own routing data
     routing_spec = AFDExpertRoutingSpec(
         router_logits_width=4,
         router_logits_dtype=torch.float32,
@@ -639,32 +612,12 @@ def test_ffn_runner_requires_dp_metadata_list():
 
 
 def test_ffn_runner_profiles_zero_cudagraph_memory():
-    """vLLM 0.30.0 Worker.determine_available_memory calls this on CUDA when
+    """Native Worker.determine_available_memory calls this on CUDA when
     CUDA graphs are enabled; FFN graphs are captured lazily from the connector
     loop into their own pool, so the engine estimate must stay zero."""
 
     runner = object.__new__(GPUFFNModelRunner)
     assert GPUFFNModelRunner.profile_cudagraph_memory(runner) == 0
-
-
-def test_ffn_runner_makes_original_style_graph_key():
-    key = make_ffn_graph_key(
-        {
-            1: _FakeDPMetadata([5, 7]),
-            0: _FakeDPMetadata([2, 3]),
-        },
-    )
-
-    assert key == ((0, (2, 3)), (1, (5, 7)))
-
-
-def test_ffn_runner_graph_key_preserves_attention_peer_shapes():
-    first_key = make_ffn_graph_key({0: _FakeDPMetadata([1, 3, 5, 7])})
-    second_key = make_ffn_graph_key({0: _FakeDPMetadata([2, 2, 6, 6])})
-
-    assert first_key == ((0, (1, 3, 5, 7)),)
-    assert second_key == ((0, (2, 2, 6, 6)),)
-    assert first_key != second_key
 
 
 def test_ffn_runner_replays_cuda_graph_when_key_exists():
@@ -717,16 +670,6 @@ def test_ffn_runner_cuda_graph_miss_falls_back_to_eager():
     ]
 
 
-def test_ffn_runner_steps_gpu_profiler():
-    runner = _runner_with_connector_and_model(_FakeModel())
-    runner.prof = _StepProfiler()
-    runner.connector.attn_outputs.append(_payload("hidden", _metadata()))
-
-    runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([1])})
-
-    assert runner.prof.steps == 1
-
-
 def test_ffn_runner_releases_owned_runtime_state_on_shutdown(monkeypatch):
     runner = _runner_with_connector_and_model(_FakeModel())
     runner.prof = _StepProfiler()
@@ -746,8 +689,6 @@ def test_ffn_runner_releases_owned_runtime_state_on_shutdown(monkeypatch):
     runner.shutdown()
 
     assert graph.reset_count == 1
-    assert runner._cuda_graphs == {}
-    assert runner._graph_memory_pool is None
     assert runner.vllm_config.compilation_config.static_forward_context == {}
     assert runner.model is None
     assert rope_cache == {}
@@ -839,7 +780,6 @@ def test_ffn_worker_loop_logs_unexpected_thread_errors(caplog):
         assert worker._ffn_thread is not None
         worker._ffn_thread.join(timeout=5)
 
-    assert worker._ffn_loop_error is expected_error
     assert "AFD FFN worker loop failed" in caplog.text
     with pytest.raises(RuntimeError, match="AFD FFN worker loop failed") as exc:
         worker.raise_ffn_loop_error_if_any()

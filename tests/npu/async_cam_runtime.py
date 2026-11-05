@@ -29,7 +29,7 @@ from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
-from afd_plugin.model_executor.npu.async_cam_w4a8 import W4A8LayerWeights
+from afd_plugin.model_executor.npu.async_cam_layered import LayeredFFNWeights
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 
 HIDDEN = 256
@@ -48,7 +48,7 @@ class SyntheticModel(torch.nn.Module):
             w13, s13, b13 = self.make_weight(device, per_channel, slot + 1, True)
             w2, s2, b2 = self.make_weight(device, per_channel, 1, False)
             self.layers.append(
-                W4A8LayerWeights(
+                LayeredFFNWeights(
                     layer_id, w13, w2, s13, s2, b13, b2, per_channel, LIMIT, 1.0
                 )
             )
@@ -80,7 +80,7 @@ class SyntheticModel(torch.nn.Module):
     def get_experts_layer_indices(self):
         return LAYERS
 
-    def get_async_cam_w4a8_layers(self):
+    def get_async_cam_layered_weights(self):
         return self.layers, ""
 
 
@@ -96,7 +96,6 @@ def main():
     if args.full_graph and not args.reference_outputs:
         parser.error("FULL replay requires saved matching eager outputs")
     faulthandler.dump_traceback_later(60)
-    os.environ["AFD_ASYNC_CAM_LAYERED_GMM"] = "1"
     os.environ["BATCH_SIZE_FACTOR"] = str(16 / 262144)
     os.environ["HCCL_BUFFSIZE"] = "64"
     ensure_cam_async_ops_available()

@@ -9,6 +9,9 @@ _RUNTIME_EXPORTS = {
     "AFDAttentionWorker": "afd_plugin.v1.worker.attention_worker",
     "AFDFFNWorker": "afd_plugin.v1.worker.ffn_worker",
     "GPUFFNModelRunner": "afd_plugin.v1.worker.ffn_model_runner",
+    "GPUFFNRoutedExpertsModelRunner": (
+        "afd_plugin.v1.worker.ffn_routed_experts_model_runner"
+    ),
 }
 
 
@@ -27,4 +30,5 @@ __all__ = [
     "AFDAttentionWorker",
     "AFDFFNWorker",
     "GPUFFNModelRunner",
+    "GPUFFNRoutedExpertsModelRunner",
 ]

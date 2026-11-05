@@ -153,6 +153,13 @@ A8W4-MSD variants) built for `ascend910_93`. It is registered as
 autograd grad) and is excluded from `ascend950` builds. The Async CAM layered
 W4A8 executor selects it with `AFD_ASYNC_CAM_LAYERED_GMM=1`.
 
+The trailing `swiglu_limit` argument defaults to `0.0` (no clipping). A finite
+positive `L` computes `SiLU(min(gate, L)) * clamp(up, -L, L)` before output
+quantization on A8W4 and A4W4. The gate has no lower clamp. Positive limits on
+A8W8 are rejected. The layered W4A8 executor forwards the model's limit, including
+DeepSeek-V4's `10.0`, in eager and graph execution. Rebuild both the native
+extension and CANN package together when upgrading this interface.
+
 A8W8 accepts an NZ weight as either an explicit five-dimensional view or the
 three-dimensional logical view `npu_format_cast` produces over NZ storage; the
 dimension and shape checks accept both, as the A8W4/A4W4 path already did.

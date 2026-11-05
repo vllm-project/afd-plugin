@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -13,10 +16,11 @@ from afd_plugin.model_executor.models.qwen3_5 import (  # noqa: E402
     AFDQwen3_5MoeForConditionalGeneration,
     _checkpoint_weight_roles,
 )
+from tests.unit.fakes.weights import OneShotWeights  # noqa: E402
 
 ATTENTION = frozenset(("attention",))
 FFN = frozenset(("ffn",))
-NONE = frozenset()
+NONE: frozenset[str] = frozenset()
 
 
 @pytest.mark.parametrize(
@@ -55,12 +59,6 @@ def test_qwen_checkpoint_weight_roles(name, roles):
     assert _checkpoint_weight_roles(name) == roles
 
 
-def test_qwen_ffn_gate_owns_router_checkpoint_weight():
-    name = "model.language_model.model.layers.0.mlp.gate.weight"
-
-    assert _checkpoint_weight_roles(name) == FFN
-
-
 def test_qwen_load_weights_filters_one_shot_iterator(monkeypatch):
     names = [
         "model.language_model.model.embed_tokens.weight",
@@ -69,16 +67,9 @@ def test_qwen_load_weights_filters_one_shot_iterator(monkeypatch):
         "model.language_model.model.layers.0.mlp.shared_expert_gate.weight",
         "model.visual.patch_embed.proj.weight",
     ]
-    iterations = 0
+    weights = OneShotWeights(names)
 
-    def one_shot():
-        nonlocal iterations
-        iterations += 1
-        if iterations > 1:
-            raise AssertionError("checkpoint iterator consumed more than once")
-        yield from ((name, torch.tensor([index])) for index, name in enumerate(names))
-
-    seen = []
+    seen: list[str] = []
     expected = {"native.loaded"}
 
     def native_load_weights(self, weights):
@@ -98,40 +89,8 @@ def test_qwen_load_weights_filters_one_shot_iterator(monkeypatch):
         SimpleNamespace(role="ffn", compute_gate_on_attention=False),
     )
 
-    result = model.load_weights(one_shot())
+    result = model.load_weights(weights)
 
     assert result is expected
     assert seen == names[1:4]
-    assert iterations == 1
-
-
-def test_qwen_ffn_gate_loads_router_with_experts(monkeypatch):
-    names = [
-        "model.language_model.model.layers.0.mlp.gate.weight",
-        "model.language_model.model.layers.0.mlp.experts.0.down_proj.weight",
-        "model.language_model.model.layers.0.mlp.shared_expert_gate.weight",
-    ]
-    seen = []
-
-    def native_load_weights(self, weights):
-        seen.extend(name for name, _ in weights)
-        return set()
-
-    monkeypatch.setattr(
-        native.Qwen3_5MoeForConditionalGeneration,
-        "load_weights",
-        native_load_weights,
-    )
-    model = object.__new__(AFDQwen3_5MoeForConditionalGeneration)
-    object.__setattr__(model, "afd_role", "ffn")
-    object.__setattr__(
-        model,
-        "afd_config",
-        SimpleNamespace(role="ffn", compute_gate_on_attention=False),
-    )
-
-    model.load_weights(
-        (name, torch.tensor([index])) for index, name in enumerate(names)
-    )
-
-    assert seen == names
+    assert weights.iterations == 1

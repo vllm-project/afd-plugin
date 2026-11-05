@@ -42,7 +42,7 @@ def load_async_modules(monkeypatch):
         "afd_plugin.compat.npu.ops",
         "afd_plugin.compat.npu.forward_context",
         "afd_plugin.compat.npu.profiler",
-        "afd_plugin.model_executor.npu.async_cam_w4a8",
+        "afd_plugin.model_executor.npu.async_cam_layered",
         "afd_plugin.v1.worker.ffn_metadata",
     ):
         stub(name)

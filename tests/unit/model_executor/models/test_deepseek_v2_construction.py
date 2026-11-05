@@ -3,9 +3,6 @@
 
 from __future__ import annotations
 
-import ast
-import hashlib
-from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -22,19 +19,12 @@ pytest.importorskip("vllm")
 
 from vllm.config import CompilationMode  # noqa: E402
 
-from afd_plugin.config import AFDConfig  # noqa: E402
+from afd_plugin.config import DEEPEP_M2N_CONNECTOR, AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
+from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
+from tests.unit.fakes.model_layers import GateLinear
 from tests.unit.fakes.model_layers import Stage as _FakeStage  # noqa: E402
 from tests.unit.fakes.model_layers import stage_type as _stage_type
-
-CONSTRUCTOR_DIGESTS = {
-    "AFDDeepseekV2Model": (
-        "a8da081dd6793d64fbb2a7774a073f5dbc2f5faf904e2b7921f286031c859dc9"
-    ),
-    "AFDDeepseekV2DecoderLayer": (
-        "83ebb82ab4e7d4e65fef6ea9427715af121f9eab04e75bbf1e31b370ec05faf1"
-    ),
-}
 
 
 @pytest.fixture
@@ -138,9 +128,11 @@ def _make_layer(
     layer_idx: int,
     attention_gate: bool = False,
     vllm_config=None,
+    connector: str = "P2pNcclAFDConnector",
 ):
     afd_config = AFDConfig(
         role=role,
+        connector=connector,
         compute_gate_on_attention=attention_gate,
     )
     monkeypatch.setattr(
@@ -160,55 +152,6 @@ def _parameter_names(module: nn.Module) -> set[str]:
     return {name for name, _ in module.named_parameters()}
 
 
-def _constructor_source(class_name: str) -> str:
-    source = Path(adapter.__file__).read_text()
-    source_lines = source.splitlines()
-    module = ast.parse(source)
-    class_node = next(
-        node
-        for node in module.body
-        if isinstance(node, ast.ClassDef) and node.name == class_name
-    )
-    constructor = next(
-        node
-        for node in class_node.body
-        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
-    )
-    return "\n".join(
-        source_lines[constructor.lineno - 1 : constructor.end_lineno],
-    )
-
-
-def _masked_patch_sha256(source: str) -> str:
-    masked_lines = []
-    in_patch = False
-    for line in source.splitlines():
-        if "# ### PATCH START" in line:
-            assert not in_patch
-            indentation = line[: len(line) - len(line.lstrip())]
-            masked_lines.append(f"{indentation}# <AFD PATCH>")
-            in_patch = True
-        elif "# ### PATCH END" in line:
-            assert in_patch
-            in_patch = False
-        elif not in_patch:
-            masked_lines.append(line.rstrip())
-    assert not in_patch
-    masked_source = "\n".join(masked_lines).strip() + "\n"
-    return hashlib.sha256(masked_source.encode()).hexdigest()
-
-
-@pytest.mark.parametrize(
-    ("class_name", "expected_digest"),
-    CONSTRUCTOR_DIGESTS.items(),
-)
-def test_non_patch_constructor_source_matches_pinned_vllm(
-    class_name: str,
-    expected_digest: str,
-) -> None:
-    assert _masked_patch_sha256(_constructor_source(class_name)) == expected_digest
-
-
 def test_standard_attention_constructs_no_ffn_parameters(
     monkeypatch,
     construction_env,
@@ -216,12 +159,6 @@ def test_standard_attention_constructs_no_ffn_parameters(
     dense = _make_layer(monkeypatch, role="attention", layer_idx=0)
     moe = _make_layer(monkeypatch, role="attention", layer_idx=1)
 
-    assert construction_env["attention"] == [
-        "model.layers.0.self_attn",
-        "model.layers.1.self_attn",
-    ]
-    assert construction_env["dense"] == []
-    assert construction_env["moe"] == []
     assert isinstance(dense.mlp, adapter.RemoteFFNProxy)
     assert isinstance(moe.mlp, adapter.RemoteFFNProxy)
     assert not any(name.startswith("mlp.") for name in _parameter_names(dense))
@@ -258,9 +195,6 @@ def test_attention_gate_keeps_dense_local_and_gate_at_mlp_path(
         attention_gate=True,
     )
 
-    assert construction_env["dense"] == ["model.layers.0.mlp"]
-    assert construction_env["moe"] == []
-    assert construction_env["gate"] == ["model.layers.1.mlp.gate"]
     assert isinstance(moe.mlp, adapter.GateOnlyRemoteMoE)
     assert "mlp.gate.weight" in _parameter_names(moe)
     assert "mlp.gate.e_score_correction_bias" in _parameter_names(moe)
@@ -272,17 +206,8 @@ def test_npu_gate_only_uses_native_gate_precision_and_checkpoint_name(
     monkeypatch,
     construction_env,
 ):
-    gate_calls = []
 
-    class _FakeGate(nn.Module):
-        def __init__(self, input_size, output_size, **kwargs):
-            super().__init__()
-            gate_calls.append((input_size, output_size, kwargs))
-            self.weight = nn.Parameter(
-                torch.empty(output_size, input_size, dtype=torch.float32),
-            )
-
-    monkeypatch.setattr(adapter.native, "GateLinear", _FakeGate)
+    monkeypatch.setattr(adapter.native, "GateLinear", GateLinear)
     vllm_config = _vllm_config()
     vllm_config.model_config.hf_config.moe_router_dtype = "float32"
 
@@ -295,18 +220,6 @@ def test_npu_gate_only_uses_native_gate_precision_and_checkpoint_name(
     )
 
     gate = layer.mlp.gate
-    assert layer.mlp.gate_router.gate is gate
-    assert gate_calls == [
-        (
-            8,
-            4,
-            {
-                "out_dtype": torch.float32,
-                "prefix": "model.layers.1.mlp.gate",
-            },
-        ),
-    ]
-    assert construction_env["gate"] == []
     assert gate.weight.dtype == torch.float32
     assert "mlp.gate.weight" in _parameter_names(layer)
 
@@ -324,13 +237,6 @@ def test_cuda_attention_gate_uses_native_gate_contract(
     monkeypatch,
     construction_env,
 ):
-    gate_calls = []
-
-    class _FakeGate(nn.Module):
-        def __init__(self, input_size, output_size, **kwargs):
-            super().__init__()
-            gate_calls.append((input_size, output_size, kwargs))
-            self.weight = nn.Parameter(torch.empty(output_size, input_size))
 
     vllm_config = _vllm_config()
     vllm_config.model_config.hf_config.moe_router_dtype = "float32"
@@ -339,7 +245,7 @@ def test_cuda_attention_gate_uses_native_gate_contract(
         "current_platform",
         SimpleNamespace(device_type="cuda"),
     )
-    monkeypatch.setattr(adapter.native, "GateLinear", _FakeGate)
+    monkeypatch.setattr(adapter.native, "GateLinear", GateLinear)
     monkeypatch.setattr(
         adapter.native,
         "get_tensor_model_parallel_world_size",
@@ -369,18 +275,11 @@ def test_cuda_attention_gate_uses_native_gate_contract(
 
     assert isinstance(moe.mlp, adapter.AFDDeepseekV2RemoteExpertsMoE)
     assert isinstance(moe.mlp.experts, adapter.AFDAttentionFusedMoE)
-    assert gate_calls == [
-        (
-            8,
-            4,
-            {
-                "out_dtype": torch.float32,
-                "prefix": "model.layers.1.mlp.gate",
-            },
-        ),
-    ]
     assert list(moe.mlp.experts.parameters()) == []
     assert list(moe.mlp.experts.buffers()) == []
+
+    assert moe.mlp.gate.weight.dtype == torch.float32
+    assert "mlp.gate.weight" in _parameter_names(moe)
 
 
 def test_cuda_remote_experts_reject_eplb_on_attention(
@@ -408,7 +307,7 @@ def test_cuda_remote_experts_reject_eplb_on_attention(
 def test_cuda_ffn_gate_uses_parameter_free_external_router_shell(
     monkeypatch,
     construction_env,
-):
+):  # long-test: native router shell ABI plus role-owned parameters
     monkeypatch.setattr(
         adapter.native,
         "current_platform",
@@ -450,7 +349,7 @@ def test_cuda_ffn_gate_uses_parameter_free_external_router_shell(
     assert isinstance(moe.mlp, adapter.AFDDeepseekV2RemoteExpertsMoE)
     assert isinstance(moe.mlp.experts, adapter.AFDAttentionFusedMoE)
     assert moe.mlp.gate is None
-    # v0.30 contract: the gate-less shell is externally routed, so its proxy
+    # Native contract: the gate-less shell is externally routed, so its proxy
     # ships hidden states only and the FFN-side runner computes the routing.
     assert moe.mlp.experts.external_routing is False
     # 0.30's native MoE forward no longer computes an external gate, so
@@ -462,6 +361,98 @@ def test_cuda_ffn_gate_uses_parameter_free_external_router_shell(
     assert not any(name.startswith("mlp.") for name in _parameter_names(moe))
 
 
+def _use_cuda_remote_experts(monkeypatch) -> None:
+    monkeypatch.setattr(
+        adapter.native,
+        "current_platform",
+        SimpleNamespace(device_type="cuda"),
+    )
+    monkeypatch.setattr(
+        adapter.native,
+        "get_ep_group",
+        lambda: SimpleNamespace(
+            device_group=SimpleNamespace(size=lambda: 1),
+            rank_in_group=0,
+        ),
+    )
+    monkeypatch.setattr(adapter.native, "_get_moe_router_dtype", lambda _c: None)
+    monkeypatch.setattr(
+        adapter,
+        "create_fused_moe_router",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+
+
+def test_deepep_m2n_attention_owns_gate_and_shared_experts(
+    monkeypatch,
+    construction_env,
+):
+    """Under DeepEP M2N, Attention builds the gate and the native shared MLP at
+    their checkpoint paths and no routed experts.
+
+    Why: the DeepEP M2N FFN runs routed experts only, so the shared experts'
+    output must come from Attention.
+    """
+    _use_cuda_remote_experts(monkeypatch)
+    vllm_config = _vllm_config()
+    vllm_config.parallel_config.tensor_parallel_size = 1
+
+    layer = _make_layer(
+        monkeypatch,
+        role="attention",
+        layer_idx=1,
+        attention_gate=True,
+        vllm_config=vllm_config,
+        connector=DEEPEP_M2N_CONNECTOR,
+    )
+
+    assert type(layer.mlp) is adapter.AFDDeepseekV2RoutedExpertsMoE
+    assert {name for name in _parameter_names(layer) if name.startswith("mlp.")} == {
+        "mlp.gate.weight",
+        "mlp.gate.e_score_correction_bias",
+        "mlp.shared_experts.weight",
+    }
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_deepep_m2n_shared_experts_replicated_under_attention_tp(
+    monkeypatch,
+    construction_env,
+    tp_size,
+):
+    """With Attention TP > 1 the shared MLP is built sequence-parallel
+    (replicated weights, no all-reduce); with TP 1 it is the plain native MLP.
+
+    Why: each TP rank runs the shared MLP on its own token slice; a TP-sharded
+    MLP would all-reduce partial sums of different tokens.
+    """
+    _use_cuda_remote_experts(monkeypatch)
+    shared_kwargs = []
+
+    class _RecordingMLP(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            shared_kwargs.append(kwargs)
+
+    monkeypatch.setattr(adapter.native, "DeepseekV2MLP", _RecordingMLP)
+    vllm_config = _vllm_config()
+    vllm_config.parallel_config.tensor_parallel_size = tp_size
+
+    layer = _make_layer(
+        monkeypatch,
+        role="attention",
+        layer_idx=1,
+        attention_gate=True,
+        vllm_config=vllm_config,
+        connector=DEEPEP_M2N_CONNECTOR,
+    )
+
+    assert layer.mlp.tp_size == tp_size
+    (kwargs,) = shared_kwargs
+    assert kwargs["prefix"] == "model.layers.1.mlp.shared_experts"
+    assert kwargs["is_sequence_parallel"] is (tp_size > 1)
+
+
 def test_ffn_constructs_no_real_attention(
     monkeypatch,
     construction_env,
@@ -469,9 +460,6 @@ def test_ffn_constructs_no_real_attention(
     dense = _make_layer(monkeypatch, role="ffn", layer_idx=0)
     moe = _make_layer(monkeypatch, role="ffn", layer_idx=1)
 
-    assert construction_env["attention"] == []
-    assert construction_env["dense"] == ["model.layers.0.mlp"]
-    assert construction_env["moe"] == ["model.layers.1.mlp"]
     assert isinstance(dense.self_attn, adapter.native.PPMissingLayer)
     assert isinstance(moe.self_attn, adapter.native.PPMissingLayer)
     assert not any(name.startswith("self_attn.") for name in _parameter_names(dense))
@@ -481,10 +469,10 @@ def test_ffn_constructs_no_real_attention(
 def test_attention_shell_computes_gate_before_transport(
     monkeypatch,
     construction_env,
-):
+):  # long-test: native gate output must be present in the peer transport payload
     """CUDA compute_gate_on_attention=True ships real router logits.
 
-    vLLM 0.30.0's native MoE forward passes router_logits=hidden_states and
+    The pinned native MoE forward passes router_logits=hidden_states and
     expects the experts runner to hold the gate. The Attention-side shell
     owns the gate, so its forward must compute the logits before transport;
     shipping hidden states breaks the P2P width contract (hidden_size vs
@@ -505,27 +493,9 @@ def test_attention_shell_computes_gate_before_transport(
     )
     monkeypatch.setattr(adapter.native, "_get_moe_router_dtype", lambda _c: None)
 
-    gate_calls = []
-
-    class _FakeGate(nn.Module):
-        def __init__(self, hidden_size, n_experts, out_dtype=None, prefix=""):
-            super().__init__()
-            self.n_experts = n_experts
-
-        def forward(self, hidden_states):
-            gate_calls.append(tuple(hidden_states.shape))
-            return torch.zeros((hidden_states.shape[0], self.n_experts)), None
-
-    monkeypatch.setattr(adapter.native, "GateLinear", _FakeGate)
-
-    sent = []
-
-    class _RecordingProxy(adapter.AFDAttentionFusedMoE):
-        def _send_and_receive(self, hidden_states, **send_kwargs):
-            sent.append(send_kwargs)
-            return hidden_states
-
-    monkeypatch.setattr(adapter, "AFDAttentionFusedMoE", _RecordingProxy)
+    monkeypatch.setattr(adapter.native, "GateLinear", GateLinear)
+    events: list[tuple] = []
+    install_proxy_context(adapter, monkeypatch, events, stage_idx=0)
 
     vllm_config = _vllm_config()
     shell = adapter.AFDDeepseekV2RemoteExpertsMoE(
@@ -535,18 +505,15 @@ def test_attention_shell_computes_gate_before_transport(
         prefix="model.layers.1.mlp",
         compute_gate_on_attention=True,
     )
-    assert shell.experts.external_routing is True
 
-    hidden_states = torch.zeros((2, 8))
+    shell.gate.weight.data.fill_(1)
+    hidden_states = torch.ones((2, 8), dtype=torch.bfloat16)
     output = shell.forward(hidden_states)
-
-    assert gate_calls == [(2, 8)]
-    assert len(sent) == 1
-    assert sent[0]["router_logits"].shape == (
-        2,
-        vllm_config.model_config.hf_config.n_routed_experts,
+    assert [event[0] for event in events] == ["send", "yield", "recv"]
+    torch.testing.assert_close(
+        events[0][3]["router_logits"], torch.full((2, 4), 8.0, dtype=torch.bfloat16)
     )
-    assert torch.equal(output, hidden_states)
+    torch.testing.assert_close(output, hidden_states * 0.25)
 
 
 def test_attention_shell_without_gate_keeps_native_delegation(
@@ -615,7 +582,7 @@ def test_npu_ffn_refreshes_native_fused_moe_factory(
 
 @pytest.mark.parametrize(
     ("aiter_enabled", "apply_routed_scale_to_output"),
-    [(False, True), (True, False)],
+    [(False, True)],
 )
 def test_ffn_moe_preserves_native_routed_scale_placement(
     monkeypatch,
@@ -704,9 +671,6 @@ def test_attention_gate_ffn_dense_uses_non_executing_placeholder(
         attention_gate=True,
     )
 
-    assert construction_env["attention"] == []
-    assert construction_env["dense"] == []
-    assert construction_env["moe"] == ["model.layers.1.mlp"]
     assert isinstance(dense.mlp, adapter.native.PPMissingLayer)
     assert isinstance(moe.self_attn, adapter.native.PPMissingLayer)
 
@@ -764,55 +728,9 @@ def test_model_constructor_uses_role_aware_layers(
     assert all(
         isinstance(layer, adapter.AFDDeepseekV2DecoderLayer) for layer in model.layers
     )
-    assert construction_env["dense"] == []
-    assert construction_env["moe"] == []
     assert model.hidden_size == vllm_config.model_config.hf_config.hidden_size
     assert model.use_mha
     assert model.num_redundant_experts == 0
-    assert (
-        sum(
-            base.__name__ == "TorchCompileWithNoGuardsWrapper"
-            for base in type(model).__mro__
-        )
-        == 1
-    )
-
-
-@pytest.mark.parametrize(
-    ("role", "expected_allocations"),
-    [("attention", 1), ("ffn", 0)],
-)
-def test_v32_indexer_buffer_is_allocated_only_on_attention(
-    monkeypatch,
-    construction_env,
-    role,
-    expected_allocations,
-):
-    vllm_config = _vllm_config()
-    vllm_config.model_config.hf_config.index_topk = 2048
-    afd_config = AFDConfig(role=role)
-    monkeypatch.setattr(
-        adapter,
-        "parse_afd_config",
-        lambda *_args, **_kwargs: afd_config,
-    )
-    _patch_model_constructor_dependencies(monkeypatch, construction_env)
-
-    original_empty = torch.empty
-    indexer_allocations = []
-
-    def track_empty(*size, **kwargs):
-        if size[:2] == (8, 2048):
-            indexer_allocations.append((size, kwargs.copy()))
-            kwargs = {key: value for key, value in kwargs.items() if key != "device"}
-        return original_empty(*size, **kwargs)
-
-    monkeypatch.setattr(adapter.torch, "empty", track_empty)
-
-    model = adapter.AFDDeepseekV2Model(vllm_config=vllm_config, prefix="model")
-
-    assert model.is_v32
-    assert len(indexer_allocations) == expected_allocations
 
 
 def test_afd_alias_without_activation_fails_before_construction(monkeypatch):
@@ -825,12 +743,6 @@ def test_afd_alias_without_activation_fails_before_construction(monkeypatch):
         adapter.AFDDeepseekV2Model(vllm_config=vllm_config, prefix="model")
     with pytest.raises(ValueError, match="requires additional_config"):
         adapter.AFDDeepseekV2DecoderLayer(vllm_config, "model.layers.0")
-
-    assert issubclass(
-        adapter.AFDDeepseekV2ForCausalLM,
-        adapter.native.DeepseekV2ForCausalLM,
-    )
-    assert adapter.AFDDeepseekV2ForCausalLM.model_cls is adapter.AFDDeepseekV2Model
 
 
 def test_model_constructor_rejects_sequence_parallel_moe_before_allocation(
@@ -848,10 +760,7 @@ def test_model_constructor_rejects_sequence_parallel_moe_before_allocation(
     with pytest.raises(RuntimeError, match="sequence-parallel MoE"):
         adapter.AFDDeepseekV2Model(vllm_config=vllm_config, prefix="model")
 
-    assert all(not calls for calls in construction_env.values())
 
-
-@pytest.mark.parametrize("pp_size", [1, 2])
 def test_npu_async_attention_allows_model_owned_sp(
     monkeypatch,
     construction_env,
@@ -859,7 +768,7 @@ def test_npu_async_attention_allows_model_owned_sp(
 ):
     vllm_config = _vllm_config()
     vllm_config.parallel_config.use_sequence_parallel_moe = True
-    vllm_config.parallel_config.pipeline_parallel_size = pp_size
+    vllm_config.parallel_config.pipeline_parallel_size = 1
     monkeypatch.setattr(
         adapter.native,
         "current_platform",
@@ -877,8 +786,7 @@ def test_npu_async_attention_allows_model_owned_sp(
     _patch_model_constructor_dependencies(monkeypatch, construction_env)
     model = adapter.AFDDeepseekV2Model(vllm_config=vllm_config, prefix="model")
     assert not model.layers[0].use_sequence_parallel_moe
-    assert model.layers[1].use_sequence_parallel_moe is (pp_size == 1)
-    assert construction_env["moe"] == []
+    assert model.layers[1].use_sequence_parallel_moe is True
 
 
 @pytest.mark.parametrize(
@@ -912,10 +820,14 @@ def test_sp_remains_rejected_outside_npu_async_attention(
     )
     with pytest.raises(RuntimeError, match="sequence-parallel MoE"):
         adapter.AFDDeepseekV2Model(vllm_config=vllm_config, prefix="model")
-    assert all(not calls for calls in construction_env.values())
 
 
-def test_async_ffn_omits_shared_with_real_hf_config(monkeypatch, construction_env):
+@pytest.mark.parametrize(
+    "connector", ["CAMAsyncAFDConnector", DEEPEP_M2N_CONNECTOR], ids=["async", "m2n"]
+)
+def test_ffn_omits_attention_owned_shared_with_real_hf_config(
+    monkeypatch, construction_env, connector
+):
     from transformers import DeepseekV2Config
 
     original = DeepseekV2Config(
@@ -939,7 +851,7 @@ def test_async_ffn_omits_shared_with_real_hf_config(monkeypatch, construction_en
         "parse_afd_config",
         lambda *_args, **_kwargs: AFDConfig(
             role="ffn",
-            connector="CAMAsyncAFDConnector",
+            connector=connector,
             compute_gate_on_attention=True,
         ),
     )

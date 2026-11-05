@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 
+from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
 
 
 def camp2p_config(
@@ -42,6 +44,7 @@ def npu_parallel_config(**overrides):
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
         "use_sequence_parallel_moe": False,
+        "enable_eplb": False,
         "prefill_context_parallel_size": 1,
         "decode_context_parallel_size": 1,
         "dbo_decode_token_threshold": 1,
@@ -114,7 +117,7 @@ def async_moe_config(
     num_ubatches=2,
     **extra_config,
 ):
-    return npu_vllm_config(
+    config = npu_vllm_config(
         role=role,
         connector="CAMAsyncAFDConnector",
         use_mla=True,
@@ -129,6 +132,252 @@ def async_moe_config(
         num_ubatches=num_ubatches,
         extra_config={
             "attn_ranks_per_dp": tensor_parallel_size,
+            "dynamicQuant": 1,
             **extra_config,
         },
+    )
+    config.model_config.hf_text_config.model_type = "deepseek_v4"
+    return config
+
+
+# DeepEP M2N connector tests: Qwen3-30B-A3B MoE shapes.
+M2N_HIDDEN_SIZE = 2048
+M2N_NUM_EXPERTS = 128
+M2N_TOP_K = 8
+M2N_INTERMEDIATE_SIZE = 768
+# Fake vLLM limits: capacity defaults to the larger of the two.
+M2N_MAX_NUM_BATCHED_TOKENS = 8192
+M2N_MAX_CUDAGRAPH_CAPTURE_SIZE = 512
+# Fake CUDA-graph capture sizes: 1, 2, 4, then every 8 up to the maximum above.
+M2N_CUDAGRAPH_CAPTURE_SIZES = (
+    1,
+    2,
+    4,
+    *range(8, M2N_MAX_CUDAGRAPH_CAPTURE_SIZE + 1, 8),
+)
+
+
+@dataclass(frozen=True)
+class M2NTopology:
+    ffn_size: int
+    attn_size: int
+    # Attention TP peers (consecutive Attention ranks) share one DP rank's
+    # tokens; each dispatches its slice.
+    attn_tp_size: int = 1
+
+    @property
+    def world_size(self) -> int:
+        return self.ffn_size + self.attn_size
+
+    @property
+    def attn_dp_size(self) -> int:
+        return self.attn_size // self.attn_tp_size
+
+    def role(self, world_rank: int) -> tuple[str, int]:
+        if world_rank < self.ffn_size:
+            return "ffn", world_rank
+        return "attention", world_rank - self.ffn_size
+
+
+def m2n_vllm_config(
+    topology: M2NTopology,
+    role: str,
+    role_rank: int,
+    extra_config: dict[str, Any],
+    port: int,
+    host: str = "127.0.0.1",
+) -> SimpleNamespace:
+    """A ``vllm_config`` for one DeepEP M2N rank of ``topology``."""
+    # Deferred: this fakes module must import on CPU-only hosts without torch.
+    import torch
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    text_config = SimpleNamespace(
+        hidden_size=M2N_HIDDEN_SIZE,
+        num_hidden_layers=2,
+        num_experts=M2N_NUM_EXPERTS,
+        num_experts_per_tok=M2N_TOP_K,
+        moe_intermediate_size=M2N_INTERMEDIATE_SIZE,
+    )
+    # vLLM's view: FFN ranks are DP ranks; Attention ranks are DP x TP.
+    tp_size = 1 if role == "ffn" else topology.attn_tp_size
+    dp_size = topology.ffn_size if role == "ffn" else topology.attn_dp_size
+    # The FFN deployment the handshake requires: linear EP over the FFN ranks,
+    # with checkpoint weights in the payload's format.
+    quant_config = (
+        Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
+        if extra_config.get("payload_format") == "fp8_block128_fp32"
+        else None
+    )
+    return SimpleNamespace(
+        additional_config={
+            "afd": {
+                "connector": "DeepEPM2NAFDConnector",
+                "role": role,
+                "host": host,
+                "port": port,
+                "num_attention_ranks": topology.attn_size,
+                "num_ffn_ranks": topology.ffn_size,
+                "compute_gate_on_attention": True,
+                "connector_extra_config": extra_config,
+            }
+        },
+        quant_config=quant_config,
+        compilation_config=SimpleNamespace(
+            max_cudagraph_capture_size=M2N_MAX_CUDAGRAPH_CAPTURE_SIZE,
+            cudagraph_capture_sizes=list(M2N_CUDAGRAPH_CAPTURE_SIZES),
+        ),
+        model_config=SimpleNamespace(
+            dtype=torch.bfloat16,
+            enforce_eager=True,
+            get_num_experts=lambda: M2N_NUM_EXPERTS,
+            hf_config=text_config,
+            hf_text_config=text_config,
+        ),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=dp_size,
+            data_parallel_rank=role_rank // tp_size,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            tensor_parallel_size=tp_size,
+            enable_expert_parallel=True,
+            expert_placement_strategy="linear",
+            enable_eplb=False,
+            all2all_backend="allgather_reducescatter",
+            use_ubatching=False,
+            num_ubatches=1,
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=M2N_MAX_NUM_BATCHED_TOKENS
+        ),
+    )
+
+
+def npu_dspark_config(*, role="attention", draft_eager=True):
+    hf = SimpleNamespace(
+        architectures=["DSparkDraftModel"],
+        vocab_size=16,
+        hidden_size=8,
+        num_experts_per_tok=2,
+        n_routed_experts=8,
+    )
+    config = npu_vllm_config(
+        role=role,
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+        extra_config={"dynamicQuant": 1},
+        speculative_config=SimpleNamespace(
+            method="dspark",
+            enforce_eager=draft_eager,
+            num_speculative_tokens=5,
+            draft_parallel_config=SimpleNamespace(tensor_parallel_size=1),
+            draft_model_config=SimpleNamespace(hf_config=hf, hf_text_config=hf),
+        ),
+    )
+    config.model_config.hf_text_config.model_type = "deepseek_v4"
+    config.model_config.hf_text_config.hidden_size = hf.hidden_size
+    config.model_config.hf_text_config.num_experts_per_tok = hf.num_experts_per_tok
+    config.model_config.hf_text_config.n_routed_experts = hf.n_routed_experts
+    config.scheduler_config.max_num_seqs = 2
+    return config
+
+
+def mrv2_vllm_config(
+    *,
+    dtype=None,
+    role: str = "attention",
+    architecture: str = "DeepseekV2ForCausalLM",
+    use_v2: bool = True,
+    num_attention_ranks: int = 1,
+    num_ffn_ranks: int = 1,
+    data_parallel_size: int = 1,
+    tensor_parallel_size: int = 1,
+    prefill_context_parallel_size: int = 1,
+    enforce_eager: bool = True,
+    cudagraph_mode="NONE",
+    cudagraph_capture_sizes: list[int] | None = None,
+    max_cudagraph_capture_size: int = 0,
+):
+    hf_config = SimpleNamespace(
+        architectures=[architecture],
+        model_type="deepseek_v2",
+        hidden_size=2048,
+    )
+    model_config = SimpleNamespace(
+        hf_config=hf_config,
+        runner_type="generate",
+        is_moe=True,
+        is_encoder_decoder=False,
+        is_multimodal_model=False,
+        enforce_eager=enforce_eager,
+        enable_prompt_embeds=False,
+        enable_return_routed_experts=False,
+        quantization=None,
+        quantization_config=None,
+        max_model_len=163840,
+        dtype=dtype,
+        get_hidden_size=lambda: 2048,
+    )
+    parallel_config = SimpleNamespace(
+        data_parallel_size=data_parallel_size,
+        data_parallel_rank=0,
+        data_parallel_rank_local=0,
+        data_parallel_index=0,
+        data_parallel_backend="mp",
+        distributed_executor_backend="mp",
+        nnodes_within_dp=1,
+        assigned_physical_gpu_ids=None,
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=prefill_context_parallel_size,
+        decode_context_parallel_size=1,
+        enable_expert_parallel=True,
+        enable_elastic_ep=False,
+        enable_eplb=False,
+        use_sequence_parallel_moe=False,
+        is_moe_model=True,
+        enable_dbo=False,
+        use_ubatching=False,
+        num_ubatches=1,
+    )
+    compilation_config = SimpleNamespace(
+        mode=None,
+        cudagraph_mode=cudagraph_mode,
+        cudagraph_capture_sizes=cudagraph_capture_sizes or [],
+        max_cudagraph_capture_size=max_cudagraph_capture_size,
+        compile_sizes=[],
+        compile_ranges_endpoints=[model_config.max_model_len],
+        pass_config=SimpleNamespace(
+            enable_sp=False,
+        ),
+    )
+    return SimpleNamespace(
+        use_v2_model_runner=use_v2,
+        is_mm_encoder_only=False,
+        additional_config={
+            "afd": {
+                "role": role,
+                "connector": "P2pNcclAFDConnector",
+                "num_attention_ranks": num_attention_ranks,
+                "num_ffn_ranks": num_ffn_ranks,
+                "compute_gate_on_attention": False,
+            },
+        },
+        model_config=model_config,
+        parallel_config=parallel_config,
+        compilation_config=compilation_config,
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        kernel_config=SimpleNamespace(moe_backend="auto"),
+        scheduler_config=SimpleNamespace(
+            enable_chunked_prefill=False,
+            async_scheduling=False,
+            max_num_batched_tokens=163840,
+            max_num_seqs=8,
+        ),
+        lora_config=None,
+        speculative_config=None,
+        num_speculative_tokens=0,
+        diffusion_config=None,
+        quant_config=None,
     )

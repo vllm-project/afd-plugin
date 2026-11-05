@@ -4,7 +4,7 @@
 # The base image already ships vLLM and its CUDA runtime stack (torch,
 # flashinfer, etc.). Install only the AFD plugin + dev tools on top.
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
-ARG VLLM_BASE_TAG=v0.30.0
+ARG VLLM_BASE_TAG=v0.32.0
 
 # deps stage: everything except the real project sources, so most PRs can
 # cache-hit on the heavy dependency layer.
@@ -47,7 +47,7 @@ RUN uv export --locked --group dev --group e2e-tests --no-emit-project -o /tmp/r
 
 RUN python -c "import torch; from importlib.metadata import version; \
     print('vLLM:', version('vllm'), 'PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda); \
-    assert version('vllm') == '0.30.0', 'CI requires vLLM 0.30.0'"
+    assert version('vllm') == '0.32.0', 'CI requires vLLM 0.32.0'"
 
 # Final stage: overlay workspace sources onto the cached deps image.
 FROM deps

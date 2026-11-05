@@ -63,11 +63,13 @@ def make_input(
         ids[:] = expert_offsets.remainder(experts_per_rank)
         ids[:, -1] = experts_per_rank - 1
     elif case == "sparse":
+        # Reserve the fixed final expert: duplicate TopK routes can make its
+        # count exceed the one-expert receive capacity.
         ids[:] = (
             torch.arange(batch, dtype=torch.int32)[:, None]
             + rank
             + expert_offsets[None, :] * experts_per_rank
-        ).remainder(total_experts)
+        ).remainder(total_experts - 1)
         ids[:, -1] = total_experts - 1
     else:
         ids[:] = expert_offsets.remainder(total_experts)

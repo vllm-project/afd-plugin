@@ -8,9 +8,10 @@ from copy import deepcopy
 from typing import TYPE_CHECKING, Literal
 
 from afd_plugin import _MODEL_REGISTRATIONS, _QWEN3_5_MODEL_REGISTRATIONS
+from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 
 if TYPE_CHECKING:
-    from vllm.config import ModelConfig
+    from vllm.config import ModelConfig, VllmConfig
 
 
 def has_afd_model_registration(model_config: ModelConfig) -> bool:
@@ -31,6 +32,8 @@ def get_afd_model_config(
 
     for model_arch in model_config.hf_config.architectures:
         if model_arch in _MODEL_REGISTRATIONS:
+            if model_arch == "DSparkDraftModel" and device_type != "npu":
+                raise ValueError("AFD DSpark currently supports only the NPU backend")
             if model_arch in _QWEN3_5_MODEL_REGISTRATIONS and device_type != "cuda":
                 raise ValueError(
                     "AFD Qwen3.5/3.6 supports CUDA execution only; "
@@ -44,3 +47,31 @@ def get_afd_model_config(
             afd_model_config.hf_config.architectures = [f"AFD{model_arch}"]
             return afd_model_config
     return model_config
+
+
+def configure_afd_dspark(vllm_config: VllmConfig) -> None:
+    """Resolve the native DSpark config through the role-local AFD model."""
+    speculative = vllm_config.speculative_config
+    if speculative is not None and speculative.method == "dspark":
+        if parse_afd_config(vllm_config).connector != AFD_ASYNC_CONNECTOR:
+            raise ValueError("AFD DSpark requires CAMAsyncAFDConnector")
+        target = vllm_config.model_config.hf_text_config
+        draft = speculative.draft_model_config.hf_text_config
+        schemas = (
+            ("hidden_size", target.hidden_size, draft.hidden_size),
+            (
+                "num_experts_per_tok",
+                target.num_experts_per_tok,
+                draft.num_experts_per_tok,
+            ),
+            ("n_routed_experts", target.n_routed_experts, draft.n_routed_experts),
+        )
+        for field, target_value, draft_value in schemas:
+            if target_value != draft_value:
+                raise ValueError(
+                    f"DSpark CAM transport {field} mismatch: "
+                    f"target={target_value}, draft={draft_value}"
+                )
+        speculative.draft_model_config = get_afd_model_config(
+            speculative.draft_model_config, device_type="npu"
+        )

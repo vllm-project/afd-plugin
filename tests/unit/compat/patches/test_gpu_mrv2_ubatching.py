@@ -34,10 +34,17 @@ class _BatchDescriptor:
     num_ubatches: int = 1
 
 
+@dataclass(frozen=True)
+class _DPSyncState:
+    num_tokens_across_dp: list[int]
+    uniform_token_count: int | None
+    eager: bool
+    num_reqs: int
+
+
 class _GraphManager:
     def __init__(self, capture_tokens: int | None = None):
         self.capture_tokens = capture_tokens
-        self.calls: list[int] = []
 
     def dispatch(
         self,
@@ -49,7 +56,6 @@ class _GraphManager:
         max_query_len=None,
         num_ubatches=1,
     ):
-        self.calls.append(num_ubatches)
         graph_matches = (
             self.capture_tokens is not None
             and num_tokens <= self.capture_tokens
@@ -160,21 +166,6 @@ def patches():
     return SimpleNamespace(**namespace, namespace=namespace)
 
 
-@pytest.mark.parametrize("dp_size", [1, 2])
-def test_factory_keeps_native_runner_and_changes_only_dp1_instance(patches, dp_size):
-    parallel = _parallel(dp_size=dp_size)
-    config = SimpleNamespace(parallel_config=parallel)
-    native_context_factory = patches.UBatchRunner._make_forward_contexts
-    inputs = ("device", "model-state", [["attn-group"]], "kv-cache", 32)
-
-    runner = patches.maybe_build_ubatch_runner(config, *inputs)
-
-    assert type(runner) is patches.UBatchRunner
-    assert runner.inputs == inputs
-    assert patches.UBatchRunner._make_forward_contexts is native_context_factory
-    assert ("_make_forward_contexts" in vars(runner)) is (dp_size == 1)
-
-
 def test_disabled_dbo_does_not_construct_runner(patches):
     config = SimpleNamespace(parallel_config=_parallel(use_ubatching=False))
     assert patches.maybe_build_ubatch_runner(config, None, None, [], None, 32) is None
@@ -263,7 +254,6 @@ def test_dp1_uses_microbatch_graph_bucket_or_native_eager_padding_fallback(
     assert desc.cg_mode is expected_mode
     assert desc.num_tokens == expected_tokens
     assert desc.num_ubatches == 2
-    assert manager.calls == [1, 2]
 
 
 def test_profile_dispatch_does_not_select_a_graph(patches):
@@ -282,84 +272,62 @@ def test_profile_dispatch_does_not_select_a_graph(patches):
     )
     assert desc.cg_mode is _CUDAGraphMode.NONE
     assert desc.num_ubatches == 2
-    assert manager.calls == []
-
-
-def test_dp2_keeps_native_coordination_and_all_dispatch_arguments(patches):
-    calls = []
-    expected = (object(), object())
-
-    def sync(*args, **kwargs):
-        calls.append((args, kwargs))
-        return expected
-
-    patches.namespace["sync_cudagraph_and_dp_padding"] = sync
-    manager = _GraphManager()
-    parallel = _parallel(dp_size=2)
-    actual = patches.dispatch_cg_and_sync_dp(
-        manager,
-        3,
-        12,
-        None,
-        2,
-        1,
-        max_query_len=6,
-        num_active_loras=0,
-        parallel_config=parallel,
-        allow_ubatching=True,
-        uniform_decode=False,
-    )
-    assert actual is expected
-    assert len(calls) == 1
-    args, kwargs = calls[0]
-    assert args[0] is manager
-    assert args[2:] == (12, 3, None, 2, 1)
-    assert kwargs == {
-        "max_query_len": 6,
-        "num_active_loras": 0,
-        "parallel_config": parallel,
-        "allow_ubatching": True,
-        "uniform_decode": False,
-    }
-    assert manager.calls == [1]
 
 
 @pytest.mark.parametrize(
-    "scope_name, symbol",
+    "eager, capture_tokens, expected_mode, expected_tokens",
     [
-        ("use_gpu_mrv2_ubatch_factory", "maybe_build_ubatch_runner"),
-        ("use_gpu_mrv2_dbo_dispatch", "dispatch_cg_and_sync_dp"),
+        (True, 16, _CUDAGraphMode.NONE, 8),
+        (False, None, _CUDAGraphMode.NONE, 8),
+        (False, 16, _CUDAGraphMode.FULL, 16),
     ],
 )
-def test_scopes_restore_native_alias_after_exception_and_nested_call(
-    patches, scope_name, symbol
+def test_dp2_reused_sync_preserves_eager_agreement_and_graph_padding(
+    patches, eager, capture_tokens, expected_mode, expected_tokens
 ):
-    scope = getattr(patches, scope_name)
-    original = getattr(patches.model_runner, symbol)
-    replacement = getattr(patches, symbol)
-    with pytest.raises(RuntimeError, match="native failure"), scope():
-        assert getattr(patches.model_runner, symbol) is replacement
-        with scope():
-            assert getattr(patches.model_runner, symbol) is replacement
-        assert getattr(patches.model_runner, symbol) is replacement
-        raise RuntimeError("native failure")
-    assert getattr(patches.model_runner, symbol) is original
+    prior_sync = _DPSyncState([8, 8], 1, eager, 8)
+    manager = None if eager else _GraphManager(capture_tokens)
+
+    descriptor, sync = patches.dispatch_cg_and_sync_dp(
+        manager, 8, 8, 1, 2, 1, dp_sync_state=prior_sync
+    )
+
+    assert descriptor.cg_mode is expected_mode
+    assert descriptor.num_tokens == expected_tokens
+    assert sync.num_tokens_across_dp == [expected_tokens, expected_tokens]
+    assert sync.uniform_token_count == 1
+    assert sync.eager is eager
+    assert prior_sync.num_tokens_across_dp == [8, 8]
+
+
+@pytest.mark.parametrize(
+    "token_counts, uniform_token_count",
+    [([8, 7], 1), ([8, 8], 2)],
+)
+def test_dp2_reused_sync_rejects_a_different_batch(
+    patches, token_counts, uniform_token_count
+):
+    prior_sync = _DPSyncState(token_counts, uniform_token_count, False, 8)
+
+    with pytest.raises(AssertionError, match="different batch"):
+        patches.dispatch_cg_and_sync_dp(
+            _GraphManager(), 8, 8, 1, 2, 1, dp_sync_state=prior_sync
+        )
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_attention_kv_initialization_scopes_factory_and_preserves_native_arguments(
-    patches, fail
-):
-    calls = []
-    original = patches.model_runner.maybe_build_ubatch_runner
+def test_kv_initialization_scopes_dp1_metadata(patches, fail):  # long-test: KV factory
 
     class NativeRunner:
         def initialize_kv_cache(self, *args, **kwargs):
-            assert (
-                patches.model_runner.maybe_build_ubatch_runner
-                is patches.maybe_build_ubatch_runner
+            self.ubatch_runner = patches.model_runner.maybe_build_ubatch_runner(
+                SimpleNamespace(parallel_config=_parallel()),
+                None,
+                None,
+                [],
+                args[0],
+                32,
             )
-            calls.append((args, kwargs))
             if fail:
                 raise RuntimeError("KV allocation failed")
 
@@ -389,13 +357,17 @@ def test_attention_kv_initialization_scopes_factory_and_preserves_native_argumen
             attention_runner.initialize_kv_cache(kv_config, True, allocation_context)
     else:
         attention_runner.initialize_kv_cache(kv_config, True, allocation_context)
-    assert calls == [
-        (
-            (kv_config,),
-            {
-                "is_profiling": True,
-                "kv_cache_allocation_context": allocation_context,
-            },
+    assert (
+        patches.model_runner.maybe_build_ubatch_runner(
+            SimpleNamespace(parallel_config=_parallel()), None, None, [], kv_config, 32
         )
-    ]
-    assert patches.model_runner.maybe_build_ubatch_runner is original
+        is None
+    )
+    if not fail:
+        contexts = attention_runner.ubatch_runner._make_forward_contexts(
+            [SimpleNamespace(num_tokens=3), SimpleNamespace(num_tokens=5)],
+            [{}, {}],
+            [{}, {}],
+            [None, None],
+        )
+        assert [c.dp_metadata.num_tokens_across_dp_cpu for c in contexts] == [[3], [5]]

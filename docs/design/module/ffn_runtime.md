@@ -9,6 +9,7 @@ primary_code_paths:
   - "afd_plugin/ffn_faas/**"
   - "afd_plugin/v1/worker/ffn_metadata.py"
   - "afd_plugin/v1/worker/ffn_model_runner.py"
+  - "afd_plugin/v1/worker/ffn_routed_experts_model_runner.py"
   - "afd_plugin/v1/worker/ffn_worker.py"
   - "afd_plugin/v1/worker/npu/ffn_model_runner.py"
   - "afd_plugin/v1/worker/npu/async_ffn_model_runner.py"
@@ -26,8 +27,11 @@ depends_on:
   - "compatibility_and_patches.md"
 validation_paths:
   - "tests/unit/ffn_faas/test_*.py"
+  - "tests/unit/model_executor/test_async_cam_layered.py"
+  - "tests/npu/test_async_cam_layered_w8a8.py"
   - "tests/unit/v1/worker/test_ffn_metadata.py"
   - "tests/unit/v1/worker/test_ffn_model_runner.py"
+  - "tests/unit/v1/worker/test_ffn_routed_experts_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
   - "tests/unit/v1/worker/test_async_ffn_two_stream.py"
@@ -39,9 +43,10 @@ validation_paths:
   - "tests/e2e/models/deepseek_v4_flash/ffn_graph.py"
   - "tests/unit/compat/patches/test_engine_core.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
-  - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
 upstream_refs:
-  - "vLLM 0.30.0 ced6857afa0ea7b2e3f0846a62e1394e90f15607"
+  - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "vLLM vllm.v1.worker.gpu_worker.Worker"
   - "vLLM vllm.v1.worker.gpu.model_runner.GPUModelRunner construction seam"
   - "vLLM vllm.v1.engine.core.EngineCore"
@@ -116,7 +121,8 @@ and native composition live under `ffn_faas/platforms/npu/`:
 communication, computation, Graph and two-stream scheduling to the Async CAM
 runtime. A shared cross-platform, cross-connector Step Loop and a pure
 `compute(item)` backend are not implemented. The runtime consumes the existing
-`W4A8LayerWeights` interface without per-step model selection; there is no
+`LayeredFFNWeights` interface with W4A8 weights, without per-step model selection;
+there is no
 separate V4 execution runtime.
 
 `attach_model` lends independently loaded parameters to the runtime. After
@@ -130,9 +136,13 @@ supported configuration, launch and shutdown behavior.
 | Platform | Worker | Model runner | Current connectors |
 | --- | --- | --- | --- |
 | CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `GPUFFNModelRunner` | `P2pNcclAFDConnector` |
+| CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `GPUFFNRoutedExpertsModelRunner` | `DeepEPM2NAFDConnector` (any `AFDRoutedExpertsConnector`) |
 | NPU | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | `AFDNPUFFNModelRunner` (sync) or `AsyncNPUFFNModelRunner` | `CAMP2pAFDConnector`, `CAMAsyncAFDConnector` |
 
-GPU and NPU FFN runners are independent, connector-driven owners. Ascend
+GPU and NPU FFN runners are independent, connector-driven owners. The CUDA
+FFN worker selects `GPUFFNRoutedExpertsModelRunner` when the connector class
+is an `AFDRoutedExpertsConnector`, and pins vLLM's MoE backend (`auto` becomes
+`triton`; other backends are rejected) before the model is built. Ascend
 selects the synchronous or Async runner in the FFN worker from the connector, with no MRV1
 inheritance or fallback. Native model loading owns weight materialization and
 quantization postprocessing. The runner explicitly initializes Ascend MC2
@@ -191,9 +201,9 @@ connector owns transport/process-group resources.
 CUDA and Ascend require ModelRunnerV2 on both roles. FFN remains connector-driven and
 does not adopt native V2 request state or scheduler-driven execution:
 
-- CUDA temporarily substitutes `GPUFFNModelRunner` at the native V2
-  construction seam inside `Worker.init_device()`; the existing AFD runner is
-  still the runtime object.
+- CUDA overrides `Worker._make_model_runner()` to construct
+  `GPUFFNRoutedExpertsModelRunner` for routed-experts connectors, otherwise
+  `GPUFFNModelRunner`.
 - Ascend constructs `AFDNPUFFNModelRunner` for CAMP2P or
   `AsyncNPUFFNModelRunner` for Async CAM. Both use the native MRV2
   forward-context shape and install Ascend state in `additional_kwargs`.
@@ -203,8 +213,12 @@ does not adopt native V2 request state or scheduler-driven execution:
 The V2 pair requires PP/PCP/DCP size 1, configured role ranks equal to DP x TP,
 static EP, and a registered AFD model. CUDA uses `P2pNcclAFDConnector` with
 model-specific gate placement and supports two native microbatches with
-Attention DP1 or DP > 1. H20 validation covers DeepSeek-V2-Lite DP1/TP2
-Graph + DBO with 128 GSM8K samples and live two-stage/full-replay assertions.
+Attention DP1 or DP > 1. See the
+[runtime matrix](execution_platforms.md#tested-runtime-matrix) for tested
+configurations and known DeepSeek-V2-Lite DBO shutdown failures.
+CUDA `DeepEPM2NAFDConnector` requires Attention-side gating, FFN TP 1, and
+the same DBO setting on both roles; see the
+[DeepEP M2N guide](../../gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md).
 Ascend supports synchronous CAMP2P with FFN-side gating, or eager Async CAM
 with Attention-side gating. CAMP2P supports eager and graph DBO with
 Attention DP > 1 and matching two-stage FFN control metadata. Async CAM
@@ -214,7 +228,7 @@ items independently of Attention's threads. These limits
 describe the pair even though only Attention inherits a native V2 runner.
 
 Async CAM also has an experimental, default-off `ffn_two_stream` mode for
-layered W4A8 eager/FULL. `AsyncFFNTwoStream`, owned by the Async runner, retains
+layered W4A8/W8A8 eager/FULL. `AsyncFFNTwoStream`, owned by the Async runner, retains
 two slots, compute/send streams and ready/done events. FULL owns four private
 graph pools and four graphs; eager retires each slot only after its send is
 observed complete. Both modes retain the bounded batch fence. Enabled eager
@@ -251,10 +265,10 @@ flowchart TD
     CONTROL --> FLAGS{"Profile, warmup, capture, replay, or eager?"}
     FLAGS --> GRAPH["Prepare graph state or eager context"]
     GRAPH --> RECEIVE["Receive Attention payload"]
-    CONTROL_PLANE -->|is None| WORK["Block on AFDAsyncFFNWorkItem"]
-    WORK --> CONTEXT["Build minimal forward context"]
+    CONTROL_PLANE -->|is None| WORK["Receive CAM payload"]
     RECEIVE --> COMPUTE["Role-aware FFN compute"]
-    CONTEXT --> COMPUTE
+    WORK --> LAYERED["Layered FFN compute on device"]
+    LAYERED --> SEND
     COMPUTE --> SEND["Send result to Attention"]
     SEND --> START
 ```
@@ -281,36 +295,24 @@ The Ascend worker checks `connector.control_plane`. When it is `None`, as for
 CAM async, the worker calls `execute_connector_driven_step()` instead of a
 control-plane receive. For each layer, the runner:
 
-1. receives a normalized `AFDAsyncFFNWorkItem` from
-   `connector.recv_ffn_work_item(...)`; CAM metadata supplies the actual layer
-   index and compact expert interval; counts.sum() supplies this chunk’s routed token count, and the connector slices tensors
-   from operator capacity down to those counts;
-2. builds a single-stage forward context sized to the work item's token count,
-   with `dp_metadata = None`;
-3. installs the work item's `AFDTransferContext.metadata` as `afd_metadata`;
-4. calls the role-aware FFN compute, forwarding the routed MoE compute
-   payloads (`group_list`, `dynamic_scales`) from the work item's `AFDAsyncTransferState` on
-   `AFDTransferContext.states`;
-5. returns the routed outputs through
-   `connector.send_ffn_work_item_output(...)`, which also handles the
-   floating zero-routed-token placeholder required by CAM combine-send.
-   A layer is complete only when the received interval ends at the final
-   local expert; earlier intervals continue the receive loop.
+1. receives a capacity-sized payload and its original CAM metadata through
+   `connector.recv_attn_output()`;
+2. passes activations, dynamic scales, expert counts and the device layer ID
+   to `AsyncCAMLayeredExecutor`;
+3. returns the routed output and original context with
+   `connector.send_ffn_output()`.
 
 Async eager does not use the synchronous DP-metadata graph cache. Its FULL
 mode captures a complete original DR/FFN/CS transaction with device-side layer
 selection. The independent Async runner owns one graph and stable resources;
 see [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md) for startup, supported
-W4A8 configuration and the original receiver's process-cleanup boundary.
+W4A8/W8A8 configurations and the original receiver's process-cleanup boundary.
 
-With `AFD_ASYNC_CAM_LAYERED_GMM=1`, eligible DeepSeek-V4 W4A8 layers instead
-use `AsyncCAMW4A8Executor`: the runner passes capacity-sized payloads, device
-expert counts, and device layer IDs directly from receive through the layered
-GMMs to combine-send. The ordinary path above materializes the work item's
-layer/count information on the host. Both paths retain worker-level
-synchronization after a work-item group. MRV2 pairing does not prohibit the
-layered path. Its nonzero `swiglu_limit` limitation and validation scope are
-documented in the [CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-layered-gmm-experimental-disabled-by-default).
+DeepSeek-V4 W4A8 and W8A8 use layered GMM for both eager and FULL. Incompatible
+weights fail startup rather than selecting another FFN path. Worker-level
+synchronization remains after a work-item group. The `swiglu_limit` behavior
+and validation scope are documented in the
+[CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-and-w8a8-layered-gmm).
 
 ## Control-plane-driven forward
 
@@ -351,6 +353,20 @@ expected by the upstream forward context. When TP expands Attention rank
 counts beyond DP metadata width, token counts are replicated per TP rank and
 then aggregated for each FFN rank.
 
+### Routed-experts forward
+
+`GPUFFNRoutedExpertsModelRunner` serves connectors that deliver routed
+(token, local expert) rows (DeepEP M2N). Routing runs on Attention, so the
+runner skips the forward-context and DP metadata setup above. After the native
+loader runs, it reads each MoE layer's local experts from vLLM's
+`RoutedExperts` (`FFNLocalExperts`, `FusedMoE` layout) and passes them, with the
+MoE layer indices, to the connector's collective `init_afd_connector()`. For
+each MoE layer and stage, in Attention's order, it receives the routed rows,
+runs `connector.run_experts()`, and sends the weighted rows back; at the end
+of the step it calls `connector.synchronize_lanes()`. vLLM's MoE forward never
+runs on this runner. Dense (non-MoE) layers and shared experts have no owner
+on this path, so the model adapters reject them.
+
 ## Role-aware model loading
 
 The FFN process uses vLLM's model loader, while plugin-owned model integration
@@ -389,19 +405,23 @@ The daemon catches failures, stores the original exception, logs it, and makes
 the error visible through `raise_ffn_loop_error_if_any()`. Re-entering startup
 or completing shutdown therefore surfaces an earlier background failure.
 
-Shutdown ordering is:
+CUDA shutdown ordering is:
 
 ```text
-signal daemon event
-  -> runner stops profiler and closes connector
+signal daemon event and close the control plane
   -> join daemon thread with a bounded timeout
   -> surface stored loop error
-  -> delegate remaining worker/runner shutdown upstream
+  -> after the thread has exited, delegate worker/runner shutdown upstream
+  -> runner stops profiler, releases its GPU state and closes the connector
 ```
 
-Connector receive calls may be blocking; the connector's `close()` behavior
-is responsible for releasing its communication resources so shutdown can
-complete.
+Connector receive calls may be blocking. The GPU control plane aborts its
+owned metadata process group to unblock the receiver before joining it. If the
+thread does not exit, native resources are not released underneath it. The
+connector then releases its remaining communication resources during runner
+shutdown. An earlier daemon failure is still surfaced after the join. Ascend
+uses its own connector close or asynchronous drain path before joining the
+daemon; see the [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md).
 
 ## Candidate invariants
 

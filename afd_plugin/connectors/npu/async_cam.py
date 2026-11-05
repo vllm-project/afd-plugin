@@ -57,7 +57,6 @@ from afd_plugin.connectors.base import (
 )
 from afd_plugin.connectors.metadata import (
     AFDA2FTransferPayload,
-    AFDF2ATransferPayload,
     AFDTransferContext,
     AFDTransferMetadata,
     AFDTransferState,
@@ -240,19 +239,6 @@ class AFDAsyncTransferState(AFDTransferState):
     send_completion: Tensor | None = None
 
 
-@dataclass(slots=True)
-class AFDAsyncFFNWorkItem:
-    """Normalized FFN-side work item produced by async CAM dispatch recv."""
-
-    hidden_states: Tensor
-    context: AFDTransferContext
-    recv_output: AFDA2FTransferPayload
-    layer_idx: int
-    stage_idx: int
-    num_tokens: int
-    total_num_tokens: int
-
-
 @dataclass(frozen=True, slots=True)
 class AFDAsyncTopology:
     """Role-local and HCCL-world rank information for one CAM participant."""
@@ -289,8 +275,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         raw: Mapping[str, Any] | None,
     ) -> AFDAsyncExtraInfo:
         return AFDAsyncExtraInfo.from_mapping(raw)
-
-    layered_gmm_enabled: bool = False
 
     def __init__(
         self,
@@ -493,129 +477,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
     def select_experts(self, **kwargs: Any) -> tuple[Tensor, Tensor]:
         """Run the target vLLM-Ascend router on Attention."""
         return select_cam_experts(**kwargs)
-
-    def recv_ffn_work_item(
-        self,
-        *,
-        stage_idx: int,
-        max_num_tokens: int,
-    ) -> AFDAsyncFFNWorkItem:
-        """Receive and normalize one connector-driven FFN dispatch item.
-
-        CAM metadata supplies the actual layer and routed token counts;
-        returned tensors are sliced from operator capacity to those counts.
-        """
-        recv_output = self.recv_attn_output(
-            stage_idx=stage_idx,
-            layer_idx=0,
-            batch_size=max(1, self.max_num_batched_tokens or max_num_tokens),
-            ubatch_idx=stage_idx,
-        )
-        context = recv_output.context
-        metadata = context.metadata
-        states = _require_async_transfer_state(context)
-        token_nums_rankid_layeridx = states.token_nums_rankid_layeridx
-        if token_nums_rankid_layeridx is None:
-            raise RuntimeError(
-                "AFD async CAM FFN work item requires "
-                "TokenNums_Rankid_Layeridx from async_dispatch_recv",
-            )
-        expert_token_nums = states.group_list
-        assert expert_token_nums is not None
-        # Preserve the full compact metadata for combine-send. Its total is
-        # rank-wide, while counts describe only this receive chunk.
-        control = torch.stack(
-            (
-                token_nums_rankid_layeridx[0],
-                token_nums_rankid_layeridx[2],
-                expert_token_nums.sum(dtype=torch.int64),
-            )
-        )
-        total_num_tokens, layer_idx, num_tokens = control.cpu().tolist()
-        if not 0 <= num_tokens <= recv_output.hidden_states.shape[0]:
-            raise RuntimeError(
-                "AFD async CAM routed chunk count is outside dispatch-recv capacity"
-            )
-
-        metadata.layer_idx = layer_idx
-        metadata.stage_idx = stage_idx
-        metadata.seq_lens = [num_tokens]
-
-        hidden_states = recv_output.hidden_states[:num_tokens]
-        if states.dynamic_scales is not None:
-            states.dynamic_scales = states.dynamic_scales[:num_tokens]
-
-        return AFDAsyncFFNWorkItem(
-            hidden_states=hidden_states,
-            context=context,
-            recv_output=recv_output,
-            layer_idx=layer_idx,
-            stage_idx=stage_idx,
-            num_tokens=num_tokens,
-            total_num_tokens=total_num_tokens,
-        )
-
-    def _send_ffn_output_payload(
-        self,
-        ffn_output: Tensor | AFDF2ATransferPayload,
-        context: AFDTransferContext,
-        *,
-        stage_idx: int,
-    ) -> None:
-        if not isinstance(ffn_output, AFDF2ATransferPayload):
-            self.send_ffn_output(
-                ffn_output,
-                context,
-                ubatch_idx=stage_idx,
-            )
-            return
-
-        self.send_ffn_output(
-            ffn_output.routed_output,
-            context,
-            ubatch_idx=stage_idx,
-        )
-
-    def send_ffn_work_item_output(
-        self,
-        work_item: AFDAsyncFFNWorkItem,
-        ffn_output: Tensor | AFDF2ATransferPayload,
-    ) -> Tensor | AFDF2ATransferPayload:
-        """Return one FFN work item's routed output through CAM.
-
-        A one-token floating routed placeholder is used when a rank receives no
-        routed tokens because CAM combine-send cannot consume the dynamic
-        quantized dispatch buffer as an empty routed result.
-        """
-        if work_item.num_tokens > 0:
-            self._send_ffn_output_payload(
-                ffn_output,
-                work_item.context,
-                stage_idx=work_item.stage_idx,
-            )
-            return ffn_output
-
-        # Temporary NPU workaround: CAM combine-send does not accept the int8
-        # dispatch-recv buffer as routed output. When this FFN rank has no
-        # routed tokens, send one fake floating routed token instead of reusing the
-        # dynamicQuant int8 input buffer.
-        fake_routed_output = torch.zeros(
-            (1, work_item.recv_output.hidden_states.shape[-1]),
-            dtype=self.activation_dtype,
-            device=work_item.recv_output.hidden_states.device,
-        )
-        if isinstance(ffn_output, AFDF2ATransferPayload):
-            ffn_output = AFDF2ATransferPayload(
-                routed_output=fake_routed_output,
-            )
-        else:
-            ffn_output = fake_routed_output
-        self._send_ffn_output_payload(
-            ffn_output,
-            work_item.context,
-            stage_idx=work_item.stage_idx,
-        )
-        return ffn_output
 
     def send_attn_output(
         self,
@@ -897,7 +758,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             ffn_output=ffn_output,
             comm_args=self.comm_args,
             token_nums_rankid_layeridx=token_nums_rankid_layeridx,
-            metadata_values=not self.layered_gmm_enabled,
+            metadata_values=False,
             comm_id=self.comm_id,
             max_seq_len=self.max_num_batched_tokens,
             batch_size=states.batch_size,
@@ -1059,7 +920,6 @@ __all__ = [
     "AFD_ASYNC_CAM_GROUP_NAME",
     "CAMAsyncAFDConnector",
     "AFDAsyncTransferState",
-    "AFDAsyncFFNWorkItem",
     "AFDAsyncTopology",
     "ATTN_RANKS_PER_DP_CONFIG_KEY",
     "CAM_COMM_ID",

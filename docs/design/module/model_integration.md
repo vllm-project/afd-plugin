@@ -17,24 +17,28 @@ depends_on:
   - "execution_platforms.md"
 validation_paths:
   - "tests/unit/model_executor/**"
+  - "tests/gpu/test_attention_routing.py"
   - "tests/e2e/models/**"
   - "tests/e2e/accuracy/**"
 upstream_refs:
+  - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "vLLM vllm.model_executor.models.deepseek_v2"
   - "vLLM vllm.model_executor.models.qwen3_moe"
   - "vLLM vllm.forward_context.ForwardContext"
   - "vLLM vllm.model_executor.model_loader"
 verified_platform_refs:
   - "DeepSeek V2 Lite GPU and NPU model E2E paths"
+  - "DeepSeek V2 Lite DeepEP M2N 2A2F E2E paths (eager, graph, graph + DBO, Attention TP2)"
   - "CAM async NPU model E2E path"
-  - "DeepSeek V4 CUDA boundary has focused unit coverage only"
-  - "DeepSeek V4 Ascend Hash-id boundary has focused unit coverage and a manual Ascend 950 run"
+  - "DeepSeek V4 CUDA contract tests and E2E profiles; see execution-platform matrix for hardware scope"
+  - "DeepSeek V4 Ascend Hash-id boundary has focused unit coverage and a historical manual Ascend 950 run"
 related_issues:
   - "#86"
   - "#88"
   - "#105"
   - "#129"
-last_reviewed: 2026-10-13
+last_reviewed: 2026-10-30
 ---
 
 # Model integration
@@ -58,7 +62,7 @@ make a backend-specific worker class the shared model API.
 | Registration map | [`afd_plugin/__init__.py`](../../../afd_plugin/__init__.py) | [`test_package.py`](../../../tests/unit/package/test_package.py) |
 | Role-aware model and weight loading | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py) | [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py), model and accuracy E2E suites |
 | DeepSeek V4 CUDA role boundary | [`deepseek_v4.py`](../../../afd_plugin/model_executor/models/deepseek_v4.py) | [`test_deepseek_v4_construction.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_construction.py), [`test_deepseek_v4_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_proxy.py), [`test_deepseek_v4_weight_policy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_weight_policy.py) |
-| DeepSeek V4 Ascend Hash-id boundary | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py), [`npu/deepseek_v4_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_attention_gate.py) | [`test_deepseek_v4_hash_ids.py`](../../../tests/unit/model_executor/test_deepseek_v4_hash_ids.py), [`test_deepseek_v4_npu_weight_roles.py`](../../../tests/unit/model_executor/test_deepseek_v4_npu_weight_roles.py), ids-mode cases in [`test_camp2p_token_ids.py`](../../../tests/unit/connectors/test_camp2p_token_ids.py) |
+| DeepSeek V4 Ascend Hash-id boundary | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py), [`npu/deepseek_v4_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_attention_gate.py) | [`test_deepseek_v4_hash_ids.py`](../../../tests/unit/model_executor/test_deepseek_v4_hash_ids.py), [NPU model role tests](../../../tests/unit/model_executor/models/npu/test_deepseek_v4.py), ids-mode cases in [`test_camp2p_token_ids.py`](../../../tests/unit/connectors/test_camp2p_token_ids.py) |
 | Qwen3 MoE role-aware model and weight loading | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py), [`test_qwen3_moe_weight_policy.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_weight_policy.py) |
 | CUDA remote-experts boundary | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py), [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py) | [`test_p2p_experts_contract.py`](../../../tests/unit/connectors/test_p2p_experts_contract.py), [`test_deepseek_v2_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_proxy.py) |
 | Forward-context adapter | [`forward_context.py`](../../../afd_plugin/model_executor/models/forward_context.py) | [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
@@ -66,7 +70,7 @@ make a backend-specific worker class the shared model API.
 | Ascend Attention-side gate | [`npu/deepseek_v2_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v2_attention_gate.py) | Attention-gate unit cases in [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
 | Ascend CAM dispatch layout | [`npu/async_cam_layout.py`](../../../afd_plugin/model_executor/models/npu/async_cam_layout.py) | [`test_async_cam_layout.py`](../../../tests/unit/model_executor/test_async_cam_layout.py) |
 | DeepSeek Ascend stage metadata ownership | [`npu/deepseek_attention_metadata.py`](../../../afd_plugin/model_executor/models/npu/deepseek_attention_metadata.py) | [`test_deepseek_attention_metadata.py`](../../../tests/unit/model_executor/test_deepseek_attention_metadata.py) |
-| Ascend CAM orchestration | [`npu/deepseek_v2_async_cam_forward.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v2_async_cam_forward.py) | Async/ubatch unit cases and [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py) |
+| Ascend CAM orchestration | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py) | [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py) |
 
 ## Model registration
 
@@ -80,6 +84,7 @@ registers lazy AFD wrapper paths under `AFD`-prefixed aliases.
 | `DeepseekV3ForCausalLM` | `AFDDeepseekV3ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `DeepseekV32ForCausalLM` | `AFDDeepseekV32ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `DeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` |
+| `DSparkDraftModel` | Unsupported | `AFDDSparkDeepseekV4ForCausalLM` (Async CAM: eager A, eager/FULL F) |
 | `GlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` |
 | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` |
 | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` |
@@ -105,15 +110,20 @@ needed by the split execution.
 | --- | --- | --- |
 | Attention module and KV-facing computation | Constructed and executed. | Not constructed. |
 | MoE with `compute_gate_on_attention=false` | CUDA constructs the native MoE shell with a parameter-free internal-router experts proxy; NPU sends after post-Attention normalization. | Native gate and experts are constructed and executed from connector input. |
-| MoE with `compute_gate_on_attention=true` | CUDA keeps the native gate and uses an external-router experts proxy; NPU uses its Attention-side gate helper. | Expert MLP is constructed and consumes transferred router logits or routed payloads without rerunning the gate. |
+| MoE with `compute_gate_on_attention=true`, non-routed connectors | CUDA keeps the native gate and uses an external-router experts proxy; NPU uses its Attention-side gate helper. | Expert MLP is constructed and consumes transferred router logits or routed payloads without rerunning the gate. |
+| MoE with `compute_gate_on_attention=true`, DeepEP M2N (CUDA) | `AFDDeepseekV2RoutedExpertsMoE` constructs the native gate, router, and shared-expert MLP. It selects top-k, dispatches routed rows, runs the shared MLP while dispatch and the FFN experts are in flight, and adds it to the combined output. With TP > 1, each TP rank routes its `sequence_parallel_chunk` slice and runs a replicated (`is_sequence_parallel`, no all-reduce) shared MLP on it; the TP group then all-gathers the output. | Native `DeepseekV2MoE` without shared experts; runs only the routed experts on the dispatched top-k IDs and weights. |
 | Dense MLP, normal mode | Not constructed; output is sent after post-Attention normalization. | Constructed and executed from connector input. |
 | Dense MLP with `compute_gate_on_attention=true` | Constructed and executed locally because there is no routed MoE handoff. | Not constructed and a dense-layer FFN compute request is rejected. |
 | Embedding, final norm, pipeline placeholders | Created according to the pinned pipeline-rank rules. | Same wrapper lifecycle rules; only role-required parameters are loaded. |
 
-CUDA MoE always splits at the remote-experts boundary while preserving native
+CUDA MoE splits at the remote-experts boundary. With gate-on-FFN, and with
+gate-on-Attention on non-routed connectors, Attention keeps native
 `DeepseekV2MoE.forward`. With gate-on-FFN, the proxy asks FFN to run its native
 internal-router MoE. With gate-on-Attention, Attention runs the native gate and
-FFN executes its external-router experts path. CUDA Attention-side remote
+FFN executes its external-router experts path. Routed-experts connectors
+(DeepEP M2N) use a third mode with an AFD-owned forward: Attention runs the
+gate, top-k selection, and shared experts; FFN runs only the routed experts,
+and combine returns each token's weighted top-k sum. CUDA Attention-side remote
 experts currently reject EPLB. The NPU gate helper supports unquantized and
 Ascend W8A8 MoE expert computation; unsupported devices or quantization fail
 explicitly.
@@ -139,8 +149,9 @@ CUDA-only and requires synchronous `P2pNcclAFDConnector`,
 `compute_gate_on_attention=false`, and pipeline-parallel size 1. It rejects
 sequence-parallel MoE, EPLB, and the `deep_gemm_mega_moe` backend. The P2P
 connector validates one-dimensional `torch.int32` input IDs and preallocates
-their receive buffers for graph execution. This boundary currently has
-focused unit coverage but no repository model or accuracy E2E case.
+their receive buffers for graph execution. See the
+[runtime matrix](execution_platforms.md#tested-runtime-matrix) for tested
+CUDA configurations and validation limits.
 
 ### DeepSeek V4 Ascend boundary
 
@@ -151,21 +162,35 @@ normalized hidden states and Hash-layer token IDs to FFN, which owns the
 native gate and MoE. Async CAM keeps the Hash/top-k router and shared experts
 on Attention and sends only routed-expert work; `dynamicQuant=1` is required.
 
-Shared-expert layout is model-specific. DeepSeek-V2/V3 Async CAM forces
-replicated shared weights when effective model SP is enabled. DeepSeek-V4
-instead uses `AFDDeepseekV4SharedExperts` to preserve the native policy:
+The DSpark adapter follows the same boundary. Native checkpoint names
+`mtp.0..2` and KV names are retained; its CAM layer IDs start at the target's
+`num_hidden_layers` to avoid collisions. Draft layers always use non-Hash
+routing. F loads one set of target and draft expert shards before rendezvous,
+then serves both from its existing receive loop. Each native draft proposal
+installs its own AFD metadata and opts out of cross-DP synchronization; native
+sampling, rejection, heads and context-KV updates are inherited. The
+[0.32 recipe](../../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md)
+describes A/F serving. In PD deployments, Prefill uses the upstream complete
+draft model and KV connector. Attention and native draft proposal execution stay
+eager. F may use the existing FULL transaction graph with one homogeneous W4A8 or W8A8
+table covering target and draft; selection remains on device. DSpark excludes
+DBO and FFN two-stream.
+
+Shared-expert layout is model-specific. DeepSeek-V4 uses
+`AFDDeepseekV4SharedExperts` to preserve the native policy:
 TP-sharded weights need all-gather/reduce-scatter around SP computation, or
 all-reduce without SP; replicated shared weights compute local SP tokens,
 or split/gather replicated input tokens without SP. The W8A8 fused arithmetic
 adapter preserves the shared MLP's clamp and activation parameters. This is
-separate from the optional routed W4A8 layered executor's unresolved nonzero
-`swiglu_limit` behavior.
+separate from the routed layered executor: W4A8 applies the model's
+`swiglu_limit`, while W8A8 retains its unclipped computation.
 
 The synchronous DSV4 E2E profiles check concurrent serving but disable answer
 checking; the A5 profile records incorrect concurrent answers. Async DSV4 has
-an exact-answer smoke case; current native DBO still requires model accuracy
-qualification. See
-[E2E testing](e2e_testing.md) and the [layered guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-layered-gmm-experimental-disabled-by-default).
+an exact-answer smoke case; V4 true native DBO still requires model accuracy
+qualification. Lite two-stage DBO has the limited result recorded in the
+[0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507). See
+[E2E testing](e2e_testing.md) and the [layered guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-and-w8a8-layered-gmm).
 
 ### Qwen3 MoE CUDA boundary
 
@@ -292,6 +317,8 @@ filtering:
 - FFN loads the MLP/expert and required common parameters and skips unrelated
   Attention parameters. In gate-on-Attention mode it also skips dense MLP
   parameters because those layers execute on Attention.
+- With a routed-experts connector (DeepEP M2N), MoE `shared_experts`
+  parameters load on Attention only; FFN builds its MoE without shared experts.
 - Model-specific missing, fused, redundant, and pipeline parameters retain the
   upstream skip/mapping behavior instead of being treated as AFD errors.
 
@@ -336,8 +363,8 @@ forward-context contract. Run model unit tests and the affected GPU/NPU model
 and accuracy E2E paths; weight-loading changes require role-specific evidence.
 Forward-context mutations require restoration/error-path tests, and an
 architecture registration change requires package registration plus checkpoint
-load evidence. A unit-only boundary such as the current CUDA DeepSeek V4 path
-must not be described as hardware-validated without new E2E evidence.
+load evidence. A unit-only boundary must not be described as
+hardware-validated without corresponding device E2E evidence.
 
 ## Limitations and open issues
 

@@ -22,9 +22,9 @@ from vllm_ascend.models.deepseek_v4 import model as native
 
 from afd_plugin.ffn_faas.platforms.npu.settings import validate_static_experts
 from afd_plugin.ffn_faas.platforms.npu.v4_model import V4CheckpointDescription
-from afd_plugin.model_executor.npu.async_cam_w4a8 import (
-    AsyncCAMW4A8Executor,
-    W4A8LayerWeights,
+from afd_plugin.model_executor.npu.async_cam_layered import (
+    AsyncCAMLayeredExecutor,
+    LayeredFFNWeights,
 )
 
 
@@ -156,7 +156,7 @@ class V4RoutedWeightOwner(nn.Module):
         """Keep the native V4 module path inside the model adapter."""
         return self.model.layers[str(layer_index)].mlp.experts.routed_experts
 
-    def weight_views(self) -> tuple[W4A8LayerWeights, ...]:
+    def weight_views(self) -> tuple[LayeredFFNWeights, ...]:
         from vllm_ascend.quantization.quant_type import QuantType
 
         weights = []
@@ -172,7 +172,7 @@ class V4RoutedWeightOwner(nn.Module):
             scheme = routed.quant_method.quant_method
             if scheme.quant_type != QuantType.W4A8:
                 raise ValueError("V4 FFN requires native W4A8 routed parameters")
-            view = W4A8LayerWeights(
+            view = LayeredFFNWeights(
                 layer_idx=layer.layer_idx,
                 w13=routed.w13_weight,
                 w2=routed.w2_weight,
@@ -183,8 +183,9 @@ class V4RoutedWeightOwner(nn.Module):
                 per_channel=scheme.is_per_channel_weight,
                 swiglu_limit=self.checkpoint.swiglu_limit,
                 routed_scaling_factor=1.0,
+                quantization="W4A8",
             )
-            AsyncCAMW4A8Executor._validate_layer(view)
+            AsyncCAMLayeredExecutor._validate_layer(view)
             weights.append(view)
         if not weights or any(w.signature() != weights[0].signature() for w in weights):
             raise ValueError("V4 FFN requires homogeneous native W4A8 layers")

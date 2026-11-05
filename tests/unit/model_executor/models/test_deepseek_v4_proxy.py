@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -7,23 +10,14 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
+from torch import nn  # noqa: E402
+
 from afd_plugin.model_executor.models import deepseek_v4 as adapter  # noqa: E402
-
-
-class _FakeConnector:
-    def __init__(self, events: list[tuple]) -> None:
-        self.events = events
-
-    def send_attn_output(self, hidden_states, context, **kwargs) -> None:
-        self.events.append(("send", hidden_states, context, kwargs))
-
-    def recv_ffn_output(self, *, ref_tensor, ubatch_idx):
-        self.events.append(("recv", ref_tensor, ubatch_idx))
-        return ref_tensor * 0.25
+from tests.unit.fakes.connector import ProxyConnector as _FakeConnector  # noqa: E402
 
 
 def test_remote_v4_ffn_sends_token_ids(monkeypatch):
-    events = []
+    events: list[tuple] = []
     connector = _FakeConnector(events)
     afd_metadata = SimpleNamespace(
         connector=connector,
@@ -68,7 +62,7 @@ def test_remote_v4_ffn_sends_token_ids(monkeypatch):
 
 
 def test_remote_v4_ffn_preserves_ids_in_padding_slots(monkeypatch):
-    events = []
+    events: list[tuple] = []
     connector = _FakeConnector(events)
     afd_metadata = SimpleNamespace(connector=connector, stage_idx=0)
     monkeypatch.setattr(
@@ -107,14 +101,20 @@ def test_remote_v4_ffn_preserves_ids_in_padding_slots(monkeypatch):
     [None, torch.ones((2, 1), dtype=torch.int64), torch.ones(3, dtype=torch.int64)],
     ids=["missing", "not-one-dimensional", "token-count-mismatch"],
 )
-def test_remote_v4_ffn_validates_token_ids_before_metadata_lookup(
+def test_remote_v4_ffn_rejects_bad_ids_before_sending(
     monkeypatch,
     input_ids,
 ):
+    events: list[tuple] = []
     monkeypatch.setattr(
         adapter,
         "get_afd_metadata_from_forward_context",
-        lambda: pytest.fail("metadata lookup must follow token-id validation"),
+        lambda: SimpleNamespace(connector=_FakeConnector(events), stage_idx=0),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "get_forward_context",
+        lambda: SimpleNamespace(ubatch_idx=0, slot_mapping={}),
     )
     proxy = adapter.RemoteDeepseekV4FFN(layer_idx=0)
 
@@ -126,15 +126,16 @@ def test_remote_v4_ffn_validates_token_ids_before_metadata_lookup(
     )
     with pytest.raises(error, match=message):
         proxy(torch.ones((2, 4)), input_ids)
+    assert events == []
 
 
 def test_v4_decoder_forward_rejects_ffn_role(monkeypatch):
-    class FakeMissingLayer(torch.nn.Module):
+    class FakeMissingLayer(nn.Module):
         pass
 
     monkeypatch.setattr(adapter.native, "PPMissingLayer", FakeMissingLayer)
     layer = object.__new__(adapter.AFDDeepseekV4DecoderLayer)
-    torch.nn.Module.__init__(layer)
+    nn.Module.__init__(layer)
     layer.attn = FakeMissingLayer()
 
     with pytest.raises(RuntimeError, match="decoder forward is Attention-owned"):
@@ -142,12 +143,13 @@ def test_v4_decoder_forward_rejects_ffn_role(monkeypatch):
             torch.ones((2, 4)),
             positions=torch.arange(2),
             input_ids=None,
+            mega_gate_metadata=None,
         )
 
 
 def test_v4_ffn_compute_rejects_attention_role_before_input_ids():
     layer = object.__new__(adapter.AFDDeepseekV4DecoderLayer)
-    torch.nn.Module.__init__(layer)
+    nn.Module.__init__(layer)
     layer.ffn = adapter.RemoteDeepseekV4FFN(layer_idx=0)
 
     with pytest.raises(RuntimeError, match="FFN compute is FFN-role only"):
@@ -155,12 +157,12 @@ def test_v4_ffn_compute_rejects_attention_role_before_input_ids():
 
 
 def test_v4_ffn_compute_requires_input_ids(monkeypatch):
-    class FakeMoE(torch.nn.Module):
+    class FakeMoE(nn.Module):
         pass
 
     monkeypatch.setattr(adapter.native, "DeepseekV4MoE", FakeMoE)
     layer = object.__new__(adapter.AFDDeepseekV4DecoderLayer)
-    torch.nn.Module.__init__(layer)
+    nn.Module.__init__(layer)
     layer.ffn = FakeMoE()
 
     with pytest.raises(RuntimeError, match="FFN compute requires input_ids"):

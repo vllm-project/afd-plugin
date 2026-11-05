@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
-    from afd_plugin.model_executor.npu.async_cam_w4a8 import W4A8LayerWeights
+    from afd_plugin.model_executor.npu.async_cam_layered import LayeredFFNWeights
 
 
 class RoutedWeightOwner(Protocol):
@@ -32,7 +32,7 @@ class RoutedWeightOwner(Protocol):
     def routed_experts(self, layer_index: int) -> RoutedExperts: ...
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]: ...
     def finish_layer(self, layer_index: int) -> None: ...
-    def weight_views(self) -> tuple[W4A8LayerWeights, ...]: ...
+    def weight_views(self) -> tuple[LayeredFFNWeights, ...]: ...
     def parameters(self) -> Iterator[nn.Parameter]: ...
 
 
@@ -65,7 +65,7 @@ class CAMRoutedModel:
         self.adapter, self.ffn_ranks, self.ffn_rank = adapter, ffn_ranks, ffn_rank
         self.local_experts = adapter.num_experts // ffn_ranks
         self._owner: RoutedWeightOwner | None = None
-        self._views: tuple[W4A8LayerWeights, ...] | None = None
+        self._views: tuple[LayeredFFNWeights, ...] | None = None
         self._loading = False
         self._loaded = False
         self._parameter_bytes = adapter.estimated_parameter_bytes(self.local_experts)
@@ -79,7 +79,7 @@ class CAMRoutedModel:
         return self._parameter_bytes
 
     @property
-    def native_view(self) -> tuple[W4A8LayerWeights, ...]:
+    def native_view(self) -> tuple[LayeredFFNWeights, ...]:
         if not self._loaded or self._views is None:
             raise RuntimeError("FFN weights have not been loaded")
         return self._views
@@ -177,7 +177,7 @@ class CAMRoutedModel:
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return self.adapter.layer_indices
 
-    def get_async_cam_w4a8_layers(self) -> tuple[list[W4A8LayerWeights], str]:
+    def get_async_cam_layered_weights(self) -> tuple[list[LayeredFFNWeights], str]:
         return list(self.native_view), ""
 
     def compute_ffn_output(

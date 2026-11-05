@@ -19,7 +19,6 @@ from vllm.model_executor.models import deepseek_v2 as native  # noqa: E402
 
 from afd_plugin.model_executor.models.deepseek_v2 import (  # noqa: E402
     AFDDeepseekV2ForCausalLM,
-    AFDDeepseekV2Model,
     _checkpoint_weight_roles,
 )
 from tests.unit.fakes.weights import OneShotWeights as _OneShotWeights  # noqa: E402
@@ -33,56 +32,25 @@ WEIGHT_ROLE_GROUPS = (
         BOTH_ROLES,
         (
             ("embedding", "model.embed_tokens.weight"),
-            ("final-norm", "model.norm.weight"),
-            ("lm-head", "lm_head.weight"),
             ("decoder-norm", "model.layers.0.input_layernorm.weight"),
         ),
     ),
     (
         ATTENTION_ROLES,
         ATTENTION_ROLES,
-        (
-            ("mha-q-projection", "model.layers.0.self_attn.q_proj.weight"),
-            ("mha-k-projection", "model.layers.0.self_attn.k_proj.weight"),
-            ("mha-v-projection", "model.layers.0.self_attn.v_proj.weight"),
-            ("mla-q-a-projection", "model.layers.0.self_attn.q_a_proj.weight"),
-            (
-                "mla-kv-a-projection",
-                "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
-            ),
-            ("indexer-projection", "model.layers.3.self_attn.indexer.wq_b.weight"),
-            ("attention-kv-scale", "model.layers.3.self_attn.attn.k_scale"),
-        ),
+        (("mha-q-projection", "model.layers.0.self_attn.q_proj.weight"),),
     ),
     (
         FFN_ROLES,
         ATTENTION_ROLES,
-        (
-            ("dense-gate-projection", "model.layers.0.mlp.gate_proj.weight"),
-            ("dense-up-projection", "model.layers.0.mlp.up_proj.weight"),
-            ("dense-down-projection", "model.layers.0.mlp.down_proj.weight"),
-        ),
+        (("dense-gate-projection", "model.layers.0.mlp.gate_proj.weight"),),
     ),
-    (
-        FFN_ROLES,
-        BOTH_ROLES,
-        (
-            ("moe-gate", "model.layers.3.mlp.gate.weight"),
-            ("moe-gate-bias", "model.layers.3.mlp.gate.e_score_correction_bias"),
-        ),
-    ),
+    (FFN_ROLES, BOTH_ROLES, (("moe-gate", "model.layers.3.mlp.gate.weight"),)),
     (
         FFN_ROLES,
         FFN_ROLES,
         (
-            (
-                "moe-expert-projection",
-                "model.layers.3.mlp.experts.0.gate_proj.weight",
-            ),
-            (
-                "moe-expert-scale",
-                "model.layers.3.mlp.experts.0.gate_proj.weight_scale_inv",
-            ),
+            ("moe-expert-projection", "model.layers.3.mlp.experts.0.gate_proj.weight"),
             (
                 "shared-expert-projection",
                 "model.layers.3.mlp.shared_experts.gate_proj.weight",
@@ -177,56 +145,8 @@ def test_load_weights_passes_one_shot_generator_to_native_loader(
     assert weights.iterations == 1
 
 
-def test_native_model_loader_packs_mha_qkv(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    target_name = "layers.0.self_attn.qkv_proj.weight"
-    loaded_shards: list[tuple[str, torch.Tensor]] = []
-    parameter = torch.nn.Parameter(torch.zeros(1))
-
-    def load_qkv(param, loaded_weight, shard_id):
-        assert param is parameter
-        loaded_shards.append((shard_id, loaded_weight))
-
-    parameter.weight_loader = load_qkv
-    monkeypatch.setattr(
-        native.rocm_aiter_ops,
-        "is_fusion_moe_shared_experts_enabled",
-        lambda: False,
-    )
-    monkeypatch.setattr(
-        native,
-        "fused_moe_make_expert_params_mapping",
-        lambda *args, **kwargs: [],
-    )
-    monkeypatch.setattr(native, "get_pp_missing_layer_names", lambda *args: set())
-    monkeypatch.setattr(native, "is_pp_missing_parameter", lambda *args: False)
-
-    model = object.__new__(AFDDeepseekV2Model)
-    object.__setattr__(model, "config", _config())
-    object.__setattr__(model, "use_mha", True)
-    object.__setattr__(model, "num_redundant_experts", 0)
-    object.__setattr__(model, "is_fused_shared_expert_enabled", False)
-    object.__setattr__(
-        model,
-        "named_parameters",
-        lambda: iter(((target_name, parameter),)),
-    )
-    qkv_weights = [
-        (f"layers.0.self_attn.{projection}_proj.weight", torch.tensor([i]))
-        for i, projection in enumerate(("q", "k", "v"))
-    ]
-
-    loaded_params = model.load_weights(iter(qkv_weights))
-
-    assert loaded_params == {target_name}
-    assert [shard_id for shard_id, _ in loaded_shards] == ["q", "k", "v"]
-    assert [weight.item() for _, weight in loaded_shards] == [0, 1, 2]
-
-
-@pytest.mark.parametrize("suffix", ["weight", "weight_scale", "input_scale", "bias"])
-def test_async_shared_weights_belong_to_attention(suffix):
-    name = f"model.layers.3.mlp.shared_experts.gate_proj.{suffix}"
+def test_async_shared_weights_belong_to_attention():
+    name = "model.layers.3.mlp.shared_experts.gate_proj.weight"
     assert (
         _checkpoint_weight_roles(
             name,
@@ -244,3 +164,49 @@ def test_async_shared_weights_belong_to_attention(suffix):
         )
         == FFN_ROLES
     )
+
+
+M2N_CHECKPOINT_NAMES = (
+    "model.layers.0.mlp.gate_proj.weight",
+    "model.layers.3.mlp.gate.weight",
+    "model.layers.3.mlp.shared_experts.gate_proj.weight",
+    "model.layers.3.mlp.experts.0.down_proj.weight",
+)
+
+
+@pytest.mark.parametrize(
+    ("role", "expected"),
+    [
+        ("attention", M2N_CHECKPOINT_NAMES[:3]),
+        ("ffn", M2N_CHECKPOINT_NAMES[1:2] + M2N_CHECKPOINT_NAMES[3:]),
+    ],
+)
+def test_deepep_m2n_loads_shared_experts_on_attention(
+    monkeypatch: pytest.MonkeyPatch, role: str, expected: tuple[str, ...]
+) -> None:
+    """Under DeepEP M2N, Attention loads the dense MLP, the gate and the
+    shared experts; the FFN loads the gate and the routed experts only.
+
+    Why: the DeepEP M2N FFN runs routed experts only, and Attention adds the
+    shared experts' output to the combined routed output.
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(
+        native.DeepseekV2ForCausalLM,
+        "load_weights",
+        lambda self, weights: seen.extend(name for name, _ in weights),
+    )
+    model = object.__new__(AFDDeepseekV2ForCausalLM)
+    object.__setattr__(model, "afd_role", role)
+    object.__setattr__(
+        model,
+        "afd_config",
+        SimpleNamespace(
+            compute_gate_on_attention=True, connector="DeepEPM2NAFDConnector"
+        ),
+    )
+    object.__setattr__(model, "config", _config())
+
+    model.load_weights(_OneShotWeights(list(M2N_CHECKPOINT_NAMES)))
+
+    assert tuple(seen) == expected

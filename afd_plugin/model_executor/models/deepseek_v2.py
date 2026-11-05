@@ -10,7 +10,7 @@ hidden states between the Attention and FFN roles through the AFD connector.
 
 from collections.abc import Iterable, Iterator
 from copy import copy
-from typing import Any, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 import torch
 import torch.nn as nn
@@ -19,17 +19,29 @@ from vllm.config import ParallelConfig, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers import fused_moe
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
+from vllm.model_executor.layers.fused_moe.router.router_factory import (
+    create_fused_moe_router,
+)
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models import deepseek_v2 as native
 
-from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
+from afd_plugin.config import (
+    AFD_ASYNC_CONNECTOR,
+    DEEPEP_M2N_CONNECTORS,
+    parse_afd_config,
+)
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
-    AFDF2ATransferPayload,
+    AFDForwardContextMetadata,
     AFDTransferContext,
     AFDTransferMetadata,
 )
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
 logger = init_logger(__name__)
 
@@ -50,6 +62,14 @@ def _is_moe_layer(config: _DeepseekAdapterConfig, layer_idx: int) -> bool:
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
 _BOTH_ROLES = frozenset(("attention", "ffn"))
+# Connectors whose Attention runs the shared experts, so their FFN builds
+# none: Async CAM, and DeepEP M2N whose FFN runs routed experts only.
+_ATTENTION_SHARED_EXPERTS_CONNECTORS = (
+    AFD_ASYNC_CONNECTOR,
+    *DEEPEP_M2N_CONNECTORS,
+)
+# Expert id of a padding row: a routed-experts connector sends it nowhere.
+UNROUTED_EXPERT_ID = -1
 
 
 def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
@@ -87,7 +107,7 @@ def _checkpoint_weight_roles(
     if not _is_moe_layer(config, layer_idx):
         return _ATTENTION_ROLE if compute_gate_on_attention else _FFN_ROLE
 
-    if attention_shared_experts and remainder and remainder[0] == "shared_experts":
+    if remainder and remainder[0] == "shared_experts" and attention_shared_experts:
         return _ATTENTION_ROLE
     is_moe_gate = bool(remainder) and remainder[0] == "gate"
     if is_moe_gate and compute_gate_on_attention:
@@ -114,24 +134,90 @@ def _iter_role_weights(
             yield name, loaded_weight
 
 
+def _unroute_tp_padding(topk_ids: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """Route the padding rows of this TP rank's ``sequence_parallel_chunk``
+    slice of ``num_tokens`` tokens to ``UNROUTED_EXPERT_ID``."""
+    local_tokens = topk_ids.shape[0]
+    token_index = native.get_tensor_model_parallel_rank() * local_tokens
+    token_index = token_index + torch.arange(local_tokens, device=topk_ids.device)
+    return topk_ids.masked_fill(
+        (token_index >= num_tokens).unsqueeze(1), UNROUTED_EXPERT_ID
+    )
+
+
 class RemoteFFNProxy(nn.Module):
-    """Parameter-free FFN stage executed through the AFD connector."""
+    """FFN stage executed through the AFD connector.
+
+    By default the proxy is parameter-free: it sends the hidden states and the
+    FFN role runs the complete MLP or MoE block. A model whose connector routes
+    on Attention (an M2N routed-experts connector such as DeepEP M2N) sets
+    ``gate``, ``top_k``, ``renormalize`` and ``tp_size`` after construction,
+    from its model and parallel config. The proxy then computes the gate and
+    vLLM's default fused top-k (``FusedTopKRouter``; EPLB is not supported)
+    and sends ``topk_ids`` and ``topk_weights``; combine returns the top-k
+    weighted sum, which replaces the native MoE block's output.
+
+    With Attention TP > 1 every TP rank holds the same tokens after the
+    attention all-reduce; dispatching them from every rank would make the FFN
+    run each token TP times. Each rank instead pads the tokens to a multiple
+    of ``tp_size`` (``sequence_parallel_chunk``), routes and dispatches only
+    its slice, and the TP group all-gathers the combined slices, as vLLM's
+    sequence-parallel MoE does. Padding rows get ``UNROUTED_EXPERT_ID`` and
+    reach no FFN rank; they are dropped after the all-gather.
+    """
 
     def __init__(self, *, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self.gate: ReplicatedLinear | None = None
+        self.top_k = 0
+        self.renormalize = False
+        self.tp_size = 1
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self._send_and_receive(hidden_states)
+        if self.gate is None:
+            return self._send_and_receive(hidden_states)
+        num_tokens = hidden_states.shape[0]
+        if self.tp_size > 1:
+            hidden_states = native.sequence_parallel_chunk(hidden_states)
+        router_logits, _ = self.gate(hidden_states)
+        topk_weights, topk_ids, _ = fused_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.top_k,
+            renormalize=self.renormalize,
+        )
+        if self.tp_size > 1:
+            topk_ids = _unroute_tp_padding(topk_ids, num_tokens)
+        output = self._send_and_receive(
+            hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+        if self.tp_size > 1:
+            output = native.tensor_model_parallel_all_gather(output, 0)
+            output = output[:num_tokens]
+        return output
 
     def _send_and_receive(
         self,
         hidden_states: torch.Tensor,
         **send_kwargs: torch.Tensor,
     ) -> torch.Tensor:
-        afd_metadata = get_afd_metadata_from_forward_context()
-        if afd_metadata is None:
-            raise RuntimeError("RemoteFFNProxy requires AFD forward metadata")
+        stage_idx = self._send(hidden_states, **send_kwargs)
+        hidden_states = maybe_apply_dbo_yield(
+            hidden_states,
+            role="attention",
+        )
+        return self._receive(hidden_states, stage_idx)
+
+    def _send(
+        self,
+        hidden_states: torch.Tensor,
+        **send_kwargs: torch.Tensor,
+    ) -> int:
+        """Send this layer's Attention output; return the stage to receive."""
+        afd_metadata = self._afd_metadata()
         forward_context = get_forward_context()
         stage_idx = int(
             getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),
@@ -148,14 +234,22 @@ class RemoteFFNProxy(nn.Module):
             context,
             **send_kwargs,
         )
-        hidden_states = maybe_apply_dbo_yield(
-            hidden_states,
-            role="attention",
-        )
-        return afd_metadata.connector.recv_ffn_output(
+        return stage_idx
+
+    def _receive(self, hidden_states: torch.Tensor, stage_idx: int) -> torch.Tensor:
+        """Receive the FFN output; a connector may write it into
+        ``hidden_states``."""
+        return self._afd_metadata().connector.recv_ffn_output(
             ref_tensor=hidden_states,
             ubatch_idx=stage_idx,
         )
+
+    @staticmethod
+    def _afd_metadata() -> AFDForwardContextMetadata:
+        afd_metadata = get_afd_metadata_from_forward_context()
+        if afd_metadata is None:
+            raise RuntimeError("RemoteFFNProxy requires AFD forward metadata")
+        return afd_metadata
 
 
 class AFDAttentionFusedMoE(RemoteFFNProxy):
@@ -168,9 +262,10 @@ class AFDAttentionFusedMoE(RemoteFFNProxy):
         external_routing: bool,
     ) -> None:
         super().__init__(layer_idx=layer_idx)
-        # v0.30 routing contract: the experts runner consumes transported
-        # router_logits only when its gate is None (external routing); a held
-        # gate routes internally and ignores the forwarded logits argument.
+        # vLLM 5df63a72 fused_moe/runner/moe_runner.py::MoERunner.forward
+        # enters _forward_impl, which consumes transported router_logits only
+        # when its gate is None (external routing); a held gate routes internally
+        # and ignores the forwarded logits argument.
         self.external_routing = external_routing
 
     # The native MoERunner boundary passes router_logits and input_ids; only
@@ -283,9 +378,9 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
     # constructing only the gate owned by Attention and a parameter-free proxy.
     # Signature: AFD-owned; adds layer_idx and compute_gate_on_attention and omits
     # quant_config because no local expert kernel is constructed.
-    # Upstream: vLLM v0.30.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
-    # In v0.30.0 the native forward always delegates routing to the experts
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
+    # In v0.32.0 the native forward always delegates routing to the experts
     # runner, so forward() below computes the Attention-side gate first when
     # this shell owns one.
     def __init__(
@@ -335,15 +430,15 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         )
         # ### PATCH END: construct a remote-experts native MoE shell.
 
-    # Patch reason: v0.30.0's native forward always delegates routing to the
+    # Patch reason: v0.32.0's native forward always delegates routing to the
     # experts runner (router_logits=hidden_states), so a shell that owns a
     # gate would never compute it and Attention would ship hidden states as
     # router logits.
     # Patch functionality: compute the Attention-side gate before transport;
     # gate-less shells keep the native delegation unchanged.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.30.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -372,14 +467,123 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         # ### PATCH END: compute the Attention-side gate before transport.
 
 
+class AFDDeepseekV2RoutedExpertsMoE(AFDDeepseekV2RemoteExpertsMoE):
+    """Attention-side DeepSeek MoE for routed-experts connectors (DeepEP M2N).
+
+    The connector dispatches each token's top-k routes to the FFN ranks that
+    own the experts, and its combine returns the top-k weighted sum. Attention
+    therefore owns the gate, the native router and the shared experts; the
+    FFN runs only the routed experts. The shared experts run between dispatch
+    and combine, overlapping the transfer and the FFN, as Async CAM does.
+
+    With Attention TP > 1 every TP rank holds the same tokens, so each routes
+    and dispatches only its ``sequence_parallel_chunk`` slice, as
+    ``RemoteFFNProxy`` does. The shared MLP then runs on that slice too, so it
+    is built with ``is_sequence_parallel`` (replicated weights, no all-reduce)
+    as native ``DeepseekV2MoE`` does; the TP group all-gathers routed plus
+    shared output.
+    """
+
+    # Patch reason: native DeepseekV2MoE runs the router and the shared experts
+    # inside its local experts runner, which Attention does not build.
+    # Patch functionality: build the native router and shared MLP next to the
+    # remote-experts shell; route, dispatch, run the shared MLP, combine.
+    # Signature: AFD-owned; takes vllm_config and layer_idx.
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
+    def __init__(
+        self,
+        *,
+        config: _DeepseekAdapterConfig,
+        vllm_config: VllmConfig,
+        layer_idx: int,
+        prefix: str,
+    ) -> None:
+        super().__init__(
+            config=config,
+            parallel_config=vllm_config.parallel_config,
+            layer_idx=layer_idx,
+            prefix=prefix,
+            compute_gate_on_attention=True,
+        )
+        assert self.gate is not None
+        # Native DeepseekV2MoE's router selection. As native, the router gets
+        # a unit scale and routed_scaling_factor applies to the routed output;
+        # combine sums weight * expert(token), so it goes into the weights.
+        self.router = create_fused_moe_router(
+            top_k=int(config.num_experts_per_tok),
+            global_num_experts=self.n_routed_experts,
+            renormalize=config.norm_topk_prob,
+            use_grouped_topk=True,
+            num_expert_group=getattr(config, "n_group", 1),
+            topk_group=getattr(config, "topk_group", 1),
+            scoring_func=getattr(config, "scoring_func", "softmax"),
+            e_score_correction_bias=self.gate.e_score_correction_bias,
+        )
+        self.routed_scaling_factor = float(
+            getattr(config, "routed_scaling_factor", 1.0),
+        )
+        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        self.shared_experts = (
+            native.DeepseekV2MLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size
+                * config.n_shared_experts,
+                hidden_act=config.hidden_act,
+                quant_config=vllm_config.quant_config,
+                is_sequence_parallel=self.tp_size > 1,
+                prefix=f"{prefix}.shared_experts",
+            )
+            if config.n_shared_experts
+            else None
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        already_sequence_parallel: bool = False,
+    ) -> torch.Tensor:
+        assert self.gate is not None
+        num_tokens = hidden_states.shape[0]
+        if self.tp_size > 1:
+            hidden_states = native.sequence_parallel_chunk(hidden_states)
+        router_logits, _ = self.gate(hidden_states)
+        topk_weights, topk_ids = self.router.select_experts(
+            hidden_states,
+            router_logits,
+        )
+        if self.routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * self.routed_scaling_factor
+        if self.tp_size > 1:
+            topk_ids = _unroute_tp_padding(topk_ids, num_tokens)
+        stage_idx = self.experts._send(
+            hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+        # Combine may write into hidden_states, so the shared MLP reads it
+        # first; it also overlaps the dispatch and the FFN's experts.
+        shared_output = (
+            None if self.shared_experts is None else self.shared_experts(hidden_states)
+        )
+        hidden_states = maybe_apply_dbo_yield(hidden_states, role="attention")
+        output = self.experts._receive(hidden_states, stage_idx)
+        if shared_output is not None:
+            output = output + shared_output
+        if self.tp_size > 1:
+            output = native.tensor_model_parallel_all_gather(output, 0)
+            output = output[:num_tokens]
+        return output
+
+
 class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
     """DeepSeek decoder layer with separable Attention and FFN execution."""
 
     # Patch reason: native DeepSeek constructs both Attention and FFN modules.
     # Patch functionality: construct only the modules owned by the active AFD role.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.30.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -490,7 +694,16 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                 **attn_kwargs,
             )
 
-            if self.uses_remote_experts:
+            if self.uses_remote_experts and afd_config.connector in (
+                DEEPEP_M2N_CONNECTORS
+            ):
+                self.mlp = AFDDeepseekV2RoutedExpertsMoE(
+                    config=config,
+                    vllm_config=vllm_config,
+                    layer_idx=layer_idx,
+                    prefix=f"{prefix}.mlp",
+                )
+            elif self.uses_remote_experts:
                 self.mlp = AFDDeepseekV2RemoteExpertsMoE(
                     config=config,
                     parallel_config=parallel_config,
@@ -528,7 +741,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                 if device_type == "npu":
                     native.FusedMoEFactory = fused_moe.FusedMoEFactory
                 moe_config = config
-                if afd_config.connector == AFD_ASYNC_CONNECTOR:
+                if afd_config.connector in _ATTENTION_SHARED_EXPERTS_CONNECTORS:
                     moe_config = copy(config)
                     # HF validates this public field as int, but pinned native
                     # MoE uses only None to omit shared construction (0 builds
@@ -549,7 +762,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                     # Keep the gate weights loadable, but with the runner's
                     # gate cleared it consumes the Attention-side router
                     # logits instead of computing its own (gate is None means
-                    # external routing in the v0.30 runner contract).
+                    # external routing in the v0.32 runner contract).
                     self.mlp.experts.gate = None
             else:
                 self.mlp = native.DeepseekV2MLP(
@@ -569,7 +782,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
-    # Target: vLLM ced6857, DeepseekV2DecoderLayer.forward attention fragment.
+    # Target: vLLM 5df63a7, DeepseekV2DecoderLayer.forward attention fragment.
     # AFD splits execution before the remote FFN and computes routing locally.
     # This AFD-owned method adds already_sequence_parallel because a one-token
     # stage can have equal global/local row counts; shape alone is ambiguous.
@@ -649,45 +862,16 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
     def compute_ffn_output(
         self,
         hidden_states: torch.Tensor,
-        *,
-        group_list: torch.Tensor | None = None,
-        dynamic_scales: torch.Tensor | None = None,
-        expand_x_shared: torch.Tensor | None = None,
-        dynamic_scales_shared: torch.Tensor | None = None,
-        topk_scales: torch.Tensor | None = None,
-        group_list_type: int = 1,
         **kwargs: Any,
-    ) -> torch.Tensor | AFDF2ATransferPayload:
+    ) -> torch.Tensor:
         if self.compute_gate_on_attention and not self.is_moe_layer:
             raise RuntimeError(
                 "Dense DeepSeek layers are computed on the Attention side "
                 "when compute_gate_on_attention=true",
             )
-        if (
-            self.compute_gate_on_attention
-            and native.current_platform.device_type == "npu"
-        ):
-            if group_list is None:
-                raise RuntimeError(
-                    "compute_gate_on_attention FFN MoE compute requires group_list",
-                )
-            # NPU-only: gated MoE FFN compute consumes Attention-side topk payloads.
-            from afd_plugin.model_executor.models.npu import (
-                deepseek_v2_attention_gate,
-            )
-
-            output = deepseek_v2_attention_gate.compute_attention_gate_moe_ffn(
-                self,
-                hidden_states=hidden_states,
-                group_list=group_list,
-                dynamic_scales=dynamic_scales,
-                expand_x_shared=expand_x_shared,
-                dynamic_scales_shared=dynamic_scales_shared,
-                topk_scales=topk_scales,
-                group_list_type=group_list_type,
-            )
-            return output
         if self.compute_gate_on_attention:
+            if native.current_platform.device_type == "npu":
+                raise RuntimeError("Async CAM FFN requires the layered executor")
             raise RuntimeError(
                 "GPU Attention-side gate must call compute_experts_output",
             )
@@ -711,7 +895,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
             )
         if not isinstance(self.mlp, native.DeepseekV2MoE):
             raise RuntimeError("FFN role does not own a native DeepSeek MoE")
-        # v0.30 runner contract: gate is None means the runner consumes the
+        # v0.32 runner contract: gate is None means the runner consumes the
         # router logits transported from Attention (external routing).
         if self.mlp.experts.gate is not None:
             raise RuntimeError("FFN native runner must use external routing")
@@ -730,8 +914,8 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
     # Patch reason: native DeepSeek always creates native Decoder layers.
     # Patch functionality: create role-aware AFD layers without full allocation.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.30.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # ### PATCH START: require AFD activation and avoid native allocation.
         afd_config = parse_afd_config(vllm_config, validate=False)
@@ -867,7 +1051,7 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         hidden_states: torch.Tensor,
         layer_idx: int,
         **kwargs: Any,
-    ) -> torch.Tensor | AFDF2ATransferPayload:
+    ) -> torch.Tensor:
         return self.layers[layer_idx].compute_ffn_output(
             hidden_states,
             **kwargs,
@@ -893,6 +1077,15 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
             for layer_idx, layer in enumerate(self.layers)
             if isinstance(layer, AFDDeepseekV2DecoderLayer) and layer.is_moe_layer
         )
+
+    def get_routed_experts(self, layer_idx: int) -> "RoutedExperts":
+        """FFN only: the vLLM module holding one MoE layer's local experts.
+
+        Connectors that route on Attention run these experts themselves, so
+        ``routed_scaling_factor`` must be folded into the top-k weights that
+        Attention sends; the FFN never applies it.
+        """
+        return self.layers[layer_idx].mlp.experts.routed_experts
 
     def get_experts_routing_spec(
         self,
@@ -937,7 +1130,7 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
         hidden_states: torch.Tensor,
         layer_idx: int,
         **kwargs: Any,
-    ) -> torch.Tensor | AFDF2ATransferPayload:
+    ) -> torch.Tensor:
         return self.model.compute_ffn_output(hidden_states, layer_idx, **kwargs)
 
     def compute_experts_output(
@@ -955,6 +1148,9 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return self.model.get_experts_layer_indices()
 
+    def get_routed_experts(self, layer_idx: int) -> "RoutedExperts":
+        return self.model.get_routed_experts(layer_idx)
+
     def get_experts_routing_spec(
         self,
         layer_idx: int,
@@ -969,7 +1165,7 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
                 config=self.config,
                 compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
                 attention_shared_experts=self.afd_config.connector
-                == AFD_ASYNC_CONNECTOR,
+                in _ATTENTION_SHARED_EXPERTS_CONNECTORS,
             )
         )
 

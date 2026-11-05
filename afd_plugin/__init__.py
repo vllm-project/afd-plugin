@@ -22,6 +22,7 @@ def __getattr__(name: str):
         "AFDAttentionWorker",
         "AFDFFNWorker",
         "GPUFFNModelRunner",
+        "GPUFFNRoutedExpertsModelRunner",
     }:
         from afd_plugin.v1 import worker
 
@@ -110,6 +111,10 @@ _DEEPSEEK_MODEL_REGISTRATIONS = {
         "afd_plugin.model_executor.models.npu.deepseek_v4:AFDDeepseekV4ForCausalLM"
         if importlib.util.find_spec("torch_npu") is not None
         else "afd_plugin.model_executor.models.deepseek_v4:AFDDeepseekV4ForCausalLM"
+    ),
+    "DSparkDraftModel": (
+        "afd_plugin.model_executor.models.npu.deepseek_v4_dspark:"
+        "AFDDSparkDeepseekV4ForCausalLM"
     ),
     "GlmMoeDsaForCausalLM": (
         "afd_plugin.model_executor.models.deepseek_v2:AFDGlmMoeDsaForCausalLM"
@@ -222,6 +227,7 @@ __all__ = [
     "AFDAttentionWorker",
     "AFDFFNWorker",
     "GPUFFNModelRunner",
+    "GPUFFNRoutedExpertsModelRunner",
     "assert_compatible_afd_stack",
     "parse_afd_config",
     "parse_optional_afd_config",

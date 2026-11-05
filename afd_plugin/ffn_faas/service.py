@@ -9,13 +9,13 @@ import os
 import threading
 import time
 from collections.abc import Mapping
-from enum import Enum
+from enum import StrEnum
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Final
+from typing import Final, cast
 
 
-class ServicePhase(str, Enum):
+class ServicePhase(StrEnum):
     STARTING = "starting"
     LOADING = "loading"
     CONNECTING = "connecting"
@@ -90,14 +90,14 @@ class FFNService:
             status = dict(self._status)
             if (
                 self.stop_requested.is_set()
-                and ServicePhase(status["phase"]) not in TERMINAL_PHASES
+                and ServicePhase(cast(str, status["phase"])) not in TERMINAL_PHASES
             ):
                 status["phase"] = ServicePhase.STOPPING.value
             return status
 
     def phase(self, phase: ServicePhase, **details: str | int | bool) -> None:
         with self._lock:
-            current = ServicePhase(self._status["phase"])
+            current = ServicePhase(cast(str, self._status["phase"]))
             if current in TERMINAL_PHASES:
                 raise RuntimeError(
                     f"cannot leave terminal service state {current.value}"
@@ -125,7 +125,7 @@ class FFNService:
         # establish device quiescence before resources can be released.
         self.stop_requested.set()
         with self._lock:
-            if ServicePhase(self._status["phase"]) not in TERMINAL_PHASES:
+            if ServicePhase(cast(str, self._status["phase"])) not in TERMINAL_PHASES:
                 self._status["phase"] = ServicePhase.STOPPING.value
 
     def request_signal_stop(self) -> None:
@@ -147,7 +147,7 @@ class FFNService:
 
             def do_GET(self) -> None:
                 status = service.snapshot()
-                phase = ServicePhase(status["phase"])
+                phase = ServicePhase(cast(str, status["phase"]))
                 if self.path == "/status":
                     self.respond(HTTPStatus.OK, status)
                 elif self.path in ("/ready", "/health"):

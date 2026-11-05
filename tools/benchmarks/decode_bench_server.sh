@@ -24,9 +24,9 @@
 # PYTHONPATH (inherited by the vLLM scheduler/worker subprocesses).
 #
 # Usage:
-#   MODEL_PATH=/path/to/DeepSeek-V2-Lite tools/benchmarks/2a2f_graph_dbo_dp2tp1_decode_bench.sh
+#   MODEL_PATH=/path/to/DeepSeek-V2-Lite tools/benchmarks/decode_bench_server.sh
 # then, once both instances are ready, drive load against the attention port:
-#   MODEL_PATH=/path/to/DeepSeek-V2-Lite tools/benchmarks/vllm_bench.sh
+#   MODEL_PATH=/path/to/DeepSeek-V2-Lite tools/benchmarks/request_generator.sh
 set -euo pipefail
 
 # --- make tools.benchmarks.decode_bench importable in vLLM subprocesses -------
@@ -98,7 +98,7 @@ CUDA_VISIBLE_DEVICES=2,3 uv run vllm serve "$MODEL_PATH" \
         "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes":[64]
     }' \
     --host 127.0.0.1 \
-    --port 18305 \
+    --port 18306 \
     --trust-remote-code > ffn.log 2>&1 &
 
 wait

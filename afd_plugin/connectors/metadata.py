@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import copy
 import json
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from torch.distributed.distributed_c10d import ProcessGroup
 
     from afd_plugin.connectors.base import AFDConnectorBase
+
+FP8_DTYPE = torch.float8_e4m3fn
 
 
 @dataclass(slots=True)
@@ -44,12 +46,21 @@ class AFDDPMetadata:
             )
 
     @contextmanager
-    def sp_local_sizes(self, sequence_parallel_size: int) -> Generator[list[int]]:
-        local_sizes: list[int] = (
-            (
-                (self.num_tokens_across_dp_cpu + sequence_parallel_size - 1)
-                // sequence_parallel_size
+    def sp_local_sizes(
+        self,
+        sequence_parallel_size: int,
+        pcp_size: int = 1,
+        use_ep: bool = False,
+    ) -> Generator[list[int]]:
+        num_tokens = self.num_tokens_across_dp_cpu
+        if pcp_size > 1:
+            num_tokens = (
+                num_tokens.repeat_interleave(pcp_size)
+                if use_ep
+                else num_tokens * pcp_size
             )
+        local_sizes: list[int] = (
+            ((num_tokens + sequence_parallel_size - 1) // sequence_parallel_size)
             .repeat_interleave(sequence_parallel_size)
             .tolist()
         )
@@ -182,7 +193,10 @@ class AFDTransferMetadata:
         seq_lens: Per-peer or per-split token lengths. The sum of this list is
             the expected leading dimension for tensors validated against this
             metadata. For one-to-one transfers this is usually a single-item
-            list; for fan-in/fan-out paths it can describe split sizes.
+            list; for fan-in/fan-out paths it can describe split sizes. An
+            entry may be ``0``: with expert-routed transports (DeepEP M2N) an
+            FFN rank can receive no rows for a layer while still taking part
+            in the collective.
     """
 
     layer_idx: int
@@ -192,8 +206,8 @@ class AFDTransferMetadata:
     def __post_init__(self) -> None:
         if not self.seq_lens:
             raise ValueError("seq_lens cannot be empty")
-        if any(length <= 0 for length in self.seq_lens):
-            raise ValueError("all sequence lengths must be positive")
+        if any(length < 0 for length in self.seq_lens):
+            raise ValueError("all sequence lengths must be non-negative")
 
     @property
     def total_tokens(self) -> int:
@@ -312,6 +326,54 @@ class AFDForwardContextMetadata:
         return cloned
 
 
+@dataclass(frozen=True)
+class LocalExpertWeights:
+    """This FFN rank's experts, in vLLM ``FusedMoE`` layout.
+
+    Attributes:
+        w13: ``[E_local, 2 * I, H]`` gate and up projections (gate first),
+            BF16 or FP8.
+        w2: ``[E_local, H, I]`` down projection, same dtype as ``w13``.
+        w13_scale: FP8 only: ``[E_local, 2 * I / 128, H / 128]`` fp32 block
+            scales (vLLM ``w13_weight_scale_inv``).
+        w2_scale: FP8 only: ``[E_local, H / 128, I / 128]`` fp32 block scales.
+    """
+
+    w13: torch.Tensor
+    w2: torch.Tensor
+    w13_scale: torch.Tensor | None = None
+    w2_scale: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        if self.w13.dtype != self.w2.dtype:
+            raise ValueError("w13 and w2 must have the same dtype")
+        if self.is_fp8 != (self.w13_scale is not None and self.w2_scale is not None):
+            raise ValueError(
+                "FP8 expert weights need both block scales (and BF16 none)"
+            )
+
+    @property
+    def num_experts(self) -> int:
+        return int(self.w13.shape[0])
+
+    @property
+    def is_fp8(self) -> bool:
+        return self.w13.dtype == FP8_DTYPE
+
+
+@dataclass(frozen=True)
+class FFNLocalExperts:
+    """One MoE layer's experts on this FFN rank, as vLLM loaded them.
+
+    Attributes:
+        expert_ids: Global ids of the experts in ``weights``, in slot order.
+        weights: The same experts in the executor's layout.
+    """
+
+    expert_ids: tuple[int, ...]
+    weights: LocalExpertWeights
+
+
 def _to_int(value: object) -> int:
     item = getattr(value, "item", None)
     return int(cast(Any, item() if callable(item) else value))
@@ -405,19 +467,49 @@ def recv_control_payload(
     src: int,
     group: ProcessGroup,
     device: torch.device,
+    check_closed: Callable[[], None] | None = None,
 ) -> AFDControlPayload:
-    """Receive and decode a DP-metadata payload from ``src`` over ``group``."""
+    """Receive a payload, checking local cancellation after device waits."""
+
+    def recv_tensor(tensor: torch.Tensor) -> int:
+        try:
+            return torch.distributed.recv(tensor, src=src, group=group)
+        except ValueError as error:
+            # Torch's rank lookup can race the owned PG's local unregistration.
+            if (
+                check_closed is not None
+                and str(error).startswith("Group ")
+                and str(error).endswith(
+                    "is not registered, please create group with "
+                    "torch.distributed.new_group API"
+                )
+            ):
+                # The base contract imports this codec; defer the circular import.
+                from afd_plugin.connectors.base import AFDControlPlaneClosedError
+
+                try:
+                    check_closed()
+                except AFDControlPlaneClosedError as closed_error:
+                    raise closed_error from error
+            raise
+
     size_tensor = torch.empty(1, dtype=torch.long, device=device)
-    rank_size = torch.distributed.recv(size_tensor, src=src, group=group)
+    rank_size = recv_tensor(size_tensor)
+    raw_size = size_tensor.item()
+    if check_closed is not None:
+        check_closed()
     object_tensor = torch.empty(
-        int(size_tensor.item()),
+        int(raw_size),
         dtype=torch.uint8,
         device=device,
     )
-    rank_object = torch.distributed.recv(object_tensor, src=src, group=group)
+    rank_object = recv_tensor(object_tensor)
     if rank_object != rank_size:
         raise RuntimeError("received AFD DP metadata fragments from different ranks")
-    return decode_control_payload(object_tensor.cpu().numpy().tobytes())
+    object_tensor_cpu = object_tensor.cpu()
+    if check_closed is not None:
+        check_closed()
+    return decode_control_payload(object_tensor_cpu.numpy().tobytes())
 
 
 __all__ = [
@@ -431,6 +523,9 @@ __all__ = [
     "AFDForwardContextMetadata",
     "AFDA2FTransferPayload",
     "AFDSingleDPMetadata",
+    "FFNLocalExperts",
+    "FP8_DTYPE",
+    "LocalExpertWeights",
     "decode_control_payload",
     "encode_control_payload",
     "recv_control_payload",

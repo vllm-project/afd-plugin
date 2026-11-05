@@ -77,7 +77,7 @@ metadata，失败会停止并记录原因；已有结果保留，不能覆盖后
 `DSV4_BENCH_RUN_ID` 为必填，针对实际 runtime、checkpoint 和执行配置选择独立标识；
 默认结果根目录为 `bench_results/dsv4-flash/v030`，不复用 0.26 的结果目录。
 benchmark 和 sweep 使用同一组部署环境变量；其中 `PREFILL_ENABLE_DBO`、
-阈值、`PREFILL_FFN_GRAPH_MODE`、`AFD_ASYNC_CAM_LAYERED_GMM` 必须描述实际服务。
+阈值和 `PREFILL_FFN_GRAPH_MODE` 必须描述实际服务。
 开启 KV connector 的部署使用独立 PD 测量，不运行这个 prefill-only benchmark。
 
 结果同时记录 skill contract、run ID、checkpoint 路径、DBO/FFN 模式、indexer dtype、
