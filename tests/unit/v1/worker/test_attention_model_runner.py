@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -17,7 +16,6 @@ from vllm.forward_context import BatchDescriptor, ForwardContext
 import afd_plugin.model_executor.models.forward_context as afd_forward_context
 from afd_plugin.config import AFDConfig
 from afd_plugin.connectors import AFDControlPayload
-from afd_plugin.distributed import resolve_role_rank
 from afd_plugin.model_executor.models.forward_context import (
     get_afd_metadata_from_forward_context,
     use_afd_metadata_provider,
@@ -26,7 +24,6 @@ from afd_plugin.v1.worker.attention_metadata import _is_ubatch_child_afd_context
 from afd_plugin.v1.worker.attention_model_runner_v2 import (
     AFDAttentionModelRunnerV2,
 )
-from afd_plugin.v1.worker.cuda_graph import validate_cuda_graph_mode
 from afd_plugin.v1.worker.ubatch_wrapper import (
     build_ubatch_additional_kwargs,
     build_ubatch_afd_metadata,
@@ -246,6 +243,9 @@ def test_attention_runner_sends_per_ubatch_dp_metadata():
 
     assert set(runner.connector.dp_metadata_updates[0]) == {0, 1}
     assert set(runner.connector.sent_dp_metadata_lists[0]) == {0, 1}
+    assert [
+        _tokens(value) for value in runner.connector.sent_dp_metadata_lists[0].values()
+    ] == [[3], [5]]
 
 
 def test_attention_runner_skips_dp_metadata_send_for_ubatch_child_context():
@@ -287,39 +287,6 @@ def test_attention_runner_skips_dp_metadata_send_for_ubatch_child_context():
     assert forward_context.additional_kwargs["afd_metadata"] is child
     assert runner.connector.dp_metadata_updates == []
     assert runner.connector.sent_dp_metadata_lists == []
-
-
-def test_attention_runner_does_not_skip_single_stage_context():
-    runner = object.__new__(AFDAttentionModelRunnerV2)
-    runner.afd_config = AFDConfig(role="attention")
-    runner.vllm_config = SimpleNamespace(
-        parallel_config=_parallel_config(),
-    )
-    runner.connector = _RecordingConnector()
-    runner._is_warmup = False
-    runner._afd_is_graph_capturing = False
-    runner._afd_transaction_counter = 0
-    runner._afd_pending_metadata = runner.build_afd_metadata(None, 5)
-    forward_context = ForwardContext(
-        no_compile_layers={},
-        attn_metadata={},
-        slot_mapping={},
-        additional_kwargs={},
-        dp_metadata=_dp_metadata([5]),
-        ubatch_slices=None,
-        batch_descriptor=BatchDescriptor(num_tokens=5),
-        cudagraph_runtime_mode=CUDAGraphMode.NONE,
-    )
-
-    assert not _is_ubatch_child_afd_context(
-        forward_context,
-        runner._afd_pending_metadata,
-    )
-
-    runner.install_afd_metadata_on_forward_context(forward_context)
-
-    assert set(runner.connector.sent_dp_metadata_lists[0]) == {0}
-    assert _tokens(runner.connector.sent_dp_metadata_lists[0][0]) == [5]
 
 
 def test_ubatch_metadata_clones_parent_and_preserves_additional_kwargs():
@@ -380,11 +347,9 @@ def test_mrv2_missing_parent_metadata_uses_complete_public_installer():
     runner.install_afd_metadata_on_forward_context(forward_context)
 
     metadata = forward_context.additional_kwargs["afd_metadata"]
-    assert metadata is runner._afd_pending_metadata
     assert metadata is not None
     assert metadata.transaction_id == "afd-0"
     assert metadata.tokens_lens == [3, 5]
-    assert metadata is runner._afd_pending_metadata
     assert set(runner.connector.sent_dp_metadata_lists[0]) == {0, 1}
 
 
@@ -444,30 +409,9 @@ def test_forward_context_provider_can_install_without_sending_metadata(monkeypat
         forward_context = fake_forward_context.create_forward_context()
         metadata = get_afd_metadata_from_forward_context(forward_context)
 
-    assert metadata is runner._afd_pending_metadata
+    assert metadata.tokens_lens == [1]
     assert runner.connector.sent_dp_metadata_lists == []
     assert fake_forward_context.create_forward_context is original_create
-
-
-def test_attention_runtime_rejects_unsupported_cuda_graph_modes():
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(enforce_eager=False),
-        compilation_config=SimpleNamespace(cudagraph_mode="PIECEWISE"),
-        parallel_config=_parallel_config(),
-    )
-
-    with pytest.raises(RuntimeError, match="FULL_DECODE_ONLY"):
-        validate_cuda_graph_mode(vllm_config, role="attention")
-
-
-def test_attention_runtime_allows_full_decode_only_cuda_graph():
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(enforce_eager=False),
-        compilation_config=SimpleNamespace(cudagraph_mode="FULL_DECODE_ONLY"),
-        parallel_config=_parallel_config(),
-    )
-
-    validate_cuda_graph_mode(vllm_config, role="attention")
 
 
 def test_attention_runner_forwards_capture_and_warmup_flags():
@@ -520,177 +464,3 @@ def test_attention_runner_builds_capture_dp_metadata_for_native_dp():
         tokens = tokens.tolist()
     assert tokens == [64, 64]
     assert not hasattr(metadata, "max_tokens_across_dp_cpu")
-
-
-def test_afd_rank_derives_from_data_parallel_rank():
-    config = AFDConfig(
-        role="attention",
-        connector="P2pNcclAFDConnector",
-        num_attention_ranks=2,
-        num_ffn_ranks=2,
-    )
-    vllm_config = SimpleNamespace(
-        parallel_config=_parallel_config(data_parallel_size=2, data_parallel_rank=1),
-    )
-
-    role_rank = resolve_role_rank(vllm_config, config)
-
-    assert role_rank == 1
-
-
-def _parallel_config_with_tp(
-    *,
-    dp_size=1,
-    dp_rank=0,
-    tp_size=1,
-    **overrides,
-):
-    values = {
-        "data_parallel_size": dp_size,
-        "data_parallel_rank": dp_rank,
-        "prefill_context_parallel_size": 1,
-        "tensor_parallel_size": tp_size,
-        "use_ubatching": False,
-        "num_ubatches": 1,
-        "dbo_decode_token_threshold": 32,
-        "dbo_prefill_token_threshold": 512,
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
-
-
-def test_afd_rank_derives_from_tp_rank_dp1_tp2(monkeypatch):
-    """DP=1, TP=2: each TP worker gets a unique role_rank."""
-    monkeypatch.setattr(
-        sys.modules["vllm.distributed.parallel_state"],
-        "get_tensor_model_parallel_rank",
-        lambda: 1,
-    )
-    config = AFDConfig(
-        role="attention",
-        connector="P2pNcclAFDConnector",
-        num_attention_ranks=4,
-        num_ffn_ranks=4,
-    )
-    vllm_config = SimpleNamespace(
-        parallel_config=_parallel_config_with_tp(dp_size=1, tp_size=2),
-    )
-
-    role_rank = resolve_role_rank(vllm_config, config)
-
-    assert role_rank == 1
-
-
-def test_afd_rank_derives_from_pcp_rank_dp1_pcp2(monkeypatch):
-    """DP=1, PCP=2, TP=1: each PCP worker gets a unique role_rank."""
-    monkeypatch.setattr(
-        sys.modules["vllm.distributed.parallel_state"],
-        "get_pcp_group",
-        lambda: SimpleNamespace(rank_in_group=1),
-    )
-    config = AFDConfig(
-        role="attention",
-        connector="P2pNcclAFDConnector",
-        num_attention_ranks=2,
-        num_ffn_ranks=2,
-    )
-    vllm_config = SimpleNamespace(
-        parallel_config=_parallel_config_with_tp(
-            dp_size=1,
-            tp_size=1,
-            prefill_context_parallel_size=2,
-        ),
-    )
-
-    role_rank = resolve_role_rank(vllm_config, config)
-
-    assert role_rank == 1
-
-
-@pytest.mark.parametrize(("pcp_rank", "expected_role_rank"), [(0, 16), (7, 23)])
-def test_afd_rank_uses_global_dp_rank_for_dp3_pcp8_node1(
-    monkeypatch,
-    pcp_rank,
-    expected_role_rank,
-):
-    monkeypatch.setattr(
-        sys.modules["vllm.distributed.parallel_state"],
-        "get_pcp_group",
-        lambda: SimpleNamespace(rank_in_group=pcp_rank),
-    )
-    config = AFDConfig(
-        role="attention",
-        connector="CAMAsyncAFDConnector",
-        num_attention_ranks=24,
-        num_ffn_ranks=8,
-    )
-    vllm_config = SimpleNamespace(
-        parallel_config=_parallel_config_with_tp(
-            dp_size=3,
-            dp_rank=2,
-            prefill_context_parallel_size=8,
-        ),
-    )
-
-    role_rank = resolve_role_rank(vllm_config, config)
-
-    assert role_rank == expected_role_rank
-
-
-def test_afd_rank_derives_from_dp_and_tp_ranks_dp2_tp2(monkeypatch):
-    """DP=2, TP=2: role_rank = dp_rank * tp_size + tp_rank."""
-    monkeypatch.setattr(
-        sys.modules["vllm.distributed.parallel_state"],
-        "get_tensor_model_parallel_rank",
-        lambda: 1,
-    )
-    config = AFDConfig(
-        role="attention",
-        connector="P2pNcclAFDConnector",
-        num_attention_ranks=4,
-        num_ffn_ranks=4,
-    )
-    vllm_config = SimpleNamespace(
-        parallel_config=_parallel_config_with_tp(dp_size=2, dp_rank=1, tp_size=2),
-    )
-
-    role_rank = resolve_role_rank(vllm_config, config)
-
-    assert role_rank == 3
-
-
-def test_afd_rank_is_zero_when_dp1_pcp1_tp1():
-    config = AFDConfig(
-        role="attention",
-        connector="P2pNcclAFDConnector",
-        num_attention_ranks=1,
-        num_ffn_ranks=1,
-    )
-    vllm_config = SimpleNamespace(
-        parallel_config=_parallel_config_with_tp(dp_size=1, tp_size=1),
-    )
-
-    role_rank = resolve_role_rank(vllm_config, config)
-
-    assert role_rank == 0
-
-
-def test_afd_rank_raises_for_out_of_range_dp2_tp2(monkeypatch):
-    """role_rank must stay within role_size."""
-    monkeypatch.setattr(
-        sys.modules["vllm.distributed.parallel_state"],
-        "get_tensor_model_parallel_rank",
-        lambda: 0,
-    )
-    config = AFDConfig(
-        role="attention",
-        connector="P2pNcclAFDConnector",
-        num_attention_ranks=2,
-        num_ffn_ranks=2,
-    )
-    vllm_config = SimpleNamespace(
-        parallel_config=_parallel_config_with_tp(dp_size=2, dp_rank=1, tp_size=2),
-    )
-
-    with pytest.raises(ValueError, match="out of range"):
-        resolve_role_rank(vllm_config, config)

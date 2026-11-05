@@ -20,9 +20,8 @@ from afd_plugin.model_executor.models.npu import (  # noqa: E402
 @pytest.mark.parametrize(
     "num_tokens,tp_size,tp_rank", [(5, 2, 1), (1, 4, 0), (1, 4, 3)]
 )
-@pytest.mark.parametrize("use_mrv2", [False, True])
 def test_sp_shared_experts_gather_before_mlp_and_reduce_scatter_after(
-    monkeypatch, num_tokens, tp_size, tp_rank, use_mrv2
+    monkeypatch, num_tokens, tp_size, tp_rank
 ):
     expert = shared.AFDDeepseekV4SharedExperts.__new__(
         shared.AFDDeepseekV4SharedExperts
@@ -31,18 +30,13 @@ def test_sp_shared_experts_gather_before_mlp_and_reduce_scatter_after(
     expert.is_sequence_parallel = True
     expert.weights_replicated = False
     monkeypatch.setattr(shared, "get_tensor_model_parallel_world_size", lambda: tp_size)
-    monkeypatch.setattr(ascend_forward_context, "_USE_V2_EXTRA_KWARGS", use_mrv2)
+    monkeypatch.setattr(ascend_forward_context, "_USE_V2_EXTRA_KWARGS", True)
     context = ForwardContext(
         no_compile_layers={},
         attn_metadata={},
         slot_mapping={},
-        additional_kwargs={"num_tokens": num_tokens} if use_mrv2 else {},
+        additional_kwargs={"num_tokens": num_tokens},
     )
-    if use_mrv2:
-        assert "num_tokens" not in vars(context)
-    else:
-        context.num_tokens = num_tokens
-
     local_size = (num_tokens + tp_size - 1) // tp_size
     full_tokens = torch.arange(local_size * tp_size, dtype=torch.float32).unsqueeze(-1)
     local_slice = slice(tp_rank * local_size, (tp_rank + 1) * local_size)

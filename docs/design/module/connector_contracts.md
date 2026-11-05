@@ -25,6 +25,7 @@ validation_paths:
   - "tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py"
   - "tests/unit/distributed/**"
   - "tests/gpu/**"
+  - "tests/npu/test_async_cam_connector.py"
 upstream_refs:
   - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
@@ -62,12 +63,12 @@ depend on role worker implementations.
 
 | Area | Source | Focused validation |
 | --- | --- | --- |
-| Base surface and lazy factory | [`base.py`](../../../afd_plugin/connectors/base.py), [`factory.py`](../../../afd_plugin/connectors/factory.py) | [`test_base_factory.py`](../../../tests/unit/connectors/test_base_factory.py) |
+| Base surface and lazy factory | [`base.py`](../../../afd_plugin/connectors/base.py), [`factory.py`](../../../afd_plugin/connectors/factory.py) | [P2P factory and construction tests](../../../tests/unit/connectors/test_p2p_connector.py), [metadata contracts](../../../tests/unit/connectors/test_metadata.py) |
 | Payloads and control-plane codec | [`metadata.py`](../../../afd_plugin/connectors/metadata.py) | Connector unit tests and [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
 | CUDA P2P | [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py), [`topology.py`](../../../afd_plugin/distributed/topology.py) | [`test_p2p_connector.py`](../../../tests/unit/connectors/test_p2p_connector.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) |
 | CUDA DeepEP M2N | [`gpu/deepep_m2n/`](../../../afd_plugin/connectors/gpu/deepep_m2n/), `AFDRoutedExpertsConnector` in [`base.py`](../../../afd_plugin/connectors/base.py) | [`test_deepep_m2n_connector.py`](../../../tests/unit/connectors/test_deepep_m2n_connector.py), [GPU device tests](../../../tests/gpu/README.md), [Qwen3 MoE E2E](../../../tests/e2e/models/qwen3_moe/test_qwen3_moe.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) (`test_deepseek_v2_lite_deepep_m2n`) |
 | Ascend CAMP2P | [`npu/camp2p.py`](../../../afd_plugin/connectors/npu/camp2p.py) | [`test_camp2p_connector.py`](../../../tests/unit/connectors/test_camp2p_connector.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) |
-| Ascend CAM async | [`npu/async_cam.py`](../../../afd_plugin/connectors/npu/async_cam.py) | [`test_async_cam_connector.py`](../../../tests/unit/connectors/test_async_cam_connector.py), [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py) |
+| Ascend CAM async | [`npu/async_cam.py`](../../../afd_plugin/connectors/npu/async_cam.py) | [Connector unit tests](../../../tests/unit/connectors/test_async_cam_connector.py), [fused routing device test](../../../tests/npu/test_async_cam_connector.py), [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py) |
 | Process-group construction | [`afd_process_group.py`](../../../afd_plugin/distributed/afd_process_group.py) | Connector initialization tests plus platform E2E paths |
 
 ## Factory and construction

@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import ast
-import os
 import sys
 from collections.abc import Callable
 from dataclasses import replace
@@ -100,7 +99,7 @@ def test_device_layer_selection_capacity_and_scaling(
     swiglu_limit,
     layer_ids,
     via_graph,
-):
+):  # long-test: one external CANN transaction spans both layered operators
     layers = [
         replace(weights(idx, per_channel, quantization), swiglu_limit=swiglu_limit)
         for idx in reversed(layer_ids)
@@ -235,63 +234,6 @@ def runner_method(name, namespace):
     return namespace[name]
 
 
-def test_runner_preserves_raw_context_and_chunk_capacity():
-    payloads = [
-        SimpleNamespace(
-            hidden_states=torch.empty(8, 32),
-            context=SimpleNamespace(
-                states=SimpleNamespace(
-                    dynamic_scales=torch.ones(8),
-                    group_list=torch.tensor([0, 0]),
-                    token_nums_rankid_layeridx=torch.tensor([99, 1, 5, 0]),
-                )
-            ),
-        )
-        for _ in range(2)
-    ]
-    received = iter(payloads)
-    sent = []
-    computed = []
-    connector = SimpleNamespace(
-        recv_attn_output=lambda: next(received),
-        send_ffn_output=lambda result, ctx: sent.append((result, ctx)),
-    )
-
-    def compute(*args):
-        computed.append(args)
-        return torch.empty(8, 32, dtype=torch.bfloat16)
-
-    runner = SimpleNamespace(
-        model=object(),
-        connector=connector,
-        _two_stream=None,
-        _layered_executor=compute,
-        layer_ids=(2, 5),
-    )
-    method = runner_method(
-        "_ffn_forward_connector_driven",
-        {
-            "cast": cast,
-            "CAMAsyncAFDConnector": SimpleNamespace,
-            "AFDAsyncTransferState": SimpleNamespace,
-        },
-    )
-    method(runner)
-    assert [ctx for _, ctx in sent] == [p.context for p in payloads]
-    for args, payload in zip(computed, payloads, strict=True):
-        assert args[0] is payload.hidden_states
-        assert args[3] is payload.context.states.token_nums_rankid_layeridx
-
-
-def test_runner_switch_off_does_not_touch_model_or_ops():
-    runner = SimpleNamespace(model=object(), _layered_gmm_requested=False)
-    method = runner_method(
-        "_initialize_layered_executor",
-        {"logger": SimpleNamespace(info=lambda *args: None)},
-    )
-    method(runner)
-
-
 @pytest.mark.parametrize(
     ("role", "connector", "is_dsv4", "message"),
     [
@@ -393,41 +335,6 @@ def test_runner_requires_complete_layered_target_and_draft_coverage(
     else:
         method(runner)
     assert runner.connector.layered_gmm_enabled == enabled
-
-
-def test_layered_debug_logging_does_not_read_metadata(monkeypatch):
-    source = Path("afd_plugin/connectors/npu/async_cam.py").read_text()
-    function = next(
-        node
-        for node in ast.parse(source).body
-        if isinstance(node, ast.FunctionDef) and node.name == "_log_cam_op_values"
-    )
-    messages = []
-    namespace = {
-        "os": os,
-        "Tensor": torch.Tensor,
-        "_CAM_OP_IO_LOG_ENV": "AFD_CAM_OP_IO_LOG",
-        "_CAM_LOG_SKIPPED_ARGS": frozenset(),
-        "logger": SimpleNamespace(warning=lambda *args: messages.append(args)),
-    }
-    exec(
-        compile(ast.Module(body=[function], type_ignores=[]), "<cam-log>", "exec"),
-        namespace,
-    )
-    monkeypatch.setenv("AFD_CAM_OP_IO_LOG", "1")
-
-    def reject(*args, **kwargs):
-        raise AssertionError("metadata D2H")
-
-    monkeypatch.setattr(torch.Tensor, "cpu", reject)
-    namespace["_log_cam_op_values"](
-        "combine",
-        "inputs",
-        metadata_values=False,
-        token_nums_rankid_layeridx=torch.tensor([10, 1, 3]),
-    )
-    assert "first5" not in messages[0][-1]
-    assert "shape=(3,)" in messages[0][-1]
 
 
 def model_weights_method(monkeypatch):

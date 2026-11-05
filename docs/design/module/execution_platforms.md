@@ -35,7 +35,7 @@ validation_paths:
   - "tests/unit/v1/worker/test_npu_runtime.py"
   - "tests/unit/v1/worker/test_npu_model_runner_v2.py"
   - "tests/unit/model_executor/test_async_cam_dbo.py"
-  - "tests/npu/test_mrv2_dbo.py"
+  - "tests/npu/**"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v4_flash/test_gpu.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"

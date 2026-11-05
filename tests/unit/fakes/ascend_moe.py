@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 
-def load_attention_gate_moe_ffn(monkeypatch, apply_mlp):
+def load_attention_gate_moe_ffn(monkeypatch, apply_mlp, *, compute_shared=None):
     torch = pytest.importorskip("torch")
     # Importing the production module would initialize optional vLLM/Ascend
     # dependencies on CPU test hosts, so compile only the function under test.
@@ -27,6 +27,7 @@ def load_attention_gate_moe_ffn(monkeypatch, apply_mlp):
     )
     namespace = {
         "torch": torch,
+        "_compute_w8a8_shared_experts_from_int8": compute_shared,
         "AFDF2ATransferPayload": SimpleNamespace,
         "_gmmswigluquant_fusion_enabled": lambda: False,
         "_dequantize_int8_activation": lambda states, scales, *, output_dtype: states,

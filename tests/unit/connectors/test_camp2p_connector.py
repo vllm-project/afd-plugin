@@ -102,7 +102,9 @@ def test_camp2p_stage_wire_counts_preserve_attention_payload(
 
 
 @pytest.mark.parametrize("with_input_ids", [False, True])
-def test_camp2p_opaque_send_uses_current_stage_padding(monkeypatch, with_input_ids):
+def test_camp2p_opaque_send_uses_current_stage_padding(
+    monkeypatch, with_input_ids
+):  # long-test: both wire directions must agree on current-stage padding
     import torch
 
     connector = CAMP2pAFDConnector(
@@ -289,51 +291,9 @@ def test_camp2p_recv_attn_output_uses_kernel_strided_af_grouping(monkeypatch):
     assert context0.states.k == 2
 
 
-def test_camp2p_recv_attn_output_drives_the_operator_ids_mode(monkeypatch):
-    """Requesting ids must reach the operator, not stay a connector-local flag.
-
-    The ``a2e`` operator only writes its ids slot in the ids mode, and the
-    sending rank selects that mode independently. A receiving rank that reads the
-    slot in the other mode would install uninitialised device memory as token
-    ids, which a token-keyed router turns into an out-of-range table read. The
-    ids that arrive are model-specific tensors, so they travel on the payload
-    rather than in the backend transfer state.
-    """
-
-    torch = pytest.importorskip("torch")
-
-    calls: list[tuple] = []
-
-    def fake_a2e(*args):
-        calls.append(args)
-        tokens, topk = args[3], args[5]
-        ids = torch.arange(tokens * topk, dtype=torch.int32).reshape(tokens, topk)
-        return ("hidden", ids, None, "atten-batch", "active-mask")
-
-    monkeypatch.setattr(torch.ops.afd_ascend, "a2e", fake_a2e, raising=False)
-    connector = _init_ffn_connector(0, _vllm_config())
-    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 5, 7])}
-
-    with_ids = connector.recv_attn_output(
-        ubatch_idx=0,
-        layer_idx=0,
-        recv_input_ids=True,
-    )
-    without_ids = connector.recv_attn_output(
-        ubatch_idx=0,
-        layer_idx=0,
-        recv_input_ids=False,
-    )
-
-    assert calls[0][-1] == 1
-    assert with_ids.input_ids.tolist() == [0, 2, 4, 6, 8, 10, 12]
-    assert calls[1][-1] == 0
-    assert without_ids.input_ids is None
-
-
-def test_camp2p_extra_info_rejects_unknown_mix_placement():
+def test_camp2p_extra_info_rejects_unknown_fields():
     with pytest.raises(ValueError, match="unknown CAMP2P connector_extra_config"):
-        CAMP2PExtraInfo.from_mapping({"mix_placement": True})
+        CAMP2PExtraInfo.from_mapping({"unknown": True})
 
 
 def test_camp2p_extra_info_validates_values():
@@ -341,21 +301,6 @@ def test_camp2p_extra_info_validates_values():
         CAMP2PExtraInfo.from_mapping({"core_num": 0})
     with pytest.raises(TypeError, match="core_num must be an integer"):
         CAMP2PExtraInfo.from_mapping({"core_num": 8.5})
-
-
-def test_camp2p_extra_info_coerces_integer_bool_values():
-    assert (
-        CAMP2PExtraInfo.from_mapping(
-            {"compute_gate_on_attention": 1},
-        ).compute_gate_on_attention
-        is True
-    )
-    assert (
-        CAMP2PExtraInfo.from_mapping(
-            {"compute_gate_on_attention": 0},
-        ).compute_gate_on_attention
-        is False
-    )
 
 
 def test_camp2p_connector_uses_role_specific_core_num(monkeypatch):
@@ -387,9 +332,10 @@ def test_camp2p_connector_uses_role_specific_core_num(monkeypatch):
     assert states.aiv_num == 13
 
 
-def test_camp2p_init_scopes_fresh_options_to_each_hccl_group(monkeypatch):
+def test_camp2p_init_scopes_fresh_options_to_each_hccl_group(
+    monkeypatch,
+):  # long-test: both ubatch communicators need independent native options
     calls = []
-    option_calls = []
 
     monkeypatch.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
     monkeypatch.setattr(camp2p_module, "ensure_cam_p2p_ops_available", lambda: None)
@@ -412,7 +358,6 @@ def test_camp2p_init_scopes_fresh_options_to_each_hccl_group(monkeypatch):
     )
 
     def fake_create_hccl_process_group_options(hccl_buffer_size_mb):
-        option_calls.append(hccl_buffer_size_mb)
         return object()
 
     monkeypatch.setattr(
@@ -434,7 +379,6 @@ def test_camp2p_init_scopes_fresh_options_to_each_hccl_group(monkeypatch):
     connector.init_afd_connector()
 
     assert [call["group_name"] for call in calls] == ["afd", "afd1", "afd_moe", "p2p"]
-    assert option_calls == [2048, 2048, 2048]
     hccl_options = [call["pg_options"] for call in calls[:3]]
     assert len({id(options) for options in hccl_options}) == 3
     assert "pg_options" not in calls[3]

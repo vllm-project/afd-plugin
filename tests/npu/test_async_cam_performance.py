@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 
 from tests.npu.async_cam_performance import FocusSchedule, selected_ops, summarize
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 class BenchmarkContractTests(unittest.TestCase):

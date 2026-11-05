@@ -13,6 +13,8 @@ from afd_plugin.connectors.base import AFDControlPlaneClosedError  # noqa: E402
 from afd_plugin.connectors.metadata import (  # noqa: E402
     AFDControlPayload,
     AFDDPMetadata,
+    AFDTransferMetadata,
+    decode_control_payload,
     encode_control_payload,
     recv_control_payload,
 )
@@ -171,3 +173,58 @@ def test_control_payload_only_translates_local_group_cancellation(
         assert caught.value.__cause__ is error
     else:
         assert caught.value is error
+
+
+def test_connector_metadata_validates_sequence_lengths():
+    with pytest.raises(ValueError, match="sequence lengths"):
+        AFDTransferMetadata(
+            layer_idx=0,
+            stage_idx=0,
+            seq_lens=[-1],
+        )
+
+
+def test_connector_metadata_allows_empty_receive():
+    metadata = AFDTransferMetadata.create_ffn_metadata(
+        layer_idx=0,
+        stage_idx=0,
+        seq_lens=[0],
+    )
+
+    assert metadata.total_tokens == 0
+    assert metadata.validate_tensor_shape((0, 16))
+
+
+def _tolist(value):
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        return tolist()
+    return list(value)
+
+
+def test_p2p_dp_metadata_serialization_uses_json_payload():
+    metadata = AFDDPMetadata(num_tokens_across_dp_cpu=[3, 5])
+
+    payload = encode_control_payload(
+        AFDControlPayload(
+            dp_metadata_list={7: metadata},
+            is_graph_capturing=True,
+            is_warmup=False,
+            is_graph_replaying=True,
+            is_profile=True,
+        ),
+    )
+    decoded_payload = decode_control_payload(payload)
+    decoded = decoded_payload.dp_metadata_list
+
+    assert payload.startswith(b"{")
+    assert isinstance(decoded[7], AFDDPMetadata)
+    assert _tolist(decoded[7].num_tokens_across_dp_cpu) == [3, 5]
+    assert int(decoded[7].max_tokens_across_dp_cpu) == 5
+    with decoded[7].sp_local_sizes(sequence_parallel_size=1):
+        assert decoded[7].get_chunk_sizes_across_dp_rank() == [3, 5]
+    assert _tolist(decoded[7].cu_tokens_across_sp(1)) == [3, 8]
+    assert decoded_payload.is_graph_capturing is True
+    assert decoded_payload.is_warmup is False
+    assert decoded_payload.is_graph_replaying is True
+    assert decoded_payload.is_profile is True

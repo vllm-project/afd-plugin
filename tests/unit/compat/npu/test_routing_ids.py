@@ -78,18 +78,6 @@ class _ThroughOp(torch.nn.Module):
         return ids.clone()
 
 
-class _PlainPython(torch.nn.Module):
-    def forward(self, ids):
-        if _PLAIN_FLAG["profile"]:
-            from afd_plugin.compat.npu.routing_ids import _force_balanced_topk_ids
-
-            _force_balanced_topk_ids(ids, num_logical_experts=NUM_EXPERTS)
-        return ids.clone()
-
-
-_PLAIN_FLAG = {"profile": False}
-
-
 def _compile_once(module):
     compiled = []
 
@@ -103,25 +91,19 @@ def _compile_once(module):
     return compiled[0]
 
 
-@pytest.mark.parametrize("case", ["through_op", "plain_python"])
 def test_reuse_without_guards_keeps_live_routing(
-    registered_routing_ids_op, monkeypatch, case
+    registered_routing_ids_op, monkeypatch
 ):
     balance_op, _op = registered_routing_ids_op
-    _PLAIN_FLAG["profile"] = True
     monkeypatch.setattr(balance_op, "_afd_in_profile_run", lambda: True)
-    module = _ThroughOp(_op) if case == "through_op" else _PlainPython()
+    module = _ThroughOp(_op)
     compiled_fn, example_inputs = _compile_once(module)
 
-    _PLAIN_FLAG["profile"] = False
     monkeypatch.setattr(balance_op, "_afd_in_profile_run", lambda: False)
     live = _ids(11)
     expected = live.clone()
     compiled_fn(live, *example_inputs[1:])
-    if case == "through_op":
-        assert torch.equal(live, expected)
-    else:
-        assert live.flatten().tolist() == _balanced()
+    assert torch.equal(live, expected)
 
 
 def _inductor_available() -> bool:

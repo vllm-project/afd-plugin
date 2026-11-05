@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ast
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +13,7 @@ from typing import cast
 
 import pytest
 
-from tests.unit.model_executor.models.attention_gate_test_utils import (
+from tests.unit.fakes.ascend_moe import (
     load_attention_gate_moe_ffn,
 )
 
@@ -152,12 +153,6 @@ def runtime(monkeypatch):
                     )
                 ]
                 classes.append(node)
-            elif family == "v2" and node.name in (
-                "AFDDeepseekForCausalLM",
-                "AFDDeepseekV3ForCausalLM",
-                "AFDGlmMoeDsaForCausalLM",
-            ):
-                classes.append(node)
         wrapper_namespace = {
             "native": SimpleNamespace(
                 current_platform=platform,
@@ -168,26 +163,17 @@ def runtime(monkeypatch):
         }
         _compile_nodes(path, classes, wrapper_namespace)
         wrappers[family] = cast(type[_NativeCausalLM], wrapper_namespace[class_name])
-        if family == "v2":
-            for alias in (
-                "AFDDeepseekForCausalLM",
-                "AFDDeepseekV3ForCausalLM",
-                "AFDGlmMoeDsaForCausalLM",
-            ):
-                wrappers[alias] = cast(type[_NativeCausalLM], wrapper_namespace[alias])
 
-    def make_model(family, *, dtype=torch.bfloat16, role="ffn", gate_on_a=True):
+    def make_model(family, *, dtype=torch.bfloat16):
         owner = _RoutedExperts(dtype)
         layer = _make_layer(owner, quant_type.W8A8)
         config = SimpleNamespace(
-            afd=SimpleNamespace(role=role, compute_gate_on_attention=gate_on_a),
+            afd=SimpleNamespace(role="ffn", compute_gate_on_attention=True),
             model=_FFNModel(layer, compute_ffn),
         )
         return wrappers[family](vllm_config=config), owner
 
-    return SimpleNamespace(
-        make_model=make_model, quant_type=quant_type, platform=platform
-    )
+    return SimpleNamespace(make_model=make_model)
 
 
 def _ffn_output(model):
@@ -259,75 +245,289 @@ def test_quant_refinalize_rebuilds_scale_from_new_canonical_values(runtime, fami
     )
 
 
-@pytest.mark.parametrize("family", ["v2", "v4"])
 @pytest.mark.parametrize(
-    ("role", "gate_on_a", "device"),
-    [("attention", True, "npu"), ("ffn", False, "npu"), ("ffn", True, "cuda")],
+    "quant_name,custom_activation,routed_scale_applied_in_topk,input_dtype",
+    [
+        ("NONE", False, False, torch.bfloat16),
+        ("NONE", True, False, torch.bfloat16),
+        ("W8A8", True, True, torch.bfloat16),
+        ("W8A8", False, False, torch.float16),
+        ("NONE", True, True, torch.float16),
+    ],
 )
-def test_disabled_role_or_backend_does_not_import_npu_helper(
-    monkeypatch, runtime, family, role, gate_on_a, device
-):
-    model, owner = runtime.make_model(family, role=role, gate_on_a=gate_on_a)
-    runtime.platform.device_type = device
-    # No preparation symbol exists: reaching the lazy NPU import would fail.
-    monkeypatch.setitem(sys.modules, _HELPER_MODULE, SimpleNamespace())
+def test_attention_gate_passes_activation_and_scaling_contract(
+    monkeypatch,
+    quant_name,
+    custom_activation,
+    routed_scale_applied_in_topk,
+    input_dtype,
+):  # long-test: external native activation ABI and routed/shared scaling agree
+    captured = []
 
-    model.process_weights_after_loading()
+    def apply_mlp(*, mlp_compute_input, quant_method):
+        # This is a deterministic CPU reference for the MoEMlpComputeInput
+        # contract, not an implementation or validation of an Ascend kernel.
+        del quant_method
+        captured.append(mlp_compute_input)
+        inputs = mlp_compute_input.hidden_states.to(torch.float32)
+        gate = inputs[:, :2]
+        up = inputs[:, 2:]
+        if mlp_compute_input.swiglu_limit > 0:
+            limit = mlp_compute_input.swiglu_limit
+            gate = gate.clamp(max=limit)
+            up = up.clamp(min=-limit, max=limit)
+        # This CPU reference mirrors the native SILU clamp path only; the other
+        # activation fields are checked as forwarded inputs, not interpreted here.
+        routed = torch.nn.functional.silu(gate) * up
+        return routed, None
 
-    with pytest.raises(AttributeError, match="w13_weight_scale_fp32"):
-        _ = owner.w13_weight_scale_fp32
+    compute_ffn, quant_type = load_attention_gate_moe_ffn(monkeypatch, apply_mlp)
+    requested_quant_type = getattr(quant_type, quant_name)
 
-
-@pytest.mark.parametrize("family", ["v2", "v4"])
-@pytest.mark.parametrize("kind", ["dense", "none", "w4a8", "expert_list"])
-def test_only_stacked_w8a8_owners_receive_a_scale(runtime, family, kind):
-    model, owner = runtime.make_model(family)
-    layer = model.model.layers[0]
-    if kind == "dense":
-        layer.is_moe_layer = False
-        del layer.mlp
-    elif kind == "expert_list":
-        owner.dynamic_eplb = True
-    else:
-        layer.mlp.experts.quant_type = (
-            runtime.quant_type.NONE if kind == "none" else runtime.quant_type.W4A8
-        )
-    del owner.w13_weight_scale
-
-    model.process_weights_after_loading()
-
-    with pytest.raises(AttributeError, match="w13_weight_scale_fp32"):
-        _ = owner.w13_weight_scale_fp32
-
-
-@pytest.mark.parametrize("family", ["v2", "v4"])
-def test_present_invalid_cache_is_not_silently_repaired(runtime, family):
-    model, owner = runtime.make_model(family)
-    owner.w13_weight_scale_fp32 = None
-
-    model.process_weights_after_loading()
-
-    assert owner.w13_weight_scale_fp32 is None
-
-
-@pytest.mark.parametrize("family", ["v2", "v4"])
-def test_missing_canonical_scale_keeps_the_native_attribute_error(runtime, family):
-    model, owner = runtime.make_model(family)
-    del owner.w13_weight_scale
-
-    with pytest.raises(AttributeError, match="w13_weight_scale"):
-        model.process_weights_after_loading()
-
-
-@pytest.mark.parametrize(
-    "family",
-    ["AFDDeepseekForCausalLM", "AFDDeepseekV3ForCausalLM", "AFDGlmMoeDsaForCausalLM"],
-)
-def test_v2_family_models_inherit_the_post_quant_lifetime(runtime, family):
-    model, owner = runtime.make_model(family)
-
-    model.process_weights_after_loading()
-
-    torch.testing.assert_close(
-        _ffn_output(model), _expected_output(owner.w13_weight_scale)
+    owner = torch.nn.Module()
+    owner.get_eplb_parameter = lambda name: getattr(owner, name)
+    owner.w13_weight = torch.ones((2, 4, 4))
+    owner.w2_weight = torch.ones((2, 4, 4))
+    owner.w13_weight_scale_fp32 = torch.ones((2, 4))
+    owner.w2_weight_scale = torch.ones((2, 4))
+    owner.quant_method = SimpleNamespace(
+        quant_method=SimpleNamespace(is_per_channel_weight=False)
     )
+    owner.dynamic_eplb = False
+    owner.activation = "silu"
+
+    activation_values: dict[str, float | None]
+    if custom_activation:
+        activation_values = {
+            "swiglu_limit": 2.0,
+            "swiglu_alpha": 1.5,
+            "swiglu_beta": 0.25,
+            "activation_situ_beta": 0.1,
+            "activation_situ_linear_beta": 0.2,
+        }
+    else:
+        activation_values = {
+            "swiglu_limit": None,
+            "swiglu_alpha": None,
+            "swiglu_beta": None,
+            "activation_situ_beta": None,
+            "activation_situ_linear_beta": None,
+        }
+    moe_config = SimpleNamespace(has_bias=False, **activation_values)
+    experts = SimpleNamespace(
+        quant_type=requested_quant_type,
+        routed_experts=owner,
+        shared_experts=SimpleNamespace(
+            _layer=lambda inputs: torch.full_like(inputs, 7.0)
+        ),
+        moe_config=moe_config,
+    )
+    scaling_factor = 2.5
+    layer = SimpleNamespace(
+        mlp=SimpleNamespace(experts=experts, routed_scaling_factor=scaling_factor)
+    )
+    hidden_states = torch.full((1, 4), 3.0, dtype=input_dtype)
+    shared_states = torch.ones((1, 4))
+    result = compute_ffn(
+        layer,
+        hidden_states=hidden_states,
+        group_list=torch.tensor([1, 1]),
+        dynamic_scales=None,
+        expand_x_shared=shared_states,
+        dynamic_scales_shared=None,
+        topk_scales=None,
+        group_list_type=0,
+        routed_scale_applied_in_topk=routed_scale_applied_in_topk,
+    )
+
+    activation = captured[0]
+    expected_parameters = (
+        (2.0, 1.5, 0.25, 0.1, 0.2) if custom_activation else (0.0, 1.0, 0.0, None, None)
+    )
+    assert (
+        activation.swiglu_limit,
+        activation.swiglu_alpha,
+        activation.swiglu_beta,
+        activation.activation_situ_beta,
+        activation.activation_situ_linear_beta,
+    ) == expected_parameters
+
+    limit = 2.0 if custom_activation else 0.0
+    expected_value = 3.0 if limit == 0 else limit
+    expected_value = expected_value / (1.0 + math.exp(-expected_value)) * expected_value
+    expected_routed = torch.full((1, 2), expected_value)
+    if not routed_scale_applied_in_topk and input_dtype != torch.float16:
+        expected_routed *= scaling_factor
+    torch.testing.assert_close(result.routed_output, expected_routed)
+    expected_shared_value = 7.0
+    if not routed_scale_applied_in_topk and input_dtype == torch.float16:
+        expected_shared_value /= scaling_factor
+    torch.testing.assert_close(
+        result.shared_output, torch.full((1, 4), expected_shared_value)
+    )
+
+
+@pytest.fixture
+def w4a8_owner(monkeypatch, dynamic_eplb, per_channel, with_bias):
+    owner = torch.nn.Module()
+    for name in ("w13_weight", "w2_weight"):
+        owner.register_parameter(
+            name,
+            torch.nn.Parameter(
+                torch.ones((2, 4, 4), dtype=torch.int32), requires_grad=False
+            ),
+        )
+    for name in ("w13_weight_scale", "w2_weight_scale"):
+        owner.register_parameter(
+            name, torch.nn.Parameter(torch.ones((2, 4)), requires_grad=False)
+        )
+    for name in ("w13_scale_bias", "w2_scale_bias"):
+        owner.register_parameter(
+            name,
+            torch.nn.Parameter(torch.ones((2, 4)), requires_grad=False)
+            if with_bias
+            else None,
+        )
+    owner.w13_weight_list = [owner.w13_weight]
+    owner.w2_weight_list = [owner.w2_weight]
+    owner.w13_weight_scale_list = [owner.w13_weight_scale]
+    owner.w2_weight_scale_list = [owner.w2_weight_scale]
+    owner.w13_scale_bias_list = [owner.w13_scale_bias] if with_bias else None
+    owner.w2_scale_bias_list = [owner.w2_scale_bias] if with_bias else None
+    owner.quant_method = SimpleNamespace(
+        quant_method=SimpleNamespace(is_per_channel_weight=per_channel)
+    )
+    owner.dynamic_eplb = dynamic_eplb
+    owner.activation = "silu"
+    return monkeypatch, owner
+
+
+@pytest.mark.parametrize(
+    "dynamic_eplb,per_channel,with_bias,rows",
+    [
+        (False, False, False, 2),
+        (False, True, True, 2),
+        (True, True, True, 2),
+        (True, False, False, 0),
+    ],
+)
+def test_w4a8_cam_mlp_contract(
+    w4a8_owner, dynamic_eplb, per_channel, with_bias, rows
+):  # long-test: native W4A8 payload includes weight views, quantization and activation
+    monkeypatch, owner = w4a8_owner
+    calls: list[SimpleNamespace] = []
+
+    def apply_mlp(*, mlp_compute_input, quant_method):
+        assert quant_method is owner.quant_method.quant_method
+        calls.append(mlp_compute_input)
+        return torch.ones((rows, 4), dtype=torch.bfloat16), None
+
+    compute_ffn, quant_type = load_attention_gate_moe_ffn(monkeypatch, apply_mlp)
+    # The native MoE config owns the activation contract.
+    owner.swiglu_limit = None
+    experts = SimpleNamespace(
+        quant_type=quant_type.W4A8,
+        routed_experts=owner,
+        shared_experts=None,
+        moe_config=SimpleNamespace(
+            swiglu_limit=10.0,
+            swiglu_alpha=1.7,
+            swiglu_beta=0.5,
+            activation_situ_beta=0.8,
+            activation_situ_linear_beta=0.3,
+        ),
+    )
+    layer = SimpleNamespace(
+        mlp=SimpleNamespace(experts=experts, routed_scaling_factor=1.0)
+    )
+    hidden_states = torch.ones((rows, 4), dtype=torch.int8)
+    scales = torch.ones(rows)
+    output = compute_ffn(
+        layer,
+        hidden_states=hidden_states,
+        group_list=torch.tensor([rows, rows]),
+        dynamic_scales=scales,
+        expand_x_shared=None,
+        dynamic_scales_shared=None,
+        topk_scales=None,
+        group_list_type=0,
+    )
+    assert output.routed_output.shape == (rows, 4)
+    assert output.routed_output.dtype == torch.bfloat16
+    if not rows:
+        return
+    contract = calls[0]
+    assert contract.hidden_states is hidden_states
+    assert contract.layer is owner
+    assert contract.dynamic_scale is scales
+    assert contract.quant.quant_type == quant_type.W4A8
+    assert contract.quant.is_per_channel_weight == per_channel
+    assert contract.swiglu_limit == 10.0
+    assert contract.swiglu_alpha == 1.7
+    assert contract.swiglu_beta == 0.5
+    assert contract.activation_situ_beta == 0.8
+    assert contract.activation_situ_linear_beta == 0.3
+    assert contract.weights.w1[0].data_ptr() == owner.w13_weight.data_ptr()
+    assert contract.weights.w2[0].data_ptr() == owner.w2_weight.data_ptr()
+    assert contract.weights.w1[0].dtype == torch.int32
+    assert contract.weights.w1_scale[0] is owner.w13_weight_scale
+    assert contract.weights.w2_scale[0] is owner.w2_weight_scale
+    assert (contract.weights.w1_scale_bias is not None) == with_bias
+    assert (contract.weights.w2_scale_bias is not None) == with_bias
+    assert contract.fusion is False
+
+
+@pytest.fixture
+def empty_rank_ffn(monkeypatch):
+    def routed_mlp(*, mlp_compute_input, quant_method):
+        states = mlp_compute_input.hidden_states
+        assert states.shape[0] > 0, "native MLP requires nonempty input"
+        return torch.ones_like(states, dtype=torch.bfloat16), None
+
+    def shared_mlp(owner, states, scales, *, swiglu_limit, output_dtype):
+        assert states.shape[0] > 0, "shared MLP requires nonempty input"
+        return torch.zeros_like(states, dtype=output_dtype)
+
+    compute, quant = load_attention_gate_moe_ffn(
+        monkeypatch, routed_mlp, compute_shared=shared_mlp
+    )
+    owner = _RoutedExperts(torch.bfloat16)
+    owner.w13_weight_scale_fp32 = owner.w13_weight_scale.float()
+    layer = _make_layer(owner, quant.W8A8)
+    layer.mlp.routed_scaling_factor = 2.0
+    layer.mlp.experts.shared_experts = SimpleNamespace(_layer=object())
+    return compute, layer
+
+
+@pytest.mark.parametrize(
+    "routed_tokens,shared_tokens", [(2, 2), (2, 0), (0, 2), (0, 0)]
+)
+def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
+    empty_rank_ffn, routed_tokens, shared_tokens
+):
+    compute, layer = empty_rank_ffn
+    states = torch.zeros((routed_tokens, 2), dtype=torch.int8)
+    shared_states = torch.zeros((shared_tokens, 2), dtype=torch.int8)
+    output = compute(
+        layer,
+        hidden_states=states,
+        group_list=torch.tensor([routed_tokens, 0]),
+        dynamic_scales=torch.ones(routed_tokens),
+        expand_x_shared=shared_states,
+        dynamic_scales_shared=torch.ones(shared_tokens),
+        topk_scales=None,
+        group_list_type=1,
+    )
+    assert output.routed_output.shape == states.shape
+    assert output.routed_output.dtype == torch.bfloat16
+    if routed_tokens:
+        torch.testing.assert_close(
+            output.routed_output,
+            torch.full((routed_tokens, 2), 2.0, dtype=torch.bfloat16),
+        )
+    if shared_tokens:
+        torch.testing.assert_close(
+            output.shared_output, torch.zeros((shared_tokens, 2), dtype=torch.bfloat16)
+        )
+    else:
+        assert output.shared_output is None

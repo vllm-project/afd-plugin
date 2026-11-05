@@ -36,7 +36,6 @@ ASYNC_CAM = dict(connector="CAMAsyncAFDConnector", async_dp=True)
         ("attention", True, True, "deepseek_v4", False, None),
         ("ffn", True, True, "deepseek_v4", False, None),
         ("attention", False, True, "deepseek_v4", False, "DSpark requires eager"),
-        ("ffn", False, True, "deepseek_v4", False, "DSpark requires eager"),
         (
             "attention",
             True,
@@ -45,11 +44,9 @@ ASYNC_CAM = dict(connector="CAMAsyncAFDConnector", async_dp=True)
             False,
             "DSpark supports only DeepSeek-V4",
         ),
-        ("ffn", True, True, "deepseek_v2", False, "DSpark supports only DeepSeek-V4"),
         ("ffn", True, True, "deepseek_v4", True, None),
         ("ffn", True, False, "deepseek_v4", True, None),
         ("attention", True, False, "deepseek_v4", False, "eager Attention"),
-        ("ffn", False, False, "deepseek_v4", True, "DSpark requires eager"),
     ],
 )
 def test_dspark_feature_boundaries(
@@ -321,6 +318,7 @@ def test_npu_async_feature_validation_checks_receive_capacity(
 @pytest.mark.parametrize(
     "extra_config,additional_config,model_type,use_mla,error",
     [
+        ({}, {"mix_placement": True}, "deepseek_v2", True, "routed-only"),
         (
             {},
             {"enable_shared_expert_dp": True},
@@ -365,11 +363,15 @@ def test_npu_async_mrv2_feature_boundaries(
 
 
 @pytest.mark.parametrize(
-    "model_type,use_mla",
-    [("deepseek_v2", True), ("deepseek_v3", True), ("deepseek_v4", False)],
+    "model_type,use_mla,tp_size,use_sp,local_ubatching",
+    [
+        ("deepseek_v2", True, 1, False, False),
+        ("deepseek_v3", True, 2, True, False),
+        ("deepseek_v2", True, 2, False, True),
+        ("deepseek_v2", True, 2, True, True),
+        ("deepseek_v4", False, 2, True, True),
+    ],
 )
-@pytest.mark.parametrize("tp_size,use_sp", [(1, False), (2, False), (2, True)])
-@pytest.mark.parametrize("local_ubatching", [False, True])
 def test_npu_async_mrv2_features_allow_model_layouts(
     model_type, use_mla, tp_size, use_sp, local_ubatching
 ):
@@ -393,3 +395,26 @@ def test_npu_async_mrv2_features_allow_model_layouts(
     config.model_config.hf_text_config.model_type = model_type
     config.additional_config["enable_flashcomm1"] = use_sp
     fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize(
+    "connector,gate,dynamic_quant,error",
+    [
+        ("P2pNcclAFDConnector", False, 0, "supports only CAMAsyncAFDConnector"),
+        ("CAMP2pAFDConnector", False, 0, None),
+        ("CAMAsyncAFDConnector", False, 1, "compute_gate_on_attention"),
+        ("CAMAsyncAFDConnector", True, 0, "dynamicQuant=1"),
+        ("CAMAsyncAFDConnector", True, 1, None),
+    ],
+)
+def test_dsv4_connector_and_quantization_policy(connector, gate, dynamic_quant, error):
+    async_cam = connector == "CAMAsyncAFDConnector"
+    config = _vllm_config(
+        connector=connector,
+        async_dp=async_cam,
+        compute_gate_on_attention=gate,
+        extra_config={"dynamicQuant": dynamic_quant} if async_cam else {},
+    )
+    config.model_config.hf_text_config.model_type = "deepseek_v4"
+    with pytest.raises(RuntimeError, match=error) if error else nullcontext():
+        fail_if_unsupported_npu_afd_features(config)

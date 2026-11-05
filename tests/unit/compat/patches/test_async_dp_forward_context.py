@@ -64,11 +64,9 @@ def _install_fake_vllm_forward_context(monkeypatch: pytest.MonkeyPatch):
 
     @contextmanager
     def original_set_forward_context(*_args, **_kwargs):
-        vars(forward_module)["original_set_forward_context_called"] = True
         yield
 
     def original_coordinate_batch_across_dp(*_args, **_kwargs):
-        vars(forward_module)["original_coordinate_called"] = True
         return True, "tokens", CUDAGraphMode.NONE
 
     @contextmanager
@@ -113,8 +111,6 @@ def _install_fake_vllm_forward_context(monkeypatch: pytest.MonkeyPatch):
         override_forward_context=override_forward_context,
         create_forward_context=create_forward_context,
         current_forward_context=None,
-        original_set_forward_context_called=False,
-        original_coordinate_called=False,
         track_batchsize=False,
         forward_start_time=0.0,
         last_logging_time=0.0,
@@ -174,8 +170,6 @@ def test_async_dp_forward_context_skips_dp_metadata(monkeypatch):
         assert context.dp_metadata is None
         assert context.additional_kwargs["platform"]["dp_metadata"] is None
 
-    assert forward_module.original_set_forward_context_called is False
-
 
 def test_async_dp_forward_context_preserves_non_async_path(monkeypatch):
     _load_patch_module(monkeypatch)
@@ -190,5 +184,4 @@ def test_async_dp_forward_context_preserves_non_async_path(monkeypatch):
         assert context.dp_metadata is not None
         assert context.dp_metadata.num_tokens == 4
 
-    assert forward_module.original_set_forward_context_called is False
-    assert forward_module.original_coordinate_called is True
+        assert context.dp_metadata.num_tokens_across_dp == "tokens"

@@ -81,7 +81,7 @@ compatibility evidence rather than a released package or container tag.
 
 | Area | Source | Focused validation |
 | --- | --- | --- |
-| Version policy | [`compat/vllm.py`](../../../afd_plugin/compat/vllm.py) | [`test_package.py`](../../../tests/unit/package/test_package.py) |
+| Version policy | [`compat/vllm.py`](../../../afd_plugin/compat/vllm.py) | [`test_vllm.py`](../../../tests/unit/compat/test_vllm.py) |
 | Core vLLM patches | [`compat/patches/`](../../../afd_plugin/compat/patches) | [`tests/unit/compat/patches/`](../../../tests/unit/compat/patches) |
 | CUDA benchmark routing | [`model_executor/routing_simulator.py`](../../../afd_plugin/model_executor/routing_simulator.py) | [`test_routing_simulator.py`](../../../tests/unit/model_executor/test_routing_simulator.py) |
 | NPU adapters | [`compat/npu/`](../../../afd_plugin/compat/npu) | [`test_runtime.py`](../../../tests/unit/compat/test_runtime.py), [`test_ascend_ops.py`](../../../tests/unit/compat/test_ascend_ops.py) |
