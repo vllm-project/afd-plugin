@@ -85,8 +85,8 @@ A_DSPARK_CONFIG="{\"method\":\"dspark\",\"model\":\"$MODEL\",\"num_speculative_t
 Native capture buckets are normalized separately for target verification and
 draft queries; choose buckets covering both query widths and `max-num-seqs`.
 For A TP4, set `A_TP=4`, `A_DP=1`, recompute `NUM_A`, and use four distinct
-A devices. Both roles use the same A TP width for CAM topology. F uses layered eager or layered FULL,
-with one combined target/draft weight table. Layered eager can be slower for
+A devices. Both roles use the same A TP width for CAM topology. F uses layered
+eager or layered FULL, with one combined target/draft weight table. Layered eager can be slower for
 small decode batches, so measure the chosen deployment.
 
 For F FULL, replace the F settings above before launching:

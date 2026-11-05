@@ -358,9 +358,10 @@ Attention for DBO and also supports Attention DP1. Its separate target
 DSV4 decode graph profile excludes DBO. Plain MLA graph DBO requires
 `FULL_DECODE_ONLY`.
 
-For full-graph capture, the V2 runner
-wraps native input preparation and publishes one warmup and one capture
-payload per descriptor. CUDA two-stage preparation installs separate AFD
+For full-graph capture, the V2 runner wraps native input preparation and
+stages descriptor-matched AFD metadata. Connectors with a control plane also
+publish one warmup and one capture payload per descriptor; Async CAM does not.
+CUDA two-stage preparation installs separate AFD
 metadata on both native stage contexts and sends their complete layout before
 eager execution or FULL replay. Single-stage FULL replay publishes its padded
 control shape through an execute-scoped manager hook; two-stage replay reuses

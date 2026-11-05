@@ -384,8 +384,8 @@ and Attention-local SP. DeepSeek-V2/V2-Lite are no longer supported by
 Async CAM; standard DeepSeek-V3.2 was already rejected by model admission.
 Finegrained TP, explicit shared-expert DP configuration, and native
 MTP and draft-model paths other than DeepSeek-V4 DSpark are excluded. DSpark
-keeps Attention/native proposal eager and permits independent layered FFN FULL;
-it does not support DBO or FFN two-stream.
+supports eager Attention/proposal or the native decode graph profile above,
+with independent layered FFN FULL. It does not support DBO or FFN two-stream.
 FFN remains connector-driven. The row's upgrade evidence retains its original
 scope; MRV2 deployment settings are documented in the
 [CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#modelrunnerv2-deployment).
