@@ -49,8 +49,8 @@ rank to enable MegaMoE and its dedicated pull protocol. With the switch off,
 CAM retains its original push Dispatch/Combine and FFN execution path.
 Pull is not a standalone transport option: there is no `dispatch_mode`
 setting or separate pull DispatchRecv/CombineSend operator. MegaMoE requires
-`dynamicQuant=1`, per-channel W4A8 and `ffn_two_stream=false`. Layered W8A8
-weights are rejected at startup rather than executed through this kernel.
+`dynamicQuant=1`, per-channel W4A8 or W8A8 weights, and
+`ffn_two_stream=false`. Per-group weights are not supported by MegaMoE.
 
 The A3 `AfdMegaMoePullNative` kernel directly includes the installed CANN MC2
 W4A8 `BlockMmad`. The build supports the CANN 9.1 MegaMoE header layout and
@@ -65,16 +65,18 @@ capacity follows ordinary CAM: `int(262144 * BATCH_SIZE_FACTOR)`, default 262144
 rows. Only transactions exceeding this capacity use multiple device rounds;
 capacity is independent of the MC2 matrix tile size. Callers must not launch
 once per receive round. The workspace allocation ABI and Attention Combine
-interface are unchanged. The path supports A3 per-channel W4A8 with SwiGLU.
-The model `swiglu_limit` is applied in both ACT paths as
+interface are unchanged. Both quantization plans use SwiGLU. W4A8 applies the
+model `swiglu_limit` in both ACT paths as
 `SiLU(min(gate, L)) * clamp(up, -L, L)`; zero, the default, disables clipping.
+W8A8 does not apply `swiglu_limit`, matching the Layered W8A8 path.
 
-For intermediate widths up to 3072, ACT directly uses the installed MC2 W4A8
-two-stage UB epilogue and expert-group synchronization. Wider supported rows
-retain the bounded column implementation. Return-address caching is bounded
-independently of receive capacity. Large capacity reserves HBM scratch without
-computing padded rows; for H4096/I2048 the default capacity needs about 10.5 GiB
-per FFN executor, excluding weights and communication windows.
+For W4A8 intermediate widths up to 3072, ACT directly uses the installed MC2
+W4A8 two-stage UB epilogue and expert-group synchronization. Wider supported
+W4A8 rows and W8A8 use bounded-column activation. Return-address caching is
+bounded independently of receive capacity. Large capacity reserves HBM scratch
+without computing padded rows; for H4096/I2048 the default capacity needs about
+12.5 GiB per FFN executor, excluding weights and communication windows. This
+includes a 2 GiB buffer for BF16 output staging.
 
 ## Default Behavior
 

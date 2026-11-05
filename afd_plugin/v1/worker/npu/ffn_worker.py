@@ -48,6 +48,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 FFN_SHUTDOWN_TIMEOUT_SECONDS = 5
+# Pull receivers must wait for all Attention ranks to stop publishing.
+ASYNC_FFN_DRAIN_TIMEOUT_SECONDS = 60
 
 
 def create_npu_ffn_model_runner(
@@ -254,7 +256,13 @@ class AFDNPUFFNWorker(NPUWorker):
                 event.set()
             thread = self._ffn_thread
             if thread is not None:
-                thread.join(timeout=FFN_SHUTDOWN_TIMEOUT_SECONDS)
+                timeout = (
+                    ASYNC_FFN_DRAIN_TIMEOUT_SECONDS
+                    if isinstance(self.model_runner, AsyncNPUFFNModelRunner)
+                    and self.model_runner.session.requires_drain
+                    else FFN_SHUTDOWN_TIMEOUT_SECONDS
+                )
+                thread.join(timeout=timeout)
                 if thread.is_alive():
                     raise RuntimeError(
                         "Async graph receive is pending; retain resources"

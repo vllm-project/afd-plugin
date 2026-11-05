@@ -621,19 +621,30 @@ def test_full_receiver_exit_releases_graph_only_after_success(
 
 @pytest.mark.parametrize("state", ["live", "failed", "drained"])
 @pytest.mark.parametrize("two_stream", [False, True])
-def test_worker_retains_resources_until_clean_exit(ffn_owners, state, two_stream):
+@pytest.mark.parametrize("requires_drain", [False, True])
+def test_worker_retains_resources_until_clean_exit(
+    ffn_owners, state, two_stream, requires_drain
+):
     _, runtime, module = ffn_owners
     calls = []
+    timeouts = []
     runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
     runner.effective_mode = "eager" if two_stream else "full"
     runner._two_stream = object() if two_stream else None
+    runner.session = SimpleNamespace(requires_drain=requires_drain)
     runner.connector = SimpleNamespace(close=lambda: calls.append("connector-close"))
     runner.shutdown = lambda: calls.append("release")
     worker = module.AFDNPUFFNWorker.__new__(module.AFDNPUFFNWorker)
     worker.model_runner = runner
     worker._ffn_shutdown_event = SimpleNamespace(set=lambda: calls.append("stop"))
+
+    def join(**kwargs):
+        calls.append("join")
+        timeouts.append(kwargs["timeout"])
+
     worker._ffn_thread = SimpleNamespace(
-        join=lambda **kw: calls.append("join"), is_alive=lambda: state == "live"
+        join=join,
+        is_alive=lambda: state == "live",
     )
     worker._ffn_loop_error = (
         RuntimeError("native failure") if state == "failed" else None
@@ -651,6 +662,7 @@ def test_worker_retains_resources_until_clean_exit(ffn_owners, state, two_stream
                     worker.raise_ffn_loop_error_if_any()
             with pytest.raises(RuntimeError):
                 worker.start_ffn_server_loop()
+    assert timeouts == [60 if requires_drain else 5]
 
 
 @pytest.mark.parametrize("async_connector", [False, True])
