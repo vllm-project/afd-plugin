@@ -8,6 +8,9 @@
 /docs/gpu/ @hsliuustc0106 @jiangkuaixue123 @ronenkat
 /.buildkite/cuda/ @hsliuustc0106 @jiangkuaixue123 @ronenkat
 
+# NPU operators
+/csrc/npu/ @hsliuustc0106 @jiangkuaixue123 @francisleely
+
 # E2E tests
 /tests/e2e/ @hsliuustc0106 @jiangkuaixue123 @ronenkat
 /.agents/skills/run-e2e/ @hsliuustc0106 @jiangkuaixue123 @ronenkat
