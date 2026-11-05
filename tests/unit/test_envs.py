@@ -4,19 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from afd_plugin.envs import (
-    async_cam_layered_gmm_enabled,
-    force_balanced_topk_ids_enabled,
-)
+from afd_plugin.envs import AFD_FORCE_BALANCED_TOPK_IDS, force_balanced_topk_ids_enabled
 
 
-@pytest.mark.parametrize(
-    "name,read",
-    [
-        ("AFD_FORCE_BALANCED_TOPK_IDS", force_balanced_topk_ids_enabled),
-        ("AFD_ASYNC_CAM_LAYERED_GMM", async_cam_layered_gmm_enabled),
-    ],
-)
 @pytest.mark.parametrize(
     "value,expected",
     [
@@ -30,9 +20,9 @@ from afd_plugin.envs import (
         ("", False),
     ],
 )
-def test_diagnostic_environment_flags(monkeypatch, name, read, value, expected):
+def test_force_balanced_topk_ids_environment(monkeypatch, value, expected):
     if value is None:
-        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(AFD_FORCE_BALANCED_TOPK_IDS, raising=False)
     else:
-        monkeypatch.setenv(name, value)
-    assert read() is expected
+        monkeypatch.setenv(AFD_FORCE_BALANCED_TOPK_IDS, value)
+    assert force_balanced_topk_ids_enabled() is expected

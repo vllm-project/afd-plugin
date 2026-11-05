@@ -31,28 +31,23 @@ ASYNC_CAM = dict(connector="CAMAsyncAFDConnector", async_dp=True)
 
 
 @pytest.mark.parametrize(
-    "role,draft_eager,target_eager,model_type,layered,error",
+    "role,draft_eager,target_eager,model_type,error",
     [
-        ("attention", True, True, "deepseek_v4", False, None),
-        ("ffn", True, True, "deepseek_v4", False, None),
-        ("attention", False, True, "deepseek_v4", False, "DSpark requires eager"),
+        ("attention", True, True, "deepseek_v4", None),
+        ("ffn", True, True, "deepseek_v4", None),
+        ("attention", False, True, "deepseek_v4", "DSpark requires eager"),
         (
             "attention",
             True,
             True,
             "deepseek_v2",
-            False,
-            "DSpark supports only DeepSeek-V4",
+            "requires DeepSeek V4",
         ),
-        ("ffn", True, True, "deepseek_v4", True, None),
-        ("ffn", True, False, "deepseek_v4", True, None),
-        ("attention", True, False, "deepseek_v4", False, "eager Attention"),
+        ("ffn", True, False, "deepseek_v4", None),
+        ("attention", True, False, "deepseek_v4", "eager Attention"),
     ],
 )
-def test_dspark_feature_boundaries(
-    monkeypatch, role, draft_eager, target_eager, model_type, layered, error
-):
-    monkeypatch.setenv("AFD_ASYNC_CAM_LAYERED_GMM", "1" if layered else "0")
+def test_dspark_feature_boundaries(role, draft_eager, target_eager, model_type, error):
     config = npu_dspark_config(role=role, draft_eager=draft_eager)
     config.model_config.enforce_eager = target_eager
     config.model_config.hf_text_config.model_type = model_type
@@ -66,8 +61,7 @@ def test_dspark_feature_boundaries(
 @pytest.mark.parametrize(
     "mode", ["FULL_DECODE_ONLY", "PIECEWISE", "FULL_AND_PIECEWISE"]
 )
-def test_dspark_ffn_graph_requires_full_mode(monkeypatch, mode):
-    monkeypatch.setenv("AFD_ASYNC_CAM_LAYERED_GMM", "1")
+def test_dspark_ffn_graph_requires_full_mode(mode):
     config = npu_dspark_config(role="ffn")
     config.model_config.enforce_eager = False
     config.compilation_config.cudagraph_mode.name = mode
@@ -76,8 +70,7 @@ def test_dspark_ffn_graph_requires_full_mode(monkeypatch, mode):
 
 
 @pytest.mark.parametrize("eager", [True, False])
-def test_dspark_rejects_ffn_two_stream(monkeypatch, eager):
-    monkeypatch.setenv("AFD_ASYNC_CAM_LAYERED_GMM", "1")
+def test_dspark_rejects_ffn_two_stream(eager):
     config = npu_dspark_config(role="ffn")
     config.model_config.enforce_eager = eager
     config.additional_config["afd"]["connector_extra_config"]["ffn_two_stream"] = True
@@ -95,9 +88,8 @@ def test_dspark_rejects_ffn_two_stream(monkeypatch, eager):
     ],
 )
 def test_dspark_draft_queries_fit_native_capacity(
-    monkeypatch, anchor, num_requests, capacity, allowed
+    anchor, num_requests, capacity, allowed
 ):
-    monkeypatch.setenv("AFD_ASYNC_CAM_LAYERED_GMM", "0")
     config = npu_dspark_config()
     config.speculative_config.draft_model_config.hf_config.sample_from_anchor = anchor
     config.scheduler_config.max_num_seqs = num_requests
@@ -112,7 +104,13 @@ def test_dspark_draft_queries_fit_native_capacity(
 
 
 def _config_with(*, model=None, max_num_batched_tokens=None, **kwargs):
+    is_async = kwargs.get("connector") == "CAMAsyncAFDConnector"
+    if is_async:
+        kwargs.setdefault("compute_gate_on_attention", True)
+        kwargs["extra_config"] = {"dynamicQuant": 1, **kwargs.get("extra_config", {})}
     config = _vllm_config(**kwargs)
+    if is_async:
+        config.model_config.hf_text_config.model_type = "deepseek_v4"
     for name, value in (model or {}).items():
         setattr(config.model_config, name, value)
     if max_num_batched_tokens is not None:
@@ -205,7 +203,11 @@ def _mla_dbo(cudagraph_mode, **model_fields):
                 error,
                 id=f"async-dynamic-quant-{value}",
             )
-            for value, error in ((0, None), ("1", None), (2, "dynamicQuant"))
+            for value, error in (
+                (0, "dynamicQuant=1"),
+                ("1", None),
+                (2, "dynamicQuant"),
+            )
         ),
         pytest.param(
             _config_with(
@@ -268,6 +270,22 @@ def test_npu_feature_validation(config, error):
         fail_if_unsupported_npu_afd_features(config)
 
 
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+@pytest.mark.parametrize("model_type", ["deepseek_v2", "deepseek_v3", "deepseek_v32"])
+def test_async_cam_rejects_models_without_layered_ffn(role, model_type):
+    config = _vllm_config(
+        role=role,
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+        use_mla=True,
+        extra_config={"dynamicQuant": 1},
+    )
+    config.model_config.hf_text_config.model_type = model_type
+    with pytest.raises(RuntimeError, match="requires DeepSeek V4"):
+        fail_if_unsupported_npu_afd_features(config)
+
+
 def test_npu_afd_num_ubatches_reads_two_ubatch_dbo():
     assert npu_afd_num_ubatches(_vllm_config(**TWO_UBATCH_DBO)) == 2
 
@@ -301,12 +319,14 @@ def test_npu_async_feature_validation_checks_receive_capacity(
         role=role,
         connector="CAMAsyncAFDConnector",
         async_dp=True,
+        compute_gate_on_attention=True,
         use_mla=True,
         use_v2_model_runner=True,
         num_attention_ranks=2,
         tensor_parallel_size=2 if role == "attention" else 1,
-        extra_config={"attn_ranks_per_dp": 2},
+        extra_config={"attn_ranks_per_dp": 2, "dynamicQuant": 1},
     )
+    config.model_config.hf_text_config.model_type = "deepseek_v4"
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
     if rejected:
         with pytest.raises(RuntimeError, match="BATCH_SIZE_FACTOR"):
@@ -318,20 +338,20 @@ def test_npu_async_feature_validation_checks_receive_capacity(
 @pytest.mark.parametrize(
     "extra_config,additional_config,model_type,use_mla,error",
     [
-        ({}, {"mix_placement": True}, "deepseek_v2", True, "routed-only"),
+        ({}, {"mix_placement": True}, "deepseek_v4", False, "routed-only"),
         (
             {},
             {"enable_shared_expert_dp": True},
-            "deepseek_v2",
-            True,
+            "deepseek_v4",
+            False,
             "shared-expert DP",
         ),
         *[
             (
                 {},
                 {"finegrained_tp_config": {key: 2}},
-                "deepseek_v2",
-                True,
+                "deepseek_v4",
+                False,
                 "finegrained TP",
             )
             for key in (
@@ -341,8 +361,8 @@ def test_npu_async_feature_validation_checks_receive_capacity(
                 "lmhead_tensor_parallel_size",
             )
         ],
-        ({}, {}, "qwen3_moe", True, "DeepSeek-V2/V3 MLA"),
-        ({}, {}, "deepseek_v2", False, "DeepSeek-V2/V3 MLA"),
+        ({}, {}, "qwen3_moe", True, "requires DeepSeek V4"),
+        ({}, {}, "deepseek_v2", False, "requires DeepSeek V4"),
     ],
 )
 def test_npu_async_mrv2_feature_boundaries(
@@ -354,7 +374,7 @@ def test_npu_async_mrv2_feature_boundaries(
         compute_gate_on_attention=True,
         use_v2_model_runner=True,
         use_mla=use_mla,
-        extra_config=extra_config,
+        extra_config={"dynamicQuant": 1, **extra_config},
     )
     config.additional_config.update(additional_config)
     config.model_config.hf_text_config.model_type = model_type
@@ -365,10 +385,9 @@ def test_npu_async_mrv2_feature_boundaries(
 @pytest.mark.parametrize(
     "model_type,use_mla,tp_size,use_sp,local_ubatching",
     [
-        ("deepseek_v2", True, 1, False, False),
-        ("deepseek_v3", True, 2, True, False),
-        ("deepseek_v2", True, 2, False, True),
-        ("deepseek_v2", True, 2, True, True),
+        ("deepseek_v4", False, 1, False, False),
+        ("deepseek_v4", False, 2, True, False),
+        ("deepseek_v4", False, 2, False, True),
         ("deepseek_v4", False, 2, True, True),
     ],
 )

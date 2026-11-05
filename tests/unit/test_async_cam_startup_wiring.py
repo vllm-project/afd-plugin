@@ -11,9 +11,10 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
-from afd_plugin.async_cam_startup import AsyncCAMGraphStartup
+from afd_plugin.async_cam_startup import AsyncCAMGraphStartup, resolve_ffn_mode
 from afd_plugin.compat.npu.feature_validation import (
     _fail_if_unsupported_npu_afd_async_features,
+    fail_if_unsupported_npu_afd_features,
 )
 from afd_plugin.config import parse_afd_config
 from tests.unit.fakes.async_ffn import (
@@ -27,6 +28,149 @@ from tests.unit.fakes.vllm_config import npu_vllm_config
 @pytest.fixture
 def modules(monkeypatch):
     return load_async_modules(monkeypatch)
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+@pytest.mark.parametrize("model_type", ["deepseek_v2", "deepseek_v3", "deepseek_v32"])
+def test_async_startup_rejects_models_without_layered_weights(role, model_type):
+    config = npu_vllm_config(
+        role=role,
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+        extra_config={"dynamicQuant": 1},
+    )
+    config.model_config.hf_text_config.model_type = model_type
+    with pytest.raises(RuntimeError, match="requires DeepSeek V4"):
+        fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+@pytest.mark.parametrize("dynamic_quant", [0, 1])
+def test_async_startup_requires_dynamic_quantization_for_v4(
+    modules, monkeypatch, role, dynamic_quant
+):
+    _, connector_module, _ = modules
+    config = npu_vllm_config(
+        role=role,
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+        extra_config={"dynamicQuant": dynamic_quant},
+    )
+    config.model_config.hf_text_config.model_type = "deepseek_v4"
+    factory = ModuleType("afd_plugin.connectors.factory")
+    factory.__dict__["AFDConnectorFactory"] = SimpleNamespace(
+        parse_connector_extra_info=lambda _, source: (
+            connector_module.AFDAsyncExtraInfo.from_mapping(
+                source.additional_config["afd"]["connector_extra_config"]
+            )
+        )
+    )
+    monkeypatch.setitem(sys.modules, factory.__name__, factory)
+    if dynamic_quant:
+        fail_if_unsupported_npu_afd_features(config)
+    else:
+        with pytest.raises(RuntimeError, match="dynamicQuant=1"):
+            fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize("model_type", ["deepseek_v2", "deepseek_v3"])
+def test_sync_camp2p_does_not_require_layered_async_weights(
+    modules, monkeypatch, model_type
+):
+    class CAMP2PExtraInfo:
+        def validate_supported(self):
+            pass
+
+    connector = ModuleType("afd_plugin.connectors.npu.camp2p")
+    connector.__dict__["CAMP2PExtraInfo"] = CAMP2PExtraInfo
+    factory = ModuleType("afd_plugin.connectors.factory")
+    factory.__dict__["AFDConnectorFactory"] = SimpleNamespace(
+        parse_connector_extra_info=lambda *_: CAMP2PExtraInfo()
+    )
+    monkeypatch.setitem(sys.modules, connector.__name__, connector)
+    monkeypatch.setitem(sys.modules, factory.__name__, factory)
+    config = npu_vllm_config(connector="CAMP2pAFDConnector", use_mla=True)
+    config.model_config.hf_text_config.model_type = model_type
+
+    fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.fixture
+def layered_startup_runner(modules, monkeypatch, mode, invalid):
+    _, _, runtime = modules
+
+    def executor(layers):
+        signature = repr(tuple(layer.layer_idx for layer in layers))
+        return SimpleNamespace(
+            layer_id_to_slot=None, graph_signature=lambda capacity: signature
+        )
+
+    monkeypatch.setattr(runtime, "AsyncCAMLayeredExecutor", executor)
+    target = (
+        []
+        if invalid == "target"
+        else [
+            SimpleNamespace(
+                layer_idx=2, quantization="W4A8", per_channel=True, swiglu_limit=0
+            )
+        ]
+    )
+    draft = [] if invalid == "draft" else [SimpleNamespace(layer_idx=5)]
+    if invalid == "layers":
+        draft = [SimpleNamespace(layer_idx=6)]
+    runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
+    runner.model = SimpleNamespace(
+        get_experts_layer_indices=lambda: (2,),
+        get_async_cam_layered_weights=lambda: (target, "unsupported target"),
+    )
+    runner.draft_model = SimpleNamespace(
+        get_experts_layer_indices=lambda: (5,),
+        get_async_cam_layered_weights=lambda: (draft, "unsupported draft"),
+    )
+    connector = SimpleNamespace(
+        is_initialized=False,
+        dynamic_quant=1,
+        extra_info=SimpleNamespace(ffn_two_stream=False),
+        graph_startup=AsyncCAMGraphStartup(1, 1, 2),
+    )
+    connector.init_afd_connector = lambda: resolve_ffn_mode(
+        [connector.graph_startup.plan]
+    )
+    runner.connector = connector
+    runner._failure = runner._layered_executor = runner._two_stream = None
+    runner.requested_mode = mode
+    monkeypatch.setattr(
+        runtime, "get_ascend_device_type", lambda: runtime.AscendDeviceType.A3
+    )
+    return runner, connector
+
+
+@pytest.mark.parametrize(
+    "mode,invalid,message",
+    [
+        (mode, invalid, message)
+        for mode in ("eager", "full")
+        for invalid, message in (
+            ("target", "target weights"),
+            ("draft", "draft weights"),
+            ("layers", "layer IDs"),
+        )
+    ]
+    + [("eager", None, None)],
+)
+def test_ffn_startup_validates_target_and_draft_weights(
+    layered_startup_runner, mode, invalid, message
+):
+    runner, connector = layered_startup_runner
+    if message:
+        with pytest.raises(ValueError, match=message):
+            runner.initialize_afd_connector()
+    else:
+        runner.initialize_afd_connector()
+        assert runner.effective_mode == "eager"
+        assert connector.graph_startup.plan.signature == "(2, 5)"
 
 
 @pytest.mark.parametrize("value", [True, 0, -1, 1.5])
@@ -89,7 +233,6 @@ def test_two_stream_flashcomm1_matches_ascend_boolean_parsing(
         monkeypatch.delenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", raising=False)
     else:
         monkeypatch.setenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", value)
-    monkeypatch.setenv("AFD_ASYNC_CAM_LAYERED_GMM", "1")
     config = npu_vllm_config(
         role=role,
         connector="CAMAsyncAFDConnector",

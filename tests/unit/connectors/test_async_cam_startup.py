@@ -88,6 +88,24 @@ def negotiate(owners, plans, signatures):
         return [future.exception(timeout=3) for future in futures]
 
 
+def test_mixed_requested_modes_are_not_silently_downgraded():
+    with pytest.raises(ValueError, match="same execution mode"):
+        resolve_ffn_mode([full_plan(), FFNGraphPlan()])
+
+
+@pytest.mark.parametrize("mode", ["eager", "full"])
+def test_executor_error_reaches_all_attention_and_ffn_ranks(mode):
+    owners = startup_world()
+    plan = full_plan(requested=mode)
+    failed = replace(plan, executor_error="unsupported FFN weights")
+    errors = negotiate(owners, [None, None, plan, failed], ["same-wire"] * 4)
+    assert all(
+        isinstance(error, (ValueError, RuntimeError))
+        and "unsupported FFN weights" in str(error)
+        for error in errors
+    ), errors
+
+
 @pytest.mark.parametrize("mode", ["eager", "full"])
 def test_two_stream_signature_and_failure_are_checked_in_both_modes(mode):
     plan = full_plan(requested=mode, stream_signature="2/12C/24V/24V")
@@ -239,12 +257,12 @@ def test_initialize_owns_nonce_and_plan_negotiation():
     )
 
 
+@pytest.mark.parametrize("mode", ["eager", "full"])
 @pytest.mark.parametrize(
     "plans,message",
     [
-        ([full_plan(), FFNGraphPlan()], "same execution mode"),
         (
-            [full_plan(), full_plan(graph_error="unsupported executor")],
+            [full_plan(), full_plan(executor_error="unsupported executor")],
             "unsupported executor",
         ),
         ([full_plan(), full_plan(signature="other")], "signatures differ"),
@@ -252,6 +270,6 @@ def test_initialize_owns_nonce_and_plan_negotiation():
         ([full_plan(signature="")], "loaded executor"),
     ],
 )
-def test_startup_rejects_incompatible_execution_plans(plans, message):
+def test_startup_rejects_incompatible_execution_plans(mode, plans, message):
     with pytest.raises(ValueError, match=message):
-        resolve_ffn_mode(plans)
+        resolve_ffn_mode([replace(plan, requested=mode) for plan in plans])

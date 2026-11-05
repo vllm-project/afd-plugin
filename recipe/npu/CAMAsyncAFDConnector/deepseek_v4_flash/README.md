@@ -38,11 +38,10 @@ NUM_A=1
 NUM_F=4
 A_DEVICES=0
 F_DEVICES=4,5,6,7
-F_LAYERED_GMM=0
 FFN_EXEC_ARGS=(--enforce-eager)
 
 export VLLM_USE_V2_MODEL_RUNNER=1 VLLM_ASCEND_ENABLE_FLASHCOMM1=0
-export AFD_ASYNC_CAM_LAYERED_GMM=0 BATCH_SIZE_FACTOR=0.00390625
+export BATCH_SIZE_FACTOR=0.00390625
 export HCCL_SOCKET_IFNAME="$INTERFACE" GLOO_SOCKET_IFNAME="$INTERFACE"
 export TP_SOCKET_IFNAME="$INTERFACE" HCCL_IF_IP="$LOCAL_IP"
 export HCCL_BUFFSIZE=256 LCCL_BUFFER_SIZE=408 OMP_NUM_THREADS=4
@@ -67,17 +66,13 @@ DSPARK_CONFIG="{\"method\":\"dspark\",\"model\":\"$MODEL\",\"num_speculative_tok
 For DP2 set `NUM_A=2` and `A_DEVICES=0,1`. The W4A8 example uses F EP4.
 For a W8A8 checkpoint, size F for its larger weights; the validated W8A8
 configuration uses `NUM_F=8` and `F_DEVICES=8,9,10,11,12,13,14,15`.
-Target and draft Attention use eager execution. F supports legacy eager,
-layered eager and layered FULL, with one combined target/draft weight table.
-The example selects legacy F. Set `F_LAYERED_GMM=1` for layered eager; keep
-`AFD_ASYNC_CAM_LAYERED_GMM=0` for A and P.
-The existing layered eager path can be slower for small decode batches; use
-ordinary GMM eager when choosing this deployment for eager throughput.
+Target and draft Attention use eager execution. F uses layered eager or layered
+FULL, with one combined target/draft weight table. Layered eager can be slower
+for small decode batches, so measure the chosen deployment.
 
 For F FULL, replace the F settings above before launching:
 
 ```bash
-F_LAYERED_GMM=1
 FFN_EXEC_ARGS=(--compilation-config '{"cudagraph_mode":"FULL"}')
 ```
 
@@ -91,15 +86,14 @@ Layered W4A8 forwards the model's `swiglu_limit` for both target and draft
 experts in eager and FULL. A positive limit clamps gate above and up on both
 sides before SwiGLU; zero disables clipping. Rebuild the AFD native extension
 and CANN package together when upgrading this interface. Layered W8A8 retains
-its unclipped computation; use legacy F when W8A8 checkpoint clamp behavior
-is required.
+its unclipped computation; deployments requiring the W8A8 checkpoint clamp
+behavior cannot use the current layered Async CAM FFN implementation.
 
 Launch F and A with their usual Async CAM arguments, adding the same
 `--speculative-config "$DSPARK_CONFIG"` to both:
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES="$F_DEVICES" VLLM_PLUGINS=ascend,afd \
-AFD_ASYNC_CAM_LAYERED_GMM="$F_LAYERED_GMM" \
 vllm serve "$MODEL" "${COMMON_ARGS[@]}" "${FFN_EXEC_ARGS[@]}" \
   --port 7101 --data-parallel-rpc-port 17101 \
   --tensor-parallel-size 1 --data-parallel-size "$NUM_F" \
@@ -185,10 +179,10 @@ validated records to `graph-proof.json` in its output directory and records
 `graph_numerics_verified` in `result.json`. Run ordinary bounded-group
 liveness checks and every performance comparison without either extension.
 
-For a layered/reference FFN performance comparison, keep DSpark enabled on P,
-A and F in both runs, toggle only F's `AFD_ASYNC_CAM_LAYERED_GMM`, and disable
-the evidence extension. For a FULL/layered-eager comparison, keep layered GMM
-enabled in both runs and change only F's execution arguments.
+For a legacy/layered FFN performance comparison, use the legacy path from an
+earlier revision as the reference and keep DSpark, checkpoint, topology and
+workload identical. Disable the evidence extension. For a FULL/layered-eager
+comparison, change only F's execution arguments.
 
 Remove `--speculative-config` on A/F for a speculation-disabled control, and
 use the corresponding upstream P configuration when testing PD. Record the

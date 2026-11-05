@@ -208,11 +208,10 @@ rank. Its receive path preserves the full compact metadata for combine-send
 and computes chunk length from expert counts. Shared activations and outputs
 do not cross the A/F boundary.
 
-DeepSeek-V2 and DeepSeek-V4 Attention roles construct the pinned native shared
-MLP or its AFD adapter. They load shared weights, scales and biases on
+DeepSeek-V4 Attention roles construct the pinned native shared MLP or its AFD
+adapter. They load shared weights, scales and biases on
 Attention, then add the shared result after restoring the routed output
-layout. DeepSeek-V2/V3 with model SP uses replicated shared weights;
-DeepSeek-V4 preserves its native TP-sharded or shared-DP layout through
+layout. DeepSeek-V4 preserves its native TP-sharded or shared-DP layout through
 `AFDDeepseekV4SharedExperts`. FFN ranks construct routed experts only.
 Native DBO children retain separate shared results. Peer receive hooks reclaim
 the single physical CAM window before another child dispatches; owner-side

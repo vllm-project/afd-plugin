@@ -1,1 +1,14 @@
 * @hsliuustc0106 @jiangkuaixue123
+
+# GPU backend
+/afd_plugin/connectors/gpu/ @hsliuustc0106 @jiangkuaixue123 @ronenkat
+/csrc/gpu/ @hsliuustc0106 @jiangkuaixue123 @ronenkat
+/recipe/gpu/ @hsliuustc0106 @jiangkuaixue123 @ronenkat
+/tests/gpu/ @hsliuustc0106 @jiangkuaixue123 @ronenkat
+/docs/gpu/ @hsliuustc0106 @jiangkuaixue123 @ronenkat
+/.buildkite/cuda/ @hsliuustc0106 @jiangkuaixue123 @ronenkat
+
+# E2E tests
+/tests/e2e/ @hsliuustc0106 @jiangkuaixue123 @ronenkat
+/.agents/skills/run-e2e/ @hsliuustc0106 @jiangkuaixue123 @ronenkat
+/.agents/skills/deploy-afd-k8s/ @hsliuustc0106 @jiangkuaixue123 @ronenkat

@@ -21,7 +21,7 @@ POLL_SECONDS = 0.02
 @dataclass(frozen=True)
 class FFNGraphPlan:
     requested: Literal["eager", "full"] = "eager"
-    graph_error: str = ""
+    executor_error: str = ""
     signature: str = ""
     layer_ids: tuple[int, ...] = ()
     stream_signature: str = ""
@@ -36,18 +36,23 @@ def resolve_ffn_mode(plans: list[FFNGraphPlan]) -> str:
     errors = [plan.stream_error for plan in plans if plan.stream_error]
     if errors:
         raise ValueError("Async FFN two-stream is unsupported: " + "; ".join(errors))
+    errors = [plan.executor_error for plan in plans if plan.executor_error]
+    if errors:
+        raise ValueError(
+            "Async FFN layered executor is unsupported: "
+            + "; ".join(dict.fromkeys(errors))
+        )
     mode = plans[0].requested
-    if mode == "eager" and not plans[0].stream_signature:
-        return "eager"
     if mode not in ("eager", "full"):
         raise ValueError("Unknown Async FFN execution mode")
-    execution = "FULL" if mode == "full" else "two-stream"
-    errors = [plan.graph_error for plan in plans if plan.graph_error]
-    if len({plan.signature for plan in plans if not plan.graph_error}) > 1:
-        errors.append("FFN graph signatures differ across ranks")
-    if errors:
-        reason = "; ".join(dict.fromkeys(errors))
-        raise ValueError(f"Async FFN {execution} is unsupported: {reason}")
+    execution = "FULL" if mode == "full" else "eager"
+    if mode == "eager" and plans[0].stream_signature:
+        execution = "two-stream"
+    if len({plan.signature for plan in plans}) > 1:
+        raise ValueError(
+            f"Async FFN {execution} is unsupported: "
+            "FFN executor signatures differ across ranks"
+        )
     if not plans[0].signature or not plans[0].layer_ids:
         raise ValueError(f"Async FFN {execution} requires a loaded executor signature")
     if len({plan.layer_ids for plan in plans}) != 1:

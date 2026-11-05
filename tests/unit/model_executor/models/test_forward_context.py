@@ -4,12 +4,8 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 
 import pytest
-
-if TYPE_CHECKING:
-    pass
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")

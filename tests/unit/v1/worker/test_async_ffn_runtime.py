@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Async CAM eager wire outputs for layered and per-token execution."""
+"""Async CAM eager wire outputs for layered execution."""
 
 from __future__ import annotations
 
 from collections import deque
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -71,7 +70,6 @@ def harness(monkeypatch):
         0,
     )
     connector._initialized = True
-    monkeypatch.setenv("AFD_ASYNC_CAM_LAYERED_GMM", "0")
     monkeypatch.setattr(runtime, "create_afd_npu_profiler", lambda role: None)
     runner = runtime.AsyncNPUFFNModelRunner(cfg, torch.device("cpu"), connector)
     runner.layer_ids = (2, 5)
@@ -82,22 +80,12 @@ def harness(monkeypatch):
         calls.append("receive")
         return payloads.popleft()
 
-    def compute(**kwargs):
-        calls.append(("compute", kwargs["layer_idx"], kwargs["hidden_states"].shape[0]))
-        return kwargs["hidden_states"].to(torch.bfloat16)
-
     def send(output, context, **kwargs):
         calls.append(("send", output, context.states.token_nums_rankid_layeridx))
 
-    @contextmanager
-    def forward(**kwargs):
-        yield SimpleNamespace(dp_metadata=None, additional_kwargs={})
-
     monkeypatch.setattr(connector, "recv_attn_output", receive)
     monkeypatch.setattr(connector, "send_ffn_output", send)
-    monkeypatch.setattr(runtime, "ascend_forward_context", forward)
-    monkeypatch.setattr(runtime, "_set_moe_layer_index", lambda *args: None)
-    runner.model = SimpleNamespace(compute_ffn_output=compute)
+    runner.model = SimpleNamespace()
     return SimpleNamespace(
         runner=runner, connector=connector, calls=calls, payloads=payloads
     )
@@ -115,34 +103,29 @@ def payload(layer, rows):
     )
 
 
-@pytest.mark.parametrize("layered", [False, True])
-def test_eager_preserves_layer_loop_device_metadata_and_return_headers(
-    harness, layered
-):
+def test_eager_preserves_layer_loop_device_metadata_and_return_headers(harness):
     h = harness
     first, zero = payload(5, 3), payload(2, 0)
     h.payloads.extend((first, zero))
-    expected = [first.hidden_states[:3], torch.zeros(1, 32)]
-    if layered:
-        first.context.states.group_list = torch.tensor([1, 2])
-        first.context.states.dynamic_scales = torch.arange(1, 9, dtype=torch.float32)
+    first.context.states.group_list = torch.tensor([1, 2])
+    first.context.states.dynamic_scales = torch.arange(1, 9, dtype=torch.float32)
 
-        def execute(hidden, scales, groups, header):
-            # Toy experts have gains 1/2 and layer gain equal to the layer ID.
-            # Only the sent result is asserted; this does not simulate CANN.
-            gains = torch.repeat_interleave(torch.tensor([1.0, 2.0]), groups)
-            rows = gains.numel()
-            output = torch.zeros_like(hidden, dtype=torch.bfloat16)
-            output[:rows] = (
-                hidden[:rows].float() * scales[:rows, None] * gains[:, None] * header[2]
-            ).to(torch.bfloat16)
-            return output
+    def execute(hidden, scales, groups, header):
+        # Toy experts have gains 1/2 and layer gain equal to the layer ID.
+        # Only the sent result is asserted; this does not simulate CANN.
+        gains = torch.repeat_interleave(torch.tensor([1.0, 2.0]), groups)
+        rows = gains.numel()
+        output = torch.zeros_like(hidden, dtype=torch.bfloat16)
+        output[:rows] = (
+            hidden[:rows].float() * scales[:rows, None] * gains[:, None] * header[2]
+        ).to(torch.bfloat16)
+        return output
 
-        h.runner._layered_executor = execute
-        expected = [torch.zeros(8, 32), torch.zeros(8, 32)]
-        expected[0][:3] = (
-            first.hidden_states[:3].float() * torch.tensor([5.0, 20.0, 30.0])[:, None]
-        )
+    h.runner._layered_executor = execute
+    expected = [torch.zeros(8, 32), torch.zeros(8, 32)]
+    expected[0][:3] = (
+        first.hidden_states[:3].float() * torch.tensor([5.0, 20.0, 30.0])[:, None]
+    )
     assert h.runner.execute_connector_driven_step()
     returned = [
         call for call in h.calls if isinstance(call, tuple) and call[0] == "send"
