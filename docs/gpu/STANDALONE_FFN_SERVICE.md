@@ -145,7 +145,10 @@ release only when Attention also shuts down (within the DeepEP GPU timeout,
 
 A step that is in flight when the stop arrives completes first; it needs
 Attention to finish the same step. If Attention dies or stops without F,
-F's pending receive or release fails, F reports `failed` with
-`resources_released=false` and exits non-zero. A restarted Attention needs a
+F's pending control receive cannot complete: once
+`afd_process_group_timeout_s` passes, PyTorch's NCCL watchdog aborts the F
+ranks (SIGABRT, so no status file is written) and `torchrun` exits non-zero.
+A failure F detects itself (for example a DeepEP timeout in a step) reports
+`failed` with `resources_released=false` and exits non-zero. A restarted Attention needs a
 new M2N world, so restart F with it. Hot restart, reconnect and graceful
 in-flight drain are not supported.
