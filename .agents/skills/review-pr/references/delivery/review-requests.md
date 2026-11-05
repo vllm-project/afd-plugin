@@ -7,24 +7,28 @@ authorization for this PR or session.
 
 ## Owners
 
-`CODEOWNERS` is a single global rule: `* @hsliuustc0106 @jiangkuaixue123`.
-The design pages under `docs/design/module/` declare the same owners. There
-are no path-specific owners, so route by contract expertise instead:
+`.github/CODEOWNERS` has a global catch-all
+(`* @hsliuustc0106 @jiangkuaixue123`) plus path-specific entries:
 
-| Changed contract | Ask for |
+| Path | Adds |
 | --- | --- |
-| Patches, version pins, platform selection | Owner with upstream vLLM/vLLM-Ascend upgrade context |
-| Connectors, topology, async CAM | Owner with the connector/NPU runtime context |
-| Model families, E2E gates | Owner with the model-suite context |
-| CI / Buildkite pipelines | Owner with CI pool context |
+| `/afd_plugin/connectors/gpu/`, `/csrc/gpu/`, `/recipe/gpu/`, `/tests/gpu/`, `/docs/gpu/`, `/.buildkite/cuda/` | `@ronenkat` |
+| `/csrc/npu/` | `@francisleely` |
+| `/tests/e2e/`, `/.agents/skills/run-e2e/`, `/.agents/skills/deploy-afd-k8s/` | `@ronenkat` |
+
+Design pages declare their own `owners` under `docs/design/module/`; most list
+`@hsliuustc0106` and `@jiangkuaixue123`, while `e2e_testing.md` is owned by
+`@yujuancao07` alone. Prefer the design page's owners for the *contract*, and
+CODEOWNERS for the *paths*; when they disagree, say which one you are
+following.
 
 ## Procedure
 
 1. From the frozen head, map the diff census to the primary module contract
    and feature overlays.
 2. Propose one to three focused reviewers with an explicit rationale naming
-   the contract ("patch contract + async CAM ubatching"), never a bare
-   "PTAL".
+   the contract ("patch contract + async CAM layered FFN", "E2E gate
+   selection"), never a bare "PTAL".
 3. Check existing reviews and requests first; do not duplicate an owner
    already engaged on the PR threads.
 4. When authorized to post, recheck the head SHA, then post at most one
