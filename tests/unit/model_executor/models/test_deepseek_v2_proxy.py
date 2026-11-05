@@ -684,3 +684,23 @@ def test_m2n_moe_tp2_rank_dispatches_its_slice_and_gathers_shared_sum(
     assert torch.equal(
         output, torch.cat([local_output, local_output + PEER_OFFSET])[:3]
     )
+
+
+def test_proxy_returns_hidden_states_unchanged_when_link_released(monkeypatch):
+    """Inside the elastic resize window (connector released, scheduler paused)
+    the proxy completes locally instead of touching a dead connector.
+
+    Why: dummy-wave forwards still run between release and connect; their
+    outputs are discarded, so identity is the safest local completion. Real
+    serving never reaches this (drain completes before release).
+    """
+    events: list[tuple] = []
+    afd_metadata = install_proxy_context(adapter, monkeypatch, events)
+    afd_metadata.connector.is_initialized = False
+    proxy = adapter.RemoteFFNProxy(layer_idx=0)
+    hidden = torch.ones(2, 4)
+
+    output = proxy(hidden)
+
+    assert torch.equal(output, hidden)
+    assert events == []

@@ -16,6 +16,7 @@ from afd_plugin.config import (
     AFDConfig,
     parse_afd_config,
 )
+from afd_plugin.elastic.config import is_elastic_attention
 from afd_plugin.v1.worker.cuda_graph import (
     cudagraph_mode_name,
     validate_cuda_graph_mode,
@@ -159,7 +160,7 @@ def validate_gpu_model_runner_v2_config(
         )
     if (
         not parallel.enable_expert_parallel
-        or parallel.enable_elastic_ep
+        or (parallel.enable_elastic_ep and not is_elastic_attention(vllm_config))
         or parallel.enable_eplb
         or parallel.use_sequence_parallel_moe
     ):
@@ -239,7 +240,16 @@ def validate_npu_model_runner_v2_config(
         )
     if (
         not parallel.enable_expert_parallel
-        or parallel.enable_elastic_ep
+        or (
+            parallel.enable_elastic_ep
+            and not (
+                # Elastic AFD is scoped to the sync CAMP2p data plane; the
+                # async CAM connector (AFD_ASYNC_CONNECTOR) has no elastic
+                # resize path, so its configs keep the static-only rule.
+                is_elastic_attention(vllm_config)
+                and afd_config.connector != AFD_ASYNC_CONNECTOR
+            )
+        )
         or parallel.enable_eplb
     ):
         raise RuntimeError("AFD ModelRunnerV2 requires static expert parallelism")

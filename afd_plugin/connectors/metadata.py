@@ -148,8 +148,13 @@ class AFDControlPayload:
     is_warmup: bool
     is_graph_replaying: bool = False
     is_profile: bool = False
+    # STOP uses the existing ordered metadata channel and contains no batches.
+    # Default False preserves the wire format's compatibility with static peers.
+    stop: bool = False
 
     def __post_init__(self) -> None:
+        if self.stop and self.dp_metadata_list:
+            raise ValueError("STOP control payload must not contain batch metadata")
         self.dp_metadata_list = {
             # stage_idx: _ensure_afd_dp_metadata(dp_metadata)
             stage_idx: AFDDPMetadata(
@@ -402,6 +407,7 @@ def encode_control_payload(payload: AFDControlPayload) -> bytes:
         "is_warmup": bool(payload.is_warmup),
         "is_graph_replaying": bool(payload.is_graph_replaying),
         "is_profile": bool(payload.is_profile),
+        "stop": bool(payload.stop),
     }
     return json.dumps(wire_payload, separators=(",", ":"), sort_keys=True).encode(
         "utf-8",
@@ -432,6 +438,7 @@ def decode_control_payload(payload_bytes: bytes) -> AFDControlPayload:
         is_warmup=bool(payload.get("is_warmup", False)),
         is_graph_replaying=bool(payload.get("is_graph_replaying", False)),
         is_profile=bool(payload.get("is_profile", False)),
+        stop=bool(payload.get("stop", False)),
     )
 
 
