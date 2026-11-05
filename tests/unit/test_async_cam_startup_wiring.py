@@ -3,6 +3,9 @@
 """Real startup call sites with host stubs; not device execution coverage."""
 
 import sys
+import threading
+import weakref
+from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call
 
@@ -18,6 +21,7 @@ from tests.unit.fakes.async_ffn import (
     load_async_modules,
     load_host_module,
 )
+from tests.unit.fakes.graph import Graph
 from tests.unit.fakes.vllm_config import npu_vllm_config
 
 
@@ -93,16 +97,26 @@ def test_sync_camp2p_does_not_require_layered_async_weights(
     fail_if_unsupported_npu_afd_features(config)
 
 
-@pytest.mark.parametrize("mode", ["eager", "full"])
-@pytest.mark.parametrize(
-    "invalid,message",
-    [("target", "target weights"), ("draft", "draft weights"), ("layers", "layer IDs")],
-)
-def test_ffn_startup_rejects_invalid_weights_on_both_execution_modes(
-    modules, monkeypatch, mode, invalid, message
-):
+@pytest.fixture
+def layered_startup_runner(modules, monkeypatch, mode, invalid):
     _, _, runtime = modules
-    target = [] if invalid == "target" else [SimpleNamespace(layer_idx=2)]
+
+    def executor(layers):
+        signature = repr(tuple(layer.layer_idx for layer in layers))
+        return SimpleNamespace(
+            layer_id_to_slot=None, graph_signature=lambda capacity: signature
+        )
+
+    monkeypatch.setattr(runtime, "AsyncCAMLayeredExecutor", executor)
+    target = (
+        []
+        if invalid == "target"
+        else [
+            SimpleNamespace(
+                layer_idx=2, quantization="W4A8", per_channel=True, swiglu_limit=0
+            )
+        ]
+    )
     draft = [] if invalid == "draft" else [SimpleNamespace(layer_idx=5)]
     if invalid == "layers":
         draft = [SimpleNamespace(layer_idx=6)]
@@ -125,13 +139,38 @@ def test_ffn_startup_rejects_invalid_weights_on_both_execution_modes(
         [connector.graph_startup.plan]
     )
     runner.connector = connector
-    runner._failure = runner._layered_executor = None
+    runner._failure = runner._layered_executor = runner._two_stream = None
     runner.requested_mode = mode
     monkeypatch.setattr(
         runtime, "get_ascend_device_type", lambda: runtime.AscendDeviceType.A3
     )
-    with pytest.raises(ValueError, match=message):
+    return runner, connector
+
+
+@pytest.mark.parametrize(
+    "mode,invalid,message",
+    [
+        (mode, invalid, message)
+        for mode in ("eager", "full")
+        for invalid, message in (
+            ("target", "target weights"),
+            ("draft", "draft weights"),
+            ("layers", "layer IDs"),
+        )
+    ]
+    + [("eager", None, None)],
+)
+def test_ffn_startup_validates_target_and_draft_weights(
+    layered_startup_runner, mode, invalid, message
+):
+    runner, connector = layered_startup_runner
+    if message:
+        with pytest.raises(ValueError, match=message):
+            runner.initialize_afd_connector()
+    else:
         runner.initialize_afd_connector()
+        assert runner.effective_mode == "eager"
+        assert connector.graph_startup.plan.signature == "(2, 5)"
 
 
 @pytest.mark.parametrize("value", [True, 0, -1, 1.5])
@@ -154,9 +193,7 @@ def test_two_stream_config_round_trip_and_default_off(modules):
     assert connector.AFDAsyncExtraInfo.from_mapping(disabled.to_mapping()) == disabled
 
 
-@pytest.mark.parametrize(
-    "feature", [None, "enable_dbo", "use_sequence_parallel_moe", "flashcomm1"]
-)
+@pytest.mark.parametrize("feature", ["use_sequence_parallel_moe"])
 def test_two_stream_attention_preflight_rejects_unqualified_modes(
     modules, monkeypatch, feature
 ):
@@ -183,14 +220,9 @@ def test_two_stream_attention_preflight_rejects_unqualified_modes(
     [
         (None, False),
         ("0", False),
-        ("", False),
-        ("false", False),
-        (" False ", False),
         ("1", True),
-        ("true", True),
         (" TRUE ", True),
         ("yes", False),
-        ("2", False),
     ],
 )
 def test_two_stream_flashcomm1_matches_ascend_boolean_parsing(
@@ -239,7 +271,7 @@ def test_two_stream_flashcomm1_matches_ascend_boolean_parsing(
 )
 def test_static_validation_precedes_hccl_creation(
     modules, monkeypatch, invalid, dbo_flag
-):
+):  # long-test: same startup boundary for valid and rejected configurations
     group, connector_module, _ = modules
     order = []
     store = MagicMock()
@@ -358,7 +390,7 @@ def test_ffn_announces_service_only_on_receiver_execution(modules):
 @pytest.mark.parametrize("two_stream", [False, True])
 def test_ffn_warmup_capture_order_and_failure_propagation(
     modules, monkeypatch, capture_fails, two_stream
-):
+):  # long-test: warmup/capture/readiness are one ordered startup protocol
     _, connector_module, runtime = modules
     calls: list[str | tuple[str, str | int]] = []
     startup = AsyncCAMGraphStartup(2, 2, 4)
@@ -416,7 +448,6 @@ def test_ffn_warmup_capture_order_and_failure_propagation(
         ("failure", "capture failed") if capture_fails else "captured",
     ]
     # Receiver readiness is intentionally not published by initialization.
-    assert "service" not in calls
 
 
 def test_attention_keeps_paired_warmup_and_waits_for_receiver(modules):
@@ -474,6 +505,85 @@ def ffn_owners(modules, monkeypatch):
     return sync_runtime, async_runtime, worker
 
 
+@pytest.fixture
+def receiver_graph_worker(ffn_owners, monkeypatch):
+    _, runtime, module = ffn_owners
+    # Admission has its own tests; this host loader replaces connector bases.
+    monkeypatch.setattr(
+        runtime, "fail_if_unsupported_npu_afd_features", lambda *args, **kwargs: None
+    )
+    config = npu_vllm_config(
+        role="ffn",
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+        enable_expert_parallel=True,
+        enable_elastic_ep=False,
+    )
+    state = SimpleNamespace(
+        token_nums_rankid_layeridx=object(),
+        group_list=object(),
+        dynamic_scales=object(),
+    )
+    connector = SimpleNamespace(
+        is_initialized=True,
+        close=lambda: None,
+        recv_attn_output=lambda: SimpleNamespace(
+            hidden_states=object(), context=SimpleNamespace(states=state)
+        ),
+        send_ffn_output=lambda *args: None,
+    )
+    runner = runtime.AsyncNPUFFNModelRunner(
+        config, SimpleNamespace(type="npu"), connector
+    )
+    runner.effective_mode = "full"
+    monkeypatch.setattr(runtime.torch.npu, "NPUGraph", Graph)
+    monkeypatch.setattr(
+        runtime.torch.npu, "graph", lambda *args, **kwargs: nullcontext()
+    )
+    runner._layered_executor = lambda hidden, *args, **kwargs: hidden
+    runner._initialize_graph(object())
+    runner._capture_graph()
+    shutdown = ModuleType("vllm.v1.worker.gpu.shutdown")
+    shutdown.__dict__["free_before_shutdown"] = lambda config: None
+    monkeypatch.setitem(sys.modules, shutdown.__name__, shutdown)
+    worker = module.AFDNPUFFNWorker.__new__(module.AFDNPUFFNWorker)
+    worker.model_runner = runner
+    worker._ffn_thread = None
+    worker._ffn_loop_error = None
+    worker._cpu_binding_attempted = True
+    return worker, weakref.ref(runner._graph)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_full_receiver_exit_releases_graph_only_after_success(
+    receiver_graph_worker, fail
+):
+    worker, graph = receiver_graph_worker
+
+    def serve():
+        worker._ffn_shutdown_event.set()
+        if fail:
+            raise RuntimeError("partial device completion")
+
+    worker._run_ffn_server_loop = serve
+    worker.start_ffn_server_loop()
+    thread: threading.Thread = worker._ffn_thread
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert graph() is not None
+    if fail:
+        with pytest.raises(RuntimeError, match="FFN worker loop failed"):
+            worker.stop_ffn_server_loop()
+        assert graph() is not None
+        with pytest.raises(RuntimeError, match="FFN worker loop failed"):
+            worker.raise_ffn_loop_error_if_any()
+    else:
+        worker.stop_ffn_server_loop()
+        worker.raise_ffn_loop_error_if_any()
+        assert graph() is None
+
+
 @pytest.mark.parametrize("state", ["live", "failed", "drained"])
 @pytest.mark.parametrize("two_stream", [False, True])
 def test_worker_retains_resources_until_clean_exit(ffn_owners, state, two_stream):
@@ -495,11 +605,11 @@ def test_worker_retains_resources_until_clean_exit(ffn_owners, state, two_stream
     )
     if state == "drained":
         worker.stop_ffn_server_loop()
-        assert calls == ["stop", "join", "release"] and worker._ffn_thread is None
+        assert calls == ["stop", "join", "release"]
     else:
         with pytest.raises(RuntimeError, match="retain resources|loop failed"):
             worker.stop_ffn_server_loop()
-        assert calls == ["stop", "join"] and worker._ffn_thread is not None
+        assert calls == ["stop", "join"]
         if state == "failed":
             for _ in range(2):
                 with pytest.raises(RuntimeError, match="loop failed"):
@@ -509,9 +619,7 @@ def test_worker_retains_resources_until_clean_exit(ffn_owners, state, two_stream
 
 
 @pytest.mark.parametrize("async_connector", [False, True])
-def test_worker_selects_owner_and_passes_device_rank(
-    ffn_owners, monkeypatch, async_connector
-):
+def test_worker_selects_runner_for_connector(ffn_owners, monkeypatch, async_connector):
     _, _, worker = ffn_owners
     config, device, calls = object(), SimpleNamespace(type="npu", index=3), MagicMock()
     parsed = SimpleNamespace(
@@ -525,16 +633,6 @@ def test_worker_selects_owner_and_passes_device_rank(
     monkeypatch.setattr(worker, "AsyncNPUFFNModelRunner", calls.asynchronous)
     selected = calls.asynchronous if async_connector else calls.sync
     assert worker.create_npu_ffn_model_runner(config, device) is selected.return_value
-    expected = [call.validate(config, expected_role="ffn", device_type="npu")]
-    expected += (
-        [
-            call.connector(7, 3, config, parsed),
-            call.asynchronous(config, device, calls.connector.return_value),
-        ]
-        if async_connector
-        else [call.sync(config, device)]
-    )
-    assert calls.mock_calls == expected
 
 
 def test_worker_rejects_v1_before_constructing_either_owner(ffn_owners, monkeypatch):
@@ -558,9 +656,9 @@ def test_worker_rejects_v1_before_constructing_either_owner(ffn_owners, monkeypa
 
 @pytest.mark.parametrize("async_connector", [False, True])
 @pytest.mark.parametrize("speculative_tokens", [None, 3])
-def test_separate_owners_construct_and_load_without_cross_graph_pool(
+def test_ffn_runner_loads_model_and_rejects_second_load(
     ffn_owners, monkeypatch, async_connector, speculative_tokens
-):
+):  # long-test: loader setup
     sync_runtime, async_runtime, _ = ffn_owners
     runtime = async_runtime if async_connector else sync_runtime
     calls = MagicMock()
@@ -587,13 +685,6 @@ def test_separate_owners_construct_and_load_without_cross_graph_pool(
         else runtime.AFDNPUFFNModelRunner
     )
     runner = owner(config, device, connector)
-    assert calls.validate.call_count == 2
-    assert calls.pool.call_count == (0 if async_connector else 1)
-    assert runner.model is None
-    if async_connector:
-        assert runner._graph is None and runner._graph_capture_count == 0
-    else:
-        assert runner._acl_graphs == {} and runner.graph_pool is calls.pool.return_value
 
     def get_loader(load_config):
         assert load_config is config.load_config

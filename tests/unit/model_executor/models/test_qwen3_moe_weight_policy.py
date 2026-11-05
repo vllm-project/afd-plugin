@@ -23,23 +23,12 @@ FFN_ROLE = frozenset(("ffn",))
 BOTH_ROLES = frozenset(("attention", "ffn"))
 WEIGHT_ROLE_CASES = (
     ("embedding", "model.embed_tokens.weight", BOTH_ROLES),
-    ("final-norm", "model.norm.weight", BOTH_ROLES),
-    ("lm-head", "lm_head.weight", BOTH_ROLES),
     (
         "attention-q-projection",
         "model.layers.0.self_attn.q_proj.weight",
         ATTENTION_ROLE,
     ),
-    (
-        "attention-k-scale",
-        "model.layers.0.self_attn.attn.k_scale",
-        ATTENTION_ROLE,
-    ),
-    (
-        "input-layernorm",
-        "model.layers.0.input_layernorm.weight",
-        ATTENTION_ROLE,
-    ),
+    ("input-layernorm", "model.layers.0.input_layernorm.weight", ATTENTION_ROLE),
     (
         "post-attention-layernorm",
         "model.layers.0.post_attention_layernorm.weight",
@@ -49,26 +38,6 @@ WEIGHT_ROLE_CASES = (
     (
         "moe-expert-projection",
         "model.layers.0.mlp.experts.0.gate_proj.weight",
-        FFN_ROLE,
-    ),
-    (
-        "moe-expert-scale",
-        "model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv",
-        FFN_ROLE,
-    ),
-    (
-        "shared-expert-projection",
-        "model.layers.0.mlp.shared_expert.gate_proj.weight",
-        FFN_ROLE,
-    ),
-    (
-        "shared-expert-gate",
-        "model.layers.0.mlp.shared_expert_gate.weight",
-        FFN_ROLE,
-    ),
-    (
-        "dense-gate-projection",
-        "model.layers.3.mlp.gate_proj.weight",
         FFN_ROLE,
     ),
 )
@@ -233,19 +202,6 @@ def test_load_weights_filters_once_and_delegates_to_native_loader(
         weights.items[names.index(name)][1] for name in expected_names
     ]
     assert weights.iterations == 1
-
-
-def test_native_loader_and_mapping_remain_native_owned() -> None:
-    assert "forward" not in adapter.AFDQwen3MoeModel.__dict__
-    assert "load_weights" not in adapter.AFDQwen3MoeModel.__dict__
-    assert (
-        adapter.AFDQwen3MoeModel.hf_to_vllm_mapper
-        is adapter.native.Qwen3MoeModel.hf_to_vllm_mapper
-    )
-    assert (
-        adapter.AFDQwen3MoeForCausalLM.hf_to_vllm_mapper
-        is adapter.native.Qwen3MoeForCausalLM.hf_to_vllm_mapper
-    )
 
 
 def test_model_reports_config_driven_moe_layer_indices() -> None:

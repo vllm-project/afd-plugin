@@ -22,7 +22,7 @@ import unittest
 from pathlib import Path
 from types import ModuleType
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 BENCHMARK_PATH = REPOSITORY_ROOT / "tests/npu/gmm_layered_performance.py"
 
 

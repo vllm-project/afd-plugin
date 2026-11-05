@@ -20,6 +20,7 @@ from afd_plugin.v1.worker.npu.async_ffn_model_runner import (  # noqa: E402
 @pytest.fixture
 def session_harness(monkeypatch):
     calls = []
+    produced = []
     connector = SimpleNamespace()
 
     class FakeGraph:
@@ -67,6 +68,7 @@ def session_harness(monkeypatch):
         calls.append("compute")
         assert batch_info is state.token_nums_rankid_layeridx
         temporary = hidden.clone()
+        produced.append(weakref.ref(temporary))
         retained_tensors.append(temporary)
         return temporary * 2
 
@@ -86,13 +88,13 @@ def session_harness(monkeypatch):
     session._graph_receiver_exited = False
     session._graph_failure = None
     session._initialize_graph(SimpleNamespace(synchronize=lambda: calls.append("wait")))
-    return session, connector, calls
+    return session, connector, calls, produced
 
 
 def test_replay_retains_transaction_until_receiver_exit(session_harness):
-    session, _, calls = session_harness
+    session, _, calls, produced = session_harness
     session._capture_graph()
-    temporary = weakref.ref(session._graph_tensors[0])
+    temporary = produced[0]
     for _ in range(3):
         session._submit_graph()
         assert session._complete_graph()
@@ -107,7 +109,7 @@ def test_replay_retains_transaction_until_receiver_exit(session_harness):
 
 
 def test_pending_device_work_prevents_replay_and_release(session_harness):
-    session, _, calls = session_harness
+    session, _, calls, produced = session_harness
     session._capture_graph()
     session._submit_graph()
     with pytest.raises(RuntimeError, match="not ready"):
@@ -120,18 +122,18 @@ def test_pending_device_work_prevents_replay_and_release(session_harness):
 
 @pytest.mark.parametrize("count", [1, 43])
 def test_batch_waits_once_without_host_metadata_or_store_poll(session_harness, count):
-    session, _, calls = session_harness
+    session, _, calls, produced = session_harness
     session._capture_graph()
     session._submit_graph(count)
     assert session._complete_graph()
-    assert calls.count("replay") == session._graph_replay_count == count
+    assert calls.count("replay") == count
     assert calls.count("wait") == 1
     assert calls[-1] == "wait"
 
 
 @pytest.mark.parametrize("failure", ["submit", "completion"])
 def test_failure_retains_resources_without_retry(session_harness, monkeypatch, failure):
-    session, _, calls = session_harness
+    session, _, calls, produced = session_harness
     session._capture_graph()
     if failure == "submit":
         session._graph.fail_launch = True
@@ -154,12 +156,12 @@ def test_failure_retains_resources_without_retry(session_harness, monkeypatch, f
     ):
         with pytest.raises(RuntimeError, match="failed"):
             operation()
-    assert session._graph_payload is not None and session._graph_output is not None
+    assert produced and all(ref() is not None for ref in produced)
     assert "reset" not in calls
 
 
 def test_partial_capture_never_retries_or_releases(session_harness):
-    session, connector, calls = session_harness
+    session, connector, calls, produced = session_harness
 
     def fail_send(*args):
         raise RuntimeError("capture failed after receive")
@@ -174,5 +176,5 @@ def test_partial_capture_never_retries_or_releases(session_harness):
     ):
         with pytest.raises(RuntimeError, match="failed"):
             operation()
-    assert session._graph_payload is not None and session._graph_output is not None
+    assert produced and all(ref() is not None for ref in produced)
     assert "replay" not in calls and "reset" not in calls

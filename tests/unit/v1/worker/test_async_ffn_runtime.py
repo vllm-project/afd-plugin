@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""MRV2 loading, eager isolation and graph-only resource lifetime contracts."""
+"""Async CAM eager wire outputs for layered execution."""
 
 from __future__ import annotations
 
-import threading
 from collections import deque
 from types import SimpleNamespace
 
@@ -25,7 +24,6 @@ from afd_plugin.connectors.npu.async_cam import (  # noqa: E402
     CAMAsyncAFDConnector,
 )
 from afd_plugin.v1.worker.npu import async_ffn_model_runner as runtime  # noqa: E402
-from afd_plugin.v1.worker.npu.ffn_worker import AFDNPUFFNWorker  # noqa: E402
 from tests.unit.fakes.vllm_config import npu_vllm_config  # noqa: E402
 
 
@@ -83,7 +81,7 @@ def harness(monkeypatch):
         return payloads.popleft()
 
     def send(output, context, **kwargs):
-        calls.append(("send", context.states.token_nums_rankid_layeridx))
+        calls.append(("send", output, context.states.token_nums_rankid_layeridx))
 
     monkeypatch.setattr(connector, "recv_attn_output", receive)
     monkeypatch.setattr(connector, "send_ffn_output", send)
@@ -100,7 +98,7 @@ def payload(layer, rows):
         dynamic_scales=torch.ones(8),
     )
     return AFDA2FTransferPayload(
-        torch.ones(8, 32, dtype=torch.int8),
+        torch.arange(8 * 32, dtype=torch.int8).reshape(8, 32),
         AFDTransferContext(AFDTransferMetadata(0, 0, [8]), state),
     )
 
@@ -109,43 +107,31 @@ def test_eager_preserves_layer_loop_device_metadata_and_return_headers(harness):
     h = harness
     first, zero = payload(5, 3), payload(2, 0)
     h.payloads.extend((first, zero))
-    observed = []
+    first.context.states.group_list = torch.tensor([1, 2])
+    first.context.states.dynamic_scales = torch.arange(1, 9, dtype=torch.float32)
 
     def execute(hidden, scales, groups, header):
-        observed.append((hidden.shape[0], groups, header))
-        return hidden.to(torch.bfloat16)
+        # Toy experts have gains 1/2 and layer gain equal to the layer ID.
+        # Only the sent result is asserted; this does not simulate CANN.
+        gains = torch.repeat_interleave(torch.tensor([1.0, 2.0]), groups)
+        rows = gains.numel()
+        output = torch.zeros_like(hidden, dtype=torch.bfloat16)
+        output[:rows] = (
+            hidden[:rows].float() * scales[:rows, None] * gains[:, None] * header[2]
+        ).to(torch.bfloat16)
+        return output
 
     h.runner._layered_executor = execute
+    expected = [torch.zeros(8, 32), torch.zeros(8, 32)]
+    expected[0][:3] = (
+        first.hidden_states[:3].float() * torch.tensor([5.0, 20.0, 30.0])[:, None]
+    )
     assert h.runner.execute_connector_driven_step()
-    assert [(rows, int(header[2])) for rows, _, header in observed] == [
-        (8, 5),
-        (8, 2),
-    ]
     returned = [
-        call[1] for call in h.calls if isinstance(call, tuple) and call[0] == "send"
+        call for call in h.calls if isinstance(call, tuple) and call[0] == "send"
     ]
-    assert returned[0] is first.context.states.token_nums_rankid_layeridx
-    assert returned[1] is zero.context.states.token_nums_rankid_layeridx
-
-
-@pytest.mark.parametrize("fail", [False, True])
-def test_full_receiver_exit_requires_success_even_during_shutdown(harness, fail):
-    worker = AFDNPUFFNWorker.__new__(AFDNPUFFNWorker)
-    worker.model_runner = harness.runner
-    harness.runner.effective_mode = "full"
-    worker._ffn_thread = None
-    worker._ffn_loop_error = None
-    worker._bind_cpus_once = lambda: None
-
-    def serve():
-        worker._ffn_shutdown_event.set()
-        if fail:
-            raise RuntimeError("partial device completion")
-
-    worker._run_ffn_server_loop = serve
-    worker.start_ffn_server_loop()
-    assert isinstance(worker._ffn_thread, threading.Thread)
-    worker._ffn_thread.join(3)
-    assert not worker._ffn_thread.is_alive()
-    assert harness.runner._graph_receiver_exited is not fail
-    assert (worker._ffn_loop_error is not None) is fail
+    for sent, received_payload, hidden in zip(
+        returned, (first, zero), expected, strict=True
+    ):
+        torch.testing.assert_close(sent[1], hidden.to(torch.bfloat16), rtol=0, atol=0)
+        assert sent[2] is received_payload.context.states.token_nums_rankid_layeridx

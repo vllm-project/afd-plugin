@@ -8,6 +8,7 @@ Constructed without ``AFDConnectorBase.__init__`` (no vLLM config needed).
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 from afd_plugin.connectors import (
@@ -77,3 +78,37 @@ class FakeRoutedConnector(AFDRoutedExpertsConnector):
 
     def synchronize_lanes(self) -> None:
         self.events.append(("sync",))
+
+
+class ProxyConnector:
+    def __init__(self, events: list[tuple]) -> None:
+        self.events = events
+
+    def send_attn_output(self, hidden_states, context, **kwargs) -> None:
+        self.events.append(("send", hidden_states, context, kwargs))
+
+    def recv_ffn_output(self, *, ref_tensor, ubatch_idx):
+        self.events.append(("recv", ref_tensor, ubatch_idx))
+        return ref_tensor * 0.25
+
+
+def install_proxy_context(adapter, monkeypatch, events, *, stage_idx=2):
+    connector = ProxyConnector(events)
+    afd_metadata = SimpleNamespace(connector=connector, stage_idx=9)
+    monkeypatch.setattr(
+        adapter,
+        "get_afd_metadata_from_forward_context",
+        lambda: afd_metadata,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "get_forward_context",
+        lambda: SimpleNamespace(ubatch_idx=stage_idx),
+    )
+
+    def record_yield(hidden_states, *, role):
+        events.append(("yield", hidden_states, role))
+        return hidden_states
+
+    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", record_yield)
+    return afd_metadata

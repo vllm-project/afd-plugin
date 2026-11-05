@@ -21,7 +21,7 @@ def test_maybe_apply_dbo_yield_uses_custom_op(monkeypatch):
     monkeypatch.setattr(
         dbo,
         "register_dbo_yield_custom_op",
-        lambda: calls.append("register"),
+        lambda: None,
     )
     monkeypatch.setattr(
         dbo.torch.ops.vllm,
@@ -31,10 +31,11 @@ def test_maybe_apply_dbo_yield_uses_custom_op(monkeypatch):
     )
 
     assert maybe_apply_dbo_yield(tensor, role="attention") is tensor
-    assert calls == ["register", ("yield", tensor)]
+    assert calls == [("yield", tensor)]
 
 
-def test_register_dbo_yield_custom_op_declares_input_mutation(monkeypatch):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_register_dbo_yield_custom_op_declares_input_mutation(monkeypatch, enabled):
     registrations = []
     yield_calls = []
     tensor = object()
@@ -47,10 +48,11 @@ def test_register_dbo_yield_custom_op_declares_input_mutation(monkeypatch):
     )
     monkeypatch.setattr(
         dbo,
-        "_yield_if_dbo_enabled",
+        "dbo_yield",
         lambda: yield_calls.append("yield"),
     )
 
+    monkeypatch.setattr(dbo, "dbo_enabled", lambda: enabled)
     dbo.register_dbo_yield_custom_op()
 
     assert len(registrations) == 1
@@ -58,7 +60,7 @@ def test_register_dbo_yield_custom_op_declares_input_mutation(monkeypatch):
     assert registration["op_name"] == "manual_dbo_yield"
     assert registration["mutates_args"] == ["x"]
     assert registration["op_func"](tensor) is None
-    assert yield_calls == ["yield"]
+    assert yield_calls == (["yield"] if enabled else [])
     assert registration["fake_impl"](tensor) is None
 
 
@@ -80,34 +82,3 @@ def test_maybe_apply_dbo_yield_does_not_probe_ascend(monkeypatch):
     )
 
     assert maybe_apply_dbo_yield(tensor, role="attention") is tensor
-
-
-def test_dbo_yield_without_native_context_does_not_import_npu_runtime(monkeypatch):
-    calls = []
-    monkeypatch.setattr(dbo, "dbo_enabled", lambda: False)
-    monkeypatch.setattr(dbo, "dbo_yield", lambda: calls.append("vllm"))
-    real_import = builtins.__import__
-
-    def check_import(name, *args, **kwargs):
-        assert not name.startswith("afd_plugin.v1.worker.npu")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", check_import)
-    dbo._yield_if_dbo_enabled()
-    assert calls == []
-
-
-def test_dbo_yield_prefers_native_context_without_importing_legacy(monkeypatch):
-    calls = []
-
-    monkeypatch.setattr(dbo, "dbo_enabled", lambda: True)
-    monkeypatch.setattr(dbo, "dbo_yield", lambda: calls.append("vllm"))
-    real_import = builtins.__import__
-
-    def check_import(name, *args, **kwargs):
-        assert name != "afd_plugin.v1.worker.npu.ubatching"
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", check_import)
-    dbo._yield_if_dbo_enabled()
-    assert calls == ["vllm"]

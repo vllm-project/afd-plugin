@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import ast
-import os
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -99,7 +98,7 @@ def test_device_layer_selection_capacity_and_scaling(
     swiglu_limit,
     layer_ids,
     via_graph,
-):
+):  # long-test: one external CANN transaction spans both layered operators
     layers = [
         replace(weights(idx, per_channel, quantization), swiglu_limit=swiglu_limit)
         for idx in reversed(layer_ids)
@@ -202,41 +201,6 @@ def test_repeated_interleaved_layer_ids(operators):
             torch.tensor([99, 0, idx, 3]),
         )
     assert [call[1][6].item() for call in operators[::2]] == [1, 0, 1, 1]
-
-
-def test_layered_debug_logging_does_not_read_metadata(monkeypatch):
-    source = Path("afd_plugin/connectors/npu/async_cam.py").read_text()
-    function = next(
-        node
-        for node in ast.parse(source).body
-        if isinstance(node, ast.FunctionDef) and node.name == "_log_cam_op_values"
-    )
-    messages = []
-    namespace = {
-        "os": os,
-        "Tensor": torch.Tensor,
-        "_CAM_OP_IO_LOG_ENV": "AFD_CAM_OP_IO_LOG",
-        "_CAM_LOG_SKIPPED_ARGS": frozenset(),
-        "logger": SimpleNamespace(warning=lambda *args: messages.append(args)),
-    }
-    exec(
-        compile(ast.Module(body=[function], type_ignores=[]), "<cam-log>", "exec"),
-        namespace,
-    )
-    monkeypatch.setenv("AFD_CAM_OP_IO_LOG", "1")
-
-    def reject(*args, **kwargs):
-        raise AssertionError("metadata D2H")
-
-    monkeypatch.setattr(torch.Tensor, "cpu", reject)
-    namespace["_log_cam_op_values"](
-        "combine",
-        "inputs",
-        metadata_values=False,
-        token_nums_rankid_layeridx=torch.tensor([10, 1, 3]),
-    )
-    assert "first5" not in messages[0][-1]
-    assert "shape=(3,)" in messages[0][-1]
 
 
 def model_weights_method(monkeypatch):

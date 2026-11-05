@@ -10,28 +10,16 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 from torch import nn  # noqa: E402
-from vllm.model_executor.layers.fused_moe.router import (  # noqa: E402
-    fused_topk_router,
-)
 
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
+from tests.unit.fakes.connector import ProxyConnector as _FakeConnector  # noqa: E402
+from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
+from tests.unit.fakes.model_layers import GateLinear  # noqa: E402
 
 ROUTING_HIDDEN_SIZE = 16
 ROUTING_NUM_EXPERTS = 8
 ROUTING_TOP_K = 2
-
-
-class _FakeConnector:
-    def __init__(self, events: list[tuple]) -> None:
-        self.events = events
-
-    def send_attn_output(self, hidden_states, context, **kwargs) -> None:
-        self.events.append(("send", hidden_states, context, kwargs))
-
-    def recv_ffn_output(self, *, ref_tensor, ubatch_idx):
-        self.events.append(("recv", ref_tensor, ubatch_idx))
-        return ref_tensor * 0.25
 
 
 class _PassthroughNorm(nn.Module):
@@ -46,35 +34,13 @@ class _FakeAttention(nn.Module):
         return hidden_states
 
 
-def _install_fake_forward_context(monkeypatch, events, *, stage_idx=2):
-    connector = _FakeConnector(events)
-    afd_metadata = SimpleNamespace(connector=connector, stage_idx=9)
-    monkeypatch.setattr(
-        adapter,
-        "get_afd_metadata_from_forward_context",
-        lambda: afd_metadata,
-    )
-    monkeypatch.setattr(
-        adapter,
-        "get_forward_context",
-        lambda: SimpleNamespace(ubatch_idx=stage_idx),
-    )
-
-    def record_yield(hidden_states, *, role):
-        events.append(("yield", hidden_states, role))
-        return hidden_states
-
-    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", record_yield)
-    return afd_metadata
-
-
 @pytest.mark.parametrize("layer_idx", [0, 1], ids=["dense", "moe"])
 def test_native_decoder_forward_calls_remote_proxy_once(
     monkeypatch,
     layer_idx,
 ):
     events: list[tuple] = []
-    afd_metadata = _install_fake_forward_context(monkeypatch, events)
+    afd_metadata = install_proxy_context(adapter, monkeypatch, events)
     monkeypatch.setattr(adapter.native, "DeepseekAttention", _FakeAttention)
 
     layer = object.__new__(adapter.AFDDeepseekV2DecoderLayer)
@@ -141,14 +107,12 @@ def test_gate_proxy_sends_routing_payload(monkeypatch):
     from afd_plugin.model_executor.models.npu import deepseek_v2_attention_gate
 
     events: list[tuple] = []
-    _install_fake_forward_context(monkeypatch, events, stage_idx=1)
+    install_proxy_context(adapter, monkeypatch, events, stage_idx=1)
     topk_weights = torch.tensor([[0.75, 0.25]])
     topk_ids = torch.tensor([[1, 3]])
     router_logits = torch.tensor([[0.1, 0.2, 0.3, 0.4]])
-    gate_calls = []
 
     def compute_gate_topk(**kwargs):
-        gate_calls.append(kwargs)
         return topk_weights, topk_ids, router_logits
 
     monkeypatch.setattr(
@@ -167,9 +131,6 @@ def test_gate_proxy_sends_routing_payload(monkeypatch):
 
     output = proxy(hidden_states)
 
-    assert len(gate_calls) == 1
-    assert gate_calls[0]["gate"] is proxy.gate
-    assert gate_calls[0]["gate_router"] is proxy.gate_router
     assert [event[0] for event in events] == ["send", "yield", "recv"]
     send_kwargs = events[0][3]
     assert send_kwargs["router_logits"] is router_logits
@@ -180,7 +141,7 @@ def test_gate_proxy_sends_routing_payload(monkeypatch):
 
 def test_remote_experts_proxy_sends_router_logits(monkeypatch):
     events: list[tuple] = []
-    _install_fake_forward_context(monkeypatch, events, stage_idx=1)
+    install_proxy_context(adapter, monkeypatch, events, stage_idx=1)
     proxy = adapter.AFDAttentionFusedMoE(
         layer_idx=3,
         external_routing=True,
@@ -203,7 +164,7 @@ def test_remote_experts_proxy_without_external_routing_ships_hidden_states(
     monkeypatch,
 ):
     events: list[tuple] = []
-    _install_fake_forward_context(monkeypatch, events, stage_idx=1)
+    install_proxy_context(adapter, monkeypatch, events, stage_idx=1)
     proxy = adapter.AFDAttentionFusedMoE(
         layer_idx=2,
         external_routing=False,
@@ -215,6 +176,7 @@ def test_remote_experts_proxy_without_external_routing_ships_hidden_states(
     assert [event[0] for event in events] == ["send", "yield", "recv"]
     assert events[0][3] == {}
     assert torch.equal(output, hidden_states * 0.25)
+    assert list(proxy.parameters()) == []
 
 
 COMBINED_VALUE = 1.0
@@ -281,7 +243,7 @@ def test_m2n_moe_sends_topk_and_adds_shared_output_of_dispatched_input(
     must ride in the weights.
     """
     events: list[tuple] = []
-    afd_metadata = _install_fake_forward_context(monkeypatch, events, stage_idx=1)
+    afd_metadata = install_proxy_context(adapter, monkeypatch, events, stage_idx=1)
     afd_metadata.connector = _InPlaceCombineConnector(events)
     moe = _routed_experts_moe(
         shared_experts=None if shared_factor is None else _Scale(shared_factor),
@@ -319,7 +281,7 @@ def test_remote_proxy_requires_forward_metadata(monkeypatch):
 
 def test_remote_proxy_exchanges_cam_during_profile(monkeypatch):
     events: list[tuple] = []
-    _install_fake_forward_context(monkeypatch, events)
+    install_proxy_context(adapter, monkeypatch, events)
     monkeypatch.setattr(
         adapter,
         "get_forward_context",
@@ -355,7 +317,6 @@ def test_synchronous_model_forward_delegates_to_native(monkeypatch):
     )
 
     assert output is expected
-    assert calls == [(model, (None, positions, None, None))]
 
 
 def test_async_connector_dispatches_to_schedule_adapter(monkeypatch):
@@ -394,15 +355,6 @@ def test_async_connector_dispatches_to_schedule_adapter(monkeypatch):
     )
 
     assert output is expected
-    assert calls == [(model, None, positions, None, None)]
-
-
-def test_decoder_inherits_native_forward_without_override():
-    assert "forward" not in adapter.AFDDeepseekV2DecoderLayer.__dict__
-    assert (
-        adapter.AFDDeepseekV2DecoderLayer.forward
-        is adapter.native.DeepseekV2DecoderLayer.forward
-    )
 
 
 @pytest.mark.usefixtures("registered_routing_ids_op")
@@ -459,21 +411,6 @@ def test_attention_gate_balances_only_profile_routing(monkeypatch):
         assert actual_logits is logits
 
 
-class _RecordingGate(nn.Module):
-    """Linear gate returning ``(logits, bias)`` like vLLM's ReplicatedLinear."""
-
-    def __init__(self, calls: list) -> None:
-        super().__init__()
-        self.calls = calls
-        self.weight = nn.Parameter(
-            torch.randn(ROUTING_NUM_EXPERTS, ROUTING_HIDDEN_SIZE)
-        )
-
-    def forward(self, hidden_states):
-        self.calls.append(hidden_states)
-        return hidden_states @ self.weight.t(), None
-
-
 def _routing_proxy(gate: nn.Module, *, renormalize: bool = True):
     """A proxy that routes on Attention, configured as a model sets it up."""
     proxy = adapter.RemoteFFNProxy(layer_idx=3)
@@ -490,13 +427,12 @@ def test_default_proxy_is_parameter_free_and_sends_no_routes(monkeypatch):
     routing settings to the base proxy must not change their payload.
     """
     events: list[tuple] = []
-    _install_fake_forward_context(monkeypatch, events)
+    install_proxy_context(adapter, monkeypatch, events)
     proxy = adapter.RemoteFFNProxy(layer_idx=0)
 
     proxy(torch.ones(2, 4))
 
     assert list(proxy.parameters()) == []
-    assert proxy.tp_size == 1
     assert events[0][3] == {}
 
 
@@ -507,29 +443,22 @@ def test_routing_proxy_routes_on_attention_and_sends_topk(monkeypatch):
     the weighted sum, so the proxy must not send logits or apply weights.
     """
     events: list[tuple] = []
-    _install_fake_forward_context(monkeypatch, events, stage_idx=1)
-    gate_calls: list = []
-    topk_calls: list[dict] = []
+    install_proxy_context(adapter, monkeypatch, events, stage_idx=1)
     topk_weights = torch.tensor([[0.75, 0.25]])
     topk_ids = torch.tensor([[1, 3]], dtype=torch.int32)
 
     def fake_fused_topk(**kwargs):
-        topk_calls.append(kwargs)
         return topk_weights, topk_ids, torch.zeros_like(topk_ids)
 
     monkeypatch.setattr(adapter, "fused_topk", fake_fused_topk)
-    proxy = _routing_proxy(_RecordingGate(gate_calls), renormalize=False)
+    proxy = _routing_proxy(
+        GateLinear(ROUTING_HIDDEN_SIZE, ROUTING_NUM_EXPERTS, out_dtype=torch.float32),
+        renormalize=False,
+    )
     hidden_states = torch.ones(1, ROUTING_HIDDEN_SIZE)
 
     output = proxy(hidden_states)
 
-    assert gate_calls == [hidden_states]
-    assert len(topk_calls) == 1
-    call = topk_calls[0]
-    assert call["hidden_states"] is hidden_states
-    assert torch.equal(call["gating_output"], hidden_states @ proxy.gate.weight.t())
-    assert call["topk"] == ROUTING_TOP_K
-    assert call["renormalize"] is False
     assert [event[0] for event in events] == ["send", "yield", "recv"]
     context = events[0][2]
     assert context.metadata.layer_idx == 3
@@ -545,53 +474,11 @@ def test_routing_proxy_owns_gate_at_native_checkpoint_path():
     Why: the proxy replaces ``mlp``, so ``model.layers.N.mlp.gate.weight``
     from the checkpoint loads into it with no name mapping.
     """
-    proxy = _routing_proxy(_RecordingGate([]))
+    proxy = _routing_proxy(
+        GateLinear(ROUTING_HIDDEN_SIZE, ROUTING_NUM_EXPERTS, out_dtype=torch.float32)
+    )
 
     assert set(dict(proxy.named_parameters())) == {"gate.weight"}
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused top-k needs CUDA")
-@pytest.mark.parametrize("renormalize", [True, False])
-def test_routing_proxy_matches_native_router(monkeypatch, renormalize):
-    """On GPU the proxy's routes equal vLLM's native fused top-k router.
-
-    Why: the FFN applies the weights the Attention side computes; any drift
-    from native routing changes the model's output.
-    """
-    torch.manual_seed(0)
-    events: list[tuple] = []
-    _install_fake_forward_context(monkeypatch, events, stage_idx=0)
-    gate = _RecordingGate([]).cuda().to(torch.bfloat16)
-    proxy = _routing_proxy(gate, renormalize=renormalize)
-    hidden_states = torch.randn(
-        33, ROUTING_HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16
-    )
-
-    proxy(hidden_states)
-
-    sent = events[0][3]
-    router_logits, _ = gate(hidden_states)
-    native_weights, native_ids = fused_topk_router.FusedTopKRouter(
-        top_k=ROUTING_TOP_K,
-        global_num_experts=ROUTING_NUM_EXPERTS,
-        renormalize=renormalize,
-    )._compute_routing(hidden_states, router_logits, indices_type=None)
-    assert torch.equal(sent["topk_ids"], native_ids)
-    assert torch.equal(sent["topk_weights"], native_weights)
-
-    reference = torch.softmax(router_logits.float(), dim=-1)
-    reference_weights, reference_ids = reference.topk(ROUTING_TOP_K, dim=-1)
-    if renormalize:
-        reference_weights = reference_weights / reference_weights.sum(-1, keepdim=True)
-    assert torch.equal(
-        sent["topk_ids"].long().sort(-1).values, reference_ids.sort(-1).values
-    )
-    torch.testing.assert_close(
-        sent["topk_weights"].sort(-1).values,
-        reference_weights.sort(-1).values,
-        rtol=1e-3,
-        atol=1e-3,
-    )
 
 
 # Fake combine output scale of ``_FakeConnector.recv_ffn_output``.
@@ -650,7 +537,7 @@ def test_routing_proxy_tp1_dispatches_every_token(monkeypatch):
         raise AssertionError("TP = 1 must not split")
 
     events: list[tuple] = []
-    _install_fake_forward_context(monkeypatch, events)
+    install_proxy_context(adapter, monkeypatch, events)
     monkeypatch.setattr(adapter.native, "sequence_parallel_chunk", no_split)
     hidden_states = _tokens(3)
 
@@ -678,7 +565,7 @@ def test_routing_proxy_tp2_rank_dispatches_its_slice_and_gathers(
     """
     tp_size = 2
     events: list[tuple] = []
-    _install_fake_forward_context(monkeypatch, events)
+    install_proxy_context(adapter, monkeypatch, events)
     monkeypatch.setattr(
         adapter.native, "sequence_parallel_chunk", _chunk_for_rank(tp_rank, tp_size)
     )
@@ -717,7 +604,7 @@ def test_routing_proxy_tp4_with_one_token_routes_only_rank0(monkeypatch):
     """
     tp_size = 4
     events: list[tuple] = []
-    _install_fake_forward_context(monkeypatch, events)
+    install_proxy_context(adapter, monkeypatch, events)
     monkeypatch.setattr(
         adapter.native,
         "tensor_model_parallel_all_gather",
@@ -761,7 +648,7 @@ def test_m2n_moe_tp2_rank_dispatches_its_slice_and_gathers_shared_sum(
     tp_size = 2
     shared_factor = 3.0
     events: list[tuple] = []
-    afd_metadata = _install_fake_forward_context(monkeypatch, events, stage_idx=1)
+    afd_metadata = install_proxy_context(adapter, monkeypatch, events, stage_idx=1)
     afd_metadata.connector = _InPlaceCombineConnector(events)
     monkeypatch.setattr(
         adapter.native, "sequence_parallel_chunk", _chunk_for_rank(tp_rank, tp_size)

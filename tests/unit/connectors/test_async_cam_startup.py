@@ -94,13 +94,6 @@ def test_mixed_requested_modes_are_not_silently_downgraded():
 
 
 @pytest.mark.parametrize("mode", ["eager", "full"])
-def test_unsupported_executor_rejects_without_automatic_fallback(mode):
-    plan = full_plan(requested=mode)
-    with pytest.raises(ValueError, match="unsupported executor"):
-        resolve_ffn_mode([plan, replace(plan, executor_error="unsupported executor")])
-
-
-@pytest.mark.parametrize("mode", ["eager", "full"])
 def test_executor_error_reaches_all_attention_and_ffn_ranks(mode):
     owners = startup_world()
     plan = full_plan(requested=mode)
@@ -113,26 +106,6 @@ def test_executor_error_reaches_all_attention_and_ffn_ranks(mode):
     ), errors
 
 
-@pytest.mark.parametrize(
-    "changes,message",
-    [
-        ({"signature": "other"}, "signatures differ"),
-        ({"layer_ids": (2, 6)}, "layer tables"),
-    ],
-)
-@pytest.mark.parametrize("mode", ["eager", "full"])
-def test_rejects_incompatible_layout_in_both_execution_modes(changes, message, mode):
-    plan = full_plan(requested=mode)
-    with pytest.raises(ValueError, match=message):
-        resolve_ffn_mode([plan, replace(plan, **changes)])
-
-
-@pytest.mark.parametrize("mode", ["eager", "full"])
-def test_empty_executor_signature_cannot_advertise_support(mode):
-    with pytest.raises(ValueError, match="loaded executor"):
-        resolve_ffn_mode([full_plan(requested=mode, signature="")])
-
-
 @pytest.mark.parametrize("mode", ["eager", "full"])
 def test_two_stream_signature_and_failure_are_checked_in_both_modes(mode):
     plan = full_plan(requested=mode, stream_signature="2/12C/24V/24V")
@@ -143,19 +116,13 @@ def test_two_stream_signature_and_failure_are_checked_in_both_modes(mode):
         resolve_ffn_mode([plan, replace(plan, stream_error="core budget")])
     with pytest.raises(ValueError, match="signatures differ"):
         resolve_ffn_mode([plan, replace(plan, signature="other-capacity")])
-    with pytest.raises(ValueError, match="layer tables"):
-        resolve_ffn_mode([plan, replace(plan, layer_ids=(2, 6))])
-    with pytest.raises(ValueError, match="loaded executor"):
-        resolve_ffn_mode([replace(plan, signature="")])
 
 
 @pytest.mark.parametrize("peer_failure", [False, True])
 def test_two_stream_waits_for_attention_capability_check(peer_failure):
     owners = startup_world(1, 1)
-    checked = []
 
     def validate():
-        checked.append("attention")
         if peer_failure:
             raise ValueError("DBO is not qualified")
 
@@ -169,7 +136,6 @@ def test_two_stream_waits_for_attention_capability_check(peer_failure):
         ), errors
     else:
         assert errors == [None, None]
-    assert checked == ["attention"]
 
 
 def test_whole_world_agrees_before_service_readiness():
@@ -218,14 +184,12 @@ def test_nonowner_attention_failure_is_visible_to_late_ffn(monkeypatch, failure)
         monkeypatch.setattr(attention._store, "set", fail_plan)
     with pytest.raises((TimeoutError, RuntimeError)):
         attention._negotiate(None, "same-wire")
-    assert attention._store.check(attention._keys("error", range(1, 2)))
     # Late plan and ready publications must not conceal the first failure.
     with pytest.raises(RuntimeError):
         ffn._negotiate(full_plan(), "same-wire")
     assert ffn.mode == "eager"
     with pytest.raises(RuntimeError):
         ffn.service_ready()
-    assert not ffn._store.check(ffn._keys("service", range(2, 3)))
 
 
 def test_capacity_matches_native_float32_factor(monkeypatch):
@@ -291,3 +255,21 @@ def test_initialize_owns_nonce_and_plan_negotiation():
         for key in store.values
         if key != "ffn_graph/nonce"
     )
+
+
+@pytest.mark.parametrize("mode", ["eager", "full"])
+@pytest.mark.parametrize(
+    "plans,message",
+    [
+        (
+            [full_plan(), full_plan(executor_error="unsupported executor")],
+            "unsupported executor",
+        ),
+        ([full_plan(), full_plan(signature="other")], "signatures differ"),
+        ([full_plan(), full_plan(layer_ids=(2, 6))], "layer tables"),
+        ([full_plan(signature="")], "loaded executor"),
+    ],
+)
+def test_startup_rejects_incompatible_execution_plans(mode, plans, message):
+    with pytest.raises(ValueError, match=message):
+        resolve_ffn_mode([replace(plan, requested=mode) for plan in plans])

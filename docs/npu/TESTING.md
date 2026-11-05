@@ -31,7 +31,7 @@ Run the focused contract checks in the matching runtime environment:
 
 ```bash
 python3 -m pytest -q -ra \
-  tests/unit/config/test_async_cam_dbo.py \
+  tests/unit/compat/npu/test_runtime_config.py \
   tests/unit/config/test_validation.py \
   tests/unit/model_executor/test_async_cam_dbo.py \
   tests/unit/model_executor/test_async_cam_layout.py \
@@ -99,8 +99,8 @@ extension and run the device suites. All four need one device and issue no
 collective:
 
 ```bash
-SOC_VERSION=910c pytest -q tests/unit/compat/npu/test_gmm_layered.py
-SOC_VERSION=910c pytest -q tests/unit/compat/npu/test_gmm_swiglu_quant_v2_layered.py
+SOC_VERSION=910c pytest -q tests/npu/test_gmm_layered.py
+SOC_VERSION=910c pytest -q tests/npu/test_gmm_swiglu_quant_v2_layered.py
 AFD_RUN_ASCEND_OP_RUNTIME=1 SOC_VERSION=910c LOCAL_RANK=0 \
   pytest -o addopts= -v -ra -s \
   tests/npu/test_async_cam_layered_w4a8.py \

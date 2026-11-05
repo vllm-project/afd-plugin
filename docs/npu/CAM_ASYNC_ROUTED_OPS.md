@@ -174,7 +174,7 @@ matching torch-npu/CANN libraries:
 
 ```bash
 SOC_VERSION=910c python -m pytest -q -ra \
-  tests/unit/compat/npu/test_cam_async_ops.py
+  tests/npu/test_cam_async_ops.py
 ```
 
 Missing dependencies or an unspecified target SOC are reported as skips, not

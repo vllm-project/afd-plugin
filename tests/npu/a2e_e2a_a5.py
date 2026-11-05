@@ -7,7 +7,7 @@ avoids the ``test_*.py`` pattern so collection does not import torch_npu.
 
 Run:
 
-    AFD_TEST_DEVICES=2,3 python tests/unit/compat/npu/a2e_e2a_a5.py
+    AFD_TEST_DEVICES=2,3 python tests/npu/a2e_e2a_a5.py
 
 Environment:
     AFD_TEST_DEVICES  physical NPU ids, default ``2,3``

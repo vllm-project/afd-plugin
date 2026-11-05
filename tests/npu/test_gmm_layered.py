@@ -4,7 +4,7 @@
 
 Build the extension against an Ascend 910C toolchain, then run::
 
-    SOC_VERSION=910c pytest tests/unit/compat/npu/test_gmm_layered.py
+    SOC_VERSION=910c pytest tests/npu/test_gmm_layered.py
 
 The Meta tests are exercised through the real PyTorch dispatcher on meta
 tensors, so only the Python interface contract and the resulting output
@@ -46,19 +46,15 @@ layer_index checks are only observable on the device path;
 CANN run package, so they are opt-in::
 
     SOC_VERSION=910c AFD_RUN_ASCEND_OP_RUNTIME=1 \\
-        pytest tests/unit/compat/npu/test_gmm_layered.py
+        pytest tests/npu/test_gmm_layered.py
 """
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
 import os
 from types import ModuleType
 
 import pytest
-
-from afd_plugin.compat.npu.ops import ensure_afd_ascend_ops_loaded
 
 pytestmark = pytest.mark.npu
 
@@ -80,22 +76,6 @@ _RUNTIME_M = 128
 _RUNTIME_K = 256
 _RUNTIME_E = 8
 _RUNTIME_N = 256
-
-
-@pytest.fixture(scope="module")
-def gmm_runtime() -> ModuleType:
-    soc = os.environ.get("SOC_VERSION", "").lower()
-    if soc != "910c" and not soc.startswith("ascend910_93"):
-        pytest.skip("Set SOC_VERSION=910c to test the compiled gmm extension")
-    for module in ("torch", "torch_npu", "afd_plugin._C_ascend"):
-        if importlib.util.find_spec(module) is None:
-            pytest.skip(f"{module} is required for compiled gmm dispatcher tests")
-    # Optional runtime imports stay inside the fixture, so CPU test collection
-    # remains independent of torch/torch_npu and their process-wide state.
-    torch = importlib.import_module("torch")
-    importlib.import_module("torch_npu")
-    ensure_afd_ascend_ops_loaded()
-    return torch
 
 
 def _build_meta_inputs(torch: ModuleType, layers: int = 1) -> dict:
@@ -174,19 +154,21 @@ def _invoke_gmm(torch: ModuleType, inputs: dict) -> list:
 
 
 def test_gmm_layered_registers_inference_and_meta_kernels(
-    gmm_runtime: ModuleType,
+    ascend_ops_runtime: ModuleType,
 ) -> None:
-    schema = str(gmm_runtime.ops.afd_ascend.grouped_matmul_layered.default._schema)
+    schema = str(
+        ascend_ops_runtime.ops.afd_ascend.grouped_matmul_layered.default._schema
+    )
     assert "Tensor group_list" in schema
     assert "int[]? group_list" not in schema
     for dispatch_key in ("PrivateUse1", "AutogradPrivateUse1", "Meta"):
-        assert gmm_runtime._C._dispatch_has_kernel_for_dispatch_key(
+        assert ascend_ops_runtime._C._dispatch_has_kernel_for_dispatch_key(
             _OP_NAME, dispatch_key
         )
 
 
-def test_gmm_layered_meta_contract(gmm_runtime: ModuleType) -> None:
-    torch = gmm_runtime
+def test_gmm_layered_meta_contract(ascend_ops_runtime: ModuleType) -> None:
+    torch = ascend_ops_runtime
     outputs = _invoke_gmm(torch, _build_meta_inputs(torch))
 
     # The layered output model is one [rows, n] tensor: the kernel writes each
@@ -201,14 +183,14 @@ def test_gmm_layered_meta_contract(gmm_runtime: ModuleType) -> None:
     assert y_out.device.type == "meta"
 
 
-def test_gmm_layered_meta_multi_layer_lists(gmm_runtime: ModuleType) -> None:
+def test_gmm_layered_meta_multi_layer_lists(ascend_ops_runtime: ModuleType) -> None:
     """A multi-layer call must succeed on the meta path too.
 
     The all_* lengths are the layer count, not the expert count, so a list of
     two elements is the two-layer shape and the output geometry must not change
     with it.
     """
-    torch = gmm_runtime
+    torch = ascend_ops_runtime
     outputs = _invoke_gmm(torch, _build_meta_inputs(torch, layers=_RUNTIME_LAYERS))
 
     assert len(outputs) == 1
@@ -217,14 +199,14 @@ def test_gmm_layered_meta_multi_layer_lists(gmm_runtime: ModuleType) -> None:
     assert y_out.dtype == torch.bfloat16
 
 
-def test_gmm_layered_meta_contract_a8w8(gmm_runtime: ModuleType) -> None:
+def test_gmm_layered_meta_contract_a8w8(ascend_ops_runtime: ModuleType) -> None:
     """The A8W8 contract on meta: int8 weight, int32 bias, explicit y dtype.
 
     Unlike A8W4 there is no dtype to derive - an int8 weight makes the wrapper
     keep the activation dtype, i.e. int8 y, which is a different def column - so
     output_dtype is passed explicitly and must be honoured.
     """
-    torch = gmm_runtime
+    torch = ascend_ops_runtime
     inputs = _build_a8w8_meta_inputs(torch)
     y_out = torch.ops.afd_ascend.grouped_matmul_layered(
         **inputs,
@@ -236,9 +218,11 @@ def test_gmm_layered_meta_contract_a8w8(gmm_runtime: ModuleType) -> None:
     assert y_out.device.type == "meta"
 
 
-def test_gmm_layered_meta_a8w8_multi_layer_lists(gmm_runtime: ModuleType) -> None:
+def test_gmm_layered_meta_a8w8_multi_layer_lists(
+    ascend_ops_runtime: ModuleType,
+) -> None:
     """The A8W8 per-layer TensorList indexing must accept a multi-layer list."""
-    torch = gmm_runtime
+    torch = ascend_ops_runtime
     inputs = _build_a8w8_meta_inputs(torch, layers=_RUNTIME_LAYERS)
     y_out = torch.ops.afd_ascend.grouped_matmul_layered(
         **inputs,
@@ -257,10 +241,10 @@ def test_gmm_layered_meta_a8w8_multi_layer_lists(gmm_runtime: ModuleType) -> Non
     ],
 )
 def test_gmm_layered_meta_a8w8_legal_dtype_pairs(
-    gmm_runtime: ModuleType, scale_dtype: str, y_dtype: str
+    ascend_ops_runtime: ModuleType, scale_dtype: str, y_dtype: str
 ) -> None:
     """Only two (scale, y) pairs are legal for A8W8; both must be accepted."""
-    torch = gmm_runtime
+    torch = ascend_ops_runtime
     scale_torch_dtype = getattr(torch, scale_dtype)
     y_torch_dtype = getattr(torch, y_dtype)
     inputs = _build_a8w8_meta_inputs(torch, scale_dtype=scale_torch_dtype)
@@ -274,10 +258,10 @@ def test_gmm_layered_meta_a8w8_legal_dtype_pairs(
 
 
 def test_gmm_layered_meta_a8w8_rejects_bad_layer_index(
-    gmm_runtime: ModuleType,
+    ascend_ops_runtime: ModuleType,
 ) -> None:
     """The layer_index contract is scenario-independent and must hold for A8W8."""
-    torch = gmm_runtime
+    torch = ascend_ops_runtime
     for bad in (
         torch.zeros((2,), dtype=torch.int64, device="meta"),  # not one element
         torch.zeros((1,), dtype=torch.int32, device="meta"),  # wrong dtype
@@ -292,10 +276,10 @@ def test_gmm_layered_meta_a8w8_rejects_bad_layer_index(
 
 
 def test_gmm_layered_meta_a8w8_rejects_mismatched_list_lengths(
-    gmm_runtime: ModuleType,
+    ascend_ops_runtime: ModuleType,
 ) -> None:
     """The per-layer list length contract is scenario-independent too."""
-    torch = gmm_runtime
+    torch = ascend_ops_runtime
     inputs = _build_a8w8_meta_inputs(torch, layers=_RUNTIME_LAYERS)
     inputs["all_bias"] = inputs["all_bias"][:1]  # 1 vs 2 layers
 
@@ -306,9 +290,11 @@ def test_gmm_layered_meta_a8w8_rejects_mismatched_list_lengths(
         )
 
 
-def test_gmm_layered_rejects_mismatched_list_lengths(gmm_runtime: ModuleType) -> None:
+def test_gmm_layered_rejects_mismatched_list_lengths(
+    ascend_ops_runtime: ModuleType,
+) -> None:
     """all_weight / all_bias / all_scale must agree on the layer count."""
-    torch = gmm_runtime
+    torch = ascend_ops_runtime
     inputs = _build_meta_inputs(torch, layers=_RUNTIME_LAYERS)
     inputs["all_bias"] = inputs["all_bias"][:1]  # 1 vs 2 layers
 
@@ -316,9 +302,11 @@ def test_gmm_layered_rejects_mismatched_list_lengths(gmm_runtime: ModuleType) ->
         _invoke_gmm(torch, inputs)
 
 
-def test_gmm_layered_rejects_bad_layer_index_shape(gmm_runtime: ModuleType) -> None:
+def test_gmm_layered_rejects_bad_layer_index_shape(
+    ascend_ops_runtime: ModuleType,
+) -> None:
     """layer_index is a single int64 element, not a vector."""
-    torch = gmm_runtime
+    torch = ascend_ops_runtime
     for bad in (
         torch.zeros((2,), dtype=torch.int64, device="meta"),  # not one element
         torch.zeros((1,), dtype=torch.int32, device="meta"),  # wrong dtype
@@ -329,8 +317,8 @@ def test_gmm_layered_rejects_bad_layer_index_shape(gmm_runtime: ModuleType) -> N
             _invoke_gmm(torch, inputs)
 
 
-def test_gmm_layered_rejects_bad_split_item(gmm_runtime: ModuleType) -> None:
-    torch = gmm_runtime
+def test_gmm_layered_rejects_bad_split_item(ascend_ops_runtime: ModuleType) -> None:
+    torch = ascend_ops_runtime
     inputs = _build_meta_inputs(torch)
     with pytest.raises(RuntimeError, match="split_item"):
         torch.ops.afd_ascend.grouped_matmul_layered(
@@ -347,7 +335,7 @@ def test_gmm_layered_rejects_bad_split_item(gmm_runtime: ModuleType) -> None:
         )
 
 
-def test_gmm_layered_runtime_multi_layer(gmm_runtime: ModuleType) -> None:
+def test_gmm_layered_runtime_multi_layer(ascend_ops_runtime: ModuleType) -> None:
     """Run the A8W4 device path for two layers and check the output geometry.
 
     This is the only layer that reaches the op_api validation and the kernel, so
@@ -361,7 +349,7 @@ def test_gmm_layered_runtime_multi_layer(gmm_runtime: ModuleType) -> None:
             "installed to run the A8W4 device invocation",
         )
 
-    torch = gmm_runtime
+    torch = ascend_ops_runtime
     torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     device = "npu"
 
@@ -409,7 +397,7 @@ def test_gmm_layered_runtime_multi_layer(gmm_runtime: ModuleType) -> None:
         assert y_out.device.type == "npu"
 
 
-def test_gmm_layered_runtime_a8w8(gmm_runtime: ModuleType) -> None:
+def test_gmm_layered_runtime_a8w8(ascend_ops_runtime: ModuleType) -> None:
     """Run the A8W8 device path for two layers and check the output geometry.
 
     The A8W8 counterpart of ``test_gmm_layered_runtime_multi_layer``. It is the
@@ -423,7 +411,7 @@ def test_gmm_layered_runtime_a8w8(gmm_runtime: ModuleType) -> None:
             "installed to run the A8W8 device invocation",
         )
 
-    torch = gmm_runtime
+    torch = ascend_ops_runtime
     torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     device = "npu"
 
@@ -469,8 +457,8 @@ def test_gmm_layered_runtime_a8w8(gmm_runtime: ModuleType) -> None:
         assert y_out.device.type == "npu"
 
 
-def test_gmm_layered_device_group_list_meta(gmm_runtime: ModuleType) -> None:
-    torch = gmm_runtime
+def test_gmm_layered_device_group_list_meta(ascend_ops_runtime: ModuleType) -> None:
+    torch = ascend_ops_runtime
     inputs = _build_meta_inputs(torch, layers=2)
     inputs["group_list"] = torch.empty((_E,), dtype=torch.int64, device="meta")
     # A slice with a nonzero storage offset is the production layer-index contract.

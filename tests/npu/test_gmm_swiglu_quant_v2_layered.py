@@ -4,7 +4,7 @@
 
 Build the extension against an Ascend 910C toolchain, then run::
 
-    SOC_VERSION=910c pytest tests/unit/compat/npu/test_gmm_swiglu_quant_v2_layered.py
+    SOC_VERSION=910c pytest tests/npu/test_gmm_swiglu_quant_v2_layered.py
 
 The Meta tests are exercised through the real PyTorch dispatcher on meta
 tensors, so only the Python interface contract and the resulting output
@@ -35,7 +35,7 @@ express ``None``). It needs a 910C device and the AFD CANN run package, so it
 is opt-in::
 
     SOC_VERSION=910c AFD_RUN_ASCEND_OP_RUNTIME=1 \\
-        pytest tests/unit/compat/npu/test_gmm_swiglu_quant_v2_layered.py
+        pytest tests/npu/test_gmm_swiglu_quant_v2_layered.py
 
 Numerical correctness is covered separately, against the built-in non-layered
 operator: ``tests/npu/test_gmm_swiglu_quant_v2_layered_precision.py``.
@@ -43,14 +43,10 @@ operator: ``tests/npu/test_gmm_swiglu_quant_v2_layered_precision.py``.
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
 import os
 from types import ModuleType
 
 import pytest
-
-from afd_plugin.compat.npu.ops import ensure_afd_ascend_ops_loaded
 
 pytestmark = pytest.mark.npu
 
@@ -74,22 +70,6 @@ _A4W4_E = 8
 _A4W4_N = 256
 # fp32 1.0 in the low word of the wire-format uint64 per-channel scale.
 _A4W4_SCALE_ONE = 0x3F800000
-
-
-@pytest.fixture(scope="module")
-def gmm_runtime() -> ModuleType:
-    soc = os.environ.get("SOC_VERSION", "").lower()
-    if soc != "910c" and not soc.startswith("ascend910_93"):
-        pytest.skip("Set SOC_VERSION=910c to test the compiled gmm extension")
-    for module in ("torch", "torch_npu", "afd_plugin._C_ascend"):
-        if importlib.util.find_spec(module) is None:
-            pytest.skip(f"{module} is required for compiled gmm dispatcher tests")
-    # Optional runtime imports stay inside the fixture, so CPU test collection
-    # remains independent of torch/torch_npu and their process-wide state.
-    torch = importlib.import_module("torch")
-    importlib.import_module("torch_npu")
-    ensure_afd_ascend_ops_loaded()
-    return torch
 
 
 def _build_pertoken_inputs(torch: ModuleType) -> tuple:
@@ -159,16 +139,18 @@ def _invoke_gmm(torch: ModuleType, inputs: tuple) -> list:
 
 
 def test_gmm_swiglu_quant_v2_layered_registers_inference_and_meta_kernels(
-    gmm_runtime: ModuleType,
+    ascend_ops_runtime: ModuleType,
 ) -> None:
     for dispatch_key in ("PrivateUse1", "AutogradPrivateUse1", "Meta"):
-        assert gmm_runtime._C._dispatch_has_kernel_for_dispatch_key(
+        assert ascend_ops_runtime._C._dispatch_has_kernel_for_dispatch_key(
             _OP_NAME, dispatch_key
         )
 
 
-def test_gmm_swiglu_quant_v2_layered_meta_contract(gmm_runtime: ModuleType) -> None:
-    torch = gmm_runtime
+def test_gmm_swiglu_quant_v2_layered_meta_contract(
+    ascend_ops_runtime: ModuleType,
+) -> None:
+    torch = ascend_ops_runtime
     outputs = _invoke_gmm(torch, _build_pertoken_inputs(torch))
 
     assert len(outputs) == 2
@@ -187,9 +169,9 @@ def test_gmm_swiglu_quant_v2_layered_meta_contract(gmm_runtime: ModuleType) -> N
 
 @pytest.mark.parametrize("swiglu_limit", [0.0, 10.0])
 def test_gmm_swiglu_quant_v2_layered_meta_accepts_activation_limit(
-    gmm_runtime: ModuleType, swiglu_limit: float
+    ascend_ops_runtime: ModuleType, swiglu_limit: float
 ) -> None:
-    torch = gmm_runtime
+    torch = ascend_ops_runtime
     inputs = list(_build_pertoken_inputs(torch))
     inputs[1] = [torch.empty((_E, _K, _N // 8), dtype=torch.int32, device="meta")]
     outputs = torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered(
@@ -202,9 +184,9 @@ def test_gmm_swiglu_quant_v2_layered_meta_accepts_activation_limit(
 
 
 def test_gmm_swiglu_quant_v2_layered_rejects_positive_a8w8_limit(
-    gmm_runtime: ModuleType,
+    ascend_ops_runtime: ModuleType,
 ) -> None:
-    torch = gmm_runtime
+    torch = ascend_ops_runtime
     with pytest.raises(RuntimeError, match="A8W4/A4W4"):
         torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered(
             *_build_pertoken_inputs(torch), swiglu_limit=10.0
@@ -213,9 +195,9 @@ def test_gmm_swiglu_quant_v2_layered_rejects_positive_a8w8_limit(
 
 @pytest.mark.parametrize("swiglu_limit", [-1.0, float("nan"), float("inf"), 1e40])
 def test_gmm_swiglu_quant_v2_layered_meta_rejects_invalid_activation_limit(
-    gmm_runtime: ModuleType, swiglu_limit: float
+    ascend_ops_runtime: ModuleType, swiglu_limit: float
 ) -> None:
-    torch = gmm_runtime
+    torch = ascend_ops_runtime
     with pytest.raises(RuntimeError, match="swiglu_limit"):
         torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered(
             *_build_pertoken_inputs(torch), swiglu_limit=swiglu_limit
@@ -223,7 +205,7 @@ def test_gmm_swiglu_quant_v2_layered_meta_rejects_invalid_activation_limit(
 
 
 def test_gmm_swiglu_quant_v2_layered_rejects_bad_layer_index(
-    gmm_runtime: ModuleType,
+    ascend_ops_runtime: ModuleType,
 ) -> None:
     """layer_index is a single int64 element, not an int32 or a vector.
 
@@ -233,7 +215,7 @@ def test_gmm_swiglu_quant_v2_layered_rejects_bad_layer_index(
     caller's logical shape. On the device path that happens in the op_api
     (``CheckLayerIndex``); here it is the binding's ``check_lists``.
     """
-    torch = gmm_runtime
+    torch = ascend_ops_runtime
     for bad in (
         torch.zeros((2,), dtype=torch.int64, device="meta"),  # not one element
         torch.zeros((1,), dtype=torch.int32, device="meta"),  # wrong dtype
@@ -245,10 +227,10 @@ def test_gmm_swiglu_quant_v2_layered_rejects_bad_layer_index(
 
 
 def test_gmm_swiglu_quant_v2_layered_rejects_mismatched_list_lengths(
-    gmm_runtime: ModuleType,
+    ascend_ops_runtime: ModuleType,
 ) -> None:
     """all_weight and all_weight_scale must agree on the layer count."""
-    torch = gmm_runtime
+    torch = ascend_ops_runtime
     x, weight, weight_scale, assist, x_scale, group_list, layer_index = (
         _build_pertoken_inputs(torch)
     )
@@ -269,10 +251,10 @@ def test_gmm_swiglu_quant_v2_layered_rejects_mismatched_list_lengths(
 
 
 def test_gmm_swiglu_quant_v2_layered_rejects_mismatched_assist_length(
-    gmm_runtime: ModuleType,
+    ascend_ops_runtime: ModuleType,
 ) -> None:
     """An assist list is either absent (empty) or one element per layer."""
-    torch = gmm_runtime
+    torch = ascend_ops_runtime
     x, weight, weight_scale, _assist, x_scale, group_list, layer_index = (
         _build_pertoken_inputs(torch)
     )
@@ -293,14 +275,14 @@ def test_gmm_swiglu_quant_v2_layered_rejects_mismatched_assist_length(
 
 
 def test_gmm_swiglu_quant_v2_layered_meta_multi_layer_lists(
-    gmm_runtime: ModuleType,
+    ascend_ops_runtime: ModuleType,
 ) -> None:
     """A multi-layer call must succeed on the Meta path too.
 
     The all_* lengths are the layer count, not the expert count, so a two-element
     list is the two-layer shape and the output geometry must not change with it.
     """
-    torch = gmm_runtime
+    torch = ascend_ops_runtime
     x, weight, weight_scale, assist, x_scale, group_list, layer_index = (
         _build_pertoken_inputs(torch)
     )
@@ -320,7 +302,7 @@ def test_gmm_swiglu_quant_v2_layered_meta_multi_layer_lists(
 
 
 def test_gmm_swiglu_quant_v2_layered_a4w4_empty_assist_matrix_runtime(
-    gmm_runtime: ModuleType,
+    ascend_ops_runtime: ModuleType,
 ) -> None:
     """A4W4 must accept an empty assist list on the real CANN device path.
 
@@ -336,7 +318,7 @@ def test_gmm_swiglu_quant_v2_layered_a4w4_empty_assist_matrix_runtime(
             "installed to run the A4W4 device invocation",
         )
 
-    torch = gmm_runtime
+    torch = ascend_ops_runtime
     torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
 
     outputs = _invoke_gmm(torch, _build_a4w4_inputs(torch))

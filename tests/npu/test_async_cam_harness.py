@@ -29,7 +29,7 @@ from tests.npu.async_cam_common import (
     window_requirements,
 )
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 class AsyncCamPlannerTests(unittest.TestCase):

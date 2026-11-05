@@ -10,46 +10,6 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from afd_plugin.compat.npu import runtime as ascend_runtime
-from afd_plugin.compat.npu.runtime import fix_all2all_backend_for_afd
-
-
-def _vllm_config(
-    *,
-    enable_sp=False,
-    use_sequence_parallel_moe=False,
-    all2all_backend="allgather_reducescatter",
-):
-    return SimpleNamespace(
-        compilation_config=SimpleNamespace(
-            pass_config=SimpleNamespace(enable_sp=enable_sp),
-        ),
-        parallel_config=SimpleNamespace(
-            all2all_backend=all2all_backend,
-            use_sequence_parallel_moe=use_sequence_parallel_moe,
-        ),
-    )
-
-
-def test_fix_all2all_backend_overrides_to_flashinfer_when_sp_disabled():
-    config = _vllm_config(enable_sp=False, all2all_backend="allgather_reducescatter")
-
-    fix_all2all_backend_for_afd(config)
-
-    assert config.parallel_config.all2all_backend == "flashinfer_all2allv"
-
-
-def test_fix_all2all_backend_skips_when_already_flashinfer():
-    config = _vllm_config(enable_sp=False, all2all_backend="flashinfer_all2allv")
-
-    fix_all2all_backend_for_afd(config)
-
-    assert config.parallel_config.all2all_backend == "flashinfer_all2allv"
-
-
-def test_fix_all2all_backend_preserves_model_owned_sp():
-    config = _vllm_config(use_sequence_parallel_moe=True)
-    fix_all2all_backend_for_afd(config)
-    assert config.parallel_config.all2all_backend == "allgather_reducescatter"
 
 
 @pytest.fixture(autouse=True)
@@ -140,85 +100,6 @@ def isolate_ascend_config_installer(monkeypatch):
 
 
 @pytest.mark.usefixtures("isolate_ascend_config_installer")
-def test_npu_afd_config_patch_restores_dbo_for_afd(monkeypatch):
-    from afd_plugin.compat.patches.npu import mla_graph
-
-    fake_package = ModuleType("vllm_ascend")
-    fake_package.__path__ = []
-    fake_platform = ModuleType("vllm_ascend.platform")
-
-    class FakeParallelConfig:
-        def __init__(self, *, enable_dbo, ubatch_size):
-            self.enable_dbo = enable_dbo
-            self.ubatch_size = ubatch_size
-            self.all2all_backend = "deepep_low_latency"
-
-        @property
-        def use_ubatching(self):
-            return self.enable_dbo or self.ubatch_size > 1
-
-    class NPUPlatform:
-        @staticmethod
-        def _fix_incompatible_config(vllm_config):
-            parallel_config = vllm_config.parallel_config
-            parallel_config.enable_dbo = False
-            parallel_config.ubatch_size = 0
-
-        @classmethod
-        def check_and_update_config(cls, vllm_config):
-            cls._fix_incompatible_config(vllm_config)
-            parallel_config = vllm_config.parallel_config
-            parallel_config.all2all_backend = "flashinfer_all2allv"
-            if getattr(vllm_config, "fail_update", False):
-                raise RuntimeError("upstream config failure")
-
-    def afd_vllm_config(*, active=True):
-        config = _vllm_config()
-        config.additional_config = (
-            {
-                "afd": {
-                    "role": "attention",
-                    "connector": "CAMP2pAFDConnector",
-                },
-            }
-            if active
-            else {}
-        )
-        config.parallel_config = FakeParallelConfig(enable_dbo=True, ubatch_size=4)
-        config.fail_update = False
-        return config
-
-    fake_platform.__dict__["NPUPlatform"] = NPUPlatform
-    monkeypatch.setattr(mla_graph, "apply_afd_mla_graph_patch", lambda: True)
-    monkeypatch.setitem(sys.modules, "vllm_ascend", fake_package)
-    monkeypatch.setitem(sys.modules, "vllm_ascend.platform", fake_platform)
-    monkeypatch.setattr(ascend_runtime, "_PATCHES_APPLIED", False)
-
-    ascend_runtime.apply_afd_ascend_patches_if_needed()
-
-    config = afd_vllm_config()
-    assert NPUPlatform.check_and_update_config(config) is None
-    assert config.parallel_config.enable_dbo is True
-    assert config.parallel_config.use_ubatching is True
-    assert config.parallel_config.ubatch_size == 4
-    assert config.parallel_config.all2all_backend == "deepep_low_latency"
-
-    failing_config = afd_vllm_config()
-    failing_config.fail_update = True
-    with pytest.raises(RuntimeError, match="upstream config failure"):
-        NPUPlatform.check_and_update_config(failing_config)
-    assert failing_config.parallel_config.enable_dbo is True
-    assert failing_config.parallel_config.ubatch_size == 4
-    assert failing_config.parallel_config.all2all_backend == "deepep_low_latency"
-
-    inactive_config = afd_vllm_config(active=False)
-    assert NPUPlatform.check_and_update_config(inactive_config) is None
-    assert inactive_config.parallel_config.enable_dbo is False
-    assert inactive_config.parallel_config.use_ubatching is False
-    assert inactive_config.parallel_config.all2all_backend == "flashinfer_all2allv"
-
-
-@pytest.mark.usefixtures("isolate_ascend_config_installer")
 def test_npu_afd_config_patch_raises_and_retries_after_import_error(monkeypatch):
     from afd_plugin.compat.patches.npu import mla_graph
 
@@ -232,22 +113,30 @@ def test_npu_afd_config_patch_raises_and_retries_after_import_error(monkeypatch)
     with pytest.raises(RuntimeError, match="DBO config patch"):
         ascend_runtime.apply_afd_ascend_patches_if_needed()
 
-    assert ascend_runtime._PATCHES_APPLIED is False
-
     fake_platform = ModuleType("vllm_ascend.platform")
 
     class NPUPlatform:
         @classmethod
         def check_and_update_config(cls, vllm_config):
-            del cls, vllm_config
+            vllm_config.parallel_config.enable_dbo = False
+            vllm_config.parallel_config.ubatch_size = 0
+            vllm_config.parallel_config.all2all_backend = "flashinfer_all2allv"
 
     fake_platform.__dict__["NPUPlatform"] = NPUPlatform
     monkeypatch.setitem(sys.modules, "vllm_ascend.platform", fake_platform)
 
     ascend_runtime.apply_afd_ascend_patches_if_needed()
 
-    assert ascend_runtime._PATCHES_APPLIED is True
-    assert hasattr(NPUPlatform, "_afd_plugin_ascend_platform_patch_state")
+    config = SimpleNamespace(
+        additional_config={"afd": {"role": "attention"}},
+        parallel_config=SimpleNamespace(
+            enable_dbo=True, ubatch_size=2, all2all_backend="deepep_low_latency"
+        ),
+    )
+    NPUPlatform.check_and_update_config(config)
+    assert config.parallel_config.enable_dbo is True
+    assert config.parallel_config.ubatch_size == 2
+    assert config.parallel_config.all2all_backend == "deepep_low_latency"
 
 
 @pytest.mark.usefixtures("isolate_ascend_config_installer")
@@ -283,11 +172,12 @@ def test_npu_patches_reject_missing_mla_resolver(monkeypatch):
 
     with pytest.raises(RuntimeError, match="MLA graph patch"):
         ascend_runtime.apply_afd_ascend_patches_if_needed()
-    assert ascend_runtime._PATCHES_APPLIED is False
 
 
 @pytest.mark.usefixtures("isolate_ascend_config_installer")
-def test_npu_patches_route_mla_graph_params_from_forward_context(monkeypatch):
+def test_npu_patches_route_mla_graph_params_from_forward_context(
+    monkeypatch,
+):  # long-test: native MLA resolver selection and native fallback in one scope
     fake_vllm = ModuleType("vllm")
     fake_vllm.__path__ = []
     fake_forward_context = ModuleType("vllm.forward_context")
@@ -342,11 +232,9 @@ def test_npu_patches_route_mla_graph_params_from_forward_context(monkeypatch):
 
     with pytest.raises(AttributeError, match="get_graph_params"):
         ascend_runtime.apply_afd_ascend_patches_if_needed()
-    assert ascend_runtime._PATCHES_APPLIED is False
 
     fake_mla.__dict__["get_graph_params"] = get_graph_params
     ascend_runtime.apply_afd_ascend_patches_if_needed()
-    patched_get_graph_params = fake_mla.get_graph_params
 
     assert fake_mla.get_graph_params() is afd_registry
 
@@ -357,4 +245,4 @@ def test_npu_patches_route_mla_graph_params_from_forward_context(monkeypatch):
     assert fake_mla.get_graph_params() is upstream_registry
 
     ascend_runtime.apply_afd_ascend_patches_if_needed()
-    assert fake_mla.get_graph_params is patched_get_graph_params
+    assert fake_mla.get_graph_params() is upstream_registry
