@@ -55,15 +55,6 @@ ASYNC_AFD_CONNECTOR = "CAMAsyncAFDConnector"
 NPU_EAGER_DBO_SCENARIO = "afd-eager-dbo-2a2f"
 NPU_EAGER_DBO_DECODE_THRESHOLD = 32
 NPU_EAGER_DBO_PREFILL_THRESHOLD = 512
-ASYNC_CAM_SCENARIO = "afd-eager-async-cam"
-ASYNC_CAM_ATTENTION_RANKS = 2
-ASYNC_CAM_FFN_RANKS = 2
-ASYNC_CAM_ATTENTION_TP_SIZE = 2
-ASYNC_UBATCH_SCENARIO = "afd-async-ubatch"
-ASYNC_UBATCH_ATTENTION_RANKS = 2
-ASYNC_UBATCH_FFN_RANKS = 1
-ASYNC_UBATCH_ATTENTION_TP_SIZE = 2
-ASYNC_UBATCH_BATCH_SIZE = 2
 # Graph capture default for the scenarios that do not carry their own launch
 # profile; the DSV4 synchronous profiles override it.
 DEFAULT_CUDAGRAPH_CAPTURE_SIZE = 8
@@ -123,37 +114,12 @@ FULL_GSM8K_TIMEOUT_S = 8 * 60 * 60
 GSM8K_LIMIT_ENV = "AFD_GSM8K_LIMIT"
 GSM8K_THRESHOLD_ENV = "AFD_GSM8K_THRESHOLD"
 DEFAULT_GSM8K_THRESHOLD = 0.27
-COMPLETION_REQUEST_TIMEOUT_S = 120
-COMPLETION_MAX_TOKENS = 32
-COMPLETION_TEMPERATURE = 0
 DBO_EVAL_NUM_CONCURRENT = 12
 DBO_EVAL_MIN_SAMPLES = 2 * DBO_EVAL_NUM_CONCURRENT
 DBO_EVAL_NUM_UBATCHES = 2
 MRV2_EVIDENCE_RPC_TIMEOUT_S = 30
 MRV2_EVIDENCE_REPLAY_MIN_COUNT = 2
 MRV2_EVIDENCE_PREFIX = "AFD E2E execution: "
-ACCOUNTING_PROMPT = (
-    "<|im_start|>system\n"
-    "You are a professional accountant. Answer questions using accounting "
-    "knowledge, output only the option letter (A/B/C/D).<|im_end|>\n"
-    "<|im_start|>user\n"
-    "Question: A company's balance sheet as of December 31, 2023 shows:\n"
-    "  Current assets: Cash and equivalents 5 million yuan, Accounts "
-    "receivable 8 million yuan, Inventory 6 million yuan\n"
-    "  Non-current assets: Net fixed assets 12 million yuan\n"
-    "  Current liabilities: Short-term loans 4 million yuan, Accounts "
-    "payable 3 million yuan\n"
-    "  Non-current liabilities: Long-term loans 9 million yuan\n"
-    "  Owner's equity: Paid-in capital 10 million yuan, Retained earnings ?\n"
-    "Requirement: Calculate the company's Asset-Liability Ratio and Current "
-    "Ratio (round to two decimal places).\n"
-    "Options:\n"
-    "A. Asset-Liability Ratio=58.33%, Current Ratio=1.90\n"
-    "B. Asset-Liability Ratio=62.50%, Current Ratio=2.17\n"
-    "C. Asset-Liability Ratio=65.22%, Current Ratio=1.75\n"
-    "D. Asset-Liability Ratio=68.00%, Current Ratio=2.50<|im_end|>\n"
-    "<|im_start|>assistant\n"
-)
 
 
 def main() -> int:
@@ -347,8 +313,6 @@ def add_scenario_arguments(parser: argparse.ArgumentParser) -> None:
             NPU_EAGER_DBO_SCENARIO,
             "afd-graph-2a2f",
             "afd-graph-dbo-2a2f",
-            ASYNC_CAM_SCENARIO,
-            ASYNC_UBATCH_SCENARIO,
             *DSV4_SCENARIOS,
             *DSV4_GPU_SCENARIOS,
             *V2_SCENARIOS,
@@ -446,8 +410,6 @@ def add_scenario_arguments(parser: argparse.ArgumentParser) -> None:
 
 def configure_scenario(args: argparse.Namespace) -> None:
     """Set topology and features for the selected fixed scenario."""
-    is_async_cam = args.scenario == ASYNC_CAM_SCENARIO
-    is_async_ubatch = args.scenario == ASYNC_UBATCH_SCENARIO
     is_dsv4 = args.scenario in DSV4_SCENARIOS
     is_dsv4_gpu = args.scenario in DSV4_GPU_SCENARIOS
     scenario_settings = {
@@ -459,20 +421,6 @@ def configure_scenario(args: argparse.Namespace) -> None:
         NPU_EAGER_DBO_SCENARIO: (False, False, True, 2, 2),
         "afd-graph-2a2f": (False, True, False, 2, 2),
         "afd-graph-dbo-2a2f": (False, True, True, 2, 2),
-        ASYNC_CAM_SCENARIO: (
-            False,
-            False,
-            False,
-            ASYNC_CAM_ATTENTION_RANKS,
-            ASYNC_CAM_FFN_RANKS,
-        ),
-        ASYNC_UBATCH_SCENARIO: (
-            False,
-            False,
-            False,
-            ASYNC_UBATCH_ATTENTION_RANKS,
-            ASYNC_UBATCH_FFN_RANKS,
-        ),
         DSV4_ASYNC_CAM_SCENARIO: (
             False,
             False,
@@ -524,10 +472,6 @@ def configure_scenario(args: argparse.Namespace) -> None:
         args.attention_tp_size = DSV4_ATTENTION_TP_SIZE
     elif active_sync_profile is not None:
         args.attention_tp_size = active_sync_profile.attention_tp_size
-    elif is_async_cam:
-        args.attention_tp_size = ASYNC_CAM_ATTENTION_TP_SIZE
-    elif is_async_ubatch:
-        args.attention_tp_size = ASYNC_UBATCH_ATTENTION_TP_SIZE
     elif args.scenario in V2_TENSOR_PARALLEL_SCENARIOS:
         args.attention_tp_size = 2
     elif args.scenario in DEEPEP_M2N_ATTENTION_TP_SCENARIOS:
@@ -543,42 +487,8 @@ def configure_scenario(args: argparse.Namespace) -> None:
         args.ffn_tp_size = active_sync_profile.ffn_tp_size
     else:
         args.ffn_tp_size = 1
-    if not is_async_cam and not is_dsv4 and args.gsm8k_output_path is None:
+    if not is_dsv4 and args.gsm8k_output_path is None:
         raise ValueError("--gsm8k-output-path is required for GSM8K scenarios")
-    if is_async_cam:
-        args.afd_connector = ASYNC_AFD_CONNECTOR
-        args.afd_async = True
-        args.compute_gate_on_attention = True
-        extra_config = parse_afd_connector_extra_config(
-            args.afd_connector_extra_config,
-        )
-        extra_config["attn_ranks_per_dp"] = ASYNC_CAM_ATTENTION_TP_SIZE
-        args.afd_connector_extra_config = [
-            json.dumps(extra_config, separators=(",", ":")),
-        ]
-    if is_async_ubatch:
-        args.afd_connector = ASYNC_AFD_CONNECTOR
-        args.afd_async = True
-        args.compute_gate_on_attention = True
-        extra_config = parse_afd_connector_extra_config(
-            args.afd_connector_extra_config,
-        )
-        # This fixed scenario must exercise the TP/SP token-split path. Replace
-        # conflicting caller values instead of silently changing its contract.
-        extra_config["attn_ranks_per_dp"] = ASYNC_UBATCH_ATTENTION_TP_SIZE
-        args.attention_vllm_arg.append("--enable-dbo")
-        args.afd_connector_extra_config = [
-            json.dumps(extra_config, separators=(",", ":")),
-        ]
-        # CAM dispatch allocates its HCCL communication pool (~8.6 GB) outside
-        # the torch memory pool; the default 0.92 GPU memory utilization leaves
-        # too little room and fails with EL0004. 0.8 leaves enough headroom.
-        if not any(
-            arg == "--gpu-memory-utilization"
-            or arg.startswith("--gpu-memory-utilization=")
-            for arg in args.common_vllm_arg
-        ):
-            args.common_vllm_arg.extend(["--gpu-memory-utilization", "0.8"])
     if args.scenario in DEEPEP_M2N_SCENARIOS:
         args.afd_connector = DEEPEP_M2N_CONNECTOR
         args.compute_gate_on_attention = True
@@ -651,11 +561,6 @@ def validate_topology(
         raise ValueError("Lite eager DBO scenario requires NPU")
     if args.scenario in DEEPEP_M2N_SCENARIOS and args.device_backend != "gpu":
         raise ValueError("DeepEP M2N E2E scenarios require GPU")
-    if (
-        args.scenario in (ASYNC_CAM_SCENARIO, ASYNC_UBATCH_SCENARIO)
-        and args.device_backend != "npu"
-    ):
-        raise ValueError("async CAM scenarios require NPU")
     if args.scenario in DSV4_SCENARIOS and args.device_backend != "npu":
         raise ValueError("DSV4 scenarios require NPU")
     if args.scenario in DSV4_GPU_SCENARIOS and args.device_backend != "gpu":
@@ -955,11 +860,7 @@ def uses_async_connector(args: argparse.Namespace) -> bool:
 
 def uses_npu_async_process_cleanup(args: argparse.Namespace) -> bool:
     """Return whether E2E teardown must find and kill every FFN process."""
-    return args.device_backend == "npu" and args.scenario in (
-        ASYNC_CAM_SCENARIO,
-        ASYNC_UBATCH_SCENARIO,
-        DSV4_ASYNC_CAM_SCENARIO,
-    )
+    return args.device_backend == "npu" and args.scenario == DSV4_ASYNC_CAM_SCENARIO
 
 
 def process_termination_timeout(args: argparse.Namespace) -> float:
@@ -971,9 +872,7 @@ def process_termination_timeout(args: argparse.Namespace) -> float:
 
 def run_scenario_evaluation(args: argparse.Namespace) -> None:
     """Run the scenario's acceptance check, shared by every runner."""
-    if args.scenario == ASYNC_CAM_SCENARIO:
-        run_completion_evaluation(args)
-    elif args.scenario in DSV4_SCENARIOS:
+    if args.scenario in DSV4_SCENARIOS:
         run_concurrent_completion_evaluation(args)
     else:
         run_gsm8k_evaluation(args)
@@ -1026,11 +925,7 @@ def run_gsm8k_evaluation(args: argparse.Namespace) -> None:
     full_run_options = (
         {"timeout_s": FULL_GSM8K_TIMEOUT_S} if sample_limit is None else {}
     )
-    scenario_options = (
-        {"batch_size": ASYNC_UBATCH_BATCH_SIZE}
-        if args.scenario == ASYNC_UBATCH_SCENARIO
-        else {}
-    )
+    scenario_options = {}
     if args.enable_dbo or is_v2_dbo_comparison:
         scenario_options["num_concurrent"] = DBO_EVAL_NUM_CONCURRENT
     role = "baseline" if args.baseline else "attention"
@@ -1061,10 +956,7 @@ def run_gsm8k_evaluation(args: argparse.Namespace) -> None:
 
 
 def uses_dbo_execution(args: argparse.Namespace) -> bool:
-    # The Lite Async case deliberately supplies enough work for native DBO.
-    # DSV4 keeps native DBO thresholds: its ten short requests can
-    # legitimately remain unsplit, so that case retains its original oracle.
-    return args.enable_dbo or args.scenario == ASYNC_UBATCH_SCENARIO
+    return args.enable_dbo
 
 
 def execution_evidence_roles(args: argparse.Namespace) -> tuple[str, ...]:
@@ -1358,46 +1250,6 @@ def assert_hash_input_freshness(
             f"bucket and real token count: {sorted(missing)}"
         )
     print("[hash-inputs] both concurrent windows show fresh IDs at the same bucket")
-
-
-def run_completion_evaluation(args: argparse.Namespace) -> None:
-    """Send the async CAM smoke request and require one returned choice."""
-    payload = json.dumps(
-        {
-            "model": served_model_name(args, "attention"),
-            "prompt": ACCOUNTING_PROMPT,
-            "max_tokens": COMPLETION_MAX_TOKENS,
-            "temperature": COMPLETION_TEMPERATURE,
-        },
-    ).encode()
-    request = urllib.request.Request(
-        f"http://{args.api_host}:{attention_api_port(args)}/v1/completions",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=COMPLETION_REQUEST_TIMEOUT_S,
-        ) as response:
-            result = json.loads(response.read())
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode(errors="replace")
-        raise RuntimeError(
-            f"completion request failed with HTTP {exc.code}: {body}",
-        ) from exc
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"completion request failed: {exc}") from exc
-
-    choices = result.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise RuntimeError("completion response contains no choices")
-    choice = choices[0]
-    text = choice.get("text") if isinstance(choice, dict) else None
-    if not isinstance(text, str) or not text.strip():
-        raise RuntimeError("completion response contains no text")
-    print(f"Completion response: {text}")
 
 
 def run_concurrent_completion_evaluation(

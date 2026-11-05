@@ -38,7 +38,7 @@ validation_paths:
   - "tests/npu/test_mrv2_dbo.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v4_flash/test_gpu.py"
-  - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
 upstream_refs:
   - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
@@ -369,14 +369,15 @@ does not expand the supported runtime contract.
 | CUDA V2 + `DeepEPM2NAFDConnector` | Eager or `FULL_DECODE_ONLY` native V2 CUDA Graph; SM90 or newer | Exactly two native microbatches, enabled on both roles; Attention DP1 or DP > 1, TP1 or TP2 | Qwen3 MoE only (all layers MoE, no shared expert); `compute_gate_on_attention=true`; FFN TP1 with EP over all FFN ranks, linear placement, `allgather_reducescatter` all2all and the Triton MoE weight layout; BF16 or block-128 FP8 payload; EPLB, PP/CP and SP MoE rejected | Historical vLLM 0.30 Qwen3-30B-A3B 2A2F GSM8K E2E for eager, graph, graph + DBO, and Attention TP2 eager/graph on H100 and H200, and for eager, graph and graph + DBO on GB200; two-node 2A2F eager, graph and graph + DBO with Attention and FFN on separate nodes; [GPU connector device tests](../../../tests/gpu/README.md) |
 | Historical Ascend V1 (removed) + `CAMP2pAFDConnector` | Eager or current ACL Graph path | Native DBO, exactly two ubatches | Common and connector-local `compute_gate_on_attention=false`; `connector_extra_config.quant_mode=0`; plugin CANN ops required | V2-Lite 2A2F graph 300-question comparison, 2A1F/2A2F functional checks, and Legacy DBO regressions; runtime, graph, ops, connector, and profiler unit tests |
 | Ascend V2 + `CAMP2pAFDConnector` | Eager, `FULL`, or `FULL_DECODE_ONLY` native V2 ACL Graph | Eager or graph native DBO with two ubatches and Attention DP > 1; plain MLA graph DBO requires `FULL_DECODE_ONLY` | `compute_gate_on_attention=false`; PP/CP, elastic EP and EPLB rejected; model-specific SP policy; role ranks equal DP x TP | Historical 0.30 V2-Lite 2A2F FULL 300-question comparison and 2A1F functional checks; current 0.32 Lite evidence is in the [validation record](https://github.com/vllm-project/afd-plugin/pull/507) |
-| Ascend V2 + `CAMAsyncAFDConnector` | Eager Attention; independent FFN eager or narrow W4A8/W8A8 FULL | Two native DBO microbatches on Attention, including DP1 and with FFN FULL; FFN stays outside the native DBO schedule; legacy split selector is ignored | Experimental async path; `async=true`; documented path uses common `compute_gate_on_attention=true`; prefill and decode context parallelism are unsupported; `connector_extra_config.dynamicQuant` is 0 or 1; plugin-owned async CAM ops required | Historical 0.30 V2-Lite and DSV4 layered comparisons retain their original scope; current Lite and DSV4 fixture results are in the [validation record](https://github.com/vllm-project/afd-plugin/pull/507) |
+| Ascend V2 + `CAMAsyncAFDConnector` | Eager Attention; layered FFN eager or FULL | Two native DBO microbatches on Attention, including DP1 and with FFN FULL; FFN stays outside the native DBO schedule | Experimental DeepSeek-V4 W4A8/W8A8 on A3/910C; `async=true`, `compute_gate_on_attention=true`, and `dynamicQuant=1`; PP/CP unsupported; plugin-owned async CAM ops required | Historical DSV4 layered comparisons and limitations are in the [validation record](https://github.com/vllm-project/afd-plugin/pull/507); they predate removal of the legacy path |
 
 The 300-question Ascend evidence in this table is historical. The 0.32
 [validation record](https://github.com/vllm-project/afd-plugin/pull/507) separately lists the
 eight Lite 100-question cells, W4A8 fixture, and observed shutdown failures.
 
-The Async CAM row also supports an MRV2 Attention runner for DeepSeek-V2/V3
-MLA and DeepSeek-V4, with static EP, PP=PCP=DCP=1, and Attention-local SP.
+The Async CAM row supports DeepSeek-V4 with static EP, PP=PCP=DCP=1,
+and Attention-local SP. DeepSeek-V2/V2-Lite are no longer supported by
+Async CAM; standard DeepSeek-V3.2 was already rejected by model admission.
 Finegrained TP, explicit shared-expert DP configuration, and native
 MTP and draft-model paths other than DeepSeek-V4 DSpark are excluded. DSpark
 keeps Attention/native proposal eager and permits independent layered FFN FULL;

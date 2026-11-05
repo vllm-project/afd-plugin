@@ -23,7 +23,7 @@ The experimental two-stream option below uses the same Attention DBO contract.
 The [0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507) identifies the tested
 W4A8 eager/FULL fixture and its limits, including graceful-exit failures.
 
-On F, set `AFD_ASYNC_CAM_LAYERED_GMM=1`, omit `--enforce-eager`, and pass
+On F, omit `--enforce-eager` and pass
 `--compilation-config '{"cudagraph_mode":"FULL"}'`. To select eager explicitly,
 use `--enforce-eager`. Unsupported FULL configurations and mismatched transport
 parameters fail startup; there is no automatic eager fallback. Piecewise and
@@ -172,8 +172,10 @@ metadata only.
 ## Validation
 
 Use the pinned stack and native artifacts built from the same baseline sources.
-The real-model fixture targets DeepSeek-V4 Flash per-channel W4A8 on A3/910C,
-4A/4F, A TP4, F TP1, receive capacity 128 and DBO disabled. Synthetic per-group
+The real-model fixture defaults to DeepSeek-V4 Flash per-channel W4A8 on
+A3/910C, 4A/4F, A TP4, F TP1, receive capacity 128 and DBO disabled. Select
+4A/8F with `--ffn-ranks 8` and twelve device IDs for a larger W8A8 checkpoint;
+this topology still needs target-device validation. Synthetic per-group
 coverage does not qualify loading real per-group checkpoints.
 
 - Host contracts: `tests/unit/connectors/test_async_cam_startup.py`,

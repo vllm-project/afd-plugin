@@ -33,7 +33,6 @@ from afd_plugin.config import (
 )
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
-    AFDF2ATransferPayload,
     AFDForwardContextMetadata,
     AFDTransferContext,
     AFDTransferMetadata,
@@ -863,45 +862,16 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
     def compute_ffn_output(
         self,
         hidden_states: torch.Tensor,
-        *,
-        group_list: torch.Tensor | None = None,
-        dynamic_scales: torch.Tensor | None = None,
-        expand_x_shared: torch.Tensor | None = None,
-        dynamic_scales_shared: torch.Tensor | None = None,
-        topk_scales: torch.Tensor | None = None,
-        group_list_type: int = 1,
         **kwargs: Any,
-    ) -> torch.Tensor | AFDF2ATransferPayload:
+    ) -> torch.Tensor:
         if self.compute_gate_on_attention and not self.is_moe_layer:
             raise RuntimeError(
                 "Dense DeepSeek layers are computed on the Attention side "
                 "when compute_gate_on_attention=true",
             )
-        if (
-            self.compute_gate_on_attention
-            and native.current_platform.device_type == "npu"
-        ):
-            if group_list is None:
-                raise RuntimeError(
-                    "compute_gate_on_attention FFN MoE compute requires group_list",
-                )
-            # NPU-only: gated MoE FFN compute consumes Attention-side topk payloads.
-            from afd_plugin.model_executor.models.npu import (
-                deepseek_v2_attention_gate,
-            )
-
-            output = deepseek_v2_attention_gate.compute_attention_gate_moe_ffn(
-                self,
-                hidden_states=hidden_states,
-                group_list=group_list,
-                dynamic_scales=dynamic_scales,
-                expand_x_shared=expand_x_shared,
-                dynamic_scales_shared=dynamic_scales_shared,
-                topk_scales=topk_scales,
-                group_list_type=group_list_type,
-            )
-            return output
         if self.compute_gate_on_attention:
+            if native.current_platform.device_type == "npu":
+                raise RuntimeError("Async CAM FFN requires the layered executor")
             raise RuntimeError(
                 "GPU Attention-side gate must call compute_experts_output",
             )
@@ -1081,7 +1051,7 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         hidden_states: torch.Tensor,
         layer_idx: int,
         **kwargs: Any,
-    ) -> torch.Tensor | AFDF2ATransferPayload:
+    ) -> torch.Tensor:
         return self.layers[layer_idx].compute_ffn_output(
             hidden_states,
             **kwargs,
@@ -1155,29 +1125,12 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
         self.afd_role = self.afd_config.role
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
-    # vLLM 5df63a7 model_loader/utils.py invokes this model hook after quant
-    # finalize. AFD's CAM GMM path still needs the scale that native MegaMoE drops.
-    def process_weights_after_loading(self) -> None:
-        # ### PATCH START: retain FFN gate-on-A W8A8 scales after quant finalize
-        if (
-            native.current_platform.device_type != "npu"
-            or self.afd_role != "ffn"
-            or not self.afd_config.compute_gate_on_attention
-        ):
-            return
-        from afd_plugin.model_executor.models.npu.deepseek_v2_attention_gate import (
-            prepare_attention_gate_w8a8_scales,
-        )
-
-        prepare_attention_gate_w8a8_scales(self.model.layers)
-        # ### PATCH END: retain FFN gate-on-A W8A8 scales after quant finalize
-
     def compute_ffn_output(
         self,
         hidden_states: torch.Tensor,
         layer_idx: int,
         **kwargs: Any,
-    ) -> torch.Tensor | AFDF2ATransferPayload:
+    ) -> torch.Tensor:
         return self.model.compute_ffn_output(hidden_states, layer_idx, **kwargs)
 
     def compute_experts_output(

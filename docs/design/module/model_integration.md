@@ -69,7 +69,7 @@ make a backend-specific worker class the shared model API.
 | Ascend Attention-side gate | [`npu/deepseek_v2_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v2_attention_gate.py) | Attention-gate unit cases in [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
 | Ascend CAM dispatch layout | [`npu/async_cam_layout.py`](../../../afd_plugin/model_executor/models/npu/async_cam_layout.py) | [`test_async_cam_layout.py`](../../../tests/unit/model_executor/test_async_cam_layout.py) |
 | DeepSeek Ascend stage metadata ownership | [`npu/deepseek_attention_metadata.py`](../../../afd_plugin/model_executor/models/npu/deepseek_attention_metadata.py) | [`test_deepseek_attention_metadata.py`](../../../tests/unit/model_executor/test_deepseek_attention_metadata.py) |
-| Ascend CAM orchestration | [`npu/deepseek_v2_async_cam_forward.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v2_async_cam_forward.py) | Async/ubatch unit cases and [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py) |
+| Ascend CAM orchestration | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py) | [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py) |
 
 ## Model registration
 
@@ -175,14 +175,13 @@ eager. F may use the existing FULL transaction graph with one homogeneous W4A8 o
 table covering target and draft; selection remains on device. DSpark excludes
 DBO and FFN two-stream.
 
-Shared-expert layout is model-specific. DeepSeek-V2/V3 Async CAM forces
-replicated shared weights when effective model SP is enabled. DeepSeek-V4
-instead uses `AFDDeepseekV4SharedExperts` to preserve the native policy:
+Shared-expert layout is model-specific. DeepSeek-V4 uses
+`AFDDeepseekV4SharedExperts` to preserve the native policy:
 TP-sharded weights need all-gather/reduce-scatter around SP computation, or
 all-reduce without SP; replicated shared weights compute local SP tokens,
 or split/gather replicated input tokens without SP. The W8A8 fused arithmetic
 adapter preserves the shared MLP's clamp and activation parameters. This is
-separate from the optional routed layered executor: W4A8 applies the model's
+separate from the routed layered executor: W4A8 applies the model's
 `swiglu_limit`, while W8A8 retains its unclipped computation.
 
 The synchronous DSV4 E2E profiles check concurrent serving but disable answer
@@ -190,7 +189,7 @@ checking; the A5 profile records incorrect concurrent answers. Async DSV4 has
 an exact-answer smoke case; V4 true native DBO still requires model accuracy
 qualification. Lite two-stage DBO has the limited result recorded in the
 [0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507). See
-[E2E testing](e2e_testing.md) and the [layered guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-and-w8a8-layered-gmm-experimental-disabled-by-default).
+[E2E testing](e2e_testing.md) and the [layered guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-and-w8a8-layered-gmm).
 
 ### Qwen3 MoE CUDA boundary
 

@@ -41,16 +41,11 @@ export LD_LIBRARY_PATH="${AFD_VENDOR}/op_api/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY
 
 核对 FFN 与 Attention 的 `/proc/<pid>/environ` 或等效启动证据，确认路径在进程创建时已生效；不要通过运行后的交互 shell 环境推断服务进程环境。该路径属于插件编译产物，不需要另装 CAM 库。
 
-## layered GMM 开关只属于 FFN
+## layered GMM 执行确认
 
-`AFD_ASYNC_CAM_LAYERED_GMM=1` 只支持 DeepSeek V4 的 async CAM FFN 角色；传给 Attention 会在特性校验时报错。要比较关闭与开启 layered GMM 的部署：关闭侧在两个角色中都不设置该变量；开启侧分别调用角色脚本，只给 FFN 设置，Attention 显式取消继承：
-
-```bash
-AFD_ASYNC_CAM_LAYERED_GMM=1 bash "${DSV4_SCRIPT_DIR}/run_prefill_ffn.sh"
-env -u AFD_ASYNC_CAM_LAYERED_GMM bash "${DSV4_SCRIPT_DIR}/run_prefill_attention.sh"
-```
-
-0.30 入口已作角色隔离：`run_prefill.sh` 可以接收该开关，Attention 子进程会显式设为 0，FFN 按请求选择路径。检查 FFN 日志中的 `AFD_ASYNC_CAM_LAYERED_GMM requested=... actual=layered/legacy`；只有环境变量或算子注册结果不足以证明实际执行了目标路径。路径日志缺失时标为尚未确认，检查实际 FFN worker 日志后再解释性能结果。
+Async CAM 的 FFN 只使用 layered GMM，无需设置选择开关。检查 FFN worker 日志中的
+`Async CAM layered GMM`，确认量化类型和层数；算子注册成功本身不足以证明服务
+完成了实际请求。比较旧路径时使用旧版源码构建的独立基线，并保持其余条件一致。
 
 每次定向重启使用新的日志和 PID 目录，保留失败启动的首个有效错误；先核对本次进程及其 worker 已退出、端口和 NPU 已释放，再启动下一次。`/health` 返回 200 后仍需完成单 token 请求验收。
 

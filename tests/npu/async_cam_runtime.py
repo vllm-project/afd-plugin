@@ -96,7 +96,6 @@ def main():
     if args.full_graph and not args.reference_outputs:
         parser.error("FULL replay requires saved matching eager outputs")
     faulthandler.dump_traceback_later(60)
-    os.environ["AFD_ASYNC_CAM_LAYERED_GMM"] = "1"
     os.environ["BATCH_SIZE_FACTOR"] = str(16 / 262144)
     os.environ["HCCL_BUFFSIZE"] = "64"
     ensure_cam_async_ops_available()
