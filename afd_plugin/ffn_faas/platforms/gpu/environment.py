@@ -14,7 +14,8 @@ import importlib
 import os
 from typing import TYPE_CHECKING
 
-from afd_plugin.ffn_faas.platforms.gpu.settings import EXTERNAL_LAUNCHER, GPUFFNConfig
+from afd_plugin.ffn_faas.platforms.gpu.settings import GPUFFNConfig
+from afd_plugin.ffn_faas.platforms.launch import reassert_external_launcher
 
 if TYPE_CHECKING:
     import torch
@@ -116,7 +117,7 @@ class GPUFFNEnvironment:
 
     # NPU parallel: CAMFFNBackend.prepare (EngineArgs, create_engine_config,
     #   re-asserted external_launcher).
-    # Reuse: PARTIAL - see REFACTOR-CANDIDATE(R4) in settings.engine_kwargs.
+    # Reuse: YES - both use the shared F-only EngineArgs and launcher helpers.
     def build_config(self) -> VllmConfig:
         """Build the F-only ``VllmConfig`` exactly as the GPU FFN Worker sees it.
 
@@ -140,7 +141,7 @@ class GPUFFNEnvironment:
         config = EngineArgs(**self.settings.engine_kwargs()).create_engine_config()
         # The F world is the already launched torchrun world, whatever executor
         # platform defaults would pick for an ordinary engine.
-        config.parallel_config.distributed_executor_backend = EXTERNAL_LAUNCHER
+        reassert_external_launcher(config)
         config.model_config = get_afd_model_config(
             config.model_config, device_type="cuda"
         )

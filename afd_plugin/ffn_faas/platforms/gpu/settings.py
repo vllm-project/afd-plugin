@@ -19,7 +19,10 @@ from types import MappingProxyType
 from typing import Any
 
 from afd_plugin.config import DEEPEP_M2N_CONNECTOR, AFDConfig
-from afd_plugin.ffn_faas.platforms.launch import validate_common_ffn_launch
+from afd_plugin.ffn_faas.platforms.launch import (
+    ffn_engine_kwargs,
+    validate_common_ffn_launch,
+)
 
 # The only qualified payload: BF16 rows against BF16 expert weights.
 BF16_PAYLOAD = "bf16"
@@ -28,7 +31,6 @@ SINGLE_LANE = 1
 DBO_LANES = 2
 FFN_GRAPH_MODE = "FULL_DECODE_ONLY"
 EAGER_MODE = "eager"
-EXTERNAL_LAUNCHER = "external_launcher"
 DEFAULT_AFD_PORT = AFDConfig.port
 DEFAULT_AFD_TIMEOUT_S = AFDConfig.afd_process_group_timeout_s
 
@@ -121,12 +123,9 @@ class GPUFFNConfig:
         }
 
     # NPU parallel: afd_plugin/ffn_faas/platforms/npu/backend.py::
-    #   CAMFFNBackend.prepare builds its EngineArgs inline.
-    # Reuse: PARTIAL - external_launcher, DP = F ranks, TP = 1 and expert
-    #   parallelism are identical; NPU adds Ascend quantization and the CAM
-    #   dispatch envelope, GPU adds graph mode, DBO and the EP weight filter.
-    #   REFACTOR-CANDIDATE(R4): one F-only EngineArgs builder with
-    #   platform-specific extras.
+    #   CAMFFNBackend.prepare builds its EngineArgs through the shared builder.
+    # Reuse: YES for the F-only topology; NPU adds Ascend quantization and the
+    #   CAM dispatch envelope, GPU adds graph mode, DBO and the EP weight filter.
     def engine_kwargs(self) -> dict[str, Any]:
         """Keyword arguments for ``EngineArgs`` of this F-only rank.
 
@@ -144,23 +143,21 @@ class GPUFFNConfig:
         pin ``auto`` to Triton. The EP weight filter skips non-local expert
         tensors before they are read, as the Worker-path recipes do.
         """
-        return {
-            "model": str(self.model),
-            "dtype": "bfloat16",
-            "skip_tokenizer_init": True,
-            "tensor_parallel_size": 1,
-            "data_parallel_size": self.ffn_ranks,
-            "data_parallel_rank": self.rank,
-            "enable_expert_parallel": True,
-            "enable_ep_weight_filter": True,
-            "distributed_executor_backend": EXTERNAL_LAUNCHER,
-            "enforce_eager": not self.graph,
-            "compilation_config": (
-                {"cudagraph_mode": FFN_GRAPH_MODE} if self.graph else {}
-            ),
-            "enable_dbo": self.dbo,
-            "additional_config": self.afd_additional_config(),
-        }
+        return ffn_engine_kwargs(
+            model=self.model,
+            ffn_ranks=self.ffn_ranks,
+            ffn_rank=self.rank,
+            additional_config=self.afd_additional_config(),
+            platform_extras={
+                "skip_tokenizer_init": True,
+                "enable_ep_weight_filter": True,
+                "enforce_eager": not self.graph,
+                "compilation_config": (
+                    {"cudagraph_mode": FFN_GRAPH_MODE} if self.graph else {}
+                ),
+                "enable_dbo": self.dbo,
+            },
+        )
 
 
 def parse_connector_extra_config(text: str) -> Mapping[str, Any]:

@@ -16,6 +16,10 @@ from vllm.engine.arg_utils import EngineArgs
 from afd_plugin.compat.npu import fix_all2all_backend_for_afd
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+from afd_plugin.ffn_faas.platforms.launch import (
+    ffn_engine_kwargs,
+    reassert_external_launcher,
+)
 from afd_plugin.ffn_faas.platforms.npu.environment import AscendFFNEnvironment
 from afd_plugin.ffn_faas.platforms.npu.model import CAMRoutedModel
 from afd_plugin.ffn_faas.platforms.npu.settings import FFNConfig
@@ -36,29 +40,29 @@ class CAMFFNBackend:
     def prepare(self, service: FFNService) -> None:
         self.environment.initialize_device()
         args = EngineArgs(
-            model=str(self.settings.model),
-            trust_remote_code=True,
-            dtype="bfloat16",
-            quantization="ascend",
-            enforce_eager=not self.settings.full_graph,
-            compilation_config={"cudagraph_mode": "FULL"}
-            if self.settings.full_graph
-            else {},
-            tensor_parallel_size=1,
-            data_parallel_size=self.settings.ffn_ranks,
-            data_parallel_rank=self.settings.rank,
-            enable_expert_parallel=True,
-            distributed_executor_backend="external_launcher",
-            # F owns a dispatch envelope, not a request-context/KV capacity.
-            max_model_len=self.settings.max_num_batched_tokens,
-            max_num_batched_tokens=self.settings.max_num_batched_tokens,
-            max_num_seqs=self.settings.max_num_seqs,
-            additional_config=self.settings.additional_config(),
+            **ffn_engine_kwargs(
+                model=self.settings.model,
+                ffn_ranks=self.settings.ffn_ranks,
+                ffn_rank=self.settings.rank,
+                additional_config=self.settings.additional_config(),
+                platform_extras={
+                    "trust_remote_code": True,
+                    "quantization": "ascend",
+                    "enforce_eager": not self.settings.full_graph,
+                    "compilation_config": {"cudagraph_mode": "FULL"}
+                    if self.settings.full_graph
+                    else {},
+                    # F owns a dispatch envelope, not a request-context/KV capacity.
+                    "max_model_len": self.settings.max_num_batched_tokens,
+                    "max_num_batched_tokens": self.settings.max_num_batched_tokens,
+                    "max_num_seqs": self.settings.max_num_seqs,
+                },
+            )
         )
         config = args.create_engine_config()
         # Platform configuration can choose an executor for ordinary Workers;
         # this loader belongs to the already launched F-only torchrun world.
-        config.parallel_config.distributed_executor_backend = "external_launcher"
+        reassert_external_launcher(config)
         fix_all2all_backend_for_afd(config)
         self.environment.initialize_compute(config)
         with set_current_vllm_config(config):

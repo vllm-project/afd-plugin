@@ -6,10 +6,17 @@ from __future__ import annotations
 
 import math
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 V2_MODEL_RUNNER_ENV = "VLLM_USE_V2_MODEL_RUNNER"
 MAX_PORT = 65535
+EXTERNAL_LAUNCHER = "external_launcher"
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 
 @dataclass(frozen=True)
@@ -63,3 +70,31 @@ def validate_common_ffn_launch(
         raise ValueError("FFN rendezvous requires a host and a valid port")
     if not math.isfinite(shutdown_timeout) or shutdown_timeout <= 0:
         raise ValueError("shutdown timeout must be finite and positive")
+
+
+def ffn_engine_kwargs(
+    *,
+    model: Path | str,
+    ffn_ranks: int,
+    ffn_rank: int,
+    additional_config: Mapping[str, Any],
+    platform_extras: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build common ``EngineArgs`` keywords and merge backend-specific extras."""
+    kwargs: dict[str, Any] = {
+        "model": str(model),
+        "dtype": "bfloat16",
+        "tensor_parallel_size": 1,
+        "data_parallel_size": ffn_ranks,
+        "data_parallel_rank": ffn_rank,
+        "enable_expert_parallel": True,
+        "distributed_executor_backend": EXTERNAL_LAUNCHER,
+        "additional_config": dict(additional_config),
+    }
+    kwargs.update(platform_extras)
+    return kwargs
+
+
+def reassert_external_launcher(config: VllmConfig) -> None:
+    """Keep an already launched F-only world from borrowing an executor."""
+    config.parallel_config.distributed_executor_backend = EXTERNAL_LAUNCHER
