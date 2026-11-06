@@ -56,6 +56,8 @@ def test_afd_config_matches_a_worker_path_m2n_ffn():
 def test_engine_args_describe_an_f_only_ep_rank(graph, dbo, eager, compilation_config):
     kwargs = _settings(graph=graph, dbo=dbo).engine_kwargs()
 
+    assert kwargs["model"] == "/model"
+    assert "dtype" not in kwargs
     assert kwargs["distributed_executor_backend"] == "external_launcher"
     assert (kwargs["data_parallel_size"], kwargs["data_parallel_rank"]) == (2, 1)
     assert kwargs["tensor_parallel_size"] == 1

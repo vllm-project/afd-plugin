@@ -83,7 +83,6 @@ def ffn_engine_kwargs(
     """Build common ``EngineArgs`` keywords and merge backend-specific extras."""
     kwargs: dict[str, Any] = {
         "model": str(model),
-        "dtype": "bfloat16",
         "tensor_parallel_size": 1,
         "data_parallel_size": ffn_ranks,
         "data_parallel_rank": ffn_rank,

@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING
 
 from afd_plugin.config import DEEPEP_M2N_CONNECTOR
 from afd_plugin.ffn_faas.interfaces import FFNLaunch
-from afd_plugin.ffn_faas.platforms.gpu.qwen3_model import Qwen3CheckpointDescription
 from afd_plugin.ffn_faas.platforms.gpu.settings import (
     BF16_PAYLOAD,
     DEFAULT_AFD_PORT,
@@ -37,7 +36,7 @@ if TYPE_CHECKING:
 # Reuse: PARTIAL - the deferred-import factory shape is the same; GPU needs
 #   no environment bootstrap before importing torch.
 def create_backend(
-    checkpoint: Qwen3CheckpointDescription, settings: GPUFFNConfig
+    settings: GPUFFNConfig,
 ) -> FFNBackend:
     """Import the GPU backend only when the host loop constructs it.
 
@@ -47,7 +46,7 @@ def create_backend(
     """
     from afd_plugin.ffn_faas.platforms.gpu.backend import DeepEPM2NFFNBackend
 
-    return DeepEPM2NFFNBackend(checkpoint, settings)
+    return DeepEPM2NFFNBackend(settings)
 
 
 # NPU parallel: afd_plugin/ffn_faas/platforms/npu/adapter.py::AscendCAMAdapter.
@@ -101,14 +100,16 @@ class GPUDeepEPM2NAdapter:
         F-only world (``WORLD_SIZE == --ffn-ranks``) and
         ``VLLM_USE_V2_MODEL_RUNNER=1`` (Attention runs ModelRunnerV2 and the
         FFN runner validates the same deployment). Parses the connector JSON
-        structurally, reads the checkpoint description, and checks that the
-        experts divide across the F ranks. Raises ``ValueError`` or
-        ``OSError``, which the entry point reports as a usage error.
+        structurally and resolves the model path without interpreting its
+        architecture; vLLM and the AFD model registry own model selection.
+        Raises ``ValueError`` or ``OSError``, which the entry point reports as
+        a usage error.
         """
         launcher = read_ffn_launcher_environment(args.ffn_ranks)
         require_v2_model_runner()
+        model_path = args.model.resolve(strict=True)
         settings = GPUFFNConfig(
-            model=args.model,
+            model=model_path,
             attention_ranks=args.attention_ranks,
             ffn_ranks=args.ffn_ranks,
             rank=launcher.rank,
@@ -123,15 +124,13 @@ class GPUDeepEPM2NAdapter:
             afd_timeout_s=args.afd_timeout,
             shutdown_timeout=args.shutdown_timeout,
         )
-        checkpoint = Qwen3CheckpointDescription.read(args.model)
-        checkpoint.local_experts(settings.ffn_ranks)
         return FFNLaunch(
             rank=launcher.rank,
             local_rank=launcher.local_rank,
-            model_path=str(checkpoint.root),
+            model_path=str(model_path),
             backend_name=DEEPEP_M2N_CONNECTOR,
             shutdown_timeout=settings.shutdown_timeout,
-            backend_factory=partial(create_backend, checkpoint, settings),
+            backend_factory=partial(create_backend, settings),
             initial_status={
                 "payload_format": BF16_PAYLOAD,
                 "num_lanes": settings.num_lanes,

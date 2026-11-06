@@ -1,17 +1,17 @@
 # Standalone GPU FFN service
 
-Run the Qwen3-30B-A3B routed experts in independent F-only processes with
-`torchrun -m afd_plugin.ffn_faas serve --backend gpu-deepep-m2n`. The service
-loads only the routed experts, reuses vLLM's native loader and the existing
-DeepEP M2N FFN runtime, and constructs no vLLM Worker, upstream ModelRunner,
-EngineCore, scheduler, KV cache or complete CausalLM. Attention keeps its
-existing `vllm serve` launch, model, connector and DBO path.
+Run a registered CUDA routed-experts model in independent F-only processes
+with `torchrun -m afd_plugin.ffn_faas serve --backend gpu-deepep-m2n`. The
+service loads only the routed experts, reuses vLLM's native loader and the
+existing DeepEP M2N FFN runtime, and constructs no vLLM Worker, upstream
+ModelRunner, EngineCore, scheduler, KV cache or complete CausalLM. Attention
+keeps its existing `vllm serve` launch, model, connector and DBO path.
 
 ## Supported configuration
 
 | Supported | Rejected at startup |
 | --- | --- |
-| `Qwen3MoeForCausalLM`, BF16, every layer MoE, no shared experts (`Qwen/Qwen3-30B-A3B`) | FP8 or any `quantization_config`, dense or partial-MoE Qwen3, shared experts, other models |
+| A registered CUDA routed-experts model; currently `Qwen3MoeForCausalLM`, BF16, every layer MoE, no shared experts | Unregistered models, FP8 or any `quantization_config`, dense or partial-MoE Qwen3, shared experts |
 | `DeepEPM2NAFDConnector` with `payload_format: bf16` | P2P, afdEP-direct, flexible placement, FP8 payload |
 | F TP=1, EP over all F ranks, linear expert placement | EPLB, elastic EP, redundant experts, PP/CP, LoRA, speculative decoding |
 | Eager, FULL_DECODE_ONLY CUDA graphs, DBO with two lanes (eager and graph) | Other graph modes, more than two micro-batches |
@@ -25,7 +25,7 @@ The routed experts must divide evenly across the F ranks.
 CPU service / host runner -> FFNBackend
   DeepEPM2NFFNBackend (ffn_faas/platforms/gpu/backend.py)
     GPUFFNEnvironment: GPU, F-only NCCL world and vLLM EP group
-    AFDQwen3MoeRoutedExperts: model.layers.<i>.mlp only, native vLLM loader
+    AFD routed-experts model selected by the model registry
     GPUFFNRoutedExpertsModelRunner: the Worker path's FFN runner
       DeepEPM2NAFDConnector: handshake, control plane, lanes, experts
 ```
@@ -115,8 +115,8 @@ Each local F rank serves `--status-port + LOCAL_RANK` (`0` chooses a free
 port; each rank prints its address at start).
 
 - `/status`: phase, `loaded_experts`/`total_experts` (this rank's experts over
-  all layers; vLLM's loader reports no per-expert progress, so the count
-  jumps from 0 to the total), `parameter_bytes`, `local_expert_first`/
+  all layers; vLLM's loader reports no per-expert progress, so both values are
+  reported together after loading), `parameter_bytes`, `local_expert_first`/
   `local_expert_last`, `m2n_paired`, `attn_tp_size`,
   `capacity_tokens_per_rank`, `num_buckets`, `network_hybrid`,
   `compute_ep_world_size`, `num_lanes`, `graph_mode`, `dbo` and

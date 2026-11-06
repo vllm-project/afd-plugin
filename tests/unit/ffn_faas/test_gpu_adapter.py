@@ -14,7 +14,6 @@ from pathlib import Path
 import pytest
 
 from afd_plugin.ffn_faas.platforms import get_platform_adapter
-from tests.unit.fakes.ffn_faas import write_qwen3_checkpoint
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 NATIVE_MODULES = ("torch", "vllm", "afdep", "deep_gemm")
@@ -35,9 +34,10 @@ def launch_env(monkeypatch):
 @pytest.fixture
 def configure(tmp_path):
     """Parse a ``serve`` command line for the GPU adapter and configure it."""
-    checkpoint = write_qwen3_checkpoint(tmp_path / "model")
+    model = tmp_path / "model"
+    model.mkdir()
 
-    def run(*options, model=checkpoint):
+    def run(*options, model=model):
         adapter = get_platform_adapter("gpu-deepep-m2n")
         parser = ArgumentParser()
         parser.add_argument("model", type=Path)
@@ -69,7 +69,9 @@ def test_backend_selection_imports_no_native_stack():
     assert json.loads(result.stdout) == []
 
 
-def test_valid_launch_describes_the_rank_and_its_lanes(launch_env, configure, tmp_path):
+def test_valid_launch_preserves_the_model_path_and_describes_the_rank(
+    launch_env, configure, tmp_path
+):
     launch = configure("--graph", "--dbo", "--port", "6239")
 
     assert (launch.rank, launch.local_rank) == (1, 1)
@@ -103,16 +105,9 @@ def test_invalid_launch_is_rejected(
         configure(*options)
 
 
-def test_unsupported_checkpoint_is_rejected(launch_env, configure, tmp_path):
-    fp8 = write_qwen3_checkpoint(
-        tmp_path / "fp8", quantization_config={"quant_method": "fp8"}
-    )
-    with pytest.raises(ValueError, match="quantized"):
-        configure(model=fp8)
-
-
 def test_cli_reports_a_bad_launch_as_a_usage_error(tmp_path):
-    checkpoint = write_qwen3_checkpoint(tmp_path / "model")
+    model = tmp_path / "model"
+    model.mkdir()
     env = {**os.environ, "WORLD_SIZE": "1", "VLLM_USE_V2_MODEL_RUNNER": "1"}
     result = subprocess.run(
         [
@@ -120,7 +115,7 @@ def test_cli_reports_a_bad_launch_as_a_usage_error(tmp_path):
             "-m",
             "afd_plugin.ffn_faas",
             "serve",
-            str(checkpoint),
+            str(model),
             "--backend",
             "gpu-deepep-m2n",
             "--attention-ranks",
