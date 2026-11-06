@@ -619,9 +619,9 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         weights directly in the token combine, so the factor is applied exactly once.
         Applying it again here would scale the routed output a second time.
 
-        Both ALLGATHER and MC2 are wired. They share this flow because their prepare
-        patches both pad the routing, and MC2's additionally splits it for the TP
-        sharding before writing the aligned version back. What differs is only whether
+        Both ALLGATHER and MC2 are wired. They share this flow because both AFD prepare
+        implementations pad the routing, and MC2's additionally splits it for the TP
+        sharding before returning the aligned routing. What differs is only whether
         finalize reduces across ranks.
 
         Any other communication method is rejected rather than silently taking one of
