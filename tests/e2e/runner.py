@@ -154,9 +154,12 @@ def main() -> int:
     ffn_devices = parse_csv(args.ffn_devices)
     validate_topology(args, attention_devices, ffn_devices)
     use_npu_async_process_cleanup = uses_npu_async_process_cleanup(args)
+    # torchrun starts the FFN service workers in their own sessions, outside
+    # the launcher's process group, so the FFN service also needs the
+    # environment-matched sweep to reap every worker on teardown.
     e2e_run_id = (
         f"{os.getpid()}-{time.monotonic_ns()}"
-        if use_npu_async_process_cleanup
+        if use_npu_async_process_cleanup or uses_ffn_faas(args)
         else None
     )
 
