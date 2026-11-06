@@ -1,15 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 
-"""Runtime gate for the sync Attention-side gate prototype.
+"""Runner validation for the sync Attention-side gate prototype.
 
-The sync shell does not call the DBO yield, so a DBO config would interleave
-microbatches against a transport that never yields. Not calling the yield is not
-the same as forbidding the feature, so the limit is enforced here.
-
-The entry-level tests matter more than the helper ones: a helper test keeps passing
-if the call is deleted from the validator, while a test that goes through the
-validator fails. Both roles are covered because both run this validator.
+The DBO and ubatching limits live in the NPU feature gate, which both workers run
+before this validator, and are covered in
+``compat/npu/test_sync_gate_feature_validation_cpu.py``. This module covers the
+runner-level contract: a supported synchronous gate configuration must return
+cleanly for either role.
 """
 
 import sys
@@ -85,22 +83,6 @@ def sync_gate_afd_config(monkeypatch):
             setattr(module, attribute, value)
         monkeypatch.setitem(sys.modules, name, module)
     return afd_config
-
-
-@pytest.mark.parametrize("role", ["attention", "ffn"])
-@pytest.mark.parametrize("unsupported", ["dbo", "ubatching"])
-def test_validator_rejects_unsupported_parallel_features(
-    sync_gate_afd_config, role, unsupported
-):
-    """Both roles refuse DBO and ubatching: the sync shell never yields."""
-
-    settings = {"enable_dbo": True} if unsupported == "dbo" else {"use_ubatching": True}
-    with pytest.raises(RuntimeError, match="DBO or ubatching"):
-        validation.validate_npu_model_runner_v2_config(
-            _runner_config(**settings),
-            expected_role=role,
-            device_type="npu",
-        )
 
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])

@@ -96,11 +96,12 @@ def test_the_supported_shape_is_accepted_for_both_roles(extra_info, role):
         ({"tp": 2}, "tensor-parallel size 1"),
     ],
 )
-def test_unsupported_shapes_are_rejected(extra_info, kwargs, match):
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_unsupported_shapes_are_rejected(extra_info, kwargs, match, role):
     with pytest.raises(RuntimeError, match=match):
         feature_validation.fail_if_unsupported_npu_afd_features(
             _vllm_config(**kwargs),
-            afd_config=_afd_config(),
+            afd_config=_afd_config(role=role),
         )
 
 
