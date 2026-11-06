@@ -31,10 +31,6 @@ PREFILL_FFN_GRAPH_MODE=${PREFILL_FFN_GRAPH_MODE:-EAGER}
 case "${PREFILL_FFN_GRAPH_MODE}" in
   EAGER) FFN_GRAPH_ARGS=(--enforce-eager) ;;
   FULL)
-    if [[ "${AFD_ASYNC_CAM_LAYERED_GMM:-0}" != 1 ]]; then
-      echo "FFN FULL requires AFD_ASYNC_CAM_LAYERED_GMM=1 (per-channel W4A8)" >&2
-      exit 2
-    fi
     : "${BATCH_SIZE_FACTOR:?Set BATCH_SIZE_FACTOR for the FULL receive capacity and memory budget}"
     FFN_GRAPH_ARGS=(--compilation-config '{"cudagraph_mode":"FULL"}')
     ;;

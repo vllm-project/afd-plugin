@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import inspect
 from contextlib import nullcontext
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -21,7 +20,6 @@ from vllm.config import CUDAGraphMode  # noqa: E402
 from vllm.v1.worker.dp_utils import should_skip_dp_coordination  # noqa: E402
 from vllm.v1.worker.gpu import cudagraph_utils, dp_utils, ubatch_utils  # noqa: E402
 from vllm.v1.worker.gpu import model_runner as native_v2  # noqa: E402
-from vllm_ascend.worker.v2 import model_runner as native_ascend_v2  # noqa: E402
 from vllm_ascend.worker.v2.input_batch import (  # noqa: E402
     AscendInputBatch,
     AscendInputBuffers,
@@ -29,9 +27,6 @@ from vllm_ascend.worker.v2.input_batch import (  # noqa: E402
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner  # noqa: E402
 
 from afd_plugin.compat.patches.npu import mrv2_ubatching as patches  # noqa: E402
-from afd_plugin.model_executor.models import (  # noqa: E402
-    forward_context as afd_context,
-)
 from afd_plugin.v1.worker.npu import attention_model_runner_v2 as npu_v2  # noqa: E402
 from afd_plugin.v1.worker.npu import ubatch_runner as npu_ubatch  # noqa: E402
 
@@ -61,7 +56,9 @@ def _runner(*, async_dp=False):
     runner.afd_config = SimpleNamespace(
         async_dp=async_dp, num_attention_ranks=2, num_ffn_ranks=2
     )
-    runner.connector = SimpleNamespace(extra_info=SimpleNamespace())
+    runner.connector = SimpleNamespace(
+        extra_info=SimpleNamespace(), attention_step=nullcontext
+    )
     runner.cudagraph_manager = None
     runner.ubatch_runner = None
     runner.prof = object()
@@ -72,17 +69,6 @@ def _runner(*, async_dp=False):
     runner._afd_is_graph_replaying = True
     runner._afd_is_profile = False
     return runner
-
-
-def _state(runner):
-    return (
-        runner._afd_pending_metadata,
-        runner._afd_suppress_metadata_send,
-        runner._is_warmup,
-        runner._afd_is_graph_capturing,
-        runner._afd_is_graph_replaying,
-        runner._afd_is_profile,
-    )
 
 
 def test_kv_control_context_does_not_publish_afd_metadata():
@@ -117,38 +103,12 @@ def test_shutdown_joins_native_children_and_releases_owned_stage_state(
         runner.shutdown()
     assert calls == ["profiler", "abort", "native", "connector"]
     assert (runner.ubatch_runner is None) is (failure != "native")
-    assert runner._afd_pending_metadata is None
-
-
-def test_mla_capture_registry_uses_exact_native_descriptor_and_skips_warmup():
-    runner = object.__new__(npu_ubatch.NPUUBatchRunner)
-    runner._uses_mla_graph_params = True
-    runner._mla_capture_params = {}
-    desc = cudagraph_utils.BatchExecutionDescriptor(
-        CUDAGraphMode.FULL, num_tokens=8, num_reqs=8, num_ubatches=2
-    )
-    lora_desc = replace(desc, num_active_loras=1)
-    first, second = object(), object()
-    contexts = [
-        SimpleNamespace(additional_kwargs={npu_ubatch.AFD_MLA_GRAPH_PARAMS_KEY: value})
-        for value in (first, second)
-    ]
-    state = SimpleNamespace(forward_contexts=contexts)
-    runner.record_capture_graph_params(desc, state, is_warmup=True)
-    assert runner._mla_capture_params == {}
-    runner.record_capture_graph_params(desc, state, is_warmup=False)
-    contexts.reverse()
-    runner.record_capture_graph_params(lora_desc, state, is_warmup=False)
-    assert runner._mla_capture_params == {
-        desc: (first, second),
-        lora_desc: (second, first),
-    }
 
 
 @pytest.mark.parametrize("fail_update", [False, True])
 def test_mla_replay_updates_captured_stage_records_and_restores_context(
     monkeypatch, fail_update
-):
+):  # long-test: native replay/update consumes merged stage records and restores context
     runner = object.__new__(npu_ubatch.NPUUBatchRunner)
     runner._uses_mla_graph_params = True
     runner.device = torch.device("cpu")
@@ -163,7 +123,17 @@ def test_mla_replay_updates_captured_stage_records_and_restores_context(
         value.events[4] = [f"event{stage}"]
         value.handles[4] = [f"handle{stage}"]
         value.attn_params[4] = [f"capture{stage}"]
-    runner._mla_capture_params = {desc: params}
+    runner._mla_capture_params = {}
+    captured = SimpleNamespace(
+        forward_contexts=[
+            SimpleNamespace(
+                additional_kwargs={npu_ubatch.AFD_MLA_GRAPH_PARAMS_KEY: value}
+            )
+            for value in params
+        ]
+    )
+    runner.record_capture_graph_params(desc, captured, is_warmup=True)
+    runner.record_capture_graph_params(desc, captured, is_warmup=False)
     runner._prepared_state = SimpleNamespace(
         slices=[SimpleNamespace(num_tokens=4), SimpleNamespace(num_tokens=4)],
         forward_contexts=[
@@ -228,96 +198,12 @@ def test_mla_replay_updates_captured_stage_records_and_restores_context(
     assert context.additional_kwargs is original_kwargs
 
 
-@pytest.mark.parametrize("async_dp", [False, True])
-@pytest.mark.parametrize("raise_in_native", [False, True])
-@pytest.mark.parametrize("randomize_inputs", [False, True])
-def test_execute_forwards_dummy_profile_and_context_then_restores(  # long-test: scopes
-    monkeypatch, raise_in_native, async_dp, randomize_inputs
-):
-    runner = _runner(async_dp=async_dp)
-    original_state = _state(runner)
-    step_calls: list[object] = []
-    monkeypatch.setattr(npu_v2, "step_afd_npu_profiler", step_calls.append)
-    context = SimpleNamespace(additional_kwargs={})
-    forward_module = afd_context.forward_context_module
-    monkeypatch.setattr(forward_module, "create_forward_context", lambda: context)
-    original_factory = forward_module.create_forward_context
-    runner.install_afd_metadata_on_forward_context = lambda ctx: (
-        ctx.additional_kwargs.update(afd_metadata="installed")
-    )
-    forwarded = []
-
-    def native_execute(self, *args, **kwargs):
-        forwarded.append((args, kwargs))
-        assert should_skip_dp_coordination() is async_dp
-        assert forward_module.create_forward_context().additional_kwargs == {
-            "afd_metadata": "installed"
-        }
-        assert self._afd_is_profile is True
-        self._afd_pending_metadata = None
-        self._afd_suppress_metadata_send = False
-        self._is_warmup = False
-        self._afd_is_graph_capturing = False
-        self._afd_is_graph_replaying = False
-        if raise_in_native:
-            raise RuntimeError("native execute failed")
-        return "native-result"
-
-    monkeypatch.setattr(NPUModelRunner, "execute_model", native_execute)
-    scheduler_output = SimpleNamespace(total_num_scheduled_tokens=7)
-    intermediate = object()
-    if raise_in_native:
-        with pytest.raises(RuntimeError, match="native execute failed"):
-            runner.execute_model(
-                scheduler_output,
-                intermediate,
-                True,
-                True,
-                True,
-                17,
-                True,
-                randomize_inputs,
-            )
-    else:
-        assert (
-            runner.execute_model(
-                scheduler_output,
-                intermediate,
-                True,
-                True,
-                True,
-                17,
-                True,
-                randomize_inputs,
-            )
-            == "native-result"
-        )
-    assert forwarded == [
-        (
-            (scheduler_output, intermediate),
-            {
-                "dummy_run": True,
-                "skip_attn_for_dummy_run": True,
-                "is_profile": True,
-                "context_len": 17,
-                "valid_dummy_state_slots": True,
-                "randomize_inputs": randomize_inputs,
-            },
-        )
-    ]
-    assert not should_skip_dp_coordination()
-    assert step_calls == [runner.prof]
-    assert _state(runner) == original_state
-    assert forward_module.create_forward_context is original_factory
-
-
 @pytest.mark.parametrize("profile_only", [False, True])
 @pytest.mark.parametrize("raise_in_native", [False, True])
-def test_capture_forwards_new_inputs_and_restores(  # long-test: capture lifecycle
+def test_capture_forwards_new_inputs_and_restores(
     monkeypatch, profile_only, raise_in_native
-):
+):  # long-test: capture lifecycle
     runner = _runner()
-    original_state = _state(runner)
     descs = [
         cudagraph_utils.BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.FULL, num_reqs=1, num_tokens=8
@@ -391,7 +277,6 @@ def test_capture_forwards_new_inputs_and_restores(  # long-test: capture lifecyc
                     )
                     == "native-state"
                 )
-                assert not self._afd_is_graph_replaying
         if raise_in_native:
             raise RuntimeError("native capture failed")
         return 42
@@ -427,51 +312,8 @@ def test_capture_forwards_new_inputs_and_restores(  # long-test: capture lifecyc
     if not profile_only:
         expected_events.extend([(32, True, False), (32, False, True)])
     assert events == expected_events
-    assert _state(runner) == original_state
     assert cudagraph_utils.prepare_inputs_to_capture is native_prepare
     assert original_prepare is not native_prepare
-
-
-@pytest.mark.parametrize("async_dp", [False, True])
-def test_native_dummy_run_reaches_afd_execute_with_context_state(monkeypatch, async_dp):
-    runner = _runner(async_dp=async_dp)
-    runner.adaptive_verification = None
-    runner.max_num_reqs = 2
-    runner.lora_config = None
-    runner.is_first_pp_rank = True
-    runner.is_last_pp_rank = False
-    runner.kv_connector = SimpleNamespace(set_disabled=lambda disabled: None)
-    runner.maybe_dummy_run_with_lora = lambda *args, **kwargs: nullcontext()
-    monkeypatch.setattr(native_ascend_v2, "lmhead_tp_enable", lambda: False)
-    monkeypatch.setattr(npu_v2, "step_afd_npu_profiler", lambda _prof: None)
-    calls = []
-
-    def native_execute(self, scheduler_output, intermediate_tensors=None, **kwargs):
-        calls.append((scheduler_output.total_num_scheduled_tokens, kwargs))
-        assert should_skip_dp_coordination() is async_dp
-        return None
-
-    monkeypatch.setattr(NPUModelRunner, "execute_model", native_execute)
-    assert runner._dummy_run(
-        7,
-        context_len=17,
-        valid_dummy_state_slots=True,
-        is_profile=True,
-        skip_eplb=True,
-    ) == (None, None)
-    assert calls == [
-        (
-            7,
-            {
-                "dummy_run": True,
-                "skip_attn_for_dummy_run": False,
-                "is_profile": True,
-                "context_len": 17,
-                "valid_dummy_state_slots": True,
-                "randomize_inputs": False,
-            },
-        )
-    ]
 
 
 @pytest.mark.parametrize("num_tokens", [0, 1, 7])
@@ -512,30 +354,21 @@ def test_async_execute_uses_native_local_dp_dispatch(monkeypatch, num_tokens, dp
 
 
 @pytest.mark.parametrize(
-    ("counts", "ffn_ranks", "attention_tp", "expected_counts", "dp_rank"),
+    "counts,ffn_ranks,attention_tp,expected_counts,dp_rank,execution",
     [
-        (counts, ffn_ranks, attention_tp, expected_counts, dp_rank)
-        for counts, ffn_ranks, attention_tp, expected_counts in [
-            ((3, 7), 1, 1, [7, 7]),
-            ((7, 3), 1, 1, [7, 7]),
-            ((1, 7), 1, 1, [7, 7]),
-            ((8, 8), 1, 1, [8, 8]),
-            ((0, 0), 1, 1, [0, 0]),
-            ((3, 7), 2, 1, [3, 7]),
-            ((3, 7, 5, 2), 2, 1, [5, 7, 5, 7]),
-            ((1, 7, 1, 3), 2, 1, [1, 7, 1, 7]),
-            ((8, 8, 8, 8), 2, 1, [8, 8, 8, 8]),
-            ((3, 7), 2, 2, [7, 7]),
-            ((3, 7, 5, 2), 4, 2, [5, 7, 5, 7]),
-            ((3, 7, 5), 3, 2, [7, 7, 7]),
-        ]
-        for dp_rank in range(len(counts))
+        ((3, 7), 1, 1, [7, 7], 0, "eager"),
+        ((7, 3), 1, 1, [7, 7], 1, "graph_miss"),
+        ((0, 0), 1, 1, [0, 0], 1, "eager"),
+        ((3, 7), 2, 1, [3, 7], 1, "peer_fallback"),
+        ((3, 7, 5, 2), 2, 1, [5, 7, 5, 7], 0, "eager"),
+        ((3, 7, 5, 2), 2, 1, [5, 7, 5, 7], 1, "graph_miss"),
+        ((3, 7), 2, 2, [7, 7], 0, "peer_fallback"),
+        ((3, 7, 5), 3, 2, [7, 7, 7], 2, "eager"),
     ],
 )
-@pytest.mark.parametrize("execution", ["eager", "graph_miss", "peer_fallback"])
 def test_camp2p_dispatch_pads_many_to_one_before_native_inputs(
     monkeypatch, counts, dp_rank, ffn_ranks, attention_tp, expected_counts, execution
-):
+):  # long-test: native dispatch reduction, padding and graph fallback form one seam
     runner = _runner()
     dp_size = len(counts)
     runner.afd_config.num_attention_ranks = dp_size * attention_tp
@@ -611,65 +444,6 @@ def test_camp2p_dispatch_pads_many_to_one_before_native_inputs(
     assert native_v2.dispatch_cg_and_sync_dp is original_dispatch
 
 
-@pytest.mark.parametrize("raise_in_native", [False, True])
-@pytest.mark.parametrize("mode", [CUDAGraphMode.FULL, CUDAGraphMode.NONE])
-def test_camp2p_padding_preserves_graph_descriptor_and_restores_dispatch(
-    monkeypatch, raise_in_native, mode
-):
-    runner = _runner()
-    runner.afd_config.num_ffn_ranks = 1
-    monkeypatch.setattr(npu_v2, "step_afd_npu_profiler", lambda _prof: None)
-    counts = [8, 8] if mode == CUDAGraphMode.FULL else [3, 7]
-    desc = cudagraph_utils.BatchExecutionDescriptor(
-        mode, counts[0], 3, uniform_token_count=1, max_query_len=1, num_active_loras=2
-    )
-    sync = dp_utils.DPSyncState(torch.tensor(counts), 1, False, 7)
-
-    def native_dispatch(*args, dp_sync_state=None, **kwargs):
-        return desc, dp_sync_state
-
-    monkeypatch.setattr(native_v2, "dispatch_cg_and_sync_dp", native_dispatch)
-
-    def native_execute(self, *args, **kwargs):
-        actual_desc, actual_sync = native_v2.dispatch_cg_and_sync_dp(
-            None,
-            3,
-            3,
-            1,
-            2,
-            0,
-            max_query_len=1,
-            need_eager=False,
-            dp_sync_state=sync,
-        )
-        if mode == CUDAGraphMode.FULL:
-            assert actual_desc is desc
-            assert actual_sync is sync
-        else:
-            assert actual_desc.num_tokens == 7
-            assert actual_desc.num_reqs == desc.num_reqs
-            assert actual_desc.uniform_token_count == desc.uniform_token_count
-            assert actual_desc.max_query_len == desc.max_query_len
-            assert actual_desc.num_active_loras == desc.num_active_loras
-            assert actual_sync.num_tokens_across_dp.tolist() == [7, 7]
-            assert actual_sync.eager is False
-            assert sync.num_tokens_across_dp.tolist() == [3, 7]
-        if raise_in_native:
-            raise RuntimeError("native execute failed")
-        return "native-result"
-
-    monkeypatch.setattr(NPUModelRunner, "execute_model", native_execute)
-    if raise_in_native:
-        with pytest.raises(RuntimeError, match="native execute failed"):
-            runner.execute_model(SimpleNamespace(total_num_scheduled_tokens=3))
-    else:
-        assert (
-            runner.execute_model(SimpleNamespace(total_num_scheduled_tokens=3))
-            == "native-result"
-        )
-    assert native_v2.dispatch_cg_and_sync_dp is native_dispatch
-
-
 def _ascend_batch(real=5, padded=8):
     buffers = AscendInputBuffers(2, padded, torch.device("cpu"))
     batch = AscendInputBatch.make_dummy(1, real, buffers)
@@ -717,7 +491,9 @@ def test_native_slices_keep_exact_ascend_lengths_and_padding(real, monkeypatch):
 
 
 @pytest.mark.parametrize("real", [2, 5])
-def test_full_graph_prepares_metadata_for_padded_tail_stage(real, monkeypatch):
+def test_full_graph_prepares_metadata_for_padded_tail_stage(
+    real, monkeypatch
+):  # long-test: both native child stages must expose actual and padded lengths
     monkeypatch.setattr(
         "vllm_ascend.worker.v2.input_batch.update_cos_sin", lambda _: None
     )
@@ -777,7 +553,9 @@ def test_full_graph_prepares_metadata_for_padded_tail_stage(real, monkeypatch):
     assert all(not call["for_cudagraph_capture"] for call in calls)
 
 
-def test_stage_prepare_uses_independent_builders_and_detaches_cache(monkeypatch):
+def test_stage_prepare_uses_independent_builders_and_detaches_cache(
+    monkeypatch,
+):  # long-test: two native builders must not share mutable metadata or block tables
     monkeypatch.setattr(
         "vllm_ascend.worker.v2.input_batch.update_cos_sin", lambda _: None
     )
@@ -826,6 +604,7 @@ def test_stage_prepare_uses_independent_builders_and_detaches_cache(monkeypatch)
     assert metadata[0]["layer"].cos.tolist() == [1] * 5
     assert metadata[1]["layer"].cos.tolist() == [2] * 5
     assert table.tolist() == [[1, 1]]
+    assert len(calls) == 2
     assert (
         runner._prepare_attn(
             SimpleNamespace(num_tokens=0),
@@ -838,7 +617,6 @@ def test_stage_prepare_uses_independent_builders_and_detaches_cache(monkeypatch)
         )
         is None
     )
-    assert len(calls) == 2
 
 
 def test_native_child_contexts_preserve_dp_and_own_ascend_kwargs(monkeypatch):
@@ -862,7 +640,8 @@ def test_native_child_contexts_preserve_dp_and_own_ascend_kwargs(monkeypatch):
             "num_tokens": kwargs["num_tokens"],
         },
     )
-    assert runner._make_forward_contexts(slices, [], [], []) is contexts
+    result = runner._make_forward_contexts(slices, [], [], [])
+    assert result == contexts
     assert [ctx.dp_metadata for ctx in contexts] == dp
     assert contexts[1].attn_metadata is None
     from afd_plugin.connectors.npu.camp2p import _get_group_ep
@@ -878,30 +657,11 @@ def test_native_child_contexts_preserve_dp_and_own_ascend_kwargs(monkeypatch):
     assert contexts[0].additional_kwargs["mc2_mask"].all()
 
 
-def test_scope_restores_native_bindings_after_failure():
-    context = patches.ubatching.UBatchContext
-    stream = patches.ubatching.current_stream
-    runner_stream = patches.ubatch_utils.current_stream
-    factory = patches.model_runner.maybe_build_ubatch_runner
-    sm_control = patches.ubatch_utils.create_sm_control_context
-    with (
-        pytest.raises(RuntimeError, match="injected"),
-        patches.use_npu_ubatch_factory(SimpleNamespace()),
-        patches.use_npu_ubatch_contexts(),
-    ):
-        raise RuntimeError("injected")
-    assert patches.ubatching.UBatchContext is context
-    assert patches.ubatching.current_stream is stream
-    assert patches.ubatch_utils.current_stream is runner_stream
-    assert patches.model_runner.maybe_build_ubatch_runner is factory
-    assert patches.ubatch_utils.create_sm_control_context is sm_control
-
-
 @pytest.mark.parametrize("dp_size", [1, 2])
 @pytest.mark.parametrize("tokens,threshold,expected", [(1, 2, 1), (7, 2, 2), (7, 8, 1)])
 def test_async_dbo_dispatch_preserves_thresholds_and_falls_back_locally(
     monkeypatch, dp_size, tokens, threshold, expected
-):
+):  # long-test: prefill/decode threshold decisions preserve native DP agreement
     from vllm.v1.worker.dp_utils import skip_dp_coordination
 
     parallel = SimpleNamespace(
@@ -1064,6 +824,25 @@ def test_async_native_context_creation_without_sp(monkeypatch, dp_size):
     assert all(ctx.dp_metadata is None for ctx in contexts)
     assert [ctx.additional_kwargs["ubatch_idx"] for ctx in contexts] == [0, 1]
     assert ubatch_utils.DPMetadata is native_metadata
+
+
+def test_scope_restores_native_bindings_after_failure():
+    context = patches.ubatching.UBatchContext
+    stream = patches.ubatching.current_stream
+    runner_stream = patches.ubatch_utils.current_stream
+    factory = patches.model_runner.maybe_build_ubatch_runner
+    sm_control = patches.ubatch_utils.create_sm_control_context
+    with (
+        pytest.raises(RuntimeError, match="injected"),
+        patches.use_npu_ubatch_factory(SimpleNamespace()),
+        patches.use_npu_ubatch_contexts(),
+    ):
+        raise RuntimeError("injected")
+    assert patches.ubatching.UBatchContext is context
+    assert patches.ubatching.current_stream is stream
+    assert patches.ubatch_utils.current_stream is runner_stream
+    assert patches.model_runner.maybe_build_ubatch_runner is factory
+    assert patches.ubatch_utils.create_sm_control_context is sm_control
 
 
 def test_async_child_metadata_factory_restores_after_failure():

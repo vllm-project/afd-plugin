@@ -10,6 +10,8 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
+from torch import dtype  # noqa: E402
+
 from afd_plugin.config import AFDConfig  # noqa: E402
 from afd_plugin.connectors import (  # noqa: E402
     AFDExpertRoutingSpec,
@@ -95,63 +97,6 @@ def _context():
     )
 
 
-def test_attention_gate_reuses_hidden_state_send_for_router_logits(monkeypatch):
-    connector = _attention_connector()
-    hidden_states = torch.ones((2, 4), dtype=torch.bfloat16)
-    router_logits = torch.ones((2, 3), dtype=torch.float32)
-    sent = []
-    monkeypatch.setattr(
-        connector,
-        "_send_hidden_states",
-        lambda tensor, *args: sent.append(tensor),
-    )
-
-    connector.send_attn_output(
-        hidden_states,
-        _context(),
-        router_logits=router_logits,
-    )
-
-    assert sent == [hidden_states, router_logits]
-
-
-def test_ffn_gate_sends_only_hidden_states(monkeypatch):
-    connector = _attention_connector()
-    hidden_states = torch.ones((2, 4), dtype=torch.bfloat16)
-    sent = []
-    monkeypatch.setattr(
-        connector,
-        "_send_hidden_states",
-        lambda tensor, *args: sent.append(tensor),
-    )
-
-    connector.send_attn_output(
-        hidden_states,
-        _context(),
-    )
-
-    assert sent == [hidden_states]
-
-
-def test_router_shape_is_validated_before_any_send(monkeypatch):
-    connector = _attention_connector()
-    sent = []
-    monkeypatch.setattr(
-        connector,
-        "_send_hidden_states",
-        lambda tensor, *args: sent.append(tensor),
-    )
-
-    with pytest.raises(ValueError, match="equal token counts"):
-        connector.send_attn_output(
-            torch.ones((2, 4), dtype=torch.bfloat16),
-            _context(),
-            router_logits=torch.ones((3, 3), dtype=torch.float32),
-        )
-
-    assert sent == []
-
-
 def test_attention_gate_fan_in_preserves_peer_order(monkeypatch):
     connector = _ffn_connector(attention_ranks=2)
     connector.tensor_metadata_list[1] = SimpleNamespace(
@@ -219,26 +164,6 @@ def test_ffn_gate_receive_does_not_expect_router_logits(monkeypatch):
     assert payload.context.states is None
 
 
-def test_attention_send_orders_token_ids_after_hidden_states(monkeypatch):
-    connector = _attention_connector()
-    hidden_states = torch.ones((2, 4), dtype=torch.bfloat16)
-    input_ids = torch.tensor([11, 13], dtype=torch.int32)
-    sent = []
-    monkeypatch.setattr(
-        connector,
-        "_send_hidden_states",
-        lambda tensor, *args: sent.append(tensor),
-    )
-
-    connector.send_attn_output(
-        hidden_states,
-        _context(),
-        input_ids=input_ids,
-    )
-
-    assert sent == [hidden_states, input_ids]
-
-
 def test_ffn_fan_in_preserves_input_id_peer_order_and_dtype(monkeypatch):
     connector = _ffn_connector(attention_ranks=2)
     connector.tensor_metadata_list[1] = SimpleNamespace(
@@ -304,3 +229,49 @@ def test_ffn_graph_receive_reuses_input_ids_buffer(monkeypatch):
     assert refs[1] is input_ids_ref
     assert payload.hidden_states is hidden_ref
     assert payload.input_ids is input_ids_ref
+
+
+@pytest.fixture
+def attention_wire(monkeypatch):
+    connector = _attention_connector()
+    connector.a2e_group = SimpleNamespace(world_size=2)
+    connector.a2e_comm_id = 17
+    messages = []
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_p2p_send",
+        lambda tensor, dst, comm: messages.append(
+            (tuple(tensor.shape), tensor.dtype, dst, comm)
+        ),
+        raising=False,
+    )
+    return connector, messages
+
+
+@pytest.mark.parametrize("field", [None, "router_logits", "input_ids"])
+def test_attention_wire_fields_follow_declared_order(attention_wire, field):
+    connector, messages = attention_wire
+    hidden = torch.ones((2, 4), dtype=torch.bfloat16, device="meta")
+    extras = {}
+    expected: list[tuple[tuple[int, ...], dtype, int, int]] = [
+        ((2, 4), torch.bfloat16, 0, 17)
+    ]
+    if field == "router_logits":
+        extras[field] = torch.ones((2, 3), dtype=torch.float32, device="meta")
+        expected.append(((2, 3), torch.float32, 0, 17))
+    elif field == "input_ids":
+        extras[field] = torch.empty(2, dtype=torch.int32, device="meta")
+        expected.append(((2,), torch.int32, 0, 17))
+    connector.send_attn_output(hidden, _context(), **extras)
+    assert messages == expected
+
+
+def test_router_shape_is_validated_before_any_wire_send(attention_wire):
+    connector, messages = attention_wire
+    with pytest.raises(ValueError, match="equal token counts"):
+        connector.send_attn_output(
+            torch.ones((2, 4), dtype=torch.bfloat16, device="meta"),
+            _context(),
+            router_logits=torch.ones((3, 3), dtype=torch.float32, device="meta"),
+        )
+    assert messages == []

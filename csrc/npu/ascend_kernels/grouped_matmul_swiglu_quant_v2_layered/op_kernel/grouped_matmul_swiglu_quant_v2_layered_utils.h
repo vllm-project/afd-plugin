@@ -26,6 +26,7 @@
 #define OP_KERNEL_GROUPED_MATMUL_DEQUANT_SWIGLU_QUANT_V2_LAYERED_UTILS_H
 
 #include "layered/layered_tensor_addr.h"
+#include "afd_swiglu_limit.h"
 
 // A8W4 MSD scenario
 #if defined(ORIG_DTYPE_X) && defined(DT_INT8) && ORIG_DTYPE_X == DT_INT8 && defined(ORIG_DTYPE_ALL_WEIGHT) &&        \
@@ -70,22 +71,6 @@ constexpr int64_t DOUBLE_ROW = 2;
 constexpr int64_t SIZE_OF_HALF_2 = 2;
 constexpr uint8_t NUM_8 = 8;
 constexpr float QUANT_SCALE_INT8 = 127.0f;
-
-// ### PATCH START: DSV4 clipped SwiGLU
-// Patch reason: the model limit applies to the dequantized branches before SiLU.
-// Patch functionality: clamp in UB without another kernel or GM round trip.
-__aicore__ inline void ClampSwiGLUInputs(LocalTensor<float> gate, LocalTensor<float> up,
-                                        float limit, uint32_t count)
-{
-    if (limit > 0.0f) {
-        Mins(gate, gate, limit, count);
-        Mins(up, up, limit, count);
-        PipeBarrier<PIPE_V>();
-        Maxs(up, up, -limit, count);
-        PipeBarrier<PIPE_V>();
-    }
-}
-// ### PATCH END: DSV4 clipped SwiGLU
 
 constexpr MatmulConfig matmulCFGUnitFlag{false, false, true, 0, 0, 0, false, false, false, false,
                                          false, 0,     0,    0, 0, 0, 0,     0,     false};

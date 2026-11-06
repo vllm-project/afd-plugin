@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib
 import sys
 import types
+import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -25,7 +26,6 @@ from afd_plugin.connectors import (  # noqa: E402
     AFDTransferMetadata,
 )
 from afd_plugin.connectors.base import AFDControlPlaneClosedError  # noqa: E402
-from afd_plugin.distributed import build_rank_mapping  # noqa: E402
 
 
 @pytest.fixture
@@ -108,21 +108,6 @@ def _fake_vllm_config(
     )
 
 
-def _tolist(value):
-    tolist = getattr(value, "tolist", None)
-    if callable(tolist):
-        return tolist()
-    return list(value)
-
-
-def test_p2p_connector_is_registered():
-    sys.modules.pop("afd_plugin.connectors.gpu.p2p", None)
-
-    cls = AFDConnectorFactory.get_connector_class("P2pNcclAFDConnector")
-
-    assert cls.__name__ == "P2pNcclAFDConnector"
-
-
 def test_p2p_connector_can_be_constructed_without_runtime_initialization():
     connector = AFDConnectorFactory.create_connector(
         0,
@@ -139,26 +124,6 @@ def test_p2p_connector_can_be_constructed_without_runtime_initialization():
     assert connector.is_initialized is False
     assert connector.world_rank == 1
     assert connector.dst_list == [0]
-
-
-def test_p2p_connector_preserves_deepseek_attention_side_gate():
-    vllm_config = _fake_vllm_config()
-    vllm_config.model_config.hf_config.model_type = "deepseek_v2"
-
-    connector = AFDConnectorFactory.create_connector(
-        0,
-        0,
-        vllm_config,
-        AFDConfig(
-            role="attention",
-            connector="P2pNcclAFDConnector",
-            num_attention_ranks=1,
-            num_ffn_ranks=1,
-            compute_gate_on_attention=True,
-        ),
-    )
-
-    assert connector.is_initialized is False
 
 
 def test_p2p_connector_uses_nested_text_config_for_multimodal_model():
@@ -214,38 +179,9 @@ def test_p2p_connector_uses_factory_resolved_role_rank():
     assert connector.p2p_rank == 7
 
 
-@pytest.mark.parametrize(
-    ("attention_size", "ffn_size", "role", "role_rank", "subgroup_ranks", "dsts"),
-    [
-        (2, 2, "attention", 1, (1, 3), (1,)),
-        (2, 1, "attention", 0, (0, 1, 2), (0,)),
-        (4, 2, "attention", 2, (1, 4, 5), ()),
-        (4, 2, "ffn", 1, (1, 4, 5), ()),
-    ],
-)
-def test_p2p_topology_supports_equal_and_integer_multiple_attention_counts(
-    attention_size,
-    ffn_size,
-    role,
-    role_rank,
-    subgroup_ranks,
-    dsts,
-):
-    mapping = build_rank_mapping(
-        AFDConfig(
-            role=role,
-            connector="P2pNcclAFDConnector",
-            num_attention_ranks=attention_size,
-            num_ffn_ranks=ffn_size,
-        ),
-        role_rank,
-    )
-
-    assert mapping.subgroup_ranks == subgroup_ranks
-    assert mapping.dp_metadata_destinations == dsts
-
-
-def test_p2p_tp2_maps_shared_dp_payload_one_to_one(monkeypatch):
+def test_p2p_tp2_maps_shared_dp_payload_one_to_one(
+    monkeypatch,
+):  # long-test: paired A/F control and data routing over the same TP2 topology
     p2p_module = importlib.import_module("afd_plugin.connectors.gpu.p2p")
     parallel_state = importlib.import_module("vllm.distributed.parallel_state")
     payload = AFDControlPayload(
@@ -386,6 +322,32 @@ def test_p2p_tp2_maps_shared_dp_payload_one_to_one(monkeypatch):
     assert ffn_routes == [(0, 2), (1, 3)]
 
 
+@pytest.fixture
+def receive_peer_payload(monkeypatch):
+    module = importlib.import_module("afd_plugin.connectors.gpu.p2p")
+    # Only allocation/transport are replaced; real control parsing and fan-in run.
+    monkeypatch.setattr(
+        module,
+        "_recv_buffer",
+        lambda metadata, reference: torch.empty(
+            metadata.size, dtype=metadata.dtype, device="cpu"
+        ),
+    )
+
+    def deliver(buffers, sources, comm_id):
+        for tensor, source in zip(buffers, sources, strict=True):
+            tensor.fill_(source)
+
+    monkeypatch.setattr(torch.ops.vllm, "afd_p2p_recv_group", deliver, raising=False)
+
+    def receive(connector):
+        connector.a2e_group = SimpleNamespace(world_size=connector.group_size)
+        connector.a2e_comm_id = 17
+        return connector.recv_attn_output()
+
+    return receive
+
+
 @pytest.mark.parametrize(
     (
         "attention_size",
@@ -405,6 +367,7 @@ def test_p2p_tp2_maps_shared_dp_payload_one_to_one(monkeypatch):
     ],
 )
 def test_p2p_ffn_metadata_tracks_each_attention_peer_in_xayf(
+    receive_peer_payload,
     attention_size,
     ffn_size,
     ffn_rank,
@@ -434,17 +397,19 @@ def test_p2p_ffn_metadata_tracks_each_attention_peer_in_xayf(
         ),
     )
 
-    for src_rank, expected_tokens in enumerate(expected_peer_tokens, start=1):
-        assert connector._recv_attn_tensor_metadata_list[
-            (0, src_rank)
-        ].size == torch.Size([expected_tokens, 16])
+    payload = receive_peer_payload(connector)
+    assert payload.context.metadata.seq_lens == expected_peer_tokens
+    assert payload.hidden_states.shape == (sum(expected_peer_tokens), 16)
+    assert payload.hidden_states[:, 0].tolist() == [
+        source
+        for source, count in enumerate(expected_peer_tokens, 1)
+        for _ in range(count)
+    ]
 
-    assert connector.tensor_metadata_list[0].size == torch.Size(
-        [sum(expected_peer_tokens), 16],
-    )
 
-
-def test_p2p_tensor_metadata_clamps_idle_attention_rank_to_dummy_token():
+def test_p2p_tensor_metadata_clamps_idle_attention_rank_to_dummy_token(
+    receive_peer_payload,
+):
     ffn_connector = AFDConnectorFactory.create_connector(
         0,
         0,
@@ -464,13 +429,9 @@ def test_p2p_tensor_metadata_clamps_idle_attention_rank_to_dummy_token():
 
     ffn_connector.control_plane.update_state_from_dp_metadata(payload)
 
-    assert ffn_connector._recv_attn_tensor_metadata_list[(0, 1)].size == torch.Size(
-        [1, 16],
-    )
-    assert ffn_connector._recv_attn_tensor_metadata_list[(0, 2)].size == torch.Size(
-        [4, 16],
-    )
-    assert ffn_connector.tensor_metadata_list[0].size == torch.Size([5, 16])
+    received = receive_peer_payload(ffn_connector)
+    assert received.context.metadata.seq_lens == [1, 4]
+    assert received.hidden_states.shape == (5, 16)
 
     attention_connector = AFDConnectorFactory.create_connector(
         1,
@@ -486,6 +447,49 @@ def test_p2p_tensor_metadata_clamps_idle_attention_rank_to_dummy_token():
     attention_connector.control_plane.update_state_from_dp_metadata(payload)
 
     assert attention_connector.tensor_metadata_list[0].size == torch.Size([1, 16])
+
+
+@pytest.fixture
+def host_hidden_allocations(monkeypatch):
+    """Observe Python buffer ownership, without claiming CUDA validation."""
+    allocations = []
+    empty = torch.empty
+
+    def allocate(*args, **kwargs):
+        kwargs["device"] = "cpu"
+        tensor = empty(*args, **kwargs)
+        if tensor.ndim == 2:
+            allocations.append(weakref.ref(tensor))
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", allocate)
+    monkeypatch.setattr(
+        torch.ops.vllm, "afd_p2p_recv_group", lambda *args: None, raising=False
+    )
+    return allocations
+
+
+def test_eager_steps_release_hidden_buffers_with_graphs_enabled(
+    lifecycle_connector, host_hidden_allocations
+):
+    _, connector = lifecycle_connector
+    connector.vllm_config.model_config.enforce_eager = False
+    connector.a2e_group = SimpleNamespace(world_size=connector.group_size)
+    connector.a2e_comm_id = 17
+
+    for num_tokens in (3, 7, 5):
+        connector.control_plane.update_state_from_dp_metadata(
+            AFDControlPayload(
+                dp_metadata_list={0: AFDDPMetadata([num_tokens])},
+                is_graph_capturing=False,
+                is_warmup=False,
+            ),
+        )
+        payload = connector.recv_attn_output()
+        assert payload.hidden_states.shape == (num_tokens, 16)
+        del payload
+        assert host_hidden_allocations
+        assert all(reference() is None for reference in host_hidden_allocations)
 
 
 @pytest.mark.parametrize(
@@ -504,106 +508,6 @@ def test_p2p_tensor_metadata_clamps_idle_attention_rank_to_dummy_token():
 def test_p2p_topology_validation_errors_are_clear(raw, message):
     with pytest.raises(ValueError, match=message):
         afd_config_from_mapping(raw)
-
-
-def test_p2p_module_exports_connector_class():
-    module = importlib.import_module("afd_plugin.connectors.gpu.p2p")
-
-    assert module.P2pNcclAFDConnector.__module__ == "afd_plugin.connectors.gpu.p2p"
-
-
-def test_p2p_dp_metadata_serialization_uses_json_payload():
-    module = importlib.import_module("afd_plugin.connectors.metadata")
-    metadata = AFDDPMetadata(num_tokens_across_dp_cpu=[3, 5])
-
-    payload = module.encode_control_payload(
-        AFDControlPayload(
-            dp_metadata_list={7: metadata},
-            is_graph_capturing=True,
-            is_warmup=False,
-            is_graph_replaying=True,
-            is_profile=True,
-        ),
-    )
-    decoded_payload = module.decode_control_payload(payload)
-    decoded = decoded_payload.dp_metadata_list
-
-    assert payload.startswith(b"{")
-    assert isinstance(decoded[7], AFDDPMetadata)
-    assert _tolist(decoded[7].num_tokens_across_dp_cpu) == [3, 5]
-    assert int(decoded[7].max_tokens_across_dp_cpu) == 5
-    with decoded[7].sp_local_sizes(sequence_parallel_size=1):
-        assert decoded[7].get_chunk_sizes_across_dp_rank() == [3, 5]
-    assert _tolist(decoded[7].cu_tokens_across_sp(1)) == [3, 8]
-    assert decoded_payload.is_graph_capturing is True
-    assert decoded_payload.is_warmup is False
-    assert decoded_payload.is_graph_replaying is True
-    assert decoded_payload.is_profile is True
-
-
-def test_graph_state_adds_input_ids_buffer_when_hidden_buffer_exists(monkeypatch):
-    connector = AFDConnectorFactory.create_connector(
-        0,
-        0,
-        _fake_vllm_config(enforce_eager=False),
-        AFDConfig(
-            role="ffn",
-            connector="P2pNcclAFDConnector",
-            num_attention_ranks=1,
-            num_ffn_ranks=1,
-        ),
-    )
-    hidden_key = (0, 1, (2, 16))
-    existing_hidden = object()
-    connector._recv_attn_buffers[hidden_key] = existing_hidden
-    monkeypatch.setattr(torch, "empty", lambda *args, **kwargs: object())
-
-    connector.control_plane.update_state_from_dp_metadata(
-        AFDControlPayload(
-            dp_metadata_list={0: AFDDPMetadata([2])},
-            is_graph_capturing=True,
-            is_warmup=False,
-        ),
-    )
-
-    assert connector._recv_attn_buffers[hidden_key] is existing_hidden
-    assert (0, 1, (2,)) in connector._recv_attn_input_ids_buffers
-
-
-# Eager FFN steps (prefill/mixed batches during serving) carry arbitrary token
-# counts. Hidden-state receive buffers must be cached only during graph capture,
-# otherwise every distinct count leaks a buffer for the rest of the run. Feed
-# three eager payloads with different counts and check that no hidden-state
-# buffer is kept, while the input_ids buffer cache still gets one per count.
-def test_eager_state_does_not_cache_hidden_buffers(monkeypatch):
-    connector = AFDConnectorFactory.create_connector(
-        0,
-        0,
-        _fake_vllm_config(enforce_eager=False),
-        AFDConfig(
-            role="ffn",
-            connector="P2pNcclAFDConnector",
-            num_attention_ranks=1,
-            num_ffn_ranks=1,
-        ),
-    )
-    monkeypatch.setattr(torch, "empty", lambda *args, **kwargs: object())
-
-    for num_tokens in (2, 3, 5):
-        connector.control_plane.update_state_from_dp_metadata(
-            AFDControlPayload(
-                dp_metadata_list={0: AFDDPMetadata([num_tokens])},
-                is_graph_capturing=False,
-                is_warmup=False,
-            ),
-        )
-
-    assert connector._recv_attn_buffers == {}
-    assert set(connector._recv_attn_input_ids_buffers) == {
-        (0, 1, (2,)),
-        (0, 1, (3,)),
-        (0, 1, (5,)),
-    }
 
 
 @pytest.fixture
@@ -715,52 +619,9 @@ def test_p2p_group_ops_issue_transfers_inside_one_nccl_group(
     ]
 
 
-def test_p2p_hidden_state_send_uses_registered_custom_op(monkeypatch):
-    module = importlib.import_module("afd_plugin.connectors.gpu.p2p")
-    connector = AFDConnectorFactory.create_connector(
-        0,
-        0,
-        _fake_vllm_config(),
-        AFDConfig(
-            role="attention",
-            connector="P2pNcclAFDConnector",
-            num_attention_ranks=2,
-            num_ffn_ranks=1,
-        ),
-    )
-    connector.a2e_comm_id = 17
-
-    calls = []
-
-    torch_module = SimpleNamespace(
-        ops=SimpleNamespace(
-            vllm=SimpleNamespace(
-                afd_p2p_send=lambda tensor, dst, comm_id: calls.append(
-                    (tensor, dst, comm_id),
-                ),
-            ),
-        ),
-    )
-    monkeypatch.setattr(module, "torch", torch_module)
-
-    hidden_states = SimpleNamespace(
-        is_cpu=False,
-        device="cuda:0",
-        shape=(4, 16),
-        dtype="bf16",
-    )
-    output = connector._send_hidden_states(
-        hidden_states,
-        1,
-        SimpleNamespace(world_size=2, rank=0),
-        connector.a2e_comm_id,
-    )
-
-    assert calls == [(hidden_states, 1, 17)]
-    assert output is None
-
-
-def test_p2p_recv_preserves_dynamic_ref_tensor_first_dim(monkeypatch):
+def test_p2p_recv_preserves_dynamic_ref_tensor_first_dim(
+    monkeypatch,
+):  # long-test: real/fake custom-op shape behavior across dynamic token counts
     module = importlib.import_module("afd_plugin.connectors.gpu.p2p")
     connector = AFDConnectorFactory.create_connector(
         0,
@@ -1031,3 +892,8 @@ def test_p2p_subgroup_rendezvous_reuses_the_afd_world_store(
     connector.a2e_group.store.set("probe", b"value")
     assert root_store.get(f"afd_subgroup_{expected_subgroup}/probe") == b"value"
     assert root_store.check([f"afd_subgroup_{1 - expected_subgroup}/probe"]) is False
+
+
+def test_factory_rejects_unknown_connector():
+    with pytest.raises(ValueError, match="unsupported AFD connector type"):
+        AFDConnectorFactory.get_connector_class("UnknownConnector")

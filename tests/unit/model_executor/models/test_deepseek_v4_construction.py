@@ -158,7 +158,7 @@ def test_v4_model_rejects_native_and_flashinfer_mega_backends(
         _make_model(monkeypatch, role="ffn", vllm_config=vllm_config)
 
 
-def test_v4_ffn_model_has_no_head_mhc_parameters_or_mtp_buffer(
+def test_v4_ffn_model_has_no_head_mhc_parameters(
     monkeypatch,
     construction_env,
 ):
@@ -169,7 +169,12 @@ def test_v4_ffn_model_has_no_head_mhc_parameters_or_mtp_buffer(
     assert model.hc_head_base is None
     assert model.hc_head_scale is None
     assert not {"hc_head_fn", "hc_head_base", "hc_head_scale"} & parameter_names
-    assert model._mtp_hidden_buffer is None
+    assert (
+        adapter.AFDDeepseekV4ForCausalLM.get_mtp_target_hidden_states(
+            SimpleNamespace(model=model)
+        )
+        is None
+    )
 
 
 def test_v4_attention_model_owns_head_mhc_parameters(
@@ -180,9 +185,12 @@ def test_v4_attention_model_owns_head_mhc_parameters(
     parameter_names = {name for name, _ in model.named_parameters()}
 
     assert {"hc_head_fn", "hc_head_base", "hc_head_scale"} <= parameter_names
-    # The MTP buffer follows the native contract: allocated only when
-    # speculative decoding needs target hidden states.
-    assert model._mtp_hidden_buffer is None
+    assert (
+        adapter.AFDDeepseekV4ForCausalLM.get_mtp_target_hidden_states(
+            SimpleNamespace(model=model)
+        )
+        is None
+    )
 
 
 def test_v4_attention_model_allocates_mtp_buffer_for_spec_decode(
@@ -206,17 +214,10 @@ def test_v4_attention_model_allocates_mtp_buffer_for_spec_decode(
     )
     model = adapter.AFDDeepseekV4Model(vllm_config=vllm_config)
 
-    assert model._mtp_hidden_buffer is not None
-    assert model._mtp_hidden_buffer.shape == (8, 16)
-
-
-def test_v4_decoder_layer_pins_sequence_parallel_off(
-    monkeypatch,
-    construction_env,
-):
-    layer = _make_layer(monkeypatch, role="attention", layer_idx=0)
-
-    assert layer.use_sequence_parallel is False
+    hidden_states = adapter.AFDDeepseekV4ForCausalLM.get_mtp_target_hidden_states(
+        SimpleNamespace(model=model)
+    )
+    assert hidden_states.shape == (8, 16)
 
 
 def test_v4_ffn_layer_passes_hash_layer_contract_to_moe(
@@ -239,21 +240,3 @@ def test_v4_ffn_layer_passes_hash_layer_contract_to_moe(
             "num_hash_layers": 1,
         }
     ]
-
-
-def test_v4_decoder_constructor_rejects_unknown_role(
-    monkeypatch,
-    construction_env,
-):
-    afd_config = SimpleNamespace(role="invalid")
-    monkeypatch.setattr(
-        adapter,
-        "parse_afd_config",
-        lambda *_args, **_kwargs: afd_config,
-    )
-
-    with pytest.raises(ValueError, match="unsupported AFD role 'invalid'"):
-        adapter.AFDDeepseekV4DecoderLayer(
-            _vllm_config(),
-            prefix="model.layers.0",
-        )

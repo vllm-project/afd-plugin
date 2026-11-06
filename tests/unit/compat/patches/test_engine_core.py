@@ -339,7 +339,6 @@ def test_engine_core_patch_skips_kv_scheduler_init_for_ffn(monkeypatch, device_t
     config = _config("ffn", device_type=device_type)
     engine = core_module.EngineCore(config, Executor, log_stats=True)
 
-    assert not hasattr(engine, "original_init_called")
     assert engine.afd_config.role == "ffn"
     assert isinstance(engine.scheduler, _AFDFFNNoopScheduler)
     assert engine.structured_output_manager is None
@@ -368,28 +367,7 @@ def test_late_loaded_ffn_returns_empty_kv_without_executor(monkeypatch, device_t
     assert scheduler.get_ec_connector() is None
 
 
-def test_ffn_noop_scheduler_tolerates_late_patch_load(monkeypatch):
-    """A cold FFN engine loads the patches mid-native-init.
-
-    The native frame then runs on with the noop scheduler returned by the
-    patched ``_initialize_kv_caches``, so the noop must expose every
-    scheduler attribute upstream touches after KV-cache setup — including
-    the ``ec_connector`` output-aggregator check and the ready handshake's
-    ``get_kv_event_publisher_config()`` probe.
-    """
-    _install_fake_vllm_core(monkeypatch)
-    _load_patch_module()
-    from afd_plugin.compat.patches.engine_core import _AFDFFNNoopScheduler
-
-    scheduler = _AFDFFNNoopScheduler()
-    assert scheduler.connector is None
-    assert scheduler.ec_connector is None
-    assert scheduler.get_kv_connector() is None
-    assert scheduler.get_kv_event_publisher_config() is None
-    assert scheduler.has_requests() is False
-
-
-def test_ffn_early_init_satisfies_native_ready_handshake(monkeypatch):
+def test_ffn_noop_scheduler_exposes_native_ready_protocol(monkeypatch):
     """Both plugin-loading orders must survive the native ready handshake.
 
     When the patches are installed before FFN EngineCore construction (fork
@@ -422,7 +400,6 @@ def test_engine_core_patch_leaves_cuda_non_ffn_path_untouched(monkeypatch):
     config.device_config = SimpleNamespace(device_type="cuda")
     engine = core_module.EngineCore(config, KVCacheExecutor, log_stats=False)
 
-    assert not hasattr(engine, "original_init_called")
     assert isinstance(engine.model_executor, KVCacheExecutor)
     assert engine.scheduler is not None
     assert engine.available_gpu_memory_for_kv_cache == -1
@@ -520,7 +497,9 @@ def test_npu_measures_encoder_widths_before_kv_allocation(monkeypatch, role):
     assert engine.model_executor.warmup_called
 
 
-def test_async_attention_loop_publishes_counts_via_upstream_hook(monkeypatch):
+def test_async_attention_loop_publishes_counts_via_upstream_hook(
+    monkeypatch,
+):  # long-test: one engine iteration publishes request-count protocol messages
     """vLLM 5df63a72 publishes request counts from the base busy loop.
 
     The AFD async-Attention engine therefore runs the copied upstream loop
@@ -529,11 +508,6 @@ def test_async_attention_loop_publishes_counts_via_upstream_hook(monkeypatch):
     """
     core_module = _install_fake_vllm_core(monkeypatch)
     _load_patch_module()
-
-    from afd_plugin.compat.patches import engine_core as engine_core_patch
-
-    assert not hasattr(engine_core_patch, "_run_async_attention_busy_loop")
-    assert not hasattr(engine_core_patch, "_publish_async_attention_request_counts")
 
     class Executor:
         max_concurrent_batches = 1

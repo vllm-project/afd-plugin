@@ -311,9 +311,9 @@ def _use_installed_patch(binding, symbol, marker_name, install):
         ),
     ],
 )
-def test_patch_preserves_upstream_signature(  # long-test: scoped table bindings.
+def test_patch_preserves_upstream_signature(
     target_module, owner, symbol, adapter_module, scope_name
-):
+):  # long-test: scoped table bindings.
     pytest.importorskip("torch")
     pytest.importorskip("vllm")
     # Ascend's platform module replaces TYPE_CHECKING-only config names with

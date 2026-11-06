@@ -35,7 +35,7 @@ validation_paths:
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v4_flash/test_gpu.py"
   - "tests/e2e/accuracy/**"
-  - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
 upstream_refs:
   - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
@@ -168,7 +168,7 @@ Both platforms require V2. The paired deployment constraints are:
 | Native DBO | Exactly two microbatches, Attention DP1 or DP > 1 | Eager or graph; exactly two microbatches, Attention DP > 1 | Eager only; exactly two microbatches at Attention DP1 or DP > 1 |
 | AFD async MoE ubatching | Not applicable | Not applicable | Legacy alias for native DBO; split selector is ignored |
 | Graph execution | Eager or `FULL_DECODE_ONLY` | Eager, `FULL`, or `FULL_DECODE_ONLY`; plain MLA graph DBO requires `FULL_DECODE_ONLY` | Eager Attention; independent FFN also supports the narrow W4A8/W8A8 FULL contract |
-| Model | Must resolve to a registered AFD architecture | Same | Registered DeepSeek-V2/V3 MLA or DeepSeek-V4; V4 requires `dynamicQuant=1` |
+| Model | Must resolve to a registered AFD architecture | Same | DeepSeek-V4 with layered W4A8/W8A8 FFN experts and `dynamicQuant=1` |
 
 Both roles validate the paired V2 topology, but only Attention uses the native
 V2 model runner. FFN remains connector-driven and uses its existing AFD runner
@@ -318,8 +318,7 @@ Enable vLLM native DBO with `--enable-dbo` on Attention. It:
 - does not support prefill or decode context parallel metadata.
 
 Native DBO owns request/token boundaries. Enable DBO on Attention only; Async FFN rejects native DBO flags and
-continues its work-item loop. For DeepSeek-V2/V3, enable chunked prefill so a
-request crossing a native microbatch boundary can attend to its prefix KV.
+continues its receive loop.
 `models/npu/async_cam_layout.py` retains only communication layout
 conversion, and `models/npu/async_cam_dbo.py` supplies the single-window receive
 hook. FlashComm1/SP is Attention-local and

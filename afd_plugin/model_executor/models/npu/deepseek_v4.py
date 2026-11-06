@@ -27,7 +27,6 @@ from vllm.sequence import IntermediateTensors
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
-    AFDF2ATransferPayload,
     AFDTransferContext,
     AFDTransferMetadata,
 )
@@ -449,41 +448,14 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
     def compute_ffn_output(
         self,
         hidden_states: torch.Tensor,
-        *,
-        group_list: torch.Tensor | None = None,
-        dynamic_scales: torch.Tensor | None = None,
-        expand_x_shared: torch.Tensor | None = None,
-        dynamic_scales_shared: torch.Tensor | None = None,
-        topk_scales: torch.Tensor | None = None,
-        group_list_type: int = 1,
         **_: Any,
-    ) -> torch.Tensor | AFDF2ATransferPayload:
+    ) -> torch.Tensor:
         if not isinstance(self.mlp, native.DeepseekV4MoE):
             raise RuntimeError(
                 "DSV4 compute_ffn_output requires the FFN role to own the MoE"
             )
         if self.compute_gate_on_attention:
-            if group_list is None:
-                raise RuntimeError(
-                    "DSV4 Attention-side routing requires CAM group_list on FFN",
-                )
-            from afd_plugin.model_executor.models.npu import (
-                deepseek_v2_attention_gate,
-            )
-
-            return deepseek_v2_attention_gate.compute_attention_gate_moe_ffn(
-                self,
-                hidden_states=hidden_states,
-                group_list=group_list,
-                dynamic_scales=dynamic_scales,
-                expand_x_shared=expand_x_shared,
-                dynamic_scales_shared=dynamic_scales_shared,
-                topk_scales=topk_scales,
-                group_list_type=group_list_type,
-                # DSV4's Attention-side CANN gate folds routed scaling into
-                # topk_weights, which CAM applies during combine-recv.
-                routed_scale_applied_in_topk=True,
-            )
+            raise RuntimeError("Async CAM FFN requires the layered executor")
         # Target Hash MoE takes explicit token IDs from the CAM transfer.
         return self.mlp(hidden_states, input_ids=get_forward_context().input_ids)
 
@@ -846,7 +818,7 @@ def _extract_async_cam_layered_weights(
             )
         )
     # One layered call shares static geometry, quantization, and scaling
-    # across every selectable layer; heterogeneous layers use the legacy path.
+    # across every selectable layer; incompatible layers are unsupported.
     if any(weight.signature() != weights[0].signature() for weight in weights):
         return [], "heterogeneous expert geometry, quantization or model semantics"
     return weights, ""

@@ -268,7 +268,9 @@ def test_send_attn_output_selects_the_operator_ids_mode(monkeypatch):
     assert without_ids[-1] is None
 
 
-def test_recv_attn_output_mode_and_ids_follow_the_receiver_declaration(monkeypatch):
+def test_recv_attn_output_mode_and_ids_follow_the_receiver_declaration(
+    monkeypatch,
+):  # long-test: paired IDs/no-IDs receive ABI and returned tensor values
     """The receiving rank declares the mode and gets ids only in that mode.
 
     ``recv_input_ids`` is the FFN side's half of the run-level decision: it

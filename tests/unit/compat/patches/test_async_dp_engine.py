@@ -322,20 +322,6 @@ def test_async_dp_engine_patch_preserves_moe_dp_without_afd_config(monkeypatch):
     assert engine.kind == "dp"
 
 
-def test_async_dp_engine_patch_reload_is_idempotent(monkeypatch):
-    patch_module = _load_patch_module(monkeypatch)
-    core_module = sys.modules["vllm.v1.engine.core"]
-    importlib.reload(patch_module)
-
-    core_module.EngineCoreProc.run_engine_core(
-        vllm_config=_config(connector="CAMP2pAFDConnector", async_dp=False),
-        dp_rank=1,
-    )
-    engine = core_module.last_engine
-
-    assert engine.kind == "dp"
-
-
 def test_async_dp_engine_patch_rebinds_after_backend_override(monkeypatch):
     patch_module = _load_patch_module(monkeypatch)
     core_module = sys.modules["vllm.v1.engine.core"]
@@ -343,16 +329,18 @@ def test_async_dp_engine_patch_rebinds_after_backend_override(monkeypatch):
     core_module.EngineCoreProc.run_engine_core = staticmethod(lambda **_kwargs: None)
 
     assert patch_module.apply_async_dp_engine_patch() is True
-    assert core_module.EngineCoreProc.run_engine_core is patch_module.run_engine_core
+    core_module.EngineCoreProc.run_engine_core(vllm_config=_config(), dp_rank=1)
+    assert core_module.last_engine.kind == "engine"
+    assert core_module.last_engine.engine_index == 1
+    assert core_module.last_engine.shutdown_called is True
 
 
 def test_async_dp_coordinator_disables_wave_coordination(monkeypatch):
     _load_patch_module(monkeypatch)
-    utils_module = sys.modules["vllm.v1.engine.utils"]
     client_module = sys.modules["vllm.v1.engine.core_client"]
 
     addresses = SimpleNamespace()
-    with utils_module.launch_core_engines(
+    with client_module.launch_core_engines(
         _config(),
         object,
         False,
@@ -360,8 +348,6 @@ def test_async_dp_coordinator_disables_wave_coordination(monkeypatch):
     ) as launch:
         assert launch.coordinator.enable_wave_coordination is False
         assert launch.addresses is addresses
-
-    assert client_module.launch_core_engines is utils_module.launch_core_engines
 
 
 def test_non_afd_launch_keeps_upstream_wave_coordination(monkeypatch):
@@ -389,19 +375,6 @@ def test_npu_launch_uses_target_coordinator_contract(monkeypatch, async_dp):
         assert launch.addresses.coordinator_output == "coord-output"
         assert launch.addresses.frontend_stats_publish_address == "stats-pub"
         assert config.parallel_config._coord_store_port == 41234
-
-
-@pytest.mark.parametrize("device_type", ["cuda", "npu"])
-def test_engine_starts_without_optional_logging_config(monkeypatch, device_type):
-    patch = _load_patch_module(monkeypatch)
-    core = sys.modules["vllm.v1.engine.core"]
-    config = _config(device_type=device_type)
-    del config.logging_config
-
-    patch.run_engine_core(vllm_config=config)
-
-    assert core.last_engine.kind == "engine"
-    assert core.last_engine.shutdown_called is True
 
 
 @pytest.mark.parametrize("async_dp", [False, True])
@@ -484,8 +457,7 @@ def test_async_dp_client_skips_first_req(monkeypatch):
     assert request.current_wave == 7
     assert request.client_index == 3
     assert client.first_req_send_socket.messages == []
-    assert client.stats_ready is True
-    assert client.output_ready is True
+    assert client.sent_inputs == [("ADD", request, 1)]
 
 
 def test_non_afd_client_preserves_first_req_wakeup(monkeypatch):

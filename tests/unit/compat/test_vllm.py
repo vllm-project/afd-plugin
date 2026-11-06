@@ -11,26 +11,12 @@ from afd_plugin.compat import vllm as compat
 
 
 @pytest.mark.parametrize(
-    ("version", "supported"),
-    [
-        ("0.32.0", True),
-        ("0.32.0.dev42+g5df63a7", True),
-        ("0.32.1", False),
-        ("0.33.0", False),
-        ("0.30.0", False),
-        ("0.30.0.dev42+gced6857", False),
-    ],
-)
-def test_version_support_matches_target_release(version, supported):
-    assert compat.is_vllm_version_supported(version) is supported
-
-
-@pytest.mark.parametrize(
     ("version", "compatible"),
     [
         ("0.32.0", True),
         ("0.32.0.dev42+g5df63a7", True),
         ("0.32.1", False),
+        ("0.33.0", False),
         ("0.30.0", False),
         ("0.30.0.dev42+gced6857", False),
         ("unknown", False),

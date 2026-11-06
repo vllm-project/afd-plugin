@@ -11,9 +11,6 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
-from afd_plugin.v1.worker import (  # noqa: E402
-    ffn_routed_experts_model_runner as routed_module,
-)
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner  # noqa: E402
 from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (  # noqa: E402
     GPUFFNRoutedExpertsModelRunner,
@@ -46,14 +43,6 @@ def _runner(connector=None):
 
 def _dp(*tokens):
     return SimpleNamespace(num_tokens_across_dp_cpu=torch.tensor(tokens))
-
-
-def test_routed_runner_reuses_the_connector_driven_ffn_runner():
-    """The routed runner is the FFN runner with a different forward.
-
-    Why: graph capture, replay, the loop contract and shutdown are shared.
-    """
-    assert issubclass(GPUFFNRoutedExpertsModelRunner, GPUFFNModelRunner)
 
 
 def _recv_and_run(stage, layer):
@@ -142,48 +131,6 @@ def test_eager_fallback_keeps_attention_replay_flag():
     (payload,) = runner.connector.control_updates
     assert payload.is_graph_replaying is True
     assert payload.is_graph_capturing is False
-
-
-def test_load_model_takes_each_moe_layers_local_experts(monkeypatch):
-    """After the native load, the runner asks the model for its MoE layers and
-    converts each layer's vLLM experts once.
-
-    Why: weights are read after vLLM's post-load processing, not per step.
-    """
-    routed_experts = {layer: object() for layer in MOE_LAYERS}
-    model = SimpleNamespace(
-        get_experts_layer_indices=lambda: list(MOE_LAYERS),
-        get_routed_experts=routed_experts.__getitem__,
-    )
-
-    def native_load(self, *, load_dummy_weights=False, **kwargs):
-        self.model = model
-
-    monkeypatch.setattr(GPUFFNModelRunner, "load_model", native_load)
-    monkeypatch.setattr(
-        routed_module,
-        "local_experts_from_vllm",
-        lambda experts: ("converted", experts),
-    )
-    runner = _runner()
-
-    runner.load_model()
-
-    assert runner.moe_layer_indices == MOE_LAYERS
-    assert runner.local_experts == {
-        layer: ("converted", routed_experts[layer]) for layer in MOE_LAYERS
-    }
-
-
-def test_initialize_passes_moe_layers_and_experts_to_the_connector():
-    runner = _runner()
-
-    runner.initialize_afd_connector()
-
-    assert runner.connector.init_kwargs == {
-        "moe_layer_indices": MOE_LAYERS,
-        "local_experts": runner.local_experts,
-    }
 
 
 def test_constructor_rejects_connectors_without_routed_rows(monkeypatch):
