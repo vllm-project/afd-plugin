@@ -258,8 +258,8 @@ BF16 transport (`quant_mode: 0`), no DBO and no ubatching, four Attention ranks 
 and four FFN ranks on devices `4-7`.
 
 Set `afd.compute_gate_on_attention` to `true` on **both** roles and leave the connector-local
-`compute_gate_on_attention` key out of `connector_extra_config`; that key is an operator option, not
-a routing switch.
+`compute_gate_on_attention` key out of `connector_extra_config`; that key is kept for backwards
+compatibility with older configurations and does not control routing.
 
 The FFN service uses devices `4,5,6,7` and starts first:
 
