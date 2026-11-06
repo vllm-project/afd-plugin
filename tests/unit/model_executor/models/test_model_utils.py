@@ -117,7 +117,9 @@ def test_model_config_rejects_qwen_on_npu_without_mutation(model_utils):
 @pytest.mark.parametrize("device_type", ["cuda", "cpu"])
 def test_model_config_rejects_deepseek_v41_outside_npu(model_utils, device_type):
     hf_config = SimpleNamespace(architectures=["DeepseekV41ForCausalLM"])
-    with pytest.raises(ValueError, match="DeepSeek-V4.1 supports Ascend NPU execution only"):
+    with pytest.raises(
+        ValueError, match="DeepSeek-V4.1 supports Ascend NPU execution only"
+    ):
         model_utils.get_afd_model_config(
             SimpleNamespace(hf_config=hf_config), device_type=device_type
         )

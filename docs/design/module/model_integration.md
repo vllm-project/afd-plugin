@@ -34,7 +34,7 @@ verified_platform_refs:
   - "CAM async NPU model E2E path"
   - "DeepSeek V4 CUDA contract tests and E2E profiles; see execution-platform matrix for hardware scope"
   - "DeepSeek V4 Ascend Hash-id boundary has focused unit coverage and a historical manual Ascend 950 run"
-  - "DeepSeek V4.1 Ascend boundary has CPU contract coverage only; no hardware E2E run yet"
+  - "DeepSeek V4.1: historical A1/F12 W8A8 eager non-layered run in PR #534; current layered path is not hardware-qualified"
 related_issues:
   - "#86"
   - "#88"
@@ -206,7 +206,9 @@ architecture rather than a V4 variant: it adds source-shared hybrid attention
 state, candidate-index buffers, Engram n-gram memory, and bounded decoder
 replay. Attention therefore keeps the complete native decoder forward and only
 its FFN slot is replaced by a parameter-free `RemoteFFNProxy`. FFN constructs
-the native `DeepseekV41MoE` and serves it through `compute_ffn_output()`.
+the native `DeepseekV41MoE`. Async CAM executes routed experts through the
+mandatory layered executor using `get_async_cam_layered_weights()`; synchronous
+CAMP2P uses `compute_ffn_output()` with the gate on FFN.
 
 The router shell, CAM exchange, shared-expert layout, and layered FFN extraction
 are parameter-identical to DeepSeek V4, so the adapter subclasses
@@ -228,16 +230,22 @@ loader runs. `attn`/`self_attn` and `engram` load on Attention;
 `ffn`/`mlp` parameters load on FFN except gate parameters, which follow
 `compute_gate_on_attention` and the vision-only `gate.bias_vl` bias, which is
 FFN-only; norms, `hc_*` state, and non-layer paths load on both roles;
-`vision.`, `aligner.`, `image_`, and `mtp.` paths are dropped. An unclassified
+`vision.`, `aligner.`, `image_`, and `mtp.` paths are dropped after removing
+an optional `model.` prefix for classification. Original names reach the loader
+unchanged. An unclassified
 layer path raises instead of silently loading on both roles.
 
 This path requires Ascend NPU, text-only execution through
 `--language-model-only`, and pipeline-parallel size 1. Async CAM additionally
 requires `compute_gate_on_attention=true`; sequence-parallel MoE is allowed only
 in that mode. It rejects EPLB, prefill/decode context parallelism, speculative
-decoding, LoRA, and `cache_config.swa_bounded_replay` during construction. There
-is no hardware E2E evidence yet; the boundary is validated by CPU contract tests
-only.
+decoding, LoRA, and `cache_config.swa_bounded_replay` during construction. The
+[historical validation record](https://github.com/vllm-project/afd-plugin/pull/534#issuecomment-6673840619)
+reports A3 A1/F12 W8A8 eager serving with the legacy non-layered FFN path and
+a server-local prefix fix. It does not qualify this rebased layered path;
+role loading, generated-answer accuracy and concurrent serving need a new NPU
+run. Graph execution, long stability runs and performance gains remain
+unqualified.
 
 ### Qwen3 MoE CUDA boundary
 

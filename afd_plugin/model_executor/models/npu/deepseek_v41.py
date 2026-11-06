@@ -8,7 +8,8 @@ hyper-connection (HC) state transitions around attention and FFN, and optional
 Engram n-gram lookup tables.  This adapter therefore keeps the native layer
 forward path on the Attention role and replaces only the FFN module with the
 AFD remote proxy.  The FFN role constructs the native ``DeepseekV41MoE`` block
-and exposes it through the runner-facing ``compute_ffn_output`` hook.
+and exposes its weights to the async layered executor. Synchronous CAMP2P
+uses the runner-facing ``compute_ffn_output`` hook.
 
 Engram tables, candidate buffers, and decoder replay belong to the Attention
 role: only that role executes the backbone forward.  The FFN role declares
@@ -30,7 +31,7 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers import fused_moe
 
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
-from afd_plugin.connectors import AFDExpertRoutingSpec, AFDF2ATransferPayload
+from afd_plugin.connectors import AFDExpertRoutingSpec
 from afd_plugin.model_executor.models.npu.deepseek_v4 import (
     AFDDeepseekV4AttentionGateRemoteMoE,
     AFDDeepseekV4RemoteMoE,
@@ -110,6 +111,7 @@ def _checkpoint_weight_roles(
     the n-gram tables; the FFN role must not receive their checkpoint paths.
     """
 
+    name = name.removeprefix("model.")
     if name.startswith(_MULTIMODAL_NAME_PREFIXES) or name.startswith(
         _DEFERRED_NAME_PREFIXES
     ):
@@ -304,7 +306,8 @@ class AFDDeepseekV41DecoderLayer(native.DeepseekV41DecoderLayer):
     Attention role it executes the full native HC/DSA/Engram sequence and the
     ``RemoteFFNProxy`` makes the AFD transfer at exactly the native FFN
     boundary.  The FFN role is connector-driven and does not call this full
-    forward method; it invokes ``compute_ffn_output`` instead.
+    forward method; async CAM uses the layered executor and synchronous CAMP2P
+    invokes ``compute_ffn_output`` instead.
     """
 
     # Upstream source: vllm-ascend bd42eea01d8312c4df469fabaed45f77a12df4d3,
@@ -447,41 +450,14 @@ class AFDDeepseekV41DecoderLayer(native.DeepseekV41DecoderLayer):
     def compute_ffn_output(
         self,
         hidden_states: torch.Tensor,
-        *,
-        group_list: torch.Tensor | None = None,
-        dynamic_scales: torch.Tensor | None = None,
-        expand_x_shared: torch.Tensor | None = None,
-        dynamic_scales_shared: torch.Tensor | None = None,
-        topk_scales: torch.Tensor | None = None,
-        group_list_type: int = 1,
         **_: Any,
-    ) -> torch.Tensor | AFDF2ATransferPayload:
+    ) -> torch.Tensor:
         if not isinstance(self.mlp, native.DeepseekV41MoE):
             raise RuntimeError(
                 "DSV4.1 compute_ffn_output requires the FFN role to own the MoE"
             )
         if self.compute_gate_on_attention:
-            if group_list is None:
-                raise RuntimeError(
-                    "DSV4.1 Attention-side routing requires CAM group_list on FFN",
-                )
-            from afd_plugin.model_executor.models.npu import (
-                deepseek_v2_attention_gate,
-            )
-
-            return deepseek_v2_attention_gate.compute_attention_gate_moe_ffn(
-                self,
-                hidden_states=hidden_states,
-                group_list=group_list,
-                dynamic_scales=dynamic_scales,
-                expand_x_shared=expand_x_shared,
-                dynamic_scales_shared=dynamic_scales_shared,
-                topk_scales=topk_scales,
-                group_list_type=group_list_type,
-                # The Attention-side CANN gate folds routed scaling into
-                # topk_weights, which CAM applies during combine-recv.
-                routed_scale_applied_in_topk=True,
-            )
+            raise RuntimeError("Async CAM FFN requires the layered executor")
         # Hash MoE layers take explicit token IDs from the CAM transfer.
         return self.mlp(hidden_states, input_ids=get_forward_context().input_ids)
 
@@ -958,7 +934,7 @@ def _extract_async_cam_layered_weights(
             )
         )
     # One layered call shares static geometry, quantization, and scaling
-    # across every selectable layer; heterogeneous layers use the legacy path.
+    # across every selectable layer; heterogeneous layers are unsupported.
     if any(weight.signature() != weights[0].signature() for weight in weights):
         return [], "heterogeneous expert geometry, quantization or model semantics"
     return weights, ""
