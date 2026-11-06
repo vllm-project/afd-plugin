@@ -20,9 +20,6 @@ from afd_plugin.connectors import (
 )
 from afd_plugin.connectors.metadata import FP8_DTYPE
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
-from afd_plugin.v1.worker.model_attachment import (
-    validate_external_model_attachment,
-)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -155,32 +152,6 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
         """
         super().load_model(load_dummy_weights=load_dummy_weights, **kwargs)
         self._take_local_experts(self.get_model())
-
-    # NPU parallel: afd_plugin/v1/worker/npu/async_ffn_model_runner.py::
-    #   AsyncNPUFFNModelRunner.attach_model.
-    # Reuse: YES for the attachment guard; expert extraction is GPU-specific
-    #   (FusedMoE Triton layout views).
-    def attach_model(
-        self, model: RoutedExpertsModel, *, model_memory_usage: int
-    ) -> None:
-        """Adopt a model loaded outside this runner, as ``load_model`` would.
-
-        The standalone FFN service builds and loads its own FFN-only model.
-        This hands it to the runner and builds the per-layer local-expert
-        views the connector reads, through the same
-        ``local_experts_from_vllm`` check ``load_model`` uses (Triton layout).
-        Must run before ``initialize_afd_connector`` because the connector
-        all-gathers these views in its startup collective, and only once,
-        because the connector keeps no way to swap them afterwards.
-        """
-        validate_external_model_attachment(
-            model_attached=self.model is not None,
-            connector_initialized=self.connector.is_initialized,
-            model_size_bytes=model_memory_usage,
-        )
-        self.model = model
-        self.model_memory_usage = model_memory_usage
-        self._take_local_experts(model)
 
     def _take_local_experts(self, model: RoutedExpertsModel) -> None:
         """Record the model's MoE layers and this rank's expert views per layer."""

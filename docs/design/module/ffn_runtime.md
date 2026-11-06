@@ -143,15 +143,15 @@ Qwen3-30B-A3B (BF16) over `DeepEPM2NAFDConnector` has a GPU standalone F,
   with `--dbo` are checked before any device work.
 - `GPUFFNEnvironment` selects the GPU, preflights afdEP and DeepGEMM, builds
   the F-only `VllmConfig` (`external_launcher`, DP = F ranks, TP 1, EP), selects
-  the AFD architecture, pins vLLM's MoE backend to Triton before any FusedMoE
-  is built, and creates the F-only world through vLLM's
+  the FFN-only routed-experts architecture, pins vLLM's MoE backend to Triton
+  before any FusedMoE is built, and creates the F-only world through vLLM's
   `init_worker_distributed_environment`.
-- `Qwen3RoutedExpertsModel` keeps only `model.layers.<i>.mlp` (native
+- `AFDQwen3MoeRoutedExperts` keeps only `model.layers.<i>.mlp` (native
   `Qwen3MoeSparseMoeBlock`) and loads through vLLM's `DefaultModelLoader`, so
   the EP weight filter, FusedMoE expert loading and strict loaded-weights check
   run unchanged; the embedding, final norm and LM head are not allocated.
-- `DeepEPM2NFFNBackend` constructs `GPUFFNRoutedExpertsModelRunner`, attaches
-  the model (`attach_model`), starts the connector, and delegates each step to
+- `DeepEPM2NFFNBackend` constructs `GPUFFNRoutedExpertsModelRunner`, loads the
+  shell through that runner, starts the connector, and delegates each step to
   `execute_connector_driven_step()`, the method the Worker loop also calls.
   CUDA graphs are captured lazily from Attention's payloads, as on the Worker
   path, so `/ready` means paired and receiving.

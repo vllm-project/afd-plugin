@@ -13,7 +13,7 @@ from vllm.config import VllmConfig
 from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.worker_base import CompilationTimes
 
-from afd_plugin.config import parse_afd_config
+from afd_plugin.config import AFDConfig, parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory, AFDRoutedExpertsConnector
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
@@ -30,6 +30,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 FFN_LOOP_JOIN_TIMEOUT_S = 5
+
+
+def _uses_routed_experts_connector(afd_config: AFDConfig) -> bool:
+    connector_cls = AFDConnectorFactory.get_connector_class(afd_config.connector)
+    return issubclass(connector_cls, AFDRoutedExpertsConnector)
 
 
 class AFDFFNWorker(Worker):
@@ -75,7 +80,7 @@ class AFDFFNWorker(Worker):
         """Initialize the native GPU worker with the connector-driven runner."""
 
         # ### PATCH START: validate and select the AFD model.
-        assert_compatible_afd_stack(
+        afd_config = assert_compatible_afd_stack(
             self.vllm_config,
             caller="AFDFFNWorker.init_device",
             expected_role="ffn",
@@ -88,6 +93,7 @@ class AFDFFNWorker(Worker):
         afd_model_config = get_afd_model_config(
             self.vllm_config.model_config,
             device_type="cuda",
+            routed_experts_connector=_uses_routed_experts_connector(afd_config),
         )
         self.vllm_config.model_config = afd_model_config
         self.model_config = afd_model_config
@@ -103,8 +109,7 @@ class AFDFFNWorker(Worker):
     def _make_model_runner(self) -> GPUModelRunner:
         """Construct the connector-driven runner via the native factory hook."""
         afd_config = parse_afd_config(self.vllm_config, expected_role="ffn")
-        connector_cls = AFDConnectorFactory.get_connector_class(afd_config.connector)
-        if issubclass(connector_cls, AFDRoutedExpertsConnector):
+        if _uses_routed_experts_connector(afd_config):
             from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (
                 GPUFFNRoutedExpertsModelRunner,
                 select_routed_moe_backend,

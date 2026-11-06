@@ -25,7 +25,7 @@ The routed experts must divide evenly across the F ranks.
 CPU service / host runner -> FFNBackend
   DeepEPM2NFFNBackend (ffn_faas/platforms/gpu/backend.py)
     GPUFFNEnvironment: GPU, F-only NCCL world and vLLM EP group
-    Qwen3RoutedExpertsModel: model.layers.<i>.mlp only, native vLLM loader
+    AFDQwen3MoeRoutedExperts: model.layers.<i>.mlp only, native vLLM loader
     GPUFFNRoutedExpertsModelRunner: the Worker path's FFN runner
       DeepEPM2NAFDConnector: handshake, control plane, lanes, experts
 ```

@@ -97,8 +97,8 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
         ``EngineArgs.create_engine_config`` (with the AFD plugin's config
         patches, which accept DBO without a DeepEP all2all backend), then
         re-asserts the ``external_launcher`` executor, swaps in the
-        AFD-prefixed model architecture that ``AFDFFNWorker.init_device``
-        selects, and pins vLLM's MoE backend to Triton as
+        FFN-only routed-experts architecture that ``AFDFFNWorker.init_device``
+        selects for this connector, and pins vLLM's MoE backend to Triton as
         ``AFDFFNWorker._make_model_runner`` does. The pin must happen before
         any FusedMoE is constructed: FusedMoE picks its weight layout at
         construction, and a reordered layout would be read silently wrong.
@@ -115,7 +115,9 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
         # platform defaults would pick for an ordinary engine.
         reassert_external_launcher(config)
         config.model_config = get_afd_model_config(
-            config.model_config, device_type="cuda"
+            config.model_config,
+            device_type="cuda",
+            routed_experts_connector=True,
         )
         select_routed_moe_backend(config)
         return config

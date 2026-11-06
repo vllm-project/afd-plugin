@@ -19,12 +19,9 @@ from afd_plugin.connectors.gpu.deepep_m2n.connector import DeepEPM2NAFDConnector
 from afd_plugin.ffn_faas.model_utils import parameter_storage_bytes
 from afd_plugin.ffn_faas.platforms.gpu.environment import GPUFFNEnvironment
 from afd_plugin.ffn_faas.platforms.gpu.qwen3_model import Qwen3CheckpointDescription
-from afd_plugin.ffn_faas.platforms.gpu.qwen3_routed_model import (
-    Qwen3RoutedExpertsModel,
-    load_qwen3_routed_experts,
-)
 from afd_plugin.ffn_faas.platforms.gpu.settings import GPUFFNConfig
 from afd_plugin.ffn_faas.service import FFNService, ServicePhase
+from afd_plugin.model_executor.models.qwen3_moe import AFDQwen3MoeRoutedExperts
 from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (
     GPUFFNRoutedExpertsModelRunner,
 )
@@ -49,7 +46,7 @@ class DeepEPM2NFFNBackend:
         self.settings = settings
         self.environment = GPUFFNEnvironment(settings)
         self.runner: GPUFFNRoutedExpertsModelRunner | None = None
-        self.model: Qwen3RoutedExpertsModel | None = None
+        self.model: AFDQwen3MoeRoutedExperts | None = None
         self._cancel_requested = threading.Event()
 
     def prepare(self, service: FFNService) -> None:
@@ -64,7 +61,7 @@ class DeepEPM2NFFNBackend:
         4. construct the routed-experts runner, which runs the ModelRunnerV2
            and CUDA-graph validation and creates the connector (no
            collective yet);
-        5. load the FFN-only Qwen3 shell and attach it to the runner;
+        5. load the FFN-only Qwen3 shell through the runner's native loader;
         6. start the connector: the collective M2N handshake with Attention,
            the model-info check, the NCCL control group, the lanes' DeepEP
            buffers and the dispatch-kernel precompile.
@@ -93,12 +90,12 @@ class DeepEPM2NFFNBackend:
                     f"{type(connector).__name__}"
                 )
             service.loading_progress(0, total_experts)
-            self.model = load_qwen3_routed_experts(config, environment.device)
+            self.runner.load_model()
+            self.model = self.runner.get_model()
             # vLLM's loader reports no per-expert progress; this rank's experts
             # are all loaded once it returns.
             service.loading_progress(total_experts, total_experts)
             parameter_bytes = parameter_storage_bytes(self.model)
-            self.runner.attach_model(self.model, model_memory_usage=parameter_bytes)
             local_expert_ids = self.runner.local_experts[
                 self.runner.moe_layer_indices[0]
             ].expert_ids
