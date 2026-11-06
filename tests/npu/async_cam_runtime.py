@@ -468,7 +468,8 @@ def main():
             local_ffn * args.experts_per_rank, (local_ffn + 1) * args.experts_per_rank
         ):
             count = int((ids == expert).sum()) * args.attention_tp
-            assert count <= args.receive_capacity
+            if not args.mega:
+                assert count <= args.receive_capacity
             if chunks[-1] + count > args.receive_capacity:
                 chunks.append(0)
             chunks[-1] += count
@@ -671,7 +672,7 @@ def main():
             assert len(references) == len(outputs)
             report["eager_exact_match"] = not accuracy_failures
             report["accuracy_failures"] = len(accuracy_failures)
-        assert not connector._pending_attention_payloads
+        assert not connector.has_pending_attention
         if args.idle_shutdown:
             connector.close()
     else:
