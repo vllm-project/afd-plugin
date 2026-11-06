@@ -179,8 +179,8 @@ role-rank totals equal to DP x TP, and a registered AFD architecture. Elastic
 EP, EPLB, sequence-parallel MoE and compile SP are rejected.
 
 Eager and `FULL_DECODE_ONLY` graph execution are accepted. V2 DBO requires
-exactly two microbatches and accepts Attention DP1 or DP > 1. The generic
-[GPU E2E runner](../../tests/e2e/runner.py) defines eager/graph DP2 and TP2
+exactly two microbatches and accepts Attention DP1 or DP > 1. The model-local
+[GPU E2E cases](../../tests/e2e/models/deepseek_v2_lite/cases.py) define eager/graph DP2 and TP2
 scenarios, including `afd-v2-eager-dbo-dp2` and
 `afd-v2-graph-dbo-dp2`. See the
 [runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix)

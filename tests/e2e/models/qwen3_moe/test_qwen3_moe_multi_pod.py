@@ -20,8 +20,8 @@ NCCL GIN (RDMA).
 from __future__ import annotations
 
 import os
-import sys
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
@@ -29,26 +29,22 @@ from tests.conftest import (
     download_dataset,
     download_model,
     preserve_environment_variable,
-    run_runner,
+    run_case_entry,
 )
-from tests.e2e.runner import GSM8K_LIMIT_ENV
+from tests.e2e.environment import model_multi_pod_command
+from tests.e2e.models.qwen3_moe.cases import MULTI_POD_IDS
 
 GSM8K_DATASET_ID = "openai/gsm8k"
 GSM8K_DATASET_CONFIG = "main"
 QWEN3_MOE_REPO_ID = "Qwen/Qwen3-30B-A3B"
-QWEN3_MOE_MAX_MODEL_LEN = 4096
-# The default sample limit of these cases; AFD_GSM8K_LIMIT overrides it.
-GSM8K_SAMPLE_LIMIT = 100
 # The layout is a second axis, orthogonal to the scenario id, so accuracy
 # evidence stays comparable with the single-host rows.
 POD_LAYOUTS = {
     "2pod-role-split": "2A0F,0A2F",
 }
-MULTI_POD_CASES = [
-    ("afd-deepep-m2n-eager-2a2f", "2pod-role-split"),
-    ("afd-deepep-m2n-graph-2a2f", "2pod-role-split"),
-    ("afd-deepep-m2n-graph-dbo-2a2f", "2pod-role-split"),
-]
+MULTI_POD_CASES = tuple(
+    (scenario, layout) for scenario in MULTI_POD_IDS for layout in POD_LAYOUTS
+)
 
 
 def _required_env(name: str) -> str:
@@ -79,31 +75,9 @@ def build_runner_command(scenario: str, layout_name: str) -> list[str]:
     only supplies what it cannot infer: the scenario, the shared rendezvous
     store host, and where to write results.
     """
-    command = [
-        sys.executable,
-        "-m",
-        "tests.e2e.multi_pod.runner",
-        "--scenario",
-        scenario,
-        "--pod-layout",
-        POD_LAYOUTS[layout_name],
-        "--run-id",
-        _required_env("AFD_E2E_RUN_ID"),
-        "--model",
-        _required_env("AFD_GPU_E2E_MODEL"),
-        "--gsm8k-output-path",
-        _required_env("AFD_E2E_GSM8K_OUTPUT"),
-        "--store-host",
-        _required_env("AFD_E2E_STORE_HOST"),
-        f"--common-vllm-arg=--max-model-len={QWEN3_MOE_MAX_MODEL_LEN}",
-    ]
-    store_port = os.environ.get("AFD_E2E_STORE_PORT")
-    if store_port:
-        command.extend(["--store-port", store_port])
-    for value in os.environ.get("AFD_E2E_POD_ENV", "").split(";"):
-        if value.strip():
-            command.extend(["--pod-env", value.strip()])
-    return command
+    return model_multi_pod_command(
+        "tests.e2e.models.qwen3_moe.cases", scenario, POD_LAYOUTS[layout_name]
+    )
 
 
 @pytest.mark.e2e
@@ -113,6 +87,7 @@ def build_runner_command(scenario: str, layout_name: str) -> list[str]:
     ids=[f"{scenario}-{layout}" for scenario, layout in MULTI_POD_CASES],
 )
 def test_multi_pod_deepep_m2n(scenario: str, layout_name: str) -> None:
-    env = os.environ.copy()
-    env.setdefault(GSM8K_LIMIT_ENV, str(GSM8K_SAMPLE_LIMIT))
-    run_runner(build_runner_command(scenario, layout_name), env=env)
+    run_case_entry(
+        build_runner_command(scenario, layout_name),
+        Path(_required_env("AFD_E2E_GSM8K_OUTPUT")),
+    )

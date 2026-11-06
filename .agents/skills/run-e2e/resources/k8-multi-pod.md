@@ -5,9 +5,9 @@ layout splits Attention and FFN ranks across more than one pod — optionally
 spread across nodes, for a genuine cross-node fabric test — rather than
 running everything in one process on one machine.
 
-This walkthrough assumes the model under test is
-`deepseek-ai/DeepSeek-V2-Lite`; substitute `MODEL`, `MODEL_PVC`, and the
-scenario's topology if you're running a different model.
+This walkthrough uses the model-owned DeepSeek-V2-Lite GPU entry. Select the
+appropriate model module, local checkpoint and PVC for another existing suite;
+do not infer model selection from the shared coordinator.
 
 ## How it works
 
@@ -19,8 +19,8 @@ Attention/FFN ranks to launch) from its Kubernetes-assigned completion
 index, then rendezvous with its peers over a shared store before serving
 and evaluating GSM8K. No process outside the pods holds test state or
 drives the run: you apply the Service and Job once, and every pod decides
-its own role, coordinates with its peers, and reports its own pass/fail
-through its container exit code.
+its own role, coordinates with its peers, and reports execution through its
+container exit code and acceptance through its run record.
 
 ## Prerequisites
 
@@ -75,10 +75,9 @@ both FFN ranks; that string becomes the runner's `--pod-layout` argument
 below, and its entry count becomes `NUM_PODS`, computed automatically from
 `POD_LAYOUT` in the Deploy script — you don't set it yourself.
 
-The ranks across all entries must sum to the scenario's topology (a
-`2a2f` scenario needs 2 Attention and 2 FFN ranks in total), and no single
-pod's rank count for a role may exceed that role's TP size — a TP group
-cannot span pods.
+The ranks across all entries must sum to the scenario's topology (a `2a2f`
+scenario needs 2 Attention and 2 FFN ranks in total). Each pod's rank count
+for a role must be divisible by that role's TP size: a TP group cannot span pods.
 
 This assumes every pod requests the same number of GPUs (`GPUS_PER_POD`
 below): the layout can vary how many Attention/FFN ranks each pod carries,
@@ -99,7 +98,7 @@ SCENARIO=afd-graph-2a2f
 POD_LAYOUT=2A0F,0A2F
 NUM_PODS=$(($(tr -cd ',' <<<"$POD_LAYOUT" | wc -c) + 1))   # entry count of POD_LAYOUT
 RUN_ID=$(date +%s)
-MODEL=deepseek-ai/DeepSeek-V2-Lite
+MODEL=/models   # local checkpoint root on the pre-warmed model PVC
 GSM8K_OUTPUT_PATH=/work/gsm8k-results
 MODEL_PVC=deepseek-v2-lite-weights
 GPUS_PER_POD=2
@@ -161,7 +160,8 @@ spec:
           args:
             - python
             - -m
-            - tests.e2e.multi_pod.runner
+            - tests.e2e.models.deepseek_v2_lite.cases
+            - multi-pod
             - --scenario
             - ${SCENARIO}
             - --pod-layout
@@ -170,7 +170,9 @@ spec:
             - ${RUN_ID}
             - --model
             - ${MODEL}
-            - --gsm8k-output-path
+            - --device-backend
+            - gpu
+            - --output-path
             - ${GSM8K_OUTPUT_PATH}
             - --store-host
             - ${JOB_NAME}-0.${JOB_NAME}
@@ -247,15 +249,26 @@ kubectl get pods -n ${NAMESPACE} -l job-name=${JOB_NAME} \
 kubectl logs -n ${NAMESPACE} <pod-name>
 ```
 
-The run passed only if every pod's exit code is `0`; a pod with no terminal
-state yet (still running when the wait timed out) is not a pass.
+Acceptance requires every pod's exit code to be `0` and every pod's `run.json`
+to have `acceptance_passed=true`. A pod with no terminal state yet is not a pass.
+The model CLI allows debug workloads, so CLI exit code alone is insufficient.
+The pytest entries enforce that requirement through `run_case_entry()`.
+`GSM8K_OUTPUT_PATH` is the run root: role logs and `run.json` are written there,
+with evaluator artifacts under `evaluation/`.
+
+The seven existing GPU multi-pod entries retain workload, liveness and cleanup
+checks. They do not collect cross-pod graph/DBO/Hash execution evidence. Qwen3
+DeepEP M2N uses `tests.e2e.models.qwen3_moe.cases multi-pod`, its declared
+role-split layouts and 100-sample workload; its connector runtime must already
+be available. See [execution and maintenance](../../../../tests/e2e/multi_pod/README.md).
 
 ## DSV4 Flash on Ascend NPU
 
 `afd-dsv4-flash-async-cam-dp2tp4-ep8` splits its fixed 16-NPU deployment
 (Attention DP2/TP4, FFN DP8/TP1/EP8, async CAM) across two 8-NPU pods. Its
-pass criterion is the ten concurrent chat completions, not GSM8K. This path
-has unit coverage only; it has not yet run on NPU hardware.
+pass criterion is the ten concurrent chat completions, not GSM8K. This retained
+NPU path requires separate hardware evidence; GPU/host validation does not
+qualify it.
 
 Start from the Deploy template above and change:
 
