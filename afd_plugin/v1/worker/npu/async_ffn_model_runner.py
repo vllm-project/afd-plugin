@@ -33,6 +33,9 @@ from afd_plugin.model_executor.npu.async_cam_layered import (
     AsyncCAMLayeredExecutor,
     LayeredFFNWeights,
 )
+from afd_plugin.v1.worker.model_attachment import (
+    validate_external_model_attachment,
+)
 from afd_plugin.v1.worker.npu.async_ffn_two_stream import AsyncFFNTwoStream
 from afd_plugin.validation import (
     cam_receive_capacity,
@@ -89,10 +92,11 @@ class AsyncNPUFFNModelRunner:
 
     def attach_model(self, model: FFNModel, *, parameter_bytes: int) -> None:
         """Borrow an independently loaded model without constructing a Worker."""
-        if self.model is not None or self.connector.is_initialized:
-            raise RuntimeError("Async FFN model must be attached before CAM startup")
-        if parameter_bytes < 0:
-            raise ValueError("model parameter size must be nonnegative")
+        validate_external_model_attachment(
+            model_attached=self.model is not None,
+            connector_initialized=self.connector.is_initialized,
+            model_size_bytes=parameter_bytes,
+        )
         self.model = model
         self.model_memory_usage = parameter_bytes
 

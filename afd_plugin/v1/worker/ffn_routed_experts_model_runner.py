@@ -20,6 +20,9 @@ from afd_plugin.connectors import (
 )
 from afd_plugin.connectors.metadata import FP8_DTYPE
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
+from afd_plugin.v1.worker.model_attachment import (
+    validate_external_model_attachment,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -154,11 +157,9 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
         self._take_local_experts(self.get_model())
 
     # NPU parallel: afd_plugin/v1/worker/npu/async_ffn_model_runner.py::
-    #   AsyncNPUFFNModelRunner.attach_model (same guard: before connector
-    #   startup and at most once; NPU borrows layered W4A8 weight views).
-    # Reuse: PARTIAL - the attach-once/before-init guard is identical; the
-    #   expert extraction is GPU-specific (FusedMoE Triton layout views).
-    #   REFACTOR-CANDIDATE(R5): a shared attach guard for both runners.
+    #   AsyncNPUFFNModelRunner.attach_model.
+    # Reuse: YES for the attachment guard; expert extraction is GPU-specific
+    #   (FusedMoE Triton layout views).
     def attach_model(
         self, model: RoutedExpertsModel, *, model_memory_usage: int
     ) -> None:
@@ -172,12 +173,11 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
         all-gathers these views in its startup collective, and only once,
         because the connector keeps no way to swap them afterwards.
         """
-        if self.model is not None or self.connector.is_initialized:
-            raise RuntimeError(
-                "a routed FFN model must be attached once, before connector startup"
-            )
-        if model_memory_usage < 0:
-            raise ValueError("model memory usage must be non-negative")
+        validate_external_model_attachment(
+            model_attached=self.model is not None,
+            connector_initialized=self.connector.is_initialized,
+            model_size_bytes=model_memory_usage,
+        )
         self.model = model
         self.model_memory_usage = model_memory_usage
         self._take_local_experts(model)
