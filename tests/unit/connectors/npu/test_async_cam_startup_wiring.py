@@ -276,6 +276,7 @@ def test_static_validation_precedes_hccl_creation(
         ),
         graph_startup=AsyncCAMGraphStartup(0, 1, 2),
     )
+    connector._session = connector_module.PushCAMSession(connector.activation_dtype)
     if dbo_flag is not None:
         setattr(connector.vllm_config.parallel_config, dbo_flag, True)
 
@@ -519,7 +520,7 @@ def receiver_graph_worker(ffn_owners, monkeypatch):
     )
     connector = SimpleNamespace(
         is_initialized=True,
-        ffn_session=sys.modules["afd_plugin.connectors.base"].DefaultFFNSession,
+        ffn_session=sys.modules["afd_plugin.connectors.base"].FFNExecutionSession,
         close=lambda: None,
         recv_attn_output=lambda: SimpleNamespace(
             hidden_states=object(), context=SimpleNamespace(states=state)
@@ -667,7 +668,7 @@ def test_ffn_runner_loads_model_and_rejects_second_load(
     monkeypatch.setattr(runtime, "fail_if_unsupported_npu_afd_features", calls.validate)
     monkeypatch.setattr(runtime, "create_afd_npu_profiler", lambda role: None)
     connector = SimpleNamespace(
-        ffn_session=sys.modules["afd_plugin.connectors.base"].DefaultFFNSession
+        ffn_session=sys.modules["afd_plugin.connectors.base"].FFNExecutionSession
     )
     device, model = SimpleNamespace(type="npu"), object()
     connector_name = "CAMAsyncAFDConnector" if async_connector else "CAMP2pAFDConnector"
@@ -743,14 +744,15 @@ def connector_world(monkeypatch):
             rank, 0, config, parse_afd_config(config), rank % 2
         )
         connector.graph_startup = startup
+        connector.ffn_session().startup = startup
         connector._initialized = True
-        connector.comm_args = object()
+        connector.ffn_session().comm_args = object()
         connectors.append(connector)
     return SimpleNamespace(connectors=connectors, runtime=runtime)
 
 
 def test_default_session_obeys_shutdown_without_drain(connector_world):
-    session = sys.modules["afd_plugin.connectors.base"].DefaultFFNSession()
+    session = sys.modules["afd_plugin.connectors.base"].FFNExecutionSession()
     assert session.keep_serving(False)
     assert not session.keep_serving(True)
     assert not session.requires_drain
@@ -771,19 +773,23 @@ def test_close_preserves_receiver_communication_on_unsafe_session(
     connector.cam_pg = group = object()
     session = connector.ffn_session()
     if failure != "unfinished":
-        monkeypatch.setattr(connector, "_pull_has_active_source", lambda: False)
+        monkeypatch.setattr(
+            connector.ffn_session(), "pull_has_active_source", lambda: False
+        )
         session.drain(lambda: pytest.fail("idle source must not launch"))
         for attention in connector_world.connectors[:2]:
             attention.graph_startup._publish("pull_quiet")
         session.finish_receiver()
     if failure == "active":
-        monkeypatch.setattr(connector, "_pull_has_active_source", lambda: True)
+        monkeypatch.setattr(
+            connector.ffn_session(), "pull_has_active_source", lambda: True
+        )
     elif failure == "status":
 
         def fail_status():
             raise RuntimeError("sticky status -5")
 
-        monkeypatch.setattr(connector, "_check_pull_status", fail_status)
+        monkeypatch.setattr(connector.ffn_session(), "check_pull_status", fail_status)
     expected = "sticky status -5" if failure == "status" else "has not drained"
     with pytest.raises(RuntimeError, match=expected):
         connector.close()
@@ -800,7 +806,7 @@ def test_attention_step_recovers_after_error(connector_world, monkeypatch, failu
         if error[0] is not None:
             raise error[0]
 
-    monkeypatch.setattr(connector, "_check_pull_status", check_status)
+    monkeypatch.setattr(connector.ffn_session(), "check_pull_status", check_status)
     expected = ValueError if failure == "body" else RuntimeError
     with pytest.raises(expected, match="failed"), connector.attention_step():
         if failure == "body":
@@ -825,7 +831,7 @@ def test_nested_attention_step_defers_status_until_outer_boundary(
     def check_status():
         raise RuntimeError("sticky status")
 
-    monkeypatch.setattr(connector, "_check_pull_status", check_status)
+    monkeypatch.setattr(connector.ffn_session(), "check_pull_status", check_status)
     with pytest.raises(RuntimeError, match="sticky status"), connector.attention_step():
         with connector.attention_step():
             pass
@@ -875,19 +881,23 @@ def test_runner_shutdown_retains_model_and_communication_on_unsafe_session(
     runner._graph_receiver_exited = True
     resource = connector.comm_args
     if failure != "unfinished":
-        monkeypatch.setattr(connector, "_pull_has_active_source", lambda: False)
+        monkeypatch.setattr(
+            connector.ffn_session(), "pull_has_active_source", lambda: False
+        )
         runner.session.drain(lambda: pytest.fail("idle source must not launch"))
         for attention in connector_world.connectors[:2]:
             attention.graph_startup._publish("pull_quiet")
         runner.session.finish_receiver()
     if failure == "active":
-        monkeypatch.setattr(connector, "_pull_has_active_source", lambda: True)
+        monkeypatch.setattr(
+            connector.ffn_session(), "pull_has_active_source", lambda: True
+        )
     elif failure == "status":
 
         def fail_status():
             raise RuntimeError("status failed; retain resources")
 
-        monkeypatch.setattr(connector, "_check_pull_status", fail_status)
+        monkeypatch.setattr(connector.ffn_session(), "check_pull_status", fail_status)
     with pytest.raises(RuntimeError, match="retain resources"):
         runner.shutdown()
     assert runner.get_model() is model

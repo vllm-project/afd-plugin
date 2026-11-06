@@ -61,7 +61,10 @@ F HTTP API initialization is not a readiness requirement.
 ## Capture boundary and ownership
 
 By default, the runner owns capture/replay, weights, stable buffers, a private graph pool
-and one execution stream. The connector owns CAM communication. The host-only `AsyncCAMGraphStartup`
+and one execution stream. The connector owns HCCL, payload validation and
+communication lifecycle coordination. Its Push session owns per-stage queues;
+its Pull session owns a single window, native publish/combine, device status
+and quiet/drain/stopped. The host-only `AsyncCAMGraphStartup`
 coordinator owns Store negotiation, stage waits and failure propagation; it owns
 no device resources or threads. A captured transaction receives activations, scales, expert counts
 and the original return metadata from DR. Device-side layer selection uses
@@ -75,7 +78,8 @@ metadata goes to CS; host code does not select the layer or copy per-item inputs
 | CS completion tensor | Retained transfer state |
 | Weights and scale/compensation lists | Runner's model and executor |
 | Captured native workspace | Graph's private allocator pool |
-| HCCL group, communication arguments and windows | Connector |
+| HCCL group and final communication cleanup decision | Connector facade |
+| Communication arguments/windows and pending routing references | Selected Push/Pull session |
 
 Each business batch submits as many replays as there are loaded FFN layers,
 then waits once for device completion. This is a bounded submission count,
@@ -144,7 +148,8 @@ A3/910C, 4A/4F, A TP4, F TP1, receive capacity 128 and DBO disabled. Select
 this topology still needs target-device validation. Synthetic per-group
 coverage does not qualify loading real per-group checkpoints.
 
-- Host contracts: `tests/unit/connectors/npu/test_async_cam_pull.py`,
+- Host contracts: `tests/unit/connectors/npu/test_async_cam.py`,
+  `tests/unit/connectors/npu/test_async_cam_session.py`,
   `tests/unit/connectors/npu/test_async_cam_startup.py`,
   `tests/unit/v1/worker/test_async_ffn_graph.py`,
   `tests/unit/v1/worker/test_async_ffn_runtime.py`, and

@@ -221,6 +221,14 @@ prefill/decode batches and must be at least the microbatch count. Native slicing
 including parent padding and requests crossing a microbatch boundary. The model
 owns SP padding and each owner's layout restoration/TP collectives.
 
+The connector keeps configuration, topology, HCCL, payload validation and
+lifecycle coordination in `async_cam.py`. Its Push session keeps a FIFO per
+stage. Both sessions live in `async_cam_runtime/async_cam_session.py`. Pull owns one window
+across stages, native publish/combine, device status and shutdown coordination.
+The session is selected once at construction. Attention uses the existing
+connector entry points; FFN uses separate receive/send for Push, or Mega's fused
+transaction for Pull. Graph execution remains in the FFN ModelRunner.
+
 CAM has one physical window per Attention rank. Before another ubatch sends,
 a native peer receive hook completes the preceding raw receive with its owner's
 explicit transfer context. The resumed owner restores layout and adds shared
@@ -351,6 +359,7 @@ slice of the original metadata, or a device mapping, selects the layer; the
 original metadata goes to combine-send. Empty ranks, chunks, and ubatches use
 the existing communication protocol. With `AFD_CAM_OP_IO_LOG` enabled, the
 path logs only Tensor shape, dtype, and device without reading metadata values.
+Input field names follow the registered native operator schema.
 The Async eager worker synchronizes after each complete FFN layer loop; FULL
 submits a bounded batch on one stream and waits once for that batch. These
 submission loops do not define request boundaries. Measure peak
