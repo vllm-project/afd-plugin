@@ -12,7 +12,6 @@ checked here.
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +19,7 @@ from types import MappingProxyType
 from typing import Any
 
 from afd_plugin.config import DEEPEP_M2N_CONNECTOR, AFDConfig
+from afd_plugin.ffn_faas.platforms.launch import validate_common_ffn_launch
 
 # The only qualified payload: BF16 rows against BF16 expert weights.
 BF16_PAYLOAD = "bf16"
@@ -29,17 +29,14 @@ DBO_LANES = 2
 FFN_GRAPH_MODE = "FULL_DECODE_ONLY"
 EAGER_MODE = "eager"
 EXTERNAL_LAUNCHER = "external_launcher"
-MAX_PORT = 65535
 DEFAULT_AFD_PORT = AFDConfig.port
 DEFAULT_AFD_TIMEOUT_S = AFDConfig.afd_process_group_timeout_s
 
 
 # NPU parallel: afd_plugin/ffn_faas/platforms/npu/settings.py::FFNConfig.
-# Reuse: PARTIAL - rank, host/port and shutdown-timeout validation are the same
-#   checks; NPU also owns the CAM dispatch envelope, Attention TP and core
+# Reuse: PARTIAL - the launch module owns rank, rendezvous and shutdown
+#   validation; NPU also owns the CAM dispatch envelope, Attention TP and core
 #   budgets, which GPU adopts from the M2N handshake instead.
-#   REFACTOR-CANDIDATE(R3): a shared base for the F-only launch fields and
-#   their validation.
 @dataclass(frozen=True)
 class GPUFFNConfig:
     """Frozen settings of one F rank in a standalone DeepEP M2N deployment."""
@@ -68,16 +65,17 @@ class GPUFFNConfig:
         ``--dbo`` implies (1 without, 2 with). Every other connector option is
         validated by ``DeepEPM2NConfig.from_mapping`` once the backend runs.
         """
-        if self.attention_ranks <= 0 or self.ffn_ranks <= 0:
-            raise ValueError("Attention and FFN rank counts must be positive")
-        if not 0 <= self.rank < self.ffn_ranks or self.local_rank < 0:
-            raise ValueError("invalid F rank or local rank")
-        if not self.host or not 0 < self.port <= MAX_PORT:
-            raise ValueError("DeepEP M2N rendezvous requires a host and a valid port")
+        validate_common_ffn_launch(
+            attention_ranks=self.attention_ranks,
+            ffn_ranks=self.ffn_ranks,
+            rank=self.rank,
+            local_rank=self.local_rank,
+            host=self.host,
+            port=self.port,
+            shutdown_timeout=self.shutdown_timeout,
+        )
         if self.afd_timeout_s <= 0:
             raise ValueError("--afd-timeout must be positive")
-        if not math.isfinite(self.shutdown_timeout) or self.shutdown_timeout <= 0:
-            raise ValueError("shutdown timeout must be finite and positive")
         payload_format = self.connector_extra_config.get("payload_format", BF16_PAYLOAD)
         if payload_format != BF16_PAYLOAD:
             raise ValueError(

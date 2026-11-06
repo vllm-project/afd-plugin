@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 
 V2_MODEL_RUNNER_ENV = "VLLM_USE_V2_MODEL_RUNNER"
+MAX_PORT = 65535
 
 
 @dataclass(frozen=True)
@@ -40,3 +42,24 @@ def require_v2_model_runner() -> None:
     """Require the model-runner generation used by both A and F ranks."""
     if os.environ.get(V2_MODEL_RUNNER_ENV) != "1":
         raise ValueError(f"set {V2_MODEL_RUNNER_ENV}=1 on both A and F")
+
+
+def validate_common_ffn_launch(
+    *,
+    attention_ranks: int,
+    ffn_ranks: int,
+    rank: int,
+    local_rank: int,
+    host: str,
+    port: int,
+    shutdown_timeout: float,
+) -> None:
+    """Validate launch fields shared by every standalone FFN backend."""
+    if attention_ranks <= 0 or ffn_ranks <= 0:
+        raise ValueError("Attention and FFN rank counts must be positive")
+    if not 0 <= rank < ffn_ranks or local_rank < 0:
+        raise ValueError("invalid F rank or local rank")
+    if not host or not 0 < port <= MAX_PORT:
+        raise ValueError("FFN rendezvous requires a host and a valid port")
+    if not math.isfinite(shutdown_timeout) or shutdown_timeout <= 0:
+        raise ValueError("shutdown timeout must be finite and positive")
