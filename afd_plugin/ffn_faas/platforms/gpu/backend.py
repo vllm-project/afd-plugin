@@ -16,12 +16,12 @@ import threading
 from vllm.config import set_current_vllm_config
 
 from afd_plugin.connectors.gpu.deepep_m2n.connector import DeepEPM2NAFDConnector
+from afd_plugin.ffn_faas.model_utils import parameter_storage_bytes
 from afd_plugin.ffn_faas.platforms.gpu.environment import GPUFFNEnvironment
 from afd_plugin.ffn_faas.platforms.gpu.qwen3_model import Qwen3CheckpointDescription
 from afd_plugin.ffn_faas.platforms.gpu.qwen3_routed_model import (
     Qwen3RoutedExpertsModel,
     load_qwen3_routed_experts,
-    parameter_storage_bytes,
 )
 from afd_plugin.ffn_faas.platforms.gpu.settings import GPUFFNConfig
 from afd_plugin.ffn_faas.service import FFNService, ServicePhase

@@ -31,7 +31,7 @@ from vllm.model_executor.models import qwen3_moe as native
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.utils.torch_utils import set_default_torch_dtype
 
-from afd_plugin.model_executor.models.qwen3_moe import _weight_layer_path
+from afd_plugin.model_executor.checkpoint_paths import weight_layer_path
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -45,10 +45,10 @@ def _is_routed_mlp_path(name: str) -> bool:
 
     Keeps ``model.layers.<i>.mlp.*`` (routed experts and the unused gate) and
     drops embeddings, norms, Attention and the LM head, which this shell does
-    not construct. Reuses the AFD Qwen3 wrapper's path parser so both models
-    classify checkpoint names identically.
+    not construct. Reuses the shared checkpoint path parser so the Worker-path
+    wrapper and this shell classify checkpoint names identically.
     """
-    layer_path = _weight_layer_path(name)
+    layer_path = weight_layer_path(name)
     return layer_path is not None and layer_path[1] == ROUTED_STAGE
 
 
@@ -75,10 +75,6 @@ class _Qwen3RoutedExpertsLayer(nn.Module):
 class _Qwen3RoutedExpertsStack(nn.Module):
     """The ``model`` submodule: only ``layers``, each holding its MoE block."""
 
-    # Upstream: vLLM v0.32.0, vllm/model_executor/models/qwen3_moe.py,
-    # Qwen3MoeModel.hf_to_vllm_mapper; reused, not copied.
-    hf_to_vllm_mapper = native.Qwen3MoeModel.hf_to_vllm_mapper
-
     def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
         """Build one ``_Qwen3RoutedExpertsLayer`` per decoder layer."""
         super().__init__()
@@ -87,33 +83,6 @@ class _Qwen3RoutedExpertsStack(nn.Module):
             _Qwen3RoutedExpertsLayer(vllm_config, f"{prefix}.layers.{layer_idx}")
             for layer_idx in range(num_layers)
         )
-
-    # Upstream source: vLLM v0.32.0 (5df63a7203cdb9328d824a27b682e77c7b9928be),
-    # vllm/model_executor/models/qwen3_moe.py, Qwen3MoeModel.load_weights.
-    # Copied unchanged: the same AutoWeightsLoader, ignored suffixes and
-    # checkpoint mapper, so expert stacking and EP sharding stay in FusedMoE's
-    # own loader. Re-copy on a vLLM upgrade.
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load ``layers.*`` tensors through the native Qwen3 model loader path.
-
-        ``AutoWeightsLoader`` walks the module tree and hands each MoE block's
-        ``experts.*`` tensors to FusedMoE's ``load_weights``, which stacks
-        per-expert gate/up/down projections into ``w13``/``w2`` and keeps
-        only this rank's experts. Returns the loaded parameter names for the
-        strict loaded-weights check.
-        """
-        loader = AutoWeightsLoader(
-            self,
-            ignore_unexpected_suffixes=[
-                ".bias",
-                "_bias",
-                ".weight_scale",
-                "_weight_scale",
-                ".input_scale",
-                "_input_scale",
-            ],
-        )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class Qwen3RoutedExpertsModel(nn.Module):
@@ -138,26 +107,34 @@ class Qwen3RoutedExpertsModel(nn.Module):
         super().__init__()
         self.model = _Qwen3RoutedExpertsStack(vllm_config, MODEL_PREFIX)
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        """Whether vLLM can skip a shard containing only this checkpoint name."""
+        return not _is_routed_mlp_path(name)
+
     # Upstream source: vLLM v0.32.0 (5df63a7203cdb9328d824a27b682e77c7b9928be),
-    # vllm/model_executor/models/qwen3_moe.py, Qwen3MoeForCausalLM.load_weights.
-    # Copied with one marked difference, the routed-path filter.
+    # vllm/model_executor/models/qwen3_moe.py, Qwen3MoeModel.hf_to_vllm_mapper.
+    # AFD difference: filter to routed MoE paths and apply the native mapper at
+    # this shell's outer AutoWeightsLoader.
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Drop non-MoE checkpoint tensors, then load like the native CausalLM.
 
-        The native CausalLM delegates to ``AutoWeightsLoader(self)``, which
-        recurses into ``model.load_weights``. Tensors this shell does not
-        construct (embeddings, norms, Attention, LM head) are filtered first,
-        as ``AFDQwen3MoeForCausalLM.load_weights`` filters by role, but
-        stricter: that wrapper still keeps non-layer tensors for its
-        embedding and LM head.
+        ``AutoWeightsLoader`` walks this shell's module tree and hands each MoE
+        block's expert tensors to FusedMoE. Tensors this shell does not construct
+        (embeddings, norms, Attention, LM head) are filtered first; the native
+        Qwen3 mapper still applies unchanged.
         """
         # ### PATCH START: keep only routed MoE checkpoint paths.
         weights = (
-            (name, tensor) for name, tensor in weights if _is_routed_mlp_path(name)
+            (name, tensor)
+            for name, tensor in weights
+            if not self.is_unused_checkpoint_weight(name)
         )
         # ### PATCH END: keep only routed MoE checkpoint paths.
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return loader.load_weights(
+            weights,
+            mapper=native.Qwen3MoeModel.hf_to_vllm_mapper,
+        )
 
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         """Every decoder layer is an MoE layer for a supported checkpoint."""
@@ -171,8 +148,8 @@ class Qwen3RoutedExpertsModel(nn.Module):
 # NPU parallel: afd_plugin/ffn_faas/platforms/npu/model.py::CAMRoutedModel.load
 #   (layer-by-layer safetensors load with per-layer progress, then storage
 #   accounting).
-# Reuse: PARTIAL - storage accounting is the same computation
-#   (REFACTOR-CANDIDATE(R7)); loading differs: vLLM's loader exposes no
+# Reuse: PARTIAL - storage accounting is shared through
+#   ``parameter_storage_bytes``; loading differs: vLLM's loader exposes no
 #   per-layer callback, so progress is reported only before and after.
 # Upstream source: vLLM v0.32.0 (5df63a7203cdb9328d824a27b682e77c7b9928be),
 #   vllm/model_executor/model_loader/base_loader.py, BaseModelLoader.load_model.
@@ -201,18 +178,3 @@ def load_qwen3_routed_experts(
     gc.collect()
     torch.accelerator.empty_cache()
     return model.eval()
-
-
-# NPU parallel: CAMRoutedModel._load_native storage accounting.
-# Reuse: YES - same computation; REFACTOR-CANDIDATE(R7).
-def parameter_storage_bytes(model: nn.Module) -> int:
-    """Bytes of the distinct storages behind ``model``'s parameters.
-
-    Views that share storage (for example the connector's expert views) are
-    counted once.
-    """
-    storage_sizes: dict[tuple[str, int], int] = {}
-    for parameter in model.parameters():
-        storage = parameter.untyped_storage()
-        storage_sizes[(str(parameter.device), storage.data_ptr())] = storage.nbytes()
-    return sum(storage_sizes.values())

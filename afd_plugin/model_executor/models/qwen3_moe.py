@@ -25,6 +25,7 @@ from afd_plugin.config import (
     AFDConfig,
     parse_afd_config,
 )
+from afd_plugin.model_executor.checkpoint_paths import weight_layer_path
 from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
 
 if TYPE_CHECKING:
@@ -49,20 +50,6 @@ def _routes_on_attention(afd_config: AFDConfig) -> bool:
     return afd_config.connector in DEEPEP_M2N_CONNECTORS
 
 
-def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
-    """Return ``(layer index, stage, remainder)`` for a native decoder path."""
-    parts = name.split(".")
-    for marker_idx, part in enumerate(parts[:-2]):
-        if part != "layers":
-            continue
-        try:
-            layer_idx = int(parts[marker_idx + 1])
-        except ValueError:
-            continue
-        return layer_idx, parts[marker_idx + 2], tuple(parts[marker_idx + 3 :])
-    return None
-
-
 def _checkpoint_weight_roles(
     name: str,
     *,
@@ -74,7 +61,7 @@ def _checkpoint_weight_roles(
     Attention routes with it, and FFN keeps the native gate parameter that
     vLLM's strict loader requires but never runs it.
     """
-    layer_path = _weight_layer_path(name)
+    layer_path = weight_layer_path(name)
     if layer_path is None:
         return _BOTH_ROLES
 
