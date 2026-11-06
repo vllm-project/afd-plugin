@@ -83,8 +83,8 @@ class CAMFFNBackend:
             self.runtime.attach_model(
                 self.model, parameter_bytes=self.model.parameter_bytes
             )
-            # Reuse paired signatures, warmup, capture, Graph pools and two-slot
-            # ready/done/FIFO ownership from the existing CAM implementation.
+            # Reuse paired signatures, warmup, capture and Graph pools from
+            # the existing CAM implementation.
             self.runtime.initialize_afd_connector()
             self.environment.bind_host_threads(config)
             service.phase(
@@ -100,7 +100,7 @@ class CAMFFNBackend:
     def execute_step(self) -> None:
         assert self.runtime is not None
         self.runtime.execute_connector_driven_step()
-        if not self.settings.full_graph and not self.settings.ffn_two_stream:
+        if self.runtime.effective_mode == "eager":
             # Preserve the mature eager loop's completion fence.
             torch.npu.synchronize()
 

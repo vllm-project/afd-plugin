@@ -40,10 +40,6 @@ class AscendCAMAdapter:
         parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
         parser.add_argument("--max-num-seqs", type=int, default=256)
         parser.add_argument("--full-graph", action="store_true")
-        parser.add_argument("--ffn-two-stream", action="store_true")
-        parser.add_argument("--ffn-compute-aic-num", type=int)
-        parser.add_argument("--ffn-compute-aiv-num", type=int)
-        parser.add_argument("--ffn-combine-aiv-num", type=int)
         parser.add_argument("--hccl-buffer-size", type=int)
 
     def configure(self, args: Namespace) -> FFNLaunch:
@@ -86,10 +82,6 @@ class AscendCAMAdapter:
             max_num_batched_tokens=args.max_num_batched_tokens,
             max_num_seqs=args.max_num_seqs,
             full_graph=args.full_graph,
-            ffn_two_stream=args.ffn_two_stream,
-            ffn_compute_aic_num=args.ffn_compute_aic_num,
-            ffn_compute_aiv_num=args.ffn_compute_aiv_num,
-            ffn_combine_aiv_num=args.ffn_combine_aiv_num,
             hccl_buffer_size=args.hccl_buffer_size,
             shutdown_timeout=args.shutdown_timeout,
         )

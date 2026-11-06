@@ -14,7 +14,7 @@ CausalLM, vLLM Worker, upstream ModelRunner, EngineCore, scheduler or KV cache.
   Attention weights are not loaded by F.
 - The existing Attention model, router, shared experts, padding, DBO hooks and
   `CAMAsyncAFDConnector` are reused. F supports layered eager or FULL Graph
-  execution, with optional two-stream scheduling.
+  execution.
 
 Configuration, expert mapping, parameter loading and quantization depend on
 vLLM/vLLM-Ascend. Other models, quantization schemes and device backends are
@@ -32,7 +32,7 @@ CPU Service / host runner -> FFNBackend
 ```
 
 The backend adapts the complete CAM runtime lifecycle. Communication, compute,
-Graph and two-stream scheduling remain in that runtime. See the
+Graph execution remains in that runtime. See the
 [FFN runtime design](../design/module/ffn_runtime.md#runtime-selection) for
 module responsibilities and ownership.
 
@@ -65,9 +65,7 @@ torchrun --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29500 \
   --host 127.0.0.1 --port 29600 \
   --attention-ranks 12 --attention-tp 4 --ffn-ranks 4 \
   --devices 12,13,14,15 --max-num-batched-tokens 2048 \
-  --full-graph --ffn-two-stream \
-  --ffn-compute-aic-num 20 --ffn-compute-aiv-num 40 \
-  --ffn-combine-aiv-num 8 --status-port 29700
+  --full-graph --status-port 29700
 ```
 
 `--devices` indexes the process's visible logical devices, not physical IDs.
@@ -80,9 +78,9 @@ different rendezvous port for the F-only compute world and CAM.
 `--max-num-batched-tokens` must match A's dispatch envelope; it is not the
 maximum request context length. F creates configuration objects for native
 loading, but allocates no request KV cache. Omit `--full-graph` to use the
-mature layered eager path. Two-stream execution supports both eager and FULL;
-omitted core budgets use the existing CAM defaults. FULL preserves paired
-warmup, private graph pools, device layer selection and FIFO slot ownership.
+mature layered eager path. FULL preserves paired warmup, private graph pools
+and device layer selection. FFN two-stream execution and its core-budget
+options were removed in #550; older launch commands must omit those options.
 
 ## Management and shutdown
 
