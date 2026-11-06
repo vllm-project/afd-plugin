@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections import deque
 from types import SimpleNamespace
 
@@ -24,6 +25,8 @@ from afd_plugin.connectors.npu.async_cam import (  # noqa: E402
     CAMAsyncAFDConnector,
 )
 from afd_plugin.v1.worker.npu import async_ffn_model_runner as runtime  # noqa: E402
+from afd_plugin.v1.worker.npu.ffn_worker import AFDNPUFFNWorker  # noqa: E402
+from tests.unit.fakes.connector import FakeFFNSession  # noqa: E402
 from tests.unit.fakes.vllm_config import npu_vllm_config  # noqa: E402
 
 
@@ -135,3 +138,51 @@ def test_eager_preserves_layer_loop_device_metadata_and_return_headers(harness):
     ):
         torch.testing.assert_close(sent[1], hidden.to(torch.bfloat16), rtol=0, atol=0)
         assert sent[2] is received_payload.context.states.token_nums_rankid_layeridx
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_full_receiver_exit_requires_success_even_during_shutdown(harness, fail):
+    worker = AFDNPUFFNWorker.__new__(AFDNPUFFNWorker)
+    worker.model_runner = harness.runner
+    harness.runner.effective_mode = "full"
+    harness.runner.session = FakeFFNSession(requires_drain=True)
+    worker._ffn_thread = None
+    worker._ffn_loop_error = None
+    worker._bind_cpus_once = lambda: None
+
+    def serve():
+        worker._ffn_shutdown_event.set()
+        if fail:
+            raise RuntimeError("partial device completion")
+
+    worker._run_ffn_server_loop = serve
+    worker.start_ffn_server_loop()
+    assert isinstance(worker._ffn_thread, threading.Thread)
+    worker._ffn_thread.join(3)
+    assert not worker._ffn_thread.is_alive()
+    assert harness.runner._graph_receiver_exited is not fail
+    assert (worker._ffn_loop_error is not None) is fail
+
+
+@pytest.mark.parametrize("drains", [True, False])
+def test_drain_propagates_session_result(harness, monkeypatch, drains):
+    h = harness
+    h.runner.session = FakeFFNSession(
+        transactions=1,
+        drain_error=None if drains else RuntimeError("retain resources"),
+    )
+    h.runner._layered_executor = lambda hidden, *_args: hidden.to(torch.bfloat16)
+    request = payload(5, 3)
+    h.payloads.append(request)
+    monkeypatch.setattr(torch.npu, "synchronize", lambda: None)
+    if drains:
+        h.runner.drain()
+    else:
+        with pytest.raises(RuntimeError, match="retain resources"):
+            h.runner.drain()
+    returned = [
+        call for call in h.calls if isinstance(call, tuple) and call[0] == "send"
+    ]
+    assert len(returned) == 1
+    torch.testing.assert_close(returned[0][1], request.hidden_states.to(torch.bfloat16))
+    assert returned[0][2] is request.context.states.token_nums_rankid_layeridx

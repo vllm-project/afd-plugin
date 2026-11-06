@@ -20,8 +20,8 @@ if TYPE_CHECKING:
     from torch import Tensor
 
 
-@pytest.fixture
-def w8a8_runtime():
+@pytest.fixture(params=[0.0, 10.0])
+def w8a8_runtime(request):
     if os.environ.get("AFD_RUN_ASCEND_OP_RUNTIME") != "1":
         pytest.skip("requires opt-in 910C runtime")
     torch = pytest.importorskip("torch")
@@ -70,16 +70,17 @@ def w8a8_runtime():
                 w13_bias=None,
                 w2_bias=None,
                 per_channel=True,
-                swiglu_limit=0.0,
+                swiglu_limit=request.param,
                 routed_scaling_factor=1.0,
                 quantization="W8A8",
             )
         )
     executor = AsyncCAMLayeredExecutor(layers)
+    assert executor.applied_swiglu_limit == 0.0
     x = torch.randint(
         -8, 8, (capacity, hidden), dtype=torch.int8, generator=generator
     ).npu()
-    scales = torch.full((capacity,), 0.01, device="npu")
+    scales = torch.full((capacity,), 0.01 if request.param == 0 else 2.0, device="npu")
     return torch, torch_npu, layers, executor, x, scales
 
 

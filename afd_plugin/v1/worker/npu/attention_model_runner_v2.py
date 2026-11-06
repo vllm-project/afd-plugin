@@ -490,6 +490,9 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         )
         try:
             with (
+                self.connector.attention_step()
+                if self.connector is not None
+                else nullcontext(),
                 skip_dp_coordination() if self.afd_config.async_dp else nullcontext(),
                 _use_camp2p_dp_padding(
                     self.afd_config.num_attention_ranks, self.afd_config.num_ffn_ranks

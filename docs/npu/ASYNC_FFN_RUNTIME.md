@@ -26,7 +26,6 @@ been validated. Other model-based drafts and MTP remain unsupported.
 Attention may enable native DBO under the
 existing two-microbatch constraints. Enable native DBO only on Attention; FFN
 consumes CAM work items without joining Attention's DBO thread schedule.
-The experimental two-stream option below uses the same Attention DBO contract.
 The [0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507) identifies the tested
 W4A8 eager/FULL fixture and its limits, including graceful-exit failures.
 
@@ -39,7 +38,8 @@ decode-only graph modes are rejected.
 DeepSeek-V4 DSpark uses this same F graph for target and draft routed experts.
 The combined layer table and startup agreement cover target0–42/draft43–45;
 all layers must share the same W4A8 or W8A8 layout. Native P loads the complete
-draft model. Target Attention may use the native decode graph; the draft can remain eager or use its native query Graph. DSpark excludes DBO and FFN two-stream; see the
+draft model. Target Attention may use the native decode graph; the draft can
+remain eager or use its native query Graph. DSpark excludes DBO; see the
 [DSpark recipe](../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md).
 
 W8A8 reuses the loaded INT8 NZ weights, FP32 W13 scales and BF16 W2 scales.
@@ -93,65 +93,9 @@ host metadata read or cancellation protocol.
 Changing weights, layout, capacity or topology requires fresh workers. There
 is no graph cache, online weight replacement or partial-rank restart.
 
-## Experimental FFN two-stream execution
-
-Set these fields in the **FFN** `afd.connector_extra_config` to opt in:
-
-```json
-{
-  "ffn_two_stream": true,
-  "ffn_compute_aic_num": 12,
-  "ffn_compute_aiv_num": 24,
-  "ffn_combine_aiv_num": 24
-}
-```
-
-`ffn_two_stream` defaults to `false`. Both eager and FULL use exactly two
-streams and two slots: receive plus the complete layered executor on the
-compute stream, and FIFO combine-send on the send stream. Each send waits for
-its matching compute-ready event; slot reuse waits for its previous send-done
-event. The original batch metadata and CS return tensor remain owned by the
-slot. The CS return tensor is an allocation anchor, not a completion flag.
-
-Core counts must be positive integers. Compute Cube must fit the available
-AIC budget, compute Vector must be at least twice compute Cube, and the sum
-of compute/send Vector limits must fit available AIV. The send stream sets
-only its Vector limit. Invalid budgets, inconsistent FFN layouts and unsupported
-Attention capabilities fail through pre-HCCL Store negotiation. Configuration
-hashing includes connector extras.
-
-This option requires the layered MRV2 prerequisites above. Keep PP/PCP/DCP
-at 1, SP and FlashComm1 off on both roles, and speculative decoding off.
-
-Attention DBO, when enabled, uses exactly two native ubatches and the existing
-receive hook: the preceding raw receive is queued before the next ubatch sends
-into CAM's single physical window. FFN slots remain independent work-item
-buffers; they do not correspond to Attention ubatch IDs. Enable DBO only on
-Attention, which remains eager, including when FFN uses FULL graph.
-Streams are limited before warmup; FULL preserves
-the existing matched warmup receive count. Enablement adds no startup receives.
-
-Eager retains each payload, intermediate and output until send completion is
-observed before reallocating that slot. FULL captures **four graphs**, one
-compute and one send graph per slot, each with a private pool and retained
-mutable addresses. Events stay outside graph capture. Both modes preserve
-the existing bounded batch size of `len(layer_ids)` and one device fence at
-batch completion. Four graph objects do not mean four business transactions:
-FULL submits two graph replays per transaction.
-
-Two-stream eager uses the same conservative shutdown rules as FULL: join the
-receiver before releasing graph/tensor/model/communicator resources. Failed
-capture, submission or device completion is terminal and retains resources.
-
-Host protocol and lifecycle tests cover this implementation. **NPU validation
-is pending**: stream limits reaching custom tiling, native same-group DR/CS
-window safety, split-graph capture and actual overlap/performance have not been
-qualified. Keep this experimental option off in validated deployments until
-the target stack passes those checks.
-
 ## Resource lifetime
 
-A host event stops further batch submissions. Graph reset and model/communicator
+With default Push transport, a host event stops further batch submissions. Graph reset and model/communicator
 release are permitted only after the receive thread exits normally and device
 completion is confirmed. Partial capture, partial launch, execution failure or
 a still-live receive thread retains resources for process cleanup. A failure
@@ -165,6 +109,17 @@ zero. Test reports distinguish successful inference from cleanup, and forced
 termination must not be described as normal shutdown. Single-stream eager and synchronous
 stopping policies retain their connector/process-level cleanup boundaries.
 
+### Opt-in Pull execution session
+
+`connector_extra_config.ffn_mega_moe=true` selects Pull; Push remains the default.
+The connector owns its execution session and all Pull status/Store handshakes.
+Attention fences pending dispatch at `attention_step()` exit. FFN keeps serving
+until every Attention source is quiet, drains active work, then publishes stopped;
+only then may Attention and FFN release their communication resources. Failed
+handshakes retain those resources. Standalone `close()` also validates shutdown
+status before release: this is an additional defensive shutdown check, not a
+relocated hot-path fence.
+
 ## Computation semantics
 
 For W4A8, FULL and layered eager forward the same model `swiglu_limit` to W13.
@@ -172,8 +127,20 @@ A positive `L` clamps gate above at `L` and up to `[-L, L]` before SiLU gating a
 quantization. Zero disables clipping. DeepSeek-V4's configured `10.0` therefore
 applies on both execution paths. The limit is a host scalar fixed at graph
 capture; layer selection remains controlled by the device `layer_index` tensor.
-Layered W8A8 retains its unclipped computation and records the model limit as
-metadata only.
+Layered and Mega W8A8 retain unclipped computation regardless of the model
+`swiglu_limit`; the executors pass zero and the native W8A8 Plan skips clamp.
+Native Mega W4A8 applies the limit in its MC2 ACT epilogue and bounded-column
+fallback. Native W8A8 uses an INT8 GEMM with INT32 intermediate results and a
+bounded-column activation; weight scales stay FP32 for W13 and BF16 for W2.
+Both plans share Pull transport and the BF16 return path. W8A8 applies weight
+and token scales in Vector before activation, preserving the Layered rounding
+sequence. The mode is selected once through `config[11]` (1=W4A8, 2=W8A8).
+
+The synthetic transport fixture accepts `--quantization W8A8 --swiglu-limit 0`
+or `--swiglu-limit 10`; W8A8 ignores either model limit. Save matching Layered
+eager outputs with `--save-outputs`,
+then compare Mega eager and `--full-graph` using `--reference-outputs`; add
+`--boundary` to exercise receive rounds, sparse experts and poisoned scratch.
 
 ## Validation
 
@@ -184,37 +151,40 @@ A3/910C, 4A/4F, A TP4, F TP1, receive capacity 128 and DBO disabled. Select
 this topology still needs target-device validation. Synthetic per-group
 coverage does not qualify loading real per-group checkpoints.
 
-- Host contracts: `tests/unit/connectors/test_async_cam_startup.py`,
-  `tests/unit/v1/worker/test_async_ffn_graph.py`, and
-  `tests/unit/v1/worker/test_async_ffn_runtime.py`. CPU-safe two-stream coverage
-  is in `tests/unit/v1/worker/test_async_ffn_two_stream.py` and
-  `tests/unit/test_async_cam_startup_wiring.py`; fakes verify host ordering and
+- Host contracts: `tests/unit/connectors/npu/test_async_cam_pull.py`,
+  `tests/unit/connectors/npu/test_async_cam_startup.py`,
+  `tests/unit/v1/worker/test_async_ffn_graph.py`,
+  `tests/unit/v1/worker/test_async_ffn_runtime.py`, and
+  `tests/unit/connectors/npu/test_async_cam_startup_wiring.py`; fakes verify host ordering and
   ownership, not device execution.
 - Finite native comparison: `tests/npu/async_cam_runtime.py`. Run eager with
   `--save-outputs PREFIX`, then FULL with `--full-graph --reference-outputs PREFIX`,
   keeping other arguments identical. `--boundary` covers chunking and poisoned
   unused capacity; `--attn-ranks 2` covers different Attention sources. The test
   supplies finite work counts, compares outputs and checks captured addresses.
+  For Pull, add `--mega --idle-shutdown` to both eager and FULL runs so the
+  fixture exercises the real worker drain/finish handshake. Compare FULL to its
+  matching ON eager reference separately from the OFF-to-ON numerical check.
 - Real MRV2 generation: the bounded 4A/4F fixture below. Its test observers add
   synchronization for functional evidence, so it is not a performance test.
 
 ```bash
 python -m tests.e2e.models.deepseek_v4_flash.ffn_graph \
-  --mode eager --model /path/to/checkpoint --afd-host "$AFD_HOST" \
-  --devices 0,1,2,3,4,5,6,7 --output-dir /path/to/eager-evidence
+  --mode eager --mega --model /path/to/checkpoint --afd-host "$AFD_HOST" \
+  --devices 0,1,2,3,4,5,6,7 --output-dir /path/to/on-eager-evidence
 python -m tests.e2e.models.deepseek_v4_flash.ffn_graph \
-  --mode full --model /path/to/checkpoint --afd-host "$AFD_HOST" \
-  --devices 0,1,2,3,4,5,6,7 --output-dir /path/to/full-evidence \
-  --reference-dir /path/to/eager-evidence
+  --mode full --mega --model /path/to/checkpoint --afd-host "$AFD_HOST" \
+  --devices 0,1,2,3,4,5,6,7 --output-dir /path/to/on-full-evidence \
+  --reference-dir /path/to/on-eager-evidence
+python -m tests.e2e.models.deepseek_v4_flash.ffn_graph \
+  --mode eager --model /path/to/checkpoint --afd-host "$AFD_HOST" \
+  --devices 0,1,2,3,4,5,6,7 --output-dir /path/to/off-eager-evidence \
+  --reference-dir /path/to/on-eager-evidence
 ```
 
 The fixture saves inputs, generated tokens, actual runner identities and per-rank
 execution evidence. FULL must capture once per F, replay during requests and
-match eager tokens. These repository fixtures exercise the single-stream path.
-Two-stream native and real-model qualification uses independent drivers outside
-`tests/e2e` and `tests/npu`, setting the FFN connector options above and recording
-four captures per F in FULL mode. Preserve driver sources, launch configuration,
-source hashes, inputs and raw outputs with the evidence.
+match eager tokens.
 Batch-end metadata samples do not prove per-layer coverage.
 Inference results and cleanup are recorded separately; remaining owned processes
 or failed requests block acceptance. Validation evidence must identify the

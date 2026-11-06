@@ -105,7 +105,7 @@ F captures one DR → layered FFN → CS transaction and repeatedly replays it f
 both target and draft layers. The bounded replay group is independent of request
 and target/draft phase boundaries. Attention target/draft graph choices are
 independent of F's execution mode. FULL requires matching W4A8 or W8A8 layouts on all layers; unsupported
-graph modes fail startup. DSpark does not support DBO or FFN two-stream.
+graph modes fail startup. DSpark does not support DBO.
 
 Layered W4A8 forwards the model's `swiglu_limit` for both target and draft
 experts in eager and FULL. A positive limit clamps gate above and up on both

@@ -174,22 +174,6 @@ def _fail_if_unsupported_npu_afd_async_features(
         )
 
     parallel_config = vllm_config.parallel_config
-    if extra_info.ffn_two_stream:
-        if not afd_config.is_ffn_server:
-            raise RuntimeError("ffn_two_stream may only be enabled on the FFN role")
-        if (
-            not vllm_config.use_v2_model_runner
-            or not afd_config.compute_gate_on_attention
-            or extra_info.dynamic_quant != 1
-            or parallel_config.tensor_parallel_size != 1
-            or parallel_config.use_sequence_parallel_moe
-            or os.environ.get("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0").strip().lower()
-            in ("1", "true")
-        ):
-            raise RuntimeError(
-                "FFN two-stream requires MRV2 layered GMM, dynamicQuant=1, "
-                "Attention-side gate, F TP=1 and SP disabled"
-            )
     if not is_afd_async_dp(vllm_config):
         raise RuntimeError(
             "CAMAsyncAFDConnector requires additional_config['afd'] "
@@ -225,8 +209,6 @@ def _fail_if_unsupported_npu_afd_async_features(
         if speculative_config.method == "dspark":
             if vllm_config.model_config.hf_text_config.model_type != "deepseek_v4":
                 raise RuntimeError("AFD DSpark supports only DeepSeek-V4 on NPU")
-            if extra_info.ffn_two_stream:
-                raise RuntimeError("AFD DSpark does not support FFN two-stream")
             # The shared MRV2 validator owns PP/CP and static EP constraints.
             # Keep only the additional target/draft restrictions here.
             # Both graphs use the native decode path. Draft capture is owned
@@ -282,9 +264,10 @@ def _fail_if_unsupported_npu_afd_async_features(
                 "AFD DSpark draft query capacity exceeds max_num_batched_tokens: "
                 f"{draft_rows} > {max_num_batched_tokens}"
             )
-    # whole-expert chunks need a full TP group's batch; smaller
-    # buffers require native sub-expert chunking.
-    if receive_capacity < max_num_batched_tokens:
+    if receive_capacity < 1:
+        raise RuntimeError("BATCH_SIZE_FACTOR must allocate at least one receive row")
+    # Push chunks whole experts. Pull can split one expert across receive rounds.
+    if not extra_info.ffn_mega_moe and receive_capacity < max_num_batched_tokens:
         raise RuntimeError(
             "CAMAsyncAFDConnector requires BATCH_SIZE_FACTOR to allocate at least "
             f"max_num_batched_tokens={max_num_batched_tokens} "
