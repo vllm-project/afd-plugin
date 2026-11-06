@@ -4,18 +4,29 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from contextlib import AbstractContextManager
-from typing import Any
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.config import VllmConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
+from vllm_ascend.worker.v2.spec_decode.dflash.aclgraph import DFlashAclGraphManager
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
     prepare_dflash_inputs_factory,
 )
 from vllm_ascend.worker.v2.spec_decode.dspark.speculator import AscendDSparkSpeculator
+
+from afd_plugin.v1.worker.npu.dspark_graph import (
+    use_afd_draft_capture,
+    use_afd_draft_replay,
+)
+
+if TYPE_CHECKING:
+    from afd_plugin.v1.worker.npu.attention_model_runner_v2 import (
+        AFDNPUAttentionModelRunnerV2,
+    )
 
 
 class AFDDSparkSpeculator(AscendDSparkSpeculator):
@@ -25,9 +36,37 @@ class AFDDSparkSpeculator(AscendDSparkSpeculator):
         device: torch.device,
         *,
         afd_context: Callable[[bool, bool], AbstractContextManager[None]],
+        afd_runner: AFDNPUAttentionModelRunnerV2,
     ) -> None:
         super().__init__(vllm_config, device)
         self.afd_context = afd_context
+        self.afd_runner = afd_runner
+
+    @contextmanager
+    def _physical_input_preparation(self, *, enabled: bool = True) -> Iterator[None]:
+        original_prepare = dflash_speculator.prepare_dflash_inputs
+        if enabled:
+            dflash_speculator.prepare_dflash_inputs = self._afd_prepare_inputs
+        try:
+            yield
+        finally:
+            dflash_speculator.prepare_dflash_inputs = original_prepare
+
+    # Upstream: vLLM 5df63a72 DFlashSpeculator.capture, inherited by Ascend
+    # bd42eea0 DSpark. Signature matches. Delegate native context/KV and Markov
+    # capture, adding draft-local AFD metadata and the physical block size.
+    # Remove when native capture exposes metadata and physical-size hooks.
+    def capture(self) -> None:
+        # ### PATCH START: scope native draft capture.
+        assert self.query_cudagraph_manager is not None
+        manager = cast(DFlashAclGraphManager, self.query_cudagraph_manager)
+        with (
+            self.afd_context(True, False),
+            self._physical_input_preparation(),
+            use_afd_draft_capture(self.afd_runner, manager),
+        ):
+            super().capture()
+        # ### PATCH END: scope native draft capture.
 
     # Upstream: Ascend bd42eea0, AscendDSparkSpeculator.set_attn.
     # Its input factory captures the global cache_config.block_size, which can
@@ -88,30 +127,41 @@ class AFDDSparkSpeculator(AscendDSparkSpeculator):
         num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
         # ### PATCH START: scope only the native draft proposal
-        prepare_inputs = dflash_speculator.prepare_dflash_inputs
-        if not (dummy_run and skip_attn_for_dummy_run):
-            dflash_speculator.prepare_dflash_inputs = self._afd_prepare_inputs
-        try:
-            with self.afd_context(dummy_run, is_profile):
-                return super().propose(
-                    input_batch,
-                    attn_metadata,
-                    slot_mappings,
-                    last_hidden_states,
-                    aux_hidden_states,
-                    num_sampled,
-                    num_rejected,
-                    last_sampled,
-                    next_prefill_tokens,
-                    temperature,
-                    seeds,
-                    None,
-                    dummy_run,
-                    skip_attn_for_dummy_run,
-                    mm_inputs,
-                    is_profile=is_profile,
-                    num_speculative_tokens=num_speculative_tokens,
-                )
-        finally:
-            dflash_speculator.prepare_dflash_inputs = prepare_inputs
+        manager = self.query_cudagraph_manager
+        # Native memory profiling runs before KV/graph-manager initialization.
+        replay_scope = (
+            use_afd_draft_replay(
+                self.afd_runner,
+                cast(DFlashAclGraphManager, manager),
+                input_batch.num_reqs * self.num_query_per_req,
+            )
+            if manager is not None
+            else nullcontext()
+        )
+        with (
+            self.afd_context(dummy_run, is_profile),
+            self._physical_input_preparation(
+                enabled=not (dummy_run and skip_attn_for_dummy_run)
+            ),
+            replay_scope,
+        ):
+            return super().propose(
+                input_batch,
+                attn_metadata,
+                slot_mappings,
+                last_hidden_states,
+                aux_hidden_states,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                temperature,
+                seeds,
+                None,
+                dummy_run,
+                skip_attn_for_dummy_run,
+                mm_inputs,
+                is_profile=is_profile,
+                num_speculative_tokens=num_speculative_tokens,
+            )
         # ### PATCH END: scope only the native draft proposal

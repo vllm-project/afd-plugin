@@ -197,8 +197,8 @@ def _use_afd_capture_input_preparation(
 
     # Patch reason: native ModelCudaGraphManager.capture calls this exact
     # module symbol once before each warmup/formal-capture forward.
-    # Patch functionality: preserve native preparation and publish the
-    # matching AFD event before the forward starts.
+    # Patch functionality: preserve native preparation and stage the matching
+    # AFD metadata before the forward; synchronous connectors also send control.
     # Signature: matches vLLM v0.32.0 prepare_inputs_to_capture exactly,
     # including the trailing pcp_manager parameter.
     # Upstream source: vllm/v1/worker/gpu/cudagraph_utils.py,
@@ -237,10 +237,11 @@ def _use_afd_capture_input_preparation(
             None,
             int(desc.num_tokens),
         )
-        runner.send_dp_metadata(
-            runner.build_capture_dp_metadata(int(desc.num_tokens)),
-            None,
-        )
+        if runner.connector.control_plane is not None:
+            runner.send_dp_metadata(
+                runner.build_capture_dp_metadata(int(desc.num_tokens)),
+                None,
+            )
         runner._afd_suppress_metadata_send = True
         return attention_state
         # ### PATCH END: stage one exact AFD capture event.

@@ -2,7 +2,8 @@
 
 AFD #449 captures one complete routed-expert transaction: original dispatch
 receive (DR), layered W4A8/W8A8 FFN, and original combine send (CS).
-Attention remains MRV2 eager. Issue #451 retires the separate MRV1 paths while
+Attention uses MRV2 eager or native target decode graphs.
+Issue #451 retires the separate MRV1 paths while
 preserving this runtime and its original transport/lifecycle boundary.
 
 `AsyncNPUFFNModelRunner` owns Async CAM model loading, eager/FULL transactions
@@ -15,7 +16,13 @@ neither runner inherits MRV1 or owns Attention request/KV state.
 The target is the pinned vLLM 0.32 / vLLM-Ascend stack on A3/910C, with
 homogeneous DeepSeek-V4 W4A8 or W8A8 layers, dynamicQuant=1, static expert placement,
 F TP=1 and Attention-side gating. Both roles select
-`VLLM_USE_V2_MODEL_RUNNER=1`. Attention keeps `--enforce-eager`.
+`VLLM_USE_V2_MODEL_RUNNER=1`. Attention normally keeps `--enforce-eager`; the
+[target Attention graph](CAM_ASYNC_CONNECTOR_USER_GUIDE.md#deepseek-v4-target-attention-graph)
+profile accepts `FULL` or `FULL_DECODE_ONLY`, with native graph-mode resolution.
+Attention-local FlashComm1/SP and native PD can be combined with the graphs.
+DSpark draft may remain eager or use its native graph alongside target graph.
+Device qualification uses compilation mode 0; other compilation modes have not
+been validated. Other model-based drafts and MTP remain unsupported.
 Attention may enable native DBO under the
 existing two-microbatch constraints. Enable native DBO only on Attention; FFN
 consumes CAM work items without joining Attention's DBO thread schedule.
@@ -31,8 +38,8 @@ decode-only graph modes are rejected.
 DeepSeek-V4 DSpark uses this same F graph for target and draft routed experts.
 The combined layer table and startup agreement cover target0–42/draft43–45;
 all layers must share the same W4A8 or W8A8 layout. Native P loads the complete
-draft model. Target/draft Attention and the native speculative configuration
-remain eager. DSpark excludes DBO; see the
+draft model. Target Attention may use the native decode graph; the draft can
+remain eager or use its native query Graph. DSpark excludes DBO; see the
 [DSpark recipe](../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md).
 
 W8A8 reuses the loaded INT8 NZ weights, FP32 W13 scales and BF16 W2 scales.

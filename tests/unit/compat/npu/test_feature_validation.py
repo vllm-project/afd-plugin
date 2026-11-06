@@ -19,7 +19,10 @@ from afd_plugin.compat.npu import (  # noqa: E402
 from tests.unit.fakes.vllm_config import (  # noqa: E402
     async_moe_config as _async_moe_config,
 )
-from tests.unit.fakes.vllm_config import npu_dspark_config  # noqa: E402
+from tests.unit.fakes.vllm_config import (  # noqa: E402
+    npu_async_cam_target_graph_config,
+    npu_dspark_config,
+)
 from tests.unit.fakes.vllm_config import (  # noqa: E402
     npu_vllm_config as _vllm_config,
 )
@@ -35,7 +38,7 @@ ASYNC_CAM = dict(connector="CAMAsyncAFDConnector", async_dp=True)
     [
         ("attention", True, True, "deepseek_v4", None),
         ("ffn", True, True, "deepseek_v4", None),
-        ("attention", False, True, "deepseek_v4", "DSpark requires eager"),
+        ("attention", False, True, "deepseek_v4", "draft Graph requires target"),
         (
             "attention",
             True,
@@ -43,19 +46,35 @@ ASYNC_CAM = dict(connector="CAMAsyncAFDConnector", async_dp=True)
             "deepseek_v2",
             "requires DeepSeek V4",
         ),
+        ("ffn", False, True, "deepseek_v4", None),
         ("ffn", True, False, "deepseek_v4", None),
-        ("attention", True, False, "deepseek_v4", "eager Attention"),
+        ("ffn", False, False, "deepseek_v4", None),
+        ("attention", True, False, "deepseek_v4", None),
+        ("attention", False, False, "deepseek_v4", None),
     ],
 )
 def test_dspark_feature_boundaries(role, draft_eager, target_eager, model_type, error):
     config = npu_dspark_config(role=role, draft_eager=draft_eager)
     config.model_config.enforce_eager = target_eager
+    if role == "attention" and not target_eager:
+        config.compilation_config.mode = 0
+        config.compilation_config.cudagraph_mode.name = "FULL_DECODE_ONLY"
     config.model_config.hf_text_config.model_type = model_type
     if error:
         with pytest.raises(RuntimeError, match=error):
             fail_if_unsupported_npu_afd_features(config)
     else:
         fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize("draft_eager", [True, False])
+def test_dspark_target_graph_reuses_tp4(monkeypatch, draft_eager):
+    monkeypatch.setenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0")
+    config = npu_dspark_config(tp_size=4, draft_eager=draft_eager)
+    config.model_config.enforce_eager = False
+    config.compilation_config.mode = 0
+    config.compilation_config.cudagraph_mode.name = "FULL_DECODE_ONLY"
+    fail_if_unsupported_npu_afd_features(config)
 
 
 @pytest.mark.parametrize(
@@ -173,7 +192,7 @@ def _mla_dbo(cudagraph_mode, **model_fields):
         ),
         pytest.param(
             _config_with(model={"enforce_eager": False}, **ASYNC_CAM),
-            "only eager",
+            "FULL_DECODE_ONLY",
             id="async-graph",
         ),
         pytest.param(
@@ -274,6 +293,41 @@ def test_async_cam_rejects_models_without_layered_ffn(role, model_type):
     )
     config.model_config.hf_text_config.model_type = model_type
     with pytest.raises(RuntimeError, match="requires DeepSeek V4"):
+        fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_async_cam_target_graph_feature_admission(monkeypatch, dp_size, tp_size):
+    monkeypatch.setenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "1")
+    config = npu_async_cam_target_graph_config(
+        data_parallel_size=dp_size,
+        tensor_parallel_size=tp_size,
+        num_attention_ranks=dp_size * tp_size,
+    )
+    config.kv_transfer_config = object()
+    config.parallel_config.use_sequence_parallel_moe = True
+    fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize(
+    "method,uses_draft,error",
+    [
+        ("mtp", True, "native draft models or MTP"),
+        ("ngram", False, None),
+    ],
+)
+def test_async_cam_target_graph_feature_preserves_draft_model_boundary(
+    monkeypatch, method, uses_draft, error
+):
+    monkeypatch.setenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0")
+    config = npu_async_cam_target_graph_config()
+    config.speculative_config = SimpleNamespace(
+        method=method,
+        use_eagle=lambda: False,
+        uses_draft_model=lambda: uses_draft,
+    )
+    with pytest.raises(RuntimeError, match=error) if error else nullcontext():
         fail_if_unsupported_npu_afd_features(config)
 
 

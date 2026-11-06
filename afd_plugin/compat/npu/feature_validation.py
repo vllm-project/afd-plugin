@@ -14,7 +14,11 @@ from afd_plugin.config import (
     is_afd_async_dp,
     parse_afd_config,
 )
-from afd_plugin.validation import cam_receive_capacity, requested_ffn_mode
+from afd_plugin.validation import (
+    cam_receive_capacity,
+    requested_ffn_mode,
+    validate_async_cam_attention_graph,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -177,14 +181,13 @@ def _fail_if_unsupported_npu_afd_async_features(
         )
     if not bool(vllm_config.model_config.enforce_eager):
         if afd_config.is_attention_server:
-            raise RuntimeError(
-                "CAMAsyncAFDConnector supports only eager Attention execution"
-            )
-        requested_ffn_mode(vllm_config)
-        if not vllm_config.use_v2_model_runner:
-            raise RuntimeError("Async FFN FULL requires MRV2")
-        if parallel_config.tensor_parallel_size != 1:
-            raise RuntimeError("Async FFN FULL requires F TP=1")
+            validate_async_cam_attention_graph(vllm_config)
+        else:
+            requested_ffn_mode(vllm_config)
+            if not vllm_config.use_v2_model_runner:
+                raise RuntimeError("Async FFN FULL requires MRV2")
+            if parallel_config.tensor_parallel_size != 1:
+                raise RuntimeError("Async FFN FULL requires F TP=1")
     if bool(parallel_config.enable_dbo) or bool(parallel_config.use_ubatching):
         if not afd_config.is_attention_server:
             raise RuntimeError("Async CAM DBO/ubatching requires the Attention role")
@@ -208,26 +211,32 @@ def _fail_if_unsupported_npu_afd_async_features(
                 raise RuntimeError("AFD DSpark supports only DeepSeek-V4 on NPU")
             # The shared MRV2 validator owns PP/CP and static EP constraints.
             # Keep only the additional target/draft restrictions here.
-            # F may replay its expert transaction in FULL; Attention and native
-            # draft proposal execution stay eager.
+            # Both graphs use the native decode path. Draft capture is owned
+            # by native target capture, so draft-only graph mode is unsupported.
+            # F keeps its independent TP1 expert execution.
             if (
-                (
-                    afd_config.is_attention_server
-                    and not vllm_config.model_config.enforce_eager
+                speculative_config.draft_parallel_config.tensor_parallel_size
+                != parallel_config.tensor_parallel_size
+                or (
+                    afd_config.is_ffn_server
+                    and parallel_config.tensor_parallel_size != 1
                 )
-                or not speculative_config.enforce_eager
-                or parallel_config.tensor_parallel_size != 1
-                or speculative_config.draft_parallel_config.tensor_parallel_size != 1
             ):
                 raise RuntimeError(
-                    "AFD DSpark requires eager Attention/draft and target/draft TP=1"
+                    "AFD DSpark requires matching target/draft TP and F TP=1"
                 )
+            if (
+                afd_config.is_attention_server
+                and not speculative_config.enforce_eager
+                and vllm_config.model_config.enforce_eager
+            ):
+                raise RuntimeError("DSpark draft Graph requires target Attention graph")
         elif afd_config.is_attention_server and (
             speculative_config.use_eagle() or speculative_config.uses_draft_model()
         ):
             raise RuntimeError(
                 "CAMAsyncAFDConnector does not support native draft models or MTP; "
-                "only DSV4 DSpark eager is supported",
+                "only DSV4 DSpark is supported",
             )
 
     factor_value = os.environ.get("BATCH_SIZE_FACTOR", "1")
