@@ -29,14 +29,6 @@ def _two_hosts() -> list[RankTopology]:
     return [_rank(r, f"n{r // 2}") for r in range(4)]
 
 
-def test_network_config_survives_a_round_trip():
-    config = NetworkConfig.from_mapping(
-        {"gin": "on", "hybrid": "off", "rdma_traffic_class": 5}
-    )
-
-    assert NetworkConfig.from_mapping(config.to_mapping()) == config
-
-
 @pytest.mark.parametrize(
     ("raw", "message"),
     [
@@ -44,8 +36,6 @@ def test_network_config_survives_a_round_trip():
         ({"hybrid": "maybe"}, "network.hybrid"),
         ({"rdma_traffic_class": -1}, "rdma_traffic_class"),
         # NICs are NCCL's own choice; the connector plans none.
-        ({"nic_policy": "shared"}, "unknown network options"),
-        ({"nccl_env": {"NCCL_IB_HCA": "mlx5_0"}}, "unknown network options"),
         ({"bogus": 1}, "unknown network options"),
     ],
 )

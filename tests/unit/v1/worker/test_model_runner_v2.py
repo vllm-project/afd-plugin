@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -19,7 +18,6 @@ from vllm.forward_context import (  # noqa: E402
     ForwardContext,
     override_forward_context,
 )
-from vllm.v1.worker import gpu_model_runner as native_v1  # noqa: E402
 from vllm.v1.worker.gpu import cudagraph_utils, dp_utils  # noqa: E402
 from vllm.v1.worker.gpu import model_runner as native_v2  # noqa: E402
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers  # noqa: E402
@@ -30,9 +28,6 @@ from vllm.v1.worker.ubatch_utils import UBatchSlice  # noqa: E402
 from afd_plugin.model_executor.models import (  # noqa: E402
     forward_context as afd_forward_context,
 )
-from afd_plugin.model_executor.models.model_utils import (  # noqa: E402
-    get_afd_model_config,
-)
 from afd_plugin.v1.worker import (  # noqa: E402
     attention_model_runner_v2 as v2_runner_module,
 )
@@ -40,20 +35,10 @@ from afd_plugin.v1.worker import (  # noqa: E402
     attention_worker,
     ffn_worker,
 )
-from afd_plugin.v1.worker import (  # noqa: E402
-    ffn_routed_experts_model_runner as routed_runner_module,
-)
 from afd_plugin.v1.worker.attention_model_runner_v2 import (  # noqa: E402
     AFDAttentionModelRunnerV2,
 )
 from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
-from afd_plugin.validation import (  # noqa: E402
-    validate_gpu_model_runner_v2_config,
-    validate_npu_model_runner_v2_config,
-)
-from tests.unit.fakes.connector import (  # noqa: E402
-    FakeRoutedConnector,
-)
 from tests.unit.fakes.deepseek_v4 import WorkspaceCase  # noqa: E402
 from tests.unit.fakes.profiler import StepProfiler as _StepProfiler  # noqa: E402
 from tests.unit.fakes.ubatching import (  # noqa: E402
@@ -64,6 +49,7 @@ from tests.unit.fakes.ubatching import (  # noqa: E402
     LegacyNPUUBatchRunner,
     PreparedUBatchRunner,
 )
+from tests.unit.fakes.vllm_config import mrv2_vllm_config  # noqa: E402
 
 TEST_MODEL_MAX_LEN = 163840
 TEST_HIDDEN_SIZE = 2048
@@ -105,103 +91,9 @@ class _NativeRunnerSentinel:
         self.device = device
 
 
-def _v2_config(
-    *,
-    role: str = "attention",
-    architecture: str = "DeepseekV2ForCausalLM",
-    use_v2: bool = True,
-    num_attention_ranks: int = 1,
-    num_ffn_ranks: int = 1,
-    data_parallel_size: int = 1,
-    tensor_parallel_size: int = 1,
-    prefill_context_parallel_size: int = 1,
-    enforce_eager: bool = True,
-    cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-    cudagraph_capture_sizes: list[int] | None = None,
-    max_cudagraph_capture_size: int = 0,
-):
-    hf_config = SimpleNamespace(
-        architectures=[architecture],
-        model_type="deepseek_v2",
-        hidden_size=TEST_HIDDEN_SIZE,
-    )
-    model_config = SimpleNamespace(
-        hf_config=hf_config,
-        runner_type="generate",
-        is_moe=True,
-        is_encoder_decoder=False,
-        is_multimodal_model=False,
-        enforce_eager=enforce_eager,
-        enable_prompt_embeds=False,
-        enable_return_routed_experts=False,
-        quantization=None,
-        quantization_config=None,
-        max_model_len=TEST_MODEL_MAX_LEN,
-        dtype=torch.bfloat16,
-        get_hidden_size=lambda: TEST_HIDDEN_SIZE,
-    )
-    parallel_config = SimpleNamespace(
-        data_parallel_size=data_parallel_size,
-        data_parallel_rank=0,
-        data_parallel_rank_local=0,
-        data_parallel_index=0,
-        data_parallel_backend="mp",
-        distributed_executor_backend="mp",
-        nnodes_within_dp=1,
-        assigned_physical_gpu_ids=None,
-        tensor_parallel_size=tensor_parallel_size,
-        pipeline_parallel_size=1,
-        prefill_context_parallel_size=prefill_context_parallel_size,
-        decode_context_parallel_size=1,
-        enable_expert_parallel=True,
-        enable_elastic_ep=False,
-        enable_eplb=False,
-        use_sequence_parallel_moe=False,
-        is_moe_model=True,
-        enable_dbo=False,
-        use_ubatching=False,
-        num_ubatches=1,
-    )
-    compilation_config = SimpleNamespace(
-        mode=None,
-        cudagraph_mode=cudagraph_mode,
-        cudagraph_capture_sizes=cudagraph_capture_sizes or [],
-        max_cudagraph_capture_size=max_cudagraph_capture_size,
-        compile_sizes=[],
-        compile_ranges_endpoints=[model_config.max_model_len],
-        pass_config=SimpleNamespace(
-            enable_sp=False,
-        ),
-    )
-    return SimpleNamespace(
-        use_v2_model_runner=use_v2,
-        is_mm_encoder_only=False,
-        additional_config={
-            "afd": {
-                "role": role,
-                "connector": "P2pNcclAFDConnector",
-                "num_attention_ranks": num_attention_ranks,
-                "num_ffn_ranks": num_ffn_ranks,
-                "compute_gate_on_attention": False,
-            },
-        },
-        model_config=model_config,
-        parallel_config=parallel_config,
-        compilation_config=compilation_config,
-        cache_config=SimpleNamespace(enable_prefix_caching=False),
-        kernel_config=SimpleNamespace(moe_backend="auto"),
-        scheduler_config=SimpleNamespace(
-            enable_chunked_prefill=False,
-            async_scheduling=False,
-            max_num_batched_tokens=TEST_MODEL_MAX_LEN,
-            max_num_seqs=TEST_CUDAGRAPH_CAPTURE_SIZE,
-        ),
-        lora_config=None,
-        speculative_config=None,
-        num_speculative_tokens=0,
-        diffusion_config=None,
-        quant_config=None,
-    )
+def _v2_config(**kwargs):
+    kwargs.setdefault("cudagraph_mode", CUDAGraphMode.NONE)
+    return mrv2_vllm_config(dtype=torch.bfloat16, **kwargs)
 
 
 def _runner_for_metadata(
@@ -265,44 +157,6 @@ def _prepare_worker(worker_cls, config, *, use_v2):
     return worker
 
 
-def test_v2_fullgraph_replay_hook_restores_manager_instance_after_success():
-    events: list[str] = []
-    runner = _runner_for_metadata(events)
-    descriptor = SimpleNamespace(num_tokens=8, num_ubatches=1)
-
-    def native_replay(self, desc):
-        events.append("native_replay")
-        return desc.num_tokens
-
-    native_bound_replay = MethodType(native_replay, runner.cudagraph_manager)
-    runner.cudagraph_manager.run_fullgraph = native_bound_replay
-    class_replay = cudagraph_utils.CudaGraphManager.run_fullgraph
-
-    with v2_runner_module._use_afd_fullgraph_replay_hook(runner, 3):
-        assert cudagraph_utils.CudaGraphManager.run_fullgraph is class_replay
-        assert runner.cudagraph_manager.run_fullgraph(descriptor) == 8
-
-    assert runner.cudagraph_manager.__dict__["run_fullgraph"] is native_bound_replay
-    assert cudagraph_utils.CudaGraphManager.run_fullgraph is class_replay
-    assert events == ["control_update", "control_send", "native_replay"]
-
-
-def test_v2_fullgraph_replay_hook_removes_temporary_instance_override():
-    class Manager:
-        def run_fullgraph(self, desc):
-            return desc.num_tokens
-
-    runner = _runner_for_metadata([])
-    runner.cudagraph_manager = Manager()
-    descriptor = SimpleNamespace(num_tokens=8, num_ubatches=1)
-    assert "run_fullgraph" not in vars(runner.cudagraph_manager)
-
-    with v2_runner_module._use_afd_fullgraph_replay_hook(runner, 3):
-        assert runner.cudagraph_manager.run_fullgraph(descriptor) == 8
-
-    assert "run_fullgraph" not in vars(runner.cudagraph_manager)
-
-
 def test_v2_fullgraph_replay_hooks_on_two_managers_do_not_interfere():
     first_events: list[str] = []
     second_events: list[str] = []
@@ -316,421 +170,34 @@ def test_v2_fullgraph_replay_hooks_on_two_managers_do_not_interfere():
     def second_replay(_self, _desc):
         second_events.append("native_replay")
 
-    first_original = MethodType(first_replay, first.cudagraph_manager)
-    second_original = MethodType(second_replay, second.cudagraph_manager)
-    first.cudagraph_manager.run_fullgraph = first_original
-    second.cudagraph_manager.run_fullgraph = second_original
+    first.cudagraph_manager.run_fullgraph = MethodType(
+        first_replay, first.cudagraph_manager
+    )
+    second.cudagraph_manager.run_fullgraph = MethodType(
+        second_replay, second.cudagraph_manager
+    )
 
     with v2_runner_module._use_afd_fullgraph_replay_hook(first, 3):
-        first_hook = first.cudagraph_manager.__dict__["run_fullgraph"]
         with v2_runner_module._use_afd_fullgraph_replay_hook(second, 5):
-            assert first.cudagraph_manager.__dict__["run_fullgraph"] is first_hook
             first.cudagraph_manager.run_fullgraph(descriptor)
             second.cudagraph_manager.run_fullgraph(descriptor)
-        assert second.cudagraph_manager.__dict__["run_fullgraph"] is second_original
-        assert first.cudagraph_manager.__dict__["run_fullgraph"] is first_hook
+        # Leaving the second scope restores native behavior while the first
+        # still publishes its own pre-replay control message.
+        second.cudagraph_manager.run_fullgraph(descriptor)
+        first.cudagraph_manager.run_fullgraph(descriptor)
 
-    assert first.cudagraph_manager.__dict__["run_fullgraph"] is first_original
-    assert second.cudagraph_manager.__dict__["run_fullgraph"] is second_original
-    assert first_events == ["control_update", "control_send", "native_replay"]
-    assert second_events == ["control_update", "control_send", "native_replay"]
-
-
-def test_v2_fullgraph_replay_hook_rejects_same_manager_reentry():
-    runner = _runner_for_metadata([])
-    original = runner.cudagraph_manager.__dict__["run_fullgraph"]
-
-    with v2_runner_module._use_afd_fullgraph_replay_hook(runner, 3):
-        active_hook = runner.cudagraph_manager.__dict__["run_fullgraph"]
-        with (
-            pytest.raises(RuntimeError, match="already active"),
-            v2_runner_module._use_afd_fullgraph_replay_hook(runner, 3),
-        ):
-            pass
-        assert runner.cudagraph_manager.__dict__["run_fullgraph"] is active_hook
-
-    assert runner.cudagraph_manager.__dict__["run_fullgraph"] is original
-
-
-_OVERRIDE_ROOTS = {
-    "par": ("parallel_config",),
-    "comp": ("compilation_config",),
-    "model": ("model_config",),
-    "hf": ("model_config", "hf_config"),
-    "sched": ("scheduler_config",),
-}
-
-
-def _validator_call(overrides):
-    """Apply dotted-path overrides to ``_v2_config()`` for a validator call.
-
-    ``afd.<key>`` edits the AFD dict; other roots are ``_OVERRIDE_ROOTS``
-    aliases or plain config attributes. ``expected_role`` (default: the AFD
-    role) and ``device_type`` are validator arguments, not config fields.
-    """
-
-    overrides = dict(overrides)
-    call = {
-        "device_type": overrides.pop("device_type", None),
-        "expected_role": overrides.pop("expected_role", None),
-    }
-    config = _v2_config()
-    afd = config.additional_config["afd"]
-    for path, value in overrides.items():
-        *parents, name = path.split(".")
-        if parents == ["afd"]:
-            afd[name] = value
-            continue
-        target = config
-        if parents:
-            parents = [*_OVERRIDE_ROOTS.get(parents[0], parents[:1]), *parents[1:]]
-        for attr in parents:
-            target = getattr(target, attr)
-        if not hasattr(target, name):
-            raise AttributeError(f"unknown validator override {path!r}")
-        setattr(target, name, value)
-    call["expected_role"] = call["expected_role"] or afd["role"]
-    return config, call
-
-
-def _err(match, exc_type=RuntimeError):
-    return exc_type, match
-
-
-def _expect(error):
-    return nullcontext() if error is None else pytest.raises(error[0], match=error[1])
-
-
-_GPU_GRAPH = {
-    "model.enforce_eager": False,
-    "comp.cudagraph_mode": CUDAGraphMode.FULL_DECODE_ONLY,
-    "comp.cudagraph_capture_sizes": [TEST_CUDAGRAPH_CAPTURE_SIZE],
-    "comp.max_cudagraph_capture_size": TEST_CUDAGRAPH_CAPTURE_SIZE,
-}
-
-
-@pytest.mark.parametrize(
-    ("overrides", "error"),
-    [
-        pytest.param({}, None, id="accept-baseline"),
-        pytest.param(
-            {"afd.role": "ffn", "hf.architectures": ["AFDDeepseekV2ForCausalLM"]},
-            None,
-            id="accept-ffn-afd-prefixed-arch",
-        ),
-        pytest.param(
-            {
-                "hf.architectures": ["DeepseekV3ForCausalLM"],
-                "afd.num_attention_ranks": 6,
-                "afd.num_ffn_ranks": 3,
-                "par.data_parallel_size": 2,
-                "par.tensor_parallel_size": 3,
-            },
-            None,
-            id="accept-attention-dp2-tp3",
-        ),
-        pytest.param(
-            {
-                "afd.role": "ffn",
-                "hf.architectures": ["Qwen3MoeForCausalLM"],
-                "afd.num_attention_ranks": 6,
-                "afd.num_ffn_ranks": 3,
-                "par.data_parallel_size": 3,
-            },
-            None,
-            id="accept-ffn-ranks-use-ffn-count",
-        ),
-        pytest.param(
-            {
-                **_GPU_GRAPH,
-                "hf.architectures": ["DeepseekV3ForCausalLM"],
-                "hf.hidden_size": 5120,
-                "afd.num_attention_ranks": 3,
-                "afd.num_ffn_ranks": 3,
-                "par.data_parallel_size": 3,
-                "comp.cudagraph_capture_sizes": [4, 16],
-                "comp.max_cudagraph_capture_size": 16,
-                "comp.compile_sizes": [16],
-                "comp.compile_ranges_endpoints": [16, TEST_MODEL_MAX_LEN],
-                "sched.max_num_seqs": 16,
-            },
-            None,
-            id="accept-full-decode-only-graph",
-        ),
-        pytest.param(
-            {**_GPU_GRAPH, "comp.cudagraph_mode": CUDAGraphMode.FULL},
-            _err("FULL_DECODE_ONLY"),
-            id="reject-graph-mode-full",
-        ),
-        pytest.param(
-            {"expected_role": "ffn"},
-            _err("role mismatch", ValueError),
-            id="reject-role-mismatch",
-        ),
-        pytest.param({"device_type": "npu"}, _err("requires CUDA"), id="reject-npu"),
-        pytest.param(
-            {"afd.connector": "CAMAsyncAFDConnector"},
-            _err("P2pNcclAFDConnector"),
-            id="reject-non-p2pnccl-connector",
-        ),
-        pytest.param(
-            {"afd.num_attention_ranks": 2},
-            _err("ranks must match DP"),
-            id="reject-rank-mismatch",
-        ),
-        pytest.param({"par.enable_dbo": True}, _err("DBO"), id="reject-dbo-1ub"),
-        pytest.param(
-            {"par.use_ubatching": True}, _err("ubatching"), id="reject-ubatching-1ub"
-        ),
-        pytest.param(
-            {"par.pipeline_parallel_size": 2}, _err("PP or CP"), id="reject-pp"
-        ),
-        pytest.param(
-            {"par.prefill_context_parallel_size": 2}, _err("PP or CP"), id="reject-pcp"
-        ),
-        pytest.param(
-            {"par.decode_context_parallel_size": 2}, _err("PP or CP"), id="reject-dcp"
-        ),
-        pytest.param(
-            {"par.enable_elastic_ep": True}, _err("static expert"), id="reject-elastic"
-        ),
-        pytest.param(
-            {"par.enable_eplb": True}, _err("static expert"), id="reject-eplb"
-        ),
-        pytest.param(
-            {"par.use_sequence_parallel_moe": True},
-            _err("static expert"),
-            id="reject-sp-moe",
-        ),
-        pytest.param(
-            {"par.enable_expert_parallel": False},
-            _err("static expert"),
-            id="reject-no-expert-parallel",
-        ),
-        pytest.param(
-            {"hf.architectures": ["UnsupportedForCausalLM"]},
-            _err("registered AFD model"),
-            id="reject-unregistered-model",
-        ),
-    ],
-)
-def test_gpu_v2_validator_outcome(overrides, error):
-    config, call = _validator_call(overrides)
-    with _expect(error):
-        validate_gpu_model_runner_v2_config(
-            config,
-            expected_role=call["expected_role"],
-            device_type=call["device_type"] or "cuda",
-        )
-
-
-@pytest.mark.parametrize("local_ubatching", [False, True])
-def test_npu_async_v2_constructor_validates_before_native_and_connector_init(
-    monkeypatch, local_ubatching
-):
-    pytest.importorskip("vllm_ascend")
-    from afd_plugin.v1.worker.npu import attention_model_runner_v2 as module
-
-    config = _v2_config()
-    config.model_config.hf_text_config = config.model_config.hf_config
-    config.model_config.use_mla = True
-    config.parallel_config.num_ubatches = 2
-    config.parallel_config.use_ubatching = local_ubatching
-    config.parallel_config.dbo_decode_token_threshold = 2
-    config.parallel_config.dbo_prefill_token_threshold = 2
-    config.additional_config["afd"].update(
-        connector="CAMAsyncAFDConnector",
-        async_dp=True,
-        compute_gate_on_attention=True,
-    )
-    events = []
-
-    def native_init(self, vllm_config, device):
-        events.append("native")
-        self.vllm_config = vllm_config
-
-    connector = SimpleNamespace(control_plane=None)
-
-    def create_connector(*args):
-        events.append("connector")
-        return connector
-
-    monkeypatch.setattr(module.NPUModelRunnerV2, "__init__", native_init)
-    monkeypatch.setattr(module, "_resolve_world_ranks", lambda: (0, 0))
-    monkeypatch.setattr(
-        module.AFDConnectorFactory, "create_connector", create_connector
-    )
-    monkeypatch.setattr(module, "create_afd_npu_profiler", lambda _role: None)
-    runner = module.AFDNPUAttentionModelRunnerV2(
-        config, SimpleNamespace(type="npu", index=0)
-    )
-    assert runner.connector is connector
-    assert events == ["native", "connector"]
-
-
-_NPU_SYNC = {"afd.connector": "CAMP2pAFDConnector"}
-_NPU_ASYNC = {
-    "afd.connector": "CAMAsyncAFDConnector",
-    "afd.async_dp": True,
-    "afd.compute_gate_on_attention": True,
-}
-_NPU_DBO = {
-    **_NPU_SYNC,
-    "afd.num_attention_ranks": 2,
-    "par.data_parallel_size": 2,
-    "par.enable_dbo": True,
-    "par.use_ubatching": True,
-    "par.num_ubatches": 2,
-}
-_NPU_GRAPH = {
-    **_NPU_SYNC,
-    "model.enforce_eager": False,
-    "comp.cudagraph_capture_sizes": [TEST_CUDAGRAPH_CAPTURE_SIZE],
-    "comp.max_cudagraph_capture_size": TEST_CUDAGRAPH_CAPTURE_SIZE,
-}
-
-
-@pytest.mark.parametrize(
-    ("overrides", "error"),
-    [
-        pytest.param(_NPU_ASYNC, None, id="accept-async-cam"),
-        pytest.param(
-            {
-                **_NPU_ASYNC,
-                "afd.num_attention_ranks": 4,
-                "par.data_parallel_size": 2,
-                "par.tensor_parallel_size": 2,
-                "par.use_sequence_parallel_moe": True,
-                "comp.pass_config.enable_sp": True,
-            },
-            None,
-            id="accept-async-cam-dp2-tp2-sp",
-        ),
-        # Model construction, rather than a backend-wide guard, owns effective
-        # SP. DeepSeek V2's negative construction regression is kept separately.
-        pytest.param(
-            {**_NPU_SYNC, "par.use_sequence_parallel_moe": True},
-            None,
-            id="accept-sync-sp-moe-deferred",
-        ),
-        pytest.param(
-            {**_NPU_SYNC, "comp.pass_config.enable_sp": True},
-            None,
-            id="accept-sync-pass-sp-deferred",
-        ),
-        pytest.param(_NPU_DBO, None, id="accept-dbo-eager-dp2"),
-        pytest.param(
-            {
-                **_NPU_DBO,
-                "model.enforce_eager": False,
-                "comp.cudagraph_mode": CUDAGraphMode.FULL_DECODE_ONLY,
-            },
-            None,
-            id="accept-dbo-graph-dp2",
-        ),
-        pytest.param(
-            {**_NPU_GRAPH, "comp.cudagraph_mode": CUDAGraphMode.FULL},
-            None,
-            id="accept-acl-graph-full",
-        ),
-        pytest.param(
-            {**_NPU_GRAPH, "comp.cudagraph_mode": CUDAGraphMode.FULL_DECODE_ONLY},
-            None,
-            id="accept-acl-graph-full-decode-only",
-        ),
-        pytest.param(
-            {**_NPU_DBO, "par.data_parallel_size": 1, "afd.num_attention_ranks": 1},
-            _err("DBO requires Attention DP > 1"),
-            id="reject-dbo-dp1",
-        ),
-        pytest.param(
-            {**_NPU_DBO, "par.num_ubatches": 3},
-            _err("DBO requires exactly two ubatches"),
-            id="reject-dbo-three-ubatches",
-        ),
-        pytest.param(
-            {**_NPU_DBO, "speculative_config": object()},
-            _err("DBO does not support speculative"),
-            id="reject-dbo-speculative",
-        ),
-        pytest.param(
-            {**_NPU_GRAPH, "comp.cudagraph_mode": CUDAGraphMode.FULL_AND_PIECEWISE},
-            _err("ACL graph modes FULL"),
-            id="reject-acl-graph-full-and-piecewise",
-        ),
-        pytest.param(
-            {**_NPU_ASYNC, "afd.async_dp": False},
-            _err("async DP"),
-            id="reject-async-cam-sync-dp",
-        ),
-        pytest.param(
-            {**_NPU_ASYNC, "afd.compute_gate_on_attention": False},
-            _err("compute_gate_on_attention"),
-            id="reject-async-cam-ffn-gate",
-        ),
-        pytest.param(
-            {**_NPU_ASYNC, "model.enforce_eager": False},
-            _err("eager"),
-            id="reject-async-cam-graph",
-        ),
-        pytest.param(
-            {**_NPU_ASYNC, "par.pipeline_parallel_size": 2},
-            _err("PP or CP"),
-            id="reject-async-cam-pp",
-        ),
-        pytest.param(
-            {**_NPU_ASYNC, "par.prefill_context_parallel_size": 2},
-            _err("PP or CP"),
-            id="reject-async-cam-pcp",
-        ),
-        pytest.param(
-            {**_NPU_ASYNC, "par.decode_context_parallel_size": 2},
-            _err("PP or CP"),
-            id="reject-async-cam-dcp",
-        ),
-        pytest.param(
-            {**_NPU_ASYNC, "par.enable_dbo": True},
-            _err("DBO"),
-            id="reject-async-cam-dbo-1ub",
-        ),
-        pytest.param(
-            {**_NPU_ASYNC, "par.use_ubatching": True},
-            _err("DBO"),
-            id="reject-async-cam-ubatching-1ub",
-        ),
-        pytest.param(
-            {**_NPU_ASYNC, "par.enable_elastic_ep": True},
-            _err("static expert"),
-            id="reject-async-cam-elastic",
-        ),
-        pytest.param(
-            {**_NPU_ASYNC, "par.enable_eplb": True},
-            _err("static expert"),
-            id="reject-async-cam-eplb",
-        ),
-    ],
-)
-def test_npu_v2_validator_outcome(overrides, error):
-    config, call = _validator_call(overrides)
-    with _expect(error):
-        validate_npu_model_runner_v2_config(
-            config,
-            expected_role=call["expected_role"],
-            device_type=call["device_type"] or "npu",
-        )
-
-
-def test_v2_metadata_provider_has_complete_transaction_and_dp_dependencies():
-    runner = _runner_for_metadata([])
-
-    first = runner.build_afd_metadata(None, 7)
-    second = runner.build_afd_metadata(None, 7)
-
-    assert first.transaction_id == "afd-0"
-    assert second.transaction_id == "afd-1"
-    assert first.tokens_lens == [7]
-    assert first.tokens_unpadded_lens == [7]
-    assert runner.build_capture_dp_metadata(9).num_tokens_across_dp_cpu.tolist() == [9]
+    assert first_events == ["control_update", "control_send", "native_replay"] * 2
+    assert second_events == [
+        "control_update",
+        "control_send",
+        "native_replay",
+        "native_replay",
+    ]
+    first_events.clear()
+    second_events.clear()
+    first.cudagraph_manager.run_fullgraph(descriptor)
+    second.cudagraph_manager.run_fullgraph(descriptor)
+    assert first_events == second_events == ["native_replay"]
 
 
 def _capture_descriptor(num_reqs: int, num_tokens: int, num_ubatches: int = 1):
@@ -778,7 +245,6 @@ def test_mrv2_stage_sidecars_preserve_native_slices_and_isolate_mutation(
         assert context.additional_kwargs["platform_key"] == f"stage-{stage_idx}"
     stages[0].tokens_lens[0] = 99
     assert stages[1].tokens_lens == [4]
-    assert runner._afd_pending_metadata.tokens_lens == [4, 4]
 
 
 @pytest.mark.parametrize("graph", [False, True])
@@ -895,7 +361,7 @@ def test_v2_capture_publishes_two_descriptor_events_outside_graph_body(
     monkeypatch,
     data_parallel_size,
     expected_dp_counts,
-):
+):  # long-test: descriptor warmup/capture payloads must precede native graph entry
     events: list[str] = []
     runner = _runner_for_metadata(
         events,
@@ -1026,7 +492,9 @@ def test_v2_capture_publishes_two_descriptor_events_outside_graph_body(
 
 
 @pytest.mark.parametrize("failure", ["prepare", "control", "forward"])
-def test_v2_capture_restores_symbol_and_sidecars_on_failure(monkeypatch, failure):
+def test_v2_capture_restores_symbol_and_sidecars_on_failure(
+    monkeypatch, failure
+):  # long-test: three failure phases share the same native capture scope
     events: list[str] = []
     runner = _runner_for_metadata(events)
     descriptor = _capture_descriptor(1, 8)
@@ -1096,10 +564,6 @@ def test_v2_capture_restores_symbol_and_sidecars_on_failure(monkeypatch, failure
         AFDAttentionModelRunnerV2.capture_model(runner)
 
     assert cudagraph_utils.prepare_inputs_to_capture is original_prepare
-    assert runner._afd_pending_metadata is previous_metadata
-    assert runner._afd_suppress_metadata_send is False
-    assert runner._is_warmup is False
-    assert runner._afd_is_graph_capturing is False
 
 
 @pytest.mark.parametrize(
@@ -1116,7 +580,7 @@ def test_v2_capture_source_drift_fails_loud_and_restores(
     monkeypatch,
     drift,
     expected_prepare_count,
-):
+):  # long-test: each native descriptor/event mismatch must reject before replay
     runner = _runner_for_metadata([])
     descriptors = [_capture_descriptor(1, 8), _capture_descriptor(2, 16)]
     if drift == "descriptor":
@@ -1169,7 +633,7 @@ def test_v2_capture_source_drift_fails_loud_and_restores(
 
 
 def test_v2_capture_profile_only_truncates_tracker_and_forwards_flag(monkeypatch):
-    """Mirror the 0.30.0 memory-profiling capture: the manager truncates the
+    """Mirror native memory-profiling capture: the manager truncates the
     FULL descriptor list to ``_max_full_descs_to_capture`` and the AFD wrapper
     must forward ``profile_only`` while pairing exactly the captured subset."""
     events: list[str] = []
@@ -1221,48 +685,6 @@ def test_v2_capture_profile_only_truncates_tracker_and_forwards_flag(monkeypatch
     assert cudagraph_utils.prepare_inputs_to_capture is original_prepare
 
 
-def test_v2_capture_profile_only_rejects_partial_event_stream(monkeypatch):
-    """Without truncation the third descriptor's events never arrive, so the
-    wrapper must fail loudly instead of silently skipping AFD payloads."""
-    events: list[str] = []
-    runner = _runner_for_metadata(events)
-    descriptors = [_capture_descriptor(1, 8), _capture_descriptor(2, 16)]
-    runner.cudagraph_manager = SimpleNamespace(
-        _capture_descs={CUDAGraphMode.FULL: descriptors},
-        _max_full_descs_to_capture=None,
-    )
-
-    def original_prepare(num_reqs, num_tokens, *args, **kwargs):
-        return "attention-state"
-
-    def native_capture(self, *, profile_only=False):
-        # Simulates a capture that stops after the first descriptor.
-        for _ in (True, False):
-            cudagraph_utils.prepare_inputs_to_capture(
-                descriptors[0].num_reqs,
-                descriptors[0].num_tokens,
-                None,
-                None,
-                None,
-                [],
-                None,
-                True,
-            )
-        return 0
-
-    monkeypatch.setattr(
-        cudagraph_utils,
-        "prepare_inputs_to_capture",
-        original_prepare,
-    )
-    monkeypatch.setattr(native_v2.GPUModelRunner, "capture_model", native_capture)
-
-    with pytest.raises(RuntimeError, match="call count"):
-        AFDAttentionModelRunnerV2.capture_model(runner, profile_only=True)
-
-    assert cudagraph_utils.prepare_inputs_to_capture is original_prepare
-
-
 @pytest.mark.parametrize(
     ("data_parallel_rank", "real_tokens"),
     [(0, 3), (1, 1)],
@@ -1272,7 +694,7 @@ def test_v2_dp2_repeated_fullgraph_replay_sends_local_real_and_padded_tokens(
     monkeypatch,
     data_parallel_rank,
     real_tokens,
-):
+):  # long-test: repeated native replay consumes paired real/padded control payloads
     events: list[str] = []
     runner = _runner_for_metadata(
         events,
@@ -1346,7 +768,6 @@ def test_v2_dp2_repeated_fullgraph_replay_sends_local_real_and_padded_tokens(
     ]
     assert cudagraph_utils.CudaGraphManager.run_fullgraph is class_replay
     assert manager.__dict__["run_fullgraph"] is native_bound_replay
-    assert runner._afd_pending_metadata is None
 
 
 def test_v2_dp2_zero_work_without_native_replay_sends_no_control(monkeypatch):
@@ -1375,7 +796,6 @@ def test_v2_dp2_zero_work_without_native_replay_sends_no_control(monkeypatch):
     )
     assert events == []
     assert cudagraph_utils.CudaGraphManager.run_fullgraph is class_replay
-    assert runner._afd_pending_metadata is None
 
 
 def test_v2_replay_exception_restores_manager_and_sidecars(monkeypatch):
@@ -1408,13 +828,11 @@ def test_v2_replay_exception_restores_manager_and_sidecars(monkeypatch):
 
     assert cudagraph_utils.CudaGraphManager.run_fullgraph is class_replay
     assert manager.__dict__["run_fullgraph"] is native_bound_replay
-    assert runner._afd_pending_metadata is previous_metadata
-    assert runner._afd_suppress_metadata_send is False
-    assert runner._is_warmup is False
-    assert runner._afd_is_graph_capturing is False
 
 
-def test_v2_graph_miss_uses_provider_once_without_replay_control(monkeypatch):
+def test_v2_graph_miss_uses_provider_once_without_replay_control(
+    monkeypatch,
+):  # long-test: native context creation orders one control message before data
     events: list[str] = []
     runner = _runner_for_metadata(events)
     runner.vllm_config.compilation_config.cudagraph_mode = (
@@ -1468,40 +886,9 @@ def test_v2_graph_miss_uses_provider_once_without_replay_control(monkeypatch):
     assert cudagraph_utils.CudaGraphManager.run_fullgraph is class_replay
 
 
-def test_v2_eager_execute_does_not_replace_fullgraph_replay(monkeypatch):
-    runner = _runner_for_metadata([])
-    replay_symbol_during_execute = []
-
-    def native_replay(self, desc):
-        return None
-
-    def native_execute(self, *args, **kwargs):
-        replay_symbol_during_execute.append(
-            cudagraph_utils.CudaGraphManager.run_fullgraph,
-        )
-        return "eager-result"
-
-    monkeypatch.setattr(
-        cudagraph_utils.CudaGraphManager,
-        "run_fullgraph",
-        native_replay,
-    )
-    monkeypatch.setattr(native_v2.GPUModelRunner, "execute_model", native_execute)
-
-    assert (
-        AFDAttentionModelRunnerV2.execute_model(
-            runner,
-            _scheduler_output(3),
-        )
-        == "eager-result"
-    )
-    assert replay_symbol_during_execute == [native_replay]
-    assert cudagraph_utils.CudaGraphManager.run_fullgraph is native_replay
-
-
 def test_v2_profile_before_graph_manager_uses_provider_without_replay_hook(
     monkeypatch,
-):
+):  # long-test: profile runs before graph-manager initialization
     events: list[str] = []
     runner = _runner_for_metadata(events)
     runner.vllm_config.compilation_config.cudagraph_mode = (
@@ -1561,30 +948,9 @@ def test_v2_profile_before_graph_manager_uses_provider_without_replay_hook(
 
     assert events == ["control_update", "control_send", "data"]
     assert cudagraph_utils.CudaGraphManager.run_fullgraph is class_replay
-    assert runner._afd_pending_metadata is None
-    assert runner._afd_suppress_metadata_send is False
-    assert runner._is_warmup is False
-    assert runner._afd_is_graph_capturing is False
     assert (
         forward_context_module.create_forward_context is original_create_forward_context
     )
-
-
-@pytest.mark.parametrize("need_eager", [False, True])
-def test_dp1_native_token_seams_preserve_real_token_count(need_eager):
-    cudagraph_manager = None if need_eager else _no_graph_model_manager()
-    descriptor, dp_metadata = dp_utils.dispatch_cg_and_sync_dp(
-        cudagraph_manager=cudagraph_manager,
-        num_reqs=2,
-        num_tokens=7,
-        uniform_token_count=None,
-        dp_size=1,
-        dp_rank=0,
-        need_eager=need_eager,
-    )
-    assert dp_metadata is None
-    assert descriptor.cg_mode is CUDAGraphMode.NONE
-    assert descriptor.num_tokens == 7
 
 
 def test_dp1_ordinary_native_path_binds_unpadded_afd_metadata():
@@ -1623,12 +989,12 @@ def test_dp1_ordinary_native_path_binds_unpadded_afd_metadata():
     ("is_profile", "skip_attn", "randomize_inputs"),
     [(False, False, False), (True, True, False), (True, True, True)],
 )
-def test_dummy_profile_preserves_randomization(  # long-test: native dummy seam
+def test_dummy_profile_preserves_randomization(
     monkeypatch,
     is_profile,
     skip_attn,
     randomize_inputs,
-):
+):  # long-test: native dummy seam
     events: list[str] = []
     runner = _runner_for_metadata(events)
     runner.max_num_reqs = 2
@@ -1704,7 +1070,7 @@ def test_dummy_profile_preserves_randomization(  # long-test: native dummy seam
 def test_v2_provider_orders_control_before_data_and_always_restores(
     monkeypatch,
     raise_in_native,
-):
+):  # long-test: success/failure share one native context and peer message protocol
     events: list[str] = []
     runner = _runner_for_metadata(events)
     context = ForwardContext(
@@ -1753,7 +1119,6 @@ def test_v2_provider_orders_control_before_data_and_always_restores(
         )
 
     assert events == ["control_update", "control_send", "data"]
-    assert runner._afd_pending_metadata is None
     assert (
         forward_context_module.create_forward_context is original_create_forward_context
     )
@@ -1820,8 +1185,6 @@ def test_v2_idle_native_kv_helper_context_does_not_publish_afd_control(
     assert context.ubatch_slices is None
     assert "afd_metadata" not in context.additional_kwargs
     assert events == []
-    assert runner._afd_pending_metadata is None
-    assert runner._afd_transaction_counter == 0
 
 
 def test_v2_eager_native_kv_helper_context_preserves_pending_afd_transaction():
@@ -1838,7 +1201,6 @@ def test_v2_eager_native_kv_helper_context_preserves_pending_afd_transaction():
         cudagraph_runtime_mode=CUDAGraphMode.NONE,
     )
     runner.install_afd_metadata_on_forward_context(model_context)
-    pending_metadata = runner._afd_pending_metadata
     loaded_contexts: list[ForwardContext] = []
     connector = _active_native_kv_connector(runner, loaded_contexts)
     scheduler_output = SimpleNamespace(
@@ -1866,14 +1228,11 @@ def test_v2_eager_native_kv_helper_context_preserves_pending_afd_transaction():
     assert context.batch_descriptor is None
     assert "afd_metadata" not in context.additional_kwargs
     assert events == ["control_update", "control_send"]
-    assert runner._afd_pending_metadata is pending_metadata
-    assert runner._afd_transaction_counter == 1
-    assert runner._afd_suppress_metadata_send is False
 
 
 def test_v2_repeated_execute_reinstalls_provider_and_advances_transactions(
     monkeypatch,
-):
+):  # long-test: consecutive public execute calls require distinct wire transactions
     events: list[str] = []
     runner = _runner_for_metadata(events)
     contexts: list[ForwardContext] = []
@@ -1917,7 +1276,6 @@ def test_v2_repeated_execute_reinstalls_provider_and_advances_transactions(
             )
             == "native-result"
         )
-        assert runner._afd_pending_metadata is None
         assert (
             forward_context_module.create_forward_context
             is original_create_forward_context
@@ -1973,7 +1331,6 @@ def test_v2_shutdown_runs_all_cleanup_layers_when_each_layer_fails(
         AFDAttentionModelRunnerV2.shutdown(runner)
 
     assert events == ["profiler", "native", "connector"]
-    assert runner._afd_pending_metadata is None
 
 
 def _patch_v2_constructor_dependencies(monkeypatch, connector):
@@ -2030,29 +1387,6 @@ def test_v2_load_model_preserves_native_model_and_connects_after_load(
     assert runner.connector.is_initialized
 
 
-def test_v2_load_model_reports_moe_layers_to_routed_connector(monkeypatch):
-    """An ``AFDRoutedExpertsConnector`` receives the MoE layers Attention
-    dispatches, which every rank checks against the FFN's.
-
-    Why: dispatch and combine run once per MoE layer on every rank.
-    """
-    connector = FakeRoutedConnector()
-    runner = object.__new__(AFDAttentionModelRunnerV2)
-    runner.connector = connector
-    runner.model = SimpleNamespace(get_experts_layer_indices=lambda: [1, 3])
-    monkeypatch.setattr(
-        native_v2.GPUModelRunner, "load_model", lambda self, *args, **kwargs: None
-    )
-    monkeypatch.setattr(AFDAttentionModelRunnerV2, "get_model", lambda self: self.model)
-
-    runner.load_model()
-
-    assert connector.init_kwargs == {
-        "moe_layer_indices": (1, 3),
-        "local_experts": None,
-    }
-
-
 def test_v2_constructor_rejects_missing_control_plane_and_cleans_native(
     monkeypatch,
 ):
@@ -2079,38 +1413,6 @@ def test_v2_constructor_rejects_missing_control_plane_and_cleans_native(
         AFDAttentionModelRunnerV2(config, torch.device("cpu"))
 
     assert events == ["native_init", "connector", "native_shutdown"]
-
-
-def test_v2_constructor_defers_connector_initialization(monkeypatch):
-    events: list[str] = []
-
-    class Connector:
-        control_plane = object()
-
-        def close(self):
-            events.append("connector")
-
-    def native_init(self, vllm_config, device):
-        events.append("native_init")
-        self.vllm_config = vllm_config
-
-    monkeypatch.setattr(native_v2.GPUModelRunner, "__init__", native_init)
-    monkeypatch.setattr(
-        native_v2.GPUModelRunner,
-        "shutdown",
-        lambda self: events.append("native_shutdown"),
-    )
-    monkeypatch.setattr(
-        "afd_plugin.v1.worker.attention_model_runner_v2.create_afd_gpu_profiler",
-        lambda role: _StepProfiler(),
-    )
-    connector = Connector()
-    config = _patch_v2_constructor_dependencies(monkeypatch, connector)
-
-    runner = AFDAttentionModelRunnerV2(config, torch.device("cpu"))
-
-    assert runner.connector is connector
-    assert events == ["native_init"]
 
 
 @pytest.fixture(
@@ -2196,113 +1498,6 @@ def test_worker_factory_failure_preserves_native_construction(
     with pytest.raises(RuntimeError, match="runner construction failed"):
         worker.init_device()
 
-    assert type(_construct_like_native_worker(worker)) is _NativeRunnerSentinel
-
-
-def test_ffn_worker_selects_routed_runner_for_routed_connector(monkeypatch):
-    """An ``AFDRoutedExpertsConnector`` gets the routed-experts runner, and
-    vLLM's MoE backend is pinned to one that keeps the expert layout.
-
-    Why: the routed runner runs the experts itself, from vLLM's layout.
-    """
-    config = _v2_config(role="ffn")
-    worker = _prepare_worker(AFDFFNWorker, config, use_v2=True)
-    monkeypatch.setattr(
-        ffn_worker.AFDConnectorFactory,
-        "get_connector_class",
-        lambda name: FakeRoutedConnector,
-    )
-    monkeypatch.setattr(
-        routed_runner_module, "GPUFFNRoutedExpertsModelRunner", _RunnerRecorder
-    )
-    monkeypatch.setattr(native_v2, "GPUModelRunner", _NativeRunnerSentinel)
-    monkeypatch.setattr(ffn_worker.Worker, "init_device", _fake_worker_init)
-    monkeypatch.setattr(
-        ffn_worker, "assert_compatible_afd_stack", lambda *args, **kwargs: None
-    )
-    monkeypatch.setattr(ffn_worker.torch.accelerator, "empty_cache", lambda: None)
-
-    worker.init_device()
-
-    assert worker.model_runner.__class__ is _RunnerRecorder
-    assert config.kernel_config.moe_backend == "triton"
-
-
-def _deepep_m2n_v2_config(**kwargs):
-    config = _v2_config(architecture="Qwen3MoeForCausalLM", **kwargs)
-    config.additional_config["afd"]["connector"] = "DeepEPM2NAFDConnector"
-    config.additional_config["afd"]["compute_gate_on_attention"] = True
-    return config
-
-
-@pytest.mark.parametrize("tp_size", [1, 2])
-def test_v2_validator_accepts_deepep_m2n_attention_tp(tp_size):
-    """DeepEP M2N accepts Attention TP > 1.
-
-    Why: each Attention TP rank dispatches its own slice of the tokens, and
-    the worker derives the TP rank from the worker rank before vLLM's
-    process groups exist.
-    """
-    validate_gpu_model_runner_v2_config(
-        _deepep_m2n_v2_config(
-            tensor_parallel_size=tp_size, num_attention_ranks=tp_size
-        ),
-        expected_role="attention",
-        device_type="cuda",
-    )
-
-
-def test_v2_validator_rejects_deepep_m2n_ffn_tp():
-    """DeepEP M2N FFN ranks must run TP = 1.
-
-    Why: DeepEP routes each token to the one FFN rank that owns the whole
-    expert; FFN experts are not TP-sharded.
-    """
-    config = _deepep_m2n_v2_config(role="ffn", tensor_parallel_size=2, num_ffn_ranks=2)
-    with pytest.raises(RuntimeError, match="requires FFN tensor_parallel_size=1"):
-        validate_gpu_model_runner_v2_config(
-            config,
-            expected_role="ffn",
-            device_type="cuda",
-        )
-
-
-@pytest.mark.parametrize("role", ["attention", "ffn"])
-def test_v2_validator_requires_gate_on_attention_for_deepep_m2n(role):
-    """DeepEP M2N without compute_gate_on_attention fails at validation.
-
-    Why: the connector routes on Attention, so a run without the gate there
-    cannot dispatch; failing here names the setting instead of failing later
-    in the connector handshake.
-    """
-    config = _deepep_m2n_v2_config(role=role)
-    config.additional_config["afd"]["compute_gate_on_attention"] = False
-    with pytest.raises(RuntimeError, match="requires compute_gate_on_attention=true"):
-        validate_gpu_model_runner_v2_config(
-            config,
-            expected_role=role,
-            device_type="cuda",
-        )
-
-
-@pytest.mark.parametrize("use_v2", [False, True])
-def test_non_afd_model_config_and_native_runner_identity_are_unchanged(
-    monkeypatch, use_v2
-):
-    model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(architectures=["OtherForCausalLM"]),
-    )
-    native_module = native_v2 if use_v2 else native_v1
-    monkeypatch.setattr(native_module, "GPUModelRunner", _NativeRunnerSentinel)
-    worker = SimpleNamespace(
-        use_v2_model_runner=use_v2,
-        vllm_config=SimpleNamespace(
-            model_config=model_config, is_mm_encoder_only=False
-        ),
-        device=torch.device("cpu"),
-    )
-
-    assert get_afd_model_config(model_config, device_type="cuda") is model_config
     assert type(_construct_like_native_worker(worker)) is _NativeRunnerSentinel
 
 

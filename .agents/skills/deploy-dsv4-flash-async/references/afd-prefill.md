@@ -42,17 +42,12 @@ DBO 只在 A 开启，固定两 microbatch，PP=PCP=DCP=1，无 speculative deco
 A 默认 FlashComm1=1，TP1 的 F 固定为 0；显式 shared-expert DP 和 finegrained TP
 不属于当前 AFD MRV2 Async CAM 接受的配置。
 
-## FFN eager、layered eager 与 FULL
+## FFN layered eager 与 FULL
 
-| FFN 模式 | `PREFILL_FFN_GRAPH_MODE` | `AFD_ASYNC_CAM_LAYERED_GMM` |
-| --- | --- | --- |
-| 普通 eager | `EAGER`（默认） | `0` 或未设置 |
-| W4A8 layered eager | `EAGER` | `1` |
-| W4A8 layered FULL | `FULL` | `1` |
-
-layered 路径的当前 checkpoint 目标是 910C、同构 DSV4 per-channel W4A8、
-动态量化、静态专家和 Attention gating；per-group 算子测试不证明真实 per-group
-checkpoint loader 可用。W8A8 仍使用普通 eager，不能由 A8W8 算子覆盖推断 FULL 支持。
+FFN 统一使用 layered GMM：`PREFILL_FFN_GRAPH_MODE=EAGER` 是默认值，
+`PREFILL_FFN_GRAPH_MODE=FULL` 启用完整事务图。当前 checkpoint 目标是
+910C、同构 DSV4 per-channel W4A8 或 W8A8、动态量化、静态专家和 Attention gating；
+per-group 算子测试不证明真实 per-group checkpoint loader 可用。
 
 FULL 只改变 F；A 保持 eager，可使用原生 DBO。F 省略 `--enforce-eager` 并显式指定
 `cudagraph_mode=FULL`，不支持 piecewise/decode-only，也没有自动 eager fallback。
@@ -62,14 +57,12 @@ FULL 启动前必须明确设置 `BATCH_SIZE_FACTOR`：receive capacity 为
 
 ```bash
 export PREFILL_FFN_GRAPH_MODE=FULL
-export AFD_ASYNC_CAM_LAYERED_GMM=1
 export BATCH_SIZE_FACTOR=<capacity-factor-for-this-topology-and-MBT>
 bash "${DSV4_SCRIPT_DIR}/run_prefill.sh"
 ```
 
-入口仅向 F 传递 layered 开关，A 子进程显式设为 0。F 的启动日志须证明
-`actual=layered`，FULL 还需实际请求期间的 replay 证据。
-切回普通 eager 时同时设 `PREFILL_FFN_GRAPH_MODE=EAGER` 和 layered=0，重启本次完整 worker 组。
+检查 F 的 `Async CAM layered GMM` 启动日志；FULL 还需实际请求期间的 replay 证据。
+切回 eager 时设 `PREFILL_FFN_GRAPH_MODE=EAGER` 并重启本次完整 worker 组。
 
 所有 A/F 的 MBT 保持一致并能被 A TP 整除；rank 总数等于各角色 DP×TP，
 `attn_ranks_per_dp=A TP`，跨节点 local DP 分段不重叠。

@@ -6,10 +6,11 @@ sections) in the reviewed head; platform init ordering lives in
 
 Use for `afd_plugin/compat/npu/`: deferred patch application
 (`runtime.py::apply_afd_ascend_patches_if_needed`), runtime config, forward
-context, feature validation, Ascend ops loading (`ops.py`), and the NPU
-profiler. Does not own the vLLM-Ascend patch files under
-`compat/patches/npu/` ([compat-patches.md](compat-patches.md)) or the NPU
-workers ([workers-runners.md](workers-runners.md)).
+context, feature validation, Ascend ops loading (`ops.py`), the opaque
+routing-id balancing boundary (`routing_ids.py`), and the NPU profiler. Does
+not own the vLLM-Ascend patch files under `compat/patches/npu/`
+([compat-patches.md](compat-patches.md)) or the NPU workers
+([workers-runners.md](workers-runners.md)).
 
 ## Contract checks
 
@@ -22,9 +23,19 @@ workers ([workers-runners.md](workers-runners.md)).
   silently continue when ops are missing.
 - Guard every `torch_npu`/`vllm_ascend` import so module import stays
   CPU-safe; runtime checks happen inside guarded functions.
+- `routing_ids.py` is an opaque boundary registered during worker
+  initialization; keep profile routing decisions inside the op rather than
+  exporting them as Python-visible state. Standalone scripts import the module
+  after device init. Its fixture lives in
+  `tests/unit/fakes/routing_ids_op.py` and is registered from
+  `tests/unit/conftest.py`; a new consumer that bypasses the fixture will break
+  CPU collection.
 - Keep NPU behavior observable: a deferred patch or runtime tweak that changes
   execution must be loggable and attributable when troubleshooting per
   `docs/npu/TROUBLESHOOTING.md`.
 
-Test in `tests/unit/compat/npu/`: application ordering, idempotence, feature
-rejections, and op-presence failure paths — all CPU-safe via guarded imports.
+Test in `tests/unit/compat/npu/` (`test_runtime_config.py`,
+`test_feature_validation.py`, `test_ascend_config_lifecycle.py`,
+`test_ascend_engine_core_binding.py`, `test_routing_ids.py`,
+`test_profiler.py`): application ordering, idempotence, feature rejections, and
+op-presence failure paths — all CPU-safe via guarded imports.

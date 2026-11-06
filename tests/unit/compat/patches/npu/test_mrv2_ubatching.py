@@ -205,6 +205,7 @@ def execute_contract():
             skip_dp.reset(token)
 
     class NativeRunner:
+        connector: object
         vllm_config: SimpleNamespace
         afd_config: SimpleNamespace
         prof: None
@@ -256,6 +257,7 @@ def execute_contract():
     future = ast.parse("from __future__ import annotations").body
     namespace = {
         "NativeRunner": NativeRunner,
+        "CAMAsyncAFDConnector": type("CAMAsyncAFDConnector", (), {}),
         "CUDAGraphMode": _GraphMode,
         "nullcontext": nullcontext,
         "step_afd_npu_profiler": lambda profiler: None,
@@ -279,6 +281,7 @@ def execute_contract():
             Callable[[], NativeRunner], namespace["AFDNPUAttentionModelRunnerV2"]
         )
         runner = runner_factory()
+        runner.connector = None
         runner.vllm_config = SimpleNamespace(
             compilation_config=SimpleNamespace(cudagraph_mode=_GraphMode.NONE)
         )
@@ -324,6 +327,35 @@ def test_execute_preserves_native_input_policy_and_restores_scopes(
         }
     assert execute_contract.provider.get() is None
     assert execute_contract.skip_dp.get() is False
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_execute_scopes_connector_step_around_native_execution(execute_contract, fail):
+    runner = execute_contract.make_runner(False)
+    events = []
+
+    @contextmanager
+    def attention_step():
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    runner.connector = SimpleNamespace(attention_step=attention_step)
+
+    def install_metadata(context):
+        assert events == ["enter"]
+        events.append("native")
+
+    runner.install_afd_metadata_on_forward_context = install_metadata
+    scheduler = SimpleNamespace(total_num_scheduled_tokens=7, fail=fail)
+    if fail:
+        with pytest.raises(RuntimeError, match="native execution failed"):
+            runner.execute_model(scheduler)
+    else:
+        runner.execute_model(scheduler)
+    assert events == ["enter", "native", "exit"]
 
 
 def test_execute_keeps_native_default_input_policy(execute_contract):

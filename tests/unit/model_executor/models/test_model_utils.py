@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Draft model registration keeps native configuration aliases intact."""
+"""AFD architecture selection preserves native configs and DSpark contracts."""
+
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,13 +11,8 @@ from tests.unit.fakes.vllm_config import npu_dspark_config
 
 
 @pytest.fixture
-def configure_dspark(monkeypatch):
-    # The parent models namespace imports vLLM forward context. Load this pure
-    # configuration module directly, using the existing CPU host-test loader.
-    module = load_host_module(
-        monkeypatch, "afd_plugin.model_executor.models.model_utils"
-    )
-    return module.configure_afd_dspark
+def configure_dspark(model_utils):
+    return model_utils.configure_afd_dspark
 
 
 @pytest.fixture
@@ -54,3 +51,63 @@ def test_dspark_rejects_incompatible_remote_transport(
     setattr(draft, field, getattr(draft, field) + 1)
     with pytest.raises(ValueError, match=f"transport {field} mismatch"):
         configure_dspark(dspark_config)
+
+
+@pytest.fixture
+def model_utils(monkeypatch):
+    return load_host_module(monkeypatch, "afd_plugin.model_executor.models.model_utils")
+
+
+@pytest.mark.parametrize(
+    "architecture,device_type",
+    [
+        ("DeepseekV2ForCausalLM", "cuda"),
+        ("DeepseekV2ForCausalLM", "npu"),
+        ("DeepseekV4ForCausalLM", "cuda"),
+        ("Qwen3MoeForCausalLM", "cuda"),
+        ("Qwen3MoeForCausalLM", "npu"),
+        ("Qwen3_5MoeForConditionalGeneration", "cuda"),
+    ],
+)
+def test_model_config_rewrites_architecture_in_private_copy(
+    model_utils, architecture, device_type
+):
+    hf_config = SimpleNamespace(architectures=[architecture])
+    original = SimpleNamespace(hf_config=hf_config, hf_text_config=hf_config)
+    mapped = model_utils.get_afd_model_config(original, device_type=device_type)
+
+    assert mapped is not original
+    assert mapped.hf_config is not hf_config
+    assert mapped.hf_text_config is mapped.hf_config
+    assert mapped.hf_config.architectures == [f"AFD{architecture}"]
+    assert hf_config.architectures == [architecture]
+
+
+def test_model_config_preserves_distinct_nested_text_config(model_utils):
+    text = SimpleNamespace(model_type="qwen3_5_moe_text")
+    original = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["Qwen3_5MoeForConditionalGeneration"]),
+        hf_text_config=text,
+    )
+    mapped = model_utils.get_afd_model_config(original, device_type="cuda")
+
+    assert mapped.hf_text_config is not text
+    assert mapped.hf_text_config is not mapped.hf_config
+    assert mapped.hf_config.architectures == ["AFDQwen3_5MoeForConditionalGeneration"]
+    assert original.hf_config.architectures == ["Qwen3_5MoeForConditionalGeneration"]
+
+
+def test_model_config_preserves_unregistered_architecture(model_utils):
+    original = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["UnknownForCausalLM"])
+    )
+    assert model_utils.get_afd_model_config(original, device_type="cuda") is original
+
+
+def test_model_config_rejects_qwen_on_npu_without_mutation(model_utils):
+    hf_config = SimpleNamespace(architectures=["Qwen3_5MoeForConditionalGeneration"])
+    with pytest.raises(ValueError, match="Qwen3.5/3.6 supports CUDA execution only"):
+        model_utils.get_afd_model_config(
+            SimpleNamespace(hf_config=hf_config), device_type="npu"
+        )
+    assert hf_config.architectures == ["Qwen3_5MoeForConditionalGeneration"]

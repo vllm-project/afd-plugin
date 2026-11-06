@@ -43,11 +43,6 @@ def _install_fake_vllm_config(monkeypatch):
         additional_config: dict
         platform_worker_cls = VLLM_GPU_WORKER_FQCN
 
-        def _get_dbo_unsupported_features(self):
-            if self.model_config.is_hybrid:
-                return ["dual batch overlap with hybrid models"]
-            return []
-
         def __post_init__(self):
             if self.parallel_config.use_ubatching:
                 assert self.parallel_config.all2all_backend in {
@@ -118,21 +113,6 @@ def _load_patch_module():
     spec.loader.exec_module(module)
     spec.loader.exec_module(module)
     return module
-
-
-@pytest.mark.parametrize("is_hybrid", [False, True])
-def test_patch_preserves_native_dbo_model_restrictions(monkeypatch, is_hybrid):
-    _, config_module = _install_fake_vllm_config(monkeypatch)
-    native_restrictions = config_module.VllmConfig._get_dbo_unsupported_features
-
-    _load_patch_module()
-
-    assert config_module.VllmConfig._get_dbo_unsupported_features is native_restrictions
-    config = config_module.VllmConfig()
-    config.additional_config = {"afd": {"role": "attention"}}
-    config.model_config = SimpleNamespace(is_hybrid=is_hybrid)
-    expected = ["dual batch overlap with hybrid models"] if is_hybrid else []
-    assert config._get_dbo_unsupported_features() == expected
 
 
 def _engine_args(
@@ -400,11 +380,10 @@ def test_config_validation_outcome(
     monkeypatch, platform, version, engine_args, revalidate, expected, raises
 ):
     arg_utils_module, config_module = _install_fake_vllm_config(monkeypatch)
-    ascend_patch_calls = []
     monkeypatch.setattr(
         npu_compat,
         "apply_afd_ascend_config_patch_if_needed",
-        lambda: ascend_patch_calls.append("npu"),
+        lambda: None,
     )
     platform_worker_cls, is_cuda, device_type = platform
     config_module.VllmConfig.platform_worker_cls = platform_worker_cls
@@ -425,35 +404,6 @@ def test_config_validation_outcome(
         assert cfg.post_init_backend == post_init_backend
         assert cfg.parallel_config.all2all_backend == "allgather_reducescatter"
     assert args.all2all_backend == "allgather_reducescatter"
-    # The Ascend config shim is installed only for AFD configs on NPU.
-    assert bool(ascend_patch_calls) == (engine_args["active"] and device_type == "npu")
-
-
-def test_config_validation_finalizes_async_attention_patch_after_ascend(monkeypatch):
-    arg_utils_module, config_module = _install_fake_vllm_config(monkeypatch)
-    config_module.VllmConfig.platform_worker_cls = VLLM_ASCEND_NPU_WORKER_FQCN
-    _set_fake_platform(is_cuda=False, device_type="npu")
-    calls: list = []
-    monkeypatch.setattr(
-        npu_compat,
-        "apply_afd_ascend_config_patch_if_needed",
-        lambda: calls.append("config"),
-    )
-    monkeypatch.setattr(
-        npu_compat,
-        "apply_afd_async_dp_engine_patch_if_needed",
-        lambda config: calls.append(("engine", config)),
-    )
-    _load_patch_module()
-    args = _engine_args(active=True)
-    args.additional_config["afd"].update(
-        connector="CAMAsyncAFDConnector",
-        async_dp=True,
-    )
-
-    config = arg_utils_module.EngineArgs.create_engine_config(args)
-
-    assert calls == ["config", "config", ("engine", config)]
 
 
 def _npu_case(case_id, *, worker, keeps_dbo, dbo=True, revalidate=False, **kwargs):

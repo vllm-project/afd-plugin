@@ -108,6 +108,20 @@ class AsyncCAMLayeredExecutor:
         self.w13_op = torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered
         self.w2_op = torch.ops.afd_ascend.grouped_matmul_layered
 
+    def geometry(self) -> tuple[int, int, int]:
+        """Return (experts, hidden, intermediate) from the loaded weight layout.
+
+        INT4 weights pack eight nibbles per INT32, so the stored last dimension
+        is a quarter of the gate/up width; INT8 stores that width directly.
+        Callers that need only the logical geometry must not re-derive it.
+        """
+        experts, hidden, last = self.w13[0].shape
+        if self.quantization == "W8A8":
+            if last % 2:
+                raise ValueError("layered GMM requires an even W13 gate/up width")
+            return experts, hidden, last // 2
+        return experts, hidden, last * INT4_PER_INT32 // 2
+
     def graph_signature(self, capacity: int) -> str:
         """Compare static layouts across ranks without local device addresses."""
         tensors = (

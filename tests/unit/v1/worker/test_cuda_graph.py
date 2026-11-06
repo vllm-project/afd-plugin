@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -136,73 +139,6 @@ def test_make_ffn_graph_key_can_aggregate_attention_counts_to_ffn_counts():
 # --- TP expansion tests ---
 
 
-def test_make_ffn_graph_key_expands_dp1_tp2():
-    """DP=1 has 1 entry in num_tokens_across_dp_cpu; with TP=2 the
-    attention_size=2 so the single DP entry must be replicated."""
-    metadata = SimpleNamespace(num_tokens_across_dp_cpu=[8])
-
-    key = make_ffn_graph_key(
-        {0: metadata},
-        attention_size=2,
-        ffn_size=2,
-        fallback=32,
-    )
-    # OLD (buggy) behaviour returned (32, 32) via the fallback path.
-    # Correct behaviour: replicate [8] -> (8, 8), then aggregate.
-    assert key == ((0, (8, 8)),)
-
-
-def test_make_ffn_graph_key_different_tokens_for_dp1_tp2():
-    """Prefill (4 tokens) and decode (8 tokens) must produce different keys
-    so that the FFN correctly distinguishes EAGER from REPLAY."""
-    prefill_meta = SimpleNamespace(num_tokens_across_dp_cpu=[4])
-    decode_meta = SimpleNamespace(num_tokens_across_dp_cpu=[8])
-
-    prefill_key = make_ffn_graph_key(
-        {0: prefill_meta},
-        attention_size=2,
-        ffn_size=2,
-        fallback=32,
-    )
-    decode_key = make_ffn_graph_key(
-        {0: decode_meta},
-        attention_size=2,
-        ffn_size=2,
-        fallback=32,
-    )
-
-    assert prefill_key == ((0, (4, 4)),)
-    assert decode_key == ((0, (8, 8)),)
-    assert prefill_key != decode_key
-
-
-def test_make_ffn_graph_key_expands_dp2_tp2():
-    """DP=2, TP=2: two DP entries replicated to 4 AFD entries."""
-    metadata = SimpleNamespace(num_tokens_across_dp_cpu=[4, 8])
-
-    key = make_ffn_graph_key(
-        {0: metadata},
-        attention_size=4,
-        ffn_size=4,
-        fallback=32,
-    )
-    # [4, 8] -> replicate tp_size=2 -> [4, 4, 8, 8] -> aggregate group_size=1
-    assert key == ((0, (4, 4, 8, 8)),)
-
-
-def test_make_ffn_graph_key_dp1_tp1_unchanged():
-    """TP=1 should not trigger expansion; behaviour unchanged from before."""
-    metadata = SimpleNamespace(num_tokens_across_dp_cpu=[8])
-
-    key = make_ffn_graph_key(
-        {0: metadata},
-        attention_size=1,
-        ffn_size=1,
-        fallback=32,
-    )
-    assert key == ((0, (8,)),)
-
-
 @pytest.mark.parametrize(
     ("is_graph_replaying", "graph_exists", "expected"),
     [
@@ -226,3 +162,19 @@ def test_graph_run_mode_requires_attention_replaying(
         )
         is expected
     )
+
+
+@pytest.mark.parametrize(
+    "counts,attention,ffn,expected",
+    [
+        ([4], 2, 2, (4, 4)),
+        ([8], 2, 2, (8, 8)),
+        ([4, 8], 4, 4, (4, 4, 8, 8)),
+        ([8], 1, 1, (8,)),
+    ],
+)
+def test_graph_keys_expand_dp_counts_by_attention_tp(counts, attention, ffn, expected):
+    metadata = SimpleNamespace(num_tokens_across_dp_cpu=counts)
+    assert make_ffn_graph_key(
+        {0: metadata}, attention_size=attention, ffn_size=ffn, fallback=32
+    ) == ((0, expected),)

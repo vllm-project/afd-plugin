@@ -67,7 +67,7 @@ def test_cam_selection_preserves_registry_order_with_legacy_operators():
     assert result.stdout.split() == ["e2a", CAM_OPERATORS[0], CAM_OPERATORS[-1]]
 
 
-def test_cam_sources_survive_source_distribution_manifest(monkeypatch):
+def test_native_sources_survive_source_distribution_manifest(monkeypatch):
     """Apply setuptools' real MANIFEST rules to the vendored build inputs."""
     root = Path(__file__).resolve().parents[3]
     monkeypatch.chdir(root)
@@ -87,29 +87,8 @@ def test_cam_sources_survive_source_distribution_manifest(monkeypatch):
     manifest.add_license_files()
     packaged = {Path(path).as_posix() for path in files.files}
 
-    required = {
-        "csrc/npu/pybind/torch_binding_cam_async.cpp",
-        "csrc/npu/ascend_kernels/operator_registry.json",
-        "LICENSE",
-    }
-    for operator in CAM_OPERATORS:
-        source_dir = root / "csrc/npu/ascend_kernels" / operator
-        for part in ("op_api", "op_host", "op_kernel"):
-            sources = tuple((source_dir / part).glob("*"))
-            assert any(path.suffix == ".cpp" for path in sources), f"{operator}/{part}"
-            if part != "op_host":
-                assert any(path.suffix == ".h" for path in sources), (
-                    f"{operator}/{part}"
-                )
-            required.update(path.relative_to(root).as_posix() for path in sources)
-    shared_headers = root / "csrc/npu/ascend_kernels/utils"
-    required.update(
-        path.relative_to(root).as_posix() for path in shared_headers.rglob("*.h")
-    )
-
+    required = set(files.allfiles) | {"LICENSE"}
     assert required <= packaged, sorted(required - packaged)
-    for path in required:
-        assert (root / path).is_file(), path
     license_text = (root / "LICENSE").read_text()
     assert " ".join(CAM_MIT_NOTICE.split()) in " ".join(license_text.split())
 

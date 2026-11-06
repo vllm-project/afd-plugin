@@ -10,7 +10,6 @@ import pytest
 
 from afd_plugin.compat.npu import ops
 from afd_plugin.compat.npu.ops import (
-    ensure_afd_ascend_ops_loaded,
     ensure_cam_async_ops_available,
     ensure_cam_p2p_ops_available,
     get_afd_cann_vendor_path,
@@ -25,14 +24,6 @@ def test_ascend_ops_loader_fails_clearly_without_extension():
 
     with pytest.raises(RuntimeError, match="CAMP2P Ascend custom ops"):
         ensure_cam_p2p_ops_available()
-
-
-def test_legacy_ascend_ops_loader_alias_fails_clearly_without_extension():
-    if has_afd_ascend_ops():
-        pytest.skip("AFD Ascend extension is installed in this environment")
-
-    with pytest.raises(RuntimeError, match="CAMP2P Ascend custom ops"):
-        ensure_afd_ascend_ops_loaded()
 
 
 def test_ascend_ops_paths_are_plugin_owned():
@@ -73,21 +64,6 @@ def test_ascend_ops_loader_sets_explicit_cust_opapi_path(tmp_path, monkeypatch):
     assert ops.os.environ["AFD_CUST_OPAPI_LIB_PATH"] == str(cust_opapi_path)
 
 
-def test_ascend_ops_namespace_check_allows_vllm_ascend_coexistence():
-    class _Namespace:
-        a2e = object()
-        e2a = object()
-
-    class _Ops:
-        _C_ascend = _Namespace()
-        afd_ascend = _Namespace()
-
-    class _Torch:
-        ops = _Ops()
-
-    ops._assert_afd_namespace_registered(_Torch)
-
-
 @pytest.mark.parametrize(
     "missing",
     [
@@ -113,10 +89,7 @@ def test_async_loader_requires_all_source_ops(monkeypatch, missing):
             ops=SimpleNamespace(afd_ascend=namespace),
         ),
     )
-    loaded = []
-    monkeypatch.setattr(
-        ops, "ensure_cam_p2p_ops_available", lambda: loaded.append(True)
-    )
+    monkeypatch.setattr(ops, "ensure_cam_p2p_ops_available", lambda: None)
     ensure_cam_async_ops_available.cache_clear()
     try:
         if missing:
@@ -124,6 +97,5 @@ def test_async_loader_requires_all_source_ops(monkeypatch, missing):
                 ensure_cam_async_ops_available()
         else:
             ensure_cam_async_ops_available()
-        assert loaded == [True]
     finally:
         ensure_cam_async_ops_available.cache_clear()

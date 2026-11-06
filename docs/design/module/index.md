@@ -136,3 +136,8 @@ Operational guides remain separate from normative module design:
 - [Ascend NPU installation](../../../README.md#ascend-npu-installation)
 - [Connector overview](../../../afd_plugin/connectors/README.md)
 - [Deployment recipes](../../../recipe/README.md)
+
+- `afd_plugin/compat/npu/routing_ids.py` — opaque routing-id balancing boundary.
+  Registered during worker initialization; standalone scripts import the module
+  after device init. Tests: `tests/unit/compat/npu/test_routing_ids.py` and the
+  shared fixture in `tests/unit/fakes/routing_ids_op.py`.

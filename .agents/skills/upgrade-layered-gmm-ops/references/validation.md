@@ -13,8 +13,8 @@ python .agents/skills/upgrade-layered-gmm-ops/scripts/compare_layered_ops.py \
   classify --kind swiglu --upstream "$NEW_UPSTREAM/gmm/grouped_matmul_swiglu_quant_v2" \
   --afd csrc/npu/ascend_kernels/grouped_matmul_swiglu_quant_v2_layered
 pytest -q tests/unit/package/ \
-  tests/unit/compat/npu/test_gmm_layered.py \
-  tests/unit/compat/npu/test_gmm_swiglu_quant_v2_layered.py
+  tests/npu/test_gmm_layered.py \
+  tests/npu/test_gmm_swiglu_quant_v2_layered.py
 ruff check .agents/skills/upgrade-layered-gmm-ops
 ```
 
