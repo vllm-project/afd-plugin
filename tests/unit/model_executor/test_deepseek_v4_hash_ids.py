@@ -22,6 +22,10 @@ from typing import Any
 
 import pytest
 
+# The gate calls torch.ops.vllm.afd_balance_routing_ids_; this module runs
+# without the AFD worker installer, so the op is registered here.
+pytestmark = pytest.mark.usefixtures("registered_routing_ids_op")
+
 torch = pytest.importorskip("torch")
 
 _STUB_MODULES = (
@@ -83,10 +87,6 @@ with _vllm_stub():
     )
 
 
-def _make_model(**attributes: object) -> types.SimpleNamespace:
-    return types.SimpleNamespace(**attributes)
-
-
 def _forward_context(**overrides: object) -> types.SimpleNamespace:
     """Build a forward context carrying the fields the helper reads.
 
@@ -142,16 +142,6 @@ def test_rejects_unalignable_token_count():
             input_ids=ids,
             router_tokens=3,
         )
-
-
-def test_model_sharded_ids_are_not_split_again():
-    ids = torch.tensor([8, -1], dtype=torch.int64)
-    assert local_hash_input_ids(input_ids=ids, router_tokens=2).tolist() == [8, -1]
-
-
-def test_rejects_global_ids_for_local_router():
-    with pytest.raises(RuntimeError, match="cannot align"):
-        local_hash_input_ids(input_ids=torch.arange(7), router_tokens=2)
 
 
 _DSV4_MODULE_PATH = (

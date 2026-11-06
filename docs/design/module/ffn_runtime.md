@@ -12,9 +12,10 @@ primary_code_paths:
   - "afd_plugin/v1/worker/ffn_worker.py"
   - "afd_plugin/v1/worker/npu/ffn_model_runner.py"
   - "afd_plugin/v1/worker/npu/async_ffn_model_runner.py"
-  - "afd_plugin/v1/worker/npu/async_ffn_two_stream.py"
   - "afd_plugin/v1/worker/npu/ffn_worker.py"
 related_code_paths:
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_startup.py"
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_session.py"
   - "afd_plugin/connectors/**"
   - "afd_plugin/model_executor/**"
   - "afd_plugin/compat/patches/engine_core.py"
@@ -32,14 +33,16 @@ validation_paths:
   - "tests/unit/v1/worker/test_ffn_routed_experts_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
-  - "tests/unit/v1/worker/test_async_ffn_two_stream.py"
-  - "tests/unit/test_async_cam_startup_wiring.py"
-  - "tests/unit/connectors/test_async_cam_startup.py"
+  - "tests/unit/connectors/npu/test_async_cam_startup_wiring.py"
+  - "tests/unit/connectors/npu/test_async_cam_startup.py"
+  - "tests/unit/connectors/test_base.py"
+  - "tests/unit/connectors/npu/test_async_cam_session.py"
+  - "tests/unit/connectors/npu/test_async_cam.py"
   - "tests/npu/async_cam_runtime.py"
   - "tests/e2e/models/deepseek_v4_flash/ffn_graph.py"
   - "tests/unit/compat/patches/test_engine_core.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
-  - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
 upstream_refs:
   - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
@@ -57,7 +60,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-10-20
+last_reviewed: 2026-11-05
 ---
 
 # FFN runtime
@@ -76,6 +79,17 @@ profiler, native-op, and build mechanisms belong to
 FFN consumes plugin configuration, connector transport, model-side compute,
 platform mechanisms, and EngineCore compatibility. No shared module may depend
 on the FFN worker or runner implementation.
+
+Async CAM's connector owns HCCL, payload validation and initialization/cleanup
+coordination. It selects a Push or Pull session at construction. Both inherit
+the concrete `FFNExecutionSession` lifecycle defaults from `connectors/base.py`. Push owns
+per-stage routing queues; Pull owns its single window, publish/combine, device
+status and quiet/drain/stopped lifecycle. Pull takes Startup, topology and the
+dimensions/capacity used for initialization and bounded drain; it does not
+retain the connector. The FFN runner continues to own eager/FULL execution,
+graph references and completion; the worker still owns the receiver thread.
+The current Mega executor reads the same live window through the connector's
+read-only `comm_args` property.
 
 ## Runtime selection
 
@@ -178,18 +192,6 @@ FFN. Async FFN FULL accepts eager Attention DBO and continues to receive work
 items independently of Attention's threads. These limits
 describe the pair even though only Attention inherits a native V2 runner.
 
-Async CAM also has an experimental, default-off `ffn_two_stream` mode for
-layered W4A8/W8A8 eager/FULL. `AsyncFFNTwoStream`, owned by the Async runner, retains
-two slots, compute/send streams and ready/done events. FULL owns four private
-graph pools and four graphs; eager retires each slot only after its send is
-observed complete. Both modes retain the bounded batch fence. Enabled eager
-and FULL agree on executor, layer, capacity and core signatures before HCCL
-creation and reject Attention DBO/SP combinations. Shutdown requires receiver
-exit and device completion before release. Partial native failures retain
-resources and remain visible to repeated health checks. Host tests do not
-qualify native window reuse, graph capture or stream overlap; see the
-[Async runtime guide](../../npu/ASYNC_FFN_RUNTIME.md#experimental-ffn-two-stream-execution).
-
 ## Daemon step selection
 
 The worker selects one of two FFN step paths from the optional
@@ -213,10 +215,10 @@ flowchart TD
     CONTROL --> FLAGS{"Profile, warmup, capture, replay, or eager?"}
     FLAGS --> GRAPH["Prepare graph state or eager context"]
     GRAPH --> RECEIVE["Receive Attention payload"]
-    CONTROL_PLANE -->|is None| WORK["Block on AFDAsyncFFNWorkItem"]
-    WORK --> CONTEXT["Build minimal forward context"]
+    CONTROL_PLANE -->|is None| WORK["Receive CAM payload"]
     RECEIVE --> COMPUTE["Role-aware FFN compute"]
-    CONTEXT --> COMPUTE
+    WORK --> LAYERED["Layered FFN compute on device"]
+    LAYERED --> SEND
     COMPUTE --> SEND["Send result to Attention"]
     SEND --> START
 ```
@@ -240,24 +242,17 @@ daemon thread:
 ### Connector-driven loop
 
 The Ascend worker checks `connector.control_plane`. When it is `None`, as for
-CAM async, the worker calls `execute_connector_driven_step()` instead of a
-control-plane receive. For each layer, the runner:
+CAM async, the worker calls `execute_connector_driven_step(shutdown_requested)`
+instead of a control-plane receive. The runner asks the execution session once
+per step whether to keep serving, so Pull adds no extra Store round trip to the
+loop. For each layer, the runner:
 
-1. receives a normalized `AFDAsyncFFNWorkItem` from
-   `connector.recv_ffn_work_item(...)`; CAM metadata supplies the actual layer
-   index and compact expert interval; counts.sum() supplies this chunk’s routed token count, and the connector slices tensors
-   from operator capacity down to those counts;
-2. builds a single-stage forward context sized to the work item's token count,
-   with `dp_metadata = None`;
-3. installs the work item's `AFDTransferContext.metadata` as `afd_metadata`;
-4. calls the role-aware FFN compute, forwarding the routed MoE compute
-   payloads (`group_list`, `dynamic_scales`) from the work item's `AFDAsyncTransferState` on
-   `AFDTransferContext.states`;
-5. returns the routed outputs through
-   `connector.send_ffn_work_item_output(...)`, which also handles the
-   floating zero-routed-token placeholder required by CAM combine-send.
-   A layer is complete only when the received interval ends at the final
-   local expert; earlier intervals continue the receive loop.
+1. receives a capacity-sized payload and its original CAM metadata through
+   `connector.recv_attn_output()`;
+2. passes activations, dynamic scales, expert counts and the device layer ID
+   to `AsyncCAMLayeredExecutor`;
+3. returns the routed output and original context with
+   `connector.send_ffn_output()`.
 
 Async eager does not use the synchronous DP-metadata graph cache. Its FULL
 mode captures a complete original DR/FFN/CS transaction with device-side layer
@@ -265,14 +260,11 @@ selection. The independent Async runner owns one graph and stable resources;
 see [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md) for startup, supported
 W4A8/W8A8 configurations and the original receiver's process-cleanup boundary.
 
-With `AFD_ASYNC_CAM_LAYERED_GMM=1`, eligible DeepSeek-V4 W4A8 or W8A8 layers instead
-use `AsyncCAMLayeredExecutor`: the runner passes capacity-sized payloads, device
-expert counts, and device layer IDs directly from receive through the layered
-GMMs to combine-send. The ordinary path above materializes the work item's
-layer/count information on the host. Both paths retain worker-level
-synchronization after a work-item group. MRV2 pairing does not prohibit the
-layered path. Its nonzero `swiglu_limit` limitation and validation scope are
-documented in the [CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-and-w8a8-layered-gmm-experimental-disabled-by-default).
+DeepSeek-V4 W4A8 and W8A8 use layered GMM for both eager and FULL. Incompatible
+weights fail startup rather than selecting another FFN path. Worker-level
+synchronization remains after a work-item group. The `swiglu_limit` behavior
+and validation scope are documented in the
+[CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-and-w8a8-layered-gmm).
 
 ## Control-plane-driven forward
 

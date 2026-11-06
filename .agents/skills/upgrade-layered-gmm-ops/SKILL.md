@@ -139,8 +139,8 @@ weights; using identical layers does not prove selection.
 The required local/remote gate is:
 
 ```bash
-SOC_VERSION=910c pytest -q tests/unit/package/ tests/unit/compat/npu/test_gmm_layered.py \
-  tests/unit/compat/npu/test_gmm_swiglu_quant_v2_layered.py
+SOC_VERSION=910c pytest -q tests/unit/package/ tests/npu/test_gmm_layered.py \
+  tests/npu/test_gmm_swiglu_quant_v2_layered.py
 ```
 
 On the Ascend build host, sync the repository without `.git`, then run:

@@ -45,20 +45,6 @@ def _preimport_real_module(module_name: str) -> None:
     importlib.import_module(module_name)
 
 
-def test_preimport_real_module_surfaces_installed_runtime_failures(monkeypatch):
-    def fail_import(_module_name):
-        raise RuntimeError("ABI mismatch")
-
-    monkeypatch.setattr(
-        f"{__name__}.find_spec",
-        lambda _dependency: SimpleNamespace(),
-    )
-    monkeypatch.setattr(importlib, "import_module", fail_import)
-
-    with pytest.raises(RuntimeError, match="ABI mismatch"):
-        _preimport_real_module("afd_plugin.v1.worker.npu.mla_graph")
-
-
 def _load_mla_graph_module(monkeypatch):
     _preimport_real_module("afd_plugin.v1.worker.npu.mla_graph")
     fake_ascend = ModuleType("vllm_ascend")

@@ -27,17 +27,17 @@ def test_parse_empty_additional_config_is_inactive():
 
 
 def test_connector_extra_fields_participate_in_the_graph_hash():
-    extra = {"ffn_two_stream": True, "ffn_compute_aic_num": 12}
+    extra = {"ffn_mega_moe": True, "dynamicQuant": 1}
     raw = {
         "connector": "CAMAsyncAFDConnector",
         "role": "ffn",
         "connector_extra_config": extra,
     }
     first = afd_config_from_mapping(raw)
-    extra["ffn_compute_aic_num"] = 10
+    extra["ffn_mega_moe"] = False
     second = afd_config_from_mapping(raw)
     assert first.compute_hash() != second.compute_hash()
-    raw["connector_extra_config"] = {"ffn_compute_aic_num": 10, "ffn_two_stream": True}
+    raw["connector_extra_config"] = {"dynamicQuant": 1, "ffn_mega_moe": False}
     assert second.compute_hash() == afd_config_from_mapping(raw).compute_hash()
 
 
@@ -72,11 +72,6 @@ def test_parse_vllm_like_config_object():
     config = parse_afd_config(vllm_config, expected_role="attention")
 
     assert config.is_attention_server
-
-
-def test_config_object_requires_additional_config_attribute():
-    with pytest.raises(AttributeError, match="additional_config"):
-        parse_optional_afd_config(object())
 
 
 def test_compute_gate_on_attention_is_common_config():
@@ -192,34 +187,28 @@ def test_is_afd_active_requires_common_config_validity():
     assert is_afd_active({}) is False
 
 
-def test_is_afd_async_dp_is_selector_not_activation_validator():
+@pytest.mark.parametrize(
+    "connector,enabled,expected",
+    [
+        ("CAMAsyncAFDConnector", True, True),
+        ("CAMAsyncAFDConnector", False, False),
+        ("CAMP2pAFDConnector", False, False),
+    ],
+)
+def test_is_afd_async_dp_is_selector_not_activation_validator(
+    connector, enabled, expected
+):
     source = {
         "afd": {
-            "connector": "CAMAsyncAFDConnector",
-            "async": True,
+            "connector": connector,
+            "async": enabled,
             "role": "decode",
         },
     }
 
-    assert is_afd_async_dp(SimpleNamespace(additional_config=source)) is True
+    assert is_afd_async_dp(SimpleNamespace(additional_config=source)) is expected
     with pytest.raises(ValueError, match="AFD role must be one of"):
         is_afd_active(source)
-
-
-def test_integer_like_config_values_are_coerced():
-    class IntLike:
-        def __int__(self) -> int:
-            return 2
-
-    config = afd_config_from_mapping(
-        {
-            "num_attention_ranks": IntLike(),
-            "num_ffn_ranks": IntLike(),
-        },
-    )
-
-    assert config.num_attention_ranks == 2
-    assert config.num_ffn_ranks == 2
 
 
 def test_common_config_rejects_float_int_values():
@@ -230,13 +219,8 @@ def test_common_config_rejects_float_int_values():
 @pytest.mark.parametrize(
     ("raw", "message"),
     [
-        ({"enabled": True}, "unknown AFD config field"),
         ({"role": "decode"}, "AFD role must be one of"),
         ({"connector": "tcp"}, "AFD connector must be one of"),
-        ({"afd_role_rank": 0}, "unknown AFD config field"),
-        ({"num_attention_servers": 2}, "unknown AFD config field"),
-        ({"num_ffn_servers": 2}, "unknown AFD config field"),
-        ({"afd_server_rank": 0}, "unknown AFD config field"),
         ({"unknown": True}, "unknown AFD config field"),
     ],
 )

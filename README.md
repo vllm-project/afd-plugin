@@ -328,6 +328,9 @@ compatibility aliases such as `afd_role`, `afd_connector`, `afd_host`, and
 
 ## Development
 
+Before adding, changing, moving, or removing tests, or changing the behavior they
+cover, read and follow the [test maintenance guide](docs/UT_MAINTENANCE.md).
+
 Run the default CPU-safe checks:
 
 ```bash

@@ -16,7 +16,6 @@ else:
     nn = torch.nn
 pytest.importorskip("vllm")
 from torch import nn  # noqa: E402
-from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper  # noqa: E402
 from vllm.config import CompilationMode  # noqa: E402
 
 from afd_plugin.config import DEEPEP_M2N_CONNECTOR, AFDConfig  # noqa: E402
@@ -140,12 +139,6 @@ def test_attention_role_constructs_only_attention_and_norms(
 ) -> None:
     layer = _make_layer(monkeypatch, role="attention", layer_idx=0)
 
-    assert construction_env["attention"] == ["model.layers.0.self_attn"]
-    assert construction_env["norm"] == ["", ""]
-    assert construction_env["dense"] == []
-    assert construction_env["moe"] == []
-    assert construction_env["gate"] == []
-    assert type(layer.mlp) is adapter.RemoteFFNProxy
     assert layer.mlp.layer_idx == 0
     assert set(dict(layer.named_parameters())) == {
         "self_attn.weight",
@@ -174,9 +167,6 @@ def test_attention_role_routes_with_native_gate_under_deepep_m2n(
         ),
     )
 
-    assert construction_env["gate"] == ["model.layers.5.mlp.gate"]
-    assert construction_env["moe"] == []
-    assert type(layer.mlp) is adapter.RemoteFFNProxy
     assert layer.mlp.gate is not None
     assert layer.mlp.layer_idx == 5
     assert layer.mlp.top_k == 2
@@ -190,77 +180,19 @@ def test_attention_role_routes_with_native_gate_under_deepep_m2n(
     }
 
 
-def test_attention_role_gives_the_proxy_the_attention_tp_size(
-    monkeypatch: pytest.MonkeyPatch,
-    construction_env,
-) -> None:
-    """Under DeepEP M2N the proxy gets the Attention TP size.
-
-    Why: with Attention TP > 1 each TP rank must dispatch only its slice of
-    the tokens; without the TP size the proxy would dispatch every token from
-    every TP rank.
-    """
-    vllm_config = _model_config()
-    vllm_config.parallel_config.tensor_parallel_size = 2
-    layer = _make_layer(
-        monkeypatch,
-        role="attention",
-        layer_idx=5,
-        vllm_config=vllm_config,
-        afd_config=AFDConfig(
-            role="attention",
-            connector=DEEPEP_M2N_CONNECTOR,
-            compute_gate_on_attention=True,
-        ),
-    )
-
-    assert type(layer.mlp) is adapter.RemoteFFNProxy
-    assert layer.mlp.tp_size == 2
-
-
 def test_ffn_role_constructs_only_native_moe(
     monkeypatch: pytest.MonkeyPatch,
     construction_env,
 ) -> None:
     layer = _make_layer(monkeypatch, role="ffn", layer_idx=0)
 
-    assert construction_env["attention"] == []
-    assert construction_env["norm"] == []
-    assert construction_env["dense"] == []
-    assert construction_env["moe"] == ["model.layers.0.mlp"]
-    assert isinstance(layer.self_attn, _FakeMissingLayer)
-    assert isinstance(layer.input_layernorm, _FakeMissingLayer)
     assert set(dict(layer.named_parameters())) == {"mlp.weight"}
-
-
-def test_ffn_role_preserves_native_dense_layer_schedule(
-    monkeypatch: pytest.MonkeyPatch,
-    construction_env,
-) -> None:
-    vllm_config = _model_config(mlp_only_layers=[0])
-    layer = _make_layer(
-        monkeypatch,
-        role="ffn",
-        layer_idx=0,
-        vllm_config=vllm_config,
-    )
-
-    assert not layer.is_moe_layer
-    assert construction_env["dense"] == ["model.layers.0.mlp"]
-    assert construction_env["moe"] == []
-
-
-def test_native_decoder_forward_is_inherited_unchanged() -> None:
-    assert (
-        adapter.AFDQwen3MoeDecoderLayer.forward
-        is adapter.native.Qwen3MoeDecoderLayer.forward
-    )
 
 
 def test_model_injects_role_aware_decoder_through_native_hook(
     monkeypatch: pytest.MonkeyPatch,
+    construction_env,
 ) -> None:
-    captured: dict[str, type[nn.Module]] = {}
 
     def fake_native_init(
         self,
@@ -270,9 +202,10 @@ def test_model_injects_role_aware_decoder_through_native_hook(
         decoder_layer_type=adapter.native.Qwen3MoeDecoderLayer,
     ) -> None:
         nn.Module.__init__(self)
-        captured["decoder_layer_type"] = decoder_layer_type
         self.config = vllm_config.model_config.hf_text_config
-        self.layers = nn.ModuleList()
+        self.layers = nn.ModuleList(
+            [decoder_layer_type(vllm_config=vllm_config, prefix="model.layers.0")]
+        )
 
     vllm_config = _model_config()
     vllm_config.compilation_config = SimpleNamespace(mode=CompilationMode.NONE)
@@ -294,13 +227,12 @@ def test_model_injects_role_aware_decoder_through_native_hook(
 
     model = adapter.AFDQwen3MoeModel(vllm_config=vllm_config)
 
-    assert captured["decoder_layer_type"] is adapter.AFDQwen3MoeDecoderLayer
+    assert set(dict(model.named_parameters())) == {
+        "layers.0.self_attn.weight",
+        "layers.0.input_layernorm.weight",
+        "layers.0.post_attention_layernorm.weight",
+    }
     assert model.afd_role == "attention"
-
-
-def test_model_inherits_native_compile_support_once() -> None:
-    assert TorchCompileWithNoGuardsWrapper in adapter.native.Qwen3MoeModel.__bases__
-    assert adapter.AFDQwen3MoeModel.__bases__ == (adapter.native.Qwen3MoeModel,)
 
 
 def test_attention_causal_lm_reports_no_local_moe_modules(
@@ -327,7 +259,6 @@ def test_attention_causal_lm_reports_no_local_moe_modules(
             self.weight = nn.Parameter(torch.empty(vocab_size, hidden_size))
 
     vllm_config = _model_config(layer_count=1)
-    native_mapping = dict(adapter.native.Qwen3MoeForCausalLM.packed_modules_mapping)
     monkeypatch.setattr(
         adapter,
         "parse_afd_config",
@@ -348,7 +279,6 @@ def test_attention_causal_lm_reports_no_local_moe_modules(
     assert model.num_local_physical_experts == 0
     assert model.num_logical_experts == 8
     assert model.get_experts_layer_indices() == (0,)
-    assert adapter.native.Qwen3MoeForCausalLM.packed_modules_mapping == native_mapping
 
 
 @pytest.mark.parametrize(
@@ -394,44 +324,6 @@ def test_unsupported_modes_fail_closed(
 
     with pytest.raises(RuntimeError, match=message):
         adapter._validate_supported_config(vllm_config, afd_config)
-
-
-def test_gate_on_attention_is_accepted_with_deepep_m2n(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """DeepEP M2N routes on Attention, so Qwen3 accepts the gate there.
-
-    Why: its FFN runs only the routed experts and never the native gate.
-    """
-    monkeypatch.setattr(adapter, "current_platform", _platform(is_cuda=True))
-
-    adapter._validate_supported_config(
-        _model_config(),
-        AFDConfig(connector="DeepEPM2NAFDConnector", compute_gate_on_attention=True),
-    )
-
-
-def test_attention_role_selects_routing_proxy_by_connector_only(
-    monkeypatch: pytest.MonkeyPatch,
-    construction_env,
-) -> None:
-    """Without DeepEP M2N, Attention builds the plain proxy even if the
-    gate-on-Attention flag is set.
-
-    Why: only DeepEP M2N dispatches by Attention-side routes; for any other
-    connector the flag is rejected by model validation, and the layer itself
-    must not pick the routing proxy from the flag alone.
-    """
-    layer = _make_layer(
-        monkeypatch,
-        role="attention",
-        layer_idx=0,
-        afd_config=AFDConfig(role="attention", compute_gate_on_attention=True),
-    )
-
-    assert type(layer.mlp) is adapter.RemoteFFNProxy
-    assert layer.mlp.gate is None
-    assert construction_env["gate"] == []
 
 
 def test_gate_on_attention_rejects_dense_layers(

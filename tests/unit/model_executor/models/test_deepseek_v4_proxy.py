@@ -13,18 +13,7 @@ pytest.importorskip("vllm")
 from torch import nn  # noqa: E402
 
 from afd_plugin.model_executor.models import deepseek_v4 as adapter  # noqa: E402
-
-
-class _FakeConnector:
-    def __init__(self, events: list[tuple]) -> None:
-        self.events = events
-
-    def send_attn_output(self, hidden_states, context, **kwargs) -> None:
-        self.events.append(("send", hidden_states, context, kwargs))
-
-    def recv_ffn_output(self, *, ref_tensor, ubatch_idx):
-        self.events.append(("recv", ref_tensor, ubatch_idx))
-        return ref_tensor * 0.25
+from tests.unit.fakes.connector import ProxyConnector as _FakeConnector  # noqa: E402
 
 
 def test_remote_v4_ffn_sends_token_ids(monkeypatch):
@@ -112,14 +101,20 @@ def test_remote_v4_ffn_preserves_ids_in_padding_slots(monkeypatch):
     [None, torch.ones((2, 1), dtype=torch.int64), torch.ones(3, dtype=torch.int64)],
     ids=["missing", "not-one-dimensional", "token-count-mismatch"],
 )
-def test_remote_v4_ffn_validates_token_ids_before_metadata_lookup(
+def test_remote_v4_ffn_rejects_bad_ids_before_sending(
     monkeypatch,
     input_ids,
 ):
+    events: list[tuple] = []
     monkeypatch.setattr(
         adapter,
         "get_afd_metadata_from_forward_context",
-        lambda: pytest.fail("metadata lookup must follow token-id validation"),
+        lambda: SimpleNamespace(connector=_FakeConnector(events), stage_idx=0),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "get_forward_context",
+        lambda: SimpleNamespace(ubatch_idx=0, slot_mapping={}),
     )
     proxy = adapter.RemoteDeepseekV4FFN(layer_idx=0)
 
@@ -131,6 +126,7 @@ def test_remote_v4_ffn_validates_token_ids_before_metadata_lookup(
     )
     with pytest.raises(error, match=message):
         proxy(torch.ones((2, 4)), input_ids)
+    assert events == []
 
 
 def test_v4_decoder_forward_rejects_ffn_role(monkeypatch):
