@@ -9,68 +9,46 @@ does not turn on EPLB/EEP or route any per-request work through its collectives.
 from __future__ import annotations
 
 import logging
-import os
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
+from afd_plugin.ffn_faas.platforms.environment import FFNEnvironmentBase
 from afd_plugin.ffn_faas.platforms.npu.settings import (
     FFNConfig,
     validate_static_experts,
 )
 
 if TYPE_CHECKING:
-    import torch
     from vllm.config import VllmConfig
-    from vllm.distributed.parallel_state import GroupCoordinator
 
 COMPUTE_GROUP_TIMEOUT_SECONDS = 180
 
 
-class AscendFFNEnvironment:
+# GPU parallel: afd_plugin/ffn_faas/platforms/gpu/environment.py::
+#   GPUFFNEnvironment.
+# Reuse: PARTIAL - the shared base owns state, launcher checks, ownership
+#   flags, the EP-group check and close-state handling; this class owns Ascend
+#   device selection, custom operators, HCCL groups and CPU binding.
+class AscendFFNEnvironment(FFNEnvironmentBase[FFNConfig]):
     """Never borrow unrelated groups or tear them down on a failed native seam."""
 
     def __init__(self, settings: FFNConfig) -> None:
-        self.settings = settings
-        self._device: torch.device | None = None
-        self._ep_group: GroupCoordinator | None = None
-        self._groups_owned = False
-
-    @property
-    def device(self) -> torch.device:
-        if self._device is None:
-            raise RuntimeError("Ascend FFN device has not been initialized")
-        return self._device
-
-    @property
-    def ep_group(self) -> GroupCoordinator:
-        if self._ep_group is None:
-            raise RuntimeError("Ascend FFN expert group has not been initialized")
-        return self._ep_group
+        super().__init__(settings, platform_name="Ascend")
 
     def initialize_device(self) -> None:
-        if self._groups_owned or self._device is not None:
-            raise RuntimeError("Ascend FFN environment is already initialized")
+        self.require_uninitialized()
+        self.require_launcher_environment()
         settings = self.settings
-        try:
-            world, rank = int(os.environ["WORLD_SIZE"]), int(os.environ["RANK"])
-        except (KeyError, ValueError) as error:
-            raise ValueError(
-                "Ascend FFN requires an external F-only launcher"
-            ) from error
-        if world != settings.ffn_ranks or rank != settings.rank:
-            raise ValueError("Ascend FFN environment differs from the F-only launcher")
         from vllm_ascend.utils import bootstrap_custom_op_env
 
         bootstrap_custom_op_env()
         import torch
         import torch_npu  # noqa: F401
-        from vllm.distributed.parallel_state import model_parallel_is_initialized
         from vllm_ascend.utils import enable_custom_op
 
         from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 
-        if torch.distributed.is_initialized() or model_parallel_is_initialized():
-            raise RuntimeError("Ascend FFN cannot borrow existing native groups")
+        self.require_no_borrowed_native_groups()
         ensure_cam_async_ops_available()
         torch.npu.set_device(settings.device)
         self._device = torch.device(f"npu:{settings.device}")
@@ -81,8 +59,7 @@ class AscendFFNEnvironment:
             raise RuntimeError("native V4 W4A8 custom operators are unavailable")
 
     def initialize_compute(self, config: VllmConfig) -> None:
-        if self._device is None or self._groups_owned:
-            raise RuntimeError("Ascend FFN compute initialization requires its device")
+        self.require_compute_initializable()
         settings = self.settings
         parallel = config.parallel_config
         validate_static_experts(
@@ -106,7 +83,7 @@ class AscendFFNEnvironment:
             register_ascend_customop(config)
             init_ascend_config(config)
             # Ownership starts before a collective can partially initialize.
-            self._groups_owned = True
+            self.mark_groups_owned()
             init_distributed_environment(
                 world_size=settings.ffn_ranks,
                 rank=settings.rank,
@@ -122,11 +99,9 @@ class AscendFFNEnvironment:
             )
             init_ascend_model_parallel(parallel)
             self._ep_group = get_ep_group()
-            if (
-                self._ep_group.world_size != settings.ffn_ranks
-                or self._ep_group.rank_in_group != settings.rank
-            ):
-                raise ValueError("native V4 expert group differs from the F world")
+            self.validate_ep_group(
+                error_message="native V4 expert group differs from the F world"
+            )
 
     def activate_thread(self) -> None:
         import torch
@@ -162,10 +137,8 @@ class AscendFFNEnvironment:
                 error,
             )
 
-    def close(self) -> None:
+    def _destroy_groups(self) -> None:
         """Only after CAM/executor completion; failures retain parameter owners."""
-        if not self._groups_owned:
-            return
         from vllm.distributed.parallel_state import (
             destroy_distributed_environment,
             destroy_model_parallel,
@@ -175,6 +148,3 @@ class AscendFFNEnvironment:
         destroy_ascend_model_parallel()
         destroy_model_parallel()
         destroy_distributed_environment()
-        self._groups_owned = False
-        self._ep_group = None
-        self._device = None

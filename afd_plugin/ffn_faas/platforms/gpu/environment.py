@@ -14,13 +14,12 @@ import importlib
 import os
 from typing import TYPE_CHECKING
 
+from afd_plugin.ffn_faas.platforms.environment import FFNEnvironmentBase
 from afd_plugin.ffn_faas.platforms.gpu.settings import GPUFFNConfig
 from afd_plugin.ffn_faas.platforms.launch import reassert_external_launcher
 
 if TYPE_CHECKING:
-    import torch
     from vllm.config import VllmConfig
-    from vllm.distributed.parallel_state import GroupCoordinator
 
 # afdEP-comm transport and the DeepGEMM grouped GEMMs the connector runs; both
 # are imported lazily by the connector, so a missing package would otherwise
@@ -36,36 +35,17 @@ DBO_WORKSPACE_UBATCHES = 2
 
 # NPU parallel: afd_plugin/ffn_faas/platforms/npu/environment.py::
 #   AscendFFNEnvironment.
-# Reuse: PARTIAL - the lifecycle (launcher check, refuse borrowed groups,
-#   device, F-only world + EP group == F world, per-thread device, ordered
-#   teardown) is the same; NPU initializes HCCL explicitly plus Ascend groups
-#   and CPU binding, GPU reuses vLLM's GPU Worker distributed initializer,
-#   pins the routed MoE backend and selects the AFD model architecture.
-#   REFACTOR-CANDIDATE(R1): a platform-neutral F-only environment base
-#   (launcher check, ownership flags, EP-group check, teardown order).
-class GPUFFNEnvironment:
+# Reuse: PARTIAL - the shared base owns state, launcher checks, ownership
+#   flags, the EP-group check and close-state handling; NPU initializes HCCL
+#   explicitly plus Ascend groups and CPU binding, GPU reuses vLLM's GPU Worker
+#   distributed initializer, pins the routed MoE backend and selects the AFD
+#   model architecture.
+class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
     """Never borrow unrelated groups or tear them down on a failed native seam."""
 
     def __init__(self, settings: GPUFFNConfig) -> None:
         """Record the settings; nothing native happens until ``initialize_device``."""
-        self.settings = settings
-        self._device: torch.device | None = None
-        self._ep_group: GroupCoordinator | None = None
-        self._groups_owned = False
-
-    @property
-    def device(self) -> torch.device:
-        """This rank's GPU, available after ``initialize_device``."""
-        if self._device is None:
-            raise RuntimeError("GPU FFN device has not been initialized")
-        return self._device
-
-    @property
-    def ep_group(self) -> GroupCoordinator:
-        """vLLM's EP group over the F-only world, after ``initialize_compute``."""
-        if self._ep_group is None:
-            raise RuntimeError("GPU FFN expert group has not been initialized")
-        return self._ep_group
+        super().__init__(settings, platform_name="GPU")
 
     # NPU parallel: AscendFFNEnvironment.initialize_device.
     # Reuse: PARTIAL - launcher and borrowed-group checks are identical;
@@ -81,21 +61,13 @@ class GPUFFNEnvironment:
         to the visible GPU the way vLLM's GPU Worker does (honoring
         ``CUDA_VISIBLE_DEVICES``) and requires SM90 or newer.
         """
-        if self._groups_owned or self._device is not None:
-            raise RuntimeError("GPU FFN environment is already initialized")
+        self.require_uninitialized()
+        self.require_launcher_environment()
+        self.require_no_borrowed_native_groups()
         settings = self.settings
-        try:
-            world, rank = int(os.environ["WORLD_SIZE"]), int(os.environ["RANK"])
-        except (KeyError, ValueError) as error:
-            raise ValueError("GPU FFN requires an external F-only launcher") from error
-        if world != settings.ffn_ranks or rank != settings.rank:
-            raise ValueError("GPU FFN environment differs from the F-only launcher")
         import torch
-        from vllm.distributed.parallel_state import model_parallel_is_initialized
         from vllm.platforms import current_platform
 
-        if torch.distributed.is_initialized() or model_parallel_is_initialized():
-            raise RuntimeError("GPU FFN cannot borrow existing native groups")
         importlib.import_module(AFDEP_TRANSPORT_MODULE)
         expert_backend = settings.connector_extra_config.get("expert_backend")
         if expert_backend != FUSED_EXPERTS_BACKEND:
@@ -167,8 +139,7 @@ class GPUFFNEnvironment:
         world can host its own, and initializes vLLM's workspace manager with
         the Worker's micro-batch count (two under DBO).
         """
-        if self._device is None or self._groups_owned:
-            raise RuntimeError("GPU FFN compute initialization requires its device")
+        self.require_compute_initializable()
         from vllm.config import set_current_vllm_config
         from vllm.distributed.parallel_state import get_ep_group
         from vllm.platforms import current_platform
@@ -177,7 +148,7 @@ class GPUFFNEnvironment:
 
         settings = self.settings
         with set_current_vllm_config(config):
-            self._groups_owned = True
+            self.mark_groups_owned()
             init_worker_distributed_environment(
                 config,
                 settings.rank,
@@ -186,11 +157,9 @@ class GPUFFNEnvironment:
                 current_platform.dist_backend,
             )
             self._ep_group = get_ep_group()
-            if (
-                self._ep_group.world_size != settings.ffn_ranks
-                or self._ep_group.rank_in_group != settings.rank
-            ):
-                raise ValueError("vLLM expert group differs from the F-only world")
+            self.validate_ep_group(
+                error_message="vLLM expert group differs from the F-only world"
+            )
         # torchrun asks every ``tcp://``/``env://`` rendezvous in its workers
         # to join the agent's store. That is right for the F-only world above,
         # but the connector's M2N rendezvous at ``--host:--port`` must be
@@ -219,15 +188,13 @@ class GPUFFNEnvironment:
     # NPU parallel: AscendFFNEnvironment.close.
     # Reuse: PARTIAL - same order and ownership guard; NPU also destroys the
     #   Ascend model-parallel groups.
-    def close(self) -> None:
+    def _destroy_groups(self) -> None:
         """Destroy the vLLM model-parallel groups and the F-only world.
 
         Only after the runner released CUDA graphs and DeepEP buffers; a failed
         native seam never reaches here, so groups stay owned until process
         isolation.
         """
-        if not self._groups_owned:
-            return
         from vllm.distributed.parallel_state import (
             destroy_distributed_environment,
             destroy_model_parallel,
@@ -237,6 +204,3 @@ class GPUFFNEnvironment:
         reset_workspace_manager()
         destroy_model_parallel()
         destroy_distributed_environment()
-        self._groups_owned = False
-        self._ep_group = None
-        self._device = None
