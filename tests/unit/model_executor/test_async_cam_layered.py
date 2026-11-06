@@ -315,7 +315,6 @@ def test_runner_preserves_raw_context_and_chunk_capacity():
     runner = SimpleNamespace(
         model=object(),
         connector=connector,
-        _two_stream=None,
         _mega_executor=None,
         _layered_executor=compute,
         layer_ids=(2, 5),

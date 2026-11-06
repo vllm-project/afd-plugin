@@ -136,14 +136,14 @@ def layered_startup_runner(modules, monkeypatch, mode, invalid):
     connector = SimpleNamespace(
         is_initialized=False,
         dynamic_quant=1,
-        extra_info=SimpleNamespace(ffn_two_stream=False, ffn_mega_moe=False),
+        extra_info=SimpleNamespace(ffn_mega_moe=False),
         graph_startup=AsyncCAMGraphStartup(1, 1, 2),
     )
     connector.init_afd_connector = lambda: resolve_ffn_mode(
         [connector.graph_startup.plan]
     )
     runner.connector = connector
-    runner._failure = runner._layered_executor = runner._two_stream = None
+    runner._failure = runner._layered_executor = None
     runner.requested_mode = mode
     monkeypatch.setattr(
         runtime, "get_ascend_device_type", lambda: runtime.AscendDeviceType.A3
@@ -187,7 +187,7 @@ def test_mega_executor_failure_is_published_during_startup(modules, monkeypatch,
     runner.requested_mode = mode
     connector = SimpleNamespace(
         is_initialized=False,
-        extra_info=SimpleNamespace(ffn_two_stream=False, ffn_mega_moe=True),
+        extra_info=SimpleNamespace(ffn_mega_moe=True),
         graph_startup=AsyncCAMGraphStartup(1, 1, 2),
     )
     connector.init_afd_connector = lambda: resolve_ffn_mode(
@@ -209,91 +209,19 @@ def test_mega_executor_failure_is_published_during_startup(modules, monkeypatch,
     assert connector.graph_startup.plan.executor_error == "unsupported Mega weights"
 
 
-@pytest.mark.parametrize("value", [True, 0, -1, 1.5])
-def test_two_stream_rejects_invalid_core_settings(modules, value):
-    _, connector, _ = modules
-    with pytest.raises((TypeError, ValueError), match="ffn_compute_aic_num"):
-        connector.AFDAsyncExtraInfo.from_mapping({"ffn_compute_aic_num": value})
-
-
-def test_two_stream_config_round_trip_and_default_off(modules):
-    _, connector, _ = modules
-    default = connector.AFDAsyncExtraInfo.from_mapping({})
-    assert not default.ffn_two_stream
-    assert "ffn_two_stream" not in default.to_mapping()
-    enabled = connector.AFDAsyncExtraInfo.from_mapping({"ffn_two_stream": True})
-    assert enabled.ffn_compute_aic_num == 12
-    assert enabled.ffn_compute_aiv_num == enabled.ffn_combine_aiv_num == 24
-    assert connector.AFDAsyncExtraInfo.from_mapping(enabled.to_mapping()) == enabled
-    disabled = connector.AFDAsyncExtraInfo.from_mapping({"ffn_compute_aic_num": 8})
-    assert connector.AFDAsyncExtraInfo.from_mapping(disabled.to_mapping()) == disabled
-
-
-@pytest.mark.parametrize("feature", ["use_sequence_parallel_moe"])
-def test_two_stream_attention_preflight_rejects_unqualified_modes(
-    modules, monkeypatch, feature
-):
-    _, module, _ = modules
-    connector = module.CAMAsyncAFDConnector.__new__(module.CAMAsyncAFDConnector)
-    connector.vllm_config = npu_vllm_config(
-        enable_dbo=feature == "enable_dbo",
-        num_ubatches=2,
-        use_sequence_parallel_moe=feature == "use_sequence_parallel_moe",
-    )
-    monkeypatch.setenv(
-        "VLLM_ASCEND_ENABLE_FLASHCOMM1", "1" if feature == "flashcomm1" else "0"
-    )
-    if feature in (None, "enable_dbo"):
-        connector._validate_two_stream_attention()
-    else:
-        with pytest.raises(ValueError, match="two-stream"):
-            connector._validate_two_stream_attention()
-
-
-@pytest.mark.parametrize("role", ["attention", "ffn"])
 @pytest.mark.parametrize(
-    "value,enabled",
+    "field",
     [
-        (None, False),
-        ("0", False),
-        ("1", True),
-        (" TRUE ", True),
-        ("yes", False),
+        "ffn_two_stream",
+        "ffn_compute_aic_num",
+        "ffn_compute_aiv_num",
+        "ffn_combine_aiv_num",
     ],
 )
-def test_two_stream_flashcomm1_matches_ascend_boolean_parsing(
-    modules, monkeypatch, role, value, enabled
-):
-    _, module, _ = modules
-    if value is None:
-        monkeypatch.delenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", value)
-    config = npu_vllm_config(
-        role=role,
-        connector="CAMAsyncAFDConnector",
-        async_dp=True,
-        compute_gate_on_attention=True,
-        use_mla=True,
-    )
-    if role == "ffn":
-
-        def validate():
-            _fail_if_unsupported_npu_afd_async_features(
-                config,
-                parse_afd_config(config),
-                module.AFDAsyncExtraInfo(ffn_two_stream=True, dynamic_quant=1),
-            )
-
-    else:
-        connector = module.CAMAsyncAFDConnector.__new__(module.CAMAsyncAFDConnector)
-        connector.vllm_config = config
-        validate = connector._validate_two_stream_attention
-    if enabled:
-        with pytest.raises((ValueError, RuntimeError), match="two-stream"):
-            validate()
-    else:
-        validate()
+def test_removed_two_stream_options_are_rejected(modules, field):
+    _, connector, _ = modules
+    with pytest.raises(ValueError, match="unknown AFD async connector_extra_config"):
+        connector.AFDAsyncExtraInfo.from_mapping({field: True})
 
 
 @pytest.mark.parametrize(
@@ -453,9 +381,8 @@ def test_ffn_step_lets_session_decide_service_after_shutdown(modules, session_se
 
 
 @pytest.mark.parametrize("capture_fails", [False, True])
-@pytest.mark.parametrize("two_stream", [False, True])
 def test_ffn_warmup_capture_order_and_failure_propagation(
-    modules, monkeypatch, capture_fails, two_stream
+    modules, monkeypatch, capture_fails
 ):  # long-test: warmup/capture/readiness are one ordered startup protocol
     _, connector_module, runtime = modules
     calls: list[str | tuple[str, str | int]] = []
@@ -467,8 +394,6 @@ def test_ffn_warmup_capture_order_and_failure_propagation(
         calls.append("connector")
         assert startup.plan.signature == "weights"
         assert startup.plan.layer_ids == (2, 5)
-        assert not startup.plan.stream_error
-        assert bool(startup.plan.stream_signature) == two_stream
         startup.mode = "full"
 
     def capture():
@@ -489,7 +414,7 @@ def test_ffn_warmup_capture_order_and_failure_propagation(
         connector=SimpleNamespace(
             is_initialized=False,
             graph_startup=startup,
-            extra_info=connector_module.AFDAsyncExtraInfo(ffn_two_stream=two_stream),
+            extra_info=connector_module.AFDAsyncExtraInfo(),
             init_afd_connector=initialize_connector,
             attn_size=2,
             tp_size=1,
@@ -510,7 +435,7 @@ def test_ffn_warmup_capture_order_and_failure_propagation(
         *(["transaction"] * 4),
         "device-done",
         "warmup",
-        *([] if two_stream else ["graph-resources"]),
+        "graph-resources",
         "capture",
         ("failure", "capture failed") if capture_fails else "captured",
     ]
@@ -653,17 +578,13 @@ def test_full_receiver_exit_releases_graph_only_after_success(
 
 
 @pytest.mark.parametrize("state", ["live", "failed", "drained"])
-@pytest.mark.parametrize("two_stream", [False, True])
 @pytest.mark.parametrize("requires_drain", [False, True])
-def test_worker_retains_resources_until_clean_exit(
-    ffn_owners, state, two_stream, requires_drain
-):
+def test_worker_retains_resources_until_clean_exit(ffn_owners, state, requires_drain):
     _, runtime, module = ffn_owners
     calls = []
     timeouts = []
     runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
-    runner.effective_mode = "eager" if two_stream else "full"
-    runner._two_stream = object() if two_stream else None
+    runner.effective_mode = "full"
     runner.session = SimpleNamespace(requires_drain=requires_drain)
     runner.connector = SimpleNamespace(close=lambda: calls.append("connector-close"))
     runner.shutdown = lambda: calls.append("release")
@@ -925,7 +846,7 @@ def test_runner_drain_returns_completed_response_or_session_error(
         transactions=1,
         drain_error=RuntimeError("source did not drain") if fails else None,
     )
-    runner._graph = runner._two_stream = None
+    runner._graph = None
     runner.layer_ids = (2, 5)
     responses = []
     runner.connector.send_ffn_output = lambda output, context: responses.append(output)

@@ -12,7 +12,6 @@ primary_code_paths:
   - "afd_plugin/v1/worker/ffn_worker.py"
   - "afd_plugin/v1/worker/npu/ffn_model_runner.py"
   - "afd_plugin/v1/worker/npu/async_ffn_model_runner.py"
-  - "afd_plugin/v1/worker/npu/async_ffn_two_stream.py"
   - "afd_plugin/v1/worker/npu/ffn_worker.py"
 related_code_paths:
   - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_startup.py"
@@ -34,7 +33,6 @@ validation_paths:
   - "tests/unit/v1/worker/test_ffn_routed_experts_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
-  - "tests/unit/v1/worker/test_async_ffn_two_stream.py"
   - "tests/unit/connectors/npu/test_async_cam_startup_wiring.py"
   - "tests/unit/connectors/npu/test_async_cam_startup.py"
   - "tests/unit/connectors/npu/test_async_cam_pull.py"
@@ -180,18 +178,6 @@ supports eager Attention DBO at DP1 or DP > 1, and rejects native DBO flags on
 FFN. Async FFN FULL accepts eager Attention DBO and continues to receive work
 items independently of Attention's threads. These limits
 describe the pair even though only Attention inherits a native V2 runner.
-
-Async CAM also has an experimental, default-off `ffn_two_stream` mode for
-layered W4A8/W8A8 eager/FULL. `AsyncFFNTwoStream`, owned by the Async runner, retains
-two slots, compute/send streams and ready/done events. FULL owns four private
-graph pools and four graphs; eager retires each slot only after its send is
-observed complete. Both modes retain the bounded batch fence. Enabled eager
-and FULL agree on executor, layer, capacity and core signatures before HCCL
-creation and reject Attention DBO/SP combinations. Shutdown requires receiver
-exit and device completion before release. Partial native failures retain
-resources and remain visible to repeated health checks. Host tests do not
-qualify native window reuse, graph capture or stream overlap; see the
-[Async runtime guide](../../npu/ASYNC_FFN_RUNTIME.md#experimental-ffn-two-stream-execution).
 
 ## Daemon step selection
 

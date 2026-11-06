@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -24,18 +23,11 @@ class FFNGraphPlan:
     executor_error: str = ""
     signature: str = ""
     layer_ids: tuple[int, ...] = ()
-    stream_signature: str = ""
-    stream_error: str = ""
 
 
 def resolve_ffn_mode(plans: list[FFNGraphPlan]) -> str:
     if not plans or len({plan.requested for plan in plans}) != 1:
         raise ValueError("All FFN ranks must request the same execution mode")
-    if len({plan.stream_signature for plan in plans}) != 1:
-        raise ValueError("FFN two-stream execution signatures differ across ranks")
-    errors = [plan.stream_error for plan in plans if plan.stream_error]
-    if errors:
-        raise ValueError("Async FFN two-stream is unsupported: " + "; ".join(errors))
     errors = [plan.executor_error for plan in plans if plan.executor_error]
     if errors:
         raise ValueError(
@@ -46,8 +38,6 @@ def resolve_ffn_mode(plans: list[FFNGraphPlan]) -> str:
     if mode not in ("eager", "full"):
         raise ValueError("Unknown Async FFN execution mode")
     execution = "FULL" if mode == "full" else "eager"
-    if mode == "eager" and plans[0].stream_signature:
-        execution = "two-stream"
     if len({plan.signature for plan in plans}) > 1:
         raise ValueError(
             f"Async FFN {execution} is unsupported: "
@@ -74,7 +64,6 @@ class AsyncCAMGraphStartup:
         self._store: Store | None = None
         self._prefix = ""
         self._shared_errors = False
-        self.validate_attention_streams: Callable[[], None] | None = None
 
     def initialize(self, store: Store, transport_signature: str) -> None:
         self._store = store
@@ -158,24 +147,14 @@ class AsyncCAMGraphStartup:
                 plans.append(FFNGraphPlan(**fields))
             self.mode = resolve_ffn_mode(plans)
             ffn_plan = plans[0]
-            two_stream = bool(ffn_plan.stream_signature)
-            validate_transport = (
-                self.mode == "full"
-                or two_stream
-                or any(entry["transport"].startswith("pull_v1:") for entry in entries)
+            validate_transport = self.mode == "full" or any(
+                entry["transport"].startswith("pull_v1:") for entry in entries
             )
             if (
                 validate_transport
                 and len({entry["transport"] for entry in entries}) != 1
             ):
                 raise ValueError("Async CAM graph transport signatures differ")
-            if two_stream:
-                if (
-                    self.world_rank < self.attn_size
-                    and self.validate_attention_streams is not None
-                ):
-                    self.validate_attention_streams()
-                self.phase("streams-validated")
             if self.mode == "full":
                 self.warmup_layer_id = ffn_plan.layer_ids[0]
         except Exception as exc:

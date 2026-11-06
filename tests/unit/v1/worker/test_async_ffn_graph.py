@@ -84,7 +84,6 @@ def session_harness(monkeypatch):
     session.model = torch.nn.Linear(1, 1)
     session._layered_executor = execute
     session._mega_executor = None
-    session._two_stream = None
     session.connector = connector
     session.session = connector.ffn_session()
     session._graph = None

@@ -174,7 +174,7 @@ describes A/F serving. In PD deployments, Prefill uses the upstream complete
 draft model and KV connector. Attention and native draft proposal execution stay
 eager. F may use the existing FULL transaction graph with one homogeneous W4A8 or W8A8
 table covering target and draft; selection remains on device. DSpark excludes
-DBO and FFN two-stream.
+DBO.
 
 Shared-expert layout is model-specific. DeepSeek-V4 uses
 `AFDDeepseekV4SharedExperts` to preserve the native policy:

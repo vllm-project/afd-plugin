@@ -163,38 +163,6 @@ def test_executor_error_reaches_all_attention_and_ffn_ranks(mode):
     ), errors
 
 
-@pytest.mark.parametrize("mode", ["eager", "full"])
-def test_two_stream_signature_and_failure_are_checked_in_both_modes(mode):
-    plan = full_plan(requested=mode, stream_signature="2/12C/24V/24V")
-    assert resolve_ffn_mode([plan, plan]) == mode
-    with pytest.raises(ValueError, match="two-stream execution signatures"):
-        resolve_ffn_mode([plan, replace(plan, stream_signature="")])
-    with pytest.raises(ValueError, match="core budget"):
-        resolve_ffn_mode([plan, replace(plan, stream_error="core budget")])
-    with pytest.raises(ValueError, match="signatures differ"):
-        resolve_ffn_mode([plan, replace(plan, signature="other-capacity")])
-
-
-@pytest.mark.parametrize("peer_failure", [False, True])
-def test_two_stream_waits_for_attention_capability_check(peer_failure):
-    owners = startup_world(1, 1)
-
-    def validate():
-        if peer_failure:
-            raise ValueError("DBO is not qualified")
-
-    owners[0].validate_attention_streams = validate
-    plan = full_plan(requested="eager", stream_signature="2/12C/24V/24V")
-    errors = negotiate(owners, [None, plan], ["wire"] * 2)
-    if peer_failure:
-        assert all(
-            isinstance(error, (ValueError, RuntimeError)) and "DBO" in str(error)
-            for error in errors
-        ), errors
-    else:
-        assert errors == [None, None]
-
-
 def test_whole_world_agrees_before_service_readiness():
     owners = startup_world()
     assert (
@@ -208,13 +176,12 @@ def test_whole_world_agrees_before_service_readiness():
         owner.wait_service_ready()
 
 
-@pytest.mark.parametrize("two_stream", [False, True])
 @pytest.mark.parametrize("mode", ["eager", "full"])
-def test_transport_check_preserves_single_stream_eager_scope(two_stream, mode):
+def test_transport_check_preserves_eager_scope(mode):
     owners = startup_world(1, 1)
-    plan = full_plan(requested=mode, stream_signature="two" if two_stream else "")
+    plan = full_plan(requested=mode)
     errors = negotiate(owners, [None, plan], ["a", "b"])
-    if two_stream or mode == "full":
+    if mode == "full":
         assert all(
             isinstance(error, (ValueError, RuntimeError))
             and "transport signatures" in str(error)

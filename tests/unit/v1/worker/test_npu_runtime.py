@@ -841,7 +841,6 @@ def test_npu_ffn_worker_uses_connector_driven_loop_for_async_connector(monkeypat
     worker.model_runner.connector = SimpleNamespace(control_plane=None)
     worker.model_runner.session = DefaultFFNSession()
     worker.model_runner.effective_mode = "eager"
-    worker.model_runner._two_stream = None
     worker.model_runner.execute_connector_driven_step = execute_connector_driven_step
 
     monkeypatch.setattr(

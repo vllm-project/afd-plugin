@@ -69,15 +69,6 @@ def test_dspark_ffn_graph_requires_full_mode(mode):
         fail_if_unsupported_npu_afd_features(config)
 
 
-@pytest.mark.parametrize("eager", [True, False])
-def test_dspark_rejects_ffn_two_stream(eager):
-    config = npu_dspark_config(role="ffn")
-    config.model_config.enforce_eager = eager
-    config.additional_config["afd"]["connector_extra_config"]["ffn_two_stream"] = True
-    with pytest.raises(RuntimeError, match="DSpark.*two-stream"):
-        fail_if_unsupported_npu_afd_features(config)
-
-
 @pytest.mark.parametrize(
     "anchor,num_requests,capacity,allowed",
     [
