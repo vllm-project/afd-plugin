@@ -91,11 +91,12 @@ class DeepEPM2NFFNBackend:
                 )
             service.loading_progress(0, total_experts)
             self.runner.load_model()
-            self.model = self.runner.get_model()
+            model: AFDQwen3MoeRoutedExperts = self.runner.get_model()
+            self.model = model
             # vLLM's loader reports no per-expert progress; this rank's experts
             # are all loaded once it returns.
             service.loading_progress(total_experts, total_experts)
-            parameter_bytes = parameter_storage_bytes(self.model)
+            parameter_bytes = parameter_storage_bytes(model)
             local_expert_ids = self.runner.local_experts[
                 self.runner.moe_layer_indices[0]
             ].expert_ids
