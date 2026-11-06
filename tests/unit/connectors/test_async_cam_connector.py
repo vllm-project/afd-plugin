@@ -178,9 +178,7 @@ def test_async_extra_info_rejects_unknown_and_invalid_fields():
 
 
 def test_mega_config_round_trips_protocol_and_normalized_quantization():
-    info = AFDAsyncExtraInfo.from_mapping(
-        {"ffn_mega_moe": "true", "dynamicQuant": "1", "ffn_two_stream": "false"}
-    )
+    info = AFDAsyncExtraInfo.from_mapping({"ffn_mega_moe": "true", "dynamicQuant": "1"})
     assert info.ffn_mega_moe and info.dynamic_quant == 1
     assert AFDAsyncExtraInfo.from_mapping(info.to_mapping()) == info
 
@@ -204,16 +202,9 @@ def test_mega_warmup_launches_once_per_source(monkeypatch, capacity):
     assert connector.graph_startup_chunks() == 1
 
 
-@pytest.mark.parametrize(
-    "raw",
-    [
-        {"ffn_mega_moe": True},
-        {"ffn_mega_moe": True, "dynamicQuant": 1, "ffn_two_stream": True},
-    ],
-)
-def test_mega_requires_quantized_single_stream(raw):
+def test_mega_requires_dynamic_quantization():
     with pytest.raises(ValueError, match="ffn_mega_moe"):
-        AFDAsyncExtraInfo.from_mapping(raw)
+        AFDAsyncExtraInfo.from_mapping({"ffn_mega_moe": True})
 
 
 @pytest.mark.parametrize(

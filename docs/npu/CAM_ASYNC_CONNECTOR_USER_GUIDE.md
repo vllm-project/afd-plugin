@@ -195,16 +195,6 @@ including `async_dp`; enable DBO through the Attention CLI flags below.
 | `dynamicQuant` | `int` | `0` | Set to `1`: FFN receives dynamically quantized routed activations and scale tensors. The default `0` is not supported by the layered FFN path. |
 | `attn_ranks_per_dp` | `int` | `1` | Positive Attention TP rank count per DP replica. It is the CAM Attention grouping width and is independent of the FFN process's local TP size. |
 | `hccl_buffer_size` | `int` | unset | Positive CAM HCCL buffer size in MB. The override applies only to the `afd_async_cam` communication domain. When unset, HCCL uses `HCCL_BUFFSIZE`, then its built-in default. Configure the same value on every Attention and FFN rank in the domain. |
-| `ffn_two_stream` | `bool` | `false` | Experimental FFN-only receive/compute and send streams with two slots. Requires an eligible layered MRV2 executor; eager and FULL are supported in code, with NPU qualification pending. |
-| `ffn_compute_aic_num` | `int` | `12` | Positive compute Cube limit, bounded by available AIC. |
-| `ffn_compute_aiv_num` | `int` | `24` | Positive compute Vector limit, at least twice the compute Cube count. |
-| `ffn_combine_aiv_num` | `int` | `24` | Positive send Vector limit; compute plus send Vector must fit available AIV. |
-
-For `ffn_two_stream=true`, disable SP and FlashComm1 on both roles. Attention
-may use native DBO with two ubatches under the constraints below; it remains
-eager, and FFN must keep DBO disabled even when using FULL graph.
-See [two-stream execution](ASYNC_FFN_RUNTIME.md#experimental-ffn-two-stream-execution)
-for graph ownership, shutdown and the remaining hardware qualification gates.
 
 For a DP+SP deployment such as DP3TP2 Attention + DP2TP1/EP2 FFN, set
 `VLLM_ASCEND_ENABLE_FLASHCOMM1=1` only on Attention and explicitly set it to

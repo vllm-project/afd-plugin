@@ -52,7 +52,6 @@ def load_async_modules(monkeypatch):
     group = load_host_module(monkeypatch, "afd_plugin.distributed.afd_process_group")
     stub("afd_plugin.distributed", init_afd_process_group=group.init_afd_process_group)
     connector = load_host_module(monkeypatch, "afd_plugin.connectors.npu.async_cam")
-    load_host_module(monkeypatch, "afd_plugin.v1.worker.npu.async_ffn_two_stream")
     runtime = load_host_module(
         monkeypatch, "afd_plugin.v1.worker.npu.async_ffn_model_runner"
     )

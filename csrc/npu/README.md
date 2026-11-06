@@ -49,8 +49,8 @@ rank to enable MegaMoE and its dedicated pull protocol. With the switch off,
 CAM retains its original push Dispatch/Combine and FFN execution path.
 Pull is not a standalone transport option: there is no `dispatch_mode`
 setting or separate pull DispatchRecv/CombineSend operator. MegaMoE requires
-`dynamicQuant=1`, per-channel W4A8 or W8A8 weights, and
-`ffn_two_stream=false`. Per-group weights are not supported by MegaMoE.
+`dynamicQuant=1` and per-channel W4A8 or W8A8 weights.
+Per-group weights are not supported by MegaMoE.
 
 The A3 `AfdMegaMoePullNative` kernel directly includes the installed CANN MC2
 W4A8 `BlockMmad`. The build supports the CANN 9.1 MegaMoE header layout and

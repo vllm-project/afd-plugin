@@ -27,17 +27,17 @@ def test_parse_empty_additional_config_is_inactive():
 
 
 def test_connector_extra_fields_participate_in_the_graph_hash():
-    extra = {"ffn_two_stream": True, "ffn_compute_aic_num": 12}
+    extra = {"ffn_mega_moe": True, "dynamicQuant": 1}
     raw = {
         "connector": "CAMAsyncAFDConnector",
         "role": "ffn",
         "connector_extra_config": extra,
     }
     first = afd_config_from_mapping(raw)
-    extra["ffn_compute_aic_num"] = 10
+    extra["ffn_mega_moe"] = False
     second = afd_config_from_mapping(raw)
     assert first.compute_hash() != second.compute_hash()
-    raw["connector_extra_config"] = {"ffn_compute_aic_num": 10, "ffn_two_stream": True}
+    raw["connector_extra_config"] = {"dynamicQuant": 1, "ffn_mega_moe": False}
     assert second.compute_hash() == afd_config_from_mapping(raw).compute_hash()
 
 

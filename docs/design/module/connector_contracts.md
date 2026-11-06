@@ -103,7 +103,7 @@ than an `AFDConfig` field. Unknown fields fail in the selected connector parser.
 | `P2pNcclAFDConnector` | None; the mapping must be empty. |
 | `DeepEPM2NAFDConnector` | `payload_format`, `expert_backend`, `capacity_tokens_per_rank`, `num_lanes`, `bucket_granularity`, `cpu_sync_min_tokens`, `num_sms`, `num_qps`, `expert_num_sms`, `cpu_timeout_s`, `gpu_timeout_s`, and a nested `network` mapping (`gin`, `hybrid`, `rdma_traffic_class`). All are optional; see the [DeepEP M2N guide](../../gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#connector_extra_config) for defaults. |
 | `CAMP2pAFDConnector` | `core_num`, optional `attn_core_num` / `ffn_core_num`, `compute_gate_on_attention`, `quant_mode`, and optional positive `hccl_buffer_size`. Core counts must be positive; the current runtime rejects gate-on-Attention and any nonzero quantization mode. |
-| `CAMAsyncAFDConnector` | `dynamicQuant`, `attn_ranks_per_dp`, optional positive `hccl_buffer_size`, and FFN two-stream options. Attention microbatching uses native DBO configuration. |
+| `CAMAsyncAFDConnector` | `dynamicQuant`, `ffn_mega_moe`, `attn_ranks_per_dp`, and optional positive `hccl_buffer_size`. Attention microbatching uses native DBO configuration. |
 
 The common `afd_process_group_timeout_s` defaults to 120 seconds and controls
 AFD rendezvous. `hccl_buffer_size` sizes connector-owned HCCL domains in MB;
