@@ -15,6 +15,8 @@ primary_code_paths:
   - "afd_plugin/v1/worker/npu/async_ffn_two_stream.py"
   - "afd_plugin/v1/worker/npu/ffn_worker.py"
 related_code_paths:
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_startup.py"
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_pull.py"
   - "afd_plugin/connectors/**"
   - "afd_plugin/model_executor/**"
   - "afd_plugin/compat/patches/engine_core.py"
@@ -33,8 +35,9 @@ validation_paths:
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
   - "tests/unit/v1/worker/test_async_ffn_two_stream.py"
-  - "tests/unit/test_async_cam_startup_wiring.py"
-  - "tests/unit/connectors/test_async_cam_startup.py"
+  - "tests/unit/connectors/npu/test_async_cam_startup_wiring.py"
+  - "tests/unit/connectors/npu/test_async_cam_startup.py"
+  - "tests/unit/connectors/npu/test_async_cam_pull.py"
   - "tests/npu/async_cam_runtime.py"
   - "tests/e2e/models/deepseek_v4_flash/ffn_graph.py"
   - "tests/unit/compat/patches/test_engine_core.py"
@@ -240,8 +243,10 @@ daemon thread:
 ### Connector-driven loop
 
 The Ascend worker checks `connector.control_plane`. When it is `None`, as for
-CAM async, the worker calls `execute_connector_driven_step()` instead of a
-control-plane receive. For each layer, the runner:
+CAM async, the worker calls `execute_connector_driven_step(shutdown_requested)`
+instead of a control-plane receive. The runner asks the execution session once
+per step whether to keep serving, so Pull adds no extra Store round trip to the
+loop. For each layer, the runner:
 
 1. receives a capacity-sized payload and its original CAM metadata through
    `connector.recv_attn_output()`;

@@ -11,12 +11,16 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
-from afd_plugin.async_cam_startup import AsyncCAMGraphStartup, resolve_ffn_mode
 from afd_plugin.compat.npu.feature_validation import (
     _fail_if_unsupported_npu_afd_async_features,
     fail_if_unsupported_npu_afd_features,
 )
 from afd_plugin.config import parse_afd_config
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup import (
+    AsyncCAMGraphStartup,
+    resolve_ffn_mode,
+)
+from tests.unit.fakes.async_cam_startup import startup_world
 from tests.unit.fakes.async_ffn import (
     load_async_modules,
     load_host_module,
@@ -132,7 +136,7 @@ def layered_startup_runner(modules, monkeypatch, mode, invalid):
     connector = SimpleNamespace(
         is_initialized=False,
         dynamic_quant=1,
-        extra_info=SimpleNamespace(ffn_two_stream=False),
+        extra_info=SimpleNamespace(ffn_two_stream=False, ffn_mega_moe=False),
         graph_startup=AsyncCAMGraphStartup(1, 1, 2),
     )
     connector.init_afd_connector = lambda: resolve_ffn_mode(
@@ -171,6 +175,38 @@ def test_ffn_startup_validates_target_and_draft_weights(
         runner.initialize_afd_connector()
         assert runner.effective_mode == "eager"
         assert connector.graph_startup.plan.signature == "(2, 5)"
+
+
+@pytest.mark.parametrize("mode", ["eager", "full"])
+def test_mega_executor_failure_is_published_during_startup(modules, monkeypatch, mode):
+    _, _, runtime = modules
+    runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
+    runner.model = SimpleNamespace(get_experts_layer_indices=lambda: (2,))
+    runner.draft_model = None
+    runner._failure = runner._layered_executor = runner._mega_executor = None
+    runner.requested_mode = mode
+    connector = SimpleNamespace(
+        is_initialized=False,
+        extra_info=SimpleNamespace(ffn_two_stream=False, ffn_mega_moe=True),
+        graph_startup=AsyncCAMGraphStartup(1, 1, 2),
+    )
+    connector.init_afd_connector = lambda: resolve_ffn_mode(
+        [connector.graph_startup.plan]
+    )
+    runner.connector = connector
+    runner._initialize_layered_executor = lambda: setattr(
+        runner,
+        "_layered_executor",
+        SimpleNamespace(graph_signature=lambda _: "layered"),
+    )
+
+    def fail_executor(*_args):
+        raise ValueError("unsupported Mega weights")
+
+    monkeypatch.setattr(runtime, "AsyncCAMMegaExecutor", fail_executor)
+    with pytest.raises(ValueError, match="unsupported Mega weights"):
+        runner.initialize_afd_connector()
+    assert connector.graph_startup.plan.executor_error == "unsupported Mega weights"
 
 
 @pytest.mark.parametrize("value", [True, 0, -1, 1.5])
@@ -291,6 +327,7 @@ def test_static_validation_precedes_hccl_creation(
     )
     connector.__dict__.update(
         _initialized=False,
+        extra_info=connector_module.AFDAsyncExtraInfo(),
         afd_config=SimpleNamespace(host="localhost", port=1),
         topology=SimpleNamespace(world_size=2),
         world_rank=0,
@@ -366,16 +403,21 @@ def test_graph_dbo_keeps_existing_role_and_count_validation(
 
 
 def test_ffn_announces_service_only_on_receiver_execution(modules):
-    _, _, runtime = modules
+    _, connector_module, runtime = modules
     runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
     calls: list[str | tuple[str, str | int]] = []
     runner.__dict__.update(
         prof=None,
         _graph=object(),
         _service_announced=False,
+        _first_step=True,
+        _graph_stream=MagicMock(),
+        device="npu:0",
+        session=sys.modules["tests.unit.fakes.connector"].FakeFFNSession(),
         layer_ids=(2, 5),
         connector=SimpleNamespace(
-            graph_startup=SimpleNamespace(service_ready=lambda: calls.append("ready"))
+            extra_info=connector_module.AFDAsyncExtraInfo(),
+            graph_startup=SimpleNamespace(service_ready=lambda: calls.append("ready")),
         ),
         _submit_graph=lambda count: calls.append(("submit", count)),
         _complete_graph=lambda: True,
@@ -384,6 +426,30 @@ def test_ffn_announces_service_only_on_receiver_execution(modules):
     assert runner.execute_connector_driven_step()
     assert runner.execute_connector_driven_step()
     assert calls == ["ready", ("submit", 2), ("submit", 2)]
+
+
+@pytest.mark.parametrize("session_serves", [False, True])
+def test_ffn_step_lets_session_decide_service_after_shutdown(modules, session_serves):
+    _, connector_module, runtime = modules
+    runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
+    submitted: list[int] = []
+    serving = [True] if session_serves else []
+    runner.__dict__.update(
+        prof=None,
+        _graph=object(),
+        _service_announced=True,
+        _first_step=False,
+        session=sys.modules["tests.unit.fakes.connector"].FakeFFNSession(
+            serving=serving
+        ),
+        layer_ids=(2, 5),
+        connector=SimpleNamespace(extra_info=connector_module.AFDAsyncExtraInfo()),
+        _submit_graph=submitted.append,
+        _complete_graph=lambda: True,
+    )
+    # Push stops on the shutdown request; Pull keeps serving until A is quiet.
+    assert runner.execute_connector_driven_step(True) is session_serves
+    assert submitted == ([2] if session_serves else [])
 
 
 @pytest.mark.parametrize("capture_fails", [False, True])
@@ -419,6 +485,7 @@ def test_ffn_warmup_capture_order_and_failure_propagation(
         draft_model=None,
         _initialize_layered_executor=lambda: None,
         _layered_executor=SimpleNamespace(graph_signature=lambda capacity: "weights"),
+        _mega_executor=None,
         connector=SimpleNamespace(
             is_initialized=False,
             graph_startup=startup,
@@ -527,6 +594,7 @@ def receiver_graph_worker(ffn_owners, monkeypatch):
     )
     connector = SimpleNamespace(
         is_initialized=True,
+        ffn_session=sys.modules["afd_plugin.connectors.base"].DefaultFFNSession,
         close=lambda: None,
         recv_attn_output=lambda: SimpleNamespace(
             hidden_states=object(), context=SimpleNamespace(states=state)
@@ -586,19 +654,30 @@ def test_full_receiver_exit_releases_graph_only_after_success(
 
 @pytest.mark.parametrize("state", ["live", "failed", "drained"])
 @pytest.mark.parametrize("two_stream", [False, True])
-def test_worker_retains_resources_until_clean_exit(ffn_owners, state, two_stream):
+@pytest.mark.parametrize("requires_drain", [False, True])
+def test_worker_retains_resources_until_clean_exit(
+    ffn_owners, state, two_stream, requires_drain
+):
     _, runtime, module = ffn_owners
     calls = []
+    timeouts = []
     runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
     runner.effective_mode = "eager" if two_stream else "full"
     runner._two_stream = object() if two_stream else None
+    runner.session = SimpleNamespace(requires_drain=requires_drain)
     runner.connector = SimpleNamespace(close=lambda: calls.append("connector-close"))
     runner.shutdown = lambda: calls.append("release")
     worker = module.AFDNPUFFNWorker.__new__(module.AFDNPUFFNWorker)
     worker.model_runner = runner
     worker._ffn_shutdown_event = SimpleNamespace(set=lambda: calls.append("stop"))
+
+    def join(**kwargs):
+        calls.append("join")
+        timeouts.append(kwargs["timeout"])
+
     worker._ffn_thread = SimpleNamespace(
-        join=lambda **kw: calls.append("join"), is_alive=lambda: state == "live"
+        join=join,
+        is_alive=lambda: state == "live",
     )
     worker._ffn_loop_error = (
         RuntimeError("native failure") if state == "failed" else None
@@ -616,6 +695,7 @@ def test_worker_retains_resources_until_clean_exit(ffn_owners, state, two_stream
                     worker.raise_ffn_loop_error_if_any()
             with pytest.raises(RuntimeError):
                 worker.start_ffn_server_loop()
+    assert timeouts == [60 if requires_drain else 5]
 
 
 @pytest.mark.parametrize("async_connector", [False, True])
@@ -665,7 +745,10 @@ def test_ffn_runner_loads_model_and_rejects_second_load(
     monkeypatch.setattr(runtime, "validate_npu_model_runner_v2_config", calls.validate)
     monkeypatch.setattr(runtime, "fail_if_unsupported_npu_afd_features", calls.validate)
     monkeypatch.setattr(runtime, "create_afd_npu_profiler", lambda role: None)
-    connector, device, model = object(), SimpleNamespace(type="npu"), object()
+    connector = SimpleNamespace(
+        ffn_session=sys.modules["afd_plugin.connectors.base"].DefaultFFNSession
+    )
+    device, model = SimpleNamespace(type="npu"), object()
     connector_name = "CAMAsyncAFDConnector" if async_connector else "CAMP2pAFDConnector"
     config = npu_vllm_config(role="ffn", connector=connector_name)
     config.model_config.enforce_eager = False
@@ -715,3 +798,176 @@ def test_ffn_runner_loads_model_and_rejects_second_load(
     assert runner.get_model() is model and runner.model_memory_usage == 1234
     with pytest.raises(RuntimeError, match="already loaded"):
         runner.load_model()
+
+
+@pytest.fixture
+def connector_world(monkeypatch):
+    _, module, runtime = load_async_modules(monkeypatch)
+    owners = startup_world()
+    connectors = []
+    for rank, startup in enumerate(owners):
+        role = "attention" if rank < 2 else "ffn"
+        config = npu_vllm_config(
+            role=role,
+            connector="CAMAsyncAFDConnector",
+            num_attention_ranks=2,
+            num_ffn_ranks=2,
+            extra_config={"ffn_mega_moe": True, "dynamicQuant": 1},
+        )
+        config.model_config.hf_config = SimpleNamespace(
+            hidden_size=32, num_experts_per_tok=2, n_routed_experts=4
+        )
+        config.model_config.dtype = "bfloat16"
+        connector = module.CAMAsyncAFDConnector(
+            rank, 0, config, parse_afd_config(config), rank % 2
+        )
+        connector.graph_startup = startup
+        connector._initialized = True
+        connector.comm_args = object()
+        connectors.append(connector)
+    return SimpleNamespace(connectors=connectors, runtime=runtime)
+
+
+def test_default_session_obeys_shutdown_without_drain(connector_world):
+    session = sys.modules["afd_plugin.connectors.base"].DefaultFFNSession()
+    assert session.keep_serving(False)
+    assert not session.keep_serving(True)
+    assert not session.requires_drain
+    session.before_first_step()
+    session.after_step()
+    session.drain(lambda: pytest.fail("Push must not execute a drain transaction"))
+    session.finish_receiver()
+    session.finish_receiver()
+    session.validate_shutdown()
+
+
+@pytest.mark.parametrize("failure", ["unfinished", "active", "status"])
+def test_close_preserves_receiver_communication_on_unsafe_session(
+    connector_world, monkeypatch, failure
+):
+    connector = connector_world.connectors[2]
+    resource = connector.comm_args
+    connector.cam_pg = group = object()
+    session = connector.ffn_session()
+    if failure != "unfinished":
+        monkeypatch.setattr(connector, "_pull_has_active_source", lambda: False)
+        session.drain(lambda: pytest.fail("idle source must not launch"))
+        for attention in connector_world.connectors[:2]:
+            attention.graph_startup._publish("pull_quiet")
+        session.finish_receiver()
+    if failure == "active":
+        monkeypatch.setattr(connector, "_pull_has_active_source", lambda: True)
+    elif failure == "status":
+
+        def fail_status():
+            raise RuntimeError("sticky status -5")
+
+        monkeypatch.setattr(connector, "_check_pull_status", fail_status)
+    expected = "sticky status -5" if failure == "status" else "has not drained"
+    with pytest.raises(RuntimeError, match=expected):
+        connector.close()
+    assert connector.is_initialized and connector.comm_args is resource
+    assert connector.cam_pg is group
+
+
+@pytest.mark.parametrize("failure", ["body", "status"])
+def test_attention_step_recovers_after_error(connector_world, monkeypatch, failure):
+    connector = connector_world.connectors[0]
+    error: list[RuntimeError | None] = [None]
+
+    def check_status():
+        if error[0] is not None:
+            raise error[0]
+
+    monkeypatch.setattr(connector, "_check_pull_status", check_status)
+    expected = ValueError if failure == "body" else RuntimeError
+    with pytest.raises(expected, match="failed"), connector.attention_step():
+        if failure == "body":
+            raise ValueError("model failed")
+        error[0] = RuntimeError("status failed")
+    error[0] = RuntimeError("status failed after recovery")
+    with (
+        pytest.raises(RuntimeError, match="after recovery"),
+        connector.attention_step(),
+    ):
+        pass
+    error[0] = None
+    with connector.attention_step():
+        pass
+
+
+def test_nested_attention_step_defers_status_until_outer_boundary(
+    connector_world, monkeypatch
+):
+    connector = connector_world.connectors[0]
+
+    def check_status():
+        raise RuntimeError("sticky status")
+
+    monkeypatch.setattr(connector, "_check_pull_status", check_status)
+    with pytest.raises(RuntimeError, match="sticky status"), connector.attention_step():
+        with connector.attention_step():
+            pass
+        # Reaching this line proves the nested scope did not check sticky status.
+        completed_inner_scope = True
+    assert completed_inner_scope
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_runner_drain_returns_completed_response_or_session_error(
+    connector_world, fails
+):
+    runtime = connector_world.runtime
+    runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
+    runner.model = object()
+    runner.connector = connector_world.connectors[2]
+    runner.session = sys.modules["tests.unit.fakes.connector"].FakeFFNSession(
+        transactions=1,
+        drain_error=RuntimeError("source did not drain") if fails else None,
+    )
+    runner._graph = runner._two_stream = None
+    runner.layer_ids = (2, 5)
+    responses = []
+    runner.connector.send_ffn_output = lambda output, context: responses.append(output)
+    # The host executor emits a peer response; it does not simulate device compute.
+    runner._mega_executor = lambda: runner.connector.send_ffn_output("response", None)
+    if fails:
+        with pytest.raises(RuntimeError, match="source did not drain"):
+            runner.drain()
+    else:
+        runner.drain()
+    assert responses == ["response"]
+
+
+@pytest.mark.parametrize("failure", ["unfinished", "active", "status"])
+def test_runner_shutdown_retains_model_and_communication_on_unsafe_session(
+    connector_world, monkeypatch, failure
+):
+    runtime = connector_world.runtime
+    runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
+    connector = connector_world.connectors[2]
+    runner.connector = connector
+    runner.session = connector.ffn_session()
+    runner.model = model = object()
+    runner._failure = None
+    runner._is_shutdown = False
+    runner._graph_receiver_exited = True
+    resource = connector.comm_args
+    if failure != "unfinished":
+        monkeypatch.setattr(connector, "_pull_has_active_source", lambda: False)
+        runner.session.drain(lambda: pytest.fail("idle source must not launch"))
+        for attention in connector_world.connectors[:2]:
+            attention.graph_startup._publish("pull_quiet")
+        runner.session.finish_receiver()
+    if failure == "active":
+        monkeypatch.setattr(connector, "_pull_has_active_source", lambda: True)
+    elif failure == "status":
+
+        def fail_status():
+            raise RuntimeError("status failed; retain resources")
+
+        monkeypatch.setattr(connector, "_check_pull_status", fail_status)
+    with pytest.raises(RuntimeError, match="retain resources"):
+        runner.shutdown()
+    assert runner.get_model() is model
+    assert connector.is_initialized and connector.comm_args is resource

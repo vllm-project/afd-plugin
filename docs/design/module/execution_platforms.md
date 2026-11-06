@@ -24,6 +24,7 @@ related_code_paths:
 depends_on:
   - "plugin_boundary.md"
 validation_paths:
+  - "tests/npu/check_pull_layout.cpp"
   - "tests/unit/compat/test_profiler.py"
   - "tests/unit/compat/test_ascend_ops.py"
   - "tests/unit/compat/npu/test_profiler.py"
@@ -93,6 +94,20 @@ Runtime modules import their real device dependencies. CPU safety applies to
 the top-level package, common configuration/validation, version checks, and
 the graph policy helper; importing a CUDA or Ascend runtime module requires
 the corresponding runtime stack.
+
+## Backend execution session
+
+Connectors expose `attention_step()` and a backend-owned `FFNExecutionSession`.
+The Async FFN runner and worker use its service predicate, first-step hook,
+completion hook, drain callback, receiver completion and pre-release validation;
+they do not inspect Pull state. Push uses the no-op default session. Pull owns
+idle enablement, sticky status checks and the `quiet → drain → stopped` handshake
+in `connectors/npu/async_cam_runtime/async_cam_pull.py`. Shutdown validates the
+session before releasing graph, profiler, model or communication resources;
+failures retain those resources. Attention batches the same device-status fence
+at step exit.
+Generic graph startup negotiation remains backend-owned and is imported without
+loading torch, vLLM or NPU modules through the connector package namespaces.
 
 ## Platform mechanism map
 

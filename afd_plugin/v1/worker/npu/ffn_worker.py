@@ -48,6 +48,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 FFN_SHUTDOWN_TIMEOUT_SECONDS = 5
+# Pull receivers must wait for all Attention ranks to stop publishing.
+ASYNC_FFN_DRAIN_TIMEOUT_SECONDS = 60
 
 
 def create_npu_ffn_model_runner(
@@ -201,16 +203,20 @@ class AFDNPUFFNWorker(NPUWorker):
             return
 
         torch.npu.set_device(self.device)
-        while not event.is_set():
-            if isinstance(self.model_runner, AsyncNPUFFNModelRunner):
-                if not self.model_runner.execute_connector_driven_step():
-                    return
+        if isinstance(self.model_runner, AsyncNPUFFNModelRunner):
+            # The runner consults the session once per step; a second
+            # predicate here would add Store round trips to the Pull hot path.
+            while self.model_runner.execute_connector_driven_step(event.is_set()):
                 if (
                     self.model_runner.effective_mode == "eager"
                     and self.model_runner._two_stream is None
                 ):
                     torch.npu.synchronize()
-                continue
+            self.model_runner.drain()
+            self.model_runner.session.finish_receiver()
+            return
+
+        while not event.is_set():
             control_plane = self.model_runner.connector.control_plane
             assert control_plane is not None
             payload = control_plane.recv_dp_metadata_list()
@@ -233,6 +239,7 @@ class AFDNPUFFNWorker(NPUWorker):
         return isinstance(self.model_runner, AsyncNPUFFNModelRunner) and (
             self.model_runner.effective_mode == "full"
             or self.model_runner._two_stream is not None
+            or self.model_runner.session.requires_drain
         )
 
     def raise_ffn_loop_error_if_any(self) -> None:
@@ -249,7 +256,13 @@ class AFDNPUFFNWorker(NPUWorker):
                 event.set()
             thread = self._ffn_thread
             if thread is not None:
-                thread.join(timeout=FFN_SHUTDOWN_TIMEOUT_SECONDS)
+                timeout = (
+                    ASYNC_FFN_DRAIN_TIMEOUT_SECONDS
+                    if isinstance(self.model_runner, AsyncNPUFFNModelRunner)
+                    and self.model_runner.session.requires_drain
+                    else FFN_SHUTDOWN_TIMEOUT_SECONDS
+                )
+                thread.join(timeout=timeout)
                 if thread.is_alive():
                     raise RuntimeError(
                         "Async graph receive is pending; retain resources"

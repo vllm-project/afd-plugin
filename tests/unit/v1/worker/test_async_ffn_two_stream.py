@@ -9,7 +9,9 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
-from afd_plugin.async_cam_startup import AsyncCAMGraphStartup
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup import (
+    AsyncCAMGraphStartup,
+)
 from tests.unit.fakes.async_ffn import load_async_modules
 
 

@@ -145,7 +145,7 @@ the target stack passes those checks.
 
 ## Resource lifetime
 
-A host event stops further batch submissions. Graph reset and model/communicator
+With default Push transport, a host event stops further batch submissions. Graph reset and model/communicator
 release are permitted only after the receive thread exits normally and device
 completion is confirmed. Partial capture, partial launch, execution failure or
 a still-live receive thread retains resources for process cleanup. A failure
@@ -159,6 +159,17 @@ zero. Test reports distinguish successful inference from cleanup, and forced
 termination must not be described as normal shutdown. Single-stream eager and synchronous
 stopping policies retain their connector/process-level cleanup boundaries.
 
+### Opt-in Pull execution session
+
+`connector_extra_config.ffn_mega_moe=true` selects Pull; Push remains the default.
+The connector owns its execution session and all Pull status/Store handshakes.
+Attention fences pending dispatch at `attention_step()` exit. FFN keeps serving
+until every Attention source is quiet, drains active work, then publishes stopped;
+only then may Attention and FFN release their communication resources. Failed
+handshakes retain those resources. Standalone `close()` also validates shutdown
+status before release: this is an additional defensive shutdown check, not a
+relocated hot-path fence. Pull cannot be combined with `ffn_two_stream`.
+
 ## Computation semantics
 
 For W4A8, FULL and layered eager forward the same model `swiglu_limit` to W13.
@@ -166,8 +177,20 @@ A positive `L` clamps gate above at `L` and up to `[-L, L]` before SiLU gating a
 quantization. Zero disables clipping. DeepSeek-V4's configured `10.0` therefore
 applies on both execution paths. The limit is a host scalar fixed at graph
 capture; layer selection remains controlled by the device `layer_index` tensor.
-Layered W8A8 retains its unclipped computation and records the model limit as
-metadata only.
+Layered and Mega W8A8 retain unclipped computation regardless of the model
+`swiglu_limit`; the executors pass zero and the native W8A8 Plan skips clamp.
+Native Mega W4A8 applies the limit in its MC2 ACT epilogue and bounded-column
+fallback. Native W8A8 uses an INT8 GEMM with INT32 intermediate results and a
+bounded-column activation; weight scales stay FP32 for W13 and BF16 for W2.
+Both plans share Pull transport and the BF16 return path. W8A8 applies weight
+and token scales in Vector before activation, preserving the Layered rounding
+sequence. The mode is selected once through `config[11]` (1=W4A8, 2=W8A8).
+
+The synthetic transport fixture accepts `--quantization W8A8 --swiglu-limit 0`
+or `--swiglu-limit 10`; W8A8 ignores either model limit. Save matching Layered
+eager outputs with `--save-outputs`,
+then compare Mega eager and `--full-graph` using `--reference-outputs`; add
+`--boundary` to exercise receive rounds, sparse experts and poisoned scratch.
 
 ## Validation
 
@@ -178,28 +201,36 @@ A3/910C, 4A/4F, A TP4, F TP1, receive capacity 128 and DBO disabled. Select
 this topology still needs target-device validation. Synthetic per-group
 coverage does not qualify loading real per-group checkpoints.
 
-- Host contracts: `tests/unit/connectors/test_async_cam_startup.py`,
+- Host contracts: `tests/unit/connectors/npu/test_async_cam_pull.py`,
+  `tests/unit/connectors/npu/test_async_cam_startup.py`,
   `tests/unit/v1/worker/test_async_ffn_graph.py`, and
   `tests/unit/v1/worker/test_async_ffn_runtime.py`. CPU-safe two-stream coverage
   is in `tests/unit/v1/worker/test_async_ffn_two_stream.py` and
-  `tests/unit/test_async_cam_startup_wiring.py`; fakes verify host ordering and
+  `tests/unit/connectors/npu/test_async_cam_startup_wiring.py`; fakes verify host ordering and
   ownership, not device execution.
 - Finite native comparison: `tests/npu/async_cam_runtime.py`. Run eager with
   `--save-outputs PREFIX`, then FULL with `--full-graph --reference-outputs PREFIX`,
   keeping other arguments identical. `--boundary` covers chunking and poisoned
   unused capacity; `--attn-ranks 2` covers different Attention sources. The test
   supplies finite work counts, compares outputs and checks captured addresses.
+  For Pull, add `--mega --idle-shutdown` to both eager and FULL runs so the
+  fixture exercises the real worker drain/finish handshake. Compare FULL to its
+  matching ON eager reference separately from the OFF-to-ON numerical check.
 - Real MRV2 generation: the bounded 4A/4F fixture below. Its test observers add
   synchronization for functional evidence, so it is not a performance test.
 
 ```bash
 python -m tests.e2e.models.deepseek_v4_flash.ffn_graph \
-  --mode eager --model /path/to/checkpoint --afd-host "$AFD_HOST" \
-  --devices 0,1,2,3,4,5,6,7 --output-dir /path/to/eager-evidence
+  --mode eager --mega --model /path/to/checkpoint --afd-host "$AFD_HOST" \
+  --devices 0,1,2,3,4,5,6,7 --output-dir /path/to/on-eager-evidence
 python -m tests.e2e.models.deepseek_v4_flash.ffn_graph \
-  --mode full --model /path/to/checkpoint --afd-host "$AFD_HOST" \
-  --devices 0,1,2,3,4,5,6,7 --output-dir /path/to/full-evidence \
-  --reference-dir /path/to/eager-evidence
+  --mode full --mega --model /path/to/checkpoint --afd-host "$AFD_HOST" \
+  --devices 0,1,2,3,4,5,6,7 --output-dir /path/to/on-full-evidence \
+  --reference-dir /path/to/on-eager-evidence
+python -m tests.e2e.models.deepseek_v4_flash.ffn_graph \
+  --mode eager --model /path/to/checkpoint --afd-host "$AFD_HOST" \
+  --devices 0,1,2,3,4,5,6,7 --output-dir /path/to/off-eager-evidence \
+  --reference-dir /path/to/on-eager-evidence
 ```
 
 The fixture saves inputs, generated tokens, actual runner identities and per-rank

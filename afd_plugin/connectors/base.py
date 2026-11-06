@@ -5,9 +5,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 
@@ -34,6 +35,75 @@ class ConnectorExtraInfo:
 
     def to_mapping(self) -> dict[str, Any]:
         return {}
+
+
+class FFNExecutionSession(Protocol):
+    """Backend lifecycle used by FFN runners and workers.
+
+    Workers stop serving before draining and finishing the receiver, then
+    validate shutdown before releasing communication and model resources.
+    ``requires_drain`` marks backends that must retain resources until their
+    pending work and receiver handshake have completed.
+    """
+
+    requires_drain: bool
+
+    def keep_serving(self, shutdown_requested: bool) -> bool:
+        """Whether to serve another step given the local shutdown_requested flag.
+
+        A backend may keep serving after local shutdown until remote producers
+        are quiet.
+        """
+        ...
+
+    def before_first_step(self) -> None:
+        """Prepare backend state once before the first FFN step."""
+        ...
+
+    def after_step(self) -> None:
+        """Check backend status after a completed FFN step."""
+        ...
+
+    def drain(self, run_one: Callable[[], None]) -> None:
+        """Drain pending work using run_one to execute and wait for a transaction."""
+        ...
+
+    def finish_receiver(self) -> None:
+        """Finish the receiver handshake after pending work has drained."""
+        ...
+
+    def validate_shutdown(self) -> None:
+        """Raise RuntimeError if resources cannot yet be released safely."""
+        ...
+
+
+class DefaultFFNSession:
+    """Lifecycle for connectors that need no drain or receiver handshake.
+
+    Service stops when ``shutdown_requested`` is true. Other hooks are no-ops;
+    in particular, ``drain`` never invokes its ``run_one`` callback. Workers
+    and runners still own device synchronization and resource release.
+    """
+
+    requires_drain = False
+
+    def keep_serving(self, shutdown_requested: bool) -> bool:
+        return not shutdown_requested
+
+    def before_first_step(self) -> None:
+        pass
+
+    def after_step(self) -> None:
+        pass
+
+    def drain(self, run_one: Callable[[], None]) -> None:
+        pass
+
+    def finish_receiver(self) -> None:
+        pass
+
+    def validate_shutdown(self) -> None:
+        pass
 
 
 class AFDConnectorBase(ABC):
@@ -111,6 +181,17 @@ class AFDConnectorBase(ABC):
     # ==============================
     # Lifecycle methods
     # ==============================
+
+    def attention_step(self) -> AbstractContextManager[None]:
+        """Return a context for ``with connector.attention_step():`` around forward.
+
+        Backends may defer transport status checks until the Attention model
+        step completes. The default context performs no additional work.
+        """
+        return nullcontext()
+
+    def ffn_session(self) -> FFNExecutionSession:
+        return DefaultFFNSession()
 
     @abstractmethod
     def close(self) -> None:
@@ -378,4 +459,6 @@ __all__ = [
     "AFDControlPlaneClosedError",
     "AFDRoutedExpertsConnector",
     "ConnectorExtraInfo",
+    "DefaultFFNSession",
+    "FFNExecutionSession",
 ]
