@@ -161,7 +161,7 @@ role rank.
 | `core_num` | `int` | `8` | Positive default AIV core count for both roles. |
 | `attn_core_num` / `ffn_core_num` | `int` | unset | Positive role-specific override for `core_num`. |
 | `quant_mode` | `int` | `0` | CAM quantization mode. The current runtime supports only `0`. |
-| `compute_gate_on_attention` | `bool` | `false` | Connector-local operator option. It does not control routing placement: leave it unset and set the common `afd.compute_gate_on_attention` field instead. |
+| `compute_gate_on_attention` | `bool` | `false` | Kept for backwards compatibility with older configurations and ignored for routing placement: transport derives the gate from the payload it actually carries. Omit it when deploying and set the common `afd.compute_gate_on_attention` field instead. |
 | `hccl_buffer_size` | `int` | unset | Positive CAMP2P HCCL buffer size in MB. The override applies to every connector-owned `afd*` communication domain and the FFN-side `afd_moe` domain; the Gloo control group is unaffected. When unset, HCCL uses `HCCL_BUFFSIZE`, then its built-in default. Use the same value on all members of each HCCL domain. |
 
 The per-domain setting avoids increasing buffers for unrelated TP, DP, or EP
@@ -321,7 +321,7 @@ vllm serve /path/to/DeepSeek-V4 \
   }'
 ```
 
-Drop `--enforce-eager` and add a `--compilation-config` block to run the same pair with ACL graphs.
+Drop `--enforce-eager` and add `--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [8, 16, 32, 64, 128]}'` to run the same pair with ACL graphs.
 The configuration is rejected when `compute_gate_on_attention=true` is combined with DBO,
 ubatching, TP > 1, a connector other than `CAMP2pAFDConnector`, or a target other than DeepSeek-V4.
 

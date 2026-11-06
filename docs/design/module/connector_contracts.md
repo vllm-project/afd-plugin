@@ -113,10 +113,12 @@ environment rather than querying the allocated domain.
 
 The common `compute_gate_on_attention` field remains on `AFDConfig` and is the
 model-routing selector. CUDA P2P supports both values; DeepEP M2N requires
-`true`. CAMP2P also parses a
-connector-local field with that name for its operator contract, but the current
-synchronous NPU runtime requires both common and connector-local values to be
-`false`. CAM async requires the common field to be `true`.
+`true`. CAMP2P also parses a connector-local field with that name, retained for
+backwards compatibility with older configurations and ignored for routing: the
+synchronous NPU runtime selects Attention-side routing from the common field, so
+deployments leave the connector-local copy unset. The supported synchronous
+shape is `true` on both roles for DeepSeek-V4 at TP=1 with no DBO or ubatching.
+CAM async requires the common field to be `true`.
 
 ## Current connector modes
 
