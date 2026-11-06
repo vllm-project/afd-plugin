@@ -123,6 +123,10 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     _NON_USER_INPUT_KEYS = {
         # ### PATCH START: AFD namespace
         "afd",
+        # Elastic AFD topology, consumed by afd_plugin.elastic.config. Not an
+        # AscendConfig field: unless stripped, extra="forbid" rejects it and
+        # pydantic re-titles the post_init failure as an outer-class error.
+        "afd_elastic",
         # ### PATCH END: AFD namespace
         # control-flow flag (singleton/cache refresh), not a configuration field
         "refresh",

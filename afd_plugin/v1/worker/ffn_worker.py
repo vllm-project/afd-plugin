@@ -16,6 +16,7 @@ from vllm.v1.worker.worker_base import CompilationTimes
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory, AFDRoutedExpertsConnector
 from afd_plugin.connectors.base import AFDControlPlaneClosedError
+from afd_plugin.elastic.gpu import connect, release_link, update_topology
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
 from afd_plugin.validation import (
@@ -120,6 +121,15 @@ class AFDFFNWorker(Worker):
 
         return {}
 
+    def afd_release_link(self) -> None:
+        release_link(self)
+
+    def afd_update_topology(self, afd: dict[str, str | int | bool]) -> None:
+        update_topology(self, afd)
+
+    def afd_connect(self) -> None:
+        connect(self)
+
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Skip KV cache allocation and start the FFN connector loop."""
 
@@ -196,6 +206,8 @@ class AFDFFNWorker(Worker):
                 if not event.is_set():
                     raise
                 break
+            if payload.stop:
+                return
             dp_metadata_list = payload.dp_metadata_list
             is_attn_graph_capturing = payload.is_graph_capturing
             is_warmup = payload.is_warmup
@@ -241,6 +253,19 @@ class AFDFFNWorker(Worker):
         self._ffn_thread = None
         self._ffn_shutdown_event = None
         self.raise_ffn_loop_error_if_any()
+
+    def join_ffn_server_loop(self, timeout: float = 60.0) -> None:
+        """Join after A sent STOP; do not destroy a communicator under recv."""
+        thread = self._ffn_thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                raise TimeoutError("FFN loop did not acknowledge STOP")
+        self.raise_ffn_loop_error_if_any()
+        self._ffn_thread = None
+        self._ffn_shutdown_event = None
+        # recv no longer blocks the device stream at this point.
+        torch.cuda.synchronize(self.device)
 
     # Upstream source: vLLM v0.32.0, vllm/v1/worker/gpu_worker.py,
     # Worker.shutdown; 5df63a7203cdb9328d824a27b682e77c7b9928be.

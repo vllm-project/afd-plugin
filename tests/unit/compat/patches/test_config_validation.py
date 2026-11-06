@@ -73,6 +73,7 @@ def _install_fake_vllm_config(monkeypatch):
             cfg = VllmConfig()
             cfg.additional_config = self.additional_config
             cfg.parallel_config = SimpleNamespace(
+                enable_elastic_ep=False,
                 use_ubatching=self.enable_dbo or self.ubatch_size > 1,
                 all2all_backend=self.all2all_backend,
                 worker_cls=self.worker_cls,
@@ -147,6 +148,8 @@ def _install_fake_npu_config(monkeypatch):
     events: list[tuple[str, str] | tuple[str, str, str]] = []
 
     class FakeParallelConfig:
+        enable_elastic_ep = False
+
         def __init__(
             self,
             *,

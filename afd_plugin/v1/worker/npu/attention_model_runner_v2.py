@@ -42,6 +42,7 @@ from afd_plugin.connectors import (
     AFDConnectorFactory,
     AFDForwardContextMetadata,
 )
+from afd_plugin.elastic.config import is_elastic_attention
 from afd_plugin.model_executor.models.forward_context import use_afd_metadata_provider
 from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
@@ -188,7 +189,17 @@ def _use_camp2p_dp_padding(attention_size: int, ffn_size: int) -> Iterator[None]
             attention_tp = attention_size // dp_size
             # Rank a sends to FFN a % ffn_size. Contiguous Attention TP peers
             # must also pad equally; non-aligned TP blocks connect all groups.
-            num_groups = ffn_size // attention_tp if ffn_size % attention_tp == 0 else 1
+            # Re-anchor: after an elastic A resize the DP span may not divide
+            # into equal FFN-target groups (e.g. A3/F2 maps r -> r % 2 with
+            # unequal group sizes); fall back to one group = pad every rank
+            # to the global max, which stays stride-safe for CAMP2P.
+            num_groups = (
+                ffn_size // attention_tp
+                if attention_tp > 0
+                and ffn_size % attention_tp == 0
+                and dp_size % (ffn_size // attention_tp) == 0
+                else 1
+            )
             padded_counts = (
                 sync.num_tokens_across_dp.reshape(-1, num_groups)
                 .amax(dim=0)
@@ -346,8 +357,19 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         **kwargs,
     ) -> None:
         super().load_model(load_dummy_weights, *args, **kwargs)
-        if not self.connector.is_initialized:
+        # ### PATCH START: elastic attention defers the connector rendezvous.
+        # Mechanism: the vLLM 0.30 launcher waits for the A engine to build
+        # synchronously, while init_afd_connector() collectively waits for F,
+        # which the client only pulls after this returns — boot deadlocks.
+        # v0.26 origin: the MRV1 attention runner gated the same rendezvous
+        # behind is_elastic_attention; the elastic lifecycle (connect() in
+        # afd_plugin/elastic/npu.py) rebuilds the connector once roles are up.
+        if (
+            not is_elastic_attention(self.vllm_config)
+            and not self.connector.is_initialized
+        ):
             self.connector.init_afd_connector()
+        # ### PATCH END: elastic attention defers the connector rendezvous.
 
     # Native MRV2 imports its factory by value; scope that exact binding while
     # preserving Ascend's KV initialization (too large to copy).
@@ -438,7 +460,9 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     # Patch functionality: delegate all request/input/Attention/KV/sampling/
     # output work to native V2 while temporarily installing AFD metadata.
     # Signature: matches vLLM v0.32.0 GPUModelRunner.execute_model, including
-    # the dummy-state parameters forwarded through Ascend NPUModelRunnerV2.
+    # the dummy-state parameters forwarded through Ascend NPUModelRunnerV2,
+    # plus a **kwargs pass-through so neighbouring generations (e.g.
+    # main@544f182d9) forward unchanged.
     # Upstream source: vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.execute_model; commit
     # 5df63a7203cdb9328d824a27b682e77c7b9928be. Ascend delegates this contract
@@ -461,6 +485,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
+        **kwargs,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         # ### PATCH START: scope AFD metadata provider/replay and profiler step.
         step_afd_npu_profiler(self.prof)
@@ -516,6 +541,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                     context_len=context_len,
                     valid_dummy_state_slots=valid_dummy_state_slots,
                     randomize_inputs=randomize_inputs,
+                    **kwargs,
                 )
         finally:
             self._afd_pending_metadata = previous_metadata

@@ -37,6 +37,7 @@ from afd_plugin.v1.worker.attention_metadata import (
 from afd_plugin.v1.worker.cuda_graph import (
     AFDGraphRunMode,
     graph_run_mode,
+    make_ffn_graph_key,
 )
 from afd_plugin.v1.worker.ffn_metadata import _set_moe_layer_index
 from afd_plugin.validation import validate_npu_model_runner_v2_config
@@ -98,7 +99,10 @@ class AFDNPUFFNModelRunner:
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
         return parse_afd_config(vllm_config, expected_role="ffn")
 
-    def load_model(self) -> None:
+    # Signature: accepts NPUWorker.load_model's load_dummy_weights keyword
+    # pass-through (vllm-ascend 8d4409d62 made MRV2 the default path). FFN
+    # weights are always real; the flag is accepted and deliberately unused.
+    def load_model(self, *, load_dummy_weights: bool = False, **kwargs: Any) -> None:
         # Load inside the initialized worker. The native loader owns weight
         # materialization and quantization postprocessing; FFN does not need
         # Attention request, sampler, KV or compilation-runner state.
@@ -238,16 +242,17 @@ class AFDNPUFFNModelRunner:
         self,
         dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
     ) -> tuple:
-        graph_key = []
-        for stage_idx in sorted(dp_metadata_list):
-            token_counts = _ffn_token_counts_across_ranks(
-                self.connector,
-                dp_metadata_list,
-                stage_idx,
-                fallback=self.max_num_tokens,
-            )
-            graph_key.append((int(stage_idx), tuple(token_counts.tolist())))
-        return tuple(graph_key)
+        return make_ffn_graph_key(
+            dp_metadata_list,
+            attention_size=int(self.connector.attn_size),
+            ffn_size=int(self.connector.ffn_size),
+            fallback=int(self.max_num_tokens),
+            # The NPU CAMP2p kernels move an equal share of rows per
+            # Attention rank; the graph key must use the same uniform row
+            # count as _ffn_token_counts_across_ranks or replay would pick a
+            # graph captured for the wrong batch shape.
+            uniform_padding=True,
+        )
 
     def _ffn_forward(
         self,
@@ -563,11 +568,20 @@ def _ffn_token_counts_across_ranks(
             and attention_size >= ffn_size
             and attention_size % ffn_size == 0
         ):
-            # Match CAMP2P's strided Attention-to-FFN rank mapping.
-            values = [
-                max(1, sum(attention_counts[idx:attention_size:ffn_size]))
-                for idx in range(ffn_size)
-            ]
+            group_size = int(connector.attn_size) // int(connector.ffn_size)
+            if group_size == 1:
+                # 1:1 mapping: each FFN rank receives its Attention twin's
+                # rows, unpadded.
+                values = [max(1, count) for count in attention_counts]
+            else:
+                # N:1 mapping: the Attention side pads every rank up to the
+                # largest count across all Attention ranks (see
+                # send_attn_output), so every FFN rank receives
+                # ``uniform * group_size`` rows.  Report exactly that count:
+                # it sizes the MC2 xActiveMask, which must match x dim0 or
+                # npu_moe_distribute_dispatch_v2 rejects the step.
+                uniform = max(1, max(attention_counts))
+                values = [uniform * group_size] * int(connector.ffn_size)
         else:
             values = [max(1, int(fallback))] * ffn_size
     return torch.tensor(values, dtype=torch.int32, device="cpu")

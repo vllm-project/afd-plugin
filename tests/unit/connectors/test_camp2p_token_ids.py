@@ -296,7 +296,9 @@ def test_recv_attn_output_mode_and_ids_follow_the_receiver_declaration(
     monkeypatch.setattr(torch.ops.afd_ascend, "a2e", fake_a2e, raising=False)
     monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
     connector = _connector(role="ffn", rank=1)
-    # FFN rank 1 owns Attention ranks 1 and 3: 3 + 7 tokens.
+    # FFN rank 1 pairs with Attention ranks 1 and 3. The CAMP2p sender pads
+    # every rank to the group max (7), so the receiver declares 7 + 7 rows
+    # (uniform-row contract; MC2 masks and graph keys size to this count).
     connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 5, 7])}
 
     with_ids = connector.recv_attn_output(
@@ -323,6 +325,10 @@ def test_recv_attn_output_mode_and_ids_follow_the_receiver_declaration(
         70,
         80,
         90,
+        100,
+        110,
+        120,
+        130,
     ]
     assert calls[1][-1] == 0
     assert without_ids.input_ids is None

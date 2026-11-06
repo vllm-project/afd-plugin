@@ -185,6 +185,11 @@ def register_afd() -> None:
             exc_info=True,
         )
 
+    # Elastic configuration cannot safely continue if its EEP seams fail to
+    # install. Keep these imports outside the legacy optional-patch fallback.
+    import afd_plugin.compat.patches.elastic  # noqa: F401
+    import afd_plugin.compat.patches.elastic_actors  # noqa: F401
+    import afd_plugin.compat.patches.elastic_parallel  # noqa: F401
     from afd_plugin.model_executor.routing_simulator import (
         register_afd_balanced_routing_strategy,
     )

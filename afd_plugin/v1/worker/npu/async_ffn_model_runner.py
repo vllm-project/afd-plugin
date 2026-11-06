@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import torch
 from vllm.logger import init_logger
@@ -92,7 +92,10 @@ class AsyncNPUFFNModelRunner:
         self._failure: Exception | None = None
         self.prof = create_afd_npu_profiler("ffn")
 
-    def load_model(self) -> None:
+    # Signature: accepts NPUWorker.load_model's load_dummy_weights keyword
+    # pass-through (vllm-ascend 8d4409d62 made MRV2 the default path). FFN
+    # weights are always real; the flag is accepted and deliberately unused.
+    def load_model(self, *, load_dummy_weights: bool = False, **kwargs: Any) -> None:
         # Import the loader only in the isolated, initialized NPU worker.
         from vllm.model_executor.model_loader import get_model_loader
         from vllm.utils.mem_utils import DeviceMemoryProfiler

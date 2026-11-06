@@ -122,6 +122,11 @@ class FakeRoutedConnector(AFDRoutedExpertsConnector):
 
 
 class ProxyConnector:
+    # AFDConnectorBase.is_initialized is part of the connector interface that
+    # the elastic link-release identity bypass reads (deepseek_v2
+    # RemoteFFNProxy._send_and_receive); keep fakes interface-exact.
+    is_initialized = True
+
     def __init__(self, events: list[tuple]) -> None:
         self.events = events
 
