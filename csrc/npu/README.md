@@ -167,19 +167,27 @@ from afd_plugin.compat.npu import ensure_afd_ascend_ops_loaded
 ensure_afd_ascend_ops_loaded()
 ```
 
+Prepare native and AFD `ASCEND_CUSTOM_OPP_PATH` vendor entries before launching
+Python when using the layered operators. GE can initialize infer-shape
+registrations while importing native modules; adding the AFD path afterward
+cannot repair that process's missing registration. Preserve the CANN Python
+and library paths from the activated environment. The
+[standalone guide](../../docs/npu/STANDALONE_FFN_SERVICE.md#launch) shows the
+paired vendor setup.
+
 ## Current Scope
 
-A2E/E2A continue to serve the existing CAMP2P connector. The four 910C
-routed-only CAM operators are an experimental native integration and are not
-yet selected by `CAMAsyncAFDConnector`, which retains its external legacy CAM
-interface.
+A2E/E2A continue to serve the existing CAMP2P connector. With Attention-side
+gating, `CAMAsyncAFDConnector` selects the four 910C routed-only CAM operators.
+The standalone FFN entry point reuses this same protocol and connector; see
+[the standalone service guide](../../docs/npu/STANDALONE_FFN_SERVICE.md).
 
 `grouped_matmul_swiglu_quant_v2_layered` is a fused
 grouped-matmul + SiLU + dynamic-quantization CAM operator (A8W8 / A4W4 /
 A8W4-MSD variants) built for `ascend910_93`. It is registered as
 `torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered` (inference + Meta; no
-autograd grad) and is excluded from `ascend950` builds. It is selected by the
-opt-in layered W4A8 executor.
+autograd grad) and is excluded from `ascend950` builds. The Async CAM layered
+W4A8 executor selects it with `AFD_ASYNC_CAM_LAYERED_GMM=1`.
 
 The trailing `swiglu_limit` argument defaults to `0.0` (no clipping). A finite
 positive `L` computes `SiLU(min(gate, L)) * clamp(up, -L, L)` before output

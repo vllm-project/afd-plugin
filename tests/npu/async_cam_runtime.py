@@ -296,16 +296,19 @@ def main():
     print(json.dumps({"rank": rank, "stage": "connector_created"}), flush=True)
     if is_ffn:
         runner = AsyncNPUFFNModelRunner(config, device, connector)
-        runner.model = SyntheticModel(
-            device,
-            not args.per_group,
-            args.hidden_size,
-            args.intermediate_size,
-            None if args.weight_seed is None else args.weight_seed + rank * 10000,
-            args.routed_scale,
-            args.quantization,
-            args.swiglu_limit,
-            args.experts_per_rank,
+        runner.attach_model(
+            SyntheticModel(
+                device,
+                not args.per_group,
+                args.hidden_size,
+                args.intermediate_size,
+                None if args.weight_seed is None else args.weight_seed + rank * 10000,
+                args.routed_scale,
+                args.quantization,
+                args.swiglu_limit,
+                args.experts_per_rank,
+            ),
+            parameter_bytes=0,
         )
         print(json.dumps({"rank": rank, "stage": "weights_ready"}), flush=True)
         runner.initialize_afd_connector()
@@ -529,7 +532,7 @@ def main():
             )
             AFDNPUFFNWorker._run_ffn_server_loop(worker)
             report["idle_shutdown"] = "PASS"
-        runner._graph_receiver_exited = True
+        runner.mark_receiver_exited()
 
     def serve():
         nonlocal batch_index, data_replays
