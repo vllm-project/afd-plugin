@@ -31,27 +31,14 @@ def test_existing_cam_configuration_roundtrip(settings):
     assert connector_extra_config_from_source(config) == {
         "dynamicQuant": 1,
         "attn_ranks_per_dp": 4,
-        "ffn_two_stream": False,
     }
 
 
-def test_explicit_native_stream_budgets(settings):
-    settings = replace(
-        settings,
-        full_graph=True,
-        ffn_two_stream=True,
-        ffn_compute_aic_num=20,
-        ffn_compute_aiv_num=40,
-        ffn_combine_aiv_num=8,
-        hccl_buffer_size=256,
-    )
+def test_explicit_native_hccl_budget(settings):
+    settings = replace(settings, hccl_buffer_size=256)
     assert connector_extra_config_from_source(settings.additional_config()) == {
         "dynamicQuant": 1,
         "attn_ranks_per_dp": 4,
-        "ffn_two_stream": True,
-        "ffn_compute_aic_num": 20,
-        "ffn_compute_aiv_num": 40,
-        "ffn_combine_aiv_num": 8,
         "hccl_buffer_size": 256,
     }
 
@@ -72,7 +59,7 @@ def test_explicit_native_stream_budgets(settings):
         {"shutdown_timeout": 0},
         {"shutdown_timeout": float("nan")},
         {"shutdown_timeout": float("inf")},
-        {"ffn_compute_aic_num": 0},
+        {"hccl_buffer_size": 0},
     ],
 )
 def test_invalid_launch_rejected_before_native_runtime(settings, change):

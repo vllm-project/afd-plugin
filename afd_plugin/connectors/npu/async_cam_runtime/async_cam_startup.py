@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -24,18 +23,11 @@ class FFNGraphPlan:
     executor_error: str = ""
     signature: str = ""
     layer_ids: tuple[int, ...] = ()
-    stream_signature: str = ""
-    stream_error: str = ""
 
 
 def resolve_ffn_mode(plans: list[FFNGraphPlan]) -> str:
     if not plans or len({plan.requested for plan in plans}) != 1:
         raise ValueError("All FFN ranks must request the same execution mode")
-    if len({plan.stream_signature for plan in plans}) != 1:
-        raise ValueError("FFN two-stream execution signatures differ across ranks")
-    errors = [plan.stream_error for plan in plans if plan.stream_error]
-    if errors:
-        raise ValueError("Async FFN two-stream is unsupported: " + "; ".join(errors))
     errors = [plan.executor_error for plan in plans if plan.executor_error]
     if errors:
         raise ValueError(
@@ -46,8 +38,6 @@ def resolve_ffn_mode(plans: list[FFNGraphPlan]) -> str:
     if mode not in ("eager", "full"):
         raise ValueError("Unknown Async FFN execution mode")
     execution = "FULL" if mode == "full" else "eager"
-    if mode == "eager" and plans[0].stream_signature:
-        execution = "two-stream"
     if len({plan.signature for plan in plans}) > 1:
         raise ValueError(
             f"Async FFN {execution} is unsupported: "
@@ -70,15 +60,18 @@ class AsyncCAMGraphStartup:
         self.plan = FFNGraphPlan()
         self.mode = "eager"
         self.warmup_layer_id: int | None = None
+        self.session_epoch = 0
         self._store: Store | None = None
         self._prefix = ""
-        self.validate_attention_streams: Callable[[], None] | None = None
+        self._shared_errors = False
 
     def initialize(self, store: Store, transport_signature: str) -> None:
         self._store = store
         if self.world_rank == 0:
             store.set("ffn_graph/nonce", uuid.uuid4().hex)
-        self._prefix = f"ffn_graph/{store.get('ffn_graph/nonce').decode()}/"
+        nonce = store.get("ffn_graph/nonce").decode()
+        self.session_epoch = int(nonce[:15], 16) or 1
+        self._prefix = f"ffn_graph/{nonce}/"
         self._negotiate(
             self.plan if self.world_rank >= self.attn_size else None,
             transport_signature,
@@ -89,10 +82,19 @@ class AsyncCAMGraphStartup:
 
     def _publish(self, stage: str, value: str = "ready") -> None:
         assert self._store is not None
+        if stage == "error":
+            # Publish the shared signal first so new peers still fail if the
+            # compatibility publication below loses its Store connection.
+            self._store.set(f"{self._prefix}error", value)
         self._store.set(f"{self._prefix}{stage}/{self.world_rank}", value)
 
     def check_failure(self) -> None:
         assert self._store is not None
+        signal = f"{self._prefix}error"
+        if self._store.check([signal]):
+            raise RuntimeError(self._store.get(signal).decode())
+        if self._shared_errors:
+            return
         for key in self._keys("error", range(self.world_size)):
             if self._store.check([key]):
                 raise RuntimeError(self._store.get(key).decode())
@@ -126,6 +128,7 @@ class AsyncCAMGraphStartup:
                 json.dumps(
                     {
                         "transport": transport_signature,
+                        "shared_errors": True,
                         "ffn": asdict(plan) if plan else None,
                     }
                 ),
@@ -133,6 +136,10 @@ class AsyncCAMGraphStartup:
             keys = self._keys("plan", range(self.world_size))
             self._wait(keys)
             entries = [json.loads(self._store.get(key)) for key in keys]
+            # Old peers publish only per-rank errors; keep their original check path.
+            self._shared_errors = all(
+                entry.get("shared_errors", False) for entry in entries
+            )
             plans = []
             for entry in entries[self.attn_size :]:
                 fields = entry["ffn"]
@@ -140,20 +147,14 @@ class AsyncCAMGraphStartup:
                 plans.append(FFNGraphPlan(**fields))
             self.mode = resolve_ffn_mode(plans)
             ffn_plan = plans[0]
-            two_stream = bool(ffn_plan.stream_signature)
-            validate_transport = self.mode == "full" or two_stream
+            validate_transport = self.mode == "full" or any(
+                entry["transport"].startswith("pull_v1:") for entry in entries
+            )
             if (
                 validate_transport
                 and len({entry["transport"] for entry in entries}) != 1
             ):
                 raise ValueError("Async CAM graph transport signatures differ")
-            if two_stream:
-                if (
-                    self.world_rank < self.attn_size
-                    and self.validate_attention_streams is not None
-                ):
-                    self.validate_attention_streams()
-                self.phase("streams-validated")
             if self.mode == "full":
                 self.warmup_layer_id = ffn_plan.layer_ids[0]
         except Exception as exc:

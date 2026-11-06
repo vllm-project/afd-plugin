@@ -25,10 +25,6 @@ class FFNConfig:
     max_num_batched_tokens: int = 2048
     max_num_seqs: int = 256
     full_graph: bool = False
-    ffn_two_stream: bool = False
-    ffn_compute_aic_num: int | None = None
-    ffn_compute_aiv_num: int | None = None
-    ffn_combine_aiv_num: int | None = None
     hccl_buffer_size: int | None = None
     shutdown_timeout: float = 5.0
 
@@ -57,29 +53,16 @@ class FFNConfig:
         )
         if self.device < 0:
             raise ValueError("invalid local NPU device")
-        optional_positive = (
-            self.ffn_compute_aic_num,
-            self.ffn_compute_aiv_num,
-            self.ffn_combine_aiv_num,
-            self.hccl_buffer_size,
-        )
-        if any(value is not None and value <= 0 for value in optional_positive):
-            raise ValueError("explicit CAM core and HCCL budgets must be positive")
+        if self.hccl_buffer_size is not None and self.hccl_buffer_size <= 0:
+            raise ValueError("explicit CAM HCCL buffer size must be positive")
 
     def additional_config(self) -> dict:
         extra = {
             "dynamicQuant": 1,
             "attn_ranks_per_dp": self.attention_tp,
-            "ffn_two_stream": self.ffn_two_stream,
         }
-        for name, value in (
-            ("ffn_compute_aic_num", self.ffn_compute_aic_num),
-            ("ffn_compute_aiv_num", self.ffn_compute_aiv_num),
-            ("ffn_combine_aiv_num", self.ffn_combine_aiv_num),
-            ("hccl_buffer_size", self.hccl_buffer_size),
-        ):
-            if value is not None:
-                extra[name] = value
+        if self.hccl_buffer_size is not None:
+            extra["hccl_buffer_size"] = self.hccl_buffer_size
         return {
             "afd": {
                 "connector": AFD_ASYNC_CONNECTOR,

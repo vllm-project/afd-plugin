@@ -113,6 +113,12 @@ Mark early findings as preliminary and continue. This is not a GitHub comment.
   blocks the verdict. Start with the first error, not the last cascade.
 - Treat the PR body as navigation. Commands, benchmark tables, and claimed tests
   become evidence only after their provenance and relevance are checked.
+- Check what the pipeline actually selects before trusting a green run.
+  `.buildkite/common/scripts/skip_ci.py` suppresses the whole default pipeline
+  when every changed path is docs (`docs/**`, any `*.md`, `mkdocs.yml`) or a
+  pytest skip-mark-only test edit. On such a diff, "CI passed" is not evidence
+  about the code. Label-only CI files gate per platform and level; there is no
+  `.buildkite/npu/` pipeline yet.
 
 ## Run bounded validation
 
@@ -129,14 +135,24 @@ paths have supported findings or explicit no-issue conclusions:
 1. Import preflight on a trusted head: `python -c "import afd_plugin"` and the
    changed modules import without torch/torch_npu present.
 2. Narrowest unit tests for the changed area, CPU-safe by default:
-   `pytest tests/unit/<area> -m "not gpu and not vllm_runtime"`.
-3. Targeted GPU-gated tests only when a GPU and a trusted head exist.
+   `pytest tests/unit/<area> -m "not gpu and not vllm_runtime"`. Mirror the CI
+   selection when the change is broad:
+   `pytest -m "not gpu and not vllm_runtime" tests/unit tests/npu/test_async_cam_harness.py tests/npu/test_async_cam_performance.py tests/npu/test_async_cam_golden.py tests/npu/test_gmm_layered_performance.py`.
+3. Targeted device tests only when the device and a trusted head exist:
+   `pytest tests/gpu/test_attention_routing.py` on CUDA (this one runs in CI),
+   `tests/gpu/test_deepep_m2n_gpu.py` on SM90+ with afdEP-comm and DeepGEMM
+   installed, and the `tests/npu/` device suites on Ascend.
 4. E2E gate scenarios only through the `run-e2e` skill, only when the review
    genuinely needs active evidence and devices are free; otherwise request
-   author evidence.
+   author evidence. Gate cases must never be turned into skips to make a run
+   pass.
 5. NPU paths have no in-repo CI. Require author-provided evidence per
    `docs/npu/TESTING.md`, or a manually executed run the user explicitly asks
    for. Never simulate device evidence.
+6. When a pin moves, verify the coherent set: `TARGET_VLLM_VERSION` in
+   `afd_plugin/compat/vllm.py`, the `vllm` extra in `pyproject.toml`,
+   `VLLM_BASE_TAG` and its assertion in `docker/Dockerfile.ci`, `README.md`,
+   and every design page's `upstream_refs`.
 
 ## Deliver maintainer-style findings
 

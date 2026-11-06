@@ -400,9 +400,18 @@ SIGTERM/SIGINT cancels pending HTTP operations before service cleanup, without
 waiting for the request timeout. It does **not** run GSM8K or establish general
 model accuracy.
 Service liveness and owned-process cleanup are also required to pass.
-This 16-NPU case allows 60 seconds for service shutdown before escalation;
+NPU async CAM cases allow 60 seconds for each vLLM worker, 90 seconds for the
+service, and 120 seconds for the test runner to shut down. Equivalent external
+launchers should set `VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS=60` and pass
+`--shutdown-timeout 90` to both services; a service timeout alone does not
+change the worker deadline. Explicit worker environment overrides are retained.
 Attention SIGKILL escalation remains a failure. FFN uses the existing scoped
 async CAM cleanup exception.
+
+vLLM 0.32 can log `AsyncLLM`'s `EngineDeadError` after an API client starts
+its own shutdown. Record this as an upstream advisory only after inference
+succeeds, every worker group exits gracefully, and process exit codes and
+cleanup checks pass. An inference-time error or forced worker exit still fails.
 
 ```bash
 export AFD_E2E_BACKEND=npu

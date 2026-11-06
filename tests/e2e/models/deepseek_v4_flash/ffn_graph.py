@@ -71,6 +71,7 @@ def profile(args) -> SimpleNamespace:
             json.dumps(
                 {
                     "dynamicQuant": 1,
+                    "ffn_mega_moe": args.mega,
                     "attn_ranks_per_dp": 4,
                     "hccl_buffer_size": 256,
                 }
@@ -332,6 +333,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", required=True, choices=("eager", "full"))
     parser.add_argument("--model", required=True)
+    parser.add_argument("--mega", action="store_true")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--reference-dir", type=Path)
     parser.add_argument("--vllm-bin", default="vllm")

@@ -4,7 +4,7 @@
 
 This finite functional check uses the original checkpoint on F and every main
 MoE layer. It has no Attention model, KV cache, HTTP inference or performance
-claim. Run an eager F service first with --output, then FULL/two-stream F with
+claim. Run an eager F service first with --output, then FULL F with
 --reference pointing to that output. Terminate the whole paired deployment
 after this client: the production service has no EOS or cancellable DR.
 """
