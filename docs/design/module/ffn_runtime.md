@@ -97,6 +97,12 @@ a vLLM Worker, upstream ModelRunner, EngineCore, scheduler or KV cache.
 Attention retains its existing model, connector and DBO path. Configuration,
 parameter loading and quantization remain vLLM/vLLM-Ascend dependencies.
 
+The standalone Ascend CLI reuses vLLM engine argument definitions, parsing and
+configuration construction. Existing AFD options remain in `additional_config`;
+only host management and shutdown options are standalone-specific. The host
+entry delegates parser creation to its selected platform, so CPU-only service
+and host-loop imports remain independent of vLLM.
+
 The CPU-only host `FFNModelRunner` accepts an `FFNBackend` factory, retains
 the backend before preparation, and owns the receiving thread and failure
 boundary. `FFNService` manages host status and stop requests. Platform options

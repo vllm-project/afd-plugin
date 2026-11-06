@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""CPU-only Ascend/V4 launch adaptation; native imports happen on preparation."""
+"""Ascend/V4 CLI adaptation; importing this module remains CPU-only."""
 
 from __future__ import annotations
 
 import os
 from argparse import ArgumentParser, Namespace
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.ffn_faas.interfaces import FFNLaunch
 from afd_plugin.ffn_faas.platforms.npu import get_model
 from afd_plugin.ffn_faas.platforms.npu.settings import FFNConfig
@@ -18,31 +20,39 @@ if TYPE_CHECKING:
     from afd_plugin.ffn_faas.platforms.npu.model import CAMRoutedModel
 
 
-def create_backend(model: CAMRoutedModel, settings: FFNConfig) -> FFNBackend:
+def create_backend(
+    model: CAMRoutedModel, settings: FFNConfig, args: Namespace
+) -> FFNBackend:
     from vllm_ascend.utils import bootstrap_custom_op_env
 
     bootstrap_custom_op_env()
     from afd_plugin.ffn_faas.platforms.npu.backend import CAMFFNBackend
 
-    return CAMFFNBackend(model, settings)
+    return CAMFFNBackend(model, settings, args)
 
 
 class AscendCAMAdapter:
     """Keep model, quantization, topology and device options out of the host loop."""
 
-    def add_arguments(self, parser: ArgumentParser) -> None:
-        parser.add_argument("--host", default="127.0.0.1")
-        parser.add_argument("--port", type=int, default=29600)
-        parser.add_argument("--attention-ranks", type=int, required=True)
-        parser.add_argument("--attention-tp", type=int, required=True)
-        parser.add_argument("--ffn-ranks", type=int, required=True)
-        parser.add_argument("--devices", help="allocated logical NPU IDs on this node")
-        parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
-        parser.add_argument("--max-num-seqs", type=int, default=256)
-        parser.add_argument("--full-graph", action="store_true")
-        parser.add_argument("--hccl-buffer-size", type=int)
+    def create_parser(self) -> ArgumentParser:
+        # Selected-platform imports: the Service/host entry stays CPU-only.
+        from vllm.engine.arg_utils import EngineArgs
+        from vllm.plugins import load_general_plugins
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+        load_general_plugins()
+        parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+        # This process is already launched by torchrun, not a vLLM executor.
+        parser.set_defaults(distributed_executor_backend="external_launcher")
+        return parser
 
     def configure(self, args: Namespace) -> FFNLaunch:
+        if args.model_tag is not None:
+            # Match vLLM serve's positional-model precedence.
+            args.model = args.model_tag
+        afd = parse_afd_config(args.additional_config, expected_role="ffn")
+        if afd.connector != AFD_ASYNC_CONNECTOR:
+            raise ValueError("standalone Ascend FFN requires CAMAsyncAFDConnector")
         rank, local_rank, world = (
             int(os.environ.get(key, default))
             for key, default in (
@@ -51,47 +61,30 @@ class AscendCAMAdapter:
                 ("WORLD_SIZE", "1"),
             )
         )
-        if world != args.ffn_ranks:
-            raise ValueError("F-only launcher WORLD_SIZE must equal --ffn-ranks")
-        local_world = int(os.environ.get("LOCAL_WORLD_SIZE", str(world)))
-        devices = (
-            tuple(map(int, args.devices.split(",")))
-            if args.devices
-            else tuple(range(local_world))
-        )
-        if (
-            not 0 <= local_rank < len(devices)
-            or len(set(devices)) != len(devices)
-            or min(devices) < 0
-        ):
-            raise ValueError("--devices must supply distinct local NPU IDs")
-        if os.environ.get("VLLM_USE_V2_MODEL_RUNNER") != "1":
-            raise ValueError("set VLLM_USE_V2_MODEL_RUNNER=1 on both A and F")
-        if os.environ.get("AFD_ASYNC_CAM_LAYERED_GMM") != "1":
-            raise ValueError("standalone V4 requires AFD_ASYNC_CAM_LAYERED_GMM=1")
+        if world != afd.num_ffn_ranks or world != args.data_parallel_size:
+            raise ValueError(
+                "F-only WORLD_SIZE, --data-parallel-size and "
+                "additional_config.afd.num_ffn_ranks must agree"
+            )
+        if args.data_parallel_rank is not None and args.data_parallel_rank != rank:
+            raise ValueError("--data-parallel-rank must match the F-only launcher RANK")
+        args.data_parallel_rank = rank
+        if args.distributed_executor_backend != "external_launcher":
+            raise ValueError("standalone FFN requires the external_launcher backend")
         settings = FFNConfig(
-            model=args.model,
-            attention_ranks=args.attention_ranks,
-            attention_tp=args.attention_tp,
-            ffn_ranks=args.ffn_ranks,
+            model=Path(args.model),
+            ffn_ranks=world,
             rank=rank,
             local_rank=local_rank,
-            device=devices[local_rank],
-            host=args.host,
-            port=args.port,
-            max_num_batched_tokens=args.max_num_batched_tokens,
-            max_num_seqs=args.max_num_seqs,
-            full_graph=args.full_graph,
-            hccl_buffer_size=args.hccl_buffer_size,
-            shutdown_timeout=args.shutdown_timeout,
+            shutdown_timeout=args.receiver_shutdown_timeout,
         )
-        model = get_model(args.model, settings.ffn_ranks, settings.rank)
+        model = get_model(settings.model, settings.ffn_ranks, settings.rank)
         return FFNLaunch(
             rank=rank,
             local_rank=local_rank,
             model_path=str(model.root),
             backend_name="CAMAsyncAFDConnector",
             shutdown_timeout=settings.shutdown_timeout,
-            backend_factory=partial(create_backend, model, settings),
+            backend_factory=partial(create_backend, model, settings, args),
             initial_status={"cam_paired": False},
         )

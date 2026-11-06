@@ -47,7 +47,7 @@ class AscendFFNEnvironment:
             raise RuntimeError("Ascend FFN expert group has not been initialized")
         return self._ep_group
 
-    def initialize_device(self) -> None:
+    def initialize_device(self, config: VllmConfig) -> None:
         if self._groups_owned or self._device is not None:
             raise RuntimeError("Ascend FFN environment is already initialized")
         settings = self.settings
@@ -65,6 +65,8 @@ class AscendFFNEnvironment:
         import torch
         import torch_npu  # noqa: F401
         from vllm.distributed.parallel_state import model_parallel_is_initialized
+        from vllm.platforms import current_platform
+        from vllm.platforms.interface import set_assigned_physical_gpu_ids
         from vllm_ascend.utils import enable_custom_op
 
         from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
@@ -72,8 +74,17 @@ class AscendFFNEnvironment:
         if torch.distributed.is_initialized() or model_parallel_is_initialized():
             raise RuntimeError("Ascend FFN cannot borrow existing native groups")
         ensure_cam_async_ops_available()
-        torch.npu.set_device(settings.device)
-        self._device = torch.device(f"npu:{settings.device}")
+        # Reuse the native Worker's mapping for --device-ids and visibility.
+        assigned = config.parallel_config.assigned_physical_gpu_ids
+        if assigned is not None:
+            if settings.local_rank >= len(assigned):
+                raise ValueError("LOCAL_RANK is outside the assigned device list")
+            set_assigned_physical_gpu_ids(assigned)
+        index = current_platform.logical_device_id_to_visible_device_id(
+            settings.local_rank
+        )
+        self._device = torch.device(f"npu:{index}")
+        torch.npu.set_device(self._device)
         # Native NPUModelRunner v1 installs this packing policy at import time.
         # This service does not import that runner; native W4A8 still needs NZ.
         torch.npu.config.allow_internal_format = True
@@ -110,7 +121,7 @@ class AscendFFNEnvironment:
             init_distributed_environment(
                 world_size=settings.ffn_ranks,
                 rank=settings.rank,
-                local_rank=settings.device,
+                local_rank=self.device.index,
                 distributed_init_method="env://",
                 backend="hccl",
                 timeout=timedelta(seconds=COMPUTE_GROUP_TIMEOUT_SECONDS),
@@ -151,7 +162,7 @@ class AscendFFNEnvironment:
             bind_cpus(
                 self.settings.local_rank,
                 npu_id=current_platform.device_id_to_physical_device_id(
-                    self.settings.device
+                    self.settings.local_rank
                 ),
                 migrate_memory=not (engram is not None and engram.cpu_offload),
             )

@@ -8,12 +8,17 @@ No Worker, upstream ModelRunner, EngineCore, scheduler or KV cache is constructe
 
 from __future__ import annotations
 
+from argparse import Namespace
+
 import torch
 import torch_npu  # noqa: F401
 from vllm.config import set_current_vllm_config
 from vllm.engine.arg_utils import EngineArgs
 
-from afd_plugin.compat.npu import fix_all2all_backend_for_afd
+from afd_plugin.compat.npu import (
+    fail_if_unsupported_npu_afd_features,
+    fix_all2all_backend_for_afd,
+)
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
 from afd_plugin.ffn_faas.platforms.npu.environment import AscendFFNEnvironment
@@ -21,45 +26,35 @@ from afd_plugin.ffn_faas.platforms.npu.model import CAMRoutedModel
 from afd_plugin.ffn_faas.platforms.npu.settings import FFNConfig
 from afd_plugin.ffn_faas.service import FFNService, ServicePhase
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
+from afd_plugin.validation import validate_npu_model_runner_v2_config
 
 
 class CAMFFNBackend:
     """Keep weights and communication owners until receiver exit is proven."""
 
-    def __init__(self, model: CAMRoutedModel, settings: FFNConfig) -> None:
+    def __init__(
+        self, model: CAMRoutedModel, settings: FFNConfig, args: Namespace
+    ) -> None:
         self.settings = settings
+        self.args = args
         self.environment = AscendFFNEnvironment(settings)
         self.model = model
         self.runtime: AsyncNPUFFNModelRunner | None = None
         self.connector: CAMAsyncAFDConnector | None = None
 
     def prepare(self, service: FFNService) -> None:
-        self.environment.initialize_device()
-        args = EngineArgs(
-            model=str(self.settings.model),
-            trust_remote_code=True,
-            dtype="bfloat16",
-            quantization="ascend",
-            enforce_eager=not self.settings.full_graph,
-            compilation_config={"cudagraph_mode": "FULL"}
-            if self.settings.full_graph
-            else {},
-            tensor_parallel_size=1,
-            data_parallel_size=self.settings.ffn_ranks,
-            data_parallel_rank=self.settings.rank,
-            enable_expert_parallel=True,
-            distributed_executor_backend="external_launcher",
-            # F owns a dispatch envelope, not a request-context/KV capacity.
-            max_model_len=self.settings.max_num_batched_tokens,
-            max_num_batched_tokens=self.settings.max_num_batched_tokens,
-            max_num_seqs=self.settings.max_num_seqs,
-            additional_config=self.settings.additional_config(),
-        )
+        args = EngineArgs.from_cli_args(self.args)
         config = args.create_engine_config()
-        # Platform configuration can choose an executor for ordinary Workers;
-        # this loader belongs to the already launched F-only torchrun world.
+        # Keep the externally launched F-only ownership after platform defaults.
         config.parallel_config.distributed_executor_backend = "external_launcher"
         fix_all2all_backend_for_afd(config)
+        validate_npu_model_runner_v2_config(
+            config, expected_role="ffn", device_type="npu"
+        )
+        fail_if_unsupported_npu_afd_features(config)
+        if config.speculative_config is not None:
+            raise ValueError("standalone V4 loads main-model routed layers only")
+        self.environment.initialize_device(config)
         self.environment.initialize_compute(config)
         with set_current_vllm_config(config):
             self.model.load(
@@ -72,7 +67,7 @@ class CAMFFNBackend:
             )
             self.connector = CAMAsyncAFDConnector(
                 rank=self.settings.rank,
-                local_rank=self.settings.device,
+                local_rank=self.environment.device.index,
                 vllm_config=config,
                 afd_config=parse_afd_config(config, expected_role="ffn"),
                 role_rank=self.settings.rank,
