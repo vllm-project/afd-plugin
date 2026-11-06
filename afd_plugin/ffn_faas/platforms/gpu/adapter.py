@@ -9,7 +9,6 @@ allocates nothing. Native imports happen in the backend factory.
 
 from __future__ import annotations
 
-import os
 from argparse import ArgumentParser, Namespace
 from functools import partial
 from typing import TYPE_CHECKING
@@ -24,11 +23,13 @@ from afd_plugin.ffn_faas.platforms.gpu.settings import (
     GPUFFNConfig,
     parse_connector_extra_config,
 )
+from afd_plugin.ffn_faas.platforms.launch import (
+    read_ffn_launcher_environment,
+    require_v2_model_runner,
+)
 
 if TYPE_CHECKING:
     from afd_plugin.ffn_faas.interfaces import FFNBackend
-
-V2_MODEL_RUNNER_ENV = "VLLM_USE_V2_MODEL_RUNNER"
 
 
 # NPU parallel: afd_plugin/ffn_faas/platforms/npu/adapter.py::create_backend
@@ -50,11 +51,9 @@ def create_backend(
 
 
 # NPU parallel: afd_plugin/ffn_faas/platforms/npu/adapter.py::AscendCAMAdapter.
-# Reuse: PARTIAL - the RANK/LOCAL_RANK/WORLD_SIZE parsing, the WORLD_SIZE ==
-#   --ffn-ranks check and the ModelRunnerV2 environment check are the same;
-#   the option set differs because GPU adopts Attention TP, capacity and the
-#   bucket ladder from the M2N handshake.
-#   REFACTOR-CANDIDATE(R2): a shared F-only launcher-environment reader.
+# Reuse: YES - the shared launch module owns the F-only torchrun and
+#   ModelRunnerV2 checks. The option set still differs because GPU adopts
+#   Attention TP, capacity and the bucket ladder from the M2N handshake.
 class GPUDeepEPM2NAdapter:
     """Keep GPU, topology and connector options out of the host loop."""
 
@@ -106,24 +105,14 @@ class GPUDeepEPM2NAdapter:
         experts divide across the F ranks. Raises ``ValueError`` or
         ``OSError``, which the entry point reports as a usage error.
         """
-        rank, local_rank, world = (
-            int(os.environ.get(key, default))
-            for key, default in (
-                ("RANK", "0"),
-                ("LOCAL_RANK", "0"),
-                ("WORLD_SIZE", "1"),
-            )
-        )
-        if world != args.ffn_ranks:
-            raise ValueError("F-only launcher WORLD_SIZE must equal --ffn-ranks")
-        if os.environ.get(V2_MODEL_RUNNER_ENV) != "1":
-            raise ValueError(f"set {V2_MODEL_RUNNER_ENV}=1 on both A and F")
+        launcher = read_ffn_launcher_environment(args.ffn_ranks)
+        require_v2_model_runner()
         settings = GPUFFNConfig(
             model=args.model,
             attention_ranks=args.attention_ranks,
             ffn_ranks=args.ffn_ranks,
-            rank=rank,
-            local_rank=local_rank,
+            rank=launcher.rank,
+            local_rank=launcher.local_rank,
             host=args.host,
             port=args.port,
             graph=args.graph,
@@ -137,8 +126,8 @@ class GPUDeepEPM2NAdapter:
         checkpoint = Qwen3CheckpointDescription.read(args.model)
         checkpoint.local_experts(settings.ffn_ranks)
         return FFNLaunch(
-            rank=rank,
-            local_rank=local_rank,
+            rank=launcher.rank,
+            local_rank=launcher.local_rank,
             model_path=str(checkpoint.root),
             backend_name=DEEPEP_M2N_CONNECTOR,
             shutdown_timeout=settings.shutdown_timeout,
