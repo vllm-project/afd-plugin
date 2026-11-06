@@ -137,7 +137,7 @@ must be placed under `connector_extra_config`.
 | `host`, `port` | `127.0.0.1`, `1239` | Connector rendezvous/control endpoint inputs. |
 | `afd_process_group_timeout_s` | `120` | Positive AFD process-group rendezvous timeout in seconds; also bounds the NPU native DBO startup barrier. It is not a device-kernel cancellation deadline. |
 | `num_attention_ranks`, `num_ffn_ranks` | `1`, `1` | AFD role-group sizes used by topology construction. |
-| `compute_gate_on_attention` | `false` | Moves supported gate/MoE routing work to Attention. CUDA supports both gate placements at the remote-experts boundary; synchronous CAMP2P still requires `false`, while CAM async requires `true`. |
+| `compute_gate_on_attention` | `false` | Moves supported gate/MoE routing work to Attention. CUDA supports both gate placements at the remote-experts boundary; synchronous CAMP2P also supports both, where `true` requires DeepSeek-V4 at TP=1 without DBO or ubatching; CAM async requires `true`. |
 | `connector_extra_config` | `{}` | Envelope key parsed by the selected connector into a typed `ConnectorExtraInfo`; it is not stored on `AFDConfig`. |
 
 The compatibility aliases `afd_connector`, `afd_role`, `afd_port`, `afd_host`,

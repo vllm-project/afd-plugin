@@ -212,13 +212,13 @@ def validate_npu_model_runner_v2_config(
                     "on Attention"
                 )
             requested_ffn_mode(vllm_config)
-    elif (
-        afd_config.connector != CAMP2P_CONNECTOR or afd_config.compute_gate_on_attention
-    ):
+    elif afd_config.connector != CAMP2P_CONNECTOR:
         raise RuntimeError(
-            "AFD NPU ModelRunnerV2 requires synchronous CAMP2pAFDConnector "
-            "with compute_gate_on_attention=false, or Async CAM",
+            "AFD NPU ModelRunnerV2 requires either synchronous CAMP2pAFDConnector "
+            "or Async CAM",
         )
+    # The sync Attention-side gate limits (connector, target, TP, DBO/ubatching)
+    # live in feature_validation and run from both workers before this point.
 
     parallel = vllm_config.parallel_config
     if (

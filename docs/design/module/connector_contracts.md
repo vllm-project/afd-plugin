@@ -67,7 +67,7 @@ depend on role worker implementations.
 | Payloads and control-plane codec | [`metadata.py`](../../../afd_plugin/connectors/metadata.py) | Connector unit tests and [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
 | CUDA P2P | [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py), [`topology.py`](../../../afd_plugin/distributed/topology.py) | [`test_p2p_connector.py`](../../../tests/unit/connectors/test_p2p_connector.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) |
 | CUDA DeepEP M2N | [`gpu/deepep_m2n/`](../../../afd_plugin/connectors/gpu/deepep_m2n/), `AFDRoutedExpertsConnector` in [`base.py`](../../../afd_plugin/connectors/base.py) | [`test_deepep_m2n_connector.py`](../../../tests/unit/connectors/test_deepep_m2n_connector.py), [GPU device tests](../../../tests/gpu/README.md), [Qwen3 MoE E2E](../../../tests/e2e/models/qwen3_moe/test_qwen3_moe.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) (`test_deepseek_v2_lite_deepep_m2n`) |
-| Ascend CAMP2P | [`npu/camp2p.py`](../../../afd_plugin/connectors/npu/camp2p.py) | [`test_camp2p_connector.py`](../../../tests/unit/connectors/test_camp2p_connector.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) |
+| Ascend CAMP2P | [`npu/camp2p/__init__.py`](../../../afd_plugin/connectors/npu/camp2p/__init__.py) | [`test_camp2p_connector.py`](../../../tests/unit/connectors/test_camp2p_connector.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) |
 | Ascend CAM async | [`npu/async_cam.py`](../../../afd_plugin/connectors/npu/async_cam.py), [`Push/Pull sessions`](../../../afd_plugin/connectors/npu/async_cam_runtime/async_cam_session.py) | [Connector unit tests](../../../tests/unit/connectors/test_async_cam_connector.py), [CAM host contracts](../../../tests/unit/connectors/npu/test_async_cam.py), [fused routing device test](../../../tests/npu/test_async_cam_connector.py), [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py) |
 | Process-group construction | [`afd_process_group.py`](../../../afd_plugin/distributed/afd_process_group.py) | Connector initialization tests plus platform E2E paths |
 
@@ -113,10 +113,12 @@ environment rather than querying the allocated domain.
 
 The common `compute_gate_on_attention` field remains on `AFDConfig` and is the
 model-routing selector. CUDA P2P supports both values; DeepEP M2N requires
-`true`. CAMP2P also parses a
-connector-local field with that name for its operator contract, but the current
-synchronous NPU runtime requires both common and connector-local values to be
-`false`. CAM async requires the common field to be `true`.
+`true`. CAMP2P also parses a connector-local field with that name, retained for
+backwards compatibility with older configurations and ignored for routing: the
+synchronous NPU runtime selects Attention-side routing from the common field, so
+deployments leave the connector-local copy unset. The supported synchronous
+shape is `true` on both roles for DeepSeek-V4 at TP=1 with no DBO or ubatching.
+CAM async requires the common field to be `true`.
 
 ## Current connector modes
 
