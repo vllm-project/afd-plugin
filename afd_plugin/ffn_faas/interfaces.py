@@ -21,7 +21,24 @@ class FFNBackend(Protocol):
 
     def start_receiver(self) -> None: ...
 
-    def execute_step(self) -> None: ...
+    def execute_step(self) -> bool:
+        """Run one connector-driven step on the receiver thread.
+
+        Returns ``True`` after a completed step. Returns ``False`` only when a
+        ``cancel_receive()`` request ended an idle receive, so the host loop
+        exits cleanly; every other failure raises.
+        """
+        ...
+
+    def cancel_receive(self) -> None:
+        """Unblock an idle receive after a host stop request.
+
+        Called on the host thread while the receiver thread may be blocked in
+        ``execute_step()``. A backend that cannot cancel a pending receive
+        implements this as a no-op; the host then reports the pending receive
+        and retains every owner.
+        """
+        ...
 
     def receiver_exited(self) -> None: ...
 

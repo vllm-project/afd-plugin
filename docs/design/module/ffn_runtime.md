@@ -28,6 +28,7 @@ depends_on:
   - "compatibility_and_patches.md"
 validation_paths:
   - "tests/unit/ffn_faas/test_*.py"
+  - "tests/gpu/test_ffn_faas_gpu.py"
   - "tests/unit/model_executor/test_async_cam_layered.py"
   - "tests/npu/test_async_cam_layered_w8a8.py"
   - "tests/unit/v1/worker/test_ffn_metadata.py"
@@ -62,7 +63,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-10-26
+last_reviewed: 2026-11-05
 ---
 
 # FFN runtime
@@ -134,10 +135,44 @@ native work retains all owners until whole-pair process isolation. A host
 See the [standalone service guide](../../npu/STANDALONE_FFN_SERVICE.md) for
 supported configuration, launch and shutdown behavior.
 
+CUDA routed-experts models over `DeepEPM2NAFDConnector` have a GPU standalone
+F, `--backend gpu-deepep-m2n`, under `ffn_faas/platforms/gpu/`:
+
+- `GPUDeepEPM2NAdapter` and `GPUFFNConfig` are CPU-only: launcher world,
+  ModelRunnerV2 environment, connector JSON structure and lane parity with
+  `--dbo` are checked before any device work. The adapter resolves the model
+  path but does not parse or name a model family.
+- `GPUFFNEnvironment` selects the GPU, preflights afdEP and DeepGEMM, builds
+  the F-only `VllmConfig` (`external_launcher`, DP = F ranks, TP 1, EP), selects
+  the FFN-only routed-experts architecture, pins vLLM's MoE backend to Triton
+  before any FusedMoE is built, and creates the F-only world through vLLM's
+  `init_worker_distributed_environment`.
+- The AFD model registry selects the FFN-only shell for the configured model.
+  For example, `AFDQwen3MoeRoutedExperts` keeps only `model.layers.<i>.mlp`
+  (native `Qwen3MoeSparseMoeBlock`) and loads through vLLM's
+  `DefaultModelLoader`, so the EP weight filter, FusedMoE expert loading and
+  strict loaded-weights check run unchanged; the embedding, final norm and LM
+  head are not allocated.
+- `DeepEPM2NFFNBackend` constructs `GPUFFNRoutedExpertsModelRunner`, loads the
+  shell through that runner, starts the connector, and delegates each step to
+  `execute_connector_driven_step()`, the method the Worker loop also calls.
+  CUDA graphs are captured lazily from Attention's payloads, as on the Worker
+  path, so `/ready` means paired and receiving.
+
+`FFNBackend.execute_step()` returns `False` only when `cancel_receive()` ended
+an idle receive; the host calls `cancel_receive()` after a stop request and
+before joining the receiver. The GPU backend closes the M2N control plane
+(aborting its own NCCL group); the NPU backend's `cancel_receive()` is a no-op.
+Releasing DeepEP lanes is a barrier over every M2N rank, so a stopped GPU F
+completes its release when Attention shuts down too. See the
+[GPU standalone service guide](../../gpu/STANDALONE_FFN_SERVICE.md).
+
 | Platform | Worker | Model runner | Current connectors |
 | --- | --- | --- | --- |
 | CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `GPUFFNModelRunner` | `P2pNcclAFDConnector` |
 | CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `GPUFFNRoutedExpertsModelRunner` | `DeepEPM2NAFDConnector` (any `AFDRoutedExpertsConnector`) |
+| CUDA standalone (`ffn_faas`, no Worker) | `DeepEPM2NFFNBackend` | `GPUFFNRoutedExpertsModelRunner` | `DeepEPM2NAFDConnector` |
+| NPU standalone (`ffn_faas`, no Worker) | `CAMFFNBackend` | `AsyncNPUFFNModelRunner` | `CAMAsyncAFDConnector` |
 | NPU | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | `AFDNPUFFNModelRunner` (sync) or `AsyncNPUFFNModelRunner` | `CAMP2pAFDConnector`, `CAMAsyncAFDConnector` |
 
 GPU and NPU FFN runners are independent, connector-driven owners. The CUDA
@@ -274,6 +309,11 @@ daemon thread:
   -> synchronize the current accelerator
   -> repeat
 ```
+
+On CUDA, one iteration is `GPUFFNModelRunner.execute_connector_driven_step()`,
+shared by `AFDFFNWorker` and the standalone GPU FFN backend. It returns
+`False` only for a receive cancelled by a requested stop; a closed control
+plane without a stop request, and every other failure, raises.
 
 ### Connector-driven loop
 

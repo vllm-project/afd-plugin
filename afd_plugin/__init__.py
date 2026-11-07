@@ -125,6 +125,9 @@ _QWEN_MODEL_REGISTRATIONS = {
     "Qwen3MoeForCausalLM": (
         "afd_plugin.model_executor.models.qwen3_moe:AFDQwen3MoeForCausalLM"
     ),
+    "Qwen3MoeRoutedExperts": (
+        "afd_plugin.model_executor.models.qwen3_moe:AFDQwen3MoeRoutedExperts"
+    ),
 }
 
 _QWEN3_5_MODEL_REGISTRATIONS = MappingProxyType(
