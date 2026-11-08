@@ -101,7 +101,7 @@ The connector needs three components in addition to the plugin and vLLM:
    ```bash
    python -m pip uninstall -y afdep
    python -m pip install --no-deps \
-     "afdep-comm @ git+https://github.com/afdEP/afdEP-comm.git@<commit pinned in pyproject.toml>"
+     "afdep-comm @ git+https://github.com/afdEP/afdEP-comm.git@<tag pinned in pyproject.toml>"
    python -m afdep doctor --build
    ```
 

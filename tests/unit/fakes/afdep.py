@@ -14,7 +14,7 @@ from importlib.util import find_spec
 from types import ModuleType
 
 # Keyword-only parameters of afdep.deepep.ElasticBuffer at the pinned afdEP-comm
-# (afdEP/afdEP-comm fdff967). The stand-in requires the required ones and
+# (afdEP/afdEP-comm v1.1.0). The stand-in requires the required ones and
 # rejects any other keyword, so a lane built with arguments the real transport
 # would refuse fails here as it would on a GPU.
 ELASTIC_BUFFER_REQUIRED = (
