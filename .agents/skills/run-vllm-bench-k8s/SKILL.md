@@ -54,6 +54,12 @@ Follow **`deploy-afd-k8s`** with `RECIPE_SCRIPT_PATH`. It returns
 recipe's attention `--port` (default 18305). `GPU_COUNT` is one number for a
 plain recipe and a per-role value when the plan spans pods.
 
+If `deploy-afd-k8s` reports a leftover deployment from the earlier
+Pod-based version of that skill, it needs the caller's consent before
+deleting it (it may be serving, and deleting it stops the endpoint until the
+new pods are ready) -- surface that question and wait for the answer instead
+of deciding for the user.
+
 Carry `DEPLOY_NAME`, `NAMESPACE`, and `CLIENT_PORT` into every later step:
 the endpoint name and port belong to the deployment, so a hard-coded
 `vllm-service:18305` only works while both defaults happen to match.

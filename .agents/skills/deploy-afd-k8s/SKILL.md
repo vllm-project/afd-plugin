@@ -22,6 +22,16 @@ On success this skill guarantees, in the target namespace:
 | Model cache | `PVC_NAME`, mounted at `/models`, `HF_HOME=/models/.hf_home` |
 | Left running | yes, deliberately -- so weights stay warm for follow-up runs; step 5 asks the caller when to delete the pods |
 
+Migration: a deployment created by the earlier, Pod-based version of this
+skill carries **no** `afd-deployment` label (fixed `vllm-pod*` names,
+selector-based `vllm-*-service` names, ConfigMap `afd-recipe-script`), so no
+labeled step sees it -- yet it collides with this one on pod names (a split
+role's `vllm-pod-attention-0` is the very name the new StatefulSet wants),
+on GPUs and the `RWO` model volume, and on Service names with a different
+`spec.type`. Steps 3b-3c detect it by the missing label, get explicit
+consent, and remove it before the endpoint is switched (step 4d); never
+deploy on top of it.
+
 Recovery scope: a crashed pod's container restarts and a deleted pod is
 recreated automatically, and a role-per-pod deployment (each role on its
 own pod) recovers from a peer-pod crash with no operator action. A
@@ -100,7 +110,7 @@ exist **before** any Pod is deployed -- see
 | Resource | Covers |
 |---|---|
 | [resolve-recipe.md](resources/resolve-recipe.md) | Step 1 (the only step that parses the recipe): read the recipe's serve-block fields and model id, record every role's `GPU_COUNT`; read its placement (or lack of one) from its header comment -- never ask. |
-| [deploy.md](resources/deploy.md) | Steps 2-4f: take step 1's `GPU_COUNT`, confirm, PVC, ConfigMap, fsGroup, Services (step 4d -- which of the four, see [services.md](resources/services.md)), StatefulSet(s) via `templates/statefulset.yaml`, wait for Running and then every plan pod's `Ready` condition (not `kubectl rollout status`, see step 4f). |
+| [deploy.md](resources/deploy.md) | Steps 2-4f: take step 1's `GPU_COUNT`, confirm, migrate a legacy Pod-based deployment if one is present (steps 3b-3c -- detect, then delete only with consent), PVC, ConfigMap, fsGroup, Services (step 4d -- which of the four, see [services.md](resources/services.md)), StatefulSet(s) via `templates/statefulset.yaml`, wait for Running and then every plan pod's `Ready` condition (not `kubectl rollout status`, see step 4f). |
 | [report-and-teardown.md](resources/report-and-teardown.md) | Step 5: report the endpoint/model/nodes and ask when to delete the running pods. Step 6: teardown when the caller says so (pods/Services only -- never the PVC unless asked). |
 
 All k8s manifests live in `templates/*.yaml`, applied via `envsubst | kubectl

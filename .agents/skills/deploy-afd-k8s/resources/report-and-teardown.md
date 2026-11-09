@@ -36,6 +36,13 @@ kubectl -n "$NAMESPACE" delete sts -l "afd-deployment=$DEPLOY_NAME"
 kubectl -n "$NAMESPACE" delete svc,configmap -l "afd-deployment=$DEPLOY_NAME"
 ```
 
+These selectors do not reach a deployment created by the earlier,
+Pod-based version of this skill: its objects carry no `afd-deployment`
+label. If deploy.md step 3b reported any of them, say so in the report
+instead of implying the namespace is clean, and remove them only as part of
+a redeploy (step 3c, which requires the caller's consent) -- they may be
+serving, and nothing recreates them.
+
 The model PVC is intentionally not deleted (it is also not labeled -- it is
 shared, user-named state, not part of the deployment's label set) -- deleting
 it discards the warm cache and forces a full re-download.
