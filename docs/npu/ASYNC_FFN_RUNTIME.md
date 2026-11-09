@@ -1,14 +1,11 @@
 # MRV2 Async CAM FFN eager/FULL runtime
 
-AFD #449 captures one complete routed-expert transaction: original dispatch
-receive (DR), layered W4A8/W8A8 FFN, and original combine send (CS).
-Attention remains MRV2 eager. Issue #451 retires the separate MRV1 paths while
-preserving this runtime and its original transport/lifecycle boundary.
+FULL captures one routed-expert transaction: dispatch receive (DR),
+W4A8/W8A8 FFN, and combine send (CS). Attention remains MRV2 eager.
 
 `AsyncNPUFFNModelRunner` owns Async CAM model loading, eager/FULL transactions
 and receive-safe resource release independently of the synchronous CAMP2P
-`AFDNPUFFNModelRunner`. The FFN worker selects the owner from the connector;
-neither runner inherits MRV1 or owns Attention request/KV state.
+`AFDNPUFFNModelRunner`. The FFN worker selects the owner from the connector.
 
 ## Selection and startup
 

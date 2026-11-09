@@ -89,6 +89,11 @@ For each entry, derive (used by [deploy.md](deploy.md) and
   which case `worker` if that line's `ATTENTION_HEADLESS` override is `1`,
   else `head`.
 - **`afd-ffn-node-role`**: symmetric, `none` unless `POD` starts with `FFN_`.
+- **`GPU_COUNT`**: the number of devices in the literal
+  `CUDA_VISIBLE_DEVICES=` of the `vllm serve` block this pod runs -- the one
+  inside the recipe's branch that tests `$POD` for this pod's role
+  (`ATTENTION` or `FFN`). Every pod sharing a role shares that literal, so
+  read it off the script; don't derive it from ranks or DP sizes.
 
 ### Pods that run both roles: `POD=AFD_<index>`
 
@@ -104,7 +109,27 @@ such pod runs one FFN and one Attention server and derives its DP flags
   `FFN_PER_POD` defaults (`NUM_PODS` must equal the number of entries). If
   the user overrides them, pass the same values to every pod as container
   env.
+- **`GPU_COUNT`**: `ATTN_PER_POD + FFN_PER_POD`, the same for every pod.
+  These recipes build `CUDA_VISIBLE_DEVICES` with `$(seq ...)`, so the
+  literal-device rules above and below don't apply:
+
+  ```bash
+  default() { grep -oE "$1:-[0-9]+" "$RECIPE_SCRIPT_PATH" | grep -oE '[0-9]+$'; }
+  GPU_COUNT=$(( ${ATTN_PER_POD:-$(default ATTN_PER_POD)} + ${FFN_PER_POD:-$(default FFN_PER_POD)} ))
+  ```
 - Ports are literals in the script, not `*_PORT:-N` defaults: the AFD
   rendezvous port is the `"port": N` of the `afd` JSON, and the FFN and
   Attention DP RPC ports are the last argument of the `role_dp "$F" ...` and
   `role_dp "$A" ...` lines.
+
+## GPU_COUNT for a plain single-pod recipe
+
+The union of every literal `CUDA_VISIBLE_DEVICES=` in the script:
+
+```bash
+GPU_COUNT="$(grep -oE 'CUDA_VISIBLE_DEVICES=[0-9,]+' "$RECIPE_SCRIPT_PATH" \
+  | cut -d= -f2 | tr ',' '\n' | sort -u | wc -l)"
+```
+
+This step is the only place that parses the recipe:
+[deploy.md](deploy.md) uses the `GPU_COUNT` (and plan) recorded here as-is.

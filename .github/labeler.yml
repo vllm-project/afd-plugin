@@ -1,0 +1,74 @@
+# Path labels applied to pull requests by actions/labeler (v5).
+#
+# The workflow sets sync-labels: false, so this file only adds labels.
+# A label that a person applied stays even when paths no longer match.
+# Labels that are not keys in this file are never added or removed.
+#
+# Intentionally not auto-applied:
+#   ready, merge-test, weekly-test  — Buildkite reads these CI triggers
+#   high priority                    — maintainer signal
+#   bug, feature request, RFC, CI-failure — GitHub Issue Forms
+#
+# There is no .buildkite/npu tree. Globs are case-sensitive, matching
+# minimatch in actions/labeler@v5. dot: true in the workflow lets these
+# patterns match .agents and .buildkite.
+
+Ascend:
+  - changed-files:
+      - any-glob-to-any-file:
+          # npu directories, plus names such as upgrade-npu and npu-compat.md.
+          - "**/npu/**"
+          - "**/*npu*/**"
+          - "**/*npu*"
+          - "**/*ascend*"
+          - "**/*ascend*/**"
+          # CAM and CAMP2P are Ascend connectors. Uppercase recipe and doc
+          # names live under npu/ and match the directory globs above.
+          - "**/*cam*"
+          - "**/*cam*/**"
+          # DSpark draft execution is implemented only on NPU.
+          - "**/*dspark*"
+          - "**/*dspark*/**"
+          - ".agents/skills/upgrade-layered-gmm-ops/**"
+          - ".agents/skills/deploy-dsv4-flash-async/**"
+          - "tests/e2e/test_deploy_dsv4_flash_async_skill.py"
+          - "tests/unit/v1/worker/test_async_ffn_*.py"
+          - "tests/unit/package/test_mega_activation_patch.py"
+          # DSV4 Flash E2E is mixed. These files are the NPU-only ones whose
+          # names do not contain npu, cam, ascend, or dspark.
+          - "tests/e2e/models/deepseek_v4_flash/config.py"
+          - "tests/e2e/models/deepseek_v4_flash/ffn_graph.py"
+          - "tests/e2e/models/deepseek_v4_flash/ffn_graph_evidence.py"
+          - "tests/e2e/models/deepseek_v4_flash/test_deepseek_v4_flash_multi_pod.py"
+
+NVIDIA:
+  - changed-files:
+      - any-glob-to-any-file:
+          # gpu directories, plus names such as upgrade-gpu-version and gpu_*.py.
+          - "**/gpu/**"
+          - "**/*gpu*/**"
+          - "**/*gpu*"
+          - "**/*cuda*"
+          - "**/*cuda*/**"
+          - "**/*deepep*"
+          - "**/*deepep*/**"
+          - ".buildkite/cuda/**"
+          # CUDA CI image (vllm-openai base). docker/ is not labeled as a whole.
+          - "docker/Dockerfile.ci"
+          # NCCL P2P unit tests. A broad *p2p* glob would also match CAMP2P
+          # and docs/npu/CAM_P2P, which are Ascend.
+          - "tests/unit/connectors/test_p2p_*.py"
+          # These E2E suites reject a non-GPU backend.
+          - "tests/e2e/models/qwen3_moe/**"
+          - "tests/e2e/models/qwen3_6/**"
+          - ".agents/skills/deploy-afd-k8s/**"
+          - ".agents/skills/run-vllm-bench-k8s/**"
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          # User-facing docs only. Module READMEs under code, tests, csrc,
+          # and .agents are left unlabeled so code PRs do not pick this up.
+          - "docs/**"
+          - "README.md"
+          - "recipe/**/*.md"

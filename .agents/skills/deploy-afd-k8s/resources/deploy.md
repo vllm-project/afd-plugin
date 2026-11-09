@@ -1,40 +1,10 @@
-# 2-4. Compute GPU_COUNT, confirm, and deploy
+# 2-4. Confirm and deploy
 
 ## 2. GPU_COUNT
 
-Plain single-pod recipe (no plan from [resolve-recipe.md](resolve-recipe.md)):
-union of every literal `CUDA_VISIBLE_DEVICES=` in the script.
-
-```bash
-GPU_COUNT="$(grep -oE 'CUDA_VISIBLE_DEVICES=[0-9,]+' "$RECIPE_SCRIPT_PATH" \
-  | cut -d= -f2 | tr ',' '\n' | sort -u | wc -l)"
-```
-
-Per plan entry: count the devices in the literal `CUDA_VISIBLE_DEVICES=` inside
-the recipe's `if` block that tests this pod's role (`ATTENTION` or `FFN` --
-whichever prefix `POD` starts with). Every pod sharing a role shares that
-literal, so this is a plain text extraction, not a per-pod computation:
-
-```bash
-role_block() {  # $1=script $2=ATTENTION|FFN
-  awk -v role="$2" '
-    /if.*\$POD/ && $0 ~ role { inblock=1; next }
-    inblock && /^fi/ { inblock=0 }
-    inblock { print }
-  ' "$1"
-}
-devices="$(role_block "$RECIPE_SCRIPT_PATH" "$ROLE" \
-  | grep -oE 'CUDA_VISIBLE_DEVICES=[0-9,]+' | head -1 | cut -d= -f2)"
-GPU_COUNT=$(( $(grep -o ',' <<<"$devices" | wc -l) + 1 ))
-```
-
-`POD=AFD_<index>` entries (both roles per pod, see
-[resolve-recipe.md](resolve-recipe.md)): every pod has the same shape,
-
-```bash
-default() { grep -oE "$1:-[0-9]+" "$RECIPE_SCRIPT_PATH" | grep -oE '[0-9]+$'; }
-GPU_COUNT=$(( ${ATTN_PER_POD:-$(default ATTN_PER_POD)} + ${FFN_PER_POD:-$(default FFN_PER_POD)} ))
-```
+Use the `GPU_COUNT` recorded by [resolve-recipe.md](resolve-recipe.md) --
+one value for a plain recipe, one per plan entry. Don't re-read the script
+here; all recipe parsing lives in step 1.
 
 ## 3. Confirm before touching the cluster
 
@@ -183,12 +153,25 @@ deploy_pod vllm-pod-afd-0 5 head head "POD=AFD_0"
 deploy_pod vllm-pod-afd-1 5 worker worker "POD=AFD_1"
 ```
 
-## 4f. Wait for Running, then for each pod's own readiness line
+## 4f. Wait for Running, then for each pod's Ready condition
 
 Bounded 15-minute wait per pod for `phase=Running` (unschedulable pods never
-reach `Failed`, so an unbounded loop would spin forever), then poll logs for
-`=== pod <name> READY ===` (budget 60 minutes -- model download and graph
-capture dominate):
+reach `Failed`, so an unbounded wait would spin forever), then a 60-minute
+wait per pod for its `Ready` condition (model download and graph capture
+dominate).
+
+`Ready` is the single readiness signal. The pod's `readinessProbe` only
+turns it on after the in-pod startup script has seen every log marker, got
+`/health` from the attention head, and printed `=== pod <name> READY ===`;
+the same condition is what puts the attention head behind `vllm-service`.
+If the in-pod script gives up, it prints `ERROR:` with log tails and exits,
+the pod goes `Failed`, and the loop below stops at once.
+
+Timeouts are nested on purpose: the in-pod startup deadline
+(`STARTUP_TIMEOUT_S` in `templates/pod.yaml`, 55 minutes, one budget shared
+by every log and `/health`) is shorter than the 60-minute wait here, so a
+slow pod always fails with its own `ERROR:` reason instead of an outer
+timeout. Change the two together.
 
 ```bash
 for pod_name in <every deployed pod_name>; do
@@ -199,17 +182,21 @@ done
 for pod_name in <every deployed pod_name>; do
   deadline=$(( $(date +%s) + 3600 ))
   while true; do
-    logs="$(kubectl logs "pod/$pod_name" 2>/dev/null || true)"
-    echo "$logs" | grep -q "pod ${pod_name} READY" && break
-    echo "$logs" | grep -q "ERROR:" && { kubectl logs "$pod_name" --tail=200; exit 1; }
-    [ "$(date +%s)" -ge "$deadline" ] && { kubectl logs "$pod_name" --tail=200; exit 1; }
+    read -r phase ready < <(kubectl get pod "$pod_name" \
+      -o jsonpath='{.status.phase} {.status.conditions[?(@.type=="Ready")].status}' || true)
+    [ "$ready" = "True" ] && break
+    if [ "$phase" = "Failed" ] || [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "pod $pod_name not Ready (phase=${phase:-unknown})"
+      kubectl logs "$pod_name" --tail=200
+      exit 1
+    fi
     sleep 10
   done
 done
 ```
 
-Only report the endpoint ready once every pod in the plan has printed its
-own `READY` line -- one pod becoming ready doesn't imply the others did.
+Only report the endpoint ready once every pod in the plan is `Ready` -- one
+pod becoming ready doesn't imply the others did.
 
 Startup markers are keyed on the fixed log names every colocation recipe
 uses today -- see `templates/pod.yaml`'s `ready_marker()` for the exact
