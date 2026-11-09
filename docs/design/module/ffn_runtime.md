@@ -12,9 +12,10 @@ primary_code_paths:
   - "afd_plugin/v1/worker/ffn_worker.py"
   - "afd_plugin/v1/worker/npu/ffn_model_runner.py"
   - "afd_plugin/v1/worker/npu/async_ffn_model_runner.py"
-  - "afd_plugin/v1/worker/npu/async_ffn_two_stream.py"
   - "afd_plugin/v1/worker/npu/ffn_worker.py"
 related_code_paths:
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_startup.py"
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_session.py"
   - "afd_plugin/connectors/**"
   - "afd_plugin/model_executor/**"
   - "afd_plugin/compat/patches/engine_core.py"
@@ -32,9 +33,11 @@ validation_paths:
   - "tests/unit/v1/worker/test_ffn_routed_experts_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
-  - "tests/unit/v1/worker/test_async_ffn_two_stream.py"
-  - "tests/unit/test_async_cam_startup_wiring.py"
-  - "tests/unit/connectors/test_async_cam_startup.py"
+  - "tests/unit/connectors/npu/test_async_cam_startup_wiring.py"
+  - "tests/unit/connectors/npu/test_async_cam_startup.py"
+  - "tests/unit/connectors/test_base.py"
+  - "tests/unit/connectors/npu/test_async_cam_session.py"
+  - "tests/unit/connectors/npu/test_async_cam.py"
   - "tests/npu/async_cam_runtime.py"
   - "tests/e2e/models/deepseek_v4_flash/ffn_graph.py"
   - "tests/unit/compat/patches/test_engine_core.py"
@@ -57,7 +60,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-10-20
+last_reviewed: 2026-11-09
 ---
 
 # FFN runtime
@@ -76,6 +79,17 @@ profiler, native-op, and build mechanisms belong to
 FFN consumes plugin configuration, connector transport, model-side compute,
 platform mechanisms, and EngineCore compatibility. No shared module may depend
 on the FFN worker or runner implementation.
+
+Async CAM's connector owns HCCL, payload validation and initialization/cleanup
+coordination. It selects a Push or Pull session at construction. Both inherit
+the concrete `FFNExecutionSession` lifecycle defaults from `connectors/base.py`. Push owns
+per-stage routing queues; Pull owns its single window, publish/combine, device
+status and quiet/drain/stopped lifecycle. Pull takes Startup, topology and the
+dimensions/capacity used for initialization and bounded drain; it does not
+retain the connector. The FFN runner continues to own eager/FULL execution,
+graph references and completion; the worker still owns the receiver thread.
+The current Mega executor reads the same live window through the connector's
+read-only `comm_args` property.
 
 ## Runtime selection
 
@@ -178,18 +192,6 @@ FFN. Async FFN FULL accepts eager Attention DBO and continues to receive work
 items independently of Attention's threads. These limits
 describe the pair even though only Attention inherits a native V2 runner.
 
-Async CAM also has an experimental, default-off `ffn_two_stream` mode for
-layered W4A8/W8A8 eager/FULL. `AsyncFFNTwoStream`, owned by the Async runner, retains
-two slots, compute/send streams and ready/done events. FULL owns four private
-graph pools and four graphs; eager retires each slot only after its send is
-observed complete. Both modes retain the bounded batch fence. Enabled eager
-and FULL agree on executor, layer, capacity and core signatures before HCCL
-creation and reject Attention DBO/SP combinations. Shutdown requires receiver
-exit and device completion before release. Partial native failures retain
-resources and remain visible to repeated health checks. Host tests do not
-qualify native window reuse, graph capture or stream overlap; see the
-[Async runtime guide](../../npu/ASYNC_FFN_RUNTIME.md#experimental-ffn-two-stream-execution).
-
 ## Daemon step selection
 
 The worker selects one of two FFN step paths from the optional
@@ -240,8 +242,10 @@ daemon thread:
 ### Connector-driven loop
 
 The Ascend worker checks `connector.control_plane`. When it is `None`, as for
-CAM async, the worker calls `execute_connector_driven_step()` instead of a
-control-plane receive. For each layer, the runner:
+CAM async, the worker calls `execute_connector_driven_step(shutdown_requested)`
+instead of a control-plane receive. The runner asks the execution session once
+per step whether to keep serving, so Pull adds no extra Store round trip to the
+loop. For each layer, the runner:
 
 1. receives a capacity-sized payload and its original CAM metadata through
    `connector.recv_attn_output()`;
@@ -393,15 +397,7 @@ async model E2E coverage.
 
 ## Limitations and open issues
 
-Current shared limits are the supported vLLM release, connector-driven FFN,
-and registered role-aware model integrations. Ascend V1 native DBO accepts
-exactly two ubatches. A V2-paired FFN uses the same AFD FFN runner with a
-V2-compatible construction and forward-context seam. CUDA FFN consumes the
-two-stage control layout and replays the matching graph when requested;
-Ascend V2 consumes two-stage synchronous control metadata in eager DBO mode.
-CAM async instead uses eager connector work items; native DBO runs only on
-Attention and does not create a separate FFN stage scheduler.
-Platform-specific limits are centralized in
+Platform-specific execution limits and validation evidence are centralized in
 [execution platforms](execution_platforms.md#tested-runtime-matrix).
 
 Issue [#107](https://github.com/JiusiServe/afd-plugin/issues/107) completed the

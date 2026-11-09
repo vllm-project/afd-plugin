@@ -73,6 +73,9 @@ PROCESS_REAP_TIMEOUT_S = 5
 NPU_ASYNC_PROCESS_KILL_TIMEOUT_S = 120
 LOG_THREAD_JOIN_TIMEOUT_S = 2
 VLLM_SHUTDOWN_TIMEOUT_S = 10
+NPU_ASYNC_VLLM_SHUTDOWN_TIMEOUT_S = 90
+NPU_ASYNC_WORKER_SHUTDOWN_TIMEOUT_S = 60
+NPU_ASYNC_TERMINATION_TIMEOUT_S = 120
 DEFAULT_GSM8K_SAMPLE_LIMIT = 7
 GSM8K_NUM_FEWSHOT = 8
 GSM8K_FULL_SAMPLE_COUNT = 1319
@@ -571,7 +574,11 @@ def build_vllm_command(
         "serve",
         args.model,
         "--shutdown-timeout",
-        str(VLLM_SHUTDOWN_TIMEOUT_S),
+        str(
+            NPU_ASYNC_VLLM_SHUTDOWN_TIMEOUT_S
+            if is_npu and args.afd_async
+            else VLLM_SHUTDOWN_TIMEOUT_S
+        ),
         "--served-model-name",
         served_model_name(args, role),
         "--data-parallel-size",
@@ -738,6 +745,8 @@ def uses_npu_async_process_cleanup(args: argparse.Namespace) -> bool:
 
 def process_termination_timeout(args: argparse.Namespace) -> float:
     """Return the scenario's teardown budget, shared by every runner."""
+    if args.device_backend == "npu" and args.afd_async and not args.baseline:
+        return NPU_ASYNC_TERMINATION_TIMEOUT_S
     if args.scenario in DSV4_SCENARIOS:
         return DSV4_PROCESS_TERMINATION_TIMEOUT_S
     return PROCESS_TERMINATION_TIMEOUT_S
@@ -1012,6 +1021,11 @@ def build_env(
         env[E2E_PROCESS_ROLE_ENV] = role
     if args.device_backend == "npu":
         env.pop("VLLM_ASCEND_ENABLE_FLASHCOMM1", None)
+        if args.afd_async and not args.baseline:
+            env.setdefault(
+                "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
+                str(NPU_ASYNC_WORKER_SHUTDOWN_TIMEOUT_S),
+            )
     env.pop("AFD_PLUGIN_EARLY_ENGINE_PATCH", None)
     current_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (

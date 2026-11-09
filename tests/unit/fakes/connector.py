@@ -8,6 +8,7 @@ Constructed without ``AFDConnectorBase.__init__`` (no vLLM config needed).
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from types import SimpleNamespace
 from typing import Any
 
@@ -17,6 +18,41 @@ from afd_plugin.connectors import (
     AFDTransferContext,
     AFDTransferMetadata,
 )
+from afd_plugin.connectors.base import FFNExecutionSession
+
+
+class FakeFFNSession(FFNExecutionSession):
+    """Configurable host lifecycle seam, with no device behavior."""
+
+    def __init__(
+        self,
+        *,
+        serving: Iterable[bool] = (),
+        requires_drain: bool = False,
+        drain_error: Exception | None = None,
+        transactions: int = 0,
+    ) -> None:
+        self.requires_drain = requires_drain
+        self.serving = iter(serving)
+        self.drain_error = drain_error
+        self.transactions = transactions
+        self.receiver_finished = False
+
+    def keep_serving(self, shutdown_requested: bool) -> bool:
+        return next(self.serving, not shutdown_requested)
+
+    def drain(self, run_one: Callable[[], None]) -> None:
+        for _ in range(self.transactions):
+            run_one()
+        if self.drain_error is not None:
+            raise self.drain_error
+
+    def finish_receiver(self) -> None:
+        self.receiver_finished = True
+
+    def validate_shutdown(self) -> None:
+        if self.requires_drain and not self.receiver_finished:
+            raise RuntimeError("receiver has not finished; retain resources")
 
 
 class FakeRoutedConnector(AFDRoutedExpertsConnector):

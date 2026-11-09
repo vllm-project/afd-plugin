@@ -139,9 +139,8 @@ from the model routed-expert count and `num_ffn_ranks`; use a model/topology in
 which routed experts divide evenly across FFN ranks. All roles must use the same
 model, routed-expert layout, quantization, HCCL address, rank counts, CAM
 settings. Enable native DBO only on Attention; FFN must not receive
-`--enable-dbo` or native ubatching flags. Legacy connector flags may remain in
-shared JSON because their normalization is Attention-only. In an async deployment, every Attention (A)
-and FFN (F) process must also set `--max-num-batched-tokens` to the same value.
+`--enable-dbo` or native ubatching flags. Every Attention and FFN process must
+set `--max-num-batched-tokens` to the same value.
 
 ## AFD configuration
 
@@ -193,18 +192,9 @@ including `async_dp`; enable DBO through the Attention CLI flags below.
 | Field | Type | Default | Meaning and constraint |
 | --- | --- | --- | --- |
 | `dynamicQuant` | `int` | `0` | Set to `1`: FFN receives dynamically quantized routed activations and scale tensors. The default `0` is not supported by the layered FFN path. |
+| `ffn_mega_moe` | `bool` | `false` | Selects Mega FFN with Pull transport; requires `dynamicQuant=1` and the same setting on all A/F ranks. See the [Pull execution session](ASYNC_FFN_RUNTIME.md#opt-in-pull-execution-session). |
 | `attn_ranks_per_dp` | `int` | `1` | Positive Attention TP rank count per DP replica. It is the CAM Attention grouping width and is independent of the FFN process's local TP size. |
 | `hccl_buffer_size` | `int` | unset | Positive CAM HCCL buffer size in MB. The override applies only to the `afd_async_cam` communication domain. When unset, HCCL uses `HCCL_BUFFSIZE`, then its built-in default. Configure the same value on every Attention and FFN rank in the domain. |
-| `ffn_two_stream` | `bool` | `false` | Experimental FFN-only receive/compute and send streams with two slots. Requires an eligible layered MRV2 executor; eager and FULL are supported in code, with NPU qualification pending. |
-| `ffn_compute_aic_num` | `int` | `12` | Positive compute Cube limit, bounded by available AIC. |
-| `ffn_compute_aiv_num` | `int` | `24` | Positive compute Vector limit, at least twice the compute Cube count. |
-| `ffn_combine_aiv_num` | `int` | `24` | Positive send Vector limit; compute plus send Vector must fit available AIV. |
-
-For `ffn_two_stream=true`, disable SP and FlashComm1 on both roles. Attention
-may use native DBO with two ubatches under the constraints below; it remains
-eager, and FFN must keep DBO disabled even when using FULL graph.
-See [two-stream execution](ASYNC_FFN_RUNTIME.md#experimental-ffn-two-stream-execution)
-for graph ownership, shutdown and the remaining hardware qualification gates.
 
 For a DP+SP deployment such as DP3TP2 Attention + DP2TP1/EP2 FFN, set
 `VLLM_ASCEND_ENABLE_FLASHCOMM1=1` only on Attention and explicitly set it to
@@ -230,6 +220,14 @@ never joins Attention's DBO thread schedule. Native thresholds select eligible
 prefill/decode batches and must be at least the microbatch count. Native slicing determines token and request ranges,
 including parent padding and requests crossing a microbatch boundary. The model
 owns SP padding and each owner's layout restoration/TP collectives.
+
+The connector keeps configuration, topology, HCCL, payload validation and
+lifecycle coordination in `async_cam.py`. Its Push session keeps a FIFO per
+stage. Both sessions live in `async_cam_runtime/async_cam_session.py`. Pull owns one window
+across stages, native publish/combine, device status and shutdown coordination.
+The session is selected once at construction. Attention uses the existing
+connector entry points; FFN uses separate receive/send for Push, or Mega's fused
+transaction for Pull. Graph execution remains in the FFN ModelRunner.
 
 CAM has one physical window per Attention rank. Before another ubatch sends,
 a native peer receive hook completes the preceding raw receive with its owner's
@@ -300,10 +298,8 @@ actual vendor library path. Missing source operators fail startup.
   parallel execution remains outside the supported Async CAM topology.
 - Native DBO requires eager Attention, two ubatches, and no speculative
   decoding. FFN keeps its independent connector-driven execution.
-- Attention DP1 reuses native DBO through scoped Ascend compatibility adapters;
-  the legacy request/token split selector no longer controls boundaries.
-- ModelRunnerV2 rejects PP, PCP, and DCP; V1 PCP and async MoE context
-  parallelism remain unsupported.
+- Attention DP1 reuses native DBO through scoped Ascend compatibility adapters.
+- ModelRunnerV2 rejects PP, PCP, and DCP.
 - Routed experts should divide evenly across FFN ranks.
 
 For startup, HCCL, CAM operator, and shutdown failures, see the
@@ -311,18 +307,10 @@ For startup, HCCL, CAM operator, and shutdown failures, see the
 
 ## W4A8 and W8A8 layered GMM
 
-Async CAM FFN always uses the two layered GMM operators. FFN startup logs the
-quantization, layer count and layout as `Async CAM layered GMM`.
-
-### Migration from the legacy FFN path
-
-Remove `AFD_ASYNC_CAM_LAYERED_GMM` from all launch environments; the selector
-has been removed and setting it to `0` no longer selects the old path.
-DeepSeek-V2 and V2-Lite, including BF16 checkpoints, no longer support Async
-CAM because their FFN weights do not implement the layered contract. The
-standard DeepSeek-V3.2 architecture was already rejected by model validation and
-remains unsupported. Other connectors keep their own model support boundaries.
-Deployments needing the old Async CAM path must remain on an earlier revision.
+By default, Async CAM FFN uses two layered GMM operators.
+`ffn_mega_moe=true` selects the fused Mega executor and Pull transport using
+the same weight table. Startup logs its quantization, layer count and layout
+as `Async CAM layered GMM`.
 
 The intended configuration is Ascend 910C / `ascend910_93`, async CAM FFN,
 Attention-side gate, `dynamicQuant=1`, eager execution (or the separately
@@ -336,8 +324,7 @@ loader rejects positive `group_size`; the current target is limited to
 per-channel W4A8, or dynamic W8A8 with FP32 W13/BF16 W2 per-channel scales.
 W8A8 uses loaded INT8 NZ tensors and a single shared zero INT32 W2 bias;
 it does not require W4A8 compensation or duplicate expert weights.
-DSV4 Flash W4A8 has layered off/on 300-question comparisons and
-real INT8-activation/INT4-weight operator traces in the
+Historical DSV4 Flash W4A8 layered off/on comparisons and operator traces are in the
 [runtime validation record](../design/module/execution_platforms.md#tested-runtime-matrix).
 Per-group operator coverage does not extend the checkpoint loader to
 per-group weights.
@@ -361,6 +348,7 @@ slice of the original metadata, or a device mapping, selects the layer; the
 original metadata goes to combine-send. Empty ranks, chunks, and ubatches use
 the existing communication protocol. With `AFD_CAM_OP_IO_LOG` enabled, the
 path logs only Tensor shape, dtype, and device without reading metadata values.
+Input field names follow the registered native operator schema.
 The Async eager worker synchronizes after each complete FFN layer loop; FULL
 submits a bounded batch on one stream and waits once for that batch. These
 submission loops do not define request boundaries. Measure peak

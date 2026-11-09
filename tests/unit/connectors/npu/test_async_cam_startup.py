@@ -2,15 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Pure host negotiation tests; no device or model runner initialization."""
 
+import json
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from threading import Condition
 from types import SimpleNamespace
 
 import pytest
 
-from afd_plugin import async_cam_startup as startup_module
-from afd_plugin.async_cam_startup import (
+from afd_plugin.connectors.npu.async_cam_runtime import (
+    async_cam_startup as startup_module,
+)
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup import (
     AsyncCAMGraphStartup,
     FFNGraphPlan,
     resolve_ffn_mode,
@@ -20,41 +24,30 @@ from afd_plugin.validation import (
     requested_ffn_mode,
     validate_graph_capacity,
 )
+from tests.unit.fakes.async_cam_startup import MemoryStore, startup_world
 
 
-class MemoryStore:
-    def __init__(self):
-        self.values = {}
-        self.condition = Condition()
-        self.closed = False
-
-    def set(self, key, value):
-        assert not self.closed, "Store used after release"
-        with self.condition:
-            self.values[key] = value.encode() if isinstance(value, str) else value
-            self.condition.notify_all()
-
-    def get(self, key):
-        assert not self.closed, "Store used after release"
-        with self.condition:
-            assert self.condition.wait_for(lambda: key in self.values, timeout=3)
-            return self.values[key]
-
-    def check(self, keys):
-        assert not self.closed, "Store used after release"
-        with self.condition:
-            return all(key in self.values for key in keys)
-
-
-def startup_world(attn=2, ffn=2, store=None):
-    store = store or MemoryStore()
-    owners = []
-    for rank in range(attn + ffn):
-        owner = AsyncCAMGraphStartup(rank, attn, attn + ffn)
-        owner._store = store
-        owner._prefix = "ffn_graph/test/"
-        owners.append(owner)
-    return owners
+def test_startup_import_needs_no_torch_or_vllm_in_clean_process():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; "
+            "sys.modules.update(torch=None, vllm=None, "
+            "torch_npu=None, vllm_ascend=None); "
+            "from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup "
+            "import AsyncCAMGraphStartup; "
+            "from afd_plugin.connectors.npu.async_cam_runtime.async_cam_session "
+            "import PullCAMSession, PushCAMSession; "
+            "assert AsyncCAMGraphStartup(0, 1, 2).mode == 'eager'; "
+            "assert PullCAMSession.requires_drain; "
+            "assert not PushCAMSession.requires_drain",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def full_plan(**changes):
@@ -88,6 +81,71 @@ def negotiate(owners, plans, signatures):
         return [future.exception(timeout=3) for future in futures]
 
 
+@pytest.mark.parametrize("world", [4, 16])
+def test_shared_failure_check_uses_one_store_request(world, monkeypatch):
+    owners = startup_world(attn=world - 2, ffn=2)
+    assert not any(
+        negotiate(
+            owners,
+            [None] * (world - 2) + [full_plan(requested="eager")] * 2,
+            ["wire"] * world,
+        )
+    )
+    calls = []
+    original = owners[0]._store.check
+
+    def check(keys):
+        calls.append(keys)
+        return original(keys)
+
+    monkeypatch.setattr(owners[0]._store, "check", check)
+    owners[-1].check_failure()
+    assert len(calls) == 1
+    owners[0].fail(RuntimeError("source failed"))
+    for owner in owners:
+        with pytest.raises(RuntimeError, match="source failed"):
+            owner.check_failure()
+
+
+def test_legacy_peer_keeps_per_rank_failure_detection(monkeypatch):
+    owners = startup_world()
+    original = owners[0]._publish
+
+    def legacy_publish(stage, value="ready"):
+        if stage == "plan":
+            fields = json.loads(value)
+            fields.pop("shared_errors")
+            value = json.dumps(fields)
+        original(stage, value)
+
+    monkeypatch.setattr(owners[0], "_publish", legacy_publish)
+    assert not any(
+        negotiate(
+            owners, [None, None] + [full_plan(requested="eager")] * 2, ["wire"] * 4
+        )
+    )
+    owners[0]._store.set(owners[0]._keys("error", range(1))[0], "legacy failure")
+    for owner in owners:
+        with pytest.raises(RuntimeError, match="legacy failure"):
+            owner.check_failure()
+
+
+def test_shared_failure_survives_compatibility_write_failure(monkeypatch):
+    owners = startup_world()
+    original = owners[0]._store.set
+
+    def fail_rank_error(key, value):
+        if key.endswith("error/0"):
+            raise ConnectionError("connection lost")
+        original(key, value)
+
+    monkeypatch.setattr(owners[0]._store, "set", fail_rank_error)
+    with pytest.raises(ConnectionError):
+        owners[0].fail(RuntimeError("original failure"))
+    with pytest.raises(RuntimeError, match="original failure"):
+        owners[-1].check_failure()
+
+
 def test_mixed_requested_modes_are_not_silently_downgraded():
     with pytest.raises(ValueError, match="same execution mode"):
         resolve_ffn_mode([full_plan(), FFNGraphPlan()])
@@ -106,38 +164,6 @@ def test_executor_error_reaches_all_attention_and_ffn_ranks(mode):
     ), errors
 
 
-@pytest.mark.parametrize("mode", ["eager", "full"])
-def test_two_stream_signature_and_failure_are_checked_in_both_modes(mode):
-    plan = full_plan(requested=mode, stream_signature="2/12C/24V/24V")
-    assert resolve_ffn_mode([plan, plan]) == mode
-    with pytest.raises(ValueError, match="two-stream execution signatures"):
-        resolve_ffn_mode([plan, replace(plan, stream_signature="")])
-    with pytest.raises(ValueError, match="core budget"):
-        resolve_ffn_mode([plan, replace(plan, stream_error="core budget")])
-    with pytest.raises(ValueError, match="signatures differ"):
-        resolve_ffn_mode([plan, replace(plan, signature="other-capacity")])
-
-
-@pytest.mark.parametrize("peer_failure", [False, True])
-def test_two_stream_waits_for_attention_capability_check(peer_failure):
-    owners = startup_world(1, 1)
-
-    def validate():
-        if peer_failure:
-            raise ValueError("DBO is not qualified")
-
-    owners[0].validate_attention_streams = validate
-    plan = full_plan(requested="eager", stream_signature="2/12C/24V/24V")
-    errors = negotiate(owners, [None, plan], ["wire"] * 2)
-    if peer_failure:
-        assert all(
-            isinstance(error, (ValueError, RuntimeError)) and "DBO" in str(error)
-            for error in errors
-        ), errors
-    else:
-        assert errors == [None, None]
-
-
 def test_whole_world_agrees_before_service_readiness():
     owners = startup_world()
     assert (
@@ -151,13 +177,12 @@ def test_whole_world_agrees_before_service_readiness():
         owner.wait_service_ready()
 
 
-@pytest.mark.parametrize("two_stream", [False, True])
 @pytest.mark.parametrize("mode", ["eager", "full"])
-def test_transport_check_preserves_single_stream_eager_scope(two_stream, mode):
+def test_transport_check_preserves_eager_scope(mode):
     owners = startup_world(1, 1)
-    plan = full_plan(requested=mode, stream_signature="two" if two_stream else "")
+    plan = full_plan(requested=mode)
     errors = negotiate(owners, [None, plan], ["a", "b"])
-    if two_stream or mode == "full":
+    if mode == "full":
         assert all(
             isinstance(error, (ValueError, RuntimeError))
             and "transport signatures" in str(error)
@@ -209,6 +234,39 @@ def test_graph_rejects_unsafe_static_envelope(tokens, tp, capacity):
 def test_graph_accepts_conservative_uint16_boundary():
     validate_graph_capacity(65535, 1, 65535)
     validate_graph_capacity(65536, 2, 65536)
+
+
+def test_pull_row_slicing_accepts_capacity_below_dispatch_envelope():
+    validate_graph_capacity(32, 2, 3, allow_row_slicing=True)
+    with pytest.raises(ValueError, match="smaller"):
+        validate_graph_capacity(32, 2, 3)
+    with pytest.raises(ValueError, match="uint16"):
+        validate_graph_capacity(65536, 1, 3, allow_row_slicing=True)
+
+
+def test_pull_requires_matching_transport_even_in_eager_mode():
+    owners = startup_world(1, 1)
+    errors = negotiate(
+        owners, [None, full_plan(requested="eager")], ["pull_v1:layout", "push"]
+    )
+    assert all("transport signatures" in str(error) for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("bad", "message"),
+    [
+        (FFNGraphPlan(), "signatures differ"),
+        (full_plan(requested="eager", layer_ids=(3,)), "layer tables"),
+    ],
+)
+def test_pull_eager_validates_executor_and_layer_tables(bad, message):
+    owners = startup_world(1, 2)
+    errors = negotiate(
+        owners,
+        [None, full_plan(requested="eager"), bad],
+        ["pull_v1:layout"] * 3,
+    )
+    assert all(message in str(error) for error in errors), errors
 
 
 @pytest.mark.parametrize("stage", ["validated", "warmup", "captured"])

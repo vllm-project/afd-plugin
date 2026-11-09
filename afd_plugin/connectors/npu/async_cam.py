@@ -1,28 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Ascend CAM asynchronous connector for Attention/FFN disaggregation.
+"""Ascend CAM connector for Attention/FFN disaggregation.
 
-``CAMAsyncAFDConnector`` supports eager Attention and eager or FULL FFN.
-Attention ranks run MoE routing, submit activations with CAM async
-dispatch-send, and receive combined expert output with combine-recv. FFN ranks
-receive routed-expert activations with dispatch-recv, execute their
-local experts, and return the results with combine-send.
+The connector validates payloads and manages the Attention-first HCCL world
+``[A0, A1, ..., F0, F1, ...]``. Push/Pull sessions own transfer state and
+protocol rules; the FFN ModelRunner owns eager/FULL execution. Attention
+microbatching uses native DBO. Native operators carry routing/count metadata
+without a separate Gloo control plane.
 
-The connector creates one HCCL world ordered as
-``[A0, A1, ..., F0, F1, ...]``. Attention world ranks therefore equal their
-role ranks, while FFN world ranks start at ``num_attention_ranks``. Unlike the
-synchronous connectors, CAM async carries routing and token-count metadata in
-the CAM operator payload and does not create a separate Gloo DP-metadata
-control plane.
-
-The supported deployment requires ``async=true``, Ascend CAM
-operator packages, and matching topology/configuration on every rank. Regular
-prefill and autoregressive decode steps use the same connector. Attention
-microbatching uses the native DBO runtime with Ascend adaptations. FFN FULL
-requires MRV2 and accepts Attention-side DBO. Native DBO owns microbatch
-splitting and scheduling. See ``docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md`` for
-configuration, rank
-derivation, launch guidance, and the full limitations.
+See ``docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md`` for configuration, rank
+derivation and supported paths.
 """
 
 from __future__ import annotations
@@ -30,6 +17,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Final, cast
@@ -38,11 +26,6 @@ import torch
 from torch import Tensor
 from vllm.logger import init_logger
 
-from afd_plugin.async_cam_startup import (
-    GRAPH_STARTUP_TIMEOUT_SECONDS,
-    POLL_SECONDS,
-    AsyncCAMGraphStartup,
-)
 from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.config import AFDConfig
 from afd_plugin.config_utils import (
@@ -54,12 +37,23 @@ from afd_plugin.config_utils import (
 from afd_plugin.connectors.base import (
     AFDConnectorBase,
     ConnectorExtraInfo,
+    FFNExecutionSession,
 )
 from afd_plugin.connectors.metadata import (
     AFDA2FTransferPayload,
     AFDTransferContext,
     AFDTransferMetadata,
     AFDTransferState,
+)
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_session import (
+    CAM_COMM_ID,
+    PullCAMSession,
+    PushCAMSession,
+)
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup import (
+    GRAPH_STARTUP_TIMEOUT_SECONDS,
+    POLL_SECONDS,
+    AsyncCAMGraphStartup,
 )
 from afd_plugin.distributed import (
     create_hccl_process_group_options,
@@ -73,23 +67,19 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.model_executor.layers.fused_moe import FusedMoERouter
 
+logger = init_logger(__name__)
+
 AFD_ASYNC_CAM_GROUP_NAME = "afd_async_cam"
-CAM_COMM_ID = 0
 ATTN_RANKS_PER_DP_CONFIG_KEY = "attn_ranks_per_dp"
 
 _AFD_ASYNC_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "dynamicQuant",
+        "ffn_mega_moe",
         "attn_ranks_per_dp",
         "hccl_buffer_size",
-        "ffn_two_stream",
-        "ffn_compute_aic_num",
-        "ffn_compute_aiv_num",
-        "ffn_combine_aiv_num",
     },
 )
-
-logger = init_logger(__name__)
 
 
 def select_cam_experts(
@@ -149,15 +139,13 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
         dynamic_quant: Dynamic quantization mode accepted by CAM operators.
         attn_ranks_per_dp: Number of Attention ranks in each data-parallel group.
         hccl_buffer_size: Optional buffer size in MB for the CAM HCCL domain.
+        ffn_mega_moe: Enable Mega FFN and its pull protocol on every A/F rank.
     """
 
+    ffn_mega_moe: bool = False
     dynamic_quant: int = 0
     attn_ranks_per_dp: int = 1
     hccl_buffer_size: int | None = None
-    ffn_two_stream: bool = False
-    ffn_compute_aic_num: int = 12
-    ffn_compute_aiv_num: int = 24
-    ffn_combine_aiv_num: int = 24
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> AFDAsyncExtraInfo:
@@ -177,7 +165,10 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
                 + ", ".join(unknown),
             )
 
-        return cls(
+        result = cls(
+            ffn_mega_moe=coerce_extra_bool(
+                raw.get("ffn_mega_moe", False), field_name="ffn_mega_moe"
+            ),
             dynamic_quant=coerce_extra_int(
                 raw.get("dynamicQuant", 0),
                 field_name="dynamicQuant",
@@ -190,53 +181,22 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
                 raw.get("hccl_buffer_size"),
                 field_name="hccl_buffer_size",
             ),
-            ffn_two_stream=coerce_extra_bool(
-                raw.get("ffn_two_stream", False), field_name="ffn_two_stream"
-            ),
-            ffn_compute_aic_num=coerce_extra_positive_int(
-                raw.get("ffn_compute_aic_num", 12), field_name="ffn_compute_aic_num"
-            ),
-            ffn_compute_aiv_num=coerce_extra_positive_int(
-                raw.get("ffn_compute_aiv_num", 24), field_name="ffn_compute_aiv_num"
-            ),
-            ffn_combine_aiv_num=coerce_extra_positive_int(
-                raw.get("ffn_combine_aiv_num", 24), field_name="ffn_combine_aiv_num"
-            ),
         )
+
+        if result.ffn_mega_moe and result.dynamic_quant != 1:
+            raise ValueError("ffn_mega_moe requires dynamicQuant=1")
+        return result
 
     def to_mapping(self) -> dict[str, Any]:
         result: dict[str, Any] = {
             "dynamicQuant": self.dynamic_quant,
             "attn_ranks_per_dp": self.attn_ranks_per_dp,
         }
+        if self.ffn_mega_moe:
+            result["ffn_mega_moe"] = True
         if self.hccl_buffer_size is not None:
             result["hccl_buffer_size"] = self.hccl_buffer_size
-        if self.ffn_two_stream or (
-            self.ffn_compute_aic_num,
-            self.ffn_compute_aiv_num,
-            self.ffn_combine_aiv_num,
-        ) != (12, 24, 24):
-            result.update(
-                ffn_two_stream=self.ffn_two_stream,
-                ffn_compute_aic_num=self.ffn_compute_aic_num,
-                ffn_compute_aiv_num=self.ffn_compute_aiv_num,
-                ffn_combine_aiv_num=self.ffn_combine_aiv_num,
-            )
         return result
-
-
-@dataclass(slots=True)
-class AFDAsyncTransferState(AFDTransferState):
-    """Routed activations, counts and untouched compact combine metadata."""
-
-    batch_size: int = 1
-    hidden_size: int = 1
-    topk: int = 1
-    layer_idx: int = 0
-    token_nums_rankid_layeridx: Tensor | None = None
-    group_list: Tensor | None = None
-    dynamic_scales: Tensor | None = None
-    send_completion: Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +214,20 @@ class AFDAsyncTopology:
     def world_size(self) -> int:
         """Return the total number of Attention and FFN ranks."""
         return self.attn_size + self.ffn_size
+
+
+@dataclass(slots=True)
+class AFDAsyncTransferState(AFDTransferState):
+    """Routed activations, counts and untouched compact combine metadata."""
+
+    batch_size: int = 1
+    hidden_size: int = 1
+    topk: int = 1
+    layer_idx: int = 0
+    token_nums_rankid_layeridx: Tensor | None = None
+    group_list: Tensor | None = None
+    dynamic_scales: Tensor | None = None
+    send_completion: Tensor | None = None
 
 
 class CAMAsyncAFDConnector(AFDConnectorBase):
@@ -305,7 +279,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         self.max_num_batched_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
         )
-        self.comm_id = CAM_COMM_ID
         self.tp_size = extra_info.attn_ranks_per_dp
         self.cam_pg: ProcessGroup | None = None
         self.topology = build_async_topology(
@@ -317,15 +290,35 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         self.attn_size = self.topology.attn_size
         self.ffn_size = self.topology.ffn_size
         self.expert_per_rank = self.topology.expert_per_rank
-        self.comm_args: Tensor | None = None
-        self._placeholder: Tensor | None = None
-        self._pending_attention_payloads: dict[
-            int,
-            list[tuple[AFDTransferContext, Tensor, Tensor]],
-        ] = {}
         self.graph_startup = AsyncCAMGraphStartup(
             self.world_rank, self.attn_size, self.topology.world_size
         )
+        self._session: PushCAMSession | PullCAMSession = (
+            PullCAMSession(
+                self.graph_startup,
+                self.topology,
+                hidden_size=self.hidden_size,
+                topk=self.topk,
+                max_num_batched_tokens=self.max_num_batched_tokens,
+                tp_size=self.tp_size,
+                receive_capacity=cam_receive_capacity(),
+            )
+            if extra_info.ffn_mega_moe
+            else PushCAMSession(self.activation_dtype)
+        )
+
+    @property
+    def comm_args(self) -> Tensor | None:
+        """Expose the selected protocol's live window to Mega compute."""
+        return self._session.comm_args
+
+    @property
+    def comm_id(self) -> int:
+        return self._session.comm_id
+
+    @property
+    def has_pending_attention(self) -> bool:
+        return self._session.has_pending_attention
 
     @property
     def is_initialized(self) -> bool:
@@ -357,21 +350,16 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         )
         backend = self.cam_pg._get_backend(torch.device("npu"))
         self.group_name = str(backend.get_hccl_comm_name(self.world_rank))
-        device = f"npu:{self.local_rank}"
-        self.comm_args = torch.empty((1,), dtype=torch.float16, device=device)
-        self._placeholder = torch.empty(
-            (1,),
-            dtype=self.activation_dtype,
-            device=device,
-        )
+        try:
+            self._session.initialize(f"npu:{self.local_rank}", self.group_name)
+        except Exception as exc:
+            self.graph_startup.fail(exc)
+            raise
         self._initialized = True
         if self.graph_startup.mode == "full" and self.world_rank < self.attn_size:
             self._run_attention_graph_startup()
 
     def _initialize_graph_startup(self, store: Store) -> None:
-        self.graph_startup.validate_attention_streams = (
-            self._validate_two_stream_attention
-        )
         signature = repr(
             (
                 self.attn_size,
@@ -385,36 +373,22 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
                 self.max_num_batched_tokens,
             )
         )
+        signature = self._session.signature_prefix + signature
         self.graph_startup.initialize(store, signature)
         if self.graph_startup.mode == "full":
             try:
                 if not self.vllm_config.use_v2_model_runner:
                     raise ValueError("Async FFN FULL requires MRV2 on every rank")
                 validate_graph_capacity(
-                    self.max_num_batched_tokens, self.tp_size, cam_receive_capacity()
+                    self.max_num_batched_tokens,
+                    self.tp_size,
+                    cam_receive_capacity(),
+                    allow_row_slicing=self._session.allow_row_slicing,
                 )
                 self.graph_startup.phase("validated")
             except Exception as exc:
                 self.graph_startup.fail(exc)
                 raise
-
-    def _validate_two_stream_attention(self) -> None:
-        config = self.vllm_config
-        parallel = config.parallel_config
-        if (
-            not config.use_v2_model_runner
-            or not config.model_config.enforce_eager
-            or parallel.pipeline_parallel_size != 1
-            or parallel.prefill_context_parallel_size != 1
-            or parallel.decode_context_parallel_size != 1
-            or parallel.use_sequence_parallel_moe
-            or os.environ.get("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0").strip().lower()
-            in ("1", "true")
-            or config.speculative_config is not None
-        ):
-            raise ValueError(
-                "FFN two-stream requires eager MRV2 Attention without PP/CP/SP"
-            )
 
     def wait_graph_device(self, event: torch.npu.Event) -> None:
         deadline = time.monotonic() + GRAPH_STARTUP_TIMEOUT_SECONDS
@@ -426,6 +400,9 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
 
     def graph_startup_chunks(self) -> int:
         """Every A TP rank sends one row to experts [0, topk)."""
+        if isinstance(self._session, PullCAMSession):
+            # A fused launch drains every receive round of the selected source.
+            return 1
         local_experts = max(
             0,
             min(
@@ -462,16 +439,21 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             self.graph_startup.fail(exc)
             raise
 
+    def ffn_session(self) -> FFNExecutionSession:
+        return self._session
+
+    def attention_step(self) -> AbstractContextManager[None]:
+        return self._session.attention_step()
+
     def close(self) -> None:
         """Destroy the HCCL process group and clear pending transfer states."""
+        self._session.prepare_close(self._initialized)
         if self.cam_pg is not None:
             import torch.distributed as dist
 
             dist.destroy_process_group(self.cam_pg)
         self.cam_pg = None
-        self.comm_args = None
-        self._placeholder = None
-        self._pending_attention_payloads.clear()
+        self._session.release()
         self._initialized = False
 
     def select_experts(self, **kwargs: Any) -> tuple[Tensor, Tensor]:
@@ -484,12 +466,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         context: AFDTransferContext,
         **kwargs: Any,
     ) -> None:
-        """Dispatch Attention activations and top-k routing to FFN ranks.
-
-        The matching context and routing tensors are queued per async stage
-        for ``recv_ffn_output``. The input token count and top-k tensor shapes
-        must match the transfer metadata and model configuration.
-        """
+        """Validate routed activations, then submit through the selected protocol."""
         self._require_initialized()
         metadata = context.metadata
         if not metadata.validate_tensor_shape(tuple(hidden_states.shape)):
@@ -523,54 +500,18 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
                 "Async CAM batch exceeds max_num_batched_tokens / TP capacity"
             )
         hidden_states = hidden_states.contiguous()
-
-        _log_cam_op_values(
-            "async_dispatch_send",
-            "inputs",
-            hidden_states=hidden_states,
-            topk_ids=topk_ids,
-            comm_args=self.comm_args,
-            comm_id=self.comm_id,
+        args = self._cam_args(states) | dict(
+            x=hidden_states,
+            expert_ids=topk_ids,
             max_seq_len=self.max_num_batched_tokens,
             batch_size=states.batch_size,
-            hidden_size=states.hidden_size,
-            topk=states.topk,
-            ffn_size=self.ffn_size,
-            attn_size=self.attn_size,
-            expert_per_rank=self.expert_per_rank,
-            rank=self.world_rank,
-            world_size=self.topology.world_size,
-            layer_idx=states.layer_idx,
+            attn_rank_id=self.world_rank,
+            layer_index=states.layer_idx,
             tp_size=self.tp_size,
             dynamic_quant=self.dynamic_quant,
-            group_name=self.group_name,
         )
-        torch.ops.afd_ascend.afd_async_dispatch_send(
-            hidden_states,
-            topk_ids,
-            self.comm_args,
-            self.comm_id,
-            self.max_num_batched_tokens,
-            states.batch_size,
-            states.hidden_size,
-            states.topk,
-            self.ffn_size,
-            self.attn_size,
-            self.expert_per_rank,
-            self.world_rank,
-            self.topology.world_size,
-            states.layer_idx,
-            self.tp_size,
-            self.dynamic_quant,
-            self.group_name,
-        )
-        self._pending_attention_payloads.setdefault(
-            context.metadata.stage_idx, []
-        ).append(
-            (context, topk_ids, topk_weights),
-        )
-
-        return None
+        _log_cam_op_values("async_dispatch_send", "inputs", **args)
+        self._session.dispatch((context, topk_ids, topk_weights), **args)
 
     def recv_ffn_output(
         self,
@@ -578,36 +519,21 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         ubatch_idx: int = 0,
         **kwargs: Any,
     ) -> Tensor:
-        """Receive and combine expert output on an Attention rank.
-
-        The optional context must match the oldest pending dispatch for the
-        stage. Routing tensors always come from that dispatch. ``ref_tensor``
-        selects the output device and dtype for the CAM receive placeholder.
-
-        Args:
-            ref_tensor: Tensor from which device/dtype are taken for the CAM
-                combine-recv placeholder.
-            ubatch_idx: Stage/microbatch index of the pending Attention
-                dispatch payload. Defaults to ``0``.
-            **kwargs: Optional ``context`` from the matching dispatch. Uses
-                FIFO order when omitted.
-        """
+        """Combine the oldest matching Push dispatch or the exclusive Pull window."""
         self._require_initialized()
         context = kwargs.get("context")
-        payloads = self._pending_attention_payloads.get(ubatch_idx)
-        if not payloads:
+        payload = self._session.pending_for(ubatch_idx)
+        if payload is None:
             raise RuntimeError(
                 "CAMAsyncAFDConnector recv_ffn_output is missing pending "
                 "Attention metadata",
             )
-        if context is not None and context is not payloads[0][0]:
+        if context is not None and context is not payload[0]:
             raise RuntimeError(
                 "CAMAsyncAFDConnector recv_ffn_output context does not match "
                 "the next pending Attention dispatch",
             )
-        context, topk_ids, topk_weights = payloads.pop(0)
-        if not payloads:
-            self._pending_attention_payloads.pop(ubatch_idx, None)
+        context, topk_ids, topk_weights = payload
 
         states = _require_async_transfer_state(context)
         _validate_topk_payload(
@@ -617,40 +543,15 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             topk=states.topk,
         )
         placeholder = ref_tensor.new_empty((1,))
-        _log_cam_op_values(
-            "async_combine_recv",
-            "inputs",
-            placeholder=placeholder,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            comm_args=self.comm_args,
-            comm_id=self.comm_id,
+        args = self._cam_args(states) | dict(
+            expand_x=placeholder,
+            expert_ids=topk_ids,
+            expert_scales=topk_weights,
             batch_size=states.batch_size,
-            hidden_size=states.hidden_size,
-            topk=states.topk,
-            ffn_size=self.ffn_size,
-            attn_size=self.attn_size,
-            expert_per_rank=self.expert_per_rank,
-            rank=self.world_rank,
-            world_size=self.topology.world_size,
-            group_name=self.group_name,
+            attn_rank_id=self.world_rank,
         )
-        output = torch.ops.afd_ascend.afd_async_combine_recv(
-            placeholder,
-            topk_ids,
-            topk_weights,
-            self.comm_args,
-            self.comm_id,
-            states.batch_size,
-            states.hidden_size,
-            states.topk,
-            self.ffn_size,
-            self.attn_size,
-            self.expert_per_rank,
-            self.world_rank,
-            self.topology.world_size,
-            self.group_name,
-        )
+        _log_cam_op_values("async_combine_recv", "inputs", **args)
+        output = self._session.combine(ubatch_idx, **args)
         _log_cam_op_values("async_combine_recv", "outputs", output=output)
         return output
 
@@ -659,8 +560,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         ubatch_idx: int = 0,
         **kwargs: Any,
     ) -> AFDA2FTransferPayload:
-        """Receive routed activations and preserve their compact metadata."""
-        self._require_initialized()
+        """Receive a Push work item and preserve its compact return metadata."""
+        session = self._require_push_session()
         batch_size = int(kwargs.get("batch_size", self.max_num_batched_tokens) or 1)
         layer_idx = int(kwargs.get("layer_idx", 0) or 0)
         metadata = AFDTransferMetadata.create_ffn_metadata(
@@ -678,42 +579,16 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             metadata=metadata,
             states=states,
         )
-        placeholder = kwargs.get("placeholder", self._placeholder)
-        _log_cam_op_values(
-            "async_dispatch_recv",
-            "inputs",
-            placeholder=placeholder,
-            comm_args=self.comm_args,
-            comm_id=self.comm_id,
+        placeholder = kwargs.get("placeholder", session.placeholder)
+        args = self._cam_args(states) | dict(
+            x=placeholder,
             max_seq_len=self.max_num_batched_tokens,
-            batch_size=states.batch_size,
-            hidden_size=states.hidden_size,
-            topk=states.topk,
-            ffn_size=self.ffn_size,
-            attn_size=self.attn_size,
-            expert_per_rank=self.expert_per_rank,
-            rank=self.world_rank,
-            world_size=self.topology.world_size,
+            moe_rank_id=self.world_rank,
             tp_size=self.tp_size,
             dynamic_quant=self.dynamic_quant,
-            group_name=self.group_name,
         )
-        outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(
-            placeholder,
-            self.comm_args,
-            self.comm_id,
-            self.max_num_batched_tokens,
-            states.hidden_size,
-            states.topk,
-            self.ffn_size,
-            self.attn_size,
-            self.expert_per_rank,
-            self.world_rank,
-            self.topology.world_size,
-            self.tp_size,
-            self.dynamic_quant,
-            self.group_name,
-        )
+        _log_cam_op_values("async_dispatch_recv", "inputs", **args)
+        outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(**args)
         hidden_states, dynamic_scales, batch_info, expert_token_nums = outputs
         _log_cam_op_values(
             "async_dispatch_recv",
@@ -737,12 +612,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         context: AFDTransferContext,
         **kwargs: Any,
     ) -> None:
-        """Send routed expert outputs for CAM combination.
-
-        ``TokenNums_Rankid_Layeridx`` from the matching dispatch-recv is
-        mandatory because CAM uses it to return results to Attention ranks.
-        """
-        self._require_initialized()
+        """Return a Push work item with its original dispatch metadata."""
+        self._require_push_session()
         states = _require_async_transfer_state(context)
         token_nums_rankid_layeridx = states.token_nums_rankid_layeridx
         if token_nums_rankid_layeridx is None:
@@ -752,93 +623,43 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
                 "AFD async CAM combine send requires "
                 "TokenNums_Rankid_Layeridx from async_dispatch_recv",
             )
-        _log_cam_op_values(
-            "async_combine_send",
-            "inputs",
-            ffn_output=ffn_output,
-            comm_args=self.comm_args,
-            token_nums_rankid_layeridx=token_nums_rankid_layeridx,
-            metadata_values=False,
-            comm_id=self.comm_id,
+        args = self._cam_args(states) | dict(
+            expand_x=ffn_output,
+            batch_info=token_nums_rankid_layeridx,
             max_seq_len=self.max_num_batched_tokens,
-            batch_size=states.batch_size,
-            hidden_size=states.hidden_size,
-            topk=states.topk,
-            ffn_size=self.ffn_size,
-            attn_size=self.attn_size,
-            expert_per_rank=self.expert_per_rank,
-            rank=self.world_rank,
-            world_size=self.topology.world_size,
+            moe_rank_id=self.world_rank,
             tp_size=self.tp_size,
-            group_name=self.group_name,
         )
-        states.send_completion = torch.ops.afd_ascend.afd_async_combine_send(
-            ffn_output,
-            self.comm_args,
-            token_nums_rankid_layeridx,
-            self.comm_id,
-            self.max_num_batched_tokens,
-            states.hidden_size,
-            states.topk,
-            self.ffn_size,
-            self.attn_size,
-            self.expert_per_rank,
-            self.world_rank,
-            self.topology.world_size,
-            self.tp_size,
-            self.group_name,
+        _log_cam_op_values("async_combine_send", "inputs", **args)
+        states.send_completion = torch.ops.afd_ascend.afd_async_combine_send(**args)
+
+    def _require_push_session(self) -> PushCAMSession:
+        self._require_initialized()
+        if not isinstance(self._session, PushCAMSession):
+            raise RuntimeError(
+                "Pull FFN receive/compute/send belongs to the Mega executor"
+            )
+        return self._session
+
+    def _cam_args(
+        self, states: AFDAsyncTransferState
+    ) -> dict[str, Tensor | int | str | None]:
+        """Fields shared by the four registered CAM operator schemas."""
+        return dict(
+            comm_args=self.comm_args,
+            comm_id=self.comm_id,
+            hidden_size=states.hidden_size,
+            top_k=states.topk,
+            moe_rank_num=self.ffn_size,
+            attn_rank_num=self.attn_size,
+            route_expert_num_per_moe=self.expert_per_rank,
+            world_size=self.topology.world_size,
+            group_name=self.group_name,
         )
 
     def _require_initialized(self) -> None:
         if not self._initialized:
             raise RuntimeError("CAMAsyncAFDConnector is not initialized")
-
-
-def _require_async_transfer_state(
-    context: AFDTransferContext,
-) -> AFDAsyncTransferState:
-    states = context.states
-    if not isinstance(states, AFDAsyncTransferState):
-        raise RuntimeError(
-            "CAMAsyncAFDConnector requires AFDAsyncTransferState in the "
-            "transfer context",
-        )
-    return states
-
-
-_CAM_LOG_SKIPPED_ARGS = frozenset({"comm_args", "comm_id", "group_name"})
-_CAM_OP_IO_LOG_ENV = "AFD_CAM_OP_IO_LOG"
-
-
-def _log_cam_op_values(
-    op_name: str, label: str, *, metadata_values: bool = True, **kwargs: object
-) -> None:
-    if os.environ.get(_CAM_OP_IO_LOG_ENV, "").lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        return
-    lines: list[str] = []
-    for name, value in kwargs.items():
-        if name in _CAM_LOG_SKIPPED_ARGS:
-            continue
-        if isinstance(value, Tensor):
-            description = (
-                f"Tensor(dtype={value.dtype}, shape={tuple(value.shape)}, "
-                f"device={value.device})"
-            )
-            if metadata_values and name == "token_nums_rankid_layeridx":
-                try:
-                    first5: object = value.detach().flatten()[:5].cpu().tolist()
-                except Exception as exc:  # pragma: no cover - defensive logging helper
-                    first5 = f"<unavailable: {type(exc).__name__}>"
-                description = f"{description}, first5={first5!r}"
-        else:
-            description = repr(value)
-        lines.append(f"  {name}={description}")
-    logger.warning("AFD CAM %s %s:\n%s", op_name, label, "\n".join(lines))
 
 
 def build_async_topology(
@@ -892,20 +713,57 @@ def build_async_topology(
     )
 
 
+def _require_async_transfer_state(
+    context: AFDTransferContext,
+) -> AFDAsyncTransferState:
+    states = context.states
+    if not isinstance(states, AFDAsyncTransferState):
+        raise RuntimeError(
+            "CAMAsyncAFDConnector requires AFDAsyncTransferState in the "
+            "transfer context",
+        )
+    return states
+
+
+_CAM_LOG_SKIPPED_ARGS = frozenset({"comm_args", "comm_id", "group_name"})
+_CAM_OP_IO_LOG_ENV = "AFD_CAM_OP_IO_LOG"
+
+
+def _log_cam_op_values(op_name: str, label: str, **kwargs: object) -> None:
+    if os.environ.get(_CAM_OP_IO_LOG_ENV, "").lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+    lines: list[str] = []
+    for name, value in kwargs.items():
+        if name in _CAM_LOG_SKIPPED_ARGS:
+            continue
+        if isinstance(value, Tensor):
+            description = (
+                f"Tensor(dtype={value.dtype}, shape={tuple(value.shape)}, "
+                f"device={value.device})"
+            )
+
+        else:
+            description = repr(value)
+        lines.append(f"  {name}={description}")
+    logger.warning("AFD CAM %s %s:\n%s", op_name, label, "\n".join(lines))
+
+
 def _validate_topk_payload(
     topk_ids: Tensor,
     topk_weights: Tensor | None,
     *,
     batch_size: int,
     topk: int,
-    require_weights: bool = True,
 ) -> None:
     if tuple(topk_ids.shape) != (batch_size, topk):
         raise ValueError(
             f"topk_ids shape must match ({batch_size}, {topk}), got {topk_ids.shape!r}",
         )
-    if not require_weights and topk_weights is None:
-        return
     if topk_weights is None:
         raise ValueError("topk_weights is required")
     if tuple(topk_weights.shape) != (batch_size, topk):

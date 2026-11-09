@@ -24,7 +24,7 @@ verified_platform_refs:
   - "Ascend: current target in root installation instructions; V2-Lite and DSV4 Flash W4A8 evidence in the execution-platform matrix; older environments remain historical"
 related_issues:
   - "#129"
-last_reviewed: 2026-10-13
+last_reviewed: 2026-11-09
 ---
 
 # AFD module design
@@ -35,12 +35,16 @@ verify boundaries, invariants, and validation evidence. The documents record
 plugin, role runtime, connector, model, platform, compatibility, and E2E
 testing contracts; open interfaces remain explicitly draft.
 
-The 2026-10-13 source review used AFD `36dadb4`, vLLM `0.30.0`
-(`ced6857a`), and Ascend `8d4409d6`; it is historical, not qualification of
-the current pair. For the 0.32 upgrade, see the
-[NPU validation record](https://github.com/vllm-project/afd-plugin/pull/507). Existing document
-statuses and historical measurements retain their scope. Each module records
-its remaining limitations and validation gaps.
+The 2026-11-09 documentation review checked path ownership, configuration,
+guide links, and upstream references against the current checkout. GPU and
+NPU target vLLM `0.32.0` (`5df63a72`); the Ascend integration targets
+vLLM-Ascend `bd42eea0`, as recorded in the
+[installation instructions](../../../README.md#ascend-npu-installation).
+The refreshed `last_reviewed` dates record documentation consistency checks;
+hardware validation remains scoped to the
+[runtime matrix](execution_platforms.md#tested-runtime-matrix) and the
+[0.32 NPU validation record](https://github.com/vllm-project/afd-plugin/pull/507).
+Existing document statuses and historical measurements retain their scope.
 
 ## Reading order
 
@@ -100,12 +104,12 @@ contract. File-level entries deliberately resolve mixed directories.
 | Primary document | Production paths |
 | --- | --- |
 | [Plugin boundary](plugin_boundary.md) | `afd_plugin/__init__.py`, `afd_plugin/config.py`, `afd_plugin/config_utils.py`, `afd_plugin/envs.py`, `afd_plugin/validation.py`, `afd_plugin/py.typed`, `afd_plugin/v1/__init__.py`, `afd_plugin/v1/worker/__init__.py`, `afd_plugin/v1/worker/npu/__init__.py`, `pyproject.toml` |
-| [Attention runtime](attention_runtime.md) | `afd_plugin/v1/worker/attention_metadata.py`, `afd_plugin/v1/worker/attention_model_runner_v2.py`, `afd_plugin/v1/worker/attention_worker.py`, `afd_plugin/v1/worker/ubatch_wrapper.py`, `afd_plugin/v1/worker/npu/attention_model_runner_v2.py`, `afd_plugin/v1/worker/npu/attention_worker.py` |
-| [FFN runtime](ffn_runtime.md) | `afd_plugin/v1/worker/ffn_metadata.py`, `afd_plugin/v1/worker/ffn_model_runner.py`, `afd_plugin/v1/worker/ffn_worker.py`, `afd_plugin/v1/worker/npu/ffn_model_runner.py`, `afd_plugin/v1/worker/npu/async_ffn_model_runner.py`, `afd_plugin/v1/worker/npu/ffn_worker.py` |
+| [Attention runtime](attention_runtime.md) | `afd_plugin/v1/worker/attention_metadata.py`, `afd_plugin/v1/worker/attention_model_runner_v2.py`, `afd_plugin/v1/worker/attention_worker.py`, `afd_plugin/v1/worker/ubatch_wrapper.py`, `afd_plugin/v1/worker/npu/attention_model_runner_v2.py`, `afd_plugin/v1/worker/npu/attention_worker.py`, `afd_plugin/v1/worker/npu/dspark_speculator.py` |
+| [FFN runtime](ffn_runtime.md) | `afd_plugin/v1/worker/ffn_metadata.py`, `afd_plugin/v1/worker/ffn_model_runner.py`, `afd_plugin/v1/worker/ffn_routed_experts_model_runner.py`, `afd_plugin/v1/worker/ffn_worker.py`, `afd_plugin/v1/worker/npu/ffn_model_runner.py`, `afd_plugin/v1/worker/npu/async_ffn_model_runner.py`, `afd_plugin/v1/worker/npu/ffn_worker.py` |
 | [Connector contracts](connector_contracts.md) | `afd_plugin/connectors/**/*.py`, `afd_plugin/connectors/npu/bin/**`, `afd_plugin/distributed/**/*.py` |
 | [Model integration](model_integration.md) | `afd_plugin/model_executor/**/*.py` |
 | [Execution platforms](execution_platforms.md) | `afd_plugin/compat/profiler.py`, `afd_plugin/compat/npu/forward_context.py`, `afd_plugin/compat/npu/ops.py`, `afd_plugin/compat/npu/profiler.py`, `afd_plugin/v1/worker/cuda_graph.py`, `afd_plugin/v1/worker/dbo.py`, `afd_plugin/v1/worker/npu/mla_graph.py`, `afd_plugin/v1/worker/npu/ubatch_runner.py`, `csrc/**`, `setup.py`, `MANIFEST.in` |
-| [Compatibility and patches](compatibility_and_patches.md) | `afd_plugin/compat/__init__.py`, `afd_plugin/compat/vllm.py`, `afd_plugin/compat/npu/__init__.py`, `afd_plugin/compat/npu/feature_validation.py`, `afd_plugin/compat/npu/runtime.py`, `afd_plugin/compat/npu/runtime_config.py`, `afd_plugin/compat/patches/**/*.py` |
+| [Compatibility and patches](compatibility_and_patches.md) | `afd_plugin/compat/__init__.py`, `afd_plugin/compat/vllm.py`, `afd_plugin/compat/npu/__init__.py`, `afd_plugin/compat/npu/feature_validation.py`, `afd_plugin/compat/npu/routing_ids.py`, `afd_plugin/compat/npu/runtime.py`, `afd_plugin/compat/npu/runtime_config.py`, `afd_plugin/compat/patches/**/*.py` |
 
 The routing inventory covers runtime and package code under `afd_plugin/**`,
 native sources under `csrc/**`, and packaging files that affect shipped
@@ -129,15 +133,15 @@ Only identified invariant blocks in a `normative` document may use `MUST`,
 Operational guides remain separate from normative module design:
 
 - [NCCL P2P connector guide](../../gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.md)
+- [DeepEP M2N connector guide](../../gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md)
 - [CAM P2P connector guide](../../npu/CAM_P2P_CONNECTOR_USER_GUIDE.md)
 - [CAM async connector guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md)
 - [CAM routed operators](../../npu/CAM_ASYNC_ROUTED_OPS.md)
+- [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md)
+- [Layered W13/W2 graph validation](../../npu/LAYERED_W2_MDL_VALIDATION.md)
 - [NPU validation](../../npu/TESTING.md) and [troubleshooting](../../npu/TROUBLESHOOTING.md)
 - [Ascend NPU installation](../../../README.md#ascend-npu-installation)
+- [Ascend NPU custom ops build](../../../csrc/npu/README.md)
 - [Connector overview](../../../afd_plugin/connectors/README.md)
 - [Deployment recipes](../../../recipe/README.md)
-
-- `afd_plugin/compat/npu/routing_ids.py` — opaque routing-id balancing boundary.
-  Registered during worker initialization; standalone scripts import the module
-  after device init. Tests: `tests/unit/compat/npu/test_routing_ids.py` and the
-  shared fixture in `tests/unit/fakes/routing_ids_op.py`.
+- [E2E test guide](../../../tests/e2e/README.md)

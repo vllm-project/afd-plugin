@@ -56,7 +56,9 @@ def _runner(*, async_dp=False):
     runner.afd_config = SimpleNamespace(
         async_dp=async_dp, num_attention_ranks=2, num_ffn_ranks=2
     )
-    runner.connector = SimpleNamespace(extra_info=SimpleNamespace())
+    runner.connector = SimpleNamespace(
+        extra_info=SimpleNamespace(), attention_step=nullcontext
+    )
     runner.cudagraph_manager = None
     runner.ubatch_runner = None
     runner.prof = object()

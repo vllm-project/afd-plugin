@@ -42,6 +42,42 @@ The supported SOC generations and the operators compiled for each are declared
 in `ascend_kernels/operator_registry.json`; `scripts/select_ops.py` resolves the
 operator list from that registry for a given SOC.
 
+## Pull Mega MC2 dependency
+
+Set `connector_extra_config.ffn_mega_moe=true` on every Attention and FFN
+rank to enable MegaMoE and its dedicated pull protocol. With the switch off,
+CAM retains its original push Dispatch/Combine and FFN execution path.
+Pull is not a standalone transport option: there is no `dispatch_mode`
+setting or separate pull DispatchRecv/CombineSend operator. MegaMoE requires
+`dynamicQuant=1` and per-channel W4A8 or W8A8 weights.
+Per-group weights are not supported by MegaMoE.
+
+The A3 `AfdMegaMoePullNative` kernel directly includes the installed CANN MC2
+W4A8 `BlockMmad`. The build supports the CANN 9.1 MegaMoE header layout and
+the CANN 9.2 layout with Catlass under `ascendc/common/catlass/include`. Set
+`ASCEND_CANN_PACKAGE_PATH` or `ASCEND_HOME_PATH` to the CANN installation.
+When this operator is selected, configuration fails if its MC2 headers are
+missing; builds that exclude it do not need this dependency. The dependency
+tree is not copied into this repository.
+
+One native launch selects a layer and drains one source transaction. Receive
+capacity follows ordinary CAM: `int(262144 * BATCH_SIZE_FACTOR)`, default 262144
+rows. Only transactions exceeding this capacity use multiple device rounds;
+capacity is independent of the MC2 matrix tile size. Callers must not launch
+once per receive round. The workspace allocation ABI and Attention Combine
+interface are unchanged. Both quantization plans use SwiGLU. W4A8 applies the
+model `swiglu_limit` in both ACT paths as
+`SiLU(min(gate, L)) * clamp(up, -L, L)`; zero, the default, disables clipping.
+W8A8 does not apply `swiglu_limit`, matching the Layered W8A8 path.
+
+For W4A8 intermediate widths up to 3072, ACT directly uses the installed MC2
+W4A8 two-stage UB epilogue and expert-group synchronization. Wider supported
+W4A8 rows and W8A8 use bounded-column activation. Return-address caching is
+bounded independently of receive capacity. Large capacity reserves HBM scratch
+without computing padded rows; for H4096/I2048 the default capacity needs about
+12.5 GiB per FFN executor, excluding weights and communication windows. This
+includes a 2 GiB buffer for BF16 output staging.
+
 ## Default Behavior
 
 Ascend custom ops build by default. Set `AFD_BUILD_ASCEND_OPS=0` only when
@@ -133,17 +169,15 @@ ensure_afd_ascend_ops_loaded()
 
 ## Current Scope
 
-A2E/E2A continue to serve the existing CAMP2P connector. The four 910C
-routed-only CAM operators are an experimental native integration and are not
-yet selected by `CAMAsyncAFDConnector`, which retains its external legacy CAM
-interface.
+A2E/E2A serve `CAMP2pAFDConnector`. `CAMAsyncAFDConnector` uses the plugin's
+910C routed-only CAM operators; see the [operator contract](../../docs/npu/CAM_ASYNC_ROUTED_OPS.md).
 
 `grouped_matmul_swiglu_quant_v2_layered` is a fused
 grouped-matmul + SiLU + dynamic-quantization CAM operator (A8W8 / A4W4 /
 A8W4-MSD variants) built for `ascend910_93`. It is registered as
 `torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered` (inference + Meta; no
-autograd grad) and is excluded from `ascend950` builds. It is selected by the
-opt-in layered W4A8 executor.
+autograd grad) and is excluded from `ascend950` builds. The default Async CAM
+layered executor uses it for W4A8 and W8A8.
 
 The trailing `swiglu_limit` argument defaults to `0.0` (no clipping). A finite
 positive `L` computes `SiLU(min(gate, L)) * clamp(up, -L, L)` before output
