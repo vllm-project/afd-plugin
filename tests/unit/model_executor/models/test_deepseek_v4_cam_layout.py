@@ -11,11 +11,11 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 pytest.importorskip("vllm_ascend.models.deepseek_v4.model")
 
+from afd_plugin.model_executor.ffn import async_cam  # noqa: E402
+from afd_plugin.model_executor.models.npu import deepseek_v4 as adapter  # noqa: E402
 from afd_plugin.model_executor.models.npu import (  # noqa: E402
-    async_cam_layout,  # noqa: E402
     deepseek_v4_attention_gate,
 )
-from afd_plugin.model_executor.models.npu import deepseek_v4 as adapter  # noqa: E402
 
 
 def _make_proxy(monkeypatch, *, use_sequence_parallel: bool, in_profile_run: bool):
@@ -55,11 +55,11 @@ def test_dsv4_profile_gate_shards_plain_tp8_and_restores(monkeypatch):
         in_profile_run=True,
     )
     tp_group = SimpleNamespace(world_size=8, rank_in_group=3)
-    monkeypatch.setattr(async_cam_layout, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(async_cam, "get_tp_group", lambda: tp_group)
     hidden_states = torch.arange(64, dtype=torch.float32).reshape(16, 4)
     gathered_output = hidden_states + 100
     monkeypatch.setattr(
-        async_cam_layout,
+        async_cam,
         "tensor_model_parallel_all_gather",
         lambda _tensor, token_dim: gathered_output,
     )
@@ -89,7 +89,7 @@ def test_dsv4_gate_keeps_sequence_parallel_tokens_rank_local(monkeypatch):
         in_profile_run=False,
     )
     monkeypatch.setattr(
-        async_cam_layout,
+        async_cam,
         "get_tp_group",
         lambda: SimpleNamespace(world_size=8, rank_in_group=3),
     )

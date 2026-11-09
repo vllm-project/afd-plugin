@@ -29,7 +29,7 @@ from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
-from afd_plugin.model_executor.npu.async_cam_layered import LayeredFFNWeights
+from afd_plugin.model_executor.ffn.expert_weights import QuantizedExpertWeights
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 from afd_plugin.v1.worker.npu.ffn_worker import AFDNPUFFNWorker
 
@@ -81,7 +81,7 @@ class SyntheticModel(torch.nn.Module):
                 experts,
             )
             self.layers.append(
-                LayeredFFNWeights(
+                QuantizedExpertWeights(
                     layer_id,
                     w13,
                     w2,
@@ -152,7 +152,7 @@ class SyntheticModel(torch.nn.Module):
     def get_experts_layer_indices(self):
         return LAYERS
 
-    def get_async_cam_layered_weights(self):
+    def get_quantized_expert_weights(self):
         return self.layers, ""
 
 
@@ -312,7 +312,7 @@ def main():
         )
         print(json.dumps({"rank": rank, "stage": "weights_ready"}), flush=True)
         runner.initialize_afd_connector()
-        assert runner._layered_executor is not None
+        assert runner.layer_ids
 
         def work_state():
             if args.mega:

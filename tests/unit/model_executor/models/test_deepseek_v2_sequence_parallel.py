@@ -13,10 +13,8 @@ from torch import Tensor  # noqa: E402
 
 pytest.importorskip("vllm")
 
+from afd_plugin.model_executor.ffn import async_cam  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
-from afd_plugin.model_executor.models.npu import (  # noqa: E402
-    async_cam_layout,
-)
 from afd_plugin.model_executor.models.npu import (  # noqa: E402
     deepseek_v2_async_cam_forward as schedule,
 )
@@ -140,7 +138,7 @@ def test_single_stage_gathers_once_at_dense_or_output_boundary(
         return torch.cat((states, torch.zeros_like(states)))
 
     monkeypatch.setattr(
-        async_cam_layout,
+        async_cam,
         "get_tp_group",
         lambda: SimpleNamespace(world_size=2, rank_in_group=0),
     )

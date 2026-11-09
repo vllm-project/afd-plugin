@@ -17,7 +17,7 @@ from pathlib import Path
 
 import torch
 
-from afd_plugin.model_executor.npu.async_cam_layered import (
+from afd_plugin.model_executor.ffn.compute import (
     CAM_LAYER_INDEX,
     AsyncCAMLayeredExecutor,
 )
@@ -32,8 +32,8 @@ class DSparkFFNGraphEvidence(DSparkEagerEvidence):
 class GraphComparison:
     def __init__(self, runner):
         self.runner = runner
-        target, _ = runner.model.get_async_cam_layered_weights()
-        draft, _ = runner.draft_model.get_async_cam_layered_weights()
+        target, _ = runner.model.get_quantized_expert_weights()
+        draft, _ = runner.draft_model.get_quantized_expert_weights()
         self.target = AsyncCAMLayeredExecutor(target)
         self.draft = AsyncCAMLayeredExecutor(draft)
         self.records = {}

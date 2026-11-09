@@ -12,6 +12,7 @@ pytest.importorskip("vllm")
 from torch import nn  # noqa: E402
 
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, AFDConfig  # noqa: E402
+from afd_plugin.model_executor.ffn import remote  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
 from tests.unit.fakes.connector import ProxyConnector as _FakeConnector  # noqa: E402
 from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
@@ -270,7 +271,7 @@ def test_m2n_moe_sends_topk_and_adds_shared_output_of_dispatched_input(
 
 def test_remote_proxy_requires_forward_metadata(monkeypatch):
     monkeypatch.setattr(
-        adapter,
+        remote,
         "get_afd_metadata_from_forward_context",
         lambda: None,
     )
@@ -283,7 +284,7 @@ def test_remote_proxy_exchanges_cam_during_profile(monkeypatch):
     events: list[tuple] = []
     install_proxy_context(adapter, monkeypatch, events)
     monkeypatch.setattr(
-        adapter,
+        remote,
         "get_forward_context",
         lambda: SimpleNamespace(in_profile_run=True, ubatch_idx=0),
     )
@@ -450,7 +451,7 @@ def test_routing_proxy_routes_on_attention_and_sends_topk(monkeypatch):
     def fake_fused_topk(**kwargs):
         return topk_weights, topk_ids, torch.zeros_like(topk_ids)
 
-    monkeypatch.setattr(adapter, "fused_topk", fake_fused_topk)
+    monkeypatch.setattr(remote, "fused_topk", fake_fused_topk)
     proxy = _routing_proxy(
         GateLinear(ROUTING_HIDDEN_SIZE, ROUTING_NUM_EXPERTS, out_dtype=torch.float32),
         renormalize=False,
@@ -521,7 +522,7 @@ def _tokens(num_tokens: int):
 
 
 def _tp_routing_proxy(monkeypatch, tp_size: int):
-    monkeypatch.setattr(adapter, "fused_topk", _torch_topk)
+    monkeypatch.setattr(remote, "fused_topk", _torch_topk)
     proxy = _routing_proxy(_TokenGate())
     proxy.tp_size = tp_size
     return proxy
@@ -538,7 +539,7 @@ def test_routing_proxy_tp1_dispatches_every_token(monkeypatch):
 
     events: list[tuple] = []
     install_proxy_context(adapter, monkeypatch, events)
-    monkeypatch.setattr(adapter.native, "sequence_parallel_chunk", no_split)
+    monkeypatch.setattr(remote, "sequence_parallel_chunk", no_split)
     hidden_states = _tokens(3)
 
     output = _tp_routing_proxy(monkeypatch, tp_size=1)(hidden_states)
@@ -567,18 +568,16 @@ def test_routing_proxy_tp2_rank_dispatches_its_slice_and_gathers(
     events: list[tuple] = []
     install_proxy_context(adapter, monkeypatch, events)
     monkeypatch.setattr(
-        adapter.native, "sequence_parallel_chunk", _chunk_for_rank(tp_rank, tp_size)
+        remote, "sequence_parallel_chunk", _chunk_for_rank(tp_rank, tp_size)
     )
-    monkeypatch.setattr(
-        adapter.native, "get_tensor_model_parallel_rank", lambda: tp_rank
-    )
+    monkeypatch.setattr(remote, "get_tensor_model_parallel_rank", lambda: tp_rank)
     gathered_inputs = []
 
     def all_gather(local_output, dim):
         gathered_inputs.append(local_output.clone())
         return torch.cat([local_output, local_output + PEER_OFFSET], dim=dim)
 
-    monkeypatch.setattr(adapter.native, "tensor_model_parallel_all_gather", all_gather)
+    monkeypatch.setattr(remote, "tensor_model_parallel_all_gather", all_gather)
 
     output = _tp_routing_proxy(monkeypatch, tp_size)(_tokens(3))
 
@@ -586,9 +585,9 @@ def test_routing_proxy_tp2_rank_dispatches_its_slice_and_gathers(
     sent_states, sent_kwargs = send[1], send[3]
     assert sent_states[:, 0].tolist() == sent_tokens
     topk_ids = sent_kwargs["topk_ids"]
-    unrouted = (topk_ids == adapter.UNROUTED_EXPERT_ID).all(dim=1)
+    unrouted = (topk_ids == remote.UNROUTED_EXPERT_ID).all(dim=1)
     assert unrouted.nonzero().flatten().tolist() == padding_rows
-    assert not (topk_ids[~unrouted] == adapter.UNROUTED_EXPERT_ID).any()
+    assert not (topk_ids[~unrouted] == remote.UNROUTED_EXPERT_ID).any()
     (local_output,) = gathered_inputs
     assert torch.equal(local_output, sent_states * COMBINE_SCALE)
     expected = torch.cat([local_output, local_output + PEER_OFFSET])[:3]
@@ -606,16 +605,16 @@ def test_routing_proxy_tp4_with_one_token_routes_only_rank0(monkeypatch):
     events: list[tuple] = []
     install_proxy_context(adapter, monkeypatch, events)
     monkeypatch.setattr(
-        adapter.native,
+        remote,
         "tensor_model_parallel_all_gather",
         lambda local, dim: torch.cat([local] * tp_size, dim=dim),
     )
     for tp_rank in range(tp_size):
         monkeypatch.setattr(
-            adapter.native, "sequence_parallel_chunk", _chunk_for_rank(tp_rank, tp_size)
+            remote, "sequence_parallel_chunk", _chunk_for_rank(tp_rank, tp_size)
         )
         monkeypatch.setattr(
-            adapter.native,
+            remote,
             "get_tensor_model_parallel_rank",
             lambda rank=tp_rank: rank,
         )
@@ -624,7 +623,7 @@ def test_routing_proxy_tp4_with_one_token_routes_only_rank0(monkeypatch):
 
         assert output.shape == (1, ROUTING_HIDDEN_SIZE)
     unrouted = [
-        bool((event[3]["topk_ids"] == adapter.UNROUTED_EXPERT_ID).all())
+        bool((event[3]["topk_ids"] == remote.UNROUTED_EXPERT_ID).all())
         for event in events
         if event[0] == "send"
     ]
@@ -653,9 +652,7 @@ def test_m2n_moe_tp2_rank_dispatches_its_slice_and_gathers_shared_sum(
     monkeypatch.setattr(
         adapter.native, "sequence_parallel_chunk", _chunk_for_rank(tp_rank, tp_size)
     )
-    monkeypatch.setattr(
-        adapter.native, "get_tensor_model_parallel_rank", lambda: tp_rank
-    )
+    monkeypatch.setattr(remote, "get_tensor_model_parallel_rank", lambda: tp_rank)
     gathered_inputs = []
 
     def all_gather(local_output, dim):
@@ -674,7 +671,7 @@ def test_m2n_moe_tp2_rank_dispatches_its_slice_and_gathers_shared_sum(
     assert [event[0] for event in events] == ["send", "yield", "recv"]
     sent_states, sent_kwargs = events[0][1], events[0][3]
     assert sent_states[:, 0].tolist() == sent_tokens
-    unrouted = (sent_kwargs["topk_ids"] == adapter.UNROUTED_EXPERT_ID).all(dim=1)
+    unrouted = (sent_kwargs["topk_ids"] == remote.UNROUTED_EXPERT_ID).all(dim=1)
     assert unrouted.nonzero().flatten().tolist() == padding_rows
     (local_output,) = gathered_inputs
     expected_local = COMBINED_VALUE + shared_factor * torch.tensor(

@@ -28,7 +28,7 @@ depends_on:
   - "compatibility_and_patches.md"
 validation_paths:
   - "tests/unit/ffn_faas/test_*.py"
-  - "tests/unit/model_executor/test_async_cam_layered.py"
+  - "tests/unit/model_executor/ffn/test_compute.py"
   - "tests/npu/test_async_cam_layered_w8a8.py"
   - "tests/unit/v1/worker/test_ffn_metadata.py"
   - "tests/unit/v1/worker/test_ffn_model_runner.py"
@@ -142,7 +142,7 @@ and CAM runtime composition live under `ffn_faas/platforms/npu/`.
 communication, computation and Graph execution to the Async CAM
 runtime. A shared cross-platform, cross-connector Step Loop and a pure
 `compute(item)` backend are not implemented. The runtime consumes the existing
-`LayeredFFNWeights` interface with W4A8 weights, without per-step model selection;
+`QuantizedExpertWeights` contract with W4A8 weights, without per-step model selection;
 there is no
 separate V4 execution runtime.
 
@@ -321,6 +321,23 @@ weights fail startup rather than selecting another FFN path. Worker-level
 synchronization remains after a work-item group. The `swiglu_limit` behavior
 and validation scope are documented in the
 [CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-and-w8a8-layered-gmm).
+
+## Async compute ownership
+
+The Async runner loads target/draft `QuantizedExpertWeights` through the model
+export contract, verifies layer coverage and selects Layered or Mega directly.
+`model_executor/ffn/expert_weights.py` owns shared shape validation, logical
+geometry and graph signatures. `compute.py` owns native operator handles,
+workspace, zero bias and layer maps. There is no execution layer beneath the
+ModelRunner and no access to private model parameters from compute.
+
+Mega consumes the exported tensors independently of Layered. It prepares its
+workspace before startup negotiation and binds live `comm_args` and the group
+name after connector initialization, before warmup/capture. Binding failures
+are published through Startup and retain resources. Negotiation preserves the
+existing signature format, including `native_mc2:` and the W8A8 zero-bias layout;
+W8A8 Mega does not allocate Layered's unused zero bias. Eager/FULL transaction,
+graph and shutdown orchestration remain runner-owned.
 
 ## Control-plane-driven forward
 

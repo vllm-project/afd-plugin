@@ -42,7 +42,7 @@ from vllm_ascend.utils import adapt_patch  # noqa: E402
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper  # noqa: E402
 
 from afd_plugin.connectors import AFDTransferContext, AFDTransferMetadata  # noqa: E402
-from afd_plugin.model_executor.models.npu.async_cam_dbo import (  # noqa: E402
+from afd_plugin.model_executor.ffn.async_cam import (  # noqa: E402
     send_async_cam_remote_call,
 )
 from afd_plugin.v1.worker.npu.ubatch_runner import NPUUBatchRunner  # noqa: E402
