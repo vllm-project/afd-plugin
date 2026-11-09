@@ -16,7 +16,7 @@ primary_code_paths:
   - "afd_plugin/v1/worker/npu/ffn_worker.py"
 related_code_paths:
   - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_startup.py"
-  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_pull.py"
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_session.py"
   - "afd_plugin/connectors/**"
   - "afd_plugin/model_executor/**"
   - "afd_plugin/compat/patches/engine_core.py"
@@ -39,7 +39,9 @@ validation_paths:
   - "tests/unit/v1/worker/test_async_ffn_runtime.py"
   - "tests/unit/connectors/npu/test_async_cam_startup_wiring.py"
   - "tests/unit/connectors/npu/test_async_cam_startup.py"
-  - "tests/unit/connectors/npu/test_async_cam_pull.py"
+  - "tests/unit/connectors/test_base.py"
+  - "tests/unit/connectors/npu/test_async_cam_session.py"
+  - "tests/unit/connectors/npu/test_async_cam.py"
   - "tests/npu/async_cam_runtime.py"
   - "tests/npu/standalone_cam_attention.py"
   - "tests/e2e/models/deepseek_v4_flash/ffn_graph.py"
@@ -83,6 +85,17 @@ FFN consumes plugin configuration, connector transport, model-side compute,
 platform mechanisms, and EngineCore compatibility. No shared module may depend
 on the FFN worker or runner implementation.
 
+Async CAM's connector owns HCCL, payload validation and initialization/cleanup
+coordination. It selects a Push or Pull session at construction. Both inherit
+the concrete `FFNExecutionSession` lifecycle defaults from `connectors/base.py`. Push owns
+per-stage routing queues; Pull owns its single window, publish/combine, device
+status and quiet/drain/stopped lifecycle. Pull takes Startup, topology and the
+dimensions/capacity used for initialization and bounded drain; it does not
+retain the connector. The FFN runner continues to own eager/FULL execution,
+graph references and completion; the worker still owns the receiver thread.
+The current Mega executor reads the same live window through the connector's
+read-only `comm_args` property.
+
 ## Runtime selection
 
 The traditional FFN is launched as a `vllm serve` process, and AFD config normalization selects
@@ -97,6 +110,12 @@ It composes `CAMAsyncAFDConnector` and `AsyncNPUFFNModelRunner` without creating
 a vLLM Worker, upstream ModelRunner, EngineCore, scheduler or KV cache.
 Attention retains its existing model, connector and DBO path. Configuration,
 parameter loading and quantization remain vLLM/vLLM-Ascend dependencies.
+
+The standalone Ascend CLI reuses vLLM engine argument definitions, parsing and
+configuration construction. Existing AFD options remain in `additional_config`;
+only host management and shutdown options are standalone-specific. The host
+entry delegates parser creation to its selected platform, so CPU-only service
+and host-loop imports remain independent of vLLM.
 
 The CPU-only host `FFNModelRunner` accepts an `FFNBackend` factory, retains
 the backend before preparation, and owns the receiving thread and failure
@@ -138,12 +157,15 @@ supported configuration, launch and shutdown behavior.
 CUDA routed-experts models over `DeepEPM2NAFDConnector` have a GPU standalone
 F, `--backend gpu-deepep-m2n`, under `ffn_faas/platforms/gpu/`:
 
-- `GPUDeepEPM2NAdapter` and `GPUFFNConfig` are CPU-only: launcher world,
-  ModelRunnerV2 environment, connector JSON structure and lane parity with
-  `--dbo` are checked before any device work. The adapter resolves the model
-  path but does not parse or name a model family.
+- `GPUDeepEPM2NAdapter` reuses the shared native engine CLI and F-only
+  launcher checks of `ffn_faas/platforms/launch.py`; with `GPUFFNConfig` it
+  checks on the CPU, before any device work, the M2N connector, TP 1 with EP,
+  the FULL_DECODE_ONLY or eager mode, the BF16 payload and lane parity with
+  `--enable-dbo`. The adapter resolves the model path but does not parse or
+  name a model family.
 - `GPUFFNEnvironment` selects the GPU, preflights afdEP and DeepGEMM, builds
-  the F-only `VllmConfig` (`external_launcher`, DP = F ranks, TP 1, EP), selects
+  the F-only `VllmConfig` with `EngineArgs.from_cli_args` (`external_launcher`,
+  DP = F ranks, TP 1, EP), selects
   the FFN-only routed-experts architecture, pins vLLM's MoE backend to Triton
   before any FusedMoE is built, and creates the F-only world through vLLM's
   `init_worker_distributed_environment`.

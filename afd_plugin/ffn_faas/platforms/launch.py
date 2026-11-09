@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Shared CPU-only launch-environment checks for standalone FFN backends."""
+"""Shared launch-time CLI and environment checks for standalone FFN backends.
+
+Importing this module stays CPU-only; ``create_ffn_engine_parser`` imports the
+selected vLLM CLI layer only when the platform adapter builds its parser.
+"""
 
 from __future__ import annotations
 
 import math
 import os
-from collections.abc import Mapping
+from argparse import ArgumentParser, Namespace
 from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-V2_MODEL_RUNNER_ENV = "VLLM_USE_V2_MODEL_RUNNER"
-MAX_PORT = 65535
+from afd_plugin.config import AFDConfig, parse_afd_config
+
 EXTERNAL_LAUNCHER = "external_launcher"
 
 if TYPE_CHECKING:
@@ -26,72 +29,84 @@ class FFNLauncherEnvironment:
     rank: int
     local_rank: int
     world_size: int
-    local_world_size: int
 
 
-def read_ffn_launcher_environment(ffn_ranks: int) -> FFNLauncherEnvironment:
-    """Read ``torchrun`` coordinates and require an F-only world."""
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(world_size)))
-    if world_size != ffn_ranks:
-        raise ValueError("F-only launcher WORLD_SIZE must equal --ffn-ranks")
+def read_ffn_launcher_environment() -> FFNLauncherEnvironment:
+    """Read the ``torchrun`` coordinates of this F-only rank."""
+    rank, local_rank, world_size = (
+        int(os.environ.get(key, default))
+        for key, default in (
+            ("RANK", "0"),
+            ("LOCAL_RANK", "0"),
+            ("WORLD_SIZE", "1"),
+        )
+    )
     return FFNLauncherEnvironment(
-        rank=rank,
-        local_rank=local_rank,
-        world_size=world_size,
-        local_world_size=local_world_size,
+        rank=rank, local_rank=local_rank, world_size=world_size
     )
 
 
-def require_v2_model_runner() -> None:
-    """Require the model-runner generation used by both A and F ranks."""
-    if os.environ.get(V2_MODEL_RUNNER_ENV) != "1":
-        raise ValueError(f"set {V2_MODEL_RUNNER_ENV}=1 on both A and F")
-
-
-def validate_common_ffn_launch(
-    *,
-    attention_ranks: int,
-    ffn_ranks: int,
-    rank: int,
-    local_rank: int,
-    host: str,
-    port: int,
-    shutdown_timeout: float,
+def validate_ffn_rank_settings(
+    *, ffn_ranks: int, rank: int, local_rank: int, shutdown_timeout: float
 ) -> None:
-    """Validate launch fields shared by every standalone FFN backend."""
-    if attention_ranks <= 0 or ffn_ranks <= 0:
-        raise ValueError("Attention and FFN rank counts must be positive")
-    if not 0 <= rank < ffn_ranks or local_rank < 0:
-        raise ValueError("invalid F rank or local rank")
-    if not host or not 0 < port <= MAX_PORT:
-        raise ValueError("FFN rendezvous requires a host and a valid port")
+    """Validate the launcher and host-shutdown facts every backend keeps.
+
+    Engine and connector definitions are validated by vLLM and AFD config.
+    """
+    if ffn_ranks <= 0 or not 0 <= rank < ffn_ranks:
+        raise ValueError("invalid F-only rank or world size")
+    if local_rank < 0:
+        raise ValueError("local rank must be nonnegative")
     if not math.isfinite(shutdown_timeout) or shutdown_timeout <= 0:
         raise ValueError("shutdown timeout must be finite and positive")
 
 
-def ffn_engine_kwargs(
-    *,
-    model: Path | str,
-    ffn_ranks: int,
-    ffn_rank: int,
-    additional_config: Mapping[str, Any],
-    platform_extras: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Build common ``EngineArgs`` keywords and merge backend-specific extras."""
-    kwargs: dict[str, Any] = {
-        "model": str(model),
-        "tensor_parallel_size": 1,
-        "data_parallel_size": ffn_ranks,
-        "data_parallel_rank": ffn_rank,
-        "enable_expert_parallel": True,
-        "distributed_executor_backend": EXTERNAL_LAUNCHER,
-        "additional_config": dict(additional_config),
-    }
-    kwargs.update(platform_extras)
-    return kwargs
+def create_ffn_engine_parser() -> ArgumentParser:
+    """Build vLLM's native engine CLI for an externally launched F-only rank."""
+    # Selected-platform imports: the Service/host entry stays CPU-only.
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.plugins import load_general_plugins
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    load_general_plugins()
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    # This process is already launched by torchrun, not a vLLM executor.
+    parser.set_defaults(distributed_executor_backend=EXTERNAL_LAUNCHER)
+    return parser
+
+
+def configure_ffn_engine_args(
+    args: Namespace, *, connector: str
+) -> tuple[AFDConfig, FFNLauncherEnvironment]:
+    """Validate the native engine arguments against the F-only launcher.
+
+    Applies vLLM serve's positional-model precedence, parses the FFN-role AFD
+    config, requires ``connector``, and requires the launcher ``WORLD_SIZE``,
+    ``--data-parallel-size`` and ``afd.num_ffn_ranks`` to agree. An omitted
+    ``--data-parallel-rank`` is taken from ``RANK``. Mutates ``args`` so
+    ``EngineArgs.from_cli_args`` sees the resolved model and DP rank.
+    """
+    if args.model_tag is not None:
+        # Match vLLM serve's positional-model precedence.
+        args.model = args.model_tag
+    afd = parse_afd_config(args.additional_config, expected_role="ffn")
+    if afd.connector != connector:
+        raise ValueError(f"this standalone FFN backend requires {connector}")
+    launcher = read_ffn_launcher_environment()
+    if (
+        launcher.world_size != afd.num_ffn_ranks
+        or launcher.world_size != args.data_parallel_size
+    ):
+        raise ValueError(
+            "F-only WORLD_SIZE, --data-parallel-size and "
+            "additional_config.afd.num_ffn_ranks must agree"
+        )
+    if args.data_parallel_rank is not None and args.data_parallel_rank != launcher.rank:
+        raise ValueError("--data-parallel-rank must match the F-only launcher RANK")
+    args.data_parallel_rank = launcher.rank
+    if args.distributed_executor_backend != EXTERNAL_LAUNCHER:
+        raise ValueError("standalone FFN requires the external_launcher backend")
+    return afd, launcher
 
 
 def reassert_external_launcher(config: VllmConfig) -> None:

@@ -35,7 +35,7 @@ class AscendFFNEnvironment(FFNEnvironmentBase[FFNConfig]):
     def __init__(self, settings: FFNConfig) -> None:
         super().__init__(settings, platform_name="Ascend")
 
-    def initialize_device(self) -> None:
+    def initialize_device(self, config: VllmConfig) -> None:
         self.require_uninitialized()
         self.require_launcher_environment()
         settings = self.settings
@@ -44,14 +44,25 @@ class AscendFFNEnvironment(FFNEnvironmentBase[FFNConfig]):
         bootstrap_custom_op_env()
         import torch
         import torch_npu  # noqa: F401
+        from vllm.platforms import current_platform
+        from vllm.platforms.interface import set_assigned_physical_gpu_ids
         from vllm_ascend.utils import enable_custom_op
 
         from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 
         self.require_no_borrowed_native_groups()
         ensure_cam_async_ops_available()
-        torch.npu.set_device(settings.device)
-        self._device = torch.device(f"npu:{settings.device}")
+        # Reuse the native Worker's mapping for --device-ids and visibility.
+        assigned = config.parallel_config.assigned_physical_gpu_ids
+        if assigned is not None:
+            if settings.local_rank >= len(assigned):
+                raise ValueError("LOCAL_RANK is outside the assigned device list")
+            set_assigned_physical_gpu_ids(assigned)
+        index = current_platform.logical_device_id_to_visible_device_id(
+            settings.local_rank
+        )
+        self._device = torch.device(f"npu:{index}")
+        torch.npu.set_device(self._device)
         # Native NPUModelRunner v1 installs this packing policy at import time.
         # This service does not import that runner; native W4A8 still needs NZ.
         torch.npu.config.allow_internal_format = True
@@ -87,7 +98,7 @@ class AscendFFNEnvironment(FFNEnvironmentBase[FFNConfig]):
             init_distributed_environment(
                 world_size=settings.ffn_ranks,
                 rank=settings.rank,
-                local_rank=settings.device,
+                local_rank=self.device.index,
                 distributed_init_method="env://",
                 backend="hccl",
                 timeout=timedelta(seconds=COMPUTE_GROUP_TIMEOUT_SECONDS),
@@ -126,7 +137,7 @@ class AscendFFNEnvironment(FFNEnvironmentBase[FFNConfig]):
             bind_cpus(
                 self.settings.local_rank,
                 npu_id=current_platform.device_id_to_physical_device_id(
-                    self.settings.device
+                    self.settings.local_rank
                 ),
                 migrate_memory=not (engram is not None and engram.cpu_offload),
             )

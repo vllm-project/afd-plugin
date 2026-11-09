@@ -9,60 +9,84 @@ from pathlib import Path
 
 import pytest
 
-from afd_plugin.config import connector_extra_config_from_source, parse_afd_config
+from afd_plugin.ffn_faas.platforms.npu.adapter import AscendCAMAdapter
 from afd_plugin.ffn_faas.platforms.npu.settings import (
     FFNConfig,
     validate_native_expert_map,
     validate_static_experts,
 )
+from tests.unit.fakes.ffn_faas import cam_cli_args
 
 
 @pytest.fixture
 def settings():
-    return FFNConfig(Path("/model"), attention_ranks=12, attention_tp=4, ffn_ranks=4)
+    return FFNConfig(Path("/model"), ffn_ranks=4)
 
 
-def test_existing_cam_configuration_roundtrip(settings):
-    config = settings.additional_config()
-    afd = parse_afd_config(config, expected_role="ffn")
-    assert afd.connector == "CAMAsyncAFDConnector"
-    assert afd.async_dp and afd.compute_gate_on_attention
-    assert (afd.num_attention_ranks, afd.num_ffn_ranks) == (12, 4)
-    assert connector_extra_config_from_source(config) == {
+@pytest.fixture
+def launcher(monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+
+
+@pytest.mark.parametrize("positional", [False, True])
+def test_engine_configuration_keeps_user_values(checkpoint_dir, launcher, positional):
+    args = cam_cli_args(checkpoint_dir)
+    if positional:
+        args.model = "/unused-option-model"
+        args.model_tag = str(checkpoint_dir)
+    launch = AscendCAMAdapter().configure(args)
+    assert (launch.rank, launch.local_rank) == (1, 1)
+    assert launch.model_path == str(checkpoint_dir)
+    assert args.model == str(checkpoint_dir)
+    assert args.data_parallel_rank == 1
+    assert args.additional_config["enable_cpu_binding"] is False
+    assert args.additional_config["afd"]["connector_extra_config"] == {
         "dynamicQuant": 1,
         "attn_ranks_per_dp": 4,
-    }
-
-
-def test_explicit_native_hccl_budget(settings):
-    settings = replace(settings, hccl_buffer_size=256)
-    assert connector_extra_config_from_source(settings.additional_config()) == {
-        "dynamicQuant": 1,
-        "attn_ranks_per_dp": 4,
-        "hccl_buffer_size": 256,
     }
 
 
 @pytest.mark.parametrize(
     "change",
     [
-        {"attention_ranks": 0},
-        {"attention_ranks": 11},
+        {"data_parallel_size": 1},
+        {"data_parallel_rank": 0},
+        {"distributed_executor_backend": "mp"},
+        {"receiver_shutdown_timeout": 0},
+    ],
+)
+def test_launcher_rejects_inconsistent_engine_arguments(
+    checkpoint_dir, launcher, change
+):
+    with pytest.raises(ValueError):
+        AscendCAMAdapter().configure(cam_cli_args(checkpoint_dir, **change))
+
+
+@pytest.mark.parametrize(
+    "field,value", [("port", 0), ("role", "attention"), ("num_ffn_ranks", 0)]
+)
+def test_cli_uses_existing_afd_validation(checkpoint_dir, launcher, field, value):
+    args = cam_cli_args(checkpoint_dir)
+    args.additional_config["afd"][field] = value
+    with pytest.raises(ValueError):
+        AscendCAMAdapter().configure(args)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
         {"ffn_ranks": 0},
-        {"attention_tp": 0},
-        {"max_num_batched_tokens": 2047},
         {"rank": 4},
         {"local_rank": -1},
-        {"device": -1},
-        {"port": 0},
-        {"port": 65536},
         {"shutdown_timeout": 0},
         {"shutdown_timeout": float("nan")},
         {"shutdown_timeout": float("inf")},
-        {"hccl_buffer_size": 0},
     ],
 )
-def test_invalid_launch_rejected_before_native_runtime(settings, change):
+def test_invalid_host_launch_rejected(settings, change):
     with pytest.raises(ValueError):
         replace(settings, **change)
 

@@ -59,8 +59,8 @@ class FFNLaunch:
 
 
 class FFNPlatformAdapter(Protocol):
-    """Register platform options and validate a CPU-only launch description."""
+    """Build the selected CLI and describe a launch without constructing a backend."""
 
-    def add_arguments(self, parser: ArgumentParser) -> None: ...
+    def create_parser(self) -> ArgumentParser: ...
 
     def configure(self, args: Namespace) -> FFNLaunch: ...

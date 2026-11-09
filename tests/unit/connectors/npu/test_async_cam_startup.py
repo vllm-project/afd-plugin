@@ -37,10 +37,11 @@ def test_startup_import_needs_no_torch_or_vllm_in_clean_process():
             "torch_npu=None, vllm_ascend=None); "
             "from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup "
             "import AsyncCAMGraphStartup; "
-            "from afd_plugin.connectors.npu.async_cam_runtime.async_cam_pull "
-            "import PullFFNSession; "
+            "from afd_plugin.connectors.npu.async_cam_runtime.async_cam_session "
+            "import PullCAMSession, PushCAMSession; "
             "assert AsyncCAMGraphStartup(0, 1, 2).mode == 'eager'; "
-            "assert PullFFNSession.requires_drain",
+            "assert PullCAMSession.requires_drain; "
+            "assert not PushCAMSession.requires_drain",
         ],
         capture_output=True,
         text=True,

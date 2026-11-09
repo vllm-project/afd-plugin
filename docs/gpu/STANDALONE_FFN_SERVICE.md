@@ -64,24 +64,34 @@ CUDA_VISIBLE_DEVICES=0,1 vllm serve "$MODEL_PATH" \
 CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc-per-node=2 \
   --master-addr=127.0.0.1 --master-port=29500 \
   -m afd_plugin.ffn_faas serve "$MODEL_PATH" --backend gpu-deepep-m2n \
-  --host 127.0.0.1 --port 6239 \
-  --attention-ranks 2 --ffn-ranks 2 \
-  --graph --dbo --afd-timeout 600 \
-  --connector-extra-config '{}' \
-  --status-port 29700
+  --data-parallel-size 2 --tensor-parallel-size 1 --enable-expert-parallel \
+  --additional-config '{"afd":{"role":"ffn","connector":"DeepEPM2NAFDConnector",
+      "host":"127.0.0.1","port":6239,"num_attention_ranks":2,"num_ffn_ranks":2,
+      "compute_gate_on_attention":true,"afd_process_group_timeout_s":600,
+      "connector_extra_config":{}}}' \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+  --enable-dbo --status-port 29700
 ```
 
 Three ports: the `torchrun` master port (F-only world), the AFD rendezvous
-`--port` (equal to Attention's `afd.port`) and the management port base.
+`afd.port` (equal to Attention's) and the management port base.
+
+Engine options use vLLM's native engine CLI, as for the
+[NPU service](../npu/STANDALONE_FFN_SERVICE.md); the AFD topology, rendezvous
+and connector options go in `--additional-config`, exactly as a `vllm serve`
+FFN would pass them. The executor defaults to `external_launcher`, and the GPU
+backend also defaults `--skip-tokenizer-init` and `--enable-ep-weight-filter`.
 
 | Option | Meaning |
 | --- | --- |
-| `--host`, `--port` | AFD rendezvous; equal to Attention's `afd.host`/`afd.port` |
-| `--attention-ranks`, `--ffn-ranks` | equal to Attention's AFD config; `WORLD_SIZE` must equal `--ffn-ranks` |
-| `--graph` | FULL_DECODE_ONLY CUDA graphs on F (default eager) |
-| `--dbo` | two DeepEP lanes; required exactly when Attention runs `--enable-dbo` |
-| `--connector-extra-config` | `DeepEPM2NAFDConnector` options (JSON object) |
-| `--afd-timeout` | `afd_process_group_timeout_s` for the M2N rendezvous (default 120) |
+| `afd.host`, `afd.port` | AFD rendezvous; equal to Attention's |
+| `afd.num_attention_ranks`, `afd.num_ffn_ranks` | equal to Attention's; `WORLD_SIZE`, `--data-parallel-size` and `afd.num_ffn_ranks` must agree |
+| `afd.connector_extra_config` | `DeepEPM2NAFDConnector` options |
+| `afd.afd_process_group_timeout_s` | M2N rendezvous timeout (default 120) |
+| `--tensor-parallel-size 1 --enable-expert-parallel` | required: EP spans all F ranks |
+| `--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'` or `--enforce-eager` | required: F graph or eager mode; other graph modes are rejected |
+| `--enable-dbo` | two DeepEP lanes; required exactly when Attention runs `--enable-dbo` |
+| `--receiver-shutdown-timeout` | host receive-loop join on stop (default 5 s) |
 
 F takes no Attention TP, batch size, model length or capture sizes: it adopts
 Attention's TP size, dispatch capacity and bucket ladder in the M2N handshake,
@@ -93,9 +103,9 @@ The handshake fails on both roles when they disagree:
 
 | Must agree | Attention | F |
 | --- | --- | --- |
-| Rank counts, AFD host/port | `afd` config | `--attention-ranks`, `--ffn-ranks`, `--host`, `--port` |
-| `payload_format`, `network`, `bucket_granularity`, `cpu_sync_min_tokens` | `connector_extra_config` | `--connector-extra-config` |
-| `num_lanes` | `--enable-dbo` | `--dbo` (an explicit `num_lanes` must agree) |
+| Rank counts, AFD host/port | `afd` config | `afd` config |
+| `payload_format`, `network`, `bucket_granularity`, `cpu_sync_min_tokens` | `connector_extra_config` | `connector_extra_config` |
+| `num_lanes` | `--enable-dbo` | `--enable-dbo` (an explicit `num_lanes` must agree) |
 | `capacity_tokens_per_rank` | derived or explicit | adopted, or explicit and equal |
 | Hidden size, experts, top-k, BF16 | checkpoint | the same checkpoint files |
 

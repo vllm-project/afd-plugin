@@ -7,79 +7,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from afd_plugin.config import AFD_ASYNC_CONNECTOR
-from afd_plugin.ffn_faas.platforms.launch import validate_common_ffn_launch
+from afd_plugin.ffn_faas.platforms.launch import validate_ffn_rank_settings
 
 
 @dataclass(frozen=True)
 class FFNConfig:
     model: Path
-    attention_ranks: int
-    attention_tp: int
     ffn_ranks: int
     rank: int = 0
     local_rank: int = 0
-    device: int = 0
-    host: str = "127.0.0.1"
-    port: int = 29600
-    max_num_batched_tokens: int = 2048
-    max_num_seqs: int = 256
-    full_graph: bool = False
-    hccl_buffer_size: int | None = None
     shutdown_timeout: float = 5.0
 
     def __post_init__(self) -> None:
-        positive = (
-            self.attention_tp,
-            self.max_num_batched_tokens,
-            self.max_num_seqs,
-        )
-        if any(value <= 0 for value in positive):
-            raise ValueError("Attention TP and scheduler capacities must be positive")
-        if self.attention_ranks % self.attention_tp:
-            raise ValueError("Attention ranks must be divisible by Attention TP")
-        if self.max_num_batched_tokens % self.attention_tp:
-            raise ValueError(
-                "the CAM dispatch envelope must be divisible by Attention TP"
-            )
-        validate_common_ffn_launch(
-            attention_ranks=self.attention_ranks,
+        # Engine/connector definitions and validation belong to vLLM/AFD.
+        # Only external-launcher and host-shutdown facts live here.
+        validate_ffn_rank_settings(
             ffn_ranks=self.ffn_ranks,
             rank=self.rank,
             local_rank=self.local_rank,
-            host=self.host,
-            port=self.port,
             shutdown_timeout=self.shutdown_timeout,
         )
-        if self.device < 0:
-            raise ValueError("invalid local NPU device")
-        if self.hccl_buffer_size is not None and self.hccl_buffer_size <= 0:
-            raise ValueError("explicit CAM HCCL buffer size must be positive")
-
-    def additional_config(self) -> dict:
-        extra = {
-            "dynamicQuant": 1,
-            "attn_ranks_per_dp": self.attention_tp,
-        }
-        if self.hccl_buffer_size is not None:
-            extra["hccl_buffer_size"] = self.hccl_buffer_size
-        return {
-            "afd": {
-                "connector": AFD_ASYNC_CONNECTOR,
-                "role": "ffn",
-                "async_dp": True,
-                "host": self.host,
-                "port": self.port,
-                "num_attention_ranks": self.attention_ranks,
-                "num_ffn_ranks": self.ffn_ranks,
-                "compute_gate_on_attention": True,
-                "connector_extra_config": extra,
-            },
-            "enable_prefill_mc2": False,
-            "enable_force_eplb": False,
-            "enable_cpu_binding": True,
-            "ascend_fusion_config": {"fusion_ops_gmmswigluquant": True},
-        }
 
 
 def validate_static_experts(

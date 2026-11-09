@@ -175,3 +175,101 @@ def test_cpu_entry_rejects_platform_imports(
     assert result.returncode == 1
     assert f"CPU host contract imported {package}" in result.stderr
     assert "platform stub ran" not in result.stderr
+
+
+@pytest.fixture
+def engine_parser():
+    pytest.importorskip("vllm")
+    from afd_plugin.ffn_faas.__main__ import create_parser
+    from afd_plugin.ffn_faas.platforms.npu.adapter import AscendCAMAdapter
+
+    return create_parser(AscendCAMAdapter())
+
+
+@pytest.fixture(params=[False, True], ids=["eager", "full"])
+def native_engine_case(engine_parser, request):
+    from vllm.engine.arg_utils import EngineArgs
+
+    graph = request.param
+    config = {
+        "enable_cpu_binding": False,
+        "afd": {
+            "connector": "CAMAsyncAFDConnector",
+            "role": "ffn",
+            "connector_extra_config": {"hccl_buffer_size": 256},
+        },
+    }
+    mode = (
+        ["--compilation-config", '{"cudagraph_mode":"FULL"}']
+        if graph
+        else ["--enforce-eager"]
+    )
+    parsed = engine_parser.parse_args(
+        [
+            "serve",
+            "/model",
+            "--dtype",
+            "bfloat16",
+            "--max-num-batched-tokens",
+            "2K",
+            "--max-num-seqs",
+            "8",
+            "--data-parallel-size",
+            "4",
+            "--device-ids",
+            "4,5,6,7",
+            "--additional-config",
+            json.dumps(config),
+            "--shutdown-timeout",
+            "0",
+            "--receiver-shutdown-timeout",
+            "0.5",
+            *mode,
+        ]
+    )
+    return (
+        graph,
+        config,
+        EngineArgs.from_cli_args(parsed),
+        parsed.receiver_shutdown_timeout,
+    )
+
+
+def test_native_engine_options_preserve_configuration(native_engine_case):
+    graph, config, args, receiver_timeout = native_engine_case
+    assert args.max_num_batched_tokens == 2048
+    assert args.max_num_seqs == 8
+    assert args.dtype == "bfloat16" and args.data_parallel_size == 4
+    assert args.device_ids == [4, 5, 6, 7]
+    assert args.additional_config == config
+    assert args.shutdown_timeout == 0 and receiver_timeout == 0.5
+    assert args.enforce_eager is (not graph)
+    if graph:
+        assert args.compilation_config.cudagraph_mode.name == "FULL"
+
+
+def test_native_dotted_json_options(engine_parser):
+    from vllm.engine.arg_utils import EngineArgs
+
+    parsed = engine_parser.parse_args(
+        [
+            "serve",
+            "/model",
+            "--additional-config.afd.role",
+            "ffn",
+            "--additional-config.afd.port",
+            "29600",
+            "--compilation-config.cudagraph_mode",
+            "FULL",
+        ]
+    )
+    args = EngineArgs.from_cli_args(parsed)
+    assert args.additional_config == {"afd": {"role": "ffn", "port": 29600}}
+    assert args.compilation_config.cudagraph_mode.name == "FULL"
+
+
+@pytest.mark.parametrize("flag", ["--full-graph", "--attention-ranks", "--devices"])
+def test_retired_standalone_engine_flags_are_rejected(engine_parser, flag):
+    with pytest.raises(SystemExit) as error:
+        engine_parser.parse_args(["serve", "/model", flag])
+    assert error.value.code == 2

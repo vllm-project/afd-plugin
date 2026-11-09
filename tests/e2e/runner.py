@@ -731,7 +731,7 @@ def build_vllm_command(
         afd_config["afd"]["compute_gate_on_attention"] = True
     if uses_ffn_faas(args):
         # Attention pairs with an independently started FFN service; keep
-        # its rendezvous timeout equal to the FFN service's --afd-timeout.
+        # its rendezvous timeout equal to the FFN service's AFD config.
         afd_config["afd"]["afd_process_group_timeout_s"] = FFN_FAAS_AFD_TIMEOUT_S
     connector_extra_config = parse_afd_connector_extra_config(
         args.afd_connector_extra_config,
@@ -958,22 +958,31 @@ def build_ffn_faas_command(
         args.model,
         "--backend",
         FFN_FAAS_BACKEND,
-        "--host",
-        args.afd_host,
-        "--port",
-        str(args.afd_port),
-        "--attention-ranks",
-        str(args.num_attention_ranks),
-        "--ffn-ranks",
+        "--data-parallel-size",
         str(args.num_ffn_ranks),
-        "--connector-extra-config",
+        "--tensor-parallel-size",
+        "1",
+        "--enable-expert-parallel",
+        "--additional-config",
         json.dumps(
-            parse_afd_connector_extra_config(args.afd_connector_extra_config),
+            {
+                "afd": {
+                    "role": "ffn",
+                    "connector": DEEPEP_M2N_CONNECTOR,
+                    "host": args.afd_host,
+                    "port": args.afd_port,
+                    "num_attention_ranks": args.num_attention_ranks,
+                    "num_ffn_ranks": args.num_ffn_ranks,
+                    "compute_gate_on_attention": True,
+                    "afd_process_group_timeout_s": FFN_FAAS_AFD_TIMEOUT_S,
+                    "connector_extra_config": parse_afd_connector_extra_config(
+                        args.afd_connector_extra_config
+                    ),
+                },
+            },
             separators=(",", ":"),
         ),
-        "--afd-timeout",
-        str(FFN_FAAS_AFD_TIMEOUT_S),
-        "--shutdown-timeout",
+        "--receiver-shutdown-timeout",
         str(FFN_FAAS_SHUTDOWN_TIMEOUT_S),
         "--status-host",
         args.api_host,
@@ -983,9 +992,17 @@ def build_ffn_faas_command(
         str(status_file),
     ]
     if args.cuda_graph_full_decode_only:
-        command.append("--graph")
-    if args.enable_dbo:
-        command.append("--dbo")
+        command.extend(
+            [
+                "--compilation-config",
+                json.dumps(
+                    {"cudagraph_mode": "FULL_DECODE_ONLY"}, separators=(",", ":")
+                ),
+            ]
+        )
+    else:
+        command.append("--enforce-eager")
+    command.extend(dbo_vllm_arguments(args))
     return command
 
 

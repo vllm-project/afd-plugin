@@ -345,18 +345,27 @@ def _start_ffn_service(
         str(checkpoint),
         "--backend",
         "gpu-deepep-m2n",
-        "--host",
-        HOST,
-        "--port",
-        str(afd_port),
-        "--attention-ranks",
-        str(TOPOLOGY.attn_size),
-        "--ffn-ranks",
+        "--data-parallel-size",
         str(TOPOLOGY.ffn_size),
-        "--connector-extra-config",
-        json.dumps(extra_config),
-        "--afd-timeout",
-        str(afd_timeout_s),
+        "--tensor-parallel-size",
+        "1",
+        "--enable-expert-parallel",
+        "--additional-config",
+        json.dumps(
+            {
+                "afd": {
+                    "role": "ffn",
+                    "connector": "DeepEPM2NAFDConnector",
+                    "host": HOST,
+                    "port": afd_port,
+                    "num_attention_ranks": TOPOLOGY.attn_size,
+                    "num_ffn_ranks": TOPOLOGY.ffn_size,
+                    "compute_gate_on_attention": True,
+                    "afd_process_group_timeout_s": afd_timeout_s,
+                    "connector_extra_config": extra_config,
+                }
+            }
+        ),
         "--status-host",
         HOST,
         # Port 0: each rank binds a free port and prints it.
@@ -364,7 +373,11 @@ def _start_ffn_service(
         "0",
         "--status-file",
         str(status_file),
-        *(["--graph"] if graph else []),
+        *(
+            ["--compilation-config", '{"cudagraph_mode":"FULL_DECODE_ONLY"}']
+            if graph
+            else ["--enforce-eager"]
+        ),
     ]
     with log_path.open("wb") as log:
         return subprocess.Popen(

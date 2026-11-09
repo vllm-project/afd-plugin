@@ -17,6 +17,7 @@ from afd_plugin.ffn_faas.platforms.npu.v4_model import (
     V4CheckpointDescription,
     V4ModelAdapter,
 )
+from tests.unit.fakes.vllm_config import npu_vllm_config
 
 
 def test_main_routed_metadata_without_parameter_allocation(checkpoint_dir):
@@ -91,16 +92,16 @@ def test_model_selection_rejects_other_quantization_before_loading(checkpoint_di
 def test_wrong_compute_world_rejected_before_native_imports(
     checkpoint_dir, monkeypatch
 ):
-    settings = FFNConfig(checkpoint_dir, attention_ranks=1, attention_tp=1, ffn_ranks=2)
+    settings = FFNConfig(checkpoint_dir, ffn_ranks=2)
     environment = AscendFFNEnvironment(settings)
     monkeypatch.setenv("RANK", "0")
     monkeypatch.setenv("WORLD_SIZE", "1")
     with pytest.raises(ValueError, match="differs from the F-only"):
-        environment.initialize_device()
+        environment.initialize_device(npu_vllm_config(role="ffn"))
 
 
 def test_unused_compute_owner_can_close_without_importing_runtime(checkpoint_dir):
-    settings = FFNConfig(checkpoint_dir, attention_ranks=1, attention_tp=1, ffn_ranks=1)
+    settings = FFNConfig(checkpoint_dir, ffn_ranks=1)
     environment = AscendFFNEnvironment(settings)
     environment.close()
     with pytest.raises(RuntimeError, match="device has not been initialized"):

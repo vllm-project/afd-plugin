@@ -19,6 +19,8 @@ from afd_plugin.ffn_faas.platforms.gpu.settings import GPUFFNConfig
 from afd_plugin.ffn_faas.platforms.launch import reassert_external_launcher
 
 if TYPE_CHECKING:
+    from argparse import Namespace
+
     from vllm.config import VllmConfig
 
 # afdEP-comm transport and the DeepGEMM grouped GEMMs the connector runs; both
@@ -87,15 +89,17 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
         torch.accelerator.set_device_index(device)
         self._device = device
 
-    # NPU parallel: CAMFFNBackend.prepare (EngineArgs, create_engine_config,
-    #   re-asserted external_launcher).
-    # Reuse: YES - both use the shared F-only EngineArgs and launcher helpers.
-    def build_config(self) -> VllmConfig:
+    # NPU parallel: CAMFFNBackend.prepare (EngineArgs.from_cli_args,
+    #   create_engine_config, re-asserted external_launcher).
+    # Reuse: YES - both build from the native engine CLI and re-assert the
+    #   shared external launcher.
+    def build_config(self, args: Namespace) -> VllmConfig:
         """Build the F-only ``VllmConfig`` exactly as the GPU FFN Worker sees it.
 
-        Creates the config from ``GPUFFNConfig.engine_kwargs`` through
-        ``EngineArgs.create_engine_config`` (with the AFD plugin's config
-        patches, which accept DBO without a DeepEP all2all backend), then
+        Creates the config from the native engine CLI arguments through
+        ``EngineArgs.from_cli_args`` and ``create_engine_config`` (with the
+        AFD plugin's config patches, which accept DBO without a DeepEP
+        all2all backend), then
         re-asserts the ``external_launcher`` executor, swaps in the
         FFN-only routed-experts architecture that ``AFDFFNWorker.init_device``
         selects for this connector, and pins vLLM's MoE backend to Triton as
@@ -110,7 +114,7 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
             select_routed_moe_backend,
         )
 
-        config = EngineArgs(**self.settings.engine_kwargs()).create_engine_config()
+        config = EngineArgs.from_cli_args(args).create_engine_config()
         # The F world is the already launched torchrun world, whatever executor
         # platform defaults would pick for an ordinary engine.
         reassert_external_launcher(config)

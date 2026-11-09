@@ -13,6 +13,7 @@ import traceback
 from contextlib import suppress
 from pathlib import Path
 
+from afd_plugin.ffn_faas.interfaces import FFNPlatformAdapter
 from afd_plugin.ffn_faas.platforms import SUPPORTED_BACKENDS, get_platform_adapter
 from afd_plugin.ffn_faas.runner import FFNModelRunner
 from afd_plugin.ffn_faas.service import FFNService
@@ -24,6 +25,24 @@ def _report_exception() -> None:
         traceback.print_exc()
 
 
+def create_parser(adapter: FFNPlatformAdapter) -> argparse.ArgumentParser:
+    parser = adapter.create_parser()
+    parser.description = __doc__
+    parser.add_argument("command", choices=["serve"])
+    parser.add_argument("model_tag", nargs="?", help="local model checkpoint")
+    parser.add_argument("--backend", choices=SUPPORTED_BACKENDS, default="ascend-cam")
+    parser.add_argument(
+        "--receiver-shutdown-timeout",
+        type=float,
+        default=5.0,
+        help="seconds to join the standalone receiver before process isolation",
+    )
+    parser.add_argument("--status-host", default="127.0.0.1")
+    parser.add_argument("--status-port", type=int, default=29700)
+    parser.add_argument("--status-file", type=Path)
+    return parser
+
+
 def main() -> int:
     selection = argparse.ArgumentParser(add_help=False)
     selection.add_argument(
@@ -31,15 +50,7 @@ def main() -> int:
     )
     selected, _ = selection.parse_known_args()
     adapter = get_platform_adapter(selected.backend)
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["serve"])
-    parser.add_argument("model", type=Path)
-    parser.add_argument("--backend", choices=SUPPORTED_BACKENDS, default="ascend-cam")
-    parser.add_argument("--shutdown-timeout", type=float, default=5.0)
-    parser.add_argument("--status-host", default="127.0.0.1")
-    parser.add_argument("--status-port", type=int, default=29700)
-    parser.add_argument("--status-file", type=Path)
-    adapter.add_arguments(parser)
+    parser = create_parser(adapter)
     args = parser.parse_args()
     try:
         launch = adapter.configure(args)

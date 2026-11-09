@@ -54,33 +54,71 @@ afd_cam_vendor=/path/to/afd_plugin/_cann_ops_custom/vendors/afd-plugin
 ascend_native_vendor=/path/to/vllm_ascend/_cann_ops_custom/vendors/custom_transformer
 export ASCEND_CUSTOM_OPP_PATH="$ascend_native_vendor:$afd_cam_vendor${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
 export VLLM_USE_V2_MODEL_RUNNER=1
-# F-only setting: keep this unset or 0 in the Attention environment.
-export AFD_ASYNC_CAM_LAYERED_GMM=1
 export SOC_VERSION=910c
 export VLLM_PLUGINS=ascend,afd,ascend_model,ascend_model_loader,ascend_kv_connector
 # Keep BATCH_SIZE_FACTOR, HCCL/network settings and receive capacity consistent
 # with the existing A launch and CAM runtime guide.
+export ASCEND_RT_VISIBLE_DEVICES=12,13,14,15
 torchrun --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29500 \
   -m afd_plugin.ffn_faas serve /path/to/model --backend ascend-cam \
-  --host 127.0.0.1 --port 29600 \
-  --attention-ranks 12 --attention-tp 4 --ffn-ranks 4 \
-  --devices 12,13,14,15 --max-num-batched-tokens 2048 \
-  --full-graph --status-port 29700
+  --trust-remote-code --dtype bfloat16 --quantization ascend \
+  --enable-expert-parallel --data-parallel-size 4 \
+  --max-num-batched-tokens 2048 --max-num-seqs 256 \
+  --compilation-config '{"cudagraph_mode":"FULL"}' \
+  --additional-config '{
+    "afd": {
+      "connector":"CAMAsyncAFDConnector","role":"ffn","async_dp":true,
+      "host":"127.0.0.1","port":29600,
+      "num_attention_ranks":12,"num_ffn_ranks":4,
+      "compute_gate_on_attention":true,
+      "connector_extra_config":{
+        "dynamicQuant":1,"attn_ranks_per_dp":4
+      }
+    },
+    "enable_prefill_mc2":false,"enable_force_eplb":false,"enable_cpu_binding":true,
+    "ascend_fusion_config":{"fusion_ops_gmmswigluquant":true}
+  }' --status-port 29700
 ```
 
-`--devices` indexes the process's visible logical devices, not physical IDs.
-When F has a restricted visibility list, use `--devices 0,1,2,3` instead. The
-external launcher's `WORLD_SIZE` is F-only. CAM creates the separate
-`[A0 ... A11, F0 ... F3]` world using the same host, port, group name, topology,
-quantization, layer table and startup signatures as traditional F. Use a
-different rendezvous port for the F-only compute world and CAM.
+Engine arguments use vLLM's `FlexibleArgumentParser`, `EngineArgs.add_cli_args`
+and `EngineArgs.from_cli_args`; definitions, JSON/dotted options, defaults and
+configuration validation come from the pinned upstream stack. The selected
+Ascend CLI imports that layer, while importing the Service, host runner or
+platform adapter module remains CPU-only. No serving engine is constructed.
+
+Use `--additional-config` for the existing AFD topology, connector and HCCL
+options. Engine capacities and compilation are passed through
+without rebuilding a second configuration. Only backend selection, management
+endpoints, status files and shutdown control add standalone options. The old
+`--full-graph`, `--attention-ranks`, `--attention-tp`, `--ffn-ranks`, `--devices`
+and standalone stream/budget flags have been removed; update launch scripts to
+the standard options above. Device selection uses the native `--device-ids`
+mapping or `ASCEND_RT_VISIBLE_DEVICES` plus the launcher's `LOCAL_RANK`.
+
+The external launcher's `WORLD_SIZE`, `--data-parallel-size` and
+`additional_config.afd.num_ffn_ranks` must agree. An omitted
+`--data-parallel-rank` is taken from `RANK`; an explicit value must match it.
+The executor defaults to `external_launcher` because torchrun already owns
+these processes. Set `VLLM_USE_V2_MODEL_RUNNER=1` as on A. All other engine
+options retain upstream defaults; the example explicitly selects the qualified
+W4A8 profile. Reusing the parser does not qualify additional models, speculative
+loading or serving/KV features for this service.
+
+The host receive-loop join uses `--receiver-shutdown-timeout` (default: five
+seconds). It is separate from vLLM's `--shutdown-timeout`, whose EngineCore
+shutdown semantics do not govern this standalone receiver.
+
+CAM creates the separate `[A0 ... A11, F0 ... F3]` world using the same host,
+port, group name, topology, quantization, layer table and startup signatures as
+traditional F. Use a different rendezvous port for the F-only compute world
+and CAM.
 
 `--max-num-batched-tokens` must match A's dispatch envelope; it is not the
-maximum request context length. F creates configuration objects for native
-loading, but allocates no request KV cache. Omit `--full-graph` to use the
-mature layered eager path. FULL preserves paired warmup, private graph pools
-and device layer selection. FFN two-stream execution and its core-budget
-options were removed in #550; older launch commands must omit those options.
+maximum request context length. F allocates no request KV cache. To use eager,
+replace `--compilation-config` with `--enforce-eager`. FULL preserves paired
+warmup, private graph pools and device layer selection. FFN two-stream
+execution and its core-budget options were removed in #550; older launch
+commands must omit those options.
 
 ## Management and shutdown
 
@@ -93,7 +131,7 @@ Each local F rank exposes a management endpoint on `--status-port + LOCAL_RANK`.
   weights and paired CAM startup are prepared. Neither proves progress of an
   outstanding device receive.
 - `POST /stop`, SIGINT and SIGTERM request a stop between completed batches.
-  The host joins its receive loop for `--shutdown-timeout` seconds.
+  The host joins its receive loop for `--receiver-shutdown-timeout` seconds.
 
 The shutdown timeout does not cancel a CAM operator or prove device quiescence.
 It applies after startup; native loading and rendezvous retain their existing

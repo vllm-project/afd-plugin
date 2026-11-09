@@ -12,7 +12,9 @@ transport logic are not re-implemented: they belong to
 from __future__ import annotations
 
 import threading
+from argparse import Namespace
 
+import torch
 from vllm.config import set_current_vllm_config
 
 from afd_plugin.connectors.gpu.deepep_m2n.connector import DeepEPM2NAFDConnector
@@ -37,9 +39,10 @@ from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (
 class DeepEPM2NFFNBackend:
     """Keep weights and communication owners until receiver exit is proven."""
 
-    def __init__(self, settings: GPUFFNConfig) -> None:
+    def __init__(self, settings: GPUFFNConfig, args: Namespace) -> None:
         """Hold the CPU-side launch facts; native work starts in ``prepare``."""
         self.settings = settings
+        self.args = args
         self.environment = GPUFFNEnvironment(settings)
         self.runner: GPUFFNRoutedExpertsModelRunner | None = None
         self.model: RoutedExpertsModel | None = None
@@ -71,7 +74,7 @@ class DeepEPM2NFFNBackend:
         """
         environment = self.environment
         environment.initialize_device()
-        config = environment.build_config()
+        config = environment.build_config(self.args)
         environment.initialize_compute(config)
         with set_current_vllm_config(config):
             self.runner = GPUFFNRoutedExpertsModelRunner(config, environment.device)
@@ -91,6 +94,10 @@ class DeepEPM2NFFNBackend:
                 for layer_idx in self.runner.moe_layer_indices
             )
             service.loading_progress(total_experts, total_experts)
+            if not isinstance(model, torch.nn.Module):
+                raise TypeError(
+                    f"FFN-only model must be a torch module, got {type(model).__name__}"
+                )
             parameter_bytes = parameter_storage_bytes(model)
             local_expert_ids = self.runner.local_experts[
                 self.runner.moe_layer_indices[0]

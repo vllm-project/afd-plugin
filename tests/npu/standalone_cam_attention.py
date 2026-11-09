@@ -31,15 +31,33 @@ from afd_plugin.connectors.metadata import (  # noqa: E402
     AFDTransferMetadata,
 )
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector  # noqa: E402
-from afd_plugin.ffn_faas.platforms.npu.settings import FFNConfig  # noqa: E402
 from afd_plugin.ffn_faas.platforms.npu.v4_model import (  # noqa: E402
     V4CheckpointDescription,
 )
 
 
-def attention_config(checkpoint, settings):
-    additional = settings.additional_config()
-    additional["afd"]["role"] = "attention"
+def attention_config(checkpoint, args):
+    additional = {
+        "afd": {
+            "connector": "CAMAsyncAFDConnector",
+            "role": "attention",
+            "async_dp": True,
+            "host": "127.0.0.1",
+            "port": args.port,
+            "num_attention_ranks": 1,
+            "num_ffn_ranks": args.ffn_ranks,
+            "compute_gate_on_attention": True,
+            "connector_extra_config": {
+                "dynamicQuant": 1,
+                "attn_ranks_per_dp": 1,
+                "hccl_buffer_size": 64,
+            },
+        },
+        "enable_prefill_mc2": False,
+        "enable_force_eplb": False,
+        "enable_cpu_binding": True,
+        "ascend_fusion_config": {"fusion_ops_gmmswigluquant": True},
+    }
     return SimpleNamespace(
         additional_config=additional,
         model_config=SimpleNamespace(
@@ -54,9 +72,7 @@ def attention_config(checkpoint, settings):
                 model_type="deepseek_v4",
             ),
         ),
-        scheduler_config=SimpleNamespace(
-            max_num_batched_tokens=settings.max_num_batched_tokens
-        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
         parallel_config=SimpleNamespace(
             enable_dbo=False,
             use_ubatching=False,
@@ -89,17 +105,7 @@ def main():
     )
     args = parser.parse_args()
     checkpoint = V4CheckpointDescription.read(args.model)
-    settings = FFNConfig(
-        args.model,
-        attention_ranks=1,
-        attention_tp=1,
-        ffn_ranks=args.ffn_ranks,
-        port=args.port,
-        max_num_batched_tokens=32,
-        max_num_seqs=8,
-        hccl_buffer_size=64,
-    )
-    config = attention_config(checkpoint, settings)
+    config = attention_config(checkpoint, args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     ensure_cam_async_ops_available()
     torch.npu.set_device(args.device)

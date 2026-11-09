@@ -1,30 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""CPU-only launch adaptation for the GPU DeepEP M2N FFN service.
+"""GPU DeepEP M2N CLI adaptation; importing this module remains CPU-only.
 
-Imports neither torch, vLLM nor afdEP: every check here runs before a device
-or process group exists, so a bad launch exits with a usage error and
-allocates nothing. Native imports happen in the backend factory.
+Imports neither torch, vLLM nor afdEP at module import: ``create_parser``
+loads vLLM's CLI layer for the selected backend, and every check in
+``configure`` runs before a device or process group exists, so a bad launch
+exits with a usage error and allocates nothing. Native imports happen in the
+backend factory.
 """
 
 from __future__ import annotations
 
 from argparse import ArgumentParser, Namespace
 from functools import partial
+from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from afd_plugin.config import DEEPEP_M2N_CONNECTOR
 from afd_plugin.ffn_faas.interfaces import FFNLaunch
 from afd_plugin.ffn_faas.platforms.gpu.settings import (
     BF16_PAYLOAD,
-    DEFAULT_AFD_PORT,
-    DEFAULT_AFD_TIMEOUT_S,
+    FFN_GRAPH_MODE,
     GPUFFNConfig,
-    parse_connector_extra_config,
 )
 from afd_plugin.ffn_faas.platforms.launch import (
-    read_ffn_launcher_environment,
-    require_v2_model_runner,
+    configure_ffn_engine_args,
+    create_ffn_engine_parser,
 )
 
 if TYPE_CHECKING:
@@ -35,9 +37,7 @@ if TYPE_CHECKING:
 #   (bootstraps the Ascend OPP environment, then imports the backend).
 # Reuse: PARTIAL - the deferred-import factory shape is the same; GPU needs
 #   no environment bootstrap before importing torch.
-def create_backend(
-    settings: GPUFFNConfig,
-) -> FFNBackend:
+def create_backend(settings: GPUFFNConfig, args: Namespace) -> FFNBackend:
     """Import the GPU backend only when the host loop constructs it.
 
     Called by ``FFNModelRunner.run`` after the management endpoint is up, so
@@ -46,83 +46,79 @@ def create_backend(
     """
     from afd_plugin.ffn_faas.platforms.gpu.backend import DeepEPM2NFFNBackend
 
-    return DeepEPM2NFFNBackend(settings)
+    return DeepEPM2NFFNBackend(settings, args)
+
+
+def uses_cuda_graphs(args: Namespace) -> bool:
+    """Return the qualified execution mode selected by the native engine CLI.
+
+    ``--enforce-eager`` selects eager; otherwise the compilation config must
+    name ``FULL_DECODE_ONLY``, the only graph mode the FFN graph cache
+    serves. Any other mode, including vLLM's unset default, is a usage error.
+    """
+    if args.enforce_eager:
+        return False
+    compilation = args.compilation_config
+    mode = (
+        compilation.get("cudagraph_mode")
+        if isinstance(compilation, dict)
+        else getattr(compilation, "cudagraph_mode", None)
+    )
+    if getattr(mode, "name", mode) != FFN_GRAPH_MODE:
+        raise ValueError(
+            "GPU standalone FFN runs --enforce-eager or --compilation-config "
+            f'\'{{"cudagraph_mode":"{FFN_GRAPH_MODE}"}}\''
+        )
+    return True
 
 
 # NPU parallel: afd_plugin/ffn_faas/platforms/npu/adapter.py::AscendCAMAdapter.
-# Reuse: YES - the shared launch module owns the F-only torchrun and
-#   ModelRunnerV2 checks. The option set still differs because GPU adopts
-#   Attention TP, capacity and the bucket ladder from the M2N handshake.
+# Reuse: YES - the shared launch module owns the native engine parser and the
+#   F-only launcher checks. GPU additionally fixes TP 1 with expert parallel,
+#   the execution mode and the lane count, and adopts Attention TP, capacity
+#   and the bucket ladder from the M2N handshake.
 class GPUDeepEPM2NAdapter:
     """Keep GPU, topology and connector options out of the host loop."""
 
-    def add_arguments(self, parser: ArgumentParser) -> None:
-        """Register the GPU backend's options on the shared ``serve`` parser.
+    def create_parser(self) -> ArgumentParser:
+        """Build vLLM's engine CLI with the F-only service's fixed defaults.
 
-        ``--host``/``--port`` must equal Attention's ``afd.host``/``afd.port``,
-        ``--attention-ranks``/``--ffn-ranks`` its rank counts, ``--dbo`` its
-        ``--enable-dbo`` and ``--connector-extra-config`` its must-match
-        connector keys. There is no Attention TP, batch or capture-size flag:
-        F learns them from the M2N handshake and control payloads.
+        F reads no request text, so the tokenizer is skipped, and non-local
+        expert tensors are skipped before they are read, as the Worker-path
+        recipes do.
         """
-        parser.add_argument("--host", default="127.0.0.1", help="AFD rendezvous host")
-        parser.add_argument(
-            "--port", type=int, default=DEFAULT_AFD_PORT, help="AFD rendezvous port"
-        )
-        parser.add_argument("--attention-ranks", type=int, required=True)
-        parser.add_argument("--ffn-ranks", type=int, required=True)
-        parser.add_argument(
-            "--graph",
-            action="store_true",
-            help="capture FULL_DECODE_ONLY CUDA graphs on F (default: eager)",
-        )
-        parser.add_argument(
-            "--dbo",
-            action="store_true",
-            help="two DeepEP lanes; required when Attention runs --enable-dbo",
-        )
-        parser.add_argument(
-            "--connector-extra-config",
-            default="{}",
-            help="DeepEPM2NAFDConnector options as a JSON object",
-        )
-        parser.add_argument(
-            "--afd-timeout",
-            type=int,
-            default=DEFAULT_AFD_TIMEOUT_S,
-            help="afd_process_group_timeout_s for the M2N rendezvous",
-        )
+        parser = create_ffn_engine_parser()
+        parser.set_defaults(skip_tokenizer_init=True, enable_ep_weight_filter=True)
+        return parser
 
     def configure(self, args: Namespace) -> FFNLaunch:
         """Validate the launch on the CPU and describe the backend to build.
 
-        Reads this rank from the ``torchrun`` environment and requires the
-        F-only world (``WORLD_SIZE == --ffn-ranks``) and
-        ``VLLM_USE_V2_MODEL_RUNNER=1`` (Attention runs ModelRunnerV2 and the
-        FFN runner validates the same deployment). Parses the connector JSON
-        structurally and resolves the model path without interpreting its
-        architecture; vLLM and the AFD model registry own model selection.
-        Raises ``ValueError`` or ``OSError``, which the entry point reports as
-        a usage error.
+        ``additional_config["afd"]`` must select ``DeepEPM2NAFDConnector`` in
+        the ``ffn`` role, and the ``torchrun`` ``WORLD_SIZE``,
+        ``--data-parallel-size`` and ``afd.num_ffn_ranks`` must agree. TP is 1
+        with expert parallelism, so vLLM's EP group is the F world. The model
+        path is resolved without interpreting its architecture; vLLM and the
+        AFD model registry own model selection. Raises ``ValueError`` or
+        ``OSError``, which the entry point reports as a usage error.
         """
-        launcher = read_ffn_launcher_environment(args.ffn_ranks)
-        require_v2_model_runner()
-        model_path = args.model.resolve(strict=True)
+        afd, launcher = configure_ffn_engine_args(args, connector=DEEPEP_M2N_CONNECTOR)
+        if args.tensor_parallel_size != 1 or not args.enable_expert_parallel:
+            raise ValueError(
+                "GPU standalone FFN requires --tensor-parallel-size 1 and "
+                "--enable-expert-parallel"
+            )
+        model_path = Path(args.model).resolve(strict=True)
+        args.model = str(model_path)
         settings = GPUFFNConfig(
             model=model_path,
-            attention_ranks=args.attention_ranks,
-            ffn_ranks=args.ffn_ranks,
+            ffn_ranks=launcher.world_size,
             rank=launcher.rank,
             local_rank=launcher.local_rank,
-            host=args.host,
-            port=args.port,
-            graph=args.graph,
-            dbo=args.dbo,
-            connector_extra_config=parse_connector_extra_config(
-                args.connector_extra_config
-            ),
-            afd_timeout_s=args.afd_timeout,
-            shutdown_timeout=args.shutdown_timeout,
+            graph=uses_cuda_graphs(args),
+            dbo=bool(args.enable_dbo),
+            connector_extra_config=MappingProxyType(dict(afd.connector_extra_config)),
+            shutdown_timeout=args.receiver_shutdown_timeout,
         )
         return FFNLaunch(
             rank=launcher.rank,
@@ -130,7 +126,7 @@ class GPUDeepEPM2NAdapter:
             model_path=str(model_path),
             backend_name=DEEPEP_M2N_CONNECTOR,
             shutdown_timeout=settings.shutdown_timeout,
-            backend_factory=partial(create_backend, settings),
+            backend_factory=partial(create_backend, settings, args),
             initial_status={
                 "payload_format": BF16_PAYLOAD,
                 "num_lanes": settings.num_lanes,
