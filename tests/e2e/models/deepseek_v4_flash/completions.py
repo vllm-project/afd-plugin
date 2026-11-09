@@ -11,8 +11,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-import httpx
-
 from tests.e2e.case import JsonValue
 from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_COMPLETION_MAX_TOKENS,
@@ -51,6 +49,10 @@ def evaluate_completions(
     exercises live decode after the answer's first token, rather than only
     checking a one-token answer computed by the eager prefill.
     """
+    # Case declarations are imported during collection; load the client only
+    # when the runner executes this task.
+    import httpx
+
     results: list[dict] = [
         {
             "index": index,

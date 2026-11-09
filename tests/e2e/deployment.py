@@ -85,6 +85,7 @@ class ResolvedDeployment:
     def command(self, role: str, probe_arguments: tuple[str, ...] = ()) -> list[str]:
         profile = self.case.deployment
         layout = dict(profile.roles)[role]
+        dbo = profile.dbo_for_role(role)
         env = self.environment
         slot = next((slot for slot in self.slots if slot.role == role), None)
         cmd = [
@@ -157,7 +158,7 @@ class ResolvedDeployment:
         cmd.extend(probe_arguments)
         # Native baseline emits DBO before graph flags; preserve existing CLI.
         if profile.is_baseline:
-            cmd.extend(dbo_arguments(profile.dbo or layout.dbo))
+            cmd.extend(dbo_arguments(dbo))
         if profile.max_num_seqs is not None:
             cmd.extend(["--max-num-seqs", str(profile.max_num_seqs)])
         if profile.max_num_batched_tokens is not None:
@@ -188,7 +189,7 @@ class ResolvedDeployment:
         else:
             cmd.append("--enforce-eager")
         if not profile.is_baseline:
-            cmd.extend(dbo_arguments(profile.dbo or layout.dbo))
+            cmd.extend(dbo_arguments(dbo))
         port = env.api_port_base + (role == "ffn")
         if slot is None or not slot.headless:
             cmd.extend(["--host", env.api_host, "--port", str(port)])
@@ -336,7 +337,7 @@ class ServiceDeployment:
         process_env.pop("AFD_E2E_MRV2_EVIDENCE_START", None)
         if backend == "npu":
             process_env.pop("VLLM_ASCEND_ENABLE_FLASHCOMM1", None)
-        if resolved.case.deployment.dbo is not None:
+        if resolved.case.deployment.dbo_for_role(role) is not None:
             process_env["VLLM_LOGGING_LEVEL"] = "DEBUG"
         process_env.update(self.probe_environment)
         inherited = process_env.get("PYTHONPATH", "")

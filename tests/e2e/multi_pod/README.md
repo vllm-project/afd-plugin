@@ -138,10 +138,13 @@ policy, including its longer process-group wait and marked-process cleanup.
 
 ## Extending and validating
 
-Add existing-capability combinations through model declarations, IDs and layout
-selection. Do not add model/scenario branches to shared coordination, commands,
-tasks or probes. Preserve the model's distributed acceptance settings explicitly;
+For the migrated GPU Case path, add existing-capability combinations through
+model declarations, IDs and layout selection. Do not add model/scenario branches
+to shared coordination, commands, tasks or probes. Preserve the model's distributed acceptance settings explicitly;
 single-deployment defaults are not automatically interchangeable.
+The retained NPU executor is outside this extension contract until migrated.
+GPU Case runs use deployment-owned cleanup; legacy NPU runs keep their existing
+cleanup path. The coordinator does not run both for the same invocation.
 
 `tests/e2e/test_runner.py` exercises two real runner processes and a real
 TCPStore, with stub service/evaluator CLIs. These host integrations require

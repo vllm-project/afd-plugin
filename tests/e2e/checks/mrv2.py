@@ -44,8 +44,10 @@ class Mrv2Session:
                         raise ValueError(
                             f"graph evidence requested for eager role {role}"
                         )
-                if check.dbo and case.deployment.dbo is None:
-                    raise ValueError("DBO evidence requested for a non-DBO deployment")
+                    if check.dbo and case.deployment.dbo_for_role(role) is None:
+                        raise ValueError(
+                            f"DBO evidence requested for non-DBO role {role}"
+                        )
 
     def prepare(self) -> None:
         if any(phase.checks for phase in self.case.phases):

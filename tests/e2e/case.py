@@ -92,6 +92,11 @@ class Deployment:
             return ((BASELINE_ROLE, self.attention),)
         return ((ATTENTION_ROLE, self.attention), (FFN_ROLE, self.ffn))
 
+    def dbo_for_role(self, role: str) -> DboConfig | None:
+        """A role's DBO overrides the deployment default; None inherits it."""
+        override = dict(self.roles)[role].dbo
+        return self.dbo if override is None else override
+
 
 @dataclass(frozen=True)
 class Gsm8kSettings:

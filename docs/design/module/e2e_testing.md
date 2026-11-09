@@ -95,6 +95,11 @@ configuration, a pinned Attention rendezvous address, exact compilation
 configuration, and `cleanup_profile`. Sync connectors start FFN then Attention;
 async CAM starts Attention then FFN. The NPU async profile alone keeps its
 scoped FFN process-ownership cleanup exception; other profiles are strict.
+`Deployment.dbo` supplies a default, and an explicit `Role.dbo` overrides it.
+`Role.dbo=None` inherits the default; `DboConfig()` keeps native thresholds.
+`Deployment.dbo_for_role()` resolves this rule for commands, probe validation
+and role logging. A DBO check requires it on every named role, so Attention-only
+native DBO does not imply FFN DBO.
 
 The seven existing GPU multi-pod entries use model-local distributed Cases.
 `multi_pod` derives local RoleSlots and coordinates addresses, launch barriers,
@@ -111,11 +116,16 @@ tables and evaluation/Hash branches have been removed. No cases are added or
 removed. Implementation/collection does not establish device qualification:
 report host, same-host distributed and cross-node/device execution separately.
 
-An existing-capability combination changes model declarations and IDs only.
+On migrated Case paths (all single-deployment entries and seven GPU multi-pod
+entries), an existing-capability combination changes model declarations and
+IDs only.
 Changing Case fields, task/check behavior or deployment protocols is a shared
 capability extension. A new connector must define launch order in deployment;
 Cases do not override that order independently. Configuration conflicts in
 deployment-owned flags fail before service startup.
+Retained NPU multi-pod and dedicated executors are outside this extension
+contract until migrated. Case execution uses deployment-owned cleanup;
+retained legacy execution uses its existing cleanup, never both for one run.
 
 Each Case run records canonical and effective settings, documented overrides,
 resource bindings, role commands, phase results, evidence and cleanup outcome.

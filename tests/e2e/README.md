@@ -69,6 +69,11 @@ workloads or coverage. It does not by itself establish device qualification:
 report actual CUDA/NPU results, host integration, skips and unexecuted cases
 separately. No existing case is removed in this migration.
 
+The extension rules below apply to the migrated Case paths: all single-deployment
+entries, including NPU, and the seven GPU multi-pod entries. NPU multi-pod and
+dedicated FFN/DSpark executors still use their retained legacy paths; they do not
+yet have the same extension contract.
+
 - Define deployment, workload and checks in the model's `cases.py`.
   Collection reads stable IDs; checkpoint and resource binding happens in the
   child process. Shared code receives the model's builder explicitly.
@@ -81,8 +86,9 @@ separately. No existing case is removed in this migration.
 - Preserve existing acceptance before deleting an old branch or helper.
   Migrate active pytest, CLI and dedicated-script callers with their behavior.
 
-For an existing-capability combination, edit the model's `cases.py` and its
-stable ID list; add CI/docs selection only where needed. The common runner,
+For an existing-capability combination on a migrated path, edit the model's
+`cases.py` and its stable ID list; add CI/docs selection only where needed.
+The common runner,
 Case schema, deployment, task/check implementations and probes must have zero
 diff for that addition. Implement a new task as a frozen dataclass following
 `Task`: `resolve()` applies documented overrides and reports ineligibility;
@@ -102,6 +108,12 @@ then FFN), readiness, pre/post-workload liveness and cleanup. Its explicit
 `cleanup_profile` retains the scoped NPU async CAM exception; ordinary cases
 use strict cleanup. Per-role options, connector configuration, pinned Attention
 address and exact compilation settings preserve the existing NPU profiles.
+`Deployment.dbo` is the default for its roles. An explicit `Role.dbo` replaces
+that default; `Role.dbo=None` inherits it. `DboConfig()` enables DBO with native
+runtime thresholds, while an effective value of `None` leaves it disabled.
+Commands, probe validation and role logging use `Deployment.dbo_for_role()`;
+checks require DBO on each role they name. Async CAM can therefore enable DBO
+on Attention alone without requiring it on FFN.
 
 GPU multi-pod entries use the model module's `multi-pod` subcommand and
 `build_multi_pod_case()`. Placement and peer coordination stay in `multi_pod`;
@@ -114,6 +126,8 @@ The legacy runner CLI and launch helpers remain for NPU and dedicated-script
 callers. GPU-specific scenario tables, evaluation branches and Hash wrappers
 have been retired from that executor. New GPU combinations extend model-local
 declarations. Retire remaining legacy helpers only with their active callers.
+The Case path uses the shared deployment cleanup; a legacy invocation uses its
+retained cleanup. A single run does not execute both paths.
 
 The migrated module CLI also supports inspection and local debug execution:
 
