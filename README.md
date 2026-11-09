@@ -19,8 +19,7 @@ tests for GPU and Ascend NPU deployments.
 > different hardware backends.
 
 The plugin extends vLLM through its general-plugin entry point without
-modifying the vLLM source tree. See the [supported runtimes and models](docs/support.md)
-and [installation requirements](docs/installation.md) before deployment.
+modifying the vLLM source tree.
 
 ## Architecture
 
@@ -35,10 +34,15 @@ and [installation requirements](docs/installation.md) before deployment.
    [`--additional-config`](docs/configuration.md). Send requests to Attention;
    FFN serves connector work.
 
-The [documentation index](docs/README.md) links user guides, module design,
-validation and troubleshooting. Hardware evidence applies only to the recorded
-models and configurations; known accuracy and shutdown limits are listed in the
-[support reference](docs/support.md#validation-limits).
+## Support matrix
+
+See the [support matrix](docs/support.md) for models, connectors, tested
+configurations, and known accuracy/shutdown limits.
+
+## Documentation
+
+Browse the [documentation index](docs/README.md) for user guides, module design,
+validation and troubleshooting.
 
 ## Development
 
