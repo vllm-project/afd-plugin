@@ -307,8 +307,10 @@ The canonical config shape is:
   "afd": {
     "role": "attention",
     "connector": "P2pNcclAFDConnector",
+    "async_dp": false,
     "host": "127.0.0.1",
     "port": 1239,
+    "afd_process_group_timeout_s": 120,
     "num_attention_ranks": 2,
     "num_ffn_ranks": 1,
     "compute_gate_on_attention": false,
@@ -324,7 +326,16 @@ omit `additional_config["afd"]` to disable AFD. Connector-owned
 `connector_extra_config` is strictly validated by the selected connector parser
 when the connector/runtime is constructed. The plugin also accepts selected
 compatibility aliases such as `afd_role`, `afd_connector`, `afd_host`, and
-`afd_port`.
+`afd_port`, plus `async` for `async_dp`.
+
+`async_dp` defaults to `false` and enables AFD's asynchronous data-parallel
+compatibility behavior. It is valid only with `CAMAsyncAFDConnector`, which
+requires it to be `true`.
+
+`afd_process_group_timeout_s` is a positive integer timeout in seconds for the
+AFD world process-group rendezvous (default: `120`). Increase it when rank
+placement or model loading makes the group join slower; it also bounds the NPU
+native DBO startup barrier, not device-kernel execution.
 
 ## Development
 

@@ -10,6 +10,7 @@ primary_code_paths:
   - "afd_plugin/compat/vllm.py"
   - "afd_plugin/compat/npu/__init__.py"
   - "afd_plugin/compat/npu/feature_validation.py"
+  - "afd_plugin/compat/npu/routing_ids.py"
   - "afd_plugin/compat/npu/runtime.py"
   - "afd_plugin/compat/npu/runtime_config.py"
   - "afd_plugin/compat/patches/**/*.py"
@@ -40,7 +41,7 @@ verified_platform_refs:
 related_issues:
   - "#86"
   - "#129"
-last_reviewed: 2026-10-13
+last_reviewed: 2026-11-09
 ---
 
 # Compatibility and patches
@@ -85,6 +86,7 @@ compatibility evidence rather than a released package or container tag.
 | Core vLLM patches | [`compat/patches/`](../../../afd_plugin/compat/patches) | [`tests/unit/compat/patches/`](../../../tests/unit/compat/patches) |
 | CUDA benchmark routing | [`model_executor/routing_simulator.py`](../../../afd_plugin/model_executor/routing_simulator.py) | [`test_routing_simulator.py`](../../../tests/unit/model_executor/test_routing_simulator.py) |
 | NPU adapters | [`compat/npu/`](../../../afd_plugin/compat/npu) | [`test_runtime.py`](../../../tests/unit/compat/test_runtime.py), [`test_ascend_ops.py`](../../../tests/unit/compat/test_ascend_ops.py) |
+| NPU routing-ID balancing | [`compat/npu/routing_ids.py`](../../../afd_plugin/compat/npu/routing_ids.py) | [`test_routing_ids.py`](../../../tests/unit/compat/npu/test_routing_ids.py), using the shared [`routing_ids_op.py` fixture](../../../tests/unit/fakes/routing_ids_op.py) |
 | NPU patch paths | [`compat/patches/npu/`](../../../afd_plugin/compat/patches/npu) | [`test_npu_runtime.py`](../../../tests/unit/v1/worker/test_npu_runtime.py) |
 | CUDA native V2 DBO preparation | [`gpu_mrv2_ubatching.py`](../../../afd_plugin/compat/patches/gpu_mrv2_ubatching.py) | [`test_gpu_mrv2_ubatching.py`](../../../tests/unit/compat/patches/test_gpu_mrv2_ubatching.py) |
 
@@ -156,6 +158,7 @@ These modules adapt upstream behavior without replacing a global symbol:
 | [`model_executor/routing_simulator.py`](../../../afd_plugin/model_executor/routing_simulator.py) | Registers the opt-in `afd_balanced` strategy through vLLM's public `RoutingSimulator` interface. Select it with `VLLM_MOE_ROUTING_SIMULATION_STRATEGY=afd_balanced`; `AFD_BENCHMARK_FORCE_LB_TOPN_PER_RANK` optionally limits each rank's expert pool. It provides deterministic source-rank phases and normalized weights for controlled CUDA performance tests without replacing router internals. EPLB remains outside the validated scope. |
 | [`compat/npu/runtime_config.py`](../../../afd_plugin/compat/npu/runtime_config.py) | Preserves model SP while applying the non-SP backend fallback; normalizes Async CAM native ubatching to Attention DBO, checks thresholds, and derives model/PP tensor layout and active ubatch count. |
 | [`compat/npu/feature_validation.py`](../../../afd_plugin/compat/npu/feature_validation.py) | Parses connector-owned typed extra information through the factory and fails before execution for unsupported NPU connector, quantization, graph, DBO, gate, or async MoE combinations. |
+| [`compat/npu/routing_ids.py`](../../../afd_plugin/compat/npu/routing_ids.py) | Registers the opaque `afd_balance_routing_ids_` custom op. It reads Ascend's live profile flag inside the op and balances logical expert IDs in place during profiling or when forced. NPU worker construction registers it before the first Attention-side gate; standalone scripts must import the module after device initialization and before using the op. |
 | [`compat/npu/forward_context.py`](../../../afd_plugin/compat/npu/forward_context.py) | Enters the pinned Ascend forward context for connector-driven FFN compute and installs AFD metadata in `additional_kwargs`. V1 uses `set_ascend_forward_context`; a V2-paired FFN uses native `set_forward_context` plus the Ascend MRV2 profile override so platform state follows the V2 proxy layout. |
 | [`compat/npu/ops.py`](../../../afd_plugin/compat/npu/ops.py) | Discovers plugin-owned CAMP2P and routed-only async CAM operators with explicit missing-runtime errors; operator build/runtime ownership is documented in [execution platforms](execution_platforms.md). |
 
