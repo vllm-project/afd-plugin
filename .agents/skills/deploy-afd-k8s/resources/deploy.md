@@ -79,86 +79,67 @@ stays free to share the node:
 ## 3b. Detect a legacy Pod-based deployment
 
 The earlier version of this skill deployed **bare Pods** and
-**selector-based Services** with fixed `vllm-*` names and no `afd-deployment`
-label (whatever `DEPLOY_NAME` you pick now, that is where they are). Nothing
-in steps 4d-4e removes them, and they conflict with the new deployment on
-every axis:
-
-- **Same pod names for a split role.** A legacy pod is
-  `vllm-pod-attention-0`; that is also the exact name the new
-  `vllm-pod-attention` StatefulSet creates for ordinal 0. The StatefulSet
-  cannot create a pod over the existing one and stalls at that ordinal.
-- **Same GPUs and, for a plain recipe, the same `ReadWriteOnce` model
-  volume.** A still-running legacy pod keeps them, so the new pod stays
-  `Pending` (insufficient GPUs, or `Multi-Attach error` on the volume).
-- **Same Service names, different `spec.type`.** `vllm-service` and
-  `vllm-ffn-p2p-service` / `vllm-attn-dp-service` used to be
-  selector-based ClusterIP (headless for the rendezvous/DP ones); the new
-  ones are ExternalName. Kubernetes refuses a service type change to or
-  from ExternalName, so step 4d cannot even apply -- and a surviving
-  selector-based `vllm-service` keeps routing the endpoint at the legacy
-  head pod instead of the new one.
+**selector-based Services** with fixed `vllm-*` names and no
+`afd-deployment` label, and nothing in 4d-4e removes them. They collide on
+every axis: a legacy `vllm-pod-attention-0` pod is the exact name the new
+`vllm-pod-attention` StatefulSet wants at ordinal 0, so it stalls there; a
+still-running legacy pod holds the GPUs and, for a plain recipe, the
+`ReadWriteOnce` model volume, so the new pod stays `Pending`; and the
+`vllm-*` Services were selector-based ClusterIP (headless for the
+rendezvous/DP ones) where step 4d applies ExternalName -- Kubernetes
+refuses that `spec.type` change, and a surviving selector-based
+`vllm-service` would keep routing the endpoint at the legacy head pod.
 
 Detect them by the one label they do **not** carry (read-only, safe to run
-any time):
+any time); `-o wide` shows the phase (still holding GPUs?) and the node
+(where an `RWO` volume is attached):
 
 ```bash
-# Legacy bare Pods: app + role labels, but no afd-deployment label.
+# Legacy bare Pods: app + role labels, no afd-deployment label.
 kubectl -n "$NAMESPACE" get pods -l 'app=afd-recipe,role=serve,!afd-deployment' -o wide
-# Legacy selector-based Services: labeled app=afd-recipe, unlabeled
-# afd-deployment (the new governing/ExternalName Services carry it).
+# Legacy selector-based Services (the new ones carry the label).
 kubectl -n "$NAMESPACE" get svc -l 'app=afd-recipe,!afd-deployment' -o wide
-# Legacy fixed-name recipe ConfigMap (the new one is
-# ${DEPLOY_NAME}-recipe-script, which is not affected).
+# Legacy fixed-name ConfigMap (the new one, ${DEPLOY_NAME}-recipe-script,
+# is unaffected).
 kubectl -n "$NAMESPACE" get configmap afd-recipe-script
 ```
 
-`-o wide` shows each legacy pod's node and phase: the phase tells you
-whether it still holds GPUs, the node tells you where an `RWO` volume is
-currently attached. These objects are also exactly the ones the step 6
-teardown misses, because it selects on `afd-deployment`.
+These are also exactly the objects step 6's labeled teardown misses.
 
 ## 3c. Remove the legacy deployment -- only with consent
 
-A legacy deployment may be serving right now: its pods run with
-`restartPolicy: Never` and no controller, so a deleted pod is gone for good
-and nothing recreates it. If 3b found anything, **stop and ask the caller
-before deleting**, stating the objects and that the endpoint stays down from
-the first delete until the new pods report `Ready` in step 4f. The two
-deployments cannot overlap -- same GPUs, same RWO volume for a plain recipe,
-same pod and Service names -- so there is no "keep both running" option.
+A legacy pod runs with `restartPolicy: Never` and no controller, so a
+deleted pod is gone for good -- and it may be serving right now. If 3b
+found anything, **stop and ask the caller before deleting**, stating the
+objects and that the endpoint stays down from the first delete until the new
+pods report `Ready` in 4f. There is no "keep both running" option; if the
+caller declines, stop and report 3b's objects rather than deploying on top
+of them (the new StatefulSets would stall as described there).
 
 Only after explicit confirmation, delete exactly what 3b selected, by the
-same label selectors (never `app=afd-recipe` alone, never a list of names
-that could drift), and **before step 4d** so the endpoint is switched away
-from the legacy head pod only once that pod is gone:
+same selectors (never `app=afd-recipe` alone, never a name list that can
+drift), and **before 4d** so the endpoint is switched away from the legacy
+head pod only once that pod is gone:
 
 ```bash
-kubectl -n "$NAMESPACE" delete pod -l 'app=afd-recipe,role=serve,!afd-deployment'
+legacy='app=afd-recipe,role=serve,!afd-deployment'
+kubectl -n "$NAMESPACE" delete pod -l "$legacy"
 kubectl -n "$NAMESPACE" delete svc -l 'app=afd-recipe,!afd-deployment'
 kubectl -n "$NAMESPACE" delete configmap afd-recipe-script --ignore-not-found
-# The new pods cannot start while the legacy ones hold the GPUs and the
-# model volume -- wait until the pods are really gone (graceful termination
-# of a serving pod takes a while), not just until the delete returns.
-# Polled rather than `kubectl wait --for=delete`, which fails when the
-# selector matches nothing -- and "already gone" is a success here.
-legacy_pods="$(kubectl -n "$NAMESPACE" get pod \
-  -l 'app=afd-recipe,role=serve,!afd-deployment' -o name)"
-for _ in $(seq 1 120); do
-  [ -z "$legacy_pods" ] && break
-  sleep 5
-  legacy_pods="$(kubectl -n "$NAMESPACE" get pod \
-    -l 'app=afd-recipe,role=serve,!afd-deployment' -o name)"
-done
-[ -z "$legacy_pods" ] || echo "still terminating after 10m: $legacy_pods"
+# Wait until the pods are really gone (a serving pod's graceful termination
+# takes a while), not just until the delete returns: the new pods cannot
+# start while the legacy ones hold the GPUs and the model volume. Guarded
+# because `kubectl wait --for=delete` errors when the selector matches
+# nothing, and "already gone" is success here.
+if [ -n "$(kubectl -n "$NAMESPACE" get pod -l "$legacy" -o name)" ]; then
+  kubectl -n "$NAMESPACE" wait --for=delete pod -l "$legacy" --timeout=10m \
+    || echo "still terminating after 10m: pod -l $legacy"
+fi
 ```
 
-If the caller declines, stop: report the blocking objects from 3b and do not
-deploy on top of them -- the new StatefulSets would stall exactly as
-described there. Never delete the model PVC in this step: after the legacy
-pods are gone a new pod landing on a different node can still show a
-transient `Multi-Attach error` until the old node's kubelet detaches the
-`RWO` volume, and that clears on its own.
+Never delete the model PVC here: after the legacy pods are gone, a new pod on
+a different node can still show a transient `Multi-Attach error` until the
+old node's kubelet detaches the `RWO` volume, and that clears on its own.
 
 ## 4a. Model PVC
 
@@ -276,19 +257,16 @@ endpoint "${DEPLOY_NAME}-service" "$attn_head"
   && endpoint "${DEPLOY_NAME}-ffn-dp-service" "$ffn_head"
 ```
 
-`BOTH_ROLES` (1 when every pod runs both roles), `TOTAL_PODS` (>1 when the
-recipe spans pods), and `ATTN_SPLIT` / `FFN_SPLIT` (1 when that role spans
->1 pod) come from the plan parsed in
-[resolve-recipe.md](resolve-recipe.md), never asked.
+`BOTH_ROLES`, `TOTAL_PODS`, `ATTN_SPLIT`, `FFN_SPLIT`: from the plan parsed
+in [resolve-recipe.md](resolve-recipe.md), never asked.
 
 ## 4e. Deploy StatefulSet(s)
 
 One StatefulSet per role the plan uses -- a plain recipe and a
 `POD=AFD_<index>` plan both deploy the single both-roles StatefulSet, a
 split-role plan one StatefulSet per role -- with `replicas` = that role's
-pod count. Pod identity is self-derived: each pod reads its role from
-`AFD_ROLE` and its zero-based index from its hostname
-(`<statefulset>-<ordinal>`), so no per-pod env is injected at all:
+pod count. Pod identity is self-derived, so no per-pod env is injected (see
+[resolve-recipe.md](resolve-recipe.md)):
 
 ```bash
 deploy_role_sts() {
@@ -304,14 +282,11 @@ deploy_role_sts() {
     < templates/statefulset.yaml | kubectl apply -n "$NAMESPACE" -f -
 }
 
-# Pre-deploy cleanup, by label and once for the whole deployment -- not per
-# StatefulSet name inside deploy_role_sts: a previous deploy of this
-# DEPLOY_NAME with a different plan leaves differently-named StatefulSets
-# behind (e.g. single-pod `${DEPLOY_NAME}-pod` after switching to a
-# split-role plan), still holding GPUs. The label selects exactly this
-# deployment's objects, never a second deployment's. Legacy bare Pods have
-# no afd-deployment label and are not selected here -- step 3c removed them
-# under its own confirmation.
+# Pre-deploy cleanup once for the whole deployment, by label: a previous
+# deploy of this DEPLOY_NAME with a different plan left differently-named
+# StatefulSets behind (step 3's warning), still holding GPUs. The label
+# selects exactly this deployment, never a second one -- and never the
+# unlabeled legacy objects, which 3c owns.
 kubectl -n "$NAMESPACE" delete sts -l "afd-deployment=$DEPLOY_NAME" \
   --ignore-not-found
 ```
@@ -331,32 +306,24 @@ deploy_role_sts attention 2 "$ATTN_GPU_COUNT"
 ```
 
 Both-roles multi-pod plan, e.g. the DeepEP M2N `POD=AFD_<index>` 2 x 4A1F
-plan: still one StatefulSet, scaled with `replicas`. Each pod derives its
-own role and ordinal, and those recipes read the ordinal as `${POD#AFD_}`
--- so no per-pod env is injected here either:
+plan: still one StatefulSet, scaled with `replicas`:
 
 ```bash
 deploy_role_sts both 2 "$GPU_COUNT"
 ```
 
 A re-applied ConfigMap (step 4b) or StatefulSet template does **not**
-restart running pods (`updateStrategy: OnDelete` in the template). AFD
-startup is a collective across every pod of the deployment, so pods must
-restart together -- after changing the recipe or the template, either
-re-run the `kubectl delete sts` + apply above, or restart every pod at
-once:
+restart running pods (`updateStrategy: OnDelete`), and AFD startup is a
+collective: after changing the recipe or the template, either re-run the
+`kubectl delete sts` + apply above, or restart every pod at once:
 
 ```bash
 kubectl delete pod -l afd-deployment="$DEPLOY_NAME"
 ```
 
-Never restart one role or one shard on its own: a restarted shard cannot
-rejoin the surviving pods' DP world and the deployment deadlocks (the
-split-role gap documented in SKILL.md), and a restarted role alone leaves
-the other role running the old recipe/config. A StatefulSet's default
-`RollingUpdate` has exactly this problem -- one pod at a time, highest
-ordinal first, waiting for Ready -- which is why the template pins
-`OnDelete`.
+Never restart one role or one shard on its own (SKILL.md's recovery scope
+has the failure mode) -- and that is why the template pins `OnDelete`: a
+default `RollingUpdate` restarts pods one at a time, waiting for Ready.
 
 ## 4f. Wait for the pods to exist, then for Running and Ready
 

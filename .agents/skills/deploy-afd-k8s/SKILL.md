@@ -23,14 +23,12 @@ On success this skill guarantees, in the target namespace:
 | Left running | yes, deliberately -- so weights stay warm for follow-up runs; step 5 asks the caller when to delete the pods |
 
 Migration: a deployment created by the earlier, Pod-based version of this
-skill carries **no** `afd-deployment` label (fixed `vllm-pod*` names,
-selector-based `vllm-*-service` names, ConfigMap `afd-recipe-script`), so no
-labeled step sees it -- yet it collides with this one on pod names (a split
-role's `vllm-pod-attention-0` is the very name the new StatefulSet wants),
-on GPUs and the `RWO` model volume, and on Service names with a different
-`spec.type`. Steps 3b-3c detect it by the missing label, get explicit
-consent, and remove it before the endpoint is switched (step 4d); never
-deploy on top of it.
+skill carries **no** `afd-deployment` label, so no labeled step sees it --
+yet it collides with this one on pod names, on GPUs and the `RWO` model
+volume, and on Service names with a different `spec.type` (step 3b has the
+detail). Steps 3b-3c detect it by the missing label, get explicit consent,
+and remove it before the endpoint is switched (step 4d); never deploy on
+top of it.
 
 Recovery scope: a crashed pod's container restarts and a deleted pod is
 recreated automatically, and a role-per-pod deployment (each role on its

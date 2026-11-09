@@ -95,13 +95,10 @@ skill's pods self-derive is accepted unchanged -- never inject `POD` as env.
   `"port": N` of the `afd` JSON, and the last argument of `role_dp "$F"
   ...` / `role_dp "$A" ...`), so nothing downstream needs them -- the
   Services are ExternalName pointers, not port mappings. The names come
-  from the scripts' fixed `HEAD_HOST` defaults (`vllm-ffn-p2p-service`,
-  `vllm-attn-dp-service`, `vllm-ffn-dp-service`), not from the template's
+  from the scripts' fixed `HEAD_HOST` defaults, not from the template's
   `AFD_CONNECTOR_HOST`/`ATTENTION_DP_ADDRESS`, and `HEAD_HOST` is unset on
-  k8s -- so these recipes expect `DEPLOY_NAME=vllm`. Under any other
-  `DEPLOY_NAME`, inject `HEAD_HOST` pointing at the head pod (it serves the
-  rendezvous and both DP-RPC ports); like the shape overrides above, that
-  means adding it to the template's `env` list.
+  k8s -- so these recipes expect `DEPLOY_NAME=vllm`; see
+  [services.md](services.md) for the names and the override.
 
 ## Read the placement plan -- never ask
 
@@ -147,15 +144,10 @@ default `DEPLOY_NAME=vllm`, the attention StatefulSet is
 `vllm-pod-attention`), with `replicas` = that role's pod count. A
 both-roles plan has no per-role split to name: it is the single
 `${DEPLOY_NAME}-pod` StatefulSet with `replicas` = `TOTAL_PODS`.
-`DEPLOY_NAME` (default `vllm`) prefixes every resource the deployment
-creates -- StatefulSets, Services, ConfigMap -- and labels every object
-it creates with `afd-deployment: <DEPLOY_NAME>`, so two deployments with
-different names coexist in one namespace without colliding (and the whole
-deployment can be selected, reported, and torn down as a unit with `-l
-afd-deployment=<DEPLOY_NAME>`). Kubernetes appends the pod
-ordinal itself, so pods are `<statefulset-name>-<ordinal>` (e.g.
-`vllm-pod-attention-0`, `vllm-pod-attention-1`) -- the ordinal suffix is
-a StatefulSet invariant and cannot be removed.
+`DEPLOY_NAME` (default `vllm`) prefixes every resource and labels every
+object `afd-deployment: <DEPLOY_NAME>` (SKILL.md's contract). Kubernetes
+appends the pod ordinal itself, so pods are `<statefulset>-<ordinal>`
+(e.g. `vllm-pod-attention-0`) -- the suffix cannot be removed.
 - **POD**: the pod's zero-based index within its role's StatefulSet,
 self-derived by the wrapper from the pod's hostname -- never injected as
 k8s env. An `AFD_<index>` plan's pods are `${DEPLOY_NAME}-pod-<ordinal>`,
