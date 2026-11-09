@@ -6,6 +6,7 @@ owners:
   - "@yujuancao07"
 primary_code_paths:
   - "tests/e2e/case.py"
+  - "tests/e2e/presets.py"
   - "tests/e2e/deployment.py"
   - "tests/e2e/checks/**"
   - "tests/e2e/runner.py"
@@ -76,6 +77,15 @@ existing CI selections stay unchanged. Collection reads IDs only. Builders
 resolve checkpoint-dependent profile settings inside the runner subprocess;
 the common `case_main` receives each model builder explicitly.
 
+`case.py` defines the common types; `presets.py` provides reusable synchronous
+eager/decode-graph deployment construction across models and backends. V2 on
+GPU/NPU, Qwen3 MoE and Qwen3.6 compose these presets with model-owned DP/TP
+layouts, connector, capture size and DBO settings. V2 retains its explicit
+comparison sequence-budget override. Presets select neither model IDs nor
+scenarios and own no workload, threshold, evidence or cleanup requirements.
+DSV4's specialized deployment configuration remains model-local. Shared
+configuration does not generate a common scenario matrix across all models.
+
 `deployment.py` owns topology/resource binding, commands, connector launch
 order, readiness, pre/post-evaluation liveness and cleanup. `runner.run_case`
 executes declared phases through the serializable Task interface and writes
@@ -128,6 +138,9 @@ Changing Case fields, task/check behavior or deployment protocols is a shared
 capability extension. A new connector must define launch order in deployment;
 Cases do not override that order independently. Configuration conflicts in
 deployment-owned flags fail before service startup.
+Changing a preset affects its existing consumers and requires configuration
+and command comparison plus affected integration checks. A new combination
+using existing presets must leave the presets unchanged.
 Retained NPU multi-pod and dedicated executors are outside this extension
 contract until migrated. Case execution uses deployment-owned cleanup;
 retained legacy execution uses its existing cleanup, never both for one run.
@@ -157,6 +170,7 @@ tests/e2e/
 ├── models/<model>/test_*.py  # Stable pytest entries; launch a child
 ├── models/<model>/cases.py  # Model-local declarations for migrated entries
 ├── case.py                  # Immutable scenario and deployment types
+├── presets.py               # Shared execution configuration; no scenario selection
 ├── runner.py                # Case phase execution; remaining legacy entries
 ├── deployment.py            # Case commands, service startup and cleanup
 ├── checks/mrv2.py           # Host probe preparation and phase windows

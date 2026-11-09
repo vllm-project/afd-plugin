@@ -77,6 +77,12 @@ yet have the same extension contract.
 - Define deployment, workload and checks in the model's `cases.py`.
   Collection reads stable IDs; checkpoint and resource binding happens in the
   child process. Shared code receives the model's builder explicitly.
+- Reuse `presets.py` for common synchronous eager/decode-graph deployment
+  construction. V2 on GPU/NPU, Qwen3 MoE and Qwen3.6 share these presets.
+  Models supply their DP/TP layouts, backend, connector, capture size and DBO
+  settings; V2 keeps its comparison-specific sequence budget explicitly.
+  Presets contain no model IDs, scenario tables, workloads or acceptance rules.
+  DSV4 keeps its specialized deployment configuration in its model directory.
 - Reuse existing fields, tasks, checks and connector protocols for a new
   combination. Its shared-module diff must be empty. A missing field or
   capability needs an explicit capability extension and affected verification.
@@ -89,7 +95,7 @@ yet have the same extension contract.
 For an existing-capability combination on a migrated path, edit the model's
 `cases.py` and its stable ID list; add CI/docs selection only where needed.
 The common runner,
-Case schema, deployment, task/check implementations and probes must have zero
+Case schema, presets, deployment, task/check implementations and probes must have zero
 diff for that addition. Implement a new task as a frozen dataclass following
 `Task`: `resolve()` applies documented overrides and reports ineligibility;
 `execute()` runs the workload and validates its result. Its fields are recorded

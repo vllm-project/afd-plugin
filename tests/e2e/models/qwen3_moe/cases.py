@@ -8,18 +8,15 @@ import sys
 from dataclasses import replace
 
 from tests.e2e.case import (
-    EXECUTION_EAGER,
-    EXECUTION_FULL_DECODE_GRAPH,
     Case,
     CaseEnvironment,
     DboConfig,
-    Deployment,
     Gsm8kSettings,
     Gsm8kTask,
     Mrv2Check,
     Phase,
-    Role,
 )
+from tests.e2e.presets import DECODE_GRAPH, EAGER
 
 SCENARIOS = (
     "baseline-graph",
@@ -91,16 +88,16 @@ def build_case(case_id: str, environment: CaseEnvironment) -> Case:
         "afd-deepep-m2n-graph-tp2-2a2f": (False, True, False, 1, 2, 2, 1),
     }
     baseline, graph, dbo, a_dp, a_tp, f_dp, f_tp = profiles[case_id]
-    execution = EXECUTION_FULL_DECODE_GRAPH if graph else EXECUTION_EAGER
+    execution = DECODE_GRAPH if graph else EAGER
     deepep = case_id in DEEPEP_M2N_SCENARIOS
     return Case(
         id=case_id,
         model="Qwen3 MoE",
         served_model_name_prefix="qwen3-moe-afd",
-        deployment=Deployment(
+        deployment=execution.deployment(
             backend="gpu",
-            attention=Role(a_dp, a_tp, execution),
-            ffn=None if baseline else Role(f_dp, f_tp, execution),
+            attention=(a_dp, a_tp),
+            ffn=None if baseline else (f_dp, f_tp),
             connector=None
             if baseline
             else "DeepEPM2NAFDConnector"
@@ -108,9 +105,7 @@ def build_case(case_id: str, environment: CaseEnvironment) -> Case:
             else "P2pNcclAFDConnector",
             compute_gate_on_attention=deepep,
             dbo=DboConfig(DBO_DECODE_THRESHOLD, DBO_PREFILL_THRESHOLD) if dbo else None,
-            cudagraph_capture_size=CAPTURE_SIZE if graph else None,
-            max_num_seqs=CAPTURE_SIZE if graph else None,
-            max_num_batched_tokens=CAPTURE_SIZE if baseline else None,
+            capture_size=CAPTURE_SIZE,
         ),
         common_vllm_args=(f"--max-model-len={MAX_MODEL_LEN}",),
         phases=(

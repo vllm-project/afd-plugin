@@ -5,17 +5,14 @@
 from __future__ import annotations
 
 from tests.e2e.case import (
-    EXECUTION_EAGER,
-    EXECUTION_FULL_DECODE_GRAPH,
     Case,
     CaseEnvironment,
-    Deployment,
     Gsm8kSettings,
     Gsm8kTask,
     Mrv2Check,
     Phase,
-    Role,
 )
+from tests.e2e.presets import DECODE_GRAPH, EAGER
 
 SCENARIOS = (
     "baseline-graph",
@@ -38,19 +35,17 @@ def build_case(case_id: str, environment: CaseEnvironment) -> Case:
         "afd-graph-2a1f": (False, True, 2, 1),
     }
     baseline, graph, attention_ranks, ffn_ranks = profiles[case_id]
-    execution = EXECUTION_FULL_DECODE_GRAPH if graph else EXECUTION_EAGER
+    execution = DECODE_GRAPH if graph else EAGER
     return Case(
         id=case_id,
         model="Qwen3.6 MoE",
         served_model_name_prefix="qwen3-6-afd",
-        deployment=Deployment(
+        deployment=execution.deployment(
             backend="gpu",
-            attention=Role(attention_ranks, execution=execution),
-            ffn=None if baseline else Role(ffn_ranks, execution=execution),
+            attention=(attention_ranks, 1),
+            ffn=None if baseline else (ffn_ranks, 1),
             connector=None if baseline else "P2pNcclAFDConnector",
-            cudagraph_capture_size=CAPTURE_SIZE if graph else None,
-            max_num_seqs=CAPTURE_SIZE if graph else None,
-            max_num_batched_tokens=CAPTURE_SIZE if baseline else None,
+            capture_size=CAPTURE_SIZE,
         ),
         common_vllm_args=(
             f"--max-model-len={MAX_MODEL_LEN}",

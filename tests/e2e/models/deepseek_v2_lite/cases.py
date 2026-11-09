@@ -13,19 +13,16 @@ from dataclasses import replace
 
 from tests.e2e.case import (
     ATTENTION_ROLE,
-    EXECUTION_EAGER,
-    EXECUTION_FULL_DECODE_GRAPH,
     FFN_ROLE,
     Case,
     CaseEnvironment,
     DboConfig,
-    Deployment,
     Gsm8kSettings,
     Gsm8kTask,
     Mrv2Check,
     Phase,
-    Role,
 )
+from tests.e2e.presets import DECODE_GRAPH, EAGER
 
 V2_SCENARIOS = (
     "afd-v2-eager-1a1f",
@@ -149,7 +146,7 @@ def _build_case(case_id: str, environment: CaseEnvironment) -> Case:
     }
     backend = environment.device_backend
     baseline, graph, dbo, a_dp, a_tp, f_dp, f_tp = profiles[case_id]
-    execution = EXECUTION_FULL_DECODE_GRAPH if graph else EXECUTION_EAGER
+    execution = DECODE_GRAPH if graph else EAGER
     comparison = case_id in V2_DBO_COMPARISON_SCENARIOS
     deepep = case_id in DEEPEP_M2N_SCENARIOS
     minimum_samples = SMOKE_MAX_SAMPLES if comparison or dbo else 1
@@ -160,29 +157,30 @@ def _build_case(case_id: str, environment: CaseEnvironment) -> Case:
     )
     # The TP2 DBO case has always retained 0.27 even for a 24-sample run.
     smoke = case_id != "afd-v2-graph-dbo-tp2"
+    deployment = execution.deployment(
+        backend=backend,
+        connector=(
+            None
+            if baseline
+            else "DeepEPM2NAFDConnector"
+            if deepep
+            else "P2pNcclAFDConnector"
+            if backend == "gpu"
+            else "CAMP2pAFDConnector"
+        ),
+        attention=(a_dp, a_tp),
+        ffn=None if baseline else (f_dp, f_tp),
+        capture_size=CAPTURE_SIZE,
+        compute_gate_on_attention=deepep,
+        dbo=DboConfig(DBO_DECODE_THRESHOLD, DBO_PREFILL_THRESHOLD) if dbo else None,
+    )
+    if comparison:
+        deployment = replace(deployment, max_num_seqs=CAPTURE_SIZE)
     return Case(
         id=case_id,
         model="DeepSeek-V2-Lite",
         served_model_name_prefix="deepseek-v2-lite-afd",
-        deployment=Deployment(
-            backend=backend,
-            connector=(
-                None
-                if baseline
-                else "DeepEPM2NAFDConnector"
-                if deepep
-                else "P2pNcclAFDConnector"
-                if backend == "gpu"
-                else "CAMP2pAFDConnector"
-            ),
-            attention=Role(a_dp, a_tp, execution),
-            ffn=None if baseline else Role(f_dp, f_tp, execution),
-            compute_gate_on_attention=deepep,
-            dbo=DboConfig(DBO_DECODE_THRESHOLD, DBO_PREFILL_THRESHOLD) if dbo else None,
-            cudagraph_capture_size=CAPTURE_SIZE if graph else None,
-            max_num_seqs=CAPTURE_SIZE if graph or comparison else None,
-            max_num_batched_tokens=CAPTURE_SIZE if baseline else None,
-        ),
+        deployment=deployment,
         common_vllm_args=(f"--max-model-len={MAX_MODEL_LEN}",),
         phases=(
             Phase(
