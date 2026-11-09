@@ -63,20 +63,6 @@ for qualname in sys.argv[1:]:
 """
 
 
-def test_gpu_attention_class_path_selects_mrv2():
-    assert (
-        ATTENTION_MODEL_RUNNER_FQCN == "afd_plugin.v1.worker.AFDAttentionModelRunnerV2"
-    )
-
-
-@pytest.mark.parametrize(
-    "qualname",
-    GPU_RUNTIME_CLASS_PATHS + NPU_RUNTIME_CLASS_PATHS,
-)
-def test_runtime_class_paths_are_plugin_paths(qualname):
-    assert qualname.startswith("afd_plugin.v1.worker")
-
-
 @pytest.mark.vllm_runtime
 @pytest.mark.parametrize("qualname", GPU_RUNTIME_CLASS_PATHS)
 def test_gpu_runtime_class_paths_resolve_when_vllm_is_available(qualname):
@@ -87,6 +73,8 @@ def test_gpu_runtime_class_paths_resolve_when_vllm_is_available(qualname):
 
     assert isinstance(cls, type)
     assert cls.__module__.startswith("afd_plugin.v1.worker")
+    if qualname == ATTENTION_MODEL_RUNNER_FQCN:
+        assert cls.__name__ == "AFDAttentionModelRunnerV2"
 
 
 _GPU_WORKER_IMPORT_SCRIPT = """

@@ -77,6 +77,10 @@ consistent.
 
 ## Test Conventions
 
+Before adding, changing, moving, or removing tests, read and follow
+[AFD test maintenance](docs/UT_MAINTENANCE.md). Also apply it when production
+changes affect existing test coverage.
+
 Unit tests protect behavior at module seams. A test that cannot fail when the
 behavior regresses is not coverage; delete it.
 

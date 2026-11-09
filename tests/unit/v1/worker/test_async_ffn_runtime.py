@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""MRV2 loading, eager isolation and graph-only resource lifetime contracts."""
+"""Async CAM eager wire outputs for layered execution."""
 
 from __future__ import annotations
 
 import threading
 from collections import deque
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +26,7 @@ from afd_plugin.connectors.npu.async_cam import (  # noqa: E402
 )
 from afd_plugin.v1.worker.npu import async_ffn_model_runner as runtime  # noqa: E402
 from afd_plugin.v1.worker.npu.ffn_worker import AFDNPUFFNWorker  # noqa: E402
+from tests.unit.fakes.connector import FakeFFNSession  # noqa: E402
 from tests.unit.fakes.vllm_config import npu_vllm_config  # noqa: E402
 
 
@@ -73,7 +73,6 @@ def harness(monkeypatch):
         0,
     )
     connector._initialized = True
-    monkeypatch.setenv("AFD_ASYNC_CAM_LAYERED_GMM", "0")
     monkeypatch.setattr(runtime, "create_afd_npu_profiler", lambda role: None)
     runner = runtime.AsyncNPUFFNModelRunner(cfg, torch.device("cpu"), connector)
     runner.layer_ids = (2, 5)
@@ -84,22 +83,12 @@ def harness(monkeypatch):
         calls.append("receive")
         return payloads.popleft()
 
-    def compute(**kwargs):
-        calls.append(("compute", kwargs["layer_idx"], kwargs["hidden_states"].shape[0]))
-        return kwargs["hidden_states"].to(torch.bfloat16)
-
     def send(output, context, **kwargs):
-        calls.append(("send", context.states.token_nums_rankid_layeridx))
-
-    @contextmanager
-    def forward(**kwargs):
-        yield SimpleNamespace(dp_metadata=None, additional_kwargs={})
+        calls.append(("send", output, context.states.token_nums_rankid_layeridx))
 
     monkeypatch.setattr(connector, "recv_attn_output", receive)
     monkeypatch.setattr(connector, "send_ffn_output", send)
-    monkeypatch.setattr(runtime, "ascend_forward_context", forward)
-    monkeypatch.setattr(runtime, "_set_moe_layer_index", lambda *args: None)
-    runner.model = SimpleNamespace(compute_ffn_output=compute)
+    runner.model = SimpleNamespace()
     return SimpleNamespace(
         runner=runner, connector=connector, calls=calls, payloads=payloads
     )
@@ -112,39 +101,43 @@ def payload(layer, rows):
         dynamic_scales=torch.ones(8),
     )
     return AFDA2FTransferPayload(
-        torch.ones(8, 32, dtype=torch.int8),
+        torch.arange(8 * 32, dtype=torch.int8).reshape(8, 32),
         AFDTransferContext(AFDTransferMetadata(0, 0, [8]), state),
     )
 
 
-@pytest.mark.parametrize("layered", [False, True])
-def test_eager_preserves_layer_loop_device_metadata_and_return_headers(
-    harness, layered
-):
+def test_eager_preserves_layer_loop_device_metadata_and_return_headers(harness):
     h = harness
     first, zero = payload(5, 3), payload(2, 0)
     h.payloads.extend((first, zero))
-    observed = []
-    if layered:
+    first.context.states.group_list = torch.tensor([1, 2])
+    first.context.states.dynamic_scales = torch.arange(1, 9, dtype=torch.float32)
 
-        def execute(hidden, scales, groups, header):
-            observed.append((groups, header))
-            return hidden.to(torch.bfloat16)
+    def execute(hidden, scales, groups, header):
+        # Toy experts have gains 1/2 and layer gain equal to the layer ID.
+        # Only the sent result is asserted; this does not simulate CANN.
+        gains = torch.repeat_interleave(torch.tensor([1.0, 2.0]), groups)
+        rows = gains.numel()
+        output = torch.zeros_like(hidden, dtype=torch.bfloat16)
+        output[:rows] = (
+            hidden[:rows].float() * scales[:rows, None] * gains[:, None] * header[2]
+        ).to(torch.bfloat16)
+        return output
 
-        h.runner._layered_executor = execute
+    h.runner._layered_executor = execute
+    expected = [torch.zeros(8, 32), torch.zeros(8, 32)]
+    expected[0][:3] = (
+        first.hidden_states[:3].float() * torch.tensor([5.0, 20.0, 30.0])[:, None]
+    )
     assert h.runner.execute_connector_driven_step()
-    computed = [
-        call for call in h.calls if isinstance(call, tuple) and call[0] == "compute"
-    ]
-    assert computed == ([] if layered else [("compute", 5, 3), ("compute", 2, 0)])
-    if layered:
-        assert [int(header[2]) for _, header in observed] == [5, 2]
     returned = [
-        call[1] for call in h.calls if isinstance(call, tuple) and call[0] == "send"
+        call for call in h.calls if isinstance(call, tuple) and call[0] == "send"
     ]
-    assert returned[0] is first.context.states.token_nums_rankid_layeridx
-    assert returned[1] is zero.context.states.token_nums_rankid_layeridx
-    assert h.runner._graph is None
+    for sent, received_payload, hidden in zip(
+        returned, (first, zero), expected, strict=True
+    ):
+        torch.testing.assert_close(sent[1], hidden.to(torch.bfloat16), rtol=0, atol=0)
+        assert sent[2] is received_payload.context.states.token_nums_rankid_layeridx
 
 
 @pytest.mark.parametrize("fail", [False, True])
@@ -152,6 +145,7 @@ def test_full_receiver_exit_requires_success_even_during_shutdown(harness, fail)
     worker = AFDNPUFFNWorker.__new__(AFDNPUFFNWorker)
     worker.model_runner = harness.runner
     harness.runner.effective_mode = "full"
+    harness.runner.session = FakeFFNSession(requires_drain=True)
     worker._ffn_thread = None
     worker._ffn_loop_error = None
     worker._bind_cpus_once = lambda: None
@@ -168,3 +162,27 @@ def test_full_receiver_exit_requires_success_even_during_shutdown(harness, fail)
     assert not worker._ffn_thread.is_alive()
     assert harness.runner._graph_receiver_exited is not fail
     assert (worker._ffn_loop_error is not None) is fail
+
+
+@pytest.mark.parametrize("drains", [True, False])
+def test_drain_propagates_session_result(harness, monkeypatch, drains):
+    h = harness
+    h.runner.session = FakeFFNSession(
+        transactions=1,
+        drain_error=None if drains else RuntimeError("retain resources"),
+    )
+    h.runner._layered_executor = lambda hidden, *_args: hidden.to(torch.bfloat16)
+    request = payload(5, 3)
+    h.payloads.append(request)
+    monkeypatch.setattr(torch.npu, "synchronize", lambda: None)
+    if drains:
+        h.runner.drain()
+    else:
+        with pytest.raises(RuntimeError, match="retain resources"):
+            h.runner.drain()
+    returned = [
+        call for call in h.calls if isinstance(call, tuple) and call[0] == "send"
+    ]
+    assert len(returned) == 1
+    torch.testing.assert_close(returned[0][1], request.hidden_states.to(torch.bfloat16))
+    assert returned[0][2] is request.context.states.token_nums_rankid_layeridx

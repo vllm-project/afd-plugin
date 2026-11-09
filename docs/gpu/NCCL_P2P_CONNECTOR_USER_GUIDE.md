@@ -203,7 +203,7 @@ alone does not authorize replay. These behaviors are covered by the
 [connector tests](../../tests/unit/connectors/test_p2p_connector.py) and
 [FFN graph-policy tests](../../tests/unit/v1/worker/test_cuda_graph.py).
 
-## Requirements and limitations to document in code
+## Requirements and limitations
 
 - CUDA-capable PyTorch/vLLM environment with NCCL and vLLM's `PyNcclCommunicator` available.
 - Hidden-state tensors must reside on CUDA devices; CPU tensors are rejected.

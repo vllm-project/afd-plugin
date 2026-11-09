@@ -400,9 +400,18 @@ SIGTERM/SIGINT cancels pending HTTP operations before service cleanup, without
 waiting for the request timeout. It does **not** run GSM8K or establish general
 model accuracy.
 Service liveness and owned-process cleanup are also required to pass.
-This 16-NPU case allows 60 seconds for service shutdown before escalation;
+NPU async CAM cases allow 60 seconds for each vLLM worker, 90 seconds for the
+service, and 120 seconds for the test runner to shut down. Equivalent external
+launchers should set `VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS=60` and pass
+`--shutdown-timeout 90` to both services; a service timeout alone does not
+change the worker deadline. Explicit worker environment overrides are retained.
 Attention SIGKILL escalation remains a failure. FFN uses the existing scoped
 async CAM cleanup exception.
+
+vLLM 0.32 can log `AsyncLLM`'s `EngineDeadError` after an API client starts
+its own shutdown. Record this as an upstream advisory only after inference
+succeeds, every worker group exits gracefully, and process exit codes and
+cleanup checks pass. An inference-time error or forced worker exit still fails.
 
 ```bash
 export AFD_E2E_BACKEND=npu
@@ -505,47 +514,8 @@ unset, the test module picks the defaults above. The model path is optional
 when Hugging Face download is available. The skill checks prerequisites, runs
 the same four tests, and reports failures and process cleanup.
 
-## NPU async CAM smoke test
+## NPU async CAM coverage
 
-This separate test still reads `AFD_E2E_DEVICES`. It uses four NPUs: the first
-two for Attention TP=2, and the last two for FFN DP=2/TP=1. It sends one
-prompt and requests 32 tokens. It does not run GSM8K.
-
-```bash
-export AFD_E2E_BACKEND=npu
-export AFD_E2E_DEVICES=0,1,2,3
-export AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V2-Lite
-python -m pytest -q -s \
-  tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py::test_deepseek_v2_lite_async_cam
-```
-
-The CANN runtime and source-built AFD custom operators must be installed. Missing
-model configuration or a device list other than four unique IDs fails the
-test.
-
-## NPU async CAM ubatching test
-
-This case runs the `afd-async-ubatch` scenario (`CAMAsyncAFDConnector` with
-native MRV2 two-stage DBO on Attention). It uses three NPUs: the first
-two for Attention DP=1/TP=2, and the last one for FFN DP=1/TP=1. Unlike the
-smoke test above, it reuses the shared runner's GSM8K path with batch size 2
-(first 7 samples, 8-shot, sample-count and accuracy gates).
-
-```bash
-export AFD_E2E_BACKEND=npu
-export AFD_E2E_DEVICES=0,1,2
-export AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V2-Lite
-python -m pytest -q -s \
-  tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py::test_deepseek_v2_lite_async_ubatch
-```
-
-The device count is derived from the scenario's Attention/FFN rank constants,
-not hard-coded; `AFD_E2E_DEVICES` may supply any three unique NPU IDs. The
-topology is fixed at 2A1F, with TP=2 on Attention as required by token split.
-
-Prerequisites match the async CAM smoke test (CAM/CANN runtime and custom
-operators), plus a reachable GSM8K dataset source — offline pods need a local
-HF mirror (`HF_ENDPOINT`). Both async CAM tests configure a 4096 MB buffer only
-for connector-owned HCCL groups and remove `HCCL_BUFFSIZE` from child process
-environments so unrelated groups retain their normal defaults. See
-[`docs/npu/TROUBLESHOOTING.md`](../../docs/npu/TROUBLESHOOTING.md).
+Async CAM uses layered FFN execution with DeepSeek-V4 W4A8/W8A8. The
+DeepSeek-V2-Lite Async CAM smoke and ubatching scenarios have been retired;
+see the DeepSeek-V4 Async CAM profile above for the supported NPU entrypoint.

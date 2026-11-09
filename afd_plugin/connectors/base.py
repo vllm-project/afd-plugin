@@ -5,23 +5,24 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import torch
-
 from afd_plugin.config import AFDConfig, connector_extra_config_from_source
-from afd_plugin.connectors.metadata import (
-    AFDA2FTransferPayload,
-    AFDControlPayload,
-    AFDTransferContext,
-    FFNLocalExperts,
-    LocalExpertWeights,
-)
 
 if TYPE_CHECKING:
+    import torch
     from vllm.config import VllmConfig
+
+    from afd_plugin.connectors.metadata import (
+        AFDA2FTransferPayload,
+        AFDControlPayload,
+        AFDTransferContext,
+        FFNLocalExperts,
+        LocalExpertWeights,
+    )
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,37 @@ class ConnectorExtraInfo:
 
     def to_mapping(self) -> dict[str, Any]:
         return {}
+
+
+class FFNExecutionSession:
+    """Backend lifecycle used by FFN runners and workers.
+
+    By default, serving stops on local shutdown and the remaining hooks do
+    nothing. Backends with remote producers override the hooks and set
+    ``requires_drain``; pending work and the receiver handshake must finish
+    before communication or model resources are released.
+    """
+
+    requires_drain = False
+
+    def keep_serving(self, shutdown_requested: bool) -> bool:
+        """Continue until local shutdown; remote producers may extend serving."""
+        return not shutdown_requested
+
+    def before_first_step(self) -> None:
+        """Prepare backend state once before the first FFN step."""
+
+    def after_step(self) -> None:
+        """Check backend status after a completed FFN step."""
+
+    def drain(self, run_one: Callable[[], None]) -> None:
+        """Drain remote work when overridden; by default do not invoke run_one."""
+
+    def finish_receiver(self) -> None:
+        """Finish the receiver handshake after pending work has drained."""
+
+    def validate_shutdown(self) -> None:
+        """Reject release when backend resources are still in use."""
 
 
 class AFDConnectorBase(ABC):
@@ -111,6 +143,17 @@ class AFDConnectorBase(ABC):
     # ==============================
     # Lifecycle methods
     # ==============================
+
+    def attention_step(self) -> AbstractContextManager[None]:
+        """Return a context for ``with connector.attention_step():`` around forward.
+
+        Backends may defer transport status checks until the Attention model
+        step completes. The default context performs no additional work.
+        """
+        return nullcontext()
+
+    def ffn_session(self) -> FFNExecutionSession:
+        return FFNExecutionSession()
 
     @abstractmethod
     def close(self) -> None:
@@ -378,4 +421,5 @@ __all__ = [
     "AFDControlPlaneClosedError",
     "AFDRoutedExpertsConnector",
     "ConnectorExtraInfo",
+    "FFNExecutionSession",
 ]

@@ -20,11 +20,12 @@ validation_paths:
   - "tests/unit/fakes/**"
   - "tests/unit/connectors/**"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
-  - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
   - "tests/e2e/models/qwen3_moe/test_qwen3_moe.py"
   - "tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py"
   - "tests/unit/distributed/**"
   - "tests/gpu/**"
+  - "tests/npu/test_async_cam_connector.py"
 upstream_refs:
   - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
@@ -41,7 +42,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-10-30
+last_reviewed: 2026-11-09
 ---
 
 # Connector contracts
@@ -62,12 +63,12 @@ depend on role worker implementations.
 
 | Area | Source | Focused validation |
 | --- | --- | --- |
-| Base surface and lazy factory | [`base.py`](../../../afd_plugin/connectors/base.py), [`factory.py`](../../../afd_plugin/connectors/factory.py) | [`test_base_factory.py`](../../../tests/unit/connectors/test_base_factory.py) |
+| Base surface and lazy factory | [`base.py`](../../../afd_plugin/connectors/base.py), [`factory.py`](../../../afd_plugin/connectors/factory.py) | [P2P factory and construction tests](../../../tests/unit/connectors/test_p2p_connector.py), [metadata contracts](../../../tests/unit/connectors/test_metadata.py) |
 | Payloads and control-plane codec | [`metadata.py`](../../../afd_plugin/connectors/metadata.py) | Connector unit tests and [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
 | CUDA P2P | [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py), [`topology.py`](../../../afd_plugin/distributed/topology.py) | [`test_p2p_connector.py`](../../../tests/unit/connectors/test_p2p_connector.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) |
 | CUDA DeepEP M2N | [`gpu/deepep_m2n/`](../../../afd_plugin/connectors/gpu/deepep_m2n/), `AFDRoutedExpertsConnector` in [`base.py`](../../../afd_plugin/connectors/base.py) | [`test_deepep_m2n_connector.py`](../../../tests/unit/connectors/test_deepep_m2n_connector.py), [GPU device tests](../../../tests/gpu/README.md), [Qwen3 MoE E2E](../../../tests/e2e/models/qwen3_moe/test_qwen3_moe.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) (`test_deepseek_v2_lite_deepep_m2n`) |
 | Ascend CAMP2P | [`npu/camp2p.py`](../../../afd_plugin/connectors/npu/camp2p.py) | [`test_camp2p_connector.py`](../../../tests/unit/connectors/test_camp2p_connector.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) |
-| Ascend CAM async | [`npu/async_cam.py`](../../../afd_plugin/connectors/npu/async_cam.py) | [`test_async_cam_connector.py`](../../../tests/unit/connectors/test_async_cam_connector.py), [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py) |
+| Ascend CAM async | [`npu/async_cam.py`](../../../afd_plugin/connectors/npu/async_cam.py), [`Push/Pull sessions`](../../../afd_plugin/connectors/npu/async_cam_runtime/async_cam_session.py) | [Connector unit tests](../../../tests/unit/connectors/test_async_cam_connector.py), [CAM host contracts](../../../tests/unit/connectors/npu/test_async_cam.py), [fused routing device test](../../../tests/npu/test_async_cam_connector.py), [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py) |
 | Process-group construction | [`afd_process_group.py`](../../../afd_plugin/distributed/afd_process_group.py) | Connector initialization tests plus platform E2E paths |
 
 ## Factory and construction
@@ -94,15 +95,15 @@ which lets feature validation use the same connector-owned schema.
 
 ## Connector-owned configuration
 
-`additional_config["afd"]["connector_extra_config"]` is an envelope rather
-than an `AFDConfig` field. Unknown fields fail in the selected connector parser.
+`AFDConfig.connector_extra_config` stores the connector-specific mapping.
+Unknown fields fail in the selected connector parser.
 
 | Connector | Accepted connector-specific fields |
 | --- | --- |
 | `P2pNcclAFDConnector` | None; the mapping must be empty. |
 | `DeepEPM2NAFDConnector` | `payload_format`, `expert_backend`, `capacity_tokens_per_rank`, `num_lanes`, `bucket_granularity`, `cpu_sync_min_tokens`, `num_sms`, `num_qps`, `expert_num_sms`, `cpu_timeout_s`, `gpu_timeout_s`, and a nested `network` mapping (`gin`, `hybrid`, `rdma_traffic_class`). All are optional; see the [DeepEP M2N guide](../../gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#connector_extra_config) for defaults. |
 | `CAMP2pAFDConnector` | `core_num`, optional `attn_core_num` / `ffn_core_num`, `compute_gate_on_attention`, `quant_mode`, and optional positive `hccl_buffer_size`. Core counts must be positive; the current runtime rejects gate-on-Attention and any nonzero quantization mode. |
-| `CAMAsyncAFDConnector` | `dynamicQuant`, `attn_ranks_per_dp`, optional positive `hccl_buffer_size`, and FFN two-stream options. Attention microbatching uses native DBO configuration. |
+| `CAMAsyncAFDConnector` | `dynamicQuant`, `ffn_mega_moe`, `attn_ranks_per_dp`, and optional positive `hccl_buffer_size`. Attention microbatching uses native DBO configuration. |
 
 The common `afd_process_group_timeout_s` defaults to 120 seconds and controls
 AFD rendezvous. `hccl_buffer_size` sizes connector-owned HCCL domains in MB;
@@ -314,6 +315,36 @@ metadata is present.
 | CUDA DeepEP M2N | AFD process group, a CPU bootstrap group for the handshake, the connector's NCCL control group, afdEP-comm transport buffers (one per lane), and compiled dispatch/combine kernels per bucket. | FFN-first ordering, any `A/F`, `num_experts % F == 0`, FFN TP 1. Across nodes every NVLink domain must hold an equal, contiguous block of world ranks. The startup handshake checks payload format, model shapes, lanes, network settings, SM90+, and the FFN expert deployment on every rank before buffers are allocated. |
 | Ascend CAMP2P | AFD process group, one HCCL communication group per ubatch, FFN HCCL state, Gloo metadata group, custom-op state and transfer handles. | FFN-first ordering and `A >= F`; group construction derives each FFN/Attention mapping. |
 | Ascend CAM async | Attention-first HCCL group, plugin-owned routed-only CAM operator state, per-stage pending Attention payload queues, and connector work-item state. | Role ranks map into a combined Attention-first world; Compact metadata determines the actual layer and expert interval; counts.sum() gives this chunk’s routed token count. |
+
+`CAMAsyncAFDConnector` owns configuration, topology, the HCCL group, startup,
+payload validation and final cleanup decisions. It selects one session at
+construction: `PushCAMSession` or `PullCAMSession`, both in
+`async_cam_runtime/async_cam_session.py`. Push keeps a FIFO per Attention
+stage and separate FFN receive/send calls. Pull owns one in-flight window across
+stages, native publish/combine, status/idle/source state and quiet/drain/stopped.
+Mega's fused FFN operation owns its receive/compute/send transaction; the public
+FFN receive/send methods reject Pull use.
+
+The four public transfer methods still enter through the connector. The existing
+`AFDAsyncTransferState` definition stays at its original import path;
+`comm_args` and `comm_id` expose the selected session's live resources through read-only
+properties for the current Mega compute path. `has_pending_attention` provides
+the diagnostic pending-state read without exposing the queue.
+
+Pull Session receives Startup, topology and required dimensions/capacity
+explicitly, without retaining the connector. Sessions allocate their buffers
+after Store negotiation and HCCL setup; initialization failures reach Startup
+before the connector is marked ready. Push records routing after a successful
+launch; Pull retains window ownership before launch. Combine failures retain
+routing/window references. DBO defers the sticky status check to the Attention
+step boundary. Graph capture, device completion and service threads remain with
+the runner/worker.
+
+`FFNExecutionSession` in `base.py` defines the lifecycle hooks and provides
+local-stop/no-drain defaults in one concrete class. Push/Pull sessions inherit
+those defaults and override their protocol-specific behavior. The base module
+keeps torch and transfer metadata imports under type checking so session imports
+remain safe before worker device bootstrap.
 
 The common process-group helper creates a plugin-owned group while temporarily
 switching PyTorch's default group so vLLM parallel-state helpers initialize

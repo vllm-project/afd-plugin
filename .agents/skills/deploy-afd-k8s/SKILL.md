@@ -20,7 +20,7 @@ On success this skill guarantees, in the target namespace:
 | Serving | the model named by `MODEL_ID` |
 | StatefulSet(s) / Service | one StatefulSet per role (`${DEPLOY_NAME}-pod-<role>`, `replicas` = that role's pod count, pods `<name>-<ordinal>`); plain recipes use one both-roles StatefulSet `${DEPLOY_NAME}-pod`; client Service `${DEPLOY_NAME}-service` (an ExternalName at the attention head pod). Every object the deployment creates (StatefulSets, pods, Services, ConfigMap) is labeled `afd-deployment=<DEPLOY_NAME>` so the whole deployment selects/reports/tears down with `-l afd-deployment=<DEPLOY_NAME>`; pods and StatefulSets also carry `app=afd-recipe,role=serve`, other objects `app=afd-recipe`. The model PVC is deliberately not labeled (shared, user-named state). |
 | Model cache | `PVC_NAME`, mounted at `/models`, `HF_HOME=/models/.hf_home` |
-| Left running | yes, deliberately -- so weights stay warm for follow-up runs |
+| Left running | yes, deliberately -- so weights stay warm for follow-up runs; step 5 asks the caller when to delete the pods |
 
 Recovery scope: a crashed pod's container restarts and a deleted pod is
 recreated automatically, and a role-per-pod deployment (each role on its
@@ -40,9 +40,9 @@ internal-only Services may also exist:
 `${DEPLOY_NAME}-ffn-p2p-service` (rendezvous -- always, when the plan has
 more than one pod) and `${DEPLOY_NAME}-attn-dp-service` (only when the
 attention role is itself split across more than one pod; there is
-deliberately no FFN counterpart -- see [services.md](services.md)). All but the
-governing Service are ExternalName pointers at head pods -- callers never talk to these directly. See
-[services.md](references/services.md).
+deliberately no FFN counterpart -- see [services.md](resources/services.md)).
+All but the governing Service are ExternalName pointers at head pods --
+callers never talk to these directly.
 
 ## Scope
 
@@ -57,10 +57,13 @@ governing Service are ExternalName pointers at head pods -- callers never talk t
   generator step and no manifest to read.
 - A recipe is **placement-driven** (more than one pod) exactly when its
   top-of-file comment block describes a per-pod placement -- read that
-  block, don't infer shape from flags. The two facts to extract are the
-  per-role pod counts and whether a role is split across pods; the recipes
-  themselves take no per-pod env, so never carry a per-pod override out of
-  the header. See [resolve-recipe.md](references/resolve-recipe.md).
+  block, don't infer shape from flags. Today's recipes state the per-role pod
+  counts in prose ("on 3 pods: two attention pods and one FFN pod"), but the
+  comment isn't guaranteed to use that exact grammar going forward. The two
+  facts to extract are the per-role pod counts and whether a role is split
+  across pods; the recipes themselves take no per-pod env, so never carry a
+  per-pod override out of the header. See
+  [resolve-recipe.md](resources/resolve-recipe.md).
 - Not for `tools/benchmarks/decode_bench_server.sh` (local, non-k8s).
 
 ## Requirements
@@ -92,13 +95,13 @@ governing Service are ExternalName pointers at head pods -- callers never talk t
 
 Load these in order; each covers one phase and nothing else. Services must
 exist **before** any Pod is deployed -- see
-[services.md](references/services.md) for why:
+[services.md](resources/services.md) for why:
 
-| Reference | Covers |
+| Resource | Covers |
 |---|---|
-| [resolve-recipe.md](references/resolve-recipe.md) | Step 1: read the recipe's serve-block fields and model id; read its placement (or lack of one) from its header comment -- never ask. |
-| [deploy.md](references/deploy.md) | Steps 2-4f: GPU_COUNT, confirm, PVC, ConfigMap, fsGroup, Services (step 4d -- which of the four, see [services.md](references/services.md)), StatefulSet(s) via `templates/statefulset.yaml`, wait for every plan pod to report `Ready` (not `kubectl rollout status`, see step 4f). |
-| [report-and-teardown.md](references/report-and-teardown.md) | Step 5: report the endpoint/model/nodes. Step 6: teardown (pods/Services only -- never the PVC unless asked). |
+| [resolve-recipe.md](resources/resolve-recipe.md) | Step 1 (the only step that parses the recipe): read the recipe's serve-block fields and model id, record every role's `GPU_COUNT`; read its placement (or lack of one) from its header comment -- never ask. |
+| [deploy.md](resources/deploy.md) | Steps 2-4f: take step 1's `GPU_COUNT`, confirm, PVC, ConfigMap, fsGroup, Services (step 4d -- which of the four, see [services.md](resources/services.md)), StatefulSet(s) via `templates/statefulset.yaml`, wait for Running and then every plan pod's `Ready` condition (not `kubectl rollout status`, see step 4f). |
+| [report-and-teardown.md](resources/report-and-teardown.md) | Step 5: report the endpoint/model/nodes and ask when to delete the running pods. Step 6: teardown when the caller says so (pods/Services only -- never the PVC unless asked). |
 
 All k8s manifests live in `templates/*.yaml`, applied via `envsubst | kubectl
 apply -f -`; no manifest is inlined in these docs.

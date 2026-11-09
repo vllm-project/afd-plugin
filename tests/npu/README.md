@@ -1,8 +1,9 @@
 # Ascend 910C operator tests
 
-Standalone harnesses and opt-in device tests for the Ascend operators this
-plugin owns. They run on 910C outside CI, and each one states whether it needs a
-device, a multi-rank launch, or nothing but a standard Python interpreter.
+Standalone harnesses, dispatcher checks, and opt-in device tests for the Ascend
+operators this plugin owns. Device tests run outside CI; CPU harness checks also
+run in the PR and merge unit-test jobs. Each entry states whether it needs a
+device, a multi-rank launch, or only a host Python environment.
 
 | File | Needs | Purpose |
 | --- | --- | --- |
@@ -10,6 +11,13 @@ device, a multi-rank launch, or nothing but a standard Python interpreter.
 | `async_cam_performance.py` | torchrun, 4 ranks | Per-operator and complete-round measurements |
 | `async_cam_common.py` | - | Protocol planning, HCCL setup, and four-stage execution |
 | `gmm_layered_performance.py` | 1 process, 1 device | Layered W13/W2 latency under eager and ACL graph |
+| `test_async_cam_{harness,performance,golden}.py` | CPU; golden needs optional torch | Harness planning, reporting, and reference numerics |
+| `test_gmm_layered_performance.py` | CPU | Benchmark geometry, case selection, statistics, and reports |
+| `test_cam_async_ops.py` | 910C extension, no device | Routed async CAM dispatcher and Meta contracts |
+| `test_gmm_layered.py`, `test_gmm_swiglu_quant_v2_layered.py` | 910C extension; device cases opt-in | Layered dispatcher contracts and runtime smoke checks |
+| `test_a2e_e2a_ops.py` | Ascend extension; runtime needs 2 ranks | A2E/E2A Meta contracts and opt-in HCCL execution |
+| `a2e_e2a_a5.py` | A5, 2 devices | Standalone 1A1F hardware sample |
+| `test_async_cam_connector.py` | pytest, 1 device, vLLM-Ascend | Fused expert selection and routing weights |
 | `test_gmm_swiglu_quant_v2_layered_precision.py` | pytest, 1 device | Layered W13 numerics, both quantization scenarios |
 | `test_gmm_layered_device_group_list.py` | pytest, 1 device | Layered W2 with a device-produced group list |
 | `test_async_cam_layered_w4a8.py` | pytest, 1 device | The `AsyncCAMLayeredExecutor` chain end to end |
@@ -40,6 +48,12 @@ values, route table, quantization result, and weighted sum are all produced
 inside this repository from the raw inputs; the harness depends on no external
 reference directory at runtime.
 
+Production Python behavior remains under `tests/unit`. Checks of these harnesses
+live beside them here, so maintaining a benchmark does not expand the production
+unit-test suite. The three 910C dispatcher modules share the optional
+`ascend_ops_runtime` fixture in `conftest.py`; requesting it loads the compiled
+extension, while collection and host-only tests stay independent of torch-npu.
+
 ## Python-only validation
 
 From the repository root, no torch or Ascend installation is needed for:
@@ -49,10 +63,10 @@ python tests/npu/async_cam_precision.py --help
 python tests/npu/async_cam_precision.py --dry-run
 python tests/npu/async_cam_performance.py --dry-run
 python tests/npu/gmm_layered_performance.py --dry-run
-python -m unittest tests.unit.compat.npu.test_async_cam_harness \
-  tests.unit.compat.npu.test_async_cam_performance \
-  tests.unit.compat.npu.test_async_cam_golden \
-  tests.unit.compat.npu.test_gmm_layered_performance
+python -m unittest tests.npu.test_async_cam_harness \
+  tests.npu.test_async_cam_performance \
+  tests.npu.test_async_cam_golden \
+  tests.npu.test_gmm_layered_performance
 ```
 
 Dry runs validate topology, positive per-rank lengths, receive capacity,
@@ -418,3 +432,24 @@ Some native kernels poll device flags without a process-group timeout; a stuck
 round terminates its worker rather than trying to synchronize it during cleanup.
 The external Linux `timeout` in the examples also bounds startup and teardown.
 Device cleanup after failure still requires validation on the target stack.
+
+## check_routing_boundary_reuse.py
+
+Device check for the opaque routing-id boundary. Requires an Ascend host with the pinned stack
+(`vllm`, `vllm-ascend`). Run it directly:
+
+```bash
+cd <repo root>
+python tests/npu/check_routing_boundary_reuse.py
+```
+
+It compiles once with the profile flag set, asserts that call produced balanced IDs, then clears the
+flag and reuses the same compiled callable for two distinct non-balanced inputs (asserting a single
+compilation). It then captures an ACL graph with the flag cleared and replays it twice over the same
+static buffer, checking each replay's IDs outside the captured region. Expected output:
+
+```text
+eager compiled reuse: OK
+acl graph reuse: OK
+ALL CHECKS PASSED
+```

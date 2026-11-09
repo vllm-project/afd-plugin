@@ -8,6 +8,8 @@ Constructed without ``AFDConnectorBase.__init__`` (no vLLM config needed).
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
+from types import SimpleNamespace
 from typing import Any
 
 from afd_plugin.connectors import (
@@ -16,6 +18,41 @@ from afd_plugin.connectors import (
     AFDTransferContext,
     AFDTransferMetadata,
 )
+from afd_plugin.connectors.base import FFNExecutionSession
+
+
+class FakeFFNSession(FFNExecutionSession):
+    """Configurable host lifecycle seam, with no device behavior."""
+
+    def __init__(
+        self,
+        *,
+        serving: Iterable[bool] = (),
+        requires_drain: bool = False,
+        drain_error: Exception | None = None,
+        transactions: int = 0,
+    ) -> None:
+        self.requires_drain = requires_drain
+        self.serving = iter(serving)
+        self.drain_error = drain_error
+        self.transactions = transactions
+        self.receiver_finished = False
+
+    def keep_serving(self, shutdown_requested: bool) -> bool:
+        return next(self.serving, not shutdown_requested)
+
+    def drain(self, run_one: Callable[[], None]) -> None:
+        for _ in range(self.transactions):
+            run_one()
+        if self.drain_error is not None:
+            raise self.drain_error
+
+    def finish_receiver(self) -> None:
+        self.receiver_finished = True
+
+    def validate_shutdown(self) -> None:
+        if self.requires_drain and not self.receiver_finished:
+            raise RuntimeError("receiver has not finished; retain resources")
 
 
 class FakeRoutedConnector(AFDRoutedExpertsConnector):
@@ -77,3 +114,37 @@ class FakeRoutedConnector(AFDRoutedExpertsConnector):
 
     def synchronize_lanes(self) -> None:
         self.events.append(("sync",))
+
+
+class ProxyConnector:
+    def __init__(self, events: list[tuple]) -> None:
+        self.events = events
+
+    def send_attn_output(self, hidden_states, context, **kwargs) -> None:
+        self.events.append(("send", hidden_states, context, kwargs))
+
+    def recv_ffn_output(self, *, ref_tensor, ubatch_idx):
+        self.events.append(("recv", ref_tensor, ubatch_idx))
+        return ref_tensor * 0.25
+
+
+def install_proxy_context(adapter, monkeypatch, events, *, stage_idx=2):
+    connector = ProxyConnector(events)
+    afd_metadata = SimpleNamespace(connector=connector, stage_idx=9)
+    monkeypatch.setattr(
+        adapter,
+        "get_afd_metadata_from_forward_context",
+        lambda: afd_metadata,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "get_forward_context",
+        lambda: SimpleNamespace(ubatch_idx=stage_idx),
+    )
+
+    def record_yield(hidden_states, *, role):
+        events.append(("yield", hidden_states, role))
+        return hidden_states
+
+    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", record_yield)
+    return afd_metadata

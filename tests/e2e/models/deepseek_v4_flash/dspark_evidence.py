@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Opt-in eager DSpark ownership and remote-expert execution evidence.
+"""Opt-in DSpark ownership and remote-expert execution evidence.
 
-Legacy work items already expose a host layer ID. Layered execution requires
-reading the device header after each return, adding synchronization. Disable
-this fixture for performance measurements.
+Layered execution requires reading the device header after each eager return,
+adding synchronization. FULL observations use the separate completion-boundary
+extension. Disable these fixtures for performance measurements.
 """
 
 from __future__ import annotations
@@ -60,11 +60,14 @@ def snapshot(runner) -> dict:
         **(
             {
                 "ffn_execution": "layered"
-                if runner.connector.layered_gmm_enabled
-                else "legacy",
+                if runner._layered_executor is not None
+                else "uninitialized",
                 "executor_layer_ids": list(runner._layered_executor.layer_ids)
                 if runner._layered_executor is not None
                 else [],
+                "ffn_mode": runner.effective_mode,
+                "graph_capture_count": runner._graph_capture_count,
+                "graph_replay_count": runner._graph_replay_count,
             }
             if is_ffn
             else {}
@@ -80,22 +83,13 @@ class DSparkEagerEvidence:
 
 
 def install_observers() -> None:
-    send = CAMAsyncAFDConnector.send_ffn_work_item_output
-    send_layered = CAMAsyncAFDConnector.send_ffn_output
+    send = CAMAsyncAFDConnector.send_ffn_output
     check = AFDNPUFFNWorker.raise_ffn_loop_error_if_any
 
     @wraps(send)
-    def sent(self, work_item, ffn_output):
-        result = send(self, work_item, ffn_output)
-        counters = self.__dict__.setdefault("_dspark_returns", {})
-        layer = str(work_item.layer_idx)
-        counters[layer] = counters.get(layer, 0) + 1
-        return result
-
-    @wraps(send_layered)
-    def sent_layered(self, ffn_output, context, **kwargs):
-        result = send_layered(self, ffn_output, context, **kwargs)
-        if self.layered_gmm_enabled:
+    def sent(self, ffn_output, context, **kwargs):
+        result = send(self, ffn_output, context, **kwargs)
+        if self.graph_startup.mode == "eager":
             # Functional observer only: the header copy fences the return
             # before a later receive can reuse this work item's metadata.
             header = context.states.token_nums_rankid_layeridx.cpu().tolist()
@@ -116,8 +110,7 @@ def install_observers() -> None:
         temporary.replace(path)
         return result
 
-    CAMAsyncAFDConnector.send_ffn_work_item_output = sent
-    CAMAsyncAFDConnector.send_ffn_output = sent_layered
+    CAMAsyncAFDConnector.send_ffn_output = sent
     AFDNPUFFNWorker.raise_ffn_loop_error_if_any = checked
 
 

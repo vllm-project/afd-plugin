@@ -29,7 +29,6 @@ validation_paths:
   - "tests/e2e/test_deploy_dsv4_flash_async_skill.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite_multi_pod.py"
-  - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
   - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
   - "tests/e2e/models/deepseek_v4_flash/test_deepseek_v4_flash_multi_pod.py"
   - "tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py"
@@ -52,7 +51,7 @@ verified_platform_refs:
   - "CUDA Qwen3 MoE"
   - "CUDA Qwen3.6 MoE"
 related_issues: []
-last_reviewed: 2026-10-13
+last_reviewed: 2026-11-09
 ---
 
 # E2E testing
@@ -143,8 +142,7 @@ scheduled job.
 Prefer graph coverage. Keep one eager smoke test unless a feature cannot run in
 graph mode.
 
-`afd-eager-async-cam` is a separate NPU-only smoke test. It uses four devices
-for Attention DP1/TP2 and FFN DP2/TP1/EP2. It is not part of the PR gate above.
+The DeepSeek-V4 Async CAM profile is a separate NPU-only test.
 The NPU async CAM cases may require SIGKILL escalation because a pending CAM
 receive cannot be interrupted cleanly. For these scenarios, the runner
 adds a unique run id and role marker to each launched process environment.

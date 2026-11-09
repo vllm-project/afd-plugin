@@ -195,25 +195,28 @@ spec:
                 esac
               }
 
-              echo "=== wait for every worker to report startup ==="
+              # One startup budget shared by every log marker and /health.
+              # Keep it below the 60-minute Ready wait in
+              # resources/deploy.md (step 4f), so a slow pod fails here with
+              # its own ERROR: reason first.
+              STARTUP_TIMEOUT_S=3300
+              STARTUP_DEADLINE=$(( $(date +%s) + STARTUP_TIMEOUT_S ))
+              past_deadline() { [ "$(date +%s)" -ge "$STARTUP_DEADLINE" ]; }
+
+              echo "=== wait for every worker to report startup (budget ${STARTUP_TIMEOUT_S}s) ==="
               for log in $LOGS; do
                 marker="$(ready_marker "$log")"
                 echo "--- waiting on $log (marker: $marker) ---"
-                ready=0
-                for i in $(seq 1 240); do
-                  if [ -f "/work/$log" ] && grep -qE "$marker" "/work/$log"; then
-                    echo "$log: ready"
-                    ready=1
-                    break
-                  fi
+                until [ -f "/work/$log" ] && grep -qE "$marker" "/work/$log"; do
                   kill -0 "$RECIPE_PID" 2>/dev/null || fail "recipe process exited before $log came up"
                   # Startup can take tens of minutes; a fatal engine error
                   # during it must fail the pod now, not at the timeout.
                   engine_died && fail "serving engine died during startup (fatal error in $LOGS)"
+                  past_deadline && fail "timed out after ${STARTUP_TIMEOUT_S}s waiting for $log"
                   touch /work/heartbeat
                   sleep 10
                 done
-                [ "$ready" = "1" ] || fail "timed out waiting for $log"
+                echo "$log: ready"
               done
 
               # Only the attention pod at ordinal 0 runs a client-facing
@@ -223,20 +226,16 @@ spec:
                   echo "--- headless attention shard (POD=$POD): skipping API /health wait ---"
                 else
                   echo "--- waiting on attention server /health (127.0.0.1:${TEMPLATE_CLIENT_PORT}) ---"
-                  endpoint_ready=0
-                  for i in $(seq 1 60); do
-                    # -m 5: an API server that accepts the connection but never
-                    # answers must not block this loop forever.
-                    if curl -fsS -m 5 "http://127.0.0.1:${TEMPLATE_CLIENT_PORT}/health" >/dev/null 2>&1; then
-                      echo "attention server: ready"
-                      endpoint_ready=1
-                      break
-                    fi
+                  # -m 5: an API server that accepts the connection but never
+                  # answers must not block this loop forever.
+                  until curl -fsS -m 5 "http://127.0.0.1:${TEMPLATE_CLIENT_PORT}/health" >/dev/null 2>&1; do
+                    kill -0 "$RECIPE_PID" 2>/dev/null || fail "recipe process exited before /health answered"
                     engine_died && fail "serving engine died while waiting for /health (fatal error in $LOGS)"
+                    past_deadline && fail "attention server did not answer /health within ${STARTUP_TIMEOUT_S}s"
                     touch /work/heartbeat
                     sleep 5
                   done
-                  [ "$endpoint_ready" = "1" ] || fail "attention server did not answer /health"
+                  echo "attention server: ready"
                 fi
               fi
 
