@@ -58,7 +58,7 @@ that logs, counters, traces, or execution behavior show the path was used.
 
 ## 3. Installation, Support, and Configuration
 
-Review `docs/installation.md`, `docs/support.md`, and `docs/configuration.md` for:
+Review `docs/installation.md`, the [support matrix](../../../../docs/support.md#tested-runtime-matrix), and `docs/configuration.md` for:
 
 - the exact supported vLLM revision or range;
 - the target Python, PyTorch, CUDA, driver, compiler, and NCCL requirements;
@@ -125,7 +125,7 @@ appear related to the changed code:
 |---|---|
 | `docs/design/module/index.md` | target runtime, upstream refs, validation entry points, ownership, and links |
 | `docs/design/module/compatibility_and_patches.md` | exact patch symbols/signatures, reasons, tests, dispositions, and removal/upstream plans |
-| `docs/design/module/execution_platforms.md` | GPU worker/runner initialization, device selection, CUDA Graph, DBO/uBatch, profiling, and runtime matrix |
+| `docs/design/module/execution_platforms.md` | GPU worker/runner initialization, device selection, CUDA Graph, DBO/uBatch, and profiling |
 | `docs/design/module/connector_contracts.md` | NCCL/P2P configuration, payload/metadata ownership, ordering, topology, lifecycle, and cleanup |
 | `docs/design/module/attention_runtime.md` | Attention lifecycle, KV/scheduler ownership, forward context, connector handoff, graph, and ubatching |
 | `docs/design/module/ffn_runtime.md` | FFN daemon/EngineCore lifecycle, MoE execution, graph dispatch, failure propagation, and shutdown |

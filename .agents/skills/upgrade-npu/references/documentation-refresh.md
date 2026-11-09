@@ -53,7 +53,7 @@ backend supports the new vLLM revision. Distinguish these evidence levels:
 
 ### Installation, support, and configuration
 
-Review `docs/installation.md`, `docs/support.md`, and `docs/configuration.md` for:
+Review `docs/installation.md`, the [support matrix](../../../../docs/support.md#tested-runtime-matrix), and `docs/configuration.md` for:
 
 - target runtime wording and whether the version applies to NPU, GPU, or both;
 - supported models, connector matrix, and validation limits;
@@ -138,7 +138,7 @@ Refresh the internal source-of-truth documents when their contracts changed:
 | --- | --- |
 | `docs/design/module/index.md` | Runtime pair, upstream references, validation entry points, code ownership, and links |
 | `docs/design/module/compatibility_and_patches.md` | Exact target patch inventory, source symbols and signatures, patch reasons, tests, and upstream/removal plans |
-| `docs/design/module/execution_platforms.md` | NPU Worker/ModelRunner initialization, ForwardContext, graph, DBO/uBatch, operator loading, and tested runtime matrix |
+| `docs/design/module/execution_platforms.md` | NPU Worker/ModelRunner initialization, ForwardContext, graph, DBO/uBatch, and operator loading |
 | `docs/design/module/connector_contracts.md` | Configuration schema, payload/work-item ownership, control plane, topology, lifecycle, and execution order |
 | `docs/design/module/attention_runtime.md` | Attention worker/runner selection, metadata, forward context, connector handoff, graph, and ubatching |
 | `docs/design/module/ffn_runtime.md` | FFN daemon/EngineCore lifecycle, MoE execution, connector steps, graph dispatch, and shutdown |
