@@ -10,11 +10,12 @@ launch order, readiness, evaluation, teardown -- is made by the in-pod
 runner itself; this only supplies what the runner cannot infer from its own
 pod's environment.
 
-DeepEP M2N needs FFN ranks first (afdEP-comm) and every NVLink domain to hold
-an equal, contiguous block of world ranks (DeepEP), so the two pods split by
-role with equal rank counts: Attention on one pod, FFN on the other. The
-ranks then span two NVLink domains, so dispatch and combine cross pods over
-NCCL GIN (RDMA).
+DeepEP M2N needs every NVLink domain (pod) to hold the same number of ranks,
+with the FFN ranks either filling the first pods or the same count in every
+pod. The cases cover both afdEP-comm modes: the role split (Attention on one
+pod, FFN on the other: FFN prefix) and the interleaved layout (one Attention
+and one FFN rank per pod: per-domain mode). The ranks span two NVLink domains,
+so dispatch and combine cross pods over NCCL GIN (RDMA).
 """
 
 from __future__ import annotations
@@ -43,11 +44,16 @@ GSM8K_SAMPLE_LIMIT = 100
 # evidence stays comparable with the single-host rows.
 POD_LAYOUTS = {
     "2pod-role-split": "2A0F,0A2F",
+    "2pod-interleaved": "1A1F,1A1F",
 }
 MULTI_POD_CASES = [
-    ("afd-deepep-m2n-eager-2a2f", "2pod-role-split"),
-    ("afd-deepep-m2n-graph-2a2f", "2pod-role-split"),
-    ("afd-deepep-m2n-graph-dbo-2a2f", "2pod-role-split"),
+    (scenario, layout)
+    for layout in POD_LAYOUTS
+    for scenario in (
+        "afd-deepep-m2n-eager-2a2f",
+        "afd-deepep-m2n-graph-2a2f",
+        "afd-deepep-m2n-graph-dbo-2a2f",
+    )
 ]
 
 

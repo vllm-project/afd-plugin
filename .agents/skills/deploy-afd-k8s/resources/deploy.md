@@ -3,10 +3,11 @@
 ## 2. GPU_COUNT
 
 Use the `GPU_COUNT` recorded by [resolve-recipe.md](resolve-recipe.md) --
-one value for a plain recipe (`GPU_COUNT`), one per role for a
-placement-driven plan (`ATTN_GPU_COUNT`, `FFN_GPU_COUNT`; every pod of a
-role shares its StatefulSet template, so it also shares the GPU count).
-Don't re-read the script here; all recipe parsing lives in step 1.
+one value for a plain or both-roles (`POD=AFD_<index>`) recipe
+(`GPU_COUNT`), one per role for a split-role plan (`ATTN_GPU_COUNT`,
+`FFN_GPU_COUNT`; every pod of a role shares its StatefulSet template, so it
+also shares the GPU count). Don't re-read the script here; all recipe
+parsing lives in step 1.
 
 ## 3. Confirm before touching the cluster
 
@@ -17,7 +18,8 @@ it prefixes every resource name and labels every object it creates
 `afd-deployment: <DEPLOY_NAME>`, so report/teardown/cleanup can select the
 whole deployment with `-l afd-deployment=<DEPLOY_NAME>`), and the plan as a
 table of `role | replicas | GPU_COUNT`
-(replicas straight from the recipe's header comment, GPU counts from
+(replicas straight from the recipe's header comment -- one `both` row for a
+both-roles plan, one row per role for a split-role plan; GPU counts from
 resolve-recipe.md -- no shape to negotiate, just restate what was parsed).
 Flag that step 4 **deletes every existing
 StatefulSet** (and its pods) carrying this deployment's label -- including
@@ -33,11 +35,12 @@ PVC_NAME=<pvc-name>
 CLIENT_PORT=<n>   # from the script's --port; default 18305
 RECIPE_SCRIPT_PATH=<local-recipe-script-path>
 DEPLOY_NAME=${DEPLOY_NAME:-vllm}
-# GPU counts recorded in step 1: GPU_COUNT for a plain recipe, or one per
-# role for a placement-driven plan.
-GPU_COUNT=<n>          # plain recipe only
-ATTN_GPU_COUNT=<n>     # placement-driven recipe only
-FFN_GPU_COUNT=<n>      # placement-driven recipe only
+# GPU counts recorded in step 1: GPU_COUNT for a plain or both-roles
+# (POD=AFD_<index>) recipe, or one per role for a split-role plan. Plan
+# shape, also from step 1: BOTH_ROLES, TOTAL_PODS, ATTN_SPLIT, FFN_SPLIT.
+GPU_COUNT=<n>          # plain or both-roles recipe only
+ATTN_GPU_COUNT=<n>     # split-role recipe only
+FFN_GPU_COUNT=<n>      # split-role recipe only
 # An unset context namespace resolves to empty here, which would silently
 # corrupt head DNS (<pod>.<svc>..svc.cluster.local) and the fsGroup lookup
 # below -- default it, and pass -n "$NAMESPACE" on every kubectl call in
@@ -236,42 +239,56 @@ endpoint() { # $1=service name, $2=head pod name
     < templates/service-endpoint.yaml | kubectl apply -n "$NAMESPACE" -f -
 }
 
+# Head pod of each role. A both-roles plan (a plain recipe or a
+# `POD=AFD_<index>` one) has a single ${DEPLOY_NAME}-pod StatefulSet, so
+# every role's head is its ordinal 0 -- the same pod serves the API server,
+# owns the rendezvous TCPStore, and leads both DP worlds. A split-role plan
+# has one StatefulSet per role, so each head is that StatefulSet's ordinal 0.
+if [ "${BOTH_ROLES:-1}" = "1" ]; then
+  attn_head="${DEPLOY_NAME}-pod-0"
+  ffn_head="${DEPLOY_NAME}-pod-0"
+else
+  attn_head="${DEPLOY_NAME}-pod-attention-0"
+  ffn_head="${DEPLOY_NAME}-pod-ffn-0"
+fi
+
 # Governing (identity) Service -- always.
 TEMPLATE_DEPLOY_NAME="$DEPLOY_NAME" envsubst '${TEMPLATE_DEPLOY_NAME}' \
   < templates/service-governing.yaml | kubectl apply -n "$NAMESPACE" -f -
 
-# Client-facing endpoint -- always; targets the attention head pod
-# (or the sole pod of a plain recipe).
-if [ "$PLAN_IS_PLAIN" = "1" ]; then
-  endpoint "${DEPLOY_NAME}-service" "${DEPLOY_NAME}-pod-0"
-else
-  endpoint "${DEPLOY_NAME}-service" "${DEPLOY_NAME}-pod-attention-0"
-fi
+# Client-facing endpoint -- always; targets the attention head pod (the sole
+# pod of a plain recipe, the API-server pod of every other plan).
+endpoint "${DEPLOY_NAME}-service" "$attn_head"
 
 # Rendezvous endpoint -- only when the plan spans more than one pod;
 # targets the FFN head pod, which owns the TCPStore.
 [ "${TOTAL_PODS:-1}" -gt 1 ] \
-  && endpoint "${DEPLOY_NAME}-ffn-p2p-service" "${DEPLOY_NAME}-pod-ffn-0"
+  && endpoint "${DEPLOY_NAME}-ffn-p2p-service" "$ffn_head"
 
-# DP-coordination endpoint -- only when the attention role itself is
-# split across >1 pod; targets the attention head pod. (No FFN counterpart:
-# nothing consumes an FFN_DP_ADDRESS today -- no env, no recipe. Add one
-# back, gated the same way, if a recipe ever needs it.)
+# DP-coordination endpoints -- only for a role that is itself split across
+# >1 pod. The FFN one exists for the `POD=AFD_<index>` recipes, which point
+# their FFN DP-RPC peers at ${DEPLOY_NAME}-ffn-dp-service; no split-role
+# recipe reads an FFN DP address today, and the template injects no
+# FFN_DP_ADDRESS env for it.
 [ "${ATTN_SPLIT:-0}" = "1" ] \
-  && endpoint "${DEPLOY_NAME}-attn-dp-service" "${DEPLOY_NAME}-pod-attention-0"
+  && endpoint "${DEPLOY_NAME}-attn-dp-service" "$attn_head"
+[ "${FFN_SPLIT:-0}" = "1" ] \
+  && endpoint "${DEPLOY_NAME}-ffn-dp-service" "$ffn_head"
 ```
 
-`TOTAL_PODS` (>1 when the recipe spans pods) and `ATTN_SPLIT` (1 when the
-attention role spans >1 pod) come from the plan parsed in
+`BOTH_ROLES` (1 when every pod runs both roles), `TOTAL_PODS` (>1 when the
+recipe spans pods), and `ATTN_SPLIT` / `FFN_SPLIT` (1 when that role spans
+>1 pod) come from the plan parsed in
 [resolve-recipe.md](resolve-recipe.md), never asked.
 
 ## 4e. Deploy StatefulSet(s)
 
-One StatefulSet per role the plan uses (a plain recipe deploys a single
-both-roles StatefulSet), with `replicas` = that role's pod count. Pod
-identity is self-derived: each pod reads its role from `AFD_ROLE` and its
-zero-based index from its hostname (`<statefulset>-<ordinal>`), so no
-per-pod env is injected at all:
+One StatefulSet per role the plan uses -- a plain recipe and a
+`POD=AFD_<index>` plan both deploy the single both-roles StatefulSet, a
+split-role plan one StatefulSet per role -- with `replicas` = that role's
+pod count. Pod identity is self-derived: each pod reads its role from
+`AFD_ROLE` and its zero-based index from its hostname
+(`<statefulset>-<ordinal>`), so no per-pod env is injected at all:
 
 ```bash
 deploy_role_sts() {
@@ -305,12 +322,21 @@ Plain recipe, one both-roles StatefulSet:
 deploy_role_sts both 1 "$GPU_COUNT"
 ```
 
-Placement-driven recipe, e.g. the qwen3.5 3-pod plan (2 attention pods,
-1 FFN pod; deploy FFN first so it owns the rendezvous):
+Split-role recipe, e.g. the qwen3.5 3-pod plan (2 attention pods, 1 FFN
+pod; deploy FFN first so it owns the rendezvous):
 
 ```bash
 deploy_role_sts ffn 1 "$FFN_GPU_COUNT"
 deploy_role_sts attention 2 "$ATTN_GPU_COUNT"
+```
+
+Both-roles multi-pod plan, e.g. the DeepEP M2N `POD=AFD_<index>` 2 x 4A1F
+plan: still one StatefulSet, scaled with `replicas`. Each pod derives its
+own role and ordinal, and those recipes read the ordinal as `${POD#AFD_}`
+-- so no per-pod env is injected here either:
+
+```bash
+deploy_role_sts both 2 "$GPU_COUNT"
 ```
 
 A re-applied ConfigMap (step 4b) or StatefulSet template does **not**

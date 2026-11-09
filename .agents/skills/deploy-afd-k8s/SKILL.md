@@ -18,7 +18,7 @@ On success this skill guarantees, in the target namespace:
 |---|---|
 | Endpoint | `http://${DEPLOY_NAME}-service:${CLIENT_PORT}` (OpenAI-compatible, in-namespace; `DEPLOY_NAME` defaults to `vllm`, `CLIENT_PORT` to `18305`) |
 | Serving | the model named by `MODEL_ID` |
-| StatefulSet(s) / Service | one StatefulSet per role (`${DEPLOY_NAME}-pod-<role>`, `replicas` = that role's pod count, pods `<name>-<ordinal>`); plain recipes use one both-roles StatefulSet `${DEPLOY_NAME}-pod`; client Service `${DEPLOY_NAME}-service` (an ExternalName at the attention head pod). Every object the deployment creates (StatefulSets, pods, Services, ConfigMap) is labeled `afd-deployment=<DEPLOY_NAME>` so the whole deployment selects/reports/tears down with `-l afd-deployment=<DEPLOY_NAME>`; pods and StatefulSets also carry `app=afd-recipe,role=serve`, other objects `app=afd-recipe`. The model PVC is deliberately not labeled (shared, user-named state). |
+| StatefulSet(s) / Service | one StatefulSet per role (`${DEPLOY_NAME}-pod-<role>`, `replicas` = that role's pod count, pods `<name>-<ordinal>`); plain recipes and both-roles plans (`POD=AFD_<index>`, every pod runs Attention and FFN) use one both-roles StatefulSet `${DEPLOY_NAME}-pod` with `replicas` = the pod count; client Service `${DEPLOY_NAME}-service` (an ExternalName at the attention head pod). Every object the deployment creates (StatefulSets, pods, Services, ConfigMap) is labeled `afd-deployment=<DEPLOY_NAME>` so the whole deployment selects/reports/tears down with `-l afd-deployment=<DEPLOY_NAME>`; pods and StatefulSets also carry `app=afd-recipe,role=serve`, other objects `app=afd-recipe`. The model PVC is deliberately not labeled (shared, user-named state). |
 | Model cache | `PVC_NAME`, mounted at `/models`, `HF_HOME=/models/.hf_home` |
 | Left running | yes, deliberately -- so weights stay warm for follow-up runs; step 5 asks the caller when to delete the pods |
 
@@ -35,28 +35,32 @@ deploy on top of it.
 Recovery scope: a crashed pod's container restarts and a deleted pod is
 recreated automatically, and a role-per-pod deployment (each role on its
 own pod) recovers from a peer-pod crash with no operator action. A
-**split-role** deployment (one role across multiple pods, e.g. a headless
-attention shard) does **not** recover automatically from the loss of its
-head pod: an idle surviving shard never detects the peer loss and never
-rejoins the restarted peer's rendezvous. Remediation is restarting the
+**split** deployment (one role across multiple pods, e.g. a headless
+attention shard, or a both-roles `POD=AFD_<index>` plan with more than one
+pod) does **not** recover automatically from the loss of its head pod: an
+idle surviving shard never detects the peer loss and never rejoins the
+restarted peer's rendezvous. Remediation is restarting the
 deployment's pods together (`kubectl delete pod -l afd-deployment=<name>`;
 the StatefulSets recreate them) -- never one role or one shard on its own,
 for the same collective-startup reason that the StatefulSets pin
 `updateStrategy: OnDelete`. Root cause is connector-level peer-loss
 detection, not this skill.
 
-Whenever a recipe's header spans more than one pod, up to two more
+Whenever a recipe's header spans more than one pod, up to three more
 internal-only Services may also exist:
 `${DEPLOY_NAME}-ffn-p2p-service` (rendezvous -- always, when the plan has
-more than one pod) and `${DEPLOY_NAME}-attn-dp-service` (only when the
-attention role is itself split across more than one pod; there is
-deliberately no FFN counterpart -- see [services.md](resources/services.md)).
+more than one pod), `${DEPLOY_NAME}-attn-dp-service` and
+`${DEPLOY_NAME}-ffn-dp-service` (only when that role is itself split across
+more than one pod -- the FFN one because the `POD=AFD_<index>` recipes
+point their FFN DP-RPC peers at it; see [services.md](resources/services.md)).
 All but the governing Service are ExternalName pointers at head pods --
 callers never talk to these directly.
 
 ## Scope
 
-- Recipes under `recipe/gpu/P2pNcclAFDConnector/**` (GPU only, not NPU),
+- Recipes under `recipe/gpu/P2pNcclAFDConnector/**` or
+  `recipe/gpu/DeepEPM2NAFDConnector/**` (GPU only, not NPU; the M2N image
+  must contain afdEP-comm and DeepGEMM),
   **`prefill_decode_colocation` only** (attention + FFN workers, no prefill
   split).
   `prefill_decode_disaggregation` recipes are **out of scope**: they need a
@@ -67,12 +71,13 @@ callers never talk to these directly.
   generator step and no manifest to read.
 - A recipe is **placement-driven** (more than one pod) exactly when its
   top-of-file comment block describes a per-pod placement -- read that
-  block, don't infer shape from flags. Today's recipes state the per-role pod
-  counts in prose ("on 3 pods: two attention pods and one FFN pod"), but the
-  comment isn't guaranteed to use that exact grammar going forward. The two
-  facts to extract are the per-role pod counts and whether a role is split
-  across pods; the recipes themselves take no per-pod env, so never carry a
-  per-pod override out of the header. See
+  block, don't infer shape from flags. Today's recipes state either the
+  per-role pod counts in prose ("on 3 pods: two attention pods and one FFN
+  pod") or one identical both-roles pod per line (`POD=AFD_0`,
+  `POD=AFD_1`, ...), but the comment isn't guaranteed to use either grammar
+  going forward. The three facts to extract are the pod count, the per-role
+  pod counts, and whether every pod runs both roles; the recipes take no
+  per-pod env, so never carry a per-pod override out of the header. See
   [resolve-recipe.md](resources/resolve-recipe.md).
 - Not for `tools/benchmarks/decode_bench_server.sh` (local, non-k8s).
 

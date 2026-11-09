@@ -177,8 +177,10 @@ python -m pytest -q -s \
 ```
 
 `tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py` runs the eager,
-graph and graph + DBO cases with Attention and FFN in two pods, one role per
-pod, so dispatch and combine cross nodes over NCCL GIN. The pods must be
+graph and graph + DBO cases on two pods in two layouts: one role per pod
+(`2A0F,0A2F`) and one Attention and one FFN rank per pod (`1A1F,1A1F`, which
+runs afdEP-comm's per-domain mode). Dispatch and combine cross nodes over NCCL
+GIN. The pods must be
 provisioned first; see
 [`.agents/skills/run-e2e/resources/k8-multi-pod.md`](../../.agents/skills/run-e2e/resources/k8-multi-pod.md)
 and the [multi-pod runner walkthrough](multi_pod/README.md).
