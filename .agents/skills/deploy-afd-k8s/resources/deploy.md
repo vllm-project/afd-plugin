@@ -332,7 +332,7 @@ the other role running the old recipe/config. A StatefulSet's default
 ordinal first, waiting for Ready -- which is why the template pins
 `OnDelete`.
 
-## 4f. Wait for Running, then for each pod's Ready condition
+## 4f. Wait for the pods to exist, then for Running and Ready
 
 One wait per pod, not `kubectl rollout status` -- that only works with
 `RollingUpdate`, and the template pins `updateStrategy: OnDelete`.
@@ -356,10 +356,39 @@ shared by every log marker and `/health`) is shorter than the 60-minute wait
 here, so a slow pod always fails with its own `ERROR:` reason instead of an
 outer timeout. Change the two together.
 
+Applying a StatefulSet only creates the StatefulSet: its controller creates
+the pods asynchronously, so between step 4e and the pods existing there is a
+window -- seconds normally, and the plain single-pod recipe has nothing
+else to wait on in between. `kubectl wait` does **not** wait for creation:
+on a pod that does not exist yet it fails with `NotFound` immediately, and
+`--timeout` does not apply. So confirm existence first, bounded at 5
+minutes, and treat "never created" as a StatefulSet problem (a stalled
+ordinal, an unschedulable template, a rejected update) rather than a slow
+pod -- the block prints the StatefulSet and its events. `--for=create` would
+be the one-liner, but it is not available in every kubectl this skill runs
+under.
+
 ```bash
 pods="<every pod of the plan, e.g. vllm-pod-ffn-0 vllm-pod-attention-0 vllm-pod-attention-1>"
 
+# The StatefulSet controller creates the pods after the apply returns, so
+# wait for each pod to exist before asking `kubectl wait` about it.
+wait_for_pod() {
+  local pod=$1
+  local deadline=$(( $(date +%s) + 300 ))
+  until kubectl -n "$NAMESPACE" get pod "$pod" >/dev/null 2>&1; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "pod $pod was never created after 5m"
+      kubectl -n "$NAMESPACE" get sts -l "afd-deployment=$DEPLOY_NAME" -o wide
+      kubectl -n "$NAMESPACE" describe sts "${pod%-*}" | tail -40
+      exit 1
+    fi
+    sleep 5
+  done
+}
+
 for pod in $pods; do
+  wait_for_pod "$pod"
   kubectl -n "$NAMESPACE" wait "pod/$pod" \
     --for=jsonpath='{.status.phase}'=Running --timeout=15m \
     || { kubectl -n "$NAMESPACE" describe "pod/$pod" | tail -40; exit 1; }

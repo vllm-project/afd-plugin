@@ -110,7 +110,7 @@ exist **before** any Pod is deployed -- see
 | Resource | Covers |
 |---|---|
 | [resolve-recipe.md](resources/resolve-recipe.md) | Step 1 (the only step that parses the recipe): read the recipe's serve-block fields and model id, record every role's `GPU_COUNT`; read its placement (or lack of one) from its header comment -- never ask. |
-| [deploy.md](resources/deploy.md) | Steps 2-4f: take step 1's `GPU_COUNT`, confirm, migrate a legacy Pod-based deployment if one is present (steps 3b-3c -- detect, then delete only with consent), PVC, ConfigMap, fsGroup, Services (step 4d -- which of the four, see [services.md](resources/services.md)), StatefulSet(s) via `templates/statefulset.yaml`, wait for Running and then every plan pod's `Ready` condition (not `kubectl rollout status`, see step 4f). |
+| [deploy.md](resources/deploy.md) | Steps 2-4f: take step 1's `GPU_COUNT`, confirm, migrate a legacy Pod-based deployment if one is present (steps 3b-3c -- detect, then delete only with consent), PVC, ConfigMap, fsGroup, Services (step 4d -- which of the four, see [services.md](resources/services.md)), StatefulSet(s) via `templates/statefulset.yaml`, wait for each pod to exist (the StatefulSet controller creates them asynchronously), then for Running, then for every plan pod's `Ready` condition (not `kubectl rollout status`, see step 4f). |
 | [report-and-teardown.md](resources/report-and-teardown.md) | Step 5: report the endpoint/model/nodes and ask when to delete the running pods. Step 6: teardown when the caller says so (pods/Services only -- never the PVC unless asked). |
 
 All k8s manifests live in `templates/*.yaml`, applied via `envsubst | kubectl
