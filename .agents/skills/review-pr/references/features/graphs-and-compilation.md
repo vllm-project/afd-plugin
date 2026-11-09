@@ -46,4 +46,4 @@ Test graph gating and metadata parity CPU-side where possible
 (`tests/unit/v1/worker/test_cuda_graph.py`, `test_npu_mla_graph.py`,
 `test_async_ffn_graph.py`, `tests/unit/connectors/test_async_cam_startup.py`);
 device behavior claims need the named GPU scenario (`afd-v2-graph-*`,
-`afd-v2-graph-dbo-*`) or the NPU run recorded per `docs/npu/TESTING.md`.
+`afd-v2-graph-dbo-*`) or the NPU run recorded per `tests/npu/README.md`.

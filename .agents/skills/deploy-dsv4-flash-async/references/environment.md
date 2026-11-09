@@ -36,7 +36,7 @@ export PID_DIR="${LOG_DIR}/pids"
 | vLLM 0.30.0 | `ced6857afa0ea7b2e3f0846a62e1394e90f15607` |
 | vLLM-Ascend | `8d4409d6256d8a6729140ddcc0d1889e3f96cdd6` |
 
-环境与历史实测见 [安装说明](../../../../README.md#ascend-npu-installation)。
+环境与历史实测见 [安装说明](../../../../docs/installation.md#ascend-npu-installation)。
 记录实际 CANN、torch、torch-npu 和构建产物；已有 A3 记录不是任意版本组合的兼容承诺。
 源码路径默认使用当前 AFD checkout 和同级 vLLM/Ascend，挂载或安装包不同则显式覆盖。
 
@@ -87,7 +87,7 @@ PYTHON
 
 仅 `import afd_plugin` 或 loader 成功不证明旧安装包含这四个算子；注册检查也不代替实际通信验收。缺少算子时检查安装日志和实际导入路径，并重新安装匹配源码。P 的 Attention/FFN 节点均需匹配的算子版本。
 
-仓库内构建细节见 `csrc/npu/README.md`，通信算子说明见 `docs/npu/CAM_ASYNC_ROUTED_OPS.md`。
+仓库内构建细节见 `csrc/npu/README.md`，通信算子说明见 `docs/design/npu/cam_async_routed_ops.md`。
 
 | 用途 | 变量 / 默认值 |
 | --- | --- |
