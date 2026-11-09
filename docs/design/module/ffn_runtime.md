@@ -16,7 +16,7 @@ primary_code_paths:
   - "afd_plugin/v1/worker/npu/ffn_worker.py"
 related_code_paths:
   - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_startup.py"
-  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_pull.py"
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_session.py"
   - "afd_plugin/connectors/**"
   - "afd_plugin/model_executor/**"
   - "afd_plugin/compat/patches/engine_core.py"
@@ -38,7 +38,9 @@ validation_paths:
   - "tests/unit/v1/worker/test_async_ffn_runtime.py"
   - "tests/unit/connectors/npu/test_async_cam_startup_wiring.py"
   - "tests/unit/connectors/npu/test_async_cam_startup.py"
-  - "tests/unit/connectors/npu/test_async_cam_pull.py"
+  - "tests/unit/connectors/test_base.py"
+  - "tests/unit/connectors/npu/test_async_cam_session.py"
+  - "tests/unit/connectors/npu/test_async_cam.py"
   - "tests/npu/async_cam_runtime.py"
   - "tests/npu/standalone_cam_attention.py"
   - "tests/e2e/models/deepseek_v4_flash/ffn_graph.py"
@@ -62,7 +64,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-10-26
+last_reviewed: 2026-11-05
 ---
 
 # FFN runtime
@@ -81,6 +83,17 @@ profiler, native-op, and build mechanisms belong to
 FFN consumes plugin configuration, connector transport, model-side compute,
 platform mechanisms, and EngineCore compatibility. No shared module may depend
 on the FFN worker or runner implementation.
+
+Async CAM's connector owns HCCL, payload validation and initialization/cleanup
+coordination. It selects a Push or Pull session at construction. Both inherit
+the concrete `FFNExecutionSession` lifecycle defaults from `connectors/base.py`. Push owns
+per-stage routing queues; Pull owns its single window, publish/combine, device
+status and quiet/drain/stopped lifecycle. Pull takes Startup, topology and the
+dimensions/capacity used for initialization and bounded drain; it does not
+retain the connector. The FFN runner continues to own eager/FULL execution,
+graph references and completion; the worker still owns the receiver thread.
+The current Mega executor reads the same live window through the connector's
+read-only `comm_args` property.
 
 ## Runtime selection
 
