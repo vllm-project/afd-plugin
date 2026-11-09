@@ -517,6 +517,10 @@ service, and 120 seconds for the test runner to shut down. Equivalent external
 launchers should set `VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS=60` and pass
 `--shutdown-timeout 90` to both services; a service timeout alone does not
 change the worker deadline. Explicit worker environment overrides are retained.
+The Case declares these three budgets through `worker_shutdown_timeout_s`,
+`shutdown_timeout_s` and `termination_timeout_s`. The worker environment override
+is recorded in the effective configuration and overrides alongside the canonical
+60-second default. The retained legacy path uses the same default constants.
 Attention SIGKILL escalation remains a failure. FFN uses the existing scoped
 async CAM cleanup exception.
 

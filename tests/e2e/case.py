@@ -31,6 +31,10 @@ DEFAULT_CONNECTOR_PORT = 1239
 DEFAULT_STARTUP_TIMEOUT_S = 900
 DEFAULT_SHUTDOWN_TIMEOUT_S = 10
 DEFAULT_TERMINATION_TIMEOUT_S = 20
+WORKER_SHUTDOWN_TIMEOUT_ENV = "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS"
+NPU_ASYNC_VLLM_SHUTDOWN_TIMEOUT_S = 90
+NPU_ASYNC_WORKER_SHUTDOWN_TIMEOUT_S = 60
+NPU_ASYNC_TERMINATION_TIMEOUT_S = 120
 
 
 @dataclass(frozen=True)
@@ -80,6 +84,8 @@ class Deployment:
     pin_attention_address: bool = False
     compilation_config: tuple[tuple[str, str | tuple[int, ...]], ...] = ()
     shutdown_timeout_s: int = DEFAULT_SHUTDOWN_TIMEOUT_S
+    # Existing worker environment overrides take precedence over this default.
+    worker_shutdown_timeout_s: int | None = None
     termination_timeout_s: float = DEFAULT_TERMINATION_TIMEOUT_S
 
     @property

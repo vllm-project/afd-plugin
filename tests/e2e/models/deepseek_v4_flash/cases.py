@@ -15,8 +15,12 @@ import json
 from tests.e2e.case import (
     CLEANUP_PROFILE_NPU_ASYNC_CAM_LEGACY,
     CLEANUP_PROFILE_STRICT,
+    DEFAULT_SHUTDOWN_TIMEOUT_S,
     EXECUTION_EAGER,
     EXECUTION_FULL_DECODE_GRAPH,
+    NPU_ASYNC_TERMINATION_TIMEOUT_S,
+    NPU_ASYNC_VLLM_SHUTDOWN_TIMEOUT_S,
+    NPU_ASYNC_WORKER_SHUTDOWN_TIMEOUT_S,
     Case,
     CaseEnvironment,
     DboConfig,
@@ -221,7 +225,15 @@ def _npu_case(case_id: str, environment: CaseEnvironment) -> Case:
             cleanup_profile=CLEANUP_PROFILE_NPU_ASYNC_CAM_LEGACY
             if asynchronous
             else CLEANUP_PROFILE_STRICT,
-            termination_timeout_s=config.DSV4_PROCESS_TERMINATION_TIMEOUT_S,
+            shutdown_timeout_s=NPU_ASYNC_VLLM_SHUTDOWN_TIMEOUT_S
+            if asynchronous
+            else DEFAULT_SHUTDOWN_TIMEOUT_S,
+            worker_shutdown_timeout_s=NPU_ASYNC_WORKER_SHUTDOWN_TIMEOUT_S
+            if asynchronous
+            else None,
+            termination_timeout_s=NPU_ASYNC_TERMINATION_TIMEOUT_S
+            if asynchronous
+            else config.DSV4_PROCESS_TERMINATION_TIMEOUT_S,
             cudagraph_capture_size=(
                 shape.cudagraph_capture_size if shape is not None and graph else None
             ),

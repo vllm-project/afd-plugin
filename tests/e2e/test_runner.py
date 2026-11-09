@@ -18,8 +18,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from tests.e2e import runner
-from tests.e2e.case import CaseEnvironment, DboConfig, Mrv2Check, Phase
+from tests.e2e.case import (
+    CLEANUP_PROFILE_STRICT,
+    CaseEnvironment,
+    DboConfig,
+    Mrv2Check,
+    Phase,
+)
 from tests.e2e.models.deepseek_v2_lite import cases as v2_cases
+from tests.e2e.models.deepseek_v4_flash import cases as dsv4_cases
 from tests.e2e.models.deepseek_v4_flash import test_async_cam_npu as entrypoint
 from tests.e2e.models.deepseek_v4_flash.completions import CompletionTask
 
@@ -148,6 +155,7 @@ with open(os.environ["AFD_HOST_PIDS"], "a") as log:
 Path(os.environ["AFD_HOST_PIDS"]).with_name(f"{model}.json").write_text(json.dumps({
     "arguments": arguments,
     "logging_level": os.environ.get("VLLM_LOGGING_LEVEL"),
+    "worker_shutdown_timeout": os.environ.get("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS"),
 }))
 if (
     (os.environ.get("AFD_HOST_OUTCOME") == "startup-failure"
@@ -260,6 +268,59 @@ def host_case_runtime(monkeypatch, tmp_path):
         api_port_base=port,
         startup_timeout=10,
     )
+
+
+@pytest.mark.parametrize(
+    "worker_override",
+    [None, "75"],
+    ids=["default-worker-timeout", "explicit-worker-timeout"],
+)
+def test_async_cam_shutdown_settings_reach_services_and_workers(
+    monkeypatch, host_case_runtime, worker_override
+):
+    if worker_override is None:
+        monkeypatch.delenv("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", worker_override)
+    environment = replace(
+        host_case_runtime,
+        device_backend="npu",
+        devices=tuple(str(index) for index in range(16)),
+    )
+    case = dsv4_cases.build_case(dsv4_cases.NPU_ASYNC_IDS[0], environment)
+    # Host stubs never daemonize. Exercise owned-group cleanup here, not the
+    # real CAM orphan/pidfd teardown, and keep this result out of device coverage.
+    case = replace(
+        case,
+        id="host-async-shutdown",
+        deployment=replace(case.deployment, cleanup_profile=CLEANUP_PROFILE_STRICT),
+    )
+    record = runner.run_case(case, environment)
+    assert record["acceptance_passed"] is True
+    assert record["cleanup"]["status"] == "passed"
+    for role in ("attention", "ffn"):
+        invocation = json.loads(
+            (
+                environment.output_path.parent
+                / f"{case.served_model_name_prefix}-{role}.json"
+            ).read_text()
+        )
+        arguments = invocation["arguments"]
+        assert arguments[arguments.index("--shutdown-timeout") + 1] == "90"
+        assert invocation["worker_shutdown_timeout"] == (worker_override or "60")
+    assert record["canonical"]["deployment"]["worker_shutdown_timeout_s"] == 60
+    assert record["effective"]["deployment"]["worker_shutdown_timeout_s"] == int(
+        worker_override or "60"
+    )
+    assert record["effective"]["deployment"]["termination_timeout_s"] == 120
+    if worker_override is not None:
+        assert (
+            record["overrides"]["VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS"]
+            == worker_override
+        )
+    for service in record["processes"]:
+        with pytest.raises(ProcessLookupError):
+            os.kill(service["pid"], 0)
 
 
 @pytest.mark.parametrize(

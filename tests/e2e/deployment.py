@@ -19,6 +19,7 @@ from pathlib import Path
 from tests.e2e.case import (
     CLEANUP_PROFILE_NPU_ASYNC_CAM_LEGACY,
     CLEANUP_PROFILE_STRICT,
+    WORKER_SHUTDOWN_TIMEOUT_ENV,
     Case,
     CaseEnvironment,
     DboConfig,
@@ -330,6 +331,9 @@ class ServiceDeployment:
         process_env["AFD_E2E_PROCESS_ROLE"] = role
         process_env["PYTHONUNBUFFERED"] = "1"
         process_env.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "18000")
+        worker_timeout = resolved.case.deployment.worker_shutdown_timeout_s
+        if worker_timeout is not None:
+            process_env.setdefault(WORKER_SHUTDOWN_TIMEOUT_ENV, str(worker_timeout))
         process_env.pop("AFD_PLUGIN_EARLY_ENGINE_PATCH", None)
         process_env.pop("AFD_E2E_HASH_INPUT_IDS", None)
         process_env.pop("AFD_E2E_HASH_REQUIRE_GRAPH", None)

@@ -29,7 +29,17 @@ from tests.e2e.accuracy.gsm8k import (
     _run_lm_eval,
 )
 from tests.e2e.cancellation import cancellable_run
-from tests.e2e.case import Case, CaseEnvironment, JsonValue, Mrv2Check, Role
+from tests.e2e.case import (
+    NPU_ASYNC_TERMINATION_TIMEOUT_S,
+    NPU_ASYNC_VLLM_SHUTDOWN_TIMEOUT_S,
+    NPU_ASYNC_WORKER_SHUTDOWN_TIMEOUT_S,
+    WORKER_SHUTDOWN_TIMEOUT_ENV,
+    Case,
+    CaseEnvironment,
+    JsonValue,
+    Mrv2Check,
+    Role,
+)
 from tests.e2e.checks.mrv2 import (
     Mrv2Session,
     assert_execution_evidence,
@@ -73,9 +83,6 @@ PROCESS_REAP_TIMEOUT_S = 5
 NPU_ASYNC_PROCESS_KILL_TIMEOUT_S = 120
 LOG_THREAD_JOIN_TIMEOUT_S = 2
 VLLM_SHUTDOWN_TIMEOUT_S = 10
-NPU_ASYNC_VLLM_SHUTDOWN_TIMEOUT_S = 90
-NPU_ASYNC_WORKER_SHUTDOWN_TIMEOUT_S = 60
-NPU_ASYNC_TERMINATION_TIMEOUT_S = 120
 DEFAULT_GSM8K_SAMPLE_LIMIT = 7
 GSM8K_NUM_FEWSHOT = 8
 GSM8K_FULL_SAMPLE_COUNT = 1319
@@ -1023,7 +1030,7 @@ def build_env(
         env.pop("VLLM_ASCEND_ENABLE_FLASHCOMM1", None)
         if args.afd_async and not args.baseline:
             env.setdefault(
-                "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
+                WORKER_SHUTDOWN_TIMEOUT_ENV,
                 str(NPU_ASYNC_WORKER_SHUTDOWN_TIMEOUT_S),
             )
     env.pop("AFD_PLUGIN_EARLY_ENGINE_PATCH", None)
@@ -1178,7 +1185,14 @@ def prepare_case(
         task, phase_reasons = phase.task.resolve(os.environ)
         effective_phases.append(replace(phase, task=task))
         reasons.extend(f"{phase.name}: {reason}" for reason in phase_reasons)
-    effective = replace(case, phases=tuple(effective_phases))
+    profile = case.deployment
+    override_names: tuple[str, ...] = (GSM8K_LIMIT_ENV, GSM8K_THRESHOLD_ENV)
+    if profile.worker_shutdown_timeout_s is not None:
+        override_names += (WORKER_SHUTDOWN_TIMEOUT_ENV,)
+        worker_timeout = os.environ.get(WORKER_SHUTDOWN_TIMEOUT_ENV)
+        if worker_timeout is not None:
+            profile = replace(profile, worker_shutdown_timeout_s=int(worker_timeout))
+    effective = replace(case, deployment=profile, phases=tuple(effective_phases))
     resolved = deployment.resolve(effective, environment, slots=slots)
     probe_arguments = (
         ("--worker-extension-cls", "tests.e2e.mrv2_evidence.Worker")
@@ -1195,9 +1209,7 @@ def prepare_case(
             "output_path": str(environment.output_path),
         },
         "overrides": {
-            name: os.environ[name]
-            for name in (GSM8K_LIMIT_ENV, GSM8K_THRESHOLD_ENV)
-            if name in os.environ
+            name: os.environ[name] for name in override_names if name in os.environ
         },
         "configuration": {
             "eligible": not reasons,

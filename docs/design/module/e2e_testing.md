@@ -100,6 +100,11 @@ scoped FFN process-ownership cleanup exception; other profiles are strict.
 `Deployment.dbo_for_role()` resolves this rule for commands, probe validation
 and role logging. A DBO check requires it on every named role, so Attention-only
 native DBO does not imply FFN DBO.
+NPU async CAM declares 60-second worker, 90-second service and 120-second runner
+shutdown budgets. The worker budget is an environment default, independent of
+the service CLI timeout. Existing worker environment overrides are retained and
+recorded in the effective configuration. Other profiles keep their declared
+shutdown budgets and do not gain this worker default.
 
 The seven existing GPU multi-pod entries use model-local distributed Cases.
 `multi_pod` derives local RoleSlots and coordinates addresses, launch barriers,
