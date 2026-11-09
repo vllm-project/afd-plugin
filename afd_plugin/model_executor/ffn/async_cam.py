@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Attention TP token-layout conversion at the Async CAM boundary."""
+"""Model-side Async CAM tensor layout and native DBO receive handoff."""
 
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final
 
@@ -12,6 +13,13 @@ import torch
 from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
+from vllm.v1.worker.ubatching import (
+    dbo_enabled,
+    dbo_maybe_run_recv_hook,
+    dbo_register_recv_hook,
+)
+
+from afd_plugin.connectors import AFDConnectorBase, AFDTransferContext
 
 ASYNC_MOE_LAYOUT_LOG_ENV: Final[str] = "AFD_ASYNC_MOE_LAYOUT_LOG"
 _TRUE_ENV_VALUES: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
@@ -223,10 +231,46 @@ def _pad_first_dim(
     )
 
 
+def send_async_cam_remote_call(
+    connector: AFDConnectorBase,
+    hidden_states: torch.Tensor,
+    context: AFDTransferContext,
+    **send_kwargs: torch.Tensor | None,
+) -> Callable[[], torch.Tensor]:
+    """Send once and let the peer submit raw receive before its next send.
+
+    The returned closure belongs to this call. Layout restoration, TP
+    collectives and shared/HC/scaling remain with the resumed owner.
+    """
+    overlapping = dbo_enabled()
+    if overlapping:
+        dbo_maybe_run_recv_hook()
+    connector.send_attn_output(hidden_states, context, **send_kwargs)
+    owner_stage = context.metadata.stage_idx
+    receive_started = False
+    output: torch.Tensor | None = None
+
+    def receive() -> torch.Tensor:
+        nonlocal receive_started, output
+        if not receive_started:
+            receive_started = True
+            output = connector.recv_ffn_output(
+                ref_tensor=hidden_states, ubatch_idx=owner_stage, context=context
+            )
+        if output is None:
+            raise RuntimeError("Async CAM receive failed; restart the A/F worker group")
+        return output
+
+    if overlapping:
+        dbo_register_recv_hook(receive)
+    return receive
+
+
 __all__ = [
     "ASYNC_MOE_LAYOUT_LOG_ENV",
     "CAMDispatchLayout",
     "CAMDispatchPayload",
     "prepare_cam_dispatch_payload",
     "restore_cam_dispatch_output",
+    "send_async_cam_remote_call",
 ]

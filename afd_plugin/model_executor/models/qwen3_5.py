@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Qwen3.5/3.6 MoE AFD wrapper for the native vLLM lifecycle."""
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -12,7 +12,11 @@ from vllm.model_executor.models import qwen3_5 as native
 from vllm.model_executor.models import qwen3_next as next_native
 
 from afd_plugin.config import parse_optional_afd_config
-from afd_plugin.model_executor.models.deepseek_v2 import AFDAttentionFusedMoE
+from afd_plugin.model_executor.ffn.remote import AFDAttentionFusedMoE
+from afd_plugin.model_executor.models._weight_utils import (
+    filter_role_weights,
+    layer_weight_path,
+)
 
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
@@ -29,20 +33,6 @@ def _validate_qwen_text_only(model_config: ModelConfig) -> None:
         )
 
 
-def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
-    """Return ``(layer index, stage, remainder)`` for a decoder weight."""
-    parts = name.split(".")
-    for marker_idx, part in enumerate(parts[:-2]):
-        if part != "layers":
-            continue
-        try:
-            layer_idx = int(parts[marker_idx + 1])
-        except ValueError:
-            continue
-        return layer_idx, parts[marker_idx + 2], tuple(parts[marker_idx + 3 :])
-    return None
-
-
 def _checkpoint_weight_roles(
     name: str,
 ) -> frozenset[str]:
@@ -51,7 +41,7 @@ def _checkpoint_weight_roles(
     if "visual" in parts or "mtp" in parts:
         return _NO_ROLES
 
-    layer_path = _weight_layer_path(name)
+    layer_path = layer_weight_path(name)
     if layer_path is None:
         # Embeddings, final norm, and lm_head are required only by Attention.
         return _ATTENTION_ROLE
@@ -70,19 +60,6 @@ def _checkpoint_weight_roles(
     ):
         return _FFN_ROLE
     raise RuntimeError(f"unclassified Qwen MoE checkpoint weight: {name}")
-
-
-def _iter_role_weights(
-    weights: Iterable[tuple[str, torch.Tensor]],
-    *,
-    role: str | None,
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """Consume a checkpoint iterator once and retain only this role's paths."""
-    for name, loaded_weight in weights:
-        if role is None or role in _checkpoint_weight_roles(
-            name,
-        ):
-            yield name, loaded_weight
 
 
 class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
@@ -551,9 +528,8 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # ### PATCH START: load each checkpoint path only on its owning role.
         loaded = super().load_weights(
-            _iter_role_weights(
-                weights,
-                role=self.afd_role,
+            filter_role_weights(
+                weights, role=self.afd_role, classify=_checkpoint_weight_roles
             ),
         )
         # ### PATCH END

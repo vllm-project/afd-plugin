@@ -131,20 +131,19 @@ class ProxyConnector:
 def install_proxy_context(adapter, monkeypatch, events, *, stage_idx=2):
     connector = ProxyConnector(events)
     afd_metadata = SimpleNamespace(connector=connector, stage_idx=9)
-    monkeypatch.setattr(
-        adapter,
-        "get_afd_metadata_from_forward_context",
-        lambda: afd_metadata,
-    )
-    monkeypatch.setattr(
-        adapter,
-        "get_forward_context",
-        lambda: SimpleNamespace(ubatch_idx=stage_idx),
-    )
+    from afd_plugin.model_executor.ffn import remote
 
     def record_yield(hidden_states, *, role):
         events.append(("yield", hidden_states, role))
         return hidden_states
 
-    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", record_yield)
+    monkeypatch.setattr(
+        remote, "get_afd_metadata_from_forward_context", lambda: afd_metadata
+    )
+    monkeypatch.setattr(
+        remote, "get_forward_context", lambda: SimpleNamespace(ubatch_idx=stage_idx)
+    )
+    # Model-specific forwards and shared proxies both yield to DBO.
+    for module in (adapter, remote):
+        monkeypatch.setattr(module, "maybe_apply_dbo_yield", record_yield)
     return afd_metadata

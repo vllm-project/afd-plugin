@@ -249,7 +249,7 @@ def checkpoint_weight_roles() -> Callable[..., frozenset[str]]:
         for node in ast.parse(path.read_text()).body
         if (
             isinstance(node, ast.FunctionDef)
-            and node.name in ("_weight_layer_path", "_checkpoint_weight_roles")
+            and node.name == "_checkpoint_weight_roles"
         )
         or (
             isinstance(node, ast.Assign)
@@ -257,7 +257,9 @@ def checkpoint_weight_roles() -> Callable[..., frozenset[str]]:
             and node.targets[0].id in ("_ATTENTION_ROLE", "_FFN_ROLE", "_BOTH_ROLES")
         )
     ]
-    namespace: dict[str, object] = {}
+    from afd_plugin.model_executor.models._weight_utils import layer_weight_path
+
+    namespace: dict[str, object] = {"layer_weight_path": layer_weight_path}
     module = ast.Module(body=helpers, type_ignores=[])
     exec(compile(module, str(path), "exec"), namespace)
     return cast(Callable[..., frozenset[str]], namespace["_checkpoint_weight_roles"])

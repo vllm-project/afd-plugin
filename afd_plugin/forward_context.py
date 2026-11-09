@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Helpers for plugin-owned model wrappers to read AFD forward metadata."""
+"""AFD forward metadata installation and access shared by runners and models."""
 
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ def get_afd_metadata_from_forward_context(
 ) -> AFDForwardContextMetadata | None:
     """Return AFD metadata from vLLM ``ForwardContext.additional_kwargs``.
 
-    Model wrappers use this helper so AFD metadata stays outside vLLM's
-    ``ForwardContext`` schema.
+    Models and remote FFN proxies read the metadata installed by runners
+    without extending vLLM's ``ForwardContext`` schema.
     """
 
     if forward_context is None:

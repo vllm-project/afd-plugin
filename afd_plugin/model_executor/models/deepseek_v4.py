@@ -8,7 +8,7 @@ and token-aligned input IDs cross the Attention-to-FFN boundary. The returned
 FFN activation is the sole FFN-to-Attention tensor.
 """
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -20,26 +20,16 @@ from vllm.models.deepseek_v4.nvidia import model as native
 from afd_plugin.compat.patches.gpu_deepseek_v4_dbo import forward_v4_attention
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
-from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
+from afd_plugin.forward_context import get_afd_metadata_from_forward_context
+from afd_plugin.model_executor.models._weight_utils import (
+    filter_role_weights,
+    layer_weight_path,
+)
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
 _BOTH_ROLES = frozenset(("attention", "ffn"))
-
-
-def _weight_layer_path(name: str) -> tuple[int, str] | None:
-    """Extract the decoder layer index and first layer-local path component."""
-    parts = name.split(".")
-    for marker_idx, part in enumerate(parts[:-2]):
-        if part != "layers":
-            continue
-        try:
-            layer_idx = int(parts[marker_idx + 1])
-        except ValueError:
-            continue
-        return layer_idx, parts[marker_idx + 2]
-    return None
 
 
 def _checkpoint_weight_roles(name: str) -> frozenset[str]:
@@ -53,24 +43,13 @@ def _checkpoint_weight_roles(name: str) -> frozenset[str]:
         "model.hc_head_scale",
     }:
         return _ATTENTION_ROLE
-    layer_path = _weight_layer_path(name)
+    layer_path = layer_weight_path(name)
     if layer_path is None:
         return _BOTH_ROLES
-    _, stage = layer_path
+    _, stage, _ = layer_path
     if stage == "ffn":
         return _FFN_ROLE
     return _ATTENTION_ROLE
-
-
-def _iter_role_weights(
-    weights: Iterable[tuple[str, torch.Tensor]],
-    *,
-    role: str,
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """Consume a checkpoint iterator once and retain only role-owned paths."""
-    for name, loaded_weight in weights:
-        if role in _checkpoint_weight_roles(name):
-            yield name, loaded_weight
 
 
 class RemoteDeepseekV4FFN(nn.Module):
@@ -615,7 +594,9 @@ class AFDDeepseekV4ForCausalLM(native.DeepseekV4ForCausalLM):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return super().load_weights(
-            _iter_role_weights(weights, role=self.afd_role),
+            filter_role_weights(
+                weights, role=self.afd_role, classify=_checkpoint_weight_roles
+            ),
         )
 
 
