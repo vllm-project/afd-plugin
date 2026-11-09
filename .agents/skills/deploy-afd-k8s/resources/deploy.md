@@ -342,6 +342,13 @@ reach `Failed`, so an unbounded wait would spin forever), then a 60-minute
 wait per pod for its `Ready` condition (model download and graph capture
 dominate).
 
+Both waits poll the API with `-o jsonpath` instead of using `kubectl wait`:
+`--for=jsonpath=...` needs kubectl >= 1.31 and this skill also runs under
+much older clients (v1.18 in the current CI image, which reports
+`error: unrecognized condition`), and the `Ready` loop has to distinguish
+`phase=Failed` and dump logs anyway. `--for=condition=Ready` is portable
+but cannot tell a dead pod from a cold one.
+
 `Ready` is the single readiness signal, and the template's `readinessProbe`
 drives it: the pod turns Ready only once its own engine is up (`/work/ready`
 written after every log marker and, on the attention head, a `/health`
@@ -389,9 +396,19 @@ wait_for_pod() {
 
 for pod in $pods; do
   wait_for_pod "$pod"
-  kubectl -n "$NAMESPACE" wait "pod/$pod" \
-    --for=jsonpath='{.status.phase}'=Running --timeout=15m \
-    || { kubectl -n "$NAMESPACE" describe "pod/$pod" | tail -40; exit 1; }
+  deadline=$(( $(date +%s) + 900 ))
+  while true; do
+    phase="$(kubectl -n "$NAMESPACE" get pod "$pod" \
+      -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    [ "$phase" = "Running" ] && break
+    if [ "$phase" = "Failed" ] || [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "pod $pod did not reach Running (phase=${phase:-unknown})"
+      kubectl -n "$NAMESPACE" logs "pod/$pod" --tail=200
+      kubectl -n "$NAMESPACE" describe "pod/$pod" | tail -40
+      exit 1
+    fi
+    sleep 5
+  done
 done
 
 for pod in $pods; do
