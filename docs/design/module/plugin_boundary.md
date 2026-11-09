@@ -138,7 +138,7 @@ must be placed under `connector_extra_config`.
 | `afd_process_group_timeout_s` | `120` | Positive AFD process-group rendezvous timeout in seconds; also bounds the NPU native DBO startup barrier. It is not a device-kernel cancellation deadline. |
 | `num_attention_ranks`, `num_ffn_ranks` | `1`, `1` | AFD role-group sizes used by topology construction. |
 | `compute_gate_on_attention` | `false` | Moves supported gate/MoE routing work to Attention. CUDA supports both gate placements at the remote-experts boundary; synchronous CAMP2P still requires `false`, while CAM async requires `true`. |
-| `connector_extra_config` | `{}` | Envelope key parsed by the selected connector into a typed `ConnectorExtraInfo`; it is not stored on `AFDConfig`. |
+| `connector_extra_config` | `{}` | Mapping stored on `AFDConfig` and parsed by the selected connector into a typed `ConnectorExtraInfo`. |
 
 The compatibility aliases `afd_connector`, `afd_role`, `afd_port`, `afd_host`,
 and `async` normalize to canonical fields. Supplying an alias and its canonical
@@ -150,15 +150,14 @@ coordinates. It is resolved once by the connector factory and is not an
 `AFDConfig` field.
 
 Connector construction parses `connector_extra_config` through the selected
-connector class. P2P accepts only an empty mapping; CAMP2P and CAM async each
-define a closed, typed schema and reject unknown fields. The detailed schemas
+connector class. P2P accepts only an empty mapping; the other connectors
+define closed, typed schemas and reject unknown fields. The detailed schemas
 belong to [connector contracts](connector_contracts.md) and the operational
 connector guides.
 
-`AFDConfig.compute_hash()` currently includes connector, async mode, role, and
-both role counts. This is an implementation detail used by
-graph-affecting configuration paths, not a complete serialization or public
-configuration identity.
+`AFDConfig.compute_hash()` includes connector, async mode, role, both role
+counts, and connector-specific configuration. It is used by graph-affecting
+configuration paths, not as a complete serialization or public identity.
 
 ## Validation and worker selection
 

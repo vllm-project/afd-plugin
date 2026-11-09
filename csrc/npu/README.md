@@ -169,17 +169,15 @@ ensure_afd_ascend_ops_loaded()
 
 ## Current Scope
 
-A2E/E2A continue to serve the existing CAMP2P connector. The four 910C
-routed-only CAM operators are an experimental native integration and are not
-yet selected by `CAMAsyncAFDConnector`, which retains its external legacy CAM
-interface.
+A2E/E2A serve `CAMP2pAFDConnector`. `CAMAsyncAFDConnector` uses the plugin's
+910C routed-only CAM operators; see the [operator contract](../../docs/npu/CAM_ASYNC_ROUTED_OPS.md).
 
 `grouped_matmul_swiglu_quant_v2_layered` is a fused
 grouped-matmul + SiLU + dynamic-quantization CAM operator (A8W8 / A4W4 /
 A8W4-MSD variants) built for `ascend910_93`. It is registered as
 `torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered` (inference + Meta; no
-autograd grad) and is excluded from `ascend950` builds. It is selected by the
-opt-in layered W4A8 executor.
+autograd grad) and is excluded from `ascend950` builds. The default Async CAM
+layered executor uses it for W4A8 and W8A8.
 
 The trailing `swiglu_limit` argument defaults to `0.0` (no clipping). A finite
 positive `L` computes `SiLU(min(gate, L)) * clamp(up, -L, L)` before output

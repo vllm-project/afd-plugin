@@ -42,7 +42,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-11-05
+last_reviewed: 2026-11-09
 ---
 
 # Connector contracts
@@ -95,8 +95,8 @@ which lets feature validation use the same connector-owned schema.
 
 ## Connector-owned configuration
 
-`additional_config["afd"]["connector_extra_config"]` is an envelope rather
-than an `AFDConfig` field. Unknown fields fail in the selected connector parser.
+`AFDConfig.connector_extra_config` stores the connector-specific mapping.
+Unknown fields fail in the selected connector parser.
 
 | Connector | Accepted connector-specific fields |
 | --- | --- |
