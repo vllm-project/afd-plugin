@@ -29,7 +29,7 @@ from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
-from afd_plugin.model_executor.ffn.expert_weights import QuantizedExpertWeights
+from afd_plugin.model_executor.ffn.npu.expert_weights import QuantizedExpertWeights
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 from afd_plugin.v1.worker.npu.ffn_worker import AFDNPUFFNWorker
 

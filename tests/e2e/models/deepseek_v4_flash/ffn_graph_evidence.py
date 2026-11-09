@@ -15,7 +15,7 @@ from weakref import WeakKeyDictionary
 import torch
 
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
-from afd_plugin.model_executor.ffn.compute import AsyncCAMMegaExecutor
+from afd_plugin.model_executor.ffn.npu.compute import AsyncCAMMegaExecutor
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 from afd_plugin.v1.worker.npu.attention_model_runner_v2 import (
     AFDNPUAttentionModelRunnerV2,

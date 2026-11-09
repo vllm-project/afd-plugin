@@ -15,11 +15,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from afd_plugin.model_executor.ffn.compute import (  # noqa: E402
+from afd_plugin.model_executor.ffn.npu.compute import (  # noqa: E402
     AsyncCAMLayeredExecutor,
     AsyncCAMMegaExecutor,
 )
-from afd_plugin.model_executor.ffn.expert_weights import (  # noqa: E402
+from afd_plugin.model_executor.ffn.npu.expert_weights import (  # noqa: E402
     QuantizedExpertWeights,
     expert_weight_signature,
 )

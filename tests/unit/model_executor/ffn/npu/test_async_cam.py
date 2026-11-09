@@ -13,7 +13,7 @@ pytest.importorskip("vllm")
 from vllm.v1.worker import ubatching  # noqa: E402
 
 from afd_plugin.connectors import AFDTransferContext, AFDTransferMetadata  # noqa: E402
-from afd_plugin.model_executor.ffn import async_cam  # noqa: E402
+from afd_plugin.model_executor.ffn.npu import async_cam  # noqa: E402
 
 
 def test_plain_tp_cam_boundary_shards_and_restores_replicated_tokens(monkeypatch):
