@@ -60,7 +60,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-11-05
+last_reviewed: 2026-11-09
 ---
 
 # FFN runtime
@@ -397,15 +397,7 @@ async model E2E coverage.
 
 ## Limitations and open issues
 
-Current shared limits are the supported vLLM release, connector-driven FFN,
-and registered role-aware model integrations. Ascend V1 native DBO accepts
-exactly two ubatches. A V2-paired FFN uses the same AFD FFN runner with a
-V2-compatible construction and forward-context seam. CUDA FFN consumes the
-two-stage control layout and replays the matching graph when requested;
-Ascend V2 consumes two-stage synchronous control metadata in eager DBO mode.
-CAM async instead uses eager connector work items; native DBO runs only on
-Attention and does not create a separate FFN stage scheduler.
-Platform-specific limits are centralized in
+Platform-specific execution limits and validation evidence are centralized in
 [execution platforms](execution_platforms.md#tested-runtime-matrix).
 
 Issue [#107](https://github.com/JiusiServe/afd-plugin/issues/107) completed the

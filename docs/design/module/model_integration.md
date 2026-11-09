@@ -38,7 +38,7 @@ related_issues:
   - "#88"
   - "#105"
   - "#129"
-last_reviewed: 2026-10-30
+last_reviewed: 2026-11-09
 ---
 
 # Model integration
@@ -188,23 +188,21 @@ separate from the routed layered executor: W4A8 applies the model's
 The synchronous DSV4 E2E profiles check concurrent serving but disable answer
 checking; the A5 profile records incorrect concurrent answers. Async DSV4 has
 an exact-answer smoke case; V4 true native DBO still requires model accuracy
-qualification. Lite two-stage DBO has the limited result recorded in the
-[0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507). See
+qualification. See
 [E2E testing](e2e_testing.md) and the [layered guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-and-w8a8-layered-gmm).
 
 ### Qwen3 MoE CUDA boundary
 
 `AFDQwen3MoeModel` uses the native `decoder_layer_type` injection hook. The
-Attention role constructs native Qwen Attention and normalization modules and
-uses a parameter-free `RemoteFFNProxy`; the FFN role constructs the complete
-native dense MLP or `Qwen3MoeSparseMoeBlock`. Native forward order, FusedMoE,
-packed parameter mapping, quantization paths, and weight loading remain owned
-by vLLM. Checkpoint weights are filtered once by layer-stage path before the
-native loader consumes them.
+Attention role constructs native Qwen Attention and normalization modules.
+With P2P, a parameter-free `RemoteFFNProxy` sends hidden states to FFN, which
+runs the complete native MLP or MoE block; `compute_gate_on_attention=false`
+is required. With DeepEP M2N, Attention owns gate/top-k and FFN runs routed
+experts only; this requires `compute_gate_on_attention=true`, every layer to
+be MoE, and no shared expert. Native weight loading follows role-based filtering.
 
-This path is CUDA-only and requires `compute_gate_on_attention=false`. It fails
-during construction for sequence-parallel MoE, EPLB, pipeline parallelism,
-speculative decoding, LoRA, or NPU.
+Both paths are CUDA-only and reject sequence-parallel MoE, EPLB, pipeline
+parallelism, speculative decoding, and LoRA during construction.
 
 ### Qwen3.5/3.6 MoE CUDA boundary
 
@@ -218,9 +216,7 @@ This path is CUDA-only, text-only, and requires `--language-model-only`,
 multimodal execution, sequence-parallel MoE, EPLB, speculative decoding, and
 LoRA before language-model construction; NPU model-config resolution fails
 before model loading. GDN DBO is unsupported under native hybrid/multimodal
-DBO validation; ordinary eager and graph execution remain supported. Earlier
-H20 Graph + DBO and recurrent-state/CUDA Graph parity checks describe the
-removed adapter and do not qualify the current implementation. The current
+DBO validation; ordinary eager and graph execution remain supported. The
 2A1F suite keeps static EP and PP1. Attention-side router transport, async
 communication, multi-node, quantization, and performance remain outside the
 validated scope.
@@ -234,9 +230,8 @@ ad-hoc `ForwardContext.afd_metadata` attribute. The current metadata supplies
 stage/request/token slicing, stage count, optional transaction ID, and a live
 connector reference.
 
-Native forward-context creation can bypass an AFD model-runner call site:
-Ascend V1 dummy runs do so, while V2 creates its context inside native
-`execute_model()`. During those scopes, `use_afd_metadata_provider()`
+Native V2 creates its context inside `execute_model()`.
+During that scope, `use_afd_metadata_provider()`
 temporarily wraps `vllm.forward_context.create_forward_context`, lets the
 runner install the same `additional_kwargs` entry, and restores the original
 function in `finally`. This is a scoped compatibility adapter, not a permanent
