@@ -67,6 +67,8 @@ def model_utils(monkeypatch):
         ("Qwen3MoeForCausalLM", "cuda"),
         ("Qwen3MoeForCausalLM", "npu"),
         ("Qwen3_5MoeForConditionalGeneration", "cuda"),
+        ("MiniMaxM3SparseForCausalLM", "npu"),
+        ("MiniMaxM3SparseForConditionalGeneration", "npu"),
     ],
 )
 def test_model_config_rewrites_architecture_in_private_copy(
@@ -111,3 +113,20 @@ def test_model_config_rejects_qwen_on_npu_without_mutation(model_utils):
             SimpleNamespace(hf_config=hf_config), device_type="npu"
         )
     assert hf_config.architectures == ["Qwen3_5MoeForConditionalGeneration"]
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration"],
+)
+def test_model_config_rejects_minimax_outside_npu_without_mutation(
+    model_utils, architecture
+):
+    hf_config = SimpleNamespace(architectures=[architecture])
+    with pytest.raises(
+        ValueError, match="MiniMax-M3 supports Ascend NPU execution only"
+    ):
+        model_utils.get_afd_model_config(
+            SimpleNamespace(hf_config=hf_config), device_type="cuda"
+        )
+    assert hf_config.architectures == [architecture]
