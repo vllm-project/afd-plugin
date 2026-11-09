@@ -52,7 +52,7 @@ verified_platform_refs:
 related_issues:
   - "#86"
   - "#129"
-last_reviewed: 2026-10-13
+last_reviewed: 2026-11-09
 ---
 
 # Execution platforms
