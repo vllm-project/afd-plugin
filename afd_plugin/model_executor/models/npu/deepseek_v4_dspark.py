@@ -37,7 +37,7 @@ from afd_plugin.model_executor.models.npu.deepseek_v4 import (
 )
 
 if TYPE_CHECKING:
-    from afd_plugin.model_executor.ffn.expert_weights import QuantizedExpertWeights
+    from afd_plugin.model_executor.ffn.npu.expert_weights import QuantizedExpertWeights
 
 
 def _iter_role_weights(

@@ -31,7 +31,7 @@ def test_async_cam_profile_forward_runs_matched_connector_io(
     )
 
     connector_calls: list[str] = []
-    from afd_plugin.model_executor.ffn import async_cam
+    from afd_plugin.model_executor.ffn.npu import async_cam
 
     monkeypatch.setattr(
         async_cam,

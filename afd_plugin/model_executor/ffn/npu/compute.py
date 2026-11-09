@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
-from afd_plugin.model_executor.ffn.expert_weights import (
+from afd_plugin.model_executor.ffn.npu.expert_weights import (
     QuantizedExpertWeights,
     expert_geometry,
     validate_expert_weights,

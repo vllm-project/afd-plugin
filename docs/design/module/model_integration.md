@@ -60,14 +60,16 @@ make a backend-specific worker class the shared model API.
 ## Shared FFN components
 
 `model_executor/models/` owns model structure and checkpoint policy.
-`model_executor/ffn/` contains four modules with separate responsibilities:
+`model_executor/ffn/remote.py` contains the remote proxies shared by CUDA and
+Ascend models. `model_executor/ffn/npu/` owns the NPU-specific Async CAM
+layout, quantized weight contracts and native compute implementations:
 
 | Component | Responsibility | Dependencies |
 | --- | --- | --- |
 | `remote.py` | Connector-independent dense/MoE proxies and routed TP padding | Connector contracts, public vLLM helpers and package forward context; no CAM, concrete model or compute imports |
-| `async_cam.py` | CAM model-side TP/SP layout conversion, padding, output restoration and native DBO receive handoff | Connector contracts and native DBO hooks; no concrete model or compute imports |
-| `expert_weights.py` | Loaded `QuantizedExpertWeights`, homogeneous layout validation, geometry and graph signatures | Torch tensors; no native operator lookup or workspace allocation |
-| `compute.py` | Independent NPU Layered and Mega native implementations and their buffers | Expert weights and explicit configuration/communication arguments; no model internals |
+| `npu/async_cam.py` | CAM model-side TP/SP layout conversion, padding, output restoration and native DBO receive handoff | Connector contracts and native DBO hooks; no concrete model or compute imports |
+| `npu/expert_weights.py` | Loaded `QuantizedExpertWeights`, Ascend quantized layout validation, geometry and graph signatures | Torch tensors with the Layered/Mega W4A8/W8A8 storage and scale contracts; no native operator lookup or workspace allocation |
+| `npu/compute.py` | Independent NPU Layered and Mega native implementations and their buffers | Expert weights and explicit configuration/communication arguments; no model internals |
 
 ```mermaid
 flowchart TD
@@ -75,19 +77,23 @@ flowchart TD
     Runner --> Model[Concrete model adapter]
     Model --> Remote[ffn/remote.py]
     Remote --> Connector[Connector / Session]
-    Model --> CAM[ffn/async_cam.py]
+    Model --> CAM[ffn/npu/async_cam.py]
     CAM --> Connector
-    Model --> Weights[ffn/expert_weights.py]
-    Runner --> Compute[ffn/compute.py: Layered OR Mega]
+    Model --> Weights[ffn/npu/expert_weights.py]
+    Runner --> Compute[ffn/npu/compute.py: Layered OR Mega]
     Compute --> Weights
     Compute --> Native[Native NPU operators]
 ```
 
 DeepSeek V2, Qwen3, Qwen3.5 and CUDA/Ascend V4 use the shared remote components.
-The CAM helpers stay in `ffn/async_cam.py` because they adapt model tensors
-to remote FFN calls across model families. Connector/Session owns transport
-windows, pending work and Push/Pull protocol state. The generic proxies do
-not import the CAM module, and neither module imports compute.
+The NPU CAM helpers adapt model tensors to remote FFN calls across Ascend
+model families. Their placement under `ffn/npu/` reflects the backend-specific
+CAM contract. The quantized weight contract is shared by Layered and Mega;
+its packed weights, encoded scales and graph signatures describe the Ascend
+layout rather than a cross-platform quantization interface. Connector/Session
+owns transport windows, pending work and Push/Pull protocol state. The shared
+remote module does not import `ffn/npu/`, and neither remote module imports
+compute.
 Gate, Hash routing, shared experts, dense-layer behavior and DSpark target/draft
 identities remain model-owned. The Async runner receives loaded weights through
 `get_quantized_expert_weights()` and selects one compute implementation. Mega
@@ -118,9 +124,9 @@ SFA/MLA/DSA-specific handling stays explicit inside that worker-side module.
 | Qwen3 MoE role-aware model and weight loading | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py), [`test_qwen3_moe_weight_policy.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_weight_policy.py) |
 | CUDA remote-experts boundary | [`ffn/remote.py`](../../../afd_plugin/model_executor/ffn/remote.py), [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py) | [`test_p2p_experts_contract.py`](../../../tests/unit/connectors/test_p2p_experts_contract.py), [`test_deepseek_v2_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_proxy.py) |
 | Forward-context adapter | [`forward_context.py`](../../../afd_plugin/forward_context.py) | [`test_forward_context.py`](../../../tests/unit/test_forward_context.py) |
-| NPU Async CAM native DBO handoff | [`ffn/async_cam.py`](../../../afd_plugin/model_executor/ffn/async_cam.py), [`npu/ubatch_runner.py`](../../../afd_plugin/v1/worker/npu/ubatch_runner.py) | [`test_async_cam.py`](../../../tests/unit/model_executor/ffn/test_async_cam.py), [`test_npu_model_runner_v2.py`](../../../tests/unit/v1/worker/test_npu_model_runner_v2.py) |
+| NPU Async CAM native DBO handoff | [`ffn/npu/async_cam.py`](../../../afd_plugin/model_executor/ffn/npu/async_cam.py), [`npu/ubatch_runner.py`](../../../afd_plugin/v1/worker/npu/ubatch_runner.py) | [`test_async_cam.py`](../../../tests/unit/model_executor/ffn/npu/test_async_cam.py), [`test_npu_model_runner_v2.py`](../../../tests/unit/v1/worker/test_npu_model_runner_v2.py) |
 | Ascend Attention-side gate | [`npu/deepseek_v2_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v2_attention_gate.py) | [`test_deepseek_v2_attention_gate.py`](../../../tests/unit/model_executor/models/npu/test_deepseek_v2_attention_gate.py), profile I/O in [`test_deepseek_v2_async_cam_forward.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_async_cam_forward.py) |
-| Ascend CAM dispatch layout | [`ffn/async_cam.py`](../../../afd_plugin/model_executor/ffn/async_cam.py) | [`test_async_cam.py`](../../../tests/unit/model_executor/ffn/test_async_cam.py) |
+| Ascend CAM dispatch layout | [`ffn/npu/async_cam.py`](../../../afd_plugin/model_executor/ffn/npu/async_cam.py) | [`test_async_cam.py`](../../../tests/unit/model_executor/ffn/npu/test_async_cam.py) |
 | Ascend stage metadata and RoPE ownership | [`worker/npu/attention_metadata.py`](../../../afd_plugin/v1/worker/npu/attention_metadata.py) | [`test_attention_metadata.py`](../../../tests/unit/v1/worker/npu/test_attention_metadata.py) |
 | Ascend external-routing MoE execution | [`npu/deepseek_v4_external_routing_moe.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_external_routing_moe.py) | [`test_deepseek_v4_external_routing_moe_cpu.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_external_routing_moe_cpu.py) |
 
@@ -308,7 +314,7 @@ global provider.
 Async CAM reuses native DBO child slices, attention metadata and execution. The generic adapter
 installs `afd_metadata` on the native child context; CAM transfer metadata and
 TP/SP layout conversion and the single-window receive hook share the
-model-side communication boundary in `model_executor/ffn/async_cam.py`. Metadata ownership and the live connector reference
+model-side communication boundary in `model_executor/ffn/npu/async_cam.py`. Metadata ownership and the live connector reference
 remain **draft** under [#88](https://github.com/JiusiServe/afd-plugin/issues/88)
 and [#105](https://github.com/JiusiServe/afd-plugin/issues/105).
 

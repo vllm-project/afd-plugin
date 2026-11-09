@@ -24,7 +24,7 @@ from afd_plugin.ffn_faas.platforms.ffn_model.deepseek_v4.npu.v4_model import (
     V4CheckpointDescription,
 )
 from afd_plugin.ffn_faas.platforms.npu.settings import validate_static_experts
-from afd_plugin.model_executor.ffn.expert_weights import (
+from afd_plugin.model_executor.ffn.npu.expert_weights import (
     QuantizedExpertWeights,
     validate_expert_weights,
 )

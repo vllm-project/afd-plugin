@@ -17,7 +17,7 @@ from pathlib import Path
 
 import torch
 
-from afd_plugin.model_executor.ffn.compute import (
+from afd_plugin.model_executor.ffn.npu.compute import (
     CAM_LAYER_INDEX,
     AsyncCAMLayeredExecutor,
 )

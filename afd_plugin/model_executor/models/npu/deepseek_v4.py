@@ -36,7 +36,7 @@ from afd_plugin.connectors import (
     AFDTransferMetadata,
 )
 from afd_plugin.forward_context import get_afd_metadata_from_forward_context
-from afd_plugin.model_executor.ffn.async_cam import (
+from afd_plugin.model_executor.ffn.npu.async_cam import (
     prepare_cam_dispatch_payload,
     restore_cam_dispatch_output,
     send_async_cam_remote_call,
@@ -68,7 +68,7 @@ if TYPE_CHECKING:
         AscendW4A8DynamicFusedMoEMethod,
     )
 
-    from afd_plugin.model_executor.ffn.expert_weights import QuantizedExpertWeights
+    from afd_plugin.model_executor.ffn.npu.expert_weights import QuantizedExpertWeights
 
 
 _ATTENTION_ROLE = "attention"
@@ -918,7 +918,7 @@ def _extract_quantized_expert_weights(
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm_ascend.quantization.quant_type import QuantType
 
-    from afd_plugin.model_executor.ffn.expert_weights import QuantizedExpertWeights
+    from afd_plugin.model_executor.ffn.npu.expert_weights import QuantizedExpertWeights
 
     layers = [layer for layer in layers if layer.is_moe_layer]
     # Only the FFN role exposes loaded experts; Ascend's factory returns its

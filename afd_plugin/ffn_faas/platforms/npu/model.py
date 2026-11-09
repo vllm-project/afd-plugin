@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
-    from afd_plugin.model_executor.ffn.expert_weights import QuantizedExpertWeights
+    from afd_plugin.model_executor.ffn.npu.expert_weights import QuantizedExpertWeights
 
 
 class RoutedWeightOwner(Protocol):

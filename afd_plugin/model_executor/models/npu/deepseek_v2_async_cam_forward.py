@@ -24,7 +24,7 @@ from afd_plugin.connectors import (
     AFDTransferMetadata,
 )
 from afd_plugin.forward_context import get_afd_metadata_from_forward_context
-from afd_plugin.model_executor.ffn.async_cam import (
+from afd_plugin.model_executor.ffn.npu.async_cam import (
     CAMDispatchLayout,
     prepare_cam_dispatch_payload,
     restore_cam_dispatch_output,

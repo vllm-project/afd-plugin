@@ -30,11 +30,11 @@ from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup import (
     POLL_SECONDS,
     FFNGraphPlan,
 )
-from afd_plugin.model_executor.ffn.compute import (
+from afd_plugin.model_executor.ffn.npu.compute import (
     AsyncCAMLayeredExecutor,
     AsyncCAMMegaExecutor,
 )
-from afd_plugin.model_executor.ffn.expert_weights import (
+from afd_plugin.model_executor.ffn.npu.expert_weights import (
     QuantizedExpertWeights,
     expert_weight_signature,
 )

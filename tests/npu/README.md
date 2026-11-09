@@ -74,7 +74,7 @@ Run the focused contract checks in the matching runtime environment:
 python3 -m pytest -q -ra \
   tests/unit/compat/npu/test_runtime_config.py \
   tests/unit/config/test_validation.py \
-  tests/unit/model_executor/ffn/test_async_cam.py \
+  tests/unit/model_executor/ffn/npu/test_async_cam.py \
   tests/unit/v1/worker/npu/test_attention_metadata.py \
   tests/unit/v1/worker/test_npu_model_runner_v2.py \
   tests/unit/v1/worker/test_npu_ubatch_outputs.py \
@@ -278,7 +278,7 @@ device and no collective. Run the CPU contracts first, then rebuild the matching
 extension/vendor library and run the device checks:
 
 ```bash
-pytest -q tests/unit/test_envs.py tests/unit/model_executor/ffn/test_compute.py
+pytest -q tests/unit/test_envs.py tests/unit/model_executor/ffn/npu/test_compute.py
 SOC_VERSION=910c pytest -q tests/npu/test_gmm_layered.py \
   tests/npu/test_gmm_swiglu_quant_v2_layered.py
 ```
