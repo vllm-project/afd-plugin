@@ -29,7 +29,9 @@ than one pod) -- callers never talk to these directly. See
 
 ## Scope
 
-- Recipes under `recipe/gpu/P2pNcclAFDConnector/**` (GPU only, not NPU),
+- Recipes under `recipe/gpu/P2pNcclAFDConnector/**` or
+  `recipe/gpu/DeepEPM2NAFDConnector/**` (GPU only, not NPU; the M2N image
+  must contain afdEP-comm and DeepGEMM),
   **`prefill_decode_colocation` only** (attention + FFN workers, no prefill
   split).
   `prefill_decode_disaggregation` recipes are **out of scope**: they need a
