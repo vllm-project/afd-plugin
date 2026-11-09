@@ -9,11 +9,85 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 from torch import nn  # noqa: E402
+from vllm.config import set_current_vllm_config  # noqa: E402
 from vllm.config.multimodal import MultiModalConfig  # noqa: E402
 from vllm.model_executor.models import qwen3_5 as native  # noqa: E402
 from vllm.model_executor.models.utils import StageMissingLayer  # noqa: E402
 
+from afd_plugin.model_executor.ffn import remote  # noqa: E402
 from afd_plugin.model_executor.models import qwen3_5 as adapter  # noqa: E402
+from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
+from tests.unit.fakes.vllm_config import attention_moe_vllm_config  # noqa: E402
+
+QWEN_LAYER_IDX = 7
+QWEN_LAYER_PREFIX = f"model.layers.{QWEN_LAYER_IDX}"
+QWEN_HIDDEN_SIZE = 8
+# ``ProxyConnector.recv_ffn_output`` returns the reference rows times this.
+FFN_OUTPUT_SCALE = 0.25
+
+
+@pytest.fixture
+def attention_qwen_layer(monkeypatch):
+    """A CUDA P2P Attention-role Qwen3.5 decoder layer and its vLLM config."""
+    text_config = SimpleNamespace(
+        model_type="qwen3_5_moe_text",
+        rms_norm_eps=1e-6,
+        num_experts=4,
+        num_experts_per_tok=2,
+        hidden_size=QWEN_HIDDEN_SIZE,
+        moe_intermediate_size=16,
+        norm_topk_prob=True,
+    )
+    config = attention_moe_vllm_config(
+        hf_text_config=text_config,
+        multimodal_config=None,
+    )
+    monkeypatch.setattr(remote, "current_platform", SimpleNamespace(device_type="cuda"))
+    monkeypatch.setattr(
+        adapter.next_native, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        adapter.next_native,
+        "get_ep_group",
+        lambda: SimpleNamespace(device_group=SimpleNamespace(size=lambda: 1)),
+    )
+    monkeypatch.setattr(
+        adapter.native, "Qwen3NextAttention", lambda *_args, **_kwargs: nn.Identity()
+    )
+    with set_current_vllm_config(config):
+        layer = adapter.AFDQwen3_5DecoderLayer(
+            config, layer_type="full_attention", prefix=QWEN_LAYER_PREFIX
+        )
+    return SimpleNamespace(layer=layer, config=config)
+
+
+def test_attention_moe_sends_hidden_states_through_weightless_runner(
+    monkeypatch, attention_qwen_layer
+):
+    """The Attention MoE is a native factory runner without gate or expert
+    weights; the native forward sends only the hidden states, tagged with the
+    decoder layer.
+
+    Why: the FFN role owns the gate, routed experts and shared expert, and
+    runs its native internal-router MoE on the rows it receives.
+    """
+    events: list[tuple] = []
+    install_proxy_context(remote, monkeypatch, events)
+    moe = attention_qwen_layer.layer.mlp
+    hidden_states = torch.ones(2, QWEN_HIDDEN_SIZE)
+
+    output = moe(hidden_states)
+
+    assert type(moe.experts) is remote.AFDRemoteMoERunner
+    assert list(moe.parameters()) == []
+    assert attention_qwen_layer.config.compilation_config.static_all_moe_layers == [
+        f"{QWEN_LAYER_PREFIX}.mlp.experts"
+    ]
+    assert [event[0] for event in events] == ["send", "yield", "recv"]
+    assert torch.equal(events[0][1], hidden_states)
+    assert events[0][2].metadata.layer_idx == QWEN_LAYER_IDX
+    assert events[0][3] == {}
+    assert torch.equal(output, hidden_states * FFN_OUTPUT_SCALE)
 
 
 def test_qwen_remote_experts_proxy_preserves_completed_ffn_output_under_tp(

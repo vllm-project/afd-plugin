@@ -12,7 +12,7 @@ from vllm.model_executor.models import qwen3_5 as native
 from vllm.model_executor.models import qwen3_next as next_native
 
 from afd_plugin.config import parse_optional_afd_config
-from afd_plugin.model_executor.ffn.remote import AFDAttentionFusedMoE
+from afd_plugin.model_executor.ffn.remote import build_attention_moe_runner
 from afd_plugin.model_executor.models._weight_utils import (
     ATTENTION_ROLE,
     FFN_ROLE,
@@ -65,21 +65,21 @@ def _checkpoint_weight_roles(
 class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
     native.Qwen3NextSparseMoeBlock,
 ):
-    """Native Qwen MoE shell with a parameter-free remote experts runner."""
+    """Native Qwen MoE shell whose gate and experts run on the FFN role."""
 
-    # Patch reason: native Qwen3NextSparseMoeBlock allocates routed and shared
-    # experts on every rank.
-    # Patch functionality: preserve its native forward while keeping a
-    # parameter-free experts proxy with a local FFN router.
-    # Signature: AFD-owned; layer_idx is required for correlation metadata.
+    # Patch reason: native Qwen3NextSparseMoeBlock allocates the gate and the
+    # routed and shared experts on every rank.
+    # Patch functionality: keep its native forward and build the experts
+    # through FusedMoEFactory with an AFD runner that sends hidden states to
+    # the FFN role, which owns the gate and all expert weights.
+    # Signature: matches upstream; no added parameters.
     # Upstream: vLLM v0.32.0, vllm/model_executor/models/qwen3_next.py
     # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def __init__(
         self,
-        *,
         vllm_config: VllmConfig,
-        layer_idx: int,
-        prefix: str,
+        prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
         # ### PATCH START: construct a remote-experts native MoE shell.
         nn.Module.__init__(self)
@@ -87,8 +87,6 @@ class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
         parallel_config = vllm_config.parallel_config
         if parallel_config.use_sequence_parallel_moe:
             raise RuntimeError("AFD Qwen3.5/3.6 does not support SP MoE")
-        if parallel_config.enable_eplb:
-            raise RuntimeError("AFD Qwen3.5/3.6 does not support EPLB")
 
         self.tp_size = next_native.get_tensor_model_parallel_world_size()
         self.ep_group = next_native.get_ep_group().device_group
@@ -106,9 +104,19 @@ class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
         self.gate = None
         self.shared_expert = None
         self.shared_expert_gate = None
-        self.experts = AFDAttentionFusedMoE(
-            layer_idx=layer_idx,
-            external_routing=False,
+        # Native Qwen3NextSparseMoeBlock factory arguments, minus local-expert
+        # ones; EPLB and the other local-expert features are rejected there.
+        self.experts = build_attention_moe_runner(
+            vllm_config,
+            gate=None,
+            num_experts=self.n_routed_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            renormalize=getattr(config, "norm_topk_prob", True),
+            prefix=f"{prefix}.experts",
+            reduce_results=reduce_results,
+            shared_expert_prefix=f"{prefix}.shared_expert",
         )
         # ### PATCH END: construct a remote-experts native MoE shell.
 
@@ -195,7 +203,6 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
                 raise ValueError(f"Invalid layer_type {self.layer_type}")
             self.mlp = AFDQwen3_5RemoteExpertsMoE(
                 vllm_config=vllm_config,
-                layer_idx=self.layer_idx,
                 prefix=f"{prefix}.mlp",
             )
             self.input_layernorm = native.Qwen3_5RMSNorm(

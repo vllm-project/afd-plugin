@@ -1,20 +1,42 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Connector-independent remote dense/MoE proxies; no concrete model imports."""
+"""Connector-independent remote dense/MoE proxies and Attention-side MoE
+runners; no concrete model imports."""
 
 from __future__ import annotations
 
+import math
+from typing import Any
+
 import torch
 from torch import nn
+from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers import fused_moe
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
+    FusedMoEParallelConfig,
+    FusedMoEQuantConfig,
+)
+from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+    FusedMoEMethodBase,
+)
+from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
+    FusedMoERouter,
+)
 from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.utils import sequence_parallel_chunk
+from vllm.platforms import current_platform
 
+from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors import (
     AFDForwardContextMetadata,
     AFDTransferContext,
@@ -24,6 +46,10 @@ from afd_plugin.forward_context import get_afd_metadata_from_forward_context
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 UNROUTED_EXPERT_ID = -1
+# The only placement validated for native-factory Attention MoE runners.
+# DeepEP M2N routes on Attention through its own model shell instead.
+ATTENTION_MOE_RUNNER_DEVICE = "cuda"
+ATTENTION_MOE_RUNNER_CONNECTOR = "P2pNcclAFDConnector"
 
 
 def _unroute_tp_padding(topk_ids: torch.Tensor, num_tokens: int) -> torch.Tensor:
@@ -144,41 +170,221 @@ class RemoteFFNProxy(nn.Module):
         return afd_metadata
 
 
-class AFDAttentionFusedMoE(RemoteFFNProxy):
-    """Parameter-free native-MoE experts proxy for the Attention runtime."""
+class AFDRemoteMoEMethod(FusedMoEMethodBase):
+    """Native MoE method lifecycle without local expert weights or kernels.
+
+    ``apply`` and ``apply_monolithic`` keep the base ``NotImplementedError``,
+    so computing experts on the Attention role fails loudly.
+    """
+
+    def create_weights(
+        self,
+        layer: RoutedExperts,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        """Allocate nothing: the FFN role owns the expert weights."""
+
+    def get_fused_moe_quant_config(
+        self, layer: RoutedExperts
+    ) -> FusedMoEQuantConfig | None:
+        return None
+
+    def maybe_roundup_sizes(
+        self,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        act_dtype: torch.dtype,
+        moe_parallel_config: FusedMoEParallelConfig,
+    ) -> tuple[int, int]:
+        # No local kernel or all2all buffer needs aligned sizes, so the
+        # runner's FusedMoEConfig keeps the model's dimensions.
+        return hidden_size, intermediate_size_per_partition
+
+
+class AFDRemoteRoutedExperts(RoutedExperts):
+    """Native routed-experts descriptor that allocates no expert parameters."""
+
+    def _get_quant_method(
+        self,
+        prefix: str,
+        quant_config: QuantizationConfig | None,
+        moe_config: FusedMoEConfig,
+    ) -> FusedMoEMethodBase:
+        return AFDRemoteMoEMethod(moe_config)
+
+
+class AFDRemoteMoERunner(MoERunner):
+    """Native MoE runner whose gate and experts run on the FFN role.
+
+    The runner keeps the native layer registration but runs no local routing
+    or expert kernel: it sends this layer's hidden states through the
+    ``RemoteFFNProxy`` transport (send, DBO yield, receive) and returns the
+    FFN output.
+    """
 
     def __init__(
         self,
-        *,
-        layer_idx: int,
-        external_routing: bool,
+        layer_name: str,
+        moe_config: FusedMoEConfig,
+        router: FusedMoERouter,
+        routed_experts: RoutedExperts,
+        enable_dbo: bool = False,
+        gate: nn.Module | None = None,
+        shared_experts: nn.Module | None = None,
+        shared_expert_gate: nn.Module | None = None,
+        routed_input_transform: nn.Module | None = None,
+        routed_output_transform: nn.Module | None = None,
+        routed_scaling_factor: float = 1.0,
     ) -> None:
-        super().__init__(layer_idx=layer_idx)
-        # vLLM 5df63a72 fused_moe/runner/moe_runner.py::MoERunner.forward
-        # enters _forward_impl, which consumes transported router_logits only
-        # when its gate is None (external routing); a held gate routes internally
-        # and ignores the forwarded logits argument.
-        self.external_routing = external_routing
+        super().__init__(
+            layer_name=layer_name,
+            moe_config=moe_config,
+            router=router,
+            routed_experts=routed_experts,
+            enable_dbo=enable_dbo,
+            gate=gate,
+            shared_experts=shared_experts,
+            shared_expert_gate=shared_expert_gate,
+            routed_input_transform=routed_input_transform,
+            routed_output_transform=routed_output_transform,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+        # The native layer name carries the decoder layer index.
+        self.ffn_transport = RemoteFFNProxy(layer_idx=self.layer_id)
 
-    # The native MoERunner boundary passes router_logits and input_ids; only
-    # the proxy's transport is reused, not its kernel execution contract.
-    def forward(  # type: ignore[override]
+    def forward(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if input_ids is not None:
             raise NotImplementedError(
                 "experts-boundary input_ids transport is not implemented",
             )
-        send_kwargs: dict[str, torch.Tensor] = {}
-        if self.external_routing:
-            send_kwargs["router_logits"] = router_logits
-        return self._send_and_receive(hidden_states, **send_kwargs)
+        if shared_experts_input is not None:
+            raise NotImplementedError(
+                "Attention remote MoE has no local shared experts",
+            )
+        return self.ffn_transport._send_and_receive(
+            hidden_states,
+            **self._routing_payload(hidden_states),
+        )
 
-    def update_expert_map(self) -> None:
-        """Satisfy the native MoERunner EPLB interface without local experts."""
+    def _routing_payload(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Routing tensors sent with the hidden states; none when FFN gates."""
+        return {}
 
 
-__all__ = ["RemoteFFNProxy", "AFDAttentionFusedMoE"]
+class AFDExternalRoutingMoERunner(AFDRemoteMoERunner):
+    """Native MoE runner that applies the gate held on the Attention role.
+
+    As native ``MoERunner._forward_impl`` does when it holds a gate, the
+    runner ignores its ``router_logits`` argument and computes the logits
+    from the hidden states. It sends them with the hidden states, and the FFN
+    role runs its external-router experts.
+    """
+
+    def _routing_payload(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        assert self.gate is not None
+        router_logits, _ = self.gate(hidden_states)
+        return {"router_logits": router_logits}
+
+
+def build_attention_moe_runner(
+    vllm_config: VllmConfig,
+    *,
+    gate: nn.Module | None,
+    **moe_kwargs: Any,
+) -> MoERunner:
+    """Build an Attention-role MoE runner through native ``FusedMoEFactory``.
+
+    ``moe_kwargs`` are the native model's ``FusedMoEFactory`` arguments. Pass
+    the model's gate exactly when ``compute_gate_on_attention`` is set; the
+    runner then applies it and sends the router logits. This function fixes
+    the arguments that describe local experts: the runner registers like a
+    native MoE layer but allocates no expert weights and runs no expert
+    kernel.
+    """
+    afd_config = parse_afd_config(vllm_config, validate=False)
+    placement = (current_platform.device_type, afd_config.connector)
+    if placement != (ATTENTION_MOE_RUNNER_DEVICE, ATTENTION_MOE_RUNNER_CONNECTOR):
+        raise ValueError(
+            f"unsupported Attention remote MoE configuration: {placement!r}",
+        )
+    if (gate is not None) != afd_config.compute_gate_on_attention:
+        raise ValueError(
+            "Attention remote MoE takes the model's gate if and only if "
+            "compute_gate_on_attention is set",
+        )
+    parallel_config = vllm_config.parallel_config
+    if parallel_config.enable_eplb:
+        raise RuntimeError(
+            "Remote MoE does not support Attention-local EPLB (enable_eplb)",
+        )
+    if parallel_config.eplb_config.num_redundant_experts != 0:
+        raise RuntimeError(
+            "Remote MoE does not support Attention-local redundant experts",
+        )
+    if vllm_config.aux_output_config.enable_return_routed_experts:
+        raise RuntimeError(
+            "Remote MoE does not support Attention-local routed_experts capture",
+        )
+    if "routed_scaling_factor" in moe_kwargs and not math.isfinite(
+        moe_kwargs["routed_scaling_factor"],
+    ):
+        raise ValueError("routed_scaling_factor must be finite")
+    # A parameter-free container: no local quantized weights, shared experts,
+    # transforms or EPLB, and unit TP/DP/PCP sizes, so no expert sharding.
+    # The FFN role applies routed_scaling_factor; the runner only records it.
+    factory_kwargs: dict[str, Any] = {
+        "gate": gate,
+        "quant_config": None,
+        "shared_experts": None,
+        "shared_expert_gate": None,
+        "routed_input_transform": None,
+        "routed_output_transform": None,
+        "n_shared_experts": None,
+        "fuse_shared_experts": False,
+        "apply_routed_scale_to_output": True,
+        "enable_eplb": False,
+        "num_redundant_experts": 0,
+        "is_sequence_parallel": False,
+        "tp_size": 1,
+        "dp_size": 1,
+        "pcp_size": 1,
+        "runner_cls": (
+            AFDExternalRoutingMoERunner if gate is not None else AFDRemoteMoERunner
+        ),
+        "runner_args": None,
+        "routed_experts_cls": AFDRemoteRoutedExperts,
+        "routed_experts_args": None,
+    }
+    reserved = moe_kwargs.keys() & factory_kwargs.keys()
+    if reserved:
+        raise ValueError(
+            "Attention remote MoE factory reserves these arguments: "
+            + ", ".join(sorted(reserved)),
+        )
+    return fused_moe.FusedMoEFactory(**moe_kwargs, **factory_kwargs)
+
+
+__all__ = [
+    "AFDExternalRoutingMoERunner",
+    "AFDRemoteMoEMethod",
+    "AFDRemoteMoERunner",
+    "AFDRemoteRoutedExperts",
+    "RemoteFFNProxy",
+    "build_attention_moe_runner",
+]

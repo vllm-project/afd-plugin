@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, TypeAlias
 import torch
 import torch.nn as nn
 from transformers import DeepseekV2Config, DeepseekV3Config, GlmMoeDsaConfig
-from vllm.config import ParallelConfig, VllmConfig
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.fused_moe.router.router_factory import (
@@ -31,9 +31,9 @@ from afd_plugin.config import (
 )
 from afd_plugin.connectors import AFDExpertRoutingSpec
 from afd_plugin.model_executor.ffn.remote import (
-    AFDAttentionFusedMoE,
     RemoteFFNProxy,
     _unroute_tp_padding,
+    build_attention_moe_runner,
 )
 from afd_plugin.model_executor.models._weight_utils import (
     ATTENTION_ROLE,
@@ -181,34 +181,38 @@ class GateOnlyRemoteMoE(RemoteFFNProxy):
 
 
 class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
-    """Native DeepSeek MoE forward with parameter-free remote experts."""
+    """Native DeepSeek MoE forward with remote experts and no expert weights."""
 
     # Patch reason: native DeepseekV2MoE constructs local routed/shared experts
     # through FusedMoEFactory.
-    # Patch functionality: preserve the native MoE forward contract while
-    # constructing only the gate owned by Attention and a parameter-free proxy.
-    # Signature: AFD-owned; adds layer_idx and compute_gate_on_attention and omits
-    # quant_config because no local expert kernel is constructed.
+    # Patch functionality: keep the native MoE forward. Construct only the
+    # gate owned by Attention, and build the experts through FusedMoEFactory
+    # with an AFD runner that runs them on the FFN role and allocates no
+    # expert weights. As native, the runner holds the gate and applies it.
+    # Signature: AFD-owned; takes vllm_config for the factory, adds layer_idx
+    # and compute_gate_on_attention, and omits quant_config because no local
+    # expert kernel is constructed.
     # Upstream: vLLM v0.32.0, vllm/model_executor/models/deepseek_v2.py
     # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
-    # In v0.32.0 the native forward always delegates routing to the experts
-    # runner, so forward() below computes the Attention-side gate first when
-    # this shell owns one.
     def __init__(
         self,
         *,
         config: _DeepseekAdapterConfig,
-        parallel_config: ParallelConfig,
+        vllm_config: VllmConfig,
         layer_idx: int,
         prefix: str,
         compute_gate_on_attention: bool,
     ) -> None:
         # ### PATCH START: construct a remote-experts native MoE shell.
         nn.Module.__init__(self)
+        parallel_config = vllm_config.parallel_config
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
         router_dtype = native._get_moe_router_dtype(config)
         self.router_dtype = router_dtype
+        # The experts runner holds this same gate, as native does. Assign it
+        # before the experts so its parameters keep their checkpoint names
+        # (mlp.gate.*).
         if compute_gate_on_attention:
             self.gate = native.GateLinear(
                 config.hidden_size,
@@ -235,47 +239,43 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         # No local shared-expert MLP is constructed, so fused shared experts
         # can never be enabled for this shell.
         self.is_fused_shared_expert_enabled = False
-        self.experts = AFDAttentionFusedMoE(
+        self.experts = self._build_remote_experts(
+            config=config,
+            vllm_config=vllm_config,
             layer_idx=layer_idx,
-            external_routing=compute_gate_on_attention,
+            prefix=prefix,
         )
         # ### PATCH END: construct a remote-experts native MoE shell.
 
-    # Patch reason: v0.32.0's native forward always delegates routing to the
-    # experts runner (router_logits=hidden_states), so a shell that owns a
-    # gate would never compute it and Attention would ship hidden states as
-    # router logits.
-    # Patch functionality: compute the Attention-side gate before transport;
-    # gate-less shells keep the native delegation unchanged.
-    # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.32.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
-    def forward(
+    def _build_remote_experts(
         self,
-        hidden_states: torch.Tensor,
-        already_sequence_parallel: bool = False,
-    ) -> torch.Tensor:
-        if self.gate is None:
-            return super().forward(hidden_states, already_sequence_parallel)
-
-        # ### PATCH START: compute the Attention-side gate before transport.
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
-        if self.is_sequence_parallel and not already_sequence_parallel:
-            hidden_states = native.sequence_parallel_chunk(hidden_states)
-        router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
+        *,
+        config: _DeepseekAdapterConfig,
+        vllm_config: VllmConfig,
+        layer_idx: int,
+        prefix: str,
+    ) -> nn.Module:
+        """Native DeepseekV2MoE factory arguments, minus local-expert ones."""
+        return build_attention_moe_runner(
+            vllm_config,
+            gate=self.gate,
+            num_experts=config.n_routed_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            renormalize=config.norm_topk_prob,
+            use_grouped_topk=True,
+            num_expert_group=getattr(config, "n_group", 1),
+            topk_group=getattr(config, "topk_group", 1),
+            prefix=f"{prefix}.experts",
+            scoring_func=getattr(config, "scoring_func", "softmax"),
+            routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
+            e_score_correction_bias=(
+                None if self.gate is None else self.gate.e_score_correction_bias
+            ),
+            shared_expert_prefix=f"{prefix}.shared_experts",
+            router_logits_dtype=self.router_dtype,
         )
-        if self.is_sequence_parallel and not already_sequence_parallel:
-            final_hidden_states = native.tensor_model_parallel_all_gather(
-                final_hidden_states,
-                0,
-            )
-            final_hidden_states = final_hidden_states[:num_tokens]
-        return final_hidden_states.view(num_tokens, hidden_dim)
-        # ### PATCH END: compute the Attention-side gate before transport.
 
 
 class AFDDeepseekV2RoutedExpertsMoE(AFDDeepseekV2RemoteExpertsMoE):
@@ -298,7 +298,9 @@ class AFDDeepseekV2RoutedExpertsMoE(AFDDeepseekV2RemoteExpertsMoE):
     # Patch reason: native DeepseekV2MoE runs the router and the shared experts
     # inside its local experts runner, which Attention does not build.
     # Patch functionality: build the native router and shared MLP next to the
-    # remote-experts shell; route, dispatch, run the shared MLP, combine.
+    # remote-experts shell; route, dispatch, run the shared MLP, combine. The
+    # connector carries the routes itself, so the experts are a parameter-free
+    # RemoteFFNProxy instead of the native factory runner.
     # Signature: AFD-owned; takes vllm_config and layer_idx.
     # Upstream: vLLM v0.32.0, vllm/model_executor/models/deepseek_v2.py
     # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
@@ -310,9 +312,13 @@ class AFDDeepseekV2RoutedExpertsMoE(AFDDeepseekV2RemoteExpertsMoE):
         layer_idx: int,
         prefix: str,
     ) -> None:
+        if vllm_config.parallel_config.enable_eplb:
+            raise RuntimeError(
+                "CUDA remote experts do not support EPLB on the Attention role",
+            )
         super().__init__(
             config=config,
-            parallel_config=vllm_config.parallel_config,
+            vllm_config=vllm_config,
             layer_idx=layer_idx,
             prefix=prefix,
             compute_gate_on_attention=True,
@@ -348,6 +354,17 @@ class AFDDeepseekV2RoutedExpertsMoE(AFDDeepseekV2RemoteExpertsMoE):
             if config.n_shared_experts
             else None
         )
+
+    def _build_remote_experts(
+        self,
+        *,
+        config: _DeepseekAdapterConfig,
+        vllm_config: VllmConfig,
+        layer_idx: int,
+        prefix: str,
+    ) -> RemoteFFNProxy:
+        """Parameter-free transport; forward sends the routes it selects."""
+        return RemoteFFNProxy(layer_idx=layer_idx)
 
     def forward(
         self,
@@ -456,15 +473,9 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
             afd_config.compute_gate_on_attention,
         )
         device_type = native.current_platform.device_type
+        # Attention-side EPLB is rejected by the remote experts: the native
+        # factory runner (P2P) and the DeepEP M2N shell.
         self.uses_remote_experts = device_type == "cuda" and self.is_moe_layer
-        if (
-            afd_role == "attention"
-            and self.uses_remote_experts
-            and parallel_config.enable_eplb
-        ):
-            raise RuntimeError(
-                "CUDA remote experts do not support EPLB on the Attention role",
-            )
         if self.compute_gate_on_attention and device_type not in ("cuda", "npu"):
             raise RuntimeError(
                 "DeepSeekV2 compute_gate_on_attention requires CUDA or NPU",
@@ -517,7 +528,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
             elif self.uses_remote_experts:
                 self.mlp = AFDDeepseekV2RemoteExpertsMoE(
                     config=config,
-                    parallel_config=parallel_config,
+                    vllm_config=vllm_config,
                     layer_idx=layer_idx,
                     prefix=f"{prefix}.mlp",
                     compute_gate_on_attention=self.compute_gate_on_attention,

@@ -6,7 +6,8 @@ head.
 Use for `afd_plugin/model_executor/`: the registration maps in
 `afd_plugin/__init__.py` (`_DEEPSEEK_MODEL_REGISTRATIONS`,
 `_QWEN_MODEL_REGISTRATIONS`, `_QWEN3_5_MODEL_REGISTRATIONS`), role-split model
-wrappers (`RemoteFFNProxy`, `AFDAttentionFusedMoE`, `GateOnlyRemoteMoE`, the
+wrappers (`RemoteFFNProxy`, the Attention-role MoE runners from
+`build_attention_moe_runner()`, `GateOnlyRemoteMoE`, the
 `AFDDeepseekV2/V3/V4` and `AFDQwen3Moe`/`AFDQwen3_5` families, plus
 `AFDGlmMoeDsaForCausalLM` and `AFDDSparkDeepseekV4ForCausalLM`), checkpoint
 weight-role filtering, the NPU-specific forward/gate modules under
@@ -27,6 +28,15 @@ transport, or the routing simulator's registration mechanics.
 - Keep remote proxies faithful: `RemoteFFNProxy` and friends preserve upstream
   signatures, hidden-state layouts, and auxiliary outputs (residuals, gate
   values) across the role boundary.
+- On CUDA with `P2pNcclAFDConnector`, build the experts of an Attention-role
+  native MoE shell through `build_attention_moe_runner()` (vLLM
+  `FusedMoEFactory` with an AFD `runner_cls` and `routed_experts_cls`): the
+  runner holds the model's gate only with `compute_gate_on_attention`,
+  allocates no expert weights, and runs no local top-k or expert kernel. A
+  change that does, or that passes an argument the factory fixes, is a
+  finding. DeepEP M2N (`AFDDeepseekV2RoutedExpertsMoE`) and the NPU gate
+  paths (`GateOnlyRemoteMoE`) route on Attention by design and keep their own
+  `RemoteFFNProxy` transports.
 - Access upstream model config attributes directly per AGENTS.md; a
   `getattr`/`hasattr` guard around vLLM model fields hides the exact
   incompatibility the pinned-version contract exists to surface.
