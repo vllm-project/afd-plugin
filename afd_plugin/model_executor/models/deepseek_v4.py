@@ -14,18 +14,17 @@ from typing import Any
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
-from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.nvidia import model as native
 
 from afd_plugin.compat.patches.gpu_deepseek_v4_dbo import forward_v4_attention
 from afd_plugin.config import parse_afd_config
-from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
+from afd_plugin.connectors.metadata import AFDForwardContextMetadata
 from afd_plugin.forward_context import get_afd_metadata_from_forward_context
+from afd_plugin.model_executor.ffn.remote import RemoteFFNProxy
 from afd_plugin.model_executor.models._weight_utils import (
     filter_role_weights,
     layer_weight_path,
 )
-from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
@@ -52,14 +51,10 @@ def _checkpoint_weight_roles(name: str) -> frozenset[str]:
     return _ATTENTION_ROLE
 
 
-class RemoteDeepseekV4FFN(nn.Module):
+class RemoteDeepseekV4FFN(RemoteFFNProxy):
     """Parameter-free FFN proxy carrying V4 hash-router token identifiers."""
 
-    def __init__(self, *, layer_idx: int) -> None:
-        super().__init__()
-        self.layer_idx = layer_idx
-
-    def forward(
+    def forward(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None,
@@ -71,33 +66,15 @@ class RemoteDeepseekV4FFN(nn.Module):
                 "DeepSeek-V4 input_ids must be one-dimensional and token-aligned",
             )
 
+        return self._send_and_receive(hidden_states, input_ids=input_ids)
+
+    @staticmethod
+    def _afd_metadata() -> AFDForwardContextMetadata:
+        # Keep V4's missing-context error while sharing the transport.
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
             raise RuntimeError("RemoteDeepseekV4FFN requires AFD forward metadata")
-        forward_context = get_forward_context()
-        stage_idx = int(
-            getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),
-        )
-        afd_metadata.stage_idx = stage_idx
-        metadata = AFDTransferMetadata.create_attention_metadata(
-            layer_idx=self.layer_idx,
-            stage_idx=stage_idx,
-            seq_len=int(hidden_states.shape[0]),
-        )
-        context = AFDTransferContext(metadata=metadata)
-        afd_metadata.connector.send_attn_output(
-            hidden_states,
-            context,
-            input_ids=input_ids,
-        )
-        hidden_states = maybe_apply_dbo_yield(
-            hidden_states,
-            role="attention",
-        )
-        return afd_metadata.connector.recv_ffn_output(
-            ref_tensor=hidden_states,
-            ubatch_idx=stage_idx,
-        )
+        return afd_metadata
 
 
 class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
@@ -546,22 +523,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         """Finalize only the Attention-owned first-layer broadcast matrix."""
         if self.afd_config.role == "ffn":
             return
-        if (
-            not native.get_pp_group().is_first_rank
-            or self.start_layer >= self.end_layer
-        ):
-            return
-        layer = self.layers[self.start_layer]
-        if isinstance(layer, AFDDeepseekV4DecoderLayer):
-            broadcast = (
-                layer.hc_attn_fn.detach()
-                .view(-1, layer.hc_mult, layer.hidden_size)
-                .sum(dim=1)
-            )
-            if layer.hc_attn_fn_broadcast is None:
-                layer.hc_attn_fn_broadcast = broadcast
-            else:
-                layer.hc_attn_fn_broadcast.copy_(broadcast)
+        super().finalize_mhc_broadcast_weights()
 
 
 class AFDDeepseekV4ForCausalLM(native.DeepseekV4ForCausalLM):

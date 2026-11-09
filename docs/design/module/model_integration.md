@@ -83,7 +83,7 @@ flowchart TD
     Compute --> Native[Native NPU operators]
 ```
 
-DeepSeek V2, Qwen3, Qwen3.5 and Ascend V4 use the shared remote components.
+DeepSeek V2, Qwen3, Qwen3.5 and CUDA/Ascend V4 use the shared remote components.
 The CAM helpers stay in `ffn/async_cam.py` because they adapt model tensors
 to remote FFN calls across model families. Connector/Session owns transport
 windows, pending work and Push/Pull protocol state. The generic proxies do
@@ -195,6 +195,12 @@ CUDA streams, and sparse-index buffers. It sends only the normalized
 two-dimensional FFN activation plus token-aligned `input_ids` through a
 parameter-free `RemoteDeepseekV4FFN`. FFN owns the complete native
 `DeepseekV4MoE`, including its hash router, and returns the FFN activation.
+
+`RemoteDeepseekV4FFN` inherits the shared `RemoteFFNProxy` transport and keeps
+V4's token-ID validation and missing-context error. The common implementation
+owns metadata creation, stage selection and send/yield/receive ordering. mHC
+broadcast-weight finalization delegates to the native model on Attention;
+the FFN role skips it because it owns no mHC parameters.
 
 Role-aware weight filtering keeps layer `.ffn` parameters on FFN and all
 other layer-local and mHC head parameters on Attention; common non-layer paths
