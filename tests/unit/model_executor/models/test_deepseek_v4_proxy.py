@@ -12,11 +12,13 @@ pytest.importorskip("vllm")
 
 from torch import nn  # noqa: E402
 
+from afd_plugin.model_executor.ffn import remote  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v4 as adapter  # noqa: E402
 from tests.unit.fakes.connector import ProxyConnector as _FakeConnector  # noqa: E402
 
 
-def test_remote_v4_ffn_sends_token_ids(monkeypatch):
+@pytest.mark.parametrize("stage_idx", [None, 2], ids=["metadata-stage", "ubatch-stage"])
+def test_remote_v4_ffn_sends_token_ids(monkeypatch, stage_idx):
     events: list[tuple] = []
     connector = _FakeConnector(events)
     afd_metadata = SimpleNamespace(
@@ -28,17 +30,22 @@ def test_remote_v4_ffn_sends_token_ids(monkeypatch):
         "get_afd_metadata_from_forward_context",
         lambda: afd_metadata,
     )
+    forward_context = SimpleNamespace()
+    if stage_idx is not None:
+        forward_context.ubatch_idx = stage_idx
+    expected_stage = 9 if stage_idx is None else stage_idx
     monkeypatch.setattr(
-        adapter,
+        remote,
         "get_forward_context",
-        lambda: SimpleNamespace(ubatch_idx=2, slot_mapping={}),
+        lambda: forward_context,
     )
 
     def record_yield(hidden_states, *, role):
         events.append(("yield", hidden_states, role))
+        forward_context.ubatch_idx = 23
         return hidden_states
 
-    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", record_yield)
+    monkeypatch.setattr(remote, "maybe_apply_dbo_yield", record_yield)
     proxy = adapter.RemoteDeepseekV4FFN(layer_idx=3)
     hidden_states = torch.full((2, 4), 8.0, dtype=torch.float16)
     input_ids = torch.tensor([11, 13], dtype=torch.int32)
@@ -49,15 +56,15 @@ def test_remote_v4_ffn_sends_token_ids(monkeypatch):
     assert [event[0] for event in events] == ["send", "yield", "recv"]
     sent_context = events[0][2]
     assert sent_context.metadata.layer_idx == 3
-    assert sent_context.metadata.stage_idx == 2
+    assert sent_context.metadata.stage_idx == expected_stage
     assert sent_context.metadata.seq_lens == [2]
     assert sent_context.states is None
     assert set(events[0][3]) == {"input_ids"}
     assert events[0][3]["input_ids"] is input_ids
     assert events[0][3]["input_ids"].dtype is torch.int32
     assert events[1][2] == "attention"
-    assert events[2][2] == 2
-    assert afd_metadata.stage_idx == 2
+    assert events[2][2] == expected_stage
+    assert afd_metadata.stage_idx == expected_stage
     assert torch.equal(output, hidden_states * 0.25)
 
 
@@ -71,7 +78,7 @@ def test_remote_v4_ffn_preserves_ids_in_padding_slots(monkeypatch):
         lambda: afd_metadata,
     )
     monkeypatch.setattr(
-        adapter,
+        remote,
         "get_forward_context",
         lambda: SimpleNamespace(
             ubatch_idx=0,
@@ -79,7 +86,7 @@ def test_remote_v4_ffn_preserves_ids_in_padding_slots(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        adapter,
+        remote,
         "maybe_apply_dbo_yield",
         lambda hidden_states, *, role: hidden_states,
     )
@@ -112,7 +119,7 @@ def test_remote_v4_ffn_rejects_bad_ids_before_sending(
         lambda: SimpleNamespace(connector=_FakeConnector(events), stage_idx=0),
     )
     monkeypatch.setattr(
-        adapter,
+        remote,
         "get_forward_context",
         lambda: SimpleNamespace(ubatch_idx=0, slot_mapping={}),
     )
@@ -127,6 +134,16 @@ def test_remote_v4_ffn_rejects_bad_ids_before_sending(
     with pytest.raises(error, match=message):
         proxy(torch.ones((2, 4)), input_ids)
     assert events == []
+
+
+def test_remote_v4_ffn_preserves_missing_metadata_error(monkeypatch):
+    monkeypatch.setattr(adapter, "get_afd_metadata_from_forward_context", lambda: None)
+    proxy = adapter.RemoteDeepseekV4FFN(layer_idx=0)
+
+    with pytest.raises(
+        RuntimeError, match="^RemoteDeepseekV4FFN requires AFD forward metadata$"
+    ):
+        proxy(torch.ones((2, 4)), torch.tensor([11, 13], dtype=torch.int32))
 
 
 def test_v4_decoder_forward_rejects_ffn_role(monkeypatch):

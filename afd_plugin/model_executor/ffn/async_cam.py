@@ -4,10 +4,8 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Final
 
 import torch
 from vllm.distributed import tensor_model_parallel_all_gather
@@ -20,9 +18,8 @@ from vllm.v1.worker.ubatching import (
 )
 
 from afd_plugin.connectors import AFDConnectorBase, AFDTransferContext
-
-ASYNC_MOE_LAYOUT_LOG_ENV: Final[str] = "AFD_ASYNC_MOE_LAYOUT_LOG"
-_TRUE_ENV_VALUES: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
+from afd_plugin.envs import AFD_ASYNC_MOE_LAYOUT_LOG as ASYNC_MOE_LAYOUT_LOG_ENV
+from afd_plugin.envs import async_moe_layout_log_enabled
 
 logger = init_logger(__name__)
 
@@ -192,7 +189,7 @@ def _log_cam_layout(
     phase: str,
     layout: CAMDispatchLayout,
 ) -> None:
-    if os.environ.get(ASYNC_MOE_LAYOUT_LOG_ENV, "").lower() not in _TRUE_ENV_VALUES:
+    if not async_moe_layout_log_enabled():
         return
     logger.warning(
         "AFD Async CAM layout; phase=%s sequence_parallel=%s "
