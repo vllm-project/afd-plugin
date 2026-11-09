@@ -31,7 +31,7 @@ verified_platform_refs:
   - "DeepSeek V2 Lite GPU and NPU model E2E paths"
   - "DeepSeek V2 Lite DeepEP M2N 2A2F E2E paths (eager, graph, graph + DBO, Attention TP2)"
   - "CAM async NPU model E2E path"
-  - "DeepSeek V4 CUDA contract tests and E2E profiles; see execution-platform matrix for hardware scope"
+  - "DeepSeek V4 CUDA contract tests and E2E profiles; see docs/support.md for hardware scope"
   - "DeepSeek V4 Ascend Hash-id boundary has focused unit coverage and a historical manual Ascend 950 run"
 related_issues:
   - "#86"
@@ -150,7 +150,7 @@ CUDA-only and requires synchronous `P2pNcclAFDConnector`,
 sequence-parallel MoE, EPLB, and the `deep_gemm_mega_moe` backend. The P2P
 connector validates one-dimensional `torch.int32` input IDs and preallocates
 their receive buffers for graph execution. See the
-[runtime matrix](execution_platforms.md#tested-runtime-matrix) for tested
+[runtime matrix](../../support.md#tested-runtime-matrix) for tested
 CUDA configurations and validation limits.
 
 ### DeepSeek V4 Ascend boundary

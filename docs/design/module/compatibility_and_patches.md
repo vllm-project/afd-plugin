@@ -68,7 +68,7 @@ Direct strict calls raise for a missing or different vLLM; plugin registration
 calls the check with `strict=False`, so it warns and continues. This warning
 policy does not make another vLLM release supported. Shared EngineCore and
 coordinator patches use the 0.32 contract. See the
-[runtime matrix](execution_platforms.md#tested-runtime-matrix) for hardware
+[runtime matrix](../../support.md#tested-runtime-matrix) for hardware
 validation scope.
 
 The NPU implementation targets vLLM `0.32.0` (`5df63a72`) and

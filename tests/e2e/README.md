@@ -237,10 +237,10 @@ and graph mode change; the graph row uses `FULL_DECODE_ONLY` with capture size 8
 
 The GPU validator accepts exactly two microbatches at Attention DP1 or
 DP > 1; FFN remains connector-driven. See the
-[runtime matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix)
+[runtime matrix](../../docs/support.md#tested-runtime-matrix)
 for tested configurations and known DeepSeek-V2-Lite shutdown failures.
 NPU retains the separate eager DBO and graph
-constraints documented in the [execution-platform matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix).
+constraints documented in the [support matrix](../../docs/support.md#tested-runtime-matrix).
 The GPU harness collects bounded per-rank summaries of actual two-stage and
 FULL-replay execution during evaluation. Historical hardware records retain
 the execution assertions of the test revision that produced them. On vLLM
@@ -282,7 +282,7 @@ samples, with the existing 24-sample floor for DBO.
 `models/deepseek_v4_flash/test_gpu.py` provides separate CUDA qualification
 profiles for the synchronous `P2pNcclAFDConnector`. They use CUDA launch
 shapes independently of the Ascend W4A8 and HCCL profiles. See the
-[runtime matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix)
+[runtime matrix](../../docs/support.md#tested-runtime-matrix)
 for source-specific hardware validation.
 
 The basic test has four cases:

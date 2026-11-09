@@ -175,7 +175,7 @@ and any detached read-only worktrees.
 Discover the current vLLM ref in this order:
 
 1. `pyproject.toml`, lockfile, and package metadata;
-2. compatibility constants, patch annotations, design matrices, README, GPU
+2. compatibility constants, patch annotations, installation/support references, GPU
    guides, recipes, CI, and active upgrade RFC;
 3. installed package versions and adjacent checkout state as corroboration only.
 

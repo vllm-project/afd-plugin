@@ -51,21 +51,20 @@ backend supports the new vLLM revision. Distinguish these evidence levels:
 
 ## User-facing runtime documentation
 
-### Root README
+### Installation, support, and configuration
 
-Review `README.md` as a complete public contract, including:
+Review `docs/installation.md`, `docs/support.md`, and `docs/configuration.md` for:
 
 - target runtime wording and whether the version applies to NPU, GPU, or both;
-- Current Status, supported models, connector matrix, and Known Gaps;
+- supported models, connector matrix, and validation limits;
 - NPU hardware and full software-stack prerequisites;
 - vLLM and vLLM-Ascend installation pins and resolved source revisions;
 - build flags, `SOC_VERSION`, custom operator packages, and container guidance;
 - plugin installation and import or environment verification commands;
-- NPU Attention and FFN launch commands, worker selection, and required
-  environment variables;
+- worker selection and required environment variables;
 - AFD configuration keys, connector names and aliases, topology fields, graph,
   DBO, uBatch, PCP, quantization, and operator settings;
-- links to the current connector guides, recipes, design docs, and E2E workflow.
+- links from `README.md` and `docs/README.md` to current guides and recipes.
 
 Remove stale commands and unsupported examples. If a shortened launch example
 is not a complete runnable Attention/FFN deployment, label it as a fragment and
@@ -74,7 +73,7 @@ link to the complete recipe.
 ### Connector package overview
 
 Review `afd_plugin/connectors/README.md`. Keep its connector status matrix
-consistent with the root README, NPU guides, recipes, design runtime matrix, and
+consistent with `docs/support.md`, NPU guides, recipes, and
 test evidence. State validation separately for CAMP2p and CAMAsync and for each
 relevant eager, graph, DBO, PCP, or topology cell.
 
@@ -194,11 +193,11 @@ Compare every public support claim across these sources:
 
 | Claim | Sources that must agree |
 | --- | --- |
-| Runtime versions | README, dependency pins, guides, recipes, design index, templates |
-| Connector support | README, connector README, both NPU guides, recipe index, execution-platform matrix, E2E evidence |
-| Models and quantization | README, recipes, model integration design, model E2E evidence |
-| DBO/graph/PCP/topology | README, connector guides, recipes/scripts, execution and connector design docs, E2E evidence |
-| Installation stack | README, guides, recipes, container/operator configuration, native-control evidence |
+| Runtime versions | Installation and support references, dependency pins, guides, recipes, design index, templates |
+| Connector support | Support reference, connector README, both NPU guides, recipe index, E2E evidence |
+| Models and quantization | Support reference, recipes, model integration design, model E2E evidence |
+| DBO/graph/PCP/topology | Support reference, connector guides, recipes/scripts, execution and connector design docs, E2E evidence |
+| Installation stack | Installation reference, guides, recipes, container/operator configuration, native-control evidence |
 
 Search the whole documentation surface for stale versions and conflicting
 support language. Adapt these commands to the current and target refs:

@@ -77,7 +77,7 @@ enforce them as review rules, not style nits:
 | --- | --- |
 | Correctness | A reachable input reaches the changed code and produces wrong output, a hang, or a crash. |
 | Patch-contract drift | A patched function's signature, return type, or upstream copy diverges from the pinned ref, or missing/incorrect `# ### PATCH START/END` markers, `Patch reason:` / `Patch functionality:` / `# Upstream source:` comments break upgrade comparability. Patched methods now live in `afd_plugin/v1/worker/**` as well as `afd_plugin/compat/`, and `tests/unit/compat/patches/test_signatures.py` owns the signature table for both. |
-| Version/compat | The change breaks the current `TARGET_VLLM_VERSION` / vLLM-Ascend pin contract, or moves a pin without updating the version gate, `docker/Dockerfile.ci` base tag and its assertion, `pyproject.toml`, README, and design-page `upstream_refs` together. Read the pin from `afd_plugin/compat/vllm.py`, not from memory. |
+| Version/compat | The change breaks the current `TARGET_VLLM_VERSION` / vLLM-Ascend pin contract, or moves a pin without updating the version gate, `docker/Dockerfile.ci` base tag and its assertion, `pyproject.toml`, installation/support references, and design-page `upstream_refs` together. Read the pin from `afd_plugin/compat/vllm.py`, not from memory. |
 | Platform divergence | The GPU or NPU twin (worker/runner/model variant, sync vs async NPU FFN runner) is not updated and the change is not provably platform-neutral. |
 | CPU-safe imports | A new module-level import of torch/torch_npu/vLLM runtime breaks `pytest -m "not gpu and not vllm_runtime"` or plugin import on a CPU host. |
 | Concurrency/async | Async-DP busy loops, ubatching state machines, DBO yield, async CAM work items, or two-stream slots can deadlock, drop, reorder, or leak work items on abort/timeout. |
@@ -90,7 +90,7 @@ enforce them as review rules, not style nits:
 | CI suppression | The diff is docs-only or skip-mark-only, so `skip_ci.py` suppresses all default CI. A green pipeline then proves nothing about the code; say so instead of treating it as validation. |
 | Vendored artifacts | New or changed files under `afd_plugin/connectors/npu/bin/` (`.run`/`.whl`) are pre-commit-excluded by design; they still need source, version, and target CANN justification. |
 | Agent/skill drift | A change to production paths, CI, or E2E gates that leaves `.agents/skills/**` stating stale behavior (pins, case counts, commands) is a P2 finding; those skills are executed instructions. |
-| Evidence | Perf/accuracy claims lack comparable base/head runs; NPU behavior claims lack manual evidence per `docs/npu/TESTING.md`. |
+| Evidence | Perf/accuracy claims lack comparable base/head runs; NPU behavior claims lack manual evidence per `tests/npu/README.md`. |
 | User contract | `AFDConfig` fields, defaults, `connector_extra_config` keys, or recipe launch scripts change meaning without a docs update and migration note. |
 
 ## Finding bar
