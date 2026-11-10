@@ -524,11 +524,11 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             and afd_config.role == _FFN_ROLE
             and isinstance(self.mlp, native.DeepseekV4MoE)
         ):
-            from afd_plugin.model_executor.models.npu.external_routing_moe import (
-                AFDExternalRoutingMoE,
+            from afd_plugin.model_executor.models.npu import (
+                deepseek_v4_external_routing_moe as external_routing_moe,
             )
 
-            self.afd_external_routing_moe = AFDExternalRoutingMoE(
+            self.afd_external_routing_moe = external_routing_moe.AFDExternalRoutingMoE(
                 self.mlp.experts.routed_experts,
             )
 

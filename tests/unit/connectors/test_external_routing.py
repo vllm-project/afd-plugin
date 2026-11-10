@@ -2,9 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """CPU tests for the Attention-side routing payload.
 
-The payload is pure tensor logic, so it is testable without an Ascend device. It is
-loaded from its file because importing the ``afd_plugin.connectors`` package pulls
-vLLM in through its ``__init__``.
+The payload is pure tensor logic, so it is testable without an Ascend device. The
+package resolves its connector lazily, so importing this module does not pull vLLM in.
 
 Rows carry rank- and position-specific values instead of a constant fill: a gather
 or split that drops, reorders or mismatches a row has to change the observed
@@ -13,9 +12,6 @@ contents, not just the shape.
 
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
-
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -23,27 +19,11 @@ torch = pytest.importorskip("torch")
 _TOP_K = 2
 
 
-def _module_path() -> Path:
-    return (
-        Path(__file__).resolve().parents[3]
-        / "afd_plugin"
-        / "connectors"
-        / "npu"
-        / "camp2p"
-        / "external_routing.py"
-    )
-
-
 @pytest.fixture(scope="module")
 def routing_module():
-    spec = importlib.util.spec_from_file_location(
-        "afd_external_routing_under_test",
-        _module_path(),
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    from afd_plugin.connectors.npu.camp2p import external_routing
+
+    return external_routing
 
 
 @pytest.fixture(scope="module")

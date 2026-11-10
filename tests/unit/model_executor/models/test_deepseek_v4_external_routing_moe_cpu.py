@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """CPU tests for the AFD-owned external-routing MoE component.
 
-``external_routing_moe`` imports vLLM-Ascend types at module scope, so the tests
+The component imports vLLM-Ascend types at module scope, so the tests
 install stand-ins for those modules, load the real component from its file, and
 drive it with fakes for the comm instance and the routed experts.
 
@@ -33,7 +33,7 @@ _MODULE_PATH = (
     / "model_executor"
     / "models"
     / "npu"
-    / "external_routing_moe.py"
+    / "deepseek_v4_external_routing_moe.py"
 )
 _ROUTING_PATH = (
     _REPO_ROOT / "afd_plugin" / "connectors" / "npu" / "camp2p" / "external_routing.py"
@@ -186,7 +186,7 @@ def _install_stub_modules():
         sys.modules[name] = module
 
     spec = importlib.util.spec_from_file_location(
-        "afd_external_routing_moe", _MODULE_PATH
+        "afd_deepseek_v4_external_routing_moe", _MODULE_PATH
     )
     assert spec is not None and spec.loader is not None
     component_module = importlib.util.module_from_spec(spec)
