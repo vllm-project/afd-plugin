@@ -28,6 +28,7 @@ from afd_plugin.compat.npu import (
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+from afd_plugin.elastic.npu import connect, release_link, update_topology
 from afd_plugin.model_executor.models.model_utils import (
     configure_afd_dspark,
     get_afd_model_config,
@@ -82,6 +83,26 @@ class AFDNPUFFNWorker(NPUWorker):
         self._ffn_shutdown_event: threading.Event | None = None
         self._ffn_loop_error: BaseException | None = None
         self._cpu_binding_attempted = False
+        # Same mount as the attention worker's non-deferred lane: vllm's
+        # elastic EP state machine dispatches elastic_ep_execute at every
+        # worker in the group (the GPU F worker inherits the mount from vllm
+        # Worker; stock NPUWorker has none, the feat branch used to add it).
+        from vllm.distributed.elastic_ep.elastic_execute import (
+            ElasticEPScalingExecutor,
+        )
+
+        self.elastic_ep_executor = ElasticEPScalingExecutor(self)
+
+    # Re-anchor main@544f182d: mirrors the attention worker's shim for the
+    # GPU-Worker property the elastic commit/warm paths read.
+    @property
+    def randomize_dummy_inputs(self) -> bool:
+        from vllm import envs
+
+        return bool(
+            getattr(envs, "VLLM_RANDOMIZE_DP_DUMMY_INPUTS", False)
+            and self.vllm_config.parallel_config.data_parallel_size > 1
+        )
 
     def init_device(self) -> None:
         assert_compatible_afd_stack(
@@ -116,6 +137,15 @@ class AFDNPUFFNWorker(NPUWorker):
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}
 
+    def afd_release_link(self) -> None:
+        release_link(self)
+
+    def afd_update_topology(self, afd: dict[str, str | int | bool]) -> None:
+        update_topology(self, afd)
+
+    def afd_connect(self) -> None:
+        connect(self)
+
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.model_runner.initialize_kv_cache(kv_cache_config)
@@ -124,6 +154,31 @@ class AFDNPUFFNWorker(NPUWorker):
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         return CompilationTimes(language_model=0.0, encoder=0.0)
+
+    # Signature matches vllm-ascend NPUWorker.load_model call sites from the
+    # 0.32 generation on; the F runners accept load_dummy_weights since the
+    # keyword pass-through fix (accepted and deliberately unused — FFN
+    # weights are always real). Stock body stays upstream; see the attention
+    # worker's identical override for the forwarding mechanism.
+    def load_model(self, *, load_dummy_weights: bool = False, **kwargs: Any) -> None:
+        runner = self.model_runner
+        original = runner.load_model
+
+        def _forward(*args: Any, **kw: Any) -> None:
+            kw.setdefault("load_dummy_weights", load_dummy_weights)
+            original(*args, **kw)
+
+        runner.load_model = _forward  # type: ignore[method-assign]
+        try:
+            super().load_model(**kwargs)
+        finally:
+            del runner.load_model  # unshadow the class method
+
+    def elastic_ep_execute(self, execute_method: str, *args: Any, **kwargs: Any):
+        # Mirrors vllm gpu_worker Worker.elastic_ep_execute; the plain
+        # upstream executor is mounted in __init__ (F-side elastic actions
+        # arrive through the afd_* RPCs, not the EEP executor).
+        return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
 
     def execute_model(
         self,
@@ -217,6 +272,8 @@ class AFDNPUFFNWorker(NPUWorker):
             control_plane = self.model_runner.connector.control_plane
             assert control_plane is not None
             payload = control_plane.recv_dp_metadata_list()
+            if payload.stop:
+                return
             dp_metadata_list = payload.dp_metadata_list
             is_attn_graph_capturing = payload.is_graph_capturing
             is_warmup = payload.is_warmup
@@ -244,6 +301,19 @@ class AFDNPUFFNWorker(NPUWorker):
             if not self._requires_async_drain():
                 self._ffn_loop_error = None
             raise RuntimeError("AFD NPU FFN worker loop failed") from error
+
+    def join_ffn_server_loop(self, timeout: float = 60.0) -> None:
+        """Join after A sent STOP; do not destroy a communicator under recv."""
+        thread = self._ffn_thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                raise TimeoutError("AFD NPU FFN worker loop did not acknowledge STOP")
+        self.raise_ffn_loop_error_if_any()
+        self._ffn_thread = None
+        self._ffn_shutdown_event = None
+        # recv no longer blocks the device stream at this point.
+        torch.npu.synchronize(self.device)
 
     def stop_ffn_server_loop(self) -> None:
         event = self._ffn_shutdown_event

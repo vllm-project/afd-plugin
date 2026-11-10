@@ -336,12 +336,15 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             return
 
         ensure_cam_async_ops_available()
+        # Same generation-uniqueness rationale as the CAMP2p connector: the
+        # HCCL communicator is resolved by group *name* in the native ops, so
+        # a rebuilt connector must not reuse the retired generation's name.
         self.cam_pg = init_afd_process_group(
             backend="hccl",
             init_method=f"tcp://{self.afd_config.host}:{self.afd_config.port}",
             world_size=self.topology.world_size,
             rank=self.world_rank,
-            group_name=AFD_ASYNC_CAM_GROUP_NAME,
+            group_name=f"{AFD_ASYNC_CAM_GROUP_NAME}_{self.afd_config.port}",
             timeout=timedelta(minutes=30),
             pg_options=create_hccl_process_group_options(
                 self.hccl_buffer_size_mb,

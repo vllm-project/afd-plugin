@@ -47,11 +47,15 @@ Documentation = "https://github.com/vllm-project/afd-plugin#readme"
 [project.entry-points."vllm.general_plugins"]
 afd = "afd_plugin:register_afd"
 
+[project.entry-points."vllm.endpoint_plugins"]
+afd_elastic = "afd_plugin.elastic.api:AFDElasticEndpointPlugin"
+
 [dependency-groups]
 dev = [
     "datasets>=3.0",
     "httpx>=0.27",
     "huggingface_hub>=0.26",
+    "msgspec",
     "pre-commit>=4",
     "pytest>=7.0",
     "ruff>=0.15.7,<0.16",
