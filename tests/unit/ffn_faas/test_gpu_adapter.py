@@ -9,14 +9,28 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
 from afd_plugin.ffn_faas.platforms import get_platform_adapter
+from afd_plugin.ffn_faas.service import FFNService
+from tests.unit.fakes.afdep import install_fake_afdep
+from tests.unit.fakes.ffn_faas import write_qwen3_checkpoint
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 NATIVE_MODULES = ("torch", "vllm", "afdep", "deep_gemm")
 GRAPH = ("--compilation-config", '{"cudagraph_mode":"FULL_DECODE_ONLY"}')
+# Hopper, the oldest architecture the DeepEP M2N connector accepts.
+SM90_CAPABILITY = (9, 0)
+
+
+class DeviceSelectionReachedError(Exception):
+    """Stops ``prepare`` at the moment the F rank binds its GPU."""
+
+    def __init__(self, device) -> None:
+        super().__init__(device)
+        self.device = device
 
 
 def _afd_config(**overrides) -> str:
@@ -203,3 +217,43 @@ def test_cli_reports_a_bad_launch_as_a_usage_error(tmp_path):
     )
     assert result.returncode == 2
     assert "must agree" in result.stderr
+
+
+def test_device_ids_place_the_rank_on_its_assigned_gpu(
+    launch_env, configure, monkeypatch, tmp_path
+):
+    """``--device-ids 2,3`` puts F local rank 1 on GPU 3, as vLLM's Worker does.
+
+    vLLM only records the resolved IDs in ``parallel_config``; its GPU Worker
+    registers them with ``set_assigned_physical_gpu_ids`` before mapping the
+    local rank to a device. The F rank must apply the same mapping, or it lands
+    on ``cuda:<LOCAL_RANK>``, which may be an Attention GPU. The device itself
+    is never touched: binding it stops ``prepare``.
+    """
+    torch = pytest.importorskip("torch")
+    platform_interface = pytest.importorskip("vllm.platforms.interface")
+    install_fake_afdep()
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    # The mapping is process-wide in vLLM; start and end without one.
+    monkeypatch.setattr(platform_interface, "_assigned_physical_gpu_ids", None)
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device=None: SM90_CAPABILITY
+    )
+
+    def stop_at_device_selection(device):
+        raise DeviceSelectionReachedError(device)
+
+    monkeypatch.setattr(torch.accelerator, "set_device_index", stop_at_device_selection)
+    write_qwen3_checkpoint(tmp_path / "model")
+    launch, _ = configure(
+        "--enforce-eager",
+        "--device-ids",
+        "2,3",
+        afd={"connector_extra_config": {"expert_backend": "fused_experts"}},
+    )
+
+    backend = launch.backend_factory()
+    with pytest.raises(DeviceSelectionReachedError) as selected:
+        backend.prepare(Mock(spec=FFNService))
+
+    assert selected.value.device == torch.device("cuda", 3)
