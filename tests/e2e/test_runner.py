@@ -753,6 +753,7 @@ def multi_pod_runtime(host_case_runtime, tmp_path):
         ("deepseek_v2_lite", "afd-graph-2a2f", "2A0F,0A2F", "pass", 7),
         ("deepseek_v2_lite", "afd-graph-2a2f", "1A1F,1A1F", "pass", 7),
         ("qwen3_moe", "afd-deepep-m2n-graph-2a2f", "2A0F,0A2F", "pass", 100),
+        ("qwen3_moe", "afd-deepep-m2n-graph-2a2f", "1A1F,1A1F", "pass", 100),
         ("deepseek_v2_lite", "afd-graph-2a2f", "2A0F,0A2F", "debug", 3),
         (
             "deepseek_v2_lite",

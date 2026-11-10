@@ -19,7 +19,7 @@ The CUDA counts include the local DeepEP M2N entries. CI still selects the
 same 15 unique node IDs across ready/merge and weekly gates. Definitions,
 collected nodes and device acceptance results are different counts.
 
-The seven existing GPU multi-pod entries also use model-local Cases and the
+The ten existing GPU multi-pod entries also use model-local Cases and the
 shared local deployment executor. Their existing workload/liveness/cleanup
 acceptance is retained; cross-pod execution evidence is not added. The two NPU
 multi-pod entries and dedicated FFN/DSpark checks retain their existing path.
@@ -70,7 +70,7 @@ report actual CUDA/NPU results, host integration, skips and unexecuted cases
 separately. No existing case is removed in this migration.
 
 The extension rules below apply to the migrated Case paths: all single-deployment
-entries, including NPU, and the seven GPU multi-pod entries. NPU multi-pod and
+entries, including NPU, and the ten GPU multi-pod entries. NPU multi-pod and
 dedicated FFN/DSpark executors still use their retained legacy paths; they do not
 yet have the same extension contract.
 
@@ -295,8 +295,10 @@ python -m pytest -q -s \
 ```
 
 `tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py` runs the eager,
-graph and graph + DBO cases with Attention and FFN in two pods, one role per
-pod, so dispatch and combine cross nodes over NCCL GIN. The pods must be
+graph and graph + DBO cases on two pods in two layouts: one role per pod
+(`2A0F,0A2F`) and one Attention and one FFN rank per pod (`1A1F,1A1F`, which
+runs afdEP-comm's per-domain mode). Dispatch and combine cross nodes over NCCL
+GIN. The pods must be
 provisioned first; see
 [`.agents/skills/run-e2e/resources/k8-multi-pod.md`](../../.agents/skills/run-e2e/resources/k8-multi-pod.md)
 and the [multi-pod runner walkthrough](multi_pod/README.md).
@@ -355,10 +357,10 @@ and graph mode change; the graph row uses `FULL_DECODE_ONLY` with capture size 8
 
 The GPU validator accepts exactly two microbatches at Attention DP1 or
 DP > 1; FFN remains connector-driven. See the
-[runtime matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix)
+[runtime matrix](../../docs/support.md#tested-runtime-matrix)
 for tested configurations and known DeepSeek-V2-Lite shutdown failures.
 NPU retains the separate eager DBO and graph
-constraints documented in the [execution-platform matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix).
+constraints documented in the [support matrix](../../docs/support.md#tested-runtime-matrix).
 The GPU harness collects bounded per-rank summaries of actual two-stage and
 FULL-replay execution during evaluation. Historical hardware records retain
 the execution assertions of the test revision that produced them. On vLLM
@@ -400,7 +402,7 @@ samples, with the existing 24-sample floor for DBO.
 `models/deepseek_v4_flash/test_gpu.py` provides separate CUDA qualification
 profiles for the synchronous `P2pNcclAFDConnector`. They use CUDA launch
 shapes independently of the Ascend W4A8 and HCCL profiles. See the
-[runtime matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix)
+[runtime matrix](../../docs/support.md#tested-runtime-matrix)
 for source-specific hardware validation.
 
 The basic test has four cases:

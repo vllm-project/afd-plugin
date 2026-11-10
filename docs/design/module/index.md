@@ -21,7 +21,7 @@ upstream_refs:
   - "vLLM-Ascend target bd42eea01d8312c4df469fabaed45f77a12df4d3"
 verified_platform_refs:
   - "CUDA: tests/e2e marked e2e with AFD_E2E_BACKEND=gpu; no canonical image is recorded"
-  - "Ascend: current target in root installation instructions; V2-Lite and DSV4 Flash W4A8 evidence in the execution-platform matrix; older environments remain historical"
+  - "Ascend: current target in docs/installation.md; V2-Lite and DSV4 Flash W4A8 evidence in docs/support.md; older environments remain historical"
 related_issues:
   - "#129"
 last_reviewed: 2026-11-09
@@ -35,16 +35,8 @@ verify boundaries, invariants, and validation evidence. The documents record
 plugin, role runtime, connector, model, platform, compatibility, and E2E
 testing contracts; open interfaces remain explicitly draft.
 
-The 2026-11-09 documentation review checked path ownership, configuration,
-guide links, and upstream references against the current checkout. GPU and
-NPU target vLLM `0.32.0` (`5df63a72`); the Ascend integration targets
-vLLM-Ascend `bd42eea0`, as recorded in the
-[installation instructions](../../../README.md#ascend-npu-installation).
-The refreshed `last_reviewed` dates record documentation consistency checks;
-hardware validation remains scoped to the
-[runtime matrix](execution_platforms.md#tested-runtime-matrix) and the
-[0.32 NPU validation record](https://github.com/vllm-project/afd-plugin/pull/507).
-Existing document statuses and historical measurements retain their scope.
+`last_reviewed` records documentation review, not hardware qualification.
+For installation, deployment and validation, use the [documentation index](../../README.md).
 
 ## Reading order
 
@@ -65,17 +57,6 @@ Existing document statuses and historical measurements retain their scope.
 Dependencies flow from role and integration modules toward shared boundaries;
 platform and compatibility modules adapt those boundaries to upstream
 runtimes. A lower-level document must not depend on a role implementation.
-
-```text
-attention_runtime ----+----> connector_contracts ----> plugin_boundary
-                      |                |
-ffn_runtime ----------+                +----> execution_platforms
-                      |
-model_integration ----+----> execution_platforms
-
-attention_runtime ----+
-ffn_runtime ----------+----> compatibility_and_patches ----> plugin_boundary
-```
 
 ```mermaid
 flowchart LR
@@ -127,21 +108,3 @@ The repository-level test contract is owned separately by
 
 Only identified invariant blocks in a `normative` document may use `MUST`,
 `MUST NOT`, or `SHOULD` as contract terms.
-
-## User and operational guides
-
-Operational guides remain separate from normative module design:
-
-- [NCCL P2P connector guide](../../gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.md)
-- [DeepEP M2N connector guide](../../gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md)
-- [CAM P2P connector guide](../../npu/CAM_P2P_CONNECTOR_USER_GUIDE.md)
-- [CAM async connector guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md)
-- [CAM routed operators](../../npu/CAM_ASYNC_ROUTED_OPS.md)
-- [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md)
-- [Layered W13/W2 graph validation](../../npu/LAYERED_W2_MDL_VALIDATION.md)
-- [NPU validation](../../npu/TESTING.md) and [troubleshooting](../../npu/TROUBLESHOOTING.md)
-- [Ascend NPU installation](../../../README.md#ascend-npu-installation)
-- [Ascend NPU custom ops build](../../../csrc/npu/README.md)
-- [Connector overview](../../../afd_plugin/connectors/README.md)
-- [Deployment recipes](../../../recipe/README.md)
-- [E2E test guide](../../../tests/e2e/README.md)

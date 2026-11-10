@@ -173,7 +173,7 @@ Both roles validate the paired V2 topology, but only Attention uses the native
 V2 model runner. FFN remains connector-driven and uses its existing AFD runner
 surface. Qwen3.5/3.6 GDN DBO is unsupported; native hybrid/multimodal
 DBO validation applies. Qwen3 MoE DBO remains supported. See the
-[runtime matrix](execution_platforms.md#tested-runtime-matrix) for tested
+[runtime matrix](../../support.md#tested-runtime-matrix) for tested
 configurations and known shutdown limitations.
 The generic V2 E2E harness remains CUDA-only.
 
@@ -323,7 +323,7 @@ supported topology and environment matrix.
 
 CAM async requires eager Attention; FFN can use eager or FULL execution.
 Feature limits are recorded in the
-[platform matrix](execution_platforms.md#tested-runtime-matrix).
+[platform matrix](../../support.md#tested-runtime-matrix).
 
 ## Ubatching and graph orchestration
 
@@ -385,7 +385,7 @@ the matching platform and connector tests as well.
 ## Limitations and open issues
 
 Platform/connector limits and hardware evidence are centralized in
-[execution platforms](execution_platforms.md#tested-runtime-matrix).
+[support matrix](../../support.md#tested-runtime-matrix).
 
 This document does not decide the runtime refactor, connector metadata
 ownership, or transfer metadata/state shape. See

@@ -30,7 +30,7 @@ The combined layer table and startup agreement cover target0–42/draft43–45;
 all layers must share the same W4A8 or W8A8 layout. Native P loads the complete
 draft model. Target/draft Attention and the native speculative configuration
 remain eager. DSpark excludes DBO; see the
-[DSpark recipe](../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md).
+[DSpark recipe](../../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md).
 
 W8A8 reuses the loaded INT8 NZ weights, FP32 W13 scales and BF16 W2 scales.
 It needs no W4A8 compensation. The W2 binding requires per-layer bias entries,

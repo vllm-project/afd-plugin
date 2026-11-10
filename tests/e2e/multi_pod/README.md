@@ -9,8 +9,8 @@ for provisioning, resources and completion handling.
 
 ## Entry and ownership
 
-The seven existing GPU entries are unchanged: four DeepSeek-V2-Lite
-scenario/layout pairs and three Qwen3 MoE DeepEP M2N pairs. Their pytest
+The ten existing GPU entries are unchanged: four DeepSeek-V2-Lite
+scenario/layout pairs and six Qwen3 MoE DeepEP M2N pairs. Their pytest
 entrypoints call `model_multi_pod_command()` and `run_case_entry()`:
 
 ```text
@@ -47,9 +47,11 @@ leader owns evaluation. These need not be the same pod.
 
 A layout such as `2A0F,0A2F` is independent of the Case's logical topology.
 Per-role totals must match the Case, and each pod must hold a whole number of
-TP groups: a TP group cannot span pods. Qwen3 DeepEP M2N retains its declared
-role-split layout; its FFN-first world ordering and contiguous NVLink domains
-are connector requirements, not a new placement capability of this migration.
+TP groups: a TP group cannot span pods. Qwen3 DeepEP M2N retains the role-split
+and interleaved layouts from main. Its transport requires equal rank counts
+per NVLink domain, with FFN ranks filling the first domains or the same FFN
+count in every domain. The connector's transport mapping owns these rules;
+this migration adds no transport capability.
 Baseline placement across multiple pods remains unsupported.
 
 `plan()` derives every pod's plan from the same topology, layout and addresses.

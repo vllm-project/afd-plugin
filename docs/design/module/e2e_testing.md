@@ -55,7 +55,7 @@ verified_platform_refs:
   - "CUDA Qwen3 MoE"
   - "CUDA Qwen3.6 MoE"
 related_issues: []
-last_reviewed: 2026-11-09
+last_reviewed: 2026-11-10
 ---
 
 # E2E testing
@@ -116,7 +116,7 @@ the service CLI timeout. Existing worker environment overrides are retained and
 recorded in the effective configuration. Other profiles keep their declared
 shutdown budgets and do not gain this worker default.
 
-The seven existing GPU multi-pod entries use model-local distributed Cases.
+The ten existing GPU multi-pod entries use model-local distributed Cases.
 `multi_pod` derives local RoleSlots and coordinates addresses, launch barriers,
 verdict and departure; `deployment.py` builds commands and owns local processes.
 The original distributed workload, liveness and cleanup checks are retained;
@@ -131,7 +131,7 @@ tables and evaluation/Hash branches have been removed. No cases are added or
 removed. Implementation/collection does not establish device qualification:
 report host, same-host distributed and cross-node/device execution separately.
 
-On migrated Case paths (all single-deployment entries and seven GPU multi-pod
+On migrated Case paths (all single-deployment entries and ten GPU multi-pod
 entries), an existing-capability combination changes model declarations and
 IDs only.
 Changing Case fields, task/check behavior or deployment protocols is a shared

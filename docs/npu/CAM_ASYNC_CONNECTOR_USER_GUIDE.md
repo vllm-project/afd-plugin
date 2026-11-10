@@ -6,9 +6,9 @@ exchange routed-expert activations with independent FFN expert ranks
 through CAM async dispatch/combine operators.
 
 Use the pinned dependency pair in the
-[root installation instructions](../../README.md#ascend-npu-installation).
+[installation instructions](../installation.md#ascend-npu-installation).
 Current runtime constraints and validation evidence are summarized in the
-[runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix).
+[runtime matrix](../support.md#tested-runtime-matrix).
 
 > [!WARNING]
 > CAM async is experimental. V4 true DBO boundary qualification and performance
@@ -32,7 +32,7 @@ unsplit locally. Both token thresholds must be at least two.
 Attention DP replicas make that decision independently; FFN is connector-driven.
 
 FFN also supports the experimental complete-transaction FULL mode described in
-[Async FFN runtime](ASYNC_FFN_RUNTIME.md#selection-and-startup).
+[Async FFN runtime](../design/npu/async_ffn_runtime.md#selection-and-startup).
 FULL requires MRV2 on both roles and accepts Attention-side DBO under the
 existing constraints. Attention graph execution remains unsupported.
 
@@ -168,31 +168,17 @@ There is no separate `--afd-config` option.
 }
 ```
 
-### Common fields
-
-| Field | Type | Default | Meaning and constraint |
-| --- | --- | --- | --- |
-| `role` | `"attention" \| "ffn"` | `"attention"` | Role owned by this process. |
-| `connector` | `str` | `"P2pNcclAFDConnector"` | Must be `CAMAsyncAFDConnector`. |
-| `async` / `async_dp` | `bool` | `false` | Must be `true`. `async` is the accepted compatibility alias for canonical `async_dp`. |
-| `host` | `str` | `"127.0.0.1"` | **Must be the IP address of the node that owns Attention rank 0.** Every rank must use the same reachable value. |
-| `port` | `int` | `1239` | HCCL rendezvous port in `1..65535`; it must be free and reachable. |
-| `afd_process_group_timeout_s` | `int` | `120` | Positive AFD group rendezvous timeout in seconds; also bounds the NPU native DBO startup barrier, not device receive polling. |
-| `num_attention_ranks` | `int` | `1` | Total Attention ranks across all DP and TP groups. |
-| `num_ffn_ranks` | `int` | `1` | Total FFN expert ranks. |
-| `compute_gate_on_attention` | `bool` | `false` | Must be `true`; CAM async runs MoE routing on Attention before dispatching to FFN ranks. |
-| `connector_extra_config` | `dict` | `{}` | Connector-specific settings. Unknown top-level AFD fields are rejected. |
-
-Compatibility aliases `afd_role`, `afd_connector`, `afd_host`, `afd_port`,
-and `async` are accepted. New configurations should use canonical names,
-including `async_dp`; enable DBO through the Attention CLI flags below.
+Use the [common configuration reference](../configuration.md) for defaults
+and aliases. CAM async requires `async_dp=true`,
+`compute_gate_on_attention=true`, and `host` on Attention rank 0.
+Enable native DBO through Attention CLI flags, not connector extra config.
 
 ### CAM async `connector_extra_config`
 
 | Field | Type | Default | Meaning and constraint |
 | --- | --- | --- | --- |
 | `dynamicQuant` | `int` | `0` | Set to `1`: FFN receives dynamically quantized routed activations and scale tensors. The default `0` is not supported by the layered FFN path. |
-| `ffn_mega_moe` | `bool` | `false` | Selects Mega FFN with Pull transport; requires `dynamicQuant=1` and the same setting on all A/F ranks. See the [Pull execution session](ASYNC_FFN_RUNTIME.md#opt-in-pull-execution-session). |
+| `ffn_mega_moe` | `bool` | `false` | Selects Mega FFN with Pull transport; requires `dynamicQuant=1` and the same setting on all A/F ranks. See the [Pull execution session](../design/npu/async_ffn_runtime.md#opt-in-pull-execution-session). |
 | `attn_ranks_per_dp` | `int` | `1` | Positive Attention TP rank count per DP replica. It is the CAM Attention grouping width and is independent of the FFN process's local TP size. |
 | `hccl_buffer_size` | `int` | unset | Positive CAM HCCL buffer size in MB. The override applies only to the `afd_async_cam` communication domain. When unset, HCCL uses `HCCL_BUFFSIZE`, then its built-in default. Configure the same value on every Attention and FFN rank in the domain. |
 
@@ -243,7 +229,7 @@ as DP > 1. The Ascend adapter extends native factory and threshold selection to
 DP1 because upstream otherwise returns early there. Async child contexts start
 with `dp_metadata=None`; FFN DP coordination belongs to the connector.
 DP1 model correctness still needs the hardware checks in the
-[NPU validation guide](TESTING.md#native-dbo-contracts-and-device-execution).
+[NPU validation guide](../../tests/npu/README.md#native-dbo-contracts-and-device-execution).
 
 For shape-only runtime diagnostics, set
 `AFD_ASYNC_MOE_LAYOUT_LOG=1` on Attention. The log reports the parent token
@@ -253,7 +239,7 @@ It does not inspect tensor values or force a device synchronization.
 ## Requirements
 
 Use Ascend 910C, the pinned stack from the
-[root installation instructions](../../README.md#ascend-npu-installation),
+[installation instructions](../installation.md#ascend-npu-installation),
 and plugin-owned source-built operators on every node.
 
 Build the AFD operators from the repository root inside the container:
@@ -278,7 +264,7 @@ rank: Async CAM host tiling reads the environment, whereas HCCL allocation
 can use the domain override. For the JSON example above, export
 `HCCL_BUFFSIZE=4096`. Changing only `hccl_buffer_size` can misalign the window
 capacity and tail-state address. `HCCL_BUFFSIZE` also affects unrelated groups
-without explicit overrides; see the [operator window contract](CAM_ASYNC_ROUTED_OPS.md#communication-window-configuration).
+without explicit overrides; see the [operator window contract](../design/npu/cam_async_routed_ops.md#communication-window-configuration).
 
 For the experimental FlashComm1/SP cases, set
 `VLLM_ASCEND_ENABLE_FLASHCOMM1=1` only on Attention. Set it to `0` for plain TP
@@ -291,8 +277,8 @@ actual vendor library path. Missing source operators fail startup.
 ## Current limitations
 
 - Attention is eager. FFN FULL targets homogeneous W4A8 or W8A8 layers on A3/910C;
-  see [supported configuration](ASYNC_FFN_RUNTIME.md#selection-and-startup)
-  and [validation commands](ASYNC_FFN_RUNTIME.md#validation).
+  see [supported configuration](../design/npu/async_ffn_runtime.md#selection-and-startup)
+  and [validation commands](../design/npu/async_ffn_runtime.md#validation).
   Broader models and topologies require separate validation.
 - Regular prefill and autoregressive decode steps are supported; context
   parallel execution remains outside the supported Async CAM topology.
@@ -325,7 +311,7 @@ per-channel W4A8, or dynamic W8A8 with FP32 W13/BF16 W2 per-channel scales.
 W8A8 uses loaded INT8 NZ tensors and a single shared zero INT32 W2 bias;
 it does not require W4A8 compensation or duplicate expert weights.
 Historical DSV4 Flash W4A8 layered off/on comparisons and operator traces are in the
-[runtime validation record](../design/module/execution_platforms.md#tested-runtime-matrix).
+[runtime validation record](../support.md#tested-runtime-matrix).
 Per-group operator coverage does not extend the checkpoint loader to
 per-group weights.
 Shared experts remain on Attention. DSV4 applies routed scaling in top-k, so
@@ -336,7 +322,7 @@ For positive `L`, it computes `SiLU(min(gate, L)) * clamp(up, -L, L)` before
 quantization; zero keeps clipping disabled. This restores DeepSeek-V4's configured
 limit of `10.0`. Layered W8A8 retains its unclipped computation. FULL reuses the
 existing native DR and CS operators. See
-[resource lifetime](ASYNC_FFN_RUNTIME.md#resource-lifetime) for completion and
+[resource lifetime](../design/npu/async_ffn_runtime.md#resource-lifetime) for completion and
 process-cleanup requirements.
 Missing W4A8 `w13_scale_bias` or `w2_scale_bias`, dynamic EPLB, non-SiLU
 activation, incompatible parameters, other quantizations, mixed quantization,
@@ -360,8 +346,8 @@ counts, parameter rejection, startup selection, and the absence of explicit
 metadata D2H in the Python path. They do not establish NPU numerical
 accuracy, empty-work completion, hidden synchronization, or a performance gain.
 Run the compiled Meta and NPU numerical tests described in the
-[testing guide](TESTING.md#layered-w4a8-validation) and the
-[FULL runtime checks](ASYNC_FFN_RUNTIME.md#validation). Deployments require
+[testing guide](../../tests/npu/README.md#layered-operator-precision) and the
+[FULL runtime checks](../design/npu/async_ffn_runtime.md#validation). Deployments require
 target-device validation of completion, checkpoint accuracy and performance.
 
 To switch from FULL to layered eager, pass `--enforce-eager` before restarting

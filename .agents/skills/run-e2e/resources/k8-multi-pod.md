@@ -256,10 +256,10 @@ The pytest entries enforce that requirement through `run_case_entry()`.
 `GSM8K_OUTPUT_PATH` is the run root: role logs and `run.json` are written there,
 with evaluator artifacts under `evaluation/`.
 
-The seven existing GPU multi-pod entries retain workload, liveness and cleanup
+The ten existing GPU multi-pod entries retain workload, liveness and cleanup
 checks. They do not collect cross-pod graph/DBO/Hash execution evidence. Qwen3
 DeepEP M2N uses `tests.e2e.models.qwen3_moe.cases multi-pod`, its declared
-role-split layouts and 100-sample workload; its connector runtime must already
+role-split/interleaved layouts and 100-sample workload; its connector runtime must already
 be available. See [execution and maintenance](../../../../tests/e2e/multi_pod/README.md).
 
 ## DSV4 Flash on Ascend NPU
