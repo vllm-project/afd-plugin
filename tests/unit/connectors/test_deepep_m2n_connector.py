@@ -869,6 +869,38 @@ def test_close_cancels_the_control_receive_but_not_the_lanes_group(monkeypatch):
         connector.control_plane.recv_dp_metadata_list()
 
 
+def test_close_destroys_the_distinct_transport_group_after_lanes(monkeypatch):
+    """A per-domain transport group is destroyed once, after its lanes.
+
+    Why: afdEP-comm leaves the caller-owned Gloo group alive; keeping it
+    registered leaks process-group state across connector lifetimes.
+    """
+    events = []
+
+    class Lane:
+        def destroy(self):
+            events.append("lane")
+
+    monkeypatch.setattr(
+        connector_module, "_abort_process_group", lambda group: events.append("control")
+    )
+    monkeypatch.setattr(
+        connector_module.dist,
+        "destroy_process_group",
+        lambda group: events.append("transport"),
+    )
+    connector = _connector("ffn", 0, M2NTopology(ffn_size=2, attn_size=2))
+    connector.group = SimpleNamespace()
+    connector.bootstrap_group = SimpleNamespace()
+    connector.transport_group = SimpleNamespace()
+    connector.lanes = [Lane()]
+
+    connector.close()
+    connector.close()
+
+    assert events == ["control", "lane", "transport"]
+
+
 @pytest.mark.parametrize(
     ("closes_first", "error", "expected"),
     [
