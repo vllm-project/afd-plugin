@@ -110,12 +110,12 @@ with _vllm_stub():
         AFDTransferContext,
         AFDTransferMetadata,
     )
-    from afd_plugin.connectors.npu import camp2p as camp2p_module
     from afd_plugin.connectors.npu.camp2p import (
         CAMP2pAFDConnector,
         prepare_token_id_transfer,
         received_token_ids,
     )
+    from afd_plugin.connectors.npu.camp2p import connector as camp2p_module
 
 
 class _CpuTorch:
