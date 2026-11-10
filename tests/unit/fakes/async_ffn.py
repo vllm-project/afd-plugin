@@ -39,6 +39,7 @@ def load_async_modules(monkeypatch):
         "vllm.distributed",
         "vllm.utils.torch_utils",
         "vllm_ascend.utils",
+        "vllm.v1.worker.gpu.shutdown",
         "afd_plugin.compat.npu.ops",
         "afd_plugin.compat.npu.forward_context",
         "afd_plugin.compat.npu.profiler",

@@ -189,6 +189,36 @@ commands:
 New commands should omit `--worker-cls`. These paths may change with the pinned
 runtime integration and are not stable third-party extension interfaces.
 
+### Validation ownership
+
+Validation follows configuration construction, Worker/device initialization,
+model loading, peer negotiation, execution and shutdown. Each Worker normalizes
+its effective child configuration and admits the deployment before native
+device initialization. ModelRunner constructors and the NPU FFN selection
+factory consume that admission; they do not repeat the deployment checklist.
+Standalone runtime harnesses explicitly perform the same applicable admission.
+
+`validation.py` owns common MRV2, PP/CP, role DP x TP, static EP, execution mode
+and DBO constraints. NPU Workers normalize DBO and the all2all backend first,
+then run common admission and the additional rules in
+`compat/npu/feature_validation.py`. That module keeps DSV4/DSpark restrictions,
+connector extras, Attention TP matching, expert divisibility and Push/Pull
+envelopes. DBO's threshold guard stays at the mutation point. A model alias or
+DBO normalization does not justify running the entire checklist again.
+
+`cam_receive_capacity()` applies native float32 rounding and requires at least
+one row. Raw connector parsing retains unknown-key/type checks and Mega's
+quantization implication. The connector factory also validates explicitly
+supplied `AFDConfig` values; directly constructing a dataclass does not validate
+it. These input contracts remain separate from runtime admission.
+
+Device capability is checked after device selection and before weights.
+Loaded-tensor validation belongs to compute construction; signature formatting
+consumes that same admitted table. Startup compares remote plans/signatures
+and layer tables, then checks the additional FULL-only uint16 source-row bound.
+It retains error publication and phase barriers. Current payload/FIFO/Pull
+status, graph completion and resource-release conditions stay at their use sites.
+
 ## Environment boundary
 
 `afd_plugin.envs` exports a boolean helper for `AFD_FORCE_BALANCED_TOPK_IDS`.

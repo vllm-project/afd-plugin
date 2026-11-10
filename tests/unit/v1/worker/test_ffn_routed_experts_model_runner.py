@@ -134,13 +134,15 @@ def test_eager_fallback_keeps_attention_replay_flag():
 
 
 def test_constructor_rejects_connectors_without_routed_rows(monkeypatch):
-    def base_init(self, vllm_config, device):
+    def base_init(self, vllm_config, device, *, afd_cudagraph_policy):
         self.connector = SimpleNamespace(close=lambda: None)
 
     monkeypatch.setattr(GPUFFNModelRunner, "__init__", base_init)
 
     with pytest.raises(TypeError, match="is not an AFDRoutedExpertsConnector"):
-        GPUFFNRoutedExpertsModelRunner(SimpleNamespace(), torch.device("cpu"))
+        GPUFFNRoutedExpertsModelRunner(
+            SimpleNamespace(), torch.device("cpu"), afd_cudagraph_policy=None
+        )
 
 
 def _routed_experts(*, fp8: bool, expert_ids=(4, 5), backend: str = "TRITON"):

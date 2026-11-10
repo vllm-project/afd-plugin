@@ -26,7 +26,6 @@ import torch
 from torch import Tensor
 from vllm.logger import init_logger
 
-from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.config import AFDConfig
 from afd_plugin.config_utils import (
     coerce_extra_bool,
@@ -59,7 +58,7 @@ from afd_plugin.distributed import (
     create_hccl_process_group_options,
     init_afd_process_group,
 )
-from afd_plugin.validation import cam_receive_capacity, validate_graph_capacity
+from afd_plugin.validation import CAM_MAX_SOURCE_ROWS, cam_receive_capacity
 
 if TYPE_CHECKING:
     from torch.distributed import Store
@@ -237,7 +236,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
     second. CAM dispatch/combine operators own both the collective data motion
     and its routing metadata, so this connector has no DP metadata control
     plane (``control_plane`` stays ``None``) and FFN work is triggered directly
-    by the connector receive loop.
+    by the connector receive loop. Worker or standalone harness admission
+    precedes construction and loads transport operators before initialization.
     """
 
     control_plane = None
@@ -335,7 +335,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         if self._initialized:
             return
 
-        ensure_cam_async_ops_available()
         self.cam_pg = init_afd_process_group(
             backend="hccl",
             init_method=f"tcp://{self.afd_config.host}:{self.afd_config.port}",
@@ -377,14 +376,10 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         self.graph_startup.initialize(store, signature)
         if self.graph_startup.mode == "full":
             try:
-                if not self.vllm_config.use_v2_model_runner:
-                    raise ValueError("Async FFN FULL requires MRV2 on every rank")
-                validate_graph_capacity(
-                    self.max_num_batched_tokens,
-                    self.tp_size,
-                    cam_receive_capacity(),
-                    allow_row_slicing=self._session.allow_row_slicing,
-                )
+                if self.max_num_batched_tokens // self.tp_size > CAM_MAX_SOURCE_ROWS:
+                    raise ValueError(
+                        "Async CAM graph source rows exceed the uint16 protocol bound"
+                    )
                 self.graph_startup.phase("validated")
             except Exception as exc:
                 self.graph_startup.fail(exc)
@@ -668,7 +663,7 @@ def build_async_topology(
     *,
     num_routed_experts: int | None = None,
 ) -> AFDAsyncTopology:
-    """Validate role-local rank settings and derive HCCL world rank.
+    """Map the actual role-local rank after config and deployment admission.
 
     The world is Attention-first: Attention role rank ``i`` maps to world rank
     ``i`` and FFN role rank ``j`` maps to
@@ -677,8 +672,6 @@ def build_async_topology(
     """
     attn_size = afd_config.num_attention_ranks
     ffn_size = afd_config.num_ffn_ranks
-    if attn_size <= 0 or ffn_size <= 0:
-        raise ValueError("AFD async topology sizes must be positive")
     if role_rank < 0:
         raise ValueError(f"AFD async role rank must be non-negative, got {role_rank}")
 
@@ -689,19 +682,15 @@ def build_async_topology(
                 f"(rank={role_rank}, size={attn_size})",
             )
         world_rank = role_rank
-    elif afd_config.role == "ffn":
+    else:
         if role_rank >= ffn_size:
             raise ValueError(
                 "FFN role rank must be within FFN size "
                 f"(rank={role_rank}, size={ffn_size})",
             )
         world_rank = attn_size + role_rank
-    else:
-        raise ValueError(f"unknown AFD role {afd_config.role!r}")
 
     expert_count = num_routed_experts if num_routed_experts is not None else ffn_size
-    if expert_count % ffn_size:
-        raise ValueError("Async CAM requires routed experts divisible by FFN ranks")
     expert_per_rank = expert_count // ffn_size
     return AFDAsyncTopology(
         role=afd_config.role,

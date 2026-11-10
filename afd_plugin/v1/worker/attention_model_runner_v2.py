@@ -46,7 +46,6 @@ from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
     _resolve_world_ranks,
 )
-from afd_plugin.validation import validate_gpu_model_runner_v2_config
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.pcp_manager import PCPManager
@@ -390,11 +389,6 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
         vllm_config: VllmConfig,
         device: torch.device,
     ):
-        validate_gpu_model_runner_v2_config(
-            vllm_config,
-            expected_role="attention",
-            device_type=device.type,
-        )
         super().__init__(vllm_config, device)
         self._afd_v4_ubatch_inputs: _AFDV4UBatchInputs | None = None
         connector: AFDConnectorBase | None = None

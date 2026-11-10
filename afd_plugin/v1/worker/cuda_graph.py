@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -21,7 +21,7 @@ FULL_DECODE_ONLY = "FULL_DECODE_ONLY"
 _SUPPORTED_GRAPH_MODES = {FULL_DECODE_ONLY}
 
 
-class AFDGraphRunMode(str, Enum):
+class AFDGraphRunMode(str, Enum):  # noqa: UP042 -- Keep Enum string formatting.
     EAGER = "eager"
     WARMUP = "warmup"
     CAPTURE = "capture"
@@ -44,7 +44,7 @@ def validate_cuda_graph_mode(
     *,
     role: str | None = None,
 ) -> AFDCUDAGraphPolicy:
-    """Return the CUDA graph policy or raise for unsupported AFD modes."""
+    """Resolve graph policy after Worker deployment and ubatch admission."""
 
     enforce_eager = bool(getattr(vllm_config.model_config, "enforce_eager", False))
     mode_name = cudagraph_mode_name(vllm_config)
@@ -65,23 +65,12 @@ def validate_cuda_graph_mode(
             f"{FULL_DECODE_ONLY}{role_suffix}; got {mode_name!r}.",
         )
 
-    parallel_config = getattr(vllm_config, "parallel_config", None)
-    use_ubatching = bool(getattr(parallel_config, "use_ubatching", False))
-    num_ubatches = getattr(parallel_config, "num_ubatches", None)
-    allow_ubatching = use_ubatching and int(num_ubatches or 0) == 2
-    if use_ubatching and not allow_ubatching:
-        raise RuntimeError(
-            "AFD CUDA graph support currently supports ubatching only for "
-            f"{FULL_DECODE_ONLY} with exactly two ubatches; "
-            f"got num_ubatches={num_ubatches!r}.",
-        )
-
     return AFDCUDAGraphPolicy(
         enabled=True,
         mode_name=mode_name,
         allow_attention_full_decode_only=role in (None, "attention"),
         enable_ffn_graph_cache=role in (None, "ffn"),
-        allow_cuda_graph_with_ubatching=allow_ubatching,
+        allow_cuda_graph_with_ubatching=vllm_config.parallel_config.use_ubatching,
     )
 
 
@@ -107,16 +96,17 @@ def make_ffn_graph_key(
     attention_size: int | None = None,
     ffn_size: int | None = None,
     fallback: int = 1,
-) -> tuple[tuple[int, tuple]]:
+) -> tuple[tuple[int, tuple], ...]:
     """Extract the AFD FFN graph hashable key from DP metadata."""
 
     key_parts: list[tuple[int, tuple]] = []
     for stage_idx, metadata in sorted(dp_metadata_list.items()):
+        values_tuple: tuple
         values = getattr(metadata, "num_tokens_across_dp_cpu", None)
         if values is None:
             if _use_ffn_aggregated_key(attention_size, ffn_size):
                 values_tuple = tuple(
-                    max(1, int(fallback)) for _ in range(int(ffn_size))
+                    max(1, int(fallback)) for _ in range(int(cast(int, ffn_size)))
                 )
             else:
                 values_tuple = (repr(metadata),)
@@ -125,8 +115,8 @@ def make_ffn_graph_key(
             if _use_ffn_aggregated_key(attention_size, ffn_size):
                 values_tuple = _aggregate_ffn_values_tuple(
                     values_tuple,
-                    attention_size=int(attention_size),
-                    ffn_size=int(ffn_size),
+                    attention_size=int(cast(int, attention_size)),
+                    ffn_size=int(cast(int, ffn_size)),
                     fallback=int(fallback),
                 )
         key_parts.append((int(stage_idx), values_tuple))
@@ -150,7 +140,7 @@ def graph_run_mode(
     return AFDGraphRunMode.EAGER
 
 
-def _metadata_values_tuple(values: object) -> tuple[int, ...]:
+def _metadata_values_tuple(values: Any) -> tuple[int, ...]:
     tolist = getattr(values, "tolist", None)
     if callable(tolist):
         values = tolist()

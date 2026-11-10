@@ -7,7 +7,6 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
 
@@ -19,11 +18,7 @@ from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup import (
     FFNGraphPlan,
     resolve_ffn_mode,
 )
-from afd_plugin.validation import (
-    cam_receive_capacity,
-    requested_ffn_mode,
-    validate_graph_capacity,
-)
+from afd_plugin.validation import cam_receive_capacity
 from tests.unit.fakes.async_cam_startup import MemoryStore, startup_world
 
 
@@ -55,21 +50,6 @@ def full_plan(**changes):
         FFNGraphPlan(requested="full", signature="weights/capacity", layer_ids=(2, 5)),
         **changes,
     )
-
-
-@pytest.mark.parametrize("mode", ["FULL_DECODE_ONLY", "PIECEWISE", "NONE"])
-def test_full_requires_explicit_complete_transaction_mode(mode):
-    config = SimpleNamespace(
-        model_config=SimpleNamespace(enforce_eager=False),
-        compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(name=mode)),
-    )
-    with pytest.raises(ValueError, match="explicit"):
-        requested_ffn_mode(config)
-    config.model_config.enforce_eager = True
-    assert requested_ffn_mode(config) == "eager"
-    config.model_config.enforce_eager = False
-    config.compilation_config.cudagraph_mode.name = "FULL"
-    assert requested_ffn_mode(config) == "full"
 
 
 def negotiate(owners, plans, signatures):
@@ -221,27 +201,6 @@ def test_capacity_matches_native_float32_factor(monkeypatch):
     monkeypatch.setenv("BATCH_SIZE_FACTOR", "0.000061035156249")
     # Python float truncates to 15; native std::stof rounds this to 16 rows.
     assert cam_receive_capacity() == 16
-
-
-@pytest.mark.parametrize(
-    "tokens,tp,capacity", [(0, 1, 16), (7, 2, 16), (32, 1, 16), (65536, 1, 65536)]
-)
-def test_graph_rejects_unsafe_static_envelope(tokens, tp, capacity):
-    with pytest.raises(ValueError):
-        validate_graph_capacity(tokens, tp, capacity)
-
-
-def test_graph_accepts_conservative_uint16_boundary():
-    validate_graph_capacity(65535, 1, 65535)
-    validate_graph_capacity(65536, 2, 65536)
-
-
-def test_pull_row_slicing_accepts_capacity_below_dispatch_envelope():
-    validate_graph_capacity(32, 2, 3, allow_row_slicing=True)
-    with pytest.raises(ValueError, match="smaller"):
-        validate_graph_capacity(32, 2, 3)
-    with pytest.raises(ValueError, match="uint16"):
-        validate_graph_capacity(65536, 1, 3, allow_row_slicing=True)
 
 
 def test_pull_requires_matching_transport_even_in_eager_mode():

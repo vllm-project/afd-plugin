@@ -30,11 +30,13 @@ class FakeFFNSession(FFNExecutionSession):
         serving: Iterable[bool] = (),
         requires_drain: bool = False,
         drain_error: Exception | None = None,
+        finish_error: Exception | None = None,
         transactions: int = 0,
     ) -> None:
         self.requires_drain = requires_drain
         self.serving = iter(serving)
         self.drain_error = drain_error
+        self.finish_error = finish_error
         self.transactions = transactions
         self.receiver_finished = False
 
@@ -48,6 +50,8 @@ class FakeFFNSession(FFNExecutionSession):
             raise self.drain_error
 
     def finish_receiver(self) -> None:
+        if self.finish_error is not None:
+            raise self.finish_error
         self.receiver_finished = True
 
     def validate_shutdown(self) -> None:

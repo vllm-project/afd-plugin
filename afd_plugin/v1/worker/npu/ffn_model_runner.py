@@ -13,10 +13,7 @@ from vllm.forward_context import DPMetadata
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
-from afd_plugin.compat.npu import (
-    ascend_forward_context,
-    fail_if_unsupported_npu_afd_features,
-)
+from afd_plugin.compat.npu import ascend_forward_context
 from afd_plugin.compat.npu.profiler import (
     create_afd_npu_profiler,
     step_afd_npu_profiler,
@@ -39,7 +36,6 @@ from afd_plugin.v1.worker.cuda_graph import (
     graph_run_mode,
 )
 from afd_plugin.v1.worker.ffn_metadata import _set_moe_layer_index
-from afd_plugin.validation import validate_npu_model_runner_v2_config
 
 if TYPE_CHECKING:
     from vllm.sequence import IntermediateTensors
@@ -54,7 +50,7 @@ logger = init_logger(__name__)
 
 
 class AFDNPUFFNModelRunner:
-    """Synchronous CAMP2P FFN runner, independent of MRV1."""
+    """Synchronous CAMP2P FFN runner after Worker deployment admission."""
 
     afd_expected_role = "ffn"
 
@@ -65,9 +61,6 @@ class AFDNPUFFNModelRunner:
         connector: AFDConnectorBase | None = None,
     ) -> None:
         afd_config = self.parse_config(vllm_config)
-        validate_npu_model_runner_v2_config(
-            vllm_config, expected_role="ffn", device_type=device.type
-        )
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.device = device
@@ -75,10 +68,6 @@ class AFDNPUFFNModelRunner:
         self.model: torch.nn.Module | None = None
         self.model_memory_usage = 0
         self.afd_config = afd_config
-        fail_if_unsupported_npu_afd_features(
-            vllm_config,
-            afd_config=afd_config,
-        )
         if connector is None:
             rank, _ = _resolve_world_ranks()
             connector = AFDConnectorFactory.create_connector(

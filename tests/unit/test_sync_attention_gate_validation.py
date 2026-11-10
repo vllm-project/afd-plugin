@@ -50,12 +50,13 @@ def _runner_config(*, enable_dbo=False, use_ubatching=False):
 
 
 @pytest.fixture()
-def sync_gate_afd_config(monkeypatch):
+def sync_gate_afd_config(monkeypatch, role):
     """Make the validator see the sync gate-on-Attention configuration."""
 
-    from afd_plugin.config import CAMP2P_CONNECTOR
+    from afd_plugin.config import CAMP2P_CONNECTOR, AFDConfig
 
-    afd_config = SimpleNamespace(
+    afd_config = AFDConfig(
+        role=role,
         connector=CAMP2P_CONNECTOR,
         async_dp=False,
         compute_gate_on_attention=True,

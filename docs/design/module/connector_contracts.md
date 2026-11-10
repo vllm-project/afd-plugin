@@ -337,6 +337,15 @@ stages, native publish/combine, status/idle/source state and quiet/drain/stopped
 Mega's fused FFN operation owns its receive/compute/send transaction; the public
 FFN receive/send methods reject Pull use.
 
+Worker admission owns role DP x TP and static expert divisibility. The
+connector maps actual role/world ranks after that admission; the factory
+validates explicitly supplied `AFDConfig` before construction. Feature admission
+owns Attention TP matching and Push/Pull dispatch envelopes. FULL transport
+agreement supplies the common envelope/TP, so Startup adds only the uint16
+source-row bound and retains its existing validated barrier. Local MRV2 and
+static capacity checks are not repeated during negotiation. Payloads, FIFO
+order and Pull status still need their own changing-state checks.
+
 The four public transfer methods still enter through the connector. The existing
 `AFDAsyncTransferState` definition stays at its original import path;
 `comm_args` and `comm_id` expose the selected session's live resources through read-only
