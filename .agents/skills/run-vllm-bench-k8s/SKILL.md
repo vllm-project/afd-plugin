@@ -42,10 +42,10 @@ folder as the list of possible recipes.
 
 Follow **`deploy-afd-k8s`** with `RECIPE_SCRIPT_PATH`. It returns
 `MODEL_ID`, `PVC_NAME`, `GPU_COUNT`, the serving node, the recipe's
-`--max-num-batched-tokens`, and an endpoint at `http://vllm-service:18305`.
+`--max-num-batched-tokens`, and an endpoint at `http://vllm-service:${CLIENT_PORT}` (18000).
 
 `vllm bench serve` is pointed at that endpoint with `HOST=vllm-service`
-`PORT=18305`, and `MODEL_PATH=${MODEL_ID}` -- it must name exactly what the
+`PORT=18000` (the launcher's Attention port), and `MODEL_PATH=${MODEL_ID}` -- it must name exactly what the
 pod serves, since the model id is sent in each request and used to load the
 tokenizer.
 
@@ -195,7 +195,7 @@ spec:
             conc="${point##*:}"
             echo "=== sweep point rate=${rate} concurrency=${conc} ==="
             MODEL_PATH="${MODEL_ID}" \
-            HOST=vllm-service PORT=18305 \
+            HOST=vllm-service PORT=18000 \
             DATASET_NAME="${DATASET_NAME}" \
             INPUT_LEN="${INPUT_LEN}" OUTPUT_LEN="${OUTPUT_LEN}" \
             NUM_PROMPTS="${NUM_PROMPTS}" \

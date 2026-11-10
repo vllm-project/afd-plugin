@@ -14,10 +14,11 @@ recipes under `recipe/gpu/` and `recipe/npu/`.
 | Topology | Where it lives |
 | --- | --- |
 | Baseline (native DP/TP, no AFD) | `baseline-graph` E2E scenarios; native DP4/TP1/EP4 |
-| CUDA NCCL P2P, colocation | `recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_colocation/` (2A2F and 4A4F, eager/graph, DBO variants, plus `multipod_2a_2f_graph_dbo_dp1tp2.sh`) |
+| CUDA NCCL P2P, colocation | `recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_colocation/` (`dbo.sh`, `eager_dbo.sh`; any `LAYOUT`, `ATTN_TP`, `FFN_TP`, e.g. 2A2F, 4A4F, `2A0F,0A2F`) |
 | CUDA NCCL P2P, disaggregation | `recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_disaggregation/` (2P1A1F eager/graph DBO) |
-| CUDA NCCL P2P, Qwen3.5 multi-pod | `recipe/gpu/P2pNcclAFDConnector/qwen3_5_122b_a10b_fp8/prefill_decode_colocation/multipod_2a_2a_2f_graph.sh` |
-| CUDA DeepEP M2N (routed experts) | `recipe/gpu/DeepEPM2NAFDConnector/{deepseek_v2_lite,qwen3_30b_a3b,qwen3_235b_a22b_fp8}/` (2A2F, and 4A2F for the 235B FP8 case) |
+| CUDA NCCL P2P, Qwen3.5 multi-pod | `recipe/gpu/P2pNcclAFDConnector/qwen3_5_122b_a10b_fp8/prefill_decode_colocation/graph.sh` (default `LAYOUT=2A0F,2A0F,0A2F`) |
+| CUDA DeepEP M2N (routed experts) | `recipe/gpu/DeepEPM2NAFDConnector/{deepseek_v2_lite,qwen3_30b_a3b,qwen3_235b_a22b_fp8}/` (graph/eager/dbo, any `LAYOUT`) |
+| GPU colocation launcher | `recipe/gpu/common/afd_colocation.sh`, shared by every GPU colocation recipe |
 | NPU CAM P2P disaggregation | `recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/` (attention/FFN/baseline scripts) |
 | NPU async CAM | `recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/v0_26_accuracy/` and `deepseek_v4_flash/` (DSpark A/F) |
 | Gate matrices | `tests/e2e/models/*/` scenario lists; `docs/design/module/e2e_testing.md` |
