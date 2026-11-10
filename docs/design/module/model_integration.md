@@ -68,6 +68,7 @@ make a backend-specific worker class the shared model API.
 | Forward-context adapter | [`forward_context.py`](../../../afd_plugin/model_executor/models/forward_context.py) | [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
 | NPU Async CAM native DBO handoff | [`npu/async_cam_dbo.py`](../../../afd_plugin/model_executor/models/npu/async_cam_dbo.py), [`npu/ubatch_runner.py`](../../../afd_plugin/v1/worker/npu/ubatch_runner.py) | [`test_async_cam_dbo.py`](../../../tests/unit/model_executor/test_async_cam_dbo.py), [`test_npu_model_runner_v2.py`](../../../tests/unit/v1/worker/test_npu_model_runner_v2.py) |
 | Ascend Attention-side gate | [`npu/deepseek_v2_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v2_attention_gate.py) | Attention-gate unit cases in [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
+| Ascend external-routing MoE execution | [`npu/deepseek_v4_external_routing_moe.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_external_routing_moe.py) | [`test_deepseek_v4_external_routing_moe_cpu.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_external_routing_moe_cpu.py) |
 | Ascend CAM dispatch layout | [`npu/async_cam_layout.py`](../../../afd_plugin/model_executor/models/npu/async_cam_layout.py) | [`test_async_cam_layout.py`](../../../tests/unit/model_executor/test_async_cam_layout.py) |
 | DeepSeek Ascend stage metadata ownership | [`npu/deepseek_attention_metadata.py`](../../../afd_plugin/model_executor/models/npu/deepseek_attention_metadata.py) | [`test_deepseek_attention_metadata.py`](../../../tests/unit/model_executor/test_deepseek_attention_metadata.py) |
 | Ascend CAM orchestration | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py) | [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py) |
@@ -157,10 +158,14 @@ CUDA configurations and validation limits.
 
 [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py)
 wraps the native Ascend model independently of the CUDA adapter. Attention
-owns attention, mHC, normalization and finalization. Synchronous CAMP2P sends
-normalized hidden states and Hash-layer token IDs to FFN, which owns the
-native gate and MoE. Async CAM keeps the Hash/top-k router and shared experts
-on Attention and sends only routed-expert work; `dynamicQuant=1` is required.
+owns attention, mHC, normalization and finalization. Synchronous CAMP2P has two
+shapes, selected by the common `compute_gate_on_attention` field: with `false`
+the FFN role owns the native gate and MoE, and with `true` (DeepSeek-V4, TP=1, no
+DBO or ubatching) the router and shared experts run on Attention and FFN executes
+only the transported routed experts. The connector-local flag of the same name is
+kept for compatibility and does not select the mode. Async CAM keeps the
+Hash/top-k router and shared experts on Attention and sends only routed-expert
+work; `dynamicQuant=1` is required.
 
 The DSpark adapter follows the same boundary. Native checkpoint names
 `mtp.0..2` and KV names are retained; its CAM layer IDs start at the target's
