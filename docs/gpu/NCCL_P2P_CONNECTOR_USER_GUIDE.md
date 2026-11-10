@@ -80,26 +80,10 @@ AFD configuration is supplied through vLLM's `--additional-config` under the `af
 }
 ```
 
-### Fields
-
-| Field | Type | Default | Required / meaning |
-| --- | --- | --- | --- |
-| `role` | `"attention" \| "ffn"` | `"attention"` | Role owned by this process. Attention sends hidden states; FFN receives and returns FFN outputs. |
-| `connector` | `str` | `"P2pNcclAFDConnector"` | Must be `P2pNcclAFDConnector` for this GPU path. |
-| `host` | `str` | `"127.0.0.1"` | Non-empty rendezvous/control-plane host. All participating ranks must use a reachable, identical value. Host must be the first rank of FFN. |
-| `port` | `int` | `1239` | Rendezvous port on `host`, valid range `1..65535`. It must be free and reachable. Subgroups share this rendezvous and need no ports of their own. |
-| `num_attention_ranks` | `int` | `1` | Total number of AFD Attention ranks, including DP/TP-derived worker ranks. Must be positive. |
-| `num_ffn_ranks` | `int` | `1` | Total number of AFD FFN ranks, including DP/TP-derived worker ranks. Must be positive. |
-| `compute_gate_on_attention` | `bool` | `false` | When `false`, FFN owns the native gate and experts. When `true`, Attention owns the native gate and transfers router logits to the FFN external-router expert path. |
-| `afd_process_group_timeout_s` | `int` | `120` | Rendezvous timeout, in seconds, for the AFD world process group join. Must be positive. The right value depends on rank count, placement, and model size; deployment tooling should compute it and pass it in. |
-| `connector_extra_config` | `dict` | `{}` | Must remain empty; `P2pNcclAFDConnector` does not currently support connector-specific options. |
-| `async` / `async_dp` | `bool` | `false` | Must remain `false` for `P2pNcclAFDConnector`; AFD async mode requires `CAMAsyncAFDConnector`. |
-
-Compatibility aliases currently accepted are `afd_role`, `afd_connector`, `afd_host`, and `afd_port`. Canonical field names should be used in new examples.
-
-The connector factory derives each process's role rank from its global DP rank
-and local PCP/TP coordinates before connector construction. Do not configure a
-role rank.
+Use the [common configuration reference](../configuration.md) for defaults
+and aliases. P2P requires `async_dp=false`, empty `connector_extra_config`,
+and `host` on FFN rank 0. DeepSeek supports either gate placement; Qwen
+requires `compute_gate_on_attention=false`.
 
 ## Topology rules
 
@@ -131,7 +115,7 @@ export VLLM_USE_V2_MODEL_RUNNER=1
 ```
 
 The commands below illustrate a DP1/TP1 launch. See the
-[runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix)
+[runtime matrix](../support.md#tested-runtime-matrix)
 for tested configurations and known shutdown limitations.
 
 Attention side:
@@ -183,7 +167,7 @@ exactly two microbatches and accepts Attention DP1 or DP > 1. The generic
 [GPU E2E runner](../../tests/e2e/runner.py) defines eager/graph DP2 and TP2
 scenarios, including `afd-v2-eager-dbo-dp2` and
 `afd-v2-graph-dbo-dp2`. See the
-[runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix)
+[runtime matrix](../support.md#tested-runtime-matrix)
 for the tested scope and known DeepSeek-V2-Lite shutdown failures. A
 registered model does not qualify every topology.
 
@@ -203,7 +187,7 @@ alone does not authorize replay. These behaviors are covered by the
 [connector tests](../../tests/unit/connectors/test_p2p_connector.py) and
 [FFN graph-policy tests](../../tests/unit/v1/worker/test_cuda_graph.py).
 
-## Requirements and limitations to document in code
+## Requirements and limitations
 
 - CUDA-capable PyTorch/vLLM environment with NCCL and vLLM's `PyNcclCommunicator` available.
 - Hidden-state tensors must reside on CUDA devices; CPU tensors are rejected.

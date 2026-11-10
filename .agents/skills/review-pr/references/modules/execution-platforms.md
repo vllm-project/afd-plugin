@@ -29,7 +29,7 @@ application ([npu-compat.md](npu-compat.md)).
   `upgrade-layered-gmm-ops` workflow.
 - Keep version pins coherent: `TARGET_VLLM_VERSION` in `compat/vllm.py`, the
   `vllm` extra in `pyproject.toml`, `VLLM_BASE_TAG` and its version assertion
-  in `docker/Dockerfile.ci`, README, and design-page `upstream_refs` move
+  in `docker/Dockerfile.ci`, installation/support references, and design-page `upstream_refs` move
   together, or the PR states why not. Read the actual pin; do not trust the
   value quoted in a review note or in this skill.
 - Keep GPU path parity visible: `csrc/gpu/` contains only a README reserving

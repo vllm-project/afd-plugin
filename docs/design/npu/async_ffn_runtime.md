@@ -1,14 +1,11 @@
 # MRV2 Async CAM FFN eager/FULL runtime
 
-AFD #449 captures one complete routed-expert transaction: original dispatch
-receive (DR), layered W4A8/W8A8 FFN, and original combine send (CS).
-Attention remains MRV2 eager. Issue #451 retires the separate MRV1 paths while
-preserving this runtime and its original transport/lifecycle boundary.
+FULL captures one routed-expert transaction: dispatch receive (DR),
+W4A8/W8A8 FFN, and combine send (CS). Attention remains MRV2 eager.
 
 `AsyncNPUFFNModelRunner` owns Async CAM model loading, eager/FULL transactions
 and receive-safe resource release independently of the synchronous CAMP2P
-`AFDNPUFFNModelRunner`. The FFN worker selects the owner from the connector;
-neither runner inherits MRV1 or owns Attention request/KV state.
+`AFDNPUFFNModelRunner`. The FFN worker selects the owner from the connector.
 
 ## Selection and startup
 
@@ -33,7 +30,7 @@ The combined layer table and startup agreement cover target0–42/draft43–45;
 all layers must share the same W4A8 or W8A8 layout. Native P loads the complete
 draft model. Target/draft Attention and the native speculative configuration
 remain eager. DSpark excludes DBO; see the
-[DSpark recipe](../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md).
+[DSpark recipe](../../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md).
 
 W8A8 reuses the loaded INT8 NZ weights, FP32 W13 scales and BF16 W2 scales.
 It needs no W4A8 compensation. The W2 binding requires per-layer bias entries,

@@ -9,8 +9,8 @@ Attention-to-Expert and Expert-to-Attention transfers:
 The 910C build also contains four experimental routed-only CAM operators:
 `afd_async_dispatch_send`, `afd_async_dispatch_recv`, `afd_async_combine_send`,
 and `afd_async_combine_recv`, under the same `torch.ops.afd_ascend` namespace.
-Their compact protocol and future connector migration are documented in
-[the routed-only operator guide](../../docs/npu/CAM_ASYNC_ROUTED_OPS.md).
+Their compact protocol is documented in
+[the routed-only operator guide](../../docs/design/npu/cam_async_routed_ops.md).
 
 The NPU native sources live in this directory:
 
@@ -177,17 +177,17 @@ paired vendor setup.
 
 ## Current Scope
 
-A2E/E2A continue to serve the existing CAMP2P connector. With Attention-side
-gating, `CAMAsyncAFDConnector` selects the four 910C routed-only CAM operators.
-The standalone FFN entry point reuses this same protocol and connector; see
+A2E/E2A serve `CAMP2pAFDConnector`. `CAMAsyncAFDConnector` uses the plugin's
+910C routed-only CAM operators; see the [operator contract](../../docs/design/npu/cam_async_routed_ops.md).
+The standalone FFN entry point reuses this protocol and connector; see
 [the standalone service guide](../../docs/npu/STANDALONE_FFN_SERVICE.md).
 
 `grouped_matmul_swiglu_quant_v2_layered` is a fused
 grouped-matmul + SiLU + dynamic-quantization CAM operator (A8W8 / A4W4 /
 A8W4-MSD variants) built for `ascend910_93`. It is registered as
 `torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered` (inference + Meta; no
-autograd grad) and is excluded from `ascend950` builds. The Async CAM layered
-W4A8 executor selects it with `AFD_ASYNC_CAM_LAYERED_GMM=1`.
+autograd grad) and is excluded from `ascend950` builds. The default Async CAM
+layered executor uses it for W4A8 and W8A8.
 
 The trailing `swiglu_limit` argument defaults to `0.0` (no clipping). A finite
 positive `L` computes `SiLU(min(gate, L)) * clamp(up, -L, L)` before output

@@ -42,7 +42,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-11-05
+last_reviewed: 2026-11-09
 ---
 
 # Connector contracts
@@ -95,8 +95,8 @@ which lets feature validation use the same connector-owned schema.
 
 ## Connector-owned configuration
 
-`additional_config["afd"]["connector_extra_config"]` is an envelope rather
-than an `AFDConfig` field. Unknown fields fail in the selected connector parser.
+`AFDConfig.connector_extra_config` stores the connector-specific mapping.
+Unknown fields fail in the selected connector parser.
 
 | Connector | Accepted connector-specific fields |
 | --- | --- |
@@ -312,7 +312,7 @@ metadata is present.
 | Connector | Connector-owned resources | Topology constraints and mapping |
 | --- | --- | --- |
 | CUDA P2P | AFD process group, PyNccl data communicators, separate NCCL metadata group, compiled custom-op communicator registry, and graph-oriented receive buffers/state. | Requires `A >= F`. One FFN rank is grouped with a consecutive block of Attention ranks in FFN-first ordering; the blocks differ in size by at most one, and hold `A/F` ranks each when `F` divides `A`. |
-| CUDA DeepEP M2N | AFD process group, a CPU bootstrap group for the handshake, the connector's NCCL control group, afdEP-comm transport buffers (one per lane), and compiled dispatch/combine kernels per bucket. | FFN-first ordering, any `A/F`, `num_experts % F == 0`, FFN TP 1. Across nodes every NVLink domain must hold an equal, contiguous block of world ranks. The startup handshake checks payload format, model shapes, lanes, network settings, SM90+, and the FFN expert deployment on every rank before buffers are allocated. |
+| CUDA DeepEP M2N | AFD process group, a CPU bootstrap group for the handshake, a CPU transport group when the physical rank order differs from the role order, the connector's NCCL control group, afdEP-comm transport buffers (one per lane), and compiled dispatch/combine kernels per bucket. | FFN-first role ordering, any `A/F`, `num_experts % F == 0`, FFN TP 1. Every NVLink domain must hold the same number of ranks, and either the FFN ranks fill the first domains (afdEP-comm FFN prefix) or every domain holds the same number of FFN ranks (afdEP-comm per-domain mode); the transport sees the ranks domain by domain, FFN first in each. The startup handshake checks payload format, model shapes, lanes, network settings, SM90+, and the FFN expert deployment on every rank before buffers are allocated. |
 | Ascend CAMP2P | AFD process group, one HCCL communication group per ubatch, FFN HCCL state, Gloo metadata group, custom-op state and transfer handles. | FFN-first ordering and `A >= F`; group construction derives each FFN/Attention mapping. |
 | Ascend CAM async | Attention-first HCCL group, plugin-owned routed-only CAM operator state, per-stage pending Attention payload queues, and connector work-item state. | Role ranks map into a combined Attention-first world; Compact metadata determines the actual layer and expert interval; counts.sum() gives this chunk’s routed token count. |
 

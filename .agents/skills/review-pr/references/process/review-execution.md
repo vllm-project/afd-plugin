@@ -147,11 +147,11 @@ paths have supported findings or explicit no-issue conclusions:
    author evidence. Gate cases must never be turned into skips to make a run
    pass.
 5. NPU paths have no in-repo CI. Require author-provided evidence per
-   `docs/npu/TESTING.md`, or a manually executed run the user explicitly asks
+   `tests/npu/README.md`, or a manually executed run the user explicitly asks
    for. Never simulate device evidence.
 6. When a pin moves, verify the coherent set: `TARGET_VLLM_VERSION` in
    `afd_plugin/compat/vllm.py`, the `vllm` extra in `pyproject.toml`,
-   `VLLM_BASE_TAG` and its assertion in `docker/Dockerfile.ci`, `README.md`,
+   `VLLM_BASE_TAG` and its assertion in `docker/Dockerfile.ci`, installation/support references,
    and every design page's `upstream_refs`.
 
 ## Deliver maintainer-style findings

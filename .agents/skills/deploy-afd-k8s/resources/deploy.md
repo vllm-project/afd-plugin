@@ -146,6 +146,13 @@ deploy_pod vllm-pod-attention-1 2 worker none "POD=ATTENTION_1 ATTENTION_HEADLES
 deploy_pod vllm-pod-ffn-0 2 none head "POD=FFN_0"
 ```
 
+`POD=AFD_<index>` recipe, e.g. the DeepEP M2N 2 x 4A1F plan (5 GPUs per pod):
+
+```bash
+deploy_pod vllm-pod-afd-0 5 head head "POD=AFD_0"
+deploy_pod vllm-pod-afd-1 5 worker worker "POD=AFD_1"
+```
+
 ## 4f. Wait for Running, then for each pod's Ready condition
 
 Bounded 15-minute wait per pod for `phase=Running` (unschedulable pods never
