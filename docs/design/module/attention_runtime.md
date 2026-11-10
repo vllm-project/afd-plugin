@@ -53,7 +53,7 @@ related_issues:
   - "#88"
   - "#105"
   - "#129"
-last_reviewed: 2026-10-13
+last_reviewed: 2026-11-09
 ---
 
 # Attention runtime
@@ -160,21 +160,20 @@ Both platforms require V2. The paired deployment constraints are:
 
 | Constraint | CUDA V2 | Ascend V2 synchronous | Ascend V2 Async CAM |
 | --- | --- | --- | --- |
-| Connector | Synchronous `P2pNcclAFDConnector` | Synchronous `CAMP2pAFDConnector` | `CAMAsyncAFDConnector`; `async=true` |
-| Gate placement | Model-specific; Qwen requires `compute_gate_on_attention=false` | `compute_gate_on_attention=false` | `compute_gate_on_attention=true` |
+| Connector | Synchronous `P2pNcclAFDConnector` or `DeepEPM2NAFDConnector` | Synchronous `CAMP2pAFDConnector` | `CAMAsyncAFDConnector`; `async_dp=true` |
+| Gate placement | P2P: model-specific, Qwen requires `false`; DeepEP M2N: `true` | `compute_gate_on_attention=false` | `compute_gate_on_attention=true` |
 | Parallelism | PP=PCP=DCP=1; configured role ranks equal DP x TP; static EP enabled | Same | Same; `attn_ranks_per_dp` equals Attention TP |
-| Excluded features | Elastic EP, EPLB, sequence-parallel MoE, and compile SP | Elastic EP and EPLB; model-specific SP restrictions | Elastic EP, EPLB, native draft models/MTP, finegrained TP, and shared-expert DP |
+| Excluded features | Elastic EP, EPLB, sequence-parallel MoE, and compile SP | Elastic EP and EPLB; model-specific SP restrictions | Elastic EP, EPLB, native draft models/MTP except DSV4 DSpark, finegrained TP, and explicit shared-expert DP |
 | Sequence parallelism | Unsupported | Model-specific; synchronous DeepSeek-V2/V3 SP is rejected | Attention-local FlashComm1/SP supported; disabled on FFN; no PCP/DCP |
 | Native DBO | Exactly two microbatches, Attention DP1 or DP > 1 | Eager or graph; exactly two microbatches, Attention DP > 1 | Eager only; exactly two microbatches at Attention DP1 or DP > 1 |
-| AFD async MoE ubatching | Not applicable | Not applicable | Legacy alias for native DBO; split selector is ignored |
 | Graph execution | Eager or `FULL_DECODE_ONLY` | Eager, `FULL`, or `FULL_DECODE_ONLY`; plain MLA graph DBO requires `FULL_DECODE_ONLY` | Eager Attention; independent FFN also supports the narrow W4A8/W8A8 FULL contract |
-| Model | Must resolve to a registered AFD architecture | Same | DeepSeek-V4 with layered W4A8/W8A8 FFN experts and `dynamicQuant=1` |
+| Model | Registered AFD architecture; DeepEP M2N is limited to Qwen3 MoE or DeepSeek-V2 | Registered AFD architecture | DeepSeek-V4 with layered W4A8/W8A8 FFN experts and `dynamicQuant=1` |
 
 Both roles validate the paired V2 topology, but only Attention uses the native
 V2 model runner. FFN remains connector-driven and uses its existing AFD runner
 surface. Qwen3.5/3.6 GDN DBO is unsupported; native hybrid/multimodal
 DBO validation applies. Qwen3 MoE DBO remains supported. See the
-[runtime matrix](execution_platforms.md#tested-runtime-matrix) for tested
+[runtime matrix](../../support.md#tested-runtime-matrix) for tested
 configurations and known shutdown limitations.
 The generic V2 E2E harness remains CUDA-only.
 
@@ -247,12 +246,9 @@ plugin-owned model code. These fields describe the current implementation;
 the open metadata issues prevent the object shape and live connector reference
 from becoming a long-term API.
 
-Ascend V1 creates pending AFD metadata while native Attention metadata is
-built and installs it immediately before model forward. V2 temporarily installs a
-provider at the native `ForwardContext` creation seam and attaches the same
-sidecar to the context created by the upstream runner. The shared metadata
-mixin supplies the ordinary single-stage and graph-control behavior. Ascend V1
-native ubatching still gives each child context stage-local metadata.
+The runner temporarily installs a provider at the native `ForwardContext`
+creation seam and attaches the sidecar to the upstream context. The shared
+metadata mixin supplies the single-stage and graph-control behavior.
 
 Ascend V2 Async CAM uses `NPUUBatchRunner` to adapt native DBO child inputs to
 Ascend attention builders. Native slicing, execution threads and output merge
@@ -325,24 +321,11 @@ hook. FlashComm1/SP is Attention-local and
 FFN topology validation is independent. See the CAM async user guide for the
 supported topology and environment matrix.
 
-CAM async requires eager execution. Its
-feature limits are recorded in the
-[platform matrix](execution_platforms.md#tested-runtime-matrix).
+CAM async requires eager Attention; FFN can use eager or FULL execution.
+Feature limits are recorded in the
+[platform matrix](../../support.md#tested-runtime-matrix).
 
 ## Ubatching and graph orchestration
-
-On Ascend V1, when native ubatching is enabled, AFD accepts exactly two
-ubatches. The Attention runner chooses or normalizes slices, creates
-stage-local AFD/DP metadata, and installs the platform wrapper during model
-load. The role-level contract is that control-plane side effects complete
-before replayable model work enters formal graph capture.
-
-During graph warmup/capture, the Attention runner marks control payloads so the
-FFN daemon can warm or capture the matching shape. A non-ubatched capture sends
-the control payload explicitly before formal capture; an ubatched capture lets
-the platform wrapper send the exact per-stage shape. CUDA Graph, ACL Graph,
-stream, and wrapper implementation details are owned by
-[execution platforms](execution_platforms.md).
 
 CUDA V2 accepts exactly two native microbatches with Attention DP1 or DP > 1.
 The CUDA-only [V4 compatibility patch](../../../afd_plugin/compat/patches/gpu_deepseek_v4_dbo.py)
@@ -401,21 +384,8 @@ the matching platform and connector tests as well.
 
 ## Limitations and open issues
 
-Current shared limits are the supported vLLM release and registered role-aware
-model integrations. Historical Ascend V1 accepted exactly two ubatches. V2
-requires static EP and no PP/CP. CUDA V2 requires a synchronous control-plane
-connector and supports the two-microbatch path above. Ascend V2 supports eager
-native DBO with exactly two microbatches: synchronous CAMP2P requires Attention
-DP > 1 and supports graph DBO; Async CAM supports eager Attention at DP1 or
-DP > 1. Hardware evidence remains limited to the recorded model and
-configuration cells; see the [0.32 record](https://github.com/vllm-project/afd-plugin/pull/507).
-Platform/connector limits are intentionally centralized in
-[execution platforms](execution_platforms.md#tested-runtime-matrix).
-
-Async CAM DBO has a Lite two-stage hardware accuracy result; broader coverage needs
-DP1/DP > 1, plain TP/model SP, uneven
-prefill lengths, and requests crossing a child boundary, with live two-child
-execution evidence and baseline output comparison.
+Platform/connector limits and hardware evidence are centralized in
+[support matrix](../../support.md#tested-runtime-matrix).
 
 This document does not decide the runtime refactor, connector metadata
 ownership, or transfer metadata/state shape. See

@@ -68,4 +68,4 @@ bash "${DSV4_SCRIPT_DIR}/run_prefill.sh"
 `attn_ranks_per_dp=A TP`，跨节点 local DP 分段不重叠。
 真实性能运行保持 `AFD_FORCE_BALANCED_TOPK_IDS=0`、`enable_force_eplb=false`，关闭 IO 调试日志。
 验证路径、数学语义和停止边界见 [验证](validation.md) 与
-[主线 FFN runtime](../../../../docs/npu/ASYNC_FFN_RUNTIME.md)。
+[主线 FFN runtime](../../../../docs/design/npu/async_ffn_runtime.md)。

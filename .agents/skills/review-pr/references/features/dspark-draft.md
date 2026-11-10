@@ -17,7 +17,7 @@ guide: `recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md`.
 DSpark is an Ascend-only draft model paired with a DeepSeek-V4 target under
 `CAMAsyncAFDConnector`. The attention role keeps native eager proposal; the FFN
 role may independently use layered eager or `FULL` graph execution. Supported
-combinations are enumerated in `execution_platforms.md`; everything else is
+combinations are listed in the [support matrix](../../../../../docs/support.md#tested-runtime-matrix); everything else is
 excluded rather than best-effort.
 
 ## Feature checks

@@ -8,7 +8,7 @@ must describe the exact target revision and the evidence actually collected.
 
 1. Evidence ledger
 2. Claim levels
-3. Root documentation
+3. Installation, support, and configuration
 4. GPU connector and runtime guides
 5. Recipes and launch scripts
 6. Design and contributor documentation
@@ -56,9 +56,9 @@ Do not turn CPU-only evidence into a GPU support claim. Do not describe an
 option as validated merely because it was accepted by the command line: confirm
 that logs, counters, traces, or execution behavior show the path was used.
 
-## 3. Root Documentation
+## 3. Installation, Support, and Configuration
 
-Review the root `README.md` and any linked installation page for:
+Review `docs/installation.md`, the [support matrix](../../../../docs/support.md#tested-runtime-matrix), and `docs/configuration.md` for:
 
 - the exact supported vLLM revision or range;
 - the target Python, PyTorch, CUDA, driver, compiler, and NCCL requirements;
@@ -66,8 +66,7 @@ Review the root `README.md` and any linked installation page for:
 - installation commands and package extras;
 - supported models, connectors, parallel modes, and execution modes;
 - CUDA Graph, DBO or uBatch, TP, profiling, and isolation support;
-- a minimal launch example with current arguments and environment variables;
-- links to current recipes, tests, design notes, and troubleshooting pages;
+- links from `README.md` and `docs/README.md` to current guides and recipes;
 - explicit unsupported or unvalidated combinations.
 
 Avoid broad phrases such as “GPU fully supported” when only selected models or
@@ -77,7 +76,7 @@ record.
 ## 4. GPU Connector and Runtime Guides
 
 Review `afd_plugin/connectors/README.md` first. Keep its connector status matrix
-consistent with the root README, GPU guide, recipes, design runtime matrix, and
+consistent with `docs/support.md`, GPU guides, recipes, and
 E2E evidence. State eager, CUDA Graph, DBO/uBatch, TP, asymmetric topology, and
 profiling evidence separately where their support differs.
 
@@ -126,7 +125,7 @@ appear related to the changed code:
 |---|---|
 | `docs/design/module/index.md` | target runtime, upstream refs, validation entry points, ownership, and links |
 | `docs/design/module/compatibility_and_patches.md` | exact patch symbols/signatures, reasons, tests, dispositions, and removal/upstream plans |
-| `docs/design/module/execution_platforms.md` | GPU worker/runner initialization, device selection, CUDA Graph, DBO/uBatch, profiling, and runtime matrix |
+| `docs/design/module/execution_platforms.md` | GPU worker/runner initialization, device selection, CUDA Graph, DBO/uBatch, and profiling |
 | `docs/design/module/connector_contracts.md` | NCCL/P2P configuration, payload/metadata ownership, ordering, topology, lifecycle, and cleanup |
 | `docs/design/module/attention_runtime.md` | Attention lifecycle, KV/scheduler ownership, forward context, connector handoff, graph, and ubatching |
 | `docs/design/module/ffn_runtime.md` | FFN daemon/EngineCore lifecycle, MoE execution, graph dispatch, failure propagation, and shutdown |
@@ -213,7 +212,7 @@ Classify each hit as one of:
 - generated and must be regenerated;
 - unrelated to the GPU upgrade.
 
-Then check that README, connector README, GPU guide, recipes, design modules,
+Then check that installation/support references, connector README, GPU guides, recipes, design modules,
 tests, CI, package/build metadata, contributor templates, and release notes
 agree on the same target identity, native-build status, and support scope.
 

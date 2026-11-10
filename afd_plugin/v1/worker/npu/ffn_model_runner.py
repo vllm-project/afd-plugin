@@ -284,7 +284,13 @@ class AFDNPUFFNModelRunner:
         # A model whose router is keyed by token identity declares that the FFN
         # role needs the tokens' ids. Resolve it once per forward, outside the
         # layer loop, so a per-layer re-read cannot drift within a step.
-        recv_input_ids = getattr(self.model, "afd_requires_input_ids", False)
+        # The wire slot carries one payload: either ids or Attention-side routing.
+        recv_routing = getattr(self.model, "afd_requires_attention_routing", False)
+        recv_input_ids = (
+            False
+            if recv_routing
+            else getattr(self.model, "afd_requires_input_ids", False)
+        )
 
         for layer_idx in _ffn_layer_indices(self):
             for stage_idx in stage_ids:
@@ -315,6 +321,7 @@ class AFDNPUFFNModelRunner:
                     layer_idx=layer_idx,
                     max_num_tokens=self.max_num_tokens,
                     recv_input_ids=recv_input_ids,
+                    recv_routing=recv_routing,
                 )
                 context = payload.context
                 metadata = context.metadata
@@ -337,9 +344,18 @@ class AFDNPUFFNModelRunner:
                     assert states, "Context.states must not be None"
                     _set_moe_layer_index(forward_context, layer_idx)
 
+                    # Only a model that declared Attention-side routing gets the
+                    # extra keywords. Passing them unconditionally changes the call
+                    # contract for every other model wrapper, including ones that
+                    # accept only (hidden_states, layer_idx).
+                    ffn_kwargs: dict[str, Any] = {}
+                    if recv_routing:
+                        ffn_kwargs["topk_ids"] = payload.topk_ids
+                        ffn_kwargs["topk_weights"] = payload.topk_weights
                     rank_ffn_output = self.model.compute_ffn_output(
                         hidden_states=hidden_states,
                         layer_idx=layer_idx,
+                        **ffn_kwargs,
                     )
                     _send_ffn_output(
                         self.connector,

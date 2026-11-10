@@ -20,4 +20,4 @@ and repeated window use. Tolerances are fixed in the script before execution.
 The retired non-layered checkpoint probe remains available on earlier
 revisions for a before/after comparison. Validate the current layered
 implementation using the numerical and real-model fixtures in the
-[NPU testing guide](../../../docs/npu/ASYNC_FFN_RUNTIME.md#validation).
+[NPU testing guide](../../../docs/design/npu/async_ffn_runtime.md#validation).

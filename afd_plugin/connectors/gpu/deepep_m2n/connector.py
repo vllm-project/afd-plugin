@@ -1203,6 +1203,12 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         _CONNECTORS.pop(self._op_id, None)
         for lane in self.lanes:
             lane.destroy()
+        if (
+            self.transport_group is not None
+            and self.transport_group is not self.bootstrap_group
+        ):
+            dist.destroy_process_group(self.transport_group)
+        self.transport_group = None
         self.lanes = []
         self.lane_streams = []
         self._pending_combines.clear()

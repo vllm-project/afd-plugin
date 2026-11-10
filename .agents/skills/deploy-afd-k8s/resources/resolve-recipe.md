@@ -89,6 +89,11 @@ For each entry, derive (used by [deploy.md](deploy.md) and
   which case `worker` if that line's `ATTENTION_HEADLESS` override is `1`,
   else `head`.
 - **`afd-ffn-node-role`**: symmetric, `none` unless `POD` starts with `FFN_`.
+- **`GPU_COUNT`**: the number of devices in the literal
+  `CUDA_VISIBLE_DEVICES=` of the `vllm serve` block this pod runs -- the one
+  inside the recipe's branch that tests `$POD` for this pod's role
+  (`ATTENTION` or `FFN`). Every pod sharing a role shares that literal, so
+  read it off the script; don't derive it from ranks or DP sizes.
 
 ### `LAYOUT` recipes: `POD=AFD_<index>`
 
@@ -103,7 +108,7 @@ entry `k` with `a` Attention and `f` FFN ranks:
 
 - **k8s Pod name**: `vllm-pod-afd-<k>`. A one-entry `LAYOUT` (the default
   `2A2F`) is a plain single pod: `vllm-pod`, no `POD` needed.
-- **GPU count**: `a + f`. The recipe computes `CUDA_VISIBLE_DEVICES` (FFN on
+- **`GPU_COUNT`**: `a + f`. The recipe computes `CUDA_VISIBLE_DEVICES` (FFN on
   the pod's first `f` GPUs), so there is no literal to read.
 - **`afd-attn-node-role`**: `none` when `a` is 0, `head` on the first entry
   with `a > 0`, `worker` on later ones. **`afd-ffn-node-role`**: the same
@@ -123,3 +128,18 @@ entry `k` with `a` Attention and `f` FFN ranks:
   FFN, `13345` Attention).
 - Whether the connector accepts the placement is checked at startup, not
   here; see the connector guide's supported layouts.
+
+## GPU_COUNT for a plain single-pod recipe
+
+The union of every literal `CUDA_VISIBLE_DEVICES=` in the script:
+
+```bash
+GPU_COUNT="$(grep -oE 'CUDA_VISIBLE_DEVICES=[0-9,]+' "$RECIPE_SCRIPT_PATH" \
+  | cut -d= -f2 | tr ',' '\n' | sort -u | wc -l)"
+```
+
+A one-entry `LAYOUT` recipe has no literal to read: its `GPU_COUNT` is
+`a + f` of that entry, as above.
+
+This step is the only place that parses the recipe:
+[deploy.md](deploy.md) uses the `GPU_COUNT` (and plan) recorded here as-is.

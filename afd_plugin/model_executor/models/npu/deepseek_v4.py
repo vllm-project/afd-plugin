@@ -24,7 +24,11 @@ from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.sequence import IntermediateTensors
 
-from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
+from afd_plugin.config import (
+    AFD_ASYNC_CONNECTOR,
+    CAMP2P_CONNECTOR,
+    parse_afd_config,
+)
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
     AFDTransferContext,
@@ -311,6 +315,72 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         return output
 
 
+class AFDDeepseekV4SyncAttentionGateRemoteMoE(AFDDeepseekV4AttentionGateRemoteMoE):
+    """DSV4 gate shell that keeps the router on Attention for the sync connector.
+
+    Inheritance is deliberate: the gate construction, the FP32 precast weight, the
+    hash-layer table and the shared-expert module are identical to the async shell,
+    and only the transport differs. Duplicating that construction would let the two
+    shells drift on routing parameters.
+
+    The forward differs in three ways, all forced by the sync contract:
+
+    - routing travels on the A2E wire slot instead of a CAM dispatch payload, so the
+      send and the receive are separate calls;
+    - the shared experts run *between* those calls, which is the whole point of
+      moving them here: their work overlaps the FFN side's routed work;
+    - no DBO yield, because the first prototype keeps the sync path free of the
+      scheduling interaction the async shell needs.
+
+    Reusing ``RemoteFFNProxy._send_and_receive`` is not possible here: it issues the
+    send and the receive back to back, leaving no window for the shared experts.
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        hidden_states_fp32: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        from afd_plugin.model_executor.models.npu import deepseek_v4_attention_gate
+
+        topk_weights, topk_ids = deepseek_v4_attention_gate.compute_attention_gate_topk(
+            self,
+            hidden_states,
+            input_ids=input_ids,
+            hidden_states_fp32=hidden_states_fp32,
+        )
+        afd_metadata = get_afd_metadata_from_forward_context()
+        if afd_metadata is None:
+            raise RuntimeError("Sync Attention-side gate requires AFD forward metadata")
+        context = AFDTransferContext(
+            metadata=AFDTransferMetadata.create_attention_metadata(
+                layer_idx=self.layer_idx,
+                stage_idx=afd_metadata.stage_idx,
+                seq_len=int(hidden_states.shape[0]),
+            )
+        )
+        # Routing shares the wire slot with token ids, so this send carries routing
+        # only. The FFN side is configured with recv_routing for the same reason.
+        afd_metadata.connector.send_attn_output(
+            hidden_states,
+            context,
+            routing=(topk_ids, topk_weights),
+        )
+        shared_output = (
+            self.shared_experts(hidden_states)
+            if self.shared_experts is not None
+            else None
+        )
+        output = afd_metadata.connector.recv_ffn_output(
+            ref_tensor=hidden_states,
+            ubatch_idx=afd_metadata.stage_idx,
+        )
+        if shared_output is not None:
+            output = output + shared_output
+        return output
+
+
 class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
     """Role-local DSV4 decoder layer.
 
@@ -347,6 +417,13 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         self.config = config
         self.afd_role = afd_config.role
         self.compute_gate_on_attention = bool(afd_config.compute_gate_on_attention)
+        # Which wire protocol this layer expects, decided from the configuration.
+        # The payload only validates that expectation; it must not pick the path,
+        # because a missing or mixed payload would otherwise silently reroute.
+        self.uses_external_routing = bool(
+            afd_config.compute_gate_on_attention
+            and afd_config.connector == CAMP2P_CONNECTOR
+        )
         self.is_moe_layer = True
         # ### PATCH END: AFD decoder metadata
         cache_config = vllm_config.cache_config
@@ -397,7 +474,14 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 need_gather_q_kv=self.use_sequence_parallel_moe and self.enable_dsa_cp,
             )
             if self.compute_gate_on_attention:
-                self.mlp = AFDDeepseekV4AttentionGateRemoteMoE(
+                # Both shells keep the router on Attention; only the transport
+                # differs. Choosing by connector keeps the async CAM path unchanged.
+                gate_shell = (
+                    AFDDeepseekV4AttentionGateRemoteMoE
+                    if afd_config.connector == AFD_ASYNC_CONNECTOR
+                    else AFDDeepseekV4SyncAttentionGateRemoteMoE
+                )
+                self.mlp = gate_shell(
                     config=config,
                     layer_idx=self.layer_idx,
                     prefix=f"{prefix}.mlp",
@@ -410,7 +494,10 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             self.self_attn = native.PPMissingLayer()
             _refresh_ascend_fused_moe()
             moe_config = config
-            if afd_config.connector == AFD_ASYNC_CONNECTOR:
+            if self.compute_gate_on_attention:
+                # The shared experts live wherever the router lives, because they
+                # run in the same window as the gate. That is true for either
+                # connector, not just for the async one.
                 moe_config = copy(config)
                 # HF validates this public field as int, but pinned native
                 # MoE uses only None to omit shared construction (0 builds a
@@ -427,6 +514,23 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             raise ValueError(f"Unsupported AFD role: {afd_config.role!r}")
 
         # ### PATCH END: role-local Attention and remote experts
+        # The external-routing component is built here, while a vLLM config context
+        # exists, so the first forward onto MC2 never constructs a comm.
+        self.afd_external_routing_moe = None
+        # Synchronous external routing only: the async CAM connector keeps its own
+        # FFN path, even though it also computes the gate on the Attention side.
+        if (
+            self.uses_external_routing
+            and afd_config.role == _FFN_ROLE
+            and isinstance(self.mlp, native.DeepseekV4MoE)
+        ):
+            from afd_plugin.model_executor.models.npu import (
+                deepseek_v4_external_routing_moe as external_routing_moe,
+            )
+
+            self.afd_external_routing_moe = external_routing_moe.AFDExternalRoutingMoE(
+                self.mlp.experts.routed_experts,
+            )
 
         self.input_layernorm = native.RMSNorm(config.hidden_size, eps=self.norm_eps)
         self.post_attention_layernorm = native.RMSNorm(
@@ -448,16 +552,89 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
     def compute_ffn_output(
         self,
         hidden_states: torch.Tensor,
+        *,
+        group_list: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        topk_weights: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor:
         if not isinstance(self.mlp, native.DeepseekV4MoE):
             raise RuntimeError(
                 "DSV4 compute_ffn_output requires the FFN role to own the MoE"
             )
+        # The configuration decides which protocol this layer speaks; the payload
+        # only has to satisfy it. Letting the payload choose would turn a missing or
+        # mixed payload into a silent reroute to a different computation.
+        routing_payload_present = topk_ids is not None or topk_weights is not None
+
+        if self.uses_external_routing:
+            # CAM dispatch data belongs to the async connector. Keep rejecting it
+            # instead of letting ``**_`` absorb it silently: a layer speaks one
+            # protocol, and a mixed payload would otherwise run half-initialized.
+            if group_list is not None:
+                raise RuntimeError(
+                    "DSV4 sync external routing received CAM dispatch data as well; "
+                    "a layer speaks one protocol",
+                )
+            if topk_ids is None or topk_weights is None:
+                raise RuntimeError(
+                    "DSV4 sync external routing requires both topk_ids and "
+                    f"topk_weights; got ids={topk_ids is not None}, "
+                    f"weights={topk_weights is not None}",
+                )
+            return self._compute_external_routing_ffn(
+                hidden_states,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+            )
+
+        # The async CAM FFN runs through the layered executor upstream; this method
+        # only serves the synchronous external-routing path and the target-hash MoE.
         if self.compute_gate_on_attention:
             raise RuntimeError("Async CAM FFN requires the layered executor")
+        if routing_payload_present:
+            raise RuntimeError(
+                "DSV4 gate-on-FFN received Attention-side routing; the FFN side owns "
+                "the gate for this configuration and must compute it itself",
+            )
         # Target Hash MoE takes explicit token IDs from the CAM transfer.
         return self.mlp(hidden_states, input_ids=get_forward_context().input_ids)
+
+    def _compute_external_routing_ffn(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the FFN on routing the Attention side computed.
+
+        Mirrors ``AscendRoutedExperts.forward`` from the pinned vLLM-Ascend tag, with
+        two differences: the top-k comes from the transport instead of a local gate,
+        and both the padding/gathering of the routing and the scale it carries are
+        supplied by the AFD prepare stage.
+
+        Routed scaling needs no separate step here. The Attention-side selector folds
+        ``routed_scaling_factor`` into ``topk_weights``, and ``apply`` consumes those
+        weights directly in the token combine, so the factor is applied exactly once.
+        Applying it again here would scale the routed output a second time.
+
+        Both ALLGATHER and MC2 are wired. They share this flow because both AFD prepare
+        implementations pad the routing, and MC2's additionally splits it for the TP
+        sharding before returning the aligned routing. What differs is only whether
+        finalize reduces across ranks.
+
+        Any other communication method is rejected rather than silently taking one of
+        these routes.
+        """
+
+        component = self.afd_external_routing_moe
+        assert component is not None, "external routing component was not built at init"
+        return component.forward(
+            hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
 
 
 @native.support_torch_compile
@@ -662,7 +839,8 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
         raise NotImplementedError(
-            "DSV4 AFD does not support compute_gate_on_attention yet"
+            "DSV4 AFD never returns gate outputs through this method; the "
+            "Attention-side gate keeps its top-k inside the gate shell"
         )
 
 
@@ -676,9 +854,20 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
     # installs them in the forward context before the FFN compute.
     afd_requires_input_ids = True
 
+    # The wire slot carries either token ids or Attention-side routing, never both.
+    # When the router lives on Attention with the sync connector, the FFN side needs
+    # the routing instead of the ids, and the runner must ask for it by name.
+    afd_requires_attention_routing = False
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         self.afd_config = parse_afd_config(vllm_config, validate=False)
         self.afd_role = self.afd_config.role
+        # Per-instance, because the same model class serves both connectors and the
+        # async CAM shell carries its routing inside its own dispatch payload.
+        self.afd_requires_attention_routing = bool(
+            self.afd_config.compute_gate_on_attention
+            and self.afd_config.connector == CAMP2P_CONNECTOR
+        )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
     # vLLM 5df63a7 model_loader/utils.py invokes this model hook after quant
@@ -733,11 +922,14 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Only the gate-on-Attention configuration gives Attention a router; with
         # the gate on FFN its MoE slot is a parameter-free transfer shell.
+        # The shared experts follow the router, so their weights load on Attention
+        # for either connector; keying this on the async connector alone would
+        # construct the modules on the sync path without ever loading them.
         role_weights = _iter_role_weights(
             weights,
             role=self.afd_role,
             attn_owns_gate=bool(self.afd_config.compute_gate_on_attention),
-            attention_shared_experts=self.afd_config.connector == AFD_ASYNC_CONNECTOR,
+            attention_shared_experts=bool(self.afd_config.compute_gate_on_attention),
         )
         loaded = super().load_weights(role_weights)
         return loaded

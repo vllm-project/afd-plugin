@@ -51,7 +51,7 @@ verified_platform_refs:
   - "CUDA Qwen3 MoE"
   - "CUDA Qwen3.6 MoE"
 related_issues: []
-last_reviewed: 2026-10-13
+last_reviewed: 2026-11-09
 ---
 
 # E2E testing

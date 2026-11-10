@@ -36,7 +36,7 @@ snapshot, under `src/comm_operator/ascend_kernels/`. The integration renames
 operator symbols and shared headers for AFD isolation while preserving the
 compact routed-only communication layout.
 The complete upstream MIT copyright and permission notice is retained in
-[the repository license](../../LICENSE) and included in package license data.
+[the repository license](../../../LICENSE) and included in package license data.
 
 ## Communication window configuration
 
@@ -70,7 +70,7 @@ the extension CMake configuration (`AFD_SOC_VERSION`).
 `AFD_SKIP_ACLNN_BUILD=1` requires an existing, matching AFD vendor package
 with all four async ACLNN symbols. Rebuild the complete operator package after
 changing its source or SOC. Use the dependency stack in the
-[installation guide](../../README.md#ascend-npu-installation).
+[installation guide](../../installation.md#ascend-npu-installation).
 
 Load the package using the lazy loader before accessing the
 operators:
@@ -230,7 +230,7 @@ unused cells and reuses a destination base while its TP peer remains unchanged.
 These changes preserve the compact protocol and do not add concurrent windows
 or remove empty-expert completion notifications.
 
-Use [the standalone precision and performance harness](../../tests/npu/README.md)
+Use [the standalone precision and performance harness](../../../tests/npu/README.md)
 to compare identical routing, TP width, window size, dtype, quantization and
 chunk capacity before claiming a speedup. A source optimization alone is not
 performance evidence; include sparse/empty peers and repeated window reuse.

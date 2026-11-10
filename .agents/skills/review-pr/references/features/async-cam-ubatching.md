@@ -7,7 +7,7 @@ interplay, the layered GMM executor, and the DSV3.2/DSV4 async CAM forward
 modules under `afd_plugin/model_executor/models/npu/`.
 
 Designs: `docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md`,
-`docs/npu/ASYNC_FFN_RUNTIME.md`, `docs/npu/CAM_ASYNC_ROUTED_OPS.md`,
+`docs/design/npu/async_ffn_runtime.md`, `docs/design/npu/cam_async_routed_ops.md`,
 `docs/design/module/connector_contracts.md`,
 `docs/design/module/ffn_runtime.md`.
 
@@ -51,5 +51,5 @@ Designs: `docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md`,
   a regression.
 
 Name the NPU evidence (who ran what, on which environment per
-`docs/npu/TESTING.md`) for any behavioral claim; CPU tests cover planning and
+`tests/npu/README.md`) for any behavioral claim; CPU tests cover planning and
 state transitions only.

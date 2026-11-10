@@ -1,7 +1,7 @@
-# Ascend 910C operator tests
+# NPU validation
 
-Standalone harnesses, dispatcher checks, and opt-in device tests for the Ascend
-operators this plugin owns. Device tests run outside CI; CPU harness checks also
+Runtime checks, standalone operator harnesses, and opt-in Ascend device tests.
+Device tests run outside CI; CPU harness checks also
 run in the PR and merge unit-test jobs. Each entry states whether it needs a
 device, a multi-rank launch, or only a host Python environment.
 
@@ -36,14 +36,12 @@ connector, model weights, or shared-expert tensors.
 The second group covers the layered routed-expert operators,
 `gmm_swiglu_quant_v2_layered` (W13) and `grouped_matmul_layered` (W2), which
 select their layer on device from a `layer_index` input. Those are the operators
-`AsyncCAMLayeredExecutor` drives, and their `all_*` lists hold one element per layer
-rather than one per expert. Their validation entry points are in
-[docs/npu/TESTING.md](../../docs/npu/TESTING.md), and the two precision suites
-are described under [Layered operator precision](#layered-operator-precision)
-below.
+`AsyncCAMLayeredExecutor` drives; their `all_*` lists hold one element per layer
+rather than one per expert. See
+[layered operator precision](#layered-operator-precision).
 
 The async CAM harness implements the AFD schemas documented in
-[CAM_ASYNC_ROUTED_OPS.md](../../docs/npu/CAM_ASYNC_ROUTED_OPS.md). The input
+[routed CAM operator contract](../../docs/design/npu/cam_async_routed_ops.md). The input
 values, route table, quantization result, and weighted sum are all produced
 inside this repository from the raw inputs; the harness depends on no external
 reference directory at runtime.
@@ -53,6 +51,66 @@ live beside them here, so maintaining a benchmark does not expand the production
 unit-test suite. The three 910C dispatcher modules share the optional
 `ascend_ops_runtime` fixture in `conftest.py`; requesting it loads the compiled
 extension, while collection and host-only tests stay independent of torch-npu.
+
+## Runtime contract checks
+
+Use the pinned [Ascend stack](../../docs/installation.md#ascend-npu-installation).
+From the repository root:
+
+```bash
+python3 -m pytest -q -ra tests/unit -m "not gpu and not vllm_runtime"
+```
+
+Run in the matching runtime environment to exercise NPU-dependent tests;
+CPU-only skips do not establish runtime correctness. `tests/conftest.py` owns
+the required vLLM-Ascend import order. A test that passes alone but fails with
+the full suite may indicate leaked module or monkeypatch state.
+
+## Native DBO contracts and device execution
+
+Run the focused contract checks in the matching runtime environment:
+
+```bash
+python3 -m pytest -q -ra \
+  tests/unit/compat/npu/test_runtime_config.py \
+  tests/unit/config/test_validation.py \
+  tests/unit/model_executor/test_async_cam_dbo.py \
+  tests/unit/model_executor/test_async_cam_layout.py \
+  tests/unit/v1/worker/test_npu_model_runner_v2.py \
+  tests/unit/v1/worker/test_npu_ubatch_outputs.py \
+  tests/unit/v1/worker/test_npu_mla_graph.py
+```
+
+The single-device executor test uses real NPU streams/events with isolated
+subprocesses for failure injection:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 python3 -m pytest -q -ra tests/npu/test_mrv2_dbo.py
+```
+
+It checks native child handoff, stream/context restoration and peer failure
+wakeup. It does not validate CAMP2P/CAM transport, checkpoint output, or model
+accuracy. For broader qualification, run model comparisons at
+Attention DP1 and DP > 1, plain TP and model SP, with
+uneven prefill lengths and requests crossing child boundaries. Enable DBO on
+Attention only. Keep two ubatches and eager execution.
+
+For synchronous MRV2 CAMP2P, include eager two-stage execution at Attention
+DP > 1, many-to-one padding, and graph+DBO. Plain MLA graph+DBO requires
+`FULL_DECODE_ONLY`. Both existing Lite graph+DBO cases must report completed
+joint two-stage replays during real requests on every participating A/F rank.
+Dummy/profile/capture or padded-only stages do not qualify that gate.
+`tests/npu/test_mrv2_graph_inputs.py` separately checks persistent input
+addresses with real NPU graph reads and modeled builders; model correctness
+still belongs to E2E. Record execution, response correctness, revisions and
+teardown outcomes separately.
+
+The original DSV4 Async concurrent case keeps native DBO thresholds. Its ten
+short prompts can remain unsplit while satisfying its exact-answer, `stop`,
+overlap and physical-cleanup checks; graceful exit failed in the recorded run.
+DSV4 DSA two-stage qualification remains deferred. Qualify it separately
+with an above-threshold workload, retaining native defaults and requiring
+completed nonempty stages on every Attention rank.
 
 ## Python-only validation
 
@@ -215,16 +273,40 @@ execution, and concurrent layers require separate hardware qualification.
 
 ### Layered operator precision
 
-Two suites cover the layered routed-expert operators. Both are pytest modules
-gated on `AFD_RUN_ASCEND_OP_RUNTIME=1`, both need one device, and neither
-performs any collective.
+The W4A8/W8A8 executor chains and the W13/W2 precision suites each use one
+device and no collective. Run the CPU contracts first, then rebuild the matching
+extension/vendor library and run the device checks:
+
+```bash
+pytest -q tests/unit/test_envs.py tests/unit/model_executor/test_async_cam_layered.py
+SOC_VERSION=910c pytest -q tests/npu/test_gmm_layered.py \
+  tests/npu/test_gmm_swiglu_quant_v2_layered.py
+```
 
 ```bash
 SOC_VERSION=910c AFD_RUN_ASCEND_OP_RUNTIME=1 LOCAL_RANK=0 \
   pytest -o addopts= -v -ra -s \
+  tests/npu/test_async_cam_layered_w4a8.py \
+  tests/npu/test_async_cam_layered_w8a8.py \
   tests/npu/test_gmm_swiglu_quant_v2_layered_precision.py \
   tests/npu/test_gmm_layered_device_group_list.py
 ```
+
+The W4A8 chain compares valid rows with an FP32 reference across distinct
+nonzero weights/compensation, per-channel/per-group scales, interleaved layer
+IDs, empty/uneven/full expert counts and poisoned capacity tails. Positive
+clipping limits use exactly representable matmuls to avoid FP16 cancellation;
+zero-limit cases retain the random reference, with the same tolerance.
+The W8A8 chain compares native operators and exact eager/FULL replay.
+These operator checks do not establish distributed completion or checkpoint
+accuracy; use the [model E2E guide](../e2e/README.md) for those gates.
+
+Checkpoint comparisons must hold the checkpoint and deployment settings fixed.
+Record parameter shapes/dtypes/formats, versions, startup path, accuracy, peak
+memory and traces. Cover empty ranks, multi-chunk layers, interleaved DP work
+and async ubatching. Check for layer-ID/count metadata D2H between receive and
+send; measure group synchronization separately. Performance claims require a
+controlled A/B comparison. A skipped device check establishes no qualification.
 
 `test_gmm_swiglu_quant_v2_layered_precision.py` collects 11 cases against W13.
 It covers A8W8 and A8W4, and it needs two reference strategies because only one
@@ -436,10 +518,9 @@ Device cleanup after failure still requires validation on the target stack.
 ## check_routing_boundary_reuse.py
 
 Device check for the opaque routing-id boundary. Requires an Ascend host with the pinned stack
-(`vllm`, `vllm-ascend`). Run it directly:
+(`vllm`, `vllm-ascend`). Run from the repository root:
 
 ```bash
-cd <repo root>
 python tests/npu/check_routing_boundary_reuse.py
 ```
 

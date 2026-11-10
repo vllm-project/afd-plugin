@@ -3,7 +3,7 @@
 End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
 (Attention-FFN Disaggregation) plugin targeting vLLM `v0.32.0`. These are
 deployment examples, not v0.32 recipe validation. See the
-[runtime matrix](../../../../docs/design/module/execution_platforms.md#tested-runtime-matrix)
+[runtime matrix](../../../../docs/support.md#tested-runtime-matrix)
 for tested E2E configurations.
 
 > [!NOTE]

@@ -48,7 +48,7 @@ never from this skill and never from memory:
 - `docs/design/module/index.md` — `upstream_refs` (vLLM commit and vLLM-Ascend
   commit) and `last_reviewed`.
 - `pyproject.toml` optional `vllm` extra, `docker/Dockerfile.ci`
-  (`VLLM_BASE_TAG` plus its version assertion), and `README.md`'s supported
+  (`VLLM_BASE_TAG` plus its version assertion), and `docs/installation.md`'s
   runtime table.
 
 The values quoted in this skill are the `main` values as of its last refresh

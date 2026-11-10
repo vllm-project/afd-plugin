@@ -3,8 +3,8 @@
 此 skill 的命令和配置已迁移到固定 0.30 源码契约，硬件资格按具体运行记录认定。
 AFD 原始模型、DBO 和 FFN FULL 的已有证据入口为
 [PR #462](https://github.com/vllm-project/afd-plugin/pull/462)、
-[原生 DBO](../../../../docs/npu/TESTING.md#native-dbo-contracts-and-device-execution) 和
-[FFN FULL](../../../../docs/npu/ASYNC_FFN_RUNTIME.md#validation)。
+[原生 DBO](../../../../tests/npu/README.md#native-dbo-contracts-and-device-execution) 和
+[FFN FULL](../../../../docs/design/npu/async_ffn_runtime.md#validation)。
 PR 中复用的旧运行、维护者确认和新运行各有范围，不能改写为本次 skill 的新硬件结果。
 
 ## 按任务选择覆盖

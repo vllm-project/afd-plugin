@@ -64,7 +64,7 @@ decoding. The pair requires static EP, PP=PCP=DCP=1, and each
 role's ranks equal to DP x TP. Sequence parallelism follows the model
 contract; synchronous DeepSeek-V2/V3 rejects effective model SP. Native MRV2
 owns request slicing, capture, graph selection, replay and output merge.
-AFD supplies stage-specific Ascend metadata and CAMP2P control/communication. The [NPU testing guide](TESTING.md) separates executor
+AFD supplies stage-specific Ascend metadata and CAMP2P control/communication. The [NPU testing guide](../../tests/npu/README.md) separates executor
 checks from model correctness evidence.
 
 DBO is configured with vLLM CLI flags, not inside the `afd` object:
@@ -132,27 +132,10 @@ Pass AFD configuration through vLLM's `--additional-config` option under the
 }
 ```
 
-### Fields
-
-| Field | Type | Default | Meaning and constraints |
-| --- | --- | --- | --- |
-| `role` | `"attention" \| "ffn"` | `"attention"` | Role owned by this process. |
-| `connector` | `str` | `"P2pNcclAFDConnector"` | Set to `CAMP2pAFDConnector` for this synchronous NPU path. |
-| `host` | `str` | `"127.0.0.1"` | Non-empty rendezvous host shared by every rank. It must be reachable from all participating processes. If the Attention and FFN ranks run on different machines, set this field to the FFN machine's reachable IP address. |
-| `port` | `int` | `1239` | AFD rendezvous port in `1..65535`. It is separate from the vLLM HTTP service ports. |
-| `afd_process_group_timeout_s` | `int` | `120` | Positive AFD group rendezvous timeout in seconds; also used by the native NPU DBO startup barrier. It does not bound a polling device kernel. |
-| `num_attention_ranks` | `int` | `1` | Total number of Attention worker ranks. Must be positive. |
-| `num_ffn_ranks` | `int` | `1` | Total number of FFN worker ranks. Must be positive. |
-| `compute_gate_on_attention` | `bool` | `false` | Controls whether the MoE gate is computed on the Attention side or the FFN side. Currently only `false` is supported. |
-| `connector_extra_config` | `dict` | `{}` | CAMP2P-specific settings such as role-specific core counts and `quant_mode`. Unknown fields are rejected. |
-| `async` / `async_dp` | `bool` | `false` | Must remain `false` for the current synchronous; Ascend async mode requires `CAMAsyncAFDConnector`. |
-
-Compatibility aliases are accepted for `afd_role`, `afd_connector`,
-`afd_host`, `afd_port`.
-
-The connector factory derives each process's role rank from its global DP rank
-and local PCP/TP coordinates before connector construction. Do not configure a
-role rank.
+Use the [common configuration reference](../configuration.md) for defaults
+and aliases. CAMP2P requires `async_dp=false`; `compute_gate_on_attention` may be `true` on
+both roles for DeepSeek-V4 at TP=1 without DBO or ubatching. For multi-machine placement, use
+the FFN machine's reachable IP as `host`.
 
 ### CAMP2P `connector_extra_config`
 
@@ -161,7 +144,7 @@ role rank.
 | `core_num` | `int` | `8` | Positive default AIV core count for both roles. |
 | `attn_core_num` / `ffn_core_num` | `int` | unset | Positive role-specific override for `core_num`. |
 | `quant_mode` | `int` | `0` | CAM quantization mode. The current runtime supports only `0`. |
-| `compute_gate_on_attention` | `bool` | `false` | Connector-local operator option; must remain `false`, as must the common AFD field. |
+| `compute_gate_on_attention` | `bool` | `false` | Kept for backwards compatibility with older configurations and ignored for routing placement: transport derives the gate from the payload it actually carries. Omit it when deploying and set the common `afd.compute_gate_on_attention` field instead. |
 | `hccl_buffer_size` | `int` | unset | Positive CAMP2P HCCL buffer size in MB. The override applies to every connector-owned `afd*` communication domain and the FFN-side `afd_moe` domain; the Gloo control group is unaffected. When unset, HCCL uses `HCCL_BUFFSIZE`, then its built-in default. Use the same value on all members of each HCCL domain. |
 
 The per-domain setting avoids increasing buffers for unrelated TP, DP, or EP
@@ -250,6 +233,80 @@ vllm serve /path/to/model \
     }
   }'
 ```
+
+## Single-node `4A4F` synchronous gate-on-Attention example (DeepSeek-V4, TP=1)
+
+This is the supported Attention-side gate deployment: synchronous CAMP2P, DeepSeek-V4, TP=1,
+BF16 transport (`quant_mode: 0`), no DBO and no ubatching, four Attention ranks on devices `0-3`
+and four FFN ranks on devices `4-7`.
+
+Set `afd.compute_gate_on_attention` to `true` on **both** roles and leave the connector-local
+`compute_gate_on_attention` key out of `connector_extra_config`; that key is kept for backwards
+compatibility with older configurations and does not control routing.
+
+The FFN service uses devices `4,5,6,7` and starts first:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 VLLM_PLUGINS=ascend,afd VLLM_USE_V2_MODEL_RUNNER=1 \
+vllm serve /path/to/DeepSeek-V4 \
+  --host 127.0.0.1 \
+  --port 18010 \
+  --data-parallel-size 4 \
+  --tensor-parallel-size 1 \
+  --enable-expert-parallel \
+  --enforce-eager \
+  --max-model-len 9216 \
+  --max-num-seqs 128 \
+  --max-num-batched-tokens 3072 \
+  --additional-config '{
+    "afd": {
+      "role": "ffn",
+      "connector": "CAMP2pAFDConnector",
+      "host": "127.0.0.1",
+      "port": 6239,
+      "num_attention_ranks": 4,
+      "num_ffn_ranks": 4,
+      "compute_gate_on_attention": true,
+      "connector_extra_config": {
+        "quant_mode": 0
+      }
+    }
+  }'
+```
+
+The Attention service uses devices `0,1,2,3`:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 VLLM_PLUGINS=ascend,afd VLLM_USE_V2_MODEL_RUNNER=1 \
+vllm serve /path/to/DeepSeek-V4 \
+  --host 127.0.0.1 \
+  --port 18000 \
+  --data-parallel-size 4 \
+  --tensor-parallel-size 1 \
+  --enable-expert-parallel \
+  --enforce-eager \
+  --max-model-len 9216 \
+  --max-num-seqs 128 \
+  --max-num-batched-tokens 3072 \
+  --additional-config '{
+    "afd": {
+      "role": "attention",
+      "connector": "CAMP2pAFDConnector",
+      "host": "127.0.0.1",
+      "port": 6239,
+      "num_attention_ranks": 4,
+      "num_ffn_ranks": 4,
+      "compute_gate_on_attention": true,
+      "connector_extra_config": {
+        "quant_mode": 0
+      }
+    }
+  }'
+```
+
+Drop `--enforce-eager` and add `--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [8, 16, 32, 64, 128]}'` to run the same pair with ACL graphs.
+The configuration is rejected when `compute_gate_on_attention=true` is combined with DBO,
+ubatching, TP > 1, a connector other than `CAMP2pAFDConnector`, or a target other than DeepSeek-V4.
 
 For model-specific launch and validation cases, see the
 [E2E guide](../../tests/e2e/README.md).
