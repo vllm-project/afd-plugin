@@ -33,33 +33,19 @@ spec:
         - -c
         - |
           set -euo pipefail
-          RECIPE_SCRIPT=/recipe/recipe.sh
-          mkdir -p /work/bin
-          # Recipes only ever call `uv run <cmd>`; drop the `run` and exec
-          # the rest directly instead of invoking uv at all.
-          printf '#!/bin/bash\nshift\nexec "$@"\n' > /work/bin/uv
-          chmod +x /work/bin/uv
-          export PATH="/work/bin:$PATH"
+          echo "=== launching recipe.sh (POD=${POD:-<none>} attn=${AFD_ATTN_NODE_ROLE} ffn=${AFD_FFN_NODE_ROLE}) ==="
 
-          echo "=== launching $(basename "$RECIPE_SCRIPT") (POD=${POD:-<none>} attn=${AFD_ATTN_NODE_ROLE} ffn=${AFD_FFN_NODE_ROLE}) ==="
-
-          # Rebind the client-facing port off loopback: every `--host
-          # 127.0.0.1` on the branch is an API-server flag (the recipe binds
-          # :${TEMPLATE_CLIENT_PORT} on 127.0.0.1), but the Service needs
-          # 0.0.0.0.
-          RECIPE_BASENAME="$(basename "$RECIPE_SCRIPT" .sh)"
-          PATCHED_SCRIPT="/work/${RECIPE_BASENAME}.patched.sh"
-          sed 's/--host 127\.0\.0\.1/--host 0.0.0.0/' "$RECIPE_SCRIPT" > "$PATCHED_SCRIPT"
-
+          # The recipe sources the launcher from AFD_RECIPE_LIB and binds its
+          # API server to SERVE_HOST (0.0.0.0, so the Service can reach it).
           cd /work
-          bash "$PATCHED_SCRIPT" &
+          bash /recipe/recipe.sh &
           RECIPE_PID=$!
           echo "$RECIPE_PID" > /work/recipe.pid
 
           # Which log(s) this pod will actually produce, and this pod's own
           # readiness marker per log -- both keyed on this pod's node-role
           # labels, not re-derived from $POD. Fixed to the attn.log/ffn.log
-          # names every colocation recipe uses today.
+          # names of the colocation launcher.
           LOGS=""
           [ "$AFD_ATTN_NODE_ROLE" != "none" ] && LOGS="$LOGS attn.log"
           [ "$AFD_FFN_NODE_ROLE" != "none" ] && LOGS="$LOGS ffn.log"
@@ -148,6 +134,10 @@ spec:
           value: "${TEMPLATE_ATTN_ROLE}"
         - name: AFD_FFN_NODE_ROLE
           value: "${TEMPLATE_FFN_ROLE}"
+        - name: AFD_RECIPE_LIB
+          value: "/recipe/afd_colocation.sh"
+        - name: SERVE_HOST
+          value: "0.0.0.0"
         # ${TEMPLATE_EXTRA_ENV}
         - name: HF_TOKEN
           valueFrom:

@@ -3,11 +3,8 @@
 ## 2. GPU_COUNT
 
 Use the `GPU_COUNT` recorded by [resolve-recipe.md](resolve-recipe.md) --
-one value for a plain recipe, one per plan entry. Don't re-read the script
-here; all recipe parsing lives in step 1.
-
-`LAYOUT` recipes (see [resolve-recipe.md](resolve-recipe.md)): each entry's
-GPU count is its `a + f`:
+`a + f` per `LAYOUT` entry. Don't re-read the script here; all recipe
+parsing lives in step 1:
 
 ```bash
 LAYOUT=${LAYOUT:-$(grep -oE 'LAYOUT:-[0-9AF,]+' "$RECIPE_SCRIPT_PATH" | cut -d- -f2)}
@@ -28,7 +25,7 @@ existing Pod(s)** with the same name(s) about to be deployed.
 AFD_PLUGIN_IMAGE=<image>
 MODEL_ID=<model-id>
 PVC_NAME=<pvc-name>
-CLIENT_PORT=<n>   # from the script's --port; default 18305
+CLIENT_PORT=<n>   # the launcher's ATTN_PORT (18000), see resolve-recipe.md
 RECIPE_SCRIPT_PATH=<local-recipe-script-path>
 ```
 
@@ -81,11 +78,14 @@ rather than re-downloading.
 ## 4b. Recipe ConfigMap
 
 Lets the pod run any local recipe -- edited, uncommitted, or new -- without
-rebuilding the image. Run from wherever `RECIPE_SCRIPT_PATH` resolves:
+rebuilding the image. The recipe sources the shared launcher, so ship both;
+`templates/pod.yaml` points the recipe at `/recipe/afd_colocation.sh`
+(`AFD_RECIPE_LIB`). Run from the repository root:
 
 ```bash
 kubectl create configmap afd-recipe-script \
   --from-file=recipe.sh="${RECIPE_SCRIPT_PATH}" \
+  --from-file=afd_colocation.sh=recipe/gpu/common/afd_colocation.sh \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
@@ -142,23 +142,18 @@ deploy_pod() {
 }
 ```
 
-Plain recipe, one pod, both roles head, no overrides:
+One-entry `LAYOUT` (e.g. the default `2A2F`), one pod, both roles head,
+with or without the caller's settings:
 
 ```bash
 deploy_pod vllm-pod "$GPU_COUNT" head head ""
+deploy_pod vllm-pod 4 head head $'VLLM_ARGS=--max-num-seqs 32'
 ```
 
-Placement-driven recipe, one call per entry parsed in
-[resolve-recipe.md](resolve-recipe.md), e.g. the qwen3.5 3-pod plan:
-
-```bash
-deploy_pod vllm-pod-attention-0 2 head none "POD=ATTENTION_0"
-deploy_pod vllm-pod-attention-1 2 worker none $'POD=ATTENTION_1\nATTENTION_HEADLESS=1\nATTENTION_DP_START_RANK=2'
-deploy_pod vllm-pod-ffn-0 2 none head "POD=FFN_0"
-```
-
-`LAYOUT` recipe, e.g. `LAYOUT=2A0F,0A2F` (2 GPUs per pod) with the
-decode-only benchmark, or `LAYOUT=4A1F,4A1F` (5 GPUs per pod):
+Several entries, one call per entry parsed in
+[resolve-recipe.md](resolve-recipe.md), e.g. `LAYOUT=2A0F,0A2F` (2 GPUs per
+pod) with the decode-only benchmark, `LAYOUT=4A1F,4A1F` (5 GPUs per pod),
+or the Qwen3.5 recipe's default `2A0F,2A0F,0A2F`:
 
 ```bash
 SETTINGS=$'LAYOUT=2A0F,0A2F\nDECODE_BENCH={}\nAFD_REPO=/opt/afd-plugin'
@@ -167,10 +162,11 @@ deploy_pod vllm-pod-afd-1 2 none head $'POD=AFD_1\n'"$SETTINGS"
 
 deploy_pod vllm-pod-afd-0 5 head head $'POD=AFD_0\nLAYOUT=4A1F,4A1F'
 deploy_pod vllm-pod-afd-1 5 worker worker $'POD=AFD_1\nLAYOUT=4A1F,4A1F'
-```
 
-A one-entry `LAYOUT` with settings is a plain pod with env, e.g.
-`deploy_pod vllm-pod 4 head head $'VLLM_ARGS=--max-num-seqs 32'`.
+deploy_pod vllm-pod-afd-0 2 head none 'POD=AFD_0'
+deploy_pod vllm-pod-afd-1 2 worker none 'POD=AFD_1'
+deploy_pod vllm-pod-afd-2 2 none head 'POD=AFD_2'
+```
 
 ## 4f. Wait for Running, then for each pod's Ready condition
 
@@ -217,6 +213,6 @@ done
 Only report the endpoint ready once every pod in the plan is `Ready` -- one
 pod becoming ready doesn't imply the others did.
 
-Startup markers are keyed on the fixed log names every colocation recipe
-uses today -- see `templates/pod.yaml`'s `ready_marker()` for the exact
-lines. A recipe using different log names needs that template updated.
+Startup markers are keyed on the launcher's fixed log names (`attn.log`,
+`ffn.log`) -- see `templates/pod.yaml`'s `ready_marker()` for the exact
+lines.
