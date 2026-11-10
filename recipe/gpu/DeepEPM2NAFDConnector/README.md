@@ -185,33 +185,24 @@ The answer should name Paris. For an accuracy check, run the matching E2E case
 
 `DECODE_BENCH` attaches the decode-only benchmark's KV connector
 (`AFDDecodeBenchConnector`) to Attention and takes its
-`kv_connector_extra_config` as JSON: every Attention DP rank prefills a pool
-of `num_prompts` random prompts of `prompt_len` tokens, pins their KV, and
-remaps every later request onto the pool, so measured requests decode over
-real KV without prefill. Set `max_output_len` to the longest output you
-measure; it sizes the startup KV check. The connector lives in
-`tools/benchmarks`, which is not in the wheel: run from the repository root or
-set `AFD_REPO`.
+`kv_connector_extra_config` as JSON (`{}` is enough). The connector reports
+every prompt token but the last as externally computed, so requests skip
+prefill and decode at a context of the full prompt length over unwritten KV.
+The connector lives in `tools/benchmarks`, which is not in the wheel: run from
+the repository root or set `AFD_REPO`.
 
 ```bash
 export MODEL_PATH=/path/model_weights/Qwen3-30B-A3B
-DECODE_BENCH='{"num_prompts": 500, "prompt_len": 1025, "max_output_len": 256}' \
+DECODE_BENCH='{}' \
     bash recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/prefill_decode_colocation/graph.sh
 
-python tools/benchmarks/decode_bench_client.py \
-    --port 18000 --dp-size 2 --pool-prompts 500 --prompt-len 1025 \
-    --result-dir /tmp/results/decode_bench \
-    -- --num-prompts 2000 --random-output-len 256 \
-       --max-concurrency 64 --request-rate inf
+INPUT_LEN=1024 OUTPUT_LEN=256 NUM_PROMPTS=2000 \
+    MAX_CONCURRENCY=64 REQUEST_RATE=inf RESULT_DIR=/tmp/results/decode_bench \
+    tools/benchmarks/request_generator.sh
 ```
 
-`--dp-size` is the Attention DP size over all pods (total Attention ranks
-divided by `ATTN_TP`; 2 for `2A2F`, `2A0F,0A2F` and `1A1F,1A1F`), and
-`--pool-prompts` and `--prompt-len` must match `DECODE_BENCH`. The benchmark
-works in every layout and mode. How the pool, the client and its checks work,
-and how to size the pool, are described in
-[`tools/benchmarks/README.md`](../../../tools/benchmarks/README.md); the model
-READMEs give each model's KV size per token.
+Drive the Attention port (18000). The benchmark works in every layout and
+mode; see [`tools/benchmarks/README.md`](../../../tools/benchmarks/README.md).
 
 ## Configuration notes
 

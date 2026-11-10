@@ -161,7 +161,7 @@ deploy_pod vllm-pod-ffn-0 2 none head "POD=FFN_0"
 decode-only benchmark, or `LAYOUT=4A1F,4A1F` (5 GPUs per pod):
 
 ```bash
-SETTINGS=$'LAYOUT=2A0F,0A2F\nDECODE_BENCH={"num_prompts": 500, "max_output_len": 256}\nAFD_REPO=/opt/afd-plugin'
+SETTINGS=$'LAYOUT=2A0F,0A2F\nDECODE_BENCH={}\nAFD_REPO=/opt/afd-plugin'
 deploy_pod vllm-pod-afd-0 2 head none $'POD=AFD_0\n'"$SETTINGS"
 deploy_pod vllm-pod-afd-1 2 none head $'POD=AFD_1\n'"$SETTINGS"
 

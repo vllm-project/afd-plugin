@@ -44,12 +44,8 @@ Common layouts:
   every running request.
 - The baseline without AFD is
   [`recipe/gpu/baseline/qwen3_235b_a22b_fp8/vanilla_tp4.sh`](../../baseline/qwen3_235b_a22b_fp8/vanilla_tp4.sh).
-- Decode-only benchmark pool sizing: Qwen3-235B holds 188 KiB of BF16 KV per
-  token (94 layers, 4 KV heads of 128). With
-  `{"num_prompts": 500, "prompt_len": 1025, "max_output_len": 256}` and 256
-  sequences, each Attention rank needs
-  `500 * ceil(1026 / 16) + 256 * ceil(257 / 16)` blocks, about 590K tokens or
-  106 GiB; an H200 Attention rank has room for about 640K tokens.
+- Qwen3-235B holds 188 KiB of BF16 KV per token (94 layers, 4 KV heads of
+  128); an H200 Attention rank has room for about 640K tokens.
 
 ## Limitations
 

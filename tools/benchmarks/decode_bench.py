@@ -1,22 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Decode benchmark KV connector for AFD decode-side pressure tests.
-
-Two modes, chosen by ``kv_connector_extra_config``:
-
-- Dummy KV (``num_prompts`` unset or 0): every prompt token but the last is
-  reported as externally computed and never written, so requests skip prefill.
-- Prompt pool (``num_prompts`` > 0): each Attention DP rank prefills a pool of
-  ``num_prompts`` seeded random prompts for real, from its first
-  ``num_prompts`` requests (the warmup), and pins their KV blocks in the prefix
-  cache. Every later request is remapped, whatever its content, onto a pinned
-  pool prompt round-robin, hits the prefix cache for all but the last prompt
-  token, and goes straight to decode over real KV.
-"""
+"""Decode benchmark KV connector for AFD decode-side pressure tests."""
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeAlias
 
@@ -34,50 +21,14 @@ from vllm.v1.request import RequestStatus
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.forward_context import ForwardContext
-    from vllm.v1.core.block_pool import BlockPool
-    from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
-    from vllm.v1.core.kv_cache_utils import BlockHash
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
-# vLLM configures handlers only for the "vllm" logger tree; a logger outside it
-# falls back to the root WARNING level and drops the prompt-pool INFO lines.
-logger = init_logger(f"vllm.{__name__}")
+logger = init_logger(__name__)
 
 KVCacheLayer: TypeAlias = torch.Tensor | tuple[torch.Tensor, ...]
-
-# A warmup request only has to prefill its pool prompt.
-WARMUP_OUTPUT_TOKENS = 1
-# Finished measured requests between two prompt-pool hit/miss log lines.
-POOL_STATS_LOG_INTERVAL = 1000
-# Warmup requests that end this way have fully prefilled their pool prompt.
-PINNABLE_WARMUP_STATUSES = (
-    RequestStatus.FINISHED_STOPPED,
-    RequestStatus.FINISHED_LENGTH_CAPPED,
-)
-
-
-@dataclass(frozen=True)
-class PromptPoolConfig:
-    """Prompt-pool keys of ``kv_connector_extra_config``.
-
-    Attributes:
-        num_prompts: Pool entries per Attention DP rank; 0 keeps the dummy-KV
-            mode.
-        prompt_len: Requested pool prompt length. It is rounded down to one
-            token past a block boundary, where a prefix-cache hit leaves exactly
-            the last token to prefill.
-        seed: Seed of the pool tokens, shared by every rank so all ranks hold
-            the same pool.
-        max_output_len: Longest output a measured request decodes; sizes the KV
-            capacity check. ``None`` uses ``max_model_len - prompt_len``.
-    """
-
-    num_prompts: int = 0
-    prompt_len: int = 1025
-    seed: int = 0
-    max_output_len: int | None = None
 
 
 @dataclass
@@ -91,10 +42,9 @@ class AFDDecodeBenchConnectorMetadata(KVConnectorMetadata):
 class AFDDecodeBenchConnector(KVConnectorBase_V1, SupportsHMA):
     """KV connector used to benchmark AFD decode instances with long ISL.
 
-    In the dummy-KV mode the connector emulates remote prefill by marking all
-    prompt tokens except the final decode token as externally provided. In the
-    prompt-pool mode only a prefix-cache miss is emulated that way; see the
-    module docstring.
+    The connector emulates remote prefill by marking all prompt tokens except
+    the final decode token as externally provided, then fills the allocated KV
+    cache pages with deterministic or random non-zero values on the worker.
     """
 
     def __init__(
@@ -109,10 +59,7 @@ class AFDDecodeBenchConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker: AFDDecodeBenchConnectorWorker | None = None
 
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = AFDDecodeBenchConnectorScheduler(
-                vllm_config,
-                kv_cache_config,
-            )
+            self.connector_scheduler = AFDDecodeBenchConnectorScheduler(vllm_config)
         elif role == KVConnectorRole.WORKER:
             self.connector_worker = AFDDecodeBenchConnectorWorker(
                 vllm_config,
@@ -143,15 +90,6 @@ class AFDDecodeBenchConnector(KVConnectorBase_V1, SupportsHMA):
 
     def wait_for_save(self) -> None:
         pass
-
-    def bind_kv_cache_manager(self, kv_cache_manager: KVCacheManager) -> None:
-        super().bind_kv_cache_manager(kv_cache_manager)
-        assert self.connector_scheduler is not None
-        self.connector_scheduler.bind_kv_cache_manager(kv_cache_manager)
-
-    def on_new_request(self, request: Request) -> None:
-        assert self.connector_scheduler is not None
-        self.connector_scheduler.on_new_request(request)
 
     def get_num_new_matched_tokens(
         self,
@@ -190,9 +128,7 @@ class AFDDecodeBenchConnector(KVConnectorBase_V1, SupportsHMA):
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
-        self.connector_scheduler.request_finished(request, block_ids)
-        # Never delay the free: the prompt pool pins its blocks with references
-        # of its own, so every request is released as soon as it finishes.
+        self.connector_scheduler.request_finished(request)
         return False, None
 
     def request_finished_all_groups(
@@ -201,69 +137,24 @@ class AFDDecodeBenchConnector(KVConnectorBase_V1, SupportsHMA):
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
-        # The prompt pool supports a single KV cache group (checked at startup).
-        self.connector_scheduler.request_finished(
-            request,
-            block_ids[0] if block_ids else [],
-        )
+        self.connector_scheduler.request_finished(request)
         return False, None
 
 
 class AFDDecodeBenchConnectorScheduler:
     """Scheduler-side implementation for AFDDecodeBenchConnector."""
 
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        kv_cache_config: KVCacheConfig | None = None,
-    ) -> None:
+    def __init__(self, vllm_config: VllmConfig) -> None:
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
         self._filled_requests: set[str] = set()
         self._pending_fills: dict[str, tuple[tuple[list[int], ...], int]] = {}
-
-        kv_transfer_config = vllm_config.kv_transfer_config
-        assert kv_transfer_config is not None
-        pool_config = PromptPoolConfig(
-            num_prompts=kv_transfer_config.get_from_extra_config(
-                "num_prompts", PromptPoolConfig.num_prompts
-            ),
-            prompt_len=kv_transfer_config.get_from_extra_config(
-                "prompt_len", PromptPoolConfig.prompt_len
-            ),
-            seed=kv_transfer_config.get_from_extra_config(
-                "seed", PromptPoolConfig.seed
-            ),
-            max_output_len=kv_transfer_config.get_from_extra_config(
-                "max_output_len", PromptPoolConfig.max_output_len
-            ),
-        )
-        self.prompt_pool = (
-            PromptPool(pool_config, vllm_config, kv_cache_config)
-            if pool_config.num_prompts > 0
-            else None
-        )
-
-    def bind_kv_cache_manager(self, kv_cache_manager: KVCacheManager) -> None:
-        if self.prompt_pool is not None:
-            self.prompt_pool.bind_block_pool(kv_cache_manager.block_pool)
-
-    def on_new_request(self, request: Request) -> None:
-        if self.prompt_pool is not None:
-            self.prompt_pool.assign(request)
 
     def get_num_new_matched_tokens(
         self,
         request: Request,
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
-        if self.prompt_pool is not None:
-            num_tokens_to_fill = self.prompt_pool.num_tokens_to_fill(
-                request,
-                num_computed_tokens,
-            )
-            return num_tokens_to_fill, False
-
         req_id = request.request_id
         allow_refill_after_preempt = (
             request.status == RequestStatus.PREEMPTED
@@ -317,269 +208,8 @@ class AFDDecodeBenchConnectorScheduler:
         self._pending_fills.clear()
         return meta
 
-    def request_finished(self, request: Request, block_ids: list[int]) -> None:
+    def request_finished(self, request: Request) -> None:
         self._filled_requests.discard(request.request_id)
-        if self.prompt_pool is not None:
-            self.prompt_pool.request_finished(request, block_ids)
-
-
-class PromptPool:
-    """Per-rank pool of real-KV prompts that measured requests decode over.
-
-    Pinning: when a warmup request that prefilled its pool prompt finishes,
-    the pool takes one reference of its own on the entry's full prompt blocks
-    (``BlockPool.touch``) and holds it for the server's lifetime; the scheduler
-    then frees the request as usual. The extra reference keeps the blocks out
-    of the free queue, so LRU eviction cannot drop a pool entry, and they stay
-    in the prefix cache, so a measured request that maps to the entry shares
-    them like any prefix hit. Unlike a delayed free, this leaves no finished
-    request behind in the scheduler, so the engine still goes idle and shuts
-    down normally.
-
-    Measured requests map only onto pinned entries. One that arrives before
-    any entry is pinned falls back to the whole pool; it may miss the prefix
-    cache, so it is counted and logged, and the client's checks catch it.
-    """
-
-    def __init__(
-        self,
-        config: PromptPoolConfig,
-        vllm_config: VllmConfig,
-        kv_cache_config: KVCacheConfig | None,
-    ) -> None:
-        if not vllm_config.cache_config.enable_prefix_caching:
-            raise ValueError(
-                "AFDDecodeBenchConnector prompt pool requires prefix caching; "
-                "launch with --enable-prefix-caching"
-            )
-        if kv_cache_config is not None and len(kv_cache_config.kv_cache_groups) != 1:
-            raise ValueError(
-                "AFDDecodeBenchConnector prompt pool supports a single KV cache "
-                f"group, got {len(kv_cache_config.kv_cache_groups)}"
-            )
-
-        self.block_size = vllm_config.cache_config.block_size
-        self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self._block_pool: BlockPool | None = None
-        max_model_len = vllm_config.model_config.max_model_len
-        self.num_prompts = config.num_prompts
-        # A prefix-cache hit covers full blocks only and stops one token short
-        # of the prompt, so a prompt one token past a block boundary hits every
-        # token but the last.
-        self.prompt_len = (
-            config.prompt_len - 1
-        ) // self.block_size * self.block_size + 1
-        if self.prompt_len == 1:
-            raise ValueError(
-                f"prompt_len ({config.prompt_len}) must exceed the KV block size "
-                f"({self.block_size})"
-            )
-        # The full prompt blocks a hit shares, and so the blocks a pinned entry
-        # holds; the block with the last prompt token is never shared.
-        self.num_entry_blocks = self.prompt_len // self.block_size
-        self.max_output_len = (
-            config.max_output_len
-            if config.max_output_len is not None
-            else max_model_len - self.prompt_len
-        )
-        if self.max_output_len < 1 or (
-            self.prompt_len + self.max_output_len > max_model_len
-        ):
-            raise ValueError(
-                f"prompt_len ({self.prompt_len}) + max_output_len "
-                f"({self.max_output_len}) must fit max_model_len ({max_model_len})"
-            )
-
-        # A CPU generator gives every rank the same pool for the same seed.
-        generator = torch.Generator().manual_seed(config.seed)
-        self.prompt_tokens = torch.randint(
-            vllm_config.model_config.get_vocab_size(),
-            (self.num_prompts, self.prompt_len),
-            generator=generator,
-            dtype=torch.int32,
-        )
-        # Hashing a long prompt per request is avoidable work on the scheduler:
-        # an entry's hashes are computed once and copied after that.
-        self._entry_block_hashes: dict[int, list[BlockHash]] = {}
-        self._unwarmed_entries = deque(range(self.num_prompts))
-        self._warming_entries: dict[str, int] = {}
-        # Pinned entries in pin order, and the block ids each one holds.
-        self._pinned_entries: list[int] = []
-        self._pinned_block_ids: dict[int, list[int]] = {}
-        self._num_assigned_measured = 0
-        # Measured requests assigned while part of the pool was still unpinned.
-        self._num_early_measured = 0
-        # request_id -> prompt tokens the prefix cache missed (0 on a hit).
-        self._measured_misses: dict[str, int] = {}
-        self._num_finished_measured = 0
-        self._num_missed_requests = 0
-        self._num_missed_tokens = 0
-
-    def bind_block_pool(self, block_pool: BlockPool) -> None:
-        """Bind the scheduler's block pool, whose blocks the pool pins."""
-        self.check_capacity(block_pool.get_num_free_blocks())
-        self._block_pool = block_pool
-
-    def check_capacity(self, num_free_blocks: int) -> None:
-        """Fail fast when the pool and the running requests cannot both fit."""
-        blocks_per_entry = self.num_entry_blocks
-        # A measured request shares its entry's full blocks and allocates only
-        # the last prompt token and its output.
-        blocks_per_seq = cdiv(1 + self.max_output_len, self.block_size)
-        num_reserved_blocks = self.max_num_seqs * blocks_per_seq
-        num_pool_blocks = self.num_prompts * blocks_per_entry
-        if num_pool_blocks + num_reserved_blocks > num_free_blocks:
-            max_num_prompts = max(
-                0,
-                (num_free_blocks - num_reserved_blocks) // blocks_per_entry,
-            )
-            raise ValueError(
-                f"AFDDecodeBenchConnector prompt pool needs {num_pool_blocks} KV "
-                f"blocks for {self.num_prompts} prompts of {self.prompt_len} "
-                f"tokens plus {num_reserved_blocks} for {self.max_num_seqs} "
-                f"sequences of up to {self.max_output_len} output tokens, but "
-                f"only {num_free_blocks} are free; use num_prompts <= "
-                f"{max_num_prompts} or shorten prompt_len/max_output_len"
-            )
-        if self.num_prompts < self.max_num_seqs:
-            logger.warning(
-                "AFDDecodeBenchConnector: %d pool prompts are fewer than "
-                "max_num_seqs (%d); concurrent requests will share KV blocks",
-                self.num_prompts,
-                self.max_num_seqs,
-            )
-        logger.info(
-            "AFDDecodeBenchConnector prompt pool: %d prompts x %d tokens use "
-            "%d of %d free KV blocks; %d reserved for running requests",
-            self.num_prompts,
-            self.prompt_len,
-            num_pool_blocks,
-            num_free_blocks,
-            num_reserved_blocks,
-        )
-
-    def assign(self, request: Request) -> None:
-        """Rewrite a new request's prompt to a pool entry's, before scheduling.
-
-        The first ``num_prompts`` requests warm one unwarmed entry each; every
-        later request maps round-robin onto the pinned entries, whatever it
-        asked for.
-        """
-        if self._unwarmed_entries:
-            entry = self._unwarmed_entries.popleft()
-            self._warming_entries[request.request_id] = entry
-            request.max_tokens = WARMUP_OUTPUT_TOKENS
-        else:
-            entry = self._next_measured_entry()
-
-        prompt_token_ids = self.prompt_tokens[entry].tolist()
-        request.prompt_token_ids = prompt_token_ids
-        request.num_prompt_tokens = len(prompt_token_ids)
-        # all_token_ids is a read-only view of _all_token_ids: replace in place.
-        request._all_token_ids[:] = prompt_token_ids
-        request.block_hashes.clear()
-        entry_block_hashes = self._entry_block_hashes.get(entry)
-        if entry_block_hashes is None:
-            request.update_block_hashes()
-            self._entry_block_hashes[entry] = list(request.block_hashes)
-        else:
-            request.block_hashes.extend(entry_block_hashes)
-
-    def _next_measured_entry(self) -> int:
-        """Pick a measured request's entry: round-robin over pinned entries.
-
-        An entry that is still warming, or whose warmup was aborted, is not
-        in the prefix cache yet: a request mapped onto it would decode over
-        unwritten blocks and could leave them cached under the entry's hashes.
-        """
-        index = self._num_assigned_measured
-        self._num_assigned_measured += 1
-        num_pinned = len(self._pinned_entries)
-        if num_pinned < self.num_prompts:
-            if self._num_early_measured == 0:
-                logger.warning(
-                    "AFDDecodeBenchConnector: a measured request arrived with "
-                    "%d of %d pool prompts pinned; finish the warmup before "
-                    "measuring",
-                    num_pinned,
-                    self.num_prompts,
-                )
-            self._num_early_measured += 1
-        if num_pinned == 0:
-            # Nothing is pinned yet: any entry may miss, and the miss is faked.
-            return index % self.num_prompts
-        return self._pinned_entries[index % num_pinned]
-
-    def num_tokens_to_fill(self, request: Request, num_computed_tokens: int) -> int:
-        """Prompt tokens to fake as external: 0 on a hit or during warmup."""
-        if request.request_id in self._warming_entries:
-            return 0
-        # A pinned entry hits every prompt token but the last. Anything the
-        # cache misses is faked so the step stays decode-only, and counted.
-        num_missed_tokens = max(0, request.num_tokens - 1 - num_computed_tokens)
-        self._measured_misses[request.request_id] = num_missed_tokens
-        return num_missed_tokens
-
-    def request_finished(self, request: Request, block_ids: list[int]) -> None:
-        """Pin a finished warmup request's blocks; tally measured hits.
-
-        Called before the scheduler frees the request, so a pinned block's
-        reference count never drops to zero.
-        """
-        entry = self._warming_entries.pop(request.request_id, None)
-        if entry is not None:
-            if request.status not in PINNABLE_WARMUP_STATUSES or not self._pin(
-                entry, block_ids
-            ):
-                # Aborted before its prompt was cached: warm it again later.
-                self._unwarmed_entries.appendleft(entry)
-            return
-
-        num_missed_tokens = self._measured_misses.pop(request.request_id, None)
-        if num_missed_tokens is None:
-            return
-        self._num_finished_measured += 1
-        if num_missed_tokens > 0:
-            self._num_missed_requests += 1
-            self._num_missed_tokens += num_missed_tokens
-        if self._num_finished_measured % POOL_STATS_LOG_INTERVAL == 0:
-            logger.info(
-                "AFDDecodeBenchConnector prompt pool: %d measured requests, "
-                "%d prefix-cache misses (%d prompt tokens faked), %d assigned "
-                "before the pool was warm",
-                self._num_finished_measured,
-                self._num_missed_requests,
-                self._num_missed_tokens,
-                self._num_early_measured,
-            )
-
-    def _pin(self, entry: int, block_ids: list[int]) -> bool:
-        """Hold one reference on an entry's cached full prompt blocks."""
-        assert self._block_pool is not None, "the KV cache manager is not bound"
-        entry_block_ids = block_ids[: self.num_entry_blocks]
-        blocks = [self._block_pool.blocks[block_id] for block_id in entry_block_ids]
-        if len(blocks) < self.num_entry_blocks or any(
-            block.is_null or block.block_hash is None for block in blocks
-        ):
-            logger.warning(
-                "AFDDecodeBenchConnector: pool prompt %d finished warming with "
-                "%d of %d prompt blocks cached; warming it again",
-                entry,
-                sum(block.block_hash is not None for block in blocks),
-                self.num_entry_blocks,
-            )
-            return False
-        self._block_pool.touch(blocks)
-        self._pinned_entries.append(entry)
-        self._pinned_block_ids[entry] = entry_block_ids
-        if len(self._pinned_entries) == self.num_prompts:
-            logger.info(
-                "AFDDecodeBenchConnector prompt pool warm: %d prompts "
-                "pinned in %d KV blocks",
-                len(self._pinned_entries),
-                self.num_prompts * self.num_entry_blocks,
-            )
-        return True
 
 
 class AFDDecodeBenchConnectorWorker:
@@ -709,6 +339,4 @@ __all__ = [
     "AFDDecodeBenchConnectorMetadata",
     "AFDDecodeBenchConnectorScheduler",
     "AFDDecodeBenchConnectorWorker",
-    "PromptPool",
-    "PromptPoolConfig",
 ]

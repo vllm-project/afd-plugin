@@ -2,20 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 #
-# Drive load against a running AFD instance (e.g. the attention endpoint of a
+# Drive load against a running AFD instance (e.g. the Attention endpoint of a
 # recipe under recipe/gpu/). Thin wrapper around `vllm bench serve`; every knob
-# is overridable via an environment variable. For a decode-only run over a
-# warmed prompt pool, use decode_bench_client.py, which wraps vllm bench too.
+# is overridable via an environment variable. For a decode-only run, start the
+# recipe with DECODE_BENCH set; see tools/benchmarks/README.md.
 #
 # Usage:
 #   MODEL_PATH=/path/to/weights tools/benchmarks/request_generator.sh
-#   HOST=127.0.0.1 PORT=18305 INPUT_LEN=8192 OUTPUT_LEN=256 MAX_CONCURRENCY=64 \
+#   HOST=127.0.0.1 PORT=18000 INPUT_LEN=8192 OUTPUT_LEN=256 MAX_CONCURRENCY=64 \
 #       MODEL_PATH=/path/to/weights tools/benchmarks/request_generator.sh
 #
 # Variables (default):
 #   MODEL_PATH        model weights dir/name              (required)
 #   HOST              server host                         (127.0.0.1)
-#   PORT              server port                         (18305)
+#   PORT              server port                         (18000)
 #   DATASET_NAME      vllm bench dataset                  (random)
 #   INPUT_LEN         random input length (ISL)           (1024)
 #   OUTPUT_LEN        random output length (OSL)          (128)
@@ -29,7 +29,7 @@ set -euo pipefail
 
 MODEL_PATH=${MODEL_PATH:?set MODEL_PATH to the model weights dir/name}
 HOST=${HOST:-127.0.0.1}
-PORT=${PORT:-18305}
+PORT=${PORT:-18000}
 DATASET_NAME=${DATASET_NAME:-random}
 INPUT_LEN=${INPUT_LEN:-1024}
 OUTPUT_LEN=${OUTPUT_LEN:-128}

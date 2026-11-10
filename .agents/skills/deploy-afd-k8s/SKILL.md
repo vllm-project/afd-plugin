@@ -49,8 +49,8 @@ than one pod) -- callers never talk to these directly. See
 - `DeepEPM2NAFDConnector` recipes take their placement from `LAYOUT` (one
   pod per `<a>A<f>F` entry) and run-specific settings as env (`VLLM_ARGS`,
   `DECODE_BENCH`, ...); see [resolve-recipe.md](resources/resolve-recipe.md).
-  This skill only serves; the decode-only benchmark's client
-  (`tools/benchmarks/decode_bench_client.py`) is run separately against the
+  This skill only serves; load for the decode-only benchmark
+  (`tools/benchmarks/request_generator.sh`) is run separately against the
   endpoint.
 
 ## Requirements
