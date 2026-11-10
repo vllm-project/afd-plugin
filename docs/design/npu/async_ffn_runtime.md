@@ -1,15 +1,11 @@
 # MRV2 Async CAM FFN eager/FULL runtime
 
-AFD #449 captures one complete routed-expert transaction: original dispatch
-receive (DR), layered W4A8/W8A8 FFN, and original combine send (CS).
-Attention uses MRV2 eager or native target decode graphs.
-Issue #451 retires the separate MRV1 paths while
-preserving this runtime and its original transport/lifecycle boundary.
+FULL captures one routed-expert transaction: dispatch receive (DR),
+W4A8/W8A8 FFN, and combine send (CS). Attention uses MRV2 eager or native target decode graphs.
 
 `AsyncNPUFFNModelRunner` owns Async CAM model loading, eager/FULL transactions
 and receive-safe resource release independently of the synchronous CAMP2P
-`AFDNPUFFNModelRunner`. The FFN worker selects the owner from the connector;
-neither runner inherits MRV1 or owns Attention request/KV state.
+`AFDNPUFFNModelRunner`. The FFN worker selects the owner from the connector.
 
 ## Selection and startup
 
@@ -17,7 +13,7 @@ The target is the pinned vLLM 0.32 / vLLM-Ascend stack on A3/910C, with
 homogeneous DeepSeek-V4 W4A8 or W8A8 layers, dynamicQuant=1, static expert placement,
 F TP=1 and Attention-side gating. Both roles select
 `VLLM_USE_V2_MODEL_RUNNER=1`. Attention normally keeps `--enforce-eager`; the
-[target Attention graph](CAM_ASYNC_CONNECTOR_USER_GUIDE.md#deepseek-v4-target-attention-graph)
+[target Attention graph](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#deepseek-v4-target-attention-graph)
 profile accepts `FULL` or `FULL_DECODE_ONLY`, with native graph-mode resolution.
 Attention-local FlashComm1/SP and native PD can be combined with the graphs.
 DSpark draft may remain eager or use its native graph alongside target graph.
@@ -40,7 +36,7 @@ The combined layer table and startup agreement cover target0–42/draft43–45;
 all layers must share the same W4A8 or W8A8 layout. Native P loads the complete
 draft model. Target Attention may use the native decode graph; the draft can
 remain eager or use its native query Graph. DSpark excludes DBO; see the
-[DSpark recipe](../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md).
+[DSpark recipe](../../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md).
 
 W8A8 reuses the loaded INT8 NZ weights, FP32 W13 scales and BF16 W2 scales.
 It needs no W4A8 compensation. The W2 binding requires per-layer bias entries,
@@ -68,7 +64,10 @@ F HTTP API initialization is not a readiness requirement.
 ## Capture boundary and ownership
 
 By default, the runner owns capture/replay, weights, stable buffers, a private graph pool
-and one execution stream. The connector owns CAM communication. The host-only `AsyncCAMGraphStartup`
+and one execution stream. The connector owns HCCL, payload validation and
+communication lifecycle coordination. Its Push session owns per-stage queues;
+its Pull session owns a single window, native publish/combine, device status
+and quiet/drain/stopped. The host-only `AsyncCAMGraphStartup`
 coordinator owns Store negotiation, stage waits and failure propagation; it owns
 no device resources or threads. A captured transaction receives activations, scales, expert counts
 and the original return metadata from DR. Device-side layer selection uses
@@ -82,7 +81,8 @@ metadata goes to CS; host code does not select the layer or copy per-item inputs
 | CS completion tensor | Retained transfer state |
 | Weights and scale/compensation lists | Runner's model and executor |
 | Captured native workspace | Graph's private allocator pool |
-| HCCL group, communication arguments and windows | Connector |
+| HCCL group and final communication cleanup decision | Connector facade |
+| Communication arguments/windows and pending routing references | Selected Push/Pull session |
 
 Each business batch submits as many replays as there are loaded FFN layers,
 then waits once for device completion. This is a bounded submission count,
@@ -151,7 +151,8 @@ A3/910C, 4A/4F, A TP4, F TP1, receive capacity 128 and DBO disabled. Select
 this topology still needs target-device validation. Synthetic per-group
 coverage does not qualify loading real per-group checkpoints.
 
-- Host contracts: `tests/unit/connectors/npu/test_async_cam_pull.py`,
+- Host contracts: `tests/unit/connectors/npu/test_async_cam.py`,
+  `tests/unit/connectors/npu/test_async_cam_session.py`,
   `tests/unit/connectors/npu/test_async_cam_startup.py`,
   `tests/unit/v1/worker/test_async_ffn_graph.py`,
   `tests/unit/v1/worker/test_async_ffn_runtime.py`, and

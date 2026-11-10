@@ -15,7 +15,7 @@ primary_code_paths:
   - "afd_plugin/v1/worker/npu/ffn_worker.py"
 related_code_paths:
   - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_startup.py"
-  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_pull.py"
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_session.py"
   - "afd_plugin/connectors/**"
   - "afd_plugin/model_executor/**"
   - "afd_plugin/compat/patches/engine_core.py"
@@ -35,7 +35,9 @@ validation_paths:
   - "tests/unit/v1/worker/test_npu_runtime.py"
   - "tests/unit/connectors/npu/test_async_cam_startup_wiring.py"
   - "tests/unit/connectors/npu/test_async_cam_startup.py"
-  - "tests/unit/connectors/npu/test_async_cam_pull.py"
+  - "tests/unit/connectors/test_base.py"
+  - "tests/unit/connectors/npu/test_async_cam_session.py"
+  - "tests/unit/connectors/npu/test_async_cam.py"
   - "tests/npu/async_cam_runtime.py"
   - "tests/e2e/models/deepseek_v4_flash/ffn_graph.py"
   - "tests/unit/compat/patches/test_engine_core.py"
@@ -58,7 +60,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-10-20
+last_reviewed: 2026-11-09
 ---
 
 # FFN runtime
@@ -77,6 +79,17 @@ profiler, native-op, and build mechanisms belong to
 FFN consumes plugin configuration, connector transport, model-side compute,
 platform mechanisms, and EngineCore compatibility. No shared module may depend
 on the FFN worker or runner implementation.
+
+Async CAM's connector owns HCCL, payload validation and initialization/cleanup
+coordination. It selects a Push or Pull session at construction. Both inherit
+the concrete `FFNExecutionSession` lifecycle defaults from `connectors/base.py`. Push owns
+per-stage routing queues; Pull owns its single window, publish/combine, device
+status and quiet/drain/stopped lifecycle. Pull takes Startup, topology and the
+dimensions/capacity used for initialization and bounded drain; it does not
+retain the connector. The FFN runner continues to own eager/FULL execution,
+graph references and completion; the worker still owns the receiver thread.
+The current Mega executor reads the same live window through the connector's
+read-only `comm_args` property.
 
 ## Runtime selection
 
@@ -166,7 +179,7 @@ The V2 pair requires PP/PCP/DCP size 1, configured role ranks equal to DP x TP,
 static EP, and a registered AFD model. CUDA uses `P2pNcclAFDConnector` with
 model-specific gate placement and supports two native microbatches with
 Attention DP1 or DP > 1. See the
-[runtime matrix](execution_platforms.md#tested-runtime-matrix) for tested
+[runtime matrix](../../support.md#tested-runtime-matrix) for tested
 configurations and known DeepSeek-V2-Lite DBO shutdown failures.
 CUDA `DeepEPM2NAFDConnector` requires Attention-side gating, FFN TP 1, and
 the same DBO setting on both roles; see the
@@ -244,7 +257,7 @@ loop. For each layer, the runner:
 Async eager does not use the synchronous DP-metadata graph cache. Its FULL
 mode captures a complete original DR/FFN/CS transaction with device-side layer
 selection. The independent Async runner owns one graph and stable resources;
-see [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md) for startup, supported
+see [Async FFN runtime](../npu/async_ffn_runtime.md) for startup, supported
 W4A8/W8A8 configurations and the original receiver's process-cleanup boundary.
 
 DeepSeek-V4 W4A8 and W8A8 use layered GMM for both eager and FULL. Incompatible
@@ -360,7 +373,7 @@ thread does not exit, native resources are not released underneath it. The
 connector then releases its remaining communication resources during runner
 shutdown. An earlier daemon failure is still surfaced after the join. Ascend
 uses its own connector close or asynchronous drain path before joining the
-daemon; see the [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md).
+daemon; see the [Async FFN runtime](../npu/async_ffn_runtime.md).
 
 ## Candidate invariants
 
@@ -384,16 +397,8 @@ async model E2E coverage.
 
 ## Limitations and open issues
 
-Current shared limits are the supported vLLM release, connector-driven FFN,
-and registered role-aware model integrations. Ascend V1 native DBO accepts
-exactly two ubatches. A V2-paired FFN uses the same AFD FFN runner with a
-V2-compatible construction and forward-context seam. CUDA FFN consumes the
-two-stage control layout and replays the matching graph when requested;
-Ascend V2 consumes two-stage synchronous control metadata in eager DBO mode.
-CAM async instead uses eager connector work items; native DBO runs only on
-Attention and does not create a separate FFN stage scheduler.
-Platform-specific limits are centralized in
-[execution platforms](execution_platforms.md#tested-runtime-matrix).
+Platform-specific execution limits and validation evidence are centralized in
+[support matrix](../../support.md#tested-runtime-matrix).
 
 Issue [#107](https://github.com/JiusiServe/afd-plugin/issues/107) completed the
 optional control-plane split. Connector metadata ownership, transfer state

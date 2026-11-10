@@ -9,7 +9,7 @@ changes, TP/SP scheduling changes, and routing changes.
 Accept a claim only with base and head runs that hold constant:
 
 - Hardware pool and placement (CI presets: `l4_1`–`l4_4`, `h100_4`; NPU:
-  documented manual environment per `docs/npu/TESTING.md`).
+  documented manual environment per `tests/npu/README.md`).
 - Container image and dependency versions (`docker/Dockerfile.ci` pins
   `VLLM_BASE_TAG` and asserts the installed vLLM version).
 - Workload and datasets (`tools/benchmarks/decode_bench.py`,

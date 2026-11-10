@@ -42,7 +42,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-10-30
+last_reviewed: 2026-11-09
 ---
 
 # Connector contracts
@@ -68,7 +68,7 @@ depend on role worker implementations.
 | CUDA P2P | [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py), [`topology.py`](../../../afd_plugin/distributed/topology.py) | [`test_p2p_connector.py`](../../../tests/unit/connectors/test_p2p_connector.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) |
 | CUDA DeepEP M2N | [`gpu/deepep_m2n/`](../../../afd_plugin/connectors/gpu/deepep_m2n/), `AFDRoutedExpertsConnector` in [`base.py`](../../../afd_plugin/connectors/base.py) | [`test_deepep_m2n_connector.py`](../../../tests/unit/connectors/test_deepep_m2n_connector.py), [GPU device tests](../../../tests/gpu/README.md), [Qwen3 MoE E2E](../../../tests/e2e/models/qwen3_moe/test_qwen3_moe.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) (`test_deepseek_v2_lite_deepep_m2n`) |
 | Ascend CAMP2P | [`npu/camp2p.py`](../../../afd_plugin/connectors/npu/camp2p.py) | [`test_camp2p_connector.py`](../../../tests/unit/connectors/test_camp2p_connector.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) |
-| Ascend CAM async | [`npu/async_cam.py`](../../../afd_plugin/connectors/npu/async_cam.py) | [Connector unit tests](../../../tests/unit/connectors/test_async_cam_connector.py), [fused routing device test](../../../tests/npu/test_async_cam_connector.py), [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py) |
+| Ascend CAM async | [`npu/async_cam.py`](../../../afd_plugin/connectors/npu/async_cam.py), [`Push/Pull sessions`](../../../afd_plugin/connectors/npu/async_cam_runtime/async_cam_session.py) | [Connector unit tests](../../../tests/unit/connectors/test_async_cam_connector.py), [CAM host contracts](../../../tests/unit/connectors/npu/test_async_cam.py), [fused routing device test](../../../tests/npu/test_async_cam_connector.py), [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py) |
 | Process-group construction | [`afd_process_group.py`](../../../afd_plugin/distributed/afd_process_group.py) | Connector initialization tests plus platform E2E paths |
 
 ## Factory and construction
@@ -95,8 +95,8 @@ which lets feature validation use the same connector-owned schema.
 
 ## Connector-owned configuration
 
-`additional_config["afd"]["connector_extra_config"]` is an envelope rather
-than an `AFDConfig` field. Unknown fields fail in the selected connector parser.
+`AFDConfig.connector_extra_config` stores the connector-specific mapping.
+Unknown fields fail in the selected connector parser.
 
 | Connector | Accepted connector-specific fields |
 | --- | --- |
@@ -312,9 +312,39 @@ metadata is present.
 | Connector | Connector-owned resources | Topology constraints and mapping |
 | --- | --- | --- |
 | CUDA P2P | AFD process group, PyNccl data communicators, separate NCCL metadata group, compiled custom-op communicator registry, and graph-oriented receive buffers/state. | Requires `A >= F`. One FFN rank is grouped with a consecutive block of Attention ranks in FFN-first ordering; the blocks differ in size by at most one, and hold `A/F` ranks each when `F` divides `A`. |
-| CUDA DeepEP M2N | AFD process group, a CPU bootstrap group for the handshake, the connector's NCCL control group, afdEP-comm transport buffers (one per lane), and compiled dispatch/combine kernels per bucket. | FFN-first ordering, any `A/F`, `num_experts % F == 0`, FFN TP 1. Across nodes every NVLink domain must hold an equal, contiguous block of world ranks. The startup handshake checks payload format, model shapes, lanes, network settings, SM90+, and the FFN expert deployment on every rank before buffers are allocated. |
+| CUDA DeepEP M2N | AFD process group, a CPU bootstrap group for the handshake, a CPU transport group when the physical rank order differs from the role order, the connector's NCCL control group, afdEP-comm transport buffers (one per lane), and compiled dispatch/combine kernels per bucket. | FFN-first role ordering, any `A/F`, `num_experts % F == 0`, FFN TP 1. Every NVLink domain must hold the same number of ranks, and either the FFN ranks fill the first domains (afdEP-comm FFN prefix) or every domain holds the same number of FFN ranks (afdEP-comm per-domain mode); the transport sees the ranks domain by domain, FFN first in each. The startup handshake checks payload format, model shapes, lanes, network settings, SM90+, and the FFN expert deployment on every rank before buffers are allocated. |
 | Ascend CAMP2P | AFD process group, one HCCL communication group per ubatch, FFN HCCL state, Gloo metadata group, custom-op state and transfer handles. | FFN-first ordering and `A >= F`; group construction derives each FFN/Attention mapping. |
 | Ascend CAM async | Attention-first HCCL group, plugin-owned routed-only CAM operator state, per-stage pending Attention payload queues, and connector work-item state. | Role ranks map into a combined Attention-first world; Compact metadata determines the actual layer and expert interval; counts.sum() gives this chunk’s routed token count. |
+
+`CAMAsyncAFDConnector` owns configuration, topology, the HCCL group, startup,
+payload validation and final cleanup decisions. It selects one session at
+construction: `PushCAMSession` or `PullCAMSession`, both in
+`async_cam_runtime/async_cam_session.py`. Push keeps a FIFO per Attention
+stage and separate FFN receive/send calls. Pull owns one in-flight window across
+stages, native publish/combine, status/idle/source state and quiet/drain/stopped.
+Mega's fused FFN operation owns its receive/compute/send transaction; the public
+FFN receive/send methods reject Pull use.
+
+The four public transfer methods still enter through the connector. The existing
+`AFDAsyncTransferState` definition stays at its original import path;
+`comm_args` and `comm_id` expose the selected session's live resources through read-only
+properties for the current Mega compute path. `has_pending_attention` provides
+the diagnostic pending-state read without exposing the queue.
+
+Pull Session receives Startup, topology and required dimensions/capacity
+explicitly, without retaining the connector. Sessions allocate their buffers
+after Store negotiation and HCCL setup; initialization failures reach Startup
+before the connector is marked ready. Push records routing after a successful
+launch; Pull retains window ownership before launch. Combine failures retain
+routing/window references. DBO defers the sticky status check to the Attention
+step boundary. Graph capture, device completion and service threads remain with
+the runner/worker.
+
+`FFNExecutionSession` in `base.py` defines the lifecycle hooks and provides
+local-stop/no-drain defaults in one concrete class. Push/Pull sessions inherit
+those defaults and override their protocol-specific behavior. The base module
+keeps torch and transfer metadata imports under type checking so session imports
+remain safe before worker device bootstrap.
 
 The common process-group helper creates a plugin-owned group while temporarily
 switching PyTorch's default group so vLLM parallel-state helpers initialize

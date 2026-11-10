@@ -9,7 +9,7 @@ and the review needs evidence beyond static reading and CI.
 | --- | --- |
 | GPU host with devices free | Narrowest changed unit tests, then the single most relevant E2E scenario via `run-e2e` |
 | GPU host for connector device tests | `tests/gpu/test_deepep_m2n_gpu.py` on SM90+ with afdEP-comm and DeepGEMM; most cases need 4 GPUs, the Attention-TP cases need 6 |
-| NPU host | Manual per `docs/npu/TESTING.md`; only what the user explicitly asked to run |
+| NPU host | Manual per `tests/npu/README.md`; only what the user explicitly asked to run |
 | CPU-only trusted checkout | Import preflight + `pytest tests/unit/<area> -m "not gpu and not vllm_runtime"` |
 | Static only (untrusted head, no sandbox) | SHA-addressed reads + existing CI evidence; report execution as a gap |
 

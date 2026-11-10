@@ -46,7 +46,8 @@ def load_async_modules(monkeypatch):
         "afd_plugin.v1.worker.ffn_metadata",
     ):
         stub(name)
-    stub("afd_plugin.connectors.metadata", AFDTransferState=object)
+    stub("vllm.forward_context")
+    load_host_module(monkeypatch, "afd_plugin.connectors.metadata")
     load_host_module(monkeypatch, "afd_plugin.connectors.base")
     load_host_module(monkeypatch, "tests.unit.fakes.connector")
     group = load_host_module(monkeypatch, "afd_plugin.distributed.afd_process_group")

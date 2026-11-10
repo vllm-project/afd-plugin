@@ -19,17 +19,19 @@ On success this skill guarantees, in the target namespace:
 | Serving | the model named by `MODEL_ID` |
 | Pod(s) / Service | `vllm-pod`, or one pod per pod the recipe's header comment describes (named `vllm-pod-<pod>`); Service `vllm-service`, labels `app=afd-recipe,role=serve` |
 | Model cache | `PVC_NAME`, mounted at `/models`, `HF_HOME=/models/.hf_home` |
-| Left running | yes, deliberately -- so weights stay warm for follow-up runs |
+| Left running | yes, deliberately -- so weights stay warm for follow-up runs; step 5 asks the caller when to delete the pods |
 
 Whenever a recipe's header spans more than one pod, two more internal-only
 Services may also exist (`vllm-ffn-p2p-service` always; `vllm-attn-dp-service`
 and/or `vllm-ffn-dp-service` only if that role is itself split across more
 than one pod) -- callers never talk to these directly. See
-[services.md](references/services.md).
+[services.md](resources/services.md).
 
 ## Scope
 
-- Recipes under `recipe/gpu/P2pNcclAFDConnector/**` (GPU only, not NPU),
+- Recipes under `recipe/gpu/P2pNcclAFDConnector/**` or
+  `recipe/gpu/DeepEPM2NAFDConnector/**` (GPU only, not NPU; the M2N image
+  must contain afdEP-comm and DeepGEMM),
   **`prefill_decode_colocation` only** (attention + FFN workers, no prefill
   split).
   `prefill_decode_disaggregation` recipes are **out of scope**: they need a
@@ -43,7 +45,7 @@ than one pod) -- callers never talk to these directly. See
   block, don't infer shape from flags. Today's recipes spell it as one
   `# For pod N: POD=...` line per pod, but the comment isn't guaranteed to
   use that exact grammar going forward. See
-  [resolve-recipe.md](references/resolve-recipe.md).
+  [resolve-recipe.md](resources/resolve-recipe.md).
 - Not for `tools/benchmarks/decode_bench_server.sh` (local, non-k8s).
 
 ## Requirements
@@ -75,13 +77,13 @@ than one pod) -- callers never talk to these directly. See
 
 Load these in order; each covers one phase and nothing else. Services must
 exist **before** any Pod is deployed -- see
-[services.md](references/services.md) for why:
+[services.md](resources/services.md) for why:
 
-| Reference | Covers |
+| Resource | Covers |
 |---|---|
-| [resolve-recipe.md](references/resolve-recipe.md) | Step 1: read the recipe's serve-block fields and model id; read its placement (or lack of one) from its header comment -- never ask. |
-| [deploy.md](references/deploy.md) | Steps 2-4f: GPU_COUNT, confirm, PVC, ConfigMap, fsGroup, Services (step 4d -- which of the four, see [services.md](references/services.md)), pod(s) via `templates/pod.yaml`, wait for Running and for each pod's own readiness line. |
-| [report-and-teardown.md](references/report-and-teardown.md) | Step 5: report the endpoint/model/nodes. Step 6: teardown (pods/Services only -- never the PVC unless asked). |
+| [resolve-recipe.md](resources/resolve-recipe.md) | Step 1 (the only step that parses the recipe): read the recipe's serve-block fields and model id; read its placement (or lack of one) from its header comment -- never ask; record `GPU_COUNT` per pod. |
+| [deploy.md](resources/deploy.md) | Steps 2-4f: take step 1's `GPU_COUNT`, confirm, PVC, ConfigMap, fsGroup, Services (step 4d -- which of the four, see [services.md](resources/services.md)), pod(s) via `templates/pod.yaml`, wait for Running and then for each pod's `Ready` condition. |
+| [report-and-teardown.md](resources/report-and-teardown.md) | Step 5: report the endpoint/model/nodes and ask when to delete the running pods. Step 6: teardown when the caller says so (pods/Services only -- never the PVC unless asked). |
 
 All k8s manifests live in `templates/*.yaml`, applied via `envsubst | kubectl
 apply -f -`; no manifest is inlined in these docs.

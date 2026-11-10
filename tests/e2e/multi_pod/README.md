@@ -44,10 +44,11 @@ it just needs the same launch inputs again.
   SIGTERM/SIGINT into that group, and raises if it exits non-zero.
 
 Critically, the test file's own docstring spells out the deployment
-assumption: **the pods must already exist**. Something else — a human, or
-`tests.e2e.multi_pod.driver.k8s` / `driver.docker` — has already created N
-pods/containers and is about to (or already did) invoke this same pytest
-node once inside each of them. `pytest tests/e2e/models/deepseek_v2_lite/
+assumption: **the pods must already exist**. A human or external deployment
+tool creates N pods/containers and invokes this same pytest node once inside
+each of them; see the
+[multi-pod deployment instructions](../../../.agents/skills/run-e2e/resources/k8-multi-pod.md).
+`pytest tests/e2e/models/deepseek_v2_lite/
 test_deepseek_v2_lite_multi_pod.py::test_multi_pod[...]` running inside pod 0
 and the identical invocation running inside pod 1 together *are* one
 multi-pod E2E run. `test_multi_pod()` only supplies the inputs the in-pod
@@ -58,7 +59,7 @@ runner itself.
 So conceptually:
 
 ```text
-driver (k8s Job / docker driver)
+external provisioning (k8s Job / container launcher)
   └─ pod 0: pytest ... test_multi_pod[...]  → runner.py --pod-layout 2A0F,0A2F ...
   └─ pod 1: pytest ... test_multi_pod[...]  → runner.py --pod-layout 2A0F,0A2F ...
 ```
@@ -126,7 +127,7 @@ line 442). Reading it top to bottom:
    `identity.py`) checks, in order: an explicit `AFD_E2E_POD_INDEX`
    override, the k8s Indexed Job's `JOB_COMPLETION_INDEX`, then falls back to
    the trailing integer of `HOSTNAME` (for hand-applied manifests or the
-   Docker driver, which names containers `..-0`, `..-1`, …).
+   container launchers that name containers `..-0`, `..-1`, …).
 
 3. **Wait for the rendezvous store's DNS to resolve, then connect.**
    `wait_for_address(args.store_host, args.store_dns_timeout)` exists
@@ -362,12 +363,11 @@ output whenever that slot doesn't actually span pods.
 ## Provisioning: who creates the pods in the first place
 
 `runner.py` assumes N pods/containers already exist and that it is being
-invoked once inside each. That provisioning step is a separate concern,
-handled by `tests/e2e/multi_pod/driver/k8s.py` and `driver/docker.py`. Both
-drivers describe themselves the same way: their whole job is to render and
-apply the deployment (a k8s Indexed Job or a set of sibling Docker
-containers), block on the platform's own completion primitive (`kubectl
-wait` / a container-exit wait), collect exit codes and logs, and clean up —
-they hold no test state and make no test decision. Launch order, readiness,
-evaluation, and teardown are entirely owned by the pods running this module,
-exactly as walked through above.
+invoked once inside each. Provision them manually or through external
+deployment tooling, following the
+[multi-pod deployment instructions](../../../.agents/skills/run-e2e/resources/k8-multi-pod.md).
+This repository does not provide a `tests/e2e/multi_pod/driver/` package.
+The provisioner creates the pods/containers, invokes the same pytest node in
+each, collects exit codes and logs, and removes the deployment afterward.
+Service launch order, readiness, evaluation, and child-process teardown are
+owned by the in-pod runner, as walked through above.

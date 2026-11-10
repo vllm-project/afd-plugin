@@ -23,7 +23,7 @@ AFD connector implementations are grouped by backend:
 
 Both backends target vLLM `0.32.0`; Ascend additionally targets
 vLLM-Ascend `bd42eea0`. See the
-[runtime matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix)
+[runtime matrix](../../docs/support.md#tested-runtime-matrix)
 for tested configurations and backend-specific validation limits.
 
 Shared connector contracts, metadata containers, factory registration, and

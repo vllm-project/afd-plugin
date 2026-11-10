@@ -18,9 +18,10 @@ from afd_plugin.connectors import (
     AFDTransferContext,
     AFDTransferMetadata,
 )
+from afd_plugin.connectors.base import FFNExecutionSession
 
 
-class FakeFFNSession:
+class FakeFFNSession(FFNExecutionSession):
     """Configurable host lifecycle seam, with no device behavior."""
 
     def __init__(
@@ -39,12 +40,6 @@ class FakeFFNSession:
 
     def keep_serving(self, shutdown_requested: bool) -> bool:
         return next(self.serving, not shutdown_requested)
-
-    def before_first_step(self) -> None:
-        pass
-
-    def after_step(self) -> None:
-        pass
 
     def drain(self, run_one: Callable[[], None]) -> None:
         for _ in range(self.transactions):

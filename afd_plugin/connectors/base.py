@@ -8,21 +8,21 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
-
-import torch
+from typing import TYPE_CHECKING, Any
 
 from afd_plugin.config import AFDConfig, connector_extra_config_from_source
-from afd_plugin.connectors.metadata import (
-    AFDA2FTransferPayload,
-    AFDControlPayload,
-    AFDTransferContext,
-    FFNLocalExperts,
-    LocalExpertWeights,
-)
 
 if TYPE_CHECKING:
+    import torch
     from vllm.config import VllmConfig
+
+    from afd_plugin.connectors.metadata import (
+        AFDA2FTransferPayload,
+        AFDControlPayload,
+        AFDTransferContext,
+        FFNLocalExperts,
+        LocalExpertWeights,
+    )
 
 
 @dataclass(frozen=True)
@@ -37,73 +37,35 @@ class ConnectorExtraInfo:
         return {}
 
 
-class FFNExecutionSession(Protocol):
+class FFNExecutionSession:
     """Backend lifecycle used by FFN runners and workers.
 
-    Workers stop serving before draining and finishing the receiver, then
-    validate shutdown before releasing communication and model resources.
-    ``requires_drain`` marks backends that must retain resources until their
-    pending work and receiver handshake have completed.
-    """
-
-    requires_drain: bool
-
-    def keep_serving(self, shutdown_requested: bool) -> bool:
-        """Whether to serve another step given the local shutdown_requested flag.
-
-        A backend may keep serving after local shutdown until remote producers
-        are quiet.
-        """
-        ...
-
-    def before_first_step(self) -> None:
-        """Prepare backend state once before the first FFN step."""
-        ...
-
-    def after_step(self) -> None:
-        """Check backend status after a completed FFN step."""
-        ...
-
-    def drain(self, run_one: Callable[[], None]) -> None:
-        """Drain pending work using run_one to execute and wait for a transaction."""
-        ...
-
-    def finish_receiver(self) -> None:
-        """Finish the receiver handshake after pending work has drained."""
-        ...
-
-    def validate_shutdown(self) -> None:
-        """Raise RuntimeError if resources cannot yet be released safely."""
-        ...
-
-
-class DefaultFFNSession:
-    """Lifecycle for connectors that need no drain or receiver handshake.
-
-    Service stops when ``shutdown_requested`` is true. Other hooks are no-ops;
-    in particular, ``drain`` never invokes its ``run_one`` callback. Workers
-    and runners still own device synchronization and resource release.
+    By default, serving stops on local shutdown and the remaining hooks do
+    nothing. Backends with remote producers override the hooks and set
+    ``requires_drain``; pending work and the receiver handshake must finish
+    before communication or model resources are released.
     """
 
     requires_drain = False
 
     def keep_serving(self, shutdown_requested: bool) -> bool:
+        """Continue until local shutdown; remote producers may extend serving."""
         return not shutdown_requested
 
     def before_first_step(self) -> None:
-        pass
+        """Prepare backend state once before the first FFN step."""
 
     def after_step(self) -> None:
-        pass
+        """Check backend status after a completed FFN step."""
 
     def drain(self, run_one: Callable[[], None]) -> None:
-        pass
+        """Drain remote work when overridden; by default do not invoke run_one."""
 
     def finish_receiver(self) -> None:
-        pass
+        """Finish the receiver handshake after pending work has drained."""
 
     def validate_shutdown(self) -> None:
-        pass
+        """Reject release when backend resources are still in use."""
 
 
 class AFDConnectorBase(ABC):
@@ -191,7 +153,7 @@ class AFDConnectorBase(ABC):
         return nullcontext()
 
     def ffn_session(self) -> FFNExecutionSession:
-        return DefaultFFNSession()
+        return FFNExecutionSession()
 
     @abstractmethod
     def close(self) -> None:
@@ -459,6 +421,5 @@ __all__ = [
     "AFDControlPlaneClosedError",
     "AFDRoutedExpertsConnector",
     "ConnectorExtraInfo",
-    "DefaultFFNSession",
     "FFNExecutionSession",
 ]
