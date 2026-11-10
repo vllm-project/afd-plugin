@@ -52,7 +52,7 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
     # NPU parallel: AscendFFNEnvironment.initialize_device.
     # Reuse: PARTIAL - launcher and borrowed-group checks are identical;
     #   the device and native preflight are platform-specific.
-    def initialize_device(self) -> None:
+    def initialize_device(self, config: VllmConfig) -> None:
         """Select this rank's GPU after checking the launcher and native stack.
 
         Requires the ``torchrun`` environment to still match the settings and
@@ -60,8 +60,9 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
         so this process never adopts groups it does not own. Imports afdEP's
         DeepEP transport and, for the DeepGEMM expert backend, DeepGEMM, so a
         missing package fails before any weight is read. Maps ``LOCAL_RANK``
-        to the visible GPU the way vLLM's GPU Worker does (honoring
-        ``CUDA_VISIBLE_DEVICES``) and requires SM90 or newer.
+        to the visible GPU the way vLLM's GPU Worker does: first registers the
+        ``--device-ids`` assignment that ``config`` resolved, then maps through
+        it (and ``CUDA_VISIBLE_DEVICES``). Requires SM90 or newer.
         """
         self.require_uninitialized()
         self.require_launcher_environment()
@@ -69,6 +70,7 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
         settings = self.settings
         import torch
         from vllm.platforms import current_platform
+        from vllm.platforms.interface import set_assigned_physical_gpu_ids
 
         importlib.import_module(AFDEP_TRANSPORT_MODULE)
         expert_backend = settings.connector_extra_config.get("expert_backend")
@@ -77,6 +79,13 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
         # Importable only after the afdEP preflight above.
         from afd_plugin.connectors.gpu.deepep_m2n.connector import MIN_SM_MAJOR
 
+        # Same step as vLLM's GPU Worker.init_device: register --device-ids
+        # before mapping the local rank to a device.
+        assigned = config.parallel_config.assigned_physical_gpu_ids
+        if assigned is not None:
+            if settings.local_rank >= len(assigned):
+                raise ValueError("LOCAL_RANK is outside the --device-ids list")
+            set_assigned_physical_gpu_ids(assigned)
         visible_index = current_platform.logical_device_id_to_visible_device_id(
             settings.local_rank
         )

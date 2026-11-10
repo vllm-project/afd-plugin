@@ -54,8 +54,10 @@ class DeepEPM2NFFNBackend:
         Runs on the host thread, in the order that lets a bad deployment fail
         before the expert weights are read:
 
-        1. select and check the GPU and the afdEP/DeepGEMM stack;
-        2. build the F-only ``VllmConfig`` (AFD architecture, Triton MoE pin);
+        1. build the F-only ``VllmConfig`` (AFD architecture, Triton MoE pin),
+           which resolves ``--device-ids``; no device or weight is touched;
+        2. select and check the GPU through that assignment, and the
+           afdEP/DeepGEMM stack;
         3. create the F-only NCCL world and vLLM's model-parallel groups;
         4. construct the routed-experts runner, which runs the ModelRunnerV2
            and CUDA-graph validation and creates the connector (no
@@ -73,8 +75,8 @@ class DeepEPM2NFFNBackend:
         before the next native step, so a failure leaves it reachable.
         """
         environment = self.environment
-        environment.initialize_device()
         config = environment.build_config(self.args)
+        environment.initialize_device(config)
         environment.initialize_compute(config)
         with set_current_vllm_config(config):
             self.runner = GPUFFNRoutedExpertsModelRunner(config, environment.device)
