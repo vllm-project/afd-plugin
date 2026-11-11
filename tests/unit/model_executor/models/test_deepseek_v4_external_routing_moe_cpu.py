@@ -217,7 +217,7 @@ def _install_stub_modules():
     return component_module, context, comm_module
 
 
-def _restore_modules(written: dict[str, object]) -> None:
+def _restore_modules(written: dict[str, types.ModuleType | None]) -> None:
     """Put back only the names this fixture replaced, and drop the ones it added."""
 
     for name, original in written.items():
