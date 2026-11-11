@@ -10,6 +10,7 @@ without afdEP-comm; tests that build a lane substitute ``FakeElasticBuffer``.
 from __future__ import annotations
 
 import sys
+from importlib.machinery import ModuleSpec
 from importlib.util import find_spec
 from types import ModuleType
 
@@ -65,6 +66,10 @@ def install_fake_afdep() -> None:
     deepep.DispatchHandle = type("DispatchHandle", (), {})  # type: ignore[attr-defined]
     deepep.ReceiveResult = type("ReceiveResult", (), {})  # type: ignore[attr-defined]
     package.deepep = deepep  # type: ignore[attr-defined]
+    # A module without a spec makes a later find_spec("afdep") raise instead of
+    # reporting the package as missing.
+    package.__spec__ = ModuleSpec("afdep", None)
+    deepep.__spec__ = ModuleSpec("afdep.deepep", None)
     setattr(package, _FAKE_MARKER, True)
     setattr(deepep, _FAKE_MARKER, True)
     sys.modules["afdep"] = package

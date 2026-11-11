@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import itertools
 from types import SimpleNamespace
@@ -28,6 +29,10 @@ install_fake_afdep()
 
 def teardown_module() -> None:
     uninstall_fake_afdep()
+
+
+# ``--collect-only`` imports this module but never runs its teardown.
+atexit.register(uninstall_fake_afdep)
 
 
 from afd_plugin.config import afd_config_from_mapping  # noqa: E402

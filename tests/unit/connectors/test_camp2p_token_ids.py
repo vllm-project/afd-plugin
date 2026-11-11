@@ -91,6 +91,7 @@ def _vllm_stub() -> Iterator[None]:
     # Only the modules that are genuinely absent are installed. Overwriting a module
     # that another test already imported would outlive this context: the restore
     # below only knows about the names it added.
+    _imported_before = set(sys.modules)
     for name in missing:
         module = types.ModuleType(name)
         module.__path__ = []  # type: ignore[attr-defined]
@@ -101,6 +102,15 @@ def _vllm_stub() -> Iterator[None]:
         yield
     finally:
         for name in missing:
+            sys.modules.pop(name, None)
+        # Modules imported while the stub was installed keep its doubles in their
+        # globals, so drop them too; a later import then rebuilds them against the
+        # real package instead of reusing the test double.
+        for name in [
+            name
+            for name in sys.modules
+            if name.startswith("afd_plugin") and name not in _imported_before
+        ]:
             sys.modules.pop(name, None)
 
 

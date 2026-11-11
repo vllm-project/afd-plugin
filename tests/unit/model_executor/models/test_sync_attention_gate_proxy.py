@@ -38,10 +38,13 @@ except ModuleNotFoundError:
     _stubbed_torch_npu = True
 
 # The NPU adapter; the CUDA module of the same name has no sync gate shell.
-from afd_plugin.model_executor.models.npu import deepseek_v4 as adapter  # noqa: E402
-
-if _stubbed_torch_npu:
-    del sys.modules["torch_npu"]
+try:
+    from afd_plugin.model_executor.models.npu import (
+        deepseek_v4 as adapter,  # noqa: E402
+    )
+finally:
+    if _stubbed_torch_npu:
+        del sys.modules["torch_npu"]
 
 TOP_K = 2
 HIDDEN = 4
