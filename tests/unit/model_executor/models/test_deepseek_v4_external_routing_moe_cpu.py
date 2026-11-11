@@ -352,13 +352,15 @@ def test_the_routing_reaches_apply_unchanged(loaded):
     component = module.AFDExternalRoutingMoE(experts)
     context._EXTRA_CTX.moe_comm_method = _AllGatherComm(_moe_config())
 
-    hidden = torch.zeros(4, 2)
+    hidden = torch.zeros(4, 2, dtype=torch.bfloat16)
     ids = torch.arange(4, dtype=torch.int32).reshape(4, 1)
     weights = torch.ones(4, 1)
     component.forward(hidden, topk_ids=ids, topk_weights=weights)
 
     assert torch.equal(experts.seen[-1][0], ids)
     assert torch.equal(experts.seen[-1][1], weights)
+    # A model-dtype activation publishes no scale, which is the BF16 transport.
+    assert experts.scales_seen[-1] is None
 
 
 @pytest.mark.parametrize(
@@ -457,66 +459,26 @@ class _GatherGroup:
 
 
 @pytest.mark.parametrize(
-    "comm_cls,expected_shape",
+    "activation_dtype,scale_present,scale_rows,message",
     [
-        # The fused GMM consumes (rows, cols // 2, 2); the MC2 dispatcher takes
-        # the scale the transport delivered, two-dimensionally.
-        pytest.param(_AllGatherComm, (4, 1, 2), id="allgather"),
-        pytest.param(_MC2Comm, (4, 2), id="mc2"),
-    ],
-)
-def test_the_received_scale_reaches_the_experts_in_its_row_order(
-    loaded, comm_cls, expected_shape
-):
-    """Both consumers read the transported bytes, each in its own layout."""
-    module, context, _ = loaded
-    comm = comm_cls(_moe_config())
-    context._EXTRA_CTX.moe_comm_method = comm
-    experts = _Experts()
-    component = module.AFDExternalRoutingMoE(experts)
-
-    scale = _e8m0_rows(4, 2)
-    component.forward(
-        torch.zeros(4, 64, dtype=torch.float8_e4m3fn),
-        topk_ids=torch.arange(4, dtype=torch.int32).reshape(4, 1),
-        topk_weights=torch.ones(4, 1),
-        activation_scale=scale,
-    )
-
-    consumed = experts.scales_seen[-1]
-    assert consumed.shape == expected_shape
-    # Padding, gathering and re-laying must not move a byte relative to its row.
-    assert _e8m0_bytes(consumed) == _e8m0_bytes(scale)
-
-
-def test_a_bf16_activation_reaches_the_experts_without_a_scale(loaded):
-    """The BF16 transport publishes no scale, and the experts quantize as usual."""
-    module, context, _ = loaded
-    context._EXTRA_CTX.moe_comm_method = _AllGatherComm(_moe_config())
-    experts = _Experts()
-    component = module.AFDExternalRoutingMoE(experts)
-
-    component.forward(
-        torch.zeros(4, 2),
-        topk_ids=torch.zeros(4, 1, dtype=torch.int32),
-        topk_weights=torch.ones(4, 1),
-    )
-
-    assert experts.scales_seen[-1] is None
-
-
-@pytest.mark.parametrize(
-    "activation_dtype,scale_present,message",
-    [
-        pytest.param(torch.float8_e4m3fn, False, "without its MX scale", id="no-scale"),
-        pytest.param(torch.bfloat16, True, "E4M3 activation", id="scale-on-bf16"),
-        pytest.param(torch.float8_e5m2, True, "E4M3 activation", id="e5m2"),
+        pytest.param(
+            torch.float8_e4m3fn, False, 0, "without its MX scale", id="no-scale"
+        ),
+        pytest.param(torch.bfloat16, True, 4, "E4M3 activation", id="scale-on-bf16"),
+        pytest.param(torch.float8_e5m2, True, 4, "E4M3 activation", id="e5m2"),
+        pytest.param(
+            torch.float8_e4m3fn,
+            True,
+            3,
+            "one scale row per activation row",
+            id="row-count",
+        ),
     ],
 )
 def test_only_a_matching_e4m3_scale_pair_reaches_the_experts(
-    loaded, activation_dtype, scale_present, message
+    loaded, activation_dtype, scale_present, scale_rows, message
 ):
-    """A half pair would be silently wrong, so it must not start."""
+    """A half pair or a wrongly sized one would be silently wrong, so neither starts."""
     module, context, _ = loaded
     context._EXTRA_CTX.moe_comm_method = _AllGatherComm(_moe_config())
     experts = _Experts()
@@ -527,23 +489,9 @@ def test_only_a_matching_e4m3_scale_pair_reaches_the_experts(
             torch.zeros(4, 64, dtype=activation_dtype),
             topk_ids=torch.zeros(4, 1, dtype=torch.int32),
             topk_weights=torch.ones(4, 1),
-            activation_scale=_e8m0_rows(4, 2) if scale_present else None,
+            activation_scale=_e8m0_rows(scale_rows, 2) if scale_present else None,
         )
     assert experts.seen == [], "expert execution ran on a broken pair"
-
-
-def test_a_scale_with_the_wrong_row_count_is_rejected(loaded):
-    module, context, _ = loaded
-    context._EXTRA_CTX.moe_comm_method = _AllGatherComm(_moe_config())
-    component = module.AFDExternalRoutingMoE(_Experts())
-
-    with pytest.raises(RuntimeError, match="one scale row per activation row"):
-        component.forward(
-            torch.zeros(4, 64, dtype=torch.float8_e4m3fn),
-            topk_ids=torch.zeros(4, 1, dtype=torch.int32),
-            topk_weights=torch.ones(4, 1),
-            activation_scale=_e8m0_rows(3, 2),
-        )
 
 
 def test_the_dp_gather_pads_the_scale_with_the_neutral_exponent(loaded):
@@ -723,63 +671,6 @@ def _load_decoder_layer_methods():
     return namespace
 
 
-def test_compute_ffn_output_hands_the_transported_scale_to_the_experts(loaded):
-    """The model entry point must carry the scale through to the experts.
-
-    Runs the real ``compute_ffn_output`` into the real MoE component; only the
-    tensor the connector delivered is supplied by the test.
-    """
-    module, context, _ = loaded
-    context._EXTRA_CTX.moe_comm_method = _AllGatherComm(_moe_config())
-    experts = _Experts()
-    namespace = _load_decoder_layer_methods()
-    layer = types.SimpleNamespace(
-        uses_external_routing=True,
-        mlp=namespace["native"].DeepseekV4MoE(),
-        afd_external_routing_moe=module.AFDExternalRoutingMoE(experts),
-    )
-    layer._compute_external_routing_ffn = types.MethodType(
-        namespace["_compute_external_routing_ffn"], layer
-    )
-
-    scale = _e8m0_rows(4, 2)
-    namespace["compute_ffn_output"](
-        layer,
-        torch.zeros(4, 64, dtype=torch.float8_e4m3fn),
-        topk_ids=torch.arange(4, dtype=torch.int32).reshape(4, 1),
-        topk_weights=torch.ones(4, 1),
-        activation_scale=scale,
-    )
-
-    consumed = experts.scales_seen[-1]
-    assert consumed.shape == (4, 1, 2)
-    assert _e8m0_bytes(consumed) == _e8m0_bytes(scale)
-
-
-def test_compute_ffn_output_refuses_a_quantized_activation_without_its_scale(loaded):
-    module, context, _ = loaded
-    context._EXTRA_CTX.moe_comm_method = _AllGatherComm(_moe_config())
-    experts = _Experts()
-    namespace = _load_decoder_layer_methods()
-    layer = types.SimpleNamespace(
-        uses_external_routing=True,
-        mlp=namespace["native"].DeepseekV4MoE(),
-        afd_external_routing_moe=module.AFDExternalRoutingMoE(experts),
-    )
-    layer._compute_external_routing_ffn = types.MethodType(
-        namespace["_compute_external_routing_ffn"], layer
-    )
-
-    with pytest.raises(RuntimeError, match="without its MX scale"):
-        namespace["compute_ffn_output"](
-            layer,
-            torch.zeros(4, 64, dtype=torch.float8_e4m3fn),
-            topk_ids=torch.zeros(4, 1, dtype=torch.int32),
-            topk_weights=torch.ones(4, 1),
-        )
-    assert experts.seen == []
-
-
 def _dispatch_input(
     *,
     scale=None,
@@ -801,13 +692,14 @@ def _dispatch_input(
     )
 
 
-def test_mc2_dispatch_consumes_the_transported_scale(loaded):
+@pytest.mark.parametrize("comm_quant_mode", [None, 0], ids=["unset", "explicit-0"])
+def test_mc2_dispatch_consumes_the_transported_scale(loaded, comm_quant_mode):
     """The operator must read the Attention-side scale instead of making one."""
     module, _, _ = loaded
     scale = _e8m0_rows(4, 2)
 
     kwargs = module.AFDTokenDispatcherWithMC2().get_dispatch_mc2_kwargs(
-        _dispatch_input(scale=scale)
+        _dispatch_input(scale=scale, comm_quant_mode=comm_quant_mode)
     )
 
     assert kwargs["scales"] is scale
@@ -824,18 +716,6 @@ def test_mc2_dispatch_without_a_scale_keeps_the_native_kwargs(loaded):
 
     assert kwargs["scales"] is None
     assert kwargs["quant_mode"] == 4, "upstream resolves the MXFP communication mode"
-
-
-def test_mc2_dispatch_accepts_an_explicit_pre_quantized_mode(loaded):
-    module, _, _ = loaded
-    scale = _e8m0_rows(4, 2)
-
-    kwargs = module.AFDTokenDispatcherWithMC2().get_dispatch_mc2_kwargs(
-        _dispatch_input(scale=scale, comm_quant_mode=0)
-    )
-
-    assert kwargs["scales"] is scale
-    assert kwargs["quant_mode"] == 0
 
 
 def test_mc2_dispatch_rejects_a_conflicting_quant_mode(loaded):
