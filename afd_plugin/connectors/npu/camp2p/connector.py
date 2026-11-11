@@ -90,6 +90,10 @@ A2E_MX_GROUP_SIZE: Final[int] = 32
 A2E_MX_MIN_AIV_NUM: Final[int] = 3
 # Each side of the A2E pair must fit the operator's rank addressing.
 A2E_MX_MAX_RANKS_PER_SIDE: Final[int] = 32
+#: Startup verdict: whether this rank keeps the FFN on an MoE path the
+#: external-routing consumer supports.
+A2E_MOE_PATH_OK: Final[int] = 1
+A2E_MOE_PATH_UNSUPPORTED: Final[int] = 0
 #: UB bytes the operator reserves for the routing ids of one call; it moves the
 #: whole `[rows, topk]` int32 block in one transfer.
 A2E_MX_GATE_UB_BYTES: Final[int] = 192 * 1024 - 1024
@@ -488,6 +492,38 @@ def _require_one_quant_mode(modes: list[int], local_mode: int) -> None:
         )
 
 
+def _require_one_path_verdict(
+    verdicts: list[int],
+    *,
+    is_attention: bool,
+    failure: Exception | None,
+) -> None:
+    """Fail every rank when any of them cannot run a supported FFN path.
+
+    The control plane is one-way, so a rejection only saws off the FFN side: the
+    Attention side keeps the same verdict and raises here, before `afd_moe` and
+    `p2p` exist, instead of entering an A2E the peer will never answer.
+    """
+    if all(int(verdict) == A2E_MOE_PATH_OK for verdict in verdicts):
+        return
+    if is_attention:
+        raise RuntimeError(
+            "CAMP2P quant_mode=4 was refused by the FFN role: its MoE selector "
+            "does not resolve to ALLGATHER or MC2 for the largest batch "
+            "Attention can send, and the external-routing consumer supports "
+            "only those paths",
+        )
+    if failure is not None:
+        raise RuntimeError(
+            "CAMP2P quant_mode=4 could not resolve an FFN MoE path; the "
+            "selector failed before it could answer",
+        ) from failure
+    raise RuntimeError(
+        "CAMP2P quant_mode=4 needs an FFN that runs ALLGATHER or MC2; the MoE "
+        "selector chose another path for the largest batch Attention can send",
+    )
+
+
 class CAMP2pAFDConnector(AFDConnectorBase):
     """Move model data between Attention and FFN workers on Ascend NPU.
 
@@ -569,6 +605,34 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         self._fail_if_mxfp8_transport_unsupported(afd_config)
         self.control_plane = CAMP2pAFDControlPlane(self)
 
+    def _moe_path_verdict(self, rows: Any) -> tuple[int, Exception | None]:
+        """Decide whether this mode-4 group keeps the FFN on a supported path.
+
+        Only the FFN role asks the selector, and only the Attention role
+        publishes a batch bound; the aggregate is ordered FFN first, so the bound
+        is read from the Attention rows alone. The selector's import, capacity
+        lookup and call all sit inside the guard: a failure has to reach the
+        other ranks through the verdict collective rather than leaving them
+        waiting for an answer that never comes.
+        """
+        if self.afd_config.role != "ffn":
+            return A2E_MOE_PATH_OK, None
+        try:
+            # Reading the bound out of the device aggregate can fail too, and a
+            # rank that stops here never publishes a verdict.
+            max_rows = int(rows[self.ffn_size :, 1].max())
+            from vllm_ascend.ascend_forward_context import (
+                MoECommType,
+                select_moe_comm_method,
+            )
+
+            chosen = select_moe_comm_method(max_rows, self.vllm_config)
+        except Exception as exc:  # noqa: BLE001 - reported as a verdict below
+            return A2E_MOE_PATH_UNSUPPORTED, exc
+        if chosen not in (MoECommType.ALLGATHER, MoECommType.MC2):
+            return A2E_MOE_PATH_UNSUPPORTED, None
+        return A2E_MOE_PATH_OK, None
+
     def _fail_if_mxfp8_transport_unsupported(self, afd_config: AFDConfig) -> None:
         """Refuse ``quant_mode=4`` when this deployment cannot carry it.
 
@@ -603,16 +667,6 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             )
         # The operator carries the whole routing-id block of one call in a single
         # UB region, so a batch larger than this cannot be sent at all.
-        ids_per_row = self.num_experts_per_tok * 4
-        rows_max = A2E_MX_GATE_UB_BYTES // ids_per_row
-        if self.max_num_batched_tokens > rows_max:
-            raise RuntimeError(
-                "quant_mode=4 sends the routing ids of a whole call through one "
-                f"operator transfer, which allows at most {rows_max} tokens at "
-                f"topk={self.num_experts_per_tok}; this deployment can batch "
-                f"{self.max_num_batched_tokens}. Lower --max-num-batched-tokens "
-                "or keep quant_mode=0",
-            )
         _require_a5_device()
         supported = a2e_accepts_mxfp8_arguments()
         if supported is False:
@@ -687,18 +741,53 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         # small collective fails both ends here -- before profile, capture and the
         # first A2E call -- instead of leaving the Attention side waiting for an E2A
         # the FFN side will never send.
-        local_mode = torch.tensor([self.quant_mode], dtype=torch.int32, device="npu")
-        gathered_modes = torch.empty(
-            self.ffn_size + self.attn_size,
+        attention_bound = (
+            self.max_num_batched_tokens if self.afd_config.role == "attention" else 0
+        )
+        world_size = self.ffn_size + self.attn_size
+        local_mode = torch.tensor(
+            [self.quant_mode, attention_bound],
             dtype=torch.int32,
             device="npu",
         )
+        gathered_modes = torch.empty(world_size * 2, dtype=torch.int32, device="npu")
         torch.distributed.all_gather_into_tensor(
             gathered_modes,
             local_mode,
             group=self.afd_pg,
         )
-        _require_one_quant_mode(gathered_modes.tolist(), self.quant_mode)
+        rows = gathered_modes.view(-1, 2)
+        _require_one_quant_mode(rows[:, 0].tolist(), self.quant_mode)
+        if self.quant_mode == A2E_QUANT_MODE_MXFP8:
+            # Only an all-mode-4 group asks the selector, so BF16 keeps exactly
+            # one startup collective. The ids of one call have to fit the UB
+            # region, and both roles judge that from the same published bound.
+            rows_max = A2E_MX_GATE_UB_BYTES // (self.num_experts_per_tok * 4)
+            attention_rows = int(rows[:, 1].max())
+            if attention_rows > rows_max:
+                raise RuntimeError(
+                    "quant_mode=4 carries the routing ids of one call in a single "
+                    f"operator transfer, which allows at most {rows_max} tokens at "
+                    f"topk={self.num_experts_per_tok}, but the Attention role "
+                    f"publishes {attention_rows}. Lower --max-num-batched-tokens "
+                    "on the Attention role or keep quant_mode=0",
+                )
+            verdict, failure = self._moe_path_verdict(rows)
+            gathered_verdicts = torch.empty(
+                world_size,
+                dtype=torch.int32,
+                device="npu",
+            )
+            torch.distributed.all_gather_into_tensor(
+                gathered_verdicts,
+                torch.tensor([verdict], dtype=torch.int32, device="npu"),
+                group=self.afd_pg,
+            )
+            _require_one_path_verdict(
+                gathered_verdicts.tolist(),
+                is_attention=self.afd_config.role == "attention",
+                failure=failure,
+            )
 
         if self.afd_config.role == "ffn":
             self.ffn_pg = init_afd_process_group(

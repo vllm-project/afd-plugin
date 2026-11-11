@@ -25,6 +25,8 @@ import logging
 import sys
 import types
 from collections.abc import Iterator
+from importlib.machinery import ModuleSpec
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -801,44 +803,106 @@ class _FakeGathered:
         return list(self._modes)
 
 
-def _init_on_stub_groups(monkeypatch, modes, local_mode, *, role="attention"):
-    """Drive the real ``init_afd_connector`` against recorded stub groups."""
+def _init_pair(
+    monkeypatch,
+    *,
+    role,
+    mode,
+    bound=0,
+    gathered_modes,
+    verdicts=None,
+    selection="ALLGATHER",
+    selector=None,
+    topk=2,
+):
+    """Drive the real startup handshake for a 1A1F pair and record every event."""
     import types as _types
 
-    order = []
-    handshakes = []
-    afd_pg = object()
+    events = []
+    published = []
 
     def fake_group(**kwargs):
         name = kwargs["group_name"]
-        order.append(name)
+        events.append(name)
         backend = SimpleNamespace(get_hccl_comm_name=lambda rank: f"hccl-{name}")
-        return SimpleNamespace(
-            _get_backend=lambda device: backend,
-            name=name,
-            group=afd_pg if name == "afd" else object(),
-        )
+        return SimpleNamespace(_get_backend=lambda device: backend, name=name)
 
-    def fake_all_gather(gathered, local, group=None):
-        order.append("handshake")
-        handshakes.append((group, local.tolist()[0]))
+    def fake_gather(output, local, group=None):
+        width = int(local.numel())
+        events.append("mode_gather" if width == 2 else "verdict_gather")
+        published.append([int(value) for value in local.tolist()])
+        source = gathered_modes if width == 2 else verdicts
+        assert source is not None, "no preset for this collective"
+        target = output.view(-1, width)
+        target.copy_(torch.as_tensor(source, dtype=torch.int32).reshape_as(target))
+        # Only the peers come from the preset: this rank's slot carries what it
+        # actually published, so a wrong verdict cannot be masked by the preset.
+        local_slot = 0 if role == "ffn" else 1
+        target[local_slot].copy_(local)
 
     class _FakeTorch:
-        int32 = "int32"
-        distributed = SimpleNamespace(all_gather_into_tensor=fake_all_gather)
+        int32 = torch.int32
+        distributed = SimpleNamespace(all_gather_into_tensor=fake_gather)
+
+        def __getattr__(self, name):
+            return getattr(torch, name)
 
         @staticmethod
-        def tensor(values, **kwargs):
-            return SimpleNamespace(tolist=lambda: list(values))
+        def _cpu(kwargs):
+            if kwargs.get("device") == "npu":
+                kwargs["device"] = "cpu"
+            return kwargs
 
-        @staticmethod
-        def empty(*args, **kwargs):
-            return _FakeGathered(modes)
+        def tensor(self, *args, **kwargs):
+            return torch.tensor(*args, **self._cpu(kwargs))
+
+        def empty(self, *args, **kwargs):
+            return torch.empty(*args, **self._cpu(kwargs))
 
         @staticmethod
         def device(name):
             return name
 
+    if selector is not None or mode == 4:
+        module = _types.ModuleType("vllm_ascend.ascend_forward_context")
+
+        class _MoECommType:
+            ALLGATHER = "ALLGATHER"
+            MC2 = "MC2"
+            ALLTOALL = "ALLTOALL"
+            FUSED_MC2 = "FUSED_MC2"
+
+        chosen = selector if selector is not None else lambda *args, **kwargs: selection
+        vars(module)["MoECommType"] = _MoECommType
+        vars(module)["select_moe_comm_method"] = chosen
+        monkeypatch.setitem(
+            sys.modules, "vllm_ascend", _types.ModuleType("vllm_ascend")
+        )
+        monkeypatch.setitem(sys.modules, "vllm_ascend.ascend_forward_context", module)
+
+    from afd_plugin.config import AFDConfig
+
+    monkeypatch.setattr(camp2p_module, "a2e_accepts_mxfp8_arguments", lambda: True)
+    vllm_config = _vllm_config(extra_config={"quant_mode": mode})
+    vllm_config.scheduler_config.max_num_batched_tokens = bound
+    vllm_config.model_config.hf_config.num_experts_per_tok = topk
+    try:
+        connector = CAMP2pAFDConnector(
+            0,
+            0,
+            vllm_config,
+            AFDConfig(
+                connector="CAMP2pAFDConnector",
+                role=role,
+                num_attention_ranks=1,
+                num_ffn_ranks=1,
+                compute_gate_on_attention=True,
+            ),
+            0,
+        )
+    except RuntimeError as exc:
+        return events, published, exc, None
+    connector._initialized = False
     monkeypatch.setitem(sys.modules, "torch_npu", _types.ModuleType("torch_npu"))
     monkeypatch.setattr(camp2p_module, "ensure_cam_p2p_ops_available", lambda: None)
     monkeypatch.setattr(camp2p_module, "_register_camp2p_custom_ops", lambda: None)
@@ -846,48 +910,177 @@ def _init_on_stub_groups(monkeypatch, modes, local_mode, *, role="attention"):
     monkeypatch.setattr(
         camp2p_module, "create_hccl_process_group_options", lambda *args: None
     )
+    monkeypatch.setattr(camp2p_module, "a2e_accepts_mxfp8_arguments", lambda: True)
     monkeypatch.setattr(camp2p_module, "torch", _FakeTorch())
-    connector = _connector(role=role, rank=0)
-    connector._initialized = False
-    connector.quant_mode = local_mode
+    error = None
     try:
         connector.init_afd_connector()
-    finally:
-        pass
-    return order, handshakes, connector
+    except RuntimeError as exc:
+        error = exc
+    return events, published, error, connector
 
 
 @pytest.mark.parametrize(
-    "modes,local_mode,refused",
+    "role,mode,gathered_modes,verdicts,selection,events,error_match",
     [
-        pytest.param([0, 0, 0, 0], 0, False, id="agree-0"),
-        pytest.param([4, 4, 4, 4], 4, False, id="agree-4"),
-        pytest.param([4, 4, 0, 0], 4, True, id="attention-4-ffn-0"),
-        pytest.param([4, 4, 0, 0], 0, True, id="attention-0-ffn-4"),
+        pytest.param(
+            "ffn",
+            0,
+            [[0, 0], [0, 0]],
+            None,
+            "ALLGATHER",
+            ["afd", "mode_gather", "afd_moe", "p2p"],
+            None,
+            id="ffn-bf16",
+        ),
+        pytest.param(
+            "attention",
+            0,
+            [[0, 0], [0, 0]],
+            None,
+            "ALLGATHER",
+            ["afd", "mode_gather", "p2p"],
+            None,
+            id="attn-bf16",
+        ),
+        pytest.param(
+            "ffn",
+            4,
+            [[4, 0], [4, 1024]],
+            [1, 1],
+            "MC2",
+            ["afd", "mode_gather", "verdict_gather", "afd_moe", "p2p"],
+            None,
+            id="ffn-mode4",
+        ),
+        pytest.param(
+            "attention",
+            4,
+            [[4, 0], [4, 1024]],
+            [1, 1],
+            "ALLGATHER",
+            ["afd", "mode_gather", "verdict_gather", "p2p"],
+            None,
+            id="attn-mode4",
+        ),
+        pytest.param(
+            "ffn",
+            0,
+            [[0, 0], [4, 1024]],
+            None,
+            "ALLGATHER",
+            ["afd", "mode_gather"],
+            "mismatch across ranks",
+            id="ffn-mixed",
+        ),
+        pytest.param(
+            "attention",
+            4,
+            [[0, 0], [4, 1024]],
+            None,
+            "ALLGATHER",
+            ["afd", "mode_gather"],
+            "mismatch across ranks",
+            id="attn-mixed",
+        ),
+        pytest.param(
+            "ffn",
+            4,
+            [[4, 0], [4, 1024]],
+            [0, 1],
+            "ALLTOALL",
+            ["afd", "mode_gather", "verdict_gather"],
+            "chose another path",
+            id="ffn-alltoall",
+        ),
+        pytest.param(
+            "attention",
+            4,
+            [[4, 0], [4, 1024]],
+            [0, 1],
+            "ALLTOALL",
+            ["afd", "mode_gather", "verdict_gather"],
+            "refused by the FFN role",
+            id="attn-peer-refused",
+        ),
     ],
 )
-def test_init_verifies_the_quant_mode_on_the_afd_group_first(
-    monkeypatch, modes, local_mode, refused
+def test_startup_handshake_stops_where_the_pair_is_refused(
+    monkeypatch,
+    on_a5,
+    role,
+    mode,
+    gathered_modes,
+    verdicts,
+    selection,
+    events,
+    error_match,
 ):
-    """Deleting the handshake must break this: order and mode are the contract."""
-    if refused:
-        with pytest.raises(RuntimeError, match="mismatch across ranks"):
-            order, handshakes, connector = _init_on_stub_groups(
-                monkeypatch, modes, local_mode, role="ffn"
-            )
-        return
-
-    order, handshakes, connector = _init_on_stub_groups(
-        monkeypatch, modes, local_mode, role="ffn"
+    """Each case records the collectives it reached, so the stop point is proved."""
+    seen, published, error, _ = _init_pair(
+        monkeypatch,
+        role=role,
+        mode=mode,
+        gathered_modes=gathered_modes,
+        verdicts=verdicts,
+        selection=selection,
     )
 
-    assert order[0] == "afd"
-    assert order.count("handshake") == 1
-    assert order.index("handshake") < order.index("afd_moe"), "afd_moe was built first"
-    assert order.index("handshake") < order.index("p2p"), "p2p was built first"
-    group, published = handshakes[0]
-    assert group is connector.afd_pg, "the mode check ran on another group"
-    assert published == local_mode, "the handshake published another rank's mode"
+    assert seen == events
+    if error_match is None:
+        assert error is None
+    else:
+        assert error is not None and error_match in str(error)
+    if mode == 4 and role == "ffn":
+        assert published[0] == [4, 0], "the FFN must publish no batch bound"
+
+
+def test_startup_handshake_asks_the_selector_about_attentions_bound(monkeypatch, on_a5):
+    """FFN's own limit is irrelevant: the selector sees what Attention can send."""
+    asked = []
+
+    def selector(max_rows, vllm_config, **kwargs):
+        asked.append(max_rows)
+        return "MC2"
+
+    seen, published, error, _ = _init_pair(
+        monkeypatch,
+        role="ffn",
+        mode=4,
+        bound=512,
+        gathered_modes=[[4, 0], [4, 1024]],
+        verdicts=[1, 1],
+        selector=selector,
+    )
+
+    assert error is None
+    assert asked == [1024]
+    assert published[0] == [4, 0]
+
+
+def test_startup_handshake_reports_a_selector_failure_to_both_roles(monkeypatch, on_a5):
+    """A raising selector must still publish its verdict, or Attention waits."""
+
+    class _NoCapacityError(RuntimeError):
+        pass
+
+    def explode(*args, **kwargs):
+        raise _NoCapacityError("mc2 capacity is not set")
+
+    seen, published, error, _ = _init_pair(
+        monkeypatch,
+        role="ffn",
+        mode=4,
+        gathered_modes=[[4, 0], [4, 1024]],
+        verdicts=[0, 1],
+        selector=explode,
+    )
+
+    assert seen == ["afd", "mode_gather", "verdict_gather"]
+    assert published[-1] == [0], "the FFN published a passing verdict"
+    assert isinstance(error, RuntimeError)
+    assert "could not resolve" in str(error)
+    assert isinstance(error.__cause__, _NoCapacityError), "the original cause is lost"
 
 
 def test_send_attn_output_reaches_the_operator_as_a_quantized_pair(monkeypatch):
@@ -963,26 +1156,50 @@ def test_send_attn_output_reaches_the_operator_as_a_quantized_pair(monkeypatch):
     assert call[13] == camp2p_module.A2E_QUANT_MODE_MXFP8
 
 
-@pytest.mark.parametrize(
-    "max_tokens,topk,refused",
-    [
-        pytest.param(8149, 6, False, id="at-cap"),
-        pytest.param(8150, 6, True, id="one-row-over"),
-        pytest.param(8192, 6, True, id="configured-max"),
-        pytest.param(8192, 2, False, id="smaller-topk"),
-    ],
-)
-def test_mxfp8_construction_bounds_the_routing_id_block(
-    monkeypatch, on_a5, max_tokens, topk, refused
-):
-    monkeypatch.setattr(camp2p_module, "a2e_accepts_mxfp8_arguments", lambda: True)
-    vllm_config = _vllm_config(extra_config={"quant_mode": 4})
-    vllm_config.scheduler_config.max_num_batched_tokens = max_tokens
-    vllm_config.model_config.hf_config.num_experts_per_tok = topk
+def test_the_routing_id_bound_is_judged_from_the_attention_role(monkeypatch, on_a5):
+    """FFN's own limit is irrelevant; Attention's published bound decides."""
+    seen, published, error, _ = _init_pair(
+        monkeypatch,
+        role="ffn",
+        mode=4,
+        bound=8192,
+        gathered_modes=[[4, 0], [4, 4096]],
+        verdicts=[1, 1],
+        selector=lambda *args, **kwargs: "MC2",
+        topk=6,
+    )
 
-    if refused:
-        with pytest.raises(RuntimeError, match="routing ids of a whole call"):
-            CAMP2pAFDConnector(0, 0, vllm_config, _mxfp8_config(), 0)
-    else:
-        connector = CAMP2pAFDConnector(0, 0, vllm_config, _mxfp8_config(), 0)
-        assert connector.max_num_batched_tokens == max_tokens
+    assert error is None, "the FFN rejected a valid pair on its own limit"
+    assert seen == ["afd", "mode_gather", "verdict_gather", "afd_moe", "p2p"]
+    assert published[0] == [4, 0]
+
+
+def test_the_handshake_rejects_a_bound_the_ids_cannot_fit(monkeypatch, on_a5):
+    """The sender is rejected at construction; the receiver on the handshake."""
+    seen, published, error, _ = _init_pair(
+        monkeypatch,
+        role="ffn",
+        mode=4,
+        bound=8192,
+        gathered_modes=[[4, 0], [4, 8150]],
+        verdicts=[1, 1],
+        selector=lambda *args, **kwargs: "MC2",
+        topk=6,
+    )
+    assert seen == ["afd", "mode_gather"], seen
+    assert error is not None and "publishes 8150" in str(error)
+
+    # The Attention role cannot publish an over-limit bound: its own check runs
+    # before any group exists, so the pair never reaches a transfer.
+    seen, published, error, _ = _init_pair(
+        monkeypatch,
+        role="attention",
+        mode=4,
+        bound=8150,
+        gathered_modes=[[4, 0], [4, 8150]],
+        verdicts=[1, 1],
+        selector=lambda *args, **kwargs: "MC2",
+        topk=6,
+    )
+    assert seen == ["afd", "mode_gather"], seen
+    assert error is not None and "publishes 8150" in str(error)
