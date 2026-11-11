@@ -25,8 +25,6 @@ import logging
 import sys
 import types
 from collections.abc import Iterator
-from importlib.machinery import ModuleSpec
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -148,6 +146,8 @@ def _vllm_stub() -> Iterator[None]:
 
 with _vllm_stub():
     from afd_plugin.connectors.metadata import (
+        AFDControlPayload,
+        AFDDPMetadata,
         AFDTransferContext,
         AFDTransferMetadata,
     )
@@ -577,6 +577,33 @@ def _mxfp8_config(*, attention=4, ffn=4, gate=True):
     )
 
 
+@pytest.fixture
+def on_a5(monkeypatch):
+    """Stand in for the device check so the remaining gate rules stay covered."""
+
+    monkeypatch.setattr(camp2p_module, "_require_a5_device", lambda: None)
+
+
+def test_mxfp8_requires_an_a5_device(monkeypatch):
+    import enum
+
+    class _DeviceType(enum.Enum):
+        A3 = 1
+        A5 = 3
+
+    utils = ModuleType("vllm_ascend.utils")
+    vars(utils)["AscendDeviceType"] = _DeviceType
+    vars(utils)["get_ascend_device_type"] = lambda: _DeviceType.A3
+    monkeypatch.setitem(sys.modules, "vllm_ascend", ModuleType("vllm_ascend"))
+    monkeypatch.setitem(sys.modules, "vllm_ascend.utils", utils)
+
+    with pytest.raises(RuntimeError, match="requires an Ascend A5 device"):
+        camp2p_module._require_a5_device()
+
+    vars(utils)["get_ascend_device_type"] = lambda: _DeviceType.A5
+    camp2p_module._require_a5_device()
+
+
 def _mxfp8_connector(*, attention=4, ffn=4, gate=True):
     return CAMP2pAFDConnector(
         0,
@@ -587,7 +614,7 @@ def _mxfp8_connector(*, attention=4, ffn=4, gate=True):
     )
 
 
-def test_mxfp8_construction_accepts_a_supported_topology(monkeypatch):
+def test_mxfp8_construction_accepts_a_supported_topology(monkeypatch, on_a5):
     monkeypatch.setattr(camp2p_module, "a2e_accepts_mxfp8_arguments", lambda: True)
 
     connector = _mxfp8_connector(attention=4, ffn=4)
@@ -605,7 +632,7 @@ def test_mxfp8_construction_accepts_a_supported_topology(monkeypatch):
     ],
 )
 def test_mxfp8_construction_refuses_a_deployment_that_cannot_carry_it(
-    monkeypatch, attention, ffn, gate, match
+    monkeypatch, on_a5, attention, ffn, gate, match
 ):
     monkeypatch.setattr(camp2p_module, "a2e_accepts_mxfp8_arguments", lambda: True)
 
@@ -621,7 +648,7 @@ def test_mxfp8_construction_refuses_a_deployment_that_cannot_carry_it(
     ],
 )
 def test_mxfp8_construction_reports_what_the_operator_probe_said(
-    monkeypatch, probe, match
+    monkeypatch, on_a5, probe, match
 ):
     monkeypatch.setattr(camp2p_module, "a2e_accepts_mxfp8_arguments", lambda: probe)
 
@@ -789,3 +816,154 @@ def test_the_mxfp8_receive_refuses_the_token_ids_slot():
             layer_idx=0,
             recv_input_ids=True,
         )
+
+
+def test_the_control_plane_declares_the_local_quant_mode(monkeypatch):
+    sent: list[AFDControlPayload] = []
+    monkeypatch.setattr(
+        camp2p_module,
+        "send_control_payload",
+        lambda payload, **kwargs: sent.append(payload),
+    )
+    connector = _connector(role="attention", rank=0)
+    connector.quant_mode = camp2p_module.A2E_QUANT_MODE_MXFP8
+    connector.p2p_pg = object()
+    connector.dst_list = [1]
+    connector.topology = SimpleNamespace(is_attn_top_min_size_rank=True)
+
+    connector.control_plane.send_dp_metadata_list(
+        AFDControlPayload(
+            dp_metadata_list={0: AFDDPMetadata(torch.tensor([2], dtype=torch.int32))},
+            is_graph_capturing=False,
+            is_warmup=False,
+        ),
+    )
+
+    assert sent[0].quant_mode == camp2p_module.A2E_QUANT_MODE_MXFP8
+
+
+def test_a_mixed_quant_mode_pair_is_refused_before_the_first_transfer(monkeypatch):
+    """Attention on 4 and FFN on 0 must fail at the handshake, not read bytes."""
+    payload = AFDControlPayload(
+        dp_metadata_list={0: AFDDPMetadata(torch.tensor([2], dtype=torch.int32))},
+        is_graph_capturing=False,
+        is_warmup=False,
+        quant_mode=camp2p_module.A2E_QUANT_MODE_MXFP8,
+    )
+    monkeypatch.setattr(camp2p_module, "recv_control_payload", lambda **kwargs: payload)
+    connector = _connector(role="ffn", rank=1)
+    connector.p2p_pg = object()
+    connector.p2p_rank = 0
+    connector.min_size = 1
+    connector.ffn_size = 2
+
+    with pytest.raises(RuntimeError, match="quant_mode=4"):
+        connector.control_plane.recv_dp_metadata_list()
+
+
+def test_ranks_must_agree_on_the_quant_mode():
+    """4/0 and 0/4 both fail, from either side's point of view."""
+    camp2p_module._require_one_quant_mode([0, 0, 0, 0], 0)
+    camp2p_module._require_one_quant_mode([4, 4, 4, 4], 4)
+
+    with pytest.raises(RuntimeError, match="mismatch across ranks"):
+        camp2p_module._require_one_quant_mode([4, 4, 0, 0], 4)
+    with pytest.raises(RuntimeError, match="mismatch across ranks"):
+        camp2p_module._require_one_quant_mode([4, 4, 0, 0], 0)
+
+
+def test_a_matching_quant_mode_pair_is_accepted(monkeypatch):
+    payload = AFDControlPayload(
+        dp_metadata_list={0: AFDDPMetadata(torch.tensor([2], dtype=torch.int32))},
+        is_graph_capturing=False,
+        is_warmup=False,
+        quant_mode=camp2p_module.A2E_QUANT_MODE_MXFP8,
+    )
+    monkeypatch.setattr(camp2p_module, "recv_control_payload", lambda **kwargs: payload)
+    connector = _connector(role="ffn", rank=1)
+    connector.quant_mode = camp2p_module.A2E_QUANT_MODE_MXFP8
+    connector.p2p_pg = object()
+    connector.p2p_rank = 0
+    connector.min_size = 1
+    connector.ffn_size = 2
+
+    assert connector.control_plane.recv_dp_metadata_list() is payload
+
+
+class _FakeGathered:
+    """Stand-in for the int32 mode tensor the handshake reads back."""
+
+    def __init__(self, modes):
+        self._modes = list(modes)
+
+    def tolist(self):
+        return list(self._modes)
+
+
+def _init_on_stub_groups(monkeypatch, modes, *, role="attention"):
+    """Drive the real `init_afd_connector` against recorded stub groups."""
+    import types as _types
+
+    order = []
+    handshakes = []
+    afd_pg = object()
+
+    def fake_group(**kwargs):
+        name = kwargs["group_name"]
+        order.append(name)
+        backend = SimpleNamespace(get_hccl_comm_name=lambda rank: f"hccl-{name}")
+        return SimpleNamespace(
+            _get_backend=lambda device: backend,
+            name=name,
+            group=afd_pg if name == "afd" else object(),
+        )
+
+    def fake_all_gather(gathered, local, group=None):
+        order.append("handshake")
+        handshakes.append(group)
+
+    class _FakeTorch:
+        int32 = "int32"
+        distributed = SimpleNamespace(all_gather_into_tensor=fake_all_gather)
+
+        @staticmethod
+        def tensor(*args, **kwargs):
+            return SimpleNamespace(tolist=lambda: [0])
+
+        @staticmethod
+        def empty(*args, **kwargs):
+            return _FakeGathered(modes)
+
+        @staticmethod
+        def device(name):
+            return name
+
+    monkeypatch.setitem(sys.modules, "torch_npu", _types.ModuleType("torch_npu"))
+    monkeypatch.setattr(camp2p_module, "ensure_cam_p2p_ops_available", lambda: None)
+    monkeypatch.setattr(camp2p_module, "_register_camp2p_custom_ops", lambda: None)
+    monkeypatch.setattr(camp2p_module, "init_afd_process_group", fake_group)
+    monkeypatch.setattr(
+        camp2p_module, "create_hccl_process_group_options", lambda *args: None
+    )
+    monkeypatch.setattr(camp2p_module, "torch", _FakeTorch())
+    connector = _connector(role=role, rank=0)
+    connector._initialized = False
+    connector.init_afd_connector()
+    return order, handshakes, connector
+
+
+def test_init_verifies_the_quant_mode_on_the_afd_group_before_other_groups(monkeypatch):
+    """Deleting the handshake must break this: the order is the contract."""
+    order, handshakes, connector = _init_on_stub_groups(
+        monkeypatch, [0, 0, 0, 0], role="ffn"
+    )
+
+    assert order[0] == "afd"
+    assert order.count("handshake") == 1
+    assert order.index("handshake") < order.index("afd_moe"), "afd_moe was built first"
+    assert handshakes[0] is connector.afd_pg, "the mode check ran on another group"
+
+
+def test_init_refuses_a_mixed_pair_before_any_other_group(monkeypatch):
+    with pytest.raises(RuntimeError, match="mismatch across ranks"):
+        _init_on_stub_groups(monkeypatch, [4, 4, 0, 0], role="attention")

@@ -159,6 +159,16 @@ FFN side hands both to the experts without dequantizing.
 
 Construction rejects the mode unless all of the following hold on every rank:
 
+- both roles are configured with the same `quant_mode`. Each role reads its own
+  value, and the two modes differ in the A2E packet layout and activation width,
+  so `init_afd_connector` gathers every rank's mode over the AFD group and fails
+  the group before any group beyond the AFD one is built. Once that handshake
+  has passed, the FFN role also checks the mode each control payload declares
+  against its own;
+- the device is an Ascend A5 and the installed operator was built with the E4M3 /
+  E5M2 / E8M0 dtypes. The operator registers the same fourteen-argument schema on
+  every build and rejects mode 4 only at runtime, so the connector checks the
+  device family itself while the schema probe covers the arguments;
 - the common `afd.compute_gate_on_attention` is `true`, because the FFN side
   consumes the routing and never runs the gate itself;
 - Attention and FFN have the same rank count, each side between 1 and 32;
@@ -166,6 +176,12 @@ Construction rejects the mode unless all of the following hold on every rank:
 - the installed `a2e` operator takes `x_scale` and `quant_mode` and returns the
   received scale. The check inspects the operator schema, and an unreadable
   schema is treated as unsupported.
+
+The handshake runs for every mode, including `quant_mode=0`. Two A/F roles on
+different versions cannot agree on it: the older side never joins the collective,
+so the newer side waits for the group and the pair fails at startup with a
+communication timeout even when both are configured for BF16. Upgrade the
+Attention and FFN roles together.
 
 On the FFN side the token-ids slot is not usable in this mode: the shared-expert
 and router paths still need the model dtype, so the FFN rank must receive the

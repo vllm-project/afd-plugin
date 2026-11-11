@@ -449,6 +449,42 @@ def received_routing(
     )
 
 
+def _require_a5_device() -> None:
+    """Refuse the MXFP8 transport on a device whose operator lacks the path.
+
+    The operator compiles its MXFP8 kernel for A5 only (``AFD_TARGET_A5`` in its
+    binding) while registering the same fourteen-argument schema on every build,
+    so the schema probe alone would accept a non-A5 device and the failure would
+    surface at the first transfer instead of at construction.
+    """
+    from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+    device_type = get_ascend_device_type()
+    if device_type != AscendDeviceType.A5:
+        raise RuntimeError(
+            "quant_mode=4 requires an Ascend A5 device; the a2e MXFP8 path is "
+            f"built for A5 only and this one is {device_type.name}",
+        )
+
+
+def _require_one_quant_mode(modes: list[int], local_mode: int) -> None:
+    """Fail on every rank when the roles disagree about the A2E transport mode.
+
+    The two modes differ in the packet layout and the activation width, so a
+    mixed group would have the FFN side read the Attention side's bytes as its
+    own mode. Raising on every rank is what keeps the mismatch from degrading
+    into one role waiting for a peer that will never answer.
+    """
+    others = sorted({int(mode) for mode in modes} - {int(local_mode)})
+    if others:
+        raise RuntimeError(
+            "CAMP2P quant_mode mismatch across ranks: this rank runs "
+            f"quant_mode={local_mode} while the group also reports {others}. The "
+            "A2E packet layout and activation width differ per mode; set the same "
+            "connector_extra_config.quant_mode on both roles",
+        )
+
+
 class CAMP2pAFDConnector(AFDConnectorBase):
     """Move model data between Attention and FFN workers on Ascend NPU.
 
@@ -559,6 +595,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 "quant_mode=4 requires at least "
                 f"{A2E_MX_MIN_AIV_NUM} AIV cores; got {self.aiv_num}",
             )
+        _require_a5_device()
         supported = a2e_accepts_mxfp8_arguments()
         if supported is False:
             raise RuntimeError(
@@ -626,6 +663,24 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             self.hccl_comm_name_list[1] if num_ubatches > 1 else self.hccl_comm_name
         )
         self.hccl_comm_name3 = self.hccl_comm_name_list[2] if num_ubatches > 2 else ""
+
+        # Both roles read their own A2E mode, and a mixed pair would interpret the
+        # peer's packets with the wrong layout. Every rank joins this group, so one
+        # small collective fails both ends here -- before profile, capture and the
+        # first A2E call -- instead of leaving the Attention side waiting for an E2A
+        # the FFN side will never send.
+        local_mode = torch.tensor([self.quant_mode], dtype=torch.int32, device="npu")
+        gathered_modes = torch.empty(
+            self.ffn_size + self.attn_size,
+            dtype=torch.int32,
+            device="npu",
+        )
+        torch.distributed.all_gather_into_tensor(
+            gathered_modes,
+            local_mode,
+            group=self.afd_pg,
+        )
+        _require_one_quant_mode(gathered_modes.tolist(), self.quant_mode)
 
         if self.afd_config.role == "ffn":
             self.ffn_pg = init_afd_process_group(
@@ -1094,8 +1149,11 @@ class CAMP2pAFDControlPlane(AFDControlPlane):
         # The CAMP2P DP-metadata group runs on gloo, so the wire tensors stay on
         # CPU rather than the NPU device.
         device = torch.device("cpu")
+        # Declare this role's A2E mode on every payload: both ends read their own
+        # configuration, so the FFN side can only notice a mismatch if the
+        # Attention side states which mode produced its packets.
         send_control_payload(
-            self._physical_payload(payload),
+            replace(self._physical_payload(payload), quant_mode=connector.quant_mode),
             dst=connector.dst_list,
             group=connector.p2p_pg,
             device=device,
@@ -1125,11 +1183,25 @@ class CAMP2pAFDControlPlane(AFDControlPlane):
         if connector.p2p_pg is None:
             raise RuntimeError("CAMP2P metadata process group is not initialized")
         src = connector.p2p_rank % connector.min_size + connector.ffn_size
-        return recv_control_payload(
+        payload = recv_control_payload(
             src=src,
             group=connector.p2p_pg,
             device=torch.device("cpu"),
         )
+        # Refuse a mixed pair before the first transfer. The two modes differ in
+        # the A2E packet layout and the activation width, so the FFN rank would
+        # otherwise read the peer's bytes as its own mode and hand the experts a
+        # silently wrong activation.
+        peer_mode = int(payload.quant_mode)
+        if peer_mode != connector.quant_mode:
+            raise RuntimeError(
+                "CAMP2P quant_mode mismatch: the Attention role sends "
+                f"quant_mode={peer_mode} while this FFN role runs "
+                f"quant_mode={connector.quant_mode}. The A2E packet layout and "
+                "activation width differ per mode; set the same "
+                "connector_extra_config.quant_mode on both roles",
+            )
+        return payload
 
 
 def build_camp2p_topology(
