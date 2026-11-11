@@ -45,8 +45,10 @@ from afd_plugin.connectors.npu.camp2p.external_routing import (
 )
 
 #: Quant mode that tells the MC2 dispatch operator the activation is already
-#: quantized and its scale arrives with it. The device smoke established this
-#: number for the pre-quantized path; every other path leaves the mode to upstream.
+#: quantized and its scale arrives with it. The historical operator smoke
+#: recorded this number for the pre-quantized path (CANN documents
+#: `dynamicScalesOut` only for this branch); the current build is not verified
+#: here. Every other path leaves the mode to upstream.
 _MC2_PREQUANT_QUANT_MODE: Final[int] = 0
 
 

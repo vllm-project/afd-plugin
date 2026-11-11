@@ -142,6 +142,8 @@ _STUBBED_MODULE_NAMES = (
     "vllm_ascend.ops.fused_moe",
     "vllm_ascend.ops.fused_moe.dataclass",
     "vllm_ascend.ops.fused_moe.dataclass.prepare_finalize",
+    "vllm_ascend.ops.fused_moe.dataclass.token_dispatcher",
+    "vllm_ascend.ops.fused_moe.token_dispatcher",
     "vllm_ascend.ops.fused_moe.prepare_finalize",
     "vllm_ascend.ops.fused_moe.moe_comm_method",
     "vllm_ascend.ops.fused_moe.moe_utils",
