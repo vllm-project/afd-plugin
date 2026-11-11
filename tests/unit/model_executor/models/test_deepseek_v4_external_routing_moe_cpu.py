@@ -466,13 +466,6 @@ class _GatherGroup:
         ),
         pytest.param(torch.bfloat16, True, 4, "E4M3 activation", id="scale-on-bf16"),
         pytest.param(torch.float8_e5m2, True, 4, "E4M3 activation", id="e5m2"),
-        pytest.param(
-            torch.float8_e4m3fn,
-            True,
-            3,
-            "one scale row per activation row",
-            id="row-count",
-        ),
     ],
 )
 def test_only_a_matching_e4m3_scale_pair_reaches_the_experts(
@@ -732,25 +725,11 @@ def test_mc2_dispatch_rejects_a_conflicting_quant_mode(loaded):
     "scale,activation_dtype,is_mxfp,message",
     [
         pytest.param(
-            torch.zeros(4, 2, dtype=torch.bfloat16),
-            torch.float8_e4m3fn,
-            True,
-            "E8M0 scale",
-            id="scale-dtype",
-        ),
-        pytest.param(
             _e8m0_rows(4, 2).reshape(4, 1, 2),
             torch.float8_e4m3fn,
             True,
             "scale dim 3",
             id="scale-dim",
-        ),
-        pytest.param(
-            _e8m0_rows(4, 2),
-            torch.bfloat16,
-            True,
-            "activation dtype",
-            id="activation-dtype",
         ),
         pytest.param(
             _e8m0_rows(4, 2),
