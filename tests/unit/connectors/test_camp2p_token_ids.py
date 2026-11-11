@@ -98,18 +98,30 @@ def _vllm_stub() -> Iterator[None]:
         for attribute, value in builders[name].items():
             setattr(module, attribute, value)
         sys.modules[name] = module
+
+    _stub_objects = {
+        id(value)
+        for name in missing
+        for attribute, value in vars(sys.modules[name]).items()
+        if not attribute.startswith("__")
+    }
     try:
         yield
     finally:
         for name in missing:
             sys.modules.pop(name, None)
-        # Modules imported while the stub was installed keep its doubles in their
-        # globals, so drop them too; a later import then rebuilds them against the
-        # real package instead of reusing the test double.
+        # A module imported while the stub was installed keeps the doubles in its
+        # globals, so it must not stay cached. Only modules that actually bind one of
+        # the stub objects are dropped: evicting their packages would rebuild the
+        # connector factory and leave two registries in one session.
         for name in [
             name
             for name in sys.modules
-            if name.startswith("afd_plugin") and name not in _imported_before
+            if name.startswith("afd_plugin")
+            and name not in _imported_before
+            and any(
+                id(value) in _stub_objects for value in vars(sys.modules[name]).values()
+            )
         ]:
             sys.modules.pop(name, None)
 
