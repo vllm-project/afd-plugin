@@ -212,6 +212,7 @@ def test_p2p_dp_metadata_serialization_uses_json_payload():
             is_warmup=False,
             is_graph_replaying=True,
             is_profile=True,
+            quant_mode=4,
         ),
     )
     decoded_payload = decode_control_payload(payload)
@@ -224,23 +225,11 @@ def test_p2p_dp_metadata_serialization_uses_json_payload():
     with decoded[7].sp_local_sizes(sequence_parallel_size=1):
         assert decoded[7].get_chunk_sizes_across_dp_rank() == [3, 5]
     assert _tolist(decoded[7].cu_tokens_across_sp(1)) == [3, 8]
+    assert decoded_payload.quant_mode == 4
     assert decoded_payload.is_graph_capturing is True
     assert decoded_payload.is_warmup is False
     assert decoded_payload.is_graph_replaying is True
     assert decoded_payload.is_profile is True
-
-
-def test_control_payload_carries_the_sender_quant_mode():
-    payload = encode_control_payload(
-        AFDControlPayload(
-            dp_metadata_list={0: AFDDPMetadata(num_tokens_across_dp_cpu=[3])},
-            is_graph_capturing=False,
-            is_warmup=False,
-            quant_mode=4,
-        ),
-    )
-
-    assert decode_control_payload(payload).quant_mode == 4
 
 
 def test_a_control_payload_without_a_quant_mode_reads_as_bf16():
