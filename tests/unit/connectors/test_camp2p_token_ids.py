@@ -842,23 +842,37 @@ def test_the_control_plane_declares_the_local_quant_mode(monkeypatch):
     assert sent[0].quant_mode == camp2p_module.A2E_QUANT_MODE_MXFP8
 
 
-def test_a_mixed_quant_mode_pair_is_refused_before_the_first_transfer(monkeypatch):
-    """Attention on 4 and FFN on 0 must fail at the handshake, not read bytes."""
+@pytest.mark.parametrize(
+    "peer_mode,local_mode,refused",
+    [
+        pytest.param(4, 0, True, id="attention-4-ffn-0"),
+        pytest.param(0, 4, True, id="attention-0-ffn-4"),
+        pytest.param(4, 4, False, id="both-4"),
+    ],
+)
+def test_the_control_payload_mode_is_checked_against_the_local_one(
+    monkeypatch, peer_mode, local_mode, refused
+):
+    """A mixed pair must fail at the handshake; a matching one passes through."""
     payload = AFDControlPayload(
         dp_metadata_list={0: AFDDPMetadata(torch.tensor([2], dtype=torch.int32))},
         is_graph_capturing=False,
         is_warmup=False,
-        quant_mode=camp2p_module.A2E_QUANT_MODE_MXFP8,
+        quant_mode=peer_mode,
     )
     monkeypatch.setattr(camp2p_module, "recv_control_payload", lambda **kwargs: payload)
     connector = _connector(role="ffn", rank=1)
+    connector.quant_mode = local_mode
     connector.p2p_pg = object()
     connector.p2p_rank = 0
     connector.min_size = 1
     connector.ffn_size = 2
 
-    with pytest.raises(RuntimeError, match="quant_mode=4"):
-        connector.control_plane.recv_dp_metadata_list()
+    if refused:
+        with pytest.raises(RuntimeError, match=f"quant_mode={peer_mode}"):
+            connector.control_plane.recv_dp_metadata_list()
+    else:
+        assert connector.control_plane.recv_dp_metadata_list() is payload
 
 
 def test_ranks_must_agree_on_the_quant_mode():
@@ -870,24 +884,6 @@ def test_ranks_must_agree_on_the_quant_mode():
         camp2p_module._require_one_quant_mode([4, 4, 0, 0], 4)
     with pytest.raises(RuntimeError, match="mismatch across ranks"):
         camp2p_module._require_one_quant_mode([4, 4, 0, 0], 0)
-
-
-def test_a_matching_quant_mode_pair_is_accepted(monkeypatch):
-    payload = AFDControlPayload(
-        dp_metadata_list={0: AFDDPMetadata(torch.tensor([2], dtype=torch.int32))},
-        is_graph_capturing=False,
-        is_warmup=False,
-        quant_mode=camp2p_module.A2E_QUANT_MODE_MXFP8,
-    )
-    monkeypatch.setattr(camp2p_module, "recv_control_payload", lambda **kwargs: payload)
-    connector = _connector(role="ffn", rank=1)
-    connector.quant_mode = camp2p_module.A2E_QUANT_MODE_MXFP8
-    connector.p2p_pg = object()
-    connector.p2p_rank = 0
-    connector.min_size = 1
-    connector.ffn_size = 2
-
-    assert connector.control_plane.recv_dp_metadata_list() is payload
 
 
 class _FakeGathered:
@@ -961,6 +957,7 @@ def test_init_verifies_the_quant_mode_on_the_afd_group_before_other_groups(monke
     assert order[0] == "afd"
     assert order.count("handshake") == 1
     assert order.index("handshake") < order.index("afd_moe"), "afd_moe was built first"
+    assert order.index("handshake") < order.index("p2p"), "p2p was built first"
     assert handshakes[0] is connector.afd_pg, "the mode check ran on another group"
 
 
