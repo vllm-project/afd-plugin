@@ -14,12 +14,12 @@ from vllm.model_executor.models import qwen3_next as next_native
 from afd_plugin.config import parse_optional_afd_config
 from afd_plugin.model_executor.ffn.remote import AFDAttentionFusedMoE
 from afd_plugin.model_executor.models._weight_utils import (
+    ATTENTION_ROLE,
+    FFN_ROLE,
     filter_role_weights,
     layer_weight_path,
 )
 
-_ATTENTION_ROLE = frozenset(("attention",))
-_FFN_ROLE = frozenset(("ffn",))
 _NO_ROLES: frozenset[str] = frozenset()
 
 
@@ -44,21 +44,21 @@ def _checkpoint_weight_roles(
     layer_path = layer_weight_path(name)
     if layer_path is None:
         # Embeddings, final norm, and lm_head are required only by Attention.
-        return _ATTENTION_ROLE
+        return ATTENTION_ROLE
 
     _layer_idx, stage, remainder = layer_path
     if stage in ("linear_attn", "self_attn"):
-        return _ATTENTION_ROLE
+        return ATTENTION_ROLE
     if stage != "mlp":
-        return _ATTENTION_ROLE
+        return ATTENTION_ROLE
     if remainder and remainder[0] == "gate":
-        return _FFN_ROLE
+        return FFN_ROLE
     if remainder and remainder[0] in (
         "experts",
         "shared_expert",
         "shared_expert_gate",
     ):
-        return _FFN_ROLE
+        return FFN_ROLE
     raise RuntimeError(f"unclassified Qwen MoE checkpoint weight: {name}")
 
 

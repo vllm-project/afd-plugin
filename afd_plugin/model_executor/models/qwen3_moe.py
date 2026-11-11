@@ -28,16 +28,15 @@ from afd_plugin.config import (
 )
 from afd_plugin.model_executor.ffn.remote import RemoteFFNProxy
 from afd_plugin.model_executor.models._weight_utils import (
+    ATTENTION_ROLE,
+    BOTH_ROLES,
+    FFN_ROLE,
     filter_role_weights,
     layer_weight_path,
 )
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-
-_ATTENTION_ROLE = frozenset(("attention",))
-_FFN_ROLE = frozenset(("ffn",))
-_BOTH_ROLES = frozenset(("attention", "ffn"))
 
 
 def _is_moe_layer(config: Qwen3MoeConfig, layer_idx: int) -> bool:
@@ -67,17 +66,17 @@ def _checkpoint_weight_roles(
     """
     layer_path = layer_weight_path(name)
     if layer_path is None:
-        return _BOTH_ROLES
+        return BOTH_ROLES
 
     _layer_idx, stage, remainder = layer_path
     if stage == "mlp":
         is_moe_gate = bool(remainder) and remainder[0] == "gate"
         if is_moe_gate and routes_on_attention:
-            return _BOTH_ROLES
-        return _FFN_ROLE
+            return BOTH_ROLES
+        return FFN_ROLE
     if stage in {"self_attn", "input_layernorm", "post_attention_layernorm"}:
-        return _ATTENTION_ROLE
-    return _BOTH_ROLES
+        return ATTENTION_ROLE
+    return BOTH_ROLES
 
 
 def _validate_supported_config(
