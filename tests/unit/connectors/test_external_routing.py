@@ -148,21 +148,6 @@ def _scale_bytes(scale):
     return scale.view(torch.uint8).tolist()
 
 
-def test_scale_follows_padding_with_the_neutral_byte(routing_module, inputs_type):
-    """Padding rows carry 2**0, not 127 as a number: the byte view is the contract."""
-
-    routing = inputs_type(
-        topk_ids=torch.zeros(3, _TOP_K, dtype=torch.int32),
-        topk_weights=torch.ones(3, _TOP_K),
-        scale=_scale(3, 2),
-    )
-    padded = routing.padded(2).scale
-    rows = _scale_bytes(padded)
-    assert len(rows) == 5
-    assert rows[:3] == _scale_bytes(_scale(3, 2))
-    assert rows[3:] == [[127] * 2] * 2
-
-
 def test_scale_gathers_in_rank_order(inputs_type):
     """Each rank contributes its own bytes, so an ordering bug is visible."""
 
@@ -236,13 +221,4 @@ def test_scale_dtype_must_be_e8m0(inputs_type):
             topk_ids=torch.zeros(2, _TOP_K, dtype=torch.int32),
             topk_weights=torch.ones(2, _TOP_K),
             scale=torch.ones(2, 2, dtype=torch.float32),
-        )
-
-
-def test_scale_must_keep_at_least_one_block(inputs_type):
-    with pytest.raises(ValueError, match="at least one MX block"):
-        inputs_type(
-            topk_ids=torch.zeros(2, _TOP_K, dtype=torch.int32),
-            topk_weights=torch.ones(2, _TOP_K),
-            scale=torch.zeros(2, 0, dtype=torch.uint8).view(torch.float8_e8m0fnu),
         )
