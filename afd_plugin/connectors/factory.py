@@ -37,7 +37,10 @@ class AFDConnectorFactory:
 
         def loader() -> type[AFDConnectorBase]:
             module = importlib.import_module(module_path)
-            connector_cls = vars(module)[class_name]
+            # ``getattr`` rather than ``vars(module)``: packages in this tree resolve
+            # their names through a module-level ``__getattr__``, so the class is not
+            # necessarily present in the module dictionary.
+            connector_cls = getattr(module, class_name)
             if not issubclass(connector_cls, AFDConnectorBase):
                 raise TypeError(
                     f"{module_path}.{class_name} is not an AFDConnectorBase",
