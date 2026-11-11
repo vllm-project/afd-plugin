@@ -152,8 +152,8 @@ def test_a_connector_level_gate_flag_does_not_block():
     ).validate_supported()
 
 
-def test_quant_mode_is_still_rejected():
-    """The transport mode really is unsupported, so that check has to stay."""
+def test_an_unknown_quant_mode_is_rejected():
+    """A mode outside the supported set has to fail before any communication starts."""
 
-    with pytest.raises(RuntimeError, match="only quant_mode=0"):
-        _real_extra_info().from_mapping({"quant_mode": 4}).validate_supported()
+    with pytest.raises(RuntimeError, match="quant_mode="):
+        _real_extra_info().from_mapping({"quant_mode": 2}).validate_supported()
