@@ -352,6 +352,11 @@ class AFDNPUFFNModelRunner:
                     if recv_routing:
                         ffn_kwargs["topk_ids"] = payload.topk_ids
                         ffn_kwargs["topk_weights"] = payload.topk_weights
+                        if payload.activation_scale is not None:
+                            # One half of the pass-through pair: the model puts the
+                            # scale on the routing payload so prepare keeps it
+                            # aligned with the activation rows.
+                            ffn_kwargs["activation_scale"] = payload.activation_scale
                     rank_ffn_output = self.model.compute_ffn_output(
                         hidden_states=hidden_states,
                         layer_idx=layer_idx,
