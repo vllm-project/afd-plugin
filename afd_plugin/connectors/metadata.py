@@ -294,6 +294,10 @@ class AFDA2FTransferPayload:
         topk_weights: Optional routing weights paired with ``topk_ids``, same
             shape. The FFN side consumes them as the gate weights, so any
             model-level routed scaling is already folded in.
+        activation_scale: Optional E8M0 MX scale for a pre-quantized activation,
+            shaped ``(tokens, ceil(hidden_size / 32))`` as
+            ``torch.float8_e8m0fnu``. Present only when the transport carried an
+            MXFP8 activation, and it describes the same rows as ``hidden_states``.
     """
 
     hidden_states: torch.Tensor
@@ -302,6 +306,7 @@ class AFDA2FTransferPayload:
     input_ids: torch.Tensor | None = None
     topk_ids: torch.Tensor | None = None
     topk_weights: torch.Tensor | None = None
+    activation_scale: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
