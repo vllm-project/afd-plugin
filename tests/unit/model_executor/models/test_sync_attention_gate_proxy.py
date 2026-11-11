@@ -25,8 +25,23 @@ torch = pytest.importorskip("torch")
 # partial vLLM install where `import vllm` succeeds but this one does not.
 pytest.importorskip("vllm.forward_context")
 
+# The adapter's import chain pulls the NPU extension in at module scope, but these
+# tests only drive the Python wire protocol with fakes. A temporary stand-in keeps
+# the module collectable on a CPU-only host; it is removed again so other modules
+# still see the extension as missing and keep skipping.
+try:
+    import torch_npu  # noqa: F401
+
+    _stubbed_torch_npu = False
+except ModuleNotFoundError:
+    sys.modules["torch_npu"] = ModuleType("torch_npu")
+    _stubbed_torch_npu = True
+
 # The NPU adapter; the CUDA module of the same name has no sync gate shell.
 from afd_plugin.model_executor.models.npu import deepseek_v4 as adapter  # noqa: E402
+
+if _stubbed_torch_npu:
+    del sys.modules["torch_npu"]
 
 TOP_K = 2
 HIDDEN = 4
