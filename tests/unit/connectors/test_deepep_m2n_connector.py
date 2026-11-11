@@ -15,10 +15,20 @@ pytest.importorskip("vllm")
 
 from vllm.platforms.interface import set_assigned_physical_gpu_ids  # noqa: E402
 
-from tests.unit.fakes.afdep import FakeElasticBuffer, install_fake_afdep  # noqa: E402
+from tests.unit.fakes.afdep import (  # noqa: E402
+    FakeElasticBuffer,
+    install_fake_afdep,
+    uninstall_fake_afdep,
+)
 
-# The connector module imports afdEP's transport when it loads.
+# The connector module imports afdEP's transport when it loads, so the stand-in has
+# to exist before the imports below. ``teardown_module`` removes it again.
 install_fake_afdep()
+
+
+def teardown_module() -> None:
+    uninstall_fake_afdep()
+
 
 from afd_plugin.config import afd_config_from_mapping  # noqa: E402
 from afd_plugin.connectors import (  # noqa: E402

@@ -52,6 +52,9 @@ class FakeElasticBuffer:
         self.kwargs = kwargs
 
 
+_FAKE_MARKER = "__afd_fake_afdep__"
+
+
 def install_fake_afdep() -> None:
     """Register the stand-in ``afdep.deepep`` unless afdEP is importable."""
     if "afdep" in sys.modules or find_spec("afdep") is not None:
@@ -62,5 +65,19 @@ def install_fake_afdep() -> None:
     deepep.DispatchHandle = type("DispatchHandle", (), {})  # type: ignore[attr-defined]
     deepep.ReceiveResult = type("ReceiveResult", (), {})  # type: ignore[attr-defined]
     package.deepep = deepep  # type: ignore[attr-defined]
+    setattr(package, _FAKE_MARKER, True)
+    setattr(deepep, _FAKE_MARKER, True)
     sys.modules["afdep"] = package
     sys.modules["afdep.deepep"] = deepep
+
+
+def uninstall_fake_afdep() -> None:
+    """Remove the stand-in again, leaving a real afdEP install untouched.
+
+    A stand-in left in ``sys.modules`` has no ``__spec__``, so a later
+    ``find_spec("afdep")`` raises instead of reporting "not installed".
+    """
+    for name in ("afdep.deepep", "afdep"):
+        module = sys.modules.get(name)
+        if module is not None and getattr(module, _FAKE_MARKER, False):
+            sys.modules.pop(name, None)

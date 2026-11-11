@@ -194,13 +194,28 @@ def _install_stub_modules():
     return component_module, context, comm_module
 
 
+def _restore_modules(before: dict) -> None:
+    """Undo only what the stub installed, keeping everything imported meanwhile."""
+
+    for name in [name for name in sys.modules if name not in before]:
+        del sys.modules[name]
+    for name, module in before.items():
+        if sys.modules.get(name) is not module:
+            sys.modules[name] = module
+
+
 @pytest.fixture(scope="module")
 def loaded():
     before = dict(sys.modules)
-    module, context, comm_module = _install_stub_modules()
-    yield module, context, comm_module
-    sys.modules.clear()
-    sys.modules.update(before)
+    try:
+        module, context, comm_module = _install_stub_modules()
+    except BaseException:
+        _restore_modules(before)
+        raise
+    try:
+        yield module, context, comm_module
+    finally:
+        _restore_modules(before)
 
 
 class _Experts(torch.nn.Module):
