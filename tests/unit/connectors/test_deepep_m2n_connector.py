@@ -15,18 +15,6 @@ pytest.importorskip("vllm")
 
 from vllm.platforms.interface import set_assigned_physical_gpu_ids  # noqa: E402
 
-from tests.unit.fakes.afdep import (  # noqa: E402
-    FakeElasticBuffer,
-    install_fake_afdep,
-    uninstall_fake_afdep,
-)
-
-# The connector module imports afdEP's transport when it loads, so the stand-in has to
-# exist for the imports below. It is removed immediately afterwards: the bound names
-# keep working, and the rest of the session sees the package as absent again.
-install_fake_afdep()
-
-
 from afd_plugin.config import afd_config_from_mapping  # noqa: E402
 from afd_plugin.connectors import (  # noqa: E402
     AFDConnectorFactory,
@@ -36,23 +24,36 @@ from afd_plugin.connectors import (  # noqa: E402
     AFDTransferMetadata,
 )
 from afd_plugin.connectors.base import AFDControlPlaneClosedError  # noqa: E402
-from afd_plugin.connectors.gpu.deepep_m2n import (  # noqa: E402
-    connector as connector_module,
+from tests.unit.fakes.afdep import (  # noqa: E402
+    FakeElasticBuffer,
+    install_fake_afdep,
+    uninstall_fake_afdep,
 )
-from afd_plugin.connectors.gpu.deepep_m2n.connector import (  # noqa: E402
-    DeepEPM2NConfig,
-    bucket_ladder,
-    expert_weight_format,
-    local_handshake_info,
-    local_model_info,
-    plan_stage,
-    precompile_buckets,
-    resolve_capacity_tokens_per_rank,
-    resolve_num_lanes,
-    tokens_per_attention_rank,
-    validate_handshake,
-    validate_model_infos,
-)
+
+# The connector module imports afdEP's transport when it loads, so the stand-in has to
+# exist for that import only. It is removed again on both paths: the bound names keep
+# working, and the rest of the session sees the package as absent.
+install_fake_afdep()
+try:
+    from afd_plugin.connectors.gpu.deepep_m2n import (  # noqa: E402
+        connector as connector_module,
+    )
+    from afd_plugin.connectors.gpu.deepep_m2n.connector import (  # noqa: E402
+        DeepEPM2NConfig,
+        bucket_ladder,
+        expert_weight_format,
+        local_handshake_info,
+        local_model_info,
+        plan_stage,
+        precompile_buckets,
+        resolve_capacity_tokens_per_rank,
+        resolve_num_lanes,
+        tokens_per_attention_rank,
+        validate_handshake,
+        validate_model_infos,
+    )
+finally:
+    uninstall_fake_afdep()
 from afd_plugin.connectors.gpu.deepep_m2n.experts import (  # noqa: E402
     expert_row_ranges,
 )
@@ -79,8 +80,6 @@ from tests.unit.fakes.vllm_config import (  # noqa: E402
     M2NTopology,
     m2n_vllm_config,
 )
-
-uninstall_fake_afdep()
 
 CONNECTOR = "DeepEPM2NAFDConnector"
 HOPPER = (9, 0)

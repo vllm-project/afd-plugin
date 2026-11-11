@@ -25,6 +25,9 @@ torch = pytest.importorskip("torch")
 # The adapter module needs this specific vLLM module, and a CPU-only host can have a
 # partial vLLM install where `import vllm` succeeds but this one does not.
 pytest.importorskip("vllm.forward_context")
+# The adapter chain imports the shared-expert module, which loads vLLM-Ascend at module
+# scope; without it the collection fails instead of skipping.
+pytest.importorskip("vllm_ascend")
 
 # afd_plugin builds its model registry from ``find_spec("torch_npu")`` when the package
 # is first imported, so it is imported before the stand-in exists; otherwise a process
