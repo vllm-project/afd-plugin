@@ -67,42 +67,41 @@ def _vllm_stub() -> Iterator[None]:
         yield
         return
 
-    saved = {name: sys.modules.get(name) for name in missing}
+    builders = {
+        "vllm": {},
+        "vllm.forward_context": {
+            "DPMetadata": type("DPMetadata", (), {}),
+            "get_forward_context": lambda: None,
+        },
+        "vllm.logger": {
+            "init_logger": lambda *args, **kwargs: logging.getLogger("test")
+        },
+        "vllm.utils": {},
+        "vllm.utils.torch_utils": {
+            "direct_register_custom_op": lambda **kwargs: None,
+            "is_torch_equal_or_newer": lambda *args, **kwargs: True,
+        },
+        "vllm.distributed": {},
+        "vllm.distributed.parallel_state": {
+            "get_pcp_group": None,
+            "get_tensor_model_parallel_rank": None,
+        },
+    }
 
-    def make(name: str, **attributes: object) -> None:
+    # Only the modules that are genuinely absent are installed. Overwriting a module
+    # that another test already imported would outlive this context: the restore
+    # below only knows about the names it added.
+    for name in missing:
         module = types.ModuleType(name)
         module.__path__ = []  # type: ignore[attr-defined]
-        for attribute, value in attributes.items():
+        for attribute, value in builders[name].items():
             setattr(module, attribute, value)
         sys.modules[name] = module
-
-    make("vllm")
-    make(
-        "vllm.forward_context",
-        DPMetadata=type("DPMetadata", (), {}),
-        get_forward_context=lambda: None,
-    )
-    make("vllm.logger", init_logger=lambda *args, **kwargs: logging.getLogger("test"))
-    make("vllm.utils")
-    make(
-        "vllm.utils.torch_utils",
-        direct_register_custom_op=lambda **kwargs: None,
-        is_torch_equal_or_newer=lambda *args, **kwargs: True,
-    )
-    make("vllm.distributed")
-    make(
-        "vllm.distributed.parallel_state",
-        get_pcp_group=None,
-        get_tensor_model_parallel_rank=None,
-    )
     try:
         yield
     finally:
         for name in missing:
             sys.modules.pop(name, None)
-        for name, module in saved.items():
-            if module is not None:
-                sys.modules[name] = module
 
 
 with _vllm_stub():
