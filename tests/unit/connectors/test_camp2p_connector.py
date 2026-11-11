@@ -201,6 +201,7 @@ def test_camp2p_opaque_send_uses_current_stage_padding(
             int(with_input_ids),
             ids,
             scales,
+            camp2p_module.A2E_QUANT_MODE_BF16,
         )
         wire = sent[-1][0]
         assert wire.shape == (physical, 16)
