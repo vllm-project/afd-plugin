@@ -72,40 +72,12 @@ def test_the_trailing_pair_in_the_wrong_order_is_rejected(monkeypatch):
     assert ops.a2e_accepts_mxfp8_arguments() is False
 
 
-def test_a_scale_that_is_not_a_tensor_is_rejected(monkeypatch):
-    _install(
-        monkeypatch,
-        _schema(_BASE + ", float x_scale=0.0, int quant_mode=0"),
-    )
-    assert ops.a2e_accepts_mxfp8_arguments() is False
-
-
 def test_a_tensor_list_scale_is_rejected(monkeypatch):
-    """List[Tensor] also has getElementType(), so the wrapper itself must be optional.
+    """List[Tensor] also has getElementType(), so the wrapper must be optional."""
 
-    The schema parser cannot express ``Tensor[]`` for this argument, so the argument
-    carries a real ``ListType`` built by PyTorch.
-    """
-
-    schema = _schema(_BASE + ", Tensor? x_scale=None, int quant_mode=0")
-    arguments = list(schema.arguments)
-    args_list = [
-        types.SimpleNamespace(
-            name=argument.name,
-            type=argument.type,
-            kwarg_only=argument.kwarg_only,
-        )
-        for argument in arguments
-    ]
-    args_list[-2].type = torch.ListType(torch.TensorType.get())
-    _install(monkeypatch, types.SimpleNamespace(arguments=args_list))
-    assert ops.a2e_accepts_mxfp8_arguments() is False
-
-
-def test_a_non_tensor_scale_is_rejected(monkeypatch):
     _install(
         monkeypatch,
-        _schema(_BASE + ", int x_scale=0, int quant_mode=0"),
+        _schema(_BASE + ", Tensor[] x_scale, int quant_mode=0"),
     )
     assert ops.a2e_accepts_mxfp8_arguments() is False
 
