@@ -49,6 +49,32 @@ _STUB_MODULES = (
 )
 
 
+def _drop_stub_bound_modules(before: set[str], stub_objects: set[int]) -> None:
+    """Forget modules the stub block loaded that still hold one of its objects.
+
+    A cached module keeps the doubles in its globals, and the parent package keeps the
+    child module as an attribute, so both have to be dropped for a later import to build
+    the real thing.
+    """
+
+    for name in [
+        name
+        for name in sys.modules
+        if name not in before and name.startswith("afd_plugin")
+    ]:
+        module = sys.modules[name]
+        if not any(
+            value is not None and id(value) in stub_objects
+            for value in vars(module).values()
+        ):
+            continue
+        sys.modules.pop(name, None)
+        parent_name, _, leaf = name.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        if parent is not None and getattr(parent, leaf, None) is module:
+            delattr(parent, leaf)
+
+
 @contextlib.contextmanager
 def _vllm_stub() -> Iterator[None]:
     """Expose a minimal ``vllm`` surface for the duration of one import.
@@ -106,7 +132,7 @@ def _vllm_stub() -> Iterator[None]:
         id(value)
         for name in missing
         for attribute, value in vars(sys.modules[name]).items()
-        if not attribute.startswith("__")
+        if not attribute.startswith("__") and value is not None
     }
     try:
         yield
@@ -114,19 +140,10 @@ def _vllm_stub() -> Iterator[None]:
         for name in missing:
             sys.modules.pop(name, None)
         # A module imported while the stub was installed keeps the doubles in its
-        # globals, so it must not stay cached. Only modules that actually bind one of
-        # the stub objects are dropped: evicting their packages would rebuild the
-        # connector factory and leave two registries in one session.
-        for name in [
-            name
-            for name in sys.modules
-            if name.startswith("afd_plugin")
-            and name not in _imported_before
-            and any(
-                id(value) in _stub_objects for value in vars(sys.modules[name]).values()
-            )
-        ]:
-            sys.modules.pop(name, None)
+        # globals, so it must not stay cached. Only modules the stub block loaded, and
+        # only those that bind one of the stub objects, are dropped; evicting their
+        # packages would rebuild the connector factory and leave two registries.
+        _drop_stub_bound_modules(_imported_before, _stub_objects)
 
 
 with _vllm_stub():

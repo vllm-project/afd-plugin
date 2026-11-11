@@ -26,6 +26,12 @@ torch = pytest.importorskip("torch")
 # partial vLLM install where `import vllm` succeeds but this one does not.
 pytest.importorskip("vllm.forward_context")
 
+# afd_plugin builds its model registry from ``find_spec("torch_npu")`` when the package
+# is first imported, so it is imported before the stand-in exists; otherwise a process
+# without the extension would register the NPU adapter for DSV4 and keep that path after
+# the stand-in is gone.
+import afd_plugin  # noqa: E402,F401
+
 # The adapter's import chain pulls the NPU extension in at module scope, but these
 # tests only drive the Python wire protocol with fakes. A temporary stand-in keeps
 # the module collectable on a CPU-only host; it is removed again so other modules

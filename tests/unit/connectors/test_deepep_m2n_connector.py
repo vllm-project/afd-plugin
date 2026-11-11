@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import atexit
 import contextlib
 import itertools
 from types import SimpleNamespace
@@ -22,17 +21,10 @@ from tests.unit.fakes.afdep import (  # noqa: E402
     uninstall_fake_afdep,
 )
 
-# The connector module imports afdEP's transport when it loads, so the stand-in has
-# to exist before the imports below. ``teardown_module`` removes it again.
+# The connector module imports afdEP's transport when it loads, so the stand-in has to
+# exist for the imports below. It is removed immediately afterwards: the bound names
+# keep working, and the rest of the session sees the package as absent again.
 install_fake_afdep()
-
-
-def teardown_module() -> None:
-    uninstall_fake_afdep()
-
-
-# ``--collect-only`` imports this module but never runs its teardown.
-atexit.register(uninstall_fake_afdep)
 
 
 from afd_plugin.config import afd_config_from_mapping  # noqa: E402
@@ -87,6 +79,8 @@ from tests.unit.fakes.vllm_config import (  # noqa: E402
     M2NTopology,
     m2n_vllm_config,
 )
+
+uninstall_fake_afdep()
 
 CONNECTOR = "DeepEPM2NAFDConnector"
 HOPPER = (9, 0)
