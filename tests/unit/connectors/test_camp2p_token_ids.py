@@ -961,3 +961,28 @@ def test_send_attn_output_reaches_the_operator_as_a_quantized_pair(monkeypatch):
     assert call[0] is quantized
     assert call[12] is scale
     assert call[13] == camp2p_module.A2E_QUANT_MODE_MXFP8
+
+
+@pytest.mark.parametrize(
+    "max_tokens,topk,refused",
+    [
+        pytest.param(8149, 6, False, id="at-cap"),
+        pytest.param(8150, 6, True, id="one-row-over"),
+        pytest.param(8192, 6, True, id="configured-max"),
+        pytest.param(8192, 2, False, id="smaller-topk"),
+    ],
+)
+def test_mxfp8_construction_bounds_the_routing_id_block(
+    monkeypatch, on_a5, max_tokens, topk, refused
+):
+    monkeypatch.setattr(camp2p_module, "a2e_accepts_mxfp8_arguments", lambda: True)
+    vllm_config = _vllm_config(extra_config={"quant_mode": 4})
+    vllm_config.scheduler_config.max_num_batched_tokens = max_tokens
+    vllm_config.model_config.hf_config.num_experts_per_tok = topk
+
+    if refused:
+        with pytest.raises(RuntimeError, match="routing ids of a whole call"):
+            CAMP2pAFDConnector(0, 0, vllm_config, _mxfp8_config(), 0)
+    else:
+        connector = CAMP2pAFDConnector(0, 0, vllm_config, _mxfp8_config(), 0)
+        assert connector.max_num_batched_tokens == max_tokens

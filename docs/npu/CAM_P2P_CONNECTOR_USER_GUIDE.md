@@ -173,6 +173,9 @@ Construction rejects the mode unless all of the following hold on every rank:
   consumes the routing and never runs the gate itself;
 - Attention and FFN have the same rank count, each side between 1 and 32;
 - `core_num` (or the role override) is at least 3;
+- `--max-num-batched-tokens` fits the operator's routing-id budget: one call
+  carries `batch_size x topk` int32 ids into a single UB region, which allows
+  8,149 tokens at `topk=6` (195,584 bytes). Exceeding it fails at construction;
 - the installed `a2e` operator takes `x_scale` and `quant_mode` and returns the
   received scale. The check inspects the operator schema, and an unreadable
   schema is treated as unsupported.
