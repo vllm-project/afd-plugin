@@ -26,11 +26,11 @@ Internal only, carries AFD rendezvous traffic to whichever pod holds
 `afd-ffn-node-role: head`. Must exist before any multi-pod deploy, since the
 launcher's default rendezvous host points at this name directly. Traffic to
 a headless Service goes straight to the pod IP, and there's one rendezvous
-port, so a single static port entry is enough (`lib_port` from
-[resolve-recipe.md](resolve-recipe.md#ports)):
+port, so a single static port entry is enough (`AFD_CONNECTOR_PORT` from
+[resolve-recipe.md](resolve-recipe.md#launcher-ports)):
 
 ```bash
-AFD_CONNECTOR_PORT="$(lib_port AFD_PORT)" envsubst '${AFD_CONNECTOR_PORT}' \
+AFD_CONNECTOR_PORT="${AFD_CONNECTOR_PORT}" envsubst '${AFD_CONNECTOR_PORT}' \
   < templates/service-ffn-p2p.yaml | kubectl apply -f -
 ```
 
@@ -43,9 +43,9 @@ pod. One per split role, generic over role via
 `templates/service-dp-coord.yaml`:
 
 ```bash
-TEMPLATE_ROLE=attn TEMPLATE_PORT="$(lib_port ATTN_DP_RPC_PORT)" \
+TEMPLATE_ROLE=attn TEMPLATE_PORT="${ATTN_DP_RPC_PORT}" \
   envsubst '${TEMPLATE_ROLE} ${TEMPLATE_PORT}' < templates/service-dp-coord.yaml | kubectl apply -f -
-TEMPLATE_ROLE=ffn TEMPLATE_PORT="$(lib_port FFN_DP_RPC_PORT)" \
+TEMPLATE_ROLE=ffn TEMPLATE_PORT="${FFN_DP_RPC_PORT}" \
   envsubst '${TEMPLATE_ROLE} ${TEMPLATE_PORT}' < templates/service-dp-coord.yaml | kubectl apply -f -
 ```
 

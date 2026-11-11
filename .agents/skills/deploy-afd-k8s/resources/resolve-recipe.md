@@ -51,9 +51,24 @@ The launcher owns role-to-device ordering, DP/TP command construction, and
 startup validation of the placement. Record the pod/resource table for
 [deploy.md](deploy.md), which uses it as-is.
 
+## Launcher ports
+
+Read the client and internal Service ports from the launcher's fixed assignments:
+
+```bash
+RECIPE_LIB_PATH=recipe/gpu/common/afd_colocation.sh
+lib_port() {
+    grep -oE "\b$1=[0-9]+" "$RECIPE_LIB_PATH" | head -1 | cut -d= -f2
+}
+
+CLIENT_PORT="$(lib_port ATTN_PORT)"
+AFD_CONNECTOR_PORT="$(lib_port AFD_PORT)"
+ATTN_DP_RPC_PORT="$(lib_port ATTN_DP_RPC_PORT)"
+FFN_DP_RPC_PORT="$(lib_port FFN_DP_RPC_PORT)"
+```
+
 ## Other deployment values
 
-Set `CLIENT_PORT` to the launcher's `ATTN_PORT`; the current launcher fixes
-it at `18000`. Record the effective `--max-num-batched-tokens` -- the
-caller's `VLLM_ARGS` value if overridden, else the recipe's `SERVE_ARGS`
-value -- for the final report.
+Record the effective `--max-num-batched-tokens` -- the caller's `VLLM_ARGS`
+value if overridden, else the recipe's `SERVE_ARGS` value -- for the final
+report.

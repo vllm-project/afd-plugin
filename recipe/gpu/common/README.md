@@ -82,7 +82,7 @@ Every setting is an environment variable; the defaults reproduce the recipe.
 | `MODEL_PATH` | recipe | Weights directory or HF id. |
 | `LAYOUT` | recipe | Pods and their GPUs; see [Layout](#layout). |
 | `POD` | `AFD_0` | This pod's entry in `LAYOUT`, `AFD_<k>`. |
-| `ATTN_TP` / `FFN_TP` | `1` | TP size of the Attention / FFN role. |
+| `ATTN_TP` / `FFN_TP` | recipe | TP size of the Attention / FFN role. |
 | `CUDAGRAPH_CAPTURE_SIZES` | recipe | Ascending decode graph sizes (graph recipes). |
 | `AFD_CONNECTOR` | recipe | Connector class, for example `P2pNcclAFDConnector` to run an M2N recipe on NCCL P2P. |
 | `VLLM_ARGS` | empty | Extra `vllm serve` flags for both roles. |
@@ -95,6 +95,10 @@ Every setting is an environment variable; the defaults reproduce the recipe.
 | `SERVE_HOST` | `127.0.0.1` | API server bind address (`0.0.0.0` to serve outside the pod). |
 | `AFD_RECIPE_LIB` | next to the recipe in the repository | Path of `afd_colocation.sh`, for a recipe copied out of the repository. |
 | `AFD_DRY_RUN` | empty | Print this pod's `vllm serve` commands instead of running them. |
+
+Each personalized recipe encodes the DP/TP shape named in its filename. The
+`ATTN_TP` and `FFN_TP` defaults are therefore recipe-specific rather than
+always `1`; set them only when intentionally changing that shape.
 
 `VLLM_ARGS`, `ATTN_ARGS`, `FFN_ARGS` and any arguments after the script name
 come after the recipe's flags, so a repeated flag overrides its default. They
