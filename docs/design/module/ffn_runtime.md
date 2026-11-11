@@ -388,7 +388,9 @@ Attention-recorded load window over the connector's bootstrap group, runs
 adopts them before it routes the next step. The Attention side of that
 module owns the recorder: it maps logical top-k ids to physical slots in the
 model proxy's routing path and records load with stable-address tensors
-CUDA graphs capture.
+CUDA graphs capture. With `log_balancedness` the connector logs EPLB's loss
+for the deployed placement every `log_balancedness_interval` steps (see
+below).
 
 ## FFN-side EPLB
 
@@ -416,7 +418,7 @@ the replicated ones — whenever a step commits a rearrangement (`eplb_step`
 snapshots the map only on steps where the counter boundary or a pending
 async transfer can commit, so ordinary steps stay sync-free). The same
 placement log runs on the DeepEP M2N path (see the routed-experts note
-below); the formatters live in `afd_plugin/distributed/eplb.py`.
+above); the formatters live in `afd_plugin/distributed/eplb.py`.
 
 The unpadded token count is the step's total real Attention tokens
 (`real_attention_token_total` in `ffn_metadata.py`), excluding the
@@ -430,6 +432,52 @@ shells hold no experts), and FFN EPLB rejects DBO/ubatching because the
 FFN daemon loop never installs vLLM's DBO thread context, so the record
 kernel could not select the per-ubatch token count. EPLB recipes live under
 `recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_colocation/`.
+
+### Loss logging on DeepEP M2N
+
+On the M2N path no `EplbState.step` runs, so vLLM's balancedness line never
+appears. `DeepEPM2NFFNEplb` therefore logs EPLB's own objective itself, and it
+logs it at two cadences (both opt-in through `log_balancedness`):
+
+- **every `log_balancedness_interval` steps**, the deployed map's loss on the
+  Attention ranks' load window;
+- **at each rearrangement**, the loss of the map being replaced and of the map
+  just committed, on the same window.
+
+Both use `eplb_map_loss`, i.e. the quantity `DefaultEplbPolicy` optimises: a
+logical expert's window load divided evenly over the replicas the candidate map
+gives it, packed into ranks and reduced to the per-layer mean/max ratio vLLM
+uses. A per-step figure was deliberately not kept: it measures *realised* load,
+which the policy never sees and which moves with the batch rather than with the
+placement.
+
+```
+AFD FFN EPLB step 1400: loss=0.9312 over 1000 steps (avg_tokens=..., max_tokens=...), steps until the next rearrangement: 1600
+AFD FFN EPLB loss: before=0.9421, after=0.9709, gain=+3.06%
+```
+
+Mechanics:
+
+- The trigger is the same rearrangement counter that paces the boundaries, so
+  both roles log at the same step: the FFN after its forward, Attention when it
+  steps the finished transaction, exactly like the boundary exchange.
+- Attention ranks aggregate their own load window into logical experts
+  (`logical_load_from_window`, the only load the policy ever reads) and the FFN
+  ranks contribute zeros; the connector's bootstrap group reduces the sum to FFN
+  world rank 0, which scores the deployed map and logs it. A window that
+  recorded nothing (warmup, graph capture) logs nothing.
+- `over N steps` is the number of recorded steps in the window, which is
+  `min(steps since the last rearrangement, window_size)`: the recorder clears
+  its window when Attention adopts a new map, because slot identities change
+  with the placement and load recorded under the old map cannot be read through
+  the new one. A window is fully refreshed before the next boundary whenever
+  `window_size <= step_interval`, so rearrangements are unaffected.
+- Each logged step costs a host sync on every rank, which is why the interval
+  exists; a rearrangement boundary is unaffected and still runs the map exchange
+  only.
+- Because both figures of the rearrangement line come from one window, `gain` is
+  the policy's own improvement rather than workload drift. On CUDA the proposal
+  commits unconditionally, so a negative `gain` is visible rather than gated.
 
 ## Role-aware model loading
 

@@ -28,7 +28,7 @@ from afd_plugin.connectors.gpu.deepep_m2n.eplb import (  # noqa: E402
 from tests.unit.fakes.connector import FakeRoutedConnector  # noqa: E402
 
 MOE_LAYERS = (1, 3)
-NUM_LOGICAL = 8
+NUM_LOGICAL = 12
 NUM_PHYSICAL = 12
 WINDOW_SIZE = 4
 STEP_INTERVAL = 100
@@ -44,6 +44,7 @@ def _schedule(**overrides) -> dict[str, int]:
         "window_size": WINDOW_SIZE,
         "step_interval": STEP_INTERVAL,
         "initial_rearrangement_step": INITIAL_REARRANGE_STEP,
+        "log_interval": 0,
     }
     schedule.update(overrides)
     return schedule
@@ -61,12 +62,12 @@ def _attention_connector(**overrides):
     return SimpleNamespace(**attrs)
 
 
-def _recorder(**connector_overrides):
+def _recorder(*, log_interval: int = 0, **connector_overrides):
     initial_map = torch.zeros((len(MOE_LAYERS), NUM_LOGICAL, 4), dtype=torch.int64)
     initial_count = torch.ones((len(MOE_LAYERS), NUM_LOGICAL), dtype=torch.int64)
     return DeepEPM2NAttentionEplb(
         _attention_connector(**connector_overrides),
-        _schedule(),
+        _schedule(log_interval=log_interval),
         MOE_LAYERS,
         initial_map,
         initial_count,
@@ -195,6 +196,72 @@ def test_recorder_exchanges_window_and_adopts_maps_at_boundary(
     assert int(recorder.logical_replica_count.sum()) == 7 * NUM_LOGICAL * len(
         MOE_LAYERS
     )
+    # Slot identities changed with the map, so the next window starts empty.
+    assert int(recorder.expert_load_window.sum()) == 0
+    assert int(recorder.expert_load_window[0].sum()) == 0
+
+
+def test_recorder_reduces_the_logical_window_at_each_log_interval(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Every log interval the recorder joins a reduce carrying its load window
+    aggregated into logical experts -- the only load EPLB's policy sees -- and
+    it changes no EPLB state."""
+    fake_dist = _FakeDist()
+    monkeypatch.setattr(eplb_module.dist, "reduce", fake_dist.reduce)
+    monkeypatch.setattr(eplb_module.dist, "broadcast", fake_dist.broadcast)
+    recorder = _recorder(log_interval=2)
+    per_logical_expert = NUM_LOGICAL * len(MOE_LAYERS)
+
+    recorder.on_control_step(_payload())
+    for step_load in (1, 2, 3, 4):
+        recorder.expert_load_pass.fill_(step_load)
+        recorder.on_control_step(_payload())
+
+    # Counters 10 and 12 are log steps. All the recorder's slots hold logical
+    # 0 (its map is all zeros), so each expert's load is slot 0's window
+    # total: 1+2 tokens at the first log step, then 1+2+3+4.
+    assert [dst for _load, dst in fake_dist.reduces] == [0, 0]
+    assert [load.shape for load, _dst in fake_dist.reduces] == [
+        (len(MOE_LAYERS), NUM_LOGICAL),
+    ] * 2
+    assert [int(load.sum()) for load, _dst in fake_dist.reduces] == [
+        3 * per_logical_expert,
+        10 * per_logical_expert,
+    ]
+    assert fake_dist.broadcasts == []
+
+
+def test_recorder_keeps_rearranging_without_the_loss_exchange(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Without log_balancedness the recorder reduces nothing until the
+    rearrangement boundary, which still runs the map exchange."""
+    fake_dist = _FakeDist()
+    monkeypatch.setattr(eplb_module.dist, "reduce", fake_dist.reduce)
+    monkeypatch.setattr(eplb_module.dist, "broadcast", fake_dist.broadcast)
+    recorder = _recorder()
+
+    for _ in range(STEP_INTERVAL - INITIAL_REARRANGE_STEP + 1):
+        recorder.on_control_step(_payload())
+
+    assert len(fake_dist.reduces) == 1
+    assert len(fake_dist.broadcasts) == 2
+
+
+def _logical_view(physical_to_logical_map: torch.Tensor):
+    """The logical-to-physical map and replica counts a placement implies."""
+    num_layers = physical_to_logical_map.shape[0]
+    logical_to_physical = torch.zeros((num_layers, NUM_LOGICAL, 4), dtype=torch.int64)
+    replica_count = torch.zeros((num_layers, NUM_LOGICAL), dtype=torch.int64)
+    for layer in range(num_layers):
+        for slot, logical in enumerate(physical_to_logical_map[layer].tolist()):
+            if logical < 0:
+                continue
+            used = int(replica_count[layer, logical])
+            logical_to_physical[layer, logical, used] = slot
+            replica_count[layer, logical] = used + 1
+    return logical_to_physical, replica_count
 
 
 def _ffn_state():
@@ -208,12 +275,14 @@ def _ffn_state():
     # layer 1 swaps logical 5 and 6 across the ranks.
     layer0 = [0, 1, 2, 3, 4, 8, 6, 7, 8, 9, 10, 11]
     layer1 = [0, 1, 2, 3, 4, 6, 5, 7, 8, 9, 10, 11]
+    physical_to_logical = torch.tensor([layer0, layer1])
+    logical_to_physical, replica_count = _logical_view(physical_to_logical)
     model_state = SimpleNamespace(
         model=model,
         expert_load_window=torch.zeros((WINDOW_SIZE, len(MOE_LAYERS), NUM_PHYSICAL)),
-        physical_to_logical_map=torch.tensor([layer0, layer1]),
-        logical_to_physical_map=torch.zeros((len(MOE_LAYERS), NUM_LOGICAL, 4)),
-        logical_replica_count=torch.zeros((len(MOE_LAYERS), NUM_LOGICAL)),
+        physical_to_logical_map=physical_to_logical,
+        logical_to_physical_map=logical_to_physical,
+        logical_replica_count=replica_count,
     )
     rearrangements: list[None] = []
 
@@ -229,14 +298,19 @@ def _ffn_state():
     return state, model_state, rearrangements
 
 
-def _ffn_connector(world_rank: int, *, log_placement: bool = False):
+def _ffn_connector(
+    world_rank: int, *, log_placement: bool = False, log_interval: int = 0
+):
     return SimpleNamespace(
         bootstrap_group=object(),
         world_rank=world_rank,
         ffn_size=2,
         vllm_config=SimpleNamespace(
             parallel_config=SimpleNamespace(
-                eplb_config=SimpleNamespace(log_balancedness=log_placement),
+                eplb_config=SimpleNamespace(
+                    log_balancedness=log_placement,
+                    log_balancedness_interval=log_interval,
+                ),
             ),
         ),
     )
@@ -351,3 +425,110 @@ def test_ffn_driver_stays_silent_without_balancedness_logging(
                 driver.step()
 
     assert caplog.messages == []
+
+
+def _rank_heavy_reduce(tensor, dst, group):
+    """Attention ranks contribute a window whose load sits on the logical
+    experts FFN rank 0's slots hold (the fake map's first four)."""
+    tensor.zero_()
+    tensor[:, :4] = 10
+
+
+def test_ffn_driver_logs_the_deployed_map_loss_at_each_log_interval(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """Every log interval FFN world rank 0 scores the deployed map on the
+    Attention-reduced window with EPLB's own load model."""
+    monkeypatch.setattr(eplb_module.dist, "reduce", _rank_heavy_reduce)
+    monkeypatch.setattr(eplb_module.dist, "broadcast", _FakeDist().broadcast)
+    state, _model_state, rearrangements = _ffn_state()
+    state.expert_rearrangement_step_interval = STEP_INTERVAL
+    state.expert_rearrangement_step = 0
+    driver = DeepEPM2NFFNEplb(
+        _ffn_connector(0, log_placement=True, log_interval=2), state
+    )
+
+    with caplog.at_level(logging.INFO, logger=eplb_module.logger.name):
+        for _ in range(5):
+            driver.step()
+
+    assert rearrangements == []
+    assert len(caplog.messages) == 2
+    message = caplog.messages[0]
+    assert "AFD FFN EPLB step 2:" in message
+    # Rank 0's slots hold 40 of the 80 tokens in every layer: half balanced.
+    assert "loss=0.5000 over 2 steps (avg_tokens=40.00, max_tokens=80)" in message
+    assert "steps until the next rearrangement: 98" in message
+    assert "AFD FFN EPLB step 4:" in caplog.messages[1]
+
+
+def test_ffn_driver_skips_loss_logging_without_recorded_load(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """A log step that recorded no load (warmup, graph capture) logs nothing,
+    though every rank still joined the reduce."""
+    fake_dist = _FakeDist()
+    monkeypatch.setattr(eplb_module.dist, "reduce", fake_dist.reduce)
+    monkeypatch.setattr(eplb_module.dist, "broadcast", fake_dist.broadcast)
+    state, _model_state, _rearrangements = _ffn_state()
+    state.expert_rearrangement_step = 0
+    driver = DeepEPM2NFFNEplb(
+        _ffn_connector(0, log_placement=True, log_interval=2), state
+    )
+
+    with caplog.at_level(logging.INFO, logger=eplb_module.logger.name):
+        for _ in range(2):
+            driver.step()
+
+    assert len(fake_dist.reduces) == 1
+    assert caplog.messages == []
+
+
+def test_ffn_driver_logs_the_loss_of_the_map_it_replaced(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """At a boundary the FFN world rank 0 logs EPLB's own objective for the
+    deployed map and for the proposal on the same window, so the gain is the
+    improvement the rearrangement made rather than workload drift."""
+
+    # Both layers recorded rank 0 holding 80 of the 100 tokens: logical 0
+    # and 1 are its hot experts, logical 6 and 7 are rank 1's cold ones.
+    def reduce(tensor, dst, group):
+        tensor.zero_()
+        tensor[:, :, 0] = 50
+        tensor[:, :, 1] = 30
+        tensor[:, :, 6] = 10
+        tensor[:, :, 7] = 10
+
+    monkeypatch.setattr(eplb_module.dist, "reduce", reduce)
+    monkeypatch.setattr(eplb_module.dist, "broadcast", _FakeDist().broadcast)
+    state, model_state, _rearrangements = _ffn_state()
+    state.expert_rearrangement_step_interval = 10
+    # Both layers serve the same placement while the window is recorded.
+    deployed = [0, 1, 2, 3, 4, 8, 6, 7, 8, 9, 10, 11]
+    model_state.physical_to_logical_map = torch.tensor([deployed, deployed])
+    (
+        model_state.logical_to_physical_map,
+        model_state.logical_replica_count,
+    ) = _logical_view(model_state.physical_to_logical_map)
+    # The proposal moves the cold expert 7 onto rank 0 and the hot expert 1
+    # onto rank 1: 60/40 instead of 80/20.
+    balanced = [0, 7, 2, 3, 4, 8, 1, 6, 8, 9, 10, 11]
+
+    def rearrange():
+        model_state.physical_to_logical_map = torch.tensor([balanced, balanced])
+
+    state.rearrange = rearrange
+    driver = DeepEPM2NFFNEplb(_ffn_connector(0, log_placement=True), state)
+
+    with caplog.at_level(logging.INFO, logger=eplb_module.logger.name):
+        for _ in range(10 - INITIAL_REARRANGE_STEP):
+            driver.step()
+
+    assert (
+        "AFD FFN EPLB loss: before=0.6250, after=0.8333, gain=+33.33%"
+        in (caplog.messages[-1])
+    )

@@ -389,13 +389,52 @@ Constraints: async EPLB (`use_async`) and DBO are rejected with EPLB. EPLB
 exchanges run on the connector's CPU bootstrap group at each rearrangement
 boundary, so a rearrangement adds a host sync on every rank.
 
-To see which experts EPLB chose, set `"log_balancedness": true` in the FFN's
-`--eplb-config`: at every rearrangement the FFN then logs, per MoE layer,
-which logical experts each FFN rank holds, which are replicated, and the
-recorded token load per rank that drove the choice. The placement also lives
-in tensors at runtime: the FFN's `EplbState.physical_to_logical_map` (via the
-runner's `eplb.state`), and on Attention the connector's
-`logical_to_physical_map` (the same map, adopted from the FFN).
+To see what EPLB is doing, set `"log_balancedness": true` in the FFN's
+`--eplb-config`. It turns on two logs:
+
+- at every rearrangement, per MoE layer, which logical experts each FFN rank
+  holds, which are replicated, and the recorded token load per rank that drove
+  the choice;
+- the loss, i.e. the quantity `DefaultEplbPolicy` actually minimises, logged
+  every `"log_balancedness_interval"` steps for the deployed placement and
+  twice at each rearrangement:
+
+```
+AFD FFN EPLB step 1400: loss=0.9312 over 1000 steps (avg_tokens=812.34, max_tokens=1180), steps until the next rearrangement: 1600
+AFD FFN EPLB loss: before=0.9421, after=0.9709, gain=+3.06%
+```
+
+`loss` is the ratio of the average to the maximum per-rank token load, computed
+per MoE layer and summed over layers, so 1.0 is perfectly even. Unlike realised
+load, it uses the policy's own estimate: a logical expert's window load is
+divided evenly over the replicas the placement gives it. Because it is a window
+average and not one step's sample, it stays flat while the placement is
+unchanged and moves when a rearrangement changes it — that series is how you
+watch EPLB work.
+
+At a rearrangement, `before` scores the map that served the window and `after`
+the map just committed, both on that same window, so `gain` is the improvement
+the rearrangement achieved rather than workload drift. Track `gain` across
+rearrangements to see whether EPLB keeps converging: near-zero gain means the
+placement has converged, and since CUDA commits the proposal unconditionally a
+negative gain is visible rather than gated.
+
+Two operational notes. Each logged step adds a host sync on every rank, so keep
+`"log_balancedness_interval"` well above 1 for throughput-sensitive runs, or set
+it equal to `"step_interval"` to log only one sample per rearrangement. And the
+Attention recorder clears its window when it adopts a new map — slot identities
+change with the placement — so `over N steps` restarts at the rearrangement; it
+reads `window_size` once `window_size <= step_interval`, as with the defaults
+1000 and 3000.
+
+The placement also lives in tensors at runtime: the FFN's
+`EplbState.physical_to_logical_map` (via the runner's `eplb.state`), and on
+Attention the connector's `logical_to_physical_map` (the same map, adopted
+from the FFN).
+
+Set `"step_interval"` to control how many steps run between rearrangements
+(default 3000; the first one happens after three quarters of that, matching
+vLLM's initial progress).
 
 Run the recipe from the repository root:
 

@@ -37,6 +37,18 @@ Boundary exchange (every rank enters, in this order):
 Attention blocks on the exchange before it routes the next step's tokens, and
 the FFN runs it after its step's last combine, so Attention can never dispatch
 rows placed by an older map than the FFN's weights.
+
+Loss logging (``log_balancedness``, one line every
+``log_balancedness_interval`` steps) reuses that exchange shape without
+changing anything: Attention ranks reduce their load window aggregated into
+logical experts, and the FFN's world rank 0 scores the deployed map on it with
+EPLB's own load model (an expert's window load split evenly over its replicas).
+The result is the quantity ``DefaultEplbPolicy`` optimises, so the series moves
+only when a rearrangement changes the placement. At each boundary the same
+window scores the replaced map and the committed one, which is what tells
+whether the rearrangement helped. It is opt-in because it adds a host sync on
+every participating rank; the map exchange above is unaffected and still runs
+only at a rearrangement boundary.
 """
 
 from __future__ import annotations
@@ -55,6 +67,8 @@ from afd_plugin.connectors.metadata import AFDControlPayload
 from afd_plugin.distributed.eplb import (
     describe_eplb_placement,
     describe_eplb_rank_load,
+    eplb_map_loss,
+    logical_load_from_window,
 )
 
 if TYPE_CHECKING:
@@ -73,6 +87,7 @@ _EPLB_SCHEDULE_FIELDS = (
     "window_size",
     "step_interval",
     "initial_rearrangement_step",
+    "log_interval",
 )
 
 
@@ -167,6 +182,7 @@ class DeepEPM2NAttentionEplb:
         self._connector = connector
         self._device = connector.device
         self._step_interval = int(schedule["step_interval"])
+        self._log_interval = int(schedule["log_interval"])
         window_size = int(schedule["window_size"])
         num_layers = int(schedule["num_moe_layers"])
         num_logical = int(schedule["num_logical_experts"])
@@ -234,20 +250,40 @@ class DeepEPM2NAttentionEplb:
         step advances the rearrangement counter, exactly like vLLM's
         ``EplbState.step``, so both roles detect the boundary together.
         """
-        if is_dummy:
-            self.expert_load_pass.zero_()
-        else:
+        if not is_dummy:
             # Record every real step: the window then always holds the last
             # ``window_size`` real steps, the same set vLLM's
             # should_record schedule would have recorded before a rearrange.
             self.expert_load_window[self._window_step].copy_(self.expert_load_pass)
-            self.expert_load_pass.zero_()
             window_size = self.expert_load_window.shape[0]
             self._window_step = (self._window_step + 1) % window_size
         self._rearrange_step += 1
+        if self._log_interval and self._rearrange_step % self._log_interval == 0:
+            self._exchange_window_load()
+        # The pass holds this step's load until here: dummy steps recorded
+        # nothing, so dropping it is a no-op for them.
+        self.expert_load_pass.zero_()
         if self._rearrange_step >= self._step_interval:
             self._rearrange_step = 0
             self._exchange_at_boundary()
+
+    def _exchange_window_load(self) -> None:
+        """Join the loss-logging exchange.
+
+        Contributes this rank's load window aggregated into logical experts,
+        which is all EPLB's policy looks at, so the FFN's world rank 0 can
+        score the deployed map on the same traffic that drives the next
+        rearrangement. Shipped every ``log_interval`` steps instead of at
+        every boundary, which keeps the figures a window average rather than
+        one step's noise. The tensor is CPU-staged because the connector's
+        bootstrap group is gloo.
+        """
+        load_cpu = logical_load_from_window(
+            self.expert_load_window,
+            self.logical_to_physical_map,
+            self.logical_replica_count,
+        ).cpu()
+        dist.reduce(load_cpu, dst=0, group=self._connector.bootstrap_group)
 
     def _prepare_current_transaction(self, payload: AFDControlPayload) -> None:
         """Gate recording and fill the real token count for the upcoming
@@ -266,7 +302,12 @@ class DeepEPM2NAttentionEplb:
         """Join the boundary exchange: contribute the load window, adopt the
         FFN's new maps. Blocks until the FFN finished its rearrangement."""
         group = self._connector.bootstrap_group
-        window_cpu = self.expert_load_window.cpu()
+        # Copied, not just moved: the window is cleared below once the new map
+        # is in place, and on a CPU device ``.cpu()`` would alias it.
+        window_cpu = torch.empty(
+            self.expert_load_window.shape, dtype=self.expert_load_window.dtype
+        )
+        window_cpu.copy_(self.expert_load_window)
         dist.reduce(window_cpu, dst=0, group=group)
         map_cpu = torch.empty(self.logical_to_physical_map.shape, dtype=torch.int64)
         dist.broadcast(map_cpu, src=0, group=group)
@@ -274,6 +315,13 @@ class DeepEPM2NAttentionEplb:
         dist.broadcast(count_cpu, src=0, group=group)
         self.logical_to_physical_map.copy_(map_cpu.to(self._device))
         self.logical_replica_count.copy_(count_cpu.to(self._device))
+        # Slot identities changed with the placement: load recorded under the
+        # old map cannot be read through the new one, and EPLB does not need
+        # it either (a window is fully refreshed before the next boundary
+        # whenever window_size <= step_interval). Start the next window clean
+        # so every logged figure describes traffic routed by one map.
+        self.expert_load_window.zero_()
+        self._window_step = 0
 
     # ==============================
     # Routing path
@@ -300,7 +348,9 @@ class DeepEPM2NFFNEplb:
     boundary, runs the exchange described in the module docstring and calls
     ``EplbState.rearrange`` directly: on the routed-experts path nothing on
     the FFN records load, so ``EplbState.step``'s window bookkeeping has no
-    input and its rearrangement trigger is replaced by this counter.
+    input and its rearrangement trigger is replaced by this counter. With
+    ``log_balancedness`` the same counter also paces the loss log, which
+    changes no state.
     """
 
     def __init__(
@@ -314,9 +364,15 @@ class DeepEPM2NFFNEplb:
         self._step_interval = eplb_state.expert_rearrangement_step_interval
         self._rearrange_step = eplb_state.expert_rearrangement_step
         # vLLM's log_balancedness flag gates placement logging: on this path
-        # no EplbState.step runs, so the flag cannot log from there.
-        self._log_placement = bool(
-            connector.vllm_config.parallel_config.eplb_config.log_balancedness
+        # no EplbState.step runs, so the flag cannot log from there. It also
+        # enables the loss log: every ``log_balancedness_interval`` steps the
+        # deployed map is scored on the Attention ranks' load window, and at
+        # each rearrangement the replaced and the committed map are scored on
+        # that same window.
+        eplb_config = connector.vllm_config.parallel_config.eplb_config
+        self._log_placement = bool(eplb_config.log_balancedness)
+        self._log_interval = (
+            int(eplb_config.log_balancedness_interval) if self._log_placement else 0
         )
 
     def broadcast_initial_state(self) -> None:
@@ -333,6 +389,7 @@ class DeepEPM2NFFNEplb:
             "window_size": int(self._model_state.expert_load_window.shape[0]),
             "step_interval": int(self._step_interval),
             "initial_rearrangement_step": int(self._rearrange_step),
+            "log_interval": int(self._log_interval),
         }
         holder = [schedule]
         dist.broadcast_object_list(holder, src=0, group=self._connector.bootstrap_group)
@@ -342,12 +399,61 @@ class DeepEPM2NFFNEplb:
         dist.broadcast(count_cpu, src=0, group=self._connector.bootstrap_group)
 
     def step(self) -> None:
-        """One connector step; runs the boundary exchange when due."""
+        """One connector step; logs the map's loss or rearranges when due."""
         self._rearrange_step += 1
+        if self._log_interval and self._rearrange_step % self._log_interval == 0:
+            self._log_window_loss()
         if self._rearrange_step < self._step_interval:
             return
         self._rearrange_step = 0
         self._rearrange()
+
+    def _log_window_loss(self) -> None:
+        """Join the loss-logging exchange and log it on world rank 0.
+
+        Attention ranks contribute their load window aggregated into logical
+        experts; FFN ranks hold no load, so they only contribute the zero
+        tensor the reduce writes into on rank 0.
+        """
+        num_logical = self._model_state.logical_to_physical_map.shape[1]
+        window_dtype = self._model_state.expert_load_window.dtype
+        staging = torch.zeros(
+            (int(self._model_state.model.num_moe_layers), num_logical),
+            dtype=window_dtype,
+        )
+        dist.reduce(staging, dst=0, group=self._connector.bootstrap_group)
+        if self._connector.world_rank == 0:
+            self._log_deployed_loss(staging)
+
+    def _log_deployed_loss(self, logical_load: torch.Tensor) -> None:
+        """Log the deployed map's EPLB loss on the recorded window.
+
+        ``logical_load`` is the reduced per-logical-expert load,
+        shape ``(num_moe_layers, num_logical)``. The loss is the figure
+        ``DefaultEplbPolicy`` optimises, so the series moves when a
+        rearrangement changes the placement and stays flat in between.
+        """
+        summary = eplb_map_loss(
+            logical_load,
+            self._model_state.physical_to_logical_map.cpu(),
+            ffn_size=self._connector.ffn_size,
+        )
+        if summary.max_tokens <= 0:
+            # Dummy steps (warmup, graph capture) record no load.
+            return
+        window_size = self._model_state.expert_load_window.shape[0]
+        recorded_steps = min(self._rearrange_step, window_size)
+        logger.info(
+            "AFD FFN EPLB step %d: loss=%.4f over %d steps "
+            "(avg_tokens=%.2f, max_tokens=%d), "
+            "steps until the next rearrangement: %d",
+            self._rearrange_step,
+            summary.balancedness,
+            recorded_steps,
+            summary.avg_tokens,
+            int(summary.max_tokens),
+            self._step_interval - self._rearrange_step,
+        )
 
     def _rearrange(self) -> None:
         window = self._model_state.expert_load_window
@@ -358,9 +464,22 @@ class DeepEPM2NFFNEplb:
         dist.reduce(staging, dst=0, group=self._connector.bootstrap_group)
         if self._connector.world_rank == 0:
             window.copy_(staging.to(window.device))
+        logs_loss = self._log_placement and self._connector.world_rank == 0
+        deployed_maps = (
+            (
+                self._model_state.physical_to_logical_map.cpu(),
+                self._model_state.logical_to_physical_map.cpu(),
+                self._model_state.logical_replica_count.cpu(),
+            )
+            if logs_loss
+            else None
+        )
         self._state.rearrange()
-        if self._log_placement and self._connector.world_rank == 0:
+        if logs_loss:
+            # Rearrangement commits the new map in place, so the loss log
+            # compares it with the copies saved above.
             self._log_chosen_experts(staging)
+            self._log_map_loss(staging, deployed_maps)
         map_cpu = self._model_state.logical_to_physical_map.cpu()
         dist.broadcast(map_cpu, src=0, group=self._connector.bootstrap_group)
         count_cpu = self._model_state.logical_replica_count.cpu()
@@ -383,6 +502,43 @@ class DeepEPM2NFFNEplb:
             load_window.shape[0],
             describe_eplb_rank_load(load_window, ffn_size=ffn_size),
             "\n".join(lines),
+        )
+
+    def _log_map_loss(
+        self,
+        load_window: torch.Tensor,
+        deployed_maps: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> None:
+        """Log what the rearrangement did to the quantity EPLB optimises.
+
+        Both figures use EPLB's own load model (a logical expert's window load
+        divided evenly over its replicas) on the same window, so the gain is
+        the policy's improvement and not workload drift. ``deployed_maps``
+        holds the physical-to-logical map, the logical-to-physical map and the
+        replica counts in force while the window was recorded; the state has
+        already committed the replacements.
+        """
+        ffn_size = self._connector.ffn_size
+        deployed_map, recording_map, recording_counts = deployed_maps
+        logical_load = logical_load_from_window(
+            load_window, recording_map, recording_counts
+        )
+        committed_map = self._model_state.physical_to_logical_map.cpu()
+        before = eplb_map_loss(logical_load, deployed_map, ffn_size=ffn_size)
+        after = eplb_map_loss(logical_load, committed_map, ffn_size=ffn_size)
+        gain = (
+            0.0
+            if before.balancedness == 0
+            else 100.0 * (after.balancedness / before.balancedness - 1.0)
+        )
+        logger.info(
+            "AFD FFN EPLB loss: before=%.4f, after=%.4f, gain=%+.2f%% "
+            "(same %d-step window; per-layer mean/max of the load EPLB "
+            "estimates by splitting each expert over its replicas)",
+            before.balancedness,
+            after.balancedness,
+            gain,
+            load_window.shape[0],
         )
 
 
