@@ -163,9 +163,9 @@ class _CpuTorch:
     """``torch`` with the NPU device mapped to CPU for host-side tests.
 
     The connector hands the operator empty device tensors, which only exist on an
-    Ascend host. Only ``tensor()`` is adapted; every other attribute, including
-    ``ops``, stays the real one so the recorded operator calls are the calls the
-    connector makes.
+    Ascend host. Only ``tensor()`` and ``empty()`` are adapted; every other
+    attribute, including ``ops``, stays the real one so the recorded operator
+    calls are the calls the connector makes.
     """
 
     def __getattr__(self, name: str) -> Any:
@@ -175,6 +175,11 @@ class _CpuTorch:
         if kwargs.get("device") == "npu":
             kwargs["device"] = "cpu"
         return torch.tensor(*args, **kwargs)
+
+    def empty(self, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("device") == "npu":
+            kwargs["device"] = "cpu"
+        return torch.empty(*args, **kwargs)
 
 
 def _connector(*, role: str, rank: int) -> CAMP2pAFDConnector:
@@ -298,15 +303,17 @@ def test_send_attn_output_selects_the_operator_ids_mode(monkeypatch):
     connector.send_attn_output(hidden_states, context)
 
     with_ids, without_ids = calls
-    # Trailing operator arguments: aiv_num, compute_gate, ids, scales.
-    assert with_ids[-3] == 1
-    assert with_ids[-2].dtype == torch.int32
-    assert with_ids[-2][:, 0].tolist() == [7, 11, 13]
-    assert with_ids[-1].dtype == torch.float32
-    assert torch.count_nonzero(with_ids[-1]) == 0
-    assert without_ids[-3] == 0
+    # Trailing operator arguments: aiv_num, compute_gate, ids, scales, mode.
+    assert with_ids[-4] == 1
+    assert with_ids[-3].dtype == torch.int32
+    assert with_ids[-3][:, 0].tolist() == [7, 11, 13]
+    assert with_ids[-2].dtype == torch.float32
+    assert torch.count_nonzero(with_ids[-2]) == 0
+    assert with_ids[-1] == camp2p_module.A2E_QUANT_MODE_BF16
+    assert without_ids[-4] == 0
+    assert without_ids[-3] is None
     assert without_ids[-2] is None
-    assert without_ids[-1] is None
+    assert without_ids[-1] == camp2p_module.A2E_QUANT_MODE_BF16
 
 
 def test_recv_attn_output_mode_and_ids_follow_the_receiver_declaration(
@@ -474,12 +481,13 @@ def test_send_attn_output_puts_routing_on_the_operator_ids_channel(monkeypatch):
     connector.send_attn_output(hidden_states, context, routing=(ids, weights))
 
     sent = calls[0]
-    # Trailing operator arguments: aiv_num, compute_gate, ids, scales.
-    assert sent[-3] == 1
-    assert sent[-2].dtype == torch.int32
-    assert sent[-2].tolist() == ids.tolist()
-    assert sent[-1].dtype == torch.float32
-    assert sent[-1].tolist() == weights.to(torch.float32).tolist()
+    # Trailing operator arguments: aiv_num, compute_gate, ids, scales, mode.
+    assert sent[-4] == 1
+    assert sent[-3].dtype == torch.int32
+    assert sent[-3].tolist() == ids.tolist()
+    assert sent[-2].dtype == torch.float32
+    assert sent[-2].tolist() == weights.to(torch.float32).tolist()
+    assert sent[-1] == camp2p_module.A2E_QUANT_MODE_BF16
 
 
 def test_send_attn_output_rejects_ids_and_routing_together(monkeypatch):
@@ -551,4 +559,233 @@ def test_recv_attn_output_rejects_two_wire_slot_modes(monkeypatch):
             layer_idx=0,
             recv_input_ids=True,
             recv_routing=True,
+        )
+
+
+# ### MXFP8 transport (quant_mode=4) ###########################################
+
+
+def _mxfp8_config(*, attention=4, ffn=4, gate=True):
+    from afd_plugin.config import AFDConfig
+
+    return AFDConfig(
+        connector="CAMP2pAFDConnector",
+        role="attention",
+        num_attention_ranks=attention,
+        num_ffn_ranks=ffn,
+        compute_gate_on_attention=gate,
+    )
+
+
+def _mxfp8_connector(*, attention=4, ffn=4, gate=True):
+    return CAMP2pAFDConnector(
+        0,
+        0,
+        _vllm_config(extra_config={"quant_mode": 4}),
+        _mxfp8_config(attention=attention, ffn=ffn, gate=gate),
+        0,
+    )
+
+
+def test_mxfp8_construction_accepts_a_supported_topology(monkeypatch):
+    monkeypatch.setattr(camp2p_module, "a2e_accepts_mxfp8_arguments", lambda: True)
+
+    connector = _mxfp8_connector(attention=4, ffn=4)
+
+    assert connector.quant_mode == camp2p_module.A2E_QUANT_MODE_MXFP8
+    assert connector.attn_size == connector.ffn_size == 4
+
+
+@pytest.mark.parametrize(
+    "attention,ffn,gate,match",
+    [
+        pytest.param(4, 2, True, "equal Attention and FFN rank counts", id="4a2f"),
+        pytest.param(4, 4, False, "compute_gate_on_attention=true", id="ffn-gate"),
+        pytest.param(40, 40, True, "1..32", id="too-many-ranks"),
+    ],
+)
+def test_mxfp8_construction_refuses_a_deployment_that_cannot_carry_it(
+    monkeypatch, attention, ffn, gate, match
+):
+    monkeypatch.setattr(camp2p_module, "a2e_accepts_mxfp8_arguments", lambda: True)
+
+    with pytest.raises(RuntimeError, match=match):
+        _mxfp8_connector(attention=attention, ffn=ffn, gate=gate)
+
+
+@pytest.mark.parametrize(
+    "probe,match",
+    [
+        pytest.param(False, "this build does not", id="unsupported"),
+        pytest.param(None, "cannot confirm", id="unreadable"),
+    ],
+)
+def test_mxfp8_construction_reports_what_the_operator_probe_said(
+    monkeypatch, probe, match
+):
+    monkeypatch.setattr(camp2p_module, "a2e_accepts_mxfp8_arguments", lambda: probe)
+
+    with pytest.raises(RuntimeError, match=match):
+        _mxfp8_connector()
+
+
+def test_send_attn_output_forwards_the_configured_quant_mode(monkeypatch):
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_camp2p_send_attn_output",
+        lambda *args: calls.append(args),
+        raising=False,
+    )
+    monkeypatch.setattr(camp2p_module, "get_forward_context", SimpleNamespace)
+    connector = _connector(role="attention", rank=0)
+    connector.quant_mode = camp2p_module.A2E_QUANT_MODE_MXFP8
+
+    connector.send_attn_output(
+        torch.zeros(3, connector.hidden_size),
+        AFDTransferContext(
+            metadata=AFDTransferMetadata.create_attention_metadata(
+                layer_idx=0,
+                stage_idx=0,
+                seq_len=3,
+            ),
+        ),
+    )
+
+    assert calls[0][-1] == camp2p_module.A2E_QUANT_MODE_MXFP8
+
+
+def test_the_mxfp8_send_calls_the_operator_with_the_scale(monkeypatch):
+    """The opaque op quantizes, and the fourteen-argument call carries the pair."""
+    sent: list[tuple[Any, ...]] = []
+    quantized = torch.zeros(3, 16, dtype=torch.float8_e4m3fn)
+    scale = torch.tensor([[130], [131], [132]], dtype=torch.uint8).view(
+        torch.float8_e8m0fnu
+    )
+    quantize_calls = []
+
+    def fake_quantize(hidden_states):
+        quantize_calls.append(hidden_states)
+        return quantized, scale
+
+    methods: dict[str, Any] = {}
+    monkeypatch.setattr(camp2p_module, "_CAMP2P_CUSTOM_OPS_REGISTERED", False)
+    monkeypatch.setattr(
+        camp2p_module,
+        "direct_register_custom_op",
+        lambda **kwargs: methods.update({kwargs["op_name"]: kwargs["op_func"]}),
+    )
+    monkeypatch.setattr(camp2p_module, "mx_quantize_a2e_activation", fake_quantize)
+
+    def fake_a2e(*args: Any) -> tuple[Any, ...]:
+        sent.append(args)
+        return (None, None, None, "atten-batch", None)
+
+    monkeypatch.setattr(torch.ops.afd_ascend, "a2e", fake_a2e, raising=False)
+    forward_context = SimpleNamespace(ubatch_idx=0, cam_afdtransfer_state=None)
+    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
+    camp2p_module._register_camp2p_custom_ops()
+
+    hidden = torch.zeros(3, 16)
+    methods["afd_camp2p_send_attn_output"](
+        hidden,
+        "n0",
+        "n1",
+        "",
+        3,
+        16,
+        2,
+        4,
+        4,
+        0,
+        8,
+        0,
+        None,
+        None,
+        camp2p_module.A2E_QUANT_MODE_MXFP8,
+    )
+
+    call = sent[0]
+    assert len(call) == 14
+    assert quantize_calls == [hidden], "the operator must quantize the wire tensor"
+    assert call[0] is quantized
+    assert call[12] is scale
+    assert call[13] == camp2p_module.A2E_QUANT_MODE_MXFP8
+
+
+def test_the_mxfp8_receive_reads_the_sixth_return_value(monkeypatch):
+    received_activation = torch.zeros(10, 16, dtype=torch.float8_e4m3fn)
+    received_scale = torch.tensor([[127]] * 10, dtype=torch.uint8).view(
+        torch.float8_e8m0fnu
+    )
+    calls: list[tuple[Any, ...]] = []
+
+    def fake_a2e(*args: Any) -> tuple[Any, ...]:
+        calls.append(args)
+        tokens, topk = int(args[3]), int(args[5])
+        ids = torch.arange(tokens * topk, dtype=torch.int32).reshape(tokens, topk)
+        weights = torch.full((tokens, topk), 0.5, dtype=torch.float32)
+        return (
+            received_activation,
+            ids,
+            weights,
+            "atten-batch",
+            "active-mask",
+            received_scale,
+        )
+
+    monkeypatch.setattr(torch.ops.afd_ascend, "a2e", fake_a2e, raising=False)
+    monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
+    connector = _connector(role="ffn", rank=1)
+    connector.quant_mode = camp2p_module.A2E_QUANT_MODE_MXFP8
+    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 5, 7])}
+
+    payload = connector.recv_attn_output(
+        ubatch_idx=0,
+        layer_idx=0,
+        recv_routing=True,
+    )
+
+    call = calls[0]
+    assert len(call) == 14
+    assert call[0].dtype == torch.float8_e4m3fn
+    assert tuple(call[0].shape) == (0, connector.hidden_size)
+    assert call[12] is None
+    assert call[13] == camp2p_module.A2E_QUANT_MODE_MXFP8
+    assert payload.hidden_states is received_activation
+    assert payload.activation_scale is received_scale
+
+
+def test_the_mxfp8_receive_names_a_build_that_returns_five_values(monkeypatch):
+    """A pre-MXFP8 operator returns five values; report that, not IndexError."""
+    monkeypatch.setattr(
+        torch.ops.afd_ascend,
+        "a2e",
+        lambda *args: (
+            torch.zeros(10, 16, dtype=torch.float8_e4m3fn),
+            torch.zeros(10, 2, dtype=torch.int32),
+            torch.zeros(10, 2, dtype=torch.float32),
+            "atten-batch",
+            "active-mask",
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
+    connector = _connector(role="ffn", rank=1)
+    connector.quant_mode = camp2p_module.A2E_QUANT_MODE_MXFP8
+    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 5, 7])}
+
+    with pytest.raises(RuntimeError, match="returned 5"):
+        connector.recv_attn_output(ubatch_idx=0, layer_idx=0, recv_routing=True)
+
+
+def test_the_mxfp8_receive_refuses_the_token_ids_slot():
+    connector = _connector(role="ffn", rank=1)
+    connector.quant_mode = camp2p_module.A2E_QUANT_MODE_MXFP8
+
+    with pytest.raises(ValueError, match="requires recv_routing"):
+        connector.recv_attn_output(
+            ubatch_idx=0,
+            layer_idx=0,
+            recv_input_ids=True,
         )
