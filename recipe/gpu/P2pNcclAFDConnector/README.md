@@ -11,11 +11,9 @@ for the connector's rank mapping and configuration contract.
 ```text
 .
 ├── deepseek_v2_lite/
-│   ├── prefill_decode_colocation/       # dbo.sh, eager_dbo.sh (any LAYOUT, ATTN_TP, FFN_TP)
+│   ├── prefill_decode_colocation/       # explicit 2A2F, 4A4F and two-pod DBO recipes
 │   └── prefill_decode_disaggregation/   # 2P1A1F
-├── qwen3_30b_a3b/prefill_decode_colocation/          # graph.sh, default 2A2F
-├── qwen3_235b_a22b_fp8/prefill_decode_colocation/    # graph.sh, default 4A2F
-└── qwen3_5_122b_a10b_fp8/prefill_decode_colocation/  # graph.sh, default 2A0F,2A0F,0A2F (3 pods)
+└── qwen3_5_122b_a10b_fp8/prefill_decode_colocation/  # multipod_2a_2a_2f_graph.sh
 ```
 
 Each model directory holds its own recipe scripts; open its `README.md`
@@ -32,7 +30,7 @@ front of it -- see the caveat in "Deploying on Kubernetes" below.
 
 ```bash
 export MODEL_PATH=/path/model_weights/DeepSeek-V2-Lite
-bash recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_colocation/dbo.sh
+bash recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_colocation/2a2f_graph_dbo_dp1tp2.sh
 ```
 
 A colocation recipe writes `attn.log` and `ffn.log` into the current
@@ -47,10 +45,10 @@ see that skill for the full contract (PVC/ConfigMap/pod/Service lifecycle,
 scope, and requirements).
 
 The skill takes the recipe path (e.g.
-`recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_colocation/dbo.sh`)
+`recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_colocation/2a2f_graph_dbo_dp1tp2.sh`)
 plus the image, model id, and PVC name, and deploys one pod per `LAYOUT`
-entry (for example `LAYOUT=2A0F,0A2F ATTN_TP=2 FFN_TP=2` on the DeepSeek
-recipe, or the Qwen3.5 recipe's default three pods).
+entry (for example the DeepSeek multipod recipe's default `2A0F,0A2F`, or
+the Qwen3.5 recipe's default three pods).
 `prefill_decode_disaggregation` recipes are out of scope for the skill; run
 those locally instead.
 

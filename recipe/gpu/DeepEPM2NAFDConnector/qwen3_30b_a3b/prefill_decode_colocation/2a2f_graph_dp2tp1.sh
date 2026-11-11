@@ -2,15 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 #
-# Qwen3-30B-A3B (BF16) on DeepEPM2NAFDConnector, FULL_DECODE_ONLY CUDA graphs.
-# Placement: one pod per comma-separated LAYOUT entry (default 2A2F), pod k
-# running POD=AFD_<k> with the same LAYOUT; FFN on each pod's first GPUs.
+# Qwen3-30B-A3B (BF16) on DeepEPM2NAFDConnector, 2A2F FULL_DECODE_ONLY CUDA
+# graphs: FFN DP2 x TP1 and Attention DP2 x TP1.
 # Settings and running in a pod: recipe/gpu/common/README.md
 # shellcheck disable=SC1090,SC2034  # the sourced launcher reads these variables
 
 AFD_CONNECTOR=${AFD_CONNECTOR:-DeepEPM2NAFDConnector}
 LAYOUT=${LAYOUT:-2A2F}
 MODEL_PATH=${MODEL_PATH:-/path/model_weights/Qwen3-30B-A3B}
+ATTN_TP=${ATTN_TP:-1} FFN_TP=${FFN_TP:-1}
 MODE=graph CUDAGRAPH_CAPTURE_SIZES=${CUDAGRAPH_CAPTURE_SIZES:-8,16,32,64}   # ascending
 SERVE_ARGS=(--enable-ep-weight-filter --max-num-seqs 64 --max-num-batched-tokens 4096 --max-model-len 4096)
 

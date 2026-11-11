@@ -12,14 +12,11 @@ lists only its defaults and model-specific notes.
 
 ## Recipes
 
-Every model directory holds the same three scripts in
-`prefill_decode_colocation/`:
-
-| Script | Mode |
-| --- | --- |
-| `graph.sh` | `FULL_DECODE_ONLY` CUDA graphs; prefill runs eager |
-| `eager.sh` | Eager (`--enforce-eager`) |
-| `dbo.sh` | `FULL_DECODE_ONLY` CUDA graphs and dual-batch overlap on both roles (`--enable-dbo`, decode/prefill token thresholds 2 and 8) |
+Recipe names encode their layout, DP/TP shape, and mode. DeepSeek-V2-Lite and
+Qwen3-30B-A3B provide `2a2f_{eager,graph,graph_dbo}_dp2tp1.sh` plus
+`2a2f_eager_dp1tp2.sh`; Qwen3-235B-A22B-FP8 provides `4a2f` eager, graph and
+DBO recipes plus `multipod_4a1f_4a1f_dbo.sh`. Each model README lists its
+exact filenames and defaults.
 
 ```text
 .
@@ -34,8 +31,9 @@ every setting, and how to run a recipe directly or in a pod.
 
 ## Prerequisites
 
-- SM90 or newer GPUs. The default `2A2F` layout uses 4 GPUs on one host; see
-  the model README for memory needs.
+- SM90 or newer GPUs. The DeepSeek and Qwen3-30B default `2A2F` layout uses
+  4 GPUs; Qwen3-235B defaults to `4A2F` on 6 GPUs. See the model README for
+  memory needs.
 - vLLM `v0.32.0`, the plugin, afdEP-comm (the `afdep` extra) and DeepGEMM
   installed in one environment, with the elfutils headers available to
   DeepGEMM's JIT. See
@@ -57,8 +55,8 @@ use the environment that holds afdEP-comm and DeepGEMM.
 
 ## Layout
 
-`LAYOUT` (default `2A2F`, one pod of 4 GPUs) lists the pods, one `<a>A<f>F`
-entry each; see [Layout](../common/README.md#layout) and
+`LAYOUT` lists the pods, one `<a>A<f>F` entry each; see
+[Layout](../common/README.md#layout) and
 [Settings](../common/README.md#settings). Examples for this connector:
 `4A2F` (one 6-GPU node), `2A0F,0A2F` and `1A1F,1A1F` (two pods), `4A1F,4A1F`
 (two 5-GPU pods). `ATTN_TP=2` runs `2A2F`'s Attention as one DP1 x TP2 engine;
@@ -73,7 +71,7 @@ pods differ in size).
 
 ```bash
 export MODEL_PATH=/path/model_weights/Qwen3-30B-A3B
-bash recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/prefill_decode_colocation/graph.sh
+bash recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/prefill_decode_colocation/2a2f_graph_dp2tp1.sh
 ```
 
 Send traffic to the Attention server on port `18000` once `attn.log` prints
@@ -117,7 +115,7 @@ the repository root or set `AFD_REPO`.
 ```bash
 export MODEL_PATH=/path/model_weights/Qwen3-30B-A3B
 DECODE_BENCH='{}' \
-    bash recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/prefill_decode_colocation/graph.sh
+    bash recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/prefill_decode_colocation/2a2f_graph_dbo_dp2tp1.sh
 
 INPUT_LEN=1024 OUTPUT_LEN=256 NUM_PROMPTS=2000 \
     MAX_CONCURRENCY=64 REQUEST_RATE=inf RESULT_DIR=/tmp/results/decode_bench \

@@ -15,7 +15,7 @@ override variables, and the two `vllm serve` processes.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 #
-# Qwen3-30B-A3B (BF16) on DeepEPM2NAFDConnector, FULL_DECODE_ONLY graphs + DBO.
+# Qwen3-30B-A3B (BF16) on DeepEPM2NAFDConnector, 2A2F graph + DBO.
 # Placement: one pod per comma-separated LAYOUT entry (default 2A2F), pod k
 # running POD=AFD_<k> with the same LAYOUT; FFN on each pod's first GPUs.
 # Settings and running in a pod: recipe/gpu/common/README.md
@@ -24,6 +24,7 @@ override variables, and the two `vllm serve` processes.
 AFD_CONNECTOR=${AFD_CONNECTOR:-DeepEPM2NAFDConnector}
 LAYOUT=${LAYOUT:-2A2F}
 MODEL_PATH=${MODEL_PATH:-/path/model_weights/Qwen3-30B-A3B}
+ATTN_TP=${ATTN_TP:-1} FFN_TP=${FFN_TP:-1}
 MODE=graph CUDAGRAPH_CAPTURE_SIZES=${CUDAGRAPH_CAPTURE_SIZES:-8,16,32,64}   # ascending
 SERVE_ARGS=(--enable-ep-weight-filter --max-num-seqs 64 --max-num-batched-tokens 4096 --max-model-len 4096
             --enable-dbo --dbo-decode-token-threshold 2 --dbo-prefill-token-threshold 8)
@@ -101,7 +102,7 @@ are split on whitespace without shell quoting, so pass JSON without spaces:
 
 ```bash
 VLLM_ARGS="--max-num-seqs 512" ATTN_ARGS="--no-enable-prefix-caching" \
-    bash recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/prefill_decode_colocation/graph.sh
+    bash recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/prefill_decode_colocation/2a2f_graph_dp2tp1.sh
 ```
 
 ## Running directly
@@ -110,7 +111,7 @@ From any directory (logs go to the current directory):
 
 ```bash
 export MODEL_PATH=/path/model_weights/Qwen3-30B-A3B
-bash recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/prefill_decode_colocation/graph.sh
+bash recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/prefill_decode_colocation/2a2f_graph_dp2tp1.sh
 ```
 
 The script starts the FFN and Attention servers in the background, writes
@@ -119,15 +120,15 @@ The script starts the FFN and Attention servers in the background, writes
 run without starting anything:
 
 ```bash
-AFD_DRY_RUN=1 LAYOUT=2A0F,0A2F POD=AFD_1 bash .../graph.sh
+AFD_DRY_RUN=1 LAYOUT=2A0F,0A2F POD=AFD_1 bash .../2a2f_graph_dp2tp1.sh
 ```
 
 Several hosts without Kubernetes run the same script with their own `POD`
 and the leaders' addresses:
 
 ```bash
-LAYOUT=2A0F,0A2F POD=AFD_0 ATTN_HEAD_HOST=<pod 0> FFN_HEAD_HOST=<pod 1> bash .../graph.sh
-LAYOUT=2A0F,0A2F POD=AFD_1 ATTN_HEAD_HOST=<pod 0> FFN_HEAD_HOST=<pod 1> bash .../graph.sh
+LAYOUT=2A0F,0A2F POD=AFD_0 ATTN_HEAD_HOST=<pod 0> FFN_HEAD_HOST=<pod 1> bash .../2a2f_graph_dp2tp1.sh
+LAYOUT=2A0F,0A2F POD=AFD_1 ATTN_HEAD_HOST=<pod 0> FFN_HEAD_HOST=<pod 1> bash .../2a2f_graph_dp2tp1.sh
 ```
 
 ## Running in a pod
