@@ -36,6 +36,9 @@ from afd_plugin.model_executor.ffn.remote import (
     _unroute_tp_padding,
 )
 from afd_plugin.model_executor.models._weight_utils import (
+    ATTENTION_ROLE,
+    BOTH_ROLES,
+    FFN_ROLE,
     filter_role_weights,
     layer_weight_path,
 )
@@ -60,9 +63,6 @@ def _is_moe_layer(config: _DeepseekAdapterConfig, layer_idx: int) -> bool:
     )
 
 
-_ATTENTION_ROLE = frozenset(("attention",))
-_FFN_ROLE = frozenset(("ffn",))
-_BOTH_ROLES = frozenset(("attention", "ffn"))
 # Connectors whose Attention runs the shared experts, so their FFN builds
 # none: Async CAM, and DeepEP M2N whose FFN runs routed experts only.
 _ATTENTION_SHARED_EXPERTS_CONNECTORS = (
@@ -81,23 +81,23 @@ def _checkpoint_weight_roles(
     """Classify one native checkpoint path by its AFD execution owner."""
     layer_path = layer_weight_path(name)
     if layer_path is None:
-        return _BOTH_ROLES
+        return BOTH_ROLES
 
     layer_idx, stage, remainder = layer_path
     if stage == "self_attn":
-        return _ATTENTION_ROLE
+        return ATTENTION_ROLE
     if stage != "mlp":
-        return _BOTH_ROLES
+        return BOTH_ROLES
 
     if not _is_moe_layer(config, layer_idx):
-        return _ATTENTION_ROLE if compute_gate_on_attention else _FFN_ROLE
+        return ATTENTION_ROLE if compute_gate_on_attention else FFN_ROLE
 
     if remainder and remainder[0] == "shared_experts" and attention_shared_experts:
-        return _ATTENTION_ROLE
+        return ATTENTION_ROLE
     is_moe_gate = bool(remainder) and remainder[0] == "gate"
     if is_moe_gate and compute_gate_on_attention:
-        return _BOTH_ROLES
-    return _FFN_ROLE
+        return BOTH_ROLES
+    return FFN_ROLE
 
 
 class GateOnlyRemoteMoE(RemoteFFNProxy):

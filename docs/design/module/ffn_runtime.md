@@ -30,7 +30,7 @@ depends_on:
   - "compatibility_and_patches.md"
 validation_paths:
   - "tests/unit/ffn_faas/test_*.py"
-  - "tests/unit/model_executor/ffn/npu/test_compute.py"
+  - "tests/unit/connectors/npu/async_cam_runtime/test_async_cam_layered.py"
   - "tests/npu/test_async_cam_layered_w8a8.py"
   - "tests/unit/v1/worker/test_ffn_metadata.py"
   - "tests/unit/v1/worker/test_ffn_model_runner.py"
@@ -334,7 +334,7 @@ The Async runner loads target/draft `QuantizedExpertWeights` through the model
 export contract, verifies layer coverage and selects Layered or Mega directly.
 `model_executor/ffn/npu/expert_weights.py` owns the Ascend quantized weight
 layout validation, logical geometry and graph signatures shared by Layered
-and Mega. `model_executor/ffn/npu/compute.py` owns native operator handles,
+and Mega. `connectors/npu/async_cam_runtime/async_cam_layered.py` and `async_cam_mega.py` own native operator handles,
 workspace, zero bias and layer maps. There is no execution layer beneath the
 ModelRunner and no access to private model parameters from compute.
 

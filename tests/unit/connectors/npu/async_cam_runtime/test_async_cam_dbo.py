@@ -13,7 +13,10 @@ pytest.importorskip("vllm")
 from vllm.v1.worker import ubatching  # noqa: E402
 
 from afd_plugin.connectors import AFDTransferContext, AFDTransferMetadata  # noqa: E402
-from afd_plugin.model_executor.ffn.npu import async_cam  # noqa: E402
+from afd_plugin.connectors.npu.async_cam_runtime import async_cam_dbo  # noqa: E402
+from afd_plugin.connectors.npu.async_cam_runtime import (  # noqa: E402
+    async_cam_layout as async_cam,
+)
 
 
 def test_plain_tp_cam_boundary_shards_and_restores_replicated_tokens(monkeypatch):
@@ -94,9 +97,9 @@ def test_peer_receives_once_before_sending_and_owner_consumes_its_result(monkeyp
 
     connector = SimpleNamespace(send_attn_output=send, recv_ffn_output=receive)
     hidden = [torch.full((2, 1), stage) for stage in range(2)]
-    first = async_cam.send_async_cam_remote_call(connector, hidden[0], _context(0))
+    first = async_cam_dbo.send_async_cam_remote_call(connector, hidden[0], _context(0))
     registry[identity] = 1
-    second = async_cam.send_async_cam_remote_call(connector, hidden[1], _context(1))
+    second = async_cam_dbo.send_async_cam_remote_call(connector, hidden[1], _context(1))
     assert events == [("send", 0, 0), ("recv", 0, 1), ("send", 1, 1)]
 
     registry[identity] = 0
@@ -129,7 +132,7 @@ def test_without_dbo_receives_directly_without_inactive_hooks(monkeypatch):
         send_attn_output=lambda *args, **kwargs: calls.append("send"),
         recv_ffn_output=recv,
     )
-    receive = async_cam.send_async_cam_remote_call(connector, value, _context(0))
+    receive = async_cam_dbo.send_async_cam_remote_call(connector, value, _context(0))
     assert calls == ["send"]
     assert receive() is value and receive() is value
     assert calls == ["send", "recv"]
@@ -146,7 +149,7 @@ def test_failed_receive_is_never_resubmitted(monkeypatch):
     connector = SimpleNamespace(
         send_attn_output=lambda *a, **k: None, recv_ffn_output=fail
     )
-    receive = async_cam.send_async_cam_remote_call(
+    receive = async_cam_dbo.send_async_cam_remote_call(
         connector, torch.ones(2, 1), _context(0)
     )
     with pytest.raises(ValueError, match="wire failure"):

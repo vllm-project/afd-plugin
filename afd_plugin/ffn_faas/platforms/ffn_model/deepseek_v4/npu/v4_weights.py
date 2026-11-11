@@ -20,10 +20,6 @@ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import FusedMoERouter
 from vllm_ascend.models.deepseek_v4 import model as native
 
-from afd_plugin.connectors.npu.async_cam_runtime.async_cam_layered import (
-    AsyncCAMLayeredExecutor,
-    LayeredFFNWeights,
-)
 from afd_plugin.ffn_faas.platforms.ffn_model.deepseek_v4.npu.v4_model import (
     V4CheckpointDescription,
 )

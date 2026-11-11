@@ -22,13 +22,12 @@ from afd_plugin.connectors.metadata import AFDForwardContextMetadata
 from afd_plugin.forward_context import get_afd_metadata_from_forward_context
 from afd_plugin.model_executor.ffn.remote import RemoteFFNProxy
 from afd_plugin.model_executor.models._weight_utils import (
+    ATTENTION_ROLE,
+    BOTH_ROLES,
+    FFN_ROLE,
     filter_role_weights,
     layer_weight_path,
 )
-
-_ATTENTION_ROLE = frozenset(("attention",))
-_FFN_ROLE = frozenset(("ffn",))
-_BOTH_ROLES = frozenset(("attention", "ffn"))
 
 
 def _checkpoint_weight_roles(name: str) -> frozenset[str]:
@@ -41,14 +40,14 @@ def _checkpoint_weight_roles(name: str) -> frozenset[str]:
         "model.hc_head_base",
         "model.hc_head_scale",
     }:
-        return _ATTENTION_ROLE
+        return ATTENTION_ROLE
     layer_path = layer_weight_path(name)
     if layer_path is None:
-        return _BOTH_ROLES
+        return BOTH_ROLES
     _, stage, _ = layer_path
     if stage == "ffn":
-        return _FFN_ROLE
-    return _ATTENTION_ROLE
+        return FFN_ROLE
+    return ATTENTION_ROLE
 
 
 class RemoteDeepseekV4FFN(RemoteFFNProxy):

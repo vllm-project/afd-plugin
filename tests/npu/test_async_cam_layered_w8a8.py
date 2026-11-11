@@ -27,7 +27,9 @@ def w8a8_runtime(request):
     torch = pytest.importorskip("torch")
     torch_npu = pytest.importorskip("torch_npu")
     from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
-    from afd_plugin.model_executor.ffn.npu.compute import AsyncCAMLayeredExecutor
+    from afd_plugin.connectors.npu.async_cam_runtime.async_cam_layered import (
+        AsyncCAMLayeredExecutor,
+    )
     from afd_plugin.model_executor.ffn.npu.expert_weights import QuantizedExpertWeights
 
     ensure_cam_async_ops_available()

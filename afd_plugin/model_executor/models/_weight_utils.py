@@ -3,9 +3,13 @@
 """Checkpoint path parsing and one-pass filtering; models own role policies."""
 
 from collections.abc import Callable, Iterable, Iterator
-from typing import TypeVar
+from typing import Final, TypeVar
 
 _Weight = TypeVar("_Weight")
+
+ATTENTION_ROLE: Final[frozenset[str]] = frozenset(("attention",))
+FFN_ROLE: Final[frozenset[str]] = frozenset(("ffn",))
+BOTH_ROLES: Final[frozenset[str]] = ATTENTION_ROLE | FFN_ROLE
 
 
 def layer_weight_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
