@@ -872,16 +872,7 @@ def _scale_payload(scale, *, tokens=4, hidden=64, routing=True):
     )
 
 
-@pytest.mark.parametrize(
-    "comm_cls,expected_shape",
-    [
-        pytest.param(_AllGatherComm, (4, 1, 2), id="allgather"),
-        pytest.param(_MC2Comm, (4, 2), id="mc2"),
-    ],
-)
-def test_the_ffn_runner_carries_the_received_scale_to_the_experts(
-    loaded, comm_cls, expected_shape
-):
+def test_the_ffn_runner_carries_the_received_scale_to_the_experts(loaded):
     """Deleting the runner's scale forwarding must fail this test.
 
     The whole chain from the runner's payload read to the expert call is real:
@@ -889,7 +880,9 @@ def test_the_ffn_runner_carries_the_received_scale_to_the_experts(
     MoE component are the ones under test elsewhere in this module.
     """
     module, context, _ = loaded
-    context._EXTRA_CTX.moe_comm_method = comm_cls(_moe_config())
+    # MC2 keeps the transported scale two-dimensionally; the DP-gather case
+    # above already asserts the ALLGATHER layout, its row order and padding.
+    context._EXTRA_CTX.moe_comm_method = _MC2Comm(_moe_config())
     experts = _Experts()
     namespace = _load_decoder_layer_methods()
     layer = types.SimpleNamespace(
@@ -927,6 +920,6 @@ def test_the_ffn_runner_carries_the_received_scale_to_the_experts(
 
     assert connector.recv_kwargs[0]["recv_routing"] is True
     consumed = experts.scales_seen[-1]
-    assert consumed.shape == expected_shape
+    assert consumed.shape == (4, 2)
     assert _e8m0_bytes(consumed) == _e8m0_bytes(scale)
     assert connector.sent, "the runner did not send the FFN output back"

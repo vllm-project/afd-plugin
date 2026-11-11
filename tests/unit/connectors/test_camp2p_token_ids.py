@@ -656,90 +656,6 @@ def test_mxfp8_construction_reports_what_the_operator_probe_said(
         _mxfp8_connector()
 
 
-def test_send_attn_output_forwards_the_configured_quant_mode(monkeypatch):
-    calls: list[tuple[Any, ...]] = []
-    monkeypatch.setattr(
-        torch.ops.vllm,
-        "afd_camp2p_send_attn_output",
-        lambda *args: calls.append(args),
-        raising=False,
-    )
-    monkeypatch.setattr(camp2p_module, "get_forward_context", SimpleNamespace)
-    connector = _connector(role="attention", rank=0)
-    connector.quant_mode = camp2p_module.A2E_QUANT_MODE_MXFP8
-
-    connector.send_attn_output(
-        torch.zeros(3, connector.hidden_size),
-        AFDTransferContext(
-            metadata=AFDTransferMetadata.create_attention_metadata(
-                layer_idx=0,
-                stage_idx=0,
-                seq_len=3,
-            ),
-        ),
-    )
-
-    assert calls[0][-1] == camp2p_module.A2E_QUANT_MODE_MXFP8
-
-
-def test_the_mxfp8_send_calls_the_operator_with_the_scale(monkeypatch):
-    """The opaque op quantizes, and the fourteen-argument call carries the pair."""
-    sent: list[tuple[Any, ...]] = []
-    quantized = torch.zeros(3, 16, dtype=torch.float8_e4m3fn)
-    scale = torch.tensor([[130], [131], [132]], dtype=torch.uint8).view(
-        torch.float8_e8m0fnu
-    )
-    quantize_calls = []
-
-    def fake_quantize(hidden_states):
-        quantize_calls.append(hidden_states)
-        return quantized, scale
-
-    methods: dict[str, Any] = {}
-    monkeypatch.setattr(camp2p_module, "_CAMP2P_CUSTOM_OPS_REGISTERED", False)
-    monkeypatch.setattr(
-        camp2p_module,
-        "direct_register_custom_op",
-        lambda **kwargs: methods.update({kwargs["op_name"]: kwargs["op_func"]}),
-    )
-    monkeypatch.setattr(camp2p_module, "mx_quantize_a2e_activation", fake_quantize)
-
-    def fake_a2e(*args: Any) -> tuple[Any, ...]:
-        sent.append(args)
-        return (None, None, None, "atten-batch", None)
-
-    monkeypatch.setattr(torch.ops.afd_ascend, "a2e", fake_a2e, raising=False)
-    forward_context = SimpleNamespace(ubatch_idx=0, cam_afdtransfer_state=None)
-    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
-    camp2p_module._register_camp2p_custom_ops()
-
-    hidden = torch.zeros(3, 16)
-    methods["afd_camp2p_send_attn_output"](
-        hidden,
-        "n0",
-        "n1",
-        "",
-        3,
-        16,
-        2,
-        4,
-        4,
-        0,
-        8,
-        0,
-        None,
-        None,
-        camp2p_module.A2E_QUANT_MODE_MXFP8,
-    )
-
-    call = sent[0]
-    assert len(call) == 14
-    assert quantize_calls == [hidden], "the operator must quantize the wire tensor"
-    assert call[0] is quantized
-    assert call[12] is scale
-    assert call[13] == camp2p_module.A2E_QUANT_MODE_MXFP8
-
-
 def test_the_mxfp8_receive_reads_the_sixth_return_value(monkeypatch):
     received_activation = torch.zeros(10, 16, dtype=torch.float8_e4m3fn)
     received_scale = torch.tensor([[127]] * 10, dtype=torch.uint8).view(
@@ -875,19 +791,8 @@ def test_the_control_payload_mode_is_checked_against_the_local_one(
         assert connector.control_plane.recv_dp_metadata_list() is payload
 
 
-def test_ranks_must_agree_on_the_quant_mode():
-    """4/0 and 0/4 both fail, from either side's point of view."""
-    camp2p_module._require_one_quant_mode([0, 0, 0, 0], 0)
-    camp2p_module._require_one_quant_mode([4, 4, 4, 4], 4)
-
-    with pytest.raises(RuntimeError, match="mismatch across ranks"):
-        camp2p_module._require_one_quant_mode([4, 4, 0, 0], 4)
-    with pytest.raises(RuntimeError, match="mismatch across ranks"):
-        camp2p_module._require_one_quant_mode([4, 4, 0, 0], 0)
-
-
 class _FakeGathered:
-    """Stand-in for the int32 mode tensor the handshake reads back."""
+    """Stand-in for the int32 mode tensor the handshake writes back."""
 
     def __init__(self, modes):
         self._modes = list(modes)
@@ -896,8 +801,8 @@ class _FakeGathered:
         return list(self._modes)
 
 
-def _init_on_stub_groups(monkeypatch, modes, *, role="attention"):
-    """Drive the real `init_afd_connector` against recorded stub groups."""
+def _init_on_stub_groups(monkeypatch, modes, local_mode, *, role="attention"):
+    """Drive the real ``init_afd_connector`` against recorded stub groups."""
     import types as _types
 
     order = []
@@ -916,15 +821,15 @@ def _init_on_stub_groups(monkeypatch, modes, *, role="attention"):
 
     def fake_all_gather(gathered, local, group=None):
         order.append("handshake")
-        handshakes.append(group)
+        handshakes.append((group, local.tolist()[0]))
 
     class _FakeTorch:
         int32 = "int32"
         distributed = SimpleNamespace(all_gather_into_tensor=fake_all_gather)
 
         @staticmethod
-        def tensor(*args, **kwargs):
-            return SimpleNamespace(tolist=lambda: [0])
+        def tensor(values, **kwargs):
+            return SimpleNamespace(tolist=lambda: list(values))
 
         @staticmethod
         def empty(*args, **kwargs):
@@ -944,23 +849,115 @@ def _init_on_stub_groups(monkeypatch, modes, *, role="attention"):
     monkeypatch.setattr(camp2p_module, "torch", _FakeTorch())
     connector = _connector(role=role, rank=0)
     connector._initialized = False
-    connector.init_afd_connector()
+    connector.quant_mode = local_mode
+    try:
+        connector.init_afd_connector()
+    finally:
+        pass
     return order, handshakes, connector
 
 
-def test_init_verifies_the_quant_mode_on_the_afd_group_before_other_groups(monkeypatch):
-    """Deleting the handshake must break this: the order is the contract."""
+@pytest.mark.parametrize(
+    "modes,local_mode,refused",
+    [
+        pytest.param([0, 0, 0, 0], 0, False, id="agree-0"),
+        pytest.param([4, 4, 4, 4], 4, False, id="agree-4"),
+        pytest.param([4, 4, 0, 0], 4, True, id="attention-4-ffn-0"),
+        pytest.param([4, 4, 0, 0], 0, True, id="attention-0-ffn-4"),
+    ],
+)
+def test_init_verifies_the_quant_mode_on_the_afd_group_first(
+    monkeypatch, modes, local_mode, refused
+):
+    """Deleting the handshake must break this: order and mode are the contract."""
+    if refused:
+        with pytest.raises(RuntimeError, match="mismatch across ranks"):
+            order, handshakes, connector = _init_on_stub_groups(
+                monkeypatch, modes, local_mode, role="ffn"
+            )
+        return
+
     order, handshakes, connector = _init_on_stub_groups(
-        monkeypatch, [0, 0, 0, 0], role="ffn"
+        monkeypatch, modes, local_mode, role="ffn"
     )
 
     assert order[0] == "afd"
     assert order.count("handshake") == 1
     assert order.index("handshake") < order.index("afd_moe"), "afd_moe was built first"
     assert order.index("handshake") < order.index("p2p"), "p2p was built first"
-    assert handshakes[0] is connector.afd_pg, "the mode check ran on another group"
+    group, published = handshakes[0]
+    assert group is connector.afd_pg, "the mode check ran on another group"
+    assert published == local_mode, "the handshake published another rank's mode"
 
 
-def test_init_refuses_a_mixed_pair_before_any_other_group(monkeypatch):
-    with pytest.raises(RuntimeError, match="mismatch across ranks"):
-        _init_on_stub_groups(monkeypatch, [4, 4, 0, 0], role="attention")
+def test_send_attn_output_reaches_the_operator_as_a_quantized_pair(monkeypatch):
+    """Through the public send: one call, fourteen arguments, the pair and the mode."""
+    sent: list[tuple[Any, ...]] = []
+    quantized = torch.zeros(3, 16, dtype=torch.float8_e4m3fn)
+    scale = torch.tensor([[130], [131], [132]], dtype=torch.uint8).view(
+        torch.float8_e8m0fnu
+    )
+    quantize_calls = []
+
+    def fake_quantize(hidden_states):
+        quantize_calls.append(hidden_states)
+        return quantized, scale
+
+    methods: dict[str, Any] = {}
+    monkeypatch.setattr(camp2p_module, "_CAMP2P_CUSTOM_OPS_REGISTERED", False)
+    monkeypatch.setattr(
+        camp2p_module,
+        "direct_register_custom_op",
+        lambda **kwargs: methods.update({kwargs["op_name"]: kwargs["op_func"]}),
+    )
+    monkeypatch.setattr(camp2p_module, "mx_quantize_a2e_activation", fake_quantize)
+
+    def fake_a2e(*args):
+        sent.append(args)
+        return (None, None, None, "atten-batch", None)
+
+    monkeypatch.setattr(torch.ops.afd_ascend, "a2e", fake_a2e, raising=False)
+    values = None
+    # attn_size > ffn_size in this fake config, so the padding branch is reached;
+    # one stage keeps it inert and out of the way of what this test asserts.
+    forward_context = SimpleNamespace(
+        ubatch_idx=0,
+        cam_afdtransfer_state=None,
+        additional_kwargs={
+            "afd_metadata": SimpleNamespace(
+                connector=SimpleNamespace(dp_metadata_list=[{}])
+            )
+        },
+    )
+    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
+    camp2p_module._register_camp2p_custom_ops()
+
+    def registered(*args):
+        if values is not None:
+            values.append(args)
+        return methods["afd_camp2p_send_attn_output"](*args)
+
+    monkeypatch.setattr(
+        torch.ops.vllm, "afd_camp2p_send_attn_output", registered, raising=False
+    )
+    connector = _connector(role="attention", rank=0)
+    connector.quant_mode = camp2p_module.A2E_QUANT_MODE_MXFP8
+
+    hidden = torch.zeros(3, 16)
+    connector.send_attn_output(
+        hidden,
+        AFDTransferContext(
+            metadata=AFDTransferMetadata.create_attention_metadata(
+                layer_idx=0,
+                stage_idx=0,
+                seq_len=3,
+            ),
+        ),
+    )
+
+    call = sent[0]
+    assert len(call) == 14
+    assert quantize_calls == [hidden], "the operator must quantize the wire tensor"
+    assert call[0] is quantized
+    assert call[12] is scale
+    assert call[13] == camp2p_module.A2E_QUANT_MODE_MXFP8
