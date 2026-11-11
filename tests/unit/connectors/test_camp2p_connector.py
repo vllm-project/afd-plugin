@@ -342,6 +342,19 @@ def test_camp2p_init_scopes_fresh_options_to_each_hccl_group(
     monkeypatch.setattr(camp2p_module, "ensure_cam_p2p_ops_available", lambda: None)
     monkeypatch.setattr(camp2p_module, "_register_camp2p_custom_ops", lambda: None)
 
+    # The group handshake is not what this test is about, and its collective
+    # cannot take the SimpleNamespace stand-ins as a process group.
+    def fake_all_gather(output, local, group=None):
+        # The handshake reads the gathered modes back, so the stand-in has to
+        # publish the local mode instead of leaving the output uninitialised.
+        output.fill_(local.item())
+
+    monkeypatch.setattr(
+        camp2p_module.torch.distributed,
+        "all_gather_into_tensor",
+        fake_all_gather,
+    )
+
     def fake_init_afd_process_group(**kwargs):
         calls.append(kwargs)
         backend = SimpleNamespace(
