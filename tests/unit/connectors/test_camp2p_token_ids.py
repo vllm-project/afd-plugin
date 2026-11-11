@@ -67,7 +67,7 @@ def _vllm_stub() -> Iterator[None]:
         yield
         return
 
-    builders = {
+    builders: dict[str, dict[str, object]] = {
         "vllm": {},
         "vllm.forward_context": {
             "DPMetadata": type("DPMetadata", (), {}),
