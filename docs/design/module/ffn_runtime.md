@@ -119,7 +119,7 @@ and host-loop imports remain independent of vLLM.
 The CPU-only host `FFNModelRunner` accepts an `FFNBackend` factory, retains
 the backend before preparation, and owns the receiving thread and failure
 boundary. `FFNService` manages host status and stop requests. Platform options
-and native composition live under `ffn_faas/platforms/npu/`:
+and CAM runtime composition live under `ffn_faas/platforms/npu/`.
 
 - `AscendFFNEnvironment` owns device initialization, F-only compute/EP groups
   and native post-warmup CPU affinity. These groups coexist with the separate
@@ -128,11 +128,12 @@ and native composition live under `ffn_faas/platforms/npu/`:
   accounting and cached-view lifetime. Startup selects a `RoutedModelAdapter`
   to provide checkpoint metadata and native owner construction. The backend
   uses the common resource without model-specific branching.
-- `v4_model.py` contains V4 checkpoint metadata and `V4ModelAdapter`;
-  `v4_weights.py` contains the lazily imported native parameter owner. Native
-  routed modules, expert-map managers and quantizers remain resident. The
-  loader adapter delegates to the native V4 loader; dependency upgrades must
-  preserve its documented receiver and factory contracts.
+- Model-specific code follows `ffn_faas/platforms/ffn_model/<model>/<backend>/`.
+  Under `deepseek_v4/npu/`, `v4_model.py` contains V4 checkpoint metadata and
+  `V4ModelAdapter`. `v4_weights.py` contains the lazily imported native parameter
+  owner. Native routed modules, expert-map managers and quantizers remain
+  resident. The loader adapter delegates to the native V4 loader. Dependency
+  upgrades must preserve its documented receiver and factory contracts.
 - Platform settings enforce static CAM placement and reject EPLB, elastic EP
   and redundant experts. Retaining native expert state does not enable these
   algorithms.
