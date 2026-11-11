@@ -1,4 +1,4 @@
-# 1. Resolve the recipe, its model, and its placement
+# 1. Resolve the recipe, model, and pod resources
 
 Take the recipe path from the user, or ask. It must be a colocation recipe
 under `recipe/gpu/P2pNcclAFDConnector/**/prefill_decode_colocation/` or
@@ -6,26 +6,17 @@ under `recipe/gpu/P2pNcclAFDConnector/**/prefill_decode_colocation/` or
 only; prefill/decode disaggregation recipes are out of scope -- see
 `SKILL.md` Scope).
 
-Every such recipe is a short script on the shared launcher
-`recipe/gpu/common/afd_colocation.sh` (see `recipe/gpu/common/README.md`):
-the recipe sets `MODEL_PATH`, `AFD_CONNECTOR`, `LAYOUT`, `MODE` and its
-`SERVE_ARGS`; the launcher derives devices, DP flags and ports. Never parse
-the `vllm serve` command out of the script -- print it:
-
-```bash
-RECIPE_LIB_PATH=recipe/gpu/common/afd_colocation.sh
-AFD_DRY_RUN=1 LAYOUT=<layout> POD=AFD_<k> <caller settings> bash "$RECIPE_SCRIPT_PATH"
-```
-
-prints, per role this pod runs, the `CUDA_VISIBLE_DEVICES=... vllm serve ...`
-line. Record `--max-num-batched-tokens` and report it to the caller later --
-it caps how much prefill work a single step can absorb.
+Every such recipe states its `MODEL_PATH`, default `LAYOUT`, mode, and serve
+flags, then sources the shared launcher,
+`recipe/gpu/common/afd_colocation.sh`. Treat the launcher as the execution
+contract: do not reconstruct or parse its `vllm serve` commands to determine
+Kubernetes resources.
 
 ## Model
 
-Resolve `MODEL_ID` from the script's `MODEL_PATH` default. It is either a
-HF Hub id or a **placeholder** path of the form `/path/model_weights/<name>`
--- every colocation recipe uses exactly this literal `/path/` stand-in.
+Resolve `MODEL_ID` from the caller's `MODEL_PATH` if given, else the recipe's
+default. It is either a HF Hub id or the placeholder
+`/path/model_weights/<name>` used by every colocation recipe.
 Never pass this through verbatim: derive the real `MODEL_ID` as
 `/models/<name>` (`/models` is the PVC mount point fixed by
 `templates/pod.yaml`), e.g. `/path/model_weights/Qwen3.5-122B-A10B-FP8`
@@ -36,44 +27,33 @@ mounting the PVC); a mismatch fails inside the pod with a confusing
 HF-repo-id validation error. Tell the caller which form it is, and the
 resolved value if derived.
 
-## Placement plan -- never ask
+## Pod resource plan -- never ask
 
-The placement is `LAYOUT`: one pod per comma-separated `<a>A<f>F` entry, in
-order, pod `k` running `POD=AFD_<k>`, every pod with the same `LAYOUT`. Take
-`LAYOUT` from the caller's settings, else from the script's
-`LAYOUT=${LAYOUT:-...}` default; never ask. For entry `k` with `a`
-Attention and `f` FFN GPUs:
+Take `LAYOUT` from the caller's settings, else the recipe's default; never
+ask. The selected `LAYOUT`, not a recipe filename or descriptive comment,
+controls the plan. Split it by comma into one `<a>A<f>F` entry per pod. For
+entry `k`, `a` is that pod's Attention GPU count and `f` its FFN GPU count:
 
 - **k8s Pod name**: `vllm-pod-afd-<k>`. A one-entry `LAYOUT` (e.g. `2A2F`)
   is a plain single pod: `vllm-pod`, no `POD` needed.
-- **`GPU_COUNT`**: `a + f` (FFN on the pod's first `f` GPUs).
+- **`GPU_COUNT`**: `a + f`, passed to `templates/pod.yaml` as `TEMPLATE_GPU`
+  so the container requests that many `nvidia.com/gpu` devices.
 - **`afd-attn-node-role`**: `none` when `a` is 0, `head` on the first entry
   with `a > 0`, `worker` on later ones. **`afd-ffn-node-role`**: the same
-  with `f`. For example `2A0F,0A2F` is `head none` and `none head`,
-  `1A1F,1A1F` is `head head` and `worker worker`, and `2A0F,2A0F,0A2F` is
-  `head none`, `worker none` and `none head`.
-- **Container env**: `POD=AFD_<k>` and `LAYOUT=<layout>`, plus every setting
-  the caller gives (`MODEL_PATH`, `ATTN_TP`, `FFN_TP`, `VLLM_ARGS`,
-  `ATTN_ARGS`, `FFN_ARGS`, `DECODE_BENCH`, `M2N_EXTRA_CONFIG`, NCCL
-  variables), the same on every pod. Leave `HEAD_HOST`, `ATTN_HEAD_HOST` and
-  `FFN_HEAD_HOST` unset: the defaults name the Services from
-  [services.md](services.md). With `DECODE_BENCH`, also set
-  `AFD_REPO=/opt/afd-plugin` (the repository in `docker/Dockerfile.ci`
-  images), since the connector lives in `tools/benchmarks` and the recipe
-  runs from `/work`.
-- Whether the connector accepts the placement is checked at startup, not
-  here; see the connector guide's supported layouts.
+  with `f`. For example, `2A0F,0A2F` gives `head none` then `none head`.
+- **Container env**: every pod gets the selected `LAYOUT`, its own
+  `POD=AFD_<k>`, and the caller's other recipe overrides unchanged. Leave
+  `HEAD_HOST`, `ATTN_HEAD_HOST`, and `FFN_HEAD_HOST` unset; their defaults
+  name the Services in [services.md](services.md). With `DECODE_BENCH`, also
+  set `AFD_REPO=/opt/afd-plugin`.
 
-## Ports
+The launcher owns role-to-device ordering, DP/TP command construction, and
+startup validation of the placement. Record the pod/resource table for
+[deploy.md](deploy.md), which uses it as-is.
 
-The launcher fixes them on one line (`ATTN_PORT=18000 FFN_PORT=18001
-AFD_PORT=6239 ATTN_DP_RPC_PORT=13345 FFN_DP_RPC_PORT=13355`); read them from
-it rather than assuming:
+## Other deployment values
 
-```bash
-lib_port() { grep -oE "\b$1=[0-9]+" "$RECIPE_LIB_PATH" | head -1 | cut -d= -f2; }
-CLIENT_PORT=$(lib_port ATTN_PORT)   # the Attention API, exposed by vllm-service
-```
-
-This step is the only place that parses the recipe:
-[deploy.md](deploy.md) uses the `GPU_COUNT` and plan recorded here as-is.
+Set `CLIENT_PORT` to the launcher's `ATTN_PORT`; the current launcher fixes
+it at `18000`. Record the effective `--max-num-batched-tokens` -- the
+caller's `VLLM_ARGS` value if overridden, else the recipe's `SERVE_ARGS`
+value -- for the final report.
