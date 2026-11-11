@@ -90,6 +90,9 @@ A2E_MX_GROUP_SIZE: Final[int] = 32
 A2E_MX_MIN_AIV_NUM: Final[int] = 3
 # Each side of the A2E pair must fit the operator's rank addressing.
 A2E_MX_MAX_RANKS_PER_SIDE: Final[int] = 32
+#: UB bytes the operator reserves for the routing ids of one call; it moves the
+#: whole `[rows, topk]` int32 block in one transfer.
+A2E_MX_GATE_UB_BYTES: Final[int] = 192 * 1024 - 1024
 
 #: Activation dtype carried end to end in MXFP8 mode.
 _A2E_MX_ACTIVATION_DTYPE: Final[torch.dtype] = torch.float8_e4m3fn
@@ -558,6 +561,9 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         hf_config = vllm_config.model_config.hf_config
         self.hidden_size = hf_config.hidden_size
         self.num_experts_per_tok = hf_config.num_experts_per_tok
+        self.max_num_batched_tokens = int(
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
         self.num_routed_experts = hf_config.n_routed_experts
         self.quant_mode = extra_info.quant_mode
         self._fail_if_mxfp8_transport_unsupported(afd_config)
@@ -594,6 +600,18 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             raise RuntimeError(
                 "quant_mode=4 requires at least "
                 f"{A2E_MX_MIN_AIV_NUM} AIV cores; got {self.aiv_num}",
+            )
+        # The operator carries the whole routing-id block of one call in a single
+        # UB region, so a batch larger than this cannot be sent at all.
+        ids_per_row = self.num_experts_per_tok * 4
+        rows_max = A2E_MX_GATE_UB_BYTES // ids_per_row
+        if self.max_num_batched_tokens > rows_max:
+            raise RuntimeError(
+                "quant_mode=4 sends the routing ids of a whole call through one "
+                f"operator transfer, which allows at most {rows_max} tokens at "
+                f"topk={self.num_experts_per_tok}; this deployment can batch "
+                f"{self.max_num_batched_tokens}. Lower --max-num-batched-tokens "
+                "or keep quant_mode=0",
             )
         _require_a5_device()
         supported = a2e_accepts_mxfp8_arguments()
