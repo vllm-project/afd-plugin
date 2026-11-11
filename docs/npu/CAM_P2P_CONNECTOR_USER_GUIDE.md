@@ -143,12 +143,36 @@ the FFN machine's reachable IP as `host`.
 | --- | --- | --- | --- |
 | `core_num` | `int` | `8` | Positive default AIV core count for both roles. |
 | `attn_core_num` / `ffn_core_num` | `int` | unset | Positive role-specific override for `core_num`. |
-| `quant_mode` | `int` | `0` | CAM quantization mode. The current runtime supports only `0`. |
+| `quant_mode` | `int` | `0` | A2E transport quantization. `0` carries a BF16 activation; `4` carries an E4M3 activation with its E8M0 MX scale. Other values are rejected. `4` requires the preconditions in [MXFP8 transport](#mxfp8-transport-quant_mode4). |
 | `compute_gate_on_attention` | `bool` | `false` | Kept for backwards compatibility with older configurations and ignored for routing placement: transport derives the gate from the payload it actually carries. Omit it when deploying and set the common `afd.compute_gate_on_attention` field instead. |
 | `hccl_buffer_size` | `int` | unset | Positive CAMP2P HCCL buffer size in MB. The override applies to every connector-owned `afd*` communication domain and the FFN-side `afd_moe` domain; the Gloo control group is unaffected. When unset, HCCL uses `HCCL_BUFFSIZE`, then its built-in default. Use the same value on all members of each HCCL domain. |
 
 The per-domain setting avoids increasing buffers for unrelated TP, DP, or EP
 process groups. `HCCL_BUFFSIZE` remains a process-wide fallback.
+
+### MXFP8 transport (`quant_mode=4`)
+
+`quant_mode=4` moves a pre-quantized activation instead of BF16. Attention
+quantizes to E4M3 with `torch_npu.npu_dynamic_mx_quant` and sends the activation
+together with its E8M0 MX scale (`ceil(hidden_size / 32)` bytes per token); the
+FFN side hands both to the experts without dequantizing.
+
+Construction rejects the mode unless all of the following hold on every rank:
+
+- the common `afd.compute_gate_on_attention` is `true`, because the FFN side
+  consumes the routing and never runs the gate itself;
+- Attention and FFN have the same rank count, each side between 1 and 32;
+- `core_num` (or the role override) is at least 3;
+- the installed `a2e` operator takes `x_scale` and `quant_mode` and returns the
+  received scale. The check inspects the operator schema, and an unreadable
+  schema is treated as unsupported.
+
+On the FFN side the token-ids slot is not usable in this mode: the shared-expert
+and router paths still need the model dtype, so the FFN rank must receive the
+Attention-side routing (`recv_routing`). Expect the scale to reach the experts in
+the layout the MoE path consumes: three-dimensional
+`(rows, cols // 2, 2)` for ALLGATHER, two-dimensional for MC2, whose dispatcher
+forwards the scale with `quant_mode=0` instead of quantizing again.
 
 ## Single-node `4A2F` example
 
