@@ -17,6 +17,7 @@ import logging
 import sys
 import types
 from collections.abc import Iterator
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +69,8 @@ def _vllm_stub() -> Iterator[None]:
     for name in missing:
         module = types.ModuleType(name)
         module.__path__ = []  # type: ignore[attr-defined]
+        # find_spec("vllm") runs at import time; a spec-less module makes it raise.
+        module.__spec__ = ModuleSpec(name, None)
         for attribute, value in builders[name].items():
             setattr(module, attribute, value)
         sys.modules[name] = module

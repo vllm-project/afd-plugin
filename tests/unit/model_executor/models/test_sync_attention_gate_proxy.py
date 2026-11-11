@@ -16,6 +16,7 @@ Like the other model-layer tests, this needs vLLM and is skipped on a CPU-only h
 from __future__ import annotations
 
 import sys
+from importlib.machinery import ModuleSpec
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -34,7 +35,11 @@ try:
 
     _stubbed_torch_npu = False
 except ModuleNotFoundError:
-    sys.modules["torch_npu"] = ModuleType("torch_npu")
+    _torch_npu_stub = ModuleType("torch_npu")
+    # ``find_spec`` is called on this name at import time, and a module without a
+    # spec makes it raise instead of reporting the extension as missing.
+    _torch_npu_stub.__spec__ = ModuleSpec("torch_npu", None)
+    sys.modules["torch_npu"] = _torch_npu_stub
     _stubbed_torch_npu = True
 
 # The NPU adapter; the CUDA module of the same name has no sync gate shell.

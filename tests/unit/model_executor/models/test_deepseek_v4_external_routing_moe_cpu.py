@@ -20,6 +20,7 @@ import importlib.util
 import sys
 import types
 from dataclasses import dataclass
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 
 import pytest
@@ -206,6 +207,9 @@ def _install_stub_modules():
     }
     assert set(modules) == set(_STUBBED_MODULE_NAMES)
     for name, module in modules.items():
+        # find_spec() is called on these names at import time and raises on a
+        # module without a spec, so the stand-ins carry one.
+        module.__spec__ = ModuleSpec(name, None)
         sys.modules[name] = module
 
     spec = importlib.util.spec_from_file_location(
