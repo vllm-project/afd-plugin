@@ -173,9 +173,18 @@ Construction rejects the mode unless all of the following hold on every rank:
   consumes the routing and never runs the gate itself;
 - Attention and FFN have the same rank count, each side between 1 and 32;
 - `core_num` (or the role override) is at least 3;
+- the FFN role resolves to ALLGATHER or MC2 for the largest batch Attention
+  can send. The external-routing consumer supports only those two paths, while
+  the pinned selector can pick ALLTOALL or FUSED_MC2 depending on batch size,
+  EP, LoRA and MegaMoE state; the **startup handshake** rejects the pair, on
+  both roles, before `afd_moe` and `p2p` are created;
+- the two roles may run different `--max-num-batched-tokens`: the path check
+  uses the bound the Attention role publishes during the handshake, not the
+  FFN role's own limit;
 - `--max-num-batched-tokens` fits the operator's routing-id budget: one call
   carries `batch_size x topk` int32 ids into a single UB region, which allows
-  8,149 tokens at `topk=6` (195,584 bytes). Exceeding it fails at construction;
+  8,149 tokens at `topk=6` (195,584 bytes). Exceeding it fails in the startup
+  handshake on both roles, before `afd_moe` and `p2p` are created;
 - the installed `a2e` operator takes `x_scale` and `quant_mode` and returns the
   received scale. The check inspects the operator schema, and an unreadable
   schema is treated as unsupported.

@@ -345,9 +345,10 @@ def test_camp2p_init_scopes_fresh_options_to_each_hccl_group(
     # The group handshake is not what this test is about, and its collective
     # cannot take the SimpleNamespace stand-ins as a process group.
     def fake_all_gather(output, local, group=None):
-        # The handshake reads the gathered modes back, so the stand-in has to
-        # publish the local mode instead of leaving the output uninitialised.
-        output.fill_(local.item())
+        # The handshake reads the gathered rows back, so the stand-in publishes
+        # the whole local vector for every rank instead of leaving the output
+        # uninitialised. It must work for the flat buffer too.
+        output.view(-1, local.numel()).copy_(local)
 
     monkeypatch.setattr(
         camp2p_module.torch.distributed,

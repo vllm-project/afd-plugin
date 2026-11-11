@@ -150,7 +150,9 @@ def _mla_dbo(cudagraph_mode, **model_fields):
             id="four-ubatches",
         ),
         pytest.param(
-            _config_with(extra_config={"quant_mode": 1}), "quant_mode=0", id="quant"
+            _config_with(extra_config={"quant_mode": 1}),
+            r"supports quant_mode=\[0, 4\]; got 1",
+            id="quant",
         ),
         pytest.param(
             _config_with(connector="P2pNcclAFDConnector", extra_config={"core_num": 8}),
