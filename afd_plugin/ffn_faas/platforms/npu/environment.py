@@ -24,13 +24,13 @@ if TYPE_CHECKING:
 COMPUTE_GROUP_TIMEOUT_SECONDS = 180
 
 
-# GPU parallel: afd_plugin/ffn_faas/platforms/gpu/environment.py::
-#   GPUFFNEnvironment.
-# Reuse: PARTIAL - the shared base owns state, launcher checks, ownership
-#   flags, the EP-group check and close-state handling; this class owns Ascend
-#   device selection, custom operators, HCCL groups and CPU binding.
 class AscendFFNEnvironment(FFNEnvironmentBase[FFNConfig]):
-    """Never borrow unrelated groups or tear them down on a failed native seam."""
+    """Never borrow unrelated groups or tear them down on a failed native seam.
+
+    ``FFNEnvironmentBase`` owns the state, launcher checks, ownership flags,
+    the EP-group check and close-state handling. This class owns Ascend
+    device selection, custom operators, HCCL groups and CPU binding.
+    """
 
     def __init__(self, settings: FFNConfig) -> None:
         super().__init__(settings, platform_name="Ascend")

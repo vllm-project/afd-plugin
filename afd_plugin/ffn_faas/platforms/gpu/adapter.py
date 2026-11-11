@@ -33,10 +33,6 @@ if TYPE_CHECKING:
     from afd_plugin.ffn_faas.interfaces import FFNBackend
 
 
-# NPU parallel: afd_plugin/ffn_faas/platforms/npu/adapter.py::create_backend
-#   (bootstraps the Ascend OPP environment, then imports the backend).
-# Reuse: PARTIAL - the deferred-import factory shape is the same; GPU needs
-#   no environment bootstrap before importing torch.
 def create_backend(settings: GPUFFNConfig, args: Namespace) -> FFNBackend:
     """Import the GPU backend only when the host loop constructs it.
 
@@ -72,13 +68,15 @@ def uses_cuda_graphs(args: Namespace) -> bool:
     return True
 
 
-# NPU parallel: afd_plugin/ffn_faas/platforms/npu/adapter.py::AscendCAMAdapter.
-# Reuse: YES - the shared launch module owns the native engine parser and the
-#   F-only launcher checks. GPU additionally fixes TP 1 with expert parallel,
-#   the execution mode and the lane count, and adopts Attention TP, capacity
-#   and the bucket ladder from the M2N handshake.
 class GPUDeepEPM2NAdapter:
-    """Keep GPU, topology and connector options out of the host loop."""
+    """Keep GPU, topology and connector options out of the host loop.
+
+    The native engine parser and the F-only launcher checks come from the
+    shared launch module. This adapter adds the GPU constraints: TP 1 with
+    expert parallelism, the execution mode and the DeepEP lane count.
+    Attention TP, capacity and the bucket ladder are not launch options; the
+    connector adopts them from the M2N handshake with Attention.
+    """
 
     def create_parser(self) -> ArgumentParser:
         """Build vLLM's engine CLI with the F-only service's fixed defaults.

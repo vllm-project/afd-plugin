@@ -35,23 +35,19 @@ TORCHELASTIC_AGENT_STORE_ENV = "TORCHELASTIC_USE_AGENT_STORE"
 DBO_WORKSPACE_UBATCHES = 2
 
 
-# NPU parallel: afd_plugin/ffn_faas/platforms/npu/environment.py::
-#   AscendFFNEnvironment.
-# Reuse: PARTIAL - the shared base owns state, launcher checks, ownership
-#   flags, the EP-group check and close-state handling; NPU initializes HCCL
-#   explicitly plus Ascend groups and CPU binding, GPU reuses vLLM's GPU Worker
-#   distributed initializer, pins the routed MoE backend and selects the AFD
-#   model architecture.
 class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
-    """Never borrow unrelated groups or tear them down on a failed native seam."""
+    """Never borrow unrelated groups or tear them down on a failed native seam.
+
+    ``FFNEnvironmentBase`` owns the state, launcher checks, ownership flags,
+    the EP-group check and close-state handling. This class adds the GPU
+    device, the F-only ``VllmConfig`` (AFD routed-experts architecture and
+    pinned MoE backend) and vLLM's GPU Worker distributed initializer.
+    """
 
     def __init__(self, settings: GPUFFNConfig) -> None:
         """Record the settings; nothing native happens until ``initialize_device``."""
         super().__init__(settings, platform_name="GPU")
 
-    # NPU parallel: AscendFFNEnvironment.initialize_device.
-    # Reuse: PARTIAL - launcher and borrowed-group checks are identical;
-    #   the device and native preflight are platform-specific.
     def initialize_device(self, config: VllmConfig) -> None:
         """Select this rank's GPU after checking the launcher and native stack.
 
@@ -98,10 +94,6 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
         torch.accelerator.set_device_index(device)
         self._device = device
 
-    # NPU parallel: CAMFFNBackend.prepare (EngineArgs.from_cli_args,
-    #   create_engine_config, re-asserted external_launcher).
-    # Reuse: YES - both build from the native engine CLI and re-assert the
-    #   shared external launcher.
     def build_config(self, args: Namespace) -> VllmConfig:
         """Build the F-only ``VllmConfig`` exactly as the GPU FFN Worker sees it.
 
@@ -135,10 +127,6 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
         select_routed_moe_backend(config)
         return config
 
-    # NPU parallel: AscendFFNEnvironment.initialize_compute.
-    # Reuse: PARTIAL - ownership-before-collective and the EP-group check are
-    #   identical; GPU calls vLLM's GPU Worker initializer instead of
-    #   init_distributed_environment + initialize_model_parallel directly.
     def initialize_compute(self, config: VllmConfig) -> None:
         """Create the F-only NCCL world, model-parallel groups and workspace.
 
@@ -188,8 +176,6 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
             DBO_WORKSPACE_UBATCHES if config.parallel_config.enable_dbo else 1,
         )
 
-    # NPU parallel: AscendFFNEnvironment.activate_thread.
-    # Reuse: YES (shape) - one call; only the device API differs.
     def activate_thread(self) -> None:
         """Select this rank's GPU on the calling (receiver) thread.
 
@@ -200,9 +186,6 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
 
         torch.cuda.set_device(self.device)
 
-    # NPU parallel: AscendFFNEnvironment.close.
-    # Reuse: PARTIAL - same order and ownership guard; NPU also destroys the
-    #   Ascend model-parallel groups.
     def _destroy_groups(self) -> None:
         """Destroy the vLLM model-parallel groups and the F-only world.
 

@@ -28,16 +28,16 @@ from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (
 )
 
 
-# NPU parallel: afd_plugin/ffn_faas/platforms/npu/backend.py::CAMFFNBackend.
-# Reuse: PARTIAL - the same FFNBackend lifecycle (prepare phases, receiver
-#   thread activation, receiver-exit proof, release order runtime ->
-#   compute groups -> weights); the native pieces differ (NCCL/DeepEP M2N vs
-#   HCCL/CAM, lazy graph capture vs capture inside prepare) and GPU adds
-#   cancel_receive because the M2N control plane can end an idle receive.
-#   REFACTOR-CANDIDATE(R8): a backend base owning the phase sequence and the
-#   release-after-proof ordering, with platform hooks.
 class DeepEPM2NFFNBackend:
-    """Keep weights and communication owners until receiver exit is proven."""
+    """Keep weights and communication owners until receiver exit is proven.
+
+    Implements the ``FFNBackend`` lifecycle over DeepEP M2N: ``prepare`` runs
+    on the host thread; ``start_receiver``, ``execute_step`` and
+    ``receiver_exited`` run on the receiver thread; ``close`` then releases
+    the runtime, the compute groups and the weights, in that order.
+    ``cancel_receive`` can end an idle receive because the M2N control plane
+    owns an abortable NCCL group.
+    """
 
     def __init__(self, settings: GPUFFNConfig, args: Namespace) -> None:
         """Hold the CPU-side launch facts; native work starts in ``prepare``."""
@@ -126,19 +126,15 @@ class DeepEPM2NFFNBackend:
                 compute_ep_world_size=environment.ep_group.world_size,
             )
 
-    # NPU parallel: CAMFFNBackend.start_receiver.
-    # Reuse: YES - identical delegation to the environment.
     def start_receiver(self) -> None:
         """Select the GPU once on the receiving thread, as the Worker does."""
         self.environment.activate_thread()
 
-    # NPU parallel: CAMFFNBackend.execute_step.
-    # Reuse: PARTIAL - both delegate to the runner's
-    #   execute_connector_driven_step; NPU adds its eager fence and never
-    #   reports a cancel, GPU's runner already ends each step with a
-    #   synchronize.
     def execute_step(self) -> bool:
         """Run one control payload's step through the shared GPU runner method.
+
+        The runner ends every step with a device synchronize, so this method
+        adds no fence of its own.
 
         Returns ``False`` only when ``cancel_receive`` closed the control
         plane while the receive was idle. A closed control plane without a
@@ -150,8 +146,6 @@ class DeepEPM2NFFNBackend:
             cancel_requested=self._cancel_requested.is_set
         )
 
-    # NPU parallel: CAMFFNBackend.cancel_receive (a no-op there).
-    # Reuse: NO - GPU-only: the M2N control plane owns an abortable group.
     def cancel_receive(self) -> None:
         """End an idle control receive so a host stop can exit cleanly.
 
@@ -168,15 +162,11 @@ class DeepEPM2NFFNBackend:
             if control_plane is not None:
                 control_plane.close()
 
-    # NPU parallel: CAMFFNBackend.receiver_exited.
-    # Reuse: YES - identical delegation to the runner.
     def receiver_exited(self) -> None:
         """Record on the receiver thread that its loop ended cleanly."""
         assert self.runner is not None
         self.runner.mark_receiver_exited()
 
-    # NPU parallel: CAMFFNBackend.close.
-    # Reuse: PARTIAL - same release order (runtime, compute groups, weights).
     def close(self) -> None:
         """Release CUDA graphs, DeepEP buffers, compute groups and weights.
 

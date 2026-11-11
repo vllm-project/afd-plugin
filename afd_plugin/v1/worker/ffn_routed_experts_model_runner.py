@@ -161,10 +161,6 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
             for layer_idx in self.moe_layer_indices
         }
 
-    # NPU parallel: afd_plugin/v1/worker/npu/async_ffn_model_runner.py::
-    #   AsyncNPUFFNModelRunner.mark_receiver_exited (records the same proof;
-    #   NPU rejects pending graph work, GPU fences the device instead).
-    # Reuse: PARTIAL - same contract, device-specific completion check.
     def mark_receiver_exited(self) -> None:
         """Record that the receive loop ended cleanly and its device work is done.
 

@@ -28,9 +28,6 @@ FFN_GRAPH_MODE = "FULL_DECODE_ONLY"
 EAGER_MODE = "eager"
 
 
-# NPU parallel: afd_plugin/ffn_faas/platforms/npu/settings.py::FFNConfig.
-# Reuse: PARTIAL - the launch module owns rank and shutdown validation; GPU
-#   also fixes the payload format, the execution mode and the lane count.
 @dataclass(frozen=True)
 class GPUFFNConfig:
     """Frozen settings of one F rank in a standalone DeepEP M2N deployment."""

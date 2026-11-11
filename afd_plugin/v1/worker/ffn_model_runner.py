@@ -152,12 +152,6 @@ class GPUFFNModelRunner:
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         return None
 
-    # NPU parallel: afd_plugin/v1/worker/npu/async_ffn_model_runner.py::
-    #   AsyncNPUFFNModelRunner.execute_connector_driven_step (same name and
-    #   bool return; the CAM step submits layered work items instead of
-    #   receiving one control payload).
-    # Reuse: NO - the step bodies share no code; only the host contract
-    #   (one call per batch, a bool result) is common.
     def execute_connector_driven_step(
         self, *, cancel_requested: Callable[[], bool]
     ) -> bool:
