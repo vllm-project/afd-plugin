@@ -20,6 +20,7 @@ import importlib.util
 import sys
 import types
 from dataclasses import dataclass
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 
 import pytest
@@ -99,6 +100,28 @@ class _MC2Comm(_CommBase):
 
 def _moe_config():
     return types.SimpleNamespace(dp_size=1, pcp_size=1, tp_size=1, dp_group=None)
+
+
+_STUBBED_MODULE_NAMES = (
+    "vllm",
+    "vllm.distributed",
+    "vllm.distributed.parallel_state",
+    "vllm_ascend",
+    "vllm_ascend.ops",
+    "vllm_ascend.ops.fused_moe",
+    "vllm_ascend.ops.fused_moe.dataclass",
+    "vllm_ascend.ops.fused_moe.dataclass.prepare_finalize",
+    "vllm_ascend.ops.fused_moe.prepare_finalize",
+    "vllm_ascend.ops.fused_moe.moe_comm_method",
+    "vllm_ascend.ops.fused_moe.moe_utils",
+    "vllm_ascend.quantization",
+    "vllm_ascend.quantization.quant_type",
+    "vllm_ascend.ascend_forward_context",
+    "afd_plugin",
+    "afd_plugin.connectors",
+    "afd_plugin.connectors.npu",
+    "afd_plugin.connectors.npu.camp2p.external_routing",
+)
 
 
 def _install_stub_modules():
@@ -182,7 +205,11 @@ def _install_stub_modules():
         "afd_plugin.connectors.npu": types.ModuleType("afd_plugin.connectors.npu"),
         "afd_plugin.connectors.npu.camp2p.external_routing": afd_routing,
     }
+    assert set(modules) == set(_STUBBED_MODULE_NAMES)
     for name, module in modules.items():
+        # find_spec() is called on these names at import time and raises on a
+        # module without a spec, so the stand-ins carry one.
+        module.__spec__ = ModuleSpec(name, None)
         sys.modules[name] = module
 
     spec = importlib.util.spec_from_file_location(
@@ -194,13 +221,28 @@ def _install_stub_modules():
     return component_module, context, comm_module
 
 
+def _restore_modules(written: dict[str, types.ModuleType | None]) -> None:
+    """Put back only the names this fixture replaced, and drop the ones it added."""
+
+    for name, original in written.items():
+        if original is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = original
+
+
 @pytest.fixture(scope="module")
 def loaded():
-    before = dict(sys.modules)
-    module, context, comm_module = _install_stub_modules()
-    yield module, context, comm_module
-    sys.modules.clear()
-    sys.modules.update(before)
+    written = {name: sys.modules.get(name) for name in _STUBBED_MODULE_NAMES}
+    try:
+        module, context, comm_module = _install_stub_modules()
+    except BaseException:
+        _restore_modules(written)
+        raise
+    try:
+        yield module, context, comm_module
+    finally:
+        _restore_modules(written)
 
 
 class _Experts(torch.nn.Module):
