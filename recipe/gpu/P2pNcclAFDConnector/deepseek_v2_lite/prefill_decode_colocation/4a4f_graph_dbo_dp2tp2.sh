@@ -1,61 +1,19 @@
+#!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+#
+# DeepSeek-V2-Lite (BF16) on P2pNcclAFDConnector, 4A4F FULL_DECODE_ONLY CUDA
+# graphs and DBO: FFN DP2 x TP2 and Attention DP2 x TP2.
+# Settings and running in a pod: recipe/gpu/common/README.md
+# shellcheck disable=SC1090,SC2034  # the sourced launcher reads these variables
 
+AFD_CONNECTOR=${AFD_CONNECTOR:-P2pNcclAFDConnector}
+LAYOUT=${LAYOUT:-4A4F}
 MODEL_PATH=${MODEL_PATH:-/path/model_weights/DeepSeek-V2-Lite}
-export VLLM_USE_V2_MODEL_RUNNER=1
+ATTN_TP=${ATTN_TP:-2} FFN_TP=${FFN_TP:-2}
+MODE=graph CUDAGRAPH_CAPTURE_SIZES=${CUDAGRAPH_CAPTURE_SIZES:-64}   # ascending
+SERVE_ARGS=(--max-num-seqs 64 --max-num-batched-tokens 64
+            --enable-dbo --dbo-decode-token-threshold 2 --dbo-prefill-token-threshold 12)
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 uv run vllm serve "$MODEL_PATH" \
-    --data-parallel-size 2 \
-    --tensor-parallel-size 2 \
-    --enable-expert-parallel \
-    --additional-config '{
-        "afd": {
-            "role": "attention",
-            "connector": "P2pNcclAFDConnector",
-            "host": "127.0.0.1",
-            "port": 6269,
-            "num_attention_ranks": 4,
-            "num_ffn_ranks": 4
-        }
-    }' \
-    --max-num-seqs 64 \
-    --max-num-batched-tokens 64 \
-    --enable-dbo \
-    --dbo-decode-token-threshold 2 \
-    --dbo-prefill-token-threshold 12 \
-    --max-cudagraph-capture-size 64 \
-    --compilation-config '{
-        "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes":[64]
-    }' \
-    --host 127.0.0.1 \
-    --port 18305 \
-    --trust-remote-code > attn.log 2>&1 &
-
-CUDA_VISIBLE_DEVICES=4,5,6,7 uv run vllm serve "$MODEL_PATH" \
-    --data-parallel-size 2 \
-    --tensor-parallel-size 2 \
-    --enable-expert-parallel \
-    --additional-config '{
-        "afd": {
-            "role": "ffn",
-            "connector": "P2pNcclAFDConnector",
-            "host": "127.0.0.1",
-            "port": 6269,
-            "num_attention_ranks": 4,
-            "num_ffn_ranks": 4
-        }
-    }' \
-    --max-num-seqs 64 \
-    --enable-dbo \
-    --dbo-decode-token-threshold 2 \
-    --dbo-prefill-token-threshold 12 \
-    --max-num-batched-tokens 64 \
-    --max-cudagraph-capture-size 64 \
-    --compilation-config '{
-        "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes":[64]
-    }' \
-    --host 127.0.0.1 \
-    --port 18306 \
-    --trust-remote-code > ffn.log 2>&1 &
-
-wait
+source "${AFD_RECIPE_LIB:-$(dirname "${BASH_SOURCE[0]}")/../../../common/afd_colocation.sh}"
+afd_colocation_serve "$@"
