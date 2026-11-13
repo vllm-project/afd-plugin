@@ -108,14 +108,14 @@ def fail_if_unsupported_npu_afd_features(
 
 
 def _is_dsv4_target(vllm_config: VllmConfig) -> bool:
-    """Return whether the target model is DeepSeek V4."""
+    """Return whether the target model is DeepSeek V4 or V4.1."""
     model_config = vllm_config.model_config
     hf_config = getattr(model_config, "hf_config", None)
     if hf_config is None:
         hf_config = getattr(model_config, "hf_text_config", None)
     if hf_config is None:
         return False
-    if getattr(hf_config, "model_type", None) == "deepseek_v4":
+    if getattr(hf_config, "model_type", None) in ("deepseek_v4", "deepseek_v41"):
         return True
     architectures = getattr(hf_config, "architectures", ()) or ()
     return any("DeepseekV4" in str(architecture) for architecture in architectures)

@@ -7,7 +7,11 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import TYPE_CHECKING, Literal
 
-from afd_plugin import _MODEL_REGISTRATIONS, _QWEN3_5_MODEL_REGISTRATIONS
+from afd_plugin import (
+    _DEEPSEEK_V41_MODEL_REGISTRATIONS,
+    _MODEL_REGISTRATIONS,
+    _QWEN3_5_MODEL_REGISTRATIONS,
+)
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 
 if TYPE_CHECKING:
@@ -37,6 +41,11 @@ def get_afd_model_config(
             if model_arch in _QWEN3_5_MODEL_REGISTRATIONS and device_type != "cuda":
                 raise ValueError(
                     "AFD Qwen3.5/3.6 supports CUDA execution only; "
+                    f"got device_type={device_type!r}",
+                )
+            if model_arch in _DEEPSEEK_V41_MODEL_REGISTRATIONS and device_type != "npu":
+                raise ValueError(
+                    "AFD DeepSeek-V4.1 supports Ascend NPU execution only; "
                     f"got device_type={device_type!r}",
                 )
             # deepcopy preserves aliasing within the copied object graph, so

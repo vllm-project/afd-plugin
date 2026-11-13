@@ -23,6 +23,7 @@ validation_paths:
 upstream_refs:
   - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "NPU DeepSeek V4.1: vLLM-Ascend bd42eea01d8312c4df469fabaed45f77a12df4d3"
   - "vLLM vllm.model_executor.models.deepseek_v2"
   - "vLLM vllm.model_executor.models.qwen3_moe"
   - "vLLM vllm.forward_context.ForwardContext"
@@ -33,6 +34,7 @@ verified_platform_refs:
   - "CAM async NPU model E2E path"
   - "DeepSeek V4 CUDA contract tests and E2E profiles; see docs/support.md for hardware scope"
   - "DeepSeek V4 Ascend Hash-id boundary has focused unit coverage and a historical manual Ascend 950 run"
+  - "DeepSeek V4.1: historical A1/F12 W8A8 eager non-layered run in PR #534; current layered path is not hardware-qualified"
 related_issues:
   - "#86"
   - "#88"
@@ -64,6 +66,7 @@ make a backend-specific worker class the shared model API.
 | DeepSeek V4 CUDA role boundary | [`deepseek_v4.py`](../../../afd_plugin/model_executor/models/deepseek_v4.py) | [`test_deepseek_v4_construction.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_construction.py), [`test_deepseek_v4_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_proxy.py), [`test_deepseek_v4_weight_policy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_weight_policy.py) |
 | DeepSeek V4 Ascend Hash-id boundary | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py), [`npu/deepseek_v4_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_attention_gate.py) | [`test_deepseek_v4_hash_ids.py`](../../../tests/unit/model_executor/test_deepseek_v4_hash_ids.py), [NPU model role tests](../../../tests/unit/model_executor/models/npu/test_deepseek_v4.py), ids-mode cases in [`test_camp2p_token_ids.py`](../../../tests/unit/connectors/test_camp2p_token_ids.py) |
 | Qwen3 MoE role-aware model and weight loading | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py), [`test_qwen3_moe_weight_policy.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_weight_policy.py) |
+| DeepSeek V4.1 Ascend role boundary | [`npu/deepseek_v41.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v41.py) | [`test_deepseek_v41_npu_weight_roles.py`](../../../tests/unit/model_executor/test_deepseek_v41_npu_weight_roles.py) |
 | CUDA remote-experts boundary | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py), [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py) | [`test_p2p_experts_contract.py`](../../../tests/unit/connectors/test_p2p_experts_contract.py), [`test_deepseek_v2_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_proxy.py) |
 | Forward-context adapter | [`forward_context.py`](../../../afd_plugin/model_executor/models/forward_context.py) | [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
 | NPU Async CAM native DBO handoff | [`npu/async_cam_dbo.py`](../../../afd_plugin/model_executor/models/npu/async_cam_dbo.py), [`npu/ubatch_runner.py`](../../../afd_plugin/v1/worker/npu/ubatch_runner.py) | [`test_async_cam_dbo.py`](../../../tests/unit/model_executor/test_async_cam_dbo.py), [`test_npu_model_runner_v2.py`](../../../tests/unit/v1/worker/test_npu_model_runner_v2.py) |
@@ -85,6 +88,7 @@ registers lazy AFD wrapper paths under `AFD`-prefixed aliases.
 | `DeepseekV3ForCausalLM` | `AFDDeepseekV3ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `DeepseekV32ForCausalLM` | `AFDDeepseekV32ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `DeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` |
+| `DeepseekV41ForCausalLM` | `AFDDeepseekV41ForCausalLM` | `AFDDeepseekV41ForCausalLM` (NPU only) |
 | `DSparkDraftModel` | Unsupported | `AFDDSparkDeepseekV4ForCausalLM` (Async CAM: eager A, eager/FULL F) |
 | `GlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` |
 | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` |
@@ -95,10 +99,12 @@ alias before constructing the AFD model runner. Non-AFD workers keep the
 checkpoint architecture and resolve to vLLM's native model class.
 
 The DeepSeek, DeepSeek V2/V3/V3.2, and GLM aliases share the DeepSeek
-V2-derived implementation. DeepSeek V4, Qwen3 MoE, and Qwen3.5/3.6 each have a
-separate wrapper around their matching native architecture. These aliases
-express known compatible architecture families; they do not make any wrapper
-a generic MoE model API.
+V2-derived implementation. DeepSeek V4, DeepSeek V4.1, Qwen3 MoE, and
+Qwen3.5/3.6 each have a separate wrapper around their matching native
+architecture. These aliases express known compatible architecture families;
+they do not make any wrapper a generic MoE model API. DeepSeek V4.1 has no
+native CUDA implementation, so its alias resolves only on Ascend NPU and
+model-config resolution rejects other device types before model loading.
 
 ## Role-aware module construction
 
@@ -195,6 +201,55 @@ checking; the A5 profile records incorrect concurrent answers. Async DSV4 has
 an exact-answer smoke case; V4 true native DBO still requires model accuracy
 qualification. See
 [E2E testing](e2e_testing.md) and the [layered guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-and-w8a8-layered-gmm).
+
+### DeepSeek V4.1 Ascend boundary
+
+[`npu/deepseek_v41.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v41.py)
+wraps vLLM-Ascend's native `AscendDeepseekV41LLMForCausalLM`. V4.1 is a distinct
+architecture rather than a V4 variant: it adds source-shared hybrid attention
+state, candidate-index buffers, Engram n-gram memory, and bounded decoder
+replay. Attention therefore keeps the complete native decoder forward and only
+its FFN slot is replaced by a parameter-free `RemoteFFNProxy`. FFN constructs
+the native `DeepseekV41MoE`. Async CAM executes routed experts through the
+mandatory layered executor using `get_async_cam_layered_weights()`; synchronous
+CAMP2P uses `compute_ffn_output()` with the gate on FFN.
+
+The router shell, CAM exchange, shared-expert layout, and layered FFN extraction
+are parameter-identical to DeepSeek V4, so the adapter subclasses
+`AFDDeepseekV4RemoteMoE` and `AFDDeepseekV4AttentionGateRemoteMoE` only to widen
+`forward` with the native `already_sequence_parallel` argument.
+`compute_gate_on_attention=true` reuses the V4 Attention-side gate helpers;
+gate-on-FFN reuses the V4 Hash-id proxy.
+
+Engram tables, candidate buffers, and shared attention state exist only on
+Attention. The FFN role declares `has_engram = False`, so the inherited native
+`load_weights` drops every `.engram.` path, and role filtering classifies
+`engram` paths as Attention-only. Decoder replay is disabled on the Attention
+role: its custom op cannot carry a cross-role CAM exchange, so each layer runs
+eagerly instead. Engram configurations still reject native DBO and
+microbatching, matching the upstream engine-level constraint.
+
+Checkpoint weights are filtered once by layer-stage path before the native
+loader runs. `attn`/`self_attn` and `engram` load on Attention;
+`ffn`/`mlp` parameters load on FFN except gate parameters, which follow
+`compute_gate_on_attention` and the vision-only `gate.bias_vl` bias, which is
+FFN-only; norms, `hc_*` state, and non-layer paths load on both roles;
+`vision.`, `aligner.`, `image_`, and `mtp.` paths are dropped after removing
+an optional `model.` prefix for classification. Original names reach the loader
+unchanged. An unclassified
+layer path raises instead of silently loading on both roles.
+
+This path requires Ascend NPU, text-only execution through
+`--language-model-only`, and pipeline-parallel size 1. Async CAM additionally
+requires `compute_gate_on_attention=true`; sequence-parallel MoE is allowed only
+in that mode. It rejects EPLB, prefill/decode context parallelism, speculative
+decoding, LoRA, and `cache_config.swa_bounded_replay` during construction. The
+[historical validation record](https://github.com/vllm-project/afd-plugin/pull/534#issuecomment-6673840619)
+reports A3 A1/F12 W8A8 eager serving with the legacy non-layered FFN path and
+a server-local prefix fix. It does not qualify this rebased layered path;
+role loading, generated-answer accuracy and concurrent serving need a new NPU
+run. Graph execution, long stability runs and performance gains remain
+unqualified.
 
 ### Qwen3 MoE CUDA boundary
 
