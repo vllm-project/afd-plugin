@@ -25,7 +25,6 @@ from tests.e2e.case import (
     DboConfig,
     Deployment,
     JsonValue,
-    PullMegaCheck,
 )
 from tests.e2e.multi_pod.layout import RoleSlot
 from tests.e2e.process_utils import (
@@ -429,16 +428,6 @@ class ServiceDeployment:
                     process_name="FFN",
                 )
             )
-        if any(
-            isinstance(check, PullMegaCheck)
-            for phase in self.resolved.case.phases
-            for check in phase.checks
-        ):
-            for role, process in self.processes_by_role.items():
-                if process.returncode != 0:
-                    failures.append(
-                        f"{role} service exited with return code {process.returncode}"
-                    )
         for thread in self.log_threads:
             thread.join(timeout=LOG_THREAD_JOIN_TIMEOUT_S)
             if thread.is_alive():

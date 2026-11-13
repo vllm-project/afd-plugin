@@ -439,9 +439,9 @@ results; it provides no device, model accuracy, or performance evidence.
 `PullMegaCheck` adds an eager Ascend A3 Async CAM acceptance capability for
 issue #576. It uses the existing phase markers, rank collection, and artifact
 format with a dedicated model-owned worker extension. It requires native Pull
-completion on every A/F rank during the workload. Process cleanup and per-rank
-shutdown are recorded separately and do not determine this case's pytest result.
+completion on every A/F rank during the workload. Process cleanup is recorded
+separately and does not determine this case's pytest result.
 It cannot be combined with Graph/DBO/Hash checks in the same deployment. `Mrv2Check` and `HashInputCheck` retain their
 existing probes and acceptance. Host-only harness tests validate configuration,
-evidence rejection and shutdown evidence; only the registered A3 hardware case
-qualifies native execution; its cleanup record must be assessed separately.
+evidence rejection and cleanup; only the registered A3 hardware case qualifies
+native execution; its cleanup record must be assessed separately.

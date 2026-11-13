@@ -704,9 +704,8 @@ requires `evaluation/mrv2.json`: every Attention rank must complete a Pull
 combine and every FFN rank must complete the actual native Mega executor with
 a nonempty, non-idle transaction after the evaluation window opens. Startup,
 dummy work before that window, missing ranks, and Push/Layered fallback fail.
-`pull-mega-shutdown.json` records whether all sixteen worker shutdowns completed
-and whether orphan processes were found. `run.json.cleanup` separately records
-service exit status and cleanup errors. Cleanup is still attempted, but for this
+`run.json.cleanup` records cleanup errors, including orphan processes that were
+found and reaped. Cleanup is still attempted, but for this
 Mega case an exit or cleanup failure does not fail pytest after the workload and
 Pull execution checks pass. A failed startup, request, answer, or execution check
 still fails the case. Inspect the cleanup record for the separate shutdown result.

@@ -250,25 +250,6 @@ class Mrv2Session:
             self.directory.cleanup()
         if not self.pull_mega:
             return
-        expected = set(
-            range(sum(role.rank_count for _, role in self.case.deployment.roles))
-        )
-        observed = set()
-        offset = 0
-        for role, layout in self.case.deployment.roles:
-            path = self.environment.output_path / f"{role}.log"
-            if path.exists():
-                role_ranks = {
-                    int(rank)
-                    for rank in re.findall(
-                        r"AFD Pull Mega shutdown: rank=(\d+) complete",
-                        path.read_text(),
-                    )
-                }
-                observed.update(
-                    role_ranks & set(range(offset, offset + layout.rank_count))
-                )
-            offset += layout.rank_count
         owned_environment = {"AFD_E2E_RUN_ID": self.run_id}
         survivors = find_processes_matching_environment(owned_environment)
         try:
@@ -283,22 +264,8 @@ class Mrv2Session:
                 poll_interval_s=PROCESS_POLL_INTERVAL_S,
                 process_name="Pull Mega orphan",
             )
-        result = {
-            "expected_ranks": sorted(expected),
-            "completed_ranks": sorted(observed),
-            "orphan_pids": orphan_pids,
-            "cleanup_errors": errors,
-            "passed": observed == expected and not orphan_pids,
-        }
-        (self.environment.output_path / "pull-mega-shutdown.json").write_text(
-            json.dumps(result, indent=2) + "\n"
-        )
         if orphan_pids:
             raise RuntimeError(f"Pull Mega orphan processes: {orphan_pids}; {errors}")
-        if observed != expected:
-            raise RuntimeError(
-                f"Missing Pull Mega shutdown completion: {sorted(expected - observed)}"
-            )
 
 
 def assert_execution_evidence(

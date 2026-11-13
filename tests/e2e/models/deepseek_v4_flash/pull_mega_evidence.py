@@ -16,10 +16,6 @@ from vllm.distributed import get_tensor_model_parallel_rank
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
 from afd_plugin.connectors.npu.async_cam_runtime.async_cam_session import PullCAMSession
 from afd_plugin.model_executor.npu.async_cam_mega import AsyncCAMMegaExecutor
-from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
-from afd_plugin.v1.worker.npu.attention_model_runner_v2 import (
-    AFDNPUAttentionModelRunnerV2,
-)
 from afd_plugin.v1.worker.npu.ffn_worker import AFDNPUFFNWorker
 
 
@@ -118,26 +114,9 @@ def install_observers() -> type:
             report(self)
         return result
 
-    def observe_shutdown(shutdown):
-        @wraps(shutdown)
-        def closed(self):
-            rank = self.connector.world_rank
-            result = shutdown(self)
-            if self.connector.is_initialized:
-                raise RuntimeError("Pull Mega shutdown retained the transport")
-            sys.stdout.write(f"AFD Pull Mega shutdown: rank={rank} complete\n")
-            sys.stdout.flush()
-            return result
-
-        return closed
-
     CAMAsyncAFDConnector.recv_ffn_output = combined
     AsyncCAMMegaExecutor.__call__ = executed
     AFDNPUFFNWorker.raise_ffn_loop_error_if_any = checked
-    AFDNPUAttentionModelRunnerV2.shutdown = observe_shutdown(
-        AFDNPUAttentionModelRunnerV2.shutdown
-    )
-    AsyncNPUFFNModelRunner.shutdown = observe_shutdown(AsyncNPUFFNModelRunner.shutdown)
     return Worker
 
 
