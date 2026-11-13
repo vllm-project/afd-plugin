@@ -72,18 +72,59 @@ def write_v4_checkpoint(root: Path, *, layers: int = 2, experts: int = 4) -> Pat
     return root
 
 
+# The shape of Qwen/Qwen3-30B-A3B's config.json (no shared-expert field).
+QWEN3_30B_A3B_CONFIG = {
+    "architectures": ["Qwen3MoeForCausalLM"],
+    "model_type": "qwen3_moe",
+    "torch_dtype": "bfloat16",
+    "hidden_size": 2048,
+    "num_hidden_layers": 48,
+    "num_experts": 128,
+    "num_experts_per_tok": 8,
+    "moe_intermediate_size": 768,
+    "decoder_sparse_step": 1,
+    "mlp_only_layers": [],
+    "norm_topk_prob": True,
+}
+
+
+def write_qwen3_checkpoint(root: Path, **overrides) -> Path:
+    """A Qwen3 MoE ``config.json`` only; ``None`` values remove a key."""
+    root.mkdir(parents=True, exist_ok=True)
+    config = {**QWEN3_30B_A3B_CONFIG, **overrides}
+    config = {key: value for key, value in config.items() if value is not None}
+    (root / "config.json").write_text(json.dumps(config))
+    return root
+
+
 class HostBackend:
     """Exercise host ownership rules, without simulating device completion."""
 
     def __init__(
-        self, *, stop_during_prepare: bool = False, fail: str = "", block: bool = False
+        self,
+        *,
+        stop_during_prepare: bool = False,
+        fail: str = "",
+        block: bool = False,
+        cancellable: bool = False,
+        end_receive: bool = False,
     ) -> None:
+        """Configure one host-contract behavior.
+
+        ``block`` keeps ``execute_step`` waiting like an idle receive;
+        ``cancellable`` lets ``cancel_receive`` end that wait the way the GPU
+        M2N control plane does; ``end_receive`` makes the first step report a
+        cancelled receive without any host stop.
+        """
         self.stop_during_prepare = stop_during_prepare
         self.fail = fail
         self.block = block
+        self.cancellable = cancellable
+        self.end_receive = end_receive
         self.entered = threading.Event()
         self.release = threading.Event()
         self.finished = threading.Event()
+        self.cancelled = False
         self.released = False
         self.service: FFNService | None = None
 
@@ -99,15 +140,27 @@ class HostBackend:
         if self.fail == "activate":
             raise RuntimeError("receiver activation failed")
 
-    def execute_step(self) -> None:
+    def execute_step(self) -> bool:
+        """Return ``False`` for a cancelled receive, else request a stop."""
         assert self.service is not None
         self.entered.set()
+        if self.end_receive:
+            return False
         if self.block:
             self.release.wait()
+            if self.cancelled:
+                return False
         if self.fail == "execute":
             self.finished.set()
             raise RuntimeError("execute failed")
         self.service.request_stop()
+        return True
+
+    def cancel_receive(self) -> None:
+        """End a blocked receive only when this fake models a cancellable one."""
+        if self.cancellable:
+            self.cancelled = True
+            self.release.set()
 
     def receiver_exited(self) -> None:
         self.finished.set()

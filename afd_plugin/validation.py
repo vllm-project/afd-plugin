@@ -52,6 +52,7 @@ GPU_MRV2_CONNECTORS: Final[tuple[str, ...]] = (
 # with the hidden states, as a routed-experts connector (DeepEP M2N) needs.
 ATTENTION_ROUTING_MODEL_ARCHITECTURES: Final[tuple[str, ...]] = (
     "Qwen3MoeForCausalLM",
+    "Qwen3MoeRoutedExperts",
     "DeepseekV2ForCausalLM",
 )
 

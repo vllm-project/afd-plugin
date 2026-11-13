@@ -4,9 +4,10 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from pathlib import Path
+
+from afd_plugin.ffn_faas.platforms.launch import validate_ffn_rank_settings
 
 
 @dataclass(frozen=True)
@@ -20,12 +21,12 @@ class FFNConfig:
     def __post_init__(self) -> None:
         # Engine/connector definitions and validation belong to vLLM/AFD.
         # Only external-launcher and host-shutdown facts live here.
-        if self.ffn_ranks <= 0 or not 0 <= self.rank < self.ffn_ranks:
-            raise ValueError("invalid F-only rank or world size")
-        if self.local_rank < 0:
-            raise ValueError("local rank must be nonnegative")
-        if not math.isfinite(self.shutdown_timeout) or self.shutdown_timeout <= 0:
-            raise ValueError("shutdown timeout must be finite and positive")
+        validate_ffn_rank_settings(
+            ffn_ranks=self.ffn_ranks,
+            rank=self.rank,
+            local_rank=self.local_rank,
+            shutdown_timeout=self.shutdown_timeout,
+        )
 
 
 def validate_static_experts(

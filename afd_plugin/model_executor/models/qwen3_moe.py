@@ -18,6 +18,7 @@ import torch.nn as nn
 from transformers import Qwen3MoeConfig
 from vllm.config import VllmConfig
 from vllm.model_executor.models import qwen3_moe as native
+from vllm.model_executor.models.utils import AutoWeightsLoader, maybe_prefix
 from vllm.platforms import current_platform
 
 from afd_plugin.config import (
@@ -25,6 +26,7 @@ from afd_plugin.config import (
     AFDConfig,
     parse_afd_config,
 )
+from afd_plugin.model_executor.checkpoint_paths import weight_layer_path
 from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
 
 if TYPE_CHECKING:
@@ -33,6 +35,7 @@ if TYPE_CHECKING:
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
 _BOTH_ROLES = frozenset(("attention", "ffn"))
+ROUTED_STAGE = "mlp"
 
 
 def _is_moe_layer(config: Qwen3MoeConfig, layer_idx: int) -> bool:
@@ -49,18 +52,10 @@ def _routes_on_attention(afd_config: AFDConfig) -> bool:
     return afd_config.connector in DEEPEP_M2N_CONNECTORS
 
 
-def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
-    """Return ``(layer index, stage, remainder)`` for a native decoder path."""
-    parts = name.split(".")
-    for marker_idx, part in enumerate(parts[:-2]):
-        if part != "layers":
-            continue
-        try:
-            layer_idx = int(parts[marker_idx + 1])
-        except ValueError:
-            continue
-        return layer_idx, parts[marker_idx + 2], tuple(parts[marker_idx + 3 :])
-    return None
+def _is_routed_mlp_path(name: str) -> bool:
+    """Whether a checkpoint tensor belongs to a decoder layer's MoE block."""
+    layer_path = weight_layer_path(name)
+    return layer_path is not None and layer_path[1] == ROUTED_STAGE
 
 
 def _checkpoint_weight_roles(
@@ -74,7 +69,7 @@ def _checkpoint_weight_roles(
     Attention routes with it, and FFN keeps the native gate parameter that
     vLLM's strict loader requires but never runs it.
     """
-    layer_path = _weight_layer_path(name)
+    layer_path = weight_layer_path(name)
     if layer_path is None:
         return _BOTH_ROLES
 
@@ -292,6 +287,80 @@ class AFDQwen3MoeModel(native.Qwen3MoeModel):
         return self.layers[layer_idx].mlp.experts.routed_experts
 
 
+class _Qwen3RoutedExpertsLayer(nn.Module):
+    """One decoder layer reduced to its native MoE block at ``<prefix>.mlp``."""
+
+    def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
+        super().__init__()
+        self.mlp = native.Qwen3MoeSparseMoeBlock(
+            vllm_config=vllm_config, prefix=f"{prefix}.{ROUTED_STAGE}"
+        )
+
+
+class _Qwen3RoutedExpertsStack(nn.Module):
+    """The ``model`` submodule: only ``layers``, each holding its MoE block."""
+
+    def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
+        super().__init__()
+        num_layers = vllm_config.model_config.hf_text_config.num_hidden_layers
+        self.layers = nn.ModuleList(
+            _Qwen3RoutedExpertsLayer(vllm_config, f"{prefix}.layers.{layer_idx}")
+            for layer_idx in range(num_layers)
+        )
+
+
+class AFDQwen3MoeRoutedExperts(nn.Module):
+    """FFN-only Qwen3 MoE model for routed-experts connectors.
+
+    Builds only the native ``Qwen3MoeSparseMoeBlock`` tree at
+    ``model.layers.<i>.mlp``. The MoE forward never runs here; the connector
+    reads the local expert parameter views directly.
+    """
+
+    fall_back_to_pt_during_load = False
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        afd_config = parse_afd_config(vllm_config, validate=False)
+        _validate_supported_config(vllm_config, afd_config)
+        super().__init__()
+        self.afd_config = afd_config
+        self.model = _Qwen3RoutedExpertsStack(
+            vllm_config, maybe_prefix(prefix, "model")
+        )
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        """Whether vLLM can skip a shard containing only this checkpoint name."""
+        return not _is_routed_mlp_path(name)
+
+    # Upstream source: vLLM v0.32.0
+    # (5df63a7203cdb9328d824a27b682e77c7b9928be),
+    # vllm/model_executor/models/qwen3_moe.py, Qwen3MoeModel.hf_to_vllm_mapper.
+    # AFD difference: filter to routed MoE paths and apply the native mapper at
+    # this shell's outer AutoWeightsLoader.
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Drop non-MoE checkpoint tensors, then load like the native model."""
+        # ### PATCH START: keep only routed MoE checkpoint paths.
+        weights = (
+            (name, tensor)
+            for name, tensor in weights
+            if not self.is_unused_checkpoint_weight(name)
+        )
+        # ### PATCH END: keep only routed MoE checkpoint paths.
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(
+            weights,
+            mapper=native.Qwen3MoeModel.hf_to_vllm_mapper,
+        )
+
+    def get_experts_layer_indices(self) -> tuple[int, ...]:
+        """Every decoder layer is an MoE layer for a supported checkpoint."""
+        return tuple(range(len(self.model.layers)))
+
+    def get_routed_experts(self, layer_idx: int) -> "RoutedExperts":
+        """The vLLM module holding one MoE layer's local experts."""
+        return self.model.layers[layer_idx].mlp.experts.routed_experts
+
+
 class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
     """Qwen3 MoE causal LM wrapper for AFD CUDA execution."""
 
@@ -411,4 +480,4 @@ class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
         return super().load_weights(role_weights)
 
 
-__all__ = ["AFDQwen3MoeForCausalLM"]
+__all__ = ["AFDQwen3MoeForCausalLM", "AFDQwen3MoeRoutedExperts"]

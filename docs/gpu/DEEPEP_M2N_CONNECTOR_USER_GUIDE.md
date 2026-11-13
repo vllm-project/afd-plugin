@@ -336,6 +336,11 @@ Send API traffic only to the Attention server. For eager, DBO, Attention TP
 and FP8 examples, see the
 [DeepEP M2N recipes](../../recipe/gpu/DeepEPM2NAFDConnector/README.md).
 
+For BF16 Qwen3-30B-A3B, the FFN side can instead run as the standalone FFN
+service (`torchrun -m afd_plugin.ffn_faas serve --backend gpu-deepep-m2n`),
+which loads only the routed experts and constructs no vLLM Worker; see the
+[standalone GPU FFN service guide](STANDALONE_FFN_SERVICE.md).
+
 ## Validation
 
 - CPU unit tests:

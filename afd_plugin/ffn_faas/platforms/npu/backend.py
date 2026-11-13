@@ -21,6 +21,7 @@ from afd_plugin.compat.npu import (
 )
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+from afd_plugin.ffn_faas.platforms.launch import reassert_external_launcher
 from afd_plugin.ffn_faas.platforms.npu.environment import AscendFFNEnvironment
 from afd_plugin.ffn_faas.platforms.npu.model import CAMRoutedModel
 from afd_plugin.ffn_faas.platforms.npu.settings import FFNConfig
@@ -46,7 +47,7 @@ class CAMFFNBackend:
         args = EngineArgs.from_cli_args(self.args)
         config = args.create_engine_config()
         # Keep the externally launched F-only ownership after platform defaults.
-        config.parallel_config.distributed_executor_backend = "external_launcher"
+        reassert_external_launcher(config)
         fix_all2all_backend_for_afd(config)
         validate_npu_model_runner_v2_config(
             config, expected_role="ffn", device_type="npu"
@@ -92,12 +93,25 @@ class CAMFFNBackend:
         """Select the device once on the receiving thread, as the Worker does."""
         self.environment.activate_thread()
 
-    def execute_step(self) -> None:
+    def execute_step(self) -> bool:
+        """Run one CAM submission batch; a CAM receive never reports a cancel.
+
+        The return value follows ``FFNBackend.execute_step``: CAM cannot end a
+        pending receive, so a completed batch always returns ``True``.
+        """
         assert self.runtime is not None
         self.runtime.execute_connector_driven_step()
         if self.runtime.effective_mode == "eager":
             # Preserve the mature eager loop's completion fence.
             torch.npu.synchronize()
+        return True
+
+    def cancel_receive(self) -> None:
+        """No-op: a pending CAM receive cannot be cancelled.
+
+        The host join then times out, reports the pending receive and retains
+        every owner, exactly as before ``cancel_receive`` existed.
+        """
 
     def receiver_exited(self) -> None:
         assert self.runtime is not None

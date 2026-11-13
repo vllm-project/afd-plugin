@@ -1283,6 +1283,7 @@ def run_case(case: Case, environment: CaseEnvironment) -> dict:
                 phase_record["evidence_records"] = len(snapshot)
                 phase_record["status"] = "passed"
             services.ensure_alive()
+            services.finish()
         record["execution"] = {"status": "passed"}
         record["acceptance_passed"] = record["configuration"]["eligible"]
         return record

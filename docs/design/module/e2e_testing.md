@@ -105,6 +105,12 @@ configuration, a pinned Attention rendezvous address, exact compilation
 configuration, and `cleanup_profile`. Sync connectors start FFN then Attention;
 async CAM starts Attention then FFN. The NPU async profile alone keeps its
 scoped FFN process-ownership cleanup exception; other profiles are strict.
+`Deployment.ffn_service` replaces the FFN role's `vllm serve` with the
+standalone FFN service under `torchrun` on one host. Readiness adds every
+rank's `/ready`; a passing case ends with `/stop` on every rank, then
+Attention, and requires a clean launcher exit and released resources per rank.
+Its torchrun workers sit outside the launcher's process group, so cleanup also
+sweeps FFN processes by run environment.
 `Deployment.dbo` supplies a default, and an explicit `Role.dbo` overrides it.
 `Role.dbo=None` inherits the default; `DboConfig()` keeps native thresholds.
 `Deployment.dbo_for_role()` resolves this rule for commands, probe validation
@@ -233,7 +239,8 @@ for NPU. The `test_deepseek_v2_lite` entry collects 13 GPU cases, including
 1A1F, 2A1F and the local-only `afd-v2-graph-dbo-tp2`; its NPU selection
 collects seven. The P2P entries across DeepSeek, Qwen3 MoE and Qwen3.6 MoE
 contain 20 CUDA cases (13 + 4 + 3). Separate DeepEP M2N entries add five GPU-only
-cases each for DeepSeek and Qwen3 MoE. Unfiltered DeepSeek module collection
+cases each for DeepSeek and Qwen3 MoE, and a Qwen3 MoE standalone FFN service
+entry adds four. Unfiltered DeepSeek module collection
 includes its five DeepEP IDs even on NPU; NPU runs select the P2P entry or
 explicit node IDs. The local-only TP2 Graph + DBO case is outside the seven-case
 ready/merge CI gate.

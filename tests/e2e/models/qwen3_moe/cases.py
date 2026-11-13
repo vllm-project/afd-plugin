@@ -11,6 +11,7 @@ from tests.e2e.case import (
     Case,
     CaseEnvironment,
     DboConfig,
+    FfnService,
     Gsm8kSettings,
     Gsm8kTask,
     Mrv2Check,
@@ -31,6 +32,16 @@ DEEPEP_M2N_SCENARIOS = (
     "afd-deepep-m2n-eager-tp2-2a2f",
     "afd-deepep-m2n-graph-tp2-2a2f",
 )
+# The same DeepEP M2N deployments with the FFN side served by the standalone FFN
+# service (torchrun -m afd_plugin.ffn_faas) instead of `vllm serve`; Attention
+# launches exactly as in the mirrored case.
+DEEPEP_M2N_FFN_SERVICE_SCENARIOS = (
+    "afd-deepep-m2n-faas-eager-2a2f",
+    "afd-deepep-m2n-faas-graph-2a2f",
+    "afd-deepep-m2n-faas-graph-dbo-2a2f",
+    "afd-deepep-m2n-faas-graph-tp2-2a2f",
+)
+FFN_SERVICE_BACKEND = "gpu-deepep-m2n"
 MULTI_POD_IDS = (
     "afd-deepep-m2n-eager-2a2f",
     "afd-deepep-m2n-graph-2a2f",
@@ -86,27 +97,38 @@ def build_case(case_id: str, environment: CaseEnvironment) -> Case:
         "afd-deepep-m2n-graph-dbo-2a2f": (False, True, True, 2, 1, 2, 1),
         "afd-deepep-m2n-eager-tp2-2a2f": (False, False, False, 1, 2, 2, 1),
         "afd-deepep-m2n-graph-tp2-2a2f": (False, True, False, 1, 2, 2, 1),
+        "afd-deepep-m2n-faas-eager-2a2f": (False, False, False, 2, 1, 2, 1),
+        "afd-deepep-m2n-faas-graph-2a2f": (False, True, False, 2, 1, 2, 1),
+        "afd-deepep-m2n-faas-graph-dbo-2a2f": (False, True, True, 2, 1, 2, 1),
+        "afd-deepep-m2n-faas-graph-tp2-2a2f": (False, True, False, 1, 2, 2, 1),
     }
     baseline, graph, dbo, a_dp, a_tp, f_dp, f_tp = profiles[case_id]
     execution = DECODE_GRAPH if graph else EAGER
-    deepep = case_id in DEEPEP_M2N_SCENARIOS
+    ffn_service = case_id in DEEPEP_M2N_FFN_SERVICE_SCENARIOS
+    deepep = case_id in DEEPEP_M2N_SCENARIOS or ffn_service
+    deployment = execution.deployment(
+        backend="gpu",
+        attention=(a_dp, a_tp),
+        ffn=None if baseline else (f_dp, f_tp),
+        connector=None
+        if baseline
+        else "DeepEPM2NAFDConnector"
+        if deepep
+        else "P2pNcclAFDConnector",
+        compute_gate_on_attention=deepep,
+        dbo=DboConfig(DBO_DECODE_THRESHOLD, DBO_PREFILL_THRESHOLD) if dbo else None,
+        capture_size=CAPTURE_SIZE,
+    )
+    if ffn_service:
+        deployment = replace(deployment, ffn_service=FfnService(FFN_SERVICE_BACKEND))
+    # The FFN service has no vLLM Worker to host the evidence extension;
+    # Attention's evidence covers the paired graph/DBO path.
+    evidence_roles = ("attention",) if ffn_service else ("attention", "ffn")
     return Case(
         id=case_id,
         model="Qwen3 MoE",
         served_model_name_prefix="qwen3-moe-afd",
-        deployment=execution.deployment(
-            backend="gpu",
-            attention=(a_dp, a_tp),
-            ffn=None if baseline else (f_dp, f_tp),
-            connector=None
-            if baseline
-            else "DeepEPM2NAFDConnector"
-            if deepep
-            else "P2pNcclAFDConnector",
-            compute_gate_on_attention=deepep,
-            dbo=DboConfig(DBO_DECODE_THRESHOLD, DBO_PREFILL_THRESHOLD) if dbo else None,
-            capture_size=CAPTURE_SIZE,
-        ),
+        deployment=deployment,
         common_vllm_args=(f"--max-model-len={MAX_MODEL_LEN}",),
         phases=(
             Phase(
@@ -119,7 +141,7 @@ def build_case(case_id: str, environment: CaseEnvironment) -> Case:
                         minimum_samples=DBO_MINIMUM_SAMPLES if dbo else 1,
                     )
                 ),
-                (Mrv2Check(("attention", "ffn"), graph=graph, dbo=dbo),)
+                (Mrv2Check(evidence_roles, graph=graph, dbo=dbo),)
                 if not baseline and (graph or dbo)
                 else (),
             ),
@@ -136,4 +158,9 @@ if __name__ == "__main__":
         )
     from tests.e2e.runner import case_main
 
-    raise SystemExit(case_main(build_case, (*SCENARIOS, *DEEPEP_M2N_SCENARIOS)))
+    raise SystemExit(
+        case_main(
+            build_case,
+            (*SCENARIOS, *DEEPEP_M2N_SCENARIOS, *DEEPEP_M2N_FFN_SERVICE_SCENARIOS),
+        )
+    )

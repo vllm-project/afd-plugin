@@ -109,6 +109,9 @@ def test_register_afd_preserves_native_models_and_is_idempotent(registration):
         "AFDQwen3MoeForCausalLM": (
             "afd_plugin.model_executor.models.qwen3_moe:AFDQwen3MoeForCausalLM"
         ),
+        "AFDQwen3MoeRoutedExperts": (
+            "afd_plugin.model_executor.models.qwen3_moe:AFDQwen3MoeRoutedExperts"
+        ),
         "AFDQwen3_5MoeForConditionalGeneration": (
             "afd_plugin.model_executor.models.qwen3_5:"
             "AFDQwen3_5MoeForConditionalGeneration"
