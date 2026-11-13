@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 DSV4_ASYNC_CAM_SCENARIO = "afd-dsv4-flash-async-cam-dp2tp4-ep8"
+DSV4_ASYNC_CAM_MEGA_SCENARIO = "afd-dsv4-flash-async-cam-pull-mega-dp2tp4-ep8"
 DSV4_SYNC_CAMP2P_A5_SCENARIO = "afd-dsv4-flash-sync-camp2p-2a2f"
 DSV4_SYNC_CAMP2P_A3_SCENARIO = "afd-dsv4-flash-sync-camp2p-8a8f"
 DSV4_SYNC_CAMP2P_SCENARIOS = (
@@ -133,7 +134,7 @@ class DSV4SyncShape(NamedTuple):
     block_size: str | None = None
     # Exact `--compilation-config` JSON when the script passes one; the runner
     # then omits its own capture-size flags.
-    compilation_config: dict[str, object] | None = None
+    compilation_config: dict[str, str | list[int]] | None = None
 
     @property
     def device_count(self) -> int:
@@ -198,7 +199,9 @@ def sync_use_graph(shape: DSV4SyncShape) -> bool:
     return shape.use_graph
 
 
-def sync_compilation_config(shape: DSV4SyncShape) -> dict[str, object] | None:
+def sync_compilation_config(
+    shape: DSV4SyncShape,
+) -> dict[str, str | list[int]] | None:
     """Return the profile's exact `--compilation-config`, or None when eager."""
     if not sync_use_graph(shape):
         return None

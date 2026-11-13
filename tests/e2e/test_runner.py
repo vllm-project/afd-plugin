@@ -14,6 +14,7 @@ import threading
 import urllib.error
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,6 +26,8 @@ from tests.e2e.case import (
     Mrv2Check,
     Phase,
 )
+from tests.e2e.checks.mrv2 import Mrv2Session
+from tests.e2e.deployment import ServiceDeployment, resolve
 from tests.e2e.models.deepseek_v2_lite import cases as v2_cases
 from tests.e2e.models.deepseek_v4_flash import cases as dsv4_cases
 from tests.e2e.models.deepseek_v4_flash import test_async_cam_npu as entrypoint
@@ -146,6 +149,7 @@ import re
 import signal
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 from pathlib import Path
 
 arguments = sys.argv[1:]
@@ -788,3 +792,194 @@ def test_multi_pod_case_coordinates_workload_and_owned_cleanup(
     if outcome == "cancel":
         assert children[0].returncode == 128 + signal.SIGTERM
         assert records[0]["execution"]["status"] == "cancelled"
+
+
+@pytest.mark.parametrize("case_id", dsv4_cases.NPU_ASYNC_IDS)
+def test_async_cam_mega_selection_reaches_both_role_commands(tmp_path, case_id):
+    environment = CaseEnvironment(
+        model="/models/dsv4",
+        vllm_bin="vllm",
+        device_backend="npu",
+        devices=tuple(map(str, range(16))),
+        output_path=tmp_path,
+    )
+    case = dsv4_cases.build_case(case_id, environment)
+    _, record = runner.prepare_case(case, environment)
+    mega = case_id == dsv4_cases.config.DSV4_ASYNC_CAM_MEGA_SCENARIO
+    for command in record["commands"].values():
+        config = json.loads(command[command.index("--additional-config") + 1])
+        assert (
+            config["afd"]["connector_extra_config"].get("ffn_mega_moe", False) is mega
+        )
+        assert ("--worker-extension-cls" in command) is mega
+    assert case.deployment.cleanup_profile == (
+        "strict" if mega else "npu_async_cam_legacy"
+    )
+    assert case.phases[0].task == CompletionTask(check_answer=True)
+
+
+@pytest.mark.parametrize(
+    "payload,missing,passed",
+    [
+        ("pull_mega=1 native_completed=2", None, True),
+        ("pull_mega=0 native_completed=2", None, False),
+        ("pull_mega=1 native_completed=0", None, False),
+        ("graph_replays=2", None, False),
+        ("pull_mega=1 native_completed=2", ("ffn", 7, 0), False),
+        ("pull_mega=1 native_completed=2", ("attention", 1, 3), False),
+    ],
+)
+def test_pull_mega_check_requires_native_work_on_every_rank(
+    monkeypatch, tmp_path, pull_mega_probe, payload, missing, passed
+):
+    probe = pull_mega_probe
+    case = probe.case
+    evidence = [
+        (role, f"window=evaluation dp_rank={dp} tp_rank={tp} {payload}")
+        for role, layout in case.deployment.roles
+        for dp in range(layout.dp)
+        for tp in range(layout.tp)
+        if (role, dp, tp) != missing
+    ]
+    services = SimpleNamespace(execution_evidence=evidence, ensure_alive=lambda: None)
+    monkeypatch.setattr(probe, "rpc", lambda *args: None)
+    monkeypatch.setattr("tests.e2e.checks.mrv2.MRV2_EVIDENCE_RPC_TIMEOUT_S", 0)
+    probe.prepare()
+    try:
+        if passed:
+            assert probe.finish(case.phases[0], services) == tuple(evidence)
+        else:
+            with pytest.raises(RuntimeError, match="missing MRV2|lacks live Pull"):
+                probe.finish(case.phases[0], services)
+    finally:
+        # No device was run: deliberately missing shutdown must fail separately.
+        with pytest.raises(RuntimeError, match="Missing Pull Mega shutdown"):
+            probe.close()
+    assert (
+        json.loads((tmp_path / "pull-mega-shutdown.json").read_text())["passed"]
+        is False
+    )
+
+
+@pytest.fixture
+def pull_mega_probe(tmp_path):
+    environment = CaseEnvironment(
+        model="/models/dsv4",
+        vllm_bin="vllm",
+        device_backend="npu",
+        devices=tuple(map(str, range(16))),
+        output_path=tmp_path,
+    )
+    case = dsv4_cases.build_case(dsv4_cases.NPU_ASYNC_IDS[1], environment)
+    return Mrv2Session(case, environment, "host-evidence-validation")
+
+
+@pytest.mark.parametrize("completed_ranks", [range(16), range(15)])
+def test_pull_mega_shutdown_requires_all_workers(
+    tmp_path, pull_mega_probe, completed_ranks
+):
+    for role, ranks in (("attention", range(8)), ("ffn", range(8, 16))):
+        (tmp_path / f"{role}.log").write_text(
+            "".join(
+                f"AFD Pull Mega shutdown: rank={rank} complete\n"
+                for rank in completed_ranks
+                if rank in ranks
+            )
+        )
+    pull_mega_probe.prepare()
+    if len(completed_ranks) == 16:
+        pull_mega_probe.close()
+    else:
+        with pytest.raises(RuntimeError, match="Missing Pull Mega shutdown"):
+            pull_mega_probe.close()
+    assert json.loads((tmp_path / "pull-mega-shutdown.json").read_text())["passed"] == (
+        len(completed_ranks) == 16
+    )
+
+
+def test_pull_mega_cleanup_rejects_and_reaps_orphan(pull_mega_probe):
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        env={**os.environ, "AFD_E2E_RUN_ID": pull_mega_probe.run_id},
+        start_new_session=True,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="Pull Mega orphan processes"):
+            pull_mega_probe.close()
+        assert process.wait(timeout=5) == -signal.SIGKILL
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_pull_mega_service_shutdown_requires_zero_exit(pull_mega_probe, exit_code):
+    probe = pull_mega_probe
+    services = ServiceDeployment(
+        resolve(probe.case, probe.environment), run_id=probe.run_id
+    )
+    script = (
+        "import signal,sys; "
+        f"signal.signal(signal.SIGTERM, lambda *args: sys.exit({exit_code})); "
+        "print('ready', flush=True); signal.pause()"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    services.processes.append(process)
+    services.processes_by_role["ffn"] = process
+    assert process.stdout is not None
+    assert process.stdout.readline().strip() == "ready"
+    if exit_code:
+        with pytest.raises(RuntimeError, match="ffn service exited with return code 1"):
+            services.close()
+    else:
+        services.close()
+    process.stdout.close()
+
+
+def test_pull_mega_sets_vendor_paths_before_service_start(monkeypatch):
+    monkeypatch.setenv("HCCL_SOCKET_IFNAME", "eth0")
+    monkeypatch.setenv("HCCL_IF_IP", "127.0.0.1")
+    monkeypatch.setenv("ASCEND_CUSTOM_OPP_PATH", "/other/vendor")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/other/lib")
+    env = entrypoint.build_environment(dsv4_cases.config.DSV4_ASYNC_CAM_MEGA_SCENARIO)
+    vendor = str(
+        entrypoint.REPO_ROOT / "afd_plugin/_cann_ops_custom/vendors/afd-plugin"
+    )
+    assert env["ASCEND_CUSTOM_OPP_PATH"].split(os.pathsep) == [vendor, "/other/vendor"]
+    assert env["LD_LIBRARY_PATH"].split(os.pathsep) == [
+        vendor + "/op_api/lib",
+        "/other/lib",
+    ]
+    assert env["AFD_CUST_OPAPI_LIB_PATH"] == vendor + "/op_api/lib/libcust_opapi.so"
+
+
+@pytest.mark.parametrize("outcome", ["pass", "wrong-answer"])
+def test_pull_mega_acceptance_records_cleanup_failure(
+    monkeypatch, host_case_runtime, outcome
+):
+    environment = replace(
+        host_case_runtime,
+        device_backend="npu",
+        devices=tuple(map(str, range(16))),
+    )
+    monkeypatch.setenv("AFD_HOST_OUTCOME", outcome)
+    # Exercise the real request and cleanup paths; host stubs cannot prove NPU work.
+    monkeypatch.setattr(Mrv2Session, "start", lambda self, phase: None)
+    monkeypatch.setattr(Mrv2Session, "finish", lambda self, phase, services: ())
+    case = dsv4_cases.build_case(dsv4_cases.NPU_ASYNC_IDS[1], environment)
+    case = replace(case, deployment=replace(case.deployment, termination_timeout_s=1))
+    if outcome == "wrong-answer":
+        with pytest.raises(RuntimeError, match="wrong answer"):
+            runner.run_case(case, environment)
+    else:
+        runner.run_case(case, environment)
+    record = json.loads((environment.output_path / "run.json").read_text())
+    assert record["acceptance_passed"] is (outcome == "pass")
+    assert record["cleanup"]["status"] == "failed"
+    assert record["cleanup"]["errors"]
