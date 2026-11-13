@@ -65,7 +65,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-11-05
+last_reviewed: 2026-11-09
 ---
 
 # FFN runtime
@@ -120,7 +120,7 @@ and host-loop imports remain independent of vLLM.
 The CPU-only host `FFNModelRunner` accepts an `FFNBackend` factory, retains
 the backend before preparation, and owns the receiving thread and failure
 boundary. `FFNService` manages host status and stop requests. Platform options
-and native composition live under `ffn_faas/platforms/npu/`:
+and CAM runtime composition live under `ffn_faas/platforms/npu/`.
 
 - `AscendFFNEnvironment` owns device initialization, F-only compute/EP groups
   and native post-warmup CPU affinity. These groups coexist with the separate
@@ -129,11 +129,12 @@ and native composition live under `ffn_faas/platforms/npu/`:
   accounting and cached-view lifetime. Startup selects a `RoutedModelAdapter`
   to provide checkpoint metadata and native owner construction. The backend
   uses the common resource without model-specific branching.
-- `v4_model.py` contains V4 checkpoint metadata and `V4ModelAdapter`;
-  `v4_weights.py` contains the lazily imported native parameter owner. Native
-  routed modules, expert-map managers and quantizers remain resident. The
-  loader adapter delegates to the native V4 loader; dependency upgrades must
-  preserve its documented receiver and factory contracts.
+- Model-specific code follows `ffn_faas/platforms/ffn_model/<model>/<backend>/`.
+  Under `deepseek_v4/npu/`, `v4_model.py` contains V4 checkpoint metadata and
+  `V4ModelAdapter`. `v4_weights.py` contains the lazily imported native parameter
+  owner. Native routed modules, expert-map managers and quantizers remain
+  resident. The loader adapter delegates to the native V4 loader. Dependency
+  upgrades must preserve its documented receiver and factory contracts.
 - Platform settings enforce static CAM placement and reject EPLB, elastic EP
   and redundant experts. Retaining native expert state does not enable these
   algorithms.
@@ -272,7 +273,7 @@ The V2 pair requires PP/PCP/DCP size 1, configured role ranks equal to DP x TP,
 static EP, and a registered AFD model. CUDA uses `P2pNcclAFDConnector` with
 model-specific gate placement and supports two native microbatches with
 Attention DP1 or DP > 1. See the
-[runtime matrix](execution_platforms.md#tested-runtime-matrix) for tested
+[runtime matrix](../../support.md#tested-runtime-matrix) for tested
 configurations and known DeepSeek-V2-Lite DBO shutdown failures.
 CUDA `DeepEPM2NAFDConnector` requires Attention-side gating, FFN TP 1, and
 the same DBO setting on both roles; see the
@@ -355,7 +356,7 @@ loop. For each layer, the runner:
 Async eager does not use the synchronous DP-metadata graph cache. Its FULL
 mode captures a complete original DR/FFN/CS transaction with device-side layer
 selection. The independent Async runner owns one graph and stable resources;
-see [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md) for startup, supported
+see [Async FFN runtime](../npu/async_ffn_runtime.md) for startup, supported
 W4A8/W8A8 configurations and the original receiver's process-cleanup boundary.
 
 DeepSeek-V4 W4A8 and W8A8 use layered GMM for both eager and FULL. Incompatible
@@ -471,7 +472,7 @@ thread does not exit, native resources are not released underneath it. The
 connector then releases its remaining communication resources during runner
 shutdown. An earlier daemon failure is still surfaced after the join. Ascend
 uses its own connector close or asynchronous drain path before joining the
-daemon; see the [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md).
+daemon; see the [Async FFN runtime](../npu/async_ffn_runtime.md).
 
 ## Candidate invariants
 
@@ -495,16 +496,8 @@ async model E2E coverage.
 
 ## Limitations and open issues
 
-Current shared limits are the supported vLLM release, connector-driven FFN,
-and registered role-aware model integrations. Ascend V1 native DBO accepts
-exactly two ubatches. A V2-paired FFN uses the same AFD FFN runner with a
-V2-compatible construction and forward-context seam. CUDA FFN consumes the
-two-stage control layout and replays the matching graph when requested;
-Ascend V2 consumes two-stage synchronous control metadata in eager DBO mode.
-CAM async instead uses eager connector work items; native DBO runs only on
-Attention and does not create a separate FFN stage scheduler.
-Platform-specific limits are centralized in
-[execution platforms](execution_platforms.md#tested-runtime-matrix).
+Platform-specific execution limits and validation evidence are centralized in
+[support matrix](../../support.md#tested-runtime-matrix).
 
 Issue [#107](https://github.com/JiusiServe/afd-plugin/issues/107) completed the
 optional control-plane split. Connector metadata ownership, transfer state

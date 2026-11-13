@@ -15,11 +15,6 @@ pytest.importorskip("vllm")
 
 from vllm.platforms.interface import set_assigned_physical_gpu_ids  # noqa: E402
 
-from tests.unit.fakes.afdep import FakeElasticBuffer, install_fake_afdep  # noqa: E402
-
-# The connector module imports afdEP's transport when it loads.
-install_fake_afdep()
-
 from afd_plugin.config import afd_config_from_mapping  # noqa: E402
 from afd_plugin.connectors import (  # noqa: E402
     AFDConnectorFactory,
@@ -29,23 +24,36 @@ from afd_plugin.connectors import (  # noqa: E402
     AFDTransferMetadata,
 )
 from afd_plugin.connectors.base import AFDControlPlaneClosedError  # noqa: E402
-from afd_plugin.connectors.gpu.deepep_m2n import (  # noqa: E402
-    connector as connector_module,
+from tests.unit.fakes.afdep import (  # noqa: E402
+    FakeElasticBuffer,
+    install_fake_afdep,
+    uninstall_fake_afdep,
 )
-from afd_plugin.connectors.gpu.deepep_m2n.connector import (  # noqa: E402
-    DeepEPM2NConfig,
-    bucket_ladder,
-    expert_weight_format,
-    local_handshake_info,
-    local_model_info,
-    plan_stage,
-    precompile_buckets,
-    resolve_capacity_tokens_per_rank,
-    resolve_num_lanes,
-    tokens_per_attention_rank,
-    validate_handshake,
-    validate_model_infos,
-)
+
+# The connector module imports afdEP's transport when it loads, so the stand-in has to
+# exist for that import only. It is removed again on both paths: the bound names keep
+# working, and the rest of the session sees the package as absent.
+install_fake_afdep()
+try:
+    from afd_plugin.connectors.gpu.deepep_m2n import (  # noqa: E402
+        connector as connector_module,
+    )
+    from afd_plugin.connectors.gpu.deepep_m2n.connector import (  # noqa: E402
+        DeepEPM2NConfig,
+        bucket_ladder,
+        expert_weight_format,
+        local_handshake_info,
+        local_model_info,
+        plan_stage,
+        precompile_buckets,
+        resolve_capacity_tokens_per_rank,
+        resolve_num_lanes,
+        tokens_per_attention_rank,
+        validate_handshake,
+        validate_model_infos,
+    )
+finally:
+    uninstall_fake_afdep()
 from afd_plugin.connectors.gpu.deepep_m2n.experts import (  # noqa: E402
     expert_row_ranges,
 )
@@ -53,7 +61,11 @@ from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (  # noqa: E402
     dequantize_fp8_block128,
     quantize_fp8_block128,
 )
-from afd_plugin.connectors.gpu.deepep_m2n.layout import DeepEPM2NLayout  # noqa: E402
+from afd_plugin.connectors.gpu.deepep_m2n.layout import (  # noqa: E402
+    DeepEPM2NLayout,
+    RankPlacement,
+    plan_transport_layout,
+)
 from afd_plugin.connectors.gpu.deepep_m2n.network import (  # noqa: E402
     NetworkConfig,
     RankTopology,
@@ -577,9 +589,11 @@ def test_handshake_rejects_mismatches(overrides, message):
 
 
 def test_handshake_plans_gin_across_nvlink_domains():
-    """Ranks on hosts ``aabb`` give a plan of 2 domains of 2 ranks with GIN.
+    """Ranks on hosts ``aabb`` (role-split pods) give a plan of 2 domains of 2
+    ranks with GIN, and keep the role world as the transport order.
 
-    Why: the handshake must hand the network plan the right domains.
+    Why: the handshake must hand the network plan the right domains, and the
+    role-split layouts that run today must take the unchanged transport.
     """
     layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
 
@@ -592,18 +606,54 @@ def test_handshake_plans_gin_across_nvlink_domains():
         2,
         2,
     )
+    assert result.transport.is_identity
+
+
+def test_handshake_gives_interleaved_pods_the_per_domain_transport():
+    """FFN 0 and FFN 1 on hosts ``a`` and ``b``, each with one Attention rank
+    (``1A1F,1A1F``), give a per-domain transport ``[F0, A0, F1, A1]`` over 2
+    domains of 2 ranks.
+
+    Why: afdEP-comm's lanes must see the ranks domain by domain with each
+    domain's FFN rank first; the network plan is checked in that order.
+    """
+    layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
+
+    result = validate_handshake(
+        _handshake(layout, hosts="abab"), layout, NetworkConfig()
+    )
+
+    assert result.transport.order == (
+        ("ffn", 0),
+        ("attention", 0),
+        ("ffn", 1),
+        ("attention", 1),
+    )
+    assert result.transport.ffn_ranks_per_domain == 1
+    assert (result.network_plan.num_domains, result.network_plan.ranks_per_domain) == (
+        2,
+        2,
+    )
 
 
 @pytest.mark.parametrize(
-    ("hosts", "message"),
-    [("aaab", "different rank counts"), ("abab", "not contiguous")],
+    ("ffn_size", "attn_size", "hosts", "message"),
+    [
+        (2, 2, "aaab", "same number of ranks"),
+        # Host a holds F0, A0, A1 and host b F1, F2, A2.
+        (3, 3, "abbaab", "same number of FFN ranks"),
+    ],
 )
-def test_handshake_rejects_unsupported_domain_layouts(hosts, message):
-    """Hosts ``aaab`` (unequal counts) and ``abab`` (not contiguous) raise.
+def test_handshake_rejects_unsupported_domain_layouts(
+    ffn_size, attn_size, hosts, message
+):
+    """Hosts with unequal rank counts, or with FFN counts that differ while
+    the FFN ranks do not fill the first hosts, raise.
 
-    Why: DeepEP's hybrid mode needs equal, contiguous ranks per domain.
+    Why: DeepEP needs equal NVLink domains, and afdEP-comm finds FFN ranks
+    only as a prefix or as the same count in every domain.
     """
-    layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
+    layout = DeepEPM2NLayout(ffn_size=ffn_size, attn_size=attn_size, num_experts=96)
 
     with pytest.raises(RuntimeError, match=message):
         validate_handshake(_handshake(layout, hosts=hosts), layout, NetworkConfig())
@@ -825,6 +875,38 @@ def test_close_cancels_the_control_receive_but_not_the_lanes_group(monkeypatch):
     assert aborted == [control]
     with pytest.raises(AFDControlPlaneClosedError):
         connector.control_plane.recv_dp_metadata_list()
+
+
+def test_close_destroys_the_distinct_transport_group_after_lanes(monkeypatch):
+    """A per-domain transport group is destroyed once, after its lanes.
+
+    Why: afdEP-comm leaves the caller-owned Gloo group alive; keeping it
+    registered leaks process-group state across connector lifetimes.
+    """
+    events = []
+
+    class Lane:
+        def destroy(self):
+            events.append("lane")
+
+    monkeypatch.setattr(
+        connector_module, "_abort_process_group", lambda group: events.append("control")
+    )
+    monkeypatch.setattr(
+        connector_module.dist,
+        "destroy_process_group",
+        lambda group: events.append("transport"),
+    )
+    connector = _connector("ffn", 0, M2NTopology(ffn_size=2, attn_size=2))
+    connector.group = SimpleNamespace()
+    connector.bootstrap_group = SimpleNamespace()
+    connector.transport_group = SimpleNamespace()
+    connector.lanes = [Lane()]
+
+    connector.close()
+    connector.close()
+
+    assert events == ["control", "lane", "transport"]
 
 
 @pytest.mark.parametrize(
@@ -1166,27 +1248,48 @@ def test_attention_init_rejects_local_experts_before_communicating():
     assert connector.bootstrap_group is None
 
 
-@pytest.mark.parametrize(("role", "role_rank"), [("attention", 2), ("ffn", 1)])
+@pytest.mark.parametrize(
+    ("role", "role_rank", "hosts", "ffn_ranks_per_domain"),
+    [
+        ("attention", 2, "aaaaaa", 0),
+        ("ffn", 1, "aaaaaa", 0),
+        # Hosts of F0 F1 A0 A1 A2 A3: 2A1F,2A1F.
+        ("ffn", 1, "ababab", 1),
+        ("attention", 3, "ababab", 1),
+    ],
+)
 def test_lane_transport_is_afdep_comm_with_the_ffn_rank_count(
-    monkeypatch, role, role_rank
+    monkeypatch, role, role_rank, hosts, ffn_ranks_per_domain
 ):
     """Each lane's transport is afdEP-comm's ``ElasticBuffer``, built with every
-    argument its constructor requires and the FFN rank count.
+    argument its constructor requires, the FFN rank count and the transport's
+    ``ffn_ranks_per_domain``, on the transport group.
 
     Why: ``ffn_ranks`` selects afdEP-comm's AFD transport (without it the
-    buffer is unspecialized DeepEP V2), and the stand-in fails on any argument
-    set the real constructor would refuse.
+    buffer is unspecialized DeepEP V2), ``ffn_ranks_per_domain`` tells it
+    where the FFN ranks sit, and the stand-in fails on any argument set the
+    real constructor would refuse.
     """
     monkeypatch.setattr(connector_module, "ElasticBuffer", FakeElasticBuffer)
-    connector = _connector(role, role_rank, M2NTopology(ffn_size=2, attn_size=3), {})
-    connector.bootstrap_group = SimpleNamespace()
+    topology = M2NTopology(ffn_size=2, attn_size=4)
+    connector = _connector(role, role_rank, topology, {})
+    connector.transport_group = SimpleNamespace()
+    connector.transport = plan_transport_layout(
+        [
+            RankPlacement(*topology.role(rank), f"host:{host}")
+            for rank, host in enumerate(hosts)
+        ],
+        ffn_size=topology.ffn_size,
+    )
     connector.network_plan = SimpleNamespace(hybrid=True, rdma_traffic_class=0)
     connector.capacity_tokens_per_rank = 64
 
     buffer = connector._new_lane()
 
     assert isinstance(buffer, FakeElasticBuffer)
+    assert buffer.kwargs["group"] is connector.transport_group
     assert buffer.kwargs["ffn_ranks"] == 2
+    assert buffer.kwargs["ffn_ranks_per_domain"] == ffn_ranks_per_domain
     assert buffer.kwargs["capacity_tokens_per_rank"] == 64
     assert buffer.kwargs["allow_hybrid_mode"] is True
 

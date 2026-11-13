@@ -214,6 +214,8 @@ class V4ModelAdapter:
         return selected
 
     def create_owner(self, config: VllmConfig) -> RoutedWeightOwner:
-        from afd_plugin.ffn_faas.platforms.npu.v4_weights import V4RoutedWeightOwner
+        from afd_plugin.ffn_faas.platforms.ffn_model.deepseek_v4.npu.v4_weights import (
+            V4RoutedWeightOwner,
+        )
 
         return V4RoutedWeightOwner(self.checkpoint, config)

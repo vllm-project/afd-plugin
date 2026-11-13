@@ -17,11 +17,11 @@ def get_model(model_path: Path, ffn_ranks: int, ffn_rank: int) -> CAMRoutedModel
     This is a loading boundary, not a model registry or multi-model support claim.
     Native CAM still requires its existing HF configuration and W4A8 contract.
     """
-    from afd_plugin.ffn_faas.platforms.npu.model import CAMRoutedModel
-    from afd_plugin.ffn_faas.platforms.npu.v4_model import (
+    from afd_plugin.ffn_faas.platforms.ffn_model.deepseek_v4.npu.v4_model import (
         V4CheckpointDescription,
         V4ModelAdapter,
     )
+    from afd_plugin.ffn_faas.platforms.npu.model import CAMRoutedModel
 
     adapter = V4ModelAdapter(V4CheckpointDescription.read(model_path))
     return CAMRoutedModel(adapter, ffn_ranks, ffn_rank)

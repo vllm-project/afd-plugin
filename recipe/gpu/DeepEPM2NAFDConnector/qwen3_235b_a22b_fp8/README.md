@@ -1,58 +1,51 @@
 # Qwen3-235B-A22B-FP8 with DeepEPM2NAFDConnector
 
-Launch scripts for Qwen3-235B-A22B-FP8 on `DeepEPM2NAFDConnector` with vLLM
-`v0.30.0`, using the FP8 dispatch payload.
-
-## Prerequisites
-
-- 6 SM90 or newer GPUs on one node with enough memory for the model. This
-  configuration was run on H200.
-- The environment described in the
-  [connector recipes README](../README.md#prerequisites).
-- Qwen3-235B-A22B-FP8 weights on disk (block-128 FP8). The scripts default to
-  `/path/model_weights/Qwen3-235B-A22B-FP8`; override with `MODEL_PATH=...`.
-- Free ports `6239` (AFD rendezvous), `18000` (Attention API) and `18001`
-  (FFN).
-
-## Layout
-
-`4A2F`: Attention DP4 x TP1 on GPUs 0-3 and FFN DP2 on GPUs 4,5. Each FFN rank
-owns half of the 128 experts.
+Qwen3-235B-A22B-FP8 recipes with the FP8 dispatch payload. The scripts,
+layouts, settings, multi-pod runs and the decode-only benchmark are described
+once in the [connector recipes README](../README.md); this page lists what is
+specific to the model.
 
 ```text
 prefill_decode_colocation/
-├── 4a2f_graph_dp4tp1.sh       # 256 sequences per Attention rank, FULL_DECODE_ONLY graph
-└── 4a2f_graph_dbo_dp4tp1.sh   # 512 sequences per Attention rank, graph + DBO
+├── 4a2f_eager_dp4tp1.sh       # eager, FFN DP2/TP1, Attention DP4/TP1
+├── 4a2f_graph_dp4tp1.sh       # graph, FFN DP2/TP1, Attention DP4/TP1
+├── 4a2f_dbo_dp4tp1.sh         # graph + DBO, FFN DP2/TP1, Attention DP4/TP1
+└── multipod_4a1f_4a1f_dbo.sh  # 2 pods, graph + DBO, Attention DP8/TP1
 ```
 
-## Configuration notes
+## Defaults
 
-- `connector_extra_config` sets `payload_format: "fp8_block128_fp32"`. The
-  FFN must load the block-128 FP8 checkpoint; the startup handshake rejects a
-  mismatch between the payload format and the loaded expert weights.
-- The FFN keeps vLLM's default `--moe-backend auto`, which the plugin pins to
-  `triton` so the expert weights stay in the layout the connector reads.
-- `afd_process_group_timeout_s` and `--cpu-distributed-timeout-seconds` are
-  raised to 3600 s because loading the weights can take longer than the
-  default 120 s join timeout, especially from cold storage.
-- The capture sizes cover `--max-num-seqs`. The connector derives its dispatch
-  buckets from them and compiles one transport kernel set per bucket at
-  startup.
-- `expert_num_sms` (default `0`, all SMs) and `num_sms` tune how SMs are split
-  between DeepGEMM experts and the transport kernels; see the connector guide.
+| Setting | `4a2f_graph_dp4tp1.sh`, `4a2f_eager_dp4tp1.sh` | `4a2f_dbo_dp4tp1.sh`, `multipod_4a1f_4a1f_dbo.sh` |
+| --- | --- | --- |
+| `LAYOUT` | `4A2F` | `4A2F` / `4A1F,4A1F` |
+| `--max-num-seqs` | 256 per Attention DP rank | 512 |
+| `--max-num-batched-tokens` | 3072 | 3072 |
+| `--max-model-len` | 4096 | 4096 |
+| `CUDAGRAPH_CAPTURE_SIZES` | 8,12,16,24,32,48,64,96,128,192,256 | 8,16,32,64,96,128,192,256,384,512 |
+| `connector_extra_config` | `"payload_format": "fp8_block128_fp32"` | same |
 
-## Checking a deployment
+Common layouts:
 
-```bash
-curl -s http://127.0.0.1:18000/v1/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"'"$MODEL_PATH"'","prompt":"The capital of France is","max_tokens":12,"temperature":0}'
-```
+| `LAYOUT` | GPUs | Notes |
+| --- | --- | --- |
+| `2A2F` | 4 on one host | each FFN GPU holds half of the 128 experts |
+| `4A2F` | 6 on one host | Attention DP4 on GPUs 2-5 |
+| `4A1F,4A1F` | 2 pods of 5 | Attention DP8, FFN DP2/EP2 |
 
-The answer should name Paris. An FFN log line `Using TRITON Fp8 MoE backend`
-confirms the expected expert-weight layout.
+## Notes
+
+- Every layout with two FFN ranks puts about 110 GB of FP8 experts on each
+  FFN GPU, so it needs H200-class GPUs (about 140 GB); four or more FFN ranks
+  fit smaller GPUs. Attention ranks hold no experts
+  (`--enable-ep-weight-filter`).
+- The FFN must load the block-128 FP8 checkpoint; the startup handshake
+  rejects a mismatch between the payload format and the loaded expert weights.
+- `ATTN_TP=4` with `LAYOUT=4A2F` runs Attention as one DP1/TP4 engine; raise
+  `--max-num-seqs` and the capture sizes with it, since one engine then holds
+  every running request.
+- Qwen3-235B holds 188 KiB of BF16 KV per token (94 layers, 4 KV heads of
+  128); an H200 Attention rank has room for about 640K tokens.
 
 ## Limitations
 
 - Qwen3 MoE only; see the connector guide for the full list of requirements.
-- `FULL_DECODE_ONLY` is the only CUDA graph mode.

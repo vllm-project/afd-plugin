@@ -40,7 +40,7 @@ module responsibilities and ownership.
 
 Keep the existing Attention launch and its `CAMAsyncAFDConnector` configuration.
 See the [connector guide](CAM_ASYNC_CONNECTOR_USER_GUIDE.md) and
-[eager/FULL runtime guide](ASYNC_FFN_RUNTIME.md) for its existing contract.
+[eager/FULL runtime guide](../design/npu/async_ffn_runtime.md) for its existing contract.
 It must use eager MRV2, Attention-side gating and dynamic quantization. Native
 Attention DBO uses the existing integration contract; do not enable DBO on F.
 

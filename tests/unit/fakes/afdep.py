@@ -10,11 +10,12 @@ without afdEP-comm; tests that build a lane substitute ``FakeElasticBuffer``.
 from __future__ import annotations
 
 import sys
+from importlib.machinery import ModuleSpec
 from importlib.util import find_spec
 from types import ModuleType
 
 # Keyword-only parameters of afdep.deepep.ElasticBuffer at the pinned afdEP-comm
-# (afdEP/afdEP-comm 2b74d57). The stand-in requires the required ones and
+# (afdEP/afdEP-comm v1.1.0). The stand-in requires the required ones and
 # rejects any other keyword, so a lane built with arguments the real transport
 # would refuse fails here as it would on a GPU.
 ELASTIC_BUFFER_REQUIRED = (
@@ -28,7 +29,13 @@ ELASTIC_BUFFER_REQUIRED = (
     "cpu_timeout_s",
     "gpu_timeout_s",
 )
-ELASTIC_BUFFER_OPTIONAL = ("use_fp8_dispatch", "num_sms", "num_qps", "ffn_ranks")
+ELASTIC_BUFFER_OPTIONAL = (
+    "use_fp8_dispatch",
+    "num_sms",
+    "num_qps",
+    "ffn_ranks",
+    "ffn_ranks_per_domain",
+)
 
 
 class FakeElasticBuffer:
@@ -46,6 +53,9 @@ class FakeElasticBuffer:
         self.kwargs = kwargs
 
 
+_FAKE_MARKER = "__afd_fake_afdep__"
+
+
 def install_fake_afdep() -> None:
     """Register the stand-in ``afdep.deepep`` unless afdEP is importable."""
     if "afdep" in sys.modules or find_spec("afdep") is not None:
@@ -56,5 +66,23 @@ def install_fake_afdep() -> None:
     deepep.DispatchHandle = type("DispatchHandle", (), {})  # type: ignore[attr-defined]
     deepep.ReceiveResult = type("ReceiveResult", (), {})  # type: ignore[attr-defined]
     package.deepep = deepep  # type: ignore[attr-defined]
+    # A module without a spec makes a later find_spec("afdep") raise instead of
+    # reporting the package as missing.
+    package.__spec__ = ModuleSpec("afdep", None)
+    deepep.__spec__ = ModuleSpec("afdep.deepep", None)
+    setattr(package, _FAKE_MARKER, True)
+    setattr(deepep, _FAKE_MARKER, True)
     sys.modules["afdep"] = package
     sys.modules["afdep.deepep"] = deepep
+
+
+def uninstall_fake_afdep() -> None:
+    """Remove the stand-in again, leaving a real afdEP install untouched.
+
+    A stand-in left in ``sys.modules`` has no ``__spec__``, so a later
+    ``find_spec("afdep")`` raises instead of reporting "not installed".
+    """
+    for name in ("afdep.deepep", "afdep"):
+        module = sys.modules.get(name)
+        if module is not None and getattr(module, _FAKE_MARKER, False):
+            sys.modules.pop(name, None)

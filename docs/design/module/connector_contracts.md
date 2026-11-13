@@ -42,7 +42,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-11-05
+last_reviewed: 2026-11-09
 ---
 
 # Connector contracts
@@ -67,7 +67,7 @@ depend on role worker implementations.
 | Payloads and control-plane codec | [`metadata.py`](../../../afd_plugin/connectors/metadata.py) | Connector unit tests and [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
 | CUDA P2P | [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py), [`topology.py`](../../../afd_plugin/distributed/topology.py) | [`test_p2p_connector.py`](../../../tests/unit/connectors/test_p2p_connector.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) |
 | CUDA DeepEP M2N | [`gpu/deepep_m2n/`](../../../afd_plugin/connectors/gpu/deepep_m2n/), `AFDRoutedExpertsConnector` in [`base.py`](../../../afd_plugin/connectors/base.py) | [`test_deepep_m2n_connector.py`](../../../tests/unit/connectors/test_deepep_m2n_connector.py), [GPU device tests](../../../tests/gpu/README.md), [Qwen3 MoE E2E](../../../tests/e2e/models/qwen3_moe/test_qwen3_moe.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) (`test_deepseek_v2_lite_deepep_m2n`) |
-| Ascend CAMP2P | [`npu/camp2p.py`](../../../afd_plugin/connectors/npu/camp2p.py) | [`test_camp2p_connector.py`](../../../tests/unit/connectors/test_camp2p_connector.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) |
+| Ascend CAMP2P | [`npu/camp2p/connector.py`](../../../afd_plugin/connectors/npu/camp2p/connector.py) | [`test_camp2p_connector.py`](../../../tests/unit/connectors/test_camp2p_connector.py), [`test_camp2p_token_ids.py`](../../../tests/unit/connectors/test_camp2p_token_ids.py), [`test_external_routing.py`](../../../tests/unit/connectors/test_external_routing.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) |
 | Ascend CAM async | [`npu/async_cam.py`](../../../afd_plugin/connectors/npu/async_cam.py), [`Push/Pull sessions`](../../../afd_plugin/connectors/npu/async_cam_runtime/async_cam_session.py) | [Connector unit tests](../../../tests/unit/connectors/test_async_cam_connector.py), [CAM host contracts](../../../tests/unit/connectors/npu/test_async_cam.py), [fused routing device test](../../../tests/npu/test_async_cam_connector.py), [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py) |
 | Process-group construction | [`afd_process_group.py`](../../../afd_plugin/distributed/afd_process_group.py) | Connector initialization tests plus platform E2E paths |
 
@@ -95,14 +95,14 @@ which lets feature validation use the same connector-owned schema.
 
 ## Connector-owned configuration
 
-`additional_config["afd"]["connector_extra_config"]` is an envelope rather
-than an `AFDConfig` field. Unknown fields fail in the selected connector parser.
+`AFDConfig.connector_extra_config` stores the connector-specific mapping.
+Unknown fields fail in the selected connector parser.
 
 | Connector | Accepted connector-specific fields |
 | --- | --- |
 | `P2pNcclAFDConnector` | None; the mapping must be empty. |
 | `DeepEPM2NAFDConnector` | `payload_format`, `expert_backend`, `capacity_tokens_per_rank`, `num_lanes`, `bucket_granularity`, `cpu_sync_min_tokens`, `num_sms`, `num_qps`, `expert_num_sms`, `cpu_timeout_s`, `gpu_timeout_s`, and a nested `network` mapping (`gin`, `hybrid`, `rdma_traffic_class`). All are optional; see the [DeepEP M2N guide](../../gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#connector_extra_config) for defaults. |
-| `CAMP2pAFDConnector` | `core_num`, optional `attn_core_num` / `ffn_core_num`, `compute_gate_on_attention`, `quant_mode`, and optional positive `hccl_buffer_size`. Core counts must be positive; the current runtime rejects gate-on-Attention and any nonzero quantization mode. |
+| `CAMP2pAFDConnector` | `core_num`, optional `attn_core_num` / `ffn_core_num`, `compute_gate_on_attention`, `quant_mode`, and optional positive `hccl_buffer_size`. Core counts must be positive. Gate placement follows the common `afd.compute_gate_on_attention` field; the connector-local copy is kept for compatibility and does not select the mode. `true` requires DeepSeek-V4 at TP=1 without DBO or ubatching. Any nonzero quantization mode is rejected today. |
 | `CAMAsyncAFDConnector` | `dynamicQuant`, `ffn_mega_moe`, `attn_ranks_per_dp`, and optional positive `hccl_buffer_size`. Attention microbatching uses native DBO configuration. |
 
 The common `afd_process_group_timeout_s` defaults to 120 seconds and controls
@@ -113,10 +113,12 @@ environment rather than querying the allocated domain.
 
 The common `compute_gate_on_attention` field remains on `AFDConfig` and is the
 model-routing selector. CUDA P2P supports both values; DeepEP M2N requires
-`true`. CAMP2P also parses a
-connector-local field with that name for its operator contract, but the current
-synchronous NPU runtime requires both common and connector-local values to be
-`false`. CAM async requires the common field to be `true`.
+`true`. CAMP2P also parses a connector-local field with that name, retained for
+backwards compatibility with older configurations and ignored for routing: the
+synchronous NPU runtime selects Attention-side routing from the common field, so
+deployments leave the connector-local copy unset. The supported synchronous
+shape is `true` on both roles for DeepSeek-V4 at TP=1 with no DBO or ubatching.
+CAM async requires the common field to be `true`.
 
 ## Current connector modes
 
@@ -207,7 +209,7 @@ The current plugin-owned objects are:
 | `AFDTransferMetadata` | Layer, stage, non-negative split lengths, and total-token validation; backend state is paired separately in `AFDTransferContext`. A split length may be `0`: with an expert-routed transport (DeepEP M2N) an FFN rank can receive no rows for a layer while still taking part in the collective. The list itself must not be empty. | **Draft** under [#88](https://github.com/JiusiServe/afd-plugin/issues/88). |
 | `AFDTransferContext` | Pairs common `metadata` with the backend `states` retained from receive through the matching send. | **Draft** under [#88](https://github.com/JiusiServe/afd-plugin/issues/88) and [#105](https://github.com/JiusiServe/afd-plugin/issues/105). |
 | `AFDTransferState` | Empty base for backend-specific state such as CAMP2P handles or async CAM state. | **Draft** under [#88](https://github.com/JiusiServe/afd-plugin/issues/88). |
-| `AFDA2FTransferPayload` | Attention-to-FFN hidden states, common metadata, and optional router logits or token-aligned input IDs. | **Draft** and scheduled for state splitting in [#105](https://github.com/JiusiServe/afd-plugin/issues/105). |
+| `AFDA2FTransferPayload` | Attention-to-FFN hidden states, common metadata, and optional router logits, token-aligned input IDs, or the routed top-k (`topk_ids` with `topk_weights`). | **Draft** and scheduled for state splitting in [#105](https://github.com/JiusiServe/afd-plugin/issues/105). |
 | `AFDF2ATransferPayload` | Structured routed/shared FFN outputs where the backend needs both. | **Draft** with the transfer-state work. |
 | `LocalExpertWeights` | One FFN rank's experts in vLLM `FusedMoE` layout (`w13` gate-first, `w2`), BF16 or block-128 FP8 with both block scales. | **Draft**; used only by routed-experts connectors. |
 | `FFNLocalExperts` | One MoE layer's global expert ids and their `LocalExpertWeights`, as vLLM loaded them. | **Draft**; used only by routed-experts connectors. |
@@ -233,7 +235,12 @@ state. P2P can send optional router logits and one-dimensional, token-aligned
 the A2E operator's ids channel, which the receiving FFN rank selects with
 `recv_input_ids`; both roles derive that mode from the model's
 `afd_requires_input_ids` declaration, because the operator only writes the ids
-slot in the mode the sender chose. FFN requests only the fields its
+slot in the mode the sender chose. The same slot carries the one payload the
+layer speaks: either token-aligned input IDs or the routed top-k, never both, and
+the connector rejects a request for both. External routing keeps the expert IDs in
+that ids slot and puts the gate weights in the paired scales slot; the receiving
+rank selects it with `recv_routing`, derived from the model's
+`afd_requires_attention_routing` declaration. FFN requests only the fields its
 model declares, concatenates them with the same per-peer token order as hidden
 states, and returns them in `AFDA2FTransferPayload`. A CUDA P2P FFN rank posts
 the receives for all of its Attention peers, each peer's tensors in wire order,
@@ -312,7 +319,7 @@ metadata is present.
 | Connector | Connector-owned resources | Topology constraints and mapping |
 | --- | --- | --- |
 | CUDA P2P | AFD process group, PyNccl data communicators, separate NCCL metadata group, compiled custom-op communicator registry, and graph-oriented receive buffers/state. | Requires `A >= F`. One FFN rank is grouped with a consecutive block of Attention ranks in FFN-first ordering; the blocks differ in size by at most one, and hold `A/F` ranks each when `F` divides `A`. |
-| CUDA DeepEP M2N | AFD process group, a CPU bootstrap group for the handshake, the connector's NCCL control group, afdEP-comm transport buffers (one per lane), and compiled dispatch/combine kernels per bucket. | FFN-first ordering, any `A/F`, `num_experts % F == 0`, FFN TP 1. Across nodes every NVLink domain must hold an equal, contiguous block of world ranks. The startup handshake checks payload format, model shapes, lanes, network settings, SM90+, and the FFN expert deployment on every rank before buffers are allocated. |
+| CUDA DeepEP M2N | AFD process group, a CPU bootstrap group for the handshake, a CPU transport group when the physical rank order differs from the role order, the connector's NCCL control group, afdEP-comm transport buffers (one per lane), and compiled dispatch/combine kernels per bucket. | FFN-first role ordering, any `A/F`, `num_experts % F == 0`, FFN TP 1. Every NVLink domain must hold the same number of ranks, and either the FFN ranks fill the first domains (afdEP-comm FFN prefix) or every domain holds the same number of FFN ranks (afdEP-comm per-domain mode); the transport sees the ranks domain by domain, FFN first in each. The startup handshake checks payload format, model shapes, lanes, network settings, SM90+, and the FFN expert deployment on every rank before buffers are allocated. |
 | Ascend CAMP2P | AFD process group, one HCCL communication group per ubatch, FFN HCCL state, Gloo metadata group, custom-op state and transfer handles. | FFN-first ordering and `A >= F`; group construction derives each FFN/Attention mapping. |
 | Ascend CAM async | Attention-first HCCL group, plugin-owned routed-only CAM operator state, per-stage pending Attention payload queues, and connector work-item state. | Role ranks map into a combined Attention-first world; Compact metadata determines the actual layer and expert interval; counts.sum() gives this chunk’s routed token count. |
 

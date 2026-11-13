@@ -23,13 +23,13 @@ from afd_plugin.connectors import (
     AFDTransferState,
 )
 from afd_plugin.connectors.metadata import AFDControlPayload, AFDDPMetadata
-from afd_plugin.connectors.npu import camp2p as camp2p_module
 from afd_plugin.connectors.npu.camp2p import (
     CAMP2pAFDConnector,
     CAMP2PExtraInfo,
     CAMP2PTransferState,
     build_camp2p_topology,
 )
+from afd_plugin.connectors.npu.camp2p import connector as camp2p_module
 from tests.unit.fakes.dp_metadata import DPMetadata as _FakeDPMetadata
 
 

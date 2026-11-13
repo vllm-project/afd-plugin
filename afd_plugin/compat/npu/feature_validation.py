@@ -14,7 +14,11 @@ from afd_plugin.config import (
     is_afd_async_dp,
     parse_afd_config,
 )
-from afd_plugin.validation import cam_receive_capacity, requested_ffn_mode
+from afd_plugin.validation import (
+    cam_receive_capacity,
+    requested_ffn_mode,
+    validate_async_cam_attention_graph,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -56,8 +60,15 @@ def fail_if_unsupported_npu_afd_features(
         return
 
     if afd_config.compute_gate_on_attention:
-        raise RuntimeError(
-            "AFD NPU runtime does not support compute_gate_on_attention=true yet",
+        # The sync Attention-side gate prototype is deliberately narrow: one
+        # connector, the target model and BF16 transport. Widening it without the
+        # corresponding transport work would produce wrong numerics instead of an
+        # error, so anything outside that shape stays rejected.
+        _fail_if_unsupported_sync_attention_gate(
+            vllm_config,
+            afd_config,
+            extra_info,
+            is_dsv4=is_dsv4,
         )
     if afd_config.connector == CAMP2P_CONNECTOR:
         from afd_plugin.connectors.npu.camp2p import CAMP2PExtraInfo
@@ -151,6 +162,53 @@ def _fail_if_unsupported_dsv4_connector(afd_config: AFDConfig) -> None:
         )
 
 
+def _fail_if_unsupported_sync_attention_gate(
+    vllm_config: VllmConfig,
+    afd_config: AFDConfig,
+    extra_info: object,
+    *,
+    is_dsv4: bool,
+) -> None:
+    """Restrict the sync Attention-side gate prototype to what it supports today.
+
+    DBO and ubatching are rejected rather than merely unused: the sync shell does not
+    call the DBO yield, so enabling DBO here would interleave microbatches against a
+    transport that never yields. Not calling the yield is not the same as forbidding
+    the feature.
+    """
+
+    parallel = vllm_config.parallel_config
+    # The routing travels on each rank's own activation, and only the TP=1 shape has
+    # been verified end to end; a wider TP would split the activation without a
+    # matching routing split on the Attention side.
+    if int(parallel.tensor_parallel_size) != 1:
+        raise RuntimeError(
+            "Attention-side gate is only supported at tensor-parallel size 1; got "
+            f"TP={int(parallel.tensor_parallel_size)}",
+        )
+    if bool(parallel.enable_dbo) or bool(parallel.use_ubatching):
+        raise RuntimeError(
+            "Attention-side gate with the synchronous connector does not support "
+            "DBO or ubatching yet",
+        )
+    if afd_config.connector != CAMP2P_CONNECTOR:
+        raise RuntimeError(
+            "Attention-side gate is only supported with "
+            f"{CAMP2P_CONNECTOR}, got {afd_config.connector!r}",
+        )
+    if not is_dsv4:
+        raise RuntimeError(
+            "Attention-side gate is only supported for the DeepSeek V4 target",
+        )
+    from afd_plugin.connectors.npu.camp2p import CAMP2PExtraInfo
+
+    if not isinstance(extra_info, CAMP2PExtraInfo):
+        raise TypeError(
+            "CAMP2pAFDConnector requires CAMP2PExtraInfo, got "
+            f"{type(extra_info).__name__}",
+        )
+
+
 def _fail_if_unsupported_npu_afd_async_features(
     vllm_config: VllmConfig,
     afd_config: AFDConfig,
@@ -177,14 +235,13 @@ def _fail_if_unsupported_npu_afd_async_features(
         )
     if not bool(vllm_config.model_config.enforce_eager):
         if afd_config.is_attention_server:
-            raise RuntimeError(
-                "CAMAsyncAFDConnector supports only eager Attention execution"
-            )
-        requested_ffn_mode(vllm_config)
-        if not vllm_config.use_v2_model_runner:
-            raise RuntimeError("Async FFN FULL requires MRV2")
-        if parallel_config.tensor_parallel_size != 1:
-            raise RuntimeError("Async FFN FULL requires F TP=1")
+            validate_async_cam_attention_graph(vllm_config)
+        else:
+            requested_ffn_mode(vllm_config)
+            if not vllm_config.use_v2_model_runner:
+                raise RuntimeError("Async FFN FULL requires MRV2")
+            if parallel_config.tensor_parallel_size != 1:
+                raise RuntimeError("Async FFN FULL requires F TP=1")
     if bool(parallel_config.enable_dbo) or bool(parallel_config.use_ubatching):
         if not afd_config.is_attention_server:
             raise RuntimeError("Async CAM DBO/ubatching requires the Attention role")
@@ -208,26 +265,32 @@ def _fail_if_unsupported_npu_afd_async_features(
                 raise RuntimeError("AFD DSpark supports only DeepSeek-V4 on NPU")
             # The shared MRV2 validator owns PP/CP and static EP constraints.
             # Keep only the additional target/draft restrictions here.
-            # F may replay its expert transaction in FULL; Attention and native
-            # draft proposal execution stay eager.
+            # Both graphs use the native decode path. Draft capture is owned
+            # by native target capture, so draft-only graph mode is unsupported.
+            # F keeps its independent TP1 expert execution.
             if (
-                (
-                    afd_config.is_attention_server
-                    and not vllm_config.model_config.enforce_eager
+                speculative_config.draft_parallel_config.tensor_parallel_size
+                != parallel_config.tensor_parallel_size
+                or (
+                    afd_config.is_ffn_server
+                    and parallel_config.tensor_parallel_size != 1
                 )
-                or not speculative_config.enforce_eager
-                or parallel_config.tensor_parallel_size != 1
-                or speculative_config.draft_parallel_config.tensor_parallel_size != 1
             ):
                 raise RuntimeError(
-                    "AFD DSpark requires eager Attention/draft and target/draft TP=1"
+                    "AFD DSpark requires matching target/draft TP and F TP=1"
                 )
+            if (
+                afd_config.is_attention_server
+                and not speculative_config.enforce_eager
+                and vllm_config.model_config.enforce_eager
+            ):
+                raise RuntimeError("DSpark draft Graph requires target Attention graph")
         elif afd_config.is_attention_server and (
             speculative_config.use_eagle() or speculative_config.uses_draft_model()
         ):
             raise RuntimeError(
                 "CAMAsyncAFDConnector does not support native draft models or MTP; "
-                "only DSV4 DSpark eager is supported",
+                "only DSV4 DSpark is supported",
             )
 
     factor_value = os.environ.get("BATCH_SIZE_FACTOR", "1")

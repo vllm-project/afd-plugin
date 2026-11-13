@@ -57,7 +57,9 @@ def _runner(*, async_dp=False):
         async_dp=async_dp, num_attention_ranks=2, num_ffn_ranks=2
     )
     runner.connector = SimpleNamespace(
-        extra_info=SimpleNamespace(), attention_step=nullcontext
+        extra_info=SimpleNamespace(),
+        control_plane=None if async_dp else object(),
+        attention_step=nullcontext,
     )
     runner.cudagraph_manager = None
     runner.ubatch_runner = None
@@ -200,10 +202,11 @@ def test_mla_replay_updates_captured_stage_records_and_restores_context(
 
 @pytest.mark.parametrize("profile_only", [False, True])
 @pytest.mark.parametrize("raise_in_native", [False, True])
-def test_capture_forwards_new_inputs_and_restores(
-    monkeypatch, profile_only, raise_in_native
-):  # long-test: capture lifecycle
-    runner = _runner()
+@pytest.mark.parametrize("async_dp", [False, True])
+def test_capture_forwards_new_inputs_and_restores(  # long-test: capture lifecycle
+    monkeypatch, profile_only, raise_in_native, async_dp
+):
+    runner = _runner(async_dp=async_dp)
     descs = [
         cudagraph_utils.BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.FULL, num_reqs=1, num_tokens=8
@@ -311,9 +314,70 @@ def test_capture_forwards_new_inputs_and_restores(
     ]
     if not profile_only:
         expected_events.extend([(32, True, False), (32, False, True)])
-    assert events == expected_events
+    assert events == ([] if async_dp else expected_events)
     assert cudagraph_utils.prepare_inputs_to_capture is native_prepare
     assert original_prepare is not native_prepare
+
+
+@pytest.mark.parametrize("async_dp", [False, True])
+@pytest.mark.parametrize("fail_replay", [False, True])
+def test_replay_real_and_padded_metadata(  # long-test: native replay/context seam
+    monkeypatch, async_dp, fail_replay
+):
+    runner = _runner(async_dp=async_dp)
+    original_metadata = runner._afd_pending_metadata
+    runner._afd_transaction_counter = 0
+    runner.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+    runner.build_capture_dp_metadata = lambda tokens: tokens
+    sent = []
+    runner.send_dp_metadata = lambda tokens, _slices: sent.append(tokens)
+    emitted = []
+    desc = cudagraph_utils.BatchExecutionDescriptor(
+        CUDAGraphMode.FULL, num_tokens=8, num_reqs=8
+    )
+
+    def context():
+        return SimpleNamespace(
+            batch_descriptor=None,
+            attn_metadata={},
+            additional_kwargs={},
+            ubatch_slices=None,
+        )
+
+    class Manager:
+        def run_fullgraph(self, descriptor):
+            update_context = context()
+            runner.install_afd_metadata_on_forward_context(update_context)
+            emitted.append(update_context.additional_kwargs["afd_metadata"])
+            if fail_replay:
+                raise RuntimeError("native replay failed")
+            return "native-output"
+
+    runner.cudagraph_manager = Manager()
+
+    def native_execute(self, *args, **kwargs):
+        assert should_skip_dp_coordination() is async_dp
+        return self.cudagraph_manager.run_fullgraph(desc)
+
+    monkeypatch.setattr(NPUModelRunner, "execute_model", native_execute)
+    monkeypatch.setattr(npu_v2, "step_afd_npu_profiler", lambda _prof: None)
+    expected = (
+        pytest.raises(RuntimeError, match="native replay failed")
+        if fail_replay
+        else nullcontext()
+    )
+    with expected:
+        assert (
+            runner.execute_model(SimpleNamespace(total_num_scheduled_tokens=5))
+            == "native-output"
+        )
+    assert emitted[0].tokens_lens == [8]
+    assert emitted[0].tokens_unpadded_lens == [5]
+    assert sent == ([] if async_dp else [8])
+    following = context()
+    runner.install_afd_metadata_on_forward_context(following)
+    assert following.additional_kwargs["afd_metadata"] is original_metadata
+    assert not should_skip_dp_coordination()
 
 
 @pytest.mark.parametrize("num_tokens", [0, 1, 7])
@@ -644,7 +708,7 @@ def test_native_child_contexts_preserve_dp_and_own_ascend_kwargs(monkeypatch):
     assert result == contexts
     assert [ctx.dp_metadata for ctx in contexts] == dp
     assert contexts[1].attn_metadata is None
-    from afd_plugin.connectors.npu.camp2p import _get_group_ep
+    from afd_plugin.connectors.npu.camp2p.connector import _get_group_ep
 
     assert [
         _get_group_ep(getattr(ctx, "ubatch_idx", 0), "stage0", "stage1", "")

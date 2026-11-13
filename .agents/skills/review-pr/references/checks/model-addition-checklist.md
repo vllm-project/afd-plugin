@@ -45,7 +45,7 @@ skill; this checklist is the reviewer's evidence bar.
 - Docs: the relevant `docs/design/module/` page (model integration) and, for
   user-facing support, a user guide or guide section; the design-page
   registration table must gain the new row.
-- For NPU support: manual validation evidence per `docs/npu/TESTING.md`;
+- For NPU support: manual validation evidence per `tests/npu/README.md`;
   there is no NPU CI.
 
 A family missing any required piece is a P1 finding; state which piece and

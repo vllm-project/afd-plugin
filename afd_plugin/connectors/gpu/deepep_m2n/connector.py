@@ -9,11 +9,21 @@ experts; FFN ranks run their local experts on what they receive and send the
 weighted results back, where combine sums each token's top-k contributions.
 
 Topology:
-    One AFD world ordered ``[F0, F1, ..., A0, A1, ...]`` (as the P2P
-    connector). DeepEP sees it as a symmetric EP group in which FFN rank ``g``
+    One AFD role world ordered ``[F0, F1, ..., A0, A1, ...]`` (as the P2P
+    connector) for the handshake, the model checks and the control plane.
+    DeepEP sees the ranks as a symmetric EP group in which FFN rank ``g``
     owns real experts ``[g * E/F, (g + 1) * E/F)`` and Attention ranks own
     dummy expert slots (see ``layout.py``). Any Attention:FFN ratio works;
     ``num_experts`` must be divisible by the FFN rank count.
+
+Placement:
+    Every NVLink domain (on HGX, every pod) holds the same number of ranks,
+    and either the FFN ranks fill the first domains or every domain holds the
+    same number of FFN ranks, with FFN DP ranks rising in pod order (2 x 4A1F
+    is two pods of one FFN and four Attention ranks). The handshake derives
+    the transport's physical rank order from the ranks' NVLink domains
+    (``plan_transport_layout``) and picks afdEP-comm's FFN-prefix or
+    per-domain mode; nothing is configured.
 
 Data path (per MoE layer and stage, identical order on every rank):
     Attention: ``send_attn_output(h, ctx, topk_ids=, topk_weights=)``
@@ -88,7 +98,12 @@ from afd_plugin.connectors.gpu.deepep_m2n.experts import (
     DeepEPM2NExperts,
     ExpertBackend,
 )
-from afd_plugin.connectors.gpu.deepep_m2n.layout import DeepEPM2NLayout
+from afd_plugin.connectors.gpu.deepep_m2n.layout import (
+    DeepEPM2NLayout,
+    RankPlacement,
+    TransportLayout,
+    plan_transport_layout,
+)
 from afd_plugin.connectors.gpu.deepep_m2n.network import (
     NetworkConfig,
     NetworkPlan,
@@ -143,6 +158,9 @@ PROCESS_GROUP_NAME = "afd_deepep_m2n"
 # CPU (gloo) group for the handshake and DeepEP's communicator bootstrap,
 # created before any NCCL communicator so the network plan can still set NCCL_*.
 BOOTSTRAP_GROUP_NAME = "afd_deepep_m2n_bootstrap"
+# CPU (gloo) group in transport order for the lanes, created only when that
+# order differs from the role world (per-domain FFN placement).
+TRANSPORT_GROUP_NAME = "afd_deepep_m2n_transport"
 # FastAFD passes 120 s for both the CPU wait and the GPU spin timeouts.
 DEFAULT_TIMEOUT_S = 120
 # Only Attention rank 0 sends the per-step control payload.
@@ -433,6 +451,7 @@ class HandshakeResult:
     attn_tp_size: int
     capacity_tokens_per_rank: int
     bucket_ladder: tuple[int, ...]
+    transport: TransportLayout
 
 
 def expert_weight_format(quant_config: QuantizationConfig | None) -> str:
@@ -626,9 +645,26 @@ def validate_handshake(
         raise RuntimeError(
             f"Attention ranks disagree on bucket_ladder: {sorted(map(str, ladders))}"
         )
-    # Every rank evaluates the same plan on the same list.
+    # Every rank evaluates the same plans on the same list. The network plan
+    # sees the ranks in the transport order afdEP-comm will see.
+    topologies = [RankTopology.from_mapping(info["topology"]) for info in infos]
+    transport = plan_transport_layout(
+        [
+            RankPlacement(info["role"], info["role_rank"], topology.nvlink_domain)
+            for info, topology in zip(infos, topologies, strict=True)
+        ],
+        layout.ffn_size,
+    )
     plan = plan_network(
-        [RankTopology.from_mapping(info["topology"]) for info in infos], network
+        [
+            RankTopology(
+                world_rank=transport.transport_rank(info["role"], info["role_rank"]),
+                host=topology.host,
+                nvlink_domain=topology.nvlink_domain,
+            )
+            for info, topology in zip(infos, topologies, strict=True)
+        ],
+        network,
     )
     return HandshakeResult(
         expert_alignment=int(alignments.pop()),
@@ -636,6 +672,7 @@ def validate_handshake(
         attn_tp_size=attn_tp_size,
         capacity_tokens_per_rank=int(capacities.pop()),
         bucket_ladder=ladders.pop() or (),
+        transport=transport,
     )
 
 
@@ -962,6 +999,9 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self._timeout = timedelta(seconds=afd_config.afd_process_group_timeout_s)
         self.group: dist.ProcessGroup | None = None
         self.bootstrap_group: dist.ProcessGroup | None = None
+        # The lanes' group: the bootstrap group, or one in transport order.
+        self.transport_group: dist.ProcessGroup | None = None
+        self.transport: TransportLayout | None = None
         self.network_plan: NetworkPlan | None = None
         self.lanes: list[ElasticBuffer] = []
         self.lane_streams: list[torch.cuda.Stream] = []
@@ -1041,8 +1081,25 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self.attn_tp_size = result.attn_tp_size
         self.capacity_tokens_per_rank = result.capacity_tokens_per_rank
         self.bucket_ladder = result.bucket_ladder
+        self.transport = result.transport
+        if self.transport.is_identity:
+            self.transport_group = self.bootstrap_group
+        else:
+            # Transport rank 0 is FFN rank 0, the process that hosts the
+            # rendezvous store, so this group joins the same store.
+            self.transport_group = init_afd_process_group(
+                backend="gloo",
+                init_method=self._rendezvous,
+                world_size=self.layout.union_size,
+                rank=self.transport.transport_rank(
+                    self.afd_config.role, self.role_rank
+                ),
+                group_name=TRANSPORT_GROUP_NAME,
+                timeout=self._timeout,
+            )
         if self.world_rank == 0:
             logger.info("DeepEP M2N network plan: %s", self.network_plan.summary())
+            logger.info("DeepEP M2N transport: %s", self.transport.summary())
         # DeepEP reads both when each buffer is created: the GIN switch, and
         # with several lanes a communication stream per buffer.
         apply_gin_environment(self.network_plan)
@@ -1117,10 +1174,11 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
 
     def _new_lane(self) -> ElasticBuffer:
         """One lane's afdEP-comm transport."""
-        assert self.bootstrap_group is not None and self.network_plan is not None
+        assert self.transport_group is not None and self.transport is not None
+        assert self.network_plan is not None
         assert self.capacity_tokens_per_rank is not None
         return ElasticBuffer(
-            group=self.bootstrap_group,
+            group=self.transport_group,
             capacity_tokens_per_rank=self.capacity_tokens_per_rank,
             hidden_size=self.hidden_size,
             num_experts=self.layout.deepep_num_experts,
@@ -1132,8 +1190,10 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             rdma_traffic_class=self.network_plan.rdma_traffic_class,
             cpu_timeout_s=self.config.cpu_timeout_s,
             gpu_timeout_s=self.config.gpu_timeout_s,
-            # The DeepEP M2N layout puts FFN ranks first, as afdEP-comm expects.
+            # FFN ranks are transport ranks [0, F) (FFN prefix), or the first
+            # ``ffn_ranks_per_domain`` of every NVLink domain (per-domain mode).
             ffn_ranks=self.ffn_size,
+            ffn_ranks_per_domain=self.transport.ffn_ranks_per_domain,
         )
 
     def close(self) -> None:
@@ -1143,6 +1203,12 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         _CONNECTORS.pop(self._op_id, None)
         for lane in self.lanes:
             lane.destroy()
+        if (
+            self.transport_group is not None
+            and self.transport_group is not self.bootstrap_group
+        ):
+            dist.destroy_process_group(self.transport_group)
+        self.transport_group = None
         self.lanes = []
         self.lane_streams = []
         self._pending_combines.clear()
@@ -1157,8 +1223,9 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
 
     @property
     def domain(self) -> tuple[int, int]:
-        """DeepEP ``(scale-out ranks, scale-up ranks)``: nodes and GPUs per node
-        in hybrid mode, ``(1, world)`` when everything is in one NVLink domain."""
+        """DeepEP ``(scale-out ranks, scale-up ranks)``: NVLink domains and
+        ranks per domain in hybrid mode (2 x 4A1F: ``(2, 5)``), ``(1, world)``
+        when everything is in one NVLink domain."""
         self._check_initialized()
         return self.lanes[0].num_scaleout_ranks, self.lanes[0].num_scaleup_ranks
 

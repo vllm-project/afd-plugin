@@ -1,6 +1,6 @@
 ---
 name: deploy-afd-k8s
-description: Use when the user asks to deploy, serve, or stand up an AFD GPU recipe on Kubernetes/OpenShift from a recipe .sh script - creating the model PVC, recipe ConfigMap, serve pod(s), and Service(s), and waiting until the endpoint answers. Placement across pods is never asked for or assumed -- it is read directly off the recipe's own top-of-file comment block (however that block describes it, strict or prose): a recipe whose comment describes a per-pod placement deploys exactly that many pods with exactly that per-pod setup; a recipe without one deploys as a single pod. Do not use for local (non-k8s) serving, NPU recipes, prefill-decode disaggregation recipes, or E2E correctness testing (see run-e2e).
+description: Use when the user asks to deploy, serve, or stand up an AFD GPU recipe on Kubernetes/OpenShift from a recipe .sh script - creating the model PVC, recipe ConfigMap, serve pod(s), and Service(s), and waiting until the endpoint answers. Placement across pods is never asked for or assumed -- it is the recipe's LAYOUT (the caller's setting, else the script's default): one pod per LAYOUT entry, a one-entry LAYOUT being a single pod. Do not use for local (non-k8s) serving, NPU recipes, prefill-decode disaggregation recipes, or E2E correctness testing (see run-e2e).
 ---
 
 # Deploy an AFD GPU recipe on Kubernetes
@@ -15,13 +15,13 @@ On success this skill guarantees, in the target namespace:
 
 | | |
 |---|---|
-| Endpoint | `http://vllm-service:${CLIENT_PORT}` (OpenAI-compatible, in-namespace; `CLIENT_PORT` defaults to `18305`) |
+| Endpoint | `http://vllm-service:${CLIENT_PORT}` (OpenAI-compatible, in-namespace; `CLIENT_PORT` is the launcher's Attention port, `18000`) |
 | Serving | the model named by `MODEL_ID` |
-| Pod(s) / Service | `vllm-pod`, or one pod per pod the recipe's header comment describes (named `vllm-pod-<pod>`); Service `vllm-service`, labels `app=afd-recipe,role=serve` |
+| Pod(s) / Service | `vllm-pod`, or one pod per `LAYOUT` entry (named `vllm-pod-afd-<k>`); Service `vllm-service`, labels `app=afd-recipe,role=serve` |
 | Model cache | `PVC_NAME`, mounted at `/models`, `HF_HOME=/models/.hf_home` |
 | Left running | yes, deliberately -- so weights stay warm for follow-up runs; step 5 asks the caller when to delete the pods |
 
-Whenever a recipe's header spans more than one pod, two more internal-only
+Whenever a recipe's `LAYOUT` spans more than one pod, two more internal-only
 Services may also exist (`vllm-ffn-p2p-service` always; `vllm-attn-dp-service`
 and/or `vllm-ffn-dp-service` only if that role is itself split across more
 than one pod) -- callers never talk to these directly. See
@@ -29,22 +29,24 @@ than one pod) -- callers never talk to these directly. See
 
 ## Scope
 
-- Recipes under `recipe/gpu/P2pNcclAFDConnector/**` (GPU only, not NPU),
+- Recipes under `recipe/gpu/P2pNcclAFDConnector/**` or
+  `recipe/gpu/DeepEPM2NAFDConnector/**` (GPU only, not NPU; the M2N image
+  must contain afdEP-comm and DeepGEMM),
   **`prefill_decode_colocation` only** (attention + FFN workers, no prefill
   split).
   `prefill_decode_disaggregation` recipes are **out of scope**: they need a
   NIXL-enabled image plus a proxy, and resolve a `SCRIPT_DIR`-relative path
   that this skill's flat script mount (step 4b) breaks. Ask the user for a
   different workflow for disaggregation.
-- Recipes are hand-written shell scripts, not JSON configs -- there is no
-  generator step and no manifest to read.
-- A recipe is **placement-driven** (more than one pod) exactly when its
-  top-of-file comment block describes a per-pod placement -- read that
-  block, don't infer shape from flags. Today's recipes spell it as one
-  `# For pod N: POD=...` line per pod, but the comment isn't guaranteed to
-  use that exact grammar going forward. See
-  [resolve-recipe.md](resources/resolve-recipe.md).
-- Not for `tools/benchmarks/decode_bench_server.sh` (local, non-k8s).
+- Recipes are short shell scripts on the shared launcher
+  `recipe/gpu/common/afd_colocation.sh` (see `recipe/gpu/common/README.md`);
+  the recipe ConfigMap ships both files (step 4b).
+- Placement is `LAYOUT` (one pod per `<a>A<f>F` entry) and run-specific
+  settings are env (`ATTN_TP`, `FFN_TP`, `VLLM_ARGS`, `DECODE_BENCH`, ...);
+  see [resolve-recipe.md](resources/resolve-recipe.md). This skill only
+  serves; load for the decode-only benchmark
+  (`tools/benchmarks/request_generator.sh`) is run separately against the
+  endpoint.
 
 ## Requirements
 
@@ -61,9 +63,9 @@ than one pod) -- callers never talk to these directly. See
   docker push "$IMAGE"
   ```
 
-  The image supplies only the `afd-plugin` install. The recipe script is
-  mounted fresh from local disk on every run (step 4b), so editing or adding
-  a recipe never requires a rebuild.
+  The image supplies only the `afd-plugin` install. The recipe script and
+  the shared launcher are mounted fresh from local disk on every run (step
+  4b), so editing or adding a recipe never requires a rebuild.
 - An `hf-token-secret` Secret with a `token` key, needed when `MODEL_ID` is
   a HF Hub repo id (not needed when weights are already staged on the PVC):
   ```bash
@@ -79,7 +81,7 @@ exist **before** any Pod is deployed -- see
 
 | Resource | Covers |
 |---|---|
-| [resolve-recipe.md](resources/resolve-recipe.md) | Step 1 (the only step that parses the recipe): read the recipe's serve-block fields and model id; read its placement (or lack of one) from its header comment -- never ask; record `GPU_COUNT` per pod. |
+| [resolve-recipe.md](resources/resolve-recipe.md) | Step 1 (the only step that parses the recipe): model id, the `LAYOUT` plan (never ask), `GPU_COUNT` per pod, and the launcher's ports. |
 | [deploy.md](resources/deploy.md) | Steps 2-4f: take step 1's `GPU_COUNT`, confirm, PVC, ConfigMap, fsGroup, Services (step 4d -- which of the four, see [services.md](resources/services.md)), pod(s) via `templates/pod.yaml`, wait for Running and then for each pod's `Ready` condition. |
 | [report-and-teardown.md](resources/report-and-teardown.md) | Step 5: report the endpoint/model/nodes and ask when to delete the running pods. Step 6: teardown when the caller says so (pods/Services only -- never the PVC unless asked). |
 

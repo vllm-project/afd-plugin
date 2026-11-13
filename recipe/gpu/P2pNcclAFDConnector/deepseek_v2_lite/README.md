@@ -3,7 +3,7 @@
 End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
 (Attention-FFN Disaggregation) plugin targeting vLLM `v0.32.0`. These are
 deployment examples, not v0.32 recipe validation. See the
-[runtime matrix](../../../../docs/design/module/execution_platforms.md#tested-runtime-matrix)
+[runtime matrix](../../../../docs/support.md#tested-runtime-matrix)
 for tested E2E configurations.
 
 > [!NOTE]
@@ -14,18 +14,18 @@ for tested E2E configurations.
 ## Prerequisites
 
 - Install [NIXL](https://github.com/ai-dynamo/nixl).
-- Four GPUs for the `2a2f_*` and `2p1a1f_*` examples; the `4a4f_*`
-  examples require eight GPUs. The multipod example uses two GPUs per pod
-  across two pods.
+- Four GPUs for the default `2A2F` colocation layout and the `2p1a1f_*`
+  examples; `LAYOUT=4A4F` needs eight GPUs, and `LAYOUT=2A0F,0A2F` two GPUs
+  on each of two pods.
 - vLLM `v0.32.0` and the `afd-plugin` package installed in the same
   environment (see repository root `AGENTS.md`).
 - DeepSeek-V2-Lite weights on disk. Colocation scripts default to
   `/path/model_weights/DeepSeek-V2-Lite`; disaggregation scripts default to
   `/home/models/hub/models--deepseek-ai--DeepSeek-V2-Lite/snapshots/604d5664dddd88a0433dbae533b7fe9472482de0`.
   Set `MODEL_PATH=...` to the local weights when launching.
-- A free TCP port `6269` on `127.0.0.1` for the AFD p2p connector, and
-  HTTP ports `18305` and `18306` for local colocation, or
-  `18301`–`18305` for prefill/decode disaggregation.
+- Free ports `6239` (AFD rendezvous), `18000` and `18001` (Attention and
+  FFN HTTP) for colocation, or `18301`–`18305` and `6269` for
+  prefill/decode disaggregation.
 
 ## Directory layout
 
@@ -34,14 +34,14 @@ for tested E2E configurations.
 ├── prefill_decode_disaggregation/        # prefill_decode_disaggregation, 2P1A1F topology
 │   ├── 2p1a1f_eager_dbo.sh
 │   └── 2p1a1f_graph_dbo.sh
-└── prefill_decode_colocation/             # prefill_decode_colocation, 2A2F/4A4F topology
-    ├── 2a2f_eager_dbo_dp1tp2.sh
-    ├── 2a2f_eager_dbo_dp2tp1.sh
-    ├── 2a2f_graph_dbo_dp1tp2.sh
-    ├── 2a2f_graph_dbo_dp2tp1.sh
-    ├── 4a4f_eager_dbo_dp2tp2.sh
-    ├── 4a4f_graph_dbo_dp2tp2.sh
-    └── multipod_2a_2f_graph_dbo_dp1tp2.sh  # 2a2f_graph_dbo_dp1tp2, split across 2 k8s pods
+└── prefill_decode_colocation/             # any LAYOUT, ATTN_TP, FFN_TP
+    ├── 2a2f_eager_dbo_dp2tp1.sh           # 2A2F, eager + DBO, DP2/TP1
+    ├── 2a2f_graph_dbo_dp2tp1.sh           # 2A2F, graph + DBO, DP2/TP1
+    ├── 2a2f_eager_dbo_dp1tp2.sh           # 2A2F, eager + DBO, DP1/TP2
+    ├── 2a2f_graph_dbo_dp1tp2.sh           # 2A2F, graph + DBO, DP1/TP2
+    ├── 4a4f_eager_dbo_dp2tp2.sh           # 4A4F, eager + DBO, DP2/TP2
+    ├── 4a4f_graph_dbo_dp2tp2.sh           # 4A4F, graph + DBO, DP2/TP2
+    └── multipod_2a_2f_graph_dbo_dp1tp2.sh # 2A0F,0A2F, graph + DBO, DP1/TP2
 ```
 
 ### 1. Prefill/Decode Disaggregation — `1a1f`
@@ -58,31 +58,17 @@ for tested E2E configurations.
 
 ### 2. Prefill/Decode Colocation — `2a2f`
 
-2 processes, two GPUs each:
+The colocation recipes run on the shared
+[colocation launcher](../../common/README.md): `LAYOUT` places the ranks and
+each script names its default DP/TP shape (FFN first, Attention second, and
+Attention HTTP port 18000):
 
-| GPUs | Role      | Port  |
-|------|-----------|-------|
-| 0, 1 | Attention | 18305 |
-| 2, 3 | FFN       | 18306 |
-
-The four `2a2f_*` variants cover the TP/DP cross product; `4a4f_*` doubles
-both attention and FFN ranks (DP=2 on each side); `multipod_2a_2f_graph_dbo_dp1tp2.sh`
-is the same `2a2f_graph_dbo_dp1tp2` config, but gated on a `POD` env var
-(`ATTENTION_0` or `FFN_0`) for the `deploy-afd-k8s` skill to deploy it
-across 2 pods (see repo-root `recipe/gpu/P2pNcclAFDConnector/README.md`);
-its Attention and FFN HTTP ports can both be 18305 because they are in
-separate pods --
-unlike the scripts above, it is **not** meant to be run directly: with
-`POD` unset, neither `vllm serve` block executes, and its
-`AFD_CONNECTOR_HOST` default (`vllm-ffn-p2p-service`) only resolves inside
-the cluster the skill deploys it to:
-
-| File                                  | DP | TP |
-|---------------------------------------|----|----|
-| `2a2f_*_dp1tp2.sh`                    | 1  | 2  |
-| `2a2f_*_dp2tp1.sh`                    | 2  | 1  |
-| `4a4f_*_dp2tp2.sh`                    | 2  | 2  |
-| `multipod_2a_2f_graph_dbo_dp1tp2.sh`  | 1  | 2  |
+| Script suffix | Attention / FFN | GPUs |
+| --- | --- | --- |
+| `2a2f_*_dp2tp1` | DP2 x TP1 each | 4 |
+| `2a2f_*_dp1tp2` | DP1 x TP2 each | 4 |
+| `4a4f_*_dp2tp2` | DP2 x TP2 each | 8 |
+| `multipod_2a_2f_*_dp1tp2` | DP1 x TP2 each, one pod per role | 2 + 2 |
 
 ## Running
 
@@ -96,7 +82,6 @@ before sending traffic.
 
 ```bash
 export MODEL_PATH=/path/model_weights/DeepSeek-V2-Lite
-export VLLM_USE_V2_MODEL_RUNNER=1
 bash recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_colocation/2a2f_graph_dbo_dp1tp2.sh
 ```
 
@@ -122,7 +107,8 @@ bash tools/benchmarks/request_generator.sh
 The script runs `vllm bench serve`; it does not wait for readiness or send a
 separate smoke request. By default it sends 1024 random requests (1024 input
 tokens / 128 output tokens) at request rate 5 with `--max-concurrency 32`
-against `127.0.0.1:18305`, and saves the JSON result to
+against `127.0.0.1:18000` (the colocation Attention port; set `PORT=18305`
+for the disaggregation proxy), and saves the JSON result to
 `$RESULT_DIR/$RESULT_FILENAME`. Override `HOST`, `PORT`, `MODEL_PATH`,
 `NUM_PROMPTS`, `REQUEST_RATE`, `MAX_CONCURRENCY`, `INPUT_LEN`, and `OUTPUT_LEN`
 for smaller smoke runs or larger throughput sweeps.
@@ -130,7 +116,9 @@ for smaller smoke runs or larger throughput sweeps.
 ## Common AFD configuration
 
 Every AFD worker is wired through `--additional-config` with the same
-shape; `role` differs between attention and FFN:
+shape; `role` differs between attention and FFN. The colocation launcher
+builds it from `LAYOUT` (the disaggregation scripts write it inline, on port
+6269); print it with `AFD_DRY_RUN=1`:
 
 ```jsonc
 {
@@ -138,9 +126,11 @@ shape; `role` differs between attention and FFN:
     "role": "attention",            // or "ffn"
     "connector": "P2pNcclAFDConnector",
     "host": "127.0.0.1",
-    "port": 6269,
-    "num_attention_ranks": 1,      // 2 in 2A2F
-    "num_ffn_ranks": 1             // 2 in 2A2F
+    "port": 6239,
+    "num_attention_ranks": 2,       // Attention GPUs in LAYOUT
+    "num_ffn_ranks": 2,             // FFN GPUs in LAYOUT
+    "compute_gate_on_attention": false,
+    "afd_process_group_timeout_s": 3600
   }
 }
 ```
@@ -150,16 +140,7 @@ DBO (Dual Batch Overlap) is turned on for all examples with
 These threshold values are example defaults; tune them for the actual workload
 and deployment configuration.
 
-### Switching eager → graph
-
-Graph mode replaces `--enforce-eager` with:
-
-```bash
---max-cudagraph-capture-size 64
---compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY",
-                       "cudagraph_capture_sizes":[64]}'
-```
-
-The capture size of `64` is an example value; adjust
-`--max-cudagraph-capture-size` and `cudagraph_capture_sizes` together based on
-the actual batch sizes and available GPU memory.
+The `graph_dbo` recipes capture `FULL_DECODE_ONLY` CUDA graphs of size `64`
+(`CUDAGRAPH_CAPTURE_SIZES=64`); the `eager_dbo` recipes run
+`--enforce-eager`. Adjust
+`CUDAGRAPH_CAPTURE_SIZES` to the actual batch sizes and available GPU memory.

@@ -31,7 +31,7 @@ from afd_plugin.connectors.metadata import (  # noqa: E402
     AFDTransferMetadata,
 )
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector  # noqa: E402
-from afd_plugin.ffn_faas.platforms.npu.v4_model import (  # noqa: E402
+from afd_plugin.ffn_faas.platforms.ffn_model.deepseek_v4.npu.v4_model import (  # noqa: E402
     V4CheckpointDescription,
 )
 

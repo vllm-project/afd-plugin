@@ -24,28 +24,28 @@ CLIENT_PORT="$CLIENT_PORT" envsubst '${CLIENT_PORT}' \
 
 Internal only, carries AFD rendezvous traffic to whichever pod holds
 `afd-ffn-node-role: head`. Must exist before any multi-pod deploy, since the
-recipe's own `AFD_CONNECTOR_HOST` default now points at this name directly.
-Traffic to a headless Service goes straight to the pod IP, and there's one
-rendezvous port, so a single static port entry is enough -- read
-`AFD_CONNECTOR_PORT` off the recipe's own shell default:
+launcher's default rendezvous host points at this name directly. Traffic to
+a headless Service goes straight to the pod IP, and there's one rendezvous
+port, so a single static port entry is enough (`AFD_CONNECTOR_PORT` from
+[resolve-recipe.md](resolve-recipe.md#launcher-ports)):
 
 ```bash
-AFD_CONNECTOR_PORT="$(grep -oE 'AFD_CONNECTOR_PORT:-[0-9]+' "$RECIPE_SCRIPT_PATH" | grep -oE '[0-9]+')"
-AFD_CONNECTOR_PORT="$AFD_CONNECTOR_PORT" envsubst '${AFD_CONNECTOR_PORT}' \
+AFD_CONNECTOR_PORT="${AFD_CONNECTOR_PORT}" envsubst '${AFD_CONNECTOR_PORT}' \
   < templates/service-ffn-p2p.yaml | kubectl apply -f -
 ```
 
 ## `vllm-attn-dp-service` / `vllm-ffn-dp-service` -- iff that role is split
 
-Only when **more than one** plan entry's `POD` carries the same role (i.e.
-that role is split across pods, not just placed in its own single pod).
-Carries that role's DP-RPC coordination traffic to its head pod. One per
-split role, generic over role via `templates/service-dp-coord.yaml`:
+Only when **more than one** `LAYOUT` entry has GPUs of that role (both
+roles in `1A1F,1A1F`, Attention in `2A0F,2A0F,0A2F`, neither in
+`2A0F,0A2F`). Carries that role's DP-RPC coordination traffic to its head
+pod. One per split role, generic over role via
+`templates/service-dp-coord.yaml`:
 
 ```bash
-TEMPLATE_ROLE=attn
-TEMPLATE_PORT="$(grep -oE 'ATTENTION_DP_RPC_PORT:-[0-9]+' "$RECIPE_SCRIPT_PATH" | grep -oE '[0-9]+')"
-TEMPLATE_ROLE="$TEMPLATE_ROLE" TEMPLATE_PORT="$TEMPLATE_PORT" \
+TEMPLATE_ROLE=attn TEMPLATE_PORT="${ATTN_DP_RPC_PORT}" \
+  envsubst '${TEMPLATE_ROLE} ${TEMPLATE_PORT}' < templates/service-dp-coord.yaml | kubectl apply -f -
+TEMPLATE_ROLE=ffn TEMPLATE_PORT="${FFN_DP_RPC_PORT}" \
   envsubst '${TEMPLATE_ROLE} ${TEMPLATE_PORT}' < templates/service-dp-coord.yaml | kubectl apply -f -
 ```
 

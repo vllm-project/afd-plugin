@@ -18,7 +18,6 @@ To split a scenario's ranks across multiple pods/nodes on a Kubernetes
 cluster instead of running single-process, see
 `resources/k8-multi-pod.md`.
 
-Each suite contains four gate scenarios:
 DeepSeek-V2-Lite on GPU has seven gate scenarios:
 
 - `baseline-graph`
@@ -154,7 +153,7 @@ For Qwen3 MoE on GPU, run:
 
 ~~~bash
 python -m pytest -q -s \
-  tests/e2e/models/qwen3_moe/test_qwen3_moe.py
+  tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe
 ~~~
 
 For Qwen3.6 MoE on CUDA, run:
@@ -192,8 +191,13 @@ On cancellation, forward SIGTERM and allow over 90 seconds for cleanup.
 Success means all selected cases pass with zero skips: seven for the GPU
 DeepSeek gate; four for the NPU DeepSeek gate or GPU Qwen3 MoE suite;
 three for the GPU Qwen3.6 MoE suite.
-The entire DeepSeek module includes local cases and collects 12 on GPU or
-seven on NPU. Report the actual selected count, failed scenario, first
+The DeepSeek P2P entry collects 13 cases on GPU or seven on NPU. Its separate
+DeepEP M2N entry adds five GPU-only IDs even to an unfiltered NPU collection;
+select the intended entry or node IDs rather than running an unfiltered module.
+GPU multi-pod entries now invoke the model module's `multi-pod` subcommand;
+follow the linked Kubernetes walkthrough for local checkpoint paths, per-pod
+acceptance records and the existing workload-only evidence scope.
+Report the actual selected count, failed scenario, first
 actionable error, and cleanup status. Any skip is a gate failure.
 
 ## Environment reference

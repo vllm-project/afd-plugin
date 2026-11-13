@@ -238,6 +238,22 @@ def _use_installed_patch(binding, symbol, marker_name, install):
             id="fullgraph-replay",
         ),
         pytest.param(
+            "vllm.v1.worker.gpu.spec_decode.dflash.cudagraph",
+            None,
+            "_prepare_dflash_inputs_to_capture",
+            None,
+            "npu-draft-capture",
+            id="npu-draft-capture",
+        ),
+        pytest.param(
+            "vllm_ascend.worker.v2.spec_decode.dflash.aclgraph",
+            "DFlashAclGraphManager",
+            "run_fullgraph",
+            None,
+            "npu-draft-replay",
+            id="npu-draft-replay",
+        ),
+        pytest.param(
             "vllm_ascend.ascend_config",
             None,
             "init_ascend_config",
@@ -352,6 +368,26 @@ def test_patch_preserves_upstream_signature(
 
         tracker = adapter._AFDCaptureEventTracker([])
         scope = adapter._use_afd_capture_input_preparation(None, tracker)
+    elif scope_name in {"npu-draft-capture", "npu-draft-replay"}:
+        from vllm.config import CUDAGraphMode
+
+        from afd_plugin.v1.worker.npu import dspark_graph as adapter
+
+        if scope_name == "npu-draft-capture":
+            runner = SimpleNamespace(
+                speculative_config=SimpleNamespace(enforce_eager=True),
+                _afd_is_graph_capturing=False,
+                _afd_is_graph_replaying=False,
+            )
+            manager = SimpleNamespace(
+                _capture_descs={CUDAGraphMode.FULL: []},
+                _max_full_descs_to_capture=None,
+            )
+            scope = adapter.use_afd_draft_capture(runner, manager)
+        else:
+            native_class = getattr(target, owner)
+            binding = native_class.__new__(native_class)
+            scope = adapter.use_afd_draft_replay(SimpleNamespace(), binding, 1)
     elif scope_name == "camp2p-dispatch":
         from afd_plugin.v1.worker.npu import attention_model_runner_v2 as adapter
 

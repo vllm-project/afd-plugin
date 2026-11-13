@@ -8,14 +8,14 @@ import json
 
 import pytest
 
+from afd_plugin.ffn_faas.platforms.ffn_model.deepseek_v4.npu.v4_model import (
+    V4CheckpointDescription,
+    V4ModelAdapter,
+)
 from afd_plugin.ffn_faas.platforms.npu import get_model
 from afd_plugin.ffn_faas.platforms.npu.environment import AscendFFNEnvironment
 from afd_plugin.ffn_faas.platforms.npu.settings import (
     FFNConfig,
-)
-from afd_plugin.ffn_faas.platforms.npu.v4_model import (
-    V4CheckpointDescription,
-    V4ModelAdapter,
 )
 from tests.unit.fakes.vllm_config import npu_vllm_config
 
