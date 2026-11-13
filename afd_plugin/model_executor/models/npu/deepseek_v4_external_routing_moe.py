@@ -13,14 +13,22 @@ The AFD prepare/finalize subclasses are selected through AFD comm implementation
 that only override the factory method, so ordinary execution keeps the upstream
 classes. The MoE component owns the per-token state that expert execution reads
 back, and clears it on both success and failure.
+
+MC2 gets a second seam for the same reason: when the transport carried a
+quantized activation, the scale it carried has to reach the dispatch operator
+instead of being replaced by a scale computed here. The dispatcher subclass
+changes only the two kwargs that describe the activation.
 """
 
 from __future__ import annotations
+
+from typing import Any, Final
 
 import torch
 import torch.nn as nn
 from vllm.distributed.parallel_state import get_pcp_group
 from vllm_ascend.ops.fused_moe.dataclass.prepare_finalize import MoEPrepareOutput
+from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import MoETokenDispatchInput
 from vllm_ascend.ops.fused_moe.moe_comm_method import (
     AllGatherCommImpl,
     MC2CommImpl,
@@ -29,11 +37,19 @@ from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalizeWithAllGather,
     PrepareAndFinalizeWithMC2,
 )
+from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithMC2
 from vllm_ascend.quantization.quant_type import QuantType
 
 from afd_plugin.connectors.npu.camp2p.external_routing import (
     AFDExternalRoutingInputs,
 )
+
+#: Quant mode that tells the MC2 dispatch operator the activation is already
+#: quantized and its scale arrives with it. The historical operator smoke
+#: recorded this number for the pre-quantized path (CANN documents
+#: `dynamicScalesOut` only for this branch); the current build is not verified
+#: here. Every other path leaves the mode to upstream.
+_MC2_PREQUANT_QUANT_MODE: Final[int] = 0
 
 
 class AFDPrepareAndFinalizeWithAllGather(PrepareAndFinalizeWithAllGather):
@@ -208,11 +224,84 @@ class AFDAllGatherCommImpl(AllGatherCommImpl):
         return AFDPrepareAndFinalizeWithAllGather(self.moe_config)
 
 
+def _require_prequant_dispatch_contract(
+    token_dispatch_input: MoETokenDispatchInput,
+    scale: torch.Tensor,
+) -> None:
+    """Reject a scale that does not describe the activation being dispatched.
+
+    Only the combination the device smoke established is accepted. A scale with a
+    different shape or dtype would otherwise reach the operator and surface as a
+    shape error inside it, or as silently wrong values.
+    """
+    problems: list[str] = []
+    if not token_dispatch_input.quant.is_mxfp:
+        problems.append(
+            f"got is_mxfp={token_dispatch_input.quant.is_mxfp}",
+        )
+    if scale.dim() != 2:
+        problems.append(f"got scale dim {scale.dim()}")
+    if scale.dtype is not torch.float8_e8m0fnu:
+        problems.append(f"got scale dtype {scale.dtype}")
+    if token_dispatch_input.hidden_states.dtype is not torch.float8_e4m3fn:
+        problems.append(
+            f"got activation dtype {token_dispatch_input.hidden_states.dtype}",
+        )
+    if problems:
+        raise RuntimeError(
+            "AFD MC2 pre-quantized dispatch expects an MXFP quant feature, an E4M3 "
+            "activation and a two-dimensional E8M0 scale; " + "; ".join(problems),
+        )
+
+
+class AFDTokenDispatcherWithMC2(TokenDispatcherWithMC2):
+    """MC2 dispatcher that accepts an already-quantized activation.
+
+    When the Attention side quantized the activation it also sent its E8M0 MX
+    scale, which prepare publishes as the routing's ``pertoken_scale``.
+    Upstream's dispatch kwargs hardcode ``scales=None`` and resolve the quant mode
+    as if this rank still had to quantize, so the transported scale would be
+    dropped and the operator would quantize a tensor that already is quantized.
+
+    Only a routing that carries a scale changes the two kwargs that describe the
+    activation; upstream builds every other field.
+    """
+
+    def get_dispatch_mc2_kwargs(
+        self,
+        token_dispatch_input: MoETokenDispatchInput,
+    ) -> dict[str, Any]:
+        kwargs = super().get_dispatch_mc2_kwargs(token_dispatch_input)
+        scale = token_dispatch_input.routing.pertoken_scale
+        if scale is None:
+            return kwargs
+        # An explicit communication quant mode that disagrees is a configuration
+        # conflict, not something to overrule silently: the caller asked for one
+        # quantisation scheme while the routing carries another.
+        comm_quant_mode = token_dispatch_input.quant.comm_quant_mode
+        if (
+            comm_quant_mode is not None
+            and int(comm_quant_mode) != _MC2_PREQUANT_QUANT_MODE
+        ):
+            raise RuntimeError(
+                "AFD MC2 pre-quantized dispatch: comm_quant_mode="
+                f"{comm_quant_mode} conflicts with a pre-quantized activation, "
+                f"which requires quant_mode={_MC2_PREQUANT_QUANT_MODE}",
+            )
+        _require_prequant_dispatch_contract(token_dispatch_input, scale)
+        kwargs["scales"] = scale
+        kwargs["quant_mode"] = _MC2_PREQUANT_QUANT_MODE
+        return kwargs
+
+
 class AFDMC2CommImpl(MC2CommImpl):
     """MC2 comm that prepares external routing instead of computing it."""
 
     def _get_prepare_finalize(self) -> AFDPrepareAndFinalizeWithMC2:
         return AFDPrepareAndFinalizeWithMC2(self.moe_config)
+
+    def _get_token_dispatcher(self) -> AFDTokenDispatcherWithMC2:
+        return AFDTokenDispatcherWithMC2()
 
 
 # Native comm types the external-routing FFN path supports, and the AFD
@@ -259,6 +348,39 @@ def _prebuilt_comms(moe_config) -> dict[type, object]:
     return candidates
 
 
+def _require_activation_scale_pair(
+    hidden_states: torch.Tensor,
+    activation_scale: torch.Tensor | None,
+) -> None:
+    """Refuse anything but a matching E4M3 activation and E8M0 scale pair.
+
+    The activation and its scale are a pair or nothing. A quantized activation
+    without its scale cannot be interpreted, and a scale next to a model-dtype
+    activation would make the MoE skip quantizing a tensor that still needs it.
+
+    Only the target format is accepted. E5M2 would take the same route while the
+    weight path is defined for E4M3.
+    """
+    if activation_scale is None:
+        if hidden_states.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            raise RuntimeError(
+                "DSV4 external routing received a quantized activation without its "
+                f"MX scale; got activation={hidden_states.dtype}",
+            )
+        return
+    if hidden_states.dtype is not torch.float8_e4m3fn:
+        raise RuntimeError(
+            "DSV4 external routing expects an E4M3 activation for the MXFP8 "
+            f"pass-through; got {hidden_states.dtype}",
+        )
+    if activation_scale.shape[0] != hidden_states.shape[0]:
+        raise RuntimeError(
+            "DSV4 external routing needs one scale row per activation row; got "
+            f"{activation_scale.shape[0]} scale rows for "
+            f"{hidden_states.shape[0]} activation rows",
+        )
+
+
 class AFDExternalRoutingMoE:
     """Run the routed experts on routing supplied by the Attention side.
 
@@ -303,8 +425,14 @@ class AFDExternalRoutingMoE:
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        activation_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+        from vllm_ascend.ops.fused_moe.moe_utils import (
+            maybe_normalize_mxfp_scale_layout,
+        )
+
+        _require_activation_scale_pair(hidden_states, activation_scale)
 
         experts = self.routed_experts
         previous_comm = _EXTRA_CTX.moe_comm_method
@@ -320,12 +448,34 @@ class AFDExternalRoutingMoE:
                 AFDExternalRoutingInputs(
                     topk_ids=topk_ids,
                     topk_weights=topk_weights,
+                    scale=activation_scale,
                 ),
                 router_logits=None,
                 replace_allreduce=experts.moe_config.is_sequence_parallel,
                 quant_type=experts.quant_type,
             )
-            experts.ascend_pertoken_scale = prepare_output.pertoken_scale
+            # The scale comes back on the aligned routing rather than on the prepare
+            # output: prepare does not quantize, so ``pertoken_scale`` stays None
+            # while the transported scale follows the activation through padding,
+            # gathering and sharding.
+            #
+            # What consumes it fixes the layout, and the paths do not agree:
+            #
+            #   ALLGATHER  the fused GMM wants ``(rows, cols // 2, 2)``, which is
+            #              what the quant method would have produced had it
+            #              quantized here.
+            #   MC2        the dispatcher's pre-quantized contract takes the scale
+            #              two-dimensionally, so normalising here would hand it the
+            #              wrong shape.
+            #   BF16       no scale at all.
+            #
+            # The condition names ALLGATHER rather than testing for "not MC2": a
+            # path added later should have to state its layout instead of
+            # inheriting one.
+            pertoken_scale = aligned.scale
+            if pertoken_scale is not None and isinstance(comm, AllGatherCommImpl):
+                pertoken_scale = maybe_normalize_mxfp_scale_layout(pertoken_scale)
+            experts.ascend_pertoken_scale = pertoken_scale
             experts.ascend_mc2_mask = prepare_output.mc2_mask
             try:
                 fused = experts.quant_method.apply(

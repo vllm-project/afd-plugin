@@ -556,6 +556,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         group_list: torch.Tensor | None = None,
         topk_ids: torch.Tensor | None = None,
         topk_weights: torch.Tensor | None = None,
+        activation_scale: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor:
         if not isinstance(self.mlp, native.DeepseekV4MoE):
@@ -586,6 +587,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 hidden_states,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
+                activation_scale=activation_scale,
             )
 
         # The async CAM FFN runs through the layered executor upstream; this method
@@ -606,6 +608,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         *,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        activation_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the FFN on routing the Attention side computed.
 
@@ -634,6 +637,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
+            activation_scale=activation_scale,
         )
 
 

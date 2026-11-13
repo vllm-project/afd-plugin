@@ -201,6 +201,7 @@ def test_camp2p_opaque_send_uses_current_stage_padding(
             int(with_input_ids),
             ids,
             scales,
+            camp2p_module.A2E_QUANT_MODE_BF16,
         )
         wire = sent[-1][0]
         assert wire.shape == (physical, 16)
@@ -340,6 +341,20 @@ def test_camp2p_init_scopes_fresh_options_to_each_hccl_group(
     monkeypatch.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
     monkeypatch.setattr(camp2p_module, "ensure_cam_p2p_ops_available", lambda: None)
     monkeypatch.setattr(camp2p_module, "_register_camp2p_custom_ops", lambda: None)
+
+    # The group handshake is not what this test is about, and its collective
+    # cannot take the SimpleNamespace stand-ins as a process group.
+    def fake_all_gather(output, local, group=None):
+        # The handshake reads the gathered rows back, so the stand-in publishes
+        # the whole local vector for every rank instead of leaving the output
+        # uninitialised. It must work for the flat buffer too.
+        output.view(-1, local.numel()).copy_(local)
+
+    monkeypatch.setattr(
+        camp2p_module.torch.distributed,
+        "all_gather_into_tensor",
+        fake_all_gather,
+    )
 
     def fake_init_afd_process_group(**kwargs):
         calls.append(kwargs)

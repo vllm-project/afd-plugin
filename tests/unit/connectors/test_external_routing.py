@@ -135,3 +135,90 @@ def test_non_float_weights_are_rejected(inputs_type):
             topk_ids=torch.zeros(2, 2, dtype=torch.int32),
             topk_weights=torch.zeros(2, 2, dtype=torch.int32),
         )
+
+
+def _scale(rows: int, blocks: int, rank: int = 0):
+    """Distinct byte per rank and row, so a row mixed up by a transform shows."""
+
+    values = torch.arange(rank * 100, rank * 100 + rows * blocks, dtype=torch.uint8)
+    return values.reshape(rows, blocks).view(torch.float8_e8m0fnu)
+
+
+def _scale_bytes(scale):
+    return scale.view(torch.uint8).tolist()
+
+
+def test_scale_gathers_in_rank_order(inputs_type):
+    """Each rank contributes its own bytes, so an ordering bug is visible."""
+
+    left = inputs_type(
+        topk_ids=torch.zeros(2, _TOP_K, dtype=torch.int32),
+        topk_weights=torch.ones(2, _TOP_K),
+        scale=_scale(2, 2, rank=1),
+    )
+    right = inputs_type(
+        topk_ids=torch.zeros(2, _TOP_K, dtype=torch.int32),
+        topk_weights=torch.ones(2, _TOP_K),
+        scale=_scale(2, 2, rank=2),
+    )
+
+    # The collective is applied once per tensor, so the fake has to answer for the
+    # ids, the weights and the scale separately; only the scale assertion matters.
+    def gather(tensor):
+        # Every tensor the payload gathers has to grow by the same row count, or the
+        # rebuilt payload would pair rows with another rank's tokens. E8M0 is
+        # rejected on purpose: the payload has to move the exponent bytes.
+        if tensor.dtype == torch.float8_e8m0fnu:
+            raise AssertionError("the collective received the E8M0 dtype")
+        if tensor.shape[1] == right.scale.shape[1] and tensor.dtype == torch.uint8:
+            return torch.cat([tensor, right.scale.view(torch.uint8)], dim=0)
+        return torch.cat([tensor, tensor], dim=0)
+
+    gathered = left.gathered(gather)
+    assert _scale_bytes(gathered.scale) == _scale_bytes(
+        _scale(2, 2, rank=1)
+    ) + _scale_bytes(_scale(2, 2, rank=2))
+
+
+def test_scale_takes_the_same_split_as_the_activation(inputs_type):
+    routing = inputs_type(
+        topk_ids=torch.zeros(4, _TOP_K, dtype=torch.int32),
+        topk_weights=torch.ones(4, _TOP_K),
+        scale=_scale(4, 2),
+    )
+
+    def take_second_rank(tensor):
+        if tensor.dtype == torch.float8_e8m0fnu:
+            raise AssertionError("the split received the E8M0 dtype")
+        return torch.tensor_split(tensor, 2, dim=0)[1]
+
+    split = routing.split_rows(take_second_rank)
+    assert _scale_bytes(split.scale) == _scale_bytes(_scale(4, 2))[2:]
+
+
+def test_a_payload_without_a_scale_keeps_none(inputs_type):
+    routing = inputs_type(
+        topk_ids=torch.zeros(2, _TOP_K, dtype=torch.int32),
+        topk_weights=torch.ones(2, _TOP_K),
+    )
+    assert routing.padded(1).scale is None
+    assert routing.gathered(lambda tensor: tensor).scale is None
+    assert routing.split_rows(lambda tensor: tensor).scale is None
+
+
+def test_scale_rows_must_match_the_token_rows(inputs_type):
+    with pytest.raises(ValueError, match="one row per token"):
+        inputs_type(
+            topk_ids=torch.zeros(3, _TOP_K, dtype=torch.int32),
+            topk_weights=torch.ones(3, _TOP_K),
+            scale=_scale(2, 2),
+        )
+
+
+def test_scale_dtype_must_be_e8m0(inputs_type):
+    with pytest.raises(ValueError, match="E8M0"):
+        inputs_type(
+            topk_ids=torch.zeros(2, _TOP_K, dtype=torch.int32),
+            topk_weights=torch.ones(2, _TOP_K),
+            scale=torch.ones(2, 2, dtype=torch.float32),
+        )

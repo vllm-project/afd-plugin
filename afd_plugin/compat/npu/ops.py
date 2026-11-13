@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Final
 
 AFD_ASCEND_OPS_NAMESPACE = "afd_ascend"
 AFD_ASCEND_VENDOR_NAME = "afd-plugin"
@@ -58,6 +59,71 @@ def _assert_afd_namespace_registered(torch: object) -> None:
     ops = vars(torch)["ops"]
     _ = ops.afd_ascend.a2e
     _ = ops.afd_ascend.e2a
+
+
+#: Trailing ``a2e`` arguments the MXFP8 transport needs, in order. A build that predates
+#: them still accepts the call shape at the Python level and fails inside the kernel, so
+#: the connector reads the schema instead of trusting the call to raise.
+A2E_MXFP8_ARGUMENT_NAMES: Final = ("x_scale", "quant_mode")
+#: Argument count of the operator once the MXFP8 arguments are present. The transport
+#: calls it positionally, so a shorter schema means those names live elsewhere.
+A2E_MXFP8_ARGUMENT_COUNT: Final = 14
+
+
+def a2e_accepts_mxfp8_arguments() -> bool | None:
+    """Whether the loaded ``a2e`` operator can be called with the MXFP8 pair.
+
+    Three answers rather than two, because the callers need different messages:
+
+    ``False``
+        The operators could not be loaded, or the schema does not have the expected
+        argument count and trailing pair by name, type and position. This build cannot
+        run the quantized transport.
+    ``None``
+        The operators loaded but no schema is exposed. Treating that as "unsupported"
+        would hide a working build; treating it as "supported" would enable a transport
+        nobody verified. The caller refuses and says it cannot confirm.
+    ``True``
+        The schema matches the input interface this transport calls. It says nothing
+        about the **output** surface: the sixth return value cannot be seen in a schema
+        whose returns are declared as ``Tensor[]``, so the receive path checks it at run
+        time.
+
+    The check reads ``a2e.default._schema.arguments`` rather than the rendered schema
+    text: the text spells the optional as ``Tensor?`` while the argument's own type
+    spells it ``Optional[Tensor]``, and the text does not mark keyword-only arguments.
+    """
+
+    try:
+        ensure_cam_p2p_ops_available()
+        import torch
+    except (ImportError, OSError, RuntimeError):
+        # Missing extension, missing torch, or a torch that cannot load its libraries.
+        return False
+    packet = getattr(getattr(torch, "ops", None), "afd_ascend", None)
+    packet = getattr(packet, "a2e", None) if packet is not None else None
+    if packet is None:
+        return False
+    default = getattr(packet, "default", None)
+    schema = getattr(default, "_schema", None) if default is not None else None
+    if schema is None:
+        return None
+    arguments = list(getattr(schema, "arguments", ()))
+    if len(arguments) != A2E_MXFP8_ARGUMENT_COUNT:
+        return False
+    scale_argument, mode_argument = arguments[-2:]
+    if scale_argument.name != "x_scale" or mode_argument.name != "quant_mode":
+        return False
+    if scale_argument.kwarg_only or mode_argument.kwarg_only:
+        # The transport passes both positionally, so keyword-only fails the call.
+        return False
+    # ``List[Tensor]`` also has ``getElementType()``; only the optional wrapper lets the
+    # FFN side pass ``None``.
+    if not isinstance(scale_argument.type, torch.OptionalType):
+        return False
+    if not isinstance(scale_argument.type.getElementType(), torch.TensorType):
+        return False
+    return isinstance(mode_argument.type, torch.IntType)
 
 
 def _assert_cam_namespace_registered(torch: object) -> None:
@@ -121,6 +187,7 @@ def ensure_cam_async_ops_available() -> None:
 
 
 __all__ = [
+    "a2e_accepts_mxfp8_arguments",
     "AFD_ASCEND_OPS_NAMESPACE",
     "AFD_ASCEND_VENDOR_NAME",
     "AFD_CUST_OPAPI_ENV",
