@@ -8,6 +8,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -17,8 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from tests.e2e.case import (
+    ATTENTION_ROLE,
     CLEANUP_PROFILE_NPU_ASYNC_CAM_LEGACY,
     CLEANUP_PROFILE_STRICT,
+    FFN_ROLE,
     WORKER_SHUTDOWN_TIMEOUT_ENV,
     Case,
     CaseEnvironment,
@@ -39,6 +42,13 @@ LOG_THREAD_JOIN_TIMEOUT_S = 2
 READY_POLL_INTERVAL_S = 2
 MRV2_EVIDENCE_PREFIX = "AFD E2E execution: "
 NPU_ASYNC_PROCESS_KILL_TIMEOUT_S = 120
+DECODE_GRAPH_COMPILATION_CONFIG = {"cudagraph_mode": "FULL_DECODE_ONLY"}
+# The standalone FFN service's torchrun (F-only) world listens next to the AFD
+# rendezvous port; its rank r management endpoint is the FFN API port + r.
+FFN_SERVICE_MASTER_PORT_OFFSET = 1
+FFN_SERVICE_STATUS_FILE = "ffn-service.json"
+FFN_SERVICE_HTTP_TIMEOUT_S = 5
+FFN_SERVICE_PROCESS_KILL_TIMEOUT_S = 120
 # Starting the first role is not waiting for its connector rendezvous or API.
 CONNECTOR_PROTOCOLS = (
     ("gpu", "P2pNcclAFDConnector", ("ffn", "attention")),
@@ -85,6 +95,9 @@ class ResolvedDeployment:
 
     def command(self, role: str, probe_arguments: tuple[str, ...] = ()) -> list[str]:
         profile = self.case.deployment
+        if role == FFN_ROLE and profile.ffn_service is not None:
+            # The service has no vLLM Worker to host the evidence extension.
+            return self.ffn_service_command()
         layout = dict(profile.roles)[role]
         dbo = profile.dbo_for_role(role)
         env = self.environment
@@ -104,26 +117,15 @@ class ResolvedDeployment:
             "--enable-expert-parallel",
         ]
         if profile.ffn is not None:
-            afd: dict[str, JsonValue] = {
-                "role": role,
-                "connector": profile.connector,
-                "host": env.afd_host if slot is None else slot.afd_host,
-                "port": env.afd_port,
-                "num_attention_ranks": profile.attention.rank_count,
-                "num_ffn_ranks": profile.ffn.rank_count,
-            }
-            if profile.connector == "CAMAsyncAFDConnector":
-                afd["async"] = True
-            if profile.compute_gate_on_attention:
-                afd["compute_gate_on_attention"] = True
-            if profile.connector_extra_config:
-                afd["connector_extra_config"] = dict(profile.connector_extra_config)
             cmd.extend(
                 [
                     "--enable-ep-weight-filter",
                     "--additional-config",
                     json.dumps(
-                        {"afd": afd, **dict(layout.additional_config)},
+                        {
+                            "afd": self.afd_config(role, slot),
+                            **dict(layout.additional_config),
+                        },
                         separators=(",", ":"),
                     ),
                 ]
@@ -182,9 +184,7 @@ class ResolvedDeployment:
                     "--cudagraph-capture-sizes",
                     capture_size,
                     "--compilation-config",
-                    json.dumps(
-                        {"cudagraph_mode": "FULL_DECODE_ONLY"}, separators=(",", ":")
-                    ),
+                    json.dumps(DECODE_GRAPH_COMPILATION_CONFIG, separators=(",", ":")),
                 ]
             )
         else:
@@ -197,6 +197,100 @@ class ResolvedDeployment:
         cmd.extend(layout.vllm_args)
         cmd.extend(self.case.common_vllm_args)
         return cmd
+
+    def afd_config(self, role: str, slot: RoleSlot | None) -> dict[str, JsonValue]:
+        """The ``additional_config["afd"]`` one role's service starts with."""
+        profile = self.case.deployment
+        assert profile.ffn is not None
+        env = self.environment
+        afd: dict[str, JsonValue] = {
+            "role": role,
+            "connector": profile.connector,
+            "host": env.afd_host if slot is None else slot.afd_host,
+            "port": env.afd_port,
+            "num_attention_ranks": profile.attention.rank_count,
+            "num_ffn_ranks": profile.ffn.rank_count,
+        }
+        if profile.connector == "CAMAsyncAFDConnector":
+            afd["async"] = True
+        if profile.compute_gate_on_attention:
+            afd["compute_gate_on_attention"] = True
+        if profile.connector_extra_config:
+            afd["connector_extra_config"] = dict(profile.connector_extra_config)
+        if profile.ffn_service is not None:
+            afd["afd_process_group_timeout_s"] = profile.ffn_service.afd_timeout_s
+        return afd
+
+    def ffn_service_command(self) -> list[str]:
+        """``torchrun`` command of the standalone FFN service on this host.
+
+        One process per FFN rank. The AFD configuration, execution mode and
+        DBO match the FFN half of the ``vllm serve`` deployment, so the
+        unchanged Attention command pairs with it. Request-shaping arguments
+        (``common_vllm_args``, batch and capture budgets) belong to Attention,
+        whose control payloads drive every FFN step and graph capture.
+        """
+        profile = self.case.deployment
+        service, ffn = profile.ffn_service, profile.ffn
+        assert service is not None and ffn is not None
+        env = self.environment
+        cmd = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            f"--nproc-per-node={ffn.rank_count}",
+            "--nnodes=1",
+            f"--master-addr={env.afd_host}",
+            f"--master-port={env.afd_port + FFN_SERVICE_MASTER_PORT_OFFSET}",
+            "-m",
+            "afd_plugin.ffn_faas",
+            "serve",
+            env.model,
+            "--backend",
+            service.backend,
+            "--data-parallel-size",
+            str(ffn.dp),
+            "--tensor-parallel-size",
+            str(ffn.tp),
+            "--enable-expert-parallel",
+            "--additional-config",
+            json.dumps(
+                {
+                    "afd": self.afd_config(FFN_ROLE, None),
+                    **dict(ffn.additional_config),
+                },
+                separators=(",", ":"),
+            ),
+            "--receiver-shutdown-timeout",
+            str(service.receiver_shutdown_timeout_s),
+            "--status-host",
+            env.api_host,
+            "--status-port",
+            str(self.ffn_service_status_port(0)),
+            "--status-file",
+            str(self.ffn_service_status_file),
+        ]
+        if ffn.uses_graph:
+            cmd.extend(
+                [
+                    "--compilation-config",
+                    json.dumps(DECODE_GRAPH_COMPILATION_CONFIG, separators=(",", ":")),
+                ]
+            )
+        else:
+            cmd.append("--enforce-eager")
+        cmd.extend(dbo_arguments(profile.dbo_for_role(FFN_ROLE)))
+        cmd.extend(ffn.vllm_args)
+        return cmd
+
+    def ffn_service_status_port(self, rank: int) -> int:
+        """Management port of one FFN service rank (the FFN API port + rank)."""
+        return self.environment.api_port_base + 1 + rank
+
+    @property
+    def ffn_service_status_file(self) -> Path:
+        """Base status file; rank r writes ``ffn-service-rank-<r>.json``."""
+        return self.environment.output_path / FFN_SERVICE_STATUS_FILE
 
 
 def dbo_arguments(dbo: DboConfig | None) -> list[str]:
@@ -240,6 +334,8 @@ def resolve(
         profile.backend != "npu" or profile.connector != "CAMAsyncAFDConnector"
     ):
         raise ValueError("legacy NPU async cleanup requires the NPU async CAM protocol")
+    if profile.ffn_service is not None and (profile.ffn is None or slots):
+        raise ValueError("the FFN service runs a local FFN role on one host")
     if any(role.uses_graph for _, role in profile.roles) and (
         profile.cudagraph_capture_size is None or profile.cudagraph_capture_size < 1
     ):
@@ -305,7 +401,87 @@ class ServiceDeployment:
     def start(self) -> None:
         for role in self.resolved.launch_order:
             self.start_role(role)
+        if self.resolved.case.deployment.ffn_service is not None:
+            self.wait_ffn_service_ready()
         self.wait_ready()
+
+    def wait_ffn_service_ready(self) -> None:
+        """Wait until every FFN service rank reports ``/ready`` (paired with A).
+
+        ``/ready`` means paired and receiving; CUDA graphs are captured later,
+        driven by Attention, whose API comes up only after that.
+        """
+        profile = self.resolved.case.deployment
+        assert profile.ffn is not None
+        env = self.resolved.environment
+        pending = set(range(profile.ffn.rank_count))
+        deadline = time.monotonic() + env.startup_timeout
+        last_error: BaseException | None = None
+        while pending and time.monotonic() < deadline:
+            self.ensure_alive()
+            for rank in sorted(pending):
+                try:
+                    with urllib.request.urlopen(
+                        self.ffn_service_url(rank, "/ready"),
+                        timeout=FFN_SERVICE_HTTP_TIMEOUT_S,
+                    ) as response:
+                        if response.status == 200:
+                            pending.discard(rank)
+                except (OSError, urllib.error.URLError) as exc:
+                    last_error = exc
+            if pending:
+                time.sleep(READY_POLL_INTERVAL_S)
+        if pending:
+            raise TimeoutError(
+                f"FFN service ranks {sorted(pending)} were not ready: {last_error}"
+            )
+
+    def ffn_service_url(self, rank: int, path: str) -> str:
+        env = self.resolved.environment
+        port = self.resolved.ffn_service_status_port(rank)
+        return f"http://{env.api_host}:{port}{path}"
+
+    def finish(self) -> None:
+        """Stop a deployment whose protocol defines a clean stop; else no-op.
+
+        The standalone FFN service stops idle: ``/stop`` on every rank cancels
+        its idle control receive, then Attention shuts down right away, since
+        releasing DeepEP buffers is a barrier over every M2N rank. The service
+        launcher must exit 0 and every rank must report ``stopped`` with
+        released resources. Other deployments stop in ``close``.
+        """
+        profile = self.resolved.case.deployment
+        service = profile.ffn_service
+        if service is None:
+            return
+        assert profile.ffn is not None
+        for rank in range(profile.ffn.rank_count):
+            request = urllib.request.Request(
+                self.ffn_service_url(rank, "/stop"), method="POST"
+            )
+            with urllib.request.urlopen(request, timeout=FFN_SERVICE_HTTP_TIMEOUT_S):
+                pass
+        failures = terminate_process_groups(
+            [self.processes_by_role[ATTENTION_ROLE]],
+            termination_timeout_s=profile.termination_timeout_s,
+            poll_interval_s=PROCESS_POLL_INTERVAL_S,
+            reap_timeout_s=PROCESS_REAP_TIMEOUT_S,
+        )
+        if failures:
+            raise RuntimeError("; ".join(failures))
+        returncode = self.processes_by_role[FFN_ROLE].wait(
+            timeout=service.stop_timeout_s
+        )
+        if returncode != 0:
+            raise RuntimeError(f"FFN service exited with {returncode}")
+        status_file = self.resolved.ffn_service_status_file
+        for rank in range(profile.ffn.rank_count):
+            rank_file = status_file.with_name(f"{status_file.stem}-rank-{rank}.json")
+            status = json.loads(rank_file.read_text())
+            if status["phase"] != "stopped" or status["resources_released"] is not True:
+                raise RuntimeError(
+                    f"FFN service rank {rank} did not stop cleanly: {status}"
+                )
 
     def start_role(self, role: str) -> None:
         """Launch one local role; multi-pod owns barriers between these calls."""
@@ -419,11 +595,16 @@ class ServiceDeployment:
             if legacy_async and ffn is not None
             else (),
         )
-        if legacy_async:
+        # torchrun starts the FFN service workers outside the launcher's process
+        # group, so the service also needs the environment-matched sweep.
+        ffn_service = self.resolved.case.deployment.ffn_service is not None
+        if legacy_async or ffn_service:
             failures.extend(
                 kill_processes_matching_environment(
                     {"AFD_E2E_RUN_ID": self.run_id, "AFD_E2E_PROCESS_ROLE": "ffn"},
-                    timeout_s=NPU_ASYNC_PROCESS_KILL_TIMEOUT_S,
+                    timeout_s=FFN_SERVICE_PROCESS_KILL_TIMEOUT_S
+                    if ffn_service
+                    else NPU_ASYNC_PROCESS_KILL_TIMEOUT_S,
                     poll_interval_s=PROCESS_POLL_INTERVAL_S,
                     process_name="FFN",
                 )

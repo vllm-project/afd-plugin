@@ -12,10 +12,11 @@ The V2 DP2 cases replace the duplicate GPU `afd-eager-2a2f`,
 baseline and AFD eager, graph, and graph+DBO on 2A1F. Qwen3.6 MoE retains
 three: baseline and AFD eager and graph on 2A1F. GDN DBO is unsupported.
 
-The single-deployment inventory contains 48 definitions: 38 CUDA cases
-(18 DeepSeek-V2-Lite, nine Qwen3 MoE, three Qwen3.6 MoE and eight DSV4
+The single-deployment inventory contains 52 definitions: 42 CUDA cases
+(18 DeepSeek-V2-Lite, 13 Qwen3 MoE, three Qwen3.6 MoE and eight DSV4
 Flash) and ten NPU cases (seven DeepSeek-V2-Lite and three DSV4 Flash).
-The CUDA counts include the local DeepEP M2N entries. CI still selects the
+The CUDA counts include the local DeepEP M2N and standalone FFN service
+entries. CI still selects the
 same 15 unique node IDs across ready/merge and weekly gates. Definitions,
 collected nodes and device acceptance results are different counts.
 
@@ -112,7 +113,12 @@ AFD eager intentionally retains its required Hash probe.
 Deployment owns connector order (sync FFN then Attention; async CAM Attention
 then FFN), readiness, pre/post-workload liveness and cleanup. Its explicit
 `cleanup_profile` retains the scoped NPU async CAM exception; ordinary cases
-use strict cleanup. Per-role options, connector configuration, pinned Attention
+use strict cleanup. `Deployment.ffn_service` runs the FFN role as the
+standalone FFN service (`torchrun -m afd_plugin.ffn_faas serve`) on one host:
+the runner waits for every rank's `/ready`, ends the case with `/stop` on
+every rank followed by Attention shutdown, requires the launcher to exit 0 and
+every rank's status file to report released resources, and sweeps the
+torchrun workers by environment on cleanup. Per-role options, connector configuration, pinned Attention
 address and exact compilation settings preserve the existing NPU profiles.
 `Deployment.dbo` is the default for its roles. An explicit `Role.dbo` replaces
 that default; `Role.dbo=None` inherits it. `DboConfig()` enables DBO with native
@@ -292,6 +298,19 @@ export AFD_E2E_BACKEND=gpu
 export AFD_E2E_DEVICES=0,1,2,3
 python -m pytest -q -s \
   tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe_deepep_m2n
+```
+
+`test_qwen3_moe_deepep_m2n_ffn_service` runs the eager, graph, graph + DBO
+and Attention TP2 graph deployments (`afd-deepep-m2n-faas-*-2a2f`) with the
+FFN side served by the
+[standalone GPU FFN service](../../docs/gpu/STANDALONE_FFN_SERVICE.md)
+instead of `vllm serve`. Attention launches unchanged; execution evidence is
+required from Attention only, because the service has no vLLM Worker. It has
+the same requirements and is not run by CI.
+
+```bash
+python -m pytest -q -s \
+  tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe_deepep_m2n_ffn_service
 ```
 
 `tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py` runs the eager,
