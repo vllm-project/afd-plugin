@@ -13,8 +13,6 @@ import time
 from collections.abc import Callable
 from datetime import timedelta
 
-from torch.distributed import TCPStore
-
 DEFAULT_STORE_PORT = 29500
 STORE_CONNECT_TIMEOUT_S = 600
 BARRIER_POLL_INTERVAL_S = 2.0
@@ -27,6 +25,7 @@ SCENARIO_KEY = "run/scenario"
 VERDICT_KEY = "verdict"
 ABORT_COUNT_KEY = "count/abort"
 PASS_VERDICT = "pass"
+DEBUG_VERDICT = "debug"
 
 
 class PeerFailureError(RuntimeError):
@@ -54,6 +53,9 @@ class Rendezvous:
         connect_timeout_s: float = STORE_CONNECT_TIMEOUT_S,
         poll_interval_s: float = BARRIER_POLL_INTERVAL_S,
     ) -> None:
+        # Runtime-only dependency: case collection and CLI inspection need no torch.
+        from torch.distributed import TCPStore
+
         if not 0 <= pod_index < num_pods:
             raise ValueError(
                 f"pod index {pod_index} is outside 0..{num_pods - 1}",
