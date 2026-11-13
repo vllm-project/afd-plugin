@@ -6,6 +6,7 @@ owners:
   - "@hsliuustc0106"
   - "@jiangkuaixue123"
 primary_code_paths:
+  - "afd_plugin/ffn_faas/**"
   - "afd_plugin/v1/worker/ffn_metadata.py"
   - "afd_plugin/v1/worker/ffn_model_runner.py"
   - "afd_plugin/v1/worker/ffn_routed_experts_model_runner.py"
@@ -26,6 +27,7 @@ depends_on:
   - "execution_platforms.md"
   - "compatibility_and_patches.md"
 validation_paths:
+  - "tests/unit/ffn_faas/test_*.py"
   - "tests/unit/model_executor/test_async_cam_layered.py"
   - "tests/npu/test_async_cam_layered_w8a8.py"
   - "tests/unit/v1/worker/test_ffn_metadata.py"
@@ -33,12 +35,14 @@ validation_paths:
   - "tests/unit/v1/worker/test_ffn_routed_experts_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
+  - "tests/unit/v1/worker/test_async_ffn_runtime.py"
   - "tests/unit/connectors/npu/test_async_cam_startup_wiring.py"
   - "tests/unit/connectors/npu/test_async_cam_startup.py"
   - "tests/unit/connectors/test_base.py"
   - "tests/unit/connectors/npu/test_async_cam_session.py"
   - "tests/unit/connectors/npu/test_async_cam.py"
   - "tests/npu/async_cam_runtime.py"
+  - "tests/npu/standalone_cam_attention.py"
   - "tests/e2e/models/deepseek_v4_flash/ffn_graph.py"
   - "tests/unit/compat/patches/test_engine_core.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
@@ -93,10 +97,62 @@ read-only `comm_args` property.
 
 ## Runtime selection
 
-FFN is launched as a `vllm serve` process, and AFD config normalization selects
+The traditional FFN is launched as a `vllm serve` process, and AFD config normalization selects
 its role-specific worker when `worker_cls="auto"`. It does not serve requests.
 Attention and FFN may be started in either order. Send API traffic only to
 Attention.
+
+DeepSeek-V4 Flash per-channel W4A8 also has a standalone F entry point,
+`python -m afd_plugin.ffn_faas serve`, implementing independent-service
+ownership under [RFC #391](https://github.com/vllm-project/afd-plugin/issues/391).
+It composes `CAMAsyncAFDConnector` and `AsyncNPUFFNModelRunner` without creating
+a vLLM Worker, upstream ModelRunner, EngineCore, scheduler or KV cache.
+Attention retains its existing model, connector and DBO path. Configuration,
+parameter loading and quantization remain vLLM/vLLM-Ascend dependencies.
+
+The standalone Ascend CLI reuses vLLM engine argument definitions, parsing and
+configuration construction. Existing AFD options remain in `additional_config`;
+only host management and shutdown options are standalone-specific. The host
+entry delegates parser creation to its selected platform, so CPU-only service
+and host-loop imports remain independent of vLLM.
+
+The CPU-only host `FFNModelRunner` accepts an `FFNBackend` factory, retains
+the backend before preparation, and owns the receiving thread and failure
+boundary. `FFNService` manages host status and stop requests. Platform options
+and CAM runtime composition live under `ffn_faas/platforms/npu/`.
+
+- `AscendFFNEnvironment` owns device initialization, F-only compute/EP groups
+  and native post-warmup CPU affinity. These groups coexist with the separate
+  A/F CAM group throughout execution.
+- `CAMRoutedModel` manages parameter loading, local placement checks, storage
+  accounting and cached-view lifetime. Startup selects a `RoutedModelAdapter`
+  to provide checkpoint metadata and native owner construction. The backend
+  uses the common resource without model-specific branching.
+- Model-specific code follows `ffn_faas/platforms/ffn_model/<model>/<backend>/`.
+  Under `deepseek_v4/npu/`, `v4_model.py` contains V4 checkpoint metadata and
+  `V4ModelAdapter`. `v4_weights.py` contains the lazily imported native parameter
+  owner. Native routed modules, expert-map managers and quantizers remain
+  resident. The loader adapter delegates to the native V4 loader. Dependency
+  upgrades must preserve its documented receiver and factory contracts.
+- Platform settings enforce static CAM placement and reject EPLB, elastic EP
+  and redundant experts. Retaining native expert state does not enable these
+  algorithms.
+
+`FFNBackend` is a runtime lifecycle interface. Its `execute_step()` delegates
+communication, computation and Graph execution to the Async CAM
+runtime. A shared cross-platform, cross-connector Step Loop and a pure
+`compute(item)` backend are not implemented. The runtime consumes the existing
+`LayeredFFNWeights` interface with W4A8 weights, without per-step model selection;
+there is no
+separate V4 execution runtime.
+
+`attach_model` lends independently loaded parameters to the runtime. After
+receiver exit and device completion, shutdown releases CAM/Graph resources,
+then native compute groups, and finally the routed owner. Failed or pending
+native work retains all owners until whole-pair process isolation. A host
+`/stop` request cannot cancel an outstanding CAM DR.
+See the [standalone service guide](../../npu/STANDALONE_FFN_SERVICE.md) for
+supported configuration, launch and shutdown behavior.
 
 | Platform | Worker | Model runner | Current connectors |
 | --- | --- | --- | --- |

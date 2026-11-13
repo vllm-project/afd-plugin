@@ -708,7 +708,7 @@ def test_native_child_contexts_preserve_dp_and_own_ascend_kwargs(monkeypatch):
     assert result == contexts
     assert [ctx.dp_metadata for ctx in contexts] == dp
     assert contexts[1].attn_metadata is None
-    from afd_plugin.connectors.npu.camp2p import _get_group_ep
+    from afd_plugin.connectors.npu.camp2p.connector import _get_group_ep
 
     assert [
         _get_group_ep(getattr(ctx, "ubatch_idx", 0), "stage0", "stage1", "")

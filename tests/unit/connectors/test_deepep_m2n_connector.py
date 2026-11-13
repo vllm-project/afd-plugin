@@ -15,11 +15,6 @@ pytest.importorskip("vllm")
 
 from vllm.platforms.interface import set_assigned_physical_gpu_ids  # noqa: E402
 
-from tests.unit.fakes.afdep import FakeElasticBuffer, install_fake_afdep  # noqa: E402
-
-# The connector module imports afdEP's transport when it loads.
-install_fake_afdep()
-
 from afd_plugin.config import afd_config_from_mapping  # noqa: E402
 from afd_plugin.connectors import (  # noqa: E402
     AFDConnectorFactory,
@@ -29,23 +24,36 @@ from afd_plugin.connectors import (  # noqa: E402
     AFDTransferMetadata,
 )
 from afd_plugin.connectors.base import AFDControlPlaneClosedError  # noqa: E402
-from afd_plugin.connectors.gpu.deepep_m2n import (  # noqa: E402
-    connector as connector_module,
+from tests.unit.fakes.afdep import (  # noqa: E402
+    FakeElasticBuffer,
+    install_fake_afdep,
+    uninstall_fake_afdep,
 )
-from afd_plugin.connectors.gpu.deepep_m2n.connector import (  # noqa: E402
-    DeepEPM2NConfig,
-    bucket_ladder,
-    expert_weight_format,
-    local_handshake_info,
-    local_model_info,
-    plan_stage,
-    precompile_buckets,
-    resolve_capacity_tokens_per_rank,
-    resolve_num_lanes,
-    tokens_per_attention_rank,
-    validate_handshake,
-    validate_model_infos,
-)
+
+# The connector module imports afdEP's transport when it loads, so the stand-in has to
+# exist for that import only. It is removed again on both paths: the bound names keep
+# working, and the rest of the session sees the package as absent.
+install_fake_afdep()
+try:
+    from afd_plugin.connectors.gpu.deepep_m2n import (  # noqa: E402
+        connector as connector_module,
+    )
+    from afd_plugin.connectors.gpu.deepep_m2n.connector import (  # noqa: E402
+        DeepEPM2NConfig,
+        bucket_ladder,
+        expert_weight_format,
+        local_handshake_info,
+        local_model_info,
+        plan_stage,
+        precompile_buckets,
+        resolve_capacity_tokens_per_rank,
+        resolve_num_lanes,
+        tokens_per_attention_rank,
+        validate_handshake,
+        validate_model_infos,
+    )
+finally:
+    uninstall_fake_afdep()
 from afd_plugin.connectors.gpu.deepep_m2n.experts import (  # noqa: E402
     expert_row_ranges,
 )
@@ -867,6 +875,38 @@ def test_close_cancels_the_control_receive_but_not_the_lanes_group(monkeypatch):
     assert aborted == [control]
     with pytest.raises(AFDControlPlaneClosedError):
         connector.control_plane.recv_dp_metadata_list()
+
+
+def test_close_destroys_the_distinct_transport_group_after_lanes(monkeypatch):
+    """A per-domain transport group is destroyed once, after its lanes.
+
+    Why: afdEP-comm leaves the caller-owned Gloo group alive; keeping it
+    registered leaks process-group state across connector lifetimes.
+    """
+    events = []
+
+    class Lane:
+        def destroy(self):
+            events.append("lane")
+
+    monkeypatch.setattr(
+        connector_module, "_abort_process_group", lambda group: events.append("control")
+    )
+    monkeypatch.setattr(
+        connector_module.dist,
+        "destroy_process_group",
+        lambda group: events.append("transport"),
+    )
+    connector = _connector("ffn", 0, M2NTopology(ffn_size=2, attn_size=2))
+    connector.group = SimpleNamespace()
+    connector.bootstrap_group = SimpleNamespace()
+    connector.transport_group = SimpleNamespace()
+    connector.lanes = [Lane()]
+
+    connector.close()
+    connector.close()
+
+    assert events == ["control", "lane", "transport"]
 
 
 @pytest.mark.parametrize(

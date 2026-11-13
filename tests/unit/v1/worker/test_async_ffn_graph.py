@@ -10,6 +10,7 @@ import pytest
 
 pytest.importorskip("vllm")
 pytest.importorskip("torch_npu")
+pytest.importorskip("vllm_ascend")
 import torch  # noqa: E402
 
 from afd_plugin.connectors.base import FFNExecutionSession  # noqa: E402

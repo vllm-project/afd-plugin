@@ -14,6 +14,8 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from tests.e2e.case import Case
+
 ATTENTION_ROLE = "attention"
 FFN_ROLE = "ffn"
 BASELINE_ROLE = "baseline"
@@ -147,6 +149,19 @@ class Topology:
                 f"no AFD rendezvous role known for connector {self.connector!r}",
             )
         return rendezvous_role
+
+    @classmethod
+    def from_case(cls, case: Case) -> Topology:
+        profile = case.deployment
+        return cls(
+            attention=RoleTopology(profile.attention.rank_count, profile.attention.tp),
+            ffn=RoleTopology(
+                0 if profile.ffn is None else profile.ffn.rank_count,
+                1 if profile.ffn is None else profile.ffn.tp,
+            ),
+            connector=profile.connector or "",
+            baseline=profile.is_baseline,
+        )
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> Topology:

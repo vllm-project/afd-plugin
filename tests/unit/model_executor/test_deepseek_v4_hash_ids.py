@@ -17,6 +17,7 @@ import logging
 import sys
 import types
 from collections.abc import Iterator
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 from typing import Any
 
@@ -50,34 +51,34 @@ def _vllm_stub() -> Iterator[None]:
         yield
         return
 
-    saved = {name: sys.modules.get(name) for name in missing}
+    builders: dict[str, dict[str, object]] = {
+        "vllm": {},
+        "vllm.forward_context": {
+            "DPMetadata": type("DPMetadata", (), {}),
+            "ForwardContext": type("ForwardContext", (), {}),
+            "get_forward_context": lambda: None,
+        },
+        "vllm.logger": {
+            "init_logger": lambda *args, **kwargs: logging.getLogger("test")
+        },
+    }
 
-    def make(name: str, **attributes: object) -> None:
+    # Only the modules that are genuinely absent are installed: overwriting one that
+    # another test imported would survive this context, because the cleanup below
+    # only removes the names it added.
+    for name in missing:
         module = types.ModuleType(name)
         module.__path__ = []  # type: ignore[attr-defined]
-        for attribute, value in attributes.items():
+        # find_spec("vllm") runs at import time; a spec-less module makes it raise.
+        module.__spec__ = ModuleSpec(name, None)
+        for attribute, value in builders[name].items():
             setattr(module, attribute, value)
         sys.modules[name] = module
-
-    make("vllm")
-    make(
-        "vllm.forward_context",
-        DPMetadata=type("DPMetadata", (), {}),
-        ForwardContext=type("ForwardContext", (), {}),
-        get_forward_context=lambda: None,
-    )
-    make(
-        "vllm.logger",
-        init_logger=lambda *args, **kwargs: logging.getLogger("test"),
-    )
     try:
         yield
     finally:
         for name in missing:
             sys.modules.pop(name, None)
-        for name, module in saved.items():
-            if module is not None:
-                sys.modules[name] = module
 
 
 with _vllm_stub():
