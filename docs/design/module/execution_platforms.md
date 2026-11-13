@@ -285,11 +285,12 @@ groups and also keeps Attention TP peers aligned.
 ### ACL Graph and NPU Graph
 
 NPU Attention follows the upstream ACL graph dispatcher while adding AFD
-metadata and control-plane coordination. Native MRV2 owns single/two-stage
-graph descriptors, warmup/capture, persistent outputs and replay. AFD retains
-formal per-stage MLA registries by the complete native descriptor, including
-LoRA specialization, and publishes one matching FFN control payload before
-each warmup, capture or live replay.
+metadata and, for synchronous CAMP2P, control-plane coordination. Native MRV2
+owns single/two-stage graph descriptors, warmup/capture, persistent outputs and
+replay. AFD retains formal per-stage MLA registries by the complete native descriptor, including
+LoRA specialization. Synchronous CAMP2P publishes one matching FFN control
+payload before each warmup, capture or live replay; Async CAM stages local
+AFD metadata without sending DP control messages.
 
 For MLA DBO full graphs, each stage records its own upstream `GraphParams`.
 `merge_mla_graph_params()` validates identical layer order and record counts,
@@ -305,12 +306,16 @@ register no FIA workspace, so those models, DeepSeek V4 among them, take the
 generic two-stage path with no MLA registries.
 
 With synchronous CAMP2P, the NPU V2 runner supports eager, `FULL`, and
-`FULL_DECODE_ONLY`; Async CAM Attention is eager-only. Like CUDA V2,
-it publishes descriptor-matched warmup/capture control outside formal graph
-capture and installs an instance-scoped pre-replay hook because native full
-replay creates no `ForwardContext`. Native `NPUUBatchRunner` owns preparation,
-execution and merge for eager and graph DBO. Plain MLA graph DBO requires
-`FULL_DECODE_ONLY`; SFA/DSA
+`FULL_DECODE_ONLY`; Async CAM additionally admits DSV4 target native
+`FULL` or `FULL_DECODE_ONLY`, with native mode resolution and no DBO. DSpark
+draft may be eager or native Graph. Attention-local FlashComm1/SP and native PD
+can remain enabled. Device qualification uses compilation mode 0.
+Synchronous CAMP2P publishes descriptor-matched warmup/capture control outside
+formal graph capture. Async CAM has no control plane and only stages local
+AFD metadata. Both install an instance-scoped pre-replay hook because native
+full replay creates no `ForwardContext`. Native `NPUUBatchRunner` owns
+preparation, execution and merge for eager and graph DBO. Plain MLA graph DBO
+requires `FULL_DECODE_ONLY`; SFA/DSA
 accepted modes still require model-specific qualification. Native two-stage capture shares the ordinary descriptor's FIA
 workspace; replay merges captured records with current metadata for Ascend
 updates. Each child carries its actual stage ID for the opaque CAMP2P HCCL
@@ -318,13 +323,13 @@ group lookup. Async CAM enables eager native DBO at DP1; it has no separate
 MoE stage pipeline. Async FFN FULL accepts eager Attention DBO; FFN stays
 outside Attention's native DBO thread schedule.
 
-The FFN runner owns a separate ACL graph cache keyed by stage token counts and
-A/F topology. Warmup runs the eager FFN path. Formal capture updates connector
-state through `connector.control_plane` before entering `torch.npu.graph(...)`,
+The synchronous FFN runner owns a separate ACL graph cache keyed by stage token
+counts and A/F topology. Warmup runs the eager FFN path. Formal capture updates
+connector state through `connector.control_plane` before entering `torch.npu.graph(...)`,
 so replay contains only model and data-plane operations. Replay additionally requires the control payload's
 `is_graph_replaying=true`; an unknown key or eager payload executes eagerly.
-CAM async has no control plane and uses the independent
-[Async FFN runtime](../npu/async_ffn_runtime.md).
+Async CAM has no control plane and uses the separate complete-transaction
+graph described in the [Async FFN runtime guide](../npu/async_ffn_runtime.md).
 
 ### Ascend native operators and packaging
 

@@ -13,6 +13,7 @@ primary_code_paths:
   - "afd_plugin/v1/worker/npu/attention_model_runner_v2.py"
   - "afd_plugin/v1/worker/npu/attention_worker.py"
   - "afd_plugin/v1/worker/npu/dspark_speculator.py"
+  - "afd_plugin/v1/worker/npu/dspark_graph.py"
 related_code_paths:
   - "afd_plugin/connectors/**"
   - "afd_plugin/model_executor/**"
@@ -24,6 +25,7 @@ depends_on:
   - "execution_platforms.md"
   - "compatibility_and_patches.md"
 validation_paths:
+  - "tests/unit/v1/worker/npu/test_dspark_graph.py"
   - "tests/unit/v1/worker/test_attention_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
@@ -166,7 +168,7 @@ Both platforms require V2. The paired deployment constraints are:
 | Excluded features | Elastic EP, EPLB, sequence-parallel MoE, and compile SP | Elastic EP and EPLB; model-specific SP restrictions | Elastic EP, EPLB, native draft models/MTP except DSV4 DSpark, finegrained TP, and explicit shared-expert DP |
 | Sequence parallelism | Unsupported | Model-specific; synchronous DeepSeek-V2/V3 SP is rejected | Attention-local FlashComm1/SP supported; disabled on FFN; no PCP/DCP |
 | Native DBO | Exactly two microbatches, Attention DP1 or DP > 1 | Eager or graph; exactly two microbatches, Attention DP > 1 | Eager only; exactly two microbatches at Attention DP1 or DP > 1 |
-| Graph execution | Eager or `FULL_DECODE_ONLY` | Eager, `FULL`, or `FULL_DECODE_ONLY`; plain MLA graph DBO requires `FULL_DECODE_ONLY` | Eager Attention; independent FFN also supports the narrow W4A8/W8A8 FULL contract |
+| Graph execution | Eager or `FULL_DECODE_ONLY` | Eager, `FULL`, or `FULL_DECODE_ONLY`; plain MLA graph DBO requires `FULL_DECODE_ONLY` | Eager Attention or DSV4 target native graph without DBO; native `FULL`/`FULL_DECODE_ONLY` resolution; Attention-local SP and native PD may remain enabled; DSpark draft may be eager or native Graph; independent FFN supports the narrow W4A8/W8A8 FULL contract |
 | Model | Registered AFD architecture; DeepEP M2N is limited to Qwen3 MoE or DeepSeek-V2 | Registered AFD architecture | DeepSeek-V4 with layered W4A8/W8A8 FFN experts and `dynamicQuant=1` |
 
 Both roles validate the paired V2 topology, but only Attention uses the native
@@ -335,12 +337,14 @@ shutdown; Ascend and other models keep native preparation and profiling.
 
 Ascend V2 supports exactly two native microbatches: synchronous CAMP2P
 requires Attention DP > 1 and supports graph DBO, while Async CAM uses eager
-Attention and also supports Attention DP1. Plain MLA graph DBO requires
+Attention for DBO and also supports Attention DP1. Its separate target
+DSV4 decode graph profile excludes DBO. Plain MLA graph DBO requires
 `FULL_DECODE_ONLY`.
 
-For full-graph capture, the V2 runner
-wraps native input preparation and publishes one warmup and one capture
-payload per descriptor. CUDA two-stage preparation installs separate AFD
+For full-graph capture, the V2 runner wraps native input preparation and
+stages descriptor-matched AFD metadata. Connectors with a control plane also
+publish one warmup and one capture payload per descriptor; Async CAM does not.
+CUDA two-stage preparation installs separate AFD
 metadata on both native stage contexts and sends their complete layout before
 eager execution or FULL replay. Single-stage FULL replay publishes its padded
 control shape through an execute-scoped manager hook; two-stage replay reuses

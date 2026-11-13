@@ -82,10 +82,10 @@ def _use_afd_fullgraph_replay_hook(
     original_run_fullgraph = manager.run_fullgraph
     manager_state[_AFD_FULLGRAPH_HOOK_MARKER] = True
 
-    # Patch reason: native FULL replay bypasses ForwardContext creation, so the
-    # execute-scoped AFD provider cannot publish runtime control.
-    # Patch functionality: wrap only this manager instance and publish one
-    # ordinary padded control payload immediately before each native replay.
+    # Patch reason: native FULL replay bypasses the ordinary forward, so its
+    # attention-parameter update needs fresh AFD real/padded token metadata.
+    # Patch functionality: stage that metadata on this manager's replay scope;
+    # synchronous connectors also publish one padded control payload.
     # Signature: matches vLLM v0.32.0 ModelCudaGraphManager.run_fullgraph exactly.
     # Upstream source: vllm/v1/worker/gpu/cudagraph_utils.py,
     # ModelCudaGraphManager.run_fullgraph; commit
@@ -119,10 +119,11 @@ def _use_afd_fullgraph_replay_hook(
             runner._is_warmup = False
             runner._afd_is_graph_capturing = False
             runner._afd_is_graph_replaying = True
-            runner.send_dp_metadata(
-                runner.build_capture_dp_metadata(padded_tokens),
-                None,
-            )
+            if runner.connector.control_plane is not None:
+                runner.send_dp_metadata(
+                    runner.build_capture_dp_metadata(padded_tokens),
+                    None,
+                )
             result = original_run_fullgraph(desc)
         finally:
             runner._afd_is_graph_replaying = previous_is_graph_replaying
@@ -269,6 +270,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                     self.vllm_config,
                     self.device,
                     afd_context=self._afd_draft_context,
+                    afd_runner=self,
                 )
                 self.speculator.update_stream = self.update_stream
         except BaseException:

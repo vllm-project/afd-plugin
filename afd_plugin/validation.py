@@ -89,6 +89,25 @@ def validate_graph_capacity(
         raise ValueError("Async CAM graph source rows exceed the uint16 protocol bound")
 
 
+def validate_async_cam_attention_graph(vllm_config: VllmConfig) -> None:
+    """Validate AFD dependencies for native Async CAM Attention graphs."""
+    model = vllm_config.model_config
+    parallel = vllm_config.parallel_config
+    if (
+        not vllm_config.use_v2_model_runner
+        or model.hf_text_config.model_type != "deepseek_v4"
+    ):
+        raise RuntimeError("Async CAM Attention graph requires MRV2 DeepSeek-V4")
+    if parallel.enable_dbo or parallel.use_ubatching:
+        raise RuntimeError("Async CAM Attention graph does not support DBO/ubatching")
+    if (
+        parallel.pipeline_parallel_size,
+        parallel.prefill_context_parallel_size,
+        parallel.decode_context_parallel_size,
+    ) != (1, 1, 1):
+        raise RuntimeError("Async CAM Attention graph does not support PP or CP")
+
+
 def validate_gpu_model_runner_v2_config(
     vllm_config: VllmConfig,
     *,
@@ -207,11 +226,9 @@ def validate_npu_model_runner_v2_config(
             )
         if not vllm_config.model_config.enforce_eager:
             if expected_role == "attention":
-                raise RuntimeError(
-                    "AFD NPU ModelRunnerV2 Async CAM requires eager execution "
-                    "on Attention"
-                )
-            requested_ffn_mode(vllm_config)
+                validate_async_cam_attention_graph(vllm_config)
+            else:
+                requested_ffn_mode(vllm_config)
     elif afd_config.connector != CAMP2P_CONNECTOR:
         raise RuntimeError(
             "AFD NPU ModelRunnerV2 requires either synchronous CAMP2pAFDConnector "

@@ -28,7 +28,7 @@ Recipes are organized by hardware backend, connector, and model:
 | GPU | `P2pNcclAFDConnector` | Qwen3.5-122B-A10B-FP8 | Decode | Three-pod graph recipe (`2A0F,2A0F,0A2F`); other layouts remain configurable through `LAYOUT` | [Graph](gpu/P2pNcclAFDConnector/qwen3_5_122b_a10b_fp8/prefill_decode_colocation/multipod_2a_2a_2f_graph.sh) |
 | Ascend NPU | `CAMP2pAFDConnector` | DeepSeek-V3.2 | Decode | Historical v0.19.1rc1 recipe; not qualified for the 0.32 target | [Synchronous decode](npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) |
 | Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V3.2 | Prefill / decode | Historical v0.19.1rc1/v0.26 recipes; standard V3.2 is unsupported by the current Async CAM path | [Async CAM](npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) |
-| Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V4-Flash W4A8/W8A8 DSpark | Separate P / decode, or colocated | v0.32; eager A TP1, F layered eager/FULL. W4A8 PD: native full-draft P TP4, A DP2, F EP4. W8A8 A/F: A DP2, F EP8; PD not qualified | [DSpark A/F](npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md) |
+| Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V4-Flash W4A8/W8A8 DSpark | Separate P / decode, or colocated | v0.32; F layered eager/FULL. W4A8 target/draft native decode Graph: A DP1/TP4, F EP4, with Attention-local SP and with/without PD; native full-draft P TP4 for PD. Earlier eager W4A8 PD: A DP2/TP1, F EP4. W8A8 eager A/F: A DP2/TP1, F EP8; A Graph and PD not qualified | [DSpark A/F](npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md) |
 
 Open the model-level README before running a recipe. It documents the required
 hardware and runtime baseline, topology, environment variables, launch order,
