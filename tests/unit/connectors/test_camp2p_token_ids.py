@@ -1198,19 +1198,26 @@ def test_the_handshake_rejects_a_bound_the_ids_cannot_fit(monkeypatch, on_a5):
     assert error is not None and "publishes 8150" in str(error)
 
 
-def test_the_handshake_rejects_a_mixed_gate(monkeypatch, on_a5):
-    """A and F disagreeing about the ids slot must fail before any A2E."""
+@pytest.mark.parametrize(
+    "role,gate",
+    [
+        pytest.param("ffn", False, id="ffn-side"),
+        pytest.param("attention", True, id="attention-side"),
+    ],
+)
+def test_the_handshake_rejects_a_mixed_gate(monkeypatch, on_a5, role, gate):
+    """Both roles stop on a mixed ids slot, so neither waits for the other."""
     seen, published, error, _ = _init_pair(
         monkeypatch,
-        role="ffn",
+        role=role,
         mode=0,
-        gate=False,
+        gate=gate,
         gates=[0, 1],
         gathered_modes=[[0, 0], [0, 0]],
     )
 
     assert seen == ["afd", "mode_gather"], seen
-    assert published[0] == [0, 0, 0], published
+    assert published[0] == [0, 0, int(gate)], published
     assert error is not None and "compute_gate_on_attention mismatch" in str(error)
 
 
