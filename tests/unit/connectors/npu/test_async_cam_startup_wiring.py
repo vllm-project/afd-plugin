@@ -112,6 +112,11 @@ def layered_startup_runner(modules, monkeypatch, mode, invalid):
         )
 
     monkeypatch.setattr(runtime, "AsyncCAMLayeredExecutor", executor)
+    monkeypatch.setattr(
+        runtime,
+        "expert_weight_signature",
+        lambda layers, capacity: repr(tuple(layer.layer_idx for layer in layers)),
+    )
     target = (
         []
         if invalid == "target"
@@ -127,11 +132,11 @@ def layered_startup_runner(modules, monkeypatch, mode, invalid):
     runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
     runner.model = SimpleNamespace(
         get_experts_layer_indices=lambda: (2,),
-        get_async_cam_layered_weights=lambda: (target, "unsupported target"),
+        get_quantized_expert_weights=lambda: (target, "unsupported target"),
     )
     runner.draft_model = SimpleNamespace(
         get_experts_layer_indices=lambda: (5,),
-        get_async_cam_layered_weights=lambda: (draft, "unsupported draft"),
+        get_quantized_expert_weights=lambda: (draft, "unsupported draft"),
     )
     connector = SimpleNamespace(
         is_initialized=False,
@@ -143,7 +148,7 @@ def layered_startup_runner(modules, monkeypatch, mode, invalid):
         [connector.graph_startup.plan]
     )
     runner.connector = connector
-    runner._failure = runner._layered_executor = None
+    runner._failure = runner._layered_executor = runner._mega_executor = None
     runner.requested_mode = mode
     monkeypatch.setattr(
         runtime, "get_ascend_device_type", lambda: runtime.AscendDeviceType.A3
@@ -181,32 +186,130 @@ def test_ffn_startup_validates_target_and_draft_weights(
 def test_mega_executor_failure_is_published_during_startup(modules, monkeypatch, mode):
     _, _, runtime = modules
     runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
-    runner.model = SimpleNamespace(get_experts_layer_indices=lambda: (2,))
+    runner.model = SimpleNamespace(
+        get_experts_layer_indices=lambda: (2,),
+        get_quantized_expert_weights=lambda: ([SimpleNamespace(layer_idx=2)], ""),
+    )
     runner.draft_model = None
     runner._failure = runner._layered_executor = runner._mega_executor = None
     runner.requested_mode = mode
     connector = SimpleNamespace(
         is_initialized=False,
         extra_info=SimpleNamespace(ffn_mega_moe=True),
+        dynamic_quant=1,
+        topology=None,
+        max_num_batched_tokens=8,
+        topk=2,
+        tp_size=1,
         graph_startup=AsyncCAMGraphStartup(1, 1, 2),
     )
     connector.init_afd_connector = lambda: resolve_ffn_mode(
         [connector.graph_startup.plan]
     )
     runner.connector = connector
-    runner._initialize_layered_executor = lambda: setattr(
-        runner,
-        "_layered_executor",
-        SimpleNamespace(graph_signature=lambda _: "layered"),
+    monkeypatch.setattr(
+        runtime, "get_ascend_device_type", lambda: runtime.AscendDeviceType.A3
     )
 
-    def fail_executor(*_args):
+    def fail_executor(*_args, **_kwargs):
         raise ValueError("unsupported Mega weights")
 
     monkeypatch.setattr(runtime, "AsyncCAMMegaExecutor", fail_executor)
     with pytest.raises(ValueError, match="unsupported Mega weights"):
         runner.initialize_afd_connector()
     assert connector.graph_startup.plan.executor_error == "unsupported Mega weights"
+
+
+@pytest.fixture
+def independent_mega_runner(modules, monkeypatch):
+    _, _, runtime = modules
+    peers = startup_world(attn=1, ffn=1)
+    model = SimpleNamespace(
+        get_experts_layer_indices=lambda: (2,),
+        get_quantized_expert_weights=lambda: ([SimpleNamespace(layer_idx=2)], ""),
+    )
+    connector = SimpleNamespace(
+        is_initialized=False,
+        dynamic_quant=1,
+        extra_info=SimpleNamespace(ffn_mega_moe=True),
+        graph_startup=peers[1],
+        topology=None,
+        max_num_batched_tokens=8,
+        topk=2,
+        tp_size=1,
+        comm_args=object(),
+        group_name="ready",
+    )
+
+    def initialize():
+        connector.graph_startup.mode = resolve_ffn_mode([connector.graph_startup.plan])
+        connector.is_initialized = True
+
+    connector.init_afd_connector = initialize
+    fail_binding = [False]
+    mega = MagicMock()
+
+    def bind(*args):
+        if not connector.is_initialized:
+            raise RuntimeError("communication was bound before initialization")
+        if fail_binding[0]:
+            raise RuntimeError("communication binding failed")
+
+    mega.bind_communication = bind
+
+    def forbidden_layered(*args):
+        raise AssertionError("Mega must not construct Layered")
+
+    monkeypatch.setattr(runtime, "AsyncCAMLayeredExecutor", forbidden_layered)
+    monkeypatch.setattr(runtime, "AsyncCAMMegaExecutor", lambda *args, **kw: mega)
+    monkeypatch.setattr(
+        runtime, "expert_weight_signature", lambda layers, capacity: "weights"
+    )
+    monkeypatch.setattr(
+        runtime, "get_ascend_device_type", lambda: runtime.AscendDeviceType.A3
+    )
+    runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
+    runner.__dict__.update(
+        model=model,
+        draft_model=None,
+        connector=connector,
+        requested_mode="eager",
+        _failure=None,
+        _layered_executor=None,
+        _mega_executor=None,
+        _first_step=False,
+        _graph=None,
+        _is_shutdown=False,
+        prof=None,
+        session=sys.modules["afd_plugin.connectors.base"].FFNExecutionSession(),
+    )
+    return SimpleNamespace(
+        runner=runner, connector=connector, peer=peers[0], fail_binding=fail_binding
+    )
+
+
+def test_mega_serves_without_constructing_layered(independent_mega_runner):
+    h = independent_mega_runner
+    h.runner.initialize_afd_connector()
+    assert h.connector.graph_startup.plan.signature == "native_mc2:weights"
+    assert h.runner.execute_connector_driven_step()
+    h.peer.check_failure()
+
+
+@pytest.mark.parametrize("mode", ["eager", "full"])
+def test_mega_binding_failure_reaches_peer_and_retains_resources(
+    independent_mega_runner, mode
+):
+    h = independent_mega_runner
+    h.runner.requested_mode = mode
+    h.fail_binding[0] = True
+    with pytest.raises(RuntimeError, match="communication binding failed"):
+        h.runner.initialize_afd_connector()
+    with pytest.raises(RuntimeError, match="communication binding failed"):
+        h.peer.check_failure()
+    with pytest.raises(RuntimeError, match="startup retains resources"):
+        h.runner.shutdown()
+    assert h.connector.is_initialized
 
 
 @pytest.mark.parametrize(
@@ -409,8 +512,8 @@ def test_ffn_warmup_capture_order_and_failure_propagation(
         device="npu:0",
         model=SimpleNamespace(get_experts_layer_indices=lambda: (5, 2)),
         draft_model=None,
-        _initialize_layered_executor=lambda: None,
-        _layered_executor=SimpleNamespace(graph_signature=lambda capacity: "weights"),
+        _initialize_ffn_executor=lambda: "weights",
+        _layered_executor=None,
         _mega_executor=None,
         connector=SimpleNamespace(
             is_initialized=False,

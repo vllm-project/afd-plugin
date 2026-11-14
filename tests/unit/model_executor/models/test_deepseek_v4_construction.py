@@ -193,6 +193,49 @@ def test_v4_attention_model_owns_head_mhc_parameters(
     )
 
 
+@pytest.mark.parametrize(
+    "role,first_rank,layer_count",
+    [
+        ("attention", True, 1),
+        ("attention", False, 1),
+        ("attention", True, 0),
+        ("ffn", True, 1),
+    ],
+    ids=["attention", "non-first-rank", "empty-model", "ffn"],
+)
+def test_v4_finalizes_only_attention_owned_mhc_broadcast(
+    monkeypatch, construction_env, role, first_rank, layer_count
+):
+    model = _make_model(
+        monkeypatch, role=role, vllm_config=_vllm_config(layer_count=layer_count)
+    )
+    monkeypatch.setattr(
+        adapter.native,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=first_rank),
+    )
+    if role == "attention" and layer_count:
+        layer = model.layers[0]
+        layer.hc_attn_fn.data.fill_(2)
+
+    model.finalize_mhc_broadcast_weights()
+
+    if role != "attention" or not layer_count:
+        return
+    if not first_rank:
+        assert layer.hc_attn_fn_broadcast is None
+        return
+    expected = torch.full(
+        (layer.hc_attn_fn.shape[0], layer.hidden_size), 2.0 * layer.hc_mult
+    )
+    torch.testing.assert_close(layer.hc_attn_fn_broadcast, expected)
+    broadcast = layer.hc_attn_fn_broadcast
+    layer.hc_attn_fn.data.fill_(3)
+    model.finalize_mhc_broadcast_weights()
+    assert layer.hc_attn_fn_broadcast is broadcast
+    torch.testing.assert_close(broadcast, expected * 1.5)
+
+
 def test_v4_attention_model_allocates_mtp_buffer_for_spec_decode(
     monkeypatch,
     construction_env,

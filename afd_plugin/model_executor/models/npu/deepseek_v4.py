@@ -11,8 +11,9 @@ constructs the native MoE module and exposes it through the runner-facing
 ``compute_ffn_output`` hook.
 """
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from copy import copy
+from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -34,14 +35,19 @@ from afd_plugin.connectors import (
     AFDTransferContext,
     AFDTransferMetadata,
 )
-from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
-from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
-from afd_plugin.model_executor.models.npu.async_cam_dbo import (
-    send_async_cam_remote_call,
-)
-from afd_plugin.model_executor.models.npu.async_cam_layout import (
+from afd_plugin.forward_context import get_afd_metadata_from_forward_context
+from afd_plugin.model_executor.ffn.npu.async_cam import (
     prepare_cam_dispatch_payload,
     restore_cam_dispatch_output,
+    send_async_cam_remote_call,
+)
+from afd_plugin.model_executor.ffn.remote import RemoteFFNProxy
+from afd_plugin.model_executor.models._weight_utils import (
+    ATTENTION_ROLE,
+    BOTH_ROLES,
+    FFN_ROLE,
+    filter_role_weights,
+    layer_weight_path,
 )
 from afd_plugin.model_executor.models.npu.deepseek_v4_shared_experts import (
     AFDDeepseekV4SharedExperts,
@@ -65,12 +71,7 @@ if TYPE_CHECKING:
         AscendW4A8DynamicFusedMoEMethod,
     )
 
-    from afd_plugin.model_executor.npu.async_cam_layered import LayeredFFNWeights
-
-
-_ATTENTION_ROLE = "attention"
-_FFN_ROLE = "ffn"
-_BOTH_ROLES = frozenset((_ATTENTION_ROLE, _FFN_ROLE))
+    from afd_plugin.model_executor.ffn.npu.expert_weights import QuantizedExpertWeights
 
 
 def _refresh_ascend_fused_moe() -> None:
@@ -80,19 +81,6 @@ def _refresh_ascend_fused_moe() -> None:
     # before either AFD role constructs its local model.
     if native.current_platform.device_type == "npu":
         native.FusedMoEFactory = fused_moe.FusedMoEFactory
-
-
-def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
-    parts = name.split(".")
-    for marker_idx, part in enumerate(parts[:-2]):
-        if part != "layers":
-            continue
-        try:
-            layer_idx = int(parts[marker_idx + 1])
-        except ValueError:
-            continue
-        return layer_idx, parts[marker_idx + 2], tuple(parts[marker_idx + 3 :])
-    return None
 
 
 def _checkpoint_weight_roles(
@@ -114,16 +102,16 @@ def _checkpoint_weight_roles(
     skipping.
     """
 
-    layer_path = _weight_layer_path(name)
+    layer_path = layer_weight_path(name)
     if layer_path is None:
-        return _BOTH_ROLES
+        return BOTH_ROLES
 
     _, stage, remainder = layer_path
     if stage in ("attn", "self_attn"):
-        return frozenset((_ATTENTION_ROLE,))
+        return ATTENTION_ROLE
     if stage in ("ffn", "mlp"):
         if attention_shared_experts and remainder and remainder[0] == "shared_experts":
-            return frozenset((_ATTENTION_ROLE,))
+            return ATTENTION_ROLE
         if remainder and remainder[0] == "gate":
             # Every router parameter, including the Hash id table, belongs to
             # each role that built a router: with the gate on Attention, the
@@ -132,28 +120,12 @@ def _checkpoint_weight_roles(
             # With the gate on FFN the Attention MoE slot is parameter-free, so
             # Attention must not receive any of them.
             if attn_owns_gate:
-                return _BOTH_ROLES
-            return frozenset((_FFN_ROLE,))
-        return frozenset((_FFN_ROLE,))
+                return BOTH_ROLES
+            return FFN_ROLE
+        return FFN_ROLE
     # HC parameters and any future shared layer parameters are required by
     # both role-local model instances.
-    return _BOTH_ROLES
-
-
-def _iter_role_weights(
-    weights: Iterable[tuple[str, torch.Tensor]],
-    *,
-    role: str,
-    attn_owns_gate: bool = True,
-    attention_shared_experts: bool = False,
-) -> Iterator[tuple[str, torch.Tensor]]:
-    for name, loaded_weight in weights:
-        if role in _checkpoint_weight_roles(
-            name,
-            attn_owns_gate=attn_owns_gate,
-            attention_shared_experts=attention_shared_experts,
-        ):
-            yield name, loaded_weight
+    return BOTH_ROLES
 
 
 class AFDDeepseekV4RemoteMoE(RemoteFFNProxy):
@@ -461,7 +433,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             | AFDDeepseekV4RemoteMoE
             | native.DeepseekV4MoE
         )
-        if afd_config.role == _ATTENTION_ROLE:
+        if afd_config.role == "attention":
             self.self_attn = native.DeepseekV4Attention(
                 vllm_config=vllm_config,
                 config=config,
@@ -490,7 +462,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 )
             else:
                 self.mlp = AFDDeepseekV4RemoteMoE(layer_idx=layer_idx)
-        elif afd_config.role == _FFN_ROLE:
+        elif afd_config.role == "ffn":
             self.self_attn = native.PPMissingLayer()
             _refresh_ascend_fused_moe()
             moe_config = config
@@ -521,7 +493,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         # FFN path, even though it also computes the gate on the Attention side.
         if (
             self.uses_external_routing
-            and afd_config.role == _FFN_ROLE
+            and afd_config.role == "ffn"
             and isinstance(self.mlp, native.DeepseekV4MoE)
         ):
             from afd_plugin.model_executor.models.npu import (
@@ -680,7 +652,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         self.vocab_size = config.vocab_size
         self.is_v32 = hasattr(config, "index_topk")
         # ### PATCH START: Attention-owned index buffer
-        if self.is_v32 and afd_config.role == _ATTENTION_ROLE:
+        if self.is_v32 and afd_config.role == "attention":
             topk_tokens = config.index_topk
             topk_indices_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
@@ -722,7 +694,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         for layer in self.layers:
             if isinstance(layer, native.DeepseekV4DecoderLayer):
                 # ### PATCH START: FFN has no Attention implementation
-                if layer.afd_role != _ATTENTION_ROLE:
+                if layer.afd_role != "attention":
                     continue
                 # ### PATCH END: FFN has no Attention implementation
                 impl = layer.self_attn.dsa_attn.dsa_attn.impl
@@ -887,8 +859,10 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         prepare_attention_gate_w8a8_scales(self.model.layers)
         # ### PATCH END: retain FFN gate-on-A W8A8 scales after quant finalize
 
-    def get_async_cam_layered_weights(self) -> "tuple[list[LayeredFFNWeights], str]":
-        return _extract_async_cam_layered_weights(self.model.layers)
+    def get_quantized_expert_weights(
+        self,
+    ) -> "tuple[list[QuantizedExpertWeights], str]":
+        return _extract_quantized_expert_weights(self.model.layers)
 
     def compute_ffn_output(
         self,
@@ -922,27 +896,29 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Only the gate-on-Attention configuration gives Attention a router; with
         # the gate on FFN its MoE slot is a parameter-free transfer shell.
-        # The shared experts follow the router, so their weights load on Attention
-        # for either connector; keying this on the async connector alone would
-        # construct the modules on the sync path without ever loading them.
-        role_weights = _iter_role_weights(
+        # Shared experts follow the router on both Async CAM and sync paths.
+        role_weights = filter_role_weights(
             weights,
             role=self.afd_role,
-            attn_owns_gate=bool(self.afd_config.compute_gate_on_attention),
-            attention_shared_experts=bool(self.afd_config.compute_gate_on_attention),
+            classify=partial(
+                _checkpoint_weight_roles,
+                attn_owns_gate=bool(self.afd_config.compute_gate_on_attention),
+                attention_shared_experts=bool(
+                    self.afd_config.compute_gate_on_attention
+                ),
+            ),
         )
-        loaded = super().load_weights(role_weights)
-        return loaded
+        return super().load_weights(role_weights)
 
 
-def _extract_async_cam_layered_weights(
+def _extract_quantized_expert_weights(
     layers: Iterable[AFDDeepseekV4DecoderLayer],
-) -> "tuple[list[LayeredFFNWeights], str]":
-    """Expose loaded DeepSeek V4 routed-expert weights to the layered executor."""
+) -> "tuple[list[QuantizedExpertWeights], str]":
+    """Expose loaded DeepSeek V4 routed-expert weights to Async CAM compute."""
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm_ascend.quantization.quant_type import QuantType
 
-    from afd_plugin.model_executor.npu.async_cam_layered import LayeredFFNWeights
+    from afd_plugin.model_executor.ffn.npu.expert_weights import QuantizedExpertWeights
 
     layers = [layer for layer in layers if layer.is_moe_layer]
     # Only the FFN role exposes loaded experts; Ascend's factory returns its
@@ -985,7 +961,7 @@ def _extract_async_cam_layered_weights(
                     f"layered GMM layer {layer.layer_idx}: missing loaded {name}"
                 )
         weights.append(
-            LayeredFFNWeights(
+            QuantizedExpertWeights(
                 layer_idx=layer.layer_idx,
                 # The presence checks above establish these dynamically
                 # registered parameters as loaded tensors on the routed owner.

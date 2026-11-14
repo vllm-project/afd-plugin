@@ -14,9 +14,9 @@ torch = pytest.importorskip("torch")
 
 @pytest.fixture
 def preparation(monkeypatch):
-    models = ModuleType("afd_plugin.model_executor.models")
-    models.__dict__["get_afd_metadata_from_forward_context"] = lambda: None
-    monkeypatch.setitem(sys.modules, models.__name__, models)
+    context = ModuleType("afd_plugin.forward_context")
+    context.__dict__["get_afd_metadata_from_forward_context"] = lambda: None
+    monkeypatch.setitem(sys.modules, context.__name__, context)
     quantization = ModuleType("vllm_ascend.quantization.quant_type")
     quant_type = SimpleNamespace(W8A8="w8a8", W4A8="w4a8", NONE="none")
     quantization.__dict__["QuantType"] = quant_type

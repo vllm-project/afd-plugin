@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""DeepSeek attention metadata ownership for staged NPU execution."""
+"""Ascend attention metadata and RoPE buffer ownership for staged execution."""
 
 from __future__ import annotations
 
@@ -21,11 +21,11 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.ops.rope_dsv4 import RopeDataProxy, get_cos_and_sin_dsa
 
 
-def isolate_deepseek_attention_builder_inputs(
+def isolate_attention_builder_inputs(
     builder: AttentionMetadataBuilder,
     metadata: AscendCommonAttentionMetadata,
 ) -> None:
-    """Detach common metadata that a DeepSeek builder mutates in place.
+    """Detach common metadata that an Ascend attention builder mutates in place.
 
     Async CAM builds the full batch before both execution stages.  Stage
     builders therefore must not write through views into the full-batch
@@ -49,7 +49,7 @@ def isolate_deepseek_attention_builder_inputs(
         metadata.block_table_tensor = metadata.block_table_tensor.clone()
 
 
-def materialize_deepseek_attention_metadata(
+def materialize_attention_metadata(
     metadata: AttentionMetadata,
     input_positions: torch.Tensor,
     num_input_tokens: int,
@@ -153,7 +153,7 @@ def _own_rope(
     return buffers[field][: value.shape[0]].copy_(value)
 
 
-def materialize_deepseek_attention_metadata_by_layer(
+def materialize_attention_metadata_by_layer(
     metadata_by_layer: Mapping[str, AttentionMetadata],
     input_positions: torch.Tensor,
     num_input_tokens: int,
@@ -168,7 +168,7 @@ def materialize_deepseek_attention_metadata_by_layer(
         metadata_id = id(metadata)
         if metadata_id in materialized_ids:
             continue
-        materialize_deepseek_attention_metadata(
+        materialize_attention_metadata(
             metadata,
             input_positions,
             num_input_tokens,
@@ -181,7 +181,7 @@ def materialize_deepseek_attention_metadata_by_layer(
 
 
 __all__ = [
-    "isolate_deepseek_attention_builder_inputs",
-    "materialize_deepseek_attention_metadata",
-    "materialize_deepseek_attention_metadata_by_layer",
+    "isolate_attention_builder_inputs",
+    "materialize_attention_metadata",
+    "materialize_attention_metadata_by_layer",
 ]

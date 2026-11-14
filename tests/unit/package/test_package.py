@@ -16,6 +16,17 @@ import pytest
 import afd_plugin
 
 
+def test_models_metadata_compat_export(monkeypatch):
+    from afd_plugin.model_executor import models
+
+    context = ModuleType("afd_plugin.forward_context")
+    metadata_reader = object()
+    context.__dict__["get_afd_metadata_from_forward_context"] = metadata_reader
+    monkeypatch.setitem(sys.modules, context.__name__, context)
+
+    assert models.get_afd_metadata_from_forward_context is metadata_reader
+
+
 @pytest.fixture(params=["cuda", "npu"])
 def registration(monkeypatch, request):
     native = {

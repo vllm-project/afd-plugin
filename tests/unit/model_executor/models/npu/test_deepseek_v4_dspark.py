@@ -12,9 +12,6 @@ import torch  # noqa: E402
 from vllm.config.compilation import CompilationMode  # noqa: E402
 
 from afd_plugin.model_executor.models.npu import deepseek_v4_dspark  # noqa: E402
-from afd_plugin.model_executor.models.npu.deepseek_v4_dspark import (  # noqa: E402
-    _iter_role_weights,
-)
 from tests.unit.fakes.vllm_config import npu_dspark_config  # noqa: E402
 
 
@@ -61,10 +58,28 @@ def test_role_constructor_preserves_native_eager_call(eager_role_model):
         ("head.weight", {"attention"}),
     ],
 )
-def test_role_receives_only_owned_checkpoint_weights(name, roles):
+def test_dspark_loader_streams_only_role_owned_weights(
+    name, roles, eager_role_model, monkeypatch
+):
     weight = torch.ones(1)
-    for role in ("attention", "ffn"):
-        actual = list(_iter_role_weights(iter([(name, weight)]), role=role))
-        assert [key for key, _ in actual] == ([name] if role in roles else [])
-        if actual:
-            assert actual[0][1] is weight
+    loaded: list[tuple[str, object]] = []
+
+    def load_weights(_model, weights):
+        loaded[:] = weights
+        return {key for key, _ in loaded}
+
+    monkeypatch.setattr(
+        deepseek_v4_dspark.native.DSparkDeepseekV4ForCausalLM,
+        "load_weights",
+        load_weights,
+    )
+    roles_to_check: tuple[object, ...] = ("attention", "ffn", None, "invalid", [])
+    for role in roles_to_check:
+        eager_role_model.afd_role = role
+        should_load = role in ("attention", "ffn") and role in roles
+        assert eager_role_model.load_weights(iter([(name, weight)])) == (
+            {name} if should_load else set()
+        )
+        assert [key for key, _ in loaded] == ([name] if should_load else [])
+        if loaded:
+            assert loaded[0][1] is weight

@@ -10,7 +10,8 @@ connector (which requires ``compute_gate_on_attention``), Attention also runs
 the MoE gate and top-k, and FFN runs only the routed experts.
 """
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -25,14 +26,17 @@ from afd_plugin.config import (
     AFDConfig,
     parse_afd_config,
 )
-from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
+from afd_plugin.model_executor.ffn.remote import RemoteFFNProxy
+from afd_plugin.model_executor.models._weight_utils import (
+    ATTENTION_ROLE,
+    BOTH_ROLES,
+    FFN_ROLE,
+    filter_role_weights,
+    layer_weight_path,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-
-_ATTENTION_ROLE = frozenset(("attention",))
-_FFN_ROLE = frozenset(("ffn",))
-_BOTH_ROLES = frozenset(("attention", "ffn"))
 
 
 def _is_moe_layer(config: Qwen3MoeConfig, layer_idx: int) -> bool:
@@ -49,20 +53,6 @@ def _routes_on_attention(afd_config: AFDConfig) -> bool:
     return afd_config.connector in DEEPEP_M2N_CONNECTORS
 
 
-def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
-    """Return ``(layer index, stage, remainder)`` for a native decoder path."""
-    parts = name.split(".")
-    for marker_idx, part in enumerate(parts[:-2]):
-        if part != "layers":
-            continue
-        try:
-            layer_idx = int(parts[marker_idx + 1])
-        except ValueError:
-            continue
-        return layer_idx, parts[marker_idx + 2], tuple(parts[marker_idx + 3 :])
-    return None
-
-
 def _checkpoint_weight_roles(
     name: str,
     *,
@@ -74,34 +64,19 @@ def _checkpoint_weight_roles(
     Attention routes with it, and FFN keeps the native gate parameter that
     vLLM's strict loader requires but never runs it.
     """
-    layer_path = _weight_layer_path(name)
+    layer_path = layer_weight_path(name)
     if layer_path is None:
-        return _BOTH_ROLES
+        return BOTH_ROLES
 
     _layer_idx, stage, remainder = layer_path
     if stage == "mlp":
         is_moe_gate = bool(remainder) and remainder[0] == "gate"
         if is_moe_gate and routes_on_attention:
-            return _BOTH_ROLES
-        return _FFN_ROLE
+            return BOTH_ROLES
+        return FFN_ROLE
     if stage in {"self_attn", "input_layernorm", "post_attention_layernorm"}:
-        return _ATTENTION_ROLE
-    return _BOTH_ROLES
-
-
-def _iter_role_weights(
-    weights: Iterable[tuple[str, torch.Tensor]],
-    *,
-    role: str,
-    routes_on_attention: bool = False,
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """Consume a checkpoint iterator once and retain this role's paths."""
-    for name, loaded_weight in weights:
-        if role in _checkpoint_weight_roles(
-            name,
-            routes_on_attention=routes_on_attention,
-        ):
-            yield name, loaded_weight
+        return ATTENTION_ROLE
+    return BOTH_ROLES
 
 
 def _validate_supported_config(
@@ -402,10 +377,13 @@ class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
     # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # ### PATCH START: filter the checkpoint stream by AFD execution role.
-        role_weights = _iter_role_weights(
+        role_weights = filter_role_weights(
             weights,
             role=self.afd_role,
-            routes_on_attention=_routes_on_attention(self.afd_config),
+            classify=partial(
+                _checkpoint_weight_roles,
+                routes_on_attention=_routes_on_attention(self.afd_config),
+            ),
         )
         # ### PATCH END: filter the checkpoint stream by AFD execution role.
         return super().load_weights(role_weights)

@@ -13,10 +13,10 @@ pytest.importorskip("vllm")
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, ForwardContext
 
-import afd_plugin.model_executor.models.forward_context as afd_forward_context
+import afd_plugin.forward_context as afd_forward_context
 from afd_plugin.config import AFDConfig
 from afd_plugin.connectors import AFDControlPayload
-from afd_plugin.model_executor.models.forward_context import (
+from afd_plugin.forward_context import (
     get_afd_metadata_from_forward_context,
     use_afd_metadata_provider,
 )

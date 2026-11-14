@@ -10,28 +10,6 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
-from afd_plugin.model_executor.models import (  # noqa: E402
-    get_afd_metadata_from_forward_context,
-)
-
-
-def test_get_afd_metadata_from_additional_kwargs():
-    forward_context = SimpleNamespace(
-        additional_kwargs={"afd_metadata": {"stage": 0}},
-        afd_metadata={"stage": 1},
-    )
-
-    assert get_afd_metadata_from_forward_context(forward_context) == {"stage": 0}
-
-
-def test_get_afd_metadata_ignores_forward_context_attribute():
-    forward_context = SimpleNamespace(
-        additional_kwargs={},
-        afd_metadata={"stage": 0},
-    )
-
-    assert get_afd_metadata_from_forward_context(forward_context) is None
-
 
 def test_async_cam_profile_forward_runs_matched_connector_io(
     monkeypatch,
@@ -53,10 +31,10 @@ def test_async_cam_profile_forward_runs_matched_connector_io(
     )
 
     connector_calls: list[str] = []
-    from afd_plugin.model_executor.models.npu import async_cam_layout
+    from afd_plugin.model_executor.ffn.npu import async_cam
 
     monkeypatch.setattr(
-        async_cam_layout,
+        async_cam,
         "get_tp_group",
         lambda: SimpleNamespace(world_size=1, rank_in_group=0),
     )

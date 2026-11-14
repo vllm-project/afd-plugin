@@ -42,7 +42,7 @@ from afd_plugin.connectors import (
     AFDConnectorFactory,
     AFDForwardContextMetadata,
 )
-from afd_plugin.model_executor.models.forward_context import use_afd_metadata_provider
+from afd_plugin.forward_context import use_afd_metadata_provider
 from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
     _resolve_world_ranks,
