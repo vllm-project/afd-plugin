@@ -791,6 +791,8 @@ def _init_pair(
     selection="ALLGATHER",
     selector=None,
     topk=2,
+    gate=None,
+    gates=None,
 ):
     """Drive the real startup handshake for a 1A1F pair and record every event."""
     import types as _types
@@ -804,11 +806,25 @@ def _init_pair(
         backend = SimpleNamespace(get_hccl_comm_name=lambda rank: f"hccl-{name}")
         return SimpleNamespace(_get_backend=lambda device: backend, name=name)
 
+    if gate is None:
+        # Mode 4 requires the Attention-side gate; a mode-0 pair carries routing
+        # only when the gate is on, which is what a verdict preset encodes.
+        gate = verdicts is not None or mode == 4
+
     def fake_gather(output, local, group=None):
         width = int(local.numel())
-        events.append("mode_gather" if width == 2 else "verdict_gather")
+        events.append("mode_gather" if width == 3 else "verdict_gather")
         published.append([int(value) for value in local.tolist()])
-        source = gathered_modes if width == 2 else verdicts
+        if width == 3:
+            row_gates = (
+                gates if gates is not None else [int(gate)] * len(gathered_modes)
+            )
+            source = [
+                list(row) + [row_gates[index]]
+                for index, row in enumerate(gathered_modes)
+            ]
+        else:
+            source = verdicts
         assert source is not None, "no preset for this collective"
         target = output.view(-1, width)
         target.copy_(torch.as_tensor(source, dtype=torch.int32).reshape_as(target))
@@ -840,7 +856,7 @@ def _init_pair(
         def device(name):
             return name
 
-    if selector is not None or mode == 4:
+    if selector is not None or mode == 4 or verdicts is not None:
         module = _types.ModuleType("vllm_ascend.ascend_forward_context")
 
         class _MoECommType:
@@ -873,7 +889,7 @@ def _init_pair(
                 role=role,
                 num_attention_ranks=1,
                 num_ffn_ranks=1,
-                compute_gate_on_attention=True,
+                compute_gate_on_attention=gate,
             ),
             0,
         )
@@ -1009,7 +1025,7 @@ def test_startup_handshake_stops_where_the_pair_is_refused(
     else:
         assert error is not None and error_match in str(error)
     if mode == 4 and role == "ffn":
-        assert published[0] == [4, 0], "the FFN must publish no batch bound"
+        assert published[0] == [4, 0, 1], "the FFN must publish no batch bound"
 
 
 def test_startup_handshake_asks_the_selector_about_attentions_bound(monkeypatch, on_a5):
@@ -1032,7 +1048,7 @@ def test_startup_handshake_asks_the_selector_about_attentions_bound(monkeypatch,
 
     assert error is None
     assert asked == [1024]
-    assert published[0] == [4, 0]
+    assert published[0] == [4, 0, 1]
 
 
 def test_startup_handshake_reports_a_selector_failure_to_both_roles(monkeypatch, on_a5):
@@ -1148,7 +1164,7 @@ def test_the_routing_id_bound_is_judged_from_the_attention_role(monkeypatch, on_
 
     assert error is None, "the FFN rejected a valid pair on its own limit"
     assert seen == ["afd", "mode_gather", "verdict_gather", "afd_moe", "p2p"]
-    assert published[0] == [4, 0]
+    assert published[0] == [4, 0, 1]
 
 
 def test_the_handshake_rejects_a_bound_the_ids_cannot_fit(monkeypatch, on_a5):
@@ -1180,3 +1196,36 @@ def test_the_handshake_rejects_a_bound_the_ids_cannot_fit(monkeypatch, on_a5):
     )
     assert seen == ["afd", "mode_gather"], seen
     assert error is not None and "publishes 8150" in str(error)
+
+
+def test_the_handshake_rejects_a_mixed_gate(monkeypatch, on_a5):
+    """A and F disagreeing about the ids slot must fail before any A2E."""
+    seen, published, error, _ = _init_pair(
+        monkeypatch,
+        role="ffn",
+        mode=0,
+        gate=False,
+        gates=[0, 1],
+        gathered_modes=[[0, 0], [0, 0]],
+    )
+
+    assert seen == ["afd", "mode_gather"], seen
+    assert published[0] == [0, 0, 0], published
+    assert error is not None and "compute_gate_on_attention mismatch" in str(error)
+
+
+def test_mode_0_gate_on_refuses_a_path_the_selector_cannot_serve(monkeypatch, on_a5):
+    """BF16 routing has the same ALLGATHER/MC2 contract as mode 4."""
+    seen, published, error, _ = _init_pair(
+        monkeypatch,
+        role="ffn",
+        mode=0,
+        gate=True,
+        gathered_modes=[[0, 0], [0, 4096]],
+        verdicts=[0, 1],
+        selection="ALLTOALL",
+    )
+
+    assert seen == ["afd", "mode_gather", "verdict_gather"], seen
+    assert published[-1] == [0], published
+    assert error is not None and "chose another path" in str(error)

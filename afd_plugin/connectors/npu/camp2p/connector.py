@@ -524,6 +524,24 @@ def _require_one_path_verdict(
     )
 
 
+def _require_one_gate(gates: list[int], local_gate: bool) -> None:
+    """Fail on every rank when the roles disagree about the ids slot.
+
+    With the Attention-side gate on, the A2E ids slot carries routing ids; with
+    it off, the same slot carries token ids. Both configurations pass
+    construction, so a mixed pair exchanges payloads successfully and the FFN
+    then reads one as the other -- silent wrong data instead of an error.
+    """
+    others = sorted({bool(gate) for gate in gates} - {bool(local_gate)})
+    if others:
+        raise RuntimeError(
+            "CAMP2P compute_gate_on_attention mismatch across ranks: this rank "
+            f"sends {bool(local_gate)} while the group also reports {others}. The "
+            "A2E ids slot carries token ids with the gate off and routing ids with "
+            "it on; set the same afd.compute_gate_on_attention on both roles",
+        )
+
+
 class CAMP2pAFDConnector(AFDConnectorBase):
     """Move model data between Attention and FFN workers on Ascend NPU.
 
@@ -741,27 +759,31 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         # small collective fails both ends here -- before profile, capture and the
         # first A2E call -- instead of leaving the Attention side waiting for an E2A
         # the FFN side will never send.
+        gate_on = self.afd_config.compute_gate_on_attention
         attention_bound = (
             self.max_num_batched_tokens if self.afd_config.role == "attention" else 0
         )
         world_size = self.ffn_size + self.attn_size
         local_mode = torch.tensor(
-            [self.quant_mode, attention_bound],
+            [self.quant_mode, attention_bound, int(gate_on)],
             dtype=torch.int32,
             device="npu",
         )
-        gathered_modes = torch.empty(world_size * 2, dtype=torch.int32, device="npu")
+        gathered_modes = torch.empty(world_size * 3, dtype=torch.int32, device="npu")
         torch.distributed.all_gather_into_tensor(
             gathered_modes,
             local_mode,
             group=self.afd_pg,
         )
-        rows = gathered_modes.view(-1, 2)
+        rows = gathered_modes.view(-1, 3)
         _require_one_quant_mode(rows[:, 0].tolist(), self.quant_mode)
+        # The ids slot carries token ids with the Attention-side gate off and
+        # routing ids with it on; a mixed pair exchanges payloads and then reads
+        # one as the other, so the disagreement has to fail here.
+        _require_one_gate(rows[:, 2].tolist(), gate_on)
         if self.quant_mode == A2E_QUANT_MODE_MXFP8:
-            # Only an all-mode-4 group asks the selector, so BF16 keeps exactly
-            # one startup collective. The ids of one call have to fit the UB
-            # region, and both roles judge that from the same published bound.
+            # The ids of one call have to fit the UB region, and both roles
+            # judge that from the same published bound.
             rows_max = A2E_MX_GATE_UB_BYTES // (self.num_experts_per_tok * 4)
             attention_rows = int(rows[:, 1].max())
             if attention_rows > rows_max:
@@ -772,6 +794,11 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                     f"publishes {attention_rows}. Lower --max-num-batched-tokens "
                     "on the Attention role or keep quant_mode=0",
                 )
+        if self.quant_mode == A2E_QUANT_MODE_MXFP8 or gate_on:
+            # Mode 4 always carries routing; mode 0 does so only with the gate on,
+            # which is why a gate-off BF16 pair still exchanges one collective.
+            # The selector is asked about the batch Attention can send, and a
+            # rejection is settled on both roles before the groups exist.
             verdict, failure = self._moe_path_verdict(rows)
             gathered_verdicts = torch.empty(
                 world_size,
