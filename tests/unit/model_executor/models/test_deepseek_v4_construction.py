@@ -10,6 +10,7 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 from torch import nn  # noqa: E402
 
+from afd_plugin.config import AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v4 as adapter  # noqa: E402
 
 
@@ -109,7 +110,7 @@ def _make_model(monkeypatch, *, role: str, vllm_config=None):
 
 
 def _make_layer(monkeypatch, *, role: str, layer_idx: int):
-    afd_config = SimpleNamespace(role=role)
+    afd_config = AFDConfig(role=role)
     monkeypatch.setattr(
         adapter,
         "parse_afd_config",

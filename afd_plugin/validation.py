@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
+    AFD_ASYNC_GPU_CONNECTOR,
     CAMP2P_CONNECTOR,
     DEEPEP_M2N_CONNECTORS,
     AFDConfig,
@@ -47,6 +48,12 @@ GPU_MRV2_NUM_UBATCHES: Final[int] = 2
 GPU_MRV2_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pNcclAFDConnector",
     *DEEPEP_M2N_CONNECTORS,
+    AFD_ASYNC_GPU_CONNECTOR,
+)
+ASYNC_GPU_MODEL_ARCHITECTURES: Final[tuple[str, ...]] = (
+    "DeepseekV2ForCausalLM",
+    "DeepseekV3ForCausalLM",
+    "DeepseekV4ForCausalLM",
 )
 # Models whose Attention side computes the MoE gate and top-k and sends them
 # with the hidden states, as a routed-experts connector (DeepEP M2N) needs.
@@ -128,11 +135,33 @@ def validate_gpu_model_runner_v2_config(
     afd_config = parse_afd_config(vllm_config, expected_role=expected_role)
     if device_type != "cuda" or afd_config.connector not in GPU_MRV2_CONNECTORS:
         raise RuntimeError(
-            "AFD ModelRunnerV2 requires CUDA and one of the synchronous "
+            "AFD ModelRunnerV2 requires CUDA and one of the "
             f"connectors {GPU_MRV2_CONNECTORS}",
         )
 
     parallel = vllm_config.parallel_config
+    if afd_config.connector == AFD_ASYNC_GPU_CONNECTOR:
+        if expected_role == "ffn" and parallel.tensor_parallel_size != 1:
+            raise RuntimeError(
+                f"{AFD_ASYNC_GPU_CONNECTOR} requires FFN tensor_parallel_size=1"
+            )
+        if expected_role == "ffn" and parallel.expert_placement_strategy != "linear":
+            raise RuntimeError(
+                f"{AFD_ASYNC_GPU_CONNECTOR} requires linear FFN expert placement"
+            )
+        architectures = vllm_config.model_config.hf_config.architectures
+        if not any(
+            architecture.removeprefix("AFD") in ASYNC_GPU_MODEL_ARCHITECTURES
+            for architecture in architectures
+        ):
+            raise RuntimeError(
+                f"{AFD_ASYNC_GPU_CONNECTOR} supports only "
+                f"{ASYNC_GPU_MODEL_ARCHITECTURES}, got {architectures}"
+            )
+        if vllm_config.speculative_config is not None:
+            raise RuntimeError(
+                f"{AFD_ASYNC_GPU_CONNECTOR} does not support speculative decoding"
+            )
     # DeepEP M2N: Attention may run TP > 1, each TP rank dispatching its own
     # slice of the tokens. FFN experts are not TP-sharded; that and the other
     # deployment checks (expert placement, all2all backend, weight format) run

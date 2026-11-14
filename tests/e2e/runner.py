@@ -66,6 +66,7 @@ from tests.e2e.process_utils import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ASYNC_AFD_CONNECTOR = "CAMAsyncAFDConnector"
+GPU_ASYNC_AFD_CONNECTOR = "GpuAsyncAFDConnector"
 NPU_EAGER_DBO_SCENARIO = "afd-eager-dbo-2a2f"
 NPU_EAGER_DBO_DECODE_THRESHOLD = 32
 NPU_EAGER_DBO_PREFILL_THRESHOLD = 512
@@ -742,7 +743,7 @@ def parse_afd_connector_extra_config(values: list[str]) -> dict[str, Any]:
 
 
 def uses_async_connector(args: argparse.Namespace) -> bool:
-    return args.afd_connector == ASYNC_AFD_CONNECTOR
+    return args.afd_connector in (ASYNC_AFD_CONNECTOR, GPU_ASYNC_AFD_CONNECTOR)
 
 
 def uses_npu_async_process_cleanup(args: argparse.Namespace) -> bool:

@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 FFN_LOOP_JOIN_TIMEOUT_S = 5
+ASYNC_FFN_DRAIN_TIMEOUT_S = 120
 
 
 class AFDFFNWorker(Worker):
@@ -105,6 +106,12 @@ class AFDFFNWorker(Worker):
         """Construct the connector-driven runner via the native factory hook."""
         afd_config = parse_afd_config(self.vllm_config, expected_role="ffn")
         connector_cls = AFDConnectorFactory.get_connector_class(afd_config.connector)
+        if afd_config.async_dp:
+            from afd_plugin.v1.worker.async_ffn_model_runner import (
+                GPUAsyncFFNModelRunner,
+            )
+
+            return GPUAsyncFFNModelRunner(self.vllm_config, self.device)  # type: ignore[return-value]
         if issubclass(connector_cls, AFDRoutedExpertsConnector):
             from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (
                 GPUFFNRoutedExpertsModelRunner,
@@ -125,7 +132,6 @@ class AFDFFNWorker(Worker):
 
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.model_runner.initialize_kv_cache(kv_cache_config)
-        self.model_runner.initialize_afd_connector()
         self.start_ffn_server_loop()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
@@ -154,6 +160,9 @@ class AFDFFNWorker(Worker):
         self.raise_ffn_loop_error_if_any()
         connector = self.model_runner.connector
         if not connector.is_initialized:
+            if connector.control_plane is None:
+                # Capture before rendezvous; Attention profiles immediately after.
+                self.model_runner.capture_padded_ffn_graphs()
             self.model_runner.initialize_afd_connector()
 
         self._ffn_shutdown_event = threading.Event()
@@ -181,15 +190,15 @@ class AFDFFNWorker(Worker):
         if self.device.type == "cuda":
             torch.cuda.set_device(self.device)
 
-        while not event.is_set():
-            control_plane = self.model_runner.connector.control_plane
-            if control_plane is None:
-                raise NotImplementedError(
-                    "GPU FFN only supports control-plane-driven connectors; "
-                    "connectors without a control plane (control_plane is None) "
-                    "are not supported.",
-                )
+        control_plane = self.model_runner.connector.control_plane
+        if control_plane is None:
+            while self.model_runner.execute_connector_driven_step(event.is_set()):
+                pass
+            self.model_runner.drain()
+            self.model_runner.session.finish_receiver()
+            return
 
+        while not event.is_set():
             try:
                 payload = control_plane.recv_dp_metadata_list()
             except AFDControlPlaneClosedError:
@@ -235,9 +244,17 @@ class AFDFFNWorker(Worker):
             control_plane.close()
         thread = self._ffn_thread
         if thread is not None:
-            thread.join(timeout=FFN_LOOP_JOIN_TIMEOUT_S)
+            timeout = (
+                ASYNC_FFN_DRAIN_TIMEOUT_S
+                if control_plane is None
+                else FFN_LOOP_JOIN_TIMEOUT_S
+            )
+            thread.join(timeout=timeout)
             if thread.is_alive():
                 raise RuntimeError("AFD FFN worker loop did not stop before shutdown")
+        if control_plane is None:
+            self.raise_ffn_loop_error_if_any()
+            self.model_runner.session.validate_shutdown()
         self._ffn_thread = None
         self._ffn_shutdown_event = None
         self.raise_ffn_loop_error_if_any()
@@ -252,10 +269,15 @@ class AFDFFNWorker(Worker):
     # Removal plan: remove when the native worker owns the AFD receiver lifecycle.
     def shutdown(self) -> None:
         # ### PATCH START: release native state only after the receiver exits.
+        receiver_stopped = False
         try:
             self.stop_ffn_server_loop()
+            receiver_stopped = True
         finally:
-            if self._ffn_thread is None:
+            if receiver_stopped or (
+                self.model_runner.connector.control_plane is not None
+                and self._ffn_thread is None
+            ):
                 super().shutdown()
         # ### PATCH END: release native state only after the receiver exits.
 

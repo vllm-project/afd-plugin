@@ -18,6 +18,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker import utils as v2_worker_utils
+from vllm.v1.worker.dp_utils import skip_dp_coordination
 from vllm.v1.worker.gpu import cudagraph_utils as v2_cudagraph_utils
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
@@ -311,10 +312,11 @@ def _use_afd_fullgraph_replay_hook(
             runner._is_warmup = False
             runner._afd_is_graph_capturing = False
             runner._afd_is_graph_replaying = True
-            runner.send_dp_metadata(
-                runner.build_capture_dp_metadata(padded_tokens),
-                None,
-            )
+            if runner.connector.control_plane is not None:
+                runner.send_dp_metadata(
+                    runner.build_capture_dp_metadata(padded_tokens),
+                    None,
+                )
             result = original_run_fullgraph(desc)
         finally:
             runner._afd_is_graph_replaying = previous_is_graph_replaying
@@ -358,6 +360,9 @@ def _use_afd_execution_context(
     )
     try:
         with (
+            skip_dp_coordination()
+            if runner.connector.control_plane is None
+            else nullcontext(),
             use_gpu_mrv2_dbo_dispatch(),
             replay_scope,
             _use_afd_ubatch_preparation(runner),
@@ -411,7 +416,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
             # The connector rendezvous is deferred to the end of ``load_model()``
             # so Attention and FFN weight loading overlap, matching the V1
             # Attention runner lifecycle.
-            if connector.control_plane is None:
+            if connector.control_plane is None and not self.afd_config.async_dp:
                 raise RuntimeError(
                     "AFD ModelRunnerV2 requires a control-plane-driven connector",
                 )

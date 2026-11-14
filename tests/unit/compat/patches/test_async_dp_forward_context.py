@@ -157,13 +157,14 @@ def _load_patch_module(monkeypatch: pytest.MonkeyPatch):
     return module
 
 
-def test_async_dp_forward_context_skips_dp_metadata(monkeypatch):
+@pytest.mark.parametrize("connector", ["CAMAsyncAFDConnector", "GpuAsyncAFDConnector"])
+def test_async_dp_forward_context_skips_dp_metadata(monkeypatch, connector):
     _load_patch_module(monkeypatch)
     forward_module = sys.modules["vllm.forward_context"]
 
     with forward_module.set_forward_context(
         attn_metadata=object(),
-        vllm_config=_config(),
+        vllm_config=_config(connector=connector),
         num_tokens=4,
     ):
         context = forward_module.current_forward_context

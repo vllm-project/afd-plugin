@@ -132,7 +132,7 @@ def test_parse_async_dp_config_from_async_alias():
 
 
 def test_async_dp_requires_async_connector():
-    with pytest.raises(ValueError, match="requires connector='CAMAsyncAFDConnector'"):
+    with pytest.raises(ValueError, match="requires connector in"):
         parse_afd_config(
             {
                 "afd": {
@@ -142,6 +142,31 @@ def test_async_dp_requires_async_connector():
                 },
             },
         )
+
+
+@pytest.mark.parametrize(
+    "async_dp,gate_on_attention,error",
+    [
+        (True, True, None),
+        (False, True, "requires async=true"),
+        (True, False, "requires compute_gate_on_attention=true"),
+    ],
+)
+def test_gpu_async_config_requires_connector_driven_attention_routing(
+    async_dp, gate_on_attention, error
+):
+    raw = {
+        "connector": "GpuAsyncAFDConnector",
+        "async": async_dp,
+        "compute_gate_on_attention": gate_on_attention,
+    }
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            afd_config_from_mapping(raw)
+    else:
+        config = afd_config_from_mapping(raw)
+        assert config.connector == "GpuAsyncAFDConnector"
+        assert is_afd_async_dp({"afd": raw})
 
 
 def test_original_common_afd_field_aliases_are_supported():
@@ -192,6 +217,8 @@ def test_is_afd_active_requires_common_config_validity():
     [
         ("CAMAsyncAFDConnector", True, True),
         ("CAMAsyncAFDConnector", False, False),
+        ("GpuAsyncAFDConnector", True, True),
+        ("GpuAsyncAFDConnector", False, False),
         ("CAMP2pAFDConnector", False, False),
     ],
 )

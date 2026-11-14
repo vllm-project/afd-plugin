@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -111,9 +113,26 @@ def test_v4_load_weights_filters_raw_checkpoint_names_once(
     )
     model = object.__new__(AFDDeepseekV4ForCausalLM)
     object.__setattr__(model, "afd_role", role)
+    object.__setattr__(
+        model, "afd_config", SimpleNamespace(compute_gate_on_attention=False)
+    )
 
     result = model.load_weights(weights)
 
     assert result is native_result
     assert seen == expected_names
     assert weights.iterations == 1
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("layers.0.ffn.gate.weight", frozenset(("attention", "ffn"))),
+        ("layers.0.ffn.gate.tid2eid", frozenset(("attention", "ffn"))),
+        ("layers.1.ffn.gate.e_score_correction_bias", frozenset(("attention", "ffn"))),
+        ("layers.0.ffn.experts.0.w1.weight", frozenset(("ffn",))),
+        ("layers.0.ffn.shared_experts.w2.weight", frozenset(("ffn",))),
+    ],
+)
+def test_v4_async_gate_weights_load_on_attention_and_ffn(name, expected):
+    assert _checkpoint_weight_roles(name, compute_gate_on_attention=True) == expected

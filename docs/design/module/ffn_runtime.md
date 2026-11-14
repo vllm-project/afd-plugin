@@ -9,6 +9,7 @@ primary_code_paths:
   - "afd_plugin/ffn_faas/**"
   - "afd_plugin/v1/worker/ffn_metadata.py"
   - "afd_plugin/v1/worker/ffn_model_runner.py"
+  - "afd_plugin/v1/worker/async_ffn_model_runner.py"
   - "afd_plugin/v1/worker/ffn_routed_experts_model_runner.py"
   - "afd_plugin/v1/worker/ffn_worker.py"
   - "afd_plugin/v1/worker/npu/ffn_model_runner.py"
@@ -32,6 +33,7 @@ validation_paths:
   - "tests/npu/test_async_cam_layered_w8a8.py"
   - "tests/unit/v1/worker/test_ffn_metadata.py"
   - "tests/unit/v1/worker/test_ffn_model_runner.py"
+  - "tests/unit/v1/worker/test_async_ffn_model_runner.py"
   - "tests/unit/v1/worker/test_ffn_routed_experts_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
@@ -64,7 +66,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-11-09
+last_reviewed: 2026-11-10
 ---
 
 # FFN runtime
@@ -461,3 +463,21 @@ optional control-plane split. Connector metadata ownership, transfer state
 separation, and the public shape of the connector work-item interface remain
 open in [#88](https://github.com/JiusiServe/afd-plugin/issues/88) and
 [#105](https://github.com/JiusiServe/afd-plugin/issues/105).
+
+## Async GPU candidate lifecycle
+
+`GPUAsyncFFNModelRunner` consumes the async GPU connector's arriving work items
+and selects the layer from their validated headers. It does not construct a
+scheduler or perform an FFN DP agreement. The model computes already-routed rows
+through its local expert adapter and returns routed and shared outputs for the
+connector to combine.
+
+Optional bucketed expert graphs use fixed input/count buffers, reserve the
+largest grouped-GEMM workspace before capture, and run oversized or uncaptured
+items eagerly. Capture finishes before the cross-role rendezvous so Attention
+profiling can immediately dispatch. The connector's `FFNExecutionSession` owns
+the producer-drain handshake; worker shutdown retains model and transport
+resources until that session finishes. Local expert graphs and both stages have
+been exercised on single-node H20 with DeepSeek-V2-Lite-Chat. The
+[validation record](../async_gpu_cross_node_research.md) scopes that evidence;
+other model, quantization and multi-node cells remain unqualified.

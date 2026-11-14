@@ -28,6 +28,7 @@ def _run_setup_py(
     has_torch_npu: bool = False,
     has_ascend_toolkit: bool = False,
     ascend_env_var: str | None = None,
+    afd_build_gpu_async_ops: str = "0",
 ) -> list[str]:
     root = Path(__file__).resolve().parents[3]
     captured: dict[str, object] = {}
@@ -53,6 +54,7 @@ def _run_setup_py(
     monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
     monkeypatch.setattr(Path, "exists", fake_path_exists)
     monkeypatch.delenv("AFD_BUILD_ASCEND_OPS", raising=False)
+    monkeypatch.setenv("AFD_BUILD_GPU_ASYNC_OPS", afd_build_gpu_async_ops)
     for name in _ASCEND_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     if afd_build_ascend_ops is not None:
@@ -70,6 +72,26 @@ def test_ascend_ops_build_is_disabled_by_default_on_gpu(
     monkeypatch: pytest.MonkeyPatch,
 ):
     assert _run_setup_py(monkeypatch) == []
+
+
+@pytest.mark.parametrize(
+    ("ascend_enabled", "expected"),
+    [
+        ("0", ["afd_plugin._C_gpu_async"]),
+        ("1", ["afd_plugin._C_ascend", "afd_plugin._C_gpu_async"]),
+    ],
+)
+def test_gpu_async_extension_is_opt_in_and_independent_of_ascend(
+    monkeypatch: pytest.MonkeyPatch, ascend_enabled: str, expected: list[str]
+):
+    assert (
+        _run_setup_py(
+            monkeypatch,
+            afd_build_ascend_ops=ascend_enabled,
+            afd_build_gpu_async_ops="1",
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
