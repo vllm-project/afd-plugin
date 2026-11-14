@@ -643,3 +643,71 @@ the same four tests, and reports failures and process cleanup.
 Async CAM uses layered FFN execution with DeepSeek-V4 W4A8/W8A8. The
 DeepSeek-V2-Lite Async CAM smoke and ubatching scenarios have been retired;
 see the DeepSeek-V4 Async CAM profile above for the supported NPU entrypoint.
+
+## A3 Async CAM Pull MegaMoE
+
+Issue [#576](https://github.com/vllm-project/afd-plugin/issues/576) is covered by
+`afd-dsv4-flash-async-cam-pull-mega-dp2tp4-ep8` in the model-owned `cases.py` and
+`test_async_cam_npu.py`. This is the opt-in `CAMAsyncAFDConnector` Pull path on
+Ascend A3/910C, using DeepSeek-V4-Flash per-channel W4A8 (or a compatible
+per-channel W8A8 checkpoint), sixteen NPU devices, Attention DP2/TP4 and FFN
+DP8/TP1/EP8. Both roles receive `ffn_mega_moe=true` and `dynamicQuant=1`.
+The existing `afd-dsv4-flash-async-cam-dp2tp4-ep8` remains Mega-off.
+
+Use the target branch's pinned vLLM/vLLM-Ascend stack (vLLM 0.32.0 target),
+CANN runtime, and plugin native operators built from the same source tip.
+Do not substitute A5 CAM async-megamoe operators or the FFN FULL helper (#509).
+The new case keeps both roles eager and the existing Attention DBO setting.
+Its test-only observers synchronize completed native work; use it for functional
+validation, never performance measurement.
+
+Use a clean committed checkout for qualification. Run from the repository root
+with the existing Async CAM prerequisites above:
+
+```bash
+set -o pipefail
+export AFD_E2E_BACKEND=npu
+export AFD_E2E_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V4-Flash-W4A8
+export HCCL_IF_IP=<host-ip>
+export HCCL_SOCKET_IFNAME=<interface>
+export HF_HOME=/path/to/huggingface
+mkdir -p artifacts/pull-mega
+# Keep the exact tip, local changes, native libraries and software stack together.
+git rev-parse HEAD > artifacts/pull-mega/tip.txt
+git diff --binary > artifacts/pull-mega/source.patch
+python -m pip freeze > artifacts/pull-mega/packages.txt
+npu-smi info > artifacts/pull-mega/npu.txt
+find afd_plugin/_cann_ops_custom -type f -exec sha256sum {} + \
+  > artifacts/pull-mega/native-sha256.txt
+python -m pytest -s --basetemp=artifacts/pull-mega/pytest \
+  tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py \
+  2>&1 | tee artifacts/pull-mega/pytest.log
+```
+
+Enable `set -o pipefail` when using `tee` to preserve pytest's exit status.
+Record the container image digest and `cat /usr/local/Ascend/ascend-toolkit/latest/version.cfg`
+(or the installed CANN version file) alongside these artifacts. A new source tip,
+model or rebuilt native package requires new evidence. Neither checkpoint mode
+has been qualified by adding this case; record the exact checkpoint path and
+quantization with every hardware run.
+
+Running this module selects both Mega-off and Mega-on sequentially with the
+same ten concurrent arithmetic requests and exact-answer/normal-stop criteria.
+For only Mega-on, append
+`::test_deepseek_v4_flash_async_cam[afd-dsv4-flash-async-cam-pull-mega-dp2tp4-ep8]`
+to the module path. A registered entry does not by itself schedule weekly CI.
+
+Each case directory under `artifacts/pull-mega/pytest` contains `run.json`,
+`attention.log`, `ffn.log`, and `evaluation/completions.json`. Mega-on additionally
+requires `evaluation/mrv2.json`: every Attention rank must complete a Pull
+combine and every FFN rank must complete the actual native Mega executor with
+a nonempty, non-idle transaction after the evaluation window opens. Startup,
+dummy work before that window, missing ranks, and Push/Layered fallback fail.
+`run.json.cleanup` records cleanup errors, including orphan processes that were
+found and reaped. Cleanup is still attempted, but for this
+Mega case an exit or cleanup failure does not fail pytest after the workload and
+Pull execution checks pass. A failed startup, request, answer, or execution check
+still fails the case. Inspect the cleanup record for the separate shutdown result.
+The native worker extension is loaded only for the new case. Hardware execution
+and graceful shutdown must be assessed separately from the pytest result.
