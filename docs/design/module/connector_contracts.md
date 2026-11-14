@@ -6,6 +6,7 @@ owners:
   - "@hsliuustc0106"
   - "@jiangkuaixue123"
 primary_code_paths:
+  - "csrc/gpu/**"
   - "afd_plugin/connectors/**/*.py"
   - "afd_plugin/connectors/npu/bin/**"
   - "afd_plugin/distributed/**/*.py"
@@ -42,7 +43,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-11-09
+last_reviewed: 2026-11-14
 ---
 
 # Connector contracts
@@ -429,3 +430,38 @@ Operational material: [NCCL P2P guide](../../gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.m
 [CAM P2P guide](../../npu/CAM_P2P_CONNECTOR_USER_GUIDE.md),
 [CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md), and
 [connector overview](../../../afd_plugin/connectors/README.md).
+
+## Async GPU candidate
+
+`GpuAsyncAFDConnector` is an experimental NVLink/RDMA connector for the pinned GPU
+ModelRunnerV2 runtime. Its transport follows the fixed symmetric-window protocol
+from `spike/AsyncGPUConnector` at `788d17d`: Attention owns routing, each FFN rank
+receives rows grouped by its experts, and combine applies the partial weights.
+There is no per-layer DP control-plane rendezvous. Native MRV2 child contexts own
+the stage index; each stage has separate ring slots and mutable header buffers.
+CUDA driver and NVSHMEM handles belong to the connector's runtime instance.
+Protocol v5 uses uint64 signals. Unmapped peers receive complete slots from
+independent symmetric outboxes through an optional CUDA/NVSHMEM bridge; its
+publish kernel reads the dispatch counter on every graph replay. NVSHMEM
+wait/test orders receive visibility, and put/quiet completes before source reuse.
+
+The GPU implementation keeps the existing CAM async configuration and NPU runtime
+separate. It requires `async=true`, `compute_gate_on_attention=true`, static expert
+parallelism, and FFN TP1. The current model adapters cover DeepSeek V2/V3 and V4;
+other architectures and speculative decoding fail validation before rendezvous.
+Attention uses native MRV2 graph/DBO lifecycle. The GPU FFN runner captures local
+expert graphs independently, before joining the cross-role rendezvous, and serves
+payloads until every Attention producer has announced shutdown.
+
+CPU protocol and configuration tests belong under `tests/unit/connectors/gpu`
+and `tests/unit/config`; the real transport checks are in
+[`test_async_gpu.py`](../../../tests/gpu/test_async_gpu.py). The
+[2A2F candidate recipe](../../../recipe/gpu/GpuAsyncAFDConnector/deepseek_v4_flash/2a2f_async.sh)
+requires a four-GPU allocation. Single-node H20 transport and DeepSeek-V2-Lite-Chat
+eager, graph, DBO and graph+DBO execution have passed targeted validation,
+including 128 GSM8K samples. See the
+[validation record and cross-node implementation](../async_gpu_cross_node_research.md)
+for the exact runtime and limits. DeepSeek V3/V4, quantization and Attention TP2
+remain unqualified; the V4 recipe is still a candidate. Two-node device oracles and a
+[2A2F Slurm recipe](../../../recipe/gpu/GpuAsyncAFDConnector/deepseek_v2_lite/2node_2a2f_async.slurm)
+cover the remote transport entry point.

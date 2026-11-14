@@ -53,7 +53,7 @@ related_issues:
   - "#88"
   - "#105"
   - "#129"
-last_reviewed: 2026-11-09
+last_reviewed: 2026-11-10
 ---
 
 # Attention runtime
@@ -82,7 +82,7 @@ worker for the active platform when `worker_cls="auto"`.
 
 | Platform | Worker | Model runner | Current connectors |
 | --- | --- | --- | --- |
-| CUDA | `afd_plugin.v1.worker.AFDAttentionWorker` | `AFDAttentionModelRunnerV2` (native V2 only) | `P2pNcclAFDConnector` |
+| CUDA | `afd_plugin.v1.worker.AFDAttentionWorker` | `AFDAttentionModelRunnerV2` (native V2 only) | `P2pNcclAFDConnector`, `DeepEPM2NAFDConnector`, experimental `GpuAsyncAFDConnector` |
 | NPU | `afd_plugin.v1.worker.npu.AFDNPUAttentionWorker` | `AFDNPUAttentionModelRunnerV2` (native V2 only) | `CAMP2pAFDConnector`, `CAMAsyncAFDConnector` |
 
 CUDA launch shape:
@@ -158,7 +158,7 @@ descriptor and metadata requirements. The CPU regression lives in
 
 Both platforms require V2. The paired deployment constraints are:
 
-| Constraint | CUDA V2 | Ascend V2 synchronous | Ascend V2 Async CAM |
+| Constraint | CUDA V2 synchronous | Ascend V2 synchronous | Ascend V2 Async CAM |
 | --- | --- | --- | --- |
 | Connector | Synchronous `P2pNcclAFDConnector` or `DeepEPM2NAFDConnector` | Synchronous `CAMP2pAFDConnector` | `CAMAsyncAFDConnector`; `async_dp=true` |
 | Gate placement | P2P: model-specific, Qwen requires `false`; DeepEP M2N: `true` | `compute_gate_on_attention=false` | `compute_gate_on_attention=true` |
@@ -176,6 +176,12 @@ DBO validation applies. Qwen3 MoE DBO remains supported. See the
 [runtime matrix](../../support.md#tested-runtime-matrix) for tested
 configurations and known shutdown limitations.
 The generic V2 E2E harness remains CUDA-only.
+
+The experimental GPU async path skips native Attention DP coordination and
+uses opaque MoE dispatch/combine operations with native MRV2 stage indices.
+Its FFN runs independent arrivals rather than matching the Attention schedule.
+See the [H20 validation record](../async_gpu_cross_node_research.md) for its
+eager, graph and two-stage scope.
 
 For Ascend V2 Async CAM, the supported contract and launch settings are in the
 [CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#modelrunnerv2-deployment).

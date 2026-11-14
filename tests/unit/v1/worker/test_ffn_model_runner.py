@@ -745,18 +745,18 @@ def test_ffn_worker_reports_zero_compilation_times():
     assert compilation_times.encoder == 0.0
 
 
-def test_ffn_worker_loop_rejects_connector_without_control_plane():
-    worker = object.__new__(AFDFFNWorker)
-    event = threading.Event()
-
-    worker._ffn_shutdown_event = event
-    worker.device = SimpleNamespace(type="cpu")
-    worker.model_runner = SimpleNamespace(
-        connector=_ConnectorDrivenFakeConnector(),
+def test_ffn_worker_loop_drains_before_finishing_async_receiver(loop_worker):
+    events = []
+    worker = loop_worker(None)
+    worker.model_runner.execute_connector_driven_step = lambda stop: False
+    worker.model_runner.drain = lambda: events.append("drain")
+    worker.model_runner.session = SimpleNamespace(
+        finish_receiver=lambda: events.append("receiver_finished"),
     )
 
-    with pytest.raises(NotImplementedError, match="control-plane-driven"):
-        worker._run_ffn_server_loop()
+    worker._run_ffn_server_loop()
+
+    assert events == ["drain", "receiver_finished"]
 
 
 def test_ffn_worker_loop_logs_unexpected_thread_errors(caplog):

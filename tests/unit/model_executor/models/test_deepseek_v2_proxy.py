@@ -15,6 +15,7 @@ from afd_plugin.config import AFD_ASYNC_CONNECTOR, AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
 from tests.unit.fakes.connector import ProxyConnector as _FakeConnector  # noqa: E402
 from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
+from tests.unit.fakes.deepseek_v2 import SingleExpertRouter  # noqa: E402
 from tests.unit.fakes.model_layers import GateLinear  # noqa: E402
 
 ROUTING_HIDDEN_SIZE = 16
@@ -684,3 +685,35 @@ def test_m2n_moe_tp2_rank_dispatches_its_slice_and_gathers_shared_sum(
     assert torch.equal(
         output, torch.cat([local_output, local_output + PEER_OFFSET])[:3]
     )
+
+
+@pytest.mark.parametrize(
+    "dtype,shared_experts,weight",
+    [(torch.bfloat16, 1, 3.0), (torch.float16, 1, 1.0), (torch.float16, 0, 3.0)],
+)
+def test_async_gpu_moe_sends_scaled_routes_without_ascend(
+    monkeypatch, dtype, shared_experts, weight
+):
+    from afd_plugin.connectors.gpu import async_moe_op  # noqa: F401
+    from afd_plugin.model_executor import models
+
+    events: list[tuple] = []
+    sidecar = SimpleNamespace(connector=_FakeConnector(events), stage_idx=1)
+    monkeypatch.setattr(
+        models, "get_afd_metadata_from_forward_context", lambda: sidecar
+    )
+    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", lambda value, **kwargs: value)
+    proxy = object.__new__(adapter.AFDDeepseekV2AsyncMoE)
+    nn.Module.__init__(proxy)
+    proxy.gate = GateLinear(4, 2, out_dtype=dtype)
+    proxy.router = SingleExpertRouter()
+    proxy.layer_idx, proxy.tp_size, proxy.routed_scaling_factor = 2, 1, 3.0
+    proxy.n_shared_experts = shared_experts
+    hidden_states = torch.ones(2, 4, dtype=dtype)
+
+    output = proxy(hidden_states)
+
+    torch.testing.assert_close(output, hidden_states * 0.25)
+    assert events[0][2].metadata.stage_idx == 1
+    assert events[0][2].metadata.layer_idx == 2
+    torch.testing.assert_close(events[0][3]["topk_weights"], torch.full((2, 1), weight))

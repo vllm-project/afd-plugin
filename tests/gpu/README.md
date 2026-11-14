@@ -1,6 +1,7 @@
 # CUDA connector device tests
 
-Opt-in device tests for `DeepEPM2NAFDConnector`. They run the connector's
+Opt-in device tests for `DeepEPM2NAFDConnector` and `GpuAsyncAFDConnector`.
+They run the connector's
 transport and expert compute on real GPUs, without model weights or a vLLM
 server, and run outside CI.
 
@@ -8,9 +9,43 @@ server, and run outside CI.
 | --- | --- | --- |
 | `test_deepep_m2n_gpu.py` | pytest, up to 6 GPUs on one node | Dispatch, expert compute and combine checked against references, in eager mode, with two lanes (DBO), under `torch.compile`, and after CUDA-graph replay |
 | `deepep_m2n_harness.py` | - | Multi-process harness: rank spawning, deterministic inputs, references, checks, scenarios, and benchmark scenarios |
+| `test_async_gpu.py` | pinned CUDA vLLM/Torch, NVSHMEM 3.4.5, up to 4 NVLink GPUs | Five real transport cases: two stages, replay, routing/accumulation precision and independent Attention producers |
+| `run_async_gpu_multinode.py` / `.slurm` | CUDA/NVSHMEM extension, two nodes with two GPUs each | The same affine oracle over remote RMA: graph counters, precision, independent producers and collective close |
 | `__init__.py` | - | Package marker |
 
-## Requirements
+## Async GPU checks
+
+The async GPU tests need no DeepEP or DeepGEMM. Run inside a four-GPU allocation:
+
+```bash
+python -m pytest -s -v tests/gpu/test_async_gpu.py
+```
+
+All five cases must pass with zero skips. They use real CUDA transport and
+an affine expert oracle; model kernels and accuracy are covered separately in
+the [single-node validation record](../../docs/design/async_gpu_cross_node_research.md).
+The requirements and harness descriptions below cover DeepEP M2N.
+
+For real two-node RDMA, first build the
+[optional CUDA/NVSHMEM extension](../../csrc/gpu/README.md), then submit from
+the checkout:
+
+```bash
+sbatch tests/gpu/run_async_gpu_multinode.slurm
+```
+
+The script uses IBRC, resolves a routable rendezvous host and runs six cases
+sequentially. Each task selects `SLURM_LOCALID` within its node's allocated GPU
+mask. A run must report `passed` from every PE; zero-route destinations, both
+stages, changed inputs/weights across 64 graph replays, sequence overflow and
+an idle Attention peer are covered. The hybrid case sends from one Attention
+to both a local and a remote FFN in the same world. Slurm bounds failed-step
+cleanup. The script uses this cluster's untyped GPU GRES in partition `h20`; adapt those
+allocation directives for another scheduler. See the
+[two-node record](../../docs/design/async_gpu_cross_node_research.md#4-本轮硬件证据)
+for the tested runtime and limits. These are correctness tests, not benchmarks.
+
+## DeepEP M2N requirements
 
 - Hopper (SM90) or newer GPUs on one node. Most cases need 4 GPUs; the two
   `2F-2DPx2TP` Attention TP cases need 6. Cases that need more GPUs than are
@@ -19,15 +54,15 @@ server, and run outside CI.
   with the elfutils headers. See
   [Installation](../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation)
   in the connector guide.
-- The full suite has 34 cases and takes about 53 minutes on six H200 GPUs with
+- The DeepEP suite has 34 cases and takes about 53 minutes on six H200 GPUs with
   cold JIT caches. DeepEP and DeepGEMM compile kernels on first use, so a
   rerun with warm caches is much faster.
 
 ## Run
 
 ```bash
-# Full suite
-pytest -sv -m gpu tests/gpu
+# Full DeepEP suite
+pytest -sv -m gpu tests/gpu/test_deepep_m2n_gpu.py
 
 # One payload format
 pytest -sv -m gpu tests/gpu -k bf16

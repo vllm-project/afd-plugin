@@ -57,3 +57,95 @@ def load_async_modules(monkeypatch):
         monkeypatch, "afd_plugin.v1.worker.npu.async_ffn_model_runner"
     )
     return group, connector, runtime
+
+
+class GPUAsyncHostCase:
+    """Host receive/compute/reply fixture; no device or graph simulation."""
+
+    def __init__(self, runtime, torch):
+        from collections import deque
+        from types import SimpleNamespace
+
+        from afd_plugin.connectors import (
+            AFDTransferContext,
+            AFDTransferMetadata,
+        )
+        from tests.unit.fakes.profiler import StepProfiler
+
+        self.arrivals: deque = deque()
+        self.replies: list[tuple] = []
+        self.events: list[str] = []
+        self.context = SimpleNamespace(
+            dp_metadata="not async",
+            additional_kwargs={},
+            all_moe_layers=[],
+        )
+        runner = object.__new__(runtime.GPUAsyncFFNModelRunner)
+        runner.vllm_config = SimpleNamespace()
+        runner.prof = StepProfiler()
+        runner.session = SimpleNamespace(
+            keep_serving=lambda stop: not stop,
+            before_first_step=lambda: self.events.append("receiver_ready"),
+            after_step=lambda: self.events.append("step_finished"),
+        )
+        runner._first_step = True
+        runner._padded_hidden = None
+        runner._padded_shared = None
+        runner._padded_counts = None
+        runner._padded_buckets = ()
+        runner._padded_graphs = {}
+        runner._padded_max_routed = 0
+        runner._padded_max_shared = 0
+
+        def receive(**kwargs):
+            if not self.arrivals:
+                raise TimeoutError("idle")
+            payload = self.arrivals.popleft()
+            if isinstance(payload, BaseException):
+                raise payload
+            return payload
+
+        def send(routed, context, *, shared_output):
+            self.replies.append((routed, context, shared_output))
+
+        def compute(hidden_states, layer_idx, *, group_list, expand_x_shared):
+            return runtime.AFDF2ATransferPayload(
+                routed_output=hidden_states * 2,
+                shared_output=expand_x_shared,
+            )
+
+        runner.connector = SimpleNamespace(
+            ffn_size=1,
+            recv_attn_output=receive,
+            send_ffn_output=send,
+            extra_info=SimpleNamespace(recv_poll_timeout_ms=1),
+        )
+        runner.model = SimpleNamespace(compute_ffn_output=compute)
+        self.runner = runner
+        self.torch = torch
+        self.runtime = runtime
+        self.make_context = AFDTransferContext
+        self.make_metadata = AFDTransferMetadata.create_attention_metadata
+
+    def add(self, *, layer_idx=3, stage_idx=1, routed_rows=2, shared_rows=1):
+        hidden = self.torch.ones(routed_rows, 4)
+        shared = self.torch.full((shared_rows, 4), 3.0)
+        state = self.runtime.GpuAsyncTransferState(
+            routed_tokens=routed_rows,
+            shared_tokens=shared_rows,
+            group_list=self.torch.tensor([routed_rows], dtype=self.torch.int32),
+            expand_x_shared=shared,
+        )
+        payload = self.runtime.AFDA2FTransferPayload(
+            hidden_states=hidden,
+            context=self.make_context(
+                metadata=self.make_metadata(
+                    layer_idx=layer_idx,
+                    stage_idx=stage_idx,
+                    seq_len=routed_rows,
+                ),
+                states=state,
+            ),
+        )
+        self.arrivals.append(payload)
+        return payload

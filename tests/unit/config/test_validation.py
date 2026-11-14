@@ -157,6 +157,55 @@ def test_gpu_validator_accepts_target_config_without_removed_enable_sp(mrv2_conf
 
 
 @pytest.mark.parametrize(
+    "role,architecture,tp,speculative,error",
+    [
+        ("attention", "DeepseekV2ForCausalLM", 1, False, None),
+        ("attention", "DeepseekV3ForCausalLM", 1, False, None),
+        ("attention", "AFDDeepseekV4ForCausalLM", 2, False, None),
+        ("ffn", "DeepseekV4ForCausalLM", 1, False, None),
+        ("ffn", "DeepseekV2ForCausalLM", 2, False, "FFN tensor_parallel_size=1"),
+        ("attention", "Qwen3MoeForCausalLM", 1, False, "supports only"),
+        ("attention", "DeepseekV2ForCausalLM", 1, True, "speculative decoding"),
+    ],
+)
+def test_gpu_async_mrv2_deployment_policy(
+    mrv2_config, role, architecture, tp, speculative, error
+):
+    mrv2_config.additional_config["afd"].update(
+        role=role,
+        connector="GpuAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+    )
+    mrv2_config.model_config.hf_config.architectures = [architecture]
+    mrv2_config.parallel_config.tensor_parallel_size = tp
+    mrv2_config.additional_config["afd"][
+        "num_attention_ranks" if role == "attention" else "num_ffn_ranks"
+    ] = mrv2_config.parallel_config.data_parallel_size * tp
+    if speculative:
+        mrv2_config.speculative_config = SimpleNamespace()
+    with _expect(_err(error) if error else None):
+        validate_gpu_model_runner_v2_config(
+            mrv2_config, expected_role=role, device_type="cuda"
+        )
+
+
+def test_gpu_async_ffn_rejects_noncontiguous_expert_placement(mrv2_config):
+    mrv2_config.additional_config["afd"].update(
+        role="ffn",
+        connector="GpuAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+    )
+    mrv2_config.model_config.hf_config.architectures = ["DeepseekV2ForCausalLM"]
+    mrv2_config.parallel_config.expert_placement_strategy = "round_robin"
+    with pytest.raises(RuntimeError, match="requires linear FFN expert placement"):
+        validate_gpu_model_runner_v2_config(
+            mrv2_config, expected_role="ffn", device_type="cuda"
+        )
+
+
+@pytest.mark.parametrize(
     "role,tp,error",
     [
         ("attention", 1, None),

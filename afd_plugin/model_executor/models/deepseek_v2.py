@@ -9,6 +9,7 @@ hidden states between the Attention and FFN roles through the AFD connector.
 """
 
 from collections.abc import Iterable, Iterator
+from contextlib import AbstractContextManager, nullcontext
 from copy import copy
 from typing import TYPE_CHECKING, Any, TypeAlias
 
@@ -28,11 +29,13 @@ from vllm.model_executor.models import deepseek_v2 as native
 
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
+    AFD_ASYNC_GPU_CONNECTOR,
     DEEPEP_M2N_CONNECTORS,
     parse_afd_config,
 )
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
+    AFDF2ATransferPayload,
     AFDForwardContextMetadata,
     AFDTransferContext,
     AFDTransferMetadata,
@@ -498,6 +501,7 @@ class AFDDeepseekV2RoutedExpertsMoE(AFDDeepseekV2RemoteExpertsMoE):
         vllm_config: VllmConfig,
         layer_idx: int,
         prefix: str,
+        shared_experts_on_attention: bool = True,
     ) -> None:
         super().__init__(
             config=config,
@@ -534,7 +538,7 @@ class AFDDeepseekV2RoutedExpertsMoE(AFDDeepseekV2RemoteExpertsMoE):
                 is_sequence_parallel=self.tp_size > 1,
                 prefix=f"{prefix}.shared_experts",
             )
-            if config.n_shared_experts
+            if config.n_shared_experts and shared_experts_on_attention
             else None
         )
 
@@ -573,6 +577,60 @@ class AFDDeepseekV2RoutedExpertsMoE(AFDDeepseekV2RemoteExpertsMoE):
         if self.tp_size > 1:
             output = native.tensor_model_parallel_all_gather(output, 0)
             output = output[:num_tokens]
+        return output
+
+
+class AFDDeepseekV2AsyncMoE(AFDDeepseekV2RoutedExpertsMoE):
+    """Native CUDA routing with async FFN-owned routed and shared experts."""
+
+    def __init__(
+        self,
+        *,
+        config: _DeepseekAdapterConfig,
+        vllm_config: VllmConfig,
+        layer_idx: int,
+        prefix: str,
+    ) -> None:
+        super().__init__(
+            config=config,
+            vllm_config=vllm_config,
+            layer_idx=layer_idx,
+            prefix=prefix,
+            shared_experts_on_attention=False,
+        )
+        self.layer_idx = layer_idx
+        # Import only for this connector; registration has no module-global flag.
+        from afd_plugin.connectors.gpu import async_moe_op  # noqa: F401
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        already_sequence_parallel: bool = False,
+    ) -> torch.Tensor:
+        assert self.gate is not None
+        num_tokens = hidden_states.shape[0]
+        if self.tp_size > 1:
+            hidden_states = native.sequence_parallel_chunk(hidden_states)
+        router_logits, _ = self.gate(hidden_states)
+        topk_weights, topk_ids = self.router.select_experts(
+            hidden_states, router_logits
+        )
+        # Native fp16 scales shared down when present; without shared experts,
+        # it applies the routed scale directly, just as for other dtypes.
+        if hidden_states.dtype != torch.float16 or self.n_shared_experts == 0:
+            topk_weights = topk_weights * self.routed_scaling_factor
+        if self.tp_size > 1:
+            topk_ids = _unroute_tp_padding(topk_ids, num_tokens)
+        torch.ops.vllm.afd_async_gpu_dispatch(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            self.layer_idx,
+        )
+        hidden_states = maybe_apply_dbo_yield(hidden_states, role="attention")
+        output = torch.ops.vllm.afd_async_gpu_receive(hidden_states)
+        if self.tp_size > 1:
+            output = native.tensor_model_parallel_all_gather(output, 0)[:num_tokens]
         return output
 
 
@@ -641,6 +699,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         self.vllm_config = vllm_config
         self.config = config
         self.is_moe_layer = is_moe_layer
+        self.is_async_gpu = afd_config.connector == AFD_ASYNC_GPU_CONNECTOR
         self.compute_gate_on_attention = bool(
             afd_config.compute_gate_on_attention,
         )
@@ -694,7 +753,17 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                 **attn_kwargs,
             )
 
-            if self.uses_remote_experts and afd_config.connector in (
+            if (
+                self.uses_remote_experts
+                and afd_config.connector == AFD_ASYNC_GPU_CONNECTOR
+            ):
+                self.mlp = AFDDeepseekV2AsyncMoE(
+                    config=config,
+                    vllm_config=vllm_config,
+                    layer_idx=layer_idx,
+                    prefix=f"{prefix}.mlp",
+                )
+            elif self.uses_remote_experts and afd_config.connector in (
                 DEEPEP_M2N_CONNECTORS
             ):
                 self.mlp = AFDDeepseekV2RoutedExpertsMoE(
@@ -741,23 +810,45 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                 if device_type == "npu":
                     native.FusedMoEFactory = fused_moe.FusedMoEFactory
                 moe_config = config
-                if afd_config.connector in _ATTENTION_SHARED_EXPERTS_CONNECTORS:
+                if (
+                    afd_config.connector in _ATTENTION_SHARED_EXPERTS_CONNECTORS
+                    or self.is_async_gpu
+                ):
                     moe_config = copy(config)
                     # HF validates this public field as int, but pinned native
                     # MoE uses only None to omit shared construction (0 builds
                     # a zero-width MLP). Apply its sentinel to this private
                     # construction copy; preserve the real model config.
                     object.__setattr__(moe_config, "n_shared_experts", None)
-                self.mlp = native.DeepseekV2MoE(
-                    config=moe_config,
-                    parallel_config=parallel_config,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.mlp",
-                    # aiter applies routed_scaling_factor internally
-                    apply_routed_scale_to_output=(
-                        not native.rocm_aiter_ops.is_fused_moe_enabled()
-                    ),
-                )
+                expert_factory_scope: AbstractContextManager[None] = nullcontext()
+                if self.is_async_gpu:
+                    from afd_plugin.model_executor.models.gpu.async_experts import (
+                        use_local_expert_factory,
+                    )
+
+                    expert_factory_scope = use_local_expert_factory(native)
+                with expert_factory_scope:
+                    self.mlp = native.DeepseekV2MoE(
+                        config=moe_config,
+                        parallel_config=parallel_config,
+                        quant_config=quant_config,
+                        prefix=f"{prefix}.mlp",
+                        apply_routed_scale_to_output=(
+                            not native.rocm_aiter_ops.is_fused_moe_enabled()
+                        ),
+                    )
+                if self.is_async_gpu and config.n_shared_experts:
+                    # Shared rows are a separate wire payload: never fuse them
+                    # into the routed expert bank or the native runner scheduler.
+                    self.mlp.shared_experts = native.DeepseekV2MLP(
+                        hidden_size=config.hidden_size,
+                        intermediate_size=config.moe_intermediate_size
+                        * config.n_shared_experts,
+                        hidden_act=config.hidden_act,
+                        quant_config=quant_config,
+                        reduce_results=False,
+                        prefix=f"{prefix}.mlp.shared_experts",
+                    )
                 if self.compute_gate_on_attention and device_type == "cuda":
                     # Keep the gate weights loadable, but with the runner's
                     # gate cleared it consumes the Attention-side router
@@ -863,7 +954,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         self,
         hidden_states: torch.Tensor,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | AFDF2ATransferPayload:
         if self.compute_gate_on_attention and not self.is_moe_layer:
             raise RuntimeError(
                 "Dense DeepSeek layers are computed on the Attention side "
@@ -872,8 +963,25 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         if self.compute_gate_on_attention:
             if native.current_platform.device_type == "npu":
                 raise RuntimeError("Async CAM FFN requires the layered executor")
+            if kwargs.get("group_list") is not None:
+                from afd_plugin.model_executor.models.gpu.async_experts import (
+                    compute_local_experts,
+                )
+
+                return compute_local_experts(
+                    self.mlp.experts.routed_experts,
+                    hidden_states=hidden_states,
+                    group_list=kwargs["group_list"],
+                    shared_experts=self.mlp.shared_experts,
+                    expand_x_shared=kwargs.get("expand_x_shared"),
+                    shared_scale=(
+                        1.0 / self.routed_scaling_factor
+                        if hidden_states.dtype == torch.float16
+                        else 1.0
+                    ),
+                )
             raise RuntimeError(
-                "GPU Attention-side gate must call compute_experts_output",
+                "GPU Attention-side gate must call compute_experts_output"
             )
         hidden_states = self.mlp(hidden_states)
         if (
@@ -1051,7 +1159,7 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         hidden_states: torch.Tensor,
         layer_idx: int,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | AFDF2ATransferPayload:
         return self.layers[layer_idx].compute_ffn_output(
             hidden_states,
             **kwargs,
@@ -1130,7 +1238,7 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
         hidden_states: torch.Tensor,
         layer_idx: int,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | AFDF2ATransferPayload:
         return self.model.compute_ffn_output(hidden_states, layer_idx, **kwargs)
 
     def compute_experts_output(

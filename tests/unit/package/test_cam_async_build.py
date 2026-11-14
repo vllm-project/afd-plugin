@@ -126,12 +126,15 @@ def test_skipping_aclnn_build_still_passes_soc_to_binding_build(
     monkeypatch.delenv("SOC_VERSION", raising=False)
     if soc is not None:
         monkeypatch.setenv("SOC_VERSION", soc)
-    monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
+    setup_options = {}
+    monkeypatch.setattr(
+        setuptools, "setup", lambda **kwargs: setup_options.update(kwargs)
+    )
     setup_namespace = runpy.run_path(str(root / "setup.py"))
     extension = setup_namespace["CMakeExtension"](
         "afd_plugin._C_ascend", "csrc/npu/pybind"
     )
-    command = setup_namespace["BuildAscendOps"](setuptools.Distribution())
+    command = setup_options["cmdclass"]["build_ext"](setuptools.Distribution())
     command.extensions = [extension]
     command.build_temp = str(tmp_path / "build")
     command.build_lib = str(tmp_path / "lib")

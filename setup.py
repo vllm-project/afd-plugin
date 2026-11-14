@@ -59,11 +59,13 @@ class CMakeExtension(Extension):
         self.source_dir = str((ROOT / source_dir).resolve())
 
 
-class BuildAscendOps(build_ext):
+class BuildNativeOps(build_ext):
     def run(self) -> None:
         if not self.extensions:
             return super().run()
-        if os.environ.get("AFD_SKIP_ACLNN_BUILD", "0") != "1":
+        if any(ext.name == "afd_plugin._C_ascend" for ext in self.extensions) and (
+            os.environ.get("AFD_SKIP_ACLNN_BUILD", "0") != "1"
+        ):
             soc_version = os.environ.get("SOC_VERSION", "910c")
             subprocess.check_call(
                 ["bash", "csrc/npu/build_aclnn.sh", str(ROOT), soc_version],
@@ -84,8 +86,6 @@ class BuildAscendOps(build_ext):
             ext.source_dir,
             f"-DCMAKE_BUILD_TYPE={os.environ.get('CMAKE_BUILD_TYPE', 'Release')}",
             f"-DCMAKE_INSTALL_PREFIX={install_prefix}",
-            f"-DPYTHON_EXECUTABLE={sys.executable}",
-            f"-DAFD_SOC_VERSION={os.environ.get('SOC_VERSION', '910c')}",
         ]
         try:
             pybind11_cmake_dir = subprocess.check_output(
@@ -93,8 +93,25 @@ class BuildAscendOps(build_ext):
                 text=True,
             ).strip()
         except subprocess.CalledProcessError as exc:
-            raise RuntimeError("pybind11 is required to build Ascend ops") from exc
+            raise RuntimeError("pybind11 is required to build native ops") from exc
         cmake_args.append(f"-DCMAKE_PREFIX_PATH={pybind11_cmake_dir}")
+        if ext.name == "afd_plugin._C_gpu_async":
+            cmake_args.extend(
+                [
+                    f"-DPython_EXECUTABLE={sys.executable}",
+                    "-DCMAKE_CUDA_ARCHITECTURES="
+                    + os.environ.get("AFD_CUDA_ARCHITECTURES", "90"),
+                ],
+            )
+            if os.environ.get("NVSHMEM_HOME"):
+                cmake_args.append(f"-DNVSHMEM_HOME={os.environ['NVSHMEM_HOME']}")
+        else:
+            cmake_args.extend(
+                [
+                    f"-DPYTHON_EXECUTABLE={sys.executable}",
+                    f"-DAFD_SOC_VERSION={os.environ.get('SOC_VERSION', '910c')}",
+                ]
+            )
         if os.environ.get("ASCEND_HOME_PATH"):
             cmake_args.append(f"-DASCEND_HOME_PATH={os.environ['ASCEND_HOME_PATH']}")
         if os.environ.get("TORCH_NPU_PATH"):
@@ -107,7 +124,7 @@ class BuildAscendOps(build_ext):
 
         src_cann_ops = ROOT / "afd_plugin" / "_cann_ops_custom"
         dst_cann_ops = Path(self.build_lib) / "afd_plugin" / "_cann_ops_custom"
-        if src_cann_ops.exists():
+        if ext.name == "afd_plugin._C_ascend" and src_cann_ops.exists():
             if dst_cann_ops.exists():
                 shutil.rmtree(dst_cann_ops)
             shutil.copytree(src_cann_ops, dst_cann_ops)
@@ -118,9 +135,11 @@ if _should_build_ascend_ops():
     ext_modules.append(
         CMakeExtension("afd_plugin._C_ascend", "csrc/npu/pybind"),
     )
+if _env_enabled(os.environ.get("AFD_BUILD_GPU_ASYNC_OPS", "0")):
+    ext_modules.append(CMakeExtension("afd_plugin._C_gpu_async", "csrc/gpu"))
 
 
 setup(
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildAscendOps},
+    cmdclass={"build_ext": BuildNativeOps},
 )
