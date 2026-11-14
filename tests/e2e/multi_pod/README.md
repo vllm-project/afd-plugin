@@ -200,8 +200,7 @@ never blocks silently past a local child dying — it notices and raises
 within one poll interval.
 
 - **Phases 6–7 — ordered launch.** Which role starts first depends on the
-  connector: `uses_async_connector(args)` (true for `CAMAsyncAFDConnector` and
-  `GpuAsyncAFDConnector`)
+  connector: `uses_async_connector(args)` (true for `CAMAsyncAFDConnector`)
   means Attention hosts the AFD rendezvous and must come up first;
   otherwise FFN does (mirrors `RENDEZVOUS_ROLE_BY_CONNECTOR` in
   `layout.py`). The runner launches this pod's slot for the *first* role
