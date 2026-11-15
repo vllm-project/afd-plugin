@@ -234,9 +234,13 @@ head on the reviewer host.
   CPU-only `tests/npu` files the pipeline names — then
   `tests/gpu/test_attention_routing.py`, on `l4_1`; the DeepSeek-V2-Lite GPU
   seven-case E2E gate runs on `l4_4`. `test-weekly` adds Qwen3 MoE, Qwen3.6
-  MoE, and the DeepSeek-V2-Lite 2A1F Graph + DBO case on `h100_4`.
+  MoE, the DeepSeek-V2-Lite 2A1F Graph + DBO case, the DeepEP M2N device tests
+  (`tests/gpu/test_deepep_m2n_gpu.py`) and the Qwen3 MoE DeepEP M2N 2A2F
+  Graph + DBO case on `h100_4`.
 - CI mirrors `docker/Dockerfile.ci`, which builds on
-  `vllm/vllm-openai:<VLLM_BASE_TAG>` and asserts the installed vLLM pin.
+  `vllm/vllm-openai:<VLLM_BASE_TAG>`, adds the `afdep` extra, and asserts the
+  installed vLLM pin. Unit tests therefore import the real afdEP-comm; the
+  fake in `tests/unit/fakes/afdep.py` only stands in where it is missing.
 - `skip_ci.py` suppresses all default CI when the diff is docs-only
   (`docs/**`, any `*.md`, `mkdocs.yml`) or changes only pytest skip marks. For
   such a PR, a green pipeline is not evidence about the change.

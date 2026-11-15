@@ -15,8 +15,8 @@ three: baseline and AFD eager and graph on 2A1F. GDN DBO is unsupported.
 The single-deployment inventory contains 48 definitions: 38 CUDA cases
 (18 DeepSeek-V2-Lite, nine Qwen3 MoE, three Qwen3.6 MoE and eight DSV4
 Flash) and ten NPU cases (seven DeepSeek-V2-Lite and three DSV4 Flash).
-The CUDA counts include the local DeepEP M2N entries. CI still selects the
-same 15 unique node IDs across ready/merge and weekly gates. Definitions,
+The CUDA counts include the DeepEP M2N entries. CI selects 16 unique node
+IDs across ready/merge and weekly gates. Definitions,
 collected nodes and device acceptance results are different counts.
 
 The ten existing GPU multi-pod entries also use model-local Cases and the
@@ -286,7 +286,8 @@ DeepSeek-V2-Lite through the same five scenarios.
 They need four SM90 or newer GPUs and afdEP-comm (DeepGEMM comes with vLLM);
 see
 [Installation](../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation)
-in the connector guide. CI does not run them.
+in the connector guide. Weekly CI runs the Qwen3 MoE
+`afd-deepep-m2n-graph-dbo-2a2f` scenario; the others are local-only.
 
 ```bash
 export AFD_E2E_BACKEND=gpu
@@ -381,10 +382,12 @@ do not establish numerical equivalence or full-dataset qualification.
 
 ### Weekly GSM8K
 
-The weekly pipeline runs eight scenarios: all four Qwen3 MoE cases
+The weekly pipeline runs nine scenarios: all four Qwen3 MoE cases
 (baseline, eager, graph, and graph+DBO), the three Qwen3.6 MoE cases
-(baseline, eager, and graph), and DeepSeek-V2-Lite `afd-graph-dbo-2a1f`,
-all with the default GSM8K sample limit. To reproduce locally:
+(baseline, eager, and graph), DeepSeek-V2-Lite `afd-graph-dbo-2a1f`, and the
+Qwen3 MoE DeepEP M2N `afd-deepep-m2n-graph-dbo-2a2f`, all with the default
+GSM8K sample limit. It also runs the DeepEP M2N device tests
+(`tests/gpu/test_deepep_m2n_gpu.py`). To reproduce locally:
 
 ```bash
 # Qwen3 MoE (all four P2P scenarios)
@@ -392,6 +395,10 @@ python -m pytest -q -s tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_
 
 # Qwen3.6 MoE (all three scenarios; GDN DBO unsupported)
 python -m pytest -q -s tests/e2e/models/qwen3_6/test_qwen3_6.py
+
+# Qwen3 MoE DeepEP M2N graph+DBO (needs afdEP-comm, see the M2N section)
+python -m pytest -q -s \
+  "tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe_deepep_m2n[afd-deepep-m2n-graph-dbo-2a2f]"
 ```
 
 For a full 1319-sample run, export `AFD_GSM8K_LIMIT=all` before invoking
