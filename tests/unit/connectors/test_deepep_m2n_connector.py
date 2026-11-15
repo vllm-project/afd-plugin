@@ -253,6 +253,62 @@ def test_expert_num_sms_sizes_the_deepgemm_grid(monkeypatch):
         experts_module.DeepEPM2NExperts("deepgemm", 128, 134)
 
 
+UPSTREAM_DG = "deep_gemm"
+VLLM_DG = "vllm.third_party.deep_gemm"
+
+
+@pytest.mark.parametrize(
+    ("missing_name", "expected"),
+    [
+        # An upstream deep_gemm is importable too; the bundled copy still wins.
+        (None, VLLM_DG),
+        # vLLM builds without DeepGEMM have no vllm.third_party package at all.
+        ("vllm.third_party", "bundled with vLLM"),
+        # The bundled copy is present but cannot load its own dependency.
+        ("deep_gemm_cpp", "deep_gemm_cpp"),
+    ],
+    ids=["vllm-copy-over-upstream", "not-bundled", "broken-bundled-copy"],
+)
+def test_deepgemm_uses_only_the_copy_bundled_with_vllm(
+    monkeypatch, missing_name, expected
+):
+    """The connector loads ``vllm.third_party.deep_gemm`` and never an upstream
+    ``deep_gemm``. Without the bundled copy the error points to the
+    ``fused_experts`` backend; any other import failure surfaces unchanged.
+
+    Why: the experts must run the DeepGEMM the pinned vLLM ships, whatever else
+    is installed, and a broken install must not be reported as a missing one.
+    """
+    from afd_plugin.connectors.gpu.deepep_m2n import deepgemm as deepgemm_module
+
+    natives = {
+        package: SimpleNamespace(source=package) for package in (UPSTREAM_DG, VLLM_DG)
+    }
+
+    def import_module(name: str):
+        if missing_name is not None:
+            raise ModuleNotFoundError(
+                f"No module named {missing_name!r}", name=missing_name
+            )
+        return natives[name.removesuffix("._C")]
+
+    monkeypatch.setattr(
+        deepgemm_module, "importlib", SimpleNamespace(import_module=import_module)
+    )
+    deepgemm_module.load_deepgemm.cache_clear()
+    try:
+        if missing_name is None:
+            assert deepgemm_module.load_deepgemm().source == expected
+        else:
+            with pytest.raises(ModuleNotFoundError, match=expected) as raised:
+                deepgemm_module.load_deepgemm()
+            assert ("fused_experts" in str(raised.value)) == (
+                missing_name == "vllm.third_party"
+            )
+    finally:
+        deepgemm_module.load_deepgemm.cache_clear()
+
+
 def test_plan_stage_skips_host_sync_below_threshold():
     """With a threshold of 256, an eager 255-token step skips the host sync
     and a 256-token step keeps it.

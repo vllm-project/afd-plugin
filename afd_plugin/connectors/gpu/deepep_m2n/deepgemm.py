@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""DeepGEMM grouped GEMMs the M2N experts use, from the ``deep_gemm`` package.
+"""DeepGEMM grouped GEMMs the M2N experts use.
 
-Uses the installed upstream DeepGEMM (https://github.com/deepseek-ai/DeepGEMM),
-installed separately: its build needs torch, CUDA and git submodules. Its
-kernels are JIT-compiled at runtime. Only the ``deepgemm`` expert backend
-needs it.
+The kernels come from the DeepGEMM copy bundled in the vLLM wheel,
+``vllm.third_party.deep_gemm``, so the connector runs the DeepGEMM version the
+pinned vLLM ships and a stock vLLM install needs no extra build. A separately
+installed upstream ``deep_gemm`` package is not used here (vLLM's own kernels
+may still prefer it).
+
+The kernels are JIT-compiled at runtime. Only the ``deepgemm`` expert backend
+needs DeepGEMM.
 
 Only the psum ("prefix-sum contiguous") layout is used: DeepEP's expanded
 dispatch already groups received rows per local expert, padded to the
@@ -15,18 +19,38 @@ DeepGEMM M alignment, and its per-expert end offsets are the group boundaries.
 from __future__ import annotations
 
 import functools
+import importlib
 from types import ModuleType
 
 import torch
 
+# The DeepGEMM copy vendored in the vLLM wheel.
+DEEPGEMM_PACKAGE = "vllm.third_party.deep_gemm"
+
 
 @functools.cache
 def load_deepgemm() -> ModuleType:
-    """DeepGEMM's native module; importing ``deep_gemm`` initializes its JIT."""
-    # Deferred: the fused_experts backend runs without DeepGEMM installed.
-    import deep_gemm
+    """The native ``_C`` module of the DeepGEMM bundled with vLLM.
 
-    return deep_gemm._C
+    Importing the package initializes its JIT. The import is deferred to first
+    use because the ``fused_experts`` backend runs without DeepGEMM.
+    """
+    try:
+        return importlib.import_module(f"{DEEPGEMM_PACKAGE}._C")
+    except ModuleNotFoundError as error:
+        # Only a vLLM build without DeepGEMM gets the hint; any other missing
+        # module means the bundled copy is broken and surfaces unchanged.
+        missing = error.name
+        if missing is None or not (
+            missing == DEEPGEMM_PACKAGE or DEEPGEMM_PACKAGE.startswith(f"{missing}.")
+        ):
+            raise
+        raise ModuleNotFoundError(
+            "The DeepEP M2N 'deepgemm' expert backend needs the DeepGEMM bundled "
+            f"with vLLM ({DEEPGEMM_PACKAGE}), which this vLLM build does not "
+            "include. Use a vLLM CUDA build, or set expert_backend: fused_experts.",
+            name=error.name,
+        ) from error
 
 
 def contiguous_m_alignment() -> int:
