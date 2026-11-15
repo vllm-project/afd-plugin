@@ -16,8 +16,8 @@ from afd_plugin.validation import (
     NPU_ATTENTION_WORKER_FQCN,
     NPU_FFN_MODEL_RUNNER_FQCN,
     NPU_FFN_WORKER_FQCN,
-    resolve_class_from_qualname,
 )
+from tests.unit.fakes.runtime import resolve_class_from_qualname
 
 GPU_RUNTIME_CLASS_PATHS = [
     ATTENTION_WORKER_FQCN,
@@ -54,7 +54,7 @@ import afd_plugin
 
 afd_plugin.register_afd()
 
-from afd_plugin.validation import resolve_class_from_qualname
+from tests.unit.fakes.runtime import resolve_class_from_qualname
 
 for qualname in sys.argv[1:]:
     cls = resolve_class_from_qualname(qualname)

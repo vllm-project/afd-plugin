@@ -4,10 +4,9 @@
 
 from __future__ import annotations
 
-import importlib
 import os
 import struct
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
@@ -303,24 +302,6 @@ def normalize_qualname(value: str) -> str:
     return value.replace(":", ".")
 
 
-def resolve_class_from_qualname(qualname: str, *, role: str = "class") -> type[Any]:
-    """Resolve a dotted or colon-separated class path."""
-
-    normalized = normalize_qualname(qualname.strip())
-    if not normalized or "." not in normalized:
-        raise ValueError(
-            f"{role} must be a dotted qualname, got {qualname!r}",
-        )
-    module_name, obj_name = normalized.rsplit(".", 1)
-    module = importlib.import_module(module_name)
-    obj = getattr(module, obj_name)
-    if not isinstance(obj, type):
-        raise TypeError(
-            f"{role} resolved to {type(obj).__name__}, expected a class",
-        )
-    return obj
-
-
 def expected_worker_qualname(role: str) -> str:
     if role == "attention":
         return ATTENTION_WORKER_FQCN
@@ -445,7 +426,6 @@ __all__ = [
     "expected_npu_worker_qualname",
     "expected_worker_qualname",
     "normalize_qualname",
-    "resolve_class_from_qualname",
     "validate_gpu_model_runner_v2_config",
     "validate_npu_model_runner_v2_config",
 ]

@@ -9,7 +9,7 @@ Attention ModelRunnerV2 variants (`AFDAttentionModelRunnerV2`,
 `AFDNPUAttentionModelRunnerV2`), the FFN runners (`GPUFFNModelRunner`,
 `GPUFFNRoutedExpertsModelRunner`, `AFDNPUFFNModelRunner`,
 `AsyncNPUFFNModelRunner`), attention/FFN metadata builders, `cuda_graph.py`,
-`dbo.py`, `ubatch_wrapper.py`, and the NPU `ubatch_runner.py`,
+`dbo.py`, `attention_metadata.py`, and the NPU `ubatch_runner.py`,
 `mla_graph.py`, `async_ffn_two_stream.py`, and `dspark_speculator.py`. Does
 not own platform selection ([execution-platforms.md](execution-platforms.md)),
 connector transport, or model wrappers ([model-integration.md](model-integration.md)).

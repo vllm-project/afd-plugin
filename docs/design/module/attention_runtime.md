@@ -9,7 +9,6 @@ primary_code_paths:
   - "afd_plugin/v1/worker/attention_metadata.py"
   - "afd_plugin/v1/worker/attention_model_runner_v2.py"
   - "afd_plugin/v1/worker/attention_worker.py"
-  - "afd_plugin/v1/worker/ubatch_wrapper.py"
   - "afd_plugin/v1/worker/npu/attention_model_runner_v2.py"
   - "afd_plugin/v1/worker/npu/attention_worker.py"
   - "afd_plugin/v1/worker/npu/dspark_speculator.py"
@@ -250,7 +249,9 @@ from becoming a long-term API.
 
 The runner temporarily installs a provider at the native `ForwardContext`
 creation seam and attaches the sidecar to the upstream context. The shared
-metadata mixin supplies the single-stage and graph-control behavior.
+metadata mixin supplies the single-stage and graph-control behavior. Its
+`install_mrv2_ubatch_metadata()` method attaches isolated AFD sidecars directly
+to the prepared native microbatch contexts.
 
 Ascend V2 Async CAM uses `NPUUBatchRunner` to adapt native DBO child inputs to
 Ascend attention builders. Native slicing, execution threads and output merge

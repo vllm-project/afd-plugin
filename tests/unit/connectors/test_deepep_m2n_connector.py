@@ -59,7 +59,6 @@ from afd_plugin.connectors.gpu.deepep_m2n.experts import (  # noqa: E402
 )
 from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (  # noqa: E402
     dequantize_fp8_block128,
-    quantize_fp8_block128,
 )
 from afd_plugin.connectors.gpu.deepep_m2n.layout import (  # noqa: E402
     DeepEPM2NLayout,
@@ -80,6 +79,7 @@ from tests.unit.fakes.vllm_config import (  # noqa: E402
     M2NTopology,
     m2n_vllm_config,
 )
+from tests.unit.fakes.weights import quantize_fp8_block128  # noqa: E402
 
 CONNECTOR = "DeepEPM2NAFDConnector"
 HOPPER = (9, 0)
@@ -276,12 +276,8 @@ def test_plan_stage_skips_host_sync_below_threshold():
     assert plan(256).do_cpu_sync
 
 
-def test_fp8_block128_round_trip():
-    """Block-128 FP8 quantization gives e4m3 values and one scale per
-    128x128 block, and dequantizes back within 5% relative error.
-
-    Why: test weights and the reference math rely on this helper.
-    """
+def test_fp8_block128_dequantization_recovers_weights():
+    """Production dequantization recovers block-FP8 test weights within 5%."""
     w = torch.randn(2, 256, 384)
 
     w_q, scale = quantize_fp8_block128(w)

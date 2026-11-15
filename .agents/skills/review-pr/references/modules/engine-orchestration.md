@@ -8,8 +8,8 @@ Use for cross-role request flow semantics: async-DP engine behavior from the
 patched `EngineCore` / `EngineCoreProc` / `DPEngineCoreProc` busy loops,
 `DPAsyncMPClient.add_request_async`, AFD request routing between attention and
 FFN, the DBO yield custom op (`v1/worker/dbo.py` →
-`maybe_apply_dbo_yield`), ubatching orchestration
-(`v1/worker/ubatch_wrapper.py`), and the `AFDBalancedRoutingStrategy` routing
+`maybe_apply_dbo_yield`), native microbatch metadata integration
+(`v1/worker/attention_metadata.py`), and the `AFDBalancedRoutingStrategy` routing
 simulator. Does not own the patch mechanics
 ([compat-patches.md](compat-patches.md)) or worker internals
 ([workers-runners.md](workers-runners.md)).
