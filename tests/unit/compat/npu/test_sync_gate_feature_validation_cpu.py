@@ -134,6 +134,10 @@ def _real_extra_info():
     pin the connector-level contract.
     """
 
+    # The class lives in a module that imports torch unconditionally; the gate
+    # tests above run without it, so these two keep skipping on a torch-less host.
+    pytest.importorskip("torch")
+
     import sys
     import types
 
