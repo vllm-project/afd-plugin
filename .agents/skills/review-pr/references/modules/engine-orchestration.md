@@ -44,6 +44,6 @@ shutdown/cancellation in `tests/unit/compat/patches/`
 (`test_engine_core.py`, `test_async_dp_engine.py`,
 `test_async_dp_forward_context.py`, `test_gpu_mrv2_ubatching.py`),
 `tests/unit/v1/worker/test_dbo.py`,
-`tests/unit/model_executor/test_async_cam_dbo.py`, and
+`tests/unit/connectors/npu/async_cam_runtime/test_async_cam_dbo.py`, and
 `tests/unit/model_executor/test_routing_simulator.py`; name the DBO E2E
 scenario that exercises the real path.

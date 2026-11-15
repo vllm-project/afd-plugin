@@ -59,6 +59,11 @@ Connectors consume common configuration and platform operations. Attention,
 FFN, and model integration consume connector contracts; connector code must not
 depend on role worker implementations.
 
+Async CAM's `npu/async_cam_runtime/` package owns startup, Push/Pull sessions,
+FFN executors, and Attention-side DBO handoff and TP/SP payload conversion.
+Model adapters choose sequence-parallel behavior and call the boundary helpers;
+native vLLM DBO retains scheduling and microbatch ownership.
+
 ## Implementation evidence
 
 | Area | Source | Focused validation |

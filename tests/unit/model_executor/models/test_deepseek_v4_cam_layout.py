@@ -11,11 +11,13 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 pytest.importorskip("vllm_ascend.models.deepseek_v4.model")
 
-from afd_plugin.model_executor.models.npu import (  # noqa: E402
-    async_cam_layout,  # noqa: E402
-    deepseek_v4_attention_gate,
+from afd_plugin.connectors.npu.async_cam_runtime import (  # noqa: E402
+    async_cam_layout,
 )
 from afd_plugin.model_executor.models.npu import deepseek_v4 as adapter  # noqa: E402
+from afd_plugin.model_executor.models.npu import (  # noqa: E402
+    deepseek_v4_attention_gate,
+)
 
 
 def _make_proxy(monkeypatch, *, use_sequence_parallel: bool, in_profile_run: bool):

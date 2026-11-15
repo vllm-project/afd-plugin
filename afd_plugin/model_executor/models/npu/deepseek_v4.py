@@ -34,15 +34,15 @@ from afd_plugin.connectors import (
     AFDTransferContext,
     AFDTransferMetadata,
 )
-from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
-from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
-from afd_plugin.model_executor.models.npu.async_cam_dbo import (
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_dbo import (
     send_async_cam_remote_call,
 )
-from afd_plugin.model_executor.models.npu.async_cam_layout import (
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_layout import (
     prepare_cam_dispatch_payload,
     restore_cam_dispatch_output,
 )
+from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
+from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
 from afd_plugin.model_executor.models.npu.deepseek_v4_shared_experts import (
     AFDDeepseekV4SharedExperts,
 )
