@@ -30,7 +30,7 @@ validation_paths:
   - "tests/unit/v1/worker/test_npu_model_runner_v2.py"
   - "tests/unit/v1/worker/npu/test_ubatch_runner.py"
   - "tests/unit/v1/worker/npu/test_attention_model_runner_v2.py"
-  - "tests/unit/model_executor/test_async_cam_dbo.py"
+  - "tests/unit/connectors/npu/async_cam_runtime/test_async_cam_dbo.py"
   - "tests/npu/test_mrv2_dbo.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v4_flash/test_gpu.py"
@@ -317,8 +317,8 @@ Enable vLLM native DBO with `--enable-dbo` on Attention. It:
 
 Native DBO owns request/token boundaries. Enable DBO on Attention only; Async FFN rejects native DBO flags and
 continues its receive loop.
-`models/npu/async_cam_layout.py` retains only communication layout
-conversion, and `models/npu/async_cam_dbo.py` supplies the single-window receive
+`connectors/npu/async_cam_runtime/async_cam_layout.py` retains only communication layout
+conversion, and `connectors/npu/async_cam_runtime/async_cam_dbo.py` supplies the single-window receive
 hook. FlashComm1/SP is Attention-local and
 FFN topology validation is independent. See the CAM async user guide for the
 supported topology and environment matrix.

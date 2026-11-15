@@ -13,7 +13,7 @@ pytest.importorskip("vllm")
 from vllm.v1.worker import ubatching  # noqa: E402
 
 from afd_plugin.connectors import AFDTransferContext, AFDTransferMetadata  # noqa: E402
-from afd_plugin.model_executor.models.npu import async_cam_dbo  # noqa: E402
+from afd_plugin.connectors.npu.async_cam_runtime import async_cam_dbo  # noqa: E402
 
 
 def _context(stage):
