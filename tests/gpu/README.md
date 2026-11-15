@@ -19,11 +19,10 @@ server, and run outside CI.
   with the elfutils headers. See
   [Installation](../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation)
   in the connector guide.
-- The full suite has 23 cases (two of them need no GPU) and takes about
-  16 minutes on four H200 GPUs with cold JIT caches. DeepEP and DeepGEMM
+- The full suite has 23 cases (two of them need no GPU). DeepEP and DeepGEMM
   compile kernels on first use, once per topology, payload format and
-  transport configuration, and that dominates a cold run: with warm caches
-  the suite takes about 6 minutes.
+  transport configuration, so a run with cold JIT caches is much slower than
+  a rerun with warm ones.
 
 ## Run
 
