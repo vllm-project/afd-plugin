@@ -4,7 +4,7 @@
 side and sends each token only to the FFN ranks that own its selected experts
 (an M:N, expert-routed exchange). Dispatch and combine run on
 [afdEP-comm](https://github.com/afdEP/afdEP-comm)'s DeepEP-derived
-`ElasticBuffer`; the FFN runs its local experts with
+transport, one `Buffer` per lane; the FFN runs its local experts with
 [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) grouped GEMMs by default.
 This guide documents installation, the configuration contract, the required
 vLLM settings, supported layouts, and operational limits.
@@ -101,7 +101,7 @@ The connector needs three components in addition to the plugin and vLLM:
    ```bash
    python -m pip uninstall -y afdep
    python -m pip install --no-deps \
-     "afdep-comm @ git+https://github.com/afdEP/afdEP-comm.git@<tag pinned in pyproject.toml>"
+     "afdep-comm @ git+https://github.com/afdEP/afdEP-comm.git@<revision pinned in pyproject.toml>"
    python -m afdep doctor --build
    ```
 

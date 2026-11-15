@@ -25,7 +25,8 @@ from afd_plugin.connectors import (  # noqa: E402
 )
 from afd_plugin.connectors.base import AFDControlPlaneClosedError  # noqa: E402
 from tests.unit.fakes.afdep import (  # noqa: E402
-    FakeElasticBuffer,
+    FakeConfig,
+    FakeLanes,
     install_fake_afdep,
     uninstall_fake_afdep,
 )
@@ -502,19 +503,30 @@ def test_precompile_buckets(ladder, sync_min, expected):
 
 
 class _RecordingLane:
-    """A DeepEP buffer stand-in that records dispatch and combine calls."""
+    """An afdEP-comm ``Buffer`` stand-in that records each side's calls as the
+    dispatch and combine they are on the wire."""
+
+    topk_idx_dtype = torch.int64
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
 
-    def dispatch(self, x, x_scale, topk_ids, topk_weights, **kwargs):
-        self.calls.append(
-            ("dispatch", kwargs["bucket"], kwargs["do_cpu_sync"], x.shape[0])
-        )
+    def source_dispatch(
+        self, x, ids, weights, x_scale=None, *, bucket, read_host_counts
+    ):
+        assert ids.dtype == self.topk_idx_dtype and weights.dtype == torch.float32
+        self.calls.append(("dispatch", bucket, read_host_counts, x.shape[0]))
+
+    def source_collect(self):
+        self.calls.append(("combine", (0, M2N_HIDDEN_SIZE)))
+
+    def worker_receive(self, *, bucket, read_host_counts):
+        self.calls.append(("dispatch", bucket, read_host_counts, 0))
         return SimpleNamespace(handle=SimpleNamespace(recv_shape=(0, M2N_HIDDEN_SIZE)))
 
-    def combine(self, expert_output, handle):
-        self.calls.append(("combine", tuple(expert_output.shape)))
+    def worker_reply(self, rows, receipt):
+        assert tuple(rows.shape) == receipt.recv_shape
+        self.calls.append(("combine", tuple(rows.shape)))
 
 
 def test_precompile_runs_the_same_empty_steps_on_attention_and_ffn(monkeypatch):
@@ -534,8 +546,6 @@ def test_precompile_runs_the_same_empty_steps_on_attention_and_ffn(monkeypatch):
         connector.bucket_ladder = (8, 16, 64)
         connector.expert_alignment = DEEPGEMM_ALIGNMENT
         connector.lanes = [_RecordingLane(), _RecordingLane()]
-        if role == "attention":
-            connector._allocate_combine_zeros()
         connector._precompile_dispatch_kernels()
         calls[role] = [lane.calls for lane in connector.lanes]
 
@@ -937,9 +947,9 @@ def test_close_destroys_the_distinct_transport_group_after_lanes(monkeypatch):
     """
     events = []
 
-    class Lane:
-        def destroy(self):
-            events.append("lane")
+    class OpenLanes:
+        def close(self):
+            events.append("lanes")
 
     monkeypatch.setattr(
         connector_module, "_abort_process_group", lambda group: events.append("control")
@@ -953,12 +963,12 @@ def test_close_destroys_the_distinct_transport_group_after_lanes(monkeypatch):
     connector.group = SimpleNamespace()
     connector.bootstrap_group = SimpleNamespace()
     connector.transport_group = SimpleNamespace()
-    connector.lanes = [Lane()]
+    connector.lanes = OpenLanes()
 
     connector.close()
     connector.close()
 
-    assert events == ["control", "lane", "transport"]
+    assert events == ["control", "lanes", "transport"]
 
 
 @pytest.mark.parametrize(
@@ -1310,21 +1320,22 @@ def test_attention_init_rejects_local_experts_before_communicating():
         ("attention", 3, "ababab", 1),
     ],
 )
-def test_lane_transport_is_afdep_comm_with_the_ffn_rank_count(
+def test_lanes_are_afdep_comm_buffers_with_the_role_counts(
     monkeypatch, role, role_rank, hosts, ffn_ranks_per_domain
 ):
-    """Each lane's transport is afdEP-comm's ``ElasticBuffer``, built with every
-    argument its constructor requires, the FFN rank count and the transport's
-    ``ffn_ranks_per_domain``, on the transport group.
+    """The transport is afdEP-comm's ``Lanes`` on the transport group, one lane
+    per micro-batch, configured with the real expert count, both role sizes
+    and the transport's ``ffn_ranks_per_domain``.
 
-    Why: ``ffn_ranks`` selects afdEP-comm's AFD transport (without it the
-    buffer is unspecialized DeepEP V2), ``ffn_ranks_per_domain`` tells it
-    where the FFN ranks sit, and the stand-in fails on any argument set the
-    real constructor would refuse.
+    Why: afdEP-comm adds DeepEP's empty Attention expert blocks itself, so it
+    takes the real expert count; ``ffn_ranks_per_domain`` tells it where the
+    FFN ranks sit; and the stand-in fails on any field the real ``Config``
+    would refuse.
     """
-    monkeypatch.setattr(connector_module, "ElasticBuffer", FakeElasticBuffer)
+    monkeypatch.setattr(connector_module, "Config", FakeConfig)
+    monkeypatch.setattr(connector_module, "Lanes", FakeLanes)
     topology = M2NTopology(ffn_size=2, attn_size=4)
-    connector = _connector(role, role_rank, topology, {})
+    connector = _connector(role, role_rank, topology, {"num_lanes": 2})
     connector.transport_group = SimpleNamespace()
     connector.transport = plan_transport_layout(
         [
@@ -1335,15 +1346,21 @@ def test_lane_transport_is_afdep_comm_with_the_ffn_rank_count(
     )
     connector.network_plan = SimpleNamespace(hybrid=True, rdma_traffic_class=0)
     connector.capacity_tokens_per_rank = 64
+    connector.expert_alignment = DEEPGEMM_ALIGNMENT
 
-    buffer = connector._new_lane()
+    lanes = connector._new_lanes()
 
-    assert isinstance(buffer, FakeElasticBuffer)
-    assert buffer.kwargs["group"] is connector.transport_group
-    assert buffer.kwargs["ffn_ranks"] == 2
-    assert buffer.kwargs["ffn_ranks_per_domain"] == ffn_ranks_per_domain
-    assert buffer.kwargs["capacity_tokens_per_rank"] == 64
-    assert buffer.kwargs["allow_hybrid_mode"] is True
+    assert isinstance(lanes, FakeLanes)
+    assert lanes.group is connector.transport_group
+    assert len(lanes) == 2
+    config = lanes.config.kwargs
+    assert config["num_experts"] == connector.layout.num_experts
+    assert (config["ffn_ranks"], config["attention_ranks"]) == (2, 4)
+    assert config["ffn_ranks_per_domain"] == ffn_ranks_per_domain
+    assert config["capacity_tokens_per_rank"] == 64
+    assert config["expert_alignment"] == DEEPGEMM_ALIGNMENT
+    assert config["payload"] == "bf16"
+    assert config["allow_hybrid_mode"] is True
 
 
 def test_attention_ops_take_the_stage_from_the_live_dbo_micro_batch(monkeypatch):
@@ -1392,41 +1409,6 @@ def test_attention_ops_take_the_stage_from_the_live_dbo_micro_batch(monkeypatch)
 DEEPGEMM_ALIGNMENT = 128
 
 
-class _ReceivingLane(_RecordingLane):
-    """A transport that reports receive rows, which afdEP-comm never gives an
-    Attention rank."""
-
-    def dispatch(self, x, x_scale, topk_ids, topk_weights, **kwargs):
-        super().dispatch(x, x_scale, topk_ids, topk_weights, **kwargs)
-        return SimpleNamespace(handle=SimpleNamespace(recv_shape=(5, M2N_HIDDEN_SIZE)))
-
-
-def test_attention_combine_rejects_receive_rows(monkeypatch):
-    """An Attention rank's combine input is empty, so a transport that reports
-    receive rows for it raises instead of combining.
-
-    Why: afdEP-comm gives Attention ranks no receive rows, with or without the
-    host sync. The worst-case zero buffer this replaces took up to ~1 GiB per
-    Attention GPU before KV-cache sizing and was never read.
-    """
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
-    connector = _connector(
-        "attention",
-        0,
-        M2NTopology(ffn_size=2, attn_size=2),
-        {"capacity_tokens_per_rank": 64},
-    )
-    connector.device = torch.device("cpu")
-    connector.capacity_tokens_per_rank = 64
-    connector.bucket_ladder = (8,)
-    connector.expert_alignment = DEEPGEMM_ALIGNMENT
-    connector.lanes = [_ReceivingLane()]
-    connector._allocate_combine_zeros()
-
-    with pytest.raises(RuntimeError, match="receive rows"):
-        connector._precompile_dispatch_kernels()
-
-
 class _LoggedEvent:
     """CPU stand-in for ``torch.cuda.Event``: logs where it was recorded."""
 
@@ -1453,8 +1435,9 @@ class _LoggedStream:
 
 
 class _FFNLane:
-    def dispatch(self, x, x_scale, topk_ids, topk_weights, **kwargs):
-        rows = torch.zeros((0, M2N_HIDDEN_SIZE))
+    def worker_receive(self, *, bucket, read_host_counts):
+        # afdEP-comm allocates the received rows on the caller's stream.
+        rows = torch.empty((0, M2N_HIDDEN_SIZE))
         return SimpleNamespace(
             recv_x=rows,
             recv_scale=None,
@@ -1464,8 +1447,8 @@ class _FFNLane:
             handle=SimpleNamespace(recv_shape=(0, M2N_HIDDEN_SIZE)),
         )
 
-    def combine(self, expert_output, handle):
-        return expert_output
+    def worker_reply(self, rows, receipt):
+        return None
 
 
 def _logged_ffn_connector(monkeypatch, num_lanes: int):
