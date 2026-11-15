@@ -32,6 +32,9 @@ from typing import Any
 import pytest
 
 from tests.unit.fakes.afd_config import camp2p_config as _afd_config
+from tests.unit.fakes.stub_modules import (
+    drop_stub_bound_modules as _drop_stub_bound_modules,
+)
 from tests.unit.fakes.vllm_config import camp2p_config as _vllm_config
 
 torch = pytest.importorskip("torch")
@@ -47,32 +50,6 @@ _STUB_MODULES = (
     "vllm.distributed",
     "vllm.distributed.parallel_state",
 )
-
-
-def _drop_stub_bound_modules(before: set[str], stub_objects: set[int]) -> None:
-    """Forget modules the stub block loaded that still hold one of its objects.
-
-    A cached module keeps the doubles in its globals, and the parent package keeps the
-    child module as an attribute, so both have to be dropped for a later import to build
-    the real thing.
-    """
-
-    for name in [
-        name
-        for name in sys.modules
-        if name not in before and name.startswith("afd_plugin")
-    ]:
-        module = sys.modules[name]
-        if not any(
-            value is not None and id(value) in stub_objects
-            for value in vars(module).values()
-        ):
-            continue
-        sys.modules.pop(name, None)
-        parent_name, _, leaf = name.rpartition(".")
-        parent = sys.modules.get(parent_name)
-        if parent is not None and getattr(parent, leaf, None) is module:
-            delattr(parent, leaf)
 
 
 @contextlib.contextmanager
