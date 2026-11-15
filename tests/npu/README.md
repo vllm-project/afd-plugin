@@ -278,7 +278,7 @@ device and no collective. Run the CPU contracts first, then rebuild the matching
 extension/vendor library and run the device checks:
 
 ```bash
-pytest -q tests/unit/test_envs.py tests/unit/model_executor/test_async_cam_layered.py
+pytest -q tests/unit/test_envs.py tests/unit/connectors/npu/async_cam_runtime/test_async_cam_layered.py
 SOC_VERSION=910c pytest -q tests/npu/test_gmm_layered.py \
   tests/npu/test_gmm_swiglu_quant_v2_layered.py
 ```

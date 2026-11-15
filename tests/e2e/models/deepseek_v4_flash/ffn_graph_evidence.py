@@ -14,7 +14,9 @@ from types import SimpleNamespace
 import torch
 
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
-from afd_plugin.model_executor.npu.async_cam_mega import AsyncCAMMegaExecutor
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_mega import (
+    AsyncCAMMegaExecutor,
+)
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 from afd_plugin.v1.worker.npu.attention_model_runner_v2 import (
     AFDNPUAttentionModelRunnerV2,

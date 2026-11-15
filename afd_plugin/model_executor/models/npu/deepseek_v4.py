@@ -65,7 +65,9 @@ if TYPE_CHECKING:
         AscendW4A8DynamicFusedMoEMethod,
     )
 
-    from afd_plugin.model_executor.npu.async_cam_layered import LayeredFFNWeights
+    from afd_plugin.connectors.npu.async_cam_runtime.async_cam_layered import (
+        LayeredFFNWeights,
+    )
 
 
 _ATTENTION_ROLE = "attention"
@@ -942,7 +944,9 @@ def _extract_async_cam_layered_weights(
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm_ascend.quantization.quant_type import QuantType
 
-    from afd_plugin.model_executor.npu.async_cam_layered import LayeredFFNWeights
+    from afd_plugin.connectors.npu.async_cam_runtime.async_cam_layered import (
+        LayeredFFNWeights,
+    )
 
     layers = [layer for layer in layers if layer.is_moe_layer]
     # Only the FFN role exposes loaded experts; Ascend's factory returns its
