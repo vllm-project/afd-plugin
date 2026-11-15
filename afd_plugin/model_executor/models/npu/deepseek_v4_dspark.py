@@ -37,7 +37,9 @@ from afd_plugin.model_executor.models.npu.deepseek_v4 import (
 )
 
 if TYPE_CHECKING:
-    from afd_plugin.model_executor.npu.async_cam_layered import LayeredFFNWeights
+    from afd_plugin.connectors.npu.async_cam_runtime.async_cam_layered import (
+        LayeredFFNWeights,
+    )
 
 
 def _iter_role_weights(

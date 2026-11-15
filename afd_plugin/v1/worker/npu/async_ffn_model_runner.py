@@ -25,16 +25,18 @@ from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
 )
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_layered import (
+    AsyncCAMLayeredExecutor,
+    LayeredFFNWeights,
+)
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_mega import (
+    AsyncCAMMegaExecutor,
+)
 from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup import (
     GRAPH_STARTUP_TIMEOUT_SECONDS,
     POLL_SECONDS,
     FFNGraphPlan,
 )
-from afd_plugin.model_executor.npu.async_cam_layered import (
-    AsyncCAMLayeredExecutor,
-    LayeredFFNWeights,
-)
-from afd_plugin.model_executor.npu.async_cam_mega import AsyncCAMMegaExecutor
 from afd_plugin.validation import (
     cam_receive_capacity,
     requested_ffn_mode,

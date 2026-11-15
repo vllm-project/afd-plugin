@@ -14,8 +14,10 @@ import torch
 from vllm.distributed import get_tensor_model_parallel_rank
 
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_mega import (
+    AsyncCAMMegaExecutor,
+)
 from afd_plugin.connectors.npu.async_cam_runtime.async_cam_session import PullCAMSession
-from afd_plugin.model_executor.npu.async_cam_mega import AsyncCAMMegaExecutor
 from afd_plugin.v1.worker.npu.ffn_worker import AFDNPUFFNWorker
 
 

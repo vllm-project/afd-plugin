@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import torch
 
-from afd_plugin.model_executor.npu.async_cam_layered import AsyncCAMLayeredExecutor
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_layered import (
+    AsyncCAMLayeredExecutor,
+)
 from afd_plugin.validation import cam_receive_capacity
 
 # Mirror Pull::MetadataWords in afd_pull_layout.h (all fields are int64_t):
