@@ -85,10 +85,12 @@ BF16 model.
 | `test_close_cancels_a_blocked_control_receive` | Closing the control plane cancels an FFN receive blocked on it and leaves the lanes' bootstrap group usable |
 | `test_non_finite_output_fails_the_numerical_checks` | The harness itself rejects NaN and infinite errors (no GPU needed) |
 
-Covered elsewhere rather than here: the `fused_experts` backend is the
-reference every FFN check already runs; the per-stage plan (host-sync
-threshold, bucket ladder, per-DP-rank split over Attention TP peers) is CPU
-logic tested in `tests/unit/connectors/test_deepep_m2n_connector.py`.
+Not run here: the per-stage plan (host-sync threshold, bucket ladder,
+per-DP-rank split over Attention TP peers) is CPU logic tested in
+`tests/unit/connectors/test_deepep_m2n_connector.py`. vLLM `fused_experts`
+runs as the reference in every FFN check, but no case configures the
+connector with `expert_backend: fused_experts` (its alignment-1 receive
+layout).
 
 ## How these tests differ from E2E
 
