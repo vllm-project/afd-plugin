@@ -114,9 +114,21 @@ The connector needs three components in addition to the plugin and vLLM:
    export AFDEP_NCCL_ROOT=$NCCL LD_LIBRARY_PATH=$NCCL/lib:${LD_LIBRARY_PATH:-}
    ```
 
-2. **DeepGEMM**, required by the default `deepgemm` expert backend. It is not a
-   plugin extra (its build imports `torch` and needs git submodules), so build
-   it from source:
+2. **DeepGEMM**, required by the default `deepgemm` expert backend. The
+   connector uses, in this order (the same order vLLM uses):
+
+   - an installed upstream `deep_gemm` package, when present;
+   - otherwise the copy vendored in the vLLM wheel
+     (`vllm.third_party.deep_gemm`), which vLLM `v0.32.0` CUDA builds,
+     including the `vllm/vllm-openai` image, bundle.
+
+   With a stock vLLM `v0.32.0` CUDA install no extra step is needed. The FFN
+   log names the package in use (`DeepEP M2N experts use DeepGEMM from ...`).
+   If DeepGEMM's JIT then fails on a missing `elfutils/libdwfl.h`, install
+   `libdw-dev` as described below.
+
+   To pin an upstream DeepGEMM instead, build it from source. It is not a
+   plugin extra (its build imports `torch` and needs git submodules):
 
    ```bash
    # DeepGEMM's JIT includes elfutils/libdwfl.h.
@@ -130,8 +142,8 @@ The connector needs three components in addition to the plugin and vLLM:
    ```
 
    - The elfutils headers (`libdw-dev`, and `libelf-dev` it depends on) are
-     needed when building DeepGEMM and at runtime, because DeepGEMM compiles
-     its kernels just in time. Without root, extract the `libdw-dev` and
+     needed when building upstream DeepGEMM and at runtime, because DeepGEMM
+     compiles its kernels just in time. Without root, extract the `libdw-dev` and
      `libelf-dev` packages that match the installed elfutils runtime with
      `dpkg -x`, and point `CPLUS_INCLUDE_PATH`, `C_INCLUDE_PATH` and
      `LIBRARY_PATH` at them for both the build and the served processes.

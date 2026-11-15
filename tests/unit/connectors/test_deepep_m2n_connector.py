@@ -253,6 +253,60 @@ def test_expert_num_sms_sizes_the_deepgemm_grid(monkeypatch):
         experts_module.DeepEPM2NExperts("deepgemm", 128, 134)
 
 
+UPSTREAM_DG = "deep_gemm"
+VENDORED_DG = "vllm.third_party.deep_gemm"
+
+
+@pytest.mark.parametrize(
+    ("installed", "missing_name", "expected"),
+    [
+        ((UPSTREAM_DG, VENDORED_DG), {}, UPSTREAM_DG),
+        ((VENDORED_DG,), {}, VENDORED_DG),
+        # vLLM builds without DeepGEMM have no vllm.third_party package at all.
+        ((), {VENDORED_DG: "vllm.third_party"}, "needs DeepGEMM"),
+        # The upstream package is installed but cannot load its own extension.
+        ((VENDORED_DG,), {UPSTREAM_DG: "deep_gemm_cpp"}, "deep_gemm_cpp"),
+    ],
+    ids=["upstream-first", "vendored-fallback", "neither", "broken-upstream"],
+)
+def test_deepgemm_prefers_upstream_then_vllm_vendored_copy(
+    monkeypatch, installed, missing_name, expected
+):
+    """An installed upstream ``deep_gemm`` wins; without it the copy vendored in
+    the vLLM wheel is used; with neither the error names both and the
+    ``fused_experts`` way out. An installed but broken upstream package fails
+    instead of falling back.
+
+    Why: a stock vLLM install should run the deepgemm backend without a
+    separate DeepGEMM build, a pinned upstream DeepGEMM must still take
+    precedence (vLLM's own order), and a broken install must not silently
+    switch to different kernels.
+    """
+    from afd_plugin.connectors.gpu.deepep_m2n import deepgemm as deepgemm_module
+
+    natives = {package: SimpleNamespace(source=package) for package in installed}
+
+    def import_module(name: str):
+        package = name.removesuffix("._C")
+        absent = missing_name.get(package, package)
+        if package in natives and package not in missing_name:
+            return natives[package] if name.endswith("._C") else SimpleNamespace()
+        raise ModuleNotFoundError(f"No module named {absent!r}", name=absent)
+
+    monkeypatch.setattr(
+        deepgemm_module, "importlib", SimpleNamespace(import_module=import_module)
+    )
+    deepgemm_module.load_deepgemm.cache_clear()
+    try:
+        if expected in natives:
+            assert deepgemm_module.load_deepgemm().source == expected
+        else:
+            with pytest.raises(ModuleNotFoundError, match=expected):
+                deepgemm_module.load_deepgemm()
+    finally:
+        deepgemm_module.load_deepgemm.cache_clear()
+
+
 def test_plan_stage_skips_host_sync_below_threshold():
     """With a threshold of 256, an eager 255-token step skips the host sync
     and a 256-token step keeps it.

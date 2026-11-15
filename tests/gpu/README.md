@@ -15,8 +15,9 @@ server, and run outside CI.
 - Hopper (SM90) or newer GPUs on one node. Most cases need 4 GPUs; the two
   `2F-2DPx2TP` Attention TP cases need 6. Cases that need more GPUs than are
   visible skip, and every case skips below SM90.
-- vLLM with the plugin installed, afdEP-comm (the `afdep` extra), and DeepGEMM
-  with the elfutils headers. See
+- vLLM with the plugin installed and afdEP-comm (the `afdep` extra).
+  DeepGEMM comes from an installed upstream `deep_gemm` package or, without
+  one, from the copy bundled in the vLLM wheel. See
   [Installation](../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation)
   in the connector guide.
 - The full suite has 34 cases and takes about 53 minutes on six H200 GPUs with

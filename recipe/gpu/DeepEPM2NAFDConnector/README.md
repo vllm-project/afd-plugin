@@ -34,9 +34,9 @@ every setting, and how to run a recipe directly or in a pod.
 - SM90 or newer GPUs. The DeepSeek and Qwen3-30B default `2A2F` layout uses
   4 GPUs; Qwen3-235B defaults to `4A2F` on 6 GPUs. See the model README for
   memory needs.
-- vLLM `v0.32.0`, the plugin, afdEP-comm (the `afdep` extra) and DeepGEMM
-  installed in one environment, with the elfutils headers available to
-  DeepGEMM's JIT. See
+- vLLM `v0.32.0`, the plugin and afdEP-comm (the `afdep` extra) installed in
+  one environment. DeepGEMM is the copy bundled in the vLLM wheel unless an
+  upstream `deep_gemm` package is installed. See
   [Installation](../../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation).
 - When afdEP-comm was built against the `nvidia-nccl` wheel, export its
   location before running a script:
