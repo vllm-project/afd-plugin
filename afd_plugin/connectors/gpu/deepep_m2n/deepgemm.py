@@ -2,14 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """DeepGEMM grouped GEMMs the M2N experts use.
 
-The module comes from one of two places, in the order vLLM itself uses
-(``vllm.utils.deep_gemm``):
-
-1. A separately installed upstream ``deep_gemm`` package
-   (https://github.com/deepseek-ai/DeepGEMM), so a deployment can pin its own
-   version.
-2. The copy vendored in the vLLM wheel, ``vllm.third_party.deep_gemm``. It
-   exposes the same ``_C`` API, so a stock vLLM install needs no extra build.
+The kernels come from the DeepGEMM copy bundled in the vLLM wheel,
+``vllm.third_party.deep_gemm``, so the connector runs the DeepGEMM version the
+pinned vLLM ships and a stock vLLM install needs no extra build. A separately
+installed upstream ``deep_gemm`` package is not used here (vLLM's own kernels
+may still prefer it).
 
 The kernels are JIT-compiled at runtime. Only the ``deepgemm`` expert backend
 needs DeepGEMM.
@@ -26,48 +23,34 @@ import importlib
 from types import ModuleType
 
 import torch
-from vllm.logger import init_logger
 
-logger = init_logger(__name__)
-
-# Preference order: an installed upstream package first, then vLLM's copy.
-DEEPGEMM_PACKAGES = ("deep_gemm", "vllm.third_party.deep_gemm")
-
-
-def _is_missing(package: str, error: ModuleNotFoundError) -> bool:
-    """Whether ``error`` means ``package`` (or a parent package) is not installed.
-
-    Any other missing module means the package is installed but broken; that
-    must surface instead of silently switching to another DeepGEMM.
-    """
-    missing = error.name
-    return missing is not None and (
-        package == missing or package.startswith(f"{missing}.")
-    )
+# The DeepGEMM copy vendored in the vLLM wheel.
+DEEPGEMM_PACKAGE = "vllm.third_party.deep_gemm"
 
 
 @functools.cache
 def load_deepgemm() -> ModuleType:
-    """DeepGEMM's native ``_C`` module, from the first package that is installed.
+    """The native ``_C`` module of the DeepGEMM bundled with vLLM.
 
     Importing the package initializes its JIT. The import is deferred to first
     use because the ``fused_experts`` backend runs without DeepGEMM.
     """
-    for package in DEEPGEMM_PACKAGES:
-        try:
-            importlib.import_module(package)
-        except ModuleNotFoundError as error:
-            if _is_missing(package, error):
-                continue
+    try:
+        return importlib.import_module(f"{DEEPGEMM_PACKAGE}._C")
+    except ModuleNotFoundError as error:
+        # Only a vLLM build without DeepGEMM gets the hint; any other missing
+        # module means the bundled copy is broken and surfaces unchanged.
+        missing = error.name
+        if missing is None or not (
+            missing == DEEPGEMM_PACKAGE or DEEPGEMM_PACKAGE.startswith(f"{missing}.")
+        ):
             raise
-        logger.info("DeepEP M2N experts use DeepGEMM from %s", package)
-        return importlib.import_module(f"{package}._C")
-    raise ModuleNotFoundError(
-        "The DeepEP M2N 'deepgemm' expert backend needs DeepGEMM: neither "
-        f"{' nor '.join(DEEPGEMM_PACKAGES)} is installed. Use a vLLM build "
-        "that bundles DeepGEMM, install upstream DeepGEMM, or set "
-        "expert_backend: fused_experts."
-    )
+        raise ModuleNotFoundError(
+            "The DeepEP M2N 'deepgemm' expert backend needs the DeepGEMM bundled "
+            f"with vLLM ({DEEPGEMM_PACKAGE}), which this vLLM build does not "
+            "include. Use a vLLM CUDA build, or set expert_backend: fused_experts.",
+            name=error.name,
+        ) from error
 
 
 def contiguous_m_alignment() -> int:

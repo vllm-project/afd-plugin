@@ -254,55 +254,57 @@ def test_expert_num_sms_sizes_the_deepgemm_grid(monkeypatch):
 
 
 UPSTREAM_DG = "deep_gemm"
-VENDORED_DG = "vllm.third_party.deep_gemm"
+VLLM_DG = "vllm.third_party.deep_gemm"
 
 
 @pytest.mark.parametrize(
-    ("installed", "missing_name", "expected"),
+    ("missing_name", "expected"),
     [
-        ((UPSTREAM_DG, VENDORED_DG), {}, UPSTREAM_DG),
-        ((VENDORED_DG,), {}, VENDORED_DG),
+        # An upstream deep_gemm is importable too; the bundled copy still wins.
+        (None, VLLM_DG),
         # vLLM builds without DeepGEMM have no vllm.third_party package at all.
-        ((), {VENDORED_DG: "vllm.third_party"}, "needs DeepGEMM"),
-        # The upstream package is installed but cannot load its own extension.
-        ((VENDORED_DG,), {UPSTREAM_DG: "deep_gemm_cpp"}, "deep_gemm_cpp"),
+        ("vllm.third_party", "bundled with vLLM"),
+        # The bundled copy is present but cannot load its own dependency.
+        ("deep_gemm_cpp", "deep_gemm_cpp"),
     ],
-    ids=["upstream-first", "vendored-fallback", "neither", "broken-upstream"],
+    ids=["vllm-copy-over-upstream", "not-bundled", "broken-bundled-copy"],
 )
-def test_deepgemm_prefers_upstream_then_vllm_vendored_copy(
-    monkeypatch, installed, missing_name, expected
+def test_deepgemm_uses_only_the_copy_bundled_with_vllm(
+    monkeypatch, missing_name, expected
 ):
-    """An installed upstream ``deep_gemm`` wins; without it the copy vendored in
-    the vLLM wheel is used; with neither the error names both and the
-    ``fused_experts`` way out. An installed but broken upstream package fails
-    instead of falling back.
+    """The connector loads ``vllm.third_party.deep_gemm`` and never an upstream
+    ``deep_gemm``. Without the bundled copy the error points to the
+    ``fused_experts`` backend; any other import failure surfaces unchanged.
 
-    Why: a stock vLLM install should run the deepgemm backend without a
-    separate DeepGEMM build, a pinned upstream DeepGEMM must still take
-    precedence (vLLM's own order), and a broken install must not silently
-    switch to different kernels.
+    Why: the experts must run the DeepGEMM the pinned vLLM ships, whatever else
+    is installed, and a broken install must not be reported as a missing one.
     """
     from afd_plugin.connectors.gpu.deepep_m2n import deepgemm as deepgemm_module
 
-    natives = {package: SimpleNamespace(source=package) for package in installed}
+    natives = {
+        package: SimpleNamespace(source=package) for package in (UPSTREAM_DG, VLLM_DG)
+    }
 
     def import_module(name: str):
-        package = name.removesuffix("._C")
-        absent = missing_name.get(package, package)
-        if package in natives and package not in missing_name:
-            return natives[package] if name.endswith("._C") else SimpleNamespace()
-        raise ModuleNotFoundError(f"No module named {absent!r}", name=absent)
+        if missing_name is not None:
+            raise ModuleNotFoundError(
+                f"No module named {missing_name!r}", name=missing_name
+            )
+        return natives[name.removesuffix("._C")]
 
     monkeypatch.setattr(
         deepgemm_module, "importlib", SimpleNamespace(import_module=import_module)
     )
     deepgemm_module.load_deepgemm.cache_clear()
     try:
-        if expected in natives:
+        if missing_name is None:
             assert deepgemm_module.load_deepgemm().source == expected
         else:
-            with pytest.raises(ModuleNotFoundError, match=expected):
+            with pytest.raises(ModuleNotFoundError, match=expected) as raised:
                 deepgemm_module.load_deepgemm()
+            assert ("fused_experts" in str(raised.value)) == (
+                missing_name == "vllm.third_party"
+            )
     finally:
         deepgemm_module.load_deepgemm.cache_clear()
 

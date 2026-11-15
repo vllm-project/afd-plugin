@@ -115,43 +115,15 @@ The connector needs three components in addition to the plugin and vLLM:
    ```
 
 2. **DeepGEMM**, required by the default `deepgemm` expert backend. The
-   connector uses, in this order (the same order vLLM uses):
+   connector uses the copy bundled in the vLLM wheel
+   (`vllm.third_party.deep_gemm`). Every vLLM `v0.32.0` CUDA build ships it,
+   including the `vllm/vllm-openai` image, so no extra step is needed.
+   A separately installed upstream `deep_gemm` package is not used by the
+   connector (vLLM's own kernels prefer it when present).
 
-   - an installed upstream `deep_gemm` package, when present;
-   - otherwise the copy vendored in the vLLM wheel
-     (`vllm.third_party.deep_gemm`), which vLLM `v0.32.0` CUDA builds,
-     including the `vllm/vllm-openai` image, bundle.
-
-   With a stock vLLM `v0.32.0` CUDA install no extra step is needed. The FFN
-   log names the package in use (`DeepEP M2N experts use DeepGEMM from ...`).
-   If DeepGEMM's JIT then fails on a missing `elfutils/libdwfl.h`, install
-   `libdw-dev` as described below.
-
-   To pin an upstream DeepGEMM instead, build it from source. It is not a
-   plugin extra (its build imports `torch` and needs git submodules):
-
-   ```bash
-   # DeepGEMM's JIT includes elfutils/libdwfl.h.
-   apt-get install -y libdw-dev
-   git clone https://github.com/deepseek-ai/DeepGEMM.git
-   cd DeepGEMM
-   git submodule update --init --recursive
-   python setup.py bdist_wheel
-   # --no-deps: DeepGEMM's own install path reinstalls torch.
-   python -m pip install --no-deps dist/*.whl
-   ```
-
-   - The elfutils headers (`libdw-dev`, and `libelf-dev` it depends on) are
-     needed when building upstream DeepGEMM and at runtime, because DeepGEMM
-     compiles its kernels just in time. Without root, extract the `libdw-dev` and
-     `libelf-dev` packages that match the installed elfutils runtime with
-     `dpkg -x`, and point `CPLUS_INCLUDE_PATH`, `C_INCLUDE_PATH` and
-     `LIBRARY_PATH` at them for both the build and the served processes.
-   - When torch comes from the pip CUDA wheels, its headers include
-     `cusparse.h` and other CUDA headers shipped by the `nvidia-*` wheels.
-     Add that wheel `include` directory to `CPLUS_INCLUDE_PATH` for the build.
-   - The `fused_experts` expert backend (vLLM's Triton kernels) runs without
-     DeepGEMM; it is a reference backend.
+   DeepGEMM compiles its kernels just in time on first use, so the first start
+   on a host is slower. The `fused_experts` expert backend (vLLM's Triton
+   kernels) runs without DeepGEMM; it is a reference backend.
 
 3. A GPU with compute capability 9.0 or newer on every rank.
 

@@ -24,9 +24,8 @@ uv sync --group dev --extra vllm
 
 The optional GPU extra pins `vllm==0.32.0`.
 
-`DeepEPM2NAFDConnector` also needs the `afdep` extra (afdEP-comm) and
-DeepGEMM. vLLM CUDA builds bundle a DeepGEMM copy the connector uses unless an
-upstream `deep_gemm` package is installed; see
+`DeepEPM2NAFDConnector` also needs the `afdep` extra (afdEP-comm). Its
+DeepGEMM experts use the DeepGEMM bundled in vLLM CUDA builds; see
 [Installation](gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation) in
 the connector guide.
 

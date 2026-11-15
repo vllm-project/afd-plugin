@@ -283,7 +283,8 @@ devices and FFN DP2 on the other two.
 `tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py` runs
 DeepSeek-V2-Lite through the same five scenarios.
 
-They need four SM90 or newer GPUs, afdEP-comm and DeepGEMM; see
+They need four SM90 or newer GPUs and afdEP-comm (DeepGEMM comes with vLLM);
+see
 [Installation](../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation)
 in the connector guide. CI does not run them.
 

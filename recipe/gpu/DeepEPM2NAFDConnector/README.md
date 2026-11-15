@@ -35,8 +35,7 @@ every setting, and how to run a recipe directly or in a pod.
   4 GPUs; Qwen3-235B defaults to `4A2F` on 6 GPUs. See the model README for
   memory needs.
 - vLLM `v0.32.0`, the plugin and afdEP-comm (the `afdep` extra) installed in
-  one environment. DeepGEMM is the copy bundled in the vLLM wheel unless an
-  upstream `deep_gemm` package is installed. See
+  one environment. DeepGEMM is the copy bundled in the vLLM wheel. See
   [Installation](../../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation).
 - When afdEP-comm was built against the `nvidia-nccl` wheel, export its
   location before running a script:
@@ -51,7 +50,7 @@ every setting, and how to run a recipe directly or in a pod.
   `13355` (FFN DP RPC).
 
 The scripts call `vllm serve` directly rather than through `uv run`, so they
-use the environment that holds afdEP-comm and DeepGEMM.
+use the environment that holds afdEP-comm.
 
 ## Layout
 
@@ -88,7 +87,7 @@ Kubernetes.
 The **`deploy-afd-k8s`** skill (`.agents/skills/deploy-afd-k8s/SKILL.md`)
 deploys a recipe as one pod per `LAYOUT` entry; see
 [Running in a pod](../common/README.md#running-in-a-pod). The image must
-contain afdEP-comm and DeepGEMM.
+contain afdEP-comm; the `vllm/vllm-openai` image already bundles DeepGEMM.
 
 ## Checking a deployment
 
