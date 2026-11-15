@@ -12,7 +12,6 @@ primary_code_paths:
   - "afd_plugin/v1/worker/npu/attention_model_runner_v2.py"
   - "afd_plugin/v1/worker/npu/attention_worker.py"
   - "afd_plugin/v1/worker/npu/dspark_speculator.py"
-  - "afd_plugin/v1/worker/npu/dspark_graph.py"
 related_code_paths:
   - "afd_plugin/connectors/**"
   - "afd_plugin/model_executor/**"
@@ -24,7 +23,7 @@ depends_on:
   - "execution_platforms.md"
   - "compatibility_and_patches.md"
 validation_paths:
-  - "tests/unit/v1/worker/npu/test_dspark_graph.py"
+  - "tests/unit/v1/worker/npu/test_dspark_speculator.py"
   - "tests/unit/v1/worker/test_attention_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
