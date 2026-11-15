@@ -22,6 +22,9 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from tests.unit.fakes.stub_modules import (
+    drop_new_modules as _drop_new_modules,
+)
+from tests.unit.fakes.stub_modules import (
     drop_stub_bound_modules as _drop_stub_bound_modules,
 )
 
@@ -69,6 +72,10 @@ finally:
         # ``import torch_npu`` at module scope), so those modules are dropped
         # together with the parent attributes that point at them.
         _drop_stub_bound_modules(_modules_before_stub, {id(_torch_npu_stub)})
+        # The adapter does not hold the stand-in itself: it imports the shared
+        # experts class, whose methods keep the defining module's globals alive.
+        # Name the subtree explicitly so the adapter is reloaded for real later.
+        _drop_new_modules(_modules_before_stub, "afd_plugin.model_executor.models.npu")
         sys.modules.pop("torch_npu", None)
 
 TOP_K = 2

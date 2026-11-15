@@ -31,3 +31,29 @@ def drop_stub_bound_modules(before: set[str], stub_objects: set[int]) -> None:
         parent = sys.modules.get(parent_name)
         if parent is not None and getattr(parent, leaf, None) is module:
             delattr(parent, leaf)
+
+
+def drop_new_modules(before: set[str], prefixes: str | tuple[str, ...]) -> None:
+    """Forget every module under ``prefixes`` that this import window loaded.
+
+    Some modules do not reference a stand-in directly: an adapter that does
+    ``from ... import SomeClass`` holds only the class, while the class methods
+    keep the defining module's globals -- and the stand-in in them -- alive. The
+    stub-object scan cannot see that, so callers name the subtree instead.
+    """
+
+    if isinstance(prefixes, str):
+        prefixes = (prefixes,)
+
+    for name in [
+        name
+        for name in sys.modules
+        # The package itself stays: it holds no stand-in, and removing it first
+        # would orphan its children before their attributes are cleared.
+        if name not in before and name.startswith(prefixes) and name not in prefixes
+    ]:
+        module = sys.modules.pop(name, None)
+        parent_name, _, leaf = name.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        if parent is not None and getattr(parent, leaf, None) is module:
+            delattr(parent, leaf)
