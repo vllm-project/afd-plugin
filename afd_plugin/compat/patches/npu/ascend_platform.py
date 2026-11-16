@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from afd_plugin.compat.npu.runtime_config import configure_async_cam_dbo
 from afd_plugin.config import parse_optional_afd_config
 
 if TYPE_CHECKING:
@@ -120,6 +121,10 @@ def _restore_afd_dbo_config(
     parallel_config.enable_dbo = saved.enable_dbo
     parallel_config.ubatch_size = saved.ubatch_size
     parallel_config.all2all_backend = saved.all2all_backend
+    if saved.ubatch_size > 1 and not saved.enable_dbo:
+        # --ubatch-size alone requests DBO on async Attention. Normalize
+        # before VllmConfig is consumed by the scheduler or serialized.
+        configure_async_cam_dbo(vllm_config)
 
 
 def _has_valid_afd_config(vllm_config: VllmConfig) -> bool:

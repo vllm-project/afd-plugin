@@ -113,8 +113,9 @@ def test_peer_receives_once_before_sending_and_owner_consumes_its_result(monkeyp
     assert not outstanding and all(context.recv_hook is None for context in contexts)
 
 
-def test_without_dbo_receives_directly_without_inactive_hooks(monkeypatch):
-    monkeypatch.setattr(async_cam_dbo, "dbo_enabled", lambda: False)
+@pytest.mark.parametrize("dbo,independent", [(False, False), (True, True)])
+def test_owner_receives_directly_without_peer_hook(monkeypatch, dbo, independent):
+    monkeypatch.setattr(async_cam_dbo, "dbo_enabled", lambda: dbo)
     monkeypatch.setattr(
         async_cam_dbo, "dbo_maybe_run_recv_hook", lambda: pytest.fail("inactive hook")
     )
@@ -132,7 +133,9 @@ def test_without_dbo_receives_directly_without_inactive_hooks(monkeypatch):
         send_attn_output=lambda *args, **kwargs: calls.append("send"),
         recv_ffn_output=recv,
     )
-    receive = async_cam_dbo.send_async_cam_remote_call(connector, value, _context(0))
+    receive = async_cam_dbo.send_async_cam_remote_call(
+        connector, value, _context(0), independent_windows=independent
+    )
     assert calls == ["send"]
     assert receive() is value and receive() is value
     assert calls == ["send", "recv"]

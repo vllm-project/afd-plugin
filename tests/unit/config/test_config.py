@@ -132,7 +132,7 @@ def test_parse_async_dp_config_from_async_alias():
 
 
 def test_async_dp_requires_async_connector():
-    with pytest.raises(ValueError, match="requires connector='CAMAsyncAFDConnector'"):
+    with pytest.raises(ValueError, match="AFD async mode requires"):
         parse_afd_config(
             {
                 "afd": {
@@ -242,3 +242,14 @@ def test_compute_hash_changes_for_graph_affecting_fields():
     ffn = AFDConfig(role="ffn")
 
     assert attention.compute_hash() != ffn.compute_hash()
+
+
+@pytest.mark.parametrize(
+    "connector", ["CAMAsyncAFDConnector", "CAMAsyncMegamoeAFDConnector"]
+)
+def test_async_connectors_enable_independent_dp(connector):
+    source = {"afd": {"connector": connector, "role": "attention", "async": True}}
+    assert parse_afd_config(source).async_dp
+    assert is_afd_async_dp(source)
+    source["afd"]["async"] = False
+    assert not is_afd_async_dp(source)

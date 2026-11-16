@@ -48,13 +48,11 @@ THE SOFTWARE.
 
 
 @pytest.mark.parametrize("operator", CAM_OPERATORS)
-def test_cam_operator_selection_rejects_unqualified_soc(operator: str):
+def test_cam_operator_selection_accepts_a5(operator: str):
     result = _run_select_ops("--soc", "ascend950", "--shmem", "1", "--ops", operator)
 
-    assert result.returncode != 0
-    assert operator in result.stderr
-    assert "not in SOC support list" in result.stderr
-    assert not result.stdout
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == [operator]
 
 
 def test_cam_selection_preserves_registry_order_with_legacy_operators():

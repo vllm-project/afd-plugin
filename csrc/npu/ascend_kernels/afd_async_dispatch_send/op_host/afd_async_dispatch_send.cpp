@@ -69,6 +69,10 @@ static void SetHcommCfg(AfdAsyncDispatchSendTilingData *tiling, const std::strin
     std::string algConfigAllToAllStr = "AlltoAll=level0:fullmesh;level1:pairwise";
 
     AscendC::Mc2CcTilingConfig mc2CcTilingConfig(groupName, opType1, algConfigAllToAllStr);
+#ifdef AFD_TILING_HAS_COMM_ENGINE
+    // Ascend950 MTE uses the AIV HCCL accelerator.
+    mc2CcTilingConfig.SetCommEngine(3);
+#endif
     mc2CcTilingConfig.GetTiling(tiling->mc2InitTiling);
     mc2CcTilingConfig.GetTiling(tiling->mc2CcTiling1);
 }
@@ -196,6 +200,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     uint32_t blockDim = 1U;
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
     uint64_t aivNum = ascendcPlatform.GetCoreNumAiv();
+    // The shared control-window layout reserves MAX_AIV_NUM rows on both SOCs.
+    if (aivNum > MAX_AIV_NUM) {
+        aivNum = MAX_AIV_NUM;
+    }
     uint64_t ubSize = 0UL;
     ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
     blockDim = ascendcPlatform.CalcTschBlockDim(aivNum, 0, aivNum);
@@ -278,6 +286,7 @@ public:
         this->Attr("hccl_group_name").String();
 
         this->AICore().AddConfig("ascend910_93");
+        this->AICore().AddConfig("ascend950");
         this->MC2().HcclGroup({"hccl_group_name"});
 
         // support graph

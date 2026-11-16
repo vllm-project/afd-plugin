@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
+    MEGAMOE_CONNECTOR,
     is_afd_async_dp,
     parse_afd_config,
 )
@@ -26,7 +27,7 @@ def configure_async_cam_dbo(vllm_config: VllmConfig) -> None:
     afd_config = parse_afd_config(vllm_config)
     parallel = vllm_config.parallel_config
     if (
-        afd_config.connector != AFD_ASYNC_CONNECTOR
+        afd_config.connector not in (AFD_ASYNC_CONNECTOR, MEGAMOE_CONNECTOR)
         or not afd_config.is_attention_server
     ):
         return

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Single-window CAM handoff through the native DBO receive hook."""
+"""Receive ownership for shared and per-stage CAM windows."""
 
 from collections.abc import Callable
 
@@ -18,15 +18,17 @@ def send_async_cam_remote_call(
     connector: AFDConnectorBase,
     hidden_states: torch.Tensor,
     context: AFDTransferContext,
+    *,
+    independent_windows: bool = False,
     **send_kwargs: torch.Tensor | None,
 ) -> Callable[[], torch.Tensor]:
-    """Send once and let the peer submit raw receive before its next send.
+    """Send once. Only shared windows require the peer to submit receive before send.
 
     The returned closure belongs to this call. Layout restoration, TP
     collectives and shared/HC/scaling remain with the resumed owner.
     """
-    overlapping = dbo_enabled()
-    if overlapping:
+    use_peer_hook = dbo_enabled() and not independent_windows
+    if use_peer_hook:
         dbo_maybe_run_recv_hook()
     connector.send_attn_output(hidden_states, context, **send_kwargs)
     owner_stage = context.metadata.stage_idx
@@ -44,6 +46,6 @@ def send_async_cam_remote_call(
             raise RuntimeError("Async CAM receive failed; restart the A/F worker group")
         return output
 
-    if overlapping:
+    if use_peer_hook:
         dbo_register_recv_hook(receive)
     return receive

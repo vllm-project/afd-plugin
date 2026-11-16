@@ -45,6 +45,24 @@ class CAMDispatchPayload:
     layout: CAMDispatchLayout
 
 
+def plain_tp_layout(
+    parent_tokens: int, tp_rank: int, tp_size: int
+) -> CAMDispatchLayout:
+    local_tokens = (parent_tokens + tp_size - 1) // tp_size
+    padded_tokens = local_tokens * tp_size
+    local_start = tp_rank * local_tokens
+    local_token_slice = slice(local_start, local_start + local_tokens)
+    return CAMDispatchLayout(
+        parent_tokens=parent_tokens,
+        padded_tokens=padded_tokens,
+        local_token_slice=local_token_slice,
+        requires_tp_all_gather=True,
+        use_sequence_parallel=False,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+    )
+
+
 def prepare_cam_dispatch_payload(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -52,6 +70,7 @@ def prepare_cam_dispatch_payload(
     router_logits: torch.Tensor | None,
     *,
     use_sequence_parallel: bool,
+    distinct_padding_ids: bool = False,
 ) -> CAMDispatchPayload:
     """Convert the model token layout to one rank-local CAM payload.
 
@@ -101,24 +120,20 @@ def prepare_cam_dispatch_payload(
             layout=layout,
         )
 
-    local_tokens = (parent_tokens + tp_size - 1) // tp_size
-    padded_tokens = local_tokens * tp_size
-    local_start = tp_rank * local_tokens
-    local_token_slice = slice(local_start, local_start + local_tokens)
-    layout = CAMDispatchLayout(
-        parent_tokens=parent_tokens,
-        padded_tokens=padded_tokens,
-        local_token_slice=local_token_slice,
-        requires_tp_all_gather=True,
-        use_sequence_parallel=False,
-        tp_rank=tp_rank,
-        tp_size=tp_size,
-    )
+    layout = plain_tp_layout(parent_tokens, tp_rank, tp_size)
+    padded_tokens = layout.padded_tokens
+    local_token_slice = layout.local_token_slice
     _log_cam_layout("dispatch", layout)
+    padded_ids = _pad_first_dim(topk_ids, padded_tokens)
+    if distinct_padding_ids and padded_tokens > parent_tokens:
+        # UMDK allocates at most one route per token in each expert slot.
+        padded_ids[parent_tokens:] = torch.arange(
+            topk_ids.shape[1], device=topk_ids.device, dtype=topk_ids.dtype
+        )
     return CAMDispatchPayload(
         hidden_states=_pad_first_dim(hidden_states, padded_tokens)[local_token_slice],
         topk_weights=_pad_first_dim(topk_weights, padded_tokens)[local_token_slice],
-        topk_ids=_pad_first_dim(topk_ids, padded_tokens)[local_token_slice],
+        topk_ids=padded_ids[local_token_slice],
         router_logits=(
             None
             if router_logits is None

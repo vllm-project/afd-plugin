@@ -38,7 +38,7 @@ _ASCEND_CONFIG_ALIAS_MODULES = (
 
 
 # Upstream: vllm_ascend/ascend_config.py at
-# bd42eea01d8312c4df469fabaed45f77a12df4d3.
+# f9c8e0bdb263d7a8c0270536f1ea00fa7373a84e.
 # Patch reason: strict AscendConfig construction rejects AFD's shared settings.
 # Patch functionality: exclude the AFD namespace from constructor kwargs,
 # preserving the source mapping, config identity and native singleton/cache.
@@ -248,7 +248,7 @@ def apply_afd_ascend_config_patch() -> None:
 
 
 # Upstream: vllm_ascend/patch/platform/patch_engine_core.py at
-# bd42eea01d8312c4df469fabaed45f77a12df4d3.
+# f9c8e0bdb263d7a8c0270536f1ea00fa7373a84e.
 # Patch reason: DP EngineCore initializes AscendConfig before vLLM loads
 # general plugins in the spawned process, so AFD's config namespace fails
 # strict validation before register_afd can install the namespace factory.
