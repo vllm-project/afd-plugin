@@ -23,11 +23,10 @@ if TYPE_CHECKING:
 
     from vllm.config import VllmConfig
 
-# afdEP-comm transport and the DeepGEMM grouped GEMMs the connector runs; both
-# are imported lazily by the connector, so a missing package would otherwise
-# fail only after 27 GiB of experts were read.
+# afdEP-comm transport the connector runs; it and vLLM's bundled DeepGEMM are
+# imported lazily by the connector, so a missing package would otherwise fail
+# only after 27 GiB of experts were read.
 AFDEP_TRANSPORT_MODULE = "afdep.deepep"
-DEEPGEMM_MODULE = "deep_gemm"
 FUSED_EXPERTS_BACKEND = "fused_experts"
 # Set by torchrun: rendezvous in its workers join the agent's TCP store.
 TORCHELASTIC_AGENT_STORE_ENV = "TORCHELASTIC_USE_AGENT_STORE"
@@ -54,8 +53,9 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
         Requires the ``torchrun`` environment to still match the settings and
         no pre-initialized ``torch.distributed`` or vLLM model-parallel state,
         so this process never adopts groups it does not own. Imports afdEP's
-        DeepEP transport and, for the DeepGEMM expert backend, DeepGEMM, so a
-        missing package fails before any weight is read. Maps ``LOCAL_RANK``
+        DeepEP transport and, for the DeepGEMM expert backend, the DeepGEMM
+        bundled with vLLM through the connector's own loader, so a missing
+        package fails before any weight is read. Maps ``LOCAL_RANK``
         to the visible GPU the way vLLM's GPU Worker does: first registers the
         ``--device-ids`` assignment that ``config`` resolved, then maps through
         it (and ``CUDA_VISIBLE_DEVICES``). Requires SM90 or newer.
@@ -71,7 +71,9 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
         importlib.import_module(AFDEP_TRANSPORT_MODULE)
         expert_backend = settings.connector_extra_config.get("expert_backend")
         if expert_backend != FUSED_EXPERTS_BACKEND:
-            importlib.import_module(DEEPGEMM_MODULE)
+            from afd_plugin.connectors.gpu.deepep_m2n.deepgemm import load_deepgemm
+
+            load_deepgemm()
         # Importable only after the afdEP preflight above.
         from afd_plugin.connectors.gpu.deepep_m2n.connector import MIN_SM_MAJOR
 
