@@ -51,6 +51,31 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/afd_mega_moe_pull_native.cpp")
     endif()
 endif()
 
+# ### PATCH START: pinned MegaMoE kernel dependencies from UMDK 7d25107
+set(MEGAMOE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../megamoe_utils")
+if(EXISTS "${MEGAMOE_ROOT}")
+    list(APPEND KERNEL_COMPILE_OPTS -DBUILD_OPEN_PROJECT)
+    foreach(inc
+        "${MEGAMOE_ROOT}"
+        "${MEGAMOE_ROOT}/mc2/common"
+        "${MEGAMOE_ROOT}/mc2/common/op_kernel"
+        "${MEGAMOE_ROOT}/opbase/include"
+        "${MEGAMOE_ROOT}/opbase/include/op_common"
+        "${MEGAMOE_ROOT}/ops-tensor/include"
+        "${MEGAMOE_ROOT}/ops-tensor/include/tensor_api/include"
+        "${MEGAMOE_ROOT}/ops-tensor/include/tensor_api")
+        list(APPEND KERNEL_COMPILE_OPTS "-I${inc}")
+    endforeach()
+    # Some SDK simple-kernel targets omit custom_compile_options.ini. The build
+    # driver forwards this exact list to those generated OPC commands as well.
+    set(MEGAMOE_OPC_OPTIONS ${KERNEL_COMPILE_OPTS})
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        list(APPEND MEGAMOE_OPC_OPTIONS -g -O0)
+    endif()
+    file(WRITE "${CMAKE_BINARY_DIR}/megamoe_kernel_options.txt" "${MEGAMOE_OPC_OPTIONS}")
+endif()
+# ### PATCH END: pinned MegaMoE kernel dependencies from UMDK 7d25107
+
 # set custom compile options (single call to avoid overwriting)
 if ("${CMAKE_BUILD_TYPE}x" STREQUAL "Debugx")
     npu_op_kernel_options("" ALL OPTIONS -g -O0 ${KERNEL_COMPILE_OPTS})

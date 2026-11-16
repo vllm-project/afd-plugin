@@ -120,6 +120,26 @@ def ensure_cam_async_ops_available() -> None:
         ) from exc
 
 
+@lru_cache(maxsize=1)
+def ensure_megamoe_ops_available() -> None:
+    """Load the independent MegaMoE DSO against AFD's private OPP package."""
+    _ensure_afd_custom_opp_env()
+    if not get_afd_cust_opapi_path().is_file():
+        raise RuntimeError(
+            "AFD MegaMoE custom operators are missing. Build with "
+            "AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=950 in a torch-npu/CANN environment."
+        )
+    try:
+        import torch_npu  # noqa: F401
+
+        import afd_plugin._C_megamoe  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "AFD MegaMoE bindings are unavailable. Rebuild with "
+            "AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=950."
+        ) from exc
+
+
 __all__ = [
     "AFD_ASCEND_OPS_NAMESPACE",
     "AFD_ASCEND_VENDOR_NAME",
@@ -131,6 +151,7 @@ __all__ = [
     "CAM_OP_NAMESPACE",
     "ensure_afd_ascend_ops_loaded",
     "ensure_cam_async_ops_available",
+    "ensure_megamoe_ops_available",
     "ensure_cam_p2p_ops_available",
     "get_afd_cann_vendor_path",
     "get_afd_cust_opapi_path",

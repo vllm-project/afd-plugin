@@ -21,12 +21,18 @@ def queue(published=None):
     store.delete_key = keys.__delitem__
     return work.ExpertWorkQueue(
         store, len(published) if published is not None else 1, 1,
-        lambda n: (n - 1) % 32 + 1,
         read_published=Mock(return_value=published) if published is not None else None,
     )
 
 
 class TestMegaMoEAdmission(unittest.TestCase):
+    def test_sequence_exhaustion_cannot_publish_wrapped_generation(self):
+        writer = queue()
+        writer.last[0] = work.SPLIT_SEQUENCE_LIMIT - 1
+        with self.assertRaisesRegex(RuntimeError, "sequence exhausted"):
+            writer.publish(0, 42, 1)
+        self.assertFalse(writer.store.check(["work/0/0"]))
+
     def test_single_window_claims_without_device_snapshot(self):
         reader = queue()
         reader.store.set("work/0/0", "42 1")
@@ -45,15 +51,15 @@ class TestMegaMoEAdmission(unittest.TestCase):
         lane0.read_published.return_value[2][0] = 27
         self.assertEqual(lane0.poll(0), (2, 0, 27))
 
-    def test_scan_past_unready_tp_group_and_wrap(self):
-        reader = queue([[1, 32], [1, 1]])
+    def test_scan_past_unready_tp_group_without_wrapping(self):
+        reader = queue([[33, 32], [1, 1]])
         reader.last = [32, 0]
-        reader.store.set("work/0/0", "0 1")
+        reader.store.set("work/0/0", "0 33")
         reader.store.set("work/1/0", "7 1")
         self.assertEqual(reader.poll(0), (1, 7, 1))
         reader.read_published.assert_called_once_with()
-        reader.read_published.return_value[0][1] = 1
-        self.assertEqual(reader.poll(0), (0, 0, 1))
+        reader.read_published.return_value[0][1] = 33
+        self.assertEqual(reader.poll(0), (0, 0, 33))
         reader.read_published.reset_mock()
         self.assertIsNone(reader.poll(0))
         reader.read_published.assert_not_called()

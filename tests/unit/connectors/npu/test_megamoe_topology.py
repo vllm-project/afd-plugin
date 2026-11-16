@@ -161,7 +161,6 @@ def test_tp_members_share_generation_and_publish_once(connector_class):
         rank = connector()
         rank.role_rank, rank.attn_tp = i, 2
         rank.ops = SimpleNamespace(
-            split_sequence=lambda n: (n - 1) % 32 + 1,
             megamoe_dispatch_send=dispatch,
             megamoe_combine_recv=combine,
         )
@@ -185,10 +184,10 @@ def test_tp_members_share_generation_and_publish_once(connector_class):
                 rank.send_attn_output(tensor, ctx, topk_ids=tensor, topk_weights=tensor)
         members = rank.dp_members(i // 2)
         assert rank.recv_ffn_output(tensor, 1) == (1, members, 13)
-        assert rank.recv_ffn_output(tensor, 0) == (0, members, 1)
+        assert rank.recv_ffn_output(tensor, 0) == (0, members, 33)
         with pytest.raises(RuntimeError, match="matching ubatch"):
             rank.recv_ffn_output(tensor, 1)
-    assert notifications == [[(dp, 7, seq) for dp in range(3)] for seq in (1, 13)]
+    assert notifications == [[(dp, 7, seq) for dp in range(3)] for seq in (33, 13)]
 
 
 def test_ffn_submits_free_stage_without_waiting_for_busy_peer(connector_class):

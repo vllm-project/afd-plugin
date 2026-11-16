@@ -101,3 +101,34 @@ target_link_options(afd_plugin_ascend_C PRIVATE
   "-Wl,-rpath,$ORIGIN:$ORIGIN/_cann_ops_custom/vendors/afd-plugin/op_api/lib")
 
 install(TARGETS afd_plugin_ascend_C LIBRARY DESTINATION afd_plugin)
+
+# MegaMoE conversion helpers contain non-inline definitions. Keep their single
+# translation unit in a separate DSO instead of mixing it with _C_ascend.
+if(AFD_SOC_VERSION STREQUAL "950" OR AFD_SOC_VERSION MATCHES "^[Aa]scend950")
+  pybind11_add_module(afd_plugin_megamoe_C "${CMAKE_CURRENT_LIST_DIR}/megamoe/module.cpp")
+  set_target_properties(afd_plugin_megamoe_C PROPERTIES OUTPUT_NAME "_C_megamoe")
+  target_compile_definitions(afd_plugin_megamoe_C PRIVATE TORCH_EXTENSION_NAME=_C_megamoe)
+  separate_arguments(MEGAMOE_TORCH_FLAGS NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
+  target_compile_options(afd_plugin_megamoe_C PRIVATE ${MEGAMOE_TORCH_FLAGS})
+
+  # CANN must precede torch-npu's bundled ACL headers for FP8/FP4 enum values.
+  target_include_directories(afd_plugin_megamoe_C BEFORE PRIVATE
+    "${ASCEND_HOME_PATH}/include"
+    "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include"
+    "${ASCEND_HOME_PATH}/include/aclnnop"
+    "${TORCH_NPU_PATH}/include/third_party/hccl/inc"
+    "${TORCH_NPU_PATH}/include/third_party/op-plugin"
+    "${TORCH_NPU_PATH}/include"
+    "${TORCH_NPU_PATH}/.."
+    ${TORCH_INCLUDE_DIRS}
+    "${AFD_NPU_CSRC_DIR}/ascend_kernels/megamoe_utils/mc2/common/op_kernel")
+  target_link_directories(afd_plugin_megamoe_C PRIVATE
+    "${TORCH_INSTALL_PREFIX}/lib"
+    "${TORCH_NPU_PATH}/lib"
+    "${ASCEND_HOME_PATH}/lib64")
+  target_link_libraries(afd_plugin_megamoe_C PRIVATE
+    ${TORCH_LIBRARIES} torch_python torch_npu ascendcl dl)
+  set_target_properties(afd_plugin_megamoe_C PROPERTIES
+    INSTALL_RPATH "$ORIGIN;$ORIGIN/../torch/lib;$ORIGIN/../torch_npu/lib;${ASCEND_HOME_PATH}/lib64")
+  install(TARGETS afd_plugin_megamoe_C LIBRARY DESTINATION afd_plugin)
+endif()

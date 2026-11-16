@@ -93,10 +93,11 @@ def test_native_sources_survive_source_distribution_manifest(monkeypatch):
     assert " ".join(CAM_MIT_NOTICE.split()) in " ".join(license_text.split())
 
 
-def test_selected_cam_sources_do_not_overwrite_other_operators_when_staged():
+@pytest.mark.parametrize("soc", ["ascend910_93", "ascend950"])
+def test_selected_cam_sources_do_not_overwrite_other_operators_when_staged(soc):
     """The build driver flattens each source category into one directory."""
     root = Path(__file__).resolve().parents[3] / "csrc/npu/ascend_kernels"
-    result = _run_select_ops("--soc", "ascend910_93", "--shmem", "0")
+    result = _run_select_ops("--soc", soc, "--shmem", "0")
     assert result.returncode == 0, result.stderr
 
     for part in ("op_api", "op_host", "op_kernel"):

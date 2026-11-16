@@ -15,7 +15,12 @@ description = "vLLM external plugin for Attention-FFN Disaggregation (AFD)"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = [
+    "LICENSE",
+    "csrc/npu/ascend_kernels/megamoe_utils/LICENSE",
+    "csrc/npu/ascend_kernels/megamoe_utils/opbase/LICENSE",
+    "csrc/npu/ascend_kernels/megamoe_utils/ops-tensor/LICENSE",
+]
 authors = [{ name = "AFD plugin contributors" }]
 keywords = ["vllm", "afd", "attention", "ffn", "disaggregation", "inference"]
 classifiers = [
@@ -71,6 +76,7 @@ namespaces = false
 
 [tool.setuptools.package-data]
 afd_plugin = ["py.typed", "_cann_ops_custom/**/*"]
+"afd_plugin.compat.npu.megamoe" = ["LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

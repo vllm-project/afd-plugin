@@ -99,6 +99,22 @@ if(EXISTS "${CANN_ROOT}/include/aclnn")
     list(APPEND CODE_GEN_COMPILE_OPTS -I${CANN_ROOT}/include/aclnn)
 endif()
 
+# ### PATCH START: pinned MegaMoE host dependencies from UMDK 7d25107
+set(MEGAMOE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../megamoe_utils")
+if(EXISTS "${MEGAMOE_ROOT}")
+    set(MEGAMOE_INCLUDES
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${MEGAMOE_ROOT}" "${MEGAMOE_ROOT}/opbase/include"
+        "${MEGAMOE_ROOT}/opbase/include/op_common/op_host/util")
+    include_directories(${MEGAMOE_INCLUDES})
+    foreach(inc IN LISTS MEGAMOE_INCLUDES)
+        list(APPEND CODE_GEN_COMPILE_OPTS "-I${inc}")
+    endforeach()
+    add_compile_definitions(BUILD_OPEN_PROJECT)
+    list(APPEND CODE_GEN_COMPILE_OPTS -DBUILD_OPEN_PROJECT -std=c++17)
+endif()
+# ### PATCH END: pinned MegaMoE host dependencies from UMDK 7d25107
+
 # Collect all host-side source files recursively.
 file(GLOB_RECURSE ops_srcs "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
@@ -176,6 +192,11 @@ target_compile_options(cust_optiling PRIVATE
 # =====================================================
 # Step 5: Register all host-side libraries into the package
 # =====================================================
+if(EXISTS "${MEGAMOE_ROOT}")
+    foreach(target cust_opapi cust_op_proto cust_optiling)
+        target_compile_features(${target} PRIVATE cxx_std_17)
+    endforeach()
+endif()
 npu_op_package_add(${package_name}
     LIBRARY
         cust_optiling

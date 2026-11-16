@@ -19,7 +19,10 @@
       "afd_async_dispatch_send",
       "afd_async_dispatch_recv",
       "afd_async_combine_send",
-      "afd_async_combine_recv"
+      "afd_async_combine_recv",
+      "cam_megamoe_dispatch_send",
+      "cam_megamoe_fused_moe",
+      "cam_megamoe_combine_recv"
     ]
   },
   "operator_meta": {
@@ -51,6 +54,15 @@
       "requires_shmem": false
     },
     "afd_mega_moe_comm": {
+      "requires_shmem": false
+    },
+    "cam_megamoe_dispatch_send": {
+      "requires_shmem": false
+    },
+    "cam_megamoe_fused_moe": {
+      "requires_shmem": false
+    },
+    "cam_megamoe_combine_recv": {
       "requires_shmem": false
     }
   }

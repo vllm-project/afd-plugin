@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Bounded work descriptors and ring-sequence ownership."""
+"""Bounded work descriptors and non-wrapping sequence ownership."""
 
 import importlib.util
 from pathlib import Path
@@ -22,7 +22,7 @@ def test_independent_dp_and_slow_readers():
     store = torch.distributed.HashStore()
 
     def queue():
-        return work.ExpertWorkQueue(store, 2, 2, lambda n: (n - 1) % 32 + 1)
+        return work.ExpertWorkQueue(store, 2, 2)
 
     writers = [queue(), queue()]
     readers = [queue(), queue()]
