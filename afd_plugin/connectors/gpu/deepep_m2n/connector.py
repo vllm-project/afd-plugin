@@ -100,6 +100,8 @@ from afd_plugin.connectors.gpu.deepep_m2n.experts import (
     ExpertBackend,
 )
 from afd_plugin.connectors.gpu.deepep_m2n.layout import (
+    ATTENTION_ROLE,
+    FFN_ROLE,
     DeepEPM2NLayout,
     RankPlacement,
     TransportLayout,
@@ -1149,6 +1151,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         )
         try:
             self.lanes = self._new_lanes()
+            self._check_lane_roles()
             # One lane runs on the caller's stream: no fork/join cost.
             if self.num_lanes > 1:
                 self.lane_streams = [
@@ -1193,6 +1196,21 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             gpu_timeout_s=self.config.gpu_timeout_s,
         )
         return Lanes(group=self.transport_group, config=config, lanes=self.num_lanes)
+
+    def _check_lane_roles(self) -> None:
+        """Check afdEP-comm puts this rank where the plugin's layout does.
+
+        Both compute the FFN placement; if they disagreed, an FFN rank would
+        receive rows for experts it did not load and return wrong results
+        without any error.
+        """
+        lane = self._lanes(0)
+        role = FFN_ROLE if self.is_ffn else ATTENTION_ROLE
+        if lane.role != role or (self.is_ffn and lane.role_rank != self.role_rank):
+            raise RuntimeError(
+                f"afdEP-comm placed this rank as {lane.role} {lane.role_rank}, but "
+                f"the DeepEP M2N layout has it as {role} {self.role_rank}"
+            )
 
     def close(self) -> None:
         """Cancel the control receive and destroy DeepEP buffers; safe after

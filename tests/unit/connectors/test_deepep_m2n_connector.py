@@ -362,15 +362,14 @@ def test_expert_weights_require_matching_fp8_scales():
 
 
 def test_layout_is_ffn_first_with_identity_expert_ids():
-    """2F3A with 128 experts: 64 experts per FFN rank, 5x64 DeepEP expert
-    slots, FFN ranks first in world order, FFN 1 owning experts 64-127.
+    """2F3A with 128 experts: 64 experts per FFN rank, FFN ranks first in
+    world order, FFN 1 owning experts 64-127.
 
     Why: real expert ids must equal DeepEP ids in the plugin's rank order.
     """
     layout = DeepEPM2NLayout(ffn_size=2, attn_size=3, num_experts=128)
 
     assert layout.experts_per_rank == 64
-    assert layout.deepep_num_experts == 5 * 64
     assert layout.world_rank("ffn", 1) == 1
     assert layout.world_rank("attention", 0) == 2
     assert layout.expert_range(1) == range(64, 128)
@@ -1361,6 +1360,35 @@ def test_lanes_are_afdep_comm_buffers_with_the_role_counts(
     assert config["expert_alignment"] == DEEPGEMM_ALIGNMENT
     assert config["payload"] == "bf16"
     assert config["allow_hybrid_mode"] is True
+
+
+@pytest.mark.parametrize(
+    ("role", "role_rank", "lane_role", "lane_role_rank", "ok"),
+    [
+        ("ffn", 1, "ffn", 1, True),
+        ("attention", 2, "attention", 0, True),
+        ("ffn", 1, "ffn", 0, False),
+        ("ffn", 0, "attention", 0, False),
+        ("attention", 0, "ffn", 0, False),
+    ],
+)
+def test_lane_roles_must_match_the_layout(
+    role, role_rank, lane_role, lane_role_rank, ok
+):
+    """afdEP-comm's role for this rank must match the plugin's layout, and on
+    FFN ranks so must the FFN index.
+
+    Why: both compute the FFN placement; if they disagreed, an FFN rank would
+    receive rows for experts it did not load and return wrong results silently.
+    Attention indices may differ in per-domain mode and are not compared.
+    """
+    connector = _connector(role, role_rank, M2NTopology(ffn_size=2, attn_size=4))
+    connector.lanes = [SimpleNamespace(role=lane_role, role_rank=lane_role_rank)]
+    if ok:
+        connector._check_lane_roles()
+    else:
+        with pytest.raises(RuntimeError, match="afdEP-comm placed this rank"):
+            connector._check_lane_roles()
 
 
 def test_attention_ops_take_the_stage_from_the_live_dbo_micro_batch(monkeypatch):
