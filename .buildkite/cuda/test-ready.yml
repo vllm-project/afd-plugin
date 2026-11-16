@@ -1,6 +1,6 @@
 # L2 ready — Simple Test + E2E. Uploaded by cuda/bootstrap-upload-steps.yml.
 # Each step reports a GitHub check run (Checks tab) on the built commit via
-# ``notify: github_check``; this needs the Buildkite GitHub App integration.
+# ``notify: github_check``. this needs the Buildkite GitHub App integration.
 steps:
   - group: ":card_index_dividers: Simple Test"
     depends_on: upload-ready-pipeline
