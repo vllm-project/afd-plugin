@@ -16,17 +16,67 @@ Like the other model-layer tests, this needs vLLM and is skipped on a CPU-only h
 from __future__ import annotations
 
 import sys
+from importlib.machinery import ModuleSpec
 from types import ModuleType, SimpleNamespace
 
 import pytest
+
+from tests.unit.fakes.stub_modules import (
+    drop_new_modules as _drop_new_modules,
+)
+from tests.unit.fakes.stub_modules import (
+    drop_stub_bound_modules as _drop_stub_bound_modules,
+)
 
 torch = pytest.importorskip("torch")
 # The adapter module needs this specific vLLM module, and a CPU-only host can have a
 # partial vLLM install where `import vllm` succeeds but this one does not.
 pytest.importorskip("vllm.forward_context")
+# The adapter chain imports the shared-expert module, which loads vLLM-Ascend at module
+# scope; without it the collection fails instead of skipping.
+pytest.importorskip("vllm_ascend")
+
+# afd_plugin builds its model registry from ``find_spec("torch_npu")`` when the package
+# is first imported, so it is imported before the stand-in exists; otherwise a process
+# without the extension would register the NPU adapter for DSV4 and keep that path after
+# the stand-in is gone.
+import afd_plugin  # noqa: E402,F401
+
+# The adapter's import chain pulls the NPU extension in at module scope, but these
+# tests only drive the Python wire protocol with fakes. A temporary stand-in keeps
+# the module collectable on a CPU-only host; it is removed again so other modules
+# still see the extension as missing and keep skipping.
+_modules_before_stub = set(sys.modules)
+
+try:
+    import torch_npu  # noqa: F401
+
+    _stubbed_torch_npu = False
+except ModuleNotFoundError:
+    _torch_npu_stub = ModuleType("torch_npu")
+    # ``find_spec`` is called on this name at import time, and a module without a
+    # spec makes it raise instead of reporting the extension as missing.
+    _torch_npu_stub.__spec__ = ModuleSpec("torch_npu", None)
+    sys.modules["torch_npu"] = _torch_npu_stub
+    _stubbed_torch_npu = True
 
 # The NPU adapter; the CUDA module of the same name has no sync gate shell.
-from afd_plugin.model_executor.models.npu import deepseek_v4 as adapter  # noqa: E402
+try:
+    from afd_plugin.model_executor.models.npu import (
+        deepseek_v4 as adapter,  # noqa: E402
+    )
+finally:
+    if _stubbed_torch_npu:
+        # Removing the cache entry alone leaves every module that imported the
+        # extension holding the stand-in (``deepseek_v4_shared_experts`` does
+        # ``import torch_npu`` at module scope), so those modules are dropped
+        # together with the parent attributes that point at them.
+        _drop_stub_bound_modules(_modules_before_stub, {id(_torch_npu_stub)})
+        # The adapter does not hold the stand-in itself: it imports the shared
+        # experts class, whose methods keep the defining module's globals alive.
+        # Name the subtree explicitly so the adapter is reloaded for real later.
+        _drop_new_modules(_modules_before_stub, "afd_plugin.model_executor.models.npu")
+        sys.modules.pop("torch_npu", None)
 
 TOP_K = 2
 HIDDEN = 4

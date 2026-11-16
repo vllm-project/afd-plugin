@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import os
-import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -15,46 +14,22 @@ from tests.conftest import (
     download_dataset,
     download_model,
     preserve_environment_variable,
-    run_runner,
+    run_case_entry,
 )
-from tests.e2e.runner import (
+from tests.e2e.environment import model_case_command
+from tests.e2e.models.deepseek_v2_lite.cases import (
     DEEPEP_M2N_SCENARIOS,
-    DEFAULT_GSM8K_SAMPLE_LIMIT,
-    GSM8K_LIMIT_ENV,
-    GSM8K_THRESHOLD_ENV,
-    V2_DBO_COMPARISON_SCENARIOS,
-    V2_DBO_SAMPLE_LIMIT,
-    V2_SCENARIOS,
     V2_SINGLE_RANK_SCENARIOS,
+    stable_ids,
 )
 
 GSM8K_DATASET_ID = "openai/gsm8k"
 GSM8K_DATASET_CONFIG = "main"
 DEEPSEEK_V2_LITE_REPO_ID = "deepseek-ai/DeepSeek-V2-Lite"
-DEEPSEEK_V2_LITE_MAX_MODEL_LEN = 4096
-SMOKE_MIN_ACCURACY = 0.25
-SMOKE_MAX_SAMPLES = 24
-DEFAULT_DEVICE_IDS = ("0", "1", "2", "3")
-ATTENTION_DEVICE_COUNT = 2
-AFD_FFN_DEVICE_COUNT = 1
-AFD_TWO_FFN_DEVICE_COUNT = 2
-BASELINE_DEVICE_COUNT = 4
-TWO_FFN_SCENARIO_SUFFIX = "-2a2f"
 # CI selects exact node IDs (E2E-INV-007). GPU uses the V2 cases for the
 # shared 2A2F coverage; NPU retains its existing scenario IDs and now runs
 # every case on native Ascend MRV2 through the shared harness.
-SCENARIOS = (
-    "baseline-graph",
-    *(
-        ("afd-eager-2a2f", "afd-graph-2a2f", "afd-graph-dbo-2a2f")
-        if os.environ.get("AFD_E2E_BACKEND") == "npu"
-        else V2_SCENARIOS
-    ),
-    # GPU weekly CI selects Graph + DBO; eager/graph remain local-only.
-    "afd-eager-2a1f",
-    "afd-graph-2a1f",
-    "afd-graph-dbo-2a1f",
-)
+SCENARIOS = stable_ids(os.environ.get("AFD_E2E_BACKEND", "gpu"))
 
 
 def _required_env(name: str) -> str:
@@ -89,65 +64,15 @@ def prepare_e2e_assets() -> None:
 
 
 def build_runner_command(scenario: str, gsm8k_output_path: Path) -> list[str]:
-    backend = _required_env("AFD_E2E_BACKEND")
-    if backend == "gpu":
-        model = _required_env("AFD_GPU_E2E_MODEL")
-        vllm_bin = os.environ.get("AFD_GPU_E2E_VLLM_BIN", "vllm")
-    elif backend == "npu":
-        model = _required_env("AFD_NPU_E2E_MODEL")
-        vllm_bin = os.environ.get("AFD_NPU_E2E_VLLM_BIN", "vllm")
-    else:
-        raise RuntimeError("AFD_E2E_BACKEND must be 'gpu' or 'npu'")
-
-    env_devices = os.environ.get("AFD_E2E_DEVICES")
-    if env_devices:
-        devices = [item.strip() for item in env_devices.split(",") if item.strip()]
-    elif scenario in V2_SINGLE_RANK_SCENARIOS:
-        devices = ["0", "1"]
-    else:
-        devices = list(DEFAULT_DEVICE_IDS)
-    if scenario == "baseline-graph":
-        attention_devices = devices[:BASELINE_DEVICE_COUNT]
-        ffn_devices = []
-    elif scenario in V2_SINGLE_RANK_SCENARIOS:
-        attention_devices = devices[:1]
-        ffn_devices = devices[1:2]
-    else:
-        attention_devices = devices[:ATTENTION_DEVICE_COUNT]
-        ffn_device_count = (
-            AFD_TWO_FFN_DEVICE_COUNT
-            if scenario.endswith(TWO_FFN_SCENARIO_SUFFIX) or scenario in V2_SCENARIOS
-            else AFD_FFN_DEVICE_COUNT
-        )
-        ffn_devices = devices[
-            ATTENTION_DEVICE_COUNT : ATTENTION_DEVICE_COUNT + ffn_device_count
-        ]
-
-    command = [
-        sys.executable,
-        "-m",
-        "tests.e2e.runner",
-        "--model",
-        model,
-        "--vllm-bin",
-        vllm_bin,
-        "--device-backend",
-        backend,
-        f"--common-vllm-arg=--max-model-len={DEEPSEEK_V2_LITE_MAX_MODEL_LEN}",
-        "--attention-devices",
-        ",".join(attention_devices),
-    ]
-    if scenario != "baseline-graph":
-        command.extend(["--ffn-devices", ",".join(ffn_devices)])
-    command.extend(
-        [
-            "--scenario",
-            scenario,
-            "--gsm8k-output-path",
-            str(gsm8k_output_path),
-        ],
+    return model_case_command(
+        "tests.e2e.models.deepseek_v2_lite.cases",
+        scenario,
+        gsm8k_output_path,
+        backend=_required_env("AFD_E2E_BACKEND"),
+        default_devices=("0", "1")
+        if scenario in V2_SINGLE_RANK_SCENARIOS
+        else ("0", "1", "2", "3"),
     )
-    return command
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -166,29 +91,11 @@ def _prepare_e2e_assets() -> Iterator[None]:
         yield
 
 
-def _runner_env(scenario: str) -> dict[str, str]:
-    env = os.environ.copy()
-    default_limit = (
-        V2_DBO_SAMPLE_LIMIT
-        if scenario in V2_DBO_COMPARISON_SCENARIOS
-        else DEFAULT_GSM8K_SAMPLE_LIMIT
-    )
-    sample_limit = env.get(GSM8K_LIMIT_ENV, str(default_limit))
-    if (
-        scenario != "afd-v2-graph-dbo-tp2"
-        and sample_limit != "all"
-        and int(sample_limit) <= SMOKE_MAX_SAMPLES
-    ):
-        # Model smoke gates require 2/7 or 6/24 correct; larger runs keep 0.27.
-        env.setdefault(GSM8K_THRESHOLD_ENV, str(SMOKE_MIN_ACCURACY))
-    return env
-
-
 @pytest.mark.e2e
 @pytest.mark.parametrize("scenario", SCENARIOS, ids=SCENARIOS)
 def test_deepseek_v2_lite(scenario: str, tmp_path: Path) -> None:
     command = build_runner_command(scenario, tmp_path / scenario)
-    run_runner(command, env=_runner_env(scenario))
+    run_case_entry(command, tmp_path / scenario)
 
 
 @pytest.mark.e2e
@@ -198,4 +105,4 @@ def test_deepseek_v2_lite(scenario: str, tmp_path: Path) -> None:
 @pytest.mark.parametrize("scenario", DEEPEP_M2N_SCENARIOS, ids=DEEPEP_M2N_SCENARIOS)
 def test_deepseek_v2_lite_deepep_m2n(scenario: str, tmp_path: Path) -> None:
     command = build_runner_command(scenario, tmp_path / scenario)
-    run_runner(command, env=_runner_env(scenario))
+    run_case_entry(command, tmp_path / scenario)

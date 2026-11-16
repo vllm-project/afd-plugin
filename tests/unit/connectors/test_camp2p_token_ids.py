@@ -25,12 +25,16 @@ import logging
 import sys
 import types
 from collections.abc import Iterator
+from importlib.machinery import ModuleSpec
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from tests.unit.fakes.afd_config import camp2p_config as _afd_config
+from tests.unit.fakes.stub_modules import (
+    drop_stub_bound_modules as _drop_stub_bound_modules,
+)
 from tests.unit.fakes.vllm_config import camp2p_config as _vllm_config
 
 torch = pytest.importorskip("torch")
@@ -67,42 +71,56 @@ def _vllm_stub() -> Iterator[None]:
         yield
         return
 
-    saved = {name: sys.modules.get(name) for name in missing}
+    builders: dict[str, dict[str, object]] = {
+        "vllm": {},
+        "vllm.forward_context": {
+            "DPMetadata": type("DPMetadata", (), {}),
+            "get_forward_context": lambda: None,
+        },
+        "vllm.logger": {
+            "init_logger": lambda *args, **kwargs: logging.getLogger("test")
+        },
+        "vllm.utils": {},
+        "vllm.utils.torch_utils": {
+            "direct_register_custom_op": lambda **kwargs: None,
+            "is_torch_equal_or_newer": lambda *args, **kwargs: True,
+        },
+        "vllm.distributed": {},
+        "vllm.distributed.parallel_state": {
+            "get_pcp_group": None,
+            "get_tensor_model_parallel_rank": None,
+        },
+    }
 
-    def make(name: str, **attributes: object) -> None:
+    # Only the modules that are genuinely absent are installed. Overwriting a module
+    # that another test already imported would outlive this context: the restore
+    # below only knows about the names it added.
+    _imported_before = set(sys.modules)
+    for name in missing:
         module = types.ModuleType(name)
         module.__path__ = []  # type: ignore[attr-defined]
-        for attribute, value in attributes.items():
+        # find_spec("vllm") runs at import time; a spec-less module makes it raise.
+        module.__spec__ = ModuleSpec(name, None)
+        for attribute, value in builders[name].items():
             setattr(module, attribute, value)
         sys.modules[name] = module
 
-    make("vllm")
-    make(
-        "vllm.forward_context",
-        DPMetadata=type("DPMetadata", (), {}),
-        get_forward_context=lambda: None,
-    )
-    make("vllm.logger", init_logger=lambda *args, **kwargs: logging.getLogger("test"))
-    make("vllm.utils")
-    make(
-        "vllm.utils.torch_utils",
-        direct_register_custom_op=lambda **kwargs: None,
-        is_torch_equal_or_newer=lambda *args, **kwargs: True,
-    )
-    make("vllm.distributed")
-    make(
-        "vllm.distributed.parallel_state",
-        get_pcp_group=None,
-        get_tensor_model_parallel_rank=None,
-    )
+    _stub_objects = {
+        id(value)
+        for name in missing
+        for attribute, value in vars(sys.modules[name]).items()
+        if not attribute.startswith("__") and value is not None
+    }
     try:
         yield
     finally:
         for name in missing:
             sys.modules.pop(name, None)
-        for name, module in saved.items():
-            if module is not None:
-                sys.modules[name] = module
+        # A module imported while the stub was installed keeps the doubles in its
+        # globals, so it must not stay cached. Only modules the stub block loaded, and
+        # only those that bind one of the stub objects, are dropped; evicting their
+        # packages would rebuild the connector factory and leave two registries.
+        _drop_stub_bound_modules(_imported_before, _stub_objects)
 
 
 with _vllm_stub():

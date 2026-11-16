@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -31,30 +31,39 @@ from vllm_ascend.models.deepseek_v4.dspark import _get_dspark_num_mtp_layers
 from vllm_ascend.utils import get_rotation_path
 
 from afd_plugin.config import parse_afd_config
+from afd_plugin.model_executor.models._weight_utils import (
+    ATTENTION_ROLE,
+    BOTH_ROLES,
+    FFN_ROLE,
+    filter_role_weights,
+)
 from afd_plugin.model_executor.models.npu.deepseek_v4 import (
     AFDDeepseekV4DecoderLayer,
-    _extract_async_cam_layered_weights,
+    _extract_quantized_expert_weights,
 )
 
 if TYPE_CHECKING:
-    from afd_plugin.model_executor.npu.async_cam_layered import LayeredFFNWeights
+    from afd_plugin.model_executor.ffn.npu.expert_weights import QuantizedExpertWeights
 
 
-def _iter_role_weights(
-    weights: Iterable[tuple[str, torch.Tensor]], *, role: str
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """Filter once before the native loader resolves its strict parameter names."""
-    for name, weight in weights:
-        parts = name.split(".")
-        routed = (
-            len(parts) > 4
-            and parts[0] == "mtp"
-            and parts[2] in ("ffn", "mlp")
-            and parts[3] in ("experts", "gate")
-        )
-        expert = routed and parts[3] == "experts"
-        if (role == "ffn" and routed) or (role == "attention" and not expert):
-            yield name, weight
+def _dspark_weight_roles(name: str) -> frozenset[str]:
+    """Classify one DSpark MTP checkpoint path by its AFD execution owner.
+
+    The draft stack has no ``layers.<idx>`` segment, so this cannot reuse
+    ``layer_weight_path``. Expert weights are FFN-only; the router (including
+    its Hash id table) belongs to every role that builds a router, matching the
+    native MoE ownership rule; everything else stays with Attention.
+    """
+    parts = name.split(".")
+    routed = (
+        len(parts) > 4
+        and parts[0] == "mtp"
+        and parts[2] in ("ffn", "mlp")
+        and parts[3] in ("experts", "gate")
+    )
+    if not routed:
+        return ATTENTION_ROLE
+    return FFN_ROLE if parts[3] == "experts" else BOTH_ROLES
 
 
 class AFDDeepseekV4DSparkModel(native.DeepseekV4DSparkModel):
@@ -241,7 +250,15 @@ class AFDDSparkDeepseekV4ForCausalLM(native.DSparkDeepseekV4ForCausalLM):
         # ### PATCH END: construct only this role's draft modules
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loaded = super().load_weights(_iter_role_weights(weights, role=self.afd_role))
+        # None must not bypass filtering for a role-specific DSpark model.
+        role: str = self.afd_role if self.afd_role in ("attention", "ffn") else ""
+        loaded = super().load_weights(
+            filter_role_weights(
+                weights,
+                role=role,
+                classify=_dspark_weight_roles,
+            )
+        )
         native.logger.info(
             "AFD DSpark role=%s remote MoE layer IDs=%s loaded parameters=%d",
             self.afd_role,
@@ -253,8 +270,8 @@ class AFDDSparkDeepseekV4ForCausalLM(native.DSparkDeepseekV4ForCausalLM):
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return tuple(int(index) for index in self.model.layers)
 
-    def get_async_cam_layered_weights(self) -> tuple[list[LayeredFFNWeights], str]:
-        return _extract_async_cam_layered_weights(self.model.layers.values())
+    def get_quantized_expert_weights(self) -> tuple[list[QuantizedExpertWeights], str]:
+        return _extract_quantized_expert_weights(self.model.layers.values())
 
     def compute_ffn_output(
         self,

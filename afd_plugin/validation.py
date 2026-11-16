@@ -4,10 +4,9 @@
 
 from __future__ import annotations
 
-import importlib
 import os
 import struct
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
@@ -87,6 +86,25 @@ def validate_graph_capacity(
         )
     if max_tokens // tp_size > CAM_MAX_SOURCE_ROWS:
         raise ValueError("Async CAM graph source rows exceed the uint16 protocol bound")
+
+
+def validate_async_cam_attention_graph(vllm_config: VllmConfig) -> None:
+    """Validate AFD dependencies for native Async CAM Attention graphs."""
+    model = vllm_config.model_config
+    parallel = vllm_config.parallel_config
+    if (
+        not vllm_config.use_v2_model_runner
+        or model.hf_text_config.model_type != "deepseek_v4"
+    ):
+        raise RuntimeError("Async CAM Attention graph requires MRV2 DeepSeek-V4")
+    if parallel.enable_dbo or parallel.use_ubatching:
+        raise RuntimeError("Async CAM Attention graph does not support DBO/ubatching")
+    if (
+        parallel.pipeline_parallel_size,
+        parallel.prefill_context_parallel_size,
+        parallel.decode_context_parallel_size,
+    ) != (1, 1, 1):
+        raise RuntimeError("Async CAM Attention graph does not support PP or CP")
 
 
 def validate_gpu_model_runner_v2_config(
@@ -207,11 +225,9 @@ def validate_npu_model_runner_v2_config(
             )
         if not vllm_config.model_config.enforce_eager:
             if expected_role == "attention":
-                raise RuntimeError(
-                    "AFD NPU ModelRunnerV2 Async CAM requires eager execution "
-                    "on Attention"
-                )
-            requested_ffn_mode(vllm_config)
+                validate_async_cam_attention_graph(vllm_config)
+            else:
+                requested_ffn_mode(vllm_config)
     elif afd_config.connector != CAMP2P_CONNECTOR:
         raise RuntimeError(
             "AFD NPU ModelRunnerV2 requires either synchronous CAMP2pAFDConnector "
@@ -284,24 +300,6 @@ def validate_npu_model_runner_v2_config(
 
 def normalize_qualname(value: str) -> str:
     return value.replace(":", ".")
-
-
-def resolve_class_from_qualname(qualname: str, *, role: str = "class") -> type[Any]:
-    """Resolve a dotted or colon-separated class path."""
-
-    normalized = normalize_qualname(qualname.strip())
-    if not normalized or "." not in normalized:
-        raise ValueError(
-            f"{role} must be a dotted qualname, got {qualname!r}",
-        )
-    module_name, obj_name = normalized.rsplit(".", 1)
-    module = importlib.import_module(module_name)
-    obj = getattr(module, obj_name)
-    if not isinstance(obj, type):
-        raise TypeError(
-            f"{role} resolved to {type(obj).__name__}, expected a class",
-        )
-    return obj
 
 
 def expected_worker_qualname(role: str) -> str:
@@ -428,7 +426,6 @@ __all__ = [
     "expected_npu_worker_qualname",
     "expected_worker_qualname",
     "normalize_qualname",
-    "resolve_class_from_qualname",
     "validate_gpu_model_runner_v2_config",
     "validate_npu_model_runner_v2_config",
 ]

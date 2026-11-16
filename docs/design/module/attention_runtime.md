@@ -9,10 +9,10 @@ primary_code_paths:
   - "afd_plugin/v1/worker/attention_metadata.py"
   - "afd_plugin/v1/worker/attention_model_runner_v2.py"
   - "afd_plugin/v1/worker/attention_worker.py"
-  - "afd_plugin/v1/worker/ubatch_wrapper.py"
   - "afd_plugin/v1/worker/npu/attention_model_runner_v2.py"
   - "afd_plugin/v1/worker/npu/attention_worker.py"
   - "afd_plugin/v1/worker/npu/dspark_speculator.py"
+  - "afd_plugin/v1/worker/npu/attention_metadata.py"
 related_code_paths:
   - "afd_plugin/connectors/**"
   - "afd_plugin/model_executor/**"
@@ -24,13 +24,15 @@ depends_on:
   - "execution_platforms.md"
   - "compatibility_and_patches.md"
 validation_paths:
+  - "tests/unit/v1/worker/npu/test_dspark_speculator.py"
   - "tests/unit/v1/worker/test_attention_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
   - "tests/unit/v1/worker/test_npu_model_runner_v2.py"
   - "tests/unit/v1/worker/npu/test_ubatch_runner.py"
   - "tests/unit/v1/worker/npu/test_attention_model_runner_v2.py"
-  - "tests/unit/model_executor/test_async_cam_dbo.py"
+  - "tests/unit/v1/worker/npu/test_attention_metadata.py"
+  - "tests/unit/connectors/npu/async_cam_runtime/test_async_cam_dbo.py"
   - "tests/npu/test_mrv2_dbo.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v4_flash/test_gpu.py"
@@ -166,7 +168,7 @@ Both platforms require V2. The paired deployment constraints are:
 | Excluded features | Elastic EP, EPLB, sequence-parallel MoE, and compile SP | Elastic EP and EPLB; model-specific SP restrictions | Elastic EP, EPLB, native draft models/MTP except DSV4 DSpark, finegrained TP, and explicit shared-expert DP |
 | Sequence parallelism | Unsupported | Model-specific; synchronous DeepSeek-V2/V3 SP is rejected | Attention-local FlashComm1/SP supported; disabled on FFN; no PCP/DCP |
 | Native DBO | Exactly two microbatches, Attention DP1 or DP > 1 | Eager or graph; exactly two microbatches, Attention DP > 1 | Eager only; exactly two microbatches at Attention DP1 or DP > 1 |
-| Graph execution | Eager or `FULL_DECODE_ONLY` | Eager, `FULL`, or `FULL_DECODE_ONLY`; plain MLA graph DBO requires `FULL_DECODE_ONLY` | Eager Attention; independent FFN also supports the narrow W4A8/W8A8 FULL contract |
+| Graph execution | Eager or `FULL_DECODE_ONLY` | Eager, `FULL`, or `FULL_DECODE_ONLY`; plain MLA graph DBO requires `FULL_DECODE_ONLY` | Eager Attention or DSV4 target native graph without DBO; native `FULL`/`FULL_DECODE_ONLY` resolution; Attention-local SP and native PD may remain enabled; DSpark draft may be eager or native Graph; independent FFN supports the narrow W4A8/W8A8 FULL contract |
 | Model | Registered AFD architecture; DeepEP M2N is limited to Qwen3 MoE or DeepSeek-V2 | Registered AFD architecture | DeepSeek-V4 with layered W4A8/W8A8 FFN experts and `dynamicQuant=1` |
 
 Both roles validate the paired V2 topology, but only Attention uses the native
@@ -248,7 +250,9 @@ from becoming a long-term API.
 
 The runner temporarily installs a provider at the native `ForwardContext`
 creation seam and attaches the sidecar to the upstream context. The shared
-metadata mixin supplies the single-stage and graph-control behavior.
+metadata mixin supplies the single-stage and graph-control behavior. Its
+`install_mrv2_ubatch_metadata()` method attaches isolated AFD sidecars directly
+to the prepared native microbatch contexts.
 
 Ascend V2 Async CAM uses `NPUUBatchRunner` to adapt native DBO child inputs to
 Ascend attention builders. Native slicing, execution threads and output merge
@@ -315,9 +319,8 @@ Enable vLLM native DBO with `--enable-dbo` on Attention. It:
 
 Native DBO owns request/token boundaries. Enable DBO on Attention only; Async FFN rejects native DBO flags and
 continues its receive loop.
-`models/npu/async_cam_layout.py` retains only communication layout
-conversion, and `models/npu/async_cam_dbo.py` supplies the single-window receive
-hook. FlashComm1/SP is Attention-local and
+`connectors/npu/async_cam_runtime/async_cam_layout.py` owns CAM layout conversion;
+`async_cam_dbo.py` owns the single-window receive hook, shared by the model adapters. FlashComm1/SP is Attention-local and
 FFN topology validation is independent. See the CAM async user guide for the
 supported topology and environment matrix.
 
@@ -335,12 +338,14 @@ shutdown; Ascend and other models keep native preparation and profiling.
 
 Ascend V2 supports exactly two native microbatches: synchronous CAMP2P
 requires Attention DP > 1 and supports graph DBO, while Async CAM uses eager
-Attention and also supports Attention DP1. Plain MLA graph DBO requires
+Attention for DBO and also supports Attention DP1. Its separate target
+DSV4 decode graph profile excludes DBO. Plain MLA graph DBO requires
 `FULL_DECODE_ONLY`.
 
-For full-graph capture, the V2 runner
-wraps native input preparation and publishes one warmup and one capture
-payload per descriptor. CUDA two-stage preparation installs separate AFD
+For full-graph capture, the V2 runner wraps native input preparation and
+stages descriptor-matched AFD metadata. Connectors with a control plane also
+publish one warmup and one capture payload per descriptor; Async CAM does not.
+CUDA two-stage preparation installs separate AFD
 metadata on both native stage contexts and sends their complete layout before
 eager execution or FULL replay. Single-stage FULL replay publishes its padded
 control shape through an execute-scoped manager hook; two-stage replay reuses

@@ -39,7 +39,7 @@ Every layout works, including multi-pod ones. From the repository root:
 ```bash
 export MODEL_PATH=/path/to/Qwen3-30B-A3B
 DECODE_BENCH='{}' \
-    bash recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/prefill_decode_colocation/graph.sh
+    bash recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/prefill_decode_colocation/2a2f_graph_dp2tp1.sh
 
 # once Attention answers on port 18000:
 INPUT_LEN=1024 OUTPUT_LEN=256 NUM_PROMPTS=2000 MAX_CONCURRENCY=64 \

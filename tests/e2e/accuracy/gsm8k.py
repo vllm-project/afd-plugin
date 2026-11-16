@@ -13,9 +13,12 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from types import FrameType
 
+from tests.e2e.case import Gsm8kSettings, JsonValue
 from tests.e2e.process_utils import terminate_process_groups
 
 LM_EVAL_TIMEOUT_S = 7200
@@ -23,6 +26,88 @@ LM_EVAL_TERMINATION_TIMEOUT_S = 20
 LM_EVAL_PROCESS_POLL_INTERVAL_S = 0.2
 LM_EVAL_REAP_TIMEOUT_S = 5
 LM_EVAL_READER_JOIN_TIMEOUT_S = 5
+GSM8K_FULL_SAMPLE_COUNT = 1319
+GSM8K_FULL_TIMEOUT_S = 8 * 60 * 60
+GSM8K_LIMIT_ENV = "AFD_GSM8K_LIMIT"
+GSM8K_THRESHOLD_ENV = "AFD_GSM8K_THRESHOLD"
+
+
+def resolve_settings(
+    canonical: Gsm8kSettings, environment: Mapping[str, str]
+) -> tuple[Gsm8kSettings, tuple[str, ...]]:
+    """Apply documented local overrides and determine configuration eligibility."""
+    limit = canonical.sample_limit
+    if GSM8K_LIMIT_ENV in environment:
+        raw = environment[GSM8K_LIMIT_ENV]
+        limit = None if raw == "all" else int(raw)
+    if limit is not None:
+        if limit < 1:
+            raise ValueError("GSM8K sample limit must be positive or 'all'")
+        limit = max(limit, canonical.minimum_samples)
+    threshold = canonical.threshold
+    if (
+        canonical.smoke_max_samples is not None
+        and limit is not None
+        and limit <= canonical.smoke_max_samples
+        and canonical.smoke_threshold is not None
+    ):
+        threshold = canonical.smoke_threshold
+    if (
+        canonical.smoke_max_samples is not None
+        and (limit is None or limit > canonical.smoke_max_samples)
+        and canonical.larger_sample_threshold is not None
+    ):
+        threshold = canonical.larger_sample_threshold
+    required_threshold = threshold
+    if GSM8K_THRESHOLD_ENV in environment:
+        threshold = float(environment[GSM8K_THRESHOLD_ENV])
+    if not 0 <= threshold <= 1:
+        raise ValueError("GSM8K threshold must be a finite value between 0 and 1")
+    reasons = []
+    canonical_count = canonical.sample_limit or GSM8K_FULL_SAMPLE_COUNT
+    actual_count = limit or GSM8K_FULL_SAMPLE_COUNT
+    if actual_count < canonical_count:
+        reasons.append(f"sample count reduced from {canonical_count} to {actual_count}")
+    if threshold < required_threshold:
+        reasons.append(
+            f"accuracy threshold reduced from {required_threshold} to {threshold}"
+        )
+    return replace(canonical, sample_limit=limit, threshold=threshold), tuple(reasons)
+
+
+def evaluate_settings(
+    settings: Gsm8kSettings,
+    *,
+    base_url: str,
+    model_name: str,
+    checkpoint: str,
+    output_path: Path,
+) -> dict[str, JsonValue]:
+    """Execute the resolved Case workload and validate complete evaluator output."""
+    results = _run_lm_eval(
+        base_url,
+        model_name,
+        output_path=str(output_path),
+        num_fewshot=settings.num_fewshot,
+        num_concurrent=settings.num_concurrent,
+        max_gen_toks=settings.max_gen_toks,
+        tokenizer=checkpoint,
+        limit=settings.sample_limit,
+        timeout_s=(
+            GSM8K_FULL_TIMEOUT_S if settings.sample_limit is None else LM_EVAL_TIMEOUT_S
+        ),
+    )
+    count = _extract_gsm8k_sample_count(results)
+    expected = settings.sample_limit or GSM8K_FULL_SAMPLE_COUNT
+    if count != expected:
+        raise RuntimeError(f"GSM8K evaluated {count} samples; expected {expected}")
+    accuracy = _extract_gsm8k_accuracy(results)
+    if not accuracy >= settings.threshold:
+        raise RuntimeError(
+            f"GSM8K accuracy {accuracy:.4f} is below the required "
+            f"threshold {settings.threshold:.4f}"
+        )
+    return {"sample_count": count, "accuracy": accuracy}
 
 
 def _finish_lm_eval_cleanup(

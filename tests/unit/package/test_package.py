@@ -16,6 +16,17 @@ import pytest
 import afd_plugin
 
 
+def test_models_metadata_compat_export(monkeypatch):
+    from afd_plugin.model_executor import models
+
+    context = ModuleType("afd_plugin.forward_context")
+    metadata_reader = object()
+    context.__dict__["get_afd_metadata_from_forward_context"] = metadata_reader
+    monkeypatch.setitem(sys.modules, context.__name__, context)
+
+    assert models.get_afd_metadata_from_forward_context is metadata_reader
+
+
 @pytest.fixture(params=["cuda", "npu"])
 def registration(monkeypatch, request):
     native = {
@@ -124,7 +135,19 @@ def test_register_afd_preserves_native_models_and_is_idempotent(registration):
 
 
 def test_entry_point_is_registered():
-    entry_points = importlib.metadata.entry_points(group="vllm.general_plugins")
-    matches = [ep for ep in entry_points if ep.name == "afd"]
+    """The installed distribution has to expose the vLLM plugin entry point.
+
+    Importing the package from a source tree does not register installation
+    metadata, so the entry point can only be checked on an installed build.
+    """
+    try:
+        distribution = importlib.metadata.distribution("vllm-afd-plugin")
+    except importlib.metadata.PackageNotFoundError:
+        pytest.skip("the plugin is not installed in this environment")
+    matches = [
+        entry_point
+        for entry_point in distribution.entry_points
+        if entry_point.group == "vllm.general_plugins" and entry_point.name == "afd"
+    ]
     assert matches
     assert matches[0].value == "afd_plugin:register_afd"

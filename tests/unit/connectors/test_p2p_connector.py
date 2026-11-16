@@ -897,3 +897,50 @@ def test_p2p_subgroup_rendezvous_reuses_the_afd_world_store(
 def test_factory_rejects_unknown_connector():
     with pytest.raises(ValueError, match="unsupported AFD connector type"):
         AFDConnectorFactory.get_connector_class("UnknownConnector")
+
+
+class _LazilyExportedConnector(AFDConnectorBase):
+    """Stands in for a connector served only through module ``__getattr__``."""
+
+    def __init__(self, *args, **kwargs) -> None:  # pragma: no cover - never built
+        raise NotImplementedError
+
+
+@pytest.fixture
+def isolated_connector_registry(monkeypatch):
+    """Keep a temporary registration out of the registry other tests share."""
+
+    monkeypatch.setattr(
+        AFDConnectorFactory,
+        "_registry",
+        dict(AFDConnectorFactory._registry),
+    )
+
+
+def test_factory_resolves_a_connector_served_only_by_package_getattr(
+    monkeypatch, isolated_connector_registry
+):
+    """The factory must read lazily exported names out of ``__getattr__``."""
+
+    module = types.ModuleType("afd_lazily_exported_connector")
+    class_name = "_LazilyExportedConnector"
+
+    def _resolve(name: str):
+        if name == class_name:
+            return _LazilyExportedConnector
+        raise AttributeError(name)
+
+    # A module-level __getattr__ (PEP 562) is what the CAMP2P package uses.
+    module.__getattr__ = _resolve  # type: ignore[method-assign]
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+    AFDConnectorFactory.register_connector(
+        "LazilyExportedConnector",
+        module.__name__,
+        class_name,
+        replace=True,
+    )
+
+    assert class_name not in vars(module), "the class must not be in the module dict"
+    resolved = AFDConnectorFactory.get_connector_class("LazilyExportedConnector")
+    assert resolved is _LazilyExportedConnector

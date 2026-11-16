@@ -29,7 +29,7 @@ FACTORY_PATH = REPO_ROOT / "afd_plugin/compat/patches/npu/ascend_config.py"
 
 
 def load_functions(path, namespace, names):
-    tree = ast.parse(path.read_text())
+    tree = ast.parse(path.read_text(encoding="utf-8"))
     tree.body = [
         node
         for node in tree.body
@@ -294,7 +294,7 @@ class AscendConfigLifecycleTests(unittest.TestCase):
                 self.assertEqual(vars(config), before)
 
     def test_factory_binds_already_loaded_native_scheduler_callers(self):
-        tree = ast.parse(FACTORY_PATH.read_text())
+        tree = ast.parse(FACTORY_PATH.read_text(encoding="utf-8"))
         aliases = next(
             ast.literal_eval(node.value)
             for node in tree.body

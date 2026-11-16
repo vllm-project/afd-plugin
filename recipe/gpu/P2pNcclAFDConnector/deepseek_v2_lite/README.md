@@ -35,8 +35,13 @@ for tested E2E configurations.
 │   ├── 2p1a1f_eager_dbo.sh
 │   └── 2p1a1f_graph_dbo.sh
 └── prefill_decode_colocation/             # any LAYOUT, ATTN_TP, FFN_TP
-    ├── dbo.sh                             # FULL_DECODE_ONLY graphs + DBO
-    └── eager_dbo.sh                       # eager + DBO
+    ├── 2a2f_eager_dbo_dp2tp1.sh           # 2A2F, eager + DBO, DP2/TP1
+    ├── 2a2f_graph_dbo_dp2tp1.sh           # 2A2F, graph + DBO, DP2/TP1
+    ├── 2a2f_eager_dbo_dp1tp2.sh           # 2A2F, eager + DBO, DP1/TP2
+    ├── 2a2f_graph_dbo_dp1tp2.sh           # 2A2F, graph + DBO, DP1/TP2
+    ├── 4a4f_eager_dbo_dp2tp2.sh           # 4A4F, eager + DBO, DP2/TP2
+    ├── 4a4f_graph_dbo_dp2tp2.sh           # 4A4F, graph + DBO, DP2/TP2
+    └── multipod_2a_2f_graph_dbo_dp1tp2.sh # 2A0F,0A2F, graph + DBO, DP1/TP2
 ```
 
 ### 1. Prefill/Decode Disaggregation — `1a1f`
@@ -54,16 +59,16 @@ for tested E2E configurations.
 ### 2. Prefill/Decode Colocation — `2a2f`
 
 The colocation recipes run on the shared
-[colocation launcher](../../common/README.md): `LAYOUT` places the ranks
-(default `2A2F`: FFN DP2 on GPUs 0,1, Attention DP2 on GPUs 2,3, Attention
-HTTP port 18000), and `ATTN_TP`/`FFN_TP` set each role's TP size:
+[colocation launcher](../../common/README.md): `LAYOUT` places the ranks and
+each script names its default DP/TP shape (FFN first, Attention second, and
+Attention HTTP port 18000):
 
-| Settings | Attention / FFN | GPUs |
-| ---------- | ----------------- | ------ |
-| (defaults) | DP2 x TP1 each | 4 |
-| `ATTN_TP=2 FFN_TP=2` | DP1 x TP2 each | 4 |
-| `LAYOUT=4A4F ATTN_TP=2 FFN_TP=2` | DP2 x TP2 each | 8 |
-| `LAYOUT=2A0F,0A2F ATTN_TP=2 FFN_TP=2` | DP1 x TP2 each, one pod per role (`POD=AFD_0`, `POD=AFD_1`) | 2 + 2 |
+| Script suffix | Attention / FFN | GPUs |
+| --- | --- | --- |
+| `2a2f_*_dp2tp1` | DP2 x TP1 each | 4 |
+| `2a2f_*_dp1tp2` | DP1 x TP2 each | 4 |
+| `4a4f_*_dp2tp2` | DP2 x TP2 each | 8 |
+| `multipod_2a_2f_*_dp1tp2` | DP1 x TP2 each, one pod per role | 2 + 2 |
 
 ## Running
 
@@ -77,8 +82,7 @@ before sending traffic.
 
 ```bash
 export MODEL_PATH=/path/model_weights/DeepSeek-V2-Lite
-ATTN_TP=2 FFN_TP=2 \
-    bash recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_colocation/dbo.sh
+bash recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/prefill_decode_colocation/2a2f_graph_dbo_dp1tp2.sh
 ```
 
 ### prefill_decode_disaggregation
@@ -96,7 +100,7 @@ Confirm the serving stack is ready before running:
 ```bash
 export MODEL_PATH=/path/model_weights/DeepSeek-V2-Lite
 export RESULT_DIR=/tmp/results
-export RESULT_FILENAME=2a2f_dbo_dp1tp2.json
+export RESULT_FILENAME=2a2f_graph_dbo_dp1tp2.json
 bash tools/benchmarks/request_generator.sh
 ```
 
@@ -136,6 +140,7 @@ DBO (Dual Batch Overlap) is turned on for all examples with
 These threshold values are example defaults; tune them for the actual workload
 and deployment configuration.
 
-`dbo.sh` captures `FULL_DECODE_ONLY` CUDA graphs of size `64`
-(`CUDAGRAPH_CAPTURE_SIZES=64`); `eager_dbo.sh` runs `--enforce-eager`. Adjust
+The `graph_dbo` recipes capture `FULL_DECODE_ONLY` CUDA graphs of size `64`
+(`CUDAGRAPH_CAPTURE_SIZES=64`); the `eager_dbo` recipes run
+`--enforce-eager`. Adjust
 `CUDAGRAPH_CAPTURE_SIZES` to the actual batch sizes and available GPU memory.

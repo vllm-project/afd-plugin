@@ -76,7 +76,7 @@ _AFD_ASYNC_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "dynamicQuant",
         "ffn_mega_moe",
-        "attn_ranks_per_dp",
+        ATTN_RANKS_PER_DP_CONFIG_KEY,
         "hccl_buffer_size",
     },
 )
@@ -174,8 +174,8 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
                 field_name="dynamicQuant",
             ),
             attn_ranks_per_dp=coerce_extra_positive_int(
-                raw.get("attn_ranks_per_dp", 1),
-                field_name="attn_ranks_per_dp",
+                raw.get(ATTN_RANKS_PER_DP_CONFIG_KEY, 1),
+                field_name=ATTN_RANKS_PER_DP_CONFIG_KEY,
             ),
             hccl_buffer_size=coerce_optional_extra_positive_int(
                 raw.get("hccl_buffer_size"),
@@ -190,7 +190,7 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
     def to_mapping(self) -> dict[str, Any]:
         result: dict[str, Any] = {
             "dynamicQuant": self.dynamic_quant,
-            "attn_ranks_per_dp": self.attn_ranks_per_dp,
+            ATTN_RANKS_PER_DP_CONFIG_KEY: self.attn_ranks_per_dp,
         }
         if self.ffn_mega_moe:
             result["ffn_mega_moe"] = True

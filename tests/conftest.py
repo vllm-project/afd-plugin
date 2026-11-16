@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -93,6 +94,18 @@ def run_runner(command: list[str], env: dict[str, str] | None = None) -> None:
         finally:
             for signum, previous_handler in previous_handlers.items():
                 signal.signal(signum, previous_handler)
+
+
+def run_case_entry(
+    command: list[str], output_path: Path, env: dict[str, str] | None = None
+) -> None:
+    """Require both successful execution and canonical acceptance at pytest gates."""
+    run_runner(command, env=env)
+    record = json.loads((output_path / "run.json").read_text())
+    assert record["acceptance_passed"], (
+        "task execution succeeded but the fixed scenario did not qualify: "
+        f"{record['configuration']}"
+    )
 
 
 def download_dataset(dataset_id: str, dataset_config: str | None = None) -> None:

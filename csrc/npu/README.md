@@ -167,10 +167,20 @@ from afd_plugin.compat.npu import ensure_afd_ascend_ops_loaded
 ensure_afd_ascend_ops_loaded()
 ```
 
+Prepare native and AFD `ASCEND_CUSTOM_OPP_PATH` vendor entries before launching
+Python when using the layered operators. GE can initialize infer-shape
+registrations while importing native modules; adding the AFD path afterward
+cannot repair that process's missing registration. Preserve the CANN Python
+and library paths from the activated environment. The
+[standalone guide](../../docs/npu/STANDALONE_FFN_SERVICE.md#launch) shows the
+paired vendor setup.
+
 ## Current Scope
 
 A2E/E2A serve `CAMP2pAFDConnector`. `CAMAsyncAFDConnector` uses the plugin's
 910C routed-only CAM operators; see the [operator contract](../../docs/design/npu/cam_async_routed_ops.md).
+The standalone FFN entry point reuses this protocol and connector; see
+[the standalone service guide](../../docs/npu/STANDALONE_FFN_SERVICE.md).
 
 `grouped_matmul_swiglu_quant_v2_layered` is a fused
 grouped-matmul + SiLU + dynamic-quantization CAM operator (A8W8 / A4W4 /

@@ -10,9 +10,9 @@ wrappers (`RemoteFFNProxy`, `AFDAttentionFusedMoE`, `GateOnlyRemoteMoE`, the
 `AFDDeepseekV2/V3/V4` and `AFDQwen3Moe`/`AFDQwen3_5` families, plus
 `AFDGlmMoeDsaForCausalLM` and `AFDDSparkDeepseekV4ForCausalLM`), checkpoint
 weight-role filtering, the NPU-specific forward/gate modules under
-`models/npu/`, and the layered executor under `model_executor/npu/`. Does not
-own runner execution, connector transport, or the routing simulator's
-registration mechanics.
+`models/npu/`. Async CAM layered and Mega executors belong to
+`connectors/npu/async_cam_runtime/`. Does not own runner execution, connector
+transport, or the routing simulator's registration mechanics.
 
 ## Contract checks
 

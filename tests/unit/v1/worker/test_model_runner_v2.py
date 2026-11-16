@@ -25,9 +25,7 @@ from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector  # noqa: E402
 from vllm.v1.worker.gpu.ubatch_utils import UBatchState  # noqa: E402
 from vllm.v1.worker.ubatch_utils import UBatchSlice  # noqa: E402
 
-from afd_plugin.model_executor.models import (  # noqa: E402
-    forward_context as afd_forward_context,
-)
+from afd_plugin import forward_context as afd_forward_context  # noqa: E402
 from afd_plugin.v1.worker import (  # noqa: E402
     attention_model_runner_v2 as v2_runner_module,
 )

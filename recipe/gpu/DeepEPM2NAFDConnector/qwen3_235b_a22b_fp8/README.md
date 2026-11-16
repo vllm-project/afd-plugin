@@ -7,16 +7,17 @@ specific to the model.
 
 ```text
 prefill_decode_colocation/
-├── graph.sh   # FULL_DECODE_ONLY CUDA graphs, 256 sequences per Attention rank
-├── eager.sh   # eager, 256 sequences per Attention rank
-└── dbo.sh     # graph + DBO, 512 sequences per Attention rank
+├── 4a2f_eager_dp4tp1.sh       # eager, FFN DP2/TP1, Attention DP4/TP1
+├── 4a2f_graph_dp4tp1.sh       # graph, FFN DP2/TP1, Attention DP4/TP1
+├── 4a2f_dbo_dp4tp1.sh         # graph + DBO, FFN DP2/TP1, Attention DP4/TP1
+└── multipod_4a1f_4a1f_dbo.sh  # 2 pods, graph + DBO, Attention DP8/TP1
 ```
 
 ## Defaults
 
-| Setting | `graph.sh`, `eager.sh` | `dbo.sh` |
+| Setting | `4a2f_graph_dp4tp1.sh`, `4a2f_eager_dp4tp1.sh` | `4a2f_dbo_dp4tp1.sh`, `multipod_4a1f_4a1f_dbo.sh` |
 | --- | --- | --- |
-| `LAYOUT` | `2A2F` | `2A2F` |
+| `LAYOUT` | `4A2F` | `4A2F` / `4A1F,4A1F` |
 | `--max-num-seqs` | 256 per Attention DP rank | 512 |
 | `--max-num-batched-tokens` | 3072 | 3072 |
 | `--max-model-len` | 4096 | 4096 |
@@ -42,10 +43,10 @@ Common layouts:
 - `ATTN_TP=4` with `LAYOUT=4A2F` runs Attention as one DP1/TP4 engine; raise
   `--max-num-seqs` and the capture sizes with it, since one engine then holds
   every running request.
-- The baseline without AFD is
-  [`recipe/gpu/baseline/qwen3_235b_a22b_fp8/vanilla_tp4.sh`](../../baseline/qwen3_235b_a22b_fp8/vanilla_tp4.sh).
 - Qwen3-235B holds 188 KiB of BF16 KV per token (94 layers, 4 KV heads of
   128); an H200 Attention rank has room for about 640K tokens.
+- The baseline without AFD is
+  [`recipe/gpu/baseline/qwen3_235b_a22b_fp8/vanilla_tp4.sh`](../../baseline/qwen3_235b_a22b_fp8/vanilla_tp4.sh).
 
 ## Limitations
 

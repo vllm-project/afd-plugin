@@ -42,7 +42,7 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 from vllm.v1.worker.utils import AttentionGroup
 from vllm.v1.worker.workspace import WorkspaceManager, current_workspace_manager
 
-from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
+from afd_plugin.forward_context import get_afd_metadata_from_forward_context
 
 if TYPE_CHECKING:
     from afd_plugin.v1.worker.attention_model_runner_v2 import AFDAttentionModelRunnerV2

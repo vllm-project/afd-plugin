@@ -7,9 +7,10 @@ the model.
 
 ```text
 prefill_decode_colocation/
-├── graph.sh   # FULL_DECODE_ONLY CUDA graphs
-├── eager.sh   # eager
-└── dbo.sh     # graph + DBO
+├── 2a2f_eager_dp2tp1.sh       # eager, FFN DP2/TP1, Attention DP2/TP1
+├── 2a2f_graph_dp2tp1.sh       # graph, FFN DP2/TP1, Attention DP2/TP1
+├── 2a2f_graph_dbo_dp2tp1.sh   # graph + DBO, FFN DP2/TP1, Attention DP2/TP1
+└── 2a2f_eager_dp1tp2.sh       # eager, FFN DP2/TP1, Attention DP1/TP2
 ```
 
 ## Defaults

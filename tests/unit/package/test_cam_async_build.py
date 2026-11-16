@@ -72,8 +72,10 @@ def test_native_sources_survive_source_distribution_manifest(monkeypatch):
     root = Path(__file__).resolve().parents[3]
     monkeypatch.chdir(root)
     files = FileList()
+    # setuptools works on manifest paths, which are always posix; native
+    # separators would make every required entry miss on Windows.
     files.allfiles = [
-        str(path.relative_to(root))
+        path.relative_to(root).as_posix()
         for path in (root / "csrc").rglob("*")
         if path.is_file()
     ]

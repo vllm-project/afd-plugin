@@ -45,6 +45,7 @@ def npu_parallel_config(**overrides):
         "pipeline_parallel_size": 1,
         "use_sequence_parallel_moe": False,
         "enable_eplb": False,
+        "enable_elastic_ep": False,
         "prefill_context_parallel_size": 1,
         "decode_context_parallel_size": 1,
         "dbo_decode_token_threshold": 1,
@@ -101,8 +102,32 @@ def npu_vllm_config(
             fast_moe_cold_start=False,
         ),
         speculative_config=speculative_config,
+        kv_transfer_config=None,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
     )
+
+
+def npu_async_cam_target_graph_config(**parallel_overrides):
+    config = npu_vllm_config(
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+        cudagraph_mode="FULL_DECODE_ONLY",
+        extra_config={
+            "dynamicQuant": 1,
+            "attn_ranks_per_dp": parallel_overrides.get("tensor_parallel_size", 1),
+        },
+        enable_expert_parallel=True,
+        **parallel_overrides,
+    )
+    config.model_config.enforce_eager = False
+    config.model_config.hf_config = config.model_config.hf_text_config = (
+        SimpleNamespace(
+            model_type="deepseek_v4", architectures=["DeepseekV4ForCausalLM"]
+        )
+    )
+    config.compilation_config.mode = 0
+    return config
 
 
 def async_moe_config(
@@ -253,7 +278,7 @@ def m2n_vllm_config(
     )
 
 
-def npu_dspark_config(*, role="attention", draft_eager=True):
+def npu_dspark_config(*, role="attention", draft_eager=True, tp_size=1):
     hf = SimpleNamespace(
         architectures=["DSparkDraftModel"],
         vocab_size=16,
@@ -266,12 +291,14 @@ def npu_dspark_config(*, role="attention", draft_eager=True):
         connector="CAMAsyncAFDConnector",
         async_dp=True,
         compute_gate_on_attention=True,
-        extra_config={"dynamicQuant": 1},
+        tensor_parallel_size=tp_size,
+        num_attention_ranks=tp_size,
+        extra_config={"dynamicQuant": 1, "attn_ranks_per_dp": tp_size},
         speculative_config=SimpleNamespace(
             method="dspark",
             enforce_eager=draft_eager,
             num_speculative_tokens=5,
-            draft_parallel_config=SimpleNamespace(tensor_parallel_size=1),
+            draft_parallel_config=SimpleNamespace(tensor_parallel_size=tp_size),
             draft_model_config=SimpleNamespace(hf_config=hf, hf_text_config=hf),
         ),
     )

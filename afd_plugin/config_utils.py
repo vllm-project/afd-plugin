@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import SupportsInt, cast
+
 
 def coerce_extra_bool(value: object, *, field_name: str) -> bool:
     """Parse a boolean option from bool, integer, or string input."""
@@ -24,21 +26,14 @@ def coerce_extra_bool(value: object, *, field_name: str) -> bool:
     raise TypeError(f"{field_name} must be a boolean, got {value!r}")
 
 
-def coerce_extra_str(value: object, *, field_name: str) -> str:
-    """Normalize a string connector option to lowercase."""
-
-    if not isinstance(value, str):
-        raise TypeError(f"{field_name} must be a string, got {value!r}")
-    return value.strip().lower()
-
-
 def coerce_extra_int(value: object, *, field_name: str) -> int:
     """Parse an integer option without truncating floats."""
 
     if isinstance(value, bool | float):
         raise TypeError(f"{field_name} must be an integer, got {value!r}")
     try:
-        return int(value)
+        # int() validates the raw value; normalize conversion failures below.
+        return int(cast(str | SupportsInt, value))
     except (TypeError, ValueError, OverflowError) as exc:
         raise TypeError(
             f"{field_name} must be an integer, got {value!r}",
@@ -70,6 +65,5 @@ __all__ = [
     "coerce_extra_bool",
     "coerce_extra_int",
     "coerce_extra_positive_int",
-    "coerce_extra_str",
     "coerce_optional_extra_positive_int",
 ]
