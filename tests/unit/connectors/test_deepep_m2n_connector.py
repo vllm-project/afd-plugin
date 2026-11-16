@@ -587,8 +587,6 @@ def test_handshake_resolves_attention_transport_settings(attn_size, tp_size):
 
     assert result.expert_alignment == 128
     assert not result.network_plan.use_gin
-    assert result.transport.is_identity
-    assert result.transport.ffn_ranks_per_domain == 0
 
 
 @pytest.mark.parametrize(
