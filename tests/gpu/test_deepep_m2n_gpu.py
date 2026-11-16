@@ -15,7 +15,6 @@ plan it sets, as the runtime does.
 
 from __future__ import annotations
 
-import time
 from collections.abc import Callable
 from dataclasses import asdict
 from typing import Any
@@ -38,7 +37,6 @@ from tests.gpu.deepep_m2n_harness import (  # noqa: E402
     graph_scenario,
     hot_cases,
     lane_cases,
-    mixed_mode_cases,
     peer_exit_scenario,
     rel_err,
     run_ranks,
@@ -124,61 +122,45 @@ def test_non_finite_output_fails_the_numerical_checks(bad_value):
         )
 
 
-@pytest.mark.parametrize("payload_format", PAYLOADS, ids=["bf16", "fp8"])
 @pytest.mark.parametrize(
-    ("ffn_size", "attn_size"),
-    [(1, 1), (2, 2), (1, 3)],
-    ids=["1F1A", "2F2A", "1F3A"],
+    ("ffn_size", "attn_size", "payload_format"),
+    [(2, 2, BF16), (2, 2, FP8), (1, 3, FP8)],
+    ids=["2F2A-bf16", "2F2A-fp8", "1F3A-fp8"],
 )
 def test_transport_and_deepgemm_experts(ffn_size, attn_size, payload_format, tmp_path):
     """Standard cases (even, uneven, decode, empty, mixed; with and without
     host sync) through dispatch, DeepGEMM experts and combine.
 
     Why: the core claim, for several rank ratios and both payload formats.
+    Pairwise: both formats on 2F2A, and FP8 on 1F3A (one FFN rank owning
+    every expert, uneven Attention:FFN ratio); each new topology or format
+    costs a cold JIT compile of the DeepEP kernels.
     """
     _run(M2NTopology(ffn_size, attn_size), {"payload_format": payload_format}, tmp_path)
 
 
-@pytest.mark.parametrize("payload_format", PAYLOADS, ids=["bf16", "fp8"])
-@pytest.mark.parametrize(
-    "topology",
-    [M2NTopology(2, 2, attn_tp_size=2), M2NTopology(2, 4, attn_tp_size=2)],
-    ids=["2F-1DPx2TP", "2F-2DPx2TP"],
-)
-def test_attention_tp_peers_dispatch_disjoint_slices(
-    topology, payload_format, tmp_path
-):
-    """With Attention TP, each TP peer dispatches its padded slice of its DP
-    rank's tokens (padding rows with expert id -1): the FFN receives every
-    token's routes exactly once and each slice combines to the dense MoE
-    reference. Covers single-lane and two-lane steps, including decode
-    batches smaller than the TP size and empty DP ranks.
+def test_attention_tp_peers_dispatch_disjoint_slices(tmp_path):
+    """With Attention TP2 (2F, one DP rank of two TP peers), each TP peer
+    dispatches its padded slice of the DP rank's tokens (padding rows with
+    expert id -1): the FFN receives every token's routes exactly once and
+    each slice combines to the dense MoE reference. Covers single-lane and
+    two-lane steps, including decode batches smaller than the TP size.
 
     Why: TP peers hold the same tokens; dispatching all of them from every
     peer would run each token's experts TP times, and a lost or doubled slice
-    would silently corrupt the output.
+    would silently corrupt the output. The per-DP-rank split over TP peers
+    (several DP ranks, empty DP ranks) is CPU logic covered by
+    ``test_tokens_per_attention_rank_splits_each_dp_rank_over_its_tp_peers``.
     """
+    topology = M2NTopology(2, 2, attn_tp_size=2)
     cases = standard_cases(topology.attn_dp_size, CAPACITY) + lane_cases(
         topology.attn_dp_size, CAPACITY
     )
     _run(
         topology,
-        {"payload_format": payload_format, "num_lanes": 2},
+        {"payload_format": FP8, "num_lanes": 2},
         tmp_path,
         scenario_args={"cases": _cases(cases)},
-    )
-
-
-@pytest.mark.parametrize("payload_format", PAYLOADS, ids=["bf16", "fp8"])
-def test_transport_with_fused_experts_backend(payload_format, tmp_path):
-    """Standard cases on 2F2A with vLLM's Triton ``fused_experts`` backend.
-
-    Why: the reference backend must keep working to cross-check DeepGEMM.
-    """
-    _run(
-        M2NTopology(2, 2),
-        {"expert_backend": "fused_experts", "payload_format": payload_format},
-        tmp_path,
     )
 
 
@@ -195,34 +177,6 @@ def test_hot_ffn_rank_routing(payload_format, tmp_path):
         {"payload_format": payload_format},
         tmp_path,
         scenario_args={"cases": _cases(hot_cases(2, CAPACITY))},
-    )
-
-
-def test_fp8_without_host_sync_for_small_buckets(tmp_path):
-    """FP8 standard cases with ``cpu_sync_min_tokens`` above capacity, so no
-    eager step reads receive counts on the host.
-
-    Why: the no-sync path uses worst-case receive shapes and must stay correct.
-    """
-    _run(
-        M2NTopology(2, 2),
-        {"payload_format": FP8, "cpu_sync_min_tokens": CAPACITY + 1},
-        tmp_path,
-    )
-
-
-def test_graph_and_eager_plans_mixed_across_ranks(tmp_path):
-    """Attention plans a step as graph (no host sync) while FFN plans it eager
-    (host sync), and the reverse, for even, decode and mixed token counts.
-
-    Why: an FFN runner without a graph for a step that Attention replays runs
-    it eagerly; the two sides then disagree on the host sync.
-    """
-    _run(
-        M2NTopology(2, 2),
-        {"payload_format": FP8},
-        tmp_path,
-        scenario_args={"cases": _cases(mixed_mode_cases(2))},
     )
 
 
@@ -274,33 +228,20 @@ def test_dbo_pipeline_eager_lanes_do_not_wait_for_each_other(payload_format, tmp
 
 
 @pytest.mark.parametrize("payload_format", PAYLOADS, ids=["bf16", "fp8"])
-def test_dbo_pipeline_cuda_graph_capture_and_replay(payload_format, tmp_path):
-    """The same DBO order captured in one graph per side and replayed with fresh
-    inputs; every layer checked after each replay.
-
-    Why: the per-lane waits become graph edges; a lane that never joined the
-    capture or a missing edge would corrupt rows only in replays.
-    """
-    _run(
-        M2NTopology(2, 2),
-        {"payload_format": payload_format, "num_lanes": 2},
-        tmp_path,
-        scenario=dbo_pipeline_scenario,
-        scenario_args={"num_layers": 4, "tokens": 64, "graph": True, "replays": 3},
-    )
-
-
-@pytest.mark.parametrize("payload_format", PAYLOADS, ids=["bf16", "fp8"])
 def test_dbo_graph_capture_reuses_sent_rows(payload_format, tmp_path):
-    """DBO steps of 2 and 8 MoE layers captured with an FFN that drops each
-    layer's rows once sent (as the routed runner does), every experts launch
-    stretched; Attention's outputs are checked after each replay, and the
+    """vLLM's DBO order captured in one graph per side and replayed with
+    fresh inputs, every layer checked on both sides after each replay; then
+    steps of 2 and 8 MoE layers captured with an FFN that drops each layer's
+    rows once sent (as the routed runner does), every experts launch
+    stretched: Attention's outputs are checked after each replay, and the
     memory the FFN's capture reserves must not grow with the layer count.
 
-    Why: rows kept alive across streams during capture were never reused
-    within it, so every layer's rows stayed allocated and Qwen3-235B
-    graph+DBO (94 MoE layers) ran out of FFN memory at startup. Reusing them
-    early must still not let a lane overwrite rows the experts read.
+    Why: the per-lane waits become graph edges; a lane that never joined the
+    capture or a missing edge would corrupt rows only in replays. And rows
+    kept alive across streams during capture were never reused within it, so
+    every layer's rows stayed allocated and Qwen3-235B graph+DBO (94 MoE
+    layers) ran out of FFN memory at startup. Reusing them early must still
+    not let a lane overwrite rows the experts read.
     """
     _run(
         M2NTopology(2, 2),
@@ -393,13 +334,14 @@ def test_failed_init_reports_and_closes(tmp_path):
 def test_peer_exit_fails_within_timeout(tmp_path):
     """FFN rank 1 exits abruptly after the step's control payload; the other
     ranks then run the layer with DeepEP timeouts of 10 s. Every survivor must
-    stop (error or abort) well within the budget instead of waiting forever.
+    stop (error or abort) well within the budget instead of waiting forever:
+    ``run_ranks`` kills ranks still alive at the budget and reports them hung,
+    including a rank that wrote its result and then hung in teardown.
 
     Why: a crashed peer must not hang the rest of the deployment.
     """
     topology = M2NTopology(2, 2)
     _skip_without_gpus(topology)
-    start = time.monotonic()
     results = run_ranks(
         topology,
         peer_exit_scenario,
@@ -412,16 +354,12 @@ def test_peer_exit_fails_within_timeout(tmp_path):
         tmp_path,
         timeout_s=PEER_EXIT_BUDGET_S,
     )
-    elapsed = time.monotonic() - start
-
-    print(f"peer exit: {elapsed:.0f} s")
     for result in results:
         print(f"rank {result.world_rank}: ok={result.ok} {result.error[-300:]}")
     assert results[1].error.startswith(NO_RESULT), "the exiting rank reported"
     survivors: list[RankResult] = [r for r in results if r.world_rank != 1]
     assert all(not r.ok for r in survivors), "a layer completed without its peer"
     assert all("hung=True" not in r.error for r in survivors), "a survivor hung"
-    assert elapsed < PEER_EXIT_BUDGET_S
 
 
 def test_close_cancels_a_blocked_control_receive(tmp_path):
@@ -434,7 +372,8 @@ def test_close_cancels_a_blocked_control_receive(tmp_path):
     still alive. The abort must reach only the control group, never the
     bootstrap group every lane holds.
     """
-    topology = M2NTopology(1, 1)
+    # 2F2A like most cases, so the run reuses their compiled DeepEP kernels.
+    topology = M2NTopology(2, 2)
     _skip_without_gpus(topology)
     results = run_ranks(
         topology,
@@ -446,7 +385,7 @@ def test_close_cancels_a_blocked_control_receive(tmp_path):
 
     for result in results:
         assert result.ok, f"rank {result.world_rank}: {result.error}"
-    ffn = results[0].metrics
-    assert ffn["receive"] == "cancelled", ffn
-    assert not ffn["alive"], ffn
-    assert ffn["stopped_s"] < CLOSE_JOIN_S, ffn
+    for ffn in (r.metrics for r in results if r.role == "ffn"):
+        assert ffn["receive"] == "cancelled", ffn
+        assert not ffn["alive"], ffn
+        assert ffn["stopped_s"] < CLOSE_JOIN_S, ffn

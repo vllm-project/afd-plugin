@@ -30,6 +30,12 @@ if TYPE_CHECKING:
 
 def snapshot(runner) -> dict:
     is_ffn = isinstance(runner, AsyncNPUFFNModelRunner)
+    executor = None
+    execution = "uninitialized"
+    if is_ffn:
+        executor = runner._mega_executor or runner._layered_executor
+        if executor is not None:
+            execution = "mega" if runner._mega_executor is not None else "layered"
     draft = runner.draft_model if is_ffn else runner.speculator.model
     if draft is None:
         return {
@@ -61,11 +67,9 @@ def snapshot(runner) -> dict:
         "draft_kv_groups": kv_groups,
         **(
             {
-                "ffn_execution": "layered"
-                if runner._layered_executor is not None
-                else "uninitialized",
-                "executor_layer_ids": list(runner._layered_executor.layer_ids)
-                if runner._layered_executor is not None
+                "ffn_execution": execution,
+                "executor_layer_ids": list(executor.layer_ids)
+                if executor is not None
                 else [],
                 "ffn_mode": runner.effective_mode,
                 "graph_capture_count": runner._graph_capture_count,

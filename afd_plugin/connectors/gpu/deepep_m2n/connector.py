@@ -355,8 +355,9 @@ def plan_stage(
     # ``cpu_sync_min_tokens``) and allocate the worst case for their bucket,
     # so they round up only to the next rung: graph steps already sit on one
     # (vLLM pads them to a capture size). The rule depends only on the token
-    # counts, because every rank must pass DeepEP the same bucket even when a
-    # rank plans the step in another mode (an FFN eager fallback).
+    # counts, because every rank must pass DeepEP the same bucket whatever
+    # mode it plans the step in (an FFN eager fallback keeps Attention's
+    # replay flag, so today the ranks plan alike).
     if not bucket_ladder or bucket > bucket_ladder[-1]:
         bucket = capacity_tokens_per_rank
     else:

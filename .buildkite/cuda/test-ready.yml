@@ -1,4 +1,6 @@
 # L2 ready — Simple Test + E2E. Uploaded by cuda/bootstrap-upload-steps.yml.
+# Each step reports a GitHub check run (Checks tab) on the built commit via
+# ``notify: github_check``. this needs the Buildkite GitHub App integration.
 steps:
   - group: ":card_index_dividers: Simple Test"
     depends_on: upload-ready-pipeline
@@ -15,6 +17,9 @@ steps:
             tests/npu/test_gmm_layered_performance.py
           - "pytest -sv tests/gpu/test_attention_routing.py"
         mirror_hardwares: l4_1
+        notify:
+          - github_check:
+              name: "ready / Simple · Unit Test"
 
   - group: ":card_index_dividers: E2E Test"
     depends_on: upload-ready-pipeline
@@ -33,3 +38,6 @@ steps:
             "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[afd-v2-eager-dbo-dp2]"
             "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[afd-v2-graph-dbo-dp2]"
         mirror_hardwares: l4_4
+        notify:
+          - github_check:
+              name: "ready / E2E · DeepSeekV2-Lite · GPU V2"

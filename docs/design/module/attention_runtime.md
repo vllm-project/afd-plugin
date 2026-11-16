@@ -12,6 +12,7 @@ primary_code_paths:
   - "afd_plugin/v1/worker/npu/attention_model_runner_v2.py"
   - "afd_plugin/v1/worker/npu/attention_worker.py"
   - "afd_plugin/v1/worker/npu/dspark_speculator.py"
+  - "afd_plugin/v1/worker/npu/attention_metadata.py"
 related_code_paths:
   - "afd_plugin/connectors/**"
   - "afd_plugin/model_executor/**"
@@ -30,6 +31,7 @@ validation_paths:
   - "tests/unit/v1/worker/test_npu_model_runner_v2.py"
   - "tests/unit/v1/worker/npu/test_ubatch_runner.py"
   - "tests/unit/v1/worker/npu/test_attention_model_runner_v2.py"
+  - "tests/unit/v1/worker/npu/test_attention_metadata.py"
   - "tests/unit/connectors/npu/async_cam_runtime/test_async_cam_dbo.py"
   - "tests/npu/test_mrv2_dbo.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
@@ -317,9 +319,8 @@ Enable vLLM native DBO with `--enable-dbo` on Attention. It:
 
 Native DBO owns request/token boundaries. Enable DBO on Attention only; Async FFN rejects native DBO flags and
 continues its receive loop.
-`connectors/npu/async_cam_runtime/async_cam_layout.py` retains only communication layout
-conversion, and `connectors/npu/async_cam_runtime/async_cam_dbo.py` supplies the single-window receive
-hook. FlashComm1/SP is Attention-local and
+`connectors/npu/async_cam_runtime/async_cam_layout.py` owns CAM layout conversion;
+`async_cam_dbo.py` owns the single-window receive hook, shared by the model adapters. FlashComm1/SP is Attention-local and
 FFN topology validation is independent. See the CAM async user guide for the
 supported topology and environment matrix.
 
