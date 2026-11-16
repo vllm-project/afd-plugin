@@ -28,11 +28,10 @@ the repository root on `PYTHONPATH`.
 
 ## Running with an AFD recipe
 
-The `DeepEPM2NAFDConnector` recipes, and the `P2pNcclAFDConnector` entry
-points that reuse them, attach the connector to Attention when `DECODE_BENCH`
-holds its `kv_connector_extra_config` as JSON (`{}` is enough) and add the
-repository root (`AFD_REPO`, default the current directory) to `PYTHONPATH`;
-see the
+Every GPU colocation recipe (via `recipe/gpu/common/afd_colocation.sh`)
+attaches the connector to Attention when `DECODE_BENCH` holds its
+`kv_connector_extra_config` as JSON (`{}` is enough) and adds the repository
+root (`AFD_REPO`, default the current directory) to `PYTHONPATH`; see the
 [recipes README](../../recipe/gpu/DeepEPM2NAFDConnector/README.md#decode-only-benchmark).
 Every layout works, including multi-pod ones. From the repository root:
 
