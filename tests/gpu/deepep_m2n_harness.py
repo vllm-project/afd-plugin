@@ -75,6 +75,7 @@ DEFAULT_EPHEMERAL_PORT_LOW = 32_768
 EPHEMERAL_PORT_RANGE = Path("/proc/sys/net/ipv4/ip_local_port_range")
 CLOSE_FAILED = "\nclose() failed:\n"
 NO_RESULT = "no result"
+KILLED_AFTER_RESULT = "killed at the deadline after writing its result"
 PEER_EXIT_CODE = 17
 ROW_KEY_SEED = 4_242
 ROW_KEY_MAX_COEFFICIENT = 1 << 31
@@ -487,7 +488,8 @@ def run_ranks(
 
     ``rank_extra_config`` adds per-rank config keys on top of ``extra_config``
     (to make ranks disagree). Ranks still alive after ``timeout_s`` are killed
-    and reported as ``no result (hung=True)``.
+    and reported failed with ``hung=True`` in the error, even if they already
+    wrote a result: a rank that reports and then hangs in teardown still hung.
     """
     placement = placement or Placement()
     rank_extra_config = rank_extra_config or {}
@@ -516,21 +518,27 @@ def run_ranks(
     deadline = time.monotonic() + timeout_s
     for proc in procs:
         proc.join(timeout=max(1.0, deadline - time.monotonic()))
-    hung = [proc for proc in procs if proc.is_alive()]
-    for proc in hung:
-        proc.kill()
+    killed: set[int] = set()
+    for rank, proc in zip(local_ranks, procs, strict=True):
+        if proc.is_alive():
+            proc.kill()
+            killed.add(rank)
     results = []
     for rank in local_ranks:
         path = out_dir / f"rank{rank}.json"
+        hung = rank in killed
         if path.exists():
-            results.append(RankResult(**json.loads(path.read_text(encoding="utf-8"))))
+            result = RankResult(**json.loads(path.read_text(encoding="utf-8")))
+            if hung:
+                # The rank reported, then hung (e.g. in teardown) until killed.
+                result.ok = False
+                result.error += f"\n{KILLED_AFTER_RESULT} (hung=True)"
         else:
             role, _ = topology.role(rank)
-            results.append(
-                RankResult(
-                    rank, role, ok=False, error=f"{NO_RESULT} (hung={bool(hung)})"
-                )
+            result = RankResult(
+                rank, role, ok=False, error=f"{NO_RESULT} (hung={hung})"
             )
+        results.append(result)
     return results
 
 

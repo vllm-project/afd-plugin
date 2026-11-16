@@ -335,7 +335,8 @@ def test_peer_exit_fails_within_timeout(tmp_path):
     """FFN rank 1 exits abruptly after the step's control payload; the other
     ranks then run the layer with DeepEP timeouts of 10 s. Every survivor must
     stop (error or abort) well within the budget instead of waiting forever:
-    ``run_ranks`` kills ranks still alive at the budget and reports them hung.
+    ``run_ranks`` kills ranks still alive at the budget and reports them hung,
+    including a rank that wrote its result and then hung in teardown.
 
     Why: a crashed peer must not hang the rest of the deployment.
     """
