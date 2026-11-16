@@ -14,7 +14,7 @@ lists only its defaults and model-specific notes.
 
 Recipe names encode their layout, DP/TP shape, and mode. DeepSeek-V2-Lite and
 Qwen3-30B-A3B provide `2a2f_{eager,graph,graph_dbo}_dp2tp1.sh` plus
-`2a2f_eager_dp1tp2.sh`; Qwen3-235B-A22B-FP8 provides `4a2f` eager, graph and
+`2a2f_eager_dp1tp2.sh`; Qwen3-235B-A22B-FP8 provides `2a2f` eager, graph and
 DBO recipes plus `multipod_4a1f_4a1f_dbo.sh`. Each model README lists its
 exact filenames and defaults.
 
@@ -31,9 +31,8 @@ every setting, and how to run a recipe directly or in a pod.
 
 ## Prerequisites
 
-- SM90 or newer GPUs. The DeepSeek and Qwen3-30B default `2A2F` layout uses
-  4 GPUs; Qwen3-235B defaults to `4A2F` on 6 GPUs. See the model README for
-  memory needs.
+- SM90 or newer GPUs. The default `2A2F` layout uses 4 GPUs on one host; see
+  the model README for memory needs.
 - vLLM `v0.32.0`, the plugin and afdEP-comm (the `afdep` extra) installed in
   one environment. DeepGEMM is the copy bundled in the vLLM wheel. See
   [Installation](../../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation).
