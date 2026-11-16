@@ -167,3 +167,47 @@ def test_v4_ffn_compute_requires_input_ids(monkeypatch):
 
     with pytest.raises(RuntimeError, match="FFN compute requires input_ids"):
         layer.compute_ffn_output(torch.ones((2, 4)), input_ids=None)
+
+
+@pytest.fixture
+def async_v4_proxy():
+    from tests.unit.fakes.model_layers import GateLinear
+
+    proxy = adapter.RemoteDeepseekV4FFN(layer_idx=0)
+    proxy.gate = GateLinear(4, 4, out_dtype=torch.float32)
+    proxy.gate.e_score_correction_bias = None
+    proxy.gate.tid2eid = nn.Parameter(
+        torch.tensor([[1, 2], [2, 3], [0, 3]], dtype=torch.int32),
+        requires_grad=False,
+    )
+    proxy.top_k, proxy.tp_size = 2, 1
+    proxy.renormalize, proxy.scoring_func = True, "sqrtsoftplus"
+    proxy.routed_scaling_factor = 2.0
+    return proxy
+
+
+def test_async_v4_hash_gate_sends_token_selected_experts(monkeypatch, async_v4_proxy):
+    from afd_plugin.connectors.gpu import async_moe_op  # noqa: F401
+    from afd_plugin.model_executor import models
+
+    events: list[tuple] = []
+    sidecar = SimpleNamespace(connector=_FakeConnector(events), stage_idx=1)
+    monkeypatch.setattr(
+        models, "get_afd_metadata_from_forward_context", lambda: sidecar
+    )
+    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", lambda value, **kwargs: value)
+
+    def route_hash(**kwargs):
+        ids = kwargs["hash_indices_table"][kwargs["input_tokens"]]
+        return torch.full(ids.shape, kwargs["routed_scaling_factor"]), ids
+
+    monkeypatch.setattr(adapter.native, "fused_topk_bias", route_hash)
+    hidden_states = torch.ones(2, 4)
+    output = async_v4_proxy(hidden_states, torch.tensor([2, 0]))
+
+    torch.testing.assert_close(output, hidden_states * 0.25)
+    assert events[0][2].metadata.stage_idx == 1
+    torch.testing.assert_close(
+        events[0][3]["topk_ids"], torch.tensor([[0, 3], [1, 2]], dtype=torch.int32)
+    )
+    torch.testing.assert_close(events[0][3]["topk_weights"], torch.full((2, 2), 2.0))

@@ -9,17 +9,24 @@ FFN activation is the sole FFN-to-Attention tensor.
 """
 
 from collections.abc import Iterable, Iterator
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
+from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.models.deepseek_v4.nvidia import model as native
 
 from afd_plugin.compat.patches.gpu_deepseek_v4_dbo import forward_v4_attention
-from afd_plugin.config import parse_afd_config
-from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
+from afd_plugin.config import AFD_ASYNC_GPU_CONNECTOR, parse_afd_config
+from afd_plugin.connectors.metadata import (
+    AFDF2ATransferPayload,
+    AFDTransferContext,
+    AFDTransferMetadata,
+)
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
@@ -42,7 +49,11 @@ def _weight_layer_path(name: str) -> tuple[int, str] | None:
     return None
 
 
-def _checkpoint_weight_roles(name: str) -> frozenset[str]:
+def _checkpoint_weight_roles(
+    name: str,
+    *,
+    compute_gate_on_attention: bool = False,
+) -> frozenset[str]:
     """Classify a native DeepSeek-V4 checkpoint path by execution owner."""
     if name in {
         "hc_head_fn",
@@ -58,6 +69,8 @@ def _checkpoint_weight_roles(name: str) -> frozenset[str]:
         return _BOTH_ROLES
     _, stage = layer_path
     if stage == "ffn":
+        if compute_gate_on_attention and ".ffn.gate." in name:
+            return _BOTH_ROLES
         return _FFN_ROLE
     return _ATTENTION_ROLE
 
@@ -66,19 +79,67 @@ def _iter_role_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
     *,
     role: str,
+    compute_gate_on_attention: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Consume a checkpoint iterator once and retain only role-owned paths."""
     for name, loaded_weight in weights:
-        if role in _checkpoint_weight_roles(name):
+        if role in _checkpoint_weight_roles(
+            name,
+            compute_gate_on_attention=compute_gate_on_attention,
+        ):
             yield name, loaded_weight
 
 
 class RemoteDeepseekV4FFN(nn.Module):
-    """Parameter-free FFN proxy carrying V4 hash-router token identifiers."""
+    """Remote FFN proxy; async GPU owns its gate and hash-router table."""
 
-    def __init__(self, *, layer_idx: int) -> None:
+    def __init__(
+        self,
+        *,
+        layer_idx: int,
+        vllm_config: VllmConfig | None = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self.gate: native.GateLinear | None = None
+        if vllm_config is None:
+            return
+        afd_config = parse_afd_config(vllm_config, validate=False)
+        if afd_config.connector != AFD_ASYNC_GPU_CONNECTOR:
+            return
+        config = vllm_config.model_config.hf_config
+        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        self.top_k = config.num_experts_per_tok
+        self.renormalize = config.norm_topk_prob
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.scoring_func = config.scoring_func
+        self.gate = native.GateLinear(
+            input_size=config.hidden_size,
+            output_size=config.n_routed_experts,
+            bias=False,
+            out_dtype=torch.float32,
+            prefix=f"{prefix}.gate",
+        )
+        self.gate.e_score_correction_bias = None
+        self.gate.tid2eid = None
+        self.gate.bias_vl = None
+        if layer_idx < config.num_hash_layers:
+            self.gate.tid2eid = nn.Parameter(
+                torch.randint(
+                    0,
+                    config.n_routed_experts,
+                    (config.vocab_size, config.num_experts_per_tok),
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+        elif config.topk_method == "noaux_tc":
+            self.gate.e_score_correction_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+        from afd_plugin.connectors.gpu import async_moe_op  # noqa: F401
 
     def forward(
         self,
@@ -91,6 +152,48 @@ class RemoteDeepseekV4FFN(nn.Module):
             raise ValueError(
                 "DeepSeek-V4 input_ids must be one-dimensional and token-aligned",
             )
+
+        if self.gate is not None:
+            num_tokens = hidden_states.shape[0]
+            if self.tp_size > 1:
+                hidden_states = sequence_parallel_chunk(hidden_states)
+                input_ids = sequence_parallel_chunk(input_ids.unsqueeze(1)).squeeze(1)
+            router_logits, _ = self.gate(hidden_states)
+            topk_weights, topk_ids = native.fused_topk_bias(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=(
+                    self.gate.e_score_correction_bias.data
+                    if self.gate.e_score_correction_bias is not None
+                    else None
+                ),
+                topk=self.top_k,
+                renormalize=self.renormalize,
+                indices_type=torch.int32,
+                input_tokens=input_ids,
+                hash_indices_table=self.gate.tid2eid,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+            if self.tp_size > 1:
+                token_index = (
+                    native.get_tensor_model_parallel_rank() * hidden_states.shape[0]
+                    + torch.arange(hidden_states.shape[0], device=hidden_states.device)
+                )
+                topk_ids = topk_ids.masked_fill(
+                    (token_index >= num_tokens).unsqueeze(1), -1
+                )
+            torch.ops.vllm.afd_async_gpu_dispatch(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                self.layer_idx,
+            )
+            hidden_states = maybe_apply_dbo_yield(hidden_states, role="attention")
+            output = torch.ops.vllm.afd_async_gpu_receive(hidden_states)
+            if self.tp_size > 1:
+                output = tensor_model_parallel_all_gather(output, 0)[:num_tokens]
+            return output
 
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
@@ -122,7 +225,7 @@ class RemoteDeepseekV4FFN(nn.Module):
 
 
 class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
-    """DeepSeek-V4 decoder layer with an FFN-boundary synchronous split."""
+    """DeepSeek-V4 decoder layer with an FFN-boundary role split."""
 
     # Patch reason: native DeepSeek-V4 always constructs Attention and FFN.
     # Patch functionality: allocate only the stage owned by the active AFD role
@@ -160,15 +263,27 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 topk_indices_buffer=topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
             )
-            self.ffn = RemoteDeepseekV4FFN(layer_idx=layer_idx)
+            self.ffn = RemoteDeepseekV4FFN(
+                layer_idx=layer_idx,
+                vllm_config=vllm_config,
+                prefix=f"{prefix}.ffn",
+            )
         elif afd_config.role == "ffn":
             self.attn = native.PPMissingLayer()
-            self.ffn = native.DeepseekV4MoE(
-                vllm_config,
-                prefix=f"{prefix}.ffn",
-                use_sequence_parallel=self.use_sequence_parallel,
-                num_hash_layers=config.num_hash_layers,
-            )
+            expert_factory_scope: AbstractContextManager[None] = nullcontext()
+            if afd_config.connector == AFD_ASYNC_GPU_CONNECTOR:
+                from afd_plugin.model_executor.models.gpu.async_experts import (
+                    use_local_expert_factory,
+                )
+
+                expert_factory_scope = use_local_expert_factory(native)
+            with expert_factory_scope:
+                self.ffn = native.DeepseekV4MoE(
+                    vllm_config,
+                    prefix=f"{prefix}.ffn",
+                    use_sequence_parallel=self.use_sequence_parallel,
+                    num_hash_layers=config.num_hash_layers,
+                )
         else:
             raise ValueError(f"unsupported AFD role {afd_config.role!r}")
         # ### PATCH END
@@ -375,11 +490,25 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         self,
         hidden_states: torch.Tensor,
         *,
-        input_ids: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Execute the complete native V4 MoE, including its native router."""
+        input_ids: torch.Tensor | None = None,
+        group_list: torch.Tensor | None = None,
+        expand_x_shared: torch.Tensor | None = None,
+    ) -> torch.Tensor | AFDF2ATransferPayload:
+        """Execute complete synchronous MoE or pre-dispatched local experts."""
         if not isinstance(self.ffn, native.DeepseekV4MoE):
             raise RuntimeError("DeepSeek-V4 FFN compute is FFN-role only")
+        if group_list is not None:
+            from afd_plugin.model_executor.models.gpu.async_experts import (
+                compute_local_experts,
+            )
+
+            return compute_local_experts(
+                self.ffn.experts.routed_experts,
+                hidden_states=hidden_states,
+                group_list=group_list,
+                shared_experts=self.ffn.shared_experts,
+                expand_x_shared=expand_x_shared,
+            )
         if input_ids is None:
             raise RuntimeError("DeepSeek-V4 FFN compute requires input_ids")
         return self.ffn(hidden_states, input_ids)
@@ -402,11 +531,17 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         self.afd_config = parse_afd_config(vllm_config, validate=False)
         if native.current_platform.device_type != "cuda":
             raise RuntimeError("AFD DeepSeek-V4 supports CUDA only")
-        if self.afd_config.connector != "P2pNcclAFDConnector":
+        if self.afd_config.connector not in (
+            "P2pNcclAFDConnector",
+            AFD_ASYNC_GPU_CONNECTOR,
+        ):
             raise RuntimeError(
                 "AFD DeepSeek-V4 requires the synchronous P2pNcclAFDConnector",
             )
-        if self.afd_config.compute_gate_on_attention:
+        if (
+            self.afd_config.compute_gate_on_attention
+            and self.afd_config.connector != AFD_ASYNC_GPU_CONNECTOR
+        ):
             raise RuntimeError(
                 "AFD DeepSeek-V4 does not support compute_gate_on_attention",
             )
@@ -544,8 +679,16 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         hidden_states: torch.Tensor,
         layer_idx: int,
         *,
-        input_ids: torch.Tensor | None,
-    ) -> torch.Tensor:
+        input_ids: torch.Tensor | None = None,
+        group_list: torch.Tensor | None = None,
+        expand_x_shared: torch.Tensor | None = None,
+    ) -> torch.Tensor | AFDF2ATransferPayload:
+        if group_list is not None:
+            return self.layers[layer_idx].compute_ffn_output(
+                hidden_states,
+                group_list=group_list,
+                expand_x_shared=expand_x_shared,
+            )
         return self.layers[layer_idx].compute_ffn_output(
             hidden_states,
             input_ids=input_ids,
@@ -603,11 +746,12 @@ class AFDDeepseekV4ForCausalLM(native.DeepseekV4ForCausalLM):
         *,
         input_ids: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | AFDF2ATransferPayload:
         return self.model.compute_ffn_output(
             hidden_states,
             layer_idx,
             input_ids=input_ids,
+            **kwargs,
         )
 
     def get_experts_layer_indices(self) -> tuple[int, ...]:
@@ -615,7 +759,11 @@ class AFDDeepseekV4ForCausalLM(native.DeepseekV4ForCausalLM):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return super().load_weights(
-            _iter_role_weights(weights, role=self.afd_role),
+            _iter_role_weights(
+                weights,
+                role=self.afd_role,
+                compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
+            ),
         )
 
 

@@ -35,6 +35,8 @@ from vllm.v1.worker.ubatch_utils import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+from afd_plugin.config import is_afd_async_dp
+
 
 # Patch reason: the native factory excludes DP1, although AFD schedules its two
 # stages locally and sends their complete metadata to the FFN control plane.
@@ -63,19 +65,19 @@ def maybe_build_ubatch_runner(
     # ### PATCH END: permit local DP1 DBO.
 
     logger.info_once("Dual batch overlap is enabled.")
-    # ### PATCH START: bind native DP1 child metadata on this instance.
+    # ### PATCH START: bind local or async child metadata on this instance.
     runner = UBatchRunner(
         vllm_config, device, model_state, attn_groups, kv_cache_config, max_num_reqs
     )
-    if parallel_config.data_parallel_size == 1:
+    if parallel_config.data_parallel_size == 1 or is_afd_async_dp(vllm_config):
         runner._make_forward_contexts = MethodType(_make_forward_contexts, runner)
-    # ### PATCH END: bind native DP1 child metadata on this instance.
+    # ### PATCH END: bind local or async child metadata on this instance.
     return runner
 
 
 # Patch reason: DPMetadata.make asserts DP>1 or SP; AFD DP1 uses neither.
-# Patch functionality: build the same native DPMetadata directly for this DP1
-# runner instance. Native context fields, token counts and SP methods are kept.
+# Patch functionality: build native DPMetadata directly at DP1, or omit it
+# for async connector-driven work. Preserve native child fields and slicing.
 # Signature: matches UBatchRunner._make_forward_contexts at the pinned commit.
 # Upstream: vllm/v1/worker/gpu/ubatch_utils.py, UBatchRunner._make_forward_contexts;
 # 5df63a7203cdb9328d824a27b682e77c7b9928be (vLLM 0.32.0).
@@ -94,6 +96,9 @@ def _make_forward_contexts(
     DP rank alike, so each rank can assume that count for the others too.
     """
     dp_size = self.parallel_config.data_parallel_size
+    # ### PATCH START: identify connector-driven child contexts.
+    async_dp = is_afd_async_dp(self.vllm_config)
+    # ### PATCH END: identify connector-driven child contexts.
     forward_contexts = []
     for i, ubatch_slice in enumerate(ubatch_slices):
         num_tokens = ubatch_slice.num_tokens
@@ -104,9 +109,9 @@ def _make_forward_contexts(
             create_forward_context(
                 attn_metadata[i],
                 self.vllm_config,
-                # ### PATCH START: native metadata without the DP>1 assertion.
-                dp_metadata=DPMetadata(num_tokens_across_dp),
-                # ### PATCH END: native metadata without the DP>1 assertion.
+                # ### PATCH START: local or connector-driven child metadata.
+                dp_metadata=None if async_dp else DPMetadata(num_tokens_across_dp),
+                # ### PATCH END: local or connector-driven child metadata.
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
                 slot_mapping=slot_mappings_by_layer[i],
                 is_padding=is_padding[i],

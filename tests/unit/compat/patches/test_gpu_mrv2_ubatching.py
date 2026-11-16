@@ -147,6 +147,7 @@ def patches():
         "DPMetadata": NativeDPMetadata,
         "model_runner": native_module,
         "logger": SimpleNamespace(info_once=lambda *args: None),
+        "is_afd_async_dp": lambda config: getattr(config, "async_dp", False),
         "torch": SimpleNamespace(
             int32="int32",
             full=lambda shape, value, **kwargs: [value] * shape[0],
@@ -371,3 +372,20 @@ def test_kv_initialization_scopes_dp1_metadata(patches, fail):  # long-test: KV 
             [None, None],
         )
         assert [c.dp_metadata.num_tokens_across_dp_cpu for c in contexts] == [[3], [5]]
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_async_children_omit_dp_coordination_metadata(patches, dp_size):
+    config = SimpleNamespace(parallel_config=_parallel(dp_size=dp_size), async_dp=True)
+    runner = patches.maybe_build_ubatch_runner(config, None, None, [], None, 32)
+    contexts = runner._make_forward_contexts(
+        [SimpleNamespace(num_tokens=3), SimpleNamespace(num_tokens=5)],
+        [{"layer": "first"}, {"layer": "second"}],
+        [{}, {}],
+        [None, None],
+    )
+    assert [context.dp_metadata for context in contexts] == [None, None]
+    assert [context.attn_metadata for context in contexts] == [
+        {"layer": "first"},
+        {"layer": "second"},
+    ]

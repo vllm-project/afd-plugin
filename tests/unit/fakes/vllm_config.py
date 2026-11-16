@@ -360,6 +360,7 @@ def mrv2_vllm_config(
         prefill_context_parallel_size=prefill_context_parallel_size,
         decode_context_parallel_size=1,
         enable_expert_parallel=True,
+        expert_placement_strategy="linear",
         enable_elastic_ep=False,
         enable_eplb=False,
         use_sequence_parallel_moe=False,

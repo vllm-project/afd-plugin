@@ -13,6 +13,12 @@ from afd_plugin.v1.worker.cuda_graph import (
     cudagraph_mode_name,
     graph_run_mode,
     make_ffn_graph_key,
+    pad_counts_to_shape,
+    padded_ffn_graph_buckets,
+    padded_ffn_graph_shape,
+    resolve_padded_ffn_graph_reserve_bytes,
+    select_padded_ffn_bucket,
+    shared_rows_for_bucket,
     validate_cuda_graph_mode,
 )
 
@@ -178,3 +184,71 @@ def test_graph_keys_expand_dp_counts_by_attention_tp(counts, attention, ffn, exp
     assert make_ffn_graph_key(
         {0: metadata}, attention_size=attention, ffn_size=ffn, fallback=32
     ) == ((0, expected),)
+
+
+@pytest.mark.parametrize(
+    "topk, ffn_size, shared, expected",
+    [(2, 2, True, (32, 8)), (8, 3, True, (128, 6)), (2, 2, False, (32, 0))],
+)
+def test_async_ffn_graph_shape_bounds_one_producers_routed_and_shared_rows(
+    topk, ffn_size, shared, expected
+):
+    assert (
+        padded_ffn_graph_shape(
+            num_tokens=16,
+            topk=topk,
+            ffn_size=ffn_size,
+            has_shared_experts=shared,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "fractions", [(), (0,), (-1,), (float("nan"),), (float("inf"),)]
+)
+def test_async_ffn_graph_buckets_reject_invalid_calibration(fractions):
+    with pytest.raises(ValueError, match="multiples"):
+        padded_ffn_graph_buckets(1024, fractions=fractions)
+
+
+def test_async_ffn_graph_bucket_preserves_both_routed_and_shared_capacity():
+    buckets = padded_ffn_graph_buckets(1024, ffn_size=2, fractions=(0.25, 0.5, 1))
+    assert buckets == (128, 256, 512)
+    assert (
+        select_padded_ffn_bucket(
+            buckets,
+            200,
+            20,
+            max_routed=1024,
+            max_shared=64,
+        )
+        == 512
+    )
+    assert shared_rows_for_bucket(512, max_routed=1024, max_shared=64) == 32
+    assert select_padded_ffn_bucket(buckets, 600) is None
+
+
+@pytest.mark.parametrize("ffn_size", [1, 2, 4])
+def test_async_ffn_bucket_fits_balanced_routed_and_shared_experts(ffn_size):
+    # A batch of 128 * ffn_size tokens routes six experts per token. Each FFN
+    # receives 768 routed rows and 128 shared rows under balanced routing.
+    options = dict(max_routed=6144, max_shared=1024 // ffn_size, ffn_size=ffn_size)
+    assert shared_rows_for_bucket(768, **options) == 128
+    assert select_padded_ffn_bucket((768,), 768, 128, **options) == 768
+
+
+def test_async_ffn_graph_padding_keeps_real_expert_assignments():
+    counts = [2, 1, 3]
+    pad_counts_to_shape(counts, padded_rows=10, actual_rows=6)
+    assert counts == [2, 1, 7]
+    with pytest.raises(ValueError, match="do not fit"):
+        pad_counts_to_shape(counts, padded_rows=4, actual_rows=6)
+
+
+@pytest.mark.parametrize("reserve", ["-1", "nan", "inf"])
+def test_async_ffn_graph_memory_reserve_rejects_invalid_sizes(reserve):
+    with pytest.raises(ValueError, match="MEM_RESERVE"):
+        resolve_padded_ffn_graph_reserve_bytes(
+            {"AFD_FFN_GRAPH_MEM_RESERVE_GIB": reserve}
+        )

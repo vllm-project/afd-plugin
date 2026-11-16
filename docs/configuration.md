@@ -30,8 +30,8 @@ ModelRunnerV2; FFN is connector-driven. Send requests only to the Attention API.
 | Field | Default | Meaning and constraint |
 | --- | --- | --- |
 | `role` | `attention` | `attention` or `ffn`. |
-| `connector` | `P2pNcclAFDConnector` | One of the four connectors linked below. |
-| `async_dp` | `false` | Must be `true` for CAM async and `false` for synchronous connectors. |
+| `connector` | `P2pNcclAFDConnector` | One of the connectors linked below. |
+| `async_dp` | `false` | Must be `true` for CAM async or GPU async, and `false` for synchronous connectors. |
 | `host` | `127.0.0.1` | Shared, reachable rendezvous host; placement depends on the connector. |
 | `port` | `1239` | Rendezvous port in `1..65535`, separate from the HTTP service ports. |
 | `afd_process_group_timeout_s` | `120` | Positive rendezvous timeout in seconds; also bounds the NPU native DBO startup barrier, not device-kernel execution. |
@@ -60,6 +60,11 @@ Each guide owns its extra fields, topology rules and launch examples:
   extra config must be empty.
 - [DeepEP M2N](gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#configuration): synchronous CUDA;
   Attention-side routing and FFN TP1.
+- [GPU async](design/async_gpu_cross_node_research.md): experimental CUDA,
+  direct peer writes locally and NVSHMEM RMA remotely. Cross-node use requires
+  the [optional GPU extension](../csrc/gpu/README.md). Requires `async_dp=true`,
+  `compute_gate_on_attention=true`, static EP and FFN TP1.
+  Hardware evidence is limited to H20/DeepSeek-V2-Lite-Chat.
 - [CAMP2P](npu/CAM_P2P_CONNECTOR_USER_GUIDE.md#afd-configuration): synchronous NPU;
   both common and connector-local gate settings must be `false`.
 - [CAM async](npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#afd-configuration): NPU;

@@ -4,6 +4,11 @@ AFD connector implementations are grouped by backend:
 
 - `gpu/`: GPU-only connector implementations.
     - `P2pNcclAFDConnector` is implemented by `afd_plugin.connectors.gpu.p2p`.
+    - `GpuAsyncAFDConnector` is implemented by
+      `afd_plugin.connectors.gpu.async_gpu`: Attention-side routing and
+      connector-driven local FFN work. See its
+      [single-node and cross-node validation](../../docs/design/async_gpu_cross_node_research.md)
+      for the validated H20/DeepSeek-V2-Lite-Chat scope.
     - `DeepEPM2NAFDConnector` is implemented by the
       `afd_plugin.connectors.gpu.deepep_m2n` package:
         - `connector.py`: the connector, its `connector_extra_config` schema,

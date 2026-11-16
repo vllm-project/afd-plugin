@@ -19,6 +19,11 @@ if TYPE_CHECKING:
 
 AFD_ADDITIONAL_CONFIG_KEY: Final[str] = "afd"
 AFD_ASYNC_CONNECTOR: Final[str] = "CAMAsyncAFDConnector"
+AFD_ASYNC_GPU_CONNECTOR: Final[str] = "GpuAsyncAFDConnector"
+AFD_ASYNC_CONNECTORS: Final[tuple[str, ...]] = (
+    AFD_ASYNC_CONNECTOR,
+    AFD_ASYNC_GPU_CONNECTOR,
+)
 CAMP2P_CONNECTOR: Final[str] = "CAMP2pAFDConnector"
 DEEPEP_M2N_CONNECTOR: Final[str] = "DeepEPM2NAFDConnector"
 DEEPEP_M2N_CONNECTORS: Final[tuple[str, ...]] = (DEEPEP_M2N_CONNECTOR,)
@@ -30,6 +35,7 @@ SUPPORTED_AFD_CONNECTORS: Final[tuple[str, ...]] = (
     DEEPEP_M2N_CONNECTOR,
     CAMP2P_CONNECTOR,
     AFD_ASYNC_CONNECTOR,
+    AFD_ASYNC_GPU_CONNECTOR,
 )
 
 _ALIASES: Final[dict[str, str]] = {
@@ -307,7 +313,7 @@ def is_afd_async_dp(vllm_config: VllmConfig) -> bool:
     return (
         config is not None
         and config.async_dp
-        and config.connector == AFD_ASYNC_CONNECTOR
+        and config.connector in AFD_ASYNC_CONNECTORS
     )
 
 
@@ -331,10 +337,17 @@ def validate_afd_config(
             "AFD connector must be one of "
             f"{SUPPORTED_AFD_CONNECTORS!r}, got {config.connector!r}",
         )
-    if config.async_dp and config.connector != AFD_ASYNC_CONNECTOR:
+    if config.async_dp and config.connector not in AFD_ASYNC_CONNECTORS:
         raise ValueError(
-            "AFD async mode requires connector='CAMAsyncAFDConnector'",
+            f"AFD async mode requires connector in {AFD_ASYNC_CONNECTORS!r}",
         )
+    if config.connector == AFD_ASYNC_GPU_CONNECTOR:
+        if not config.async_dp:
+            raise ValueError(f"{AFD_ASYNC_GPU_CONNECTOR} requires async=true")
+        if not config.compute_gate_on_attention:
+            raise ValueError(
+                f"{AFD_ASYNC_GPU_CONNECTOR} requires compute_gate_on_attention=true"
+            )
     if config.connector == "P2pNcclAFDConnector":
         from afd_plugin.distributed import validate_p2p_topology
 
@@ -356,6 +369,8 @@ def validate_afd_config(
 __all__ = [
     "AFDConfig",
     "AFD_ASYNC_CONNECTOR",
+    "AFD_ASYNC_GPU_CONNECTOR",
+    "AFD_ASYNC_CONNECTORS",
     "afd_config_from_mapping",
     "AFD_ADDITIONAL_CONFIG_KEY",
     "AFDRole",

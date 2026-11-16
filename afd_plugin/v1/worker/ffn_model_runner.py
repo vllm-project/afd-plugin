@@ -52,10 +52,9 @@ if TYPE_CHECKING:
 class GPUFFNModelRunner:
     """FFN model runner for AFD GPU execution.
 
-    FFN steps are driven by the connector control plane rather than the vLLM
-    scheduler. GPU only supports control-plane-driven connectors, so the runner
-    asserts ``connector.control_plane is not None`` at construction; connectors
-    without a control plane (``control_plane is None``) are not supported.
+    FFN steps are driven by the connector rather than the vLLM scheduler.
+    This runner handles control-plane steps; ``GPUAsyncFFNModelRunner`` reuses
+    its loading and lifecycle while serving async connector arrivals.
     """
 
     afd_expected_role = "ffn"
@@ -83,8 +82,7 @@ class GPUFFNModelRunner:
             vllm_config,
             self.afd_config,
         )
-        # TODO: Async GPU connector will be supported in the future
-        assert self.connector.control_plane is not None, (
+        assert self.connector.control_plane is not None or self.afd_config.async_dp, (
             "GPU model runner only supports control-plane-driven connectors"
         )
 
