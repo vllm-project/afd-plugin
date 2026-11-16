@@ -114,12 +114,12 @@ def test_peer_receives_once_before_sending_and_owner_consumes_its_result(monkeyp
 
 
 def test_without_dbo_receives_directly_without_inactive_hooks(monkeypatch):
-    monkeypatch.setattr(async_cam, "dbo_enabled", lambda: False)
+    monkeypatch.setattr(async_cam_dbo, "dbo_enabled", lambda: False)
     monkeypatch.setattr(
-        async_cam, "dbo_maybe_run_recv_hook", lambda: pytest.fail("inactive hook")
+        async_cam_dbo, "dbo_maybe_run_recv_hook", lambda: pytest.fail("inactive hook")
     )
     monkeypatch.setattr(
-        async_cam, "dbo_register_recv_hook", lambda _: pytest.fail("inactive hook")
+        async_cam_dbo, "dbo_register_recv_hook", lambda _: pytest.fail("inactive hook")
     )
     calls = []
     value = torch.ones(2, 1)
@@ -139,7 +139,7 @@ def test_without_dbo_receives_directly_without_inactive_hooks(monkeypatch):
 
 
 def test_failed_receive_is_never_resubmitted(monkeypatch):
-    monkeypatch.setattr(async_cam, "dbo_enabled", lambda: False)
+    monkeypatch.setattr(async_cam_dbo, "dbo_enabled", lambda: False)
     calls = []
 
     def fail(**kwargs):
