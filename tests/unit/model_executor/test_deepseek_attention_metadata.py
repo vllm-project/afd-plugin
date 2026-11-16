@@ -11,15 +11,9 @@ pytest.importorskip("vllm_ascend")
 pytest.importorskip("torch_npu")
 
 from torch import Tensor  # noqa: E402
-from vllm_ascend.attention.dsa_v1 import (  # noqa: E402
-    AscendDSAMetadata,
-    AscendDSAMetadataBuilder,
-)
+from vllm_ascend.attention.dsa_v1 import AscendDSAMetadata  # noqa: E402
 from vllm_ascend.attention.mla_v1 import AscendMLAMetadata  # noqa: E402
-from vllm_ascend.attention.sfa_v1 import (  # noqa: E402
-    AscendSFAMetadata,
-    AscendSFAMetadataBuilder,
-)
+from vllm_ascend.attention.sfa_v1 import AscendSFAMetadata  # noqa: E402
 from vllm_ascend.ops import rope_dsv4  # noqa: E402
 from vllm_ascend.ops.rope_dsv4 import RopeDataProxy  # noqa: E402
 
@@ -99,36 +93,6 @@ def test_materializes_sfa_mla_and_dsa_rope_metadata(
     ]
     assert dsa_metadata.req_metadata.cos["layer"].tolist() == [100, 101, 102, 103]
     assert dsa_metadata.req_metadata.sin["layer"].tolist() == [200, 201, 202, 203]
-
-
-def test_isolates_mutable_sfa_and_dsa_builder_inputs():
-    group_len = torch.tensor([1, 2], dtype=torch.int32)
-    group_key_idx = torch.tensor([3, 4], dtype=torch.int32)
-    group_key_cache_idx = torch.tensor([5, 6], dtype=torch.int32)
-    sfa_common_metadata = SimpleNamespace(
-        group_len=group_len,
-        group_key_idx=group_key_idx,
-        group_key_cache_idx=group_key_cache_idx,
-    )
-    deepseek_attention_metadata.isolate_deepseek_attention_builder_inputs(
-        object.__new__(AscendSFAMetadataBuilder),
-        sfa_common_metadata,
-    )
-    sfa_common_metadata.group_len.fill_(9)
-    sfa_common_metadata.group_key_idx.fill_(9)
-    sfa_common_metadata.group_key_cache_idx.fill_(9)
-    assert group_len.tolist() == [1, 2]
-    assert group_key_idx.tolist() == [3, 4]
-    assert group_key_cache_idx.tolist() == [5, 6]
-
-    block_table = torch.arange(6, dtype=torch.int32).reshape(2, 3)
-    dsa_common_metadata = SimpleNamespace(block_table_tensor=block_table)
-    deepseek_attention_metadata.isolate_deepseek_attention_builder_inputs(
-        object.__new__(AscendDSAMetadataBuilder),
-        dsa_common_metadata,
-    )
-    dsa_common_metadata.block_table_tensor.fill_(0)
-    assert block_table.tolist() == [[0, 1, 2], [3, 4, 5]]
 
 
 @pytest.fixture

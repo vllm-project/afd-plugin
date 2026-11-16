@@ -13,10 +13,10 @@ from torch import Tensor  # noqa: E402
 
 pytest.importorskip("vllm")
 
-from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
-from afd_plugin.model_executor.models.npu import (  # noqa: E402
+from afd_plugin.connectors.npu.async_cam_runtime import (  # noqa: E402
     async_cam_layout,
 )
+from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
 from afd_plugin.model_executor.models.npu import (  # noqa: E402
     deepseek_v2_async_cam_forward as schedule,
 )

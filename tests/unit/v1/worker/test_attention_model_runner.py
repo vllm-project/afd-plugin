@@ -20,13 +20,8 @@ from afd_plugin.model_executor.models.forward_context import (
     get_afd_metadata_from_forward_context,
     use_afd_metadata_provider,
 )
-from afd_plugin.v1.worker.attention_metadata import _is_ubatch_child_afd_context
 from afd_plugin.v1.worker.attention_model_runner_v2 import (
     AFDAttentionModelRunnerV2,
-)
-from afd_plugin.v1.worker.ubatch_wrapper import (
-    build_ubatch_additional_kwargs,
-    build_ubatch_afd_metadata,
 )
 from tests.unit.fakes.dp_metadata import dp_tokens as _tokens  # noqa: E402
 
@@ -248,7 +243,8 @@ def test_attention_runner_sends_per_ubatch_dp_metadata():
     ] == [[3], [5]]
 
 
-def test_attention_runner_skips_dp_metadata_send_for_ubatch_child_context():
+@pytest.fixture
+def mrv2_child_context():
     runner = object.__new__(AFDAttentionModelRunnerV2)
     runner.afd_config = AFDConfig(role="attention")
     runner.vllm_config = SimpleNamespace(
@@ -260,68 +256,37 @@ def test_attention_runner_skips_dp_metadata_send_for_ubatch_child_context():
     runner._afd_transaction_counter = 0
     runner._afd_pending_metadata = None
 
-    parent = runner.build_afd_metadata(
-        [_UbatchSlice(0, 3, 0, 1), _UbatchSlice(3, 8, 1, 2)],
-        8,
-    )
-    child = build_ubatch_afd_metadata(
-        parent,
-        [_UbatchSlice(0, 3, 0, 1), _UbatchSlice(3, 8, 1, 2)],
-        1,
-    )
-    forward_context = ForwardContext(
-        no_compile_layers={},
-        attn_metadata={},
-        slot_mapping={},
-        additional_kwargs={"afd_metadata": child},
-        dp_metadata=_dp_metadata([5]),
-        ubatch_slices=None,
-        batch_descriptor=BatchDescriptor(num_tokens=5),
-        cudagraph_runtime_mode=CUDAGraphMode.NONE,
-    )
+    slices = [_UbatchSlice(0, 3, 0, 1), _UbatchSlice(3, 8, 1, 2)]
+    contexts = [
+        ForwardContext(
+            no_compile_layers={},
+            attn_metadata={},
+            slot_mapping={},
+            additional_kwargs={},
+            dp_metadata=_dp_metadata([stage.num_tokens]),
+            ubatch_slices=None,
+            batch_descriptor=BatchDescriptor(num_tokens=stage.num_tokens),
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        )
+        for stage in slices
+    ]
+    runner.install_mrv2_ubatch_metadata(slices, contexts, 8)
+    # Exercise child-context detection independently of parent send suppression.
+    runner._afd_suppress_metadata_send = False
+    return runner, contexts[1]
 
-    assert _is_ubatch_child_afd_context(forward_context, child)
+
+def test_attention_runner_skips_dp_metadata_send_for_ubatch_child_context(
+    mrv2_child_context,
+):
+    runner, forward_context = mrv2_child_context
+    child = forward_context.additional_kwargs["afd_metadata"]
 
     runner.install_afd_metadata_on_forward_context(forward_context)
 
     assert forward_context.additional_kwargs["afd_metadata"] is child
     assert runner.connector.dp_metadata_updates == []
     assert runner.connector.sent_dp_metadata_lists == []
-
-
-def test_ubatch_metadata_clones_parent_and_preserves_additional_kwargs():
-    runner = object.__new__(AFDAttentionModelRunnerV2)
-    runner.connector = object()
-    runner._afd_transaction_counter = 0
-    parent = runner.build_afd_metadata(
-        [_UbatchSlice(0, 3, 0, 1), _UbatchSlice(3, 8, 1, 2)],
-        8,
-    )
-    parent.tokens_unpadded_lens = [3, 4]
-
-    first = build_ubatch_afd_metadata(
-        parent, [_UbatchSlice(0, 3, 0, 1), _UbatchSlice(3, 8, 1, 2)], 0
-    )
-    second = build_ubatch_afd_metadata(
-        parent, [_UbatchSlice(0, 3, 0, 1), _UbatchSlice(3, 8, 1, 2)], 1
-    )
-    child_kwargs = build_ubatch_additional_kwargs(
-        {"platform_key": "platform_value", "afd_metadata": parent},
-        second,
-    )
-
-    assert first is not parent
-    assert second is not parent
-    assert first is not second
-    assert first.stage_idx == 0
-    assert first.tokens_lens == [3]
-    assert second.stage_idx == 1
-    assert second.tokens_start_loc == [3]
-    assert second.requests_start_loc == [1]
-    assert second.tokens_lens == [5]
-    assert second.tokens_unpadded_lens == [4]
-    assert child_kwargs["platform_key"] == "platform_value"
-    assert child_kwargs["afd_metadata"] is second
 
 
 def test_mrv2_missing_parent_metadata_uses_complete_public_installer():

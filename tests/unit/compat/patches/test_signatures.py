@@ -371,7 +371,7 @@ def test_patch_preserves_upstream_signature(
     elif scope_name in {"npu-draft-capture", "npu-draft-replay"}:
         from vllm.config import CUDAGraphMode
 
-        from afd_plugin.v1.worker.npu import dspark_graph as adapter
+        from afd_plugin.v1.worker.npu import dspark_speculator as adapter
 
         if scope_name == "npu-draft-capture":
             runner = SimpleNamespace(
@@ -383,11 +383,11 @@ def test_patch_preserves_upstream_signature(
                 _capture_descs={CUDAGraphMode.FULL: []},
                 _max_full_descs_to_capture=None,
             )
-            scope = adapter.use_afd_draft_capture(runner, manager)
+            scope = adapter._use_afd_draft_capture(runner, manager)
         else:
             native_class = getattr(target, owner)
             binding = native_class.__new__(native_class)
-            scope = adapter.use_afd_draft_replay(SimpleNamespace(), binding, 1)
+            scope = adapter._use_afd_draft_replay(SimpleNamespace(), binding, 1)
     elif scope_name == "camp2p-dispatch":
         from afd_plugin.v1.worker.npu import attention_model_runner_v2 as adapter
 

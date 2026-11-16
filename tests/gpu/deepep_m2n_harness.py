@@ -42,6 +42,7 @@ from tests.unit.fakes.vllm_config import (
     M2NTopology,
     m2n_vllm_config,
 )
+from tests.unit.fakes.weights import quantize_fp8_block128
 
 INPUT_SEED_STRIDE = 1_000_003
 WEIGHT_SEED_OFFSET = 7_777
@@ -577,7 +578,6 @@ def local_weights(experts: range, payload_format: str) -> tuple[Any, Any, Any]:
     """
     from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (
         dequantize_fp8_block128,
-        quantize_fp8_block128,
     )
     from afd_plugin.connectors.metadata import LocalExpertWeights
 

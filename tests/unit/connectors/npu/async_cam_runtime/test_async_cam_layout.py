@@ -9,7 +9,7 @@ torch = pytest.importorskip("torch")
 
 pytest.importorskip("vllm")
 
-from afd_plugin.model_executor.models.npu import async_cam_layout  # noqa: E402
+from afd_plugin.connectors.npu.async_cam_runtime import async_cam_layout  # noqa: E402
 
 
 def test_plain_tp_cam_boundary_shards_and_restores_replicated_tokens(monkeypatch):

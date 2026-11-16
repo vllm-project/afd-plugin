@@ -22,6 +22,9 @@ import pytest
 
 from afd_plugin.compat.npu import feature_validation
 from afd_plugin.config import CAMP2P_CONNECTOR
+from tests.unit.fakes.stub_modules import (
+    drop_stub_bound_modules as _drop_stub_bound_modules,
+)
 
 _DSV4 = "deepseek_v4"
 
@@ -123,17 +126,83 @@ def test_gate_on_ffn_keeps_its_previous_behaviour(extra_info):
 
 
 def _real_extra_info():
-    """The connector's own type; importing it needs vLLM.
+    """Return the real ``CAMP2PExtraInfo`` with only its imports stubbed.
 
-    ``camp2p`` pulls ``vllm.forward_context`` at module scope, so the real
-    class is only reachable where vLLM is installed. The validator cases
-    above use a stand-in and run everywhere; these two cover the class
-    itself and skip on a bare CPU host.
+    ``camp2p`` pulls ``vllm`` at module scope, so a bare CPU host cannot import
+    it. Stubbing the couple of runtime modules it touches keeps the class under
+    test -- the parsing and the validation -- instead of skipping the cases that
+    pin the connector-level contract.
     """
 
+    # The class lives in a module that imports torch unconditionally; the gate
+    # tests above run without it, so these two keep skipping on a torch-less host.
     pytest.importorskip("torch")
-    pytest.importorskip("vllm")
-    from afd_plugin.connectors.npu.camp2p import CAMP2PExtraInfo
+
+    import sys
+    import types
+
+    stubs = {}
+
+    def module(name, package=False, **attrs):
+        stub = types.ModuleType(name)
+        if package:
+            stub.__path__ = []
+        for key, value in attrs.items():
+            setattr(stub, key, value)
+        stubs[name] = stub
+        return stub
+
+    def missing(name):
+        try:
+            __import__(name)
+        except ImportError:
+            return True
+        return False
+
+    if missing("vllm.forward_context"):
+        vllm = module("vllm", package=True)
+        module(
+            "vllm.forward_context",
+            DPMetadata=type("DPMetadata", (), {}),
+            get_forward_context=lambda: None,
+        )
+        module(
+            "vllm.logger",
+            init_logger=lambda *args: __import__("logging").getLogger("vllm"),
+        )
+        module("vllm.utils", package=True)
+        module(
+            "vllm.utils.torch_utils",
+            direct_register_custom_op=lambda **kwargs: None,
+            is_torch_equal_or_newer=lambda *args: True,
+        )
+        module("vllm.distributed", package=True)
+        module("vllm.distributed.parallel_state")
+        vllm.forward_context = stubs["vllm.forward_context"]
+        vllm.logger = stubs["vllm.logger"]
+        vllm.utils = stubs["vllm.utils"]
+        vllm.distributed = stubs["vllm.distributed"]
+
+    stub_objects = {
+        id(value) for stub in stubs.values() for value in vars(stub).values()
+    }
+    saved = {name: sys.modules.get(name) for name in stubs}
+    before = set(sys.modules)
+    sys.modules.update(stubs)
+    try:
+        from afd_plugin.connectors.npu.camp2p import CAMP2PExtraInfo
+    finally:
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+        # A module imported under the stubs keeps the stub callables alive -- the
+        # connector is one, but so is everything else the connector pulled in
+        # (``afd_plugin.connectors.metadata`` holds ``DPMetadata``), and the
+        # parent package keeps the child as an attribute. Drop both (the leak
+        # #568 describes).
+        _drop_stub_bound_modules(before, stub_objects)
 
     return CAMP2PExtraInfo
 

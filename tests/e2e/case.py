@@ -186,6 +186,11 @@ class Mrv2Check:
 
 
 @dataclass(frozen=True)
+class PullMegaCheck:
+    roles: tuple[str, ...] = (ATTENTION_ROLE, FFN_ROLE)
+
+
+@dataclass(frozen=True)
 class HashInputCheck:
     roles: tuple[str, ...] = (ATTENTION_ROLE, FFN_ROLE)
     graph: bool = False
@@ -197,7 +202,7 @@ class HashInputCheck:
 class Phase:
     name: str
     task: Task
-    checks: tuple[Mrv2Check | HashInputCheck, ...] = ()
+    checks: tuple[Mrv2Check | HashInputCheck | PullMegaCheck, ...] = ()
 
 
 @dataclass(frozen=True)

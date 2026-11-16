@@ -30,6 +30,7 @@ from tests.e2e.case import (
     HashInputCheck,
     Mrv2Check,
     Phase,
+    PullMegaCheck,
     Role,
 )
 from tests.e2e.models.deepseek_v4_flash import config, gpu_config
@@ -37,7 +38,10 @@ from tests.e2e.models.deepseek_v4_flash.completions import CompletionTask
 
 GPU_BASIC_IDS = gpu_config.DSV4_GPU_BASIC_SCENARIOS
 GPU_DBO_IDS = gpu_config.DSV4_GPU_DBO_SCENARIOS
-NPU_ASYNC_IDS = (config.DSV4_ASYNC_CAM_SCENARIO,)
+NPU_ASYNC_IDS = (
+    config.DSV4_ASYNC_CAM_SCENARIO,
+    config.DSV4_ASYNC_CAM_MEGA_SCENARIO,
+)
 NPU_SYNC_IDS = config.DSV4_SYNC_CAMP2P_SCENARIOS
 GSM8K_SAMPLES = 7
 GSM8K_THRESHOLD = 0.27
@@ -165,6 +169,7 @@ def _gpu_case(case_id: str, environment: CaseEnvironment) -> Case:
 
 
 def _npu_case(case_id: str, environment: CaseEnvironment) -> Case:
+    mega = case_id == config.DSV4_ASYNC_CAM_MEGA_SCENARIO
     asynchronous = case_id in NPU_ASYNC_IDS
     shape = None if asynchronous else config.DSV4_SYNC_SHAPES[case_id]
     args = _profile_arguments(case_id, environment)
@@ -184,6 +189,17 @@ def _npu_case(case_id: str, environment: CaseEnvironment) -> Case:
         # The existing async path enables native DBO only on Attention, using
         # upstream defaults; it does not claim a DBO execution acceptance check.
         args.attention_vllm_arg.remove("--enable-dbo")
+    connector_extra_config = (
+        json.loads(args.afd_connector_extra_config[0])
+        if args.afd_connector_extra_config
+        else {}
+    )
+    checks: tuple[Mrv2Check | PullMegaCheck, ...] = ()
+    if mega:
+        connector_extra_config["ffn_mega_moe"] = True
+        checks = (PullMegaCheck(),)
+    elif graph:
+        checks = (Mrv2Check(("attention", "ffn"), graph=True),)
     compilation = None if shape is None else config.sync_compilation_config(shape)
     return Case(
         id=case_id,
@@ -214,16 +230,10 @@ def _npu_case(case_id: str, environment: CaseEnvironment) -> Case:
             ),
             connector=args.afd_connector,
             compute_gate_on_attention=args.compute_gate_on_attention,
-            connector_extra_config=tuple(
-                (
-                    json.loads(args.afd_connector_extra_config[0])
-                    if args.afd_connector_extra_config
-                    else {}
-                ).items()
-            ),
+            connector_extra_config=tuple(connector_extra_config.items()),
             pin_attention_address=args.attention_data_parallel_address is not None,
             cleanup_profile=CLEANUP_PROFILE_NPU_ASYNC_CAM_LEGACY
-            if asynchronous
+            if asynchronous and not mega
             else CLEANUP_PROFILE_STRICT,
             shutdown_timeout_s=NPU_ASYNC_VLLM_SHUTDOWN_TIMEOUT_S
             if asynchronous
@@ -253,7 +263,7 @@ def _npu_case(case_id: str, environment: CaseEnvironment) -> Case:
                 CompletionTask(
                     check_answer=True if shape is None else shape.check_answer
                 ),
-                (Mrv2Check(("attention", "ffn"), graph=True),) if graph else (),
+                checks,
             ),
         ),
     )

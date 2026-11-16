@@ -23,7 +23,9 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
-    from afd_plugin.model_executor.npu.async_cam_layered import LayeredFFNWeights
+    from afd_plugin.connectors.npu.async_cam_runtime.async_cam_layered import (
+        LayeredFFNWeights,
+    )
 
 
 class RoutedWeightOwner(Protocol):
