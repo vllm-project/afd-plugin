@@ -150,11 +150,6 @@ def _mla_dbo(cudagraph_mode, **model_fields):
             id="four-ubatches",
         ),
         pytest.param(
-            _config_with(extra_config={"compute_gate_on_attention": True}),
-            "compute_gate_on_attention",
-            id="gate-on-attention",
-        ),
-        pytest.param(
             _config_with(extra_config={"quant_mode": 1}), "quant_mode=0", id="quant"
         ),
         pytest.param(
@@ -190,9 +185,11 @@ def _mla_dbo(cudagraph_mode, **model_fields):
             "async=true",
             id="async-off",
         ),
+        # Since #545 Async CAM Attention accepts FULL; the native backend resolves
+        # it to FULL_DECODE_ONLY, so this shape is valid rather than rejected.
         pytest.param(
             _config_with(model={"enforce_eager": False}, **ASYNC_CAM),
-            "FULL_DECODE_ONLY",
+            None,
             id="async-graph",
         ),
         pytest.param(

@@ -11,8 +11,21 @@ import time
 import urllib.request
 from pathlib import Path
 
-from tests.e2e.case import Case, CaseEnvironment, HashInputCheck, Mrv2Check, Phase, Role
+from tests.e2e.case import (
+    Case,
+    CaseEnvironment,
+    HashInputCheck,
+    Mrv2Check,
+    Phase,
+    PullMegaCheck,
+    Role,
+)
 from tests.e2e.deployment import ServiceDeployment
+from tests.e2e.process_utils import (
+    close_process_identities,
+    find_processes_matching_environment,
+    kill_processes_matching_environment,
+)
 
 MRV2_EVIDENCE_RPC_TIMEOUT_S = 30
 MRV2_EVIDENCE_REPLAY_MIN_COUNT = 2
@@ -20,11 +33,26 @@ PROCESS_POLL_INTERVAL_S = 0.2
 DBO_NUM_STAGES = 2
 
 
+def uses_pull_mega(case: Case) -> bool:
+    return any(
+        isinstance(check, PullMegaCheck)
+        for phase in case.phases
+        for check in phase.checks
+    )
+
+
+def probe_extension(case: Case) -> str:
+    if uses_pull_mega(case):
+        return "tests.e2e.models.deepseek_v4_flash.pull_mega_evidence.Worker"
+    return "tests.e2e.mrv2_evidence.Worker"
+
+
 class Mrv2Session:
     """One shared probe per deployment, with independent immutable snapshots."""
 
     def __init__(self, case: Case, environment: CaseEnvironment, run_id: str) -> None:
         self.case = case
+        self.pull_mega = uses_pull_mega(case)
         self.environment = environment
         self.run_id = run_id
         self.directory: tempfile.TemporaryDirectory[str] | None = None
@@ -33,21 +61,35 @@ class Mrv2Session:
             str, dict[tuple[int, int, int, int], set[tuple[int, ...]]]
         ] = {}
         layouts = dict(case.deployment.roles)
-        for phase in case.phases:
-            for check in phase.checks:
-                if not check.roles:
-                    raise ValueError("MRV2 check requires at least one role")
-                for role in check.roles:
-                    if role not in layouts:
-                        raise ValueError(f"MRV2 requests absent role {role}")
-                    if check.graph and not layouts[role].uses_graph:
-                        raise ValueError(
-                            f"graph evidence requested for eager role {role}"
-                        )
-                    if check.dbo and case.deployment.dbo_for_role(role) is None:
-                        raise ValueError(
-                            f"DBO evidence requested for non-DBO role {role}"
-                        )
+        checks = [check for phase in case.phases for check in phase.checks]
+        only_pull_mega = all(isinstance(check, PullMegaCheck) for check in checks)
+        for check in checks:
+            if isinstance(check, PullMegaCheck):
+                profile = case.deployment
+                if (
+                    check.roles != ("attention", "ffn")
+                    or profile.backend != "npu"
+                    or profile.connector != "CAMAsyncAFDConnector"
+                    or dict(profile.connector_extra_config).get("ffn_mega_moe")
+                    is not True
+                    or profile.cleanup_profile != "strict"
+                    or any(role.uses_graph for _, role in profile.roles)
+                    or not only_pull_mega
+                ):
+                    raise ValueError(
+                        "Pull Mega evidence requires eager NPU CAM Mega ON "
+                        "with strict cleanup"
+                    )
+                continue
+            if not check.roles:
+                raise ValueError("MRV2 check requires at least one role")
+            for role in check.roles:
+                if role not in layouts:
+                    raise ValueError(f"MRV2 requests absent role {role}")
+                if check.graph and not layouts[role].uses_graph:
+                    raise ValueError(f"graph evidence requested for eager role {role}")
+                if check.dbo and case.deployment.dbo_for_role(role) is None:
+                    raise ValueError(f"DBO evidence requested for non-DBO role {role}")
 
     def prepare(self) -> None:
         if any(phase.checks for phase in self.case.phases):
@@ -58,7 +100,7 @@ class Mrv2Session:
     def arguments(self) -> tuple[str, ...]:
         if self.start_marker is None:
             return ()
-        return ("--worker-extension-cls", "tests.e2e.mrv2_evidence.Worker")
+        return ("--worker-extension-cls", probe_extension(self.case))
 
     @property
     def worker_environment(self) -> dict[str, str]:
@@ -163,7 +205,21 @@ class Mrv2Session:
             + "\n"
         )
         for check in phase.checks:
-            if isinstance(check, Mrv2Check):
+            if isinstance(check, PullMegaCheck):
+                for role, dp, tp in expected:
+                    if not any(
+                        recorded_role == role
+                        and f"dp_rank={dp} tp_rank={tp} " in line
+                        and re.search(
+                            r"pull_mega=1 native_completed=[1-9][0-9]*(?: |$)", line
+                        )
+                        for recorded_role, line in snapshot
+                    ):
+                        raise RuntimeError(
+                            f"{role} rank {(dp, tp)} lacks live "
+                            "Pull native Mega evidence"
+                        )
+            elif isinstance(check, Mrv2Check):
                 assert_execution_evidence(
                     list(snapshot),
                     check,
@@ -192,6 +248,24 @@ class Mrv2Session:
     def close(self) -> None:
         if self.directory is not None:
             self.directory.cleanup()
+        if not self.pull_mega:
+            return
+        owned_environment = {"AFD_E2E_RUN_ID": self.run_id}
+        survivors = find_processes_matching_environment(owned_environment)
+        try:
+            orphan_pids = [process.pid for process in survivors]
+        finally:
+            close_process_identities(survivors)
+        errors = []
+        if orphan_pids:
+            errors = kill_processes_matching_environment(
+                owned_environment,
+                timeout_s=self.case.deployment.termination_timeout_s,
+                poll_interval_s=PROCESS_POLL_INTERVAL_S,
+                process_name="Pull Mega orphan",
+            )
+        if orphan_pids:
+            raise RuntimeError(f"Pull Mega orphan processes: {orphan_pids}; {errors}")
 
 
 def assert_execution_evidence(

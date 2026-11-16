@@ -129,23 +129,6 @@ def silu_mul_fp8_quant(
     return y_q, y_s
 
 
-def quantize_fp8_block128(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """``[E, N, K]`` weights -> FP8 and fp32 per-128x128-block scales.
-
-    Same layout as vLLM's block-FP8 ``FusedMoE`` weights (``w13_weight`` /
-    ``w13_weight_scale_inv``), so real checkpoints can be passed through as is.
-    """
-    num_experts, n, k = w.shape
-    if n % GROUP_SIZE or k % GROUP_SIZE:
-        raise ValueError(f"weight shape {tuple(w.shape)} is not 128-block aligned")
-    blocks = w.float().view(
-        num_experts, n // GROUP_SIZE, GROUP_SIZE, k // GROUP_SIZE, GROUP_SIZE
-    )
-    scale = blocks.abs().amax(dim=(2, 4)).clamp(min=EPS) / FP8_MAX
-    w_q = (blocks / scale[:, :, None, :, None]).clamp(FP8_MIN, FP8_MAX).to(FP8_DTYPE)
-    return w_q.view(num_experts, n, k), scale
-
-
 def dequantize_fp8_block128(w_q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     num_experts, n, k = w_q.shape
     blocks = w_q.float().view(

@@ -15,8 +15,8 @@ server, and run outside CI.
 - Hopper (SM90) or newer GPUs on one node. Every case needs at most 4 GPUs;
   cases that need more GPUs than are visible skip, and every case skips below
   SM90.
-- vLLM with the plugin installed, afdEP-comm (the `afdep` extra), and DeepGEMM
-  with the elfutils headers. See
+- vLLM with the plugin installed and afdEP-comm (the `afdep` extra).
+  DeepGEMM is the copy bundled in the vLLM wheel. See
   [Installation](../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation)
   in the connector guide.
 - The full suite has 23 cases (two of them need no GPU). DeepEP and DeepGEMM

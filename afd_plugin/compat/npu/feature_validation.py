@@ -214,7 +214,10 @@ def _fail_if_unsupported_npu_afd_async_features(
     afd_config: AFDConfig,
     extra_info: ConnectorExtraInfo,
 ) -> None:
-    from afd_plugin.connectors.npu.async_cam import AFDAsyncExtraInfo
+    from afd_plugin.connectors.npu.async_cam import (
+        ATTN_RANKS_PER_DP_CONFIG_KEY,
+        AFDAsyncExtraInfo,
+    )
 
     if not isinstance(extra_info, AFDAsyncExtraInfo):
         raise TypeError(
@@ -336,7 +339,7 @@ def _fail_if_unsupported_npu_afd_async_features(
         ):
             raise RuntimeError(
                 "AFD NPU ModelRunnerV2 Async CAM requires max_num_batched_tokens "
-                "divisible by attn_ranks_per_dp",
+                f"divisible by {ATTN_RANKS_PER_DP_CONFIG_KEY}",
             )
         additional_config = vllm_config.additional_config
         if additional_config.get("enable_shared_expert_dp", False) or any(
@@ -360,7 +363,10 @@ def _validate_cam_world_topology(
     extra_info: ConnectorExtraInfo,
 ) -> None:
     """Require each role's local layout to fill the one CAM world."""
-    from afd_plugin.connectors.npu.async_cam import AFDAsyncExtraInfo
+    from afd_plugin.connectors.npu.async_cam import (
+        ATTN_RANKS_PER_DP_CONFIG_KEY,
+        AFDAsyncExtraInfo,
+    )
 
     if not isinstance(extra_info, AFDAsyncExtraInfo):
         return
@@ -370,7 +376,7 @@ def _validate_cam_world_topology(
         if int(parallel_config.tensor_parallel_size) != attn_ranks_per_dp:
             raise RuntimeError(
                 "CAMAsyncAFDConnector Attention tensor_parallel_size must equal "
-                "attn_ranks_per_dp",
+                f"{ATTN_RANKS_PER_DP_CONFIG_KEY}",
             )
         local_world_size = int(parallel_config.data_parallel_size) * attn_ranks_per_dp
         expected_world_size = afd_config.num_attention_ranks

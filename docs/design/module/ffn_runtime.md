@@ -15,6 +15,8 @@ primary_code_paths:
   - "afd_plugin/v1/worker/npu/async_ffn_model_runner.py"
   - "afd_plugin/v1/worker/npu/ffn_worker.py"
 related_code_paths:
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_layered.py"
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_mega.py"
   - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_startup.py"
   - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_session.py"
   - "afd_plugin/connectors/**"
@@ -28,7 +30,7 @@ depends_on:
   - "compatibility_and_patches.md"
 validation_paths:
   - "tests/unit/ffn_faas/test_*.py"
-  - "tests/unit/model_executor/test_async_cam_layered.py"
+  - "tests/unit/connectors/npu/async_cam_runtime/test_async_cam_layered.py"
   - "tests/npu/test_async_cam_layered_w8a8.py"
   - "tests/unit/v1/worker/test_ffn_metadata.py"
   - "tests/unit/v1/worker/test_ffn_model_runner.py"
@@ -94,6 +96,10 @@ retain the connector. The FFN runner continues to own eager/FULL execution,
 graph references and completion; the worker still owns the receiver thread.
 The current Mega executor reads the same live window through the connector's
 read-only `comm_args` property.
+
+Async CAM-specific layered and Mega executors live alongside startup and
+Push/Pull sessions in `connectors/npu/async_cam_runtime/`. Model adapters
+provide layer weights; the runner drives these executors and owns graph state.
 
 ## Runtime selection
 

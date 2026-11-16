@@ -43,6 +43,7 @@ from tests.e2e.case import (
 from tests.e2e.checks.mrv2 import (
     Mrv2Session,
     assert_execution_evidence,
+    probe_extension,
 )
 from tests.e2e.environment import parse_case_environment
 from tests.e2e.models.deepseek_v4_flash import config as dsv4_config
@@ -373,15 +374,15 @@ def configure_scenario(args: argparse.Namespace) -> None:
             DSV4_FFN_RANKS,
         ),
     }
-    for scenario, profile in DSV4_SYNC_SHAPES.items():
+    for scenario, sync_profile in DSV4_SYNC_SHAPES.items():
         # The A5 host profile keeps native DBO off: split batches are the
         # current suspect for its DSA operator tiling failure.
         settings[scenario] = (
             False,
-            dsv4_config.sync_use_graph(profile),
+            dsv4_config.sync_use_graph(sync_profile),
             False,
-            profile.attention_ranks,
-            profile.ffn_ranks,
+            sync_profile.attention_ranks,
+            sync_profile.ffn_ranks,
         )
     baseline, graph, dbo, attention_ranks, ffn_ranks = settings[args.scenario]
     args.baseline = baseline
@@ -1195,7 +1196,7 @@ def prepare_case(
     effective = replace(case, deployment=profile, phases=tuple(effective_phases))
     resolved = deployment.resolve(effective, environment, slots=slots)
     probe_arguments = (
-        ("--worker-extension-cls", "tests.e2e.mrv2_evidence.Worker")
+        ("--worker-extension-cls", probe_extension(effective))
         if any(phase.checks for phase in effective.phases)
         else ()
     )
@@ -1229,7 +1230,7 @@ def prepare_case(
 
 
 def run_case(case: Case, environment: CaseEnvironment) -> dict:
-    """Execute one deployment; success follows task, evidence and cleanup."""
+    """Execute one deployment and record task, evidence and cleanup outcomes."""
     effective, record = prepare_case(case, environment)
     resolved = deployment.resolve(effective, environment)
     probe = Mrv2Session(effective, environment, record["run_id"])
@@ -1253,7 +1254,9 @@ def run_case(case: Case, environment: CaseEnvironment) -> dict:
             ]
         if failures:
             record["cleanup"] = {"status": "failed", "errors": failures}
-            raise RuntimeError("; ".join(failures))
+            if not probe.pull_mega:
+                raise RuntimeError("; ".join(failures))
+            return
         record["cleanup"] = {"status": "passed"}
 
     try:

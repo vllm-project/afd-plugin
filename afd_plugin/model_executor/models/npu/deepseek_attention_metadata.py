@@ -7,46 +7,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import torch
-from vllm.v1.attention.backend import AttentionMetadata, AttentionMetadataBuilder
-from vllm_ascend.attention.dsa_v1 import (
-    AscendDSAMetadata,
-    AscendDSAMetadataBuilder,
-)
+from vllm.v1.attention.backend import AttentionMetadata
+from vllm_ascend.attention.dsa_v1 import AscendDSAMetadata
 from vllm_ascend.attention.mla_v1 import AscendMLAMetadata
-from vllm_ascend.attention.sfa_v1 import (
-    AscendSFAMetadata,
-    AscendSFAMetadataBuilder,
-)
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+from vllm_ascend.attention.sfa_v1 import AscendSFAMetadata
 from vllm_ascend.ops.rope_dsv4 import RopeDataProxy, get_cos_and_sin_dsa
-
-
-def isolate_deepseek_attention_builder_inputs(
-    builder: AttentionMetadataBuilder,
-    metadata: AscendCommonAttentionMetadata,
-) -> None:
-    """Detach common metadata that a DeepSeek builder mutates in place.
-
-    Async CAM builds the full batch before both execution stages.  Stage
-    builders therefore must not write through views into the full-batch
-    common metadata.  The copies below are deliberately backend-specific;
-    the remaining common metadata fields are read-only builder inputs and
-    retain their zero-copy views.
-    """
-
-    if isinstance(builder, AscendSFAMetadataBuilder):
-        # SFA C8 reshape writes all three arrays through
-        # store_kv_block_metadata().
-        if metadata.group_len is not None:
-            metadata.group_len = metadata.group_len.clone()
-        if metadata.group_key_idx is not None:
-            metadata.group_key_idx = metadata.group_key_idx.clone()
-        if metadata.group_key_cache_idx is not None:
-            metadata.group_key_cache_idx = metadata.group_key_cache_idx.clone()
-    elif isinstance(builder, AscendDSAMetadataBuilder):
-        # DSA clears padded request rows while building prefill/decode
-        # metadata.  Keep those writes local to this stage and cache group.
-        metadata.block_table_tensor = metadata.block_table_tensor.clone()
 
 
 def materialize_deepseek_attention_metadata(
@@ -181,7 +146,6 @@ def materialize_deepseek_attention_metadata_by_layer(
 
 
 __all__ = [
-    "isolate_deepseek_attention_builder_inputs",
     "materialize_deepseek_attention_metadata",
     "materialize_deepseek_attention_metadata_by_layer",
 ]

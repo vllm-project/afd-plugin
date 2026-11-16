@@ -13,8 +13,8 @@ AFD connector implementations are grouped by backend:
           plan.
         - `experts.py`: FFN expert execution with the `deepgemm` or
           `fused_experts` backend.
-        - `deepgemm.py`: the DeepGEMM grouped GEMMs, imported from the
-          installed `deep_gemm` package.
+        - `deepgemm.py`: the DeepGEMM grouped GEMMs, imported from the copy
+          bundled in vLLM (`vllm.third_party.deep_gemm`).
         - `fp8_quant.py`: the fused SiLU, top-k weight and FP8 block-128
           requantization step between the two FP8 expert GEMMs.
 - `npu/`: NPU-only connector implementations. `CAMP2pAFDConnector` is implemented
