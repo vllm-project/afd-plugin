@@ -198,9 +198,7 @@ def runtime(monkeypatch):
     stub(
         "vllm_ascend.ops.rope_dsv4", RopeDataProxy=_RopeProxy, get_cos_and_sin_dsa=_rope
     )
-    load_host_module(
-        monkeypatch, "afd_plugin.model_executor.models.npu.deepseek_attention_metadata"
-    )
+    load_host_module(monkeypatch, "afd_plugin.v1.worker.npu.attention_metadata")
     module = load_host_module(monkeypatch, "afd_plugin.v1.worker.npu.ubatch_runner")
     return module
 

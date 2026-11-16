@@ -54,6 +54,13 @@ def install_observers() -> type:
                 if active == window and not emitted:
                     completed += 1
 
+    def observe_native(active: str, valid: bool) -> None:
+        nonlocal completed
+        if valid and active:
+            with lock:
+                if active == window and not emitted:
+                    completed += 1
+
     def report(worker) -> None:
         nonlocal emitted
         connector = worker.model_runner.connector
@@ -100,8 +107,7 @@ def install_observers() -> type:
         if active:
             torch.npu.current_stream().synchronize()
             header = self.batch_info.cpu().tolist()
-            observe(
-                self.connector,
+            observe_native(
                 active,
                 self.op is torch.ops.afd_ascend.afd_mega_moe_pull_native
                 and header[0] > 0

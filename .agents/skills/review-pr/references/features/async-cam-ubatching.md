@@ -25,7 +25,7 @@ Designs: `docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md`,
   `w13_scale_bias`/`w2_scale_bias` are required for W4A8; W8A8 uses INT8 NZ
   tensors with a single shared zero bias; `swiglu_limit` is applied in both
   eager and FULL while W8A8 keeps its unclipped computation.
-- Keep `AsyncCAMLayeredExecutor` and `LayeredFFNWeights` pure about device
+- Keep `AsyncCAMLayeredExecutor` and `QuantizedExpertWeights` pure about device
   side effects where the design says so: planning (`async_cam_layout.py`) is
   host-side and testable on CPU, device execution belongs to the executor.
 - Prove state-machine safety: `AFDAsyncTransferState`, async FFN work items,

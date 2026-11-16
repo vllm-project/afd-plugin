@@ -148,7 +148,7 @@ and CAM runtime composition live under `ffn_faas/platforms/npu/`.
 communication, computation and Graph execution to the Async CAM
 runtime. A shared cross-platform, cross-connector Step Loop and a pure
 `compute(item)` backend are not implemented. The runtime consumes the existing
-`LayeredFFNWeights` interface with W4A8 weights, without per-step model selection;
+`QuantizedExpertWeights` contract with W4A8 weights, without per-step model selection;
 there is no
 separate V4 execution runtime.
 
@@ -327,6 +327,24 @@ weights fail startup rather than selecting another FFN path. Worker-level
 synchronization remains after a work-item group. The `swiglu_limit` behavior
 and validation scope are documented in the
 [CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-and-w8a8-layered-gmm).
+
+## Async compute ownership
+
+The Async runner loads target/draft `QuantizedExpertWeights` through the model
+export contract, verifies layer coverage and selects Layered or Mega directly.
+`model_executor/ffn/npu/expert_weights.py` owns the Ascend quantized weight
+layout validation, logical geometry and graph signatures shared by Layered
+and Mega. `connectors/npu/async_cam_runtime/async_cam_layered.py` and `async_cam_mega.py` own native operator handles,
+workspace, zero bias and layer maps. There is no execution layer beneath the
+ModelRunner and no access to private model parameters from compute.
+
+Mega consumes the exported tensors independently of Layered. It prepares its
+workspace before startup negotiation and binds live `comm_args` and the group
+name after connector initialization, before warmup/capture. Binding failures
+are published through Startup and retain resources. Negotiation preserves the
+existing signature format, including `native_mc2:` and the W8A8 zero-bias layout;
+W8A8 Mega does not allocate Layered's unused zero bias. Eager/FULL transaction,
+graph and shutdown orchestration remain runner-owned.
 
 ## Control-plane-driven forward
 

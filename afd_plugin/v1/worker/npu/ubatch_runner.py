@@ -54,8 +54,8 @@ from afd_plugin.compat.patches.npu.mrv2_ubatching import (
     use_npu_ubatch_contexts,
     use_npu_ubatch_output_merge,
 )
-from afd_plugin.model_executor.models.npu.deepseek_attention_metadata import (
-    materialize_deepseek_attention_metadata_by_layer,
+from afd_plugin.v1.worker.npu.attention_metadata import (
+    materialize_attention_metadata_by_layer,
 )
 from afd_plugin.v1.worker.npu.mla_graph import (
     merge_mla_graph_params,
@@ -208,7 +208,7 @@ class NPUUBatchRunner(UBatchRunner):
             full_graph_mode=cudagraph_mode == CUDAGraphMode.FULL,
         )
         if cudagraph_mode == CUDAGraphMode.FULL:
-            materialize_deepseek_attention_metadata_by_layer(
+            materialize_attention_metadata_by_layer(
                 metadata,
                 input_batch.positions,
                 num_input_tokens,
@@ -216,7 +216,7 @@ class NPUUBatchRunner(UBatchRunner):
                 rope_capacity=self.vllm_config.scheduler_config.max_num_batched_tokens,
             )
         else:
-            materialize_deepseek_attention_metadata_by_layer(
+            materialize_attention_metadata_by_layer(
                 metadata, input_batch.positions, num_input_tokens
             )
         return metadata

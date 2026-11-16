@@ -11,15 +11,19 @@ pytest.importorskip("vllm_ascend")
 pytest.importorskip("torch_npu")
 
 from torch import Tensor  # noqa: E402
-from vllm_ascend.attention.dsa_v1 import AscendDSAMetadata  # noqa: E402
+from vllm_ascend.attention.dsa_v1 import (  # noqa: E402
+    AscendDSAMetadata,
+    AscendDSAMetadataBuilder,
+)
 from vllm_ascend.attention.mla_v1 import AscendMLAMetadata  # noqa: E402
-from vllm_ascend.attention.sfa_v1 import AscendSFAMetadata  # noqa: E402
+from vllm_ascend.attention.sfa_v1 import (  # noqa: E402
+    AscendSFAMetadata,
+    AscendSFAMetadataBuilder,
+)
 from vllm_ascend.ops import rope_dsv4  # noqa: E402
 from vllm_ascend.ops.rope_dsv4 import RopeDataProxy  # noqa: E402
 
-from afd_plugin.model_executor.models.npu import (  # noqa: E402
-    deepseek_attention_metadata,
-)
+from afd_plugin.v1.worker.npu import attention_metadata  # noqa: E402
 
 
 def test_materializes_sfa_mla_and_dsa_rope_metadata(
@@ -30,7 +34,7 @@ def test_materializes_sfa_mla_and_dsa_rope_metadata(
     sfa_metadata = object.__new__(AscendSFAMetadata)
     sfa_metadata.cos = sfa_cos_source[:4]
     sfa_metadata.sin = sfa_sin_source[:4]
-    deepseek_attention_metadata.materialize_deepseek_attention_metadata(
+    attention_metadata.materialize_attention_metadata(
         sfa_metadata,
         torch.arange(4),
         4,
@@ -47,7 +51,7 @@ def test_materializes_sfa_mla_and_dsa_rope_metadata(
         cos=mla_cos_source[5:],
         sin=mla_sin_source[5:],
     )
-    deepseek_attention_metadata.materialize_deepseek_attention_metadata(
+    attention_metadata.materialize_attention_metadata(
         mla_metadata,
         torch.arange(8),
         8,
@@ -76,13 +80,13 @@ def test_materializes_sfa_mla_and_dsa_rope_metadata(
     state.layer_info["layer"] = ("test", ["default"])
     monkeypatch.setattr(rope_dsv4, "_ROPE_STATE", state)
     monkeypatch.setattr(
-        deepseek_attention_metadata,
+        attention_metadata,
         "get_cos_and_sin_dsa",
         get_dsa_rope,
     )
     dsa_metadata = object.__new__(AscendDSAMetadata)
     dsa_metadata.req_metadata = SimpleNamespace(cos=object(), sin=object())
-    deepseek_attention_metadata.materialize_deepseek_attention_metadata(
+    attention_metadata.materialize_attention_metadata(
         dsa_metadata,
         torch.arange(6),
         4,
@@ -93,6 +97,36 @@ def test_materializes_sfa_mla_and_dsa_rope_metadata(
     ]
     assert dsa_metadata.req_metadata.cos["layer"].tolist() == [100, 101, 102, 103]
     assert dsa_metadata.req_metadata.sin["layer"].tolist() == [200, 201, 202, 203]
+
+
+def test_isolates_mutable_sfa_and_dsa_builder_inputs():
+    group_len = torch.tensor([1, 2], dtype=torch.int32)
+    group_key_idx = torch.tensor([3, 4], dtype=torch.int32)
+    group_key_cache_idx = torch.tensor([5, 6], dtype=torch.int32)
+    sfa_common_metadata = SimpleNamespace(
+        group_len=group_len,
+        group_key_idx=group_key_idx,
+        group_key_cache_idx=group_key_cache_idx,
+    )
+    attention_metadata.isolate_attention_builder_inputs(
+        object.__new__(AscendSFAMetadataBuilder),
+        sfa_common_metadata,
+    )
+    sfa_common_metadata.group_len.fill_(9)
+    sfa_common_metadata.group_key_idx.fill_(9)
+    sfa_common_metadata.group_key_cache_idx.fill_(9)
+    assert group_len.tolist() == [1, 2]
+    assert group_key_idx.tolist() == [3, 4]
+    assert group_key_cache_idx.tolist() == [5, 6]
+
+    block_table = torch.arange(6, dtype=torch.int32).reshape(2, 3)
+    dsa_common_metadata = SimpleNamespace(block_table_tensor=block_table)
+    attention_metadata.isolate_attention_builder_inputs(
+        object.__new__(AscendDSAMetadataBuilder),
+        dsa_common_metadata,
+    )
+    dsa_common_metadata.block_table_tensor.fill_(0)
+    assert block_table.tolist() == [[0, 1, 2], [3, 4, 5]]
 
 
 @pytest.fixture
@@ -121,13 +155,13 @@ def dsa_rope_source(monkeypatch):
         returned.append(result)
         return result
 
-    monkeypatch.setattr(deepseek_attention_metadata, "get_cos_and_sin_dsa", get_rope)
+    monkeypatch.setattr(attention_metadata, "get_cos_and_sin_dsa", get_rope)
 
     def materialize(positions, num_tokens, buffers=None):
         metadata = object.__new__(AscendDSAMetadata)
         metadata.req_metadata = SimpleNamespace(cos=None, sin=None)
         # Both layers share one request metadata object: one getter call is enough.
-        deepseek_attention_metadata.materialize_deepseek_attention_metadata_by_layer(
+        attention_metadata.materialize_attention_metadata_by_layer(
             {"layer-a": metadata, "layer-b": metadata},
             positions,
             num_tokens,

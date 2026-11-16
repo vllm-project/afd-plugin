@@ -586,7 +586,7 @@ def test_full_graph_prepares_metadata_for_padded_tail_stage(
     monkeypatch.setattr(npu_ubatch, "build_attn_state", unexpected_state)
     monkeypatch.setattr(
         npu_ubatch,
-        "materialize_deepseek_attention_metadata_by_layer",
+        "materialize_attention_metadata_by_layer",
         lambda *a, **kw: None,
     )
     with patches.use_npu_input_batch_slicing():
@@ -648,7 +648,7 @@ def test_stage_prepare_uses_independent_builders_and_detaches_cache(
     monkeypatch.setattr(npu_ubatch, "build_attn_metadata", build)
     monkeypatch.setattr(npu_ubatch, "build_attn_state", lambda *args: "child-state")
     monkeypatch.setattr(
-        npu_ubatch, "materialize_deepseek_attention_metadata_by_layer", materialize
+        npu_ubatch, "materialize_attention_metadata_by_layer", materialize
     )
     table = torch.ones((1, 2))
     metadata = [

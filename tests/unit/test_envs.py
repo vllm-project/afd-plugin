@@ -4,9 +4,21 @@ from __future__ import annotations
 
 import pytest
 
-from afd_plugin.envs import AFD_FORCE_BALANCED_TOPK_IDS, force_balanced_topk_ids_enabled
+from afd_plugin.envs import (
+    AFD_ASYNC_MOE_LAYOUT_LOG,
+    AFD_FORCE_BALANCED_TOPK_IDS,
+    async_moe_layout_log_enabled,
+    force_balanced_topk_ids_enabled,
+)
 
 
+@pytest.mark.parametrize(
+    "name,enabled",
+    [
+        (AFD_FORCE_BALANCED_TOPK_IDS, force_balanced_topk_ids_enabled),
+        (AFD_ASYNC_MOE_LAYOUT_LOG, async_moe_layout_log_enabled),
+    ],
+)
 @pytest.mark.parametrize(
     "value,expected",
     [
@@ -20,9 +32,9 @@ from afd_plugin.envs import AFD_FORCE_BALANCED_TOPK_IDS, force_balanced_topk_ids
         ("", False),
     ],
 )
-def test_force_balanced_topk_ids_environment(monkeypatch, value, expected):
+def test_diagnostic_environment_flags(monkeypatch, name, enabled, value, expected):
     if value is None:
-        monkeypatch.delenv(AFD_FORCE_BALANCED_TOPK_IDS, raising=False)
+        monkeypatch.delenv(name, raising=False)
     else:
-        monkeypatch.setenv(AFD_FORCE_BALANCED_TOPK_IDS, value)
-    assert force_balanced_topk_ids_enabled() is expected
+        monkeypatch.setenv(name, value)
+    assert enabled() is expected

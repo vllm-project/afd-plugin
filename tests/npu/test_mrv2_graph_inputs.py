@@ -28,10 +28,10 @@ from vllm_ascend.attention.sfa_v1 import AscendSFAMetadata  # noqa: E402
 from vllm_ascend.ops import rope_dsv4  # noqa: E402
 from vllm_ascend.ops.rope_dsv4 import RopeDataProxy  # noqa: E402
 
-from afd_plugin.model_executor.models.npu import (  # noqa: E402
-    deepseek_attention_metadata,
+from afd_plugin.v1.worker.npu import (  # noqa: E402
+    attention_metadata,
+    ubatch_runner,
 )
-from afd_plugin.v1.worker.npu import ubatch_runner  # noqa: E402
 
 
 @pytest.mark.parametrize("backend", ["mla", "sfa", "dsa"])
@@ -85,7 +85,7 @@ def test_full_graph_reads_updated_block_ids_and_stage_rope(monkeypatch, backend)
 
     monkeypatch.setattr(ubatch_runner, "build_attn_metadata", build)
     monkeypatch.setattr(
-        deepseek_attention_metadata,
+        attention_metadata,
         "get_cos_and_sin_dsa",
         lambda positions, use_cache: dsa_rope(
             positions.float().view(2, 1) * 3,
