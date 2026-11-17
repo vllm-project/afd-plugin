@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -56,6 +57,37 @@ def snapshot(runner) -> dict:
             for gid in runner.speculator.draft_kv_cache_group_ids
         ]
     return {
+        "pid": os.getpid(),
+        "runtime": {
+            "executable": sys.executable,
+            "prefix": sys.prefix,
+            "base_prefix": sys.base_prefix,
+            "version": sys.version,
+            "sys_path": [str(path) for path in sys.path],
+            "modules": {
+                name: str(Path(origin).resolve())
+                for name in (
+                    "afd_plugin",
+                    "numpy",
+                    "safetensors",
+                    "tokenizers",
+                    "torch",
+                    "torch_npu",
+                    "transformers",
+                    "vllm",
+                    "vllm_ascend",
+                )
+                if (module := sys.modules.get(name)) is not None
+                and (origin := getattr(module, "__file__", None))
+            },
+        },
+        "native_maps": sorted(
+            {
+                line.split()[-1]
+                for line in Path("/proc/self/maps").read_text().splitlines()
+                if "afd_plugin" in line and ".so" in line
+            }
+        ),
         "rank": runner.connector.world_rank,
         "role": "ffn" if is_ffn else "attention",
         "draft_class": type(draft).__name__,

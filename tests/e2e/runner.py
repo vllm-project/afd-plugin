@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1195,12 +1196,12 @@ def prepare_case(
             profile = replace(profile, worker_shutdown_timeout_s=int(worker_timeout))
     effective = replace(case, deployment=profile, phases=tuple(effective_phases))
     resolved = deployment.resolve(effective, environment, slots=slots)
-    probe_arguments = (
-        ("--worker-extension-cls", probe_extension(effective))
-        if any(phase.checks for phase in effective.phases)
-        else ()
-    )
-    record = {
+    has_checks = any(phase.checks for phase in effective.phases)
+    if has_checks and effective.worker_extension:
+        raise ValueError("a Case cannot install two worker extensions")
+    extension = probe_extension(effective) if has_checks else effective.worker_extension
+    probe_arguments = ("--worker-extension-cls", extension) if extension else ()
+    record: dict[str, Any] = {
         "case_id": case.id,
         "run_id": uuid.uuid4().hex,
         "canonical": asdict(case),
@@ -1226,6 +1227,8 @@ def prepare_case(
         "phases": [],
         "acceptance_passed": False,
     }
+    if effective.deployment.prefill is not None:
+        record["commands"]["proxy"] = resolved.proxy_command()
     return effective, record
 
 
@@ -1249,9 +1252,44 @@ def run_case(case: Case, environment: CaseEnvironment) -> dict:
             except BaseException as exc:
                 failures.append(str(exc))
             record["processes"] = [
-                {"pid": process.pid, "returncode": process.poll()}
-                for process in services.processes
+                {"role": role, "pid": process.pid, "returncode": process.poll()}
+                for role, process in services.processes_by_role.items()
             ]
+            forced_events = []
+            for role in services.processes_by_role:
+                log = environment.output_path / f"{role}.log"
+                if log.is_file():
+                    for line in log.read_text(errors="replace").splitlines():
+                        lowered = line.lower()
+                        if "[shutdown]" in lowered and (
+                            "force killing" in lowered or "sending sigkill" in lowered
+                        ):
+                            forced_events.append({"role": role, "line": line})
+            forced = (
+                services.forced_process_groups
+                or services.forced_ffn_processes
+                or forced_events
+            )
+            abnormal = any(
+                item["returncode"] not in (0, -signal.SIGTERM)
+                for item in record["processes"]
+            )
+            record["shutdown"] = {
+                "status": (
+                    "not_started"
+                    if not record["processes"]
+                    else "forced"
+                    if forced
+                    else "abnormal_exit"
+                    if abnormal
+                    else "unknown"
+                    if failures
+                    else "graceful"
+                ),
+                "forced_process_groups": services.forced_process_groups,
+                "forced_ffn_processes": services.forced_ffn_processes,
+                "forced_log_events": forced_events,
+            }
         if failures:
             record["cleanup"] = {"status": "failed", "errors": failures}
             if not probe.pull_mega:
@@ -1262,8 +1300,15 @@ def run_case(case: Case, environment: CaseEnvironment) -> dict:
     try:
         with cancellable_run(cleanup):
             probe.prepare()
-            services.probe_arguments = probe.arguments
-            services.probe_environment = probe.worker_environment
+            services.probe_arguments = probe.arguments or (
+                ("--worker-extension-cls", effective.worker_extension)
+                if effective.worker_extension
+                else ()
+            )
+            services.probe_environment = {
+                **dict(effective.worker_environment),
+                **probe.worker_environment,
+            }
             services.start()
             services.ensure_alive()
             record["execution"] = {"status": "running"}
@@ -1276,8 +1321,11 @@ def run_case(case: Case, environment: CaseEnvironment) -> dict:
                 record["phases"].append(phase_record)
                 probe.start(phase)
                 role = "baseline" if effective.deployment.is_baseline else "attention"
+                task_port = environment.api_port_base + (
+                    3 if effective.deployment.prefill is not None else 0
+                )
                 phase_record["result"] = phase.task.execute(
-                    base_url=f"http://{environment.api_host}:{environment.api_port_base}",
+                    base_url=f"http://{environment.api_host}:{task_port}",
                     model_name=f"{case.served_model_name_prefix}-{role}",
                     checkpoint=environment.model,
                     output_path=environment.output_path / phase.name,

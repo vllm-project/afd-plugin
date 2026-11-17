@@ -34,6 +34,9 @@ validation_paths:
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite_multi_pod.py"
   - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_dspark_npu.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_dspark_core_checker.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_dspark_graph_checker.py"
   - "tests/e2e/models/deepseek_v4_flash/test_deepseek_v4_flash_multi_pod.py"
   - "tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py"
   - "tests/e2e/models/deepseek_v4_flash/test_gpu.py"
@@ -55,7 +58,7 @@ verified_platform_refs:
   - "CUDA Qwen3 MoE"
   - "CUDA Qwen3.6 MoE"
 related_issues: []
-last_reviewed: 2026-11-10
+last_reviewed: 2026-11-17
 ---
 
 # E2E testing
@@ -125,15 +128,28 @@ before launch rather than being silently dropped. Every pod records the actual
 evaluator configuration/results, its local outcome and cleanup. Qualification
 requires every pod's acceptance entry to pass.
 
-The two NPU multi-pod entries and dedicated FFN/DSpark callers retain their
-legacy path. Remaining CLI scenario configuration is NPU-only; GPU-specific
-tables and evaluation/Hash branches have been removed. No cases are added or
-removed. Implementation/collection does not establish device qualification:
-report host, same-host distributed and cross-node/device execution separately.
+The two NPU multi-pod entries and older dedicated FFN/DSpark callers retain
+their legacy path. Remaining legacy CLI scenario configuration is NPU-only;
+GPU-specific tables and evaluation/Hash branches have been removed. Three opt-in
+DSpark core Cases add same-topology eager, graph and PD+graph comparisons. Their
+model-owned orchestration runs each reference and target as a separate
+deployment through the shared executor;
+PD additionally uses native prefill and the existing proxy. Their workload
+keeps four cancellable concurrent requests and records per-rank request-time
+evidence. Ordinary graph execution and the separate instrumented per-layer
+comparison are distinct deployments. Each attempt has its own artifact
+directory, so earlier rank evidence cannot qualify a later attempt.
 
-On migrated Case paths (all single-deployment entries and ten GPU multi-pod
-entries), an existing-capability combination changes model declarations and
-IDs only.
+An optional eager reference is reused only when its recorded identity matches
+the current source, runtime and deployment inputs. Its actual A/F worker
+interpreter and package identities must also match the graph deployment;
+ordinary graph checks require FULL mode and request-window replay on every FFN
+rank. Implementation/collection does not establish device qualification: report
+host, same-host distributed and cross-node/device execution separately.
+
+On migrated Case paths (single-deployment entries, DSpark core Cases and ten GPU
+multi-pod entries), an existing-capability combination changes model
+declarations and IDs only.
 Changing Case fields, task/check behavior or deployment protocols is a shared
 capability extension. A new connector must define launch order in deployment;
 Cases do not override that order independently. Configuration conflicts in
