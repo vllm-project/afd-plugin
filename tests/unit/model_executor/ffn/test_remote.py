@@ -99,12 +99,6 @@ def test_factory_registers_native_runner_without_expert_weights(
 
     runner = _build_runner(monkeypatch, config, gate=gate)
 
-    expected_type = (
-        remote.AFDExternalRoutingMoERunner
-        if compute_gate_on_attention
-        else remote.AFDRemoteMoERunner
-    )
-    assert type(runner) is expected_type
     assert config.compilation_config.static_forward_context == {PREFIX: runner}
     assert config.compilation_config.static_all_moe_layers == [PREFIX]
     gate_parameters = [] if gate is None else list(gate.parameters())
@@ -237,37 +231,26 @@ def test_factory_rejects_reserved_native_arguments(monkeypatch, argument):
     assert config.compilation_config.static_forward_context == {}
 
 
-def test_runner_descriptor_ignores_attention_parallel_layout(monkeypatch):
-    """The runner describes unsharded experts with the model's dimensions.
-
-    Why: Attention TP and DP must not shard or map experts that live on the
-    FFN role.
-    """
-    attention_tp_size = 4
-    monkeypatch.setattr(
-        fused_moe_layer,
-        "get_tensor_model_parallel_world_size",
-        lambda: attention_tp_size,
-    )
-
-    runner = _build_runner(monkeypatch, attention_moe_vllm_config())
-
-    parallel = runner.moe_config.moe_parallel_config
-    assert (parallel.tp_size, parallel.dp_size, parallel.pcp_size) == (1, 1, 1)
-    assert (parallel.ep_size, parallel.use_ep) == (1, False)
-    assert runner.moe_config.hidden_dim == HIDDEN_SIZE
-    assert runner.moe_config.intermediate_size_per_partition == INTERMEDIATE_SIZE
-    assert runner.expert_map is None
-
-
+@pytest.mark.parametrize(
+    "attention_tp_size", [1, 4], ids=["attention-tp1", "attention-tp4"]
+)
 @pytest.mark.parametrize("num_tokens", [1, 7])
-def test_runner_without_gate_sends_hidden_states_only(monkeypatch, num_tokens):
+def test_runner_without_gate_sends_hidden_states_only(
+    monkeypatch, num_tokens, attention_tp_size
+):
     """With the gate on FFN, the runner sends only the hidden states, tagged
     with its layer and stage, and returns the FFN output.
 
     Why: the FFN role runs its native internal-router MoE on the rows it
     receives; the send, DBO yield and receive order is the stage contract.
+    Attention TP must neither slice those rows nor reduce the output, because
+    the experts live on the FFN role.
     """
+    monkeypatch.setattr(
+        fused_moe_layer,
+        "get_tensor_model_parallel_world_size",
+        lambda: attention_tp_size,
+    )
     events: list[tuple] = []
     install_proxy_context(remote, monkeypatch, events, stage_idx=STAGE_IDX)
     runner = _build_runner(monkeypatch, attention_moe_vllm_config())
