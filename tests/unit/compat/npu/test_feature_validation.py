@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from importlib import import_module
 from types import SimpleNamespace
 
 import pytest
@@ -158,6 +159,20 @@ def _mla_dbo(cudagraph_mode, **model_fields):
         },
         **TWO_UBATCH_DBO,
     )
+
+
+def test_camp2p_admission_after_connector_preloaded(monkeypatch):
+    package = import_module("afd_plugin.connectors.npu.camp2p")
+    connector = import_module("afd_plugin.connectors.npu.camp2p.connector")
+    monkeypatch.setattr(package, "connector", connector, raising=False)
+
+    with monkeypatch.context() as isolated:
+        load_async_modules(isolated)
+        load_host_module(isolated, "afd_plugin.connectors.npu.camp2p.connector")
+        load_host_module(isolated, "afd_plugin.connectors.factory")
+        _admit(_config_with())
+
+    _admit(_config_with())
 
 
 @pytest.mark.parametrize(
