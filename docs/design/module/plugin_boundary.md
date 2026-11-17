@@ -27,7 +27,8 @@ validation_paths:
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_runtime_classpaths.py"
 upstream_refs:
-  - "vLLM 0.30.0 ced6857afa0ea7b2e3f0846a62e1394e90f15607"
+  - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "vLLM vllm.general_plugins entry-point group"
   - "vLLM vllm.config.VllmConfig"
 verified_platform_refs:
@@ -36,7 +37,7 @@ verified_platform_refs:
 related_issues:
   - "#89"
   - "#129"
-last_reviewed: 2026-10-13
+last_reviewed: 2026-11-09
 ---
 
 # Plugin boundary
@@ -128,36 +129,23 @@ presence is the activation signal: `parse_optional_afd_config()` returns
 raise if the required namespace is missing. Unknown top-level AFD keys are rejected and connector-specific values
 must be placed under `connector_extra_config`.
 
-| Canonical key | Default | Current meaning |
-| --- | --- | --- |
-| `connector` | `P2pNcclAFDConnector` | Connector factory name selected from the built-in supported-name allow-list. |
-| `async_dp` | `false` | Enables AFD async-DP compatibility behavior; currently valid only with `CAMAsyncAFDConnector`. |
-| `role` | `attention` | Process role: `attention` or `ffn`. |
-| `host`, `port` | `127.0.0.1`, `1239` | Connector rendezvous/control endpoint inputs. |
-| `afd_process_group_timeout_s` | `120` | Positive AFD process-group rendezvous timeout in seconds; also bounds the NPU native DBO startup barrier. It is not a device-kernel cancellation deadline. |
-| `num_attention_ranks`, `num_ffn_ranks` | `1`, `1` | AFD role-group sizes used by topology construction. |
-| `compute_gate_on_attention` | `false` | Moves supported gate/MoE routing work to Attention. CUDA supports both gate placements at the remote-experts boundary; synchronous CAMP2P still requires `false`, while CAM async requires `true`. |
-| `connector_extra_config` | `{}` | Envelope key parsed by the selected connector into a typed `ConnectorExtraInfo`; it is not stored on `AFDConfig`. |
-
-The compatibility aliases `afd_connector`, `afd_role`, `afd_port`, `afd_host`,
-and `async` normalize to canonical fields. Supplying an alias and its canonical
-field together is rejected. Boolean-like strings and integer-like values are
-normalized; invalid types fail during parsing.
+Public fields, defaults and aliases are defined in the
+[configuration reference](../../configuration.md). Parsing normalizes
+boolean-like strings and integer-like values; invalid types fail.
 
 Role rank is runtime state derived from the global DP rank and local PCP/TP
 coordinates. It is resolved once by the connector factory and is not an
 `AFDConfig` field.
 
 Connector construction parses `connector_extra_config` through the selected
-connector class. P2P accepts only an empty mapping; CAMP2P and CAM async each
-define a closed, typed schema and reject unknown fields. The detailed schemas
+connector class. P2P accepts only an empty mapping; the other connectors
+define closed, typed schemas and reject unknown fields. The detailed schemas
 belong to [connector contracts](connector_contracts.md) and the operational
 connector guides.
 
-`AFDConfig.compute_hash()` currently includes connector, async mode, role, and
-both role counts. This is an implementation detail used by
-graph-affecting configuration paths, not a complete serialization or public
-configuration identity.
+`AFDConfig.compute_hash()` includes connector, async mode, role, both role
+counts, and connector-specific configuration. It is used by graph-affecting
+configuration paths, not as a complete serialization or public identity.
 
 ## Validation and worker selection
 
@@ -177,8 +165,8 @@ communication resources are created. Both roles must use PP/PCP/DCP size 1,
 role ranks equal to DP x TP, static EP, and a registered AFD model; elastic EP
 and EPLB are rejected. CUDA V2 requires `P2pNcclAFDConnector`, model-specific
 gate placement, and exactly two microbatches with Attention DP1 or DP > 1.
-The DP1 path has H20 DeepSeek-V2-Lite DP1/TP2 Graph + DBO validation with
-128 GSM8K samples and live two-stage/full-replay assertions.
+See the [runtime matrix](../../support.md#tested-runtime-matrix) for
+tested configurations and known DeepSeek-V2-Lite DBO shutdown failures.
 Ascend V2 accepts synchronous `CAMP2pAFDConnector` with FFN-side gating or
 eager `CAMAsyncAFDConnector` with async DP and Attention-side gating. Ascend
 native DBO requires exactly two microbatches and no speculative decoding.
@@ -203,11 +191,12 @@ runtime integration and are not stable third-party extension interfaces.
 
 ## Environment boundary
 
-`afd_plugin.envs` exports boolean helpers for `AFD_FORCE_BALANCED_TOPK_IDS`
-and `AFD_ASYNC_CAM_LAYERED_GMM`. Profiling and connector diagnostics are read
+`afd_plugin.envs` exports a boolean helper for `AFD_FORCE_BALANCED_TOPK_IDS`.
+Profiling and connector diagnostics are read
 by their owning modules. Environment switches do not replace `additional_config["afd"]` as the
-activation or topology channel. The layered-GMM switch is FFN-only and
-validated for the DeepSeek-V4 Async CAM path.
+activation or topology channel. See the
+[runtime matrix](../../support.md#tested-runtime-matrix) for hardware
+validation scope.
 
 `AFD_FORCE_SPAWN_MULTIPROCESSING=1` is an opt-in package-import adaptation for
 the affected A3 Python 3.12 environment. It sets the default multiprocessing

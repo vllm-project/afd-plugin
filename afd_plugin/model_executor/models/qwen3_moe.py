@@ -10,7 +10,8 @@ connector (which requires ``compute_gate_on_attention``), Attention also runs
 the MoE gate and top-k, and FFN runs only the routed experts.
 """
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -25,14 +26,17 @@ from afd_plugin.config import (
     AFDConfig,
     parse_afd_config,
 )
-from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
+from afd_plugin.model_executor.ffn.remote import RemoteFFNProxy
+from afd_plugin.model_executor.models._weight_utils import (
+    ATTENTION_ROLE,
+    BOTH_ROLES,
+    FFN_ROLE,
+    filter_role_weights,
+    layer_weight_path,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-
-_ATTENTION_ROLE = frozenset(("attention",))
-_FFN_ROLE = frozenset(("ffn",))
-_BOTH_ROLES = frozenset(("attention", "ffn"))
 
 
 def _is_moe_layer(config: Qwen3MoeConfig, layer_idx: int) -> bool:
@@ -49,20 +53,6 @@ def _routes_on_attention(afd_config: AFDConfig) -> bool:
     return afd_config.connector in DEEPEP_M2N_CONNECTORS
 
 
-def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
-    """Return ``(layer index, stage, remainder)`` for a native decoder path."""
-    parts = name.split(".")
-    for marker_idx, part in enumerate(parts[:-2]):
-        if part != "layers":
-            continue
-        try:
-            layer_idx = int(parts[marker_idx + 1])
-        except ValueError:
-            continue
-        return layer_idx, parts[marker_idx + 2], tuple(parts[marker_idx + 3 :])
-    return None
-
-
 def _checkpoint_weight_roles(
     name: str,
     *,
@@ -74,34 +64,19 @@ def _checkpoint_weight_roles(
     Attention routes with it, and FFN keeps the native gate parameter that
     vLLM's strict loader requires but never runs it.
     """
-    layer_path = _weight_layer_path(name)
+    layer_path = layer_weight_path(name)
     if layer_path is None:
-        return _BOTH_ROLES
+        return BOTH_ROLES
 
     _layer_idx, stage, remainder = layer_path
     if stage == "mlp":
         is_moe_gate = bool(remainder) and remainder[0] == "gate"
         if is_moe_gate and routes_on_attention:
-            return _BOTH_ROLES
-        return _FFN_ROLE
+            return BOTH_ROLES
+        return FFN_ROLE
     if stage in {"self_attn", "input_layernorm", "post_attention_layernorm"}:
-        return _ATTENTION_ROLE
-    return _BOTH_ROLES
-
-
-def _iter_role_weights(
-    weights: Iterable[tuple[str, torch.Tensor]],
-    *,
-    role: str,
-    routes_on_attention: bool = False,
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """Consume a checkpoint iterator once and retain this role's paths."""
-    for name, loaded_weight in weights:
-        if role in _checkpoint_weight_roles(
-            name,
-            routes_on_attention=routes_on_attention,
-        ):
-            yield name, loaded_weight
+        return ATTENTION_ROLE
+    return BOTH_ROLES
 
 
 def _validate_supported_config(
@@ -160,8 +135,8 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
     # Patch reason: native Qwen3 MoE constructs both Attention and FFN modules.
     # Patch functionality: construct only the large modules owned by the AFD role.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.30.0, vllm/model_executor/models/qwen3_moe.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/qwen3_moe.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     # is_fused_checkpoint_transposed is accepted for upstream signature parity;
     # AFD never builds the fused-checkpoint MoE path.
     def __init__(
@@ -169,6 +144,7 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
         vllm_config: VllmConfig,
         prefix: str = "",
         is_fused_checkpoint_transposed: bool = False,
+        mrope_positions_factor: int = 4,
     ) -> None:
         # ### PATCH START: initialize the role-aware layer without native allocation.
         nn.Module.__init__(self)
@@ -208,14 +184,15 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
                 dual_chunk_attention_config=dual_chunk_attention_config,
+                mrope_positions_factor=mrope_positions_factor,
             )
             self.mlp = RemoteFFNProxy(layer_idx=layer_idx)
             if _routes_on_attention(afd_config):
-                # Same gate as native Qwen3MoeSparseMoeBlock, same weight path.
-                self.mlp.gate = native.ReplicatedLinear(
+                # Same gate as native Qwen3MoeSparseMoeBlock (GateLinear, same
+                # arguments), same weight path.
+                self.mlp.gate = native.GateLinear(
                     config.hidden_size,
                     config.num_experts,
-                    bias=False,
                     quant_config=quant_config,
                     prefix=f"{prefix}.mlp.gate",
                 )
@@ -297,8 +274,8 @@ class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
     # Patch functionality: construct AFDQwen3MoeModel and retain native lifecycle
     # and MoE metadata without requiring local experts on the Attention role.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.30.0, vllm/model_executor/models/qwen3_moe.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/qwen3_moe.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # ### PATCH START: avoid constructing the full native model first.
         nn.Module.__init__(self)
@@ -396,14 +373,17 @@ class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
     # Patch functionality: retain only role-owned checkpoint paths, then use the
     # native loader unchanged for mapping, packing, and loaded-parameter results.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.30.0, vllm/model_executor/models/qwen3_moe.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/qwen3_moe.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # ### PATCH START: filter the checkpoint stream by AFD execution role.
-        role_weights = _iter_role_weights(
+        role_weights = filter_role_weights(
             weights,
             role=self.afd_role,
-            routes_on_attention=_routes_on_attention(self.afd_config),
+            classify=partial(
+                _checkpoint_weight_roles,
+                routes_on_attention=_routes_on_attention(self.afd_config),
+            ),
         )
         # ### PATCH END: filter the checkpoint stream by AFD execution role.
         return super().load_weights(role_weights)

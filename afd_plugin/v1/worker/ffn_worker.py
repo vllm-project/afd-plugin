@@ -10,12 +10,12 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import VllmConfig
-from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
 from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.worker_base import CompilationTimes
 
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory, AFDRoutedExpertsConnector
+from afd_plugin.connectors.base import AFDControlPlaneClosedError
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
 from afd_plugin.validation import (
@@ -27,8 +27,10 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
     from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 logger = logging.getLogger(__name__)
+FFN_LOOP_JOIN_TIMEOUT_S = 5
 
 
 class AFDFFNWorker(Worker):
@@ -60,28 +62,25 @@ class AFDFFNWorker(Worker):
         self._ffn_shutdown_event: threading.Event | None = None
         self._ffn_loop_error: BaseException | None = None
 
-    # Patch reason: vLLM 0.30.0 selects its V2 runner from a module-level
-    # symbol inside Worker.init_device and exposes no injectable runner factory.
-    # Patch functionality: replace only the V2 construction seam with the
-    # connector-driven FFN runner: GPUFFNRoutedExpertsModelRunner (imported
-    # only then) for an AFDRoutedExpertsConnector, else GPUFFNModelRunner.
-    # Signature: matches vLLM v0.30.0 Worker.init_device exactly: (self).
+    # Patch reason: native device initialization does not validate the AFD role
+    # or select its model architecture before allocating GPU resources.
+    # Patch functionality: validate and select the AFD model before delegating
+    # native device, distributed, workspace and runner initialization.
+    # Signature: matches vLLM v0.32.0 Worker.init_device exactly: (self).
     # Upstream source: vllm/v1/worker/gpu_worker.py, Worker.init_device;
-    # ced6857afa0ea7b2e3f0846a62e1394e90f15607. The 0.30.0 init_device still
-    # local-imports ``GPUModelRunner`` from vllm.v1.worker.gpu.model_runner and
-    # constructs it there, so the module-attribute substitution stays effective.
-    # Delegation exception: native device and distributed setup remain in
-    # super().init_device(). Remove this branch when vLLM exposes runner injection.
-    # Worker initialization is synchronous within each worker process.
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # Delegation exception: the large native device/distributed setup remains
+    # in super().init_device(); this override contains only AFD preflight.
+    # Removal plan: remove when native worker startup supports AFD preflight.
     def init_device(self):
-        """Initialize the native GPU worker and swap in the FFN runner."""
+        """Initialize the native GPU worker with the connector-driven runner."""
 
+        # ### PATCH START: validate and select the AFD model.
         assert_compatible_afd_stack(
             self.vllm_config,
             caller="AFDFFNWorker.init_device",
             expected_role="ffn",
         )
-        # ### PATCH START: construct the FFN runner through the V2 seam.
         validate_gpu_model_runner_v2_config(
             self.vllm_config,
             expected_role="ffn",
@@ -93,28 +92,28 @@ class AFDFFNWorker(Worker):
         )
         self.vllm_config.model_config = afd_model_config
         self.model_config = afd_model_config
+        # ### PATCH END: validate and select the AFD model.
+
+        super().init_device()
+        torch.accelerator.empty_cache()
+
+    # Upstream: vLLM 5df63a72, gpu_worker.py::Worker._make_model_runner.
+    # Select the connector-driven runner before native model loading; routed
+    # executors also require the Triton expert-weight layout. The native factory
+    # annotates V1, so connector-driven V2 runners keep its return-type exception.
+    def _make_model_runner(self) -> GPUModelRunner:
+        """Construct the connector-driven runner via the native factory hook."""
         afd_config = parse_afd_config(self.vllm_config, expected_role="ffn")
-        runner_cls: type[GPUFFNModelRunner] = GPUFFNModelRunner
         connector_cls = AFDConnectorFactory.get_connector_class(afd_config.connector)
         if issubclass(connector_cls, AFDRoutedExpertsConnector):
-            # Lazy: only workers whose connector delivers routed rows load the
-            # routed-experts runner.
             from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (
                 GPUFFNRoutedExpertsModelRunner,
                 select_routed_moe_backend,
             )
 
-            runner_cls = GPUFFNRoutedExpertsModelRunner
-            # Before vLLM builds the model, which reads the selected backend.
             select_routed_moe_backend(self.vllm_config)
-        native_runner_cls = gpu_model_runner_v2.GPUModelRunner
-        gpu_model_runner_v2.GPUModelRunner = runner_cls
-        try:
-            super().init_device()
-        finally:
-            gpu_model_runner_v2.GPUModelRunner = native_runner_cls
-        # ### PATCH END: construct the FFN runner through the V2 seam.
-        torch.accelerator.empty_cache()
+            return GPUFFNRoutedExpertsModelRunner(self.vllm_config, self.device)  # type: ignore[return-value]
+        return GPUFFNModelRunner(self.vllm_config, self.device)  # type: ignore[return-value]
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """FFN workers do not allocate KV cache."""
@@ -183,14 +182,20 @@ class AFDFFNWorker(Worker):
             torch.cuda.set_device(self.device)
 
         while not event.is_set():
-            if self.model_runner.connector.control_plane is None:
+            control_plane = self.model_runner.connector.control_plane
+            if control_plane is None:
                 raise NotImplementedError(
                     "GPU FFN only supports control-plane-driven connectors; "
                     "connectors without a control plane (control_plane is None) "
                     "are not supported.",
                 )
 
-            payload = self.model_runner.connector.control_plane.recv_dp_metadata_list()
+            try:
+                payload = control_plane.recv_dp_metadata_list()
+            except AFDControlPlaneClosedError:
+                if not event.is_set():
+                    raise
+                break
             dp_metadata_list = payload.dp_metadata_list
             is_attn_graph_capturing = payload.is_graph_capturing
             is_warmup = payload.is_warmup
@@ -218,26 +223,41 @@ class AFDFFNWorker(Worker):
     def raise_ffn_loop_error_if_any(self) -> None:
         error = self._ffn_loop_error
         if error is not None:
-            self._ffn_loop_error = None
+            # EngineCore and Worker can both stop the loop; retain its failure.
             raise RuntimeError("AFD FFN worker loop failed") from error
 
     def stop_ffn_server_loop(self) -> None:
         event = self._ffn_shutdown_event
         if event is not None:
             event.set()
-        try:
-            self.model_runner.shutdown()
-        finally:
-            thread = self._ffn_thread
-            if thread is not None:
-                thread.join(timeout=5)
-            self._ffn_thread = None
-            self._ffn_shutdown_event = None
+        control_plane = self.model_runner.connector.control_plane
+        if control_plane is not None:
+            control_plane.close()
+        thread = self._ffn_thread
+        if thread is not None:
+            thread.join(timeout=FFN_LOOP_JOIN_TIMEOUT_S)
+            if thread.is_alive():
+                raise RuntimeError("AFD FFN worker loop did not stop before shutdown")
+        self._ffn_thread = None
+        self._ffn_shutdown_event = None
         self.raise_ffn_loop_error_if_any()
 
+    # Upstream source: vLLM v0.32.0, vllm/v1/worker/gpu_worker.py,
+    # Worker.shutdown; 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # Patch reason: the native worker does not own AFD's metadata receiver.
+    # Patch functionality: stop that receiver before releasing native resources,
+    # including when the joined loop reports an earlier failure.
+    # Signature: matches Worker.shutdown exactly: (self) -> None.
+    # Delegation exception: native cleanup stays in super().shutdown().
+    # Removal plan: remove when the native worker owns the AFD receiver lifecycle.
     def shutdown(self) -> None:
-        self.stop_ffn_server_loop()
-        super().shutdown()
+        # ### PATCH START: release native state only after the receiver exits.
+        try:
+            self.stop_ffn_server_loop()
+        finally:
+            if self._ffn_thread is None:
+                super().shutdown()
+        # ### PATCH END: release native state only after the receiver exits.
 
 
 __all__ = ["AFDFFNWorker"]

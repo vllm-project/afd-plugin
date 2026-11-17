@@ -13,7 +13,7 @@ tests nor the Meta dispatcher tests can observe the omission.
 
 The probe replays the staging into a temporary project, configures the real
 ``cmake_files/op_host/CMakeLists.txt`` against a stub ``npu_op_*`` API, and
-records the source list given to each build step, so it needs neither a CANN
+records source and link lists for each build step, so it needs neither a CANN
 toolchain nor a compiler. On an Ascend host the equivalent check on the linked
 artifact is that the installed ``libcust_optiling.so`` still carries the tiling
 registration, for example::
@@ -75,7 +75,9 @@ function(npu_op_package_add package)
   file(WRITE "${CMAKE_BINARY_DIR}/package_libs.txt" "${libs}\\n")
 endfunction()
 
-function(target_link_libraries)
+function(target_link_libraries target)
+  string(REPLACE ";" "\\n" libraries "${ARGN}")
+  file(APPEND "${CMAKE_BINARY_DIR}/lib_${target}_links.txt" "${libraries}\\n")
 endfunction()
 function(target_compile_options)
 endfunction()
@@ -137,11 +139,11 @@ def _cmake_generator_args() -> list[str]:
         return []
     if shutil.which("ninja"):
         return ["-G", "Ninja"]
-    pytest.skip("no make program is available for the op_host probe")
+    return pytest.skip("no make program is available for the op_host probe")
 
 
 def _configure_probe(project: Path, tmp_path: Path) -> dict[str, set[str]]:
-    """Configure ``project`` and return the sources recorded per build step."""
+    """Configure ``project`` and return sources and links per build step."""
     (project / "CMakeLists.txt").write_text(_PROBE_CMAKE_LISTS, encoding="utf-8")
     # The host CMakeLists only needs the CANN platform header to exist; the
     # include directories it derives from it are added when present.
@@ -173,6 +175,7 @@ def _configure_probe(project: Path, tmp_path: Path) -> dict[str, set[str]]:
     for step, name in (
         ("code_gen", "code_gen_srcs.txt"),
         ("cust_opapi", "lib_cust_opapi_srcs.txt"),
+        ("cust_opapi_links", "lib_cust_opapi_links.txt"),
         ("cust_op_proto", "lib_cust_op_proto_srcs.txt"),
         ("cust_optiling", "lib_cust_optiling_srcs.txt"),
         ("package", "package_libs.txt"),
@@ -234,3 +237,14 @@ def test_op_host_build_collects_nested_tiling_registration(tmp_path: Path):
     # The registration only reaches the run package if the tiling library is
     # packaged, which is what the probe records from npu_op_package_add().
     assert "cust_optiling" in recorded["package"]
+
+
+def test_custom_opapi_links_math_without_aggregate_builtin_api(tmp_path: Path):
+    root = Path(__file__).resolve().parents[3]
+    project = tmp_path / "project"
+    _stage_project(project, root, [_LAYERED_OP])
+
+    recorded = _configure_probe(project, tmp_path)
+
+    assert "opapi_math" in recorded["cust_opapi_links"]
+    assert "opapi" not in recorded["cust_opapi_links"]

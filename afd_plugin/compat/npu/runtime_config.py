@@ -73,18 +73,6 @@ def npu_model_uses_sequence_parallel_moe(vllm_config: VllmConfig) -> bool:
     )
 
 
-def npu_model_uses_sharded_pp_tensors(vllm_config: VllmConfig) -> bool:
-    """Return the model's PP wire layout independently of its internal SP.
-
-    Target DSV4 gathers the complete sequence before each PP boundary. Target
-    DSV2 disables MoE SP when PP is enabled; its PP tensors are global too.
-    """
-    return (
-        npu_model_uses_sequence_parallel_moe(vllm_config)
-        and vllm_config.model_config.hf_text_config.model_type != "deepseek_v4"
-    )
-
-
 def fix_all2all_backend_for_afd(vllm_config: VllmConfig) -> None:
     """Keep configured model SP while preserving the non-SP worker fallback.
 
@@ -97,7 +85,6 @@ def fix_all2all_backend_for_afd(vllm_config: VllmConfig) -> None:
     parallel_config = vllm_config.parallel_config
     if (
         not parallel_config.use_sequence_parallel_moe
-        and not vllm_config.compilation_config.pass_config.enable_sp
         and parallel_config.all2all_backend != FLASHINFER_ALL2ALLV_BACKEND
     ):
         parallel_config.all2all_backend = FLASHINFER_ALL2ALLV_BACKEND
@@ -108,6 +95,5 @@ __all__ = [
     "fix_all2all_backend_for_afd",
     "npu_afd_num_ubatches",
     "npu_model_uses_sequence_parallel_moe",
-    "npu_model_uses_sharded_pp_tensors",
     "uses_async_cam_dbo",
 ]

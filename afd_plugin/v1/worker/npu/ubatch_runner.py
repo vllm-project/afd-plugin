@@ -54,8 +54,8 @@ from afd_plugin.compat.patches.npu.mrv2_ubatching import (
     use_npu_ubatch_contexts,
     use_npu_ubatch_output_merge,
 )
-from afd_plugin.model_executor.models.npu.deepseek_attention_metadata import (
-    materialize_deepseek_attention_metadata_by_layer,
+from afd_plugin.v1.worker.npu.attention_metadata import (
+    materialize_attention_metadata_by_layer,
 )
 from afd_plugin.v1.worker.npu.mla_graph import (
     merge_mla_graph_params,
@@ -114,7 +114,9 @@ class NPUUBatchRunner(UBatchRunner):
                         )
                 self.stage_attn_groups.append(groups)
 
-    # Ascend 8d4409d6 asserts ubatch_idx == 0 and always selects builder zero.
+    # Upstream: vLLM-Ascend bd42eea01d8312c4df469fabaed45f77a12df4d3,
+    # worker/v2/attn_utils.py and worker/v2/model_states/default.py::prepare_attn.
+    # Native build_attn_metadata always selects builder zero.
     # Feed its existing builder function an independent group per native child;
     # no request/KV slicing or MRV1 state is reproduced here. Preserve native
     # FULL padding and Ascend's capture-specific metadata builder contract.
@@ -203,9 +205,10 @@ class NPUUBatchRunner(UBatchRunner):
             ),
             is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
             for_cudagraph_capture=for_capture,
+            full_graph_mode=cudagraph_mode == CUDAGraphMode.FULL,
         )
         if cudagraph_mode == CUDAGraphMode.FULL:
-            materialize_deepseek_attention_metadata_by_layer(
+            materialize_attention_metadata_by_layer(
                 metadata,
                 input_batch.positions,
                 num_input_tokens,
@@ -213,7 +216,7 @@ class NPUUBatchRunner(UBatchRunner):
                 rope_capacity=self.vllm_config.scheduler_config.max_num_batched_tokens,
             )
         else:
-            materialize_deepseek_attention_metadata_by_layer(
+            materialize_attention_metadata_by_layer(
                 metadata, input_batch.positions, num_input_tokens
             )
         return metadata
@@ -297,12 +300,14 @@ class NPUUBatchRunner(UBatchRunner):
 
     # Native graph capture calls begin_capturable_run directly, bypassing run.
     # Scope NPU aliases until the native finish/abort joins its own threads.
-    # Signature matches UBatchRunner.begin_capturable_run at ced6857a. Native
-    # execution is too large to copy: only context and CUDA-only BLAS setup are
-    # adapted here. Remove when upstream offers NPU thread initialization hooks.
+    # Signature matches vllm/v1/worker/gpu/ubatch_utils.py::
+    # UBatchRunner.begin_capturable_run at
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be. Native execution is too large
+    # to copy: only context and CUDA-only BLAS setup are adapted here. Remove
+    # when upstream offers NPU thread initialization hooks.
     def begin_capturable_run(
         self,
-        model: Callable,
+        model: Any,
         model_inputs: dict[str, Any],
         ubatch_state: UBatchState,
         for_capture: bool = False,

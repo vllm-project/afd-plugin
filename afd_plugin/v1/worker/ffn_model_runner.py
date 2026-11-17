@@ -128,7 +128,7 @@ class GPUFFNModelRunner:
     def profile_run(self) -> None:
         pass
 
-    # Patch reason: vLLM 0.30.0 Worker.determine_available_memory calls
+    # Patch reason: vLLM 0.32.0 Worker.determine_available_memory calls
     # ``self.model_runner.profile_cudagraph_memory()`` on CUDA when the compile
     # config enables CUDA graphs (gpu_worker.py), and GPUFFNModelRunner does
     # not inherit that method from any native runner.
@@ -136,11 +136,11 @@ class GPUFFNModelRunner:
     # engine's memory planning is unchanged. The FFN runner captures its graphs
     # lazily from the connector loop after memory profiling, into its own
     # graph pool, so no graph memory belongs in the profiling estimate.
-    # Signature: matches vLLM v0.30.0 GPUModelRunner.profile_cudagraph_memory
+    # Signature: matches vLLM v0.32.0 GPUModelRunner.profile_cudagraph_memory
     # exactly: (self) -> int; 0 mirrors the upstream NONE-mode early return.
-    # Upstream: vLLM v0.30.0, vllm/v1/worker/gpu/model_runner.py,
+    # Upstream: vLLM v0.32.0, vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.profile_cudagraph_memory; commit
-    # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
+    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
     def profile_cudagraph_memory(self) -> int:
         return 0
 
@@ -220,7 +220,13 @@ class GPUFFNModelRunner:
             stage_idx: self._make_ffn_dp_metadata(dp_metadata_list[stage_idx])
             for stage_idx in stage_ids
         }
-        recv_input_ids = getattr(model, "afd_requires_input_ids", False)
+        # The wire slot carries one payload: either token ids or Attention-side
+        # routing. Routing wins when the model declares it, because a sync
+        # gate-on-Attention model does not need ids on the FFN side at all.
+        recv_routing = getattr(model, "afd_requires_attention_routing", False)
+        recv_input_ids = (
+            False if recv_routing else getattr(model, "afd_requires_input_ids", False)
+        )
         with _ffn_forward_context(self.vllm_config) as forward_context:
             for layer_idx in layer_indices:
                 uses_remote_experts = layer_idx in experts_layer_indices
@@ -233,7 +239,9 @@ class GPUFFNModelRunner:
                     recv_kwargs: dict[str, Any] = {}
                     if routing_spec is not None:
                         recv_kwargs["routing_spec"] = routing_spec
-                    if recv_input_ids:
+                    if recv_routing:
+                        recv_kwargs["recv_routing"] = True
+                    elif recv_input_ids:
                         recv_kwargs["recv_input_ids"] = True
                     payload = self.connector.recv_attn_output(
                         ubatch_idx=stage_idx,
@@ -458,8 +466,8 @@ class GPUFFNModelRunner:
     # portable subset; the FFN runner owns no KV caches or attention groups)
     # and then close AFD-owned profiler and connector resources.
     # Signature: matches GPUModelRunner.shutdown; no added parameters.
-    # Upstream: vLLM v0.30.0, vllm/v1/worker/gpu_model_runner.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/v1/worker/gpu_model_runner.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def shutdown(self) -> None:
         # ### PATCH START: release native-equivalent and AFD-owned GPU state.
         stop_afd_gpu_profiler(self.prof)

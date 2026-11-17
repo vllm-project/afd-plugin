@@ -9,6 +9,8 @@ import importlib
 import logging
 import sys
 import types
+import weakref
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -23,6 +25,7 @@ def _config(
     async_dp: bool = True,
     is_moe: bool = True,
     data_parallel_size: int = 2,
+    device_type: str = "cuda",
 ):
     return SimpleNamespace(
         additional_config={
@@ -48,12 +51,14 @@ def _config(
         kv_transfer_config=None,
         needs_dp_coordinator=True,
         cache_config=SimpleNamespace(),
+        device_config=SimpleNamespace(device_type=device_type),
+        logging_config=None,
     )
 
 
 def _install_fake_vllm_engine(monkeypatch: pytest.MonkeyPatch):
     vllm_module = types.ModuleType("vllm")
-    vllm_module.__version__ = "0.30.0"
+    vllm_module.__version__ = "0.32.0"
     vllm_v1_module = types.ModuleType("vllm.v1")
     engine_module = types.ModuleType("vllm.v1.engine")
     core_module = types.ModuleType("vllm.v1.engine.core")
@@ -126,9 +131,12 @@ def _install_fake_vllm_engine(monkeypatch: pytest.MonkeyPatch):
         watched_frontend_processes: tuple = field(default=())
 
     class DPCoordinator:
-        def __init__(self, parallel_config, enable_wave_coordination=True):
+        def __init__(
+            self, parallel_config, enable_wave_coordination=True, logging_config=None
+        ):
             self.parallel_config = parallel_config
             self.enable_wave_coordination = enable_wave_coordination
+            self.logging_config = logging_config
             self.proc = SimpleNamespace(pid=123)
 
         def get_engine_socket_addresses(self):
@@ -215,6 +223,13 @@ def _install_fake_vllm_engine(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, "vllm.v1.engine.core", core_module)
     monkeypatch.setitem(sys.modules, "vllm.v1.engine.utils", utils_module)
     monkeypatch.setitem(sys.modules, "vllm.v1.engine.core_client", client_module)
+    distributed_module = types.ModuleType("vllm.distributed")
+    distributed_utils = types.ModuleType("vllm.distributed.utils")
+    distributed_utils.create_tcp_store = lambda *_args, **_kwargs: SimpleNamespace(
+        port=41234
+    )
+    monkeypatch.setitem(sys.modules, "vllm.distributed", distributed_module)
+    monkeypatch.setitem(sys.modules, "vllm.distributed.utils", distributed_utils)
     return core_module, utils_module, client_module
 
 
@@ -254,6 +269,44 @@ def test_async_dp_engine_patch_preserves_non_async_moe_dp(monkeypatch):
     assert engine.kind == "dp"
 
 
+@pytest.mark.parametrize("async_dp", [False, True])
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+def test_engine_honors_shutdown_received_during_construction(
+    monkeypatch, async_dp, device_type
+):
+    patch = _load_patch_module(monkeypatch)
+    core = sys.modules["vllm.v1.engine.core"]
+    handlers: dict[int, Callable[[int, None], None] | int] = {}
+    signals = SimpleNamespace(
+        SIGTERM=15,
+        SIGINT=2,
+        SIG_DFL=0,
+        Signals=lambda _number: SimpleNamespace(name="SIGTERM"),
+        signal=lambda number, handler: handlers.__setitem__(number, handler),
+    )
+    base = patch.EngineCoreProc if async_dp else core.DPEngineCoreProc
+
+    def interrupted_engine(*args, **kwargs):
+        handler = handlers[signals.SIGTERM]
+        assert callable(handler)
+        handler(signals.SIGTERM, None)
+        return base(*args, **kwargs)
+
+    monkeypatch.setattr(core, "signal", signals)
+    if async_dp:
+        monkeypatch.setattr(patch, "EngineCoreProc", interrupted_engine)
+    else:
+        monkeypatch.setattr(core, "DPEngineCoreProc", interrupted_engine)
+    patch.run_engine_core(
+        vllm_config=_config(async_dp=async_dp, device_type=device_type)
+    )
+
+    assert core.last_engine.shutdown_state == core.EngineShutdownState.REQUESTED
+    assert core.last_engine.shutdown_called is True
+    assert handlers[signals.SIGTERM] == signals.SIG_DFL
+    assert handlers[signals.SIGINT] == signals.SIG_DFL
+
+
 def test_async_dp_engine_patch_preserves_moe_dp_without_afd_config(monkeypatch):
     _load_patch_module(monkeypatch)
     core_module = sys.modules["vllm.v1.engine.core"]
@@ -269,20 +322,6 @@ def test_async_dp_engine_patch_preserves_moe_dp_without_afd_config(monkeypatch):
     assert engine.kind == "dp"
 
 
-def test_async_dp_engine_patch_reload_is_idempotent(monkeypatch):
-    patch_module = _load_patch_module(monkeypatch)
-    core_module = sys.modules["vllm.v1.engine.core"]
-    importlib.reload(patch_module)
-
-    core_module.EngineCoreProc.run_engine_core(
-        vllm_config=_config(connector="CAMP2pAFDConnector", async_dp=False),
-        dp_rank=1,
-    )
-    engine = core_module.last_engine
-
-    assert engine.kind == "dp"
-
-
 def test_async_dp_engine_patch_rebinds_after_backend_override(monkeypatch):
     patch_module = _load_patch_module(monkeypatch)
     core_module = sys.modules["vllm.v1.engine.core"]
@@ -290,16 +329,18 @@ def test_async_dp_engine_patch_rebinds_after_backend_override(monkeypatch):
     core_module.EngineCoreProc.run_engine_core = staticmethod(lambda **_kwargs: None)
 
     assert patch_module.apply_async_dp_engine_patch() is True
-    assert core_module.EngineCoreProc.run_engine_core is patch_module.run_engine_core
+    core_module.EngineCoreProc.run_engine_core(vllm_config=_config(), dp_rank=1)
+    assert core_module.last_engine.kind == "engine"
+    assert core_module.last_engine.engine_index == 1
+    assert core_module.last_engine.shutdown_called is True
 
 
 def test_async_dp_coordinator_disables_wave_coordination(monkeypatch):
     _load_patch_module(monkeypatch)
-    utils_module = sys.modules["vllm.v1.engine.utils"]
     client_module = sys.modules["vllm.v1.engine.core_client"]
 
     addresses = SimpleNamespace()
-    with utils_module.launch_core_engines(
+    with client_module.launch_core_engines(
         _config(),
         object,
         False,
@@ -307,8 +348,6 @@ def test_async_dp_coordinator_disables_wave_coordination(monkeypatch):
     ) as launch:
         assert launch.coordinator.enable_wave_coordination is False
         assert launch.addresses is addresses
-
-    assert client_module.launch_core_engines is utils_module.launch_core_engines
 
 
 def test_non_afd_launch_keeps_upstream_wave_coordination(monkeypatch):
@@ -323,6 +362,45 @@ def test_non_afd_launch_keeps_upstream_wave_coordination(monkeypatch):
         addresses,
     ) as launch:
         assert launch.coordinator.enable_wave_coordination is True
+
+
+@pytest.mark.parametrize("async_dp", [False, True])
+def test_npu_launch_uses_target_coordinator_contract(monkeypatch, async_dp):
+    patch = _load_patch_module(monkeypatch)
+    config = _config(async_dp=async_dp, device_type="npu")
+    addresses = SimpleNamespace()
+    with patch.launch_core_engines(config, object, False, addresses) as launch:
+        assert launch.coordinator.enable_wave_coordination is not async_dp
+        assert launch.addresses.coordinator_input == "coord-input"
+        assert launch.addresses.coordinator_output == "coord-output"
+        assert launch.addresses.frontend_stats_publish_address == "stats-pub"
+        assert config.parallel_config._coord_store_port == 41234
+
+
+@pytest.mark.parametrize("async_dp", [False, True])
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+def test_dp_launch_keeps_coordination_store_alive_until_context_exit(
+    monkeypatch, async_dp, device_type
+):
+    patch = _load_patch_module(monkeypatch)
+    references = []
+
+    class Store:
+        port = 41234
+
+    def create_store(*_args, **_kwargs):
+        store = Store()
+        references.append(weakref.ref(store))
+        return store
+
+    monkeypatch.setattr(
+        sys.modules["vllm.distributed.utils"], "create_tcp_store", create_store
+    )
+    config = _config(async_dp=async_dp, device_type=device_type)
+    with patch.launch_core_engines(config, object, False, SimpleNamespace()):
+        assert config.parallel_config._coord_store_port == Store.port
+        assert references[0]() is not None
+    assert references[0]() is None
 
 
 def test_non_target_vllm_release_skips_patch_application(monkeypatch):
@@ -379,8 +457,7 @@ def test_async_dp_client_skips_first_req(monkeypatch):
     assert request.current_wave == 7
     assert request.client_index == 3
     assert client.first_req_send_socket.messages == []
-    assert client.stats_ready is True
-    assert client.output_ready is True
+    assert client.sent_inputs == [("ADD", request, 1)]
 
 
 def test_non_afd_client_preserves_first_req_wakeup(monkeypatch):

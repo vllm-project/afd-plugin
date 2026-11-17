@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Qwen3.5/3.6 MoE AFD wrapper for the native vLLM lifecycle."""
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -12,10 +12,14 @@ from vllm.model_executor.models import qwen3_5 as native
 from vllm.model_executor.models import qwen3_next as next_native
 
 from afd_plugin.config import parse_optional_afd_config
-from afd_plugin.model_executor.models.deepseek_v2 import AFDAttentionFusedMoE
+from afd_plugin.model_executor.ffn.remote import AFDAttentionFusedMoE
+from afd_plugin.model_executor.models._weight_utils import (
+    ATTENTION_ROLE,
+    FFN_ROLE,
+    filter_role_weights,
+    layer_weight_path,
+)
 
-_ATTENTION_ROLE = frozenset(("attention",))
-_FFN_ROLE = frozenset(("ffn",))
 _NO_ROLES: frozenset[str] = frozenset()
 
 
@@ -29,20 +33,6 @@ def _validate_qwen_text_only(model_config: ModelConfig) -> None:
         )
 
 
-def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
-    """Return ``(layer index, stage, remainder)`` for a decoder weight."""
-    parts = name.split(".")
-    for marker_idx, part in enumerate(parts[:-2]):
-        if part != "layers":
-            continue
-        try:
-            layer_idx = int(parts[marker_idx + 1])
-        except ValueError:
-            continue
-        return layer_idx, parts[marker_idx + 2], tuple(parts[marker_idx + 3 :])
-    return None
-
-
 def _checkpoint_weight_roles(
     name: str,
 ) -> frozenset[str]:
@@ -51,38 +41,25 @@ def _checkpoint_weight_roles(
     if "visual" in parts or "mtp" in parts:
         return _NO_ROLES
 
-    layer_path = _weight_layer_path(name)
+    layer_path = layer_weight_path(name)
     if layer_path is None:
         # Embeddings, final norm, and lm_head are required only by Attention.
-        return _ATTENTION_ROLE
+        return ATTENTION_ROLE
 
     _layer_idx, stage, remainder = layer_path
     if stage in ("linear_attn", "self_attn"):
-        return _ATTENTION_ROLE
+        return ATTENTION_ROLE
     if stage != "mlp":
-        return _ATTENTION_ROLE
+        return ATTENTION_ROLE
     if remainder and remainder[0] == "gate":
-        return _FFN_ROLE
+        return FFN_ROLE
     if remainder and remainder[0] in (
         "experts",
         "shared_expert",
         "shared_expert_gate",
     ):
-        return _FFN_ROLE
+        return FFN_ROLE
     raise RuntimeError(f"unclassified Qwen MoE checkpoint weight: {name}")
-
-
-def _iter_role_weights(
-    weights: Iterable[tuple[str, torch.Tensor]],
-    *,
-    role: str | None,
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """Consume a checkpoint iterator once and retain only this role's paths."""
-    for name, loaded_weight in weights:
-        if role is None or role in _checkpoint_weight_roles(
-            name,
-        ):
-            yield name, loaded_weight
 
 
 class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
@@ -95,8 +72,8 @@ class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
     # Patch functionality: preserve its native forward while keeping a
     # parameter-free experts proxy with a local FFN router.
     # Signature: AFD-owned; layer_idx is required for correlation metadata.
-    # Upstream: vLLM v0.30.0, vllm/model_executor/models/qwen3_next.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/qwen3_next.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def __init__(
         self,
         *,
@@ -149,8 +126,8 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
     # Patch reason: native Qwen3_5DecoderLayer constructs Attention/GDN and MoE.
     # Patch functionality: allocate only the modules owned by the active role.
     # Signature: matches upstream.
-    # Upstream: vLLM v0.30.0, vllm/model_executor/models/qwen3_5.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/qwen3_5.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -179,7 +156,7 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
 
         self.layer_type = layer_type
         self.layer_idx = native.extract_layer_index(prefix)
-        # Native v0.30.0 derives the MoE reduce-scatter mode from the SP
+        # Native v0.32.0 derives the MoE reduce-scatter mode from the SP
         # configuration; AFD rejects SP MoE above, so this is always False.
         is_moe_layer = config.model_type == "qwen3_5_moe_text"
         self.use_attn_reduce_scatter_for_moe = (
@@ -212,6 +189,7 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
                     quant_config=quant_config,
                     prefix=f"{prefix}.self_attn",
                     reduce_results=not self.use_attn_reduce_scatter_for_moe,
+                    mrope_positions_factor=native.mrope_positions_factor(vllm_config),
                 )
             else:
                 raise ValueError(f"Invalid layer_type {self.layer_type}")
@@ -260,7 +238,7 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
             raise RuntimeError("native Qwen MoE is owned by the FFN role")
         if not isinstance(self.mlp, native.Qwen3NextSparseMoeBlock):
             raise RuntimeError("FFN role does not own native Qwen MoE")
-        # v0.30 runner contract: a held gate routes internally, consuming no
+        # v0.32 runner contract: a held gate routes internally, consuming no
         # transported router logits.
         if self.mlp.experts.gate is None:
             raise RuntimeError("FFN native runner must use its local router")
@@ -284,8 +262,8 @@ class AFDQwen3_5Model(native.Qwen3_5Model):  # noqa: N801
     # Patch functionality: use role-aware layers without replacing its forward
     # or load_weights implementation.
     # Signature: matches upstream.
-    # Upstream: vLLM v0.30.0, vllm/model_executor/models/qwen3_5.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/qwen3_5.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # ### PATCH START: require the minimal experts boundary.
         afd_config = parse_optional_afd_config(vllm_config, validate=False)
@@ -377,10 +355,10 @@ class AFDQwen3_5MoeForCausalLM(  # noqa: N801
 
     # Patch reason: the native shell hard-codes Qwen3_5Model construction.
     # Patch functionality: construct AFDQwen3_5Model while preserving inherited
-    # forward, logits, state, and loader methods.
+    # forward, logits, state, and loader methods; retain AFD's aligned-cache scope.
     # Signature: matches upstream.
-    # Upstream: vLLM v0.30.0, vllm/model_executor/models/qwen3_5.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/qwen3_5.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # ### PATCH START: require AFD activation for the replacement shell.
         afd_config = parse_optional_afd_config(vllm_config, validate=False)
@@ -388,18 +366,25 @@ class AFDQwen3_5MoeForCausalLM(  # noqa: N801
             raise RuntimeError("AFD Qwen causal LM requires AFD activation")
         # ### PATCH END
 
-        nn.Module.__init__(self)
         config = vllm_config.model_config.hf_text_config
+        self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
+
+        scheduler_config = vllm_config.scheduler_config
+        # ### PATCH START: retain AFD's qualified aligned-cache scope.
         cache_config = vllm_config.cache_config
         if cache_config.mamba_cache_mode == "all":
             raise NotImplementedError(
-                "Qwen3.5/3.6 requires --mamba-cache-mode=align",
+                "AFD Qwen3.5/3.6 requires --mamba-cache-mode=align",
             )
-        self.vllm_config = vllm_config
-        self.model_config = vllm_config.model_config
+        # ### PATCH END: retain AFD's qualified aligned-cache scope.
         self.quant_config = vllm_config.quant_config
+
+        # ### PATCH START: initialize the role-aware shell without native allocation.
+        nn.Module.__init__(self)
+        # ### PATCH END
         self.config = config
-        self.scheduler_config = vllm_config.scheduler_config
+        self.scheduler_config = scheduler_config
         # ### PATCH START: retain the active AFD role for weight ownership.
         self.afd_config = afd_config
         # ### PATCH END
@@ -450,8 +435,8 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
     # Patch functionality: retain native tower staging but construct the AFD
     # language model. Forward and multimodal interfaces stay native.
     # Signature: matches upstream.
-    # Upstream: vLLM v0.30.0, vllm/model_executor/models/qwen3_5.py
-    # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/qwen3_5.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         # ### PATCH START: enforce AFD's supported Qwen GPU configuration.
         afd_config = parse_optional_afd_config(vllm_config, validate=False)
@@ -480,9 +465,9 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
         # ### PATCH END
 
         nn.Module.__init__(self)
-        config = vllm_config.model_config.hf_config
+        config: native.Qwen3_5MoeConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
-        multimodal_config = vllm_config.model_config.multimodal_config
+        multimodal_config = vllm_config.model_config.get_multimodal_config()
         self.config = config
         self.model_config = vllm_config.model_config
         self.multimodal_config = multimodal_config
@@ -512,6 +497,7 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
                 config.vision_config,
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 quant_config=quant_config,
+                input_norm=native.build_mm_input_norm(self.model_config),
                 prefix=native.maybe_prefix(prefix, "visual"),
             )
         # ### PATCH START: replace only the native language-model child.
@@ -542,9 +528,8 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # ### PATCH START: load each checkpoint path only on its owning role.
         loaded = super().load_weights(
-            _iter_role_weights(
-                weights,
-                role=self.afd_role,
+            filter_role_weights(
+                weights, role=self.afd_role, classify=_checkpoint_weight_roles
             ),
         )
         # ### PATCH END

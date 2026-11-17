@@ -5,21 +5,14 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 from vllm.logger import init_logger
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
-from afd_plugin.async_cam_startup import (
-    GRAPH_STARTUP_TIMEOUT_SECONDS,
-    POLL_SECONDS,
-    FFNGraphPlan,
-)
-from afd_plugin.compat.npu import (
-    ascend_forward_context,
-    fail_if_unsupported_npu_afd_features,
-)
+from afd_plugin.compat.npu import fail_if_unsupported_npu_afd_features
 from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.compat.npu.profiler import (
     create_afd_npu_profiler,
@@ -27,21 +20,26 @@ from afd_plugin.compat.npu.profiler import (
     stop_afd_npu_profiler,
 )
 from afd_plugin.config import parse_afd_config
-from afd_plugin.connectors.metadata import (
-    AFDF2ATransferPayload,
-    AFDForwardContextMetadata,
-)
+from afd_plugin.connectors.metadata import AFDA2FTransferPayload
 from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
 )
-from afd_plugin.envs import async_cam_layered_gmm_enabled
-from afd_plugin.model_executor.npu.async_cam_w4a8 import (
-    AsyncCAMW4A8Executor,
-    W4A8LayerWeights,
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_layered import (
+    AsyncCAMLayeredExecutor,
 )
-from afd_plugin.v1.worker.ffn_metadata import _set_moe_layer_index
-from afd_plugin.v1.worker.npu.async_ffn_two_stream import AsyncFFNTwoStream
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_mega import (
+    AsyncCAMMegaExecutor,
+)
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup import (
+    GRAPH_STARTUP_TIMEOUT_SECONDS,
+    POLL_SECONDS,
+    FFNGraphPlan,
+)
+from afd_plugin.model_executor.ffn.npu.expert_weights import (
+    QuantizedExpertWeights,
+    expert_weight_signature,
+)
 from afd_plugin.validation import (
     cam_receive_capacity,
     requested_ffn_mode,
@@ -58,21 +56,14 @@ logger = init_logger(__name__)
 
 
 class FFNModel(Protocol):
-    def compute_ffn_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-        *,
-        group_list: torch.Tensor | None,
-        dynamic_scales: torch.Tensor | None,
-    ) -> torch.Tensor | AFDF2ATransferPayload: ...
     def get_experts_layer_indices(self) -> tuple[int, ...]: ...
-    def get_async_cam_w4a8_layers(self) -> tuple[list[W4A8LayerWeights], str]: ...
+    def get_quantized_expert_weights(
+        self,
+    ) -> tuple[list[QuantizedExpertWeights], str]: ...
 
 
 class AsyncNPUFFNModelRunner:
     afd_expected_role = "ffn"
-    _two_stream: AsyncFFNTwoStream | None = None
 
     def __init__(
         self,
@@ -88,11 +79,13 @@ class AsyncNPUFFNModelRunner:
         self.afd_config = parse_afd_config(vllm_config, expected_role="ffn")
         fail_if_unsupported_npu_afd_features(vllm_config, afd_config=self.afd_config)
         self.model: FFNModel | None = None
+        self.draft_model: FFNModel | None = None
         self.model_memory_usage = 0
-        self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.layer_ids: tuple[int, ...] = ()
-        self._layered_executor: AsyncCAMW4A8Executor | None = None
-        self._layered_gmm_requested = async_cam_layered_gmm_enabled()
+        self._layered_executor: AsyncCAMLayeredExecutor | None = None
+        self._mega_executor: AsyncCAMMegaExecutor | None = None
+        self.session = self.connector.ffn_session()
+        self._first_step = True
         self.requested_mode = requested_ffn_mode(vllm_config)
         self.effective_mode = "eager"
         self._graph: torch.npu.NPUGraph | None = None
@@ -103,6 +96,21 @@ class AsyncNPUFFNModelRunner:
         self._service_announced = self._is_shutdown = False
         self._failure: Exception | None = None
         self.prof = create_afd_npu_profiler("ffn")
+
+    def attach_model(self, model: FFNModel, *, parameter_bytes: int) -> None:
+        """Borrow an independently loaded model without constructing a Worker."""
+        if self.model is not None or self.connector.is_initialized:
+            raise RuntimeError("Async FFN model must be attached before CAM startup")
+        if parameter_bytes < 0:
+            raise ValueError("model parameter size must be nonnegative")
+        self.model = model
+        self.model_memory_usage = parameter_bytes
+
+    def mark_receiver_exited(self) -> None:
+        """Allow release only after the owner joined a successful receive loop."""
+        if self._graph_pending:
+            raise RuntimeError("Async FFN has pending work; retain resources")
+        self._graph_receiver_exited = True
 
     def load_model(self) -> None:
         # Import the loader only in the isolated, initialized NPU worker.
@@ -138,6 +146,20 @@ class AsyncNPUFFNModelRunner:
                     vllm_config=self.vllm_config, model_config=self.model_config
                 ),
             )
+            if speculative_config is not None and speculative_config.method == "dspark":
+                from vllm.model_executor.models.utils import get_draft_quant_config
+
+                # F has no draft attention or embedding/head to share. Use the
+                # native quantization/weight loader with its role-local model.
+                draft_config = replace(self.vllm_config)
+                draft_config.quant_config = get_draft_quant_config(self.vllm_config)
+                self.draft_model = cast(
+                    FFNModel,
+                    loader.load_model(
+                        vllm_config=draft_config,
+                        model_config=speculative_config.draft_model_config,
+                    ),
+                )
         self.model_memory_usage = profiler.consumed_memory
 
     def get_model(self) -> torch.nn.Module:
@@ -153,63 +175,35 @@ class AsyncNPUFFNModelRunner:
         if self.connector.is_initialized:
             return
         assert self.model is not None
-        self.layer_ids = tuple(sorted(self.model.get_experts_layer_indices()))
-        stream_signature = stream_error = ""
-        config = self.connector.extra_info
+        executor_error = signature = ""
         try:
-            self._initialize_layered_executor()
-        except Exception as exc:
-            if not config.ffn_two_stream:
-                raise
-            stream_error = str(exc)
-        executor = self._layered_executor
-        if config.ffn_two_stream:
-            stream_signature = repr(
-                (
-                    1,
-                    2,
-                    config.ffn_compute_aic_num,
-                    config.ffn_compute_aiv_num,
-                    config.ffn_combine_aiv_num,
-                )
+            models = (self.model,) + (
+                (self.draft_model,) if self.draft_model is not None else ()
             )
-            try:
-                if stream_error:
-                    raise ValueError(stream_error)
-                if executor is None:
-                    raise ValueError("FFN two-stream requires layered W4A8")
-                self._two_stream = AsyncFFNTwoStream(
-                    self.device,
-                    config,
-                    self.connector,
-                    executor,
-                )
-            except Exception as exc:
-                stream_error = str(exc)
-        graph_error = (
-            "requires layered W4A8 (AFD_ASYNC_CAM_LAYERED_GMM=1)"
-            if executor is None
-            else ""
-        )
+            layer_ids = [
+                index for model in models for index in model.get_experts_layer_indices()
+            ]
+            if len(layer_ids) != len(set(layer_ids)):
+                raise ValueError("Target and draft remote MoE layer IDs overlap")
+            self.layer_ids = tuple(sorted(layer_ids))
+            signature = self._initialize_ffn_executor()
+        except Exception as exc:
+            executor_error = str(exc) or type(exc).__name__
         self.connector.graph_startup.plan = FFNGraphPlan(
             requested=self.requested_mode,
-            graph_error=graph_error,
-            signature=executor.graph_signature(cam_receive_capacity())
-            if executor
-            else "",
+            executor_error=executor_error,
+            signature=signature,
             layer_ids=self.layer_ids,
-            stream_signature=stream_signature,
-            stream_error=stream_error,
         )
         try:
             self.connector.init_afd_connector()
-            self.effective_mode = self.connector.graph_startup.mode
-            if self._two_stream is not None:
-                self._two_stream.compute.wait_stream(
-                    torch.npu.current_stream(self.device)
+            if self._mega_executor is not None:
+                assert self.connector.comm_args is not None
+                self._mega_executor.bind_communication(
+                    self.connector.comm_args, self.connector.group_name
                 )
+            self.effective_mode = self.connector.graph_startup.mode
             if self.effective_mode == "full":
-                assert executor is not None
                 chunks = self.connector.graph_startup_chunks() * (
                     self.connector.attn_size // self.connector.tp_size
                 )
@@ -219,10 +213,9 @@ class AsyncNPUFFNModelRunner:
                 done.record()
                 self._wait_graph_device(done)
                 self.connector.graph_startup.phase("warmup")
-                if self._two_stream is None:
-                    stream = torch.npu.Stream(device=self.device)
-                    stream.wait_stream(torch.npu.current_stream(self.device))
-                    self._initialize_graph(stream)
+                stream = torch.npu.Stream(device=self.device)
+                stream.wait_stream(torch.npu.current_stream(self.device))
+                self._initialize_graph(stream)
                 self._capture_graph()
                 self.connector.graph_startup.phase("captured")
         except Exception as exc:
@@ -247,6 +240,7 @@ class AsyncNPUFFNModelRunner:
         self._graph_stream = stream
         self._graph_pool = torch.npu.graph_pool_handle()
         self._graph_tensors: list[torch.Tensor] = []
+        self._graph_payload: AFDA2FTransferPayload | None = None
 
     def _check_graph_live(self) -> None:
         if self._graph_failure is not None:
@@ -259,33 +253,36 @@ class AsyncNPUFFNModelRunner:
     @torch.inference_mode()
     def _capture_graph(self) -> None:
         self._check_graph_live()
-        if self._two_stream is not None:
-            self._two_stream.capture()
-            self._graph_capture_count = self._two_stream.capture_count
-            return
         if self._graph is not None:
             raise RuntimeError("Async FFN may only capture once")
-        assert self._layered_executor is not None
+        assert self._layered_executor is not None or self._mega_executor is not None
         self._graph = torch.npu.NPUGraph()
         try:
             with torch.npu.graph(
                 self._graph, pool=self._graph_pool, stream=self._graph_stream
             ):
-                self._graph_payload = self.connector.recv_attn_output()
-                state = cast(AFDAsyncTransferState, self._graph_payload.context.states)
-                assert state.token_nums_rankid_layeridx is not None
-                assert state.group_list is not None
-                assert state.dynamic_scales is not None
-                self._graph_output = self._layered_executor(
-                    self._graph_payload.hidden_states,
-                    state.dynamic_scales,
-                    state.group_list,
-                    state.token_nums_rankid_layeridx,
-                    retained_tensors=self._graph_tensors,
-                )
-                self.connector.send_ffn_output(
-                    self._graph_output, self._graph_payload.context
-                )
+                if self._mega_executor is not None:
+                    self._graph_payload = None
+                    self._graph_output = self._mega_executor()
+                else:
+                    assert self._layered_executor is not None
+                    self._graph_payload = self.connector.recv_attn_output()
+                    state = cast(
+                        AFDAsyncTransferState, self._graph_payload.context.states
+                    )
+                    assert state.token_nums_rankid_layeridx is not None
+                    assert state.group_list is not None
+                    assert state.dynamic_scales is not None
+                    self._graph_output = self._layered_executor(
+                        self._graph_payload.hidden_states,
+                        state.dynamic_scales,
+                        state.group_list,
+                        state.token_nums_rankid_layeridx,
+                        retained_tensors=self._graph_tensors,
+                    )
+                    self.connector.send_ffn_output(
+                        self._graph_output, self._graph_payload.context
+                    )
             self._graph_capture_count = 1
         except Exception as exc:
             self._graph_failure = exc
@@ -294,13 +291,6 @@ class AsyncNPUFFNModelRunner:
     @torch.inference_mode()
     def _submit_graph(self, count: int = 1) -> None:
         self._check_graph_live()
-        if self._two_stream is not None:
-            if self._graph_pending or self._graph_receiver_exited:
-                raise RuntimeError("Async FFN graph is not ready for replay")
-            self._graph_pending = True
-            self._two_stream.submit(count)
-            self._graph_replay_count = self._two_stream.sequence
-            return
         if (
             self._graph is None
             or self._graph_capture_count != 1
@@ -321,16 +311,13 @@ class AsyncNPUFFNModelRunner:
 
     def _complete_graph(self) -> bool:
         self._check_graph_live()
-        if self._two_stream is not None:
-            result = self._two_stream.complete()
-            self._graph_pending = False
-            return result
         if not self._graph_pending:
             raise RuntimeError("Async FFN has no pending replay")
         try:
             # One fence per bounded batch. The original DR cannot be cancelled;
             # a blocked batch retains its graph, model and communication buffers.
             torch.npu.synchronize()
+            self.session.after_step()
         except Exception as exc:
             self._graph_failure = exc
             raise
@@ -341,10 +328,6 @@ class AsyncNPUFFNModelRunner:
         if self._graph_closed:
             return
         self._check_graph_live()
-        if self._two_stream is not None:
-            self._two_stream.close(receiver_exited=self._graph_receiver_exited)
-            self._graph_closed = True
-            return
         if self._graph_pending or not self._graph_receiver_exited:
             raise RuntimeError(
                 "Async graph resources require receiver exit and device completion"
@@ -357,53 +340,64 @@ class AsyncNPUFFNModelRunner:
         del self._graph_pool, self._graph_stream
         self._graph_closed = True
 
-    def _initialize_layered_executor(self) -> None:
+    def _initialize_ffn_executor(self) -> str:
         assert self.model is not None
-        reason = "switch disabled"
-        if self._layered_gmm_requested:
-            if not isinstance(self.connector, CAMAsyncAFDConnector):
-                reason = "requires CAMAsyncAFDConnector"
-            elif not self.afd_config.compute_gate_on_attention:
-                reason = "requires Attention-side gate"
-            else:
-                layers, reason = self.model.get_async_cam_w4a8_layers()
-                if layers:
-                    if get_ascend_device_type() != AscendDeviceType.A3:
-                        raise ValueError("layered W4A8 GMM requires Ascend 910C/A3")
-                    if self.connector.dynamic_quant != 1:
-                        raise ValueError("layered W4A8 GMM requires dynamicQuant=1")
-                    if tuple(sorted(layer.layer_idx for layer in layers)) != tuple(
-                        self.layer_ids
-                    ):
-                        raise ValueError(
-                            "layered GMM weights do not cover the remote MoE layer IDs"
-                        )
-                    ensure_cam_async_ops_available()
-                    self._layered_executor = AsyncCAMW4A8Executor(layers)
-                    self.connector.layered_gmm_enabled = True
-                    logger.info(
-                        "AFD_ASYNC_CAM_LAYERED_GMM requested=1 actual=layered "
-                        "quant=W4A8 layers=%d mode=%s layer_mapping=%s "
-                        "swiglu_limit=%s ignored=%s",
-                        len(layers),
-                        "per-channel" if layers[0].per_channel else "per-group",
-                        self._layered_executor.layer_id_to_slot is not None,
-                        layers[0].swiglu_limit,
-                        layers[0].swiglu_limit != 0.0,
-                    )
-                    return
+        layers, reason = self.model.get_quantized_expert_weights()
+        if not layers:
+            raise ValueError(f"layered GMM target weights are unsupported: {reason}")
+        if self.draft_model is not None:
+            draft_layers, reason = self.draft_model.get_quantized_expert_weights()
+            if not draft_layers:
+                raise ValueError(f"layered GMM draft weights are unsupported: {reason}")
+            layers = [*layers, *draft_layers]
+        if get_ascend_device_type() != AscendDeviceType.A3:
+            raise ValueError("layered GMM requires Ascend 910C/A3")
+        if self.connector.dynamic_quant != 1:
+            raise ValueError("layered GMM requires dynamicQuant=1")
+        if tuple(sorted(layer.layer_idx for layer in layers)) != self.layer_ids:
+            raise ValueError(
+                "layered GMM weights do not cover the remote MoE layer IDs"
+            )
+        ensure_cam_async_ops_available()
+        if self.connector.extra_info.ffn_mega_moe:
+            self._mega_executor = AsyncCAMMegaExecutor(
+                layers,
+                topology=self.connector.topology,
+                max_num_batched_tokens=self.connector.max_num_batched_tokens,
+                topk=self.connector.topk,
+                tp_size=self.connector.tp_size,
+                capacity=cam_receive_capacity(),
+            )
+            return "native_mc2:" + expert_weight_signature(
+                layers, cam_receive_capacity()
+            )
+        self._layered_executor = AsyncCAMLayeredExecutor(layers)
         logger.info(
-            "AFD_ASYNC_CAM_LAYERED_GMM requested=%s actual=legacy reason=%s",
-            self._layered_gmm_requested,
-            reason,
+            "Async CAM layered GMM quant=%s layers=%d mode=%s layer_mapping=%s "
+            "swiglu_limit=%s ignored=%s",
+            layers[0].quantization,
+            len(layers),
+            "per-channel" if layers[0].per_channel else "per-group",
+            self._layered_executor.layer_id_to_slot is not None,
+            layers[0].swiglu_limit,
+            layers[0].quantization == "W8A8" and bool(layers[0].swiglu_limit),
         )
+        return expert_weight_signature(layers, cam_receive_capacity())
 
     @torch.inference_mode()
-    def execute_connector_driven_step(self) -> bool:
+    def execute_connector_driven_step(self, shutdown_requested: bool = False) -> bool:
         step_afd_npu_profiler(self.prof)
-        if self._graph is None and self._two_stream is None:
-            # Preserve main's eager layer loop and synchronization policy.
+        if not self.session.keep_serving(shutdown_requested):
+            return False
+        if self._first_step:
+            self.session.before_first_step()
+            if self._graph is not None:
+                self._graph_stream.wait_stream(torch.npu.current_stream(self.device))
+            self._first_step = False
+        if self._graph is None:
+            # Eager and graph modes use the same selected compute implementation.
             self._ffn_forward_connector_driven()
+            self.session.after_step()
             return True
         if not self._service_announced:
             self.connector.graph_startup.service_ready()
@@ -413,77 +407,40 @@ class AsyncNPUFFNModelRunner:
         self._submit_graph(len(self.layer_ids))
         return self._complete_graph()
 
+    def drain(self) -> None:
+        self.session.drain(self._run_one_transaction)
+
+    def _run_one_transaction(self) -> None:
+        if self._graph is not None:
+            self._submit_graph(1)
+            self._complete_graph()
+        else:
+            self._ffn_forward_connector_driven(single=True)
+            torch.npu.synchronize()
+            self.session.after_step()
+
     def _ffn_forward_connector_driven(
         self,
         *,
         single: bool = False,
-    ) -> torch.Tensor | AFDF2ATransferPayload | None:
+    ) -> torch.Tensor | None:
         assert self.model is not None
-        if self._two_stream is not None:
-            self._two_stream.submit(1 if single else len(self.layer_ids))
-            self._two_stream.complete(wait=self._wait_graph_device if single else None)
-            return None
-        stage_idx = 0
-        rank_ffn_output = None
-        connector = cast(CAMAsyncAFDConnector, self.connector)
-        if self._layered_executor is not None:
+        if self._mega_executor is not None:
             for _ in self.layer_ids[:1] if single else self.layer_ids:
-                payload = connector.recv_attn_output()
-                states = cast(AFDAsyncTransferState, payload.context.states)
-                rank_ffn_output = self._layered_executor(
-                    payload.hidden_states,
-                    states.dynamic_scales,
-                    states.group_list,
-                    states.token_nums_rankid_layeridx,
-                )
-                connector.send_ffn_output(rank_ffn_output, payload.context)
+                rank_ffn_output = self._mega_executor()
             return rank_ffn_output
-
+        rank_ffn_output = None
+        assert self._layered_executor is not None
         for _ in self.layer_ids[:1] if single else self.layer_ids:
-            work_item = connector.recv_ffn_work_item(
-                stage_idx=stage_idx,
-                max_num_tokens=self.max_num_tokens,
+            payload = self.connector.recv_attn_output()
+            states = cast(AFDAsyncTransferState, payload.context.states)
+            rank_ffn_output = self._layered_executor(
+                payload.hidden_states,
+                states.dynamic_scales,
+                states.group_list,
+                states.token_nums_rankid_layeridx,
             )
-            hidden_states = work_item.hidden_states
-            metadata = work_item.context.metadata
-            legacy_states = work_item.context.states
-            if not isinstance(legacy_states, AFDAsyncTransferState):
-                raise RuntimeError(
-                    "CAM async FFN work item requires AFDAsyncTransferState",
-                )
-            layer_idx = work_item.layer_idx
-            num_tokens = work_item.num_tokens
-            afd_metadata = AFDForwardContextMetadata(
-                tokens_start_loc=[0],
-                requests_start_loc=[0],
-                stage_idx=stage_idx,
-                connector=self.connector,
-                tokens_lens=[num_tokens],
-                num_stages=1,
-                tokens_unpadded_lens=[num_tokens],
-            )
-
-            with ascend_forward_context(
-                vllm_config=self.vllm_config,
-                afd_metadata=afd_metadata,
-                model_instance=self.model,
-                num_tokens=num_tokens,
-                skip_mc2_mask=self.afd_config.compute_gate_on_attention,
-            ) as forward_context:
-                forward_context.dp_metadata = None
-                forward_context.additional_kwargs["afd_metadata"] = metadata
-                _set_moe_layer_index(forward_context, layer_idx)
-
-                rank_ffn_output = self.model.compute_ffn_output(
-                    hidden_states=hidden_states,
-                    layer_idx=layer_idx,
-                    group_list=legacy_states.group_list,
-                    dynamic_scales=legacy_states.dynamic_scales,
-                )
-                rank_ffn_output = connector.send_ffn_work_item_output(
-                    work_item,
-                    rank_ffn_output,
-                )
+            self.connector.send_ffn_output(rank_ffn_output, payload.context)
         return rank_ffn_output
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -508,16 +465,18 @@ class AsyncNPUFFNModelRunner:
             raise RuntimeError(
                 "Failed graph startup retains resources"
             ) from self._failure
+        if self.session.requires_drain and not self._graph_receiver_exited:
+            raise RuntimeError("Receiver has not exited; retain resources")
+        self.session.validate_shutdown()
         from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 
-        if self._two_stream is not None:
-            self._two_stream.close(receiver_exited=self._graph_receiver_exited)
-            self._two_stream = None
-        elif self._graph is not None:
+        if self._graph is not None:
             self._close_graph()
         stop_afd_npu_profiler(self.prof)
         self.connector.close()
+        self._mega_executor = None
         self._layered_executor = None
         free_before_shutdown(self.vllm_config)
         self.model = None
+        self.draft_model = None
         self._is_shutdown = True

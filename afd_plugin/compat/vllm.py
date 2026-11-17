@@ -9,7 +9,12 @@ import warnings
 from importlib.metadata import PackageNotFoundError, version
 from typing import Final
 
-TARGET_VLLM_VERSION: Final[str] = "0.30.0"
+TARGET_VLLM_VERSION: Final[str] = "0.32.0"
+
+
+def get_target_vllm_version() -> str:
+    """Return the common vLLM pin for both backends."""
+    return TARGET_VLLM_VERSION
 
 
 def _parse_release(value: str) -> tuple[int, int, int]:
@@ -32,7 +37,9 @@ def is_vllm_version_supported(installed_version: str | None = None) -> bool:
     if installed_version is None:
         return False
 
-    return _parse_release(installed_version) == _parse_release(TARGET_VLLM_VERSION)
+    return _parse_release(installed_version) == _parse_release(
+        get_target_vllm_version()
+    )
 
 
 def assert_vllm_version_supported(*, strict: bool = True) -> None:
@@ -42,7 +49,7 @@ def assert_vllm_version_supported(*, strict: bool = True) -> None:
 
     message = (
         "AFD plugin currently supports exactly vLLM "
-        f"{TARGET_VLLM_VERSION}; installed vLLM version is "
+        f"{get_target_vllm_version()}; installed vLLM version is "
         f"{installed_version or 'not installed'}"
     )
     if strict:
@@ -53,8 +60,8 @@ def assert_vllm_version_supported(*, strict: bool = True) -> None:
 def is_target_vllm_compatible() -> bool:
     """Return whether compatibility patches may install.
 
-    Tolerates development builds of the target release and any import
-    failure (no vLLM installed) so CPU-safe imports keep working.
+    Tolerates development builds of the target release and missing vLLM so
+    CPU-safe imports keep working.
     """
     try:
         import vllm
@@ -62,16 +69,17 @@ def is_target_vllm_compatible() -> bool:
         version_value = vllm.__version__
     except (AttributeError, ImportError):
         return True
-    version_text = str(version_value)
-    if "dev" in version_text:
-        return True
-    return version_text.startswith(TARGET_VLLM_VERSION)
+    try:
+        return is_vllm_version_supported(str(version_value))
+    except ValueError:
+        return False
 
 
 __all__ = [
     "TARGET_VLLM_VERSION",
     "assert_vllm_version_supported",
     "get_installed_vllm_version",
+    "get_target_vllm_version",
     "is_target_vllm_compatible",
     "is_vllm_version_supported",
 ]

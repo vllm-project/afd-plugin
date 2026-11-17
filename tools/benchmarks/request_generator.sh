@@ -8,13 +8,13 @@
 #
 # Usage:
 #   MODEL_PATH=/path/to/weights tools/benchmarks/request_generator.sh
-#   HOST=127.0.0.1 PORT=18305 INPUT_LEN=8192 OUTPUT_LEN=256 MAX_CONCURRENCY=64 \
+#   HOST=127.0.0.1 PORT=18000 INPUT_LEN=8192 OUTPUT_LEN=256 MAX_CONCURRENCY=64 \
 #       MODEL_PATH=/path/to/weights tools/benchmarks/request_generator.sh
 #
 # Variables (default):
 #   MODEL_PATH        model weights dir/name              (required)
 #   HOST              server host                         (127.0.0.1)
-#   PORT              server port                         (18305)
+#   PORT              server port                         (18000)
 #   DATASET_NAME      vllm bench dataset                  (random)
 #   INPUT_LEN         random input length (ISL)           (1024)
 #   OUTPUT_LEN        random output length (OSL)          (128)
@@ -28,7 +28,7 @@ set -euo pipefail
 
 MODEL_PATH=${MODEL_PATH:?set MODEL_PATH to the model weights dir/name}
 HOST=${HOST:-127.0.0.1}
-PORT=${PORT:-18305}
+PORT=${PORT:-18000}
 DATASET_NAME=${DATASET_NAME:-random}
 INPUT_LEN=${INPUT_LEN:-1024}
 OUTPUT_LEN=${OUTPUT_LEN:-128}

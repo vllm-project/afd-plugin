@@ -1,7 +1,7 @@
 name: CI failure report
 description: Report a failing CI job, flaky test, or validation regression.
 title: "[CI Failure]: "
-labels: ["ci-failure"]
+labels: ["CI-failure"]
 
 body:
   - type: input
@@ -51,4 +51,3 @@ body:
     attributes:
       label: CC list
       description: People who should be aware of this failure.
-

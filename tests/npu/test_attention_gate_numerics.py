@@ -30,12 +30,13 @@ def npu_runtime():
     return torch
 
 
-@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
-def test_gate_loading_and_fp32_logits(npu_runtime, monkeypatch, dtype_name, tmp_path):
+@pytest.fixture(params=["float16", "bfloat16"])
+def gate_case(npu_runtime, monkeypatch, request):
     torch = npu_runtime
     from transformers import DeepseekV2Config
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed import parallel_state
+    from vllm_ascend import ascend_config
     from vllm_ascend.ops.fused_moe.gate_linear import AscendGateLinear
 
     from afd_plugin.model_executor.models import deepseek_v2
@@ -46,7 +47,7 @@ def test_gate_loading_and_fp32_logits(npu_runtime, monkeypatch, dtype_name, tmp_
         SimpleNamespace(rank_in_group=0, world_size=1),
     )
     monkeypatch.setattr(deepseek_v2.native, "GateLinear", AscendGateLinear)
-    dtype = getattr(torch, dtype_name)
+    dtype = getattr(torch, request.param)
     config = DeepseekV2Config(
         hidden_size=64,
         n_routed_experts=8,
@@ -59,45 +60,114 @@ def test_gate_loading_and_fp32_logits(npu_runtime, monkeypatch, dtype_name, tmp_
         norm_topk_prob=True,
     )
     runtime_config = VllmConfig()
+    generator = torch.Generator().manual_seed(417)
+    # Keep unrounded FP32 values so each storage policy is observable.
+    checkpoint = torch.randn(
+        config.n_routed_experts,
+        config.hidden_size,
+        generator=generator,
+        dtype=torch.float32,
+    )
+    hidden = torch.randn(
+        7, config.hidden_size, generator=generator, dtype=torch.float32
+    ).to(dtype)
     old_dtype = torch.get_default_dtype()
     try:
         torch.set_default_dtype(dtype)
-        with set_current_vllm_config(runtime_config), torch.device("npu"):
-            moe = deepseek_v2.GateOnlyRemoteMoE(
+        with set_current_vllm_config(runtime_config):
+            ascend_config.init_ascend_config(runtime_config)
+            yield SimpleNamespace(
+                torch=torch,
+                dtype=dtype,
                 config=config,
-                layer_idx=1,
-                prefix="model.layers.1.mlp",
-                vllm_config=runtime_config,
+                runtime_config=runtime_config,
+                afd_model=deepseek_v2.GateOnlyRemoteMoE,
+                native_gate=AscendGateLinear,
+                gate_options={
+                    "input_size": config.hidden_size,
+                    "output_size": config.n_routed_experts,
+                    "out_dtype": deepseek_v2.native._get_moe_router_dtype(config),
+                    "prefix": "model.layers.1.mlp.gate",
+                },
+                checkpoint=checkpoint,
+                hidden=hidden,
             )
-        assert moe.gate.weight.dtype == torch.float32
-        assert moe.gate.prefix == "model.layers.1.mlp.gate"
-        assert set(dict(moe.named_parameters())) == {
-            "gate.weight",
-            "gate.e_score_correction_bias",
-        }
-        generator = torch.Generator().manual_seed(417)
-        # FP32 checkpoint values are deliberately not rounded to the model dtype.
-        checkpoint = torch.randn(8, 64, generator=generator, dtype=torch.float32)
-        moe.gate.weight.weight_loader(moe.gate.weight, checkpoint.npu())
-        moe.gate.quant_method.process_weights_after_loading(moe.gate)
-        torch.testing.assert_close(moe.gate.weight.cpu(), checkpoint, rtol=0, atol=0)
-        hidden = torch.randn(7, 64, generator=generator, dtype=torch.float32).to(dtype)
-        with torch.inference_mode():
-            actual, _ = moe.gate(hidden.npu())
-        expected = torch.nn.functional.linear(hidden.float(), checkpoint)
-        assert actual.dtype == torch.float32
-        torch.save(
-            {
-                "input": hidden,
-                "checkpoint": checkpoint,
-                "actual": actual.cpu(),
-                "expected": expected,
-            },
-            tmp_path / "gate.pt",
-        )
-        torch.testing.assert_close(actual.cpu(), expected, rtol=2e-5, atol=2e-5)
     finally:
-        torch.set_default_dtype(old_dtype)
+        try:
+            ascend_config.clear_ascend_config()
+        finally:
+            torch.set_default_dtype(old_dtype)
+
+
+def test_gate_loading_and_fp32_logits(gate_case, tmp_path):
+    case = gate_case
+    torch = case.torch
+    with torch.device("npu"):
+        moe = case.afd_model(
+            config=case.config,
+            layer_idx=1,
+            prefix="model.layers.1.mlp",
+            vllm_config=case.runtime_config,
+        )
+        native_gate = case.native_gate(**case.gate_options)
+    assert moe.gate.prefix == "model.layers.1.mlp.gate"
+    assert set(dict(moe.named_parameters())) == {
+        "gate.weight",
+        "gate.e_score_correction_bias",
+    }
+    # bd42eea keeps default weights in the model dtype, with FP32 logits.
+    expected_weight = case.checkpoint.to(case.dtype)
+    for gate in (moe.gate, native_gate):
+        assert gate.weight.dtype == case.dtype
+        gate.weight.weight_loader(gate.weight, case.checkpoint.npu())
+        gate.quant_method.process_weights_after_loading(gate)
+        torch.testing.assert_close(gate.weight.cpu(), expected_weight, rtol=0, atol=0)
+    with torch.inference_mode():
+        actual, _ = moe.gate(case.hidden.npu())
+        expected, _ = native_gate(case.hidden.npu())
+    assert actual.dtype == expected.dtype == torch.float32
+    torch.save(
+        {
+            "input": case.hidden,
+            "checkpoint": case.checkpoint,
+            "expected_weight": expected_weight,
+            "actual": actual.cpu(),
+            "expected": expected.cpu(),
+        },
+        tmp_path / "gate.pt",
+    )
+    torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.parametrize("fp32_policy", ["params_dtype", "force_fp32_compute"])
+def test_native_gate_explicit_fp32_preserves_checkpoint(
+    gate_case, fp32_policy, tmp_path
+):
+    case = gate_case
+    torch = case.torch
+    options = case.gate_options | {
+        fp32_policy: torch.float32 if fp32_policy == "params_dtype" else True
+    }
+    with torch.device("npu"):
+        gate = case.native_gate(**options)
+    assert gate.weight.dtype == torch.float32
+    gate.weight.weight_loader(gate.weight, case.checkpoint.npu())
+    gate.quant_method.process_weights_after_loading(gate)
+    torch.testing.assert_close(gate.weight.cpu(), case.checkpoint, rtol=0, atol=0)
+    with torch.inference_mode():
+        actual, _ = gate(case.hidden.npu())
+    expected = torch.nn.functional.linear(case.hidden.float(), case.checkpoint)
+    assert actual.dtype == torch.float32
+    torch.save(
+        {
+            "input": case.hidden,
+            "checkpoint": case.checkpoint,
+            "actual": actual.cpu(),
+            "expected": expected,
+        },
+        tmp_path / "gate.pt",
+    )
+    torch.testing.assert_close(actual.cpu(), expected, rtol=2e-5, atol=2e-5)
 
 
 @pytest.mark.parametrize(

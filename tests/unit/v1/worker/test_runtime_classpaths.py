@@ -16,8 +16,8 @@ from afd_plugin.validation import (
     NPU_ATTENTION_WORKER_FQCN,
     NPU_FFN_MODEL_RUNNER_FQCN,
     NPU_FFN_WORKER_FQCN,
-    resolve_class_from_qualname,
 )
+from tests.unit.fakes.runtime import resolve_class_from_qualname
 
 GPU_RUNTIME_CLASS_PATHS = [
     ATTENTION_WORKER_FQCN,
@@ -54,27 +54,13 @@ import afd_plugin
 
 afd_plugin.register_afd()
 
-from afd_plugin.validation import resolve_class_from_qualname
+from tests.unit.fakes.runtime import resolve_class_from_qualname
 
 for qualname in sys.argv[1:]:
     cls = resolve_class_from_qualname(qualname)
     assert cls.__module__.startswith("afd_plugin.v1.worker.npu")
 
 """
-
-
-def test_gpu_attention_class_path_selects_mrv2():
-    assert (
-        ATTENTION_MODEL_RUNNER_FQCN == "afd_plugin.v1.worker.AFDAttentionModelRunnerV2"
-    )
-
-
-@pytest.mark.parametrize(
-    "qualname",
-    GPU_RUNTIME_CLASS_PATHS + NPU_RUNTIME_CLASS_PATHS,
-)
-def test_runtime_class_paths_are_plugin_paths(qualname):
-    assert qualname.startswith("afd_plugin.v1.worker")
 
 
 @pytest.mark.vllm_runtime
@@ -87,6 +73,8 @@ def test_gpu_runtime_class_paths_resolve_when_vllm_is_available(qualname):
 
     assert isinstance(cls, type)
     assert cls.__module__.startswith("afd_plugin.v1.worker")
+    if qualname == ATTENTION_MODEL_RUNNER_FQCN:
+        assert cls.__name__ == "AFDAttentionModelRunnerV2"
 
 
 _GPU_WORKER_IMPORT_SCRIPT = """

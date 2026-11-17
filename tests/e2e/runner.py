@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Run fixed baseline and AFD E2E scenarios on real hardware."""
+"""Execute model-declared Cases and retain the existing NPU CLI callers."""
 
 from __future__ import annotations
 
@@ -16,16 +16,36 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Mapping
+import uuid
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
+from tests.e2e import deployment
 from tests.e2e.accuracy.gsm8k import (
     _extract_gsm8k_accuracy,
     _extract_gsm8k_sample_count,
     _run_lm_eval,
 )
 from tests.e2e.cancellation import cancellable_run
+from tests.e2e.case import (
+    NPU_ASYNC_TERMINATION_TIMEOUT_S,
+    NPU_ASYNC_VLLM_SHUTDOWN_TIMEOUT_S,
+    NPU_ASYNC_WORKER_SHUTDOWN_TIMEOUT_S,
+    WORKER_SHUTDOWN_TIMEOUT_ENV,
+    Case,
+    CaseEnvironment,
+    JsonValue,
+    Mrv2Check,
+    Role,
+)
+from tests.e2e.checks.mrv2 import (
+    Mrv2Session,
+    assert_execution_evidence,
+    probe_extension,
+)
+from tests.e2e.environment import parse_case_environment
 from tests.e2e.models.deepseek_v4_flash import config as dsv4_config
 from tests.e2e.models.deepseek_v4_flash.completions import evaluate_completions
 from tests.e2e.models.deepseek_v4_flash.config import (
@@ -47,55 +67,12 @@ from tests.e2e.process_utils import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ASYNC_AFD_CONNECTOR = "CAMAsyncAFDConnector"
-ASYNC_CAM_SCENARIO = "afd-eager-async-cam"
-ASYNC_CAM_ATTENTION_RANKS = 2
-ASYNC_CAM_FFN_RANKS = 2
-ASYNC_CAM_ATTENTION_TP_SIZE = 2
-ASYNC_UBATCH_SCENARIO = "afd-async-ubatch"
-ASYNC_UBATCH_ATTENTION_RANKS = 2
-ASYNC_UBATCH_FFN_RANKS = 1
-ASYNC_UBATCH_ATTENTION_TP_SIZE = 2
-ASYNC_UBATCH_BATCH_SIZE = 2
+NPU_EAGER_DBO_SCENARIO = "afd-eager-dbo-2a2f"
+NPU_EAGER_DBO_DECODE_THRESHOLD = 32
+NPU_EAGER_DBO_PREFILL_THRESHOLD = 512
 # Graph capture default for the scenarios that do not carry their own launch
 # profile; the DSV4 synchronous profiles override it.
 DEFAULT_CUDAGRAPH_CAPTURE_SIZE = 8
-V2_SCENARIOS = (
-    "afd-v2-eager-1a1f",
-    "afd-v2-eager-dp2",
-    "afd-v2-eager-tp2",
-    "afd-v2-graph-1a1f",
-    "afd-v2-graph-dp2",
-    "afd-v2-graph-tp2",
-    "afd-v2-eager-dbo-dp2",
-    "afd-v2-graph-dbo-dp2",
-)
-# DeepEP M2N routes on Attention (gate and top-k there) and dispatches each
-# token straight to the FFN ranks owning its experts.
-DEEPEP_M2N_CONNECTOR = "DeepEPM2NAFDConnector"
-DEEPEP_M2N_SCENARIOS = (
-    "afd-deepep-m2n-eager-2a2f",
-    "afd-deepep-m2n-graph-2a2f",
-    "afd-deepep-m2n-graph-dbo-2a2f",
-    "afd-deepep-m2n-eager-tp2-2a2f",
-    "afd-deepep-m2n-graph-tp2-2a2f",
-)
-# Attention runs DP1 x TP2: each TP rank dispatches its slice of the tokens.
-# FFN stays DP2 x TP1 (experts are not TP-sharded under DeepEP M2N).
-DEEPEP_M2N_ATTENTION_TP_SCENARIOS = frozenset(
-    ("afd-deepep-m2n-eager-tp2-2a2f", "afd-deepep-m2n-graph-tp2-2a2f"),
-)
-DEEPEP_M2N_ATTENTION_TP_SIZE = 2
-V2_DBO_COMPARISON_SCENARIOS = frozenset(
-    ("afd-v2-eager-dp2", "afd-v2-eager-dbo-dp2", "afd-v2-graph-dbo-dp2"),
-)
-V2_DBO_SAMPLE_LIMIT = 128
-V2_DBO_MAX_NUM_SEQS = 8
-V2_SINGLE_RANK_SCENARIOS = frozenset(
-    ("afd-v2-eager-1a1f", "afd-v2-graph-1a1f"),
-)
-V2_TENSOR_PARALLEL_SCENARIOS = frozenset(
-    ("afd-v2-eager-tp2", "afd-v2-graph-tp2"),
-)
 E2E_RUN_ID_ENV = "AFD_E2E_RUN_ID"
 E2E_PROCESS_ROLE_ENV = "AFD_E2E_PROCESS_ROLE"
 PROCESS_TERMINATION_TIMEOUT_S = 20
@@ -114,37 +91,12 @@ FULL_GSM8K_TIMEOUT_S = 8 * 60 * 60
 GSM8K_LIMIT_ENV = "AFD_GSM8K_LIMIT"
 GSM8K_THRESHOLD_ENV = "AFD_GSM8K_THRESHOLD"
 DEFAULT_GSM8K_THRESHOLD = 0.27
-COMPLETION_REQUEST_TIMEOUT_S = 120
-COMPLETION_MAX_TOKENS = 32
-COMPLETION_TEMPERATURE = 0
 DBO_EVAL_NUM_CONCURRENT = 12
 DBO_EVAL_MIN_SAMPLES = 2 * DBO_EVAL_NUM_CONCURRENT
 DBO_EVAL_NUM_UBATCHES = 2
 MRV2_EVIDENCE_RPC_TIMEOUT_S = 30
 MRV2_EVIDENCE_REPLAY_MIN_COUNT = 2
 MRV2_EVIDENCE_PREFIX = "AFD E2E execution: "
-ACCOUNTING_PROMPT = (
-    "<|im_start|>system\n"
-    "You are a professional accountant. Answer questions using accounting "
-    "knowledge, output only the option letter (A/B/C/D).<|im_end|>\n"
-    "<|im_start|>user\n"
-    "Question: A company's balance sheet as of December 31, 2023 shows:\n"
-    "  Current assets: Cash and equivalents 5 million yuan, Accounts "
-    "receivable 8 million yuan, Inventory 6 million yuan\n"
-    "  Non-current assets: Net fixed assets 12 million yuan\n"
-    "  Current liabilities: Short-term loans 4 million yuan, Accounts "
-    "payable 3 million yuan\n"
-    "  Non-current liabilities: Long-term loans 9 million yuan\n"
-    "  Owner's equity: Paid-in capital 10 million yuan, Retained earnings ?\n"
-    "Requirement: Calculate the company's Asset-Liability Ratio and Current "
-    "Ratio (round to two decimal places).\n"
-    "Options:\n"
-    "A. Asset-Liability Ratio=58.33%, Current Ratio=1.90\n"
-    "B. Asset-Liability Ratio=62.50%, Current Ratio=2.17\n"
-    "C. Asset-Liability Ratio=65.22%, Current Ratio=1.75\n"
-    "D. Asset-Liability Ratio=68.00%, Current Ratio=2.50<|im_end|>\n"
-    "<|im_start|>assistant\n"
-)
 
 
 def main() -> int:
@@ -249,23 +201,18 @@ def main() -> int:
         wait_for_openai_api(args, processes)
         ensure_processes_alive(processes)
 
-        if needs_mrv2_execution_evidence(args):
-            mrv2_execution_evidence_rpc(args, "afd_reset_execution_evidence")
-            assert mrv2_evidence_start is not None
-            mrv2_evidence_start.touch()
+        start_evaluation_window(args, mrv2_evidence_start, "evaluation")
         run_scenario_evaluation(args)
-        if needs_mrv2_execution_evidence(args):
-            mrv2_execution_evidence_rpc(args, "afd_log_execution_evidence")
-            assert mrv2_evidence_start is not None
-            mrv2_evidence_start.with_name("evaluation-complete").touch()
-            wait_for_mrv2_execution_summaries(mrv2_execution_evidence, args, processes)
+        finish_evaluation_window(
+            args,
+            mrv2_evidence_start,
+            "evaluation",
+            mrv2_execution_evidence,
+            processes,
+        )
 
         ensure_processes_alive(processes)
 
-    # FFN reports through its existing health RPC. Read all summaries after process
-    # shutdown/join so stdout-reader scheduling cannot look like missing ranks.
-    if needs_mrv2_execution_evidence(args):
-        assert_mrv2_execution_evidence(mrv2_execution_evidence, args)
     print(f"\nE2E SCENARIO {args.scenario} PASSED")
     return 0
 
@@ -313,20 +260,17 @@ def add_scenario_arguments(parser: argparse.ArgumentParser) -> None:
             "afd-graph-2a1f",
             "afd-graph-dbo-2a1f",
             "afd-eager-2a2f",
+            NPU_EAGER_DBO_SCENARIO,
             "afd-graph-2a2f",
             "afd-graph-dbo-2a2f",
-            ASYNC_CAM_SCENARIO,
-            ASYNC_UBATCH_SCENARIO,
             *DSV4_SCENARIOS,
-            *V2_SCENARIOS,
-            *DEEPEP_M2N_SCENARIOS,
         ],
         required=True,
         help="Fixed E2E scenario to run.",
     )
     parser.add_argument(
         "--completion-output-path",
-        help="JSON file containing the ten concurrent DSV4 requests and responses.",
+        help="JSON file containing concurrent DSV4 requests and responses.",
     )
     parser.add_argument(
         "--gsm8k-output-path",
@@ -412,32 +356,16 @@ def add_scenario_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def configure_scenario(args: argparse.Namespace) -> None:
-    """Set topology and features for the selected fixed scenario."""
-    is_async_cam = args.scenario == ASYNC_CAM_SCENARIO
-    is_async_ubatch = args.scenario == ASYNC_UBATCH_SCENARIO
-    is_dsv4 = args.scenario in DSV4_SCENARIOS
-    scenario_settings = {
+    """Configure retained NPU callers; GPU cases are model-owned declarations."""
+    settings = {
         "baseline-graph": (True, True, False, 4, 0),
         "afd-eager-2a1f": (False, False, False, 2, 1),
         "afd-graph-2a1f": (False, True, False, 2, 1),
         "afd-graph-dbo-2a1f": (False, True, True, 2, 1),
         "afd-eager-2a2f": (False, False, False, 2, 2),
+        NPU_EAGER_DBO_SCENARIO: (False, False, True, 2, 2),
         "afd-graph-2a2f": (False, True, False, 2, 2),
         "afd-graph-dbo-2a2f": (False, True, True, 2, 2),
-        ASYNC_CAM_SCENARIO: (
-            False,
-            False,
-            False,
-            ASYNC_CAM_ATTENTION_RANKS,
-            ASYNC_CAM_FFN_RANKS,
-        ),
-        ASYNC_UBATCH_SCENARIO: (
-            False,
-            False,
-            False,
-            ASYNC_UBATCH_ATTENTION_RANKS,
-            ASYNC_UBATCH_FFN_RANKS,
-        ),
         DSV4_ASYNC_CAM_SCENARIO: (
             False,
             False,
@@ -445,119 +373,51 @@ def configure_scenario(args: argparse.Namespace) -> None:
             DSV4_ATTENTION_RANKS,
             DSV4_FFN_RANKS,
         ),
-        "afd-v2-eager-1a1f": (False, False, False, 1, 1),
-        "afd-v2-eager-dp2": (False, False, False, 2, 2),
-        "afd-v2-eager-tp2": (False, False, False, 2, 2),
-        "afd-v2-graph-1a1f": (False, True, False, 1, 1),
-        "afd-v2-graph-dp2": (False, True, False, 2, 2),
-        "afd-v2-graph-tp2": (False, True, False, 2, 2),
-        "afd-v2-eager-dbo-dp2": (False, False, True, 2, 2),
-        "afd-v2-graph-dbo-dp2": (False, True, True, 2, 2),
-        "afd-deepep-m2n-eager-2a2f": (False, False, False, 2, 2),
-        "afd-deepep-m2n-graph-2a2f": (False, True, False, 2, 2),
-        "afd-deepep-m2n-graph-dbo-2a2f": (False, True, True, 2, 2),
-        "afd-deepep-m2n-eager-tp2-2a2f": (False, False, False, 2, 2),
-        "afd-deepep-m2n-graph-tp2-2a2f": (False, True, False, 2, 2),
     }
-    for sync_scenario, sync_profile in DSV4_SYNC_SHAPES.items():
-        # The A5 script's native DBO stays off for these scenarios: a split batch
-        # is the current suspect for the DSA operator tiling failure on that
-        # host.
-        scenario_settings[sync_scenario] = (
+    for scenario, sync_profile in DSV4_SYNC_SHAPES.items():
+        # The A5 host profile keeps native DBO off: split batches are the
+        # current suspect for its DSA operator tiling failure.
+        settings[scenario] = (
             False,
             dsv4_config.sync_use_graph(sync_profile),
             False,
             sync_profile.attention_ranks,
             sync_profile.ffn_ranks,
         )
-    baseline, use_graph, enable_dbo, attention_ranks, ffn_ranks = scenario_settings[
-        args.scenario
-    ]
+    baseline, graph, dbo, attention_ranks, ffn_ranks = settings[args.scenario]
     args.baseline = baseline
-    args.cuda_graph_full_decode_only = use_graph
-    args.enable_dbo = enable_dbo
+    args.cuda_graph_full_decode_only = graph
+    args.enable_dbo = dbo
     args.num_attention_ranks = attention_ranks
     args.num_ffn_ranks = ffn_ranks
     args.attention_data_parallel_address = None
-    # A runner that cannot drive the evidence window turns this off.
     args.collect_mrv2_execution_evidence = True
     args.tp_size = 1
-    active_sync_profile = sync_shape(args.scenario)
-    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
-        args.attention_tp_size = DSV4_ATTENTION_TP_SIZE
-    elif active_sync_profile is not None:
-        args.attention_tp_size = active_sync_profile.attention_tp_size
-    elif is_async_cam:
-        args.attention_tp_size = ASYNC_CAM_ATTENTION_TP_SIZE
-    elif is_async_ubatch:
-        args.attention_tp_size = ASYNC_UBATCH_ATTENTION_TP_SIZE
-    elif args.scenario in V2_TENSOR_PARALLEL_SCENARIOS:
-        args.attention_tp_size = 2
-    elif args.scenario in DEEPEP_M2N_ATTENTION_TP_SCENARIOS:
-        args.attention_tp_size = DEEPEP_M2N_ATTENTION_TP_SIZE
-    else:
-        args.attention_tp_size = 1
-    if args.scenario in V2_TENSOR_PARALLEL_SCENARIOS:
-        args.ffn_tp_size = 2
-    elif active_sync_profile is not None:
-        # A synchronous DSV4 profile sizes the FFN side exactly like its
-        # Attention side: A5 shards by data parallel with expert parallelism,
-        # A3 by tensor parallel.
-        args.ffn_tp_size = active_sync_profile.ffn_tp_size
-    else:
-        args.ffn_tp_size = 1
-    if not is_async_cam and not is_dsv4 and args.gsm8k_output_path is None:
+    profile = sync_shape(args.scenario)
+    args.attention_tp_size = (
+        DSV4_ATTENTION_TP_SIZE
+        if args.scenario == DSV4_ASYNC_CAM_SCENARIO
+        else profile.attention_tp_size
+        if profile is not None
+        else 1
+    )
+    args.ffn_tp_size = profile.ffn_tp_size if profile is not None else 1
+    if args.scenario not in DSV4_SCENARIOS and args.gsm8k_output_path is None:
         raise ValueError("--gsm8k-output-path is required for GSM8K scenarios")
-    if is_async_cam:
-        args.afd_connector = ASYNC_AFD_CONNECTOR
-        args.afd_async = True
-        args.compute_gate_on_attention = True
-        extra_config = parse_afd_connector_extra_config(
-            args.afd_connector_extra_config,
-        )
-        extra_config["attn_ranks_per_dp"] = ASYNC_CAM_ATTENTION_TP_SIZE
-        args.afd_connector_extra_config = [
-            json.dumps(extra_config, separators=(",", ":")),
-        ]
-    if is_async_ubatch:
-        args.afd_connector = ASYNC_AFD_CONNECTOR
-        args.afd_async = True
-        args.compute_gate_on_attention = True
-        extra_config = parse_afd_connector_extra_config(
-            args.afd_connector_extra_config,
-        )
-        # This fixed scenario must exercise the TP/SP token-split path. Replace
-        # conflicting caller values instead of silently changing its contract.
-        extra_config["attn_ranks_per_dp"] = ASYNC_UBATCH_ATTENTION_TP_SIZE
-        args.attention_vllm_arg.append("--enable-dbo")
-        args.afd_connector_extra_config = [
-            json.dumps(extra_config, separators=(",", ":")),
-        ]
-        # CAM dispatch allocates its HCCL communication pool (~8.6 GB) outside
-        # the torch memory pool; the default 0.92 GPU memory utilization leaves
-        # too little room and fails with EL0004. 0.8 leaves enough headroom.
-        if not any(
-            arg == "--gpu-memory-utilization"
-            or arg.startswith("--gpu-memory-utilization=")
-            for arg in args.common_vllm_arg
-        ):
-            args.common_vllm_arg.extend(["--gpu-memory-utilization", "0.8"])
-    if args.scenario in DEEPEP_M2N_SCENARIOS:
-        args.afd_connector = DEEPEP_M2N_CONNECTOR
-        args.compute_gate_on_attention = True
     if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
         dsv4_config.configure_scenario(args)
     elif args.scenario in DSV4_SYNC_CAMP2P_SCENARIOS:
         dsv4_config.configure_sync_camp2p_scenario(args)
-    if use_graph:
+    if graph:
         args.cudagraph_capture_size = (
-            active_sync_profile.cudagraph_capture_size
-            if active_sync_profile is not None
+            profile.cudagraph_capture_size
+            if profile is not None
             else DEFAULT_CUDAGRAPH_CAPTURE_SIZE
         )
-    if enable_dbo:
-        # vLLM 0.30 validates that both DBO thresholds are at least the
-        # microbatch count (2), so a decode threshold of 1 is rejected.
+    if args.scenario == NPU_EAGER_DBO_SCENARIO:
+        args.dbo_decode_token_threshold = NPU_EAGER_DBO_DECODE_THRESHOLD
+        args.dbo_prefill_token_threshold = NPU_EAGER_DBO_PREFILL_THRESHOLD
+    elif dbo:
         args.dbo_decode_token_threshold = 2
         args.dbo_prefill_token_threshold = 8
 
@@ -587,22 +447,17 @@ def validate_topology(
             f"--ffn-devices must contain exactly {args.num_ffn_ranks} device",
         )
     if args.baseline:
-        if args.num_attention_ranks != 4 or args.num_ffn_ranks != 0:
+        baseline_ranks = 4
+        if args.num_attention_ranks != baseline_ranks or args.num_ffn_ranks != 0:
             raise ValueError(
-                "baseline E2E requires four Attention ranks and no FFN ranks",
+                f"baseline E2E requires {baseline_ranks} Attention ranks "
+                "and no FFN ranks",
             )
         if role_tp_size(args, "attention") != 1:
             raise ValueError("baseline E2E requires Attention TP=1")
         return
-    if args.scenario in V2_SCENARIOS and args.device_backend != "gpu":
-        raise ValueError("ModelRunnerV2 E2E scenarios require GPU")
-    if args.scenario in DEEPEP_M2N_SCENARIOS and args.device_backend != "gpu":
-        raise ValueError("DeepEP M2N E2E scenarios require GPU")
-    if (
-        args.scenario in (ASYNC_CAM_SCENARIO, ASYNC_UBATCH_SCENARIO)
-        and args.device_backend != "npu"
-    ):
-        raise ValueError("async CAM scenarios require NPU")
+    if args.scenario == NPU_EAGER_DBO_SCENARIO and args.device_backend != "npu":
+        raise ValueError("Lite eager DBO scenario requires NPU")
     if args.scenario in DSV4_SCENARIOS and args.device_backend != "npu":
         raise ValueError("DSV4 scenarios require NPU")
     for role, rank_count in (
@@ -642,6 +497,9 @@ def build_baseline_command(args: argparse.Namespace) -> list[str]:
         "1",
         "--enable-expert-parallel",
     ]
+    if needs_mrv2_execution_evidence(args):
+        cmd.extend(["--worker-extension-cls", "tests.e2e.mrv2_evidence.Worker"])
+    cmd.extend(dbo_vllm_arguments(args))
     if args.cuda_graph_full_decode_only:
         capture_size = str(args.cudagraph_capture_size)
         cmd.extend(
@@ -650,6 +508,10 @@ def build_baseline_command(args: argparse.Namespace) -> list[str]:
                 capture_size,
                 "--max-num-batched-tokens",
                 capture_size,
+            ],
+        )
+        cmd.extend(
+            [
                 "--max-cudagraph-capture-size",
                 capture_size,
                 "--cudagraph-capture-sizes",
@@ -720,7 +582,11 @@ def build_vllm_command(
         "serve",
         args.model,
         "--shutdown-timeout",
-        str(VLLM_SHUTDOWN_TIMEOUT_S),
+        str(
+            NPU_ASYNC_VLLM_SHUTDOWN_TIMEOUT_S
+            if is_npu and args.afd_async
+            else VLLM_SHUTDOWN_TIMEOUT_S
+        ),
         "--served-model-name",
         served_model_name(args, role),
         "--data-parallel-size",
@@ -777,15 +643,6 @@ def build_vllm_command(
         )
     if needs_mrv2_execution_evidence(args):
         cmd.extend(["--worker-extension-cls", "tests.e2e.mrv2_evidence.Worker"])
-    if args.scenario in V2_DBO_COMPARISON_SCENARIOS:
-        # Keep request concurrency identical across the no-DBO, eager DBO
-        # and graph DBO comparison; retain native chunked-prefill defaults.
-        cmd.extend(
-            [
-                "--max-num-seqs",
-                str(V2_DBO_MAX_NUM_SEQS),
-            ],
-        )
     profile_compilation_config = (
         None
         if sync_profile is None
@@ -806,8 +663,7 @@ def build_vllm_command(
         # profiles do) keeps it: the capture size only has to cover it.
         max_num_seqs_args = (
             []
-            if args.scenario in V2_DBO_COMPARISON_SCENARIOS
-            or any(arg == "--max-num-seqs" for arg in args.common_vllm_arg)
+            if any(arg == "--max-num-seqs" for arg in args.common_vllm_arg)
             else ["--max-num-seqs", capture_size]
         )
         cmd.extend(
@@ -827,21 +683,7 @@ def build_vllm_command(
     else:
         cmd.append("--enforce-eager")
 
-    if args.enable_dbo:
-        prefill_threshold = (
-            args.dbo_prefill_token_threshold
-            if args.dbo_prefill_token_threshold is not None
-            else args.cudagraph_capture_size
-        )
-        cmd.extend(
-            [
-                "--enable-dbo",
-                "--dbo-decode-token-threshold",
-                str(args.dbo_decode_token_threshold),
-                "--dbo-prefill-token-threshold",
-                str(prefill_threshold),
-            ],
-        )
+    cmd.extend(dbo_vllm_arguments(args))
 
     # A headless slot starts no API server (vllm/entrypoints/cli/serve.py:61),
     # so binding one would only reserve a port it never uses.
@@ -864,8 +706,26 @@ def build_vllm_command(
     return cmd
 
 
+def dbo_vllm_arguments(args: argparse.Namespace) -> list[str]:
+    """Keep native and AFD qualification on identical DBO thresholds."""
+    if not args.enable_dbo:
+        return []
+    prefill_threshold = (
+        args.dbo_prefill_token_threshold
+        if args.dbo_prefill_token_threshold is not None
+        else args.cudagraph_capture_size
+    )
+    return [
+        "--enable-dbo",
+        "--dbo-decode-token-threshold",
+        str(args.dbo_decode_token_threshold),
+        "--dbo-prefill-token-threshold",
+        str(prefill_threshold),
+    ]
+
+
 def role_tp_size(args: argparse.Namespace, role: str) -> int:
-    if role == "attention":
+    if role in ("attention", "baseline"):
         return args.attention_tp_size or args.tp_size
     if role == "ffn":
         return args.ffn_tp_size or args.tp_size
@@ -888,15 +748,13 @@ def uses_async_connector(args: argparse.Namespace) -> bool:
 
 def uses_npu_async_process_cleanup(args: argparse.Namespace) -> bool:
     """Return whether E2E teardown must find and kill every FFN process."""
-    return args.device_backend == "npu" and args.scenario in (
-        ASYNC_CAM_SCENARIO,
-        ASYNC_UBATCH_SCENARIO,
-        DSV4_ASYNC_CAM_SCENARIO,
-    )
+    return args.device_backend == "npu" and args.scenario == DSV4_ASYNC_CAM_SCENARIO
 
 
 def process_termination_timeout(args: argparse.Namespace) -> float:
     """Return the scenario's teardown budget, shared by every runner."""
+    if args.device_backend == "npu" and args.afd_async and not args.baseline:
+        return NPU_ASYNC_TERMINATION_TIMEOUT_S
     if args.scenario in DSV4_SCENARIOS:
         return DSV4_PROCESS_TERMINATION_TIMEOUT_S
     return PROCESS_TERMINATION_TIMEOUT_S
@@ -904,9 +762,7 @@ def process_termination_timeout(args: argparse.Namespace) -> float:
 
 def run_scenario_evaluation(args: argparse.Namespace) -> None:
     """Run the scenario's acceptance check, shared by every runner."""
-    if args.scenario == ASYNC_CAM_SCENARIO:
-        run_completion_evaluation(args)
-    elif args.scenario in DSV4_SCENARIOS:
+    if args.scenario in DSV4_SCENARIOS:
         run_concurrent_completion_evaluation(args)
     else:
         run_gsm8k_evaluation(args)
@@ -943,15 +799,12 @@ def run_gsm8k_evaluation(args: argparse.Namespace) -> None:
     """Run the configured GSM8K workload against the scenario's public API."""
     if args.gsm8k_output_path is None:
         raise RuntimeError("--gsm8k-output-path is required for GSM8K scenarios")
-    is_v2_dbo_comparison = args.scenario in V2_DBO_COMPARISON_SCENARIOS
     configured_limit = os.environ.get(
         GSM8K_LIMIT_ENV,
-        str(
-            V2_DBO_SAMPLE_LIMIT if is_v2_dbo_comparison else DEFAULT_GSM8K_SAMPLE_LIMIT
-        ),
+        str(DEFAULT_GSM8K_SAMPLE_LIMIT),
     )
     sample_limit = None if configured_limit == "all" else int(configured_limit)
-    if (args.enable_dbo or is_v2_dbo_comparison) and sample_limit is not None:
+    if args.enable_dbo and sample_limit is not None:
         sample_limit = max(sample_limit, DBO_EVAL_MIN_SAMPLES)
     expected_sample_count = (
         GSM8K_FULL_SAMPLE_COUNT if sample_limit is None else sample_limit
@@ -959,12 +812,8 @@ def run_gsm8k_evaluation(args: argparse.Namespace) -> None:
     full_run_options = (
         {"timeout_s": FULL_GSM8K_TIMEOUT_S} if sample_limit is None else {}
     )
-    scenario_options = (
-        {"batch_size": ASYNC_UBATCH_BATCH_SIZE}
-        if args.scenario == ASYNC_UBATCH_SCENARIO
-        else {}
-    )
-    if args.enable_dbo or is_v2_dbo_comparison:
+    scenario_options = {}
+    if args.enable_dbo:
         scenario_options["num_concurrent"] = DBO_EVAL_NUM_CONCURRENT
     role = "baseline" if args.baseline else "attention"
     results = _run_lm_eval(
@@ -994,21 +843,18 @@ def run_gsm8k_evaluation(args: argparse.Namespace) -> None:
 
 
 def uses_dbo_execution(args: argparse.Namespace) -> bool:
-    # The Lite Async case deliberately supplies enough work for native DBO.
-    # DSV4 keeps native DBO thresholds: its ten short requests can
-    # legitimately remain unsplit, so that case retains its original oracle.
-    return args.enable_dbo or args.scenario == ASYNC_UBATCH_SCENARIO
+    return args.enable_dbo
 
 
 def execution_evidence_roles(args: argparse.Namespace) -> tuple[str, ...]:
+    if args.baseline:
+        return ("baseline",)
     # Async CAM stages belong to Attention; FFN consumes independent native
     # work items. Sync graph/DBO must prove the matching path on both roles.
     return ("attention",) if uses_async_connector(args) else ("attention", "ffn")
 
 
 def needs_mrv2_execution_evidence(args: argparse.Namespace) -> bool:
-    # The opt-out is checked last: callers that build their own namespace
-    # (ffn_graph.py) never enable graph decode or DBO, so they need not set it.
     return (
         not args.baseline
         and (args.cuda_graph_full_decode_only or uses_dbo_execution(args))
@@ -1016,7 +862,41 @@ def needs_mrv2_execution_evidence(args: argparse.Namespace) -> bool:
     )
 
 
-def mrv2_execution_evidence_rpc(args: argparse.Namespace, method: str) -> None:
+def start_evaluation_window(
+    args: argparse.Namespace, start_marker: Path | None, window: str
+) -> None:
+    if not needs_mrv2_execution_evidence(args):
+        return
+    assert start_marker is not None
+    start_marker.with_name("evaluation-complete").unlink(missing_ok=True)
+    mrv2_execution_evidence_rpc(args, "afd_reset_execution_evidence", window)
+    pending = start_marker.with_suffix(".pending")
+    pending.write_text(window)
+    pending.replace(start_marker)
+
+
+def finish_evaluation_window(
+    args: argparse.Namespace,
+    start_marker: Path | None,
+    window: str,
+    evidence: list[tuple[str, str]],
+    processes: list[subprocess.Popen[str]],
+) -> dict[tuple[int, int, int, int], set[tuple[int, ...]]]:
+    if not needs_mrv2_execution_evidence(args):
+        return {}
+    assert start_marker is not None
+    mrv2_execution_evidence_rpc(args, "afd_log_execution_evidence")
+    start_marker.with_name("evaluation-complete").write_text(window)
+    wait_for_mrv2_execution_summaries(evidence, args, processes, window=window)
+    scoped = [(role, line) for role, line in evidence if f"window={window} " in line]
+    if args.cuda_graph_full_decode_only or uses_dbo_execution(args):
+        assert_mrv2_execution_evidence(scoped, args)
+    return {}
+
+
+def mrv2_execution_evidence_rpc(
+    args: argparse.Namespace, method: str, window: str | None = None
+) -> None:
     """Broadcast on Attention; its DP/TP workers log their own summaries.
 
     Pinned vLLM's DP load balancer returns only the first DP engine's result,
@@ -1026,7 +906,11 @@ def mrv2_execution_evidence_rpc(args: argparse.Namespace, method: str) -> None:
     request = urllib.request.Request(
         f"http://{args.api_host}:{attention_api_port(args)}/collective_rpc",
         data=json.dumps(
-            {"method": method, "timeout": MRV2_EVIDENCE_RPC_TIMEOUT_S}
+            {
+                "method": method,
+                "timeout": MRV2_EVIDENCE_RPC_TIMEOUT_S,
+                "kwargs": {} if window is None else {"evaluation_window": window},
+            }
         ).encode(),
         headers={"Content-Type": "application/json"},
     )
@@ -1040,13 +924,13 @@ def wait_for_mrv2_execution_summaries(
     evidence: list[tuple[str, str]],
     args: argparse.Namespace,
     processes: list[subprocess.Popen[str]],
+    *,
+    window: str | None = None,
 ) -> None:
     expected: set[tuple[str, int, int]] = set()
     for role in execution_evidence_roles(args):
         tp_size = role_tp_size(args, role)
-        rank_count = (
-            args.num_attention_ranks if role == "attention" else args.num_ffn_ranks
-        )
+        rank_count = args.num_ffn_ranks if role == "ffn" else args.num_attention_ranks
         expected.update(
             (role, dp, tp)
             for dp in range(rank_count // tp_size)
@@ -1058,6 +942,7 @@ def wait_for_mrv2_execution_summaries(
         observed = {
             (role, int(match[1]), int(match[2]))
             for role, line in evidence
+            if window is None or f"window={window} " in line
             if (match := re.search(r"dp_rank=(\d+) tp_rank=(\d+)", line)) is not None
         }
         if expected <= observed:
@@ -1065,7 +950,7 @@ def wait_for_mrv2_execution_summaries(
         if time.monotonic() >= deadline:
             raise RuntimeError(
                 "Timed out waiting for MRV2 execution summaries: "
-                f"{sorted(expected - observed)}"
+                f"window={window} {sorted(expected - observed)}"
             )
         time.sleep(PROCESS_POLL_INTERVAL_S)
 
@@ -1073,127 +958,34 @@ def wait_for_mrv2_execution_summaries(
 def assert_mrv2_execution_evidence(
     evidence: list[tuple[str, str]], args: argparse.Namespace
 ) -> None:
-    metric = (
-        "two_stage_graph_replays"
-        if uses_dbo_execution(args) and args.cuda_graph_full_decode_only
-        else "two_stage_steps"
-        if uses_dbo_execution(args)
-        else "graph_replays"
-    )
-    minimum = (
-        MRV2_EVIDENCE_REPLAY_MIN_COUNT if metric == "two_stage_graph_replays" else 1
-    )
-    layout_kind = (
-        "consecutive_graph" if args.cuda_graph_full_decode_only else "two_stage"
-    )
-    common_layouts: set[str] | None = None
-    for role in execution_evidence_roles(args):
-        tp_size = role_tp_size(args, role)
-        rank_count = (
-            args.num_attention_ranks if role == "attention" else args.num_ffn_ranks
+    roles = execution_evidence_roles(args)
+    layouts = {
+        role: Role(
+            dp=(args.num_ffn_ranks if role == "ffn" else args.num_attention_ranks)
+            // role_tp_size(args, role),
+            tp=role_tp_size(args, role),
         )
-        expected = {
-            (dp, tp) for dp in range(rank_count // tp_size) for tp in range(tp_size)
-        }
-        observed = set()
-        layouts: dict[str, set[tuple[int, int]]] = {}
-        for recorded_role, line in evidence:
-            if recorded_role != role:
-                continue
-            match = re.search(
-                rf"dp_rank=(\d+) tp_rank=(\d+).*\b{metric}=(\d+)(?: |$)", line
-            )
-            if match is not None and int(match[3]) >= minimum:
-                rank = (int(match[1]), int(match[2]))
-                observed.add(rank)
-                if uses_dbo_execution(args) and not uses_async_connector(args):
-                    payload = json.loads(line.split(" layouts=", 1)[1])
-                    for layout in payload[layout_kind]:
-                        key = json.dumps(layout, separators=(",", ":"))
-                        layouts.setdefault(key, set()).add(rank)
-        if missing := expected - observed:
-            raise RuntimeError(
-                f"{args.device_backend.upper()} {role} lacks live "
-                f"{metric}>={minimum} evidence on ranks "
-                f"{sorted(missing)}"
-            )
-        if uses_dbo_execution(args) and not uses_async_connector(args):
-            complete_layouts = {
-                layout for layout, ranks in layouts.items() if expected <= ranks
-            }
-            common_layouts = (
-                complete_layouts
-                if common_layouts is None
-                else common_layouts & complete_layouts
-            )
-    if (
-        uses_dbo_execution(args)
-        and not uses_async_connector(args)
-        and not common_layouts
-    ):
-        raise RuntimeError(
-            f"{args.device_backend.upper()} DBO lacks matching two-stage layouts "
-            "across every participating rank"
-            + (
-                " with consecutive graph replays"
-                if args.cuda_graph_full_decode_only
-                else ""
-            )
-        )
-    print(
-        f"[execution-coverage] live {metric}>={minimum} "
-        "confirmed on every participating rank"
+        for role in roles
+    }
+    assert_execution_evidence(
+        evidence,
+        Mrv2Check(
+            roles, graph=args.cuda_graph_full_decode_only, dbo=uses_dbo_execution(args)
+        ),
+        role_layouts=layouts,
+        backend=args.device_backend,
+        asynchronous=uses_async_connector(args),
     )
-
-
-def run_completion_evaluation(args: argparse.Namespace) -> None:
-    """Send the async CAM smoke request and require one returned choice."""
-    payload = json.dumps(
-        {
-            "model": served_model_name(args, "attention"),
-            "prompt": ACCOUNTING_PROMPT,
-            "max_tokens": COMPLETION_MAX_TOKENS,
-            "temperature": COMPLETION_TEMPERATURE,
-        },
-    ).encode()
-    request = urllib.request.Request(
-        f"http://{args.api_host}:{attention_api_port(args)}/v1/completions",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=COMPLETION_REQUEST_TIMEOUT_S,
-        ) as response:
-            result = json.loads(response.read())
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode(errors="replace")
-        raise RuntimeError(
-            f"completion request failed with HTTP {exc.code}: {body}",
-        ) from exc
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"completion request failed: {exc}") from exc
-
-    choices = result.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise RuntimeError("completion response contains no choices")
-    choice = choices[0]
-    text = choice.get("text") if isinstance(choice, dict) else None
-    if not isinstance(text, str) or not text.strip():
-        raise RuntimeError("completion response contains no text")
-    print(f"Completion response: {text}")
 
 
 def run_concurrent_completion_evaluation(args: argparse.Namespace) -> None:
     profile = sync_shape(args.scenario)
+    role = "baseline" if args.baseline else "attention"
     evaluate_completions(
         url=f"http://{args.api_host}:{attention_api_port(args)}/v1/chat/completions",
-        model=served_model_name(args, "attention"),
+        model=served_model_name(args, role),
         output_path=Path(args.completion_output_path),
-        # A synchronous profile may state that its host does not answer reliably
-        # yet, and then the oracle checks the concurrent plumbing only.
+        # Preserve the NPU profile's answer/plumbing acceptance policy.
         check_answer=True if profile is None else profile.check_answer,
     )
 
@@ -1213,8 +1005,14 @@ def build_env(
     env.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "18000")
     env[visible_devices_env_name(args.device_backend)] = visible_devices
     env["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    env.pop("AFD_E2E_HASH_INPUT_IDS", None)
+    env.pop("AFD_E2E_HASH_REQUIRE_GRAPH", None)
     if needs_mrv2_execution_evidence(args):
         env["VLLM_SERVER_DEV_MODE"] = "1"
+        if args.baseline:
+            env["AFD_E2E_NATIVE_BASELINE"] = "1"
+        else:
+            env.pop("AFD_E2E_NATIVE_BASELINE", None)
         if mrv2_evidence_start is not None:
             env["AFD_E2E_MRV2_EVIDENCE_START"] = str(mrv2_evidence_start)
     if args.baseline:
@@ -1231,6 +1029,11 @@ def build_env(
         env[E2E_PROCESS_ROLE_ENV] = role
     if args.device_backend == "npu":
         env.pop("VLLM_ASCEND_ENABLE_FLASHCOMM1", None)
+        if args.afd_async and not args.baseline:
+            env.setdefault(
+                WORKER_SHUTDOWN_TIMEOUT_ENV,
+                str(NPU_ASYNC_WORKER_SHUTDOWN_TIMEOUT_S),
+            )
     env.pop("AFD_PLUGIN_EARLY_ENGINE_PATCH", None)
     current_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (
@@ -1371,6 +1174,157 @@ def shell_quote(value: str) -> str:
     if value and all(char.isalnum() or char in "@%_+=:,./-" for char in value):
         return value
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def prepare_case(
+    case: Case, environment: CaseEnvironment, *, slots: tuple[RoleSlot, ...] = ()
+) -> tuple[Case, dict]:
+    """Resolve documented overrides without mutating the canonical declaration."""
+    effective_phases = []
+    reasons: list[str] = []
+    for phase in case.phases:
+        task, phase_reasons = phase.task.resolve(os.environ)
+        effective_phases.append(replace(phase, task=task))
+        reasons.extend(f"{phase.name}: {reason}" for reason in phase_reasons)
+    profile = case.deployment
+    override_names: tuple[str, ...] = (GSM8K_LIMIT_ENV, GSM8K_THRESHOLD_ENV)
+    if profile.worker_shutdown_timeout_s is not None:
+        override_names += (WORKER_SHUTDOWN_TIMEOUT_ENV,)
+        worker_timeout = os.environ.get(WORKER_SHUTDOWN_TIMEOUT_ENV)
+        if worker_timeout is not None:
+            profile = replace(profile, worker_shutdown_timeout_s=int(worker_timeout))
+    effective = replace(case, deployment=profile, phases=tuple(effective_phases))
+    resolved = deployment.resolve(effective, environment, slots=slots)
+    probe_arguments = (
+        ("--worker-extension-cls", probe_extension(effective))
+        if any(phase.checks for phase in effective.phases)
+        else ()
+    )
+    record = {
+        "case_id": case.id,
+        "run_id": uuid.uuid4().hex,
+        "canonical": asdict(case),
+        "effective": asdict(effective),
+        "bindings": {
+            **asdict(environment),
+            "output_path": str(environment.output_path),
+        },
+        "overrides": {
+            name: os.environ[name] for name in override_names if name in os.environ
+        },
+        "configuration": {
+            "eligible": not reasons,
+            "classification": "debug" if reasons else "qualified",
+            "reasons": reasons,
+        },
+        "commands": {
+            role: resolved.command(role, probe_arguments)
+            for role, _ in resolved.role_devices
+        },
+        "execution": {"status": "not_started"},
+        "cleanup": {"status": "not_started"},
+        "phases": [],
+        "acceptance_passed": False,
+    }
+    return effective, record
+
+
+def run_case(case: Case, environment: CaseEnvironment) -> dict:
+    """Execute one deployment and record task, evidence and cleanup outcomes."""
+    effective, record = prepare_case(case, environment)
+    resolved = deployment.resolve(effective, environment)
+    probe = Mrv2Session(effective, environment, record["run_id"])
+    services = deployment.ServiceDeployment(resolved, run_id=record["run_id"])
+    environment.output_path.mkdir(parents=True, exist_ok=True)
+
+    def cleanup() -> None:
+        failures = []
+        try:
+            services.close()
+        except BaseException as exc:
+            failures.append(str(exc))
+        finally:
+            try:
+                probe.close()
+            except BaseException as exc:
+                failures.append(str(exc))
+            record["processes"] = [
+                {"pid": process.pid, "returncode": process.poll()}
+                for process in services.processes
+            ]
+        if failures:
+            record["cleanup"] = {"status": "failed", "errors": failures}
+            if not probe.pull_mega:
+                raise RuntimeError("; ".join(failures))
+            return
+        record["cleanup"] = {"status": "passed"}
+
+    try:
+        with cancellable_run(cleanup):
+            probe.prepare()
+            services.probe_arguments = probe.arguments
+            services.probe_environment = probe.worker_environment
+            services.start()
+            services.ensure_alive()
+            record["execution"] = {"status": "running"}
+            for phase in effective.phases:
+                phase_record: dict[str, JsonValue] = {
+                    "name": phase.name,
+                    "status": "running",
+                    "checks": [asdict(check) for check in phase.checks],
+                }
+                record["phases"].append(phase_record)
+                probe.start(phase)
+                role = "baseline" if effective.deployment.is_baseline else "attention"
+                phase_record["result"] = phase.task.execute(
+                    base_url=f"http://{environment.api_host}:{environment.api_port_base}",
+                    model_name=f"{case.served_model_name_prefix}-{role}",
+                    checkpoint=environment.model,
+                    output_path=environment.output_path / phase.name,
+                )
+                snapshot = probe.finish(phase, services)
+                phase_record["evidence_records"] = len(snapshot)
+                phase_record["status"] = "passed"
+            services.ensure_alive()
+        record["execution"] = {"status": "passed"}
+        record["acceptance_passed"] = record["configuration"]["eligible"]
+        return record
+    except BaseException as exc:
+        record["execution"] = {
+            "status": "cancelled" if isinstance(exc, SystemExit) else "failed",
+            "error": str(exc),
+        }
+        for phase_record in record["phases"]:
+            if phase_record["status"] == "running":
+                phase_record["status"] = record["execution"]["status"]
+                phase_record["error"] = str(exc)
+        raise
+    finally:
+        (environment.output_path / "run.json").write_text(
+            json.dumps(record, indent=2) + "\n"
+        )
+        print(
+            f"\nE2E CASE {case.id}: {record['execution']['status']}; "
+            f"configuration={record['configuration']['classification']}; "
+            f"acceptance_passed={record['acceptance_passed']}",
+            flush=True,
+        )
+
+
+def case_main(
+    build_case: Callable[[str, CaseEnvironment], Case],
+    case_ids: tuple[str, ...],
+    argv: list[str] | None = None,
+) -> int:
+    """The model injects its builder; shared code never imports the model."""
+    case_id, environment, describe = parse_case_environment(case_ids, argv)
+    case = build_case(case_id, environment)
+    if describe:
+        _, record = prepare_case(case, environment)
+        print(json.dumps(record, indent=2))
+    else:
+        run_case(case, environment)
+    return 0
 
 
 if __name__ == "__main__":

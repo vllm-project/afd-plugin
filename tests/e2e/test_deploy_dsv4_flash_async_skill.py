@@ -131,7 +131,6 @@ class DeploymentScriptsTest(unittest.TestCase):
             "PREFILL_ENABLE_KV_CONNECTOR": "0",
             "PREFILL_ENABLE_DBO": "1",
             "PREFILL_FFN_GRAPH_MODE": "EAGER",
-            "AFD_ASYNC_CAM_LAYERED_GMM": "0",
             "MAX_MODEL_LEN": "65536",
             "LOG_DIR": str(self.root / "logs"),
             "PID_DIR": str(self.root / "pids"),
@@ -179,10 +178,8 @@ class DeploymentScriptsTest(unittest.TestCase):
         paths = sorted(set(self.captures.iterdir()) - before)
         return result, [json.loads(path.read_text()) for path in paths]
 
-    def test_role_contract_and_layered_isolation(self) -> None:
-        result, captures = self.run_script(
-            "run_prefill.sh", expected_captures=2, AFD_ASYNC_CAM_LAYERED_GMM="1"
-        )
+    def test_role_contract(self) -> None:
+        result, captures = self.run_script("run_prefill.sh", expected_captures=2)
         self.assertEqual(result.returncode, 0, result.stderr)
         by_role = {
             json.loads(option(capture, "--additional-config"))["afd"]["role"]: capture
@@ -203,8 +200,6 @@ class DeploymentScriptsTest(unittest.TestCase):
             )
         self.assertIn("--enable-dbo", attention["args"])
         self.assertNotIn("--enable-dbo", ffn["args"])
-        self.assertEqual(attention["env"]["AFD_ASYNC_CAM_LAYERED_GMM"], "0")
-        self.assertEqual(ffn["env"]["AFD_ASYNC_CAM_LAYERED_GMM"], "1")
         self.assertEqual(ffn["env"]["VLLM_ASCEND_ENABLE_FLASHCOMM1"], "0")
 
     def test_attention_dbo_off_and_explicit_threshold(self) -> None:
@@ -224,29 +219,16 @@ class DeploymentScriptsTest(unittest.TestCase):
         self.assertEqual(option(captures[0], "--dbo-prefill-token-threshold"), "1024")
 
     def test_ffn_full_selection_and_missing_prerequisites(self) -> None:
-        for settings in (
-            {"PREFILL_FFN_GRAPH_MODE": "FULL"},
-            {
-                "PREFILL_FFN_GRAPH_MODE": "FULL",
-                "AFD_ASYNC_CAM_LAYERED_GMM": "1",
-                "BATCH_SIZE_FACTOR": "",
-            },
-        ):
-            with self.subTest(settings=settings):
-                result, _ = self.run_script(
-                    "run_prefill_ffn.sh",
-                    PREFILL_FFN_GRAPH_MODE="FULL",
-                    AFD_ASYNC_CAM_LAYERED_GMM=settings.get(
-                        "AFD_ASYNC_CAM_LAYERED_GMM", "0"
-                    ),
-                    BATCH_SIZE_FACTOR=settings.get("BATCH_SIZE_FACTOR", ""),
-                )
-                self.assertNotEqual(result.returncode, 0)
+        result, _ = self.run_script(
+            "run_prefill_ffn.sh",
+            PREFILL_FFN_GRAPH_MODE="FULL",
+            BATCH_SIZE_FACTOR="",
+        )
+        self.assertNotEqual(result.returncode, 0)
         result, captures = self.run_script(
             "run_prefill_ffn.sh",
             expected_captures=1,
             PREFILL_FFN_GRAPH_MODE="FULL",
-            AFD_ASYNC_CAM_LAYERED_GMM="1",
             BATCH_SIZE_FACTOR="0.0625",
         )
         self.assertEqual(result.returncode, 0, result.stderr)

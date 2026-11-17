@@ -6,7 +6,7 @@ This module patches:
 1. ``vllm.forward_context.set_forward_context``
 
 Why:
-    vLLM 0.30.0 constructs ``DPMetadata`` and coordinates token counts across
+    vLLM 0.32.0 constructs ``DPMetadata`` and coordinates token counts across
     MoE DP ranks whenever DP size is greater than one. AFD async-DP uses the
     connector data flow instead of vLLM's DP metadata control plane, so those
     all-reduce and metadata paths must be skipped for the AFD async connector.
@@ -54,6 +54,8 @@ _FORWARD_CONTEXT_IMPORT_MODULES = (
 )
 
 
+# Upstream source: vLLM v0.32.0 (5df63a7203cdb9328d824a27b682e77c7b9928be),
+# vllm/forward_context.py::set_forward_context.
 # Patch reason: upstream set_forward_context always creates DPMetadata for MoE
 # DP ranks, but AFD async-DP uses connector-driven coordination instead.
 # Patch functionality: preserves the target upstream tag's forward-context

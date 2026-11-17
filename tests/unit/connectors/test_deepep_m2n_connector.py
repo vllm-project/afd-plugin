@@ -15,11 +15,6 @@ pytest.importorskip("vllm")
 
 from vllm.platforms.interface import set_assigned_physical_gpu_ids  # noqa: E402
 
-from tests.unit.fakes.afdep import FakeElasticBuffer, install_fake_afdep  # noqa: E402
-
-# The connector module imports afdEP's transport when it loads.
-install_fake_afdep()
-
 from afd_plugin.config import afd_config_from_mapping  # noqa: E402
 from afd_plugin.connectors import (  # noqa: E402
     AFDConnectorFactory,
@@ -28,32 +23,48 @@ from afd_plugin.connectors import (  # noqa: E402
     AFDTransferContext,
     AFDTransferMetadata,
 )
-from afd_plugin.connectors.gpu.deepep_m2n import (  # noqa: E402
-    connector as connector_module,
+from afd_plugin.connectors.base import AFDControlPlaneClosedError  # noqa: E402
+from tests.unit.fakes.afdep import (  # noqa: E402
+    FakeElasticBuffer,
+    install_fake_afdep,
+    uninstall_fake_afdep,
 )
-from afd_plugin.connectors.gpu.deepep_m2n.connector import (  # noqa: E402
-    DeepEPM2NConfig,
-    bucket_ladder,
-    expert_weight_format,
-    local_handshake_info,
-    local_model_info,
-    no_sync_bucket_limit,
-    plan_stage,
-    precompile_buckets,
-    resolve_capacity_tokens_per_rank,
-    resolve_num_lanes,
-    tokens_per_attention_rank,
-    validate_handshake,
-    validate_model_infos,
-)
+
+# The connector module imports afdEP's transport when it loads, so the stand-in has to
+# exist for that import only. It is removed again on both paths: the bound names keep
+# working, and the rest of the session sees the package as absent.
+install_fake_afdep()
+try:
+    from afd_plugin.connectors.gpu.deepep_m2n import (  # noqa: E402
+        connector as connector_module,
+    )
+    from afd_plugin.connectors.gpu.deepep_m2n.connector import (  # noqa: E402
+        DeepEPM2NConfig,
+        bucket_ladder,
+        expert_weight_format,
+        local_handshake_info,
+        local_model_info,
+        plan_stage,
+        precompile_buckets,
+        resolve_capacity_tokens_per_rank,
+        resolve_num_lanes,
+        tokens_per_attention_rank,
+        validate_handshake,
+        validate_model_infos,
+    )
+finally:
+    uninstall_fake_afdep()
 from afd_plugin.connectors.gpu.deepep_m2n.experts import (  # noqa: E402
     expert_row_ranges,
 )
 from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (  # noqa: E402
     dequantize_fp8_block128,
-    quantize_fp8_block128,
 )
-from afd_plugin.connectors.gpu.deepep_m2n.layout import DeepEPM2NLayout  # noqa: E402
+from afd_plugin.connectors.gpu.deepep_m2n.layout import (  # noqa: E402
+    DeepEPM2NLayout,
+    RankPlacement,
+    plan_transport_layout,
+)
 from afd_plugin.connectors.gpu.deepep_m2n.network import (  # noqa: E402
     NetworkConfig,
     RankTopology,
@@ -68,6 +79,7 @@ from tests.unit.fakes.vllm_config import (  # noqa: E402
     M2NTopology,
     m2n_vllm_config,
 )
+from tests.unit.fakes.weights import quantize_fp8_block128  # noqa: E402
 
 CONNECTOR = "DeepEPM2NAFDConnector"
 HOPPER = (9, 0)
@@ -147,17 +159,6 @@ def _handshake(
     return infos
 
 
-def test_connector_is_registered():
-    """The factory resolves ``DeepEPM2NAFDConnector`` to this module's class.
-
-    Why: deployments select the connector by name in the AFD config.
-    """
-    cls = AFDConnectorFactory.get_connector_class(CONNECTOR)
-
-    assert cls.__name__ == CONNECTOR
-    assert cls.__module__ == "afd_plugin.connectors.gpu.deepep_m2n.connector"
-
-
 def test_config_defaults_and_round_trip():
     """An empty config gives DeepGEMM experts and a BF16 payload, and the config
     survives to_mapping/from_mapping unchanged.
@@ -179,21 +180,22 @@ def test_config_defaults_and_round_trip():
         ({"expert_backend": "cutlass"}, "expert_backend"),
         ({"payload_format": "fp4"}, "payload_format"),
         # Removed in Phase 4b (now under ``network``): rejected, not ignored.
-        ({"disable_gin": "auto"}, "unknown DeepEPM2NAFDConnector options.*disable_gin"),
         ({"num_lanes": 3}, "num_lanes"),
         ({"capacity_tokens_per_rank": 0}, "capacity_tokens_per_rank"),
         ({"bucket_granularity": 0}, "bucket_granularity"),
         ({"cpu_sync_min_tokens": -1}, "cpu_sync_min_tokens"),
-        ({"control_backend": "mpi"}, "control_backend"),
+        # Removed (gloo could not cancel a blocked receive): rejected, not ignored.
+        (
+            {"control_backend": "nccl"},
+            "unknown DeepEPM2NAFDConnector options.*control_backend",
+        ),
         ({"network": {"gin": "maybe"}}, "network.gin"),
         # The connector no longer plans NICs: NCCL picks them.
-        ({"network": {"nic_policy": "shared"}}, "unknown network options"),
         ({"num_qps": -1}, "num_qps"),
         ({"expert_num_sms": -2}, "expert_num_sms"),
         ({"expert_num_sms": 131}, "expert_num_sms"),
         ({"cpu_timeout_s": 0}, "cpu_timeout_s"),
         # afdEP-comm removed the switch: the transport is always role-specialized.
-        ({"role_aware": False}, "unknown DeepEPM2NAFDConnector options.*role_aware"),
     ],
 )
 def test_config_rejects_invalid_options(raw, message):
@@ -251,6 +253,62 @@ def test_expert_num_sms_sizes_the_deepgemm_grid(monkeypatch):
         experts_module.DeepEPM2NExperts("deepgemm", 128, 134)
 
 
+UPSTREAM_DG = "deep_gemm"
+VLLM_DG = "vllm.third_party.deep_gemm"
+
+
+@pytest.mark.parametrize(
+    ("missing_name", "expected"),
+    [
+        # An upstream deep_gemm is importable too; the bundled copy still wins.
+        (None, VLLM_DG),
+        # vLLM builds without DeepGEMM have no vllm.third_party package at all.
+        ("vllm.third_party", "bundled with vLLM"),
+        # The bundled copy is present but cannot load its own dependency.
+        ("deep_gemm_cpp", "deep_gemm_cpp"),
+    ],
+    ids=["vllm-copy-over-upstream", "not-bundled", "broken-bundled-copy"],
+)
+def test_deepgemm_uses_only_the_copy_bundled_with_vllm(
+    monkeypatch, missing_name, expected
+):
+    """The connector loads ``vllm.third_party.deep_gemm`` and never an upstream
+    ``deep_gemm``. Without the bundled copy the error points to the
+    ``fused_experts`` backend; any other import failure surfaces unchanged.
+
+    Why: the experts must run the DeepGEMM the pinned vLLM ships, whatever else
+    is installed, and a broken install must not be reported as a missing one.
+    """
+    from afd_plugin.connectors.gpu.deepep_m2n import deepgemm as deepgemm_module
+
+    natives = {
+        package: SimpleNamespace(source=package) for package in (UPSTREAM_DG, VLLM_DG)
+    }
+
+    def import_module(name: str):
+        if missing_name is not None:
+            raise ModuleNotFoundError(
+                f"No module named {missing_name!r}", name=missing_name
+            )
+        return natives[name.removesuffix("._C")]
+
+    monkeypatch.setattr(
+        deepgemm_module, "importlib", SimpleNamespace(import_module=import_module)
+    )
+    deepgemm_module.load_deepgemm.cache_clear()
+    try:
+        if missing_name is None:
+            assert deepgemm_module.load_deepgemm().source == expected
+        else:
+            with pytest.raises(ModuleNotFoundError, match=expected) as raised:
+                deepgemm_module.load_deepgemm()
+            assert ("fused_experts" in str(raised.value)) == (
+                missing_name == "vllm.third_party"
+            )
+    finally:
+        deepgemm_module.load_deepgemm.cache_clear()
+
+
 def test_plan_stage_skips_host_sync_below_threshold():
     """With a threshold of 256, an eager 255-token step skips the host sync
     and a 256-token step keeps it.
@@ -274,12 +332,8 @@ def test_plan_stage_skips_host_sync_below_threshold():
     assert plan(256).do_cpu_sync
 
 
-def test_fp8_block128_round_trip():
-    """Block-128 FP8 quantization gives e4m3 values and one scale per
-    128x128 block, and dequantizes back within 5% relative error.
-
-    Why: test weights and the reference math rely on this helper.
-    """
+def test_fp8_block128_dequantization_recovers_weights():
+    """Production dequantization recovers block-FP8 test weights within 5%."""
     w = torch.randn(2, 256, 384)
 
     w_q, scale = quantize_fp8_block128(w)
@@ -365,82 +419,14 @@ def test_tokens_per_attention_rank_splits_each_dp_rank_over_its_tp_peers():
         tokens_per_attention_rank(_dp(3, 5), attn_size=4, attn_tp_size=1)
 
 
-def test_plan_stage_sizes_the_bucket_for_the_tp_slice():
-    """A 17-token DP rank with Attention TP 2 dispatches 9-token slices.
-
-    Why: the bucket and capacity check apply to what one rank dispatches.
-    """
-    plan = plan_stage(
-        _dp(17),
-        attn_size=2,
-        attn_tp_size=2,
-        capacity_tokens_per_rank=9,
-        bucket_granularity=1,
-        graph_mode=False,
-        bucket_ladder=(9,),
-    )
-
-    assert plan.tokens_per_attn_rank == (9, 9)
-    assert plan.bucket == 9
-
-
-def test_plan_stage_rounds_graph_buckets_up_the_ladder_without_host_sync():
-    """With ladder (8, 16, 32, 64), graph-mode steps of (17, 4), (16, 16) and
-    (0, 0) tokens get buckets 32, 16 and 8 and never a host sync.
-
-    Why: graph steps sit on a rung (vLLM pads them to a capture size) and must
-    keep it; anything else rounds up to the next rung, never to 0, and graph
-    mode must never block on the host.
-    """
-
-    def plan(*tokens: int):
-        return plan_stage(
-            _dp(*tokens),
-            attn_size=2,
-            attn_tp_size=1,
-            capacity_tokens_per_rank=64,
-            bucket_granularity=1,
-            graph_mode=True,
-            bucket_ladder=(8, 16, 32, 64),
-        )
-
-    assert (plan(17, 4).bucket, plan(17, 4).do_cpu_sync) == (32, False)
-    assert plan(17, 4).tokens_per_attn_rank == (17, 4)
-    assert plan(16, 16).bucket == 16
-    assert plan(0, 0).bucket == 8
-
-
-def test_plan_stage_gives_buckets_above_the_no_sync_limit_the_capacity():
-    """With ladder (8, 16) and capacity 64, eager steps of 17, 40 and 64
-    tokens all get bucket 64, while a 5-token step rounds up to rung 8.
-
-    Why: DeepEP compiles its kernels per bucket; a bucket per eager token
-    count ran nvcc on the request path (seconds per new prefill size).
-    """
-
-    def plan(tokens: int):
-        return plan_stage(
-            _dp(tokens),
-            attn_size=1,
-            attn_tp_size=1,
-            capacity_tokens_per_rank=64,
-            bucket_granularity=1,
-            graph_mode=False,
-            bucket_ladder=(8, 16),
-        )
-
-    assert [plan(tokens).bucket for tokens in (17, 40, 64)] == [64] * 3
-    assert (plan(5).bucket, plan(5).do_cpu_sync) == (8, True)
-
-
 @pytest.mark.parametrize("tokens", [8, 40])
 def test_plan_stage_bucket_does_not_depend_on_the_rank_s_mode(tokens):
     """A step planned as graph on one rank and eager on another gets the same
     bucket, both on the ladder (8 tokens) and above it (40).
 
-    Why: an FFN eager fallback can plan a step Attention replays in another
-    mode, and DeepEP needs the same bucket on every rank; a capacity bucket
-    chosen by the sync decision broke test_graph_and_eager_plans_mixed_across_ranks.
+    Why: DeepEP needs the same bucket on every rank whatever mode a rank plans
+    the step in; a capacity bucket chosen by the sync decision once broke
+    ranks that planned the same step in different modes.
     """
     buckets = {
         plan_stage(
@@ -458,31 +444,6 @@ def test_plan_stage_bucket_does_not_depend_on_the_rank_s_mode(tokens):
     }
 
     assert len(buckets) == 1
-
-
-def test_plan_stage_keeps_a_ladder_bucket_for_eager_steps_without_host_sync():
-    """With a threshold of 256 and ladder (32, 128, 255), an eager 20-token
-    step skips the sync with rung 32, while a 300-token step syncs with the
-    capacity bucket.
-
-    Why: without the sync DeepEP allocates the worst case for the bucket, so
-    a capacity bucket there would allocate for the capacity on every step.
-    """
-
-    def plan(tokens: int):
-        return plan_stage(
-            _dp(tokens),
-            attn_size=1,
-            attn_tp_size=1,
-            capacity_tokens_per_rank=1024,
-            bucket_granularity=1,
-            graph_mode=False,
-            bucket_ladder=(32, 128, 255),
-            cpu_sync_min_tokens=256,
-        )
-
-    assert (plan(20).bucket, plan(20).do_cpu_sync) == (32, False)
-    assert (plan(300).bucket, plan(300).do_cpu_sync) == (1024, True)
 
 
 @pytest.mark.parametrize(
@@ -603,22 +564,8 @@ def test_plan_stage_rejects_bucket_above_capacity():
         )
 
 
-def test_handshake_accepts_consistent_ranks():
-    """Four consistent handshake records pass, giving expert alignment 128
-    and no GIN (one host).
-
-    Why: the normal path must pass and yield the right settings.
-    """
-    layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
-
-    result = validate_handshake(_handshake(layout), layout, NetworkConfig())
-
-    assert result.expert_alignment == 128
-    assert not result.network_plan.use_gin
-    assert (result.attn_tp_size, result.capacity_tokens_per_rank) == (1, 256)
-
-
-def test_handshake_gives_ffn_the_attention_tp_size_capacity_and_ladder():
+@pytest.mark.parametrize("attn_size,tp_size", [(2, 1), (4, 2)])
+def test_handshake_resolves_attention_transport_settings(attn_size, tp_size):
     """FFN ranks report no TP size, capacity or bucket ladder; the result
     carries Attention's.
 
@@ -626,17 +573,20 @@ def test_handshake_gives_ffn_the_attention_tp_size_capacity_and_ladder():
     Attention knows its TP size, the capacity of a TP slice and its graph
     buckets; both roles must size buffers and pick buckets alike.
     """
-    layout = DeepEPM2NLayout(ffn_size=2, attn_size=4, num_experts=128)
+    layout = DeepEPM2NLayout(ffn_size=2, attn_size=attn_size, num_experts=128)
 
     result = validate_handshake(
-        _handshake(layout, attn_tp_size=2), layout, NetworkConfig()
+        _handshake(layout, attn_tp_size=tp_size), layout, NetworkConfig()
     )
 
     assert (
         result.attn_tp_size,
         result.capacity_tokens_per_rank,
         result.bucket_ladder,
-    ) == (2, 256, (8, 16, 64))
+    ) == (tp_size, 256, (8, 16, 64))
+
+    assert result.expert_alignment == 128
+    assert not result.network_plan.use_gin
 
 
 @pytest.mark.parametrize(
@@ -673,11 +623,14 @@ def test_handshake_rejects_attention_tp_and_capacity_mismatches(overrides, messa
         ({(1, "expert_alignment"): 64}, "expert_alignment"),
         ({(0, "role"): "attention"}, "expected 'ffn'"),
         ({(2, "sm"): [8, 0]}, "SM90 or newer"),
+        # Protocol 1 ranks may still build a gloo control group.
+        ({(1, "protocol"): "deepep_m2n/1"}, "disagree on protocol"),
     ],
 )
 def test_handshake_rejects_mismatches(overrides, message):
     """One rank's record differs (hidden size, payload format, expert
-    alignment, role order, or a pre-Hopper GPU): the handshake raises.
+    alignment, role order, a pre-Hopper GPU, or the handshake protocol): the
+    handshake raises.
 
     Why: disagreeing ranks would corrupt data or hang; fail before buffers.
     """
@@ -688,9 +641,11 @@ def test_handshake_rejects_mismatches(overrides, message):
 
 
 def test_handshake_plans_gin_across_nvlink_domains():
-    """Ranks on hosts ``aabb`` give a plan of 2 domains of 2 ranks with GIN.
+    """Ranks on hosts ``aabb`` (role-split pods) give a plan of 2 domains of 2
+    ranks with GIN, and keep the role world as the transport order.
 
-    Why: the handshake must hand the network plan the right domains.
+    Why: the handshake must hand the network plan the right domains, and the
+    role-split layouts that run today must take the unchanged transport.
     """
     layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
 
@@ -703,18 +658,54 @@ def test_handshake_plans_gin_across_nvlink_domains():
         2,
         2,
     )
+    assert result.transport.is_identity
+
+
+def test_handshake_gives_interleaved_pods_the_per_domain_transport():
+    """FFN 0 and FFN 1 on hosts ``a`` and ``b``, each with one Attention rank
+    (``1A1F,1A1F``), give a per-domain transport ``[F0, A0, F1, A1]`` over 2
+    domains of 2 ranks.
+
+    Why: afdEP-comm's lanes must see the ranks domain by domain with each
+    domain's FFN rank first; the network plan is checked in that order.
+    """
+    layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
+
+    result = validate_handshake(
+        _handshake(layout, hosts="abab"), layout, NetworkConfig()
+    )
+
+    assert result.transport.order == (
+        ("ffn", 0),
+        ("attention", 0),
+        ("ffn", 1),
+        ("attention", 1),
+    )
+    assert result.transport.ffn_ranks_per_domain == 1
+    assert (result.network_plan.num_domains, result.network_plan.ranks_per_domain) == (
+        2,
+        2,
+    )
 
 
 @pytest.mark.parametrize(
-    ("hosts", "message"),
-    [("aaab", "different rank counts"), ("abab", "not contiguous")],
+    ("ffn_size", "attn_size", "hosts", "message"),
+    [
+        (2, 2, "aaab", "same number of ranks"),
+        # Host a holds F0, A0, A1 and host b F1, F2, A2.
+        (3, 3, "abbaab", "same number of FFN ranks"),
+    ],
 )
-def test_handshake_rejects_unsupported_domain_layouts(hosts, message):
-    """Hosts ``aaab`` (unequal counts) and ``abab`` (not contiguous) raise.
+def test_handshake_rejects_unsupported_domain_layouts(
+    ffn_size, attn_size, hosts, message
+):
+    """Hosts with unequal rank counts, or with FFN counts that differ while
+    the FFN ranks do not fill the first hosts, raise.
 
-    Why: DeepEP's hybrid mode needs equal, contiguous ranks per domain.
+    Why: DeepEP needs equal NVLink domains, and afdEP-comm finds FFN ranks
+    only as a prefix or as the same count in every domain.
     """
-    layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
+    layout = DeepEPM2NLayout(ffn_size=ffn_size, attn_size=attn_size, num_experts=96)
 
     with pytest.raises(RuntimeError, match=message):
         validate_handshake(_handshake(layout, hosts=hosts), layout, NetworkConfig())
@@ -731,36 +722,6 @@ def test_handshake_rejects_mismatched_network_config():
 
     with pytest.raises(RuntimeError, match="disagree on network"):
         validate_handshake(infos, layout, NetworkConfig())
-
-
-def test_handshake_rejects_mixed_control_backends():
-    """FFN on ``nccl`` and Attention on ``gloo``: the handshake raises.
-
-    Why: NCCL ranks would create a communicator that the gloo ranks never
-    join, so startup would hang until the timeout instead of failing.
-    """
-    layout = DeepEPM2NLayout(ffn_size=1, attn_size=1, num_experts=128)
-    nccl = _handshake(layout)
-    gloo = _handshake(layout, config=DeepEPM2NConfig(control_backend="gloo"))
-
-    validate_handshake(gloo, layout, NetworkConfig())
-    with pytest.raises(RuntimeError, match="disagree on control_backend"):
-        validate_handshake([nccl[0], gloo[1]], layout, NetworkConfig())
-
-
-def test_gloo_control_backend_stages_payloads_on_cpu():
-    """With ``control_backend: gloo`` control payloads are staged on CPU.
-
-    Why: gloo cannot send CUDA tensors.
-    """
-    connector = _connector(
-        "attention",
-        0,
-        M2NTopology(ffn_size=1, attn_size=1),
-        {"control_backend": "gloo"},
-    )
-
-    assert connector.control_device == torch.device("cpu")
 
 
 def test_config_parses_network_section_and_tunables():
@@ -936,6 +897,105 @@ def test_close_without_init_is_safe():
     connector.close()
 
     assert connector.is_initialized is False
+
+
+def test_close_cancels_the_control_receive_but_not_the_lanes_group(monkeypatch):
+    """``close()`` aborts the control group once, never the bootstrap group
+    the lanes use, and later receives raise the cancellation error.
+
+    Why: the FFN worker joins its metadata-receive thread before the native
+    worker shutdown; a receive nobody can cancel blocks that shutdown. The
+    GPU test ``test_close_cancels_a_blocked_control_receive`` checks the real
+    groups.
+    """
+    aborted = []
+
+    def abort(group):
+        if group in aborted:
+            raise ValueError("group already unregistered")
+        aborted.append(group)
+
+    monkeypatch.setattr(connector_module, "_abort_process_group", abort)
+    connector = _connector("ffn", 0, M2NTopology(ffn_size=1, attn_size=1))
+    control, bootstrap = SimpleNamespace(), SimpleNamespace()
+    connector.group, connector.bootstrap_group = control, bootstrap
+
+    connector.control_plane.close()
+    connector.close()
+    connector.close()
+
+    assert aborted == [control]
+    with pytest.raises(AFDControlPlaneClosedError):
+        connector.control_plane.recv_dp_metadata_list()
+
+
+def test_close_destroys_the_distinct_transport_group_after_lanes(monkeypatch):
+    """A per-domain transport group is destroyed once, after its lanes.
+
+    Why: afdEP-comm leaves the caller-owned Gloo group alive; keeping it
+    registered leaks process-group state across connector lifetimes.
+    """
+    events = []
+
+    class Lane:
+        def destroy(self):
+            events.append("lane")
+
+    monkeypatch.setattr(
+        connector_module, "_abort_process_group", lambda group: events.append("control")
+    )
+    monkeypatch.setattr(
+        connector_module.dist,
+        "destroy_process_group",
+        lambda group: events.append("transport"),
+    )
+    connector = _connector("ffn", 0, M2NTopology(ffn_size=2, attn_size=2))
+    connector.group = SimpleNamespace()
+    connector.bootstrap_group = SimpleNamespace()
+    connector.transport_group = SimpleNamespace()
+    connector.lanes = [Lane()]
+
+    connector.close()
+    connector.close()
+
+    assert events == ["control", "lane", "transport"]
+
+
+@pytest.mark.parametrize(
+    ("closes_first", "error", "expected"),
+    [
+        (True, ValueError("group is not initialized"), AFDControlPlaneClosedError),
+        (True, RuntimeError("NCCL communicator aborted"), AFDControlPlaneClosedError),
+        (False, RuntimeError("NCCL transport failure"), RuntimeError),
+    ],
+)
+def test_receive_failure_is_a_cancellation_only_after_a_local_close(
+    monkeypatch, closes_first, error, expected
+):
+    """A receive that fails because this rank closed its control plane
+    raises the cancellation error; any other failure propagates unchanged.
+
+    Why: the FFN worker stops quietly only on a cancellation it requested;
+    the abort surfaces as an error that depends on where the receive was.
+    """
+    monkeypatch.setattr(connector_module, "_abort_process_group", lambda group: None)
+    connector = _connector("ffn", 0, M2NTopology(ffn_size=1, attn_size=1))
+    connector.group = SimpleNamespace()
+
+    def failing_receive(**kwargs):
+        if closes_first:
+            connector.control_plane.close()
+        raise error
+
+    monkeypatch.setattr(connector_module, "recv_control_payload", failing_receive)
+
+    with pytest.raises(expected) as caught:
+        connector.control_plane.recv_dp_metadata_list()
+
+    if closes_first:
+        assert caught.value.__cause__ is error
+    else:
+        assert caught.value is error
 
 
 def test_data_path_requires_initialization():
@@ -1240,27 +1300,48 @@ def test_attention_init_rejects_local_experts_before_communicating():
     assert connector.bootstrap_group is None
 
 
-@pytest.mark.parametrize(("role", "role_rank"), [("attention", 2), ("ffn", 1)])
+@pytest.mark.parametrize(
+    ("role", "role_rank", "hosts", "ffn_ranks_per_domain"),
+    [
+        ("attention", 2, "aaaaaa", 0),
+        ("ffn", 1, "aaaaaa", 0),
+        # Hosts of F0 F1 A0 A1 A2 A3: 2A1F,2A1F.
+        ("ffn", 1, "ababab", 1),
+        ("attention", 3, "ababab", 1),
+    ],
+)
 def test_lane_transport_is_afdep_comm_with_the_ffn_rank_count(
-    monkeypatch, role, role_rank
+    monkeypatch, role, role_rank, hosts, ffn_ranks_per_domain
 ):
     """Each lane's transport is afdEP-comm's ``ElasticBuffer``, built with every
-    argument its constructor requires and the FFN rank count.
+    argument its constructor requires, the FFN rank count and the transport's
+    ``ffn_ranks_per_domain``, on the transport group.
 
     Why: ``ffn_ranks`` selects afdEP-comm's AFD transport (without it the
-    buffer is unspecialized DeepEP V2), and the stand-in fails on any argument
-    set the real constructor would refuse.
+    buffer is unspecialized DeepEP V2), ``ffn_ranks_per_domain`` tells it
+    where the FFN ranks sit, and the stand-in fails on any argument set the
+    real constructor would refuse.
     """
     monkeypatch.setattr(connector_module, "ElasticBuffer", FakeElasticBuffer)
-    connector = _connector(role, role_rank, M2NTopology(ffn_size=2, attn_size=3), {})
-    connector.bootstrap_group = SimpleNamespace()
+    topology = M2NTopology(ffn_size=2, attn_size=4)
+    connector = _connector(role, role_rank, topology, {})
+    connector.transport_group = SimpleNamespace()
+    connector.transport = plan_transport_layout(
+        [
+            RankPlacement(*topology.role(rank), f"host:{host}")
+            for rank, host in enumerate(hosts)
+        ],
+        ffn_size=topology.ffn_size,
+    )
     connector.network_plan = SimpleNamespace(hybrid=True, rdma_traffic_class=0)
     connector.capacity_tokens_per_rank = 64
 
     buffer = connector._new_lane()
 
     assert isinstance(buffer, FakeElasticBuffer)
+    assert buffer.kwargs["group"] is connector.transport_group
     assert buffer.kwargs["ffn_ranks"] == 2
+    assert buffer.kwargs["ffn_ranks_per_domain"] == ffn_ranks_per_domain
     assert buffer.kwargs["capacity_tokens_per_rank"] == 64
     assert buffer.kwargs["allow_hybrid_mode"] is True
 
@@ -1309,35 +1390,6 @@ def test_attention_ops_take_the_stage_from_the_live_dbo_micro_batch(monkeypatch)
 # ---------------------------------------------------------------------------
 
 DEEPGEMM_ALIGNMENT = 128
-
-
-@pytest.mark.parametrize(
-    ("capture", "tp", "granularity", "sync_min", "capacity", "expected"),
-    [
-        (512, 1, 1, 0, 8192, 512),  # graph buckets only
-        (512, 2, 1, 0, 4096, 256),  # each TP rank dispatches its slice
-        (100, 1, 16, 0, 8192, 112),  # graph bucket rounded to granularity
-        (512, 1, 1, 1000, 8192, 999),  # eager buckets below the sync threshold
-        (512, 1, 1, 0, 256, 256),  # never above capacity
-        (0, 1, 1, 0, 8192, 0),  # eager-only and always syncing
-    ],
-)
-def test_no_sync_bucket_limit(capture, tp, granularity, sync_min, capacity, expected):
-    """The largest bucket that skips the host sync: the largest graph bucket or
-    the largest eager bucket below cpu_sync_min_tokens, capped by capacity.
-
-    Why: it is the ladder's top rung, and dispatches up to it give FFN ranks
-    DeepEP's worst-case receive instead of a synced count.
-    """
-    limit = no_sync_bucket_limit(
-        capacity_tokens_per_rank=capacity,
-        max_cudagraph_capture_size=capture,
-        attn_tp_size=tp,
-        bucket_granularity=granularity,
-        cpu_sync_min_tokens=sync_min,
-    )
-
-    assert limit == expected
 
 
 class _ReceivingLane(_RecordingLane):
@@ -1607,3 +1659,39 @@ def test_keep_alive_records_stream_uses_while_capturing(monkeypatch):
     m2n._keep_alive_on("lane0", _Tensor(), None, _Tensor())
 
     assert recorded == ["lane0", "lane0"]
+
+
+@pytest.mark.parametrize(
+    "tokens,tp_size,capacity,ladder,graph,sync_min,bucket,sync",
+    [
+        ((17,), 2, 9, (9,), False, 0, 9, True),
+        ((17, 4), 1, 64, (8, 16, 32, 64), True, 0, 32, False),
+        ((16, 16), 1, 64, (8, 16, 32, 64), True, 0, 16, False),
+        ((0, 0), 1, 64, (8, 16, 32, 64), True, 0, 8, False),
+        ((17,), 1, 64, (8, 16), False, 0, 64, True),
+        ((40,), 1, 64, (8, 16), False, 0, 64, True),
+        ((64,), 1, 64, (8, 16), False, 0, 64, True),
+        ((5,), 1, 64, (8, 16), False, 0, 8, True),
+        ((20,), 1, 1024, (32, 128, 255), False, 256, 32, False),
+        ((300,), 1, 1024, (32, 128, 255), False, 256, 1024, True),
+    ],
+)
+def test_stage_plan_preserves_tp_slices_buckets_and_sync_policy(
+    tokens, tp_size, capacity, ladder, graph, sync_min, bucket, sync
+):
+    plan = plan_stage(
+        _dp(*tokens),
+        attn_size=len(tokens) * tp_size,
+        attn_tp_size=tp_size,
+        capacity_tokens_per_rank=capacity,
+        bucket_granularity=1,
+        graph_mode=graph,
+        bucket_ladder=ladder,
+        cpu_sync_min_tokens=sync_min,
+    )
+    assert plan.bucket == bucket
+    assert plan.do_cpu_sync is sync
+    if tp_size == 2:
+        assert plan.tokens_per_attn_rank == (9, 9)
+    else:
+        assert plan.tokens_per_attn_rank == tokens

@@ -14,11 +14,13 @@ pod's environment.
 from __future__ import annotations
 
 import os
-import sys
+from pathlib import Path
 
 import pytest
 
-from tests.conftest import run_runner
+from tests.conftest import run_case_entry
+from tests.e2e.environment import model_multi_pod_command
+from tests.e2e.models.deepseek_v2_lite.cases import MULTI_POD_IDS
 
 # The layout is a second axis, orthogonal to the scenario id, so accuracy
 # evidence stays comparable with the single-host rows.
@@ -26,13 +28,9 @@ POD_LAYOUTS = {
     "2pod-role-split": "2A0F,0A2F",
     "2pod-interleaved": "1A1F,1A1F",
 }
-MULTI_POD_CASES = [
-    ("afd-graph-2a2f", "2pod-role-split"),
-    ("afd-graph-2a2f", "2pod-interleaved"),
-    ("afd-graph-dbo-2a2f", "2pod-role-split"),
-    ("afd-graph-dbo-2a2f", "2pod-interleaved"),
-]
-DEEPSEEK_V2_LITE_MAX_MODEL_LEN = 4096
+MULTI_POD_CASES = tuple(
+    (scenario, layout) for scenario in MULTI_POD_IDS for layout in POD_LAYOUTS
+)
 
 
 def _required_env(name: str) -> str:
@@ -58,32 +56,9 @@ def build_runner_command(scenario: str, layout_name: str) -> list[str]:
     invocation should still get its own value, or a leftover process from a
     prior run on this same pod could be mistaken for part of this run.
     """
-    layout = POD_LAYOUTS[layout_name]
-    command = [
-        sys.executable,
-        "-m",
-        "tests.e2e.multi_pod.runner",
-        "--scenario",
-        scenario,
-        "--pod-layout",
-        layout,
-        "--run-id",
-        _required_env("AFD_E2E_RUN_ID"),
-        "--model",
-        _required_env("AFD_GPU_E2E_MODEL"),
-        "--gsm8k-output-path",
-        _required_env("AFD_E2E_GSM8K_OUTPUT"),
-        "--store-host",
-        _required_env("AFD_E2E_STORE_HOST"),
-        f"--common-vllm-arg=--max-model-len={DEEPSEEK_V2_LITE_MAX_MODEL_LEN}",
-    ]
-    store_port = os.environ.get("AFD_E2E_STORE_PORT")
-    if store_port:
-        command.extend(["--store-port", store_port])
-    for value in os.environ.get("AFD_E2E_POD_ENV", "").split(";"):
-        if value.strip():
-            command.extend(["--pod-env", value.strip()])
-    return command
+    return model_multi_pod_command(
+        "tests.e2e.models.deepseek_v2_lite.cases", scenario, POD_LAYOUTS[layout_name]
+    )
 
 
 @pytest.mark.e2e
@@ -93,4 +68,7 @@ def build_runner_command(scenario: str, layout_name: str) -> list[str]:
     ids=[f"{scenario}-{layout}" for scenario, layout in MULTI_POD_CASES],
 )
 def test_multi_pod(scenario: str, layout_name: str) -> None:
-    run_runner(build_runner_command(scenario, layout_name))
+    run_case_entry(
+        build_runner_command(scenario, layout_name),
+        Path(_required_env("AFD_E2E_GSM8K_OUTPUT")),
+    )

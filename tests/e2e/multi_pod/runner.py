@@ -12,6 +12,7 @@ state, and each pod tears down only its own children.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -20,9 +21,12 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 
+from tests.e2e import deployment
 from tests.e2e.cancellation import cancellable_run
+from tests.e2e.case import Case, CaseEnvironment, JsonValue
+from tests.e2e.environment import add_case_environment_arguments, case_environment
 from tests.e2e.multi_pod.identity import (
     POD_ADDRESSES_ENV,
     find_stale_run_markers,
@@ -42,6 +46,7 @@ from tests.e2e.multi_pod.layout import (
     validate_layout,
 )
 from tests.e2e.multi_pod.rendezvous import (
+    DEBUG_VERDICT,
     DEFAULT_STORE_PORT,
     PASS_VERDICT,
     VERDICT_KEY,
@@ -57,6 +62,7 @@ from tests.e2e.runner import (
     build_env,
     build_vllm_command,
     configure_scenario,
+    prepare_case,
     print_command,
     process_termination_timeout,
     run_scenario_evaluation,
@@ -166,7 +172,34 @@ def main() -> int:
 
         with cancellable_run(cleanup):
             try:
-                run_pod(args, rendezvous, pod_plan, processes, log_threads)
+
+                def check_alive() -> None:
+                    for entry in processes:
+                        if entry.process.poll() is not None:
+                            raise RuntimeError(
+                                f"{entry.label} exited with {entry.process.returncode}"
+                            )
+
+                def evaluate() -> str:
+                    run_scenario_evaluation(args)
+                    return PASS_VERDICT
+
+                run_pod(
+                    args,
+                    rendezvous,
+                    pod_plan,
+                    launch_order=(ATTENTION_ROLE, FFN_ROLE)
+                    if uses_async_connector(args)
+                    else (FFN_ROLE, ATTENTION_ROLE),
+                    start_slot=lambda slot: launch_slot(
+                        args, pod_plan, slot, processes, log_threads
+                    ),
+                    check_alive=check_alive,
+                    wait_ready=lambda slot, check: wait_for_health(
+                        args, slot, args.serving_timeout, on_poll=check
+                    ),
+                    evaluate=evaluate,
+                )
             except BaseException as exc:
                 rendezvous.publish_abort(f"pod {pod_index}: {exc}")
                 raise
@@ -185,34 +218,30 @@ def run_pod(
     args: argparse.Namespace,
     rendezvous: Rendezvous,
     pod_plan: PodPlan,
-    processes: list[PodProcess],
-    log_threads: list[threading.Thread],
-) -> None:
+    *,
+    launch_order: tuple[str, ...],
+    start_slot: Callable[[RoleSlot], None],
+    check_alive: Callable[[], None],
+    wait_ready: Callable[[RoleSlot, Callable[[], None]], None],
+    evaluate: Callable[[], str],
+) -> str:
     """Phases 6-12: ordered launch, readiness, evaluation, verdict, teardown."""
     pod_index = pod_plan.index
 
     def assert_local_processes_alive() -> None:
-        for entry in processes:
-            returncode = entry.process.poll()
-            if returncode is not None:
-                message = (
-                    f"pod {pod_index} {entry.label} exited "
-                    f"(rc={returncode}) during the run"
-                )
-                rendezvous.publish_abort(message)
-                raise RuntimeError(message)
+        try:
+            check_alive()
+        except BaseException as exc:
+            rendezvous.publish_abort(f"pod {pod_index}: {exc}")
+            raise
 
     # Phases 6-7: the connector's rendezvous role launches first, and every pod
     # waits for it before the other role starts.
-    first_kind, second_kind = (
-        (ATTENTION_ROLE, FFN_ROLE)
-        if uses_async_connector(args)
-        else (FFN_ROLE, ATTENTION_ROLE)
-    )
+    first_kind, second_kind = launch_order
     for kind, barrier in ((first_kind, f"{first_kind}-launched"), (second_kind, None)):
         slot = pod_plan.slot(kind)
         if slot is not None:
-            launch_slot(args, pod_plan, slot, processes, log_threads)
+            start_slot(slot)
         if barrier is not None:
             rendezvous.barrier(
                 barrier,
@@ -238,12 +267,7 @@ def run_pod(
     # for both the honest assertion is liveness, published at phase 8.
     serving_slot = pod_plan.slot(ATTENTION_ROLE)
     if serving_slot is not None and not serving_slot.headless:
-        wait_for_health(
-            args,
-            serving_slot,
-            args.serving_timeout,
-            on_poll=assert_local_processes_alive,
-        )
+        wait_ready(serving_slot, assert_local_processes_alive)
     rendezvous.set(f"phase/{pod_index}/serving", "ok")
     rendezvous.barrier(
         SERVING_BARRIER,
@@ -254,14 +278,13 @@ def run_pod(
     # Phase 10: exactly one pod evaluates, against its own local API.
     if pod_plan.is_evaluator:
         try:
-            run_scenario_evaluation(args)
+            verdict = evaluate()
         except BaseException as exc:
             verdict = f"fail: {exc}"
             rendezvous.set(VERDICT_KEY, verdict)
             rendezvous.publish_abort(verdict)
             raise
-        rendezvous.set(VERDICT_KEY, PASS_VERDICT)
-        verdict = PASS_VERDICT
+        rendezvous.set(VERDICT_KEY, verdict)
     else:
         verdict = rendezvous.wait_for_key(
             VERDICT_KEY,
@@ -277,7 +300,7 @@ def run_pod(
     )
     assert_local_processes_alive()
     print(f"[pod-{pod_index}] verdict: {verdict}", flush=True)
-    if verdict != PASS_VERDICT:
+    if verdict not in (PASS_VERDICT, DEBUG_VERDICT):
         raise RuntimeError(f"pod {pod_index} run failed: {verdict}")
 
     # Phase 12: no pod tears down until every pod has passed its last liveness
@@ -285,6 +308,7 @@ def run_pod(
     # still checking would report as a failed run. No on_poll here: from now on
     # a child exiting is expected.
     rendezvous.barrier(TEARDOWN_BARRIER, args.verdict_timeout)
+    return verdict
 
 
 def launch_slot(
@@ -446,11 +470,189 @@ def print_plan(pod_plan: PodPlan, addresses: list[str]) -> None:
         )
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Run one pod's slice of a multi-pod AFD E2E scenario.",
+def run_case(
+    case: Case, environment: CaseEnvironment, args: argparse.Namespace
+) -> dict:
+    """Coordinate an existing GPU case; no cross-pod execution probes are added."""
+    if any(phase.checks for phase in case.phases):
+        raise ValueError(
+            "multi-pod execution checks require cross-pod evidence support"
+        )
+    layout = PodLayout.parse(args.pod_layout)
+    topology = Topology.from_case(case)
+    validate_layout(topology, layout)
+    pod_index = resolve_pod_index(layout.num_pods)
+    wait_for_address(args.store_host, args.store_dns_timeout)
+    rendezvous = Rendezvous(
+        host=args.store_host,
+        port=args.store_port,
+        pod_index=pod_index,
+        num_pods=layout.num_pods,
     )
-    add_scenario_arguments(parser)
+    try:
+        rendezvous.verify_agreement(layout.canonical(), case.id)
+        addresses = resolve_addresses(args, rendezvous, layout.num_pods, pod_index)
+        pod_plan = plan(topology, layout, addresses)[pod_index]
+        print_plan(pod_plan, addresses)
+        environment = replace(
+            environment, devices=environment.devices or pod_plan.devices
+        )
+        effective, record = prepare_case(case, environment, slots=pod_plan.slots)
+        resolved = deployment.resolve(effective, environment, slots=pod_plan.slots)
+        record["run_id"] = pod_e2e_run_id(args.run_id, pod_index)
+        record["pod"] = {
+            **asdict(pod_plan),
+            "layout": layout.canonical(),
+            "role_devices": dict(resolved.role_devices),
+        }
+        record["coverage"] = ["task_result", "local_liveness", "local_cleanup"]
+        services = deployment.ServiceDeployment(
+            resolved,
+            run_id=record["run_id"],
+            extra_environment=parse_key_values(args.pod_env, option="--pod-env"),
+        )
+        environment.output_path.mkdir(parents=True, exist_ok=True)
+
+        def cleanup() -> None:
+            try:
+                services.close()
+            except BaseException as exc:
+                record["cleanup"] = {"status": "failed", "error": str(exc)}
+                publish_quietly(rendezvous, f"phase/{pod_index}/cleanup", str(exc))
+                raise
+            else:
+                record["cleanup"] = {"status": "passed"}
+                publish_quietly(rendezvous, f"phase/{pod_index}/cleanup", "ok")
+            finally:
+                record["processes"] = [
+                    {"pid": process.pid, "returncode": process.poll()}
+                    for process in services.processes
+                ]
+
+        def evaluate() -> str:
+            for phase in effective.phases:
+                phase_record: dict[str, JsonValue] = {
+                    "name": phase.name,
+                    "status": "running",
+                    "checks": [],
+                }
+                record["phases"].append(phase_record)
+                phase_record["result"] = phase.task.execute(
+                    base_url=f"http://{environment.api_host}:{environment.api_port_base}",
+                    model_name=f"{case.served_model_name_prefix}-attention",
+                    checkpoint=environment.model,
+                    output_path=environment.output_path / phase.name,
+                )
+                phase_record["status"] = "passed"
+            # This is workload/configuration result propagation, not per-rank
+            # graph/DBO evidence. Every pod records what the evaluator ran.
+            rendezvous.set(
+                "evaluation/result",
+                json.dumps(
+                    {
+                        "effective": record["effective"],
+                        "configuration": record["configuration"],
+                        "phases": record["phases"],
+                    }
+                ),
+            )
+            return (
+                PASS_VERDICT if record["configuration"]["eligible"] else DEBUG_VERDICT
+            )
+
+        try:
+            with cancellable_run(cleanup):
+                record["execution"] = {"status": "running"}
+                try:
+                    verdict = run_pod(
+                        args,
+                        rendezvous,
+                        pod_plan,
+                        launch_order=resolved.launch_order,
+                        start_slot=lambda slot: services.start_role(slot.role),
+                        check_alive=services.ensure_alive,
+                        wait_ready=lambda slot, check: services.wait_ready(
+                            path="/health",
+                            on_poll=check,
+                        ),
+                        evaluate=evaluate,
+                    )
+                    evaluation = json.loads(
+                        rendezvous.wait_for_key(
+                            "evaluation/result",
+                            args.verdict_timeout,
+                        )
+                    )
+                    record.update(evaluation)
+                except BaseException as exc:
+                    rendezvous.publish_abort(f"pod {pod_index}: {exc}")
+                    raise
+            record["execution"] = {"status": "passed"}
+            record["acceptance_passed"] = verdict == PASS_VERDICT
+            return record
+        except BaseException as exc:
+            status = "cancelled" if isinstance(exc, SystemExit) else "failed"
+            record["execution"] = {"status": status, "error": str(exc)}
+            for phase_record in record["phases"]:
+                if phase_record["status"] == "running":
+                    phase_record.update(status=status, error=str(exc))
+            raise
+        finally:
+            (environment.output_path / "run.json").write_text(
+                json.dumps(record, indent=2) + "\n"
+            )
+            print(
+                f"[pod-{pod_index}] CASE {case.id}: {record['execution']['status']}; "
+                f"acceptance_passed={record['acceptance_passed']}",
+                flush=True,
+            )
+    except BaseException as exc:
+        rendezvous.publish_abort(f"pod {pod_index}: {exc}")
+        raise
+    finally:
+        leave_rendezvous(
+            rendezvous, case.deployment.termination_timeout_s + DEPARTURE_GRACE_S
+        )
+
+
+def case_main(
+    build_case: Callable[[str, CaseEnvironment], Case],
+    case_ids: tuple[str, ...],
+    argv: list[str] | None = None,
+) -> int:
+    parser = argparse.ArgumentParser(
+        description="Run one pod of a model-declared GPU case"
+    )
+    add_case_environment_arguments(
+        parser,
+        case_ids,
+        devices_required=False,
+        startup_option="--serving-timeout",
+    )
+    add_pod_arguments(parser)
+    parser.set_defaults(startup_timeout=1800)
+    args = parser.parse_args(argv)
+    args.serving_timeout = args.startup_timeout
+    environment = case_environment(args)
+    if not environment.devices and os.environ.get("CUDA_VISIBLE_DEVICES"):
+        environment = replace(
+            environment, devices=tuple(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
+        )
+    case = build_case(args.scenario, environment)
+    if args.describe:
+        print(
+            json.dumps(
+                {"canonical": asdict(case), "bindings": asdict(environment)},
+                default=str,
+                indent=2,
+            )
+        )
+    else:
+        run_case(case, environment, args)
+    return 0
+
+
+def add_pod_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--pod-layout",
         required=True,
@@ -492,8 +694,16 @@ def parse_args() -> argparse.Namespace:
         help="KEY=VALUE added to every launched vLLM process environment.",
     )
     parser.add_argument("--launch-timeout", type=float, default=900)
-    parser.add_argument("--serving-timeout", type=float, default=1800)
     parser.add_argument("--verdict-timeout", type=float, default=3600)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the retained NPU multi-pod entry.",
+    )
+    add_scenario_arguments(parser)
+    add_pod_arguments(parser)
+    parser.add_argument("--serving-timeout", type=float, default=1800)
     return parser.parse_args()
 
 

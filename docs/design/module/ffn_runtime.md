@@ -6,15 +6,19 @@ owners:
   - "@hsliuustc0106"
   - "@jiangkuaixue123"
 primary_code_paths:
+  - "afd_plugin/ffn_faas/**"
   - "afd_plugin/v1/worker/ffn_metadata.py"
   - "afd_plugin/v1/worker/ffn_model_runner.py"
   - "afd_plugin/v1/worker/ffn_routed_experts_model_runner.py"
   - "afd_plugin/v1/worker/ffn_worker.py"
   - "afd_plugin/v1/worker/npu/ffn_model_runner.py"
   - "afd_plugin/v1/worker/npu/async_ffn_model_runner.py"
-  - "afd_plugin/v1/worker/npu/async_ffn_two_stream.py"
   - "afd_plugin/v1/worker/npu/ffn_worker.py"
 related_code_paths:
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_layered.py"
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_mega.py"
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_startup.py"
+  - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_session.py"
   - "afd_plugin/connectors/**"
   - "afd_plugin/model_executor/**"
   - "afd_plugin/compat/patches/engine_core.py"
@@ -25,21 +29,29 @@ depends_on:
   - "execution_platforms.md"
   - "compatibility_and_patches.md"
 validation_paths:
+  - "tests/unit/ffn_faas/test_*.py"
+  - "tests/unit/connectors/npu/async_cam_runtime/test_async_cam_layered.py"
+  - "tests/npu/test_async_cam_layered_w8a8.py"
   - "tests/unit/v1/worker/test_ffn_metadata.py"
   - "tests/unit/v1/worker/test_ffn_model_runner.py"
   - "tests/unit/v1/worker/test_ffn_routed_experts_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
-  - "tests/unit/v1/worker/test_async_ffn_two_stream.py"
-  - "tests/unit/test_async_cam_startup_wiring.py"
-  - "tests/unit/connectors/test_async_cam_startup.py"
+  - "tests/unit/v1/worker/test_async_ffn_runtime.py"
+  - "tests/unit/connectors/npu/test_async_cam_startup_wiring.py"
+  - "tests/unit/connectors/npu/test_async_cam_startup.py"
+  - "tests/unit/connectors/test_base.py"
+  - "tests/unit/connectors/npu/test_async_cam_session.py"
+  - "tests/unit/connectors/npu/test_async_cam.py"
   - "tests/npu/async_cam_runtime.py"
+  - "tests/npu/standalone_cam_attention.py"
   - "tests/e2e/models/deepseek_v4_flash/ffn_graph.py"
   - "tests/unit/compat/patches/test_engine_core.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
-  - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
 upstream_refs:
-  - "vLLM 0.30.0 ced6857afa0ea7b2e3f0846a62e1394e90f15607"
+  - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "vLLM vllm.v1.worker.gpu_worker.Worker"
   - "vLLM vllm.v1.worker.gpu.model_runner.GPUModelRunner construction seam"
   - "vLLM vllm.v1.engine.core.EngineCore"
@@ -54,7 +66,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-10-20
+last_reviewed: 2026-11-09
 ---
 
 # FFN runtime
@@ -74,12 +86,79 @@ FFN consumes plugin configuration, connector transport, model-side compute,
 platform mechanisms, and EngineCore compatibility. No shared module may depend
 on the FFN worker or runner implementation.
 
+Async CAM's connector owns HCCL, payload validation and initialization/cleanup
+coordination. It selects a Push or Pull session at construction. Both inherit
+the concrete `FFNExecutionSession` lifecycle defaults from `connectors/base.py`. Push owns
+per-stage routing queues; Pull owns its single window, publish/combine, device
+status and quiet/drain/stopped lifecycle. Pull takes Startup, topology and the
+dimensions/capacity used for initialization and bounded drain; it does not
+retain the connector. The FFN runner continues to own eager/FULL execution,
+graph references and completion; the worker still owns the receiver thread.
+The current Mega executor reads the same live window through the connector's
+read-only `comm_args` property.
+
+Async CAM-specific layered and Mega executors live alongside startup and
+Push/Pull sessions in `connectors/npu/async_cam_runtime/`. Model adapters
+provide layer weights; the runner drives these executors and owns graph state.
+
 ## Runtime selection
 
-FFN is launched as a `vllm serve` process, and AFD config normalization selects
+The traditional FFN is launched as a `vllm serve` process, and AFD config normalization selects
 its role-specific worker when `worker_cls="auto"`. It does not serve requests.
 Attention and FFN may be started in either order. Send API traffic only to
 Attention.
+
+DeepSeek-V4 Flash per-channel W4A8 also has a standalone F entry point,
+`python -m afd_plugin.ffn_faas serve`, implementing independent-service
+ownership under [RFC #391](https://github.com/vllm-project/afd-plugin/issues/391).
+It composes `CAMAsyncAFDConnector` and `AsyncNPUFFNModelRunner` without creating
+a vLLM Worker, upstream ModelRunner, EngineCore, scheduler or KV cache.
+Attention retains its existing model, connector and DBO path. Configuration,
+parameter loading and quantization remain vLLM/vLLM-Ascend dependencies.
+
+The standalone Ascend CLI reuses vLLM engine argument definitions, parsing and
+configuration construction. Existing AFD options remain in `additional_config`;
+only host management and shutdown options are standalone-specific. The host
+entry delegates parser creation to its selected platform, so CPU-only service
+and host-loop imports remain independent of vLLM.
+
+The CPU-only host `FFNModelRunner` accepts an `FFNBackend` factory, retains
+the backend before preparation, and owns the receiving thread and failure
+boundary. `FFNService` manages host status and stop requests. Platform options
+and CAM runtime composition live under `ffn_faas/platforms/npu/`.
+
+- `AscendFFNEnvironment` owns device initialization, F-only compute/EP groups
+  and native post-warmup CPU affinity. These groups coexist with the separate
+  A/F CAM group throughout execution.
+- `CAMRoutedModel` manages parameter loading, local placement checks, storage
+  accounting and cached-view lifetime. Startup selects a `RoutedModelAdapter`
+  to provide checkpoint metadata and native owner construction. The backend
+  uses the common resource without model-specific branching.
+- Model-specific code follows `ffn_faas/platforms/ffn_model/<model>/<backend>/`.
+  Under `deepseek_v4/npu/`, `v4_model.py` contains V4 checkpoint metadata and
+  `V4ModelAdapter`. `v4_weights.py` contains the lazily imported native parameter
+  owner. Native routed modules, expert-map managers and quantizers remain
+  resident. The loader adapter delegates to the native V4 loader. Dependency
+  upgrades must preserve its documented receiver and factory contracts.
+- Platform settings enforce static CAM placement and reject EPLB, elastic EP
+  and redundant experts. Retaining native expert state does not enable these
+  algorithms.
+
+`FFNBackend` is a runtime lifecycle interface. Its `execute_step()` delegates
+communication, computation and Graph execution to the Async CAM
+runtime. A shared cross-platform, cross-connector Step Loop and a pure
+`compute(item)` backend are not implemented. The runtime consumes the existing
+`QuantizedExpertWeights` contract with W4A8 weights, without per-step model selection;
+there is no
+separate V4 execution runtime.
+
+`attach_model` lends independently loaded parameters to the runtime. After
+receiver exit and device completion, shutdown releases CAM/Graph resources,
+then native compute groups, and finally the routed owner. Failed or pending
+native work retains all owners until whole-pair process isolation. A host
+`/stop` request cannot cancel an outstanding CAM DR.
+See the [standalone service guide](../../npu/STANDALONE_FFN_SERVICE.md) for
+supported configuration, launch and shutdown behavior.
 
 | Platform | Worker | Model runner | Current connectors |
 | --- | --- | --- | --- |
@@ -149,10 +228,9 @@ connector owns transport/process-group resources.
 CUDA and Ascend require ModelRunnerV2 on both roles. FFN remains connector-driven and
 does not adopt native V2 request state or scheduler-driven execution:
 
-- CUDA temporarily substitutes `GPUFFNModelRunner`, or
-  `GPUFFNRoutedExpertsModelRunner` for a routed-experts connector, at the
-  native V2 construction seam inside `Worker.init_device()`; the AFD runner is
-  still the runtime object.
+- CUDA overrides `Worker._make_model_runner()` to construct
+  `GPUFFNRoutedExpertsModelRunner` for routed-experts connectors, otherwise
+  `GPUFFNModelRunner`.
 - Ascend constructs `AFDNPUFFNModelRunner` for CAMP2P or
   `AsyncNPUFFNModelRunner` for Async CAM. Both use the native MRV2
   forward-context shape and install Ascend state in `additional_kwargs`.
@@ -162,8 +240,9 @@ does not adopt native V2 request state or scheduler-driven execution:
 The V2 pair requires PP/PCP/DCP size 1, configured role ranks equal to DP x TP,
 static EP, and a registered AFD model. CUDA uses `P2pNcclAFDConnector` with
 model-specific gate placement and supports two native microbatches with
-Attention DP1 or DP > 1. H20 validation covers DeepSeek-V2-Lite DP1/TP2
-Graph + DBO with 128 GSM8K samples and live two-stage/full-replay assertions.
+Attention DP1 or DP > 1. See the
+[runtime matrix](../../support.md#tested-runtime-matrix) for tested
+configurations and known DeepSeek-V2-Lite DBO shutdown failures.
 CUDA `DeepEPM2NAFDConnector` requires Attention-side gating, FFN TP 1, and
 the same DBO setting on both roles; see the
 [DeepEP M2N guide](../../gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md).
@@ -174,18 +253,6 @@ supports eager Attention DBO at DP1 or DP > 1, and rejects native DBO flags on
 FFN. Async FFN FULL accepts eager Attention DBO and continues to receive work
 items independently of Attention's threads. These limits
 describe the pair even though only Attention inherits a native V2 runner.
-
-Async CAM also has an experimental, default-off `ffn_two_stream` mode for
-layered W4A8 eager/FULL. `AsyncFFNTwoStream`, owned by the Async runner, retains
-two slots, compute/send streams and ready/done events. FULL owns four private
-graph pools and four graphs; eager retires each slot only after its send is
-observed complete. Both modes retain the bounded batch fence. Enabled eager
-and FULL agree on executor, layer, capacity and core signatures before HCCL
-creation and reject Attention DBO/SP combinations. Shutdown requires receiver
-exit and device completion before release. Partial native failures retain
-resources and remain visible to repeated health checks. Host tests do not
-qualify native window reuse, graph capture or stream overlap; see the
-[Async runtime guide](../../npu/ASYNC_FFN_RUNTIME.md#experimental-ffn-two-stream-execution).
 
 ## Daemon step selection
 
@@ -210,10 +277,10 @@ flowchart TD
     CONTROL --> FLAGS{"Profile, warmup, capture, replay, or eager?"}
     FLAGS --> GRAPH["Prepare graph state or eager context"]
     GRAPH --> RECEIVE["Receive Attention payload"]
-    CONTROL_PLANE -->|is None| WORK["Block on AFDAsyncFFNWorkItem"]
-    WORK --> CONTEXT["Build minimal forward context"]
+    CONTROL_PLANE -->|is None| WORK["Receive CAM payload"]
     RECEIVE --> COMPUTE["Role-aware FFN compute"]
-    CONTEXT --> COMPUTE
+    WORK --> LAYERED["Layered FFN compute on device"]
+    LAYERED --> SEND
     COMPUTE --> SEND["Send result to Attention"]
     SEND --> START
 ```
@@ -237,39 +304,47 @@ daemon thread:
 ### Connector-driven loop
 
 The Ascend worker checks `connector.control_plane`. When it is `None`, as for
-CAM async, the worker calls `execute_connector_driven_step()` instead of a
-control-plane receive. For each layer, the runner:
+CAM async, the worker calls `execute_connector_driven_step(shutdown_requested)`
+instead of a control-plane receive. The runner asks the execution session once
+per step whether to keep serving, so Pull adds no extra Store round trip to the
+loop. For each layer, the runner:
 
-1. receives a normalized `AFDAsyncFFNWorkItem` from
-   `connector.recv_ffn_work_item(...)`; CAM metadata supplies the actual layer
-   index and compact expert interval; counts.sum() supplies this chunk’s routed token count, and the connector slices tensors
-   from operator capacity down to those counts;
-2. builds a single-stage forward context sized to the work item's token count,
-   with `dp_metadata = None`;
-3. installs the work item's `AFDTransferContext.metadata` as `afd_metadata`;
-4. calls the role-aware FFN compute, forwarding the routed MoE compute
-   payloads (`group_list`, `dynamic_scales`) from the work item's `AFDAsyncTransferState` on
-   `AFDTransferContext.states`;
-5. returns the routed outputs through
-   `connector.send_ffn_work_item_output(...)`, which also handles the
-   floating zero-routed-token placeholder required by CAM combine-send.
-   A layer is complete only when the received interval ends at the final
-   local expert; earlier intervals continue the receive loop.
+1. receives a capacity-sized payload and its original CAM metadata through
+   `connector.recv_attn_output()`;
+2. passes activations, dynamic scales, expert counts and the device layer ID
+   to `AsyncCAMLayeredExecutor`;
+3. returns the routed output and original context with
+   `connector.send_ffn_output()`.
 
 Async eager does not use the synchronous DP-metadata graph cache. Its FULL
 mode captures a complete original DR/FFN/CS transaction with device-side layer
 selection. The independent Async runner owns one graph and stable resources;
-see [Async FFN runtime](../../npu/ASYNC_FFN_RUNTIME.md) for startup, supported
-W4A8 configuration and the original receiver's process-cleanup boundary.
+see [Async FFN runtime](../npu/async_ffn_runtime.md) for startup, supported
+W4A8/W8A8 configurations and the original receiver's process-cleanup boundary.
 
-With `AFD_ASYNC_CAM_LAYERED_GMM=1`, eligible DeepSeek-V4 W4A8 layers instead
-use `AsyncCAMW4A8Executor`: the runner passes capacity-sized payloads, device
-expert counts, and device layer IDs directly from receive through the layered
-GMMs to combine-send. The ordinary path above materializes the work item's
-layer/count information on the host. Both paths retain worker-level
-synchronization after a work-item group. MRV2 pairing does not prohibit the
-layered path. Its nonzero `swiglu_limit` limitation and validation scope are
-documented in the [CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-layered-gmm-experimental-disabled-by-default).
+DeepSeek-V4 W4A8 and W8A8 use layered GMM for both eager and FULL. Incompatible
+weights fail startup rather than selecting another FFN path. Worker-level
+synchronization remains after a work-item group. The `swiglu_limit` behavior
+and validation scope are documented in the
+[CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-and-w8a8-layered-gmm).
+
+## Async compute ownership
+
+The Async runner loads target/draft `QuantizedExpertWeights` through the model
+export contract, verifies layer coverage and selects Layered or Mega directly.
+`model_executor/ffn/npu/expert_weights.py` owns the Ascend quantized weight
+layout validation, logical geometry and graph signatures shared by Layered
+and Mega. `connectors/npu/async_cam_runtime/async_cam_layered.py` and `async_cam_mega.py` own native operator handles,
+workspace, zero bias and layer maps. There is no execution layer beneath the
+ModelRunner and no access to private model parameters from compute.
+
+Mega consumes the exported tensors independently of Layered. It prepares its
+workspace before startup negotiation and binds live `comm_args` and the group
+name after connector initialization, before warmup/capture. Binding failures
+are published through Startup and retain resources. Negotiation preserves the
+existing signature format, including `native_mc2:` and the W8A8 zero-bias layout;
+W8A8 Mega does not allocate Layered's unused zero bias. Eager/FULL transaction,
+graph and shutdown orchestration remain runner-owned.
 
 ## Control-plane-driven forward
 
@@ -362,19 +437,23 @@ The daemon catches failures, stores the original exception, logs it, and makes
 the error visible through `raise_ffn_loop_error_if_any()`. Re-entering startup
 or completing shutdown therefore surfaces an earlier background failure.
 
-Shutdown ordering is:
+CUDA shutdown ordering is:
 
 ```text
-signal daemon event
-  -> runner stops profiler and closes connector
+signal daemon event and close the control plane
   -> join daemon thread with a bounded timeout
   -> surface stored loop error
-  -> delegate remaining worker/runner shutdown upstream
+  -> after the thread has exited, delegate worker/runner shutdown upstream
+  -> runner stops profiler, releases its GPU state and closes the connector
 ```
 
-Connector receive calls may be blocking; the connector's `close()` behavior
-is responsible for releasing its communication resources so shutdown can
-complete.
+Connector receive calls may be blocking. The GPU control plane aborts its
+owned metadata process group to unblock the receiver before joining it. If the
+thread does not exit, native resources are not released underneath it. The
+connector then releases its remaining communication resources during runner
+shutdown. An earlier daemon failure is still surfaced after the join. Ascend
+uses its own connector close or asynchronous drain path before joining the
+daemon; see the [Async FFN runtime](../npu/async_ffn_runtime.md).
 
 ## Candidate invariants
 
@@ -398,16 +477,8 @@ async model E2E coverage.
 
 ## Limitations and open issues
 
-Current shared limits are the supported vLLM release, connector-driven FFN,
-and registered role-aware model integrations. Ascend V1 native DBO accepts
-exactly two ubatches. A V2-paired FFN uses the same AFD FFN runner with a
-V2-compatible construction and forward-context seam. CUDA FFN consumes the
-two-stage control layout and replays the matching graph when requested;
-Ascend V2 consumes two-stage synchronous control metadata in eager DBO mode.
-CAM async instead uses eager connector work items; native DBO runs only on
-Attention and does not create a separate FFN stage scheduler.
-Platform-specific limits are centralized in
-[execution platforms](execution_platforms.md#tested-runtime-matrix).
+Platform-specific execution limits and validation evidence are centralized in
+[support matrix](../../support.md#tested-runtime-matrix).
 
 Issue [#107](https://github.com/JiusiServe/afd-plugin/issues/107) completed the
 optional control-plane split. Connector metadata ownership, transfer state

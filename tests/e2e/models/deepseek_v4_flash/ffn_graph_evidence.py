@@ -9,10 +9,15 @@ import os
 import time
 from functools import wraps
 from pathlib import Path
+from types import SimpleNamespace
+from weakref import WeakKeyDictionary
 
 import torch
 
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+from afd_plugin.connectors.npu.async_cam_runtime.async_cam_mega import (
+    AsyncCAMMegaExecutor,
+)
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 from afd_plugin.v1.worker.npu.attention_model_runner_v2 import (
     AFDNPUAttentionModelRunnerV2,
@@ -29,7 +34,13 @@ def snapshot(runner) -> dict:
         "transport_live": connector.is_initialized,
     }
     if isinstance(runner, AsyncNPUFFNModelRunner):
+        execution = "uninitialized"
+        if runner._mega_executor is not None:
+            execution = "mega"
+        elif runner._layered_executor is not None:
+            execution = "layered"
         result.update(
+            execution=execution,
             mode=runner.effective_mode,
             requested=runner.requested_mode,
             capture_count=runner._graph_capture_count
@@ -70,8 +81,13 @@ class FFNGraphEvidence:
 
 
 def install_observers() -> None:
+    initialize = AsyncNPUFFNModelRunner.initialize_afd_connector
+    owners: WeakKeyDictionary[AsyncCAMMegaExecutor, CAMAsyncAFDConnector] = (
+        WeakKeyDictionary()
+    )
     complete = AsyncNPUFFNModelRunner._complete_graph
     send_eager = CAMAsyncAFDConnector.send_ffn_output
+    execute_mega = AsyncCAMMegaExecutor.__call__
     execute = AFDNPUAttentionModelRunnerV2.execute_model
     shutdown_attention = AFDNPUAttentionModelRunnerV2.shutdown
     shutdown_ffn = AsyncNPUFFNModelRunner.shutdown
@@ -83,6 +99,8 @@ def install_observers() -> None:
         # RPC snapshots read this host copy without touching device buffers.
         state = context.states
         header = state.token_nums_rankid_layeridx.cpu().tolist()
+        if header[2] < 0:
+            return  # Pull idle returns are not layer transactions.
         rows = int(state.group_list.sum().item())
         previous = getattr(connector, "_e2e_completion", {})
         layers = dict(previous.get("layers", {}))
@@ -96,11 +114,41 @@ def install_observers() -> None:
             "zero_rows": previous.get("zero_rows", 0) + int(rows == 0),
         }
 
+    def mega_context(executor):
+        return SimpleNamespace(
+            states=SimpleNamespace(
+                token_nums_rankid_layeridx=executor.batch_info,
+                group_list=executor.group_list,
+            )
+        )
+
     @wraps(complete)
     def completed(self):
         result = complete(self)
         if result:
-            observe(self.connector, self._graph_payload.context)
+            context = (
+                mega_context(self._mega_executor)
+                if self._mega_executor is not None
+                else self._graph_payload.context
+            )
+            observe(self.connector, context)
+        return result
+
+    @wraps(initialize)
+    def initialized(self):
+        result = initialize(self)
+        if self._mega_executor is not None:
+            owners[self._mega_executor] = self.connector
+        return result
+
+    @wraps(execute_mega)
+    def mega_executed(self):
+        result = execute_mega(self)
+        connector = owners.get(self)
+        if connector is not None and connector.graph_startup.mode == "eager":
+            # Never read device headers while FULL is warming up or capturing.
+            torch.npu.current_stream().synchronize()
+            observe(connector, mega_context(self))
         return result
 
     @wraps(send_eager)
@@ -166,8 +214,10 @@ def install_observers() -> None:
         record(self.model_runner, "stop_rpc_complete")
         return result
 
+    AsyncNPUFFNModelRunner.initialize_afd_connector = initialized
     AsyncNPUFFNModelRunner._complete_graph = completed
     CAMAsyncAFDConnector.send_ffn_output = sent
+    AsyncCAMMegaExecutor.__call__ = mega_executed
     AFDNPUAttentionModelRunnerV2.execute_model = executed
     AFDNPUAttentionModelRunnerV2.shutdown = attention_closed
     AsyncNPUFFNModelRunner.shutdown = ffn_closed

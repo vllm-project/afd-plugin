@@ -5,56 +5,49 @@
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 import pytest
 
-from tests.conftest import run_runner
-from tests.e2e.environment import devices_from_env, required_env
+from tests.conftest import REPO_ROOT, run_case_entry
+from tests.e2e.environment import devices_from_env, model_case_command, required_env
+from tests.e2e.models.deepseek_v4_flash.cases import NPU_ASYNC_IDS
 from tests.e2e.models.deepseek_v4_flash.config import (
+    DSV4_ASYNC_CAM_MEGA_SCENARIO,
     DSV4_ASYNC_CAM_SCENARIO,
     DSV4_ATTENTION_RANKS,
     DSV4_FFN_RANKS,
 )
 
 
-def build_runner_command(output_path: Path) -> list[str]:
+def build_runner_command(
+    output_path: Path, scenario: str = DSV4_ASYNC_CAM_SCENARIO
+) -> list[str]:
     if required_env("AFD_E2E_BACKEND") != "npu":
         raise RuntimeError("DSV4 async CAM E2E requires AFD_E2E_BACKEND=npu")
-    devices = devices_from_env("AFD_E2E_DEVICES", DSV4_ATTENTION_RANKS + DSV4_FFN_RANKS)
-    return [
-        sys.executable,
-        "-m",
-        "tests.e2e.runner",
-        "--model",
-        required_env("AFD_NPU_E2E_MODEL"),
-        "--vllm-bin",
-        os.environ.get("AFD_NPU_E2E_VLLM_BIN", "vllm"),
-        "--device-backend",
-        "npu",
-        "--attention-devices",
-        ",".join(devices[:DSV4_ATTENTION_RANKS]),
-        "--ffn-devices",
-        ",".join(devices[DSV4_ATTENTION_RANKS:]),
-        "--scenario",
-        DSV4_ASYNC_CAM_SCENARIO,
-        "--served-model-name-prefix",
-        "dsv4-flash",
-        "--afd-host",
-        required_env("HCCL_IF_IP"),
-        "--api-port-base",
-        os.environ.get("AFD_NPU_DSV4_E2E_API_PORT", "19280"),
-        "--afd-port",
-        os.environ.get("AFD_NPU_DSV4_E2E_AFD_PORT", "6455"),
-        "--startup-timeout",
-        os.environ.get("AFD_NPU_E2E_STARTUP_TIMEOUT", "1800"),
-        "--completion-output-path",
-        str(output_path),
-    ]
+    devices_from_env("AFD_E2E_DEVICES", DSV4_ATTENTION_RANKS + DSV4_FFN_RANKS)
+    command = model_case_command(
+        "tests.e2e.models.deepseek_v4_flash.cases",
+        scenario,
+        output_path,
+        backend="npu",
+    )
+    command.extend(
+        [
+            "--afd-host",
+            required_env("HCCL_IF_IP"),
+            "--api-port-base",
+            os.environ.get("AFD_NPU_DSV4_E2E_API_PORT", "19280"),
+            "--afd-port",
+            os.environ.get("AFD_NPU_DSV4_E2E_AFD_PORT", "6455"),
+            "--startup-timeout",
+            os.environ.get("AFD_NPU_E2E_STARTUP_TIMEOUT", "1800"),
+        ]
+    )
+    return command
 
 
-def build_environment() -> dict[str, str]:
+def build_environment(scenario: str = DSV4_ASYNC_CAM_SCENARIO) -> dict[str, str]:
     env = os.environ.copy()
     interface = required_env("HCCL_SOCKET_IFNAME")
     required_env("HCCL_IF_IP")
@@ -80,15 +73,29 @@ def build_environment() -> dict[str, str]:
             "TP_SOCKET_IFNAME": interface,
         }
     )
+    if scenario == DSV4_ASYNC_CAM_MEGA_SCENARIO:
+        vendor = REPO_ROOT / "afd_plugin/_cann_ops_custom/vendors/afd-plugin"
+        for key, path in (
+            ("ASCEND_CUSTOM_OPP_PATH", vendor),
+            ("LD_LIBRARY_PATH", vendor / "op_api/lib"),
+        ):
+            env[key] = os.pathsep.join(
+                dict.fromkeys(
+                    filter(None, (str(path), *env.get(key, "").split(os.pathsep)))
+                )
+            )
+        env["AFD_CUST_OPAPI_LIB_PATH"] = str(vendor / "op_api/lib/libcust_opapi.so")
     return env
 
 
 @pytest.mark.npu
 @pytest.mark.e2e
 @pytest.mark.slow
-@pytest.mark.parametrize("scenario", [DSV4_ASYNC_CAM_SCENARIO])
+@pytest.mark.parametrize("scenario", NPU_ASYNC_IDS)
 def test_deepseek_v4_flash_async_cam(scenario: str, tmp_path: Path) -> None:
-    run_runner(
-        build_runner_command(tmp_path / f"{scenario}.json"),
-        env=build_environment(),
+    output_path = tmp_path / scenario
+    run_case_entry(
+        build_runner_command(output_path, scenario),
+        output_path,
+        env=build_environment(scenario),
     )

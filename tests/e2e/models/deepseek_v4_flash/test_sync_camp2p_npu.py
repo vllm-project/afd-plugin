@@ -14,13 +14,12 @@ Hash layers, the token ids that the FFN-side gate routes with.
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 import pytest
 
-from tests.conftest import run_runner
-from tests.e2e.environment import devices_from_env, required_env
+from tests.conftest import run_case_entry
+from tests.e2e.environment import devices_from_env, model_case_command, required_env
 from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_SYNC_CAMP2P_SCENARIOS,
     DSV4_SYNC_HCCL_BUFFER_SIZE_MB,
@@ -46,36 +45,23 @@ def build_runner_command(scenario: str, output_path: Path) -> list[str]:
     shape = DSV4_SYNC_SHAPES[scenario]
     if required_env("AFD_E2E_BACKEND") != "npu":
         raise RuntimeError("DSV4 sync CAMP2P E2E requires AFD_E2E_BACKEND=npu")
-    devices = devices_from_env("AFD_E2E_DEVICES", shape.device_count)
-    return [
-        sys.executable,
-        "-m",
-        "tests.e2e.runner",
-        "--model",
-        required_env("AFD_NPU_E2E_MODEL"),
-        "--vllm-bin",
-        os.environ.get("AFD_NPU_E2E_VLLM_BIN", "vllm"),
-        "--device-backend",
-        "npu",
-        "--attention-devices",
-        ",".join(devices[: shape.attention_ranks]),
-        "--ffn-devices",
-        ",".join(devices[shape.attention_ranks :]),
-        "--scenario",
-        scenario,
-        "--served-model-name-prefix",
-        "dsv4-flash-sync",
-        "--afd-host",
-        _afd_host(shape),
-        "--api-port-base",
-        os.environ.get("AFD_NPU_DSV4_SYNC_E2E_API_PORT", "19380"),
-        "--afd-port",
-        os.environ.get("AFD_NPU_DSV4_SYNC_E2E_AFD_PORT", "6456"),
-        "--startup-timeout",
-        os.environ.get("AFD_NPU_E2E_STARTUP_TIMEOUT", "1800"),
-        "--completion-output-path",
-        str(output_path),
-    ]
+    devices_from_env("AFD_E2E_DEVICES", shape.device_count)
+    command = model_case_command(
+        "tests.e2e.models.deepseek_v4_flash.cases", scenario, output_path, backend="npu"
+    )
+    command.extend(
+        [
+            "--afd-host",
+            _afd_host(shape),
+            "--api-port-base",
+            os.environ.get("AFD_NPU_DSV4_SYNC_E2E_API_PORT", "19380"),
+            "--afd-port",
+            os.environ.get("AFD_NPU_DSV4_SYNC_E2E_AFD_PORT", "6456"),
+            "--startup-timeout",
+            os.environ.get("AFD_NPU_E2E_STARTUP_TIMEOUT", "1800"),
+        ]
+    )
+    return command
 
 
 def build_environment(scenario: str) -> dict[str, str]:
@@ -139,7 +125,9 @@ def build_environment(scenario: str) -> dict[str, str]:
 @pytest.mark.slow
 @pytest.mark.parametrize("scenario", DSV4_SYNC_CAMP2P_SCENARIOS)
 def test_deepseek_v4_flash_sync_camp2p(scenario: str, tmp_path: Path) -> None:
-    run_runner(
-        build_runner_command(scenario, tmp_path / f"{scenario}.json"),
+    output_path = tmp_path / scenario
+    run_case_entry(
+        build_runner_command(scenario, output_path),
+        output_path,
         env=build_environment(scenario),
     )

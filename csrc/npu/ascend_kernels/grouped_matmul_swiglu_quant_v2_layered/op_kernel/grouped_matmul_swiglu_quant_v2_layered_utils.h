@@ -26,6 +26,7 @@
 #define OP_KERNEL_GROUPED_MATMUL_DEQUANT_SWIGLU_QUANT_V2_LAYERED_UTILS_H
 
 #include "layered/layered_tensor_addr.h"
+#include "afd_swiglu_limit.h"
 
 // A8W4 MSD scenario
 #if defined(ORIG_DTYPE_X) && defined(DT_INT8) && ORIG_DTYPE_X == DT_INT8 && defined(ORIG_DTYPE_ALL_WEIGHT) &&        \

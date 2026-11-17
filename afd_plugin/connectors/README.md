@@ -13,20 +13,18 @@ AFD connector implementations are grouped by backend:
           plan.
         - `experts.py`: FFN expert execution with the `deepgemm` or
           `fused_experts` backend.
-        - `deepgemm.py`: the DeepGEMM grouped GEMMs, imported from the
-          installed `deep_gemm` package.
+        - `deepgemm.py`: the DeepGEMM grouped GEMMs, imported from the copy
+          bundled in vLLM (`vllm.third_party.deep_gemm`).
         - `fp8_quant.py`: the fused SiLU, top-k weight and FP8 block-128
           requantization step between the two FP8 expert GEMMs.
 - `npu/`: NPU-only connector implementations. `CAMP2pAFDConnector` is implemented
   by `afd_plugin.connectors.npu.camp2p`, and `CAMAsyncAFDConnector` is implemented
   by `afd_plugin.connectors.npu.async_cam`.
 
-The vLLM 0.30 integration has GPU hardware evidence for
-`P2pNcclAFDConnector` and, on SM90 or newer GPUs, `DeepEPM2NAFDConnector`. On
-vLLM-Ascend `8d4409d6`, NPU `CAMP2pAFDConnector` and `CAMAsyncAFDConnector`
-have representative V2-Lite and DSV4 Flash W4A8 functional and 300-question
-accuracy evidence; see the
-[runtime matrix](../../docs/design/module/execution_platforms.md#tested-runtime-matrix).
+Both backends target vLLM `0.32.0`; Ascend additionally targets
+vLLM-Ascend `bd42eea0`. See the
+[runtime matrix](../../docs/support.md#tested-runtime-matrix)
+for tested configurations and backend-specific validation limits.
 
 Shared connector contracts, metadata containers, factory registration, and
 backend-neutral helpers stay in `afd_plugin.connectors`:

@@ -19,9 +19,16 @@ and dispatches only the routed copies of each token to the FFN ranks that hold
 those experts. FFN ranks run only routed experts and send the weighted rows
 back; Attention sums each token's top-k contributions in combine.
 
-Supported models: Qwen3 MoE (`Qwen3MoeForCausalLM`) whose layers are all MoE
-and which has no shared expert. DeepSeek and Qwen3.5/Qwen3.6 MoE are rejected
-with this connector.
+Supported models:
+
+- Qwen3 MoE (`Qwen3MoeForCausalLM`) whose layers are all MoE and which has no
+  shared expert.
+- DeepSeek-V2 (`DeepseekV2ForCausalLM`, validated with DeepSeek-V2-Lite).
+  Attention runs the dense layers and the shared experts; the shared experts
+  overlap the dispatch and the FFN. With Attention TP > 1 each TP rank runs
+  them, with replicated weights, on the token slice it dispatches.
+
+DeepSeek-V3, GLM-DSA and Qwen3.5/Qwen3.6 MoE are rejected with this connector.
 
 ## How it works
 
@@ -41,6 +48,16 @@ DeepEP sees this world as one symmetric expert-parallel group. FFN rank `g`
 owns real experts `[g * E/F, (g + 1) * E/F)`, so `num_experts` must be
 divisible by `F`; Attention ranks own dummy expert slots that routing never
 selects. Any Attention:FFN ratio works.
+
+The handshake, the model checks and the control plane use this order. The
+afdEP-comm transport sees the same ranks in physical order instead: NVLink
+domain by domain (DeepEP numbers ranks that way), with each domain's FFN ranks
+first. When the FFN ranks fill the first domains (one node, or FFN and
+Attention on separate pods) the two orders are equal. When every domain holds
+the same number of FFN ranks (`4A1F,4A1F`), the connector runs afdEP-comm's
+per-domain mode, which finds the FFN ranks at the start of every domain. The
+connector derives the order from where the ranks run; see
+[Supported layouts](#supported-layouts).
 
 ### Data path
 
@@ -66,11 +83,12 @@ sync, graph mode), so there is no per-layer control traffic.
 
 Before allocating transport buffers, all ranks exchange a handshake and fail
 together if they disagree. The handshake checks the payload format, model
-shapes, lane count (DBO), `control_backend`, `network`, bucket settings, GPU
+shapes, lane count (DBO), `network`, bucket settings, GPU
 architecture (SM90 or newer), and the FFN deployment (expert parallel, EP
 size, FFN TP=1, linear expert placement, no EPLB, all2all backend and expert
-weight format). The FFN adopts the Attention TP size, dispatch capacity and
-bucket ladder reported by the Attention ranks.
+weight format), and the placement of the ranks over NVLink domains. The FFN
+adopts the Attention TP size, dispatch capacity and bucket ladder reported by
+the Attention ranks.
 
 ## Installation
 
@@ -83,7 +101,7 @@ The connector needs three components in addition to the plugin and vLLM:
    ```bash
    python -m pip uninstall -y afdep
    python -m pip install --no-deps \
-     "afdep-comm @ git+https://github.com/afdEP/afdEP-comm.git@<commit pinned in pyproject.toml>"
+     "afdep-comm @ git+https://github.com/afdEP/afdEP-comm.git@<tag pinned in pyproject.toml>"
    python -m afdep doctor --build
    ```
 
@@ -96,32 +114,16 @@ The connector needs three components in addition to the plugin and vLLM:
    export AFDEP_NCCL_ROOT=$NCCL LD_LIBRARY_PATH=$NCCL/lib:${LD_LIBRARY_PATH:-}
    ```
 
-2. **DeepGEMM**, required by the default `deepgemm` expert backend. It is not a
-   plugin extra (its build imports `torch` and needs git submodules), so build
-   it from source:
+2. **DeepGEMM**, required by the default `deepgemm` expert backend. The
+   connector uses the copy bundled in the vLLM wheel
+   (`vllm.third_party.deep_gemm`). Every vLLM `v0.32.0` CUDA build ships it,
+   including the `vllm/vllm-openai` image, so no extra step is needed.
+   A separately installed upstream `deep_gemm` package is not used by the
+   connector (vLLM's own kernels prefer it when present).
 
-   ```bash
-   # DeepGEMM's JIT includes elfutils/libdwfl.h.
-   apt-get install -y libdw-dev
-   git clone https://github.com/deepseek-ai/DeepGEMM.git
-   cd DeepGEMM
-   git submodule update --init --recursive
-   python setup.py bdist_wheel
-   # --no-deps: DeepGEMM's own install path reinstalls torch.
-   python -m pip install --no-deps dist/*.whl
-   ```
-
-   - The elfutils headers (`libdw-dev`, and `libelf-dev` it depends on) are
-     needed when building DeepGEMM and at runtime, because DeepGEMM compiles
-     its kernels just in time. Without root, extract the `libdw-dev` and
-     `libelf-dev` packages that match the installed elfutils runtime with
-     `dpkg -x`, and point `CPLUS_INCLUDE_PATH`, `C_INCLUDE_PATH` and
-     `LIBRARY_PATH` at them for both the build and the served processes.
-   - When torch comes from the pip CUDA wheels, its headers include
-     `cusparse.h` and other CUDA headers shipped by the `nvidia-*` wheels.
-     Add that wheel `include` directory to `CPLUS_INCLUDE_PATH` for the build.
-   - The `fused_experts` expert backend (vLLM's Triton kernels) runs without
-     DeepGEMM; it is a reference backend.
+   DeepGEMM compiles its kernels just in time on first use, so the first start
+   on a host is slower. The `fused_experts` expert backend (vLLM's Triton
+   kernels) runs without DeepGEMM; it is a reference backend.
 
 3. A GPU with compute capability 9.0 or newer on every rank.
 
@@ -177,7 +179,6 @@ Unknown keys are rejected. All keys are optional.
 | `expert_num_sms` | `int` | `0` | SMs used by the FFN's DeepGEMM expert kernels; must be even. `0` uses all SMs. With DBO, a value that leaves SMs for the other lane's transport kernels avoids delaying overlapping GEMMs. |
 | `cpu_timeout_s` | `int` | `120` | Transport host-wait timeout. |
 | `gpu_timeout_s` | `int` | `120` | Transport kernel-spin timeout. |
-| `control_backend` | `str` | `"nccl"` | Backend of the connector's own process group (handshake, transport bootstrap, per-step control payload): `"nccl"` or `"gloo"`. `gloo` keeps this traffic off the GPUs and RDMA NICs. |
 | `network` | `object` | see below | Fabric settings. |
 
 `network` keys:
@@ -220,7 +221,63 @@ that sets `capacity_tokens_per_rank` explicitly must agree with Attention.
 | Attention DP x TP | Supported, including TP > 1: each TP rank dispatches its slice of the DP rank's tokens and the TP group all-gathers the combined rows. |
 | FFN DP x TP1 | Required. FFN experts are not TP-sharded. |
 | One node | Supported; ranks reach each other over NVLink. |
-| Several nodes | Supported when every node (NVLink domain) holds an equal, contiguous block of world ranks, with FFN ranks first. Writing each node's ranks as `<A>A<F>F`, the layouts `2A0F,0A2F` (Attention on one node, FFN on another) and `4A0F,0A4F` are valid; `4A1F,4A1F` (FFN ranks not contiguous) and `4A0F,0A2F` (unequal blocks) are not. The fabric must route between the NICs NCCL picks. |
+| Several nodes or pods | Supported for the placements below. The fabric must route between the NICs NCCL picks. |
+
+Write each pod's ranks as `<a>A<f>F`, in pod order (on HGX every pod is one
+NVLink domain; on NVL72, pods in one NVLink clique form one domain). A
+placement is valid when:
+
+1. every pod holds the same number of GPUs;
+2. either the FFN ranks fill the first pods, or every pod holds the same
+   number of FFN ranks;
+3. FFN DP ranks rise in pod order, and so do Attention DP ranks;
+4. `num_experts % F == 0`, and Attention TP stays inside a pod.
+
+Inside a pod, put the FFN ranks on the same local GPUs in every pod
+(the recipes use the first ones): DeepEP's hybrid mode pairs ranks across pods
+by their position in the pod.
+
+| Placement | Accepted | afdEP-comm mode |
+| --- | --- | --- |
+| `4A2F` (one pod) | yes | FFN prefix |
+| `2A0F,0A2F`, `0A4F,4A0F` | yes | FFN prefix |
+| `3A2F,5A0F` | yes | FFN prefix (one mixed pod at the boundary) |
+| `0A1F,0A1F,1A0F,1A0F` | yes | FFN prefix, pods of one GPU |
+| `4A1F,4A1F`, `1A1F,1A1F`, `6A2F,6A2F` | yes | per-domain, `f` = FFN ranks per pod |
+| `4A1F,3A2F` | no | the FFN count varies from pod to pod |
+| `0A1F,0A1F,2A0F,2A0F`, `0A2F,4A0F` | no | pods of different sizes |
+
+The rejected placements usually have an equivalent with equal pods: for
+example `0A2F,2A0F,2A0F` instead of `0A2F,4A0F`. There is nothing to
+configure; the handshake rejects other placements with the pods' shapes in
+the message.
+
+## Multi-pod deployment
+
+Each pod starts one `vllm serve` per role it holds, with the AFD config
+(`num_attention_ranks = A`, `num_ffn_ranks = F`, `host:port` = the pod that
+holds FFN rank 0) the same on every rank. For each role, with `S` = the role's
+DP size, `L` = this pod's local DP size and `start` = the sum of the local
+sizes of the pods before it:
+
+| Flag | First pod holding the role | Other pods holding the role |
+| --- | --- | --- |
+| `--data-parallel-size` | `S` | `S` |
+| `--data-parallel-size-local` | `L` | `L` |
+| `--data-parallel-address` / `--data-parallel-rpc-port` | its own address | the first pod's address |
+| `--data-parallel-start-rank` | omitted | `start` |
+| `--headless` | no | yes |
+
+When one pod holds the whole role, pass only `--data-parallel-size`. Do not
+pass `--data-parallel-start-rank 0` on the first pod: vLLM reads an explicit
+start rank on a non-headless engine as hybrid load balancing and then rejects
+the headless pods. The FFN DP rank is the FFN's EP rank, so it decides which
+experts a pod loads; `--enable-ep-weight-filter` keeps each FFN from reading
+the other experts' weights.
+
+The [DeepEP M2N recipes](../../recipe/gpu/DeepEPM2NAFDConnector/README.md#layout)
+derive all of these flags from a `LAYOUT` such as `2A0F,0A2F` or `4A1F,4A1F`
+and the pod index (`POD=AFD_<k>`).
 
 ## Minimal launch shape
 
@@ -267,18 +324,21 @@ and FP8 examples, see the
 
 - CPU unit tests:
   [`tests/unit/connectors/test_deepep_m2n_connector.py`](../../tests/unit/connectors/test_deepep_m2n_connector.py)
-  runs against a fake afdEP module when afdEP-comm is not installed.
+  runs against a fake afdEP module when afdEP-comm is not installed;
+  [`test_deepep_m2n_layout.py`](../../tests/unit/connectors/test_deepep_m2n_layout.py)
+  checks the placement table above.
 - GPU connector tests: [`tests/gpu`](../../tests/gpu/README.md) checks
   dispatch, DeepGEMM experts and combine against references on one node.
 - Model E2E: the Qwen3 MoE cases `afd-deepep-m2n-*-2a2f` in
   [`tests/e2e`](../../tests/e2e/README.md#deepep-m2n-scenarios) (eager, graph,
-  graph + DBO, and Attention TP2) and the two-pod cases in
+  graph + DBO, and Attention TP2), the same five DeepSeek-V2-Lite cases and
+  the two-pod cases in
   `tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py`.
 
 ## Requirements and limitations
 
 - SM90 or newer on every rank; the handshake rejects older GPUs.
-- Qwen3 MoE only, with every layer MoE and no shared expert.
+- Qwen3 MoE with every layer MoE and no shared expert, or DeepSeek-V2.
 - `compute_gate_on_attention=true` on both roles; EPLB is not supported.
 - FFN TP must be 1; FFN EP size equals `num_ffn_ranks`.
 - `num_experts` must be divisible by `num_ffn_ranks`.

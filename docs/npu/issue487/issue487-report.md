@@ -597,4 +597,3 @@ timeline 重叠不等于真正同时执行。
 
 优化后的同机补测（AIV 8/24、fan-in 8、GMM 12/24、`BATCH_SIZE_FACTOR=1.0`）与 production
 GMM 配额见 [issue487-optimization-result.md](issue487-optimization-result.md) §10。
-

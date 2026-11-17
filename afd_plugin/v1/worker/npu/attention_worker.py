@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any
 
 from vllm.v1.worker.workspace import init_workspace_manager
+from vllm_ascend.utils import register_ascend_fla_customop
 from vllm_ascend.worker.worker import NPUWorker
 
 from afd_plugin.compat.npu import (
@@ -16,7 +17,10 @@ from afd_plugin.compat.npu import (
     npu_afd_num_ubatches,
 )
 from afd_plugin.compat.npu.runtime_config import configure_async_cam_dbo
-from afd_plugin.model_executor.models.model_utils import get_afd_model_config
+from afd_plugin.model_executor.models.model_utils import (
+    configure_afd_dspark,
+    get_afd_model_config,
+)
 from afd_plugin.v1.worker.npu.attention_model_runner_v2 import (
     AFDNPUAttentionModelRunnerV2,
 )
@@ -53,6 +57,9 @@ class AFDNPUAttentionWorker(NPUWorker):
         )
 
         self.device = self._init_device()
+        # Match native bd42eea: FLA capability queries use the selected device
+        # and registration completes before the model runner is constructed.
+        register_ascend_fla_customop()
         init_workspace_manager(
             self.device,
             npu_afd_num_ubatches(self.vllm_config),
@@ -61,6 +68,7 @@ class AFDNPUAttentionWorker(NPUWorker):
             self.vllm_config.model_config,
             device_type="npu",
         )
+        configure_afd_dspark(self.vllm_config)
         self.model_runner = AFDNPUAttentionModelRunnerV2(
             self.vllm_config,
             self.device,

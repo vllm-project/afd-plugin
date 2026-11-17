@@ -42,18 +42,19 @@ def load_async_modules(monkeypatch):
         "afd_plugin.compat.npu.ops",
         "afd_plugin.compat.npu.forward_context",
         "afd_plugin.compat.npu.profiler",
-        "afd_plugin.model_executor.npu.async_cam_w4a8",
+        "afd_plugin.connectors.npu.async_cam_runtime.async_cam_layered",
+        "afd_plugin.connectors.npu.async_cam_runtime.async_cam_mega",
+        "afd_plugin.model_executor.ffn.npu.expert_weights",
         "afd_plugin.v1.worker.ffn_metadata",
     ):
         stub(name)
-    stub(
-        "afd_plugin.connectors.base", AFDConnectorBase=object, ConnectorExtraInfo=object
-    )
-    stub("afd_plugin.connectors.metadata", AFDTransferState=object)
+    stub("vllm.forward_context")
+    load_host_module(monkeypatch, "afd_plugin.connectors.metadata")
+    load_host_module(monkeypatch, "afd_plugin.connectors.base")
+    load_host_module(monkeypatch, "tests.unit.fakes.connector")
     group = load_host_module(monkeypatch, "afd_plugin.distributed.afd_process_group")
     stub("afd_plugin.distributed", init_afd_process_group=group.init_afd_process_group)
     connector = load_host_module(monkeypatch, "afd_plugin.connectors.npu.async_cam")
-    load_host_module(monkeypatch, "afd_plugin.v1.worker.npu.async_ffn_two_stream")
     runtime = load_host_module(
         monkeypatch, "afd_plugin.v1.worker.npu.async_ffn_model_runner"
     )

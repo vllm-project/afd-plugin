@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 
 AFD_FORCE_BALANCED_TOPK_IDS = "AFD_FORCE_BALANCED_TOPK_IDS"
-AFD_ASYNC_CAM_LAYERED_GMM = "AFD_ASYNC_CAM_LAYERED_GMM"
+AFD_ASYNC_MOE_LAYOUT_LOG = "AFD_ASYNC_MOE_LAYOUT_LOG"
 ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
@@ -15,13 +15,13 @@ def force_balanced_topk_ids_enabled() -> bool:
     return os.environ.get(AFD_FORCE_BALANCED_TOPK_IDS, "").lower() in ENV_TRUE_VALUES
 
 
-def async_cam_layered_gmm_enabled() -> bool:
-    return os.environ.get(AFD_ASYNC_CAM_LAYERED_GMM, "").lower() in ENV_TRUE_VALUES
+def async_moe_layout_log_enabled() -> bool:
+    return os.environ.get(AFD_ASYNC_MOE_LAYOUT_LOG, "").lower() in ENV_TRUE_VALUES
 
 
 __all__ = [
+    "AFD_ASYNC_MOE_LAYOUT_LOG",
     "AFD_FORCE_BALANCED_TOPK_IDS",
-    "AFD_ASYNC_CAM_LAYERED_GMM",
-    "async_cam_layered_gmm_enabled",
+    "async_moe_layout_log_enabled",
     "force_balanced_topk_ids_enabled",
 ]

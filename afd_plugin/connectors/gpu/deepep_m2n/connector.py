@@ -9,11 +9,21 @@ experts; FFN ranks run their local experts on what they receive and send the
 weighted results back, where combine sums each token's top-k contributions.
 
 Topology:
-    One AFD world ordered ``[F0, F1, ..., A0, A1, ...]`` (as the P2P
-    connector). DeepEP sees it as a symmetric EP group in which FFN rank ``g``
+    One AFD role world ordered ``[F0, F1, ..., A0, A1, ...]`` (as the P2P
+    connector) for the handshake, the model checks and the control plane.
+    DeepEP sees the ranks as a symmetric EP group in which FFN rank ``g``
     owns real experts ``[g * E/F, (g + 1) * E/F)`` and Attention ranks own
     dummy expert slots (see ``layout.py``). Any Attention:FFN ratio works;
     ``num_experts`` must be divisible by the FFN rank count.
+
+Placement:
+    Every NVLink domain (on HGX, every pod) holds the same number of ranks,
+    and either the FFN ranks fill the first domains or every domain holds the
+    same number of FFN ranks, with FFN DP ranks rising in pod order (2 x 4A1F
+    is two pods of one FFN and four Attention ranks). The handshake derives
+    the transport's physical rank order from the ranks' NVLink domains
+    (``plan_transport_layout``) and picks afdEP-comm's FFN-prefix or
+    per-domain mode; nothing is configured.
 
 Data path (per MoE layer and stage, identical order on every rank):
     Attention: ``send_attn_output(h, ctx, topk_ids=, topk_weights=)``
@@ -66,6 +76,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.distributed as dist
 from afdep.deepep import DispatchHandle, ElasticBuffer, ReceiveResult
+from torch.distributed.distributed_c10d import _abort_process_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -78,6 +89,7 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id, dbo_enabled
 from afd_plugin.config import AFDConfig
 from afd_plugin.connectors.base import (
     AFDControlPlane,
+    AFDControlPlaneClosedError,
     AFDRoutedExpertsConnector,
     ConnectorExtraInfo,
 )
@@ -86,7 +98,12 @@ from afd_plugin.connectors.gpu.deepep_m2n.experts import (
     DeepEPM2NExperts,
     ExpertBackend,
 )
-from afd_plugin.connectors.gpu.deepep_m2n.layout import DeepEPM2NLayout
+from afd_plugin.connectors.gpu.deepep_m2n.layout import (
+    DeepEPM2NLayout,
+    RankPlacement,
+    TransportLayout,
+    plan_transport_layout,
+)
 from afd_plugin.connectors.gpu.deepep_m2n.network import (
     NetworkConfig,
     NetworkPlan,
@@ -118,7 +135,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-PROTOCOL_VERSION = "deepep_m2n/1"
+PROTOCOL_VERSION = "deepep_m2n/2"
 BF16_PAYLOAD = "bf16"
 # FP8 e4m3 rows with one fp32 scale per row and 128 channels (SM90 recipe).
 FP8_PAYLOAD = "fp8_block128_fp32"
@@ -135,13 +152,15 @@ PAYLOAD_WEIGHT_FORMATS = {
 # vLLM's own MoE all-to-all never runs; this backend allocates no buffers and
 # keeps vLLM's DeepEP out of the process.
 IDLE_ALL2ALL_BACKEND = "allgather_reducescatter"
-CONTROL_BACKENDS = ("nccl", "gloo")
 # DeepEP V2 needs Hopper (SM90) or newer.
 MIN_SM_MAJOR = 9
 PROCESS_GROUP_NAME = "afd_deepep_m2n"
 # CPU (gloo) group for the handshake and DeepEP's communicator bootstrap,
 # created before any NCCL communicator so the network plan can still set NCCL_*.
 BOOTSTRAP_GROUP_NAME = "afd_deepep_m2n_bootstrap"
+# CPU (gloo) group in transport order for the lanes, created only when that
+# order differs from the role world (per-domain FFN placement).
+TRANSPORT_GROUP_NAME = "afd_deepep_m2n_transport"
 # FastAFD passes 120 s for both the CPU wait and the GPU spin timeouts.
 DEFAULT_TIMEOUT_S = 120
 # Only Attention rank 0 sends the per-step control payload.
@@ -186,10 +205,6 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
         cpu_sync_min_tokens: Eager steps whose bucket is below this skip the
             host sync that reads receive counts; FFN ranks then allocate the
             worst-case receive size instead. ``0`` always syncs in eager mode.
-        control_backend: Backend of the connector's own process group
-            (handshake, DeepEP communicator bootstrap, per-step control
-            payload). ``gloo`` keeps it off the GPUs and the RDMA NICs, so
-            DeepEP's communicator is the only RDMA user.
     """
 
     capacity_tokens_per_rank: int | None = None
@@ -204,7 +219,6 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
     cpu_timeout_s: int = DEFAULT_TIMEOUT_S
     gpu_timeout_s: int = DEFAULT_TIMEOUT_S
     cpu_sync_min_tokens: int = 0
-    control_backend: str = "nccl"
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> DeepEPM2NConfig:
@@ -242,8 +256,6 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             raise ValueError("num_qps must be non-negative")
         if self.cpu_timeout_s <= 0 or self.gpu_timeout_s <= 0:
             raise ValueError("cpu_timeout_s and gpu_timeout_s must be positive")
-        if self.control_backend not in CONTROL_BACKENDS:
-            raise ValueError(f"control_backend must be one of {CONTROL_BACKENDS}")
 
     def to_mapping(self) -> dict[str, Any]:
         return {**asdict(self), "network": self.network.to_mapping()}
@@ -343,8 +355,9 @@ def plan_stage(
     # ``cpu_sync_min_tokens``) and allocate the worst case for their bucket,
     # so they round up only to the next rung: graph steps already sit on one
     # (vLLM pads them to a capture size). The rule depends only on the token
-    # counts, because every rank must pass DeepEP the same bucket even when a
-    # rank plans the step in another mode (an FFN eager fallback).
+    # counts, because every rank must pass DeepEP the same bucket whatever
+    # mode it plans the step in (an FFN eager fallback keeps Attention's
+    # replay flag, so today the ranks plan alike).
     if not bucket_ladder or bucket > bucket_ladder[-1]:
         bucket = capacity_tokens_per_rank
     else:
@@ -439,6 +452,7 @@ class HandshakeResult:
     attn_tp_size: int
     capacity_tokens_per_rank: int
     bucket_ladder: tuple[int, ...]
+    transport: TransportLayout
 
 
 def expert_weight_format(quant_config: QuantizationConfig | None) -> str:
@@ -506,7 +520,6 @@ def local_handshake_info(
         "cpu_sync_min_tokens": config.cpu_sync_min_tokens,
         "attn_tp_size": attn_tp_size,
         "compute_gate_on_attention": compute_gate_on_attention,
-        "control_backend": config.control_backend,
         "network": str(config.network.to_mapping()),
         "expert_alignment": expert_alignment,
         "ffn_deployment": ffn_deployment,
@@ -523,8 +536,6 @@ _MUST_MATCH = (
     "top_k",
     "num_lanes",
     "compute_gate_on_attention",
-    # NCCL ranks create a communicator that gloo ranks would never join.
-    "control_backend",
     "network",
     "bucket_granularity",
     "cpu_sync_min_tokens",
@@ -635,9 +646,26 @@ def validate_handshake(
         raise RuntimeError(
             f"Attention ranks disagree on bucket_ladder: {sorted(map(str, ladders))}"
         )
-    # Every rank evaluates the same plan on the same list.
+    # Every rank evaluates the same plans on the same list. The network plan
+    # sees the ranks in the transport order afdEP-comm will see.
+    topologies = [RankTopology.from_mapping(info["topology"]) for info in infos]
+    transport = plan_transport_layout(
+        [
+            RankPlacement(info["role"], info["role_rank"], topology.nvlink_domain)
+            for info, topology in zip(infos, topologies, strict=True)
+        ],
+        layout.ffn_size,
+    )
     plan = plan_network(
-        [RankTopology.from_mapping(info["topology"]) for info in infos], network
+        [
+            RankTopology(
+                world_rank=transport.transport_rank(info["role"], info["role_rank"]),
+                host=topology.host,
+                nvlink_domain=topology.nvlink_domain,
+            )
+            for info, topology in zip(infos, topologies, strict=True)
+        ],
+        network,
     )
     return HandshakeResult(
         expert_alignment=int(alignments.pop()),
@@ -645,6 +673,7 @@ def validate_handshake(
         attn_tp_size=attn_tp_size,
         capacity_tokens_per_rank=int(capacities.pop()),
         bucket_ladder=ladders.pop() or (),
+        transport=transport,
     )
 
 
@@ -924,7 +953,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self.layout = DeepEPM2NLayout(
             ffn_size=afd_config.num_ffn_ranks,
             attn_size=afd_config.num_attention_ranks,
-            num_experts=text_config.num_experts,
+            num_experts=vllm_config.model_config.get_num_experts(),
         )
         self.attn_size = self.layout.attn_size
         self.ffn_size = self.layout.ffn_size
@@ -967,16 +996,13 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self.device = torch.device(
             "cuda", current_platform.logical_device_id_to_visible_device_id(local_rank)
         )
-        # Where control payloads are staged: gloo moves CPU tensors.
-        self.control_device = (
-            torch.device("cpu")
-            if self.config.control_backend == "gloo"
-            else self.device
-        )
         self._rendezvous = f"tcp://{afd_config.host}:{afd_config.port}"
         self._timeout = timedelta(seconds=afd_config.afd_process_group_timeout_s)
         self.group: dist.ProcessGroup | None = None
         self.bootstrap_group: dist.ProcessGroup | None = None
+        # The lanes' group: the bootstrap group, or one in transport order.
+        self.transport_group: dist.ProcessGroup | None = None
+        self.transport: TransportLayout | None = None
         self.network_plan: NetworkPlan | None = None
         self.lanes: list[ElasticBuffer] = []
         self.lane_streams: list[torch.cuda.Stream] = []
@@ -996,7 +1022,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self._combine_zeros: torch.Tensor | None = None
         self._op_id = next(_CONNECTOR_IDS)
         self._initialized = False
-        self.control_plane = DeepEPM2NAFDControlPlane(self)
+        self.control_plane: DeepEPM2NAFDControlPlane = DeepEPM2NAFDControlPlane(self)
 
     # ==============================
     # Lifecycle
@@ -1056,8 +1082,25 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self.attn_tp_size = result.attn_tp_size
         self.capacity_tokens_per_rank = result.capacity_tokens_per_rank
         self.bucket_ladder = result.bucket_ladder
+        self.transport = result.transport
+        if self.transport.is_identity:
+            self.transport_group = self.bootstrap_group
+        else:
+            # Transport rank 0 is FFN rank 0, the process that hosts the
+            # rendezvous store, so this group joins the same store.
+            self.transport_group = init_afd_process_group(
+                backend="gloo",
+                init_method=self._rendezvous,
+                world_size=self.layout.union_size,
+                rank=self.transport.transport_rank(
+                    self.afd_config.role, self.role_rank
+                ),
+                group_name=TRANSPORT_GROUP_NAME,
+                timeout=self._timeout,
+            )
         if self.world_rank == 0:
             logger.info("DeepEP M2N network plan: %s", self.network_plan.summary())
+            logger.info("DeepEP M2N transport: %s", self.transport.summary())
         # DeepEP reads both when each buffer is created: the GIN switch, and
         # with several lanes a communication stream per buffer.
         apply_gin_environment(self.network_plan)
@@ -1099,17 +1142,15 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             hidden_size=self.hidden_size,
             payload_format=self.config.payload_format,
         )
-        self.group = (
-            self.bootstrap_group
-            if self.config.control_backend == "gloo"
-            else init_afd_process_group(
-                backend="nccl",
-                init_method=self._rendezvous,
-                world_size=self.layout.union_size,
-                rank=self.world_rank,
-                group_name=PROCESS_GROUP_NAME,
-                timeout=self._timeout,
-            )
+        # Never the lanes' bootstrap group: the control plane's close() aborts
+        # this group to cancel a pending receive.
+        self.group = init_afd_process_group(
+            backend="nccl",
+            init_method=self._rendezvous,
+            world_size=self.layout.union_size,
+            rank=self.world_rank,
+            group_name=PROCESS_GROUP_NAME,
+            timeout=self._timeout,
         )
         try:
             for _ in range(self.num_lanes):
@@ -1134,10 +1175,11 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
 
     def _new_lane(self) -> ElasticBuffer:
         """One lane's afdEP-comm transport."""
-        assert self.bootstrap_group is not None and self.network_plan is not None
+        assert self.transport_group is not None and self.transport is not None
+        assert self.network_plan is not None
         assert self.capacity_tokens_per_rank is not None
         return ElasticBuffer(
-            group=self.bootstrap_group,
+            group=self.transport_group,
             capacity_tokens_per_rank=self.capacity_tokens_per_rank,
             hidden_size=self.hidden_size,
             num_experts=self.layout.deepep_num_experts,
@@ -1149,15 +1191,25 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             rdma_traffic_class=self.network_plan.rdma_traffic_class,
             cpu_timeout_s=self.config.cpu_timeout_s,
             gpu_timeout_s=self.config.gpu_timeout_s,
-            # The DeepEP M2N layout puts FFN ranks first, as afdEP-comm expects.
+            # FFN ranks are transport ranks [0, F) (FFN prefix), or the first
+            # ``ffn_ranks_per_domain`` of every NVLink domain (per-domain mode).
             ffn_ranks=self.ffn_size,
+            ffn_ranks_per_domain=self.transport.ffn_ranks_per_domain,
         )
 
     def close(self) -> None:
-        """Destroy DeepEP buffers; safe after partial init and on repeat calls."""
+        """Cancel the control receive and destroy DeepEP buffers; safe after
+        partial init and on repeat calls."""
+        self.control_plane.close()
         _CONNECTORS.pop(self._op_id, None)
         for lane in self.lanes:
             lane.destroy()
+        if (
+            self.transport_group is not None
+            and self.transport_group is not self.bootstrap_group
+        ):
+            dist.destroy_process_group(self.transport_group)
+        self.transport_group = None
         self.lanes = []
         self.lane_streams = []
         self._pending_combines.clear()
@@ -1172,8 +1224,9 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
 
     @property
     def domain(self) -> tuple[int, int]:
-        """DeepEP ``(scale-out ranks, scale-up ranks)``: nodes and GPUs per node
-        in hybrid mode, ``(1, world)`` when everything is in one NVLink domain."""
+        """DeepEP ``(scale-out ranks, scale-up ranks)``: NVLink domains and
+        ranks per domain in hybrid mode (2 x 4A1F: ``(2, 5)``), ``(1, world)``
+        when everything is in one NVLink domain."""
         self._check_initialized()
         return self.lanes[0].num_scaleout_ranks, self.lanes[0].num_scaleup_ranks
 
@@ -1577,6 +1630,21 @@ class DeepEPM2NAFDControlPlane(AFDControlPlane):
 
     def __init__(self, connector: DeepEPM2NAFDConnector) -> None:
         self.connector = connector
+        self._closed = False
+
+    def close(self) -> None:
+        """Cancel a pending receive by aborting the connector's control group."""
+        self._closed = True
+        group = self.connector.group
+        if group is not None:
+            # A graceful shutdown would wait for the idle unmatched receive.
+            # The group is the control plane's own, so the lanes keep theirs.
+            _abort_process_group(group)
+            self.connector.group = None
+
+    def _check_closed(self) -> None:
+        if self._closed:
+            raise AFDControlPlaneClosedError("DeepEPM2N control plane is closed")
 
     def update_state_from_dp_metadata(self, payload: AFDControlPayload) -> None:
         connector = self.connector
@@ -1616,15 +1684,29 @@ class DeepEPM2NAFDControlPlane(AFDControlPlane):
             payload,
             dst=list(range(connector.ffn_size)),
             group=connector.group,
-            device=connector.control_device,
+            device=connector.device,
         )
 
     def recv_dp_metadata_list(self) -> AFDControlPayload:
         connector = self.connector
-        if connector.group is None:
+        group = connector.group
+        self._check_closed()
+        if group is None:
             raise RuntimeError("DeepEPM2N control plane is not initialized")
-        return recv_control_payload(
-            src=connector.layout.world_rank("attention", CONTROL_SENDER_ATTN_RANK),
-            group=connector.group,
-            device=connector.control_device,
-        )
+        try:
+            return recv_control_payload(
+                src=connector.layout.world_rank("attention", CONTROL_SENDER_ATTN_RANK),
+                group=group,
+                device=connector.device,
+                check_closed=self._check_closed,
+            )
+        except AFDControlPlaneClosedError:
+            raise
+        except Exception as error:
+            # The abort fails the pending receive with an error that depends on
+            # where the receive was (NCCL, or torch's lookup of the group).
+            if self._closed:
+                raise AFDControlPlaneClosedError(
+                    "DeepEPM2N control plane is closed"
+                ) from error
+            raise

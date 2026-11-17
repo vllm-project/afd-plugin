@@ -765,4 +765,3 @@ docker exec z00952334-afd487 bash -lc '
 `run_arm.sh`（单臂矩阵）、`orchestrate.sh`（四段顺序执行）、`run_fan8_ab.sh`（fan-in 8
 A/B/A/B）、`summarize.py`（按 case 汇总）。原始 case JSON（去掉 rank 日志）与
 `summary.csv` 归档在 `build/results/issue487-supplement-2026-11-03/`。
-

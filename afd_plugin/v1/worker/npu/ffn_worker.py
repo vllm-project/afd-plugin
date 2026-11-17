@@ -16,6 +16,7 @@ from vllm.v1.worker.worker_base import CompilationTimes
 from vllm.v1.worker.workspace import init_workspace_manager
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.cpu_binding import bind_cpus
+from vllm_ascend.utils import register_ascend_fla_customop
 from vllm_ascend.worker.worker import NPUWorker
 
 from afd_plugin.compat.npu import (
@@ -27,7 +28,10 @@ from afd_plugin.compat.npu import (
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
-from afd_plugin.model_executor.models.model_utils import get_afd_model_config
+from afd_plugin.model_executor.models.model_utils import (
+    configure_afd_dspark,
+    get_afd_model_config,
+)
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
 from afd_plugin.validation import (
@@ -44,6 +48,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 FFN_SHUTDOWN_TIMEOUT_SECONDS = 5
+# Pull receivers must wait for all Attention ranks to stop publishing.
+ASYNC_FFN_DRAIN_TIMEOUT_SECONDS = 60
 
 
 def create_npu_ffn_model_runner(
@@ -93,6 +99,9 @@ class AFDNPUFFNWorker(NPUWorker):
         )
 
         self.device = self._init_device()
+        # Match native bd42eea: FLA capability queries use the selected device
+        # and registration completes before the model runner is constructed.
+        register_ascend_fla_customop()
         init_workspace_manager(
             self.device,
             npu_afd_num_ubatches(self.vllm_config),
@@ -101,6 +110,7 @@ class AFDNPUFFNWorker(NPUWorker):
             self.vllm_config.model_config,
             device_type="npu",
         )
+        configure_afd_dspark(self.vllm_config)
         self.model_runner = create_npu_ffn_model_runner(self.vllm_config, self.device)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -193,16 +203,17 @@ class AFDNPUFFNWorker(NPUWorker):
             return
 
         torch.npu.set_device(self.device)
-        while not event.is_set():
-            if isinstance(self.model_runner, AsyncNPUFFNModelRunner):
-                if not self.model_runner.execute_connector_driven_step():
-                    return
-                if (
-                    self.model_runner.effective_mode == "eager"
-                    and self.model_runner._two_stream is None
-                ):
+        if isinstance(self.model_runner, AsyncNPUFFNModelRunner):
+            # The runner consults the session once per step; a second
+            # predicate here would add Store round trips to the Pull hot path.
+            while self.model_runner.execute_connector_driven_step(event.is_set()):
+                if self.model_runner.effective_mode == "eager":
                     torch.npu.synchronize()
-                continue
+            self.model_runner.drain()
+            self.model_runner.session.finish_receiver()
+            return
+
+        while not event.is_set():
             control_plane = self.model_runner.connector.control_plane
             assert control_plane is not None
             payload = control_plane.recv_dp_metadata_list()
@@ -224,7 +235,7 @@ class AFDNPUFFNWorker(NPUWorker):
     def _requires_async_drain(self) -> bool:
         return isinstance(self.model_runner, AsyncNPUFFNModelRunner) and (
             self.model_runner.effective_mode == "full"
-            or self.model_runner._two_stream is not None
+            or self.model_runner.session.requires_drain
         )
 
     def raise_ffn_loop_error_if_any(self) -> None:
@@ -241,7 +252,13 @@ class AFDNPUFFNWorker(NPUWorker):
                 event.set()
             thread = self._ffn_thread
             if thread is not None:
-                thread.join(timeout=FFN_SHUTDOWN_TIMEOUT_SECONDS)
+                timeout = (
+                    ASYNC_FFN_DRAIN_TIMEOUT_SECONDS
+                    if isinstance(self.model_runner, AsyncNPUFFNModelRunner)
+                    and self.model_runner.session.requires_drain
+                    else FFN_SHUTDOWN_TIMEOUT_SECONDS
+                )
+                thread.join(timeout=timeout)
                 if thread.is_alive():
                     raise RuntimeError(
                         "Async graph receive is pending; retain resources"

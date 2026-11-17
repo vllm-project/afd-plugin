@@ -226,6 +226,10 @@ __aicore__ inline void GMMA8W4PostProcess::Swiglu(uint32_t loopIdx, VecConfig &v
         _inMMLocal[loopIdx * gmmSwigluQuantV2->tokenLen + gmmSwigluQuantV2->tokenLen / SWIGLU_REDUCE_FACTOR];
     LocalTensor<float> src1Local = _inMMLocal[loopIdx * gmmSwigluQuantV2->tokenLen];
 
+    // ### PATCH START: DSV4 clipped SwiGLU
+    ClampSwiGLUInputs(src1Local, src0Local, gmmSwigluQuantV2BaseParams->swigluLimit,
+                     gmmSwigluQuantV2->tokenLen / SWIGLU_REDUCE_FACTOR);
+    // ### PATCH END: DSV4 clipped SwiGLU
     SwiGLU<float, false>(workspaceLocal, src0Local, src1Local, beta, gmmSwigluQuantV2->tokenLen / SWIGLU_REDUCE_FACTOR);
     PipeBarrier<PIPE_V>();
     DataCopyParams repeatParams{

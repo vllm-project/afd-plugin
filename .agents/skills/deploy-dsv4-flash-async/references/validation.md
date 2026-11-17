@@ -3,8 +3,8 @@
 此 skill 的命令和配置已迁移到固定 0.30 源码契约，硬件资格按具体运行记录认定。
 AFD 原始模型、DBO 和 FFN FULL 的已有证据入口为
 [PR #462](https://github.com/vllm-project/afd-plugin/pull/462)、
-[原生 DBO](../../../../docs/npu/TESTING.md#native-dbo-contracts-and-device-execution) 和
-[FFN FULL](../../../../docs/npu/ASYNC_FFN_RUNTIME.md#validation)。
+[原生 DBO](../../../../tests/npu/README.md#native-dbo-contracts-and-device-execution) 和
+[FFN FULL](../../../../docs/design/npu/async_ffn_runtime.md#validation)。
 PR 中复用的旧运行、维护者确认和新运行各有范围，不能改写为本次 skill 的新硬件结果。
 
 ## 按任务选择覆盖
@@ -76,8 +76,8 @@ FFN FULL、其他拓扑或长请求。
 
 ## 扩展运行时验收
 
-当前 FULL 的公开真实模型 fixture 为 per-channel W4A8、4A/4F、A TP4/F TP1、
-receive capacity 128、DBO off；它不是内置 EP8、大 MBT 或跨机部署的资格证明。
+当前 FULL 的公开真实模型 fixture 使用 A TP4/F TP1、receive capacity 128、DBO off；
+默认 4A/4F，也可通过 `--ffn-ranks 8` 指定 4A/8F。它不是大 MBT 或跨机部署的资格证明。
 其观察器为功能证据增加同步，不用于吞吐测量。调用已有 fixture 前先读其参数与资源布局：
 
 ```bash
@@ -91,13 +91,14 @@ AFD 与原生 EP 可以在同资源预算、checkpoint、负载和服务要求�
 MBT、并发、缓存、预热及显存配置，限制结论的适用范围。
 
 隔离单项机制时保持其余条件可比：DBO off/on、普通 eager/layered eager、
-layered eager/FULL 分别成对。当前 layered W13 未应用 `swiglu_limit`，普通 eager 可能应用，
-因此普通 eager/FULL 的差异不能全部归因于 graph。
+layered eager/FULL 分别成对。普通 eager 对照须使用移除 legacy 路径之前的版本。
+当前 W4A8 layered W13 应用 `swiglu_limit`，W8A8 layered W13 不应用；
+普通 eager 可能应用，因此普通 eager/FULL 的差异不能全部归因于 graph。
 单 token prefill benchmark 可以衡量该 workload 的 prefill 收益，不能独立证明模型精度、
 PD 或完整业务收益。原始失败和负结果同样保留。
 
 MRV1 与旧 request/token splitter 已退役；Attention graph、PP/PCP/DCP、MTP、
-W8A8 FFN FULL、真实 per-group W4A8 checkpoint、A5 Async CAM 不作为本 skill 的已支持组合。
+真实 per-group W4A8 checkpoint、A5 Async CAM 不作为本 skill 的已支持组合。
 原生 D 的 MTP、DSpark 和 graph 是另一条路径，须单独核查，不能沿用 AFD Attention 的限制判断。
 同步 CAMP2P 保留在仓库原有 E2E；部分 DSV4 同步案例只检查 liveness，不是精度资格。
 运行时 profiling 和独立算子性能工具只在目标版本实际具备时使用，先检查相关 PR 是否已合入。

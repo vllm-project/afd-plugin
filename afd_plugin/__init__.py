@@ -112,6 +112,10 @@ _DEEPSEEK_MODEL_REGISTRATIONS = {
         if importlib.util.find_spec("torch_npu") is not None
         else "afd_plugin.model_executor.models.deepseek_v4:AFDDeepseekV4ForCausalLM"
     ),
+    "DSparkDraftModel": (
+        "afd_plugin.model_executor.models.npu.deepseek_v4_dspark:"
+        "AFDDSparkDeepseekV4ForCausalLM"
+    ),
     "GlmMoeDsaForCausalLM": (
         "afd_plugin.model_executor.models.deepseek_v2:AFDGlmMoeDsaForCausalLM"
     ),

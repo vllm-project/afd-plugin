@@ -163,12 +163,11 @@ gathering. Disable it after diagnosis to keep normal service logs concise.
 
 Native DBO owns request/token split boundaries. Enable DBO only on
 Attention, with exactly two ubatches and both token thresholds at least two.
-For DeepSeek-V2/V3, enable chunked prefill to handle requests crossing the
-child boundary. NPU MRV2 DBO requires eager execution; synchronous CAMP2P
+NPU MRV2 DBO requires eager execution; synchronous CAMP2P
 additionally requires Attention DP > 1, while Async CAM permits DP1.
 
 An `NPU DBO peer failed` or `Async CAM receive failed` error means the
 host-side handoff was aborted. Restart the A/F worker group; waking the peer
 does not recover a partially used device window. Use the
-[executor tests](TESTING.md#native-dbo-contracts-and-device-execution) to
+[executor tests](../../tests/npu/README.md#native-dbo-contracts-and-device-execution) to
 separate thread/stream failures from communication and model correctness.

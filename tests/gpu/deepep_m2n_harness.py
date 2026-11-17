@@ -21,6 +21,7 @@ import math
 import os
 import random
 import socket
+import threading
 import time
 import traceback
 from collections.abc import Callable, Mapping
@@ -41,6 +42,7 @@ from tests.unit.fakes.vllm_config import (
     M2NTopology,
     m2n_vllm_config,
 )
+from tests.unit.fakes.weights import quantize_fp8_block128
 
 INPUT_SEED_STRIDE = 1_000_003
 WEIGHT_SEED_OFFSET = 7_777
@@ -73,6 +75,7 @@ DEFAULT_EPHEMERAL_PORT_LOW = 32_768
 EPHEMERAL_PORT_RANGE = Path("/proc/sys/net/ipv4/ip_local_port_range")
 CLOSE_FAILED = "\nclose() failed:\n"
 NO_RESULT = "no result"
+KILLED_AFTER_RESULT = "killed at the deadline after writing its result"
 PEER_EXIT_CODE = 17
 ROW_KEY_SEED = 4_242
 ROW_KEY_MAX_COEFFICIENT = 1 << 31
@@ -96,9 +99,6 @@ class Case:
     second_stage: tuple[int, ...] | None = None
     # Route every top-k choice to FFN rank 0's experts (worst-case receive).
     hot_ffn_rank: bool = False
-    # FFN ranks plan the step as graph (True) or eager (False) regardless of
-    # the payload: one side replaying a graph while the other runs eagerly.
-    ffn_graph_mode: bool | None = None
 
     def stage_tokens(self) -> list[tuple[int, ...]]:
         if self.second_stage is None:
@@ -151,27 +151,6 @@ def hot_cases(attn_size: int, capacity: int) -> list[Case]:
         replace(case, name=f"hot_{case.name}", hot_ffn_rank=True)
         for case in standard_cases(attn_size, capacity)
     ]
-
-
-def mixed_mode_cases(attn_size: int) -> list[Case]:
-    """Attention and FFN plan the same step differently (graph vs eager)."""
-    cases: list[Case] = []
-    for attention_graph in (True, False):
-        tag = "attn_graph_ffn_eager" if attention_graph else "attn_eager_ffn_graph"
-        cases += [
-            Case(
-                f"{tag}_{name}",
-                tokens,
-                graph_mode=attention_graph,
-                ffn_graph_mode=not attention_graph,
-            )
-            for name, tokens in (
-                ("even64", (64,) * attn_size),
-                ("decode1", (1,) * attn_size),
-                ("mixed", tuple(17 + 5 * rank for rank in range(attn_size))),
-            )
-        ]
-    return cases
 
 
 def lane_cases(attn_size: int, capacity: int) -> list[Case]:
@@ -424,24 +403,17 @@ def control_step(
     tokens_by_stage: list[tuple[int, ...]],
     *,
     graph_mode: bool = False,
-    ffn_graph_mode: bool | None = None,
 ) -> None:
     """Deliver one step's control payload like the runtime does.
 
     ``tokens_by_stage[s]`` holds every Attention rank's token count for stage
     (lane) ``s``. ``graph_mode`` marks the step as graph capture/replay (no
-    host sync, fixed worst-case shapes). ``ffn_graph_mode`` makes FFN ranks
-    plan the step in the other mode than the payload says, as an FFN runner
-    does when it has no graph for a step Attention replays.
+    host sync, fixed worst-case shapes).
     """
     from afd_plugin.connectors import AFDControlPayload, AFDDPMetadata
 
     if connector.is_ffn:
         payload = connector.control_plane.recv_dp_metadata_list()
-        if ffn_graph_mode is not None:
-            payload = replace(
-                payload, is_graph_capturing=False, is_graph_replaying=ffn_graph_mode
-            )
     else:
         payload = AFDControlPayload(
             dp_metadata_list={
@@ -516,7 +488,8 @@ def run_ranks(
 
     ``rank_extra_config`` adds per-rank config keys on top of ``extra_config``
     (to make ranks disagree). Ranks still alive after ``timeout_s`` are killed
-    and reported as ``no result (hung=True)``.
+    and reported failed with ``hung=True`` in the error, even if they already
+    wrote a result: a rank that reports and then hangs in teardown still hung.
     """
     placement = placement or Placement()
     rank_extra_config = rank_extra_config or {}
@@ -545,21 +518,27 @@ def run_ranks(
     deadline = time.monotonic() + timeout_s
     for proc in procs:
         proc.join(timeout=max(1.0, deadline - time.monotonic()))
-    hung = [proc for proc in procs if proc.is_alive()]
-    for proc in hung:
-        proc.kill()
+    killed: set[int] = set()
+    for rank, proc in zip(local_ranks, procs, strict=True):
+        if proc.is_alive():
+            proc.kill()
+            killed.add(rank)
     results = []
     for rank in local_ranks:
         path = out_dir / f"rank{rank}.json"
+        hung = rank in killed
         if path.exists():
-            results.append(RankResult(**json.loads(path.read_text(encoding="utf-8"))))
+            result = RankResult(**json.loads(path.read_text(encoding="utf-8")))
+            if hung:
+                # The rank reported, then hung (e.g. in teardown) until killed.
+                result.ok = False
+                result.error += f"\n{KILLED_AFTER_RESULT} (hung=True)"
         else:
             role, _ = topology.role(rank)
-            results.append(
-                RankResult(
-                    rank, role, ok=False, error=f"{NO_RESULT} (hung={bool(hung)})"
-                )
+            result = RankResult(
+                rank, role, ok=False, error=f"{NO_RESULT} (hung={hung})"
             )
+        results.append(result)
     return results
 
 
@@ -576,7 +555,6 @@ def local_weights(experts: range, payload_format: str) -> tuple[Any, Any, Any]:
     """
     from afd_plugin.connectors.gpu.deepep_m2n.fp8_quant import (
         dequantize_fp8_block128,
-        quantize_fp8_block128,
     )
     from afd_plugin.connectors.metadata import LocalExpertWeights
 
@@ -848,12 +826,7 @@ def correctness_scenario(
     for case in [Case(**case) for case in args["cases"]]:
         stages = case.stage_tokens()
         limit = routing_limit(case, connector.layout)
-        control_step(
-            connector,
-            stages,
-            graph_mode=case.graph_mode,
-            ffn_graph_mode=case.ffn_graph_mode,
-        )
+        control_step(connector, stages, graph_mode=case.graph_mode)
         for layer in range(case.num_layers):
             step += 1
             if connector.is_ffn:
@@ -1381,6 +1354,51 @@ def peer_exit_scenario(
         run_attention_step(connector, [(x, ids, w)], [torch.empty_like(x)])
     torch.cuda.synchronize()
     return {"completed_without_peer_s": time.monotonic() - start}
+
+
+def close_cancels_receive_scenario(
+    connector: Any, topology: M2NTopology, args: dict[str, Any]
+) -> dict[str, Any]:
+    """FFN ranks close the control plane while another thread waits for the
+    next step's payload, as the FFN worker's shutdown does; every rank then
+    meets on the bootstrap group the DeepEP lanes hold.
+
+    One step first brings the control group up, so the receive waits on an
+    idle group, as a serving FFN worker's does. FFN ranks return how the
+    receive ended, whether its thread outlived ``join_s``, and how long after
+    ``close()`` it stopped.
+    """
+    from afd_plugin.connectors.base import AFDControlPlaneClosedError
+
+    control_step(connector, [(args["tokens"],) * topology.attn_size])
+    metrics: dict[str, Any] = {}
+    if connector.is_ffn:
+        outcome = {"receive": "blocked"}
+
+        def receive() -> None:
+            torch.cuda.set_device(connector.device)
+            try:
+                connector.control_plane.recv_dp_metadata_list()
+                outcome["receive"] = "payload"
+            except AFDControlPlaneClosedError:
+                outcome["receive"] = "cancelled"
+            except Exception as error:
+                outcome["receive"] = repr(error)
+
+        thread = threading.Thread(target=receive, daemon=True)
+        thread.start()
+        time.sleep(args["block_s"])
+        start = time.monotonic()
+        connector.control_plane.close()
+        thread.join(args["join_s"])
+        metrics = {
+            **outcome,
+            "alive": thread.is_alive(),
+            "stopped_s": time.monotonic() - start,
+        }
+    # Fails on an FFN rank whose close() aborted the lanes' bootstrap group.
+    dist.barrier(group=connector.bootstrap_group)
+    return metrics
 
 
 def _timed(fn: Any, iters: int) -> float:

@@ -1,61 +1,18 @@
+#!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+#
+# Qwen3-235B-A22B-FP8 on DeepEPM2NAFDConnector, 4A2F FULL_DECODE_ONLY CUDA
+# graphs: FFN DP2 x TP1 and Attention DP4 x TP1.
+# Settings and running in a pod: recipe/gpu/common/README.md
+# shellcheck disable=SC1090,SC2034  # the sourced launcher reads these variables
 
-# 4A2F graph, FP8 payload: Attention DP4 x TP1 on GPUs 0-3; FFN DP2 on GPUs 4,5.
-
+AFD_CONNECTOR=${AFD_CONNECTOR:-DeepEPM2NAFDConnector}
+LAYOUT=${LAYOUT:-4A2F}
 MODEL_PATH=${MODEL_PATH:-/path/model_weights/Qwen3-235B-A22B-FP8}
-export VLLM_USE_V2_MODEL_RUNNER=1
+CONNECTOR_CONFIG='"payload_format": "fp8_block128_fp32"'   # FP8 payload
+MODE=graph CUDAGRAPH_CAPTURE_SIZES=${CUDAGRAPH_CAPTURE_SIZES:-8,12,16,24,32,48,64,96,128,192,256}   # ascending
+SERVE_ARGS=(--enable-ep-weight-filter --max-num-seqs 256 --max-num-batched-tokens 3072 --max-model-len 4096)
 
-CUDA_VISIBLE_DEVICES=4,5 vllm serve "$MODEL_PATH" \
-    --data-parallel-size 2 \
-    --tensor-parallel-size 1 \
-    --enable-expert-parallel \
-    --additional-config '{
-        "afd": {
-            "role": "ffn",
-            "connector": "DeepEPM2NAFDConnector",
-            "host": "127.0.0.1",
-            "port": 6239,
-            "num_attention_ranks": 4,
-            "num_ffn_ranks": 2,
-            "compute_gate_on_attention": true,
-            "afd_process_group_timeout_s": 3600,
-            "connector_extra_config": {"payload_format": "fp8_block128_fp32"}
-        }
-    }' \
-    --max-num-seqs 256 \
-    --max-num-batched-tokens 3072 \
-    --max-model-len 4096 \
-    --max-cudagraph-capture-size 256 \
-    --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [8, 16, 32, 64, 96, 128, 192, 256]}' \
-    --cpu-distributed-timeout-seconds 3600 \
-    --host 127.0.0.1 \
-    --port 18001 > ffn.log 2>&1 &
-
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve "$MODEL_PATH" \
-    --data-parallel-size 4 \
-    --tensor-parallel-size 1 \
-    --enable-expert-parallel \
-    --additional-config '{
-        "afd": {
-            "role": "attention",
-            "connector": "DeepEPM2NAFDConnector",
-            "host": "127.0.0.1",
-            "port": 6239,
-            "num_attention_ranks": 4,
-            "num_ffn_ranks": 2,
-            "compute_gate_on_attention": true,
-            "afd_process_group_timeout_s": 3600,
-            "connector_extra_config": {"payload_format": "fp8_block128_fp32"}
-        }
-    }' \
-    --max-num-seqs 256 \
-    --max-num-batched-tokens 3072 \
-    --max-model-len 4096 \
-    --max-cudagraph-capture-size 256 \
-    --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [8, 16, 32, 64, 96, 128, 192, 256]}' \
-    --cpu-distributed-timeout-seconds 3600 \
-    --host 127.0.0.1 \
-    --port 18000 > attn.log 2>&1 &
-
-wait
+source "${AFD_RECIPE_LIB:-$(dirname "${BASH_SOURCE[0]}")/../../../common/afd_colocation.sh}"
+afd_colocation_serve "$@"
