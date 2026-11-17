@@ -297,6 +297,7 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
                         dist.PrefixStore(f"stage/{stage}", store),
                         self.attn_size // self.attn_tp,
                         self.ffn_size,
+                        ops.split_sequence,
                         read_published=(
                             _PublishedWords(buffer, self.attn_size, self.attn_tp)
                             if dual_stage and not attention
@@ -333,9 +334,7 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
             )
         dp = self.role_rank // self.attn_tp
         members = self.dp_members(dp)
-        # The pinned four-commit protocol does not wrap generations.
-        # SplitBuffer.configuration validates the limit before submitting work.
-        sequence = lane.sequence + 1
+        sequence = self.ops.split_sequence(lane.sequence + 1)
         ticket = self.ops.megamoe_dispatch_send(
             hidden_states.contiguous(),
             kwargs["topk_ids"].int().contiguous(),

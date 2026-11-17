@@ -14,6 +14,7 @@
  */
 
 #include "megamoe_host_compat.h"
+#include "megamoe_sequence_limit.h"
 #include <vector>
 #include <cstring>
 #include <cmath>
@@ -542,8 +543,8 @@ static ge::graphStatus Tile(gert::TilingContext *context)
         config[5] < 512 || config[5] > 8192 || config[5] % 256 || config[6] < 1 || config[6] > 32 ||
         config[6] > config[2] || (config[7] != 3 && config[7] != 4) ||
         (config[8] != 0 && config[8] != 3 && config[8] != 4) || (config[9] != 0 && config[9] != 1) ||
-        config[11] < 1 || config[11] >= INT32_MAX || config[12] < 0 || config[12] > 4 ||
-        config[13] < 0 || config[13] > config[3] || config[14] < 1 || config[14] >= INT32_MAX ||
+        config[11] < 1 || config[11] > CamMegamoe::SPLIT_SEQUENCE_MAX || config[12] < 0 || config[12] > 4 ||
+        config[13] < 0 || config[13] > config[3] || config[14] < 1 || config[14] > CamMegamoe::SPLIT_SEQUENCE_MAX ||
         config[15] < 0 || config[15] > 3 || config[16] < 0 || config[16] > 1) {
         OP_LOGE(nodeName, "Invalid split configuration; see docs/megamoe_split/README.md");
         return ge::GRAPH_FAILED;

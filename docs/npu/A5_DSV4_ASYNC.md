@@ -58,11 +58,14 @@ accuracy, long-run communication and performance checks have not been performed.
   AIV communication-engine selection, A5 registration and Python bindings.
   Rebuild both OPP and extension, then follow [A5 verification](A5_ASYNC_CAM_VALIDATION.md).
   This source adaptation has not yet been compiled or executed on A5.
-- MegaMoE needs the Ascend950 OPP and `umdk_cam_megamoe` wheel from UMDK
-  [`793d2f02`](https://gitcode.com/lqy16/umdk/commit/793d2f02c2564eda1e0f8971040f8626d89295d0),
-  including the ring-sequence changes. This is separate from the ordinary CAM
-  bundle. Its three Python entry points are `megamoe_dispatch_send`,
-  `megamoe_fused_moe`, and `megamoe_combine_recv`.
+- MegaMoE is bundled in AFD: build the extension and private Ascend950 OPP
+  together with `AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=950 pip install --no-build-isolation .`.
+  No external `umdk_cam_megamoe` wheel is required. Import the three wrappers
+  from `afd_plugin.compat.npu.megamoe`; they use `afd_plugin._C_megamoe`,
+  `torch.ops.afd_ascend.npu_megamoe_*`, and AFD's private `libcust_opapi.so`.
+  The loader configures `AFD_CUST_OPAPI_LIB_PATH` automatically.
+  Rebuild both the extension and OPP after protocol changes; mixing old kernels
+  with the ring-sequence Python wrappers is unsupported.
 - MegaMoE's one-time FP4 storage conversion preserves packed nibbles; its
   format-cast and CANN interpretation still need device verification. Local CPU
   checks establish byte reordering and queue behavior, not numerical support.

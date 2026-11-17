@@ -96,6 +96,8 @@ protected:
             ResetSyncStatus<TopkWeightsPrefetch>(aivJob_, params_, DISPATCH_RESET_BATCH, zeros);
             if (GetSubBlockIdx() == 1U) {
                 auto *progress = reinterpret_cast<__gm__ int32_t *>(params_.peermemInfo.rankSyncInWorldPtr + 48U * 1024U);
+                // Invalidate this core's done tag before the existing launch barrier.
+                WriteGmByPassDCache(progress + blockIdx_ * 16U, 0);
                 WriteGmByPassDCache(progress + blockIdx_ * 16U + 1U, 0);
             }
             PipeBarrier<PIPE_ALL>();
@@ -526,7 +528,15 @@ __aicore__ inline void MegamoeFusedMoe<TemplateMegamoeFusedMoeTypeFunc>::Process
         SyncAll<true>();
         if (aivCoreIdx_ == 0U) {
             for (uint32_t member = 0; member < params_.tilingData->splitDpSize; ++member) {
+                // All input readers have drained. Reaffirm TAKEN because the
+                // nonblocking early fan-in may miss its last writer.
+                SplitPublish(params_, g_winRankAddr_, params_.tilingData->splitDpRanks[member], SPLIT_TAKEN);
                 SplitPublish(params_, g_winRankAddr_, params_.tilingData->splitDpRanks[member], SPLIT_READY);
+            }
+            // Empty routes skip the payload path's output-slot wait. Bound
+            // their READY/CONSUMED skew after publishing READY to all sources.
+            for (uint32_t member = 0; member < params_.tilingData->splitDpSize; ++member) {
+                SplitWaitOutputSlot(params_, params_.tilingData->splitDpRanks[member]);
             }
         }
     }

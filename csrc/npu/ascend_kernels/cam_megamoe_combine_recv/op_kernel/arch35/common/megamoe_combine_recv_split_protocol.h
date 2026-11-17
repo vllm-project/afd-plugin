@@ -9,11 +9,12 @@
  */
 
 #pragma once
+#include "megamoe_sequence_ring.h"
 
 namespace MegamoeCombineRecvImpl {
 
 // Split protocol, MTE only. Each control word has exactly one remote writer.
-// Counts retain the original in-band epoch; a full sequence gates DP admission.
+// Counts retain the original in-band epoch; the ring sequence gates DP admission.
 constexpr uint32_t SPLIT_PUBLISHED = 0U;
 constexpr uint32_t SPLIT_TAKEN = 1U;
 constexpr uint32_t SPLIT_READY = 2U;
@@ -22,9 +23,9 @@ __aicore__ inline __gm__ int32_t *SplitWord(GM_ADDR window, uint32_t peer, uint3
 {
     return reinterpret_cast<__gm__ int32_t *>(window + static_cast<uint64_t>(peer) * 64U + field * 4U);
 }
-__aicore__ inline void SplitWait(__gm__ int32_t *word, uint32_t sequence)
+__aicore__ inline void SplitWait(__gm__ int32_t *word, uint32_t sequence, bool previous = false)
 {
-    while (static_cast<uint32_t>(ReadGmByPassDCache(word)) < sequence) {
+    while (!CamMegamoe::SplitSequenceReached(static_cast<uint32_t>(ReadGmByPassDCache(word)), sequence, previous)) {
         int64_t start = GetSystemCycle();
         while (GetSystemCycle() - start < GM_FLAG_POLL_BACKOFF_CYCLES) {}
     }
@@ -59,7 +60,7 @@ __aicore__ inline void SplitDispatchTaken(const Params &params, GM_ADDR *windows
 __aicore__ inline void SplitWaitOutputSlot(const Params &params, uint32_t source)
 {
     SplitWait(SplitWord(params.peermemInfo.rankSyncInWorldPtr, source, SPLIT_CONSUMED),
-              params.tilingData->splitSequence - 1U);
+              params.tilingData->splitSequence, true);
 }
 
 

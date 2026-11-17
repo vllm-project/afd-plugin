@@ -216,7 +216,7 @@ __aicore__ inline void MegamoeDispatchSend<TemplateMegamoeDispatchSendTypeFunc>:
     if constexpr (g_coreType == AIV) {
         const auto *td = params_.tilingData;
         for (uint32_t owner = td->splitAttentionRanks; owner < worldSize_; ++owner) {
-            SplitWait(SplitWord(params_.peermemInfo.rankSyncInWorldPtr, owner, SPLIT_TAKEN), td->splitSequence - 1U);
+            SplitWait(SplitWord(params_.peermemInfo.rankSyncInWorldPtr, owner, SPLIT_TAKEN), td->splitSequence, true);
         }
         params_.workspaceInfo.sharedExpertInputDataPtr = snapshotData;
         params_.workspaceInfo.sharedExpertInputScalePtr = snapshotScale;

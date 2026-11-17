@@ -14,7 +14,6 @@ if TYPE_CHECKING:
 
 POLL_SECONDS = 0.001
 PUBLISH_TIMEOUT_SECONDS = 120
-SPLIT_SEQUENCE_LIMIT = 2**31 - 1
 
 
 class ExpertWorkQueue:
@@ -25,23 +24,20 @@ class ExpertWorkQueue:
         store: Store,
         sources: int,
         experts: int,
+        wrap: Callable[[int], int],
         *,
         read_published: Callable[[], Sequence[Sequence[int]]] | None = None,
     ):
         self.store = store
         self.sources = sources
         self.experts = experts
+        self.wrap = wrap
         self.last = [0] * sources
         self.cursor = 0
         self.read_published = read_published
 
     def next_sequence(self, source: int) -> int:
-        sequence = self.last[source] + 1
-        if sequence >= SPLIT_SEQUENCE_LIMIT:
-            raise RuntimeError(
-                "MegaMoE sequence exhausted; drain and recreate the buffers"
-            )
-        return sequence
+        return self.wrap(self.last[source] + 1)
 
     def publish(self, source: int, layer: int, sequence: int) -> None:
         if sequence != self.next_sequence(source):

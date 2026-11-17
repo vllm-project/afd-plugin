@@ -20,17 +20,31 @@ def queue(published=None):
     store.check = lambda names: all(key in keys for key in names)
     store.delete_key = keys.__delitem__
     return work.ExpertWorkQueue(
-        store, len(published) if published is not None else 1, 1,
-        read_published=Mock(return_value=published) if published is not None else None,
+        store,
+        len(published) if published is not None else 1,
+        1,
+        lambda iteration: (iteration - 1) % 32 + 1,
+        read_published=(lambda: published) if published is not None else None,
     )
 
 
+def advance(reader, source, count):
+    for iteration in range(1, count + 1):
+        sequence = (iteration - 1) % 32 + 1
+        reader.store.set(f"work/{source}/0", f"42 {sequence}")
+        assert reader.poll(0) == (source, 42, sequence)
+
+
 class TestMegaMoEAdmission(unittest.TestCase):
-    def test_sequence_exhaustion_cannot_publish_wrapped_generation(self):
+    def test_publication_wraps_and_rejects_skipped_generation(self):
         writer = queue()
-        writer.last[0] = work.SPLIT_SEQUENCE_LIMIT - 1
-        with self.assertRaisesRegex(RuntimeError, "sequence exhausted"):
-            writer.publish(0, 42, 1)
+        for iteration in range(1, 98):
+            sequence = (iteration - 1) % 32 + 1
+            writer.publish(0, 42, sequence)
+            self.assertEqual(writer.store.get("work/0/0"), f"42 {sequence}")
+            writer.store.delete_key("work/0/0")
+        with self.assertRaisesRegex(RuntimeError, "Out-of-order"):
+            writer.publish(0, 42, 3)
         self.assertFalse(writer.store.check(["work/0/0"]))
 
     def test_single_window_claims_without_device_snapshot(self):
@@ -39,30 +53,31 @@ class TestMegaMoEAdmission(unittest.TestCase):
         self.assertEqual(reader.poll(0), (0, 42, 1))
         self.assertIsNone(reader.poll(0))
 
-    def test_two_lanes_at_batch_boundary(self):
-        lane0 = queue([[0], [0], [26]])
-        lane1 = queue([[0], [0], [4]])
-        lane0.last[2], lane1.last[2] = 26, 3
-        lane0.store.set("work/2/0", "0 27")
-        lane1.store.set("work/2/0", "42 4")
-        self.assertIsNone(lane0.poll(0))
-        self.assertEqual(lane0.last[2], 26)
-        self.assertEqual(lane1.poll(0), (2, 42, 4))
-        lane0.read_published.return_value[2][0] = 27
-        self.assertEqual(lane0.poll(0), (2, 0, 27))
-
-    def test_scan_past_unready_tp_group_without_wrapping(self):
-        reader = queue([[33, 32], [1, 1]])
-        reader.last = [32, 0]
-        reader.store.set("work/0/0", "0 33")
+    def test_scan_past_unready_tp_group_at_wrap(self):
+        published = [[0, 0], [1, 1]]
+        reader = queue(published)
+        for sequence in range(1, 33):
+            published[0][:] = [sequence, sequence]
+            reader.store.set("work/0/0", f"42 {sequence}")
+            self.assertEqual(reader.poll(0), (0, 42, sequence))
+        published[0][:] = [1, 32]
+        reader.store.set("work/0/0", "0 1")
         reader.store.set("work/1/0", "7 1")
         self.assertEqual(reader.poll(0), (1, 7, 1))
-        reader.read_published.assert_called_once_with()
-        reader.read_published.return_value[0][1] = 33
-        self.assertEqual(reader.poll(0), (0, 0, 33))
-        reader.read_published.reset_mock()
         self.assertIsNone(reader.poll(0))
-        reader.read_published.assert_not_called()
+        self.assertTrue(reader.store.check(["work/0/0"]))
+        published[0][1] = 1
+        self.assertEqual(reader.poll(0), (0, 0, 1))
+        self.assertIsNone(reader.poll(0))
+
+    def test_independent_lane_generations(self):
+        lane0, lane1 = queue(), queue()
+        advance(lane0, 0, 32)
+        advance(lane1, 0, 3)
+        lane0.store.set("work/0/0", "0 1")
+        lane1.store.set("work/0/0", "42 4")
+        self.assertEqual(lane1.poll(0), (0, 42, 4))
+        self.assertEqual(lane0.poll(0), (0, 0, 1))
 
 
 if __name__ == "__main__":
