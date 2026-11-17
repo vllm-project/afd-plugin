@@ -24,7 +24,11 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 import torch_npu
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
+from afd_plugin.compat.npu.feature_validation import (
+    fail_if_unsupported_npu_afd_features,
+)
 from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
@@ -32,6 +36,7 @@ from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
 from afd_plugin.model_executor.ffn.npu.expert_weights import QuantizedExpertWeights
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 from afd_plugin.v1.worker.npu.ffn_worker import AFDNPUFFNWorker
+from afd_plugin.validation import validate_npu_model_runner_v2_config
 
 HIDDEN = 256
 EXPERTS = 4
@@ -200,15 +205,11 @@ def main():
     faulthandler.dump_traceback_later(60)
     os.environ["BATCH_SIZE_FACTOR"] = str(args.receive_capacity / 262144)
     os.environ["HCCL_BUFFSIZE"] = "64"
-    ensure_cam_async_ops_available()
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = args.attn_ranks + 2
     assert int(os.environ["WORLD_SIZE"]) == world_size
     is_ffn = rank >= args.attn_ranks
-    torch.npu.set_device(local_rank)
-    torch.npu.config.allow_internal_format = True
-    device = torch.device("npu", local_rank)
     dist.init_process_group("gloo", timeout=timedelta(seconds=120))
     # torchrun's agent owns only the default rendezvous endpoint. The actual
     # connector creates a distinct Store, as in separate vLLM A/F workers.
@@ -272,6 +273,16 @@ def main():
         ),
         use_v2_model_runner=True,
     )
+    validate_npu_model_runner_v2_config(
+        config, expected_role="ffn" if is_ffn else "attention", device_type="npu"
+    )
+    fail_if_unsupported_npu_afd_features(config)
+    torch.npu.set_device(local_rank)
+    torch.npu.config.allow_internal_format = True
+    device = torch.device("npu", local_rank)
+    if is_ffn and get_ascend_device_type() != AscendDeviceType.A3:
+        raise ValueError("layered GMM requires Ascend 910C/A3")
+    ensure_cam_async_ops_available()
     connector = CAMAsyncAFDConnector(
         rank,
         local_rank,

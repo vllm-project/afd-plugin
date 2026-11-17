@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 
 def has_afd_model_registration(model_config: ModelConfig) -> bool:
-    """Return whether the model resolves to a registered AFD implementation."""
+    """Return whether the architecture has an AFD registration mapping."""
 
     return any(
         model_arch.removeprefix("AFD") in _MODEL_REGISTRATIONS

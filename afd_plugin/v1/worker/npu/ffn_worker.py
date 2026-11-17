@@ -16,7 +16,11 @@ from vllm.v1.worker.worker_base import CompilationTimes
 from vllm.v1.worker.workspace import init_workspace_manager
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.cpu_binding import bind_cpus
-from vllm_ascend.utils import register_ascend_fla_customop
+from vllm_ascend.utils import (
+    AscendDeviceType,
+    get_ascend_device_type,
+    register_ascend_fla_customop,
+)
 from vllm_ascend.worker.worker import NPUWorker
 
 from afd_plugin.compat.npu import (
@@ -25,6 +29,7 @@ from afd_plugin.compat.npu import (
     fix_all2all_backend_for_afd,
     npu_afd_num_ubatches,
 )
+from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
@@ -55,10 +60,7 @@ ASYNC_FFN_DRAIN_TIMEOUT_SECONDS = 60
 def create_npu_ffn_model_runner(
     vllm_config: VllmConfig, device: torch.device
 ) -> AFDNPUFFNModelRunner | AsyncNPUFFNModelRunner:
-    """Select the execution owner from the connector, with no MRV1 fallback."""
-    validate_npu_model_runner_v2_config(
-        vllm_config, expected_role="ffn", device_type=device.type
-    )
+    """Select the FFN owner after Worker deployment admission."""
     afd_config = parse_afd_config(vllm_config, expected_role="ffn")
     if afd_config.connector == AFD_ASYNC_CONNECTOR:
         connector = AFDConnectorFactory.create_connector(
@@ -84,13 +86,12 @@ class AFDNPUFFNWorker(NPUWorker):
         self._cpu_binding_attempted = False
 
     def init_device(self) -> None:
-        assert_compatible_afd_stack(
+        afd_config = assert_compatible_afd_stack(
             self.vllm_config,
             caller="AFDNPUFFNWorker.init_device",
             expected_role="ffn",
             expected_worker_qualname_override=NPU_FFN_WORKER_FQCN,
         )
-        fail_if_unsupported_npu_afd_features(self.vllm_config)
         fix_all2all_backend_for_afd(self.vllm_config)
         validate_npu_model_runner_v2_config(
             self.vllm_config,
@@ -98,19 +99,24 @@ class AFDNPUFFNWorker(NPUWorker):
             device_type="npu",
         )
 
-        self.device = self._init_device()
-        # Match native bd42eea: FLA capability queries use the selected device
-        # and registration completes before the model runner is constructed.
-        register_ascend_fla_customop()
-        init_workspace_manager(
-            self.device,
-            npu_afd_num_ubatches(self.vllm_config),
-        )
-        self.vllm_config.model_config = get_afd_model_config(
+        fail_if_unsupported_npu_afd_features(self.vllm_config, afd_config=afd_config)
+        self.model_config = self.vllm_config.model_config = get_afd_model_config(
             self.vllm_config.model_config,
             device_type="npu",
         )
         configure_afd_dspark(self.vllm_config)
+
+        self.device = self._init_device()
+        # FLA registration needs the selected device, before Runner construction.
+        register_ascend_fla_customop()
+        if afd_config.connector == AFD_ASYNC_CONNECTOR:
+            if get_ascend_device_type() != AscendDeviceType.A3:
+                raise ValueError("layered GMM requires Ascend 910C/A3")
+            ensure_cam_async_ops_available()
+        init_workspace_manager(
+            self.device,
+            npu_afd_num_ubatches(self.vllm_config),
+        )
         self.model_runner = create_npu_ffn_model_runner(self.vllm_config, self.device)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -151,6 +157,9 @@ class AFDNPUFFNWorker(NPUWorker):
         def ffn_worker_loop() -> None:
             try:
                 self._run_ffn_server_loop()
+                if self._requires_async_drain():
+                    assert isinstance(self.model_runner, AsyncNPUFFNModelRunner)
+                    self.model_runner.mark_receiver_exited()
             except Exception as exc:
                 shutdown_event = self._ffn_shutdown_event
                 if (
@@ -165,10 +174,6 @@ class AFDNPUFFNWorker(NPUWorker):
                     return
                 self._ffn_loop_error = exc
                 logger.exception("AFD NPU FFN worker loop failed")
-            else:
-                if self._requires_async_drain():
-                    assert isinstance(self.model_runner, AsyncNPUFFNModelRunner)
-                    self.model_runner._graph_receiver_exited = True
 
         self._ffn_thread = threading.Thread(
             target=ffn_worker_loop,

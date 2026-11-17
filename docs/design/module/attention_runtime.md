@@ -138,8 +138,11 @@ coordination state. It closes the connector and profiler during shutdown.
 CUDA overrides the native `Worker._make_model_runner()` factory to construct
 `AFDAttentionModelRunnerV2` and requires the upstream `use_v2_model_runner`
 setting; there is no GPU V1 fallback. NPU applies the
-AFD-scoped vLLM-Ascend patches, fixes the all-to-all backend when required, initializes
-the vLLM workspace manager, and directly constructs the NPU V2 runner. Their exact inheritance and device mechanisms are specified in
+AFD-scoped vLLM-Ascend patches. Its Worker normalizes DBO/backend, admits
+common and additional feature constraints, and selects target/draft model
+configuration before device allocation. It checks device capabilities before
+workspace and Runner construction. The Runner consumes that admission instead
+of repeating it. Exact inheritance and device mechanisms are specified in
 [execution platforms](execution_platforms.md).
 
 ## ModelRunnerV2 boundary

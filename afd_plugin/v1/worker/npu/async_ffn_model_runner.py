@@ -6,14 +6,11 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import torch
 from vllm.logger import init_logger
-from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
-from afd_plugin.compat.npu import fail_if_unsupported_npu_afd_features
-from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.compat.npu.profiler import (
     create_afd_npu_profiler,
     step_afd_npu_profiler,
@@ -40,11 +37,7 @@ from afd_plugin.model_executor.ffn.npu.expert_weights import (
     QuantizedExpertWeights,
     expert_weight_signature,
 )
-from afd_plugin.validation import (
-    cam_receive_capacity,
-    requested_ffn_mode,
-    validate_npu_model_runner_v2_config,
-)
+from afd_plugin.validation import cam_receive_capacity
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -63,6 +56,8 @@ class FFNModel(Protocol):
 
 
 class AsyncNPUFFNModelRunner:
+    """Run Async FFN after Worker or standalone harness deployment admission."""
+
     afd_expected_role = "ffn"
 
     def __init__(
@@ -71,13 +66,9 @@ class AsyncNPUFFNModelRunner:
         device: torch.device,
         connector: CAMAsyncAFDConnector,
     ) -> None:
-        validate_npu_model_runner_v2_config(
-            vllm_config, expected_role="ffn", device_type=device.type
-        )
         self.vllm_config, self.device, self.connector = vllm_config, device, connector
         self.model_config = vllm_config.model_config
         self.afd_config = parse_afd_config(vllm_config, expected_role="ffn")
-        fail_if_unsupported_npu_afd_features(vllm_config, afd_config=self.afd_config)
         self.model: FFNModel | None = None
         self.draft_model: FFNModel | None = None
         self.model_memory_usage = 0
@@ -86,7 +77,9 @@ class AsyncNPUFFNModelRunner:
         self._mega_executor: AsyncCAMMegaExecutor | None = None
         self.session = self.connector.ffn_session()
         self._first_step = True
-        self.requested_mode = requested_ffn_mode(vllm_config)
+        self.requested_mode: Literal["eager", "full"] = (
+            "eager" if self.model_config.enforce_eager else "full"
+        )
         self.effective_mode = "eager"
         self._graph: torch.npu.NPUGraph | None = None
         self._graph_capture_count = self._graph_replay_count = 0
@@ -108,8 +101,11 @@ class AsyncNPUFFNModelRunner:
 
     def mark_receiver_exited(self) -> None:
         """Allow release only after the owner joined a successful receive loop."""
+        self._check_graph_live()
         if self._graph_pending:
-            raise RuntimeError("Async FFN has pending work; retain resources")
+            raise RuntimeError(
+                "Async FFN has pending work; retain resources until device completion"
+            )
         self._graph_receiver_exited = True
 
     def load_model(self) -> None:
@@ -261,28 +257,9 @@ class AsyncNPUFFNModelRunner:
             with torch.npu.graph(
                 self._graph, pool=self._graph_pool, stream=self._graph_stream
             ):
-                if self._mega_executor is not None:
-                    self._graph_payload = None
-                    self._graph_output = self._mega_executor()
-                else:
-                    assert self._layered_executor is not None
-                    self._graph_payload = self.connector.recv_attn_output()
-                    state = cast(
-                        AFDAsyncTransferState, self._graph_payload.context.states
-                    )
-                    assert state.token_nums_rankid_layeridx is not None
-                    assert state.group_list is not None
-                    assert state.dynamic_scales is not None
-                    self._graph_output = self._layered_executor(
-                        self._graph_payload.hidden_states,
-                        state.dynamic_scales,
-                        state.group_list,
-                        state.token_nums_rankid_layeridx,
-                        retained_tensors=self._graph_tensors,
-                    )
-                    self.connector.send_ffn_output(
-                        self._graph_output, self._graph_payload.context
-                    )
+                self._graph_output = self._run_ffn_transaction(
+                    retained_tensors=self._graph_tensors
+                )
             self._graph_capture_count = 1
         except Exception as exc:
             self._graph_failure = exc
@@ -328,7 +305,7 @@ class AsyncNPUFFNModelRunner:
         if self._graph_closed:
             return
         self._check_graph_live()
-        if self._graph_pending or not self._graph_receiver_exited:
+        if not self._graph_receiver_exited:
             raise RuntimeError(
                 "Async graph resources require receiver exit and device completion"
             )
@@ -350,15 +327,11 @@ class AsyncNPUFFNModelRunner:
             if not draft_layers:
                 raise ValueError(f"layered GMM draft weights are unsupported: {reason}")
             layers = [*layers, *draft_layers]
-        if get_ascend_device_type() != AscendDeviceType.A3:
-            raise ValueError("layered GMM requires Ascend 910C/A3")
-        if self.connector.dynamic_quant != 1:
-            raise ValueError("layered GMM requires dynamicQuant=1")
         if tuple(sorted(layer.layer_idx for layer in layers)) != self.layer_ids:
             raise ValueError(
                 "layered GMM weights do not cover the remote MoE layer IDs"
             )
-        ensure_cam_async_ops_available()
+        capacity = cam_receive_capacity()
         if self.connector.extra_info.ffn_mega_moe:
             self._mega_executor = AsyncCAMMegaExecutor(
                 layers,
@@ -366,11 +339,9 @@ class AsyncNPUFFNModelRunner:
                 max_num_batched_tokens=self.connector.max_num_batched_tokens,
                 topk=self.connector.topk,
                 tp_size=self.connector.tp_size,
-                capacity=cam_receive_capacity(),
+                capacity=capacity,
             )
-            return "native_mc2:" + expert_weight_signature(
-                layers, cam_receive_capacity()
-            )
+            return "native_mc2:" + expert_weight_signature(layers, capacity)
         self._layered_executor = AsyncCAMLayeredExecutor(layers)
         logger.info(
             "Async CAM layered GMM quant=%s layers=%d mode=%s layer_mapping=%s "
@@ -382,7 +353,7 @@ class AsyncNPUFFNModelRunner:
             layers[0].swiglu_limit,
             layers[0].quantization == "W8A8" and bool(layers[0].swiglu_limit),
         )
-        return expert_weight_signature(layers, cam_receive_capacity())
+        return expert_weight_signature(layers, capacity)
 
     @torch.inference_mode()
     def execute_connector_driven_step(self, shutdown_requested: bool = False) -> bool:
@@ -425,23 +396,40 @@ class AsyncNPUFFNModelRunner:
         single: bool = False,
     ) -> torch.Tensor | None:
         assert self.model is not None
-        if self._mega_executor is not None:
-            for _ in self.layer_ids[:1] if single else self.layer_ids:
-                rank_ffn_output = self._mega_executor()
-            return rank_ffn_output
         rank_ffn_output = None
-        assert self._layered_executor is not None
         for _ in self.layer_ids[:1] if single else self.layer_ids:
-            payload = self.connector.recv_attn_output()
-            states = cast(AFDAsyncTransferState, payload.context.states)
-            rank_ffn_output = self._layered_executor(
-                payload.hidden_states,
-                states.dynamic_scales,
-                states.group_list,
-                states.token_nums_rankid_layeridx,
-            )
-            self.connector.send_ffn_output(rank_ffn_output, payload.context)
+            rank_ffn_output = self._run_ffn_transaction()
         return rank_ffn_output
+
+    def _run_ffn_transaction(
+        self, *, retained_tensors: list[torch.Tensor] | None = None
+    ) -> torch.Tensor:
+        if self._mega_executor is not None:
+            return self._mega_executor()
+        assert self._layered_executor is not None
+        payload = self.connector.recv_attn_output()
+        if retained_tensors is not None:
+            # A partial capture may already reference the received device buffers.
+            self._graph_payload = payload
+        states = cast(AFDAsyncTransferState, payload.context.states)
+        assert states.token_nums_rankid_layeridx is not None
+        assert states.group_list is not None
+        assert states.dynamic_scales is not None
+        output = self._layered_executor(
+            payload.hidden_states,
+            states.dynamic_scales,
+            states.group_list,
+            states.token_nums_rankid_layeridx,
+            retained_tensors=retained_tensors,
+        )
+        if retained_tensors is not None:
+            self._graph_output = output
+        self.connector.send_ffn_output(output, payload.context)
+        return output
+
+    @property
+    def receiver_exited(self) -> bool:
+        return self._graph_receiver_exited
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}
@@ -467,10 +455,10 @@ class AsyncNPUFFNModelRunner:
             ) from self._failure
         if self.session.requires_drain and not self._graph_receiver_exited:
             raise RuntimeError("Receiver has not exited; retain resources")
-        self.session.validate_shutdown()
         from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 
         if self._graph is not None:
+            self.session.validate_shutdown()
             self._close_graph()
         stop_afd_npu_profiler(self.prof)
         self.connector.close()

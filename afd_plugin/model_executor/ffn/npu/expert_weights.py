@@ -84,8 +84,8 @@ def expert_geometry(layer: QuantizedExpertWeights) -> tuple[int, int, int]:
 
 
 def expert_weight_signature(layers: list[QuantizedExpertWeights], capacity: int) -> str:
-    """Preserve the negotiated layout, including Layered's W8A8 zero bias."""
-    layers = validate_expert_weights(layers)
+    """Serialize admitted weights, including Layered's W8A8 zero-bias layout."""
+    layers = sorted(layers, key=lambda layer: layer.layer_idx)
     first = layers[0]
     tensors = [
         first.w13,

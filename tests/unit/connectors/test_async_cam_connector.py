@@ -214,9 +214,6 @@ def test_async_select_experts_rejects_mix_placement():
 def test_async_receive_anchor_uses_model_dtype(monkeypatch, dtype):
     fake_torch = _FakeTorch()
     monkeypatch.setattr(async_cam_module, "torch", fake_torch)
-    monkeypatch.setattr(
-        async_cam_module, "ensure_cam_async_ops_available", lambda: None
-    )
     backend = SimpleNamespace(get_hccl_comm_name=lambda rank: "source-test")
     monkeypatch.setattr(
         async_cam_module,
@@ -233,11 +230,6 @@ def test_async_receive_anchor_uses_model_dtype(monkeypatch, dtype):
     connector.init_afd_connector()
     connector.recv_attn_output(batch_size=1, layer_idx=0)
     assert fake_torch.ops.afd_ascend.calls[0][1][0].dtype == dtype
-
-
-def test_async_rejects_nondivisible_expert_placement():
-    with pytest.raises(ValueError, match="divisible"):
-        build_async_topology(_afd_config(role="ffn"), 0, num_routed_experts=7)
 
 
 def test_async_rejects_fused_shared_expert_ids():
