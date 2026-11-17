@@ -15,10 +15,11 @@ from typing import Any
 
 import pytest
 
-from tests.e2e.models.deepseek_v4_flash import dspark_eager
+from tests.e2e.case import CaseEnvironment
+from tests.e2e.models.deepseek_v4_flash import dspark_cases, dspark_eager
 
 
-@pytest.mark.parametrize("mode,replays", [("eager", 0)])
+@pytest.mark.parametrize("mode,replays", [("eager", 0), ("full", 0)])
 def test_graph_dispatch_requires_full_request_replay_on_every_ffn(mode, replays):
     before, after = {}, {}
     for rank in range(2, 6):
@@ -48,6 +49,94 @@ def test_graph_dispatch_requires_full_request_replay_on_every_ffn(mode, replays)
     dspark_eager.assert_dispatch(
         before, after, require_graph=True, require_layer_returns=False
     )
+
+
+@pytest.fixture
+def service_observations(tmp_path):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    executable = runtime / "python"
+    executable.write_text("interpreter a")
+    modules = {}
+    for name in (
+        "afd_plugin",
+        "numpy",
+        "safetensors",
+        "tokenizers",
+        "torch",
+        "torch_npu",
+        "transformers",
+        "vllm",
+        "vllm_ascend",
+    ):
+        package = runtime / name
+        package.mkdir()
+        origin = package / "__init__.py"
+        origin.write_text(f"{name} content")
+        modules[name] = str(origin)
+    observation = {
+        "executable": str(executable),
+        "prefix": str(runtime),
+        "base_prefix": str(runtime),
+        "version": "test",
+        "sys_path": [str(runtime)],
+        "modules": modules,
+    }
+
+    def write_stage(stage, data):
+        requests = stage / "requests"
+        requests.mkdir(parents=True)
+        (requests / "summary.json").write_text("[]")
+        attention = [{"rank": rank, "runtime": data} for rank in range(2)]
+        ffn = {
+            f"rank-{rank}.json": {"rank": rank, "runtime": data} for rank in range(2, 6)
+        }
+        (requests / "attention.json").write_text(json.dumps({"results": attention}))
+        (requests / "ffn-after.json").write_text(json.dumps(ffn))
+
+    return observation, write_stage
+
+
+def test_graph_reference_compares_worker_runtime(
+    service_observations, monkeypatch, tmp_path
+):
+    observation, write_stage = service_observations
+    reference_stage = tmp_path / "old-target"
+    write_stage(reference_stage, observation)
+    old_runtime = dspark_cases.service_runtime_identity(reference_stage)
+    executable = tmp_path / "other-python"
+    executable.write_text("interpreter b")
+    new_observation = {**observation, "executable": str(executable)}
+    reference = tmp_path / "reference"
+    reference.mkdir()
+    (reference / "run.json").write_text(
+        json.dumps(
+            {
+                "case_id": dspark_cases.EAGER,
+                "acceptance_passed": True,
+                "identity": {"same": True},
+                "service_runtime": old_runtime,
+                "stages": {"target": str(reference_stage)},
+            }
+        )
+    )
+    env = CaseEnvironment(
+        model="/model",
+        vllm_bin="same-wrapper",
+        device_backend="npu",
+        devices=tuple(map(str, range(6))),
+        output_path=tmp_path / "graph",
+    )
+    monkeypatch.setattr(dspark_cases, "identity", lambda _env: {"same": True})
+
+    def subrun(_case_id, env, name, **_kwargs):
+        path = env.output_path / name
+        write_stage(path, new_observation)
+        return path
+
+    monkeypatch.setattr(dspark_cases, "subrun", subrun)
+    with pytest.raises(ValueError, match="service runtime"):
+        dspark_cases.execute(dspark_cases.GRAPH, env, reference)
 
 
 @pytest.fixture
