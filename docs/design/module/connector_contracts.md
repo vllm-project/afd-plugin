@@ -345,6 +345,8 @@ agreement supplies the common envelope/TP, so Startup adds only the uint16
 source-row bound and retains its existing validated barrier. Local MRV2 and
 static capacity checks are not repeated during negotiation. Payloads, FIFO
 order and Pull status still need their own changing-state checks.
+Follow the [validation placement rules](plugin_boundary.md#adding-or-moving-a-check)
+when changing checks at these boundaries.
 
 The four public transfer methods still enter through the connector. The existing
 `AFDAsyncTransferState` definition stays at its original import path;

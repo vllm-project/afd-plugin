@@ -105,6 +105,8 @@ NPU selection factory consume this admission. CUDA FFN receives the existing
 `AFDCUDAGraphPolicy` through its Worker factory instead of resolving it again.
 CUDA and NPU share PP/CP and role-world rules; connector, DBO and graph policies
 remain scoped to their backend.
+Changes to validation placement follow the
+[ownership and coverage rules](plugin_boundary.md#adding-or-moving-a-check).
 
 Connectors expose `attention_step()` and a backend-owned `FFNExecutionSession`.
 The Async FFN runner and worker use its service predicate, first-step hook,
@@ -224,7 +226,8 @@ is a fallback trace directory.
 NPU workers apply AFD-scoped vLLM-Ascend compatibility patches before
 upstream construction. During device initialization they:
 
-1. validate the selected Worker/role wiring and normalize Async CAM DBO;
+1. validate the selected Worker/role wiring and, on Attention, normalize
+   Async CAM DBO;
 2. apply the non-sequence-parallel all2all backend correction when needed;
 3. admit the common MRV2/topology/execution contract, then additional features;
 4. select the target AFD model config and configure DSpark draft/transport
