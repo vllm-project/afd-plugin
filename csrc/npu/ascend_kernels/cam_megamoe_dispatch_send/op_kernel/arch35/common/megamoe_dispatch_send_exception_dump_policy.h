@@ -7,6 +7,13 @@
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  */
+/*
+ * License: CANN Open Software License Agreement Version 2.0
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * Description: Provide shared exception dump policy definitions for split MegaMoE execution.
+ * Note:
+ * History: 2026-11-17 adapt the split MegaMoE operator for AFD integration.
+ */
 
 #ifndef MEGAMOE_DISPATCH_SEND_ARCH35_EXCEPTION_DUMP_POLICY_H
 #define MEGAMOE_DISPATCH_SEND_ARCH35_EXCEPTION_DUMP_POLICY_H

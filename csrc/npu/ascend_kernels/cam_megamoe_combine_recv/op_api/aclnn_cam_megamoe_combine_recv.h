@@ -1,4 +1,11 @@
 /* Copyright (c) 2026 Huawei Technologies Co., Ltd. Licensed under CANN OSL v2. */
+/*
+ * License: CANN Open Software License Agreement Version 2.0
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * Description: Expose the ACLNN interface for the AFD MegaMoE operator.
+ * Note:
+ * History: 2026-11-17 adapt the split MegaMoE operator for AFD integration.
+ */
 #pragma once
 #include "aclnn/acl_meta.h"
 #ifdef __cplusplus
