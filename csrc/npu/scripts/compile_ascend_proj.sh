@@ -121,8 +121,8 @@ build_ascend_proj() {
     # operators (include mode)
     copy_ops_include "${src_path}/ascend_kernels" "${build_root}/${proj_name}" "$selected_ops"
 
-    # Keep dependencies outside the merged operator directories; no per-operator
-    # staging helper or rewrite is needed because incoming headers are prefixed.
+    # Stage the four shared MegaMoE protocol/host headers beside the merged
+    # operator directories. Third-party headers are resolved from the CANN SDK.
     case " $selected_ops " in
         *" cam_megamoe_"*)
             cp -a "${src_path}/ascend_kernels/megamoe_utils" "${build_root}/${proj_name}/"

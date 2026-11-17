@@ -29,15 +29,10 @@
 #else
 #include "kernel_operator.h"
 #endif
-#if __has_include("../../../../common/quantize_functions.h")
 // ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/quantize_functions.h"
+#include "quantize_functions.h"
 // ### PATCH END: AFD merged source layout
-#else
-// ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/quantize_functions.h"
-// ### PATCH END: AFD merged source layout
-#endif
+
 #include "../../common/megamoe_combine_recv_constants.h"
 #include "../../common/megamoe_combine_recv_utils.h"
 // ### PATCH START: AFD merged source layout

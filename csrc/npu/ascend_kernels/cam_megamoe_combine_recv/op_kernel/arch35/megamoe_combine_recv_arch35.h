@@ -25,15 +25,10 @@
 
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
-#if __has_include("../../common/mc2_kernel_utils.h")
 // ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/mc2_kernel_utils.h"
+#include "mc2_kernel_utils.h"
 // ### PATCH END: AFD merged source layout
-#else
-// ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/mc2_kernel_utils.h"
-// ### PATCH END: AFD merged source layout
-#endif
+
 #include "kernel_operator_list_tensor_intf.h"
 #include "common/megamoe_combine_recv_types.h"
 #include "common/megamoe_combine_recv_workspace.h"
@@ -49,15 +44,10 @@
 #include "stage/megamoe_combine_recv_gmm1_activation.h"
 #include "stage/megamoe_combine_recv_gmm2_combine.h"
 #include "stage/megamoe_combine_recv_unpermute.h"
-#if __has_include("../../common/quantize_functions.h")
 // ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/quantize_functions.h"
+#include "quantize_functions.h"
 // ### PATCH END: AFD merged source layout
-#else
-// ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/quantize_functions.h"
-// ### PATCH END: AFD merged source layout
-#endif
+
 
 namespace MegamoeCombineRecvImpl {
 

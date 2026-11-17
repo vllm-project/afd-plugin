@@ -33,21 +33,13 @@
 #include "../common/megamoe_fused_moe_gmm_common.h"
 #include "../common/megamoe_fused_moe_utils.h"
 #include "../common/megamoe_fused_moe_mxfp8_utils.h"
-#if __has_include("../../../common/mc2_kernel_utils.h")
 // ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/mc2_kernel_utils.h"
+#include "mc2_kernel_utils.h"
 // ### PATCH END: AFD merged source layout
 // ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/quantize_functions.h"
+#include "quantize_functions.h"
 // ### PATCH END: AFD merged source layout
-#else
-// ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/mc2_kernel_utils.h"
-// ### PATCH END: AFD merged source layout
-// ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/quantize_functions.h"
-// ### PATCH END: AFD merged source layout
-#endif
+
 
 namespace MegamoeFusedMoeImpl {
 

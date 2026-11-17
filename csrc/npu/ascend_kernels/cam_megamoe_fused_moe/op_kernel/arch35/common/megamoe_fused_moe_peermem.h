@@ -42,7 +42,7 @@
 // ### PATCH END: AFD merged source layout
 #include "megamoe_fused_moe_constants.h"
 // ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/megamoe_layer_selection.h"
+#include "megamoe_layer_selection.h"
 // ### PATCH END: AFD merged source layout
 
 namespace MegamoeFusedMoeImpl {

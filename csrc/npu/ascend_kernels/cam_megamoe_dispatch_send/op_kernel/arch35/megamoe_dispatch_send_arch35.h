@@ -26,15 +26,10 @@
 #include <type_traits>
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
-#if __has_include("../../common/mc2_kernel_utils.h")
 // ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/mc2_kernel_utils.h"
+#include "mc2_kernel_utils.h"
 // ### PATCH END: AFD merged source layout
-#else
-// ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/mc2_kernel_utils.h"
-// ### PATCH END: AFD merged source layout
-#endif
+
 #include "kernel_operator_list_tensor_intf.h"
 #include "common/megamoe_dispatch_send_types.h"
 #include "common/megamoe_dispatch_send_workspace.h"
@@ -43,15 +38,10 @@
 #include "stage/megamoe_dispatch_send_token_quant.h"
 #include "stage/megamoe_dispatch_send_send_mask.h"
 #include "stage/megamoe_dispatch_send_shared_expert_input.h"
-#if __has_include("../../common/quantize_functions.h")
 // ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/quantize_functions.h"
+#include "quantize_functions.h"
 // ### PATCH END: AFD merged source layout
-#else
-// ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/quantize_functions.h"
-// ### PATCH END: AFD merged source layout
-#endif
+
 
 namespace MegamoeDispatchSendImpl {
 using namespace AscendC;

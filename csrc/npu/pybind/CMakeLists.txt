@@ -121,7 +121,7 @@ if(AFD_SOC_VERSION STREQUAL "950" OR AFD_SOC_VERSION MATCHES "^[Aa]scend950")
     "${TORCH_NPU_PATH}/include"
     "${TORCH_NPU_PATH}/.."
     ${TORCH_INCLUDE_DIRS}
-    "${AFD_NPU_CSRC_DIR}/ascend_kernels/megamoe_utils/mc2/common/op_kernel")
+    "${AFD_NPU_CSRC_DIR}/ascend_kernels/megamoe_utils")
   target_link_directories(afd_plugin_megamoe_C PRIVATE
     "${TORCH_INSTALL_PREFIX}/lib"
     "${TORCH_NPU_PATH}/lib"

@@ -12,8 +12,10 @@ The UMDK MIT notice is not applied to CANN source. The 2026-11-17 history
 entry records the adaptation history, not original creation.
 Existing original creation dates are preserved.
 
-Vendored dependencies under `megamoe_utils` retain their original license
-and copyright notices; no AFD ownership is asserted over unchanged copies.
+`megamoe_utils` contains only the shared layer-selection, sequence-limit,
+sequence-ring and host-compatibility headers. Their existing copyright and
+license notices remain unchanged. MC2 common, OpBase, Blaze and Tensor API
+headers are consumed from the installed CANN SDK rather than vendored here.
 The local reference checkouts used for this review are `ops-transformer`
 and `umdk` alongside this repository.
 
@@ -29,9 +31,8 @@ and `umdk` alongside this repository.
 
 ## License location
 
-The CANN OSL v2 text is retained in [`megamoe_utils/LICENSE`](megamoe_utils/LICENSE),
-with additional dependency license files under `megamoe_utils/opbase` and
-`megamoe_utils/ops-tensor`. The repository root license is Apache; therefore
+The CANN OSL v2 text is retained in [`LICENSE-CANN`](LICENSE-CANN).
+The repository root license is Apache; therefore
 the original source headers' reference to a root `LICENSE` does not resolve
 to the CANN license in this repository. The appended header identifies CANN
 OSL v2; the link above locates its retained text. No license text has been rewritten.

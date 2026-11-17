@@ -19,7 +19,7 @@
 #define MEGAMOE_COMBINE_RECV_ARCH35_EXCEPTION_DUMP_POLICY_H
 // ### PATCH START: AFD merged source layout
 
-#include "mc2/common/op_kernel/mc2_exception_dump.h"
+#include "mc2_exception_dump.h"
 // ### PATCH END: AFD merged source layout
 #include "megamoe_combine_recv_workspace.h"
 // ### PATCH START: AFD merged source layout

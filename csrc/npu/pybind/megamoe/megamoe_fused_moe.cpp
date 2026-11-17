@@ -10,13 +10,9 @@
 
 #include <torch/extension.h>
 #include "aclnn_common.h"
-#if __has_include("megamoe_layer_selection.h")
+// ### PATCH START: AFD shared MegaMoE headers
 #include "megamoe_layer_selection.h"
-#else
-// ### PATCH START: AFD dependency directory
-#include "../../ascend_kernels/megamoe_utils/mc2/common/op_kernel/megamoe_layer_selection.h"
-// ### PATCH END: AFD dependency directory
-#endif
+// ### PATCH END: AFD shared MegaMoE headers
 
 namespace cam_megamoe_fused_moe {
 static void CheckExpertTensors(const std::vector<at::Tensor> &first,

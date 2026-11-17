@@ -28,15 +28,10 @@
 #if defined(ENABLE_MEGAMOE_COMBINE_RECV_LAYERED_KERNEL)
 #include "adv_api/hcomm/hcomm.h"
 #endif
-#if __has_include("../../../common/mc2_moe_context.h")
 // ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/mc2_moe_context.h"
+#include "mc2_moe_context.h"
 // ### PATCH END: AFD merged source layout
-#else
-// ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/mc2_moe_context.h"
-// ### PATCH END: AFD merged source layout
-#endif
+
 
 namespace MegamoeCombineRecvImpl {
 

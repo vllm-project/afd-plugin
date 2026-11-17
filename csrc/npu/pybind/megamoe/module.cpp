@@ -3,7 +3,7 @@
 // Isolate it from CAM's existing pytorch_npu_helper.hpp in a separate native DSO.
 #include <torch/extension.h>
 #include "aclnn_common.h"
-#include "../../ascend_kernels/megamoe_utils/megamoe_sequence_limit.h"
+#include "megamoe_sequence_limit.h"
 #include "comm_context.cpp"
 #include "megamoe_dispatch_send.cpp"
 #include "megamoe_combine_recv.cpp"

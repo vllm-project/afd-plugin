@@ -24,15 +24,10 @@
 #include "basic_api/reg_compute/kernel_reg_compute_intf.h"
 #endif
 #include "megamoe_dispatch_send_constants.h"
-#if __has_include("../../../common/quantize_functions.h")
 // ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/quantize_functions.h"
+#include "quantize_functions.h"
 // ### PATCH END: AFD merged source layout
-#else
-// ### PATCH START: AFD merged source layout
-#include "mc2/common/op_kernel/quantize_functions.h"
-// ### PATCH END: AFD merged source layout
-#endif
+
 
 namespace MegamoeDispatchSendImpl {
 

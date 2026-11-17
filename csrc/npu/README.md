@@ -177,6 +177,19 @@ paired vendor setup.
 
 ## Current Scope
 
+The A5 `cam_megamoe_*` split operators keep only four shared protocol/host
+headers in `ascend_kernels/megamoe_utils`. Build them against a CANN 9.2
+installation that includes the ops-transformer source headers under
+`opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/common`:
+Blaze, Tensor API (both `include` and `impl`), and the MC2/OpBase kernel
+headers in `op_kernel`. Host tiling also requires
+`op_common/op_host/util/math_util.h` from the SDK `include` or `pkg_inc`
+directory. Set `ASCEND_CANN_PACKAGE_PATH` to that installation. CMake checks
+the required entry headers and reports missing components before OPC runs.
+The split operators and `_C_megamoe` extension share the same flat utility
+directory. SDK header/interface compatibility still requires an A5 build and
+runtime check; header discovery alone does not establish compatibility.
+
 A2E/E2A serve `CAMP2pAFDConnector`. `CAMAsyncAFDConnector` uses the plugin's
 910C routed-only CAM operators; see the [operator contract](../../docs/design/npu/cam_async_routed_ops.md).
 The standalone FFN entry point reuses this protocol and connector; see
