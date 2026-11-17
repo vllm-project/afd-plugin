@@ -31,8 +31,10 @@ responsible for the model semantics.
 Both use `afd.async=true` and `afd.compute_gate_on_attention=true`. Attention
 DPs can progress independently. Both require eager ModelRunnerV2 for this A5
 path. Use `enable_fused_mc2=0` so native loading retains the tensors consumed by
-these backends. The A3 layered INT4/INT8 executor is not the A5 MXFP4 executor;
-leave `AFD_ASYNC_CAM_LAYERED_GMM` disabled.
+these backends. For `CAMAsyncAFDConnector` on A5, leave `AFD_ASYNC_CAM_LAYERED_GMM` disabled:
+the A3 layered INT4/INT8 executor is not the A5 MXFP4 executor. For
+`CAMAsyncMegamoeAFDConnector`, the same FFN-side switch enables device layer
+selection inside the MXFP4 fused operator; see [MegaMoE configuration](MEGAMOE_EAGER.md).
 
 For ordinary CAM, the BF16 receive scale output is a placeholder. The connector
 now passes `None` to the FFN MLP, causing the native MX method to perform group-32
