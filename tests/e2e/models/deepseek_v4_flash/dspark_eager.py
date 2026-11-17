@@ -52,7 +52,12 @@ def worker_records(directory: Path) -> dict:
 
 
 def assert_dispatch(
-    before: dict, after: dict, ffn_ranks: int = 4, *, require_layer_returns=True
+    before: dict,
+    after: dict,
+    ffn_ranks: int = 4,
+    *,
+    require_layer_returns=True,
+    require_graph=False,
 ) -> None:
     assert len(after) == ffn_ranks and set(after) == set(before), after
     for name, state in after.items():
@@ -61,6 +66,8 @@ def assert_dispatch(
         assert not state["owns_attention"] and not state["owns_shared_experts"], state
         assert state["ffn_execution"] == "layered", state
         assert state["executor_layer_ids"] == list(range(46)), state
+        if require_graph:
+            assert state["ffn_mode"] == "full", state
         if state["ffn_mode"] == "full":
             assert state["graph_capture_count"] == 1, state
             assert state["graph_replay_count"] > before[name]["graph_replay_count"], (
@@ -407,6 +414,7 @@ def exercise(args, control, output, before, verify_graph_numerics, initial_metri
                     before,
                     after,
                     args.ffn_ranks,
+                    require_graph=args.observe_graph,
                     require_layer_returns=not args.observe_graph
                     or verify_graph_numerics,
                 )

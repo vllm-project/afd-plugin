@@ -8,6 +8,7 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 import uuid
@@ -262,6 +263,20 @@ def files_digest(root: Path, paths: set[Path]) -> str:
     return digest.hexdigest()
 
 
+def package_digest(origin: Path) -> str:
+    root = origin.resolve().parent
+    return files_digest(
+        root,
+        {
+            item
+            for item in root.rglob("*")
+            if item.is_file()
+            and item.suffix != ".pyc"
+            and "__pycache__" not in item.parts
+        },
+    )
+
+
 def identity(environment: CaseEnvironment) -> dict:
     """Bind reusable reference to source, native binaries, model and runtime."""
     model = Path(environment.model).resolve()
@@ -310,32 +325,75 @@ def identity(environment: CaseEnvironment) -> dict:
                 "changes": changes,
                 # Git status names dirty files, but does not identify their
                 # contents or installed packages outside a Git checkout.
-                "content_sha256": files_digest(
-                    path.parent,
-                    {
-                        item
-                        for item in path.parent.rglob("*")
-                        if item.is_file()
-                        and item.suffix != ".pyc"
-                        and "__pycache__" not in item.parts
-                    },
-                ),
+                "content_sha256": package_digest(path),
             }
             runtime[name]["native"] = {
                 str(p): file_digest(p) for p in path.parent.glob("*.so")
             }
+    executable = shutil.which(environment.vllm_bin)
     return {
         "source_sha256": files_digest(ROOT, source_files),
         "model": str(model),
         "model_files": model_files,
         "runtime": runtime,
         "python": {"executable": sys.executable, "version": sys.version},
+        "service_executable": {
+            "command": environment.vllm_bin,
+            "path": str(Path(executable).resolve()) if executable else None,
+            "sha256": file_digest(Path(executable)) if executable else None,
+        },
         "packages": {
             name: importlib.metadata.version(name)
             for name in ("vllm", "vllm-ascend", "torch", "torch-npu", "numpy")
         },
         "devices": list(environment.devices[:6]),
     }
+
+
+def service_runtime_identity(stage: Path) -> dict:
+    """Fingerprint interpreters and package contents observed by A/F workers."""
+    requests = stage / "requests"
+    roles = {
+        "attention": json.loads((requests / "attention.json").read_text())["results"],
+        "ffn": list(json.loads((requests / "ffn-after.json").read_text()).values()),
+    }
+    workers: dict[str, dict[str, Any]] = {}
+    executables: dict[str, str] = {}
+    packages: dict[str, str] = {}
+    required_modules = {
+        "afd_plugin",
+        "numpy",
+        "safetensors",
+        "tokenizers",
+        "torch",
+        "torch_npu",
+        "transformers",
+        "vllm",
+        "vllm_ascend",
+    }
+    for role, states in roles.items():
+        if not states:
+            raise ValueError(f"no {role} worker runtime identities")
+        workers[role] = {}
+        for state in states:
+            runtime = state["runtime"]
+            executable = runtime["executable"]
+            modules = runtime["modules"]
+            if not required_modules.issubset(modules):
+                raise ValueError(f"{role} worker is missing runtime module identities")
+            rank = str(state["rank"])
+            if rank in workers[role]:
+                raise ValueError(f"duplicate {role} worker rank {rank}")
+            workers[role][rank] = runtime
+            if executable not in executables:
+                executables[executable] = file_digest(Path(executable))
+            for origin in modules.values():
+                if origin not in packages:
+                    path = Path(origin)
+                    if not path.is_file():
+                        raise ValueError(f"worker runtime module is missing: {path}")
+                    packages[origin] = package_digest(path)
+    return {"workers": workers, "executables": executables, "packages": packages}
 
 
 def compare(reference: Path, target: Path) -> None:
@@ -373,6 +431,7 @@ def execute(case_id: str, env: CaseEnvironment, eager_reference: Path | None = N
             target = subrun(EAGER, env, "target")
             compare(reference, target)
             record["stages"] = {"reference": str(reference), "target": str(target)}
+            record["service_runtime"] = service_runtime_identity(target)
         elif case_id == GRAPH:
             if eager_reference is None:
                 nested = replace(env, output_path=env.output_path / "eager-reference")
@@ -383,29 +442,40 @@ def execute(case_id: str, env: CaseEnvironment, eager_reference: Path | None = N
                 proof.get("case_id") != EAGER
                 or not proof.get("acceptance_passed")
                 or proof.get("identity") != record["identity"]
+                or not isinstance(proof.get("service_runtime"), dict)
             ):
                 raise ValueError("eager reference is not a matching qualified run")
             reference = Path(proof["stages"]["target"])
             target = subrun(GRAPH, env, "target")
             compare(reference, target)
+            target_runtime = service_runtime_identity(target)
+            if proof.get("service_runtime") != target_runtime:
+                raise ValueError("eager reference has a different service runtime")
             instrumented = subrun(GRAPH, env, "layer-evidence", instrumented=True)
             compare(target, instrumented)
+            if service_runtime_identity(instrumented) != target_runtime:
+                raise ValueError("graph deployments have different service runtimes")
             record["stages"] = {
                 "reference": str(reference),
                 "target": str(target),
                 "layer_evidence": str(instrumented),
             }
+            record["service_runtime"] = target_runtime
         else:
             reference = subrun(PD_GRAPH, env, "reference", speculative=False)
             target = subrun(PD_GRAPH, env, "target")
             compare(reference, target)
+            target_runtime = service_runtime_identity(target)
             instrumented = subrun(PD_GRAPH, env, "layer-evidence", instrumented=True)
             compare(target, instrumented)
+            if service_runtime_identity(instrumented) != target_runtime:
+                raise ValueError("PD graph deployments have different service runtimes")
             record["stages"] = {
                 "reference": str(reference),
                 "target": str(target),
                 "layer_evidence": str(instrumented),
             }
+            record["service_runtime"] = target_runtime
         record["acceptance_passed"] = True
     except BaseException as exc:
         record["error"] = f"{type(exc).__name__}: {exc}"

@@ -141,9 +141,11 @@ comparison are distinct deployments. Each attempt has its own artifact
 directory, so earlier rank evidence cannot qualify a later attempt.
 
 An optional eager reference is reused only when its recorded identity matches
-the current source, runtime and deployment inputs. Implementation/collection
-does not establish device qualification: report host, same-host distributed
-and cross-node/device execution separately.
+the current source, runtime and deployment inputs. Its actual A/F worker
+interpreter and package identities must also match the graph deployment;
+ordinary graph checks require FULL mode and request-window replay on every FFN
+rank. Implementation/collection does not establish device qualification: report
+host, same-host distributed and cross-node/device execution separately.
 
 On migrated Case paths (single-deployment entries, DSpark core Cases and ten GPU
 multi-pod entries), an existing-capability combination changes model

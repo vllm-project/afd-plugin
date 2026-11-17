@@ -732,6 +732,13 @@ reference unless `AFD_DSPARK_EAGER_REFERENCE` names a completed eager case with
 matching source, native, runtime, model and A/F device identities. Runtime
 identity includes the vLLM and vLLM-Ascend Python/native package contents and
 the installed AFD CANN vendor package, including device kernels and metadata.
+It also records the selected service executable and verifies the actual A/F
+workers' interpreter, import paths, AFD plugin, vLLM, vLLM-Ascend, torch,
+torch-npu, NumPy, Transformers, safetensors and tokenizers package contents.
+The graph case compares its target workers with the eager reference workers.
+Both graph cases also compare their normal and instrumented workers. The
+non-speculative reference does not expose worker runtime observations; worker
+observations are checked after each observed deployment runs.
 Checkpoint identity records the resolved path, file sizes and modification
 times, and JSON content hashes; it does not hash weight contents. Do not alter
 or replace checkpoint files in place when reusing a reference.

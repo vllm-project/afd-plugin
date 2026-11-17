@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import threading
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -99,6 +100,38 @@ def test_graph_replay_requires_nonempty_target_and_draft_on_every_attention_rank
         dspark_eager.assert_attention_graph(records, 2)
 
 
+@pytest.mark.parametrize("mode,replays", [("eager", 0), ("full", 0)])
+def test_graph_dispatch_requires_full_request_replay_on_every_ffn(mode, replays):
+    before, after = {}, {}
+    for rank in range(2, 6):
+        name = f"rank-{rank}.json"
+        state = {
+            "rank": rank,
+            "draft_wire_layer_ids": [43, 44, 45],
+            "owns_routed_experts": True,
+            "owns_attention": False,
+            "owns_shared_experts": False,
+            "ffn_execution": "layered",
+            "executor_layer_ids": list(range(46)),
+            "ffn_mode": mode if rank == 3 else "full",
+            "graph_capture_count": 0 if mode == "eager" and rank == 3 else 1,
+            "graph_replay_count": replays if rank == 3 else 1,
+            "submitted_returns": {},
+        }
+        before[name] = {**state, "graph_replay_count": 0}
+        after[name] = state
+    with pytest.raises(AssertionError):
+        dspark_eager.assert_dispatch(
+            before, after, require_graph=True, require_layer_returns=False
+        )
+    after["rank-3.json"].update(
+        ffn_mode="full", graph_capture_count=1, graph_replay_count=1
+    )
+    dspark_eager.assert_dispatch(
+        before, after, require_graph=True, require_layer_returns=False
+    )
+
+
 def test_serial_comparison_requires_same_tokens_and_prompts(tmp_path: Path):
     left, right = tmp_path / "left", tmp_path / "right"
     for path in (left, right):
@@ -168,6 +201,163 @@ def test_repeated_subruns_keep_evidence_isolated(monkeypatch, tmp_path):
     second = dspark_cases.subrun(dspark_cases.GRAPH, env, "target")
     assert old_proof.is_file()
     assert not (second / "workers/attention-graph/rank-1.json").exists()
+
+
+def test_reference_identity_includes_the_service_executable(monkeypatch, tmp_path):
+    root = tmp_path / "afd"
+    (root / "afd_plugin").mkdir(parents=True)
+    (root / "tests/e2e").mkdir(parents=True)
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    first, second = tmp_path / "vllm-a", tmp_path / "vllm-b"
+    first.write_text("runtime a")
+    second.write_text("runtime b")
+    first.chmod(0o755)
+    second.chmod(0o755)
+    env = CaseEnvironment(
+        model=str(model),
+        vllm_bin=str(first),
+        device_backend="npu",
+        devices=tuple(map(str, range(6))),
+        output_path=tmp_path,
+    )
+    monkeypatch.setattr(dspark_cases, "ROOT", root)
+    monkeypatch.setattr(dspark_cases.importlib.util, "find_spec", lambda _name: None)
+    monkeypatch.setattr(
+        dspark_cases.importlib.metadata, "version", lambda _name: "test"
+    )
+    assert dspark_cases.identity(env) != dspark_cases.identity(
+        replace(env, vllm_bin=str(second))
+    )
+    before = dspark_cases.identity(env)
+    first.write_text("changed wrapper")
+    assert dspark_cases.identity(env) != before
+
+
+@pytest.fixture
+def service_observations(tmp_path):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    executable = runtime / "python"
+    executable.write_text("interpreter a")
+    modules = {}
+    for name in (
+        "afd_plugin",
+        "numpy",
+        "safetensors",
+        "tokenizers",
+        "torch",
+        "torch_npu",
+        "transformers",
+        "vllm",
+        "vllm_ascend",
+    ):
+        package = runtime / name
+        package.mkdir()
+        origin = package / "__init__.py"
+        origin.write_text(f"{name} content")
+        modules[name] = str(origin)
+    observation = {
+        "executable": str(executable),
+        "prefix": str(runtime),
+        "base_prefix": str(runtime),
+        "version": "test",
+        "sys_path": [str(runtime)],
+        "modules": modules,
+    }
+
+    def write_stage(stage, data):
+        requests = stage / "requests"
+        requests.mkdir(parents=True)
+        (requests / "summary.json").write_text("[]")
+        attention = [{"rank": rank, "runtime": data} for rank in range(2)]
+        ffn = {
+            f"rank-{rank}.json": {"rank": rank, "runtime": data} for rank in range(2, 6)
+        }
+        (requests / "attention.json").write_text(json.dumps({"results": attention}))
+        (requests / "ffn-after.json").write_text(json.dumps(ffn))
+
+    return observation, write_stage
+
+
+@pytest.mark.parametrize("changed", ["vllm", "afd_plugin", "numpy", "interpreter"])
+def test_service_runtime_hashes_worker_contents(
+    service_observations, tmp_path, changed
+):
+    observation, write_stage = service_observations
+    stage = tmp_path / "stage"
+    write_stage(stage, observation)
+    before = dspark_cases.service_runtime_identity(stage)
+    path = Path(
+        observation["executable"]
+        if changed == "interpreter"
+        else observation["modules"][changed]
+    )
+    path.write_text("changed runtime code")
+    assert dspark_cases.service_runtime_identity(stage) != before
+
+
+def test_service_runtime_requires_worker_plugin_identity(
+    service_observations, tmp_path
+):
+    observation, write_stage = service_observations
+    missing = {**observation, "modules": dict(observation["modules"])}
+    del missing["modules"]["afd_plugin"]
+    stage = tmp_path / "stage"
+    write_stage(stage, missing)
+    with pytest.raises(ValueError, match="missing runtime module identities"):
+        dspark_cases.service_runtime_identity(stage)
+
+
+@pytest.mark.parametrize("different", [False, True], ids=["matching", "different"])
+def test_graph_reference_compares_worker_runtime(
+    service_observations, monkeypatch, tmp_path, different
+):
+    observation, write_stage = service_observations
+    reference_stage = tmp_path / "old-target"
+    write_stage(reference_stage, observation)
+    old_runtime = dspark_cases.service_runtime_identity(reference_stage)
+    executable = tmp_path / "other-python"
+    executable.write_text("interpreter b")
+    new_observation = (
+        {**observation, "executable": str(executable)} if different else observation
+    )
+    reference = tmp_path / "reference"
+    reference.mkdir()
+    (reference / "run.json").write_text(
+        json.dumps(
+            {
+                "case_id": dspark_cases.EAGER,
+                "acceptance_passed": True,
+                "identity": {"same": True},
+                "service_runtime": old_runtime,
+                "stages": {"target": str(reference_stage)},
+            }
+        )
+    )
+    env = CaseEnvironment(
+        model="/model",
+        vllm_bin="same-wrapper",
+        device_backend="npu",
+        devices=tuple(map(str, range(6))),
+        output_path=tmp_path / "graph",
+    )
+    monkeypatch.setattr(dspark_cases, "identity", lambda _env: {"same": True})
+
+    def subrun(_case_id, env, name, **_kwargs):
+        path = env.output_path / name
+        write_stage(path, new_observation)
+        return path
+
+    monkeypatch.setattr(dspark_cases, "subrun", subrun)
+    if different:
+        with pytest.raises(ValueError, match="service runtime"):
+            dspark_cases.execute(dspark_cases.GRAPH, env, reference)
+    else:
+        assert dspark_cases.execute(dspark_cases.GRAPH, env, reference)[
+            "acceptance_passed"
+        ]
 
 
 @pytest.mark.parametrize("changed", ["dirty-runtime", "cann-kernel"])
