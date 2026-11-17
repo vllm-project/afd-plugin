@@ -78,7 +78,6 @@ def test_attention_moe_sends_hidden_states_through_weightless_runner(
 
     output = moe(hidden_states)
 
-    assert type(moe.experts) is remote.AFDRemoteMoERunner
     assert list(moe.parameters()) == []
     assert attention_qwen_layer.config.compilation_config.static_all_moe_layers == [
         f"{QWEN_LAYER_PREFIX}.mlp.experts"

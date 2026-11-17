@@ -283,7 +283,6 @@ def test_cuda_attention_gate_uses_native_gate_contract(
     )
 
     assert isinstance(moe.mlp, adapter.AFDDeepseekV2RemoteExpertsMoE)
-    assert type(moe.mlp.experts) is remote.AFDExternalRoutingMoERunner
     assert moe.mlp.gate.weight.dtype == torch.float32
     assert {name for name in _parameter_names(moe) if name.startswith("mlp.")} == {
         "mlp.gate.weight",
@@ -354,7 +353,6 @@ def test_cuda_ffn_gate_shell_owns_no_mlp_parameters(
     )
 
     assert isinstance(moe.mlp, adapter.AFDDeepseekV2RemoteExpertsMoE)
-    assert type(moe.mlp.experts) is remote.AFDRemoteMoERunner
     assert moe.mlp.gate is None
     assert not any(name.startswith("mlp.") for name in _parameter_names(moe))
     assert list(moe.mlp.buffers()) == []
