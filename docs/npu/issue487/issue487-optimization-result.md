@@ -237,7 +237,6 @@ harness 跑完 baseline 与 optimized 两臂，8 个点全部 `correctness=True`
 项，1.87× → 1.31×**，剩下那 0.31 的比值来自“同样的 24 MiB payload 必须过链路”，
 属于带宽/字节量，而不是 store 完成等待，因此不能再靠合并事务继续压。
 
-
 ### 3.4 优化前后性能总表（单机 / 跨机）
 
 把算子级与 serving 级的全部实测放在一张表里，**单机（同机）与跨机两列并排**，
@@ -245,7 +244,7 @@ harness 跑完 baseline 与 optimized 两臂，8 个点全部 `correctness=True`
 2026-11-02 22:04）；† 行是 2026-11-03 在 103 上按同一协议补测的最终交付构建（§10）。
 跨机口径来自 S=101 / R=103（§1）。所有点 `correctness=True`。
 
-**算子级（fan-in 1，除非注明；µs，3 轮 event 均值）**
+#### 算子级（fan-in 1，除非注明；µs，3 轮 event 均值）
 
 | 场景 | 基线 单机 | 优化 单机 | 单机变化 | 基线 跨机 | 优化 跨机 | 跨机变化 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -278,7 +277,7 @@ harness 跑完 baseline 与 optimized 两臂，8 个点全部 `correctness=True`
   （§10.4）。跨机 fan-in 8 在 11-02 仍是 −2.6%，所以这是同机拓扑特有的回归，不是批量化
   收益消失。
 
-**serving 级（单机 `afd_dp4tp2`，冻结 1536 请求、RPS=2、MBT 8192）**
+#### serving 级（单机 `afd_dp4tp2`，冻结 1536 请求、RPS=2、MBT 8192）
 
 | 指标 | 基线 单机 | 优化 单机 | 单机变化 | 跨机 |
 | --- | ---: | ---: | ---: | --- |
@@ -405,7 +404,6 @@ harness 的 −28%，量级仍在 −20% 以上。
 5. **同机 fan-in 8**：**已补测且发现回归（§10.4）**：+4.4%~+5.6%（三次成对），与跨机的
    −2.6% 方向相反；P2 仍未解决。
 
-
 ## 7. 后续建议
 
 1. **serving 集成**：`build/variants/final_comm/` 是 CANN 9.1（harness 侧）vendor，
@@ -441,7 +439,7 @@ harness 的 −28%，量级仍在 −20% 以上。
 
 随后用冻结负载（1536 请求、RPS=2、chunk 8192）压测，**26 秒后服务自己崩了**：
 
-```
+```text
 (EngineCore_DP0..DP3) RuntimeError: Executor failed.        # 12:28:10 UTC / 20:28:10 CST
 curl /health -> 000（API 端口消失）
 ```

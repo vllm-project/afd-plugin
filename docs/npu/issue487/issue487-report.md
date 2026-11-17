@@ -104,6 +104,7 @@ CS 的 AIV × fan-in 矩阵（本机实测 / µs；括号内为 issue 值）：
 | 48 | 跨机 | 212.3 (212.8) | 213.7 (214.5) | 339.5 (339.6) | 667.7 (684.0) |
 
 同机点与 issue 的偏差在 -0.6%~+4.2%，跨机 fan1/2 的偏差约 +4%。两个关键趋势已经复现：
+
 - AIV=4 时跨机 fan-in 1→2 基本平坦（1280→1282），说明每个 sender 的完成延迟是独立的，
   增加 sender 并不改变单 sender 的串行 copy 链；
 - AIV 48 时同机 fan-in 4→8 从 338→679 µs，源端共享资源效应出现，与 issue 一致。
@@ -116,6 +117,7 @@ DS 的 fan-in 曲线按 issue 约定取 rank0，CS 取活跃 sender 均值，避
 
 已知 issue 基线：CS 4→48 AIV 跨机 1228.9→212.8 µs；DS 6127.3→628.2 µs。
 这说明 4 AIV 时跨机增量主要来自“每 copy 完成等待”的串行链，而不是链路带宽：
+
 - CS 4 AIV：每 AIV ~48 次 copy，跨机单次约 19-27 µs；48 AIV 时每 AIV 只有 ~4 次 copy，
   同样的 24 MiB 可在 ~213 µs 内完成，吞吐提升近 6×。
 - DS 4 AIV：每核 1536 次 payload + 384 次 index 写；issue 的 detail probe 估计
@@ -395,15 +397,15 @@ GMM 叠加的 vendor 用“kernel 替换”构造：把 `ds_index` 的
   启动。跨机 DR、aiv48、fan1 实测：baseline 209.5 µs，token-major 303.1 µs
   （**慢 44.7%**）。原因是 48 AIV 下每个 AIV 只分到 64 个 slot，token-major 的逆表
   构造没有去重收益，反而增加 head/next 开销。因此：
-  - DR token-major 只适合 4/8 AIV 的算子预算（4 AIV 时 1592.5 → 1452.4 µs，
+    - DR token-major 只适合 4/8 AIV 的算子预算（4 AIV 时 1592.5 → 1452.4 µs，
     8 AIV 时也有收益）；serving 默认 48 AIV 下**不应使用 token-major recv**。
-  - serving 的安全优化 vendor 应为 **DS index only + baseline recv + GMM**；
+    - serving 的安全优化 vendor 应为 **DS index only + baseline recv + GMM**；
     `stacked_gmm`（含 token-major recv）不适合直接用于默认 48 AIV 的 serving。
-  - 已构造并验证 `build/variants/ds_index_gmm/`（baseline vendor + ds_index 的 send
+    - 已构造并验证 `build/variants/ds_index_gmm/`（baseline vendor + ds_index 的 send
     kernel 替换）：跨机 GMM 22/44、aiv4、fan1 下 DS **6237.0 µs**（baseline 6827.3，
     −8.6%），DR 2707.6 µs（baseline 2725.6，基本不变）。这个 vendor 用作 serving 的
     优化版本，避免 token-major 在 48 AIV 的回归。
-  - **DS index 也有 AIV 依赖**：跨机、无 GMM、fan1 下 aiv48 baseline 642.1 µs，
+    - **DS index 也有 AIV 依赖**：跨机、无 GMM、fan1 下 aiv48 baseline 642.1 µs，
     ds_index 640.2 µs（基本不变）；aiv4 时才是 6297.4 → 5719.3（−9.2%）。serving 的
     FFN send 默认 `ffn_combine_aiv_num=24`，DS index 的实际收益可能介于两者之间，
     需要 serving 实测；不要直接套用 aiv4 的 −8.6%。

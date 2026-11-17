@@ -59,13 +59,14 @@ def placement(mode: str, location: str, sender_devices, target_devices):
 
 
 def make_cases(args):
-    cases = []
+    cases: list[dict] = []
     for mode, location, aiv, fan_in, gmm in itertools.product(
         args.modes, args.placements, args.aivs, args.fan_ins, args.gmm
     ):
         if location == "cross-fixed-receiver" and mode != "dr":
             continue
         ranks = placement(mode, location, args.sender_devices, args.target_devices)
+        socket_port_start = args.npu_port_base + len(cases) * NPU_PORT_STRIDE
         case = {
             "mode": mode,
             "placement": location,
@@ -87,8 +88,7 @@ def make_cases(args):
             # so give every case its own host/NPU socket range; otherwise the
             # next case can fail or hang with Communication_Error_Bind_IP_Port.
             "socket_port_range": (
-                f"{args.npu_port_base + len(cases) * NPU_PORT_STRIDE}-"
-                f"{args.npu_port_base + len(cases) * NPU_PORT_STRIDE + NPU_PORT_STRIDE - 1}"
+                f"{socket_port_start}-{socket_port_start + NPU_PORT_STRIDE - 1}"
             ),
             "group_timeout": args.group_timeout,
         }
@@ -242,7 +242,7 @@ def run_case(args, case, extension: Path, vendor: Path):
 
 
 def summarize(directories):
-    cases = {}
+    cases: dict[str, dict[int, dict]] = {}
     for directory in directories:
         for path in directory.glob("*/rank*.json"):
             report = json.loads(path.read_text())
@@ -403,9 +403,10 @@ def main():
     # Device ordinals are local to a host, so a cross case may reuse the same
     # ordinal numbers on S and R. Every rank of a same-host placement lands on
     # one host, so the ten ordinals there still have to be disjoint.
-    if any(place != "cross" for place in args.placements) and len(
-        set(args.sender_devices + args.target_devices)
-    ) != WORLD_SIZE:
+    if (
+        any(place != "cross" for place in args.placements)
+        and len(set(args.sender_devices + args.target_devices)) != WORLD_SIZE
+    ):
         parser.error("Same-host placements need ten distinct ordinals")
     if not args.aivs or set(args.aivs) - {4, 8, 24, 48}:
         parser.error("--aivs must be drawn from 4,8,24,48")

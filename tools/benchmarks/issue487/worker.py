@@ -165,9 +165,9 @@ class Fixture:
             CS_TRACE_ELEMENTS if self.mode == "cs" else DISPATCH_TRACE_ELEMENTS
         )
         self.trace = torch.zeros(trace_elements, dtype=torch.float16, device="npu")
-        self.graph = None
-        self.graph_outputs = []
-        self.graph_traces = []
+        self.graph: torch.npu.NPUGraph | None = None
+        self.graph_outputs: list[torch.Tensor | tuple[torch.Tensor, ...]] = []
+        self.graph_traces: list[torch.Tensor] = []
         self.graph_calls = (
             CS_GRAPH_CALLS
             if self.mode == "cs"
@@ -339,6 +339,7 @@ class Fixture:
         for _ in range(fan_in):
             with torch.npu.stream(self.stream):
                 if replay:
+                    assert self.graph is not None
                     self.graph.replay()
                     outputs = self.graph_outputs[0]
                 else:
@@ -400,6 +401,7 @@ class Fixture:
                 if not self.sender:
                     self.drain(self.case["fan_in"], replay=True)
             elif self.measured:
+                assert self.graph is not None
                 with torch.npu.stream(self.stream):
                     self.graph.replay()
             torch.npu.synchronize()
@@ -501,6 +503,7 @@ class Background:
 
 
 def timed_replay(fixture: Fixture, background: Background | None):
+    assert fixture.graph is not None
     count = fixture.case["fan_in"] if fixture.mode == "dr" else 1
     events = [
         (torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True))
