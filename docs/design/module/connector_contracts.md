@@ -107,7 +107,7 @@ Unknown fields fail in the selected connector parser.
 | --- | --- |
 | `P2pNcclAFDConnector` | None; the mapping must be empty. |
 | `DeepEPM2NAFDConnector` | `payload_format`, `expert_backend`, `capacity_tokens_per_rank`, `num_lanes`, `bucket_granularity`, `cpu_sync_min_tokens`, `num_sms`, `num_qps`, `expert_num_sms`, `cpu_timeout_s`, `gpu_timeout_s`, and a nested `network` mapping (`gin`, `hybrid`, `rdma_traffic_class`). All are optional; see the [DeepEP M2N guide](../../gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#connector_extra_config) for defaults. |
-| `CAMP2pAFDConnector` | `core_num`, optional `attn_core_num` / `ffn_core_num`, `compute_gate_on_attention`, `quant_mode`, and optional positive `hccl_buffer_size`. Core counts must be positive. Gate placement follows the common `afd.compute_gate_on_attention` field; the connector-local copy is kept for compatibility and does not select the mode. `true` requires DeepSeek-V4 at TP=1 without DBO or ubatching. Any nonzero quantization mode is rejected today. |
+| `CAMP2pAFDConnector` | `core_num`, optional `attn_core_num` / `ffn_core_num`, `compute_gate_on_attention`, `quant_mode`, and optional positive `hccl_buffer_size`. Core counts must be positive. Gate placement follows the common `afd.compute_gate_on_attention` field; the connector-local copy is kept for compatibility and does not select the mode. `true` requires DeepSeek-V4 at TP=1; DBO/ubatching needs exactly two microbatches and Attention DP > 1 on the BF16 transport. Any nonzero quantization mode is rejected today. |
 | `CAMAsyncAFDConnector` | `dynamicQuant`, `ffn_mega_moe`, `attn_ranks_per_dp`, and optional positive `hccl_buffer_size`. Attention microbatching uses native DBO configuration. |
 
 The common `afd_process_group_timeout_s` defaults to 120 seconds and controls
@@ -122,7 +122,7 @@ model-routing selector. CUDA P2P supports both values; DeepEP M2N requires
 backwards compatibility with older configurations and ignored for routing: the
 synchronous NPU runtime selects Attention-side routing from the common field, so
 deployments leave the connector-local copy unset. The supported synchronous
-shape is `true` on both roles for DeepSeek-V4 at TP=1 with no DBO or ubatching.
+shape is `true` on both roles for DeepSeek-V4 at TP=1; native DBO is supported on the BF16 transport with two microbatches and Attention DP > 1.
 CAM async requires the common field to be `true`.
 
 ## Current connector modes

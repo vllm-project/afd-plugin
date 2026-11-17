@@ -97,6 +97,21 @@ class _RecordingConnector:
         return ref_tensor * 0.5
 
 
+@pytest.fixture(autouse=True)
+def _stub_dbo_yield(monkeypatch):
+    """Keep the protocol tests off the real DBO custom op.
+
+    The registered op dispatches through CUDA and rejects a CPU tensor before the
+    DBO check runs, so even a DBO-disabled run must not reach it.
+    """
+
+    monkeypatch.setattr(
+        adapter,
+        "maybe_apply_dbo_yield",
+        lambda hidden_states, *, role: hidden_states,
+    )
+
+
 def _fake_gate_topk(monkeypatch, events: list[tuple], topk_ids, topk_weights):
     """Replace the gate helper with one that records and returns fixed routing.
 
@@ -247,14 +262,17 @@ def test_forward_resolves_the_stage_before_the_dbo_yield(monkeypatch):
 
     events: list[tuple] = []
     connector = _RecordingConnector(events)
-    _install_metadata(monkeypatch, connector, events, ubatch_idx=1)
+    afd_metadata = _install_metadata(monkeypatch, connector, events, ubatch_idx=1)
     forward_context = SimpleNamespace(ubatch_idx=1)
     monkeypatch.setattr(adapter, "get_forward_context", lambda: forward_context)
 
     def fake_yield(hidden_states, *, role):
         events.append(("yield", role))
-        # The peer ubatch runs from here; this forward must not follow its stage.
+        # The peer ubatch runs from here. Both stage sources move: the context the
+        # peer forward sees, and the shared metadata that already carries this
+        # forward's stage -- a receive that re-reads either must fail the test.
         forward_context.ubatch_idx = 0
+        afd_metadata.stage_idx = 0
         return hidden_states
 
     monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", fake_yield)
