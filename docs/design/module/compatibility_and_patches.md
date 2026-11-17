@@ -150,7 +150,8 @@ not the package dependency policy.
 [`gpu_deepseek_v4_dbo.py`](../../../afd_plugin/compat/patches/gpu_deepseek_v4_dbo.py)
 records the pinned source, four workarounds, upstream PRs and removal conditions.
 The CUDA runner scopes input/indexer preparation and reserves workspace before
-profiling; the V4 decoder calls the padding guard. Instance bindings are restored
+profiling; on Attention, each V4 layer uses an AFD subclass of the selected
+attention class that applies the padding guard. Instance bindings are restored
 on exit. Regressions live in
 [`test_gpu_deepseek_v4_dbo.py`](../../../tests/unit/compat/patches/test_gpu_deepseek_v4_dbo.py)
 and [`test_model_runner_v2.py`](../../../tests/unit/v1/worker/test_model_runner_v2.py).

@@ -50,7 +50,8 @@ def test_remote_v4_ffn_sends_token_ids(monkeypatch, stage_idx):
     hidden_states = torch.full((2, 4), 8.0, dtype=torch.float16)
     input_ids = torch.tensor([11, 13], dtype=torch.int32)
 
-    output = proxy(hidden_states, input_ids)
+    # vLLM's decoder layer calls its MoE as ffn(x, input_ids, mega_gate_metadata).
+    output = proxy(hidden_states, input_ids, None)
 
     assert adapter.AFDDeepseekV4ForCausalLM.afd_requires_input_ids
     assert [event[0] for event in events] == ["send", "yield", "recv"]
@@ -144,24 +145,6 @@ def test_remote_v4_ffn_preserves_missing_metadata_error(monkeypatch):
         RuntimeError, match="^RemoteDeepseekV4FFN requires AFD forward metadata$"
     ):
         proxy(torch.ones((2, 4)), torch.tensor([11, 13], dtype=torch.int32))
-
-
-def test_v4_decoder_forward_rejects_ffn_role(monkeypatch):
-    class FakeMissingLayer(nn.Module):
-        pass
-
-    monkeypatch.setattr(adapter.native, "PPMissingLayer", FakeMissingLayer)
-    layer = object.__new__(adapter.AFDDeepseekV4DecoderLayer)
-    nn.Module.__init__(layer)
-    layer.attn = FakeMissingLayer()
-
-    with pytest.raises(RuntimeError, match="decoder forward is Attention-owned"):
-        layer.forward(
-            torch.ones((2, 4)),
-            positions=torch.arange(2),
-            input_ids=None,
-            mega_gate_metadata=None,
-        )
 
 
 def test_v4_ffn_compute_rejects_attention_role_before_input_ids():
