@@ -23,6 +23,18 @@ constexpr uint32_t UB_ALIGN = 32;            // UB aligned to 32 bytes
 constexpr uint32_t BATCH_INFO_VAL_NUM = 5;   // number of batch-related info fields
 constexpr uint32_t IDS_PAGE_SIZE = 1024 * 64;  // routing table cache page size
 constexpr uint32_t IDS_PAGE_ELEMENT_NUM = IDS_PAGE_SIZE / sizeof(int32_t); // elements per cache page
+// Upper bound on the token rows staged per remote store. The cross-host cost of
+// a token payload tracks the number of stores rather than their size, so one
+// store per this many tokens replaces that many completion waits.
+constexpr uint32_t PAYLOAD_STAGE_MAX_ROWS = 8;
+// A stage of one row degenerates to the per-token store path, so only keep the
+// staging buffers when at least two rows fit.
+constexpr uint32_t PAYLOAD_STAGE_MIN_ROWS = 2;
+// The per-row destination set is a bitmask, one bit per MoE rank.
+constexpr uint32_t PAYLOAD_STAGE_MAX_DESTS = 32;
+// Token-offset entries batched per peer write. One write per expert per kernel is
+// the floor here, so a batch that mostly fills makes that floor the cost.
+constexpr uint32_t TOKEN_OFFSET_FLUSH_BATCH = 64;
 
 template<AscendC::HardEvent event>
 __aicore__ inline void SyncFunc() {
@@ -141,10 +153,20 @@ private:
     uint32_t batchSizePerAivStart_{0};
     uint32_t batchSizePerAivEnd_{0};
 
-    // batch 16 entries, then flush to the peer once
-    uint32_t tokenOffsetFlushBatchSize_{0};  // 16
-    LocalTensor<uint16_t> tokenOffsetBatchTensor_;        // 16 * expertNum, holds the 16 entries during batching
+    // batch the token-offset entries of one expert, then flush to the peer once
+    uint32_t tokenOffsetFlushBatchSize_{0};  // TOKEN_OFFSET_FLUSH_BATCH
+    LocalTensor<uint16_t> tokenOffsetBatchTensor_;        // batch size * expertNum, the batched entries
     LocalTensor<uint32_t> tokenOffsetBatchInfoTensor_;   // 2 * expertNum
+
+    // Payload staging: consecutive tokens of one destination are packed in UB and
+    // written with one remote store. Nothing here is allocated when fewer than
+    // PAYLOAD_STAGE_MIN_ROWS rows fit, and the per-token store path is kept then.
+    uint32_t payloadRowElements_{0};   // elements per staged token row
+    uint32_t payloadRowLimit_{0};      // row capacity of the stage; 0 disables staging
+    uint32_t payloadRowCount_{0};      // rows staged for the next flush
+    LocalTensor<ExpandXOutType> payloadStageTensor_;   // payloadRowLimit_ * payloadRowElements_
+    LocalTensor<uint32_t> payloadDestMaskTensor_;      // PAYLOAD_STAGE_MAX_ROWS destination bitmasks
+    LocalTensor<uint32_t> payloadSlotTensor_;          // PAYLOAD_STAGE_MAX_ROWS * moeRankNum_ slots
 
     bool isError_{false};
     // expertId | tokens already written to the target position | tokens sent to that expert
@@ -185,6 +207,88 @@ private:
             {1U, (uint32_t)(sizeof(uint16_t) * pendingOffsetCnt), 0U, 0U, 0U});
         SyncFunc<HardEvent::MTE3_S>();
         tokenOffsetBatchInfoTensor_(2 * expertId) = 0;
+    }
+
+    __aicore__ inline void AllocatePayloadStage(uint64_t &bufOffset)
+    {
+        payloadRowElements_ = DynamicQuant ? hiddenSizeQuant_ : hiddenSize_;
+        uint64_t rowBytes = static_cast<uint64_t>(payloadRowElements_) * sizeof(ExpandXOutType);
+        // One row must be 32B aligned: the stage is sliced by whole rows and each
+        // slice has to be a legal DataCopy source.
+        if (moeRankNum_ > PAYLOAD_STAGE_MAX_DESTS || rowBytes % UB_ALIGN != 0) {
+            return;
+        }
+
+        uint64_t maskBytes = MathCeil(sizeof(uint32_t) * PAYLOAD_STAGE_MAX_ROWS, UB_ALIGN);
+        uint64_t slotBytes =
+            MathCeil(sizeof(uint32_t) * PAYLOAD_STAGE_MAX_ROWS * moeRankNum_, UB_ALIGN);
+        if (totalUbSize_ <= bufOffset + maskBytes + slotBytes) {
+            return;
+        }
+        uint64_t stageBytes = (totalUbSize_ - bufOffset - maskBytes - slotBytes) / rowBytes * rowBytes;
+        uint32_t rows = static_cast<uint32_t>(stageBytes / rowBytes);
+        if (rows < PAYLOAD_STAGE_MIN_ROWS) {
+            return;
+        }
+        payloadRowLimit_ = rows < PAYLOAD_STAGE_MAX_ROWS ? rows : PAYLOAD_STAGE_MAX_ROWS;
+
+        payloadDestMaskTensor_ = ubBuffer_.GetWithOffset<uint32_t>(
+            maskBytes / sizeof(uint32_t), bufOffset);
+        bufOffset += maskBytes;
+        payloadSlotTensor_ = ubBuffer_.GetWithOffset<uint32_t>(
+            slotBytes / sizeof(uint32_t), bufOffset);
+        bufOffset += slotBytes;
+        payloadStageTensor_ = ubBuffer_.GetWithOffset<ExpandXOutType>(
+            payloadRowLimit_ * payloadRowElements_, bufOffset);
+        bufOffset += payloadRowLimit_ * rowBytes;
+    }
+
+    // Record that the staged row is sent to moeRankId at moeTokenSendIdx. The
+    // caller stages one row per token, so a row may carry several destinations.
+    __aicore__ inline void MarkStageRow(uint32_t moeRankId, uint32_t moeTokenSendIdx)
+    {
+        payloadDestMaskTensor_(payloadRowCount_) |= (1U << moeRankId);
+        payloadSlotTensor_(payloadRowCount_ * moeRankNum_ + moeRankId) = moeTokenSendIdx;
+    }
+
+    // Write every staged row to each of its destinations. Rows of one destination
+    // stay in token order and consecutive tokens take consecutive destination
+    // slots, so each run is a single contiguous peer-window store.
+    __aicore__ inline void FlushPayload(uint64_t tokenStoreOffset)
+    {
+        if (payloadRowCount_ == 0) {
+            return;
+        }
+        for (uint32_t moeRankId = 0; moeRankId < moeRankNum_; ++moeRankId) {
+            GM_ADDR dstGM = GetPeerAddrByRankId(attnRankNum_ + moeRankId) + tokenStoreOffset;
+            GlobalTensor<ExpandXOutType> dstTokenGMTensor;
+            dstTokenGMTensor.SetGlobalBuffer((__gm__ ExpandXOutType *)dstGM);
+            uint32_t rowStart = 0;
+            while (rowStart < payloadRowCount_) {
+                if (((payloadDestMaskTensor_(rowStart) >> moeRankId) & 1U) == 0U) {
+                    ++rowStart;
+                    continue;
+                }
+                uint32_t rowEnd = rowStart;
+                while (rowEnd + 1 < payloadRowCount_ &&
+                       ((payloadDestMaskTensor_(rowEnd + 1) >> moeRankId) & 1U) != 0U) {
+                    ++rowEnd;
+                }
+                uint32_t rowNum = rowEnd - rowStart + 1;
+                uint32_t firstSlot = payloadSlotTensor_(rowStart * moeRankNum_ + moeRankId);
+                DataCopy(dstTokenGMTensor[payloadRowElements_ * firstSlot],
+                         payloadStageTensor_[payloadRowElements_ * rowStart],
+                         payloadRowElements_ * rowNum);
+                rowStart = rowEnd + 1;
+            }
+        }
+        // The stage is reused by the next batch, so every store must have landed.
+        SyncFunc<HardEvent::MTE3_S>();
+
+        for (uint32_t row = 0; row < payloadRowCount_; ++row) {
+            payloadDestMaskTensor_(row) = 0;
+        }
+        payloadRowCount_ = 0;
     }
 };
 
@@ -316,14 +420,16 @@ __aicore__ inline void AfdAsyncDispatchSend<TemplateMC2TypeFunc>::Init(
 
     // ----- mandatory buffers allocated above -----
 
-    tokenOffsetFlushBatchSize_ = UB_ALIGN / sizeof(uint16_t);
-    bufSize = MathCeil(sizeof(uint16_t) * tokenOffsetFlushBatchSize_ * expertNum_, UB_ALIGN); // 32 B or 64 B
+    tokenOffsetFlushBatchSize_ = TOKEN_OFFSET_FLUSH_BATCH;
+    bufSize = MathCeil(sizeof(uint16_t) * tokenOffsetFlushBatchSize_ * expertNum_, UB_ALIGN);
     tokenOffsetBatchTensor_ = ubBuffer_.GetWithOffset<uint16_t>(bufSize / sizeof(uint16_t), bufOffset);
     bufOffset += bufSize;
 
     bufSize = MathCeil(sizeof(uint32_t) * expertNum_ * 2, UB_ALIGN); // 32 B or 64 B
     tokenOffsetBatchInfoTensor_ = ubBuffer_.GetWithOffset<uint32_t>(bufSize / sizeof(uint32_t), bufOffset);
     bufOffset += bufSize;
+
+    AllocatePayloadStage(bufOffset);
 
     if (bufOffset > totalUbSize_) {
         isError_ = true;
@@ -351,8 +457,11 @@ __aicore__ inline void AfdAsyncDispatchSend<TemplateMC2TypeFunc>::DispatchSend()
     Duplicate(moeRecvTokenNumTensor_, (uint32_t)0, moeRankNum_);  // tokens this attn sends to each moe card
     // per-card-range prefix sum, counted per moe card; offset of tokens sent to each expert
     Duplicate(expertPrefixOffsetTensor_, (uint32_t)0, expertNum_);
-    Duplicate(tokenOffsetBatchTensor_, (uint16_t)0, tokenOffsetFlushBatchSize_ * expertNum_); // 16 * expertNum
+    Duplicate(tokenOffsetBatchTensor_, (uint16_t)0, tokenOffsetFlushBatchSize_ * expertNum_);
     Duplicate(tokenOffsetBatchInfoTensor_, (uint32_t)0, expertNum_ * 2);
+    if (payloadRowLimit_ != 0) {
+        Duplicate(payloadDestMaskTensor_, (uint32_t)0, PAYLOAD_STAGE_MAX_ROWS);
+    }
     SyncFunc<HardEvent::V_S>();
 
     // accumulate send offsets at expert granularity
@@ -397,14 +506,26 @@ __aicore__ inline void AfdAsyncDispatchSend<TemplateMC2TypeFunc>::DispatchSend()
     for (uint32_t topkId = (topk_ * batchSizePerAivStart_); topkId < (topk_ * batchSizePerAivEnd_); ++topkId) {
         uint32_t tokenId = topkId / topk_;  // corresponding token id
         if (topkId % topk_ == 0) {  // first read of the token
+            // The token needs one staged row; make room before producing it.
+            if (payloadRowLimit_ != 0 && payloadRowCount_ == payloadRowLimit_) {
+                FlushPayload(tokenStoreOffset);
+            }
             // read the token
             if constexpr (DynamicQuant) {
                 DataCopy(xTensor_, xGMTensor_[hiddenSize_ * tokenId], hiddenSize_);
                 SyncFunc<HardEvent::MTE2_V>();
                 SyncFunc<HardEvent::V_MTE2>();
 
-
-                QuantProcess(xTensor_, xOutTensor_);
+                // Quantize straight into the staged row: the row is what each
+                // destination of this token reads, so no copy is needed.
+                LocalTensor<ExpandXOutType> quantTarget = payloadRowLimit_ != 0
+                    ? payloadStageTensor_[payloadRowElements_ * payloadRowCount_]
+                    : xOutTensor_;
+                QuantProcess(xTensor_, quantTarget);
+            } else if (payloadRowLimit_ != 0) {
+                DataCopy(payloadStageTensor_[payloadRowElements_ * payloadRowCount_],
+                    xGMTensor_[hiddenSize_ * tokenId], hiddenSize_);
+                SyncFunc<HardEvent::MTE2_MTE3>();
             } else {
                 DataCopy(xTensor_, xGMTensor_[hiddenSize_ * tokenId], hiddenSize_);
                 SyncFunc<HardEvent::MTE2_S>();
@@ -437,12 +558,15 @@ __aicore__ inline void AfdAsyncDispatchSend<TemplateMC2TypeFunc>::DispatchSend()
 
         // send only if the token has not been sent to this moe
         if (tokenSentFlagTensor_(moeRankId) == 0) {
-            dstTokenGMTensor.SetGlobalBuffer((__gm__ ExpandXOutType*)(dstGM + tokenStoreOffset));
-            if constexpr (DynamicQuant) {
-                DataCopy(dstTokenGMTensor[hiddenSizeQuant_ * moeTokenSendIdx], xOutTensor_, hiddenSizeQuant_);
-                SyncFunc<HardEvent::MTE3_S>();
+            if (payloadRowLimit_ != 0) {
+                MarkStageRow(moeRankId, moeTokenSendIdx);
             } else {
-                DataCopy(dstTokenGMTensor[hiddenSize_ * moeTokenSendIdx], xOutTensor_, hiddenSize_);
+                dstTokenGMTensor.SetGlobalBuffer((__gm__ ExpandXOutType*)(dstGM + tokenStoreOffset));
+                if constexpr (DynamicQuant) {
+                    DataCopy(dstTokenGMTensor[hiddenSizeQuant_ * moeTokenSendIdx], xOutTensor_, hiddenSizeQuant_);
+                } else {
+                    DataCopy(dstTokenGMTensor[hiddenSize_ * moeTokenSendIdx], xOutTensor_, hiddenSize_);
+                }
                 SyncFunc<HardEvent::MTE3_S>();
             }
             tokenSentFlagTensor_(moeRankId) = 1;
@@ -460,8 +584,13 @@ __aicore__ inline void AfdAsyncDispatchSend<TemplateMC2TypeFunc>::DispatchSend()
                     ++moeSendStartOffsetTensor_(moeRankId);
                 }
             }
+            if (payloadRowLimit_ != 0) {
+                ++payloadRowCount_;
+            }
         }
     }
+    FlushPayload(tokenStoreOffset);
+
     for (uint32_t expertId = 0; expertId < expertNum_; ++expertId) {
         FlushExpertTokenOffset(expertId, tokenAddrStoreOffset);
     }
