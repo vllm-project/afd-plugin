@@ -43,6 +43,10 @@ extern "C" __global__ __aicore__ void afd_async_combine_send(
     REGISTER_TILING_DEFAULT(AfdAsyncCombineSendTilingData);
     REGISTER_TILING_FOR_TILINGKEY("TILING_KEY_VAR < 2000", AfdAsyncCombineSendTilingData);
     GET_TILING_DATA_WITH_STRUCT(AfdAsyncCombineSendTilingData, tiling, tilingGM);
+    // The host tiling selects tiling key 100 (BF16) or 101 (FP16). A
+    // range-only REGISTER_TILING_FOR_TILINGKEY leaves key 100 absent from
+    // the kernel binary's funcEntry table, so register both keys explicitly.
+    if (TILING_KEY_IS(100) || TILING_KEY_IS(101)) {
     TPipe pipe;
     TBuf<> buffer;
     pipe.InitBuffer(buffer, COPY_ELEMENTS * sizeof(uint16_t));
@@ -94,5 +98,6 @@ extern "C" __global__ __aicore__ void afd_async_combine_send(
             DataCopy(window[offset], payload, count);
         }
         Fence<HardEvent::MTE3_S>();
+    }
     }
 }

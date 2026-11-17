@@ -30,6 +30,7 @@ MAX_AIV = 48
 POLL_SECONDS = 0.2
 STOP_TIMEOUT_SECONDS = 5
 CONTROL_MESSAGE_BYTES = 4096
+NPU_PORT_STRIDE = 200
 ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -81,6 +82,14 @@ def make_cases(args):
                 ranks[0]["host"]
             ],
             "master_port": args.base_port + len(cases),
+            # HCCL binds a fixed NPU socket port (16666 by default) for each
+            # communicator. Consecutive ten-rank cases reuse the same devices,
+            # so give every case its own host/NPU socket range; otherwise the
+            # next case can fail or hang with Communication_Error_Bind_IP_Port.
+            "socket_port_range": (
+                f"{args.npu_port_base + len(cases) * NPU_PORT_STRIDE}-"
+                f"{args.npu_port_base + len(cases) * NPU_PORT_STRIDE + NPU_PORT_STRIDE - 1}"
+            ),
             "group_timeout": args.group_timeout,
         }
         case["id"] = (
@@ -171,7 +180,13 @@ def run_case(args, case, extension: Path, vendor: Path):
                 HCCL_CONNECT_TIMEOUT="120",
                 HCCL_EXEC_TIMEOUT="120",
                 HCCL_BUFFSIZE="512",
-                BATCH_SIZE_FACTOR="0.0625",
+                # 0.0625 matches the qualification recipe; ISSUE487_BATCH_SIZE_FACTOR
+                # lets a run exercise the native BATCH_SIZE_FACTOR=1.0 capacity.
+                BATCH_SIZE_FACTOR=os.environ.get(
+                    "ISSUE487_BATCH_SIZE_FACTOR", "0.0625"
+                ),
+                HCCL_NPU_SOCKET_PORT_RANGE=case["socket_port_range"],
+                HCCL_HOST_SOCKET_PORT_RANGE=case["socket_port_range"],
                 RANK=str(rank),
                 LOCAL_RANK="0",
                 WORLD_SIZE=str(WORLD_SIZE),
@@ -338,7 +353,9 @@ def main():
     parser.add_argument(
         "--gmm", nargs="+", choices=("off", "on"), default=["off", "on"]
     )
-    parser.add_argument("--gmm-aic", type=int, choices=(20, 22), default=22)
+    # 12 is the production FFN compute quota (12 AIC / 24 AIV); 20/22 are the
+    # oversubscription probes used by the issue #487 reproduction.
+    parser.add_argument("--gmm-aic", type=int, choices=(12, 20, 22), default=22)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument(
         "--samples", type=int, default=16, help="DR ready groups per round"
@@ -354,6 +371,12 @@ def main():
     )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--base-port", type=int, default=29500)
+    parser.add_argument(
+        "--npu-port-base",
+        type=int,
+        default=30000,
+        help="First port of the per-case HCCL host/NPU socket range",
+    )
     parser.add_argument("--control-port", type=int, default=29499)
     parser.add_argument("--group-timeout", type=int, default=300)
     parser.add_argument("--case-timeout", type=int, default=1800)
@@ -370,14 +393,22 @@ def main():
     if (
         len(args.sender_devices) != SENDERS
         or len(args.target_devices) != TARGETS
-        or len(set(args.sender_devices + args.target_devices)) != WORLD_SIZE
+        or len(set(args.sender_devices)) != SENDERS
+        or len(set(args.target_devices)) != TARGETS
         or min(args.sender_devices + args.target_devices) < 0
     ):
         parser.error(
-            "Need eight sender and two target ordinals, all distinct/nonnegative"
+            "Need eight sender and two target ordinals, nonnegative and unique per host"
         )
-    if not args.aivs or set(args.aivs) - {4, 8, 48}:
-        parser.error("--aivs must be drawn from 4,8,48")
+    # Device ordinals are local to a host, so a cross case may reuse the same
+    # ordinal numbers on S and R. Every rank of a same-host placement lands on
+    # one host, so the ten ordinals there still have to be disjoint.
+    if any(place != "cross" for place in args.placements) and len(
+        set(args.sender_devices + args.target_devices)
+    ) != WORLD_SIZE:
+        parser.error("Same-host placements need ten distinct ordinals")
+    if not args.aivs or set(args.aivs) - {4, 8, 24, 48}:
+        parser.error("--aivs must be drawn from 4,8,24,48")
     if not args.fan_ins or set(args.fan_ins) - {1, 2, 4, 8}:
         parser.error("--fan-ins must be drawn from 1,2,4,8")
     if min(args.rounds, args.samples, args.group_timeout, args.case_timeout) < 1:
@@ -385,6 +416,11 @@ def main():
     cases = make_cases(args)
     if not cases or args.base_port < 1024 or args.base_port + len(cases) > 65536:
         parser.error("Empty matrix or invalid rendezvous port range")
+    if (
+        args.npu_port_base < 1024
+        or args.npu_port_base + len(cases) * NPU_PORT_STRIDE > 65536
+    ):
+        parser.error("Invalid per-case HCCL host/NPU socket port range")
     if not 1024 <= args.control_port <= 65535 or (
         args.base_port <= args.control_port < args.base_port + len(cases)
     ):
