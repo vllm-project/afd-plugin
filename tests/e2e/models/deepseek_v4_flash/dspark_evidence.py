@@ -56,6 +56,14 @@ def snapshot(runner) -> dict:
             for gid in runner.speculator.draft_kv_cache_group_ids
         ]
     return {
+        "pid": os.getpid(),
+        "native_maps": sorted(
+            {
+                line.split()[-1]
+                for line in Path("/proc/self/maps").read_text().splitlines()
+                if "afd_plugin" in line and ".so" in line
+            }
+        ),
         "rank": runner.connector.world_rank,
         "role": "ffn" if is_ffn else "attention",
         "draft_class": type(draft).__name__,
