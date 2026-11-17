@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Final
 
 import torch
 
-from afd_plugin.connectors.gpu.async_gpu_protocol import nvshmem_pe_mapping
+from afd_plugin.connectors.gpu.async_nvshmem.protocol import nvshmem_pe_mapping
 
 if TYPE_CHECKING:
     from torch.distributed.distributed_c10d import ProcessGroup, Store

@@ -97,7 +97,7 @@ AFDConnectorFactory.register_connector(
 )
 AFDConnectorFactory.register_connector(
     "GpuAsyncAFDConnector",
-    "afd_plugin.connectors.gpu.async_gpu",
+    "afd_plugin.connectors.gpu.async_nvshmem.connector",
     "GpuAsyncAFDConnector",
 )
 AFDConnectorFactory.register_connector(

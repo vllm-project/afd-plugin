@@ -19,7 +19,7 @@ from vllm.distributed.parallel_state import graph_capture
 
 from afd_plugin.compat.profiler import step_afd_gpu_profiler
 from afd_plugin.connectors import AFDA2FTransferPayload, AFDF2ATransferPayload
-from afd_plugin.connectors.gpu.async_gpu import (
+from afd_plugin.connectors.gpu.async_nvshmem.connector import (
     ConnectorShutdown,
     GpuAsyncAFDConnector,
     GpuAsyncTransferState,

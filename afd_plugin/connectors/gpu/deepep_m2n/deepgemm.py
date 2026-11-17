@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""DeepGEMM grouped GEMMs the M2N experts use, from the ``deep_gemm`` package.
+"""DeepGEMM grouped GEMMs the M2N experts use.
 
-Uses the installed upstream DeepGEMM (https://github.com/deepseek-ai/DeepGEMM),
-installed separately: its build needs torch, CUDA and git submodules. Its
-kernels are JIT-compiled at runtime. Only the ``deepgemm`` expert backend
-needs it.
+Uses upstream DeepGEMM (https://github.com/deepseek-ai/DeepGEMM), either installed
+separately or bundled with vLLM. A separate build needs torch, CUDA and git
+submodules. Kernels are JIT-compiled at runtime. Only the ``deepgemm`` expert
+backend needs it.
 
 Only the psum ("prefix-sum contiguous") layout is used: DeepEP's expanded
 dispatch already groups received rows per local expert, padded to the
@@ -15,6 +15,7 @@ DeepGEMM M alignment, and its per-expert end offsets are the group boundaries.
 from __future__ import annotations
 
 import functools
+import importlib.util
 from types import ModuleType
 
 import torch
@@ -24,7 +25,10 @@ import torch
 def load_deepgemm() -> ModuleType:
     """DeepGEMM's native module; importing ``deep_gemm`` initializes its JIT."""
     # Deferred: the fused_experts backend runs without DeepGEMM installed.
-    import deep_gemm
+    if importlib.util.find_spec("deep_gemm") is None:
+        from vllm.third_party import deep_gemm
+    else:
+        import deep_gemm
 
     return deep_gemm._C
 

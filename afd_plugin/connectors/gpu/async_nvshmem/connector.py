@@ -25,10 +25,11 @@ from typing import TYPE_CHECKING, Any, Final
 import torch
 from torch import Tensor
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 from afd_plugin.config import AFDConfig
 from afd_plugin.connectors.base import AFDConnectorBase, FFNExecutionSession
-from afd_plugin.connectors.gpu.async_gpu_protocol import (
+from afd_plugin.connectors.gpu.async_nvshmem.protocol import (
     FLAG_REPLY_READY,
     FLAG_SHUTDOWN_BIT,
     H_ROUTED_TOKENS,
@@ -39,7 +40,7 @@ from afd_plugin.connectors.gpu.async_gpu_protocol import (
     shared_token_slice,
     stage_rings,
 )
-from afd_plugin.connectors.gpu.symm_window import (
+from afd_plugin.connectors.gpu.async_nvshmem.symm_window import (
     SymmWindow,
     encode_header,
     fill_header_prefix,
@@ -413,7 +414,10 @@ class GpuAsyncAFDConnector(AFDConnectorBase):
             group_name=AFD_ASYNC_GPU_GROUP_NAME,
             timeout=timedelta(seconds=self.afd_config.afd_process_group_timeout_s),
         )
-        device = torch.device("cuda", self.local_rank)
+        device = torch.device(
+            "cuda",
+            current_platform.logical_device_id_to_visible_device_id(self.local_rank),
+        )
         # The dispatch sequence number lives on the device so that a CUDA graph
         # can advance it. An FFN rank recognizes an arrival by its flag holding
         # something other than the value it last consumed, so the number has to

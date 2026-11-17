@@ -39,7 +39,14 @@ def main() -> None:
     parser.add_argument("--interleave-roles", action="store_true")
     parser.add_argument(
         "--mode",
-        choices=("eager", "graph", "precision", "cross_rank_precision", "independent"),
+        choices=(
+            "eager",
+            "graph",
+            "precision",
+            "cross_rank_precision",
+            "independent",
+            "varying",
+        ),
         default="graph",
     )
     args = parser.parse_args()

@@ -4,10 +4,10 @@ kind: research
 status: draft
 primary_code_paths:
   - "csrc/gpu/"
-  - "afd_plugin/connectors/gpu/async_gpu.py"
-  - "afd_plugin/connectors/gpu/async_gpu_protocol.py"
-  - "afd_plugin/connectors/gpu/nvshmem_rt.py"
-  - "afd_plugin/connectors/gpu/symm_window.py"
+  - "afd_plugin/connectors/gpu/async_nvshmem/connector.py"
+  - "afd_plugin/connectors/gpu/async_nvshmem/protocol.py"
+  - "afd_plugin/connectors/gpu/async_nvshmem/nvshmem_rt.py"
+  - "afd_plugin/connectors/gpu/async_nvshmem/symm_window.py"
   - "afd_plugin/v1/worker/async_ffn_model_runner.py"
 depends_on:
   - "module/connector_contracts.md"

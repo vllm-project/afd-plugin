@@ -18,7 +18,7 @@ single spec sizes both directions. Shared-expert tokens are a contiguous range
 of the batch, so the slot carries only their count -- the range is implied by
 which FFN rank the slot belongs to.
 
-Every slot is written at capacity: the payload carries the whole batch
+The payload carries the whole batch
 (``num_tokens`` rows) and the ``expand_idx``/``weights`` arrays carry every
 partial, with ``segment_start``/``routed_tokens`` in the header telling a
 destination which run of partials is its own. Sizing the writes by the routing
@@ -26,7 +26,10 @@ instead would save a fraction of the bytes and cost a device-to-host readback
 per layer to learn the sizes, which measured far more than the bytes are worth:
 with ``topk`` slots spread over ``ffn_size`` destinations a token misses a given
 destination only ``(1 - 1/ffn_size) ** topk`` of the time, so at 2A2F and
-``topk=6`` the capacity payload is about 1.6% larger than the exact one.
+``topk=6`` the whole-batch payload is about 1.6% larger than the exact one.
+This refers to the actual batch, not the window's maximum token capacity:
+remote sends transfer only the populated prefix of each fixed-offset field.
+Tensor shapes provide these lengths without reading routing counts on the host.
 
 ``expand_idx`` and ``weights`` are 4 bytes a row against the payload's
 ``hidden_size`` elements, so shipping them whole to every peer costs well under
@@ -40,8 +43,9 @@ Sizing it like ``routed_x`` reserved a second whole-batch payload per slot that
 nothing could ever fill.
 
 Mapped peers receive direct writes followed by a 64-bit signal. Remote peers
-receive one contiguous slot via NVSHMEM put-with-signal from a symmetric
-outbox, after local dtype conversion. The CUDA kernel reads the dispatch
+receive populated field prefixes from a symmetric outbox, after local dtype
+conversion. A device fence orders payload puts before the header's
+put-with-signal. The CUDA kernel reads the dispatch
 counter on every graph replay and completes RMA before the outbox is reused.
 NVSHMEM wait/test supplies the corresponding receive visibility guarantee.
 
@@ -61,12 +65,14 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
-from afd_plugin.connectors.gpu import cuda_rt, nvshmem_rt
-from afd_plugin.connectors.gpu.async_gpu_protocol import (
+from afd_plugin.connectors.gpu import cuda_rt
+from afd_plugin.connectors.gpu.async_nvshmem import nvshmem_rt
+from afd_plugin.connectors.gpu.async_nvshmem.protocol import (
     FLAG_EMPTY,
     HEADER_FIXED_WORDS,
     HEADER_MAGIC,
     HEADER_VERSION,
+    HEADER_WORD_BYTES,
     SIGNAL_WORD_BYTES,
     SlotHeader,
     SlotLayout,
@@ -445,7 +451,7 @@ class SymmWindow:
         ``routed_rows``/``shared_rows`` are row indices into ``routed_x`` /
         ``shared_x``: the gather then lands directly in the peer's window.
         Mapped peers receive the gather directly; remote peers receive a
-        contiguous copy of the local symmetric outbox after all fields finish.
+        copy of each populated field after all local packing finishes.
 
         ``flag_value`` is what the flag is stamped with. A dispatch stamps a
         rising sequence number, which is how the receiver's poll notices it; a
@@ -559,7 +565,22 @@ class SymmWindow:
             bridge.put_signal(
                 self._base + byte_off,
                 self._peer_base[peer] + byte_off,
-                layout.slot_bytes,
+                (
+                    (layout.header_off, layout.header_words * HEADER_WORD_BYTES),
+                    (layout.expand_idx_off, partial_count * torch.int32.itemsize),
+                    (
+                        layout.weights_off,
+                        _row_count(weights, None) * torch.float32.itemsize,
+                    ),
+                    (
+                        layout.routed_x_off,
+                        routed_count * layout.hidden_size * layout.payload_itemsize,
+                    ),
+                    (
+                        layout.shared_x_off,
+                        shared_count * layout.hidden_size * layout.payload_itemsize,
+                    ),
+                ),
                 self._base + flag_idx * SIGNAL_WORD_BYTES,
                 flag_value.data_ptr() if isinstance(flag_value, torch.Tensor) else 0,
                 0 if isinstance(flag_value, torch.Tensor) else flag_value,

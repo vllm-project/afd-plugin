@@ -187,7 +187,7 @@ def async_v4_proxy():
 
 
 def test_async_v4_hash_gate_sends_token_selected_experts(monkeypatch, async_v4_proxy):
-    from afd_plugin.connectors.gpu import async_moe_op  # noqa: F401
+    from afd_plugin.connectors.gpu.async_nvshmem import async_moe_op  # noqa: F401
     from afd_plugin.model_executor import models
 
     events: list[tuple] = []

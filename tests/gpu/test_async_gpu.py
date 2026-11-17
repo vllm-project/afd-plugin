@@ -37,7 +37,7 @@ def _connector(
     role, device_index, role_rank, port, attention_ranks, ffn_ranks, host="127.0.0.1"
 ):
     from afd_plugin.config import AFDConfig
-    from afd_plugin.connectors.gpu.async_gpu import GpuAsyncAFDConnector
+    from afd_plugin.connectors.gpu.async_nvshmem.connector import GpuAsyncAFDConnector
 
     afd = AFDConfig(
         connector="GpuAsyncAFDConnector",
@@ -146,6 +146,21 @@ def _run_attention(connector, device, mode, replays=GRAPH_REPLAYS):
     for stream in streams:
         stream.synchronize()
     _assert_outputs(outputs, inputs, mode)
+    if mode == "varying":
+        # Reuse each slot after a larger batch, then grow it again. Receivers
+        # must observe only the current batch's routed and shared prefixes.
+        for iteration, num_tokens in enumerate((1, NUM_TOKENS, NUM_TOKENS // 2, 1)):
+            inputs = [
+                tuple(
+                    tensor[:num_tokens] for tensor in _inputs(stage, iteration, device)
+                )
+                for stage in range(NUM_STAGES)
+            ]
+            outputs = _roundtrip(connector, inputs, streams)
+            for stream in streams:
+                stream.synchronize()
+            _assert_outputs(outputs, inputs, mode)
+        return
     if mode in ("eager", "precision", "cross_rank_precision"):
         return
 
@@ -168,7 +183,7 @@ def _run_attention(connector, device, mode, replays=GRAPH_REPLAYS):
 
 
 def _run_ffn(connector, role_rank, ffn_ranks, mode):
-    from afd_plugin.connectors.gpu.async_gpu import ConnectorShutdown
+    from afd_plugin.connectors.gpu.async_nvshmem.connector import ConnectorShutdown
     from afd_plugin.connectors.metadata import AFDF2ATransferPayload
 
     session = connector.ffn_session()
@@ -227,7 +242,18 @@ def _rank(
     connector = None
     try:
         os.environ.setdefault("NVSHMEM_REMOTE_TRANSPORT", "none")
-        torch.cuda.set_device(rank)
+        device_index = rank
+        if mode == "mapped_graph":
+            from vllm.platforms import current_platform
+            from vllm.platforms.interface import set_assigned_physical_gpu_ids
+
+            assigned_ids = [
+                current_platform.visible_device_id_to_physical_device_id(index)
+                for index in reversed(range(attention_ranks + ffn_ranks))
+            ]
+            set_assigned_physical_gpu_ids(assigned_ids)
+            device_index = current_platform.logical_device_id_to_visible_device_id(rank)
+        torch.cuda.set_device(device_index)
         dist.init_process_group(
             "gloo",
             init_method=f"file://{default_stores[rank]}",
@@ -253,7 +279,9 @@ def _rank(
             attention_mode = (
                 "eager" if mode == "independent" and role_rank == 0 else mode
             )
-            _run_attention(connector, torch.device("cuda", rank), attention_mode)
+            _run_attention(
+                connector, torch.device("cuda", device_index), attention_mode
+            )
             if role_rank == 0:
                 first_done.set()
         else:
@@ -279,6 +307,8 @@ def _rank(
     [
         ("eager", 1, 1),
         ("graph", 1, 1),
+        ("mapped_graph", 1, 1),
+        ("varying", 1, 1),
         ("precision", 1, 1),
         ("cross_rank_precision", 1, 2),
         ("independent", 2, 2),

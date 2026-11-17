@@ -694,7 +694,7 @@ def test_m2n_moe_tp2_rank_dispatches_its_slice_and_gathers_shared_sum(
 def test_async_gpu_moe_sends_scaled_routes_without_ascend(
     monkeypatch, dtype, shared_experts, weight
 ):
-    from afd_plugin.connectors.gpu import async_moe_op  # noqa: F401
+    from afd_plugin.connectors.gpu.async_nvshmem import async_moe_op  # noqa: F401
     from afd_plugin.model_executor import models
 
     events: list[tuple] = []

@@ -43,7 +43,7 @@ related_issues:
   - "#105"
   - "#107"
   - "#129"
-last_reviewed: 2026-11-14
+last_reviewed: 2026-11-17
 ---
 
 # Connector contracts
@@ -440,8 +440,10 @@ receives rows grouped by its experts, and combine applies the partial weights.
 There is no per-layer DP control-plane rendezvous. Native MRV2 child contexts own
 the stage index; each stage has separate ring slots and mutable header buffers.
 CUDA driver and NVSHMEM handles belong to the connector's runtime instance.
-Protocol v5 uses uint64 signals. Unmapped peers receive complete slots from
-independent symmetric outboxes through an optional CUDA/NVSHMEM bridge; its
+Protocol v5 uses uint64 signals. Unmapped peers receive populated field prefixes
+at fixed slot offsets from independent symmetric outboxes through an optional
+CUDA/NVSHMEM bridge. A device fence orders payload puts before the header's
+put-with-signal; its
 publish kernel reads the dispatch counter on every graph replay. NVSHMEM
 wait/test orders receive visibility, and put/quiet completes before source reuse.
 
@@ -465,3 +467,5 @@ for the exact runtime and limits. DeepSeek V3/V4, quantization and Attention TP2
 remain unqualified; the V4 recipe is still a candidate. Two-node device oracles and a
 [2A2F Slurm recipe](../../../recipe/gpu/GpuAsyncAFDConnector/deepseek_v2_lite/2node_2a2f_async.slurm)
 cover the remote transport entry point.
+The [prefill imbalance benchmark](../async_gpu_prefill_benchmark.md) compares
+both synchronous GPU connectors on identical cross-node workloads.

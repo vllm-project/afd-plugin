@@ -5,10 +5,12 @@ AFD connector implementations are grouped by backend:
 - `gpu/`: GPU-only connector implementations.
     - `P2pNcclAFDConnector` is implemented by `afd_plugin.connectors.gpu.p2p`.
     - `GpuAsyncAFDConnector` is implemented by
-      `afd_plugin.connectors.gpu.async_gpu`: Attention-side routing and
+      `afd_plugin.connectors.gpu.async_nvshmem.connector`: Attention-side routing and
       connector-driven local FFN work. See its
       [single-node and cross-node validation](../../docs/design/async_gpu_cross_node_research.md)
       for the validated H20/DeepSeek-V2-Lite-Chat scope.
+      The [prefill imbalance benchmark](../../docs/design/async_gpu_prefill_benchmark.md)
+      compares latency and throughput with both synchronous GPU connectors.
     - `DeepEPM2NAFDConnector` is implemented by the
       `afd_plugin.connectors.gpu.deepep_m2n` package:
         - `connector.py`: the connector, its `connector_extra_config` schema,
@@ -19,7 +21,7 @@ AFD connector implementations are grouped by backend:
         - `experts.py`: FFN expert execution with the `deepgemm` or
           `fused_experts` backend.
         - `deepgemm.py`: the DeepGEMM grouped GEMMs, imported from the
-          installed `deep_gemm` package.
+          installed `deep_gemm` package or vLLM's bundled upstream copy.
         - `fp8_quant.py`: the fused SiLU, top-k weight and FP8 block-128
           requantization step between the two FP8 expert GEMMs.
 - `npu/`: NPU-only connector implementations. `CAMP2pAFDConnector` is implemented

@@ -12,12 +12,12 @@ pytest.importorskip("vllm")
 import torch  # noqa: E402
 
 from afd_plugin.config import parse_afd_config  # noqa: E402
-from afd_plugin.connectors.gpu.async_gpu import (  # noqa: E402
+from afd_plugin.connectors.gpu.async_nvshmem.connector import (  # noqa: E402
     ConnectorShutdown,
     GpuAsyncAFDConnector,
     plan_dispatch,
 )
-from afd_plugin.connectors.gpu.async_gpu_protocol import (  # noqa: E402
+from afd_plugin.connectors.gpu.async_nvshmem.protocol import (  # noqa: E402
     FLAG_REPLY_READY,
     FLAG_SHUTDOWN_BIT,
     SlotHeader,

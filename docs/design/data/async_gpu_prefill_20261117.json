@@ -1,0 +1,170 @@
+{
+  "requests": 34332,
+  "errors": 0,
+  "grid_runs": 108,
+  "pair_runs": 36,
+  "five_minute_runs": 3,
+  "matched_grid_plans": 36,
+  "source_sha256": {
+    "tools/benchmarks/prefill_skew.py": "88a7d0a63b744abafc5670f9b3639277acf8a1a3087f68ee8fee6cdbcefa4de0",
+    "tools/benchmarks/run_prefill_skew_slurm.py": "c5188b481ac7d00b79acf6878c2efeb0f59de6ff3b2abb73fde519baed529c33",
+    "csrc/gpu/async_transport.cu": "a30929ee2ea5bfdd6e22f9339b88714be01081dd09e80cdd9160b7667fc4cef3",
+    "afd_plugin/connectors/gpu/async_nvshmem/connector.py": "7b135baf8fcf7d269f45f96e3f164045d9c345f51d39dee3cfd0e69156181deb",
+    "afd_plugin/connectors/gpu/async_nvshmem/symm_window.py": "0b3502a88446190d4df93cb7c38bea115ae718c3b5ab8897a283a398732a7fe4",
+    "afd_plugin/model_executor/models/gpu/async_experts.py": "4bc252bdcf8476a0c6bd0137472ec994325195095cc44e754b65edbd80345caf",
+    "afd_plugin/_C_gpu_async.cpython-312-x86_64-linux-gnu.so": "091eaa019e623e99d74612bbe264a46e63f52767a48b48f8316fe34d1a1c099e"
+  },
+  "plan": {
+    "duration_s": 60,
+    "pairs": 10,
+    "base_seed": 20261117,
+    "rounds": [
+      {
+        "arms": [
+          "async",
+          "m2n",
+          "p2p"
+        ],
+        "profiles": [
+          "balanced",
+          "mixed",
+          "token_balanced",
+          "skewed"
+        ],
+        "rates": [
+          2,
+          4,
+          8
+        ]
+      },
+      {
+        "arms": [
+          "p2p",
+          "async",
+          "m2n"
+        ],
+        "profiles": [
+          "skewed",
+          "token_balanced",
+          "mixed",
+          "balanced"
+        ],
+        "rates": [
+          8,
+          4,
+          2
+        ]
+      },
+      {
+        "arms": [
+          "m2n",
+          "p2p",
+          "async"
+        ],
+        "profiles": [
+          "mixed",
+          "balanced",
+          "skewed",
+          "token_balanced"
+        ],
+        "rates": [
+          4,
+          2,
+          8
+        ]
+      }
+    ],
+    "comparison": "Three connectors, fixed model/token/scheduling controls; fresh servers per arm/round"
+  },
+  "profile": {
+    "before": {
+      "all": {
+        "instances": 3120,
+        "mean_ms": 1.0682407448717948,
+        "median_ms": 1.065954,
+        "total_ms": 3332.911124
+      },
+      "short_alone": {
+        "instances": 520,
+        "mean_ms": 1.0707404019230768,
+        "median_ms": 1.065282,
+        "total_ms": 556.785009
+      }
+    },
+    "after": {
+      "all": {
+        "instances": 3120,
+        "mean_ms": 0.8214488173076923,
+        "median_ms": 1.14384,
+        "total_ms": 2562.92031
+      },
+      "short_alone": {
+        "instances": 520,
+        "mean_ms": 0.16856014615384615,
+        "median_ms": 0.16736,
+        "total_ms": 87.651276
+      }
+    }
+  },
+  "runtime": {
+    "torch": "2.13.0",
+    "vllm": "0.32.0",
+    "nvidia-nccl-cu13": "2.30.7",
+    "nvidia-nvshmem-cu13": "3.4.5",
+    "afdep-comm": "1.2.0",
+    "vllm_target_sha": "5df63a7203cdb9328d824a27b682e77c7b9928be",
+    "torch_build": "2.13.0+cu130",
+    "afdep_commit": "ef2ac0688a5a9da7ab97fc1c2548a2cbab0f79e7"
+  },
+  "numerical_validation": {
+    "reference": "Fresh native DP2/EP2, same benchmark config and NCCL 2.30.7; job 15101 on 04/06",
+    "threshold": {
+      "max_logprob_delta": 0.5,
+      "confident_argmax_margin": 0.5,
+      "allowed_confident_argmax_changes": 0
+    },
+    "fresh_native_vs_archived_native": {
+      "positions": 819,
+      "max_logprob_delta": 0.49559545516967773,
+      "mean_logprob_delta": 0.015489939888066838,
+      "confident_argmax": 753,
+      "confident_argmax_changes": [],
+      "passed": true
+    },
+    "first_m2n_vs_archived_native": {
+      "positions": 819,
+      "max_logprob_delta": 0.5379734039306641,
+      "mean_logprob_delta": 0.013204111734821531,
+      "confident_argmax": 753,
+      "confident_argmax_changes": [],
+      "passed": false
+    },
+    "current_reference_sha256": "481c428b55213839526f500b37a1694c1747a4f75e2a478fa80a763978b45b9f",
+    "connectors": {
+      "async": {
+        "positions": 819,
+        "max_logprob_delta": 0.4573819637298584,
+        "mean_logprob_delta": 0.015700640917426723,
+        "confident_argmax": 754,
+        "confident_argmax_changes": [],
+        "passed": true
+      },
+      "m2n": {
+        "positions": 819,
+        "max_logprob_delta": 0.43315672874450684,
+        "mean_logprob_delta": 0.013567867028927401,
+        "confident_argmax": 754,
+        "confident_argmax_changes": [],
+        "passed": true
+      },
+      "p2p": {
+        "positions": 819,
+        "max_logprob_delta": 0.0,
+        "mean_logprob_delta": 0.0,
+        "confident_argmax": 754,
+        "confident_argmax_changes": [],
+        "passed": true
+      }
+    }
+  }
+}

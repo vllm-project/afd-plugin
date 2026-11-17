@@ -6,7 +6,7 @@ from dataclasses import replace
 
 import pytest
 
-from afd_plugin.connectors.gpu.async_gpu_protocol import (
+from afd_plugin.connectors.gpu.async_nvshmem.protocol import (
     FLAG_SHUTDOWN_BIT,
     GpuAsyncExtraInfo,
     SlotHeader,

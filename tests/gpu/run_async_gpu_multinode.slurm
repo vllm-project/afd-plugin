@@ -36,6 +36,7 @@ run_oracle graph 1 6282
 run_oracle precision 1 6283
 run_oracle cross_rank_precision 2 6284
 run_oracle independent 2 6285
+run_oracle varying 2 6287
 # Hybrid placement: A0/F0 share node 0; A1/F1 share node 1.
 srun --nodes=2 --ntasks=4 --ntasks-per-node=2 --distribution=block:block \
     --gres=gpu:2 --gpu-bind=none --kill-on-bad-exit=1 --wait=15 \

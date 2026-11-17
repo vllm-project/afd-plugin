@@ -8,7 +8,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
-pytest.importorskip("afd_plugin.connectors.gpu.async_gpu")
+pytest.importorskip("afd_plugin.connectors.gpu.async_nvshmem.connector")
 
 from afd_plugin.v1.worker import async_ffn_model_runner as runtime  # noqa: E402
 from tests.unit.fakes.async_ffn import GPUAsyncHostCase  # noqa: E402

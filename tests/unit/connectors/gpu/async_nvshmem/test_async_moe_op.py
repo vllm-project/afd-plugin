@@ -9,7 +9,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
-from afd_plugin.connectors.gpu import async_moe_op  # noqa: E402, F401
+from afd_plugin.connectors.gpu.async_nvshmem import async_moe_op  # noqa: E402, F401
 from afd_plugin.model_executor import models  # noqa: E402
 from tests.unit.fakes.connector import ProxyConnector  # noqa: E402
 

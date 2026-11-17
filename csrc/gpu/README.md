@@ -26,9 +26,11 @@ The runtime validates node counts and maps logical A-first ranks to
 node-contiguous NVSHMEM PEs before initialization.
 
 The receive window and per-peer/stage outboxes are allocated symmetrically.
-Packing performs dtype conversion before the byte transfer. One blocking
-`putmem_signal` plus `quiet` completes each transfer before its stream may reuse
-the outbox; the target is the local symmetric address plus the slot offset,
+Packing performs dtype conversion before the byte transfer. Blocking puts send
+only populated field prefixes at their fixed offsets; their lengths come from
+tensor shapes without a routing readback. A device `fence` orders those puts
+before the header's `putmem_signal`, and `quiet` completes the transfer before
+its stream may reuse the outbox. The target is the local symmetric address plus the slot offset,
 with the destination PE passed separately. The kernel reads the int32 dispatch
 counter on the GPU on every graph replay and publishes an aligned uint64 signal.
 Mapped peers retain direct Torch writes. Replies retain separate routed/shared

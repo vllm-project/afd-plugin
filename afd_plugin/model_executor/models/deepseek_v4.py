@@ -139,7 +139,7 @@ class RemoteDeepseekV4FFN(nn.Module):
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
             )
-        from afd_plugin.connectors.gpu import async_moe_op  # noqa: F401
+        from afd_plugin.connectors.gpu.async_nvshmem import async_moe_op  # noqa: F401
 
     def forward(
         self,

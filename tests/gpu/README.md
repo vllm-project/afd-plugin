@@ -9,7 +9,7 @@ server, and run outside CI.
 | --- | --- | --- |
 | `test_deepep_m2n_gpu.py` | pytest, up to 6 GPUs on one node | Dispatch, expert compute and combine checked against references, in eager mode, with two lanes (DBO), under `torch.compile`, and after CUDA-graph replay |
 | `deepep_m2n_harness.py` | - | Multi-process harness: rank spawning, deterministic inputs, references, checks, scenarios, and benchmark scenarios |
-| `test_async_gpu.py` | pinned CUDA vLLM/Torch, NVSHMEM 3.4.5, up to 4 NVLink GPUs | Five real transport cases: two stages, replay, routing/accumulation precision and independent Attention producers |
+| `test_async_gpu.py` | pinned CUDA vLLM/Torch, NVSHMEM 3.4.5, up to 4 NVLink GPUs | Seven real transport cases: two stages, replay, device mapping, variable batch sizes, routing/accumulation precision and independent Attention producers |
 | `run_async_gpu_multinode.py` / `.slurm` | CUDA/NVSHMEM extension, two nodes with two GPUs each | The same affine oracle over remote RMA: graph counters, precision, independent producers and collective close |
 | `__init__.py` | - | Package marker |
 
@@ -21,7 +21,7 @@ The async GPU tests need no DeepEP or DeepGEMM. Run inside a four-GPU allocation
 python -m pytest -s -v tests/gpu/test_async_gpu.py
 ```
 
-All five cases must pass with zero skips. They use real CUDA transport and
+All seven cases must pass with zero skips. They use real CUDA transport and
 an affine expert oracle; model kernels and accuracy are covered separately in
 the [single-node validation record](../../docs/design/async_gpu_cross_node_research.md).
 The requirements and harness descriptions below cover DeepEP M2N.
@@ -34,10 +34,10 @@ the checkout:
 sbatch tests/gpu/run_async_gpu_multinode.slurm
 ```
 
-The script uses IBRC, resolves a routable rendezvous host and runs six cases
+The script uses IBRC, resolves a routable rendezvous host and runs seven cases
 sequentially. Each task selects `SLURM_LOCALID` within its node's allocated GPU
 mask. A run must report `passed` from every PE; zero-route destinations, both
-stages, changed inputs/weights across 64 graph replays, sequence overflow and
+stages, changing batch lengths, changed inputs/weights across 64 graph replays, sequence overflow and
 an idle Attention peer are covered. The hybrid case sends from one Attention
 to both a local and a remote FFN in the same world. Slurm bounds failed-step
 cleanup. The script uses this cluster's untyped GPU GRES in partition `h20`; adapt those

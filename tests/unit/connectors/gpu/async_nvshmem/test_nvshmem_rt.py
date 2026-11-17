@@ -10,7 +10,7 @@ pytest.importorskip("torch")
 
 import torch  # noqa: E402
 
-from afd_plugin.connectors.gpu.nvshmem_rt import (  # noqa: E402
+from afd_plugin.connectors.gpu.async_nvshmem.nvshmem_rt import (  # noqa: E402
     NvshmemRuntime,
     tensor_from_ptr,
 )

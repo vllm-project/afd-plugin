@@ -600,7 +600,7 @@ class AFDDeepseekV2AsyncMoE(AFDDeepseekV2RoutedExpertsMoE):
         )
         self.layer_idx = layer_idx
         # Import only for this connector; registration has no module-global flag.
-        from afd_plugin.connectors.gpu import async_moe_op  # noqa: F401
+        from afd_plugin.connectors.gpu.async_nvshmem import async_moe_op  # noqa: F401
 
     def forward(
         self,
