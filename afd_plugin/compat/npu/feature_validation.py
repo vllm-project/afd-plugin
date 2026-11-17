@@ -30,6 +30,12 @@ def fail_if_unsupported_npu_afd_features(
     """Fail fast for NPU AFD settings that are not currently supported."""
 
     afd_config = afd_config or parse_afd_config(vllm_config)
+    if getattr(afd_config, "ffn_compute_backend", "native") == "mega_ffn":
+        from afd_plugin.model_executor.models.npu.mega_ffn_config import (
+            validate_mega_ffn_config,
+        )
+
+        validate_mega_ffn_config(vllm_config)
     is_dsv4 = _is_dsv4_target(vllm_config)
     if afd_config.connector == AFD_ASYNC_CONNECTOR and not is_dsv4:
         raise RuntimeError(

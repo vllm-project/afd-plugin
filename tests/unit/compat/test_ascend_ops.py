@@ -99,3 +99,11 @@ def test_async_loader_requires_all_source_ops(monkeypatch, missing):
             ensure_cam_async_ops_available()
     finally:
         ensure_cam_async_ops_available.cache_clear()
+
+
+def test_explicit_vendor_override_selects_matching_soc_package(tmp_path, monkeypatch):
+    vendor = tmp_path / "a5-vendor"
+    vendor.mkdir()
+    monkeypatch.setenv("AFD_CANN_VENDOR_PATH", str(vendor))
+    assert get_afd_cann_vendor_path() == vendor
+    assert get_afd_cust_opapi_path() == vendor / "op_api/lib/libcust_opapi.so"

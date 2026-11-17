@@ -55,6 +55,13 @@ Model integration consumes plugin configuration, connector payload contracts,
 and platform mechanisms. It must not reach into concrete worker instances or
 make a backend-specific worker class the shared model API.
 
+## Experimental A5 MegaFFN backend
+
+`ffn_compute_backend="mega_ffn"` replaces F-side routed-expert computation
+for the constrained synchronous CAMP2p / A-side-gate path. Native remains
+the default. See the [implementation and validation guide](../../npu/mega_ffn_sync_a5.md)
+for exact scope, weight conversion, fixed-capacity graphs and deployment evidence.
+
 ## Implementation evidence
 
 | Area | Source | Focused validation |

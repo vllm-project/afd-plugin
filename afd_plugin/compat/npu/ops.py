@@ -19,6 +19,14 @@ CAM_COMBINE_RECV = "afd_async_combine_recv"
 
 
 def get_afd_cann_vendor_path() -> Path:
+    override = os.environ.get("AFD_CANN_VENDOR_PATH")
+    if override:
+        path = Path(override)
+        if not path.is_absolute() or not path.is_dir():
+            raise ValueError(
+                "AFD_CANN_VENDOR_PATH must be an existing absolute directory"
+            )
+        return path
     return (
         Path(__file__).resolve().parents[2]
         / "_cann_ops_custom"

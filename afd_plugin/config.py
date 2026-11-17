@@ -67,6 +67,8 @@ class AFDConfig:
     num_ffn_ranks: int = 1
     # Whether Attention computes MoE gate outputs before sending to FFN.
     compute_gate_on_attention: bool = False
+    # Experimental normal-mode F compute; the wire connector remains independent.
+    ffn_compute_backend: Literal["native", "mega_ffn"] = "native"
     # Timeout, in seconds, for the AFD world process group rendezvous.
     # The right value depends on rank count, placement, and model size, so
     # it is left to the caller (deployment tooling) rather than derived here.
@@ -108,6 +110,7 @@ class AFDConfig:
             self.role,
             self.num_attention_ranks,
             self.num_ffn_ranks,
+            self.ffn_compute_backend,
         ]
         extra = (
             json.dumps(self.connector_extra_config, sort_keys=True)
@@ -318,6 +321,15 @@ def validate_afd_config(
 ) -> None:
     """Validate AFD config values without importing vLLM or CUDA modules."""
 
+    if config.ffn_compute_backend not in ("native", "mega_ffn"):
+        raise ValueError("ffn_compute_backend must be 'native' or 'mega_ffn'")
+    if config.ffn_compute_backend == "mega_ffn" and (
+        config.connector != CAMP2P_CONNECTOR
+        or not config.compute_gate_on_attention
+        or config.num_attention_ranks != 1
+        or config.num_ffn_ranks != 1
+    ):
+        raise ValueError("mega_ffn requires CAMP2p, A-side gate and one A/one F rank")
     if config.role not in SUPPORTED_AFD_ROLES:
         raise ValueError(
             f"AFD role must be one of {SUPPORTED_AFD_ROLES!r}, got {config.role!r}",

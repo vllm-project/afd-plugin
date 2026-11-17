@@ -97,7 +97,7 @@ AFDConnectorFactory.register_connector(
 )
 AFDConnectorFactory.register_connector(
     "CAMP2pAFDConnector",
-    "afd_plugin.connectors.npu.camp2p",
+    "afd_plugin.connectors.npu.camp2p.connector",
     "CAMP2pAFDConnector",
 )
 AFDConnectorFactory.register_connector(

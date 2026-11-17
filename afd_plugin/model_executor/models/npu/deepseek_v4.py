@@ -528,9 +528,23 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 deepseek_v4_external_routing_moe as external_routing_moe,
             )
 
-            self.afd_external_routing_moe = external_routing_moe.AFDExternalRoutingMoE(
-                self.mlp.experts.routed_experts,
-            )
+            if getattr(afd_config, "ffn_compute_backend", "native") == "mega_ffn":
+                from afd_plugin.model_executor.models.npu.mega_ffn_backend import (
+                    MegaFFNBackend,
+                )
+
+                self.afd_external_routing_moe = MegaFFNBackend(
+                    self.mlp.experts.routed_experts,
+                    config,
+                    self.layer_idx,
+                    max_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
+                )
+            else:
+                self.afd_external_routing_moe = (
+                    external_routing_moe.AFDExternalRoutingMoE(
+                        self.mlp.experts.routed_experts,
+                    )
+                )
 
         self.input_layernorm = native.RMSNorm(config.hidden_size, eps=self.norm_eps)
         self.post_attention_layernorm = native.RMSNorm(

@@ -242,3 +242,33 @@ def test_compute_hash_changes_for_graph_affecting_fields():
     ffn = AFDConfig(role="ffn")
 
     assert attention.compute_hash() != ffn.compute_hash()
+
+
+def test_mega_ffn_backend_is_explicit_and_changes_graph_identity():
+    raw = dict(connector="CAMP2pAFDConnector", compute_gate_on_attention=True)
+    native = afd_config_from_mapping(raw)
+    mega = afd_config_from_mapping(dict(raw, ffn_compute_backend="mega_ffn"))
+    assert native.ffn_compute_backend == "native"
+    assert mega.ffn_compute_backend == "mega_ffn"
+    assert native.compute_hash() != mega.compute_hash()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"ffn_compute_backend": "typo"},
+        {"compute_gate_on_attention": False},
+        {"connector": "CAMAsyncAFDConnector"},
+        {"num_ffn_ranks": 2},
+        {"num_attention_ranks": 2},
+    ],
+)
+def test_mega_ffn_rejects_unsupported_wire_topology(changes):
+    raw = dict(
+        connector="CAMP2pAFDConnector",
+        compute_gate_on_attention=True,
+        ffn_compute_backend="mega_ffn",
+    )
+    raw.update(changes)
+    with pytest.raises(ValueError, match="ffn_compute_backend|mega_ffn"):
+        afd_config_from_mapping(raw)
