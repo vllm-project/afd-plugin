@@ -160,13 +160,17 @@ def _shell(*, events, connector, shared_experts):
     return shell
 
 
-def _install_metadata(monkeypatch, connector, events):
+def _install_metadata(monkeypatch, connector, events, *, ubatch_idx=None):
     afd_metadata = SimpleNamespace(connector=connector, stage_idx=7)
     monkeypatch.setattr(
         adapter,
         "get_afd_metadata_from_forward_context",
         lambda: afd_metadata,
     )
+    forward_context = SimpleNamespace()
+    if ubatch_idx is not None:
+        forward_context.ubatch_idx = ubatch_idx
+    monkeypatch.setattr(adapter, "get_forward_context", lambda: forward_context)
     return afd_metadata
 
 
@@ -236,3 +240,32 @@ def test_forward_refuses_a_context_without_afd_metadata(monkeypatch):
 
     with pytest.raises(RuntimeError, match="AFD forward metadata"):
         shell(torch.zeros(2, HIDDEN, dtype=torch.bfloat16))
+
+
+def test_forward_resolves_the_stage_before_the_dbo_yield(monkeypatch):
+    """The stage resolved before the yield is the one the receive uses."""
+
+    events: list[tuple] = []
+    connector = _RecordingConnector(events)
+    _install_metadata(monkeypatch, connector, events, ubatch_idx=1)
+    forward_context = SimpleNamespace(ubatch_idx=1)
+    monkeypatch.setattr(adapter, "get_forward_context", lambda: forward_context)
+
+    def fake_yield(hidden_states, *, role):
+        events.append(("yield", role))
+        # The peer ubatch runs from here; this forward must not follow its stage.
+        forward_context.ubatch_idx = 0
+        return hidden_states
+
+    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", fake_yield)
+    topk_ids = torch.zeros((2, TOP_K), dtype=torch.int32)
+    topk_weights = torch.ones((2, TOP_K), dtype=torch.float32)
+    _fake_gate_topk(monkeypatch, events, topk_ids, topk_weights)
+    shell = _shell(events=events, connector=connector, shared_experts=True)
+    hidden_states = torch.full((2, HIDDEN), 8.0, dtype=torch.bfloat16)
+
+    shell(hidden_states)
+
+    assert [event[0] for event in events] == ["gate", "send", "shared", "yield", "recv"]
+    assert events[1][2].metadata.stage_idx == 1
+    assert events[-1][1] == 1, "the receive followed the peer ubatch's stage"

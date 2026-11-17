@@ -97,6 +97,12 @@ def _is_dsv4_target(vllm_config: VllmConfig) -> bool:
     return any("DeepseekV4" in str(architecture) for architecture in architectures)
 
 
+# ``connector_extra_config.quant_mode`` of the pre-quantized A2E transport. The
+# transport lands with its own change; this guard keeps DBO rejected for it until
+# the ubatch yield has been verified together with quantization.
+_MXFP8_QUANT_MODE = 4
+
+
 def _fail_if_unsupported_sync_attention_gate(
     vllm_config: VllmConfig,
     afd_config: AFDConfig,
@@ -104,12 +110,12 @@ def _fail_if_unsupported_sync_attention_gate(
     *,
     is_dsv4: bool,
 ) -> None:
-    """Restrict the sync Attention-side gate prototype to what it supports today.
+    """Restrict the sync Attention-side gate to what it supports today.
 
-    DBO and ubatching are rejected rather than merely unused: the sync shell does not
-    call the DBO yield, so enabling DBO here would interleave microbatches against a
-    transport that never yields. Not calling the yield is not the same as forbidding
-    the feature.
+    Native DBO runs through this shell: the forward resolves the ubatch stage before
+    the routing send, yields, and receives on the resolved stage, and the connector
+    keeps one AFD group per ubatch. The pre-quantized transport stays excluded until
+    its yield interaction is verified.
     """
 
     parallel = vllm_config.parallel_config
@@ -122,10 +128,17 @@ def _fail_if_unsupported_sync_attention_gate(
             f"TP={int(parallel.tensor_parallel_size)}",
         )
     if bool(parallel.enable_dbo) or bool(parallel.use_ubatching):
-        raise RuntimeError(
-            "Attention-side gate with the synchronous connector does not support "
-            "DBO or ubatching yet",
-        )
+        if int(parallel.num_ubatches) != 2:
+            raise RuntimeError(
+                "Attention-side gate with the synchronous connector requires "
+                f"exactly two microbatches; got {int(parallel.num_ubatches)}",
+            )
+        if int(getattr(extra_info, "quant_mode", 0)) == _MXFP8_QUANT_MODE:
+            raise RuntimeError(
+                "quant_mode=4 does not support DBO or ubatching yet: the ubatch "
+                "yield and the pre-quantized transport have not been verified "
+                "together",
+            )
     if afd_config.connector != CAMP2P_CONNECTOR:
         raise RuntimeError(
             "Attention-side gate is only supported with "

@@ -60,7 +60,10 @@ eager, `FULL`, or `FULL_DECODE_ONLY`. Plain MLA graph+DBO requires
 `FULL_DECODE_ONLY`; `FULL` is rejected for that backend. SFA/DSA use the
 generic graph path, whose accepted modes do not establish model qualification.
 DBO requires Attention DP > 1, exactly two microbatches, and no speculative
-decoding. The pair requires static EP, PP=PCP=DCP=1, and each
+decoding. With the Attention-side gate enabled the sync connector also runs DBO:
+the gate shell resolves the ubatch stage before the routing send, yields between
+the send and the receive, and receives on the resolved stage. The pre-quantized
+A2E transport is excluded from DBO until its yield interaction is verified. The pair requires static EP, PP=PCP=DCP=1, and each
 role's ranks equal to DP x TP. Sequence parallelism follows the model
 contract; synchronous DeepSeek-V2/V3 rejects effective model SP. Native MRV2
 owns request slicing, capture, graph selection, replay and output merge.

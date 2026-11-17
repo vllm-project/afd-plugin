@@ -61,17 +61,20 @@ def _afd_config(*, role: str = "attention"):
     )
 
 
-def _vllm_config(*, tp: int = 1, dbo: bool = False, ubatching: bool = False):
+def _vllm_config(
+    *, tp: int = 1, dbo: bool = False, ubatching: bool = False, ubatches: int = 1
+):
     hf_config = SimpleNamespace(model_type=_DSV4)
     return SimpleNamespace(
         model_config=SimpleNamespace(
             hf_config=hf_config,
             hf_text_config=SimpleNamespace(model_type=_DSV4),
+            use_mla=False,
         ),
         parallel_config=SimpleNamespace(
             enable_dbo=dbo,
             use_ubatching=ubatching,
-            num_ubatches=1,
+            num_ubatches=ubatches,
             tensor_parallel_size=tp,
         ),
         compilation_config=SimpleNamespace(cudagraph_mode=None),
@@ -91,12 +94,37 @@ def test_the_supported_shape_is_accepted_for_both_roles(extra_info, role):
     assert extra_info.validated == 1
 
 
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_dbo_is_accepted_with_two_ubatches(extra_info, role):
+    """Native DBO is part of the sync gate contract once it has two ubatches."""
+
+    feature_validation.fail_if_unsupported_npu_afd_features(
+        _vllm_config(dbo=True, ubatching=True, ubatches=2),
+        afd_config=_afd_config(role=role),
+    )
+
+    assert extra_info.validated == 1
+
+
+def test_the_pre_quantized_transport_keeps_the_dbo_rejection(extra_info):
+    """The MXFP8 transport stays out of DBO until its yield is verified."""
+
+    extra_info.quant_mode = 4
+    with pytest.raises(RuntimeError, match="does not support DBO or ubatching"):
+        feature_validation.fail_if_unsupported_npu_afd_features(
+            _vllm_config(dbo=True, ubatching=True, ubatches=2),
+            afd_config=_afd_config(role="attention"),
+        )
+
+
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
-        ({"dbo": True}, "DBO or ubatching"),
-        ({"ubatching": True}, "DBO or ubatching"),
         ({"tp": 2}, "tensor-parallel size 1"),
+        (
+            {"dbo": True, "ubatching": True, "ubatches": 4},
+            "exactly two microbatches",
+        ),
     ],
 )
 @pytest.mark.parametrize("role", ["attention", "ffn"])
