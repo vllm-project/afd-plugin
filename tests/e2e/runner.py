@@ -753,7 +753,10 @@ def uses_async_connector(args: argparse.Namespace) -> bool:
 
 def uses_npu_async_process_cleanup(args: argparse.Namespace) -> bool:
     """Return whether E2E teardown must find and kill every FFN process."""
-    return args.device_backend == "npu" and args.scenario in (DSV4_ASYNC_CAM_SCENARIO, DSV4_MEGAMOE_SCENARIO)
+    return args.device_backend == "npu" and args.scenario in (
+        DSV4_ASYNC_CAM_SCENARIO,
+        DSV4_MEGAMOE_SCENARIO,
+    )
 
 
 def process_termination_timeout(args: argparse.Namespace) -> float:

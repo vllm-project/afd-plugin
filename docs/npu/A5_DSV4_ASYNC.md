@@ -2,7 +2,9 @@
 
 ## Source baseline
 
-This branch starts at AFD `update/v0.32.0`, commit `2917805`, and targets the
+The PR branch `feat/a5-async-with-megamoe` starts at upstream `main`, commit
+`0d6ec9e`, and carries the A5 work from `feature/a5-async-megamoe` (`9dcb69b`).
+It targets the
 [#537](https://github.com/vllm-project/afd-plugin/issues/537) software environment:
 
 | Component | Target |
@@ -13,10 +15,17 @@ This branch starts at AFD `update/v0.32.0`, commit `2917805`, and targets the
 | Model | DeepSeek-V4-Flash, original FP8 checkpoint with MXFP4 routed experts |
 
 The model target is V4 Flash, not V4.1. The existing A3 validation record uses an
-older Ascend commit and does not establish A5 support. This branch removes the
-DSV4 wrapper's calls to the DSA-CP interfaces deleted in the target Ascend source.
+older Ascend commit and does not establish A5 support. On A5, the wrapper omits the DSA-CP interfaces deleted in the target Ascend
+source. The existing A3 constructor path is preserved.
 The native loader, attention, HC, hash routing and shared-expert arithmetic remain
 responsible for the model semantics.
+
+Upstream main moved CAM execution into `connectors/npu/async_cam_runtime`.
+`AsyncCAMMXFPExecutor` retains the eager native MXFP4 MLP path for A5 within
+that runtime; the A3 layered and Pull-Mega executors remain unchanged. No new
+launch option is needed. The source branch was verified on A5; this main-based
+integration still requires a fresh A5 build and E2E run. Host tests do not
+validate NPU execution or accuracy.
 
 ## Two execution paths
 

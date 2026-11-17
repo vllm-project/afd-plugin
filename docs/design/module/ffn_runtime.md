@@ -29,6 +29,7 @@ depends_on:
   - "execution_platforms.md"
   - "compatibility_and_patches.md"
 validation_paths:
+  - "tests/unit/connectors/npu/async_cam_runtime/test_async_cam_mxfp.py"
   - "tests/unit/ffn_faas/test_*.py"
   - "tests/unit/connectors/npu/async_cam_runtime/test_async_cam_layered.py"
   - "tests/unit/v1/worker/test_async_ffn_runtime.py"

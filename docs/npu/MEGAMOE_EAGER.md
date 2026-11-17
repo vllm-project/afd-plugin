@@ -1,7 +1,7 @@
 # DeepSeek-V4-Flash on A5 with asynchronous MegaMoE
 
 The connector is now named `CAMAsyncMegamoeAFDConnector` and requires
-`afd.async=true`. Its AFD base is `update/v0.32.0` at `2917805`.
+`afd.async=true`. The PR branch is based on upstream `main` at `0d6ec9e`.
 
 See [A5 development notes](A5_DSV4_ASYNC.md) for the pinned #537 environment,
 operator dependencies, precision/weight handling and configuration contract.

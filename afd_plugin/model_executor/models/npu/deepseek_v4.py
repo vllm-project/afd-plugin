@@ -24,6 +24,7 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.sequence import IntermediateTensors
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
@@ -488,6 +489,12 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             | native.DeepseekV4MoE
         )
         if afd_config.role == "attention":
+            attention_kwargs = {}
+            if get_ascend_device_type() != AscendDeviceType.A5:
+                self.enable_dsa_cp = native.enable_dsa_cp()
+                attention_kwargs["need_gather_q_kv"] = (
+                    self.use_sequence_parallel_moe and self.enable_dsa_cp
+                )
             self.self_attn = native.DeepseekV4Attention(
                 vllm_config=vllm_config,
                 config=config,
@@ -497,6 +504,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 reduce_results=not self.use_sequence_parallel_moe,
+                **attention_kwargs,
             )
             if self.compute_gate_on_attention:
                 # Both shells keep the router on Attention; only the transport
@@ -911,6 +919,15 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
 
         prepare_attention_gate_w8a8_scales(self.model.layers)
         # ### PATCH END: retain FFN gate-on-A W8A8 scales after quant finalize
+
+    def get_mxfp_expert_layers(self) -> list[tuple[int, nn.Module]]:
+        """Expose the native A5 MLPs to the eager CAM connector runtime."""
+        return [
+            (layer.layer_idx, layer.mlp)
+            for layer in self.model.layers
+            if isinstance(layer, AFDDeepseekV4DecoderLayer)
+            and isinstance(layer.mlp, native.DeepseekV4MoE)
+        ]
 
     def get_quantized_expert_weights(
         self,
