@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Temporary CUDA DeepSeek-V4 DBO fixes for vLLM 0.32.0.
+"""Temporary CUDA DeepSeek-V4 DBO fixes for vLLM 0.34.0.
 
-Upstream pin: 5df63a7203cdb9328d824a27b682e77c7b9928be.
+Upstream pin: 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
 
 Removal tracking:
 * Input alignment: no published upstream PR. Remove the aligned stage storage
@@ -278,7 +278,7 @@ def _use_flashmla_workspace_slot(
     # Patch functionality: route only this manager's allocation-only reservation
     # to a configured slot, then restore its exact instance/class lookup.
     # Signature: matches WorkspaceManager._get_workspace_id(self) -> int in
-    # vllm/v1/worker/workspace.py, 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # vllm/v1/worker/workspace.py, 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
     # Remove with #61584 only after V4 uses its all-slot reservation API.
     def _get_workspace_id(self) -> int:
         return slot
@@ -306,7 +306,7 @@ def _reserve_flashmla_ubatch_workspace(model: nn.Module, config: VllmConfig) -> 
         return
     manager = current_workspace_manager()
     # Native forward_mqa's NoMeta branch (nvidia/flashmla.py:105-131, vLLM
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be) reserves its configured bound,
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca) reserves its configured bound,
     # zeros only this small output, and returns before KV/kernels/Indexer/FFN.
     # Visit all real layers: the first SWA-only layer does not bound C4 demand.
     # Known manager geometry is the pin-local exception above, not a new policy.
@@ -330,13 +330,13 @@ class _PaddingStageGuard(DeepseekV4Attention):
     """Skip native V4 attention on a padding-only AFD DBO stage."""
 
     # Patch reason: native V4 attention asserts on a padding-only decode stage
-    # because no tile scheduler exists for zero actual tokens (vLLM 5df63a7,
+    # because no tile scheduler exists for zero actual tokens (vLLM 0.34.0,
     # vllm/models/deepseek_v4/nvidia/flashmla.py, forward_mqa/_forward_decode).
     # Patch functionality: return zero attention output for that stage, so the
     # native decoder layer still runs its mHC and remote FFN steps. Graph
     # capture keeps full attention because native dummy inputs give every
     # stage a positive real extent.
-    # Signature: matches DeepseekV4Attention.forward at vLLM 5df63a7,
+    # Signature: matches DeepseekV4Attention.forward at vLLM 0.34.0,
     # vllm/models/deepseek_v4/attention.py; no added parameters.
     # Delegation: other stages call the native forward through super() instead
     # of a copy. A copy would bring back the duplicated upstream code that #599
@@ -362,7 +362,7 @@ class _PaddingStageGuard(DeepseekV4Attention):
         return super().forward(positions, hidden_states, llama_4_scaling)
 
 
-# One subclass per class that vLLM 5df63a7's _select_dsv4_attn_cls can return
+# One subclass per class that vLLM 0.34.0's _select_dsv4_attn_cls can return
 # (vllm/models/deepseek_v4/nvidia/model.py). Subclasses keep the native weight
 # names, backend and isinstance checks.
 class AFDDeepseekV4FlashMLAAttention(_PaddingStageGuard, DeepseekV4FlashMLAAttention):
