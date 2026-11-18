@@ -5,6 +5,7 @@ runners; no concrete model imports."""
 
 from __future__ import annotations
 
+import importlib
 import math
 from typing import Any
 
@@ -38,6 +39,7 @@ from vllm.platforms import current_platform
 
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors import (
+    AFDConnectorFactory,
     AFDForwardContextMetadata,
     AFDTransferContext,
     AFDTransferMetadata,
@@ -46,10 +48,10 @@ from afd_plugin.forward_context import get_afd_metadata_from_forward_context
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 UNROUTED_EXPERT_ID = -1
-# The only placement validated for native-factory Attention MoE runners.
+# The only device validated for native-factory Attention MoE runners. Each
+# connector's registration names its runner; only CUDA P2P registers one.
 # DeepEP M2N routes on Attention through its own model shell instead.
 ATTENTION_MOE_RUNNER_DEVICE = "cuda"
-ATTENTION_MOE_RUNNER_CONNECTOR = "P2pNcclAFDConnector"
 
 
 def _unroute_tp_padding(topk_ids: torch.Tensor, num_tokens: int) -> torch.Tensor:
@@ -61,6 +63,41 @@ def _unroute_tp_padding(topk_ids: torch.Tensor, num_tokens: int) -> torch.Tensor
     return topk_ids.masked_fill(
         (token_index >= num_tokens).unsqueeze(1), UNROUTED_EXPERT_ID
     )
+
+
+def _current_afd_metadata() -> AFDForwardContextMetadata:
+    afd_metadata = get_afd_metadata_from_forward_context()
+    if afd_metadata is None:
+        raise RuntimeError("remote FFN transfer requires AFD forward metadata")
+    return afd_metadata
+
+
+def _send_attention_output(
+    afd_metadata: AFDForwardContextMetadata,
+    hidden_states: torch.Tensor,
+    *,
+    layer_idx: int,
+    **send_kwargs: torch.Tensor,
+) -> int:
+    """Send a layer's Attention output to the FFN role; return the stage to
+    receive."""
+    forward_context = get_forward_context()
+    stage_idx = int(
+        getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),
+    )
+    afd_metadata.stage_idx = stage_idx
+    metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=layer_idx,
+        stage_idx=stage_idx,
+        seq_len=int(hidden_states.shape[0]),
+    )
+    context = AFDTransferContext(metadata=metadata)
+    afd_metadata.connector.send_attn_output(
+        hidden_states,
+        context,
+        **send_kwargs,
+    )
+    return stage_idx
 
 
 class RemoteFFNProxy(nn.Module):
@@ -135,24 +172,12 @@ class RemoteFFNProxy(nn.Module):
         **send_kwargs: torch.Tensor,
     ) -> int:
         """Send this layer's Attention output; return the stage to receive."""
-        afd_metadata = self._afd_metadata()
-        forward_context = get_forward_context()
-        stage_idx = int(
-            getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),
-        )
-        afd_metadata.stage_idx = stage_idx
-        metadata = AFDTransferMetadata.create_attention_metadata(
-            layer_idx=self.layer_idx,
-            stage_idx=stage_idx,
-            seq_len=int(hidden_states.shape[0]),
-        )
-        context = AFDTransferContext(metadata=metadata)
-        afd_metadata.connector.send_attn_output(
+        return _send_attention_output(
+            self._afd_metadata(),
             hidden_states,
-            context,
+            layer_idx=self.layer_idx,
             **send_kwargs,
         )
-        return stage_idx
 
     def _receive(self, hidden_states: torch.Tensor, stage_idx: int) -> torch.Tensor:
         """Receive the FFN output; a connector may write it into
@@ -164,10 +189,9 @@ class RemoteFFNProxy(nn.Module):
 
     @staticmethod
     def _afd_metadata() -> AFDForwardContextMetadata:
-        afd_metadata = get_afd_metadata_from_forward_context()
-        if afd_metadata is None:
-            raise RuntimeError("RemoteFFNProxy requires AFD forward metadata")
-        return afd_metadata
+        """Overridable: a model's proxy may raise its own missing-context
+        error."""
+        return _current_afd_metadata()
 
 
 class AFDRemoteMoEMethod(FusedMoEMethodBase):
@@ -218,12 +242,16 @@ class AFDRemoteRoutedExperts(RoutedExperts):
 
 
 class AFDRemoteMoERunner(MoERunner):
-    """Native MoE runner whose gate and experts run on the FFN role.
+    """Native MoE runner whose experts run on the FFN role.
 
     The runner keeps the native layer registration but runs no local routing
-    or expert kernel: it sends this layer's hidden states through the
-    ``RemoteFFNProxy`` transport (send, DBO yield, receive) and returns the
-    FFN output.
+    or expert kernel: it sends this layer's hidden states through the AFD
+    connector, yields for DBO, and returns the FFN output. Without a gate,
+    the FFN role runs its native internal-router MoE. When the runner holds
+    the model's gate (``compute_gate_on_attention``), it applies the gate as
+    native ``MoERunner._forward_impl`` does, ignoring its ``router_logits``
+    argument, and sends the logits with the hidden states; the FFN role runs
+    its external-router experts.
     """
 
     def __init__(
@@ -253,8 +281,9 @@ class AFDRemoteMoERunner(MoERunner):
             routed_output_transform=routed_output_transform,
             routed_scaling_factor=routed_scaling_factor,
         )
-        # The native layer name carries the decoder layer index.
-        self.ffn_transport = RemoteFFNProxy(layer_idx=self.layer_id)
+        # The native layer name carries the decoder layer index. Parse it
+        # once: forward may be traced by torch.compile.
+        self.layer_idx: int = self.layer_id
 
     def forward(
         self,
@@ -271,58 +300,48 @@ class AFDRemoteMoERunner(MoERunner):
             raise NotImplementedError(
                 "Attention remote MoE has no local shared experts",
             )
-        return self.ffn_transport._send_and_receive(
+        send_kwargs: dict[str, torch.Tensor] = {}
+        if self.gate is not None:
+            router_logits, _ = self.gate(hidden_states)
+            send_kwargs["router_logits"] = router_logits
+        stage_idx = _send_attention_output(
+            _current_afd_metadata(),
             hidden_states,
-            **self._routing_payload(hidden_states),
+            layer_idx=self.layer_idx,
+            **send_kwargs,
+        )
+        hidden_states = maybe_apply_dbo_yield(hidden_states, role="attention")
+        return _current_afd_metadata().connector.recv_ffn_output(
+            ref_tensor=hidden_states,
+            ubatch_idx=stage_idx,
         )
 
-    def _routing_payload(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """Routing tensors sent with the hidden states; none when FFN gates."""
-        return {}
 
-
-class AFDExternalRoutingMoERunner(AFDRemoteMoERunner):
-    """Native MoE runner that applies the gate held on the Attention role.
-
-    As native ``MoERunner._forward_impl`` does when it holds a gate, the
-    runner ignores its ``router_logits`` argument and computes the logits
-    from the hidden states. It sends them with the hidden states, and the FFN
-    role runs its external-router experts.
-    """
-
-    def _routing_payload(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        assert self.gate is not None
-        router_logits, _ = self.gate(hidden_states)
-        return {"router_logits": router_logits}
-
-
-def build_attention_moe_runner(
+def build_expert(
     vllm_config: VllmConfig,
     *,
     gate: nn.Module | None,
     **moe_kwargs: Any,
 ) -> MoERunner:
-    """Build an Attention-role MoE runner through native ``FusedMoEFactory``.
+    """Build an Attention-role MoE ``experts`` module through native
+    ``FusedMoEFactory``.
 
     ``moe_kwargs`` are the native model's ``FusedMoEFactory`` arguments. Pass
     the model's gate exactly when ``compute_gate_on_attention`` is set; the
-    runner then applies it and sends the router logits. This function fixes
-    the arguments that describe local experts: the runner registers like a
-    native MoE layer but allocates no expert weights and runs no expert
-    kernel.
+    runner then applies it and sends the router logits. The configured
+    connector's registration names the runner class, imported here. This
+    function fixes the arguments that describe local experts: the runner
+    registers like a native MoE layer but allocates no expert weights and runs
+    no expert kernel.
     """
     afd_config = parse_afd_config(vllm_config, validate=False)
+    runner_path = AFDConnectorFactory.get_attention_moe_runner(afd_config.connector)
     placement = (current_platform.device_type, afd_config.connector)
-    if placement != (ATTENTION_MOE_RUNNER_DEVICE, ATTENTION_MOE_RUNNER_CONNECTOR):
+    if runner_path is None or placement[0] != ATTENTION_MOE_RUNNER_DEVICE:
         raise ValueError(
             f"unsupported Attention remote MoE configuration: {placement!r}",
         )
+    runner_module, runner_class = runner_path
     if (gate is not None) != afd_config.compute_gate_on_attention:
         raise ValueError(
             "Attention remote MoE takes the model's gate if and only if "
@@ -364,9 +383,7 @@ def build_attention_moe_runner(
         "tp_size": 1,
         "dp_size": 1,
         "pcp_size": 1,
-        "runner_cls": (
-            AFDExternalRoutingMoERunner if gate is not None else AFDRemoteMoERunner
-        ),
+        "runner_cls": getattr(importlib.import_module(runner_module), runner_class),
         "runner_args": None,
         "routed_experts_cls": AFDRemoteRoutedExperts,
         "routed_experts_args": None,
@@ -381,10 +398,9 @@ def build_attention_moe_runner(
 
 
 __all__ = [
-    "AFDExternalRoutingMoERunner",
     "AFDRemoteMoEMethod",
     "AFDRemoteMoERunner",
     "AFDRemoteRoutedExperts",
     "RemoteFFNProxy",
-    "build_attention_moe_runner",
+    "build_expert",
 ]

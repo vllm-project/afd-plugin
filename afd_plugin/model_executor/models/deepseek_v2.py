@@ -33,7 +33,7 @@ from afd_plugin.connectors import AFDExpertRoutingSpec
 from afd_plugin.model_executor.ffn.remote import (
     RemoteFFNProxy,
     _unroute_tp_padding,
-    build_attention_moe_runner,
+    build_expert,
 )
 from afd_plugin.model_executor.models._weight_utils import (
     ATTENTION_ROLE,
@@ -256,7 +256,7 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         prefix: str,
     ) -> nn.Module:
         """Native DeepseekV2MoE factory arguments, minus local-expert ones."""
-        return build_attention_moe_runner(
+        return build_expert(
             vllm_config,
             gate=self.gate,
             num_experts=config.n_routed_experts,

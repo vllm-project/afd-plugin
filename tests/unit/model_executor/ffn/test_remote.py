@@ -17,6 +17,7 @@ from vllm.model_executor.model_loader.utils import (  # noqa: E402
     process_weights_after_loading,
 )
 
+from afd_plugin.connectors import AFDConnectorFactory  # noqa: E402
 from afd_plugin.model_executor.ffn import remote  # noqa: E402
 from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
 from tests.unit.fakes.model_layers import GateLinear  # noqa: E402
@@ -59,7 +60,7 @@ def _build_runner(monkeypatch, config, *, device_type="cuda", gate=None, **kwarg
         remote, "current_platform", SimpleNamespace(device_type=device_type)
     )
     with set_current_vllm_config(config):
-        return remote.build_attention_moe_runner(
+        return remote.build_expert(
             config,
             gate=gate,
             num_experts=NUM_EXPERTS,
@@ -69,6 +70,19 @@ def _build_runner(monkeypatch, config, *, device_type="cuda", gate=None, **kwarg
             prefix=PREFIX,
             **kwargs,
         )
+
+
+class _RegisteredRunner(remote.AFDRemoteMoERunner):
+    """A runner a test connector registers; it marks its output."""
+
+    def forward(
+        self,
+        hidden_states,
+        router_logits,
+        input_ids=None,
+        shared_experts_input=None,
+    ):
+        return hidden_states + 1
 
 
 def _gate():
@@ -138,12 +152,41 @@ def test_runner_stays_weightless_and_fails_on_expert_checkpoints(monkeypatch):
 def test_factory_rejects_unsupported_placement_before_registration(
     monkeypatch, device_type, connector
 ):
+    """Only a CUDA connector whose registration names a runner builds one.
+
+    Why: the other connectors route on Attention or run on NPU through their
+    own model paths, which expect a different payload.
+    """
     config = attention_moe_vllm_config(connector=connector)
 
     with pytest.raises(ValueError, match="unsupported Attention remote MoE"):
         _build_runner(monkeypatch, config, device_type=device_type)
 
     assert config.compilation_config.static_forward_context == {}
+
+
+def test_factory_builds_the_runner_its_connector_registers(monkeypatch):
+    """The factory builds the runner class the configured connector names.
+
+    Why: each connector picks its Attention-side MoE runner, so every model
+    builds its experts with the same call whatever the connector.
+    """
+    monkeypatch.setattr(
+        AFDConnectorFactory, "_registry", dict(AFDConnectorFactory._registry)
+    )
+    AFDConnectorFactory.register_connector(
+        "RegisteredRunnerConnector",
+        "afd_plugin.connectors.gpu.p2p",
+        "P2pNcclAFDConnector",
+        attention_moe_runner=(__name__, _RegisteredRunner.__name__),
+    )
+    config = attention_moe_vllm_config(connector="RegisteredRunnerConnector")
+    runner = _build_runner(monkeypatch, config)
+    hidden_states = _hidden_states(2)
+
+    output = runner(hidden_states=hidden_states, router_logits=hidden_states)
+
+    assert torch.equal(output, hidden_states + 1)
 
 
 @pytest.mark.parametrize(
@@ -270,8 +313,9 @@ def test_runner_without_gate_sends_hidden_states_only(
 
 
 def test_runner_with_gate_sends_its_router_logits(monkeypatch):
-    """With the gate on Attention, the runner applies its gate and sends the
-    logits with the hidden states, ignoring its router_logits argument.
+    """With the gate on Attention, the runner applies its gate once to the
+    hidden states and sends the logits with them, ignoring its router_logits
+    argument.
 
     Why: native DeepseekV2MoE passes the hidden states as router_logits and
     lets the runner's gate route, as native MoERunner does; the FFN role
@@ -280,12 +324,18 @@ def test_runner_with_gate_sends_its_router_logits(monkeypatch):
     events: list[tuple] = []
     install_proxy_context(remote, monkeypatch, events, stage_idx=STAGE_IDX)
     gate = _gate()
+    gate_inputs: list = []
+    gate.register_forward_hook(
+        lambda _module, args, _output: gate_inputs.append(args[0])
+    )
     config = attention_moe_vllm_config(compute_gate_on_attention=True)
     runner = _build_runner(monkeypatch, config, gate=gate)
     hidden_states = _hidden_states(3)
 
     output = runner(hidden_states=hidden_states, router_logits=hidden_states)
 
+    assert len(gate_inputs) == 1
+    assert gate_inputs[0] is hidden_states
     assert [event[0] for event in events] == ["send", "yield", "recv"]
     _, sent_states, context, send_kwargs = events[0]
     assert sent_states is hidden_states

@@ -187,18 +187,21 @@ needed by the split execution.
 CUDA MoE splits at the remote-experts boundary. With gate-on-FFN, and with
 gate-on-Attention on non-routed connectors, Attention keeps native
 `DeepseekV2MoE.forward`. Its experts come from vLLM's own `FusedMoEFactory`
-through `build_attention_moe_runner()` in `ffn/remote.py`, with an AFD runner
-(`runner_cls`) and parameter-free routed experts (`routed_experts_cls`,
+through `build_expert()` in `ffn/remote.py`, with an AFD runner (`runner_cls`)
+and parameter-free routed experts (`routed_experts_cls`,
 `AFDRemoteRoutedExperts`, whose `AFDRemoteMoEMethod` allocates no weights).
-The runner registers like a native MoE layer but runs no local routing or
-expert kernel; it sends through the `RemoteFFNProxy` transport (send, DBO
-yield, receive). With gate-on-FFN, `AFDRemoteMoERunner` sends the hidden states
-and FFN runs its native internal-router MoE. With gate-on-Attention, the
-runner holds the shell's native gate, as native `MoERunner` does;
-`AFDExternalRoutingMoERunner` applies it and sends the router logits, and FFN
-executes its external-router experts path. The factory accepts only CUDA with
-`P2pNcclAFDConnector` and fixes the arguments that describe local experts
-(quantization, shared experts, transforms, EPLB and TP/DP/PCP sharding). It
+The configured connector's `AFDConnectorFactory` registration names the runner
+by module path, and `build_expert()` imports it; only `P2pNcclAFDConnector`
+registers one, `AFDRemoteMoERunner`. The runner registers like a native MoE
+layer but runs no local routing or expert kernel; it sends through the
+connector, yields for DBO, and receives the FFN output. With gate-on-FFN it
+sends the hidden states, and FFN runs its native internal-router MoE. With
+gate-on-Attention, the runner holds the shell's native gate, as native
+`MoERunner` does, applies it, and sends the router logits with the hidden
+states; FFN executes its external-router experts path. The factory accepts
+only CUDA and a connector that registers a runner, and fixes the arguments
+that describe local experts (quantization, shared experts, transforms, EPLB
+and TP/DP/PCP sharding). It
 rejects Attention-local EPLB, redundant experts, routed-expert capture, a
 non-finite `routed_scaling_factor`, and caller-supplied values for the
 arguments it fixes. Routed-experts connectors (DeepEP M2N) use a third mode

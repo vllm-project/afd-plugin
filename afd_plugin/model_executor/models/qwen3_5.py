@@ -12,7 +12,7 @@ from vllm.model_executor.models import qwen3_5 as native
 from vllm.model_executor.models import qwen3_next as next_native
 
 from afd_plugin.config import parse_optional_afd_config
-from afd_plugin.model_executor.ffn.remote import build_attention_moe_runner
+from afd_plugin.model_executor.ffn.remote import build_expert
 from afd_plugin.model_executor.models._weight_utils import (
     ATTENTION_ROLE,
     FFN_ROLE,
@@ -106,7 +106,7 @@ class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
         self.shared_expert_gate = None
         # Native Qwen3NextSparseMoeBlock factory arguments, minus local-expert
         # ones; EPLB and the other local-expert features are rejected there.
-        self.experts = build_attention_moe_runner(
+        self.experts = build_expert(
             vllm_config,
             gate=None,
             num_experts=self.n_routed_experts,
