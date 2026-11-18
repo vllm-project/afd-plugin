@@ -42,7 +42,7 @@ from vllm.v1.worker.utils import AttentionGroup
 # DP1 child-context metadata factory.
 # Signature: matches maybe_build_ubatch_runner exactly at the pinned commit.
 # Upstream: vllm/v1/worker/gpu/ubatch_utils.py, maybe_build_ubatch_runner;
-# 5df63a7203cdb9328d824a27b682e77c7b9928be (vLLM 0.32.0).
+# 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca (vLLM 0.34.0).
 # Removal plan: remove when native GPU DBO supports DP1.
 def maybe_build_ubatch_runner(
     vllm_config: VllmConfig,
@@ -78,7 +78,7 @@ def maybe_build_ubatch_runner(
 # runner instance. Native context fields, token counts and SP methods are kept.
 # Signature: matches UBatchRunner._make_forward_contexts at the pinned commit.
 # Upstream: vllm/v1/worker/gpu/ubatch_utils.py, UBatchRunner._make_forward_contexts;
-# 5df63a7203cdb9328d824a27b682e77c7b9928be (vLLM 0.32.0).
+# 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca (vLLM 0.34.0).
 # Removal plan: remove when native child contexts support DP1 metadata.
 def _make_forward_contexts(
     self,
@@ -120,7 +120,7 @@ def _make_forward_contexts(
 # retain native DP>1 coordination and native descriptor selection.
 # Signature: matches dispatch_cg_and_sync_dp exactly at the pinned commit.
 # Upstream: vllm/v1/worker/gpu/dp_utils.py, dispatch_cg_and_sync_dp;
-# 5df63a7203cdb9328d824a27b682e77c7b9928be (vLLM 0.32.0).
+# 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca (vLLM 0.34.0).
 # Removal plan: remove when native dispatch selects DP1 microbatch descriptors.
 def dispatch_cg_and_sync_dp(
     cudagraph_manager: CudaGraphManager | None,

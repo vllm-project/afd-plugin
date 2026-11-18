@@ -140,7 +140,7 @@ def _use_afd_ubatch_preparation(
         # A/F payload before threads start (or before FULL replay).
         # Signature: matches UBatchRunner.prepare in
         # vllm/v1/worker/gpu/ubatch_utils.py at vLLM
-        # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+        # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
         # Delegation exception: keep native slicing/attention preparation in the
         # bound method. Remove this seam when upstream offers a prepared-state
         # callback; no runner class or module-global function is replaced here.
@@ -212,7 +212,7 @@ def _use_afd_capture_input_preparation(
     # including the slot-mappings buffer added after pcp_manager.
     # Upstream source: vllm/v1/worker/gpu/cudagraph_utils.py,
     # prepare_inputs_to_capture; commit
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
     def prepare_inputs_to_capture(
         num_reqs: int,
         num_tokens: int,
@@ -289,10 +289,10 @@ def _use_afd_fullgraph_replay_hook(
     # execute-scoped AFD provider cannot publish runtime control.
     # Patch functionality: wrap only this manager instance and publish one
     # ordinary padded control payload immediately before each native replay.
-    # Signature: matches vLLM v0.32.0 ModelCudaGraphManager.run_fullgraph exactly.
+    # Signature: matches vLLM v0.34.0 ModelCudaGraphManager.run_fullgraph exactly.
     # Upstream source: vllm/v1/worker/gpu/cudagraph_utils.py,
     # ModelCudaGraphManager.run_fullgraph; commit
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
     # Delegation exception: native replay remains wholly in the saved bound
     # method; this scope owns only the AFD pre-replay control seam.
     # Removal/upstream plan: delete this hook when vLLM exposes a per-manager
@@ -386,7 +386,7 @@ def _use_afd_execution_context(
 
 
 class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
-    """Thin AFD seam over native vLLM 0.32.0 GPU ModelRunnerV2.
+    """Thin AFD seam over native vLLM 0.34.0 GPU ModelRunnerV2.
 
     Native V2 retains request state, input preparation, Attention/KV handling,
     sampling, and output ownership. The inherited AFD metadata methods are
@@ -437,7 +437,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
             raise
 
     def _afd_num_tokens_for_context(self, forward_context: ForwardContext) -> int:
-        # vLLM 0.32.0's token chain is
+        # vLLM 0.34.0's token chain is
         # scheduler_output.total_num_scheduled_tokens ->
         # dispatch_cg_and_sync_dp(..., need_eager=is_profile or skip_compiled)
         # -> ordinary ModelCudaGraphManager.dispatch() or the forced-eager
@@ -477,9 +477,9 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     # loading so Attention and FFN model loading overlap across roles.
     # Routed-experts connectors receive the loaded MoE layer order for their
     # cross-rank handshake.
-    # Signature: matches vLLM v0.32.0 GPUModelRunnerV2.load_model exactly.
+    # Signature: matches vLLM v0.34.0 GPUModelRunnerV2.load_model exactly.
     # Upstream: vllm/v1/worker/gpu/model_runner.py, load_model;
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
     # Delegation exception: native loading and model injection remain in super;
     # only the AFD connector handshake follows native loading.
     # Removal plan: remove when native loading supports connector lifecycle hooks.
@@ -507,7 +507,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     # Patch functionality: reserve each real V4 FlashMLA owner's native bound
     # before the unchanged profile so resident scratch overlaps its normal peak.
     # Signature/decorator: GPUModelRunner.profile_run, vllm/v1/worker/gpu/
-    # model_runner.py, 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # model_runner.py, 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
     # Delegation keeps the full native activation/sampler profile exactly once.
     # Remove when native profiling reserves scratch for all execution owners.
     @torch.inference_mode()
@@ -533,7 +533,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     # adapter; native KV allocation, runner and CUDA graph setup stay upstream.
     # Signature: matches GPUModelRunner.initialize_kv_cache at the pinned commit.
     # Upstream: vllm/v1/worker/gpu/model_runner.py, initialize_kv_cache;
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be (vLLM 0.32.0).
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca (vLLM 0.34.0).
     # Delegation exception: the large native KV/graph lifecycle remains in super;
     # only its factory seam is missing. Remove when upstream supports DP1 DBO.
     def initialize_kv_cache(
@@ -553,7 +553,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
             )
         # ### PATCH END: enable native DP1 UBatchRunner construction.
 
-    # Patch reason: vLLM 0.32.0 prepares FULL graph inputs before each warmup
+    # Patch reason: vLLM 0.34.0 prepares FULL graph inputs before each warmup
     # and formal capture forward, outside torch.cuda.graph, but does not expose
     # that lifecycle to AFD's control plane.
     # Patch functionality: temporarily wrap the exact upstream input-preparation
@@ -564,12 +564,12 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     # prepares inputs exactly twice per captured descriptor (warmup + capture);
     # profiling only truncates the descriptor list to
     # manager._max_full_descs_to_capture, which this wrapper mirrors.
-    # Signature: matches vLLM v0.32.0 GPUModelRunner.capture_model exactly
+    # Signature: matches vLLM v0.34.0 GPUModelRunner.capture_model exactly
     # (including the keyword-only profile_only parameter) and is forwarded
     # unchanged to super().
     # Upstream source: vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.capture_model; commit
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
     # Delegation exception: native capture remains wholly in super(); this
     # wrapper owns only the temporary AFD lifecycle seam.
     # Removal/upstream plan: delete this wrapper when vLLM exposes graph
@@ -624,11 +624,11 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     # AFD must install its sidecar at that exact context-construction seam.
     # Patch functionality: delegate all request/input/Attention/KV/sampling/
     # output work to native V2 while temporarily installing AFD metadata.
-    # Signature: matches vLLM v0.32.0 GPUModelRunnerV2.execute_model exactly,
+    # Signature: matches vLLM v0.34.0 GPUModelRunnerV2.execute_model exactly,
     # including randomize_inputs, forwarded unchanged to native dummy execution.
     # Upstream source: vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.execute_model; commit
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
     # Delegation exception: the upstream method is intentionally not copied;
     # only this narrow provider/profiler wrapper is AFD-specific.
     # Removal/upstream plan: delete this wrapper when vLLM exposes a plugin
@@ -667,10 +667,10 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     # connector, or pending metadata sidecar.
     # Patch functionality: preserve delegated native cleanup and guarantee all
     # AFD cleanup layers run when any earlier layer raises.
-    # Signature: matches vLLM v0.32.0 GPUModelRunnerV2.shutdown exactly.
+    # Signature: matches vLLM v0.34.0 GPUModelRunnerV2.shutdown exactly.
     # Upstream source: vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.shutdown; commit
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
     # Delegation exception: native resource release remains in super().shutdown;
     # this override contains only AFD-specific finalizers.
     # Removal/upstream plan: delete this wrapper if AFD-owned lifecycle moves
