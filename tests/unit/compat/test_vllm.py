@@ -60,3 +60,12 @@ def test_missing_runtime_keeps_cpu_safe_patch_imports(monkeypatch):
 
     assert compat.is_target_vllm_compatible()
     assert compat.get_target_vllm_version() == "0.34.0"
+
+
+def test_target_version_tracks_active_backend(monkeypatch):
+    monkeypatch.setattr(compat, "runtime_device_type", lambda: "npu")
+    assert compat.get_target_vllm_version() == compat.TARGET_NPU_VLLM_VERSION
+    assert compat.get_target_vllm_version("npu") == "0.32.0"
+    monkeypatch.setattr(compat, "runtime_device_type", lambda: "cuda")
+    assert compat.get_target_vllm_version() == compat.TARGET_VLLM_VERSION
+    assert compat.get_target_vllm_version("cuda") == "0.34.0"

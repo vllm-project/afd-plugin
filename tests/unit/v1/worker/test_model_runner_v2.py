@@ -1788,3 +1788,40 @@ def test_npu_v4_ubatch_prepare_error_restores_native_preparation(npu_v4_ubatch_c
         {"platform_stage": 1},
     ]
     assert events == []
+
+
+def test_initialize_kv_cache_forwards_extensible(monkeypatch):
+    runner = object.__new__(AFDAttentionModelRunnerV2)
+    recorded = {}
+
+    def native(
+        self,
+        kv_cache_config,
+        is_profiling=False,
+        kv_cache_allocation_context=None,
+        extensible=False,
+    ):
+        recorded.update(
+            config=kv_cache_config,
+            is_profiling=is_profiling,
+            allocation_context=kv_cache_allocation_context,
+            extensible=extensible,
+        )
+
+    monkeypatch.setattr(
+        native_v2.GPUModelRunner, "initialize_kv_cache", native, raising=True
+    )
+    config = object()
+    allocation_context = object()
+    runner.initialize_kv_cache(
+        config,
+        is_profiling=True,
+        kv_cache_allocation_context=allocation_context,
+        extensible=True,
+    )
+    assert recorded == {
+        "config": config,
+        "is_profiling": True,
+        "allocation_context": allocation_context,
+        "extensible": True,
+    }
