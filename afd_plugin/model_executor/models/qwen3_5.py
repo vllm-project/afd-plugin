@@ -311,15 +311,11 @@ class AFDQwen3_5Model(native.Qwen3_5Model):  # noqa: N801
             get_layer,
             prefix=f"{prefix}.layers",
         )
-        # Needed by the inherited native loader's fused shared-expert routing;
-        # role-local shells never enable the fused path.
-        self.is_fused_shared_expert_enabled = (
-            native.is_model_fused_shared_expert_compatible(
-                self.layers,
-                native.Qwen3NextSparseMoeBlock,
-                "mlp",
-            )
-        )
+        # vLLM 0.34 resolves fused shared experts from the live module tree.
+        # AFD role-local shells never construct that slot, so the layer set is
+        # empty and the model-level flag stays off.
+        self.is_fused_shared_expert_enabled = False
+        self.fused_shared_expert_layers = frozenset()
         self.make_empty_intermediate_tensors = (
             native.make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"],

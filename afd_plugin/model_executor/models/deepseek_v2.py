@@ -801,6 +801,7 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         # AFD role-local layers do not construct the native shared-expert
         # module, so the v0.34 fused-expert capability check is not applicable.
         self.is_fused_shared_expert_enabled = False
+        self.fused_shared_expert_layers = frozenset()
 
         if native.get_pp_group().is_last_rank:
             self.norm = native.RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
