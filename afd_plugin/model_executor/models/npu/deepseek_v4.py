@@ -328,9 +328,8 @@ class AFDDeepseekV4SyncAttentionGateRemoteMoE(AFDDeepseekV4AttentionGateRemoteMo
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
             raise RuntimeError("Sync Attention-side gate requires AFD forward metadata")
-        # AFD metadata is shared by the layer while DBO gives each ubatch its own
-        # thread and forward context, so resolve the stage once, before the send:
-        # the value has to survive the yield and the peer ubatch's forward.
+        # Resolve the stage once and reuse it for the send and the receive. Reading
+        # it again after the yield would let the two diverge.
         stage_idx = int(
             getattr(get_forward_context(), "ubatch_idx", afd_metadata.stage_idx),
         )
