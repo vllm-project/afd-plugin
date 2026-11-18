@@ -67,14 +67,30 @@ counted as validation.
 ## Eager full-accuracy crash
 
 The full GSM8K run on the AFD eager path (`AFD_GSM8K_LIMIT=all`, 1319 samples)
-crashed after 32 samples. The attention EngineCore reported
-`torch.AcceleratorError: CUDA error: an illegal memory access was encountered`
-while copying DP metadata to the device, and `CUDA_ERROR_ILLEGAL_ADDRESS` on
-`cuStreamSynchronize`. Because CUDA reports illegal accesses at the next API
-call, the metadata copy is a victim; the originating kernel is not yet
-localized. The run was re-queued with `CUDA_LAUNCH_BLOCKING=1` to identify the
-failing kernel. Until that finishes, full accuracy is **not validated**; only
-the 7-sample smoke result above is available.
+crashed at sample 32/1319 with
+`torch.AcceleratorError: CUDA error: an illegal memory access was encountered`.
+The error surfaced while copying the DP metadata payload to the device; because
+CUDA reports illegal accesses at the next API call, that copy is a victim, not
+the origin.
+
+Isolation results:
+
+- Native vLLM 0.34 eager without AFD serves the same ~2250-token prompt and
+  returns a normal completion, so the eager path of the base runtime does not
+  crash on this model.
+- Running the same AFD scenario under `CUDA_LAUNCH_BLOCKING=1` passed 40/40
+  samples, which points at an asynchronous ordering/race rather than a
+  deterministic shape error.
+- Rerunning the AFD eager scenario with `--gpu-memory-utilization 0.9` (about
+  15 GiB of KV-cache headroom instead of ~1.4 GiB) still crashed at
+  32/1319, so KV-cache memory pressure is **ruled out** as the cause.
+- The crash recurs at the same sample index without blocking, while blocking
+  hides it. The originating kernel has not been identified; a compute-sanitizer
+  run or a component-level bisection (connector send vs. model forward) is the
+  next step.
+
+Until that is resolved, full accuracy is **not validated**; only the 7-sample
+smoke result above is available.
 
 ## Coverage gaps
 
