@@ -57,13 +57,11 @@ ROUTING_HIDDEN_SIZE = 16
 ROUTING_NUM_EXPERTS = 8
 ROUTING_TOP_K = 2
 
-# The parity child process imports vLLM, initializes its distributed
-# environment and compiles the Triton MoE kernels on first use.
+# The child process starts vLLM and compiles the Triton MoE kernels.
 PARITY_TIMEOUT_S = 600
 PARITY_TOKEN_COUNTS = (1, 7)
 PARITY_HIDDEN_SIZE = 128
 PARITY_MODEL_LEN = 128
-# The single rank of the child process's vLLM world.
 PARITY_RANK = 0
 # Deterministic values ``(i % period - period // 2) / scale``, exact in BF16.
 WEIGHT_PATTERN = (31, 128)
@@ -148,19 +146,10 @@ def test_routing_proxy_matches_native_router(monkeypatch, renormalize):
     ],
 )
 def test_attention_moe_runner_matches_native_moe_bit_for_bit(tmp_path, routing):
-    """On CUDA, the Attention MoE built by vLLM's FusedMoEFactory sends the
-    payload the gate placement requires and returns, bit for bit, the output
-    of the unsplit native MoE, for both gate placements and for 1 and 7
-    tokens.
-
-    A loopback connector runs the FFN role's native MoE in-process on what
-    Attention sends: the complete MoE on the hidden states when FFN owns the
-    gate, or its external-router experts on the sent router logits when
-    Attention does.
+    """The split Attention MoE returns the native MoE's output bit for bit,
+    for both gate placements.
 
     Why: splitting the MoE between the roles must not change any output.
-    Both sides run the same kernels on the same inputs, so the comparison
-    uses rtol=0 and atol=0.
     """
     program = (
         "import runpy\n"
@@ -196,13 +185,11 @@ class _LoopbackFFN:
         num_tokens = hidden_states.shape[0]
         with set_forward_context(None, self.vllm_config, num_tokens=num_tokens):
             if payload:
-                # FFN compute_experts_output: native runner, external routing.
                 self.output = self.external_router_moe.experts(
                     hidden_states=hidden_states,
                     router_logits=payload["router_logits"],
                 ).clone()
             else:
-                # FFN compute_ffn_output: the complete native MoE.
                 self.output = self.internal_router_moe(hidden_states).clone()
 
     def recv_ffn_output(self, *, ref_tensor, ubatch_idx) -> torch.Tensor:

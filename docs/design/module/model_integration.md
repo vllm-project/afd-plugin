@@ -186,29 +186,16 @@ needed by the split execution.
 
 CUDA MoE splits at the remote-experts boundary. With gate-on-FFN, and with
 gate-on-Attention on non-routed connectors, Attention keeps native
-`DeepseekV2MoE.forward`. Its experts come from vLLM's own `FusedMoEFactory`
-through `build_expert()` in `ffn/remote.py`, with an AFD runner (`runner_cls`)
-and parameter-free routed experts (`routed_experts_cls`,
-`AFDRemoteRoutedExperts`, whose `AFDRemoteMoEMethod` allocates no weights).
-The configured connector's `AFDConnectorFactory` registration names the runner
-by module path, and `build_expert()` imports it; only `P2pNcclAFDConnector`
-registers one, `AFDRemoteMoERunner`. The runner registers like a native MoE
-layer but runs no local routing or expert kernel; it sends through the
-connector, yields for DBO, and receives the FFN output. With gate-on-FFN it
-sends the hidden states, and FFN runs its native internal-router MoE. With
-gate-on-Attention, the runner holds the shell's native gate, as native
-`MoERunner` does, applies it, and sends the router logits with the hidden
-states; FFN executes its external-router experts path. The factory accepts
-only CUDA and a connector that registers a runner, and fixes the arguments
-that describe local experts (quantization, shared experts, transforms, EPLB
-and TP/DP/PCP sharding). It
-rejects Attention-local EPLB, redundant experts, routed-expert capture, a
-non-finite `routed_scaling_factor`, and caller-supplied values for the
-arguments it fixes. Routed-experts connectors (DeepEP M2N) use a third mode
-with an AFD-owned forward: Attention runs the gate, top-k selection, and shared
-experts; FFN runs only the routed experts, and combine returns each token's
-weighted top-k sum. That shell sends through a parameter-free `RemoteFFNProxy`
-instead of the factory runner and also rejects EPLB. The NPU gate helper
+`DeepseekV2MoE.forward`, and `build_expert()` in `ffn/remote.py` builds its
+experts with vLLM's `FusedMoEFactory`: no expert weights, and the runner named
+by the connector's registration (only `P2pNcclAFDConnector` has one). With
+gate-on-FFN, the runner sends the hidden states and FFN runs its native
+internal-router MoE. With gate-on-Attention, the runner also applies the gate
+and sends the router logits; FFN executes its external-router experts path.
+Routed-experts connectors (DeepEP M2N) use a third mode with an AFD-owned
+forward: Attention runs the gate, top-k selection, and shared experts; FFN runs
+only the routed experts, and combine returns each token's weighted top-k sum.
+CUDA Attention-side remote experts currently reject EPLB. The NPU gate helper
 supports unquantized and Ascend W8A8 MoE expert computation; unsupported
 devices or quantization fail explicitly.
 
