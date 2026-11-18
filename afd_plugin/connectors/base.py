@@ -320,6 +320,10 @@ class AFDRoutedExpertsConnector(AFDConnectorBase):
     FFN worker selects the routed-experts runner for these connectors.
     """
 
+    # A two-stage capture may submit the first combine after posting the
+    # second dispatch, before issuing the second stage's experts.
+    early_combine_in_two_stage_graph = False
+
     # Extends AFDConnectorBase.init_afd_connector with optional keywords only,
     # so calls through the base contract stay valid.
     @abstractmethod

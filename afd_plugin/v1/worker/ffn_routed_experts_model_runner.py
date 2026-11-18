@@ -172,12 +172,17 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
         connector = self.routed_connector
         stage_ids = sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
         ffn_output = None
-        # Each stage's combine waits until just before that stage's next
+        # By default each combine waits until just before that stage's next
         # dispatch, matching Attention's DBO micro-batch order
         # D0(0) D1(0) C0(0) D0(1) C1(0) D1(1) ... C0(n) C1(n). Dispatch and
         # combine can block the host, so a combine issued earlier would wait
         # on an Attention combine that only follows the next stage's dispatch.
         # On the first layer no stage has a result to send back yet.
+        early_combine = (
+            connector.early_combine_in_two_stage_graph
+            and len(stage_ids) == 2
+            and torch.cuda.is_current_stream_capturing()
+        )
         pending_outputs: dict[int, tuple[torch.Tensor, AFDTransferContext]] = {}
         for layer_idx in self.moe_layer_indices:
             weights = self.local_experts[layer_idx].weights
@@ -185,6 +190,10 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
                 if stage_idx in pending_outputs:
                     connector.send_ffn_output(*pending_outputs.pop(stage_idx))
                 payload = connector.recv_attn_output(ubatch_idx=stage_idx)
+                # D1 is now posted. Capture C0 before E1, preserving the
+                # wire order D0 D1 C0 and each lane's expert-done event.
+                if early_combine and stage_idx == stage_ids[1]:
+                    connector.send_ffn_output(*pending_outputs.pop(stage_ids[0]))
                 ffn_output = connector.run_experts(payload, weights)
                 pending_outputs[stage_idx] = (ffn_output, payload.context)
         for stage_idx in stage_ids:

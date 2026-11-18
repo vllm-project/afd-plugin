@@ -200,6 +200,8 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             a share of every overlapping GEMM. Size the grid to the SMs that
             transport leaves free while it waits. Must be even (DeepGEMM
             launches 2-CTA clusters).
+        dbo_graph_wait_for_first_combine: In two-stage FFN graphs, wait on
+            the first combine before running the second stage's experts.
         cpu_timeout_s / gpu_timeout_s: DeepEP host-wait and kernel-spin
             timeouts.
         cpu_sync_min_tokens: Eager steps whose bucket is below this skip the
@@ -216,6 +218,7 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
     num_sms: int = 0
     num_qps: int = 0
     expert_num_sms: int = 0
+    dbo_graph_wait_for_first_combine: bool = False
     cpu_timeout_s: int = DEFAULT_TIMEOUT_S
     gpu_timeout_s: int = DEFAULT_TIMEOUT_S
     cpu_sync_min_tokens: int = 0
@@ -250,6 +253,8 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             raise ValueError("num_sms must be non-negative")
         if self.expert_num_sms < 0 or self.expert_num_sms % 2:
             raise ValueError("expert_num_sms must be a non-negative even number")
+        if not isinstance(self.dbo_graph_wait_for_first_combine, bool):
+            raise ValueError("dbo_graph_wait_for_first_combine must be a boolean")
         if self.cpu_sync_min_tokens < 0:
             raise ValueError("cpu_sync_min_tokens must be non-negative")
         if self.num_qps < 0:
@@ -944,6 +949,9 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         if not isinstance(self.extra_info, DeepEPM2NConfig):
             raise TypeError("DeepEPM2NAFDConnector expects DeepEPM2NConfig extra info")
         self.config = self.extra_info
+        self.early_combine_in_two_stage_graph = (
+            self.config.dbo_graph_wait_for_first_combine
+        )
         text_config = vllm_config.model_config.hf_text_config
         self.hidden_size: int = text_config.hidden_size
         self.top_k: int = text_config.num_experts_per_tok
@@ -1443,6 +1451,15 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             done = torch.cuda.Event()
             done.record(lane_stream)
         self._lane_done[state.lane] = done
+        if (
+            self.config.dbo_graph_wait_for_first_combine
+            and state.lane == 0
+            and len(self.stage_plans) == 2
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            # Only the FFN expert stream waits. Attention can consume MB1
+            # as soon as its own combine completes.
+            torch.cuda.current_stream(self.device).wait_event(done)
 
     def synchronize_lanes(self) -> None:
         """Make the caller's stream wait for every lane's outstanding combine.

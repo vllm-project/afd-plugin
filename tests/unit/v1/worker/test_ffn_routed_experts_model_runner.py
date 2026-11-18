@@ -53,7 +53,10 @@ def _send(stage):
     return [("send", f"out(rows{stage})", stage)]
 
 
-def test_forward_follows_attention_dbo_order_then_joins_lanes():
+@pytest.mark.parametrize(("capturing", "strict"), [(False, True), (True, False)])
+def test_forward_follows_attention_dbo_order_then_joins_lanes(
+    monkeypatch, capturing, strict
+):
     """For layers (1, 3) and stages (0, 1) the FFN issues Attention's DBO
     micro-batch order: both stages dispatch layer 1, then each stage sends
     its layer-1 result just before dispatching layer 3, and the last results
@@ -65,7 +68,9 @@ def test_forward_follows_attention_dbo_order_then_joins_lanes():
     experts (D0 C0 D1) hung every rank in the graph+DBO warmup. A CUDA-graph
     capture also fails if forked lane streams are not joined.
     """
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
     runner = _runner()
+    runner.connector.early_combine_in_two_stage_graph = strict
 
     output = runner._ffn_forward(dp_metadata_list={1: _dp(3), 0: _dp(5)})
 
@@ -84,6 +89,17 @@ def test_forward_follows_attention_dbo_order_then_joins_lanes():
     assert runner.connector.events == expected
     assert output == "out(rows1)"
     assert len(runner.connector.control_updates) == 1
+
+
+def test_capture_sends_first_result_before_running_second_experts(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    runner = _runner()
+    runner.connector.early_combine_in_two_stage_graph = True
+    runner._ffn_forward(dp_metadata_list={0: _dp(5), 1: _dp(3)})
+
+    for layer in MOE_LAYERS:
+        run = runner.connector.events.index(("run", "rows1", f"w{layer}"))
+        assert runner.connector.events[run - 2 : run] == [("recv", 1), *_send(0)]
 
 
 def test_forward_with_one_stage_sends_each_layer_before_the_next_recv():
