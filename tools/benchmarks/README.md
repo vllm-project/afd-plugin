@@ -55,6 +55,16 @@ The connector is not AFD-specific. For a single vanilla vLLM process, pass
 the same `--kv-transfer-config`:
 
 ```bash
+DECODE_BENCH='{}' \
+    bash recipe/gpu/baseline/qwen3_235b_a22b_fp8/vanilla_tp4.sh
+```
+
+The recipe adds the repository root to `PYTHONPATH`; set `AFD_REPO` when
+running it from outside the repository.
+
+For a direct `vllm serve` invocation, pass the same configuration:
+
+```bash
 export PYTHONPATH=$PWD
 vllm serve "$MODEL_PATH" \
     --tensor-parallel-size 4 \

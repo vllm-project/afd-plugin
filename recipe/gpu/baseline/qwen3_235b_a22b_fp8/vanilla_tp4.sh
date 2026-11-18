@@ -24,6 +24,8 @@
 #   ALL2ALL_BACKEND          MoE all-to-all backend (allgather_reducescatter);
 #                            DBO requires DeepEP or NIXL instead
 #   GPU_MEMORY_UTILIZATION   optional GPU memory utilization fraction (unset)
+#   DECODE_BENCH             optional decode-benchmark connector config JSON
+#   AFD_REPO                 repository root (with DECODE_BENCH)
 #   EXTRA_ARGS               extra `vllm serve` arguments (empty)
 
 set -euo pipefail
@@ -43,6 +45,8 @@ DBO_DECODE_TOKEN_THRESHOLD=${DBO_DECODE_TOKEN_THRESHOLD:-2}
 DBO_PREFILL_TOKEN_THRESHOLD=${DBO_PREFILL_TOKEN_THRESHOLD:-2}
 ALL2ALL_BACKEND=${ALL2ALL_BACKEND:-allgather_reducescatter}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-}
+DECODE_BENCH=${DECODE_BENCH:-}
+AFD_REPO=${AFD_REPO:-}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 
 export VLLM_USE_V2_MODEL_RUNNER=1
@@ -80,6 +84,11 @@ fi
 
 if [[ -n "$GPU_MEMORY_UTILIZATION" ]]; then
     ARGS+=(--gpu-memory-utilization "$GPU_MEMORY_UTILIZATION")
+fi
+
+if [[ -n "$DECODE_BENCH" ]]; then
+    ARGS+=(--kv-transfer-config "{\"kv_connector\": \"AFDDecodeBenchConnector\", \"kv_connector_module_path\": \"tools.benchmarks.decode_bench\", \"kv_role\": \"kv_both\", \"kv_connector_extra_config\": $DECODE_BENCH}")
+    export PYTHONPATH=${AFD_REPO:-$PWD}${PYTHONPATH:+:$PYTHONPATH}
 fi
 
 # shellcheck disable=SC2206
