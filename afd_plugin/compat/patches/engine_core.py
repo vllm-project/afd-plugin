@@ -327,6 +327,7 @@ def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
         self.model_executor.get_supported_kv_cache_layouts(),
         [s for specs in kv_cache_specs for s in specs.values()],
     )
+    global_kv_cache_groups = None
     if hasattr(core_module, "get_global_kv_cache_groups"):
         global_kv_cache_groups = core_module.get_global_kv_cache_groups(
             vllm_config, kv_cache_specs
@@ -363,9 +364,17 @@ def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
     # Track max_model_len before KV cache config to detect auto-fit changes
     max_model_len_before = vllm_config.model_config.max_model_len
 
-    kv_cache_configs = core_module.get_kv_cache_configs(
-        vllm_config, kv_cache_specs, available_gpu_memory
-    )
+    if global_kv_cache_groups is None:
+        kv_cache_configs = core_module.get_kv_cache_configs(
+            vllm_config, kv_cache_specs, available_gpu_memory
+        )
+    else:
+        kv_cache_configs = core_module.get_kv_cache_configs(
+            vllm_config,
+            kv_cache_specs,
+            available_gpu_memory,
+            global_kv_cache_groups,
+        )
     for kv_cache_config in kv_cache_configs:
         kv_cache_config.kv_cache_layout = vllm_config.cache_config.kv_cache_layout
 

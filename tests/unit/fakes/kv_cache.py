@@ -21,8 +21,9 @@ class KVCacheExecutor:
     def get_supported_kv_cache_layouts(self):
         return ["layered"]
 
-    def set_kv_cache_layout(self, layout_name):
+    def set_kv_cache_layout(self, layout_name, cp_kv_cache_interleave_size=None):
         self.kv_cache_layout = layout_name
+        self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
 
     def initialize_from_config(self, kv_cache_configs):
         # Workers receive a serialized configuration, not a live scheduler reference.
