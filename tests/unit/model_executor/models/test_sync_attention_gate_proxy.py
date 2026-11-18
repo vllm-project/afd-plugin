@@ -97,6 +97,21 @@ class _RecordingConnector:
         return ref_tensor * 0.5
 
 
+@pytest.fixture(autouse=True)
+def _stub_dbo_yield(monkeypatch):
+    """Keep the protocol tests off the real DBO custom op.
+
+    The registered op dispatches through CUDA and rejects a CPU tensor before the
+    DBO check runs, so even a DBO-disabled run must not reach it.
+    """
+
+    monkeypatch.setattr(
+        adapter,
+        "maybe_apply_dbo_yield",
+        lambda hidden_states, *, role: hidden_states,
+    )
+
+
 def _fake_gate_topk(monkeypatch, events: list[tuple], topk_ids, topk_weights):
     """Replace the gate helper with one that records and returns fixed routing.
 
@@ -160,13 +175,17 @@ def _shell(*, events, connector, shared_experts):
     return shell
 
 
-def _install_metadata(monkeypatch, connector, events):
+def _install_metadata(monkeypatch, connector, events, *, ubatch_idx=None):
     afd_metadata = SimpleNamespace(connector=connector, stage_idx=7)
     monkeypatch.setattr(
         adapter,
         "get_afd_metadata_from_forward_context",
         lambda: afd_metadata,
     )
+    forward_context = SimpleNamespace()
+    if ubatch_idx is not None:
+        forward_context.ubatch_idx = ubatch_idx
+    monkeypatch.setattr(adapter, "get_forward_context", lambda: forward_context)
     return afd_metadata
 
 
@@ -236,3 +255,73 @@ def test_forward_refuses_a_context_without_afd_metadata(monkeypatch):
 
     with pytest.raises(RuntimeError, match="AFD forward metadata"):
         shell(torch.zeros(2, HIDDEN, dtype=torch.bfloat16))
+
+
+def test_forward_resolves_the_stage_before_the_dbo_yield(monkeypatch):
+    """The stage resolved before the yield is the one the receive uses."""
+
+    events: list[tuple] = []
+    connector = _RecordingConnector(events)
+    afd_metadata = _install_metadata(monkeypatch, connector, events, ubatch_idx=1)
+    forward_context = SimpleNamespace(ubatch_idx=1)
+    monkeypatch.setattr(adapter, "get_forward_context", lambda: forward_context)
+
+    def fake_yield(hidden_states, *, role):
+        events.append(("yield", role))
+        # The peer ubatch runs from here. Both stage sources move: the context the
+        # peer forward sees, and the shared metadata that already carries this
+        # forward's stage -- a receive that re-reads either must fail the test.
+        forward_context.ubatch_idx = 0
+        afd_metadata.stage_idx = 0
+        return hidden_states
+
+    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", fake_yield)
+    topk_ids = torch.zeros((2, TOP_K), dtype=torch.int32)
+    topk_weights = torch.ones((2, TOP_K), dtype=torch.float32)
+    _fake_gate_topk(monkeypatch, events, topk_ids, topk_weights)
+    shell = _shell(events=events, connector=connector, shared_experts=True)
+    hidden_states = torch.full((2, HIDDEN), 8.0, dtype=torch.bfloat16)
+
+    shell(hidden_states)
+
+    assert [event[0] for event in events] == ["gate", "send", "shared", "yield", "recv"]
+    assert events[1][2].metadata.stage_idx == 1
+    assert events[-1][1] == 1, "the receive followed the peer ubatch's stage"
+
+
+def test_two_stages_keep_their_own_routing_and_activation(monkeypatch):
+    """Each ubatch sends its own routing and activation and receives its stage."""
+
+    events: list[tuple] = []
+    connector = _RecordingConnector(events)
+    _install_metadata(monkeypatch, connector, events)
+    contexts = {stage: SimpleNamespace(ubatch_idx=stage) for stage in (0, 1)}
+    current = {"context": contexts[0]}
+    monkeypatch.setattr(adapter, "get_forward_context", lambda: current["context"])
+    monkeypatch.setattr(
+        adapter,
+        "maybe_apply_dbo_yield",
+        lambda hidden_states, *, role: hidden_states,
+    )
+
+    stages = []
+    for stage in (0, 1):
+        routing_ids = torch.full((2, TOP_K), stage + 1, dtype=torch.int32)
+        routing_weights = torch.full(
+            (2, TOP_K), float(stage + 1) / 4.0, dtype=torch.float32
+        )
+        _fake_gate_topk(monkeypatch, events, routing_ids, routing_weights)
+        shell = _shell(events=events, connector=connector, shared_experts=True)
+        hidden_states = torch.full((2, HIDDEN), 8.0 + stage, dtype=torch.bfloat16)
+        current["context"] = contexts[stage]
+        shell(hidden_states)
+        stages.append((routing_ids, routing_weights, hidden_states))
+
+    sends = [event for event in events if event[0] == "send"]
+    receives = [event for event in events if event[0] == "recv"]
+    assert [send[2].metadata.stage_idx for send in sends] == [0, 1]
+    for index, (routing_ids, routing_weights, hidden_states) in enumerate(stages):
+        assert sends[index][3]["routing"][0] is routing_ids
+        assert sends[index][3]["routing"][1] is routing_weights
+        assert sends[index][1] is hidden_states
+        assert receives[index][1] == index
