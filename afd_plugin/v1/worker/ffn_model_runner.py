@@ -8,7 +8,6 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
-from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config import update_config as update_vllm_config
 from vllm.distributed.parallel_state import get_world_group, graph_capture
@@ -397,34 +396,29 @@ class GPUFFNModelRunner:
         if self._graph_memory_pool is None:
             self._graph_memory_pool = torch.cuda.graph_pool_handle()
 
-        set_cudagraph_capturing_enabled(True)
-        try:
-            with graph_capture(device=self.device):
-                if is_warmup:
-                    cast(
-                        AFDControlPlane, self.connector.control_plane
-                    ).update_state_from_dp_metadata(
-                        _make_dp_metadata_payload(
-                            dp_metadata_list,
-                            is_graph_capturing=False,
-                            is_warmup=True,
-                        ),
-                    )
-                    self._ffn_forward(
-                        dp_metadata_list=dp_metadata_list,
+        with graph_capture(device=self.device):
+            if is_warmup:
+                cast(
+                    AFDControlPlane, self.connector.control_plane
+                ).update_state_from_dp_metadata(
+                    _make_dp_metadata_payload(
+                        dp_metadata_list,
                         is_graph_capturing=False,
                         is_warmup=True,
-                        update_connector_state=False,
-                    )
-                else:
-                    self._dummy_run(
-                        cudagraph_runtime_mode=CUDAGraphMode.FULL,
-                        dp_metadata_list=dp_metadata_list,
-                        is_attn_graph_capturing=is_attn_graph_capturing,
-                    )
-        finally:
-            set_cudagraph_capturing_enabled(False)
-
+                    ),
+                )
+                self._ffn_forward(
+                    dp_metadata_list=dp_metadata_list,
+                    is_graph_capturing=False,
+                    is_warmup=True,
+                    update_connector_state=False,
+                )
+            else:
+                self._dummy_run(
+                    cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                    dp_metadata_list=dp_metadata_list,
+                    is_attn_graph_capturing=is_attn_graph_capturing,
+                )
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
         cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
         return int(cuda_graph_size)

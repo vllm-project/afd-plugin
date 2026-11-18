@@ -135,6 +135,7 @@ def dispatch_cg_and_sync_dp(
     parallel_config: ParallelConfig | None = None,
     allow_ubatching: bool = False,
     uniform_decode: bool = False,
+    allow_skip_drafts: bool = False,
     dp_sync_state: DPSyncState | None = None,
 ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
     """Pick a cudagraph descriptor for this batch, agreeing it across DP ranks.
@@ -265,6 +266,7 @@ def dispatch_cg_and_sync_dp(
         parallel_config=parallel_config,
         allow_ubatching=allow_ubatching,
         uniform_decode=uniform_decode,
+        allow_skip_drafts=allow_skip_drafts,
     )
 
 

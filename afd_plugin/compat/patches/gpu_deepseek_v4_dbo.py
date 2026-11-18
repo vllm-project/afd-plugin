@@ -38,6 +38,8 @@ from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -123,7 +125,7 @@ def _use_v4_ubatch_preparation(
     # Patch functionality: retain native stage-zero inputs where their fixed
     # layout is aligned; stage other inputs before native metadata builders.
     # Stable addresses are refreshed before FULL replay as well as eager/capture.
-    # Signature: matches DefaultModelState.prepare_attn at vLLM 5df63a7,
+    # Signature: matches DefaultModelState.prepare_attn at vLLM 0.34.0,
     # vllm/v1/worker/gpu/model_states/default.py. Delegation retains native
     # metadata construction; remove when native stage buffers meet V4's ABI.
     def prepare_attn(
@@ -165,7 +167,7 @@ def _use_v4_ubatch_preparation(
     # Patch reason: native model-input slicing recreates the unaligned view.
     # Patch functionality: bind the model call to the same persistent positions
     # prepared for this stage; native threads, streams and finish stay intact.
-    # Signature: matches UBatchRunner.begin_capturable_run at vLLM 5df63a7,
+    # Signature: matches UBatchRunner.begin_capturable_run at vLLM 0.34.0,
     # vllm/v1/worker/gpu/ubatch_utils.py. The callable accepts the native open
     # model-input dictionary. Remove with the aligned V4 preparation adapter.
     def begin_capturable_run(
@@ -194,7 +196,7 @@ def _use_v4_ubatch_preparation(
     # indexer builders, restore it even on failure, and bind aligned live/capture
     # slots. Native slicing, metadata construction and FULL replay stay native.
     # Signature: matches UBatchRunner.prepare in vllm/v1/worker/gpu/ubatch_utils.py
-    # at vLLM 5df63a7203cdb9328d824a27b682e77c7b9928be; indexer.py at the same pin
+    # at vLLM 0.34.0; indexer.py at the same pin
     # owns the physical-capacity buffers and planner refill. Delegation avoids
     # copying the full native preparation. Remove when native propagates its SM
     # budget (#60732) and provides stable aligned V4 stage inputs.
@@ -203,10 +205,12 @@ def _use_v4_ubatch_preparation(
         input_batch: InputBatch,
         block_tables: tuple[torch.Tensor, ...],
         slot_mappings: torch.Tensor,
-        cg_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        batch_desc: BatchExecutionDescriptor,
+        dp_sync_state: DPSyncState | None = None,
         for_capture: bool = False,
     ) -> UBatchState:
         # ### PATCH START: V4 stage input and indexer preparation.
+        cg_mode = batch_desc.cg_mode
         indexer_budgets: list[tuple[DeepseekV32IndexerMetadataBuilder, int]] = []
         try:
             for groups in self.attn_groups:
@@ -217,7 +221,12 @@ def _use_v4_ubatch_preparation(
                             indexer_budgets.append((builder, builder.num_sms))
                             builder.num_sms = self.sm_control.compute_sms
             prepared = original_ubatch_prepare(
-                input_batch, block_tables, slot_mappings, cg_mode, for_capture
+                input_batch,
+                block_tables,
+                slot_mappings,
+                batch_desc,
+                dp_sync_state,
+                for_capture,
             )
         finally:
             # Reverse order also restores correctly if groups share a builder.

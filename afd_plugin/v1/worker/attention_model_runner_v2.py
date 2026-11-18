@@ -19,6 +19,8 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker import utils as v2_worker_utils
 from vllm.v1.worker.gpu import cudagraph_utils as v2_cudagraph_utils
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
@@ -147,12 +149,18 @@ def _use_afd_ubatch_preparation(
             input_batch: InputBatch,
             block_tables: tuple[torch.Tensor, ...],
             slot_mappings: torch.Tensor,
-            cg_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+            batch_desc: BatchExecutionDescriptor,
+            dp_sync_state: DPSyncState | None = None,
             for_capture: bool = False,
         ) -> UBatchState:
             # ### PATCH START: bind AFD to native stage state outside graph execution.
             prepared = original_prepare(
-                input_batch, block_tables, slot_mappings, cg_mode, for_capture
+                input_batch,
+                block_tables,
+                slot_mappings,
+                batch_desc,
+                dp_sync_state,
+                for_capture,
             )
             if event_tracker is not None:
                 desc, is_warmup = event_tracker.consume(
@@ -166,7 +174,9 @@ def _use_afd_ubatch_preparation(
                 if capture_prepared is not None:
                     capture_prepared(desc, prepared, is_warmup)
             else:
-                runner._afd_is_graph_replaying = cg_mode == CUDAGraphMode.FULL
+                runner._afd_is_graph_replaying = (
+                    batch_desc.cg_mode == CUDAGraphMode.FULL
+                )
             runner.install_mrv2_ubatch_metadata(
                 prepared.slices, prepared.forward_contexts, input_batch.num_tokens
             )
@@ -198,8 +208,8 @@ def _use_afd_capture_input_preparation(
     # module symbol once before each warmup/formal-capture forward.
     # Patch functionality: preserve native preparation and stage the matching
     # AFD metadata before the forward; synchronous connectors also send control.
-    # Signature: matches vLLM v0.32.0 prepare_inputs_to_capture exactly,
-    # including the trailing pcp_manager parameter.
+    # Signature: matches vLLM v0.34.0 prepare_inputs_to_capture exactly,
+    # including the slot-mappings buffer added after pcp_manager.
     # Upstream source: vllm/v1/worker/gpu/cudagraph_utils.py,
     # prepare_inputs_to_capture; commit
     # 5df63a7203cdb9328d824a27b682e77c7b9928be.
@@ -214,6 +224,7 @@ def _use_afd_capture_input_preparation(
         full_cudagraph: bool,
         max_query_len: int | None = None,
         pcp_manager: PCPManager | None = None,
+        slot_mappings_buffer: torch.Tensor | None = None,
     ) -> v2_cudagraph_utils.AttentionState:
         # ### PATCH START: stage one exact AFD capture event.
         attention_state = original_prepare(
@@ -227,6 +238,7 @@ def _use_afd_capture_input_preparation(
             full_cudagraph=full_cudagraph,
             max_query_len=max_query_len,
             pcp_manager=pcp_manager,
+            slot_mappings_buffer=slot_mappings_buffer,
         )
         desc, is_warmup = event_tracker.consume(num_reqs, num_tokens)
         runner._is_warmup = is_warmup
@@ -529,6 +541,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
         kv_cache_config: KVCacheConfig,
         is_profiling: bool = False,
         kv_cache_allocation_context: AbstractContextManager | None = None,
+        extensible: bool = False,
     ) -> None:
         # ### PATCH START: enable native DP1 UBatchRunner construction.
         with use_gpu_mrv2_ubatch_factory():
@@ -536,6 +549,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
                 kv_cache_config,
                 is_profiling=is_profiling,
                 kv_cache_allocation_context=kv_cache_allocation_context,
+                extensible=extensible,
             )
         # ### PATCH END: enable native DP1 UBatchRunner construction.
 
