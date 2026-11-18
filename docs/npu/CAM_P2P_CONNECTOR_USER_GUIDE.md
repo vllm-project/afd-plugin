@@ -357,8 +357,9 @@ vllm serve /path/to/DeepSeek-V4 \
 ```
 
 Drop `--enforce-eager` and add `--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [8, 16, 32, 64, 128]}'` to run the same pair with ACL graphs.
-The configuration is rejected when `compute_gate_on_attention=true` is combined with DBO,
-ubatching, TP > 1, a connector other than `CAMP2pAFDConnector`, or a target other than DeepSeek-V4.
+`compute_gate_on_attention=true` requires `CAMP2pAFDConnector`, DeepSeek-V4 and TP 1. With DBO
+or ubatching it also requires Attention DP > 1 and exactly two microbatches; any other
+combination is rejected.
 
 For model-specific launch and validation cases, see the
 [E2E guide](../../tests/e2e/README.md).
