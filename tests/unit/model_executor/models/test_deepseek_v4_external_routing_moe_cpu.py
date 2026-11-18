@@ -167,7 +167,17 @@ def _install_stub_modules():
     routing_spec.loader.exec_module(routing_module)
 
     quant = types.ModuleType("vllm_ascend.quantization.quant_type")
-    quant.QuantType = type("QuantType", (), {"NONE": 0})
+    quant.QuantType = type(
+        "QuantType",
+        (),
+        {
+            "NONE": 0,
+            "W8A8MXFP": 3,
+            "W4A4MXFP": 5,
+            "W4A8MXFP": 6,
+            "W4A16MXFP": 8,
+        },
+    )
 
     dataclass_module = types.ModuleType(
         "vllm_ascend.ops.fused_moe.dataclass.prepare_finalize"
@@ -303,7 +313,7 @@ class _Experts(torch.nn.Module):
         self.moe_config = types.SimpleNamespace(
             is_sequence_parallel=False, dp_size=1, pcp_size=1, tp_size=1, dp_group=None
         )
-        self.quant_type = 0
+        self.quant_type = 3  # W8A8MXFP: an FP8 activation, like the transport
         self.ascend_pertoken_scale = "stale"
         self.ascend_mc2_mask = "stale"
         self.seen = []
@@ -904,3 +914,50 @@ def test_the_ffn_runner_carries_the_received_scale_to_the_experts(loaded):
     assert consumed.shape == (4, 2)
     assert _e8m0_bytes(consumed) == _e8m0_bytes(scale)
     assert connector.sent, "the runner did not send the FFN output back"
+
+
+@pytest.mark.parametrize(
+    "quant_type,message",
+    [
+        pytest.param(5, "W4A4MXFP expects FP4", id="w4a4"),
+        pytest.param(8, "W4A16MXFP expects BF16", id="w4a16"),
+    ],
+)
+def test_a_transported_pair_is_refused_for_experts_that_take_another_activation(
+    loaded, quant_type, message
+):
+    """Prepare skips requantization, so a non-FP8 expert type must not start."""
+
+    module, context, _ = loaded
+    context._EXTRA_CTX.moe_comm_method = _AllGatherComm(_moe_config())
+    experts = _Experts()
+    experts.quant_type = quant_type
+    component = module.AFDExternalRoutingMoE(experts)
+
+    with pytest.raises(RuntimeError, match=message):
+        component.forward(
+            torch.zeros(4, 64, dtype=torch.float8_e4m3fn),
+            topk_ids=torch.zeros(4, 1, dtype=torch.int32),
+            topk_weights=torch.ones(4, 1),
+            activation_scale=_e8m0_rows(4, 2),
+        )
+    assert experts.seen == [], "expert execution ran on mismatched quantization"
+
+
+def test_a_transported_pair_reaches_experts_that_take_an_fp8_activation(loaded):
+    """W8A8MXFP and W4A8MXFP accept the transported E4M3 pair."""
+
+    module, context, _ = loaded
+    context._EXTRA_CTX.moe_comm_method = _AllGatherComm(_moe_config())
+    experts = _Experts()
+    experts.quant_type = 6  # W4A8MXFP: FP8 activation, FP4 weights
+    component = module.AFDExternalRoutingMoE(experts)
+
+    component.forward(
+        torch.zeros(4, 64, dtype=torch.float8_e4m3fn),
+        topk_ids=torch.zeros(4, 1, dtype=torch.int32),
+        topk_weights=torch.ones(4, 1),
+        activation_scale=_e8m0_rows(4, 2),
+    )
+
+    assert experts.seen, "the routed experts never ran"

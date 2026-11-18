@@ -348,9 +348,19 @@ def _prebuilt_comms(moe_config) -> dict[type, object]:
     return candidates
 
 
+#: Expert quant types whose activation is FP8, and which can therefore consume the
+#: E4M3 activation the MXFP8 transport carries. W4A4MXFP expects FP4 and W4A16MXFP
+#: expects BF16, so handing either of them a transported E4M3 pair would reach the
+#: fused GMM with mismatched activation formats.
+_A8_MXFP_EXPERT_QUANT_TYPES = frozenset(
+    {QuantType.W8A8MXFP, QuantType.W4A8MXFP},
+)
+
+
 def _require_activation_scale_pair(
     hidden_states: torch.Tensor,
     activation_scale: torch.Tensor | None,
+    quant_type: QuantType,
 ) -> None:
     """Refuse anything but a matching E4M3 activation and E8M0 scale pair.
 
@@ -359,7 +369,9 @@ def _require_activation_scale_pair(
     activation would make the MoE skip quantizing a tensor that still needs it.
 
     Only the target format is accepted. E5M2 would take the same route while the
-    weight path is defined for E4M3.
+    weight path is defined for E4M3. A transported pair also requires an expert
+    type that takes an FP8 activation: prepare skips requantization for a
+    pre-quantized input, so an FP4 expert type would receive E4M3 bytes as FP4.
     """
     if activation_scale is None:
         if hidden_states.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
@@ -378,6 +390,14 @@ def _require_activation_scale_pair(
             "DSV4 external routing needs one scale row per activation row; got "
             f"{activation_scale.shape[0]} scale rows for "
             f"{hidden_states.shape[0]} activation rows",
+        )
+    if quant_type not in _A8_MXFP_EXPERT_QUANT_TYPES:
+        name = getattr(quant_type, "name", str(quant_type))
+        raise RuntimeError(
+            "DSV4 external routing carries an E4M3 activation with its E8M0 scale, "
+            f"so the experts must take an FP8 activation; the configured quant type "
+            f"{name} cannot consume it. W4A4MXFP expects FP4 and W4A16MXFP expects "
+            "BF16, while W8A8MXFP and W4A8MXFP accept the transported pair.",
         )
 
 
@@ -432,9 +452,13 @@ class AFDExternalRoutingMoE:
             maybe_normalize_mxfp_scale_layout,
         )
 
-        _require_activation_scale_pair(hidden_states, activation_scale)
-
         experts = self.routed_experts
+        _require_activation_scale_pair(
+            hidden_states,
+            activation_scale,
+            experts.quant_type,
+        )
+
         previous_comm = _EXTRA_CTX.moe_comm_method
         comm = self._comm_for(_EXTRA_CTX.moe_comm_type, previous_comm)
         prepare_finalize = comm.prepare_finalize
