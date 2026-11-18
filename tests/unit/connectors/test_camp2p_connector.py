@@ -494,3 +494,62 @@ def test_camp2p_init_fails_cleanly_without_ascend_runtime(monkeypatch):
 
     with pytest.raises(RuntimeError, match="AFD Ascend custom ops|torch-npu"):
         connector.init_afd_connector()
+
+
+def test_camp2p_mxfp8_send_keeps_each_stage_on_its_own_rows(monkeypatch):
+    """Mode 4 quantizes exactly the rows of the stage it is sending."""
+
+    import torch
+
+    methods = {}
+    monkeypatch.setattr(camp2p_module, "_CAMP2P_CUSTOM_OPS_REGISTERED", False)
+    monkeypatch.setattr(
+        camp2p_module,
+        "direct_register_custom_op",
+        lambda **kwargs: methods.update({kwargs["op_name"]: kwargs["op_func"]}),
+    )
+    camp2p_module._register_camp2p_custom_ops()
+
+    quantize_rows: list[int] = []
+    transport: list[tuple] = []
+
+    def fake_quantize(hidden_states):
+        rows, hidden_size = (int(size) for size in hidden_states.shape)
+        quantize_rows.append(rows)
+        scale = torch.ones((rows, -(-hidden_size // 32)), dtype=torch.uint8)
+        return hidden_states.to(torch.float8_e4m3fn), scale
+
+    def fake_a2e(*args):
+        transport.append(args)
+        return (None, None, None, torch.tensor([1]), None, None)
+
+    monkeypatch.setattr(camp2p_module, "mx_quantize_a2e_activation", fake_quantize)
+    monkeypatch.setattr(torch.ops.afd_ascend, "a2e", fake_a2e, raising=False)
+
+    for stage, rows in ((0, 3), (1, 1)):
+        context = SimpleNamespace(ubatch_idx=stage)
+        monkeypatch.setattr(camp2p_module, "get_forward_context", lambda c=context: c)
+        hidden = torch.full((rows, 32), float(stage + 1))
+        methods["afd_camp2p_send_attn_output"](
+            hidden,
+            "group0",
+            "group1",
+            "",
+            rows,
+            32,
+            2,
+            4,
+            4,
+            1,
+            8,
+            0,
+            None,
+            None,
+            camp2p_module.A2E_QUANT_MODE_MXFP8,
+        )
+
+    assert quantize_rows == [3, 1]
+    assert [len(call[0]) for call in transport] == [3, 1]
+    assert [call[12].shape[0] for call in transport] == [3, 1]
+    assert [call[13] for call in transport] == [4, 4]
+    assert not torch.equal(transport[0][0][:1].float(), transport[1][0].float())
