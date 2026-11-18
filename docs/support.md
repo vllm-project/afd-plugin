@@ -62,10 +62,11 @@ compiled-prefill blocker for the AFD graph path.
 
 - GPU accuracy evidence covers selected first-300 GSM8K comparisons, not
   full-dataset accuracy, numerical equivalence, or performance improvement.
-- vLLM 0.34 GPU: the AFD eager path is validated on L20X with
-  DeepSeek-V2-Lite; AFD CUDA Graph is not validated because vLLM 0.34 compiled
-  prefill fails on L20 even without AFD. The native baseline graph case passes
-  only with eight-token chunked prefill.
+- vLLM 0.34 GPU: the AFD eager path has a passing smoke run on L20X with
+  DeepSeek-V2-Lite, but the full-accuracy run crashed at 32/1319 samples with an
+  illegal memory access and is not validated. AFD CUDA Graph is not validated
+  because vLLM 0.34 compiled prefill fails on L20 even without AFD. The native
+  baseline graph case passes only with eight-token chunked prefill.
 - DeepSeek-V4-Flash is not validated on L20 under vLLM 0.34; its DeepGEMM path
   requires SM90 or newer while L20 is SM89.
 - DeepSeek-V2-Lite TP2 Graph + DBO and DP2 eager DBO can require force

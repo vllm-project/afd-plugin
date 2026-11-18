@@ -29,7 +29,7 @@ the AFD checkout installed editable.
 | Cell | Execution | GPUs | Result | Evidence |
 | --- | --- | --- | --- | --- |
 | AFD, DeepSeek-V2-Lite, `afd-v2-eager-1a1f` smoke | eager, `P2pNcclAFDConnector` | 2 | pass; 7 GSM8K samples, accuracy 0.285714 (smoke threshold 0.25) | `artifacts/v2-afd-eager-1a1f-g/run.json` (`phases[0].result`) |
-| AFD, DeepSeek-V2-Lite, `afd-v2-eager-1a1f` full GSM8K | eager, `P2pNcclAFDConnector` | 2 | pending at the time of this record | `artifacts/v2-afd-eager-1a1f-fullacc/` |
+| AFD, DeepSeek-V2-Lite, `afd-v2-eager-1a1f` full GSM8K | eager, `P2pNcclAFDConnector` | 2 | failed at 32/1319 samples; illegal memory access (see below) | `artifacts/v2-afd-eager-1a1f-fullacc/attention.log` |
 | Native baseline, `baseline-graph` smoke | CUDA Graph, no AFD | 4 (Attention DP4) | pass; 7 GSM8K samples, accuracy 0.285714; cleanup passed, shutdown graceful | `artifacts/v2-baseline-graph4/pytest/test_deepseek_v2_lite_baseline0/baseline-graph/run.json` |
 | AFD, DeepSeek-V2-Lite, `afd-v2-graph-1a1f` | CUDA Graph, `P2pNcclAFDConnector` | 2 | blocked; see below | `artifacts/v2-afd-graph-1a1f/attention.log` |
 | Native no-AFD compiled-prefill probe | compile, no AFD | 1 | blocked; same failure | `artifacts/native-graph-prefill-probe/serve.log` |
@@ -64,6 +64,18 @@ AFD change. It is not worked around by changing AFD production code; a chunked
 prefill workaround would no longer exercise the intended graph path and is not
 counted as validation.
 
+## Eager full-accuracy crash
+
+The full GSM8K run on the AFD eager path (`AFD_GSM8K_LIMIT=all`, 1319 samples)
+crashed after 32 samples. The attention EngineCore reported
+`torch.AcceleratorError: CUDA error: an illegal memory access was encountered`
+while copying DP metadata to the device, and `CUDA_ERROR_ILLEGAL_ADDRESS` on
+`cuStreamSynchronize`. Because CUDA reports illegal accesses at the next API
+call, the metadata copy is a victim; the originating kernel is not yet
+localized. The run was re-queued with `CUDA_LAUNCH_BLOCKING=1` to identify the
+failing kernel. Until that finishes, full accuracy is **not validated**; only
+the 7-sample smoke result above is available.
+
 ## Coverage gaps
 
 - AFD CUDA Graph on vLLM 0.34 is **not validated** on L20 because of the
@@ -72,7 +84,8 @@ counted as validation.
   targets SM90/SM100/SM120 while L20 is SM89, so the V4 FP8 MLA path is outside
   the supported hardware set. This is a hardware/toolchain limit, not an AFD
   regression.
-- Full GSM8K accuracy on the AFD eager path is recorded separately when the run
-  completes; the 7-sample smoke result above is not a full accuracy claim.
+- Full GSM8K accuracy on the AFD eager path is **not validated**: the run
+  crashed at 32/1319 with an illegal memory access (under investigation). The
+  7-sample smoke result above is not a full accuracy claim.
 - DBO, TP2/DP2 AFD graph variants, and multi-pod cases were not run; they remain
   outside this record.
