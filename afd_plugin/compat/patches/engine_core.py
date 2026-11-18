@@ -315,12 +315,30 @@ def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
     # capture full cudagraphs initialize a minimal KV cache during it.
     # Attention-free models resolve the default so layout reads never precede
     # resolution.
+    # vLLM 0.34 added opt-in extensible KV cache support and a CP interleave
+    # size for the layout RPC. The Ascend 0.32 runtime has neither.
+    if getattr(vllm_config.cache_config, "enable_extensible_kv_cache", False):
+        executor = self.model_executor
+        reason = executor.extensible_kv_cache_unsupported_reason(kv_cache_specs)
+        if reason is not None:
+            executor.disable_extensible_kv_cache(reason)
     layout = core_module.resolve_kv_cache_layout(
         vllm_config,
         self.model_executor.get_supported_kv_cache_layouts(),
         [s for specs in kv_cache_specs for s in specs.values()],
     )
-    self.model_executor.set_kv_cache_layout(layout.name)
+    if hasattr(core_module, "get_global_kv_cache_groups"):
+        global_kv_cache_groups = core_module.get_global_kv_cache_groups(
+            vllm_config, kv_cache_specs
+        )
+        vllm_config.adjust_dcp_kv_cache_interleave_size(global_kv_cache_groups)
+    cp_interleave = getattr(
+        vllm_config.parallel_config, "cp_kv_cache_interleave_size", None
+    )
+    if cp_interleave is None:
+        self.model_executor.set_kv_cache_layout(layout.name)
+    else:
+        self.model_executor.set_kv_cache_layout(layout.name, cp_interleave)
 
     has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
     if has_kv_cache:
