@@ -1,7 +1,9 @@
 # GPU vLLM 0.34 upgrade validation record
 
-Status: **implemented, partial GPU validation**. The AFD eager path is validated
-on the target GPU; the AFD CUDA Graph path is blocked by an upstream vLLM 0.34
+Status: **implemented, partial GPU validation; not ready to merge.** The AFD
+eager path passes a 7-sample smoke run but a full GSM8K run crashes with an
+AFD-side asynchronous illegal memory access whose originating kernel is still
+unidentified. The AFD CUDA Graph path is blocked by an upstream vLLM 0.34
 regression that reproduces without AFD. This record separates what was exercised
 on hardware from what was not.
 
