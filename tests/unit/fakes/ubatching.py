@@ -84,7 +84,8 @@ class PreparedUBatchRunner:
         input_batch,
         block_tables,
         slot_mappings,
-        cg_mode,
+        batch_desc,
+        dp_sync_state=None,
         for_capture=False,
     ):
         slices = create_ubatch_slices(input_batch, self.num_ubatches)
@@ -96,7 +97,7 @@ class PreparedUBatchRunner:
                     input_batch,
                     positions=input_batch.positions[ubatch_slice.token_slice],
                 ),
-                cg_mode,
+                batch_desc.cg_mode,
                 block_tables,
                 slots,
                 self.attn_groups,
@@ -174,7 +175,13 @@ class LegacyNPUUBatchRunner:
         self.kv_cache_config = kv_cache_config
 
     def prepare(
-        self, input_batch, block_tables, slot_mappings, cg_mode, for_capture=False
+        self,
+        input_batch,
+        block_tables,
+        slot_mappings,
+        batch_desc,
+        dp_sync_state=None,
+        for_capture=False,
     ):
         slices = create_ubatch_slices(input_batch, self.num_ubatches)
         contexts = []
@@ -185,7 +192,7 @@ class LegacyNPUUBatchRunner:
                     input_batch,
                     positions=input_batch.positions[ubatch_slice.token_slice],
                 ),
-                cg_mode,
+                batch_desc.cg_mode,
                 block_tables,
                 slots,
                 [],

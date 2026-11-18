@@ -7,7 +7,7 @@ Attention reports after evaluation; FFN reports through its existing health
 RPC. Its daemon does not service HTTP RPC. CUDA V4 also records a bounded set
 of successful live transactions, pairing native A input IDs with the actual
 first local Hash-layer F input IDs. Capture retains references without D2H.
-CUDA target: 5df63a7203cdb9328d824a27b682e77c7b9928be (0.32.0).
+CUDA target: 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca (0.34.0).
 Ascend retains the existing 0.30 call without CUDA's randomize_inputs argument.
 Remove these wrappers when upstream exposes equivalent live Attention/FFN
 replay and microbatch counters.

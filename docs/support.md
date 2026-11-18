@@ -45,7 +45,8 @@ FFN remains connector-driven. The row's upgrade evidence retains its original
 scope; MRV2 deployment settings are documented in the
 [CAM async guide](npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#modelrunnerv2-deployment).
 
-Both backends target vLLM `0.32.0` (`5df63a72`); Ascend additionally targets
+The GPU backend targets vLLM `0.34.0` (`62d4bc3c7`). The Ascend backend targets
+vLLM `0.32.0` (`5df63a72`) and additionally targets
 vLLM-Ascend `bd42eea0`. Source-specific
 H20 model, topology, execution-mode and accuracy results are recorded in
 the [GPU upgrade validation matrix](https://github.com/vllm-project/afd-plugin/pull/501)

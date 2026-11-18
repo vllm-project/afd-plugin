@@ -13,9 +13,9 @@ from afd_plugin.compat import vllm as compat
 @pytest.mark.parametrize(
     ("version", "compatible"),
     [
-        ("0.32.0", True),
-        ("0.32.0.dev42+g5df63a7", True),
-        ("0.32.1", False),
+        ("0.34.0", True),
+        ("0.34.0.dev42+g62d4bc3", True),
+        ("0.34.1", False),
         ("0.33.0", False),
         ("0.30.0", False),
         ("0.30.0.dev42+gced6857", False),
@@ -37,7 +37,7 @@ def test_version_error_reports_target_pin(monkeypatch, installed_version):
     with pytest.raises(RuntimeError) as error:
         compat.assert_vllm_version_supported()
     assert str(error.value) == (
-        "AFD plugin currently supports exactly vLLM 0.32.0; "
+        "AFD plugin currently supports exactly vLLM 0.34.0; "
         f"installed vLLM version is {installed_version or 'not installed'}"
     )
 
@@ -49,7 +49,7 @@ def test_version_warning_reports_target_pin(monkeypatch, installed_version):
     with pytest.warns(RuntimeWarning) as recorded:
         compat.assert_vllm_version_supported(strict=False)
     assert str(recorded[0].message) == (
-        "AFD plugin currently supports exactly vLLM 0.32.0; "
+        "AFD plugin currently supports exactly vLLM 0.34.0; "
         f"installed vLLM version is {installed_version or 'not installed'}"
     )
 
@@ -59,4 +59,4 @@ def test_missing_runtime_keeps_cpu_safe_patch_imports(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm.platforms", None)
 
     assert compat.is_target_vllm_compatible()
-    assert compat.get_target_vllm_version() == "0.32.0"
+    assert compat.get_target_vllm_version() == "0.34.0"

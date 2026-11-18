@@ -38,7 +38,7 @@ def _install_fake_vllm_core(
     monkeypatch.setattr(patch_package, "engine_core", None, raising=False)
 
     vllm_module = types.ModuleType("vllm")
-    vllm_module.__version__ = "0.32.0"
+    vllm_module.__version__ = "0.32.0" if device_type == "npu" else "0.34.0"
     platforms_module = types.ModuleType("vllm.platforms")
     platforms_module.current_platform = SimpleNamespace(device_type=device_type)
     vllm_v1_module = types.ModuleType("vllm.v1")
@@ -187,7 +187,7 @@ def _install_fake_vllm_core(
     core_module.EngineCoreProc = EngineCoreProc
     core_module.DPEngineCoreProc = DPEngineCoreProc
     core_module.EngineShutdownState = _EngineShutdownState
-    core_module.VLLM_VERSION = "0.32.0"
+    core_module.VLLM_VERSION = "0.32.0" if device_type == "npu" else "0.34.0"
     core_module.logger = logging.getLogger("fake-vllm-core")
     core_module.logger.info_once = lambda *args, **kwargs: None
     core_module.envs = SimpleNamespace(VLLM_ELASTIC_EP_SCALE_UP_LAUNCH=False)
