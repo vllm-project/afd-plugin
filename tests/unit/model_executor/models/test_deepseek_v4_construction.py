@@ -9,18 +9,19 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 from torch import nn  # noqa: E402
+from vllm.forward_context import override_forward_context  # noqa: E402
+from vllm.models.deepseek_v4.nvidia.flashmla import (  # noqa: E402
+    DeepseekV4FlashMLAAttention,
+)
 
 from afd_plugin.model_executor.models import deepseek_v4 as adapter  # noqa: E402
+from tests.unit.fakes.deepseek_v4 import afd_stage_context  # noqa: E402
 
 
 class _FakeStage(nn.Module):
     def __init__(self, *args, prefix: str = "", **kwargs) -> None:
         super().__init__()
         self.prefix = prefix
-
-
-class _FakeAttention(_FakeStage):
-    pass
 
 
 class _FakeMoE(_FakeStage):
@@ -75,7 +76,13 @@ def construction_env(monkeypatch):
     monkeypatch.setattr(
         adapter.native,
         "_select_dsv4_attn_cls",
-        lambda _config: _FakeAttention,
+        lambda _config: DeepseekV4FlashMLAAttention,
+    )
+    # The native constructor needs a full CUDA config; keep only the module.
+    monkeypatch.setattr(
+        DeepseekV4FlashMLAAttention,
+        "__init__",
+        lambda self, *args, **kwargs: nn.Module.__init__(self),
     )
     monkeypatch.setattr(adapter.native, "DeepseekV4MoE", _FakeMoE)
     monkeypatch.setattr(adapter.native, "PPMissingLayer", _FakeMissingLayer)
@@ -131,7 +138,7 @@ def test_v4_model_constructs_only_role_owned_decoder_stages(
 
     for layer in model.layers:
         if role == "attention":
-            assert isinstance(layer.attn, _FakeAttention)
+            assert isinstance(layer.attn, DeepseekV4FlashMLAAttention)
             assert isinstance(layer.ffn, adapter.RemoteDeepseekV4FFN)
             assert hasattr(layer, "hc_attn_fn")
         else:
@@ -139,6 +146,20 @@ def test_v4_model_constructs_only_role_owned_decoder_stages(
             assert isinstance(layer.ffn, _FakeMoE)
             assert not hasattr(layer, "hc_attn_fn")
             assert not hasattr(layer, "attn_norm")
+
+
+def test_v4_attention_layer_skips_padding_only_dbo_stage(
+    monkeypatch,
+    construction_env,
+):
+    layer = _make_layer(monkeypatch, role="attention", layer_idx=0)
+    hidden_states = torch.ones((4, 8))
+
+    # vLLM's decoder layer calls its attention as attn(positions, x, None).
+    with override_forward_context(afd_stage_context(tokens=0, stages=2)):
+        output = layer.attn(torch.arange(4), hidden_states, None)
+
+    assert torch.equal(output, torch.zeros_like(hidden_states))
 
 
 @pytest.mark.parametrize("backend", sorted(adapter.native.MEGA_MOE_BACKENDS))
