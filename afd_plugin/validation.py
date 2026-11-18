@@ -81,6 +81,15 @@ def cam_receive_capacity() -> int:
     return capacity
 
 
+def uses_v2_model_runner(vllm_config: VllmConfig) -> bool:
+    """Return whether the runtime uses Model Runner V2.
+
+    vLLM 0.34 removed Model Runner V1 and with it ``use_v2_model_runner``; an
+    absent flag therefore means V2. The Ascend 0.32 runtime still exposes it.
+    """
+    return bool(getattr(vllm_config, "use_v2_model_runner", True))
+
+
 def validate_no_pp_or_cp(vllm_config: VllmConfig) -> None:
     parallel = vllm_config.parallel_config
     if (
@@ -111,7 +120,7 @@ def validate_async_cam_attention_graph(vllm_config: VllmConfig) -> None:
     model = vllm_config.model_config
     parallel = vllm_config.parallel_config
     if (
-        not vllm_config.use_v2_model_runner
+        not uses_v2_model_runner(vllm_config)
         or model.hf_text_config.model_type != "deepseek_v4"
     ):
         raise RuntimeError("Async CAM Attention graph requires MRV2 DeepSeek-V4")
@@ -139,7 +148,7 @@ def validate_gpu_model_runner_v2_config(
     connector-driven and does not implement native ModelRunnerV2 execution.
     """
 
-    if not vllm_config.use_v2_model_runner:
+    if not uses_v2_model_runner(vllm_config):
         raise RuntimeError("AFD GPU requires ModelRunnerV2")
 
     afd_config = parse_afd_config(vllm_config, expected_role=expected_role)
@@ -214,7 +223,7 @@ def validate_npu_model_runner_v2_config(
 ) -> None:
     """Validate the supported Ascend NPU ModelRunnerV2 deployment."""
 
-    if not vllm_config.use_v2_model_runner:
+    if not uses_v2_model_runner(vllm_config):
         raise RuntimeError("AFD NPU requires ModelRunnerV2")
     afd_config = parse_afd_config(vllm_config, expected_role=expected_role)
     if device_type != "npu":
