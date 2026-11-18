@@ -63,7 +63,12 @@ def _afd_config(*, role: str = "attention"):
 
 
 def _vllm_config(
-    *, tp: int = 1, dbo: bool = False, ubatching: bool = False, ubatches: int = 1
+    *,
+    tp: int = 1,
+    dbo: bool = False,
+    ubatching: bool = False,
+    ubatches: int = 1,
+    dp: int = 4,
 ):
     hf_config = SimpleNamespace(model_type=_DSV4)
     return SimpleNamespace(
@@ -76,6 +81,7 @@ def _vllm_config(
             enable_dbo=dbo,
             use_ubatching=ubatching,
             num_ubatches=ubatches,
+            data_parallel_size=dp,
             tensor_parallel_size=tp,
         ),
         compilation_config=SimpleNamespace(cudagraph_mode=None),
@@ -93,6 +99,16 @@ def test_the_supported_shape_is_accepted_for_both_roles(extra_info, role):
     )
 
     assert extra_info.validated == 1
+
+
+def test_dbo_is_rejected_without_attention_data_parallelism(extra_info):
+    """At DP=1 the runtime builds no ubatch runner, so DBO cannot run."""
+
+    with pytest.raises(RuntimeError, match="requires Attention DP > 1"):
+        feature_validation.fail_if_unsupported_npu_afd_features(
+            _vllm_config(dbo=True, ubatching=True, ubatches=2, dp=1),
+            afd_config=_afd_config(role="attention"),
+        )
 
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])
