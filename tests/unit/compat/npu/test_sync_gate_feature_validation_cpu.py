@@ -34,6 +34,7 @@ class _FakeExtraInfo:
 
     def __init__(self) -> None:
         self.validated = 0
+        self.quant_mode = 0
 
     def validate_supported(self) -> None:
         self.validated += 1
@@ -95,9 +96,11 @@ def test_the_supported_shape_is_accepted_for_both_roles(extra_info, role):
 
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])
-def test_dbo_is_accepted_with_two_ubatches(extra_info, role):
+@pytest.mark.parametrize("quant_mode", [0, 4])
+def test_dbo_is_accepted_with_two_ubatches(extra_info, role, quant_mode):
     """Native DBO is part of the sync gate contract on either transport."""
 
+    extra_info.quant_mode = quant_mode
     feature_validation.fail_if_unsupported_npu_afd_features(
         _vllm_config(dbo=True, ubatching=True, ubatches=2),
         afd_config=_afd_config(role=role),

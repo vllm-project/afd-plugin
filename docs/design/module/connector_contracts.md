@@ -107,7 +107,7 @@ Unknown fields fail in the selected connector parser.
 | --- | --- |
 | `P2pNcclAFDConnector` | None; the mapping must be empty. |
 | `DeepEPM2NAFDConnector` | `payload_format`, `expert_backend`, `capacity_tokens_per_rank`, `num_lanes`, `bucket_granularity`, `cpu_sync_min_tokens`, `num_sms`, `num_qps`, `expert_num_sms`, `cpu_timeout_s`, `gpu_timeout_s`, and a nested `network` mapping (`gin`, `hybrid`, `rdma_traffic_class`). All are optional; see the [DeepEP M2N guide](../../gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#connector_extra_config) for defaults. |
-| `CAMP2pAFDConnector` | `core_num`, optional `attn_core_num` / `ffn_core_num`, `compute_gate_on_attention`, `quant_mode`, and optional positive `hccl_buffer_size`. Core counts must be positive. Gate placement follows the common `afd.compute_gate_on_attention` field; the connector-local copy is kept for compatibility and does not select the mode. `true` requires DeepSeek-V4 at TP=1 without DBO or ubatching. `quant_mode` accepts `0` (BF16 activation) and `4` (E4M3 activation with its E8M0 MX scale); `4` additionally requires the common gate field to be `true`, equal Attention and FFN rank counts between 1 and 32 per side, at least three AIV cores, and an `a2e` operator whose schema takes `x_scale` and `quant_mode`. |
+| `CAMP2pAFDConnector` | `core_num`, optional `attn_core_num` / `ffn_core_num`, `compute_gate_on_attention`, `quant_mode`, and optional positive `hccl_buffer_size`. Core counts must be positive. Gate placement follows the common `afd.compute_gate_on_attention` field; the connector-local copy is kept for compatibility and does not select the mode. `true` requires DeepSeek-V4 at TP=1; DBO/ubatching also needs Attention DP > 1 with exactly two microbatches. `quant_mode` accepts `0` (BF16 activation) and `4` (E4M3 activation with its E8M0 MX scale); `4` additionally requires the common gate field to be `true`, equal Attention and FFN rank counts between 1 and 32 per side, at least three AIV cores, and an `a2e` operator whose schema takes `x_scale` and `quant_mode`. |
 | `CAMAsyncAFDConnector` | `dynamicQuant`, `ffn_mega_moe`, `attn_ranks_per_dp`, and optional positive `hccl_buffer_size`. Attention microbatching uses native DBO configuration. |
 
 The common `afd_process_group_timeout_s` defaults to 120 seconds and controls
@@ -122,7 +122,7 @@ model-routing selector. CUDA P2P supports both values; DeepEP M2N requires
 backwards compatibility with older configurations and ignored for routing: the
 synchronous NPU runtime selects Attention-side routing from the common field, so
 deployments leave the connector-local copy unset. The supported synchronous
-shape is `true` on both roles for DeepSeek-V4 at TP=1 with no DBO or ubatching.
+shape is `true` on both roles for DeepSeek-V4 at TP=1; native DBO/ubatching is supported when Attention DP > 1 with exactly two microbatches.
 CAM async requires the common field to be `true`.
 
 ## Current connector modes

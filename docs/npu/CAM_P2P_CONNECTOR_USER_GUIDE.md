@@ -134,7 +134,8 @@ Pass AFD configuration through vLLM's `--additional-config` option under the
 
 Use the [common configuration reference](../configuration.md) for defaults
 and aliases. CAMP2P requires `async_dp=false`; `compute_gate_on_attention` may be `true` on
-both roles for DeepSeek-V4 at TP=1 without DBO or ubatching. For multi-machine placement, use
+both roles for DeepSeek-V4 at TP=1; DBO or ubatching also needs Attention DP > 1 with
+exactly two microbatches. For multi-machine placement, use
 the FFN machine's reachable IP as `host`.
 
 ### CAMP2P `connector_extra_config`

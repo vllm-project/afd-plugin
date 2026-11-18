@@ -186,12 +186,13 @@ def _fail_if_unsupported_sync_attention_gate(
             "Attention-side gate is only supported at tensor-parallel size 1; got "
             f"TP={int(parallel.tensor_parallel_size)}",
         )
-    if bool(parallel.enable_dbo) or bool(parallel.use_ubatching):
-        if int(parallel.num_ubatches) != 2:
-            raise RuntimeError(
-                "Attention-side gate with the synchronous connector requires "
-                f"exactly two microbatches; got {int(parallel.num_ubatches)}",
-            )
+    if (bool(parallel.enable_dbo) or bool(parallel.use_ubatching)) and int(
+        parallel.num_ubatches
+    ) != 2:
+        raise RuntimeError(
+            "Attention-side gate with the synchronous connector requires "
+            f"exactly two microbatches; got {int(parallel.num_ubatches)}",
+        )
     if afd_config.connector != CAMP2P_CONNECTOR:
         raise RuntimeError(
             "Attention-side gate is only supported with "

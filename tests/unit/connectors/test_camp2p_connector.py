@@ -516,7 +516,9 @@ def test_camp2p_mxfp8_send_keeps_each_stage_on_its_own_rows(monkeypatch):
     def fake_quantize(hidden_states):
         rows, hidden_size = (int(size) for size in hidden_states.shape)
         quantize_rows.append(rows)
-        scale = torch.ones((rows, -(-hidden_size // 32)), dtype=torch.uint8)
+        scale = torch.ones((rows, -(-hidden_size // 32)), dtype=torch.uint8).view(
+            torch.float8_e8m0fnu
+        )
         return hidden_states.to(torch.float8_e4m3fn), scale
 
     def fake_a2e(*args):
@@ -530,6 +532,8 @@ def test_camp2p_mxfp8_send_keeps_each_stage_on_its_own_rows(monkeypatch):
         context = SimpleNamespace(ubatch_idx=stage)
         monkeypatch.setattr(camp2p_module, "get_forward_context", lambda c=context: c)
         hidden = torch.full((rows, 32), float(stage + 1))
+        expert_ids = torch.full((rows, 2), stage + 1, dtype=torch.int32)
+        expert_scales = torch.full((rows, 2), 0.5, dtype=torch.float32)
         methods["afd_camp2p_send_attn_output"](
             hidden,
             "group0",
@@ -542,14 +546,16 @@ def test_camp2p_mxfp8_send_keeps_each_stage_on_its_own_rows(monkeypatch):
             4,
             1,
             8,
-            0,
-            None,
-            None,
+            1,
+            expert_ids,
+            expert_scales,
             camp2p_module.A2E_QUANT_MODE_MXFP8,
         )
 
     assert quantize_rows == [3, 1]
     assert [len(call[0]) for call in transport] == [3, 1]
+    assert [call[9] for call in transport] == ["group0", "group1"]
     assert [call[12].shape[0] for call in transport] == [3, 1]
+    assert [call[12].dtype for call in transport] == [torch.float8_e8m0fnu] * 2
     assert [call[13] for call in transport] == [4, 4]
     assert not torch.equal(transport[0][0][:1].float(), transport[1][0].float())
