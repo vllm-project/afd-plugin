@@ -6,7 +6,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from afd_plugin.connectors.npu.async_cam_runtime.megamoe_weights import _nz_bytes  # noqa: E402
+from afd_plugin.connectors.npu.megamoe_weights import _nz_bytes  # noqa: E402
 
 
 def test_nz_packing_preserves_checkpoint_bytes():

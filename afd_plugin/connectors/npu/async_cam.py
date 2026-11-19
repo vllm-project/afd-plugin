@@ -595,9 +595,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         )
         states.token_nums_rankid_layeridx = batch_info
         states.group_list = expert_token_nums
-        # dynamicQuant=0 returns a placeholder, not a quantization scale.
-        # Native MX kernels quantize BF16 only when the scale is absent.
-        states.dynamic_scales = dynamic_scales if self.dynamic_quant else None
+        states.dynamic_scales = dynamic_scales
         return AFDA2FTransferPayload(
             hidden_states=hidden_states,
             context=context,

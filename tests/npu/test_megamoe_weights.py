@@ -11,7 +11,7 @@ torch_npu = pytest.importorskip("torch_npu")
 def test_native_fp4_weight_round_trip_on_a5():
     from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
-    from afd_plugin.connectors.npu.async_cam_runtime.megamoe_weights import (
+    from afd_plugin.connectors.npu.megamoe_weights import (
         ACL_FORMAT_FRACTAL_NZ,
         ACL_FORMAT_ND,
         PACKED_BYTE_NZ_C0_16,

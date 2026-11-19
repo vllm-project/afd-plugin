@@ -24,7 +24,7 @@ from afd_plugin.distributed.afd_process_group import (
     DefaultProcessGroupSwitcher,
     init_afd_process_group,
 )
-from afd_plugin.envs import async_cam_layered_gmm_enabled
+from afd_plugin.envs import megamoe_layered_gmm_enabled
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -56,29 +56,6 @@ class MegaMoEStage:
     ticket: Any = None
     stream: Any = None
     completion: Any = None
-
-
-class _PublishedWords:
-    """Read local PUBLISHED words without queuing behind an FFN compute stream."""
-
-    def __init__(self, buffer, attention_ranks: int, tp: int):
-        exception_bytes = dict(buffer.layout.sections)["exception"]
-        window = buffer.manager.get_local_buffer_tensor(
-            torch.int32, exception_bytes // 4
-        )
-        # UMDK SplitWord: one 64-byte control row per union rank, PUBLISHED at word 0.
-        self.rows = window[: attention_ranks * 16].view(attention_ranks, 16)
-        self.host = torch.empty(self.rows.shape, dtype=torch.int32, pin_memory=True)
-        self.stream = torch.npu.Stream(device=window.device)
-        self.tp = tp
-
-    def __call__(self) -> list[list[int]]:
-        # Copy contiguous rows with DMA. Strided gathers would launch a device
-        # kernel that could contend with the very fused work we are scheduling.
-        with torch.npu.stream(self.stream):
-            self.host.copy_(self.rows, non_blocking=True)
-        self.stream.synchronize()
-        return self.host[:, 0].reshape(-1, self.tp).tolist()
 
 
 def validate_megamoe_config(config: VllmConfig, afd: AFDConfig) -> None:
@@ -195,7 +172,7 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
         self.layered_weights: LayerWeights | None = None
         self.layer_slots: dict[int, int] = {}
         self.layered_gmm_enabled = (
-            afd_config.role == "ffn" and async_cam_layered_gmm_enabled()
+            afd_config.role == "ffn" and megamoe_layered_gmm_enabled()
         )
 
     @property
@@ -203,7 +180,7 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
         return bool(self.stages)
 
     def prepare_layers(self, layers) -> None:
-        from afd_plugin.connectors.npu.async_cam_runtime.megamoe_weights import expert_weights
+        from afd_plugin.connectors.npu.megamoe_weights import expert_weights
 
         hf = self.vllm_config.model_config.hf_config
         layers = list(layers)
@@ -222,7 +199,7 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
     def init_afd_connector(self) -> None:
         if self.is_initialized:
             return
-        from afd_plugin.compat.npu import megamoe as ops
+        from afd_plugin.connectors.npu import megamoe_runtime as ops
 
         self.ops = ops
         stores = []
@@ -323,7 +300,7 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
                         self.ffn_size,
                         ops.split_sequence,
                         read_published=(
-                            _PublishedWords(buffer, self.attn_size, self.attn_tp)
+                            buffer.create_published_reader(self.attn_tp)
                             if dual_stage and not attention
                             else None
                         ),

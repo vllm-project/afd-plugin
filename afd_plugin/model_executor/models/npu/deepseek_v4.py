@@ -920,15 +920,6 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         prepare_attention_gate_w8a8_scales(self.model.layers)
         # ### PATCH END: retain FFN gate-on-A W8A8 scales after quant finalize
 
-    def get_mxfp_expert_layers(self) -> list[tuple[int, nn.Module]]:
-        """Expose the native A5 MLPs to the eager CAM connector runtime."""
-        return [
-            (layer.layer_idx, layer.mlp)
-            for layer in self.model.layers
-            if isinstance(layer, AFDDeepseekV4DecoderLayer)
-            and isinstance(layer.mlp, native.DeepseekV4MoE)
-        ]
-
     def get_quantized_expert_weights(
         self,
     ) -> "tuple[list[QuantizedExpertWeights], str]":

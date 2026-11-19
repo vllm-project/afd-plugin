@@ -4,7 +4,7 @@
 
 The PR branch `feat/a5-async-with-megamoe` starts at upstream `main`, commit
 `0d6ec9e`, and carries the A5 work from `feature/a5-async-megamoe` (`9dcb69b`).
-It targets the
+The branch also merges upstream `main@3dc2347` (#600 and #601). It targets the
 [#537](https://github.com/vllm-project/afd-plugin/issues/537) software environment:
 
 | Component | Target |
@@ -20,38 +20,31 @@ source. The existing A3 constructor path is preserved.
 The native loader, attention, HC, hash routing and shared-expert arithmetic remain
 responsible for the model semantics.
 
-Upstream main moved CAM execution into `connectors/npu/async_cam_runtime`.
-`AsyncCAMMXFPExecutor` retains the eager native MXFP4 MLP path for A5 within
-that runtime; the A3 layered and Pull-Mega executors remain unchanged. No new
-launch option is needed. The source branch was verified on A5; this main-based
-integration still requires a fresh A5 build and E2E run. Host tests do not
-validate NPU execution or accuracy.
+## Scope after PR #603 review
 
-## Two execution paths
+This development branch contains only A5 `CAMAsyncMegaAFDConnector`, its three
+split operators and the DSV4 integration needed by that path. A5 support for the
+existing `CAMAsyncAFDConnector` is retained on `feature/a5-async-cam-followup` for a
+separate PR: its four operator changes, BF16 receive handling, MXFP executor,
+validation and tests are not included here. Existing A3 Async CAM behavior is
+preserved. Shared model TP layout and DBO helpers remain because Mega uses
+them; their existing CAM defaults are unchanged.
 
-| | `CAMAsyncAFDConnector` | `CAMAsyncMegamoeAFDConnector` |
-| --- | --- | --- |
-| Attention | Routing and shared experts; asynchronous dispatch/combine | Same model-side ownership |
-| Transfer input | BF16 (`dynamicQuant=0`) | Dispatch quantizes BF16 to MXFP8 inside the operator |
-| FFN | CAM receive, native MXFP4 expert MLP, CAM send | One fused receive + expert MLP + send operator |
-| Weights | Native transposed FP4 NZ tensors and E8M0 scales | Output-major FP4 C0=32 storage and E8M0 scales, prepared once after loading |
-| Scheduling | Existing CAM device work selection | Bounded per-DP/per-FFN Store descriptors select layer and generation; tensors travel through MTE |
+## Mega execution path
 
-Both use `afd.async=true` and `afd.compute_gate_on_attention=true`. Attention
-DPs can progress independently. Both require eager ModelRunnerV2 for this A5
-path. Use `enable_fused_mc2=0` so native loading retains the tensors consumed by
-these backends. For `CAMAsyncAFDConnector` on A5, leave `AFD_ASYNC_CAM_LAYERED_GMM` disabled:
-the A3 layered INT4/INT8 executor is not the A5 MXFP4 executor. For
-`CAMAsyncMegamoeAFDConnector`, the same FFN-side switch enables device layer
-selection inside the MXFP4 fused operator; see [MegaMoE configuration](MEGAMOE_EAGER.md).
+Attention owns routing and shared experts. Dispatch converts BF16 activations to
+MXFP8; the FFN fused operator receives, computes the MXFP4 experts and sends results.
+`connectors/npu/mega_weights.py` performs the one-time FP4 C0=32 storage
+conversion and E8M0 scale preparation after loading. Native checkpoint loading
+remains in the DSV4 model wrapper.
 
-For ordinary CAM, the BF16 receive scale output is a placeholder. The connector
-now passes `None` to the FFN MLP, causing the native MX method to perform group-32
-MXFP8 activation quantization. Passing the placeholder would incorrectly suppress
-that quantization. The FFN MLP consumes the native weights directly and does not
-perform another EP dispatch. Top-k scaling remains applied once by combine.
+The path requires eager ModelRunnerV2, `afd.async=true`,
+`afd.compute_gate_on_attention=true` and `enable_fused_mc2=0`. The current optional
+FFN device-layer-selection switch is documented in [MEGA_EAGER.md](MEGA_EAGER.md).
+Its independent configuration name is a separate review follow-up; this scope
+change removes the public validation of the old switch for other connectors/roles.
 
-For MegaMoE, each ubatch stage owns a communication window and dispatch ticket.
+For Mega, each ubatch stage owns a communication window and dispatch ticket.
 Within each window, each Attention DP advances the UMDK ring sequence from 1 through 32 and back to 1.
 Every FFN rank consumes the descriptor, including ranks with no selected expert.
 The kernel's PUBLISHED/TAKEN/READY/CONSUMED protocol protects input/output reuse.
@@ -65,43 +58,27 @@ requests: communication-window destruction requires the union-group barrier.
 **Plugin development is not an A5 runtime validation result.** Remote deployment,
 accuracy, long-run communication and performance checks have not been performed.
 
-- Ordinary CAM's four bundled operators now include an A5 HCCL-window path,
-  AIV communication-engine selection, A5 registration and Python bindings.
-  Rebuild both OPP and extension, then follow [A5 verification](A5_ASYNC_CAM_VALIDATION.md).
-  This source adaptation has not yet been compiled or executed on A5.
-- MegaMoE is bundled in AFD: build the extension and private Ascend950 OPP
+- Mega is bundled in AFD: build the extension and private Ascend950 OPP
   together with `AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=950 pip install --no-build-isolation .`.
-  No external `umdk_cam_megamoe` wheel is required. Import the three wrappers
-  from `afd_plugin.compat.npu.megamoe`; they use `afd_plugin._C_megamoe`,
-  `torch.ops.afd_ascend.npu_megamoe_*`, and AFD's private `libcust_opapi.so`.
+  No external `umdk_cam_mega` wheel is required. Import the three wrappers
+  from `afd_plugin.connectors.npu.mega_runtime`; they use `afd_plugin._C_afd_async_mega`,
+  `torch.ops.afd_ascend.afd_async_*`, and AFD's private `libcust_opapi.so`.
   The loader configures `AFD_CUST_OPAPI_LIB_PATH` automatically.
   Rebuild both the extension and OPP after protocol changes; mixing old kernels
   with the ring-sequence Python wrappers is unsupported.
-- MegaMoE's one-time FP4 storage conversion preserves packed nibbles; its
+- Mega's one-time FP4 storage conversion preserves packed nibbles; its
   format-cast and CANN interpretation still need device verification. Local CPU
   checks establish byte reordering and queue behavior, not numerical support.
 
 ## Configuration contract
 
-Supply role, rendezvous and rank counts as usual. The relevant additional-config
-fields for ordinary CAM are:
-
-```json
-{
-  "enable_fused_mc2": 0,
-  "afd": {
-    "connector": "CAMAsyncAFDConnector",
-    "async": true,
-    "compute_gate_on_attention": true,
-    "connector_extra_config": {"dynamicQuant": 0, "attn_ranks_per_dp": 1}
-  }
-}
-```
-
-For MegaMoE, select `CAMAsyncMegamoeAFDConnector`, keep both booleans true,
-set the same A/F counts on both roles, and optionally set `connector_extra_config.attn_ranks_per_dp` to the Attention TP width.
-Each role sets DP x TP to its own configured rank count and uses static EP, BF16 model activations and eager execution. These are
-configuration fragments, not complete deployment commands or verified recipes.
+Supply role, rendezvous and rank counts as usual. Select
+`CAMAsyncMegaAFDConnector`, set `afd.async=true` and
+`afd.compute_gate_on_attention=true`, and use `enable_fused_mc2=0`.
+Set identical A/F counts on both roles and optionally set
+`connector_extra_config.attn_ranks_per_dp` to the Attention TP width. Each role's
+DP x TP must match its configured rank count. Use static EP, BF16 activations and
+eager execution. These are fragments, not a complete deployment command.
 
 For Attention DP3TP2 + FFN DP2TP1/EP2, configure 6 Attention ranks and
 2 FFN ranks on both roles. Set Attention max-num-batched-tokens to a multiple
@@ -113,7 +90,7 @@ assigns each rank complete local experts. This eager topology extension needs
 A5 qualification; the existing 2A2F test recipe uses TP1.
 
 
-For eager MegaMoE DBO, enable `--enable-dbo` on Attention only, with two
+For eager Mega DBO, enable `--enable-dbo` on Attention only, with two
 ubatches and native decode/prefill thresholds of at least two tokens.
 For example, use `--dbo-prefill-token-threshold 8 --dbo-decode-token-threshold 2`
 to exercise splitting with eligible requests. Attention dispatches each shard

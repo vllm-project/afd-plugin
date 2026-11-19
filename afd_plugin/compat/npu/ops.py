@@ -7,6 +7,10 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 AFD_ASCEND_OPS_NAMESPACE = "afd_ascend"
 AFD_ASCEND_VENDOR_NAME = "afd-plugin"
@@ -121,8 +125,8 @@ def ensure_cam_async_ops_available() -> None:
 
 
 @lru_cache(maxsize=1)
-def ensure_megamoe_ops_available() -> None:
-    """Load the independent MegaMoE DSO against AFD's private OPP package."""
+def ensure_megamoe_ops_available() -> torch.library.Library:
+    """Load MegaMoE and retain its torch registrations for the process lifetime."""
     _ensure_afd_custom_opp_env()
     if not get_afd_cust_opapi_path().is_file():
         raise RuntimeError(
@@ -132,12 +136,52 @@ def ensure_megamoe_ops_available() -> None:
     try:
         import torch_npu  # noqa: F401
 
-        import afd_plugin._C_megamoe  # noqa: F401
+        import torch
+
+        from afd_plugin import _C_megamoe
     except ImportError as exc:
         raise RuntimeError(
             "AFD MegaMoE bindings are unavailable. Rebuild with "
             "AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=950."
         ) from exc
+
+    # CAM registers its operators in C++ via TORCH_LIBRARY macros; the CANN-derived
+    # MegaMoE bindings only export pybind functions, so register their schemas,
+    # Meta and PrivateUse1 impls here. FRAGMENT coexists with CAM; the cached
+    # return value keeps the Library alive so the operators stay registered.
+    library = torch.library.Library(AFD_ASCEND_OPS_NAMESPACE, "FRAGMENT")
+
+    # MegaMoE schema/Meta adapters below retain their source license:
+    # Copyright (c) 2026 Huawei Technologies Co., Ltd. Licensed under CANN OSL v2.
+
+    library.define('npu_megamoe_dispatch_send(Tensor(a!) context, Tensor x, Tensor topk_ids, Tensor topk_weights, int[] configuration, int[] dp_ranks, float[] activation_parameters, int layer_index=0) -> (Tensor, Tensor, Tensor)')
+
+    def megamoe_dispatch_send_meta(context, x, topk_ids, topk_weights, configuration, dp_ranks, activation_parameters, layer_index=0):
+        tokens = configuration[13] if configuration[12] else 0
+        return (context.new_empty((tokens, configuration[4]), dtype=torch.uint8),
+                context.new_empty((tokens, (configuration[4] + 63) // 64 * 2), dtype=torch.uint8), context.new_empty((1,), dtype=torch.int32))
+
+    library.impl("npu_megamoe_dispatch_send", megamoe_dispatch_send_meta, "Meta")
+    library.impl("npu_megamoe_dispatch_send", _C_megamoe.npu_megamoe_dispatch_send, "PrivateUse1")
+
+    library.define('npu_megamoe_combine_recv(Tensor(a!) context, Tensor topk_ids, Tensor topk_weights, Tensor snapshot_data, Tensor snapshot_scales, Tensor[] shared_weight1, Tensor[] shared_weight2, Tensor[] shared_scales1, Tensor[] shared_scales2, int[] configuration, int[] dp_ranks, float[] activation_parameters) -> (Tensor, Tensor)')
+
+    def megamoe_combine_recv_meta(context, topk_ids, topk_weights, snapshot_data, snapshot_scales, shared_weight1, shared_weight2, shared_scales1, shared_scales2, configuration, dp_ranks, activation_parameters):
+        return (context.new_empty((configuration[13], configuration[4]), dtype=torch.bfloat16),
+                context.new_empty((1,), dtype=torch.int32))
+
+    library.impl("npu_megamoe_combine_recv", megamoe_combine_recv_meta, "Meta")
+    library.impl("npu_megamoe_combine_recv", _C_megamoe.npu_megamoe_combine_recv, "PrivateUse1")
+
+    library.define('npu_megamoe_fused_moe(Tensor(a!) context, Tensor[] weight1, Tensor[] weight2, Tensor[] weight_scales1, Tensor[] weight_scales2, int[] configuration, int[] dp_ranks, float[] activation_parameters) -> Tensor')
+
+    def megamoe_fused_moe_meta(context, weight1, weight2, weight_scales1, weight_scales2, configuration, dp_ranks, activation_parameters):
+        return context.new_empty((configuration[2] // configuration[1],), dtype=torch.int32)
+
+    library.impl("npu_megamoe_fused_moe", megamoe_fused_moe_meta, "Meta")
+    library.impl("npu_megamoe_fused_moe", _C_megamoe.npu_megamoe_fused_moe, "PrivateUse1")
+
+    return library
 
 
 __all__ = [

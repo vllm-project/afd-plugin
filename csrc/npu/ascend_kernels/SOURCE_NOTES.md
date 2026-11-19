@@ -36,3 +36,31 @@ The repository root license is Apache; therefore
 the original source headers' reference to a root `LICENSE` does not resolve
 to the CANN license in this repository. The appended header identifies CANN
 OSL v2; the link above locates its retained text. No license text has been rewritten.
+
+## Python interface and connector protocol
+
+The split operator Python code came from `lqy16/umdk` at
+`ab039f0a384854a4d5f504b9c3425bc232186735`, under
+`src/cam/comm_operator/pybind/umdk_cam_megamoe/`, with corresponding development
+sources under `mc2/common/torch_extension/` in ops-transformer.
+These are split operator development sources, not an official CANN Python API.
+Existing copyright and license notices are preserved.
+
+`afd_plugin/compat/npu/ops.py` loads `afd_plugin._C_megamoe` and registers the
+three `afd_ascend` operator schemas, Meta implementations and native bindings.
+It does not manage windows, sequences, tickets or publication polling.
+
+`afd_plugin/connectors/npu/megamoe_runtime.py` owns window lifecycle,
+configuration construction, sequence validation, dispatch tickets and PUBLISHED
+reads. `megamoe_layout.py` owns the Python window geometry. The connector uses
+these modules directly. Window access uses the existing native
+`CommContextManager.get_local_buffer_tensor()` binding; the native extension
+does not currently expose kernel layout calculation. The reader preserves its
+dedicated DMA copy stream and synchronizes only that stream.
+
+AFD adaptations include private OPP loading, the `afd_ascend` namespace,
+argument validation and draining HCCL warmup before channel creation.
+The redundant `common/comm_context.py` re-export and `ops.py` aliases are removed.
+
+The Python source license is retained at `afd_plugin/connectors/npu/LICENSE-CANN`;
+it also covers the migrated schema/Meta adapter block in `compat/npu/ops.py`.

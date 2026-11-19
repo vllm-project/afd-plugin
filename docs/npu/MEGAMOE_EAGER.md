@@ -12,8 +12,8 @@ configuration for later device verification; it has not been run on A5.
 
 ## Bundled operator protocol
 
-The bundled Python API exports `split_sequence` and `SPLIT_SEQUENCE_MAX` from
-`afd_plugin.compat.npu.megamoe`. The maximum comes from the native constant
+The connector protocol uses `split_sequence` and `SPLIT_SEQUENCE_MAX` from
+`afd_plugin.connectors.npu.megamoe_runtime`. The maximum comes from the native constant
 (`constexpr int64_t`, currently 32), shared by host tiling and device comparison.
 Each lane/DP advances 1 through 32 and wraps to 1. The per-buffer launch tag also
 wraps; each fused launch clears its local AIV done tags before the launch barrier.

@@ -192,10 +192,6 @@ def _run_select_ops(*args: str) -> subprocess.CompletedProcess[str]:
             [
                 "a2e",
                 "e2a",
-                "afd_async_dispatch_send",
-                "afd_async_dispatch_recv",
-                "afd_async_combine_send",
-                "afd_async_combine_recv",
                 "cam_megamoe_dispatch_send",
                 "cam_megamoe_fused_moe",
                 "cam_megamoe_combine_recv",
