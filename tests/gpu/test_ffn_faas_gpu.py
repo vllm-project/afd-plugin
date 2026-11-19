@@ -274,9 +274,14 @@ def _attention_rank_main(
             except Exception:
                 result["ok"] = False
                 result["error"] += traceback.format_exc()
-        (out / f"rank{role_rank}.json").write_text(json.dumps(result, default=str))
         if dist.is_initialized():
-            dist.destroy_process_group()
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                result["ok"] = False
+                result["error"] += traceback.format_exc()
+        # Written last, so a success result also means teardown finished.
+        (out / f"rank{role_rank}.json").write_text(json.dumps(result, default=str))
 
 
 def _start_attention(
@@ -541,6 +546,8 @@ def test_ffn_service_serves_and_stops_cleanly(  # long-test: two launchers
         assert service.wait(timeout=STOP_TIMEOUT_S) == 0, log_path.read_text()[-4000:]
         for proc in attention:
             proc.join(timeout=STOP_TIMEOUT_S)
+            # None means the rank is still alive (hung in teardown).
+            assert proc.exitcode == 0, f"Attention rank exit code {proc.exitcode}"
         results = [
             json.loads((tmp_path / f"rank{rank}.json").read_text())
             for rank in range(TOPOLOGY.attn_size)
