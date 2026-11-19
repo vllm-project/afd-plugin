@@ -128,7 +128,7 @@ class ProxyConnector:
         return ref_tensor * 0.25
 
 
-def install_proxy_context(adapter, monkeypatch, events, *, stage_idx=2):
+def install_proxy_context(monkeypatch, events, *, stage_idx=2):
     connector = ProxyConnector(events)
     afd_metadata = SimpleNamespace(connector=connector, stage_idx=9)
     from afd_plugin.model_executor.ffn import remote
@@ -143,7 +143,5 @@ def install_proxy_context(adapter, monkeypatch, events, *, stage_idx=2):
     monkeypatch.setattr(
         remote, "get_forward_context", lambda: SimpleNamespace(ubatch_idx=stage_idx)
     )
-    # Model-specific forwards and shared proxies both yield to DBO.
-    for module in (adapter, remote):
-        monkeypatch.setattr(module, "maybe_apply_dbo_yield", record_yield)
+    monkeypatch.setattr(remote, "maybe_apply_dbo_yield", record_yield)
     return afd_metadata

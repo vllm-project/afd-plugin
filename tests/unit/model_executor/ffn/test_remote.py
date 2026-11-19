@@ -11,15 +11,20 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
+from torch import nn  # noqa: E402
 from vllm.config import set_current_vllm_config  # noqa: E402
 from vllm.model_executor.layers.fused_moe import layer as fused_moe_layer  # noqa: E402
 from vllm.model_executor.model_loader.utils import (  # noqa: E402
     process_weights_after_loading,
 )
 
+from afd_plugin.config import DEEPEP_M2N_CONNECTOR  # noqa: E402
 from afd_plugin.connectors import AFDConnectorFactory  # noqa: E402
 from afd_plugin.model_executor.ffn import remote  # noqa: E402
-from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
+from tests.unit.fakes.connector import (  # noqa: E402
+    ProxyConnector,
+    install_proxy_context,
+)
 from tests.unit.fakes.model_layers import GateLinear  # noqa: E402
 from tests.unit.fakes.vllm_config import attention_moe_vllm_config  # noqa: E402
 
@@ -32,10 +37,12 @@ INTERMEDIATE_SIZE = 11
 # ``ProxyConnector.recv_ffn_output`` returns the reference rows times this.
 FFN_OUTPUT_SCALE = 0.25
 STAGE_IDX = 1
+# The in-place combine below writes this into the receive buffer.
+COMBINED_VALUE = 1.0
+SHARED_EXPERTS_SCALE = 3.0
 # FusedMoEFactory arguments the AFD factory fixes for a weightless runner.
 RESERVED_FACTORY_ARGUMENTS = (
     "quant_config",
-    "shared_experts",
     "shared_expert_gate",
     "routed_input_transform",
     "routed_output_transform",
@@ -83,6 +90,24 @@ class _RegisteredRunner(remote.AFDRemoteMoERunner):
         shared_experts_input=None,
     ):
         return hidden_states + 1
+
+
+class _InPlaceCombineConnector(ProxyConnector):
+    """Combine writes the routed output into the buffer it is given, as DeepEP
+    M2N does."""
+
+    def send_attn_output(self, hidden_states, context, **kwargs) -> None:
+        # Record a copy: combine may be given the sent buffer.
+        super().send_attn_output(hidden_states.clone(), context, **kwargs)
+
+    def recv_ffn_output(self, *, ref_tensor, ubatch_idx):
+        self.events.append(("recv", ref_tensor, ubatch_idx))
+        return ref_tensor.fill_(COMBINED_VALUE)
+
+
+class _ScaledSharedExperts(nn.Module):
+    def forward(self, hidden_states):
+        return hidden_states * SHARED_EXPERTS_SCALE
 
 
 def _gate():
@@ -144,7 +169,6 @@ def test_runner_stays_weightless_and_fails_on_expert_checkpoints(monkeypatch):
     ("device_type", "connector"),
     [
         ("cuda", "CAMAsyncAFDConnector"),
-        ("cuda", "DeepEPM2NAFDConnector"),
         ("npu", "CAMP2pAFDConnector"),
         ("cpu", "P2pNcclAFDConnector"),
     ],
@@ -154,8 +178,8 @@ def test_factory_rejects_unsupported_placement_before_registration(
 ):
     """Only a CUDA connector whose registration names a runner builds one.
 
-    Why: the other connectors route on Attention or run on NPU through their
-    own model paths, which expect a different payload.
+    Why: the other connectors run on NPU through their own model paths, which
+    expect a different payload.
     """
     config = attention_moe_vllm_config(connector=connector)
 
@@ -295,7 +319,7 @@ def test_runner_without_gate_sends_hidden_states_only(
         lambda: attention_tp_size,
     )
     events: list[tuple] = []
-    install_proxy_context(remote, monkeypatch, events, stage_idx=STAGE_IDX)
+    install_proxy_context(monkeypatch, events, stage_idx=STAGE_IDX)
     runner = _build_runner(monkeypatch, attention_moe_vllm_config())
     hidden_states = _hidden_states(num_tokens)
 
@@ -322,7 +346,7 @@ def test_runner_with_gate_sends_its_router_logits(monkeypatch):
     needs the real logits for its external-router experts.
     """
     events: list[tuple] = []
-    install_proxy_context(remote, monkeypatch, events, stage_idx=STAGE_IDX)
+    install_proxy_context(monkeypatch, events, stage_idx=STAGE_IDX)
     gate = _gate()
     gate_inputs: list = []
     gate.register_forward_hook(
@@ -345,6 +369,54 @@ def test_runner_with_gate_sends_its_router_logits(monkeypatch):
     assert torch.equal(output, hidden_states * FFN_OUTPUT_SCALE)
 
 
+def test_routed_experts_send_routes_and_combine_into_a_new_tensor(monkeypatch):
+    """Under DeepEP M2N, the routed experts send the routes vLLM's runner
+    selected with the hidden states and return the combined output in a new
+    tensor; their input and the shared experts' input stay unchanged.
+
+    Why: the FFN runs only the routed experts on the routes it receives.
+    Combine writes into the tensor it is given, and vLLM's MoE op declares
+    that it does not mutate its inputs. The send, DBO yield and receive order
+    is the stage contract.
+    """
+    events: list[tuple] = []
+    afd_metadata = install_proxy_context(monkeypatch, events, stage_idx=STAGE_IDX)
+    afd_metadata.connector = _InPlaceCombineConnector(events)
+    config = attention_moe_vllm_config(
+        connector=DEEPEP_M2N_CONNECTOR, compute_gate_on_attention=True
+    )
+    runner = _build_runner(
+        monkeypatch, config, gate=_gate(), shared_experts=_ScaledSharedExperts()
+    )
+    hidden_states = _hidden_states(2)
+    dispatched_states = hidden_states.clone()
+    topk_weights = torch.full((2, TOP_K), 0.5)
+    topk_ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+
+    output = runner.routed_experts.forward_modular(
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=runner.shared_experts,
+        shared_experts_input=hidden_states,
+    )
+
+    assert [event[0] for event in events] == ["send", "yield", "recv"]
+    _, sent_states, context, send_kwargs = events[0]
+    assert torch.equal(sent_states, dispatched_states)
+    assert send_kwargs.keys() == {"topk_ids", "topk_weights"}
+    assert send_kwargs["topk_ids"] is topk_ids
+    assert send_kwargs["topk_weights"] is topk_weights
+    assert context.metadata.layer_idx == LAYER_IDX
+    assert context.metadata.stage_idx == STAGE_IDX
+    assert events[2][2] == STAGE_IDX
+    assert torch.equal(output, torch.full_like(dispatched_states, COMBINED_VALUE))
+    assert torch.equal(hidden_states, dispatched_states)
+    assert torch.equal(
+        runner.shared_experts.output, dispatched_states * SHARED_EXPERTS_SCALE
+    )
+
+
 @pytest.mark.parametrize(
     ("local_input", "message"),
     [
@@ -359,7 +431,7 @@ def test_runner_rejects_local_inputs_before_sending(monkeypatch, local_input, me
     Attention role builds no shared experts to feed.
     """
     events: list[tuple] = []
-    install_proxy_context(remote, monkeypatch, events)
+    install_proxy_context(monkeypatch, events)
     runner = _build_runner(monkeypatch, attention_moe_vllm_config())
     hidden_states = _hidden_states(2)
     local_inputs = {

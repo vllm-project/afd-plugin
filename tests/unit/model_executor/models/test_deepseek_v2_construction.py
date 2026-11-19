@@ -296,7 +296,7 @@ def test_cuda_attention_gate_uses_native_gate_contract(
     [
         ("P2pNcclAFDConnector", False, "Attention-local EPLB"),
         ("P2pNcclAFDConnector", True, "Attention-local EPLB"),
-        (DEEPEP_M2N_CONNECTOR, True, "do not support EPLB on the Attention role"),
+        (DEEPEP_M2N_CONNECTOR, True, "Attention-local EPLB"),
     ],
     ids=["p2p-ffn-gate", "p2p-attention-gate", "m2n"],
 )
@@ -358,24 +358,9 @@ def test_cuda_ffn_gate_shell_owns_no_mlp_parameters(
     assert list(moe.mlp.buffers()) == []
 
 
-def _use_cuda_remote_experts(monkeypatch) -> None:
-    monkeypatch.setattr(
-        adapter.native,
-        "current_platform",
-        SimpleNamespace(device_type="cuda"),
-    )
-    monkeypatch.setattr(adapter.native, "get_ep_group", _single_ep_rank)
-    monkeypatch.setattr(adapter.native, "_get_moe_router_dtype", lambda _c: None)
-    monkeypatch.setattr(
-        adapter,
-        "create_fused_moe_router",
-        lambda **kwargs: SimpleNamespace(**kwargs),
-    )
-
-
 def test_deepep_m2n_attention_owns_gate_and_shared_experts(
     monkeypatch,
-    construction_env,
+    cuda_construction_env,
 ):
     """Under DeepEP M2N, Attention builds the gate and the native shared MLP at
     their checkpoint paths and no routed experts.
@@ -383,67 +368,38 @@ def test_deepep_m2n_attention_owns_gate_and_shared_experts(
     Why: the DeepEP M2N FFN runs routed experts only, so the shared experts'
     output must come from Attention.
     """
-    _use_cuda_remote_experts(monkeypatch)
-    vllm_config = _vllm_config()
-    vllm_config.parallel_config.tensor_parallel_size = 1
+    monkeypatch.setattr(adapter.native, "GateLinear", GateLinear)
 
     layer = _make_layer(
         monkeypatch,
         role="attention",
         layer_idx=1,
         attention_gate=True,
-        vllm_config=vllm_config,
+        vllm_config=cuda_construction_env,
         connector=DEEPEP_M2N_CONNECTOR,
     )
 
-    assert type(layer.mlp) is adapter.AFDDeepseekV2RoutedExpertsMoE
     assert {name for name in _parameter_names(layer) if name.startswith("mlp.")} == {
         "mlp.gate.weight",
         "mlp.gate.e_score_correction_bias",
         "mlp.shared_experts.weight",
     }
-
-
-def test_deepep_m2n_shell_builds_parameter_free_proxy_transport(
-    monkeypatch,
-    construction_env,
-):
-    """The DeepEP M2N shell builds with a parameter-free ``RemoteFFNProxy`` as
-    its transport, not the native factory runner.
-
-    Why: the shell dispatches the top-k routes it selects itself, and the
-    native factory runner accepts only the P2P connector.
-    """
-    _use_cuda_remote_experts(monkeypatch)
-    vllm_config = _vllm_config()
-    vllm_config.parallel_config.tensor_parallel_size = 1
-
-    layer = _make_layer(
-        monkeypatch,
-        role="attention",
-        layer_idx=1,
-        attention_gate=True,
-        vllm_config=vllm_config,
-        connector=DEEPEP_M2N_CONNECTOR,
-    )
-
-    assert type(layer.mlp.experts) is adapter.RemoteFFNProxy
-    assert list(layer.mlp.experts.parameters()) == []
+    assert list(layer.mlp.buffers()) == []
 
 
 @pytest.mark.parametrize("tp_size", [1, 2])
-def test_deepep_m2n_shared_experts_replicated_under_attention_tp(
+def test_deepep_m2n_attention_tp_ranks_send_their_own_token_slice(
     monkeypatch,
-    construction_env,
+    cuda_construction_env,
     tp_size,
 ):
-    """With Attention TP > 1 the shared MLP is built sequence-parallel
-    (replicated weights, no all-reduce); with TP 1 it is the plain native MLP.
+    """With Attention TP > 1 the DeepEP M2N MoE is sequence-parallel, and its
+    shared MLP is built sequence-parallel (replicated weights, no all-reduce);
+    with TP 1 both are plain native.
 
-    Why: each TP rank runs the shared MLP on its own token slice; a TP-sharded
-    MLP would all-reduce partial sums of different tokens.
+    Why: TP peers hold the same tokens, so each must send a disjoint slice;
+    a TP-sharded shared MLP would all-reduce partial sums of different tokens.
     """
-    _use_cuda_remote_experts(monkeypatch)
     shared_kwargs = []
 
     class _RecordingMLP(nn.Module):
@@ -452,19 +408,19 @@ def test_deepep_m2n_shared_experts_replicated_under_attention_tp(
             shared_kwargs.append(kwargs)
 
     monkeypatch.setattr(adapter.native, "DeepseekV2MLP", _RecordingMLP)
-    vllm_config = _vllm_config()
-    vllm_config.parallel_config.tensor_parallel_size = tp_size
+    monkeypatch.setattr(adapter.native, "GateLinear", GateLinear)
+    cuda_construction_env.parallel_config.tensor_parallel_size = tp_size
 
     layer = _make_layer(
         monkeypatch,
         role="attention",
         layer_idx=1,
         attention_gate=True,
-        vllm_config=vllm_config,
+        vllm_config=cuda_construction_env,
         connector=DEEPEP_M2N_CONNECTOR,
     )
 
-    assert layer.mlp.tp_size == tp_size
+    assert layer.mlp.is_sequence_parallel is (tp_size > 1)
     (kwargs,) = shared_kwargs
     assert kwargs["prefix"] == "model.layers.1.mlp.shared_experts"
     assert kwargs["is_sequence_parallel"] is (tp_size > 1)
@@ -495,9 +451,9 @@ def _remote_experts_shell(monkeypatch, *, compute_gate_on_attention: bool):
         return adapter.AFDDeepseekV2RemoteExpertsMoE(
             config=_vllm_config().model_config.hf_config,
             vllm_config=config,
-            layer_idx=1,
             prefix="model.layers.1.mlp",
             compute_gate_on_attention=compute_gate_on_attention,
+            sends_routes=False,
         )
 
 
@@ -510,7 +466,7 @@ def test_attention_shell_computes_gate_before_transport(monkeypatch):
     break the P2P width contract (hidden_size vs n_routed_experts) on the FFN.
     """
     events: list[tuple] = []
-    install_proxy_context(adapter, monkeypatch, events, stage_idx=0)
+    install_proxy_context(monkeypatch, events, stage_idx=0)
     shell = _remote_experts_shell(monkeypatch, compute_gate_on_attention=True)
     shell.gate.weight.data.fill_(1)
     hidden_states = torch.ones((2, 8), dtype=torch.bfloat16)
@@ -531,7 +487,7 @@ def test_attention_shell_without_gate_keeps_native_delegation(monkeypatch):
     Why: the FFN role runs its own native gate on the received rows.
     """
     events: list[tuple] = []
-    install_proxy_context(adapter, monkeypatch, events)
+    install_proxy_context(monkeypatch, events)
     shell = _remote_experts_shell(monkeypatch, compute_gate_on_attention=False)
     hidden_states = torch.ones((2, 8))
 
