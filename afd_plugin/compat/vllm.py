@@ -7,14 +7,37 @@ from __future__ import annotations
 import re
 import warnings
 from importlib.metadata import PackageNotFoundError, version
+from importlib.util import find_spec
 from typing import Final
 
-TARGET_VLLM_VERSION: Final[str] = "0.32.0"
+# The GPU backend moves to 0.34 while the Ascend backend keeps its tested
+# 0.32 source pair (upgrade tracked separately in RFC #613).
+TARGET_VLLM_VERSION: Final[str] = "0.34.0"
+TARGET_NPU_VLLM_VERSION: Final[str] = "0.32.0"
 
 
-def get_target_vllm_version() -> str:
-    """Return the common vLLM pin for both backends."""
-    return TARGET_VLLM_VERSION
+def runtime_device_type() -> str:
+    """Return the active vLLM accelerator without importing torch_npu."""
+    try:
+        from vllm.platforms import current_platform
+
+        device_type = getattr(current_platform, "device_type", "") or ""
+    except Exception:
+        device_type = ""
+    if device_type:
+        return str(device_type)
+    return "npu" if find_spec("torch_npu") is not None else "cuda"
+
+
+def get_target_vllm_version(device_type: str | None = None) -> str:
+    """Return the pinned vLLM version for the active backend."""
+    if device_type is None:
+        device_type = runtime_device_type()
+    return (
+        TARGET_NPU_VLLM_VERSION
+        if device_type == "npu"
+        else TARGET_VLLM_VERSION
+    )
 
 
 def _parse_release(value: str) -> tuple[int, int, int]:
@@ -31,14 +54,18 @@ def get_installed_vllm_version() -> str | None:
         return None
 
 
-def is_vllm_version_supported(installed_version: str | None = None) -> bool:
+def is_vllm_version_supported(
+    installed_version: str | None = None,
+    *,
+    device_type: str | None = None,
+) -> bool:
     if installed_version is None:
         installed_version = get_installed_vllm_version()
     if installed_version is None:
         return False
 
     return _parse_release(installed_version) == _parse_release(
-        get_target_vllm_version()
+        get_target_vllm_version(device_type)
     )
 
 
@@ -76,10 +103,12 @@ def is_target_vllm_compatible() -> bool:
 
 
 __all__ = [
+    "TARGET_NPU_VLLM_VERSION",
     "TARGET_VLLM_VERSION",
     "assert_vllm_version_supported",
     "get_installed_vllm_version",
     "get_target_vllm_version",
     "is_target_vllm_compatible",
     "is_vllm_version_supported",
+    "runtime_device_type",
 ]

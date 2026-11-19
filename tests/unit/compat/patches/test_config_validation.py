@@ -295,7 +295,7 @@ def _cuda_case(
 ):
     engine_args.setdefault("active", True)
     if version is None:
-        version = "0.32.0"
+        version = "0.32.0" if platform[2] == "npu" else "0.34.0"
     return pytest.param(
         platform,
         version,
@@ -316,7 +316,7 @@ def _cuda_case(
         _cuda_case("afd-auto-ffn", role="ffn", worker=FFN_WORKER_FQCN),
         _cuda_case(
             "vllm-dev-checkout",
-            version="0.32.0.dev14230+g5df63a7",
+            version="0.34.0.dev14230+g62d4bc3",
             worker=ATTENTION_WORKER_FQCN,
         ),
         _cuda_case(

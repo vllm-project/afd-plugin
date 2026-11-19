@@ -80,6 +80,18 @@ class RemoteDeepseekV4FFN(RemoteFFNProxy):
         return afd_metadata
 
 
+def _resolve_num_hash_layers(config: Any) -> int:
+    """Return the hash-MoE layer count on both vLLM 0.32 and 0.34 configs.
+
+    vLLM 0.34 derives it from ``mlp_layer_types`` and may not expose the
+    checkpoint field on the loaded HF config.
+    """
+    value = getattr(config, "num_hash_layers", None)
+    if value is not None:
+        return int(value)
+    return int(config.mlp_layer_types.count("hash_moe"))
+
+
 class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
     """DeepSeek-V4 decoder layer with an FFN-boundary synchronous split."""
 
@@ -129,7 +141,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 vllm_config,
                 prefix=f"{prefix}.ffn",
                 use_sequence_parallel=self.use_sequence_parallel,
-                num_hash_layers=config.num_hash_layers,
+                num_hash_layers=_resolve_num_hash_layers(config),
             )
         else:
             raise ValueError(f"unsupported AFD role {afd_config.role!r}")
@@ -328,7 +340,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         )
         # ### PATCH END
         self.has_local_hash_moe = self.start_layer < min(
-            self.end_layer, config.num_hash_layers
+            self.end_layer, _resolve_num_hash_layers(config)
         )
 
         if native.get_pp_group().is_last_rank:

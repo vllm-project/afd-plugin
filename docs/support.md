@@ -45,18 +45,30 @@ FFN remains connector-driven. The row's upgrade evidence retains its original
 scope; MRV2 deployment settings are documented in the
 [CAM async guide](npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#modelrunnerv2-deployment).
 
-Both backends target vLLM `0.32.0` (`5df63a72`); Ascend additionally targets
+The GPU backend targets vLLM `0.34.0` (`62d4bc3c7`). The Ascend backend targets
+vLLM `0.32.0` (`5df63a72`) and additionally targets
 vLLM-Ascend `bd42eea0`. Source-specific
 H20 model, topology, execution-mode and accuracy results are recorded in
 the [GPU upgrade validation matrix](https://github.com/vllm-project/afd-plugin/pull/501)
 and [runtime-fix validation matrix](https://github.com/vllm-project/afd-plugin/pull/502).
 Those records identify the exact tested revisions. Earlier GPU results on
-vLLM 0.30 do not establish vLLM 0.32 hardware qualification.
+vLLM 0.30 do not establish vLLM 0.32 hardware qualification. The vLLM 0.34 GPU
+evidence is recorded in the
+[0.34 validation record](reports/gpu-vllm-034-validation.md): it covers the AFD
+eager path and the native baseline graph path on L20X, and records the upstream
+compiled-prefill blocker for the AFD graph path.
 
 ## Validation limits
 
 - GPU accuracy evidence covers selected first-300 GSM8K comparisons, not
   full-dataset accuracy, numerical equivalence, or performance improvement.
+- vLLM 0.34 GPU: the AFD eager path has a passing smoke run on L20X with
+  DeepSeek-V2-Lite, but the full-accuracy run crashed at 32/1319 samples with an
+  illegal memory access and is not validated. AFD CUDA Graph is not validated
+  because vLLM 0.34 compiled prefill fails on L20 even without AFD. The native
+  baseline graph case passes only with eight-token chunked prefill.
+- DeepSeek-V4-Flash is not validated on L20 under vLLM 0.34; its DeepGEMM path
+  requires SM90 or newer while L20 is SM89.
 - DeepSeek-V2-Lite TP2 Graph + DBO and DP2 eager DBO can require force
   killing during shutdown. Inference success does not imply graceful exit.
 - Native V4 DBO requires a compatible upstream communication backend. The

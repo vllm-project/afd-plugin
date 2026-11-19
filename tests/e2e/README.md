@@ -655,7 +655,8 @@ per-channel W8A8 checkpoint), sixteen NPU devices, Attention DP2/TP4 and FFN
 DP8/TP1/EP8. Both roles receive `ffn_mega_moe=true` and `dynamicQuant=1`.
 The existing `afd-dsv4-flash-async-cam-dp2tp4-ep8` remains Mega-off.
 
-Use the target branch's pinned vLLM/vLLM-Ascend stack (vLLM 0.32.0 target),
+Use the target branch's pinned vLLM/vLLM-Ascend stack (vLLM 0.34.0 for CUDA;
+vLLM 0.32.0 for Ascend),
 CANN runtime, and plugin native operators built from the same source tip.
 Do not substitute A5 CAM async-megamoe operators or the FFN FULL helper (#509).
 The new case keeps both roles eager and the existing Attention DBO setting.

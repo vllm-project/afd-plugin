@@ -38,7 +38,7 @@ def _install_fake_vllm_core(
     monkeypatch.setattr(patch_package, "engine_core", None, raising=False)
 
     vllm_module = types.ModuleType("vllm")
-    vllm_module.__version__ = "0.32.0"
+    vllm_module.__version__ = "0.32.0" if device_type == "npu" else "0.34.0"
     platforms_module = types.ModuleType("vllm.platforms")
     platforms_module.current_platform = SimpleNamespace(device_type=device_type)
     vllm_v1_module = types.ModuleType("vllm.v1")
@@ -152,8 +152,13 @@ def _install_fake_vllm_core(
 
         return run_with_fault_tolerance
 
-    def get_kv_cache_configs(vllm_config, kv_cache_specs, available_gpu_memory):
-        del vllm_config, available_gpu_memory
+    def get_kv_cache_configs(
+        vllm_config,
+        kv_cache_specs,
+        available_gpu_memory,
+        global_kv_cache_groups=None,
+    ):
+        del vllm_config, available_gpu_memory, global_kv_cache_groups
         return kv_cache_specs
 
     def generate_scheduler_kv_cache_config(kv_cache_configs):
@@ -187,7 +192,7 @@ def _install_fake_vllm_core(
     core_module.EngineCoreProc = EngineCoreProc
     core_module.DPEngineCoreProc = DPEngineCoreProc
     core_module.EngineShutdownState = _EngineShutdownState
-    core_module.VLLM_VERSION = "0.32.0"
+    core_module.VLLM_VERSION = "0.32.0" if device_type == "npu" else "0.34.0"
     core_module.logger = logging.getLogger("fake-vllm-core")
     core_module.logger.info_once = lambda *args, **kwargs: None
     core_module.envs = SimpleNamespace(VLLM_ELASTIC_EP_SCALE_UP_LAUNCH=False)
@@ -434,6 +439,48 @@ def test_native_kv_config_preserves_worker_and_scheduler_alignment(
     assert executor.kv_cache_configs[0].hash_block_size == 16
     assert executor.kv_cache_configs[0].cache_hit_alignment_tokens == 32
     assert executor.kv_cache_configs[0].kv_cache_layout == "layered"
+
+
+def test_v034_kv_planning_receives_global_groups(monkeypatch):
+    core = _install_fake_vllm_core(monkeypatch)
+    patch = _load_patch_module()
+    config = _config(None)
+    worker_config = SimpleNamespace(kv_cache_groups=[], num_blocks=0)
+    executor = KVCacheExecutor(config)
+    executor.kv_cache_specs = [{}]
+    global_groups = [object()]
+    captured = {}
+
+    def get_global_kv_cache_groups(_config, _kv_cache_specs):
+        return global_groups
+
+    def adjust_dcp_kv_cache_interleave_size(groups):
+        assert groups is global_groups
+        config.parallel_config.cp_kv_cache_interleave_size = 2
+
+    def get_kv_cache_configs(
+        _config, _kv_cache_specs, _available_memory, received_global_groups
+    ):
+        captured["global_groups"] = received_global_groups
+        return [worker_config]
+
+    monkeypatch.setattr(
+        core,
+        "get_global_kv_cache_groups",
+        get_global_kv_cache_groups,
+        raising=False,
+    )
+    monkeypatch.setattr(core, "get_kv_cache_configs", get_kv_cache_configs)
+    config.adjust_dcp_kv_cache_interleave_size = adjust_dcp_kv_cache_interleave_size
+
+    result = patch._initialize_kv_caches(
+        SimpleNamespace(model_executor=executor), config
+    )
+
+    assert result.hash_block_size == 16
+    assert captured["global_groups"] is global_groups
+    assert executor.kv_cache_layout == "layered"
+    assert executor.cp_kv_cache_interleave_size == 2
 
 
 @pytest.mark.parametrize("role", [None, "attention"])

@@ -887,3 +887,12 @@ def test_cam_receive_capacity_validates_native_float32_envelope(
             cam_receive_capacity()
     else:
         assert cam_receive_capacity() == capacity
+
+
+def test_v2_runner_flag_absent_means_v2():
+    from afd_plugin.validation import uses_v2_model_runner
+
+    # vLLM 0.34 removed Model Runner V1 and the flag.
+    assert uses_v2_model_runner(SimpleNamespace()) is True
+    assert uses_v2_model_runner(SimpleNamespace(use_v2_model_runner=True)) is True
+    assert uses_v2_model_runner(SimpleNamespace(use_v2_model_runner=False)) is False

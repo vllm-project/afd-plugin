@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -266,13 +267,14 @@ def test_mrv2_prepare_sends_one_complete_payload_and_restores_instance(graph, dp
     runner.ubatch_runner = NativeUBatch()
     batch = SimpleNamespace(num_tokens=5, num_tokens_after_padding=8, num_reqs=4)
     mode = CUDAGraphMode.FULL if graph else CUDAGraphMode.NONE
+    desc = SimpleNamespace(cg_mode=mode)
     with v2_runner_module._use_afd_ubatch_preparation(runner):
-        assert runner.ubatch_runner.prepare(batch, (), None, mode) is prepared
+        assert runner.ubatch_runner.prepare(batch, (), None, desc) is prepared
         if graph:
             with v2_runner_module._use_afd_fullgraph_replay_hook(runner, 5):
                 runner.cudagraph_manager.run_fullgraph(_capture_descriptor(4, 8, 2))
     assert "prepare" not in vars(runner.ubatch_runner)
-    assert calls == [(batch, (), None, mode, False)]
+    assert calls == [(batch, (), None, desc, None, False)]
     assert events == ["control_update", "control_send"]
     payload = runner.connector.last_payload
     assert payload.is_graph_replaying is graph
@@ -327,7 +329,14 @@ def test_mrv2_ubatch_capture_events_and_exception_restore(fail_control, dp_size)
     def capture():
         with v2_runner_module._use_afd_ubatch_preparation(runner, tracker):
             for _ in (True, False):
-                runner.ubatch_runner.prepare(batch, (), None, CUDAGraphMode.FULL, True)
+                runner.ubatch_runner.prepare(
+                    batch,
+                    (),
+                    None,
+                    SimpleNamespace(cg_mode=CUDAGraphMode.FULL),
+                    None,
+                    True,
+                )
 
     if fail_control:
         with pytest.raises(RuntimeError, match="control failed"):
@@ -1001,6 +1010,8 @@ def test_dummy_profile_preserves_randomization(
     runner.lora_config = None
     runner.is_first_pp_rank = True
     runner.is_last_pp_rank = False
+    # vLLM 0.34 suppresses EPLB bookkeeping inside the native dummy run.
+    runner.eplb = SimpleNamespace(suppress=nullcontext)
 
     class KVConnector:
         def set_disabled(self, disabled):
@@ -1552,7 +1563,7 @@ def test_v4_stage_inputs_stay_aligned_and_refresh_for_eager_or_replay(
                 batch,
                 (),
                 slots,
-                mode,
+                SimpleNamespace(cg_mode=mode),
                 for_capture=offset == 0 and mode == CUDAGraphMode.FULL,
             )
             for stage, context in enumerate(prepared.forward_contexts):
@@ -1604,12 +1615,16 @@ def test_v4_ubatch_failure_restores_native_inputs_and_sm_budget(
         pytest.raises(ValueError, match="step failed"),
         v2_runner_module._use_afd_ubatch_preparation(runner),
     ):
-        prepared = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+        prepared = runner.ubatch_runner.prepare(
+            batch, (), slots, SimpleNamespace(cg_mode=CUDAGraphMode.NONE)
+        )
         runner.ubatch_runner.begin_capturable_run(
             fail, {"positions": batch.positions}, prepared
         )()
     runner.model_state.prepare_error = None
-    prepared = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    prepared = runner.ubatch_runner.prepare(
+            batch, (), slots, SimpleNamespace(cg_mode=CUDAGraphMode.NONE)
+        )
     for stage, context in enumerate(prepared.forward_contexts):
         metadata = context.attn_metadata["kv0"]
         assert metadata.decode.schedule_metadata.shape == (TEST_PHYSICAL_SMS + 1,)
@@ -1633,7 +1648,9 @@ def test_npu_v4_keeps_native_preparation_and_stage_inputs(stage_input_runner):
     runner = stage_input_runner(device="npu")
     batch, slots = _stage_test_inputs(runner, 0)
     with v2_runner_module._use_afd_ubatch_preparation(runner):
-        prepared = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+        prepared = runner.ubatch_runner.prepare(
+            batch, (), slots, SimpleNamespace(cg_mode=CUDAGraphMode.NONE)
+        )
     for stage, context in enumerate(prepared.forward_contexts):
         assert context.additional_kwargs["platform_stage"] == stage
         assert context.additional_kwargs["afd_metadata"].tokens_lens == [14]
@@ -1641,7 +1658,9 @@ def test_npu_v4_keeps_native_preparation_and_stage_inputs(stage_input_runner):
             context.attn_metadata["kv0"].positions.data_ptr()
             == batch.positions[prepared.slices[stage].token_slice].data_ptr()
         )
-    native = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    native = runner.ubatch_runner.prepare(
+            batch, (), slots, SimpleNamespace(cg_mode=CUDAGraphMode.NONE)
+        )
     assert [context.additional_kwargs for context in native.forward_contexts] == [
         {"platform_stage": 0},
         {"platform_stage": 1},
@@ -1711,7 +1730,9 @@ def test_npu_v4_ubatch_preparation_preserves_native_context_and_control(
         runner.connector.control_plane = None
 
     with v2_runner_module._use_afd_ubatch_preparation(runner):
-        prepared = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+        prepared = runner.ubatch_runner.prepare(
+            batch, (), slots, SimpleNamespace(cg_mode=CUDAGraphMode.NONE)
+        )
 
     for stage, context in enumerate(prepared.forward_contexts):
         metadata = context.additional_kwargs["afd_metadata"]
@@ -1737,7 +1758,9 @@ def test_npu_v4_ubatch_preparation_preserves_native_context_and_control(
             for m in payload.dp_metadata_list.values()
         ] == [[4, 4], [4, 4]]
 
-    native = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    native = runner.ubatch_runner.prepare(
+            batch, (), slots, SimpleNamespace(cg_mode=CUDAGraphMode.NONE)
+        )
     assert [context.additional_kwargs for context in native.forward_contexts] == [
         {"platform_stage": 0},
         {"platform_stage": 1},
@@ -1752,12 +1775,53 @@ def test_npu_v4_ubatch_prepare_error_restores_native_preparation(npu_v4_ubatch_c
         pytest.raises(ValueError, match="native preparation failed"),
         v2_runner_module._use_afd_ubatch_preparation(runner),
     ):
-        runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+        runner.ubatch_runner.prepare(
+            batch, (), slots, SimpleNamespace(cg_mode=CUDAGraphMode.NONE)
+        )
     runner.model_state.prepare_error = None
 
-    native = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    native = runner.ubatch_runner.prepare(
+            batch, (), slots, SimpleNamespace(cg_mode=CUDAGraphMode.NONE)
+        )
     assert [context.additional_kwargs for context in native.forward_contexts] == [
         {"platform_stage": 0},
         {"platform_stage": 1},
     ]
     assert events == []
+
+
+def test_initialize_kv_cache_forwards_extensible(monkeypatch):
+    runner = object.__new__(AFDAttentionModelRunnerV2)
+    recorded = {}
+
+    def native(
+        self,
+        kv_cache_config,
+        is_profiling=False,
+        kv_cache_allocation_context=None,
+        extensible=False,
+    ):
+        recorded.update(
+            config=kv_cache_config,
+            is_profiling=is_profiling,
+            allocation_context=kv_cache_allocation_context,
+            extensible=extensible,
+        )
+
+    monkeypatch.setattr(
+        native_v2.GPUModelRunner, "initialize_kv_cache", native, raising=True
+    )
+    config = object()
+    allocation_context = object()
+    runner.initialize_kv_cache(
+        config,
+        is_profiling=True,
+        kv_cache_allocation_context=allocation_context,
+        extensible=True,
+    )
+    assert recorded == {
+        "config": config,
+        "is_profiling": True,
+        "allocation_context": allocation_context,
+        "extensible": True,
+    }

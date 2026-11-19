@@ -3,7 +3,7 @@
 This directory contains deployment and benchmark recipes for AFD connectors.
 Read each recipe's support status before running it: some historical experiment
 records are retained for provenance but are not supported by the current
-runtime. Both GPU and Ascend target vLLM 0.32. The
+runtime. GPU targets vLLM 0.34 and Ascend targets vLLM 0.32. The
 [Ascend validation record](https://github.com/vllm-project/afd-plugin/pull/507) links the tested
 scope; the V3.2 recipes below retain their historical versions.
 

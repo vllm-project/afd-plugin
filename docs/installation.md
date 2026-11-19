@@ -22,7 +22,7 @@ command:
 uv sync --group dev --extra vllm
 ```
 
-The optional GPU extra pins `vllm==0.32.0`.
+The optional GPU extra pins `vllm==0.34.0`.
 
 `DeepEPM2NAFDConnector` also needs the `afdep` extra (afdEP-comm). Its
 DeepGEMM experts use the DeepGEMM bundled in vLLM CUDA builds; see
@@ -41,7 +41,8 @@ and firmware, then confirm device visibility with `npu-smi info`.
 | Component | Version |
 | --- | --- |
 | Python | Package range `3.11–3.13`; tested `3.12.13` |
-| vLLM | `0.32.0`, commit `5df63a7203cdb9328d824a27b682e77c7b9928be` |
+| vLLM (GPU) | `0.34.0`, commit `62d4bc3c7` |
+| vLLM (NPU) | `0.32.0`, commit `5df63a7203cdb9328d824a27b682e77c7b9928be` |
 | vLLM-Ascend | commit [`bd42eea0`](https://github.com/vllm-project/vllm-ascend/commit/bd42eea01d8312c4df469fabaed45f77a12df4d3) |
 | Tested CANN / torch / torch-npu | `9.2` / `2.10.0+cpu` / `2.10.0.post7` |
 | Tested Triton Ascend / CAM | `3.6` / `1.3` |

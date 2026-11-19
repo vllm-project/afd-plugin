@@ -348,6 +348,13 @@ def test_patch_preserves_upstream_signature(
         pytest.importorskip("vllm_ascend")
     if scope_name == "capture-inputs":
         from vllm.v1.worker.gpu.pcp_manager import PCPManager  # noqa: F401
+    # vLLM 0.34 keeps these annotations under TYPE_CHECKING in ubatch_utils;
+    # expose their runtime definitions while resolving the AST signature.
+    if scope_name == "ubatch-prepare":
+        from vllm.v1.worker.gpu.cudagraph_utils import (  # noqa: F401
+            BatchExecutionDescriptor,
+        )
+        from vllm.v1.worker.gpu.dp_utils import DPSyncState  # noqa: F401
     target = importlib.import_module(target_module)
     # These call sites import the native definition by value. Its defining
     # module owns the AST, even if the call-site alias has already been patched.
