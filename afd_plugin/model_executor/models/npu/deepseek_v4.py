@@ -538,6 +538,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                     config,
                     self.layer_idx,
                     max_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
+                    execution_mode=afd_config.mega_ffn_execution_mode,
                 )
             else:
                 self.afd_external_routing_moe = (
@@ -903,6 +904,14 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
 
     def get_async_cam_layered_weights(self) -> "tuple[list[LayeredFFNWeights], str]":
         return _extract_async_cam_layered_weights(self.model.layers)
+
+    def close_mega_ffn_backends(self) -> None:
+        from afd_plugin.model_executor.models.npu.mega_ffn_backend import MegaFFNBackend
+
+        for layer in self.model.layers:
+            backend = layer.afd_external_routing_moe
+            if isinstance(backend, MegaFFNBackend):
+                backend.close()
 
     def compute_ffn_output(
         self,

@@ -233,6 +233,9 @@ def validate_npu_model_runner_v2_config(
         if expected_role == "attention"
         else afd_config.num_ffn_ranks
     )
+    if afd_config.independent_attention:
+        # num_attention_ranks counts independent services, each with local DP1.
+        configured_ranks = 1
     distributed_ranks = parallel.data_parallel_size * parallel.tensor_parallel_size
     if configured_ranks != distributed_ranks:
         raise RuntimeError(

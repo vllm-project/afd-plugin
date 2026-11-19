@@ -58,6 +58,7 @@ def sync_gate_afd_config(monkeypatch):
     afd_config = SimpleNamespace(
         connector=CAMP2P_CONNECTOR,
         async_dp=False,
+        independent_attention=False,
         compute_gate_on_attention=True,
         num_attention_ranks=4,
         num_ffn_ranks=4,

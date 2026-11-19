@@ -54,7 +54,10 @@ def _runner(*, async_dp=False):
     runner.max_num_tokens = 7
     runner.debugger = None
     runner.afd_config = SimpleNamespace(
-        async_dp=async_dp, num_attention_ranks=2, num_ffn_ranks=2
+        async_dp=async_dp,
+        independent_attention=False,
+        num_attention_ranks=2,
+        num_ffn_ranks=2,
     )
     runner.connector = SimpleNamespace(
         extra_info=SimpleNamespace(), attention_step=nullcontext

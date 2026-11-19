@@ -81,3 +81,17 @@ def test_quantization_and_speculation_are_rejected(field):
     setattr(config, field, SimpleNamespace())
     with pytest.raises(ValueError, match="mega_ffn"):
         validate_mega_ffn_config(config)
+
+
+@pytest.mark.parametrize("layers", [0, 2, 61])
+def test_persistent_rejects_multiple_or_missing_layers(layers):
+    config = valid_config()
+    config.model_config.hf_config.num_hidden_layers = layers
+    with pytest.raises(ValueError, match="single layer"):
+        validate_mega_ffn_config(config, execution_mode="persistent")
+
+
+def test_persistent_accepts_one_layer():
+    config = valid_config()
+    config.model_config.hf_config.num_hidden_layers = 1
+    validate_mega_ffn_config(config, execution_mode="persistent")

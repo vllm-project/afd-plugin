@@ -496,6 +496,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                     self.afd_config.num_attention_ranks, self.afd_config.num_ffn_ranks
                 )
                 if not self.afd_config.async_dp
+                and not self.afd_config.independent_attention
                 and self.afd_config.num_attention_ranks > self.afd_config.num_ffn_ranks
                 else nullcontext(),
                 replay_scope,

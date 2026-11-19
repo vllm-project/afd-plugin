@@ -31,6 +31,10 @@ class _FakeExtraInfo:
 
     def __init__(self) -> None:
         self.validated = 0
+        self.ffn_cores = 8
+
+    def aiv_num_for_role(self, role: str) -> int:
+        return self.ffn_cores if role == "ffn" else 8
 
     def validate_supported(self) -> None:
         self.validated += 1
@@ -157,3 +161,36 @@ def test_quant_mode_is_still_rejected():
 
     with pytest.raises(RuntimeError, match="only quant_mode=0"):
         _real_extra_info().from_mapping({"quant_mode": 4}).validate_supported()
+
+
+@pytest.mark.parametrize("cores", [4, 8])
+@pytest.mark.parametrize("mode", ["normal", "persistent"])
+def test_megaffn_communication_cores_fit_resident_kernel(extra_info, cores, mode):
+    torch = pytest.importorskip("torch")
+    config = _vllm_config()
+    model = config.model_config
+    model.enforce_eager = True
+    model.dtype = torch.bfloat16
+    model.hf_config.hidden_size = 4096
+    model.hf_config.moe_intermediate_size = 1024
+    model.hf_config.swiglu_limit = 0
+    model.hf_config.num_hidden_layers = 1
+    for name in (
+        "data_parallel_size",
+        "pipeline_parallel_size",
+        "prefill_context_parallel_size",
+        "decode_context_parallel_size",
+    ):
+        setattr(config.parallel_config, name, 1)
+    config.quant_config = None
+    afd = _afd_config()
+    afd.ffn_compute_backend = "mega_ffn"
+    afd.mega_ffn_execution_mode = mode
+    extra_info.ffn_cores = cores
+    if mode == "persistent" and cores != 4:
+        with pytest.raises(ValueError, match="ffn_core_num=4"):
+            feature_validation.fail_if_unsupported_npu_afd_features(
+                config, afd_config=afd
+            )
+    else:
+        feature_validation.fail_if_unsupported_npu_afd_features(config, afd_config=afd)

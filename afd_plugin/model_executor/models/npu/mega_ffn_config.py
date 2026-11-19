@@ -9,9 +9,13 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
-def validate_mega_ffn_config(config: VllmConfig) -> None:
+def validate_mega_ffn_config(
+    config: VllmConfig, *, execution_mode: str = "normal"
+) -> None:
     model, parallel = config.model_config, config.parallel_config
     hf = model.hf_config
+    if execution_mode == "persistent" and hf.num_hidden_layers != 1:
+        raise ValueError("mega_ffn persistent requires a single layer")
     if hf.model_type != "deepseek_v4":
         raise ValueError("mega_ffn currently supports DeepSeek V4 only")
     if not model.enforce_eager or str(model.dtype) != "torch.bfloat16":

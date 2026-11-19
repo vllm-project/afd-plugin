@@ -27,7 +27,9 @@ from afd_plugin.compat.npu import (
 )
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory
+from afd_plugin.connectors.base import AFDControlPlaneClosedError
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+from afd_plugin.connectors.npu.camp2p.independent import IndependentCAMP2pControlPlane
 from afd_plugin.model_executor.models.model_utils import (
     configure_afd_dspark,
     get_afd_model_config,
@@ -157,6 +159,12 @@ class AFDNPUFFNWorker(NPUWorker):
                     not self._requires_async_drain()
                     and shutdown_event is not None
                     and shutdown_event.is_set()
+                    and (
+                        not isinstance(
+                            connector.control_plane, IndependentCAMP2pControlPlane
+                        )
+                        or isinstance(exc, AFDControlPlaneClosedError)
+                    )
                 ):
                     logger.debug(
                         "AFD NPU FFN receive loop stopped during shutdown",
@@ -230,7 +238,13 @@ class AFDNPUFFNWorker(NPUWorker):
                 is_profile=is_profile,
                 is_graph_replaying=is_graph_replaying,
             )
-            torch.npu.synchronize()
+            if self.model_runner.afd_config.mega_ffn_execution_mode == "persistent":
+                # submit_ffn completes its foreign-runtime task and copy-out;
+                # E2A is enqueued on this stream. Device-wide synchronization
+                # would also wait for the resident daemon, which must stay live.
+                torch.npu.current_stream(self.device).synchronize()
+            else:
+                torch.npu.synchronize()
 
     def _requires_async_drain(self) -> bool:
         return isinstance(self.model_runner, AsyncNPUFFNModelRunner) and (
@@ -241,7 +255,9 @@ class AFDNPUFFNWorker(NPUWorker):
     def raise_ffn_loop_error_if_any(self) -> None:
         error = self._ffn_loop_error
         if error is not None:
-            if not self._requires_async_drain():
+            if not self._requires_async_drain() and not isinstance(
+                self.model_runner.connector.control_plane, IndependentCAMP2pControlPlane
+            ):
                 self._ffn_loop_error = None
             raise RuntimeError("AFD NPU FFN worker loop failed") from error
 
@@ -265,6 +281,28 @@ class AFDNPUFFNWorker(NPUWorker):
                     )
             self.raise_ffn_loop_error_if_any()
             self.model_runner.shutdown()
+            self._ffn_thread = None
+            self._ffn_shutdown_event = None
+            return
+        control = self.model_runner.connector.control_plane
+        if isinstance(control, IndependentCAMP2pControlPlane):
+            if event is not None:
+                event.set()
+            # Cancel the idle host receive without freeing an in-flight A2E/E2A
+            # window. The serving thread synchronizes its current stream before
+            # exiting; a timeout must retain all device and transport resources.
+            control.close()
+            thread = self._ffn_thread
+            if thread is not None:
+                thread.join(timeout=FFN_SHUTDOWN_TIMEOUT_SECONDS)
+                if thread.is_alive():
+                    raise RuntimeError(
+                        "Independent FFN step is pending; retain resources"
+                    )
+            # A failed step may have queued device work before raising. Keep
+            # the error sticky so repeated shutdown cannot free its windows.
+            self.raise_ffn_loop_error_if_any()
+            self.model_runner.connector.close()
             self._ffn_thread = None
             self._ffn_shutdown_event = None
             return

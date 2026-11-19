@@ -286,7 +286,10 @@ def execute_contract():
             compilation_config=SimpleNamespace(cudagraph_mode=_GraphMode.NONE)
         )
         runner.afd_config = SimpleNamespace(
-            async_dp=async_dp, num_attention_ranks=2, num_ffn_ranks=2
+            async_dp=async_dp,
+            independent_attention=False,
+            num_attention_ranks=2,
+            num_ffn_ranks=2,
         )
         runner.prof, runner.cudagraph_manager, runner.ubatch_runner = None, None, None
         runner._afd_pending_metadata = None

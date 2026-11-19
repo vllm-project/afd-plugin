@@ -474,6 +474,10 @@ class AFDNPUFFNModelRunner:
     def shutdown(self) -> None:
         if self._is_shutdown:
             return
+        if self.model is not None and self.afd_config.ffn_compute_backend == "mega_ffn":
+            # Stop the device daemon before profiler/global synchronization or
+            # releasing captured model tensors. Propagate failure and retain them.
+            self.model.close_mega_ffn_backends()
         stop_afd_npu_profiler(self.prof)
         if self.connector.is_initialized:
             self.connector.close()

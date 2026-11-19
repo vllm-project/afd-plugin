@@ -70,6 +70,8 @@ _CAMP2P_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
         "compute_gate_on_attention",
         "hccl_buffer_size",
         "quant_mode",
+        "independent_attention",
+        "attention_id",
     },
 )
 
@@ -93,6 +95,9 @@ class CAMP2PExtraInfo(ConnectorExtraInfo):
     compute_gate_on_attention: bool = False
     hccl_buffer_size: int | None = None
     quant_mode: int = 0
+    # Separate DP1 clients share F via independent 1A1F HCCL windows.
+    independent_attention: bool = False
+    attention_id: int | None = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> CAMP2PExtraInfo:
@@ -112,6 +117,15 @@ class CAMP2PExtraInfo(ConnectorExtraInfo):
             )
 
         return cls(
+            independent_attention=coerce_extra_bool(
+                raw.get("independent_attention", False),
+                field_name="independent_attention",
+            ),
+            attention_id=(
+                coerce_extra_int(raw["attention_id"], field_name="attention_id")
+                if "attention_id" in raw
+                else None
+            ),
             core_num=coerce_extra_positive_int(
                 raw.get("core_num", 8),
                 field_name="core_num",
@@ -165,6 +179,10 @@ class CAMP2PExtraInfo(ConnectorExtraInfo):
             result["ffn_core_num"] = self.ffn_core_num
         if self.hccl_buffer_size is not None:
             result["hccl_buffer_size"] = self.hccl_buffer_size
+        if self.independent_attention:
+            result["independent_attention"] = True
+        if self.attention_id is not None:
+            result["attention_id"] = self.attention_id
         return result
 
 
@@ -459,7 +477,13 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         """
         super().__init__(rank, local_rank, vllm_config, afd_config, role_rank)
         self._initialized = False
-        self.topology = build_camp2p_topology(afd_config, role_rank)
+        extra_info = cast(CAMP2PExtraInfo, self.extra_info)
+        pair_config = (
+            replace(afd_config, num_attention_ranks=1)
+            if extra_info.independent_attention
+            else afd_config
+        )
+        self.topology = build_camp2p_topology(pair_config, role_rank)
         self.world_rank = self.topology.world_rank
         self.p2p_rank = self.topology.p2p_rank
         self.attn_size = self.topology.attention_size
@@ -489,6 +513,16 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         self.num_experts_per_tok = hf_config.num_experts_per_tok
         self.num_routed_experts = hf_config.n_routed_experts
         self.control_plane = CAMP2pAFDControlPlane(self)
+        if extra_info.independent_attention:
+            # Deferred to avoid a circular import: the independent control plane
+            # reuses this class's tensor path and metadata state updates.
+            from afd_plugin.connectors.npu.camp2p.independent import (
+                IndependentCAMP2pControlPlane,
+            )
+
+            self.control_plane = IndependentCAMP2pControlPlane(self)
+        elif extra_info.attention_id is not None:
+            raise ValueError("attention_id requires independent_attention=true")
 
     @property
     def is_initialized(self) -> bool:
@@ -517,6 +551,16 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         ensure_cam_p2p_ops_available()
 
         _register_camp2p_custom_ops()
+
+        if cast(CAMP2PExtraInfo, self.extra_info).independent_attention:
+            from afd_plugin.connectors.npu.camp2p.independent import (
+                IndependentCAMP2pControlPlane,
+            )
+
+            assert isinstance(self.control_plane, IndependentCAMP2pControlPlane)
+            self.control_plane.initialize_channels()
+            self._initialized = True
+            return
 
         num_ubatches = max(1, self.vllm_config.parallel_config.num_ubatches)
         self.afd_pg_list = []
@@ -581,6 +625,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         The method also clears saved HCCL group names and marks the connector as
         uninitialized. It is safe to initialize the connector again afterward.
         """
+        self.control_plane.close()
         groups = [self.p2p_pg, self.ffn_pg, *self.afd_pg_list]
         if self.afd_pg is not None and not self.afd_pg_list:
             groups.append(self.afd_pg)

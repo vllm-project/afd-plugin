@@ -35,7 +35,9 @@ def fail_if_unsupported_npu_afd_features(
             validate_mega_ffn_config,
         )
 
-        validate_mega_ffn_config(vllm_config)
+        validate_mega_ffn_config(
+            vllm_config, execution_mode=afd_config.mega_ffn_execution_mode
+        )
     is_dsv4 = _is_dsv4_target(vllm_config)
     if afd_config.connector == AFD_ASYNC_CONNECTOR and not is_dsv4:
         raise RuntimeError(
@@ -81,6 +83,17 @@ def fail_if_unsupported_npu_afd_features(
                 f"{type(extra_info).__name__}",
             )
         extra_info.validate_supported()
+        if (
+            getattr(afd_config, "ffn_compute_backend", "native") == "mega_ffn"
+            and afd_config.mega_ffn_execution_mode == "persistent"
+            and extra_info.aiv_num_for_role("ffn") != 4
+        ):
+            # The A5 runner reserves two cube/four vector cores. CAMP2p passes
+            # its explicit blockDim to the operator, bypassing stream tiling.
+            raise ValueError(
+                "mega_ffn persistent requires connector_extra_config "
+                "ffn_core_num=4 to coexist with the resident kernel"
+            )
 
     uses_ubatching = bool(vllm_config.parallel_config.use_ubatching)
     if uses_ubatching and int(vllm_config.parallel_config.num_ubatches) != 2:

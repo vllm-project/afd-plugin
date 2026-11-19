@@ -156,6 +156,21 @@ def test_gpu_validator_accepts_target_config_without_removed_enable_sp(mrv2_conf
     )
 
 
+def test_npu_independent_attention_uses_one_local_rank(mrv2_config):
+    mrv2_config.additional_config["afd"].update(
+        connector="CAMP2pAFDConnector",
+        num_attention_ranks=2,
+        num_ffn_ranks=1,
+        connector_extra_config={"independent_attention": True, "attention_id": 1},
+    )
+    mrv2_config.parallel_config.data_parallel_size = 1
+    mrv2_config.parallel_config.enable_dbo = False
+    mrv2_config.parallel_config.use_ubatching = False
+    validate_npu_model_runner_v2_config(
+        mrv2_config, expected_role="attention", device_type="npu"
+    )
+
+
 @pytest.mark.parametrize(
     "role,tp,error",
     [

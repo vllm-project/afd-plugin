@@ -146,7 +146,11 @@ def _new_ffn_runner():
     runner.effective_mode = "eager"
     # _ffn_layer_indices reads these; production runs with the gate on the
     # Attention side, so every layer index is a MoE FFN layer here.
-    runner.afd_config = SimpleNamespace(compute_gate_on_attention=True)
+    runner.afd_config = SimpleNamespace(
+        compute_gate_on_attention=True,
+        ffn_compute_backend="native",
+        mega_ffn_execution_mode="normal",
+    )
     runner.model_config = SimpleNamespace(
         hf_config=SimpleNamespace(
             n_routed_experts=8,
@@ -509,7 +513,8 @@ def test_npu_ffn_capture_cache_hit_still_updates_state_and_executes(monkeypatch)
     ]
 
 
-def test_npu_ffn_runner_shutdown_is_idempotent(monkeypatch):
+@pytest.mark.parametrize("backend", ["native", "mega_ffn"])
+def test_npu_ffn_runner_shutdown_is_idempotent(monkeypatch, backend):
     _require_npu_runtime()
     from afd_plugin.v1.worker.npu import ffn_model_runner
 
@@ -524,6 +529,9 @@ def test_npu_ffn_runner_shutdown_is_idempotent(monkeypatch):
     }
     runner.graph_pool = "pool"
     runner.model = _FakeModel()
+    runner.afd_config.ffn_compute_backend = backend
+    lifecycle = []
+    runner.model.close_mega_ffn_backends = lambda: lifecycle.append("stop_daemon")
     runner.connector = SimpleNamespace(
         is_initialized=True,
         close=lambda: close_calls.append(True),
@@ -531,7 +539,10 @@ def test_npu_ffn_runner_shutdown_is_idempotent(monkeypatch):
     monkeypatch.setattr(
         ffn_model_runner,
         "stop_afd_npu_profiler",
-        lambda profiler: profiler_calls.append(profiler),
+        lambda profiler: (
+            lifecycle.append("stop_profiler"),
+            profiler_calls.append(profiler),
+        ),
     )
     from vllm.v1.worker.gpu import shutdown
 
@@ -546,6 +557,23 @@ def test_npu_ffn_runner_shutdown_is_idempotent(monkeypatch):
     assert reset_calls == [True]
     assert runner.graph_pool is None
     assert runner.model is None
+    assert lifecycle == (
+        ["stop_daemon", "stop_profiler"] if backend == "mega_ffn" else ["stop_profiler"]
+    )
+
+
+def test_npu_ffn_runner_retains_model_when_daemon_stop_fails():
+    runner = _new_ffn_runner()
+    runner.afd_config.ffn_compute_backend = "mega_ffn"
+
+    def fail_stop():
+        raise RuntimeError("daemon still running")
+
+    model = SimpleNamespace(close_mega_ffn_backends=fail_stop)
+    runner.model = model
+    with pytest.raises(RuntimeError, match="daemon still running"):
+        runner.shutdown()
+    assert runner.model is model
 
 
 def test_npu_ffn_worker_scheduler_execute_model_fails_fast():
@@ -770,6 +798,94 @@ def test_npu_ffn_worker_stops_loop_before_parent_shutdown(monkeypatch):
         ("join", ffn_worker.FFN_SHUTDOWN_TIMEOUT_SECONDS),
         ("parent", None),
     ]
+
+
+@pytest.mark.parametrize("shutdown_requested", [False, True])
+def test_independent_ffn_step_error_keeps_resources_on_repeated_shutdown(
+    monkeypatch, shutdown_requested
+):
+    _require_npu_runtime()
+    from afd_plugin.connectors.npu.camp2p.independent import (
+        IndependentCAMP2pControlPlane,
+        IndependentMetadataMailbox,
+    )
+    from afd_plugin.v1.worker.npu import ffn_worker
+
+    worker = _new_ffn_worker()
+    worker._ffn_thread = None
+    worker._ffn_shutdown_event = None
+    control = object.__new__(IndependentCAMP2pControlPlane)
+    control.mailbox = IndependentMetadataMailbox({})
+    released = []
+    worker.model_runner = SimpleNamespace(
+        connector=SimpleNamespace(
+            is_initialized=True,
+            control_plane=control,
+            close=lambda: released.append("channels"),
+        )
+    )
+    monkeypatch.setattr(
+        ffn_worker.NPUWorker, "shutdown", lambda self: released.append("model")
+    )
+    error = RuntimeError("step failed after device submission")
+
+    def fail_step():
+        if shutdown_requested:
+            worker._ffn_shutdown_event.set()
+        raise error
+
+    worker._run_ffn_server_loop = fail_step
+    worker.start_ffn_server_loop()
+    worker._ffn_thread.join(timeout=5)
+    # A dead host thread does not prove that previously submitted device work
+    # has drained. Even repeated cleanup must retain its windows and tensors.
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="worker loop failed") as exc:
+            worker.shutdown()
+        assert exc.value.__cause__ is error
+    assert released == []
+
+
+@pytest.mark.parametrize("still_running", [False, True])
+def test_independent_ffn_retains_channels_until_current_step_finishes(
+    monkeypatch, still_running
+):
+    _require_npu_runtime()
+    from afd_plugin.connectors.npu.camp2p.independent import (
+        IndependentCAMP2pControlPlane,
+        IndependentMetadataMailbox,
+    )
+    from afd_plugin.v1.worker.npu import ffn_worker
+
+    worker = _new_ffn_worker()
+    worker._ffn_shutdown_event = threading.Event()
+    events = []
+    control = object.__new__(IndependentCAMP2pControlPlane)
+    control.mailbox = IndependentMetadataMailbox({})
+
+    class StepThread:
+        def join(self, timeout):
+            events.append("step_joined")
+
+        def is_alive(self):
+            return still_running
+
+    worker._ffn_thread = StepThread()
+    worker.model_runner = SimpleNamespace(
+        connector=SimpleNamespace(
+            control_plane=control, close=lambda: events.append("channels_closed")
+        )
+    )
+    monkeypatch.setattr(
+        ffn_worker.NPUWorker, "shutdown", lambda self: events.append("parent")
+    )
+    if still_running:
+        with pytest.raises(RuntimeError, match="retain"):
+            worker.shutdown()
+        assert events == ["step_joined"]
+    else:
+        worker.shutdown()
+        assert events == ["step_joined", "channels_closed", "parent"]
 
 
 def test_npu_ffn_worker_preserves_live_thread_after_shutdown_timeout(monkeypatch):

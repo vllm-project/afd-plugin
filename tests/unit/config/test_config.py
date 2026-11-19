@@ -272,3 +272,46 @@ def test_mega_ffn_rejects_unsupported_wire_topology(changes):
     raw.update(changes)
     with pytest.raises(ValueError, match="ffn_compute_backend|mega_ffn"):
         afd_config_from_mapping(raw)
+
+
+def test_mega_ffn_execution_mode_changes_graph_identity():
+    raw = dict(
+        connector="CAMP2pAFDConnector",
+        compute_gate_on_attention=True,
+        ffn_compute_backend="mega_ffn",
+    )
+    normal = afd_config_from_mapping(raw)
+    persistent = afd_config_from_mapping(
+        dict(raw, mega_ffn_execution_mode="persistent")
+    )
+    assert normal.mega_ffn_execution_mode == "normal"
+    assert persistent.mega_ffn_execution_mode == "persistent"
+    assert normal.compute_hash() != persistent.compute_hash()
+
+
+def test_mega_ffn_accepts_two_independent_attention_clients():
+    config = afd_config_from_mapping(
+        dict(
+            connector="CAMP2pAFDConnector",
+            num_attention_ranks=2,
+            compute_gate_on_attention=True,
+            ffn_compute_backend="mega_ffn",
+            connector_extra_config={"independent_attention": True, "attention_id": 1},
+        )
+    )
+    assert config.num_attention_ranks == 2
+
+
+@pytest.mark.parametrize(
+    "backend, mode", [("native", "persistent"), ("mega_ffn", "typo")]
+)
+def test_invalid_mega_ffn_execution_mode_is_rejected(backend, mode):
+    with pytest.raises(ValueError, match="mega_ffn_execution_mode"):
+        afd_config_from_mapping(
+            dict(
+                connector="CAMP2pAFDConnector",
+                compute_gate_on_attention=True,
+                ffn_compute_backend=backend,
+                mega_ffn_execution_mode=mode,
+            )
+        )

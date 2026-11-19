@@ -13,20 +13,44 @@ from afd_plugin.model_executor.models.npu.mega_ffn_backend import (  # noqa: E40
 )
 
 
-def test_shapes_share_two_graphs_and_padding_does_not_leak_old_inputs(monkeypatch):
+@pytest.mark.parametrize("mode", ["normal", "persistent"])
+def test_shapes_reuse_graphs_and_padding_does_not_leak_old_inputs(monkeypatch, mode):
+    # long-test: one adapter lifetime verifies reuse, changing inputs and shutdown.
     built = []
     calls = []
     conversions = []
+    lifecycle = []
 
     class Runner:
         def __init__(self, args, device_id, weights):
             self.args = args
 
-        def build_graph(self, tokens):
+        def build_graph(self, tokens, persistent=False):
             self.tokens = tokens
             built.append(tokens)
+            self.persistent = persistent
+            self.running = False
+
+        def start_persistent(self):
+            assert self.persistent and not self.running
+            assert lifecycle == []  # Native runtime supports only one active graph.
+            self.running = True
+            lifecycle.append("start")
+
+        def stop_persistent(self):
+            assert self.running
+            self.running = False
+            lifecycle.append("stop")
+
+        def submit_ffn(self, hidden, routing, ids):
+            assert self.running
+            return self.calculate(hidden, routing, ids)
 
         def run_ffn(self, hidden, routing, ids):
+            assert not self.persistent
+            return self.calculate(hidden, routing, ids)
+
+        def calculate(self, hidden, routing, ids):
             assert hidden.shape == (self.tokens, 64)
             assert routing.shape == ids.shape == (self.tokens, 2)
             calls.append((hidden.clone(), routing.clone(), ids.clone()))
@@ -52,7 +76,7 @@ def test_shapes_share_two_graphs_and_padding_does_not_leak_old_inputs(monkeypatc
         num_experts_per_tok=2,
     )
     experts = SimpleNamespace(w13_weight=object(), w2_weight=object())
-    adapter = MegaFFNBackend(experts, config, 0, max_tokens=8)
+    adapter = MegaFFNBackend(experts, config, 0, max_tokens=8, execution_mode=mode)
     for m in (8, 1, 3, 7, 2, 1):
         x = torch.arange(m * 64).reshape(m, 64).bfloat16()
         routing = torch.tensor([0.25, 1.25]).repeat(m, 1)
@@ -65,7 +89,7 @@ def test_shapes_share_two_graphs_and_padding_does_not_leak_old_inputs(monkeypatc
         torch.testing.assert_close(i[:m].int(), ids)
         assert not h[m:].count_nonzero() and not r[m:].count_nonzero()
         assert ((i >= 0) & (i < 4)).all()
-    assert built == [8, 1]
+    assert built == ([8] if mode == "persistent" else [8, 1])
     assert len(conversions) == 1
     with pytest.raises(ValueError, match="capacity"):
         adapter.forward(
@@ -73,4 +97,8 @@ def test_shapes_share_two_graphs_and_padding_does_not_leak_old_inputs(monkeypatc
             topk_ids=torch.zeros(9, 2, dtype=torch.int32),
             topk_weights=torch.ones(9, 2),
         )
-    assert built == [8, 1]
+    adapter.close()
+    adapter.close()
+    assert lifecycle == (["start", "stop"] if mode == "persistent" else [])
+    with pytest.raises(RuntimeError, match="closed"):
+        adapter.forward(x, topk_ids=ids, topk_weights=routing)
