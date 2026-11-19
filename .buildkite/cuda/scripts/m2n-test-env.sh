@@ -7,8 +7,8 @@
 # POSIX sh (the step shell may be dash).
 
 # afdEP-comm builds its transport against the NCCL wheel shipped in the image.
-NV_DIR=$(python -c "import nvidia; print(list(nvidia.__path__)[0])")
-export AFDEP_NCCL_ROOT="${NV_DIR}/nccl"
+AFDEP_NCCL_ROOT=$(python -c "import nvidia.nccl; print(list(nvidia.nccl.__path__)[0])")
+export AFDEP_NCCL_ROOT
 export LD_LIBRARY_PATH="${AFDEP_NCCL_ROOT}/lib:${LD_LIBRARY_PATH:-}"
 
 # All ranks share one node (one NVLink domain), so NCCL GIN is not used.
