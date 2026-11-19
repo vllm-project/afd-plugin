@@ -48,10 +48,6 @@ SUPPORTED_INDEX_DTYPES: Final[tuple[torch.dtype, ...]] = (
 # filling a tensor with the *float* 127 would round to ``2 ** 7`` and store byte 134.
 SCALE_PAD_BYTE: Final[int] = 127
 
-# MX block size the A2E MXFP8 contract is defined against: one E8M0 exponent per 32
-# activation values, so a scale row has ``ceil(hidden_size / 32)`` columns.
-MX_BLOCK_SIZE: Final[int] = 32
-
 
 @dataclass(frozen=True, eq=False)
 class AFDExternalRoutingInputs:
@@ -227,6 +223,5 @@ def _pad_rows(tensor: torch.Tensor, pad_size: int, value: int) -> torch.Tensor:
 
 __all__ = [
     "AFDExternalRoutingInputs",
-    "MX_BLOCK_SIZE",
     "SCALE_PAD_BYTE",
 ]

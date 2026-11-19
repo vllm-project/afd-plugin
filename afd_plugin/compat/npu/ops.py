@@ -61,10 +61,6 @@ def _assert_afd_namespace_registered(torch: object) -> None:
     _ = ops.afd_ascend.e2a
 
 
-#: Trailing ``a2e`` arguments the MXFP8 transport needs, in order. A build that predates
-#: them still accepts the call shape at the Python level and fails inside the kernel, so
-#: the connector reads the schema instead of trusting the call to raise.
-A2E_MXFP8_ARGUMENT_NAMES: Final = ("x_scale", "quant_mode")
 #: Argument count of the operator once the MXFP8 arguments are present. The transport
 #: calls it positionally, so a shorter schema means those names live elsewhere.
 A2E_MXFP8_ARGUMENT_COUNT: Final = 14
