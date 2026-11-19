@@ -298,6 +298,32 @@ def m2n_vllm_config(
     )
 
 
+def attention_moe_vllm_config(
+    *,
+    connector: str = "P2pNcclAFDConnector",
+    compute_gate_on_attention: bool = False,
+    **model_fields: Any,
+):
+    """A real CPU ``VllmConfig`` for building Attention-role MoE runners.
+
+    vLLM's ``FusedMoEFactory`` reads the full config, so this is not a
+    ``SimpleNamespace``. ``model_config`` holds only what the factory and the
+    AFD model shells read; ``model_fields`` adds model-specific fields.
+    """
+    # Deferred: this fakes module must import on CPU-only hosts without torch.
+    import torch
+    from vllm.config import DeviceConfig, VllmConfig
+
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    config.additional_config["afd"] = {
+        "role": "attention",
+        "connector": connector,
+        "compute_gate_on_attention": compute_gate_on_attention,
+    }
+    config.model_config = SimpleNamespace(dtype=torch.float32, **model_fields)
+    return config
+
+
 def npu_dspark_config(*, role="attention", draft_eager=True, tp_size=1):
     hf = SimpleNamespace(
         architectures=["DSparkDraftModel"],

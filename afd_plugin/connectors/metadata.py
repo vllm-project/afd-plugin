@@ -292,8 +292,8 @@ class AFDA2FTransferPayload:
             shaped ``(tokens, topk)``. Present instead of ``input_ids`` when the
             Attention role transported its gate result over the ids channel.
         topk_weights: Optional routing weights paired with ``topk_ids``, same
-            shape. The FFN side consumes them as the gate weights, so any
-            model-level routed scaling is already folded in.
+            shape. The FFN side consumes them as the gate weights and applies
+            no model-level routed scaling.
     """
 
     hidden_states: torch.Tensor

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from afd_plugin.config import (
     AFDConfig,
@@ -20,8 +20,16 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
+class _ConnectorRegistration(NamedTuple):
+    load_connector: Callable[[], type[AFDConnectorBase]]
+    # (module path, class name) of the Attention-role MoE runner that
+    # ``build_expert`` builds for this connector; None when the connector has
+    # no factory-built Attention MoE path.
+    attention_moe_runner: tuple[str, str] | None
+
+
 class AFDConnectorFactory:
-    _registry: dict[str, Callable[[], type[AFDConnectorBase]]] = {}
+    _registry: dict[str, _ConnectorRegistration] = {}
 
     @classmethod
     def register_connector(
@@ -30,6 +38,7 @@ class AFDConnectorFactory:
         module_path: str,
         class_name: str,
         *,
+        attention_moe_runner: tuple[str, str] | None = None,
         replace: bool = False,
     ) -> None:
         if name in cls._registry and not replace:
@@ -47,7 +56,7 @@ class AFDConnectorFactory:
                 )
             return connector_cls
 
-        cls._registry[name] = loader
+        cls._registry[name] = _ConnectorRegistration(loader, attention_moe_runner)
 
     @classmethod
     def create_connector(
@@ -64,7 +73,7 @@ class AFDConnectorFactory:
             config = afd_config
         if config.connector not in cls._registry:
             raise ValueError(f"unsupported AFD connector type: {config.connector}")
-        connector_cls = cls._registry[config.connector]()
+        connector_cls = cls._registry[config.connector].load_connector()
         role_rank = resolve_role_rank(vllm_config, config)
         return connector_cls(
             rank,
@@ -78,7 +87,15 @@ class AFDConnectorFactory:
     def get_connector_class(cls, connector_name: str) -> type[AFDConnectorBase]:
         if connector_name not in cls._registry:
             raise ValueError(f"unsupported AFD connector type: {connector_name}")
-        return cls._registry[connector_name]()
+        return cls._registry[connector_name].load_connector()
+
+    @classmethod
+    def get_attention_moe_runner(cls, connector_name: str) -> tuple[str, str] | None:
+        """Return the (module path, class name) of the connector's
+        Attention-role MoE runner, or None when it registers none."""
+        if connector_name not in cls._registry:
+            raise ValueError(f"unsupported AFD connector type: {connector_name}")
+        return cls._registry[connector_name].attention_moe_runner
 
     @classmethod
     def parse_connector_extra_info(
@@ -96,11 +113,20 @@ AFDConnectorFactory.register_connector(
     "P2pNcclAFDConnector",
     "afd_plugin.connectors.gpu.p2p",
     "P2pNcclAFDConnector",
+    attention_moe_runner=(
+        "afd_plugin.model_executor.ffn.remote",
+        "AFDRemoteMoERunner",
+    ),
 )
 AFDConnectorFactory.register_connector(
     "DeepEPM2NAFDConnector",
     "afd_plugin.connectors.gpu.deepep_m2n.connector",
     "DeepEPM2NAFDConnector",
+    # vLLM's own runner routes; AFD's routed experts send the routes.
+    attention_moe_runner=(
+        "vllm.model_executor.layers.fused_moe.runner.moe_runner",
+        "MoERunner",
+    ),
 )
 AFDConnectorFactory.register_connector(
     "CAMP2pAFDConnector",

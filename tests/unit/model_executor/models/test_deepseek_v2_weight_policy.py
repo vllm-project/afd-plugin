@@ -104,14 +104,27 @@ def test_weight_role_policy(
     )
 
 
+@pytest.mark.parametrize("connector", ["P2pNcclAFDConnector", "CAMP2pAFDConnector"])
 def test_load_weights_passes_one_shot_generator_to_native_loader(
     monkeypatch: pytest.MonkeyPatch,
+    connector: str,
 ) -> None:
+    """Attention forwards only its own weights, once, to the native loader,
+    for the P2P connector as for CAMP2P.
+
+    Why: with P2P on CUDA the Attention MoE is a native runner without expert
+    parameters, so an FFN-owned gate, expert or shared-expert weight that
+    reached the native loader would fail the load. The P2P case fails if P2P
+    is ever classified as a connector whose Attention owns shared experts.
+    """
     names = [
         "model.embed_tokens.weight",
         "model.layers.0.self_attn.q_proj.weight",
         "model.layers.0.mlp.gate_proj.weight",
         "model.layers.3.mlp.experts.0.down_proj.weight",
+        "model.layers.3.mlp.experts.0.down_proj.weight_scale_inv",
+        "model.layers.3.mlp.gate.weight",
+        "model.layers.3.mlp.shared_experts.gate_proj.weight",
     ]
     weights = _OneShotWeights(names)
     seen: list[str] = []
@@ -132,9 +145,7 @@ def test_load_weights_passes_one_shot_generator_to_native_loader(
     object.__setattr__(
         model,
         "afd_config",
-        SimpleNamespace(
-            compute_gate_on_attention=False, connector="CAMP2pAFDConnector"
-        ),
+        SimpleNamespace(compute_gate_on_attention=False, connector=connector),
     )
     object.__setattr__(model, "config", _config())
 

@@ -14,7 +14,6 @@ from torch import nn  # noqa: E402
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, AFDConfig  # noqa: E402
 from afd_plugin.model_executor.ffn import remote  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
-from tests.unit.fakes.connector import ProxyConnector as _FakeConnector  # noqa: E402
 from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
 from tests.unit.fakes.model_layers import GateLinear  # noqa: E402
 
@@ -41,7 +40,7 @@ def test_native_decoder_forward_calls_remote_proxy_once(
     layer_idx,
 ):
     events: list[tuple] = []
-    afd_metadata = install_proxy_context(adapter, monkeypatch, events)
+    afd_metadata = install_proxy_context(monkeypatch, events)
     monkeypatch.setattr(adapter.native, "DeepseekAttention", _FakeAttention)
 
     layer = object.__new__(adapter.AFDDeepseekV2DecoderLayer)
@@ -108,7 +107,7 @@ def test_gate_proxy_sends_routing_payload(monkeypatch):
     from afd_plugin.model_executor.models.npu import deepseek_v2_attention_gate
 
     events: list[tuple] = []
-    install_proxy_context(adapter, monkeypatch, events, stage_idx=1)
+    install_proxy_context(monkeypatch, events, stage_idx=1)
     topk_weights = torch.tensor([[0.75, 0.25]])
     topk_ids = torch.tensor([[1, 3]])
     router_logits = torch.tensor([[0.1, 0.2, 0.3, 0.4]])
@@ -140,135 +139,6 @@ def test_gate_proxy_sends_routing_payload(monkeypatch):
     assert torch.equal(output, hidden_states * 0.25)
 
 
-def test_remote_experts_proxy_sends_router_logits(monkeypatch):
-    events: list[tuple] = []
-    install_proxy_context(adapter, monkeypatch, events, stage_idx=1)
-    proxy = adapter.AFDAttentionFusedMoE(
-        layer_idx=3,
-        external_routing=True,
-    )
-    hidden_states = torch.ones(1, 4)
-    router_logits = torch.ones(1, 8)
-
-    output = proxy(hidden_states, router_logits)
-
-    assert [event[0] for event in events] == ["send", "yield", "recv"]
-    context = events[0][2]
-    assert context.metadata.layer_idx == 3
-    assert context.metadata.stage_idx == 1
-    assert context.states is None
-    assert events[0][3]["router_logits"] is router_logits
-    assert torch.equal(output, hidden_states * 0.25)
-
-
-def test_remote_experts_proxy_without_external_routing_ships_hidden_states(
-    monkeypatch,
-):
-    events: list[tuple] = []
-    install_proxy_context(adapter, monkeypatch, events, stage_idx=1)
-    proxy = adapter.AFDAttentionFusedMoE(
-        layer_idx=2,
-        external_routing=False,
-    )
-    hidden_states = torch.ones(1, 4)
-
-    output = proxy(hidden_states, hidden_states)
-
-    assert [event[0] for event in events] == ["send", "yield", "recv"]
-    assert events[0][3] == {}
-    assert torch.equal(output, hidden_states * 0.25)
-    assert list(proxy.parameters()) == []
-
-
-COMBINED_VALUE = 1.0
-ROUTE_WEIGHT = 0.5
-
-
-class _InPlaceCombineConnector(_FakeConnector):
-    """Combine writes the routed output into the Attention buffer, as DeepEP
-    M2N does."""
-
-    def send_attn_output(self, hidden_states, context, **kwargs) -> None:
-        # Record what was sent; combine overwrites the buffer afterwards.
-        super().send_attn_output(hidden_states.clone(), context, **kwargs)
-
-    def recv_ffn_output(self, *, ref_tensor, ubatch_idx):
-        self.events.append(("recv", ref_tensor, ubatch_idx))
-        return ref_tensor.fill_(COMBINED_VALUE)
-
-
-class _LogitsGate(nn.Module):
-    def forward(self, hidden_states):
-        return torch.zeros(hidden_states.shape[0], ROUTING_NUM_EXPERTS), None
-
-
-class _Scale(nn.Module):
-    def __init__(self, factor: float) -> None:
-        super().__init__()
-        self.factor = factor
-
-    def forward(self, hidden_states):
-        return hidden_states * self.factor
-
-
-def _routed_experts_moe(*, shared_experts, routed_scaling_factor, tp_size=1):
-    moe = object.__new__(adapter.AFDDeepseekV2RoutedExpertsMoE)
-    nn.Module.__init__(moe)
-    moe.gate = _LogitsGate()
-    moe.router = SimpleNamespace(
-        select_experts=lambda hidden_states, router_logits: (
-            torch.full((hidden_states.shape[0], ROUTING_TOP_K), ROUTE_WEIGHT),
-            torch.zeros((hidden_states.shape[0], ROUTING_TOP_K), dtype=torch.int32),
-        ),
-    )
-    moe.routed_scaling_factor = routed_scaling_factor
-    moe.tp_size = tp_size
-    moe.experts = adapter.AFDAttentionFusedMoE(layer_idx=3, external_routing=True)
-    moe.shared_experts = shared_experts
-    return moe
-
-
-@pytest.mark.parametrize(
-    ("shared_factor", "routed_scaling_factor"),
-    [(None, 1.0), (3.0, 1.0), (3.0, 2.0)],
-    ids=["routed-only", "shared", "shared-scaled"],
-)
-def test_m2n_moe_sends_topk_and_adds_shared_output_of_dispatched_input(
-    monkeypatch, shared_factor, routed_scaling_factor
-):
-    """The DeepSeek M2N MoE sends top-k routes scaled by routed_scaling_factor
-    and returns combine plus the shared experts of the input it dispatched.
-
-    Why: combine overwrites the Attention buffer and sums weight * expert, so
-    the shared MLP must read the input before combine, and the routed scale
-    must ride in the weights.
-    """
-    events: list[tuple] = []
-    afd_metadata = install_proxy_context(adapter, monkeypatch, events, stage_idx=1)
-    afd_metadata.connector = _InPlaceCombineConnector(events)
-    moe = _routed_experts_moe(
-        shared_experts=None if shared_factor is None else _Scale(shared_factor),
-        routed_scaling_factor=routed_scaling_factor,
-    )
-    hidden_value = 2.0
-    hidden_states = torch.full((2, ROUTING_HIDDEN_SIZE), hidden_value)
-
-    output = moe(hidden_states)
-
-    assert [event[0] for event in events] == ["send", "yield", "recv"]
-    send_kwargs = events[0][3]
-    assert set(send_kwargs) == {"topk_ids", "topk_weights"}
-    assert torch.equal(
-        send_kwargs["topk_weights"],
-        torch.full((2, ROUTING_TOP_K), ROUTE_WEIGHT * routed_scaling_factor),
-    )
-    shared_value = 0.0 if shared_factor is None else hidden_value * shared_factor
-    assert torch.equal(
-        output,
-        torch.full((2, ROUTING_HIDDEN_SIZE), COMBINED_VALUE + shared_value),
-    )
-
-
 def test_remote_proxy_requires_forward_metadata(monkeypatch):
     monkeypatch.setattr(
         remote,
@@ -282,7 +152,7 @@ def test_remote_proxy_requires_forward_metadata(monkeypatch):
 
 def test_remote_proxy_exchanges_cam_during_profile(monkeypatch):
     events: list[tuple] = []
-    install_proxy_context(adapter, monkeypatch, events)
+    install_proxy_context(monkeypatch, events)
     monkeypatch.setattr(
         remote,
         "get_forward_context",
@@ -428,7 +298,7 @@ def test_default_proxy_is_parameter_free_and_sends_no_routes(monkeypatch):
     routing settings to the base proxy must not change their payload.
     """
     events: list[tuple] = []
-    install_proxy_context(adapter, monkeypatch, events)
+    install_proxy_context(monkeypatch, events)
     proxy = adapter.RemoteFFNProxy(layer_idx=0)
 
     proxy(torch.ones(2, 4))
@@ -444,7 +314,7 @@ def test_routing_proxy_routes_on_attention_and_sends_topk(monkeypatch):
     the weighted sum, so the proxy must not send logits or apply weights.
     """
     events: list[tuple] = []
-    install_proxy_context(adapter, monkeypatch, events, stage_idx=1)
+    install_proxy_context(monkeypatch, events, stage_idx=1)
     topk_weights = torch.tensor([[0.75, 0.25]])
     topk_ids = torch.tensor([[1, 3]], dtype=torch.int32)
 
@@ -538,7 +408,7 @@ def test_routing_proxy_tp1_dispatches_every_token(monkeypatch):
         raise AssertionError("TP = 1 must not split")
 
     events: list[tuple] = []
-    install_proxy_context(adapter, monkeypatch, events)
+    install_proxy_context(monkeypatch, events)
     monkeypatch.setattr(remote, "sequence_parallel_chunk", no_split)
     hidden_states = _tokens(3)
 
@@ -566,7 +436,7 @@ def test_routing_proxy_tp2_rank_dispatches_its_slice_and_gathers(
     """
     tp_size = 2
     events: list[tuple] = []
-    install_proxy_context(adapter, monkeypatch, events)
+    install_proxy_context(monkeypatch, events)
     monkeypatch.setattr(
         remote, "sequence_parallel_chunk", _chunk_for_rank(tp_rank, tp_size)
     )
@@ -603,7 +473,7 @@ def test_routing_proxy_tp4_with_one_token_routes_only_rank0(monkeypatch):
     """
     tp_size = 4
     events: list[tuple] = []
-    install_proxy_context(adapter, monkeypatch, events)
+    install_proxy_context(monkeypatch, events)
     monkeypatch.setattr(
         remote,
         "tensor_model_parallel_all_gather",
@@ -628,56 +498,3 @@ def test_routing_proxy_tp4_with_one_token_routes_only_rank0(monkeypatch):
         if event[0] == "send"
     ]
     assert unrouted == [False, True, True, True]
-
-
-@pytest.mark.parametrize(
-    ("tp_rank", "sent_tokens", "padding_rows"),
-    [(0, [0, 1], []), (1, [2, 0], [1])],
-)
-def test_m2n_moe_tp2_rank_dispatches_its_slice_and_gathers_shared_sum(
-    monkeypatch, tp_rank, sent_tokens, padding_rows
-):
-    """With TP 2 and 3 tokens the DeepSeek M2N MoE routes and dispatches only
-    its slice, unroutes the padding row, adds the shared output of the slice
-    before combine overwrites it, and all-gathers routed plus shared.
-
-    Why: TP peers hold the same tokens; each must dispatch a disjoint slice,
-    and the replicated shared MLP must see the same rows as combine.
-    """
-    tp_size = 2
-    shared_factor = 3.0
-    events: list[tuple] = []
-    afd_metadata = install_proxy_context(adapter, monkeypatch, events, stage_idx=1)
-    afd_metadata.connector = _InPlaceCombineConnector(events)
-    monkeypatch.setattr(
-        adapter.native, "sequence_parallel_chunk", _chunk_for_rank(tp_rank, tp_size)
-    )
-    monkeypatch.setattr(remote, "get_tensor_model_parallel_rank", lambda: tp_rank)
-    gathered_inputs = []
-
-    def all_gather(local_output, dim):
-        gathered_inputs.append(local_output.clone())
-        return torch.cat([local_output, local_output + PEER_OFFSET], dim=dim)
-
-    monkeypatch.setattr(adapter.native, "tensor_model_parallel_all_gather", all_gather)
-    moe = _routed_experts_moe(
-        shared_experts=_Scale(shared_factor),
-        routed_scaling_factor=1.0,
-        tp_size=tp_size,
-    )
-
-    output = moe(_tokens(3))
-
-    assert [event[0] for event in events] == ["send", "yield", "recv"]
-    sent_states, sent_kwargs = events[0][1], events[0][3]
-    assert sent_states[:, 0].tolist() == sent_tokens
-    unrouted = (sent_kwargs["topk_ids"] == remote.UNROUTED_EXPERT_ID).all(dim=1)
-    assert unrouted.nonzero().flatten().tolist() == padding_rows
-    (local_output,) = gathered_inputs
-    expected_local = COMBINED_VALUE + shared_factor * torch.tensor(
-        sent_tokens, dtype=torch.float32
-    )[:, None].expand(-1, ROUTING_HIDDEN_SIZE)
-    assert torch.equal(local_output, expected_local)
-    assert torch.equal(
-        output, torch.cat([local_output, local_output + PEER_OFFSET])[:3]
-    )
