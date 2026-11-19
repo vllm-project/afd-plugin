@@ -207,7 +207,8 @@ cleanup. Production code does not depend on the E2E harness.
 - `E2E-INV-002` — A PR case **MUST NOT** use more than four unique devices.
   AFD gate topology **MUST** match the selected suite: DeepSeek-V2-Lite
   defaults use 2A2F; Qwen3 MoE and Qwen3.6 MoE use 2A1F. Weekly CI also
-  selects the existing DeepSeek-V2-Lite 2A1F Graph + DBO case.
+  selects the existing DeepSeek-V2-Lite 2A1F Graph + DBO case and the Qwen3
+  MoE DeepEP M2N 2A2F Graph + DBO case.
 - `E2E-INV-003` — Cases sharing devices or ports **MUST** run sequentially,
   remain order-independent, and release owned process groups before the next
   case.
@@ -381,7 +382,7 @@ unverified.
 | Samples | first 7 for ordinary cases; default DBO floors at 24; V2 DP2 eager/DBO comparison defaults to 128 | first 7; all DBO cases floor at 24 |
 | Metric | GSM8K exact match | GSM8K exact match |
 | Minimum accuracy | DeepSeek-V2-Lite smoke (up to 24 samples): 0.25; otherwise 0.27 | DeepSeek-V2-Lite smoke (up to 24 samples): 0.25; otherwise 0.27 |
-| Cases | seven CUDA DeepSeek-V2-Lite cases; four existing NPU DeepSeek-V2-Lite cases | seven Qwen3 MoE / Qwen3.6 MoE cases plus DeepSeek-V2-Lite `afd-graph-dbo-2a1f` |
+| Cases | seven CUDA DeepSeek-V2-Lite cases; four existing NPU DeepSeek-V2-Lite cases | seven Qwen3 MoE / Qwen3.6 MoE cases plus DeepSeek-V2-Lite `afd-graph-dbo-2a1f` and Qwen3 MoE `afd-deepep-m2n-graph-dbo-2a2f` |
 
 An accuracy of `0.27` requires at least 2 correct answers out of 7, 7 out of
 24, or 35 out of 128. The DeepSeek smoke threshold of `0.25` requires 6 out
