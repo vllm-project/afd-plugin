@@ -181,6 +181,7 @@ tests/e2e/
 ├── deployment.py            # Case commands, service startup and cleanup
 ├── checks/mrv2.py           # Host probe preparation and phase windows
 ├── mrv2_evidence.py         # Worker-side probe
+├── ffn_service_evidence.py  # Same probe for the standalone FFN service
 ├── accuracy/<task>.py       # Shared workload and result validation
 ├── environment.py          # Resource bindings and CLI environment
 ├── multi_pod/              # Peer coordination and placement; NPU legacy entry

@@ -305,9 +305,11 @@ python -m pytest -q -s \
 and Attention TP2 graph deployments (`afd-deepep-m2n-faas-*-2a2f`) with the
 FFN side served by the
 [standalone GPU FFN service](../../docs/gpu/STANDALONE_FFN_SERVICE.md)
-instead of `vllm serve`. Attention launches unchanged; execution evidence is
-required from Attention only, because the service has no vLLM Worker. It has
-the same requirements and is not run by CI.
+instead of `vllm serve`. Attention launches unchanged. Graph and DBO cases
+still require execution evidence from both roles: the service has no vLLM
+Worker, so its ranks run `tests.e2e.ffn_service_evidence`, which installs the
+same FFN probe and runs the unchanged CLI. It has the same requirements and is
+not run by CI.
 
 ```bash
 python -m pytest -q -s \

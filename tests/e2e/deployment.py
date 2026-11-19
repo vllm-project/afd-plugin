@@ -49,6 +49,9 @@ FFN_SERVICE_MASTER_PORT_OFFSET = 1
 FFN_SERVICE_STATUS_FILE = "ffn-service.json"
 FFN_SERVICE_HTTP_TIMEOUT_S = 5
 FFN_SERVICE_PROCESS_KILL_TIMEOUT_S = 120
+FFN_SERVICE_MODULE = "afd_plugin.ffn_faas"
+# Same CLI with the MRV2 FFN probe installed; see that module.
+FFN_SERVICE_PROBE_MODULE = "tests.e2e.ffn_service_evidence"
 # Starting the first role is not waiting for its connector rendezvous or API.
 CONNECTOR_PROTOCOLS = (
     ("gpu", "P2pNcclAFDConnector", ("ffn", "attention")),
@@ -96,8 +99,8 @@ class ResolvedDeployment:
     def command(self, role: str, probe_arguments: tuple[str, ...] = ()) -> list[str]:
         profile = self.case.deployment
         if role == FFN_ROLE and profile.ffn_service is not None:
-            # The service has no vLLM Worker to host the evidence extension.
-            return self.ffn_service_command()
+            # No vLLM Worker loads the extension; the probe entry installs it.
+            return self.ffn_service_command(probe=bool(probe_arguments))
         layout = dict(profile.roles)[role]
         dbo = profile.dbo_for_role(role)
         env = self.environment
@@ -221,7 +224,7 @@ class ResolvedDeployment:
             afd["afd_process_group_timeout_s"] = profile.ffn_service.afd_timeout_s
         return afd
 
-    def ffn_service_command(self) -> list[str]:
+    def ffn_service_command(self, *, probe: bool = False) -> list[str]:
         """``torchrun`` command of the standalone FFN service on this host.
 
         One process per FFN rank. The AFD configuration, execution mode and
@@ -229,6 +232,8 @@ class ResolvedDeployment:
         unchanged Attention command pairs with it. Request-shaping arguments
         (``common_vllm_args``, batch and capture budgets) belong to Attention,
         whose control payloads drive every FFN step and graph capture.
+        With ``probe``, the ranks run the MRV2 probe entry instead of the
+        plain module, so graph/DBO checks see FFN evidence.
         """
         profile = self.case.deployment
         service, ffn = profile.ffn_service, profile.ffn
@@ -243,7 +248,7 @@ class ResolvedDeployment:
             f"--master-addr={env.afd_host}",
             f"--master-port={env.afd_port + FFN_SERVICE_MASTER_PORT_OFFSET}",
             "-m",
-            "afd_plugin.ffn_faas",
+            FFN_SERVICE_PROBE_MODULE if probe else FFN_SERVICE_MODULE,
             "serve",
             env.model,
             "--backend",

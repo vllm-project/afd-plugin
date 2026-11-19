@@ -4,9 +4,12 @@
 
 Native RPC resets each named window; a marker arms FFN for that same window.
 Attention reports after evaluation; FFN reports through its existing health
-RPC. Its daemon does not service HTTP RPC. CUDA V4 also records a bounded set
-of successful live transactions, pairing native A input IDs with the actual
-first local Hash-layer F input IDs. Capture retains references without D2H.
+RPC. Its daemon does not service HTTP RPC. The standalone FFN service has no
+Worker or health RPC: ``tests.e2e.ffn_service_evidence`` installs the same
+probe there and polls ``flush_ffn_service_evidence``. CUDA V4 also records a
+bounded set of successful live transactions, pairing native A input IDs with
+the actual first local Hash-layer F input IDs. Capture retains references
+without D2H.
 CUDA target: 5df63a7203cdb9328d824a27b682e77c7b9928be (0.32.0).
 Ascend retains the existing 0.30 call without CUDA's randomize_inputs argument.
 Remove these wrappers when upstream exposes equivalent live Attention/FFN
@@ -47,6 +50,8 @@ else:
     FFN_WORKER = ffn_worker.AFDFFNWorker
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import torch
     from vllm.config import VllmConfig
     from vllm.forward_context import DPMetadata
@@ -62,7 +67,7 @@ if TYPE_CHECKING:
     from afd_plugin.connectors import AFDControlPayload, AFDDPMetadata
     from afd_plugin.connectors.gpu.p2p import P2pNcclAFDConnector
 
-__all__ = ["Worker"]
+__all__ = ["Worker", "flush_ffn_service_evidence"]
 
 DBO_NUM_STAGES = 2
 MRV2_EVIDENCE_START_ENV = "AFD_E2E_MRV2_EVIDENCE_START"
@@ -232,7 +237,7 @@ class _HashInputProbe:
         return samples
 
 
-def _install_probes() -> type:
+def _install_probes() -> tuple[type, Callable[[], None]]:
     counts = _ExecutionCounts()
     counts_lock = Lock()
     armed = False
@@ -242,6 +247,7 @@ def _install_probes() -> type:
     complete_marker = start_marker.with_name("evaluation-complete")
     attention_replayed = False
     ffn_mode: AFDGraphRunMode | None = None
+    ffn_vllm_config: VllmConfig | None = None
     native_execute = GPUModelRunner.execute_model
     native_replay = ModelCudaGraphManager.run_fullgraph
     native_prepare = UBatchRunner.prepare
@@ -559,7 +565,9 @@ def _install_probes() -> type:
         is_warmup: bool = False,
         is_graph_replaying: bool = False,
     ) -> None:
-        nonlocal ffn_in_flight, armed
+        nonlocal ffn_in_flight, armed, ffn_vllm_config
+        # The standalone FFN service reports with its runner's config.
+        ffn_vllm_config = self.vllm_config
         arm_ffn()
         with counts_lock:
             ffn_in_flight = True
@@ -643,9 +651,21 @@ def _install_probes() -> type:
             # ### PATCH END: preserve failure without later success evidence.
             raise
         # ### PATCH START: freeze once after the completed evaluation window.
-        if armed and complete_marker.exists() and complete_marker.read_text() == window:
-            log_execution_evidence(self.vllm_config, only_if_armed=True)
+        flush_completed_window(self.vllm_config)
         # ### PATCH END: freeze once after the completed evaluation window.
+
+    def flush_completed_window(vllm_config: VllmConfig) -> None:
+        if armed and complete_marker.exists() and complete_marker.read_text() == window:
+            log_execution_evidence(vllm_config, only_if_armed=True)
+
+    def flush_ffn_service_evidence() -> None:
+        """The standalone FFN service's stand-in for the Worker health RPC.
+
+        Its receiver blocks in the control receive once Attention is idle, so
+        a host thread calls this; nothing is logged before the first FFN step.
+        """
+        if ffn_vllm_config is not None:
+            flush_completed_window(ffn_vllm_config)
 
     GPUModelRunner.execute_model = execute
     ModelCudaGraphManager.run_fullgraph = replay
@@ -721,7 +741,7 @@ def _install_probes() -> type:
         P2pNcclAFDControlPlane.send_dp_metadata_list = send_dp_metadata_list
         P2pNcclAFDControlPlane.recv_dp_metadata_list = recv_dp_metadata_list
         AFDDeepseekV4Model.compute_ffn_output = compute_ffn_output
-    return Worker
+    return Worker, flush_ffn_service_evidence
 
 
-Worker = _install_probes()
+Worker, flush_ffn_service_evidence = _install_probes()

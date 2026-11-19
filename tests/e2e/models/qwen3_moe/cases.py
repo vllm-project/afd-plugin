@@ -121,9 +121,6 @@ def build_case(case_id: str, environment: CaseEnvironment) -> Case:
     )
     if ffn_service:
         deployment = replace(deployment, ffn_service=FfnService(FFN_SERVICE_BACKEND))
-    # The FFN service has no vLLM Worker to host the evidence extension;
-    # Attention's evidence covers the paired graph/DBO path.
-    evidence_roles = ("attention",) if ffn_service else ("attention", "ffn")
     return Case(
         id=case_id,
         model="Qwen3 MoE",
@@ -141,7 +138,7 @@ def build_case(case_id: str, environment: CaseEnvironment) -> Case:
                         minimum_samples=DBO_MINIMUM_SAMPLES if dbo else 1,
                     )
                 ),
-                (Mrv2Check(evidence_roles, graph=graph, dbo=dbo),)
+                (Mrv2Check(("attention", "ffn"), graph=graph, dbo=dbo),)
                 if not baseline and (graph or dbo)
                 else (),
             ),
