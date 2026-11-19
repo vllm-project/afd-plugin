@@ -45,6 +45,7 @@ from vllm.v1.worker.workspace import (  # noqa: E402
     reset_workspace_manager,
 )
 
+from afd_plugin.config import DEEPEP_M2N_CONNECTOR  # noqa: E402
 from afd_plugin.connectors import AFDForwardContextMetadata  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
 from tests.conftest import REPO_ROOT  # noqa: E402
@@ -78,7 +79,7 @@ def test_routing_proxy_matches_native_router(monkeypatch, renormalize):
     """
     torch.manual_seed(0)
     events: list[tuple] = []
-    install_proxy_context(adapter, monkeypatch, events, stage_idx=0)
+    install_proxy_context(monkeypatch, events, stage_idx=0)
     gate = (
         GateLinear(ROUTING_HIDDEN_SIZE, ROUTING_NUM_EXPERTS, out_dtype=torch.float32)
         .cuda()
@@ -147,7 +148,7 @@ def test_routing_proxy_matches_native_router(monkeypatch, renormalize):
 )
 def test_attention_moe_runner_matches_native_moe_bit_for_bit(tmp_path, routing):
     """The split Attention MoE returns the native MoE's output bit for bit,
-    for both gate placements.
+    for both gate placements and for DeepEP M2N routes.
 
     Why: splitting the MoE between the roles must not change any output.
     """
@@ -184,7 +185,18 @@ class _LoopbackFFN:
         assert set(payload) == self.expected_payload
         num_tokens = hidden_states.shape[0]
         with set_forward_context(None, self.vllm_config, num_tokens=num_tokens):
-            if payload:
+            if "topk_ids" in payload:
+                # As the DeepEP M2N FFN, run only the routed experts on the
+                # routes Attention selected.
+                routed_experts = self.external_router_moe.experts.routed_experts
+                output = routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=payload["topk_weights"],
+                    topk_ids=payload["topk_ids"],
+                )
+                assert isinstance(output, torch.Tensor)
+                self.output = output.clone()
+            elif payload:
                 self.output = self.external_router_moe.experts(
                     hidden_states=hidden_states,
                     router_logits=payload["router_logits"],
@@ -257,25 +269,30 @@ def _check_attention_moe_parity(
             ),
         },
     )
-    for layer_idx, gate_on_attention in ((2, False), (3, True)):
+    for layer_idx, connector, gate_on_attention, payload in (
+        (2, "P2pNcclAFDConnector", False, set()),
+        (3, "P2pNcclAFDConnector", True, {"router_logits"}),
+        (4, DEEPEP_M2N_CONNECTOR, True, {"topk_ids", "topk_weights"}),
+    ):
         vllm_config.additional_config["afd"] = {
             "role": "attention",
-            "connector": "P2pNcclAFDConnector",
+            "connector": connector,
             "compute_gate_on_attention": gate_on_attention,
         }
-        # Equal shapes get equal values, so the gate matches the native one.
+        # Equal shapes get equal values, so the gate and the shared experts
+        # match the native ones.
         attention_moe = _built_moe(
             partial(
                 adapter.AFDDeepseekV2RemoteExpertsMoE,
                 config=hf_config,
                 vllm_config=vllm_config,
-                layer_idx=layer_idx,
                 prefix=f"model.layers.{layer_idx}.mlp",
                 compute_gate_on_attention=gate_on_attention,
+                sends_routes=connector == DEEPEP_M2N_CONNECTOR,
             ),
             vllm_config,
         )
-        loopback.expected_payload = {"router_logits"} if gate_on_attention else set()
+        loopback.expected_payload = payload
         for num_tokens in PARITY_TOKEN_COUNTS:
             hidden_states = _pattern(num_tokens * PARITY_HIDDEN_SIZE, INPUT_PATTERN)
             hidden_states = hidden_states.view(num_tokens, -1).to(torch.bfloat16)

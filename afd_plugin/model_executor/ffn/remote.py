@@ -32,9 +32,16 @@ from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
 )
 from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+    SharedExperts,
+    SharedExpertsOrder,
+)
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.models.utils import sequence_parallel_chunk
+from vllm.model_executor.models.utils import (
+    extract_layer_index,
+    sequence_parallel_chunk,
+)
 from vllm.platforms import current_platform
 
 from afd_plugin.config import parse_afd_config
@@ -49,8 +56,8 @@ from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 UNROUTED_EXPERT_ID = -1
 # The only device validated for native-factory Attention MoE runners. Each
-# connector's registration names its runner; only CUDA P2P registers one.
-# DeepEP M2N routes on Attention through its own model shell instead.
+# connector's registration names its runner: AFD's for CUDA P2P, vLLM's own
+# for DeepEP M2N, whose routed experts send the routes.
 ATTENTION_MOE_RUNNER_DEVICE = "cuda"
 
 
@@ -197,9 +204,19 @@ class RemoteFFNProxy(nn.Module):
 class AFDRemoteMoEMethod(FusedMoEMethodBase):
     """Native MoE method lifecycle without local expert weights or kernels.
 
-    ``apply`` and ``apply_monolithic`` keep the base ``NotImplementedError``,
-    so computing experts on the Attention role fails loudly.
+    ``apply`` runs the routed experts on the FFN role: vLLM's runner calls it
+    with the top-k routes it selected (DeepEP M2N). ``apply_monolithic`` keeps
+    the base ``NotImplementedError``.
     """
+
+    def __init__(self, moe: FusedMoEConfig, *, layer_idx: int) -> None:
+        super().__init__(moe)
+        self.layer_idx = layer_idx
+
+    @property
+    def mk_can_overlap_shared_experts(self) -> bool:
+        # apply runs the shared experts while the routes are in flight.
+        return True
 
     def create_weights(
         self,
@@ -228,6 +245,38 @@ class AFDRemoteMoEMethod(FusedMoEMethodBase):
         # runner's FusedMoEConfig keeps the model's dimensions.
         return hidden_size, intermediate_size_per_partition
 
+    def apply(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: SharedExperts | None,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Dispatch the routes to the FFN role's routed experts and return
+        their combined output."""
+        stage_idx = _send_attention_output(
+            _current_afd_metadata(),
+            x,
+            layer_idx=self.layer_idx,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+        if shared_experts is not None:
+            assert shared_experts_input is not None
+            shared_experts(
+                shared_experts_input,
+                SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
+            )
+        x = maybe_apply_dbo_yield(x, role="attention")
+        # Combine writes into ref_tensor, and vLLM's MoE op declares that it
+        # does not mutate its inputs, so combine into a new tensor, not x.
+        return _current_afd_metadata().connector.recv_ffn_output(
+            ref_tensor=torch.empty_like(x),
+            ubatch_idx=stage_idx,
+        )
+
 
 class AFDRemoteRoutedExperts(RoutedExperts):
     """Native routed-experts descriptor that allocates no expert parameters."""
@@ -238,7 +287,7 @@ class AFDRemoteRoutedExperts(RoutedExperts):
         quant_config: QuantizationConfig | None,
         moe_config: FusedMoEConfig,
     ) -> FusedMoEMethodBase:
-        return AFDRemoteMoEMethod(moe_config)
+        return AFDRemoteMoEMethod(moe_config, layer_idx=extract_layer_index(prefix))
 
 
 class AFDRemoteMoERunner(MoERunner):
@@ -321,6 +370,7 @@ def build_expert(
     vllm_config: VllmConfig,
     *,
     gate: nn.Module | None,
+    shared_experts: nn.Module | None = None,
     **moe_kwargs: Any,
 ) -> MoERunner:
     """Build an Attention-role MoE ``experts`` module through native
@@ -328,11 +378,11 @@ def build_expert(
 
     ``moe_kwargs`` are the native model's ``FusedMoEFactory`` arguments. Pass
     the model's gate exactly when ``compute_gate_on_attention`` is set; the
-    runner then applies it and sends the router logits. The configured
-    connector's registration names the runner class, imported here. This
-    function fixes the arguments that describe local experts: the runner
-    registers like a native MoE layer but allocates no expert weights and runs
-    no expert kernel.
+    runner then applies it. Pass the shared experts when Attention runs them
+    (DeepEP M2N). The configured connector's registration names the runner
+    class, imported here. This function fixes the arguments that describe
+    local experts: the runner registers like a native MoE layer but allocates
+    no expert weights and runs no expert kernel.
     """
     afd_config = parse_afd_config(vllm_config, validate=False)
     runner_path = AFDConnectorFactory.get_attention_moe_runner(afd_config.connector)
@@ -364,13 +414,14 @@ def build_expert(
         moe_kwargs["routed_scaling_factor"],
     ):
         raise ValueError("routed_scaling_factor must be finite")
-    # A parameter-free container: no local quantized weights, shared experts,
-    # transforms or EPLB, and unit TP/DP/PCP sizes, so no expert sharding.
-    # The FFN role applies routed_scaling_factor; the runner only records it.
+    # A parameter-free container: no local quantized weights, transforms or
+    # EPLB, and unit TP/DP/PCP sizes, so no expert sharding. vLLM's runner
+    # scales the combined routed output, as native; the P2P runner returns the
+    # FFN output, which the FFN role has already scaled.
     factory_kwargs: dict[str, Any] = {
         "gate": gate,
         "quant_config": None,
-        "shared_experts": None,
+        "shared_experts": shared_experts,
         "shared_expert_gate": None,
         "routed_input_transform": None,
         "routed_output_transform": None,
