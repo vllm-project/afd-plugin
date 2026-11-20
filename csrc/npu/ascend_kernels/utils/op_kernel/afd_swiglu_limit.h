@@ -8,7 +8,7 @@
  * clipping, matching the ACLNN and PyTorch surfaces that default to 0.
  *
  * This lives in utils/op_kernel so the layered W4A8/A4W4 postprocessors and
- * the native Mega activation share one definition instead of each carrying
+ * the native MegaMoE activation share one definition instead of each carrying
  * its own Mins/Maxs sequence.
  */
 #ifndef AFD_SWIGLU_LIMIT_H

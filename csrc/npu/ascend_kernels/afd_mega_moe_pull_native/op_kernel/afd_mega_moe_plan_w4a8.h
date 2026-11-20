@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 /**
- * W4A8 execution plan for the native Mega pull operator.
+ * W4A8 execution plan for the native MegaMoE pull operator.
  *
  * Everything the pipeline needs that depends on the weight/activation dtype
  * lives here, so afd_mega_moe_pull_pipeline.h stays dtype-agnostic and a new

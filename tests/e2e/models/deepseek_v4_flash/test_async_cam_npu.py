@@ -74,7 +74,7 @@ def build_environment(scenario: str = DSV4_ASYNC_CAM_SCENARIO) -> dict[str, str]
         }
     )
     if scenario == DSV4_ASYNC_CAM_MEGA_SCENARIO:
-        vendor = REPO_ROOT / "afd_plugin/_custom_ops/vendors/afd-plugin"
+        vendor = REPO_ROOT / "afd_plugin/_cann_ops_custom/vendors/afd-plugin"
         for key, path in (
             ("ASCEND_CUSTOM_OPP_PATH", vendor),
             ("LD_LIBRARY_PATH", vendor / "op_api/lib"),

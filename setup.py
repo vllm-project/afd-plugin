@@ -114,8 +114,8 @@ class BuildAscendOps(build_ext):
         subprocess.check_call(["cmake", "--build", ".", f"-j={jobs}"], cwd=build_temp)
         subprocess.check_call(["cmake", "--install", "."], cwd=build_temp)
 
-        src_cann_ops = ROOT / "afd_plugin" / "_custom_ops"
-        dst_cann_ops = Path(self.build_lib) / "afd_plugin" / "_custom_ops"
+        src_cann_ops = ROOT / "afd_plugin" / "_cann_ops_custom"
+        dst_cann_ops = Path(self.build_lib) / "afd_plugin" / "_cann_ops_custom"
         if src_cann_ops.exists():
             if dst_cann_ops.exists():
                 shutil.rmtree(dst_cann_ops)

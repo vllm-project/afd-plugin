@@ -131,7 +131,7 @@ loading torch, vLLM or NPU modules through the connector package namespaces.
 | Native ubatching | native `UBatchRunner` with scoped AFD metadata preparation | `NPUUBatchRunner` adapting native child inputs, contexts and streams |
 | Profiling | `compat/profiler.py` | `compat/npu/profiler.py` |
 | Native operators | PyTorch/vLLM CUDA runtime used by NCCL P2P | plugin CANN A2E/E2A and routed-only async CAM ops |
-| Build/packaging | no plugin CUDA extension | `setup.py`, `csrc/npu/**`, packaged `_custom_ops` vendor tree |
+| Build/packaging | no plugin CUDA extension | `setup.py`, `csrc/npu/**`, packaged `_cann_ops_custom` vendor tree |
 
 ```mermaid
 flowchart TB
@@ -358,7 +358,7 @@ variables, or the default toolkit path identifies an Ascend environment.
 artifacts already exist.
 
 The build performs the CANN vendor build under `csrc/npu`, builds the PyTorch
-CMake extension, and packages `_custom_ops`. Loading remains lazy:
+CMake extension, and packages `_cann_ops_custom`. Loading remains lazy:
 `ensure_cam_p2p_ops_available()` updates the vendor/library environment, imports
 `afd_plugin._C_ascend`, and verifies `torch.ops.afd_ascend.a2e/e2a` only when
 the connector initializes. The package can therefore be imported without the

@@ -45,15 +45,15 @@ operator list from that registry for a given SOC.
 ## Pull Mega MC2 dependency
 
 Set `connector_extra_config.ffn_mega_moe=true` on every Attention and FFN
-rank to enable Mega and its dedicated pull protocol. With the switch off,
+rank to enable MegaMoE and its dedicated pull protocol. With the switch off,
 CAM retains its original push Dispatch/Combine and FFN execution path.
 Pull is not a standalone transport option: there is no `dispatch_mode`
-setting or separate pull DispatchRecv/CombineSend operator. Mega requires
+setting or separate pull DispatchRecv/CombineSend operator. MegaMoE requires
 `dynamicQuant=1` and per-channel W4A8 or W8A8 weights.
-Per-group weights are not supported by Mega.
+Per-group weights are not supported by MegaMoE.
 
 The A3 `AfdMegaMoePullNative` kernel directly includes the installed CANN MC2
-W4A8 `BlockMmad`. The build supports the CANN 9.1 Mega header layout and
+W4A8 `BlockMmad`. The build supports the CANN 9.1 MegaMoE header layout and
 the CANN 9.2 layout with Catlass under `ascendc/common/catlass/include`. Set
 `ASCEND_CANN_PACKAGE_PATH` or `ASCEND_HOME_PATH` to the CANN installation.
 When this operator is selected, configuration fails if its MC2 headers are
@@ -140,7 +140,7 @@ The generated artifacts are installed into the Python package:
 
 ```text
 afd_plugin/_C_ascend*.so
-afd_plugin/_custom_ops/
+afd_plugin/_cann_ops_custom/
 ```
 
 `csrc/npu/output/` and `csrc/npu/build/` are build outputs and are not tracked.
@@ -154,7 +154,7 @@ AFD custom ops must coexist with vLLM-Ascend in the same process:
 - A2E/E2A are registered under `torch.ops.afd_ascend`, not under
   vLLM-Ascend's `torch.ops._C_ascend` namespace.
 - The CANN custom-op package is installed under the AFD vendor path,
-  `afd_plugin/_custom_ops/vendors/afd-plugin/...`.
+  `afd_plugin/_cann_ops_custom/vendors/afd-plugin/...`.
 - The loader uses the package-local `libcust_opapi.so` path through
   `AFD_CUST_OPAPI_LIB_PATH`; it must not rely on a bare
   `dlopen("libcust_opapi.so")`.

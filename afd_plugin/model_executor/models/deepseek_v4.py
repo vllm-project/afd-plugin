@@ -277,9 +277,9 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         self.use_native_mega_moe = (
             vllm_config.kernel_config.moe_backend in native.NATIVE_MEGA_MOE_BACKENDS
         )
-        # ### PATCH START: Mega has unproven role-local finalization semantics.
+        # ### PATCH START: MegaMoE has unproven role-local finalization semantics.
         if vllm_config.kernel_config.moe_backend in native.MEGA_MOE_BACKENDS:
-            raise RuntimeError("AFD DeepSeek-V4 does not support Mega")
+            raise RuntimeError("AFD DeepSeek-V4 does not support MegaMoE")
         # Native derives SP from the EP/TP/DP layout; AFD splits roles across
         # dedicated workers and requires full-token boundary payloads.
         self.use_sequence_parallel = False
@@ -411,7 +411,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         return super().get_expert_mapping()
 
     def finalize_mega_moe_weights(self) -> None:
-        """Mega is rejected before allocation, so no finalizer is needed."""
+        """MegaMoE is rejected before allocation, so no finalizer is needed."""
 
     def finalize_mhc_broadcast_weights(self) -> None:
         """Finalize only the Attention-owned first-layer broadcast matrix."""

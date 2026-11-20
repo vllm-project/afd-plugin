@@ -169,7 +169,7 @@ def environment_for(args, settings, role: str) -> dict[str, str]:
     # CANN caches its operator registry when the device is initialized. The
     # package paths must be inherited by CLI/EngineCore/worker processes, before
     # model loading performs any NPU operation (the P3 fixture did this early).
-    vendor = runner.REPO_ROOT / "afd_plugin/_custom_ops/vendors/afd-plugin"
+    vendor = runner.REPO_ROOT / "afd_plugin/_cann_ops_custom/vendors/afd-plugin"
     for key, path in (
         ("ASCEND_CUSTOM_OPP_PATH", vendor),
         ("LD_LIBRARY_PATH", vendor / "op_api/lib"),

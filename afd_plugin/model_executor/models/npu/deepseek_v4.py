@@ -904,7 +904,7 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
     # vLLM 5df63a7 model_loader/utils.py invokes this model hook after quant
-    # finalize. AFD's CAM GMM path still needs the scale that native Mega drops.
+    # finalize. AFD's CAM GMM path still needs the scale that native MegaMoE drops.
     def process_weights_after_loading(self) -> None:
         # ### PATCH START: retain FFN gate-on-A W8A8 scales after quant finalize
         if (

@@ -891,7 +891,7 @@ def test_pull_mega_sets_vendor_paths_before_service_start(monkeypatch):
     monkeypatch.setenv("LD_LIBRARY_PATH", "/other/lib")
     env = entrypoint.build_environment(dsv4_cases.config.DSV4_ASYNC_CAM_MEGA_SCENARIO)
     vendor = str(
-        entrypoint.REPO_ROOT / "afd_plugin/_custom_ops/vendors/afd-plugin"
+        entrypoint.REPO_ROOT / "afd_plugin/_cann_ops_custom/vendors/afd-plugin"
     )
     assert env["ASCEND_CUSTOM_OPP_PATH"].split(os.pathsep) == [vendor, "/other/vendor"]
     assert env["LD_LIBRARY_PATH"].split(os.pathsep) == [

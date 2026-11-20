@@ -465,7 +465,7 @@ GPU execution and bounded ID copies run outside the publication lock.
 The fixed text profile uses 4096 context, a 1024-token batch budget, up to 8
 sequences, chunked prefill, and `kv-cache-dtype=fp8`. It leaves weight
 quantization and the device-aware MoE kernel selection to the checkpoint and
-target vLLM. AFD keeps gating on FFN and does not enable Mega. Provision the
+target vLLM. AFD keeps gating on FFN and does not enable MegaMoE. Provision the
 large Flash checkpoint explicitly with `AFD_GPU_E2E_MODEL`; there is no implicit
 model download. See the runtime matrix for tested configurations.
 
@@ -652,7 +652,7 @@ Async CAM uses layered FFN execution with DeepSeek-V4 W4A8/W8A8. The
 DeepSeek-V2-Lite Async CAM smoke and ubatching scenarios have been retired;
 see the DeepSeek-V4 Async CAM profile above for the supported NPU entrypoint.
 
-## A3 Async CAM Pull Mega
+## A3 Async CAM Pull MegaMoE
 
 Issue [#576](https://github.com/vllm-project/afd-plugin/issues/576) is covered by
 `afd-dsv4-flash-async-cam-pull-mega-dp2tp4-ep8` in the model-owned `cases.py` and
@@ -686,7 +686,7 @@ git rev-parse HEAD > artifacts/pull-mega/tip.txt
 git diff --binary > artifacts/pull-mega/source.patch
 python -m pip freeze > artifacts/pull-mega/packages.txt
 npu-smi info > artifacts/pull-mega/npu.txt
-find afd_plugin/_custom_ops -type f -exec sha256sum {} + \
+find afd_plugin/_cann_ops_custom -type f -exec sha256sum {} + \
   > artifacts/pull-mega/native-sha256.txt
 python -m pytest -s --basetemp=artifacts/pull-mega/pytest \
   tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py \

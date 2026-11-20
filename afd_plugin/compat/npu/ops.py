@@ -22,17 +22,17 @@ CAM_COMBINE_SEND = "afd_async_combine_send"
 CAM_COMBINE_RECV = "afd_async_combine_recv"
 
 
-def get_afd_vendor_path() -> Path:
+def get_afd_cann_vendor_path() -> Path:
     return (
         Path(__file__).resolve().parents[2]
-        / "_custom_ops"
+        / "_cann_ops_custom"
         / "vendors"
         / AFD_ASCEND_VENDOR_NAME
     )
 
 
 def get_afd_cust_opapi_path() -> Path:
-    return get_afd_vendor_path() / "op_api" / "lib" / "libcust_opapi.so"
+    return get_afd_cann_vendor_path() / "op_api" / "lib" / "libcust_opapi.so"
 
 
 def _prepend_env_path(name: str, path: Path) -> None:
@@ -45,7 +45,7 @@ def _prepend_env_path(name: str, path: Path) -> None:
 
 
 def _ensure_afd_custom_opp_env() -> None:
-    vendor_dir = get_afd_vendor_path()
+    vendor_dir = get_afd_cann_vendor_path()
     if not vendor_dir.exists():
         return
 
@@ -197,7 +197,7 @@ __all__ = [
     "ensure_cam_async_ops_available",
     "ensure_mega_ops_available",
     "ensure_cam_p2p_ops_available",
-    "get_afd_vendor_path",
+    "get_afd_cann_vendor_path",
     "get_afd_cust_opapi_path",
     "has_afd_ascend_ops",
 ]

@@ -49,7 +49,7 @@ export HCCL_SOCKET_IFNAME="$INTERFACE" GLOO_SOCKET_IFNAME="$INTERFACE"
 export TP_SOCKET_IFNAME="$INTERFACE" HCCL_IF_IP="$LOCAL_IP"
 export HCCL_BUFFSIZE=256 LCCL_BUFFER_SIZE=408 OMP_NUM_THREADS=4
 
-OPP=$(python3 -c 'from pathlib import Path; import afd_plugin; print(Path(afd_plugin.__file__).resolve().parent / "_custom_ops/vendors/afd-plugin")')
+OPP=$(python3 -c 'from pathlib import Path; import afd_plugin; print(Path(afd_plugin.__file__).resolve().parent / "_cann_ops_custom/vendors/afd-plugin")')
 export ASCEND_CUSTOM_OPP_PATH="$OPP${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
 export AFD_CUST_OPAPI_LIB_PATH="$OPP/op_api/lib/libcust_opapi.so"
 export LD_LIBRARY_PATH="$OPP/op_api/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
