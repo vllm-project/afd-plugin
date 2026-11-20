@@ -89,6 +89,17 @@ def test_ascend_forward_context_uses_native_mrv2_layout(
     assert profile_states == [True, False]
 
 
+@pytest.fixture(autouse=True)
+def _isolate_stateless_pg_patches(monkeypatch):
+    """The installer also applies the elastic stateless-PG patches, whose module
+    binds torch at import; CPU runs stub that seam, exactly as the routing-id op
+    above is stubbed."""
+    name = "afd_plugin.compat.patches.npu.stateless_pg"
+    stub = types.ModuleType(name)
+    stub.__dict__["apply_afd_stateless_pg_patches"] = lambda: True
+    monkeypatch.setitem(sys.modules, name, stub)
+
+
 @pytest.fixture
 def isolate_ascend_config_installer(monkeypatch):
     # AscendConfig installation has dedicated lifecycle tests; these tests
