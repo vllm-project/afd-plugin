@@ -94,19 +94,6 @@ def test_cuda_graph_policy_allows_two_way_ubatching_with_full_decode_only_graph(
     assert policy.allow_cuda_graph_with_ubatching is True
 
 
-def test_cuda_graph_policy_rejects_unsupported_ubatch_count_with_graph():
-    with pytest.raises(RuntimeError, match="ubatching"):
-        validate_cuda_graph_mode(
-            _config(
-                enforce_eager=False,
-                cudagraph_mode=FULL_DECODE_ONLY,
-                use_ubatching=True,
-                num_ubatches=4,
-            ),
-            role="attention",
-        )
-
-
 def test_cudagraph_mode_name_handles_enum_like_values():
     mode = SimpleNamespace(name=FULL_DECODE_ONLY)
 

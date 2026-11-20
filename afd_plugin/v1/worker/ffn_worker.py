@@ -85,7 +85,7 @@ class AFDFFNWorker(Worker):
             caller="AFDFFNWorker.init_device",
             expected_role="ffn",
         )
-        validate_gpu_model_runner_v2_config(
+        self.afd_cudagraph_policy = validate_gpu_model_runner_v2_config(
             self.vllm_config,
             expected_role="ffn",
             device_type=self.device_config.device_type,
@@ -116,8 +116,16 @@ class AFDFFNWorker(Worker):
             )
 
             select_routed_moe_backend(self.vllm_config)
-            return GPUFFNRoutedExpertsModelRunner(self.vllm_config, self.device)  # type: ignore[return-value]
-        return GPUFFNModelRunner(self.vllm_config, self.device)  # type: ignore[return-value]
+            return GPUFFNRoutedExpertsModelRunner(
+                self.vllm_config,
+                self.device,
+                afd_cudagraph_policy=self.afd_cudagraph_policy,
+            )  # type: ignore[return-value]
+        return GPUFFNModelRunner(
+            self.vllm_config,
+            self.device,
+            afd_cudagraph_policy=self.afd_cudagraph_policy,
+        )  # type: ignore[return-value]
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """FFN workers do not allocate KV cache."""

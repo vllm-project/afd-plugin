@@ -2,7 +2,8 @@
 
 Opt-in device tests for `DeepEPM2NAFDConnector`. They run the connector's
 transport and expert compute on real GPUs, without model weights or a vLLM
-server, and run outside CI.
+server. Weekly CI runs the full suite on four H100 GPUs
+(`.buildkite/cuda/test-weekly.yml`).
 
 | File | Needs | Purpose |
 | --- | --- | --- |

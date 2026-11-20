@@ -33,17 +33,16 @@ from afd_plugin.connectors import (
 )
 from afd_plugin.connectors.base import AFDControlPlaneClosedError
 from afd_plugin.v1.worker.cuda_graph import (
+    AFDCUDAGraphPolicy,
     AFDGraphRunMode,
     graph_run_mode,
     make_ffn_graph_key,
-    validate_cuda_graph_mode,
 )
 from afd_plugin.v1.worker.ffn_metadata import (
     _set_moe_layer_index,
     aggregate_ffn_token_counts,
     project_ffn_token_counts_to_dp,
 )
-from afd_plugin.validation import validate_gpu_model_runner_v2_config
 
 if TYPE_CHECKING:
     from vllm.sequence import IntermediateTensors
@@ -55,29 +54,28 @@ class GPUFFNModelRunner:
     """FFN model runner for AFD GPU execution.
 
     FFN steps are driven by the connector control plane rather than the vLLM
-    scheduler. GPU only supports control-plane-driven connectors, so the runner
+    scheduler. Worker admits deployment and supplies the resolved graph policy.
+    GPU only supports control-plane-driven connectors, so the runner
     asserts ``connector.control_plane is not None`` at construction; connectors
     without a control plane (``control_plane is None``) are not supported.
     """
 
     afd_expected_role = "ffn"
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        *,
+        afd_cudagraph_policy: AFDCUDAGraphPolicy,
+    ) -> None:
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.load_config = vllm_config.load_config
         self.device = device
         self.dtype = self.model_config.dtype
         self.afd_config = self.parse_config(vllm_config)
-        validate_gpu_model_runner_v2_config(
-            vllm_config,
-            expected_role="ffn",
-            device_type=device.type,
-        )
-        self.afd_cudagraph_policy = validate_cuda_graph_mode(
-            vllm_config,
-            role="ffn",
-        )
+        self.afd_cudagraph_policy = afd_cudagraph_policy
         rank, local_rank = _resolve_world_ranks()
         self.connector = AFDConnectorFactory.create_connector(
             rank,

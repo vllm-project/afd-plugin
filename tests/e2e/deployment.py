@@ -105,6 +105,7 @@ class ResolvedDeployment:
         dbo = profile.dbo_for_role(role)
         env = self.environment
         slot = next((slot for slot in self.slots if slot.role == role), None)
+        served_role = "attention" if role == "prefill" else role
         cmd = [
             env.vllm_bin,
             "serve",
@@ -112,14 +113,19 @@ class ResolvedDeployment:
             "--shutdown-timeout",
             str(profile.shutdown_timeout_s),
             "--served-model-name",
-            f"{self.case.served_model_name_prefix}-{role}",
+            f"{self.case.served_model_name_prefix}-{served_role}",
             "--data-parallel-size",
             str(layout.dp),
             "--tensor-parallel-size",
             str(layout.tp),
             "--enable-expert-parallel",
         ]
-        if profile.ffn is not None:
+        if role == "prefill":
+            if layout.additional_config:
+                cmd.extend(
+                    ["--additional-config", json.dumps(dict(layout.additional_config))]
+                )
+        elif profile.ffn is not None:
             cmd.extend(
                 [
                     "--enable-ep-weight-filter",
@@ -161,7 +167,10 @@ class ResolvedDeployment:
                     env.afd_host if slot is None else slot.dp_address,
                 ]
             )
-        cmd.extend(probe_arguments)
+        if layout.data_parallel_rpc_port is not None:
+            cmd.extend(["--data-parallel-rpc-port", str(layout.data_parallel_rpc_port)])
+        if role != "prefill":
+            cmd.extend(probe_arguments)
         # Native baseline emits DBO before graph flags; preserve existing CLI.
         if profile.is_baseline:
             cmd.extend(dbo_arguments(dbo))
@@ -171,11 +180,12 @@ class ResolvedDeployment:
             cmd.extend(
                 ["--max-num-batched-tokens", str(profile.max_num_batched_tokens)]
             )
-        if profile.compilation_config:
+        compilation_config = layout.compilation_config or profile.compilation_config
+        if compilation_config:
             cmd.extend(
                 [
                     "--compilation-config",
-                    json.dumps(dict(profile.compilation_config), separators=(",", ":")),
+                    json.dumps(dict(compilation_config), separators=(",", ":")),
                 ]
             )
         elif layout.uses_graph:
@@ -194,7 +204,7 @@ class ResolvedDeployment:
             cmd.append("--enforce-eager")
         if not profile.is_baseline:
             cmd.extend(dbo_arguments(dbo))
-        port = env.api_port_base + (role == "ffn")
+        port = env.api_port_base + {"ffn": 1, "prefill": 2}.get(role, 0)
         if slot is None or not slot.headless:
             cmd.extend(["--host", env.api_host, "--port", str(port)])
         cmd.extend(layout.vllm_args)
@@ -297,6 +307,27 @@ class ResolvedDeployment:
         """Base status file; rank r writes ``ffn-service-rank-<r>.json``."""
         return self.environment.output_path / FFN_SERVICE_STATUS_FILE
 
+    def proxy_command(self) -> list[str]:
+        env = self.environment
+        return [
+            sys.executable,
+            str(REPO_ROOT / "tools/proxy_server.py"),
+            "--host",
+            env.api_host,
+            "--port",
+            str(env.api_port_base + 3),
+            "--workers",
+            "1",
+            "--prefiller-hosts",
+            env.api_host,
+            "--prefiller-ports",
+            str(env.api_port_base + 2),
+            "--decoder-hosts",
+            env.api_host,
+            "--decoder-ports",
+            str(env.api_port_base),
+        ]
+
 
 def dbo_arguments(dbo: DboConfig | None) -> list[str]:
     if dbo is None:
@@ -316,7 +347,7 @@ def launch_order(profile: Deployment) -> tuple[str, ...]:
         return ("baseline",)
     for backend, connector, order in CONNECTOR_PROTOCOLS:
         if (profile.backend, profile.connector) == (backend, connector):
-            return order
+            return order + (("prefill",) if profile.prefill is not None else ())
     raise ValueError(
         f"unsupported connector protocol: {profile.backend}/{profile.connector}"
     )
@@ -341,6 +372,10 @@ def resolve(
         raise ValueError("legacy NPU async cleanup requires the NPU async CAM protocol")
     if profile.ffn_service is not None and (profile.ffn is None or slots):
         raise ValueError("the FFN service runs a local FFN role on one host")
+    if profile.ffn_service is not None and profile.prefill is not None:
+        # FFN service rank r reports on api_port_base + 1 + r, which overlaps
+        # the prefill (+2) and PD proxy (+3) ports.
+        raise ValueError("the FFN service cannot run with a prefill role")
     if any(role.uses_graph for _, role in profile.roles) and (
         profile.cudagraph_capture_size is None or profile.cudagraph_capture_size < 1
     ):
@@ -402,6 +437,8 @@ class ServiceDeployment:
         self.processes_by_role: dict[str, subprocess.Popen[str]] = {}
         self.log_threads: list[threading.Thread] = []
         self.execution_evidence: list[tuple[str, str]] = []
+        self.forced_process_groups: list[int] = []
+        self.forced_ffn_processes: list[int] = []
 
     def start(self) -> None:
         for role in self.resolved.launch_order:
@@ -409,6 +446,11 @@ class ServiceDeployment:
         if self.resolved.case.deployment.ffn_service is not None:
             self.wait_ffn_service_ready()
         self.wait_ready()
+        if self.resolved.case.deployment.prefill is not None:
+            env = self.resolved.environment
+            self.wait_url(f"http://{env.api_host}:{env.api_port_base + 2}/v1/models")
+            self.start_proxy()
+            self.wait_url(f"http://{env.api_host}:{env.api_port_base + 3}/healthcheck")
 
     def wait_ffn_service_ready(self) -> None:
         """Wait until every FFN service rank reports ``/ready`` (paired with A).
@@ -507,6 +549,14 @@ class ServiceDeployment:
             if resolved.case.deployment.is_baseline
             else ("ascend,afd" if backend == "npu" else "afd")
         )
+        if backend == "npu" and resolved.case.deployment.prefill is not None:
+            if role == "prefill":
+                process_env["VLLM_PLUGINS"] = (
+                    "ascend,ascend_model,ascend_model_loader,"
+                    "ascend_service_profiling,ascend_kv_connector"
+                )
+            elif role == "attention":
+                process_env["VLLM_PLUGINS"] += ",ascend_kv_connector"
         process_env["VLLM_USE_V2_MODEL_RUNNER"] = "1"
         process_env["AFD_E2E_RUN_ID"] = self.run_id
         process_env["AFD_E2E_PROCESS_ROLE"] = role
@@ -524,7 +574,10 @@ class ServiceDeployment:
             process_env.pop("VLLM_ASCEND_ENABLE_FLASHCOMM1", None)
         if resolved.case.deployment.dbo_for_role(role) is not None:
             process_env["VLLM_LOGGING_LEVEL"] = "DEBUG"
-        process_env.update(self.probe_environment)
+        if role == "prefill":
+            process_env.update(dict(resolved.case.worker_environment))
+        else:
+            process_env.update(self.probe_environment)
         inherited = process_env.get("PYTHONPATH", "")
         process_env["PYTHONPATH"] = os.pathsep.join(
             path for path in (str(REPO_ROOT), inherited) if path
@@ -543,6 +596,30 @@ class ServiceDeployment:
         self.processes.append(process)
         self.processes_by_role[role] = process
         thread = threading.Thread(target=self.stream, args=(role, process), daemon=True)
+        self.log_threads.append(thread)
+        thread.start()
+        self.ensure_alive()
+
+    def start_proxy(self) -> None:
+        command = self.resolved.proxy_command()
+        process_env = os.environ.copy()
+        process_env["AFD_E2E_RUN_ID"] = self.run_id
+        process_env["AFD_E2E_PROCESS_ROLE"] = "proxy"
+        process = subprocess.Popen(
+            command,
+            cwd=REPO_ROOT,
+            env=process_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+        self.processes.append(process)
+        self.processes_by_role["proxy"] = process
+        thread = threading.Thread(
+            target=self.stream, args=("proxy", process), daemon=True
+        )
         self.log_threads.append(thread)
         thread.start()
         self.ensure_alive()
@@ -570,6 +647,10 @@ class ServiceDeployment:
     ) -> None:
         env = self.resolved.environment
         url = f"http://{env.api_host}:{env.api_port_base}{path}"
+        self.wait_url(url, on_poll=on_poll)
+
+    def wait_url(self, url: str, *, on_poll: Callable[[], None] | None = None) -> None:
+        env = self.resolved.environment
         deadline = time.monotonic() + env.startup_timeout
         last_error: BaseException | None = None
         while time.monotonic() < deadline:
@@ -599,6 +680,7 @@ class ServiceDeployment:
             deferred_sigkill_pgids=(ffn.pid,)
             if legacy_async and ffn is not None
             else (),
+            forced_pgids_out=self.forced_process_groups,
         )
         # torchrun starts the FFN service workers outside the launcher's process
         # group, so the service also needs the environment-matched sweep.
@@ -612,6 +694,7 @@ class ServiceDeployment:
                     else NPU_ASYNC_PROCESS_KILL_TIMEOUT_S,
                     poll_interval_s=PROCESS_POLL_INTERVAL_S,
                     process_name="FFN",
+                    killed_pids_out=self.forced_ffn_processes,
                 )
             )
         for thread in self.log_threads:

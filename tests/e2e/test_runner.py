@@ -843,6 +843,20 @@ def test_ffn_service_runs_the_probe_entry_for_graph_evidence(tmp_path, case_id):
     assert ("--worker-extension-cls" in record["commands"]["attention"]) is probed
 
 
+def test_ffn_service_rejects_a_prefill_role(tmp_path):
+    environment = CaseEnvironment(
+        model="/models/qwen3",
+        vllm_bin="vllm",
+        device_backend="gpu",
+        devices=tuple(map(str, range(6))),
+        output_path=tmp_path,
+    )
+    case = qwen3_cases.build_case("afd-deepep-m2n-faas-eager-2a2f", environment)
+    deployment = replace(case.deployment, prefill=case.deployment.attention)
+    with pytest.raises(ValueError, match="cannot run with a prefill role"):
+        runner.prepare_case(replace(case, deployment=deployment), environment)
+
+
 @pytest.mark.parametrize(
     "payload,missing,passed",
     [

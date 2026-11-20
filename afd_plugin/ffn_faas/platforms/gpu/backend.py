@@ -26,6 +26,7 @@ from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (
     GPUFFNRoutedExpertsModelRunner,
     RoutedExpertsModel,
 )
+from afd_plugin.validation import validate_gpu_model_runner_v2_config
 
 
 class DeepEPM2NFFNBackend:
@@ -55,13 +56,14 @@ class DeepEPM2NFFNBackend:
         before the expert weights are read:
 
         1. build the F-only ``VllmConfig`` (AFD architecture, Triton MoE pin),
-           which resolves ``--device-ids``; no device or weight is touched;
+           which resolves ``--device-ids``, and admit the deployment with the
+           Worker's GPU ModelRunnerV2 checks, which also resolve the CUDA
+           graph policy; no device or weight is touched;
         2. select and check the GPU through that assignment, and the
            afdEP/DeepGEMM stack;
         3. create the F-only NCCL world and vLLM's model-parallel groups;
-        4. construct the routed-experts runner, which runs the ModelRunnerV2
-           and CUDA-graph validation and creates the connector (no
-           collective yet);
+        4. construct the routed-experts runner with that graph policy, which
+           creates the connector (no collective yet);
         5. load the FFN-only routed-experts shell through vLLM's native loader;
         6. start the connector: the collective M2N handshake with Attention,
            the model-info check, the NCCL control group, the lanes' DeepEP
@@ -76,10 +78,18 @@ class DeepEPM2NFFNBackend:
         """
         environment = self.environment
         config = environment.build_config(self.args)
+        # No Worker runs here, so admit the deployment as AFDFFNWorker does.
+        cudagraph_policy = validate_gpu_model_runner_v2_config(
+            config, expected_role="ffn", device_type="cuda"
+        )
         environment.initialize_device(config)
         environment.initialize_compute(config)
         with set_current_vllm_config(config):
-            self.runner = GPUFFNRoutedExpertsModelRunner(config, environment.device)
+            self.runner = GPUFFNRoutedExpertsModelRunner(
+                config,
+                environment.device,
+                afd_cudagraph_policy=cudagraph_policy,
+            )
             connector = self.runner.connector
             if not isinstance(connector, DeepEPM2NAFDConnector):
                 raise TypeError(

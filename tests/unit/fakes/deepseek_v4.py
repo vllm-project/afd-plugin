@@ -1,15 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Native CPU FlashMLA reservation seam; no CUDA profiling or kernel proof."""
+"""Native CPU V4 attention seams; no CUDA profiling or kernel proof."""
 
 from types import SimpleNamespace
 
 import torch
 from torch import nn
 from vllm import forward_context
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import ForwardContext, set_forward_context
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.v1.worker import workspace
+
+
+def afd_stage_context(*, tokens: int | None, stages: int) -> ForwardContext:
+    """Forward context for one AFD stage; ``tokens=None`` omits AFD metadata."""
+    metadata = (
+        None
+        if tokens is None
+        else SimpleNamespace(num_stages=stages, tokens_unpadded_lens=[tokens])
+    )
+    return ForwardContext(
+        no_compile_layers={},
+        attn_metadata={},
+        slot_mapping={},
+        additional_kwargs={"afd_metadata": metadata},
+        is_padding=torch.ones(4, dtype=torch.bool),
+    )
 
 
 class FailingFlashAttention(DeepseekV4FlashMLAAttention):

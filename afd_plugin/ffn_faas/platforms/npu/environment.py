@@ -46,7 +46,11 @@ class AscendFFNEnvironment(FFNEnvironmentBase[FFNConfig]):
         import torch_npu  # noqa: F401
         from vllm.platforms import current_platform
         from vllm.platforms.interface import set_assigned_physical_gpu_ids
-        from vllm_ascend.utils import enable_custom_op
+        from vllm_ascend.utils import (
+            AscendDeviceType,
+            enable_custom_op,
+            get_ascend_device_type,
+        )
 
         from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 
@@ -63,6 +67,8 @@ class AscendFFNEnvironment(FFNEnvironmentBase[FFNConfig]):
         )
         self._device = torch.device(f"npu:{index}")
         torch.npu.set_device(self._device)
+        if get_ascend_device_type() != AscendDeviceType.A3:
+            raise ValueError("layered GMM requires Ascend 910C/A3")
         # Native NPUModelRunner v1 installs this packing policy at import time.
         # This service does not import that runner; native W4A8 still needs NZ.
         torch.npu.config.allow_internal_format = True

@@ -57,7 +57,11 @@ class AFDConnectorFactory:
         vllm_config: VllmConfig,
         afd_config: AFDConfig | None = None,
     ) -> AFDConnectorBase:
-        config = afd_config or parse_afd_config(vllm_config)
+        if afd_config is None:
+            config = parse_afd_config(vllm_config)
+        else:
+            afd_config.validate()
+            config = afd_config
         if config.connector not in cls._registry:
             raise ValueError(f"unsupported AFD connector type: {config.connector}")
         connector_cls = cls._registry[config.connector]()

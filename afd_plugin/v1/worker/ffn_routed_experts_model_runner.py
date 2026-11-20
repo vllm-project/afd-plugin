@@ -19,6 +19,7 @@ from afd_plugin.connectors import (
     LocalExpertWeights,
 )
 from afd_plugin.connectors.metadata import FP8_DTYPE
+from afd_plugin.v1.worker.cuda_graph import AFDCUDAGraphPolicy
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
 
 if TYPE_CHECKING:
@@ -128,8 +129,14 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
     (DeepEP M2N).
     """
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
-        super().__init__(vllm_config, device)
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        *,
+        afd_cudagraph_policy: AFDCUDAGraphPolicy,
+    ) -> None:
+        super().__init__(vllm_config, device, afd_cudagraph_policy=afd_cudagraph_policy)
         _require_routed(self.connector)
         self.moe_layer_indices: tuple[int, ...] = ()
         self.local_experts: dict[int, FFNLocalExperts] = {}

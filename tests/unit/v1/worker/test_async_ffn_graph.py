@@ -107,7 +107,7 @@ def test_replay_retains_transaction_until_receiver_exit(session_harness):
     assert calls.count("replay") == 3 and temporary() is not None
     with pytest.raises(RuntimeError, match="receiver exit"):
         session._close_graph()
-    session._graph_receiver_exited = True
+    session.mark_receiver_exited()
     session._close_graph()
     session._close_graph()
     assert calls.count("reset") == 1 and temporary() is None
@@ -119,7 +119,8 @@ def test_pending_device_work_prevents_replay_and_release(session_harness):
     session._submit_graph()
     with pytest.raises(RuntimeError, match="not ready"):
         session._submit_graph()
-    session._graph_receiver_exited = True
+    with pytest.raises(RuntimeError, match="device completion"):
+        session.mark_receiver_exited()
     with pytest.raises(RuntimeError, match="device completion"):
         session._close_graph()
     assert calls.count("replay") == 1 and "reset" not in calls
@@ -153,8 +154,8 @@ def test_failure_retains_resources_without_retry(session_harness, monkeypatch, f
         operation = session._complete_graph
     with pytest.raises(RuntimeError):
         operation()
-    session._graph_receiver_exited = True
     for operation in (
+        session.mark_receiver_exited,
         session._submit_graph,
         session._complete_graph,
         session._close_graph,

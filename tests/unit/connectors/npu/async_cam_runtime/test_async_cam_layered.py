@@ -25,6 +25,7 @@ from afd_plugin.model_executor.ffn.npu.expert_weights import (  # noqa: E402
     QuantizedExpertWeights,
     expert_weight_signature,
 )
+from tests.unit.fakes.async_ffn import load_async_modules  # noqa: E402
 
 
 def weights(layer_idx=0, per_channel=True, quantization="W4A8"):
@@ -258,37 +259,8 @@ def test_repeated_interleaved_layer_ids(operators):
     assert [call[1][6].item() for call in operators[::2]] == [1, 0, 1, 1]
 
 
-def runner_method(name, namespace):
-    tree = ast.parse(
-        Path("afd_plugin/v1/worker/npu/async_ffn_model_runner.py").read_text()
-    )
-    cls = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "AsyncNPUFFNModelRunner"
-    )
-    method = next(
-        node
-        for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name == name
-    )
-    module = ast.Module(
-        body=[
-            ast.ImportFrom(
-                module="__future__", names=[ast.alias(name="annotations")], level=0
-            ),
-            method,
-        ],
-        type_ignores=[],
-    )
-    exec(
-        compile(ast.fix_missing_locations(module), "<runner-contract>", "exec"),
-        namespace,
-    )
-    return namespace[name]
-
-
-def test_runner_preserves_raw_context_and_chunk_capacity():
+def test_runner_preserves_raw_context_and_chunk_capacity(monkeypatch):
+    _, _, runtime = load_async_modules(monkeypatch)
     payloads = [
         SimpleNamespace(
             hidden_states=torch.empty(8, 32),
@@ -310,26 +282,19 @@ def test_runner_preserves_raw_context_and_chunk_capacity():
         send_ffn_output=lambda result, ctx: sent.append((result, ctx)),
     )
 
-    def compute(*args):
+    def compute(*args, retained_tensors=None):
         computed.append(args)
         return torch.empty(8, 32, dtype=torch.bfloat16)
 
-    runner = SimpleNamespace(
+    runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
+    runner.__dict__.update(
         model=object(),
         connector=connector,
         _mega_executor=None,
         _layered_executor=compute,
         layer_ids=(2, 5),
     )
-    method = runner_method(
-        "_ffn_forward_connector_driven",
-        {
-            "cast": cast,
-            "CAMAsyncAFDConnector": SimpleNamespace,
-            "AFDAsyncTransferState": SimpleNamespace,
-        },
-    )
-    method(runner)
+    runner._ffn_forward_connector_driven()
     assert [ctx for _, ctx in sent] == [p.context for p in payloads]
     for args, payload in zip(computed, payloads, strict=True):
         assert args[0] is payload.hidden_states
