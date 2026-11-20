@@ -170,6 +170,7 @@ def test_config_defaults_and_round_trip():
 
     assert config.expert_backend == "deepgemm"
     assert config.payload_format == "bf16"
+    assert config.dbo_graph_wait_for_first_combine is False
     assert DeepEPM2NConfig.from_mapping(config.to_mapping()) == config
 
 
@@ -192,6 +193,7 @@ def test_config_defaults_and_round_trip():
         ({"network": {"gin": "maybe"}}, "network.gin"),
         # The connector no longer plans NICs: NCCL picks them.
         ({"num_qps": -1}, "num_qps"),
+        ({"dbo_graph_wait_for_first_combine": "false"}, "must be a boolean"),
         ({"expert_num_sms": -2}, "expert_num_sms"),
         ({"expert_num_sms": 131}, "expert_num_sms"),
         ({"cpu_timeout_s": 0}, "cpu_timeout_s"),

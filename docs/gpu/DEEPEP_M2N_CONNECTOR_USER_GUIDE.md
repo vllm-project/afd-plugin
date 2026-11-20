@@ -177,6 +177,7 @@ Unknown keys are rejected. All keys are optional.
 | `num_sms` | `int` | `0` | SMs used by the dispatch/combine kernels. `0` uses a fixed fraction of the device. |
 | `num_qps` | `int` | `0` | RDMA queue pairs per transport buffer. `0` uses the transport's default. |
 | `expert_num_sms` | `int` | `0` | SMs used by the FFN's DeepGEMM expert kernels; must be even. `0` uses all SMs. With DBO, a value that leaves SMs for the other lane's transport kernels avoids delaying overlapping GEMMs. |
+| `dbo_graph_wait_for_first_combine` | `bool` | `false` | In a two-stage FFN graph, post the second dispatch, send the first combine and wait for it to finish before starting the second stage’s experts. |
 | `cpu_timeout_s` | `int` | `120` | Transport host-wait timeout. |
 | `gpu_timeout_s` | `int` | `120` | Transport kernel-spin timeout. |
 | `network` | `object` | see below | Fabric settings. |
