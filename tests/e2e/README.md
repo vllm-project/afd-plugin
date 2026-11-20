@@ -15,8 +15,8 @@ three: baseline and AFD eager and graph on 2A1F. GDN DBO is unsupported.
 The single-deployment inventory contains 48 definitions: 38 CUDA cases
 (18 DeepSeek-V2-Lite, nine Qwen3 MoE, three Qwen3.6 MoE and eight DSV4
 Flash) and ten NPU cases (seven DeepSeek-V2-Lite and three DSV4 Flash).
-The CUDA counts include the local DeepEP M2N entries. CI still selects the
-same 15 unique node IDs across ready/merge and weekly gates. Definitions,
+The CUDA counts include the DeepEP M2N entries. CI selects 16 unique node
+IDs across ready/merge and weekly gates. Definitions,
 collected nodes and device acceptance results are different counts.
 
 The ten existing GPU multi-pod entries also use model-local Cases and the
@@ -286,7 +286,8 @@ DeepSeek-V2-Lite through the same five scenarios.
 They need four SM90 or newer GPUs and afdEP-comm (DeepGEMM comes with vLLM);
 see
 [Installation](../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation)
-in the connector guide. CI does not run them.
+in the connector guide. Weekly CI runs the Qwen3 MoE
+`afd-deepep-m2n-graph-dbo-2a2f` scenario; the others are local-only.
 
 ```bash
 export AFD_E2E_BACKEND=gpu
@@ -381,10 +382,12 @@ do not establish numerical equivalence or full-dataset qualification.
 
 ### Weekly GSM8K
 
-The weekly pipeline runs eight scenarios: all four Qwen3 MoE cases
+The weekly pipeline runs nine scenarios: all four Qwen3 MoE cases
 (baseline, eager, graph, and graph+DBO), the three Qwen3.6 MoE cases
-(baseline, eager, and graph), and DeepSeek-V2-Lite `afd-graph-dbo-2a1f`,
-all with the default GSM8K sample limit. To reproduce locally:
+(baseline, eager, and graph), DeepSeek-V2-Lite `afd-graph-dbo-2a1f`, and the
+Qwen3 MoE DeepEP M2N `afd-deepep-m2n-graph-dbo-2a2f`, all with the default
+GSM8K sample limit. It also runs the DeepEP M2N device tests
+(`tests/gpu/test_deepep_m2n_gpu.py`). To reproduce locally:
 
 ```bash
 # Qwen3 MoE (all four P2P scenarios)
@@ -392,6 +395,10 @@ python -m pytest -q -s tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_
 
 # Qwen3.6 MoE (all three scenarios; GDN DBO unsupported)
 python -m pytest -q -s tests/e2e/models/qwen3_6/test_qwen3_6.py
+
+# Qwen3 MoE DeepEP M2N graph+DBO (needs afdEP-comm, see the M2N section)
+python -m pytest -q -s \
+  "tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe_deepep_m2n[afd-deepep-m2n-graph-dbo-2a2f]"
 ```
 
 For a full 1319-sample run, export `AFD_GSM8K_LIMIT=all` before invoking
@@ -712,3 +719,76 @@ Pull execution checks pass. A failed startup, request, answer, or execution chec
 still fails the case. Inspect the cleanup record for the separate shutdown result.
 The native worker extension is loaded only for the new case. Hardware execution
 and graceful shutdown must be assessed separately from the pytest result.
+
+## DSV4 Flash DSpark core cases (local A3)
+
+`test_dspark_npu.py` adds three opt-in, multi-deployment acceptance cases:
+
+| Case ID | Placement | Comparison |
+| --- | --- | --- |
+| `afd-dspark-eager` | Attention DP2/TP1, FFN EP4/TP1; eager | Same A/F deployment without DSpark |
+| `afd-dspark-graph` | Same A/F topology; Attention target/draft FULL_DECODE_ONLY, FFN FULL | Qualified same-topology DSpark eager run |
+| `pd-afd-dspark-graph` | Native Prefill TP4, the same A/F graph topology, MooncakeHybridConnector and proxy | Same PD+A/F deployment without DSpark |
+
+The model is DeepSeek-V4-Flash W4A8. Each case uses five speculative tokens,
+4096 maximum model length, 512 maximum batched tokens, four sequences per DP,
+128-token blocks, disabled prefix caching, and chunked prefill. A/F require six
+visible dies; PD requires ten. A reference is part of the acceptance case, not
+an additional scenario. The graph case creates and qualifies its own eager
+reference unless `AFD_DSPARK_EAGER_REFERENCE` names a completed eager case with
+matching source, native, runtime, model and A/F device identities. Runtime
+identity includes the vLLM and vLLM-Ascend Python/native package contents and
+the installed AFD CANN vendor package, including device kernels and metadata.
+It also records the selected service executable and verifies the actual A/F
+workers' interpreter, import paths, AFD plugin, vLLM, vLLM-Ascend, torch,
+torch-npu, NumPy, Transformers, safetensors and tokenizers package contents.
+The graph case compares its target workers with the eager reference workers.
+Both graph cases also compare their normal and instrumented workers. The
+non-speculative reference does not expose worker runtime observations; worker
+observations are checked after each observed deployment runs.
+Checkpoint identity records the resolved path, file sizes and modification
+times, and JSON content hashes; it does not hash weight contents. Do not alter
+or replace checkpoint files in place when reusing a reference.
+
+Each deployment records raw responses for fixed short, 1, 127, 128, 129 and 513
+input-token requests; A/F also tests a two-prompt batch. The workload tests four
+independent concurrent requests and repeats a request after early stop and stream
+abort. The concurrent client cancels pending requests on SIGTERM or SIGINT
+before service cleanup. Serial generated token IDs must match the reference.
+Counters are sampled before and after real requests; both Attention DPs must
+produce and accept draft tokens, and PD must receive external KV tokens on both
+DPs. The FFN workers must own the routed draft experts, and Attention workers
+must own attention and shared experts. Eager checks every target and draft FFN
+layer on every FFN rank.
+
+Graph cases first run ordinary grouped FFN execution and require actual request-time
+Attention target/draft and FFN graph replays on every rank. A separate deployment
+then forces one FFN replay per completion fence to inspect every target and draft
+layer and compare graph results with layered eager results. Its instrumentation
+changes submission grouping and adds synchronization; it is not evidence of the
+default grouping or a performance measurement. All three cases require their
+existing async CAM cleanup contract, and retain individual process exit statuses
+and cleanup results.
+
+```bash
+export AFD_E2E_BACKEND=npu
+export AFD_E2E_DEVICES=0,1,2,3,4,5,6,7,8,9
+export AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V4-Flash-W4A8
+export HCCL_IF_IP='<local-communication-ip>'
+export HCCL_SOCKET_IFNAME=eth0
+timeout --signal=TERM --kill-after=300s 21600s \
+  python -m pytest -q -s tests/e2e/models/deepseek_v4_flash/test_dspark_npu.py
+```
+
+Device IDs are assigned in A, F, then P order. Supply an actual device list,
+model, runtime and plugin-built Ascend operators; missing setup fails rather
+than skips. `AFD_NPU_E2E_VLLM_BIN`, `AFD_NPU_DSPARK_E2E_API_PORT`,
+`AFD_NPU_DSPARK_E2E_AFD_PORT`, and `AFD_NPU_E2E_STARTUP_TIMEOUT` override the
+executable, ports and startup timeout. Run records under each pytest temporary
+output include per-deployment `run.json`, requests, metrics, service logs,
+worker evidence and graph proof. Each deployment attempt gets a fresh directory;
+the top-level `run.json` records its actual paths under `stages`. Previous
+attempts are retained and cannot supply current worker evidence. The example
+sets an outer deadline and a cleanup grace period; use an appropriate scheduler
+deadline and preserve the cleanup grace when selecting individual cases. No CI
+gate or performance threshold is added.

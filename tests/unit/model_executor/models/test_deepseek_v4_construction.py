@@ -9,18 +9,19 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 from torch import nn  # noqa: E402
+from vllm.forward_context import override_forward_context  # noqa: E402
+from vllm.models.deepseek_v4.nvidia.flashmla import (  # noqa: E402
+    DeepseekV4FlashMLAAttention,
+)
 
 from afd_plugin.model_executor.models import deepseek_v4 as adapter  # noqa: E402
+from tests.unit.fakes.deepseek_v4 import afd_stage_context  # noqa: E402
 
 
 class _FakeStage(nn.Module):
     def __init__(self, *args, prefix: str = "", **kwargs) -> None:
         super().__init__()
         self.prefix = prefix
-
-
-class _FakeAttention(_FakeStage):
-    pass
 
 
 class _FakeMoE(_FakeStage):
@@ -75,7 +76,13 @@ def construction_env(monkeypatch):
     monkeypatch.setattr(
         adapter.native,
         "_select_dsv4_attn_cls",
-        lambda _config: _FakeAttention,
+        lambda _config: DeepseekV4FlashMLAAttention,
+    )
+    # The native constructor needs a full CUDA config; keep only the module.
+    monkeypatch.setattr(
+        DeepseekV4FlashMLAAttention,
+        "__init__",
+        lambda self, *args, **kwargs: nn.Module.__init__(self),
     )
     monkeypatch.setattr(adapter.native, "DeepseekV4MoE", _FakeMoE)
     monkeypatch.setattr(adapter.native, "PPMissingLayer", _FakeMissingLayer)
@@ -131,7 +138,7 @@ def test_v4_model_constructs_only_role_owned_decoder_stages(
 
     for layer in model.layers:
         if role == "attention":
-            assert isinstance(layer.attn, _FakeAttention)
+            assert isinstance(layer.attn, DeepseekV4FlashMLAAttention)
             assert isinstance(layer.ffn, adapter.RemoteDeepseekV4FFN)
             assert hasattr(layer, "hc_attn_fn")
         else:
@@ -139,6 +146,20 @@ def test_v4_model_constructs_only_role_owned_decoder_stages(
             assert isinstance(layer.ffn, _FakeMoE)
             assert not hasattr(layer, "hc_attn_fn")
             assert not hasattr(layer, "attn_norm")
+
+
+def test_v4_attention_layer_skips_padding_only_dbo_stage(
+    monkeypatch,
+    construction_env,
+):
+    layer = _make_layer(monkeypatch, role="attention", layer_idx=0)
+    hidden_states = torch.ones((4, 8))
+
+    # vLLM's decoder layer calls its attention as attn(positions, x, None).
+    with override_forward_context(afd_stage_context(tokens=0, stages=2)):
+        output = layer.attn(torch.arange(4), hidden_states, None)
+
+    assert torch.equal(output, torch.zeros_like(hidden_states))
 
 
 @pytest.mark.parametrize("backend", sorted(adapter.native.MEGA_MOE_BACKENDS))
@@ -191,6 +212,49 @@ def test_v4_attention_model_owns_head_mhc_parameters(
         )
         is None
     )
+
+
+@pytest.mark.parametrize(
+    "role,first_rank,layer_count",
+    [
+        ("attention", True, 1),
+        ("attention", False, 1),
+        ("attention", True, 0),
+        ("ffn", True, 1),
+    ],
+    ids=["attention", "non-first-rank", "empty-model", "ffn"],
+)
+def test_v4_finalizes_only_attention_owned_mhc_broadcast(
+    monkeypatch, construction_env, role, first_rank, layer_count
+):
+    model = _make_model(
+        monkeypatch, role=role, vllm_config=_vllm_config(layer_count=layer_count)
+    )
+    monkeypatch.setattr(
+        adapter.native,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=first_rank),
+    )
+    if role == "attention" and layer_count:
+        layer = model.layers[0]
+        layer.hc_attn_fn.data.fill_(2)
+
+    model.finalize_mhc_broadcast_weights()
+
+    if role != "attention" or not layer_count:
+        return
+    if not first_rank:
+        assert layer.hc_attn_fn_broadcast is None
+        return
+    expected = torch.full(
+        (layer.hc_attn_fn.shape[0], layer.hidden_size), 2.0 * layer.hc_mult
+    )
+    torch.testing.assert_close(layer.hc_attn_fn_broadcast, expected)
+    broadcast = layer.hc_attn_fn_broadcast
+    layer.hc_attn_fn.data.fill_(3)
+    model.finalize_mhc_broadcast_weights()
+    assert layer.hc_attn_fn_broadcast is broadcast
+    torch.testing.assert_close(broadcast, expected * 1.5)
 
 
 def test_v4_attention_model_allocates_mtp_buffer_for_spec_decode(

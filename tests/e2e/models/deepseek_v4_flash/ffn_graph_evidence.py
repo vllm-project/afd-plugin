@@ -10,6 +10,7 @@ import time
 from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
+from weakref import WeakKeyDictionary
 
 import torch
 
@@ -33,14 +34,20 @@ def snapshot(runner) -> dict:
         "transport_live": connector.is_initialized,
     }
     if isinstance(runner, AsyncNPUFFNModelRunner):
+        execution = "uninitialized"
+        if runner._mega_executor is not None:
+            execution = "mega"
+        elif runner._layered_executor is not None:
+            execution = "layered"
         result.update(
+            execution=execution,
             mode=runner.effective_mode,
             requested=runner.requested_mode,
             capture_count=runner._graph_capture_count
             if runner._graph is not None
             else 0,
             replay_count=runner._graph_replay_count if runner._graph is not None else 0,
-            receiver_exited=runner._graph_receiver_exited,
+            receiver_exited=runner.receiver_exited,
             step_pending=runner._graph_pending if runner._graph is not None else False,
             shutdown=runner._is_shutdown,
             model_released=runner.model is None,
@@ -74,6 +81,10 @@ class FFNGraphEvidence:
 
 
 def install_observers() -> None:
+    initialize = AsyncNPUFFNModelRunner.initialize_afd_connector
+    owners: WeakKeyDictionary[AsyncCAMMegaExecutor, CAMAsyncAFDConnector] = (
+        WeakKeyDictionary()
+    )
     complete = AsyncNPUFFNModelRunner._complete_graph
     send_eager = CAMAsyncAFDConnector.send_ffn_output
     execute_mega = AsyncCAMMegaExecutor.__call__
@@ -123,13 +134,21 @@ def install_observers() -> None:
             observe(self.connector, context)
         return result
 
+    @wraps(initialize)
+    def initialized(self):
+        result = initialize(self)
+        if self._mega_executor is not None:
+            owners[self._mega_executor] = self.connector
+        return result
+
     @wraps(execute_mega)
     def mega_executed(self):
         result = execute_mega(self)
-        if self.connector.graph_startup.mode == "eager":
+        connector = owners.get(self)
+        if connector is not None and connector.graph_startup.mode == "eager":
             # Never read device headers while FULL is warming up or capturing.
             torch.npu.current_stream().synchronize()
-            observe(self.connector, mega_context(self))
+            observe(connector, mega_context(self))
         return result
 
     @wraps(send_eager)
@@ -195,6 +214,7 @@ def install_observers() -> None:
         record(self.model_runner, "stop_rpc_complete")
         return result
 
+    AsyncNPUFFNModelRunner.initialize_afd_connector = initialized
     AsyncNPUFFNModelRunner._complete_graph = completed
     CAMAsyncAFDConnector.send_ffn_output = sent
     AsyncCAMMegaExecutor.__call__ = mega_executed

@@ -8,38 +8,26 @@ and token-aligned input IDs cross the Attention-to-FFN boundary. The returned
 FFN activation is the sole FFN-to-Attention tensor.
 """
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from typing import Any
 
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
-from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.nvidia import model as native
 
-from afd_plugin.compat.patches.gpu_deepseek_v4_dbo import forward_v4_attention
+from afd_plugin.compat.patches.gpu_deepseek_v4_dbo import afd_v4_attention_cls
 from afd_plugin.config import parse_afd_config
-from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
-from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
-from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
-
-_ATTENTION_ROLE = frozenset(("attention",))
-_FFN_ROLE = frozenset(("ffn",))
-_BOTH_ROLES = frozenset(("attention", "ffn"))
-
-
-def _weight_layer_path(name: str) -> tuple[int, str] | None:
-    """Extract the decoder layer index and first layer-local path component."""
-    parts = name.split(".")
-    for marker_idx, part in enumerate(parts[:-2]):
-        if part != "layers":
-            continue
-        try:
-            layer_idx = int(parts[marker_idx + 1])
-        except ValueError:
-            continue
-        return layer_idx, parts[marker_idx + 2]
-    return None
+from afd_plugin.connectors.metadata import AFDForwardContextMetadata
+from afd_plugin.forward_context import get_afd_metadata_from_forward_context
+from afd_plugin.model_executor.ffn.remote import RemoteFFNProxy
+from afd_plugin.model_executor.models._weight_utils import (
+    ATTENTION_ROLE,
+    BOTH_ROLES,
+    FFN_ROLE,
+    filter_role_weights,
+    layer_weight_path,
+)
 
 
 def _checkpoint_weight_roles(name: str) -> frozenset[str]:
@@ -52,38 +40,27 @@ def _checkpoint_weight_roles(name: str) -> frozenset[str]:
         "model.hc_head_base",
         "model.hc_head_scale",
     }:
-        return _ATTENTION_ROLE
-    layer_path = _weight_layer_path(name)
+        return ATTENTION_ROLE
+    layer_path = layer_weight_path(name)
     if layer_path is None:
-        return _BOTH_ROLES
-    _, stage = layer_path
+        return BOTH_ROLES
+    _, stage, _ = layer_path
     if stage == "ffn":
-        return _FFN_ROLE
-    return _ATTENTION_ROLE
+        return FFN_ROLE
+    return ATTENTION_ROLE
 
 
-def _iter_role_weights(
-    weights: Iterable[tuple[str, torch.Tensor]],
-    *,
-    role: str,
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """Consume a checkpoint iterator once and retain only role-owned paths."""
-    for name, loaded_weight in weights:
-        if role in _checkpoint_weight_roles(name):
-            yield name, loaded_weight
-
-
-class RemoteDeepseekV4FFN(nn.Module):
+class RemoteDeepseekV4FFN(RemoteFFNProxy):
     """Parameter-free FFN proxy carrying V4 hash-router token identifiers."""
 
-    def __init__(self, *, layer_idx: int) -> None:
-        super().__init__()
-        self.layer_idx = layer_idx
-
-    def forward(
+    # Matches DeepseekV4MoE.forward, so vLLM's decoder layer calls the proxy
+    # in place of its MoE. AFD rejects MegaMoE when it builds the model, so
+    # vLLM always passes mega_gate_metadata=None and the proxy does not send it.
+    def forward(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor,
-        input_ids: torch.Tensor | None,
+        input_ids: torch.Tensor | None = None,
+        mega_gate_metadata: native.MegaGateRoutingMetadata | None = None,
     ) -> torch.Tensor:
         if input_ids is None:
             raise RuntimeError("DeepSeek-V4 remote FFN requires input_ids")
@@ -92,33 +69,15 @@ class RemoteDeepseekV4FFN(nn.Module):
                 "DeepSeek-V4 input_ids must be one-dimensional and token-aligned",
             )
 
+        return self._send_and_receive(hidden_states, input_ids=input_ids)
+
+    @staticmethod
+    def _afd_metadata() -> AFDForwardContextMetadata:
+        # Keep V4's missing-context error while sharing the transport.
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
             raise RuntimeError("RemoteDeepseekV4FFN requires AFD forward metadata")
-        forward_context = get_forward_context()
-        stage_idx = int(
-            getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),
-        )
-        afd_metadata.stage_idx = stage_idx
-        metadata = AFDTransferMetadata.create_attention_metadata(
-            layer_idx=self.layer_idx,
-            stage_idx=stage_idx,
-            seq_len=int(hidden_states.shape[0]),
-        )
-        context = AFDTransferContext(metadata=metadata)
-        afd_metadata.connector.send_attn_output(
-            hidden_states,
-            context,
-            input_ids=input_ids,
-        )
-        hidden_states = maybe_apply_dbo_yield(
-            hidden_states,
-            role="attention",
-        )
-        return afd_metadata.connector.recv_ffn_output(
-            ref_tensor=hidden_states,
-            ubatch_idx=stage_idx,
-        )
+        return afd_metadata
 
 
 class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
@@ -128,7 +87,9 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
     # Patch functionality: allocate only the stage owned by the active AFD role
     # and pin sequence parallelism off (the native derivation would enable SP
     # for AFD DP>1 layouts, which the synchronous AFD boundary does not
-    # support).
+    # support). Attention uses AFD's subclass of the selected attention class,
+    # which skips attention on padding-only DBO stages. vLLM's own decoder-layer
+    # forward then runs unchanged.
     # Signature: matches upstream; no added parameters.
     # Upstream: vLLM v0.32.0, vllm/models/deepseek_v4/nvidia/model.py
     # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
@@ -152,9 +113,10 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         self.hidden_size = config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
 
-        # ### PATCH START: replace the remote stage with a parameter-free proxy.
+        # ### PATCH START: guarded Attention; the remote stage is a proxy.
         if afd_config.role == "attention":
-            self.attn = native._select_dsv4_attn_cls(vllm_config)(
+            attn_cls = afd_v4_attention_cls(native._select_dsv4_attn_cls(vllm_config))
+            self.attn = attn_cls(
                 vllm_config,
                 prefix=f"{prefix}.attn",
                 topk_indices_buffer=topk_indices_buffer,
@@ -258,118 +220,6 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 hidden_size=self.hidden_size,
                 hc_mult=self.hc_mult,
             )
-
-    # Patch reason: native forward directly invokes its locally allocated FFN.
-    # Patch functionality: preserve native mHC state locally while the proxy
-    # transfers only the two-dimensional FFN activation and input IDs. The
-    # v0.32.0 native sequence-parallel gather/scatter branches around the
-    # attention call are omitted because AFD pins use_sequence_parallel off.
-    # Padding-only AFD ubatches use zero attention output while retaining all
-    # mHC and remote FFN work. Native FlashMLA's zero-token decode metadata has
-    # no scheduler tile, so entering its forward consumer would assert.
-    # Removal plan: drop this branch when native V4 attention supports zero
-    # actual tokens in a nonempty padded ubatch. Capture retains full attention
-    # because native dummy inputs publish a positive real extent for each stage.
-    # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.32.0, vllm/models/deepseek_v4/nvidia/model.py
-    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
-    def forward(
-        self,
-        x: torch.Tensor,
-        positions: torch.Tensor,
-        input_ids: torch.Tensor | None,
-        post_mix: torch.Tensor | None = None,
-        res_mix: torch.Tensor | None = None,
-        residual: torch.Tensor | None = None,
-        mega_gate_metadata: native.MegaGateRoutingMetadata | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # ### PATCH START: prohibit accidental execution on the FFN worker.
-        if isinstance(self.attn, native.PPMissingLayer):
-            raise RuntimeError("DeepSeek-V4 decoder forward is Attention-owned")
-        # ### PATCH END
-        attn_norm_weight = self.attn_norm.weight.data
-        attn_norm_eps = self.attn_norm.variance_epsilon
-        if residual is None:
-            if x.dim() == 2:
-                assert self.hc_attn_fn_broadcast is not None
-                residual, post_mix, res_mix, x = native.mhc_pre_broadcast_tilelang(
-                    x,
-                    self.hc_attn_fn,
-                    self.hc_attn_scale,
-                    self.hc_attn_base,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                    self.hc_eps,
-                    self.hc_post_alpha,
-                    self.hc_sinkhorn_iters,
-                    norm_weight=attn_norm_weight,
-                    norm_eps=attn_norm_eps,
-                    fn_broadcast=self.hc_attn_fn_broadcast,
-                )
-            else:
-                residual = x
-                post_mix, res_mix, x = native.mhc_pre_tilelang(
-                    x,
-                    self.hc_attn_fn,
-                    self.hc_attn_scale,
-                    self.hc_attn_base,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                    self.hc_eps,
-                    self.hc_post_alpha,
-                    self.hc_sinkhorn_iters,
-                    norm_weight=attn_norm_weight,
-                    norm_eps=attn_norm_eps,
-                )
-        else:
-            residual, post_mix, res_mix, x = native.mhc_fused_post_pre_tilelang(
-                x,
-                residual,
-                post_mix,
-                res_mix,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.hc_eps,
-                self.hc_post_alpha,
-                self.hc_sinkhorn_iters,
-                n_splits=1,
-                tile_n=1,
-                norm_weight=attn_norm_weight,
-                norm_eps=attn_norm_eps,
-            )
-
-        # ### PATCH START: preserve padded-stage protocol with zero attention.
-        x = forward_v4_attention(self.attn, positions, x)
-        # ### PATCH END: preserve padded-stage protocol with zero attention.
-        ffn_norm_weight = self.ffn_norm.weight.data
-        ffn_norm_eps = self.ffn_norm.variance_epsilon
-        residual, post_mix, res_mix, x = native.mhc_fused_post_pre_tilelang(
-            x,
-            residual,
-            post_mix,
-            res_mix,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-            self.hc_eps,
-            self.hc_post_alpha,
-            self.hc_sinkhorn_iters,
-            n_splits=1,
-            tile_n=1,
-            norm_weight=ffn_norm_weight,
-            norm_eps=ffn_norm_eps,
-        )
-
-        # ### PATCH START: this call enters the synchronous remote FFN proxy.
-        # MegaMoE is excluded, so only activations and token IDs cross the wire.
-        x = self.ffn(x, input_ids)
-        # ### PATCH END
-        return x, residual, post_mix, res_mix
 
     def compute_ffn_output(
         self,
@@ -567,22 +417,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         """Finalize only the Attention-owned first-layer broadcast matrix."""
         if self.afd_config.role == "ffn":
             return
-        if (
-            not native.get_pp_group().is_first_rank
-            or self.start_layer >= self.end_layer
-        ):
-            return
-        layer = self.layers[self.start_layer]
-        if isinstance(layer, AFDDeepseekV4DecoderLayer):
-            broadcast = (
-                layer.hc_attn_fn.detach()
-                .view(-1, layer.hc_mult, layer.hidden_size)
-                .sum(dim=1)
-            )
-            if layer.hc_attn_fn_broadcast is None:
-                layer.hc_attn_fn_broadcast = broadcast
-            else:
-                layer.hc_attn_fn_broadcast.copy_(broadcast)
+        super().finalize_mhc_broadcast_weights()
 
 
 class AFDDeepseekV4ForCausalLM(native.DeepseekV4ForCausalLM):
@@ -615,7 +450,9 @@ class AFDDeepseekV4ForCausalLM(native.DeepseekV4ForCausalLM):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return super().load_weights(
-            _iter_role_weights(weights, role=self.afd_role),
+            filter_role_weights(
+                weights, role=self.afd_role, classify=_checkpoint_weight_roles
+            ),
         )
 
 

@@ -30,7 +30,7 @@ excluded rather than best-effort.
   the patch contract against the pinned vLLM-Ascend ref, including signature
   parity and `Patch reason:`/`Patch functionality:` comments.
 - Target and draft must agree on layered FFN weight extraction
-  (`_extract_async_cam_layered_weights`) and on the layer set each side runs;
+  (`_extract_quantized_expert_weights`) and on the layer set each side runs;
   a mismatch fails at startup or, worse, silently runs a partial draft.
 - The prefill/decode split used by the DSpark recipes is a launch contract:
   `MODEL`, `DSPARK_CONFIG`, TP/DP/EP counts, and the upstream worker choice on

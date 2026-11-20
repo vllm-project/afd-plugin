@@ -23,14 +23,10 @@ from vllm.v1.worker.gpu import model_runner as v2_model_runner
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
 
-from afd_plugin.compat.npu import fail_if_unsupported_npu_afd_features
 from afd_plugin.compat.npu.profiler import (
     create_afd_npu_profiler,
     step_afd_npu_profiler,
     stop_afd_npu_profiler,
-)
-from afd_plugin.compat.npu.runtime_config import (
-    configure_async_cam_dbo,
 )
 from afd_plugin.compat.patches.npu.mrv2_ubatching import (
     use_async_cam_dbo_dispatch,
@@ -42,7 +38,7 @@ from afd_plugin.connectors import (
     AFDConnectorFactory,
     AFDForwardContextMetadata,
 )
-from afd_plugin.model_executor.models.forward_context import use_afd_metadata_provider
+from afd_plugin.forward_context import use_afd_metadata_provider
 from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
     _resolve_world_ranks,
@@ -53,7 +49,6 @@ from afd_plugin.v1.worker.attention_model_runner_v2 import (
     _use_afd_ubatch_preparation,
 )
 from afd_plugin.v1.worker.npu.dspark_speculator import AFDDSparkSpeculator
-from afd_plugin.validation import validate_npu_model_runner_v2_config
 
 if TYPE_CHECKING:
     from afd_plugin.v1.worker.npu.ubatch_runner import NPUUBatchRunner
@@ -224,14 +219,6 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         vllm_config: VllmConfig,
         device: torch.device,
     ):
-        fail_if_unsupported_npu_afd_features(vllm_config)
-        configure_async_cam_dbo(vllm_config)
-        validate_npu_model_runner_v2_config(
-            vllm_config,
-            expected_role="attention",
-            device_type=device.type,
-        )
-        fail_if_unsupported_npu_afd_features(vllm_config)
         super().__init__(vllm_config, device)
         connector: AFDConnectorBase | None = None
         try:

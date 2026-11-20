@@ -5,18 +5,18 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from importlib import import_module
 from types import SimpleNamespace
 
 import pytest
 
-# The validator parses connector extra config, which imports vLLM.
-pytest.importorskip("vllm")
-
-from afd_plugin.compat.npu import (  # noqa: E402
+from afd_plugin.compat.npu import (
     fail_if_unsupported_npu_afd_features,
     npu_afd_num_ubatches,
 )
-from tests.unit.fakes.vllm_config import (  # noqa: E402
+from afd_plugin.validation import validate_npu_model_runner_v2_config
+from tests.unit.fakes.async_ffn import load_async_modules, load_host_module
+from tests.unit.fakes.vllm_config import (
     async_moe_config as _async_moe_config,
 )
 from tests.unit.fakes.vllm_config import (  # noqa: E402
@@ -26,6 +26,22 @@ from tests.unit.fakes.vllm_config import (  # noqa: E402
 from tests.unit.fakes.vllm_config import (  # noqa: E402
     npu_vllm_config as _vllm_config,
 )
+
+
+@pytest.fixture(autouse=True)
+def host_dependencies(monkeypatch):
+    load_async_modules(monkeypatch)
+    load_host_module(monkeypatch, "afd_plugin.model_executor.models.model_utils")
+    load_host_module(monkeypatch, "afd_plugin.connectors.npu.camp2p.connector")
+    load_host_module(monkeypatch, "afd_plugin.connectors.factory")
+
+
+def _admit(config):
+    validate_npu_model_runner_v2_config(
+        config, expected_role=config.additional_config["afd"]["role"], device_type="npu"
+    )
+    fail_if_unsupported_npu_afd_features(config)
+
 
 TWO_UBATCH_DBO = dict(
     enable_dbo=True, use_ubatching=True, num_ubatches=2, ubatch_size=4
@@ -62,9 +78,9 @@ def test_dspark_feature_boundaries(role, draft_eager, target_eager, model_type, 
     config.model_config.hf_text_config.model_type = model_type
     if error:
         with pytest.raises(RuntimeError, match=error):
-            fail_if_unsupported_npu_afd_features(config)
+            _admit(config)
     else:
-        fail_if_unsupported_npu_afd_features(config)
+        _admit(config)
 
 
 @pytest.mark.parametrize("draft_eager", [True, False])
@@ -85,7 +101,7 @@ def test_dspark_ffn_graph_requires_full_mode(mode):
     config.model_config.enforce_eager = False
     config.compilation_config.cudagraph_mode.name = mode
     with pytest.raises(ValueError, match="explicit cudagraph_mode=FULL"):
-        fail_if_unsupported_npu_afd_features(config)
+        _admit(config)
 
 
 @pytest.mark.parametrize(
@@ -110,11 +126,17 @@ def test_dspark_draft_queries_fit_native_capacity(
         else pytest.raises(RuntimeError, match="draft query capacity")
     )
     with expected:
-        fail_if_unsupported_npu_afd_features(config)
+        _admit(config)
 
 
 def _config_with(*, model=None, max_num_batched_tokens=None, **kwargs):
     is_async = kwargs.get("connector") == "CAMAsyncAFDConnector"
+    if (
+        not is_async
+        and kwargs.get("use_ubatching")
+        and kwargs.get("role", "attention") == "attention"
+    ):
+        kwargs.setdefault("data_parallel_size", 2)
     if is_async:
         kwargs.setdefault("compute_gate_on_attention", True)
         kwargs["extra_config"] = {"dynamicQuant": 1, **kwargs.get("extra_config", {})}
@@ -139,6 +161,20 @@ def _mla_dbo(cudagraph_mode, **model_fields):
     )
 
 
+def test_camp2p_admission_after_connector_preloaded(monkeypatch):
+    package = import_module("afd_plugin.connectors.npu.camp2p")
+    connector = import_module("afd_plugin.connectors.npu.camp2p.connector")
+    monkeypatch.setattr(package, "connector", connector, raising=False)
+
+    with monkeypatch.context() as isolated:
+        load_async_modules(isolated)
+        load_host_module(isolated, "afd_plugin.connectors.npu.camp2p.connector")
+        load_host_module(isolated, "afd_plugin.connectors.factory")
+        _admit(_config_with())
+
+    _admit(_config_with())
+
+
 @pytest.mark.parametrize(
     ("config", "error"),
     [
@@ -154,8 +190,8 @@ def _mla_dbo(cudagraph_mode, **model_fields):
         ),
         pytest.param(
             _config_with(connector="P2pNcclAFDConnector", extra_config={"core_num": 8}),
-            "does not support connector_extra_config",
-            id="connector-extra-parser",
+            "requires either synchronous CAMP2p",
+            id="unsupported-npu-connector",
         ),
         pytest.param(_mla_dbo("FULL"), "FULL_DECODE_ONLY", id="mla-full"),
         pytest.param(
@@ -262,7 +298,9 @@ def _mla_dbo(cudagraph_mode, **model_fields):
             id="moe-prefill-context-parallel",
         ),
         pytest.param(
-            _async_moe_config(tensor_parallel_size=2, attn_ranks_per_dp=1),
+            _async_moe_config(
+                tensor_parallel_size=2, num_attention_ranks=2, attn_ranks_per_dp=1
+            ),
             "attn_ranks_per_dp",
             id="moe-attention-cam-tp-mismatch",
         ),
@@ -274,7 +312,7 @@ def test_npu_feature_validation(config, error):
         if error
         else nullcontext()
     ):
-        fail_if_unsupported_npu_afd_features(config)
+        _admit(config)
 
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])
@@ -290,7 +328,7 @@ def test_async_cam_rejects_models_without_layered_ffn(role, model_type):
     )
     config.model_config.hf_text_config.model_type = model_type
     with pytest.raises(RuntimeError, match="requires DeepSeek V4"):
-        fail_if_unsupported_npu_afd_features(config)
+        _admit(config)
 
 
 @pytest.mark.parametrize("dp_size", [1, 2])
@@ -380,9 +418,9 @@ def test_npu_async_feature_validation_checks_receive_capacity(
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
     if rejected:
         with pytest.raises(RuntimeError, match="BATCH_SIZE_FACTOR"):
-            fail_if_unsupported_npu_afd_features(config)
+            _admit(config)
     else:
-        fail_if_unsupported_npu_afd_features(config)
+        _admit(config)
 
 
 @pytest.mark.parametrize(
@@ -429,7 +467,7 @@ def test_npu_async_mrv2_feature_boundaries(
     config.additional_config.update(additional_config)
     config.model_config.hf_text_config.model_type = model_type
     with pytest.raises(RuntimeError, match=error):
-        fail_if_unsupported_npu_afd_features(config)
+        _admit(config)
 
 
 @pytest.mark.parametrize(
@@ -463,13 +501,13 @@ def test_npu_async_mrv2_features_allow_model_layouts(
     )
     config.model_config.hf_text_config.model_type = model_type
     config.additional_config["enable_flashcomm1"] = use_sp
-    fail_if_unsupported_npu_afd_features(config)
+    _admit(config)
 
 
 @pytest.mark.parametrize(
     "connector,gate,dynamic_quant,error",
     [
-        ("P2pNcclAFDConnector", False, 0, "supports only CAMAsyncAFDConnector"),
+        ("P2pNcclAFDConnector", False, 0, "requires either synchronous CAMP2p"),
         ("CAMP2pAFDConnector", False, 0, None),
         ("CAMAsyncAFDConnector", False, 1, "compute_gate_on_attention"),
         ("CAMAsyncAFDConnector", True, 0, "dynamicQuant=1"),
@@ -486,4 +524,13 @@ def test_dsv4_connector_and_quantization_policy(connector, gate, dynamic_quant, 
     )
     config.model_config.hf_text_config.model_type = "deepseek_v4"
     with pytest.raises(RuntimeError, match=error) if error else nullcontext():
-        fail_if_unsupported_npu_afd_features(config)
+        _admit(config)
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_dspark_requires_strict_model_type_even_with_dsv4_architecture(role):
+    config = npu_dspark_config(role=role)
+    config.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
+    config.model_config.hf_text_config.model_type = "deepseek_v2"
+    with pytest.raises(RuntimeError, match="DSpark supports only DeepSeek-V4"):
+        _admit(config)

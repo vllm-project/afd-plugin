@@ -138,8 +138,6 @@ def construct_model(torch):
             "cast": cast,
             "nn": nn,
             "native": native,
-            "_ATTENTION_ROLE": "attention",
-            "_FFN_ROLE": "ffn",
             "AFD_ASYNC_CONNECTOR": "CAMAsyncAFDConnector",
             "parse_afd_config": lambda config, **kwargs: config.afd,
             "_refresh_ascend_fused_moe": lambda: None,
@@ -238,8 +236,8 @@ BOTH_ROLES = frozenset(("attention", "ffn"))
 
 @pytest.fixture(scope="module")
 def checkpoint_weight_roles() -> Callable[..., frozenset[str]]:
-    # Execute the pure helpers and their real role constants without importing
-    # torch or the native model class graph.
+    # Execute the pure helper against the shared role constants without
+    # importing torch or the native model class graph.
     path = (
         Path(__file__).resolve().parents[5]
         / "afd_plugin/model_executor/models/npu/deepseek_v4.py"
@@ -247,17 +245,21 @@ def checkpoint_weight_roles() -> Callable[..., frozenset[str]]:
     helpers: list[ast.stmt] = [
         node
         for node in ast.parse(path.read_text()).body
-        if (
-            isinstance(node, ast.FunctionDef)
-            and node.name in ("_weight_layer_path", "_checkpoint_weight_roles")
-        )
-        or (
-            isinstance(node, ast.Assign)
-            and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id in ("_ATTENTION_ROLE", "_FFN_ROLE", "_BOTH_ROLES")
-        )
+        if isinstance(node, ast.FunctionDef) and node.name == "_checkpoint_weight_roles"
     ]
-    namespace: dict[str, object] = {}
+    from afd_plugin.model_executor.models._weight_utils import (
+        ATTENTION_ROLE,
+        BOTH_ROLES,
+        FFN_ROLE,
+        layer_weight_path,
+    )
+
+    namespace: dict[str, object] = {
+        "ATTENTION_ROLE": ATTENTION_ROLE,
+        "BOTH_ROLES": BOTH_ROLES,
+        "FFN_ROLE": FFN_ROLE,
+        "layer_weight_path": layer_weight_path,
+    }
     module = ast.Module(body=helpers, type_ignores=[])
     exec(compile(module, str(path), "exec"), namespace)
     return cast(Callable[..., frozenset[str]], namespace["_checkpoint_weight_roles"])

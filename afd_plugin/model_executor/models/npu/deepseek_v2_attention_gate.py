@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 from afd_plugin.envs import force_balanced_topk_ids_enabled
-from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
+from afd_plugin.forward_context import get_afd_metadata_from_forward_context
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig

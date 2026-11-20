@@ -8,6 +8,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from tests.e2e.models.deepseek_v4_flash import dspark_eager as checker
@@ -146,6 +147,19 @@ def run_checker(monkeypatch, tmp_path):
 
         monkeypatch.setattr(checker, "post", post)
         monkeypatch.setattr(checker.urllib.request, "urlopen", urlopen)
+        client_type = httpx.AsyncClient
+
+        def handle_request(request):
+            payload = json.loads(request.content)
+            return httpx.Response(200, json=post("", request.url.path, payload))
+
+        monkeypatch.setattr(
+            httpx,
+            "AsyncClient",
+            lambda **kwargs: client_type(
+                transport=httpx.MockTransport(handle_request), **kwargs
+            ),
+        )
         clock = iter((0, 60))
         monkeypatch.setattr(
             checker, "time", SimpleNamespace(monotonic=lambda: next(clock))

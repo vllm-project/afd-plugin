@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import os
 import struct
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final
 
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
@@ -16,6 +16,7 @@ from afd_plugin.config import (
     parse_afd_config,
 )
 from afd_plugin.v1.worker.cuda_graph import (
+    AFDCUDAGraphPolicy,
     cudagraph_mode_name,
     validate_cuda_graph_mode,
 )
@@ -42,7 +43,7 @@ VLLM_GPU_WORKER_FQCN: Final[str] = "vllm.v1.worker.gpu_worker.Worker"
 VLLM_ASCEND_NPU_WORKER_FQCN: Final[str] = "vllm_ascend.worker.worker.NPUWorker"
 VLLM_ASCEND_310P_WORKER_FQCN: Final[str] = "vllm_ascend._310p.worker_310p.NPUWorker310"
 VLLM_ASCEND_XLITE_WORKER_FQCN: Final[str] = "vllm_ascend.xlite.xlite_worker.XliteWorker"
-GPU_MRV2_NUM_UBATCHES: Final[int] = 2
+MRV2_NUM_UBATCHES: Final[int] = 2
 GPU_MRV2_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pNcclAFDConnector",
     *DEEPEP_M2N_CONNECTORS,
@@ -60,32 +61,49 @@ CAM_MAX_SOURCE_ROWS = (1 << 16) - 1
 
 
 def cam_receive_capacity() -> int:
+    value = os.environ.get("BATCH_SIZE_FACTOR", "1")
+    try:
+        # Python accepts underscores and Unicode digits that std::stof does not.
+        if not value.isascii() or "_" in value:
+            raise ValueError("Not a native floating-point literal")
+        factor = float(value)
+    except ValueError as exc:
+        raise RuntimeError(
+            "BATCH_SIZE_FACTOR must be a decimal number in (0, 1]"
+        ) from exc
+    if not 0 < factor <= 1:
+        raise RuntimeError("BATCH_SIZE_FACTOR must be a decimal number in (0, 1]")
     # Match the native std::stof + float multiplication, including rounding.
-    factor = struct.unpack(
-        "f", struct.pack("f", float(os.environ.get("BATCH_SIZE_FACTOR", "1")))
-    )[0]
-    return int(CAM_MAX_RECEIVE_TOKENS * factor)
+    factor = struct.unpack("f", struct.pack("f", factor))[0]
+    capacity = int(CAM_MAX_RECEIVE_TOKENS * factor)
+    if capacity < 1:
+        raise RuntimeError("BATCH_SIZE_FACTOR must allocate at least one receive row")
+    return capacity
 
 
-def requested_ffn_mode(config: VllmConfig) -> Literal["eager", "full"]:
-    if config.model_config.enforce_eager:
-        return "eager"
-    if config.compilation_config.cudagraph_mode.name != "FULL":
-        raise ValueError("Async FFN graph requires explicit cudagraph_mode=FULL")
-    return "full"
+def validate_no_pp_or_cp(vllm_config: VllmConfig) -> None:
+    parallel = vllm_config.parallel_config
+    if (
+        parallel.pipeline_parallel_size,
+        parallel.prefill_context_parallel_size,
+        parallel.decode_context_parallel_size,
+    ) != (1, 1, 1):
+        raise RuntimeError("AFD ModelRunnerV2 does not support PP or CP")
 
 
-def validate_graph_capacity(
-    max_tokens: int, tp_size: int, capacity: int, *, allow_row_slicing: bool = False
-) -> None:
-    if min(max_tokens, tp_size, capacity) <= 0 or max_tokens % tp_size:
-        raise ValueError("Graph dispatch envelope must be positive and divisible by TP")
-    if capacity < max_tokens and not allow_row_slicing:
-        raise ValueError(
-            "Async FFN graph capacity is smaller than the dispatch envelope"
+def validate_afd_world_size(vllm_config: VllmConfig, afd_config: AFDConfig) -> None:
+    parallel = vllm_config.parallel_config
+    configured = (
+        afd_config.num_attention_ranks
+        if afd_config.is_attention_server
+        else afd_config.num_ffn_ranks
+    )
+    distributed = parallel.data_parallel_size * parallel.tensor_parallel_size
+    if configured != distributed:
+        raise RuntimeError(
+            f"AFD ModelRunnerV2 {afd_config.role} ranks must match DP * TP: "
+            f"configured={configured}, distributed={distributed}",
         )
-    if max_tokens // tp_size > CAM_MAX_SOURCE_ROWS:
-        raise ValueError("Async CAM graph source rows exceed the uint16 protocol bound")
 
 
 def validate_async_cam_attention_graph(vllm_config: VllmConfig) -> None:
@@ -112,7 +130,7 @@ def validate_gpu_model_runner_v2_config(
     *,
     expected_role: str,
     device_type: str,
-) -> None:
+) -> AFDCUDAGraphPolicy:
     """Validate the shared GPU ModelRunnerV2 deployment constraints.
 
     For the Attention role these checks guard native ModelRunnerV2 execution.
@@ -149,7 +167,7 @@ def validate_gpu_model_runner_v2_config(
             raise RuntimeError(
                 f"{afd_config.connector} requires compute_gate_on_attention=true"
             )
-        # Runners validate the AFD-prefixed architecture of the wrapped model.
+        # Accept the native architecture and its role-local AFD alias.
         architectures = vllm_config.model_config.hf_config.architectures
         if not any(
             architecture.removeprefix("AFD") in ATTENTION_ROUTING_MODEL_ARCHITECTURES
@@ -159,24 +177,8 @@ def validate_gpu_model_runner_v2_config(
                 f"{afd_config.connector} supports only "
                 f"{ATTENTION_ROUTING_MODEL_ARCHITECTURES}, got {architectures}"
             )
-    if (
-        parallel.pipeline_parallel_size,
-        parallel.prefill_context_parallel_size,
-        parallel.decode_context_parallel_size,
-    ) != (1, 1, 1):
-        raise RuntimeError("AFD ModelRunnerV2 does not support PP or CP")
-
-    configured_ranks = (
-        afd_config.num_attention_ranks
-        if expected_role == "attention"
-        else afd_config.num_ffn_ranks
-    )
-    distributed_ranks = parallel.data_parallel_size * parallel.tensor_parallel_size
-    if configured_ranks != distributed_ranks:
-        raise RuntimeError(
-            f"AFD ModelRunnerV2 {expected_role} ranks must match DP * TP: "
-            f"configured={configured_ranks}, distributed={distributed_ranks}",
-        )
+    validate_no_pp_or_cp(vllm_config)
+    validate_afd_world_size(vllm_config, afd_config)
     if (
         not parallel.enable_expert_parallel
         or parallel.enable_elastic_ep
@@ -186,7 +188,7 @@ def validate_gpu_model_runner_v2_config(
         raise RuntimeError("AFD ModelRunnerV2 requires static expert parallelism")
     if (
         parallel.enable_dbo or parallel.use_ubatching
-    ) and parallel.num_ubatches != GPU_MRV2_NUM_UBATCHES:
+    ) and parallel.num_ubatches != MRV2_NUM_UBATCHES:
         raise RuntimeError(
             "AFD ModelRunnerV2 DBO/ubatching requires exactly two microbatches",
         )
@@ -201,7 +203,7 @@ def validate_gpu_model_runner_v2_config(
     if not has_afd_model_registration(vllm_config.model_config):
         raise RuntimeError("AFD ModelRunnerV2 requires a registered AFD model")
 
-    validate_cuda_graph_mode(vllm_config, role=expected_role)
+    return validate_cuda_graph_mode(vllm_config, role=expected_role)
 
 
 def validate_npu_model_runner_v2_config(
@@ -217,18 +219,7 @@ def validate_npu_model_runner_v2_config(
     afd_config = parse_afd_config(vllm_config, expected_role=expected_role)
     if device_type != "npu":
         raise RuntimeError("AFD NPU ModelRunnerV2 requires NPU")
-    if afd_config.connector == AFD_ASYNC_CONNECTOR:
-        if not afd_config.async_dp or not afd_config.compute_gate_on_attention:
-            raise RuntimeError(
-                "AFD NPU ModelRunnerV2 Async CAM requires async DP and "
-                "compute_gate_on_attention=true",
-            )
-        if not vllm_config.model_config.enforce_eager:
-            if expected_role == "attention":
-                validate_async_cam_attention_graph(vllm_config)
-            else:
-                requested_ffn_mode(vllm_config)
-    elif afd_config.connector != CAMP2P_CONNECTOR:
+    if afd_config.connector not in (AFD_ASYNC_CONNECTOR, CAMP2P_CONNECTOR):
         raise RuntimeError(
             "AFD NPU ModelRunnerV2 requires either synchronous CAMP2pAFDConnector "
             "or Async CAM",
@@ -237,43 +228,23 @@ def validate_npu_model_runner_v2_config(
     # live in feature_validation and run from both workers before this point.
 
     parallel = vllm_config.parallel_config
-    if (
-        parallel.pipeline_parallel_size,
-        parallel.prefill_context_parallel_size,
-        parallel.decode_context_parallel_size,
-    ) != (1, 1, 1):
-        raise RuntimeError("AFD ModelRunnerV2 does not support PP or CP")
-
-    configured_ranks = (
-        afd_config.num_attention_ranks
-        if expected_role == "attention"
-        else afd_config.num_ffn_ranks
-    )
-    distributed_ranks = parallel.data_parallel_size * parallel.tensor_parallel_size
-    if configured_ranks != distributed_ranks:
-        raise RuntimeError(
-            f"AFD ModelRunnerV2 {expected_role} ranks must match DP * TP: "
-            f"configured={configured_ranks}, distributed={distributed_ranks}",
-        )
+    validate_no_pp_or_cp(vllm_config)
+    validate_afd_world_size(vllm_config, afd_config)
     if (
         not parallel.enable_expert_parallel
         or parallel.enable_elastic_ep
         or parallel.enable_eplb
     ):
         raise RuntimeError("AFD ModelRunnerV2 requires static expert parallelism")
-    if parallel.enable_dbo or parallel.use_ubatching:
-        if (
-            afd_config.connector == AFD_ASYNC_CONNECTOR
-            and not vllm_config.model_config.enforce_eager
-        ):
-            raise RuntimeError("AFD NPU ModelRunnerV2 DBO requires eager execution")
-        if (
-            expected_role == "attention"
-            and parallel.data_parallel_size <= 1
-            and afd_config.connector != AFD_ASYNC_CONNECTOR
-        ):
-            raise RuntimeError("AFD NPU ModelRunnerV2 DBO requires Attention DP > 1")
-        if parallel.num_ubatches != 2:
+    if (
+        afd_config.connector == AFD_ASYNC_CONNECTOR
+        and afd_config.is_attention_server
+        and not vllm_config.model_config.enforce_eager
+    ):
+        validate_async_cam_attention_graph(vllm_config)
+    uses_dbo = parallel.enable_dbo or parallel.use_ubatching
+    if uses_dbo:
+        if parallel.num_ubatches != MRV2_NUM_UBATCHES:
             raise RuntimeError(
                 "AFD NPU ModelRunnerV2 DBO requires exactly two ubatches"
             )
@@ -282,12 +253,30 @@ def validate_npu_model_runner_v2_config(
                 "AFD NPU ModelRunnerV2 DBO does not support speculative decoding"
             )
 
-    from afd_plugin.model_executor.models.model_utils import (
-        has_afd_model_registration,
-    )
-
-    if not has_afd_model_registration(vllm_config.model_config):
-        raise RuntimeError("AFD ModelRunnerV2 requires a registered AFD model")
+    if afd_config.connector == AFD_ASYNC_CONNECTOR:
+        if not afd_config.async_dp:
+            raise RuntimeError("Async CAM requires async DP (async=true)")
+        if not afd_config.compute_gate_on_attention:
+            raise RuntimeError("Async CAM requires compute_gate_on_attention=true")
+        if uses_dbo and not afd_config.is_attention_server:
+            raise RuntimeError("Async CAM DBO/ubatching requires the Attention role")
+        if (
+            not vllm_config.model_config.enforce_eager
+            and not afd_config.is_attention_server
+        ):
+            if vllm_config.compilation_config.cudagraph_mode.name != "FULL":
+                raise ValueError(
+                    "Async FFN graph requires explicit cudagraph_mode=FULL"
+                )
+            if parallel.tensor_parallel_size != 1:
+                raise RuntimeError("Async FFN FULL requires F TP=1")
+    else:
+        if (
+            uses_dbo
+            and expected_role == "attention"
+            and parallel.data_parallel_size <= 1
+        ):
+            raise RuntimeError("AFD NPU ModelRunnerV2 DBO requires Attention DP > 1")
 
     if not vllm_config.model_config.enforce_eager:
         graph_mode = cudagraph_mode_name(vllm_config)
@@ -296,6 +285,13 @@ def validate_npu_model_runner_v2_config(
                 "AFD NPU ModelRunnerV2 supports ACL graph modes FULL and "
                 f"FULL_DECODE_ONLY; got {graph_mode!r}.",
             )
+
+    from afd_plugin.model_executor.models.model_utils import (
+        has_afd_model_registration,
+    )
+
+    if not has_afd_model_registration(vllm_config.model_config):
+        raise RuntimeError("AFD ModelRunnerV2 requires a registered AFD model")
 
 
 def normalize_qualname(value: str) -> str:
@@ -428,4 +424,6 @@ __all__ = [
     "normalize_qualname",
     "validate_gpu_model_runner_v2_config",
     "validate_npu_model_runner_v2_config",
+    "validate_afd_world_size",
+    "validate_no_pp_or_cp",
 ]

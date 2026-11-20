@@ -17,17 +17,21 @@ torch = pytest.importorskip("torch")
 
 from afd_plugin.connectors.npu.async_cam_runtime.async_cam_layered import (  # noqa: E402
     AsyncCAMLayeredExecutor,
-    LayeredFFNWeights,
 )
 from afd_plugin.connectors.npu.async_cam_runtime.async_cam_mega import (  # noqa: E402
     AsyncCAMMegaExecutor,
 )
+from afd_plugin.model_executor.ffn.npu.expert_weights import (  # noqa: E402
+    QuantizedExpertWeights,
+    expert_weight_signature,
+)
+from tests.unit.fakes.async_ffn import load_async_modules  # noqa: E402
 
 
 def weights(layer_idx=0, per_channel=True, quantization="W4A8"):
     experts, hidden, intermediate = 2, 32, 16
     if quantization == "W8A8":
-        return LayeredFFNWeights(
+        return QuantizedExpertWeights(
             layer_idx=layer_idx,
             w13=torch.empty(experts, hidden, 2 * intermediate, dtype=torch.int8),
             w2=torch.empty(experts, intermediate, hidden, dtype=torch.int8),
@@ -40,7 +44,7 @@ def weights(layer_idx=0, per_channel=True, quantization="W4A8"):
             routed_scaling_factor=2.0,
             quantization="W8A8",
         )
-    return LayeredFFNWeights(
+    return QuantizedExpertWeights(
         layer_idx=layer_idx,
         w13=torch.empty(experts, hidden, intermediate // 4, dtype=torch.int32),
         w2=torch.empty(experts, intermediate, hidden // 8, dtype=torch.int32),
@@ -62,9 +66,15 @@ def weights(layer_idx=0, per_channel=True, quantization="W4A8"):
 
 
 def test_native_rejects_grouped_scale_before_receiving(operators):
-    executor = AsyncCAMLayeredExecutor([weights(per_channel=False)])
     with pytest.raises(ValueError, match="per-channel"):
-        AsyncCAMMegaExecutor(executor, None)
+        AsyncCAMMegaExecutor(
+            [weights(per_channel=False)],
+            topology=None,
+            max_num_batched_tokens=8,
+            topk=2,
+            tp_size=1,
+            capacity=16,
+        )
 
 
 @pytest.mark.parametrize("quantization", ["W4A8", "W8A8"])
@@ -86,21 +96,14 @@ def test_native_forwards_the_applied_swiglu_limit(monkeypatch, operators, quanti
         torch.ops.afd_ascend, "afd_mega_moe_pull_native", execute, raising=False
     )
     executor = AsyncCAMMegaExecutor(
-        AsyncCAMLayeredExecutor(
-            [replace(weights(quantization=quantization), swiglu_limit=10.0)]
-        ),
-        SimpleNamespace(
-            max_num_batched_tokens=8,
-            topk=2,
-            ffn_size=2,
-            attn_size=1,
-            world_rank=1,
-            topology=SimpleNamespace(world_size=3),
-            tp_size=1,
-            comm_args=torch.empty(512, dtype=torch.float16),
-            group_name="test-pull",
-        ),
+        [replace(weights(quantization=quantization), swiglu_limit=10.0)],
+        topology=SimpleNamespace(ffn_size=2, attn_size=1, world_rank=1, world_size=3),
+        max_num_batched_tokens=8,
+        topk=2,
+        tp_size=1,
+        capacity=16,
     )
+    executor.bind_communication(torch.empty(512, dtype=torch.float16), "test-pull")
     executor()
     assert calls[0][-1] == (10.0 if quantization == "W4A8" else 0.0)
     assert calls[0][10][11] == (1 if quantization == "W4A8" else 2)
@@ -236,10 +239,10 @@ def test_w8a8_rejects_incompatible_layout_before_receive(operators, change, mess
     assert operators == []
 
 
-def test_graph_signature_distinguishes_quantization(operators):
-    w4 = AsyncCAMLayeredExecutor([weights()])
-    w8 = AsyncCAMLayeredExecutor([weights(quantization="W8A8")])
-    assert w4.graph_signature(32) != w8.graph_signature(32)
+def test_graph_signature_distinguishes_quantization():
+    assert expert_weight_signature([weights()], 32) != expert_weight_signature(
+        [weights(quantization="W8A8")], 32
+    )
     with pytest.raises(ValueError, match="homogeneous"):
         AsyncCAMLayeredExecutor([weights(0), weights(1, quantization="W8A8")])
 
@@ -256,37 +259,8 @@ def test_repeated_interleaved_layer_ids(operators):
     assert [call[1][6].item() for call in operators[::2]] == [1, 0, 1, 1]
 
 
-def runner_method(name, namespace):
-    tree = ast.parse(
-        Path("afd_plugin/v1/worker/npu/async_ffn_model_runner.py").read_text()
-    )
-    cls = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "AsyncNPUFFNModelRunner"
-    )
-    method = next(
-        node
-        for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name == name
-    )
-    module = ast.Module(
-        body=[
-            ast.ImportFrom(
-                module="__future__", names=[ast.alias(name="annotations")], level=0
-            ),
-            method,
-        ],
-        type_ignores=[],
-    )
-    exec(
-        compile(ast.fix_missing_locations(module), "<runner-contract>", "exec"),
-        namespace,
-    )
-    return namespace[name]
-
-
-def test_runner_preserves_raw_context_and_chunk_capacity():
+def test_runner_preserves_raw_context_and_chunk_capacity(monkeypatch):
+    _, _, runtime = load_async_modules(monkeypatch)
     payloads = [
         SimpleNamespace(
             hidden_states=torch.empty(8, 32),
@@ -308,26 +282,19 @@ def test_runner_preserves_raw_context_and_chunk_capacity():
         send_ffn_output=lambda result, ctx: sent.append((result, ctx)),
     )
 
-    def compute(*args):
+    def compute(*args, retained_tensors=None):
         computed.append(args)
         return torch.empty(8, 32, dtype=torch.bfloat16)
 
-    runner = SimpleNamespace(
+    runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
+    runner.__dict__.update(
         model=object(),
         connector=connector,
         _mega_executor=None,
         _layered_executor=compute,
         layer_ids=(2, 5),
     )
-    method = runner_method(
-        "_ffn_forward_connector_driven",
-        {
-            "cast": cast,
-            "CAMAsyncAFDConnector": SimpleNamespace,
-            "AFDAsyncTransferState": SimpleNamespace,
-        },
-    )
-    method(runner)
+    runner._ffn_forward_connector_driven()
     assert [ctx for _, ctx in sent] == [p.context for p in payloads]
     for args, payload in zip(computed, payloads, strict=True):
         assert args[0] is payload.hidden_states
@@ -340,7 +307,7 @@ def model_weights_method(monkeypatch):
         node
         for node in ast.parse(source).body
         if isinstance(node, ast.FunctionDef)
-        and node.name == "_extract_async_cam_layered_weights"
+        and node.name == "_extract_quantized_expert_weights"
     )
     monkeypatch.setitem(
         sys.modules,
@@ -365,7 +332,7 @@ def model_weights_method(monkeypatch):
     exec(
         compile(ast.fix_missing_locations(module), "<model-weights>", "exec"), namespace
     )
-    return namespace["_extract_async_cam_layered_weights"]
+    return namespace["_extract_quantized_expert_weights"]
 
 
 def model_layer(idx, quantization="W4A8"):

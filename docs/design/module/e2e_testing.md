@@ -34,6 +34,9 @@ validation_paths:
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite_multi_pod.py"
   - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_dspark_npu.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_dspark_core_checker.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_dspark_graph_checker.py"
   - "tests/e2e/models/deepseek_v4_flash/test_deepseek_v4_flash_multi_pod.py"
   - "tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py"
   - "tests/e2e/models/deepseek_v4_flash/test_gpu.py"
@@ -55,7 +58,7 @@ verified_platform_refs:
   - "CUDA Qwen3 MoE"
   - "CUDA Qwen3.6 MoE"
 related_issues: []
-last_reviewed: 2026-11-10
+last_reviewed: 2026-11-17
 ---
 
 # E2E testing
@@ -125,15 +128,28 @@ before launch rather than being silently dropped. Every pod records the actual
 evaluator configuration/results, its local outcome and cleanup. Qualification
 requires every pod's acceptance entry to pass.
 
-The two NPU multi-pod entries and dedicated FFN/DSpark callers retain their
-legacy path. Remaining CLI scenario configuration is NPU-only; GPU-specific
-tables and evaluation/Hash branches have been removed. No cases are added or
-removed. Implementation/collection does not establish device qualification:
-report host, same-host distributed and cross-node/device execution separately.
+The two NPU multi-pod entries and older dedicated FFN/DSpark callers retain
+their legacy path. Remaining legacy CLI scenario configuration is NPU-only;
+GPU-specific tables and evaluation/Hash branches have been removed. Three opt-in
+DSpark core Cases add same-topology eager, graph and PD+graph comparisons. Their
+model-owned orchestration runs each reference and target as a separate
+deployment through the shared executor;
+PD additionally uses native prefill and the existing proxy. Their workload
+keeps four cancellable concurrent requests and records per-rank request-time
+evidence. Ordinary graph execution and the separate instrumented per-layer
+comparison are distinct deployments. Each attempt has its own artifact
+directory, so earlier rank evidence cannot qualify a later attempt.
 
-On migrated Case paths (all single-deployment entries and ten GPU multi-pod
-entries), an existing-capability combination changes model declarations and
-IDs only.
+An optional eager reference is reused only when its recorded identity matches
+the current source, runtime and deployment inputs. Its actual A/F worker
+interpreter and package identities must also match the graph deployment;
+ordinary graph checks require FULL mode and request-window replay on every FFN
+rank. Implementation/collection does not establish device qualification: report
+host, same-host distributed and cross-node/device execution separately.
+
+On migrated Case paths (single-deployment entries, DSpark core Cases and ten GPU
+multi-pod entries), an existing-capability combination changes model
+declarations and IDs only.
 Changing Case fields, task/check behavior or deployment protocols is a shared
 capability extension. A new connector must define launch order in deployment;
 Cases do not override that order independently. Configuration conflicts in
@@ -191,7 +207,8 @@ cleanup. Production code does not depend on the E2E harness.
 - `E2E-INV-002` — A PR case **MUST NOT** use more than four unique devices.
   AFD gate topology **MUST** match the selected suite: DeepSeek-V2-Lite
   defaults use 2A2F; Qwen3 MoE and Qwen3.6 MoE use 2A1F. Weekly CI also
-  selects the existing DeepSeek-V2-Lite 2A1F Graph + DBO case.
+  selects the existing DeepSeek-V2-Lite 2A1F Graph + DBO case and the Qwen3
+  MoE DeepEP M2N 2A2F Graph + DBO case.
 - `E2E-INV-003` — Cases sharing devices or ports **MUST** run sequentially,
   remain order-independent, and release owned process groups before the next
   case.
@@ -365,7 +382,7 @@ unverified.
 | Samples | first 7 for ordinary cases; default DBO floors at 24; V2 DP2 eager/DBO comparison defaults to 128 | first 7; all DBO cases floor at 24 |
 | Metric | GSM8K exact match | GSM8K exact match |
 | Minimum accuracy | DeepSeek-V2-Lite smoke (up to 24 samples): 0.25; otherwise 0.27 | DeepSeek-V2-Lite smoke (up to 24 samples): 0.25; otherwise 0.27 |
-| Cases | seven CUDA DeepSeek-V2-Lite cases; four existing NPU DeepSeek-V2-Lite cases | seven Qwen3 MoE / Qwen3.6 MoE cases plus DeepSeek-V2-Lite `afd-graph-dbo-2a1f` |
+| Cases | seven CUDA DeepSeek-V2-Lite cases; four existing NPU DeepSeek-V2-Lite cases | seven Qwen3 MoE / Qwen3.6 MoE cases plus DeepSeek-V2-Lite `afd-graph-dbo-2a1f` and Qwen3 MoE `afd-deepep-m2n-graph-dbo-2a2f` |
 
 An accuracy of `0.27` requires at least 2 correct answers out of 7, 7 out of
 24, or 35 out of 128. The DeepSeek smoke threshold of `0.25` requires 6 out

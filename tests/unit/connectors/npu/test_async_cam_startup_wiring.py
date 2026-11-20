@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Real startup call sites with host stubs; not device execution coverage."""
 
+import json
 import sys
 import threading
 import weakref
@@ -12,21 +13,22 @@ from unittest.mock import MagicMock, call
 import pytest
 
 from afd_plugin.compat.npu.feature_validation import (
-    _fail_if_unsupported_npu_afd_async_features,
     fail_if_unsupported_npu_afd_features,
 )
-from afd_plugin.config import parse_afd_config
+from afd_plugin.config import AFDConfig, parse_afd_config
 from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup import (
     AsyncCAMGraphStartup,
+    FFNGraphPlan,
     resolve_ffn_mode,
 )
-from tests.unit.fakes.async_cam_startup import startup_world
+from afd_plugin.validation import validate_npu_model_runner_v2_config
+from tests.unit.fakes.async_cam_startup import MemoryStore, startup_world
 from tests.unit.fakes.async_ffn import (
     load_async_modules,
     load_host_module,
 )
 from tests.unit.fakes.graph import Graph
-from tests.unit.fakes.vllm_config import npu_vllm_config
+from tests.unit.fakes.vllm_config import npu_dspark_config, npu_vllm_config
 
 
 @pytest.fixture
@@ -112,6 +114,11 @@ def layered_startup_runner(modules, monkeypatch, mode, invalid):
         )
 
     monkeypatch.setattr(runtime, "AsyncCAMLayeredExecutor", executor)
+    monkeypatch.setattr(
+        runtime,
+        "expert_weight_signature",
+        lambda layers, capacity: repr(tuple(layer.layer_idx for layer in layers)),
+    )
     target = (
         []
         if invalid == "target"
@@ -127,11 +134,11 @@ def layered_startup_runner(modules, monkeypatch, mode, invalid):
     runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
     runner.model = SimpleNamespace(
         get_experts_layer_indices=lambda: (2,),
-        get_async_cam_layered_weights=lambda: (target, "unsupported target"),
+        get_quantized_expert_weights=lambda: (target, "unsupported target"),
     )
     runner.draft_model = SimpleNamespace(
         get_experts_layer_indices=lambda: (5,),
-        get_async_cam_layered_weights=lambda: (draft, "unsupported draft"),
+        get_quantized_expert_weights=lambda: (draft, "unsupported draft"),
     )
     connector = SimpleNamespace(
         is_initialized=False,
@@ -143,11 +150,8 @@ def layered_startup_runner(modules, monkeypatch, mode, invalid):
         [connector.graph_startup.plan]
     )
     runner.connector = connector
-    runner._failure = runner._layered_executor = None
+    runner._failure = runner._layered_executor = runner._mega_executor = None
     runner.requested_mode = mode
-    monkeypatch.setattr(
-        runtime, "get_ascend_device_type", lambda: runtime.AscendDeviceType.A3
-    )
     return runner, connector
 
 
@@ -181,32 +185,124 @@ def test_ffn_startup_validates_target_and_draft_weights(
 def test_mega_executor_failure_is_published_during_startup(modules, monkeypatch, mode):
     _, _, runtime = modules
     runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
-    runner.model = SimpleNamespace(get_experts_layer_indices=lambda: (2,))
+    runner.model = SimpleNamespace(
+        get_experts_layer_indices=lambda: (2,),
+        get_quantized_expert_weights=lambda: ([SimpleNamespace(layer_idx=2)], ""),
+    )
     runner.draft_model = None
     runner._failure = runner._layered_executor = runner._mega_executor = None
     runner.requested_mode = mode
     connector = SimpleNamespace(
         is_initialized=False,
         extra_info=SimpleNamespace(ffn_mega_moe=True),
+        dynamic_quant=1,
+        topology=None,
+        max_num_batched_tokens=8,
+        topk=2,
+        tp_size=1,
         graph_startup=AsyncCAMGraphStartup(1, 1, 2),
     )
     connector.init_afd_connector = lambda: resolve_ffn_mode(
         [connector.graph_startup.plan]
     )
     runner.connector = connector
-    runner._initialize_layered_executor = lambda: setattr(
-        runner,
-        "_layered_executor",
-        SimpleNamespace(graph_signature=lambda _: "layered"),
-    )
 
-    def fail_executor(*_args):
+    def fail_executor(*_args, **_kwargs):
         raise ValueError("unsupported Mega weights")
 
     monkeypatch.setattr(runtime, "AsyncCAMMegaExecutor", fail_executor)
     with pytest.raises(ValueError, match="unsupported Mega weights"):
         runner.initialize_afd_connector()
     assert connector.graph_startup.plan.executor_error == "unsupported Mega weights"
+
+
+@pytest.fixture
+def independent_mega_runner(modules, monkeypatch):
+    _, _, runtime = modules
+    peers = startup_world(attn=1, ffn=1)
+    model = SimpleNamespace(
+        get_experts_layer_indices=lambda: (2,),
+        get_quantized_expert_weights=lambda: ([SimpleNamespace(layer_idx=2)], ""),
+    )
+    connector = SimpleNamespace(
+        is_initialized=False,
+        dynamic_quant=1,
+        extra_info=SimpleNamespace(ffn_mega_moe=True),
+        graph_startup=peers[1],
+        topology=None,
+        max_num_batched_tokens=8,
+        topk=2,
+        tp_size=1,
+        comm_args=object(),
+        group_name="ready",
+    )
+
+    def initialize():
+        connector.graph_startup.mode = resolve_ffn_mode([connector.graph_startup.plan])
+        connector.is_initialized = True
+
+    connector.init_afd_connector = initialize
+    fail_binding = [False]
+    mega = MagicMock()
+
+    def bind(*args):
+        if not connector.is_initialized:
+            raise RuntimeError("communication was bound before initialization")
+        if fail_binding[0]:
+            raise RuntimeError("communication binding failed")
+
+    mega.bind_communication = bind
+
+    def forbidden_layered(*args):
+        raise AssertionError("Mega must not construct Layered")
+
+    monkeypatch.setattr(runtime, "AsyncCAMLayeredExecutor", forbidden_layered)
+    monkeypatch.setattr(runtime, "AsyncCAMMegaExecutor", lambda *args, **kw: mega)
+    monkeypatch.setattr(
+        runtime, "expert_weight_signature", lambda layers, capacity: "weights"
+    )
+    runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
+    runner.__dict__.update(
+        model=model,
+        draft_model=None,
+        connector=connector,
+        requested_mode="eager",
+        _failure=None,
+        _layered_executor=None,
+        _mega_executor=None,
+        _first_step=False,
+        _graph=None,
+        _is_shutdown=False,
+        prof=None,
+        session=sys.modules["afd_plugin.connectors.base"].FFNExecutionSession(),
+    )
+    return SimpleNamespace(
+        runner=runner, connector=connector, peer=peers[0], fail_binding=fail_binding
+    )
+
+
+def test_mega_serves_without_constructing_layered(independent_mega_runner):
+    h = independent_mega_runner
+    h.runner.initialize_afd_connector()
+    assert h.connector.graph_startup.plan.signature == "native_mc2:weights"
+    assert h.runner.execute_connector_driven_step()
+    h.peer.check_failure()
+
+
+@pytest.mark.parametrize("mode", ["eager", "full"])
+def test_mega_binding_failure_reaches_peer_and_retains_resources(
+    independent_mega_runner, mode
+):
+    h = independent_mega_runner
+    h.runner.requested_mode = mode
+    h.fail_binding[0] = True
+    with pytest.raises(RuntimeError, match="communication binding failed"):
+        h.runner.initialize_afd_connector()
+    with pytest.raises(RuntimeError, match="communication binding failed"):
+        h.peer.check_failure()
+    with pytest.raises(RuntimeError, match="startup retains resources"):
+        h.runner.shutdown()
+    assert h.connector.is_initialized
 
 
 @pytest.mark.parametrize(
@@ -224,22 +320,19 @@ def test_removed_two_stream_options_are_rejected(modules, field):
         connector.AFDAsyncExtraInfo.from_mapping({field: True})
 
 
-@pytest.mark.parametrize(
-    "invalid,dbo_flag",
-    [
-        (False, None),
-        (False, "enable_dbo"),
-        (False, "use_ubatching"),
-        (True, None),
-    ],
-)
-def test_static_validation_precedes_hccl_creation(
-    modules, monkeypatch, invalid, dbo_flag
-):  # long-test: same startup boundary for valid and rejected configurations
+@pytest.mark.parametrize("mode", ["eager", "full"])
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+@pytest.mark.parametrize("tokens,tp", [(65535, 1), (65536, 1), (65536, 2), (131072, 2)])
+def test_full_row_bound_precedes_hccl_creation(
+    modules, monkeypatch, mode, role, tokens, tp
+):  # long-test: negotiated mode gates the same pre-HCCL boundary on both roles
     group, connector_module, _ = modules
     order = []
     store = MagicMock()
-    monkeypatch.setattr(group, "rendezvous", lambda *a, **k: iter([(store, 0, 2)]))
+    rank = 0 if role == "attention" else tp
+    monkeypatch.setattr(
+        group, "rendezvous", lambda *a, **k: iter([(store, rank, tp + 1)])
+    )
     monkeypatch.setattr(group, "PrefixStore", lambda *a: store)
     backend = SimpleNamespace(get_hccl_comm_name=lambda rank: "test")
     pg = MagicMock()
@@ -257,32 +350,30 @@ def test_static_validation_precedes_hccl_creation(
         _initialized=False,
         extra_info=connector_module.AFDAsyncExtraInfo(),
         afd_config=SimpleNamespace(host="localhost", port=1),
-        topology=SimpleNamespace(world_size=2),
-        world_rank=0,
-        attn_size=1,
+        topology=SimpleNamespace(world_size=tp + 1),
+        world_rank=rank,
+        attn_size=tp,
         ffn_size=1,
         hidden_size=32,
         topk=1,
         num_routed_experts=1,
         activation_dtype="bf16",
         dynamic_quant=1,
-        tp_size=1,
-        max_num_batched_tokens=8,
+        tp_size=tp,
+        max_num_batched_tokens=tokens,
         hccl_buffer_size_mb=256,
         local_rank=0,
         vllm_config=SimpleNamespace(
-            use_v2_model_runner=not invalid,
+            use_v2_model_runner=True,
             parallel_config=SimpleNamespace(enable_dbo=False, use_ubatching=False),
         ),
-        graph_startup=AsyncCAMGraphStartup(0, 1, 2),
+        graph_startup=AsyncCAMGraphStartup(rank, tp, tp + 1),
     )
     connector._session = connector_module.PushCAMSession(connector.activation_dtype)
-    if dbo_flag is not None:
-        setattr(connector.vllm_config.parallel_config, dbo_flag, True)
 
     def negotiate(store, signature):
         order.append("negotiate")
-        connector.graph_startup.mode = "full"
+        connector.graph_startup.mode = mode
 
     monkeypatch.setattr(connector.graph_startup, "initialize", negotiate)
     monkeypatch.setattr(
@@ -296,13 +387,72 @@ def test_static_validation_precedes_hccl_creation(
         "_run_attention_graph_startup",
         lambda: order.append("attention-warmup"),
     )
-    if invalid:
-        with pytest.raises(ValueError, match="MRV2"):
+    if mode == "full" and tokens // tp > 65535:
+        with pytest.raises(ValueError, match="uint16"):
             connector.init_afd_connector()
         assert order == ["negotiate", "failure"]
     else:
         connector.init_afd_connector()
-        assert order == ["negotiate", "validated", "hccl", "attention-warmup"]
+        expected = ["negotiate"]
+        if mode == "full":
+            expected.append("validated")
+        expected.append("hccl")
+        if mode == "full" and role == "attention":
+            expected.append("attention-warmup")
+        assert order == expected
+
+
+def test_executor_error_reaches_store_without_retrying_transport_loader(
+    modules, monkeypatch
+):  # long-test: real Store callback must publish the construction error before HCCL
+    group, _, _ = modules
+
+    def unavailable_transport_ops():
+        raise RuntimeError("transport loader retried")
+
+    monkeypatch.setattr(
+        sys.modules["afd_plugin.compat.npu.ops"],
+        "ensure_cam_async_ops_available",
+        unavailable_transport_ops,
+    )
+    module = load_host_module(monkeypatch, "afd_plugin.connectors.npu.async_cam")
+    config = npu_vllm_config(
+        role="ffn",
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+        extra_config={"dynamicQuant": 1},
+    )
+    config.model_config.dtype = "bf16"
+    connector = module.CAMAsyncAFDConnector(1, 0, config, parse_afd_config(config), 0)
+    connector.graph_startup.plan = FFNGraphPlan(
+        executor_error="unsupported compute operator"
+    )
+    store = MemoryStore()
+    nonce = "000000000000001"
+    store.set("ffn_graph/nonce", nonce)
+    store.set(
+        f"ffn_graph/{nonce}/plan/0",
+        json.dumps(
+            {
+                "transport": "wire",
+                "shared_errors": True,
+                "ffn": None,
+            }
+        ),
+    )
+    monkeypatch.setattr(group, "rendezvous", lambda *a, **k: iter([(store, 1, 2)]))
+    monkeypatch.setattr(group, "PrefixStore", lambda *args: store)
+
+    def unexpected_hccl(*args, **kwargs):
+        pytest.fail("invalid executor must fail before HCCL construction")
+
+    monkeypatch.setattr(group, "_new_process_group_helper", unexpected_hccl)
+    with pytest.raises(ValueError, match="unsupported compute operator"):
+        connector.init_afd_connector()
+    assert (
+        "unsupported compute operator" in store.get(f"ffn_graph/{nonce}/error").decode()
+    )
 
 
 @pytest.mark.parametrize(
@@ -321,13 +471,14 @@ def test_graph_dbo_keeps_existing_role_and_count_validation(
         role=role,
         connector="CAMAsyncAFDConnector",
         async_dp=True,
+        compute_gate_on_attention=True,
         num_ubatches=num_ubatches,
     )
     config.model_config.enforce_eager = role == "attention"
     setattr(config.parallel_config, native_flag, True)
     with pytest.raises(RuntimeError, match=error):
-        _fail_if_unsupported_npu_afd_async_features(
-            config, parse_afd_config(config), connector_module.AFDAsyncExtraInfo()
+        validate_npu_model_runner_v2_config(
+            config, expected_role=role, device_type="npu"
         )
 
 
@@ -409,8 +560,8 @@ def test_ffn_warmup_capture_order_and_failure_propagation(
         device="npu:0",
         model=SimpleNamespace(get_experts_layer_indices=lambda: (5, 2)),
         draft_model=None,
-        _initialize_layered_executor=lambda: None,
-        _layered_executor=SimpleNamespace(graph_signature=lambda capacity: "weights"),
+        _initialize_ffn_executor=lambda: "weights",
+        _layered_executor=None,
         _mega_executor=None,
         connector=SimpleNamespace(
             is_initialized=False,
@@ -484,13 +635,14 @@ def ffn_owners(modules, monkeypatch):
         "vllm_ascend.ascend_config",
         "vllm_ascend.cpu_binding",
         "vllm_ascend.worker.worker",
-        "afd_plugin.model_executor.models.model_utils",
     ):
         module = ModuleType(name)
         module.__dict__["__getattr__"] = lambda attr: MagicMock(name=attr)
         if name == "vllm_ascend.worker.worker":
             module.__dict__["NPUWorker"] = object
         monkeypatch.setitem(sys.modules, name, module)
+    load_host_module(monkeypatch, "afd_plugin.model_executor.models.model_utils")
+    load_host_module(monkeypatch, "afd_plugin.connectors.factory")
     sync_runtime = load_host_module(
         monkeypatch, "afd_plugin.v1.worker.npu.ffn_model_runner"
     )
@@ -498,13 +650,154 @@ def ffn_owners(modules, monkeypatch):
     return sync_runtime, async_runtime, worker
 
 
+@pytest.fixture(params=["attention", "ffn"])
+def npu_worker(request, ffn_owners, monkeypatch):
+    _, _, ffn_module = ffn_owners
+    role = request.param
+    events = []
+    if role == "attention":
+        runner_module = ModuleType("afd_plugin.v1.worker.npu.attention_model_runner_v2")
+        runner_module.__dict__["AFDNPUAttentionModelRunnerV2"] = lambda *args: (
+            events.append("runner")
+        )
+        monkeypatch.setitem(sys.modules, runner_module.__name__, runner_module)
+        module = load_host_module(
+            monkeypatch, "afd_plugin.v1.worker.npu.attention_worker"
+        )
+        worker_class = module.AFDNPUAttentionWorker
+    else:
+        module = ffn_module
+        worker_class = module.AFDNPUFFNWorker
+        monkeypatch.setattr(
+            module, "create_npu_ffn_model_runner", lambda *args: events.append("runner")
+        )
+        module.get_ascend_device_type.return_value = module.AscendDeviceType.A3
+    config = npu_vllm_config(
+        role=role,
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+        num_ffn_ranks=2,
+        data_parallel_size=2 if role == "ffn" else 1,
+        extra_config={"dynamicQuant": 1},
+        use_ubatching=role == "attention",
+        num_ubatches=2,
+        dbo_decode_token_threshold=2,
+        dbo_prefill_token_threshold=2,
+        worker_cls=(
+            "afd_plugin.v1.worker.npu.AFDNPUAttentionWorker"
+            if role == "attention"
+            else "afd_plugin.v1.worker.npu.AFDNPUFFNWorker"
+        ),
+        all2all_backend="native-default",
+    )
+    config.model_config.hf_config.model_type = "deepseek_v4"
+    config.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
+    worker = worker_class.__new__(worker_class)
+    worker.vllm_config = config
+    worker.model_config = config.model_config
+    harness = SimpleNamespace(
+        worker=worker, module=module, events=events, fail_ops=False
+    )
+
+    def initialize_device():
+        events.append("device")
+        return SimpleNamespace(type="npu", index=0)
+
+    def load_ops():
+        events.append("ops")
+        if harness.fail_ops:
+            raise RuntimeError("transport operators unavailable")
+
+    worker._init_device = initialize_device
+    monkeypatch.setattr(module, "ensure_cam_async_ops_available", load_ops)
+    monkeypatch.setattr(
+        module, "init_workspace_manager", lambda *args: events.append("workspace")
+    )
+    return harness
+
+
+@pytest.mark.parametrize(
+    "invalid,error",
+    [
+        ("v1", "requires ModelRunnerV2"),
+        ("pp", "does not support PP or CP"),
+        ("world", "ranks must match DP"),
+        ("ep", "static expert parallelism"),
+        ("quant", "dynamicQuant=1"),
+        ("experts", "experts divisible by FFN ranks"),
+    ],
+)
+def test_worker_rejects_deployment_before_device_initialization(
+    npu_worker, invalid, error
+):
+    config = npu_worker.worker.vllm_config
+    if invalid == "v1":
+        config.use_v2_model_runner = False
+    elif invalid == "pp":
+        config.parallel_config.pipeline_parallel_size = 2
+    elif invalid == "world":
+        config.parallel_config.data_parallel_size += 1
+    elif invalid == "ep":
+        config.parallel_config.enable_expert_parallel = False
+    elif invalid == "quant":
+        config.additional_config["afd"]["connector_extra_config"]["dynamicQuant"] = 2
+    else:
+        config.model_config.hf_config.n_routed_experts = 7
+    with pytest.raises((RuntimeError, ValueError), match=error):
+        npu_worker.worker.init_device()
+    assert npu_worker.events == []
+
+
+def test_worker_prepares_role_config_and_dbo_before_native_device(npu_worker):
+    worker = npu_worker.worker
+    worker.init_device()
+    assert npu_worker.events == ["device", "ops", "workspace", "runner"]
+    assert worker.model_config is worker.vllm_config.model_config
+    assert worker.model_config.hf_config.architectures == ["AFDDeepseekV4ForCausalLM"]
+    parallel = worker.vllm_config.parallel_config
+    assert parallel.enable_dbo == (worker.afd_expected_role == "attention")
+    assert parallel.all2all_backend == "flashinfer_all2allv"
+
+
+@pytest.mark.parametrize("npu_worker", ["attention"], indirect=True)
+def test_dbo_normalization_rechecks_threshold_before_device(npu_worker):
+    npu_worker.worker.vllm_config.parallel_config.dbo_decode_token_threshold = 1
+    with pytest.raises(ValueError, match="at least the number of microbatches"):
+        npu_worker.worker.init_device()
+    assert npu_worker.events == []
+
+
+def test_dspark_transport_dimensions_fail_before_device(npu_worker):
+    config = npu_worker.worker.vllm_config
+    config.parallel_config.use_ubatching = False
+    config.speculative_config = npu_dspark_config().speculative_config
+    config.speculative_config.draft_model_config.hf_text_config.hidden_size = 64
+    config.scheduler_config.max_num_seqs = 2
+    with pytest.raises(ValueError, match="transport hidden_size mismatch"):
+        npu_worker.worker.init_device()
+    assert npu_worker.events == []
+
+
+def test_missing_transport_operators_fail_before_workspace_or_runner(npu_worker):
+    npu_worker.fail_ops = True
+    with pytest.raises(RuntimeError, match="transport operators unavailable"):
+        npu_worker.worker.init_device()
+    assert npu_worker.events == ["device", "ops"]
+
+
+@pytest.mark.parametrize("npu_worker", ["ffn"], indirect=True)
+def test_ffn_device_capability_fails_before_workspace_or_runner(npu_worker):
+    npu_worker.module.get_ascend_device_type.return_value = object()
+    with pytest.raises(ValueError, match="requires Ascend 910C/A3"):
+        npu_worker.worker.init_device()
+    assert npu_worker.events == ["device"]
+
+
 @pytest.fixture
 def receiver_graph_worker(ffn_owners, monkeypatch):
     _, runtime, module = ffn_owners
     # Admission has its own tests; this host loader replaces connector bases.
-    monkeypatch.setattr(
-        runtime, "fail_if_unsupported_npu_afd_features", lambda *args, **kwargs: None
-    )
     config = npu_vllm_config(
         role="ffn",
         connector="CAMAsyncAFDConnector",
@@ -520,6 +813,7 @@ def receiver_graph_worker(ffn_owners, monkeypatch):
     )
     connector = SimpleNamespace(
         is_initialized=True,
+        graph_startup=SimpleNamespace(service_ready=lambda: None),
         ffn_session=sys.modules["afd_plugin.connectors.base"].FFNExecutionSession,
         close=lambda: None,
         recv_attn_output=lambda: SimpleNamespace(
@@ -536,37 +830,55 @@ def receiver_graph_worker(ffn_owners, monkeypatch):
         runtime.torch.npu, "graph", lambda *args, **kwargs: nullcontext()
     )
     runner._layered_executor = lambda hidden, *args, **kwargs: hidden
-    runner._initialize_graph(object())
+    runner._initialize_graph(runtime.torch.npu.Stream(device=runner.device))
     runner._capture_graph()
     shutdown = ModuleType("vllm.v1.worker.gpu.shutdown")
     shutdown.__dict__["free_before_shutdown"] = lambda config: None
     monkeypatch.setitem(sys.modules, shutdown.__name__, shutdown)
     worker = module.AFDNPUFFNWorker.__new__(module.AFDNPUFFNWorker)
     worker.model_runner = runner
+    worker.device = runner.device
     worker._ffn_thread = None
     worker._ffn_loop_error = None
     worker._cpu_binding_attempted = True
     return worker, weakref.ref(runner._graph)
 
 
-@pytest.mark.parametrize("fail", [False, True])
+def test_receiver_exit_prevents_further_graph_submission(receiver_graph_worker):
+    worker, _ = receiver_graph_worker
+    worker.model_runner.layer_ids = (2,)
+    worker.model_runner.mark_receiver_exited()
+    with pytest.raises(RuntimeError, match="not ready for replay"):
+        worker.model_runner.execute_connector_driven_step()
+
+
+@pytest.mark.parametrize("failure", [None, "serve", "drain", "finish", "pending"])
 def test_full_receiver_exit_releases_graph_only_after_success(
-    receiver_graph_worker, fail
+    receiver_graph_worker, failure
 ):
     worker, graph = receiver_graph_worker
+    runner = worker.model_runner
+    runner.session = sys.modules["tests.unit.fakes.connector"].FakeFFNSession(
+        serving=(False,),
+        requires_drain=True,
+        drain_error=RuntimeError("drain failed") if failure == "drain" else None,
+        finish_error=RuntimeError("finish failed") if failure == "finish" else None,
+    )
 
-    def serve():
-        worker._ffn_shutdown_event.set()
-        if fail:
+    def step(shutdown_requested):
+        if failure == "serve":
             raise RuntimeError("partial device completion")
+        if failure == "pending":
+            runner._submit_graph()
+        return False
 
-    worker._run_ffn_server_loop = serve
+    runner.execute_connector_driven_step = step
     worker.start_ffn_server_loop()
     thread: threading.Thread = worker._ffn_thread
     thread.join(timeout=3)
     assert not thread.is_alive()
     assert graph() is not None
-    if fail:
+    if failure:
         with pytest.raises(RuntimeError, match="FFN worker loop failed"):
             worker.stop_ffn_server_loop()
         assert graph() is not None
@@ -620,6 +932,22 @@ def test_worker_retains_resources_until_clean_exit(ffn_owners, state, requires_d
     assert timeouts == [60 if requires_drain else 5]
 
 
+@pytest.mark.parametrize(
+    "config,error",
+    [
+        (AFDConfig(role="invalid"), "AFD role"),
+        (AFDConfig(num_ffn_ranks=0), "num_ffn_ranks must be positive"),
+        (AFDConfig(port=0), "AFD port"),
+    ],
+)
+def test_connector_factory_validates_supplied_config_before_construction(
+    modules, monkeypatch, config, error
+):
+    factory = load_host_module(monkeypatch, "afd_plugin.connectors.factory")
+    with pytest.raises(ValueError, match=error):
+        factory.AFDConnectorFactory.create_connector(0, 0, object(), config)
+
+
 @pytest.mark.parametrize("async_connector", [False, True])
 def test_worker_selects_runner_for_connector(ffn_owners, monkeypatch, async_connector):
     _, _, worker = ffn_owners
@@ -629,31 +957,11 @@ def test_worker_selects_runner_for_connector(ffn_owners, monkeypatch, async_conn
     )
     monkeypatch.setattr(worker, "parse_afd_config", lambda *a, **k: parsed)
     monkeypatch.setattr(worker, "get_world_group", lambda: SimpleNamespace(rank=7))
-    monkeypatch.setattr(worker, "validate_npu_model_runner_v2_config", calls.validate)
     monkeypatch.setattr(worker.AFDConnectorFactory, "create_connector", calls.connector)
     monkeypatch.setattr(worker, "AFDNPUFFNModelRunner", calls.sync)
     monkeypatch.setattr(worker, "AsyncNPUFFNModelRunner", calls.asynchronous)
     selected = calls.asynchronous if async_connector else calls.sync
     assert worker.create_npu_ffn_model_runner(config, device) is selected.return_value
-
-
-def test_worker_rejects_v1_before_constructing_either_owner(ffn_owners, monkeypatch):
-    _, _, worker = ffn_owners
-
-    def reject(*args, **kwargs):
-        raise ValueError("requires MRV2")
-
-    monkeypatch.setattr(worker, "validate_npu_model_runner_v2_config", reject)
-
-    def unexpected(*args, **kwargs):
-        pytest.fail("rejected configuration must not create an owner or communicator")
-
-    monkeypatch.setattr(worker, "parse_afd_config", unexpected)
-    monkeypatch.setattr(worker.AFDConnectorFactory, "create_connector", unexpected)
-    monkeypatch.setattr(worker, "AFDNPUFFNModelRunner", unexpected)
-    monkeypatch.setattr(worker, "AsyncNPUFFNModelRunner", unexpected)
-    with pytest.raises(ValueError, match="MRV2"):
-        worker.create_npu_ffn_model_runner(object(), SimpleNamespace(type="npu"))
 
 
 @pytest.mark.parametrize("async_connector", [False, True])
@@ -664,8 +972,6 @@ def test_ffn_runner_loads_model_and_rejects_second_load(
     sync_runtime, async_runtime, _ = ffn_owners
     runtime = async_runtime if async_connector else sync_runtime
     calls = MagicMock()
-    monkeypatch.setattr(runtime, "validate_npu_model_runner_v2_config", calls.validate)
-    monkeypatch.setattr(runtime, "fail_if_unsupported_npu_afd_features", calls.validate)
     monkeypatch.setattr(runtime, "create_afd_npu_profiler", lambda role: None)
     connector = SimpleNamespace(
         ffn_session=sys.modules["afd_plugin.connectors.base"].FFNExecutionSession
@@ -871,14 +1177,12 @@ def test_runner_shutdown_retains_model_and_communication_on_unsafe_session(
     connector_world, monkeypatch, failure
 ):
     runtime = connector_world.runtime
-    runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
     connector = connector_world.connectors[2]
-    runner.connector = connector
-    runner.session = connector.ffn_session()
+    runner = runtime.AsyncNPUFFNModelRunner(
+        connector.vllm_config, SimpleNamespace(type="npu"), connector
+    )
     runner.model = model = object()
-    runner._failure = None
-    runner._is_shutdown = False
-    runner._graph_receiver_exited = True
+    runner.mark_receiver_exited()
     resource = connector.comm_args
     if failure != "unfinished":
         monkeypatch.setattr(

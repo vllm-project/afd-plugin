@@ -17,10 +17,12 @@ alignment.
   calls. Assert call order only when the order itself is the contract. Text
   assertions may cover artifacts, not production Python source.
 
-- **Reuse before adding.** Review affected coverage and extend nearby tests,
-  fixtures, or parameter tables before creating new tests. Add only meaningful
-  missing behavior or boundaries. Existing tests may be sufficient; explain
-  their coverage rather than adding a test for every helper, branch, or PR.
+- **Require independent, necessary coverage.** Add a test only if the Test Plan
+  names the observable failure, explains why existing cases miss it, and shows
+  why extending the closest case would leave the gap. Do not add tests for the
+  internals of test scripts. Propose a minimal host regression only for a known,
+  important acceptance failure that existing E2E and host integration cases
+  cannot reliably catch.
   Keep one behavior per test and combine repeated setup through shared helpers.
 
 - **Maintain coverage with the behavior.** Preserve effective coverage through

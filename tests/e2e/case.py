@@ -45,6 +45,8 @@ class Role:
     dbo: DboConfig | None = None
     vllm_args: tuple[str, ...] = ()
     additional_config: tuple[tuple[str, bool], ...] = ()
+    compilation_config: tuple[tuple[str, str | int | tuple[int, ...]], ...] = ()
+    data_parallel_rpc_port: int | None = None
 
     def __post_init__(self) -> None:
         if self.dp < 1 or self.tp < 1:
@@ -87,6 +89,7 @@ class Deployment:
     # Existing worker environment overrides take precedence over this default.
     worker_shutdown_timeout_s: int | None = None
     termination_timeout_s: float = DEFAULT_TERMINATION_TIMEOUT_S
+    prefill: Role | None = None
 
     @property
     def is_baseline(self) -> bool:
@@ -96,7 +99,8 @@ class Deployment:
     def roles(self) -> tuple[tuple[str, Role], ...]:
         if self.ffn is None:
             return ((BASELINE_ROLE, self.attention),)
-        return ((ATTENTION_ROLE, self.attention), (FFN_ROLE, self.ffn))
+        roles = ((ATTENTION_ROLE, self.attention), (FFN_ROLE, self.ffn))
+        return roles + (("prefill", self.prefill),) if self.prefill else roles
 
     def dbo_for_role(self, role: str) -> DboConfig | None:
         """A role's DBO overrides the deployment default; None inherits it."""
@@ -191,6 +195,8 @@ class Case:
     phases: tuple[Phase, ...]
     served_model_name_prefix: str
     common_vllm_args: tuple[str, ...] = ()
+    worker_extension: str | None = None
+    worker_environment: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.id or not self.phases:

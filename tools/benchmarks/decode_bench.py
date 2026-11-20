@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-KVCacheLayer = torch.Tensor | tuple[torch.Tensor, ...]
+KVCacheLayer: TypeAlias = torch.Tensor | tuple[torch.Tensor, ...]
 
 
 @dataclass

@@ -17,6 +17,11 @@ def load_host_module(monkeypatch, name):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)
+    parent_name, _, child_name = name.rpartition(".")
+    parent = sys.modules.get(parent_name)
+    if parent is not None:
+        # A cached package attribute otherwise keeps the previous module alive.
+        monkeypatch.setitem(vars(parent), child_name, module)
     return module
 
 
@@ -39,10 +44,13 @@ def load_async_modules(monkeypatch):
         "vllm.distributed",
         "vllm.utils.torch_utils",
         "vllm_ascend.utils",
+        "vllm.v1.worker.gpu.shutdown",
         "afd_plugin.compat.npu.ops",
         "afd_plugin.compat.npu.forward_context",
         "afd_plugin.compat.npu.profiler",
         "afd_plugin.connectors.npu.async_cam_runtime.async_cam_layered",
+        "afd_plugin.connectors.npu.async_cam_runtime.async_cam_mega",
+        "afd_plugin.model_executor.ffn.npu.expert_weights",
         "afd_plugin.v1.worker.ffn_metadata",
     ):
         stub(name)

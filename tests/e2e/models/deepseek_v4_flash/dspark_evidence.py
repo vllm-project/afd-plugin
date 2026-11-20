@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -30,6 +31,12 @@ if TYPE_CHECKING:
 
 def snapshot(runner) -> dict:
     is_ffn = isinstance(runner, AsyncNPUFFNModelRunner)
+    executor = None
+    execution = "uninitialized"
+    if is_ffn:
+        executor = runner._mega_executor or runner._layered_executor
+        if executor is not None:
+            execution = "mega" if runner._mega_executor is not None else "layered"
     draft = runner.draft_model if is_ffn else runner.speculator.model
     if draft is None:
         return {
@@ -50,6 +57,37 @@ def snapshot(runner) -> dict:
             for gid in runner.speculator.draft_kv_cache_group_ids
         ]
     return {
+        "pid": os.getpid(),
+        "runtime": {
+            "executable": sys.executable,
+            "prefix": sys.prefix,
+            "base_prefix": sys.base_prefix,
+            "version": sys.version,
+            "sys_path": [str(path) for path in sys.path],
+            "modules": {
+                name: str(Path(origin).resolve())
+                for name in (
+                    "afd_plugin",
+                    "numpy",
+                    "safetensors",
+                    "tokenizers",
+                    "torch",
+                    "torch_npu",
+                    "transformers",
+                    "vllm",
+                    "vllm_ascend",
+                )
+                if (module := sys.modules.get(name)) is not None
+                and (origin := getattr(module, "__file__", None))
+            },
+        },
+        "native_maps": sorted(
+            {
+                line.split()[-1]
+                for line in Path("/proc/self/maps").read_text().splitlines()
+                if "afd_plugin" in line and ".so" in line
+            }
+        ),
         "rank": runner.connector.world_rank,
         "role": "ffn" if is_ffn else "attention",
         "draft_class": type(draft).__name__,
@@ -61,11 +99,9 @@ def snapshot(runner) -> dict:
         "draft_kv_groups": kv_groups,
         **(
             {
-                "ffn_execution": "layered"
-                if runner._layered_executor is not None
-                else "uninitialized",
-                "executor_layer_ids": list(runner._layered_executor.layer_ids)
-                if runner._layered_executor is not None
+                "ffn_execution": execution,
+                "executor_layer_ids": list(executor.layer_ids)
+                if executor is not None
                 else [],
                 "ffn_mode": runner.effective_mode,
                 "graph_capture_count": runner._graph_capture_count,

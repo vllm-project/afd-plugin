@@ -52,12 +52,6 @@ def config():
 def harness(monkeypatch):
     # These CPU tensor tests exercise execution/loading, while the configuration
     # and real-device contracts validate admission separately.
-    monkeypatch.setattr(
-        runtime, "validate_npu_model_runner_v2_config", lambda *a, **k: None
-    )
-    monkeypatch.setattr(
-        runtime, "fail_if_unsupported_npu_afd_features", lambda *a, **k: None
-    )
     cfg = config()
     connector = CAMAsyncAFDConnector(
         2,
@@ -140,7 +134,7 @@ def test_eager_preserves_layer_loop_device_metadata_and_return_headers(harness):
     first.context.states.group_list = torch.tensor([1, 2])
     first.context.states.dynamic_scales = torch.arange(1, 9, dtype=torch.float32)
 
-    def execute(hidden, scales, groups, header):
+    def execute(hidden, scales, groups, header, *, retained_tensors=None):
         # Toy experts have gains 1/2 and layer gain equal to the layer ID.
         # Only the sent result is asserted; this does not simulate CANN.
         gains = torch.repeat_interleave(torch.tensor([1.0, 2.0]), groups)
@@ -187,7 +181,7 @@ def test_full_receiver_exit_requires_success_even_during_shutdown(harness, fail)
     assert isinstance(worker._ffn_thread, threading.Thread)
     worker._ffn_thread.join(3)
     assert not worker._ffn_thread.is_alive()
-    assert harness.runner._graph_receiver_exited is not fail
+    assert harness.runner.receiver_exited is not fail
     assert (worker._ffn_loop_error is not None) is fail
 
 
@@ -198,7 +192,9 @@ def test_drain_propagates_session_result(harness, monkeypatch, drains):
         transactions=1,
         drain_error=None if drains else RuntimeError("retain resources"),
     )
-    h.runner._layered_executor = lambda hidden, *_args: hidden.to(torch.bfloat16)
+    h.runner._layered_executor = lambda hidden, *_args, **_kwargs: hidden.to(
+        torch.bfloat16
+    )
     request = payload(5, 3)
     h.payloads.append(request)
     monkeypatch.setattr(torch.npu, "synchronize", lambda: None)

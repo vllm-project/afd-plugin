@@ -30,6 +30,10 @@ import torch.nn as nn
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
+    DeepseekV4FlashInferMLAAttention,
+    DeepseekV4FlashInferSM120Attention,
+)
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -42,7 +46,7 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 from vllm.v1.worker.utils import AttentionGroup
 from vllm.v1.worker.workspace import WorkspaceManager, current_workspace_manager
 
-from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
+from afd_plugin.forward_context import get_afd_metadata_from_forward_context
 
 if TYPE_CHECKING:
     from afd_plugin.v1.worker.attention_model_runner_v2 import AFDAttentionModelRunnerV2
@@ -313,26 +317,71 @@ def _reserve_flashmla_ubatch_workspace(model: nn.Module, config: VllmConfig) -> 
                     layer.forward_mqa(q, kv, positions, output)
 
 
-# Patch reason: native V4 attention asserts on a padding-only decode stage
-# because no tile scheduler exists for zero actual tokens (vLLM 5df63a7,
-# vllm/models/deepseek_v4/nvidia/flashmla.py, forward_mqa/_forward_decode).
-# Patch functionality: retain the existing AFD stage-extent guard while the
-# decoder continues its mHC and remote FFN protocol. This call adapter takes the
-# attention instance explicitly; it does not replace a native method signature.
-# Removal: #63823 is related FULL-graph work, not an eager consumer fix. Remove
-# when native attention supports zero-token padded stages in the supported modes.
-def forward_v4_attention(
-    attention: DeepseekV4Attention,
-    positions: torch.Tensor,
-    hidden_states: torch.Tensor,
-) -> torch.Tensor:
-    # ### PATCH START: preserve padded-stage protocol with zero attention.
-    afd_metadata = get_afd_metadata_from_forward_context()
-    if (
-        afd_metadata is not None
-        and afd_metadata.num_stages > 1
-        and afd_metadata.tokens_unpadded_lens == [0]
-    ):
-        return torch.zeros_like(hidden_states)
-    # ### PATCH END: preserve padded-stage protocol with zero attention.
-    return attention(positions, hidden_states, None)
+class _PaddingStageGuard(DeepseekV4Attention):
+    """Skip native V4 attention on a padding-only AFD DBO stage."""
+
+    # Patch reason: native V4 attention asserts on a padding-only decode stage
+    # because no tile scheduler exists for zero actual tokens (vLLM 5df63a7,
+    # vllm/models/deepseek_v4/nvidia/flashmla.py, forward_mqa/_forward_decode).
+    # Patch functionality: return zero attention output for that stage, so the
+    # native decoder layer still runs its mHC and remote FFN steps. Graph
+    # capture keeps full attention because native dummy inputs give every
+    # stage a positive real extent.
+    # Signature: matches DeepseekV4Attention.forward at vLLM 5df63a7,
+    # vllm/models/deepseek_v4/attention.py; no added parameters.
+    # Delegation: other stages call the native forward through super() instead
+    # of a copy. A copy would bring back the duplicated upstream code that #599
+    # removed from the decoder layer.
+    # Removal: #63823 is related FULL-graph work, not an eager consumer fix.
+    # Remove when native attention supports zero-token padded stages in the
+    # supported modes.
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        llama_4_scaling: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # ### PATCH START: preserve padded-stage protocol with zero attention.
+        afd_metadata = get_afd_metadata_from_forward_context()
+        if (
+            afd_metadata is not None
+            and afd_metadata.num_stages > 1
+            and afd_metadata.tokens_unpadded_lens == [0]
+        ):
+            return torch.zeros_like(hidden_states)
+        # ### PATCH END: preserve padded-stage protocol with zero attention.
+        return super().forward(positions, hidden_states, llama_4_scaling)
+
+
+# One subclass per class that vLLM 5df63a7's _select_dsv4_attn_cls can return
+# (vllm/models/deepseek_v4/nvidia/model.py). Subclasses keep the native weight
+# names, backend and isinstance checks.
+class AFDDeepseekV4FlashMLAAttention(_PaddingStageGuard, DeepseekV4FlashMLAAttention):
+    """FlashMLA V4 attention with the AFD padding-stage guard."""
+
+
+class AFDDeepseekV4FlashInferMLAAttention(
+    _PaddingStageGuard, DeepseekV4FlashInferMLAAttention
+):
+    """FlashInfer MLA V4 attention with the AFD padding-stage guard."""
+
+
+class AFDDeepseekV4FlashInferSM120Attention(
+    _PaddingStageGuard, DeepseekV4FlashInferSM120Attention
+):
+    """FlashInfer SM120 V4 attention with the AFD padding-stage guard."""
+
+
+def afd_v4_attention_cls(
+    native_cls: type[DeepseekV4Attention],
+) -> type[DeepseekV4Attention]:
+    """Return the AFD subclass of the V4 attention class that vLLM selected."""
+    if native_cls is DeepseekV4FlashMLAAttention:
+        return AFDDeepseekV4FlashMLAAttention
+    if native_cls is DeepseekV4FlashInferMLAAttention:
+        return AFDDeepseekV4FlashInferMLAAttention
+    if native_cls is DeepseekV4FlashInferSM120Attention:
+        return AFDDeepseekV4FlashInferSM120Attention
+    raise ValueError(
+        f"AFD DeepSeek-V4 has no padding-stage guard for {native_cls.__name__}"
+    )

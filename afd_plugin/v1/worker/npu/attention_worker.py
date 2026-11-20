@@ -16,7 +16,9 @@ from afd_plugin.compat.npu import (
     fix_all2all_backend_for_afd,
     npu_afd_num_ubatches,
 )
+from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.compat.npu.runtime_config import configure_async_cam_dbo
+from afd_plugin.config import AFD_ASYNC_CONNECTOR
 from afd_plugin.model_executor.models.model_utils import (
     configure_afd_dspark,
     get_afd_model_config,
@@ -41,14 +43,13 @@ class AFDNPUAttentionWorker(NPUWorker):
         super().__init__(*args, **kwargs)
 
     def init_device(self) -> None:
-        assert_compatible_afd_stack(
+        afd_config = assert_compatible_afd_stack(
             self.vllm_config,
             caller="AFDNPUAttentionWorker.init_device",
             expected_role="attention",
             expected_worker_qualname_override=NPU_ATTENTION_WORKER_FQCN,
         )
         configure_async_cam_dbo(self.vllm_config)
-        fail_if_unsupported_npu_afd_features(self.vllm_config)
         fix_all2all_backend_for_afd(self.vllm_config)
         validate_npu_model_runner_v2_config(
             self.vllm_config,
@@ -56,19 +57,22 @@ class AFDNPUAttentionWorker(NPUWorker):
             device_type="npu",
         )
 
-        self.device = self._init_device()
-        # Match native bd42eea: FLA capability queries use the selected device
-        # and registration completes before the model runner is constructed.
-        register_ascend_fla_customop()
-        init_workspace_manager(
-            self.device,
-            npu_afd_num_ubatches(self.vllm_config),
-        )
-        self.vllm_config.model_config = get_afd_model_config(
+        fail_if_unsupported_npu_afd_features(self.vllm_config, afd_config=afd_config)
+        self.model_config = self.vllm_config.model_config = get_afd_model_config(
             self.vllm_config.model_config,
             device_type="npu",
         )
         configure_afd_dspark(self.vllm_config)
+
+        self.device = self._init_device()
+        # FLA registration needs the selected device, before Runner construction.
+        register_ascend_fla_customop()
+        if afd_config.connector == AFD_ASYNC_CONNECTOR:
+            ensure_cam_async_ops_available()
+        init_workspace_manager(
+            self.device,
+            npu_afd_num_ubatches(self.vllm_config),
+        )
         self.model_runner = AFDNPUAttentionModelRunnerV2(
             self.vllm_config,
             self.device,

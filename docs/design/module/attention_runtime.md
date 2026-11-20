@@ -12,7 +12,7 @@ primary_code_paths:
   - "afd_plugin/v1/worker/npu/attention_model_runner_v2.py"
   - "afd_plugin/v1/worker/npu/attention_worker.py"
   - "afd_plugin/v1/worker/npu/dspark_speculator.py"
-  - "afd_plugin/v1/worker/npu/dspark_graph.py"
+  - "afd_plugin/v1/worker/npu/attention_metadata.py"
 related_code_paths:
   - "afd_plugin/connectors/**"
   - "afd_plugin/model_executor/**"
@@ -24,14 +24,15 @@ depends_on:
   - "execution_platforms.md"
   - "compatibility_and_patches.md"
 validation_paths:
-  - "tests/unit/v1/worker/npu/test_dspark_graph.py"
+  - "tests/unit/v1/worker/npu/test_dspark_speculator.py"
   - "tests/unit/v1/worker/test_attention_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
   - "tests/unit/v1/worker/test_npu_model_runner_v2.py"
   - "tests/unit/v1/worker/npu/test_ubatch_runner.py"
   - "tests/unit/v1/worker/npu/test_attention_model_runner_v2.py"
-  - "tests/unit/model_executor/test_async_cam_dbo.py"
+  - "tests/unit/v1/worker/npu/test_attention_metadata.py"
+  - "tests/unit/connectors/npu/async_cam_runtime/test_async_cam_dbo.py"
   - "tests/npu/test_mrv2_dbo.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v4_flash/test_gpu.py"
@@ -137,8 +138,11 @@ coordination state. It closes the connector and profiler during shutdown.
 CUDA overrides the native `Worker._make_model_runner()` factory to construct
 `AFDAttentionModelRunnerV2` and requires the upstream `use_v2_model_runner`
 setting; there is no GPU V1 fallback. NPU applies the
-AFD-scoped vLLM-Ascend patches, fixes the all-to-all backend when required, initializes
-the vLLM workspace manager, and directly constructs the NPU V2 runner. Their exact inheritance and device mechanisms are specified in
+AFD-scoped vLLM-Ascend patches. Its Worker normalizes DBO/backend, admits
+common and additional feature constraints, and selects target/draft model
+configuration before device allocation. It checks device capabilities before
+workspace and Runner construction. The Runner consumes that admission instead
+of repeating it. Exact inheritance and device mechanisms are specified in
 [execution platforms](execution_platforms.md).
 
 ## ModelRunnerV2 boundary
@@ -318,9 +322,8 @@ Enable vLLM native DBO with `--enable-dbo` on Attention. It:
 
 Native DBO owns request/token boundaries. Enable DBO on Attention only; Async FFN rejects native DBO flags and
 continues its receive loop.
-`models/npu/async_cam_layout.py` retains only communication layout
-conversion, and `models/npu/async_cam_dbo.py` supplies the single-window receive
-hook. FlashComm1/SP is Attention-local and
+`connectors/npu/async_cam_runtime/async_cam_layout.py` owns CAM layout conversion;
+`async_cam_dbo.py` owns the single-window receive hook, shared by the model adapters. FlashComm1/SP is Attention-local and
 FFN topology validation is independent. See the CAM async user guide for the
 supported topology and environment matrix.
 

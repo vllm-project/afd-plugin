@@ -424,9 +424,9 @@ def test_plan_stage_bucket_does_not_depend_on_the_rank_s_mode(tokens):
     """A step planned as graph on one rank and eager on another gets the same
     bucket, both on the ladder (8 tokens) and above it (40).
 
-    Why: an FFN eager fallback can plan a step Attention replays in another
-    mode, and DeepEP needs the same bucket on every rank; a capacity bucket
-    chosen by the sync decision broke test_graph_and_eager_plans_mixed_across_ranks.
+    Why: DeepEP needs the same bucket on every rank whatever mode a rank plans
+    the step in; a capacity bucket chosen by the sync decision once broke
+    ranks that planned the same step in different modes.
     """
     buckets = {
         plan_stage(

@@ -3,7 +3,9 @@
 # Runs seven Qwen3 MoE and Qwen3.6 MoE scenarios, including Qwen3 MoE
 # graph+DBO on V2, plus a
 # DeepSeek-V2-Lite 2A1F graph+DBO scenario, with the default GSM8K sample
-# limit (see e2e_testing.md).
+# limit (see e2e_testing.md). DeepEPM2NAFDConnector adds its device tests and
+# the Qwen3 MoE 2A2F graph+DBO scenario; they keep their kernel JIT caches on
+# the node (m2n-test-env.sh).
 steps:
   - label: "E2E · Qwen3 MoE · GPU V2"
     timeout_in_minutes: 60
@@ -35,4 +37,21 @@ steps:
       - >-
         pytest -sv
         "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py::test_deepseek_v2_lite[afd-graph-dbo-2a1f]"
+    mirror_hardwares: h100_4
+
+  - label: "GPU · DeepEP M2N device tests"
+    timeout_in_minutes: 50
+    commands:
+      - ". .buildkite/cuda/scripts/m2n-test-env.sh"
+      - "pytest -sv -m gpu tests/gpu/test_deepep_m2n_gpu.py"
+    mirror_hardwares: h100_4
+
+  - label: "E2E · Qwen3 MoE · DeepEP M2N 2A2F DBO Graph · GPU V2"
+    timeout_in_minutes: 40
+    commands:
+      - ". .buildkite/cuda/scripts/m2n-test-env.sh"
+      - "export AFD_E2E_BACKEND=gpu"
+      - >-
+        pytest -sv
+        "tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe_deepep_m2n[afd-deepep-m2n-graph-dbo-2a2f]"
     mirror_hardwares: h100_4

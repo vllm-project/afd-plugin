@@ -31,6 +31,8 @@ depends_on:
 validation_paths:
   - "tests/unit/ffn_faas/test_*.py"
   - "tests/unit/connectors/npu/async_cam_runtime/test_async_cam_layered.py"
+  - "tests/unit/v1/worker/test_async_ffn_runtime.py"
+  - "tests/unit/v1/worker/test_async_ffn_graph.py"
   - "tests/npu/test_async_cam_layered_w8a8.py"
   - "tests/unit/v1/worker/test_ffn_metadata.py"
   - "tests/unit/v1/worker/test_ffn_model_runner.py"
@@ -148,7 +150,7 @@ and CAM runtime composition live under `ffn_faas/platforms/npu/`.
 communication, computation and Graph execution to the Async CAM
 runtime. A shared cross-platform, cross-connector Step Loop and a pure
 `compute(item)` backend are not implemented. The runtime consumes the existing
-`LayeredFFNWeights` interface with W4A8 weights, without per-step model selection;
+`QuantizedExpertWeights` contract with W4A8 weights, without per-step model selection;
 there is no
 separate V4 execution runtime.
 
@@ -234,8 +236,9 @@ does not adopt native V2 request state or scheduler-driven execution:
 - Ascend constructs `AFDNPUFFNModelRunner` for CAMP2P or
   `AsyncNPUFFNModelRunner` for Async CAM. Both use the native MRV2
   forward-context shape and install Ascend state in `additional_kwargs`.
-- Both workers run the same V2 topology and feature validator as the paired
-  Attention role before constructing communication resources.
+- Both roles admit V2 topology and features in their Workers before device
+  initialization. Runner constructors consume that admission without repeating it;
+  communication resources are initialized after model loading.
 
 The V2 pair requires PP/PCP/DCP size 1, configured role ranks equal to DP x TP,
 static EP, and a registered AFD model. CUDA uses `P2pNcclAFDConnector` with
@@ -327,6 +330,43 @@ weights fail startup rather than selecting another FFN path. Worker-level
 synchronization remains after a work-item group. The `swiglu_limit` behavior
 and validation scope are documented in the
 [CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#w4a8-and-w8a8-layered-gmm).
+
+## Async compute ownership
+
+Eager execution and FULL capture share `_run_ffn_transaction()` inside
+`AsyncNPUFFNModelRunner`: Layered receives, computes and sends; Mega runs its
+fused transaction. Capture retains inputs and outputs before subsequent work
+can fail. Session completion stays outside this body: eager calls `after_step()`
+before the worker fence; FULL fences before `after_step()` and clearing pending.
+
+After drain and `finish_receiver()` succeed, the worker calls
+`mark_receiver_exited()`. The runner rejects the notification while graph
+work is pending or failed; `receiver_exited` exposes the existing state for
+diagnostics. A failed finish never authorizes graph/model/connector release.
+The exit notification rejects pending work and later submissions reject an
+exited receiver, so graph close only needs the established exit condition,
+not another pending check. FULL validates the Session before graph reset;
+eager delegates that check to connector close. Connector close keeps its own
+resource-release validation for independent shutdown callers.
+
+The Async runner loads target/draft `QuantizedExpertWeights` through the model
+export contract, verifies layer coverage and selects Layered or Mega directly.
+`model_executor/ffn/npu/expert_weights.py` owns shared shape validation, logical
+geometry and graph signatures. Selected compute construction validates the
+actual tensor table once; signature serialization does not validate it again.
+Declared target/draft layer coverage remains a separate Runner check.
+`connectors/npu/async_cam_runtime/async_cam_layered.py` and `async_cam_mega.py`
+own native operator handles,
+workspace, zero bias and layer maps. There is no execution layer beneath the
+ModelRunner and no access to private model parameters from compute.
+
+Mega consumes the exported tensors independently of Layered. It prepares its
+workspace before startup negotiation and binds live `comm_args` and the group
+name after connector initialization, before warmup/capture. Binding failures
+are published through Startup and retain resources. Negotiation preserves the
+existing signature format, including `native_mc2:` and the W8A8 zero-bias layout;
+W8A8 Mega does not allocate Layered's unused zero bias. Eager/FULL transaction,
+graph and shutdown orchestration remain runner-owned.
 
 ## Control-plane-driven forward
 

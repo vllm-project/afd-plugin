@@ -35,7 +35,7 @@ validation_paths:
   - "tests/unit/v1/worker/test_npu_mla_graph.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
   - "tests/unit/v1/worker/test_npu_model_runner_v2.py"
-  - "tests/unit/model_executor/test_async_cam_dbo.py"
+  - "tests/unit/connectors/npu/async_cam_runtime/test_async_cam_dbo.py"
   - "tests/npu/**"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v4_flash/test_gpu.py"
@@ -97,6 +97,16 @@ the graph policy helper; importing a CUDA or Ascend runtime module requires
 the corresponding runtime stack.
 
 ## Backend execution session
+
+CUDA and NPU Workers admit their effective deployment before native device
+initialization. NPU normalizes DBO/backend first, then checks common deployment
+rules and additional Ascend feature constraints. Runner constructors and the
+NPU selection factory consume this admission. CUDA FFN receives the existing
+`AFDCUDAGraphPolicy` through its Worker factory instead of resolving it again.
+CUDA and NPU share PP/CP and role-world rules; connector, DBO and graph policies
+remain scoped to their backend.
+Changes to validation placement follow the
+[ownership and coverage rules](plugin_boundary.md#adding-or-moving-a-check).
 
 Connectors expose `attention_step()` and a backend-owned `FFNExecutionSession`.
 The Async FFN runner and worker use its service predicate, first-step hook,
@@ -216,13 +226,20 @@ is a fallback trace directory.
 NPU workers apply AFD-scoped vLLM-Ascend compatibility patches before
 upstream construction. During device initialization they:
 
-1. validate Ascend-specific feature combinations;
-2. apply the non-sequence-parallel all-to-all backend correction when needed,
-   including legacy explicit-worker launches;
-3. require ModelRunnerV2 and validate the connector's role-specific execution mode;
-4. call `NPUWorker._init_device()`;
-5. initialize the vLLM workspace manager for one or two ubatches;
-6. construct `AFDNPUAttentionModelRunnerV2` or the connector-driven FFN runner.
+1. validate the selected Worker/role wiring and, on Attention, normalize
+   Async CAM DBO;
+2. apply the non-sequence-parallel all2all backend correction when needed;
+3. admit the common MRV2/topology/execution contract, then additional features;
+4. select the target AFD model config and configure DSpark draft/transport
+   dimensions, updating both Worker and `VllmConfig` model references;
+5. call `NPUWorker._init_device()` and complete device-dependent FLA registration;
+6. for Async CAM, admit transport operators on both roles and A3/910C on FFN;
+7. initialize workspace and construct the Attention or connector-driven FFN Runner.
+
+Config-based errors precede native device initialization; capability failures
+precede workspace and weight loading. Later compute-operator/workspace failures
+are still published through the existing FFN startup plan. Connector
+initialization does not repeat the transport-op loader before Store publication.
 
 The all-to-all correction selects `flashinfer_all2allv` when sequence
 parallelism is disabled. Automatic worker selection receives the matching

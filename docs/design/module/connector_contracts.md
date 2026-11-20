@@ -59,12 +59,17 @@ Connectors consume common configuration and platform operations. Attention,
 FFN, and model integration consume connector contracts; connector code must not
 depend on role worker implementations.
 
+Async CAM's `npu/async_cam_runtime/` package owns startup, Push/Pull sessions,
+FFN executors, and Attention-side DBO handoff and TP/SP payload conversion.
+Model adapters choose sequence-parallel behavior and call the boundary helpers;
+native vLLM DBO retains scheduling and microbatch ownership.
+
 ## Implementation evidence
 
 | Area | Source | Focused validation |
 | --- | --- | --- |
 | Base surface and lazy factory | [`base.py`](../../../afd_plugin/connectors/base.py), [`factory.py`](../../../afd_plugin/connectors/factory.py) | [P2P factory and construction tests](../../../tests/unit/connectors/test_p2p_connector.py), [metadata contracts](../../../tests/unit/connectors/test_metadata.py) |
-| Payloads and control-plane codec | [`metadata.py`](../../../afd_plugin/connectors/metadata.py) | Connector unit tests and [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
+| Payloads and control-plane codec | [`metadata.py`](../../../afd_plugin/connectors/metadata.py) | Connector unit tests and [`test_forward_context.py`](../../../tests/unit/test_forward_context.py) |
 | CUDA P2P | [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py), [`topology.py`](../../../afd_plugin/distributed/topology.py) | [`test_p2p_connector.py`](../../../tests/unit/connectors/test_p2p_connector.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) |
 | CUDA DeepEP M2N | [`gpu/deepep_m2n/`](../../../afd_plugin/connectors/gpu/deepep_m2n/), `AFDRoutedExpertsConnector` in [`base.py`](../../../afd_plugin/connectors/base.py) | [`test_deepep_m2n_connector.py`](../../../tests/unit/connectors/test_deepep_m2n_connector.py), [GPU device tests](../../../tests/gpu/README.md), [Qwen3 MoE E2E](../../../tests/e2e/models/qwen3_moe/test_qwen3_moe.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) (`test_deepseek_v2_lite_deepep_m2n`) |
 | Ascend CAMP2P | [`npu/camp2p/connector.py`](../../../afd_plugin/connectors/npu/camp2p/connector.py) | [`test_camp2p_connector.py`](../../../tests/unit/connectors/test_camp2p_connector.py), [`test_camp2p_token_ids.py`](../../../tests/unit/connectors/test_camp2p_token_ids.py), [`test_external_routing.py`](../../../tests/unit/connectors/test_external_routing.py), [DeepSeek-V2-Lite E2E](../../../tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py) |
@@ -331,6 +336,17 @@ stage and separate FFN receive/send calls. Pull owns one in-flight window across
 stages, native publish/combine, status/idle/source state and quiet/drain/stopped.
 Mega's fused FFN operation owns its receive/compute/send transaction; the public
 FFN receive/send methods reject Pull use.
+
+Worker admission owns role DP x TP and static expert divisibility. The
+connector maps actual role/world ranks after that admission; the factory
+validates explicitly supplied `AFDConfig` before construction. Feature admission
+owns Attention TP matching and Push/Pull dispatch envelopes. FULL transport
+agreement supplies the common envelope/TP, so Startup adds only the uint16
+source-row bound and retains its existing validated barrier. Local MRV2 and
+static capacity checks are not repeated during negotiation. Payloads, FIFO
+order and Pull status still need their own changing-state checks.
+Follow the [validation placement rules](plugin_boundary.md#adding-or-moving-a-check)
+when changing checks at these boundaries.
 
 The four public transfer methods still enter through the connector. The existing
 `AFDAsyncTransferState` definition stays at its original import path;

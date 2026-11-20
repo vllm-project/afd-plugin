@@ -16,7 +16,7 @@ def test_resource_uses_adapter_routed_layers_and_loading_estimate(tmp_path):
     assert model.get_experts_layer_indices() == (2, 7)
     assert model.parameter_bytes == 2048
     with pytest.raises(RuntimeError, match="not been loaded"):
-        model.get_async_cam_layered_weights()
+        model.get_quantized_expert_weights()
     with pytest.raises(RuntimeError, match="not finished loading"):
         _ = model.native_owner
     model.close()
