@@ -20,6 +20,7 @@ class SplitLayout:
     top_k: int
     prefetch: bool = False
     combine_quant_mode: int = 0
+    is_attention: bool = True
 
     def __post_init__(self):
         if (self.attention_ranks < 1 or self.moe_ranks < 1 or self.world_size > 768 or
@@ -46,12 +47,17 @@ class SplitLayout:
         result_bytes = self.hidden * 2
         if self.combine_quant_mode:
             result_bytes = align(align(self.hidden, 256) + align((self.hidden + 31) // 32, 2), 32)
-        return (
+        prefix = (
             ("exception", 60 * 1024),
             ("control", 60 * 1024),
-            ("routes", align(self.local_experts * self.world_size * route_stride, 512)),
-            ("route_task_meta", align(self.world_size * 64, 512)),
-            ("counts", align(self.local_experts * self.world_size * 4, 512)),
+        )
+        if not self.is_attention:
+            return prefix + (
+                ("routes", align(self.local_experts * self.attention_ranks * route_stride, 512)),
+                ("route_task_meta", align(self.attention_ranks * 64, 512)),
+                ("counts", align(self.local_experts * self.attention_ranks * 4, 512)),
+            )
+        return prefix + (
             ("inputs", align(self.capacity * record_bytes, 512)),
             ("results", align(self.capacity * self.top_k * result_bytes, 512)),
         )

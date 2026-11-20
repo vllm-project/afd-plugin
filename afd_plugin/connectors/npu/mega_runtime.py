@@ -45,6 +45,7 @@ class SplitBuffer:
         activation_submode=0,
         activation_parameters=(3.4028234663852886e38, 1.702, 1.0),
     ):
+        self.rank = distributed.get_rank(group)
         self.layout = SplitLayout(
             attention_ranks,
             moe_ranks,
@@ -54,6 +55,7 @@ class SplitBuffer:
             top_k,
             prefetch,
             combine_quant_mode,
+            is_attention=self.rank < attention_ranks,
         )
         if (
             attention_ranks < 1
@@ -77,7 +79,6 @@ class SplitBuffer:
         ):
             raise ValueError("Invalid intermediate width or shared expert count")
         self.group = group
-        self.rank = distributed.get_rank(group)
         self.shared_experts = shared_experts
         self.activation_parameters = list(activation_parameters)
         self.launch = 0
