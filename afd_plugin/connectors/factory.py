@@ -93,6 +93,11 @@ class AFDConnectorFactory:
 
 
 AFDConnectorFactory.register_connector(
+    "CAMAsyncMegaAFDConnector",
+    "afd_plugin.connectors.npu.async_mega",
+    "CAMAsyncMegaAFDConnector",
+)
+AFDConnectorFactory.register_connector(
     "P2pNcclAFDConnector",
     "afd_plugin.connectors.gpu.p2p",
     "P2pNcclAFDConnector",

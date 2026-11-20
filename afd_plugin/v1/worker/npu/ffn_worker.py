@@ -33,6 +33,7 @@ from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+from afd_plugin.connectors.npu.async_mega import CAMAsyncMegaAFDConnector
 from afd_plugin.model_executor.models.model_utils import (
     configure_afd_dspark,
     get_afd_model_config,
@@ -219,7 +220,11 @@ class AFDNPUFFNWorker(NPUWorker):
             return
 
         while not event.is_set():
-            control_plane = self.model_runner.connector.control_plane
+            connector = self.model_runner.connector
+            if isinstance(connector, CAMAsyncMegaAFDConnector):
+                connector.execute_next_experts()
+                continue
+            control_plane = connector.control_plane
             assert control_plane is not None
             payload = control_plane.recv_dp_metadata_list()
             dp_metadata_list = payload.dp_metadata_list
@@ -252,7 +257,9 @@ class AFDNPUFFNWorker(NPUWorker):
 
     def stop_ffn_server_loop(self) -> None:
         event = self._ffn_shutdown_event
-        if self._requires_async_drain():
+        if self._requires_async_drain() or isinstance(
+            self.model_runner.connector, CAMAsyncMegaAFDConnector
+        ):
             if event is not None:
                 event.set()
             thread = self._ffn_thread
@@ -265,9 +272,7 @@ class AFDNPUFFNWorker(NPUWorker):
                 )
                 thread.join(timeout=timeout)
                 if thread.is_alive():
-                    raise RuntimeError(
-                        "Async graph receive is pending; retain resources"
-                    )
+                    raise RuntimeError("FFN receive is pending; retain resources")
             self.raise_ffn_loop_error_if_any()
             self.model_runner.shutdown()
             self._ffn_thread = None

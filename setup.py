@@ -60,9 +60,16 @@ class CMakeExtension(Extension):
 
 
 class BuildAscendOps(build_ext):
+    def initialize_options(self) -> None:
+        super().initialize_options()
+        self._built_cmake_sources: set[str] = set()
+
     def run(self) -> None:
         if not self.extensions:
             return super().run()
+        # Both Python extensions share one CMake build/install. CMake itself
+        # handles parallel compilation; setuptools must not run it twice.
+        self.parallel = False
         if os.environ.get("AFD_SKIP_ACLNN_BUILD", "0") != "1":
             soc_version = os.environ.get("SOC_VERSION", "910c")
             subprocess.check_call(
@@ -74,6 +81,8 @@ class BuildAscendOps(build_ext):
     def build_extension(self, ext: Extension) -> None:
         if not isinstance(ext, CMakeExtension):
             return super().build_extension(ext)
+        if ext.source_dir in self._built_cmake_sources:
+            return
 
         build_temp = Path(self.build_temp) / ext.name
         build_temp.mkdir(parents=True, exist_ok=True)
@@ -111,6 +120,7 @@ class BuildAscendOps(build_ext):
             if dst_cann_ops.exists():
                 shutil.rmtree(dst_cann_ops)
             shutil.copytree(src_cann_ops, dst_cann_ops)
+        self._built_cmake_sources.add(ext.source_dir)
 
 
 ext_modules = []
@@ -118,6 +128,11 @@ if _should_build_ascend_ops():
     ext_modules.append(
         CMakeExtension("afd_plugin._C_ascend", "csrc/npu/pybind"),
     )
+    soc_version = os.environ.get("SOC_VERSION", "910c").lower()
+    if soc_version == "950" or soc_version.startswith("ascend950"):
+        ext_modules.append(
+            CMakeExtension("afd_plugin._C_afd_async_mega", "csrc/npu/pybind"),
+        )
 
 
 setup(

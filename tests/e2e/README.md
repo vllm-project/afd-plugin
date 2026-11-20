@@ -664,7 +664,7 @@ The existing `afd-dsv4-flash-async-cam-dp2tp4-ep8` remains Mega-off.
 
 Use the target branch's pinned vLLM/vLLM-Ascend stack (vLLM 0.32.0 target),
 CANN runtime, and plugin native operators built from the same source tip.
-Do not substitute A5 CAM async-megamoe operators or the FFN FULL helper (#509).
+Do not substitute A5 CAM async-mega operators or the FFN FULL helper (#509).
 The new case keeps both roles eager and the existing Attention DBO setting.
 Its test-only observers synchronize completed native work; use it for functional
 validation, never performance measurement.

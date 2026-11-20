@@ -52,7 +52,7 @@ pybind11_add_module(afd_plugin_ascend_C
   "${CMAKE_CURRENT_LIST_DIR}/pytorch_extension/NPUStorageImpl.cpp")
 
 # Keep registration aligned with the run package selected by setup.py. The
-# asynchronous CAM kernels use the A3 HCCL resource ABI and do not support A5.
+# asynchronous CAM kernels select the platform-specific HCCL resource ABI.
 if(NOT DEFINED AFD_SOC_VERSION OR AFD_SOC_VERSION STREQUAL "")
   set(AFD_SOC_VERSION "$ENV{SOC_VERSION}")
 endif()
@@ -65,7 +65,8 @@ if(AFD_SOC_VERSION STREQUAL "910c" OR AFD_SOC_VERSION MATCHES "^ascend910_93")
     "${CMAKE_CURRENT_LIST_DIR}/torch_binding_mega_moe_pull.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/torch_binding_mega_moe_comm.cpp")
 elseif(AFD_SOC_VERSION STREQUAL "950" OR AFD_SOC_VERSION MATCHES "^[Aa]scend950")
-  message(STATUS "CAM asynchronous bindings disabled for Ascend 950")
+  target_sources(afd_plugin_ascend_C PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/torch_binding_cam_async.cpp")
 else()
   message(FATAL_ERROR "Unsupported AFD_SOC_VERSION: ${AFD_SOC_VERSION}")
 endif()
@@ -100,3 +101,34 @@ target_link_options(afd_plugin_ascend_C PRIVATE
   "-Wl,-rpath,$ORIGIN:$ORIGIN/_cann_ops_custom/vendors/afd-plugin/op_api/lib")
 
 install(TARGETS afd_plugin_ascend_C LIBRARY DESTINATION afd_plugin)
+
+# Mega conversion helpers contain non-inline definitions. Keep their single
+# translation unit in a separate DSO instead of mixing it with _C_ascend.
+if(AFD_SOC_VERSION STREQUAL "950" OR AFD_SOC_VERSION MATCHES "^[Aa]scend950")
+  pybind11_add_module(afd_plugin_mega_C "${CMAKE_CURRENT_LIST_DIR}/afd_async_mega/module.cpp")
+  set_target_properties(afd_plugin_mega_C PROPERTIES OUTPUT_NAME "_C_afd_async_mega")
+  target_compile_definitions(afd_plugin_mega_C PRIVATE TORCH_EXTENSION_NAME=_C_afd_async_mega)
+  separate_arguments(MEGA_TORCH_FLAGS NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
+  target_compile_options(afd_plugin_mega_C PRIVATE ${MEGA_TORCH_FLAGS})
+
+  # CANN must precede torch-npu's bundled ACL headers for FP8/FP4 enum values.
+  target_include_directories(afd_plugin_mega_C BEFORE PRIVATE
+    "${ASCEND_HOME_PATH}/include"
+    "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include"
+    "${ASCEND_HOME_PATH}/include/aclnnop"
+    "${TORCH_NPU_PATH}/include/third_party/hccl/inc"
+    "${TORCH_NPU_PATH}/include/third_party/op-plugin"
+    "${TORCH_NPU_PATH}/include"
+    "${TORCH_NPU_PATH}/.."
+    ${TORCH_INCLUDE_DIRS}
+    "${AFD_NPU_CSRC_DIR}/ascend_kernels/mega_utils")
+  target_link_directories(afd_plugin_mega_C PRIVATE
+    "${TORCH_INSTALL_PREFIX}/lib"
+    "${TORCH_NPU_PATH}/lib"
+    "${ASCEND_HOME_PATH}/lib64")
+  target_link_libraries(afd_plugin_mega_C PRIVATE
+    ${TORCH_LIBRARIES} torch_python torch_npu ascendcl dl)
+  set_target_properties(afd_plugin_mega_C PROPERTIES
+    INSTALL_RPATH "$ORIGIN;$ORIGIN/../torch/lib;$ORIGIN/../torch_npu/lib;${ASCEND_HOME_PATH}/lib64")
+  install(TARGETS afd_plugin_mega_C LIBRARY DESTINATION afd_plugin)
+endif()

@@ -24,10 +24,12 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.sequence import IntermediateTensors
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
     CAMP2P_CONNECTOR,
+    MEGA_CONNECTOR,
     parse_afd_config,
 )
 from afd_plugin.connectors import (
@@ -39,6 +41,8 @@ from afd_plugin.connectors.npu.async_cam_runtime.async_cam_dbo import (
     send_async_cam_remote_call,
 )
 from afd_plugin.connectors.npu.async_cam_runtime.async_cam_layout import (
+    CAMDispatchPayload,
+    plain_tp_layout,
     prepare_cam_dispatch_payload,
     restore_cam_dispatch_output,
 )
@@ -184,6 +188,9 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         is_draft_layer: bool = False,
     ) -> None:
         super().__init__(layer_idx=layer_idx)
+        self.mega = (
+            parse_afd_config(vllm_config, validate=False).connector == MEGA_CONNECTOR
+        )
         self.use_sequence_parallel_moe = (
             vllm_config.parallel_config.use_sequence_parallel_moe
         )
@@ -244,21 +251,69 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         hidden_states_fp32: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Select DSV4 experts on Attention and exchange routed work via CAM."""
+        from vllm.distributed.parallel_state import get_tp_group
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
         from afd_plugin.model_executor.models.npu import deepseek_v4_attention_gate
 
-        topk_weights, topk_ids = deepseek_v4_attention_gate.compute_attention_gate_topk(
-            self,
-            hidden_states,
-            input_ids=input_ids,
-            hidden_states_fp32=hidden_states_fp32,
+        tp = (
+            get_tp_group()
+            if self.mega and not self.use_sequence_parallel_moe
+            else None
         )
-        dispatch_payload = prepare_cam_dispatch_payload(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            None,
-            use_sequence_parallel=self.use_sequence_parallel_moe,
-        )
+        if tp is not None and tp.world_size > 1 and not _EXTRA_CTX.in_profile_run:
+            layout = plain_tp_layout(
+                hidden_states.shape[0], tp.rank_in_group, tp.world_size
+            )
+            rows = layout.local_token_slice
+            local_hidden = hidden_states[rows]
+            valid = local_hidden.shape[0]
+            pad = layout.local_tokens - valid
+            if self.gate.tid2eid is not None:
+                if input_ids is None:
+                    input_ids = get_forward_context().input_ids
+                input_ids = deepseek_v4_attention_gate.local_hash_input_ids(
+                    input_ids=input_ids, router_tokens=hidden_states.shape[0]
+                )[rows]
+            if valid:
+                weights, ids = deepseek_v4_attention_gate.compute_attention_gate_topk(
+                    self,
+                    local_hidden,
+                    input_ids=input_ids,
+                    hidden_states_fp32=None
+                    if hidden_states_fp32 is None
+                    else hidden_states_fp32[rows],
+                )
+            else:
+                weights = hidden_states.new_empty((0, self.top_k), dtype=torch.float32)
+                ids = hidden_states.new_empty((0, self.top_k), dtype=torch.int32)
+            if pad:
+                local_hidden = torch.nn.functional.pad(local_hidden, (0, 0, 0, pad))
+                weights = torch.nn.functional.pad(weights, (0, 0, 0, pad))
+                padding_ids = torch.arange(
+                    self.top_k, device=ids.device, dtype=ids.dtype
+                )
+                ids = torch.cat((ids, padding_ids.expand(pad, -1)))
+            dispatch_payload = CAMDispatchPayload(
+                local_hidden, weights, ids, None, layout
+            )
+        else:
+            topk_weights, topk_ids = (
+                deepseek_v4_attention_gate.compute_attention_gate_topk(
+                    self,
+                    hidden_states,
+                    input_ids=input_ids,
+                    hidden_states_fp32=hidden_states_fp32,
+                )
+            )
+            dispatch_payload = prepare_cam_dispatch_payload(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                None,
+                use_sequence_parallel=self.use_sequence_parallel_moe,
+                distinct_padding_ids=self.mega,
+            )
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
             raise RuntimeError("Async CAM requires AFD forward metadata")
@@ -273,6 +328,7 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
             afd_metadata.connector,
             dispatch_payload.hidden_states,
             context,
+            independent_windows=self.mega,
             topk_weights=dispatch_payload.topk_weights,
             topk_ids=dispatch_payload.topk_ids,
         )
@@ -365,7 +421,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
     forward method; it invokes ``compute_ffn_output`` instead.
     """
 
-    # Upstream source: vllm-ascend bd42eea01d8312c4df469fabaed45f77a12df4d3,
+    # Upstream source: vllm-ascend f9c8e0bdb263d7a8c0270536f1ea00fa7373a84e,
     # vllm_ascend/models/deepseek_v4/model.py::DeepseekV4DecoderLayer.__init__.
     # Patch reason: allocate Attention and FFN weights only on their AFD role.
     # Patch functionality: keep target HC/SP attributes and native layer forward,
@@ -425,9 +481,6 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         # ### PATCH END: distinguish CAM IDs from native draft checkpoint names
         self.norm_eps = config.rms_norm_eps
         self.use_sequence_parallel_moe = parallel_config.use_sequence_parallel_moe
-        self.enable_dsa_cp = (
-            native.enable_dsa_cp()
-        )  # TODO: delete this when native.enable_dsa_cp is sunset.
 
         # ### PATCH START: role-local Attention and remote experts
         self.mlp: (
@@ -436,6 +489,12 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             | native.DeepseekV4MoE
         )
         if afd_config.role == "attention":
+            attention_kwargs = {}
+            if get_ascend_device_type() != AscendDeviceType.A5:
+                self.enable_dsa_cp = native.enable_dsa_cp()
+                attention_kwargs["need_gather_q_kv"] = (
+                    self.use_sequence_parallel_moe and self.enable_dsa_cp
+                )
             self.self_attn = native.DeepseekV4Attention(
                 vllm_config=vllm_config,
                 config=config,
@@ -445,14 +504,14 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 reduce_results=not self.use_sequence_parallel_moe,
-                need_gather_q_kv=self.use_sequence_parallel_moe and self.enable_dsa_cp,
+                **attention_kwargs,
             )
             if self.compute_gate_on_attention:
                 # Both shells keep the router on Attention; only the transport
                 # differs. Choosing by connector keeps the async CAM path unchanged.
                 gate_shell = (
                     AFDDeepseekV4AttentionGateRemoteMoE
-                    if afd_config.connector == AFD_ASYNC_CONNECTOR
+                    if afd_config.connector in (AFD_ASYNC_CONNECTOR, MEGA_CONNECTOR)
                     else AFDDeepseekV4SyncAttentionGateRemoteMoE
                 )
                 self.mlp = gate_shell(
@@ -617,7 +676,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
 
     fall_back_to_pt_during_load = False
 
-    # Upstream source: vllm-ascend bd42eea01d8312c4df469fabaed45f77a12df4d3,
+    # Upstream source: vllm-ascend f9c8e0bdb263d7a8c0270536f1ea00fa7373a84e,
     # vllm_ascend/models/deepseek_v4/model.py::DeepseekV4Model.__init__.
     # Patch reason: construct role-local decoder layers and retain AFD metadata.
     # Patch functionality: initialize the target SP/PP/HC/MTP model contract
@@ -627,7 +686,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         # ### PATCH START: initialize role-local model
         afd_config = parse_afd_config(vllm_config, validate=False)
         if (
-            afd_config.connector == AFD_ASYNC_CONNECTOR
+            afd_config.connector in (AFD_ASYNC_CONNECTOR, MEGA_CONNECTOR)
             and not afd_config.compute_gate_on_attention
         ):
             raise ValueError(

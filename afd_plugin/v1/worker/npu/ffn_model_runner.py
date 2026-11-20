@@ -28,6 +28,7 @@ from afd_plugin.connectors import (
     AFDForwardContextMetadata,
     AFDTransferContext,
 )
+from afd_plugin.connectors.npu.async_mega import CAMAsyncMegaAFDConnector
 from afd_plugin.v1.worker.attention_metadata import (
     _resolve_world_ranks,
 )
@@ -133,6 +134,11 @@ class AFDNPUFFNModelRunner:
         self.model_config.max_model_len = max_model_len
 
     def initialize_afd_connector(self) -> None:
+        if (
+            isinstance(self.connector, CAMAsyncMegaAFDConnector)
+            and not self.connector.is_initialized
+        ):
+            self.connector.prepare_layers(self.get_model().model.layers)
         self.connector.init_afd_connector()
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:

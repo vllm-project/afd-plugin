@@ -887,3 +887,22 @@ def test_cam_receive_capacity_validates_native_float32_envelope(
             cam_receive_capacity()
     else:
         assert cam_receive_capacity() == capacity
+
+
+@pytest.mark.parametrize("dp_size,tp_size", [(1, 1), (1, 2), (2, 2)])
+def test_mega_eager_dbo_admits_attention_topology(
+    monkeypatch, mrv2_config, dp_size, tp_size
+):
+    config = npu_async_cam_target_graph_config(
+        data_parallel_size=dp_size,
+        tensor_parallel_size=tp_size,
+        num_attention_ranks=dp_size * tp_size,
+    )
+    config.additional_config["afd"]["connector"] = "CAMAsyncMegaAFDConnector"
+    config.model_config.enforce_eager = True
+    config.parallel_config.enable_dbo = True
+    config.parallel_config.use_ubatching = True
+    config.parallel_config.num_ubatches = 2
+    validate_npu_model_runner_v2_config(
+        config, expected_role="attention", device_type="npu"
+    )

@@ -62,12 +62,13 @@ def create_hccl_process_group_options(
 def init_afd_process_group(
     *,
     backend: str,
-    init_method: str,
+    init_method: str | None = None,
     world_size: int,
     rank: int,
     group_name: str,
     timeout: timedelta,
     pg_options: Any | None = None,
+    existing_store: Store | None = None,
     store_callback: Callable[[Store], None] | None = None,
 ) -> ProcessGroup:
     """Create a plugin-owned process group without patching vLLM source.
@@ -77,14 +78,15 @@ def init_afd_process_group(
     unavailable.
     """
 
-    rendezvous_iterator = rendezvous(
-        init_method,
-        rank,
-        world_size,
-        timeout=timeout,
-    )
-    store, rank, world_size = next(rendezvous_iterator)
-    store.set_timeout(timeout)
+    if (existing_store is None) == (init_method is None):
+        raise ValueError("Pass either init_method or existing_store")
+    if init_method is not None:
+        rendezvous_iterator = rendezvous(init_method, rank, world_size, timeout=timeout)
+        store, rank, world_size = next(rendezvous_iterator)
+        store.set_timeout(timeout)
+    else:
+        assert existing_store is not None
+        store = existing_store
     prefixed_store = PrefixStore(group_name, store)
     if store_callback is not None:
         store_callback(prefixed_store)
