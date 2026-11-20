@@ -8,15 +8,12 @@ import torch.distributed as distributed
 
 from afd_plugin.compat.npu.ops import ensure_mega_ops_available
 
-from .mega_layout import CONTROL_ROW_BYTES, SplitLayout
+from .mega_layout import SplitLayout
 
 
 ensure_mega_ops_available()
 
 from afd_plugin._C_afd_async_mega import SPLIT_SEQUENCE_MAX, CommContextManager  # noqa: E402
-
-
-PUBLISHED_WORD = 0
 
 
 def split_sequence(iteration):
@@ -144,30 +141,6 @@ class SplitBuffer:
         values[11], values[13], values[14] = sequence_or_dp_width, tokens, self.launch
         return values
 
-    def control_rows(self):
-        """Return int32 peer rows using the same layout as SplitWord in the kernel.
-
-        The view borrows the registered window and must not outlive this buffer.
-        """
-        word_bytes = torch.int32.itemsize
-        window = self.manager.get_local_buffer_tensor(
-            torch.int32, self.layout.control_offset // word_bytes
-        )
-        words_per_row = CONTROL_ROW_BYTES // word_bytes
-        return window[: self.layout.world_size * words_per_row].view(
-            self.layout.world_size, words_per_row
-        )
-
-    def create_published_reader(self, ranks_per_group=1):
-        """Create a reusable host reader; stop using it before destroying the buffer.
-
-        Reading synchronizes only the reader's copy stream. It does not wait for
-        fused_moe, which may itself be waiting for a dispatch to be published.
-        """
-        if ranks_per_group < 1 or self.layout.attention_ranks % ranks_per_group:
-            raise ValueError("Attention ranks must divide into complete groups")
-        return PublishedReader(self, ranks_per_group)
-
     def destroy(self):
         # Caller drains all role streams and synchronizes the union group first.
         self.manager.destroy()
@@ -187,24 +160,6 @@ class DispatchTicket:
     sequence: int
     configuration: list
     completion: torch.Tensor
-
-
-class PublishedReader:
-    """Read local PUBLISHED words without queuing behind an FFN compute stream."""
-
-    def __init__(self, buffer, ranks_per_group: int):
-        self.rows = buffer.control_rows()[: buffer.layout.attention_ranks]
-        self.host = torch.empty(self.rows.shape, dtype=torch.int32, pin_memory=True)
-        self.stream = torch.npu.Stream(device=self.rows.device)
-        self.ranks_per_group = ranks_per_group
-
-    def __call__(self) -> list[list[int]]:
-        # Copy contiguous rows with DMA. Strided gathers would launch a device
-        # kernel that could contend with the very fused work we are scheduling.
-        with torch.npu.stream(self.stream):
-            self.host.copy_(self.rows, non_blocking=True)
-        self.stream.synchronize()
-        return self.host[:, PUBLISHED_WORD].reshape(-1, self.ranks_per_group).tolist()
 
 
 def atten_send(activations, topk_ids, topk_weights, buffer, dp_ranks, sequence, layer_index=0):

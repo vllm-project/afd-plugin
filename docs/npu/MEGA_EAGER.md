@@ -17,7 +17,8 @@ The connector protocol uses `split_sequence` and `SPLIT_SEQUENCE_MAX` from
 (`constexpr int64_t`, currently 32), shared by host tiling and device comparison.
 Each lane/DP advances 1 through 32 and wraps to 1. The per-buffer launch tag also
 wraps; each fused launch clears its local AIV done tags before the launch barrier.
-CPU mailbox generations and TP PUBLISHED snapshots require exact equality.
+Within each stage, the fused kernel scans DPs round-robin. It claims a DP once
+all its Attention ranks have published the next generation for that DP.
 Device waits use half-ring ordering and distinguish waiting for this generation
 from waiting for its predecessor.
 
@@ -29,42 +30,30 @@ skew required by half-ring comparison.
 
 ## Device layer selection
 
-Like the A3 async CAM layered executor, enable the feature on **every FFN
-worker** with:
-
-```bash
-export AFD_ASYNC_CAM_LAYERED_GMM=1
-```
-
 Use `CAMAsyncMegaAFDConnector` and keep `--enforce-eager` on both roles.
-Do not enable the switch on Attention. FFN publishes the mode and sorted model
-layer IDs through the startup Store; all FFN ranks must agree. Attention adopts
-that mapping before creating the communication windows. The default (unset or
-0) retains host-selected, single-layer calls.
+FFN ranks publish their sorted model layer IDs through the startup Store.
+Attention adopts that mapping before creating the communication windows.
 
-In layered mode, FFN builds four static TensorLists (W1, W2, scale1, scale2),
+FFN builds four static TensorLists (W1, W2, scale1, scale2),
 ordered by model layer ID, with one stacked expert tensor per layer. These lists
 reference the already prepared weights; no second copy is allocated. Attention
 maps `context.metadata.layer_idx` to the corresponding bank slot and supplies
-it as `mega_dispatch_send(..., layer_index=slot)`. For example, model IDs
-`[2, 7]` occupy slots `[0, 1]`. In legacy mode every slot is 0 because FFN passes
-only the requested layer's weights.
+it as `atten_send(..., layer_index=slot)`. For example, model IDs
+`[2, 7]` occupy slots `[0, 1]`.
 
 The dispatch kernel publishes the slot with the generation. FFN submits the
-same complete weight bank on every call; fused_moe reads the device task record
-and selects W1/W2/scales internally. combine_recv continues to use its dispatch
+same complete weight bank on every call; mega_ffn reads the device task record
+and selects W1/W2/scales internally. atten_recv continues to use its dispatch
 ticket and does not need a layer argument. All TP members must publish the same
 slot for a task, as checked by the kernel.
 
-The CPU mailbox still schedules DP, generation and lane, and retains the model
-layer ID for legacy calls. This change does not remove PUBLISHED admission,
-change ubatch scheduling, or add graph execution support. All A/F processes must
-run the updated connector because initialization now exchanges layer metadata.
+With DBO, each FFN stream submits one fused call at a time on its own window.
+An idle kernel waits for work on that stage; stopping it can require terminating the workers.
 
 CPU checks:
 
 ```bash
-python -m pytest tests/unit/connectors/npu/test_mega_work.py tests/unit/connectors/npu/test_mega_admission.py tests/unit/connectors/npu/test_mega_sequence_ring.py tests/unit/connectors/npu/test_mega_layers.py
+python -m pytest tests/unit/connectors/npu/test_mega_topology.py tests/unit/connectors/npu/test_mega_sequence_ring.py tests/unit/connectors/npu/test_mega_layers.py
 ```
 
 These check host protocol messages and the actual C++ comparison arithmetic;
@@ -73,7 +62,5 @@ run more than 96 dispatch/combine calls per active lane/DP (three ring laps),
 and include empty routes and uneven TP publication. Verify accuracy against the
 reference as well as continued progress with DBO enabled and disabled.
 
-For A5 verification, compare the same requests with the FFN switch set to 0 and
-1, including more than one model layer and at least three sequence laps per
-active lane/DP. Check numerical outputs as well as forward progress. The host
-unit tests validate mapping and rank agreement, not device numerical accuracy.
+With DBO enabled, also send work only to stage 0, then only to stage 1.
+Verify that the active stage returns results while the other waits.

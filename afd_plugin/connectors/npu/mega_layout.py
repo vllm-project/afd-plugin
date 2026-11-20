@@ -3,9 +3,6 @@
 from dataclasses import dataclass
 
 
-CONTROL_ROW_BYTES = 64
-
-
 def align(value, multiple):
     return (value + multiple - 1) // multiple * multiple
 
@@ -64,10 +61,6 @@ class SplitLayout:
             ("inputs", align(self.capacity * record_bytes, 512)),
             ("results", align(self.capacity * self.top_k * result_bytes, 512)),
         )
-
-    @property
-    def control_offset(self):
-        return dict(self.sections)["exception"]
 
     @property
     def buffer_bytes(self):

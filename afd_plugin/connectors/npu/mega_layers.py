@@ -34,22 +34,15 @@ def agree_layer_selection(
     store: Store,
     ffn_size: int,
     ffn_rank: int | None,
-    enabled: bool,
     layer_ids: list[int],
 ) -> dict[int, int]:
-    """FFN owns the switch; all A/F ranks adopt the same model-ID to bank-slot map."""
+    """All A/F ranks adopt the same model-ID to bank-slot map."""
     if ffn_rank is not None:
-        store.set(
-            f"layers/{ffn_rank}",
-            json.dumps({"enabled": enabled, "layers": sorted(layer_ids)}),
-        )
+        store.set(f"layers/{ffn_rank}", json.dumps(sorted(layer_ids)))
     configs = [json.loads(store.get(f"layers/{rank}")) for rank in range(ffn_size)]
     if any(config != configs[0] for config in configs[1:]):
-        raise ValueError("All Mega FFN ranks must agree on layer selection and IDs")
-    ids = configs[0]["layers"]
+        raise ValueError("All Mega FFN ranks must agree on layer IDs")
+    ids = configs[0]
     if not ids or ids[0] < 0 or len(set(ids)) != len(ids):
         raise ValueError("Mega requires unique nonnegative FFN layer IDs")
-    # In legacy mode every call carries one layer, selected as slot zero.
-    return {
-        layer: slot if configs[0]["enabled"] else 0 for slot, layer in enumerate(ids)
-    }
+    return {layer: slot for slot, layer in enumerate(ids)}

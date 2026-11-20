@@ -39,19 +39,15 @@ conversion and E8M0 scale preparation after loading. Native checkpoint loading
 remains in the DSV4 model wrapper.
 
 The path requires eager ModelRunnerV2, `afd.async=true`,
-`afd.compute_gate_on_attention=true` and `enable_fused_mc2=0`. The current optional
-FFN device-layer-selection switch is documented in [MEGA_EAGER.md](MEGA_EAGER.md).
-Its independent configuration name is a separate review follow-up; this scope
-change removes the public validation of the old switch for other connectors/roles.
+`afd.compute_gate_on_attention=true` and `enable_fused_mc2=0`. FFN selects the DP and layer on device as described in [MEGA_EAGER.md](MEGA_EAGER.md).
 
 For Mega, each ubatch stage owns a communication window and dispatch ticket.
 Within each window, each Attention DP advances the UMDK ring sequence from 1 through 32 and back to 1.
-Every FFN rank consumes the descriptor, including ranks with no selected expert.
+Every FFN rank claims the DP on device, including ranks with no selected expert.
 The kernel's PUBLISHED/TAKEN/READY/CONSUMED protocol protects input/output reuse.
 Each FFN rank admits at most one fused submission per window at a time.
 The validated recipe uses 2A2F. Other A/F counts use DP x TP per role and contiguous static FFN EP in one
-MTE supernode; no graphs, MTP or EPLB. Close the roles together after draining
-requests: communication-window destruction requires the union-group barrier.
+MTE supernode; no graphs, MTP or EPLB. Idle fused kernels wait for new work; stopping a run may require terminating the workers.
 
 ## Operator dependencies and current limits
 
@@ -68,7 +64,7 @@ accuracy, long-run communication and performance checks have not been performed.
   with the ring-sequence Python wrappers is unsupported.
 - Mega's one-time FP4 storage conversion preserves packed nibbles; its
   format-cast and CANN interpretation still need device verification. Local CPU
-  checks establish byte reordering and queue behavior, not numerical support.
+  checks establish byte reordering and layer mapping, not numerical support.
 
 ## Configuration contract
 
@@ -95,7 +91,7 @@ ubatches and native decode/prefill thresholds of at least two tokens.
 For example, use `--dbo-prefill-token-threshold 8 --dbo-decode-token-threshold 2`
 to exercise splitting with eligible requests. Attention dispatches each shard
 into its own registered window and combines it with its own ticket after the
-DBO yield. Each FFN rank polls both stage queues. While one fused kernel is in
+DBO yield. Each FFN rank checks the completion event for each stage. While one fused kernel is in
 flight it can submit work for the other stage on a second NPU stream. An event
 on each stream protects its window until the previous fused kernel completes.
 Both stages use the same expert weights.

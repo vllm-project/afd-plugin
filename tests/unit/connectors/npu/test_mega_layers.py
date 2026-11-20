@@ -31,33 +31,29 @@ def test_bank_order_matches_sparse_model_layer_mapping(store):
         2: tuple([object()] for _ in range(4)),
     }
     bank = layers.pack_layer_weights(weights)
-    slots = layers.agree_layer_selection(store, 1, 0, True, [7, 2])
+    slots = layers.agree_layer_selection(store, 1, 0, [7, 2])
     assert slots == {2: 0, 7: 1}
     for layer, slot in slots.items():
         for part in range(4):
             assert bank[part][slot] is weights[layer][part][0]
 
 
-@pytest.mark.parametrize(
-    "enabled,expected", [(True, {2: 0, 7: 1}), (False, {2: 0, 7: 0})]
-)
-def test_attention_adopts_ffn_mode_without_local_switch(store, enabled, expected):
-    ffn = layers.agree_layer_selection(store, 1, 0, enabled, [7, 2])
-    attention = layers.agree_layer_selection(store, 1, None, not enabled, [])
-    assert ffn == attention == expected
+def test_attention_adopts_ffn_layer_slots(store):
+    ffn = layers.agree_layer_selection(store, 1, 0, [7, 2])
+    attention = layers.agree_layer_selection(store, 1, None, [])
+    assert ffn == attention == {2: 0, 7: 1}
 
 
-@pytest.mark.parametrize("enabled,ids", [(False, [2, 7]), (True, [2, 8])])
-def test_disagreement_between_ffn_ranks_is_rejected(store, enabled, ids):
-    store.set("layers/1", json.dumps({"enabled": enabled, "layers": ids}))
+def test_disagreement_between_ffn_ranks_is_rejected(store):
+    store.set("layers/1", json.dumps([2, 8]))
     with pytest.raises(ValueError, match="must agree"):
-        layers.agree_layer_selection(store, 2, 0, True, [2, 7])
+        layers.agree_layer_selection(store, 2, 0, [2, 7])
 
 
 @pytest.mark.parametrize("ids", [[], [-1], [2, 2]])
 def test_invalid_layer_ids_rejected_before_dispatch(store, ids):
     with pytest.raises(ValueError, match="unique nonnegative"):
-        layers.agree_layer_selection(store, 1, 0, True, ids)
+        layers.agree_layer_selection(store, 1, 0, ids)
 
 
 def test_bank_rejects_per_expert_or_missing_projection_lists():
