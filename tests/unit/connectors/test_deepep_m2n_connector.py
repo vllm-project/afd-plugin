@@ -1363,31 +1363,36 @@ def test_lanes_are_afdep_comm_buffers_with_the_role_counts(
 
 
 @pytest.mark.parametrize(
-    ("role", "role_rank", "lane_role", "lane_role_rank", "ok"),
+    ("role", "role_rank", "lane_role", "lane_index", "peer_error", "error_rank"),
     [
-        ("ffn", 1, "ffn", 1, True),
-        ("attention", 2, "attention", 0, True),
-        ("ffn", 1, "ffn", 0, False),
-        ("ffn", 0, "attention", 0, False),
-        ("attention", 0, "ffn", 0, False),
+        ("ffn", 1, "ffn", 1, False, None),
+        ("attention", 1, "attention", 0, False, None),
+        ("ffn", 1, "ffn", 0, False, 1),
+        ("ffn", 1, "attention", 0, False, 1),
+        ("attention", 1, "attention", 0, True, 0),
     ],
 )
 def test_lane_roles_must_match_the_layout(
-    role, role_rank, lane_role, lane_role_rank, ok
+    monkeypatch, role, role_rank, lane_role, lane_index, peer_error, error_rank
 ):
-    """afdEP-comm's role for this rank must match the plugin's layout, and on
-    FFN ranks so must the FFN index.
-
-    Why: both compute the FFN placement; if they disagreed, an FFN rank would
-    receive rows for experts it did not load and return wrong results silently.
-    Attention indices may differ in per-domain mode and are not compared.
+    """A peer mismatch must stop warmup even when this rank agrees. Attention
+    indices may differ in per-domain mode and are not compared.
     """
-    connector = _connector(role, role_rank, M2NTopology(ffn_size=2, attn_size=4))
-    connector.lanes = [SimpleNamespace(role=lane_role, role_rank=lane_role_rank)]
-    if ok:
+    connector = _connector(role, role_rank, M2NTopology(ffn_size=2, attn_size=2))
+    connector.lanes = [SimpleNamespace(role=lane_role, role_rank=lane_index)]
+    connector.bootstrap_group = object()
+
+    def gather(errors, local_error, *, group):
+        assert group is connector.bootstrap_group
+        errors[connector.world_rank] = local_error
+        if peer_error:
+            errors[0] = "afdEP-comm placed world rank 0 as attention 0"
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    if error_rank is None:
         connector._check_lane_roles()
     else:
-        with pytest.raises(RuntimeError, match="afdEP-comm placed this rank"):
+        with pytest.raises(RuntimeError, match=f"placed world rank {error_rank}"):
             connector._check_lane_roles()
 
 

@@ -1207,11 +1207,21 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         """
         lane = self._lanes(0)
         role = FFN_ROLE if self.is_ffn else ATTENTION_ROLE
+        mismatch = None
         if lane.role != role or (self.is_ffn and lane.role_rank != self.role_rank):
-            raise RuntimeError(
-                f"afdEP-comm placed this rank as {lane.role} {lane.role_rank}, but "
-                f"the DeepEP M2N layout has it as {role} {self.role_rank}"
+            mismatch = (
+                f"afdEP-comm placed world rank {self.world_rank} as "
+                f"{lane.role} {lane.role_rank}, but the DeepEP M2N layout "
+                f"has it as {role} {self.role_rank}"
             )
+        # Closing the lanes is collective. All ranks must choose between
+        # teardown and kernel warmup together, even if just one disagrees.
+        assert self.bootstrap_group is not None
+        mismatches: list[str | None] = [None] * self.layout.union_size
+        dist.all_gather_object(mismatches, mismatch, group=self.bootstrap_group)
+        for error in mismatches:
+            if error is not None:
+                raise RuntimeError(error)
 
     def close(self) -> None:
         """Cancel the control receive and destroy DeepEP buffers; safe after
