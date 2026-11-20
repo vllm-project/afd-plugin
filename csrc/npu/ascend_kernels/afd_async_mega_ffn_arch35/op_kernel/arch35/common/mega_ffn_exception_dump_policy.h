@@ -81,7 +81,7 @@ __aicore__ inline __gm__ GmmLoopCount *RegisterMegaFfnExceptionDump(ExceptionDum
     engine.Dump(epRankIdAddr, sizeof(uint32_t));
     size_t routeRecvSize = static_cast<size_t>(CalcRouteIndexRecvSize(
         CalcDispatchRouteIndexAlignSize(tilingData), static_cast<int64_t>(tilingData->moeExpertPerRank),
-        static_cast<int64_t>(tilingData->epWorldSize)));
+        static_cast<int64_t>(tilingData->splitAttentionRanks)));
     engine.Dump(peermemInfo.rankSyncInWorldPtr, static_cast<size_t>(MegaFusedMoeImpl::PEERMEM_DATA_OFFSET));
     engine.Dump(peermemInfo.maskRecvPtr, routeRecvSize);
     GM_ADDR loopCountBase = dumpBase + GMM_LOOP_COUNT_REGION_OFFSET;

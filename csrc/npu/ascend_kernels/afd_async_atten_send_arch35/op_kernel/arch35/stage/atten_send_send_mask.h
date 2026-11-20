@@ -35,16 +35,12 @@ struct SendMaskConfig {
 // 装配 MTE 路径唯一的 compact route 发送配置。
 __aicore__ inline SendMaskConfig CreateSendMaskConfig(const Params &params, uint32_t aivCoreIdx)
 {
-    uint64_t routeIndexWinOffset =
-        static_cast<uint64_t>(params.peermemInfo.maskRecvPtr - params.peermemInfo.rankSyncInWorldPtr);
-    uint64_t expertCountWinOffset =
-        static_cast<uint64_t>(params.peermemInfo.expertCountRecvPtr - params.peermemInfo.rankSyncInWorldPtr);
     const MegaDispatchSendSendMaskBufferConfig &bufferConfig = aivCoreIdx < params.tilingData->sendMaskCoreCountWithExtraExpert ?
                                                           params.tilingData->sendMaskConfigForCoreWithExtraExpert :
                                                           params.tilingData->sendMaskConfigForCoreWithoutExtraExpert;
-    return {.expertCountWinOffset = expertCountWinOffset,
+    return {.expertCountWinOffset = static_cast<uint64_t>(params.peermemInfo.mte.counts),
             .routeIndexAlignSize = static_cast<uint64_t>(CalcDispatchRouteIndexAlignSize(params.tilingData)),
-            .routeIndexWinOffset = routeIndexWinOffset,
+            .routeIndexWinOffset = static_cast<uint64_t>(params.peermemInfo.mte.routes),
             .bufferConfig = bufferConfig};
 }
 
@@ -110,7 +106,7 @@ __aicore__ inline void GatherAndSendExpertCompactRoute(const MoeStageCommonConfi
         int32_t dstRank = routeInfo.globalExpertId / expertPerRank + config.splitAttentionRanks;
         int32_t localExpertId = routeInfo.globalExpertId % expertPerRank;
         uint64_t dstOffset = config.routeIndexWinOffset +
-                             static_cast<uint64_t>(localExpertId * static_cast<int32_t>(common.worldSize) +
+                             static_cast<uint64_t>(localExpertId * static_cast<int32_t>(config.splitAttentionRanks) +
                                                    static_cast<int32_t>(common.rankId)) *
                                  config.routeIndexAlignSize +
                              static_cast<uint64_t>(previousCount) * sizeof(int32_t);
@@ -145,7 +141,7 @@ __aicore__ inline void PublishExpertCounts(const MoeStageCommonConfig &common, G
 
     int32_t sourceRank = static_cast<int32_t>(common.rankId);
     int32_t expertPerRank = static_cast<int32_t>(common.moeExpertPerRank);
-    int32_t worldSize = static_cast<int32_t>(common.worldSize);
+    int32_t countRowWidth = static_cast<int32_t>(config.splitAttentionRanks);
     int32_t ownedOffset = 0;
     GlobalTensor<int32_t> dstCountGm;
 
@@ -159,11 +155,11 @@ __aicore__ inline void PublishExpertCounts(const MoeStageCommonConfig &common, G
         segmentExpertCount = segmentExpertCount < remainingInRank ? segmentExpertCount : remainingInRank;
 
         uint64_t dstOffset = config.expertCountWinOffset +
-                             static_cast<uint64_t>(localExpertBegin * worldSize + sourceRank) * sizeof(int32_t);
+                             static_cast<uint64_t>(localExpertBegin * countRowWidth + sourceRank) * sizeof(int32_t);
         dstCountGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(winRankAddr[dstRank] + dstOffset));
         DataCopyExtParams countCopyParams{
             static_cast<uint16_t>(segmentExpertCount), static_cast<uint32_t>(sizeof(int32_t)), 0,
-            static_cast<int64_t>(worldSize - 1) * static_cast<int64_t>(sizeof(int32_t)), 0U};
+            static_cast<int64_t>(countRowWidth - 1) * static_cast<int64_t>(sizeof(int32_t)), 0U};
 
         if (ownedOffset % static_cast<int32_t>(INT32_PER_256B) == 0) {
             DataCopyPad<int32_t, PaddingMode::Compact>(dstCountGm, scratch.sendCntAccTensor[ownedOffset],

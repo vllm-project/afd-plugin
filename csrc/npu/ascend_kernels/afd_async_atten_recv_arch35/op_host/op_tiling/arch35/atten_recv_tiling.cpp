@@ -592,7 +592,7 @@ static ge::graphStatus Tile(gert::TilingContext *context)
     SetUnpermuteBufferConfigs(td, ge::DT_FLOAT, ub);
     PeermemSizeParams sizes{int64_t(td->numMaxTokensPerRank), int64_t(td->topK), int64_t(td->h),
         int64_t(td->moeExpertPerRank), int64_t(td->epWorldSize), 2, 1, bool(td->topkWeightsPrefetch),
-        bool(td->combineQuantMode), 0, 1};
+        bool(td->combineQuantMode), 0, 1, td->splitAttentionRanks};
     if (CalcPeermemLeastSize(sizes) + EXCEPTION_DUMP_REGION_SIZE > config[10]) {
         OP_LOGE(nodeName, "Split communication window is too small");
         return ge::GRAPH_FAILED;

@@ -53,9 +53,7 @@ __aicore__ inline void SplitPublish(const Params &params, GM_ADDR *windows, uint
 __aicore__ inline void SplitPublishRouteTask(const Params &params, GM_ADDR *windows, uint32_t peer)
 {
     const auto *td = params.tilingData;
-    uint64_t metaOffset = static_cast<uint64_t>(params.peermemInfo.routeTaskMetaPtr -
-                                              params.peermemInfo.rankSyncInWorldPtr);
-    auto *record = reinterpret_cast<__gm__ int32_t *>(windows[peer] + metaOffset +
+    auto *record = reinterpret_cast<__gm__ int32_t *>(windows[peer] + params.peermemInfo.mte.taskMeta +
         static_cast<uint64_t>(td->splitRank) * AfdAsyncLayer::TASK_BYTES);
     WriteGmByPassDCache(record + 1, static_cast<int32_t>(td->splitSequence));
     WriteGmByPassDCache(record, static_cast<int32_t>(AfdAsyncLayer::LayerTag(

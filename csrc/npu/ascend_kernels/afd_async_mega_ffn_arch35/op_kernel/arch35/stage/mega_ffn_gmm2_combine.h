@@ -83,8 +83,7 @@ __aicore__ inline void CombineTokens(uint32_t nLoc, uint32_t n, LocalTensor<int3
     // 调用方在进入该数据操作前，保证批量加载的 metadata 对 Scalar 可见。
     int32_t lenTile = Get<M_VALUE>(actualBlockShape);
     AscendC::GlobalTensor<ElementMMadOut2> gmRemoteD;
-    uint64_t gmRemoteBaseOffset =
-        static_cast<uint64_t>(params.peermemInfo.combineSendPtr - params.peermemInfo.rankSyncInWorldPtr);
+    uint64_t gmRemoteBaseOffset = params.peermemInfo.mte.results;
     AscendC::DataCopyExtParams ub2GmParams{1, 0, 0, 0, 0};
     ub2GmParams.blockCount = 1;
     ub2GmParams.blockLen = Get<N_VALUE>(actualBlockShape) * sizeof(ElementMMadOut2);
@@ -132,7 +131,7 @@ __aicore__ inline void CombineSendTokenToRemote(uint32_t batchStart, uint32_t cu
     uint32_t topkIdx = metaInfoTensor.GetValue(batchStart * META_INFO_SIZE + TOPK_INDEX);
 
     AscendC::GlobalTensor<DataType> gmLocalD;
-    uint64_t gmRemoteOffset = params.peermemInfo.combineSendPtr - params.peermemInfo.rankSyncInWorldPtr;
+    uint64_t gmRemoteOffset = params.peermemInfo.mte.results;
     GM_ADDR srcAddr = localSrcPtr;
 
     if (toRankId == rankId) {
@@ -180,8 +179,7 @@ __aicore__ inline void CombineQuantizedTokens(uint32_t batchStart, uint32_t curR
     SplitWaitOutputSlot(params, route.dstRankId);
 
     AscendC::GlobalTensor<QuantOutType> gmRemoteD;
-    uint64_t gmRemoteOffset =
-        static_cast<uint64_t>(params.peermemInfo.combineSendPtr - params.peermemInfo.rankSyncInWorldPtr);
+    uint64_t gmRemoteOffset = params.peermemInfo.mte.results;
     __gm__ void *dstPeermemPtr = GetRankWinAddrWithOffset(route.dstRankId, gmRemoteOffset);
     gmRemoteD.SetGlobalBuffer(reinterpret_cast<__gm__ QuantOutType *>(dstPeermemPtr));
 
@@ -481,8 +479,7 @@ __aicore__ inline void CombineWaveTokenRange(const MoeStageCommonConfig &common,
     }
     GlobalTensor<bfloat16_t> gmm2OutGm;
     gmm2OutGm.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(gmm2OutGlobal));
-    uint64_t gmRemoteBaseOffset =
-        static_cast<uint64_t>(params.peermemInfo.combineSendPtr - params.peermemInfo.rankSyncInWorldPtr);
+    uint64_t gmRemoteBaseOffset = params.peermemInfo.mte.results;
     uint32_t rowBufferCount = bufferConfig.rowBufferCount;
     uint32_t tokenIdxInSlice = 0U;
     uint32_t firstUseCount = rowSequence < rowBufferCount ? rowBufferCount - rowSequence : 0U;

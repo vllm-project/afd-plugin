@@ -17,9 +17,9 @@
 
 /*!
  * \file atten_send_peermem.h
- * \brief peermem 跨卡对称窗口的布局与尺寸计算。
+ * \brief peermem 跨卡通信窗口的布局与尺寸计算。
  *        窗口各区尺寸一律按全卡一致的 numMaxTokensPerRank 上界推导（可变 bs 下各卡真实 bs 可不同，
- *        但跨卡读写共用同一套偏移，布局必须逐字节一致）。
+ *        跨卡读写按目标角色的布局计算偏移）。
  *        本文件是 host 侧 tiling 校验与 device 侧地址装配的唯一事实源，两侧不得各写一份公式。
  */
 
@@ -43,6 +43,7 @@
 #include "atten_send_constants.h"
 // ### PATCH START: AFD merged source layout
 #include "mega_layer_selection.h"
+#include "mega_mte_window.h"
 // ### PATCH END: AFD merged source layout
 
 namespace MegaDispatchSendImpl {
@@ -109,7 +110,7 @@ HOST_DEVICE int64_t CalcMaskRecvSize(int64_t maskAlignSize, int64_t moeExpertPer
     return Ops::Base::CeilAlign(moeExpertPerRank * epWorldSize * maskSlotSize, ALIGN_512);
 }
 
-// 独立 raw count 表按 [localExpert][sourceRank] 排列，供接收端一次搬入并做前缀和。
+// 独立 raw count 表按 [localExpert][sourceRank] 排列，供接收端构建前缀和。
 HOST_DEVICE int64_t CalcExpertCountRecvSize(int64_t moeExpertPerRank, int64_t epWorldSize)
 {
     return Ops::Base::CeilAlign(moeExpertPerRank * epWorldSize * static_cast<int64_t>(sizeof(int32_t)), ALIGN_512);
@@ -157,6 +158,7 @@ struct PeermemSizeParams {
     bool isQuantCombine;
     int64_t topoType;
     int64_t serverNum;
+    int64_t attentionRanks;
 };
 
 // peermem 各分段尺寸。Host 打印、窗口下限校验共用该结果，避免重复维护布局公式。
@@ -182,13 +184,14 @@ HOST_DEVICE PeermemLayoutSizes CalcPeermemLayoutSizes(const PeermemSizeParams &p
     if (params.topoType == TOPO_TYPE_MTE) {
         int64_t routeIndexAlignSize =
             Ops::Base::CeilAlign(params.numMaxTokensPerRank * static_cast<int64_t>(sizeof(int32_t)), ALIGN_32);
-        sizes.maskRecvSize = CalcRouteIndexRecvSize(routeIndexAlignSize, params.moeExpertPerRank, params.epWorldSize);
+        sizes.maskRecvSize = CalcRouteIndexRecvSize(routeIndexAlignSize, params.moeExpertPerRank, params.attentionRanks);
     } else {
         sizes.maskRecvSize = CalcMaskRecvSize(sizes.maskAlignSize, params.moeExpertPerRank, params.epWorldSize);
     }
     sizes.routeTaskMetaSize = params.topoType == TOPO_TYPE_MTE ?
-        static_cast<int64_t>(AfdAsyncLayer::TaskAreaBytes(static_cast<uint32_t>(params.epWorldSize))) : 0;
-    sizes.expertCountRecvSize = CalcExpertCountRecvSize(params.moeExpertPerRank, params.epWorldSize);
+        static_cast<int64_t>(AfdAsyncLayer::TaskAreaBytes(static_cast<uint32_t>(params.attentionRanks))) : 0;
+    sizes.expertCountRecvSize = CalcExpertCountRecvSize(params.moeExpertPerRank,
+        params.topoType == TOPO_TYPE_MTE ? params.attentionRanks : params.epWorldSize);
     sizes.tokenScaleBytes =
         CalcQuantTokenScaleBytes(params.h, params.elemsPerByte, params.topK, params.topkWeightsPrefetch);
     sizes.dispatchRecordAreaSize = Ops::Base::CeilAlign(params.numMaxTokensPerRank * sizes.tokenScaleBytes, ALIGN_512);
@@ -208,12 +211,15 @@ HOST_DEVICE PeermemLayoutSizes CalcPeermemLayoutSizes(const PeermemSizeParams &p
 
 /*
  * peermem 窗口所需的最小字节数，逐段与下方 PeermemInfo 构造函数的偏移推进同源：
- *   同步区(dataOffset) + route/mask 区 + MTE task metadata 区 + count 区 + dispatch 区 + combine 区。
+ *   MTE 取本角色最后一个分区的结束偏移；URMA 按原分区顺序累加。
  * host 侧 tiling 用它校验用户传入的 cclBufferSize，不再各自手写一份布局公式。
  */
 HOST_DEVICE int64_t CalcPeermemLeastSize(const PeermemSizeParams &params)
 {
     PeermemLayoutSizes sizes = CalcPeermemLayoutSizes(params);
+    if (params.topoType == TOPO_TYPE_MTE) {
+        return AfdAsync::MteOffsets(sizes).attentionEnd;
+    }
     return sizes.dataOffset + sizes.maskRecvSize + sizes.routeTaskMetaSize + sizes.expertCountRecvSize + sizes.dispatchRecordAreaSize +
            sizes.combineSendSize;
 }
@@ -221,6 +227,7 @@ HOST_DEVICE int64_t CalcPeermemLeastSize(const PeermemSizeParams &params)
 #if defined(__DAV_C310_CUBE__) || defined(__DAV_C310_VEC__)
 // device 侧窗口各区基址；偏移推进顺序即上方 CalcPeermemLeastSize 的分段顺序。
 struct PeermemInfo {
+    AfdAsync::MteWindowOffsets mte{};
     GM_ADDR rankSyncInWorldPtr{nullptr};
     GM_ADDR maskRecvPtr{nullptr};
     GM_ADDR routeTaskMetaPtr{nullptr};
@@ -245,25 +252,24 @@ struct PeermemInfo {
         params.topkWeightsPrefetch = tilingData->topkWeightsPrefetch == 1;
         params.isQuantCombine = tilingData->combineQuantMode != COMBINE_NO_QUANT;
         params.topoType = tilingData->topoType;
+        params.attentionRanks = tilingData->splitAttentionRanks;
         params.serverNum = static_cast<int64_t>(serverNum);
         PeermemLayoutSizes sizes = CalcPeermemLayoutSizes(params);
 
         rankSyncInWorldPtr = base;
+        if (params.topoType == TOPO_TYPE_MTE) {
+            mte = AfdAsync::MteOffsets(sizes);
+            quantTokenScalePtr = base + mte.inputs;
+            combineSendPtr = base + mte.results;
+            return;
+        }
         int64_t offset = sizes.dataOffset;
         maskRecvPtr = base + offset;
         offset += sizes.maskRecvSize;
 
-        if (tilingData->topoType == TOPO_TYPE_MTE) {
-            routeTaskMetaPtr = base + offset;
-            offset += sizes.routeTaskMetaSize;
-        }
         expertCountRecvPtr = base + offset;
         offset += sizes.expertCountRecvSize;
 
-        if (tilingData->topoType == TOPO_TYPE_MTE) {
-            quantTokenScalePtr = base + offset;
-            offset += sizes.dispatchRecordAreaSize;
-        }
         if (tilingData->topoType == TOPO_TYPE_URMA) {
             dispatchReceivePtr = base + offset;
             offset += sizes.relayDataSize;

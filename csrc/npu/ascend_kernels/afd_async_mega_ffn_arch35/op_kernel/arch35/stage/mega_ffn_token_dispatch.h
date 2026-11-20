@@ -62,12 +62,10 @@ struct ExpertDispatchCoreRange {
 __aicore__ inline TokenDispatchConfig CreateTokenDispatchConfig(const Params &params,
                                                                 const QuantProcessConfig &quantProcessConfig)
 {
-    uint64_t quantWinOffset =
-        static_cast<uint64_t>(params.peermemInfo.quantTokenScalePtr - params.peermemInfo.rankSyncInWorldPtr);
     return {.maxOutputSize = params.tilingData->maxOutputSize,
             .bufferConfig = params.tilingData->dispatchBufferConfig,
             .routeIndexAlignSize = static_cast<uint64_t>(CalcDispatchRouteIndexAlignSize(params.tilingData)),
-            .quantWinOffset = quantWinOffset,
+            .quantWinOffset = static_cast<uint64_t>(params.peermemInfo.mte.inputs),
             .quantTokenAlignBytes = quantProcessConfig.quantTokenAlignBytes,
             .quantScaleAlignBytes = quantProcessConfig.quantScaleAlignBytes,
             .quantTokenScaleAlignBytes = quantProcessConfig.quantTokenScaleAlignBytes};
@@ -262,7 +260,8 @@ __aicore__ inline int32_t DispatchRankTokens(const TokenDispatchConfig &context,
         int32_t routeOrdinal = segmentMatchOrdinalBegin + processedRouteCount;
         // 直接定位当前专家、source rank 的 compact ordinal，不再扫描完整 topK mask。
         uint64_t slotOffset =
-            (static_cast<uint64_t>(localExpertId) * common.worldSize + remoteRankIdx) * context.routeIndexAlignSize;
+            (static_cast<uint64_t>(localExpertId) * params.tilingData->splitAttentionRanks + remoteRankIdx) *
+            context.routeIndexAlignSize;
         remoteRouteIndexGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(
             params.peermemInfo.maskRecvPtr + slotOffset + static_cast<uint64_t>(routeOrdinal) * sizeof(int32_t)));
         DataCopyExtParams routeCopyParams{1U, static_cast<uint32_t>(batchDispatchRowCount * sizeof(int32_t)), 0U, 0U,
@@ -457,10 +456,11 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
     }
     weights.layerIndex = taskLayer;
     uint32_t rawCountElementCount = common.worldSize * common.moeExpertPerRank;
+    uint32_t windowCountElements = params.tilingData->splitAttentionRanks * common.moeExpertPerRank;
     GlobalTensor<int32_t> expertCountGlobal;
     expertCountGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(params.peermemInfo.expertCountRecvPtr));
     DataCopyPad(scratch.cumsumInfoTensor, expertCountGlobal,
-                {1U, rawCountElementCount * static_cast<uint32_t>(sizeof(int32_t)), 0U, 0U, 0U}, {true, 0U, 0U, 0U});
+                {1U, windowCountElements * static_cast<uint32_t>(sizeof(int32_t)), 0U, 0U, 0U}, {true, 0U, 0U, 0U});
     SyncFuncStatic<AscendC::HardEvent::MTE2_S, SYNC_EVENT_ID2>();
 
     /*
@@ -476,9 +476,11 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
             scratch.cumsumInfoTensor.SetValue(slotIdx, 0);
             continue;
         }
-        int32_t slotValue = ReadGmByPassDCache(rawCountGm + slotIdx);
+        // Local prefix rows retain union width; only the registered count rows are compact.
+        uint32_t countIdx = (slotIdx / common.worldSize) * td->splitAttentionRanks + slotIdx % common.worldSize;
+        int32_t slotValue = ReadGmByPassDCache(rawCountGm + countIdx);
         while (((static_cast<uint32_t>(slotValue) >> 24U) & 0xFFU) != static_cast<uint32_t>(expectEpoch)) {
-            slotValue = ReadGmByPassDCache(rawCountGm + slotIdx);
+            slotValue = ReadGmByPassDCache(rawCountGm + countIdx);
         }
         scratch.cumsumInfoTensor.SetValue(slotIdx, slotValue & 0x00FFFFFF);
     }
