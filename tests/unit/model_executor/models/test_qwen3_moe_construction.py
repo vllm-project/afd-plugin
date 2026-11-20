@@ -235,6 +235,40 @@ def test_model_injects_role_aware_decoder_through_native_hook(
     assert model.afd_role == "attention"
 
 
+def test_routed_experts_shell_builds_only_native_moe_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+    construction_env,
+) -> None:
+    vllm_config = _model_config(layer_count=2)
+    monkeypatch.setattr(adapter, "current_platform", _platform(is_cuda=True))
+    monkeypatch.setattr(
+        adapter,
+        "parse_afd_config",
+        lambda *_args, **_kwargs: AFDConfig(
+            role="ffn",
+            connector=DEEPEP_M2N_CONNECTOR,
+            compute_gate_on_attention=True,
+        ),
+    )
+
+    model = adapter.AFDQwen3MoeRoutedExperts(
+        vllm_config=vllm_config,
+        prefix="draft",
+    )
+
+    assert construction_env["moe"] == [
+        "draft.model.layers.0.mlp",
+        "draft.model.layers.1.mlp",
+    ]
+    assert set(dict(model.named_parameters())) == {
+        "model.layers.0.mlp.weight",
+        "model.layers.1.mlp.weight",
+    }
+    assert model.get_experts_layer_indices() == (0, 1)
+    assert model.is_unused_checkpoint_weight("lm_head.weight")
+    assert not model.is_unused_checkpoint_weight("model.layers.0.mlp.gate.weight")
+
+
 def test_attention_causal_lm_reports_no_local_moe_modules(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
