@@ -114,8 +114,8 @@ class BuildAscendOps(build_ext):
         subprocess.check_call(["cmake", "--build", ".", f"-j={jobs}"], cwd=build_temp)
         subprocess.check_call(["cmake", "--install", "."], cwd=build_temp)
 
-        src_cann_ops = ROOT / "afd_plugin" / "_cann_ops_custom"
-        dst_cann_ops = Path(self.build_lib) / "afd_plugin" / "_cann_ops_custom"
+        src_cann_ops = ROOT / "afd_plugin" / "_custom_ops"
+        dst_cann_ops = Path(self.build_lib) / "afd_plugin" / "_custom_ops"
         if src_cann_ops.exists():
             if dst_cann_ops.exists():
                 shutil.rmtree(dst_cann_ops)
@@ -131,7 +131,7 @@ if _should_build_ascend_ops():
     soc_version = os.environ.get("SOC_VERSION", "910c").lower()
     if soc_version == "950" or soc_version.startswith("ascend950"):
         ext_modules.append(
-            CMakeExtension("afd_plugin._C_megamoe", "csrc/npu/pybind"),
+            CMakeExtension("afd_plugin._C_afd_async_mega", "csrc/npu/pybind"),
         )
 
 

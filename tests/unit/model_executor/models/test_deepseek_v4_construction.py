@@ -175,7 +175,7 @@ def test_v4_model_rejects_native_and_flashinfer_mega_backends(
     vllm_config = _vllm_config()
     vllm_config.kernel_config.moe_backend = backend
 
-    with pytest.raises(RuntimeError, match="does not support MegaMoE"):
+    with pytest.raises(RuntimeError, match="does not support Mega"):
         _make_model(monkeypatch, role="ffn", vllm_config=vllm_config)
 
 

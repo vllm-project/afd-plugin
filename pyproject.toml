@@ -69,11 +69,11 @@ e2e-tests = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["afd_plugin*"]
-exclude = ["afd_plugin._cann_ops_custom*"]
+exclude = ["afd_plugin._custom_ops*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-afd_plugin = ["py.typed", "_cann_ops_custom/**/*"]
+afd_plugin = ["py.typed", "_custom_ops/**/*"]
 "afd_plugin.compat.npu.megamoe" = ["LICENSE"]
 
 [tool.pytest.ini_options]

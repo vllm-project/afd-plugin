@@ -245,7 +245,7 @@ def test_compute_hash_changes_for_graph_affecting_fields():
 
 
 @pytest.mark.parametrize(
-    "connector", ["CAMAsyncAFDConnector", "CAMAsyncMegamoeAFDConnector"]
+    "connector", ["CAMAsyncAFDConnector", "CAMAsyncMegaAFDConnector"]
 )
 def test_async_connectors_enable_independent_dp(connector):
     source = {"afd": {"connector": connector, "role": "attention", "async": True}}

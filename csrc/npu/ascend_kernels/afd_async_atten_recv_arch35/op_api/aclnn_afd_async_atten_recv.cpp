@@ -1,0 +1,31 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+/*
+ * License: CANN Open Software License Agreement Version 2.0
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * Description: Expose the ACLNN interface for the AFD Mega operator.
+ * Note:
+ * History: 2026-11-17 adapt the split Mega operator for AFD integration.
+ */
+
+#include "aclnnInner_afd_async_atten_recv_arch35.h"
+
+#include "aclnn_afd_async_atten_recv.h"
+
+extern "C" {
+aclnnStatus aclnnAfdAsyncAttenRecvGetWorkspaceSize(const aclTensor *context, const aclTensor *topk_ids, const aclTensor *topk_weights, const aclTensor *snapshot_data, const aclTensor *snapshot_scales, const aclTensorList *shared_weight1, const aclTensorList *shared_weight2, const aclTensorList *shared_scales1, const aclTensorList *shared_scales2, const aclIntArray *configuration, const aclIntArray *dp_ranks, const aclFloatArray *activation_parameters, const aclTensor *y, const aclTensor *completion, uint64_t *workspaceSize, aclOpExecutor **executor)
+{
+    return aclnnInnerAfdAsyncAttenRecvArch35GetWorkspaceSize(context, topk_ids, topk_weights, snapshot_data, snapshot_scales, shared_weight1, shared_weight2, shared_scales1, shared_scales2, configuration, dp_ranks, activation_parameters, y, completion, workspaceSize, executor);
+}
+aclnnStatus aclnnAfdAsyncAttenRecv(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream)
+{
+    return aclnnInnerAfdAsyncAttenRecvArch35(workspace, workspaceSize, executor, stream);
+}
+}

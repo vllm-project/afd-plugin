@@ -9,7 +9,7 @@ Use for NPU/GPU selection and platform mechanics: `validation.py`
 `validate_npu_model_runner_v2_config`), `setup.py` Ascend-op build gating, and
 `csrc/npu/` (`ascend_kernels/` a2e/e2a and `grouped_matmul_layered` ACLNN
 operators under the `npu_op_*` build system, `pybind/` → `afd_plugin._C_ascend`,
-`build_aclnn.sh` installing into `afd_plugin/_cann_ops_custom`, and the drivers
+`build_aclnn.sh` installing into `afd_plugin/_custom_ops`, and the drivers
 in `scripts/`). Does not own connector behavior or the deferred NPU patch
 application ([npu-compat.md](npu-compat.md)).
 
@@ -37,7 +37,7 @@ application ([npu-compat.md](npu-compat.md)).
   native ops must state where the GPU counterpart lives and why it is not
   plugin-owned today.
 - Vendored `.run`/`.whl` artifacts under `afd_plugin/connectors/npu/bin/` and
-  the generated `_cann_ops_custom` tree are packaging, not source; a change
+  the generated `_custom_ops` tree are packaging, not source; a change
   there needs version/CANN justification (see
   [connectors.md](connectors.md#vendored-ascend-artifacts)).
 

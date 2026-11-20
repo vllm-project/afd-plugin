@@ -21,7 +21,7 @@ tests for GPU and Ascend NPU deployments.
 The plugin extends vLLM through its general-plugin entry point without
 modifying the vLLM source tree.
 
-A5 DeepSeek V4 Flash support and bundled MegaMoE setup are described in
+A5 DeepSeek V4 Flash support and bundled Mega setup are described in
 [A5 development notes](docs/npu/A5_DSV4_ASYNC.md).
 
 ## Architecture

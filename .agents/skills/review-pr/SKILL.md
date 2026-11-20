@@ -145,7 +145,7 @@ state fingerprints, and byte-for-byte staleness checks.
 Group files into production code, tests, docs, configuration, build/CI, agent
 skills, and vendored artifacts (for example
 `afd_plugin/connectors/npu/bin/*.run|*.whl` and the packaged
-`afd_plugin/_cann_ops_custom` tree). Map each changed production file and test
+`afd_plugin/_custom_ops` tree). Map each changed production file and test
 group to the PR goal. Compare the title/body claims with the actual diff; use
 linked issues only when they define the contract or reproduction.
 

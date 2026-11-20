@@ -29,7 +29,7 @@ bash "${NPU_CSRC_DIR}/scripts/compile_ascend_proj.sh" \
   "${CMAKE_BUILD_TYPE:-Release}" \
   "${NPU_CSRC_DIR}/output"
 
-INSTALL_PATH="${ROOT_DIR}/afd_plugin/_cann_ops_custom"
+INSTALL_PATH="${ROOT_DIR}/afd_plugin/_custom_ops"
 rm -rf "${INSTALL_PATH}"
 mkdir -p "${INSTALL_PATH}"
 run_file="${NPU_CSRC_DIR}/output/AFD_${SOC_ARG}.run"

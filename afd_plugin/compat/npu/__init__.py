@@ -14,7 +14,7 @@ from afd_plugin.compat.npu.ops import (
     ensure_afd_ascend_ops_loaded,
     ensure_cam_async_ops_available,
     ensure_cam_p2p_ops_available,
-    get_afd_cann_vendor_path,
+    get_afd_vendor_path,
     get_afd_cust_opapi_path,
     has_afd_ascend_ops,
 )
@@ -48,7 +48,7 @@ __all__ = [
     "ensure_cam_p2p_ops_available",
     "fail_if_unsupported_npu_afd_features",
     "fix_all2all_backend_for_afd",
-    "get_afd_cann_vendor_path",
+    "get_afd_vendor_path",
     "get_afd_cust_opapi_path",
     "has_afd_ascend_ops",
     "npu_afd_num_ubatches",

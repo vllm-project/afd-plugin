@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 AFD_ADDITIONAL_CONFIG_KEY: Final[str] = "afd"
 AFD_ASYNC_CONNECTOR: Final[str] = "CAMAsyncAFDConnector"
-MEGAMOE_CONNECTOR: Final[str] = "CAMAsyncMegamoeAFDConnector"
+MEGA_CONNECTOR: Final[str] = "CAMAsyncMegaAFDConnector"
 CAMP2P_CONNECTOR: Final[str] = "CAMP2pAFDConnector"
 DEEPEP_M2N_CONNECTOR: Final[str] = "DeepEPM2NAFDConnector"
 DEEPEP_M2N_CONNECTORS: Final[tuple[str, ...]] = (DEEPEP_M2N_CONNECTOR,)
@@ -30,7 +30,7 @@ SUPPORTED_AFD_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pNcclAFDConnector",
     DEEPEP_M2N_CONNECTOR,
     CAMP2P_CONNECTOR,
-    MEGAMOE_CONNECTOR,
+    MEGA_CONNECTOR,
     AFD_ASYNC_CONNECTOR,
 )
 
@@ -309,7 +309,7 @@ def is_afd_async_dp(vllm_config: VllmConfig) -> bool:
     return (
         config is not None
         and config.async_dp
-        and config.connector in (AFD_ASYNC_CONNECTOR, MEGAMOE_CONNECTOR)
+        and config.connector in (AFD_ASYNC_CONNECTOR, MEGA_CONNECTOR)
     )
 
 
@@ -335,11 +335,11 @@ def validate_afd_config(
         )
     if config.async_dp and config.connector not in (
         AFD_ASYNC_CONNECTOR,
-        MEGAMOE_CONNECTOR,
+        MEGA_CONNECTOR,
     ):
         raise ValueError(
             "AFD async mode requires CAMAsyncAFDConnector or "
-            "CAMAsyncMegamoeAFDConnector",
+            "CAMAsyncMegaAFDConnector",
         )
     if config.connector == "P2pNcclAFDConnector":
         from afd_plugin.distributed import validate_p2p_topology

@@ -8,8 +8,8 @@ project(opp)
 find_package(ASC REQUIRED)
 set(package_name ${vendor_name})
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/megamoe_utils")
-    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/megamoe_sdk.cmake")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/mega_utils")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/mega_sdk.cmake")
 endif()
 
 npu_op_package(${package_name}

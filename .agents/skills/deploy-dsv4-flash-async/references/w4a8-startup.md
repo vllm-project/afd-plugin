@@ -4,7 +4,7 @@
 
 ## 启动前检查源码编译算子
 
-当前 async CAM 算子由 AFD 源码构建，打包在 `afd_plugin/_cann_ops_custom/vendors/afd-plugin` 和 `_C_ascend` 中，不要求单独的 CAM vendor 库。不要以 `/usr/local/Ascend/.../vendors/CAM/op_api/lib/libopapi.so` 是否存在判定安装成败。检查安装日志的成功退出码、编译进程是否结束，并在与服务相同的 Python 环境中先导入 `torch`，再加载扩展；反过来先导入 `_C_ascend` 可能误报找不到 `libtorch.so`。
+当前 async CAM 算子由 AFD 源码构建，打包在 `afd_plugin/_custom_ops/vendors/afd-plugin` 和 `_C_ascend` 中，不要求单独的 CAM vendor 库。不要以 `/usr/local/Ascend/.../vendors/CAM/op_api/lib/libopapi.so` 是否存在判定安装成败。检查安装日志的成功退出码、编译进程是否结束，并在与服务相同的 Python 环境中先导入 `torch`，再加载扩展；反过来先导入 `_C_ascend` 可能误报找不到 `libtorch.so`。
 
 ```python
 import torch

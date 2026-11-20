@@ -28,7 +28,7 @@ from afd_plugin.connectors import (
     AFDForwardContextMetadata,
     AFDTransferContext,
 )
-from afd_plugin.connectors.npu.async_megamoe import CAMAsyncMegamoeAFDConnector
+from afd_plugin.connectors.npu.async_mega import CAMAsyncMegaAFDConnector
 from afd_plugin.v1.worker.attention_metadata import (
     _resolve_world_ranks,
 )
@@ -135,7 +135,7 @@ class AFDNPUFFNModelRunner:
 
     def initialize_afd_connector(self) -> None:
         if (
-            isinstance(self.connector, CAMAsyncMegamoeAFDConnector)
+            isinstance(self.connector, CAMAsyncMegaAFDConnector)
             and not self.connector.is_initialized
         ):
             self.connector.prepare_layers(self.get_model().model.layers)

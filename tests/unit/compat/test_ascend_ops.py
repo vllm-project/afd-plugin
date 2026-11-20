@@ -12,7 +12,7 @@ from afd_plugin.compat.npu import ops
 from afd_plugin.compat.npu.ops import (
     ensure_cam_async_ops_available,
     ensure_cam_p2p_ops_available,
-    get_afd_cann_vendor_path,
+    get_afd_vendor_path,
     get_afd_cust_opapi_path,
     has_afd_ascend_ops,
 )
@@ -27,14 +27,14 @@ def test_ascend_ops_loader_fails_clearly_without_extension():
 
 
 def test_ascend_ops_paths_are_plugin_owned():
-    vendor_path = get_afd_cann_vendor_path()
+    vendor_path = get_afd_vendor_path()
     cust_opapi_path = get_afd_cust_opapi_path()
 
-    assert vendor_path.parts[-3:] == ("_cann_ops_custom", "vendors", "afd-plugin")
+    assert vendor_path.parts[-3:] == ("_custom_ops", "vendors", "afd-plugin")
     assert "vllm-ascend" not in vendor_path.parts
     assert cust_opapi_path.name == "libcust_opapi.so"
     assert cust_opapi_path.parts[-6:] == (
-        "_cann_ops_custom",
+        "_custom_ops",
         "vendors",
         "afd-plugin",
         "op_api",
@@ -45,13 +45,13 @@ def test_ascend_ops_paths_are_plugin_owned():
 
 def test_ascend_ops_loader_sets_explicit_cust_opapi_path(tmp_path, monkeypatch):
     vendor_path = (
-        tmp_path / "afd_plugin" / "_cann_ops_custom" / "vendors" / "afd-plugin"
+        tmp_path / "afd_plugin" / "_custom_ops" / "vendors" / "afd-plugin"
     )
     op_api_lib = vendor_path / "op_api" / "lib"
     op_api_lib.mkdir(parents=True)
     cust_opapi_path = op_api_lib / "libcust_opapi.so"
     cust_opapi_path.touch()
-    monkeypatch.setattr(ops, "get_afd_cann_vendor_path", lambda: vendor_path)
+    monkeypatch.setattr(ops, "get_afd_vendor_path", lambda: vendor_path)
     monkeypatch.setattr(ops, "get_afd_cust_opapi_path", lambda: cust_opapi_path)
     monkeypatch.delenv("ASCEND_CUSTOM_OPP_PATH", raising=False)
     monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)

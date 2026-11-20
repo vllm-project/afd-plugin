@@ -22,17 +22,17 @@ CAM_COMBINE_SEND = "afd_async_combine_send"
 CAM_COMBINE_RECV = "afd_async_combine_recv"
 
 
-def get_afd_cann_vendor_path() -> Path:
+def get_afd_vendor_path() -> Path:
     return (
         Path(__file__).resolve().parents[2]
-        / "_cann_ops_custom"
+        / "_custom_ops"
         / "vendors"
         / AFD_ASCEND_VENDOR_NAME
     )
 
 
 def get_afd_cust_opapi_path() -> Path:
-    return get_afd_cann_vendor_path() / "op_api" / "lib" / "libcust_opapi.so"
+    return get_afd_vendor_path() / "op_api" / "lib" / "libcust_opapi.so"
 
 
 def _prepend_env_path(name: str, path: Path) -> None:
@@ -45,7 +45,7 @@ def _prepend_env_path(name: str, path: Path) -> None:
 
 
 def _ensure_afd_custom_opp_env() -> None:
-    vendor_dir = get_afd_cann_vendor_path()
+    vendor_dir = get_afd_vendor_path()
     if not vendor_dir.exists():
         return
 
@@ -125,12 +125,12 @@ def ensure_cam_async_ops_available() -> None:
 
 
 @lru_cache(maxsize=1)
-def ensure_megamoe_ops_available() -> torch.library.Library:
-    """Load MegaMoE and retain its torch registrations for the process lifetime."""
+def ensure_mega_ops_available() -> torch.library.Library:
+    """Load Mega and retain its torch registrations for the process lifetime."""
     _ensure_afd_custom_opp_env()
     if not get_afd_cust_opapi_path().is_file():
         raise RuntimeError(
-            "AFD MegaMoE custom operators are missing. Build with "
+            "AFD Mega custom operators are missing. Build with "
             "AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=950 in a torch-npu/CANN environment."
         )
     try:
@@ -138,48 +138,48 @@ def ensure_megamoe_ops_available() -> torch.library.Library:
 
         import torch
 
-        from afd_plugin import _C_megamoe
+        from afd_plugin import _C_afd_async_mega
     except ImportError as exc:
         raise RuntimeError(
-            "AFD MegaMoE bindings are unavailable. Rebuild with "
+            "AFD Mega bindings are unavailable. Rebuild with "
             "AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=950."
         ) from exc
 
     # CAM registers its operators in C++ via TORCH_LIBRARY macros; the CANN-derived
-    # MegaMoE bindings only export pybind functions, so register their schemas,
+    # Mega bindings only export pybind functions, so register their schemas,
     # Meta and PrivateUse1 impls here. FRAGMENT coexists with CAM; the cached
     # return value keeps the Library alive so the operators stay registered.
     library = torch.library.Library(AFD_ASCEND_OPS_NAMESPACE, "FRAGMENT")
 
-    # MegaMoE schema/Meta adapters below retain their source license:
+    # Mega schema/Meta adapters below retain their source license:
     # Copyright (c) 2026 Huawei Technologies Co., Ltd. Licensed under CANN OSL v2.
 
-    library.define('npu_megamoe_dispatch_send(Tensor(a!) context, Tensor x, Tensor topk_ids, Tensor topk_weights, int[] configuration, int[] dp_ranks, float[] activation_parameters, int layer_index=0) -> (Tensor, Tensor, Tensor)')
+    library.define('afd_async_atten_send(Tensor(a!) context, Tensor x, Tensor topk_ids, Tensor topk_weights, int[] configuration, int[] dp_ranks, float[] activation_parameters, int layer_index=0) -> (Tensor, Tensor, Tensor)')
 
-    def megamoe_dispatch_send_meta(context, x, topk_ids, topk_weights, configuration, dp_ranks, activation_parameters, layer_index=0):
+    def atten_send_meta(context, x, topk_ids, topk_weights, configuration, dp_ranks, activation_parameters, layer_index=0):
         tokens = configuration[13] if configuration[12] else 0
         return (context.new_empty((tokens, configuration[4]), dtype=torch.uint8),
                 context.new_empty((tokens, (configuration[4] + 63) // 64 * 2), dtype=torch.uint8), context.new_empty((1,), dtype=torch.int32))
 
-    library.impl("npu_megamoe_dispatch_send", megamoe_dispatch_send_meta, "Meta")
-    library.impl("npu_megamoe_dispatch_send", _C_megamoe.npu_megamoe_dispatch_send, "PrivateUse1")
+    library.impl("afd_async_atten_send", atten_send_meta, "Meta")
+    library.impl("afd_async_atten_send", _C_afd_async_mega.afd_async_atten_send, "PrivateUse1")
 
-    library.define('npu_megamoe_combine_recv(Tensor(a!) context, Tensor topk_ids, Tensor topk_weights, Tensor snapshot_data, Tensor snapshot_scales, Tensor[] shared_weight1, Tensor[] shared_weight2, Tensor[] shared_scales1, Tensor[] shared_scales2, int[] configuration, int[] dp_ranks, float[] activation_parameters) -> (Tensor, Tensor)')
+    library.define('afd_async_atten_recv(Tensor(a!) context, Tensor topk_ids, Tensor topk_weights, Tensor snapshot_data, Tensor snapshot_scales, Tensor[] shared_weight1, Tensor[] shared_weight2, Tensor[] shared_scales1, Tensor[] shared_scales2, int[] configuration, int[] dp_ranks, float[] activation_parameters) -> (Tensor, Tensor)')
 
-    def megamoe_combine_recv_meta(context, topk_ids, topk_weights, snapshot_data, snapshot_scales, shared_weight1, shared_weight2, shared_scales1, shared_scales2, configuration, dp_ranks, activation_parameters):
+    def atten_recv_meta(context, topk_ids, topk_weights, snapshot_data, snapshot_scales, shared_weight1, shared_weight2, shared_scales1, shared_scales2, configuration, dp_ranks, activation_parameters):
         return (context.new_empty((configuration[13], configuration[4]), dtype=torch.bfloat16),
                 context.new_empty((1,), dtype=torch.int32))
 
-    library.impl("npu_megamoe_combine_recv", megamoe_combine_recv_meta, "Meta")
-    library.impl("npu_megamoe_combine_recv", _C_megamoe.npu_megamoe_combine_recv, "PrivateUse1")
+    library.impl("afd_async_atten_recv", atten_recv_meta, "Meta")
+    library.impl("afd_async_atten_recv", _C_afd_async_mega.afd_async_atten_recv, "PrivateUse1")
 
-    library.define('npu_megamoe_fused_moe(Tensor(a!) context, Tensor[] weight1, Tensor[] weight2, Tensor[] weight_scales1, Tensor[] weight_scales2, int[] configuration, int[] dp_ranks, float[] activation_parameters) -> Tensor')
+    library.define('afd_async_mega_ffn(Tensor(a!) context, Tensor[] weight1, Tensor[] weight2, Tensor[] weight_scales1, Tensor[] weight_scales2, int[] configuration, int[] dp_ranks, float[] activation_parameters) -> Tensor')
 
-    def megamoe_fused_moe_meta(context, weight1, weight2, weight_scales1, weight_scales2, configuration, dp_ranks, activation_parameters):
+    def mega_ffn_meta(context, weight1, weight2, weight_scales1, weight_scales2, configuration, dp_ranks, activation_parameters):
         return context.new_empty((configuration[2] // configuration[1],), dtype=torch.int32)
 
-    library.impl("npu_megamoe_fused_moe", megamoe_fused_moe_meta, "Meta")
-    library.impl("npu_megamoe_fused_moe", _C_megamoe.npu_megamoe_fused_moe, "PrivateUse1")
+    library.impl("afd_async_mega_ffn", mega_ffn_meta, "Meta")
+    library.impl("afd_async_mega_ffn", _C_afd_async_mega.afd_async_mega_ffn, "PrivateUse1")
 
     return library
 
@@ -195,9 +195,9 @@ __all__ = [
     "CAM_OP_NAMESPACE",
     "ensure_afd_ascend_ops_loaded",
     "ensure_cam_async_ops_available",
-    "ensure_megamoe_ops_available",
+    "ensure_mega_ops_available",
     "ensure_cam_p2p_ops_available",
-    "get_afd_cann_vendor_path",
+    "get_afd_vendor_path",
     "get_afd_cust_opapi_path",
     "has_afd_ascend_ops",
 ]

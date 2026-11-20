@@ -121,11 +121,11 @@ build_ascend_proj() {
     # operators (include mode)
     copy_ops_include "${src_path}/ascend_kernels" "${build_root}/${proj_name}" "$selected_ops"
 
-    # Stage the four shared MegaMoE protocol/host headers beside the merged
+    # Stage the four shared Mega protocol/host headers beside the merged
     # operator directories. Third-party headers are resolved from the CANN SDK.
     case " $selected_ops " in
-        *" cam_megamoe_"*)
-            cp -a "${src_path}/ascend_kernels/megamoe_utils" "${build_root}/${proj_name}/"
+        *" afd_async_atten_send_arch35 "*|*" afd_async_mega_ffn_arch35 "*|*" afd_async_atten_recv_arch35 "*)
+            cp -a "${src_path}/ascend_kernels/mega_utils" "${build_root}/${proj_name}/"
             ;;
     esac
 
@@ -152,7 +152,7 @@ build_ascend_proj() {
 
     # Configure cmake
     local -a generator_args=()
-    if [ -d megamoe_utils ]; then
+    if [ -d mega_utils ]; then
         # The pinned SDK parser adaptation operates on generated Make recipes.
         generator_args=(-G "Unix Makefiles")
     fi
@@ -160,7 +160,7 @@ build_ascend_proj() {
 
     # ### PATCH START: build-local SDK format/OPC adaptation from UMDK 7d25107
     # Preserve SDK validation: only add the FP4 weight format to a local copy.
-    if [ -d megamoe_utils ]; then
+    if [ -d mega_utils ]; then
         python3 - <<'PYBUILD'
 import ast
 import re
@@ -180,16 +180,16 @@ if formats is None:
 if "FRACTAL_NZ_C0_32" not in ast.literal_eval(formats[1]):
     pos = formats.start(1) + 1
     text = text[:pos] + '\n    "FRACTAL_NZ_C0_32",' + text[pos:]
-local = Path("build_out/megamoe_ops_info/parse_ini_to_json.py").resolve()
+local = Path("build_out/mega_ops_info/parse_ini_to_json.py").resolve()
 local.parent.mkdir(parents=True, exist_ok=True)
 local.write_text(text)
 for make in files:
     make.write_text(pattern.sub(lambda m: m[1] + shlex.quote(str(local)), make.read_text()))
-print(f"MegaMoE ops-info parser: {source} -> {local}")
+print(f"Mega ops-info parser: {source} -> {local}")
 
 # Forward the same options as op_kernel/CMakeLists.txt when the SDK's simple
 # compile recipe omits them. Do not overwrite a non-empty SDK option string.
-options = Path("build_out/megamoe_kernel_options.txt").read_text().split(";")
+options = Path("build_out/mega_kernel_options.txt").read_text().split(";")
 compile_options = shlex.quote(" ".join(shlex.quote(option) for option in options))
 for make in Path("build_out/op_kernel/CMakeFiles").rglob("build.make"):
     text = make.read_text()

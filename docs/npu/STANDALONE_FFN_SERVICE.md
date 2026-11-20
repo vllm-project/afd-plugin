@@ -50,7 +50,7 @@ matching dispatch envelope of 2048 tokens:
 ```bash
 # Activate the existing CANN environment and keep its Python/library paths.
 # GE must see both native vendor paths before the first torch-npu import.
-afd_cam_vendor=/path/to/afd_plugin/_cann_ops_custom/vendors/afd-plugin
+afd_cam_vendor=/path/to/afd_plugin/_custom_ops/vendors/afd-plugin
 ascend_native_vendor=/path/to/vllm_ascend/_cann_ops_custom/vendors/custom_transformer
 export ASCEND_CUSTOM_OPP_PATH="$ascend_native_vendor:$afd_cam_vendor${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
 export VLLM_USE_V2_MODEL_RUNNER=1

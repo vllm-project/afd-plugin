@@ -24,7 +24,7 @@ def _make_proxy(monkeypatch, *, use_sequence_parallel: bool, in_profile_run: boo
     proxy = object.__new__(adapter.AFDDeepseekV4AttentionGateRemoteMoE)
     torch.nn.Module.__init__(proxy)
     proxy.use_sequence_parallel_moe = use_sequence_parallel
-    proxy.megamoe = False
+    proxy.mega = False
     proxy.shared_experts = None
     proxy.layer_idx = 3
     connector = SimpleNamespace()
@@ -115,14 +115,14 @@ def test_dsv4_gate_keeps_sequence_parallel_tokens_rank_local(monkeypatch):
 
 
 @pytest.mark.parametrize("tokens,rank", [(5, 0), (5, 1), (1, 1)])
-def test_megamoe_routes_only_real_local_rows(monkeypatch, tokens, rank):
+def test_mega_routes_only_real_local_rows(monkeypatch, tokens, rank):
     from vllm.distributed import parallel_state
     from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
     proxy, _, _ = _make_proxy(
         monkeypatch, use_sequence_parallel=False, in_profile_run=False
     )
-    proxy.megamoe = True
+    proxy.mega = True
     proxy.top_k = 2
     proxy.gate = SimpleNamespace(tid2eid=True)
     hidden = torch.arange(tokens * 4).reshape(tokens, 4).to(torch.bfloat16)

@@ -1,7 +1,7 @@
-# MegaMoE source attribution
+# Mega source attribution
 
-The `cam_megamoe_dispatch_send`, `cam_megamoe_combine_recv`, and
-`cam_megamoe_fused_moe` operators adapt the MegaMoE operators in CANN
+The `afd_async_atten_send`, `afd_async_atten_recv`, and
+`afd_async_mega_ffn` operators adapt the Mega operators in CANN
 `ops-transformer/mc2`. Their original CANN copyright and license notices
 remain in place. The appended blocks use the UMDK-style Huawei copyright
 notice and record the split operator adaptations for AFD integration.
@@ -12,7 +12,7 @@ The UMDK MIT notice is not applied to CANN source. The 2026-11-17 history
 entry records the adaptation history, not original creation.
 Existing original creation dates are preserved.
 
-`megamoe_utils` contains only the shared layer-selection, sequence-limit,
+`mega_utils` contains only the shared layer-selection, sequence-limit,
 sequence-ring and host-compatibility headers. Their existing copyright and
 license notices remain unchanged. MC2 common, OpBase, Blaze and Tensor API
 headers are consumed from the installed CANN SDK rather than vendored here.
@@ -23,7 +23,7 @@ and `umdk` alongside this repository.
 
 - CANN operator reference: [ops-transformer local upstream](https://gitcode.com/lqy16/ops-transformer),
   revision `b7dd23b2999cc5ea052ab92a033ba640395b6ee4`, paths
-  `mc2/megamoe_dispatch_send`, `mc2/megamoe_combine_recv`, and related MegaMoE sources.
+  `mc2/atten_send`, `mc2/atten_recv`, and related Mega sources.
 - Header format reference: [UMDK fused_deep_moe.cpp](https://gitcode.com/openeuler/umdk/blob/master/src/cam/comm_operator/ascend_kernels/fused_deep_moe/op_kernel/fused_deep_moe.cpp).
   The local template read was
   `src/cam/comm_operator/ascend_kernels/fused_deep_moe_w4a8/op_kernel/fused_deep_moe.cpp`
@@ -41,18 +41,18 @@ OSL v2; the link above locates its retained text. No license text has been rewri
 
 The split operator Python code came from `lqy16/umdk` at
 `ab039f0a384854a4d5f504b9c3425bc232186735`, under
-`src/cam/comm_operator/pybind/umdk_cam_megamoe/`, with corresponding development
+`src/cam/comm_operator/pybind/umdk_afd_async/`, with corresponding development
 sources under `mc2/common/torch_extension/` in ops-transformer.
 These are split operator development sources, not an official CANN Python API.
 Existing copyright and license notices are preserved.
 
-`afd_plugin/compat/npu/ops.py` loads `afd_plugin._C_megamoe` and registers the
+`afd_plugin/compat/npu/ops.py` loads `afd_plugin._C_afd_async_mega` and registers the
 three `afd_ascend` operator schemas, Meta implementations and native bindings.
 It does not manage windows, sequences, tickets or publication polling.
 
-`afd_plugin/connectors/npu/megamoe_runtime.py` owns window lifecycle,
+`afd_plugin/connectors/npu/mega_runtime.py` owns window lifecycle,
 configuration construction, sequence validation, dispatch tickets and PUBLISHED
-reads. `megamoe_layout.py` owns the Python window geometry. The connector uses
+reads. `mega_layout.py` owns the Python window geometry. The connector uses
 these modules directly. Window access uses the existing native
 `CommContextManager.get_local_buffer_tensor()` binding; the native extension
 does not currently expose kernel layout calculation. The reader preserves its

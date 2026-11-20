@@ -60,7 +60,7 @@ csrc/npu/output/
 cover/
 
 # Ascend runtime-generated custom-op and kernel cache artifacts
-afd_plugin/_cann_ops_custom/
+afd_plugin/_custom_ops/
 kernel_meta/
 
 # Translations

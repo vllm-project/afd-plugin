@@ -51,22 +51,22 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/afd_mega_moe_pull_native.cpp")
     endif()
 endif()
 
-# ### PATCH START: shared MegaMoE headers and installed CANN dependencies
-set(MEGAMOE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../megamoe_utils")
-if(EXISTS "${MEGAMOE_ROOT}")
+# ### PATCH START: shared Mega headers and installed CANN dependencies
+set(MEGA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../mega_utils")
+if(EXISTS "${MEGA_ROOT}")
     list(APPEND KERNEL_COMPILE_OPTS -DBUILD_OPEN_PROJECT)
-    foreach(inc "${MEGAMOE_ROOT}" ${MEGAMOE_KERNEL_SDK_INCLUDES})
+    foreach(inc "${MEGA_ROOT}" ${MEGA_KERNEL_SDK_INCLUDES})
         list(APPEND KERNEL_COMPILE_OPTS "-I${inc}")
     endforeach()
     # Some SDK simple-kernel targets omit custom_compile_options.ini. The build
     # driver forwards this exact list to those generated OPC commands as well.
-    set(MEGAMOE_OPC_OPTIONS ${KERNEL_COMPILE_OPTS})
+    set(MEGA_OPC_OPTIONS ${KERNEL_COMPILE_OPTS})
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-        list(APPEND MEGAMOE_OPC_OPTIONS -g -O0)
+        list(APPEND MEGA_OPC_OPTIONS -g -O0)
     endif()
-    file(WRITE "${CMAKE_BINARY_DIR}/megamoe_kernel_options.txt" "${MEGAMOE_OPC_OPTIONS}")
+    file(WRITE "${CMAKE_BINARY_DIR}/mega_kernel_options.txt" "${MEGA_OPC_OPTIONS}")
 endif()
-# ### PATCH END: shared MegaMoE headers and installed CANN dependencies
+# ### PATCH END: shared Mega headers and installed CANN dependencies
 
 # set custom compile options (single call to avoid overwriting)
 if ("${CMAKE_BUILD_TYPE}x" STREQUAL "Debugx")

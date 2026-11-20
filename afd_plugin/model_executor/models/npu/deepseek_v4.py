@@ -29,7 +29,7 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
     CAMP2P_CONNECTOR,
-    MEGAMOE_CONNECTOR,
+    MEGA_CONNECTOR,
     parse_afd_config,
 )
 from afd_plugin.connectors import (
@@ -188,8 +188,8 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         is_draft_layer: bool = False,
     ) -> None:
         super().__init__(layer_idx=layer_idx)
-        self.megamoe = (
-            parse_afd_config(vllm_config, validate=False).connector == MEGAMOE_CONNECTOR
+        self.mega = (
+            parse_afd_config(vllm_config, validate=False).connector == MEGA_CONNECTOR
         )
         self.use_sequence_parallel_moe = (
             vllm_config.parallel_config.use_sequence_parallel_moe
@@ -258,7 +258,7 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
 
         tp = (
             get_tp_group()
-            if self.megamoe and not self.use_sequence_parallel_moe
+            if self.mega and not self.use_sequence_parallel_moe
             else None
         )
         if tp is not None and tp.world_size > 1 and not _EXTRA_CTX.in_profile_run:
@@ -312,7 +312,7 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
                 topk_ids,
                 None,
                 use_sequence_parallel=self.use_sequence_parallel_moe,
-                distinct_padding_ids=self.megamoe,
+                distinct_padding_ids=self.mega,
             )
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
@@ -328,7 +328,7 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
             afd_metadata.connector,
             dispatch_payload.hidden_states,
             context,
-            independent_windows=self.megamoe,
+            independent_windows=self.mega,
             topk_weights=dispatch_payload.topk_weights,
             topk_ids=dispatch_payload.topk_ids,
         )
@@ -511,7 +511,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 # differs. Choosing by connector keeps the async CAM path unchanged.
                 gate_shell = (
                     AFDDeepseekV4AttentionGateRemoteMoE
-                    if afd_config.connector in (AFD_ASYNC_CONNECTOR, MEGAMOE_CONNECTOR)
+                    if afd_config.connector in (AFD_ASYNC_CONNECTOR, MEGA_CONNECTOR)
                     else AFDDeepseekV4SyncAttentionGateRemoteMoE
                 )
                 self.mlp = gate_shell(
@@ -686,7 +686,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         # ### PATCH START: initialize role-local model
         afd_config = parse_afd_config(vllm_config, validate=False)
         if (
-            afd_config.connector in (AFD_ASYNC_CONNECTOR, MEGAMOE_CONNECTOR)
+            afd_config.connector in (AFD_ASYNC_CONNECTOR, MEGA_CONNECTOR)
             and not afd_config.compute_gate_on_attention
         ):
             raise ValueError(
@@ -904,7 +904,7 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
     # vLLM 5df63a7 model_loader/utils.py invokes this model hook after quant
-    # finalize. AFD's CAM GMM path still needs the scale that native MegaMoE drops.
+    # finalize. AFD's CAM GMM path still needs the scale that native Mega drops.
     def process_weights_after_loading(self) -> None:
         # ### PATCH START: retain FFN gate-on-A W8A8 scales after quant finalize
         if (

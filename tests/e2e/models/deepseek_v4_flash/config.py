@@ -15,7 +15,7 @@ from typing import NamedTuple
 
 DSV4_ASYNC_CAM_SCENARIO = "afd-dsv4-flash-async-cam-dp2tp4-ep8"
 DSV4_ASYNC_CAM_MEGA_SCENARIO = "afd-dsv4-flash-async-cam-pull-mega-dp2tp4-ep8"
-DSV4_MEGAMOE_SCENARIO = "afd-dsv4-flash-megamoe-eager-2a2f"
+DSV4_MEGA_SCENARIO = "afd-dsv4-flash-mega-eager-2a2f"
 DSV4_SYNC_CAMP2P_A5_SCENARIO = "afd-dsv4-flash-sync-camp2p-2a2f"
 DSV4_SYNC_CAMP2P_A3_SCENARIO = "afd-dsv4-flash-sync-camp2p-8a8f"
 DSV4_SYNC_CAMP2P_SCENARIOS = (
@@ -24,7 +24,7 @@ DSV4_SYNC_CAMP2P_SCENARIOS = (
 )
 DSV4_SCENARIOS = (
     DSV4_ASYNC_CAM_SCENARIO,
-    DSV4_MEGAMOE_SCENARIO,
+    DSV4_MEGA_SCENARIO,
     *DSV4_SYNC_CAMP2P_SCENARIOS,
 )
 DSV4_ATTENTION_RANKS = 8
@@ -374,8 +374,8 @@ def configure_scenario(args: argparse.Namespace) -> None:
     ]
 
 
-def configure_megamoe_scenario(args: argparse.Namespace) -> None:
-    args.afd_connector = "CAMAsyncMegamoeAFDConnector"
+def configure_mega_scenario(args: argparse.Namespace) -> None:
+    args.afd_connector = "CAMAsyncMegaAFDConnector"
     args.compute_gate_on_attention = True
     args.afd_async = True
     args.afd_connector_extra_config = []
