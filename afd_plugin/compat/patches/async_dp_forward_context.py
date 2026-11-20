@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Patches for AFD async-DP forward-context coordination.
+"""Ascend patches for AFD async-DP forward-context coordination.
 
 This module patches:
 1. ``vllm.forward_context.set_forward_context``
@@ -12,10 +12,9 @@ Why:
     all-reduce and metadata paths must be skipped for the AFD async connector.
 
 How:
-    This module is imported by ``register_afd()``. Importing it patches
-    ``set_forward_context`` in-place. The patched function expands the pinned
-    upstream implementation and only changes the DP metadata section for AFD
-    async configs.
+    Ascend registration imports this module. On the 0.32 pin, it patches
+    ``set_forward_context`` and any already-imported aliases. The copied
+    implementation changes the DP metadata section for AFD async configs.
 
 Future plan:
     Remove this patch when vLLM exposes a plugin-owned way to opt out of MoE
@@ -206,7 +205,7 @@ def set_forward_context(
                     )
 
 
-if _is_target_vllm_compatible():
+if _is_target_vllm_compatible("npu"):
     forward_context_module.set_forward_context = set_forward_context
     for module_name in _FORWARD_CONTEXT_IMPORT_MODULES:
         module = sys.modules.get(module_name)

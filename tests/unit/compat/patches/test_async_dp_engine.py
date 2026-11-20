@@ -76,6 +76,10 @@ def _install_fake_vllm_engine(monkeypatch: pytest.MonkeyPatch):
             self.shutdown_called = False
             core_module.last_engine = self
 
+        @staticmethod
+        def run_engine_core(*_args, **_kwargs):
+            return None
+
         def run_busy_loop(self):
             return None
 
@@ -235,6 +239,10 @@ def _install_fake_vllm_engine(monkeypatch: pytest.MonkeyPatch):
 
 def _load_patch_module(monkeypatch: pytest.MonkeyPatch):
     _install_fake_vllm_engine(monkeypatch)
+    return _import_patch_module()
+
+
+def _import_patch_module():
     module_name = "afd_plugin.compat.patches.async_dp_engine"
     if module_name in sys.modules:
         return importlib.reload(sys.modules[module_name])
@@ -403,18 +411,15 @@ def test_dp_launch_keeps_coordination_store_alive_until_context_exit(
     assert references[0]() is None
 
 
-def test_non_target_vllm_release_skips_patch_application(monkeypatch):
-    _load_patch_module(monkeypatch)
-    vllm_module = sys.modules["vllm"]
-    core_module = sys.modules["vllm.v1.engine.core"]
-    utils_module = sys.modules["vllm.v1.engine.utils"]
-    client_module = sys.modules["vllm.v1.engine.core_client"]
-    patch_module = sys.modules["afd_plugin.compat.patches.async_dp_engine"]
-
+@pytest.mark.parametrize("version", ["0.34.0", "0.29.0"])
+def test_non_target_vllm_release_keeps_native_engine_bindings(monkeypatch, version):
+    core_module, utils_module, client_module = _install_fake_vllm_engine(monkeypatch)
+    sys.modules["vllm"].__version__ = version
     native_run_engine_core = core_module.EngineCoreProc.run_engine_core
     native_launch = utils_module.launch_core_engines
     native_add_request = client_module.DPAsyncMPClient.add_request_async
-    vllm_module.__version__ = "0.29.0"
+
+    patch_module = _import_patch_module()
 
     assert patch_module.apply_async_dp_engine_patch() is False
     assert core_module.EngineCoreProc.run_engine_core is native_run_engine_core

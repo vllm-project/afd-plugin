@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Patches for AFD async-DP engine scheduling.
+"""Ascend patches for AFD async-DP engine scheduling.
 
 This module patches:
 1. ``vllm.v1.engine.core.EngineCoreProc.run_engine_core``
@@ -461,7 +461,7 @@ def apply_async_dp_engine_patch() -> bool:
     AFD async Attention, so non-AFD and FFN Ascend scheduling remain untouched.
     """
 
-    if not _is_target_vllm_compatible():
+    if not _is_target_vllm_compatible("npu"):
         return False
 
     EngineCoreProc.run_engine_core = staticmethod(run_engine_core)

@@ -796,15 +796,21 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         )
         # ### PATCH END
 
-        # Needed by the inherited native loader to route fused shared-expert
-        # checkpoints; role-local shells never enable the fused path.
-        self.is_fused_shared_expert_enabled = (
-            native.is_model_fused_shared_expert_compatible(
-                self.layers,
-                native.DeepseekV2MoE,
-                "mlp",
+        # ### PATCH START: initialize the native weight loader for each pin.
+        if self.device == "npu":
+            # The Ascend vLLM 0.32 loader reads the model-wide flag.
+            self.is_fused_shared_expert_enabled = (
+                native.is_model_fused_shared_expert_compatible(  # type: ignore[attr-defined]
+                    self.layers,
+                    native.DeepseekV2MoE,
+                    "mlp",
+                )
             )
-        )
+        else:
+            # The vLLM 0.34 loader reads a set of fused layer indices.
+            # The role-local CUDA model does not build fused shared experts.
+            self.fused_shared_expert_layers: frozenset[int] = frozenset()
+        # ### PATCH END
 
         if native.get_pp_group().is_last_rank:
             self.norm = native.RMSNorm(self.hidden_size, eps=config.rms_norm_eps)

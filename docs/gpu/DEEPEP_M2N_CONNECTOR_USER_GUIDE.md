@@ -116,7 +116,7 @@ The connector needs three components in addition to the plugin and vLLM:
 
 2. **DeepGEMM**, required by the default `deepgemm` expert backend. The
    connector uses the copy bundled in the vLLM wheel
-   (`vllm.third_party.deep_gemm`). Every vLLM `v0.32.0` CUDA build ships it,
+   (`vllm.third_party.deep_gemm`). Every vLLM `v0.34.0` CUDA build ships it,
    including the `vllm/vllm-openai` image, so no extra step is needed.
    A separately installed upstream `deep_gemm` package is not used by the
    connector (vLLM's own kernels prefer it when present).

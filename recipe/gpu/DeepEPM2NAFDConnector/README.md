@@ -2,7 +2,7 @@
 
 Launch scripts for running Attention-FFN Disaggregation (AFD) with
 `DeepEPM2NAFDConnector`, the expert-routed M2N connector for Hopper (SM90) and
-newer GPUs, with vLLM `v0.32.0`. See
+newer GPUs, with vLLM `v0.34.0`. See
 [`docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md`](../../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md)
 for installation, the configuration contract, the required vLLM settings, and
 the placements the connector accepts.
@@ -34,7 +34,7 @@ every setting, and how to run a recipe directly or in a pod.
 - SM90 or newer GPUs. The DeepSeek and Qwen3-30B default `2A2F` layout uses
   4 GPUs; Qwen3-235B defaults to `4A2F` on 6 GPUs. See the model README for
   memory needs.
-- vLLM `v0.32.0`, the plugin and afdEP-comm (the `afdep` extra) installed in
+- vLLM `v0.34.0`, the plugin and afdEP-comm (the `afdep` extra) installed in
   one environment. DeepGEMM is the copy bundled in the vLLM wheel. See
   [Installation](../../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation).
 - When afdEP-comm was built against the `nvidia-nccl` wheel, export its

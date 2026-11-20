@@ -27,7 +27,7 @@ validation_paths:
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
 upstream_refs:
-  - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "GPU: vLLM 0.34.0 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca"
   - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
   - "vLLM vllm.v1.engine.core.EngineCore and EngineCoreProc"
   - "vLLM vllm.v1.engine.core_client.DPAsyncMPClient"
@@ -67,13 +67,17 @@ validation adds model/connector restrictions after them. Runner constructors
 and selection factories do not repeat that admission. No validation cache,
 new validation framework or additional monkey patch is used.
 
-The package extra pins vLLM `0.32.0` for both backends.
-[`compat/vllm.py`](../../../afd_plugin/compat/vllm.py) checks the shared
-`0.32.0` target.
+The package extra pins vLLM `0.34.0` for the GPU backend.
+[`compat/vllm.py`](../../../afd_plugin/compat/vllm.py) holds one pin per backend:
+`0.34.0` for CUDA and `0.32.0` for Ascend, which stays on its tested source
+pair until RFC #613 moves it.
 Direct strict calls raise for a missing or different vLLM; plugin registration
 calls the check with `strict=False`, so it warns and continues. This warning
-policy does not make another vLLM release supported. Shared EngineCore and
-coordinator patches use the 0.32 contract. See the
+policy does not make another vLLM release supported. A caller that has not
+resolved its device type accepts either pin, because the compatibility patches
+are shared; callers that observe the platform pass their `device_type` and get
+that backend's pin. Bodies copied from upstream are dispatched by the installed
+release where the two differ. See the
 [runtime matrix](../../support.md#tested-runtime-matrix) for hardware
 validation scope.
 

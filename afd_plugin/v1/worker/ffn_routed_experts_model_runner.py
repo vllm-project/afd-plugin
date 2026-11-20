@@ -23,6 +23,7 @@ from afd_plugin.v1.worker.cuda_graph import AFDCUDAGraphPolicy
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
 
 if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.expert_map_manager import ExpertMapManager
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
 
@@ -71,6 +72,14 @@ def _check_expert_layout(routed_experts: RoutedExperts) -> None:
         )
 
 
+def _local_expert_ids(expert_map_manager: ExpertMapManager) -> tuple[int, ...]:
+    """Return global IDs in the connector's required linear placement."""
+    expert_map = expert_map_manager.expert_map
+    if expert_map is None:
+        return tuple(range(expert_map_manager.global_num_experts))
+    return tuple(torch.where(expert_map != -1)[0].tolist())
+
+
 def local_experts_from_vllm(routed_experts: RoutedExperts) -> FFNLocalExperts:
     """This rank's experts of one vLLM MoE layer, as views of its parameters.
 
@@ -86,7 +95,7 @@ def local_experts_from_vllm(routed_experts: RoutedExperts) -> FFNLocalExperts:
         w13_scale = routed_experts.w13_weight_scale_inv.data
         w2_scale = routed_experts.w2_weight_scale_inv.data
     return FFNLocalExperts(
-        expert_ids=tuple(routed_experts.expert_map_manager.get_local_expert_ids()),
+        expert_ids=_local_expert_ids(routed_experts.expert_map_manager),
         weights=LocalExpertWeights(
             w13=w13, w2=w2, w13_scale=w13_scale, w2_scale=w2_scale
         ),
