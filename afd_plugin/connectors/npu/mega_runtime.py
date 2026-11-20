@@ -44,6 +44,7 @@ class SplitBuffer:
         activation_mode=0,
         activation_submode=0,
         activation_parameters=(3.4028234663852886e38, 1.702, 1.0),
+        attn_ranks_per_dp=1,
     ):
         self.rank = distributed.get_rank(group)
         self.layout = SplitLayout(
@@ -56,6 +57,7 @@ class SplitBuffer:
             prefetch,
             combine_quant_mode,
             is_attention=self.rank < attention_ranks,
+            attn_ranks_per_dp=attn_ranks_per_dp,
         )
         if (
             attention_ranks < 1
@@ -125,22 +127,21 @@ class SplitBuffer:
         distributed.barrier(group=group)
 
     def configuration(self, dp_ranks, sequence, tokens):
-        if (
-            not dp_ranks
-            or len(set(dp_ranks)) != len(dp_ranks)
-            or any(rank < 0 or rank >= self.layout.attention_ranks for rank in dp_ranks)
-        ):
-            raise ValueError(
-                "dp_ranks must list the distinct Attention union ranks of one DP"
-            )
+        width = self.layout.attn_ranks_per_dp
+        start = self.rank // width * width
+        if sorted(dp_ranks) != list(range(start, start + width)):
+            raise ValueError("dp_ranks must match this Attention rank's contiguous DP group")
         if not 1 <= sequence <= SPLIT_SEQUENCE_MAX:
             raise ValueError(
                 f"Use consecutive per-DP sequences in [1, {SPLIT_SEQUENCE_MAX}], "
                 "wrapping to 1"
             )
+        return self.launch_configuration(sequence, tokens)
+
+    def launch_configuration(self, sequence_or_dp_width, tokens):
         self.launch = self.launch % SPLIT_SEQUENCE_MAX + 1
         values = self._configuration.copy()
-        values[11], values[13], values[14] = sequence, tokens, self.launch
+        values[11], values[13], values[14] = sequence_or_dp_width, tokens, self.launch
         return values
 
     def control_rows(self):
@@ -235,10 +236,10 @@ def atten_recv(ticket, buffer, shared_weight1=None, shared_weight2=None,
     return output
 
 
-def mega_ffn(weight1, weight2, weight_scales1, weight_scales2, buffer, dp_ranks, sequence):
+def mega_ffn(weight1, weight2, weight_scales1, weight_scales2, buffer):
     if buffer.rank < buffer.layout.attention_ranks:
         raise ValueError("fused_moe must run on a MoE rank")
-    configuration = buffer.configuration(dp_ranks, sequence, buffer.layout.capacity)
+    configuration = buffer.launch_configuration(buffer.layout.attn_ranks_per_dp, buffer.layout.capacity)
     return torch.ops.afd_ascend.afd_async_mega_ffn(
         buffer.context, weight1, weight2, weight_scales1, weight_scales2,
-        configuration, dp_ranks, buffer.activation_parameters)
+        configuration, buffer.activation_parameters)

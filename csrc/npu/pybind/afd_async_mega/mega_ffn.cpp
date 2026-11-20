@@ -57,7 +57,7 @@ static void CheckExpertTensors(const std::vector<at::Tensor> &first,
     }
 }
 
-at::Tensor Run(const at::Tensor &context, const std::vector<at::Tensor> &weight1, const std::vector<at::Tensor> &weight2, const std::vector<at::Tensor> &weight_scales1, const std::vector<at::Tensor> &weight_scales2, const std::vector<int64_t> &configuration, const std::vector<int64_t> &dp_ranks, const std::vector<float> &activation_parameters)
+at::Tensor Run(const at::Tensor &context, const std::vector<at::Tensor> &weight1, const std::vector<at::Tensor> &weight2, const std::vector<at::Tensor> &weight_scales1, const std::vector<at::Tensor> &weight_scales2, const std::vector<int64_t> &configuration, const std::vector<float> &activation_parameters)
 {
     TORCH_CHECK(configuration.size() == 17, "Expected 17 configuration values");
     TORCH_CHECK(configuration[0] > 0 && configuration[1] > 0 && configuration[2] > 0 &&
@@ -90,8 +90,7 @@ at::Tensor Run(const at::Tensor &context, const std::vector<at::Tensor> &weight1
     TORCH_CHECK(!weight_scales2.empty(), "weight_scales2 needs at least one typed tensor");
     TensorListWrapper weight_scales2Wrapper = {at::TensorList(weight_scales2), aclDataType::ACL_FLOAT8_E8M0};
     at::IntArrayRef configurationRef(configuration);
-    at::IntArrayRef dpRanksRef(dp_ranks);
-    ACLNN_CMD(aclnnAfdAsyncMegaFfn, context, weight1Wrapper, weight2Wrapper, weight_scales1Wrapper, weight_scales2Wrapper, configurationRef, dpRanksRef, activation_parameters, expert_token_nums);
+    ACLNN_CMD(aclnnAfdAsyncMegaFfn, context, weight1Wrapper, weight2Wrapper, weight_scales1Wrapper, weight_scales2Wrapper, configurationRef, activation_parameters, expert_token_nums);
     return expert_token_nums;
 }
 void RegisterMegaFfn(pybind11::module_ &module)

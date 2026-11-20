@@ -504,19 +504,23 @@ __aicore__ inline void MegaFusedMoe<TemplateMegaFusedMoeTypeFunc>::ProcessWave(D
 {
     int64_t originalOverflow = GetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>();
     SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(0);
+    auto *td = params_.tilingData;
+    auto &window = params_.peermemInfo;
+    auto *claims = reinterpret_cast<__gm__ int32_t *>(window.rankSyncInWorldPtr + window.mte.ffnEnd);
+    uint32_t dpCount = td->splitAttentionRanks / td->splitDpSize;
     if constexpr (g_coreType == AIV) {
-        // This is a local workspace reset, never a reset of the registered control window.
         ResetSplitWorkspace();
+        if (aivCoreIdx_ == 0U) {
+            SplitClaimNextDp(window.rankSyncInWorldPtr, claims, dpCount, td->splitDpSize);
+        }
         PipeBarrier<PIPE_ALL>();
     }
     SyncAll<false>();
-    if constexpr (g_coreType == AIV) {
-        for (uint32_t member = 0; member < params_.tilingData->splitDpSize; ++member) {
-            SplitWait(SplitWord(params_.peermemInfo.rankSyncInWorldPtr,
-                              params_.tilingData->splitDpRanks[member], SPLIT_PUBLISHED),
-                      params_.tilingData->splitSequence);
-        }
-    }
+    // A single stream owns the window: the DP before the new cursor is this call's claim.
+    uint32_t next = ReadGmByPassDCache(claims);
+    uint32_t dp = next == 0 ? dpCount - 1 : next - 1;
+    td->splitDpStart = dp * td->splitDpSize;
+    td->splitSequence = ReadGmByPassDCache(claims + 1 + dp);
     derived.ProcessMoeExpertStages();
     MaybePublishDispatchTaken(true); // Includes the all-empty / trailing-empty expert case.
     if constexpr (g_coreType == AIV) {
@@ -527,13 +531,13 @@ __aicore__ inline void MegaFusedMoe<TemplateMegaFusedMoeTypeFunc>::ProcessWave(D
             for (uint32_t member = 0; member < params_.tilingData->splitDpSize; ++member) {
                 // All input readers have drained. Reaffirm TAKEN because the
                 // nonblocking early fan-in may miss its last writer.
-                SplitPublish(params_, g_winRankAddr_, params_.tilingData->splitDpRanks[member], SPLIT_TAKEN);
-                SplitPublish(params_, g_winRankAddr_, params_.tilingData->splitDpRanks[member], SPLIT_READY);
+                SplitPublish(params_, g_winRankAddr_, td->splitDpStart + member, SPLIT_TAKEN);
+                SplitPublish(params_, g_winRankAddr_, td->splitDpStart + member, SPLIT_READY);
             }
             // Empty routes skip the payload path's output-slot wait. Bound
             // their READY/CONSUMED skew after publishing READY to all sources.
             for (uint32_t member = 0; member < params_.tilingData->splitDpSize; ++member) {
-                SplitWaitOutputSlot(params_, params_.tilingData->splitDpRanks[member]);
+                SplitWaitOutputSlot(params_, td->splitDpStart + member);
             }
         }
     }

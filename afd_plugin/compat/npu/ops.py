@@ -173,9 +173,9 @@ def ensure_mega_ops_available() -> torch.library.Library:
     library.impl("afd_async_atten_recv", atten_recv_meta, "Meta")
     library.impl("afd_async_atten_recv", _C_afd_async_mega.afd_async_atten_recv, "PrivateUse1")
 
-    library.define('afd_async_mega_ffn(Tensor(a!) context, Tensor[] weight1, Tensor[] weight2, Tensor[] weight_scales1, Tensor[] weight_scales2, int[] configuration, int[] dp_ranks, float[] activation_parameters) -> Tensor')
+    library.define('afd_async_mega_ffn(Tensor(a!) context, Tensor[] weight1, Tensor[] weight2, Tensor[] weight_scales1, Tensor[] weight_scales2, int[] configuration, float[] activation_parameters) -> Tensor')
 
-    def mega_ffn_meta(context, weight1, weight2, weight_scales1, weight_scales2, configuration, dp_ranks, activation_parameters):
+    def mega_ffn_meta(context, weight1, weight2, weight_scales1, weight_scales2, configuration, activation_parameters):
         return context.new_empty((configuration[2] // configuration[1],), dtype=torch.int32)
 
     library.impl("afd_async_mega_ffn", mega_ffn_meta, "Meta")

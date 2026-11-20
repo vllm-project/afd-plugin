@@ -438,7 +438,7 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
     // Capture task metadata before TAKEN can let this source overwrite its route slot.
     uint32_t taskLayer = 0U;
     for (uint32_t member = 0; member < params.tilingData->splitDpSize; ++member) {
-        uint32_t source = params.tilingData->splitDpRanks[member];
+        uint32_t source = params.tilingData->splitDpStart + member;
         auto *record = reinterpret_cast<__gm__ int32_t *>(params.peermemInfo.routeTaskMetaPtr +
             static_cast<uint64_t>(source) * AfdAsyncLayer::TASK_BYTES);
         uint32_t tag;

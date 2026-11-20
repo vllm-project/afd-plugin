@@ -159,6 +159,7 @@ struct PeermemSizeParams {
     int64_t topoType;
     int64_t serverNum;
     int64_t attentionRanks;
+    int64_t attnRanksPerDp = 1;
 };
 
 // peermem 各分段尺寸。Host 打印、窗口下限校验共用该结果，避免重复维护布局公式。
@@ -218,7 +219,9 @@ HOST_DEVICE int64_t CalcPeermemLeastSize(const PeermemSizeParams &params)
 {
     PeermemLayoutSizes sizes = CalcPeermemLayoutSizes(params);
     if (params.topoType == TOPO_TYPE_MTE) {
-        return AfdAsync::MteOffsets(sizes).ffnEnd;
+        int64_t claimWords = 1 + params.attentionRanks / params.attnRanksPerDp;
+        return AfdAsync::MteOffsets(sizes).ffnEnd +
+               Ops::Base::CeilAlign(claimWords * static_cast<int64_t>(sizeof(int32_t)), ALIGN_512);
     }
     return sizes.dataOffset + sizes.maskRecvSize + sizes.routeTaskMetaSize + sizes.expertCountRecvSize + sizes.dispatchRecordAreaSize +
            sizes.combineSendSize;

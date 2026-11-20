@@ -37,12 +37,28 @@ __aicore__ inline void SplitWait(__gm__ int32_t *word, uint32_t sequence, bool p
         while (GetSystemCycle() - start < GM_FLAG_POLL_BACKOFF_CYCLES) {}
     }
 }
+// FFN-local words: next DP to inspect, then the last claimed generation for each DP.
+__aicore__ inline void SplitClaimNextDp(GM_ADDR window, __gm__ int32_t *claims, uint32_t dpCount, uint32_t width)
+{
+    uint32_t dp = ReadGmByPassDCache(claims);
+    for (;;) {
+        int32_t sequence = ReadGmByPassDCache(claims + 1 + dp) % AfdAsync::SPLIT_SEQUENCE_MAX + 1;
+        uint32_t member = 0;
+        while (member < width && ReadGmByPassDCache(SplitWord(window, dp * width + member, SPLIT_PUBLISHED)) == sequence) {
+            ++member;
+        }
+        uint32_t next = (dp + 1 == dpCount) ? 0 : dp + 1;
+        if (member == width) {
+            WriteGmByPassDCache(claims + 1 + dp, sequence);
+            WriteGmByPassDCache(claims, static_cast<int32_t>(next));
+            return;
+        }
+        dp = next;
+    }
+}
 __aicore__ inline bool SplitMember(const MegaFusedMoeTilingData *td, uint32_t rank)
 {
-    for (uint32_t index = 0; index < td->splitDpSize; ++index) {
-        if (td->splitDpRanks[index] == rank) { return true; }
-    }
-    return false;
+    return rank >= td->splitDpStart && rank < td->splitDpStart + td->splitDpSize;
 }
 __aicore__ inline void SplitPublish(const Params &params, GM_ADDR *windows, uint32_t peer, uint32_t field)
 {
@@ -61,7 +77,7 @@ __aicore__ inline void SplitDispatchTaken(const Params &params, GM_ADDR *windows
         if (static_cast<uint32_t>(ReadGmByPassDCache(done + index * 16U)) != td->splitLaunch) { return; }
     }
     for (uint32_t index = 0; index < td->splitDpSize; ++index) {
-        SplitPublish(params, windows, td->splitDpRanks[index], SPLIT_TAKEN);
+        SplitPublish(params, windows, td->splitDpStart + index, SPLIT_TAKEN);
     }
 }
 __aicore__ inline void SplitWaitOutputSlot(const Params &params, uint32_t source)
@@ -87,7 +103,7 @@ __aicore__ inline void SplitCombineProgress(const Params &params, GM_ADDR *windo
         commonEnd = end < commonEnd ? end : commonEnd;
     }
     for (uint32_t member = 0; member < td->splitDpSize; ++member) {
-        uint32_t source = td->splitDpRanks[member];
+        uint32_t source = td->splitDpStart + member;
         // Prefix is expert-major, then source-major, and has already been snapshotted
         // in local workspace. It remains valid after dispatch_taken releases input metadata.
         uint32_t lastRequired = 0U;

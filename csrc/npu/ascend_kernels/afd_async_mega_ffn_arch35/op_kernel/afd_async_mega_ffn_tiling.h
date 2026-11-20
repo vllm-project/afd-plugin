@@ -221,7 +221,7 @@ struct MegaFusedMoeTilingData {
     uint32_t splitSequence;
     uint32_t splitLaunch;
     uint32_t splitDpSize;
-    uint32_t splitDpRanks[768];
+    uint32_t splitDpStart;
     uint32_t weightLayerCount;
 };
 #endif

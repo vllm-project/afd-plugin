@@ -537,12 +537,9 @@ static ge::graphStatus Tile(gert::TilingContext *context)
     const char *nodeName = context->GetNodeName();
     auto *attrs = context->GetAttrs();
     auto *values = attrs->GetAttrPointer<gert::ContinuousVector>(0);
-    auto *members = attrs->GetAttrPointer<gert::ContinuousVector>(1);
-    auto *activation = attrs->GetAttrPointer<gert::ContinuousVector>(2);
-    if (!values || values->GetSize() != 17 || !members || members->GetSize() == 0 ||
-        members->GetSize() > 768 || !activation || activation->GetSize() != 3) { return ge::GRAPH_FAILED; }
+    auto *activation = attrs->GetAttrPointer<gert::ContinuousVector>(1);
+    if (!values || values->GetSize() != 17 || !activation || activation->GetSize() != 3) { return ge::GRAPH_FAILED; }
     auto *config = reinterpret_cast<const int64_t *>(values->GetData());
-    auto *dp = reinterpret_cast<const int64_t *>(members->GetData());
     auto *parameters = reinterpret_cast<const float *>(activation->GetData());
     if (config[0] < 1 || config[1] < 1 || config[0] + config[1] > 768 || config[2] < config[1] ||
         config[2] > 2048 || (config[0] + config[1]) * (config[2] / config[1]) > 16384 || config[2] % config[1] != 0 || config[2] / config[1] > 1024 ||
@@ -550,17 +547,11 @@ static ge::graphStatus Tile(gert::TilingContext *context)
         config[5] < 512 || config[5] > 8192 || config[5] % 256 || config[6] < 1 || config[6] > 32 ||
         config[6] > config[2] || (config[7] != 3 && config[7] != 4) ||
         (config[8] != 0 && config[8] != 3 && config[8] != 4) || (config[9] != 0 && config[9] != 1) ||
-        config[11] < 1 || config[11] > AfdAsync::SPLIT_SEQUENCE_MAX || config[12] < 0 || config[12] > 4 ||
+        config[11] < 1 || config[0] % config[11] != 0 || config[12] < 0 || config[12] > 4 ||
         config[13] < 0 || config[13] > config[3] || config[14] < 1 || config[14] > AfdAsync::SPLIT_SEQUENCE_MAX ||
         config[15] < 0 || config[15] > 3 || config[16] < 0 || config[16] > 1) {
         OP_LOGE(nodeName, "Invalid split configuration; see docs/mega_split/README.md");
         return ge::GRAPH_FAILED;
-    }
-    for (size_t index = 0; index < members->GetSize(); ++index) {
-        if (dp[index] < 0 || dp[index] >= config[0]) { return ge::GRAPH_FAILED; }
-        for (size_t previous = 0; previous < index; ++previous) {
-            if (dp[previous] == dp[index]) { return ge::GRAPH_FAILED; }
-        }
     }
     auto *td = context->GetTilingData<MegaFusedMoeTilingData>();
     if (!td) { return ge::GRAPH_FAILED; }
@@ -575,7 +566,7 @@ static ge::graphStatus Tile(gert::TilingContext *context)
     td->topK = config[6];
     td->combineQuantMode = config[8];
     td->topkWeightsPrefetch = config[9];
-    td->splitSequence = config[11];
+    td->splitDpSize = config[11];
     td->sharedExpertNum = config[12];
     td->bs = config[13];
     td->splitLaunch = config[14];
@@ -586,9 +577,7 @@ static ge::graphStatus Tile(gert::TilingContext *context)
     td->activationBeta = parameters[2];
     td->topoType = 0;
     td->rankNumPerServer = td->epWorldSize;
-    td->splitDpSize = members->GetSize();
-    std::copy(dp, dp + members->GetSize(), td->splitDpRanks);
-    uint64_t maxOutput = uint64_t(config[3]) * members->GetSize() * std::min(config[6], config[2] / config[1]);
+    uint64_t maxOutput = uint64_t(config[3]) * td->splitDpSize * std::min(config[6], config[2] / config[1]);
     if (maxOutput > INT32_MAX) { return ge::GRAPH_FAILED; }
     td->maxOutputSize = maxOutput;
     auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
@@ -639,7 +628,7 @@ static ge::graphStatus Tile(gert::TilingContext *context)
     td->dispatchBufferConfig = CalcDispatchBufferConfig(td, 1U, ub);
     PeermemSizeParams sizes{int64_t(td->numMaxTokensPerRank), int64_t(td->topK), int64_t(td->h),
         int64_t(td->moeExpertPerRank), int64_t(td->epWorldSize), 2, 1, bool(td->topkWeightsPrefetch),
-        bool(td->combineQuantMode), 0, 1, td->splitAttentionRanks};
+        bool(td->combineQuantMode), 0, 1, td->splitAttentionRanks, td->splitDpSize};
     if (CalcPeermemLeastSize(sizes) + EXCEPTION_DUMP_REGION_SIZE > config[10]) {
         OP_LOGE(nodeName, "Split communication window is too small");
         return ge::GRAPH_FAILED;

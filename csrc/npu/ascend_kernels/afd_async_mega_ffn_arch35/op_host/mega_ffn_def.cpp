@@ -35,7 +35,6 @@ public:
         this->Input("weight_scales2").ParamType(DYNAMIC).DataTypeList({ge::DT_FLOAT8_E8M0}).FormatList({ge::FORMAT_ND}).AutoContiguous();
         this->Output("expert_token_nums").ParamType(REQUIRED).DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND});
         this->Attr("configuration").AttrType(REQUIRED).ListInt();
-        this->Attr("dp_ranks").AttrType(REQUIRED).ListInt();
         this->Attr("activation_parameters").AttrType(REQUIRED).ListFloat();
         OpAICoreConfig config;
         config.DynamicCompileStaticFlag(true).DynamicFormatFlag(true).DynamicRankSupportFlag(true)
