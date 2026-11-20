@@ -141,6 +141,11 @@ class AFDControlPayload:
         is_profile: Whether the payload belongs to an initial memory-profile
             forward. NPU FFN workers use this to preserve Ascend's balanced
             dummy MoE routing in the split-process AFD execution model.
+        quant_mode: The A2E transport quantization mode the Attention role is
+            configured with. The mode decides the packet layout and the
+            activation width, so the FFN role compares it with its own before
+            the first transfer and refuses a mismatched pair. A peer that does
+            not declare a mode is treated as ``0``.
     """
 
     dp_metadata_list: dict[int, AFDDPMetadata]
@@ -148,6 +153,7 @@ class AFDControlPayload:
     is_warmup: bool
     is_graph_replaying: bool = False
     is_profile: bool = False
+    quant_mode: int = 0
 
     def __post_init__(self) -> None:
         self.dp_metadata_list = {
@@ -294,6 +300,10 @@ class AFDA2FTransferPayload:
         topk_weights: Optional routing weights paired with ``topk_ids``, same
             shape. The FFN side consumes them as the gate weights, so any
             model-level routed scaling is already folded in.
+        activation_scale: Optional E8M0 MX scale for a pre-quantized activation,
+            shaped ``(tokens, ceil(hidden_size / 32))`` as
+            ``torch.float8_e8m0fnu``. Present only when the transport carried an
+            MXFP8 activation, and it describes the same rows as ``hidden_states``.
     """
 
     hidden_states: torch.Tensor
@@ -302,6 +312,7 @@ class AFDA2FTransferPayload:
     input_ids: torch.Tensor | None = None
     topk_ids: torch.Tensor | None = None
     topk_weights: torch.Tensor | None = None
+    activation_scale: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -390,8 +401,9 @@ def _to_int(value: object) -> int:
 def encode_control_payload(payload: AFDControlPayload) -> bytes:
     """Serialize an ``AFDControlPayload`` to a compact JSON byte string.
 
-    Only ``num_tokens_across_dp_cpu`` / ``max_tokens_across_dp_cpu`` per stage
-    and the graph-capturing, warmup, replay, and profile flags are carried.
+    Only ``num_tokens_across_dp_cpu`` / ``max_tokens_across_dp_cpu`` per stage,
+    the graph-capturing, warmup, replay, and profile flags, and the sender's A2E
+    ``quant_mode`` are carried.
     These are the fields the FFN-side connectors read back after decode. A
     plugin-owned minimal schema keeps the wire format decoupled from
     vLLM-internal DP metadata objects.
@@ -410,6 +422,7 @@ def encode_control_payload(payload: AFDControlPayload) -> bytes:
         "is_warmup": bool(payload.is_warmup),
         "is_graph_replaying": bool(payload.is_graph_replaying),
         "is_profile": bool(payload.is_profile),
+        "quant_mode": int(payload.quant_mode),
     }
     return json.dumps(wire_payload, separators=(",", ":"), sort_keys=True).encode(
         "utf-8",
@@ -440,6 +453,8 @@ def decode_control_payload(payload_bytes: bytes) -> AFDControlPayload:
         is_warmup=bool(payload.get("is_warmup", False)),
         is_graph_replaying=bool(payload.get("is_graph_replaying", False)),
         is_profile=bool(payload.get("is_profile", False)),
+        # An older peer does not declare a mode, and its only mode is BF16.
+        quant_mode=int(payload.get("quant_mode", 0)),
     )
 
 

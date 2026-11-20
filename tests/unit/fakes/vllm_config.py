@@ -21,7 +21,7 @@ def camp2p_config(
             tensor_parallel_size=1,
             num_ubatches=num_ubatches,
         ),
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
+        scheduler_config=SimpleNamespace(max_num_seqs=8, max_num_batched_tokens=16),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(
                 hidden_size=16,

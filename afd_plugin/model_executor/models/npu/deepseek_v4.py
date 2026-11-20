@@ -303,8 +303,9 @@ class AFDDeepseekV4SyncAttentionGateRemoteMoE(AFDDeepseekV4AttentionGateRemoteMo
       send and the receive are separate calls;
     - the shared experts run *between* those calls, which is the whole point of
       moving them here: their work overlaps the FFN side's routed work;
-    - no DBO yield, because the first prototype keeps the sync path free of the
-      scheduling interaction the async shell needs.
+    - with native DBO the stage is resolved before the routing send, the forward
+      yields between the send and the receive, and the receive reuses the resolved
+      stage so a peer ubatch cannot switch it mid-transfer.
 
     Reusing ``RemoteFFNProxy._send_and_receive`` is not possible here: it issues the
     send and the receive back to back, leaving no window for the shared experts.
@@ -327,10 +328,16 @@ class AFDDeepseekV4SyncAttentionGateRemoteMoE(AFDDeepseekV4AttentionGateRemoteMo
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
             raise RuntimeError("Sync Attention-side gate requires AFD forward metadata")
+        # AFD metadata is shared by the layer while DBO gives each ubatch its own
+        # thread and forward context, so resolve the stage once, before the send.
+        stage_idx = int(
+            getattr(get_forward_context(), "ubatch_idx", afd_metadata.stage_idx),
+        )
+        afd_metadata.stage_idx = stage_idx
         context = AFDTransferContext(
             metadata=AFDTransferMetadata.create_attention_metadata(
                 layer_idx=self.layer_idx,
-                stage_idx=afd_metadata.stage_idx,
+                stage_idx=stage_idx,
                 seq_len=int(hidden_states.shape[0]),
             )
         )
@@ -346,9 +353,10 @@ class AFDDeepseekV4SyncAttentionGateRemoteMoE(AFDDeepseekV4AttentionGateRemoteMo
             if self.shared_experts is not None
             else None
         )
+        maybe_apply_dbo_yield(hidden_states, role="attention")
         output = afd_metadata.connector.recv_ffn_output(
             ref_tensor=hidden_states,
-            ubatch_idx=afd_metadata.stage_idx,
+            ubatch_idx=stage_idx,
         )
         if shared_output is not None:
             output = output + shared_output
@@ -530,6 +538,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         group_list: torch.Tensor | None = None,
         topk_ids: torch.Tensor | None = None,
         topk_weights: torch.Tensor | None = None,
+        activation_scale: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor:
         if not isinstance(self.mlp, native.DeepseekV4MoE):
@@ -560,6 +569,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 hidden_states,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
+                activation_scale=activation_scale,
             )
 
         # The async CAM FFN runs through the layered executor upstream; this method
@@ -580,6 +590,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         *,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        activation_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the FFN on routing the Attention side computed.
 
@@ -608,6 +619,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
+            activation_scale=activation_scale,
         )
 
 

@@ -234,9 +234,10 @@ CUDA configurations and validation limits.
 wraps the native Ascend model independently of the CUDA adapter. Attention
 owns attention, mHC, normalization and finalization. Synchronous CAMP2P has two
 shapes, selected by the common `compute_gate_on_attention` field: with `false`
-the FFN role owns the native gate and MoE, and with `true` (DeepSeek-V4, TP=1, no
-DBO or ubatching) the router and shared experts run on Attention and FFN executes
-only the transported routed experts. The connector-local flag of the same name is
+the FFN role owns the native gate and MoE, and with `true` (DeepSeek-V4, TP 1; DBO or
+ubatching additionally requires Attention DP > 1 and exactly two microbatches) the
+router and shared experts run on Attention and FFN executes only the transported
+routed experts. The connector-local flag of the same name is
 kept for compatibility and does not select the mode. Async CAM keeps the
 Hash/top-k router and shared experts on Attention and sends only routed-expert
 work; `dynamicQuant=1` is required.
