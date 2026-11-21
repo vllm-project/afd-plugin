@@ -320,6 +320,36 @@ Send API traffic only to the Attention server. For eager, DBO, Attention TP
 and FP8 examples, see the
 [DeepEP M2N recipes](../../recipe/gpu/DeepEPM2NAFDConnector/README.md).
 
+## Validation
+
+- CPU unit tests:
+  [`tests/unit/connectors/test_deepep_m2n_connector.py`](../../tests/unit/connectors/test_deepep_m2n_connector.py)
+  runs against a fake afdEP module when afdEP-comm is not installed;
+  [`test_deepep_m2n_layout.py`](../../tests/unit/connectors/test_deepep_m2n_layout.py)
+  checks the placement table above.
+- GPU connector tests: [`tests/gpu`](../../tests/gpu/README.md) checks
+  dispatch, DeepGEMM experts and combine against references on one node.
+- Model E2E: the Qwen3 MoE cases `afd-deepep-m2n-*-2a2f` in
+  [`tests/e2e`](../../tests/e2e/README.md#deepep-m2n-scenarios) (eager, graph,
+  graph + DBO, and Attention TP2), the same five DeepSeek-V2-Lite cases and
+  the two-pod cases in
+  `tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py`.
+
+## Requirements and limitations
+
+- SM90 or newer on every rank; the handshake rejects older GPUs.
+- Qwen3 MoE with every layer MoE and no shared expert, or DeepSeek-V2.
+- `compute_gate_on_attention=true` on both roles; EPLB is not supported.
+- FFN TP must be 1; FFN EP size equals `num_ffn_ranks`.
+- `num_experts` must be divisible by `num_ffn_ranks`.
+- CUDA graphs are limited to `FULL_DECODE_ONLY`; DBO uses exactly two
+  micro-batches and must be enabled on both roles or neither.
+- Every rank must take part in every MoE layer and stage. The transport uses
+  `cpu_timeout_s` and `gpu_timeout_s` for host waits and kernel spins. See
+  [Recovering from a startup failure](#recovering-from-a-startup-failure) for
+  failures during collective construction.
+- There is no fallback to another transport.
+
 ### Recovering from a startup failure
 
 With afdEP-comm v1.2.1, creating each lane is collective. If one rank fails in
@@ -352,33 +382,3 @@ Allow enough startup time for a cold model load and kernel compilation.
   When roles span containers or pods, the controller must stop and recreate every
   member on a startup failure. A probe on one container restarts only that
   container.
-
-## Validation
-
-- CPU unit tests:
-  [`tests/unit/connectors/test_deepep_m2n_connector.py`](../../tests/unit/connectors/test_deepep_m2n_connector.py)
-  runs against a fake afdEP module when afdEP-comm is not installed;
-  [`test_deepep_m2n_layout.py`](../../tests/unit/connectors/test_deepep_m2n_layout.py)
-  checks the placement table above.
-- GPU connector tests: [`tests/gpu`](../../tests/gpu/README.md) checks
-  dispatch, DeepGEMM experts and combine against references on one node.
-- Model E2E: the Qwen3 MoE cases `afd-deepep-m2n-*-2a2f` in
-  [`tests/e2e`](../../tests/e2e/README.md#deepep-m2n-scenarios) (eager, graph,
-  graph + DBO, and Attention TP2), the same five DeepSeek-V2-Lite cases and
-  the two-pod cases in
-  `tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py`.
-
-## Requirements and limitations
-
-- SM90 or newer on every rank; the handshake rejects older GPUs.
-- Qwen3 MoE with every layer MoE and no shared expert, or DeepSeek-V2.
-- `compute_gate_on_attention=true` on both roles; EPLB is not supported.
-- FFN TP must be 1; FFN EP size equals `num_ffn_ranks`.
-- `num_experts` must be divisible by `num_ffn_ranks`.
-- CUDA graphs are limited to `FULL_DECODE_ONLY`; DBO uses exactly two
-  micro-batches and must be enabled on both roles or neither.
-- Every rank must take part in every MoE layer and stage. The transport uses
-  `cpu_timeout_s` and `gpu_timeout_s` for host waits and kernel spins. See
-  [Recovering from a startup failure](#recovering-from-a-startup-failure) for
-  failures during collective construction.
-- There is no fallback to another transport.
