@@ -9,8 +9,9 @@ in which every rank owns ``experts_per_rank`` experts. FastAFD orders the
 union ``[Attention.., FFN..]`` and remaps real expert ids by an offset. The
 plugin orders the AFD role world FFN first (``[F0.., A0..]``, as the P2P
 connector does), so FFN rank ``g`` owns real experts
-``[g * E_local, (g + 1) * E_local)``. Attention ranks own dummy expert slots
-that routing never selects.
+``[g * E_local, (g + 1) * E_local)``. afdEP-comm gives Attention ranks the
+empty expert blocks DeepEP needs (``afdep.Config.logical_experts``); routing
+never selects them.
 
 The transport world (``plan_transport_layout``) holds the same ranks in
 physical order: NVLink domain by domain, as DeepEP numbers ranks, with each
@@ -55,11 +56,6 @@ class DeepEPM2NLayout:
     @property
     def experts_per_rank(self) -> int:
         return self.num_experts // self.ffn_size
-
-    @property
-    def deepep_num_experts(self) -> int:
-        """Expert count DeepEP sees: real experts plus Attention dummy slots."""
-        return self.union_size * self.experts_per_rank
 
     def world_rank(self, role: str, role_rank: int) -> int:
         """Rank in the role world ``[F0.., A0..]``."""

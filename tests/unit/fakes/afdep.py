@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """A stand-in for afdEP-comm's ``afdep`` package where it is not installed.
 
-``DeepEPM2NAFDConnector`` imports ``afdep.deepep`` when its module loads. The
-stand-in provides the names it imports, so connector tests run on hosts
-without afdEP-comm; tests that build a lane substitute ``FakeElasticBuffer``.
+``DeepEPM2NAFDConnector`` imports ``afdep`` when its module loads. The stand-in
+provides the names it imports, so connector tests run on hosts without
+afdEP-comm; tests that build the lanes substitute ``FakeConfig`` and
+``FakeLanes``.
 """
 
 from __future__ import annotations
@@ -14,66 +15,70 @@ from importlib.machinery import ModuleSpec
 from importlib.util import find_spec
 from types import ModuleType
 
-# Keyword-only parameters of afdep.deepep.ElasticBuffer at the pinned afdEP-comm
-# (afdEP/afdEP-comm v1.1.0). The stand-in requires the required ones and
-# rejects any other keyword, so a lane built with arguments the real transport
-# would refuse fails here as it would on a GPU.
-ELASTIC_BUFFER_REQUIRED = (
-    "group",
+# Fields of afdep.Config at the pinned afdEP-comm. The stand-in requires the
+# required ones and rejects any other keyword, so a transport built with
+# arguments the real Config would refuse fails here as it would on a GPU.
+CONFIG_REQUIRED = (
     "capacity_tokens_per_rank",
     "hidden_size",
     "num_experts",
     "top_k",
+    "ffn_ranks",
+    "attention_ranks",
+)
+CONFIG_OPTIONAL = (
+    "expert_alignment",
+    "payload",
     "allow_hybrid_mode",
+    "num_sms",
+    "num_qps",
     "rdma_traffic_class",
     "cpu_timeout_s",
     "gpu_timeout_s",
-)
-ELASTIC_BUFFER_OPTIONAL = (
-    "use_fp8_dispatch",
-    "num_sms",
-    "num_qps",
-    "ffn_ranks",
     "ffn_ranks_per_domain",
 )
 
 
-class FakeElasticBuffer:
-    """Records the arguments one lane's transport is built with."""
+class FakeConfig:
+    """Records the fields the transport is configured with."""
 
     def __init__(self, **kwargs: object) -> None:
-        missing = sorted(set(ELASTIC_BUFFER_REQUIRED) - set(kwargs))
-        unknown = sorted(
-            set(kwargs) - set(ELASTIC_BUFFER_REQUIRED) - set(ELASTIC_BUFFER_OPTIONAL)
-        )
+        missing = sorted(set(CONFIG_REQUIRED) - set(kwargs))
+        unknown = sorted(set(kwargs) - set(CONFIG_REQUIRED) - set(CONFIG_OPTIONAL))
         if missing or unknown:
             raise TypeError(
-                f"ElasticBuffer() missing keywords {missing}, unexpected {unknown}"
+                f"Config() missing keywords {missing}, unexpected {unknown}"
             )
         self.kwargs = kwargs
+
+
+class FakeLanes:
+    """Records what the lanes are built with; ``afdep.Lanes`` is keyword-only."""
+
+    def __init__(self, *, group: object, config: FakeConfig, lanes: int) -> None:
+        self.group, self.config, self.num_lanes = group, config, lanes
+
+    def __len__(self) -> int:
+        return self.num_lanes
 
 
 _FAKE_MARKER = "__afd_fake_afdep__"
 
 
 def install_fake_afdep() -> None:
-    """Register the stand-in ``afdep.deepep`` unless afdEP is importable."""
+    """Register the stand-in ``afdep`` unless afdEP is importable."""
     if "afdep" in sys.modules or find_spec("afdep") is not None:
         return
     package = ModuleType("afdep")
-    deepep = ModuleType("afdep.deepep")
-    deepep.ElasticBuffer = FakeElasticBuffer  # type: ignore[attr-defined]
-    deepep.DispatchHandle = type("DispatchHandle", (), {})  # type: ignore[attr-defined]
-    deepep.ReceiveResult = type("ReceiveResult", (), {})  # type: ignore[attr-defined]
-    package.deepep = deepep  # type: ignore[attr-defined]
+    package.Buffer = type("Buffer", (), {})  # type: ignore[attr-defined]
+    package.Config = FakeConfig  # type: ignore[attr-defined]
+    package.DispatchHandle = type("DispatchHandle", (), {})  # type: ignore[attr-defined]
+    package.Lanes = FakeLanes  # type: ignore[attr-defined]
     # A module without a spec makes a later find_spec("afdep") raise instead of
     # reporting the package as missing.
     package.__spec__ = ModuleSpec("afdep", None)
-    deepep.__spec__ = ModuleSpec("afdep.deepep", None)
     setattr(package, _FAKE_MARKER, True)
-    setattr(deepep, _FAKE_MARKER, True)
     sys.modules["afdep"] = package
-    sys.modules["afdep.deepep"] = deepep
 
 
 def uninstall_fake_afdep() -> None:
@@ -82,7 +87,6 @@ def uninstall_fake_afdep() -> None:
     A stand-in left in ``sys.modules`` has no ``__spec__``, so a later
     ``find_spec("afdep")`` raises instead of reporting "not installed".
     """
-    for name in ("afdep.deepep", "afdep"):
-        module = sys.modules.get(name)
-        if module is not None and getattr(module, _FAKE_MARKER, False):
-            sys.modules.pop(name, None)
+    module = sys.modules.get("afdep")
+    if module is not None and getattr(module, _FAKE_MARKER, False):
+        sys.modules.pop("afdep", None)
