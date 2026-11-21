@@ -85,8 +85,16 @@ def local_experts_from_vllm(routed_experts: RoutedExperts) -> FFNLocalExperts:
     if w13.dtype == FP8_DTYPE:
         w13_scale = routed_experts.w13_weight_scale_inv.data
         w2_scale = routed_experts.w2_weight_scale_inv.data
+    # vLLM 0.34.0 removed ExpertMapManager.get_local_expert_ids; the map is in both.
+    manager = routed_experts.expert_map_manager
+    expert_map = manager.expert_map  # global -> local id, -1 elsewhere; None: all local
+    expert_ids = (
+        range(manager.global_num_experts)
+        if expert_map is None
+        else torch.where(expert_map != -1)[0].tolist()
+    )
     return FFNLocalExperts(
-        expert_ids=tuple(routed_experts.expert_map_manager.get_local_expert_ids()),
+        expert_ids=tuple(expert_ids),
         weights=LocalExpertWeights(
             w13=w13, w2=w2, w13_scale=w13_scale, w2_scale=w2_scale
         ),

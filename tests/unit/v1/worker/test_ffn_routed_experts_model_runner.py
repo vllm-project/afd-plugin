@@ -145,8 +145,13 @@ def test_constructor_rejects_connectors_without_routed_rows(monkeypatch):
         )
 
 
+GLOBAL_EXPERTS = 8
+
+
 def _routed_experts(*, fp8: bool, expert_ids=(4, 5), backend: str = "TRITON"):
     num_experts = len(expert_ids)
+    expert_map = torch.full((GLOBAL_EXPERTS,), -1)
+    expert_map[list(expert_ids)] = torch.arange(num_experts)
     dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
     selected = SimpleNamespace(name=backend)
     experts = SimpleNamespace(
@@ -164,7 +169,7 @@ def _routed_experts(*, fp8: bool, expert_ids=(4, 5), backend: str = "TRITON"):
             requires_grad=False,
         ),
         expert_map_manager=SimpleNamespace(
-            get_local_expert_ids=lambda: list(expert_ids),
+            global_num_experts=GLOBAL_EXPERTS, expert_map=expert_map
         ),
     )
     if fp8:
@@ -201,6 +206,16 @@ def test_local_experts_are_views_of_vllm_parameters(fp8):
         )
     else:
         assert local.weights.w13_scale is None
+
+
+def test_local_experts_without_an_expert_map_are_all_experts():
+    """vLLM keeps no expert map when the rank holds every expert."""
+    experts = _routed_experts(fp8=False, expert_ids=tuple(range(GLOBAL_EXPERTS)))
+    experts.expert_map_manager.expert_map = None
+
+    local = local_experts_from_vllm(experts)
+
+    assert local.expert_ids == tuple(range(GLOBAL_EXPERTS))
 
 
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
