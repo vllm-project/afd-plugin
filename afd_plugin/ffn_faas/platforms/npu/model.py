@@ -14,6 +14,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from afd_plugin.ffn_faas.model_utils import parameter_storage_bytes
 from afd_plugin.ffn_faas.platforms.npu.settings import validate_native_expert_map
 
 if TYPE_CHECKING:
@@ -166,12 +167,7 @@ class CAMRoutedModel:
             if tuple(view.layer_idx for view in views) != adapter.layer_indices:
                 raise ValueError("native views do not match the routed model layers")
             self._views = views
-            storage_sizes: dict[tuple[str, int], int] = {}
-            for parameter in owner.parameters():
-                storage = parameter.untyped_storage()
-                key = (str(parameter.device), storage.data_ptr())
-                storage_sizes[key] = storage.nbytes()
-            self._parameter_bytes = sum(storage_sizes.values())
+            self._parameter_bytes = parameter_storage_bytes(owner)
         self._loaded = True
 
     def get_experts_layer_indices(self) -> tuple[int, ...]:

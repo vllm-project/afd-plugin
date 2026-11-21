@@ -15,6 +15,9 @@ class MemoryStore:
         self.condition = Condition()
         self.closed = False
 
+    def set_timeout(self, timeout):
+        self.timeout = timeout
+
     def set(self, key, value):
         assert not self.closed, "Store used after release"
         with self.condition:

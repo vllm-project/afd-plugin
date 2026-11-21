@@ -32,6 +32,7 @@ from tests.e2e.models.deepseek_v2_lite import cases as v2_cases
 from tests.e2e.models.deepseek_v4_flash import cases as dsv4_cases
 from tests.e2e.models.deepseek_v4_flash import test_async_cam_npu as entrypoint
 from tests.e2e.models.deepseek_v4_flash.completions import CompletionTask
+from tests.e2e.models.qwen3_moe import cases as qwen3_cases
 
 CONCURRENT_REQUESTS = 10
 
@@ -816,6 +817,44 @@ def test_async_cam_mega_selection_reaches_both_role_commands(tmp_path, case_id):
         "strict" if mega else "npu_async_cam_legacy"
     )
     assert case.phases[0].task == CompletionTask(check_answer=True)
+
+
+@pytest.mark.parametrize("case_id", qwen3_cases.DEEPEP_M2N_FFN_SERVICE_SCENARIOS)
+def test_ffn_service_runs_the_probe_entry_for_graph_evidence(tmp_path, case_id):
+    environment = CaseEnvironment(
+        model="/models/qwen3",
+        vllm_bin="vllm",
+        device_backend="gpu",
+        devices=tuple(map(str, range(4))),
+        output_path=tmp_path,
+    )
+    case = qwen3_cases.build_case(case_id, environment)
+    _, record = runner.prepare_case(case, environment)
+    checks = case.phases[0].checks
+    probed = bool(checks)
+    assert probed == (case_id != "afd-deepep-m2n-faas-eager-2a2f")
+    assert all(check.roles == ("attention", "ffn") for check in checks)
+    ffn = record["commands"]["ffn"]
+    module = ffn[ffn.index("-m", ffn.index("torch.distributed.run")) + 1]
+    assert module == (
+        "tests.e2e.ffn_service_evidence" if probed else "afd_plugin.ffn_faas"
+    )
+    assert "--worker-extension-cls" not in ffn
+    assert ("--worker-extension-cls" in record["commands"]["attention"]) is probed
+
+
+def test_ffn_service_rejects_a_prefill_role(tmp_path):
+    environment = CaseEnvironment(
+        model="/models/qwen3",
+        vllm_bin="vllm",
+        device_backend="gpu",
+        devices=tuple(map(str, range(6))),
+        output_path=tmp_path,
+    )
+    case = qwen3_cases.build_case("afd-deepep-m2n-faas-eager-2a2f", environment)
+    deployment = replace(case.deployment, prefill=case.deployment.attention)
+    with pytest.raises(ValueError, match="cannot run with a prefill role"):
+        runner.prepare_case(replace(case, deployment=deployment), environment)
 
 
 @pytest.mark.parametrize(

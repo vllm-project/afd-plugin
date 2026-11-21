@@ -30,6 +30,9 @@ constexpr uint32_t LAYER_INDEX_INDEX = 2;
 constexpr uint32_t START_EXPERT_INDEX = 3;
 constexpr uint32_t END_EXPERT_INDEX = 4;
 constexpr uint32_t MOE_PRE_TOKEN_NUM_INDEX = 3;
+// Row buffers used to read the token payloads. Two is enough to overlap the next
+// token's local read with the current token's store; one keeps the serial loop.
+constexpr uint32_t ROW_STAGE_NUM = 2;
 
 template<AscendC::HardEvent event>
 __aicore__ inline void SyncFunc() {
@@ -123,7 +126,30 @@ private:
     // for quantization
     uint32_t hiddenSizeQuant_{0};
 
+    // Token payload staging: the routed loop stores one row per token, and the
+    // local read of the next row overlaps that store when two buffers are spare.
+    uint32_t rowStageStride_{0};   // elements per staged row
+    bool rowPipeline_{false};      // ROW_STAGE_NUM buffers allocated
+    LocalTensor<ExpandXOutType> rowStageTensor_;
+
     bool isError_{false};
+
+    __aicore__ inline LocalTensor<ExpandXOutType> RowStage(uint32_t rowIndex)
+    {
+        return rowStageTensor_[rowStageStride_ * (rowIndex % ROW_STAGE_NUM)];
+    }
+
+    // Store one staged row plus its dynamic scale where the FFN expert reads it.
+    __aicore__ inline void StoreStagedRow(LocalTensor<ExpandXOutType> &row, uint32_t tpExpertSlotOffset)
+    {
+        SyncFunc<HardEvent::S_MTE3>();
+        DataCopy(xOutGMTensor_[hiddenSize_ * tpExpertSlotOffset], row, hiddenSize_);
+        if constexpr (DynamicQuant) {
+            LocalTensor<float> rowFloat = row.template ReinterpretCast<float>();
+            DataCopyPad(quantScaleGMTensor_[tpExpertSlotOffset], rowFloat[hiddenSize_ / sizeof(float)],
+                {1U, sizeof(float), 0U, 0U, 0U});
+        }
+    }
 };
 
 template <TemplateMC2TypeClass>
@@ -224,6 +250,24 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::Init(
 
     // remaining reusable UB space
     ubReuseSize_ = totalUbSize_ - bufOffset;
+
+    // Two token rows let one local read overlap one store. The routed loop DMAs
+    // at most ceil(maxTokenNum_ / aivNum_) token addresses per core, so that is
+    // the capacity the row buffers have to leave available; sizing the guard by
+    // maxTokenNum_ itself would switch the overlap off for the default
+    // BATCH_SIZE_FACTOR, where maxTokenNum_ is larger than the whole UB.
+    rowStageStride_ = DynamicQuant ? hiddenSizeQuant_ : hiddenSize_;
+    uint64_t rowStageBytes = static_cast<uint64_t>(rowStageStride_) * sizeof(ExpandXOutType);
+    uint32_t tokenAddrEntries = static_cast<uint32_t>(maxTokenNum_ / aivNum_) + 1;
+    uint64_t tokenAddrBytes = MathCeil(sizeof(uint16_t) * tokenAddrEntries, UB_ALIGN);
+    if (rowStageBytes % UB_ALIGN == 0 &&
+        rowStageBytes * ROW_STAGE_NUM + tokenAddrBytes <= ubReuseSize_) {
+        rowStageTensor_ = ubBuffer_.GetWithOffset<ExpandXOutType>(
+            rowStageStride_ * ROW_STAGE_NUM, bufOffset);
+        bufOffset += rowStageBytes * ROW_STAGE_NUM;
+        ubReuseSize_ -= rowStageBytes * ROW_STAGE_NUM;
+        rowPipeline_ = true;
+    }
 
     bufSize = ubReuseSize_;
     tokenAddrOffsetTensor_ = ubBuffer_.GetWithOffset<uint16_t>(bufSize / sizeof(uint16_t), bufOffset);
@@ -440,6 +484,16 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecvRo
         ++currExpertId;
         nextExpertTokenNum += expertRecvTokenNumTensor_(currExpertId);
     }
+    uint32_t rowCount = tokenNumPerAivEnd - tokenNumPerAivStart;
+    uint32_t rowElements = DynamicQuant ? hiddenSizeQuant_ : hiddenSize_;
+    bool pipelined = rowPipeline_ && rowCount > 1;
+    if (pipelined) {
+        // Prime row 0. Every later row is issued before the previous row stores,
+        // so the read latency of a token is off the serial path.
+        DataCopy(RowStage(0), dstTokenStoreGMTensor[rowElements * tokenAddrOffsetTensor_(0)], rowElements);
+        SyncFunc<HardEvent::MTE2_S>();
+        SyncFunc<HardEvent::S_MTE2>();
+    }
     for (uint32_t expertSlotOffset = tokenNumPerAivStart; expertSlotOffset < tokenNumPerAivEnd; ++expertSlotOffset) {
         while (expertSlotOffset >= nextExpertTokenNum) {
             preExpertTokenNum += tpExpertRecvTokenNumTensor_(currExpertId);
@@ -450,8 +504,26 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecvRo
         // received by prior experts + sent by prior attns to this expert + nth sent by current attn to current expert
         uint32_t tpExpertSlotOffset = preExpertTokenNum + tpExpertRecvTokenNumTensor_(expertNumPerMoe_ + currExpertId) +
             (expertSlotOffset - currExpertTokenNum);
+        uint32_t rowIndex = expertSlotOffset - tokenNumPerAivStart;
 
-        uint16_t moeTokenSendIdx = tokenAddrOffsetTensor_(expertSlotOffset - tokenNumPerAivStart);
+        if (pipelined) {
+            if (rowIndex + 1 < rowCount) {
+                // Row rowIndex + 1 reuses the buffer of row rowIndex - 1, so that
+                // store has to land before the next read overwrites it.
+                SyncFunc<HardEvent::MTE3_S>();
+                DataCopy(RowStage(rowIndex + 1),
+                    dstTokenStoreGMTensor[rowElements * tokenAddrOffsetTensor_(rowIndex + 1)], rowElements);
+            }
+            LocalTensor<ExpandXOutType> row = RowStage(rowIndex);
+            StoreStagedRow(row, tpExpertSlotOffset);
+            if (rowIndex + 1 < rowCount) {
+                SyncFunc<HardEvent::MTE2_S>();
+                SyncFunc<HardEvent::S_MTE2>();
+            }
+            continue;
+        }
+
+        uint16_t moeTokenSendIdx = tokenAddrOffsetTensor_(rowIndex);
 
         if constexpr (DynamicQuant) {
             DataCopy(xOutTensor_, dstTokenStoreGMTensor[hiddenSizeQuant_ * moeTokenSendIdx], hiddenSizeQuant_);
@@ -473,6 +545,10 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecvRo
             DataCopy(xOutGMTensor_[hiddenSize_ * tpExpertSlotOffset], xOutTensor_, hiddenSize_);
             SyncFunc<HardEvent::MTE3_S>();
         }
+    }
+    if (pipelined) {
+        // The completion flags below must not publish before the last store lands.
+        SyncFunc<HardEvent::MTE3_S>();
     }
 
     if (aivId_ == 0) {

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, cast
 
@@ -30,18 +31,18 @@ from afd_plugin.connectors import (
     AFDControlPlane,
     AFDDPMetadata,
 )
+from afd_plugin.connectors.base import AFDControlPlaneClosedError
 from afd_plugin.v1.worker.cuda_graph import (
+    AFDCUDAGraphPolicy,
     AFDGraphRunMode,
     graph_run_mode,
     make_ffn_graph_key,
-    validate_cuda_graph_mode,
 )
 from afd_plugin.v1.worker.ffn_metadata import (
     _set_moe_layer_index,
     aggregate_ffn_token_counts,
     project_ffn_token_counts_to_dp,
 )
-from afd_plugin.validation import validate_gpu_model_runner_v2_config
 
 if TYPE_CHECKING:
     from vllm.sequence import IntermediateTensors
@@ -53,29 +54,28 @@ class GPUFFNModelRunner:
     """FFN model runner for AFD GPU execution.
 
     FFN steps are driven by the connector control plane rather than the vLLM
-    scheduler. GPU only supports control-plane-driven connectors, so the runner
+    scheduler. Worker admits deployment and supplies the resolved graph policy.
+    GPU only supports control-plane-driven connectors, so the runner
     asserts ``connector.control_plane is not None`` at construction; connectors
     without a control plane (``control_plane is None``) are not supported.
     """
 
     afd_expected_role = "ffn"
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        *,
+        afd_cudagraph_policy: AFDCUDAGraphPolicy,
+    ) -> None:
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.load_config = vllm_config.load_config
         self.device = device
         self.dtype = self.model_config.dtype
         self.afd_config = self.parse_config(vllm_config)
-        validate_gpu_model_runner_v2_config(
-            vllm_config,
-            expected_role="ffn",
-            device_type=device.type,
-        )
-        self.afd_cudagraph_policy = validate_cuda_graph_mode(
-            vllm_config,
-            role="ffn",
-        )
+        self.afd_cudagraph_policy = afd_cudagraph_policy
         rank, local_rank = _resolve_world_ranks()
         self.connector = AFDConnectorFactory.create_connector(
             rank,
@@ -149,6 +149,65 @@ class GPUFFNModelRunner:
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         return None
+
+    def execute_connector_driven_step(
+        self, *, cancel_requested: Callable[[], bool]
+    ) -> bool:
+        """Receive one control payload and run the FFN step it describes.
+
+        Blocks in the control plane until Attention rank 0 sends the next
+        payload. Warmup and capture payloads go to ``capture_model`` when FFN
+        CUDA graphs are enabled; every other payload (eager, replay, or an
+        eager fallback for a replay without a captured key) goes to
+        ``execute_model``. The step ends with a device synchronize so the
+        caller only sees completed work.
+
+        ``cancel_requested`` tells a cancelled receive apart from a broken
+        control plane: when the control plane was closed on purpose (the
+        caller set its stop flag before closing it) the method returns
+        ``False``; any other closed or failed receive raises unchanged, so a
+        peer or transport failure is never reported as a clean stop.
+
+        Shared by ``AFDFFNWorker._run_ffn_server_loop`` and the standalone
+        FFN service backend, so both drive identical capture, replay and
+        synchronization order.
+        """
+        control_plane = self.connector.control_plane
+        if control_plane is None:
+            raise NotImplementedError(
+                "GPU FFN only supports control-plane-driven connectors; "
+                "connectors without a control plane (control_plane is None) "
+                "are not supported.",
+            )
+
+        try:
+            payload = control_plane.recv_dp_metadata_list()
+        except AFDControlPlaneClosedError:
+            if not cancel_requested():
+                raise
+            return False
+        dp_metadata_list = payload.dp_metadata_list
+        is_attn_graph_capturing = payload.is_graph_capturing
+        is_warmup = payload.is_warmup
+        is_graph_replaying = payload.is_graph_replaying
+
+        if self.use_cuda_graph and (is_warmup or is_attn_graph_capturing):
+            self.capture_model(
+                dp_metadata_list=dp_metadata_list,
+                is_warmup=is_warmup,
+                is_attn_graph_capturing=is_attn_graph_capturing,
+            )
+        else:
+            self.execute_model(
+                dp_metadata_list=dp_metadata_list,
+                is_graph_capturing=is_attn_graph_capturing,
+                is_warmup=is_warmup,
+                is_graph_replaying=is_graph_replaying,
+            )
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        return True
 
     def execute_model(
         self,

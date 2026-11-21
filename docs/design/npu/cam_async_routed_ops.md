@@ -230,6 +230,17 @@ unused cells and reuses a destination base while its TP peer remains unchanged.
 These changes preserve the compact protocol and do not add concurrent windows
 or remove empty-expert completion notifications.
 
+Dispatch-send stages whole token rows in UB and writes one contiguous
+peer-window store per run of consecutive tokens that share a destination, and
+dispatch-receive reads the next token row while it stores the current one. Both
+keep the same payload bytes, destination offsets and ready-flag ordering; they
+only reduce the number of peer-window stores and the number of serialized row
+waits. Staging is skipped whenever UB cannot hold at least two rows, and each
+optimization degrades to the previous per-token path in that case. The receive
+row buffers are sized against the per-core token-address bound
+(`ceil(maxTokenNum / aivNum)`), not the whole capacity, so the overlap also
+engages for the native `BATCH_SIZE_FACTOR`.
+
 Use [the standalone precision and performance harness](../../../tests/npu/README.md)
 to compare identical routing, TP width, window size, dtype, quantization and
 chunk capacity before claiming a speedup. A source optimization alone is not

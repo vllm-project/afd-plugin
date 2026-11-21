@@ -23,8 +23,10 @@ technical review, before delivery.
   `pytest tests/gpu/test_attention_routing.py`. The DeepSeek-V2-Lite
   seven-case GPU E2E gate runs on `l4_4`.
 - `test-weekly` (main + `WEEKLY=1`, or PR label `weekly-test`) adds Qwen3 MoE
-  (four cases), Qwen3.6 MoE (three cases), and DeepSeek-V2-Lite
-  `afd-graph-dbo-2a1f` on `h100_4`.
+  (four cases), Qwen3.6 MoE (three cases), DeepSeek-V2-Lite
+  `afd-graph-dbo-2a1f`, the DeepEP M2N device tests
+  (`tests/gpu/test_deepep_m2n_gpu.py`) and Qwen3 MoE
+  `afd-deepep-m2n-graph-dbo-2a2f` on `h100_4`.
 - `skip_ci.py` suppresses the whole default pipeline for docs-only
   (`docs/**`, any `*.md`, `mkdocs.yml`) or skip-mark-only diffs; label-only CI
   YAML edits gate per platform and level. Say what a green run does and does

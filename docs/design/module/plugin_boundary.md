@@ -151,29 +151,33 @@ configuration paths, not as a complete serialization or public identity.
 
 Common configuration validation is CPU-safe and checks role, optional expected
 role, supported connector name, async/connector pairing, P2P topology,
-endpoint, positive role counts, and role-rank range. Connector-specific schema
-and feature validation runs when the factory resolves the selected connector.
+endpoint and positive role counts. Actual role-rank resolution is a separate
+runtime boundary. The factory uses the selected connector's schema; NPU
+feature validation follows deployment admission.
 When `worker_cls="auto"`, config normalization selects the AFD worker from the
 active platform and configured role after upstream platform normalization.
 Role mismatches, unsupported platforms, non-standard Ascend workers, and
 incorrect explicit worker paths fail before device execution. CAM async always
 uses the NPU worker family.
 
-CUDA and Ascend require ModelRunnerV2. Role
-role workers apply an additional CPU-safe deployment validator before
+CUDA and Ascend require ModelRunnerV2. Role workers apply an additional
+CPU-safe deployment validator before
 communication resources are created. Both roles must use PP/PCP/DCP size 1,
 role ranks equal to DP x TP, static EP, and a registered AFD model; elastic EP
-and EPLB are rejected. CUDA V2 requires `P2pNcclAFDConnector`, model-specific
-gate placement, and exactly two microbatches with Attention DP1 or DP > 1.
+and EPLB are rejected. CUDA V2 accepts `P2pNcclAFDConnector` and
+`DeepEPM2NAFDConnector`, with connector-specific gate and topology rules. When
+DBO or ubatching is enabled, it requires exactly two microbatches.
 See the [runtime matrix](../../support.md#tested-runtime-matrix) for
 tested configurations and known DeepSeek-V2-Lite DBO shutdown failures.
-Ascend V2 accepts synchronous `CAMP2pAFDConnector` with FFN-side gating or
-eager `CAMAsyncAFDConnector` with async DP and Attention-side gating. Ascend
-native DBO requires exactly two microbatches and no speculative decoding.
-CAMP2P requires Attention DP > 1 and supports eager/graph DBO; plain MLA
-graph DBO requires `FULL_DECODE_ONLY`. Async CAM supports eager Attention
-DBO at DP1 or DP > 1, including when FFN uses FULL. FFN remains outside
-Attention's native DBO thread schedule.
+Ascend V2 accepts synchronous `CAMP2pAFDConnector` or `CAMAsyncAFDConnector`.
+Async CAM requires async DP and Attention-side gating; the supported sync
+Attention-side gate has additional feature restrictions. Ascend native DBO
+requires exactly two microbatches and no speculative decoding. CAMP2P DBO
+requires Attention DP > 1 and supports eager/graph execution; plain MLA graph
+DBO requires `FULL_DECODE_ONLY`. Async CAM supports eager Attention DBO at DP1
+or DP > 1, including when FFN uses FULL. Its DSV4 Attention graph path has
+separate graph and DBO restrictions. FFN remains outside Attention's native
+DBO thread schedule.
 Sequence parallelism follows model policy; synchronous DeepSeek-V2/V3 SP is
 rejected, while Async CAM permits Attention-local model SP. Graph-mode details belong to
 [execution platforms](execution_platforms.md).
@@ -188,6 +192,63 @@ commands:
 
 New commands should omit `--worker-cls`. These paths may change with the pinned
 runtime integration and are not stable third-party extension interfaces.
+
+### Validation ownership
+
+Validation follows configuration construction, Worker/device initialization,
+model loading, peer negotiation, execution and shutdown. Each Worker admits its
+effective child configuration after the required normalization and before native
+device initialization. ModelRunner constructors and the NPU FFN selection
+factory consume that admission; they do not repeat the deployment checklist.
+Standalone runtime harnesses explicitly perform the same applicable admission.
+
+`validation.py` owns common MRV2, PP/CP, role DP x TP, static EP, execution mode
+and DBO constraints. NPU Attention normalizes Async CAM DBO; both NPU Workers
+apply the all2all backend correction before common admission and the rules in
+`compat/npu/feature_validation.py`. That module keeps DSV4/DSpark restrictions,
+connector extras, Attention TP matching, expert divisibility and Push/Pull
+envelopes. DBO's threshold guard stays at the mutation point. A model alias or
+DBO normalization does not justify running the entire checklist again when
+the inputs to those rules remain unchanged.
+
+`cam_receive_capacity()` applies native float32 rounding and requires at least
+one row. Raw connector parsing retains unknown-key/type checks and Mega's
+quantization implication. The connector factory also validates explicitly
+supplied `AFDConfig` values; directly constructing a dataclass does not validate
+it. These input contracts remain separate from runtime admission.
+
+Device capability is checked after device selection and before weights.
+Loaded-tensor validation belongs to compute construction; signature formatting
+consumes that same admitted table. Startup compares remote plans/signatures
+and layer tables, then checks the additional FULL-only uint16 source-row bound.
+It retains error publication and phase barriers. Current payload/FIFO/Pull
+status, graph completion and resource-release conditions stay at their use sites.
+
+#### Adding or moving a check
+
+Place each rule at the earliest owner with the facts and failure handling it
+needs. Reuse an existing admission check instead of repeating it in a Runner,
+factory or Connector only when all of the following hold:
+
+1. Every relevant entry path passes the earlier check in the same process,
+   including standalone services and test harnesses that bypass a Worker.
+2. The earlier condition covers the same role, backend, connector and mode.
+3. The checked configuration, environment and loaded objects cannot change
+   between the two boundaries in that lifecycle. Parent and child config
+   reconstruction and model reloads are separate boundaries; a previous
+   success does not establish validity after a mutation.
+4. The earlier failure preserves the required publication and resource
+   ownership semantics. Local admission cannot replace a peer handshake,
+   per-transaction status check, device-completion fence or release guard.
+
+If any condition is not established, retain the boundary-specific check or
+update the entry path and its coverage. For example, a Worker checks the
+deployment before device initialization, but cannot validate weights before
+they are loaded or prove that another rank announced a compatible plan.
+Review affected callers and exercise the admitted and rejected cases at the
+owning boundary; include direct-entry, mutation and failure-publication cases
+when they are relevant. Avoid adding a cache, flag or wrapper solely to avoid
+repeating a checklist.
 
 ## Environment boundary
 
@@ -210,8 +271,10 @@ switch does not activate AFD or relax AFD validation.
 
 ## Failure and ownership rules
 
-- Parsing and validation errors are caller-visible and occur before connector
-  or device resource creation.
+- Common configuration and Worker deployment admission errors are
+  caller-visible before device initialization. Connector-specific construction,
+  loaded data, peer and runtime-state errors remain visible at their respective
+  boundaries.
 - Optional backend discovery must not make CPU-safe imports fail.
 - The plugin entry point owns registration state, but does not own connector,
   worker, process-group, or graph lifetime.

@@ -46,13 +46,25 @@ no host layer read or per-transaction weight conversion. W4A8 retains its
 existing packed INT4 weights and compensation path. Mixed quantizations do
 not form a single layered table.
 
-`BATCH_SIZE_FACTOR` determines the existing native receive capacity. It must
-cover the dispatched TP-group token envelope, and per-source indices must fit
-the compact protocol's uint16 bound. All F ranks must agree on execution mode
+`BATCH_SIZE_FACTOR` determines the existing native receive capacity. Push must
+cover the dispatched TP-group token envelope; Pull can split rows across rounds.
+FULL additionally requires per-source indices to fit the compact uint16 bound. All F ranks must agree on execution mode
 and static executor layout through the rendezvous Store before HCCL creation.
 
-FULL startup validates the configuration, runs a paired eager communication
-warmup across all A/F ranks, captures one graph per F, then waits for the F
+The shared `cam_receive_capacity()` validates the factor's native-compatible
+literal and range `(0, 1]`, applies float32 rounding, and rejects capacities
+below one row. Eager and FULL use this same calculation. Push must fit the
+whole dispatch envelope; Mega/Pull can split receive rows across rounds.
+
+Worker admission validates local execution, quantization, topology and capacity
+before native device initialization. Model/draft configuration is resolved at
+that boundary; device capabilities are checked before weight loading. The
+standalone runtime harness explicitly performs the applicable admission before
+constructing its connector/Runner. Loaded-weight construction failures still
+reach peers through the existing FFN plan.
+
+FULL Startup compares peer plans and transport signatures, checks the additional
+uint16 row bound, runs a paired eager communication warmup across all A/F ranks, captures one graph per F, then waits for the F
 receive threads to announce readiness. Every A rank participates concurrently
 in cold MC2 initialization. Output comparison belongs to tests. Startup failures
 are published to peers, including F ranks that join after an A timeout.
@@ -117,8 +129,13 @@ Attention fences pending dispatch at `attention_step()` exit. FFN keeps serving
 until every Attention source is quiet, drains active work, then publishes stopped;
 only then may Attention and FFN release their communication resources. Failed
 handshakes retain those resources. Standalone `close()` also validates shutdown
-status before release: this is an additional defensive shutdown check, not a
-relocated hot-path fence.
+status before release. Eager delegates Session validation to connector close;
+FULL also validates before graph reset. These protect separate resource-release
+boundaries without relocating the hot-path fence.
+
+The worker notifies the runner of receiver exit only after drain and receiver
+finish succeed. Pending or failed graph work blocks that notification and
+resource release. Evidence readers use the read-only `receiver_exited` property.
 
 ## Computation semantics
 

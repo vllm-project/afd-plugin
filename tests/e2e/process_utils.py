@@ -80,6 +80,7 @@ def terminate_process_groups(
     process_name: str = "",
     deferred_sigkill_pgids: Collection[int] = (),
     proc_root: Path = PROC_ROOT,
+    forced_pgids_out: list[int] | None = None,
 ) -> list[str]:
     """Terminate process groups with one deadline and reap their leaders.
 
@@ -155,6 +156,8 @@ def terminate_process_groups(
             )
             forced_pgids.append(pgid)
         else:
+            if forced_pgids_out is not None:
+                forced_pgids_out.append(pgid)
             if pgid not in deferred_sigkill_pgids:
                 failures.append(
                     f"forced SIGKILL for {group_description} {pgid} after "
@@ -255,6 +258,7 @@ def kill_processes_matching_environment(
     poll_interval_s: float,
     process_name: str,
     proc_root: Path = PROC_ROOT,
+    killed_pids_out: list[int] | None = None,
 ) -> list[str]:
     """SIGKILL matching processes until none remain or the deadline expires."""
     failures: list[str] = []
@@ -269,6 +273,8 @@ def kill_processes_matching_environment(
             for process in matching_processes:
                 try:
                     signal.pidfd_send_signal(process.pidfd, signal.SIGKILL)
+                    if killed_pids_out is not None:
+                        killed_pids_out.append(process.pid)
                 except ProcessLookupError:
                     continue
                 except OSError as exc:

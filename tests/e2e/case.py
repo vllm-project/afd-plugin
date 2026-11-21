@@ -35,6 +35,27 @@ WORKER_SHUTDOWN_TIMEOUT_ENV = "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS"
 NPU_ASYNC_VLLM_SHUTDOWN_TIMEOUT_S = 90
 NPU_ASYNC_WORKER_SHUTDOWN_TIMEOUT_S = 60
 NPU_ASYNC_TERMINATION_TIMEOUT_S = 120
+# Independently started services must pair within the AFD rendezvous timeout on
+# both roles; the standalone FFN service loads its experts while Attention loads.
+FFN_SERVICE_AFD_TIMEOUT_S = 600
+FFN_SERVICE_RECEIVER_SHUTDOWN_TIMEOUT_S = 10
+FFN_SERVICE_STOP_TIMEOUT_S = 120
+
+
+@dataclass(frozen=True)
+class FfnService:
+    """The FFN role runs the standalone FFN service instead of ``vllm serve``.
+
+    ``torchrun -m afd_plugin.ffn_faas serve --backend <backend>`` starts one
+    process per FFN rank on the local host. Attention launches unchanged. The
+    service reports per-rank readiness on its management endpoint and must
+    stop cleanly: ``/stop`` on every rank while idle, then Attention.
+    """
+
+    backend: str
+    afd_timeout_s: int = FFN_SERVICE_AFD_TIMEOUT_S
+    receiver_shutdown_timeout_s: int = FFN_SERVICE_RECEIVER_SHUTDOWN_TIMEOUT_S
+    stop_timeout_s: float = FFN_SERVICE_STOP_TIMEOUT_S
 
 
 @dataclass(frozen=True)
@@ -45,6 +66,8 @@ class Role:
     dbo: DboConfig | None = None
     vllm_args: tuple[str, ...] = ()
     additional_config: tuple[tuple[str, bool], ...] = ()
+    compilation_config: tuple[tuple[str, str | int | tuple[int, ...]], ...] = ()
+    data_parallel_rpc_port: int | None = None
 
     def __post_init__(self) -> None:
         if self.dp < 1 or self.tp < 1:
@@ -87,6 +110,8 @@ class Deployment:
     # Existing worker environment overrides take precedence over this default.
     worker_shutdown_timeout_s: int | None = None
     termination_timeout_s: float = DEFAULT_TERMINATION_TIMEOUT_S
+    ffn_service: FfnService | None = None
+    prefill: Role | None = None
 
     @property
     def is_baseline(self) -> bool:
@@ -96,7 +121,8 @@ class Deployment:
     def roles(self) -> tuple[tuple[str, Role], ...]:
         if self.ffn is None:
             return ((BASELINE_ROLE, self.attention),)
-        return ((ATTENTION_ROLE, self.attention), (FFN_ROLE, self.ffn))
+        roles = ((ATTENTION_ROLE, self.attention), (FFN_ROLE, self.ffn))
+        return roles + (("prefill", self.prefill),) if self.prefill else roles
 
     def dbo_for_role(self, role: str) -> DboConfig | None:
         """A role's DBO overrides the deployment default; None inherits it."""
@@ -191,6 +217,8 @@ class Case:
     phases: tuple[Phase, ...]
     served_model_name_prefix: str
     common_vllm_args: tuple[str, ...] = ()
+    worker_extension: str | None = None
+    worker_environment: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.id or not self.phases:

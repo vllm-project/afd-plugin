@@ -47,7 +47,7 @@ def snapshot(runner) -> dict:
             if runner._graph is not None
             else 0,
             replay_count=runner._graph_replay_count if runner._graph is not None else 0,
-            receiver_exited=runner._graph_receiver_exited,
+            receiver_exited=runner.receiver_exited,
             step_pending=runner._graph_pending if runner._graph is not None else False,
             shutdown=runner._is_shutdown,
             model_released=runner.model is None,

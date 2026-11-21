@@ -2,26 +2,28 @@
 
 Opt-in device tests for `DeepEPM2NAFDConnector`. They run the connector's
 transport and expert compute on real GPUs, without model weights or a vLLM
-server, and run outside CI.
+server. Weekly CI runs the full suite on four H100 GPUs
+(`.buildkite/cuda/test-weekly.yml`).
 
 | File | Needs | Purpose |
 | --- | --- | --- |
-| `test_deepep_m2n_gpu.py` | pytest, up to 6 GPUs on one node | Dispatch, expert compute and combine checked against references, in eager mode, with two lanes (DBO), under `torch.compile`, and after CUDA-graph replay |
+| `test_deepep_m2n_gpu.py` | pytest, up to 4 GPUs on one node | Dispatch, expert compute and combine checked against references, in eager mode, with two lanes (DBO), under `torch.compile`, and after CUDA-graph replay |
 | `deepep_m2n_harness.py` | - | Multi-process harness: rank spawning, deterministic inputs, references, checks, scenarios, and benchmark scenarios |
 | `__init__.py` | - | Package marker |
 
 ## Requirements
 
-- Hopper (SM90) or newer GPUs on one node. Most cases need 4 GPUs; the two
-  `2F-2DPx2TP` Attention TP cases need 6. Cases that need more GPUs than are
-  visible skip, and every case skips below SM90.
+- Hopper (SM90) or newer GPUs on one node. Every case needs at most 4 GPUs;
+  cases that need more GPUs than are visible skip, and every case skips below
+  SM90.
 - vLLM with the plugin installed and afdEP-comm (the `afdep` extra).
   DeepGEMM is the copy bundled in the vLLM wheel. See
   [Installation](../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation)
   in the connector guide.
-- The full suite has 34 cases and takes about 53 minutes on six H200 GPUs with
-  cold JIT caches. DeepEP and DeepGEMM compile kernels on first use, so a
-  rerun with warm caches is much faster.
+- The full suite has 23 cases (two of them need no GPU). DeepEP and DeepGEMM
+  compile kernels on first use, once per topology, payload format and
+  transport configuration, so a run with cold JIT caches is much slower than
+  a rerun with warm ones.
 
 ## Run
 
@@ -70,17 +72,17 @@ BF16 model.
 
 | Test | Covers |
 | --- | --- |
-| `test_transport_and_deepgemm_experts` | Standard cases (even, uneven, decode, empty, mixed; with and without host sync) for `1F1A`, `2F2A` and `1F3A`, BF16 and FP8 |
-| `test_attention_tp_peers_dispatch_disjoint_slices` | Attention TP2: each TP peer dispatches its slice, every route arrives exactly once |
-| `test_transport_with_fused_experts_backend` | The `fused_experts` expert backend |
+| `test_transport_and_deepgemm_experts` | Standard cases (even, uneven, decode, empty, mixed; with and without host sync) for `2F2A` in BF16 and FP8, and `1F3A` in FP8 |
+| `test_attention_tp_peers_dispatch_disjoint_slices` | Attention TP2 (`2F`, one DP rank of two TP peers, FP8): each TP peer dispatches its slice, every route arrives exactly once |
 | `test_hot_ffn_rank_routing` | Every top-k choice on FFN rank 0's experts (the worst-case receive size) |
-| `test_fp8_without_host_sync_for_small_buckets` | FP8 without the host sync (`cpu_sync_min_tokens` above the capacity) |
-| `test_graph_and_eager_plans_mixed_across_ranks` | Attention plans a step as graph while FFN plans it eager |
-| `test_two_lanes_dbo_order`, `test_dbo_pipeline_*` | Two lanes in DBO order, eager and under CUDA-graph capture and replay |
+| `test_two_lanes_dbo_order` | Two lanes with different token counts per lane, including an empty lane |
+| `test_dbo_pipeline_eager_lanes_do_not_wait_for_each_other` | vLLM's DBO order, eager: one lane's combine does not wait for the other lane's experts |
+| `test_dbo_graph_capture_reuses_sent_rows` | vLLM's DBO order captured and replayed, and the FFN capture memory does not grow with the layer count |
 | `test_cuda_graph_capture_and_replay` | One graph per bucket (1, 8, 64, 256), several MoE layers per graph |
 | `test_torch_compile_attention_side` | Dispatch and combine as custom ops under `torch.compile` |
 | `test_failed_init_reports_and_closes` | Mismatched payload formats fail the handshake, and every rank reports and closes |
 | `test_peer_exit_fails_within_timeout` | A rank exiting mid-step makes the others fail through the transport timeouts |
+| `test_close_cancels_a_blocked_control_receive` | Closing the control plane cancels an FFN receive blocked on it and leaves the lanes' bootstrap group usable |
 | `test_non_finite_output_fails_the_numerical_checks` | The harness itself rejects NaN and infinite errors (no GPU needed) |
 
 ## How these tests differ from E2E
