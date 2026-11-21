@@ -320,6 +320,39 @@ Send API traffic only to the Attention server. For eager, DBO, Attention TP
 and FP8 examples, see the
 [DeepEP M2N recipes](../../recipe/gpu/DeepEPM2NAFDConnector/README.md).
 
+### Recovering from a startup failure
+
+With afdEP-comm v1.2.1, creating each lane is collective. If one rank fails in
+the native buffer constructor, peers can remain inside that constructor with
+either one or two lanes. On the second lane, the failing rank can also wait
+while closing the first. The role check runs only after all lanes have been
+created. The process-group, CPU and GPU timeouts cover individual operations
+and provide no deadline for the entire startup.
+
+Treat all Attention and FFN ranks as one restart group. Monitor both role
+processes and the Attention API's `/v1/models` endpoint. If either role exits
+before readiness or the startup deadline expires, stop both roles on every
+host, force-kill surviving workers after a finite grace period, and wait for
+them to exit before relaunching the full group on the rendezvous address.
+Allow enough startup time for a cold model load and kernel compilation.
+
+- The [single-node E2E launcher](../../tests/e2e/deployment.py) polls both
+  role processes and Attention readiness. Its `--startup-timeout` defaults to
+  900 s. On failure, cleanup signals the role processes and allows 20 s by
+  default before sending `SIGKILL` to surviving process groups.
+- The [colocation recipe](../../recipe/gpu/common/afd_colocation.sh) starts
+  separate role processes with a 3600 s process-group timeout. Its shell
+  `wait` has no startup deadline. When both roles run in one Kubernetes
+  container, run the recipe as the container command and configure a
+  [startup probe](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/#protect-slow-starting-containers-with-startup-probes)
+  that runs `curl -fsS --max-time 2 http://127.0.0.1:18000/v1/models` inside
+  the container. For example, `timeoutSeconds: 3`, `periodSeconds: 10` and
+  `failureThreshold: 90` give a roughly 15-minute startup budget. Set a finite
+  termination grace period and a restart policy that relaunches the container.
+  When roles span containers or pods, the controller must stop and recreate every
+  member on a startup failure. A probe on one container restarts only that
+  container.
+
 ## Validation
 
 - CPU unit tests:
@@ -344,7 +377,8 @@ and FP8 examples, see the
 - `num_experts` must be divisible by `num_ffn_ranks`.
 - CUDA graphs are limited to `FULL_DECODE_ONLY`; DBO uses exactly two
   micro-batches and must be enabled on both roles or neither.
-- Every rank must take part in every MoE layer and stage. Missing ranks,
-  mismatched settings, or a crashed peer fail at the handshake or after the
-  transport timeouts (`cpu_timeout_s`, `gpu_timeout_s`).
+- Every rank must take part in every MoE layer and stage. The transport uses
+  `cpu_timeout_s` and `gpu_timeout_s` for host waits and kernel spins. See
+  [Recovering from a startup failure](#recovering-from-a-startup-failure) for
+  failures during collective construction.
 - There is no fallback to another transport.
