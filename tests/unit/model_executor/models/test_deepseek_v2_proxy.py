@@ -140,46 +140,6 @@ def test_gate_proxy_sends_routing_payload(monkeypatch):
     assert torch.equal(output, hidden_states * 0.25)
 
 
-def test_remote_experts_proxy_sends_router_logits(monkeypatch):
-    events: list[tuple] = []
-    install_proxy_context(adapter, monkeypatch, events, stage_idx=1)
-    proxy = adapter.AFDAttentionFusedMoE(
-        layer_idx=3,
-        external_routing=True,
-    )
-    hidden_states = torch.ones(1, 4)
-    router_logits = torch.ones(1, 8)
-
-    output = proxy(hidden_states, router_logits)
-
-    assert [event[0] for event in events] == ["send", "yield", "recv"]
-    context = events[0][2]
-    assert context.metadata.layer_idx == 3
-    assert context.metadata.stage_idx == 1
-    assert context.states is None
-    assert events[0][3]["router_logits"] is router_logits
-    assert torch.equal(output, hidden_states * 0.25)
-
-
-def test_remote_experts_proxy_without_external_routing_ships_hidden_states(
-    monkeypatch,
-):
-    events: list[tuple] = []
-    install_proxy_context(adapter, monkeypatch, events, stage_idx=1)
-    proxy = adapter.AFDAttentionFusedMoE(
-        layer_idx=2,
-        external_routing=False,
-    )
-    hidden_states = torch.ones(1, 4)
-
-    output = proxy(hidden_states, hidden_states)
-
-    assert [event[0] for event in events] == ["send", "yield", "recv"]
-    assert events[0][3] == {}
-    assert torch.equal(output, hidden_states * 0.25)
-    assert list(proxy.parameters()) == []
-
-
 COMBINED_VALUE = 1.0
 ROUTE_WEIGHT = 0.5
 
@@ -223,7 +183,7 @@ def _routed_experts_moe(*, shared_experts, routed_scaling_factor, tp_size=1):
     )
     moe.routed_scaling_factor = routed_scaling_factor
     moe.tp_size = tp_size
-    moe.experts = adapter.AFDAttentionFusedMoE(layer_idx=3, external_routing=True)
+    moe.experts = adapter.RemoteFFNProxy(layer_idx=3)
     moe.shared_experts = shared_experts
     return moe
 
