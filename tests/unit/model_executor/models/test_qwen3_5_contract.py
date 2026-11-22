@@ -72,7 +72,7 @@ def test_attention_moe_sends_hidden_states_through_weightless_runner(
     runs its native internal-router MoE on the rows it receives.
     """
     events: list[tuple] = []
-    install_proxy_context(remote, monkeypatch, events)
+    install_proxy_context(monkeypatch, events)
     moe = attention_qwen_layer.layer.mlp
     hidden_states = torch.ones(2, QWEN_HIDDEN_SIZE)
 

@@ -122,6 +122,12 @@ AFDConnectorFactory.register_connector(
     "DeepEPM2NAFDConnector",
     "afd_plugin.connectors.gpu.deepep_m2n.connector",
     "DeepEPM2NAFDConnector",
+    # vLLM's runner routes, with a shared-experts slot per microbatch; AFD's
+    # routed experts send the routes.
+    attention_moe_runner=(
+        "afd_plugin.model_executor.ffn.remote",
+        "AFDRoutedExpertsMoERunner",
+    ),
 )
 AFDConnectorFactory.register_connector(
     "CAMP2pAFDConnector",

@@ -28,15 +28,17 @@ transport, or the routing simulator's registration mechanics.
 - Keep remote proxies faithful: `RemoteFFNProxy` and friends preserve upstream
   signatures, hidden-state layouts, and auxiliary outputs (residuals, gate
   values) across the role boundary.
-- On CUDA with `P2pNcclAFDConnector`, build the experts of an Attention-role
-  native MoE shell through `build_expert()` (vLLM `FusedMoEFactory` with the
-  `runner_cls` the connector's registration names and AFD's
-  `routed_experts_cls`): the runner holds the model's gate only with
-  `compute_gate_on_attention`, allocates no expert weights, and runs no local
-  top-k or expert kernel. A
-  change that does, or that passes an argument the factory fixes, is a
-  finding. DeepEP M2N (`AFDDeepseekV2RoutedExpertsMoE`) and the NPU gate
-  paths (`GateOnlyRemoteMoE`) route on Attention by design and keep their own
+- On CUDA with `P2pNcclAFDConnector` or DeepEP M2N, build the experts of an
+  Attention-role native MoE shell through `build_expert()` (vLLM
+  `FusedMoEFactory` with the `runner_cls` the connector's registration names
+  and AFD's `routed_experts_cls`): the runner holds the model's gate only with
+  `compute_gate_on_attention` and allocates no expert weights. The P2P runner
+  runs no local top-k; under DeepEP M2N vLLM's runner selects top-k and runs
+  the shared experts, with an output slot per microbatch, and AFD's routed
+  experts send the routes, with TP padding rows unrouted, instead of running
+  an expert kernel. A change that computes experts locally, or that
+  passes an argument the factory fixes, is a finding. The NPU gate paths
+  (`GateOnlyRemoteMoE`) route on Attention by design and keep their own
   `RemoteFFNProxy` transports.
 - Access upstream model config attributes directly per AGENTS.md; a
   `getattr`/`hasattr` guard around vLLM model fields hides the exact

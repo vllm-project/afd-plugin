@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 from torch import nn
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     tensor_model_parallel_all_gather,
@@ -32,9 +32,16 @@ from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
 )
 from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+    SharedExperts,
+    SharedExpertsOrder,
+)
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.models.utils import sequence_parallel_chunk
+from vllm.model_executor.models.utils import (
+    extract_layer_index,
+    sequence_parallel_chunk,
+)
 from vllm.platforms import current_platform
 
 from afd_plugin.config import parse_afd_config
@@ -49,8 +56,9 @@ from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 UNROUTED_EXPERT_ID = -1
 # The only device validated for native-factory Attention MoE runners. Each
-# connector's registration names its runner; only CUDA P2P registers one.
-# DeepEP M2N routes on Attention through its own model shell instead.
+# connector's registration names its runner: AFDRemoteMoERunner for CUDA P2P,
+# and for DeepEP M2N AFDRoutedExpertsMoERunner, vLLM's runner whose routed
+# experts send the routes.
 ATTENTION_MOE_RUNNER_DEVICE = "cuda"
 
 
@@ -72,6 +80,18 @@ def _current_afd_metadata() -> AFDForwardContextMetadata:
     return afd_metadata
 
 
+def _current_stage_idx(afd_metadata: AFDForwardContextMetadata) -> int:
+    forward_context = get_forward_context()
+    return int(getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx))
+
+
+def _stage_num_tokens(afd_metadata: AFDForwardContextMetadata, stage_idx: int) -> int:
+    """This stage's token count before any TP split, padding included. A
+    native microbatch's metadata holds only its own stage's length."""
+    tokens_lens = afd_metadata.tokens_lens
+    return int(tokens_lens[0] if len(tokens_lens) == 1 else tokens_lens[stage_idx])
+
+
 def _send_attention_output(
     afd_metadata: AFDForwardContextMetadata,
     hidden_states: torch.Tensor,
@@ -81,10 +101,7 @@ def _send_attention_output(
 ) -> int:
     """Send a layer's Attention output to the FFN role; return the stage to
     receive."""
-    forward_context = get_forward_context()
-    stage_idx = int(
-        getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),
-    )
+    stage_idx = _current_stage_idx(afd_metadata)
     afd_metadata.stage_idx = stage_idx
     metadata = AFDTransferMetadata.create_attention_metadata(
         layer_idx=layer_idx,
@@ -197,9 +214,23 @@ class RemoteFFNProxy(nn.Module):
 class AFDRemoteMoEMethod(FusedMoEMethodBase):
     """Native MoE method lifecycle without local expert weights or kernels.
 
-    ``apply`` and ``apply_monolithic`` keep the base ``NotImplementedError``,
-    so computing experts on the Attention role fails loudly.
+    ``apply`` runs the routed experts on the FFN role: vLLM's runner calls it
+    with the top-k routes it selected (DeepEP M2N). With Attention TP > 1 the
+    native MoE block gives each TP rank its ``sequence_parallel_chunk`` slice;
+    the padding rows of that slice are sent with ``UNROUTED_EXPERT_ID`` and
+    reach no FFN rank. ``apply_monolithic`` keeps the base
+    ``NotImplementedError``.
     """
+
+    def __init__(self, moe: FusedMoEConfig, *, layer_idx: int, tp_size: int) -> None:
+        super().__init__(moe)
+        self.layer_idx = layer_idx
+        self.tp_size = tp_size
+
+    @property
+    def mk_can_overlap_shared_experts(self) -> bool:
+        # apply runs the shared experts while the routes are in flight.
+        return True
 
     def create_weights(
         self,
@@ -228,6 +259,44 @@ class AFDRemoteMoEMethod(FusedMoEMethodBase):
         # runner's FusedMoEConfig keeps the model's dimensions.
         return hidden_size, intermediate_size_per_partition
 
+    def apply(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: SharedExperts | None,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Dispatch the routes to the FFN role's routed experts and return
+        their combined output."""
+        afd_metadata = _current_afd_metadata()
+        if self.tp_size > 1:
+            num_tokens = _stage_num_tokens(
+                afd_metadata, _current_stage_idx(afd_metadata)
+            )
+            topk_ids = _unroute_tp_padding(topk_ids, num_tokens)
+        stage_idx = _send_attention_output(
+            afd_metadata,
+            x,
+            layer_idx=self.layer_idx,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+        if shared_experts is not None:
+            assert shared_experts_input is not None
+            shared_experts(
+                shared_experts_input,
+                SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
+            )
+        x = maybe_apply_dbo_yield(x, role="attention")
+        # Combine writes into ref_tensor, and vLLM's MoE op declares that it
+        # does not mutate its inputs, so combine into a new tensor, not x.
+        return _current_afd_metadata().connector.recv_ffn_output(
+            ref_tensor=torch.empty_like(x),
+            ubatch_idx=stage_idx,
+        )
+
 
 class AFDRemoteRoutedExperts(RoutedExperts):
     """Native routed-experts descriptor that allocates no expert parameters."""
@@ -238,7 +307,28 @@ class AFDRemoteRoutedExperts(RoutedExperts):
         quant_config: QuantizationConfig | None,
         moe_config: FusedMoEConfig,
     ) -> FusedMoEMethodBase:
-        return AFDRemoteMoEMethod(moe_config)
+        return AFDRemoteMoEMethod(
+            moe_config,
+            layer_idx=extract_layer_index(prefix),
+            tp_size=get_current_vllm_config().parallel_config.tensor_parallel_size,
+        )
+
+
+class AFDRoutedExpertsMoERunner(MoERunner):
+    """vLLM's MoE runner for a connector whose routed experts send the routes
+    (DeepEP M2N); see ``AFDRemoteMoEMethod``.
+
+    ``apply`` stores the shared experts' output and yields to the other
+    microbatch before the runner reads it, so each microbatch needs its own
+    output slot. vLLM picks the slot per microbatch only when its runner gets
+    ``enable_dbo``, but AFD also runs two microbatches with ``--ubatch-size 2``
+    alone. Pass ``enable_dbo`` whenever vLLM microbatches; vLLM 0.32 reads the
+    runner's ``enable_dbo`` only to pick that slot.
+    """
+
+    def __init__(self, *args: Any, enable_dbo: bool = False, **kwargs: Any) -> None:
+        use_ubatching = get_current_vllm_config().parallel_config.use_ubatching
+        super().__init__(*args, enable_dbo=enable_dbo or use_ubatching, **kwargs)
 
 
 class AFDRemoteMoERunner(MoERunner):
@@ -321,6 +411,7 @@ def build_expert(
     vllm_config: VllmConfig,
     *,
     gate: nn.Module | None,
+    shared_experts: nn.Module | None = None,
     **moe_kwargs: Any,
 ) -> MoERunner:
     """Build an Attention-role MoE ``experts`` module through native
@@ -328,11 +419,11 @@ def build_expert(
 
     ``moe_kwargs`` are the native model's ``FusedMoEFactory`` arguments. Pass
     the model's gate exactly when ``compute_gate_on_attention`` is set; the
-    runner then applies it and sends the router logits. The configured
-    connector's registration names the runner class, imported here. This
-    function fixes the arguments that describe local experts: the runner
-    registers like a native MoE layer but allocates no expert weights and runs
-    no expert kernel.
+    runner then applies it. Pass the shared experts when Attention runs them
+    (DeepEP M2N). The configured connector's registration names the runner
+    class, imported here. This function fixes the arguments that describe
+    local experts: the runner registers like a native MoE layer but allocates
+    no expert weights and runs no expert kernel.
     """
     afd_config = parse_afd_config(vllm_config, validate=False)
     runner_path = AFDConnectorFactory.get_attention_moe_runner(afd_config.connector)
@@ -364,13 +455,14 @@ def build_expert(
         moe_kwargs["routed_scaling_factor"],
     ):
         raise ValueError("routed_scaling_factor must be finite")
-    # A parameter-free container: no local quantized weights, shared experts,
-    # transforms or EPLB, and unit TP/DP/PCP sizes, so no expert sharding.
-    # The FFN role applies routed_scaling_factor; the runner only records it.
+    # A parameter-free container: no local quantized weights, transforms or
+    # EPLB, and unit TP/DP/PCP sizes, so no expert sharding. vLLM's runner
+    # scales the combined routed output, as native; the P2P runner returns the
+    # FFN output, which the FFN role has already scaled.
     factory_kwargs: dict[str, Any] = {
         "gate": gate,
         "quant_config": None,
-        "shared_experts": None,
+        "shared_experts": shared_experts,
         "shared_expert_gate": None,
         "routed_input_transform": None,
         "routed_output_transform": None,
@@ -401,6 +493,7 @@ __all__ = [
     "AFDRemoteMoEMethod",
     "AFDRemoteMoERunner",
     "AFDRemoteRoutedExperts",
+    "AFDRoutedExpertsMoERunner",
     "RemoteFFNProxy",
     "build_expert",
 ]
