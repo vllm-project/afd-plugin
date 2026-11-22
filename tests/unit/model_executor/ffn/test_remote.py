@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,7 @@ from vllm.model_executor.layers.fused_moe import layer as fused_moe_layer  # noq
 from vllm.model_executor.model_loader.utils import (  # noqa: E402
     process_weights_after_loading,
 )
+from vllm.v1.worker import ubatching  # noqa: E402
 
 from afd_plugin.config import DEEPEP_M2N_CONNECTOR  # noqa: E402
 from afd_plugin.connectors import AFDConnectorFactory  # noqa: E402
@@ -40,6 +42,7 @@ STAGE_IDX = 1
 # The in-place combine below writes this into the receive buffer.
 COMBINED_VALUE = 1.0
 SHARED_EXPERTS_SCALE = 3.0
+MICROBATCH_HANDOFF_TIMEOUT_S = 30
 # FusedMoEFactory arguments the AFD factory fixes for a weightless runner.
 RESERVED_FACTORY_ARGUMENTS = (
     "quant_config",
@@ -415,6 +418,156 @@ def test_routed_experts_send_routes_and_combine_into_a_new_tensor(monkeypatch):
     assert torch.equal(
         runner.shared_experts.output, dispatched_states * SHARED_EXPERTS_SCALE
     )
+
+
+@pytest.mark.parametrize(
+    "tokens_lens", [[3], [5, 3]], ids=["stage-metadata", "batch-metadata"]
+)
+@pytest.mark.parametrize(
+    ("tp_rank", "padding_rows"), [(0, []), (1, [1])], ids=["rank0", "rank1"]
+)
+def test_routed_experts_unroute_tp_padding_rows(
+    monkeypatch, tokens_lens, tp_rank, padding_rows
+):
+    """With Attention TP 2 and 3 tokens in the stage, rank 0 sends tokens 0-1
+    with their routes, and rank 1 sends token 2 plus one padding row whose
+    top-k IDs are all ``UNROUTED_EXPERT_ID``. A microbatch's metadata holds
+    only its own stage's length; a whole batch's holds every stage's.
+
+    Why: the native MoE block pads the tokens to a multiple of the TP size and
+    gives each rank a slice, and the TP gather drops the padding rows. A
+    routed padding row would make the FFN run experts at every MoE layer for a
+    row that is thrown away.
+    """
+    events: list[tuple] = []
+    afd_metadata = install_proxy_context(monkeypatch, events, stage_idx=STAGE_IDX)
+    afd_metadata.tokens_lens = tokens_lens
+    monkeypatch.setattr(remote, "get_tensor_model_parallel_rank", lambda: tp_rank)
+    config = attention_moe_vllm_config(
+        connector=DEEPEP_M2N_CONNECTOR, compute_gate_on_attention=True
+    )
+    config.parallel_config.tensor_parallel_size = 2
+    runner = _build_runner(monkeypatch, config, gate=_gate())
+    topk_ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+
+    runner.routed_experts.forward_modular(
+        x=_hidden_states(2),
+        topk_weights=torch.full((2, TOP_K), 0.5),
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+    (send,) = [event for event in events if event[0] == "send"]
+    sent_ids = send[3]["topk_ids"]
+    unrouted = (sent_ids == remote.UNROUTED_EXPERT_ID).all(dim=1)
+    assert unrouted.nonzero().flatten().tolist() == padding_rows
+    assert torch.equal(sent_ids[~unrouted], topk_ids[~unrouted])
+
+
+class _MicrobatchTurns:
+    """Two threads take turns as vLLM's microbatch threads do: one runs at a
+    time and hands over at AFD's DBO yield."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._turn = 0
+        self._done = [False, False]
+
+    def wait_turn(self, ubatch_id: int) -> None:
+        with self._condition:
+            assert self._condition.wait_for(
+                lambda: self._turn == ubatch_id, MICROBATCH_HANDOFF_TIMEOUT_S
+            )
+
+    def yield_to_peer(self, ubatch_id: int) -> None:
+        peer = 1 - ubatch_id
+        with self._condition:
+            if self._done[peer]:
+                return
+            self._turn = peer
+            self._condition.notify_all()
+            assert self._condition.wait_for(
+                lambda: self._turn == ubatch_id, MICROBATCH_HANDOFF_TIMEOUT_S
+            )
+
+    def finish(self, ubatch_id: int) -> None:
+        with self._condition:
+            self._done[ubatch_id] = True
+            self._turn = 1 - ubatch_id
+            self._condition.notify_all()
+
+
+@pytest.mark.parametrize(
+    "enable_dbo", [True, False], ids=["enable-dbo", "ubatch-size-2-without-dbo"]
+)
+def test_routed_experts_keep_shared_output_per_microbatch(monkeypatch, enable_dbo):
+    """Two microbatches that interleave at the DBO yield each read their own
+    shared experts' output, with ``--enable-dbo`` or with ``--ubatch-size 2``
+    alone.
+
+    Why: the routed experts store the shared output and yield before vLLM's
+    runner reads it, so each microbatch needs its own output slot; one slot
+    fails vLLM's empty-slot check when the second microbatch arrives.
+    """
+    events: list[tuple] = []
+    install_proxy_context(monkeypatch, events, stage_idx=0)
+    config = attention_moe_vllm_config(
+        connector=DEEPEP_M2N_CONNECTOR, compute_gate_on_attention=True
+    )
+    config.parallel_config.enable_dbo = enable_dbo
+    config.parallel_config.ubatch_size = 0 if enable_dbo else 2
+    runner = _build_runner(
+        monkeypatch, config, gate=_gate(), shared_experts=_ScaledSharedExperts()
+    )
+    turns = _MicrobatchTurns()
+    ubatch_of: dict[int, int] = {}
+
+    def dbo_yield(tensor, *, role):
+        turns.yield_to_peer(ubatch_of[threading.get_ident()])
+        return tensor
+
+    monkeypatch.setattr(remote, "maybe_apply_dbo_yield", dbo_yield)
+    results: dict[int, tuple] = {}
+    errors: dict[int, BaseException] = {}
+
+    def run_microbatch(ubatch_id: int) -> None:
+        thread_id = threading.get_ident()
+        ubatch_of[thread_id] = ubatch_id
+        # As vLLM's UBatchContext does, so dbo_current_ubatch_id() works.
+        ubatching._THREAD_ID_TO_CONTEXT[thread_id] = ubatch_id
+        turns.wait_turn(ubatch_id)
+        try:
+            hidden_states = _hidden_states(2) + 100 * ubatch_id
+            runner.routed_experts.forward_modular(
+                x=hidden_states,
+                topk_weights=torch.full((2, TOP_K), 0.5),
+                topk_ids=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+                shared_experts=runner.shared_experts,
+                shared_experts_input=hidden_states,
+            )
+            # vLLM's runner reads the shared output after forward_modular.
+            results[ubatch_id] = (hidden_states, runner.shared_experts.output)
+        except BaseException as error:  # noqa: BLE001 - reported below
+            errors[ubatch_id] = error
+        finally:
+            turns.finish(ubatch_id)
+
+    threads = [threading.Thread(target=run_microbatch, args=(i,)) for i in (0, 1)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(MICROBATCH_HANDOFF_TIMEOUT_S)
+    finally:
+        for thread in threads:
+            ubatching._THREAD_ID_TO_CONTEXT.pop(thread.ident, None)
+
+    assert not errors, errors
+    assert [event[0] for event in events] == ["send", "send", "recv", "recv"]
+    assert sorted(results) == [0, 1]
+    for hidden_states, shared_output in results.values():
+        assert torch.equal(shared_output, hidden_states * SHARED_EXPERTS_SCALE)
 
 
 @pytest.mark.parametrize(

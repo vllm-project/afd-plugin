@@ -183,7 +183,7 @@ needed by the split execution.
 | Attention module and KV-facing computation | Constructed and executed. | Not constructed. |
 | MoE with `compute_gate_on_attention=false` | CUDA constructs the native MoE shell without a gate; its experts are a `FusedMoEFactory` runner without expert weights that sends the hidden states. NPU sends after post-Attention normalization. | Native gate and experts are constructed and executed from connector input. |
 | MoE with `compute_gate_on_attention=true`, non-routed connectors | CUDA keeps the native gate on the shell and passes it to the `FusedMoEFactory` runner, which applies it and sends the router logits with the hidden states; NPU uses its Attention-side gate helper. | Expert MLP is constructed and consumes transferred router logits or routed payloads without rerunning the gate. |
-| MoE with `compute_gate_on_attention=true`, DeepEP M2N (CUDA) | CUDA keeps the native gate and builds the native shared-expert MLP on the shell. Its experts are vLLM's own runner, which selects top-k and runs the shared MLP while the routes are in flight; its weightless routed experts send the top-k IDs and weights with the hidden states and return the combined output. With TP > 1 the shell is sequence-parallel: each TP rank sends its slice and runs a replicated shared MLP on it; the TP group then all-gathers the output. | Native `DeepseekV2MoE` without shared experts; runs only the routed experts on the dispatched top-k IDs and weights. |
+| MoE with `compute_gate_on_attention=true`, DeepEP M2N (CUDA) | CUDA keeps the native gate and builds the native shared-expert MLP on the shell. Its experts are vLLM's runner, which selects top-k and runs the shared MLP while the routes are in flight; its weightless routed experts send the top-k IDs and weights with the hidden states and return the combined output. With TP > 1 the shell is sequence-parallel: each TP rank sends its slice, with the padding rows unrouted, and runs a replicated shared MLP on it; the TP group then all-gathers the output. | Native `DeepseekV2MoE` without shared experts; runs only the routed experts on the dispatched top-k IDs and weights. |
 | Dense MLP, normal mode | Not constructed; output is sent after post-Attention normalization. | Constructed and executed from connector input. |
 | Dense MLP with `compute_gate_on_attention=true` | Constructed and executed locally because there is no routed MoE handoff. | Not constructed and a dense-layer FFN compute request is rejected. |
 | Embedding, final norm, pipeline placeholders | Created according to the pinned pipeline-rank rules. | Same wrapper lifecycle rules; only role-required parameters are loaded. |
@@ -194,9 +194,11 @@ experts with vLLM's `FusedMoEFactory`: no expert weights, and the runner named
 by the connector's registration. With gate-on-FFN, the P2P runner sends the
 hidden states and FFN runs its native internal-router MoE. With
 gate-on-Attention, it also applies the gate and sends the router logits; FFN
-executes its external-router experts path. DeepEP M2N registers vLLM's own
-runner: Attention runs the gate, top-k selection, and shared experts as
-native, and its routed experts send the routes. FFN runs only the routed
+executes its external-router experts path. DeepEP M2N registers vLLM's
+runner, through a subclass that keeps a shared-experts output per microbatch
+whenever vLLM microbatches: Attention runs the gate, top-k selection, and
+shared experts as native, and its routed experts send the routes, with the TP
+padding rows unrouted. FFN runs only the routed
 experts, and combine returns each token's weighted top-k sum, which the runner
 scales as native. CUDA Attention-side remote experts currently reject EPLB. The NPU gate helper
 supports unquantized and Ascend W8A8 MoE expert computation; unsupported

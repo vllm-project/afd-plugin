@@ -34,8 +34,9 @@ transport, or the routing simulator's registration mechanics.
   and AFD's `routed_experts_cls`): the runner holds the model's gate only with
   `compute_gate_on_attention` and allocates no expert weights. The P2P runner
   runs no local top-k; under DeepEP M2N vLLM's runner selects top-k and runs
-  the shared experts, and AFD's routed experts send the routes instead of
-  running an expert kernel. A change that computes experts locally, or that
+  the shared experts, with an output slot per microbatch, and AFD's routed
+  experts send the routes, with TP padding rows unrouted, instead of running
+  an expert kernel. A change that computes experts locally, or that
   passes an argument the factory fixes, is a finding. The NPU gate paths
   (`GateOnlyRemoteMoE`) route on Attention by design and keep their own
   `RemoteFFNProxy` transports.

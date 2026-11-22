@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 from torch import nn
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     tensor_model_parallel_all_gather,
@@ -56,8 +56,9 @@ from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 UNROUTED_EXPERT_ID = -1
 # The only device validated for native-factory Attention MoE runners. Each
-# connector's registration names its runner: AFD's for CUDA P2P, vLLM's own
-# for DeepEP M2N, whose routed experts send the routes.
+# connector's registration names its runner: AFDRemoteMoERunner for CUDA P2P,
+# and for DeepEP M2N AFDRoutedExpertsMoERunner, vLLM's runner whose routed
+# experts send the routes.
 ATTENTION_MOE_RUNNER_DEVICE = "cuda"
 
 
@@ -79,6 +80,18 @@ def _current_afd_metadata() -> AFDForwardContextMetadata:
     return afd_metadata
 
 
+def _current_stage_idx(afd_metadata: AFDForwardContextMetadata) -> int:
+    forward_context = get_forward_context()
+    return int(getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx))
+
+
+def _stage_num_tokens(afd_metadata: AFDForwardContextMetadata, stage_idx: int) -> int:
+    """This stage's token count before any TP split, padding included. A
+    native microbatch's metadata holds only its own stage's length."""
+    tokens_lens = afd_metadata.tokens_lens
+    return int(tokens_lens[0] if len(tokens_lens) == 1 else tokens_lens[stage_idx])
+
+
 def _send_attention_output(
     afd_metadata: AFDForwardContextMetadata,
     hidden_states: torch.Tensor,
@@ -88,10 +101,7 @@ def _send_attention_output(
 ) -> int:
     """Send a layer's Attention output to the FFN role; return the stage to
     receive."""
-    forward_context = get_forward_context()
-    stage_idx = int(
-        getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),
-    )
+    stage_idx = _current_stage_idx(afd_metadata)
     afd_metadata.stage_idx = stage_idx
     metadata = AFDTransferMetadata.create_attention_metadata(
         layer_idx=layer_idx,
@@ -205,13 +215,17 @@ class AFDRemoteMoEMethod(FusedMoEMethodBase):
     """Native MoE method lifecycle without local expert weights or kernels.
 
     ``apply`` runs the routed experts on the FFN role: vLLM's runner calls it
-    with the top-k routes it selected (DeepEP M2N). ``apply_monolithic`` keeps
-    the base ``NotImplementedError``.
+    with the top-k routes it selected (DeepEP M2N). With Attention TP > 1 the
+    native MoE block gives each TP rank its ``sequence_parallel_chunk`` slice;
+    the padding rows of that slice are sent with ``UNROUTED_EXPERT_ID`` and
+    reach no FFN rank. ``apply_monolithic`` keeps the base
+    ``NotImplementedError``.
     """
 
-    def __init__(self, moe: FusedMoEConfig, *, layer_idx: int) -> None:
+    def __init__(self, moe: FusedMoEConfig, *, layer_idx: int, tp_size: int) -> None:
         super().__init__(moe)
         self.layer_idx = layer_idx
+        self.tp_size = tp_size
 
     @property
     def mk_can_overlap_shared_experts(self) -> bool:
@@ -256,8 +270,14 @@ class AFDRemoteMoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         """Dispatch the routes to the FFN role's routed experts and return
         their combined output."""
+        afd_metadata = _current_afd_metadata()
+        if self.tp_size > 1:
+            num_tokens = _stage_num_tokens(
+                afd_metadata, _current_stage_idx(afd_metadata)
+            )
+            topk_ids = _unroute_tp_padding(topk_ids, num_tokens)
         stage_idx = _send_attention_output(
-            _current_afd_metadata(),
+            afd_metadata,
             x,
             layer_idx=self.layer_idx,
             topk_ids=topk_ids,
@@ -287,7 +307,28 @@ class AFDRemoteRoutedExperts(RoutedExperts):
         quant_config: QuantizationConfig | None,
         moe_config: FusedMoEConfig,
     ) -> FusedMoEMethodBase:
-        return AFDRemoteMoEMethod(moe_config, layer_idx=extract_layer_index(prefix))
+        return AFDRemoteMoEMethod(
+            moe_config,
+            layer_idx=extract_layer_index(prefix),
+            tp_size=get_current_vllm_config().parallel_config.tensor_parallel_size,
+        )
+
+
+class AFDRoutedExpertsMoERunner(MoERunner):
+    """vLLM's MoE runner for a connector whose routed experts send the routes
+    (DeepEP M2N); see ``AFDRemoteMoEMethod``.
+
+    ``apply`` stores the shared experts' output and yields to the other
+    microbatch before the runner reads it, so each microbatch needs its own
+    output slot. vLLM picks the slot per microbatch only when its runner gets
+    ``enable_dbo``, but AFD also runs two microbatches with ``--ubatch-size 2``
+    alone. Pass ``enable_dbo`` whenever vLLM microbatches; vLLM 0.32 reads the
+    runner's ``enable_dbo`` only to pick that slot.
+    """
+
+    def __init__(self, *args: Any, enable_dbo: bool = False, **kwargs: Any) -> None:
+        use_ubatching = get_current_vllm_config().parallel_config.use_ubatching
+        super().__init__(*args, enable_dbo=enable_dbo or use_ubatching, **kwargs)
 
 
 class AFDRemoteMoERunner(MoERunner):
@@ -452,6 +493,7 @@ __all__ = [
     "AFDRemoteMoEMethod",
     "AFDRemoteMoERunner",
     "AFDRemoteRoutedExperts",
+    "AFDRoutedExpertsMoERunner",
     "RemoteFFNProxy",
     "build_expert",
 ]

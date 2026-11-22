@@ -122,10 +122,11 @@ AFDConnectorFactory.register_connector(
     "DeepEPM2NAFDConnector",
     "afd_plugin.connectors.gpu.deepep_m2n.connector",
     "DeepEPM2NAFDConnector",
-    # vLLM's own runner routes; AFD's routed experts send the routes.
+    # vLLM's runner routes, with a shared-experts slot per microbatch; AFD's
+    # routed experts send the routes.
     attention_moe_runner=(
-        "vllm.model_executor.layers.fused_moe.runner.moe_runner",
-        "MoERunner",
+        "afd_plugin.model_executor.ffn.remote",
+        "AFDRoutedExpertsMoERunner",
     ),
 )
 AFDConnectorFactory.register_connector(
