@@ -29,7 +29,8 @@ transport, or the routing simulator's registration mechanics.
   signatures, hidden-state layouts, and auxiliary outputs (residuals, gate
   values) across the role boundary.
 - On CUDA with `P2pNcclAFDConnector` or DeepEP M2N, build the experts of an
-  Attention-role native MoE shell through `build_expert()` (vLLM
+  Attention-role native MoE shell (DeepSeek V2, Qwen3 MoE) through
+  `build_expert()` (vLLM
   `FusedMoEFactory` with the `runner_cls` the connector's registration names
   and AFD's `routed_experts_cls`): the runner holds the model's gate only with
   `compute_gate_on_attention` and allocates no expert weights. The P2P runner
