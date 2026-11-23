@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from copy import copy
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -45,6 +46,8 @@ class MegaFFNBackend:
         self.layer_idx = layer_idx
         self.weights: dict[str, torch.Tensor] | None = None
         self.runners: dict[int, MegaFfnRunner] = {}
+        self.pool: MegaFFNBackend | None = None
+        self.expert_offset = 0
 
     def forward(
         self,
@@ -60,6 +63,20 @@ class MegaFFNBackend:
 
         if self.closed:
             raise RuntimeError("MegaFFN backend is closed")
+        if self.pool is not None:
+            # Check BEFORE offset: an invalid local ID could select another layer.
+            if topk_ids.dtype not in (torch.int32, torch.int64) or bool(
+                ((topk_ids < 0) | (topk_ids >= self.config.n_routed_experts)).any()
+            ):
+                raise ValueError("MegaFFN local expert IDs must be integers in [0,E)")
+            result = self.pool.forward(
+                hidden_states,
+                topk_ids=topk_ids + self.expert_offset,
+                topk_weights=topk_weights,
+            )
+            logger.debug("MegaFFN pool layer=%d offset=%d completed tokens=%d",
+                         self.layer_idx, self.expert_offset, hidden_states.shape[0])
+            return result
         args = MegaFfnArgs(
             hidden_size=self.config.hidden_size,
             moe_intermediate_size=self.config.moe_intermediate_size,
@@ -139,8 +156,80 @@ class MegaFFNBackend:
         """Stop the resident graph before its captured tensors can be freed."""
         if self.closed:
             return
+        if self.pool is not None:
+            self.pool.close()
         if self.execution_mode == "persistent":
             for runner in self.runners.values():
                 runner.stop_persistent()
         # On stop failure keep the runner and its buffers alive and propagate.
         self.closed = True
+
+
+def prepare_persistent_expert_pool(backends: list[MegaFFNBackend]) -> None:
+    """Pack post-load layer weights once; all layers share one resident graph.
+
+    Called by the model's post-load hook, after vLLM has finalized layouts.
+    Layers may have non-consecutive model indices. The mapping follows the
+    supplied model order, not ``layer_idx * E`` for skipped/dense layers.
+    Normal-mode adapters retain their independent graphs.
+    """
+    from blockrt.models.mega_ffn.ffn_args import MegaFfnArgs
+    from blockrt.models.mega_ffn.weight_loader import convert_routed_expert_weights
+
+    if not backends:
+        return
+    if all(b.pool is backends[0].pool for b in backends) and backends[0].pool is not None:
+        return
+    first = backends[0]
+    fields = ("hidden_size", "moe_intermediate_size", "num_experts_per_tok")
+    if len({b.layer_idx for b in backends}) != len(backends):
+        raise ValueError("MegaFFN pool has duplicate layer indices")
+    for backend in backends:
+        if (backend.execution_mode != "persistent" or backend.closed
+                or backend.pool is not None or backend.runners or backend.weights is not None):
+            raise ValueError("MegaFFN pooling requires fresh persistent backends")
+        if (backend.max_tokens != first.max_tokens or any(
+            getattr(backend.config, field) != getattr(first.config, field) for field in fields
+        )):
+            raise ValueError("MegaFFN pool requires matching layer dimensions and capacity")
+        if backend.config.n_routed_experts <= 0:
+            raise ValueError("MegaFFN pool requires positive expert counts")
+    total = sum(b.config.n_routed_experts for b in backends)
+    config = copy(first.config)
+    config.n_routed_experts = total
+    owner = MegaFFNBackend(first.experts, config, -1, max_tokens=first.max_tokens,
+                           execution_mode="persistent")
+    pooled: dict[str, torch.Tensor] = {}
+    offsets = []
+    offset = 0
+    for backend in backends:
+        cfg = backend.config
+        args = MegaFfnArgs(hidden_size=cfg.hidden_size,
+                           moe_intermediate_size=cfg.moe_intermediate_size,
+                           n_routed_experts=cfg.n_routed_experts,
+                           num_experts_per_tok=cfg.num_experts_per_tok,
+                           routed_scaling_factor=1.0)
+        converted = convert_routed_expert_weights(
+            args, backend.experts.w13_weight, backend.experts.w2_weight)
+        # Allocate the final pool once, avoiding simultaneous per-layer copies
+        # plus a second full-size torch.cat allocation on the NPU.
+        for name, tensor in converted.items():
+            if name not in pooled:
+                pooled[name] = torch.empty((total, *tensor.shape[1:]),
+                                           dtype=tensor.dtype, device=tensor.device)
+            if (tensor.shape[0] != cfg.n_routed_experts
+                    or tensor.shape[1:] != pooled[name].shape[1:]
+                    or tensor.device != pooled[name].device
+                    or tensor.dtype != pooled[name].dtype):
+                raise ValueError("MegaFFN pool weight layout/device mismatch")
+            pooled[name][offset:offset + cfg.n_routed_experts].copy_(tensor)
+        offsets.append(offset)
+        offset += cfg.n_routed_experts
+        del converted
+    owner.weights = pooled
+    # Publish only once all conversions succeed; no partially populated pool.
+    for backend, offset in zip(backends, offsets):
+        backend.pool = owner
+        backend.expert_offset = offset
+    logger.info("MegaFFN persistent pool layers=%s offsets=%s experts=%d",
+                [b.layer_idx for b in backends], offsets, total)

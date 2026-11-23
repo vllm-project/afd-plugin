@@ -901,6 +901,19 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
 
         prepare_attention_gate_w8a8_scales(self.model.layers)
         # ### PATCH END: retain FFN gate-on-A W8A8 scales after quant finalize
+        # ### PATCH START: one persistent expert pool across routed FFN layers
+        if (self.afd_config.ffn_compute_backend == "mega_ffn"
+                and self.afd_config.mega_ffn_execution_mode == "persistent"):
+            from afd_plugin.model_executor.models.npu.mega_ffn_backend import (
+                MegaFFNBackend,
+                prepare_persistent_expert_pool,
+            )
+
+            prepare_persistent_expert_pool([
+                layer.afd_external_routing_moe for layer in self.model.layers
+                if isinstance(getattr(layer, "afd_external_routing_moe", None), MegaFFNBackend)
+            ])
+        # ### PATCH END: one persistent expert pool across routed FFN layers
 
     def get_async_cam_layered_weights(self) -> "tuple[list[LayeredFFNWeights], str]":
         return _extract_async_cam_layered_weights(self.model.layers)
