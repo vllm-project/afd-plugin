@@ -60,8 +60,12 @@ copy_ops_include() {
         fi
         # SoC variants with a shared ACLNN ABI use the common op_api.
         local api_dir="$subdir/op_api"
-        if [[ ! -d "$api_dir" && "$name" == */* ]]; then
-            api_dir="$src_dir/${name##*/}/op_api"
+        if [[ ! -d "$api_dir" && "$name" == *_arch35 ]]; then
+            api_dir="$src_dir/${name%_arch35}/op_api"
+            if [[ ! -d "$api_dir" ]]; then
+                echo "ERROR: shared ACLNN sources missing: $api_dir" >&2
+                return 1
+            fi
         fi
         if [ -d "$api_dir" ]; then
             cp -rf "$api_dir/"* "$dst_dir/pregen/build_out/autogen/"
@@ -116,6 +120,7 @@ build_ascend_proj() {
 
     # Copy the top-level CMakeLists.txt (CMakePresets.json comes from msopgen)
     cp "${src_path}/ascend_kernels/CMakeLists.txt" "${build_root}/${proj_name}/"
+    cp "${src_path}/../../LICENSE" "${build_root}/${proj_name}/LICENSE"
 
     # Copy the op_host and op_kernel CMakeLists.txt (npu_op_* versions)
     cp "${src_path}/ascend_kernels/cmake_files/op_host/CMakeLists.txt" "${build_root}/${proj_name}/op_host/"

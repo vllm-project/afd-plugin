@@ -29,7 +29,7 @@ from afd_plugin.compat.npu import (
     fix_all2all_backend_for_afd,
     npu_afd_num_ubatches,
 )
-from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
+from afd_plugin.compat.npu.ops import ensure_afd_async_ops_available
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
@@ -112,7 +112,7 @@ class AFDNPUFFNWorker(NPUWorker):
                 AscendDeviceType.A5,
             ):
                 raise ValueError("Async CAM requires Ascend 910C/A3 or 950/A5")
-            ensure_cam_async_ops_available()
+            ensure_afd_async_ops_available()
         self.device = self._init_device()
         # FLA registration needs the selected device, before Runner construction.
         register_ascend_fla_customop()

@@ -14,7 +14,7 @@ import pytest
 import afd_plugin
 from afd_plugin.compat.npu import ops
 from afd_plugin.compat.npu.ops import (
-    ensure_cam_async_ops_available,
+    ensure_afd_async_ops_available,
     ensure_cam_p2p_ops_available,
     get_afd_cann_vendor_path,
     get_afd_cust_opapi_path,
@@ -107,9 +107,9 @@ def compact_dispatcher(monkeypatch):
         ),
     )
     monkeypatch.setattr(ops, "ensure_cam_p2p_ops_available", lambda: None)
-    ensure_cam_async_ops_available.cache_clear()
+    ensure_afd_async_ops_available.cache_clear()
     yield namespace
-    ensure_cam_async_ops_available.cache_clear()
+    ensure_afd_async_ops_available.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -124,14 +124,14 @@ def compact_dispatcher(monkeypatch):
 def test_async_loader_requires_all_source_ops(compact_dispatcher, missing):
     delattr(compact_dispatcher, missing)
     with pytest.raises(RuntimeError, match="afd_ascend"):
-        ensure_cam_async_ops_available()
+        ensure_afd_async_ops_available()
 
 
 def test_async_loader_rejects_registered_buffer_abi(compact_dispatcher):
     schema = compact_dispatcher.afd_async_combine_recv.default._schema
     schema.arguments = [SimpleNamespace(name=a) for a in ("context", "group_ep")]
     with pytest.raises(RuntimeError, match="compact comm_args/group_name"):
-        ensure_cam_async_ops_available()
+        ensure_afd_async_ops_available()
 
 
 _CAM_EXPORTS = tuple(
@@ -152,10 +152,10 @@ def test_async_loader_requires_each_vendor_export(
     )
     monkeypatch.setattr(ctypes, "CDLL", {path: library}.__getitem__)
     if missing is None:
-        ensure_cam_async_ops_available()
+        ensure_afd_async_ops_available()
     else:
         with pytest.raises(RuntimeError, match=missing + r"\b") as error:
-            ensure_cam_async_ops_available()
+            ensure_afd_async_ops_available()
         assert path in str(error.value)
 
 
@@ -165,6 +165,6 @@ def test_async_loader_reports_unloadable_vendor(
     path = str(tmp_path / "missing-opapi.so")
     monkeypatch.setenv("AFD_CUST_OPAPI_LIB_PATH", path)
     with pytest.raises(RuntimeError) as error:
-        ensure_cam_async_ops_available()
+        ensure_afd_async_ops_available()
     assert path in str(error.value)
     assert isinstance(error.value.__cause__, OSError)

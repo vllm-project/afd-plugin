@@ -35,7 +35,7 @@ def ascend_ops_runtime() -> ModuleType:
 
 
 @pytest.fixture(scope="module")
-def compact_cam_runtime() -> ModuleType:
+def afd_async_ops_runtime() -> ModuleType:
     soc = os.environ.get("SOC_VERSION", "").lower()
     if soc not in {"910c", "950"} and not soc.startswith(("ascend910_93", "ascend950")):
         pytest.skip("Set SOC_VERSION to 910c or ascend950 to test compact CAM")

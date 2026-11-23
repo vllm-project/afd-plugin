@@ -29,7 +29,7 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 from afd_plugin.compat.npu.feature_validation import (
     fail_if_unsupported_npu_afd_features,
 )
-from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
+from afd_plugin.compat.npu.ops import ensure_afd_async_ops_available
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
@@ -282,7 +282,7 @@ def main():
     device = torch.device("npu", local_rank)
     if is_ffn and get_ascend_device_type() != AscendDeviceType.A3:
         raise ValueError("layered GMM requires Ascend 910C/A3")
-    ensure_cam_async_ops_available()
+    ensure_afd_async_ops_available()
     connector = CAMAsyncAFDConnector(
         rank,
         local_rank,

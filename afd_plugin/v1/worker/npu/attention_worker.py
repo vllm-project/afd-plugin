@@ -16,7 +16,7 @@ from afd_plugin.compat.npu import (
     fix_all2all_backend_for_afd,
     npu_afd_num_ubatches,
 )
-from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
+from afd_plugin.compat.npu.ops import ensure_afd_async_ops_available
 from afd_plugin.compat.npu.runtime_config import configure_async_cam_dbo
 from afd_plugin.config import AFD_ASYNC_CONNECTOR
 from afd_plugin.model_executor.models.model_utils import (
@@ -65,7 +65,7 @@ class AFDNPUAttentionWorker(NPUWorker):
         configure_afd_dspark(self.vllm_config)
 
         if afd_config.connector == AFD_ASYNC_CONNECTOR:
-            ensure_cam_async_ops_available()
+            ensure_afd_async_ops_available()
         self.device = self._init_device()
         # FLA registration needs the selected device, before Runner construction.
         register_ascend_fla_customop()

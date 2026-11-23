@@ -517,7 +517,7 @@ def test_executor_error_reaches_store_without_retrying_transport_loader(
 
     monkeypatch.setattr(
         sys.modules["afd_plugin.compat.npu.ops"],
-        "ensure_cam_async_ops_available",
+        "ensure_afd_async_ops_available",
         unavailable_transport_ops,
     )
     module = load_host_module(monkeypatch, "afd_plugin.connectors.npu.async_cam")
@@ -815,7 +815,7 @@ def npu_worker(request, ffn_owners, monkeypatch):
             raise RuntimeError("transport operators unavailable")
 
     worker._init_device = initialize_device
-    monkeypatch.setattr(module, "ensure_cam_async_ops_available", load_ops)
+    monkeypatch.setattr(module, "ensure_afd_async_ops_available", load_ops)
     monkeypatch.setattr(
         module, "init_workspace_manager", lambda *args: events.append("workspace")
     )

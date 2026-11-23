@@ -1577,7 +1577,7 @@ def require_runtime() -> tuple[Any, Any]:
     """Import torch and torch_npu, load the extension, and pin the device.
 
     The loader is the one the sibling layered tests use, not
-    ``ensure_cam_async_ops_available``: that stronger check also requires the
+    ``ensure_afd_async_ops_available``: that stronger check also requires the
     four ``afd_async_*`` communication operators to be registered, and this
     benchmark issues no collective at all. Requiring them would refuse to run on
     a build that has the two compute operators this file actually measures.

@@ -24,7 +24,7 @@ bootstrap_custom_op_env()
 import torch  # noqa: E402
 import torch_npu  # noqa: E402, F401
 
-from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available  # noqa: E402
+from afd_plugin.compat.npu.ops import ensure_afd_async_ops_available  # noqa: E402
 from afd_plugin.config import parse_afd_config  # noqa: E402
 from afd_plugin.connectors.metadata import (  # noqa: E402
     AFDTransferContext,
@@ -107,7 +107,7 @@ def main():
     checkpoint = V4CheckpointDescription.read(args.model)
     config = attention_config(checkpoint, args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    ensure_cam_async_ops_available()
+    ensure_afd_async_ops_available()
     torch.npu.set_device(args.device)
     connector = CAMAsyncAFDConnector(
         0, args.device, config, parse_afd_config(config), role_rank=0
