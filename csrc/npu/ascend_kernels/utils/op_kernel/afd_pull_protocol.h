@@ -4,7 +4,7 @@
 #define AFD_PULL_PROTOCOL_H
 
 #include "kernel_operator.h"
-#include "cam_async_comm_group.h"
+#include "afd_async_comm_group.h"
 #include "afd_pull_layout.h"
 
 namespace Cam::Pull {

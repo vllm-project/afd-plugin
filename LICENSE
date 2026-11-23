@@ -203,15 +203,17 @@
 Third-party software notice: Routed-only asynchronous CAM operators
 =================================================================
 
-The imported CAM operator sources under csrc/npu/ascend_kernels/afd_async_*/,
-their Ascend 950 implementations under csrc/npu/ascend_kernels/arch35/,
-the MIT-licensed compact CAM helpers in utils/op_host and utils/op_kernel,
-and their adapted PyTorch bindings retain the following license. The 950
-additions retain their original 2026 Huawei copyright notices.
+The imported compact operator sources in csrc/npu/ascend_kernels/afd_async_*/
+(including the *_arch35 variants), the MIT-marked afd_async_* headers in
+utils/op_host and utils/op_kernel, and csrc/npu/pybind/afd_async_bindings.cpp
+carry the MIT permission notice below. Helpers bearing an Apache-2.0 SPDX
+identifier retain the Apache License, Version 2.0, reproduced above, and
+their AFD plugin contributor notices.
 
 The MIT License
 
 Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

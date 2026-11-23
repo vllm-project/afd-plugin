@@ -13,11 +13,11 @@ AFD_ASCEND_OPS_NAMESPACE = "afd_ascend"
 AFD_ASCEND_VENDOR_NAME = "afd-plugin"
 AFD_CUST_OPAPI_ENV = "AFD_CUST_OPAPI_LIB_PATH"
 _A5_CUST_OPAPI_NAME = "libafd_cust_opapi.so"
-CAM_OP_NAMESPACE = AFD_ASCEND_OPS_NAMESPACE
-CAM_DISPATCH_SEND = "afd_async_dispatch_send"
-CAM_DISPATCH_RECV = "afd_async_dispatch_recv"
-CAM_COMBINE_SEND = "afd_async_combine_send"
-CAM_COMBINE_RECV = "afd_async_combine_recv"
+AFD_ASYNC_OP_NAMESPACE = AFD_ASCEND_OPS_NAMESPACE
+AFD_ASYNC_DISPATCH_SEND = "afd_async_dispatch_send"
+AFD_ASYNC_DISPATCH_RECV = "afd_async_dispatch_recv"
+AFD_ASYNC_COMBINE_SEND = "afd_async_combine_send"
+AFD_ASYNC_COMBINE_RECV = "afd_async_combine_recv"
 
 
 def get_afd_cann_vendor_path() -> Path:
@@ -81,7 +81,7 @@ def _assert_afd_namespace_registered(torch: object) -> None:
     _ = ops.afd_ascend.e2a
 
 
-def _assert_cam_namespace_registered(torch: object) -> None:
+def _assert_afd_async_namespace_registered(torch: object) -> None:
     ops = vars(torch)["ops"]
     operators = (
         ops.afd_ascend.afd_async_dispatch_send,
@@ -135,13 +135,13 @@ def has_afd_ascend_ops() -> bool:
 
 
 @lru_cache(maxsize=1)
-def ensure_cam_async_ops_available() -> None:
+def ensure_afd_async_ops_available() -> None:
     """Check the compact schemas and their native entry points before CAM startup."""
     ensure_cam_p2p_ops_available()
     import torch
 
     try:
-        _assert_cam_namespace_registered(torch)
+        _assert_afd_async_namespace_registered(torch)
     except AttributeError as exc:
         raise RuntimeError(
             "Async CAM requires all four torch.ops.afd_ascend.afd_async_* "
@@ -175,16 +175,31 @@ def ensure_cam_async_ops_available() -> None:
         )
 
 
+# Public spellings used by older connector integrations.
+ensure_cam_async_ops_available = ensure_afd_async_ops_available
+CAM_COMBINE_RECV = AFD_ASYNC_COMBINE_RECV
+CAM_COMBINE_SEND = AFD_ASYNC_COMBINE_SEND
+CAM_DISPATCH_RECV = AFD_ASYNC_DISPATCH_RECV
+CAM_DISPATCH_SEND = AFD_ASYNC_DISPATCH_SEND
+CAM_OP_NAMESPACE = AFD_ASYNC_OP_NAMESPACE
+
+
 __all__ = [
     "AFD_ASCEND_OPS_NAMESPACE",
     "AFD_ASCEND_VENDOR_NAME",
     "AFD_CUST_OPAPI_ENV",
+    "AFD_ASYNC_COMBINE_RECV",
+    "AFD_ASYNC_COMBINE_SEND",
+    "AFD_ASYNC_DISPATCH_RECV",
+    "AFD_ASYNC_DISPATCH_SEND",
+    "AFD_ASYNC_OP_NAMESPACE",
     "CAM_COMBINE_RECV",
     "CAM_COMBINE_SEND",
     "CAM_DISPATCH_RECV",
     "CAM_DISPATCH_SEND",
     "CAM_OP_NAMESPACE",
     "ensure_afd_ascend_ops_loaded",
+    "ensure_afd_async_ops_available",
     "ensure_cam_async_ops_available",
     "ensure_cam_p2p_ops_available",
     "get_afd_cann_vendor_path",

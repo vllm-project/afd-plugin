@@ -1,7 +1,6 @@
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
  * Description: AfdAsyncCombineSend operator kernel function header file
- * Author: Yan Ming
  * Create: 2025-12-18
  * Note:
  * History:
@@ -14,8 +13,8 @@
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "afd_async_combine_send_tiling.h"
-#include "cam_async_comm_args.h"
-#include "cam_async_comm_group.h"
+#include "afd_async_comm_args.h"
+#include "afd_async_comm_group.h"
 
 namespace MoeDistributeCombineSendImpl {
 constexpr uint64_t CAM_MAX_RANK_SIZE = 384;  // max NPUs supported by the Cam comm library

@@ -24,8 +24,14 @@ Each 950 source directory registers its own SoC and reuses the common
 compact ACLNN interface. The four vector-only kernel entries carry the donor's
 [AIV-only task declaration](https://github.com/GuangyuZhu04/afd-plugin/commit/cb303bbbd18b055919f86b194f2b754fa4e794e5).
 The plugin builds the compact transport without a CCU runtime or custom
-session class. The source files retain the notices covered by the project
-[LICENSE](../../LICENSE).
+session class. The compact kernels and binding retain the Huawei MIT notice
+from the original import. The 950 helper headers carry their individual
+source licenses. For example, `afd_async_combine_tile_plan.h` retains the
+Apache-2.0 identifier and AFD contributor notice from the donor. The source
+distribution, wheel and native vendor install carry the repository license
+and third-party notice. [Original import](https://github.com/vllm-project/afd-plugin/pull/361)
+· [Tile-plan source](https://github.com/GuangyuZhu04/afd-plugin/blob/4d134dc955c58727c08511c6043ee01279eb6279/csrc/npu/ascend_kernels/utils/op_kernel/cam_async_combine_tile_plan.h)
+· [LICENSE](../../LICENSE)
 
 The NPU native sources live in this directory:
 
@@ -47,7 +53,7 @@ ascend_kernels/
   a2e/{op_api,op_host,op_kernel}
   e2a/{op_api,op_host,op_kernel}
   afd_async_*/{op_api,op_host,op_kernel}  # common ACLNN interfaces and 910C implementations
-  arch35/afd_async_*/{op_host,op_kernel}  # 950 compact MTE implementations
+  afd_async_*_arch35/{op_host,op_kernel}  # 950 compact MTE implementations
   grouped_matmul_swiglu_quant_v2_layered/{op_api,op_host,op_kernel}
   grouped_matmul_layered/{op_api,op_host,op_kernel}
   utils/op_host/           # CAM host logging/check/tiling-base headers
@@ -146,7 +152,7 @@ generated `CMakePresets.json` through `scripts/set_conf.py`, then emits a
 deterministically named run package at `csrc/npu/output/AFD_<soc>.run`.
 
 For 950, `select_ops.py` maps each public `afd_async_*` selection to its
-`arch35/afd_async_*` source directory. The staging step uses the common
+`afd_async_*_arch35` source directory. The staging step uses the common
 `afd_async_*/op_api/` directory when the variant shares its ACLNN interface.
 Staging copies each selected operator's `op_host/`, `op_kernel/`, and `op_api/`
 trees recursively, so operators that keep sources in nested directories (for

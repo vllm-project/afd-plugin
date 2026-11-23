@@ -8,7 +8,7 @@ availability filter, then prints the selected operator directory names (one
 per line).
 
 Notes:
-  - The public operator name is the basename of its SoC-specific directory.
+  - An _arch35 source directory shares the unsuffixed operator name and metadata.
   - "utils" is a shared header directory, always copied by the build script
     and therefore never emitted here.
 """
@@ -114,12 +114,15 @@ def main():
 
     registry = load_registry(args.registry)
     directories = get_soc_list(registry, args.soc)
-    sources = {path.rsplit("/", 1)[-1]: path for path in directories}
+    sources = {name.removesuffix("_arch35"): name for name in directories}
     if len(sources) != len(directories):
         die(f"SOC '{args.soc}' lists multiple implementations of the same operator")
     soc_list = list(sources)
     user_ops = split_ops(args.ops)
     if user_ops is not None:
+        user_ops = [
+            op.removesuffix("_arch35") if op in directories else op for op in user_ops
+        ]
         validate_user_ops(user_ops, soc_list)
 
     final_ops = resolve(registry, soc_list, args.shmem == "1", user_ops)

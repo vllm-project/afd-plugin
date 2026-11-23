@@ -64,7 +64,7 @@ SOC_VERSION=910c AFD_BUILD_ASCEND_OPS=1 \
 
 Both builds select A2E/E2A and all four routed-only operators. For Atlas A5
 use `SOC_VERSION=950`. The build selects compact/MTE kernel sources under
-`csrc/npu/ascend_kernels/arch35/` and shares the compact PyTorch schemas
+`csrc/npu/ascend_kernels/afd_async_*_arch35/` and shares the compact PyTorch schemas
 with 910C. `setup.py` passes the same `SOC_VERSION` to the ACLNN build and
 the extension CMake configuration (`AFD_SOC_VERSION`).
 
@@ -166,7 +166,7 @@ collisions, and propagation of the SOC into the extension build:
 ```bash
 python -m pytest -q \
   tests/unit/package/test_ascend_build_files.py \
-  tests/unit/package/test_cam_async_build.py \
+  tests/unit/package/test_afd_async_build.py \
   tests/unit/compat/test_ascend_ops.py
 ```
 
@@ -175,7 +175,7 @@ matching torch-npu/CANN libraries:
 
 ```bash
 SOC_VERSION=910c python -m pytest -q -ra \
-  tests/npu/test_cam_async_ops.py
+  tests/npu/test_afd_async_ops.py
 ```
 
 Set `SOC_VERSION=950` to check the 950 build. A matching compiled extension
@@ -194,7 +194,7 @@ cleanup results. Validate all four phases together, including:
 - Rebuilding and loading with the existing A2E/E2A operators on both SoCs.
 
 The standalone device check is
-`tests/npu/async_cam_precision.py`. Run it with `torchrun` using
+`tests/npu/afd_async_precision.py`. Run it with `torchrun` using
 TP1/2/4 plus two FFN ranks, both FP16/BF16, and quantization off/on. Each run
 compares against an independent CPU weighted-sum/quantization reference and
 covers sparse/empty ranks, multiple chunks and repeated window reuse. Model

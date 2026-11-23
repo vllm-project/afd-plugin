@@ -52,10 +52,10 @@ class AscendFFNEnvironment(FFNEnvironmentBase[FFNConfig]):
             get_ascend_device_type,
         )
 
-        from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
+        from afd_plugin.compat.npu.ops import ensure_afd_async_ops_available
 
         self.require_no_borrowed_native_groups()
-        ensure_cam_async_ops_available()
+        ensure_afd_async_ops_available()
         # Reuse the native Worker's mapping for --device-ids and visibility.
         assigned = config.parallel_config.assigned_physical_gpu_ids
         if assigned is not None:

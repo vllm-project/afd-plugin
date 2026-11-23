@@ -29,7 +29,7 @@ from afd_plugin.compat.npu import (
     fix_all2all_backend_for_afd,
     npu_afd_num_ubatches,
 )
-from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
+from afd_plugin.compat.npu.ops import ensure_afd_async_ops_available
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
@@ -109,7 +109,7 @@ class AFDNPUFFNWorker(NPUWorker):
         if afd_config.connector == AFD_ASYNC_CONNECTOR:
             if get_ascend_device_type() != AscendDeviceType.A3:
                 raise ValueError("layered GMM requires Ascend 910C/A3")
-            ensure_cam_async_ops_available()
+            ensure_afd_async_ops_available()
         self.device = self._init_device()
         # FLA registration needs the selected device, before Runner construction.
         register_ascend_fla_customop()

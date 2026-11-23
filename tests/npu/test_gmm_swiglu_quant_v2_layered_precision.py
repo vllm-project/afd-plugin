@@ -25,7 +25,7 @@ native-provider report are retained in the case's pytest temporary directory.
 
 ``a8w4`` compares against a CPU golden implemented in this file, following the
 formula already exercised on device by
-``tests/npu/test_async_cam_layered_w4a8.py``: dequantize the int4 weights,
+``tests/npu/test_afd_async_layered_w4a8.py``: dequantize the int4 weights,
 per-expert matmul, SiLU gating, then per-token quantization. The built-in cannot
 serve as the reference for this scenario, and the reason is worth recording
 precisely.
@@ -143,7 +143,7 @@ _LAYER_SELECTION_COUNTS = {
 
 # The A8W4 MSD path consumes an assist matrix that compensates the packed-int
 # arithmetic, so the kernel's result matches the true dequantized matmul. The
-# compensation is computed exactly as ``test_async_cam_layered_w4a8.py`` does.
+# compensation is computed exactly as ``test_afd_async_layered_w4a8.py`` does.
 _ASSIST_FACTOR = 8
 
 # A8W8: the reference and the layered operator run the same arithmetic on the
@@ -291,7 +291,7 @@ def _a8w4_golden(torch, x_cpu, x_scale_cpu, dequant_weight, counts, swiglu_limit
     """Return the golden (y, y_scale) as CPU int8 and float32 tensors.
 
     The formula is the one validated on device by
-    ``tests/npu/test_async_cam_layered_w4a8.py``: per-token dequantize the
+    ``tests/npu/test_afd_async_layered_w4a8.py``: per-token dequantize the
     activation, matmul against the dequantized int4 weight of each expert, split
     into gate/up halves, apply SiLU gating, then quantize per token.
     """
