@@ -25,6 +25,10 @@ from afd_plugin.config import (
     AFDConfig,
     parse_afd_config,
 )
+from afd_plugin.eplb.capability import (
+    check_eplb_support,
+    eplb_request_from_vllm_config,
+)
 from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
 
 if TYPE_CHECKING:
@@ -144,8 +148,14 @@ def _validate_supported_config(
         raise RuntimeError(
             "AFD Qwen3 MoE does not support sequence-parallel MoE",
         )
-    if parallel_config.enable_eplb and afd_config.role != "ffn":
-        raise RuntimeError("AFD Qwen3 MoE supports EPLB only on the FFN role")
+    if parallel_config.enable_eplb:
+        check_eplb_support(
+            eplb_request_from_vllm_config(
+                vllm_config,
+                afd_config,
+                supports_expert_weight_views=True,
+            ),
+        )
     if parallel_config.pipeline_parallel_size != 1:
         raise RuntimeError("AFD Qwen3 MoE does not support pipeline parallelism")
     if vllm_config.speculative_config is not None:

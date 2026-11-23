@@ -146,11 +146,7 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
         self.routed_connector.init_afd_connector(
             moe_layer_indices=self.moe_layer_indices,
             local_experts=self.local_experts,
-            eplb_state=(
-                self.eplb.state
-                if self.vllm_config.parallel_config.enable_eplb
-                else None
-            ),
+            eplb_state=self.eplb_lifecycle.get_eplb_state(),
         )
 
     def _ffn_forward(

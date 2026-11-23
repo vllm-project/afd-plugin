@@ -16,6 +16,10 @@ from afd_plugin.config import (
     AFDConfig,
     parse_afd_config,
 )
+from afd_plugin.eplb.capability import (
+    check_eplb_support,
+    eplb_request_from_vllm_config,
+)
 from afd_plugin.v1.worker.cuda_graph import (
     cudagraph_mode_name,
     validate_cuda_graph_mode,
@@ -184,32 +188,15 @@ def validate_gpu_model_runner_v2_config(
         or parallel.use_sequence_parallel_moe
     ):
         raise RuntimeError("AFD ModelRunnerV2 requires static expert parallelism")
-    if parallel.enable_eplb:
-        # EPLB runs on the FFN role only: Attention holds no experts and no
-        # MoE routing, and its CUDA remote-expert shells reject EPLB.
-        if expected_role != "ffn":
-            raise RuntimeError(
-                "AFD ModelRunnerV2 supports EPLB only on the FFN role",
-            )
-        # The FFN-side record kernel selects its per-ubatch unpadded token
-        # tensor through vLLM's DBO thread context, which the FFN daemon loop
-        # never installs, so DBO steps would read the wrong token count.
-        if parallel.enable_dbo or parallel.use_ubatching:
-            raise RuntimeError(
-                "AFD ModelRunnerV2 FFN EPLB does not support DBO or ubatching",
-            )
-        # vLLM 0.32 async EPLB commits new expert maps from a background
-        # worker outside the connector step boundary: AFD steps EPLB from
-        # the connector loop, and the M2N exchange adopts the committed maps
-        # only at that boundary. Migration batching is async-only, so this
-        # gate covers it too.
-        if parallel.eplb_config.use_async:
-            raise RuntimeError(
-                "AFD ModelRunnerV2 FFN EPLB does not support async EPLB: "
-                "rearrangement commits expert maps from a background worker "
-                "outside the connector step boundary. Pass use_async=false "
-                "in --eplb-config.",
-            )
+    # The model is not built yet, so weight-view support is checked by the
+    # model constructors.
+    check_eplb_support(
+        eplb_request_from_vllm_config(
+            vllm_config,
+            afd_config,
+            supports_expert_weight_views=True,
+        ),
+    )
     if (
         parallel.enable_dbo or parallel.use_ubatching
     ) and parallel.num_ubatches != GPU_MRV2_NUM_UBATCHES:
@@ -281,12 +268,15 @@ def validate_npu_model_runner_v2_config(
             f"AFD ModelRunnerV2 {expected_role} ranks must match DP * TP: "
             f"configured={configured_ranks}, distributed={distributed_ranks}",
         )
-    if (
-        not parallel.enable_expert_parallel
-        or parallel.enable_elastic_ep
-        or parallel.enable_eplb
-    ):
+    if not parallel.enable_expert_parallel or parallel.enable_elastic_ep:
         raise RuntimeError("AFD ModelRunnerV2 requires static expert parallelism")
+    check_eplb_support(
+        eplb_request_from_vllm_config(
+            vllm_config,
+            afd_config,
+            supports_expert_weight_views=True,
+        ),
+    )
     if parallel.enable_dbo or parallel.use_ubatching:
         if (
             afd_config.connector == AFD_ASYNC_CONNECTOR

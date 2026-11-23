@@ -169,6 +169,10 @@ def cam_vllm_config(*, tp_size=1, pcp_size=1, extra_config=None, dtype="bf16"):
             data_parallel_rank=0,
             prefill_context_parallel_size=pcp_size,
             tensor_parallel_size=tp_size,
+            enable_eplb=False,
+            eplb_config=SimpleNamespace(num_redundant_experts=0, use_async=False),
+            enable_dbo=False,
+            use_ubatching=False,
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
         model_config=SimpleNamespace(

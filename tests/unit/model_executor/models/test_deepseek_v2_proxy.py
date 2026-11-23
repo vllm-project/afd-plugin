@@ -445,7 +445,7 @@ def test_attention_gate_balances_only_profile_routing(monkeypatch):
     vllm_config = SimpleNamespace(
         additional_config={},
         parallel_config=SimpleNamespace(
-            eplb_config=SimpleNamespace(num_redundant_experts=0)
+            eplb_config=SimpleNamespace(num_redundant_experts=0, use_async=False)
         ),
     )
     for is_profile in (False, True, False):

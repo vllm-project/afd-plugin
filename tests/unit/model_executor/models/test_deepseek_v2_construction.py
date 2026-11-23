@@ -111,7 +111,7 @@ def _vllm_config(*, layer_count: int = 2):
         model_config=SimpleNamespace(hf_config=config, use_mla=False),
         parallel_config=SimpleNamespace(
             enable_eplb=False,
-            eplb_config=SimpleNamespace(num_redundant_experts=0),
+            eplb_config=SimpleNamespace(num_redundant_experts=0, use_async=False),
             pipeline_parallel_size=1,
             use_sequence_parallel_moe=False,
         ),
@@ -294,7 +294,7 @@ def test_cuda_remote_experts_reject_eplb_on_attention(
         SimpleNamespace(device_type="cuda"),
     )
 
-    with pytest.raises(RuntimeError, match="do not support EPLB"):
+    with pytest.raises(RuntimeError, match="EPLB must be enabled on the FFN role only"):
         _make_layer(
             monkeypatch,
             role="attention",

@@ -21,7 +21,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.utils.mem_utils import DeviceMemoryProfiler
-from vllm.v1.worker.gpu.eplb_utils import EPLBController
 from vllm.v1.worker.workspace import reset_workspace_manager
 
 from afd_plugin.compat.profiler import (
@@ -40,6 +39,8 @@ from afd_plugin.distributed.eplb import (
     describe_eplb_placement,
     describe_eplb_rank_load,
 )
+from afd_plugin.eplb.gpu import create_gpu_eplb_backend
+from afd_plugin.eplb.lifecycle import FFNEplbLifecycle
 from afd_plugin.v1.worker.cuda_graph import (
     AFDGraphRunMode,
     graph_run_mode,
@@ -106,8 +107,12 @@ class GPUFFNModelRunner:
         self.num_layers = int(self.model_config.hf_text_config.num_hidden_layers)
         # Expert parallelism load balancer. EPLB runs on the FFN role only:
         # the Attention role holds no experts and no MoE routing. The
-        # controller no-ops unless ``parallel_config.enable_eplb`` is set.
-        self.eplb = EPLBController(vllm_config.parallel_config, device)
+        # lifecycle no-ops unless ``parallel_config.enable_eplb`` is set.
+        self.eplb_lifecycle = FFNEplbLifecycle(
+            vllm_config,
+            self.afd_config,
+            create_gpu_eplb_backend(vllm_config, device),
+        )
         self.use_cuda_graph = bool(
             self.afd_cudagraph_policy.enable_ffn_graph_cache,
         )
@@ -129,7 +134,6 @@ class GPUFFNModelRunner:
         """Load the vLLM model and register it with FFN-side EPLB."""
 
         model_loader = get_model_loader(self.load_config)
-        self.eplb.prepare_load()
         with DeviceMemoryProfiler() as profiler:
             if self.model is None:
                 self.model = model_loader.load_model(
@@ -142,11 +146,10 @@ class GPUFFNModelRunner:
                     model_config=self.model_config,
                 )
         self.model_memory_usage = profiler.consumed_memory
-        eplb_models_added = self.eplb.maybe_register_model(
+        self.eplb_lifecycle.initialize_model(
             self.model,
-            self.model_config,
+            load_dummy_weights=load_dummy_weights,
         )
-        self.eplb.maybe_start_async_loop(eplb_models_added, load_dummy_weights)
 
     def profile_run(self) -> None:
         pass
@@ -228,7 +231,7 @@ class GPUFFNModelRunner:
         """Step the FFN-side EPLB state after one connector-driven step."""
 
         placement_before = self._snapshot_eplb_placement_if_due()
-        self.eplb.step(is_dummy=is_dummy)
+        self.eplb_lifecycle.step(is_dummy=is_dummy)
         if placement_before is not None:
             self._log_eplb_placement_if_changed(placement_before)
 
@@ -241,7 +244,7 @@ class GPUFFNModelRunner:
     def _snapshot_eplb_placement_if_due(self) -> dict[str, torch.Tensor] | None:
         """CPU snapshots of the committed expert maps when this step may
         commit a rearrangement; ``None`` keeps the common step sync-free."""
-        state = self.eplb.state
+        state = self.eplb_lifecycle.get_eplb_state()
         if state is None:
             return None
         # vLLM logs balancedness stats from EplbState.step with this flag;
@@ -271,7 +274,7 @@ class GPUFFNModelRunner:
         self,
         placement_before: dict[str, torch.Tensor],
     ) -> None:
-        state = self.eplb.state
+        state = self.eplb_lifecycle.get_eplb_state()
         assert state is not None
         ep_size = self.vllm_config.parallel_config.data_parallel_size * (
             self.vllm_config.parallel_config.tensor_parallel_size
@@ -319,7 +322,10 @@ class GPUFFNModelRunner:
             attention_counts,
             attention_size=int(self.connector.attn_size),
         )
-        self.eplb.prepare_forward(self.model_config, num_unpadded_tokens)
+        self.eplb_lifecycle.prepare_forward(
+            num_unpadded_tokens,
+            is_dummy=False,
+        )
 
     def _ffn_forward(
         self,

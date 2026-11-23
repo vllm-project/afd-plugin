@@ -41,6 +41,7 @@ def _runner_config(*, enable_dbo=False, use_ubatching=False):
             enable_expert_parallel=True,
             enable_elastic_ep=False,
             enable_eplb=False,
+            eplb_config=SimpleNamespace(num_redundant_experts=0, use_async=False),
             use_sequence_parallel_moe=False,
         ),
         compilation_config=SimpleNamespace(
@@ -62,11 +63,12 @@ def sync_gate_afd_config(monkeypatch):
         num_attention_ranks=4,
         num_ffn_ranks=4,
     )
-    monkeypatch.setattr(
-        validation,
-        "parse_afd_config",
-        lambda _vllm_config, expected_role=None: afd_config,
-    )
+
+    def _parse(_vllm_config, expected_role=None):
+        afd_config.role = expected_role
+        return afd_config
+
+    monkeypatch.setattr(validation, "parse_afd_config", _parse)
     # The validator imports this lazily, and the real module path pulls vLLM in.
     # Inject the leaf module so the accepted path can run on a CPU host.
     for name, attributes in (

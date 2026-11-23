@@ -92,7 +92,7 @@ def construct_model(torch):
             scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
             parallel_config=SimpleNamespace(
                 use_sequence_parallel_moe=False,
-                eplb_config=SimpleNamespace(num_redundant_experts=0),
+                eplb_config=SimpleNamespace(num_redundant_experts=0, use_async=False),
             ),
             cache_config=None,
             quant_config=None,

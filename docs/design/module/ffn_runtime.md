@@ -395,8 +395,18 @@ below).
 ## FFN-side EPLB
 
 The FFN role can enable vLLM's expert-parallel load balancing
-(`--enable-eplb` plus `--eplb-config`). `GPUFFNModelRunner` owns the native
-`EPLBController` and follows the upstream `GPUModelRunner` wiring:
+(`--enable-eplb` plus `--eplb-config`). Support is decided in one place:
+`afd_plugin/eplb/capability.py` keys the request on router location,
+connector and role, so a combination without a backend raises
+`EplbUnsupportedError` (a `RuntimeError`) instead of failing late. The
+decision table currently enables the GPU rows only: FFN-local EPLB on
+`P2pNcclAFDConnector` and on `DeepEPM2NAFDConnector` (which also enables
+Attention-side logical-to-physical mapping).
+
+`GPUFFNModelRunner` composes the platform-neutral `FFNEplbLifecycle`
+(`afd_plugin/eplb/lifecycle.py`) with the GPU `EplbBackend` implementation
+(`afd_plugin/eplb/gpu.py`, a wrapper over the native `EPLBController`), and
+follows the upstream `GPUModelRunner` wiring:
 
 - `load_model` calls `prepare_load`, registers the loaded model through
   `maybe_register_model` (the AFD FFN model inherits the native
@@ -426,6 +436,12 @@ placeholder rows idle Attention peers transfer. Every FFN rank's router
 view covers those tokens, either through TP-replicated delivery or through
 the MoE-level all-gather, so the count matches the rows the router's
 map-and-record kernel processes.
+
+The lifecycle owns no device tensors: it forwards `prepare_forward` and
+`step` to the backend on every connector step. Backends are platform
+specific (GPU: `EPLBController`/`EplbState`, NCCL or the configured EPLB
+communicator; NPU will wrap the vLLM-Ascend V2 stack) so that vLLM and
+vLLM-Ascend version bumps stay independent.
 
 Limits: EPLB is rejected on the Attention role (its CUDA remote-expert
 shells hold no experts), and FFN EPLB rejects DBO/ubatching because the

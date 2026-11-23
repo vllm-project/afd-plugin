@@ -134,6 +134,7 @@ from afd_plugin.distributed import init_afd_process_group
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.distributed.eplb.eplb_state import EplbState
     from vllm.model_executor.layers.quantization.base_config import (
         QuantizationConfig,
     )
@@ -1204,7 +1205,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         *,
         moe_layer_indices: Sequence[int] | None = None,
         local_experts: Mapping[int, FFNLocalExperts] | None = None,
-        eplb_state: Any | None = None,
+        eplb_state: EplbState | None = None,
     ) -> None:
         """Collective: check what every rank loaded, then create buffers.
 

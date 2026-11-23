@@ -59,6 +59,10 @@ from afd_plugin.distributed import (
     create_hccl_process_group_options,
     init_afd_process_group,
 )
+from afd_plugin.eplb.capability import (
+    check_eplb_support,
+    eplb_request_from_vllm_config,
+)
 from afd_plugin.validation import cam_receive_capacity, validate_graph_capacity
 
 if TYPE_CHECKING:
@@ -266,6 +270,15 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         width.
         """
         super().__init__(rank, local_rank, vllm_config, afd_config, role_rank)
+        # CAM consumes logical routed ids and has no EPLB state, so a
+        # redundant-expert count must not be silently dropped.
+        check_eplb_support(
+            eplb_request_from_vllm_config(
+                vllm_config,
+                afd_config,
+                supports_expert_weight_views=True,
+            ),
+        )
         self._initialized = False
         hf_config = vllm_config.model_config.hf_config
         self.hidden_size = hf_config.hidden_size

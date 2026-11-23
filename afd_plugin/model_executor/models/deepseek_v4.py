@@ -20,6 +20,10 @@ from vllm.models.deepseek_v4.nvidia import model as native
 from afd_plugin.compat.patches.gpu_deepseek_v4_dbo import forward_v4_attention
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
+from afd_plugin.eplb.capability import (
+    check_eplb_support,
+    eplb_request_from_vllm_config,
+)
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
@@ -416,7 +420,13 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         if parallel_config.use_sequence_parallel_moe:
             raise RuntimeError("AFD DeepSeek-V4 does not support SP MoE")
         if parallel_config.enable_eplb:
-            raise RuntimeError("AFD DeepSeek-V4 does not support EPLB")
+            check_eplb_support(
+                eplb_request_from_vllm_config(
+                    vllm_config,
+                    self.afd_config,
+                    supports_expert_weight_views=False,
+                ),
+            )
         # ### PATCH END
 
         config = vllm_config.model_config.hf_config

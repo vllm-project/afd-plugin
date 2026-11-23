@@ -38,6 +38,10 @@ from afd_plugin.connectors import (
     AFDTransferContext,
     AFDTransferMetadata,
 )
+from afd_plugin.eplb.capability import (
+    check_eplb_support,
+    eplb_request_from_vllm_config,
+)
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
@@ -663,8 +667,12 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
             and self.uses_remote_experts
             and parallel_config.enable_eplb
         ):
-            raise RuntimeError(
-                "CUDA remote experts do not support EPLB on the Attention role",
+            check_eplb_support(
+                eplb_request_from_vllm_config(
+                    vllm_config,
+                    afd_config,
+                    supports_expert_weight_views=False,
+                ),
             )
         if self.compute_gate_on_attention and device_type not in ("cuda", "npu"):
             raise RuntimeError(

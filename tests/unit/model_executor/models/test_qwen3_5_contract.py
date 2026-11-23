@@ -128,6 +128,7 @@ def test_qwen_text_only_uses_upstream_missing_vision_tower_stage(
         quant_config=None,
         parallel_config=SimpleNamespace(
             enable_eplb=False,
+            eplb_config=SimpleNamespace(num_redundant_experts=0, use_async=False),
             pipeline_parallel_size=1,
             use_sequence_parallel_moe=False,
         ),
@@ -185,6 +186,7 @@ def conditional_config(monkeypatch):
         ),
         parallel_config=SimpleNamespace(
             enable_eplb=False,
+            eplb_config=SimpleNamespace(num_redundant_experts=0, use_async=False),
             pipeline_parallel_size=1,
             use_sequence_parallel_moe=False,
         ),
@@ -210,7 +212,6 @@ def conditional_config(monkeypatch):
             "pass --language-model-only",
         ),
         ("config.parallel_config.use_sequence_parallel_moe", True, "SP MoE"),
-        ("config.parallel_config.enable_eplb", True, "EPLB"),
         (
             "config.parallel_config.pipeline_parallel_size",
             2,
@@ -228,6 +229,18 @@ def test_qwen_rejects_unsupported_configuration_before_construction(
     setattr(target, field, value)
 
     with pytest.raises(ValueError, match=message):
+        adapter.AFDQwen3_5MoeForConditionalGeneration(
+            vllm_config=conditional_config.config
+        )
+
+
+def test_qwen_attention_eplb_raises_the_eplb_capability_error(conditional_config):
+    """Attention-role EPLB uses the shared capability error, not ValueError."""
+    from afd_plugin.eplb.capability import EplbUnsupportedError
+
+    conditional_config.config.parallel_config.enable_eplb = True
+
+    with pytest.raises(EplbUnsupportedError, match="FFN role only"):
         adapter.AFDQwen3_5MoeForConditionalGeneration(
             vllm_config=conditional_config.config
         )

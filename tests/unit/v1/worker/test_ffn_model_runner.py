@@ -25,6 +25,7 @@ from afd_plugin.connectors import (  # noqa: E402
     AFDTransferMetadata,
 )
 from afd_plugin.connectors.base import AFDControlPlaneClosedError  # noqa: E402
+from afd_plugin.eplb.lifecycle import FFNEplbLifecycle  # noqa: E402
 from afd_plugin.model_executor.models.deepseek_v2 import (  # noqa: E402
     AFDDeepseekV2ForCausalLM,
 )
@@ -236,32 +237,32 @@ class _ConnectorDrivenFakeConnector(_FakeConnector):
         self.control_plane = None
 
 
-class _FakeEplbController:
-    """Records the EPLB calls the FFN runner makes per connector step."""
+class _FakeEplbBackend:
+    """Records the lifecycle calls the FFN runner makes per connector step."""
 
-    def __init__(self):
+    def __init__(self, model_config=None):
         self.state = None
+        self.model_config = model_config
         self.prepare_loads = 0
         self.registrations = []
         self.async_loop_starts = []
         self.steps = []
         self.prepared_forwards = []
 
-    def prepare_load(self):
+    def initialize_model(self, model, *, load_dummy_weights=False):
         self.prepare_loads += 1
+        self.registrations.append((model, self.model_config))
+        self.async_loop_starts.append((True, load_dummy_weights))
 
-    def maybe_register_model(self, model, model_config):
-        self.registrations.append((model, model_config))
-        return True
+    def step(self, *, is_dummy=False):
+        self.steps.append((is_dummy, False))
+        return False
 
-    def maybe_start_async_loop(self, eplb_models_added, load_dummy_weights=False):
-        self.async_loop_starts.append((eplb_models_added, load_dummy_weights))
+    def prepare_forward(self, num_unpadded_tokens, *, is_dummy=False):
+        self.prepared_forwards.append(num_unpadded_tokens)
 
-    def step(self, is_dummy=False, is_profile=False):
-        self.steps.append((is_dummy, is_profile))
-
-    def prepare_forward(self, model_config, num_unpadded_tokens, ubatch_slices=None):
-        self.prepared_forwards.append((model_config, num_unpadded_tokens))
+    def get_eplb_state(self):
+        return self.state
 
 
 class _FakeModel:
@@ -330,7 +331,11 @@ def _runner_with_connector_and_model(model, *, num_layers=1):
     runner.load_config = SimpleNamespace()
     runner.device = torch.device("cpu")
     runner.prof = None
-    runner.eplb = _FakeEplbController()
+    runner.eplb_lifecycle = FFNEplbLifecycle(
+        runner.vllm_config,
+        runner.afd_config,
+        _FakeEplbBackend(model_config=runner.model_config),
+    )
     return runner
 
 
@@ -726,41 +731,22 @@ def test_ffn_runner_loads_model_and_registers_eplb(monkeypatch):
     runner.load_model()
 
     assert runner.model is model
-    assert runner.eplb.prepare_loads == 1
-    assert runner.eplb.registrations == [(model, runner.model_config)]
-    assert runner.eplb.async_loop_starts == [(True, False)]
+    assert runner.eplb_lifecycle.backend.prepare_loads == 1
+    assert runner.eplb_lifecycle.backend.registrations == [(model, runner.model_config)]
+    assert runner.eplb_lifecycle.backend.async_loop_starts == [(True, False)]
 
 
-def test_fake_eplb_controller_matches_vllm_eplb_controller_api():
-    """The fake must mirror vLLM's EPLBController call surface.
+def test_lifecycle_noops_without_a_backend():
+    runner = _runner_with_connector_and_model(_FakeModel())
+    runner.eplb_lifecycle = FFNEplbLifecycle(
+        runner.vllm_config,
+        runner.afd_config,
+        None,
+    )
 
-    A drifted fake hides upstream signature changes: vLLM 0.32 removed
-    ``load_dummy_weights`` from ``maybe_register_model`` and moved it to
-    ``maybe_start_async_loop``, and the stale fake kept the runner's broken
-    three-argument call green.
-    """
-    import inspect
-
-    from vllm.v1.worker.gpu.eplb_utils import EPLBController
-
-    for name in (
-        "prepare_load",
-        "maybe_register_model",
-        "maybe_start_async_loop",
-        "step",
-        "prepare_forward",
-    ):
-        real = inspect.signature(getattr(EPLBController, name))
-        fake = inspect.signature(getattr(_FakeEplbController, name))
-        real_params = [
-            (param.name, param.default is not inspect.Parameter.empty)
-            for param in real.parameters.values()
-        ]
-        fake_params = [
-            (param.name, param.default is not inspect.Parameter.empty)
-            for param in fake.parameters.values()
-        ]
-        assert fake_params == real_params, name
+    assert runner.eplb_lifecycle.is_enabled is False
+    assert runner.eplb_lifecycle.step(is_dummy=False) is False
+    assert runner.eplb_lifecycle.get_eplb_state() is None
 
 
 def test_ffn_runner_steps_eplb_once_per_real_step():
@@ -769,7 +755,7 @@ def test_ffn_runner_steps_eplb_once_per_real_step():
 
     runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([1])})
 
-    assert runner.eplb.steps == [(False, False)]
+    assert runner.eplb_lifecycle.backend.steps == [(False, False)]
 
 
 def test_ffn_runner_marks_warmup_and_capturing_steps_dummy():
@@ -783,7 +769,7 @@ def test_ffn_runner_marks_warmup_and_capturing_steps_dummy():
         dp_metadata_list={0: _FakeDPMetadata([1])}, is_graph_capturing=True
     )
 
-    assert runner.eplb.steps == [(True, False), (True, False)]
+    assert runner.eplb_lifecycle.backend.steps == [(True, False), (True, False)]
 
 
 def test_ffn_runner_replay_steps_eplb_as_real_step():
@@ -798,7 +784,7 @@ def test_ffn_runner_replay_steps_eplb_as_real_step():
     runner.execute_model(dp_metadata_list=dp_metadata, is_graph_replaying=True)
 
     assert graph.replay_count == 1
-    assert runner.eplb.steps == [(False, False)]
+    assert runner.eplb_lifecycle.backend.steps == [(False, False)]
 
 
 def test_ffn_runner_prepares_eplb_unpadded_tokens_from_dp_metadata():
@@ -811,7 +797,7 @@ def test_ffn_runner_prepares_eplb_unpadded_tokens_from_dp_metadata():
 
     # Two DP counts of 4 and 6 tokens, each replicated across two Attention
     # TP peers, give 20 real tokens for the router's record kernel.
-    assert runner.eplb.prepared_forwards == [(runner.model_config, 20)]
+    assert runner.eplb_lifecycle.backend.prepared_forwards == [20]
 
 
 def test_ffn_runner_skips_eplb_prepare_when_eplb_is_disabled():
@@ -820,7 +806,7 @@ def test_ffn_runner_skips_eplb_prepare_when_eplb_is_disabled():
 
     runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([4, 6])})
 
-    assert runner.eplb.prepared_forwards == []
+    assert runner.eplb_lifecycle.backend.prepared_forwards == []
 
 
 def test_ffn_runner_rejects_multistage_eplb_payload():
@@ -850,8 +836,8 @@ def test_ffn_runner_capture_prepared_and_steps_eplb_as_dummy(monkeypatch):
     cuda_graph_size = runner.capture_model(dp_metadata_list={0: _FakeDPMetadata([2])})
 
     assert cuda_graph_size == 10
-    assert runner.eplb.steps == [(True, False)]
-    assert runner.eplb.prepared_forwards == [(runner.model_config, 2)]
+    assert runner.eplb_lifecycle.backend.steps == [(True, False)]
+    assert runner.eplb_lifecycle.backend.prepared_forwards == [2]
 
 
 class _FakeEplbModelState:
@@ -891,7 +877,14 @@ def _runner_for_placement_logging(state, *, log_placement: bool):
     runner = _runner_with_connector_and_model(_FakeModel())
     # The runner's EPLB seam needs only the state and its step; two FFN EP
     # ranks split the four-slot placement.
-    runner.eplb = SimpleNamespace(state=state, step=state.step)
+    backend = _FakeEplbBackend()
+    backend.state = state
+    backend.step = state.step
+    runner.eplb_lifecycle = FFNEplbLifecycle(
+        runner.vllm_config,
+        runner.afd_config,
+        backend,
+    )
     runner.vllm_config.parallel_config.data_parallel_size = 2
     runner.vllm_config.parallel_config.eplb_config = SimpleNamespace(
         log_balancedness=log_placement,
