@@ -26,7 +26,9 @@ All fourteen cases must pass with zero skips in a four-GPU allocation. The four
 deadline cases use disposable processes because a device timeout deliberately
 traps the CUDA context. They cover mapped and native NVSHMEM waits, both eager
 and graph replay. With two GPUs, only the three/four-GPU transport cases skip.
-The transport cases use real CUDA transport and an affine expert oracle.
+The transport cases use real CUDA transport and
+an affine expert oracle; model kernels and accuracy are covered separately in
+the [single-node validation record](../../docs/design/async_gpu_cross_node_research.md).
 Startup checks hide the optional bridge without changing the installed files:
 local peers still replay graphs, while an injected unmapped peer on one rank
 forces every rank to free/finalize NVSHMEM before rejecting the configuration.
@@ -47,7 +49,9 @@ The default 2A2F run uses two GPUs per node. For hybrid local/remote graph
 replay add `--interleave-roles`. Other 2A2F cases use `--mode independent`,
 `varying` or `cross_rank_precision`. To exercise 1A1F, pass
 `--attention-ranks 1 --ffn-ranks 1` with `--mode eager`, `graph` or
-`precision`. Each case prints `passed` once per rank. These are correctness tests, not benchmarks.
+`precision`. Each case prints `passed` once per rank. See the
+[two-node record](../../docs/design/async_gpu_cross_node_research.md#4-本轮硬件证据)
+for the tested runtime and limits. These are correctness tests, not benchmarks.
 
 ## DeepEP M2N requirements
 

@@ -45,7 +45,10 @@ from vllm.v1.worker.workspace import (  # noqa: E402
     reset_workspace_manager,
 )
 
-from afd_plugin.config import DEEPEP_M2N_CONNECTOR  # noqa: E402
+from afd_plugin.config import (  # noqa: E402
+    AFD_ASYNC_GPU_CONNECTOR,
+    DEEPEP_M2N_CONNECTOR,
+)
 from afd_plugin.connectors import AFDForwardContextMetadata  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
 from afd_plugin.model_executor.models import qwen3_moe as qwen3_adapter  # noqa: E402
@@ -138,6 +141,7 @@ class _LoopbackFFN:
         self.vllm_config = vllm_config
         self.internal_router_moe = internal_router_moe
         self.external_router_moe = external_router_moe
+        self.remote_shared = False
         self.expected_payload: set[str] = set()
         self.output: torch.Tensor | None = None
 
@@ -155,6 +159,9 @@ class _LoopbackFFN:
                     topk_ids=payload["topk_ids"],
                 )
                 assert isinstance(output, torch.Tensor)
+                if self.remote_shared:
+                    shared = self.external_router_moe.shared_experts(hidden_states)
+                    output = output + shared
                 self.output = output.clone()
             elif payload:
                 self.output = self.external_router_moe.experts(
@@ -219,6 +226,7 @@ def _check_attention_moe_parity(
         (2, "P2pNcclAFDConnector", False, set()),
         (3, "P2pNcclAFDConnector", True, {"router_logits"}),
         (4, DEEPEP_M2N_CONNECTOR, True, {"topk_ids", "topk_weights"}),
+        (5, AFD_ASYNC_GPU_CONNECTOR, True, {"topk_ids", "topk_weights"}),
     ):
         vllm_config.additional_config["afd"] = {
             "role": "attention",
@@ -234,14 +242,38 @@ def _check_attention_moe_parity(
                 vllm_config=vllm_config,
                 prefix=f"model.layers.{layer_idx}.mlp",
                 compute_gate_on_attention=gate_on_attention,
-                sends_routes=connector == DEEPEP_M2N_CONNECTOR,
+                connector=connector,
             ),
             vllm_config,
         )
         loopback.expected_payload = payload
+        loopback.remote_shared = connector == AFD_ASYNC_GPU_CONNECTOR
+        native_oracle: Callable[[torch.Tensor], torch.Tensor] = internal_router_moe
+        if loopback.remote_shared:
+            native_oracle = partial(
+                _async_gpu_native_output,
+                internal_router_moe,
+                float(hf_config.routed_scaling_factor),
+            )
         _assert_matches_native(
-            attention_moe, internal_router_moe, attention_context, vllm_config
+            attention_moe, native_oracle, attention_context, vllm_config
         )
+
+
+def _async_gpu_native_output(
+    moe: nn.Module,
+    routed_scaling_factor: float,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    logits, _ = moe.gate(hidden_states)
+    weights, ids = moe.experts.router.select_experts(hidden_states, logits)
+    routed = moe.experts.routed_experts.forward_modular(
+        x=hidden_states,
+        topk_weights=weights * routed_scaling_factor,
+        topk_ids=ids,
+    )
+    assert isinstance(routed, torch.Tensor)
+    return routed + moe.shared_experts(hidden_states)
 
 
 def _check_qwen3_attention_moe_parity(vllm_config: VllmConfig) -> None:
@@ -303,7 +335,7 @@ def _attention_context(
 
 def _assert_matches_native(
     attention_moe: nn.Module,
-    native_moe: nn.Module,
+    native_moe: Callable[[torch.Tensor], torch.Tensor],
     attention_context: ForwardContext,
     vllm_config: VllmConfig,
 ) -> None:

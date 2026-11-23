@@ -22,8 +22,9 @@ BASELINE_ROLE = "baseline"
 ROLE_KINDS = (ATTENTION_ROLE, FFN_ROLE)
 
 ASYNC_AFD_CONNECTOR = "CAMAsyncAFDConnector"
+GPU_ASYNC_AFD_CONNECTOR = "GpuAsyncAFDConnector"
 # docs/gpu/NCCL_P2P_CONNECTOR_USER_GUIDE.md:88 - the synchronous connectors
-# rendezvous at the first FFN rank. The async CAM connector rendezvous at the
+# rendezvous at the first FFN rank. Async CAM/GPU connectors rendezvous at the
 # Attention side instead (tools/itask/launch_dsv4_afd_cross_node.sh). DeepEP M2N
 # puts FFN ranks first, so its world rank 0 (the gloo store) is the first FFN rank.
 RENDEZVOUS_ROLE_BY_CONNECTOR = {
@@ -31,6 +32,7 @@ RENDEZVOUS_ROLE_BY_CONNECTOR = {
     "DeepEPM2NAFDConnector": FFN_ROLE,
     "CAMP2pAFDConnector": FFN_ROLE,
     ASYNC_AFD_CONNECTOR: ATTENTION_ROLE,
+    GPU_ASYNC_AFD_CONNECTOR: ATTENTION_ROLE,
 }
 
 # Fixed and distinct per role so a pod holding both roles cannot collide.

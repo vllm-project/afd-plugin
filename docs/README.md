@@ -25,6 +25,7 @@
 - [Model serving and accuracy E2E](../tests/e2e/README.md), including
   [multi-pod deployments](../tests/e2e/multi_pod/README.md)
 - [GPU connector tests](../tests/gpu/README.md)
+- [Async GPU single-node and cross-node validation](design/async_gpu_cross_node_research.md)
 - [NPU runtime and operator tests](../tests/npu/README.md)
 - [NPU troubleshooting](npu/TROUBLESHOOTING.md)
 - Historical measurement: [Layered W13/W2 graph validation](reports/layered_w2_mdl_validation.md)

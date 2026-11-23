@@ -51,7 +51,9 @@ is unsupported.
 Set `NVSHMEM_REMOTE_TRANSPORT=ibrc` for the initial RoCE/RDMA qualification.
 `NVSHMEM_SYMMETRIC_SIZE` must cover receive slots **and** outboxes; use the
 connector's logged allocation size to select it. NIC selection and any IBGDA
-configuration remain deployment-specific.
+configuration remain deployment-specific. See the
+[GPU tests](../../tests/gpu/README.md) and
+[validation record](../../docs/design/async_gpu_cross_node_research.md).
 
 Both native kernels that call `nvshmem_uint64_test` (reply wait and arrival
 poll) use `nvshmemx_collective_launch`. In the pinned release this API checks
