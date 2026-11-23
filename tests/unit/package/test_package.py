@@ -14,6 +14,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 import afd_plugin
+from afd_plugin.compat import vllm as compat
 
 
 def test_models_metadata_compat_export(monkeypatch):
@@ -56,7 +57,6 @@ def registration(monkeypatch, request):
         "vllm.model_executor.models": {
             "ModelRegistry": SimpleNamespace(register_model=register_model)
         },
-        "afd_plugin.compat.vllm": {"assert_vllm_version_supported": lambda **kw: None},
         "afd_plugin.model_executor.routing_simulator": {
             "register_afd_balanced_routing_strategy": lambda: None
         },
@@ -76,6 +76,8 @@ def registration(monkeypatch, request):
         module = ModuleType(name)
         vars(module).update(attributes)
         monkeypatch.setitem(sys.modules, name, module)
+    installed_version = "0.32.0" if request.param == "npu" else "0.34.0"
+    monkeypatch.setattr(compat, "get_installed_vllm_version", lambda: installed_version)
     find_spec = importlib.util.find_spec
     monkeypatch.setattr(
         importlib.util,
@@ -132,6 +134,12 @@ def test_register_afd_preserves_native_models_and_is_idempotent(registration):
     # ModelRegistry is the external registration seam; compare requests without
     # requiring the implementation's iteration order.
     assert sorted(registration.sent) == sorted(expected.items())
+
+
+def test_register_afd_accepts_active_backend_pin(registration, recwarn):
+    registration.plugin.register_afd()
+
+    assert not recwarn.list
 
 
 def test_entry_point_is_registered():

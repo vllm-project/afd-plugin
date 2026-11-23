@@ -406,16 +406,6 @@ def test_mrv2_validator_accepts_supported_deployment(
         pytest.param(
             "gpu",
             "attention",
-            V1_RUNNER,
-            "AFD GPU requires ModelRunnerV2",
-            id="gpu-v1-attention",
-        ),
-        pytest.param(
-            "gpu", "ffn", V1_RUNNER, "AFD GPU requires ModelRunnerV2", id="gpu-v1-ffn"
-        ),
-        pytest.param(
-            "gpu",
-            "attention",
             {"parallel_config.num_ubatches": 1},
             "exactly two microbatches",
             id="gpu-one-ubatch",

@@ -110,6 +110,9 @@ def validate_async_cam_attention_graph(vllm_config: VllmConfig) -> None:
     """Validate AFD dependencies for native Async CAM Attention graphs."""
     model = vllm_config.model_config
     parallel = vllm_config.parallel_config
+    # 0.32 exposes use_v2_model_runner. Drop the field check after RFC #613
+    # verifies native 0.34 MRV1 rejection and Ascend DeepSeek-V4 Async CAM graphs.
+    # See https://github.com/vllm-project/afd-plugin/issues/613.
     if (
         not vllm_config.use_v2_model_runner
         or model.hf_text_config.model_type != "deepseek_v4"
@@ -137,10 +140,11 @@ def validate_gpu_model_runner_v2_config(
     For the FFN role they validate only the paired deployment and the
     ``Worker.init_device`` construction seam; ``GPUFFNModelRunner`` remains
     connector-driven and does not implement native ModelRunnerV2 execution.
-    """
 
-    if not vllm_config.use_v2_model_runner:
-        raise RuntimeError("AFD GPU requires ModelRunnerV2")
+    Model Runner V1 no longer needs a check here: vLLM 0.34 removed it, and its
+    ``EngineArgs.create_engine_config`` rejects a leftover
+    ``VLLM_USE_V2_MODEL_RUNNER`` that is not ``1`` before either AFD entry runs.
+    """
 
     afd_config = parse_afd_config(vllm_config, expected_role=expected_role)
     if device_type != "cuda" or afd_config.connector not in GPU_MRV2_CONNECTORS:
@@ -214,6 +218,8 @@ def validate_npu_model_runner_v2_config(
 ) -> None:
     """Validate the supported Ascend NPU ModelRunnerV2 deployment."""
 
+    # Keep the 0.32 runner-selection check until #613 verifies native 0.34
+    # rejects MRV1 at both Ascend AFD startup entry points.
     if not vllm_config.use_v2_model_runner:
         raise RuntimeError("AFD NPU requires ModelRunnerV2")
     afd_config = parse_afd_config(vllm_config, expected_role=expected_role)

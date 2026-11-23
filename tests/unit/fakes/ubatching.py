@@ -84,9 +84,11 @@ class PreparedUBatchRunner:
         input_batch,
         block_tables,
         slot_mappings,
-        cg_mode,
+        batch_desc,
+        dp_sync_state=None,
         for_capture=False,
     ):
+        cg_mode = batch_desc.cg_mode
         slices = create_ubatch_slices(input_batch, self.num_ubatches)
         contexts = []
         for stage, ubatch_slice in enumerate(slices):

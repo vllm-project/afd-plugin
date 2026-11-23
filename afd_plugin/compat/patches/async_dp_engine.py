@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Patches for AFD async-DP engine scheduling.
+"""Ascend patches for AFD async-DP engine scheduling.
 
 This module patches:
 1. ``vllm.v1.engine.core.EngineCoreProc.run_engine_core``
@@ -426,8 +426,10 @@ async def add_request_async(
     chosen_engine = self.get_core_engine_for_request(request)
     to_await = self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)
     # ### PATCH START: AFD async-DP request wakeup
-    # Async-DP engines step independently, so skip the coordinator FIRST_REQ
-    # wakeup while preserving normal routing.
+    # The 0.32 client sends FIRST_REQ for idle MoE DP waves. Async CAM skips it.
+    # Retire this client override after RFC #613 validates 0.34 engine-side wave
+    # wakeup and independent Async CAM request admission on Ascend.
+    # See https://github.com/vllm-project/afd-plugin/issues/613.
     if not self.engines_running and not is_afd_async_dp(self.vllm_config):
         req_msg = core_client_module.msgspec.msgpack.encode(
             ("FIRST_REQ", chosen_engine),
@@ -461,12 +463,16 @@ def apply_async_dp_engine_patch() -> bool:
     AFD async Attention, so non-AFD and FFN Ascend scheduling remain untouched.
     """
 
-    if not _is_target_vllm_compatible():
+    if not _is_target_vllm_compatible("npu"):
         return False
 
+    # These 0.32 launch bindings select the AFD Async CAM child-process target
+    # and keep a stats-only coordinator. Replace the copies once #613 validates
+    # the 0.34 process target and coordinator launch after Ascend platform setup.
     EngineCoreProc.run_engine_core = staticmethod(run_engine_core)
     engine_utils_module.launch_core_engines = launch_core_engines
     core_client_module.launch_core_engines = launch_core_engines
+    # The separate client binding below controls request-time wakeups.
     DPAsyncMPClient.add_request_async = add_request_async
     engine_core_module.logger.debug("AFD async-DP engine patch applied")
     return True

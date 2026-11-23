@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections import deque
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -167,6 +167,11 @@ def test_native_weight_update_finishes_without_ffn_lora_state(monkeypatch):
     worker.vllm_config = SimpleNamespace()
     worker._weight_update_active = True
     worker._weight_update_is_draft = False
+    # vLLM 0.34 lends KV cache space to a weight update through an ExitStack
+    # created in the native __init__; finish_weight_update closes it.
+    worker._weight_update_kv_cache_loan = ExitStack()
+    # The native session bookkeeping the same __init__ owns.
+    worker._incomplete_weight_updates = set()
     worker.weight_transfer_engine = SimpleNamespace(
         finish_weight_update=lambda: events.append("finish"),
         reset_weight_update_target=lambda: events.append("reset_target"),
