@@ -73,6 +73,15 @@ _CAMP2P_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
     },
 )
 
+# Timeout of the Gloo p2p control group. It bounds the blocking dp-metadata
+# recv in the FFN worker loop: while Attention is idle it runs no engine step
+# and sends no metadata, so an idle FFN rank's recv raises after exactly this
+# duration and the FFN exits. Increase this (or keep at least one request per
+# interval flowing through Attention) to let an idle AFD pair survive. A
+# larger value equally delays how fast the FFN notices that Attention hung
+# (a dead Attention is detected immediately via TCP reset, not via timeout).
+_P2P_GROUP_TIMEOUT = timedelta(days=7)
+
 
 @dataclass(frozen=True)
 class CAMP2PExtraInfo(ConnectorExtraInfo):
@@ -529,6 +538,8 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 world_size=self.ffn_size + self.attn_size,
                 rank=self.world_rank,
                 group_name=group_name,
+                # Bounds HCCL rendezvous and collectives only; the idle FFN
+                # receive path is governed by _P2P_GROUP_TIMEOUT instead.
                 timeout=timedelta(minutes=30),
                 pg_options=create_hccl_process_group_options(
                     self.hccl_buffer_size_mb,
@@ -553,6 +564,8 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 world_size=self.ffn_size,
                 rank=self.world_rank,
                 group_name="afd_moe",
+                # Bounds HCCL rendezvous and collectives only; the idle FFN
+                # receive path is governed by _P2P_GROUP_TIMEOUT instead.
                 timeout=timedelta(minutes=30),
                 pg_options=create_hccl_process_group_options(
                     self.hccl_buffer_size_mb,
@@ -570,7 +583,9 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 world_size=self.topology.p2p_world_size,
                 rank=self.p2p_rank,
                 group_name="p2p",
-                timeout=timedelta(minutes=30),
+                # Idle Attention sends no dp metadata; an idle FFN dies after
+                # this timeout. See _P2P_GROUP_TIMEOUT above.
+                timeout=_P2P_GROUP_TIMEOUT,
             )
 
         self._initialized = True
@@ -970,6 +985,12 @@ class CAMP2pAFDControlPlane(AFDControlPlane):
         return replace(payload, dp_metadata_list=physical_metadata)
 
     def recv_dp_metadata_list(self) -> AFDControlPayload:
+        """Receive one control payload from a mapped Attention rank.
+
+        Blocks until the mapped Attention rank runs its next engine step. An
+        idle Attention sends nothing, so this raises a gloo timeout after
+        ``_P2P_GROUP_TIMEOUT`` and the FFN worker loop exits.
+        """
         connector = self.connector
         if connector.p2p_pg is None:
             raise RuntimeError("CAMP2P metadata process group is not initialized")

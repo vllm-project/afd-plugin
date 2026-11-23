@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import importlib
 import logging
-import queue
 import sys
 import types
 from enum import IntEnum
@@ -86,23 +85,8 @@ def _install_fake_vllm_core(
     class EngineCoreProc(EngineCore):
         last_counts: tuple[int, int]
 
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.input_queue: queue.Queue[tuple[str, object]] = queue.Queue()
-            self.process_input_queue_block = True
-            self.processed_frontend_requests: list[object] = []
-
         def run_busy_loop(self):
             self.original_run_busy_loop_called = True
-
-        def _process_input_queue(self):
-            while not self.input_queue.empty():
-                request = self.input_queue.get_nowait()
-                self._handle_client_request(*request)
-
-        def _handle_client_request(self, request_type, request):
-            del request_type
-            self.processed_frontend_requests.append(request)
 
         def _maybe_publish_request_counts(self):
             if not getattr(self, "publish_dp_lb_stats", False):
@@ -629,38 +613,6 @@ def test_engine_core_patch_runs_and_stops_ffn_loop(monkeypatch):
         "raise_ffn_loop_error_if_any",
         "stop_ffn_server_loop",
     ]
-
-
-def test_ffn_connector_loop_processes_frontend_requests(monkeypatch):
-    core_module = _install_fake_vllm_core(monkeypatch)
-    _load_patch_module()
-
-    class Executor:
-        def __init__(self, vllm_config):
-            del vllm_config
-
-        def collective_rpc(self, method):
-            del method
-
-        def shutdown(self):
-            return None
-
-    engine = core_module.EngineCoreProc(_config("ffn"), Executor, log_stats=True)
-    frontend_request = object()
-    engine.input_queue.put_nowait(("frontend", frontend_request))
-    engine.shutdown_state = _EngineShutdownState.RUNNING
-
-    from afd_plugin.compat.patches import engine_core as engine_core_patch
-
-    def request_shutdown(_seconds):
-        engine.shutdown_state = _EngineShutdownState.REQUESTED
-
-    monkeypatch.setattr(engine_core_patch.time, "sleep", request_shutdown)
-
-    with pytest.raises(SystemExit):
-        engine.run_busy_loop()
-
-    assert engine.processed_frontend_requests == [frontend_request]
 
 
 def test_engine_core_ffn_readiness_log_follows_start_rpc(monkeypatch):

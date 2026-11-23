@@ -39,9 +39,6 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 
-_FFN_ENGINE_CORE_POLL_INTERVAL_SECONDS = 0.5
-
-
 # Upstream source: vLLM v0.32.0 (5df63a7203cdb9328d824a27b682e77c7b9928be),
 # vllm/v1/engine/core.py::EngineCore.__init__.
 # Patch reason: AFD FFN ranks run as connector daemons instead of normal
@@ -680,6 +677,23 @@ def _prepare_late_loaded_ffn_engine_core(
             scheduler_config.get_scheduler_cls = lambda: _AFDFFNNoopScheduler
 
 
+# Patch reason: the front-end blocks in AsyncLLM.from_vllm_config() awaiting
+# the `get_supported_tasks` utility RPC before it starts the HTTP server. The
+# normal busy loop is the only consumer of the input queue, so an FFN engine
+# whose busy loop is replaced by the connector loop never answers that RPC and
+# its business port is never bound (no /health for orchestrators).
+# Patch functionality: drain the input queue once per connector-loop tick and
+# dispatch each message through the same handler the normal busy loop uses.
+# Signature: standalone helper for _run_ffn_busy_loop; no upstream symbol.
+def _drain_frontend_requests(engine_core: Any) -> None:
+    while True:
+        try:
+            req = engine_core.input_queue.get_nowait()
+        except Exception:
+            return
+        engine_core._handle_client_request(*req)
+
+
 def _run_ffn_busy_loop(self, core_module: Any) -> None:
     started = False
     try:
@@ -690,18 +704,12 @@ def _run_ffn_busy_loop(self, core_module: Any) -> None:
         core_module.logger.info(
             "AFD FFN EngineCore started; workers run connector loop."
         )
-        # ### PATCH START: AFD FFN frontend request polling
-        # The FFN connector loop bypasses the upstream request-scheduling loop.
-        # Keep control-plane requests from blocking the frontend by draining the
-        # native input queue non-blockingly on each connector-loop iteration.
-        self.process_input_queue_block = False
-        # ### PATCH END: AFD FFN frontend request polling
         while _is_running(self, core_module):
-            # ### PATCH START: AFD FFN frontend request polling
-            self._process_input_queue()
-            # ### PATCH END: AFD FFN frontend request polling
+            # ### PATCH START: AFD FFN frontend RPC drain
+            _drain_frontend_requests(self)
+            # ### PATCH END: AFD FFN frontend RPC drain
             self.model_executor.collective_rpc("raise_ffn_loop_error_if_any")
-            time.sleep(_FFN_ENGINE_CORE_POLL_INTERVAL_SECONDS)
+            time.sleep(0.5)
     except KeyboardInterrupt:
         core_module.logger.info(
             "AFD FFN EngineCore shutting down after KeyboardInterrupt"
