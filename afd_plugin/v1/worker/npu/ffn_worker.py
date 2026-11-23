@@ -110,8 +110,11 @@ class AFDNPUFFNWorker(NPUWorker):
         # FLA registration needs the selected device, before Runner construction.
         register_ascend_fla_customop()
         if afd_config.connector == AFD_ASYNC_CONNECTOR:
-            if get_ascend_device_type() != AscendDeviceType.A3:
-                raise ValueError("layered GMM requires Ascend 910C/A3")
+            if get_ascend_device_type() not in (
+                AscendDeviceType.A3,
+                AscendDeviceType.A5,
+            ):
+                raise ValueError("Async CAM requires Ascend 910C/A3 or 950/A5")
             ensure_cam_async_ops_available()
         init_workspace_manager(
             self.device,

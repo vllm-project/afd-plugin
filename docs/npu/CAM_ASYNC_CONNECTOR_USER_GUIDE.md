@@ -10,6 +10,12 @@ Use the pinned dependency pair in the
 Current runtime constraints and validation evidence are summarized in the
 [runtime matrix](../support.md#tested-runtime-matrix).
 
+The [eight-die DeepSeek-V4-Flash case](../../tests/e2e/README.md#dsv4-flash-compact-async-cam-on-ascend-950-local-8-npus)
+targets compact Push/MTE on Ascend 950. It selects BF16 dispatch
+(`dynamicQuant=0`) and W4A8MXFP experts, with eager ModelRunnerV2 on both
+roles, no DBO, and a 2048 MiB HCCL domain. The case guide includes the role
+layout, checkpoint and network settings, answer oracle and validation status.
+
 > [!WARNING]
 > CAM async is experimental. V4 true DBO boundary qualification and performance
 > remain unverified. The [0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507)
@@ -39,11 +45,13 @@ the existing constraints. The target Attention graph profile is described below.
 
 ## ModelRunnerV2 deployment
 
-Set `VLLM_USE_V2_MODEL_RUNNER=1` and `VLLM_PLUGINS=ascend,afd` on both roles.
+Set `VLLM_USE_V2_MODEL_RUNNER=1` and `VLLM_PLUGINS=ascend,ascend_model,afd` on both roles.
+`ascend_model` registers native DeepSeek-V4 for the initial checkpoint inspection.
+`afd` registers the role-specific AFD model.
 Attention uses native Ascend ModelRunnerV2; FFN uses the independent
 `AsyncNPUFFNModelRunner`. Neither role selects or falls back to MRV1. Use the pinned vLLM/vLLM-Ascend pair in the installation instructions.
 
-The V2 Async CAM contract is:
+The 910C/A3 ModelRunnerV2 Async CAM contract is:
 
 - DeepSeek-V4 with homogeneous W4A8 or W8A8 routed experts on Ascend 910C/A3;
 - eager Attention or the target graph profile below, and `--enable-expert-parallel` on both roles, with
@@ -213,7 +221,7 @@ Enable native DBO through Attention CLI flags, not connector extra config.
 
 | Field | Type | Default | Meaning and constraint |
 | --- | --- | --- | --- |
-| `dynamicQuant` | `int` | `0` | Set to `1`: FFN receives dynamically quantized routed activations and scale tensors. The default `0` is not supported by the layered FFN path. |
+| `dynamicQuant` | `int` | `0` | The A3 layered FFN uses `1` for quantized activations and scale tensors; the 950 eager W4A8MXFP case uses `0` for BF16 transport and expert-side block quantization. |
 | `ffn_mega_moe` | `bool` | `false` | Selects Mega FFN with Pull transport; requires `dynamicQuant=1` and the same setting on all A/F ranks. See the [Pull execution session](../design/npu/async_ffn_runtime.md#opt-in-pull-execution-session). |
 | `attn_ranks_per_dp` | `int` | `1` | Positive Attention TP rank count per DP replica. It is the CAM Attention grouping width and is independent of the FFN process's local TP size. |
 | `hccl_buffer_size` | `int` | unset | Positive CAM HCCL buffer size in MB. The override applies only to the `afd_async_cam` communication domain. When unset, HCCL uses `HCCL_BUFFSIZE`, then its built-in default. Configure the same value on every Attention and FFN rank in the domain. |

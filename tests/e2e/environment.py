@@ -15,6 +15,14 @@ from tests.e2e.case import (
 )
 
 
+def vllm_plugin_allowlist(backend: str, *, baseline: bool) -> str:
+    """Load native model registrations before vLLM inspects the checkpoint."""
+    plugins = ["ascend", "ascend_model"] if backend == "npu" else []
+    if not baseline:
+        plugins.append("afd")
+    return ",".join(plugins)
+
+
 def add_case_environment_arguments(
     parser: argparse.ArgumentParser,
     case_ids: tuple[str, ...],

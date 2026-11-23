@@ -27,8 +27,16 @@ def test_models_metadata_compat_export(monkeypatch):
     assert models.get_afd_metadata_from_forward_context is metadata_reader
 
 
-@pytest.fixture(params=["cuda", "npu"])
+@pytest.fixture(
+    params=[
+        pytest.param(("cuda", False), id="cuda-without-torch-npu"),
+        pytest.param(("cuda", True), id="cuda-with-torch-npu"),
+        pytest.param(("npu", False), id="npu-without-torch-npu"),
+        pytest.param(("npu", True), id="npu-with-torch-npu"),
+    ],
+)
 def registration(monkeypatch, request):
+    device, has_torch_npu = request.param
     native = {
         name: object()
         for name in (
@@ -49,9 +57,7 @@ def registration(monkeypatch, request):
         str, dict[str, ModuleSpec | list[str] | SimpleNamespace | Callable[..., None]]
     ] = {
         "vllm": {"__spec__": ModuleSpec("vllm", loader=None), "__path__": []},
-        "vllm.platforms": {
-            "current_platform": SimpleNamespace(device_type=request.param)
-        },
+        "vllm.platforms": {"current_platform": SimpleNamespace(device_type=device)},
         "vllm.model_executor": {"__path__": []},
         "vllm.model_executor.models": {
             "ModelRegistry": SimpleNamespace(register_model=register_model)
@@ -76,16 +82,11 @@ def registration(monkeypatch, request):
         module = ModuleType(name)
         vars(module).update(attributes)
         monkeypatch.setitem(sys.modules, name, module)
-    find_spec = importlib.util.find_spec
-    monkeypatch.setattr(
-        importlib.util,
-        "find_spec",
-        lambda name, *args, **kw: (
-            (ModuleSpec(name, loader=None) if request.param == "npu" else None)
-            if name == "torch_npu"
-            else find_spec(name, *args, **kw)
-        ),
-    )
+    torch_npu = None
+    if has_torch_npu:
+        torch_npu = ModuleType("torch_npu")
+        torch_npu.__spec__ = ModuleSpec("torch_npu", loader=None)
+    monkeypatch.setitem(sys.modules, "torch_npu", torch_npu)
     monkeypatch.delenv("AFD_FORCE_SPAWN_MULTIPROCESSING", raising=False)
     # A fresh module isolates registration state from test order without
     # asserting or changing the real package's private registration flag.
@@ -96,7 +97,7 @@ def registration(monkeypatch, request):
     plugin = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(plugin)
     return SimpleNamespace(
-        plugin=plugin, models=models, native=native, sent=sent, device=request.param
+        plugin=plugin, models=models, native=native, sent=sent, device=device
     )
 
 

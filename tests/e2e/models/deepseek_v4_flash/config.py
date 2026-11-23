@@ -15,6 +15,7 @@ from typing import NamedTuple
 
 DSV4_ASYNC_CAM_SCENARIO = "afd-dsv4-flash-async-cam-dp2tp4-ep8"
 DSV4_ASYNC_CAM_MEGA_SCENARIO = "afd-dsv4-flash-async-cam-pull-mega-dp2tp4-ep8"
+DSV4_ASYNC_CAM_A5_SCENARIO = "afd-dsv4-flash-async-cam-dp2tp2-ep4"
 DSV4_SYNC_CAMP2P_A5_SCENARIO = "afd-dsv4-flash-sync-camp2p-2a2f"
 DSV4_SYNC_CAMP2P_A3_SCENARIO = "afd-dsv4-flash-sync-camp2p-8a8f"
 DSV4_SYNC_CAMP2P_SCENARIOS = (
@@ -28,9 +29,8 @@ DSV4_ATTENTION_TP_SIZE = 4
 
 
 DSV4_SYNC_CAMP2P_CONNECTOR = "CAMP2pAFDConnector"
-# CAMP2P sizes its AFD HCCL domains through this override; the A5 and A3 runs
-# used 2048 MB. quant_mode stays 0, the only mode the runtime accepts today.
-DSV4_SYNC_HCCL_BUFFER_SIZE_MB = 2048
+# Recorded size of the CAMP2P and A5 compact CAM HCCL domains, in MiB.
+DSV4_HCCL_BUFFER_SIZE_MB = 2048
 DSV4_SYNC_QUANT_MODE = 0
 DSV4_ASCEND_QUANTIZATION = "ascend"
 # Context, batch, and memory budget. The asynchronous case keeps the 16-die
@@ -69,8 +69,41 @@ DSV4_SYNC_LOCAL_AFD_HOST = "127.0.0.1"
 # The A3 profile sizes its CAMP2P domains per domain instead of through the
 # caller's global HCCL_BUFFSIZE.
 DSV4_SYNC_CONNECTOR_EXTRA_CONFIG = {
-    "hccl_buffer_size": DSV4_SYNC_HCCL_BUFFER_SIZE_MB,
+    "hccl_buffer_size": DSV4_HCCL_BUFFER_SIZE_MB,
     "quant_mode": DSV4_SYNC_QUANT_MODE,
+}
+
+
+class DSV4AsyncShape(NamedTuple):
+    attention_ranks: int
+    ffn_ranks: int
+    attention_tp_size: int
+    dynamic_quant: int
+    indexer_kv_dtype: str
+    attention_dbo: bool
+    hccl_buffer_size: int | None = None
+
+
+DSV4_ASYNC_A3_SHAPE = DSV4AsyncShape(
+    DSV4_ATTENTION_RANKS,
+    DSV4_FFN_RANKS,
+    DSV4_ATTENTION_TP_SIZE,
+    dynamic_quant=1,
+    indexer_kv_dtype="int8",
+    attention_dbo=True,
+)
+DSV4_ASYNC_SHAPES = {
+    DSV4_ASYNC_CAM_SCENARIO: DSV4_ASYNC_A3_SHAPE,
+    DSV4_ASYNC_CAM_MEGA_SCENARIO: DSV4_ASYNC_A3_SHAPE,
+    DSV4_ASYNC_CAM_A5_SCENARIO: DSV4AsyncShape(
+        attention_ranks=4,
+        ffn_ranks=4,
+        attention_tp_size=2,
+        dynamic_quant=0,
+        indexer_kv_dtype="fp8",
+        attention_dbo=False,
+        hccl_buffer_size=DSV4_HCCL_BUFFER_SIZE_MB,
+    ),
 }
 
 
@@ -115,6 +148,7 @@ class DSV4SyncShape(NamedTuple):
     max_num_seqs: str | None = DSV4_MAX_NUM_SEQS
     memory_utilization: str | None = DSV4_MEMORY_UTILIZATION
     multithread_load: bool = True
+    indexer_kv_dtype: str = "int8"
     connector_extra_config: dict[str, int] | None = DSV4_SYNC_CONNECTOR_EXTRA_CONFIG
     quantization_from_checkpoint: bool = True
     # A profile whose host does not return reliable answers yet sets this false:
@@ -155,6 +189,7 @@ DSV4_SYNC_SHAPES = {
         multithread_load=False,
         connector_extra_config=None,
         quantization_from_checkpoint=False,
+        indexer_kv_dtype="fp8",
         verbatim_launch=True,
         # The script leaves prefix caching and the block size at vLLM's defaults.
         # Its ten concurrent chat requests share one template prefix, and that
@@ -255,6 +290,7 @@ def _configure_dsv4_arguments(
     verbatim_launch: bool = False,
     disable_prefix_caching: bool = False,
     block_size: str | None = None,
+    indexer_kv_dtype: str = "int8",
 ) -> None:
     """Apply the fixed model arguments shared by every DSV4 scenario.
 
@@ -319,7 +355,7 @@ def _configure_dsv4_arguments(
         ),
         *(["--quantization", quantization] if quantization is not None else []),
         "--attention_config.indexer_kv_dtype",
-        "int8",
+        indexer_kv_dtype,
         "--tokenizer-mode",
         "deepseek_v4",
         *(
@@ -348,22 +384,27 @@ def _configure_dsv4_arguments(
 
 
 def configure_scenario(args: argparse.Namespace) -> None:
-    """Configure the 16-NPU asynchronous CAM deployment."""
+    """Configure the compact CAM deployment for the scenario's target SoC."""
+    shape = DSV4_ASYNC_SHAPES[args.scenario]
     args.afd_connector = "CAMAsyncAFDConnector"
     args.afd_async = True
     args.compute_gate_on_attention = True
-    args.afd_connector_extra_config = [
-        json.dumps(
-            {
-                "dynamicQuant": 1,
-                "attn_ranks_per_dp": DSV4_ATTENTION_TP_SIZE,
-            }
-        )
-    ]
-    _configure_dsv4_arguments(args, DSV4_ASCEND_QUANTIZATION)
+    extra = {
+        "dynamicQuant": shape.dynamic_quant,
+        "attn_ranks_per_dp": shape.attention_tp_size,
+    }
+    if shape.hccl_buffer_size is not None:
+        extra["hccl_buffer_size"] = shape.hccl_buffer_size
+    args.afd_connector_extra_config = [json.dumps(extra)]
+    _configure_dsv4_arguments(
+        args, DSV4_ASCEND_QUANTIZATION, indexer_kv_dtype=shape.indexer_kv_dtype
+    )
+    if shape.dynamic_quant == 0:
+        # A5 sends BF16 rows. W4A8MXFP experts compute their own block scales.
+        args.common_vllm_arg.extend(["--dtype", "bfloat16"])
     args.ffn_vllm_arg = ["--all2all-backend", "flashinfer_all2allv"]
     args.attention_vllm_arg[:0] = [
-        "--enable-dbo",
+        *(["--enable-dbo"] if shape.attention_dbo else []),
         "--all2all-backend",
         "allgather_reducescatter",
     ]
@@ -402,6 +443,7 @@ def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
         verbatim_launch=shape.verbatim_launch,
         disable_prefix_caching=shape.disable_prefix_caching,
         block_size=shape.block_size,
+        indexer_kv_dtype=shape.indexer_kv_dtype,
     )
 
 

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import sys
 from contextlib import nullcontext
 from importlib import import_module
 from types import SimpleNamespace
@@ -41,6 +42,43 @@ def _admit(config):
         config, expected_role=config.additional_config["afd"]["role"], device_type="npu"
     )
     fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (None, None),
+        ("quant", "dynamicQuant=0"),
+        ("dtype", "BF16"),
+        ("target", "DeepseekV4ForCausalLM"),
+        ("ffn_tp", "F TP=1"),
+        ("graph", "eager execution"),
+        ("ubo", "without DBO or ubatching"),
+        ("spec", "without draft models"),
+    ],
+)
+def test_a5_bf16_eager_admission(monkeypatch, change, message):
+    torch = sys.modules["torch"]
+    monkeypatch.setattr(torch, "bfloat16", "bf16")
+    utils = sys.modules["vllm_ascend.utils"]
+    monkeypatch.setattr(utils, "AscendDeviceType", SimpleNamespace(A5="a5", A3="a3"))
+    monkeypatch.setattr(utils, "get_ascend_device_type", lambda: "a5")
+    config = _config_with(
+        role="ffn", extra_config={"dynamicQuant": int(change == "quant")}, **ASYNC_CAM
+    )
+    config.model_config.hf_config.architectures = [
+        "DeepseekV4ForCausalLM" if change != "target" else "DeepseekV41ForCausalLM"
+    ]
+    config.model_config.dtype = "fp16" if change == "dtype" else torch.bfloat16
+    config.model_config.enforce_eager = change != "graph"
+    config.parallel_config.use_ubatching = change == "ubo"
+    config.parallel_config.tensor_parallel_size = 2 if change == "ffn_tp" else 1
+    config.speculative_config = object() if change == "spec" else None
+    if message:
+        with pytest.raises(RuntimeError, match=message):
+            fail_if_unsupported_npu_afd_features(config)
+    else:
+        fail_if_unsupported_npu_afd_features(config)
 
 
 TWO_UBATCH_DBO = dict(

@@ -372,7 +372,12 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
                 self.max_num_batched_tokens,
             )
         )
-        signature = self._session.signature_prefix + signature
+        # BF16 Push receives a different payload/scale layout from INT8 Push.
+        # Even eager peers must agree before issuing any 950 transfers.
+        prefix = (
+            "bf16_push:" if self.dynamic_quant == 0 else self._session.signature_prefix
+        )
+        signature = prefix + signature
         self.graph_startup.initialize(store, signature)
         if self.graph_startup.mode == "full":
             try:
@@ -595,7 +600,9 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         )
         states.token_nums_rankid_layeridx = batch_info
         states.group_list = expert_token_nums
-        states.dynamic_scales = dynamic_scales
+        # The quant0 ABI returns a one-element placeholder. Native MXFP4
+        # experts derive their block scales from the received BF16 activations.
+        states.dynamic_scales = dynamic_scales if self.dynamic_quant else None
         return AFDA2FTransferPayload(
             hidden_states=hidden_states,
             context=context,

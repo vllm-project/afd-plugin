@@ -866,6 +866,15 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
     ) -> "tuple[list[QuantizedExpertWeights], str]":
         return _extract_quantized_expert_weights(self.model.layers)
 
+    def get_mxfp_expert_layers(self) -> dict[int, native.DeepseekV4MoE]:
+        """Return the native expert MLPs loaded by this FFN rank."""
+        return {
+            layer.layer_idx: layer.mlp
+            for layer in self.model.layers
+            if isinstance(layer, AFDDeepseekV4DecoderLayer)
+            and isinstance(layer.mlp, native.DeepseekV4MoE)
+        }
+
     def compute_ffn_output(
         self,
         hidden_states: torch.Tensor,

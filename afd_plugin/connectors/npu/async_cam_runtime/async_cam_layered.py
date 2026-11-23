@@ -8,12 +8,11 @@ from typing import cast
 
 import torch
 
+from afd_plugin.connectors.npu.async_cam_runtime import CAM_LAYER_INDEX
 from afd_plugin.model_executor.ffn.npu.expert_weights import (
     QuantizedExpertWeights,
     validate_expert_weights,
 )
-
-CAM_LAYER_INDEX = 2
 
 
 class AsyncCAMLayeredExecutor:

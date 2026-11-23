@@ -44,6 +44,10 @@ if TYPE_CHECKING:
     from vllm.tasks import SupportedTask
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
+    from afd_plugin.connectors.npu.async_cam_runtime.async_cam_mxfp import (
+        AsyncCAMMXFPExecutor,
+    )
+
 
 logger = init_logger(__name__)
 
@@ -74,6 +78,7 @@ class AsyncNPUFFNModelRunner:
         self.model_memory_usage = 0
         self.layer_ids: tuple[int, ...] = ()
         self._layered_executor: AsyncCAMLayeredExecutor | None = None
+        self._mxfp_executor: AsyncCAMMXFPExecutor | None = None
         self._mega_executor: AsyncCAMMegaExecutor | None = None
         self.session = self.connector.ffn_session()
         self._first_step = True
@@ -319,6 +324,25 @@ class AsyncNPUFFNModelRunner:
 
     def _initialize_ffn_executor(self) -> str:
         assert self.model is not None
+        if self.connector.dynamic_quant == 0:
+            from afd_plugin.connectors.npu.async_cam_runtime.async_cam_mxfp import (
+                AsyncCAMMXFPExecutor,
+            )
+            from afd_plugin.model_executor.models.npu.deepseek_v4 import (
+                AFDDeepseekV4ForCausalLM,
+            )
+
+            if not isinstance(self.model, AFDDeepseekV4ForCausalLM):
+                raise ValueError(
+                    "Ascend 950 Async CAM requires the DeepSeek-V4 FFN adapter"
+                )
+            layers_by_id = self.model.get_mxfp_expert_layers()
+            if tuple(sorted(layers_by_id)) != self.layer_ids:
+                raise ValueError("MXFP4 weights do not cover the remote MoE layer IDs")
+            self._mxfp_executor = AsyncCAMMXFPExecutor(
+                layers_by_id, self.connector.expert_per_rank
+            )
+            return self._mxfp_executor.signature
         layers, reason = self.model.get_quantized_expert_weights()
         if not layers:
             raise ValueError(f"layered GMM target weights are unsupported: {reason}")
@@ -406,7 +430,7 @@ class AsyncNPUFFNModelRunner:
     ) -> torch.Tensor:
         if self._mega_executor is not None:
             return self._mega_executor()
-        assert self._layered_executor is not None
+        assert self._layered_executor is not None or self._mxfp_executor is not None
         payload = self.connector.recv_attn_output()
         if retained_tensors is not None:
             # A partial capture may already reference the received device buffers.
@@ -414,14 +438,22 @@ class AsyncNPUFFNModelRunner:
         states = cast(AFDAsyncTransferState, payload.context.states)
         assert states.token_nums_rankid_layeridx is not None
         assert states.group_list is not None
-        assert states.dynamic_scales is not None
-        output = self._layered_executor(
-            payload.hidden_states,
-            states.dynamic_scales,
-            states.group_list,
-            states.token_nums_rankid_layeridx,
-            retained_tensors=retained_tensors,
-        )
+        if self._layered_executor is not None:
+            assert states.dynamic_scales is not None
+            output = self._layered_executor(
+                payload.hidden_states,
+                states.dynamic_scales,
+                states.group_list,
+                states.token_nums_rankid_layeridx,
+                retained_tensors=retained_tensors,
+            )
+        else:
+            assert self._mxfp_executor is not None
+            output = self._mxfp_executor(
+                payload.hidden_states,
+                states.group_list,
+                states.token_nums_rankid_layeridx,
+            )
         if retained_tensors is not None:
             self._graph_output = output
         self.connector.send_ffn_output(output, payload.context)
@@ -464,6 +496,7 @@ class AsyncNPUFFNModelRunner:
         self.connector.close()
         self._mega_executor = None
         self._layered_executor = None
+        self._mxfp_executor = None
         free_before_shutdown(self.vllm_config)
         self.model = None
         self.draft_model = None

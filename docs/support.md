@@ -30,6 +30,12 @@ qualify every model/topology combination on the current target.
 | Ascend V2 + `CAMP2pAFDConnector` | Eager, `FULL`, or `FULL_DECODE_ONLY` native V2 ACL Graph | Eager or graph native DBO with two ubatches and Attention DP > 1; plain MLA graph DBO requires `FULL_DECODE_ONLY` | `compute_gate_on_attention` may be `false`, or `true` for DeepSeek-V4 at TP=1 without DBO/ubatching; PP/CP, elastic EP and EPLB rejected; model-specific SP policy; role ranks equal DP x TP | Historical 0.30 V2-Lite 2A2F FULL 300-question comparison and 2A1F functional checks; current 0.32 Lite evidence is in the [validation record](https://github.com/vllm-project/afd-plugin/pull/507) |
 | Ascend V2 + `CAMAsyncAFDConnector` | Eager Attention; layered FFN eager or FULL | Two native DBO microbatches on Attention, including DP1 and with FFN FULL; FFN stays outside the native DBO schedule | Experimental DeepSeek-V4 W4A8/W8A8 on A3/910C; `async_dp=true`, `compute_gate_on_attention=true`, and `dynamicQuant=1`; PP/CP unsupported; plugin-owned async CAM ops required | Historical DSV4 layered comparisons and limitations are in the [validation record](https://github.com/vllm-project/afd-plugin/pull/507); they predate removal of the legacy path |
 
+The A5 compact `CAMAsyncAFDConnector` case targets DeepSeek-V4-Flash with
+Attention DP2/TP2, FFN EP4/TP1, eager execution on both roles, BF16
+transport and W4A8MXFP experts. Ten concurrent requests passed in four runs
+on the source branch's ModelRunnerV1 deployment. The ModelRunnerV2 port
+requires a fresh eight-device run. [Source results](https://github.com/GuangyuZhu04/afd-plugin/issues/5) · [MRV2 case](../tests/e2e/README.md#dsv4-flash-compact-async-cam-on-ascend-950-local-8-npus)
+
 The 300-question Ascend evidence in this table is historical. The 0.32
 [validation record](https://github.com/vllm-project/afd-plugin/pull/507) separately lists the
 eight Lite 100-question cells, W4A8 fixture, and observed shutdown failures.
