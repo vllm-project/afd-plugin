@@ -87,10 +87,11 @@ class _NativeUBatchRunner:
     stage_attn_groups: list[list[list[_DSAGroup]]]
     kv_cache_config: object
 
-    def prepare(self, batch, tables, slots, cg_mode, for_capture):
+    def prepare(self, batch, tables, slots, batch_desc, dp_sync_state, for_capture):
+        self.last_dp_sync_state = dp_sync_state
         return self.model_state.prepare_attn(
             batch,
-            cg_mode,
+            batch_desc.cg_mode,
             tables,
             slots,
             self.stage_attn_groups[0],
@@ -123,6 +124,7 @@ def runtime(monkeypatch):
         "vllm.v1.worker.gpu.cudagraph_utils": (
             "BatchExecutionDescriptor ModelCudaGraphManager"
         ),
+        "vllm.v1.worker.gpu.dp_utils": "DPSyncState",
         "vllm.v1.worker.gpu.input_batch": "InputBatch",
         "vllm.v1.worker.gpu.model_states.interface": "ModelState",
         "vllm.v1.worker.ubatch_utils": "UBatchSlices",
@@ -357,13 +359,16 @@ def test_prepare_restores_native_metadata_factory(
     batch = _batch(3, 5)
     table = torch.tensor([[11, 12], [13, 14]], dtype=torch.int32)
     slots = torch.arange(5)[None, :]
+    batch_desc = SimpleNamespace(cg_mode=_GraphMode.FULL)
+    dp_sync_state = object()
 
     if fail:
         with pytest.raises(RuntimeError, match="native preparation failed"):
-            runner.prepare(batch, (table,), slots, _GraphMode.FULL)
+            runner.prepare(batch, (table,), slots, batch_desc, dp_sync_state)
     else:
-        result = runner.prepare(batch, (table,), slots, _GraphMode.FULL)
+        result = runner.prepare(batch, (table,), slots, batch_desc, dp_sync_state)
         assert result["layer"].req_metadata.num_compressed_tokens == 3
+        assert runner.last_dp_sync_state is dp_sync_state
     if existing_override:
         assert runner.model_state.prepare_attn is original
     else:

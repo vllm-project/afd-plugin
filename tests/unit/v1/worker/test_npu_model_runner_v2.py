@@ -455,13 +455,10 @@ def test_camp2p_dispatch_pads_many_to_one_before_native_inputs(
         manager = SimpleNamespace(dispatch=dispatch, run_fullgraph=run_fullgraph)
         runner.cudagraph_manager = manager
     monkeypatch.setattr(npu_v2, "step_afd_npu_profiler", lambda _prof: None)
-    monkeypatch.setattr(
-        dp_utils, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
-    )
     monkeypatch.setattr(dp_utils, "should_skip_dp_coordination", lambda: False)
     reductions = []
 
-    def all_reduce(tensor, group):
+    def all_reduce(tensor):
         reductions.append(tensor)
         tensor[0] = torch.tensor(counts, dtype=torch.int32)
         tensor[1].fill_(
@@ -472,7 +469,9 @@ def test_camp2p_dispatch_pads_many_to_one_before_native_inputs(
         tensor[1][0] = CUDAGraphMode.NONE.value
         tensor[5].fill_(1)
 
-    monkeypatch.setattr(dp_utils.dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(
+        dp_utils, "get_dp_group", lambda: SimpleNamespace(cpu_all_reduce_=all_reduce)
+    )
     original_dispatch = native_v2.dispatch_cg_and_sync_dp
 
     def native_execute(self, *args, **kwargs):
@@ -731,15 +730,13 @@ def test_async_dbo_dispatch_preserves_thresholds_and_falls_back_locally(
     parallel = SimpleNamespace(
         use_ubatching=True,
         enable_dbo=True,
+        enable_fault_tolerance=False,
         num_ubatches=2,
         dbo_decode_token_threshold=threshold,
         dbo_prefill_token_threshold=threshold,
     )
     monkeypatch.setattr(
-        dp_utils, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
-    )
-    monkeypatch.setattr(
-        dp_utils.dist, "all_reduce", lambda *a, **k: pytest.fail("Async DP collective")
+        dp_utils, "get_dp_group", lambda: pytest.fail("Async DP collective")
     )
     native = native_v2.dispatch_cg_and_sync_dp
     with (

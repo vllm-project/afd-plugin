@@ -144,9 +144,9 @@ def _use_camp2p_dp_padding(attention_size: int, ffn_size: int) -> Iterator[None]
     # Patch reason: native execute calls this module-level function before input
     # preparation; no runner method exposes that boundary.
     # Patch functionality: apply CAMP2P group padding to the agreed eager batch.
-    # Signature: matches vLLM v0.32.0 dispatch_cg_and_sync_dp exactly.
+    # Signature: matches vLLM v0.34.0 dispatch_cg_and_sync_dp exactly.
     # Upstream source: vllm/v1/worker/gpu/dp_utils.py;
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
     # Delegation exception: preserve native graph selection and DP collectives.
     # Removal plan: replace when native dispatch exposes a padding callback.
     def dispatch_cg_and_sync_dp(
@@ -162,6 +162,7 @@ def _use_camp2p_dp_padding(attention_size: int, ffn_size: int) -> Iterator[None]
         parallel_config: ParallelConfig | None = None,
         allow_ubatching: bool = False,
         uniform_decode: bool = False,
+        allow_skip_drafts: bool = False,
         dp_sync_state: DPSyncState | None = None,
     ) -> tuple[v2_cudagraph_utils.BatchExecutionDescriptor, DPSyncState | None]:
         desc, sync = original_dispatch(
@@ -177,6 +178,7 @@ def _use_camp2p_dp_padding(attention_size: int, ffn_size: int) -> Iterator[None]
             parallel_config=parallel_config,
             allow_ubatching=allow_ubatching,
             uniform_decode=uniform_decode,
+            allow_skip_drafts=allow_skip_drafts,
             dp_sync_state=dp_sync_state,
         )
         # ### PATCH START: equal CAMP2P strides for eager and graph fallback.

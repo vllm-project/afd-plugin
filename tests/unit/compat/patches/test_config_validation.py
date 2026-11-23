@@ -26,7 +26,7 @@ from afd_plugin.validation import (
 
 def _install_fake_vllm_config(monkeypatch):
     vllm_module = types.ModuleType("vllm")
-    vllm_module.__dict__["__version__"] = "0.32.0"
+    vllm_module.__dict__["__version__"] = "0.34.0"
     config_package = types.ModuleType("vllm.config")
     config_module = types.ModuleType("vllm.config.vllm")
     engine_package = types.ModuleType("vllm.engine")
@@ -295,7 +295,7 @@ def _cuda_case(
 ):
     engine_args.setdefault("active", True)
     if version is None:
-        version = "0.32.0"
+        version = "0.34.0"
     return pytest.param(
         platform,
         version,
@@ -316,7 +316,7 @@ def _cuda_case(
         _cuda_case("afd-auto-ffn", role="ffn", worker=FFN_WORKER_FQCN),
         _cuda_case(
             "vllm-dev-checkout",
-            version="0.32.0.dev14230+g5df63a7",
+            version="0.34.0.dev14230+g62d4bc3c",
             worker=ATTENTION_WORKER_FQCN,
         ),
         _cuda_case(

@@ -44,8 +44,8 @@ from tests.unit.fakes.ubatching import (  # noqa: E402
     TEST_COMPUTE_SMS,
     TEST_PHYSICAL_SMS,
     AttentionMetadataState,
-    LegacyNPUAttentionMetadataState,
-    LegacyNPUUBatchRunner,
+    NPUAttentionMetadataState,
+    PreparedNPUUBatchRunner,
     PreparedUBatchRunner,
 )
 from tests.unit.fakes.vllm_config import mrv2_vllm_config  # noqa: E402
@@ -366,12 +366,13 @@ def test_mrv2_ubatch_capture_events_and_exception_restore(fail_control, dp_size)
     assert runner.ubatch_runner.prepare is native_prepare
 
 
-def test_v2_capture_accepts_pinned_ascend_prepare_signature(monkeypatch):
+def test_v2_capture_forwards_ascend_slot_mappings_buffer(monkeypatch):
     runner = _runner_for_metadata([])
     runner.device = SimpleNamespace(type="npu")
     desc = _capture_descriptor(1, TEST_CUDAGRAPH_CAPTURE_SIZE)
     tracker = v2_runner_module._AFDCaptureEventTracker([desc])
     expected_state = object()
+    slot_buffer = torch.empty((1, desc.num_tokens), dtype=torch.int64)
 
     def native_prepare(
         num_reqs,
@@ -384,14 +385,24 @@ def test_v2_capture_accepts_pinned_ascend_prepare_signature(monkeypatch):
         full_cudagraph,
         max_query_len=None,
         pcp_manager=None,
+        slot_mappings_buffer=None,
     ):
+        assert slot_mappings_buffer is slot_buffer
         return expected_state
 
     monkeypatch.setattr(cudagraph_utils, "prepare_inputs_to_capture", native_prepare)
     with v2_runner_module._use_afd_capture_input_preparation(runner, tracker):
         for _ in range(2):
             state = cudagraph_utils.prepare_inputs_to_capture(
-                desc.num_reqs, desc.num_tokens, None, None, None, [], None, True
+                desc.num_reqs,
+                desc.num_tokens,
+                None,
+                None,
+                None,
+                [],
+                None,
+                True,
+                slot_mappings_buffer=slot_buffer,
             )
             assert state is expected_state
     tracker.assert_complete()
@@ -1538,8 +1549,8 @@ def stage_input_runner(monkeypatch):
             ]
         )
         if device == "npu":
-            runner.model_state = LegacyNPUAttentionMetadataState()
-            runner.ubatch_runner = LegacyNPUUBatchRunner(
+            runner.model_state = NPUAttentionMetadataState()
+            runner.ubatch_runner = PreparedNPUUBatchRunner(
                 runner.model_state, runner.kv_cache_config
             )
         else:
@@ -1669,7 +1680,9 @@ def test_npu_v4_keeps_native_preparation_and_stage_inputs(stage_input_runner):
     runner = stage_input_runner(device="npu")
     batch, slots = _stage_test_inputs(runner, 0)
     with v2_runner_module._use_afd_ubatch_preparation(runner):
-        prepared = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+        prepared = runner.ubatch_runner.prepare(
+            batch, (), slots, _batch_desc(CUDAGraphMode.NONE)
+        )
     for stage, context in enumerate(prepared.forward_contexts):
         assert context.additional_kwargs["platform_stage"] == stage
         assert context.additional_kwargs["afd_metadata"].tokens_lens == [14]
@@ -1677,7 +1690,9 @@ def test_npu_v4_keeps_native_preparation_and_stage_inputs(stage_input_runner):
             context.attn_metadata["kv0"].positions.data_ptr()
             == batch.positions[prepared.slices[stage].token_slice].data_ptr()
         )
-    native = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    native = runner.ubatch_runner.prepare(
+        batch, (), slots, _batch_desc(CUDAGraphMode.NONE)
+    )
     assert [context.additional_kwargs for context in native.forward_contexts] == [
         {"platform_stage": 0},
         {"platform_stage": 1},
@@ -1725,9 +1740,9 @@ def npu_v4_ubatch_case():
     runner = _runner_for_metadata(events, data_parallel_size=2)
     runner.device = SimpleNamespace(type="npu")
     runner.vllm_config.model_config.hf_config.model_type = "deepseek_v4"
-    runner.model_state = LegacyNPUAttentionMetadataState()
+    runner.model_state = NPUAttentionMetadataState()
     runner.kv_cache_config = SimpleNamespace()
-    runner.ubatch_runner = LegacyNPUUBatchRunner(
+    runner.ubatch_runner = PreparedNPUUBatchRunner(
         runner.model_state, runner.kv_cache_config
     )
     input_buffers = InputBuffers(4, 8, torch.device("cpu"))
@@ -1747,7 +1762,9 @@ def test_npu_v4_ubatch_preparation_preserves_native_context_and_control(
         runner.connector.control_plane = None
 
     with v2_runner_module._use_afd_ubatch_preparation(runner):
-        prepared = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+        prepared = runner.ubatch_runner.prepare(
+            batch, (), slots, _batch_desc(CUDAGraphMode.NONE)
+        )
 
     for stage, context in enumerate(prepared.forward_contexts):
         metadata = context.additional_kwargs["afd_metadata"]
@@ -1773,7 +1790,9 @@ def test_npu_v4_ubatch_preparation_preserves_native_context_and_control(
             for m in payload.dp_metadata_list.values()
         ] == [[4, 4], [4, 4]]
 
-    native = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    native = runner.ubatch_runner.prepare(
+        batch, (), slots, _batch_desc(CUDAGraphMode.NONE)
+    )
     assert [context.additional_kwargs for context in native.forward_contexts] == [
         {"platform_stage": 0},
         {"platform_stage": 1},
@@ -1788,10 +1807,12 @@ def test_npu_v4_ubatch_prepare_error_restores_native_preparation(npu_v4_ubatch_c
         pytest.raises(ValueError, match="native preparation failed"),
         v2_runner_module._use_afd_ubatch_preparation(runner),
     ):
-        runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+        runner.ubatch_runner.prepare(batch, (), slots, _batch_desc(CUDAGraphMode.NONE))
     runner.model_state.prepare_error = None
 
-    native = runner.ubatch_runner.prepare(batch, (), slots, CUDAGraphMode.NONE)
+    native = runner.ubatch_runner.prepare(
+        batch, (), slots, _batch_desc(CUDAGraphMode.NONE)
+    )
     assert [context.additional_kwargs for context in native.forward_contexts] == [
         {"platform_stage": 0},
         {"platform_stage": 1},

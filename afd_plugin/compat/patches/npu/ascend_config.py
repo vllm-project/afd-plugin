@@ -38,7 +38,7 @@ _ASCEND_CONFIG_ALIAS_MODULES = (
 
 
 # Upstream: vllm_ascend/ascend_config.py at
-# bd42eea01d8312c4df469fabaed45f77a12df4d3.
+# 19c063b5471f90e158e163d27c2e0cc54af1700e.
 # Patch reason: strict AscendConfig construction rejects AFD's shared settings.
 # Patch functionality: exclude the AFD namespace from constructor kwargs,
 # preserving the source mapping, config identity and native singleton/cache.
@@ -167,7 +167,6 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         "enable_balance_scheduling",
         "recompute_scheduler_enable",
         "short_request_first_config",
-        "profiling_chunk_config",
         "batch_job_sched_config",
     }
     kwargs = {
@@ -201,6 +200,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     # the single legitimate entry point — bypassing the factory leaves derived
     # fields at their sentinel defaults.
     new_config.derive_and_validate(vllm_config)
+    new_config.quantized_all_reduce_config._validate_preconditions(vllm_config)
     # ### PATCH START: Async CAM shared weights
     afd_config = parse_optional_afd_config(vllm_config, validate=False)
     if (
@@ -248,7 +248,7 @@ def apply_afd_ascend_config_patch() -> None:
 
 
 # Upstream: vllm_ascend/patch/platform/patch_engine_core.py at
-# bd42eea01d8312c4df469fabaed45f77a12df4d3.
+# 19c063b5471f90e158e163d27c2e0cc54af1700e.
 # Patch reason: DP EngineCore initializes AscendConfig before vLLM loads
 # general plugins in the spawned process, so AFD's config namespace fails
 # strict validation before register_afd can install the namespace factory.

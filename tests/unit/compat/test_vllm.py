@@ -13,12 +13,10 @@ from afd_plugin.compat import vllm as compat
 @pytest.mark.parametrize(
     ("version", "compatible"),
     [
-        # The patches are shared: the GPU pin and the retained Ascend pin both
-        # install them, so an unqualified gate accepts either.
         ("0.34.0", True),
         ("0.34.0.dev42+g62d4bc3c", True),
-        ("0.32.0", True),
-        ("0.32.0.dev42+g5df63a7", True),
+        ("0.32.0", False),
+        ("0.32.0.dev42+g5df63a7", False),
         ("0.34.1", False),
         ("0.35.0", False),
         ("0.31.0", False),
@@ -38,8 +36,8 @@ def test_patch_gate_accepts_every_supported_pin(monkeypatch, version, compatible
     [
         ("cuda", "0.34.0", True),
         ("cuda", "0.32.0", False),
-        ("npu", "0.32.0", True),
-        ("npu", "0.34.0", False),
+        ("npu", "0.32.0", False),
+        ("npu", "0.34.0", True),
     ],
 )
 def test_patch_gate_with_device_type_requires_that_backend_pin(
@@ -54,7 +52,7 @@ def test_patch_gate_with_device_type_requires_that_backend_pin(
 
 @pytest.mark.parametrize("installed_version", ["0.29.0", None])
 @pytest.mark.parametrize(
-    ("device_type", "target"), [("cuda", "0.34.0"), ("npu", "0.32.0")]
+    ("device_type", "target"), [("cuda", "0.34.0"), ("npu", "0.34.0")]
 )
 def test_version_error_reports_target_pin(
     monkeypatch, installed_version, device_type, target
@@ -71,7 +69,7 @@ def test_version_error_reports_target_pin(
 
 @pytest.mark.parametrize("installed_version", ["0.29.0", None])
 @pytest.mark.parametrize(
-    ("device_type", "target"), [("cuda", "0.34.0"), ("npu", "0.32.0")]
+    ("device_type", "target"), [("cuda", "0.34.0"), ("npu", "0.34.0")]
 )
 def test_version_warning_reports_target_pin(
     monkeypatch, installed_version, device_type, target

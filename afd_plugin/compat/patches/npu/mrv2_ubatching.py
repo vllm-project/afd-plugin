@@ -162,7 +162,7 @@ def use_async_cam_dbo_dispatch() -> Iterator[None]:
     # Patch functionality: apply native eligibility and thresholds at DP=1;
     # native dispatch continues to own every DP>1 descriptor.
     # Upstream: vllm/v1/worker/gpu/dp_utils.py at
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
     # Signature matches dispatch_cg_and_sync_dp; no added parameters.
     # Delegation exception: native descriptor/threshold selection stays upstream.
     # Removal plan: remove when native dispatch supports local DP=1 DBO.
@@ -179,6 +179,7 @@ def use_async_cam_dbo_dispatch() -> Iterator[None]:
         parallel_config: ParallelConfig | None = None,
         allow_ubatching: bool = False,
         uniform_decode: bool = False,
+        allow_skip_drafts: bool = False,
         dp_sync_state: DPSyncState | None = None,
     ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
         desc, sync = original_dispatch(
@@ -194,6 +195,7 @@ def use_async_cam_dbo_dispatch() -> Iterator[None]:
             parallel_config=parallel_config,
             allow_ubatching=allow_ubatching,
             uniform_decode=uniform_decode,
+            allow_skip_drafts=allow_skip_drafts,
             dp_sync_state=dp_sync_state,
         )
         # ### PATCH START: native DBO eligibility without a DP handshake.

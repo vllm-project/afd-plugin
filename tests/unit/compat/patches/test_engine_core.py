@@ -21,15 +21,10 @@ class _EngineShutdownState(IntEnum):
     REQUESTED = 1
 
 
-def _engine_core_outputs(**kwargs):
-    return SimpleNamespace(**kwargs)
-
-
 def _install_fake_vllm_core(
     monkeypatch: pytest.MonkeyPatch,
     *,
     device_type: str = "cuda",
-    vllm_version: str = "0.32.0",
 ):
     # Reload a fresh patch module against the fake, leaving any existing real
     # module and its already-imported references untouched. Undo restores both
@@ -41,7 +36,7 @@ def _install_fake_vllm_core(
     monkeypatch.setattr(patch_package, "engine_core", None, raising=False)
 
     vllm_module = types.ModuleType("vllm")
-    vllm_module.__version__ = vllm_version
+    vllm_module.__version__ = "0.34.0"
     platforms_module = types.ModuleType("vllm.platforms")
     platforms_module.current_platform = SimpleNamespace(device_type=device_type)
     vllm_v1_module = types.ModuleType("vllm.v1")
@@ -65,15 +60,18 @@ def _install_fake_vllm_core(
         ):
             self.vllm_config = vllm_config
             self.original_init_called = True
-            if vllm_version == "0.34.0":
-                self.prefix_hash_config = (
-                    SimpleNamespace(
-                        hash_algo=vllm_config.cache_config.prefix_caching_hash_algo,
-                        num_lookahead_tokens=vllm_config.num_hash_lookahead_tokens,
-                    )
-                    if vllm_config.cache_config.enable_prefix_caching
-                    else None
+            self.model_executor = executor_class(vllm_config)
+            self.structured_output_manager = object()
+            core_module.measure_encoder_output_widths(vllm_config, self.collective_rpc)
+            self._initialize_kv_caches(vllm_config)
+            self.prefix_hash_config = (
+                SimpleNamespace(
+                    hash_algo=vllm_config.cache_config.prefix_caching_hash_algo,
+                    num_lookahead_tokens=vllm_config.num_hash_lookahead_tokens,
                 )
+                if vllm_config.cache_config.enable_prefix_caching
+                else None
+            )
 
         def shutdown(self):
             self.original_shutdown_called = True
@@ -95,52 +93,14 @@ def _install_fake_vllm_core(
             self.vllm_config.cache_config.effective_attention_block_size = None
 
     class EngineCoreProc(EngineCore):
-        last_counts: tuple[int, int]
-
         def _make_ready_response(self):
             return SimpleNamespace(prefix_hash_config=self.prefix_hash_config)
 
         def run_busy_loop(self):
             self.original_run_busy_loop_called = True
 
-        def _maybe_publish_request_counts(self):
-            if not getattr(self, "publish_dp_lb_stats", False):
-                return
-            counts: tuple[int, int] = self.scheduler.get_request_counts()
-            if counts != self.last_counts:
-                self.last_counts = counts
-                stats = _SchedulerStats(
-                    *counts,
-                    kv_cache_usage=self.scheduler.get_kv_cache_usage(),
-                )
-                self.output_queue.put_nowait(
-                    (-1, _engine_core_outputs(scheduler_stats=stats))
-                )
-
     class DPEngineCoreProc(EngineCoreProc):
         pass
-
-    class _StructuredOutputManager:
-        def __init__(self, vllm_config):
-            self.vllm_config = vllm_config
-
-        def clear_backend(self):
-            self.backend_cleared = True
-
-    class _SchedulerStats:
-        def __init__(
-            self,
-            num_running_reqs=0,
-            num_waiting_reqs=0,
-            kv_cache_usage=0.0,
-            step_counter=0,
-            current_wave=0,
-        ):
-            self.num_running_reqs = num_running_reqs
-            self.num_waiting_reqs = num_waiting_reqs
-            self.kv_cache_usage = kv_cache_usage
-            self.step_counter = step_counter
-            self.current_wave = current_wave
 
     def instrument(*args, **kwargs):
         def decorator(fn):
@@ -167,8 +127,10 @@ def _install_fake_vllm_core(
 
         return run_with_fault_tolerance
 
-    def get_kv_cache_configs(vllm_config, kv_cache_specs, available_gpu_memory):
-        del vllm_config, available_gpu_memory
+    def get_kv_cache_configs(
+        vllm_config, kv_cache_specs, available_gpu_memory, global_kv_cache_groups
+    ):
+        del vllm_config, available_gpu_memory, global_kv_cache_groups
         return kv_cache_specs
 
     def generate_scheduler_kv_cache_config(kv_cache_configs):
@@ -183,15 +145,6 @@ def _install_fake_vllm_core(
         del vllm_config, specs
         return SimpleNamespace(name=supported_layouts[0])
 
-    def get_hash_fn_by_name(name):
-        return name
-
-    def init_none_hash(_hash_fn):
-        return None
-
-    def get_request_block_hasher(block_size, hash_fn):
-        return block_size, hash_fn
-
     def register_all_kvcache_specs(_vllm_config):
         return None
 
@@ -202,33 +155,22 @@ def _install_fake_vllm_core(
     core_module.EngineCoreProc = EngineCoreProc
     core_module.DPEngineCoreProc = DPEngineCoreProc
     core_module.EngineShutdownState = _EngineShutdownState
-    core_module.VLLM_VERSION = vllm_version
+    core_module.VLLM_VERSION = vllm_module.__version__
     core_module.logger = logging.getLogger("fake-vllm-core")
     core_module.logger.info_once = lambda *args, **kwargs: None
     core_module.envs = SimpleNamespace(VLLM_ELASTIC_EP_SCALE_UP_LAUNCH=False)
-    core_module.StructuredOutputManager = _StructuredOutputManager
-    core_module.engine_receiver_cache_from_config = lambda config: (
-        "mm-cache",
-        config,
-    )
     core_module.measure_encoder_output_widths = lambda _config, _rpc: None
-    core_module.SchedulerStats = _SchedulerStats
     core_module.instrument = instrument
     core_module.fault_tolerant_wrapper = fault_tolerant_wrapper
+    core_module.get_watch_dog = lambda: SimpleNamespace(feed=lambda: None)
+    core_module.get_global_kv_cache_groups = lambda *_args: []
     core_module.get_kv_cache_configs = get_kv_cache_configs
     core_module.generate_scheduler_kv_cache_config = generate_scheduler_kv_cache_config
     core_module.update_kv_cache_capacity = update_kv_cache_capacity
     core_module.resolve_kv_cache_layout = resolve_kv_cache_layout
-    core_module.get_hash_fn_by_name = get_hash_fn_by_name
-    core_module.init_none_hash = init_none_hash
-    core_module.get_request_block_hasher = get_request_block_hasher
     core_module.register_all_kvcache_specs = register_all_kvcache_specs
     core_module.resolve_kv_cache_block_sizes = resolve_kv_cache_block_sizes
     core_module.resolve_cache_hit_alignment_tokens = lambda *_args: 32
-    core_module.freeze_gc_heap = lambda: None
-    core_module.maybe_attach_gc_debug_callback = lambda: None
-    core_module.enable_envs_cache = lambda: None
-    core_module.EngineCoreOutputs = _engine_core_outputs
 
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
     monkeypatch.setitem(sys.modules, "vllm.platforms", platforms_module)
@@ -236,14 +178,6 @@ def _install_fake_vllm_core(
     monkeypatch.setitem(sys.modules, "vllm.v1.engine", vllm_engine_module)
     monkeypatch.setitem(sys.modules, "vllm.v1.engine.core", core_module)
     monkeypatch.setitem(sys.modules, "vllm.plugins", plugins_module)
-    if device_type == "npu":
-        for name in (
-            "vllm_ascend",
-            "vllm_ascend.patch",
-            "vllm_ascend.patch.platform",
-            "vllm_ascend.patch.platform.patch_kv_cache_utils",
-        ):
-            monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
     return core_module
 
 
@@ -283,12 +217,14 @@ def _config(role: str | None, *, async_dp: bool = False, device_type: str = "cud
     cache_config = SimpleNamespace(
         block_size=16,
         enable_prefix_caching=False,
+        enable_extensible_kv_cache=False,
         prefix_caching_hash_algo="builtin",
         num_gpu_blocks=None,
         kv_cache_layout="layered",
     )
     parallel_config = SimpleNamespace(
         data_parallel_rank_local=0,
+        cp_kv_cache_interleave_size=1,
         decode_context_parallel_size=1,
         prefill_context_parallel_size=1,
     )
@@ -319,6 +255,8 @@ def _config(role: str | None, *, async_dp: bool = False, device_type: str = "cud
         model_config=model_config,
         speculative_config=None,
         ec_transfer_config=None,
+        kv_transfer_config=None,
+        adjust_dcp_kv_cache_interleave_size=lambda _groups: None,
         is_mm_encoder_only=False,
         max_concurrent_batches=1,
         compilation_config=SimpleNamespace(
@@ -331,10 +269,7 @@ def _config(role: str | None, *, async_dp: bool = False, device_type: str = "cud
 
 @pytest.mark.parametrize("device_type", ["cuda", "npu"])
 def test_engine_core_patch_skips_kv_scheduler_init_for_ffn(monkeypatch, device_type):
-    version = "0.34.0" if device_type == "cuda" else "0.32.0"
-    core_module = _install_fake_vllm_core(
-        monkeypatch, device_type=device_type, vllm_version=version
-    )
+    core_module = _install_fake_vllm_core(monkeypatch, device_type=device_type)
     patch_module = _load_patch_module()
     importlib.reload(patch_module)
 
@@ -367,10 +302,7 @@ def test_engine_core_patch_skips_kv_scheduler_init_for_ffn(monkeypatch, device_t
 
 @pytest.mark.parametrize("device_type", ["cuda", "npu"])
 def test_late_loaded_ffn_returns_empty_kv_without_executor(monkeypatch, device_type):
-    version = "0.34.0" if device_type == "cuda" else "0.32.0"
-    core = _install_fake_vllm_core(
-        monkeypatch, device_type=device_type, vllm_version=version
-    )
+    core = _install_fake_vllm_core(monkeypatch, device_type=device_type)
     _load_patch_module()
     config = _config("ffn", device_type=device_type)
     config.cache_config.enable_prefix_caching = True
@@ -412,30 +344,26 @@ def test_ffn_noop_scheduler_exposes_native_ready_protocol(monkeypatch):
     assert noop.has_unfinished_requests() is False
 
 
-def test_engine_core_patch_leaves_cuda_non_ffn_path_untouched(monkeypatch):
-    core_module = _install_fake_vllm_core(monkeypatch)
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+def test_attention_uses_native_constructor_with_kv_layout_and_warmup(
+    monkeypatch, device_type
+):
+    core = _install_fake_vllm_core(monkeypatch, device_type=device_type)
     _load_patch_module()
-    monkeypatch.setitem(sys.modules, "vllm_ascend", None)
+    config = _config("attention", device_type=device_type)
+    config.parallel_config.cp_kv_cache_interleave_size = 64
 
-    config = _config("attention")
-    config.device_config = SimpleNamespace(device_type="cuda")
-    engine = core_module.EngineCore(config, KVCacheExecutor, log_stats=False)
+    engine = core.EngineCore(config, KVCacheExecutor, log_stats=False)
 
-    assert isinstance(engine.model_executor, KVCacheExecutor)
-    assert engine.scheduler is not None
-    assert engine.available_gpu_memory_for_kv_cache == -1
-    # Warmup has been separate from Executor.initialize_from_config since vLLM
-    # 0.30.0 and remains so at 5df63a72. The AFD copy of _initialize_kv_caches
-    # must drive it for non-FFN engines or CUDA graphs would never be captured.
+    assert engine.original_init_called
     assert engine.model_executor.warmup_called
-    # vLLM 5df63a72 resolves the KV cache layout before memory profiling and
-    # pushes it onto the workers; the AFD copy must preserve that.
     assert engine.model_executor.kv_cache_layout == "layered"
+    assert engine.model_executor.cp_kv_cache_interleave_size == 64
 
 
 @pytest.mark.parametrize("role", [None, "attention"])
 def test_v034_non_ffn_ready_response_keeps_native_prefix_hash_config(monkeypatch, role):
-    core = _install_fake_vllm_core(monkeypatch, vllm_version="0.34.0")
+    core = _install_fake_vllm_core(monkeypatch)
     _load_patch_module()
     # This test exercises native initialization and the ready payload. KV
     # allocation is covered separately and does not participate in the check.
@@ -456,7 +384,7 @@ def test_v034_non_ffn_ready_response_keeps_native_prefix_hash_config(monkeypatch
 
 @pytest.mark.parametrize("engine_type", ["EngineCoreProc", "DPEngineCoreProc"])
 def test_v034_non_ffn_keeps_native_busy_loop_exit(monkeypatch, engine_type):
-    core = _install_fake_vllm_core(monkeypatch, vllm_version="0.34.0")
+    core = _install_fake_vllm_core(monkeypatch)
 
     def exit_native_loop(self):
         raise SystemExit(engine_type)
@@ -496,38 +424,6 @@ def test_native_kv_config_preserves_worker_and_scheduler_alignment(
 
 
 @pytest.mark.parametrize("role", [None, "attention"])
-@pytest.mark.parametrize("is_mm_encoder_only", [False, True])
-def test_engine_core_preserves_v032_npu_initialization(
-    monkeypatch, role, is_mm_encoder_only
-):
-    core_module = _install_fake_vllm_core(monkeypatch, device_type="npu")
-    _load_patch_module()
-    imported = []
-    real_import = __import__
-
-    def tracking_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "vllm_ascend.patch.platform.patch_kv_cache_utils":
-            imported.append(name)
-            return types.ModuleType(name)
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr("builtins.__import__", tracking_import)
-
-    config = _config(role, device_type="npu")
-    config.is_mm_encoder_only = is_mm_encoder_only
-    config.cache_config.enable_prefix_caching = True
-    engine = core_module.EngineCore(config, KVCacheExecutor, log_stats=False)
-
-    assert imported == ["vllm_ascend.patch.platform.patch_kv_cache_utils"]
-    assert engine.scheduler is not None
-    assert engine.mm_receiver_cache == ("mm-cache", config)
-    assert engine.is_mm_encoder_only is is_mm_encoder_only
-    assert engine.request_block_hasher == (16, "builtin")
-    assert config.cache_config.effective_attention_block_size is None
-    assert engine.model_executor.warmup_called
-
-
-@pytest.mark.parametrize("role", [None, "attention"])
 def test_npu_measures_encoder_widths_before_kv_allocation(monkeypatch, role):
     core = _install_fake_vllm_core(monkeypatch, device_type="npu")
     _load_patch_module()
@@ -556,93 +452,9 @@ def test_npu_measures_encoder_widths_before_kv_allocation(monkeypatch, role):
     assert engine.model_executor.warmup_called
 
 
-def test_async_attention_loop_publishes_counts_via_upstream_hook(
-    monkeypatch,
-):  # long-test: one engine iteration publishes request-count protocol messages
-    """vLLM 5df63a72 publishes request counts from the base busy loop.
-
-    The AFD async-Attention engine therefore runs the copied upstream loop
-    unchanged and relies on ``_maybe_publish_request_counts``; the former
-    AFD publication helpers must be gone.
-    """
-    core_module = _install_fake_vllm_core(monkeypatch)
-    _load_patch_module()
-
-    class Executor:
-        max_concurrent_batches = 1
-
-        def __init__(self, vllm_config):
-            self.vllm_config = vllm_config
-            self.sleeping = False
-
-        def get_kv_cache_specs(self):
-            return []
-
-        def get_supported_kv_cache_layouts(self):
-            return ["layered"]
-
-        def set_kv_cache_layout(self, layout_name):
-            return None
-
-        def initialize_from_config(self, kv_cache_configs):
-            self.kv_cache_configs = kv_cache_configs
-
-        def compile_or_warm_up_model(self):
-            return None
-
-        def shutdown(self):
-            return None
-
-    engine = core_module.EngineCoreProc(
-        _config("attention", async_dp=True),
-        Executor,
-        log_stats=False,
-    )
-    engine.engine_index = 2
-    engine.publish_dp_lb_stats = True
-    engine.last_counts = (0, 0)
-    published = []
-    engine.output_queue = SimpleNamespace(
-        put_nowait=lambda output: published.append(output)
-    )
-
-    loop_states = iter((True, True, False))
-    count_states = iter(((0, 1), (1, 0), (1, 0), (0, 0)))
-    engine._handle_shutdown = lambda: next(loop_states)
-    engine._process_input_queue = lambda: setattr(
-        engine.scheduler,
-        "request_counts",
-        next(count_states),
-    )
-    engine._process_engine_step = lambda: setattr(
-        engine.scheduler,
-        "request_counts",
-        next(count_states),
-    )
-
-    def forbidden_sync_path(*_args, **_kwargs):
-        pytest.fail("async Attention must not enter DP-wave synchronization")
-
-    engine._has_global_unfinished_reqs = forbidden_sync_path
-    engine.execute_dummy_batch = forbidden_sync_path
-
-    with pytest.raises(SystemExit):
-        engine.run_busy_loop()
-
-    published_stats = [
-        output.scheduler_stats for destination, output in published if destination == -1
-    ]
-    # Counts changed (0,1) -> (1,0) -> (0,0): every change is published once
-    # with the upstream kv_cache_usage stamp.
-    assert [
-        (stats.num_waiting_reqs, stats.num_running_reqs) for stats in published_stats
-    ] == [(1, 0), (0, 1), (0, 0)]
-    assert all(stats.kv_cache_usage == 0.0 for stats in published_stats)
-
-
-@pytest.mark.parametrize("vllm_version", ["0.32.0", "0.34.0"])
-def test_engine_core_patch_runs_and_stops_ffn_loop(monkeypatch, vllm_version):
-    core_module = _install_fake_vllm_core(monkeypatch, vllm_version=vllm_version)
+@pytest.mark.parametrize("engine_type", ["EngineCoreProc", "DPEngineCoreProc"])
+def test_engine_core_patch_runs_and_stops_ffn_loop(monkeypatch, engine_type):
+    core_module = _install_fake_vllm_core(monkeypatch, device_type="npu")
     _load_patch_module()
 
     class Executor:
@@ -655,8 +467,15 @@ def test_engine_core_patch_runs_and_stops_ffn_loop(monkeypatch, vllm_version):
         def shutdown(self):
             self.calls.append("shutdown")
 
-    engine = core_module.EngineCoreProc(_config("ffn"), Executor, log_stats=True)
+    engine_class = getattr(core_module, engine_type)
+    engine = engine_class(_config("ffn", device_type="npu"), Executor, log_stats=True)
     engine.shutdown_state = _EngineShutdownState.RUNNING
+    watchdog_feeds = []
+    monkeypatch.setattr(
+        core_module,
+        "get_watch_dog",
+        lambda: SimpleNamespace(feed=lambda: watchdog_feeds.append(True)),
+    )
 
     from afd_plugin.compat.patches import engine_core as engine_core_patch
 
@@ -668,6 +487,7 @@ def test_engine_core_patch_runs_and_stops_ffn_loop(monkeypatch, vllm_version):
     with pytest.raises(SystemExit):
         engine.run_busy_loop()
 
+    assert watchdog_feeds == [True]
     assert engine.model_executor.calls == [
         "start_ffn_server_loop",
         "raise_ffn_loop_error_if_any",

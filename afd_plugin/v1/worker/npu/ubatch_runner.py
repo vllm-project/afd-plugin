@@ -24,6 +24,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
 )
+from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.ubatch_utils import UBatchRunner, UBatchState
@@ -227,7 +228,8 @@ class NPUUBatchRunner(UBatchRunner):
         input_batch: InputBatch,
         block_tables: tuple[torch.Tensor, ...],
         slot_mappings: torch.Tensor,
-        cg_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        batch_desc: BatchExecutionDescriptor,
+        dp_sync_state: DPSyncState | None = None,
         for_capture: bool = False,
     ) -> UBatchState:
         previous_override = self.model_state.__dict__.get("prepare_attn")
@@ -235,7 +237,12 @@ class NPUUBatchRunner(UBatchRunner):
         try:
             with use_npu_input_batch_slicing():
                 prepared = super().prepare(
-                    input_batch, block_tables, slot_mappings, cg_mode, for_capture
+                    input_batch,
+                    block_tables,
+                    slot_mappings,
+                    batch_desc,
+                    dp_sync_state,
+                    for_capture,
                 )
             if for_capture and self._uses_mla_graph_params:
                 sizes = tuple(stage.num_tokens for stage in prepared.slices)
