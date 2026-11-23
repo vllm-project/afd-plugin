@@ -47,7 +47,7 @@ DECODE_GRAPH_COMPILATION_CONFIG = {"cudagraph_mode": "FULL_DECODE_ONLY"}
 # rendezvous port.
 FFN_SERVICE_MASTER_PORT_OFFSET = 1
 # Attention, the FFN API, prefill and the PD proxy listen on the API port base
-# + 0..3; FFN service rank r reports on the base + this offset + r.
+# + 0..3; the FFN service ranks report on consecutive ports after them.
 FFN_SERVICE_STATUS_PORT_OFFSET = 4
 FFN_SERVICE_STATUS_FILE = "ffn-service.json"
 FFN_SERVICE_HTTP_TIMEOUT_S = 5
@@ -302,8 +302,19 @@ class ResolvedDeployment:
         return cmd
 
     def ffn_service_status_port(self, rank: int) -> int:
-        """Management port of one FFN service rank, past every API role port."""
-        return self.environment.api_port_base + FFN_SERVICE_STATUS_PORT_OFFSET + rank
+        """Management port of one FFN service rank.
+
+        The service adds the rank to one ``--status-port``, so the ranks need
+        consecutive ports: the first block past the API role ports that also
+        misses the AFD rendezvous port and the ``torchrun`` port next to it.
+        """
+        env = self.environment
+        assert self.case.deployment.ffn is not None
+        first = env.api_port_base + FFN_SERVICE_STATUS_PORT_OFFSET
+        past_rendezvous = env.afd_port + FFN_SERVICE_MASTER_PORT_OFFSET + 1
+        if env.afd_port - self.case.deployment.ffn.rank_count < first < past_rendezvous:
+            first = past_rendezvous
+        return first + rank
 
     @property
     def ffn_service_status_file(self) -> Path:

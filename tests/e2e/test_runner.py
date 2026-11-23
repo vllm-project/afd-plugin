@@ -871,6 +871,32 @@ def test_ffn_service_status_ports_are_apart_from_the_prefill_and_proxy_ports(
     assert len(set(ports)) == len(ports) == 5
 
 
+@pytest.mark.parametrize("afd_port", [8003, 8004, 8005, 8006])
+def test_ffn_service_status_ports_miss_the_afd_and_torchrun_ports(tmp_path, afd_port):
+    environment = CaseEnvironment(
+        model="/models/qwen3",
+        vllm_bin="vllm",
+        device_backend="gpu",
+        devices=tuple(map(str, range(4))),
+        api_port_base=8000,
+        afd_port=afd_port,
+        output_path=tmp_path,
+    )
+    case = qwen3_cases.build_case("afd-deepep-m2n-faas-eager-2a2f", environment)
+    resolved = runner.deployment.resolve(case, environment)
+
+    service = resolved.ffn_service_command()
+    master_port = int(
+        next(a for a in service if a.startswith("--master-port=")).split("=")[1]
+    )
+    first = int(service[service.index("--status-port") + 1])
+    status_ports = [first + rank for rank in range(case.deployment.ffn.rank_count)]
+    assert status_ports == [
+        resolved.ffn_service_status_port(rank) for rank in range(len(status_ports))
+    ]
+    assert not {afd_port, master_port, *range(8000, 8004)} & set(status_ports)
+
+
 @pytest.mark.parametrize(
     "payload,missing,passed",
     [
