@@ -224,7 +224,7 @@ Enable native DBO through Attention CLI flags, not connector extra config.
 | `dynamicQuant` | `int` | `0` | The A3 layered FFN uses `1` for quantized activations and scale tensors; the 950 eager W4A8MXFP case uses `0` for BF16 transport and expert-side block quantization. |
 | `ffn_mega_moe` | `bool` | `false` | Selects Mega FFN with Pull transport; requires `dynamicQuant=1` and the same setting on all A/F ranks. See the [Pull execution session](../design/npu/async_ffn_runtime.md#opt-in-pull-execution-session). |
 | `attn_ranks_per_dp` | `int` | `1` | Positive Attention TP rank count per DP replica. It is the CAM Attention grouping width and is independent of the FFN process's local TP size. |
-| `hccl_buffer_size` | `int` | unset | Positive CAM HCCL buffer size in MB. The override applies only to the `afd_async_cam` communication domain. When unset, HCCL uses `HCCL_BUFFSIZE`, then its built-in default. Configure the same value on every Attention and FFN rank in the domain. |
+| `hccl_buffer_size` | `int` | unset | CAM HCCL domain window in MiB. A5 BF16 Push checks it against the tiling value on every rank, as described below. Other paths use HCCL's environment and built-in defaults when the override is unset. |
 
 For a DP+SP deployment such as DP3TP2 Attention + DP2TP1/EP2 FFN, set
 `VLLM_ASCEND_ENABLE_FLASHCOMM1=1` only on Attention and explicitly set it to
@@ -309,6 +309,12 @@ can use the domain override. For the JSON example above, export
 `HCCL_BUFFSIZE=4096`. Changing only `hccl_buffer_size` can misalign the window
 capacity and tail-state address. `HCCL_BUFFSIZE` also affects unrelated groups
 without explicit overrides; see the [operator window contract](../design/npu/cam_async_routed_ops.md#communication-window-configuration).
+
+For Ascend 950 BF16 Push, Attention and FFN agree on the window size through
+the rendezvous Store before creating the CAM group. Set `HCCL_BUFFSIZE` to an
+integer from 1 to 32768 MiB. Its unset value for the tiler is 408 MiB. If
+provided, `hccl_buffer_size` must match that effective value. The connector
+passes the agreed size explicitly to HCCL, including when both settings are unset.
 
 For the experimental FlashComm1/SP cases, set
 `VLLM_ASCEND_ENABLE_FLASHCOMM1=1` only on Attention. Set it to `0` for plain TP

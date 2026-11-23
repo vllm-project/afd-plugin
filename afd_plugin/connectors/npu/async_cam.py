@@ -50,6 +50,7 @@ from afd_plugin.connectors.npu.async_cam_runtime.async_cam_session import (
     PushCAMSession,
 )
 from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup import (
+    BF16_PUSH_SIGNATURE_PREFIX,
     GRAPH_STARTUP_TIMEOUT_SECONDS,
     POLL_SECONDS,
     AsyncCAMGraphStartup,
@@ -342,9 +343,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             rank=self.world_rank,
             group_name=AFD_ASYNC_CAM_GROUP_NAME,
             timeout=timedelta(minutes=30),
-            pg_options=create_hccl_process_group_options(
-                self.hccl_buffer_size_mb,
-            ),
             store_callback=self._initialize_graph_startup,
         )
         backend = self.cam_pg._get_backend(torch.device("npu"))
@@ -358,7 +356,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         if self.graph_startup.mode == "full" and self.world_rank < self.attn_size:
             self._run_attention_graph_startup()
 
-    def _initialize_graph_startup(self, store: Store) -> None:
+    def _initialize_graph_startup(self, store: Store) -> object | None:
         signature = repr(
             (
                 self.attn_size,
@@ -372,13 +370,16 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
                 self.max_num_batched_tokens,
             )
         )
-        # BF16 Push receives a different payload/scale layout from INT8 Push.
-        # Even eager peers must agree before issuing any 950 transfers.
+        # BF16 Push peers also locate the receive cursor from the window tail.
         prefix = (
-            "bf16_push:" if self.dynamic_quant == 0 else self._session.signature_prefix
+            BF16_PUSH_SIGNATURE_PREFIX
+            if self.dynamic_quant == 0
+            else self._session.signature_prefix
         )
         signature = prefix + signature
-        self.graph_startup.initialize(store, signature)
+        window_mib = self.graph_startup.initialize(
+            store, signature, hccl_buffer_size_mb=self.hccl_buffer_size_mb
+        )
         if self.graph_startup.mode == "full":
             try:
                 if self.max_num_batched_tokens // self.tp_size > CAM_MAX_SOURCE_ROWS:
@@ -389,6 +390,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             except Exception as exc:
                 self.graph_startup.fail(exc)
                 raise
+        return create_hccl_process_group_options(window_mib)
 
     def wait_graph_device(self, event: torch.npu.Event) -> None:
         deadline = time.monotonic() + GRAPH_STARTUP_TIMEOUT_SECONDS
