@@ -23,6 +23,7 @@ from vllm.distributed.parallel_state import get_pcp_group
 from vllm_ascend.ops.fused_moe.dataclass.prepare_finalize import MoEPrepareOutput
 from vllm_ascend.ops.fused_moe.moe_comm_method import (
     AllGatherCommImpl,
+    FusedExpertsResult,
     MC2CommImpl,
 )
 from vllm_ascend.ops.fused_moe.prepare_finalize import (
@@ -34,6 +35,38 @@ from vllm_ascend.quantization.quant_type import QuantType
 from afd_plugin.connectors.npu.camp2p.external_routing import (
     AFDExternalRoutingInputs,
 )
+
+
+def _record_eplb_load(experts, result: FusedExpertsResult) -> None:
+    """Record operator-provided expert counts for the FFN-side EPLB state.
+
+    The external-routing path calls ``quant_method.apply`` directly instead of
+    ``AscendRoutedExperts.forward_impl``, so it must mirror its V2 EPLB record
+    step. Without a router state this is a no-op.
+    """
+    router = experts.router
+    eplb_state = router.eplb_state
+    if eplb_state is None:
+        return
+    expert_tokens = result.expert_tokens
+    if expert_tokens is None:
+        raise RuntimeError("AFD external routing EPLB needs expert counts")
+    expert_load_view = eplb_state.expert_load_view
+    record_enabled = eplb_state.should_record_tensor
+    if expert_load_view is None or record_enabled is None:
+        raise RuntimeError("AFD external routing EPLB state is not initialized")
+    if expert_tokens.numel() != eplb_state.local_expert_count:
+        raise RuntimeError(
+            "MoE expert count does not match local EPLB experts: "
+            f"{expert_tokens.numel()} != {eplb_state.local_expert_count}"
+        )
+    torch.ops.vllm.ascend_eplb_record_expert_tokens(
+        expert_tokens,
+        expert_load_view,
+        record_enabled,
+        result.group_list_type,
+        eplb_state.local_expert_start,
+    )
 
 
 class AFDPrepareAndFinalizeWithAllGather(PrepareAndFinalizeWithAllGather):
@@ -339,6 +372,7 @@ class AFDExternalRoutingMoE:
             finally:
                 experts.ascend_pertoken_scale = None
                 experts.ascend_mc2_mask = None
+            _record_eplb_load(experts, fused)
             return comm.finalize(
                 hidden_states=fused.routed_out,
                 reduce_results=isinstance(comm, AllGatherCommImpl),

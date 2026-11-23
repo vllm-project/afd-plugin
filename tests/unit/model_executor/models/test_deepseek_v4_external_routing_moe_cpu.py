@@ -148,6 +148,7 @@ def _install_stub_modules():
     comm_module = types.ModuleType("vllm_ascend.ops.fused_moe.moe_comm_method")
     comm_module.AllGatherCommImpl = _AllGatherComm
     comm_module.MC2CommImpl = _MC2Comm
+    comm_module.FusedExpertsResult = object
     # The native selector is keyed by MoECommType and returns None when this
     # configuration was not initialised with that method.
     comm_by_type = {
@@ -257,6 +258,7 @@ class _Experts(torch.nn.Module):
         self.seen = []
         self.fail_at = fail_at
         self.quant_method = self
+        self.router = types.SimpleNamespace(eplb_state=None)
 
     def apply(
         self, *, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
