@@ -13,7 +13,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, cast
 
-from afd_plugin._cann_vendor import prepare_afd_ascend950_vendor
+from afd_plugin.compat.npu.ops import prepare_afd_ascend950_vendor
 from afd_plugin.config import AFDConfig, parse_afd_config, parse_optional_afd_config
 
 
