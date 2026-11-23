@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Adapted from the A5 eager executor in afd-plugin commit bd1e4d28271a.
+# This version selects the received layer and bounds work to the compact chunk.
 """Eager Ascend 950 expert computation on rows already routed by CAM."""
 
 from __future__ import annotations
@@ -14,13 +16,13 @@ from vllm_ascend.ops.fused_moe.dataclass.moe_quant import MoEMxfpParams, MoEQuan
 from vllm_ascend.ops.fused_moe.moe_mlp import apply_moe_mlp
 from vllm_ascend.quantization.quant_type import QuantType
 
-from afd_plugin.connectors.npu.async_cam_runtime import CAM_LAYER_INDEX
+from afd_plugin.connectors.npu.async_cam_runtime import AFD_ASYNC_LAYER_INDEX
 
 if TYPE_CHECKING:
     from vllm_ascend.models.deepseek_v4.model import DeepseekV4MoE
 
 
-class AsyncCAMMXFPExecutor:
+class AfdAsyncMXFPExecutor:
     """Select the received layer and run its native, routed-only W4A8MXFP MLP."""
 
     def __init__(self, layers: dict[int, DeepseekV4MoE], local_experts: int) -> None:
@@ -85,7 +87,7 @@ class AsyncCAMMXFPExecutor:
         # describe its valid rows. Eager mode allows one host read for both values.
         layer_id, rows = (
             torch.stack(
-                (batch_info[CAM_LAYER_INDEX], group_list.sum(dtype=torch.int64))
+                (batch_info[AFD_ASYNC_LAYER_INDEX], group_list.sum(dtype=torch.int64))
             )
             .cpu()
             .tolist()

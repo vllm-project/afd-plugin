@@ -101,8 +101,8 @@ def mxfp_runtime(monkeypatch, torch):
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setitem(sys.modules, "torch", torch)
     executor = load_host_module(
-        monkeypatch, "afd_plugin.connectors.npu.async_cam_runtime.async_cam_mxfp"
-    ).AsyncCAMMXFPExecutor
+        monkeypatch, "afd_plugin.connectors.npu.async_cam_runtime.afd_async_mxfp"
+    ).AfdAsyncMXFPExecutor
     config = SimpleNamespace(
         swiglu_limit=0.0,
         swiglu_alpha=1.0,

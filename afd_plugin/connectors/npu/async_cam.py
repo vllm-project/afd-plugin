@@ -512,7 +512,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             tp_size=self.tp_size,
             dynamic_quant=self.dynamic_quant,
         )
-        _log_cam_op_values("async_dispatch_send", "inputs", **args)
+        _log_cam_op_values("afd_async_dispatch_send", "inputs", **args)
         self._session.dispatch((context, topk_ids, topk_weights), **args)
 
     def recv_ffn_output(
@@ -552,9 +552,9 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             batch_size=states.batch_size,
             attn_rank_id=self.world_rank,
         )
-        _log_cam_op_values("async_combine_recv", "inputs", **args)
+        _log_cam_op_values("afd_async_combine_recv", "inputs", **args)
         output = self._session.combine(ubatch_idx, **args)
-        _log_cam_op_values("async_combine_recv", "outputs", output=output)
+        _log_cam_op_values("afd_async_combine_recv", "outputs", output=output)
         return output
 
     def recv_attn_output(
@@ -589,11 +589,11 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             tp_size=self.tp_size,
             dynamic_quant=self.dynamic_quant,
         )
-        _log_cam_op_values("async_dispatch_recv", "inputs", **args)
+        _log_cam_op_values("afd_async_dispatch_recv", "inputs", **args)
         outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(**args)
         hidden_states, dynamic_scales, batch_info, expert_token_nums = outputs
         _log_cam_op_values(
-            "async_dispatch_recv",
+            "afd_async_dispatch_recv",
             "outputs",
             hidden_states=hidden_states,
             dynamic_scales=dynamic_scales,
@@ -625,7 +625,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         if token_nums_rankid_layeridx is None:
             raise RuntimeError(
                 "AFD async CAM combine send requires "
-                "TokenNums_Rankid_Layeridx from async_dispatch_recv",
+                "TokenNums_Rankid_Layeridx from afd_async_dispatch_recv",
             )
         args = self._cam_args(states) | dict(
             expand_x=ffn_output,
@@ -634,7 +634,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             moe_rank_id=self.world_rank,
             tp_size=self.tp_size,
         )
-        _log_cam_op_values("async_combine_send", "inputs", **args)
+        _log_cam_op_values("afd_async_combine_send", "inputs", **args)
         states.send_completion = torch.ops.afd_ascend.afd_async_combine_send(**args)
 
     def _require_push_session(self) -> PushCAMSession:

@@ -18,13 +18,13 @@ GRAPH_STARTUP_TIMEOUT_SECONDS = 30.0
 POLL_SECONDS = 0.02
 BF16_PUSH_SIGNATURE_PREFIX = "bf16_push:"
 # GetMaxWindowSize() in ascend_kernels/utils/op_host/ops_log.h uses MiB.
-_DEFAULT_CAM_WINDOW_MIB = 408
-_MAX_CAM_WINDOW_MIB = 32 * 1024
+_AFD_ASYNC_DEFAULT_WINDOW_MIB = 408
+_AFD_ASYNC_MAX_WINDOW_MIB = 32 * 1024
 
 
-def _bf16_push_window_mib(configured_mib: int | None) -> int:
+def _afd_async_bf16_window_mib(configured_mib: int | None) -> int:
     raw = os.environ.get("HCCL_BUFFSIZE")
-    window_mib = _DEFAULT_CAM_WINDOW_MIB
+    window_mib = _AFD_ASYNC_DEFAULT_WINDOW_MIB
     if raw is not None:
         value = raw.strip(" \t\r\n\v\f").removeprefix("+")
         if not (value.isascii() and value.isdecimal()):
@@ -32,8 +32,10 @@ def _bf16_push_window_mib(configured_mib: int | None) -> int:
                 f"HCCL_BUFFSIZE must be a positive integer in MiB, got {raw!r}"
             )
         window_mib = int(value)
-        if not 1 <= window_mib <= _MAX_CAM_WINDOW_MIB:
-            raise ValueError(f"HCCL_BUFFSIZE must be in [1, {_MAX_CAM_WINDOW_MIB}] MiB")
+        if not 1 <= window_mib <= _AFD_ASYNC_MAX_WINDOW_MIB:
+            raise ValueError(
+                f"HCCL_BUFFSIZE must be in [1, {_AFD_ASYNC_MAX_WINDOW_MIB}] MiB"
+            )
     if configured_mib is not None and configured_mib != window_mib:
         raise ValueError(
             f"hccl_buffer_size={configured_mib} MiB must match the tiler's "
@@ -161,7 +163,7 @@ class AsyncCAMGraphStartup:
         assert self._store is not None
         try:
             if transport_signature.startswith(BF16_PUSH_SIGNATURE_PREFIX):
-                hccl_buffer_size_mb = _bf16_push_window_mib(hccl_buffer_size_mb)
+                hccl_buffer_size_mb = _afd_async_bf16_window_mib(hccl_buffer_size_mb)
                 transport_signature += f":window_mib={hccl_buffer_size_mb}"
             self._publish(
                 "plan",

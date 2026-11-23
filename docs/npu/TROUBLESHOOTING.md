@@ -142,7 +142,7 @@ topology first.
 
 ## FFN workers do not exit
 
-An idle async FFN worker can remain blocked in `async_dispatch_recv` during
+An idle async FFN worker can remain blocked in `afd_async_dispatch_recv` during
 shutdown. Allow the normal service shutdown to finish before forcing process
 termination. Before restarting the deployment, use `npu-smi info` to confirm
 that the old workers no longer hold device memory. A process left in an

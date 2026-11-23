@@ -123,12 +123,12 @@ eliminates unnecessary idle time caused by DP request imbalance.
 One MoE layer follows this sequence:
 
 1. Attention computes top-k expert IDs and weights.
-2. `async_dispatch_send` sends hidden states and routing IDs into the CAM group.
-3. Each FFN rank calls `async_dispatch_recv` and receives its routed expert
+2. `afd_async_dispatch_send` sends hidden states and routing IDs into the CAM group.
+3. Each FFN rank calls `afd_async_dispatch_recv` and receives its routed expert
    tokens, compact metadata, per-expert counts, and optional dynamic-quant scales.
 4. The FFN worker executes its local routed experts; Attention computes shared experts.
-5. `async_combine_send` returns those outputs with the dispatch metadata.
-6. Attention calls `async_combine_recv`; CAM routes, weights, and combines the
+5. `afd_async_combine_send` returns those outputs with the dispatch metadata.
+6. Attention calls `afd_async_combine_recv`; CAM routes, weights, and combines the
    expert results for the original tokens, then adds its local shared output.
 
 CAM dispatch payloads carry the token-count and routing metadata. Consequently,
