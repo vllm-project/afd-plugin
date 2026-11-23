@@ -1,6 +1,7 @@
 # CUDA connector device tests
 
-Opt-in device tests for `DeepEPM2NAFDConnector`. They run the connector's
+Opt-in device tests for `DeepEPM2NAFDConnector` and `GpuAsyncAFDConnector`.
+They run the connector's
 transport and expert compute on real GPUs, without model weights or a vLLM
 server. Weekly CI runs the full suite on four H100 GPUs
 (`.buildkite/cuda/test-weekly.yml`).
@@ -9,9 +10,46 @@ server. Weekly CI runs the full suite on four H100 GPUs
 | --- | --- | --- |
 | `test_deepep_m2n_gpu.py` | pytest, up to 4 GPUs on one node | Dispatch, expert compute and combine checked against references, in eager mode, with two lanes (DBO), under `torch.compile`, and after CUDA-graph replay |
 | `deepep_m2n_harness.py` | - | Multi-process harness: rank spawning, deterministic inputs, references, checks, scenarios, and benchmark scenarios |
+| `test_async_gpu.py` | pinned CUDA vLLM/Torch, NVSHMEM 3.4.5, up to 4 NVLink GPUs | Ten transport/startup cases plus four missing-reply deadline cases: stages, replay, bounded header memory, mapping, precision and independent producers |
+| `run_async_gpu_multinode.py` | CUDA/NVSHMEM extension, two nodes with two GPUs each | The same affine oracle over remote RMA: graph counters, precision, independent producers and collective close |
 | `__init__.py` | - | Package marker |
 
-## Requirements
+## Async GPU checks
+
+The async GPU tests need no DeepEP or DeepGEMM. Run inside a four-GPU allocation:
+
+```bash
+python -m pytest -s -v tests/gpu/test_async_gpu.py
+```
+
+All fourteen cases must pass with zero skips in a four-GPU allocation. The four
+deadline cases use disposable processes because a device timeout deliberately
+traps the CUDA context. They cover mapped and native NVSHMEM waits, both eager
+and graph replay. With two GPUs, only the three/four-GPU transport cases skip.
+The transport cases use real CUDA transport and an affine expert oracle.
+Startup checks hide the optional bridge without changing the installed files:
+local peers still replay graphs, while an injected unmapped peer on one rank
+forces every rank to free/finalize NVSHMEM before rejecting the configuration.
+The requirements and harness descriptions below cover DeepEP M2N.
+
+For remote RMA, build the [CUDA/NVSHMEM extension](../../csrc/gpu/README.md) on
+both hosts. Run the following from each checkout with the same reachable
+`AFD_HOST` (node 0) and connector port. Set `NODE_RANK=0` on the first host
+and `NODE_RANK=1` on the second. Each process uses its local visible GPU index.
+
+```bash
+export NVSHMEM_REMOTE_TRANSPORT=ibrc NVSHMEM_SYMMETRIC_SIZE=1G
+python -m tests.gpu.run_async_gpu_multinode --node-rank "$NODE_RANK" \
+    --host "$AFD_HOST" --port 6281 --mode graph --replays 64
+```
+
+The default 2A2F run uses two GPUs per node. For hybrid local/remote graph
+replay add `--interleave-roles`. Other 2A2F cases use `--mode independent`,
+`varying` or `cross_rank_precision`. To exercise 1A1F, pass
+`--attention-ranks 1 --ffn-ranks 1` with `--mode eager`, `graph` or
+`precision`. Each case prints `passed` once per rank. These are correctness tests, not benchmarks.
+
+## DeepEP M2N requirements
 
 - Hopper (SM90) or newer GPUs on one node. Every case needs at most 4 GPUs;
   cases that need more GPUs than are visible skip, and every case skips below
@@ -28,8 +66,8 @@ server. Weekly CI runs the full suite on four H100 GPUs
 ## Run
 
 ```bash
-# Full suite
-pytest -sv -m gpu tests/gpu
+# Full DeepEP suite
+pytest -sv -m gpu tests/gpu/test_deepep_m2n_gpu.py
 
 # One payload format
 pytest -sv -m gpu tests/gpu -k bf16

@@ -6,15 +6,18 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from afd_plugin.connectors.gpu.async_nvshmem.connector import GpuAsyncAFDConnector
     from afd_plugin.connectors.gpu.p2p import P2pNcclAFDConnector
 
 
 def __getattr__(name: str):
     if name == "P2pNcclAFDConnector":
         module = "p2p"
+    elif name == "GpuAsyncAFDConnector":
+        module = "async_nvshmem.connector"
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     return getattr(import_module(f"{__name__}.{module}"), name)
 
 
-__all__ = ["P2pNcclAFDConnector"]
+__all__ = ["P2pNcclAFDConnector", "GpuAsyncAFDConnector"]
