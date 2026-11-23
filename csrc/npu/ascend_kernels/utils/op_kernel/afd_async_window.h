@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 // AFD adaptation: renamed the helper and its references for afd_async.
 #ifndef AFD_ASYNC_WINDOW_H

@@ -25,13 +25,23 @@ compact ACLNN interface. The four vector-only kernel entries carry the donor's
 [AIV-only task declaration](https://github.com/GuangyuZhu04/afd-plugin/commit/cb303bbbd18b055919f86b194f2b754fa4e794e5).
 The plugin builds the compact transport without a CCU runtime or custom
 session class. The compact kernels and binding retain the Huawei MIT notice
-from the original import. The 950 helper headers carry their individual
-source licenses. For example, `afd_async_combine_tile_plan.h` retains the
-Apache-2.0 identifier and AFD contributor notice from the donor. The source
-distribution, wheel and native vendor install carry the repository license
-and third-party notice. [Original import](https://github.com/vllm-project/afd-plugin/pull/361)
-· [Tile-plan source](https://github.com/GuangyuZhu04/afd-plugin/blob/4d134dc955c58727c08511c6043ee01279eb6279/csrc/npu/ascend_kernels/utils/op_kernel/cam_async_combine_tile_plan.h)
+from the original import. The source distribution, wheel and native vendor
+install carry the repository license and third-party notice.
+[Original import](https://github.com/vllm-project/afd-plugin/pull/361)
 · [LICENSE](../../LICENSE)
+
+The six A5 helpers below first appeared in the A5 MTE development branch
+with Apache-2.0 headers. Their author has authorized MIT distribution of
+these copies. Each retains its AFD plugin contributor copyright notice.
+
+| Header under `ascend_kernels/utils/op_kernel/` | Original file and introducing commit |
+| --- | --- |
+| `afd_async_combine_tile_plan.h` | [`cam_async_combine_tile_plan.h` at `4d134dc9`](https://github.com/GuangyuZhu04/afd-plugin/blob/4d134dc955c58727c08511c6043ee01279eb6279/csrc/npu/ascend_kernels/utils/op_kernel/cam_async_combine_tile_plan.h) |
+| `afd_async_dispatch_pipeline.h` | [`cam_async_dispatch_pipeline.h` at `5574c9e0`](https://github.com/GuangyuZhu04/afd-plugin/blob/5574c9e0fd76a1e952e44359740b2dd5ce9982c8/csrc/npu/ascend_kernels/utils/op_kernel/cam_async_dispatch_pipeline.h) |
+| `afd_async_receive_cache.h` | [`cam_async_receive_cache.h` at `52504ac3`](https://github.com/GuangyuZhu04/afd-plugin/blob/52504ac3ce1eace526bd1f5148f5045fe7efaa25/csrc/npu/ascend_kernels/utils/op_kernel/cam_async_receive_cache.h) |
+| `afd_async_receive_runs.h` | [`cam_async_receive_runs.h` at `fbb268be`](https://github.com/GuangyuZhu04/afd-plugin/blob/fbb268be5362827bc69f984685f595eae3f5b53e/csrc/npu/ascend_kernels/utils/op_kernel/cam_async_receive_runs.h) |
+| `afd_async_sparse_ranks.h` | [`cam_async_sparse_ranks.h` at `3a265b45`](https://github.com/GuangyuZhu04/afd-plugin/blob/3a265b45aa0b21b9d33038ec30d5a220668456cb/csrc/npu/ascend_kernels/utils/op_kernel/cam_async_sparse_ranks.h) |
+| `afd_async_window.h` | [`cam_async_window.h` at `7d773dcb`](https://github.com/GuangyuZhu04/afd-plugin/blob/7d773dcb5f1e73987d80b61f1191da2069057a34/csrc/npu/ascend_kernels/utils/op_kernel/cam_async_window.h) |
 
 The NPU native sources live in this directory:
 
