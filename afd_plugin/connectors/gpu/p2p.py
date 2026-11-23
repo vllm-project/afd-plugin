@@ -217,6 +217,7 @@ class P2pNcclAFDConnector(AFDConnectorBase):
         self.a2e_group: StatelessProcessGroup | None = None
         self.e2a_group: StatelessProcessGroup | None = None
         self.p2p_pg: ProcessGroup | None = None
+        self.afd_pg: ProcessGroup | None = None
         self.a2e_pynccl: PyNcclCommunicator | None = None
         self.e2a_pynccl: PyNcclCommunicator | None = None
         self.a2e_comm_id: int | None = None
@@ -240,6 +241,16 @@ class P2pNcclAFDConnector(AFDConnectorBase):
             if communicator is not None:
                 communicator.destroy()
         self.a2e_pynccl = self.e2a_pynccl = None
+        for group in (self.p2p_pg, self.afd_pg):
+            if group is not None:
+                torch.distributed.destroy_process_group(group)
+        self.p2p_pg = self.afd_pg = None
+        self.a2e_group = self.e2a_group = None
+        self.dp_metadata_list.clear()
+        self.tensor_metadata_list.clear()
+        self._recv_attn_tensor_metadata_list.clear()
+        self._recv_attn_buffers.clear()
+        self._recv_attn_input_ids_buffers.clear()
         self._initialized = False
 
     def init_afd_connector(self) -> None:
@@ -274,6 +285,7 @@ class P2pNcclAFDConnector(AFDConnectorBase):
             group_name="afd",
             timeout=timedelta(seconds=self.afd_config.afd_process_group_timeout_s),
         )
+        self.afd_pg = afd_pg
 
         with DefaultProcessGroupSwitcher(_get_default_group(), afd_pg):
             # The subgroup only has to hand rank 0's ncclUniqueId to its

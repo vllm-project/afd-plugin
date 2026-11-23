@@ -23,6 +23,8 @@ device, a multi-rank launch, or only a host Python environment.
 | `test_async_cam_layered_w4a8.py` | pytest, 1 device | The `AsyncCAMLayeredExecutor` chain end to end |
 | `test_async_cam_layered_w8a8.py` | pytest, 1 device | W8A8 chain versus native operators and exact eager/FULL replay |
 | `test_attention_gate_numerics.py` | pytest, 1 device | Gate, router, and activation components |
+| `test_stateless_hccl_pg.py` | pytest, 4 devices (N0, `N0_WORLD_SIZE`) | Stateless HCCL group create/destroy, standby groups, subgroup switch |
+| `test_eep_group_lifecycle.py` | pytest, 4 devices (N1) | Real elastic-EP standby-group lifecycle across a 2 → 4 DP scale-up |
 | `__init__.py` | - | Package marker |
 
 The first group exercises the four routed async CAM operators added by

@@ -204,6 +204,15 @@ class RemoteFFNProxy(nn.Module):
         hidden_states: torch.Tensor,
         **send_kwargs: torch.Tensor,
     ) -> torch.Tensor:
+        if not self._afd_metadata().connector.is_initialized:
+            # Paused A engines keep running empty DP waves while the AFD link
+            # is down (between release_link and connect during elastic
+            # resize), and those dummy steps reach the model forward. Their
+            # outputs are discarded, so an identity FFN is the safe local
+            # completion. Real serving cannot land here: the client drains and
+            # pauses before release and only resumes after finish() has
+            # re-connected both roles.
+            return hidden_states
         stage_idx = self._send(hidden_states, **send_kwargs)
         hidden_states = maybe_apply_dbo_yield(
             hidden_states,

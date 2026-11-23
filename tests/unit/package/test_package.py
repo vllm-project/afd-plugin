@@ -58,6 +58,9 @@ def registration(monkeypatch, request):
         "async_dp_engine",
         "async_dp_forward_context",
         "config_validation",
+        "elastic",
+        "elastic_actors",
+        "elastic_parallel",
         "engine_core",
     ):
         modules[f"afd_plugin.compat.patches.{name}"] = {}
