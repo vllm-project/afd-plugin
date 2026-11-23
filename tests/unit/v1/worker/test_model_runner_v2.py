@@ -58,7 +58,7 @@ TEST_CUDAGRAPH_CAPTURE_SIZE = 8
 class _RecordingConnector:
     def __init__(self, events: list[str]):
         self.events = events
-        self.control_plane = self
+        self.control_plane: _RecordingConnector | None = self
         self.closed = False
 
     def update_state_from_dp_metadata(self, payload):
@@ -356,10 +356,12 @@ def test_mrv2_ubatch_capture_events_and_exception_restore(fail_control, dp_size)
     ],
     ids=["dp1", "dp2"],
 )
+@pytest.mark.parametrize("has_control_plane", [False, True])
 def test_v2_capture_publishes_two_descriptor_events_outside_graph_body(
     monkeypatch,
     data_parallel_size,
     expected_dp_counts,
+    has_control_plane,
 ):  # long-test: descriptor warmup/capture payloads must precede native graph entry
     events: list[str] = []
     runner = _runner_for_metadata(
@@ -387,6 +389,8 @@ def test_v2_capture_publishes_two_descriptor_events_outside_graph_body(
             super().send_dp_metadata_list(payload)
 
     runner.connector = CaptureConnector(events)
+    if not has_control_plane:
+        runner.connector.control_plane = None
 
     def original_prepare(num_reqs, num_tokens, *args, **kwargs):
         prepare_calls.append((num_reqs, num_tokens))
@@ -448,15 +452,12 @@ def test_v2_capture_publishes_two_descriptor_events_outside_graph_body(
     assert AFDAttentionModelRunnerV2.capture_model(runner) == 23
 
     assert prepare_calls == [(1, 8), (1, 8), (2, 16), (2, 16)]
-    assert [(p.is_warmup, p.is_graph_capturing) for p in payloads] == [
-        (True, False),
-        (False, True),
-        (True, False),
-        (False, True),
-    ]
+    assert [(p.is_warmup, p.is_graph_capturing) for p in payloads] == (
+        [(True, False), (False, True)] * 2 if has_control_plane else []
+    )
     assert [
         p.dp_metadata_list[0].num_tokens_across_dp_cpu.tolist() for p in payloads
-    ] == expected_dp_counts
+    ] == (expected_dp_counts if has_control_plane else [])
     assert [m.tokens_lens for m in captured_metadata] == [[8], [8], [16], [16]]
     assert [m.tokens_unpadded_lens for m in captured_metadata] == [
         [8],
@@ -464,24 +465,11 @@ def test_v2_capture_publishes_two_descriptor_events_outside_graph_body(
         [16],
         [16],
     ]
-    assert events == [
-        "control_update",
-        "control_send",
-        "graph_enter",
-        "graph_exit",
-        "control_update",
-        "control_send",
-        "graph_enter",
-        "graph_exit",
-        "control_update",
-        "control_send",
-        "graph_enter",
-        "graph_exit",
-        "control_update",
-        "control_send",
-        "graph_enter",
-        "graph_exit",
-    ]
+    assert events == (
+        ["control_update", "control_send", "graph_enter", "graph_exit"] * 4
+        if has_control_plane
+        else ["graph_enter", "graph_exit"] * 4
+    )
     assert cudagraph_utils.prepare_inputs_to_capture is original_prepare
     assert (
         afd_forward_context.forward_context_module.create_forward_context
@@ -689,10 +677,12 @@ def test_v2_capture_profile_only_truncates_tracker_and_forwards_flag(monkeypatch
     [(0, 3), (1, 1)],
     ids=["rank0-real3", "rank1-idle-real1"],
 )
+@pytest.mark.parametrize("has_control_plane", [False, True])
 def test_v2_dp2_repeated_fullgraph_replay_sends_local_real_and_padded_tokens(
     monkeypatch,
     data_parallel_rank,
     real_tokens,
+    has_control_plane,
 ):  # long-test: repeated native replay consumes paired real/padded control payloads
     events: list[str] = []
     runner = _runner_for_metadata(
@@ -716,6 +706,8 @@ def test_v2_dp2_repeated_fullgraph_replay_sends_local_real_and_padded_tokens(
             super().send_dp_metadata_list(payload)
 
     runner.connector = ReplayConnector(events)
+    if not has_control_plane:
+        runner.connector.control_plane = None
 
     def native_replay(self, desc):
         metadata = runner._afd_pending_metadata
@@ -750,21 +742,17 @@ def test_v2_dp2_repeated_fullgraph_replay_sends_local_real_and_padded_tokens(
         ([8], [real_tokens]),
         ([8], [real_tokens]),
     ]
-    assert [(p.is_warmup, p.is_graph_capturing) for p in payloads] == [
-        (False, False),
-        (False, False),
-    ]
+    assert [(p.is_warmup, p.is_graph_capturing) for p in payloads] == (
+        [(False, False), (False, False)] if has_control_plane else []
+    )
     assert [
         p.dp_metadata_list[0].num_tokens_across_dp_cpu.tolist() for p in payloads
-    ] == [[8, 8], [8, 8]]
-    assert events == [
-        "control_update",
-        "control_send",
-        "native_replay",
-        "control_update",
-        "control_send",
-        "native_replay",
-    ]
+    ] == ([[8, 8], [8, 8]] if has_control_plane else [])
+    assert events == (
+        ["control_update", "control_send", "native_replay"] * 2
+        if has_control_plane
+        else ["native_replay"] * 2
+    )
     assert cudagraph_utils.CudaGraphManager.run_fullgraph is class_replay
     assert manager.__dict__["run_fullgraph"] is native_bound_replay
 
@@ -1066,12 +1054,16 @@ def test_dummy_profile_preserves_randomization(
 
 
 @pytest.mark.parametrize("raise_in_native", [False, True])
+@pytest.mark.parametrize("has_control_plane", [False, True])
 def test_v2_provider_orders_control_before_data_and_always_restores(
     monkeypatch,
     raise_in_native,
+    has_control_plane,
 ):  # long-test: success/failure share one native context and peer message protocol
     events: list[str] = []
     runner = _runner_for_metadata(events)
+    if not has_control_plane:
+        runner.connector.control_plane = None
     context = ForwardContext(
         no_compile_layers={},
         attn_metadata={},
@@ -1094,6 +1086,9 @@ def test_v2_provider_orders_control_before_data_and_always_restores(
     )
 
     def native_execute(self, *args, **kwargs):
+        from vllm.v1.worker.dp_utils import should_skip_dp_coordination
+
+        assert should_skip_dp_coordination() is not has_control_plane
         native_context = forward_context_module.create_forward_context()
         native_context.additional_kwargs["afd_metadata"].connector.send_attn_output(
             None,
@@ -1117,7 +1112,9 @@ def test_v2_provider_orders_control_before_data_and_always_restores(
             == "native-result"
         )
 
-    assert events == ["control_update", "control_send", "data"]
+    assert events == (
+        ["control_update", "control_send", "data"] if has_control_plane else ["data"]
+    )
     assert (
         forward_context_module.create_forward_context is original_create_forward_context
     )

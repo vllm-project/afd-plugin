@@ -820,6 +820,22 @@ def test_ffn_worker_loop_rejects_connector_without_control_plane():
         worker._run_ffn_server_loop()
 
 
+def test_ffn_worker_loop_drains_before_finishing_async_receiver(loop_worker):
+    events = []
+    worker = loop_worker(None)
+    worker.model_runner.execute_connector_driven_step = lambda *, cancel_requested: (
+        False
+    )
+    worker.model_runner.drain = lambda: events.append("drain")
+    worker.model_runner.session = SimpleNamespace(
+        finish_receiver=lambda: events.append("receiver_finished"),
+    )
+
+    worker._run_ffn_server_loop()
+
+    assert events == ["drain", "receiver_finished"]
+
+
 def test_ffn_worker_loop_logs_unexpected_thread_errors(caplog):
     worker = object.__new__(AFDFFNWorker)
     worker._ffn_thread = None
