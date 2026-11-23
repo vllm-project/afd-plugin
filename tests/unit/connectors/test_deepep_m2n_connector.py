@@ -886,6 +886,20 @@ def test_close_cancels_the_control_receive_but_not_the_lanes_group(monkeypatch):
         connector.control_plane.recv_dp_metadata_list()
 
 
+def test_control_plane_close_joins_a_pending_eplb_boundary():
+    """Closing Attention releases FFN ranks blocked in the EPLB exchange."""
+    calls = []
+    connector = SimpleNamespace(
+        _eplb_finish=lambda: calls.append("finish"),
+        group=None,
+    )
+    control = connector_module.DeepEPM2NAFDControlPlane(connector)
+
+    control.close()
+
+    assert calls == ["finish"]
+
+
 def test_close_destroys_the_distinct_transport_group_after_lanes(monkeypatch):
     """A per-domain transport group is destroyed once, after its lanes.
 

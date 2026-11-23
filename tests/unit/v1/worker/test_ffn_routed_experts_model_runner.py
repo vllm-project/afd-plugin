@@ -11,6 +11,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
+from afd_plugin.eplb.lifecycle import FFNEplbLifecycle  # noqa: E402
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner  # noqa: E402
 from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (  # noqa: E402
     GPUFFNRoutedExpertsModelRunner,
@@ -38,6 +39,7 @@ def _runner(connector=None):
     runner.use_cuda_graph = False
     runner._cuda_graphs = {}
     runner.prof = None
+    runner.eplb_lifecycle = FFNEplbLifecycle(SimpleNamespace(), SimpleNamespace(), None)
     return runner
 
 

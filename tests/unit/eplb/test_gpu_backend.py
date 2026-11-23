@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from afd_plugin.eplb.gpu import GpuVllmEplbBackend
+from afd_plugin.eplb.gpu import GpuVllmEplbBackend, create_gpu_eplb_backend
 
 MODEL_CONFIG = object()
 
@@ -63,6 +63,12 @@ def _backend(controller: FakeController) -> GpuVllmEplbBackend:
     backend.model_config = MODEL_CONFIG
     backend.controller = controller
     return backend
+
+
+def test_factory_returns_none_when_eplb_is_disabled():
+    config = SimpleNamespace(parallel_config=SimpleNamespace(enable_eplb=False))
+
+    assert create_gpu_eplb_backend(config, None) is None
 
 
 def test_initialize_model_creates_state_registers_and_starts_async_loop():

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from afd_plugin.eplb.npu import AscendEplbBackend
+from afd_plugin.eplb.npu import AscendEplbBackend, create_ascend_eplb_backend
 
 MODEL_CONFIG = object()
 
@@ -60,6 +60,12 @@ def _backend(controller: FakeController) -> AscendEplbBackend:
     backend.model_config = MODEL_CONFIG
     backend.controller = controller
     return backend
+
+
+def test_factory_returns_none_when_eplb_is_disabled():
+    config = SimpleNamespace(parallel_config=SimpleNamespace(enable_eplb=False))
+
+    assert create_ascend_eplb_backend(config, None) is None
 
 
 def test_initialize_model_registers_the_ascend_state():

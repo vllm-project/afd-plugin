@@ -159,6 +159,22 @@ def _new_ffn_runner():
     return runner
 
 
+class _RecordingEplbLifecycle:
+    """Records the NPU FFN runner's EPLB lifecycle calls."""
+
+    is_enabled = True
+
+    def __init__(self):
+        self.calls = []
+
+    def prepare_forward(self, num_unpadded_tokens, *, is_dummy=False):
+        self.calls.append(("prepare", num_unpadded_tokens, is_dummy))
+
+    def step(self, *, is_dummy=False):
+        self.calls.append(("step", is_dummy))
+        return False
+
+
 def _new_ffn_worker():
     _require_npu_runtime()
     from afd_plugin.v1.worker.npu.ffn_worker import AFDNPUFFNWorker
@@ -296,6 +312,79 @@ def test_npu_ffn_runner_sends_structured_shared_output(monkeypatch):
             },
         ),
     ]
+
+
+def test_npu_ffn_runner_prepares_and_steps_eplb_around_eager_execution(
+    monkeypatch,
+):
+    _patch_ffn_forward_context(monkeypatch)
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(role="ffn")
+    runner.connector = _FakeFFNConnector(attn_size=2)
+    runner.model = _FakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 1
+    runner.use_aclgraph = False
+    runner._acl_graphs = {}
+    lifecycle = _RecordingEplbLifecycle()
+    runner.eplb_lifecycle = lifecycle
+    monkeypatch.setattr(runner, "_ffn_forward", lambda **_kwargs: None)
+
+    runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([3, 5])})
+
+    # Two DP counts replicated across two Attention ranks: 8 real tokens.
+    assert lifecycle.calls == [("prepare", 8, False), ("step", False)]
+
+
+def test_npu_ffn_runner_prepares_and_steps_eplb_around_replay():
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(role="ffn")
+    runner.connector = _FakeFFNConnector()
+    runner.model = _FakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 1
+    runner.use_aclgraph = True
+    dp_metadata = {0: _FakeDPMetadata([1])}
+    graph = _FakeGraph()
+    runner._acl_graphs = {runner._make_graph_key(dp_metadata): {"graph": graph}}
+    lifecycle = _RecordingEplbLifecycle()
+    runner.eplb_lifecycle = lifecycle
+
+    runner.execute_model(
+        dp_metadata_list=dp_metadata,
+        is_graph_replaying=True,
+    )
+
+    assert graph.replay_count == 1
+    assert lifecycle.calls == [("prepare", 1, False), ("step", False)]
+
+
+def test_npu_ffn_runner_capture_steps_eplb_as_dummy(monkeypatch):
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(role="ffn")
+    runner.connector = _FakeFFNConnector()
+    runner.model = _FakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 1
+    runner.use_aclgraph = True
+    runner._acl_graphs = {}
+    runner.graph_pool = None
+    lifecycle = _RecordingEplbLifecycle()
+    runner.eplb_lifecycle = lifecycle
+    monkeypatch.setattr(runner, "_ffn_forward", lambda **_kwargs: None)
+    monkeypatch.setattr(ffn_model_runner.torch.npu, "mem_get_info", lambda: (0, 0))
+    monkeypatch.setattr(
+        ffn_model_runner, "set_cudagraph_capturing_enabled", lambda _enabled: None
+    )
+
+    runner.capture_model(
+        dp_metadata_list={0: _FakeDPMetadata([1])},
+        is_warmup=True,
+    )
+
+    assert lifecycle.calls == [("prepare", 1, True), ("step", True)]
 
 
 def test_npu_ffn_runner_replays_acl_graph_when_key_exists():

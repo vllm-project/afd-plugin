@@ -129,6 +129,8 @@ def test_qwen_text_only_uses_upstream_missing_vision_tower_stage(
         parallel_config=SimpleNamespace(
             enable_eplb=False,
             eplb_config=SimpleNamespace(num_redundant_experts=0, use_async=False),
+            enable_dbo=False,
+            use_ubatching=False,
             pipeline_parallel_size=1,
             use_sequence_parallel_moe=False,
         ),
@@ -177,7 +179,11 @@ def test_qwen_text_only_uses_upstream_missing_vision_tower_stage(
 
 @pytest.fixture
 def conditional_config(monkeypatch):
-    afd = SimpleNamespace(role="attention", compute_gate_on_attention=False)
+    afd = SimpleNamespace(
+        role="attention",
+        connector="P2pNcclAFDConnector",
+        compute_gate_on_attention=False,
+    )
     config = SimpleNamespace(
         lora_config=None,
         speculative_config=None,
@@ -187,6 +193,8 @@ def conditional_config(monkeypatch):
         parallel_config=SimpleNamespace(
             enable_eplb=False,
             eplb_config=SimpleNamespace(num_redundant_experts=0, use_async=False),
+            enable_dbo=False,
+            use_ubatching=False,
             pipeline_parallel_size=1,
             use_sequence_parallel_moe=False,
         ),
@@ -247,15 +255,22 @@ def test_qwen_attention_eplb_raises_the_eplb_capability_error(conditional_config
 
 
 def test_qwen_ffn_role_eplb_passes_feature_gates(conditional_config):
-    """FFN-role EPLB passes the gates that Attention-role EPLB fails.
+    """FFN-role EPLB passes the capability gate that Attention-role EPLB fails."""
+    from afd_plugin.eplb.capability import (
+        EplbPath,
+        check_eplb_support,
+        eplb_request_from_vllm_config,
+    )
 
-    Why: the fixture traps visual-tower construction, which only runs after
-    every unsupported-feature check, so reaching it proves the checks passed.
-    """
     conditional_config.afd.role = "ffn"
     conditional_config.config.parallel_config.enable_eplb = True
 
-    with pytest.raises(pytest.fail.Exception, match="visual path was constructed"):
-        adapter.AFDQwen3_5MoeForConditionalGeneration(
-            vllm_config=conditional_config.config
+    path = check_eplb_support(
+        eplb_request_from_vllm_config(
+            conditional_config.config,
+            conditional_config.afd,
+            supports_expert_weight_views=True,
         )
+    )
+
+    assert path is EplbPath.FFN_LOCAL

@@ -307,7 +307,10 @@ class GPUFFNModelRunner:
         idle Attention peers transfer are excluded.
         """
 
-        if not self.vllm_config.parallel_config.enable_eplb:
+        if not (
+            self.eplb_lifecycle.is_enabled
+            and self.vllm_config.parallel_config.enable_eplb
+        ):
             return
         if len(dp_metadata_list) != 1:
             raise RuntimeError(

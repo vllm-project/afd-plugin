@@ -98,6 +98,8 @@ def _model_config(
         parallel_config=SimpleNamespace(
             enable_eplb=False,
             eplb_config=SimpleNamespace(num_redundant_experts=0, use_async=False),
+            enable_dbo=False,
+            use_ubatching=False,
             pipeline_parallel_size=1,
             tensor_parallel_size=1,
             use_sequence_parallel_moe=False,

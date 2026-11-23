@@ -276,6 +276,47 @@ def _routing(component_module, offset, tokens=4):
     )
 
 
+def test_expert_counts_are_recorded_when_the_router_has_eplb_state(
+    loaded, monkeypatch: pytest.MonkeyPatch
+):
+    """The direct-apply path hands the operator's counts to the EPLB op."""
+    module, _context, _ = loaded
+    calls = []
+    monkeypatch.setattr(
+        torch.ops,
+        "vllm",
+        types.SimpleNamespace(
+            ascend_eplb_record_expert_tokens=lambda *args: calls.append(args)
+        ),
+        raising=False,
+    )
+    import torch as real_torch
+
+    expert_tokens = real_torch.tensor([1, 2, 3], dtype=real_torch.int32)
+    load_view = real_torch.zeros(3, dtype=real_torch.int32)
+    record_enabled = real_torch.ones((), dtype=real_torch.bool)
+    state = types.SimpleNamespace(
+        expert_load_view=load_view,
+        should_record_tensor=record_enabled,
+        local_expert_count=3,
+        local_expert_start=0,
+    )
+    experts = types.SimpleNamespace(
+        router=types.SimpleNamespace(eplb_state=state),
+    )
+    result = types.SimpleNamespace(expert_tokens=expert_tokens, group_list_type=1)
+
+    module._record_eplb_load(experts, result)
+
+    assert len(calls) == 1
+    args = calls[0]
+    assert args[0] is expert_tokens
+    assert args[1] is load_view
+    assert args[2] is record_enabled
+    assert args[3] == 1
+    assert args[4] == 0
+
+
 def test_the_routing_reaches_apply_unchanged(loaded):
     module, context, _ = loaded
     experts = _Experts()
