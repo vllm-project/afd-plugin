@@ -51,6 +51,10 @@ from afd_plugin.model_executor.models._weight_utils import (
     filter_role_weights,
     layer_weight_path,
 )
+from afd_plugin.model_executor.models.model_utils import (
+    AFDCausalLMHooks,
+    AFDModelHooks,
+)
 from afd_plugin.model_executor.models.npu.deepseek_v4_shared_experts import (
     AFDDeepseekV4SharedExperts,
 )
@@ -612,7 +616,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
 
 
 @native.support_torch_compile
-class AFDDeepseekV4Model(native.DeepseekV4Model):
+class AFDDeepseekV4Model(AFDModelHooks, native.DeepseekV4Model):
     """DSV4 model with role-local Attention/FFN allocations."""
 
     fall_back_to_pt_during_load = False
@@ -777,14 +781,6 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         )
         # ### PATCH END: AFD model introspection
 
-    def compute_ffn_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        return self.layers[layer_idx].compute_ffn_output(hidden_states, **kwargs)
-
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return tuple(
             layer.layer_idx
@@ -818,7 +814,10 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         )
 
 
-class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
+class AFDDeepseekV4ForCausalLM(
+    AFDCausalLMHooks,
+    native.AscendDeepseekV4ForCausalLM,
+):
     """Ascend DSV4 causal LM wrapper for AFD."""
 
     model_cls = AFDDeepseekV4Model
@@ -827,11 +826,6 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
     # input_ids, so the connector must transport them and the FFN runner
     # installs them in the forward context before the FFN compute.
     afd_requires_input_ids = True
-
-    # The wire slot carries either token ids or Attention-side routing, never both.
-    # When the router lives on Attention with the sync connector, the FFN side needs
-    # the routing instead of the ids, and the runner must ask for it by name.
-    afd_requires_attention_routing = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         self.afd_config = parse_afd_config(vllm_config, validate=False)
@@ -865,35 +859,6 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         self,
     ) -> "tuple[list[QuantizedExpertWeights], str]":
         return _extract_quantized_expert_weights(self.model.layers)
-
-    def compute_ffn_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        return self.model.compute_ffn_output(hidden_states, layer_idx, **kwargs)
-
-    def get_experts_layer_indices(self) -> tuple[int, ...]:
-        return self.model.get_experts_layer_indices()
-
-    def get_experts_routing_spec(
-        self,
-        layer_idx: int,
-    ) -> AFDExpertRoutingSpec:
-        return self.model.get_experts_routing_spec(layer_idx)
-
-    def compute_experts_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-        router_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.model.compute_experts_output(
-            hidden_states,
-            layer_idx,
-            router_logits,
-        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Only the gate-on-Attention configuration gives Attention a router; with

@@ -282,10 +282,8 @@ class GPUFFNModelRunner:
         # The wire slot carries one payload: either token ids or Attention-side
         # routing. Routing wins when the model declares it, because a sync
         # gate-on-Attention model does not need ids on the FFN side at all.
-        recv_routing = getattr(model, "afd_requires_attention_routing", False)
-        recv_input_ids = (
-            False if recv_routing else getattr(model, "afd_requires_input_ids", False)
-        )
+        recv_routing = model.afd_requires_attention_routing
+        recv_input_ids = False if recv_routing else model.afd_requires_input_ids
         with _ffn_forward_context(self.vllm_config) as forward_context:
             for layer_idx in layer_indices:
                 uses_remote_experts = layer_idx in experts_layer_indices

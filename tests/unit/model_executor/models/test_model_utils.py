@@ -58,6 +58,40 @@ def model_utils(monkeypatch):
     return load_host_module(monkeypatch, "afd_plugin.model_executor.models.model_utils")
 
 
+class _RecordingLayer:
+    def __init__(self, output):
+        self.output = output
+        self.calls = []
+
+    def compute_ffn_output(self, hidden_states, **ffn_inputs):
+        self.calls.append((hidden_states, ffn_inputs))
+        return self.output
+
+
+@pytest.mark.parametrize(
+    "ffn_inputs",
+    [
+        {},
+        {"input_ids": object()},
+        {"topk_ids": object(), "topk_weights": object()},
+    ],
+    ids=["no-extras", "input-ids", "attention-routing"],
+)
+def test_causal_lm_hooks_route_ffn_compute_to_target_layer(model_utils, ffn_inputs):
+    layers = [_RecordingLayer("layer-0"), _RecordingLayer("layer-1")]
+    inner = model_utils.AFDModelHooks()
+    inner.layers = layers
+    outer = model_utils.AFDCausalLMHooks()
+    outer.model = inner
+
+    hidden_states = object()
+    output = outer.compute_ffn_output(hidden_states, 1, **ffn_inputs)
+
+    assert output == "layer-1"
+    assert layers[0].calls == []
+    assert layers[1].calls == [(hidden_states, ffn_inputs)]
+
+
 @pytest.mark.parametrize(
     "architecture,device_type",
     [

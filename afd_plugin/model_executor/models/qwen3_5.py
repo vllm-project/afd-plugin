@@ -19,6 +19,10 @@ from afd_plugin.model_executor.models._weight_utils import (
     filter_role_weights,
     layer_weight_path,
 )
+from afd_plugin.model_executor.models.model_utils import (
+    AFDCausalLMHooks,
+    AFDModelHooks,
+)
 
 _NO_ROLES: frozenset[str] = frozenset()
 
@@ -260,7 +264,7 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
         "inputs_embeds": 0,
     }
 )
-class AFDQwen3_5Model(native.Qwen3_5Model):  # noqa: N801
+class AFDQwen3_5Model(AFDModelHooks, native.Qwen3_5Model):  # noqa: N801
     """Native Qwen model lifecycle with AFD role-aware decoder layers."""
 
     fall_back_to_pt_during_load = False
@@ -344,18 +348,12 @@ class AFDQwen3_5Model(native.Qwen3_5Model):  # noqa: N801
         # ### PATCH END
         self.aux_hidden_state_layers: tuple[int, ...] = ()
 
-    def compute_ffn_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-    ) -> torch.Tensor:
-        return self.layers[layer_idx].compute_ffn_output(hidden_states)
-
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return tuple(range(self.start_layer, self.end_layer))
 
 
 class AFDQwen3_5MoeForCausalLM(  # noqa: N801
+    AFDCausalLMHooks,
     native.Qwen3_5MoeForCausalLM,
 ):
     """Text-generation shell that owns the role-aware native Qwen model."""
@@ -422,18 +420,9 @@ class AFDQwen3_5MoeForCausalLM(  # noqa: N801
         )
         self.set_moe_parameters()
 
-    def compute_ffn_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-    ) -> torch.Tensor:
-        return self.model.compute_ffn_output(hidden_states, layer_idx)
-
-    def get_experts_layer_indices(self) -> tuple[int, ...]:
-        return self.model.get_experts_layer_indices()
-
 
 class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
+    AFDCausalLMHooks,
     native.Qwen3_5MoeForConditionalGeneration,
 ):
     """Qwen3.5/3.6 checkpoint wrapper for text-only AFD execution."""
@@ -519,15 +508,8 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
         )
         self.set_moe_parameters()
 
-    def compute_ffn_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-    ) -> torch.Tensor:
-        return self.language_model.compute_ffn_output(hidden_states, layer_idx)
-
-    def get_experts_layer_indices(self) -> tuple[int, ...]:
-        return self.language_model.get_experts_layer_indices()
+    def afd_inner_model(self) -> AFDModelHooks:
+        return self.language_model.afd_inner_model()
 
     # Patch reason: native loading allocates every Qwen checkpoint path locally.
     # Patch functionality: filter checkpoint paths to the owning AFD role.

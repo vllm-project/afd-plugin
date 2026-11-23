@@ -26,6 +26,9 @@ class _OtherImpl:
 @pytest.fixture
 def construct_model(torch):
     layers = importlib.import_module("tests.unit.fakes.model_layers")
+    model_utils = importlib.import_module(
+        "afd_plugin.model_executor.models.model_utils"
+    )
     nn = torch.nn
 
     # Execute the real constructors with CPU collaborators instead of importing
@@ -138,6 +141,8 @@ def construct_model(torch):
             "cast": cast,
             "nn": nn,
             "native": native,
+            "AFDModelHooks": model_utils.AFDModelHooks,
+            "AFDCausalLMHooks": model_utils.AFDCausalLMHooks,
             "AFD_ASYNC_CONNECTOR": "CAMAsyncAFDConnector",
             "parse_afd_config": lambda config, **kwargs: config.afd,
             "_refresh_ascend_fused_moe": lambda: None,
