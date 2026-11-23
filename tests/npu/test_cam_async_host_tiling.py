@@ -56,7 +56,7 @@ def host_budget_probe(tmp_path_factory: pytest.TempPathFactory) -> dict[str, int
         None,
     )
     if compiler is None:
-        pytest.skip(
+        return pytest.skip(
             "A GNU-compatible C++17 compiler is required for the host budget probe"
         )
     root = Path(__file__).resolve().parents[2]
