@@ -135,12 +135,14 @@ def _require_npu_runtime():
 
 def _new_ffn_runner():
     _require_npu_runtime()
-    from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
-
     # object.__new__ bypasses __init__, which is where the runner would set up
     # the profiler and device; provide inert defaults the runtime paths expect.
+    from afd_plugin.eplb.lifecycle import FFNEplbLifecycle
+    from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
+
     runner = object.__new__(AFDNPUFFNModelRunner)
     runner.prof = None
+    runner.eplb_lifecycle = FFNEplbLifecycle(SimpleNamespace(), SimpleNamespace(), None)
     runner.device = SimpleNamespace(type="npu")
     runner._is_shutdown = False
     runner.effective_mode = "eager"

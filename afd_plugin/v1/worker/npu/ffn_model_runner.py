@@ -31,6 +31,8 @@ from afd_plugin.connectors import (
     AFDForwardContextMetadata,
     AFDTransferContext,
 )
+from afd_plugin.eplb.lifecycle import FFNEplbLifecycle
+from afd_plugin.eplb.npu import create_ascend_eplb_backend
 from afd_plugin.v1.worker.attention_metadata import (
     _resolve_world_ranks,
 )
@@ -38,7 +40,10 @@ from afd_plugin.v1.worker.cuda_graph import (
     AFDGraphRunMode,
     graph_run_mode,
 )
-from afd_plugin.v1.worker.ffn_metadata import _set_moe_layer_index
+from afd_plugin.v1.worker.ffn_metadata import (
+    _set_moe_layer_index,
+    real_attention_token_total,
+)
 from afd_plugin.validation import validate_npu_model_runner_v2_config
 
 if TYPE_CHECKING:
@@ -86,6 +91,13 @@ class AFDNPUFFNModelRunner:
             )
         self.connector = connector
         self.num_layers = int(self.model_config.hf_config.num_hidden_layers)
+        # Expert parallelism load balancer. EPLB runs on the FFN role only;
+        # the lifecycle no-ops unless ``parallel_config.enable_eplb`` is set.
+        self.eplb_lifecycle = FFNEplbLifecycle(
+            vllm_config,
+            afd_config,
+            create_ascend_eplb_backend(vllm_config, device),
+        )
         self.use_aclgraph = _use_npu_aclgraph(vllm_config)
         self._acl_graphs: dict[tuple, dict[str, Any]] = {}
         self.graph_pool = (
@@ -131,6 +143,7 @@ class AFDNPUFFNModelRunner:
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
         self.model_memory_usage = profiler.consumed_memory
+        self.eplb_lifecycle.initialize_model(self.model)
 
     def get_model(self) -> torch.nn.Module:
         if self.model is None:
@@ -212,6 +225,7 @@ class AFDNPUFFNModelRunner:
             graph_enabled=graph_enabled,
             graph_exists=graph_info is not None,
         )
+        is_dummy = is_warmup or is_graph_capturing
         if run_mode is AFDGraphRunMode.REPLAY:
             assert graph_info is not None
             logger.debug(
@@ -219,20 +233,57 @@ class AFDNPUFFNModelRunner:
                 graph_key,
                 len(acl_graphs),
             )
+            self._eplb_prepare_forward(dp_metadata_list, is_dummy=is_dummy)
             graph_info["graph"].replay()
+            self.eplb_lifecycle.step(is_dummy=is_dummy)
             return None
         if run_mode in (AFDGraphRunMode.WARMUP, AFDGraphRunMode.CAPTURE):
+            # ``capture_model`` owns the EPLB lifecycle for capture steps.
             return self.execute_ffn_step(
                 dp_metadata_list=dp_metadata_list,
                 is_graph_capturing=is_graph_capturing,
                 is_warmup=is_warmup,
             )
 
+        self._eplb_prepare_forward(dp_metadata_list, is_dummy=is_dummy)
         self._ffn_forward(
             dp_metadata_list=dp_metadata_list,
             is_profile=is_profile,
         )
+        self.eplb_lifecycle.step(is_dummy=is_dummy)
         return None
+
+    def _eplb_prepare_forward(
+        self,
+        dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
+        *,
+        is_dummy: bool,
+    ) -> None:
+        """Publish the step's real Attention token count to FFN EPLB.
+
+        DBO/ubatching is rejected with EPLB, so there is exactly one stage.
+        NPU's Ascend routed-experts operator records load from its own
+        ``expert_tokens`` output, but the Ascend controller still uses this
+        call to gate recording and to support paths that need the count.
+        """
+        if not self.eplb_lifecycle.is_enabled:
+            return
+        if len(dp_metadata_list) != 1:
+            raise RuntimeError(
+                "AFD NPU FFN EPLB supports exactly one stage per step; DBO "
+                f"and ubatching are not supported, got {sorted(dp_metadata_list)}"
+            )
+        stage_metadata = next(iter(dp_metadata_list.values()))
+        attention_counts = tuple(
+            int(count) for count in stage_metadata.num_tokens_across_dp_cpu
+        )
+        self.eplb_lifecycle.prepare_forward(
+            real_attention_token_total(
+                attention_counts,
+                attention_size=int(self.connector.attn_size),
+            ),
+            is_dummy=is_dummy,
+        )
 
     def _make_graph_key(
         self,
@@ -384,6 +435,7 @@ class AFDNPUFFNModelRunner:
             is_attn_graph_capturing,
         )
         start_free_memory = int(torch.npu.mem_get_info()[0])
+        self._eplb_prepare_forward(dp_metadata_list, is_dummy=True)
         set_cudagraph_capturing_enabled(True)
         try:
             if is_warmup:
@@ -404,6 +456,7 @@ class AFDNPUFFNModelRunner:
                     )
         finally:
             set_cudagraph_capturing_enabled(False)
+        self.eplb_lifecycle.step(is_dummy=True)
 
         end_free_memory = int(torch.npu.mem_get_info()[0])
         graph_size = max(0, int(start_free_memory - end_free_memory))
