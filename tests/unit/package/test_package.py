@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import importlib.util
+import os
 import sys
 from collections.abc import Callable
 from importlib.machinery import ModuleSpec
@@ -14,6 +15,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 import afd_plugin
+from afd_plugin.compat.npu import ops
 
 
 def test_models_metadata_compat_export(monkeypatch):
@@ -135,6 +137,37 @@ def test_register_afd_preserves_native_models_and_is_idempotent(registration):
     # ModelRegistry is the external registration seam; compare requests without
     # requiring the implementation's iteration order.
     assert sorted(registration.sent) == sorted(expected.items())
+
+
+@pytest.mark.parametrize("registration", ["npu"], indirect=True)
+def test_register_publishes_a5_vendor_before_runtime_setup(
+    registration, monkeypatch, tmp_path
+):
+    library = tmp_path / "op_api/lib/libafd_cust_opapi.so"
+    library.parent.mkdir(parents=True)
+    library.touch()
+    monkeypatch.setattr(ops, "get_afd_cann_vendor_path", lambda: tmp_path)
+    monkeypatch.delenv("AFD_CUST_OPAPI_LIB_PATH", raising=False)
+    monkeypatch.setenv("ASCEND_CUSTOM_OPP_PATH", "/native/vendor")
+    observed = []
+
+    def check_version(*, strict):
+        observed.append(
+            (
+                os.environ.get("AFD_CUST_OPAPI_LIB_PATH"),
+                os.environ["ASCEND_CUSTOM_OPP_PATH"],
+            )
+        )
+
+    monkeypatch.setattr(
+        sys.modules["afd_plugin.compat.vllm"],
+        "assert_vllm_version_supported",
+        check_version,
+    )
+    registration.plugin.register_afd()
+    assert observed == [
+        (str(library), os.pathsep.join(("/native/vendor", str(tmp_path))))
+    ]
 
 
 def test_entry_point_is_registered():

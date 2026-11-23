@@ -106,13 +106,13 @@ class AFDNPUFFNWorker(NPUWorker):
         )
         configure_afd_dspark(self.vllm_config)
 
-        self.device = self._init_device()
-        # FLA registration needs the selected device, before Runner construction.
-        register_ascend_fla_customop()
         if afd_config.connector == AFD_ASYNC_CONNECTOR:
             if get_ascend_device_type() != AscendDeviceType.A3:
                 raise ValueError("layered GMM requires Ascend 910C/A3")
             ensure_cam_async_ops_available()
+        self.device = self._init_device()
+        # FLA registration needs the selected device, before Runner construction.
+        register_ascend_fla_customop()
         init_workspace_manager(
             self.device,
             npu_afd_num_ubatches(self.vllm_config),

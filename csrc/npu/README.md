@@ -128,6 +128,10 @@ Common environment variables:
 - `CMAKE_BUILD_TYPE`: ACLNN operator build type, `Release` (default) or `Debug`.
 - `AFD_SKIP_ACLNN_BUILD=1`: skip rebuilding the ACLNN operator package and
   build the PyTorch extension against an existing custom-op installation.
+  At async CAM startup, each worker checks the four compact operator schemas
+  and resolves their eight ACLNN execution and workspace-query symbols before
+  joining the CAM communication group. If the installed library is stale,
+  the error identifies its path and missing symbols.
 
 The setup flow calls:
 

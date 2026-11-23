@@ -64,11 +64,11 @@ class AFDNPUAttentionWorker(NPUWorker):
         )
         configure_afd_dspark(self.vllm_config)
 
+        if afd_config.connector == AFD_ASYNC_CONNECTOR:
+            ensure_cam_async_ops_available()
         self.device = self._init_device()
         # FLA registration needs the selected device, before Runner construction.
         register_ascend_fla_customop()
-        if afd_config.connector == AFD_ASYNC_CONNECTOR:
-            ensure_cam_async_ops_available()
         init_workspace_manager(
             self.device,
             npu_afd_num_ubatches(self.vllm_config),
