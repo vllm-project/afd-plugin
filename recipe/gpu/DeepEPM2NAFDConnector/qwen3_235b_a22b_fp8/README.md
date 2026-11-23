@@ -10,14 +10,16 @@ prefill_decode_colocation/
 ├── 4a2f_eager_dp4tp1.sh       # eager, FFN DP2/TP1, Attention DP4/TP1
 ├── 4a2f_graph_dp4tp1.sh       # graph, FFN DP2/TP1, Attention DP4/TP1
 ├── 4a2f_dbo_dp4tp1.sh         # graph + DBO, FFN DP2/TP1, Attention DP4/TP1
-└── multipod_4a1f_4a1f_dbo.sh  # 2 pods, graph + DBO, Attention DP8/TP1
+├── 4a2f_graph_dp4tp1_eplb.sh  # graph + EPLB, FFN DP2/EP2, Attention DP4/TP1
+├── multipod_4a1f_4a1f_dbo.sh  # 2 pods, graph + DBO, Attention DP8/TP1
+└── multipod_8a8f_graph_eplb.sh  # 2 pods, graph + EPLB, 8A on pod 0, 8F on pod 1
 ```
 
 ## Defaults
 
 | Setting | `4a2f_graph_dp4tp1.sh`, `4a2f_eager_dp4tp1.sh` | `4a2f_dbo_dp4tp1.sh`, `multipod_4a1f_4a1f_dbo.sh` |
 | --- | --- | --- |
-| `LAYOUT` | `4A2F` | `4A2F` / `4A1F,4A1F` |
+| `LAYOUT` | `4A2F` | `4A2F` / `4A1F,4A1F` / `8A0F,0A8F` |
 | `--max-num-seqs` | 256 per Attention DP rank | 512 |
 | `--max-num-batched-tokens` | 3072 | 3072 |
 | `--max-model-len` | 4096 | 4096 |
