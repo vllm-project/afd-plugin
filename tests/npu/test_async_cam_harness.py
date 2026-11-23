@@ -197,6 +197,16 @@ class AsyncCamPlannerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "48-AIV owner"):
             validate_config(replace(HarnessConfig(), moe_ranks=49))
 
+    def test_950_preflight_uses_declared_device_resources(self):
+        config = HarnessConfig(soc_version="950")
+        with self.assertRaisesRegex(ValueError, "950 requires explicit"):
+            validate_config(config)
+        config = replace(config, aiv_count=8, ub_budget_bytes=CONSERVATIVE_UB_BYTES)
+        validate_config(config)
+        peak = max(unified_buffer_requirements(config).values())
+        with self.assertRaisesRegex(ValueError, "UB bytes"):
+            validate_config(replace(config, ub_budget_bytes=peak - 1))
+
     def test_cli_help_and_dry_run_use_only_standard_library(self):
         script = REPOSITORY_ROOT / "tests/npu/async_cam_precision.py"
         for arguments in (("--help",), ("--dry-run", "--capacity", "8")):

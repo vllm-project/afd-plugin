@@ -121,7 +121,13 @@ namespace optiling {
         return ge::GRAPH_SUCCESS;
     }
 
+#ifdef AFD_TILING_HAS_COMM_ENGINE
+    // Retain the A5 registration in the hidden-visibility tiling library.
+    __attribute__((visibility("default"))) gert::OpImplRegisterV2 op_impl_register_optiling_A2e =
+        gert::OpImplRegisterV2("A2e")
+#else
     IMPL_OP_OPTILING(A2e)
+#endif
         .Tiling(A2eTilingFunc)
         .TilingParse<A2eInfo>(TilingParseForA2e);
 }

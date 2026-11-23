@@ -48,13 +48,14 @@ THE SOFTWARE.
 
 
 @pytest.mark.parametrize("operator", CAM_OPERATORS)
-def test_cam_operator_selection_rejects_unqualified_soc(operator: str):
-    result = _run_select_ops("--soc", "ascend950", "--shmem", "1", "--ops", operator)
+@pytest.mark.parametrize("soc", ["ascend910_93", "ascend950"])
+def test_cam_operator_selection_uses_soc_implementation(operator: str, soc: str):
+    result = _run_select_ops("--soc", soc, "--shmem", "0", "--ops", operator)
 
-    assert result.returncode != 0
-    assert operator in result.stderr
-    assert "not in SOC support list" in result.stderr
-    assert not result.stdout
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        f"arch35/{operator}" if soc == "ascend950" else operator
+    ]
 
 
 def test_cam_selection_preserves_registry_order_with_legacy_operators():
@@ -95,16 +96,19 @@ def test_native_sources_survive_source_distribution_manifest(monkeypatch):
     assert " ".join(CAM_MIT_NOTICE.split()) in " ".join(license_text.split())
 
 
-def test_selected_cam_sources_do_not_overwrite_other_operators_when_staged():
+@pytest.mark.parametrize("soc", ["ascend910_93", "ascend950"])
+def test_selected_cam_sources_do_not_overwrite_other_operators_when_staged(soc):
     """The build driver flattens each source category into one directory."""
     root = Path(__file__).resolve().parents[3] / "csrc/npu/ascend_kernels"
-    result = _run_select_ops("--soc", "ascend910_93", "--shmem", "0")
+    result = _run_select_ops("--soc", soc, "--shmem", "0")
     assert result.returncode == 0, result.stderr
 
     for part in ("op_api", "op_host", "op_kernel"):
         staged: dict[str, Path] = {}
         for operator in ("utils", *result.stdout.split()):
             part_dir = root / operator / part
+            if part == "op_api" and not part_dir.is_dir():
+                part_dir = root / Path(operator).name / part
             for path in part_dir.rglob("*"):
                 if not path.is_file():
                     # Nested subdirectories (e.g. op_host/op_tiling/) are copied

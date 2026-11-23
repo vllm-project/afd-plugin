@@ -49,8 +49,8 @@ copy_ops_include() {
     for name in "${ops[@]}"; do
         local subdir="$src_dir/$name"
         if [ ! -d "$subdir" ]; then
-            echo "Warning: operator dir not found, skipping: $name"
-            continue
+            echo "ERROR: registered operator source directory missing: $subdir" >&2
+            return 1
         fi
         if [ -d "$subdir/op_host" ]; then
             cp -rf "$subdir/op_host/"* "$dst_dir/op_host/"
@@ -58,9 +58,13 @@ copy_ops_include() {
         if [ -d "$subdir/op_kernel" ]; then
             cp -rf "$subdir/op_kernel/"* "$dst_dir/op_kernel/"
         fi
-        # op_api interface files go to pregen/build_out/autogen
-        if [ -d "$subdir/op_api" ]; then
-            cp -rf "$subdir/op_api/"* "$dst_dir/pregen/build_out/autogen/"
+        # SoC variants with a shared ACLNN ABI use the common op_api.
+        local api_dir="$subdir/op_api"
+        if [[ ! -d "$api_dir" && "$name" == */* ]]; then
+            api_dir="$src_dir/${name##*/}/op_api"
+        fi
+        if [ -d "$api_dir" ]; then
+            cp -rf "$api_dir/"* "$dst_dir/pregen/build_out/autogen/"
         fi
     done
 }

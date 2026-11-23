@@ -3,7 +3,7 @@
 """Routed-only AFD asynchronous operator harness; imports no device packages eagerly.
 
 The pure Python planner is also used by ``--dry-run``. Native execution requires
-one torchrun process per 910C device and a matching built AFD extension.
+one torchrun process per A3/A5 device and a matching built AFD extension.
 """
 
 from __future__ import annotations
@@ -33,7 +33,9 @@ MAX_SEQUENCE_LENGTH = 262144
 UINT16_MAX = 65535
 MAX_LAYER_INDEX = (1 << 32) - 1
 ALIGNMENT = 32
+# Compatibility defaults for the existing A3 harness; A5 requires explicit inputs.
 MAX_AIV_COUNT = 48
+MAX_A5_RANKS = 64
 MIB = 1024 * 1024
 MAX_WINDOW_MB = 32768
 CONSERVATIVE_UB_BYTES = 192 * 1024
@@ -143,6 +145,9 @@ class HarnessConfig:
     window_mb: int = 64
     timeout_seconds: float = 120.0
     max_seq_len: int = 14
+    soc_version: str = "910c"
+    aiv_count: int | None = None
+    ub_budget_bytes: int | None = None
 
     @property
     def world_size(self) -> int:
@@ -178,6 +183,21 @@ class ChunkPlan:
 
 
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--soc-version", choices=("910c", "950"), default="910c")
+    parser.add_argument(
+        "--aiv-count",
+        type=int,
+        help="Actual AIV count used by native tiling; required for 950. "
+        f"910c defaults to {MAX_AIV_COUNT}. "
+        "This planning input does not control kernel launch.",
+    )
+    parser.add_argument(
+        "--ub-budget-bytes",
+        type=int,
+        help="Checked usable per-core UB budget in bytes; required for 950. "
+        f"910c defaults to {CONSERVATIVE_UB_BYTES}. "
+        "CPU planning does not verify device resources.",
+    )
     parser.add_argument("--attn-ranks", type=int, default=2)
     parser.add_argument("--moe-ranks", type=int, default=2)
     parser.add_argument("--tp-size", type=int, default=2)
@@ -237,6 +257,9 @@ def config_from_args(args: argparse.Namespace) -> HarnessConfig:
         window_mb=args.window_mb,
         timeout_seconds=args.timeout_seconds,
         max_seq_len=args.max_seq_len or max(lengths, default=0) * args.tp_size,
+        soc_version=args.soc_version,
+        aiv_count=args.aiv_count,
+        ub_budget_bytes=args.ub_budget_bytes,
     )
     validate_config(config)
     return config
@@ -351,26 +374,51 @@ def window_requirements(config: HarnessConfig) -> dict[str, int]:
     }
 
 
+def hardware_limits(config: HarnessConfig) -> tuple[int, int]:
+    """Resolve declared resources without inferring A5 hardware from a CPU host."""
+    if config.soc_version not in ("910c", "950"):
+        raise ValueError("soc-version must be 910c or 950")
+    if config.soc_version == "950" and (
+        config.aiv_count is None or config.ub_budget_bytes is None
+    ):
+        raise ValueError("950 requires explicit --aiv-count and --ub-budget-bytes")
+    aiv_count = MAX_AIV_COUNT if config.aiv_count is None else config.aiv_count
+    ub_budget = (
+        CONSERVATIVE_UB_BYTES
+        if config.ub_budget_bytes is None
+        else config.ub_budget_bytes
+    )
+    if aiv_count <= 0 or ub_budget <= 0:
+        raise ValueError("aiv-count and ub-budget-bytes must be positive")
+    if aiv_count > MAX_AIV_COUNT:
+        raise ValueError(
+            f"aiv-count must not exceed the native {MAX_AIV_COUNT}-AIV launch cap"
+        )
+    return aiv_count, ub_budget
+
+
 def unified_buffer_requirements(config: HarnessConfig) -> dict[str, int]:
-    """Conservative peak bytes from the four 910C ``op_kernel`` Init layouts.
+    """Conservative peak bytes from the four baseline ``op_kernel`` Init layouts.
 
     PreProcess scratch aliases later buffers, so count its peak separately.
     Receive addresses are copied for a whole per-source AIV slice without a
     scratch-capacity check in the kernel. Bound that slice by both the receive
-    capacity and source assignments. This planner targets 48 AIVs with at least
-    192 KiB UB; it does not query or qualify hardware from a CPU-only process.
+    capacity and source assignments. The A3 compatibility default uses 48 AIVs
+    and 192 KiB UB; A5 requires explicitly checked resource inputs. This planner
+    does not query or qualify hardware from a CPU-only process.
     """
 
     def align(size: int) -> int:
         return (size + ALIGNMENT - 1) // ALIGNMENT * ALIGNMENT
 
     owners = config.moe_ranks
+    aiv_count, _ = hardware_limits(config)
     experts = config.total_experts
     local_experts = config.experts_per_rank
     tp = config.tp_size
     hidden = config.hidden_size
     metadata_bytes = align(INT64_BYTES * (BATCH_INFO_FIELDS + tp + local_experts * tp))
-    statistics_bytes = align(INT32_BYTES * (owners + experts) * MAX_AIV_COUNT)
+    statistics_bytes = align(INT32_BYTES * (owners + experts) * aiv_count)
     send_prefix = (
         IDS_CACHE_BYTES
         + align(INT32_BYTES * experts)
@@ -408,7 +456,7 @@ def unified_buffer_requirements(config: HarnessConfig) -> dict[str, int]:
         + align(INT32_BYTES * local_experts + INT32_BYTES * local_experts)
     )
     source_chunk_rows = min(config.capacity, max(config.lengths) * config.top_k)
-    rows_per_aiv = (source_chunk_rows + MAX_AIV_COUNT - 1) // MAX_AIV_COUNT
+    rows_per_aiv = (source_chunk_rows + aiv_count - 1) // aiv_count
     recv_scratch = align(INT16_BYTES * rows_per_aiv)
     combine_send_buffers = (
         metadata_bytes
@@ -440,6 +488,7 @@ def unified_buffer_requirements(config: HarnessConfig) -> dict[str, int]:
 
 
 def validate_config(config: HarnessConfig) -> None:
+    aiv_count, ub_budget = hardware_limits(config)
     positive = (
         config.attn_ranks,
         config.moe_ranks,
@@ -454,6 +503,8 @@ def validate_config(config: HarnessConfig) -> None:
         )
     if config.attn_ranks % config.tp_size:
         raise ValueError("tp-size must divide attn-ranks")
+    if config.soc_version == "950" and config.world_size > MAX_A5_RANKS:
+        raise ValueError(f"950 world-size must not exceed {MAX_A5_RANKS}")
     if config.moe_ranks > MAX_AIV_COUNT:
         raise ValueError(
             "moe-ranks exceeds the harness's supported 48-AIV owner layout"
@@ -493,10 +544,10 @@ def validate_config(config: HarnessConfig) -> None:
             "HCCL window is smaller than the kernel's static byte requirement"
         )
     for operation, required in unified_buffer_requirements(config).items():
-        if required > CONSERVATIVE_UB_BYTES:
+        if required > ub_budget:
             raise ValueError(
                 f"{operation} requires at least {required} UB bytes under the "
-                f"48-AIV plan, exceeding the {CONSERVATIVE_UB_BYTES}-byte harness limit"
+                f"{aiv_count}-AIV plan, exceeding the {ub_budget}-byte harness limit"
             )
     # Routing has no duplicate expert IDs, so each source/expert count and each
     # source/owner's unique payload count is bounded by the checked batch size.
@@ -505,6 +556,7 @@ def validate_config(config: HarnessConfig) -> None:
 
 
 def describe_config(config: HarnessConfig) -> dict:
+    aiv_count, ub_budget = hardware_limits(config)
     plans = [chunk_plans(config, owner) for owner in range(config.moe_ranks)]
     return {
         "status": "plan_only_no_device_validation",
@@ -514,8 +566,9 @@ def describe_config(config: HarnessConfig) -> dict:
         "batch_size_factor": config.capacity / MAX_SEQUENCE_LENGTH,
         "windows": window_requirements(config),
         "unified_buffer_bytes": unified_buffer_requirements(config),
-        "unified_buffer_budget_bytes": CONSERVATIVE_UB_BYTES,
-        "assumed_aiv_count": MAX_AIV_COUNT,
+        "unified_buffer_budget_bytes": ub_budget,
+        "assumed_aiv_count": aiv_count,
+        "resource_validation": "declared planning inputs; not verified on a device",
         "moe_chunks": [
             [
                 {
@@ -657,6 +710,7 @@ class NativeHarness:
         return reports
 
     def environment(self) -> dict:
+        aiv_count, ub_budget = hardware_limits(self.config)
         versions = {}
         for package in ("torch", "torch-npu", "vllm-afd-plugin"):
             try:
@@ -685,6 +739,9 @@ class NativeHarness:
             "python": platform.python_version(),
             "packages": versions,
             "device": self.torch.npu.get_device_name(self.local_rank),
+            "soc_version": self.config.soc_version,
+            "declared_aiv_count": aiv_count,
+            "declared_ub_budget_bytes": ub_budget,
             "hccl_group_name": self.group_name,
             "cann_home": os.environ.get("ASCEND_HOME_PATH"),
             "visible_devices": os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),

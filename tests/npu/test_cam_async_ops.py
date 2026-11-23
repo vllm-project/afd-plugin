@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Real dispatcher/Meta tests for the Ascend 910C routed-only CAM extension.
+"""Dispatcher and Meta tests for the 910C and 950 compact CAM extensions.
 
-Build the extension with SOC_VERSION=910c, then run this file with
-SOC_VERSION=910c pytest tests/npu/test_cam_async_ops.py.
+Set SOC_VERSION to the build's target before running this file. Mega operators
+are tested on 910C only.
 No HCCL group or device kernel is launched. These tests do not qualify NPU
 communication, numerical correctness, synchronization, or the legacy connector.
 """
@@ -43,18 +43,29 @@ def _dispatch_recv(torch: ModuleType, *, dynamic_quant: int = 0, moe_rank_id: in
         "afd_async_dispatch_recv",
         "afd_async_combine_send",
         "afd_async_combine_recv",
-        "afd_mega_dispatch_send",
-        "afd_mega_combine_recv",
     ),
 )
 def test_cam_dispatcher_registers_inference_and_meta_kernels(
+    compact_cam_runtime, name: str
+):
+    _assert_dispatch_keys(compact_cam_runtime, name)
+    schema = getattr(compact_cam_runtime.ops.afd_ascend, name).default._schema
+    assert {"comm_args", "group_name"} <= {arg.name for arg in schema.arguments}
+
+
+@pytest.mark.parametrize("name", ("afd_mega_dispatch_send", "afd_mega_combine_recv"))
+def test_mega_dispatcher_registers_inference_and_meta_kernels(
     ascend_ops_runtime, name: str
 ):
+    _assert_dispatch_keys(ascend_ops_runtime, name)
+
+
+def _assert_dispatch_keys(torch, name: str):
     for dispatch_key in ("PrivateUse1", "AutogradPrivateUse1", "Meta"):
-        assert ascend_ops_runtime._C._dispatch_has_kernel_for_dispatch_key(
+        assert torch._C._dispatch_has_kernel_for_dispatch_key(
             f"afd_ascend::{name}", dispatch_key
         )
-    schema = getattr(ascend_ops_runtime.ops.afd_ascend, name).default._schema
+    schema = getattr(torch.ops.afd_ascend, name).default._schema
     assert all("shared" not in argument.name for argument in schema.arguments)
 
 
@@ -84,8 +95,8 @@ def _native_mega_inputs(torch, mode):
 
 
 @pytest.mark.parametrize("mode", [1, 2])
-def test_native_mega_meta_quantization_contract(cam_runtime, mode):
-    torch = cam_runtime
+def test_native_mega_meta_quantization_contract(ascend_ops_runtime, mode):
+    torch = ascend_ops_runtime
     completion = torch.ops.afd_ascend.afd_mega_moe_pull_native(
         *_native_mega_inputs(torch, mode), swiglu_limit=10.0
     )
@@ -96,8 +107,8 @@ def test_native_mega_meta_quantization_contract(cam_runtime, mode):
 @pytest.mark.parametrize(
     "invalid", ["mode", "weight", "scale", "bias", "shape", "layers"]
 )
-def test_native_mega_meta_rejects_invalid_w8a8(cam_runtime, invalid):
-    torch = cam_runtime
+def test_native_mega_meta_rejects_invalid_w8a8(ascend_ops_runtime, invalid):
+    torch = ascend_ops_runtime
     inputs = _native_mega_inputs(torch, 2)
     if invalid == "mode":
         inputs[10][11] = 3
@@ -115,8 +126,8 @@ def test_native_mega_meta_rejects_invalid_w8a8(cam_runtime, invalid):
         torch.ops.afd_ascend.afd_mega_moe_pull_native(*inputs)
 
 
-def test_mega_dispatch_meta_publishes_completion(cam_runtime):
-    torch = cam_runtime
+def test_mega_dispatch_meta_publishes_completion(ascend_ops_runtime):
+    torch = ascend_ops_runtime
     state = torch.ops.afd_ascend.afd_mega_pull_init(
         torch.empty(1, dtype=torch.bfloat16, device="meta"),
         [8, 256, 2, 2, 1, 4, 0, 1],
@@ -149,8 +160,8 @@ def test_mega_dispatch_meta_publishes_completion(cam_runtime):
     assert comm_arg.alias_info.is_write
 
 
-def test_pull_empty_combine_preserves_logical_shape(cam_runtime):
-    torch = cam_runtime
+def test_pull_empty_combine_preserves_logical_shape(ascend_ops_runtime):
+    torch = ascend_ops_runtime
     anchor = torch.empty(1, dtype=torch.bfloat16, device="meta")
     state = torch.ops.afd_ascend.afd_mega_pull_init(
         anchor, [8, 256, 2, 2, 1, 4, 0, 1], [], 1, "meta_only"
@@ -177,8 +188,8 @@ def test_pull_empty_combine_preserves_logical_shape(cam_runtime):
 
 
 @pytest.mark.parametrize("layers", [(2, 2), (-1,), (65536,), (2**63 - 1,)])
-def test_pull_init_rejects_invalid_layer_map(cam_runtime, layers):
-    torch = cam_runtime
+def test_pull_init_rejects_invalid_layer_map(ascend_ops_runtime, layers):
+    torch = ascend_ops_runtime
     with pytest.raises(RuntimeError, match="layer"):
         torch.ops.afd_ascend.afd_mega_pull_init(
             torch.empty(1, dtype=torch.bfloat16, device="meta"),
@@ -192,9 +203,9 @@ def test_pull_init_rejects_invalid_layer_map(cam_runtime, layers):
 @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
 @pytest.mark.parametrize("dynamic_quant", [0, 1])
 def test_cam_four_phase_meta_contracts(
-    ascend_ops_runtime, monkeypatch, dtype_name, dynamic_quant
+    compact_cam_runtime, monkeypatch, dtype_name, dynamic_quant
 ):
-    torch = ascend_ops_runtime
+    torch = compact_cam_runtime
     monkeypatch.delenv("BATCH_SIZE_FACTOR", raising=False)
     dtype = getattr(torch, dtype_name)
     x = torch.empty((4, 64), device="meta", dtype=dtype)
@@ -295,10 +306,10 @@ def test_cam_four_phase_meta_contracts(
     [("0.5", 131072), ("0.000003814697265625", 1), ("invalid", 262144)],
 )
 def test_cam_receive_capacity_environment_contract(
-    ascend_ops_runtime, monkeypatch, factor: str, expected_capacity: int
+    compact_cam_runtime, monkeypatch, factor: str, expected_capacity: int
 ):
     monkeypatch.setenv("BATCH_SIZE_FACTOR", factor)
-    expanded, scales, _, _ = _dispatch_recv(ascend_ops_runtime, dynamic_quant=1)
+    expanded, scales, _, _ = _dispatch_recv(compact_cam_runtime, dynamic_quant=1)
 
     assert expanded.shape[0] == expected_capacity
     assert scales.shape[0] == expected_capacity
@@ -306,20 +317,20 @@ def test_cam_receive_capacity_environment_contract(
 
 @pytest.mark.parametrize("factor", ["0", "-0.5", "1.5", "nan", "1e-20"])
 def test_cam_receive_rejects_invalid_or_empty_capacity(
-    ascend_ops_runtime, monkeypatch, factor
+    compact_cam_runtime, monkeypatch, factor
 ):
     monkeypatch.setenv("BATCH_SIZE_FACTOR", factor)
     with pytest.raises(RuntimeError, match="BATCH_SIZE_FACTOR"):
-        _dispatch_recv(ascend_ops_runtime)
+        _dispatch_recv(compact_cam_runtime)
 
 
-def test_cam_receive_rejects_local_moe_rank_id(ascend_ops_runtime):
+def test_cam_receive_rejects_local_moe_rank_id(compact_cam_runtime):
     with pytest.raises(RuntimeError, match="global rank"):
-        _dispatch_recv(ascend_ops_runtime, moe_rank_id=0)
+        _dispatch_recv(compact_cam_runtime, moe_rank_id=0)
 
 
-def test_cam_combine_rejects_noncompact_batch_info_shape(ascend_ops_runtime):
-    torch = ascend_ops_runtime
+def test_cam_combine_rejects_noncompact_batch_info_shape(compact_cam_runtime):
+    torch = compact_cam_runtime
     with pytest.raises(RuntimeError, match="batch_info must be int64"):
         torch.ops.afd_ascend.afd_async_combine_send(
             torch.empty((8, 64), device="meta", dtype=torch.bfloat16),
@@ -339,8 +350,8 @@ def test_cam_combine_rejects_noncompact_batch_info_shape(ascend_ops_runtime):
         )
 
 
-def test_cam_send_rejects_autograd_inputs(ascend_ops_runtime):
-    torch = ascend_ops_runtime
+def test_cam_send_rejects_autograd_inputs(compact_cam_runtime):
+    torch = compact_cam_runtime
     with pytest.raises(RuntimeError, match="inference only"):
         torch.ops.afd_ascend.afd_async_dispatch_send(
             torch.empty(

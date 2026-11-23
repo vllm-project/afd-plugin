@@ -187,7 +187,17 @@ def _run_select_ops(*args: str) -> subprocess.CompletedProcess[str]:
                 "afd_mega_moe_comm",
             ],
         ),
-        ("ascend950", ["a2e", "e2a"]),
+        (
+            "ascend950",
+            [
+                "a2e",
+                "e2a",
+                "arch35/afd_async_dispatch_send",
+                "arch35/afd_async_dispatch_recv",
+                "arch35/afd_async_combine_send",
+                "arch35/afd_async_combine_recv",
+            ],
+        ),
     ],
 )
 @pytest.mark.parametrize("shmem", ["0", "1"])

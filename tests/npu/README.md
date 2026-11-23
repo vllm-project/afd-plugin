@@ -13,7 +13,7 @@ device, a multi-rank launch, or only a host Python environment.
 | `gmm_layered_performance.py` | 1 process, 1 device | Layered W13/W2 latency under eager and ACL graph |
 | `test_async_cam_{harness,performance,golden}.py` | CPU; golden needs optional torch | Harness planning, reporting, and reference numerics |
 | `test_gmm_layered_performance.py` | CPU | Benchmark geometry, case selection, statistics, and reports |
-| `test_cam_async_ops.py` | 910C extension, no device | Routed async CAM dispatcher and Meta contracts |
+| `test_cam_async_ops.py` | 910C or 950 extension, no device | Routed async CAM dispatcher and Meta contracts |
 | `test_gmm_layered.py`, `test_gmm_swiglu_quant_v2_layered.py` | 910C extension; device cases opt-in | Layered dispatcher contracts and runtime smoke checks |
 | `test_a2e_e2a_ops.py` | Ascend extension; runtime needs 2 ranks | A2E/E2A Meta contracts and opt-in HCCL execution |
 | `a2e_e2a_a5.py` | A5, 2 devices | Standalone 1A1F hardware sample |
@@ -148,8 +148,8 @@ crash.
 
 ## Native setup
 
-Use Ascend 910C with the matching PyTorch, torch-npu, CANN/HCCL stack and an
-AFD extension built with all four operators. Follow the native build guide:
+Use Ascend 910C or 950 with the matching PyTorch, torch-npu, CANN/HCCL stack
+and an AFD extension built with all four operators. Select the SoC at build time.
 
 ```bash
 SOC_VERSION=910c AFD_BUILD_ASCEND_OPS=1 \
@@ -341,6 +341,29 @@ activation buffer it was handed. Every invocation therefore gets its own clone;
 without it, whichever op runs first changes what the second sees.
 
 ## Performance
+
+For the A5 compact/MTE path, build with `SOC_VERSION=950`. Supply the
+platform's usable per-core UB size in bytes and the tiler's AIV cap
+(`min(platform AIV count, 48)`) to both precision and performance runs.
+These values describe the target for the harness preflight. Native tiling
+chooses the launch dimensions. To measure a BF16 four-Attention, four-FFN
+round with TP2, run the following commands on an eight-device Ascend host
+with `AIV_CAP` and `UB_BYTES` set for that device.
+
+```bash
+shape=(--soc-version 950 --aiv-count "$AIV_CAP" --ub-budget-bytes "$UB_BYTES"
+       --attn-ranks 4 --moe-ranks 4 --tp-size 2 --lengths 8 --capacity 64
+       --dtype bf16 --dynamic-quant 0 --window-mb 2048)
+python tests/npu/async_cam_performance.py "${shape[@]}" --dry-run
+torchrun --standalone --nproc-per-node=8 tests/npu/async_cam_precision.py "${shape[@]}"
+torchrun --standalone --nproc-per-node=8 tests/npu/async_cam_performance.py \
+  "${shape[@]}" --measure-mode cycle --warmup 2 --iterations 10 --output .cache/a5-cycle.json
+```
+
+The precision run compares the four-stage round against the CPU oracle. The
+benchmark repeats an untimed correctness check before collecting per-call
+host and NPU-event timings and the slowest rank's round time. Record the
+build revision, CANN/HCCL and torch-npu versions with the JSON report.
 
 ```bash
 timeout --kill-after=30s 600s torchrun --standalone --nproc_per_node=4 \

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """HCCL benchmarks for the four plugin-owned routed async CAM operators.
 
-Run with torchrun on Ascend 910C; --help and --dry-run need only Python.
+Run with torchrun on Ascend 910C or 950. --help and --dry-run need only Python.
 See README.md beside this file for timing boundaries and launch examples.
 """
 

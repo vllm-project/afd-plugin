@@ -8,7 +8,7 @@ availability filter, then prints the selected operator directory names (one
 per line).
 
 Notes:
-  - Operator identity = source directory name under ascend_kernels/.
+  - The public operator name is the basename of its SoC-specific directory.
   - "utils" is a shared header directory, always copied by the build script
     and therefore never emitted here.
 """
@@ -113,7 +113,11 @@ def main():
     args = parser.parse_args()
 
     registry = load_registry(args.registry)
-    soc_list = get_soc_list(registry, args.soc)
+    directories = get_soc_list(registry, args.soc)
+    sources = {path.rsplit("/", 1)[-1]: path for path in directories}
+    if len(sources) != len(directories):
+        die(f"SOC '{args.soc}' lists multiple implementations of the same operator")
+    soc_list = list(sources)
     user_ops = split_ops(args.ops)
     if user_ops is not None:
         validate_user_ops(user_ops, soc_list)
@@ -127,7 +131,7 @@ def main():
         )
 
     for op in final_ops:
-        print(op)
+        print(sources[op])
 
 
 if __name__ == "__main__":
