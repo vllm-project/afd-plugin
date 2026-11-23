@@ -38,6 +38,10 @@ from afd_plugin.model_executor.models._weight_utils import (
     filter_role_weights,
     layer_weight_path,
 )
+from afd_plugin.model_executor.models.model_utils import (
+    AFDCausalLMHooks,
+    AFDModelHooks,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -288,7 +292,7 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
         return self.mlp(hidden_states)
 
 
-class AFDQwen3MoeModel(native.Qwen3MoeModel):
+class AFDQwen3MoeModel(AFDModelHooks, native.Qwen3MoeModel):
     """Native Qwen3 MoE model using role-aware decoder layers."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -302,23 +306,12 @@ class AFDQwen3MoeModel(native.Qwen3MoeModel):
         self.afd_config = afd_config
         self.afd_role = afd_config.role
 
-    def compute_ffn_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-    ) -> torch.Tensor:
-        return self.layers[layer_idx].compute_ffn_output(hidden_states)
-
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return tuple(
             layer_idx
             for layer_idx in range(self.config.num_hidden_layers)
             if _is_moe_layer(self.config, layer_idx)
         )
-
-    def get_routed_experts(self, layer_idx: int) -> "RoutedExperts":
-        """FFN only: the vLLM module holding one MoE layer's local experts."""
-        return self.layers[layer_idx].mlp.experts.routed_experts
 
 
 class _Qwen3RoutedExpertsLayer(nn.Module):
@@ -395,7 +388,7 @@ class AFDQwen3MoeRoutedExperts(nn.Module):
         return self.model.layers[layer_idx].mlp.experts.routed_experts
 
 
-class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
+class AFDQwen3MoeForCausalLM(AFDCausalLMHooks, native.Qwen3MoeForCausalLM):
     """Qwen3 MoE causal LM wrapper for AFD CUDA execution."""
 
     # Patch reason: native Qwen3MoeForCausalLM has no model-class injection hook.
@@ -468,19 +461,6 @@ class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
         self.num_local_physical_experts = example_layer.n_local_physical_experts
         self.num_routed_experts = example_layer.n_routed_experts
         self.num_redundant_experts = example_layer.n_redundant_experts
-
-    def compute_ffn_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-    ) -> torch.Tensor:
-        return self.model.compute_ffn_output(hidden_states, layer_idx)
-
-    def get_experts_layer_indices(self) -> tuple[int, ...]:
-        return self.model.get_experts_layer_indices()
-
-    def get_routed_experts(self, layer_idx: int) -> "RoutedExperts":
-        return self.model.get_routed_experts(layer_idx)
 
     # Patch reason: the native loader would materialize both execution stages
     # even though each AFD role constructs only one stage's decoder modules.

@@ -273,12 +273,8 @@ class AFDNPUFFNModelRunner:
         # role needs the tokens' ids. Resolve it once per forward, outside the
         # layer loop, so a per-layer re-read cannot drift within a step.
         # The wire slot carries one payload: either ids or Attention-side routing.
-        recv_routing = getattr(self.model, "afd_requires_attention_routing", False)
-        recv_input_ids = (
-            False
-            if recv_routing
-            else getattr(self.model, "afd_requires_input_ids", False)
-        )
+        recv_routing = self.model.afd_requires_attention_routing
+        recv_input_ids = False if recv_routing else self.model.afd_requires_input_ids
 
         for layer_idx in _ffn_layer_indices(self):
             for stage_idx in stage_ids:

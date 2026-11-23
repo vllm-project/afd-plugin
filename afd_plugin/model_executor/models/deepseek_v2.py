@@ -11,7 +11,7 @@ hidden states between the Attention and FFN roles through the AFD connector.
 from collections.abc import Iterable
 from copy import copy
 from functools import partial
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TypeAlias
 
 import torch
 import torch.nn as nn
@@ -31,9 +31,10 @@ from afd_plugin.model_executor.models._weight_utils import (
     filter_role_weights,
     layer_weight_path,
 )
-
-if TYPE_CHECKING:
-    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from afd_plugin.model_executor.models.model_utils import (
+    AFDCausalLMHooks,
+    AFDModelHooks,
+)
 
 logger = init_logger(__name__)
 
@@ -365,7 +366,6 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
     def compute_ffn_output(
         self,
         hidden_states: torch.Tensor,
-        **kwargs: Any,
     ) -> torch.Tensor:
         if self.compute_gate_on_attention and not self.is_moe_layer:
             raise RuntimeError(
@@ -407,7 +407,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
 
 
 @native.support_torch_compile
-class AFDDeepseekV2Model(native.DeepseekV2Model):
+class AFDDeepseekV2Model(AFDModelHooks, native.DeepseekV2Model):
     """DeepSeek model wrapper that routes Attention outputs through AFD."""
 
     fall_back_to_pt_during_load = False
@@ -511,43 +511,12 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def compute_ffn_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        return self.layers[layer_idx].compute_ffn_output(
-            hidden_states,
-            **kwargs,
-        )
-
-    def compute_experts_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-        router_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.layers[layer_idx].compute_experts_output(
-            hidden_states,
-            router_logits,
-        )
-
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return tuple(
             layer_idx
             for layer_idx, layer in enumerate(self.layers)
             if isinstance(layer, AFDDeepseekV2DecoderLayer) and layer.is_moe_layer
         )
-
-    def get_routed_experts(self, layer_idx: int) -> "RoutedExperts":
-        """FFN only: the vLLM module holding one MoE layer's local experts.
-
-        Connectors that route on Attention run these experts themselves. The
-        FFN never applies ``routed_scaling_factor``: Attention's runner scales
-        the combined output.
-        """
-        return self.layers[layer_idx].mlp.experts.routed_experts
 
     def get_experts_routing_spec(
         self,
@@ -562,7 +531,7 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         )
 
 
-class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
+class AFDDeepseekV2ForCausalLM(AFDCausalLMHooks, native.DeepseekV2ForCausalLM):
     """DeepSeekV2 causal LM wrapper for AFD execution."""
 
     model_cls = AFDDeepseekV2Model
@@ -571,38 +540,6 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
         self.afd_config = parse_afd_config(vllm_config, validate=False)
         self.afd_role = self.afd_config.role
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-
-    def compute_ffn_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        return self.model.compute_ffn_output(hidden_states, layer_idx, **kwargs)
-
-    def compute_experts_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-        router_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.model.compute_experts_output(
-            hidden_states,
-            layer_idx,
-            router_logits,
-        )
-
-    def get_experts_layer_indices(self) -> tuple[int, ...]:
-        return self.model.get_experts_layer_indices()
-
-    def get_routed_experts(self, layer_idx: int) -> "RoutedExperts":
-        return self.model.get_routed_experts(layer_idx)
-
-    def get_experts_routing_spec(
-        self,
-        layer_idx: int,
-    ) -> AFDExpertRoutingSpec:
-        return self.model.get_experts_routing_spec(layer_idx)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return super().load_weights(

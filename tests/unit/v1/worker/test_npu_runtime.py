@@ -115,11 +115,17 @@ class _FakeFFNConnector:
 
 
 class _FakeModel:
+    afd_requires_input_ids = False
+    afd_requires_attention_routing = False
+
     def compute_ffn_output(self, hidden_states, layer_idx, **kwargs):
         return f"npu-ffn({hidden_states}, layer={layer_idx})"
 
 
 class _FakeStructuredFFNModel:
+    afd_requires_input_ids = False
+    afd_requires_attention_routing = False
+
     def compute_ffn_output(self, hidden_states, layer_idx, **_kwargs):
         return AFDF2ATransferPayload(
             routed_output=f"routed({hidden_states}, layer={layer_idx})",
