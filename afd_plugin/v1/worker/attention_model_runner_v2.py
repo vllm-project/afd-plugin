@@ -202,6 +202,10 @@ def _use_afd_ubatch_preparation(
         # Patch reason: publish AFD stage metadata before native execution.
         # Upstream: vLLM v0.32.0, vllm/v1/worker/gpu/ubatch_utils.py
         # UBatchRunner.prepare.
+        # Retire the cg_mode signature after RFC #613 validates the 0.34
+        # batch_desc/dp_sync_state path publishes AFD stage metadata in eager
+        # and ACL Graph DBO on Ascend.
+        # See https://github.com/vllm-project/afd-plugin/issues/613.
         def prepare_v032(
             self,
             input_batch: InputBatch,
@@ -296,7 +300,10 @@ def _use_afd_capture_input_preparation(
     # Patch reason: Ascend uses this symbol for its warmup and ACL graph capture.
     # Patch functionality: publish AFD metadata after native preparation.
     # Signature: the pinned 0.32 call ends at pcp_manager.
-    # Delegation and removal plan match the 0.34 capture wrapper above.
+    # Delegation keeps native input construction as in the 0.34 wrapper.
+    # Retire this wrapper once #613 validates Ascend warmup, ACL Graph
+    # capture/replay, and AFD metadata with the 0.34 input preparation
+    # signature that accepts slot_mappings_buffer.
     def prepare_inputs_to_capture_v032(
         num_reqs: int,
         num_tokens: int,

@@ -205,6 +205,10 @@ def set_forward_context(
                     )
 
 
+# The 0.32 set_forward_context copy and aliases let Async CAM skip native MoE
+# DP coordination. Retire these bindings after RFC #613 validates normal DP
+# metadata and the Async CAM opt-out in the 0.34 Ascend forward-context path.
+# See https://github.com/vllm-project/afd-plugin/issues/613.
 if _is_target_vllm_compatible("npu"):
     forward_context_module.set_forward_context = set_forward_context
     for module_name in _FORWARD_CONTEXT_IMPORT_MODULES:

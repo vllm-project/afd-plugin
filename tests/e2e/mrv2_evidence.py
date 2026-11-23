@@ -372,8 +372,11 @@ def _install_probes() -> type:
 
     # Patch reason: observe live native DBO slices on the Ascend 0.32 pin.
     # Signature/source: UBatchRunner.prepare, vLLM 5df63a7,
-    # vllm/v1/worker/gpu/ubatch_utils.py. Keep the native slicing and remove
-    # the probe when upstream exposes equivalent live counters.
+    # vllm/v1/worker/gpu/ubatch_utils.py. Delegate native slicing.
+    # Retire the cg_mode signature once RFC #613 verifies the 0.34
+    # batch_desc/dp_sync_state hook still records live nonempty DBO slices
+    # on Ascend.
+    # See https://github.com/vllm-project/afd-plugin/issues/613.
     def prepare_ascend(
         self,
         input_batch: InputBatch,
@@ -433,7 +436,9 @@ def _install_probes() -> type:
     # Patch functionality: count completed live replay and nonempty microbatches.
     # Signature/source: GPUModelRunner.execute_model, CUDA vLLM 5df63a7,
     # vllm/v1/worker/gpu/model_runner.py. Delegation is observation-only.
-    # Ascend retains its 0.30 native call; randomize_inputs is CUDA-only.
+    # The Ascend 0.32 hook omits randomize_inputs. Retire this call split when
+    # RFC #613 verifies the 0.34 call with that keyword and the hook still
+    # counts completed ACL replays and live DBO steps on Ascend.
     def execute(
         self,
         scheduler_output: SchedulerOutput,

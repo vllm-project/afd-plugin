@@ -798,7 +798,10 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
 
         # ### PATCH START: initialize the native weight loader for each pin.
         if self.device == "npu":
-            # The Ascend vLLM 0.32 loader reads the model-wide flag.
+            # The 0.32 loader routes shared-expert weights using this model-wide
+            # flag. Remove it when RFC #613 verifies that the Ascend 0.34
+            # loader maps those weights using only fused_shared_expert_layers.
+            # See https://github.com/vllm-project/afd-plugin/issues/613.
             self.is_fused_shared_expert_enabled = (
                 native.is_model_fused_shared_expert_compatible(  # type: ignore[attr-defined]
                     self.layers,

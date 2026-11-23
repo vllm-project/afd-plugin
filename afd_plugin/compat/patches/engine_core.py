@@ -1038,9 +1038,16 @@ def _with_ffn_busy_loop(
 
 
 if _is_target_vllm_compatible():
+    # Ascend 0.32 uses the copied constructor, one-argument KV layout setter,
+    # and three-argument KV planner. Retire these bindings and their 0.32-only
+    # tests once RFC #613 validates 0.34 native and AFD startup, Attention KV
+    # planning, and FFN KV bypass on Ascend.
+    # See https://github.com/vllm-project/afd-plugin/issues/613.
     if core_module.VLLM_VERSION.startswith(TARGET_NPU_VLLM_VERSION):
         core_module.EngineCore.__init__ = __init__
         core_module.EngineCore._initialize_kv_caches = _initialize_kv_caches_v032
+        # The 0.32 base loop publishes DP request counts. Retire the old loops
+        # once #613 verifies 0.34 DP stats and the FFN connector loop on Ascend.
         core_module.EngineCoreProc.run_busy_loop = run_busy_loop
         core_module.DPEngineCoreProc.run_busy_loop = run_busy_loop
     else:

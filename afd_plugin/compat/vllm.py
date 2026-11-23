@@ -26,6 +26,9 @@ def get_target_vllm_version(device_type: str | None = None) -> str:
     observe the runtime pass it explicitly; the default keeps the GPU pin.
     """
     if device_type == "npu":
+        # Keep the Ascend 0.32 pin until RFC #613 qualifies native and AFD
+        # startup on the 0.34 vLLM-Ascend pair.
+        # See https://github.com/vllm-project/afd-plugin/issues/613.
         return TARGET_NPU_VLLM_VERSION
     return TARGET_VLLM_VERSION
 
