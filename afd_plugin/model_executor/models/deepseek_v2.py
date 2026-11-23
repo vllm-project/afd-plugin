@@ -725,8 +725,8 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
     # Patch reason: native DeepSeek always creates native Decoder layers.
     # Patch functionality: create role-aware AFD layers without full allocation.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.32.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
+    # Upstream: vLLM v0.34.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # ### PATCH START: require AFD activation and avoid native allocation.
         afd_config = parse_afd_config(vllm_config, validate=False)
@@ -796,24 +796,11 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         )
         # ### PATCH END
 
-        # ### PATCH START: initialize the native weight loader for each pin.
-        if self.device == "npu":
-            # The 0.32 loader routes shared-expert weights using this model-wide
-            # flag. Remove it when RFC #613 verifies that the Ascend 0.34
-            # loader maps those weights using only fused_shared_expert_layers.
-            # See https://github.com/vllm-project/afd-plugin/issues/613.
-            self.is_fused_shared_expert_enabled = (
-                native.is_model_fused_shared_expert_compatible(  # type: ignore[attr-defined]
-                    self.layers,
-                    native.DeepseekV2MoE,
-                    "mlp",
-                )
-            )
-        else:
-            # The vLLM 0.34 loader reads a set of fused layer indices.
-            # The role-local CUDA model does not build fused shared experts.
-            self.fused_shared_expert_layers: frozenset[int] = frozenset()
-        # ### PATCH END
+        self.fused_shared_expert_layers = native.get_fused_shared_expert_layers(
+            self,
+            native.DeepseekV2MoE,
+            enable_eplb=vllm_config.parallel_config.enable_eplb,
+        )
 
         if native.get_pp_group().is_last_rank:
             self.norm = native.RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
