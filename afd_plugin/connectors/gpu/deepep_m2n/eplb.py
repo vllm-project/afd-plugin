@@ -243,6 +243,20 @@ class DeepEPM2NAttentionEplb:
         self._prepare_current_transaction(payload)
         self._previous_step_is_dummy = payload.is_warmup or payload.is_graph_capturing
 
+    def finish(self) -> None:
+        """Step the last finished transaction before the control plane closes.
+
+        The FFN steps EPLB after each forward, so at shutdown its counter is
+        already past the last transaction while this recorder's is not. If
+        that step reached a rearrangement boundary the FFN is blocked in the
+        exchange, so this join releases it; otherwise it is a no-op and
+        Attention closes as before.
+        """
+        if self._previous_step_is_dummy is None:
+            return
+        self._step_finished_transaction(self._previous_step_is_dummy)
+        self._previous_step_is_dummy = None
+
     def _step_finished_transaction(self, is_dummy: bool) -> None:
         """Mirror the FFN's per-step EPLB transitions.
 

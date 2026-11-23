@@ -68,7 +68,7 @@ from __future__ import annotations
 import itertools
 import os
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
@@ -1033,6 +1033,14 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         # ``init_afd_connector`` once the handshake reports the FFN's EPLB
         # deployment. ``None`` when the FFN runs without EPLB.
         self.eplb: DeepEPM2NAttentionEplb | DeepEPM2NFFNEplb | None = None
+        # Bound once at init so the per-layer routing path does not run an
+        # isinstance check on every MoE layer.
+        self._eplb_apply_routing: Callable[[torch.Tensor, int], torch.Tensor] | None = (
+            None
+        )
+        self._eplb_on_control_step: Callable[[AFDControlPayload], None] | None = None
+        self._eplb_ffn_step: Callable[[], None] | None = None
+        self._eplb_finish: Callable[[], None] | None = None
         self._handshake_enable_eplb = False
         self.attn_size = self.layout.attn_size
         self.ffn_size = self.layout.ffn_size
@@ -1262,6 +1270,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
                     initial_map,
                     initial_count,
                 )
+        self._bind_eplb_callbacks()
         # Never the lanes' bootstrap group: the control plane's close() aborts
         # this group to cancel a pending receive.
         self.group = init_afd_process_group(
@@ -1572,6 +1581,15 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             done.record(lane_stream)
         self._lane_done[state.lane] = done
 
+    def _bind_eplb_callbacks(self) -> None:
+        """Bind the role's EPLB operations once, after ``init_afd_connector``."""
+        if isinstance(self.eplb, DeepEPM2NAttentionEplb):
+            self._eplb_apply_routing = self.eplb.apply_routing
+            self._eplb_on_control_step = self.eplb.on_control_step
+            self._eplb_finish = self.eplb.finish
+        elif isinstance(self.eplb, DeepEPM2NFFNEplb):
+            self._eplb_ffn_step = self.eplb.step
+
     def apply_eplb_routing(
         self,
         topk_ids: torch.Tensor,
@@ -1584,15 +1602,15 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         expert (see ``deepep_m2n/eplb.py``).
         """
         self._check_initialized()
-        if not isinstance(self.eplb, DeepEPM2NAttentionEplb):
+        if self._eplb_apply_routing is None:
             return topk_ids
-        return self.eplb.apply_routing(topk_ids, layer_idx)
+        return self._eplb_apply_routing(topk_ids, layer_idx)
 
     def step_ffn_eplb(self) -> None:
         """Advance the FFN-side rearrangement counter; see ``eplb.py``."""
         self._check_initialized()
-        if isinstance(self.eplb, DeepEPM2NFFNEplb):
-            self.eplb.step()
+        if self._eplb_ffn_step is not None:
+            self._eplb_ffn_step()
 
     def synchronize_lanes(self) -> None:
         """Make the caller's stream wait for every lane's outstanding combine.
@@ -1785,6 +1803,10 @@ class DeepEPM2NAFDControlPlane(AFDControlPlane):
     def close(self) -> None:
         """Cancel a pending receive by aborting the connector's control group."""
         self._closed = True
+        # Do not leave FFN ranks blocked in an EPLB boundary exchange when the
+        # Attention side finishes at exactly that boundary.
+        if self.connector._eplb_finish is not None:
+            self.connector._eplb_finish()
         group = self.connector.group
         if group is not None:
             # A graceful shutdown would wait for the idle unmatched receive.
@@ -1808,8 +1830,8 @@ class DeepEPM2NAFDControlPlane(AFDControlPlane):
         # previous payload) and prepare the recording state for the one about
         # to run. The FFN steps its side after its forward, so both roles
         # reach each rearrangement boundary together.
-        if isinstance(connector.eplb, DeepEPM2NAttentionEplb):
-            connector.eplb.on_control_step(payload)
+        if connector._eplb_on_control_step is not None:
+            connector._eplb_on_control_step(payload)
         graph_mode = payload.is_graph_capturing or payload.is_graph_replaying
         if (
             connector.attn_tp_size is None

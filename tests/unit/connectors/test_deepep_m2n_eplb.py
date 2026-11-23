@@ -150,6 +150,47 @@ def test_recorder_rotates_the_window_and_drops_dummy_load():
     assert recorder.record_enabled.item() is False
 
 
+def test_recorder_finish_steps_the_last_transaction_at_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """``finish`` joins the boundary exchange the FFN is blocked in.
+
+    The FFN steps EPLB after each forward while Attention steps the previous
+    transaction, so at shutdown Attention is one step behind. If that step is
+    the rearrangement boundary, ``finish`` must step it so the blocked FFN
+    ranks are released instead of waiting for a transaction that never comes.
+    """
+    fake_dist = _FakeDist()
+    monkeypatch.setattr(eplb_module.dist, "reduce", fake_dist.reduce)
+    monkeypatch.setattr(eplb_module.dist, "broadcast", fake_dist.broadcast)
+    recorder = DeepEPM2NAttentionEplb(
+        _attention_connector(),
+        _schedule(initial_rearrangement_step=STEP_INTERVAL - 1),
+        MOE_LAYERS,
+        torch.zeros((len(MOE_LAYERS), NUM_LOGICAL, 4), dtype=torch.int64),
+        torch.ones((len(MOE_LAYERS), NUM_LOGICAL), dtype=torch.int64),
+    )
+
+    recorder.on_control_step(_payload())
+    assert fake_dist.reduces == []
+
+    recorder.finish()
+
+    assert [dst for _window, dst in fake_dist.reduces] == [0]
+    assert fake_dist.broadcasts
+    # A second close is a no-op: the transaction was already stepped.
+    recorder.finish()
+    assert len(fake_dist.reduces) == 1
+
+
+def test_recorder_finish_is_a_noop_without_a_finished_transaction():
+    recorder = _recorder()
+
+    recorder.finish()
+
+    assert recorder._previous_step_is_dummy is None
+
+
 def test_recorder_steps_tp_rank_real_counts():
     """With Attention TP the recorder counts only this rank's real rows."""
     recorder = _recorder(attn_tp_size=2, attention_tp_rank=1)
