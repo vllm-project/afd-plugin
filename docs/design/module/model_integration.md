@@ -291,10 +291,14 @@ for MoE layers the native `Qwen3MoeSparseMoeBlock` forward with experts from
 runs the complete native MLP or MoE block; `compute_gate_on_attention=false`
 is required. With DeepEP M2N, Attention owns gate/top-k and FFN runs routed
 experts only; this requires `compute_gate_on_attention=true`, every layer to
-be MoE, and no shared expert. Native weight loading follows role-based filtering.
+be MoE, and no shared expert. With Attention TP > 1 the M2N block is
+sequence-parallel, as in DeepSeek's M2N row: each TP rank sends its slice of
+the tokens, with the padding rows unrouted, and the TP group then all-gathers
+the output. Native weight loading follows role-based filtering.
 
-Both paths are CUDA-only and reject sequence-parallel MoE, EPLB, pipeline
-parallelism, speculative decoding, and LoRA during construction.
+Both paths are CUDA-only and reject the `use_sequence_parallel_moe` config
+flag, EPLB, pipeline parallelism, speculative decoding, and LoRA during
+construction.
 
 ### Qwen3.5/3.6 MoE CUDA boundary
 
