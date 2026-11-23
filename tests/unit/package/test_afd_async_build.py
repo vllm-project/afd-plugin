@@ -27,6 +27,7 @@ The MIT License
 
 Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
 Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+Copyright contributors to the AFD plugin project
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
