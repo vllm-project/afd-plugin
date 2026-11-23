@@ -30,6 +30,7 @@ from afd_plugin.connectors.npu.camp2p import (
     build_camp2p_topology,
 )
 from afd_plugin.connectors.npu.camp2p import connector as camp2p_module
+from afd_plugin.connectors.npu.camp2p import mxfp8_transport as mxfp8_module
 from tests.unit.fakes.dp_metadata import DPMetadata as _FakeDPMetadata
 
 
@@ -525,7 +526,7 @@ def test_camp2p_mxfp8_send_keeps_each_stage_on_its_own_rows(monkeypatch):
         transport.append(args)
         return (None, None, None, torch.tensor([1]), None, None)
 
-    monkeypatch.setattr(camp2p_module, "mx_quantize_a2e_activation", fake_quantize)
+    monkeypatch.setattr(mxfp8_module, "quantize_activation", fake_quantize)
     monkeypatch.setattr(torch.ops.afd_ascend, "a2e", fake_a2e, raising=False)
 
     for stage, rows in ((0, 3), (1, 1)):

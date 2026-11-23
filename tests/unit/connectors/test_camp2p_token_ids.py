@@ -136,6 +136,9 @@ with _vllm_stub():
         received_token_ids,
     )
     from afd_plugin.connectors.npu.camp2p import connector as camp2p_module
+from afd_plugin.connectors.npu.camp2p import (  # noqa: E402
+    mxfp8_transport as mxfp8_module,  # noqa: E402
+)
 
 
 class _CpuTorch:
@@ -322,6 +325,7 @@ def test_recv_attn_output_mode_and_ids_follow_the_receiver_declaration(
 
     monkeypatch.setattr(torch.ops.afd_ascend, "a2e", fake_a2e, raising=False)
     monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
+    monkeypatch.setattr(mxfp8_module, "torch", camp2p_module.torch)
     connector = _connector(role="ffn", rank=1)
     # FFN rank 1 owns Attention ranks 1 and 3: 3 + 7 tokens.
     connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 5, 7])}
@@ -511,6 +515,7 @@ def test_recv_attn_output_reads_the_routing_slot(monkeypatch):
 
     monkeypatch.setattr(torch.ops.afd_ascend, "a2e", fake_a2e, raising=False)
     monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
+    monkeypatch.setattr(mxfp8_module, "torch", camp2p_module.torch)
     connector = _connector(role="ffn", rank=1)
     connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 5, 7])}
 
@@ -560,7 +565,7 @@ def _mxfp8_config(*, attention=4, ffn=4, gate=True):
 def on_a5(monkeypatch):
     """Stand in for the device check so the remaining gate rules stay covered."""
 
-    monkeypatch.setattr(camp2p_module, "_require_a5_device", lambda: None)
+    monkeypatch.setattr(mxfp8_module, "_require_a5_device", lambda: None)
 
 
 def test_mxfp8_requires_an_a5_device(monkeypatch):
@@ -577,10 +582,10 @@ def test_mxfp8_requires_an_a5_device(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm_ascend.utils", utils)
 
     with pytest.raises(RuntimeError, match="requires an Ascend A5 device"):
-        camp2p_module._require_a5_device()
+        mxfp8_module._require_a5_device()
 
     vars(utils)["get_ascend_device_type"] = lambda: _DeviceType.A5
-    camp2p_module._require_a5_device()
+    mxfp8_module._require_a5_device()
 
 
 def _mxfp8_connector(*, attention=4, ffn=4, gate=True):
@@ -594,7 +599,7 @@ def _mxfp8_connector(*, attention=4, ffn=4, gate=True):
 
 
 def test_mxfp8_construction_accepts_a_supported_topology(monkeypatch, on_a5):
-    monkeypatch.setattr(camp2p_module, "a2e_accepts_mxfp8_arguments", lambda: True)
+    monkeypatch.setattr(mxfp8_module, "a2e_accepts_mxfp8_arguments", lambda: True)
 
     connector = _mxfp8_connector(attention=4, ffn=4)
 
@@ -613,7 +618,7 @@ def test_mxfp8_construction_accepts_a_supported_topology(monkeypatch, on_a5):
 def test_mxfp8_construction_refuses_a_deployment_that_cannot_carry_it(
     monkeypatch, on_a5, attention, ffn, gate, match
 ):
-    monkeypatch.setattr(camp2p_module, "a2e_accepts_mxfp8_arguments", lambda: True)
+    monkeypatch.setattr(mxfp8_module, "a2e_accepts_mxfp8_arguments", lambda: True)
 
     with pytest.raises(RuntimeError, match=match):
         _mxfp8_connector(attention=attention, ffn=ffn, gate=gate)
@@ -629,7 +634,7 @@ def test_mxfp8_construction_refuses_a_deployment_that_cannot_carry_it(
 def test_mxfp8_construction_reports_what_the_operator_probe_said(
     monkeypatch, on_a5, probe, match
 ):
-    monkeypatch.setattr(camp2p_module, "a2e_accepts_mxfp8_arguments", lambda: probe)
+    monkeypatch.setattr(mxfp8_module, "a2e_accepts_mxfp8_arguments", lambda: probe)
 
     with pytest.raises(RuntimeError, match=match):
         _mxfp8_connector()
@@ -658,6 +663,7 @@ def test_the_mxfp8_receive_reads_the_sixth_return_value(monkeypatch):
 
     monkeypatch.setattr(torch.ops.afd_ascend, "a2e", fake_a2e, raising=False)
     monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
+    monkeypatch.setattr(mxfp8_module, "torch", camp2p_module.torch)
     connector = _connector(role="ffn", rank=1)
     connector.quant_mode = camp2p_module.A2E_QUANT_MODE_MXFP8
     connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 5, 7])}
@@ -693,6 +699,7 @@ def test_the_mxfp8_receive_names_a_build_that_returns_five_values(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
+    monkeypatch.setattr(mxfp8_module, "torch", camp2p_module.torch)
     connector = _connector(role="ffn", rank=1)
     connector.quant_mode = camp2p_module.A2E_QUANT_MODE_MXFP8
     connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 5, 7])}
@@ -875,7 +882,7 @@ def _init_pair(
 
     from afd_plugin.config import AFDConfig
 
-    monkeypatch.setattr(camp2p_module, "a2e_accepts_mxfp8_arguments", lambda: True)
+    monkeypatch.setattr(mxfp8_module, "a2e_accepts_mxfp8_arguments", lambda: True)
     vllm_config = _vllm_config(extra_config={"quant_mode": mode})
     vllm_config.scheduler_config.max_num_batched_tokens = bound
     vllm_config.model_config.hf_config.num_experts_per_tok = topk
@@ -903,7 +910,7 @@ def _init_pair(
     monkeypatch.setattr(
         camp2p_module, "create_hccl_process_group_options", lambda *args: None
     )
-    monkeypatch.setattr(camp2p_module, "a2e_accepts_mxfp8_arguments", lambda: True)
+    monkeypatch.setattr(mxfp8_module, "a2e_accepts_mxfp8_arguments", lambda: True)
     monkeypatch.setattr(camp2p_module, "torch", _FakeTorch())
     error = None
     try:
@@ -1096,7 +1103,7 @@ def test_send_attn_output_reaches_the_operator_as_a_quantized_pair(monkeypatch):
         "direct_register_custom_op",
         lambda **kwargs: methods.update({kwargs["op_name"]: kwargs["op_func"]}),
     )
-    monkeypatch.setattr(camp2p_module, "mx_quantize_a2e_activation", fake_quantize)
+    monkeypatch.setattr(mxfp8_module, "quantize_activation", fake_quantize)
 
     def fake_a2e(*args):
         sent.append(args)
@@ -1236,3 +1243,25 @@ def test_mode_0_gate_on_refuses_a_path_the_selector_cannot_serve(monkeypatch, on
     assert seen == ["afd", "mode_gather", "verdict_gather"], seen
     assert published[-1] == [0], published
     assert error is not None and "chose another path" in str(error)
+
+
+def test_the_mxfp8_pair_check_keeps_the_layout_and_device_contract():
+    """A non-contiguous or foreign-device scale is refused, not reinterpreted."""
+
+    activation = torch.zeros(4, 64, dtype=torch.float8_e4m3fn)
+    scale = torch.zeros(4, 2, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    mxfp8_module._check_a2e_mx_transport_pair(activation, scale, 64)
+
+    with pytest.raises(RuntimeError, match="not contiguous"):
+        mxfp8_module._check_a2e_mx_transport_pair(
+            activation,
+            scale.transpose(0, 1),
+            64,
+        )
+
+    with pytest.raises(RuntimeError, match="scale device"):
+        mxfp8_module._check_a2e_mx_transport_pair(
+            activation,
+            torch.empty(4, 2, dtype=torch.float8_e8m0fnu, device="meta"),
+            64,
+        )

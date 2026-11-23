@@ -28,7 +28,6 @@ from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from afd_plugin.compat.npu import ensure_cam_p2p_ops_available
-from afd_plugin.compat.npu.ops import a2e_accepts_mxfp8_arguments
 from afd_plugin.config import AFDConfig
 from afd_plugin.config_utils import (
     coerce_extra_bool,
@@ -51,6 +50,7 @@ from afd_plugin.connectors.metadata import (
     recv_control_payload,
     send_control_payload,
 )
+from afd_plugin.connectors.npu.camp2p import mxfp8_transport
 from afd_plugin.distributed import (
     create_hccl_process_group_options,
     init_afd_process_group,
@@ -79,17 +79,11 @@ _CAMP2P_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
 # pre-quantized E4M3 activation with its E8M0 MX scale. The mode is a connector setting
 # (``connector_extra_config.quant_mode``), not an environment knob.
 A2E_QUANT_MODE_BF16: Final[int] = 0
-A2E_QUANT_MODE_MXFP8: Final[int] = 4
+A2E_QUANT_MODE_MXFP8: Final[int] = mxfp8_transport.A2E_QUANT_MODE_MXFP8
 _A2E_QUANT_MODES: Final[frozenset[int]] = frozenset(
     (A2E_QUANT_MODE_BF16, A2E_QUANT_MODE_MXFP8),
 )
 
-# MX block size the A2E contract is defined against, and the smallest AIV count the
-# quantized transport was verified with.
-A2E_MX_GROUP_SIZE: Final[int] = 32
-A2E_MX_MIN_AIV_NUM: Final[int] = 3
-# Each side of the A2E pair must fit the operator's rank addressing.
-A2E_MX_MAX_RANKS_PER_SIDE: Final[int] = 32
 #: Startup verdict: whether this rank keeps the FFN on an MoE path the
 #: external-routing consumer supports.
 A2E_MOE_PATH_OK: Final[int] = 1
@@ -97,15 +91,6 @@ A2E_MOE_PATH_UNSUPPORTED: Final[int] = 0
 #: UB bytes the operator reserves for the routing ids of one call; it moves the
 #: whole `[rows, topk]` int32 block in one transfer.
 A2E_MX_GATE_UB_BYTES: Final[int] = 192 * 1024 - 1024
-
-#: Activation dtype carried end to end in MXFP8 mode.
-_A2E_MX_ACTIVATION_DTYPE: Final[torch.dtype] = torch.float8_e4m3fn
-#: Scale dtype the A2E operator validates. This is the PyTorch dtype, not the
-#: torch_npu ScalarType enum, because the operator schema is written in dtypes.
-_A2E_MX_SCALE_DTYPE: Final[torch.dtype] = torch.float8_e8m0fnu
-#: Return values the MXFP8 contract needs: the BF16 four past the activation plus
-#: the received E8M0 scale.
-_A2E_MX_RETURN_VALUES: Final[int] = 6
 
 
 @dataclass(frozen=True)
@@ -456,24 +441,6 @@ def received_routing(
     )
 
 
-def _require_a5_device() -> None:
-    """Refuse the MXFP8 transport on a device whose operator lacks the path.
-
-    The operator compiles its MXFP8 kernel for A5 only (``AFD_TARGET_A5`` in its
-    binding) while registering the same fourteen-argument schema on every build,
-    so the schema probe alone would accept a non-A5 device and the failure would
-    surface at the first transfer instead of at construction.
-    """
-    from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
-
-    device_type = get_ascend_device_type()
-    if device_type != AscendDeviceType.A5:
-        raise RuntimeError(
-            "quant_mode=4 requires an Ascend A5 device; the a2e MXFP8 path is "
-            f"built for A5 only and this one is {device_type.name}",
-        )
-
-
 def _require_one_quant_mode(modes: list[int], local_mode: int) -> None:
     """Fail on every rank when the roles disagree about the A2E transport mode.
 
@@ -652,51 +619,16 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         return A2E_MOE_PATH_OK, None
 
     def _fail_if_mxfp8_transport_unsupported(self, afd_config: AFDConfig) -> None:
-        """Refuse ``quant_mode=4`` when this deployment cannot carry it.
-
-        The checks are the ones the transport depends on, and they run before any
-        communication starts so a bad configuration cannot fail halfway through a
-        request. ``quant_mode=0`` keeps the original twelve-argument call and gains no
-        new requirement.
-        """
+        """Refuse ``quant_mode=4`` when this deployment cannot carry it."""
 
         if self.quant_mode == A2E_QUANT_MODE_BF16:
             return
-        if not afd_config.compute_gate_on_attention:
-            raise RuntimeError(
-                "quant_mode=4 carries a pre-quantized Attention activation, so it "
-                "needs the common compute_gate_on_attention=true on both roles",
-            )
-        if self.attn_size != self.ffn_size:
-            raise RuntimeError(
-                "quant_mode=4 requires equal Attention and FFN rank counts; got "
-                f"A={self.attn_size}, F={self.ffn_size}",
-            )
-        for side, size in (("Attention", self.attn_size), ("FFN", self.ffn_size)):
-            if not 1 <= size <= A2E_MX_MAX_RANKS_PER_SIDE:
-                raise RuntimeError(
-                    "quant_mode=4 requires 1.."
-                    f"{A2E_MX_MAX_RANKS_PER_SIDE} {side} ranks; got {size}",
-                )
-        if self.aiv_num < A2E_MX_MIN_AIV_NUM:
-            raise RuntimeError(
-                "quant_mode=4 requires at least "
-                f"{A2E_MX_MIN_AIV_NUM} AIV cores; got {self.aiv_num}",
-            )
-        # The operator carries the whole routing-id block of one call in a single
-        # UB region, so a batch larger than this cannot be sent at all.
-        _require_a5_device()
-        supported = a2e_accepts_mxfp8_arguments()
-        if supported is False:
-            raise RuntimeError(
-                "quant_mode=4 requires an a2e operator that takes x_scale and "
-                "quant_mode; this build does not",
-            )
-        if supported is None:
-            raise RuntimeError(
-                "quant_mode=4 cannot confirm that this a2e build takes x_scale and "
-                "quant_mode, so the quantized transport stays disabled",
-            )
+        mxfp8_transport.require_supported(
+            afd_config,
+            attn_size=self.attn_size,
+            ffn_size=self.ffn_size,
+            aiv_num=self.aiv_num,
+        )
 
     @property
     def is_initialized(self) -> bool:
@@ -1109,29 +1041,13 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             self.hccl_comm_name3,
         )
         if self.quant_mode == A2E_QUANT_MODE_MXFP8:
-            # The FFN rank receives both payloads from its paired Attention rank,
-            # so it supplies an empty FP8 activation placeholder and omits
-            # ``x_scale``: the operator returns the received activation in
-            # ``outputs[0]`` and the received E8M0 MX scale in ``outputs[5]``.
-            outputs = torch.ops.afd_ascend.a2e(
-                torch.empty(
-                    (0, custom_states.h),
-                    dtype=_A2E_MX_ACTIVATION_DTYPE,
-                    device="npu",
-                ),
-                torch.tensor([], dtype=torch.int32, device="npu"),
-                torch.tensor([], dtype=torch.float32, device="npu"),
-                custom_states.batch_size,
-                custom_states.h,
-                custom_states.k,
-                self.ffn_size,
-                self.attn_size,
-                self.world_rank,
-                group_ep,
-                custom_states.aiv_num,
-                compute_gate_mode,
-                None,
-                A2E_QUANT_MODE_MXFP8,
+            outputs = mxfp8_transport.receive_packet(
+                custom_states,
+                ffn_size=self.ffn_size,
+                attn_size=self.attn_size,
+                world_rank=self.world_rank,
+                group_ep=group_ep,
+                compute_gate_mode=compute_gate_mode,
             )
         else:
             outputs = torch.ops.afd_ascend.a2e(
@@ -1175,23 +1091,10 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             )
         if self.quant_mode == A2E_QUANT_MODE_MXFP8:
             # The BF16 contract is four values past the activation, so a build
-            # that predates the MXFP8 arguments returns exactly five and passes
-            # the two reads above. Name the shortfall here instead of letting
-            # the missing sixth value surface as an IndexError.
-            if len(outputs) < _A2E_MX_RETURN_VALUES:
-                raise RuntimeError(
-                    "CAMP2P MXFP8 transport expects "
-                    f"{_A2E_MX_RETURN_VALUES} operator return values including the "
-                    f"received scale; this a2e build returned {len(outputs)}. The "
-                    "operator does not implement the MXFP8 path",
-                )
-            # Validate the received pair here rather than in the MoE: a wrong
-            # scale would otherwise reach the quantized GMM as a silently
-            # wrongly scaled activation.
-            received_activation_scale = outputs[5]
-            _check_a2e_mx_transport_pair(
-                outputs[0],
-                received_activation_scale,
+            # that predates the MXFP8 arguments returns exactly five; the
+            # transport module names that shortfall instead of an IndexError.
+            received_activation_scale = mxfp8_transport.receive(
+                outputs,
                 self.hidden_size,
             )
         return AFDA2FTransferPayload(
@@ -1472,82 +1375,6 @@ def _get_group_ep(
     return hccl_comm_name1
 
 
-def _check_a2e_mx_transport_pair(
-    quantized: torch.Tensor,
-    scale: torch.Tensor,
-    hidden_size: int,
-) -> None:
-    """Name which part of the A2E ``x_scale`` contract was broken.
-
-    The operator answers six conditions with one opaque failure, which says
-    nothing about what actually arrived. Checking both directions here reports
-    the observed shapes and dtypes instead.
-    """
-    groups = (hidden_size + A2E_MX_GROUP_SIZE - 1) // A2E_MX_GROUP_SIZE
-    problems: list[str] = []
-    if quantized.dtype != _A2E_MX_ACTIVATION_DTYPE:
-        problems.append(
-            f"activation dtype {quantized.dtype} != {_A2E_MX_ACTIVATION_DTYPE}",
-        )
-    if scale.dtype != _A2E_MX_SCALE_DTYPE:
-        problems.append(f"scale dtype {scale.dtype} != {_A2E_MX_SCALE_DTYPE}")
-    if scale.dim() != 2:
-        problems.append(f"scale dim {scale.dim()} != 2")
-    if not scale.is_contiguous():
-        problems.append("scale is not contiguous")
-    if scale.device != quantized.device:
-        problems.append(
-            f"scale device {scale.device} != activation device {quantized.device}",
-        )
-    if scale.shape[0] != quantized.shape[0]:
-        problems.append(
-            f"scale rows {scale.shape[0]} != activation rows {quantized.shape[0]}",
-        )
-    if scale.dim() == 2 and scale.shape[1] != groups:
-        problems.append(
-            f"scale cols {scale.shape[1]} != "
-            f"ceil({hidden_size}/{A2E_MX_GROUP_SIZE})={groups}",
-        )
-    if problems:
-        raise RuntimeError(
-            "A2E MXFP8 transport pair violates its contract: "
-            f"{'; '.join(problems)}"
-            f" | activation {tuple(quantized.shape)} {quantized.dtype}"
-            f" | scale {tuple(scale.shape)} {scale.dtype}",
-        )
-
-
-def mx_quantize_a2e_activation(
-    hidden_states: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize an Attention activation into the A2E MXFP8 transport pair.
-
-    Returns the E4M3 activation and its E8M0 MX scale, the scale shaped
-    ``(tokens, ceil(hidden_size / A2E_MX_GROUP_SIZE))``. The FFN side hands both
-    to the experts without dequantizing, so the row count of the two must agree.
-
-    ``npu_dynamic_mx_quant`` returns the scale with its group axis split into
-    ``(tokens, num_groups // 2, 2)`` -- the layout the fused GMM operators
-    consume -- and returns it as ``uint8``. The A2E packet is two-dimensional
-    and typed ``float8_e8m0fnu``, so the trailing pair is collapsed and the
-    bytes are reinterpreted rather than converted. The scale algorithm is read
-    from vLLM-Ascend so both sides round the same way.
-    """
-    import torch_npu
-    from vllm_ascend.quantization.utils import get_dynamic_mx_quant_scale_alg
-
-    quantized, scale = torch_npu.npu_dynamic_mx_quant(
-        hidden_states,
-        dst_type=_A2E_MX_ACTIVATION_DTYPE,
-        scale_alg=get_dynamic_mx_quant_scale_alg(),
-    )
-    scale = scale.flatten(-2)
-    if scale.dtype != _A2E_MX_SCALE_DTYPE:
-        scale = scale.view(_A2E_MX_SCALE_DTYPE)
-    _check_a2e_mx_transport_pair(quantized, scale, int(hidden_states.shape[-1]))
-    return quantized, scale
-
-
 def _register_camp2p_custom_ops() -> None:
     """Register the CAMP2P send and receive operations once per process.
 
@@ -1621,24 +1448,16 @@ def _register_camp2p_custom_ops() -> None:
             # Quantize the final wire tensor so the scale always covers exactly
             # the rows the operator sends. Mode 4 requires equal Attention and
             # FFN rank counts, so it cannot reach the padding branch above.
-            wire_hidden_states, wire_x_scale = mx_quantize_a2e_activation(
-                wire_hidden_states,
-            )
-            outputs = torch.ops.afd_ascend.a2e(
+            outputs = mxfp8_transport.send(
                 wire_hidden_states,
                 expert_ids,
                 expert_scales,
-                transfer_state.batch_size,
-                transfer_state.h,
-                transfer_state.k,
-                ffn_size,
-                attn_size,
-                world_rank,
-                group_ep,
-                transfer_state.aiv_num,
-                compute_gate,
-                wire_x_scale,
-                quant_mode,
+                transfer_state,
+                ffn_size=ffn_size,
+                attn_size=attn_size,
+                world_rank=world_rank,
+                group_ep=group_ep,
+                compute_gate=compute_gate,
             )
         else:
             # The BF16 transport keeps the original twelve-argument call, so it
