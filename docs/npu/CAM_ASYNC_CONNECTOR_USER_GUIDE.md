@@ -316,6 +316,10 @@ integer from 1 to 32768 MiB. Its unset value for the tiler is 408 MiB. If
 provided, `hccl_buffer_size` must match that effective value. The connector
 passes the agreed size explicitly to HCCL, including when both settings are unset.
 
+Each Attention rank can send at most 65,535 rows in a batch. With Attention
+TP2, the largest divisible `max_num_batched_tokens` is 131,070. Both roles
+validate this limit using `attn_ranks_per_dp`, including FFN workers with local TP1.
+
 For the experimental FlashComm1/SP cases, set
 `VLLM_ASCEND_ENABLE_FLASHCOMM1=1` only on Attention. Set it to `0` for plain TP
 Attention and on every FFN process.

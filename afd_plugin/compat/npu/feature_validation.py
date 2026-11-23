@@ -12,7 +12,7 @@ from afd_plugin.config import (
     AFDConfig,
     parse_afd_config,
 )
-from afd_plugin.validation import cam_receive_capacity
+from afd_plugin.validation import CAM_MAX_SOURCE_ROWS, cam_receive_capacity
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -167,6 +167,7 @@ def _fail_if_unsupported_npu_afd_async_features(
 
     parallel_config = vllm_config.parallel_config
     speculative_config = vllm_config.speculative_config
+    max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
     if get_ascend_device_type() == AscendDeviceType.A5:
         import torch
 
@@ -179,6 +180,12 @@ def _fail_if_unsupported_npu_afd_async_features(
         if afd_config.is_ffn_server and parallel_config.tensor_parallel_size != 1:
             raise RuntimeError(
                 "Ascend 950 Async CAM requires F TP=1 with static expert parallelism"
+            )
+        if max_num_batched_tokens > CAM_MAX_SOURCE_ROWS * extra_info.attn_ranks_per_dp:
+            raise RuntimeError(
+                f"Ascend 950 Async CAM supports at most {CAM_MAX_SOURCE_ROWS} "
+                f"source rows per Attention rank (max_num_batched_tokens="
+                f"{max_num_batched_tokens}, TP={extra_info.attn_ranks_per_dp})"
             )
         if (
             extra_info.dynamic_quant != 0
@@ -236,7 +243,6 @@ def _fail_if_unsupported_npu_afd_async_features(
             )
 
     receive_capacity = cam_receive_capacity()
-    max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
     if speculative_config is not None and speculative_config.method == "dspark":
         draft_hf = speculative_config.draft_model_config.hf_config
         query_rows_per_request = speculative_config.num_speculative_tokens + (
