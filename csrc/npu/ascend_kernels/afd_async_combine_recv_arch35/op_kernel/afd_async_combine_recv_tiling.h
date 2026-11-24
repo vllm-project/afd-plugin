@@ -1,12 +1,12 @@
 /*
  * SPDX-License-Identifier: MIT
  * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * Description: AfdAsyncCombineRecv tiling function header file
+ * Description: Define the host-to-device tiling data for afd_async_combine_recv.
  * Create: 2025-12-18
- * Note:
- * History:
- * 2025-12-18 create AfdAsyncCombineRecv tiling function header file
+ * Note: The host tiler and the device entry point share this structure layout.
+ * History: 2025-12-18 create AfdAsyncCombineRecv tiling function header file
  */
+
 #ifndef AFD_ASYNC_COMBINE_RECV_TILING_H
 #define AFD_ASYNC_COMBINE_RECV_TILING_H
 

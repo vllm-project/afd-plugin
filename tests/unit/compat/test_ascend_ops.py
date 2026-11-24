@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Test the Ascend custom operator loader.
+# Create: 2026-05-25
+# Note: Tests cover vendor search order, compact schemas and missing native symbols.
+# History: 2026-05-25 create
 
 from __future__ import annotations
 

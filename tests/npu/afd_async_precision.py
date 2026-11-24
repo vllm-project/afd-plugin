@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Check all four routed-only native operators against an independent CPU
+#              oracle.
+# Create: 2026-09-22
+# Note: The CPU oracle checks the routed output after the four communication phases.
+# History: 2026-09-22 create
 """Check all four routed-only native operators against an independent CPU oracle.
 
 Example (four 910C devices, two Attention ranks and two MoE ranks)::

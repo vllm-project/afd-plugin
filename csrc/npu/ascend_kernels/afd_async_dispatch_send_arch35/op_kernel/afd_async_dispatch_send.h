@@ -1,12 +1,12 @@
 /*
  * SPDX-License-Identifier: MIT
  * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * Description: AfdAsyncDispatchSend operator kernel function header file
+ * Description: Ascend C implementation of afd_async_dispatch_send.
  * Create: 2025-12-18
- * Note:
- * History:
- * 2025-12-18 create AfdAsyncDispatchSend operator kernel function header file
+ * Note: Send token payloads and routing metadata to their destination expert ranks.
+ * History: 2025-12-18 create AfdAsyncDispatchSend operator kernel function header file
  */
+
 #ifndef AFD_ASYNC_DISPATCH_SEND_H
 #define AFD_ASYNC_DISPATCH_SEND_H
 #define OPT_RANK_OFFSET 512

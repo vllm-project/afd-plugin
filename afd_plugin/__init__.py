@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: vLLM AFD plugin: Attention-FFN Disaggregation support.
+# Create: 2026-05-15
+# Note: Plugin registration installs the AFD model aliases.
+# History: 2026-05-15 create
 """vLLM AFD plugin: Attention-FFN Disaggregation support."""
 
 from __future__ import annotations

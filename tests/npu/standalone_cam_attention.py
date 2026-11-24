@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: One real CAM A peer for a separately launched routed-only FFN service.
+# Create: 2026-11-11
+# Note: Pair the Attention client with a separately launched FFN service.
+# History: 2026-11-11 create
 """One real CAM A peer for a separately launched routed-only FFN service.
 
 This finite functional check uses the original checkpoint on F and every main

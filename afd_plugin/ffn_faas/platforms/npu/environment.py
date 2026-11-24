@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Initialize the Ascend device and compute groups for standalone FFN
+#              execution.
+# Create: 2026-11-11
+# Note: This environment owns the FFN-local expert parallel group.
+# History: 2026-11-11 create
 """Own the F-local Ascend device and native compute groups through execution.
 
 CAM owns a distinct A/F process group. Keeping the native F-only EP context

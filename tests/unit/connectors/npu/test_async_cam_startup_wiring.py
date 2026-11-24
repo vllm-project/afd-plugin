@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Real startup call sites with host stubs; not device execution coverage.
+# Create: 2026-10-19
+# Note: The tests observe whether invalid configurations reach group creation.
+# History: 2026-10-19 create
 """Real startup call sites with host stubs; not device execution coverage."""
 
 import json

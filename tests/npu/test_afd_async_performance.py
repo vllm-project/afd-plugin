@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: CPU checks for benchmark metric definitions and readiness sequencing.
+# Create: 2026-09-22
+# Note: CPU tests verify timing boundaries and the report's aggregation rules.
+# History: 2026-09-22 create
 """CPU checks for benchmark metric definitions and readiness sequencing."""
 
 from __future__ import annotations

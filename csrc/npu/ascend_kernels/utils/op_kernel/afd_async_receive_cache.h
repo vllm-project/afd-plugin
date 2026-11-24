@@ -1,4 +1,14 @@
-// SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+ * Description: Track two cached DispatchRecv payload rows.
+ * Create: 2026-10-13
+ * Note: The row key includes the source, so equal offsets on different ranks stay
+ *       distinct.
+ * History: 2026-10-13 create
+ */
+
 #ifndef AFD_ASYNC_RECEIVE_CACHE_H
 #define AFD_ASYNC_RECEIVE_CACHE_H
 

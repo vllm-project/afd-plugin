@@ -1,12 +1,12 @@
 /*
  * SPDX-License-Identifier: MIT
  * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * Description: AfdAsyncDispatchRecv kernel function definition file
+ * Description: Ascend C kernel entry point for afd_async_dispatch_recv.
  * Create: 2025-12-18
- * Note:
- * History:
- * 2025-12-18 create AfdAsyncDispatchRecv operator definition file
+ * Note: The tiling key selects the kernel specialization.
+ * History: 2025-12-18 create AfdAsyncDispatchRecv operator definition file
  */
+
 #include "kernel_operator.h"
 #include "afd_async_dispatch_recv.h"
 #include "afd_async_dispatch_recv_tiling.h"

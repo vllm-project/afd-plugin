@@ -1,11 +1,12 @@
 /*
+ * SPDX-License-Identifier: MIT
  * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * Description: AfdAsyncCombineRecv operator kernel function header file
+ * Description: Ascend C implementation of afd_async_combine_recv.
  * Create: 2025-12-18
- * Note:
- * History:
- * 2025-12-18 create AfdAsyncCombineRecv operator kernel function header file
+ * Note: Combine routed expert outputs in logical top-k order.
+ * History: 2025-12-18 create AfdAsyncCombineRecv operator kernel function header file
  */
+
 #ifndef AFD_ASYNC_COMBINE_RECV_H
 #define AFD_ASYNC_COMBINE_RECV_H
 #define OPT_RANK_OFFSET 512

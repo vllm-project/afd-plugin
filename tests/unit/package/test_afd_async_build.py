@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: CPU checks for the routed-only CAM sources and build selection
+#              contract.
+# Create: 2026-09-21
+# Note: Checks operator selection, source staging and packaged license notices.
+# History: 2026-09-21 create
 """CPU checks for the routed-only CAM sources and build selection contract."""
 
 from __future__ import annotations

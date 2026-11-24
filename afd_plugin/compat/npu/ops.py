@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Loader for plugin-owned Ascend custom operators.
+# Create: 2026-05-25
+# Note: Async startup resolves the ACLNN execution and workspace symbols before HCCL
+#       initialization.
+# History: 2026-05-25 create
 """Loader for plugin-owned Ascend custom operators."""
 
 from __future__ import annotations

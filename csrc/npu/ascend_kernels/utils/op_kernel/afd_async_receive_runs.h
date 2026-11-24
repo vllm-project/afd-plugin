@@ -1,4 +1,13 @@
-// SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+ * Description: Plan contiguous payload copies for DispatchRecv.
+ * Create: 2026-10-14
+ * Note: Each run stays within one expert and the current AIV's source slice.
+ * History: 2026-10-14 create
+ */
+
 #ifndef AFD_ASYNC_RECEIVE_RUNS_H
 #define AFD_ASYNC_RECEIVE_RUNS_H
 

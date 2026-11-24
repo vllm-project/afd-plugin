@@ -1,11 +1,14 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
-// Copyright contributors to the AFD plugin project
-//
-// Adapted from cam_async/src/comm_operator/pybind/moe_*_async.cpp.
-// New AFD inference adapters share allocation and validation between NPU and
-// Meta. They retain the cam_async_routed_only_compact_v2 argument order and
-// ACLNN calls, without the source's placeholder autograd implementation.
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+ * Copyright contributors to the AFD plugin project
+ * Description: Register the four compact afd_async operators with PyTorch.
+ * Create: 2026-09-21
+ * Note: Adapted from cam_async/src/comm_operator/pybind/moe_*_async.cpp. The NPU and
+ *       Meta bindings share the cam_async_routed_only_compact_v2 argument order and
+ *       ACLNN calls.
+ * History: 2026-09-21 integrate the compact operator bindings into afd-plugin
+ */
 
 #include <cstdlib>
 #include <exception>

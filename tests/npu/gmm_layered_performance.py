@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: 910C performance benchmarks for the two layered routed-expert
+#              operators.
+# Create: 2026-10-20
+# Note: The benchmark measures W13 and W2 separately.
+# History: 2026-10-20 create
 """910C performance benchmarks for the two layered routed-expert operators.
 
 Covers the DSV4-Flash W4A8 / EP4 FFN compute path. Geometry is derived from the

@@ -1,12 +1,13 @@
 /*
  * SPDX-License-Identifier: MIT
  * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * Description: AfdAsyncCombineRecv tiling function implementation file
+ * Description: Host tiling and registration for afd_async_combine_recv.
  * Create: 2025-12-18
- * Note:
- * History:
- * 2025-12-18 create AfdAsyncCombineRecv tiling function file
+ * Note: The host selects the AIV launch dimensions and configures the MC2
+ *       communication group.
+ * History: 2025-12-18 create AfdAsyncCombineRecv tiling function file
  */
+
 #include "register/op_def_registry.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling/hccl/hccl_tiling.h"

@@ -1,4 +1,13 @@
-// SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+ * Description: Resolve the HCCL input window for a compact AFD transfer.
+ * Create: 2026-10-12
+ * Note: The A5 MC2 resource context supplies the per-rank buffer addresses.
+ * History: 2026-10-12 create
+ */
+
 #ifndef AFD_ASYNC_WINDOW_H
 #define AFD_ASYNC_WINDOW_H
 

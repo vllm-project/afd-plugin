@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: The plugin entry point registers lazy AFD aliases without replacing
+#              vLLM.
+# Create: 2026-05-15
+# Note: Tests use the general-plugin entry point and the model registry.
+# History: 2026-05-15 create
 """The plugin entry point registers lazy AFD aliases without replacing vLLM."""
 
 from __future__ import annotations

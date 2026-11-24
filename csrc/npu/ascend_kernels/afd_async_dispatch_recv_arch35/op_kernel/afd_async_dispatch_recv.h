@@ -1,12 +1,12 @@
 /*
  * SPDX-License-Identifier: MIT
  * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * Description: AfdAsyncDispatchRecv operator kernel function header file
+ * Description: Ascend C implementation of afd_async_dispatch_recv.
  * Create: 2025-12-18
- * Note:
- * History:
- * 2025-12-18 create AfdAsyncDispatchRecv operator kernel function header file
+ * Note: Receive and group routed token rows for local experts.
+ * History: 2025-12-18 create AfdAsyncDispatchRecv operator kernel function header file
  */
+
 #ifndef AFD_ASYNC_DISPATCH_RECV_H
 #define AFD_ASYNC_DISPATCH_RECV_H
 #define OPT_RANK_OFFSET 512

@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Resolve the final AFD operator list to compile for a given SOC
+#              generation.
+# Create: 2026-09-20
+# Note: The selected SoC determines which source directory implements a public
+#       operator.
+# History: 2026-09-20 create
 """Resolve the final AFD operator list to compile for a given SOC generation.
 
 Reads operator_registry.json, validates the user selection, applies the SHMEM

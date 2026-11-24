@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Optional CPU PyTorch regression tests for the FP16/BF16 golden
+#              contract.
+# Create: 2026-09-22
+# Note: CPU tensors provide reference values for dispatch and weighted combine.
+# History: 2026-09-22 create
 """Optional CPU PyTorch regression tests for the FP16/BF16 golden contract."""
 
 from __future__ import annotations
