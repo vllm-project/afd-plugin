@@ -27,7 +27,7 @@ from afd_plugin.config import (
     AFDConfig,
     parse_afd_config,
 )
-from afd_plugin.model_executor.ffn.remote import RemoteFFNProxy
+from afd_plugin.model_executor.ffn.remote import RemoteFFNProxy, build_expert
 from afd_plugin.model_executor.models._weight_utils import (
     ATTENTION_ROLE,
     BOTH_ROLES,
@@ -116,7 +116,7 @@ def _validate_supported_config(
                 f"AFD Qwen3 MoE with {afd_config.connector} requires every "
                 "layer to be MoE (no mlp_only_layers, decoder_sparse_step=1)",
             )
-        # Neither the Attention proxy nor the routed FFN runner computes a
+        # Neither the Attention MoE block nor the routed FFN runner computes a
         # shared expert, so its output would be dropped silently. The field is
         # optional on Qwen3 configs; native vLLM reads it the same way.
         if getattr(text_config, "shared_expert_intermediate_size", 0) > 0:
@@ -136,6 +136,85 @@ def _validate_supported_config(
         raise RuntimeError("AFD Qwen3 MoE does not support speculative decoding")
     if vllm_config.lora_config is not None:
         raise RuntimeError("AFD Qwen3 MoE does not support LoRA")
+
+
+class AFDQwen3MoeRemoteExpertsBlock(native.Qwen3MoeSparseMoeBlock):
+    """Native Qwen3 MoE block forward with remote experts and no expert weights."""
+
+    # Patch reason: native Qwen3MoeSparseMoeBlock builds local experts.
+    # Patch functionality: keep the native forward; build the gate only when
+    # Attention computes it, no shared expert, and weightless remote experts
+    # with build_expert. With routes and TP > 1, each TP rank sends its slice.
+    # Signature: matches upstream; no added parameters.
+    # Upstream: vLLM v0.32.0, vllm/model_executor/models/qwen3_moe.py
+    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        is_fused_checkpoint_transposed: bool = False,
+    ):
+        # ### PATCH START: skip the native constructor.
+        nn.Module.__init__(self)
+        afd_config = parse_afd_config(vllm_config, validate=False)
+        # ### PATCH END: skip the native constructor.
+
+        config = vllm_config.model_config.hf_text_config
+        parallel_config = vllm_config.parallel_config
+        quant_config = vllm_config.quant_config
+
+        self.tp_size = native.get_tensor_model_parallel_world_size()
+
+        self.ep_group = native.get_ep_group().device_group
+        self.ep_size = self.ep_group.size()
+        self.n_routed_experts = config.num_experts
+
+        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+
+        if self.tp_size > config.num_experts:
+            raise ValueError(
+                f"Tensor parallel size {self.tp_size} is greater than "
+                f"the number of experts {config.num_experts}."
+            )
+
+        # Load balancing settings.
+        vllm_config = native.get_current_vllm_config()
+        eplb_config = vllm_config.parallel_config.eplb_config
+        self.enable_eplb = parallel_config.enable_eplb
+
+        self.n_logical_experts = self.n_routed_experts
+        self.n_redundant_experts = eplb_config.num_redundant_experts
+        self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
+        self.n_local_physical_experts = self.n_physical_experts // self.ep_size
+
+        # ### PATCH START: Attention gate, TP slicing and remote experts.
+        # TP peers hold the same tokens; each sends only its slice of the routes.
+        if _routes_on_attention(afd_config) and self.tp_size > 1:
+            self.is_sequence_parallel = True
+        # Before the experts (which hold it too), so it keeps the name mlp.gate.*.
+        self.gate = None
+        if afd_config.compute_gate_on_attention:
+            self.gate = native.GateLinear(
+                config.hidden_size,
+                config.num_experts,
+                quant_config=quant_config,
+                prefix=f"{prefix}.gate",
+            )
+        # The FFN runs any shared expert; DeepEP M2N rejects them.
+        self.shared_expert_gate = None
+        self.shared_expert = None
+        self.experts = build_expert(
+            vllm_config,
+            gate=self.gate,
+            num_experts=self.n_routed_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            renormalize=config.norm_topk_prob,
+            prefix=f"{prefix}.experts",
+            is_fused_checkpoint_transposed=is_fused_checkpoint_transposed,
+        )
+        # ### PATCH END: Attention gate, TP slicing and remote experts.
 
 
 class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
@@ -195,20 +274,10 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
                 dual_chunk_attention_config=dual_chunk_attention_config,
                 mrope_positions_factor=mrope_positions_factor,
             )
-            self.mlp = RemoteFFNProxy(layer_idx=layer_idx)
-            if _routes_on_attention(afd_config):
-                # Same gate as native Qwen3MoeSparseMoeBlock (GateLinear, same
-                # arguments), same weight path.
-                self.mlp.gate = native.GateLinear(
-                    config.hidden_size,
-                    config.num_experts,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.mlp.gate",
-                )
-                self.mlp.top_k = int(config.num_experts_per_tok)
-                self.mlp.renormalize = bool(config.norm_topk_prob)
-                # Attention TP peers each dispatch their slice of the tokens.
-                self.mlp.tp_size = vllm_config.parallel_config.tensor_parallel_size
+            if self.is_moe_layer:
+                self.mlp = AFDQwen3MoeRemoteExpertsBlock(vllm_config, f"{prefix}.mlp")
+            else:
+                self.mlp = RemoteFFNProxy(layer_idx=layer_idx)
             self.input_layernorm = native.RMSNorm(
                 config.hidden_size,
                 eps=config.rms_norm_eps,
@@ -354,8 +423,8 @@ class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
     """Qwen3 MoE causal LM wrapper for AFD CUDA execution."""
 
     # Patch reason: native Qwen3MoeForCausalLM has no model-class injection hook.
-    # Patch functionality: construct AFDQwen3MoeModel and retain native lifecycle
-    # and MoE metadata without requiring local experts on the Attention role.
+    # Patch functionality: construct AFDQwen3MoeModel and keep the native
+    # lifecycle and MoE metadata.
     # Signature: matches upstream; no added parameters.
     # Upstream: vLLM v0.32.0, vllm/model_executor/models/qwen3_moe.py
     # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
@@ -412,31 +481,17 @@ class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
                 example_layer = layer.mlp
                 self.moe_layers.append(layer.mlp.experts)
 
-        # ### PATCH START: Attention owns no local MoE but keeps native metadata.
-        if example_layer is None and self.afd_role == "attention":
-            moe_layer_indices = self.model.get_experts_layer_indices()
-            if not moe_layer_indices:
-                raise RuntimeError("No Qwen3MoE layer found in the model.layers.")
-            self.num_moe_layers = 0
-            self.num_expert_groups = 1
-            self.num_shared_experts = 0
-            self.num_logical_experts = config.num_experts
-            self.num_physical_experts = config.num_experts
-            self.num_local_physical_experts = 0
-            self.num_routed_experts = config.num_experts
-            self.num_redundant_experts = 0
-        elif example_layer is None:
+        if example_layer is None:
             raise RuntimeError("No Qwen3MoE layer found in the model.layers.")
-        else:
-            self.num_moe_layers = len(self.moe_layers)
-            self.num_expert_groups = 1
-            self.num_shared_experts = 0
-            self.num_logical_experts = example_layer.n_logical_experts
-            self.num_physical_experts = example_layer.n_physical_experts
-            self.num_local_physical_experts = example_layer.n_local_physical_experts
-            self.num_routed_experts = example_layer.n_routed_experts
-            self.num_redundant_experts = example_layer.n_redundant_experts
-        # ### PATCH END: Attention owns no local MoE but keeps native metadata.
+
+        self.num_moe_layers = len(self.moe_layers)
+        self.num_expert_groups = 1
+        self.num_shared_experts = 0
+        self.num_logical_experts = example_layer.n_logical_experts
+        self.num_physical_experts = example_layer.n_physical_experts
+        self.num_local_physical_experts = example_layer.n_local_physical_experts
+        self.num_routed_experts = example_layer.n_routed_experts
+        self.num_redundant_experts = example_layer.n_redundant_experts
 
     def compute_ffn_output(
         self,

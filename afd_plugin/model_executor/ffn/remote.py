@@ -12,10 +12,7 @@ from typing import Any
 import torch
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    tensor_model_parallel_all_gather,
-)
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.fused_moe.config import (
@@ -30,18 +27,13 @@ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
-from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
     SharedExpertsOrder,
 )
-from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.models.utils import (
-    extract_layer_index,
-    sequence_parallel_chunk,
-)
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 
 from afd_plugin.config import parse_afd_config
@@ -120,56 +112,16 @@ def _send_attention_output(
 class RemoteFFNProxy(nn.Module):
     """FFN stage executed through the AFD connector.
 
-    By default the proxy is parameter-free: it sends the hidden states and the
-    FFN role runs the complete MLP or MoE block. A model whose connector routes
-    on Attention (an M2N routed-experts connector such as DeepEP M2N) sets
-    ``gate``, ``top_k``, ``renormalize`` and ``tp_size`` after construction,
-    from its model and parallel config. The proxy then computes the gate and
-    vLLM's default fused top-k (``FusedTopKRouter``; EPLB is not supported)
-    and sends ``topk_ids`` and ``topk_weights``; combine returns the top-k
-    weighted sum, which replaces the native MoE block's output.
-
-    With Attention TP > 1 every TP rank holds the same tokens after the
-    attention all-reduce; dispatching them from every rank would make the FFN
-    run each token TP times. Each rank instead pads the tokens to a multiple
-    of ``tp_size`` (``sequence_parallel_chunk``), routes and dispatches only
-    its slice, and the TP group all-gathers the combined slices, as vLLM's
-    sequence-parallel MoE does. Padding rows get ``UNROUTED_EXPERT_ID`` and
-    reach no FFN rank; they are dropped after the all-gather.
+    The proxy is parameter-free: it sends the hidden states and the FFN role
+    runs the complete MLP or MoE block.
     """
 
     def __init__(self, *, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
-        self.gate: ReplicatedLinear | None = None
-        self.top_k = 0
-        self.renormalize = False
-        self.tp_size = 1
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.gate is None:
-            return self._send_and_receive(hidden_states)
-        num_tokens = hidden_states.shape[0]
-        if self.tp_size > 1:
-            hidden_states = sequence_parallel_chunk(hidden_states)
-        router_logits, _ = self.gate(hidden_states)
-        topk_weights, topk_ids, _ = fused_topk(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=self.top_k,
-            renormalize=self.renormalize,
-        )
-        if self.tp_size > 1:
-            topk_ids = _unroute_tp_padding(topk_ids, num_tokens)
-        output = self._send_and_receive(
-            hidden_states,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-        )
-        if self.tp_size > 1:
-            output = tensor_model_parallel_all_gather(output, 0)
-            output = output[:num_tokens]
-        return output
+        return self._send_and_receive(hidden_states)
 
     def _send_and_receive(
         self,
