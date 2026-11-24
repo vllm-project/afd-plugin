@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: CPU checks for the routed-only CAM sources and build selection
+#              contract.
+# Create: 2026-09-21
+# Note: Checks operator selection, source staging and packaged license notices.
+# History: 2026-09-21 create
 """CPU checks for the routed-only CAM sources and build selection contract."""
 
 from __future__ import annotations
@@ -15,17 +20,19 @@ from setuptools.command.egg_info import FileList, manifest_maker
 
 from tests.unit.package.test_ascend_build_files import _run_select_ops
 
-CAM_OPERATORS = (
+AFD_ASYNC_OPERATORS = (
     "afd_async_dispatch_send",
     "afd_async_dispatch_recv",
     "afd_async_combine_send",
     "afd_async_combine_recv",
 )
 
-CAM_MIT_NOTICE = """\
+AFD_ASYNC_MIT_NOTICE = """\
 The MIT License
 
 Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+Copyright contributors to the AFD plugin project
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -47,24 +54,38 @@ THE SOFTWARE.
 """
 
 
-@pytest.mark.parametrize("operator", CAM_OPERATORS)
-def test_cam_operator_selection_rejects_unqualified_soc(operator: str):
-    result = _run_select_ops("--soc", "ascend950", "--shmem", "1", "--ops", operator)
+@pytest.mark.parametrize("operator", AFD_ASYNC_OPERATORS)
+@pytest.mark.parametrize("soc", ["ascend910_93", "ascend950"])
+def test_afd_async_operator_selection_uses_soc_implementation(operator: str, soc: str):
+    result = _run_select_ops("--soc", soc, "--shmem", "0", "--ops", operator)
 
-    assert result.returncode != 0
-    assert operator in result.stderr
-    assert "not in SOC support list" in result.stderr
-    assert not result.stdout
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        f"{operator}_arch35" if soc == "ascend950" else operator
+    ]
 
 
-def test_cam_selection_preserves_registry_order_with_legacy_operators():
-    requested = [CAM_OPERATORS[-1], "e2a", CAM_OPERATORS[0]]
+def test_afd_async_arch35_selector_is_specific_to_950():
+    directory = "afd_async_dispatch_send_arch35"
+    args = ("--shmem", "0", "--ops", directory)
+    result = _run_select_ops("--soc", "ascend950", *args)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [directory]
+    assert _run_select_ops("--soc", "ascend910_93", *args).returncode != 0
+
+
+def test_afd_async_selection_preserves_registry_order_with_legacy_operators():
+    requested = [AFD_ASYNC_OPERATORS[-1], "e2a", AFD_ASYNC_OPERATORS[0]]
     result = _run_select_ops(
         "--soc", "ascend910_93", "--shmem", "0", "--ops", ";".join(requested)
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.split() == ["e2a", CAM_OPERATORS[0], CAM_OPERATORS[-1]]
+    assert result.stdout.split() == [
+        "e2a",
+        AFD_ASYNC_OPERATORS[0],
+        AFD_ASYNC_OPERATORS[-1],
+    ]
 
 
 def test_native_sources_survive_source_distribution_manifest(monkeypatch):
@@ -92,19 +113,27 @@ def test_native_sources_survive_source_distribution_manifest(monkeypatch):
     required = set(files.allfiles) | {"LICENSE"}
     assert required <= packaged, sorted(required - packaged)
     license_text = (root / "LICENSE").read_text()
-    assert " ".join(CAM_MIT_NOTICE.split()) in " ".join(license_text.split())
+    assert " ".join(AFD_ASYNC_MIT_NOTICE.split()) in " ".join(license_text.split())
 
 
-def test_selected_cam_sources_do_not_overwrite_other_operators_when_staged():
+@pytest.mark.parametrize("soc", ["ascend910_93", "ascend950"])
+def test_selected_afd_async_sources_do_not_overwrite_other_operators_when_staged(soc):
     """The build driver flattens each source category into one directory."""
     root = Path(__file__).resolve().parents[3] / "csrc/npu/ascend_kernels"
-    result = _run_select_ops("--soc", "ascend910_93", "--shmem", "0")
+    result = _run_select_ops("--soc", soc, "--shmem", "0")
     assert result.returncode == 0, result.stderr
 
     for part in ("op_api", "op_host", "op_kernel"):
         staged: dict[str, Path] = {}
         for operator in ("utils", *result.stdout.split()):
             part_dir = root / operator / part
+            if (
+                part == "op_api"
+                and operator.endswith("_arch35")
+                and not part_dir.is_dir()
+            ):
+                part_dir = root / operator.removesuffix("_arch35") / part
+                assert part_dir.is_dir(), part_dir
             for path in part_dir.rglob("*"):
                 if not path.is_file():
                     # Nested subdirectories (e.g. op_host/op_tiling/) are copied

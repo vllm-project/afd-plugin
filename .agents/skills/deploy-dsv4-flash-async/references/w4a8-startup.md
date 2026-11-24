@@ -9,9 +9,9 @@
 ```python
 import torch
 import afd_plugin._C_ascend
-from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
+from afd_plugin.compat.npu.ops import ensure_afd_async_ops_available
 
-ensure_cam_async_ops_available()
+ensure_afd_async_ops_available()
 print(torch.ops.afd_ascend.grouped_matmul_layered)
 print(torch.ops.afd_ascend.gmm_swiglu_quant_v2_layered)
 ```

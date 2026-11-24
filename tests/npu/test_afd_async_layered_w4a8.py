@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Check the numerical accuracy of the 910C layered W4A8 expert path.
+# Create: 2026-09-24
+# Note: The numerical comparison covers valid rows and the receive-capacity tail.
+# History: 2026-09-24 create
 """Opt-in numerical checks; requires a 910C and the compiled AFD extension.
 
 Run with AFD_RUN_ASCEND_OP_RUNTIME=1 SOC_VERSION=910c via pytest.
@@ -26,13 +30,13 @@ def test_layered_w4a8_valid_rows_and_capacity_tail(
         pytest.skip("requires opt-in 910C runtime")
     torch = pytest.importorskip("torch")
     torch_npu = pytest.importorskip("torch_npu")
-    from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
+    from afd_plugin.compat.npu.ops import ensure_afd_async_ops_available
     from afd_plugin.connectors.npu.async_cam_runtime.async_cam_layered import (
         AsyncCAMLayeredExecutor,
     )
     from afd_plugin.model_executor.ffn.npu.expert_weights import QuantizedExpertWeights
 
-    ensure_cam_async_ops_available()
+    ensure_afd_async_ops_available()
     torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     torch.npu.config.allow_internal_format = True
     torch.manual_seed(7)

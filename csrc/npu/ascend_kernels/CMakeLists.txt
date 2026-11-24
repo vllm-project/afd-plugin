@@ -14,6 +14,9 @@ npu_op_package(${package_name}
         INSTALL_PATH ${CMAKE_BINARY_DIR}/
 )
 
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
+        DESTINATION "packages/vendors/${vendor_name}")
+
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/op_host)
     add_subdirectory(op_host)
 endif()

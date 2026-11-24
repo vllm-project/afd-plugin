@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: NPU Attention-side worker for AFD execution.
+# Create: 2026-05-25
+# Note: Async transport operators are checked before device and distributed
+#       initialization.
+# History: 2026-05-25 create
 """NPU Attention-side worker for AFD execution."""
 
 from __future__ import annotations
@@ -16,7 +21,7 @@ from afd_plugin.compat.npu import (
     fix_all2all_backend_for_afd,
     npu_afd_num_ubatches,
 )
-from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
+from afd_plugin.compat.npu.ops import ensure_afd_async_ops_available
 from afd_plugin.compat.npu.runtime_config import configure_async_cam_dbo
 from afd_plugin.config import AFD_ASYNC_CONNECTOR
 from afd_plugin.model_executor.models.model_utils import (
@@ -64,11 +69,11 @@ class AFDNPUAttentionWorker(NPUWorker):
         )
         configure_afd_dspark(self.vllm_config)
 
+        if afd_config.connector == AFD_ASYNC_CONNECTOR:
+            ensure_afd_async_ops_available()
         self.device = self._init_device()
         # FLA registration needs the selected device, before Runner construction.
         register_ascend_fla_customop()
-        if afd_config.connector == AFD_ASYNC_CONNECTOR:
-            ensure_cam_async_ops_available()
         init_workspace_manager(
             self.device,
             npu_afd_num_ubatches(self.vllm_config),

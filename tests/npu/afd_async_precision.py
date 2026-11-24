@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Check all four routed-only native operators against an independent CPU
+#              oracle.
+# Create: 2026-09-22
+# Note: The CPU oracle checks the routed output after the four communication phases.
+# History: 2026-09-22 create
 """Check all four routed-only native operators against an independent CPU oracle.
 
 Example (four 910C devices, two Attention ranks and two MoE ranks)::
 
-    torchrun --standalone --nproc-per-node=4 tests/npu/async_cam_precision.py \
+    torchrun --standalone --nproc-per-node=4 tests/npu/afd_async_precision.py \
         --dtype bf16 --dynamic-quant 1 --capacity 8 --iterations 3
 
 Use a fresh torchrun for each dtype, quantization and routing configuration.
@@ -20,7 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING or __package__:
-    from .async_cam_common import (
+    from .afd_async_common import (
         MAX_LAYER_INDEX,
         NativeHarness,
         add_common_arguments,
@@ -28,7 +33,7 @@ if TYPE_CHECKING or __package__:
         describe_config,
     )
 else:
-    from async_cam_common import (
+    from afd_async_common import (
         MAX_LAYER_INDEX,
         NativeHarness,
         add_common_arguments,

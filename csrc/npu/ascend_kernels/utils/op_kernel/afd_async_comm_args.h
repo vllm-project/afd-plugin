@@ -1,14 +1,14 @@
 /*
  * SPDX-License-Identifier: MIT
  * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
- * Description: create comm args header file
+ * Description: Define the CAM communication argument layout.
  * Create: 2026-01-05
- * Note: This file might be replaced! We will try to use the file from cann-toolkit in env when compiling.
+ * Note: The structure layout must match the CANN toolkit communication ABI.
  * History: 2026-01-05 create comm args header file
  */
 
-#ifndef AFD_CAM_ASYNC_COMM_ARGS_H
-#define AFD_CAM_ASYNC_COMM_ARGS_H
+#ifndef AFD_ASYNC_COMM_ARGS_H
+#define AFD_ASYNC_COMM_ARGS_H
 #include <cstdint>
 
 #define FORCE_INLINE_AICORE __attribute__((always_inline)) inline __aicore__
@@ -79,4 +79,4 @@ struct CommArgs {
     int64_t dfx[DFX_COUNT] = {};
 };
 } // namespace Cam
-#endif // AFD_CAM_ASYNC_COMM_ARGS_H
+#endif // AFD_ASYNC_COMM_ARGS_H

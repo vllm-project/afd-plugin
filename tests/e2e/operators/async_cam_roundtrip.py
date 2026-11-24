@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Independent source-operator numerical check, launched with torchrun.
+# Create: 2026-09-21
+# Note: Run with one torchrun process per NPU.
+# History: 2026-09-21 create
 """Independent source-operator numerical check, launched with torchrun.
 
 Example (six NPUs: Attention TP4 + FFN EP2)::
@@ -27,7 +31,7 @@ import torch
 import torch.distributed as dist
 import torch_npu  # noqa: F401
 
-from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
+from afd_plugin.compat.npu.ops import ensure_afd_async_ops_available
 
 HIDDEN_SIZE = 512
 FFN_RANKS = 2
@@ -112,7 +116,7 @@ def main() -> None:
     # One expert fits; two fully populated experts require separate chunks.
     capacity = args.tp * BATCH_SIZE
     os.environ["BATCH_SIZE_FACTOR"] = str(capacity / MAX_CAPACITY)
-    ensure_cam_async_ops_available()
+    ensure_afd_async_ops_available()
     dist.init_process_group("hccl", timeout=timedelta(minutes=5))
     group_name = dist.group.WORLD._get_backend(torch.device("npu")).get_hccl_comm_name(
         rank

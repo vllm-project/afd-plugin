@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: vLLM AFD plugin: Attention-FFN Disaggregation support.
+# Create: 2026-05-15
+# Note: Plugin registration installs the AFD model aliases.
+# History: 2026-05-15 create
 """vLLM AFD plugin: Attention-FFN Disaggregation support."""
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, cast
 
+from afd_plugin.compat.npu.ops import prepare_afd_ascend950_vendor
 from afd_plugin.config import AFDConfig, parse_afd_config, parse_optional_afd_config
 
 
@@ -166,6 +171,10 @@ def register_afd() -> None:
         _logger.debug("AFD plugin: vLLM not found, skipping runtime registration")
         _registered = True
         return
+
+    # CANN can resolve native operators during platform initialization. Make
+    # the private A5 vendor visible before any of the runtime patch imports.
+    prepare_afd_ascend950_vendor()
 
     try:
         from afd_plugin.compat.vllm import assert_vllm_version_supported

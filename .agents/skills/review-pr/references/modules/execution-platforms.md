@@ -44,5 +44,5 @@ application ([npu-compat.md](npu-compat.md)).
 Test platform selection and build gating in `tests/unit/v1/worker/`
 (`test_runtime_classpaths.py`), `tests/unit/config/test_validation.py`, and
 `tests/unit/package/` (`test_package.py`, `test_ascend_build_files.py`,
-`test_ascend_op_host_build.py`, `test_cam_async_build.py`); kernel changes
+`test_ascend_op_host_build.py`, `test_afd_async_build.py`); kernel changes
 additionally name the NPU run that produced their evidence.

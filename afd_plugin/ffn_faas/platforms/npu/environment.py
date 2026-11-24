@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Initialize the Ascend device and compute groups for standalone FFN
+#              execution.
+# Create: 2026-11-11
+# Note: This environment owns the FFN-local expert parallel group.
+# History: 2026-11-11 create
 """Own the F-local Ascend device and native compute groups through execution.
 
 CAM owns a distinct A/F process group. Keeping the native F-only EP context
@@ -52,10 +57,10 @@ class AscendFFNEnvironment(FFNEnvironmentBase[FFNConfig]):
             get_ascend_device_type,
         )
 
-        from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
+        from afd_plugin.compat.npu.ops import ensure_afd_async_ops_available
 
         self.require_no_borrowed_native_groups()
-        ensure_cam_async_ops_available()
+        ensure_afd_async_ops_available()
         # Reuse the native Worker's mapping for --device-ids and visibility.
         assigned = config.parallel_config.assigned_physical_gpu_ids
         if assigned is not None:

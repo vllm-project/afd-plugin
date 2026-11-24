@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: 910C performance benchmarks for the two layered routed-expert
+#              operators.
+# Create: 2026-10-20
+# Note: The benchmark measures W13 and W2 separately.
+# History: 2026-10-20 create
 """910C performance benchmarks for the two layered routed-expert operators.
 
 Covers the DSV4-Flash W4A8 / EP4 FFN compute path. Geometry is derived from the
@@ -1577,7 +1582,7 @@ def require_runtime() -> tuple[Any, Any]:
     """Import torch and torch_npu, load the extension, and pin the device.
 
     The loader is the one the sibling layered tests use, not
-    ``ensure_cam_async_ops_available``: that stronger check also requires the
+    ``ensure_afd_async_ops_available``: that stronger check also requires the
     four ``afd_async_*`` communication operators to be registered, and this
     benchmark issues no collective at all. Requiring them would refuse to run on
     a build that has the two compute operators this file actually measures.

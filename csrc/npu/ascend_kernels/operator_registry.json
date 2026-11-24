@@ -1,5 +1,5 @@
 {
-  "_comment": "AFD Ascend custom operator registry. soc_versions maps a SOC generation to the operator directory names it supports. operator_meta holds per-operator build metadata. To support a new SOC generation, add an entry under soc_versions. To add an operator, append its directory name to the relevant soc list and (optionally) add meta. Operator identity = source directory name under ascend_kernels/.",
+  "_comment": "soc_versions lists source directories under ascend_kernels/. The _arch35 suffix identifies the 950 implementation. operator_meta keys and runtime names are shared between SoCs.",
   "soc_versions": {
     "ascend910_93": [
       "a2e",
@@ -15,7 +15,11 @@
     ],
     "ascend950": [
       "a2e",
-      "e2a"
+      "e2a",
+      "afd_async_dispatch_send_arch35",
+      "afd_async_dispatch_recv_arch35",
+      "afd_async_combine_send_arch35",
+      "afd_async_combine_recv_arch35"
     ]
   },
   "operator_meta": {
