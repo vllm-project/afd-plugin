@@ -1,5 +1,12 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * Description: Manage two-slot MTE transfers for the A5 transport kernels.
+ * Create: 2026-10-12
+ * Note: Event credits guard slot reuse across the copy and vector pipelines.
+ * History: 2026-10-12 create
+ */
+
 #ifndef AFD_ASYNC_MTE_PIPELINE_H
 #define AFD_ASYNC_MTE_PIPELINE_H
 

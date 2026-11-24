@@ -1,5 +1,12 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * Description: Compute per-operator unified buffer requirements and active AIV counts.
+ * Create: 2026-10-12
+ * Note: Host tiling checks the compact metadata budget before launching a kernel.
+ * History: 2026-10-12 create
+ */
+
 #ifndef AFD_ASYNC_HOST_TILING_H
 #define AFD_ASYNC_HOST_TILING_H
 

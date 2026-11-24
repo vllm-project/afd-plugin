@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: NPU FFN-side worker for AFD execution.
+# Create: 2026-05-16
+# Note: The selected connector determines which FFN model runner to construct.
+# History: 2026-05-16 create
 """NPU FFN-side worker for AFD execution."""
 
 from __future__ import annotations

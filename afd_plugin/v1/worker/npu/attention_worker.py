@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: NPU Attention-side worker for AFD execution.
+# Create: 2026-05-25
+# Note: Async transport operators are checked before device and distributed
+#       initialization.
+# History: 2026-05-25 create
 """NPU Attention-side worker for AFD execution."""
 
 from __future__ import annotations

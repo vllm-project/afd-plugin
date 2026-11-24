@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Independent source-operator numerical check, launched with torchrun.
+# Create: 2026-09-21
+# Note: Run with one torchrun process per NPU.
+# History: 2026-09-21 create
 """Independent source-operator numerical check, launched with torchrun.
 
 Example (six NPUs: Attention TP4 + FFN EP2)::

@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Ascend/vLLM-Ascend compatibility helpers for AFD runtime classes.
+# Create: 2026-05-25
+# Note: Exports the public NPU loader and runtime compatibility helpers.
+# History: 2026-05-25 create
 """Ascend/vLLM-Ascend compatibility helpers for AFD runtime classes."""
 
 from afd_plugin.compat.npu.ops import (

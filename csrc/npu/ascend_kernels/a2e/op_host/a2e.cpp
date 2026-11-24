@@ -6,6 +6,10 @@
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
+ * Description: Register host tiling for the A2E operator.
+ * Create: 2026-05-25 (AFD import)
+ * Note: The A5 build exports the tiling registration symbol.
+ * History: 2026-05-25 import A2E host code into afd-plugin
  */
 
 #include <cstdio>

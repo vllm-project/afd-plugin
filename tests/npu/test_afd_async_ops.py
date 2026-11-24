@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Dispatcher and Meta tests for the 910C and 950 compact CAM extensions.
+# Create: 2026-09-21
+# Note: Meta tensors exercise dispatcher schemas and inference-time validation.
+# History: 2026-09-21 create
 """Dispatcher and Meta tests for the 910C and 950 compact CAM extensions.
 
 Set SOC_VERSION to the build's target before running this file. Mega operators

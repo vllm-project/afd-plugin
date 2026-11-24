@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Routed-only AFD asynchronous operator harness; imports no device
+#              packages eagerly.
+# Create: 2026-09-22
+# Note: The planner can describe rank topology and resource requirements on a CPU.
+# History: 2026-09-22 create
 """Routed-only AFD asynchronous operator harness; imports no device packages eagerly.
 
 The pure Python planner is also used by ``--dry-run``. Native execution requires

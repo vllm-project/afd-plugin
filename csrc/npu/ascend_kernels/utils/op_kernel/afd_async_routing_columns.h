@@ -1,5 +1,12 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * Description: Count routed tokens and compute per-column dispatch prefixes.
+ * Create: 2026-10-12
+ * Note: Assignments to different experts on the same rank share one token payload.
+ * History: 2026-10-12 create
+ */
+
 #ifndef AFD_ASYNC_ROUTING_COLUMNS_H
 #define AFD_ASYNC_ROUTING_COLUMNS_H
 

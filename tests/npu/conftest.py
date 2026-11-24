@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Optional runtime setup shared by the compiled Ascend dispatcher tests.
+# Create: 2026-11-05
+# Note: The 950 fixture selects the compact dispatcher tests for that build.
+# History: 2026-11-05 create
 """Optional runtime setup shared by the compiled Ascend dispatcher tests."""
 
 from __future__ import annotations

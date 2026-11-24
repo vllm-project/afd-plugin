@@ -1,5 +1,12 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * Description: Calculate the unified buffer budget for SIMT routing.
+ * Create: 2026-10-12
+ * Note: The budget includes space for the SIMT data cache and compiler workspace.
+ * History: 2026-10-12 create
+ */
+
 #ifndef AFD_ASYNC_SIMT_ROUTING_BUDGET_H
 #define AFD_ASYNC_SIMT_ROUTING_BUDGET_H
 

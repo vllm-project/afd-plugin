@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Validate Ascend build inputs and package selection.
+# Create: 2026-05-25
+# Note: Tests cover the optional Ascend extension and SoC selection.
+# History: 2026-05-25 create
 
 from __future__ import annotations
 

@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Compile and execute compact-v2 host budgets without CANN or an NPU.
+# Create: 2026-10-12
+# Note: A host C++ compiler runs the same tiling budget calculations used in the
+#       build.
+# History: 2026-10-12 create
 """Compile and execute compact-v2 host budgets without CANN or an NPU.
 
 The dispatch-receive boundary below is derived from its actual kernel buffer

@@ -30,9 +30,10 @@ install carry the repository license and third-party notice.
 [Original import](https://github.com/vllm-project/afd-plugin/pull/361)
 · [LICENSE](../../LICENSE)
 
-The six A5 helpers below retain their AFD plugin contributor copyright
-notices. Their filenames and include paths use the `afd_async_` prefix in
-this repository. The table links each original file at the commit that added it.
+The six A5 helpers below are distributed under MIT with the 2026 Huawei
+copyright notice and their original AFD plugin contributor attribution.
+Their filenames and include paths use the `afd_async_` prefix in this
+repository. The table links each original file at the commit that added it.
 
 | Header under `ascend_kernels/utils/op_kernel/` | Original file and introducing commit |
 | --- | --- |

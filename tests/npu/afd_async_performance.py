@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: HCCL benchmarks for the four plugin-owned routed async CAM operators.
+# Create: 2026-09-22
+# Note: The timing harness checks precision before collecting device measurements.
+# History: 2026-09-22 create
 """HCCL benchmarks for the four plugin-owned routed async CAM operators.
 
 Run with torchrun on Ascend 910C or 950. --help and --dry-run need only Python.

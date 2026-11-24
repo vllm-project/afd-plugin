@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Check the numerical accuracy of the 910C layered W4A8 expert path.
+# Create: 2026-09-24
+# Note: The numerical comparison covers valid rows and the receive-capacity tail.
+# History: 2026-09-24 create
 """Opt-in numerical checks; requires a 910C and the compiled AFD extension.
 
 Run with AFD_RUN_ASCEND_OP_RUNTIME=1 SOC_VERSION=910c via pytest.

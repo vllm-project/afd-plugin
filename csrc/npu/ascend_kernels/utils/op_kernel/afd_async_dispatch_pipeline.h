@@ -1,4 +1,13 @@
-// SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+ * Description: Plan the two input slots used by DispatchSend.
+ * Create: 2026-10-14
+ * Note: Completion events protect each slot until its payload has been consumed.
+ * History: 2026-10-14 create
+ */
+
 #ifndef AFD_ASYNC_DISPATCH_PIPELINE_H
 #define AFD_ASYNC_DISPATCH_PIPELINE_H
 

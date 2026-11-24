@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: 910C precision tests for ``gmm_swiglu_quant_v2_layered``.
+# Create: 2026-10-12
+# Note: Device results are compared with an independent quantization reference.
+# History: 2026-10-12 create
 """910C precision tests for ``gmm_swiglu_quant_v2_layered``.
 
 Build the extension against an Ascend 910C toolchain, then run::

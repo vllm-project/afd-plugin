@@ -1,9 +1,9 @@
 /*
  * SPDX-License-Identifier: MIT
  * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
- * Description: create comm args header file
+ * Description: Define the CAM communication argument layout.
  * Create: 2026-01-05
- * Note: This file might be replaced! We will try to use the file from cann-toolkit in env when compiling.
+ * Note: The structure layout must match the CANN toolkit communication ABI.
  * History: 2026-01-05 create comm args header file
  */
 

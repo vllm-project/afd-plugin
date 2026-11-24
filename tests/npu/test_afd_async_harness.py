@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: CPU-only tests for the route oracle and safety preflight (no torch
+#              required).
+# Create: 2026-09-22
+# Note: Planner checks run independently of the Ascend device runtime.
+# History: 2026-09-22 create
 """CPU-only tests for the route oracle and safety preflight (no torch required)."""
 
 from __future__ import annotations

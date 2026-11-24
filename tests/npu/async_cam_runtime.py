@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Synthetic-weight integration of the real Async runner and CAM
+#              connector.
+# Create: 2026-10-19
+# Note: The fixture uses synthetic expert weights and a real connector.
+# History: 2026-10-19 create
 """Synthetic-weight integration of the real Async runner and CAM connector.
 
 Run on three isolated 910C devices with torchrun --nproc-per-node=3.

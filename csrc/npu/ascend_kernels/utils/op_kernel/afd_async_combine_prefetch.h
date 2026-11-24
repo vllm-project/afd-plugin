@@ -1,5 +1,12 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * Description: Plan and synchronize CombineRecv input prefetch.
+ * Create: 2026-10-13
+ * Note: A second input slot uses spare unified buffer space.
+ * History: 2026-10-13 create
+ */
+
 #ifndef AFD_ASYNC_COMBINE_PREFETCH_H
 #define AFD_ASYNC_COMBINE_PREFETCH_H
 

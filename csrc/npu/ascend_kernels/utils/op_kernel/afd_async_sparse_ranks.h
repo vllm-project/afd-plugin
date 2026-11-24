@@ -1,4 +1,13 @@
-// SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+ * Description: Track the destination ranks visited by a DispatchSend token.
+ * Create: 2026-10-13
+ * Note: The rank bitmask is used only for supported communicator sizes.
+ * History: 2026-10-13 create
+ */
+
 #ifndef AFD_ASYNC_SPARSE_RANKS_H
 #define AFD_ASYNC_SPARSE_RANKS_H
 

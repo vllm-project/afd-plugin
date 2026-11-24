@@ -1,12 +1,12 @@
 /*
  * SPDX-License-Identifier: MIT
  * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * Description: AfdAsyncDispatchRecv tiling function header file
+ * Description: Define the host-to-device tiling data for afd_async_dispatch_recv.
  * Create: 2025-12-18
- * Note:
- * History:
- * 2025-12-18 create AfdAsyncDispatchRecv tiling function header file
+ * Note: The host tiler and the device entry point share this structure layout.
+ * History: 2025-12-18 create AfdAsyncDispatchRecv tiling function header file
  */
+
 #ifndef AFD_ASYNC_DISPATCH_RECV_TILING_H
 #define AFD_ASYNC_DISPATCH_RECV_TILING_H
 

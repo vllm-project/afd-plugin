@@ -1,12 +1,12 @@
 /*
  * SPDX-License-Identifier: MIT
  * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * Description: AfdAsyncCombineSend operator kernel function header file
+ * Description: Ascend C implementation of afd_async_combine_send.
  * Create: 2025-12-18
- * Note:
- * History:
- * 2025-12-18 create AfdAsyncCombineSend operator kernel function header file
+ * Note: Return expert outputs to their source Attention ranks.
+ * History: 2025-12-18 create AfdAsyncCombineSend operator kernel function header file
  */
+
 #ifndef AFD_ASYNC_COMBINE_SEND_H
 #define AFD_ASYNC_COMBINE_SEND_H
 #define OPT_RANK_OFFSET 512

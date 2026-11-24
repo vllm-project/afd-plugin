@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: W8A8 executor versus CANN W13 and ordinary GMM W2, with FULL replay.
+# Create: 2026-11-03
+# Note: The suite checks eager layer selection and graph replay.
+# History: 2026-11-03 create
 """W8A8 executor versus CANN W13 and ordinary GMM W2, with FULL replay."""
 
 from __future__ import annotations
