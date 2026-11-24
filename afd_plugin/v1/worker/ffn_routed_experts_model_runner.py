@@ -132,6 +132,9 @@ def token_experts_from_vllm(routed_experts: RoutedExperts) -> FFNLocalExperts:
         topk_weights: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
+        if rows.shape[0] == 0:
+            # A rank that received nothing; Marlin rejects a zero-row GEMM.
+            return
         ids = torch.where(topk_ids < 0, num_local, topk_ids)
         _, num_rows, intermediate, hidden, top_k = kernel.moe_problem_size(
             rows, w13, w2, ids
