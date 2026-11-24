@@ -139,7 +139,9 @@ def test_v4_model_constructs_only_role_owned_decoder_stages(
     for layer in model.layers:
         if role == "attention":
             assert isinstance(layer.attn, DeepseekV4FlashMLAAttention)
-            assert isinstance(layer.ffn, adapter.RemoteDeepseekV4FFN)
+            assert isinstance(layer.ffn, _FakeMoE)
+            assert isinstance(layer.ffn.gate, adapter._FFNOwnedGate)
+            assert layer.ffn.shared_experts is None
             assert hasattr(layer, "hc_attn_fn")
         else:
             assert isinstance(layer.attn, _FakeMissingLayer)

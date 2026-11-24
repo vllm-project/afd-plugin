@@ -570,33 +570,36 @@ def test_routed_experts_keep_shared_output_per_microbatch(monkeypatch, enable_db
         assert torch.equal(shared_output, hidden_states * SHARED_EXPERTS_SCALE)
 
 
-@pytest.mark.parametrize(
-    ("local_input", "message"),
-    [
-        ("input_ids", "input_ids transport"),
-        ("shared_experts_input", "no local shared experts"),
-    ],
-)
-def test_runner_rejects_local_inputs_before_sending(monkeypatch, local_input, message):
-    """Inputs for local routing or shared experts fail before any transfer.
-
-    Why: the FFN protocol carries no token ids for this boundary, and the
-    Attention role builds no shared experts to feed.
-    """
+def test_runner_rejects_shared_experts_input_before_sending(monkeypatch):
+    """Why: the Attention role builds no shared experts to feed."""
     events: list[tuple] = []
     install_proxy_context(monkeypatch, events)
     runner = _build_runner(monkeypatch, attention_moe_vllm_config())
     hidden_states = _hidden_states(2)
-    local_inputs = {
-        "input_ids": torch.tensor([1, 2]),
-        "shared_experts_input": hidden_states,
-    }
 
-    with pytest.raises(NotImplementedError, match=message):
+    with pytest.raises(NotImplementedError, match="no local shared experts"):
         runner(
             hidden_states=hidden_states,
             router_logits=hidden_states,
-            **{local_input: local_inputs[local_input]},
+            shared_experts_input=hidden_states,
         )
 
     assert events == []
+
+
+def test_runner_sends_input_ids(monkeypatch):
+    """Why: the FFN role of a hash-routed model routes by token id."""
+    events: list[tuple] = []
+    install_proxy_context(monkeypatch, events)
+    runner = _build_runner(monkeypatch, attention_moe_vllm_config())
+    hidden_states = _hidden_states(2)
+    input_ids = torch.tensor([1, 2], dtype=torch.int32)
+
+    runner(
+        hidden_states=hidden_states,
+        router_logits=hidden_states,
+        input_ids=input_ids,
+    )
+
+    assert set(events[0][3]) == {"input_ids"}
+    assert events[0][3]["input_ids"] is input_ids

@@ -9,6 +9,7 @@ FFN activation is the sole FFN-to-Attention tensor.
 """
 
 from collections.abc import Iterable
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -17,9 +18,7 @@ from vllm.models.deepseek_v4.nvidia import model as native
 
 from afd_plugin.compat.patches.gpu_deepseek_v4_dbo import afd_v4_attention_cls
 from afd_plugin.config import parse_afd_config
-from afd_plugin.connectors.metadata import AFDForwardContextMetadata
-from afd_plugin.forward_context import get_afd_metadata_from_forward_context
-from afd_plugin.model_executor.ffn.remote import RemoteFFNProxy
+from afd_plugin.model_executor.ffn.remote import build_expert
 from afd_plugin.model_executor.models._weight_utils import (
     ATTENTION_ROLE,
     BOTH_ROLES,
@@ -53,34 +52,29 @@ def _checkpoint_weight_roles(name: str) -> frozenset[str]:
     return ATTENTION_ROLE
 
 
-class RemoteDeepseekV4FFN(RemoteFFNProxy):
-    """Parameter-free FFN proxy carrying V4 hash-router token identifiers."""
+# FusedMoEFactory arguments of the native block that the Attention role drops:
+# the FFN role owns the gate, its routing tables and the shared experts, and
+# build_expert() fixes the rest.
+_FFN_OWNED_FACTORY_ARGS = (
+    "gate",
+    "shared_experts",
+    "e_score_correction_bias",
+    "hash_indices_table",
+    "bias_vl",
+    "quant_config",
+    "enable_eplb",
+    "num_redundant_experts",
+    "is_sequence_parallel",
+)
 
-    # Matches DeepseekV4MoE.forward, so vLLM's decoder layer calls the proxy
-    # in place of its MoE. AFD rejects MegaMoE when it builds the model, so
-    # vLLM always passes mega_gate_metadata=None and the proxy does not send it.
-    def forward(  # type: ignore[override]
-        self,
-        hidden_states: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
-        mega_gate_metadata: native.MegaGateRoutingMetadata | None = None,
-    ) -> torch.Tensor:
-        if input_ids is None:
-            raise RuntimeError("DeepSeek-V4 remote FFN requires input_ids")
-        if input_ids.ndim != 1 or input_ids.shape[0] != hidden_states.shape[0]:
-            raise ValueError(
-                "DeepSeek-V4 input_ids must be one-dimensional and token-aligned",
-            )
 
-        return self._send_and_receive(hidden_states, input_ids=input_ids)
+class _FFNOwnedGate(nn.Module):
+    """Stands in for the gate, which the FFN role owns: vLLM's
+    ``DeepseekV4MoE.forward`` reads these two attributes before it calls the
+    experts."""
 
-    @staticmethod
-    def _afd_metadata() -> AFDForwardContextMetadata:
-        # Keep V4's missing-context error while sharing the transport.
-        afd_metadata = get_afd_metadata_from_forward_context()
-        if afd_metadata is None:
-            raise RuntimeError("RemoteDeepseekV4FFN requires AFD forward metadata")
-        return afd_metadata
+    tid2eid = None
+    bias_vl = None
 
 
 class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
@@ -116,7 +110,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         self.hidden_size = config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
 
-        # ### PATCH START: guarded Attention; the remote stage is a proxy.
+        # ### PATCH START: guarded Attention; its MoE block gets remote experts.
         if afd_config.role == "attention":
             attn_cls = afd_v4_attention_cls(native._select_dsv4_attn_cls(vllm_config))
             self.attn = attn_cls(
@@ -125,7 +119,29 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 topk_indices_buffer=topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
             )
-            self.ffn = RemoteDeepseekV4FFN(layer_idx=layer_idx)
+            # vLLM's MoE block always builds local experts. For this one
+            # constructor call its FusedMoEFactory name reaches build_expert()
+            # (RFC #630, option B).
+            native_factory = native.FusedMoEFactory
+
+            def remote_experts(**kwargs: Any) -> nn.Module:
+                for name in _FFN_OWNED_FACTORY_ARGS:
+                    kwargs.pop(name, None)
+                return build_expert(vllm_config, gate=None, **kwargs)
+
+            native.FusedMoEFactory = remote_experts
+            try:
+                self.ffn = native.DeepseekV4MoE(
+                    vllm_config,
+                    prefix=f"{prefix}.ffn",
+                    use_sequence_parallel=self.use_sequence_parallel,
+                    num_hash_layers=config.num_hash_layers,
+                )
+            finally:
+                native.FusedMoEFactory = native_factory
+            # The FFN role runs the gate and the shared experts.
+            self.ffn.gate = _FFNOwnedGate()
+            self.ffn.shared_experts = None
         elif afd_config.role == "ffn":
             self.attn = native.PPMissingLayer()
             self.ffn = native.DeepseekV4MoE(
@@ -231,7 +247,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Execute the complete native V4 MoE, including its native router."""
-        if not isinstance(self.ffn, native.DeepseekV4MoE):
+        if not isinstance(self.attn, native.PPMissingLayer):
             raise RuntimeError("DeepSeek-V4 FFN compute is FFN-role only")
         if input_ids is None:
             raise RuntimeError("DeepSeek-V4 FFN compute requires input_ids")

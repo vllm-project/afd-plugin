@@ -341,7 +341,8 @@ class AFDRemoteMoERunner(MoERunner):
     the model's gate (``compute_gate_on_attention``), it applies the gate as
     native ``MoERunner._forward_impl`` does, ignoring its ``router_logits``
     argument, and sends the logits with the hidden states; the FFN role runs
-    its external-router experts.
+    its external-router experts. The runner sends ``input_ids`` when the
+    native block passes them.
     """
 
     def __init__(
@@ -382,15 +383,15 @@ class AFDRemoteMoERunner(MoERunner):
         input_ids: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if input_ids is not None:
-            raise NotImplementedError(
-                "experts-boundary input_ids transport is not implemented",
-            )
         if shared_experts_input is not None:
             raise NotImplementedError(
                 "Attention remote MoE has no local shared experts",
             )
         send_kwargs: dict[str, torch.Tensor] = {}
+        if input_ids is not None:
+            # A hash-routed model (DeepSeek V4): the FFN role's router needs
+            # the token ids.
+            send_kwargs["input_ids"] = input_ids
         if self.gate is not None:
             router_logits, _ = self.gate(hidden_states)
             send_kwargs["router_logits"] = router_logits

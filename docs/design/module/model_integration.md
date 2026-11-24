@@ -247,14 +247,16 @@ vLLM-Ascend.
 splits immediately around each decoder FFN. Attention owns Attention, all mHC
 residual-stream state and normalization, embeddings/finalization, auxiliary
 CUDA streams, and sparse-index buffers. It sends only the normalized
-two-dimensional FFN activation plus token-aligned `input_ids` through a
-parameter-free `RemoteDeepseekV4FFN`. FFN owns the complete native
+two-dimensional FFN activation plus token-aligned `input_ids` through the
+remote experts of vLLM's own `DeepseekV4MoE`. FFN owns the complete native
 `DeepseekV4MoE`, including its hash router, and returns the FFN activation.
 
-`RemoteDeepseekV4FFN` inherits the shared `RemoteFFNProxy` transport and keeps
-V4's token-ID validation and missing-context error. It accepts the native MoE
-call, so vLLM's own decoder-layer forward runs on Attention. The common
-implementation owns metadata creation, stage selection and send/yield/receive
+Attention builds the native `DeepseekV4MoE` while the module's
+`FusedMoEFactory` name is bound to `build_expert()`, and restores the name
+afterwards. The gate and the shared experts are then dropped, so the block
+keeps no parameters and vLLM's own decoder-layer and MoE forward run on
+Attention. `AFDRemoteMoERunner` owns metadata creation, stage selection and
+send/yield/receive
 ordering. mHC broadcast-weight finalization delegates to the native model on
 Attention; the FFN role skips it because it owns no mHC parameters.
 
