@@ -14,15 +14,12 @@ torch = pytest.importorskip("torch")
 
 @pytest.fixture
 def preparation(monkeypatch):
-    context = ModuleType("afd_plugin.forward_context")
-    context.__dict__["get_afd_metadata_from_forward_context"] = lambda: None
-    monkeypatch.setitem(sys.modules, context.__name__, context)
     quantization = ModuleType("vllm_ascend.quantization.quant_type")
     quant_type = SimpleNamespace(W8A8="w8a8", W4A8="w4a8", NONE="none")
     quantization.__dict__["QuantType"] = quant_type
     monkeypatch.setitem(sys.modules, quantization.__name__, quantization)
     module = load_host_module(
-        monkeypatch, "afd_plugin.model_executor.models.npu.deepseek_v2_attention_gate"
+        monkeypatch, "afd_plugin.model_executor.models.npu.deepseek_v4_weights"
     )
     return module.prepare_attention_gate_w8a8_scales, quant_type
 

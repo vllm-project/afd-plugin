@@ -21,11 +21,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.models import deepseek_v2 as native
 
-from afd_plugin.config import (
-    AFD_ASYNC_CONNECTOR,
-    DEEPEP_M2N_CONNECTORS,
-    parse_afd_config,
-)
+from afd_plugin.config import DEEPEP_M2N_CONNECTORS, parse_afd_config
 from afd_plugin.connectors import AFDExpertRoutingSpec
 from afd_plugin.model_executor.ffn.remote import RemoteFFNProxy, build_expert
 from afd_plugin.model_executor.models._weight_utils import (
@@ -55,14 +51,6 @@ def _is_moe_layer(config: _DeepseekAdapterConfig, layer_idx: int) -> bool:
     )
 
 
-# Connectors whose Attention runs the shared experts, so their FFN builds
-# none: Async CAM, and DeepEP M2N whose FFN runs routed experts only.
-_ATTENTION_SHARED_EXPERTS_CONNECTORS = (
-    AFD_ASYNC_CONNECTOR,
-    *DEEPEP_M2N_CONNECTORS,
-)
-
-
 def _checkpoint_weight_roles(
     name: str,
     config: _DeepseekAdapterConfig,
@@ -90,86 +78,6 @@ def _checkpoint_weight_roles(
     if is_moe_gate and compute_gate_on_attention:
         return BOTH_ROLES
     return FFN_ROLE
-
-
-class GateOnlyRemoteMoE(RemoteFFNProxy):
-    """Attention-side MoE gate with experts delegated to the FFN role."""
-
-    def __init__(
-        self,
-        *,
-        config: _DeepseekAdapterConfig,
-        layer_idx: int,
-        prefix: str,
-        vllm_config: VllmConfig,
-    ) -> None:
-        super().__init__(layer_idx=layer_idx)
-        self.vllm_config = vllm_config
-        self.config = config
-        self.top_k = int(config.num_experts_per_tok)
-        # Construct the native shared MLP; Ascend selects its weight layout.
-        self.shared_experts = (
-            native.DeepseekV2MLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=config.moe_intermediate_size
-                * config.n_shared_experts,
-                hidden_act=config.hidden_act,
-                quant_config=vllm_config.quant_config,
-                is_sequence_parallel=True,
-                prefix=f"{prefix}.shared_experts",
-            )
-            if (
-                config.n_shared_experts
-                and parse_afd_config(vllm_config, validate=False).connector
-                == AFD_ASYNC_CONNECTOR
-            )
-            else None
-        )
-        self.gate = native.GateLinear(
-            config.hidden_size,
-            config.n_routed_experts,
-            out_dtype=native._get_moe_router_dtype(config),
-            prefix=f"{prefix}.gate",
-        )
-        if getattr(config, "topk_method", None) == "noaux_tc":
-            self.gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, dtype=torch.float32),
-            )
-        else:
-            self.gate.e_score_correction_bias = None
-
-        from afd_plugin.model_executor.models.npu.deepseek_v2_attention_gate import (
-            create_gate_router,
-        )
-
-        self.gate_router = create_gate_router(
-            gate=self.gate,
-            vllm_config=vllm_config,
-            config=config,
-            top_k=self.top_k,
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        from afd_plugin.model_executor.models.npu import (
-            deepseek_v2_attention_gate,
-        )
-
-        topk_weights, topk_ids, router_logits = (
-            deepseek_v2_attention_gate.compute_gate_topk(
-                gate=self.gate,
-                vllm_config=self.vllm_config,
-                config=self.config,
-                top_k=self.top_k,
-                hidden_states=hidden_states,
-                gate_router=self.gate_router,
-            )
-        )
-        return self._send_and_receive(
-            hidden_states,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            router_logits=router_logits,
-        )
 
 
 class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
@@ -338,20 +246,15 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         )
 
         # ### PATCH START: construct only the stage owned by this AFD role.
-        self.vllm_config = vllm_config
-        self.config = config
         self.is_moe_layer = is_moe_layer
         self.compute_gate_on_attention = bool(
             afd_config.compute_gate_on_attention,
         )
         device_type = native.current_platform.device_type
-        # build_expert rejects Attention-side EPLB for these remote experts.
-        self.uses_remote_experts = device_type == "cuda" and self.is_moe_layer
-        if self.compute_gate_on_attention and device_type not in ("cuda", "npu"):
+        if self.compute_gate_on_attention and device_type != "cuda":
             raise RuntimeError(
-                "DeepSeekV2 compute_gate_on_attention requires CUDA or NPU",
+                "DeepSeekV2 compute_gate_on_attention requires CUDA",
             )
-        self.top_k = int(config.num_experts_per_tok)
 
         if afd_role == "attention":
             attn_cls = (
@@ -387,20 +290,13 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                 **attn_kwargs,
             )
 
-            if self.uses_remote_experts:
+            if device_type == "cuda" and self.is_moe_layer:
                 self.mlp = AFDDeepseekV2RemoteExpertsMoE(
                     config=config,
                     vllm_config=vllm_config,
                     prefix=f"{prefix}.mlp",
                     compute_gate_on_attention=self.compute_gate_on_attention,
                     sends_routes=afd_config.connector in DEEPEP_M2N_CONNECTORS,
-                )
-            elif self.compute_gate_on_attention and self.is_moe_layer:
-                self.mlp = GateOnlyRemoteMoE(
-                    config=config,
-                    layer_idx=layer_idx,
-                    prefix=f"{prefix}.mlp",
-                    vllm_config=vllm_config,
                 )
             elif self.compute_gate_on_attention:
                 self.mlp = native.DeepseekV2MLP(
@@ -425,7 +321,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                 if device_type == "npu":
                     native.FusedMoEFactory = fused_moe.FusedMoEFactory
                 moe_config = config
-                if afd_config.connector in _ATTENTION_SHARED_EXPERTS_CONNECTORS:
+                if afd_config.connector in DEEPEP_M2N_CONNECTORS:
                     moe_config = copy(config)
                     # HF validates this public field as int, but pinned native
                     # MoE uses only None to omit shared construction (0 builds
@@ -442,7 +338,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                         not native.rocm_aiter_ops.is_fused_moe_enabled()
                     ),
                 )
-                if self.compute_gate_on_attention and device_type == "cuda":
+                if self.compute_gate_on_attention:
                     # Keep the gate weights loadable, but with the runner's
                     # gate cleared it consumes the Attention-side router
                     # logits instead of computing its own (gate is None means
@@ -466,83 +362,6 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
-    # Target: vLLM 5df63a7, DeepseekV2DecoderLayer.forward attention fragment.
-    # AFD splits execution before the remote FFN and computes routing locally.
-    # This AFD-owned method adds already_sequence_parallel because a one-token
-    # stage can have equal global/local row counts; shape alone is ambiguous.
-    # Keep collective ownership here until upstream exposes the split boundary.
-    def compute_attn_output(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
-        llama_4_scaling: torch.Tensor | None = None,
-        *,
-        already_sequence_parallel: bool = False,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-    ]:
-        if residual is None:
-            residual = hidden_states.clone()
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
-        if self.use_sequence_parallel_moe and already_sequence_parallel:
-            hidden_states = native.tensor_model_parallel_all_gather(hidden_states, 0)
-            hidden_states = hidden_states[: positions.shape[0]]
-
-        attn_kwargs: dict[str, torch.Tensor | None] = {
-            "positions": positions,
-            "hidden_states": hidden_states,
-        }
-        if not self.use_mha:
-            attn_kwargs["llama_4_scaling"] = llama_4_scaling
-        hidden_states = self.self_attn(**attn_kwargs)
-
-        if (
-            not isinstance(self.self_attn, native.DeepseekAttention)
-            and hidden_states.dtype == torch.float16
-        ):
-            hidden_states *= 1.0 / self.routed_scaling_factor
-            if self.layer_idx == 0:
-                residual *= 1.0 / self.routed_scaling_factor
-
-        if self.use_sequence_parallel_moe:
-            tp_size = native.get_tensor_model_parallel_world_size()
-            sp_pad = (-hidden_states.shape[0]) % tp_size
-            hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, sp_pad))
-            hidden_states = native.tensor_model_parallel_reduce_scatter(
-                hidden_states, 0
-            )
-            if not already_sequence_parallel:
-                residual = native.sequence_parallel_chunk(residual)
-
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states,
-            residual,
-        )
-        topk_weights = None
-        topk_ids = None
-        router_logits = None
-        # NPU-only: Attention-side gate/topk is implemented in the NPU helper.
-        if self.compute_gate_on_attention and self.is_moe_layer:
-            from afd_plugin.model_executor.models.npu import (
-                deepseek_v2_attention_gate,
-            )
-
-            topk_weights, topk_ids, router_logits = (
-                deepseek_v2_attention_gate.compute_attention_gate_topk(
-                    self,
-                    hidden_states,
-                )
-            )
-        return hidden_states, residual, topk_weights, topk_ids, router_logits
-
     def compute_ffn_output(
         self,
         hidden_states: torch.Tensor,
@@ -554,8 +373,6 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                 "when compute_gate_on_attention=true",
             )
         if self.compute_gate_on_attention:
-            if native.current_platform.device_type == "npu":
-                raise RuntimeError("Async CAM FFN requires the layered executor")
             raise RuntimeError(
                 "GPU Attention-side gate must call compute_experts_output",
             )
@@ -603,19 +420,13 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # ### PATCH START: require AFD activation and avoid native allocation.
         afd_config = parse_afd_config(vllm_config, validate=False)
-        if vllm_config.parallel_config.use_sequence_parallel_moe and not (
-            native.current_platform.device_type == "npu"
-            and afd_config.role == "attention"
-            and afd_config.connector == AFD_ASYNC_CONNECTOR
-            and afd_config.compute_gate_on_attention
-        ):
+        if vllm_config.parallel_config.use_sequence_parallel_moe:
             raise RuntimeError(
                 "AFD DeepSeek does not support sequence-parallel MoE",
             )
         torch.nn.Module.__init__(self)
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
-        self.afd_config = afd_config
         # ### PATCH END
 
         config = vllm_config.model_config.hf_config
@@ -704,32 +515,6 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-        intermediate_tensors: native.IntermediateTensors | None,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | native.IntermediateTensors:
-        if self.afd_config.connector == AFD_ASYNC_CONNECTOR:
-            from afd_plugin.model_executor.models.npu import (
-                deepseek_v2_async_cam_forward,
-            )
-
-            return deepseek_v2_async_cam_forward.run_model_forward(
-                self,
-                input_ids,
-                positions,
-                intermediate_tensors,
-                inputs_embeds,
-            )
-        return super().forward(
-            input_ids,
-            positions,
-            intermediate_tensors,
-            inputs_embeds,
-        )
-
     def compute_ffn_output(
         self,
         hidden_states: torch.Tensor,
@@ -753,9 +538,6 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         )
 
     def get_experts_layer_indices(self) -> tuple[int, ...]:
-        # Async NPU FFN and CUDA remote-expert execution share this inventory.
-        # uses_remote_experts selects a CUDA-specific construction path; it
-        # does not describe whether an NPU decoder contains routed experts.
         return tuple(
             layer_idx
             for layer_idx, layer in enumerate(self.layers)
@@ -781,21 +563,6 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         return AFDExpertRoutingSpec(
             router_logits_width=int(layer.mlp.n_routed_experts),
             router_logits_dtype=gate.out_dtype or gate.weight.dtype,
-        )
-
-    def _get_llama_4_scaling(
-        self,
-        positions: torch.Tensor,
-    ) -> torch.Tensor | None:
-        llama_4_scaling_config = getattr(self.config, "llama_4_scaling", None)
-        if llama_4_scaling_config is None:
-            return None
-        return native._get_llama_4_scaling(
-            original_max_position_embeddings=llama_4_scaling_config[
-                "original_max_position_embeddings"
-            ],
-            scaling_beta=llama_4_scaling_config["beta"],
-            positions=positions,
         )
 
 
@@ -851,7 +618,7 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
                     config=self.config,
                     compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
                     attention_shared_experts=self.afd_config.connector
-                    in _ATTENTION_SHARED_EXPERTS_CONNECTORS,
+                    in DEEPEP_M2N_CONNECTORS,
                 ),
             )
         )
