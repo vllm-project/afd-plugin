@@ -17,7 +17,7 @@ DSV4_ASYNC_CAM_SCENARIO = "afd-dsv4-flash-async-cam-dp2tp4-ep8"
 DSV4_ASYNC_CAM_MEGA_SCENARIO = "afd-dsv4-flash-async-cam-pull-mega-dp2tp4-ep8"
 DSV4_SYNC_CAMP2P_A5_SCENARIO = "afd-dsv4-flash-sync-camp2p-2a2f"
 DSV4_SYNC_CAMP2P_A3_SCENARIO = "afd-dsv4-flash-sync-camp2p-8a8f"
-DSV4_SYNC_CAMP2P_MXFP8_A5_SCENARIO = "afd-dsv4-flash-sync-camp2p-mxfp8-2a2f"
+DSV4_SYNC_CAMP2P_MXFP8_A5_SCENARIO = "afd-dsv4-flash-sync-camp2p-mxfp8-4a4f"
 DSV4_SYNC_CAMP2P_SCENARIOS = (
     DSV4_SYNC_CAMP2P_A5_SCENARIO,
     DSV4_SYNC_CAMP2P_A3_SCENARIO,
@@ -188,12 +188,13 @@ DSV4_SYNC_SHAPES = {
         indexer_kv_dtype="fp8",
     ),
     DSV4_SYNC_CAMP2P_MXFP8_A5_SCENARIO: DSV4SyncShape(
-        # Same A5 host and 2A2F layout as the BF16 profile, with the router on
-        # Attention and the MXFP8 transport enabled end to end. The batch budget
+        # The measured A5 4A4F layout (Attention DP4/TP1, FFN DP4/TP1), with
+        # the router on Attention and the MXFP8 transport enabled end to end.
+        # Four dies per role are needed to hold this checkpoint. The batch budget
         # stays at the measured 3072 tokens; a larger one can exceed the routing
         # id budget the mode-4 handshake checks.
-        attention_ranks=2,
-        ffn_ranks=2,
+        attention_ranks=4,
+        ffn_ranks=4,
         enable_expert_parallel=True,
         gate_on_attention=True,
         use_graph=True,

@@ -591,7 +591,7 @@ recorded launch shape:
 | Scenario | Host | Deployment | Devices |
 | --- | --- | --- | --- |
 | `afd-dsv4-flash-sync-camp2p-2a2f` | A5 (Ascend 950) | Attention DP2/TP1 + FFN DP2/TP1, expert parallel, ACL graph (`FULL_DECODE_ONLY`, capture 16), 4096 context, native DBO off, 128-token block, prefix caching off | 4 |
-| `afd-dsv4-flash-sync-camp2p-mxfp8-2a2f` | A5 (Ascend 950) | Attention DP2/TP1 + FFN DP2/TP1, gate on Attention, expert parallel, MXFP8 transport (`quant_mode=4`), ACL graph (`FULL_DECODE_ONLY`, capture 16), 4096 context, 3072 batch tokens, native DBO off, 128-token block, prefix caching off | 4 |
+| `afd-dsv4-flash-sync-camp2p-mxfp8-4a4f` | A5 (Ascend 950) | Attention DP4/TP1 + FFN DP4/TP1, gate on Attention, expert parallel, MXFP8 transport (`quant_mode=4`), ACL graph (`FULL_DECODE_ONLY`, capture 16), 4096 context, 3072 batch tokens, native DBO off, 128-token block, prefix caching off | 8 |
 | `afd-dsv4-flash-sync-camp2p-8a8f` | A3 (Ascend 910C) | Attention DP2/TP4 + FFN DP8/TP1, expert parallel, eager, 8192 context | 16 |
 
 Build the operators for the target SOC first (`SOC_VERSION=ascend950` on A5,
