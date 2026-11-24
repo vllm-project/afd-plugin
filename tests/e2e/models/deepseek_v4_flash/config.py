@@ -17,9 +17,11 @@ DSV4_ASYNC_CAM_SCENARIO = "afd-dsv4-flash-async-cam-dp2tp4-ep8"
 DSV4_ASYNC_CAM_MEGA_SCENARIO = "afd-dsv4-flash-async-cam-pull-mega-dp2tp4-ep8"
 DSV4_SYNC_CAMP2P_A5_SCENARIO = "afd-dsv4-flash-sync-camp2p-2a2f"
 DSV4_SYNC_CAMP2P_A3_SCENARIO = "afd-dsv4-flash-sync-camp2p-8a8f"
+DSV4_SYNC_CAMP2P_MXFP8_A5_SCENARIO = "afd-dsv4-flash-sync-camp2p-mxfp8-2a2f"
 DSV4_SYNC_CAMP2P_SCENARIOS = (
     DSV4_SYNC_CAMP2P_A5_SCENARIO,
     DSV4_SYNC_CAMP2P_A3_SCENARIO,
+    DSV4_SYNC_CAMP2P_MXFP8_A5_SCENARIO,
 )
 DSV4_SCENARIOS = (DSV4_ASYNC_CAM_SCENARIO, *DSV4_SYNC_CAMP2P_SCENARIOS)
 DSV4_ATTENTION_RANKS = 8
@@ -29,7 +31,7 @@ DSV4_ATTENTION_TP_SIZE = 4
 
 DSV4_SYNC_CAMP2P_CONNECTOR = "CAMP2pAFDConnector"
 # CAMP2P sizes its AFD HCCL domains through this override; the A5 and A3 runs
-# used 2048 MB. quant_mode stays 0, the only mode the runtime accepts today.
+# used 2048 MB. The BF16 profiles keep quant_mode 0; the MXFP8 profile sets 4.
 DSV4_SYNC_HCCL_BUFFER_SIZE_MB = 2048
 DSV4_SYNC_QUANT_MODE = 0
 DSV4_ASCEND_QUANTIZATION = "ascend"
@@ -107,6 +109,8 @@ class DSV4SyncShape(NamedTuple):
     attention_tp_size: int = 1
     ffn_tp_size: int = 1
     enable_expert_parallel: bool = False
+    # Attention-side routing: the Attention role owns the gate and sends routing.
+    gate_on_attention: bool = False
     use_graph: bool = False
     cudagraph_capture_size: int = 0
     max_model_len: str = DSV4_SYNC_MAX_MODEL_LEN
@@ -174,6 +178,39 @@ DSV4_SYNC_SHAPES = {
         check_answer=False,
         # The A5 script runs both roles on one host, keeps the platform's
         # multiprocessing start method, and exports its own HCCL_BUFFSIZE.
+        nic_env_required=False,
+        force_spawn=False,
+        keep_hccl_buffsize=True,
+        npu_alloc_conf=DSV4_SYNC_ALLOC_CONF_PLAIN,
+    ),
+    DSV4_SYNC_CAMP2P_MXFP8_A5_SCENARIO: DSV4SyncShape(
+        # Same A5 host and 2A2F layout as the BF16 profile, with the router on
+        # Attention and the MXFP8 transport enabled end to end. The batch budget
+        # stays at the measured 3072 tokens; a larger one can exceed the routing
+        # id budget the mode-4 handshake checks.
+        attention_ranks=2,
+        ffn_ranks=2,
+        enable_expert_parallel=True,
+        gate_on_attention=True,
+        use_graph=True,
+        cudagraph_capture_size=DSV4_SYNC_A5_CUDAGRAPH_CAPTURE_SIZE,
+        max_model_len=DSV4_SYNC_A5_MAX_MODEL_LEN,
+        max_num_batched_tokens="3072",
+        max_num_seqs=None,
+        memory_utilization=None,
+        multithread_load=False,
+        connector_extra_config={"quant_mode": 4},
+        quantization_from_checkpoint=True,
+        verbatim_launch=True,
+        disable_prefix_caching=True,
+        block_size=DSV4_BLOCK_SIZE,
+        compilation_config={
+            "cudagraph_capture_sizes": [DSV4_SYNC_A5_CUDAGRAPH_CAPTURE_SIZE],
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+        },
+        # This profile must answer: the mode-4 path is only covered end to end
+        # when the generated answer is checked, not just that requests finished.
+        check_answer=True,
         nic_env_required=False,
         force_spawn=False,
         keep_hccl_buffsize=True,
@@ -385,7 +422,7 @@ def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
     shape = DSV4_SYNC_SHAPES[args.scenario]
     args.afd_connector = DSV4_SYNC_CAMP2P_CONNECTOR
     args.afd_async = False
-    args.compute_gate_on_attention = False
+    args.compute_gate_on_attention = shape.gate_on_attention
     args.afd_connector_extra_config = (
         []
         if shape.connector_extra_config is None
