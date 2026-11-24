@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Launch model E2E cases and collect their results.
+# Create: 2026-05-16
+# Note: The runner records commands, acceptance results and cleanup for each
+#       deployment.
+# History: 2026-05-16 create
 """Execute model-declared Cases and retain the existing NPU CLI callers."""
 
 from __future__ import annotations

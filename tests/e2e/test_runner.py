@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Host-only harness integration: real sockets, processes and signals; no
+#              devices.
+# Create: 2026-05-17
+# Note: Host tests exercise resolved launch arguments and subprocess lifecycle.
+# History: 2026-05-17 create
 
 """Host-only harness integration: real sockets, processes and signals; no devices."""
 

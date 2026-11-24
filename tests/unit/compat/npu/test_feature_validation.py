@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: NPU AFD feature validation rejects unsupported combinations before
+#              execution.
+# Create: 2026-10-19
+# Note: Cases exercise the worker admission rules for both NPU roles.
+# History: 2026-10-19 create
 """NPU AFD feature validation rejects unsupported combinations before execution."""
 
 from __future__ import annotations

@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Validation for AFD features supported by the Ascend runtime.
+# Create: 2026-07-09
+# Note: Both roles use the Attention TP width when checking A5 source-row capacity.
+# History: 2026-07-09 create
 """Validation for AFD features supported by the Ascend runtime."""
 
 from __future__ import annotations

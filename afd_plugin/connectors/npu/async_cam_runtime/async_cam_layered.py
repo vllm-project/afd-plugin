@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Run W13 and W2 with layer-selected expert weights.
+# Create: 2026-09-24
+# Note: The device layer index selects the W13 and W2 weights.
+# History: 2026-09-24 create
 """NPU Async CAM compute: independent Layered and Mega native calls."""
 
 from __future__ import annotations

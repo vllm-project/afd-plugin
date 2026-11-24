@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Collect DeepSeek draft-model FFN graph observations.
+# Create: 2026-11-04
+# Note: Graph observations associate the received descriptor with its model layer.
+# History: 2026-11-04 create
 """Functional-only DSpark graph observations, one replay per completion fence.
 
 The production runtime submits bounded groups of transactions. This extension

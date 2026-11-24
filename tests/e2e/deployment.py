@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Case deployment: protocol order, role commands, readiness and owned
+#              cleanup.
+# Create: 2026-11-13
+# Note: The deployment owns startup ordering, readiness checks and service cleanup.
+# History: 2026-11-13 create
 """Case deployment: protocol order, role commands, readiness and owned cleanup."""
 
 from __future__ import annotations

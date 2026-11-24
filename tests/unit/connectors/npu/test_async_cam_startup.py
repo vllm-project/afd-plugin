@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Pure host negotiation tests; no device or model runner initialization.
+# Create: 2026-10-19
+# Note: An in-memory Store models rank negotiation.
+# History: 2026-10-19 create
 """Pure host negotiation tests; no device or model runner initialization."""
 
 import json

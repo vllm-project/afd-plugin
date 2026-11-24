@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Ascend CAM connector for Attention/FFN disaggregation.
+# Create: 2026-06-08
+# Note: The connector passes the compact dispatch descriptor back to combine-send.
+# History: 2026-06-08 create
 """Ascend CAM connector for Attention/FFN disaggregation.
 
 The connector validates payloads and manages the Attention-first HCCL world

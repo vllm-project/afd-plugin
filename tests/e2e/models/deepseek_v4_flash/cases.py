@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: DSV4 single-deployment declarations, separate from dedicated/multi-pod
+#              runs.
+# Create: 2026-11-13
+# Note: Each case declares its topology and acceptance checks.
+# History: 2026-11-13 create
 """DSV4 single-deployment declarations, separate from dedicated/multi-pod runs.
 
 Importing IDs is safe. Checkpoint quantization is resolved only by build_case

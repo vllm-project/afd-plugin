@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Host-only Async CAM graph startup protocol, before and after HCCL
+#              setup.
+# Create: 2026-10-19
+# Note: The rendezvous Store publishes errors to peers before CAM group creation.
+# History: 2026-10-19 create
 """Host-only Async CAM graph startup protocol, before and after HCCL setup."""
 
 from __future__ import annotations

@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: AFD distributed helpers for P2P topology and process-group setup.
+# Create: 2026-05-16
+# Note: A Store callback can provide the negotiated backend options.
+# History: 2026-05-16 create
 """AFD distributed helpers for P2P topology and process-group setup."""
 
 from __future__ import annotations

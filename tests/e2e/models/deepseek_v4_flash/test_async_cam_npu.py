@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Device-backed DSV4 Flash async CAM concurrent-request acceptance cases.
+# Create: 2026-09-18
+# Note: The pytest entry point selects devices and the advertised HCCL interface.
+# History: 2026-09-18 create
 """Device-backed DSV4 Flash async CAM concurrent-request acceptance cases."""
 
 from __future__ import annotations

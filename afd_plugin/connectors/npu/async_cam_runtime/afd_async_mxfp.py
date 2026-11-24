@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Eager Ascend 950 expert computation on rows already routed by CAM.
+# Create: 2026-11-17
+# Note: The native MXFP4 expert method derives its block scales from the received BF16
+#       rows.
+# History: 2026-11-17 create
 # Adapted from the A5 eager executor in afd-plugin commit bd1e4d28271a.
 # This version selects the received layer and bounds work to the compact chunk.
 """Eager Ascend 950 expert computation on rows already routed by CAM."""

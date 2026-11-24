@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Local NPU DSV4 Flash cases over the synchronous CAMP2P boundary.
+# Create: 2026-10-08
+# Note: Each host profile supplies its own device count and indexer cache dtype.
+# History: 2026-10-08 create
 """Local NPU DSV4 Flash cases over the synchronous CAMP2P boundary.
 
 DeepSeek V4 does not fit on a single Attention or FFN die, so each host runs

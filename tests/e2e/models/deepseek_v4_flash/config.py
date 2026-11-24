@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Fixed DSV4 Flash deployment and acceptance parameters.
+# Create: 2026-09-18
+# Note: The target SoC determines the Attention indexer cache dtype for NPU cases.
+# History: 2026-09-18 create
 """Fixed DSV4 Flash deployment and acceptance parameters.
 
 Two transports are covered: the asynchronous CAM connector, and the

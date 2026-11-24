@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: DeepSeek V4 AFD model wrapper for the Ascend native implementation.
+# Create: 2026-09-04
+# Note: The role-specific model wrappers split Attention-side routing from remote
+#       expert execution.
+# History: 2026-09-04 create
 """DeepSeek V4 AFD model wrapper for the Ascend native implementation.
 
 The Ascend DSV4 implementation is not a DeepSeek V2 layer with different

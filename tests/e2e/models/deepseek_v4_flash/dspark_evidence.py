@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Opt-in DSpark ownership and remote-expert execution evidence.
+# Create: 2026-11-02
+# Note: Return counts are attributed to the layer in the compact receive descriptor.
+# History: 2026-11-02 create
 """Opt-in DSpark ownership and remote-expert execution evidence.
 
 Layered execution requires reading the device header after each eager return,

@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: MRV2 Async CAM FFN runtime, composed from the model loader and
+#              connector.
+# Create: 2026-10-19
+# Note: Each FFN transaction returns the received compact descriptor with its expert
+#       output.
+# History: 2026-10-19 create
 """MRV2 Async CAM FFN runtime, composed from the model loader and connector."""
 
 from __future__ import annotations

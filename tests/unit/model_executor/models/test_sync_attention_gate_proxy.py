@@ -1,6 +1,10 @@
 # mypy: disable-error-code="attr-defined, name-defined"
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Wire protocol of the sync Attention-side gate shell.
+# Create: 2026-11-10
+# Note: A recording connector captures routing payloads and call order.
+# History: 2026-11-10 create
 
 """Wire protocol of the sync Attention-side gate shell.
 

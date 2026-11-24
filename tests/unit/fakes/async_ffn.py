@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Load Async FFN host orchestration without device/runtime dependencies.
+# Create: 2026-10-22
+# Note: Host fixtures isolate upstream runtime imports and native compute.
+# History: 2026-10-22 create
 """Load Async FFN host orchestration without device/runtime dependencies."""
 
 import importlib.util

@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Host tests for compact receive/compute/return and MXFP4 layer
+#              selection.
+# Create: 2026-11-23
+# Note: The native expert compute boundary is stubbed for host execution.
+# History: 2026-11-23 create
 """Host tests for compact receive/compute/return and MXFP4 layer selection."""
 
 from types import SimpleNamespace
