@@ -409,9 +409,10 @@ def configure_scenario(args: argparse.Namespace) -> None:
 def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
     """Configure a synchronous CAMP2P deployment from its host profile.
 
-    The caller selects the A5 (2A2F) or A3 (8A8F) host through the scenario;
-    both keep the gate on FFN, because CAMP2P carries the Hash-layer token ids
-    over the a2e ids channel, and neither needs a CAM vendor package. The rest
+    The caller selects the A5 (2A2F) or A3 (8A8F) host through the scenario. The
+    BF16 profiles keep the gate on FFN, because CAMP2P carries the Hash-layer
+    token ids over the a2e ids channel, while the MXFP8 profile places the gate
+    on Attention with `quant_mode=4`; none needs a CAM vendor package. The rest
     of the deployment follows that host's recorded launch script: its rank
     layout, per-role tensor parallelism and expert parallelism, graph capture,
     the context and batch budget, the weight loader, and whether the case or the
