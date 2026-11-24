@@ -169,6 +169,7 @@ Unknown keys are rejected. All keys are optional.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `payload_format` | `str` | `"bf16"` | Dispatch wire format: `"bf16"` or `"fp8_block128_fp32"` (FP8 e4m3 rows with one fp32 scale per 128 channels). The FFN must load matching expert weights: BF16 weights for `bf16`, block-128 FP8 weights (for example an FP8 checkpoint with `weight_block_size=[128, 128]`) for `fp8_block128_fp32`. |
+| `receive_layout` | `str` | `"expert"` | `"expert"` delivers one row per (token, local expert) and runs `expert_backend`. `"token"` delivers one row per token with its expert ids and weights and runs the MoE kernel vLLM selected on the FFN (`--moe-backend`, for example `marlin`), so the expert weights may be in any format that kernel takes. `"token"` needs `payload_format: "bf16"` and a kernel that takes unquantized rows and reduces over top-k itself; it ignores `expert_backend` and `expert_num_sms`. Both roles must set the same value. |
 | `expert_backend` | `str` | `"deepgemm"` | `"deepgemm"` (DeepGEMM grouped GEMMs) or `"fused_experts"` (vLLM `fused_experts`, a reference path). |
 | `capacity_tokens_per_rank` | `int \| null` | `null` | Largest dispatch one Attention rank issues per call (with Attention TP, its slice); sizes the transport buffers. `null` uses the larger of `max_num_batched_tokens` and the largest CUDA-graph capture size, divided by the Attention TP size. |
 | `num_lanes` | `int \| null` | `null` | In-flight micro-batches, one transport buffer each, `1` or `2`. `null` uses vLLM's micro-batch count: 2 with DBO, otherwise 1. |
@@ -207,7 +208,7 @@ that sets `capacity_tokens_per_rank` explicitly must agree with Attention.
 | `--tensor-parallel-size` | FFN | Must be `1`. Attention may use TP > 1. |
 | Expert placement | FFN | `linear` (vLLM's default `--expert-placement-strategy`). |
 | `--all2all-backend` | FFN | `allgather_reducescatter` (vLLM's default). The connector moves the rows itself, so vLLM's MoE all-to-all never runs; this backend allocates no buffers and keeps vLLM's own DeepEP out of the process. |
-| `--moe-backend` | FFN | `triton` or `auto`. `auto` is pinned to `triton`; any other backend is rejected because it reorders the expert weights that the connector reads. |
+| `--moe-backend` | FFN | `triton` or `auto` with the default `receive_layout`. `auto` is pinned to `triton`; any other backend is rejected after the weights load because it reorders the expert weights that the connector reads. With `receive_layout: token` the FFN runs the selected backend's kernel, for example `marlin`. |
 | `--enable-eplb` | Both | Not supported. |
 | `--enable-dbo` | Both | Optional, but must match on both roles. DBO uses exactly two micro-batches. |
 | CUDA graphs | Both | Eager or `FULL_DECODE_ONLY`. |

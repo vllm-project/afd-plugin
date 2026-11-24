@@ -20,6 +20,7 @@ from tests.e2e.environment import model_case_command
 from tests.e2e.models.qwen3_moe.cases import (
     DEEPEP_M2N_FFN_SERVICE_SCENARIOS,
     DEEPEP_M2N_SCENARIOS,
+    DEEPEP_M2N_TOKEN_SCENARIOS,
     SCENARIOS,
 )
 
@@ -81,6 +82,15 @@ def test_qwen3_moe(scenario: str, tmp_path: Path) -> None:
 @pytest.mark.e2e
 @pytest.mark.parametrize("scenario", DEEPEP_M2N_SCENARIOS, ids=DEEPEP_M2N_SCENARIOS)
 def test_qwen3_moe_deepep_m2n(scenario: str, tmp_path: Path) -> None:
+    command = build_runner_command(scenario, tmp_path / scenario)
+    run_case_entry(command, tmp_path / scenario)
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    "scenario", DEEPEP_M2N_TOKEN_SCENARIOS, ids=DEEPEP_M2N_TOKEN_SCENARIOS
+)
+def test_qwen3_moe_deepep_m2n_token_layout(scenario: str, tmp_path: Path) -> None:
     command = build_runner_command(scenario, tmp_path / scenario)
     run_case_entry(command, tmp_path / scenario)
 

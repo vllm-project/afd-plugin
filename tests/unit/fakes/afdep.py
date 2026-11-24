@@ -36,6 +36,7 @@ CONFIG_OPTIONAL = (
     "cpu_timeout_s",
     "gpu_timeout_s",
     "ffn_ranks_per_domain",
+    "receive_layout",
 )
 
 

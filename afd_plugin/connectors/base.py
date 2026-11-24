@@ -22,6 +22,7 @@ if TYPE_CHECKING:
         AFDTransferContext,
         FFNLocalExperts,
         LocalExpertWeights,
+        TokenExperts,
     )
 
 
@@ -320,6 +321,12 @@ class AFDRoutedExpertsConnector(AFDConnectorBase):
     FFN worker selects the routed-experts runner for these connectors.
     """
 
+    @property
+    def receives_token_rows(self) -> bool:
+        """Whether the FFN receives one row per token, with its expert ids and
+        weights in the payload, and ``run_experts`` takes ``TokenExperts``."""
+        return False
+
     # Extends AFDConnectorBase.init_afd_connector with optional keywords only,
     # so calls through the base contract stay valid.
     @abstractmethod
@@ -343,7 +350,7 @@ class AFDRoutedExpertsConnector(AFDConnectorBase):
     def run_experts(
         self,
         payload: AFDA2FTransferPayload,
-        weights: LocalExpertWeights,
+        weights: LocalExpertWeights | TokenExperts,
     ) -> torch.Tensor:
         """Run this rank's experts on the rows ``recv_attn_output`` returned;
         the result is what ``send_ffn_output`` sends back."""

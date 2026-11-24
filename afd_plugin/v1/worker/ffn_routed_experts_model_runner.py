@@ -9,6 +9,13 @@ from typing import TYPE_CHECKING, Any, Protocol
 import torch
 from vllm.config import VllmConfig
 from vllm.forward_context import DPMetadata
+from vllm.model_executor.layers.fused_moe.modular_kernel import (
+    FusedMoEActivationFormat,
+    FusedMoEExpertsModular,
+)
+from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+    TopKWeightAndReduceNoOP,
+)
 
 from afd_plugin.connectors import (
     AFDConnectorBase,
@@ -17,6 +24,7 @@ from afd_plugin.connectors import (
     AFDTransferContext,
     FFNLocalExperts,
     LocalExpertWeights,
+    TokenExperts,
 )
 from afd_plugin.connectors.metadata import FP8_DTYPE
 from afd_plugin.v1.worker.cuda_graph import AFDCUDAGraphPolicy
@@ -36,23 +44,18 @@ _LAYOUT_PRESERVING_BACKENDS = frozenset({"TRITON"})
 
 
 def select_routed_moe_backend(vllm_config: VllmConfig) -> None:
-    """Pin the FFN's vLLM MoE backend to one that keeps the expert layout.
+    """Turn the FFN's ``auto`` MoE backend into one that keeps the expert layout.
 
-    vLLM's MoE forward never runs on a routed-experts FFN; its backend only
-    decides how the expert weights are processed at load. ``auto`` picks
+    With the connector's executor vLLM's MoE forward never runs; its backend
+    only decides how the expert weights are processed at load. ``auto`` picks
     FlashInfer CUTLASS on Hopper with EP > 1 for block FP8, which reorders
-    w13, so ``auto`` becomes ``triton`` and any other explicit choice fails.
+    w13, so ``auto`` becomes ``triton``. An explicit backend stays: a
+    connector that delivers token rows runs it, and ``local_experts_from_vllm``
+    refuses it for the executor.
     """
     kernel_config = vllm_config.kernel_config
-    backend = str(kernel_config.moe_backend)
-    if backend == "auto":
+    if str(kernel_config.moe_backend) == "auto":
         kernel_config.moe_backend = ROUTED_MOE_BACKEND
-    elif backend != ROUTED_MOE_BACKEND:
-        raise RuntimeError(
-            f"routed-experts AFD FFN needs --moe-backend {ROUTED_MOE_BACKEND} (or "
-            f"auto); moe_backend={backend!r} reorders the expert weights the "
-            "connector reads"
-        )
 
 
 def _check_expert_layout(routed_experts: RoutedExperts) -> None:
@@ -91,6 +94,78 @@ def local_experts_from_vllm(routed_experts: RoutedExperts) -> FFNLocalExperts:
             w13=w13, w2=w2, w13_scale=w13_scale, w2_scale=w2_scale
         ),
     )
+
+
+def token_experts_from_vllm(routed_experts: RoutedExperts) -> FFNLocalExperts:
+    """This rank's experts of one vLLM MoE layer, run by the kernel vLLM chose.
+
+    Only the experts half of vLLM's MoE kernel runs: the connector already
+    moved the rows, so vLLM's prepare/finalize is skipped. That is valid only
+    for a kernel that takes BF16 rows in token order and writes each row's
+    weighted sum itself, which is checked here.
+    """
+    kernel = routed_experts.quant_method.moe_kernel.fused_experts
+    if not (
+        isinstance(kernel, FusedMoEExpertsModular)
+        and isinstance(
+            kernel.finalize_weight_and_reduce_impl(), TopKWeightAndReduceNoOP
+        )
+        and kernel.activation_format() == FusedMoEActivationFormat.Standard
+        and kernel.quant_dtype is None
+    ):
+        raise RuntimeError(
+            f"token rows cannot run on vLLM MoE kernel {type(kernel).__name__}: "
+            "it must take unquantized rows in token order and reduce over "
+            "top-k itself (for example --moe-backend marlin)"
+        )
+    local_ids = tuple(routed_experts.expert_map_manager.get_local_expert_ids())
+    num_local = len(local_ids)
+    w13, w2 = routed_experts.w13_weight, routed_experts.w2_weight
+    # Rows carry local ids, -1 where the expert is on another rank. The kernel
+    # skips ids its map sends to -1, so -1 becomes one extra id mapped to -1.
+    expert_map = torch.arange(num_local + 1, dtype=torch.int32, device=w13.device)
+    expert_map[num_local] = -1
+
+    def run(
+        rows: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        ids = torch.where(topk_ids < 0, num_local, topk_ids)
+        _, num_rows, intermediate, hidden, top_k = kernel.moe_problem_size(
+            rows, w13, w2, ids
+        )
+        workspace13_shape, workspace2_shape, _ = kernel.workspace_shapes(
+            num_rows,
+            intermediate,
+            hidden,
+            top_k,
+            num_local + 1,
+            num_local,
+            None,
+            routed_experts.activation,
+        )
+        dtype = kernel.workspace_dtype(rows.dtype)
+        kernel.apply(
+            output=out,
+            hidden_states=rows,
+            w1=w13,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=ids,
+            activation=routed_experts.activation,
+            global_num_experts=num_local + 1,
+            expert_map=expert_map,
+            a1q_scale=None,
+            a2_scale=kernel.a2_scale,
+            workspace13=rows.new_empty(workspace13_shape, dtype=dtype),
+            workspace2=rows.new_empty(workspace2_shape, dtype=dtype),
+            expert_tokens_meta=None,
+            apply_router_weight_on_input=False,
+        )
+
+    return FFNLocalExperts(expert_ids=local_ids, weights=TokenExperts(run=run))
 
 
 class RoutedExpertsModel(Protocol):
@@ -163,8 +238,13 @@ class GPUFFNRoutedExpertsModelRunner(GPUFFNModelRunner):
     def _take_local_experts(self, model: RoutedExpertsModel) -> None:
         """Record the model's MoE layers and this rank's expert views per layer."""
         self.moe_layer_indices = tuple(model.get_experts_layer_indices())
+        take = (
+            token_experts_from_vllm
+            if self.routed_connector.receives_token_rows
+            else local_experts_from_vllm
+        )
         self.local_experts = {
-            layer_idx: local_experts_from_vllm(model.get_routed_experts(layer_idx))
+            layer_idx: take(model.get_routed_experts(layer_idx))
             for layer_idx in self.moe_layer_indices
         }
 
@@ -234,4 +314,5 @@ __all__ = [
     "GPUFFNRoutedExpertsModelRunner",
     "RoutedExpertsModel",
     "local_experts_from_vllm",
+    "token_experts_from_vllm",
 ]

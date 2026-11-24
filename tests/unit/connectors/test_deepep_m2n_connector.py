@@ -73,6 +73,7 @@ from afd_plugin.connectors.gpu.deepep_m2n.network import (  # noqa: E402
 from afd_plugin.connectors.metadata import (  # noqa: E402
     FFNLocalExperts,
     LocalExpertWeights,
+    TokenExperts,
 )
 from tests.unit.fakes.platform import cuda_like_platform  # noqa: E402
 from tests.unit.fakes.vllm_config import (  # noqa: E402
@@ -180,6 +181,12 @@ def test_config_defaults_and_round_trip():
         ({"bogus": 1}, "unknown DeepEPM2NAFDConnector options"),
         ({"expert_backend": "cutlass"}, "expert_backend"),
         ({"payload_format": "fp4"}, "payload_format"),
+        ({"receive_layout": "row"}, "receive_layout"),
+        # vLLM's MoE kernel takes BF16 rows.
+        (
+            {"receive_layout": "token", "payload_format": "fp8_block128_fp32"},
+            "needs payload_format='bf16'",
+        ),
         # Removed in Phase 4b (now under ``network``): rejected, not ignored.
         ({"num_lanes": 3}, "num_lanes"),
         ({"capacity_tokens_per_rank": 0}, "capacity_tokens_per_rank"),
@@ -629,6 +636,7 @@ def test_handshake_rejects_attention_tp_and_capacity_mismatches(overrides, messa
     [
         ({(3, "hidden_size"): 4096}, "disagree on hidden_size"),
         ({(0, "payload_format"): "fp8"}, "disagree on payload_format"),
+        ({(0, "receive_layout"): "token"}, "disagree on receive_layout"),
         ({(1, "expert_alignment"): 64}, "expert_alignment"),
         ({(0, "role"): "attention"}, "expected 'ffn'"),
         ({(2, "sm"): [8, 0]}, "SM90 or newer"),
@@ -1157,6 +1165,37 @@ def test_handshake_accepts_fp8_block_weights_for_fp8_payload():
         infos[rank]["ffn_deployment"] = _ffn_deployment(layout, "fp8_block128")
 
     validate_handshake(infos, layout, NetworkConfig())
+
+
+def test_token_layout_leaves_the_weight_format_to_vllm():
+    """With ``receive_layout="token"`` FFN ranks that loaded FP8 experts pass
+    the handshake with the BF16 payload, and the model check needs only the
+    expert ids.
+
+    Why: vLLM's own kernel runs the weights, so the connector reads none.
+    """
+    layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
+    infos = _handshake(layout, config=DeepEPM2NConfig(receive_layout="token"))
+    for rank in range(layout.ffn_size):
+        infos[rank]["ffn_deployment"] = _ffn_deployment(layout, "fp8_block128")
+    token_experts = [
+        {
+            layer: FFNLocalExperts(tuple(ids), TokenExperts(run=lambda *_: None))
+            for layer in MOE_LAYERS
+        }
+        for ids in (range(0, 4), range(4, 8))
+    ]
+    model_infos = [local_model_info(MOE_LAYERS, held) for held in token_experts]
+    model_infos.append(local_model_info(MOE_LAYERS, None))
+
+    validate_handshake(infos, layout, NetworkConfig())
+    validate_model_infos(
+        model_infos,
+        SMALL_LAYOUT,
+        hidden_size=SMALL_HIDDEN,
+        payload_format="bf16",
+        receive_layout="token",
+    )
 
 
 def test_handshake_requires_gate_on_attention():
