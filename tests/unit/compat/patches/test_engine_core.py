@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import queue
 import sys
 import types
 from enum import IntEnum
@@ -51,6 +52,23 @@ def _install_fake_vllm_core(
 
     plugins_module.load_general_plugins = load_general_plugins
 
+    class EngineCoreRequestType:
+        UTILITY = "utility"
+
+    class UtilityResult:
+        def __init__(self, result):
+            self.result = result
+
+    class UtilityOutput:
+        def __init__(self, call_id):
+            self.call_id = call_id
+            self.failure_message = None
+            self.result = None
+
+    class EngineCoreOutputs:
+        def __init__(self, *, utility_output):
+            self.utility_output = utility_output
+
     class EngineCore:
         def __init__(
             self,
@@ -76,6 +94,47 @@ def _install_fake_vllm_core(
         def step_with_batch_queue(self):
             return None
 
+        def get_supported_tasks(self):
+            supported_tasks = self.model_executor.supported_tasks
+            self._log_pooler_config(supported_tasks)
+            return supported_tasks
+
+        def _log_pooler_config(self, supported_tasks):
+            del supported_tasks
+            if self._pooler_config_logged:
+                return
+
+            model_config = self.vllm_config.model_config
+            pooler_config = model_config.pooler_config
+            if (
+                self.vllm_config.parallel_config.data_parallel_rank_local
+                or model_config.runner_type != "pooling"
+                or pooler_config is None
+            ):
+                return
+
+        def reset_mm_cache(self):
+            if self.scheduler.has_unfinished_requests():
+                return
+            if self.mm_receiver_cache is not None:
+                self.mm_receiver_cache.clear_cache()
+            self.model_executor.reset_mm_cache()
+
+        def _handle_client_request(self, request_type, request):
+            if request_type != EngineCoreRequestType.UTILITY:
+                raise AssertionError(f"unexpected request type: {request_type}")
+
+            client_idx, call_id, method_name, args = request
+            output = UtilityOutput(call_id)
+            try:
+                result = getattr(self, method_name)(*args)
+                output.result = UtilityResult(result)
+            except Exception as exc:
+                output.failure_message = f"Call to {method_name} method failed: {exc}"
+            self.output_queue.put_nowait(
+                (client_idx, EngineCoreOutputs(utility_output=output))
+            )
+
         def collective_rpc(self, _method, *args, **kwargs):
             return []
 
@@ -84,6 +143,11 @@ def _install_fake_vllm_core(
 
     class EngineCoreProc(EngineCore):
         last_counts: tuple[int, int]
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.input_queue = queue.Queue()
+            self.output_queue = queue.Queue()
 
         def run_busy_loop(self):
             self.original_run_busy_loop_called = True
@@ -186,6 +250,7 @@ def _install_fake_vllm_core(
     core_module.EngineCore = EngineCore
     core_module.EngineCoreProc = EngineCoreProc
     core_module.DPEngineCoreProc = DPEngineCoreProc
+    core_module.EngineCoreRequestType = EngineCoreRequestType
     core_module.EngineShutdownState = _EngineShutdownState
     core_module.VLLM_VERSION = "0.32.0"
     core_module.logger = logging.getLogger("fake-vllm-core")
@@ -281,6 +346,7 @@ def _config(role: str | None, *, async_dp: bool = False, device_type: str = "cud
         max_model_len=8,
         runner_type="generate",
         is_diffusion=False,
+        pooler_config=None,
     )
 
     def validate_block_size():
@@ -613,6 +679,61 @@ def test_engine_core_patch_runs_and_stops_ffn_loop(monkeypatch):
         "raise_ffn_loop_error_if_any",
         "stop_ffn_server_loop",
     ]
+
+
+def test_ffn_connector_loop_replies_to_startup_utility_requests(monkeypatch):
+    core_module = _install_fake_vllm_core(monkeypatch)
+    _load_patch_module()
+
+    class Executor:
+        supported_tasks = ()
+
+        def __init__(self, vllm_config):
+            del vllm_config
+
+        def collective_rpc(self, method):
+            del method
+
+        def reset_mm_cache(self):
+            return None
+
+        def shutdown(self):
+            return None
+
+    engine = core_module.EngineCoreProc(_config("ffn"), Executor, log_stats=True)
+    engine.shutdown_state = _EngineShutdownState.RUNNING
+    engine.input_queue.put_nowait(
+        (
+            core_module.EngineCoreRequestType.UTILITY,
+            (0, 41, "reset_mm_cache", ()),
+        )
+    )
+    engine.input_queue.put_nowait(
+        (
+            core_module.EngineCoreRequestType.UTILITY,
+            (0, 42, "get_supported_tasks", ()),
+        )
+    )
+
+    from afd_plugin.compat.patches import engine_core as engine_core_patch
+
+    def request_shutdown(_seconds):
+        engine.shutdown_state = _EngineShutdownState.REQUESTED
+
+    monkeypatch.setattr(engine_core_patch.time, "sleep", request_shutdown)
+
+    with pytest.raises(SystemExit):
+        engine.run_busy_loop()
+
+    replies = {}
+    while not engine.output_queue.empty():
+        _client_idx, outputs = engine.output_queue.get_nowait()
+        replies[outputs.utility_output.call_id] = outputs.utility_output
+
+    assert replies[41].failure_message is None
+    assert replies[41].result.result is None
+    assert replies[42].failure_message is None
+    assert replies[42].result.result == ()
 
 
 def test_engine_core_ffn_readiness_log_follows_start_rpc(monkeypatch):
