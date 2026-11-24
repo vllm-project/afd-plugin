@@ -4,7 +4,7 @@
  * Description: Ascend C implementation of afd_async_combine_send.
  * Create: 2025-12-18
  * Note: Return expert outputs to their source Attention ranks.
- * History: 2025-12-18 create AfdAsyncCombineSend operator kernel function header file
+ * History: 2026-11-23 update shared afd_async header references
  */
 
 #ifndef AFD_ASYNC_COMBINE_SEND_H

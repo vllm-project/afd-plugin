@@ -1,10 +1,11 @@
 /*
  * SPDX-License-Identifier: MIT
  * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
  * Description: Count routed tokens and compute per-column dispatch prefixes.
- * Create: 2026-10-12
+ * Create: 2026-11-23
  * Note: Assignments to different experts on the same rank share one token payload.
- * History: 2026-10-12 create
+ * History: 2026-11-23 add to the Ascend 950 port
  */
 
 #ifndef AFD_ASYNC_ROUTING_COLUMNS_H

@@ -4,7 +4,7 @@
  * Description: Ascend C implementation of afd_async_dispatch_send.
  * Create: 2025-12-18
  * Note: Send token payloads and routing metadata to their destination expert ranks.
- * History: 2025-12-18 create AfdAsyncDispatchSend operator kernel function header file
+ * History: 2026-11-23 update shared afd_async header references
  */
 
 #ifndef AFD_ASYNC_DISPATCH_SEND_H

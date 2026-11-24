@@ -3,10 +3,10 @@
  * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
  * SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
  * Description: Track two cached DispatchRecv payload rows.
- * Create: 2026-10-13
+ * Create: 2026-11-23
  * Note: The row key includes the source, so equal offsets on different ranks stay
  *       distinct.
- * History: 2026-10-13 create
+ * History: 2026-11-23 add to the Ascend 950 port
  */
 
 #ifndef AFD_ASYNC_RECEIVE_CACHE_H

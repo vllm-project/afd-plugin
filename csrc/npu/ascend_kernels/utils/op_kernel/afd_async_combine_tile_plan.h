@@ -3,9 +3,9 @@
  * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
  * SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
  * Description: Plan CombineRecv scratch space for a tile of hidden elements.
- * Create: 2026-10-14
+ * Create: 2026-11-23
  * Note: The cursor traverses each hidden tile in logical top-k order.
- * History: 2026-10-14 create
+ * History: 2026-11-23 add to the Ascend 950 port
  */
 
 #ifndef AFD_ASYNC_COMBINE_TILE_PLAN_H

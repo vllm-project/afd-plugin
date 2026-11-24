@@ -4,7 +4,7 @@
  * Description: Ascend C implementation of afd_async_dispatch_recv.
  * Create: 2025-12-18
  * Note: Receive and group routed token rows for local experts.
- * History: 2025-12-18 create AfdAsyncDispatchRecv operator kernel function header file
+ * History: 2026-11-23 update shared afd_async header references
  */
 
 #ifndef AFD_ASYNC_DISPATCH_RECV_H

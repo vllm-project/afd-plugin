@@ -1,10 +1,11 @@
 /*
  * SPDX-License-Identifier: MIT
  * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
  * Description: Manage two-slot MTE transfers for the A5 transport kernels.
- * Create: 2026-10-12
+ * Create: 2026-11-23
  * Note: Event credits guard slot reuse across the copy and vector pipelines.
- * History: 2026-10-12 create
+ * History: 2026-11-23 add to the Ascend 950 port
  */
 
 #ifndef AFD_ASYNC_MTE_PIPELINE_H

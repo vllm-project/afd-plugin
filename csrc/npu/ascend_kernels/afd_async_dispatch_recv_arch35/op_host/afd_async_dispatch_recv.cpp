@@ -1,11 +1,12 @@
 /*
  * SPDX-License-Identifier: MIT
- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
  * Description: Host tiling and registration for afd_async_dispatch_recv.
- * Create: 2025-12-18
+ * Create: 2026-11-23
  * Note: The host selects the AIV launch dimensions and configures the MC2
  *       communication group.
- * History: 2025-12-18 create AfdAsyncDispatchRecv tiling function file
+ * History: 2026-11-23 add to the Ascend 950 port
  */
 
 #include "register/op_def_registry.h"
