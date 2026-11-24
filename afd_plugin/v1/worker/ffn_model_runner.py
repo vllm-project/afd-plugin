@@ -144,6 +144,14 @@ class GPUFFNModelRunner:
     def profile_cudagraph_memory(self) -> int:
         return 0
 
+    def reset_mm_cache(self) -> None:
+        """Accept the worker startup multimodal-cache reset.
+
+        AFD FFN runners do not allocate vLLM's multimodal budget or late
+        interaction state, so there is no cache to release.
+        """
+        return None
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}
 

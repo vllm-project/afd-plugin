@@ -651,6 +651,10 @@ def _initialize_ffn_engine_core(
     self._idle_state_callbacks = []
     self.use_spec_decode = False
     self.is_pooling_model = False
+    # The native startup utility RPC reads this even when the worker reports no
+    # supported tasks. Early-loaded FFN engines bypass the standard EngineCore
+    # constructor, so initialize it explicitly for the frontend handshake.
+    self._pooler_config_logged = False
 
 
 def _prepare_late_loaded_ffn_engine_core(
@@ -677,6 +681,18 @@ def _prepare_late_loaded_ffn_engine_core(
             scheduler_config.get_scheduler_cls = lambda: _AFDFFNNoopScheduler
 
 
+# FFN replaces the normal busy loop, so service the frontend startup RPCs from
+# the connector loop. Otherwise the frontend waits for get_supported_tasks and
+# never starts its HTTP health endpoint.
+def _drain_frontend_requests(engine_core: Any) -> None:
+    while True:
+        try:
+            req = engine_core.input_queue.get_nowait()
+        except Exception:
+            return
+        engine_core._handle_client_request(*req)
+
+
 def _run_ffn_busy_loop(self, core_module: Any) -> None:
     started = False
     try:
@@ -688,6 +704,7 @@ def _run_ffn_busy_loop(self, core_module: Any) -> None:
             "AFD FFN EngineCore started; workers run connector loop."
         )
         while _is_running(self, core_module):
+            _drain_frontend_requests(self)
             self.model_executor.collective_rpc("raise_ffn_loop_error_if_any")
             time.sleep(0.5)
     except KeyboardInterrupt:

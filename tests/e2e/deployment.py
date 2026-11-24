@@ -44,8 +44,11 @@ MRV2_EVIDENCE_PREFIX = "AFD E2E execution: "
 NPU_ASYNC_PROCESS_KILL_TIMEOUT_S = 120
 DECODE_GRAPH_COMPILATION_CONFIG = {"cudagraph_mode": "FULL_DECODE_ONLY"}
 # The standalone FFN service's torchrun (F-only) world listens next to the AFD
-# rendezvous port; its rank r management endpoint is the FFN API port + r.
+# rendezvous port.
 FFN_SERVICE_MASTER_PORT_OFFSET = 1
+# Attention, the FFN API, prefill and the PD proxy listen on the API port base
+# + 0..3; the FFN service ranks report on consecutive ports after them.
+FFN_SERVICE_STATUS_PORT_OFFSET = 4
 FFN_SERVICE_STATUS_FILE = "ffn-service.json"
 FFN_SERVICE_HTTP_TIMEOUT_S = 5
 FFN_SERVICE_PROCESS_KILL_TIMEOUT_S = 120
@@ -299,8 +302,19 @@ class ResolvedDeployment:
         return cmd
 
     def ffn_service_status_port(self, rank: int) -> int:
-        """Management port of one FFN service rank (the FFN API port + rank)."""
-        return self.environment.api_port_base + 1 + rank
+        """Management port of one FFN service rank.
+
+        The service adds the rank to one ``--status-port``, so the ranks need
+        consecutive ports: the first block past the API role ports that also
+        misses the AFD rendezvous port and the ``torchrun`` port next to it.
+        """
+        env = self.environment
+        assert self.case.deployment.ffn is not None
+        first = env.api_port_base + FFN_SERVICE_STATUS_PORT_OFFSET
+        past_rendezvous = env.afd_port + FFN_SERVICE_MASTER_PORT_OFFSET + 1
+        if env.afd_port - self.case.deployment.ffn.rank_count < first < past_rendezvous:
+            first = past_rendezvous
+        return first + rank
 
     @property
     def ffn_service_status_file(self) -> Path:
@@ -372,10 +386,6 @@ def resolve(
         raise ValueError("legacy NPU async cleanup requires the NPU async CAM protocol")
     if profile.ffn_service is not None and (profile.ffn is None or slots):
         raise ValueError("the FFN service runs a local FFN role on one host")
-    if profile.ffn_service is not None and profile.prefill is not None:
-        # FFN service rank r reports on api_port_base + 1 + r, which overlaps
-        # the prefill (+2) and PD proxy (+3) ports.
-        raise ValueError("the FFN service cannot run with a prefill role")
     if any(role.uses_graph for _, role in profile.roles) and (
         profile.cudagraph_capture_size is None or profile.cudagraph_capture_size < 1
     ):

@@ -286,15 +286,20 @@ qualification. See
 ### Qwen3 MoE CUDA boundary
 
 `AFDQwen3MoeModel` uses the native `decoder_layer_type` injection hook. The
-Attention role constructs native Qwen Attention and normalization modules.
-With P2P, a parameter-free `RemoteFFNProxy` sends hidden states to FFN, which
+Attention role constructs native Qwen Attention and normalization modules, and
+for MoE layers the native `Qwen3MoeSparseMoeBlock` forward with experts from
+`build_expert()`, as for DeepSeek. With P2P, it sends hidden states and FFN
 runs the complete native MLP or MoE block; `compute_gate_on_attention=false`
 is required. With DeepEP M2N, Attention owns gate/top-k and FFN runs routed
 experts only; this requires `compute_gate_on_attention=true`, every layer to
-be MoE, and no shared expert. Native weight loading follows role-based filtering.
+be MoE, and no shared expert. With Attention TP > 1 the M2N block is
+sequence-parallel, as in DeepSeek's M2N row: each TP rank sends its slice of
+the tokens, with the padding rows unrouted, and the TP group then all-gathers
+the output. Native weight loading follows role-based filtering.
 
-Both paths are CUDA-only and reject sequence-parallel MoE, EPLB, pipeline
-parallelism, speculative decoding, and LoRA during construction.
+Both paths are CUDA-only and reject the `use_sequence_parallel_moe` config
+flag, EPLB, pipeline parallelism, speculative decoding, and LoRA during
+construction.
 
 ### Qwen3.5/3.6 MoE CUDA boundary
 
@@ -457,7 +462,7 @@ hardware-validated without corresponding device E2E evidence.
 ## Limitations and open issues
 
 The common metadata and transfer-state contracts remain DeepSeek-oriented.
-Qwen3 MoE reuses only their existing remote-FFN boundary and does not expand
+Qwen3 MoE reuses only their existing remote-experts boundary and does not expand
 them into a generic model API. Metadata ownership and transfer state decisions
 remain linked to
 [#88](https://github.com/JiusiServe/afd-plugin/issues/88) and

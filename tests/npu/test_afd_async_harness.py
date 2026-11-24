@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: CPU-only tests for the route oracle and safety preflight (no torch
+#              required).
+# Create: 2026-09-22
+# Note: Planner checks run independently of the Ascend device runtime.
+# History: 2026-09-22 create
 """CPU-only tests for the route oracle and safety preflight (no torch required)."""
 
 from __future__ import annotations
@@ -13,7 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from tests.npu.async_cam_common import (
+from tests.npu.afd_async_common import (
     CONSERVATIVE_UB_BYTES,
     HarnessConfig,
     NativeHarness,
@@ -32,7 +37,7 @@ from tests.npu.async_cam_common import (
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
-class AsyncCamPlannerTests(unittest.TestCase):
+class AfdAsyncPlannerTests(unittest.TestCase):
     def test_routed_rows_preserve_expert_rank_token_order_and_topk(self):
         config = HarnessConfig(capacity=8)
         plans = [chunk_plans(config, owner) for owner in range(config.moe_ranks)]
@@ -197,8 +202,18 @@ class AsyncCamPlannerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "48-AIV owner"):
             validate_config(replace(HarnessConfig(), moe_ranks=49))
 
+    def test_950_preflight_uses_declared_device_resources(self):
+        config = HarnessConfig(soc_version="950")
+        with self.assertRaisesRegex(ValueError, "950 requires explicit"):
+            validate_config(config)
+        config = replace(config, aiv_count=8, ub_budget_bytes=CONSERVATIVE_UB_BYTES)
+        validate_config(config)
+        peak = max(unified_buffer_requirements(config).values())
+        with self.assertRaisesRegex(ValueError, "UB bytes"):
+            validate_config(replace(config, ub_budget_bytes=peak - 1))
+
     def test_cli_help_and_dry_run_use_only_standard_library(self):
-        script = REPOSITORY_ROOT / "tests/npu/async_cam_precision.py"
+        script = REPOSITORY_ROOT / "tests/npu/afd_async_precision.py"
         for arguments in (("--help",), ("--dry-run", "--capacity", "8")):
             result = subprocess.run(
                 [sys.executable, "-S", str(script), *arguments],

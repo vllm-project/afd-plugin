@@ -843,7 +843,9 @@ def test_ffn_service_runs_the_probe_entry_for_graph_evidence(tmp_path, case_id):
     assert ("--worker-extension-cls" in record["commands"]["attention"]) is probed
 
 
-def test_ffn_service_rejects_a_prefill_role(tmp_path):
+def test_ffn_service_status_ports_are_apart_from_the_prefill_and_proxy_ports(
+    tmp_path,
+):
     environment = CaseEnvironment(
         model="/models/qwen3",
         vllm_bin="vllm",
@@ -852,9 +854,47 @@ def test_ffn_service_rejects_a_prefill_role(tmp_path):
         output_path=tmp_path,
     )
     case = qwen3_cases.build_case("afd-deepep-m2n-faas-eager-2a2f", environment)
-    deployment = replace(case.deployment, prefill=case.deployment.attention)
-    with pytest.raises(ValueError, match="cannot run with a prefill role"):
-        runner.prepare_case(replace(case, deployment=deployment), environment)
+    case = replace(
+        case, deployment=replace(case.deployment, prefill=case.deployment.attention)
+    )
+    resolved = runner.deployment.resolve(case, environment)
+
+    def port(command):
+        return int(command[command.index("--port") + 1])
+
+    ports = [
+        port(resolved.command("attention")),
+        port(resolved.command("prefill")),
+        port(resolved.proxy_command()),
+        *map(resolved.ffn_service_status_port, range(case.deployment.ffn.rank_count)),
+    ]
+    assert len(set(ports)) == len(ports) == 5
+
+
+@pytest.mark.parametrize("afd_port", [8003, 8004, 8005, 8006])
+def test_ffn_service_status_ports_miss_the_afd_and_torchrun_ports(tmp_path, afd_port):
+    environment = CaseEnvironment(
+        model="/models/qwen3",
+        vllm_bin="vllm",
+        device_backend="gpu",
+        devices=tuple(map(str, range(4))),
+        api_port_base=8000,
+        afd_port=afd_port,
+        output_path=tmp_path,
+    )
+    case = qwen3_cases.build_case("afd-deepep-m2n-faas-eager-2a2f", environment)
+    resolved = runner.deployment.resolve(case, environment)
+
+    service = resolved.ffn_service_command()
+    master_port = int(
+        next(a for a in service if a.startswith("--master-port=")).split("=")[1]
+    )
+    first = int(service[service.index("--status-port") + 1])
+    status_ports = [first + rank for rank in range(case.deployment.ffn.rank_count)]
+    assert status_ports == [
+        resolved.ffn_service_status_port(rank) for rank in range(len(status_ports))
+    ]
+    assert not {afd_port, master_port, *range(8000, 8004)} & set(status_ports)
 
 
 @pytest.mark.parametrize(

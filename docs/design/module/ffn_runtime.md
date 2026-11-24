@@ -34,7 +34,7 @@ validation_paths:
   - "tests/unit/connectors/npu/async_cam_runtime/test_async_cam_layered.py"
   - "tests/unit/v1/worker/test_async_ffn_runtime.py"
   - "tests/unit/v1/worker/test_async_ffn_graph.py"
-  - "tests/npu/test_async_cam_layered_w8a8.py"
+  - "tests/npu/test_afd_async_layered_w8a8.py"
   - "tests/unit/v1/worker/test_ffn_metadata.py"
   - "tests/unit/v1/worker/test_ffn_model_runner.py"
   - "tests/unit/v1/worker/test_ffn_routed_experts_model_runner.py"

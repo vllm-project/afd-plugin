@@ -1,11 +1,14 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
-// Copyright contributors to the AFD plugin project
-//
-// Adapted from cam_async/src/comm_operator/pybind/moe_*_async.cpp.
-// New AFD inference adapters share allocation and validation between NPU and
-// Meta. They retain the cam_async_routed_only_compact_v2 argument order and
-// ACLNN calls, without the source's placeholder autograd implementation.
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+ * Copyright contributors to the AFD plugin project
+ * Description: Register the four compact afd_async operators with PyTorch.
+ * Create: 2026-09-21
+ * Note: Adapted from cam_async/src/comm_operator/pybind/moe_*_async.cpp. The NPU and
+ *       Meta bindings share the cam_async_routed_only_compact_v2 argument order and
+ *       ACLNN calls.
+ * History: 2026-09-21 integrate the compact operator bindings into afd-plugin
+ */
 
 #include <cstdlib>
 #include <exception>
@@ -21,7 +24,7 @@
 #include "afd_async_dispatch_recv/op_api/aclnn_afd_async_dispatch_recv.h"
 #include "afd_async_dispatch_send/op_api/aclnn_afd_async_dispatch_send.h"
 
-namespace afd_plugin::cam_async {
+namespace afd_plugin::afd_async {
 namespace {
 
 constexpr int64_t MAX_SEQUENCE_LENGTH = 1024 * 256;
@@ -272,7 +275,7 @@ at::Tensor combine_recv(
   return output;
 }
 
-}  // namespace afd_plugin::cam_async
+}  // namespace afd_plugin::afd_async
 
 TORCH_LIBRARY_FRAGMENT(afd_ascend, ops) {
   ops.def("afd_async_dispatch_send(Tensor x, Tensor expert_ids, Tensor comm_args, "
@@ -297,23 +300,23 @@ TORCH_LIBRARY_FRAGMENT(afd_ascend, ops) {
 }
 
 TORCH_LIBRARY_IMPL(afd_ascend, PrivateUse1, ops) {
-  ops.impl("afd_async_dispatch_send", &afd_plugin::cam_async::dispatch_send<true>);
-  ops.impl("afd_async_dispatch_recv", &afd_plugin::cam_async::dispatch_recv<true>);
-  ops.impl("afd_async_combine_send", &afd_plugin::cam_async::combine_send<true>);
-  ops.impl("afd_async_combine_recv", &afd_plugin::cam_async::combine_recv<true>);
+  ops.impl("afd_async_dispatch_send", &afd_plugin::afd_async::dispatch_send<true>);
+  ops.impl("afd_async_dispatch_recv", &afd_plugin::afd_async::dispatch_recv<true>);
+  ops.impl("afd_async_combine_send", &afd_plugin::afd_async::combine_send<true>);
+  ops.impl("afd_async_combine_recv", &afd_plugin::afd_async::combine_recv<true>);
 }
 
 // Explicitly enforce the inference-only contract, including when grad mode is on.
 TORCH_LIBRARY_IMPL(afd_ascend, AutogradPrivateUse1, ops) {
-  ops.impl("afd_async_dispatch_send", &afd_plugin::cam_async::dispatch_send<true>);
-  ops.impl("afd_async_dispatch_recv", &afd_plugin::cam_async::dispatch_recv<true>);
-  ops.impl("afd_async_combine_send", &afd_plugin::cam_async::combine_send<true>);
-  ops.impl("afd_async_combine_recv", &afd_plugin::cam_async::combine_recv<true>);
+  ops.impl("afd_async_dispatch_send", &afd_plugin::afd_async::dispatch_send<true>);
+  ops.impl("afd_async_dispatch_recv", &afd_plugin::afd_async::dispatch_recv<true>);
+  ops.impl("afd_async_combine_send", &afd_plugin::afd_async::combine_send<true>);
+  ops.impl("afd_async_combine_recv", &afd_plugin::afd_async::combine_recv<true>);
 }
 
 TORCH_LIBRARY_IMPL(afd_ascend, Meta, ops) {
-  ops.impl("afd_async_dispatch_send", &afd_plugin::cam_async::dispatch_send<false>);
-  ops.impl("afd_async_dispatch_recv", &afd_plugin::cam_async::dispatch_recv<false>);
-  ops.impl("afd_async_combine_send", &afd_plugin::cam_async::combine_send<false>);
-  ops.impl("afd_async_combine_recv", &afd_plugin::cam_async::combine_recv<false>);
+  ops.impl("afd_async_dispatch_send", &afd_plugin::afd_async::dispatch_send<false>);
+  ops.impl("afd_async_dispatch_recv", &afd_plugin::afd_async::dispatch_recv<false>);
+  ops.impl("afd_async_combine_send", &afd_plugin::afd_async::combine_send<false>);
+  ops.impl("afd_async_combine_recv", &afd_plugin::afd_async::combine_recv<false>);
 }

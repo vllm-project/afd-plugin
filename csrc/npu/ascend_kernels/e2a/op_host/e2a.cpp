@@ -6,6 +6,10 @@
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
+ * Description: Register host tiling for the E2A operator.
+ * Create: 2026-05-25 (AFD import)
+ * Note: The A5 build exports the tiling registration symbol.
+ * History: 2026-05-25 import E2A host code into afd-plugin
  */
 
 #include "../op_kernel/e2a_tiling.h"
@@ -110,7 +114,13 @@ namespace optiling {
         return ge::GRAPH_SUCCESS;
     }
 
+#ifdef AFD_TILING_HAS_COMM_ENGINE
+    // Retain the A5 registration in the hidden-visibility tiling library.
+    __attribute__((visibility("default"))) gert::OpImplRegisterV2 op_impl_register_optiling_E2a =
+        gert::OpImplRegisterV2("E2a")
+#else
     IMPL_OP_OPTILING(E2a)
+#endif
         .Tiling(E2aTilingFunc)
         .TilingParse<E2aInfo>(TilingParseForE2a);
 }

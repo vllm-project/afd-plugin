@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Validate Ascend build inputs and package selection.
+# Create: 2026-05-25
+# Note: Tests cover the optional Ascend extension and SoC selection.
+# History: 2026-05-25 create
 
 from __future__ import annotations
 
@@ -187,7 +191,17 @@ def _run_select_ops(*args: str) -> subprocess.CompletedProcess[str]:
                 "afd_mega_moe_comm",
             ],
         ),
-        ("ascend950", ["a2e", "e2a"]),
+        (
+            "ascend950",
+            [
+                "a2e",
+                "e2a",
+                "afd_async_dispatch_send_arch35",
+                "afd_async_dispatch_recv_arch35",
+                "afd_async_combine_send_arch35",
+                "afd_async_combine_recv_arch35",
+            ],
+        ),
     ],
 )
 @pytest.mark.parametrize("shmem", ["0", "1"])

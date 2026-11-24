@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: HCCL benchmarks for the four plugin-owned routed async CAM operators.
+# Create: 2026-09-22
+# Note: The timing harness checks precision before collecting device measurements.
+# History: 2026-09-22 create
 """HCCL benchmarks for the four plugin-owned routed async CAM operators.
 
-Run with torchrun on Ascend 910C; --help and --dry-run need only Python.
+Run with torchrun on Ascend 910C or 950. --help and --dry-run need only Python.
 See README.md beside this file for timing boundaries and launch examples.
 """
 
@@ -18,14 +22,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING or __package__:
-    from .async_cam_common import (
+    from .afd_async_common import (
         NativeHarness,
         add_common_arguments,
         config_from_args,
         describe_config,
     )
 else:
-    from async_cam_common import (
+    from afd_async_common import (
         NativeHarness,
         add_common_arguments,
         config_from_args,
