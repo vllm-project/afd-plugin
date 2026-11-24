@@ -674,6 +674,14 @@ def test_ffn_runner_profiles_zero_cudagraph_memory():
     assert GPUFFNModelRunner.profile_cudagraph_memory(runner) == 0
 
 
+def test_ffn_runner_accepts_startup_mm_cache_reset():
+    """Native Worker.reset_mm_cache forwards the startup utility RPC to the
+    runner; AFD FFN runners have no multimodal cache state."""
+
+    runner = object.__new__(GPUFFNModelRunner)
+    assert GPUFFNModelRunner.reset_mm_cache(runner) is None
+
+
 def test_ffn_runner_replays_cuda_graph_when_key_exists():
     runner = _runner_with_connector_and_model(_FakeModel())
     runner.use_cuda_graph = True
