@@ -208,7 +208,9 @@ The imported compact operator sources in csrc/npu/ascend_kernels/afd_async_*/
 carry the MIT permission notice below. In utils/op_host and utils/op_kernel,
 this notice applies to headers explicitly marked MIT, including the six A5
 helpers that credit both Huawei Technologies Co., Ltd. and the AFD plugin
-project contributors. The same notice covers tests/npu/test_afd_async_host_tiling.py.
+project contributors. The same notice covers the original Python tests
+tests/npu/test_afd_async_host_tiling.py and
+tests/unit/connectors/npu/async_cam_runtime/test_afd_async_mxfp.py.
 
 The 2026 Ascend 950 variants incorporate sources with this original notice:
 

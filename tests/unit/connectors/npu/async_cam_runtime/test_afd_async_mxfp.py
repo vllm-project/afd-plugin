@@ -1,10 +1,11 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
+# Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 # Description: Host tests for compact receive/compute/return and MXFP4 layer
 #              selection.
 # Create: 2026-11-23
 # Note: The native expert compute boundary is stubbed for host execution.
-# History: 2026-11-23 create
+# History: 2026-11-23 add to the Ascend 950 port
 """Host tests for compact receive/compute/return and MXFP4 layer selection."""
 
 from types import SimpleNamespace

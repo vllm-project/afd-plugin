@@ -43,6 +43,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 HUAWEI_MIT_TESTS = frozenset(
     {
         REPO_ROOT / "tests/npu/test_afd_async_host_tiling.py",
+        REPO_ROOT
+        / "tests/unit/connectors/npu/async_cam_runtime/test_afd_async_mxfp.py",
     }
 )
 HUAWEI_MIT_HEADER = (
