@@ -7,7 +7,7 @@ Use for `afd_plugin/model_executor/`: the registration maps in
 `afd_plugin/__init__.py` (`_DEEPSEEK_MODEL_REGISTRATIONS`,
 `_QWEN_MODEL_REGISTRATIONS`, `_QWEN3_5_MODEL_REGISTRATIONS`), role-split model
 wrappers (`RemoteFFNProxy`, the Attention-role MoE runners from
-`build_expert()`, `GateOnlyRemoteMoE`, the
+`build_expert()`, the
 `AFDDeepseekV2/V3/V4` and `AFDQwen3Moe`/`AFDQwen3_5` families, plus
 `AFDGlmMoeDsaForCausalLM` and `AFDDSparkDeepseekV4ForCausalLM`), checkpoint
 weight-role filtering, the NPU-specific forward/gate modules under
@@ -37,9 +37,8 @@ transport, or the routing simulator's registration mechanics.
   the shared experts, with an output slot per microbatch, and AFD's routed
   experts send the routes, with TP padding rows unrouted, instead of running
   an expert kernel. A change that computes experts locally, or that
-  passes an argument the factory fixes, is a finding. The NPU gate paths
-  (`GateOnlyRemoteMoE`) route on Attention by design and keep their own
-  `RemoteFFNProxy` transports.
+  passes an argument the factory fixes, is a finding. On NPU, DeepSeek V2 uses synchronous CAMP2P
+  with the gate on FFN. DeepSeek V4 owns the supported Attention-side gates.
 - Access upstream model config attributes directly per AGENTS.md; a
   `getattr`/`hasattr` guard around vLLM model fields hides the exact
   incompatibility the pinned-version contract exists to surface.

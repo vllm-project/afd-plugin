@@ -156,27 +156,6 @@ def test_load_weights_passes_one_shot_generator_to_native_loader(
     assert weights.iterations == 1
 
 
-def test_async_shared_weights_belong_to_attention():
-    name = "model.layers.3.mlp.shared_experts.gate_proj.weight"
-    assert (
-        _checkpoint_weight_roles(
-            name,
-            _config(),
-            compute_gate_on_attention=True,
-            attention_shared_experts=True,
-        )
-        == ATTENTION_ROLES
-    )
-    assert (
-        _checkpoint_weight_roles(
-            name,
-            _config(),
-            compute_gate_on_attention=True,
-        )
-        == FFN_ROLES
-    )
-
-
 M2N_CHECKPOINT_NAMES = (
     "model.layers.0.mlp.gate_proj.weight",
     "model.layers.3.mlp.gate.weight",

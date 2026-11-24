@@ -54,6 +54,9 @@ from afd_plugin.model_executor.models._weight_utils import (
 from afd_plugin.model_executor.models.npu.deepseek_v4_shared_experts import (
     AFDDeepseekV4SharedExperts,
 )
+from afd_plugin.model_executor.models.npu.deepseek_v4_weights import (
+    prepare_attention_gate_w8a8_scales,
+)
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 try:
@@ -866,10 +869,6 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
             or not self.afd_config.compute_gate_on_attention
         ):
             return
-        from afd_plugin.model_executor.models.npu.deepseek_v2_attention_gate import (
-            prepare_attention_gate_w8a8_scales,
-        )
-
         prepare_attention_gate_w8a8_scales(self.model.layers)
         # ### PATCH END: retain FFN gate-on-A W8A8 scales after quant finalize
 

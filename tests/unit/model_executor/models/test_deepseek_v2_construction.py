@@ -31,13 +31,6 @@ from tests.unit.fakes.vllm_config import attention_moe_vllm_config  # noqa: E402
 
 @pytest.fixture
 def construction_env(monkeypatch):
-    from afd_plugin.model_executor.models.npu import deepseek_v2_attention_gate
-
-    monkeypatch.setattr(
-        deepseek_v2_attention_gate,
-        "create_gate_router",
-        lambda **kwargs: SimpleNamespace(gate=kwargs["gate"]),
-    )
     calls: dict[str, list[str]] = {
         "attention": [],
         "dense": [],
@@ -182,8 +175,12 @@ def test_standard_attention_constructs_no_ffn_parameters(
     monkeypatch,
     construction_env,
 ):
-    dense = _make_layer(monkeypatch, role="attention", layer_idx=0)
-    moe = _make_layer(monkeypatch, role="attention", layer_idx=1)
+    dense = _make_layer(
+        monkeypatch, role="attention", layer_idx=0, connector="CAMP2pAFDConnector"
+    )
+    moe = _make_layer(
+        monkeypatch, role="attention", layer_idx=1, connector="CAMP2pAFDConnector"
+    )
 
     assert isinstance(dense.mlp, adapter.RemoteFFNProxy)
     assert isinstance(moe.mlp, adapter.RemoteFFNProxy)
@@ -191,72 +188,15 @@ def test_standard_attention_constructs_no_ffn_parameters(
     assert not any(name.startswith("mlp.") for name in _parameter_names(moe))
 
 
-def test_npu_async_ffn_layer_inventory_excludes_dense_and_pp_placeholders(
-    monkeypatch, construction_env
+def test_ffn_layer_inventory_excludes_dense_and_pp_placeholders(
+    monkeypatch, cuda_construction_env
 ):
     model = object.__new__(adapter.AFDDeepseekV2Model)
     nn.Module.__init__(model)
-    dense = _make_layer(monkeypatch, role="ffn", layer_idx=0, attention_gate=True)
-    moe = _make_layer(monkeypatch, role="ffn", layer_idx=2, attention_gate=True)
-    assert not moe.uses_remote_experts, "NPU does not use the CUDA remote proxy"
+    dense = _make_layer(monkeypatch, role="ffn", layer_idx=0)
+    moe = _make_layer(monkeypatch, role="ffn", layer_idx=2)
     model.layers = nn.ModuleList([dense, nn.Identity(), moe])
-    # #461 iterates this inventory before submitting its first CAM receive.
     assert model.get_experts_layer_indices() == (2,)
-
-
-def test_attention_gate_keeps_dense_local_and_gate_at_mlp_path(
-    monkeypatch,
-    construction_env,
-):
-    dense = _make_layer(
-        monkeypatch,
-        role="attention",
-        layer_idx=0,
-        attention_gate=True,
-    )
-    moe = _make_layer(
-        monkeypatch,
-        role="attention",
-        layer_idx=1,
-        attention_gate=True,
-    )
-
-    assert isinstance(moe.mlp, adapter.GateOnlyRemoteMoE)
-    assert "mlp.gate.weight" in _parameter_names(moe)
-    assert "mlp.gate.e_score_correction_bias" in _parameter_names(moe)
-    assert not any("experts" in name for name in _parameter_names(moe))
-    assert not isinstance(dense.mlp, adapter.RemoteFFNProxy)
-
-
-def test_npu_gate_only_uses_native_gate_precision_and_checkpoint_name(
-    monkeypatch,
-    construction_env,
-):
-
-    monkeypatch.setattr(adapter.native, "GateLinear", GateLinear)
-    vllm_config = _vllm_config()
-    vllm_config.model_config.hf_config.moe_router_dtype = "float32"
-
-    layer = _make_layer(
-        monkeypatch,
-        role="attention",
-        layer_idx=1,
-        attention_gate=True,
-        vllm_config=vllm_config,
-    )
-
-    gate = layer.mlp.gate
-    assert gate.weight.dtype == torch.float32
-    assert "mlp.gate.weight" in _parameter_names(layer)
-
-    checkpoint_weight = torch.ones_like(gate.weight, dtype=torch.bfloat16)
-    result = layer.load_state_dict(
-        {"mlp.gate.weight": checkpoint_weight},
-        strict=False,
-    )
-    assert "mlp.gate.weight" not in result.unexpected_keys
-    assert gate.weight.dtype == torch.float32
-    assert torch.equal(gate.weight, checkpoint_weight.float())
 
 
 def test_cuda_attention_gate_uses_native_gate_contract(
@@ -597,7 +537,7 @@ def test_ffn_side_gate_keeps_native_internal_router(
 
 def test_attention_gate_ffn_dense_uses_non_executing_placeholder(
     monkeypatch,
-    construction_env,
+    cuda_construction_env,
 ):
     dense = _make_layer(
         monkeypatch,
@@ -605,15 +545,7 @@ def test_attention_gate_ffn_dense_uses_non_executing_placeholder(
         layer_idx=0,
         attention_gate=True,
     )
-    moe = _make_layer(
-        monkeypatch,
-        role="ffn",
-        layer_idx=1,
-        attention_gate=True,
-    )
-
     assert isinstance(dense.mlp, adapter.native.PPMissingLayer)
-    assert isinstance(moe.self_attn, adapter.native.PPMissingLayer)
 
 
 def _patch_model_constructor_dependencies(
@@ -686,87 +618,26 @@ def test_afd_alias_without_activation_fails_before_construction(monkeypatch):
         adapter.AFDDeepseekV2DecoderLayer(vllm_config, "model.layers.0")
 
 
+@pytest.mark.parametrize("role", ["attention", "ffn"])
 def test_model_constructor_rejects_sequence_parallel_moe_before_allocation(
     monkeypatch,
     construction_env,
+    role,
 ):
     vllm_config = _vllm_config()
     vllm_config.parallel_config.use_sequence_parallel_moe = True
     monkeypatch.setattr(
         adapter,
         "parse_afd_config",
-        lambda *_args, **_kwargs: AFDConfig(role="ffn"),
+        lambda *_args, **_kwargs: AFDConfig(role=role, connector="CAMP2pAFDConnector"),
     )
 
     with pytest.raises(RuntimeError, match="sequence-parallel MoE"):
         adapter.AFDDeepseekV2Model(vllm_config=vllm_config, prefix="model")
 
 
-def test_npu_async_attention_allows_model_owned_sp(
-    monkeypatch,
-    construction_env,
-):
-    vllm_config = _vllm_config()
-    vllm_config.parallel_config.use_sequence_parallel_moe = True
-    vllm_config.parallel_config.pipeline_parallel_size = 1
-    monkeypatch.setattr(
-        adapter.native,
-        "current_platform",
-        SimpleNamespace(device_type="npu"),
-    )
-    monkeypatch.setattr(
-        adapter,
-        "parse_afd_config",
-        lambda *_args, **_kwargs: AFDConfig(
-            role="attention",
-            connector="CAMAsyncAFDConnector",
-            compute_gate_on_attention=True,
-        ),
-    )
-    _patch_model_constructor_dependencies(monkeypatch, construction_env)
-    model = adapter.AFDDeepseekV2Model(vllm_config=vllm_config, prefix="model")
-    assert not model.layers[0].use_sequence_parallel_moe
-    assert model.layers[1].use_sequence_parallel_moe is True
-
-
-@pytest.mark.parametrize(
-    "device_type,connector",
-    [
-        ("cuda", "CAMAsyncAFDConnector"),
-        ("npu", "CAMP2pAFDConnector"),
-    ],
-)
-def test_sp_remains_rejected_outside_npu_async_attention(
-    monkeypatch,
-    construction_env,
-    device_type,
-    connector,
-):
-    vllm_config = _vllm_config()
-    vllm_config.parallel_config.use_sequence_parallel_moe = True
-    monkeypatch.setattr(
-        adapter.native,
-        "current_platform",
-        SimpleNamespace(device_type=device_type),
-    )
-    monkeypatch.setattr(
-        adapter,
-        "parse_afd_config",
-        lambda *_args, **_kwargs: AFDConfig(
-            role="attention",
-            connector=connector,
-            compute_gate_on_attention=True,
-        ),
-    )
-    with pytest.raises(RuntimeError, match="sequence-parallel MoE"):
-        adapter.AFDDeepseekV2Model(vllm_config=vllm_config, prefix="model")
-
-
-@pytest.mark.parametrize(
-    "connector", ["CAMAsyncAFDConnector", DEEPEP_M2N_CONNECTOR], ids=["async", "m2n"]
-)
-def test_ffn_omits_attention_owned_shared_with_real_hf_config(
-    monkeypatch, construction_env, connector
+def test_m2n_ffn_omits_attention_owned_shared_with_real_hf_config(
+    monkeypatch, cuda_construction_env
 ):
     from transformers import DeepseekV2Config
 
@@ -784,6 +655,7 @@ def test_ffn_omits_attention_owned_shared_with_real_hf_config(
         def __init__(self, *, config, **kwargs):
             super().__init__()
             native_configs.append(config)
+            self.experts = SimpleNamespace(gate=None)
 
     monkeypatch.setattr(adapter.native, "DeepseekV2MoE", RoutedMoE)
     monkeypatch.setattr(
@@ -791,7 +663,7 @@ def test_ffn_omits_attention_owned_shared_with_real_hf_config(
         "parse_afd_config",
         lambda *_args, **_kwargs: AFDConfig(
             role="ffn",
-            connector=connector,
+            connector=DEEPEP_M2N_CONNECTOR,
             compute_gate_on_attention=True,
         ),
     )
