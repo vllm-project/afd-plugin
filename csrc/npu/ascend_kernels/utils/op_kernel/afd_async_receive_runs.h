@@ -1,6 +1,4 @@
-// SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-// AFD adaptation: renamed the helper and its references for afd_async.
 #ifndef AFD_ASYNC_RECEIVE_RUNS_H
 #define AFD_ASYNC_RECEIVE_RUNS_H
 

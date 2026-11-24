@@ -204,11 +204,9 @@ Third-party software notice: Routed-only asynchronous CAM operators
 =================================================================
 
 The imported compact operator sources in csrc/npu/ascend_kernels/afd_async_*/
-(including the *_arch35 variants), the MIT-marked afd_async_* headers in
-utils/op_host and utils/op_kernel, and csrc/npu/pybind/afd_async_bindings.cpp
-carry the MIT permission notice below. The tile planner, dispatch pipeline,
-receive cache, contiguous receive runs, sparse-rank tracker and window
-helper retain their original AFD plugin contributor copyright notice.
+(including the *_arch35 variants) and csrc/npu/pybind/afd_async_bindings.cpp
+carry the MIT permission notice below. In utils/op_host and utils/op_kernel,
+this notice applies only to headers explicitly marked MIT.
 
 The MIT License
 

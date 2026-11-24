@@ -30,9 +30,9 @@ install carry the repository license and third-party notice.
 [Original import](https://github.com/vllm-project/afd-plugin/pull/361)
 · [LICENSE](../../LICENSE)
 
-The six A5 helpers below first appeared in the A5 MTE development branch
-with Apache-2.0 headers. Their author has authorized MIT distribution of
-these copies. Each retains its AFD plugin contributor copyright notice.
+The six A5 helpers below retain their AFD plugin contributor copyright
+notices. Their filenames and include paths use the `afd_async_` prefix in
+this repository. The table links each original file at the commit that added it.
 
 | Header under `ascend_kernels/utils/op_kernel/` | Original file and introducing commit |
 | --- | --- |
