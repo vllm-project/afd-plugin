@@ -11,6 +11,7 @@ import sys
 import types
 from enum import IntEnum
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -146,8 +147,8 @@ def _install_fake_vllm_core(
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            self.input_queue = queue.Queue()
-            self.output_queue = queue.Queue()
+            self.input_queue: queue.Queue[Any] = queue.Queue()
+            self.output_queue: queue.Queue[Any] = queue.Queue()
 
         def run_busy_loop(self):
             self.original_run_busy_loop_called = True
