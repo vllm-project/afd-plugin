@@ -14,9 +14,11 @@ lists only its defaults and model-specific notes.
 
 Recipe names encode their layout, DP/TP shape, and mode. DeepSeek-V2-Lite and
 Qwen3-30B-A3B provide `2a2f_{eager,graph,graph_dbo}_dp2tp1.sh` plus
-`2a2f_eager_dp1tp2.sh`; Qwen3-235B-A22B-FP8 provides `4a2f` eager, graph and
-DBO recipes plus `multipod_4a1f_4a1f_dbo.sh`. Each model README lists its
-exact filenames and defaults.
+`2a2f_eager_dp1tp2.sh`; Qwen3-235B-A22B-FP8 provides `4a2f` eager, graph,
+DBO and EPLB recipes plus the multipod DBO and 4A4F EPLB recipes
+(`multipod_4a1f_4a1f_dbo.sh`, `multipod_2a2f_graph_eplb.sh`,
+`multipod_8a8f_graph_eplb.sh`). Each model README lists its exact filenames
+and defaults.
 
 ```text
 .
