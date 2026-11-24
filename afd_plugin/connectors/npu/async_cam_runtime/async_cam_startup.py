@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Host-only Async CAM graph startup protocol, before and after HCCL
+#              setup.
+# Create: 2026-10-19
+# Note: The rendezvous Store publishes errors to peers before CAM group creation.
+# History: 2026-10-19 create
 """Host-only Async CAM graph startup protocol, before and after HCCL setup."""
 
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -15,6 +21,32 @@ if TYPE_CHECKING:
 
 GRAPH_STARTUP_TIMEOUT_SECONDS = 30.0
 POLL_SECONDS = 0.02
+BF16_PUSH_SIGNATURE_PREFIX = "bf16_push:"
+# GetMaxWindowSize() in ascend_kernels/utils/op_host/ops_log.h uses MiB.
+_AFD_ASYNC_DEFAULT_WINDOW_MIB = 408
+_AFD_ASYNC_MAX_WINDOW_MIB = 32 * 1024
+
+
+def _afd_async_bf16_window_mib(configured_mib: int | None) -> int:
+    raw = os.environ.get("HCCL_BUFFSIZE")
+    window_mib = _AFD_ASYNC_DEFAULT_WINDOW_MIB
+    if raw is not None:
+        value = raw.strip(" \t\r\n\v\f").removeprefix("+")
+        if not (value.isascii() and value.isdecimal()):
+            raise ValueError(
+                f"HCCL_BUFFSIZE must be a positive integer in MiB, got {raw!r}"
+            )
+        window_mib = int(value)
+        if not 1 <= window_mib <= _AFD_ASYNC_MAX_WINDOW_MIB:
+            raise ValueError(
+                f"HCCL_BUFFSIZE must be in [1, {_AFD_ASYNC_MAX_WINDOW_MIB}] MiB"
+            )
+    if configured_mib is not None and configured_mib != window_mib:
+        raise ValueError(
+            f"hccl_buffer_size={configured_mib} MiB must match the tiler's "
+            f"HCCL_BUFFSIZE={window_mib} MiB for BF16 Push"
+        )
+    return window_mib
 
 
 @dataclass(frozen=True)
@@ -65,16 +97,23 @@ class AsyncCAMGraphStartup:
         self._prefix = ""
         self._shared_errors = False
 
-    def initialize(self, store: Store, transport_signature: str) -> None:
+    def initialize(
+        self,
+        store: Store,
+        transport_signature: str,
+        *,
+        hccl_buffer_size_mb: int | None = None,
+    ) -> int | None:
         self._store = store
         if self.world_rank == 0:
             store.set("ffn_graph/nonce", uuid.uuid4().hex)
         nonce = store.get("ffn_graph/nonce").decode()
         self.session_epoch = int(nonce[:15], 16) or 1
         self._prefix = f"ffn_graph/{nonce}/"
-        self._negotiate(
+        return self._negotiate(
             self.plan if self.world_rank >= self.attn_size else None,
             transport_signature,
+            hccl_buffer_size_mb,
         )
 
     def _keys(self, stage: str, ranks: range) -> list[str]:
@@ -120,9 +159,17 @@ class AsyncCAMGraphStartup:
         self._publish(stage)
         self._wait(self._keys(stage, range(self.world_size)))
 
-    def _negotiate(self, plan: FFNGraphPlan | None, transport_signature: str) -> None:
+    def _negotiate(
+        self,
+        plan: FFNGraphPlan | None,
+        transport_signature: str,
+        hccl_buffer_size_mb: int | None = None,
+    ) -> int | None:
         assert self._store is not None
         try:
+            if transport_signature.startswith(BF16_PUSH_SIGNATURE_PREFIX):
+                hccl_buffer_size_mb = _afd_async_bf16_window_mib(hccl_buffer_size_mb)
+                transport_signature += f":window_mib={hccl_buffer_size_mb}"
             self._publish(
                 "plan",
                 json.dumps(
@@ -148,15 +195,17 @@ class AsyncCAMGraphStartup:
             self.mode = resolve_ffn_mode(plans)
             ffn_plan = plans[0]
             validate_transport = self.mode == "full" or any(
-                entry["transport"].startswith("pull_v1:") for entry in entries
+                entry["transport"].startswith(("pull_v1:", BF16_PUSH_SIGNATURE_PREFIX))
+                for entry in entries
             )
-            if (
-                validate_transport
-                and len({entry["transport"] for entry in entries}) != 1
-            ):
-                raise ValueError("Async CAM graph transport signatures differ")
+            signatures = {entry["transport"] for entry in entries}
+            if validate_transport and len(signatures) != 1:
+                raise ValueError(
+                    f"Async CAM transport signatures differ: {sorted(signatures)}"
+                )
             if self.mode == "full":
                 self.warmup_layer_id = ffn_plan.layer_ids[0]
+            return hccl_buffer_size_mb
         except Exception as exc:
             self.fail(exc)
             raise

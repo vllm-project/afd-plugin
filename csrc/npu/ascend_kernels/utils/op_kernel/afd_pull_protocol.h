@@ -1,10 +1,17 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+ * Description: Define the shared-window protocol used by Pull MegaMoE.
+ * Create: 2026-11-05
+ * Note: Attention and FFN use the same layout and status fields.
+ * History: 2026-11-05 create
+ */
+
 #ifndef AFD_PULL_PROTOCOL_H
 #define AFD_PULL_PROTOCOL_H
 
 #include "kernel_operator.h"
-#include "cam_async_comm_group.h"
+#include "afd_async_comm_group.h"
 #include "afd_pull_layout.h"
 
 namespace Cam::Pull {

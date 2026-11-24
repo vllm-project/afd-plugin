@@ -12,9 +12,9 @@ The V2 DP2 cases replace the duplicate GPU `afd-eager-2a2f`,
 baseline and AFD eager, graph, and graph+DBO on 2A1F. Qwen3.6 MoE retains
 three: baseline and AFD eager and graph on 2A1F. GDN DBO is unsupported.
 
-The single-deployment inventory contains 52 definitions: 42 CUDA cases
+The single-deployment inventory contains 54 definitions: 42 CUDA cases
 (18 DeepSeek-V2-Lite, 13 Qwen3 MoE, three Qwen3.6 MoE and eight DSV4
-Flash) and ten NPU cases (seven DeepSeek-V2-Lite and three DSV4 Flash).
+Flash) and twelve NPU cases (seven DeepSeek-V2-Lite and five DSV4 Flash).
 The CUDA counts include the DeepEP M2N and standalone FFN service entries.
 CI selects 16 unique node IDs across ready/merge and weekly gates. Definitions,
 collected nodes and device acceptance results are different counts.
@@ -63,7 +63,7 @@ adding a model or case.
 
 ## Case migration and maintenance
 
-All 48 single-deployment entries now use model-local Python Cases through
+Single-deployment entries use model-local Python Cases through
 their existing pytest node IDs. This changes the harness, not their accepted
 workloads or coverage. It does not by itself establish device qualification:
 report actual CUDA/NPU results, host integration, skips and unexecuted cases
@@ -580,6 +580,43 @@ Defaults: API ports 19280/19281, AFD rendezvous port 6455, startup timeout
 `AFD_NPU_DSV4_E2E_AFD_PORT`, and `AFD_NPU_E2E_STARTUP_TIMEOUT`.
 `AFD_NPU_E2E_VLLM_BIN` selects the executable. Build the plugin-owned 910C
 operators before running. Model and all sixteen device IDs must be supplied explicitly; missing setup fails rather than skips.
+
+## DSV4 Flash compact async CAM on Ascend 950 (local, 8 NPUs)
+
+`afd-dsv4-flash-async-cam-dp2tp2-ep4` uses the first four dies for Attention
+(DP2/TP2) and the last four for FFN (DP4/TP1/EP4). Use a DeepSeek-V4-Flash
+W4A8MXFP checkpoint and the plugin's Ascend 950 compact MTE build. Both roles
+run eager ModelRunnerV2, with Attention-side routing and no DBO or speculative
+decoding. Dispatch sends BF16 rows (`dynamicQuant=0`); the MXFP expert computes
+its own activation block scales. The A5 indexer K cache uses `fp8`.
+
+Set `HCCL_IF_IP` to the host's advertised HCCL interface address. The Attention
+DP rendezvous and the A/F connector use that address. The case sets both the
+connector's `hccl_buffer_size` and each process's `HCCL_BUFFSIZE` to 2048 MiB.
+
+```bash
+export AFD_E2E_BACKEND=npu
+export AFD_E2E_DEVICES=0,1,2,3,4,5,6,7
+export AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V4-Flash-W4A8MXFP
+export HCCL_IF_IP='<advertised-communication-ip>'
+export HCCL_SOCKET_IFNAME='<communication-interface>'
+python -m pytest -q -s \
+  'tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py::test_deepseek_v4_flash_async_cam[afd-dsv4-flash-async-cam-dp2tp2-ep4]'
+```
+
+For a diagnostic run export `AFD_CAM_OP_IO_LOG=1` to record the four
+`afd_async_*` calls. It defaults to `0`. This case requires ten overlapping
+requests to return the expected sums 19 through 28 with `finish_reason=stop`
+and strict service cleanup. Keep `run.json`, `evaluation/completions.json`, both
+roles' logs, the exact checkpoint, and the loaded wheel/OPP identities.
+
+The source branch reported 10/10 concurrent completions on four runs.
+Its diagnostic run produced 10,844 connector I/O log records (1,204 DS,
+4,824 DR, 2,408 CS and 2,408 CR). DR and CR each log inputs and outputs.
+The source NPU launcher set `VLLM_USE_V2_MODEL_RUNNER=0` and targeted
+vLLM-Ascend `f9c8e0bd`. This ModelRunnerV2 case targets vLLM
+`0.32.0@5df63a72` and vLLM-Ascend `bd42eea0`. Qualification requires
+a fresh eight-device run on the candidate build. [Source commit](https://github.com/GuangyuZhu04/afd-plugin/commit/d43535c92fdfe26334c0abb54bfa6d33e9616e34) · [Device run record](https://github.com/GuangyuZhu04/afd-plugin/issues/5)
 
 ## DSV4 Flash sync CAMP2P concurrent requests (local, 4 or 16 NPUs)
 

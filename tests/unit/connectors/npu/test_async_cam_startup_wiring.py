@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Real startup call sites with host stubs; not device execution coverage.
+# Create: 2026-10-19
+# Note: The tests observe whether invalid configurations reach group creation.
+# History: 2026-10-19 create
 """Real startup call sites with host stubs; not device execution coverage."""
 
 import json
 import sys
 import threading
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call
@@ -320,6 +325,109 @@ def test_removed_two_stream_options_are_rejected(modules, field):
         connector.AFDAsyncExtraInfo.from_mapping({field: True})
 
 
+@pytest.fixture
+def bf16_startup(modules, monkeypatch):
+    group, module, _ = modules
+    store = MemoryStore()
+    allocations = []
+
+    def rendezvous(method, rank, world_size, *, timeout):
+        return iter([(store, rank, world_size)])
+
+    def create(*args, backend_options, **kwargs):
+        allocations.append(backend_options)
+        return MagicMock(), None
+
+    monkeypatch.setattr(group, "rendezvous", rendezvous)
+    monkeypatch.setattr(group, "PrefixStore", lambda name, store: store)
+    monkeypatch.setattr(group, "_new_process_group_helper", create)
+    monkeypatch.setattr(module, "create_hccl_process_group_options", lambda mb: mb)
+
+    def connector(role, override):
+        extra = {"dynamicQuant": 0}
+        if override is not None:
+            extra["hccl_buffer_size"] = override
+        config = npu_vllm_config(
+            role=role, connector="CAMAsyncAFDConnector", extra_config=extra
+        )
+        config.model_config.dtype = "bf16"
+        owner = module.CAMAsyncAFDConnector(0, 0, config, parse_afd_config(config), 0)
+        owner.graph_startup.plan = FFNGraphPlan(signature="mxfp", layer_ids=(0,))
+        return owner
+
+    return connector, allocations, store
+
+
+@pytest.mark.parametrize(
+    "env_mb,override,expected",
+    [
+        (None, None, 408),
+        ("2048", None, 2048),
+        ("2048", 2048, 2048),
+        ("32768", 32768, 32768),
+    ],
+)
+def test_bf16_window_allocates_agreed_mib(
+    bf16_startup, monkeypatch, env_mb, override, expected
+):
+    connector, allocations, _ = bf16_startup
+    if env_mb is None:
+        monkeypatch.delenv("HCCL_BUFFSIZE", raising=False)
+    else:
+        monkeypatch.setenv("HCCL_BUFFSIZE", env_mb)
+    ranks = [connector("attention", override), connector("ffn", None)]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda rank: rank.init_afd_connector(), ranks))
+    assert allocations == [expected, expected]
+
+
+@pytest.mark.parametrize(
+    "env_mb,override",
+    [
+        ("4096", 2048),
+        ("1024", 2048),
+        (None, 2048),
+        ("0", None),
+        ("32769", None),
+        ("2_048", None),
+    ],
+)
+def test_bf16_invalid_local_window_fails_before_hccl(
+    bf16_startup, monkeypatch, env_mb, override
+):
+    connector, allocations, _ = bf16_startup
+    if env_mb is None:
+        monkeypatch.delenv("HCCL_BUFFSIZE", raising=False)
+    else:
+        monkeypatch.setenv("HCCL_BUFFSIZE", env_mb)
+    with pytest.raises(ValueError, match="HCCL_BUFFSIZE"):
+        connector("attention", override).init_afd_connector()
+    # A correctly configured peer must see the first rank's Store error.
+    monkeypatch.setenv("HCCL_BUFFSIZE", "2048")
+    with pytest.raises(RuntimeError, match="HCCL_BUFFSIZE"):
+        connector("ffn", 2048).init_afd_connector()
+    assert allocations == []
+
+
+def test_bf16_peer_window_mismatch_precedes_hccl(bf16_startup, monkeypatch):
+    connector, allocations, store = bf16_startup
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        monkeypatch.setenv("HCCL_BUFFSIZE", "1024")
+        first = pool.submit(connector("attention", None).init_afd_connector)
+        nonce = store.get("ffn_graph/nonce").decode()
+        store.get(f"ffn_graph/{nonce}/plan/0")
+        monkeypatch.setenv("HCCL_BUFFSIZE", "2048")
+        second = pool.submit(connector("ffn", None).init_afd_connector)
+        for peer in (first, second):
+            with pytest.raises(
+                (ValueError, RuntimeError), match="transport signatures"
+            ) as exc:
+                peer.result(timeout=3)
+            assert "window_mib=1024" in str(exc.value)
+            assert "window_mib=2048" in str(exc.value)
+    assert allocations == []
+
+
 @pytest.mark.parametrize("mode", ["eager", "full"])
 @pytest.mark.parametrize("role", ["attention", "ffn"])
 @pytest.mark.parametrize("tokens,tp", [(65535, 1), (65536, 1), (65536, 2), (131072, 2)])
@@ -371,9 +479,10 @@ def test_full_row_bound_precedes_hccl_creation(
     )
     connector._session = connector_module.PushCAMSession(connector.activation_dtype)
 
-    def negotiate(store, signature):
+    def negotiate(store, signature, *, hccl_buffer_size_mb):
         order.append("negotiate")
         connector.graph_startup.mode = mode
+        return hccl_buffer_size_mb
 
     monkeypatch.setattr(connector.graph_startup, "initialize", negotiate)
     monkeypatch.setattr(
@@ -412,7 +521,7 @@ def test_executor_error_reaches_store_without_retrying_transport_loader(
 
     monkeypatch.setattr(
         sys.modules["afd_plugin.compat.npu.ops"],
-        "ensure_cam_async_ops_available",
+        "ensure_afd_async_ops_available",
         unavailable_transport_ops,
     )
     module = load_host_module(monkeypatch, "afd_plugin.connectors.npu.async_cam")
@@ -710,7 +819,7 @@ def npu_worker(request, ffn_owners, monkeypatch):
             raise RuntimeError("transport operators unavailable")
 
     worker._init_device = initialize_device
-    monkeypatch.setattr(module, "ensure_cam_async_ops_available", load_ops)
+    monkeypatch.setattr(module, "ensure_afd_async_ops_available", load_ops)
     monkeypatch.setattr(
         module, "init_workspace_manager", lambda *args: events.append("workspace")
     )
@@ -752,7 +861,7 @@ def test_worker_rejects_deployment_before_device_initialization(
 def test_worker_prepares_role_config_and_dbo_before_native_device(npu_worker):
     worker = npu_worker.worker
     worker.init_device()
-    assert npu_worker.events == ["device", "ops", "workspace", "runner"]
+    assert npu_worker.events == ["ops", "device", "workspace", "runner"]
     assert worker.model_config is worker.vllm_config.model_config
     assert worker.model_config.hf_config.architectures == ["AFDDeepseekV4ForCausalLM"]
     parallel = worker.vllm_config.parallel_config
@@ -779,11 +888,11 @@ def test_dspark_transport_dimensions_fail_before_device(npu_worker):
     assert npu_worker.events == []
 
 
-def test_missing_transport_operators_fail_before_workspace_or_runner(npu_worker):
+def test_missing_transport_operators_fail_before_native_device_and_hccl(npu_worker):
     npu_worker.fail_ops = True
     with pytest.raises(RuntimeError, match="transport operators unavailable"):
         npu_worker.worker.init_device()
-    assert npu_worker.events == ["device", "ops"]
+    assert npu_worker.events == ["ops"]
 
 
 @pytest.mark.parametrize("npu_worker", ["ffn"], indirect=True)
@@ -791,7 +900,7 @@ def test_ffn_device_capability_fails_before_workspace_or_runner(npu_worker):
     npu_worker.module.get_ascend_device_type.return_value = object()
     with pytest.raises(ValueError, match="requires Ascend 910C/A3"):
         npu_worker.worker.init_device()
-    assert npu_worker.events == ["device"]
+    assert npu_worker.events == []
 
 
 @pytest.fixture

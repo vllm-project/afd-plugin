@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Validation for AFD features supported by the Ascend runtime.
+# Create: 2026-07-09
+# Note: Both roles use the Attention TP width when checking A5 source-row capacity.
+# History: 2026-07-09 create
 """Validation for AFD features supported by the Ascend runtime."""
 
 from __future__ import annotations
@@ -12,7 +16,7 @@ from afd_plugin.config import (
     AFDConfig,
     parse_afd_config,
 )
-from afd_plugin.validation import cam_receive_capacity
+from afd_plugin.validation import CAM_MAX_SOURCE_ROWS, cam_receive_capacity
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -30,9 +34,7 @@ def fail_if_unsupported_npu_afd_features(
     afd_config = afd_config or parse_afd_config(vllm_config)
     is_dsv4 = _is_dsv4_target(vllm_config)
     if afd_config.connector == AFD_ASYNC_CONNECTOR and not is_dsv4:
-        raise RuntimeError(
-            "Async CAM requires DeepSeek V4 with layered W4A8/W8A8 FFN experts"
-        )
+        raise RuntimeError("Async CAM requires DeepSeek V4 routed experts")
     from afd_plugin.connectors.factory import AFDConnectorFactory
 
     extra_info = AFDConnectorFactory.parse_connector_extra_info(
@@ -149,6 +151,8 @@ def _fail_if_unsupported_npu_afd_async_features(
     afd_config: AFDConfig,
     extra_info: ConnectorExtraInfo,
 ) -> None:
+    from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
     from afd_plugin.connectors.npu.async_cam import (
         ATTN_RANKS_PER_DP_CONFIG_KEY,
         AFDAsyncExtraInfo,
@@ -167,6 +171,47 @@ def _fail_if_unsupported_npu_afd_async_features(
 
     parallel_config = vllm_config.parallel_config
     speculative_config = vllm_config.speculative_config
+    max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+    if get_ascend_device_type() == AscendDeviceType.A5:
+        import torch
+
+        architectures = vllm_config.model_config.hf_config.architectures
+        if architectures not in (
+            ["DeepseekV4ForCausalLM"],
+            ["AFDDeepseekV4ForCausalLM"],
+        ):
+            raise RuntimeError("Ascend 950 Async CAM requires DeepseekV4ForCausalLM")
+        if afd_config.is_ffn_server and parallel_config.tensor_parallel_size != 1:
+            raise RuntimeError(
+                "Ascend 950 Async CAM requires F TP=1 with static expert parallelism"
+            )
+        if max_num_batched_tokens > CAM_MAX_SOURCE_ROWS * extra_info.attn_ranks_per_dp:
+            raise RuntimeError(
+                f"Ascend 950 Async CAM supports at most {CAM_MAX_SOURCE_ROWS} "
+                f"source rows per Attention rank (max_num_batched_tokens="
+                f"{max_num_batched_tokens}, TP={extra_info.attn_ranks_per_dp})"
+            )
+        if (
+            extra_info.dynamic_quant != 0
+            or vllm_config.model_config.dtype != torch.bfloat16
+        ):
+            raise RuntimeError("Ascend 950 Async CAM requires BF16 and dynamicQuant=0")
+        if extra_info.ffn_mega_moe or speculative_config is not None:
+            raise RuntimeError(
+                "Ascend 950 Async CAM requires Push without draft models"
+            )
+        if (
+            not vllm_config.model_config.enforce_eager
+            or parallel_config.enable_dbo
+            or parallel_config.use_ubatching
+        ):
+            raise RuntimeError(
+                "Ascend 950 Async CAM requires eager execution without DBO or ubatching"
+            )
+    elif extra_info.dynamic_quant != 1:
+        raise RuntimeError(
+            "DSV4 Flash-INT8 CAMAsyncAFDConnector requires dynamicQuant=1"
+        )
     if speculative_config is not None:
         if speculative_config.method == "dspark":
             if vllm_config.model_config.hf_text_config.model_type != "deepseek_v4":
@@ -202,7 +247,6 @@ def _fail_if_unsupported_npu_afd_async_features(
             )
 
     receive_capacity = cam_receive_capacity()
-    max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
     if speculative_config is not None and speculative_config.method == "dspark":
         draft_hf = speculative_config.draft_model_config.hf_config
         query_rows_per_request = speculative_config.num_speculative_tokens + (
@@ -241,10 +285,6 @@ def _fail_if_unsupported_npu_afd_async_features(
                 "AFD NPU ModelRunnerV2 Async CAM does not support finegrained TP "
                 "or shared-expert DP",
             )
-    if extra_info.dynamic_quant != 1:
-        raise RuntimeError(
-            "DSV4 Flash-INT8 CAMAsyncAFDConnector requires dynamicQuant=1",
-        )
     if (
         afd_config.is_attention_server
         and parallel_config.tensor_parallel_size != extra_info.attn_ranks_per_dp

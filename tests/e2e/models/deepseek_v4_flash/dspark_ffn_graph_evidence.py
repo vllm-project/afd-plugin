@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Collect DeepSeek draft-model FFN graph observations.
+# Create: 2026-11-04
+# Note: Graph observations associate the received descriptor with its model layer.
+# History: 2026-11-04 create
 """Functional-only DSpark graph observations, one replay per completion fence.
 
 The production runtime submits bounded groups of transactions. This extension
@@ -17,8 +21,8 @@ from pathlib import Path
 
 import torch
 
+from afd_plugin.connectors.npu.async_cam_runtime import AFD_ASYNC_LAYER_INDEX
 from afd_plugin.connectors.npu.async_cam_runtime.async_cam_layered import (
-    CAM_LAYER_INDEX,
     AsyncCAMLayeredExecutor,
 )
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
@@ -45,7 +49,7 @@ class GraphComparison:
         payload = runner._graph_payload
         state = payload.context.states
         header = state.token_nums_rankid_layeridx.cpu()
-        wire = int(header[CAM_LAYER_INDEX])
+        wire = int(header[AFD_ASYNC_LAYER_INDEX])
         counters = runner.connector.__dict__.setdefault("_dspark_returns", {})
         counters[str(wire)] = counters.get(str(wire), 0) + 1
         if wire in self.records or not (self.directory / "enable").exists():

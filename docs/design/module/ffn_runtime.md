@@ -16,6 +16,7 @@ primary_code_paths:
   - "afd_plugin/v1/worker/npu/ffn_worker.py"
 related_code_paths:
   - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_layered.py"
+  - "afd_plugin/connectors/npu/async_cam_runtime/afd_async_mxfp.py"
   - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_mega.py"
   - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_startup.py"
   - "afd_plugin/connectors/npu/async_cam_runtime/async_cam_session.py"
@@ -32,9 +33,10 @@ validation_paths:
   - "tests/unit/ffn_faas/test_*.py"
   - "tests/gpu/test_ffn_faas_gpu.py"
   - "tests/unit/connectors/npu/async_cam_runtime/test_async_cam_layered.py"
+  - "tests/unit/connectors/npu/async_cam_runtime/test_afd_async_mxfp.py"
   - "tests/unit/v1/worker/test_async_ffn_runtime.py"
   - "tests/unit/v1/worker/test_async_ffn_graph.py"
-  - "tests/npu/test_async_cam_layered_w8a8.py"
+  - "tests/npu/test_afd_async_layered_w8a8.py"
   - "tests/unit/v1/worker/test_ffn_metadata.py"
   - "tests/unit/v1/worker/test_ffn_model_runner.py"
   - "tests/unit/v1/worker/test_ffn_routed_experts_model_runner.py"
@@ -357,8 +359,10 @@ loop. For each layer, the runner:
 
 1. receives a capacity-sized payload and its original CAM metadata through
    `connector.recv_attn_output()`;
-2. passes activations, dynamic scales, expert counts and the device layer ID
-   to `AsyncCAMLayeredExecutor`;
+2. on A3, passes activations, dynamic scales, expert counts and the device
+   layer ID to `AsyncCAMLayeredExecutor`. On A5, the eager MXFP4 executor
+   selects the received layer, processes the BF16 rows counted for this
+   chunk and lets the native expert method derive its MX block scales;
 3. returns the routed output and original context with
    `connector.send_ffn_output()`.
 

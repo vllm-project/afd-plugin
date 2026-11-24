@@ -1,14 +1,14 @@
 /*
  * SPDX-License-Identifier: MIT
  * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * Description: HCCL communication group resource layout
+ * Description: Define the HCCL communication group resource layout.
  * Create: 2025-07-19
- * Note: This file might be replaced! We will try to use the file from cann-toolkit in env when compiling.
+ * Note: The structure layout must match the CANN toolkit communication ABI.
  * History: 2025-07-19 create moe distribute base header file
  */
 
-#ifndef AFD_CAM_ASYNC_COMM_GROUP_H
-#define AFD_CAM_ASYNC_COMM_GROUP_H
+#ifndef AFD_ASYNC_COMM_GROUP_H
+#define AFD_ASYNC_COMM_GROUP_H
 
 constexpr uint32_t LOCAL_NOTIFY_MAX_NUM = 64;
 constexpr uint32_t LOCAL_STREAM_MAX_NUM = 19;
@@ -172,4 +172,4 @@ struct HcclOpResParam {
     bool utraceStatusFlag;
 };
 
-#endif  // AFD_CAM_ASYNC_COMM_GROUP_H
+#endif  // AFD_ASYNC_COMM_GROUP_H

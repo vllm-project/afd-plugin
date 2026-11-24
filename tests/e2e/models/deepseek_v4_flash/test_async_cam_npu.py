@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Local 16-NPU DSV4 Flash async CAM concurrent-request acceptance case."""
+# Description: Device-backed DSV4 Flash async CAM concurrent-request acceptance cases.
+# Create: 2026-09-18
+# Note: The pytest entry point selects devices and the advertised HCCL interface.
+# History: 2026-09-18 create
+"""Device-backed DSV4 Flash async CAM concurrent-request acceptance cases."""
 
 from __future__ import annotations
 
@@ -15,8 +19,7 @@ from tests.e2e.models.deepseek_v4_flash.cases import NPU_ASYNC_IDS
 from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_ASYNC_CAM_MEGA_SCENARIO,
     DSV4_ASYNC_CAM_SCENARIO,
-    DSV4_ATTENTION_RANKS,
-    DSV4_FFN_RANKS,
+    DSV4_ASYNC_SHAPES,
 )
 
 
@@ -25,7 +28,8 @@ def build_runner_command(
 ) -> list[str]:
     if required_env("AFD_E2E_BACKEND") != "npu":
         raise RuntimeError("DSV4 async CAM E2E requires AFD_E2E_BACKEND=npu")
-    devices_from_env("AFD_E2E_DEVICES", DSV4_ATTENTION_RANKS + DSV4_FFN_RANKS)
+    shape = DSV4_ASYNC_SHAPES[scenario]
+    devices_from_env("AFD_E2E_DEVICES", shape.attention_ranks + shape.ffn_ranks)
     command = model_case_command(
         "tests.e2e.models.deepseek_v4_flash.cases",
         scenario,
@@ -54,9 +58,10 @@ def build_environment(scenario: str = DSV4_ASYNC_CAM_SCENARIO) -> dict[str, str]
     env.update(
         {
             "VLLM_USE_V1": "1",
+            "VLLM_USE_V2_MODEL_RUNNER": "1",
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
             "AFD_FORCE_SPAWN_MULTIPROCESSING": "1",
-            "HCCL_BUFFSIZE": "4096",
+            "HCCL_BUFFSIZE": str(DSV4_ASYNC_SHAPES[scenario].hccl_buffer_size or 4096),
             "HCCL_OP_EXPANSION_MODE": "AIV",
             "HCCL_CONNECT_TIMEOUT": "1200",
             "HCCL_EXEC_TIMEOUT": "2000",
@@ -67,7 +72,7 @@ def build_environment(scenario: str = DSV4_ASYNC_CAM_SCENARIO) -> dict[str, str]
             "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
             "TASK_QUEUE_ENABLE": "1",
             "AFD_FORCE_BALANCED_TOPK_IDS": "0",
-            "AFD_CAM_OP_IO_LOG": "0",
+            "AFD_CAM_OP_IO_LOG": os.environ.get("AFD_CAM_OP_IO_LOG", "0"),
             "AFD_ASYNC_MOE_LAYOUT_LOG": "0",
             "GLOO_SOCKET_IFNAME": interface,
             "TP_SOCKET_IFNAME": interface,

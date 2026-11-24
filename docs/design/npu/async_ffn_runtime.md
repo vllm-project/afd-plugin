@@ -9,7 +9,13 @@ and receive-safe resource release independently of the synchronous CAMP2P
 
 ## Selection and startup
 
-The target is the pinned vLLM 0.32 / vLLM-Ascend stack on A3/910C, with
+On A5/950 the compact eager path accepts BF16 dispatch (`dynamicQuant=0`)
+and static DeepSeek-V4-Flash W4A8MXFP experts. It uses the compact batch
+descriptor and per-expert counts to choose the layer and valid rows. The
+original descriptor accompanies the combine, including for empty chunks.
+The device qualification target is the [eight-NPU case](../../../tests/e2e/README.md#dsv4-flash-compact-async-cam-on-ascend-950-local-8-npus).
+
+The layered target is the pinned vLLM 0.32 / vLLM-Ascend stack on A3/910C, with
 homogeneous DeepSeek-V4 W4A8 or W8A8 layers, dynamicQuant=1, static expert placement,
 F TP=1 and Attention-side gating. Both roles select
 `VLLM_USE_V2_MODEL_RUNNER=1`. Attention normally keeps `--enforce-eager`; the

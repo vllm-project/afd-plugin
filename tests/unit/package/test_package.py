@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: The plugin entry point registers lazy AFD aliases without replacing
+#              vLLM.
+# Create: 2026-05-15
+# Note: Tests use the general-plugin entry point and the model registry.
+# History: 2026-05-15 create
 """The plugin entry point registers lazy AFD aliases without replacing vLLM."""
 
 from __future__ import annotations
 
 import importlib.metadata
 import importlib.util
+import os
 import sys
 from collections.abc import Callable
 from importlib.machinery import ModuleSpec
@@ -14,6 +20,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 import afd_plugin
+from afd_plugin.compat.npu import ops
 
 
 def test_models_metadata_compat_export(monkeypatch):
@@ -27,8 +34,16 @@ def test_models_metadata_compat_export(monkeypatch):
     assert models.get_afd_metadata_from_forward_context is metadata_reader
 
 
-@pytest.fixture(params=["cuda", "npu"])
+@pytest.fixture(
+    params=[
+        pytest.param(("cuda", False), id="cuda-without-torch-npu"),
+        pytest.param(("cuda", True), id="cuda-with-torch-npu"),
+        pytest.param(("npu", False), id="npu-without-torch-npu"),
+        pytest.param(("npu", True), id="npu-with-torch-npu"),
+    ],
+)
 def registration(monkeypatch, request):
+    device, has_torch_npu = request.param
     native = {
         name: object()
         for name in (
@@ -49,9 +64,7 @@ def registration(monkeypatch, request):
         str, dict[str, ModuleSpec | list[str] | SimpleNamespace | Callable[..., None]]
     ] = {
         "vllm": {"__spec__": ModuleSpec("vllm", loader=None), "__path__": []},
-        "vllm.platforms": {
-            "current_platform": SimpleNamespace(device_type=request.param)
-        },
+        "vllm.platforms": {"current_platform": SimpleNamespace(device_type=device)},
         "vllm.model_executor": {"__path__": []},
         "vllm.model_executor.models": {
             "ModelRegistry": SimpleNamespace(register_model=register_model)
@@ -76,16 +89,11 @@ def registration(monkeypatch, request):
         module = ModuleType(name)
         vars(module).update(attributes)
         monkeypatch.setitem(sys.modules, name, module)
-    find_spec = importlib.util.find_spec
-    monkeypatch.setattr(
-        importlib.util,
-        "find_spec",
-        lambda name, *args, **kw: (
-            (ModuleSpec(name, loader=None) if request.param == "npu" else None)
-            if name == "torch_npu"
-            else find_spec(name, *args, **kw)
-        ),
-    )
+    torch_npu = None
+    if has_torch_npu:
+        torch_npu = ModuleType("torch_npu")
+        torch_npu.__spec__ = ModuleSpec("torch_npu", loader=None)
+    monkeypatch.setitem(sys.modules, "torch_npu", torch_npu)
     monkeypatch.delenv("AFD_FORCE_SPAWN_MULTIPROCESSING", raising=False)
     # A fresh module isolates registration state from test order without
     # asserting or changing the real package's private registration flag.
@@ -96,7 +104,7 @@ def registration(monkeypatch, request):
     plugin = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(plugin)
     return SimpleNamespace(
-        plugin=plugin, models=models, native=native, sent=sent, device=request.param
+        plugin=plugin, models=models, native=native, sent=sent, device=device
     )
 
 
@@ -135,6 +143,37 @@ def test_register_afd_preserves_native_models_and_is_idempotent(registration):
     # ModelRegistry is the external registration seam; compare requests without
     # requiring the implementation's iteration order.
     assert sorted(registration.sent) == sorted(expected.items())
+
+
+@pytest.mark.parametrize("registration", [("npu", True)], indirect=True)
+def test_register_publishes_a5_vendor_before_runtime_setup(
+    registration, monkeypatch, tmp_path
+):
+    library = tmp_path / "op_api/lib/libafd_cust_opapi.so"
+    library.parent.mkdir(parents=True)
+    library.touch()
+    monkeypatch.setattr(ops, "get_afd_cann_vendor_path", lambda: tmp_path)
+    monkeypatch.delenv("AFD_CUST_OPAPI_LIB_PATH", raising=False)
+    monkeypatch.setenv("ASCEND_CUSTOM_OPP_PATH", "/native/vendor")
+    observed = []
+
+    def check_version(*, strict):
+        observed.append(
+            (
+                os.environ.get("AFD_CUST_OPAPI_LIB_PATH"),
+                os.environ["ASCEND_CUSTOM_OPP_PATH"],
+            )
+        )
+
+    monkeypatch.setattr(
+        sys.modules["afd_plugin.compat.vllm"],
+        "assert_vllm_version_supported",
+        check_version,
+    )
+    registration.plugin.register_afd()
+    assert observed == [
+        (str(library), os.pathsep.join(("/native/vendor", str(tmp_path))))
+    ]
 
 
 def test_entry_point_is_registered():

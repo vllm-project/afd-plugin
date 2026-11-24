@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Launch model E2E cases and collect their results.
+# Create: 2026-05-16
+# Note: The runner records commands, acceptance results and cleanup for each
+#       deployment.
+# History: 2026-05-16 create
 """Execute model-declared Cases and retain the existing NPU CLI callers."""
 
 from __future__ import annotations
@@ -46,7 +51,7 @@ from tests.e2e.checks.mrv2 import (
     assert_execution_evidence,
     probe_extension,
 )
-from tests.e2e.environment import parse_case_environment
+from tests.e2e.environment import parse_case_environment, vllm_plugin_allowlist
 from tests.e2e.models.deepseek_v4_flash import config as dsv4_config
 from tests.e2e.models.deepseek_v4_flash.completions import evaluate_completions
 from tests.e2e.models.deepseek_v4_flash.config import (
@@ -1016,10 +1021,9 @@ def build_env(
             env.pop("AFD_E2E_NATIVE_BASELINE", None)
         if mrv2_evidence_start is not None:
             env["AFD_E2E_MRV2_EVIDENCE_START"] = str(mrv2_evidence_start)
-    if args.baseline:
-        env["VLLM_PLUGINS"] = "ascend" if args.device_backend == "npu" else ""
-    else:
-        env["VLLM_PLUGINS"] = "ascend,afd" if args.device_backend == "npu" else "afd"
+    env["VLLM_PLUGINS"] = vllm_plugin_allowlist(
+        args.device_backend, baseline=args.baseline
+    )
     if args.enable_dbo:
         env["VLLM_LOGGING_LEVEL"] = "DEBUG"
     env["PYTHONUNBUFFERED"] = "1"

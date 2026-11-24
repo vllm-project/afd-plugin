@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: DeepSeek V4 AFD model wrapper for the Ascend native implementation.
+# Create: 2026-09-04
+# Note: The role-specific model wrappers split Attention-side routing from remote
+#       expert execution.
+# History: 2026-09-04 create
 """DeepSeek V4 AFD model wrapper for the Ascend native implementation.
 
 The Ascend DSV4 implementation is not a DeepSeek V2 layer with different
@@ -865,6 +870,15 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         self,
     ) -> "tuple[list[QuantizedExpertWeights], str]":
         return _extract_quantized_expert_weights(self.model.layers)
+
+    def get_mxfp_expert_layers(self) -> dict[int, native.DeepseekV4MoE]:
+        """Return the native expert MLPs loaded by this FFN rank."""
+        return {
+            layer.layer_idx: layer.mlp
+            for layer in self.model.layers
+            if isinstance(layer, AFDDeepseekV4DecoderLayer)
+            and isinstance(layer.mlp, native.DeepseekV4MoE)
+        }
 
     def compute_ffn_output(
         self,

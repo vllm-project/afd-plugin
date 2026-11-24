@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: DSV4 single-deployment declarations, separate from dedicated/multi-pod
+#              runs.
+# Create: 2026-11-13
+# Note: Each case declares its topology and acceptance checks.
+# History: 2026-11-13 create
 """DSV4 single-deployment declarations, separate from dedicated/multi-pod runs.
 
 Importing IDs is safe. Checkpoint quantization is resolved only by build_case
@@ -11,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from ipaddress import ip_address
 
 from tests.e2e.case import (
     CLEANUP_PROFILE_NPU_ASYNC_CAM_LEGACY,
@@ -38,10 +44,7 @@ from tests.e2e.models.deepseek_v4_flash.completions import CompletionTask
 
 GPU_BASIC_IDS = gpu_config.DSV4_GPU_BASIC_SCENARIOS
 GPU_DBO_IDS = gpu_config.DSV4_GPU_DBO_SCENARIOS
-NPU_ASYNC_IDS = (
-    config.DSV4_ASYNC_CAM_SCENARIO,
-    config.DSV4_ASYNC_CAM_MEGA_SCENARIO,
-)
+NPU_ASYNC_IDS = tuple(config.DSV4_ASYNC_SHAPES)
 NPU_SYNC_IDS = config.DSV4_SYNC_CAMP2P_SCENARIOS
 GSM8K_SAMPLES = 7
 GSM8K_THRESHOLD = 0.27
@@ -177,23 +180,34 @@ def _npu_case(case_id: str, environment: CaseEnvironment) -> Case:
     max_num_batched_tokens = _budget(args.common_vllm_arg, "--max-num-batched-tokens")
     graph = shape is not None and config.sync_use_graph(shape)
     execution = EXECUTION_FULL_DECODE_GRAPH if graph else EXECUTION_EAGER
-    attention_ranks = (
-        config.DSV4_ATTENTION_RANKS if shape is None else shape.attention_ranks
+    topology: config.DSV4AsyncShape | config.DSV4SyncShape = (
+        config.DSV4_ASYNC_SHAPES[case_id] if shape is None else shape
     )
-    ffn_ranks = config.DSV4_FFN_RANKS if shape is None else shape.ffn_ranks
-    attention_tp = (
-        config.DSV4_ATTENTION_TP_SIZE if shape is None else shape.attention_tp_size
-    )
+    attention_ranks = topology.attention_ranks
+    ffn_ranks = topology.ffn_ranks
+    attention_tp = topology.attention_tp_size
     ffn_tp = 1 if shape is None else shape.ffn_tp_size
-    if asynchronous:
-        # The existing async path enables native DBO only on Attention, using
-        # upstream defaults; it does not claim a DBO execution acceptance check.
+    attention_dbo = "--enable-dbo" in args.attention_vllm_arg
+    if attention_dbo:
+        # The deployment owns the DBO flag. Its A3 profile uses native thresholds.
         args.attention_vllm_arg.remove("--enable-dbo")
     connector_extra_config = (
         json.loads(args.afd_connector_extra_config[0])
         if args.afd_connector_extra_config
         else {}
     )
+    worker_environment: tuple[tuple[str, str], ...] = ()
+    if case_id == config.DSV4_ASYNC_CAM_A5_SCENARIO:
+        address = ip_address(environment.afd_host)
+        if address.is_loopback or address.is_unspecified or address.is_multicast:
+            raise ValueError(
+                "A5 async CAM requires --afd-host to advertise the HCCL interface IP"
+            )
+        # Direct case invocations must give host tiling the same window as HCCL.
+        worker_environment = (
+            ("HCCL_BUFFSIZE", str(connector_extra_config["hccl_buffer_size"])),
+            ("HCCL_IF_IP", environment.afd_host),
+        )
     checks: tuple[Mrv2Check | PullMegaCheck, ...] = ()
     if mega:
         connector_extra_config["ffn_mega_moe"] = True
@@ -211,7 +225,7 @@ def _npu_case(case_id: str, environment: CaseEnvironment) -> Case:
                 attention_ranks // attention_tp,
                 attention_tp,
                 execution,
-                dbo=DboConfig() if asynchronous else None,
+                dbo=DboConfig() if attention_dbo else None,
                 vllm_args=tuple(args.attention_vllm_arg),
                 additional_config=tuple(
                     config.additional_config(
@@ -233,7 +247,7 @@ def _npu_case(case_id: str, environment: CaseEnvironment) -> Case:
             connector_extra_config=tuple(connector_extra_config.items()),
             pin_attention_address=args.attention_data_parallel_address is not None,
             cleanup_profile=CLEANUP_PROFILE_NPU_ASYNC_CAM_LEGACY
-            if asynchronous and not mega
+            if case_id == config.DSV4_ASYNC_CAM_SCENARIO
             else CLEANUP_PROFILE_STRICT,
             shutdown_timeout_s=NPU_ASYNC_VLLM_SHUTDOWN_TIMEOUT_S
             if asynchronous
@@ -257,6 +271,7 @@ def _npu_case(case_id: str, environment: CaseEnvironment) -> Case:
             max_num_batched_tokens=max_num_batched_tokens,
         ),
         common_vllm_args=tuple(args.common_vllm_arg),
+        worker_environment=worker_environment,
         phases=(
             Phase(
                 "evaluation",

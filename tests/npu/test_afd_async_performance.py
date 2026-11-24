@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: CPU checks for benchmark metric definitions and readiness sequencing.
+# Create: 2026-09-22
+# Note: CPU tests verify timing boundaries and the report's aggregation rules.
+# History: 2026-09-22 create
 """CPU checks for benchmark metric definitions and readiness sequencing."""
 
 from __future__ import annotations
@@ -11,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from tests.npu.async_cam_performance import FocusSchedule, selected_ops, summarize
+from tests.npu.afd_async_performance import FocusSchedule, selected_ops, summarize
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
@@ -31,7 +35,7 @@ class BenchmarkContractTests(unittest.TestCase):
         self.assertEqual(selected_ops("recv"), ("dispatch_recv", "combine_recv"))
         self.assertEqual(len(selected_ops("cycle")), 4)
 
-    @patch("tests.npu.async_cam_performance.time.sleep")
+    @patch("tests.npu.afd_async_performance.time.sleep")
     def test_sender_publishes_readiness_without_waiting_for_receive(self, sleep):
         store = Mock()
         schedule = FocusSchedule(store, "recv", 1, 2, 2, 50, 200, 20)
@@ -40,7 +44,7 @@ class BenchmarkContractTests(unittest.TestCase):
         store.wait.assert_not_called()
         sleep.assert_called_once_with(0.05)
 
-    @patch("tests.npu.async_cam_performance.time.sleep")
+    @patch("tests.npu.afd_async_performance.time.sleep")
     def test_receiver_waits_for_all_senders_only_before_first_chunk(self, sleep):
         store = Mock()
         schedule = FocusSchedule(store, "recv", 3, 2, 2, 50, 200, 20)
@@ -49,7 +53,7 @@ class BenchmarkContractTests(unittest.TestCase):
         store.wait.assert_called_once_with(["dispatch/send/0", "dispatch/send/1"])
         sleep.assert_called_once_with(0.2)
 
-    @patch("tests.npu.async_cam_performance.time.sleep")
+    @patch("tests.npu.afd_async_performance.time.sleep")
     def test_combine_sender_uses_attention_receivers_and_moe_local_index(self, sleep):
         store = Mock()
         schedule = FocusSchedule(store, "send", 3, 2, 2, 50, 200, 20)
@@ -57,7 +61,7 @@ class BenchmarkContractTests(unittest.TestCase):
         store.wait.assert_called_once_with(["combine/recv/0", "combine/recv/1"])
         sleep.assert_called_once_with(0.07)
 
-    @patch("tests.npu.async_cam_performance.time.sleep")
+    @patch("tests.npu.afd_async_performance.time.sleep")
     def test_cycle_adds_no_artificial_delay_or_store_traffic(self, sleep):
         store = Mock()
         schedule = FocusSchedule(store, "cycle", 0, 2, 2, 50, 200, 20)
@@ -71,7 +75,7 @@ class BenchmarkContractTests(unittest.TestCase):
             [
                 sys.executable,
                 "-S",
-                "tests/npu/async_cam_performance.py",
+                "tests/npu/afd_async_performance.py",
                 "--dry-run",
                 "--measure-mode",
                 "both",
@@ -98,7 +102,7 @@ class BenchmarkContractTests(unittest.TestCase):
                     [
                         sys.executable,
                         "-S",
-                        "tests/npu/async_cam_performance.py",
+                        "tests/npu/afd_async_performance.py",
                         "--dry-run",
                         *arguments,
                     ],

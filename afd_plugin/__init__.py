@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: vLLM AFD plugin: Attention-FFN Disaggregation support.
+# Create: 2026-05-15
+# Note: Plugin registration installs the AFD model aliases.
+# History: 2026-05-15 create
 """vLLM AFD plugin: Attention-FFN Disaggregation support."""
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, cast
 
+from afd_plugin.compat.npu.ops import prepare_afd_ascend950_vendor
 from afd_plugin.config import AFDConfig, parse_afd_config, parse_optional_afd_config
 
 
@@ -88,10 +93,9 @@ def _force_spawn_multiprocessing_if_requested() -> None:
         multiprocessing_module._afd_spawn_context_redirect = True
 
 
-# vLLM model workers import the configured worker class directly in spawned
-# child interpreters; they do not invoke the general-plugin entry point below.
-# Apply the opt-in setting at package import time so it is also in effect before
-# Ascend TE Fusion initializes its compilation workers.
+# vLLM 0.32 loads general plugins in its worker wrapper. Apply the opt-in
+# setting on package import as well so processes importing AFD directly set
+# the multiprocessing context before Ascend TE Fusion starts its workers.
 _force_spawn_multiprocessing_if_requested()
 
 _DEEPSEEK_MODEL_REGISTRATIONS = {
@@ -108,9 +112,7 @@ _DEEPSEEK_MODEL_REGISTRATIONS = {
         "afd_plugin.model_executor.models.deepseek_v2:AFDDeepseekV3ForCausalLM"
     ),
     "DeepseekV4ForCausalLM": (
-        "afd_plugin.model_executor.models.npu.deepseek_v4:AFDDeepseekV4ForCausalLM"
-        if importlib.util.find_spec("torch_npu") is not None
-        else "afd_plugin.model_executor.models.deepseek_v4:AFDDeepseekV4ForCausalLM"
+        "afd_plugin.model_executor.models.deepseek_v4:AFDDeepseekV4ForCausalLM"
     ),
     "DSparkDraftModel": (
         "afd_plugin.model_executor.models.npu.deepseek_v4_dspark:"
@@ -167,6 +169,10 @@ def register_afd() -> None:
         _registered = True
         return
 
+    # CANN can resolve native operators during platform initialization. Make
+    # the private A5 vendor visible before any of the runtime patch imports.
+    prepare_afd_ascend950_vendor()
+
     try:
         from afd_plugin.compat.vllm import assert_vllm_version_supported
 
@@ -209,7 +215,8 @@ def register_afd() -> None:
     # so direct scheduler calls and already imported aliases accept AFD settings.
     from vllm.platforms import current_platform
 
-    if current_platform.device_type == "npu":
+    is_npu = current_platform.device_type == "npu"
+    if is_npu:
         from afd_plugin.compat.patches.npu.ascend_config import (
             apply_afd_ascend_config_patch,
         )
@@ -219,6 +226,11 @@ def register_afd() -> None:
     from vllm.model_executor.models import ModelRegistry
 
     for model_arch, model_cls in _MODEL_REGISTRATIONS.items():
+        if is_npu and model_arch == "DeepseekV4ForCausalLM":
+            model_cls = (
+                "afd_plugin.model_executor.models.npu.deepseek_v4:"
+                "AFDDeepseekV4ForCausalLM"
+            )
         ModelRegistry.register_model(f"AFD{model_arch}", model_cls)
 
     _registered = True

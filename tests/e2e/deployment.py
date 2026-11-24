@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Case deployment: protocol order, role commands, readiness and owned
+#              cleanup.
+# Create: 2026-11-13
+# Note: The deployment owns startup ordering, readiness checks and service cleanup.
+# History: 2026-11-13 create
 """Case deployment: protocol order, role commands, readiness and owned cleanup."""
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from tests.e2e.case import (
     Deployment,
     JsonValue,
 )
+from tests.e2e.environment import vllm_plugin_allowlist
 from tests.e2e.multi_pod.layout import RoleSlot
 from tests.e2e.process_utils import (
     kill_processes_matching_environment,
@@ -554,10 +560,8 @@ class ServiceDeployment:
         process_env[
             "ASCEND_RT_VISIBLE_DEVICES" if backend == "npu" else "CUDA_VISIBLE_DEVICES"
         ] = visible
-        process_env["VLLM_PLUGINS"] = (
-            ("ascend" if backend == "npu" else "")
-            if resolved.case.deployment.is_baseline
-            else ("ascend,afd" if backend == "npu" else "afd")
+        process_env["VLLM_PLUGINS"] = vllm_plugin_allowlist(
+            backend, baseline=resolved.case.deployment.is_baseline
         )
         if backend == "npu" and resolved.case.deployment.prefill is not None:
             if role == "prefill":

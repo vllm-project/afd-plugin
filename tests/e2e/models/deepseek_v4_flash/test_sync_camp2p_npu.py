@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Local NPU DSV4 Flash cases over the synchronous CAMP2P boundary.
+# Create: 2026-10-08
+# Note: Each host profile supplies its own device count and indexer cache dtype.
+# History: 2026-10-08 create
 """Local NPU DSV4 Flash cases over the synchronous CAMP2P boundary.
 
 DeepSeek V4 does not fit on a single Attention or FFN die, so each host runs
@@ -21,8 +25,8 @@ import pytest
 from tests.conftest import run_case_entry
 from tests.e2e.environment import devices_from_env, model_case_command, required_env
 from tests.e2e.models.deepseek_v4_flash.config import (
+    DSV4_HCCL_BUFFER_SIZE_MB,
     DSV4_SYNC_CAMP2P_SCENARIOS,
-    DSV4_SYNC_HCCL_BUFFER_SIZE_MB,
     DSV4_SYNC_LOCAL_AFD_HOST,
     DSV4_SYNC_SHAPES,
     DSV4SyncShape,
@@ -84,7 +88,7 @@ def build_environment(scenario: str) -> dict[str, str]:
     else:
         interface = os.environ.get("HCCL_SOCKET_IFNAME", "")
     if shape.keep_hccl_buffsize:
-        env.setdefault("HCCL_BUFFSIZE", str(DSV4_SYNC_HCCL_BUFFER_SIZE_MB))
+        env.setdefault("HCCL_BUFFSIZE", str(DSV4_HCCL_BUFFER_SIZE_MB))
     else:
         env.pop("HCCL_BUFFSIZE", None)
     if shape.force_spawn:

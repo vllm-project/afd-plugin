@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: NPU AFD feature validation rejects unsupported combinations before
+#              execution.
+# Create: 2026-10-19
+# Note: Cases exercise the worker admission rules for both NPU roles.
+# History: 2026-10-19 create
 """NPU AFD feature validation rejects unsupported combinations before execution."""
 
 from __future__ import annotations
 
+import sys
 from contextlib import nullcontext
 from importlib import import_module
 from types import SimpleNamespace
@@ -41,6 +47,76 @@ def _admit(config):
         config, expected_role=config.additional_config["afd"]["role"], device_type="npu"
     )
     fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.fixture
+def a5_bf16(monkeypatch):
+    torch = sys.modules["torch"]
+    monkeypatch.setattr(torch, "bfloat16", "bf16")
+    utils = sys.modules["vllm_ascend.utils"]
+    monkeypatch.setattr(utils, "AscendDeviceType", SimpleNamespace(A5="a5", A3="a3"))
+    monkeypatch.setattr(utils, "get_ascend_device_type", lambda: "a5")
+    return torch.bfloat16
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (None, None),
+        ("quant", "dynamicQuant=0"),
+        ("dtype", "BF16"),
+        ("target", "DeepseekV4ForCausalLM"),
+        ("ffn_tp", "F TP=1"),
+        ("graph", "eager execution"),
+        ("ubo", "without DBO or ubatching"),
+        ("spec", "without draft models"),
+    ],
+)
+def test_a5_bf16_eager_admission(a5_bf16, change, message):
+    config = _config_with(
+        role="ffn", extra_config={"dynamicQuant": int(change == "quant")}, **ASYNC_CAM
+    )
+    config.model_config.hf_config.architectures = [
+        "DeepseekV4ForCausalLM" if change != "target" else "DeepseekV41ForCausalLM"
+    ]
+    config.model_config.dtype = "fp16" if change == "dtype" else a5_bf16
+    config.model_config.enforce_eager = change != "graph"
+    config.parallel_config.use_ubatching = change == "ubo"
+    config.parallel_config.tensor_parallel_size = 2 if change == "ffn_tp" else 1
+    config.speculative_config = object() if change == "spec" else None
+    if message:
+        with pytest.raises(RuntimeError, match=message):
+            fail_if_unsupported_npu_afd_features(config)
+    else:
+        fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+@pytest.mark.parametrize(
+    "attn_tp,batch,allowed",
+    [
+        (1, 65_535, True),
+        (1, 65_536, False),
+        (2, 131_070, True),
+        (2, 131_071, False),
+        (2, 131_072, False),
+    ],
+)
+def test_a5_eager_source_rows_per_attention_rank(
+    a5_bf16, role, attn_tp, batch, allowed
+):
+    config = _config_with(
+        role=role,
+        tensor_parallel_size=attn_tp if role == "attention" else 1,
+        num_attention_ranks=attn_tp,
+        max_num_batched_tokens=batch,
+        model={"dtype": a5_bf16},
+        extra_config={"dynamicQuant": 0, "attn_ranks_per_dp": attn_tp},
+        **ASYNC_CAM,
+    )
+    config.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
+    with nullcontext() if allowed else pytest.raises(RuntimeError, match="65535"):
+        fail_if_unsupported_npu_afd_features(config)
 
 
 TWO_UBATCH_DBO = dict(

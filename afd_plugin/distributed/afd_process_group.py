@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: AFD distributed helpers for P2P topology and process-group setup.
+# Create: 2026-05-16
+# Note: A Store callback can provide the negotiated backend options.
+# History: 2026-05-16 create
 """AFD distributed helpers for P2P topology and process-group setup."""
 
 from __future__ import annotations
@@ -68,13 +72,14 @@ def init_afd_process_group(
     group_name: str,
     timeout: timedelta,
     pg_options: Any | None = None,
-    store_callback: Callable[[Store], None] | None = None,
+    store_callback: Callable[[Store], object | None] | None = None,
 ) -> ProcessGroup:
     """Create a plugin-owned process group without patching vLLM source.
 
     The helper keeps process-group setup isolated in the plugin. It relies on
     PyTorch/vLLM private APIs and fails fast if the target runtime stack is
-    unavailable.
+    unavailable. The Store callback may return backend options agreed by the
+    peers before the process group is constructed.
     """
 
     rendezvous_iterator = rendezvous(
@@ -87,7 +92,9 @@ def init_afd_process_group(
     store.set_timeout(timeout)
     prefixed_store = PrefixStore(group_name, store)
     if store_callback is not None:
-        store_callback(prefixed_store)
+        negotiated_options = store_callback(prefixed_store)
+        if negotiated_options is not None:
+            pg_options = negotiated_options
     backend_value = Backend(backend) if backend else Backend("undefined")
     pg_options_param_name = (
         "backend_options" if is_torch_equal_or_newer("2.6.0") else "pg_options"

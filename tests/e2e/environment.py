@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Parse resources and build commands for model E2E cases.
+# Create: 2026-09-18
+# Note: Service launches select the vLLM plugins required by the chosen backend.
+# History: 2026-09-18 create
 """Resource and environment parsing shared by E2E entrypoints."""
 
 import argparse
@@ -13,6 +17,14 @@ from tests.e2e.case import (
     DEFAULT_STARTUP_TIMEOUT_S,
     CaseEnvironment,
 )
+
+
+def vllm_plugin_allowlist(backend: str, *, baseline: bool) -> str:
+    """Load native model registrations before vLLM inspects the checkpoint."""
+    plugins = ["ascend", "ascend_model"] if backend == "npu" else []
+    if not baseline:
+        plugins.append("afd")
+    return ",".join(plugins)
 
 
 def add_case_environment_arguments(

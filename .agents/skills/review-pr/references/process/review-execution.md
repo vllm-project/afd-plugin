@@ -137,7 +137,7 @@ paths have supported findings or explicit no-issue conclusions:
 2. Narrowest unit tests for the changed area, CPU-safe by default:
    `pytest tests/unit/<area> -m "not gpu and not vllm_runtime"`. Mirror the CI
    selection when the change is broad:
-   `pytest -m "not gpu and not vllm_runtime" tests/unit tests/npu/test_async_cam_harness.py tests/npu/test_async_cam_performance.py tests/npu/test_async_cam_golden.py tests/npu/test_gmm_layered_performance.py`.
+   `pytest -m "not gpu and not vllm_runtime" tests/unit tests/npu/test_afd_async_harness.py tests/npu/test_afd_async_performance.py tests/npu/test_afd_async_golden.py tests/npu/test_gmm_layered_performance.py`.
 3. Targeted device tests only when the device and a trusted head exist:
    `pytest tests/gpu/test_attention_routing.py` on CUDA (this one runs in CI),
    `tests/gpu/test_deepep_m2n_gpu.py` on SM90+ with afdEP-comm and DeepGEMM

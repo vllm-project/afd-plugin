@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Ascend CAM connector for Attention/FFN disaggregation.
+# Create: 2026-06-08
+# Note: The connector passes the compact dispatch descriptor back to combine-send.
+# History: 2026-06-08 create
 """Ascend CAM connector for Attention/FFN disaggregation.
 
 The connector validates payloads and manages the Attention-first HCCL world
@@ -50,6 +54,7 @@ from afd_plugin.connectors.npu.async_cam_runtime.async_cam_session import (
     PushCAMSession,
 )
 from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup import (
+    BF16_PUSH_SIGNATURE_PREFIX,
     GRAPH_STARTUP_TIMEOUT_SECONDS,
     POLL_SECONDS,
     AsyncCAMGraphStartup,
@@ -342,9 +347,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             rank=self.world_rank,
             group_name=AFD_ASYNC_CAM_GROUP_NAME,
             timeout=timedelta(minutes=30),
-            pg_options=create_hccl_process_group_options(
-                self.hccl_buffer_size_mb,
-            ),
             store_callback=self._initialize_graph_startup,
         )
         backend = self.cam_pg._get_backend(torch.device("npu"))
@@ -358,7 +360,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         if self.graph_startup.mode == "full" and self.world_rank < self.attn_size:
             self._run_attention_graph_startup()
 
-    def _initialize_graph_startup(self, store: Store) -> None:
+    def _initialize_graph_startup(self, store: Store) -> object | None:
         signature = repr(
             (
                 self.attn_size,
@@ -372,8 +374,16 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
                 self.max_num_batched_tokens,
             )
         )
-        signature = self._session.signature_prefix + signature
-        self.graph_startup.initialize(store, signature)
+        # BF16 Push peers also locate the receive cursor from the window tail.
+        prefix = (
+            BF16_PUSH_SIGNATURE_PREFIX
+            if self.dynamic_quant == 0
+            else self._session.signature_prefix
+        )
+        signature = prefix + signature
+        window_mib = self.graph_startup.initialize(
+            store, signature, hccl_buffer_size_mb=self.hccl_buffer_size_mb
+        )
         if self.graph_startup.mode == "full":
             try:
                 if self.max_num_batched_tokens // self.tp_size > CAM_MAX_SOURCE_ROWS:
@@ -384,6 +394,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             except Exception as exc:
                 self.graph_startup.fail(exc)
                 raise
+        return create_hccl_process_group_options(window_mib)
 
     def wait_graph_device(self, event: torch.npu.Event) -> None:
         deadline = time.monotonic() + GRAPH_STARTUP_TIMEOUT_SECONDS
@@ -505,7 +516,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             tp_size=self.tp_size,
             dynamic_quant=self.dynamic_quant,
         )
-        _log_cam_op_values("async_dispatch_send", "inputs", **args)
+        _log_cam_op_values("afd_async_dispatch_send", "inputs", **args)
         self._session.dispatch((context, topk_ids, topk_weights), **args)
 
     def recv_ffn_output(
@@ -545,9 +556,9 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             batch_size=states.batch_size,
             attn_rank_id=self.world_rank,
         )
-        _log_cam_op_values("async_combine_recv", "inputs", **args)
+        _log_cam_op_values("afd_async_combine_recv", "inputs", **args)
         output = self._session.combine(ubatch_idx, **args)
-        _log_cam_op_values("async_combine_recv", "outputs", output=output)
+        _log_cam_op_values("afd_async_combine_recv", "outputs", output=output)
         return output
 
     def recv_attn_output(
@@ -582,11 +593,11 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             tp_size=self.tp_size,
             dynamic_quant=self.dynamic_quant,
         )
-        _log_cam_op_values("async_dispatch_recv", "inputs", **args)
+        _log_cam_op_values("afd_async_dispatch_recv", "inputs", **args)
         outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(**args)
         hidden_states, dynamic_scales, batch_info, expert_token_nums = outputs
         _log_cam_op_values(
-            "async_dispatch_recv",
+            "afd_async_dispatch_recv",
             "outputs",
             hidden_states=hidden_states,
             dynamic_scales=dynamic_scales,
@@ -595,7 +606,9 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         )
         states.token_nums_rankid_layeridx = batch_info
         states.group_list = expert_token_nums
-        states.dynamic_scales = dynamic_scales
+        # The quant0 ABI returns a one-element placeholder. Native MXFP4
+        # experts derive their block scales from the received BF16 activations.
+        states.dynamic_scales = dynamic_scales if self.dynamic_quant else None
         return AFDA2FTransferPayload(
             hidden_states=hidden_states,
             context=context,
@@ -616,7 +629,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         if token_nums_rankid_layeridx is None:
             raise RuntimeError(
                 "AFD async CAM combine send requires "
-                "TokenNums_Rankid_Layeridx from async_dispatch_recv",
+                "TokenNums_Rankid_Layeridx from afd_async_dispatch_recv",
             )
         args = self._cam_args(states) | dict(
             expand_x=ffn_output,
@@ -625,7 +638,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             moe_rank_id=self.world_rank,
             tp_size=self.tp_size,
         )
-        _log_cam_op_values("async_combine_send", "inputs", **args)
+        _log_cam_op_values("afd_async_combine_send", "inputs", **args)
         states.send_completion = torch.ops.afd_ascend.afd_async_combine_send(**args)
 
     def _require_push_session(self) -> PushCAMSession:

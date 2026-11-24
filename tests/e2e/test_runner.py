@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Host-only harness integration: real sockets, processes and signals; no
+#              devices.
+# Create: 2026-05-17
+# Note: Host tests exercise resolved launch arguments and subprocess lifecycle.
+# History: 2026-05-17 create
 
 """Host-only harness integration: real sockets, processes and signals; no devices."""
 
@@ -160,6 +165,7 @@ with open(os.environ["AFD_HOST_PIDS"], "a") as log:
 Path(os.environ["AFD_HOST_PIDS"]).with_name(f"{model}.json").write_text(json.dumps({
     "arguments": arguments,
     "logging_level": os.environ.get("VLLM_LOGGING_LEVEL"),
+    "plugins": os.environ.get("VLLM_PLUGINS"),
     "worker_shutdown_timeout": os.environ.get("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS"),
 }))
 if (
@@ -313,6 +319,7 @@ def test_async_cam_shutdown_settings_reach_services_and_workers(
         arguments = invocation["arguments"]
         assert arguments[arguments.index("--shutdown-timeout") + 1] == "90"
         assert invocation["worker_shutdown_timeout"] == (worker_override or "60")
+        assert invocation["plugins"] == "ascend,ascend_model,afd"
     assert record["canonical"]["deployment"]["worker_shutdown_timeout_s"] == 60
     assert record["effective"]["deployment"]["worker_shutdown_timeout_s"] == int(
         worker_override or "60"
@@ -795,7 +802,13 @@ def test_multi_pod_case_coordinates_workload_and_owned_cleanup(
         assert records[0]["execution"]["status"] == "cancelled"
 
 
-@pytest.mark.parametrize("case_id", dsv4_cases.NPU_ASYNC_IDS)
+@pytest.mark.parametrize(
+    "case_id",
+    (
+        dsv4_cases.config.DSV4_ASYNC_CAM_SCENARIO,
+        dsv4_cases.config.DSV4_ASYNC_CAM_MEGA_SCENARIO,
+    ),
+)
 def test_async_cam_mega_selection_reaches_both_role_commands(tmp_path, case_id):
     environment = CaseEnvironment(
         model="/models/dsv4",
@@ -817,6 +830,91 @@ def test_async_cam_mega_selection_reaches_both_role_commands(tmp_path, case_id):
         "strict" if mega else "npu_async_cam_legacy"
     )
     assert case.phases[0].task == CompletionTask(check_answer=True)
+
+
+def test_dsv4_a5_compact_launch_profile(
+    monkeypatch, tmp_path
+):  # long-test: verify both resolved service commands and the device entrypoint
+    scenario = dsv4_cases.config.DSV4_ASYNC_CAM_A5_SCENARIO
+    host = "192.0.2.30"
+    devices = "7,5,3,1,6,4,2,0"
+    monkeypatch.setenv("AFD_E2E_BACKEND", "npu")
+    monkeypatch.setenv("AFD_E2E_DEVICES", devices)
+    monkeypatch.setenv(
+        "AFD_NPU_E2E_MODEL", str(tmp_path / "DeepSeek-V4-Flash-W4A8MXFP")
+    )
+    monkeypatch.setenv("HCCL_IF_IP", host)
+    monkeypatch.setenv("HCCL_SOCKET_IFNAME", "eth0")
+    monkeypatch.delenv("AFD_CAM_OP_IO_LOG", raising=False)
+    assert entrypoint.build_environment(scenario)["AFD_CAM_OP_IO_LOG"] == "0"
+    monkeypatch.setenv("AFD_CAM_OP_IO_LOG", "1")
+    env = entrypoint.build_environment(scenario)
+    assert env["AFD_CAM_OP_IO_LOG"] == "1"
+    assert env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+    assert env["HCCL_BUFFSIZE"] == "2048"
+    result = subprocess.run(
+        [*entrypoint.build_runner_command(tmp_path, scenario), "--describe"],
+        env=env,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    record = json.loads(result.stdout)
+    assert record["bindings"]["devices"] == devices.split(",")
+    case = record["effective"]
+    assert dict(case["worker_environment"])["HCCL_BUFFSIZE"] == "2048"
+    assert dict(case["worker_environment"])["HCCL_IF_IP"] == host
+    assert case["deployment"]["cleanup_profile"] == CLEANUP_PROFILE_STRICT
+    assert case["phases"][0]["task"]["check_answer"] is True
+    assert case["phases"][0]["task"]["num_requests"] == 10
+    for role, (dp, tp) in {"attention": ("2", "2"), "ffn": ("4", "1")}.items():
+        command = record["commands"][role]
+        assert command[command.index("--data-parallel-size") + 1] == dp
+        assert command[command.index("--tensor-parallel-size") + 1] == tp
+        assert command[command.index("--dtype") + 1] == "bfloat16"
+        assert (
+            command[command.index("--attention_config.indexer_kv_dtype") + 1] == "fp8"
+        )
+        assert "--enable-expert-parallel" in command and "--enforce-eager" in command
+        assert "--enable-dbo" not in command and "--speculative-config" not in command
+        afd = json.loads(command[command.index("--additional-config") + 1])["afd"]
+        assert (afd["num_attention_ranks"], afd["num_ffn_ranks"]) == (4, 4)
+        assert afd["role"] == role and afd["host"] == host
+        assert afd["compute_gate_on_attention"] and afd["async"]
+        assert afd["connector"] == "CAMAsyncAFDConnector"
+        assert afd["connector_extra_config"] == {
+            "attn_ranks_per_dp": 2,
+            "dynamicQuant": 0,
+            "hccl_buffer_size": 2048,
+        }
+    attention = record["commands"]["attention"]
+    assert attention[attention.index("--data-parallel-address") + 1] == host
+
+
+@pytest.mark.parametrize(
+    ("case_id", "indexer_dtype"),
+    [
+        (dsv4_cases.config.DSV4_SYNC_CAMP2P_A5_SCENARIO, "fp8"),
+        (dsv4_cases.config.DSV4_SYNC_CAMP2P_A3_SCENARIO, "int8"),
+    ],
+)
+def test_dsv4_sync_commands_select_the_hardware_indexer(
+    tmp_path, case_id, indexer_dtype
+):
+    environment = CaseEnvironment(
+        model="/models/dsv4",
+        vllm_bin="vllm",
+        device_backend="npu",
+        devices=tuple(map(str, range(16))),
+        output_path=tmp_path,
+    )
+    case = dsv4_cases.build_case(case_id, environment)
+    _, record = runner.prepare_case(case, environment)
+    for command in record["commands"].values():
+        assert (
+            command[command.index("--attention_config.indexer_kv_dtype") + 1]
+            == indexer_dtype
+        )
 
 
 @pytest.mark.parametrize("case_id", qwen3_cases.DEEPEP_M2N_FFN_SERVICE_SCENARIOS)

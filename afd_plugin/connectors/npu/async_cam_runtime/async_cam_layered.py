@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Run W13 and W2 with layer-selected expert weights.
+# Create: 2026-09-24
+# Note: The device layer index selects the W13 and W2 weights.
+# History: 2026-09-24 create
 """NPU Async CAM compute: independent Layered and Mega native calls."""
 
 from __future__ import annotations
@@ -8,12 +12,11 @@ from typing import cast
 
 import torch
 
+from afd_plugin.connectors.npu.async_cam_runtime import AFD_ASYNC_LAYER_INDEX
 from afd_plugin.model_executor.ffn.npu.expert_weights import (
     QuantizedExpertWeights,
     validate_expert_weights,
 )
-
-CAM_LAYER_INDEX = 2
 
 
 class AsyncCAMLayeredExecutor:
@@ -72,7 +75,7 @@ class AsyncCAMLayeredExecutor:
         *,
         retained_tensors: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        layer_index = batch_info[CAM_LAYER_INDEX : CAM_LAYER_INDEX + 1]
+        layer_index = batch_info[AFD_ASYNC_LAYER_INDEX : AFD_ASYNC_LAYER_INDEX + 1]
         if self.layer_id_to_slot is not None:
             layer_index = self.layer_id_to_slot.index_select(0, layer_index)
         else:

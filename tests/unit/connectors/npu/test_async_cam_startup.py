@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Pure host negotiation tests; no device or model runner initialization.
+# Create: 2026-10-19
+# Note: An in-memory Store models rank negotiation.
+# History: 2026-10-19 create
 """Pure host negotiation tests; no device or model runner initialization."""
 
 import json
@@ -203,10 +207,11 @@ def test_capacity_matches_native_float32_factor(monkeypatch):
     assert cam_receive_capacity() == 16
 
 
-def test_pull_requires_matching_transport_even_in_eager_mode():
+@pytest.mark.parametrize("signature", ["pull_v1:layout", "bf16_push:layout"])
+def test_payload_protocol_requires_matching_transport_even_in_eager_mode(signature):
     owners = startup_world(1, 1)
     errors = negotiate(
-        owners, [None, full_plan(requested="eager")], ["pull_v1:layout", "push"]
+        owners, [None, full_plan(requested="eager")], [signature, "push"]
     )
     assert all("transport signatures" in str(error) for error in errors)
 
