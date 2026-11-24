@@ -136,6 +136,9 @@ class DSV4SyncShape(NamedTuple):
     # unless the profile turns it off.
     disable_prefix_caching: bool = False
     block_size: str | None = None
+    # Indexer KV dtype the host's script passes. The A5 platform accepts fp8
+    # only; A3 keeps the int8 default its checkpoint and script use.
+    indexer_kv_dtype: str = "int8"
     # Exact `--compilation-config` JSON when the script passes one; the runner
     # then omits its own capture-size flags.
     compilation_config: dict[str, str | list[int]] | None = None
@@ -182,6 +185,7 @@ DSV4_SYNC_SHAPES = {
         force_spawn=False,
         keep_hccl_buffsize=True,
         npu_alloc_conf=DSV4_SYNC_ALLOC_CONF_PLAIN,
+        indexer_kv_dtype="fp8",
     ),
     DSV4_SYNC_CAMP2P_MXFP8_A5_SCENARIO: DSV4SyncShape(
         # Same A5 host and 2A2F layout as the BF16 profile, with the router on
@@ -215,6 +219,7 @@ DSV4_SYNC_SHAPES = {
         force_spawn=False,
         keep_hccl_buffsize=True,
         npu_alloc_conf=DSV4_SYNC_ALLOC_CONF_PLAIN,
+        indexer_kv_dtype="fp8",
     ),
     DSV4_SYNC_CAMP2P_A3_SCENARIO: DSV4SyncShape(
         # Sixteen dies: eight do not fit the checkpoint on this host. Attention
@@ -292,6 +297,7 @@ def _configure_dsv4_arguments(
     verbatim_launch: bool = False,
     disable_prefix_caching: bool = False,
     block_size: str | None = None,
+    indexer_kv_dtype: str = "int8",
 ) -> None:
     """Apply the fixed model arguments shared by every DSV4 scenario.
 
@@ -356,7 +362,7 @@ def _configure_dsv4_arguments(
         ),
         *(["--quantization", quantization] if quantization is not None else []),
         "--attention_config.indexer_kv_dtype",
-        "int8",
+        indexer_kv_dtype,
         "--tokenizer-mode",
         "deepseek_v4",
         *(
@@ -440,6 +446,7 @@ def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
         verbatim_launch=shape.verbatim_launch,
         disable_prefix_caching=shape.disable_prefix_caching,
         block_size=shape.block_size,
+        indexer_kv_dtype=shape.indexer_kv_dtype,
     )
 
 
