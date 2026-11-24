@@ -4,7 +4,7 @@
  * Description: Ascend C implementation of afd_async_combine_recv.
  * Create: 2025-12-18
  * Note: Combine routed expert outputs in logical top-k order.
- * History: 2025-12-18 create AfdAsyncCombineRecv operator kernel function header file
+ * History: 2026-11-23 update shared afd_async header references
  */
 
 #ifndef AFD_ASYNC_COMBINE_RECV_H

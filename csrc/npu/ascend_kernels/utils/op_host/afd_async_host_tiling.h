@@ -1,10 +1,11 @@
 /*
  * SPDX-License-Identifier: MIT
  * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
  * Description: Compute per-operator unified buffer requirements and active AIV counts.
- * Create: 2026-10-12
+ * Create: 2026-11-23
  * Note: Host tiling checks the compact metadata budget before launching a kernel.
- * History: 2026-10-12 create
+ * History: 2026-11-23 add to the Ascend 950 port
  */
 
 #ifndef AFD_ASYNC_HOST_TILING_H

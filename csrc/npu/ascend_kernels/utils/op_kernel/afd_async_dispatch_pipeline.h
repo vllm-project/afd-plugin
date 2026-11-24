@@ -3,9 +3,9 @@
  * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
  * SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
  * Description: Plan the two input slots used by DispatchSend.
- * Create: 2026-10-14
+ * Create: 2026-11-23
  * Note: Completion events protect each slot until its payload has been consumed.
- * History: 2026-10-14 create
+ * History: 2026-11-23 add to the Ascend 950 port
  */
 
 #ifndef AFD_ASYNC_DISPATCH_PIPELINE_H

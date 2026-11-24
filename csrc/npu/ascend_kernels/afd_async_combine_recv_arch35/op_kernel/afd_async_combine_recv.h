@@ -1,10 +1,11 @@
 /*
  * SPDX-License-Identifier: MIT
- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
  * Description: Ascend C implementation of afd_async_combine_recv.
- * Create: 2025-12-18
+ * Create: 2026-11-23
  * Note: Combine routed expert outputs in logical top-k order.
- * History: 2025-12-18 create AfdAsyncCombineRecv operator kernel function header file
+ * History: 2026-11-23 add to the Ascend 950 port
  */
 
 #ifndef AFD_ASYNC_COMBINE_RECV_H

@@ -3,9 +3,9 @@
  * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
  * SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
  * Description: Plan contiguous payload copies for DispatchRecv.
- * Create: 2026-10-14
+ * Create: 2026-11-23
  * Note: Each run stays within one expert and the current AIV's source slice.
- * History: 2026-10-14 create
+ * History: 2026-11-23 add to the Ascend 950 port
  */
 
 #ifndef AFD_ASYNC_RECEIVE_RUNS_H

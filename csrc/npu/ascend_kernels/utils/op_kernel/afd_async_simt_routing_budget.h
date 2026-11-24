@@ -1,10 +1,11 @@
 /*
  * SPDX-License-Identifier: MIT
  * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
  * Description: Calculate the unified buffer budget for SIMT routing.
- * Create: 2026-10-12
+ * Create: 2026-11-23
  * Note: The budget includes space for the SIMT data cache and compiler workspace.
- * History: 2026-10-12 create
+ * History: 2026-11-23 add to the Ascend 950 port
  */
 
 #ifndef AFD_ASYNC_SIMT_ROUTING_BUDGET_H

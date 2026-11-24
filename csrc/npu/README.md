@@ -21,7 +21,10 @@ The 950 sources come from the default MTE line in
 [GuangyuZhu04/afd-plugin at 4d134dc](https://github.com/GuangyuZhu04/afd-plugin/tree/4d134dc955c58727c08511c6043ee01279eb6279/csrc/npu/ascend_kernels),
 an ancestor of the [0.32 donor](https://github.com/GuangyuZhu04/afd-plugin/commit/d43535c92fdfe26334c0abb54bfa6d33e9616e34).
 Each 950 source directory registers its own SoC and reuses the common
-compact ACLNN interface. The four vector-only kernel entries carry the donor's
+compact ACLNN interface. The 2026-11-23 creation and history entries in the
+new native files record their addition to this Ascend 950 port. The packaged
+LICENSE includes the 2025 Huawei notice for the original operator sources.
+The four vector-only kernel entries carry the donor's
 [AIV-only task declaration](https://github.com/GuangyuZhu04/afd-plugin/commit/cb303bbbd18b055919f86b194f2b754fa4e794e5).
 The plugin builds the compact transport without a CCU runtime or custom
 session class. The compact kernels and binding retain the Huawei MIT notice
@@ -30,8 +33,8 @@ install carry the repository license and third-party notice.
 [Original import](https://github.com/vllm-project/afd-plugin/pull/361)
 · [LICENSE](../../LICENSE)
 
-The six A5 helpers below are distributed under MIT with the 2026 Huawei
-copyright notice and their original AFD plugin contributor attribution.
+The native files added for the A5 port use the same MIT, Huawei 2026 and
+AFD plugin contributor notices. This includes the six helpers below.
 Their filenames and include paths use the `afd_async_` prefix in this
 repository. The table links each original file at the commit that added it.
 

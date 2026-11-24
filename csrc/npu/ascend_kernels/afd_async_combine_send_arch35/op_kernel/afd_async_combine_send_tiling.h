@@ -1,10 +1,11 @@
 /*
  * SPDX-License-Identifier: MIT
- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
  * Description: Define the host-to-device tiling data for afd_async_combine_send.
- * Create: 2025-12-18
+ * Create: 2026-11-23
  * Note: The host tiler and the device entry point share this structure layout.
- * History: 2025-12-18 create AfdAsyncCombineSend tiling function header file
+ * History: 2026-11-23 add to the Ascend 950 port
  */
 
 #ifndef AFD_ASYNC_COMBINE_SEND_TILING_H

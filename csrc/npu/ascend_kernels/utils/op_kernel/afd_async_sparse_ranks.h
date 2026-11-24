@@ -3,9 +3,9 @@
  * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
  * SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
  * Description: Track the destination ranks visited by a DispatchSend token.
- * Create: 2026-10-13
+ * Create: 2026-11-23
  * Note: The rank bitmask is used only for supported communicator sizes.
- * History: 2026-10-13 create
+ * History: 2026-11-23 add to the Ascend 950 port
  */
 
 #ifndef AFD_ASYNC_SPARSE_RANKS_H
