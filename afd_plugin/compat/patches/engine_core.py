@@ -681,14 +681,9 @@ def _prepare_late_loaded_ffn_engine_core(
             scheduler_config.get_scheduler_cls = lambda: _AFDFFNNoopScheduler
 
 
-# Patch reason: the front-end blocks in AsyncLLM.from_vllm_config() awaiting
-# the `get_supported_tasks` utility RPC before it starts the HTTP server. The
-# normal busy loop is the only consumer of the input queue, so an FFN engine
-# whose busy loop is replaced by the connector loop never answers that RPC and
-# its business port is never bound (no /health for orchestrators).
-# Patch functionality: drain the input queue once per connector-loop tick and
-# dispatch each message through the same handler the normal busy loop uses.
-# Signature: standalone helper for _run_ffn_busy_loop; no upstream symbol.
+# FFN replaces the normal busy loop, so service the frontend startup RPCs from
+# the connector loop. Otherwise the frontend waits for get_supported_tasks and
+# never starts its HTTP health endpoint.
 def _drain_frontend_requests(engine_core: Any) -> None:
     while True:
         try:
@@ -709,9 +704,7 @@ def _run_ffn_busy_loop(self, core_module: Any) -> None:
             "AFD FFN EngineCore started; workers run connector loop."
         )
         while _is_running(self, core_module):
-            # ### PATCH START: AFD FFN frontend RPC drain
             _drain_frontend_requests(self)
-            # ### PATCH END: AFD FFN frontend RPC drain
             self.model_executor.collective_rpc("raise_ffn_loop_error_if_any")
             time.sleep(0.5)
     except KeyboardInterrupt:
