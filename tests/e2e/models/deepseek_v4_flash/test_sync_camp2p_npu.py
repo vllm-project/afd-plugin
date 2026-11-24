@@ -3,12 +3,14 @@
 """Local NPU DSV4 Flash cases over the synchronous CAMP2P boundary.
 
 DeepSeek V4 does not fit on a single Attention or FFN die, so each host runs
-its own recorded launch profile: the A5 case runs Attention DP2/TP1 and FFN
-DP2/TP1 with expert parallelism and graph capture on four dies, without the
-native DBO its launch script records, while the A3 case shards by tensor
-parallel on eight. The synchronous connector needs no CAM vendor package: the
-plugin's own a2e/e2a operators carry the activations and, for the DeepSeek V4
-Hash layers, the token ids that the FFN-side gate routes with.
+its own recorded launch profile. The A5 BF16 case keeps the gate on FFN over
+Attention DP2/TP1 and FFN DP2/TP1; the A5 MXFP8 case uses the measured 4A4F
+layout (Attention DP4/TP1, FFN DP4/TP1) with the gate on Attention and
+`quant_mode=4`, so one run covers the external routing, the quantized transport
+and the FFN consumer. The A3 case shards by tensor parallel on eight. The
+synchronous connector needs no CAM vendor package: the plugin's own a2e/e2a
+operators carry the activations and, for the DeepSeek V4 Hash layers, the token
+ids that the FFN-side gate routes with.
 """
 
 from __future__ import annotations

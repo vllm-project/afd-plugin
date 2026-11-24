@@ -591,6 +591,7 @@ recorded launch shape:
 | Scenario | Host | Deployment | Devices |
 | --- | --- | --- | --- |
 | `afd-dsv4-flash-sync-camp2p-2a2f` | A5 (Ascend 950) | Attention DP2/TP1 + FFN DP2/TP1, expert parallel, ACL graph (`FULL_DECODE_ONLY`, capture 16), 4096 context, native DBO off, 128-token block, prefix caching off | 4 |
+| `afd-dsv4-flash-sync-camp2p-mxfp8-4a4f` | A5 (Ascend 950) | Attention DP4/TP1 + FFN DP4/TP1, gate on Attention, expert parallel, MXFP8 transport (`quant_mode=4`), ACL graph (`FULL_DECODE_ONLY`, capture 16), 4096 context, 3072 batch tokens, native DBO off, 128-token block, prefix caching off | 8 |
 | `afd-dsv4-flash-sync-camp2p-8a8f` | A3 (Ascend 910C) | Attention DP2/TP4 + FFN DP8/TP1, expert parallel, eager, 8192 context | 16 |
 
 Build the operators for the target SOC first (`SOC_VERSION=ascend950` on A5,
@@ -598,6 +599,28 @@ Build the operators for the target SOC first (`SOC_VERSION=ascend950` on A5,
 entries go to Attention and the rest to FFN, so A5 passes `2,3,0,1` for its
 recorded mapping and A3 passes `0-7` for Attention with `8-15` for FFN — and a
 list sized for the other host fails rather than skips.
+
+### A5 MXFP8 acceptance case
+
+`afd-dsv4-flash-sync-camp2p-mxfp8-4a4f` covers Attention-side routing, the MXFP8
+transport and the FFN consumer in one run: A5 4A4F, `quant_mode=4`, DBO off,
+`FULL_DECODE_ONLY`, a 3,072-token batch budget and answer checking enabled. It
+needs the A5 host, a checkpoint with FP8 expert activations and an `a2e` operator
+built from #444. When the operator probe or the loaded expert quant type does not
+match, startup is expected to fail rather than skip. The public CI carries no NPU
+lane, so select the case explicitly on the device host:
+
+```bash
+set -o pipefail
+AFD_E2E_BACKEND=npu AFD_E2E_DEVICES=0,1,2,3,4,5,6,7 \
+AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V4-Flash \
+python -m pytest -q -s \
+  "tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py::test_deepseek_v4_flash_sync_camp2p[afd-dsv4-flash-sync-camp2p-mxfp8-4a4f]"
+```
+
+Keep `run.json`, both role logs, the answer samples and the Graph artifacts with
+the run so a failure can be assigned to startup, answer checking or Graph
+execution.
 
 Both profiles are **smoke cases**: the async case's ten concurrent chat requests
 (`12 + 7` … `21 + 7`, temperature=0, thinking=false, max_tokens=256) must be served

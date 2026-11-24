@@ -212,6 +212,7 @@ def test_p2p_dp_metadata_serialization_uses_json_payload():
             is_warmup=False,
             is_graph_replaying=True,
             is_profile=True,
+            quant_mode=4,
         ),
     )
     decoded_payload = decode_control_payload(payload)
@@ -224,7 +225,19 @@ def test_p2p_dp_metadata_serialization_uses_json_payload():
     with decoded[7].sp_local_sizes(sequence_parallel_size=1):
         assert decoded[7].get_chunk_sizes_across_dp_rank() == [3, 5]
     assert _tolist(decoded[7].cu_tokens_across_sp(1)) == [3, 8]
+    assert decoded_payload.quant_mode == 4
     assert decoded_payload.is_graph_capturing is True
     assert decoded_payload.is_warmup is False
     assert decoded_payload.is_graph_replaying is True
     assert decoded_payload.is_profile is True
+
+
+def test_a_control_payload_without_a_quant_mode_reads_as_bf16():
+    # An older peer declares no mode, and its only mode is BF16. Decoding it as
+    # 0 is what lets a mode-4 FFN role notice that the pair is mixed.
+    legacy = (
+        b'{"dp_metadata_list":{"0":{"num_tokens_across_dp_cpu":[3],'
+        b'"max_tokens_across_dp_cpu":3}},"is_graph_capturing":false,"is_warmup":false}'
+    )
+
+    assert decode_control_payload(legacy).quant_mode == 0
