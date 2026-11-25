@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig
@@ -19,6 +19,7 @@ from afd_plugin.connectors import (
     LocalExpertWeights,
 )
 from afd_plugin.connectors.metadata import FP8_DTYPE
+from afd_plugin.model_executor.ffn.experts_shell import RoutedExpertsModel
 from afd_plugin.v1.worker.cuda_graph import AFDCUDAGraphPolicy
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
 
@@ -91,18 +92,6 @@ def local_experts_from_vllm(routed_experts: RoutedExperts) -> FFNLocalExperts:
             w13=w13, w2=w2, w13_scale=w13_scale, w2_scale=w2_scale
         ),
     )
-
-
-class RoutedExpertsModel(Protocol):
-    """What the routed runner reads from a model: MoE layers and their experts.
-
-    Implemented by the AFD CausalLM models the Worker path loads and by the
-    standalone FFN service's FFN-only model shells.
-    """
-
-    def get_experts_layer_indices(self) -> tuple[int, ...]: ...
-
-    def get_routed_experts(self, layer_idx: int) -> RoutedExperts: ...
 
 
 def _require_routed(connector: AFDConnectorBase) -> AFDRoutedExpertsConnector:
