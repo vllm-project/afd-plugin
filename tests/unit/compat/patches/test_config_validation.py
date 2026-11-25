@@ -11,7 +11,6 @@ import pytest
 
 from afd_plugin.compat import npu as npu_compat
 from afd_plugin.compat.npu import runtime as ascend_runtime
-from afd_plugin.compat.patches.npu import mla_graph
 from afd_plugin.validation import (
     ATTENTION_WORKER_FQCN,
     FFN_WORKER_FQCN,
@@ -272,7 +271,6 @@ def _install_fake_npu_config(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm_ascend", fake_package)
     monkeypatch.setitem(sys.modules, "vllm_ascend.platform", fake_platform)
     sys.modules["vllm.platforms"].__dict__["current_platform"] = NPUPlatform
-    monkeypatch.setattr(mla_graph, "apply_afd_mla_graph_patch", lambda: True)
     monkeypatch.setattr(ascend_runtime, "_PATCHES_APPLIED", False)
     return arg_utils_module, NPUPlatform, events
 

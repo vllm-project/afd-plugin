@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from types import MethodType
 from typing import TYPE_CHECKING
@@ -106,10 +106,6 @@ class _AFDCaptureEventTracker:
 def _use_afd_ubatch_preparation(
     runner: AFDAttentionModelRunnerV2,
     event_tracker: _AFDCaptureEventTracker | None = None,
-    capture_prepared: Callable[
-        [v2_cudagraph_utils.BatchExecutionDescriptor, UBatchState, bool], None
-    ]
-    | None = None,
 ) -> Iterator[None]:
     """Publish one transaction from native prepared state before stage execution."""
     ubatch_runner = runner.ubatch_runner
@@ -150,7 +146,7 @@ def _use_afd_ubatch_preparation(
         ) -> UBatchState:
             # ### PATCH START: bind AFD to native stage state outside graph execution.
             if event_tracker is not None:
-                desc, is_warmup = event_tracker.consume(
+                _, is_warmup = event_tracker.consume(
                     input_batch.num_reqs,
                     input_batch.num_tokens_after_padding,
                     len(prepared.slices),
@@ -158,8 +154,6 @@ def _use_afd_ubatch_preparation(
                 runner._is_warmup = is_warmup
                 runner._afd_is_graph_capturing = not is_warmup
                 runner._afd_is_graph_replaying = False
-                if capture_prepared is not None:
-                    capture_prepared(desc, prepared, is_warmup)
             else:
                 runner._afd_is_graph_replaying = cg_mode == CUDAGraphMode.FULL
             runner.install_mrv2_ubatch_metadata(

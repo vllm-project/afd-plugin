@@ -310,12 +310,20 @@ def _use_installed_patch(binding, symbol, marker_name, install):
             id="npu-platform-config",
         ),
         pytest.param(
-            "vllm_ascend.attention.mla_v1",
+            "vllm_ascend.compilation.updatable_graph",
+            "UpdatableGraph",
+            "register_task",
             None,
-            "get_graph_params",
+            "npu-ubatch-register-task",
+            id="npu-ubatch-register-task",
+        ),
+        pytest.param(
+            "vllm_ascend.worker.v2.aclgraph_utils",
+            "ModelAclGraphManager",
+            "_updatable_graph_replay",
             None,
-            "npu-mla-graph-params",
-            id="npu-mla-graph-params",
+            "npu-ubatch-updatable-replay",
+            id="npu-ubatch-updatable-replay",
         ),
     ],
 )
@@ -369,8 +377,6 @@ def test_patch_preserves_upstream_signature(
         expected_module = importlib.import_module(GPU_DP)
     elif scope_name == "npu-dbo-factory":
         expected_module = importlib.import_module(GPU_UBATCH)
-    elif scope_name == "npu-mla-graph-params":
-        expected_module = importlib.import_module("vllm_ascend.compilation.acl_graph")
     else:
         expected_module = target
     expected = _upstream_signature(expected_module, owner, symbol, locals())
@@ -470,15 +476,14 @@ def test_patch_preserves_upstream_signature(
             adapter._ASCEND_PLATFORM_PATCH_ATTR,
             adapter.apply_afd_ascend_dbo_config_patch,
         )
-    elif scope_name == "npu-mla-graph-params":
-        from afd_plugin.compat.patches.npu import mla_graph as adapter
+    elif scope_name in {"npu-ubatch-register-task", "npu-ubatch-updatable-replay"}:
+        from afd_plugin.v1.worker.npu import mla_graph as adapter
 
-        scope = _use_installed_patch(
-            binding,
-            symbol,
-            adapter._MLA_GRAPH_PATCH_ATTR,
-            adapter.apply_afd_mla_graph_patch,
-        )
+        binding = SimpleNamespace(**{symbol: getattr(getattr(target, owner), symbol)})
+        if scope_name == "npu-ubatch-register-task":
+            scope = adapter.use_ubatch_graph_registration(binding)
+        else:
+            scope = adapter.use_ubatch_replay_metadata(binding, ())
     else:
         adapter_name, _, renamed_symbol = adapter_module.partition(":")
         adapter = importlib.import_module(f"{PATCHES}.{adapter_name}")

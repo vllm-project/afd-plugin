@@ -108,96 +108,89 @@ def test_shutdown_joins_native_children_and_releases_owned_stage_state(
 
 
 @pytest.mark.parametrize("fail_update", [False, True])
-def test_mla_replay_updates_captured_stage_records_and_restores_context(
+def test_ubatch_replay_supplies_fresh_stages_and_keeps_native_cleanup(
     monkeypatch, fail_update
-):  # long-test: native replay/update consumes merged stage records and restores context
+):
+    from vllm_ascend.attention.mla_v1 import AscendMLABackend
+    from vllm_ascend.worker.v2 import aclgraph_utils
+
     runner = object.__new__(npu_ubatch.NPUUBatchRunner)
-    runner._uses_mla_graph_params = True
-    runner.device = torch.device("cpu")
-    runner.attn_groups = object()
-    runner.vllm_config = SimpleNamespace(speculative_config=None)
-    desc = cudagraph_utils.BatchExecutionDescriptor(
-        CUDAGraphMode.FULL, num_tokens=8, num_reqs=8, num_ubatches=2
-    )
-    workspace = object()
-    params = tuple(npu_ubatch.new_mla_graph_params(4, workspace) for _ in range(2))
-    for stage, value in enumerate(params):
-        value.events[4] = [f"event{stage}"]
-        value.handles[4] = [f"handle{stage}"]
-        value.attn_params[4] = [f"capture{stage}"]
-    runner._mla_capture_params = {}
-    captured = SimpleNamespace(
-        forward_contexts=[
-            SimpleNamespace(
-                additional_kwargs={npu_ubatch.AFD_MLA_GRAPH_PARAMS_KEY: value}
-            )
-            for value in params
-        ]
-    )
-    runner.record_capture_graph_params(desc, captured, is_warmup=True)
-    runner.record_capture_graph_params(desc, captured, is_warmup=False)
     runner._prepared_state = SimpleNamespace(
         slices=[SimpleNamespace(num_tokens=4), SimpleNamespace(num_tokens=4)],
         forward_contexts=[
-            SimpleNamespace(
-                attn_metadata={"layer": f"live{stage}"},
-                dp_metadata=SimpleNamespace(
-                    num_tokens_across_dp_cpu=torch.tensor([4, 4])
-                ),
-            )
-            for stage in range(2)
+            SimpleNamespace(attn_metadata={"layer": 17}),
+            SimpleNamespace(attn_metadata={"layer": 41}),
         ],
     )
-    calls: list[str | tuple[str, object]] = []
-    current_stream = object()
-    manager = SimpleNamespace(
-        update_stream=SimpleNamespace(
-            wait_stream=lambda stream: calls.append(("wait", stream))
-        )
+    calls = []
+    manager = object.__new__(npu_ubatch.ModelAclGraphManager)
+    manager.vllm_config = object()
+    manager.update_stream = object()
+    manager.model_runner = SimpleNamespace(
+        attn_groups=[[SimpleNamespace(backend=AscendMLABackend)]],
+        model_state=SimpleNamespace(
+            attn_metadata={"layer": "parent"},
+            device_metadata=SimpleNamespace(
+                finish_replay=lambda: calls.append("cleanup"),
+            ),
+        ),
     )
-    context = SimpleNamespace(attn_metadata=None, additional_kwargs={"parent": True})
-    original_kwargs = context.additional_kwargs
-    monkeypatch.setattr(torch.npu, "current_stream", lambda _: current_stream)
-    monkeypatch.setattr(npu_ubatch, "set_current_vllm_config", lambda _: nullcontext())
-    monkeypatch.setattr(
-        npu_ubatch, "set_forward_context", lambda *a, **kw: nullcontext(context)
+    desc = cudagraph_utils.BatchExecutionDescriptor(
+        CUDAGraphMode.FULL, num_tokens=8, num_reqs=8, num_ubatches=2
     )
-    monkeypatch.setattr(npu_ubatch, "get_forward_context", lambda: context)
-    monkeypatch.setattr(npu_ubatch, "_get_graph_update_backend", lambda _: "mla")
+    monkeypatch.setattr(aclgraph_utils, "set_current_vllm_config", nullcontext)
 
-    def replay(self, descriptor):
-        assert self is manager and descriptor is desc
-        calls.append("replay")
-        return "native-output"
-
-    def update(backend, stream, forward, tokens, config, speculative):
+    def replay(descriptor, metadata):
+        assert descriptor is desc
         calls.append("update")
-        assert (backend, stream, forward, tokens, config, speculative) == (
-            "mla",
-            manager.update_stream,
-            context,
-            4,
-            runner.vllm_config,
-            None,
-        )
-        assert context.attn_metadata == {("layer", 0): "live0", ("layer", 1): "live1"}
-        merged = context.additional_kwargs[npu_ubatch.AFD_MLA_GRAPH_PARAMS_KEY]
-        assert merged.attn_params[4] == ["capture0", "capture1"]
-        assert merged.events[4] == ["event0", "event1"]
-        assert merged.workspaces[4] is workspace
         if fail_update:
             raise RuntimeError("update failed")
+        return [stage["layer"] for stage in metadata]
 
-    monkeypatch.setattr(npu_ubatch.ModelCudaGraphManager, "run_fullgraph", replay)
-    monkeypatch.setattr(npu_ubatch, "update_full_graph_params", update)
+    manager._updatable_graph_replay = replay
     if fail_update:
         with pytest.raises(RuntimeError, match="update failed"):
             runner.run_fullgraph(manager, desc)
     else:
-        assert runner.run_fullgraph(manager, desc) == "native-output"
-    assert calls == [("wait", current_stream), "replay", "update"]
-    assert context.attn_metadata is None
-    assert context.additional_kwargs is original_kwargs
+        assert runner.run_fullgraph(manager, desc) == [17, 41]
+    assert calls == ["update", "cleanup"]
+    assert manager._updatable_graph_replay is replay
+
+
+@pytest.mark.parametrize(("use_pcp", "max_metadata_reqs"), [(False, 5), (True, 9)])
+def test_kv_initialization_sizes_each_stage_from_the_native_manager_table(
+    monkeypatch, use_pcp, max_metadata_reqs
+):
+    runner = _runner()
+    stages = [
+        SimpleNamespace(
+            kernel_block_table=torch.full((1, 4, 2), value),
+            kernel_block_size=4,
+            kv_cache_spec=SimpleNamespace(block_size=8),
+            kv_cache_group_id=0,
+        )
+        for value in (1, 2)
+    ]
+
+    def init_native(self, *_args):
+        self.max_num_reqs = 4
+        self.pcp_manager = SimpleNamespace(max_num_local_reqs=8) if use_pcp else None
+        self.block_tables = SimpleNamespace(
+            block_tables=[SimpleNamespace(gpu=torch.empty(4, 6))],
+        )
+        self.ubatch_runner = SimpleNamespace(
+            stage_attn_groups=[[[stage]] for stage in stages],
+        )
+
+    monkeypatch.setattr(NPUModelRunner, "initialize_kv_cache", init_native)
+    runner.initialize_kv_cache(object())
+    for value, stage in enumerate(stages, start=1):
+        table = stage.kernel_block_table
+        assert table.shape == (1, max_metadata_reqs, 12)
+        assert table[0, :4, :2].tolist() == [[value, value]] * 4
+    assert stages[0].kernel_block_table.data_ptr() != (
+        stages[1].kernel_block_table.data_ptr()
+    )
 
 
 @pytest.mark.parametrize("profile_only", [False, True])
@@ -570,7 +563,7 @@ def test_full_graph_prepares_metadata_for_padded_tail_stage(
         additional_config={},
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
     )
-    runner._uses_mla_graph_params = True
+    runner._shares_mla_block_tables = True
     runner._stage_rope_buffers = [{}, {}]
     calls = []
 
@@ -628,7 +621,7 @@ def test_stage_prepare_uses_independent_builders_and_detaches_cache(
     runner.model_state = SimpleNamespace(max_model_len=128)
     runner.parallel_config = object()
     runner.vllm_config = SimpleNamespace(additional_config={})
-    runner._uses_mla_graph_params = False
+    runner._shares_mla_block_tables = False
     runner._stage_block_tables = [None, None]
     runner.ubatch_seq_lens = [torch.empty(2), torch.empty(2)]
     calls = []
