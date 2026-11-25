@@ -7,21 +7,21 @@ device, a multi-rank launch, or only a host Python environment.
 
 | File | Needs | Purpose |
 | --- | --- | --- |
-| `async_cam_precision.py` | torchrun, 4 ranks | Independent dispatch and weighted-combine reference |
-| `async_cam_performance.py` | torchrun, 4 ranks | Per-operator and complete-round measurements |
-| `async_cam_common.py` | - | Protocol planning, HCCL setup, and four-stage execution |
+| `afd_async_precision.py` | torchrun, 4 ranks | Independent dispatch and weighted-combine reference |
+| `afd_async_performance.py` | torchrun, 4 ranks | Per-operator and complete-round measurements |
+| `afd_async_common.py` | - | Protocol planning, HCCL setup, and four-stage execution |
 | `gmm_layered_performance.py` | 1 process, 1 device | Layered W13/W2 latency under eager and ACL graph |
-| `test_async_cam_{harness,performance,golden}.py` | CPU; golden needs optional torch | Harness planning, reporting, and reference numerics |
+| `test_afd_async_{harness,performance,golden}.py` | CPU; golden needs optional torch | Harness planning, reporting, and reference numerics |
 | `test_gmm_layered_performance.py` | CPU | Benchmark geometry, case selection, statistics, and reports |
-| `test_cam_async_ops.py` | 910C extension, no device | Routed async CAM dispatcher and Meta contracts |
+| `test_afd_async_ops.py` | 910C or 950 extension, no device | Routed async CAM dispatcher and Meta contracts |
 | `test_gmm_layered.py`, `test_gmm_swiglu_quant_v2_layered.py` | 910C extension; device cases opt-in | Layered dispatcher contracts and runtime smoke checks |
 | `test_a2e_e2a_ops.py` | Ascend extension; runtime needs 2 ranks | A2E/E2A Meta contracts and opt-in HCCL execution |
 | `a2e_e2a_a5.py` | A5, 2 devices | Standalone 1A1F hardware sample |
 | `test_async_cam_connector.py` | pytest, 1 device, vLLM-Ascend | Fused expert selection and routing weights |
 | `test_gmm_swiglu_quant_v2_layered_precision.py` | pytest, 1 device | Layered W13 numerics, both quantization scenarios |
 | `test_gmm_layered_device_group_list.py` | pytest, 1 device | Layered W2 with a device-produced group list |
-| `test_async_cam_layered_w4a8.py` | pytest, 1 device | The `AsyncCAMLayeredExecutor` chain end to end |
-| `test_async_cam_layered_w8a8.py` | pytest, 1 device | W8A8 chain versus native operators and exact eager/FULL replay |
+| `test_afd_async_layered_w4a8.py` | pytest, 1 device | The `AsyncCAMLayeredExecutor` chain end to end |
+| `test_afd_async_layered_w8a8.py` | pytest, 1 device | W8A8 chain versus native operators and exact eager/FULL replay |
 | `test_attention_gate_numerics.py` | pytest, 1 device | Gate, router, and activation components |
 | `__init__.py` | - | Package marker |
 
@@ -117,13 +117,13 @@ completed nonempty stages on every Attention rank.
 From the repository root, no torch or Ascend installation is needed for:
 
 ```bash
-python tests/npu/async_cam_precision.py --help
-python tests/npu/async_cam_precision.py --dry-run
-python tests/npu/async_cam_performance.py --dry-run
+python tests/npu/afd_async_precision.py --help
+python tests/npu/afd_async_precision.py --dry-run
+python tests/npu/afd_async_performance.py --dry-run
 python tests/npu/gmm_layered_performance.py --dry-run
-python -m unittest tests.npu.test_async_cam_harness \
-  tests.npu.test_async_cam_performance \
-  tests.npu.test_async_cam_golden \
+python -m unittest tests.npu.test_afd_async_harness \
+  tests.npu.test_afd_async_performance \
+  tests.npu.test_afd_async_golden \
   tests.npu.test_gmm_layered_performance
 ```
 
@@ -136,7 +136,7 @@ prints the derived `M` and `C`, every case on both launch paths, and any
 modelling warning, and it runs under `python3 -S` so a device import fails
 loudly rather than silently.
 
-`test_async_cam_golden` runs tensor regression tests when CPU PyTorch is
+`test_afd_async_golden` runs tensor regression tests when CPU PyTorch is
 installed and otherwise reports skips. It needs no torch-npu or NPU. It checks
 FP16/BF16 output rounding, FP32 accumulation order, quantization budgets and
 strict bit comparisons; the other three test modules need only standard Python.
@@ -148,8 +148,8 @@ crash.
 
 ## Native setup
 
-Use Ascend 910C with the matching PyTorch, torch-npu, CANN/HCCL stack and an
-AFD extension built with all four operators. Follow the native build guide:
+Use Ascend 910C or 950 with the matching PyTorch, torch-npu, CANN/HCCL stack
+and an AFD extension built with all four operators. Select the SoC at build time.
 
 ```bash
 SOC_VERSION=910c AFD_BUILD_ASCEND_OPS=1 \
@@ -182,19 +182,19 @@ that all accepted configurations have been qualified on hardware.
 
 ```bash
 timeout --kill-after=30s 600s torchrun --standalone --nproc_per_node=4 \
-  tests/npu/async_cam_precision.py --dtype fp16 --dynamic-quant 0
+  tests/npu/afd_async_precision.py --dtype fp16 --dynamic-quant 0
 
 # Multiple chunks, quantized BF16, and repeated use of the same HCCL windows.
 timeout --kill-after=30s 600s torchrun --standalone --nproc_per_node=4 \
-  tests/npu/async_cam_precision.py --dtype bf16 --dynamic-quant 1 --capacity 4
+  tests/npu/afd_async_precision.py --dtype bf16 --dynamic-quant 1 --capacity 4
 
 # Empty experts and an entirely empty MoE participant still send completion.
 timeout --kill-after=30s 600s torchrun --standalone --nproc_per_node=4 \
-  tests/npu/async_cam_precision.py --routing sparse --capacity 16
+  tests/npu/afd_async_precision.py --routing sparse --capacity 16
 
 # Two independent Attention groups: receive order may vary by readiness.
 timeout --kill-after=30s 600s torchrun --standalone --nproc_per_node=6 \
-  tests/npu/async_cam_precision.py --attn-ranks 4 --moe-ranks 2 --tp-size 2 \
+  tests/npu/afd_async_precision.py --attn-ranks 4 --moe-ranks 2 --tp-size 2 \
   --lengths 7,5,3,1 --capacity 4
 ```
 
@@ -232,7 +232,7 @@ reported separately, under its own budget — see the combine note below.
 ### Quantization contract
 
 The dynamic-quantization contract is versioned in
-`async_cam_common._quantize_contract()`, which is the single place allowed to
+`afd_async_common._quantize_contract()`, which is the single place allowed to
 encode it. It mirrors `QuantProcess()` in
 `csrc/npu/ascend_kernels/afd_async_dispatch_send/op_kernel`: per-row FP32
 `amax`, multiplier `127/amax`, FP32 product rounding followed by
@@ -286,8 +286,8 @@ SOC_VERSION=910c pytest -q tests/npu/test_gmm_layered.py \
 ```bash
 SOC_VERSION=910c AFD_RUN_ASCEND_OP_RUNTIME=1 LOCAL_RANK=0 \
   pytest -o addopts= -v -ra -s \
-  tests/npu/test_async_cam_layered_w4a8.py \
-  tests/npu/test_async_cam_layered_w8a8.py \
+  tests/npu/test_afd_async_layered_w4a8.py \
+  tests/npu/test_afd_async_layered_w8a8.py \
   tests/npu/test_gmm_swiglu_quant_v2_layered_precision.py \
   tests/npu/test_gmm_layered_device_group_list.py
 ```
@@ -342,13 +342,36 @@ without it, whichever op runs first changes what the second sees.
 
 ## Performance
 
+For the A5 compact/MTE path, build with `SOC_VERSION=950`. Supply the
+platform's usable per-core UB size in bytes and the tiler's AIV cap
+(`min(platform AIV count, 48)`) to both precision and performance runs.
+These values describe the target for the harness preflight. Native tiling
+chooses the launch dimensions. To measure a BF16 four-Attention, four-FFN
+round with TP2, run the following commands on an eight-device Ascend host
+with `AIV_CAP` and `UB_BYTES` set for that device.
+
+```bash
+shape=(--soc-version 950 --aiv-count "$AIV_CAP" --ub-budget-bytes "$UB_BYTES"
+       --attn-ranks 4 --moe-ranks 4 --tp-size 2 --lengths 8 --capacity 64
+       --dtype bf16 --dynamic-quant 0 --window-mb 2048)
+python tests/npu/afd_async_performance.py "${shape[@]}" --dry-run
+torchrun --standalone --nproc-per-node=8 tests/npu/afd_async_precision.py "${shape[@]}"
+torchrun --standalone --nproc-per-node=8 tests/npu/afd_async_performance.py \
+  "${shape[@]}" --measure-mode cycle --warmup 2 --iterations 10 --output .cache/a5-cycle.json
+```
+
+The precision run compares the four-stage round against the CPU oracle. The
+benchmark repeats an untimed correctness check before collecting per-call
+host and NPU-event timings and the slowest rank's round time. Record the
+build revision, CANN/HCCL and torch-npu versions with the JSON report.
+
 ```bash
 timeout --kill-after=30s 600s torchrun --standalone --nproc_per_node=4 \
-  tests/npu/async_cam_performance.py --measure-mode both \
+  tests/npu/afd_async_performance.py --measure-mode both \
   --warmup 2 --iterations 10 --output .cache/async-cam-performance.json
 
 timeout --kill-after=30s 600s torchrun --standalone --nproc_per_node=4 \
-  tests/npu/async_cam_performance.py --measure-mode cycle \
+  tests/npu/afd_async_performance.py --measure-mode cycle \
   --warmup 5 --iterations 50 --dtype bf16 --dynamic-quant 1 \
   --output .cache/async-cam-cycle.json
 ```

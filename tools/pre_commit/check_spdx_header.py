@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Check source headers against the repository's license notices.
+# Create: 2026-08-26
+# Note: Explicitly licensed AFD tests have a separate MIT header.
+# History: 2026-08-26 create
 """Require SPDX license headers on source files.
 
 The copyright line uses the AFD plugin project name. Shell scripts (``.sh``)
@@ -34,6 +38,17 @@ class SPDXStatus(Enum):
 LICENSE_TEXT = "SPDX-License-Identifier: Apache-2.0"
 COPYRIGHT_TEXT = (
     "SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project"
+)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+HUAWEI_MIT_TESTS = frozenset(
+    {
+        REPO_ROOT / "tests/npu/test_afd_async_host_tiling.py",
+    }
+)
+HUAWEI_MIT_HEADER = (
+    "# SPDX-License-Identifier: MIT\n"
+    "# Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.\n"
+    f"# {COPYRIGHT_TEXT}\n"
 )
 FILE_STYLES = {
     ".py": HeaderStyle("#", preserve_shebang=True),
@@ -144,11 +159,19 @@ def add_header(file_path, status):
 def main():
     """Main function"""
     files_missing_both = []
+    invalid_mit_header = False
     files_missing_copyright = []
     files_missing_license = []
 
     for file_path in sys.argv[1:]:
         if Path(file_path).suffix not in FILE_STYLES:
+            continue
+        path = Path(file_path)
+        if path.resolve() in HUAWEI_MIT_TESTS:
+            if not path.read_text(encoding="utf-8").startswith(HUAWEI_MIT_HEADER):
+                print(f"{file_path} requires the following header:")
+                print(HUAWEI_MIT_HEADER, end="")
+                invalid_mit_header = True
             continue
         status = check_spdx_header_status(file_path)
 
@@ -181,7 +204,7 @@ def main():
                 print(f"  {file_path}")
                 add_header(file_path, SPDXStatus.MISSING_LICENSE)
 
-    sys.exit(1 if all_files_to_fix else 0)
+    sys.exit(1 if all_files_to_fix or invalid_mit_header else 0)
 
 
 if __name__ == "__main__":

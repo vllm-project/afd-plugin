@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: One real CAM A peer for a separately launched routed-only FFN service.
+# Create: 2026-11-11
+# Note: Pair the Attention client with a separately launched FFN service.
+# History: 2026-11-11 create
 """One real CAM A peer for a separately launched routed-only FFN service.
 
 This finite functional check uses the original checkpoint on F and every main
@@ -24,7 +28,7 @@ bootstrap_custom_op_env()
 import torch  # noqa: E402
 import torch_npu  # noqa: E402, F401
 
-from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available  # noqa: E402
+from afd_plugin.compat.npu.ops import ensure_afd_async_ops_available  # noqa: E402
 from afd_plugin.config import parse_afd_config  # noqa: E402
 from afd_plugin.connectors.metadata import (  # noqa: E402
     AFDTransferContext,
@@ -107,7 +111,7 @@ def main():
     checkpoint = V4CheckpointDescription.read(args.model)
     config = attention_config(checkpoint, args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    ensure_cam_async_ops_available()
+    ensure_afd_async_ops_available()
     torch.npu.set_device(args.device)
     connector = CAMAsyncAFDConnector(
         0, args.device, config, parse_afd_config(config), role_rank=0

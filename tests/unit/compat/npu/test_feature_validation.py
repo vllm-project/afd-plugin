@@ -186,7 +186,9 @@ def test_camp2p_admission_after_connector_preloaded(monkeypatch):
             id="four-ubatches",
         ),
         pytest.param(
-            _config_with(extra_config={"quant_mode": 1}), "quant_mode=0", id="quant"
+            _config_with(extra_config={"quant_mode": 1}),
+            r"supports quant_mode=\[0, 4\]; got 1",
+            id="quant",
         ),
         pytest.param(
             _config_with(connector="P2pNcclAFDConnector", extra_config={"core_num": 8}),
@@ -427,13 +429,6 @@ def test_npu_async_feature_validation_checks_receive_capacity(
     "extra_config,additional_config,model_type,use_mla,error",
     [
         ({}, {"mix_placement": True}, "deepseek_v4", False, "routed-only"),
-        (
-            {},
-            {"enable_shared_expert_dp": True},
-            "deepseek_v4",
-            False,
-            "shared-expert DP",
-        ),
         *[
             (
                 {},
@@ -468,6 +463,17 @@ def test_npu_async_mrv2_feature_boundaries(
     config.model_config.hf_text_config.model_type = model_type
     with pytest.raises(RuntimeError, match=error):
         _admit(config)
+
+
+def test_npu_async_mrv2_features_allow_shared_expert_dp():
+    config = _config_with(
+        **ASYNC_CAM,
+        enable_expert_parallel=True,
+        tensor_parallel_size=2,
+        extra_config={"attn_ranks_per_dp": 2},
+    )
+    config.additional_config["enable_shared_expert_dp"] = True
+    _admit(config)
 
 
 @pytest.mark.parametrize(

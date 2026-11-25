@@ -18,13 +18,15 @@ technical review, before delivery.
   changing that assertion leaves CI unable to catch drift.
 - `test-ready` (L2) and `test-merge` (L3) run on `l4_1`: the CPU unit
   selection (`pytest -m "not gpu and not vllm_runtime" tests/unit` plus
-  `tests/npu/test_async_cam_harness.py`, `test_async_cam_performance.py`,
-  `test_async_cam_golden.py`, `test_gmm_layered_performance.py`) and
+  `tests/npu/test_afd_async_harness.py`, `test_afd_async_performance.py`,
+  `test_afd_async_golden.py`, `test_gmm_layered_performance.py`) and
   `pytest tests/gpu/test_attention_routing.py`. The DeepSeek-V2-Lite
   seven-case GPU E2E gate runs on `l4_4`.
 - `test-weekly` (main + `WEEKLY=1`, or PR label `weekly-test`) adds Qwen3 MoE
-  (four cases), Qwen3.6 MoE (three cases), and DeepSeek-V2-Lite
-  `afd-graph-dbo-2a1f` on `h100_4`.
+  (four cases), Qwen3.6 MoE (three cases), DeepSeek-V2-Lite
+  `afd-graph-dbo-2a1f`, the DeepEP M2N device tests
+  (`tests/gpu/test_deepep_m2n_gpu.py`) and Qwen3 MoE
+  `afd-deepep-m2n-graph-dbo-2a2f` on `h100_4`.
 - `skip_ci.py` suppresses the whole default pipeline for docs-only
   (`docs/**`, any `*.md`, `mkdocs.yml`) or skip-mark-only diffs; label-only CI
   YAML edits gate per platform and level. Say what a green run does and does

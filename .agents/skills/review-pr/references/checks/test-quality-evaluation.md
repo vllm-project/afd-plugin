@@ -21,8 +21,8 @@ Enforce:
   regression class; check it before anything else.
 - New tests pass in the CI selection: `pytest tests/unit -m "not gpu and not
   vllm_runtime"`, plus the four CPU-only `tests/npu` modules CI names
-  (`test_async_cam_harness.py`, `test_async_cam_performance.py`,
-  `test_async_cam_golden.py`, `test_gmm_layered_performance.py`). Run (or
+  (`test_afd_async_harness.py`, `test_afd_async_performance.py`,
+  `test_afd_async_golden.py`, `test_gmm_layered_performance.py`). Run (or
   reason through) the selection for the changed directory.
 
 ## Markers and selection

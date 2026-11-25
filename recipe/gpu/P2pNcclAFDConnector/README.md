@@ -13,6 +13,8 @@ for the connector's rank mapping and configuration contract.
 ├── deepseek_v2_lite/
 │   ├── prefill_decode_colocation/       # explicit 2A2F, 4A4F and two-pod DBO recipes
 │   └── prefill_decode_disaggregation/   # 2P1A1F
+├── qwen3_30b_a3b/prefill_decode_colocation/          # 2a2f_graph_dp2tp1.sh
+├── qwen3_235b_a22b_fp8/prefill_decode_colocation/    # 2a2f_graph_dp2tp1.sh
 └── qwen3_5_122b_a10b_fp8/prefill_decode_colocation/  # multipod_2a_2a_2f_graph.sh
 ```
 

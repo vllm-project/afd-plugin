@@ -122,10 +122,23 @@ def _fail_if_unsupported_sync_attention_gate(
             f"TP={int(parallel.tensor_parallel_size)}",
         )
     if bool(parallel.enable_dbo) or bool(parallel.use_ubatching):
-        raise RuntimeError(
-            "Attention-side gate with the synchronous connector does not support "
-            "DBO or ubatching yet",
-        )
+        if int(parallel.num_ubatches) != 2:
+            raise RuntimeError(
+                "Attention-side gate with the synchronous connector requires "
+                f"exactly two microbatches; got {int(parallel.num_ubatches)}",
+            )
+        # At DP=1 the runtime never builds the ubatch runner, so accepting the
+        # configuration here would silently run without overlap.
+        if (
+            getattr(afd_config, "role", None) == "attention"
+            and int(parallel.data_parallel_size) <= 1
+        ):
+            raise RuntimeError(
+                "Attention-side gate with the synchronous connector requires "
+                "Attention DP > 1 for DBO/ubatching; at DP=1 the runtime does not "
+                "build the ubatch runner and DBO would not run. Got "
+                f"DP={int(parallel.data_parallel_size)}",
+            )
     if afd_config.connector != CAMP2P_CONNECTOR:
         raise RuntimeError(
             "Attention-side gate is only supported with "
@@ -233,13 +246,12 @@ def _fail_if_unsupported_npu_afd_async_features(
                 f"divisible by {ATTN_RANKS_PER_DP_CONFIG_KEY}",
             )
         additional_config = vllm_config.additional_config
-        if additional_config.get("enable_shared_expert_dp", False) or any(
+        if any(
             int(size) > 0
             for size in additional_config.get("finegrained_tp_config", {}).values()
         ):
             raise RuntimeError(
-                "AFD NPU ModelRunnerV2 Async CAM does not support finegrained TP "
-                "or shared-expert DP",
+                "AFD NPU ModelRunnerV2 Async CAM does not support finegrained TP",
             )
     if extra_info.dynamic_quant != 1:
         raise RuntimeError(

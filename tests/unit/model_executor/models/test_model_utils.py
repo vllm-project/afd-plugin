@@ -83,6 +83,30 @@ def test_model_config_rewrites_architecture_in_private_copy(
     assert hf_config.architectures == [architecture]
 
 
+@pytest.mark.parametrize(
+    "routed_experts_connector,expected_architecture",
+    [
+        (False, "AFDQwen3MoeForCausalLM"),
+        (True, "AFDQwen3MoeRoutedExperts"),
+    ],
+    ids=["full-model", "routed-experts-shell"],
+)
+def test_qwen3_routed_connector_selects_the_ffn_only_shell(
+    model_utils, routed_experts_connector, expected_architecture
+):
+    hf_config = SimpleNamespace(architectures=["Qwen3MoeForCausalLM"])
+    original = SimpleNamespace(hf_config=hf_config, hf_text_config=hf_config)
+
+    mapped = model_utils.get_afd_model_config(
+        original,
+        device_type="cuda",
+        routed_experts_connector=routed_experts_connector,
+    )
+
+    assert mapped.hf_config.architectures == [expected_architecture]
+    assert hf_config.architectures == ["Qwen3MoeForCausalLM"]
+
+
 def test_model_config_preserves_distinct_nested_text_config(model_utils):
     text = SimpleNamespace(model_type="qwen3_5_moe_text")
     original = SimpleNamespace(
