@@ -184,7 +184,7 @@ def test_config_defaults_and_round_trip():
         ({"receive_layout": "row"}, "receive_layout"),
         # vLLM's MoE kernel takes BF16 rows.
         (
-            {"receive_layout": "token", "payload_format": "fp8_block128_fp32"},
+            {"receive_layout": "token-major", "payload_format": "fp8_block128_fp32"},
             "needs payload_format='bf16'",
         ),
         # Removed in Phase 4b (now under ``network``): rejected, not ignored.
@@ -636,7 +636,7 @@ def test_handshake_rejects_attention_tp_and_capacity_mismatches(overrides, messa
     [
         ({(3, "hidden_size"): 4096}, "disagree on hidden_size"),
         ({(0, "payload_format"): "fp8"}, "disagree on payload_format"),
-        ({(0, "receive_layout"): "token"}, "disagree on receive_layout"),
+        ({(0, "receive_layout"): "token-major"}, "disagree on receive_layout"),
         ({(1, "expert_alignment"): 64}, "expert_alignment"),
         ({(0, "role"): "attention"}, "expected 'ffn'"),
         ({(2, "sm"): [8, 0]}, "SM90 or newer"),
@@ -1167,15 +1167,15 @@ def test_handshake_accepts_fp8_block_weights_for_fp8_payload():
     validate_handshake(infos, layout, NetworkConfig())
 
 
-def test_token_layout_leaves_the_weight_format_to_vllm():
-    """With ``receive_layout="token"`` FFN ranks that loaded FP8 experts pass
+def test_token_major_layout_leaves_the_weight_format_to_vllm():
+    """With ``receive_layout="token-major"`` FFN ranks that loaded FP8 experts pass
     the handshake with the BF16 payload, and the model check needs only the
     expert ids.
 
     Why: vLLM's own kernel runs the weights, so the connector reads none.
     """
     layout = DeepEPM2NLayout(ffn_size=2, attn_size=2, num_experts=128)
-    infos = _handshake(layout, config=DeepEPM2NConfig(receive_layout="token"))
+    infos = _handshake(layout, config=DeepEPM2NConfig(receive_layout="token-major"))
     for rank in range(layout.ffn_size):
         infos[rank]["ffn_deployment"] = _ffn_deployment(layout, "fp8_block128")
     token_experts = [
@@ -1194,7 +1194,7 @@ def test_token_layout_leaves_the_weight_format_to_vllm():
         SMALL_LAYOUT,
         hidden_size=SMALL_HIDDEN,
         payload_format="bf16",
-        receive_layout="token",
+        receive_layout="token-major",
     )
 
 

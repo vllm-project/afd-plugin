@@ -44,17 +44,17 @@ DEEPEP_M2N_FFN_SERVICE_SCENARIOS = (
 FFN_SERVICE_BACKEND = "gpu-deepep-m2n"
 # DeepEP M2N with one received row per token: the FFN runs the MoE kernel vLLM
 # selected instead of the connector's grouped GEMM.
-DEEPEP_M2N_TOKEN_SCENARIOS = (
-    "afd-deepep-m2n-token-eager-2a2f",
-    "afd-deepep-m2n-token-graph-2a2f",
-    "afd-deepep-m2n-token-graph-dbo-2a2f",
+DEEPEP_M2N_TOKEN_MAJOR_SCENARIOS = (
+    "afd-deepep-m2n-token-major-eager-2a2f",
+    "afd-deepep-m2n-token-major-graph-2a2f",
+    "afd-deepep-m2n-token-major-graph-dbo-2a2f",
 )
-TOKEN_LAYOUT_CONFIG = (("receive_layout", "token"),)
+TOKEN_LAYOUT_CONFIG = (("receive_layout", "token-major"),)
 MULTI_POD_IDS = (
     "afd-deepep-m2n-eager-2a2f",
     "afd-deepep-m2n-graph-2a2f",
     "afd-deepep-m2n-graph-dbo-2a2f",
-    *DEEPEP_M2N_TOKEN_SCENARIOS,
+    *DEEPEP_M2N_TOKEN_MAJOR_SCENARIOS,
 )
 MULTI_POD_GSM8K_SAMPLES = 100
 
@@ -106,9 +106,9 @@ def build_case(case_id: str, environment: CaseEnvironment) -> Case:
         "afd-deepep-m2n-graph-dbo-2a2f": (False, True, True, 2, 1, 2, 1),
         "afd-deepep-m2n-eager-tp2-2a2f": (False, False, False, 1, 2, 2, 1),
         "afd-deepep-m2n-graph-tp2-2a2f": (False, True, False, 1, 2, 2, 1),
-        "afd-deepep-m2n-token-eager-2a2f": (False, False, False, 2, 1, 2, 1),
-        "afd-deepep-m2n-token-graph-2a2f": (False, True, False, 2, 1, 2, 1),
-        "afd-deepep-m2n-token-graph-dbo-2a2f": (False, True, True, 2, 1, 2, 1),
+        "afd-deepep-m2n-token-major-eager-2a2f": (False, False, False, 2, 1, 2, 1),
+        "afd-deepep-m2n-token-major-graph-2a2f": (False, True, False, 2, 1, 2, 1),
+        "afd-deepep-m2n-token-major-graph-dbo-2a2f": (False, True, True, 2, 1, 2, 1),
         "afd-deepep-m2n-faas-eager-2a2f": (False, False, False, 2, 1, 2, 1),
         "afd-deepep-m2n-faas-graph-2a2f": (False, True, False, 2, 1, 2, 1),
         "afd-deepep-m2n-faas-graph-dbo-2a2f": (False, True, True, 2, 1, 2, 1),
@@ -117,8 +117,8 @@ def build_case(case_id: str, environment: CaseEnvironment) -> Case:
     baseline, graph, dbo, a_dp, a_tp, f_dp, f_tp = profiles[case_id]
     execution = DECODE_GRAPH if graph else EAGER
     ffn_service = case_id in DEEPEP_M2N_FFN_SERVICE_SCENARIOS
-    token_layout = case_id in DEEPEP_M2N_TOKEN_SCENARIOS
-    deepep = case_id in DEEPEP_M2N_SCENARIOS or ffn_service or token_layout
+    token_major = case_id in DEEPEP_M2N_TOKEN_MAJOR_SCENARIOS
+    deepep = case_id in DEEPEP_M2N_SCENARIOS or ffn_service or token_major
     deployment = execution.deployment(
         backend="gpu",
         attention=(a_dp, a_tp),
@@ -132,7 +132,7 @@ def build_case(case_id: str, environment: CaseEnvironment) -> Case:
         dbo=DboConfig(DBO_DECODE_THRESHOLD, DBO_PREFILL_THRESHOLD) if dbo else None,
         capture_size=CAPTURE_SIZE,
     )
-    if token_layout:
+    if token_major:
         deployment = replace(deployment, connector_extra_config=TOKEN_LAYOUT_CONFIG)
     if ffn_service:
         deployment = replace(deployment, ffn_service=FfnService(FFN_SERVICE_BACKEND))
@@ -176,7 +176,7 @@ if __name__ == "__main__":
             (
                 *SCENARIOS,
                 *DEEPEP_M2N_SCENARIOS,
-                *DEEPEP_M2N_TOKEN_SCENARIOS,
+                *DEEPEP_M2N_TOKEN_MAJOR_SCENARIOS,
                 *DEEPEP_M2N_FFN_SERVICE_SCENARIOS,
             ),
         )
