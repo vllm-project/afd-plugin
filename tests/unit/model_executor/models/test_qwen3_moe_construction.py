@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -18,6 +19,7 @@ else:
 pytest.importorskip("vllm")
 from torch import nn  # noqa: E402
 from vllm.config import CompilationMode, set_current_vllm_config  # noqa: E402
+from vllm.distributed import parallel_state  # noqa: E402
 from vllm.model_executor.layers import fused_moe  # noqa: E402
 
 from afd_plugin.config import DEEPEP_M2N_CONNECTOR, AFDConfig  # noqa: E402
@@ -33,6 +35,7 @@ DEEPEP_M2N_ATTENTION = AFDConfig(
     compute_gate_on_attention=True,
 )
 NATIVE_MOE_BLOCK = adapter.native.Qwen3MoeSparseMoeBlock
+NATIVE_MLP = adapter.native.Qwen3MoeMLP
 
 
 class _FakeMissingLayer(nn.Module):
@@ -319,6 +322,98 @@ def test_attention_moe_restores_vllm_experts_factory(
         )
 
     assert adapter.native.FusedMoEFactory is fused_moe.FusedMoEFactory
+
+
+def test_p2p_attention_tp2_builds_no_shared_expert(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_construction_env,
+) -> None:
+    """With P2P at Attention TP 2, Attention builds no shared expert, even one
+    that TP 2 cannot split, and the model config keeps its size.
+
+    Why: the FFN (here TP 1) runs it; vLLM's TP linear layers reject the size.
+    """
+    text_config = cuda_construction_env.model_config.hf_text_config
+    text_config.shared_expert_intermediate_size = 3
+    monkeypatch.setattr(adapter.native, "Qwen3MoeMLP", NATIVE_MLP)
+    # Attention rank 0 of TP 2, as vLLM's linear layers see it.
+    monkeypatch.setattr(
+        parallel_state, "_TP", SimpleNamespace(world_size=2, rank_in_group=0)
+    )
+    monkeypatch.setattr(
+        adapter.native, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+
+    layer = _make_layer(
+        monkeypatch,
+        role="attention",
+        layer_idx=0,
+        vllm_config=cuda_construction_env,
+    )
+
+    assert layer.mlp.shared_expert is None
+    assert layer.mlp.shared_expert_gate is None
+    assert text_config.shared_expert_intermediate_size == 3
+
+
+def test_attention_moe_swap_is_scoped_to_its_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_construction_env,
+) -> None:
+    """While one thread builds an Attention MoE block, another thread gets
+    vLLM's experts factory and cannot start an overlapping swap.
+
+    Why: the swap rebinds a vLLM module attribute that every thread sees.
+    """
+
+    def vllm_factory(**kwargs):
+        return "vllm experts"
+
+    monkeypatch.setattr(fused_moe, "FusedMoEFactory", vllm_factory)
+    monkeypatch.setattr(adapter.native, "FusedMoEFactory", vllm_factory)
+    in_swap, release = threading.Event(), threading.Event()
+
+    def paused_build_expert(vllm_config, **kwargs):
+        in_swap.set()
+        assert release.wait(timeout=30)
+        return nn.Identity()
+
+    monkeypatch.setattr(adapter, "build_expert", paused_build_expert)
+    built: list[nn.Module | BaseException] = []
+
+    def build_attention_layer() -> None:
+        try:
+            built.append(
+                _make_layer(
+                    monkeypatch,
+                    role="attention",
+                    layer_idx=0,
+                    vllm_config=cuda_construction_env,
+                )
+            )
+        except BaseException as error:
+            built.append(error)
+
+    builder = threading.Thread(target=build_attention_layer)
+    builder.start()
+    try:
+        assert in_swap.wait(timeout=30)
+        assert adapter.native.FusedMoEFactory(num_experts=8) == "vllm experts"
+        with pytest.raises(RuntimeError, match="already replaced"):
+            _make_layer(
+                monkeypatch,
+                role="attention",
+                layer_idx=1,
+                vllm_config=cuda_construction_env,
+            )
+    finally:
+        release.set()
+        builder.join(timeout=30)
+
+    [layer] = built
+    assert isinstance(layer, nn.Module), layer
+    assert isinstance(layer.mlp.experts, nn.Identity)
+    assert adapter.native.FusedMoEFactory is vllm_factory
 
 
 def test_ffn_role_constructs_only_native_moe(

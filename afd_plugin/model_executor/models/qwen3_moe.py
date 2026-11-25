@@ -10,6 +10,8 @@ connector (which requires ``compute_gate_on_attention``), Attention also runs
 the MoE gate and top-k, and FFN runs only the routed experts.
 """
 
+import copy
+import threading
 from collections.abc import Iterable
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -18,6 +20,7 @@ import torch
 import torch.nn as nn
 from transformers import Qwen3MoeConfig
 from vllm.config import VllmConfig
+from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.models import qwen3_moe as native
 from vllm.model_executor.models.utils import AutoWeightsLoader, maybe_prefix
 from vllm.platforms import current_platform
@@ -144,8 +147,9 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
 
     # Patch reason: native Qwen3 MoE constructs both Attention and FFN modules.
     # Patch functionality: construct only the large modules owned by the AFD role.
-    # Attention MoE layers build vLLM's block while qwen3_moe.FusedMoEFactory
-    # builds remote experts with build_expert(); vLLM's factory is restored after.
+    # Attention MoE layers build vLLM's block from a config view without the
+    # shared expert, while qwen3_moe.FusedMoEFactory builds remote experts with
+    # build_expert() for this thread only; vLLM's factory is restored after.
     # Signature: matches upstream; no added parameters.
     # Upstream: vLLM v0.32.0, vllm/model_executor/models/qwen3_moe.py
     # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
@@ -199,11 +203,26 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
                 mrope_positions_factor=mrope_positions_factor,
             )
             if self.is_moe_layer:
-                # Drops what the FFN runs (any shared expert, and the gate unless
-                # Attention computes it) and what build_expert() sets itself.
+                # The FFN runs any shared expert, so the block is built from a
+                # config view without one; at Attention TP > 1 it may not split.
+                text_config = copy.copy(config)
+                text_config.shared_expert_intermediate_size = 0
+                block_config = copy.copy(vllm_config)
+                block_config.model_config = copy.copy(vllm_config.model_config)
+                block_config.model_config.hf_text_config = text_config
+                # One swap at a time, so none restores another's out of order.
+                native_factory = native.FusedMoEFactory
+                if native_factory is not fused_moe.FusedMoEFactory:
+                    raise RuntimeError("qwen3_moe.FusedMoEFactory is already replaced")
+                owner = threading.get_ident()
+
+                # Drops the gate unless Attention computes it, and what
+                # build_expert() sets itself.
                 def remote_experts(**kwargs: Any) -> "MoERunner":
+                    # Blocks built on other threads keep vLLM's experts.
+                    if threading.get_ident() != owner:
+                        return native_factory(**kwargs)
                     for name in (
-                        "shared_experts",
                         "quant_config",
                         "enable_eplb",
                         "num_redundant_experts",
@@ -214,18 +233,16 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
                         kwargs["gate"] = None
                     return build_expert(vllm_config, **kwargs)
 
-                native_factory = native.FusedMoEFactory
                 native.FusedMoEFactory = remote_experts
                 try:
                     self.mlp = native.Qwen3MoeSparseMoeBlock(
-                        vllm_config=vllm_config,
+                        vllm_config=block_config,
                         prefix=f"{prefix}.mlp",
                     )
                 finally:
                     native.FusedMoEFactory = native_factory
                 if not afd_config.compute_gate_on_attention:
                     self.mlp.gate = None
-                self.mlp.shared_expert = self.mlp.shared_expert_gate = None
                 # TP peers hold the same tokens; each sends only its slice.
                 if _routes_on_attention(afd_config) and self.mlp.tp_size > 1:
                     self.mlp.is_sequence_parallel = True
