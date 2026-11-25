@@ -84,17 +84,34 @@ def test_model_config_rewrites_architecture_in_private_copy(
 
 
 @pytest.mark.parametrize(
-    "routed_experts_connector,expected_architecture",
+    ("architecture", "full_architecture", "routed_architecture"),
     [
-        (False, "AFDQwen3MoeForCausalLM"),
-        (True, "AFDQwen3MoeRoutedExperts"),
+        (
+            "Qwen3MoeForCausalLM",
+            "AFDQwen3MoeForCausalLM",
+            "AFDQwen3MoeRoutedExperts",
+        ),
+        (
+            "DeepseekV2ForCausalLM",
+            "AFDDeepseekV2ForCausalLM",
+            "AFDDeepseekV2RoutedExperts",
+        ),
     ],
+    ids=["qwen3-moe", "deepseek-v2"],
+)
+@pytest.mark.parametrize(
+    "routed_experts_connector",
+    [False, True],
     ids=["full-model", "routed-experts-shell"],
 )
-def test_qwen3_routed_connector_selects_the_ffn_only_shell(
-    model_utils, routed_experts_connector, expected_architecture
+def test_routed_connector_selects_the_ffn_only_shell(
+    model_utils,
+    architecture,
+    full_architecture,
+    routed_architecture,
+    routed_experts_connector,
 ):
-    hf_config = SimpleNamespace(architectures=["Qwen3MoeForCausalLM"])
+    hf_config = SimpleNamespace(architectures=[architecture])
     original = SimpleNamespace(hf_config=hf_config, hf_text_config=hf_config)
 
     mapped = model_utils.get_afd_model_config(
@@ -103,8 +120,9 @@ def test_qwen3_routed_connector_selects_the_ffn_only_shell(
         routed_experts_connector=routed_experts_connector,
     )
 
-    assert mapped.hf_config.architectures == [expected_architecture]
-    assert hf_config.architectures == ["Qwen3MoeForCausalLM"]
+    expected = routed_architecture if routed_experts_connector else full_architecture
+    assert mapped.hf_config.architectures == [expected]
+    assert hf_config.architectures == [architecture]
 
 
 def test_model_config_preserves_distinct_nested_text_config(model_utils):

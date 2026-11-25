@@ -337,16 +337,24 @@ def test_routed_experts_shell_builds_only_native_moe_blocks(
     construction_env,
 ) -> None:
     vllm_config = _model_config(layer_count=2)
+    vllm_config.additional_config = {
+        "afd": {
+            "role": "ffn",
+            "connector": DEEPEP_M2N_CONNECTOR,
+            "compute_gate_on_attention": True,
+        }
+    }
+    built_blocks: list[nn.Module] = []
+    base_moe = adapter.native.Qwen3MoeSparseMoeBlock
+
+    def make_moe(*args, **kwargs):
+        block = base_moe(*args, **kwargs)
+        block.experts = SimpleNamespace(routed_experts=object())
+        built_blocks.append(block)
+        return block
+
     monkeypatch.setattr(adapter, "current_platform", _platform(is_cuda=True))
-    monkeypatch.setattr(
-        adapter,
-        "parse_afd_config",
-        lambda *_args, **_kwargs: AFDConfig(
-            role="ffn",
-            connector=DEEPEP_M2N_CONNECTOR,
-            compute_gate_on_attention=True,
-        ),
-    )
+    monkeypatch.setattr(adapter.native, "Qwen3MoeSparseMoeBlock", make_moe)
 
     model = adapter.AFDQwen3MoeRoutedExperts(
         vllm_config=vllm_config,
@@ -362,8 +370,20 @@ def test_routed_experts_shell_builds_only_native_moe_blocks(
         "model.layers.1.mlp.weight",
     }
     assert model.get_experts_layer_indices() == (0, 1)
-    assert model.is_unused_checkpoint_weight("lm_head.weight")
+    assert model.get_routed_experts(0) is built_blocks[0].experts.routed_experts
+    assert model.get_routed_experts(1) is built_blocks[1].experts.routed_experts
     assert not model.is_unused_checkpoint_weight("model.layers.0.mlp.gate.weight")
+    assert not model.is_unused_checkpoint_weight(
+        "model.layers.0.mlp.experts.0.gate_proj.weight"
+    )
+    assert model.is_unused_checkpoint_weight("lm_head.weight")
+    assert model.is_unused_checkpoint_weight(
+        "model.layers.0.mlp.shared_expert.gate_proj.weight"
+    )
+    assert model.is_unused_checkpoint_weight("model.layers.0.self_attn.q_proj.weight")
+    assert model.is_unused_checkpoint_weight(
+        "mtp.layers.0.mlp.experts.0.gate_proj.weight"
+    )
 
 
 def test_attention_causal_lm_reports_its_remote_moe_blocks_as_native(

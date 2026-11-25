@@ -41,6 +41,24 @@ def default_routed_experts(block: nn.Module) -> RoutedExperts:
     return block.experts.routed_experts
 
 
+def is_routed_block_weight(
+    name: str,
+    *,
+    ffn_submodule: str = "mlp",
+    allowed_children: tuple[str, ...] = ("experts", "gate"),
+) -> bool:
+    """Return whether a checkpoint path targets routed experts or their gate."""
+    if name.startswith("mtp."):
+        return False
+    layer_path = layer_weight_path(name)
+    if layer_path is None:
+        return False
+    _layer_idx, stage, remainder = layer_path
+    return (
+        stage == ffn_submodule and bool(remainder) and remainder[0] in allowed_children
+    )
+
+
 @dataclass(frozen=True)
 class FFNExpertsSpec(Generic[_ConfigT]):
     """Model-family specification for building an experts-only FFN shell."""
@@ -188,4 +206,5 @@ __all__ = [
     "FFNExpertsSpec",
     "RoutedExpertsModel",
     "default_routed_experts",
+    "is_routed_block_weight",
 ]

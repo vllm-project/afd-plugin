@@ -74,6 +74,7 @@ layout, quantized weight contracts and native compute implementations:
 
 | Component | Responsibility | Dependencies |
 | --- | --- | --- |
+| `experts_shell.py` | Shared experts-only FFN shell (`AFDFFNExpertsModel`), model-family spec (`FFNExpertsSpec`), routed-experts protocol (`RoutedExpertsModel`), and checkpoint weight filter (`is_routed_block_weight`) | Plugin AFD config, `_weight_utils.layer_weight_path`, and vLLM's `AutoWeightsLoader`/`WeightsMapper`; no concrete model or worker imports |
 | `remote.py` | Connector-independent dense/MoE proxies, routed TP padding, and the Attention-role MoE runners built through vLLM's `FusedMoEFactory` | Connector contracts, the plugin AFD config, public vLLM helpers, the native fused-MoE factory, runner and routed-experts classes, and package forward context; no CAM, concrete model or compute imports |
 | `npu/async_cam.py` | CAM model-side TP/SP layout conversion, padding, output restoration and native DBO receive handoff | Connector contracts and native DBO hooks; no concrete model or compute imports |
 | `npu/expert_weights.py` | Loaded `QuantizedExpertWeights`, Ascend quantized layout validation, geometry and graph signatures | Torch tensors with the Layered/Mega W4A8/W8A8 storage and scale contracts; no native operator lookup or workspace allocation |
@@ -131,7 +132,7 @@ SFA/MLA/DSA-specific handling stays explicit inside that worker-side module.
 | DeepSeek V4 Ascend Hash-id boundary | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py), [`npu/deepseek_v4_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_attention_gate.py) | [`test_deepseek_v4_hash_ids.py`](../../../tests/unit/model_executor/test_deepseek_v4_hash_ids.py), [NPU model role tests](../../../tests/unit/model_executor/models/npu/test_deepseek_v4.py), ids-mode cases in [`test_camp2p_token_ids.py`](../../../tests/unit/connectors/test_camp2p_token_ids.py) |
 | Qwen3 MoE role-aware model and weight loading | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py), [`test_qwen3_moe_weight_policy.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_weight_policy.py) |
 | CUDA remote-experts boundary | [`ffn/remote.py`](../../../afd_plugin/model_executor/ffn/remote.py), [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py) | [`test_remote.py`](../../../tests/unit/model_executor/ffn/test_remote.py), [`test_p2p_experts_contract.py`](../../../tests/unit/connectors/test_p2p_experts_contract.py), [`test_deepseek_v2_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_proxy.py), bit-exact native-kernel parity in [`test_attention_routing.py`](../../../tests/gpu/test_attention_routing.py) |
-| Qwen3 MoE FFN-only routed-experts shell | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py) |
+| Shared FFN-only routed-experts shell | [`ffn/experts_shell.py`](../../../afd_plugin/model_executor/ffn/experts_shell.py), [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py), [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py) | [`test_experts_shell.py`](../../../tests/unit/model_executor/ffn/test_experts_shell.py), [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py), [`test_deepseek_v2_construction.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_construction.py) |
 | Forward-context adapter | [`forward_context.py`](../../../afd_plugin/forward_context.py) | [`test_forward_context.py`](../../../tests/unit/test_forward_context.py) |
 | NPU Async CAM native DBO handoff | [`async_cam_dbo.py`](../../../afd_plugin/connectors/npu/async_cam_runtime/async_cam_dbo.py), [`npu/ubatch_runner.py`](../../../afd_plugin/v1/worker/npu/ubatch_runner.py) | [`test_async_cam_dbo.py`](../../../tests/unit/connectors/npu/async_cam_runtime/test_async_cam_dbo.py), [`test_npu_model_runner_v2.py`](../../../tests/unit/v1/worker/test_npu_model_runner_v2.py) |
 | Ascend DeepSeek V4 FFN W8A8 scales | [`deepseek_v4_weights.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_weights.py) | [`test_deepseek_v4_weights.py`](../../../tests/unit/model_executor/models/npu/test_deepseek_v4_weights.py) |
@@ -150,6 +151,7 @@ registers lazy AFD wrapper paths under `AFD`-prefixed aliases.
 | --- | --- | --- |
 | `DeepseekForCausalLM` | `AFDDeepseekForCausalLM` | `AFDDeepseekForCausalLM` |
 | `DeepseekV2ForCausalLM` | `AFDDeepseekV2ForCausalLM` | `AFDDeepseekV2ForCausalLM` |
+| `DeepseekV2RoutedExperts` | `AFDDeepseekV2RoutedExperts` | `AFDDeepseekV2RoutedExperts` (internal FFN-only alias) |
 | `DeepseekV3ForCausalLM` | `AFDDeepseekV3ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `DeepseekV32ForCausalLM` | `AFDDeepseekV32ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `DeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` |
@@ -162,8 +164,10 @@ registers lazy AFD wrapper paths under `AFD`-prefixed aliases.
 Only AFD workers switch their worker-local model configuration to the matching
 alias before constructing the AFD model runner. Non-AFD workers keep the
 checkpoint architecture and resolve to vLLM's native model class.
-For CUDA FFN workers using a routed-experts connector, Qwen3 MoE selects the
-internal FFN-only shell alias instead of the CausalLM wrapper.
+For CUDA FFN workers and standalone GPU FFN services using a routed-experts
+connector, both Qwen3 MoE and DeepSeek V2 select their internal FFN-only shell
+alias (`AFDQwen3MoeRoutedExperts` / `AFDDeepseekV2RoutedExperts`, backed by
+`AFDFFNExpertsModel`) instead of the CausalLM wrapper.
 
 The DeepSeek, DeepSeek V2/V3/V3.2, and GLM aliases share the DeepSeek
 V2-derived implementation. DeepSeek V4, Qwen3 MoE, and Qwen3.5/3.6 each have a

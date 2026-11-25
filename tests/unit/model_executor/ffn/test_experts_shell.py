@@ -25,6 +25,7 @@ from afd_plugin.config import DEEPEP_M2N_CONNECTOR, AFDConfig  # noqa: E402
 from afd_plugin.model_executor.ffn.experts_shell import (  # noqa: E402
     AFDFFNExpertsModel,
     FFNExpertsSpec,
+    is_routed_block_weight,
 )
 
 MIXED_NUM_LAYERS = 3
@@ -347,3 +348,27 @@ def test_filter_safetensors_files_skips_non_routed_shards(tmp_path: Path) -> Non
     )
 
     assert kept == [str(routed_shard)]
+
+
+@pytest.mark.parametrize(
+    ("weight_name", "ffn_submodule", "expected"),
+    [
+        ("model.layers.1.mlp.experts.0.gate_proj.weight", "mlp", True),
+        ("model.layers.1.mlp.gate.weight", "mlp", True),
+        ("model.layers.1.mlp.gate.e_score_correction_bias", "mlp", True),
+        ("model.layers.1.mlp.shared_experts.gate_proj.weight", "mlp", False),
+        ("model.layers.1.mlp.shared_expert.gate_proj.weight", "mlp", False),
+        ("model.layers.0.mlp.gate_proj.weight", "mlp", False),
+        ("model.layers.1.self_attn.q_proj.weight", "mlp", False),
+        ("model.embed_tokens.weight", "mlp", False),
+        ("mtp.layers.1.mlp.experts.0.gate_proj.weight", "mlp", False),
+        ("model.layers.1.ffn.experts.0.gate_proj.weight", "ffn", True),
+        ("model.layers.1.mlp.experts.0.gate_proj.weight", "ffn", False),
+    ],
+)
+def test_is_routed_block_weight_filters_submodule_children_and_mtp(
+    weight_name: str,
+    ffn_submodule: str,
+    expected: bool,
+) -> None:
+    assert is_routed_block_weight(weight_name, ffn_submodule=ffn_submodule) is expected

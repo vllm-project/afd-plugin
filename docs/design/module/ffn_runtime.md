@@ -178,12 +178,14 @@ F, `--backend gpu-deepep-m2n`, under `ffn_faas/platforms/gpu/`:
   the FFN-only routed-experts architecture, pins vLLM's MoE backend to Triton
   before any FusedMoE is built, and creates the F-only world through vLLM's
   `init_worker_distributed_environment`.
-- The AFD model registry selects the FFN-only shell for the configured model.
-  For example, `AFDQwen3MoeRoutedExperts` keeps only `model.layers.<i>.mlp`
-  (native `Qwen3MoeSparseMoeBlock`) and loads through vLLM's
-  `DefaultModelLoader`, so the EP weight filter, FusedMoE expert loading and
-  strict loaded-weights check run unchanged; the embedding, final norm and LM
-  head are not allocated.
+- The AFD model registry selects the shared `AFDFFNExpertsModel` FFN-only shell
+  (`AFDQwen3MoeRoutedExperts` and `AFDDeepseekV2RoutedExperts`) for both
+  standalone `ffn_faas` and the DeepEP M2N `AFDFFNWorker` path. Each shell
+  builds only the MoE layers' native sparse blocks at `model.layers.<i>.mlp`
+  (leaving dense layers empty and omitting shared experts, embedding, final
+  norm, and LM head) and loads through vLLM's `DefaultModelLoader`, so the EP
+  weight filter, FusedMoE expert loading, and strict loaded-weights check run
+  unchanged.
 - `DeepEPM2NFFNBackend` constructs `GPUFFNRoutedExpertsModelRunner`, loads the
   shell through that runner, starts the connector, and delegates each step to
   `execute_connector_driven_step()`, the method the Worker loop also calls.

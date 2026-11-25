@@ -112,6 +112,7 @@ def test_register_afd_preserves_native_models_and_is_idempotent(registration):
     expected = {
         "AFDDeepseekForCausalLM": deepseek + "AFDDeepseekForCausalLM",
         "AFDDeepseekV2ForCausalLM": deepseek + "AFDDeepseekV2ForCausalLM",
+        "AFDDeepseekV2RoutedExperts": deepseek + "AFDDeepseekV2RoutedExperts",
         "AFDDeepseekV3ForCausalLM": deepseek + "AFDDeepseekV3ForCausalLM",
         "AFDDeepseekV32ForCausalLM": deepseek + "AFDDeepseekV3ForCausalLM",
         "AFDGlmMoeDsaForCausalLM": deepseek + "AFDGlmMoeDsaForCausalLM",

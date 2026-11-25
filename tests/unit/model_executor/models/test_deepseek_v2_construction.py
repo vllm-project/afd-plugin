@@ -103,7 +103,9 @@ def _vllm_config(*, layer_count: int = 2):
     return SimpleNamespace(
         cache_config=None,
         compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
-        model_config=SimpleNamespace(hf_config=config, use_mla=False),
+        model_config=SimpleNamespace(
+            hf_config=config, hf_text_config=config, use_mla=False
+        ),
         parallel_config=SimpleNamespace(
             enable_eplb=False,
             eplb_config=SimpleNamespace(num_redundant_experts=0),
@@ -671,3 +673,268 @@ def test_m2n_ffn_omits_attention_owned_shared_with_real_hf_config(
     assert native_configs[0] is not original
     assert native_configs[0].n_shared_experts is None
     assert original.n_shared_experts == 1
+
+
+class _FakeDeepseekRoutedExperts(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.w13_weight = nn.Parameter(
+            torch.empty(
+                config.n_routed_experts,
+                2 * config.moe_intermediate_size,
+                config.hidden_size,
+                dtype=torch.bfloat16,
+            )
+        )
+        self.w2_weight = nn.Parameter(
+            torch.empty(
+                config.n_routed_experts,
+                config.hidden_size,
+                config.moe_intermediate_size,
+                dtype=torch.bfloat16,
+            )
+        )
+
+
+def _make_fake_deepseek_moe_cls(
+    records: list[dict],
+    built_blocks: list[nn.Module],
+) -> type[nn.Module]:
+    class _FakeDeepseekMoE(nn.Module):
+        def __init__(
+            self,
+            *,
+            config,
+            parallel_config,
+            quant_config,
+            prefix="",
+            apply_routed_scale_to_output=False,
+        ) -> None:
+            super().__init__()
+            records.append(
+                {
+                    "config": config,
+                    "parallel_config": parallel_config,
+                    "quant_config": quant_config,
+                    "prefix": prefix,
+                    "apply_routed_scale_to_output": apply_routed_scale_to_output,
+                }
+            )
+            self.gate = GateLinear(config.hidden_size, config.n_routed_experts)
+            if getattr(config, "topk_method", None) == "noaux_tc":
+                self.gate.e_score_correction_bias = nn.Parameter(
+                    torch.empty(config.n_routed_experts, dtype=torch.float32)
+                )
+            if config.n_shared_experts is not None:
+                self.shared_experts = nn.Linear(
+                    config.hidden_size,
+                    config.moe_intermediate_size,
+                    bias=False,
+                )
+            self.experts = nn.Module()
+            self.experts.gate = self.gate
+            self.experts.routed_experts = _FakeDeepseekRoutedExperts(config)
+            built_blocks.append(self)
+
+    return _FakeDeepseekMoE
+
+
+def _deepseek_v2_routed_vllm_config(
+    *,
+    layer_count: int = 3,
+    first_k_dense_replace: int = 1,
+    n_shared_experts: int = 1,
+    use_sequence_parallel_moe: bool = False,
+):
+    from transformers import DeepseekV2Config
+
+    hf_config = DeepseekV2Config(
+        hidden_size=16,
+        intermediate_size=32,
+        moe_intermediate_size=8,
+        num_hidden_layers=layer_count,
+        first_k_dense_replace=first_k_dense_replace,
+        n_routed_experts=4,
+        n_shared_experts=n_shared_experts,
+        num_experts_per_tok=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        kv_lora_rank=8,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=4,
+        v_head_dim=4,
+        topk_method="noaux_tc",
+        vocab_size=32,
+    )
+    vllm_config = _vllm_config(layer_count=layer_count)
+    vllm_config.additional_config = {
+        "afd": {
+            "role": "ffn",
+            "connector": DEEPEP_M2N_CONNECTOR,
+            "compute_gate_on_attention": True,
+        }
+    }
+    vllm_config.model_config.hf_config = hf_config
+    vllm_config.model_config.hf_text_config = hf_config
+    vllm_config.parallel_config.use_sequence_parallel_moe = use_sequence_parallel_moe
+    return vllm_config, hf_config
+
+
+def test_routed_experts_shell_builds_only_moe_blocks_without_shared_experts(
+    monkeypatch,
+    cuda_construction_env,
+) -> None:
+    vllm_config, original = _deepseek_v2_routed_vllm_config()
+    records: list[dict] = []
+    built_blocks: list[nn.Module] = []
+    monkeypatch.setattr(
+        adapter.native,
+        "DeepseekV2MoE",
+        _make_fake_deepseek_moe_cls(records, built_blocks),
+    )
+    monkeypatch.setattr(
+        adapter.native.rocm_aiter_ops,
+        "is_fused_moe_enabled",
+        lambda: False,
+    )
+
+    model = adapter.AFDDeepseekV2RoutedExperts(vllm_config=vllm_config)
+
+    assert [record["prefix"] for record in records] == [
+        "model.layers.1.mlp",
+        "model.layers.2.mlp",
+    ]
+    assert all(record["config"] is not original for record in records)
+    assert all(record["config"].n_shared_experts is None for record in records)
+    assert all(record["apply_routed_scale_to_output"] is True for record in records)
+    assert original.n_shared_experts == 1
+    assert list(model.model.layers[0].parameters()) == []
+    assert list(model.model.layers[0].children()) == []
+    assert not any("shared_experts" in name for name in _parameter_names(model))
+    assert model.get_experts_layer_indices() == (1, 2)
+    assert model.get_routed_experts(1) is built_blocks[0].experts.routed_experts
+    assert model.get_routed_experts(2) is built_blocks[1].experts.routed_experts
+    with pytest.raises(ValueError, match="not an MoE layer"):
+        model.get_routed_experts(0)
+
+
+@pytest.mark.parametrize(
+    ("weight_name", "expected_unused"),
+    [
+        ("model.embed_tokens.weight", True),
+        ("model.norm.weight", True),
+        ("lm_head.weight", True),
+        ("model.layers.1.self_attn.q_proj.weight", True),
+        ("model.layers.0.mlp.gate_proj.weight", True),
+        ("model.layers.0.mlp.experts.0.gate_proj.weight", True),
+        ("model.layers.1.mlp.shared_experts.gate_proj.weight", True),
+        ("model.layers.3.mlp.experts.0.gate_proj.weight", True),
+        ("mtp.layers.1.mlp.experts.0.gate_proj.weight", True),
+        ("model.layers.1.mlp.experts.0.gate_proj.weight", False),
+        ("model.layers.2.mlp.experts.0.down_proj.weight", False),
+        ("model.layers.1.mlp.gate.weight", False),
+        ("model.layers.1.mlp.gate.e_score_correction_bias", False),
+    ],
+)
+def test_routed_experts_shell_checkpoint_weight_filter(
+    monkeypatch,
+    cuda_construction_env,
+    weight_name: str,
+    expected_unused: bool,
+) -> None:
+    vllm_config, _ = _deepseek_v2_routed_vllm_config()
+    monkeypatch.setattr(
+        adapter.native,
+        "DeepseekV2MoE",
+        _make_fake_deepseek_moe_cls([], []),
+    )
+    model = adapter.AFDDeepseekV2RoutedExperts(vllm_config=vllm_config)
+
+    assert model.is_unused_checkpoint_weight(weight_name) is expected_unused
+
+
+@pytest.mark.parametrize(
+    ("device_type", "use_sp_moe", "message"),
+    [
+        ("npu", False, "CUDA"),
+        ("cuda", True, "sequence-parallel MoE"),
+    ],
+    ids=["non-cuda", "sequence-parallel-moe"],
+)
+def test_routed_experts_shell_rejects_unsupported_config_before_building(
+    monkeypatch,
+    construction_env,
+    device_type: str,
+    use_sp_moe: bool,
+    message: str,
+) -> None:
+    vllm_config, _ = _deepseek_v2_routed_vllm_config(
+        use_sequence_parallel_moe=use_sp_moe
+    )
+    records: list[dict] = []
+    monkeypatch.setattr(
+        adapter.native,
+        "current_platform",
+        SimpleNamespace(device_type=device_type),
+    )
+    monkeypatch.setattr(
+        adapter.native,
+        "DeepseekV2MoE",
+        _make_fake_deepseek_moe_cls(records, []),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        adapter.AFDDeepseekV2RoutedExperts(vllm_config=vllm_config)
+
+    assert records == []
+
+
+def test_routed_experts_shell_matches_role_aware_ffn_routed_parameters(
+    monkeypatch,
+    construction_env,
+) -> None:
+    vllm_config, _ = _deepseek_v2_routed_vllm_config()
+    monkeypatch.setattr(
+        adapter.native,
+        "current_platform",
+        SimpleNamespace(device_type="cuda"),
+    )
+    _patch_model_constructor_dependencies(monkeypatch, construction_env)
+    records: list[dict] = []
+    monkeypatch.setattr(
+        adapter.native,
+        "DeepseekV2MoE",
+        _make_fake_deepseek_moe_cls(records, []),
+    )
+
+    shell = adapter.AFDDeepseekV2RoutedExperts(vllm_config=vllm_config)
+    full_model = adapter.AFDDeepseekV2Model(vllm_config=vllm_config, prefix="model")
+
+    assert shell.get_experts_layer_indices() == full_model.get_experts_layer_indices()
+    for layer_idx in shell.get_experts_layer_indices():
+        shell_params = {
+            (name, tuple(param.shape), param.dtype)
+            for name, param in shell.get_routed_experts(layer_idx).named_parameters()
+        }
+        full_params = {
+            (name, tuple(param.shape), param.dtype)
+            for name, param in full_model.get_routed_experts(
+                layer_idx
+            ).named_parameters()
+        }
+        assert shell_params == full_params
+    shell_names = _parameter_names(shell)
+    full_names = _parameter_names(full_model)
+    assert any(name.startswith("embed_tokens.") for name in full_names)
+    assert any(name.startswith("norm.") for name in full_names)
+    assert not any(
+        token in name
+        for name in shell_names
+        for token in (
+            "embed_tokens",
+            "norm",
+            "lm_head",
+            "shared_experts",
+            "layers.0.",
+        )
+    )
