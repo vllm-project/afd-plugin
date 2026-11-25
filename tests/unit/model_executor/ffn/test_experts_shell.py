@@ -82,7 +82,19 @@ def _is_moe_layer(config: Any, layer_idx: int) -> bool:
 
 
 def _is_routed_weight(name: str) -> bool:
-    return ".experts." in name
+    return is_routed_block_weight(
+        name,
+        allowed_children=("experts",),
+        layer_prefixes=("model.layers.", "model.language_model.layers."),
+    )
+
+
+def _write_shard(path: Path, weight_names: tuple[str, ...]) -> Path:
+    save_file(
+        {name: torch.zeros(WEIGHT_SHAPE) for name in weight_names},
+        str(path),
+    )
+    return path
 
 
 def _make_spec(
@@ -309,37 +321,71 @@ def test_load_weights_applies_hf_to_vllm_mapper() -> None:
     assert torch.equal(model.get_routed_experts(2).w13_weight, layer_2_tensor)
 
 
+def test_load_weights_allows_raw_checkpoint_stage_mapped_to_ffn_submodule() -> None:
+    spec = _make_spec(
+        ffn_submodule="mlp",
+        is_routed_expert_weight=lambda name: is_routed_block_weight(
+            name,
+            ffn_submodule="block_sparse_moe",
+            allowed_children=("experts",),
+        ),
+        hf_to_vllm_mapper=WeightsMapper(
+            orig_to_new_substr={".block_sparse_moe.": ".mlp."}
+        ),
+    )
+    model = AFDFFNExpertsModel(vllm_config=_vllm_config(), spec=spec)
+    layer_1_tensor = torch.full(WEIGHT_SHAPE, LAYER_1_FILL)
+    layer_2_tensor = torch.full(WEIGHT_SHAPE, LAYER_2_FILL)
+    unused_tensor = torch.ones(WEIGHT_SHAPE)
+    raw_layer_1 = "model.layers.1.block_sparse_moe.experts.routed_experts.w13_weight"
+    raw_layer_2 = "model.layers.2.block_sparse_moe.experts.routed_experts.w13_weight"
+    raw_dense = "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight"
+    raw_unmapped = "model.layers.1.mlp.experts.routed_experts.w13_weight"
+
+    assert model.is_unused_checkpoint_weight(raw_layer_1) is False
+    assert model.is_unused_checkpoint_weight(raw_dense) is True
+    assert model.is_unused_checkpoint_weight(raw_unmapped) is True
+
+    loaded = model.load_weights(
+        [
+            (raw_dense, unused_tensor),
+            (raw_unmapped, unused_tensor),
+            (raw_layer_1, layer_1_tensor),
+            (raw_layer_2, layer_2_tensor),
+        ]
+    )
+
+    assert loaded == {
+        "model.layers.1.mlp.experts.routed_experts.w13_weight",
+        "model.layers.2.mlp.experts.routed_experts.w13_weight",
+    }
+    assert torch.equal(model.get_routed_experts(1).w13_weight, layer_1_tensor)
+    assert torch.equal(model.get_routed_experts(2).w13_weight, layer_2_tensor)
+
+
 def test_filter_safetensors_files_skips_non_routed_shards(tmp_path: Path) -> None:
     model = AFDFFNExpertsModel(vllm_config=_vllm_config(), spec=_make_spec())
     assert model.fall_back_to_pt_during_load is False
 
-    unused_shard = tmp_path / "model-00001-of-00002.safetensors"
-    routed_shard = tmp_path / "model-00002-of-00002.safetensors"
-    out_of_range_weight = (
+    out_of_range = (
         f"model.layers.{OUT_OF_RANGE_LAYER}.mlp.experts.routed_experts.w13_weight"
     )
-    save_file(
-        {
-            name: torch.zeros(WEIGHT_SHAPE)
-            for name in (
-                "model.embed_tokens.weight",
-                "model.layers.0.mlp.experts.routed_experts.w13_weight",
-                "model.layers.1.self_attn.q_proj.weight",
-                "model.layers.1.mlp.shared_experts.gate_proj.weight",
-                out_of_range_weight,
-            )
-        },
-        str(unused_shard),
+    unused_shard = _write_shard(
+        tmp_path / "model-00001-of-00002.safetensors",
+        (
+            "model.embed_tokens.weight",
+            "model.layers.0.mlp.experts.routed_experts.w13_weight",
+            "model.layers.1.self_attn.q_proj.weight",
+            "model.layers.1.mlp.shared_experts.gate_proj.weight",
+            out_of_range,
+        ),
     )
-    save_file(
-        {
-            name: torch.zeros(WEIGHT_SHAPE)
-            for name in (
-                "model.layers.1.self_attn.v_proj.weight",
-                "model.layers.1.mlp.experts.routed_experts.w13_weight",
-            )
-        },
-        str(routed_shard),
+    routed_shard = _write_shard(
+        tmp_path / "model-00002-of-00002.safetensors",
+        (
+            "model.layers.1.self_attn.v_proj.weight",
+            "model.layers.1.mlp.experts.routed_experts.w13_weight",
+        ),
     )
 
     kept = filter_safetensors_files_by_weight_name(
@@ -362,13 +408,39 @@ def test_filter_safetensors_files_skips_non_routed_shards(tmp_path: Path) -> Non
         ("model.layers.1.self_attn.q_proj.weight", "mlp", False),
         ("model.embed_tokens.weight", "mlp", False),
         ("mtp.layers.1.mlp.experts.0.gate_proj.weight", "mlp", False),
+        ("model.mtp.layers.1.mlp.experts.0.gate_proj.weight", "mlp", False),
+        ("model.visual.layers.1.mlp.experts.0.gate_proj.weight", "mlp", False),
+        ("model.language_model.layers.1.mlp.experts.0.gate_proj.weight", "mlp", False),
         ("model.layers.1.ffn.experts.0.gate_proj.weight", "ffn", True),
         ("model.layers.1.mlp.experts.0.gate_proj.weight", "ffn", False),
     ],
 )
-def test_is_routed_block_weight_filters_submodule_children_and_mtp(
+def test_is_routed_block_weight_filters_prefixes_submodules_and_children(
     weight_name: str,
     ffn_submodule: str,
     expected: bool,
 ) -> None:
     assert is_routed_block_weight(weight_name, ffn_submodule=ffn_submodule) is expected
+
+
+@pytest.mark.parametrize(
+    ("weight_name", "expected"),
+    [
+        ("model.language_model.layers.1.mlp.experts.0.gate_proj.weight", True),
+        ("model.language_model.layers.1.mlp.gate.weight", True),
+        ("model.visual.layers.1.mlp.experts.0.gate_proj.weight", False),
+        ("model.mtp.layers.1.mlp.experts.0.gate_proj.weight", False),
+        ("model.layers.1.mlp.experts.0.gate_proj.weight", False),
+    ],
+)
+def test_is_routed_block_weight_honors_custom_layer_prefixes(
+    weight_name: str,
+    expected: bool,
+) -> None:
+    assert (
+        is_routed_block_weight(
+            weight_name,
+            layer_prefixes=("model.language_model.layers.",),
+        )
+        is expected
+    )

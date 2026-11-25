@@ -9,6 +9,7 @@ import json
 import math
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -80,6 +81,7 @@ PARITY_NUM_EXPERTS: Final[int] = 4
 PARITY_TOP_K: Final[int] = 2
 
 QWEN3_NUM_LAYERS: Final[int] = 2
+QWEN3_HEAD_DIM: Final[int] = PARITY_HIDDEN_SIZE // PARITY_NUM_HEADS
 DEEPSEEK_NUM_LAYERS: Final[int] = 3
 DEEPSEEK_FIRST_K_DENSE: Final[int] = 1
 DEEPSEEK_NUM_SHARED_EXPERTS: Final[int] = 1
@@ -87,6 +89,10 @@ DEEPSEEK_KV_LORA_RANK: Final[int] = 64
 DEEPSEEK_QK_NOPE_HEAD_DIM: Final[int] = 32
 DEEPSEEK_QK_ROPE_HEAD_DIM: Final[int] = 32
 DEEPSEEK_V_HEAD_DIM: Final[int] = 32
+DEEPSEEK_QK_HEAD_DIM: Final[int] = DEEPSEEK_QK_NOPE_HEAD_DIM + DEEPSEEK_QK_ROPE_HEAD_DIM
+DEEPSEEK_KV_PROJ_OUT: Final[int] = PARITY_NUM_HEADS * (
+    DEEPSEEK_QK_NOPE_HEAD_DIM + DEEPSEEK_V_HEAD_DIM
+)
 DEEPSEEK_ROUTED_SCALING_FACTOR: Final[float] = 2.5
 
 # Deterministic BF16/FP32 weight pattern with per-tensor seed offsets so no
@@ -108,8 +114,43 @@ FORBIDDEN_SHELL_TOKENS: Final[tuple[str, ...]] = (
     "self_attn",
 )
 
+_ATTN_PROJECTIONS: Final[dict[str, tuple[tuple[str, tuple[int, ...]], ...]]] = {
+    "qwen3_moe": (
+        ("q_proj", (PARITY_HIDDEN_SIZE, PARITY_HIDDEN_SIZE)),
+        ("k_proj", (PARITY_HIDDEN_SIZE, PARITY_HIDDEN_SIZE)),
+        ("v_proj", (PARITY_HIDDEN_SIZE, PARITY_HIDDEN_SIZE)),
+        ("o_proj", (PARITY_HIDDEN_SIZE, PARITY_HIDDEN_SIZE)),
+        ("q_norm", (QWEN3_HEAD_DIM,)),
+        ("k_norm", (QWEN3_HEAD_DIM,)),
+    ),
+    "deepseek_v2": (
+        ("q_proj", (PARITY_NUM_HEADS * DEEPSEEK_QK_HEAD_DIM, PARITY_HIDDEN_SIZE)),
+        (
+            "kv_a_proj_with_mqa",
+            (
+                DEEPSEEK_KV_LORA_RANK + DEEPSEEK_QK_ROPE_HEAD_DIM,
+                PARITY_HIDDEN_SIZE,
+            ),
+        ),
+        ("kv_a_layernorm", (DEEPSEEK_KV_LORA_RANK,)),
+        ("kv_b_proj", (DEEPSEEK_KV_PROJ_OUT, DEEPSEEK_KV_LORA_RANK)),
+        ("o_proj", (PARITY_HIDDEN_SIZE, PARITY_NUM_HEADS * DEEPSEEK_V_HEAD_DIM)),
+    ),
+}
+
 RoutingParams = dict[str, str | int | bool]
 ParityCase = tuple[str, RoutingParams]
+
+
+@dataclass(frozen=True)
+class _ParityCaseSpec:
+    family: str
+    hf_config: Qwen3MoeConfig | DeepseekV2Config
+    expected_shell_cls: str
+    expected_full_cls: str
+    moe_layers: tuple[int, ...]
+    dense_layers: tuple[int, ...]
+    has_correction_bias: bool
 
 
 @pytest.mark.skipif(
@@ -238,14 +279,33 @@ def _build_deepseek_v2_config(routing: RoutingParams) -> DeepseekV2Config:
     )
 
 
+def _build_parity_spec(family: str, routing: RoutingParams) -> _ParityCaseSpec:
+    if family == "qwen3_moe":
+        return _ParityCaseSpec(
+            family=family,
+            hf_config=_build_qwen3_config(),
+            expected_shell_cls="AFDQwen3MoeRoutedExperts",
+            expected_full_cls="AFDQwen3MoeForCausalLM",
+            moe_layers=tuple(range(QWEN3_NUM_LAYERS)),
+            dense_layers=(),
+            has_correction_bias=False,
+        )
+    if family == "deepseek_v2":
+        return _ParityCaseSpec(
+            family=family,
+            hf_config=_build_deepseek_v2_config(routing),
+            expected_shell_cls="AFDDeepseekV2RoutedExperts",
+            expected_full_cls="AFDDeepseekV2ForCausalLM",
+            moe_layers=tuple(range(DEEPSEEK_FIRST_K_DENSE, DEEPSEEK_NUM_LAYERS)),
+            dense_layers=tuple(range(DEEPSEEK_FIRST_K_DENSE)),
+            has_correction_bias=routing.get("topk_method") == "noaux_tc",
+        )
+    raise ValueError(f"Unsupported parity test family: {family!r}")
+
+
 def _write_synthetic_checkpoint(
     checkpoint_dir: Path,
-    family: str,
-    hf_config: Qwen3MoeConfig | DeepseekV2Config,
-    *,
-    moe_layers: tuple[int, ...],
-    dense_layers: tuple[int, ...],
-    has_correction_bias: bool,
+    spec: _ParityCaseSpec,
 ) -> tuple[Path, Path, dict[int, torch.Tensor], dict[int, torch.Tensor]]:
     """Write a two-shard safetensors checkpoint plus its index file.
 
@@ -253,7 +313,7 @@ def _write_synthetic_checkpoint(
     model (embeddings, norms, lm_head, attention, dense MLP, and shared
     experts). Shard 2 holds only the MoE layers' routed experts and gates.
     """
-    hf_config.save_pretrained(str(checkpoint_dir))
+    spec.hf_config.save_pretrained(str(checkpoint_dir))
     non_routed: dict[str, torch.Tensor] = {
         "model.embed_tokens.weight": _pattern_tensor(
             (PARITY_VOCAB_SIZE, PARITY_HIDDEN_SIZE), seed=1
@@ -265,7 +325,8 @@ def _write_synthetic_checkpoint(
     }
 
     seed = 10
-    num_layers = int(hf_config.num_hidden_layers)
+    num_layers = int(spec.hf_config.num_hidden_layers)
+    attn_projections = _ATTN_PROJECTIONS[spec.family]
     for layer_idx in range(num_layers):
         prefix = f"model.layers.{layer_idx}"
         non_routed[f"{prefix}.input_layernorm.weight"] = _pattern_tensor(
@@ -275,47 +336,13 @@ def _write_synthetic_checkpoint(
             (PARITY_HIDDEN_SIZE,), seed=seed + 1
         )
         seed += 2
-        if family == "qwen3_moe":
-            head_dim = PARITY_HIDDEN_SIZE // PARITY_NUM_HEADS
-            for proj_name, shape in (
-                ("q_proj", (PARITY_HIDDEN_SIZE, PARITY_HIDDEN_SIZE)),
-                ("k_proj", (PARITY_HIDDEN_SIZE, PARITY_HIDDEN_SIZE)),
-                ("v_proj", (PARITY_HIDDEN_SIZE, PARITY_HIDDEN_SIZE)),
-                ("o_proj", (PARITY_HIDDEN_SIZE, PARITY_HIDDEN_SIZE)),
-                ("q_norm", (head_dim,)),
-                ("k_norm", (head_dim,)),
-            ):
-                non_routed[f"{prefix}.self_attn.{proj_name}.weight"] = _pattern_tensor(
-                    shape, seed=seed
-                )
-                seed += 1
-        else:
-            qk_head_dim = DEEPSEEK_QK_NOPE_HEAD_DIM + DEEPSEEK_QK_ROPE_HEAD_DIM
-            kv_proj_out = PARITY_NUM_HEADS * (
-                DEEPSEEK_QK_NOPE_HEAD_DIM + DEEPSEEK_V_HEAD_DIM
+        for proj_name, shape in attn_projections:
+            non_routed[f"{prefix}.self_attn.{proj_name}.weight"] = _pattern_tensor(
+                shape, seed=seed
             )
-            for proj_name, shape in (
-                ("q_proj", (PARITY_NUM_HEADS * qk_head_dim, PARITY_HIDDEN_SIZE)),
-                (
-                    "kv_a_proj_with_mqa",
-                    (
-                        DEEPSEEK_KV_LORA_RANK + DEEPSEEK_QK_ROPE_HEAD_DIM,
-                        PARITY_HIDDEN_SIZE,
-                    ),
-                ),
-                ("kv_a_layernorm", (DEEPSEEK_KV_LORA_RANK,)),
-                ("kv_b_proj", (kv_proj_out, DEEPSEEK_KV_LORA_RANK)),
-                (
-                    "o_proj",
-                    (PARITY_HIDDEN_SIZE, PARITY_NUM_HEADS * DEEPSEEK_V_HEAD_DIM),
-                ),
-            ):
-                non_routed[f"{prefix}.self_attn.{proj_name}.weight"] = _pattern_tensor(
-                    shape, seed=seed
-                )
-                seed += 1
+            seed += 1
 
-    for layer_idx in dense_layers:
+    for layer_idx in spec.dense_layers:
         mlp_prefix = f"model.layers.{layer_idx}.mlp"
         for proj_name, shape in (
             ("gate_proj", (PARITY_INTERMEDIATE_SIZE, PARITY_HIDDEN_SIZE)),
@@ -327,9 +354,11 @@ def _write_synthetic_checkpoint(
             )
             seed += 1
 
-    if family == "deepseek_v2":
-        shared_intermediate = PARITY_MOE_INTERMEDIATE_SIZE * DEEPSEEK_NUM_SHARED_EXPERTS
-        for layer_idx in moe_layers:
+    if isinstance(spec.hf_config, DeepseekV2Config) and spec.hf_config.n_shared_experts:
+        shared_intermediate = (
+            PARITY_MOE_INTERMEDIATE_SIZE * spec.hf_config.n_shared_experts
+        )
+        for layer_idx in spec.moe_layers:
             shared_prefix = f"model.layers.{layer_idx}.mlp.shared_experts"
             for proj_name, shape in (
                 ("gate_proj", (shared_intermediate, PARITY_HIDDEN_SIZE)),
@@ -344,13 +373,13 @@ def _write_synthetic_checkpoint(
     routed: dict[str, torch.Tensor] = {}
     expected_w13: dict[int, torch.Tensor] = {}
     expected_w2: dict[int, torch.Tensor] = {}
-    for layer_idx in moe_layers:
+    for layer_idx in spec.moe_layers:
         mlp_prefix = f"model.layers.{layer_idx}.mlp"
         routed[f"{mlp_prefix}.gate.weight"] = _pattern_tensor(
             (PARITY_NUM_EXPERTS, PARITY_HIDDEN_SIZE), seed=seed
         )
         seed += 1
-        if has_correction_bias:
+        if spec.has_correction_bias:
             routed[f"{mlp_prefix}.gate.e_score_correction_bias"] = _pattern_tensor(
                 (PARITY_NUM_EXPERTS,), seed=seed, dtype=torch.float32
             )
@@ -446,24 +475,20 @@ def _load_ffn_model(
 
 def _assert_shell_parity(
     *,
+    spec: _ParityCaseSpec,
     shell: nn.Module,
     full_model: nn.Module,
-    expected_shell_cls: str,
-    expected_full_cls: str,
-    expected_moe_layers: tuple[int, ...],
-    dense_layers: tuple[int, ...],
     expected_w13: dict[int, torch.Tensor],
     expected_w2: dict[int, torch.Tensor],
     shard_paths: list[str],
     routed_shard_path: str,
-    has_correction_bias: bool,
 ) -> None:
-    assert type(shell).__name__ == expected_shell_cls
-    assert type(full_model).__name__ == expected_full_cls
+    assert type(shell).__name__ == spec.expected_shell_cls
+    assert type(full_model).__name__ == spec.expected_full_cls
     assert isinstance(shell, AFDFFNExpertsModel)
     assert isinstance(full_model, (AFDQwen3MoeForCausalLM, AFDDeepseekV2ForCausalLM))
 
-    assert shell.get_experts_layer_indices() == expected_moe_layers
+    assert shell.get_experts_layer_indices() == spec.moe_layers
     assert shell.get_experts_layer_indices() == full_model.get_experts_layer_indices()
 
     for layer_idx in shell.get_experts_layer_indices():
@@ -501,14 +526,14 @@ def _assert_shell_parity(
 
     forbidden_tokens = (
         *FORBIDDEN_SHELL_TOKENS,
-        *(f"layers.{layer_idx}." for layer_idx in dense_layers),
+        *(f"layers.{layer_idx}." for layer_idx in spec.dense_layers),
     )
     assert not any(
         token in name for name in shell_param_names for token in forbidden_tokens
     )
-    for layer_idx in expected_moe_layers:
+    for layer_idx in spec.moe_layers:
         bias_name = f"model.layers.{layer_idx}.mlp.gate.e_score_correction_bias"
-        assert (bias_name in shell_param_names) is has_correction_bias
+        assert (bias_name in shell_param_names) is spec.has_correction_bias
 
     kept_shards = filter_safetensors_files_by_weight_name(
         shard_paths,
@@ -520,31 +545,12 @@ def _assert_shell_parity(
 def _run_experts_shell_parity(model_dir: str, case: ParityCase) -> None:
     """Child-process body verifying shell vs role-aware FFN expert parity."""
     family, routing = case
-    if family == "qwen3_moe":
-        hf_config: Qwen3MoeConfig | DeepseekV2Config = _build_qwen3_config()
-        expected_full_cls = "AFDQwen3MoeForCausalLM"
-        expected_shell_cls = "AFDQwen3MoeRoutedExperts"
-        moe_layers = tuple(range(QWEN3_NUM_LAYERS))
-        dense_layers: tuple[int, ...] = ()
-        has_correction_bias = False
-    elif family == "deepseek_v2":
-        hf_config = _build_deepseek_v2_config(routing)
-        expected_full_cls = "AFDDeepseekV2ForCausalLM"
-        expected_shell_cls = "AFDDeepseekV2RoutedExperts"
-        moe_layers = tuple(range(DEEPSEEK_FIRST_K_DENSE, DEEPSEEK_NUM_LAYERS))
-        dense_layers = tuple(range(DEEPSEEK_FIRST_K_DENSE))
-        has_correction_bias = routing.get("topk_method") == "noaux_tc"
-    else:
-        raise ValueError(f"Unsupported parity test family: {family!r}")
+    spec = _build_parity_spec(family, routing)
 
     checkpoint_dir = Path(model_dir)
     shard1_path, shard2_path, expected_w13, expected_w2 = _write_synthetic_checkpoint(
         checkpoint_dir,
-        family,
-        hf_config,
-        moe_layers=moe_layers,
-        dense_layers=dense_layers,
-        has_correction_bias=has_correction_bias,
+        spec,
     )
 
     register_afd()
@@ -567,17 +573,13 @@ def _run_experts_shell_parity(model_dir: str, case: ParityCase) -> None:
         full_model = _load_ffn_model(model_dir, routed_experts_connector=False)
         shell = _load_ffn_model(model_dir, routed_experts_connector=True)
         _assert_shell_parity(
+            spec=spec,
             shell=shell,
             full_model=full_model,
-            expected_shell_cls=expected_shell_cls,
-            expected_full_cls=expected_full_cls,
-            expected_moe_layers=moe_layers,
-            dense_layers=dense_layers,
             expected_w13=expected_w13,
             expected_w2=expected_w2,
             shard_paths=[str(shard1_path), str(shard2_path)],
             routed_shard_path=str(shard2_path),
-            has_correction_bias=has_correction_bias,
         )
     finally:
         reset_workspace_manager()

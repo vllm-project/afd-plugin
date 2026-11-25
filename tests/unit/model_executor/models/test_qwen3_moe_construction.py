@@ -107,6 +107,7 @@ def _model_config(
         model_config=SimpleNamespace(hf_text_config=config),
         parallel_config=SimpleNamespace(
             enable_eplb=False,
+            eplb_config=SimpleNamespace(num_redundant_experts=0),
             pipeline_parallel_size=1,
             tensor_parallel_size=1,
             use_sequence_parallel_moe=False,
@@ -384,6 +385,57 @@ def test_routed_experts_shell_builds_only_native_moe_blocks(
     assert model.is_unused_checkpoint_weight(
         "mtp.layers.0.mlp.experts.0.gate_proj.weight"
     )
+
+
+def test_routed_experts_shell_matches_role_aware_ffn_moe_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    construction_env,
+) -> None:
+    vllm_config = _model_config(layer_count=2)
+    vllm_config.compilation_config = SimpleNamespace(mode=CompilationMode.NONE)
+    vllm_config.additional_config = {
+        "afd": {
+            "role": "ffn",
+            "connector": DEEPEP_M2N_CONNECTOR,
+            "compute_gate_on_attention": True,
+        }
+    }
+
+    def make_layers(count, factory, *, prefix):
+        layers = nn.ModuleList(
+            factory(f"{prefix}.{layer_idx}") for layer_idx in range(count)
+        )
+        return 0, count, layers
+
+    monkeypatch.setattr(adapter, "current_platform", _platform(is_cuda=True))
+    monkeypatch.setattr(
+        adapter.native,
+        "VocabParallelEmbedding",
+        lambda *_args, **_kwargs: nn.Embedding(1, 1),
+    )
+    monkeypatch.setattr(adapter.native, "make_layers", make_layers)
+
+    shell = adapter.AFDQwen3MoeRoutedExperts(vllm_config=vllm_config)
+    shell_moe_prefixes = list(construction_env["moe"])
+    construction_env["moe"].clear()
+    full_model = adapter.AFDQwen3MoeModel(vllm_config=vllm_config, prefix="model")
+    full_moe_prefixes = list(construction_env["moe"])
+
+    assert shell.get_experts_layer_indices() == (0, 1)
+    assert shell.get_experts_layer_indices() == full_model.get_experts_layer_indices()
+    assert shell_moe_prefixes == ["model.layers.0.mlp", "model.layers.1.mlp"]
+    assert shell_moe_prefixes == full_moe_prefixes
+
+    shell_names = set(dict(shell.named_parameters()))
+    full_names = set(dict(full_model.named_parameters()))
+    assert shell_names == {
+        "model.layers.0.mlp.weight",
+        "model.layers.1.mlp.weight",
+    }
+    assert any(name.startswith("embed_tokens.") for name in full_names)
+    assert any(name.startswith("norm.") for name in full_names)
+    forbidden = ("embed_tokens", "norm", "lm_head", "self_attn")
+    assert not any(token in name for name in shell_names for token in forbidden)
 
 
 def test_attention_causal_lm_reports_its_remote_moe_blocks_as_native(

@@ -46,9 +46,10 @@ def is_routed_block_weight(
     *,
     ffn_submodule: str = "mlp",
     allowed_children: tuple[str, ...] = ("experts", "gate"),
+    layer_prefixes: tuple[str, ...] = ("model.layers.",),
 ) -> bool:
     """Return whether a checkpoint path targets routed experts or their gate."""
-    if name.startswith("mtp."):
+    if not name.startswith(layer_prefixes):
         return False
     layer_path = layer_weight_path(name)
     if layer_path is None:
@@ -164,12 +165,7 @@ class AFDFFNExpertsModel(nn.Module):
     def is_unused_checkpoint_weight(self, name: str) -> bool:
         """Whether vLLM can skip this checkpoint tensor or shard."""
         layer_path = layer_weight_path(name)
-        if layer_path is None:
-            return True
-        layer_idx, stage, _remainder = layer_path
-        if stage != self._spec.ffn_submodule:
-            return True
-        if layer_idx not in self._moe_layer_index_set:
+        if layer_path is None or layer_path[0] not in self._moe_layer_index_set:
             return True
         return not self._spec.is_routed_expert_weight(name)
 
