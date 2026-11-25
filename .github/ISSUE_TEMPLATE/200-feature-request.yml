@@ -9,7 +9,7 @@ body:
       value: >
         Before submitting, please search existing issues and RFCs. Keep proposals
         tied to the applicable target unless the issue proposes a version expansion.
-        GPU uses vLLM v0.34.0. Ascend uses vLLM v0.32.0 and the pinned
+        GPU uses vLLM v0.34.0. Ascend uses vLLM v0.34.0 and the pinned
         vLLM-Ascend revision.
 
   - type: textarea

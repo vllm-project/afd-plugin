@@ -42,20 +42,22 @@ and firmware, then confirm device visibility with `npu-smi info`.
 | --- | --- |
 | Python | Package range `3.11–3.13`; tested `3.12.13` |
 | vLLM | `0.34.0`, commit `62d4bc3c7e33b1b6c906e233e6af2d3506c482ca` |
-| vLLM-Ascend | commit [`bd42eea0`](https://github.com/vllm-project/vllm-ascend/commit/bd42eea01d8312c4df469fabaed45f77a12df4d3) |
-| Tested CANN / torch / torch-npu | `9.2` / `2.10.0+cpu` / `2.10.0.post7` |
-| Tested Triton Ascend / CAM | `3.6` / `1.3` |
+| vLLM-Ascend | commit [`7dcdb690`](https://github.com/vllm-project/vllm-ascend/commit/7dcdb690caf879a17ab07382880d5773f5202e20) |
+| Tested CANN / torch / torch-npu | `9.3.0` / `2.10.0+cpu` / `2.10.0.post7` |
+| Tested Triton Ascend / CAM | `3.6.0.post2` / `1.3.0` |
 
 See the [support reference](support.md#validation-limits) for hardware coverage
 and known shutdown limitations.
 
 ### Environment
 
-The recorded A3 environment uses the pinned pair and stack above. The
-repository does not claim a released container tag for the Ascend target. Use the
-[installation guide at that source snapshot](https://github.com/vllm-project/vllm-ascend/blob/bd42eea01d8312c4df469fabaed45f77a12df4d3/docs/source/getting_started/installation.md)
-to prepare a matching A3/openEuler environment, then install AFD from the
-repository root.
+The recorded A3 environment uses the official Ubuntu 22.04 arm64 nightly
+from [vLLM-Ascend build 45558867839](https://github.com/vllm-project/vllm-ascend/actions/runs/45558867839).
+Pull the pinned manifest before installing AFD from the repository root.
+
+```text
+quay.io/ascend/vllm-ascend@sha256:daa1bc6a1d780b49678ba49fa7f296cdad3d8a16a1994784c02c4754a2d4d562
+```
 
 ### Install AFD
 

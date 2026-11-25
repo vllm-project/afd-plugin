@@ -28,7 +28,7 @@ validation_paths:
   - "tests/unit/v1/worker/test_npu_runtime.py"
 upstream_refs:
   - "GPU: vLLM 0.34.0 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca"
-  - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "NPU target: vLLM 0.34.0 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca"
   - "vLLM vllm.v1.engine.core.EngineCore and EngineCoreProc"
   - "vLLM vllm.v1.engine.core_client.DPAsyncMPClient"
   - "vLLM vllm.forward_context.set_forward_context"
@@ -68,25 +68,18 @@ and selection factories do not repeat that admission. No validation cache,
 new validation framework or additional monkey patch is used.
 
 The package extra pins vLLM `0.34.0` for the GPU backend.
-[`compat/vllm.py`](../../../afd_plugin/compat/vllm.py) holds one pin per backend:
-`0.34.0` for CUDA and `0.32.0` for Ascend, which stays on its tested source
-pair until RFC #613 moves it.
-Direct strict calls raise for a missing or different vLLM; plugin registration
-calls the check with `strict=False`, so it warns and continues. This warning
-policy does not make another vLLM release supported. A caller that has not
-resolved its device type accepts either pin, because the compatibility patches
-are shared; callers that observe the platform pass their `device_type` and get
-that backend's pin. Bodies copied from upstream are dispatched by the installed
-release where the two differ. See the
+[`compat/vllm.py`](../../../afd_plugin/compat/vllm.py) uses the same release pin
+for CUDA and Ascend and accepts builds with development suffixes.
+Direct strict calls raise for a missing or different vLLM. Plugin registration
+calls the check with `strict=False` and continues after a warning. See the
 [runtime matrix](../../support.md#tested-runtime-matrix) for hardware
 validation scope.
 
-The NPU implementation targets vLLM `0.32.0` (`5df63a72`) and
+The NPU implementation targets vLLM `0.34.0` (`62d4bc3c`) and
 vLLM-Ascend commit
-[`bd42eea0`](https://github.com/vllm-project/vllm-ascend/commit/bd42eea01d8312c4df469fabaed45f77a12df4d3).
-The repository does not declare a vLLM-Ascend package dependency in
-`pyproject.toml`, so this source commit and the recorded NPU validation are the
-compatibility evidence rather than a released package or container tag.
+[`7dcdb690`](https://github.com/vllm-project/vllm-ascend/commit/7dcdb690caf879a17ab07382880d5773f5202e20).
+The [A3 installation guide](../../installation.md#ascend-npu-installation)
+pins the official Ubuntu image for that source pair.
 
 ## Implementation evidence
 
