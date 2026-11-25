@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -17,6 +18,7 @@ else:
 pytest.importorskip("vllm")
 from torch import nn  # noqa: E402
 from vllm.config import CompilationMode, set_current_vllm_config  # noqa: E402
+from vllm.model_executor.layers import fused_moe  # noqa: E402
 
 from afd_plugin.config import DEEPEP_M2N_CONNECTOR, AFDConfig  # noqa: E402
 from afd_plugin.model_executor.ffn import remote  # noqa: E402
@@ -30,6 +32,7 @@ DEEPEP_M2N_ATTENTION = AFDConfig(
     connector=DEEPEP_M2N_CONNECTOR,
     compute_gate_on_attention=True,
 )
+NATIVE_MOE_BLOCK = adapter.native.Qwen3MoeSparseMoeBlock
 
 
 class _FakeMissingLayer(nn.Module):
@@ -165,8 +168,11 @@ def attention_moe_env(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
-def cuda_construction_env(construction_env, attention_moe_env):
-    """Decoder layers with stand-in native stages and real Attention MoE runners."""
+def cuda_construction_env(
+    monkeypatch: pytest.MonkeyPatch, construction_env, attention_moe_env
+):
+    """Stand-in native stages, except vLLM's MoE block with real runners."""
+    monkeypatch.setattr(adapter.native, "Qwen3MoeSparseMoeBlock", NATIVE_MOE_BLOCK)
     return attention_moe_env
 
 
@@ -185,7 +191,7 @@ def test_attention_role_constructs_only_attention_and_norms(
         vllm_config=cuda_construction_env,
     )
 
-    assert isinstance(layer.mlp, adapter.AFDQwen3MoeRemoteExpertsBlock)
+    assert isinstance(layer.mlp, NATIVE_MOE_BLOCK)
     assert set(dict(layer.named_parameters())) == {
         "self_attn.weight",
         "input_layernorm.weight",
@@ -281,6 +287,40 @@ def test_attention_moe_with_ffn_gate_sends_hidden_states_only(
     assert torch.equal(output, hidden_states * 0.25)
 
 
+@pytest.mark.parametrize(
+    ("tp_size", "outcome"),
+    [
+        (1, nullcontext()),
+        (16, pytest.raises(ValueError, match="greater than the number of experts")),
+    ],
+    ids=["built", "native-error"],
+)
+def test_attention_moe_restores_vllm_experts_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_construction_env,
+    tp_size: int,
+    outcome,
+) -> None:
+    """vLLM's experts factory is restored after the Attention MoE block,
+    also when its constructor raised.
+
+    Why: models built later in the process need vLLM's experts.
+    """
+    monkeypatch.setattr(
+        adapter.native, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+
+    with outcome:
+        _make_layer(
+            monkeypatch,
+            role="attention",
+            layer_idx=0,
+            vllm_config=cuda_construction_env,
+        )
+
+    assert adapter.native.FusedMoEFactory is fused_moe.FusedMoEFactory
+
+
 def test_ffn_role_constructs_only_native_moe(
     monkeypatch: pytest.MonkeyPatch,
     construction_env,
@@ -368,17 +408,17 @@ def test_routed_experts_shell_builds_only_native_moe_blocks(
 
 def test_attention_causal_lm_reports_its_remote_moe_blocks_as_native(
     monkeypatch: pytest.MonkeyPatch,
-    attention_moe_env,
+    cuda_construction_env,
 ) -> None:
     """The Attention causal LM reports its MoE blocks through native metadata.
 
     Why: the native constructor raises if it finds no native MoE block.
     """
-    layer = object.__new__(adapter.AFDQwen3MoeDecoderLayer)
-    nn.Module.__init__(layer)
-    layer.mlp = adapter.AFDQwen3MoeRemoteExpertsBlock(
-        vllm_config=attention_moe_env,
-        prefix="model.layers.0.mlp",
+    layer = _make_layer(
+        monkeypatch,
+        role="attention",
+        layer_idx=0,
+        vllm_config=cuda_construction_env,
     )
 
     class FakeAFDModel(nn.Module):
@@ -401,7 +441,7 @@ def test_attention_causal_lm_reports_its_remote_moe_blocks_as_native(
     monkeypatch.setattr(adapter.native, "ParallelLMHead", FakeLMHead)
     monkeypatch.setattr(adapter.native, "LogitsProcessor", lambda *_args: object())
 
-    model = adapter.AFDQwen3MoeForCausalLM(vllm_config=attention_moe_env)
+    model = adapter.AFDQwen3MoeForCausalLM(vllm_config=cuda_construction_env)
 
     assert model.moe_layers == [layer.mlp.experts]
     assert model.num_moe_layers == 1
