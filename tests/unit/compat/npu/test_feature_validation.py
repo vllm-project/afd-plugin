@@ -241,12 +241,19 @@ def test_npu_async_feature_validation_checks_receive_capacity(
             {"enable_shared_expert_dp": True},
             "deepseek_v2",
             True,
-            "shared-expert DP",
+            None,
+        ),
+        (
+            {"dynamicQuant": 1},
+            {"enable_shared_expert_dp": True},
+            "deepseek_v4",
+            False,
+            None,
         ),
         *[
             (
                 {},
-                {"finegrained_tp_config": {key: 2}},
+                {"enable_shared_expert_dp": True, "finegrained_tp_config": {key: 2}},
                 "deepseek_v2",
                 True,
                 "finegrained TP",
@@ -275,7 +282,7 @@ def test_npu_async_mrv2_feature_boundaries(
     )
     config.additional_config.update(additional_config)
     config.model_config.hf_text_config.model_type = model_type
-    with pytest.raises(RuntimeError, match=error):
+    with pytest.raises(RuntimeError, match=error) if error else nullcontext():
         fail_if_unsupported_npu_afd_features(config)
 
 
