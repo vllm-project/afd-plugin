@@ -103,7 +103,7 @@ class Deployment:
     max_num_seqs: int | None = None
     max_num_batched_tokens: int | None = None
     compute_gate_on_attention: bool = False
-    connector_extra_config: tuple[tuple[str, int], ...] = ()
+    connector_extra_config: tuple[tuple[str, int | str], ...] = ()
     pin_attention_address: bool = False
     compilation_config: tuple[tuple[str, str | tuple[int, ...]], ...] = ()
     shutdown_timeout_s: int = DEFAULT_SHUTDOWN_TIMEOUT_S

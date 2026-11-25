@@ -125,6 +125,7 @@ from afd_plugin.connectors.metadata import (
     AFDTransferState,
     FFNLocalExperts,
     LocalExpertWeights,
+    TokenExperts,
     recv_control_payload,
     send_control_payload,
 )
@@ -143,6 +144,12 @@ BF16_PAYLOAD = "bf16"
 # FP8 e4m3 rows with one fp32 scale per row and 128 channels (SM90 recipe).
 FP8_PAYLOAD = "fp8_block128_fp32"
 PAYLOAD_FORMATS = (BF16_PAYLOAD, FP8_PAYLOAD)
+# What an FFN rank receives (``afdep.Config.receive_layout``): one row per
+# (token, local expert) for the connector's executor, or one row per token
+# with its expert ids and weights for the MoE kernel vLLM selected.
+EXPERT_LAYOUT = "expert"
+TOKEN_LAYOUT = "token"
+RECEIVE_LAYOUTS = (EXPERT_LAYOUT, TOKEN_LAYOUT)
 FP8_GROUP_SIZE = 128
 # afdEP-comm's names for the two payloads (``afdep.Config.payload``).
 AFDEP_BF16_PAYLOAD = "bf16"
@@ -189,6 +196,13 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             uses vLLM's micro-batch count: two under DBO, otherwise one
             (``resolve_num_lanes``).
         payload_format: Dispatch wire format.
+        receive_layout: ``expert`` (default) delivers one row per (token,
+            local expert) and runs ``expert_backend``. ``token`` delivers one
+            row per token and runs the MoE kernel vLLM selected on the FFN
+            (for example ``--moe-backend marlin``), so the expert weights may
+            be in any format that kernel takes; it needs the BF16 payload and
+            ignores ``expert_backend`` and ``expert_num_sms``. Both roles must
+            set the same value.
         expert_backend: ``deepgemm`` (fast) or ``fused_experts`` (reference).
         network: Fabric settings (GIN, hybrid mode, traffic class); see
             ``network.NetworkConfig``. NICs are NCCL's own per-GPU choice.
@@ -215,6 +229,7 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
     capacity_tokens_per_rank: int | None = None
     num_lanes: int | None = None
     payload_format: str = "bf16"
+    receive_layout: str = EXPERT_LAYOUT
     expert_backend: ExpertBackend = "deepgemm"
     network: NetworkConfig = field(default_factory=NetworkConfig)
     bucket_granularity: int = 1
@@ -247,6 +262,13 @@ class DeepEPM2NConfig(ConnectorExtraInfo):
             raise ValueError(f"num_lanes must be in [1, {MAX_LANES}]")
         if self.payload_format not in PAYLOAD_FORMATS:
             raise ValueError(f"payload_format must be one of {PAYLOAD_FORMATS}")
+        if self.receive_layout not in RECEIVE_LAYOUTS:
+            raise ValueError(f"receive_layout must be one of {RECEIVE_LAYOUTS}")
+        if self.receive_layout == TOKEN_LAYOUT and self.payload_format != BF16_PAYLOAD:
+            raise ValueError(
+                f"receive_layout={TOKEN_LAYOUT!r} needs payload_format="
+                f"{BF16_PAYLOAD!r}: vLLM's MoE kernel takes BF16 rows"
+            )
         if self.expert_backend not in EXPERT_BACKENDS:
             raise ValueError(f"expert_backend must be one of {EXPERT_BACKENDS}")
         if self.bucket_granularity <= 0:
@@ -514,6 +536,7 @@ def local_handshake_info(
         "world_rank": world_rank,
         "sm": list(sm),
         "payload_format": config.payload_format,
+        "receive_layout": config.receive_layout,
         "hidden_size": hidden_size,
         "dtype": str(dtype),
         "num_experts": num_experts,
@@ -535,6 +558,7 @@ def local_handshake_info(
 _MUST_MATCH = (
     "protocol",
     "payload_format",
+    "receive_layout",
     "hidden_size",
     "dtype",
     "num_experts",
@@ -552,11 +576,14 @@ def _check_ffn_deployment(
     deployment: dict[str, Any] | None,
     layout: DeepEPM2NLayout,
     payload_format: str,
+    receive_layout: str,
 ) -> None:
     """vLLM must place experts on FFN ranks exactly as DeepEP routes them.
 
     Otherwise rows reach a rank that holds other experts and the results are
     silently wrong. Every rank runs this, so Attention fails with the FFN.
+    The token layout runs vLLM's own kernel on the weights, so their format
+    is that kernel's to check.
     """
     if deployment is None:
         raise RuntimeError(f"FFN world rank {world_rank} sent no deployment info")
@@ -569,6 +596,8 @@ def _check_ffn_deployment(
         "all2all_backend": IDLE_ALL2ALL_BACKEND,
         "weight_format": PAYLOAD_WEIGHT_FORMATS[payload_format],
     }
+    if receive_layout == TOKEN_LAYOUT:
+        del expected["weight_format"]
     mismatches = {
         key: deployment[key]
         for key, value in expected.items()
@@ -613,7 +642,11 @@ def validate_handshake(
         )
     for world_rank, info in enumerate(infos[: layout.ffn_size]):
         _check_ffn_deployment(
-            world_rank, info["ffn_deployment"], layout, info["payload_format"]
+            world_rank,
+            info["ffn_deployment"],
+            layout,
+            info["payload_format"],
+            info["receive_layout"],
         )
     alignments = {info["expert_alignment"] for info in infos[: layout.ffn_size]}
     if len(alignments) != 1 or None in alignments:
@@ -695,16 +728,18 @@ def local_model_info(
         return None
     experts = None
     if local_experts is not None:
-        experts = {
-            layer_idx: {
-                "ids": list(layer_experts.expert_ids),
-                "w13": _describe_tensor(layer_experts.weights.w13),
-                "w2": _describe_tensor(layer_experts.weights.w2),
-                "w13_scale": _describe_tensor(layer_experts.weights.w13_scale),
-                "w2_scale": _describe_tensor(layer_experts.weights.w2_scale),
-            }
-            for layer_idx, layer_experts in local_experts.items()
-        }
+        experts = {}
+        for layer_idx, layer_experts in local_experts.items():
+            described: dict[str, Any] = {"ids": list(layer_experts.expert_ids)}
+            weights = layer_experts.weights
+            if isinstance(weights, LocalExpertWeights):
+                described |= {
+                    "w13": _describe_tensor(weights.w13),
+                    "w2": _describe_tensor(weights.w2),
+                    "w13_scale": _describe_tensor(weights.w13_scale),
+                    "w2_scale": _describe_tensor(weights.w2_scale),
+                }
+            experts[layer_idx] = described
     return {"moe_layers": list(moe_layer_indices), "experts": experts}
 
 
@@ -744,12 +779,14 @@ def validate_model_infos(
     *,
     hidden_size: int,
     payload_format: str,
+    receive_layout: str = EXPERT_LAYOUT,
 ) -> None:
     """After weights load, check what every rank actually holds.
 
     All ranks must run the same MoE layers (dispatch and combine are
     collectives issued once per MoE layer), and every FFN rank must hold
-    exactly the experts DeepEP routes to it, in the payload's format. Ranks
+    exactly the experts DeepEP routes to it, in the payload's format (the
+    token layout leaves the format to vLLM's kernel). Ranks
     that report nothing (``None``) are skipped; an FFN rank must report its
     experts once any rank reports.
     """
@@ -781,6 +818,8 @@ def validate_model_infos(
                     f"[{expected_ids[0]}, {expected_ids[-1] + 1}) to it: use "
                     "linear expert placement with EP size = num_ffn_ranks"
                 )
+            if receive_layout == TOKEN_LAYOUT:
+                continue
             intermediate_size = described["w2"][1][2]
             expected = _expected_expert_tensors(
                 layout.experts_per_rank, hidden_size, intermediate_size, payload_format
@@ -804,6 +843,7 @@ class DeepEPM2NTransferState(AFDTransferState):
     """FFN-side state from ``recv_attn_output`` needed by experts and combine."""
 
     handle: DispatchHandle
+    # ``[rows]`` in the expert layout, ``[rows, top_k]`` in the token layout.
     recv_topk_weights: torch.Tensor
     recv_count_psum: torch.Tensor
     recv_counts_host: list[int]
@@ -937,6 +977,10 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
     def parse_extra_config(cls, raw: Mapping[str, Any] | None) -> DeepEPM2NConfig:
         return DeepEPM2NConfig.from_mapping(raw)
 
+    @property
+    def receives_token_rows(self) -> bool:
+        return self._token_layout
+
     def __init__(
         self,
         rank: int,
@@ -964,6 +1008,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self.ffn_size = self.layout.ffn_size
         self.is_ffn = afd_config.role == "ffn"
         self.is_fp8_payload = self.config.payload_format == FP8_PAYLOAD
+        self._token_layout = self.config.receive_layout == TOKEN_LAYOUT
         self.payload_dtype = FP8_DTYPE if self.is_fp8_payload else self.dtype
         if self.is_fp8_payload and self.hidden_size % FP8_GROUP_SIZE != 0:
             raise ValueError(f"FP8 payload needs hidden_size % {FP8_GROUP_SIZE} == 0")
@@ -1047,7 +1092,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         if self.is_ffn:
             local_alignment = (
                 DeepEPM2NExperts.deepgemm_alignment()
-                if self.config.expert_backend == "deepgemm"
+                if self.config.expert_backend == "deepgemm" and not self._token_layout
                 else 1
             )
         info = local_handshake_info(
@@ -1139,6 +1184,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             self.layout,
             hidden_size=self.hidden_size,
             payload_format=self.config.payload_format,
+            receive_layout=self.config.receive_layout,
         )
         # Never the lanes' bootstrap group: the control plane's close() aborts
         # this group to cancel a pending receive.
@@ -1158,7 +1204,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
                 self.lane_streams = [
                     torch.cuda.Stream(self.device) for _ in range(self.num_lanes)
                 ]
-            if self.is_ffn:
+            if self.is_ffn and not self._token_layout:
                 self.experts = DeepEPM2NExperts(
                     self.config.expert_backend,
                     self.expert_alignment,
@@ -1195,6 +1241,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             rdma_traffic_class=self.network_plan.rdma_traffic_class,
             cpu_timeout_s=self.config.cpu_timeout_s,
             gpu_timeout_s=self.config.gpu_timeout_s,
+            receive_layout=self.config.receive_layout,
         )
         return Lanes(group=self.transport_group, config=config, lanes=self.num_lanes)
 
@@ -1397,15 +1444,25 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         return AFDA2FTransferPayload(
             hidden_states=result.recv_x,
             context=AFDTransferContext(metadata=metadata, states=state),
+            # Token layout only: local expert ids, -1 where held elsewhere.
+            topk_ids=result.recv_topk_idx if self._token_layout else None,
+            topk_weights=result.recv_topk_weights if self._token_layout else None,
         )
 
     def run_experts(
-        self, payload: AFDA2FTransferPayload, weights: LocalExpertWeights
+        self,
+        payload: AFDA2FTransferPayload,
+        weights: LocalExpertWeights | TokenExperts,
     ) -> torch.Tensor:
         """MoE FFN on received rows: top-k weighted local-expert outputs."""
         self._check_initialized()
-        if self.experts is None:
+        if not self.is_ffn:
             raise RuntimeError("run_experts is only available on FFN ranks")
+        if isinstance(weights, TokenExperts) != self._token_layout:
+            raise TypeError(
+                f"receive_layout={self.config.receive_layout!r} got "
+                f"{type(weights).__name__}"
+            )
         state = self._transfer_state(payload.context)
         current = torch.cuda.current_stream(self.device)
         current.wait_event(state.ready_event)
@@ -1414,14 +1471,21 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             out = torch.empty(
                 payload.hidden_states.shape, dtype=torch.bfloat16, device=self.device
             )
-        out = self.experts(
-            payload.hidden_states,
-            state.recv_scale,
-            state.recv_topk_weights,
-            state.recv_count_psum,
-            weights,
-            out=out,
-        )
+        if isinstance(weights, TokenExperts):
+            assert payload.topk_ids is not None
+            weights.run(
+                payload.hidden_states, payload.topk_ids, state.recv_topk_weights, out
+            )
+        else:
+            assert self.experts is not None
+            out = self.experts(
+                payload.hidden_states,
+                state.recv_scale,
+                state.recv_topk_weights,
+                state.recv_count_psum,
+                weights,
+                out=out,
+            )
         if self.lane_streams:
             experts_done = torch.cuda.Event()
             experts_done.record(current)

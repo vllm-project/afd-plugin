@@ -195,7 +195,7 @@ to it, so connectors without routed experts implement none of it.
 | `init_afd_connector(*, moe_layer_indices=None, local_experts=None)` | Collective. Runners call it after weights load with the MoE layers they run and, on FFN, each layer's `FFNLocalExperts` as vLLM loaded them. The keywords are optional, so calls through the base contract stay valid. |
 | `send_attn_output(hidden_states, context, topk_ids=, topk_weights=)` | Attention dispatches the routed rows; the top-k tensors come from the model's Attention-side router. |
 | `recv_attn_output(ubatch_idx)` | FFN receives the rows routed to its local experts. An FFN rank may receive zero rows. |
-| `run_experts(payload, weights)` | FFN runs its local experts (`LocalExpertWeights`) on the received rows; the result is what `send_ffn_output()` returns. |
+| `run_experts(payload, weights)` | FFN runs its local experts (`LocalExpertWeights`, or `TokenExperts` when `receives_token_rows`) on the received rows; the result is what `send_ffn_output()` returns. |
 | `synchronize_lanes()` | FFN runners join the connector's forked streams at the end of each step, before a CUDA-graph capture ends. |
 
 The FFN worker selects `GPUFFNRoutedExpertsModelRunner` when the configured

@@ -381,16 +381,35 @@ class LocalExpertWeights:
 
 
 @dataclass(frozen=True)
+class TokenExperts:
+    """This FFN rank's experts as a kernel that takes one row per token.
+
+    Used by connectors that deliver token rows (``receives_token_rows``): the
+    runner wraps the MoE kernel vLLM selected, so any weight format that
+    kernel supports works without the connector reading the weights.
+
+    Attributes:
+        run: ``run(rows, topk_ids, topk_weights, out)`` writes into ``out``
+            ``[rows, H]`` each row's sum of weighted local-expert outputs.
+            ``topk_ids`` ``[rows, K]`` holds local expert ids, ``-1`` where
+            the expert is on another rank.
+    """
+
+    run: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None]
+
+
+@dataclass(frozen=True)
 class FFNLocalExperts:
     """One MoE layer's experts on this FFN rank, as vLLM loaded them.
 
     Attributes:
         expert_ids: Global ids of the experts in ``weights``, in slot order.
-        weights: The same experts in the executor's layout.
+        weights: The same experts in the executor's layout, or the kernel
+            that runs them for a connector that delivers token rows.
     """
 
     expert_ids: tuple[int, ...]
-    weights: LocalExpertWeights
+    weights: LocalExpertWeights | TokenExperts
 
 
 def _to_int(value: object) -> int:
@@ -549,6 +568,7 @@ __all__ = [
     "FFNLocalExperts",
     "FP8_DTYPE",
     "LocalExpertWeights",
+    "TokenExperts",
     "decode_control_payload",
     "encode_control_payload",
     "recv_control_payload",

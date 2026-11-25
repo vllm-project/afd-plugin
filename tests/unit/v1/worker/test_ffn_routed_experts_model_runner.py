@@ -16,6 +16,7 @@ from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (  # noqa: E402
     GPUFFNRoutedExpertsModelRunner,
     local_experts_from_vllm,
     select_routed_moe_backend,
+    token_experts_from_vllm,
 )
 from tests.unit.fakes.connector import (  # noqa: E402
     FakeRoutedConnector,
@@ -235,11 +236,25 @@ def test_routed_ffn_pins_auto_moe_backend_to_triton():
         assert vllm_config.kernel_config.moe_backend == "triton"
 
 
-@pytest.mark.parametrize("configured", ["flashinfer_cutlass", "deep_gemm", "marlin"])
-def test_routed_ffn_rejects_other_explicit_moe_backends(configured):
-    """An explicit backend other than triton fails before the weights load.
+def test_routed_ffn_keeps_an_explicit_moe_backend():
+    """An explicit backend stays as configured.
 
-    Why: the failure must be loud at startup, not wrong tokens at serving.
+    Why: with token rows the FFN runs that backend's kernel; for the
+    connector's executor ``local_experts_from_vllm`` refuses it after load.
     """
-    with pytest.raises(RuntimeError, match="moe-backend triton"):
-        select_routed_moe_backend(_kernel_config(configured))
+    vllm_config = _kernel_config("marlin")
+    select_routed_moe_backend(vllm_config)
+    assert vllm_config.kernel_config.moe_backend == "marlin"
+
+
+def test_token_experts_reject_a_kernel_that_needs_vllm_prepare_finalize():
+    """A kernel that is not a modular one reducing over top-k itself is refused.
+
+    Why: the FFN skips vLLM's prepare/finalize, so such a kernel would return
+    rows in another order or unreduced, with no error.
+    """
+    experts = _routed_experts(fp8=True)
+    experts.quant_method.moe_kernel = SimpleNamespace(fused_experts=SimpleNamespace())
+
+    with pytest.raises(RuntimeError, match="moe-backend marlin"):
+        token_experts_from_vllm(experts)

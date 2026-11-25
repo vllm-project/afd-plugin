@@ -26,6 +26,7 @@ if TYPE_CHECKING:
         AFDTransferState,
         FFNLocalExperts,
         LocalExpertWeights,
+        TokenExperts,
     )
 
 
@@ -64,4 +65,5 @@ __all__ = [
     "AFDSingleDPMetadata",
     "FFNLocalExperts",
     "LocalExpertWeights",
+    "TokenExperts",
 ]
