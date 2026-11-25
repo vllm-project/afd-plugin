@@ -18,6 +18,8 @@ from afd_plugin.ffn_faas.platforms import SUPPORTED_BACKENDS, get_platform_adapt
 from afd_plugin.ffn_faas.runner import FFNModelRunner
 from afd_plugin.ffn_faas.service import FFNService
 
+DEFAULT_RECEIVER_SHUTDOWN_TIMEOUT = 5.0
+
 
 def _report_exception() -> None:
     """Diagnostics must not choose how an unsafe native session exits."""
@@ -31,10 +33,13 @@ def create_parser(adapter: FFNPlatformAdapter) -> argparse.ArgumentParser:
     parser.add_argument("command", choices=["serve"])
     parser.add_argument("model_tag", nargs="?", help="local model checkpoint")
     parser.add_argument("--backend", choices=SUPPORTED_BACKENDS, default="ascend-cam")
+    default_shutdown_timeout = parser.get_default("receiver_shutdown_timeout")
+    if default_shutdown_timeout is None:
+        default_shutdown_timeout = DEFAULT_RECEIVER_SHUTDOWN_TIMEOUT
     parser.add_argument(
         "--receiver-shutdown-timeout",
         type=float,
-        default=5.0,
+        default=default_shutdown_timeout,
         help="seconds to join the standalone receiver before process isolation",
     )
     parser.add_argument("--status-host", default="127.0.0.1")

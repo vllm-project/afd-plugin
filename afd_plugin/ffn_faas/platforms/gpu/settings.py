@@ -17,6 +17,10 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from afd_plugin.connectors.gpu.async_nvshmem.protocol import (
+    GpuAsyncExtraInfo,
+    stage_rings,
+)
 from afd_plugin.ffn_faas.platforms.launch import validate_ffn_rank_settings
 
 # The only qualified payload: BF16 rows against BF16 expert weights.
@@ -24,6 +28,9 @@ BF16_PAYLOAD = "bf16"
 SINGLE_LANE = 1
 # DBO runs two micro-batches, one DeepEP lane each.
 DBO_LANES = 2
+SINGLE_STAGE = 1
+DBO_STAGES = 2
+ASYNC_FFN_DRAIN_TIMEOUT_S = 120.0
 FFN_GRAPH_MODE = "FULL_DECODE_ONLY"
 EAGER_MODE = "eager"
 
@@ -76,6 +83,48 @@ class GPUFFNConfig:
     def num_lanes(self) -> int:
         """DeepEP lanes this rank creates: two under DBO, otherwise one."""
         return DBO_LANES if self.dbo else SINGLE_LANE
+
+    @property
+    def graph_mode(self) -> str:
+        """Status name of the FFN execution mode."""
+        return FFN_GRAPH_MODE if self.graph else EAGER_MODE
+
+
+@dataclass(frozen=True)
+class GPUAsyncFFNConfig:
+    """Frozen settings of one F rank in a standalone async GPU deployment."""
+
+    model: Path
+    ffn_ranks: int
+    rank: int = 0
+    local_rank: int = 0
+    graph: bool = False
+    dbo: bool = False
+    connector_extra_config: Mapping[str, Any] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    shutdown_timeout: float = ASYNC_FFN_DRAIN_TIMEOUT_S
+
+    def __post_init__(self) -> None:
+        """Reject incompatible async GPU launch settings on the CPU."""
+        validate_ffn_rank_settings(
+            ffn_ranks=self.ffn_ranks,
+            rank=self.rank,
+            local_rank=self.local_rank,
+            shutdown_timeout=self.shutdown_timeout,
+        )
+        extra = GpuAsyncExtraInfo.from_mapping(self.connector_extra_config)
+        effective_ring_depth = (
+            extra.ring_depth
+            if extra.ring_depth_pinned
+            else max(extra.ring_depth, self.num_stages)
+        )
+        stage_rings(0, self.num_stages, effective_ring_depth)
+
+    @property
+    def num_stages(self) -> int:
+        """Microbatch stages expected per Attention step: two under DBO, else one."""
+        return DBO_STAGES if self.dbo else SINGLE_STAGE
 
     @property
     def graph_mode(self) -> str:

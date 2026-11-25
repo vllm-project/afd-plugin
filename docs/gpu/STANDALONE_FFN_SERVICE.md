@@ -162,3 +162,37 @@ A failure F detects itself (for example a DeepEP timeout in a step) reports
 `failed` with `resources_released=false` and exits non-zero. A restarted Attention needs a
 new M2N world, so restart F with it. Hot restart, reconnect and graceful
 in-flight drain are not supported.
+
+## Async NVSHMEM backend (`--backend gpu-async`)
+
+`GpuAsyncAFDConnector` also runs in standalone F-only processes with
+`--backend gpu-async`.
+
+- **Supported configuration**: `DeepseekV2ForCausalLM`, `DeepseekV3ForCausalLM`
+  or `DeepseekV4ForCausalLM`, `async=true`, `compute_gate_on_attention=true`,
+  F `TP=1` with `--enable-expert-parallel`, linear expert placement, modular
+  MoE backends, and `--enforce-eager` or `FULL_DECODE_ONLY` padded expert graphs
+  (with or without `--enable-dbo`). Speculative decoding is rejected.
+- **Pre-rendezvous graph capture**: `AsyncGPUFFNBackend` loads the model, enters
+  `WARMUP` to run `GPUAsyncFFNModelRunner.capture_padded_ffn_graphs()`, and only
+  then joins the cross-role NVSHMEM rendezvous in `initialize_afd_connector()`.
+- **Launch example (2 FFN ranks)**:
+
+```bash
+export VLLM_PLUGINS=afd VLLM_USE_V2_MODEL_RUNNER=1
+torchrun --nproc-per-node=2 --master-addr=127.0.0.1 --master-port=29500 \
+  -m afd_plugin.ffn_faas serve "$MODEL_PATH" --backend gpu-async \
+  --data-parallel-size 2 --tensor-parallel-size 1 --enable-expert-parallel \
+  --additional-config '{"afd":{"role":"ffn","connector":"GpuAsyncAFDConnector",
+      "async":true,"compute_gate_on_attention":true,"host":"127.0.0.1",
+      "port":6281,"num_attention_ranks":2,"num_ffn_ranks":2}}' \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+  --enable-dbo --status-port 29700
+```
+
+- **Shutdown and drain**: `gpu-async` defaults `--receiver-shutdown-timeout` to
+  120 s. Stop Attention first (or signal F via `POST /stop` alongside stopping
+  Attention) so F's `receiver_exited()` can run `drain()` and
+  `session.finish_receiver()` until every Attention rank publishes its
+  shutdown terminal before releasing graphs, NVSHMEM windows, and compute
+  groups.

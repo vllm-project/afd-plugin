@@ -200,11 +200,31 @@ Releasing DeepEP lanes is a barrier over every M2N rank, so a stopped GPU F
 completes its release when Attention shuts down too. See the
 [GPU standalone service guide](../../gpu/STANDALONE_FFN_SERVICE.md).
 
+CUDA async NVSHMEM models over `GpuAsyncAFDConnector` have a GPU standalone F
+entry point, `--backend gpu-async`, sharing the GPU device/F-only compute-group
+environment base under `ffn_faas/platforms/gpu/`:
+
+- `GPUAsyncAdapter` and `GPUAsyncFFNConfig` validate on CPU the async connector
+  (`async=true`, `compute_gate_on_attention=true`), F TP 1 with EP, linear
+  expert placement, `FULL_DECODE_ONLY` or eager mode, no speculative decoding,
+  and valid `GpuAsyncExtraInfo` / `ring_depth` settings. The receiver shutdown
+  timeout defaults to 120 s to cover producer drain.
+- `GPUAsyncFFNEnvironment` preflights the NVSHMEM host library before weight
+  loading, keeps modular MoE backends (without DeepGEMM/Triton pinning), loads
+  the role-aware AFD model (`routed_experts_connector=False`), and drops
+  `TORCHELASTIC_USE_AGENT_STORE` before the cross-role rendezvous.
+- `AsyncGPUFFNBackend` constructs `GPUAsyncFFNModelRunner`, loads weights, runs
+  `capture_padded_ffn_graphs()` in `WARMUP` before `initialize_afd_connector()`
+  (since Attention can dispatch immediately after the rendezvous), polls
+  arrivals via `execute_connector_driven_step()`, and runs `drain()` plus
+  `session.finish_receiver()` in `receiver_exited()` before `shutdown()`.
+
 | Platform | Worker | Model runner | Current connectors |
 | --- | --- | --- | --- |
 | CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `GPUFFNModelRunner` | `P2pNcclAFDConnector` |
 | CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `GPUFFNRoutedExpertsModelRunner` | `DeepEPM2NAFDConnector` (any `AFDRoutedExpertsConnector`) |
 | CUDA standalone (`ffn_faas`, no Worker) | `DeepEPM2NFFNBackend` | `GPUFFNRoutedExpertsModelRunner` | `DeepEPM2NAFDConnector` |
+| CUDA standalone (`ffn_faas`, no Worker) | `AsyncGPUFFNBackend` | `GPUAsyncFFNModelRunner` | `GpuAsyncAFDConnector` |
 | NPU standalone (`ffn_faas`, no Worker) | `CAMFFNBackend` | `AsyncNPUFFNModelRunner` | `CAMAsyncAFDConnector` |
 | NPU | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | `AFDNPUFFNModelRunner` (sync) or `AsyncNPUFFNModelRunner` | `CAMP2pAFDConnector`, `CAMAsyncAFDConnector` |
 
