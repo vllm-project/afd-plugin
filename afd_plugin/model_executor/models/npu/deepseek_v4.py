@@ -221,7 +221,20 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
             prefix=f"{prefix}.gate",
         )
         self.gate.precast_fp32_weight = True
-        if layer_idx < config.num_hash_layers and not is_draft_layer:
+        # Match DeepseekV4MoE in Ascend 7dcdb690. Transformers may place Hash
+        # MoE at nonconsecutive layers and omits the legacy count.
+        if is_draft_layer:
+            uses_hash = False
+        else:
+            mlp_layer_types = getattr(config, "mlp_layer_types", None)
+            if mlp_layer_types is not None:
+                uses_hash = (
+                    layer_idx < len(mlp_layer_types)
+                    and mlp_layer_types[layer_idx] == "hash_moe"
+                )
+            else:
+                uses_hash = layer_idx < getattr(config, "num_hash_layers", 0)
+        if uses_hash:
             self.gate.tid2eid = nn.Parameter(
                 (
                     torch.arange(config.vocab_size, dtype=torch.int32).unsqueeze(1)
