@@ -36,7 +36,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 
-from afd_plugin.config import parse_afd_config
+from afd_plugin.config import AFD_ASYNC_GPU_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import (
     AFDConnectorFactory,
     AFDForwardContextMetadata,
@@ -228,6 +228,8 @@ class AFDRemoteMoEMethod(FusedMoEMethodBase):
                 afd_metadata, _current_stage_idx(afd_metadata)
             )
             topk_ids = _unroute_tp_padding(topk_ids, num_tokens)
+        if layer.routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * layer.routed_scaling_factor
         stage_idx = _send_attention_output(
             afd_metadata,
             x,
@@ -438,7 +440,16 @@ def build_expert(
             "Attention remote MoE factory reserves these arguments: "
             + ", ".join(sorted(reserved)),
         )
-    return fused_moe.FusedMoEFactory(**moe_kwargs, **factory_kwargs)
+    # Async GPU returns routed and shared outputs already combined. Keep the
+    # native router at unit scale and scale only the routes sent to the FFN.
+    dispatch_scale = (
+        moe_kwargs.pop("routed_scaling_factor", 1.0)
+        if afd_config.connector == AFD_ASYNC_GPU_CONNECTOR
+        else 1.0
+    )
+    runner = fused_moe.FusedMoEFactory(**moe_kwargs, **factory_kwargs)
+    runner.routed_experts.routed_scaling_factor = dispatch_scale
+    return runner
 
 
 __all__ = [

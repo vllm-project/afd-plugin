@@ -566,4 +566,7 @@ largest grouped-GEMM workspace before capture, and run oversized or uncaptured
 items eagerly. Capture finishes before the cross-role rendezvous so Attention
 profiling can immediately dispatch. The connector's `FFNExecutionSession` owns
 the producer-drain handshake; worker shutdown retains model and transport
-resources until that session finishes.
+resources until that session finishes. Local expert graphs and both stages have
+been exercised on single-node and two-node H20 with DeepSeek-V2-Lite-Chat. The
+[validation record](../async_gpu_cross_node_research.md) describes the cases run.
+For this connector, other models, quantization and larger topologies remain unqualified.

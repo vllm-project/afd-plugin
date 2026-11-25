@@ -130,6 +130,15 @@ AFDConnectorFactory.register_connector(
     ),
 )
 AFDConnectorFactory.register_connector(
+    "GpuAsyncAFDConnector",
+    "afd_plugin.connectors.gpu.async_nvshmem.connector",
+    "GpuAsyncAFDConnector",
+    attention_moe_runner=(
+        "afd_plugin.model_executor.ffn.remote",
+        "AFDRoutedExpertsMoERunner",
+    ),
+)
+AFDConnectorFactory.register_connector(
     "CAMP2pAFDConnector",
     "afd_plugin.connectors.npu.camp2p",
     "CAMP2pAFDConnector",

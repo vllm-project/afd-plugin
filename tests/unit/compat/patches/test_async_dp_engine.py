@@ -241,12 +241,13 @@ def _load_patch_module(monkeypatch: pytest.MonkeyPatch):
     return importlib.import_module(module_name)
 
 
-def test_async_dp_attention_uses_regular_engine_core(monkeypatch):
+@pytest.mark.parametrize("connector", ["CAMAsyncAFDConnector", "GpuAsyncAFDConnector"])
+def test_async_dp_attention_uses_regular_engine_core(monkeypatch, connector):
     _load_patch_module(monkeypatch)
     core_module = sys.modules["vllm.v1.engine.core"]
 
     core_module.EngineCoreProc.run_engine_core(
-        vllm_config=_config(),
+        vllm_config=_config(connector=connector),
         dp_rank=1,
     )
     engine = core_module.last_engine
@@ -335,13 +336,14 @@ def test_async_dp_engine_patch_rebinds_after_backend_override(monkeypatch):
     assert core_module.last_engine.shutdown_called is True
 
 
-def test_async_dp_coordinator_disables_wave_coordination(monkeypatch):
+@pytest.mark.parametrize("connector", ["CAMAsyncAFDConnector", "GpuAsyncAFDConnector"])
+def test_async_dp_coordinator_disables_wave_coordination(monkeypatch, connector):
     _load_patch_module(monkeypatch)
     client_module = sys.modules["vllm.v1.engine.core_client"]
 
     addresses = SimpleNamespace()
     with client_module.launch_core_engines(
-        _config(),
+        _config(connector=connector),
         object,
         False,
         addresses,
@@ -422,7 +424,8 @@ def test_non_target_vllm_release_skips_patch_application(monkeypatch):
     assert client_module.DPAsyncMPClient.add_request_async is native_add_request
 
 
-def test_async_dp_client_skips_first_req(monkeypatch):
+@pytest.mark.parametrize("connector", ["CAMAsyncAFDConnector", "GpuAsyncAFDConnector"])
+def test_async_dp_client_skips_first_req(monkeypatch, connector):
     _load_patch_module(monkeypatch)
     client_module = sys.modules["vllm.v1.engine.core_client"]
 
@@ -434,7 +437,7 @@ def test_async_dp_client_skips_first_req(monkeypatch):
             self.messages.append(message)
 
     client = client_module.DPAsyncMPClient()
-    client.vllm_config = _config()
+    client.vllm_config = _config(connector=connector)
     client.current_wave = 7
     client.client_index = 3
     client.engines_running = False

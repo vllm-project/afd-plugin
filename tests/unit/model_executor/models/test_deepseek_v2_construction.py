@@ -19,7 +19,11 @@ pytest.importorskip("vllm")
 
 from vllm.config import CompilationMode, set_current_vllm_config  # noqa: E402
 
-from afd_plugin.config import DEEPEP_M2N_CONNECTOR, AFDConfig  # noqa: E402
+from afd_plugin.config import (  # noqa: E402
+    AFD_ASYNC_GPU_CONNECTOR,
+    DEEPEP_M2N_CONNECTOR,
+    AFDConfig,
+)
 from afd_plugin.model_executor.ffn import remote  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
 from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
@@ -379,21 +383,33 @@ def test_ffn_constructs_no_real_attention(
     assert not any(name.startswith("self_attn.") for name in _parameter_names(moe))
 
 
-def _remote_experts_shell(monkeypatch, *, compute_gate_on_attention: bool):
-    """A CUDA P2P Attention MoE shell with its native factory runner."""
+def _remote_experts_shell(
+    monkeypatch,
+    *,
+    compute_gate_on_attention: bool,
+    connector="P2pNcclAFDConnector",
+    dtype=torch.float32,
+    shared_experts=1,
+    routed_scale=1.0,
+):
+    """A CUDA Attention MoE shell with its native factory runner."""
     monkeypatch.setattr(remote, "current_platform", SimpleNamespace(device_type="cuda"))
     monkeypatch.setattr(adapter.native, "get_ep_group", _single_ep_rank)
     monkeypatch.setattr(adapter.native, "GateLinear", GateLinear)
     config = attention_moe_vllm_config(
-        compute_gate_on_attention=compute_gate_on_attention
+        compute_gate_on_attention=compute_gate_on_attention, connector=connector
     )
+    config.model_config.dtype = dtype
+    hf_config = _vllm_config().model_config.hf_config
+    hf_config.n_shared_experts = shared_experts
+    hf_config.routed_scaling_factor = routed_scale
     with set_current_vllm_config(config):
         return adapter.AFDDeepseekV2RemoteExpertsMoE(
-            config=_vllm_config().model_config.hf_config,
+            config=hf_config,
             vllm_config=config,
             prefix="model.layers.1.mlp",
             compute_gate_on_attention=compute_gate_on_attention,
-            sends_routes=False,
+            connector=connector,
         )
 
 
@@ -437,6 +453,35 @@ def test_attention_shell_without_gate_keeps_native_delegation(monkeypatch):
     assert torch.equal(events[0][1], hidden_states)
     assert events[0][3] == {}
     assert torch.equal(output, hidden_states * 0.25)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "shared_experts", "expected_scale"),
+    [(torch.bfloat16, 1, 3.0), (torch.float16, 1, 1.0), (torch.float16, 0, 3.0)],
+)
+def test_async_remote_experts_scale_only_dispatched_routes(
+    monkeypatch, dtype, shared_experts, expected_scale
+):
+    events: list[tuple] = []
+    install_proxy_context(monkeypatch, events, stage_idx=0)
+    shell = _remote_experts_shell(
+        monkeypatch,
+        compute_gate_on_attention=True,
+        connector=AFD_ASYNC_GPU_CONNECTOR,
+        dtype=dtype,
+        shared_experts=shared_experts,
+        routed_scale=3.0,
+    )
+    weights = torch.tensor([[0.25, 0.75]])
+    shell.experts.routed_experts.forward_modular(
+        x=torch.ones(1, 8, dtype=dtype),
+        topk_weights=weights,
+        topk_ids=torch.tensor([[1, 2]], dtype=torch.int32),
+    )
+
+    assert [event[0] for event in events] == ["send", "yield", "recv"]
+    torch.testing.assert_close(events[0][3]["topk_weights"], weights * expected_scale)
+    assert not any("shared_experts" in name for name, _ in shell.named_parameters())
 
 
 def test_npu_ffn_refreshes_native_fused_moe_factory(

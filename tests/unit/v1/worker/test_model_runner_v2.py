@@ -1763,3 +1763,28 @@ def test_npu_v4_ubatch_prepare_error_restores_native_preparation(npu_v4_ubatch_c
         {"platform_stage": 1},
     ]
     assert events == []
+
+
+def test_validated_async_runner_accepts_connector_without_control_plane(monkeypatch):
+    events: list[str] = []
+    connector = _RecordingConnector(events)
+    connector.control_plane = None
+
+    def native_init(self, config, device):
+        self.vllm_config = config
+        self.device = device
+
+    monkeypatch.setattr(native_v2.GPUModelRunner, "__init__", native_init)
+    monkeypatch.setattr(v2_runner_module, "create_afd_gpu_profiler", lambda role: None)
+    config = _patch_v2_constructor_dependencies(monkeypatch, connector)
+    config.additional_config["afd"].update(
+        connector="GpuAsyncAFDConnector",
+        compute_gate_on_attention=True,
+    )
+    # parse_afd_config accepts the public JSON alias; validation is isolated by
+    # the constructor fixture, so this exercises only the runner lifecycle seam.
+    config.additional_config["afd"]["async"] = True
+
+    runner = AFDAttentionModelRunnerV2(config, torch.device("cpu"))
+    assert runner.connector is connector
+    assert events == []

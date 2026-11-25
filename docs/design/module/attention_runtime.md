@@ -185,6 +185,8 @@ The generic V2 E2E harness remains CUDA-only.
 The experimental GPU async path skips native Attention DP coordination and
 uses opaque MoE dispatch/combine operations with native MRV2 stage indices.
 Its FFN runs independent arrivals rather than matching the Attention schedule.
+See the [H20 validation record](../async_gpu_cross_node_research.md) for its
+eager, graph and two-stage scope.
 
 For Ascend V2 Async CAM, the supported contract and launch settings are in the
 [CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#modelrunnerv2-deployment).
