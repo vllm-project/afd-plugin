@@ -99,7 +99,6 @@ def build_case(
         for key in (
             "enable_cpu_binding",
             "enable_force_eplb",
-            "enable_dsa_cp",
             "multistream_dsv4_dsa_overlap",
         )
     )

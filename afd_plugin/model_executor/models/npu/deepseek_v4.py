@@ -365,7 +365,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
     forward method; it invokes ``compute_ffn_output`` instead.
     """
 
-    # Upstream source: vllm-ascend bd42eea01d8312c4df469fabaed45f77a12df4d3,
+    # Upstream source: vllm-ascend 7dcdb690caf879a17ab07382880d5773f5202e20,
     # vllm_ascend/models/deepseek_v4/model.py::DeepseekV4DecoderLayer.__init__.
     # Patch reason: allocate Attention and FFN weights only on their AFD role.
     # Patch functionality: keep target HC/SP attributes and native layer forward,
@@ -425,9 +425,6 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         # ### PATCH END: distinguish CAM IDs from native draft checkpoint names
         self.norm_eps = config.rms_norm_eps
         self.use_sequence_parallel_moe = parallel_config.use_sequence_parallel_moe
-        self.enable_dsa_cp = (
-            native.enable_dsa_cp()
-        )  # TODO: delete this when native.enable_dsa_cp is sunset.
 
         # ### PATCH START: role-local Attention and remote experts
         self.mlp: (
@@ -445,7 +442,6 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 reduce_results=not self.use_sequence_parallel_moe,
-                need_gather_q_kv=self.use_sequence_parallel_moe and self.enable_dsa_cp,
             )
             if self.compute_gate_on_attention:
                 # Both shells keep the router on Attention; only the transport

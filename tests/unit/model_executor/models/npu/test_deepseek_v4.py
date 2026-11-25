@@ -112,6 +112,23 @@ def construct_model(torch):
                 nn.ModuleList(factory(f"{prefix}.{i}") for i in range(count)),
             )
 
+        # Ascend 0.34 chooses DSA context parallelism from the topology. Its
+        # native Attention constructor rejects legacy DSA-specific keywords.
+        def make_attention(
+            vllm_config,
+            config,
+            max_position_embeddings=0,
+            cache_config=None,
+            quant_config=None,
+            prefix="",
+            topk_indices_buffer=None,
+            reduce_results=True,
+        ):
+            return layers.DSAAttention(
+                implementation=implementation,
+                max_position_embeddings=max_position_embeddings,
+            )
+
         native = SimpleNamespace(
             DeepseekV4DecoderLayer=layers.DeepseekV4Decoder,
             DeepseekV4Model=nn.Module,
@@ -120,10 +137,7 @@ def construct_model(torch):
             get_pp_group=lambda: SimpleNamespace(
                 is_first_rank=True, is_last_rank=last_rank
             ),
-            enable_dsa_cp=lambda: False,
-            DeepseekV4Attention=lambda **kwargs: layers.DSAAttention(
-                implementation=implementation, **kwargs
-            ),
+            DeepseekV4Attention=make_attention,
             DeepseekV4MoE=layers.DeepseekV4MoE,
             PPMissingLayer=nn.Identity,
             RMSNorm=lambda *args, **kwargs: nn.Identity(),
