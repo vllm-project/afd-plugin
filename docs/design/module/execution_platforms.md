@@ -130,8 +130,8 @@ loading torch, vLLM or NPU modules through the connector package namespaces.
 | Graph policy/keying | `v1/worker/cuda_graph.py` | shared policy/keying plus ACL/NPUGraph integration |
 | Native ubatching | native `UBatchRunner` with scoped AFD metadata preparation | `NPUUBatchRunner` adapting native child inputs, contexts and streams |
 | Profiling | `compat/profiler.py` | `compat/npu/profiler.py` |
-| Native operators | PyTorch/vLLM CUDA runtime used by NCCL P2P | plugin CANN A2E/E2A and routed-only async CAM ops |
-| Build/packaging | no plugin CUDA extension | `setup.py`, `csrc/npu/**`, packaged `_cann_ops_custom` vendor tree |
+| Native operators | PyTorch/vLLM CUDA runtime; optional mapped/NVSHMEM async bridge | plugin CANN A2E/E2A and routed-only async CAM ops |
+| Build/packaging | optional `_C_gpu_async` extension from `csrc/gpu/**` | `setup.py`, `csrc/npu/**`, packaged `_cann_ops_custom` vendor tree |
 
 ```mermaid
 flowchart TB
@@ -160,7 +160,8 @@ Both CUDA workers validate the AFD configuration and select the role's model
 before delegating device and distributed setup to native `Worker.init_device()`.
 Their `_make_model_runner()` overrides construct `AFDAttentionModelRunnerV2`
 or the connector-driven FFN runner (`GPUFFNModelRunner` for P2P,
-`GPUFFNRoutedExpertsModelRunner` for DeepEP M2N). Both roles require
+`GPUFFNRoutedExpertsModelRunner` for DeepEP M2N, and
+`GPUAsyncFFNModelRunner` for the async GPU connector). Both roles require
 ModelRunnerV2. Attention retains upstream request, KV-cache, sampling, and
 output ownership.
 
@@ -197,6 +198,15 @@ connector state before `torch.cuda.graph(...)`, captures only
 model/data-plane work, and stores the graph by `make_ffn_graph_key()`. A
 future payload replays only when `is_graph_replaying=true` and its key matches;
 otherwise FFN executes eagerly.
+
+The async GPU connector has no per-step control plane. Its FFN runner captures
+local-expert graphs before rendezvous and selects a bucket independently for
+each arriving work item, including both DBO stages. The default ladder includes
+powers of two through 1024 routed rows. These launch-bound items tolerate up to
+2x padding; larger items keep the 1.05x padding limit and otherwise run eagerly.
+Explicit `AFD_FFN_GRAPH_FRACTIONS` calibration replaces the default ladder.
+Attention retains MLA and `FULL_DECODE_ONLY`: only decode uses Attention full
+graph replay.
 
 ### CUDA native ubatching
 
