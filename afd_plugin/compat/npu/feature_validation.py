@@ -287,13 +287,12 @@ def _fail_if_unsupported_npu_afd_async_features(
                 "or DeepSeek-V4",
             )
         additional_config = vllm_config.additional_config
-        if additional_config.get("enable_shared_expert_dp", False) or any(
+        if any(
             int(size) > 0
             for size in additional_config.get("finegrained_tp_config", {}).values()
         ):
             raise RuntimeError(
-                "AFD NPU ModelRunnerV2 Async CAM does not support finegrained TP "
-                "or shared-expert DP",
+                "AFD NPU ModelRunnerV2 Async CAM does not support finegrained TP",
             )
     if extra_info.dynamic_quant not in (0, 1):
         raise RuntimeError(

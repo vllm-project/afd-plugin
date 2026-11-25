@@ -61,8 +61,9 @@ Attention-local FlashComm1/SP is supported. Set
 DeepSeek-V2/V3 Attention with effective model SP automatically selects Ascend
 shared-expert DP: shared weights are replicated per rank, which computes its
 local tokens. Without model SP, this automatic override is not applied.
-Attention TP/SP and routed-expert parallelism are unchanged. MRV2 rejects
-explicit `enable_shared_expert_dp=true` and finegrained TP configuration.
+Attention TP/SP and routed-expert parallelism are unchanged. Attention also
+accepts explicit `enable_shared_expert_dp=true`. MRV2 rejects finegrained TP
+configuration.
 Use `--block-size=128` for V2-Lite MLA Attention; for V4,
 use the model-specific settings in the
 [DSV4 E2E profiles](../../tests/e2e/models/deepseek_v4_flash/config.py).
