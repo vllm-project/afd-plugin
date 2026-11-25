@@ -15,7 +15,14 @@ import pytest
 from afd_plugin.ffn_faas.platforms import get_platform_adapter
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-NATIVE_MODULES = ("torch", "vllm", "afdep", "deep_gemm")
+NATIVE_MODULES = (
+    "torch",
+    "vllm",
+    "afdep",
+    "deep_gemm",
+    "nvidia.nvshmem",
+    "afd_plugin._C_gpu_async",
+)
 GRAPH = ("--compilation-config", '{"cudagraph_mode":"FULL_DECODE_ONLY"}')
 
 
@@ -27,6 +34,21 @@ def _afd_config(**overrides) -> str:
         "num_attention_ranks": 2,
         "num_ffn_ranks": 2,
         "compute_gate_on_attention": True,
+        **overrides,
+    }
+    return json.dumps({"afd": afd})
+
+
+def _async_afd_json(**overrides) -> str:
+    afd = {
+        "role": "ffn",
+        "connector": "GpuAsyncAFDConnector",
+        "async": True,
+        "compute_gate_on_attention": True,
+        "host": "127.0.0.1",
+        "port": 6281,
+        "num_attention_ranks": 2,
+        "num_ffn_ranks": 2,
         **overrides,
     }
     return json.dumps({"afd": afd})
@@ -69,11 +91,42 @@ def configure(tmp_path):
     return run
 
 
-def test_backend_selection_imports_no_native_stack():
+@pytest.fixture
+def configure_async(tmp_path):
+    """Parse a native ``serve`` command line and configure the async GPU adapter."""
+    pytest.importorskip("vllm")
+    from afd_plugin.ffn_faas.__main__ import create_parser
+
+    model = tmp_path / "model"
+    model.mkdir()
+
+    def run(*options, afd=None, data_parallel_size="2"):
+        adapter = get_platform_adapter("gpu-async")
+        args = create_parser(adapter).parse_args(
+            [
+                "serve",
+                str(model),
+                "--backend",
+                "gpu-async",
+                "--data-parallel-size",
+                data_parallel_size,
+                "--enable-expert-parallel",
+                "--additional-config",
+                _async_afd_json(**(afd or {})),
+                *options,
+            ]
+        )
+        return adapter.configure(args), args
+
+    return run
+
+
+@pytest.mark.parametrize("backend", ["gpu-deepep-m2n", "gpu-async"])
+def test_backend_selection_imports_no_native_stack(backend):
     script = (
         "import json, sys; "
         "from afd_plugin.ffn_faas.platforms import get_platform_adapter; "
-        "get_platform_adapter('gpu-deepep-m2n'); "
+        f"get_platform_adapter({backend!r}); "
         f"print(json.dumps([m for m in {NATIVE_MODULES!r} if m in sys.modules]))"
     )
     result = subprocess.run(
@@ -203,3 +256,139 @@ def test_cli_reports_a_bad_launch_as_a_usage_error(tmp_path):
     )
     assert result.returncode == 2
     assert "must agree" in result.stderr
+
+
+def test_async_valid_graph_dbo_launch_defaults(launch_env, configure_async, tmp_path):
+    launch, args = configure_async(*GRAPH, "--enable-dbo")
+
+    assert (launch.rank, launch.local_rank) == (1, 1)
+    assert launch.model_path == str((tmp_path / "model").resolve())
+    assert launch.backend_name == "GpuAsyncAFDConnector"
+    assert launch.shutdown_timeout == 120.0
+    assert launch.initial_status == {
+        "graph_mode": "FULL_DECODE_ONLY",
+        "dbo": True,
+        "num_stages": 2,
+        "async_paired": False,
+    }
+    assert args.data_parallel_rank == 1
+    assert args.distributed_executor_backend == "external_launcher"
+    assert args.skip_tokenizer_init and args.enable_ep_weight_filter
+
+
+def test_async_eager_launch_and_timeout_override(launch_env, configure_async):
+    launch, _ = configure_async("--enforce-eager", "--receiver-shutdown-timeout", "30")
+
+    assert launch.shutdown_timeout == 30.0
+    assert launch.initial_status["graph_mode"] == "eager"
+    assert launch.initial_status["num_stages"] == 1
+    assert launch.initial_status["dbo"] is False
+
+
+def test_async_recipe_flags_parse_and_configure(launch_env, configure_async):
+    launch, args = configure_async(
+        "--trust-remote-code",
+        "--dtype",
+        "bfloat16",
+        "--seed",
+        "0",
+        "--enable-ep-weight-filter",
+        "--max-model-len",
+        "4096",
+        "--max-num-batched-tokens",
+        "1024",
+        "--max-num-seqs",
+        "8",
+        "--gpu-memory-utilization",
+        "0.5",
+        "--enable-dbo",
+        "--dbo-decode-token-threshold",
+        "2",
+        "--dbo-prefill-token-threshold",
+        "12",
+        "--compilation-config",
+        '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}',
+        "--cudagraph-capture-sizes",
+        "2",
+        "4",
+        "8",
+    )
+    assert launch.initial_status["graph_mode"] == "FULL_DECODE_ONLY"
+    assert launch.initial_status["dbo"] is True
+    assert args.cudagraph_capture_sizes == [2, 4, 8]
+
+
+@pytest.mark.parametrize(
+    "env, options, afd, message",
+    [
+        ({"WORLD_SIZE": "4"}, ("--enforce-eager",), {}, "must agree"),
+        ({}, (), {}, "runs --enforce-eager or"),
+        (
+            {},
+            ("--compilation-config", '{"cudagraph_mode":"FULL"}'),
+            {},
+            "runs --enforce-eager or",
+        ),
+        (
+            {},
+            ("--enforce-eager", "--tensor-parallel-size", "2"),
+            {},
+            "--tensor-parallel-size 1",
+        ),
+        (
+            {},
+            ("--enforce-eager", "--expert-placement-strategy", "round_robin"),
+            {},
+            "linear FFN expert placement",
+        ),
+        (
+            {},
+            ("--enforce-eager", "--speculative-config", '{"method":"ngram"}'),
+            {},
+            "does not support speculative decoding",
+        ),
+        (
+            {},
+            ("--enforce-eager",),
+            {"connector": "CAMAsyncAFDConnector"},
+            "requires GpuAsyncAFDConnector",
+        ),
+        (
+            {},
+            ("--enforce-eager",),
+            {"async": False},
+            "requires async=true",
+        ),
+        (
+            {},
+            ("--enforce-eager",),
+            {"compute_gate_on_attention": False},
+            "requires compute_gate_on_attention=true",
+        ),
+        (
+            {},
+            ("--enforce-eager", "--enable-dbo"),
+            {"connector_extra_config": {"ring_depth": 1}},
+            "ring_depth must cover every live stage",
+        ),
+    ],
+    ids=[
+        "world-size",
+        "unset-graph-mode",
+        "full-graph-mode",
+        "tensor-parallel",
+        "expert-placement",
+        "speculative-config",
+        "connector",
+        "sync-mode",
+        "gate-on-ffn",
+        "ring-depth-below-dbo",
+    ],
+)
+def test_async_invalid_launch_is_rejected(
+    launch_env, configure_async, monkeypatch, env, options, afd, message
+):
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    with pytest.raises(ValueError, match=message):
+        configure_async(*options, afd=afd)

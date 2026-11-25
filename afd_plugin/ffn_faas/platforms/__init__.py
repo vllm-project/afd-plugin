@@ -6,13 +6,20 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from afd_plugin.ffn_faas.platforms.gpu import GPU_DEEPEP_M2N_BACKEND
+from afd_plugin.ffn_faas.platforms.gpu import (
+    GPU_ASYNC_BACKEND,
+    GPU_DEEPEP_M2N_BACKEND,
+)
 
 if TYPE_CHECKING:
     from afd_plugin.ffn_faas.interfaces import FFNPlatformAdapter
 
 ASCEND_CAM_BACKEND = "ascend-cam"
-SUPPORTED_BACKENDS = (ASCEND_CAM_BACKEND, GPU_DEEPEP_M2N_BACKEND)
+SUPPORTED_BACKENDS = (
+    ASCEND_CAM_BACKEND,
+    GPU_DEEPEP_M2N_BACKEND,
+    GPU_ASYNC_BACKEND,
+)
 
 
 def get_platform_adapter(name: str) -> FFNPlatformAdapter:
@@ -29,4 +36,8 @@ def get_platform_adapter(name: str) -> FFNPlatformAdapter:
         from afd_plugin.ffn_faas.platforms.gpu.adapter import GPUDeepEPM2NAdapter
 
         return GPUDeepEPM2NAdapter()
+    if name == GPU_ASYNC_BACKEND:
+        from afd_plugin.ffn_faas.platforms.gpu.async_adapter import GPUAsyncAdapter
+
+        return GPUAsyncAdapter()
     raise ValueError(f"unsupported standalone FFN backend: {name}")
