@@ -13,6 +13,7 @@ from vllm_ascend.ascend_config import (
     SchedulerConfig,
     SparseKVOffloadConfig,
     _is_ascend_config_initialized,
+    is_draft_config_context,
     logger,
     validate_additional_config_bool,
 )
@@ -38,7 +39,7 @@ _ASCEND_CONFIG_ALIAS_MODULES = (
 
 
 # Upstream: vllm_ascend/ascend_config.py at
-# 19c063b5471f90e158e163d27c2e0cc54af1700e.
+# 7dcdb690caf879a17ab07382880d5773f5202e20.
 # Patch reason: strict AscendConfig construction rejects AFD's shared settings.
 # Patch functionality: exclude the AFD namespace from constructor kwargs,
 # preserving the source mapping, config identity and native singleton/cache.
@@ -88,9 +89,11 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         # Do not reuse a cached config: let AscendConfig's normal nested
         # pydantic validation report the invalid sub-config input below.
         refresh = True
+    is_draft = is_draft_config_context()
     # ### PATCH START: native singleton ownership
     if (
-        ascend_config._ASCEND_CONFIG is not None
+        not is_draft
+        and ascend_config._ASCEND_CONFIG is not None
         and not refresh
         and _is_ascend_config_initialized(ascend_config._ASCEND_CONFIG)
         and ascend_config._INIT_VLLM_CONFIG is vllm_config
@@ -220,10 +223,13 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     new_config.rl_config.apply(new_config)
     new_config.finegrained_tp_config._validate_preconditions(vllm_config)
     new_config.xlite_graph_config._validate_preconditions(vllm_config)
+    if is_draft:
+        return new_config
     if _is_ascend_config_initialized(new_config):
         # ### PATCH START: native singleton publication
         ascend_config._ASCEND_CONFIG = new_config
         ascend_config._INIT_VLLM_CONFIG = vllm_config
+        ascend_config._MEGA_MOE_SUPPORTED = new_config._megamoe_supported
         # ### PATCH END: native singleton publication
         # Publish the fully validated singleton before invalidating derived
         # process caches. The next runtime read rebuilds them from new_config;

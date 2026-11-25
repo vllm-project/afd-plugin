@@ -49,7 +49,9 @@ def factory_namespace() -> Iterator[
     from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_optional_afd_config
 
     runtime = runpy.run_path(str(REPO_ROOT / "afd_plugin/compat/npu/runtime_config.py"))
-    native = SimpleNamespace(_ASCEND_CONFIG=None, _INIT_VLLM_CONFIG=None)
+    native = SimpleNamespace(
+        _ASCEND_CONFIG=None, _INIT_VLLM_CONFIG=None, _MEGA_MOE_SUPPORTED=False
+    )
 
     class NativeConfig:
         __dataclass_fields__ = dict.fromkeys(
@@ -99,6 +101,7 @@ def factory_namespace() -> Iterator[
             if self.native_option == "invalid":
                 raise ValueError("native option failed validation")
             self.initialized = self.native_option != "partial"
+            self._megamoe_supported = bool(self.native_option)
 
         def validate_quantized_all_reduce(self, config):
             if (
@@ -124,6 +127,7 @@ def factory_namespace() -> Iterator[
         return config
 
     native.get_ascend_config = get_ascend_config
+    native.is_mega_moe_supported = lambda: native._MEGA_MOE_SUPPORTED
     utils = types.ModuleType("vllm_ascend.utils")
 
     @lru_cache(maxsize=1)
@@ -168,6 +172,7 @@ def factory_namespace() -> Iterator[
         "_is_ascend_config_initialized": lambda config: (
             config is not None and config.initialized
         ),
+        "is_draft_config_context": lambda: False,
         "validate_additional_config_bool": validate_bool,
         "logger": SimpleNamespace(
             warning_once=logger.warning,
@@ -228,6 +233,18 @@ class AscendConfigLifecycleTests(unittest.TestCase):
             second = ns["init_ascend_config"](copied_config)
             self.assertIsNot(second, first)
             self.assertIs(native.get_ascend_config(), second)
+
+    def test_draft_config_leaves_published_target_and_capability_in_place(self):
+        target_config = SimpleNamespace(additional_config={"native_option": 1})
+        draft_config = SimpleNamespace(additional_config={"native_option": 0})
+        with factory_namespace() as (ns, native, utils):
+            target = ns["init_ascend_config"](target_config)
+            with patch.dict(ns, {"is_draft_config_context": lambda: True}):
+                draft = ns["init_ascend_config"](draft_config)
+            self.assertEqual(draft.native_option, 0)
+            self.assertIs(native.get_ascend_config(), target)
+            self.assertTrue(native.is_mega_moe_supported())
+            self.assertTrue(utils.enable_sp())
 
     def test_native_validation_failure_keeps_published_config(self):
         config = SimpleNamespace(
