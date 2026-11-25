@@ -111,7 +111,7 @@ def test_shutdown_joins_native_children_and_releases_owned_stage_state(
 def test_ubatch_replay_supplies_fresh_stages_and_keeps_native_cleanup(
     monkeypatch, fail_update
 ):
-    from vllm_ascend.attention.mla_v1 import AscendMLABackend
+    from vllm_ascend.attention import mla_v1
     from vllm_ascend.worker.v2 import aclgraph_utils
 
     runner = object.__new__(npu_ubatch.NPUUBatchRunner)
@@ -127,7 +127,7 @@ def test_ubatch_replay_supplies_fresh_stages_and_keeps_native_cleanup(
     manager.vllm_config = object()
     manager.update_stream = object()
     manager.model_runner = SimpleNamespace(
-        attn_groups=[[SimpleNamespace(backend=AscendMLABackend)]],
+        attn_groups=[[SimpleNamespace(backend=mla_v1.AscendMLABackend)]],
         model_state=SimpleNamespace(
             attn_metadata={"layer": "parent"},
             device_metadata=SimpleNamespace(
@@ -139,6 +139,8 @@ def test_ubatch_replay_supplies_fresh_stages_and_keeps_native_cleanup(
         CUDAGraphMode.FULL, num_tokens=8, num_reqs=8, num_ubatches=2
     )
     monkeypatch.setattr(aclgraph_utils, "set_current_vllm_config", nullcontext)
+    # This fixture supplies the ordinary MLA backend without a live vLLM config.
+    monkeypatch.setattr(mla_v1, "is_dcp_enabled", lambda: False, raising=False)
 
     def replay(descriptor, metadata):
         assert descriptor is desc
