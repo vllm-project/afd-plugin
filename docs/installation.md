@@ -74,6 +74,18 @@ CANN/torch-npu toolchain. `AFD_BUILD_ASCEND_OPS=1` forces the native build;
 `0` skips it. When unset, setup detects the Ascend environment. See the
 [native build guide](../csrc/npu/README.md) for build controls and artifacts.
 
+On the Ubuntu A3 image, expose the installed AFD vendor before launching a
+CAMP2P service so CANN can register the A2E/E2A tiling functions on startup.
+From the repository root used for the editable install, run the following
+with the CANN environment already activated.
+
+```bash
+afd_vendor="$PWD/afd_plugin/_cann_ops_custom/vendors/afd-plugin"
+export ASCEND_CUSTOM_OPP_PATH="$afd_vendor${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
+export LD_LIBRARY_PATH="$afd_vendor/op_api/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export AFD_CUST_OPAPI_LIB_PATH="$afd_vendor/op_api/lib/libcust_opapi.so"
+```
+
 ### Verify
 
 ```bash
