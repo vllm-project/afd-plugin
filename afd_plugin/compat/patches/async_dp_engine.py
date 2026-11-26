@@ -2,12 +2,32 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Ascend patches for AFD async-DP engine scheduling.
 
-Connector-driven Attention ranks use the regular EngineCoreProc to step
-independently with their original DP/EP topology. The coordinator still
-publishes request counts for load balancing. In vLLM 0.34, DPEngineCoreProc
-starts DP waves when it admits requests, so request clients stay native.
+This module patches:
+1. ``vllm.v1.engine.core.EngineCoreProc.run_engine_core``
+2. ``vllm.v1.engine.utils.launch_core_engines``
 
-Remove these patches when vLLM exposes a per-engine MoE DP scheduling hook.
+Why:
+    vLLM 0.34.0's native MoE DP path uses ``DPEngineCoreProc`` and DP wave
+    notifications. AFD async-DP Attention ranks are connector-driven and must
+    step independently while keeping the original DP/EP topology for expert
+    placement and weight loading.
+
+How:
+    For Async CAM Attention, AFD selects async-DP through
+    ``additional_config["afd"]["async_dp"]``. Its MoE DP engine processes
+    instantiate ``EngineCoreProc`` instead of ``DPEngineCoreProc``. The DP
+    coordinator keeps publishing request counts for load balancing with wave
+    coordination disabled for these ranks.
+    vLLM 0.34 starts waves in ``DPEngineCoreProc.add_request``. The request
+    client uses the native implementation.
+
+Future plan:
+    Remove the remaining patches when vLLM exposes an external async-DP
+    scheduling hook selectable by plugin config. The copied DP-coordinator
+    patches that existed for vLLM 0.26.0 were removed because vLLM absorbed
+    the non-lockstep stats handling upstream (#49204, present since 0.28.0):
+    the coordinator now gates lockstep timeouts and step/wave ordering on
+    ``enable_wave_coordination`` itself.
 """
 
 from __future__ import annotations
