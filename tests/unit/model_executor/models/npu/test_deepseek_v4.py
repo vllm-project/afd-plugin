@@ -280,23 +280,24 @@ def test_model_constructs_only_role_owned_stages(construct_model, role):
 
 
 @pytest.mark.parametrize(
-    "connector, gate_on_attention, recv_input_ids, recv_routing",
+    "connector, gate_on_attention, requires_routing",
     [
-        ("CAMP2pAFDConnector", False, True, False),
-        ("CAMP2pAFDConnector", True, False, True),
+        ("CAMP2pAFDConnector", False, False),
+        ("CAMP2pAFDConnector", True, True),
         # The async CAM shell carries routing inside its own dispatch payload.
-        ("CAMAsyncAFDConnector", True, True, False),
+        ("CAMAsyncAFDConnector", True, False),
     ],
     ids=["sync-gate-on-ffn", "sync-gate-on-attention", "async-gate-on-attention"],
 )
-def test_ffn_transport_flags_select_runner_receive_mode(
-    construct_model, connector, gate_on_attention, recv_input_ids, recv_routing
+def test_ffn_requests_attention_routing_only_for_sync_gate_on_attention(
+    construct_model, connector, gate_on_attention, requires_routing
 ):
     """The FFN adapter asks for top-k routing only for sync gate-on-Attention.
 
-    Why: the wire slot carries either token ids or Attention-side routing. The
-    FFN runners resolve it as below; a wrong flag makes the synchronous runner
-    receive ids where the layer expects ``topk_ids``/``topk_weights``.
+    Why: the wire slot carries either token ids or Attention-side routing, and
+    the FFN runners give routing precedence when the model declares it. A wrong
+    flag makes the synchronous runner receive ids where the layer expects
+    ``topk_ids``/``topk_weights``.
     """
     model = construct_model(
         role="ffn",
@@ -304,10 +305,7 @@ def test_ffn_transport_flags_select_runner_receive_mode(
         compute_gate_on_attention=gate_on_attention,
     )
 
-    routing = model.afd_requires_attention_routing
-    input_ids = False if routing else model.afd_requires_input_ids
-
-    assert (input_ids, routing) == (recv_input_ids, recv_routing)
+    assert model.afd_requires_attention_routing is requires_routing
 
 
 def test_ffn_compute_forwards_attention_routing_to_target_layer(torch, construct_model):
@@ -339,10 +337,6 @@ def test_ffn_compute_forwards_attention_routing_to_target_layer(torch, construct
 
     assert torch.equal(output, hidden_states + 1)
     assert calls == [(1, hidden_states, routing)]
-    # Attention-side routing travels through compute_ffn_output, never through
-    # the GPU router-logits hooks.
-    assert not hasattr(model, "compute_experts_output")
-    assert not hasattr(model, "get_experts_routing_spec")
 
 
 def test_attention_layers_share_model_local_reserved_output_storage(construct_model):

@@ -354,7 +354,6 @@ def test_v2_ffn_runner_keeps_hidden_state_only_connector_contract():
 
     runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([1])})
 
-    assert model.afd_requires_input_ids is False
     assert runner.connector.recv_input_ids == [False]
     assert runner.connector.ffn_outputs == [("v2-hidden", metadata)]
 

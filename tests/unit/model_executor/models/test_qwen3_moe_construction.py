@@ -778,18 +778,14 @@ def test_attention_role_rejects_local_ffn_compute(
         layer.compute_ffn_output(torch.zeros(2, 4))
 
 
-@pytest.mark.parametrize(
-    "cls_name",
-    ["AFDQwen3MoeModel", "AFDQwen3MoeForCausalLM", "AFDQwen3MoeRoutedExperts"],
-)
-def test_qwen3_moe_exposes_routed_experts_accessor(cls_name):
-    """Qwen3 MoE keeps vLLM's RoutedExperts at ``mlp.experts.routed_experts``."""
-    assert callable(getattr(adapter, cls_name).get_routed_experts)
-
-
 @pytest.mark.parametrize("cls_name", ["AFDQwen3MoeModel", "AFDQwen3MoeForCausalLM"])
-def test_qwen3_moe_does_not_expose_router_logits_hooks(cls_name):
-    """Qwen3 MoE routes on Attention only through routed-experts connectors."""
+def test_qwen3_moe_exposes_routed_experts_but_not_router_logits_hooks(cls_name):
+    """Qwen3 MoE routes on Attention only through routed-experts connectors.
+
+    Why: its layers keep vLLM's ``RoutedExperts`` for the routed-experts runner,
+    but no Qwen3 layer computes experts from Attention router logits.
+    """
     cls = getattr(adapter, cls_name)
+    assert callable(cls.get_routed_experts)
     assert not hasattr(cls, "compute_experts_output")
     assert not hasattr(cls, "get_experts_routing_spec")

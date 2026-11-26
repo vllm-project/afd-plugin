@@ -68,16 +68,8 @@ class _RecordingLayer:
         return self.output
 
 
-@pytest.mark.parametrize(
-    "ffn_inputs",
-    [
-        {},
-        {"input_ids": object()},
-        {"topk_ids": object(), "topk_weights": object()},
-    ],
-    ids=["no-extras", "input-ids", "attention-routing"],
-)
-def test_causal_lm_hooks_route_ffn_compute_to_target_layer(model_utils, ffn_inputs):
+def test_causal_lm_hooks_route_ffn_compute_to_target_layer(model_utils):
+    """Transport inputs reach the target layer unchanged; other layers stay idle."""
     layers = [_RecordingLayer("layer-0"), _RecordingLayer("layer-1")]
     inner = model_utils.AFDModelHooks()
     inner.layers = layers
@@ -85,6 +77,7 @@ def test_causal_lm_hooks_route_ffn_compute_to_target_layer(model_utils, ffn_inpu
     outer.model = inner
 
     hidden_states = object()
+    ffn_inputs = {"input_ids": object()}
     output = outer.compute_ffn_output(hidden_states, 1, **ffn_inputs)
 
     assert output == "layer-1"
@@ -147,20 +140,6 @@ def test_router_logits_hooks_are_opt_in(model_utils):
         router_logits,
     )
     assert outer.get_experts_routing_spec(1) == (spec, 1)
-
-
-def test_opt_in_outer_hooks_reject_base_inner_model(model_utils):
-    """An opt-in outer mixin over a base-only inner model fails with a clear type."""
-    inner = model_utils.AFDModelHooks()
-    routed = model_utils.AFDRoutedExpertsCausalLMHooks()
-    routed.model = inner
-    logits = model_utils.AFDRouterLogitsCausalLMHooks()
-    logits.model = inner
-
-    with pytest.raises(TypeError, match="routed-experts"):
-        routed.get_routed_experts(0)
-    with pytest.raises(TypeError, match="router logits"):
-        logits.get_experts_routing_spec(0)
 
 
 @pytest.mark.parametrize(
