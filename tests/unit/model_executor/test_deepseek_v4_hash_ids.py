@@ -135,8 +135,9 @@ def test_rejects_unalignable_token_count():
     ],
 )
 @pytest.mark.parametrize("in_profile_run", [False, True])
+@pytest.mark.parametrize("precomputed_fp32", [False, True])
 def test_dsv4_router_uses_model_gate(
-    monkeypatch, scoring_func, selector, in_profile_run
+    monkeypatch, scoring_func, selector, in_profile_run, precomputed_fp32
 ):
     extra_context = types.ModuleType("vllm_ascend.ascend_forward_context")
     extra_context._EXTRA_CTX = types.SimpleNamespace(  # type: ignore[attr-defined]
@@ -148,7 +149,7 @@ def test_dsv4_router_uses_model_gate(
     monkeypatch.setenv("AFD_FORCE_BALANCED_TOPK_IDS", "1")
     hidden = torch.tensor([[1.0, 0.25]], dtype=torch.bfloat16)
     router_input = torch.tensor([[1.0, 1.001953125]], dtype=torch.float32)
-    router_logits = router_input
+    router_logits = router_input if precomputed_fp32 else hidden.float()
     moe = types.SimpleNamespace(
         gate=types.SimpleNamespace(weight_fp32=torch.eye(2)),
         scoring_func=scoring_func,
@@ -169,10 +170,10 @@ def test_dsv4_router_uses_model_gate(
     weights, ids = deepseek_v4_attention_gate.compute_attention_gate_topk(
         moe,
         hidden,
-        hidden_states_fp32=router_input,
+        hidden_states_fp32=router_input if precomputed_fp32 else None,
     )
 
     assert torch.equal(captured[0], router_logits)
-    assert ids.tolist() == [[0 if in_profile_run else 1]]
+    assert ids.tolist() == [[int(precomputed_fp32 and not in_profile_run)]]
     assert weights.tolist() == [[1.0]]
     assert weights.dtype == torch.float32

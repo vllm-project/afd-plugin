@@ -31,7 +31,7 @@ def cam_factory_on_cpu(monkeypatch):
 
 
 @pytest.fixture
-def cam_moe(cam_factory_on_cpu):
+def cam_moe(cam_factory_on_cpu, monkeypatch):
     from vllm.config import set_current_vllm_config
 
     from afd_plugin.model_executor.models.npu.deepseek_v4_moe import AFDDeepseekV4MoE
@@ -45,20 +45,34 @@ def cam_moe(cam_factory_on_cpu):
         prefix="model.layers.3.mlp",
         is_draft_layer=False,
         routing_config=None,
+        shared_cls=None,
+        sp=False,
     ):
         config = SimpleNamespace(
             hidden_size=4,
             moe_intermediate_size=8,
             num_experts_per_tok=2,
             n_routed_experts=3,
-            n_shared_experts=0,
+            n_shared_experts=int(shared_cls is not None),
+            hidden_act="silu",
             norm_topk_prob=True,
             vocab_size=4,
             **(routing_config or {}),
         )
+        if shared_cls is not None:
+            monkeypatch.setitem(
+                sys.modules,
+                "afd_plugin.model_executor.models.npu.deepseek_v4_shared_experts",
+                SimpleNamespace(AFDDeepseekV4SharedExperts=shared_cls),
+            )
         vllm_config = attention_moe_vllm_config(
             connector=connector, compute_gate_on_attention=gate
         )
+        if sp:
+            parallel = vllm_config.parallel_config
+            parallel.tensor_parallel_size = parallel.data_parallel_size = 2
+            parallel.enable_expert_parallel = True
+            parallel.all2all_backend = "allgather_reducescatter"
         with set_current_vllm_config(vllm_config):
             return AFDDeepseekV4MoE(
                 vllm_config=vllm_config,

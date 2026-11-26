@@ -12,7 +12,6 @@ import __future__
 import ast
 import copy
 import logging
-import runpy
 import sys
 import types
 import unittest
@@ -46,9 +45,6 @@ def factory_namespace() -> Iterator[
     tuple[dict[str, Any], SimpleNamespace, types.ModuleType]
 ]:
     # Child lifecycle probes run in isolation without importing the package.
-    from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_optional_afd_config
-
-    runtime = runpy.run_path(str(REPO_ROOT / "afd_plugin/compat/npu/runtime_config.py"))
     native = SimpleNamespace(
         _ASCEND_CONFIG=None, _INIT_VLLM_CONFIG=None, _MEGA_MOE_SUPPORTED=False
     )
@@ -112,9 +108,6 @@ def factory_namespace() -> Iterator[
                     "quantized_all_reduce_config supports tensor_parallel_size <= 8"
                 )
 
-        def _check_mix_placement(self):
-            pass
-
     def validate_bool(value, key):
         if not isinstance(value, bool):
             raise ValueError(key)
@@ -154,12 +147,6 @@ def factory_namespace() -> Iterator[
     )
     logger = logging.getLogger("afd_test_ascend_config")
     ns: dict[str, Any] = {
-        "AFD_ASYNC_CONNECTOR": AFD_ASYNC_CONNECTOR,
-        "parse_optional_afd_config": parse_optional_afd_config,
-        "DEEPSEEK_V2_MODEL_TYPES": runtime["DEEPSEEK_V2_MODEL_TYPES"],
-        "npu_model_uses_sequence_parallel_moe": runtime[
-            "npu_model_uses_sequence_parallel_moe"
-        ],
         "ascend_config": native,
         "AscendConfig": NativeConfig,
         "SchedulerConfig": SimpleNamespace(
@@ -280,63 +267,6 @@ class AscendConfigLifecycleTests(unittest.TestCase):
             self.assertIsNot(partial, first)
             self.assertIs(native.get_ascend_config(), first)
             self.assertTrue(utils.enable_sp())
-
-    def test_async_shared_replication_only_overrides_effective_model_sp(
-        self,
-    ):  # long-test: native cached SP decision must use effective model SP
-        afd = {
-            "connector": "CAMAsyncAFDConnector",
-            "role": "attention",
-            "compute_gate_on_attention": True,
-        }
-        cases = [
-            (afd, "deepseek_v2", {}, True, 1, True),
-            (afd, "deepseek_v3", {"enable_shared_expert_dp": False}, True, 1, True),
-            ({**afd, "role": "ffn"}, "deepseek_v2", {}, True, 1, False),
-            (
-                {**afd, "connector": "CAMP2pAFDConnector"},
-                "deepseek_v2",
-                {},
-                True,
-                1,
-                False,
-            ),
-            (
-                {**afd, "compute_gate_on_attention": False},
-                "deepseek_v2",
-                {},
-                True,
-                1,
-                False,
-            ),
-            (afd, "deepseek_v4", {}, True, 1, False),
-            (None, "deepseek_v2", {}, True, 1, False),
-            (afd, "deepseek_v2", {}, False, 1, False),
-            (afd, "deepseek_v2", {}, True, 2, False),
-            (afd, "deepseek_v2", {"enable_shared_expert_dp": True}, False, 1, True),
-        ]
-        for afd_mapping, model_type, options, use_sp, pp_size, expected in cases:
-            with self.subTest(afd=afd_mapping, model_type=model_type, options=options):
-                additional: dict[str, Any] = dict(options)
-                if afd_mapping is not None:
-                    additional["afd"] = afd_mapping
-                config = SimpleNamespace(
-                    additional_config=additional,
-                    model_config=SimpleNamespace(
-                        hf_text_config=SimpleNamespace(model_type=model_type),
-                    ),
-                    parallel_config=SimpleNamespace(
-                        tensor_parallel_size=4,
-                        pipeline_parallel_size=pp_size,
-                        use_sequence_parallel_moe=use_sp,
-                        all2all_backend="allgather_reducescatter",
-                    ),
-                )
-                before = copy.deepcopy(vars(config))
-                with factory_namespace() as (ns, _, _):
-                    result = ns["init_ascend_config"](config)
-                self.assertIs(result.enable_shared_expert_dp, expected)
-                self.assertEqual(vars(config), before)
 
     def test_factory_binds_already_loaded_native_scheduler_callers(self):
         tree = ast.parse(FACTORY_PATH.read_text(encoding="utf-8"))

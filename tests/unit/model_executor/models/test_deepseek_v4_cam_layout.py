@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+"""V4 Async CAM dispatch, shared overlap and layout restoration on CPU."""
 
-from __future__ import annotations
-
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
@@ -10,104 +10,97 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
+from torch import nn  # noqa: E402
+
+from afd_plugin.config import AFD_ASYNC_CONNECTOR  # noqa: E402
 from afd_plugin.connectors.npu.async_cam_runtime import (  # noqa: E402
-    async_cam_layout as async_cam,
+    async_cam_dbo,
+    async_cam_layout,
 )
-from afd_plugin.model_executor.models.npu import (  # noqa: E402
-    deepseek_v4_moe as adapter,
+from afd_plugin.model_executor.ffn.npu import cam_runner  # noqa: E402
+from afd_plugin.model_executor.models.npu import deepseek_v4_moe as model  # noqa: E402
+from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "sp", [False, True], ids=["replicated-tp", "sequence-parallel"]
 )
-
-
-def _make_proxy(monkeypatch, *, use_sequence_parallel: bool, in_profile_run: bool):
-    proxy = object.__new__(adapter.AFDDeepseekV4MoE)
-    torch.nn.Module.__init__(proxy)
-    proxy.use_sequence_parallel_moe = use_sequence_parallel
-    proxy.gate = torch.nn.Identity()
-    proxy.experts = None
-    proxy.shared_experts = None
-    proxy.layer_idx = 3
-    connector = SimpleNamespace()
+def test_draft_dispatch_restores_its_own_layout_and_adds_shared_once(
+    cam_moe, monkeypatch, sp
+):
+    hidden = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    ids = torch.arange(10, dtype=torch.int32).reshape(5, 2) % 3
+    weights = torch.arange(10, dtype=torch.float32).reshape(5, 2)
     monkeypatch.setattr(
-        adapter,
-        "get_afd_metadata_from_forward_context",
-        lambda: SimpleNamespace(connector=connector, stage_idx=0),
-    )
-    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", lambda states, **kw: states)
-    topk_weights = torch.arange(32, dtype=torch.float32).reshape(16, 2)
-    topk_ids = torch.arange(32, dtype=torch.int32).reshape(16, 2)
-    monkeypatch.setattr(
-        adapter,
-        "compute_attention_gate_topk",
-        lambda _proxy, _hidden_states, **_kwargs: (topk_weights, topk_ids),
+        model, "compute_attention_gate_topk", lambda *_a, **_kw: (weights, ids)
     )
     monkeypatch.setattr(
-        adapter,
-        "get_forward_context",
-        lambda: SimpleNamespace(
-            in_profile_run=in_profile_run,
-        ),
-    )
-    return proxy, topk_weights, topk_ids
-
-
-def test_dsv4_profile_gate_shards_plain_tp8_and_restores(monkeypatch):
-    proxy, topk_weights, topk_ids = _make_proxy(
-        monkeypatch,
-        use_sequence_parallel=False,
-        in_profile_run=True,
-    )
-    tp_group = SimpleNamespace(world_size=8, rank_in_group=3)
-    monkeypatch.setattr(async_cam, "get_tp_group", lambda: tp_group)
-    hidden_states = torch.arange(64, dtype=torch.float32).reshape(16, 4)
-    gathered_output = hidden_states + 100
-    monkeypatch.setattr(
-        async_cam,
-        "tensor_model_parallel_all_gather",
-        lambda _tensor, token_dim: gathered_output,
-    )
-    sends = []
-
-    def send(_connector, local_hidden_states, context, **kwargs):
-        assert context.metadata.layer_idx == proxy.layer_idx
-        assert context.metadata.stage_idx == 0
-        sends.append((local_hidden_states, kwargs))
-        return lambda: local_hidden_states + 100
-
-    monkeypatch.setattr(adapter, "send_async_cam_remote_call", send)
-
-    output = proxy(hidden_states)
-
-    sent_hidden_states, send_kwargs = sends[0]
-    assert torch.equal(sent_hidden_states, hidden_states[6:8])
-    assert torch.equal(send_kwargs["topk_weights"], topk_weights[6:8])
-    assert torch.equal(send_kwargs["topk_ids"], topk_ids[6:8])
-    assert torch.equal(output, gathered_output)
-
-
-def test_dsv4_gate_keeps_sequence_parallel_tokens_rank_local(monkeypatch):
-    proxy, topk_weights, topk_ids = _make_proxy(
-        monkeypatch,
-        use_sequence_parallel=True,
-        in_profile_run=False,
-    )
-    monkeypatch.setattr(
-        async_cam,
+        async_cam_layout,
         "get_tp_group",
-        lambda: SimpleNamespace(world_size=8, rank_in_group=3),
+        lambda: SimpleNamespace(world_size=2, rank_in_group=1),
     )
-    hidden_states = torch.arange(64, dtype=torch.float32).reshape(16, 4)
-    sends = []
+    events: list[str] = []
+    metadata = install_proxy_context(monkeypatch, [])
+    metadata.stage_idx = 1
 
-    def send(_connector, local_hidden_states, context, **kwargs):
-        sends.append((local_hidden_states, kwargs))
-        return lambda: local_hidden_states + 1
+    def local(rows):
+        return rows if sp else torch.cat((rows[3:], torch.zeros_like(rows[:1])))
 
-    monkeypatch.setattr(adapter, "send_async_cam_remote_call", send)
+    def send(states, context, **payload):
+        events.append("send")
+        assert context.metadata.layer_idx == 43
+        assert context.metadata.stage_idx == 1
+        assert context.metadata.seq_lens == [5 if sp else 3]
+        assert payload.keys() == {"topk_ids", "topk_weights"}
+        torch.testing.assert_close(states, local(hidden))
+        torch.testing.assert_close(payload["topk_ids"], local(ids))
+        torch.testing.assert_close(payload["topk_weights"], local(weights))
 
-    output = proxy(hidden_states)
+    def recv(*, ref_tensor, ubatch_idx, context):
+        events.append("recv")
+        assert ubatch_idx == context.metadata.stage_idx == 1
+        torch.testing.assert_close(ref_tensor, local(hidden))
+        return ref_tensor + 100
 
-    sent_hidden_states, send_kwargs = sends[0]
-    assert sent_hidden_states is hidden_states
-    assert send_kwargs["topk_weights"] is topk_weights
-    assert send_kwargs["topk_ids"] is topk_ids
-    assert torch.equal(output, hidden_states + 1)
+    class Shared(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            assert kwargs["prefix"] == "mtp.0.mlp.shared_experts"
+            assert kwargs["is_sequence_parallel"] == sp
+
+        def forward(self, states):
+            events.append("shared")
+            assert states is hidden
+            return states * 3
+
+    block = cam_moe(
+        gate=True,
+        connector=AFD_ASYNC_CONNECTOR,
+        layer_idx=43,
+        prefix="mtp.0.mlp",
+        is_draft_layer=True,
+        sp=sp,
+        shared_cls=Shared,
+    )
+    metadata.connector = SimpleNamespace(send_attn_output=send, recv_ffn_output=recv)
+    hooks: list[Callable] = []
+    monkeypatch.setattr(async_cam_dbo, "dbo_enabled", lambda: True)
+    monkeypatch.setattr(async_cam_dbo, "dbo_maybe_run_recv_hook", lambda: None)
+    monkeypatch.setattr(async_cam_dbo, "dbo_register_recv_hook", hooks.append)
+
+    def yield_to_peer(states, *, role):
+        events.append("yield")
+        metadata.stage_idx = 0
+        hooks.pop()()
+        return states
+
+    def gather(local_output, dim):
+        events.append("gather")
+        torch.testing.assert_close(local_output, local(hidden) + 100)
+        return torch.cat((hidden, torch.zeros_like(hidden[:1]))) + 100
+
+    monkeypatch.setattr(cam_runner, "maybe_apply_dbo_yield", yield_to_peer)
+    monkeypatch.setattr(async_cam_layout, "tensor_model_parallel_all_gather", gather)
+
+    torch.testing.assert_close(block(hidden), hidden * 4 + 100)
+    assert events == ["send", "shared", "yield", "recv"] + ([] if sp else ["gather"])

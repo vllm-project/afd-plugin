@@ -191,7 +191,7 @@ def test_runner_stays_weightless_and_fails_on_expert_checkpoints(
     ("device_type", "connector"),
     [
         ("cuda", "CAMP2pAFDConnector"),
-        ("npu", "CAMAsyncAFDConnector"),
+        ("cuda", "CAMAsyncAFDConnector"),
         ("npu", "P2pNcclAFDConnector"),
         ("cpu", "P2pNcclAFDConnector"),
     ],

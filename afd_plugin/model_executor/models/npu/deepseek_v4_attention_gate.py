@@ -62,9 +62,7 @@ def compute_attention_gate_topk(
         )
     else:
         topk_weights, topk_ids = _compute_standard_topk(moe, router_logits)
-    # The proxy bypasses AscendRoutedExperts' dummy-profile balancing. The flag
-    # read lives inside the custom op so tracing records an op call instead of
-    # specializing the branch on the profile-time value.
+    # Read the profile flag inside the op so graph replay can use real routes.
     torch.ops.vllm.afd_balance_routing_ids_(
         topk_ids,
         router_logits.shape[1],
@@ -81,20 +79,15 @@ def _compute_sqrtsoftplus_topk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run DSV4's sqrtsoftplus CANN router without native MoE communication."""
 
-    if moe.scoring_func != "sqrtsoftplus":
-        raise RuntimeError(
-            "DSV4 Hash routing requires scoring_func='sqrtsoftplus', got "
-            f"{moe.scoring_func!r}",
-        )
-
     assert moe.gate is not None
     tid2eid = moe.gate.tid2eid
     if tid2eid is not None:
         from vllm.forward_context import get_forward_context
 
-        forward_context = get_forward_context()
         input_ids = local_hash_input_ids(
-            input_ids=(forward_context.input_ids if input_ids is None else input_ids),
+            input_ids=get_forward_context().input_ids
+            if input_ids is None
+            else input_ids,
             router_tokens=router_logits.shape[0],
         )
         input_ids = torch.where(input_ids == -1, 0, input_ids)

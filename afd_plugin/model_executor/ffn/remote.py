@@ -269,8 +269,8 @@ class AFDRoutedExpertsMoERunner(MoERunner):
     microbatch before the runner reads it, so each microbatch needs its own
     output slot. vLLM picks the slot per microbatch only when its runner gets
     ``enable_dbo``, but AFD also runs two microbatches with ``--ubatch-size 2``
-    alone. Pass ``enable_dbo`` whenever vLLM microbatches; vLLM 0.32 reads the
-    runner's ``enable_dbo`` only to pick that slot.
+    alone. On vLLM 0.34, pass ``enable_dbo`` whenever vLLM microbatches so
+    the shared-expert output slot follows the active microbatch.
     """
 
     def __init__(self, *args: Any, enable_dbo: bool = False, **kwargs: Any) -> None:
@@ -319,8 +319,7 @@ class AFDRemoteMoERunner(MoERunner):
             routed_output_transform=routed_output_transform,
             routed_scaling_factor=routed_scaling_factor,
         )
-        # The native layer name carries the decoder layer index. Parse it
-        # once: forward may be traced by torch.compile.
+        # DSpark uses draft-local checkpoint names and target-global CAM layer IDs.
         self.layer_idx: int = (
             self.layer_id if transport_layer_idx is None else transport_layer_idx
         )
@@ -377,12 +376,10 @@ def build_expert(
     ``FusedMoEFactory``.
 
     ``moe_kwargs`` are the native model's ``FusedMoEFactory`` arguments. Pass
-    the model's gate exactly when ``compute_gate_on_attention`` is set; the
-    runner then applies it. Pass the shared experts when Attention runs them
-    (DeepEP M2N). The configured connector's registration names the runner
-    class, imported here. This function fixes the arguments that describe
-    local experts: the runner registers like a native MoE layer but allocates
-    no expert weights and runs no expert kernel.
+    the model's gate exactly when ``compute_gate_on_attention`` is set.
+    CUDA runners apply it. CAM receives routes selected by the model. Pass
+    shared experts to the native runner for DeepEP M2N. The connector selects
+    the runner. Its routed experts register with vLLM and allocate no weights.
     """
     afd_config = parse_afd_config(vllm_config, validate=False)
     device_type = current_platform.device_type
@@ -425,6 +422,8 @@ def build_expert(
         )
 
         routed_experts_cls = AFDAscendRemoteRoutedExperts
+        # CAM consumes preselected routes. Keep the gate's single checkpoint name.
+        gate = None
 
     # A parameter-free container: no local quantized weights, transforms or
     # EPLB, and unit TP/DP/PCP sizes, so no expert sharding. vLLM's runner
@@ -439,7 +438,7 @@ def build_expert(
         "routed_output_transform": None,
         "n_shared_experts": None,
         "fuse_shared_experts": False,
-        "apply_routed_scale_to_output": True,
+        "apply_routed_scale_to_output": device_type != "npu",
         "enable_eplb": False,
         "num_redundant_experts": 0,
         "is_sequence_parallel": False,

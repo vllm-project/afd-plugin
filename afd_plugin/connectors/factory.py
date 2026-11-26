@@ -151,6 +151,11 @@ AFDConnectorFactory.register_connector(
     "CAMAsyncAFDConnector",
     "afd_plugin.connectors.npu.async_cam",
     "CAMAsyncAFDConnector",
+    attention_moe_runner=(
+        "afd_plugin.model_executor.ffn.npu.cam_runner",
+        "AFDAsyncCAMMoERunner",
+    ),
+    attention_moe_device="npu",
 )
 
 

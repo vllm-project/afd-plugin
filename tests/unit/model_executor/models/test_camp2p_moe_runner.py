@@ -9,6 +9,8 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
+from torch import nn  # noqa: E402
+
 from afd_plugin.model_executor.ffn import remote  # noqa: E402
 from afd_plugin.model_executor.models.npu import deepseek_v4_moe as model  # noqa: E402
 from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
@@ -16,7 +18,7 @@ from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
 
 @pytest.mark.parametrize("explicit", [False, True], ids=["context-ids", "model-ids"])
 def test_ffn_gate_sends_local_ids(cam_moe, monkeypatch, explicit):
-    events = []
+    events: list[tuple] = []
     install_proxy_context(monkeypatch, events)
     local_ids = torch.tensor([4, 7], dtype=torch.int32)
     context_ids = torch.arange(5) if explicit else local_ids
@@ -36,7 +38,7 @@ def test_ffn_gate_sends_local_ids(cam_moe, monkeypatch, explicit):
 
 
 def test_ffn_gate_requires_ids_before_send(cam_moe, monkeypatch):
-    events = []
+    events: list[tuple] = []
     install_proxy_context(monkeypatch, events)
     monkeypatch.setattr(
         model, "get_forward_context", lambda: SimpleNamespace(input_ids=None)
@@ -52,7 +54,7 @@ def test_ffn_gate_requires_ids_before_send(cam_moe, monkeypatch):
 def test_sync_gate_preserves_routes_and_stage_across_yield(
     cam_moe, monkeypatch, has_shared
 ):
-    events = []
+    events: list[tuple] = []
     stage = SimpleNamespace(ubatch_idx=0)
     metadata = install_proxy_context(monkeypatch, events)
     monkeypatch.setattr(remote, "get_forward_context", lambda: stage)
@@ -64,15 +66,21 @@ def test_sync_gate_preserves_routes_and_stage_across_yield(
         return hidden
 
     monkeypatch.setattr(remote, "maybe_apply_dbo_yield", switch_stage)
-    block = cam_moe(gate=True)
 
-    class Shared(torch.nn.Module):
+    class Shared(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            self.scale = nn.Parameter(torch.tensor(3.0))
+
         def forward(self, states):
             events.append(("shared", states))
-            return states * 3
+            return states * self.scale
 
+    block = cam_moe(gate=True, shared_cls=Shared if has_shared else None)
+    expected_weights = {"gate.weight", "gate.e_score_correction_bias"}
     if has_shared:
-        block.shared_experts = Shared()
+        expected_weights.add("shared_experts.scale")
+    assert set(block.state_dict()) == expected_weights
     for owner in (0, 1):
         hidden = torch.full((2, 4), 4.0 + owner)
         ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32) + owner
@@ -111,3 +119,41 @@ def test_sync_gate_requires_forward_metadata(cam_moe, monkeypatch):
     )
     with pytest.raises(RuntimeError, match="AFD forward metadata"):
         cam_moe(gate=True)(torch.ones(1, 4))
+
+
+def test_hash_gate_sends_routes_from_the_checkpoint_table(cam_moe, monkeypatch):
+    block = cam_moe(
+        gate=True,
+        routing_config={
+            "mlp_layer_types": ["moe"] * 3 + ["hash_moe"],
+            "scoring_func": "sqrtsoftplus",
+            "routed_scaling_factor": 2.5,
+        },
+    )
+    table = torch.tensor([[2, 1], [0, 2], [1, 0], [0, 1]], dtype=torch.int32)
+    gate_weight = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    block.load_state_dict({"gate.weight": gate_weight, "gate.tid2eid": table})
+    # Supply the FP32 weight produced by Ascend's post-load hook.
+    block.gate.weight_fp32 = block.gate.weight.detach().float()
+    hidden = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
+    normalized = torch.tensor([[0.25, 0.75], [0.5, 0.5]])
+
+    def select(*, x, input_ids, tid2eid, routed_scaling_factor, **kwargs):
+        torch.testing.assert_close(x, hidden.float() @ gate_weight.T)
+        return normalized * routed_scaling_factor, tid2eid[input_ids], None
+
+    monkeypatch.setattr(
+        torch.ops._C_ascend, "moe_gating_top_k_hash", select, raising=False
+    )
+    monkeypatch.setattr(
+        torch.ops.vllm, "afd_balance_routing_ids_", lambda *_: None, raising=False
+    )
+    events: list[tuple] = []
+    install_proxy_context(monkeypatch, events)
+
+    output = block(hidden, input_ids=torch.tensor([2, -1]))
+
+    ids, weights = events[0][3]["routing"]
+    torch.testing.assert_close(ids, table[[2, 0]])
+    torch.testing.assert_close(weights, normalized * 2.5)
+    torch.testing.assert_close(output, hidden * 0.25)

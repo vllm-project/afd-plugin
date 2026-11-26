@@ -94,8 +94,8 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
     # Signature: AFD-owned; takes vllm_config for the factory, adds
     # compute_gate_on_attention and sends_routes, and omits quant_config
     # because no local expert kernel is constructed.
-    # Upstream: vLLM v0.32.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
+    # Upstream: vLLM v0.34.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
     def __init__(
         self,
         *,
@@ -208,8 +208,8 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
     # Patch reason: native DeepSeek constructs both Attention and FFN modules.
     # Patch functionality: construct only the modules owned by the active AFD role.
     # Signature: matches upstream; no added parameters.
-    # Upstream: vLLM v0.32.0, vllm/model_executor/models/deepseek_v2.py
-    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
+    # Upstream: vLLM v0.34.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
     def __init__(
         self,
         vllm_config: VllmConfig,

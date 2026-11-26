@@ -201,7 +201,7 @@ def test_v2_camp2p_sends_the_decoder_activation(
             vllm_config=config,
             connector="CAMP2pAFDConnector",
         ).mlp
-    events = []
+    events: list[tuple] = []
     install_proxy_context(monkeypatch, events, stage_idx=0)
     hidden = torch.ones(2, hf.hidden_size)
 

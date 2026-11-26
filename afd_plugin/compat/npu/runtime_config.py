@@ -16,9 +16,6 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 FLASHINFER_ALL2ALLV_BACKEND = "flashinfer_all2allv"
-DEEPSEEK_V2_MODEL_TYPES = frozenset(
-    ("deepseek", "deepseek_v2", "deepseek_v3", "deepseek_v32", "glm_moe_dsa")
-)
 
 
 def configure_async_cam_dbo(vllm_config: VllmConfig) -> None:
@@ -63,16 +60,6 @@ def npu_afd_num_ubatches(vllm_config: VllmConfig) -> int:
     return 1
 
 
-def npu_model_uses_sequence_parallel_moe(vllm_config: VllmConfig) -> bool:
-    """Match the DSV2 decoder's effective SP setting under pipeline parallelism."""
-    parallel_config = vllm_config.parallel_config
-    model_type = vllm_config.model_config.hf_text_config.model_type
-    return parallel_config.use_sequence_parallel_moe and (
-        model_type not in DEEPSEEK_V2_MODEL_TYPES
-        or parallel_config.pipeline_parallel_size == 1
-    )
-
-
 def fix_all2all_backend_for_afd(vllm_config: VllmConfig) -> None:
     """Keep configured model SP while preserving the non-SP worker fallback.
 
@@ -94,6 +81,5 @@ __all__ = [
     "configure_async_cam_dbo",
     "fix_all2all_backend_for_afd",
     "npu_afd_num_ubatches",
-    "npu_model_uses_sequence_parallel_moe",
     "uses_async_cam_dbo",
 ]
