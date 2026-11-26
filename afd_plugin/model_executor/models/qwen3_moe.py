@@ -39,8 +39,8 @@ from afd_plugin.model_executor.models._weight_utils import (
     layer_weight_path,
 )
 from afd_plugin.model_executor.models.model_utils import (
-    AFDCausalLMHooks,
-    AFDModelHooks,
+    AFDRoutedExpertsCausalLMHooks,
+    AFDRoutedExpertsModelHooks,
 )
 
 if TYPE_CHECKING:
@@ -292,7 +292,7 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
         return self.mlp(hidden_states)
 
 
-class AFDQwen3MoeModel(AFDModelHooks, native.Qwen3MoeModel):
+class AFDQwen3MoeModel(AFDRoutedExpertsModelHooks, native.Qwen3MoeModel):
     """Native Qwen3 MoE model using role-aware decoder layers."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -388,7 +388,7 @@ class AFDQwen3MoeRoutedExperts(nn.Module):
         return self.model.layers[layer_idx].mlp.experts.routed_experts
 
 
-class AFDQwen3MoeForCausalLM(AFDCausalLMHooks, native.Qwen3MoeForCausalLM):
+class AFDQwen3MoeForCausalLM(AFDRoutedExpertsCausalLMHooks, native.Qwen3MoeForCausalLM):
     """Qwen3 MoE causal LM wrapper for AFD CUDA execution."""
 
     # Patch reason: native Qwen3MoeForCausalLM has no model-class injection hook.

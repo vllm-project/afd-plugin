@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import ast
 import importlib
+import sys
 from collections.abc import Callable
+from copy import copy
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import cast
@@ -56,12 +58,37 @@ def _compile_constructors(*names: str):
 
 
 @pytest.fixture
-def construct_model(torch):
+def construct_model(torch, monkeypatch):
     layers = importlib.import_module("tests.unit.fakes.model_layers")
     model_utils = importlib.import_module(
         "afd_plugin.model_executor.models.model_utils"
     )
     nn = torch.nn
+
+    def init_moe_with_routed_experts(self, **kwargs):
+        layers.DeepseekV4MoE.__init__(self, **kwargs)
+        # The FFN external-routing path reads ``experts.routed_experts``.
+        self.experts = SimpleNamespace(routed_experts=None)
+
+    moe_with_routed_experts = type(
+        "MoEWithRoutedExperts",
+        (layers.DeepseekV4MoE,),
+        {"__init__": init_moe_with_routed_experts},
+    )
+
+    # The FFN role with synchronous gate-on-Attention imports the NPU external
+    # routing MoE inside the decoder constructor; keep that import CPU-only.
+    external_routing = SimpleNamespace(AFDExternalRoutingMoE=lambda _experts: None)
+    external_routing_name = (
+        "afd_plugin.model_executor.models.npu.deepseek_v4_external_routing_moe"
+    )
+    monkeypatch.setitem(sys.modules, external_routing_name, external_routing)
+    monkeypatch.setattr(
+        importlib.import_module("afd_plugin.model_executor.models.npu"),
+        "deepseek_v4_external_routing_moe",
+        external_routing,
+        raising=False,
+    )
     constructors = _compile_constructors(
         "AFDDeepseekV4DecoderLayer",
         "AFDDeepseekV4Model",
@@ -75,6 +102,8 @@ def construct_model(torch):
         spec="none",
         last_rank=True,
         implementation=layers.DSAImpl,
+        connector="CAMP2pAFDConnector",
+        compute_gate_on_attention=False,
     ):
         config = SimpleNamespace(
             hidden_size=4,
@@ -91,8 +120,8 @@ def construct_model(torch):
         vllm_config = SimpleNamespace(
             afd=SimpleNamespace(
                 role=role,
-                connector="CAMP2pAFDConnector",
-                compute_gate_on_attention=False,
+                connector=connector,
+                compute_gate_on_attention=compute_gate_on_attention,
             ),
             model_config=SimpleNamespace(hf_config=config, dtype=torch.float16),
             scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
@@ -144,7 +173,7 @@ def construct_model(torch):
                 is_first_rank=True, is_last_rank=last_rank
             ),
             DeepseekV4Attention=make_attention,
-            DeepseekV4MoE=layers.DeepseekV4MoE,
+            DeepseekV4MoE=moe_with_routed_experts,
             PPMissingLayer=nn.Identity,
             RMSNorm=lambda *args, **kwargs: nn.Identity(),
             VocabParallelEmbedding=lambda *args, **kwargs: nn.Identity(),
@@ -161,6 +190,10 @@ def construct_model(torch):
             "AFDModelHooks": model_utils.AFDModelHooks,
             "AFDCausalLMHooks": model_utils.AFDCausalLMHooks,
             "AFD_ASYNC_CONNECTOR": "CAMAsyncAFDConnector",
+            "CAMP2P_CONNECTOR": "CAMP2pAFDConnector",
+            "copy": copy,
+            "AFDDeepseekV4AttentionGateRemoteMoE": lambda **kwargs: nn.Identity(),
+            "AFDDeepseekV4SyncAttentionGateRemoteMoE": lambda **kwargs: nn.Identity(),
             "parse_afd_config": lambda config, **kwargs: config.afd,
             "_refresh_ascend_fused_moe": lambda: None,
             "AFDDeepseekV4RemoteMoE": lambda **kwargs: nn.Identity(),
@@ -244,6 +277,68 @@ def test_model_constructs_only_role_owned_stages(construct_model, role):
 
     assert ("model.layers.0.self_attn.weight" in parameters) == (role == "attention")
     assert ("model.layers.0.mlp.weight" in parameters) == (role == "ffn")
+
+
+@pytest.mark.parametrize(
+    "connector, gate_on_attention, recv_input_ids, recv_routing",
+    [
+        ("CAMP2pAFDConnector", False, True, False),
+        ("CAMP2pAFDConnector", True, False, True),
+        # The async CAM shell carries routing inside its own dispatch payload.
+        ("CAMAsyncAFDConnector", True, True, False),
+    ],
+    ids=["sync-gate-on-ffn", "sync-gate-on-attention", "async-gate-on-attention"],
+)
+def test_ffn_transport_flags_select_runner_receive_mode(
+    construct_model, connector, gate_on_attention, recv_input_ids, recv_routing
+):
+    """The FFN adapter asks for top-k routing only for sync gate-on-Attention.
+
+    Why: the wire slot carries either token ids or Attention-side routing. The
+    FFN runners resolve it as below; a wrong flag makes the synchronous runner
+    receive ids where the layer expects ``topk_ids``/``topk_weights``.
+    """
+    model = construct_model(
+        role="ffn",
+        connector=connector,
+        compute_gate_on_attention=gate_on_attention,
+    )
+
+    routing = model.afd_requires_attention_routing
+    input_ids = False if routing else model.afd_requires_input_ids
+
+    assert (input_ids, routing) == (recv_input_ids, recv_routing)
+
+
+def test_ffn_compute_forwards_attention_routing_to_target_layer(torch, construct_model):
+    """The adapter forwards the routing keywords the NPU runner adds."""
+    model = construct_model(
+        role="ffn",
+        connector="CAMP2pAFDConnector",
+        compute_gate_on_attention=True,
+    )
+    calls = []
+
+    def recording_compute(layer_idx):
+        def compute_ffn_output(hidden_states, **ffn_inputs):
+            calls.append((layer_idx, hidden_states, ffn_inputs))
+            return hidden_states + layer_idx
+
+        return compute_ffn_output
+
+    for layer_idx, layer in enumerate(model.model.layers):
+        layer.compute_ffn_output = recording_compute(layer_idx)
+    hidden_states = torch.zeros(2, 4)
+    routing = {
+        "topk_ids": torch.zeros(2, 1, dtype=torch.int32),
+        "topk_weights": torch.ones(2, 1),
+        "activation_scale": torch.ones(2, 1),
+    }
+
+    output = model.compute_ffn_output(hidden_states, 1, **routing)
+
+    assert torch.equal(output, hidden_states + 1)
+    assert calls == [(1, hidden_states, routing)]
 
 
 def test_attention_layers_share_model_local_reserved_output_storage(construct_model):

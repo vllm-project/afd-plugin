@@ -92,6 +92,29 @@ def test_causal_lm_hooks_route_ffn_compute_to_target_layer(model_utils, ffn_inpu
     assert layers[1].calls == [(hidden_states, ffn_inputs)]
 
 
+def test_routed_experts_accessor_is_opt_in(model_utils):
+    """Only the routed-experts mixins expose ``get_routed_experts``.
+
+    Why: CUDA DeepSeek V4 keeps its MoE under ``layer.ffn``, so a shared
+    accessor reading ``layer.mlp.experts.routed_experts`` would fail there.
+    """
+    assert not hasattr(model_utils.AFDModelHooks, "get_routed_experts")
+    assert not hasattr(model_utils.AFDCausalLMHooks, "get_routed_experts")
+
+    routed = [object(), object()]
+    inner = model_utils.AFDRoutedExpertsModelHooks()
+    inner.layers = [
+        SimpleNamespace(
+            mlp=SimpleNamespace(experts=SimpleNamespace(routed_experts=experts))
+        )
+        for experts in routed
+    ]
+    outer = model_utils.AFDRoutedExpertsCausalLMHooks()
+    outer.model = inner
+
+    assert outer.get_routed_experts(1) is routed[1]
+
+
 @pytest.mark.parametrize(
     "architecture,device_type",
     [

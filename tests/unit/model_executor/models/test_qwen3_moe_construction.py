@@ -776,3 +776,12 @@ def test_attention_role_rejects_local_ffn_compute(
 
     with pytest.raises(RuntimeError, match="requires the AFD FFN role"):
         layer.compute_ffn_output(torch.zeros(2, 4))
+
+
+@pytest.mark.parametrize(
+    "cls_name",
+    ["AFDQwen3MoeModel", "AFDQwen3MoeForCausalLM", "AFDQwen3MoeRoutedExperts"],
+)
+def test_qwen3_moe_exposes_routed_experts_accessor(cls_name):
+    """Qwen3 MoE keeps vLLM's RoutedExperts at ``mlp.experts.routed_experts``."""
+    assert callable(getattr(adapter, cls_name).get_routed_experts)

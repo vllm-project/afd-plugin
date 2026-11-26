@@ -106,13 +106,13 @@ class AFDModelHooks:
     * ``compute_experts_output`` runs routed experts from router logits that
       Attention sent.
     * ``get_experts_layer_indices`` lists the MoE layers.
-    * ``get_routed_experts`` returns one layer's vLLM ``RoutedExperts`` module.
     * ``get_experts_routing_spec`` returns the static router width and dtype
       used for graph capture.
 
     Models keep only the hooks whose logic is model specific, plus the optional
     class flags the runners read (``afd_requires_input_ids`` and
-    ``afd_requires_attention_routing`` on the outer mixin).
+    ``afd_requires_attention_routing`` on the outer mixin). Adapters that serve a
+    routed-experts connector use ``AFDRoutedExpertsModelHooks`` instead.
     """
 
     layers: nn.ModuleList
@@ -148,6 +148,20 @@ class AFDModelHooks:
         """Return the MoE layer indices; every AFD model overrides this."""
         raise NotImplementedError("AFD model must declare its MoE layer inventory")
 
+    def get_experts_routing_spec(self, layer_idx: int) -> AFDExpertRoutingSpec:
+        """Return the static router contract; models without a router override."""
+        raise NotImplementedError("AFD model does not expose a native router contract")
+
+
+class AFDRoutedExpertsModelHooks(AFDModelHooks):
+    """Inner-model hooks for adapters that serve a routed-experts connector.
+
+    Only adapters whose MoE layers keep vLLM's ``RoutedExperts`` at
+    ``layer.mlp.experts.routed_experts`` opt in (DeepSeek V2 family and Qwen3
+    MoE). Others do not expose the accessor, so a routed-experts runner fails
+    at the attribute lookup instead of walking a layer that has no such module.
+    """
+
     def get_routed_experts(self, layer_idx: int) -> RoutedExperts:
         """Return the vLLM module holding one MoE layer's local experts.
 
@@ -156,10 +170,6 @@ class AFDModelHooks:
         the combined output.
         """
         return self.layers[layer_idx].mlp.experts.routed_experts
-
-    def get_experts_routing_spec(self, layer_idx: int) -> AFDExpertRoutingSpec:
-        """Return the static router contract; models without a router override."""
-        raise NotImplementedError("AFD model does not expose a native router contract")
 
 
 class AFDCausalLMHooks:
@@ -210,8 +220,17 @@ class AFDCausalLMHooks:
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return self.afd_inner_model().get_experts_layer_indices()
 
-    def get_routed_experts(self, layer_idx: int) -> RoutedExperts:
-        return self.afd_inner_model().get_routed_experts(layer_idx)
-
     def get_experts_routing_spec(self, layer_idx: int) -> AFDExpertRoutingSpec:
         return self.afd_inner_model().get_experts_routing_spec(layer_idx)
+
+
+class AFDRoutedExpertsCausalLMHooks(AFDCausalLMHooks):
+    """Outer-model hooks for adapters that serve a routed-experts connector."""
+
+    model: AFDRoutedExpertsModelHooks
+
+    def afd_inner_model(self) -> AFDRoutedExpertsModelHooks:
+        return self.model
+
+    def get_routed_experts(self, layer_idx: int) -> RoutedExperts:
+        return self.afd_inner_model().get_routed_experts(layer_idx)

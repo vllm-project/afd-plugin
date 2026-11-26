@@ -698,3 +698,18 @@ def test_m2n_ffn_omits_attention_owned_shared_with_real_hf_config(
     assert native_configs[0] is not original
     assert native_configs[0].n_shared_experts is None
     assert original.n_shared_experts == 1
+
+
+@pytest.mark.parametrize(
+    "cls_name",
+    [
+        "AFDDeepseekV2Model",
+        "AFDDeepseekV2ForCausalLM",
+        "AFDDeepseekForCausalLM",
+        "AFDDeepseekV3ForCausalLM",
+        "AFDGlmMoeDsaForCausalLM",
+    ],
+)
+def test_deepseek_family_exposes_routed_experts_accessor(cls_name):
+    """Routed-experts connectors load these classes and read their experts."""
+    assert callable(getattr(adapter, cls_name).get_routed_experts)

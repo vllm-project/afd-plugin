@@ -167,3 +167,9 @@ def test_v4_ffn_compute_requires_input_ids(monkeypatch):
 
     with pytest.raises(RuntimeError, match="FFN compute requires input_ids"):
         layer.compute_ffn_output(torch.ones((2, 4)), input_ids=None)
+
+
+@pytest.mark.parametrize("cls_name", ["AFDDeepseekV4Model", "AFDDeepseekV4ForCausalLM"])
+def test_cuda_v4_does_not_expose_routed_experts_accessor(cls_name):
+    """CUDA V4 keeps its MoE under ``layer.ffn``; no routed connector serves it."""
+    assert not hasattr(getattr(adapter, cls_name), "get_routed_experts")

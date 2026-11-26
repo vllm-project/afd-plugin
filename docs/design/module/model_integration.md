@@ -128,18 +128,20 @@ The AFD workers call a small set of hooks on the object returned by
 contract once:
 
 - `AFDModelHooks` is mixed into the inner model, the class that owns
-  `self.layers`. It forwards per-layer hooks to the target decoder layer and
-  provides the routed-experts accessor every model shares.
+  `self.layers`. It forwards per-layer hooks to the target decoder layer.
 - `AFDCausalLMHooks` is mixed into the outer class returned by `get_model()`.
   It forwards every hook to `afd_inner_model()` and declares the transport
   flags the FFN runners read.
+- `AFDRoutedExpertsModelHooks` and `AFDRoutedExpertsCausalLMHooks` extend the
+  pair with `get_routed_experts`. Only adapters that serve a routed-experts
+  connector opt in.
 
 | Hook | Purpose |
 | --- | --- |
 | `compute_ffn_output(hidden_states, layer_idx, **ffn_inputs)` | Run one layer's FFN stage on the FFN role. `ffn_inputs` carries transport-specific tensors (`input_ids` on CUDA V4, `topk_ids`/`topk_weights` on NPU Attention-side routing, plus `activation_scale` for MXFP8 payloads); the mixin passes them through unchanged and each layer validates its own payload. |
 | `compute_experts_output(hidden_states, layer_idx, router_logits)` | Run routed experts from router logits sent by Attention. |
 | `get_experts_layer_indices()` | List the MoE layers. Every inner model overrides it. |
-| `get_routed_experts(layer_idx)` | Return one layer's vLLM `RoutedExperts` module for routed-experts connectors. |
+| `get_routed_experts(layer_idx)` | Routed-experts mixins only. Return one layer's vLLM `RoutedExperts` module for routed-experts connectors. DeepSeek V2 family and Qwen3 MoE provide it (Qwen3 MoE through its dedicated FFN shell when the connector is routed); CUDA DeepSeek V4, Ascend DeepSeek V4 and Qwen3.5/3.6 do not, because their MoE layers do not keep `mlp.experts.routed_experts`, or no routed connector serves them. |
 | `get_experts_routing_spec(layer_idx)` | Return the static router width and dtype used for graph capture; models without a native router leave it unimplemented. |
 
 `AFDCausalLMHooks` also declares `afd_requires_input_ids = False` and
@@ -147,8 +149,9 @@ contract once:
 carry a tensor overrides the flag, and the GPU and NPU FFN runners read it as a
 plain attribute instead of probing with `getattr`.
 
-The DeepSeek V2, Qwen3 MoE, Qwen3.5/3.6, CUDA DeepSeek V4 and Ascend DeepSeek
-V4 adapters mix in the classes and keep only model-specific hooks
+DeepSeek V2 and Qwen3 MoE mix in the routed-experts pair. Qwen3.5/3.6, CUDA
+DeepSeek V4 and Ascend DeepSeek V4 mix in the base pair. All of them keep only
+model-specific hooks
 (`get_experts_layer_indices`, a native `get_experts_routing_spec`, or a
 layer-specific `compute_experts_output`). NPU DSpark retains its own hook
 implementations and router payload.
@@ -158,7 +161,7 @@ implementations and router payload.
 | Area | Source | Focused validation |
 | --- | --- | --- |
 | Registration map | [`afd_plugin/__init__.py`](../../../afd_plugin/__init__.py) | [`test_package.py`](../../../tests/unit/package/test_package.py) |
-| Runner hook contract | [`model_utils.py`](../../../afd_plugin/model_executor/models/model_utils.py) | [`test_model_utils.py`](../../../tests/unit/model_executor/models/test_model_utils.py) |
+| Runner hook contract | [`model_utils.py`](../../../afd_plugin/model_executor/models/model_utils.py) | [`test_model_utils.py`](../../../tests/unit/model_executor/models/test_model_utils.py), Qwen3.5 wrapper forwarding in [`test_qwen3_5_contract.py`](../../../tests/unit/model_executor/models/test_qwen3_5_contract.py), Ascend V4 receive mode in [NPU model role tests](../../../tests/unit/model_executor/models/npu/test_deepseek_v4.py) and [`test_npu_runtime.py`](../../../tests/unit/v1/worker/test_npu_runtime.py) |
 | Role-aware model and weight loading | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py), [`_weight_utils.py`](../../../afd_plugin/model_executor/models/_weight_utils.py) | [`test_deepseek_v2_construction.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_construction.py), [`test_weight_utils.py`](../../../tests/unit/model_executor/models/test_weight_utils.py), model and accuracy E2E suites |
 | DeepSeek V4 CUDA role boundary | [`deepseek_v4.py`](../../../afd_plugin/model_executor/models/deepseek_v4.py) | [`test_deepseek_v4_construction.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_construction.py), [`test_deepseek_v4_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_proxy.py), [`test_deepseek_v4_weight_policy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_weight_policy.py) |
 | DeepSeek V4 Ascend Hash-id boundary | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py), [`npu/deepseek_v4_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_attention_gate.py) | [`test_deepseek_v4_hash_ids.py`](../../../tests/unit/model_executor/test_deepseek_v4_hash_ids.py), [NPU model role tests](../../../tests/unit/model_executor/models/npu/test_deepseek_v4.py), ids-mode cases in [`test_camp2p_token_ids.py`](../../../tests/unit/connectors/test_camp2p_token_ids.py) |
