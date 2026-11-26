@@ -20,6 +20,7 @@ from tests.unit.fakes.weights import OneShotWeights  # noqa: E402
 
 ATTENTION = frozenset(("attention",))
 FFN = frozenset(("ffn",))
+BOTH = ATTENTION | FFN
 NONE: frozenset[str] = frozenset()
 
 
@@ -59,14 +60,52 @@ def test_qwen_checkpoint_weight_roles(name, roles):
     assert _checkpoint_weight_roles(name) == roles
 
 
-def test_qwen_load_weights_filters_one_shot_iterator(monkeypatch):
-    names = [
-        "model.language_model.model.embed_tokens.weight",
-        "model.language_model.model.layers.0.mlp.gate.weight",
-        "model.language_model.model.layers.0.mlp.experts.0.down_proj.weight",
-        "model.language_model.model.layers.0.mlp.shared_expert_gate.weight",
-        "model.visual.patch_embed.proj.weight",
-    ]
+@pytest.mark.parametrize(
+    ("name", "roles"),
+    [
+        ("model.language_model.model.layers.0.mlp.gate.weight", BOTH),
+        (
+            "model.language_model.model.layers.0.mlp.shared_expert.gate_proj.weight",
+            BOTH,
+        ),
+        ("model.language_model.model.layers.0.mlp.shared_expert_gate.weight", BOTH),
+        (
+            "model.language_model.model.layers.0.mlp.experts.0.down_proj.weight",
+            FFN,
+        ),
+    ],
+)
+def test_qwen_checkpoint_weight_roles_when_attention_routes(name, roles):
+    """With DeepEP M2N, both roles load the gate and the gated shared expert,
+    and only the FFN loads the routed experts.
+
+    Why: Attention routes and runs the shared expert with them, and the FFN's
+    native block still holds them, which vLLM's strict loader requires.
+    """
+    assert _checkpoint_weight_roles(name, routes_on_attention=True) == roles
+
+
+NAMES = (
+    "model.language_model.model.embed_tokens.weight",
+    "model.language_model.model.layers.0.mlp.gate.weight",
+    "model.language_model.model.layers.0.mlp.experts.0.down_proj.weight",
+    "model.language_model.model.layers.0.mlp.shared_expert_gate.weight",
+    "model.visual.patch_embed.proj.weight",
+)
+
+
+@pytest.mark.parametrize(
+    ("role", "connector", "loaded"),
+    [
+        ("ffn", "P2pNcclAFDConnector", NAMES[1:4]),
+        ("attention", "DeepEPM2NAFDConnector", (NAMES[0], NAMES[1], NAMES[3])),
+    ],
+    ids=["p2p-ffn", "deepep-m2n-attention"],
+)
+def test_qwen_load_weights_filters_one_shot_iterator(
+    monkeypatch, role, connector, loaded
+):
+    names = list(NAMES)
     weights = OneShotWeights(names)
 
     seen: list[str] = []
@@ -82,15 +121,19 @@ def test_qwen_load_weights_filters_one_shot_iterator(monkeypatch):
         native_load_weights,
     )
     model = object.__new__(AFDQwen3_5MoeForConditionalGeneration)
-    object.__setattr__(model, "afd_role", "ffn")
+    object.__setattr__(model, "afd_role", role)
     object.__setattr__(
         model,
         "afd_config",
-        SimpleNamespace(role="ffn", compute_gate_on_attention=False),
+        SimpleNamespace(
+            role=role,
+            connector=connector,
+            compute_gate_on_attention=connector == "DeepEPM2NAFDConnector",
+        ),
     )
 
     result = model.load_weights(weights)
 
     assert result is expected
-    assert seen == names[1:4]
+    assert seen == list(loaded)
     assert weights.iterations == 1

@@ -14,6 +14,7 @@ from vllm.config.multimodal import MultiModalConfig  # noqa: E402
 from vllm.model_executor.models import qwen3_5 as native  # noqa: E402
 from vllm.model_executor.models.utils import StageMissingLayer  # noqa: E402
 
+from afd_plugin.config import DEEPEP_M2N_CONNECTOR  # noqa: E402
 from afd_plugin.model_executor.ffn import remote  # noqa: E402
 from afd_plugin.model_executor.models import qwen3_5 as adapter  # noqa: E402
 from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
@@ -24,11 +25,21 @@ QWEN_LAYER_PREFIX = f"model.layers.{QWEN_LAYER_IDX}"
 QWEN_HIDDEN_SIZE = 8
 # ``ProxyConnector.recv_ffn_output`` returns the reference rows times this.
 FFN_OUTPUT_SCALE = 0.25
+P2P_CONNECTOR = "P2pNcclAFDConnector"
+
+
+class _StandInLayer(nn.Module):
+    """vLLM's gate and shared-expert layers, which need tensor-parallel state."""
+
+    def __init__(self, *_args, **_kwargs):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(1))
 
 
 @pytest.fixture
-def attention_qwen_layer(monkeypatch):
-    """A CUDA P2P Attention-role Qwen3.5 decoder layer and its vLLM config."""
+def build_attention_qwen_layer(monkeypatch):
+    """Builds a CUDA Attention-role Qwen3.5 decoder layer for a connector and
+    an Attention TP size; DeepEP M2N computes the gate on Attention."""
     text_config = SimpleNamespace(
         model_type="qwen3_5_moe_text",
         rms_norm_eps=1e-6,
@@ -37,28 +48,46 @@ def attention_qwen_layer(monkeypatch):
         hidden_size=QWEN_HIDDEN_SIZE,
         moe_intermediate_size=16,
         norm_topk_prob=True,
-    )
-    config = attention_moe_vllm_config(
-        hf_text_config=text_config,
-        multimodal_config=None,
+        shared_expert_intermediate_size=16,
+        hidden_act="silu",
     )
     monkeypatch.setattr(remote, "current_platform", SimpleNamespace(device_type="cuda"))
-    monkeypatch.setattr(
-        adapter.next_native, "get_tensor_model_parallel_world_size", lambda: 1
-    )
     monkeypatch.setattr(
         adapter.next_native,
         "get_ep_group",
         lambda: SimpleNamespace(device_group=SimpleNamespace(size=lambda: 1)),
     )
+    for name in ("GateLinear", "ReplicatedLinear", "Qwen3NextMLP"):
+        monkeypatch.setattr(adapter.next_native, name, _StandInLayer)
     monkeypatch.setattr(
         adapter.native, "Qwen3NextAttention", lambda *_args, **_kwargs: nn.Identity()
     )
-    with set_current_vllm_config(config):
-        layer = adapter.AFDQwen3_5DecoderLayer(
-            config, layer_type="full_attention", prefix=QWEN_LAYER_PREFIX
+
+    def build(connector: str = P2P_CONNECTOR, tp_size: int = 1) -> SimpleNamespace:
+        config = attention_moe_vllm_config(
+            connector=connector,
+            compute_gate_on_attention=connector == DEEPEP_M2N_CONNECTOR,
+            hf_text_config=text_config,
+            multimodal_config=None,
         )
-    return SimpleNamespace(layer=layer, config=config)
+        monkeypatch.setattr(
+            adapter.next_native,
+            "get_tensor_model_parallel_world_size",
+            lambda: tp_size,
+        )
+        with set_current_vllm_config(config):
+            layer = adapter.AFDQwen3_5DecoderLayer(
+                config, layer_type="full_attention", prefix=QWEN_LAYER_PREFIX
+            )
+        return SimpleNamespace(layer=layer, config=config)
+
+    return build
+
+
+@pytest.fixture
+def attention_qwen_layer(build_attention_qwen_layer):
+    """A CUDA P2P Attention-role Qwen3.5 decoder layer and its vLLM config."""
+    return build_attention_qwen_layer()
 
 
 def test_attention_moe_sends_hidden_states_through_weightless_runner(
@@ -87,6 +116,75 @@ def test_attention_moe_sends_hidden_states_through_weightless_runner(
     assert events[0][2].metadata.layer_idx == QWEN_LAYER_IDX
     assert events[0][3] == {}
     assert torch.equal(output, hidden_states * FFN_OUTPUT_SCALE)
+
+
+def test_attention_moe_with_routes_owns_gate_and_gated_shared_expert(
+    build_attention_qwen_layer,
+):
+    """Under DeepEP M2N, Attention owns the native gate and the gated shared
+    expert, at their checkpoint names, and the runner applies that same gate.
+
+    Why: Attention routes with the checkpoint's gate and runs the shared
+    expert; the FFN runs only the routed experts.
+    """
+    moe = build_attention_qwen_layer(connector=DEEPEP_M2N_CONNECTOR).layer.mlp
+
+    assert set(dict(moe.named_parameters())) == {
+        "gate.weight",
+        "shared_expert_gate.weight",
+        "shared_expert.weight",
+    }
+    assert moe.experts.gate is moe.gate
+    assert list(moe.experts.buffers()) == []
+
+
+@pytest.mark.parametrize(
+    ("connector", "tp_size", "sequence_parallel"),
+    [
+        (DEEPEP_M2N_CONNECTOR, 1, False),
+        (DEEPEP_M2N_CONNECTOR, 2, True),
+        (P2P_CONNECTOR, 2, False),
+    ],
+    ids=["m2n-tp1", "m2n-tp2", "p2p-tp2"],
+)
+def test_attention_tp_ranks_send_their_own_slice_only_with_routes(
+    build_attention_qwen_layer, connector, tp_size, sequence_parallel
+):
+    """Only with routes and Attention TP > 1 is the MoE block sequence-parallel.
+
+    Why: TP peers hold the same tokens, so each must send a disjoint slice.
+    """
+    layer = build_attention_qwen_layer(connector=connector, tp_size=tp_size).layer
+
+    assert layer.mlp.is_sequence_parallel is sequence_parallel
+
+
+def test_ffn_model_hands_each_layer_routed_experts_to_the_runner():
+    """The FFN model returns each MoE layer's local experts, through the
+    conditional-generation and causal-LM shells.
+
+    Why: under DeepEP M2N the FFN runs only these experts, from the native
+    block vLLM loaded.
+    """
+    routed = [object(), object()]
+    layers = []
+    for routed_experts in routed:
+        layer = nn.Module()
+        layer.mlp = nn.Module()
+        layer.mlp.experts = nn.Module()
+        layer.mlp.experts.routed_experts = routed_experts
+        layers.append(layer)
+    model = object.__new__(adapter.AFDQwen3_5Model)
+    nn.Module.__init__(model)
+    model.layers = nn.ModuleList(layers)
+    language_model = object.__new__(adapter.AFDQwen3_5MoeForCausalLM)
+    nn.Module.__init__(language_model)
+    language_model.model = model
+    conditional = object.__new__(adapter.AFDQwen3_5MoeForConditionalGeneration)
+    nn.Module.__init__(conditional)
+    conditional.language_model = language_model
+
+    assert conditional.get_routed_experts(1) is routed[1]
 
 
 def test_qwen_remote_experts_proxy_preserves_completed_ffn_output_under_tp(
@@ -169,8 +267,13 @@ def test_qwen_causal_model_retains_afd_aligned_cache_scope(monkeypatch):
         adapter.AFDQwen3_5MoeForCausalLM(vllm_config=vllm_config)
 
 
+@pytest.mark.parametrize(
+    ("connector", "gate_on_attention"),
+    [(P2P_CONNECTOR, False), (DEEPEP_M2N_CONNECTOR, True)],
+    ids=["p2p", "deepep-m2n"],
+)
 def test_qwen_text_only_uses_upstream_missing_vision_tower_stage(
-    monkeypatch,
+    monkeypatch, connector, gate_on_attention
 ):  # long-test: native multimodal constructor consumes the text-only AFD wrapper
     class FakeCausalLM(nn.Module):
         def __init__(self):
@@ -211,7 +314,8 @@ def test_qwen_text_only_uses_upstream_missing_vision_tower_stage(
         "parse_optional_afd_config",
         lambda *_args, **_kwargs: SimpleNamespace(
             role="attention",
-            compute_gate_on_attention=False,
+            connector=connector,
+            compute_gate_on_attention=gate_on_attention,
         ),
     )
     monkeypatch.setattr(adapter.native, "Qwen3_VisionTransformer", FakeVisionTower)
@@ -249,7 +353,9 @@ def test_qwen_text_only_uses_upstream_missing_vision_tower_stage(
 
 @pytest.fixture
 def conditional_config(monkeypatch):
-    afd = SimpleNamespace(role="attention", compute_gate_on_attention=False)
+    afd = SimpleNamespace(
+        role="attention", connector=P2P_CONNECTOR, compute_gate_on_attention=False
+    )
     config = SimpleNamespace(
         lora_config=None,
         speculative_config=None,
@@ -274,7 +380,8 @@ def conditional_config(monkeypatch):
 @pytest.mark.parametrize(
     "path,value,message",
     [
-        ("afd.compute_gate_on_attention", True, "compute_gate_on_attention=False"),
+        ("afd.compute_gate_on_attention", True, "compute_gate_on_attention=true with"),
+        ("afd.connector", DEEPEP_M2N_CONNECTOR, "compute_gate_on_attention=true with"),
         ("config.speculative_config", SimpleNamespace(), "speculative decoding"),
         ("config.lora_config", SimpleNamespace(), "LoRA"),
         (

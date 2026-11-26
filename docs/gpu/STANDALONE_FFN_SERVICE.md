@@ -2,22 +2,37 @@
 
 Run a registered CUDA routed-experts model in independent F-only processes
 with `torchrun -m afd_plugin.ffn_faas serve --backend gpu-deepep-m2n`. The
-service loads only the routed experts, reuses vLLM's native loader and the
-existing DeepEP M2N FFN runtime, and constructs no vLLM Worker, upstream
-ModelRunner, EngineCore, scheduler, KV cache or complete CausalLM. Attention
-keeps its existing `vllm serve` launch, model, connector and DBO path.
+service loads only FFN-side weights (see [Models](#models)), reuses vLLM's
+native loader and the existing DeepEP M2N FFN runtime, and constructs no vLLM
+Worker, upstream ModelRunner, EngineCore, scheduler, KV cache or complete
+CausalLM. Attention keeps its existing `vllm serve` launch, model, connector
+and DBO path.
 
 ## Supported configuration
 
 | Supported | Rejected at startup |
 | --- | --- |
-| A registered CUDA routed-experts model; currently `Qwen3MoeForCausalLM`, BF16, every layer MoE, no shared experts | Unregistered models, FP8 or any `quantization_config`, dense or partial-MoE Qwen3, shared experts |
+| A registered CUDA routed-experts model in BF16; see [Models](#models) | Unregistered models, FP8 or any `quantization_config`, Qwen3 with dense layers or shared experts |
 | `DeepEPM2NAFDConnector` with `payload_format: bf16` | P2P, afdEP-direct, flexible placement, FP8 payload |
 | F TP=1, EP over all F ranks, linear expert placement | EPLB, elastic EP, redundant experts, PP/CP, LoRA, speculative decoding |
 | Eager, FULL_DECODE_ONLY CUDA graphs, DBO with two lanes (eager and graph) | Other graph modes, more than two micro-batches |
 | SM90 or newer (H100, H200, GB200) | Pre-Hopper GPUs |
 
 The routed experts must divide evenly across the F ranks.
+
+### Models
+
+The model registry picks the FFN model, as on the Worker path: an FFN-only
+shell when the architecture has one, otherwise its role-aware AFD model.
+Routing, shared experts and dense layers run on Attention.
+
+| Architecture | FFN model | F allocates |
+| --- | --- | --- |
+| `Qwen3MoeForCausalLM` (every layer MoE, no shared experts) | `AFDQwen3MoeRoutedExperts`, an FFN-only shell | `model.layers.<i>.mlp` only: gate and routed experts |
+| `Qwen3_5MoeForConditionalGeneration` (Qwen3.5/3.6, text-only with `--language-model-only`, no DBO) | `AFDQwen3_5MoeForConditionalGeneration`, the role-aware model | each layer's native MoE block: gate, gated shared expert and routed experts |
+
+Qwen3.5/3.6 F holds the gate and shared expert of vLLM's native block but never
+runs them (about 0.27 GiB per rank for Qwen3.6-35B-A3B).
 
 ## Architecture
 

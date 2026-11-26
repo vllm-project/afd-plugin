@@ -12,8 +12,8 @@ The V2 DP2 cases replace the duplicate GPU `afd-eager-2a2f`,
 baseline and AFD eager, graph, and graph+DBO on 2A1F. Qwen3.6 MoE retains
 three: baseline and AFD eager and graph on 2A1F. GDN DBO is unsupported.
 
-The single-deployment inventory contains 52 definitions: 42 CUDA cases
-(18 DeepSeek-V2-Lite, 13 Qwen3 MoE, three Qwen3.6 MoE and eight DSV4
+The single-deployment inventory contains 58 definitions: 48 CUDA cases
+(18 DeepSeek-V2-Lite, 13 Qwen3 MoE, nine Qwen3.6 MoE and eight DSV4
 Flash) and ten NPU cases (seven DeepSeek-V2-Lite and three DSV4 Flash).
 The CUDA counts include the DeepEP M2N and standalone FFN service entries.
 CI selects 16 unique node IDs across ready/merge and weekly gates. Definitions,
@@ -235,17 +235,17 @@ python -m pytest -q -s \
 python -m pytest -q -s \
   tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe
 
-# Qwen3.6 MoE (text-only CUDA lane)
+# Qwen3.6 MoE (text-only CUDA lane; P2P cases, run the DeepEP M2N entries separately)
 export AFD_E2E_BACKEND=gpu
 export AFD_E2E_DEVICES=0,1,2,3
 export AFD_GPU_E2E_MODEL=/path/to/Qwen3.6-35B-A3B
 python -m pytest -q -s \
-  tests/e2e/models/qwen3_6/test_qwen3_6.py
+  tests/e2e/models/qwen3_6/test_qwen3_6.py::test_qwen3_6
 ```
 
 Success means seven GPU DeepSeek gate cases, four NPU DeepSeek gate cases,
 four GPU Qwen3 MoE P2P cases, five GPU Qwen3 MoE DeepEP M2N cases, or three
-GPU Qwen3.6 MoE cases, passed with zero skips.
+GPU Qwen3.6 MoE P2P cases, passed with zero skips.
 The DeepSeek `test_deepseek_v2_lite` entry collects 13 cases on GPU and seven
 on NPU, including local-only cases. The separate DeepEP M2N entry adds five
 GPU-only cases. An unfiltered module collection includes those five IDs even
@@ -264,9 +264,10 @@ on four devices. The two AFD scenarios use synchronous 2A1F: Attention on
 the first two devices and FFN on the third. The fourth device remains unused
 by AFD scenarios. The suite uses eight-shot GSM8K with a 4096-token model
 length and a 0.27 minimum exact-match gate: seven samples for baseline,
-eager, and graph. NPU, multimodal,
-`compute_gate_on_attention=true`, pipeline-parallel, asynchronous, and
+eager, and graph. NPU, multimodal, pipeline-parallel, asynchronous, and
 multi-node execution are not covered; quantization is unverified.
+`compute_gate_on_attention=true` runs in the separate
+[DeepEP M2N entries](#deepep-m2n-scenarios).
 
 ### DeepEP M2N scenarios
 
@@ -288,6 +289,11 @@ devices and FFN DP2 on the other two.
 `tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py` runs
 DeepSeek-V2-Lite through the same five scenarios.
 
+`test_qwen3_6_deepep_m2n` in `tests/e2e/models/qwen3_6/test_qwen3_6.py` runs
+text-only Qwen3.6-35B-A3B through the eager, graph and graph-tp2 scenarios,
+without DBO. `test_qwen3_6_deepep_m2n_ffn_service` runs the same three with the
+FFN side on the standalone FFN service (`afd-deepep-m2n-faas-*-2a2f`, below).
+
 They need four SM90 or newer GPUs and afdEP-comm (DeepGEMM comes with vLLM);
 see
 [Installation](../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation)
@@ -299,6 +305,8 @@ export AFD_E2E_BACKEND=gpu
 export AFD_E2E_DEVICES=0,1,2,3
 python -m pytest -q -s \
   tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe_deepep_m2n
+python -m pytest -q -s \
+  tests/e2e/models/qwen3_6/test_qwen3_6.py::test_qwen3_6_deepep_m2n
 ```
 
 `test_qwen3_moe_deepep_m2n_ffn_service` runs the eager, graph, graph + DBO
@@ -413,8 +421,8 @@ GSM8K sample limit. It also runs the DeepEP M2N device tests
 # Qwen3 MoE (all four P2P scenarios)
 python -m pytest -q -s tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe
 
-# Qwen3.6 MoE (all three scenarios; GDN DBO unsupported)
-python -m pytest -q -s tests/e2e/models/qwen3_6/test_qwen3_6.py
+# Qwen3.6 MoE (all three P2P scenarios; GDN DBO unsupported)
+python -m pytest -q -s tests/e2e/models/qwen3_6/test_qwen3_6.py::test_qwen3_6
 
 # Qwen3 MoE DeepEP M2N graph+DBO (needs afdEP-comm, see the M2N section)
 python -m pytest -q -s \

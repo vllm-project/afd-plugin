@@ -156,14 +156,14 @@ python -m pytest -q -s \
   tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe
 ~~~
 
-For Qwen3.6 MoE on CUDA, run:
+For the Qwen3.6 MoE P2P cases on CUDA, run:
 
 ~~~bash
 export AFD_E2E_BACKEND=gpu
 export AFD_E2E_DEVICES=0,1,2,3
 export AFD_GPU_E2E_MODEL=/path/to/Qwen3.6-35B-A3B
 python -m pytest -q -s \
-  tests/e2e/models/qwen3_6/test_qwen3_6.py
+  tests/e2e/models/qwen3_6/test_qwen3_6.py::test_qwen3_6
 ~~~
 
 The Qwen3.6 suite uses `Qwen/Qwen3.6-35B-A3B` and selects native vLLM V2
@@ -175,9 +175,10 @@ adapter and are historical evidence only. The suite passes
 `--language-model-only` to every runner invocation. It is CUDA-only and
 text-only: `baseline-graph` is native DP4/TP1/EP4, while the AFD scenarios are
 synchronous 2A1F with Attention on the first two devices and FFN on the third.
-Multimodal, NPU, `compute_gate_on_attention=true`, asynchronous,
-pipeline-parallel, and multi-node execution are not covered; quantization is
-unverified.
+Multimodal, NPU, asynchronous, pipeline-parallel, and multi-node execution are
+not covered; quantization is unverified. DeepEP M2N 2A2F runs in the separate
+`test_qwen3_6_deepep_m2n` and `test_qwen3_6_deepep_m2n_ffn_service` entries,
+which need four SM90 or newer GPUs and afdEP-comm.
 
 Do not add backend markers or run scenarios in parallel; they share devices.
 

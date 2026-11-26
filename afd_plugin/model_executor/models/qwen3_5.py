@@ -3,7 +3,8 @@
 """Qwen3.5/3.6 MoE AFD wrapper for the native vLLM lifecycle."""
 
 from collections.abc import Iterable
-from typing import Any
+from functools import partial
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -11,14 +12,23 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.model_executor.models import qwen3_5 as native
 from vllm.model_executor.models import qwen3_next as next_native
 
-from afd_plugin.config import parse_optional_afd_config
+from afd_plugin.config import (
+    DEEPEP_M2N_CONNECTORS,
+    AFDConfig,
+    parse_afd_config,
+    parse_optional_afd_config,
+)
 from afd_plugin.model_executor.ffn.remote import build_expert
 from afd_plugin.model_executor.models._weight_utils import (
     ATTENTION_ROLE,
+    BOTH_ROLES,
     FFN_ROLE,
     filter_role_weights,
     layer_weight_path,
 )
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
 _NO_ROLES: frozenset[str] = frozenset()
 
@@ -33,10 +43,21 @@ def _validate_qwen_text_only(model_config: ModelConfig) -> None:
         )
 
 
+def _routes_on_attention(afd_config: AFDConfig) -> bool:
+    """Whether the DeepEP M2N runner performs gate and top-k on Attention."""
+    return afd_config.connector in DEEPEP_M2N_CONNECTORS
+
+
 def _checkpoint_weight_roles(
     name: str,
+    *,
+    routes_on_attention: bool = False,
 ) -> frozenset[str]:
-    """Classify one native Qwen3.5/3.6 checkpoint path by AFD owner."""
+    """Classify one native Qwen3.5/3.6 checkpoint path by AFD owner.
+
+    With ``routes_on_attention`` the gate and gated shared expert go to both
+    roles: Attention runs them; FFN's native block needs them but never runs them.
+    """
     parts = name.split(".")
     if "visual" in parts or "mtp" in parts:
         return _NO_ROLES
@@ -51,13 +72,9 @@ def _checkpoint_weight_roles(
         return ATTENTION_ROLE
     if stage != "mlp":
         return ATTENTION_ROLE
-    if remainder and remainder[0] == "gate":
-        return FFN_ROLE
-    if remainder and remainder[0] in (
-        "experts",
-        "shared_expert",
-        "shared_expert_gate",
-    ):
+    if remainder and remainder[0] in ("gate", "shared_expert", "shared_expert_gate"):
+        return BOTH_ROLES if routes_on_attention else FFN_ROLE
+    if remainder and remainder[0] == "experts":
         return FFN_ROLE
     raise RuntimeError(f"unclassified Qwen MoE checkpoint weight: {name}")
 
@@ -65,13 +82,14 @@ def _checkpoint_weight_roles(
 class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
     native.Qwen3NextSparseMoeBlock,
 ):
-    """Native Qwen MoE shell whose gate and experts run on the FFN role."""
+    """Native Qwen MoE forward with remote experts and no expert weights."""
 
     # Patch reason: native Qwen3NextSparseMoeBlock allocates the gate and the
     # routed and shared experts on every rank.
-    # Patch functionality: keep its native forward and build the experts
-    # through FusedMoEFactory with an AFD runner that sends hidden states to
-    # the FFN role, which owns the gate and all expert weights.
+    # Patch functionality: keep its native forward and build weightless experts
+    # through FusedMoEFactory. P2P sends hidden states; FFN runs gate and experts.
+    # DeepEP M2N also builds the gate and gated shared expert here, sends the
+    # routes, and with TP > 1 sends only this rank's token slice.
     # Signature: matches upstream; no added parameters.
     # Upstream: vLLM v0.32.0, vllm/model_executor/models/qwen3_next.py
     # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
@@ -83,6 +101,8 @@ class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
     ) -> None:
         # ### PATCH START: construct a remote-experts native MoE shell.
         nn.Module.__init__(self)
+        afd_config = parse_afd_config(vllm_config, validate=False)
+        routes_on_attention = _routes_on_attention(afd_config)
         config = vllm_config.model_config.hf_text_config
         parallel_config = vllm_config.parallel_config
         if parallel_config.use_sequence_parallel_moe:
@@ -92,8 +112,9 @@ class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
         self.ep_group = next_native.get_ep_group().device_group
         self.ep_size = self.ep_group.size()
         self.n_routed_experts = int(config.num_experts)
-        self.is_sequence_parallel = False
-        # No local shared-expert module and no fused shared-expert slot.
+        # TP peers hold the same tokens; each sends only its slice of the routes.
+        self.is_sequence_parallel = routes_on_attention and self.tp_size > 1
+        # No fused shared-expert slot; a shared expert runs inside the runner.
         self.is_fused_shared_expert_enabled = False
         self.replicate_shared_expert = False
         self.enable_eplb = False
@@ -101,14 +122,42 @@ class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
         self.n_redundant_experts = 0
         self.n_physical_experts = self.n_logical_experts
         self.n_local_physical_experts = self.n_physical_experts // self.ep_size
-        self.gate = None
-        self.shared_expert = None
+        # Before the experts (which hold them too), so they keep checkpoint names.
+        self.gate = (
+            next_native.GateLinear(
+                config.hidden_size,
+                config.num_experts,
+                prefix=f"{prefix}.gate",
+            )
+            if afd_config.compute_gate_on_attention
+            else None
+        )
         self.shared_expert_gate = None
+        self.shared_expert = None
+        if routes_on_attention and config.shared_expert_intermediate_size > 0:
+            self.shared_expert_gate = next_native.ReplicatedLinear(
+                config.hidden_size,
+                1,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.shared_expert_gate",
+            )
+            self.shared_expert = next_native.Qwen3NextMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.shared_expert_intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=vllm_config.quant_config,
+                reduce_results=False,
+                expert_gate=self.shared_expert_gate,
+                is_sequence_parallel=self.is_sequence_parallel,
+                prefix=f"{prefix}.shared_expert",
+            )
         # Native Qwen3NextSparseMoeBlock factory arguments, minus local-expert
         # ones; EPLB and the other local-expert features are rejected there.
         self.experts = build_expert(
             vllm_config,
-            gate=None,
+            gate=self.gate,
+            shared_experts=self.shared_expert,
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
@@ -351,6 +400,10 @@ class AFDQwen3_5Model(native.Qwen3_5Model):  # noqa: N801
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return tuple(range(self.start_layer, self.end_layer))
 
+    def get_routed_experts(self, layer_idx: int) -> "RoutedExperts":
+        """FFN only: the vLLM module holding one MoE layer's local experts."""
+        return self.layers[layer_idx].mlp.experts.routed_experts
+
 
 class AFDQwen3_5MoeForCausalLM(  # noqa: N801
     native.Qwen3_5MoeForCausalLM,
@@ -429,6 +482,9 @@ class AFDQwen3_5MoeForCausalLM(  # noqa: N801
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return self.model.get_experts_layer_indices()
 
+    def get_routed_experts(self, layer_idx: int) -> "RoutedExperts":
+        return self.model.get_routed_experts(layer_idx)
+
 
 class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
     native.Qwen3_5MoeForConditionalGeneration,
@@ -446,9 +502,10 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
         afd_config = parse_optional_afd_config(vllm_config, validate=False)
         if afd_config is None:
             raise RuntimeError("AFD Qwen conditional model requires AFD activation")
-        if afd_config.compute_gate_on_attention:
+        if afd_config.compute_gate_on_attention != _routes_on_attention(afd_config):
             raise ValueError(
-                "AFD Qwen3.5/3.6 CUDA supports compute_gate_on_attention=False only",
+                "AFD Qwen3.5/3.6 CUDA requires compute_gate_on_attention=true "
+                f"with {' or '.join(DEEPEP_M2N_CONNECTORS)} and false otherwise",
             )
         if vllm_config.speculative_config is not None:
             raise ValueError(
@@ -526,6 +583,9 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return self.language_model.get_experts_layer_indices()
 
+    def get_routed_experts(self, layer_idx: int) -> "RoutedExperts":
+        return self.language_model.get_routed_experts(layer_idx)
+
     # Patch reason: native loading allocates every Qwen checkpoint path locally.
     # Patch functionality: filter checkpoint paths to the owning AFD role.
     # Signature: matches upstream.
@@ -533,7 +593,12 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
         # ### PATCH START: load each checkpoint path only on its owning role.
         loaded = super().load_weights(
             filter_role_weights(
-                weights, role=self.afd_role, classify=_checkpoint_weight_roles
+                weights,
+                role=self.afd_role,
+                classify=partial(
+                    _checkpoint_weight_roles,
+                    routes_on_attention=_routes_on_attention(self.afd_config),
+                ),
             ),
         )
         # ### PATCH END

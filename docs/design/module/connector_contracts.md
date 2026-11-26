@@ -34,7 +34,7 @@ upstream_refs:
   - "PyTorch torch.distributed process-group APIs used by the pinned runtime"
 verified_platform_refs:
   - "P2pNcclAFDConnector GPU unit and E2E paths"
-  - "DeepEPM2NAFDConnector GPU unit, device, Qwen3 MoE and DeepSeek-V2-Lite E2E paths"
+  - "DeepEPM2NAFDConnector GPU unit, device, Qwen3 MoE, Qwen3.6 MoE and DeepSeek-V2-Lite E2E paths"
   - "CAMP2pAFDConnector and CAMAsyncAFDConnector Ascend unit and E2E paths"
 related_issues:
   - "#88"

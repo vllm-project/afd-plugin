@@ -27,8 +27,10 @@ Supported models:
   Attention runs the dense layers and the shared experts; the shared experts
   overlap the dispatch and the FFN. With Attention TP > 1 each TP rank runs
   them, with replicated weights, on the token slice it dispatches.
+- Qwen3.5/Qwen3.6 MoE (`Qwen3_5MoeForConditionalGeneration`), text-only with
+  `--language-model-only` and without DBO. Attention runs the shared expert.
 
-DeepSeek-V3, GLM-DSA and Qwen3.5/Qwen3.6 MoE are rejected with this connector.
+DeepSeek-V3 and GLM-DSA are rejected with this connector.
 
 ## How it works
 
@@ -334,9 +336,10 @@ Send API traffic only to the Attention server. For eager, DBO, Attention TP
 and FP8 examples, see the
 [DeepEP M2N recipes](../../recipe/gpu/DeepEPM2NAFDConnector/README.md).
 
-For BF16 Qwen3-30B-A3B, the FFN side can instead run as the standalone FFN
-service (`torchrun -m afd_plugin.ffn_faas serve --backend gpu-deepep-m2n`),
-which loads only the routed experts and constructs no vLLM Worker; see the
+For BF16 Qwen3-30B-A3B and text-only Qwen3.6-35B-A3B, the FFN side can
+instead run as the standalone FFN service
+(`torchrun -m afd_plugin.ffn_faas serve --backend gpu-deepep-m2n`), which
+constructs no vLLM Worker; see the
 [standalone GPU FFN service guide](STANDALONE_FFN_SERVICE.md).
 
 ## Validation
@@ -350,14 +353,15 @@ which loads only the routed experts and constructs no vLLM Worker; see the
   dispatch, DeepGEMM experts and combine against references on one node.
 - Model E2E: the Qwen3 MoE cases `afd-deepep-m2n-*-2a2f` in
   [`tests/e2e`](../../tests/e2e/README.md#deepep-m2n-scenarios) (eager, graph,
-  graph + DBO, and Attention TP2), the same five DeepSeek-V2-Lite cases and
-  the two-pod cases in
-  `tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py`.
+  graph + DBO, and Attention TP2), the same five DeepSeek-V2-Lite cases, the
+  Qwen3.6 MoE eager, graph and Attention TP2 graph cases, and the two-pod
+  cases in `tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py`.
 
 ## Requirements and limitations
 
 - SM90 or newer on every rank; the handshake rejects older GPUs.
-- Qwen3 MoE with every layer MoE and no shared expert, or DeepSeek-V2.
+- Qwen3 MoE with every layer MoE and no shared expert, DeepSeek-V2, or
+  text-only Qwen3.5/Qwen3.6 MoE without DBO.
 - `compute_gate_on_attention=true` on both roles; EPLB is not supported.
 - FFN TP must be 1; FFN EP size equals `num_ffn_ranks`.
 - `num_experts` must be divisible by `num_ffn_ranks`.
