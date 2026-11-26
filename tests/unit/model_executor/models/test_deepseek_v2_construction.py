@@ -698,3 +698,20 @@ def test_m2n_ffn_omits_attention_owned_shared_with_real_hf_config(
     assert native_configs[0] is not original
     assert native_configs[0].n_shared_experts is None
     assert original.n_shared_experts == 1
+
+
+@pytest.mark.parametrize("cls_name", ["AFDDeepseekV2Model", "AFDDeepseekV2ForCausalLM"])
+def test_deepseek_v2_exposes_routed_experts_and_router_logits_hooks(cls_name):
+    """V2 serves routed-experts connectors and GPU P2P with the gate on Attention.
+
+    Why: the routed-experts runner reads ``get_routed_experts`` and the GPU FFN
+    runner drives experts through the router-logits hooks; both fail only at
+    serving time if V2 stops opting in.
+    """
+    cls = getattr(adapter, cls_name)
+    for hook in (
+        "get_routed_experts",
+        "compute_experts_output",
+        "get_experts_routing_spec",
+    ):
+        assert callable(getattr(cls, hook))

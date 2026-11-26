@@ -58,6 +58,90 @@ def model_utils(monkeypatch):
     return load_host_module(monkeypatch, "afd_plugin.model_executor.models.model_utils")
 
 
+class _RecordingLayer:
+    def __init__(self, output):
+        self.output = output
+        self.calls = []
+
+    def compute_ffn_output(self, hidden_states, **ffn_inputs):
+        self.calls.append((hidden_states, ffn_inputs))
+        return self.output
+
+
+def test_causal_lm_hooks_route_ffn_compute_to_target_layer(model_utils):
+    """Transport inputs reach the target layer unchanged; other layers stay idle."""
+    layers = [_RecordingLayer("layer-0"), _RecordingLayer("layer-1")]
+    inner = model_utils.AFDModelHooks()
+    inner.layers = layers
+    outer = model_utils.AFDCausalLMHooks()
+    outer.model = inner
+
+    hidden_states = object()
+    ffn_inputs = {"input_ids": object()}
+    output = outer.compute_ffn_output(hidden_states, 1, **ffn_inputs)
+
+    assert output == "layer-1"
+    assert layers[0].calls == []
+    assert layers[1].calls == [(hidden_states, ffn_inputs)]
+
+
+def test_routed_experts_accessor_is_opt_in(model_utils):
+    """Only the routed-experts mixins expose ``get_routed_experts``.
+
+    Why: CUDA DeepSeek V4 keeps its MoE under ``layer.ffn``, so a shared
+    accessor reading ``layer.mlp.experts.routed_experts`` would fail there.
+    """
+    assert not hasattr(model_utils.AFDModelHooks, "get_routed_experts")
+    assert not hasattr(model_utils.AFDCausalLMHooks, "get_routed_experts")
+
+    routed = [object(), object()]
+    inner = model_utils.AFDRoutedExpertsModelHooks()
+    inner.layers = [
+        SimpleNamespace(
+            mlp=SimpleNamespace(experts=SimpleNamespace(routed_experts=experts))
+        )
+        for experts in routed
+    ]
+    outer = model_utils.AFDRoutedExpertsCausalLMHooks()
+    outer.model = inner
+
+    assert outer.get_routed_experts(1) is routed[1]
+
+
+def test_router_logits_hooks_are_opt_in(model_utils):
+    """Only the router-logits mixins expose the Attention-side logits hooks.
+
+    Why: only the GPU FFN runner with a non-routed connector and the gate on
+    Attention calls them, and only the DeepSeek V2 family serves that path.
+    """
+    for hook in ("compute_experts_output", "get_experts_routing_spec"):
+        assert not hasattr(model_utils.AFDModelHooks, hook)
+        assert not hasattr(model_utils.AFDCausalLMHooks, hook)
+
+    class _ExpertsLayer:
+        def __init__(self, tag):
+            self.tag = tag
+
+        def compute_experts_output(self, hidden_states, router_logits):
+            return (self.tag, hidden_states, router_logits)
+
+    spec = object()
+    inner = model_utils.AFDRouterLogitsModelHooks()
+    # The opting-in model supplies its native router contract.
+    inner.get_experts_routing_spec = lambda layer_idx: (spec, layer_idx)
+    inner.layers = [_ExpertsLayer("layer-0"), _ExpertsLayer("layer-1")]
+    outer = model_utils.AFDRouterLogitsCausalLMHooks()
+    outer.model = inner
+    hidden_states, router_logits = object(), object()
+
+    assert outer.compute_experts_output(hidden_states, 1, router_logits) == (
+        "layer-1",
+        hidden_states,
+        router_logits,
+    )
+    assert outer.get_experts_routing_spec(1) == (spec, 1)
+
+
 @pytest.mark.parametrize(
     "architecture,device_type",
     [

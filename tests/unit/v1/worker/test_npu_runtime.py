@@ -74,6 +74,7 @@ class _FakeFFNConnector:
         ] = deque()
         self.ffn_outputs = []
         self.updates = []
+        self.recv_kwargs = []
         self.attn_size = attn_size
         self.ffn_size = ffn_size
         self.world_rank = world_rank
@@ -96,6 +97,7 @@ class _FakeFFNConnector:
         )
 
     def recv_attn_output(self, ubatch_idx=None, **kwargs):
+        self.recv_kwargs.append(kwargs)
         for item in tuple(self.attn_outputs):
             payload = (
                 item
@@ -115,11 +117,17 @@ class _FakeFFNConnector:
 
 
 class _FakeModel:
+    afd_requires_input_ids = False
+    afd_requires_attention_routing = False
+
     def compute_ffn_output(self, hidden_states, layer_idx, **kwargs):
         return f"npu-ffn({hidden_states}, layer={layer_idx})"
 
 
 class _FakeStructuredFFNModel:
+    afd_requires_input_ids = False
+    afd_requires_attention_routing = False
+
     def compute_ffn_output(self, hidden_states, layer_idx, **_kwargs):
         return AFDF2ATransferPayload(
             routed_output=f"routed({hidden_states}, layer={layer_idx})",
@@ -194,6 +202,66 @@ def test_npu_ffn_runner_executes_eager_ffn_step(monkeypatch):
     assert update_flags == {"is_graph_capturing": False, "is_warmup": False}
     assert runner.connector.ffn_outputs == [
         ("npu-ffn(hidden, layer=0)", metadata, {"ubatch_idx": 0}),
+    ]
+
+
+def test_npu_ffn_runner_receives_attention_routing_instead_of_input_ids(
+    monkeypatch,
+):
+    """A model that declares Attention-side routing gets top-k, not ids.
+
+    Why: Ascend DeepSeek V4 with sync CAMP2P and the gate on Attention sets
+    both flags; the wire slot carries one payload, so routing must win and the
+    routing tensors must reach ``compute_ffn_output``.
+    """
+
+    class _RoutingModel:
+        afd_requires_input_ids = True
+        afd_requires_attention_routing = True
+
+        def __init__(self):
+            self.calls = []
+
+        def compute_ffn_output(self, hidden_states, layer_idx, **ffn_inputs):
+            self.calls.append((hidden_states, layer_idx, ffn_inputs))
+            return f"npu-ffn({hidden_states}, layer={layer_idx})"
+
+    _patch_ffn_forward_context(monkeypatch)
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(role="ffn")
+    runner.connector = _FakeFFNConnector()
+    runner.model = _RoutingModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 1
+    runner.use_aclgraph = False
+    runner._acl_graphs = {}
+    metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0,
+        stage_idx=0,
+        seq_len=1,
+    )
+    payload = _ffn_payload("hidden", metadata)
+    payload.topk_ids = "topk-ids"
+    payload.topk_weights = "topk-weights"
+    payload.activation_scale = "activation-scale"
+    runner.connector.attn_outputs.append(payload)
+
+    runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([1])})
+
+    assert [
+        (kwargs["recv_input_ids"], kwargs["recv_routing"])
+        for kwargs in runner.connector.recv_kwargs
+    ] == [(False, True)]
+    assert runner.model.calls == [
+        (
+            "hidden",
+            0,
+            {
+                "topk_ids": "topk-ids",
+                "topk_weights": "topk-weights",
+                "activation_scale": "activation-scale",
+            },
+        ),
     ]
 
 

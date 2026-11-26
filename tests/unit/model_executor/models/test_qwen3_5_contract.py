@@ -153,6 +153,50 @@ def test_ffn_compute_ffn_output_rejects_external_router():
         layer.compute_ffn_output(torch.zeros(2, 4))
 
 
+def _bare_module(cls):
+    module = object.__new__(cls)
+    nn.Module.__init__(module)
+    return module
+
+
+def test_conditional_generation_routes_ffn_compute_to_text_model_layer():
+    """The checkpoint wrapper reaches the text model's decoder layer.
+
+    Why: the FFN runner calls the hooks on the object ``get_model()`` returns,
+    which is the multimodal wrapper; its ``afd_inner_model`` override must pick
+    ``language_model.model``, not the wrapper or the causal LM.
+    """
+
+    class OffsetInternalMoe(native.Qwen3NextSparseMoeBlock):
+        def forward(self, hidden_states):
+            return hidden_states + self.offset
+
+    layers = []
+    for offset in (1.0, 2.0):
+        moe = _bare_module(OffsetInternalMoe)
+        moe.experts = type("Experts", (), {"gate": object()})()
+        moe.offset = offset
+        layer = _bare_module(adapter.AFDQwen3_5DecoderLayer)
+        layer.afd_role = "ffn"
+        layer.mlp = moe
+        layers.append(layer)
+    text_model = _bare_module(adapter.AFDQwen3_5Model)
+    text_model.layers = nn.ModuleList(layers)
+    text_model.start_layer, text_model.end_layer = 0, len(layers)
+    causal_lm = _bare_module(adapter.AFDQwen3_5MoeForCausalLM)
+    causal_lm.model = text_model
+    wrapper = _bare_module(adapter.AFDQwen3_5MoeForConditionalGeneration)
+    wrapper.language_model = causal_lm
+    hidden_states = torch.zeros(2, 4)
+
+    assert wrapper.afd_inner_model() is text_model
+    assert wrapper.get_experts_layer_indices() == (0, 1)
+    assert torch.equal(wrapper.compute_ffn_output(hidden_states, 1), hidden_states + 2)
+    assert torch.equal(
+        causal_lm.compute_ffn_output(hidden_states, 0), hidden_states + 1
+    )
+
+
 def test_qwen_causal_model_retains_afd_aligned_cache_scope(monkeypatch):
     monkeypatch.setattr(
         adapter,

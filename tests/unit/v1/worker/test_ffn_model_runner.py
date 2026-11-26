@@ -245,6 +245,9 @@ class _ConnectorDrivenFakeConnector(_FakeConnector):
 
 
 class _FakeModel:
+    afd_requires_input_ids = False
+    afd_requires_attention_routing = False
+
     def get_experts_layer_indices(self):
         return ()
 
@@ -351,7 +354,6 @@ def test_v2_ffn_runner_keeps_hidden_state_only_connector_contract():
 
     runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([1])})
 
-    assert not getattr(model, "afd_requires_input_ids", False)
     assert runner.connector.recv_input_ids == [False]
     assert runner.connector.ffn_outputs == [("v2-hidden", metadata)]
 
@@ -360,6 +362,7 @@ def test_ffn_runner_forwards_payload_input_ids_to_model():
     class _InputIdsModel:
         get_experts_layer_indices = _FakeModel.get_experts_layer_indices
         afd_requires_input_ids = True
+        afd_requires_attention_routing = False
 
         def __init__(self):
             self.calls = []

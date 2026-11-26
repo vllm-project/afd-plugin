@@ -167,3 +167,15 @@ def test_v4_ffn_compute_requires_input_ids(monkeypatch):
 
     with pytest.raises(RuntimeError, match="FFN compute requires input_ids"):
         layer.compute_ffn_output(torch.ones((2, 4)), input_ids=None)
+
+
+@pytest.mark.parametrize("cls_name", ["AFDDeepseekV4Model", "AFDDeepseekV4ForCausalLM"])
+def test_cuda_v4_exposes_only_base_hooks(cls_name):
+    """CUDA V4 keeps its MoE under ``layer.ffn`` and rejects gate-on-Attention."""
+    cls = getattr(adapter, cls_name)
+    for hook in (
+        "get_routed_experts",
+        "compute_experts_output",
+        "get_experts_routing_spec",
+    ):
+        assert not hasattr(cls, hook)

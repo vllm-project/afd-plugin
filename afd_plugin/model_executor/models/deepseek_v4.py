@@ -9,7 +9,6 @@ FFN activation is the sole FFN-to-Attention tensor.
 """
 
 from collections.abc import Iterable
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -27,6 +26,10 @@ from afd_plugin.model_executor.models._weight_utils import (
     FFN_ROLE,
     filter_role_weights,
     layer_weight_path,
+)
+from afd_plugin.model_executor.models.model_utils import (
+    AFDCausalLMHooks,
+    AFDModelHooks,
 )
 
 
@@ -228,7 +231,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         self,
         hidden_states: torch.Tensor,
         *,
-        input_ids: torch.Tensor | None,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Execute the complete native V4 MoE, including its native router."""
         if not isinstance(self.ffn, native.DeepseekV4MoE):
@@ -238,7 +241,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         return self.ffn(hidden_states, input_ids)
 
 
-class AFDDeepseekV4Model(native.DeepseekV4Model):
+class AFDDeepseekV4Model(AFDModelHooks, native.DeepseekV4Model):
     """Role-aware DeepSeek-V4 model retaining mHC exclusively on Attention."""
 
     # Patch reason: native DeepSeek-V4 allocates every decoder stage and stream.
@@ -392,18 +395,6 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
             )
         # ### PATCH END
 
-    def compute_ffn_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-        *,
-        input_ids: torch.Tensor | None,
-    ) -> torch.Tensor:
-        return self.layers[layer_idx].compute_ffn_output(
-            hidden_states,
-            input_ids=input_ids,
-        )
-
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return tuple(range(int(self.config.num_hidden_layers)))
 
@@ -423,7 +414,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         super().finalize_mhc_broadcast_weights()
 
 
-class AFDDeepseekV4ForCausalLM(native.DeepseekV4ForCausalLM):
+class AFDDeepseekV4ForCausalLM(AFDCausalLMHooks, native.DeepseekV4ForCausalLM):
     """DeepSeek-V4 causal LM exposing the GPU FFN-runner model contract."""
 
     model_cls = AFDDeepseekV4Model
@@ -433,23 +424,6 @@ class AFDDeepseekV4ForCausalLM(native.DeepseekV4ForCausalLM):
         self.afd_config = parse_afd_config(vllm_config, validate=False)
         self.afd_role = self.afd_config.role
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-
-    def compute_ffn_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-        *,
-        input_ids: torch.Tensor | None = None,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        return self.model.compute_ffn_output(
-            hidden_states,
-            layer_idx,
-            input_ids=input_ids,
-        )
-
-    def get_experts_layer_indices(self) -> tuple[int, ...]:
-        return self.model.get_experts_layer_indices()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return super().load_weights(
