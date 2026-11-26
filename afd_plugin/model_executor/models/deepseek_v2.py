@@ -425,6 +425,8 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
             reject_unsupported_features(
                 vllm_config, "DeepSeek", "speculative decoding", "LoRA"
             )
+        # Keep this check: the NPU validator does not reject SP MoE, and this
+        # model also runs on Ascend.
         if vllm_config.parallel_config.use_sequence_parallel_moe:
             raise RuntimeError(
                 "AFD DeepSeek does not support sequence-parallel MoE",

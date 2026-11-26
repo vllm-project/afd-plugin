@@ -272,36 +272,24 @@ def conditional_config(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "path,value,error,message",
+    "path,value,message",
     [
-        (
-            "afd.compute_gate_on_attention",
-            True,
-            ValueError,
-            "compute_gate_on_attention=False",
-        ),
+        ("afd.compute_gate_on_attention", True, "compute_gate_on_attention=False"),
         (
             "config.speculative_config",
             SimpleNamespace(),
-            RuntimeError,
             "Qwen3.5/3.6 does not support speculative decoding",
         ),
-        (
-            "config.lora_config",
-            SimpleNamespace(),
-            RuntimeError,
-            "Qwen3.5/3.6 does not support LoRA",
-        ),
+        ("config.lora_config", SimpleNamespace(), "Qwen3.5/3.6 does not support LoRA"),
         (
             "config.model_config.multimodal_config.language_model_only",
             False,
-            ValueError,
             "pass --language-model-only",
         ),
     ],
 )
 def test_qwen_rejects_unsupported_configuration_before_construction(
-    conditional_config, path, value, error, message
+    conditional_config, path, value, message
 ):
     *parents, field = path.split(".")
     target = conditional_config
@@ -309,7 +297,7 @@ def test_qwen_rejects_unsupported_configuration_before_construction(
         target = getattr(target, parent)
     setattr(target, field, value)
 
-    with pytest.raises(error, match=message):
+    with pytest.raises(RuntimeError, match=message):
         adapter.AFDQwen3_5MoeForConditionalGeneration(
             vllm_config=conditional_config.config
         )
