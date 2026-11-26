@@ -158,50 +158,10 @@ def construct_model(torch):
             "AFD_ASYNC_CONNECTOR": "CAMAsyncAFDConnector",
             "parse_afd_config": lambda config, **kwargs: config.afd,
             "_refresh_ascend_fused_moe": lambda: None,
-            "AFDDeepseekV4RemoteMoE": lambda **kwargs: nn.Identity(),
+            "AFDDeepseekV4MoE": lambda **kwargs: nn.Identity(),
         }
         exec(constructors, namespace)
         return namespace["AFDDeepseekV4ForCausalLM"](vllm_config=vllm_config)
-
-    return construct
-
-
-@pytest.fixture
-def construct_gate(torch):
-    nn = torch.nn
-
-    def make_linear(input_size, output_size, *, bias, **_):
-        return nn.Linear(input_size, output_size, bias=bias)
-
-    namespace = {
-        "nn": nn,
-        "torch": torch,
-        "RemoteFFNProxy": nn.Identity,
-        "ReplicatedLinear": make_linear,
-    }
-    exec(_compile_constructors("AFDDeepseekV4AttentionGateRemoteMoE"), namespace)
-    gate = namespace["AFDDeepseekV4AttentionGateRemoteMoE"]
-    vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(use_sequence_parallel_moe=False),
-    )
-
-    def construct(routing_config, layer_idx, is_draft_layer):
-        config = SimpleNamespace(
-            hidden_size=2,
-            vocab_size=4,
-            num_experts_per_tok=2,
-            n_routed_experts=3,
-            n_shared_experts=None,
-            norm_topk_prob=True,
-            **routing_config,
-        )
-        return gate(
-            config=config,
-            layer_idx=layer_idx,
-            prefix=f"model.layers.{layer_idx}.mlp",
-            vllm_config=vllm_config,
-            is_draft_layer=is_draft_layer,
-        )
 
     return construct
 
@@ -218,9 +178,14 @@ def construct_gate(torch):
     ],
 )
 def test_gate_allocates_the_checkpoint_parameters_for_its_moe_type(
-    construct_gate, torch, routing_config, layer_idx, is_draft_layer, uses_hash
+    cam_moe, torch, routing_config, layer_idx, is_draft_layer, uses_hash
 ):
-    state = construct_gate(routing_config, layer_idx, is_draft_layer).state_dict()
+    state = cam_moe(
+        gate=True,
+        routing_config=routing_config,
+        layer_idx=layer_idx,
+        is_draft_layer=is_draft_layer,
+    ).state_dict()
     if uses_hash:
         assert state["gate.tid2eid"].dtype == torch.int32
         assert state["gate.tid2eid"].tolist() == [[0, 1], [1, 2], [2, 0], [0, 1]]

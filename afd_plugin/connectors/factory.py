@@ -142,8 +142,8 @@ AFDConnectorFactory.register_connector(
     "afd_plugin.connectors.npu.camp2p",
     "CAMP2pAFDConnector",
     attention_moe_runner=(
-        "afd_plugin.model_executor.ffn.remote",
-        "AFDRemoteMoERunner",
+        "afd_plugin.model_executor.ffn.npu.cam_runner",
+        "AFDCAMP2PMoERunner",
     ),
     attention_moe_device="npu",
 )

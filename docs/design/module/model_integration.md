@@ -243,7 +243,12 @@ CUDA configurations and validation limits.
 
 [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py)
 wraps the native Ascend model independently of the CUDA adapter. Attention
-owns attention, mHC, normalization and finalization. Synchronous CAMP2P has two
+owns attention, mHC, normalization and finalization. Its MoE block passes the
+original activations to the registered CAMP2P runner. With the gate on FFN,
+every layer sends its rank-local token IDs. With the gate on Attention, the
+runner sends top-k IDs and weights, runs shared experts on the original rows,
+yields and receives on the sending stage. It adds the shared output once.
+Synchronous CAMP2P has two
 shapes, selected by the common `compute_gate_on_attention` field: with `false`
 the FFN role owns the native gate and MoE, and with `true` (DeepSeek-V4, TP 1; DBO or
 ubatching additionally requires Attention DP > 1 and exactly two microbatches) the

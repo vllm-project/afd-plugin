@@ -9,9 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from afd_plugin.model_executor.models.npu.deepseek_v4 import (
-        AFDDeepseekV4AttentionGateRemoteMoE,
-    )
+    from afd_plugin.model_executor.models.npu.deepseek_v4_moe import AFDDeepseekV4MoE
 
 
 def local_hash_input_ids(
@@ -42,7 +40,7 @@ def local_hash_input_ids(
 
 
 def compute_attention_gate_topk(
-    moe: AFDDeepseekV4AttentionGateRemoteMoE,
+    moe: AFDDeepseekV4MoE,
     hidden_states: torch.Tensor,
     *,
     input_ids: torch.Tensor | None = None,
@@ -50,10 +48,8 @@ def compute_attention_gate_topk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run DSV4 routing without entering vLLM's native MoE communicator.
 
-    AFD Async CAM owns cross-role dispatch and receives tokens and IDs already
-    sharded by the model. Preserve the target decoder's exact FP32 RMSNorm
-    result and the precast gate weights, then call the CANN selectors on those
-    local tokens without entering the native MoE runner's EP communication.
+    The 0.34 decoder supplies normalized activations and rank-local IDs.
+    Project in FP32 with the precast gate weight, then select on these rows.
     """
     assert moe.gate is not None
     router_input = (
@@ -78,7 +74,7 @@ def compute_attention_gate_topk(
 
 
 def _compute_sqrtsoftplus_topk(
-    moe: AFDDeepseekV4AttentionGateRemoteMoE,
+    moe: AFDDeepseekV4MoE,
     router_logits: torch.Tensor,
     *,
     input_ids: torch.Tensor | None = None,
@@ -127,7 +123,7 @@ def _compute_sqrtsoftplus_topk(
 
 
 def _compute_standard_topk(
-    moe: AFDDeepseekV4AttentionGateRemoteMoE,
+    moe: AFDDeepseekV4MoE,
     router_logits: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the non-Hash CANN selector without native MoE communication."""

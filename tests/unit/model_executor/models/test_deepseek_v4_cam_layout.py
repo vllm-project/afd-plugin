@@ -9,21 +9,21 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
-pytest.importorskip("vllm_ascend.models.deepseek_v4.model")
 
 from afd_plugin.connectors.npu.async_cam_runtime import (  # noqa: E402
     async_cam_layout as async_cam,
 )
-from afd_plugin.model_executor.models.npu import deepseek_v4 as adapter  # noqa: E402
 from afd_plugin.model_executor.models.npu import (  # noqa: E402
-    deepseek_v4_attention_gate,
+    deepseek_v4_moe as adapter,
 )
 
 
 def _make_proxy(monkeypatch, *, use_sequence_parallel: bool, in_profile_run: bool):
-    proxy = object.__new__(adapter.AFDDeepseekV4AttentionGateRemoteMoE)
+    proxy = object.__new__(adapter.AFDDeepseekV4MoE)
     torch.nn.Module.__init__(proxy)
     proxy.use_sequence_parallel_moe = use_sequence_parallel
+    proxy.gate = torch.nn.Identity()
+    proxy.experts = None
     proxy.shared_experts = None
     proxy.layer_idx = 3
     connector = SimpleNamespace()
@@ -36,7 +36,7 @@ def _make_proxy(monkeypatch, *, use_sequence_parallel: bool, in_profile_run: boo
     topk_weights = torch.arange(32, dtype=torch.float32).reshape(16, 2)
     topk_ids = torch.arange(32, dtype=torch.int32).reshape(16, 2)
     monkeypatch.setattr(
-        deepseek_v4_attention_gate,
+        adapter,
         "compute_attention_gate_topk",
         lambda _proxy, _hidden_states, **_kwargs: (topk_weights, topk_ids),
     )

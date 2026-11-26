@@ -84,7 +84,7 @@ def _send_attention_output(
     hidden_states: torch.Tensor,
     *,
     layer_idx: int,
-    **send_kwargs: torch.Tensor,
+    **send_kwargs: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
 ) -> int:
     """Send a layer's Attention output to the FFN role; return the stage to
     receive."""
@@ -304,6 +304,7 @@ class AFDRemoteMoERunner(MoERunner):
         routed_input_transform: nn.Module | None = None,
         routed_output_transform: nn.Module | None = None,
         routed_scaling_factor: float = 1.0,
+        transport_layer_idx: int | None = None,
     ) -> None:
         super().__init__(
             layer_name=layer_name,
@@ -320,7 +321,9 @@ class AFDRemoteMoERunner(MoERunner):
         )
         # The native layer name carries the decoder layer index. Parse it
         # once: forward may be traced by torch.compile.
-        self.layer_idx: int = self.layer_id
+        self.layer_idx: int = (
+            self.layer_id if transport_layer_idx is None else transport_layer_idx
+        )
 
     def forward(
         self,
@@ -341,17 +344,25 @@ class AFDRemoteMoERunner(MoERunner):
         if self.gate is not None:
             router_logits, _ = self.gate(hidden_states)
             send_kwargs["router_logits"] = router_logits
+        return self._exchange(hidden_states, **send_kwargs)
+
+    def _exchange(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        shared_experts: nn.Module | None = None,
+        **send_kwargs: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        metadata = _current_afd_metadata()
         stage_idx = _send_attention_output(
-            _current_afd_metadata(),
-            hidden_states,
-            layer_idx=self.layer_idx,
-            **send_kwargs,
+            metadata, hidden_states, layer_idx=self.layer_idx, **send_kwargs
         )
+        shared = shared_experts(hidden_states) if shared_experts is not None else None
         hidden_states = maybe_apply_dbo_yield(hidden_states, role="attention")
-        return _current_afd_metadata().connector.recv_ffn_output(
-            ref_tensor=hidden_states,
-            ubatch_idx=stage_idx,
+        output = metadata.connector.recv_ffn_output(
+            ref_tensor=hidden_states, ubatch_idx=stage_idx
         )
+        return output if shared is None else output + shared
 
 
 def build_expert(
@@ -359,6 +370,7 @@ def build_expert(
     *,
     gate: nn.Module | None,
     shared_experts: nn.Module | None = None,
+    transport_layer_idx: int | None = None,
     **moe_kwargs: Any,
 ) -> MoERunner:
     """Build an Attention-role MoE ``experts`` module through native
@@ -435,7 +447,11 @@ def build_expert(
         "dp_size": 1,
         "pcp_size": 1,
         "runner_cls": getattr(importlib.import_module(runner_module), runner_class),
-        "runner_args": None,
+        "runner_args": (
+            {"transport_layer_idx": transport_layer_idx}
+            if transport_layer_idx is not None
+            else None
+        ),
         "routed_experts_cls": routed_experts_cls,
         "routed_experts_args": None,
     }

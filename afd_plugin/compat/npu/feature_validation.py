@@ -104,13 +104,7 @@ def _fail_if_unsupported_sync_attention_gate(
     *,
     is_dsv4: bool,
 ) -> None:
-    """Restrict the sync Attention-side gate prototype to what it supports today.
-
-    DBO and ubatching are rejected rather than merely unused: the sync shell does not
-    call the DBO yield, so enabling DBO here would interleave microbatches against a
-    transport that never yields. Not calling the yield is not the same as forbidding
-    the feature.
-    """
+    """Validate the V4 TP=1 routing channel and its two-stage DBO configuration."""
 
     parallel = vllm_config.parallel_config
     # The routing travels on each rank's own activation, and only the TP=1 shape has

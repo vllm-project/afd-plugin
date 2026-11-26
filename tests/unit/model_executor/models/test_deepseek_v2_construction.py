@@ -186,6 +186,37 @@ def test_legacy_deepseek_npu_attention_constructs_no_ffn_parameters(
     assert not any(name.startswith("mlp.") for name in _parameter_names(moe))
 
 
+def test_v2_camp2p_sends_the_decoder_activation(
+    monkeypatch, construction_env, cam_factory_on_cpu
+):
+    hf = _vllm_config().model_config.hf_config
+    hf.model_type = "deepseek_v2"
+    config = attention_moe_vllm_config(hf_config=hf, use_mla=False)
+    monkeypatch.setattr(adapter.native, "get_ep_group", _single_ep_rank)
+    with set_current_vllm_config(config):
+        moe = _make_layer(
+            monkeypatch,
+            role="attention",
+            layer_idx=1,
+            vllm_config=config,
+            connector="CAMP2pAFDConnector",
+        ).mlp
+    events = []
+    install_proxy_context(monkeypatch, events, stage_idx=0)
+    hidden = torch.ones(2, hf.hidden_size)
+
+    output = moe(hidden)
+
+    assert list(moe.parameters()) == []
+    assert config.compilation_config.static_all_moe_layers == [
+        "model.layers.1.mlp.experts"
+    ]
+    assert [e[0] for e in events] == ["send", "yield", "recv"]
+    assert events[0][1] is hidden and events[-1][1] is hidden
+    assert events[0][3] == {}
+    torch.testing.assert_close(output, hidden * 0.25)
+
+
 def test_ffn_layer_inventory_excludes_dense_and_pp_placeholders(
     monkeypatch, cuda_construction_env
 ):
