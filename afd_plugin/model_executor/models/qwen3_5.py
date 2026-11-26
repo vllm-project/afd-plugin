@@ -19,6 +19,7 @@ from afd_plugin.model_executor.models._weight_utils import (
     filter_role_weights,
     layer_weight_path,
 )
+from afd_plugin.model_executor.models.model_utils import reject_unsupported_features
 
 _NO_ROLES: frozenset[str] = frozenset()
 
@@ -272,14 +273,10 @@ class AFDQwen3_5Model(native.Qwen3_5Model):  # noqa: N801
     # Upstream: vLLM v0.32.0, vllm/model_executor/models/qwen3_5.py
     # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        # ### PATCH START: require the minimal experts boundary.
+        # ### PATCH START: require AFD activation.
         afd_config = parse_optional_afd_config(vllm_config, validate=False)
         if afd_config is None:
             raise RuntimeError("AFD Qwen model requires AFD activation")
-        if vllm_config.parallel_config.use_sequence_parallel_moe:
-            raise RuntimeError("AFD Qwen3.5/3.6 does not support SP MoE")
-        if vllm_config.parallel_config.enable_eplb:
-            raise RuntimeError("AFD Qwen3.5/3.6 does not support EPLB")
         self.afd_config = afd_config
         # ### PATCH END
 
@@ -450,22 +447,10 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
             raise ValueError(
                 "AFD Qwen3.5/3.6 CUDA supports compute_gate_on_attention=False only",
             )
-        if vllm_config.speculative_config is not None:
-            raise ValueError(
-                "AFD Qwen3.5/3.6 CUDA does not support speculative decoding",
-            )
-        if vllm_config.lora_config is not None:
-            raise ValueError("AFD Qwen3.5/3.6 CUDA does not support LoRA")
+        reject_unsupported_features(
+            vllm_config, "Qwen3.5/3.6", "speculative decoding", "LoRA"
+        )
         _validate_qwen_text_only(vllm_config.model_config)
-        parallel_config = vllm_config.parallel_config
-        if parallel_config.use_sequence_parallel_moe:
-            raise ValueError("AFD Qwen3.5/3.6 CUDA does not support SP MoE")
-        if parallel_config.enable_eplb:
-            raise ValueError("AFD Qwen3.5/3.6 CUDA does not support EPLB")
-        if parallel_config.pipeline_parallel_size != 1:
-            raise ValueError(
-                "AFD Qwen3.5/3.6 CUDA supports pipeline_parallel_size=1 only",
-            )
         # ### PATCH END
 
         nn.Module.__init__(self)

@@ -101,6 +101,7 @@ def _vllm_config(*, layer_count: int = 2):
     return SimpleNamespace(
         cache_config=None,
         compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
+        lora_config=None,
         model_config=SimpleNamespace(hf_config=config, use_mla=False),
         parallel_config=SimpleNamespace(
             enable_eplb=False,
@@ -661,6 +662,60 @@ def test_model_constructor_rejects_sequence_parallel_moe_before_allocation(
 
     with pytest.raises(RuntimeError, match="sequence-parallel MoE"):
         adapter.AFDDeepseekV2Model(vllm_config=vllm_config, prefix="model")
+
+
+@pytest.mark.parametrize(
+    "config_field,feature",
+    [
+        ("speculative_config", "speculative decoding"),
+        ("lora_config", "LoRA"),
+    ],
+)
+def test_cuda_model_rejects_unsupported_features_before_allocation(
+    monkeypatch,
+    construction_env,
+    config_field,
+    feature,
+):
+    vllm_config = _vllm_config()
+    setattr(vllm_config, config_field, SimpleNamespace())
+    monkeypatch.setattr(
+        adapter.native,
+        "current_platform",
+        SimpleNamespace(device_type="cuda"),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "parse_afd_config",
+        lambda *_args, **_kwargs: AFDConfig(role="attention"),
+    )
+
+    with pytest.raises(RuntimeError, match=f"DeepSeek does not support {feature}"):
+        adapter.AFDDeepseekV2Model(vllm_config=vllm_config, prefix="model")
+
+
+def test_npu_model_skips_the_cuda_feature_checks(
+    monkeypatch,
+    construction_env,
+):
+    vllm_config = _vllm_config()
+    vllm_config.speculative_config = SimpleNamespace()
+    vllm_config.lora_config = SimpleNamespace()
+    monkeypatch.setattr(
+        adapter.native,
+        "current_platform",
+        SimpleNamespace(device_type="npu"),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "parse_afd_config",
+        lambda *_args, **_kwargs: AFDConfig(role="attention"),
+    )
+    _patch_model_constructor_dependencies(monkeypatch, construction_env)
+
+    model = adapter.AFDDeepseekV2Model(vllm_config=vllm_config, prefix="model")
+
+    assert isinstance(model, adapter.native.DeepseekV2Model)
 
 
 def test_m2n_ffn_omits_attention_owned_shared_with_real_hf_config(

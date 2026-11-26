@@ -250,7 +250,10 @@ For the model adapter:
   delegation, stage/proxy integration, and path-to-role classification;
 - keep gate-on-FFN as the default unless the target and requested scope prove
   an Attention-side gate contract;
-- fail closed for unsupported gate, MTP, topology, or backend combinations.
+- fail closed for unsupported gate, MTP, topology, or backend combinations;
+- on CUDA, reject unsupported vLLM features with
+  `reject_unsupported_features()` from `model_utils.py`; do not repeat the PP,
+  EPLB, or SP MoE checks the GPU validator already makes.
 
 When copying native code, add the required reason, source file, source commit,
 exact signature/return type, and paired `PATCH START/END` markers immediately

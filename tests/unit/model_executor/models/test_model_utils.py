@@ -135,3 +135,29 @@ def test_model_config_rejects_qwen_on_npu_without_mutation(model_utils):
             SimpleNamespace(hf_config=hf_config), device_type="npu"
         )
     assert hf_config.architectures == ["Qwen3_5MoeForConditionalGeneration"]
+
+
+@pytest.mark.parametrize(
+    "feature,config_field",
+    [
+        ("speculative decoding", "speculative_config"),
+        ("LoRA", "lora_config"),
+    ],
+)
+def test_declared_unsupported_feature_fails_with_the_shared_message(
+    model_utils, feature, config_field
+):
+    vllm_config = SimpleNamespace(speculative_config=None, lora_config=None)
+    setattr(vllm_config, config_field, SimpleNamespace())
+
+    with pytest.raises(RuntimeError, match=f"^AFD Example does not support {feature}$"):
+        model_utils.reject_unsupported_features(vllm_config, "Example", feature)
+
+
+def test_feature_a_model_does_not_declare_stays_allowed(model_utils):
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(),
+        lora_config=SimpleNamespace(),
+    )
+
+    model_utils.reject_unsupported_features(vllm_config, "Example")

@@ -8,8 +8,8 @@ source revision. See [installation](installation.md) for the pinned runtime stac
 
 | Model family | Execution scope |
 | --- | --- |
-| DeepSeek V2 / V3 / V3.2 | CUDA P2P and synchronous Ascend paths; DeepEP M2N admits V2 only. Each role loads its required components. |
-| DeepSeek V4 Flash | CUDA P2P or Ascend CAMP2P / Async CAM; backend-specific limits are in the matrix below. |
+| DeepSeek V2 / V3 / V3.2 | CUDA P2P and synchronous Ascend paths; DeepEP M2N admits V2 only. Each role loads its required components. CUDA rejects speculative decoding and LoRA. |
+| DeepSeek V4 Flash | CUDA P2P or Ascend CAMP2P / Async CAM; backend-specific limits are in the matrix below. CUDA rejects LoRA. |
 | Qwen3 MoE | CUDA; P2P gates on FFN, DeepEP M2N gates on Attention. Rejects sequence-parallel MoE, EPLB, PP, speculative decoding, LoRA and NPU. |
 | Qwen3.5 / Qwen3.6 MoE | CUDA text-only with `--language-model-only`; evidence covers Qwen3.6-35B-A3B native DP4/TP1/EP4 and synchronous AFD 2A1F eager/graph. GDN DBO, Attention-side routing, PP, async and multi-node execution are unsupported; NPU/multimodal are unsupported or unverified, quantization is unverified, and no performance claim is made. |
 

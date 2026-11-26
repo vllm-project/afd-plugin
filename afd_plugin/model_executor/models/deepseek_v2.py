@@ -31,6 +31,7 @@ from afd_plugin.model_executor.models._weight_utils import (
     filter_role_weights,
     layer_weight_path,
 )
+from afd_plugin.model_executor.models.model_utils import reject_unsupported_features
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -420,6 +421,10 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # ### PATCH START: require AFD activation and avoid native allocation.
         afd_config = parse_afd_config(vllm_config, validate=False)
+        if native.current_platform.device_type == "cuda":
+            reject_unsupported_features(
+                vllm_config, "DeepSeek", "speculative decoding", "LoRA"
+            )
         if vllm_config.parallel_config.use_sequence_parallel_moe:
             raise RuntimeError(
                 "AFD DeepSeek does not support sequence-parallel MoE",
