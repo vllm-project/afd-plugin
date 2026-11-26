@@ -66,12 +66,12 @@ class NPUUBatchContext(ubatching.UBatchContext):
         if self.ready_barrier.broken:
             raise RuntimeError("NPU DBO peer failed; restart the A/F worker group")
 
-    # Native __enter__ leaves its registry entry behind if barrier/device setup
-    # fails. The bounded barrier also catches initialization before __enter__.
+    # Native run_ubatch selects the device before entering this context.
+    # Clean up native registry entries if the barrier or stream setup fails.
+    # The bounded barrier also catches failures before context entry.
     def __enter__(self):
         # ### PATCH START: unwind failed native context entry.
         try:
-            torch.npu.set_device(self.compute_stream.device)
             super().__enter__()
             self._check_cancelled()
             return self
