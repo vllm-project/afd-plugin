@@ -11,7 +11,11 @@ pytest.importorskip("vllm")
 from torch import nn  # noqa: E402
 from vllm.config import set_current_vllm_config  # noqa: E402
 from vllm.config.multimodal import MultiModalConfig  # noqa: E402
+from vllm.model_executor.layers.fused_moe.runner import (  # noqa: E402
+    moe_runner as native_moe_runner,
+)
 from vllm.model_executor.models import qwen3_5 as native  # noqa: E402
+from vllm.model_executor.models import utils as native_utils  # noqa: E402
 from vllm.model_executor.models.utils import StageMissingLayer  # noqa: E402
 
 from afd_plugin.config import DEEPEP_M2N_CONNECTOR  # noqa: E402
@@ -70,6 +74,7 @@ def build_attention_qwen_layer(monkeypatch):
             hf_text_config=text_config,
             multimodal_config=None,
         )
+        config.parallel_config.tensor_parallel_size = tp_size
         monkeypatch.setattr(
             adapter.next_native,
             "get_tensor_model_parallel_world_size",
@@ -157,6 +162,117 @@ def test_attention_tp_ranks_send_their_own_slice_only_with_routes(
     layer = build_attention_qwen_layer(connector=connector, tp_size=tp_size).layer
 
     assert layer.mlp.is_sequence_parallel is sequence_parallel
+
+
+class _GateStandIn(nn.Module):
+    """vLLM's gate, whose logits the routes below do not use."""
+
+    def __init__(self, *_args, **_kwargs):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(1))
+
+    def forward(self, hidden_states):
+        return hidden_states, None
+
+
+class _ZeroSharedExpert(_GateStandIn):
+    """vLLM's shared-expert MLP, contributing nothing."""
+
+    def forward(self, hidden_states):
+        return torch.zeros_like(hidden_states)
+
+
+def _token_routes(tokens):
+    """Two experts per token number, so each route names its token."""
+    tokens = tokens.to(torch.int32)
+    return torch.stack((tokens % 4, (tokens + 1) % 4), dim=1)
+
+
+def test_attention_tp2_sends_each_token_once_and_padding_unrouted(
+    monkeypatch, build_attention_qwen_layer
+):
+    """With routes and Attention TP 2, three tokens reach the connector as
+    rank 0's tokens 1-2 and rank 1's token 3 plus one padding row. Across the
+    two ranks each token is sent once with its own routes, and the padding
+    row's top-k IDs are all ``UNROUTED_EXPERT_ID``.
+
+    Why: TP peers hold the same tokens. A token sent by both ranks would run
+    its experts twice, and a routed padding row would run experts for a row
+    the TP gather drops.
+    """
+    num_tokens, tp_size = 3, 2
+    monkeypatch.setattr(adapter.next_native, "GateLinear", _GateStandIn)
+    monkeypatch.setattr(adapter.next_native, "Qwen3NextMLP", _ZeroSharedExpert)
+    moe = build_attention_qwen_layer(
+        connector=DEEPEP_M2N_CONNECTOR, tp_size=tp_size
+    ).layer.mlp
+    runner = moe.experts
+    # vLLM's MoE custom op and top-k kernel run only on CUDA: call the
+    # runner's _forward_impl directly, without DP metadata (Attention DP1, as
+    # in the TP2 E2E case), and route by token number. The token split stays
+    # vLLM's sequence_parallel_chunk.
+    monkeypatch.setattr(
+        native_moe_runner,
+        "get_forward_context",
+        lambda: SimpleNamespace(dp_metadata=None),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_forward_entry",
+        lambda states, logits, shared_input, input_ids, *_: runner._forward_impl(
+            states, logits, shared_input, input_ids
+        ),
+    )
+    monkeypatch.setattr(
+        runner.router,
+        "select_experts",
+        lambda hidden_states, **_: (
+            torch.full((hidden_states.shape[0], 2), 0.5),
+            _token_routes(hidden_states[:, 0]),
+        ),
+    )
+    monkeypatch.setattr(
+        adapter.next_native,
+        "sequence_parallel_chunk",
+        native_utils.sequence_parallel_chunk_impl,
+    )
+    monkeypatch.setattr(
+        native_utils, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+    monkeypatch.setattr(
+        adapter.next_native,
+        "tensor_model_parallel_all_gather",
+        lambda tensor, dim: torch.cat([tensor] * tp_size, dim),
+    )
+    # Token n's row is all n; padding rows are zeros.
+    tokens = torch.arange(1, num_tokens + 1, dtype=torch.float32)
+    hidden_states = tokens.unsqueeze(1).repeat(1, QWEN_HIDDEN_SIZE)
+
+    sent_tokens: list[float] = []
+    padding_rows = 0
+    for tp_rank in range(tp_size):
+        events: list[tuple] = []
+        install_proxy_context(monkeypatch, events).tokens_lens = [num_tokens]
+        for module in (remote, native_utils):
+            monkeypatch.setattr(
+                module, "get_tensor_model_parallel_rank", lambda rank=tp_rank: rank
+            )
+
+        moe(hidden_states.clone())
+
+        (send,) = [event for event in events if event[0] == "send"]
+        sent_states, sent_ids = send[1], send[3]["topk_ids"]
+        unrouted = sent_ids == remote.UNROUTED_EXPERT_ID
+        padding = unrouted.all(dim=1)
+        assert torch.equal(unrouted.any(dim=1), padding)
+        assert not sent_states[padding].any()
+        rank_tokens = sent_states[~padding, 0]
+        assert torch.equal(sent_ids[~padding], _token_routes(rank_tokens))
+        sent_tokens += rank_tokens.tolist()
+        padding_rows += int(padding.sum())
+
+    assert sorted(sent_tokens) == tokens.tolist()
+    assert padding_rows == 1
 
 
 def test_ffn_model_hands_each_layer_routed_experts_to_the_runner():
