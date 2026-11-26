@@ -257,9 +257,9 @@ for NPU. The `test_deepseek_v2_lite` entry collects 13 GPU cases, including
 1A1F, 2A1F and the local-only `afd-v2-graph-dbo-tp2`; its NPU selection
 collects seven. The P2P entries across DeepSeek, Qwen3 MoE and Qwen3.6 MoE
 contain 20 CUDA cases (13 + 4 + 3). Separate DeepEP M2N entries add five GPU-only
-cases each for DeepSeek and Qwen3 MoE, and a Qwen3 MoE standalone FFN service
-entry adds four. Unfiltered DeepSeek module collection
-includes its five DeepEP IDs even on NPU; NPU runs select the P2P entry or
+cases each for DeepSeek and Qwen3 MoE, and standalone FFN service entries add
+four each. Unfiltered DeepSeek module collection includes its nine DeepEP and
+FFN service IDs even on NPU; NPU runs select the P2P entry or
 explicit node IDs. The local-only TP2 Graph + DBO case is outside the seven-case
 ready/merge CI gate.
 

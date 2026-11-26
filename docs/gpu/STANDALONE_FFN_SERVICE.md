@@ -2,22 +2,34 @@
 
 Run a registered CUDA routed-experts model in independent F-only processes
 with `torchrun -m afd_plugin.ffn_faas serve --backend gpu-deepep-m2n`. The
-service loads only the routed experts, reuses vLLM's native loader and the
-existing DeepEP M2N FFN runtime, and constructs no vLLM Worker, upstream
-ModelRunner, EngineCore, scheduler, KV cache or complete CausalLM. Attention
-keeps its existing `vllm serve` launch, model, connector and DBO path.
+service loads only FFN-side weights (see [Models](#models)), reuses vLLM's
+native loader and the existing DeepEP M2N FFN runtime, and constructs no vLLM
+Worker, upstream ModelRunner, EngineCore, scheduler, KV cache or complete
+CausalLM. Attention keeps its existing `vllm serve` launch, model, connector
+and DBO path.
 
 ## Supported configuration
 
 | Supported | Rejected at startup |
 | --- | --- |
-| A registered CUDA routed-experts model; currently `Qwen3MoeForCausalLM`, BF16, every layer MoE, no shared experts | Unregistered models, FP8 or any `quantization_config`, dense or partial-MoE Qwen3, shared experts |
+| A registered CUDA routed-experts model in BF16; see [Models](#models) | Unregistered models, FP8 or any `quantization_config`, Qwen3 with dense layers or shared experts |
 | `DeepEPM2NAFDConnector` with `payload_format: bf16` | P2P, afdEP-direct, flexible placement, FP8 payload |
 | F TP=1, EP over all F ranks, linear expert placement | EPLB, elastic EP, redundant experts, PP/CP, LoRA, speculative decoding |
 | Eager, FULL_DECODE_ONLY CUDA graphs, DBO with two lanes (eager and graph) | Other graph modes, more than two micro-batches |
 | SM90 or newer (H100, H200, GB200) | Pre-Hopper GPUs |
 
 The routed experts must divide evenly across the F ranks.
+
+### Models
+
+The model registry picks the FFN model, as on the Worker path: an FFN-only
+shell when the architecture has one, otherwise its role-aware AFD model.
+Routing, shared experts and dense layers run on Attention.
+
+| Architecture | FFN model | F allocates |
+| --- | --- | --- |
+| `Qwen3MoeForCausalLM` (every layer MoE, no shared experts) | `AFDQwen3MoeRoutedExperts`, an FFN-only shell | `model.layers.<i>.mlp` only: gate and routed experts |
+| `DeepseekV2ForCausalLM` (DeepSeek-V2-Lite) | `AFDDeepseekV2ForCausalLM`, the role-aware model | each MoE layer's gate and routed experts, plus the embedding, norms and LM head |
 
 ## Architecture
 
@@ -38,15 +50,16 @@ method the Worker-path `AFDFFNWorker` loop calls, so the data path, buckets,
 lanes, graphs and DBO order are identical to a `vllm serve` FFN. See the
 [FFN runtime design](../design/module/ffn_runtime.md#runtime-selection).
 
-Compared with a `vllm serve` FFN, F does not allocate the embedding, final
-norm and LM head (about 1.16 GiB per rank for Qwen3-30B-A3B).
+The Qwen3 shell does not allocate the embedding, final norm and LM head (about
+1.16 GiB per rank for Qwen3-30B-A3B). DeepSeek-V2 has no shell yet, so F
+allocates them (about 0.78 GiB per rank for DeepSeek-V2-Lite).
 
 ## Launch
 
 Keep the Attention half of an existing recipe under
-`recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/` unchanged and replace only
-the FFN half. Example: 2A2F, graph and DBO on one node, Attention on GPUs 0
-and 1, F on GPUs 2 and 3:
+`recipe/gpu/DeepEPM2NAFDConnector/qwen3_30b_a3b/` or `deepseek_v2_lite/`
+unchanged and replace only the FFN half. Example: 2A2F, graph and DBO on one
+node, Attention on GPUs 0 and 1, F on GPUs 2 and 3:
 
 ```bash
 export VLLM_USE_V2_MODEL_RUNNER=1
