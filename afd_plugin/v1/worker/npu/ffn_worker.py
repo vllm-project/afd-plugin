@@ -135,6 +135,10 @@ class AFDNPUFFNWorker(NPUWorker):
     def compile_or_warm_up_model(self) -> CompilationTimes:
         return CompilationTimes(language_model=0.0, encoder=0.0)
 
+    def reset_mm_cache(self) -> None:
+        """Acknowledge the startup cache reset for the activation-only worker."""
+        return None
+
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
