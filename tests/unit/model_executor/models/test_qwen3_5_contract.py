@@ -200,7 +200,12 @@ def test_conditional_generation_routes_ffn_compute_to_text_model_layer():
         adapter.AFDQwen3_5MoeForCausalLM,
         adapter.AFDQwen3_5MoeForConditionalGeneration,
     ):
-        assert not hasattr(cls, "get_routed_experts")
+        for hook in (
+            "get_routed_experts",
+            "compute_experts_output",
+            "get_experts_routing_spec",
+        ):
+            assert not hasattr(cls, hook)
 
 
 def test_qwen_causal_model_retains_afd_aligned_cache_scope(monkeypatch):

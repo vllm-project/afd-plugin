@@ -115,6 +115,54 @@ def test_routed_experts_accessor_is_opt_in(model_utils):
     assert outer.get_routed_experts(1) is routed[1]
 
 
+def test_router_logits_hooks_are_opt_in(model_utils):
+    """Only the router-logits mixins expose the Attention-side logits hooks.
+
+    Why: only the GPU FFN runner with a non-routed connector and the gate on
+    Attention calls them, and only the DeepSeek V2 family serves that path.
+    """
+    for hook in ("compute_experts_output", "get_experts_routing_spec"):
+        assert not hasattr(model_utils.AFDModelHooks, hook)
+        assert not hasattr(model_utils.AFDCausalLMHooks, hook)
+
+    class _ExpertsLayer:
+        def __init__(self, tag):
+            self.tag = tag
+
+        def compute_experts_output(self, hidden_states, router_logits):
+            return (self.tag, hidden_states, router_logits)
+
+    spec = object()
+    inner = model_utils.AFDRouterLogitsModelHooks()
+    # The opting-in model supplies its native router contract.
+    inner.get_experts_routing_spec = lambda layer_idx: (spec, layer_idx)
+    inner.layers = [_ExpertsLayer("layer-0"), _ExpertsLayer("layer-1")]
+    outer = model_utils.AFDRouterLogitsCausalLMHooks()
+    outer.model = inner
+    hidden_states, router_logits = object(), object()
+
+    assert outer.compute_experts_output(hidden_states, 1, router_logits) == (
+        "layer-1",
+        hidden_states,
+        router_logits,
+    )
+    assert outer.get_experts_routing_spec(1) == (spec, 1)
+
+
+def test_opt_in_outer_hooks_reject_base_inner_model(model_utils):
+    """An opt-in outer mixin over a base-only inner model fails with a clear type."""
+    inner = model_utils.AFDModelHooks()
+    routed = model_utils.AFDRoutedExpertsCausalLMHooks()
+    routed.model = inner
+    logits = model_utils.AFDRouterLogitsCausalLMHooks()
+    logits.model = inner
+
+    with pytest.raises(TypeError, match="routed-experts"):
+        routed.get_routed_experts(0)
+    with pytest.raises(TypeError, match="router logits"):
+        logits.get_experts_routing_spec(0)
+
+
 @pytest.mark.parametrize(
     "architecture,device_type",
     [

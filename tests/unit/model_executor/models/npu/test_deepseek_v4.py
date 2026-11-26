@@ -339,6 +339,10 @@ def test_ffn_compute_forwards_attention_routing_to_target_layer(torch, construct
 
     assert torch.equal(output, hidden_states + 1)
     assert calls == [(1, hidden_states, routing)]
+    # Attention-side routing travels through compute_ffn_output, never through
+    # the GPU router-logits hooks.
+    assert not hasattr(model, "compute_experts_output")
+    assert not hasattr(model, "get_experts_routing_spec")
 
 
 def test_attention_layers_share_model_local_reserved_output_storage(construct_model):

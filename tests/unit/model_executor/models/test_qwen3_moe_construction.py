@@ -785,3 +785,11 @@ def test_attention_role_rejects_local_ffn_compute(
 def test_qwen3_moe_exposes_routed_experts_accessor(cls_name):
     """Qwen3 MoE keeps vLLM's RoutedExperts at ``mlp.experts.routed_experts``."""
     assert callable(getattr(adapter, cls_name).get_routed_experts)
+
+
+@pytest.mark.parametrize("cls_name", ["AFDQwen3MoeModel", "AFDQwen3MoeForCausalLM"])
+def test_qwen3_moe_does_not_expose_router_logits_hooks(cls_name):
+    """Qwen3 MoE routes on Attention only through routed-experts connectors."""
+    cls = getattr(adapter, cls_name)
+    assert not hasattr(cls, "compute_experts_output")
+    assert not hasattr(cls, "get_experts_routing_spec")

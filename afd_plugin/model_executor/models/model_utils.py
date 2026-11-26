@@ -100,19 +100,17 @@ class AFDModelHooks:
 
     Mixed into the AFD inner model, the class that owns ``self.layers`` and is
     reached through ``AFDCausalLMHooks.afd_inner_model()``. It holds the hooks
-    the AFD workers call on ``ModelRunner.get_model()``:
+    every AFD adapter serves on ``ModelRunner.get_model()``:
 
     * ``compute_ffn_output`` runs one layer's FFN stage on the FFN role.
-    * ``compute_experts_output`` runs routed experts from router logits that
-      Attention sent.
     * ``get_experts_layer_indices`` lists the MoE layers.
-    * ``get_experts_routing_spec`` returns the static router width and dtype
-      used for graph capture.
 
-    Models keep only the hooks whose logic is model specific, plus the optional
-    class flags the runners read (``afd_requires_input_ids`` and
-    ``afd_requires_attention_routing`` on the outer mixin). Adapters that serve a
-    routed-experts connector use ``AFDRoutedExpertsModelHooks`` instead.
+    Hooks that only some connector paths use live in opt-in subclasses:
+    ``AFDRoutedExpertsModelHooks`` for routed-experts connectors and
+    ``AFDRouterLogitsModelHooks`` for Attention-side router logits. Models keep
+    only the hooks whose logic is model specific, plus the optional class flags
+    the runners read (``afd_requires_input_ids`` and
+    ``afd_requires_attention_routing`` on the outer mixin).
     """
 
     layers: nn.ModuleList
@@ -132,25 +130,9 @@ class AFDModelHooks:
         """
         return self.layers[layer_idx].compute_ffn_output(hidden_states, **ffn_inputs)
 
-    def compute_experts_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-        router_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run one layer's routed experts from Attention-side router logits."""
-        return self.layers[layer_idx].compute_experts_output(
-            hidden_states,
-            router_logits,
-        )
-
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         """Return the MoE layer indices; every AFD model overrides this."""
         raise NotImplementedError("AFD model must declare its MoE layer inventory")
-
-    def get_experts_routing_spec(self, layer_idx: int) -> AFDExpertRoutingSpec:
-        """Return the static router contract; models without a router override."""
-        raise NotImplementedError("AFD model does not expose a native router contract")
 
 
 class AFDRoutedExpertsModelHooks(AFDModelHooks):
@@ -172,14 +154,40 @@ class AFDRoutedExpertsModelHooks(AFDModelHooks):
         return self.layers[layer_idx].mlp.experts.routed_experts
 
 
+class AFDRouterLogitsModelHooks(AFDModelHooks):
+    """Inner-model hooks for FFN experts driven by Attention-side router logits.
+
+    The GPU FFN runner uses them on a non-routed connector with
+    ``compute_gate_on_attention``: it sizes the router-logits receive from
+    ``get_experts_routing_spec`` and runs the layer's experts on the logits it
+    received. Only the DeepSeek V2 family opts in; the other adapters reject
+    that configuration or route on Attention through their own payload.
+    """
+
+    def compute_experts_output(
+        self,
+        hidden_states: torch.Tensor,
+        layer_idx: int,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one layer's routed experts from Attention-side router logits."""
+        return self.layers[layer_idx].compute_experts_output(
+            hidden_states,
+            router_logits,
+        )
+
+    def get_experts_routing_spec(self, layer_idx: int) -> AFDExpertRoutingSpec:
+        """Return the static router width and dtype used for graph capture."""
+        raise NotImplementedError("AFD model must declare its native router contract")
+
+
 class AFDCausalLMHooks:
     """Outer-model half of the AFD runner contract.
 
     Mixed into the class returned by ``ModelRunner.get_model()``. Every hook
     forwards to the inner AFD model from ``afd_inner_model()``, so subclasses
-    override only the model-specific hooks (``get_experts_layer_indices``, a
-    native ``get_experts_routing_spec``, or a layer-specific
-    ``compute_experts_output``) and the two transport flags.
+    override only ``afd_inner_model`` (multimodal wrappers) and the two
+    transport flags.
     """
 
     # Runners read these directly; a model that needs the transport to carry a
@@ -205,32 +213,44 @@ class AFDCausalLMHooks:
             **ffn_inputs,
         )
 
+    def get_experts_layer_indices(self) -> tuple[int, ...]:
+        return self.afd_inner_model().get_experts_layer_indices()
+
+
+class AFDRoutedExpertsCausalLMHooks(AFDCausalLMHooks):
+    """Outer-model hooks for adapters that serve a routed-experts connector."""
+
+    def get_routed_experts(self, layer_idx: int) -> RoutedExperts:
+        inner = self.afd_inner_model()
+        if not isinstance(inner, AFDRoutedExpertsModelHooks):
+            raise TypeError(
+                f"{type(inner).__name__} does not serve routed-experts connectors"
+            )
+        return inner.get_routed_experts(layer_idx)
+
+
+class AFDRouterLogitsCausalLMHooks(AFDCausalLMHooks):
+    """Outer-model hooks for FFN experts driven by Attention-side router logits."""
+
+    def _router_logits_model(self) -> AFDRouterLogitsModelHooks:
+        inner = self.afd_inner_model()
+        if not isinstance(inner, AFDRouterLogitsModelHooks):
+            raise TypeError(
+                f"{type(inner).__name__} does not take Attention-side router logits"
+            )
+        return inner
+
     def compute_experts_output(
         self,
         hidden_states: torch.Tensor,
         layer_idx: int,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
-        return self.afd_inner_model().compute_experts_output(
+        return self._router_logits_model().compute_experts_output(
             hidden_states,
             layer_idx,
             router_logits,
         )
 
-    def get_experts_layer_indices(self) -> tuple[int, ...]:
-        return self.afd_inner_model().get_experts_layer_indices()
-
     def get_experts_routing_spec(self, layer_idx: int) -> AFDExpertRoutingSpec:
-        return self.afd_inner_model().get_experts_routing_spec(layer_idx)
-
-
-class AFDRoutedExpertsCausalLMHooks(AFDCausalLMHooks):
-    """Outer-model hooks for adapters that serve a routed-experts connector."""
-
-    model: AFDRoutedExpertsModelHooks
-
-    def afd_inner_model(self) -> AFDRoutedExpertsModelHooks:
-        return self.model
-
-    def get_routed_experts(self, layer_idx: int) -> RoutedExperts:
-        return self.afd_inner_model().get_routed_experts(layer_idx)
+        return self._router_logits_model().get_experts_routing_spec(layer_idx)

@@ -713,3 +713,20 @@ def test_m2n_ffn_omits_attention_owned_shared_with_real_hf_config(
 def test_deepseek_family_exposes_routed_experts_accessor(cls_name):
     """Routed-experts connectors load these classes and read their experts."""
     assert callable(getattr(adapter, cls_name).get_routed_experts)
+
+
+@pytest.mark.parametrize(
+    "cls_name",
+    [
+        "AFDDeepseekV2Model",
+        "AFDDeepseekV2ForCausalLM",
+        "AFDDeepseekForCausalLM",
+        "AFDDeepseekV3ForCausalLM",
+        "AFDGlmMoeDsaForCausalLM",
+    ],
+)
+def test_deepseek_family_exposes_router_logits_hooks(cls_name):
+    """The GPU FFN runner drives these experts from Attention router logits."""
+    cls = getattr(adapter, cls_name)
+    assert callable(cls.compute_experts_output)
+    assert callable(cls.get_experts_routing_spec)

@@ -34,6 +34,8 @@ from afd_plugin.model_executor.models._weight_utils import (
 from afd_plugin.model_executor.models.model_utils import (
     AFDRoutedExpertsCausalLMHooks,
     AFDRoutedExpertsModelHooks,
+    AFDRouterLogitsCausalLMHooks,
+    AFDRouterLogitsModelHooks,
 )
 
 logger = init_logger(__name__)
@@ -407,7 +409,11 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
 
 
 @native.support_torch_compile
-class AFDDeepseekV2Model(AFDRoutedExpertsModelHooks, native.DeepseekV2Model):
+class AFDDeepseekV2Model(
+    AFDRoutedExpertsModelHooks,
+    AFDRouterLogitsModelHooks,
+    native.DeepseekV2Model,
+):
     """DeepSeek model wrapper that routes Attention outputs through AFD."""
 
     fall_back_to_pt_during_load = False
@@ -532,7 +538,9 @@ class AFDDeepseekV2Model(AFDRoutedExpertsModelHooks, native.DeepseekV2Model):
 
 
 class AFDDeepseekV2ForCausalLM(
-    AFDRoutedExpertsCausalLMHooks, native.DeepseekV2ForCausalLM
+    AFDRoutedExpertsCausalLMHooks,
+    AFDRouterLogitsCausalLMHooks,
+    native.DeepseekV2ForCausalLM,
 ):
     """DeepSeekV2 causal LM wrapper for AFD execution."""
 

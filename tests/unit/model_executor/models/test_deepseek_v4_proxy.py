@@ -170,6 +170,12 @@ def test_v4_ffn_compute_requires_input_ids(monkeypatch):
 
 
 @pytest.mark.parametrize("cls_name", ["AFDDeepseekV4Model", "AFDDeepseekV4ForCausalLM"])
-def test_cuda_v4_does_not_expose_routed_experts_accessor(cls_name):
-    """CUDA V4 keeps its MoE under ``layer.ffn``; no routed connector serves it."""
-    assert not hasattr(getattr(adapter, cls_name), "get_routed_experts")
+def test_cuda_v4_exposes_only_base_hooks(cls_name):
+    """CUDA V4 keeps its MoE under ``layer.ffn`` and rejects gate-on-Attention."""
+    cls = getattr(adapter, cls_name)
+    for hook in (
+        "get_routed_experts",
+        "compute_experts_output",
+        "get_experts_routing_spec",
+    ):
+        assert not hasattr(cls, hook)

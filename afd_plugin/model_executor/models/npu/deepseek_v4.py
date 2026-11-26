@@ -826,17 +826,6 @@ class AFDDeepseekV4Model(AFDModelHooks, native.DeepseekV4Model):
             router_logits_dtype=gate.out_dtype or gate.weight.dtype,
         )
 
-    def compute_experts_output(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-        router_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        raise NotImplementedError(
-            "DSV4 AFD never returns gate outputs through this method; the "
-            "Attention-side gate keeps its top-k inside the gate shell"
-        )
-
 
 class AFDDeepseekV4ForCausalLM(
     AFDCausalLMHooks,
