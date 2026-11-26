@@ -2,10 +2,10 @@
 
 Run a registered CUDA routed-experts model in independent F-only processes
 with `torchrun -m afd_plugin.ffn_faas serve --backend gpu-deepep-m2n`. The
-service loads only FFN-side weights (see [Models](#models)), reuses vLLM's
-native loader and the existing DeepEP M2N FFN runtime, and constructs no vLLM
-Worker, upstream ModelRunner, EngineCore, scheduler, KV cache or complete
-CausalLM. Attention keeps its existing `vllm serve` launch, model, connector
+service loads the FFN model (see [Models](#models)), reuses vLLM's native
+loader and the existing DeepEP M2N FFN runtime, and constructs no vLLM
+Worker, upstream ModelRunner, EngineCore, scheduler, KV cache or Attention
+layers. Attention keeps its existing `vllm serve` launch, model, connector
 and DBO path.
 
 ## Supported configuration

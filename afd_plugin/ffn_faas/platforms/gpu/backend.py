@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""FFN-only routed experts composed with the existing GPU M2N runtime.
+"""The FFN model composed with the existing GPU M2N runtime.
 
 Imported inside the externally launched F process, after the adapter has
 validated the launch. No vLLM Worker, upstream ModelRunner, EngineCore,
@@ -64,7 +64,7 @@ class DeepEPM2NFFNBackend:
         3. create the F-only NCCL world and vLLM's model-parallel groups;
         4. construct the routed-experts runner with that graph policy, which
            creates the connector (no collective yet);
-        5. load the FFN-only routed-experts shell through vLLM's native loader;
+        5. load the FFN model through vLLM's native loader;
         6. start the connector: the collective M2N handshake with Attention,
            the model-info check, the NCCL control group, the lanes' DeepEP
            buffers and the dispatch-kernel precompile.
@@ -108,7 +108,7 @@ class DeepEPM2NFFNBackend:
             service.loading_progress(total_experts, total_experts)
             if not isinstance(model, torch.nn.Module):
                 raise TypeError(
-                    f"FFN-only model must be a torch module, got {type(model).__name__}"
+                    f"FFN model must be a torch module, got {type(model).__name__}"
                 )
             parameter_bytes = parameter_storage_bytes(model)
             local_expert_ids = self.runner.local_experts[
@@ -184,7 +184,7 @@ class DeepEPM2NFFNBackend:
         the captured graphs, drops their pool, clears vLLM's forward-context
         registrations and the model reference, and closes the connector
         (control group and lanes); then the environment destroys the F-only
-        groups, and the last reference to the FFN-only model is dropped. The
+        groups, and the last reference to the FFN model is dropped. The
         connector's gloo bootstrap group outlives this, which only matters
         for an in-process restart, which is not supported.
         """

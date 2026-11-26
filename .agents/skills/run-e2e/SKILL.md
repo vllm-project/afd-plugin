@@ -192,8 +192,10 @@ Success means all selected cases pass with zero skips: seven for the GPU
 DeepSeek gate; four for the NPU DeepSeek gate or GPU Qwen3 MoE suite;
 three for the GPU Qwen3.6 MoE suite.
 The DeepSeek P2P entry collects 13 cases on GPU or seven on NPU. Its separate
-DeepEP M2N entry adds five GPU-only IDs even to an unfiltered NPU collection;
-select the intended entry or node IDs rather than running an unfiltered module.
+DeepEP M2N and FFN service entries, `test_deepseek_v2_lite_deepep_m2n` and
+`test_deepseek_v2_lite_deepep_m2n_ffn_service`, add nine GPU-only IDs (five
+and four) even to an unfiltered NPU collection; select the intended entry or
+node IDs rather than running an unfiltered module.
 GPU multi-pod entries now invoke the model module's `multi-pod` subcommand;
 follow the linked Kubernetes walkthrough for local checkpoint paths, per-pod
 acceptance records and the existing workload-only evidence scope.

@@ -175,7 +175,7 @@ F, `--backend gpu-deepep-m2n`, under `ffn_faas/platforms/gpu/`:
 - `GPUFFNEnvironment` selects the GPU, preflights afdEP and DeepGEMM, builds
   the F-only `VllmConfig` with `EngineArgs.from_cli_args` (`external_launcher`,
   DP = F ranks, TP 1, EP), selects
-  the FFN-only routed-experts architecture, pins vLLM's MoE backend to Triton
+  the FFN model (below), pins vLLM's MoE backend to Triton
   before any FusedMoE is built, and creates the F-only world through vLLM's
   `init_worker_distributed_environment`.
 - The AFD model registry selects the FFN model, as on the Worker path: the
