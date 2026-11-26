@@ -48,8 +48,8 @@ validation_paths:
   - "tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py"
   - "tests/e2e/models/qwen3_6/test_qwen3_6.py"
 upstream_refs:
-  - "vLLM 0.32.0 CUDA serving, MRV2 execution and shutdown interfaces"
-  - "vLLM 0.32.0 Ascend serving and shutdown interfaces"
+  - "vLLM 0.34.0 CUDA serving, MRV2 execution and shutdown interfaces"
+  - "vLLM 0.34.0 Ascend serving and shutdown interfaces"
   - "lm-evaluation-harness GSM8K task and local-completions API"
   - "pytest parameterized test IDs"
 verified_platform_refs:

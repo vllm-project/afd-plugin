@@ -63,6 +63,8 @@ def _load_functions(path, names, namespace):
 def dispatch_contract():
     # Native supplies the selected descriptor and agreement. The strict keyword
     # boundary rejects the retired dp_sync name instead of silently swallowing it.
+    skip_drafts_calls = []
+
     def dispatch(
         cudagraph_manager,
         num_reqs,
@@ -76,8 +78,10 @@ def dispatch_contract():
         parallel_config=None,
         allow_ubatching=False,
         uniform_decode=False,
+        allow_skip_drafts=False,
         dp_sync_state=None,
     ):
+        skip_drafts_calls.append(allow_skip_drafts)
         return cudagraph_manager, dp_sync_state
 
     native = SimpleNamespace(dispatch_cg_and_sync_dp=dispatch)
@@ -96,6 +100,7 @@ def dispatch_contract():
         native=native,
         camp2p=namespace["_use_camp2p_dp_padding"],
         async_dbo=namespace["use_async_cam_dbo_dispatch"],
+        skip_drafts_calls=skip_drafts_calls,
     )
 
 
@@ -114,8 +119,16 @@ def test_camp2p_reuses_native_agreement_and_restores_dispatch(
     )
     with expected_failure, dispatch_contract.camp2p(2, 1):
         result, reused = native.dispatch_cg_and_sync_dp(
-            descriptor, 1, counts[0], 1, 2, 0, dp_sync_state=agreement
+            descriptor,
+            1,
+            counts[0],
+            1,
+            2,
+            0,
+            allow_skip_drafts=True,
+            dp_sync_state=agreement,
         )
+        assert dispatch_contract.skip_drafts_calls == [True]
         assert result.num_tokens == (7 if mode == _GraphMode.NONE else 8)
         assert result.num_reqs == descriptor.num_reqs
         assert reused.epoch == agreement.epoch
@@ -155,8 +168,10 @@ def test_async_dbo_preserves_native_agreement_and_dp1_eligibility(
             parallel_config=parallel,
             allow_ubatching=allow_ubatching,
             uniform_decode=True,
+            allow_skip_drafts=True,
             dp_sync_state=agreement,
         )
+        assert dispatch_contract.skip_drafts_calls == [True]
         assert result.num_ubatches == (local_ubatches if dp_size == 1 else 1)
         assert result.num_tokens == tokens
         assert reused is agreement

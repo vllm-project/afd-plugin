@@ -102,21 +102,35 @@ The connector needs three components in addition to the plugin and vLLM:
    python -m pip uninstall -y afdep
    python -m pip install --no-deps \
      "afdep-comm @ git+https://github.com/afdEP/afdEP-comm.git@<tag pinned in pyproject.toml>"
-   python -m afdep doctor --build
    ```
 
-   afdEP-comm builds against NCCL with device headers. When NCCL comes from the
-   `nvidia-nccl` wheel, point `AFDEP_NCCL_ROOT` at it and add its `lib`
-   directory to `LD_LIBRARY_PATH` on both roles:
+   afdEP-comm 1.1.0 requires NCCL 2.30.7 or newer with device headers. When
+   NCCL comes from the `nvidia-nccl` wheel, point `AFDEP_NCCL_ROOT` at it and
+   add its `lib` directory to `LD_LIBRARY_PATH` on both roles.
+   See the [NCCL build check](https://github.com/afdEP/afdEP-comm/blob/741b9aa5364687ac84c5049f5c6239b8cae6a7eb/afdep/_build.py#L101-L125).
 
    ```bash
    NCCL=$(python -c "import nvidia.nccl; print(nvidia.nccl.__path__[0])")
    export AFDEP_NCCL_ROOT=$NCCL LD_LIBRARY_PATH=$NCCL/lib:${LD_LIBRARY_PATH:-}
    ```
 
+   The H20 PyTorch 2.14 build selected GCC 13.4 and compiled the host source
+   with `-std=c++20`. If the linker reports `cannot find -lcuda` on a host
+   with the versioned driver library, scope the toolkit's stub directory to
+   the build's `LIBRARY_PATH`. Keep the real driver library on the runtime
+   library path. The following uses the tested CUDA 13 directory layout.
+
+   ```bash
+   export CUDA_HOME=/usr/local/cuda-13.0
+   export CXX=/path/to/g++-13
+   export CUDAHOSTCXX="$CXX"
+   LIBRARY_PATH="$CUDA_HOME/targets/x86_64-linux/lib/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}" \
+     python -m afdep doctor --build
+   ```
+
 2. **DeepGEMM**, required by the default `deepgemm` expert backend. The
    connector uses the copy bundled in the vLLM wheel
-   (`vllm.third_party.deep_gemm`). Every vLLM `v0.32.0` CUDA build ships it,
+   (`vllm.third_party.deep_gemm`). Every vLLM `v0.34.0` CUDA build ships it,
    including the `vllm/vllm-openai` image, so no extra step is needed.
    A separately installed upstream `deep_gemm` package is not used by the
    connector (vLLM's own kernels prefer it when present).
@@ -159,7 +173,7 @@ AFD configuration is supplied through vLLM's `--additional-config` under the
 | `num_attention_ranks` | Attention DP x TP. |
 | `num_ffn_ranks` | FFN DP (FFN TP is 1). |
 | `compute_gate_on_attention` | Must be `true` on both roles. |
-| `afd_process_group_timeout_s` | AFD world join timeout, default 120 s. Raise it when one role loads weights much more slowly than the other. |
+| `afd_process_group_timeout_s` | AFD process-group timeout, default 120 s. Increase it when Attention cold startup and warmup take longer. The H20 Qwen3 validation used 600 s. |
 | `async` / `async_dp` | Must remain `false`. |
 
 ### `connector_extra_config`

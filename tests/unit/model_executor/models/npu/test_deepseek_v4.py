@@ -23,22 +23,13 @@ class _OtherImpl:
     """A different implementation has no DSA reservation protocol."""
 
 
-@pytest.fixture
-def construct_model(torch):
-    layers = importlib.import_module("tests.unit.fakes.model_layers")
-    nn = torch.nn
-
+def _compile_constructors(*names: str):
     # Execute the real constructors with CPU collaborators instead of importing
     # the NPU package and replacing its complete runtime module graph.
     path = (
         Path(__file__).resolve().parents[5]
         / "afd_plugin/model_executor/models/npu/deepseek_v4.py"
     )
-    names = {
-        "AFDDeepseekV4DecoderLayer",
-        "AFDDeepseekV4Model",
-        "AFDDeepseekV4ForCausalLM",
-    }
     constructors = []
     for node in ast.parse(path.read_text()).body:
         if isinstance(node, ast.ClassDef) and node.name in names:
@@ -51,7 +42,7 @@ def construct_model(torch):
                 and member.name == "__init__"
             ]
             constructors.append(node)
-    assert {node.name for node in constructors} == names
+    assert {node.name for node in constructors} == set(names)
     source = ast.Module(
         body=[
             ast.ImportFrom(
@@ -60,6 +51,18 @@ def construct_model(torch):
             *constructors,
         ],
         type_ignores=[],
+    )
+    return compile(ast.fix_missing_locations(source), str(path), "exec")
+
+
+@pytest.fixture
+def construct_model(torch):
+    layers = importlib.import_module("tests.unit.fakes.model_layers")
+    nn = torch.nn
+    constructors = _compile_constructors(
+        "AFDDeepseekV4DecoderLayer",
+        "AFDDeepseekV4Model",
+        "AFDDeepseekV4ForCausalLM",
     )
 
     def construct(
@@ -112,6 +115,23 @@ def construct_model(torch):
                 nn.ModuleList(factory(f"{prefix}.{i}") for i in range(count)),
             )
 
+        # Ascend 0.34 chooses DSA context parallelism from the topology. Its
+        # native Attention constructor rejects legacy DSA-specific keywords.
+        def make_attention(
+            vllm_config,
+            config,
+            max_position_embeddings=0,
+            cache_config=None,
+            quant_config=None,
+            prefix="",
+            topk_indices_buffer=None,
+            reduce_results=True,
+        ):
+            return layers.DSAAttention(
+                implementation=implementation,
+                max_position_embeddings=max_position_embeddings,
+            )
+
         native = SimpleNamespace(
             DeepseekV4DecoderLayer=layers.DeepseekV4Decoder,
             DeepseekV4Model=nn.Module,
@@ -120,10 +140,7 @@ def construct_model(torch):
             get_pp_group=lambda: SimpleNamespace(
                 is_first_rank=True, is_last_rank=last_rank
             ),
-            enable_dsa_cp=lambda: False,
-            DeepseekV4Attention=lambda **kwargs: layers.DSAAttention(
-                implementation=implementation, **kwargs
-            ),
+            DeepseekV4Attention=make_attention,
             DeepseekV4MoE=layers.DeepseekV4MoE,
             PPMissingLayer=nn.Identity,
             RMSNorm=lambda *args, **kwargs: nn.Identity(),
@@ -143,10 +160,76 @@ def construct_model(torch):
             "_refresh_ascend_fused_moe": lambda: None,
             "AFDDeepseekV4RemoteMoE": lambda **kwargs: nn.Identity(),
         }
-        exec(compile(ast.fix_missing_locations(source), str(path), "exec"), namespace)
+        exec(constructors, namespace)
         return namespace["AFDDeepseekV4ForCausalLM"](vllm_config=vllm_config)
 
     return construct
+
+
+@pytest.fixture
+def construct_gate(torch):
+    nn = torch.nn
+
+    def make_linear(input_size, output_size, *, bias, **_):
+        return nn.Linear(input_size, output_size, bias=bias)
+
+    namespace = {
+        "nn": nn,
+        "torch": torch,
+        "RemoteFFNProxy": nn.Identity,
+        "ReplicatedLinear": make_linear,
+    }
+    exec(_compile_constructors("AFDDeepseekV4AttentionGateRemoteMoE"), namespace)
+    gate = namespace["AFDDeepseekV4AttentionGateRemoteMoE"]
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(use_sequence_parallel_moe=False),
+    )
+
+    def construct(routing_config, layer_idx, is_draft_layer):
+        config = SimpleNamespace(
+            hidden_size=2,
+            vocab_size=4,
+            num_experts_per_tok=2,
+            n_routed_experts=3,
+            n_shared_experts=None,
+            norm_topk_prob=True,
+            **routing_config,
+        )
+        return gate(
+            config=config,
+            layer_idx=layer_idx,
+            prefix=f"model.layers.{layer_idx}.mlp",
+            vllm_config=vllm_config,
+            is_draft_layer=is_draft_layer,
+        )
+
+    return construct
+
+
+@pytest.mark.parametrize(
+    "routing_config, layer_idx, is_draft_layer, uses_hash",
+    [
+        ({"mlp_layer_types": ["moe", "hash_moe", "moe", "hash_moe"]}, 0, False, False),
+        ({"mlp_layer_types": ["moe", "hash_moe", "moe", "hash_moe"]}, 3, False, True),
+        ({"mlp_layer_types": ["hash_moe"], "num_hash_layers": 2}, 1, False, False),
+        ({"num_hash_layers": 2}, 1, False, True),
+        ({"mlp_layer_types": ["hash_moe"]}, 0, True, False),
+        ({}, 0, False, False),
+    ],
+)
+def test_gate_allocates_the_checkpoint_parameters_for_its_moe_type(
+    construct_gate, torch, routing_config, layer_idx, is_draft_layer, uses_hash
+):
+    state = construct_gate(routing_config, layer_idx, is_draft_layer).state_dict()
+    if uses_hash:
+        assert state["gate.tid2eid"].dtype == torch.int32
+        assert state["gate.tid2eid"].tolist() == [[0, 1], [1, 2], [2, 0], [0, 1]]
+        assert "gate.e_score_correction_bias" not in state
+    else:
+        assert "gate.tid2eid" not in state
+        correction_bias = state["gate.e_score_correction_bias"]
+        assert correction_bias.dtype == torch.float32
+        assert correction_bias.shape == (3,)
 
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])

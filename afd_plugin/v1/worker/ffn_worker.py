@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
     from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 logger = logging.getLogger(__name__)
 FFN_LOOP_JOIN_TIMEOUT_S = 5
@@ -70,9 +70,9 @@ class AFDFFNWorker(Worker):
     # or select its model architecture before allocating GPU resources.
     # Patch functionality: validate and select the AFD model before delegating
     # native device, distributed, workspace and runner initialization.
-    # Signature: matches vLLM v0.32.0 Worker.init_device exactly: (self).
+    # Signature: matches vLLM v0.34.0 Worker.init_device exactly: (self).
     # Upstream source: vllm/v1/worker/gpu_worker.py, Worker.init_device;
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
     # Delegation exception: the large native device/distributed setup remains
     # in super().init_device(); this override contains only AFD preflight.
     # Removal plan: remove when native worker startup supports AFD preflight.
@@ -102,10 +102,10 @@ class AFDFFNWorker(Worker):
         super().init_device()
         torch.accelerator.empty_cache()
 
-    # Upstream: vLLM 5df63a72, gpu_worker.py::Worker._make_model_runner.
+    # Upstream: vLLM 62d4bc32, gpu_worker.py::Worker._make_model_runner.
     # Select the connector-driven runner before native model loading; routed
     # executors also require the Triton expert-weight layout. The native factory
-    # annotates V1, so connector-driven V2 runners keep its return-type exception.
+    # returns the native V2 runner, while AFD returns a connector-driven runner.
     def _make_model_runner(self) -> GPUModelRunner:
         """Construct the connector-driven runner via the native factory hook."""
         afd_config = parse_afd_config(self.vllm_config, expected_role="ffn")
@@ -228,8 +228,8 @@ class AFDFFNWorker(Worker):
         self._ffn_shutdown_event = None
         self.raise_ffn_loop_error_if_any()
 
-    # Upstream source: vLLM v0.32.0, vllm/v1/worker/gpu_worker.py,
-    # Worker.shutdown; 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # Upstream source: vLLM v0.34.0, vllm/v1/worker/gpu_worker.py,
+    # Worker.shutdown; 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
     # Patch reason: the native worker does not own AFD's metadata receiver.
     # Patch functionality: stop that receiver before releasing native resources,
     # including when the joined loop reports an earlier failure.

@@ -21,6 +21,7 @@ from vllm.v1.worker.dp_utils import skip_dp_coordination
 from vllm.v1.worker.gpu import cudagraph_utils as v2_cudagraph_utils
 from vllm.v1.worker.gpu import model_runner as v2_model_runner
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
+from vllm_ascend.worker.v2.attn_utils import initialize_kernel_block_table_buffers
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
 
 from afd_plugin.compat.npu.profiler import (
@@ -96,7 +97,7 @@ def _use_afd_fullgraph_replay_hook(
         # ### PATCH START: publish one AFD pre-replay payload.
         if desc.num_ubatches > 1:
             # Native execute already prepared live stages and published their
-            # complete A/F transaction. Update their captured MLA records at
+            # complete A/F transaction. Resolve their captured graph tasks at
             # this graph-manager seam without publishing duplicate control.
             assert runner.ubatch_runner is not None
             return runner.ubatch_runner.run_fullgraph(self, desc)
@@ -144,9 +145,9 @@ def _use_camp2p_dp_padding(attention_size: int, ffn_size: int) -> Iterator[None]
     # Patch reason: native execute calls this module-level function before input
     # preparation; no runner method exposes that boundary.
     # Patch functionality: apply CAMP2P group padding to the agreed eager batch.
-    # Signature: matches vLLM v0.32.0 dispatch_cg_and_sync_dp exactly.
+    # Signature: matches vLLM v0.34.0 dispatch_cg_and_sync_dp exactly.
     # Upstream source: vllm/v1/worker/gpu/dp_utils.py;
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
     # Delegation exception: preserve native graph selection and DP collectives.
     # Removal plan: replace when native dispatch exposes a padding callback.
     def dispatch_cg_and_sync_dp(
@@ -162,6 +163,7 @@ def _use_camp2p_dp_padding(attention_size: int, ffn_size: int) -> Iterator[None]
         parallel_config: ParallelConfig | None = None,
         allow_ubatching: bool = False,
         uniform_decode: bool = False,
+        allow_skip_drafts: bool = False,
         dp_sync_state: DPSyncState | None = None,
     ) -> tuple[v2_cudagraph_utils.BatchExecutionDescriptor, DPSyncState | None]:
         desc, sync = original_dispatch(
@@ -177,6 +179,7 @@ def _use_camp2p_dp_padding(attention_size: int, ffn_size: int) -> Iterator[None]
             parallel_config=parallel_config,
             allow_ubatching=allow_ubatching,
             uniform_decode=uniform_decode,
+            allow_skip_drafts=allow_skip_drafts,
             dp_sync_state=dp_sync_state,
         )
         # ### PATCH START: equal CAMP2P strides for eager and graph fallback.
@@ -338,11 +341,13 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         if not self.connector.is_initialized:
             self.connector.init_afd_connector()
 
-    # Native MRV2 imports its factory by value; scope that exact binding while
-    # preserving Ascend's KV initialization (too large to copy).
+    # Native MRV2 imports its factory by value; scope that binding while
+    # preserving Ascend's KV initialization (too large to copy). The native
+    # runner reserves kernel mapping storage for its own builders, so extend
+    # the same allocation to the stage-local builders before graph capture.
     # Signature matches vllm_ascend/worker/v2/model_runner.py::
-    # NPUModelRunner.initialize_kv_cache at bd42eea0, which delegates to
-    # vllm/v1/worker/gpu/model_runner.py at 5df63a72.
+    # NPUModelRunner.initialize_kv_cache at 7dcdb690, which delegates to
+    # vllm/v1/worker/gpu/model_runner.py at 62d4bc3c.
     # Restore the alias even on failure.
     def initialize_kv_cache(
         self,
@@ -352,9 +357,27 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         # ### PATCH START: create the native NPU ubatch adapter.
         with use_npu_ubatch_factory(self):
             super().initialize_kv_cache(kv_cache_config, kv_cache_allocation_context)
+        if self.ubatch_runner is not None:
+            # Use the native request capacity, including FIA's padding row,
+            # and the actual manager widths before any graph uses these tensors.
+            max_metadata_reqs = (
+                self.pcp_manager.max_num_local_reqs
+                if self.pcp_manager is not None
+                else self.max_num_reqs
+            ) + 1
+            initialize_kernel_block_table_buffers(
+                (
+                    group
+                    for stage in self.ubatch_runner.stage_attn_groups
+                    for groups in stage
+                    for group in groups
+                ),
+                max_metadata_reqs,
+                [table.gpu.shape[1] for table in self.block_tables.block_tables],
+            )
         # ### PATCH END: create the native NPU ubatch adapter.
 
-    # Patch reason: vLLM 5df63a72 prepares FULL graph inputs before each warmup
+    # Patch reason: vLLM 62d4bc3c prepares FULL graph inputs before each warmup
     # and formal capture forward, outside torch.cuda.graph, but does not expose
     # that lifecycle to AFD's control plane.
     # Patch functionality: temporarily wrap the exact upstream input-preparation
@@ -364,9 +387,9 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     # Signature: matches Ascend NPUModelRunner.capture_model and its vLLM
     # GPUModelRunner.capture_model delegate, including profile_only.
     # Upstream: vllm_ascend/worker/v2/model_runner.py at
-    # bd42eea01d8312c4df469fabaed45f77a12df4d3; delegated
+    # 7dcdb690caf879a17ab07382880d5773f5202e20; delegated
     # vllm/v1/worker/gpu/model_runner.py at
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
     # Delegation exception: Ascend's wrappers and native capture remain in
     # super(); this wrapper owns only the temporary AFD lifecycle seam.
     # Removal/upstream plan: delete this wrapper when vLLM exposes graph
@@ -395,18 +418,12 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         previous_is_warmup = self._is_warmup
         previous_is_graph_capturing = self._afd_is_graph_capturing
         previous_is_graph_replaying = self._afd_is_graph_replaying
-        # Pinned Ascend patch_v2/patch_input_batch.py already supplies
+        # Ascend patch/worker/patch_input_batch.py already supplies
         # AscendInputBatch in both native dummy/capture branches.
         try:
             with (
                 _use_afd_capture_input_preparation(self, event_tracker),
-                _use_afd_ubatch_preparation(
-                    self,
-                    event_tracker,
-                    self.ubatch_runner.record_capture_graph_params
-                    if self.ubatch_runner is not None
-                    else None,
-                ),
+                _use_afd_ubatch_preparation(self, event_tracker),
                 use_afd_metadata_provider(
                     self.install_afd_metadata_on_forward_context,
                 ),

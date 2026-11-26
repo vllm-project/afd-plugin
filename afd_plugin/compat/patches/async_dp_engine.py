@@ -1,28 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Patches for AFD async-DP engine scheduling.
+"""Ascend patches for AFD async-DP engine scheduling.
 
 This module patches:
 1. ``vllm.v1.engine.core.EngineCoreProc.run_engine_core``
 2. ``vllm.v1.engine.utils.launch_core_engines``
-3. ``vllm.v1.engine.core_client.DPAsyncMPClient.add_request_async``
 
 Why:
-    vLLM 0.32.0's native MoE DP path uses ``DPEngineCoreProc`` and DP wave
+    vLLM 0.34.0's native MoE DP path uses ``DPEngineCoreProc`` and DP wave
     notifications. AFD async-DP Attention ranks are connector-driven and must
     step independently while keeping the original DP/EP topology for expert
     placement and weight loading.
 
 How:
-    AFD async configs are selected by plugin-owned
-    ``additional_config["afd"]["async"]``. Attention-side MoE DP engine
-    processes instantiate ``EngineCoreProc`` instead of ``DPEngineCoreProc``;
-    launch disables wave coordination on the DP coordinator, which vLLM
-    0.32.0 also uses to skip lockstep stat aggregation, and client
-    ``FIRST_REQ`` wakeups are skipped for AFD async configs.
+    For Async CAM Attention, AFD selects async-DP through
+    ``additional_config["afd"]["async_dp"]``. Its MoE DP engine processes
+    instantiate ``EngineCoreProc`` instead of ``DPEngineCoreProc``. The DP
+    coordinator keeps publishing request counts for load balancing with wave
+    coordination disabled for these ranks.
+    vLLM 0.34 starts waves in ``DPEngineCoreProc.add_request``. The request
+    client uses the native implementation.
 
 Future plan:
-    Remove the remaining patch when vLLM exposes an external async-DP
+    Remove the remaining patches when vLLM exposes an external async-DP
     scheduling hook selectable by plugin config. The copied DP-coordinator
     patches that existed for vLLM 0.26.0 were removed because vLLM absorbed
     the non-lockstep stats handling upstream (#49204, present since 0.28.0):
@@ -32,6 +32,7 @@ Future plan:
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
@@ -41,7 +42,6 @@ import vllm.v1.engine.core_client as core_client_module
 import vllm.v1.engine.utils as engine_utils_module
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import EngineCoreProc
-from vllm.v1.engine.core_client import DPAsyncMPClient
 
 from afd_plugin.compat.vllm import (
     is_target_vllm_compatible as _is_target_vllm_compatible,
@@ -52,12 +52,11 @@ if TYPE_CHECKING:
     from multiprocessing.queues import Queue
 
     from vllm.config import VllmConfig
-    from vllm.v1.engine import EngineCoreRequest
     from vllm.v1.engine.utils import CoreEngineLaunch, EngineZmqAddresses
     from vllm.v1.executor import Executor
 
 
-# Upstream source: vLLM v0.32.0 (5df63a7203cdb9328d824a27b682e77c7b9928be),
+# Upstream source: vLLM v0.34.0 (62d4bc3c7e33b1b6c906e233e6af2d3506c482ca),
 # vllm/v1/engine/core.py::EngineCoreProc.run_engine_core.
 # Patch reason: vLLM's MoE DP engine process uses DPEngineCoreProc, but AFD
 # async Attention ranks are connector-driven and must not run DP wave logic.
@@ -133,6 +132,8 @@ def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
                 "[shutdown] EngineCore: trigger received signal=%s",
                 signal_name,
             )
+            if signum == engine_core_module.signal.SIGTERM:
+                engine_core_module.get_watch_dog().handle_failure(signal_name)
             # Record the request first so it survives the construction window.
             shutdown_requested = True
             if engine_core is not None:
@@ -184,6 +185,9 @@ def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         # later signal can still wake an idle busy loop.
         signal_callback = engine_core_module.SignalCallback(wakeup_engine)
 
+        engine_core_module.start_watch_dog(
+            f"engine_{dp_rank}", vllm_config.watchdog_config, engine_core_module.logger
+        )
         engine_core.run_busy_loop()
 
     except SystemExit as e:
@@ -225,12 +229,12 @@ def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
                 engine_core_module.gc.freeze()
 
 
-# Upstream source: vLLM v0.32.0 (5df63a7203cdb9328d824a27b682e77c7b9928be),
+# Upstream source: vLLM v0.34.0 (62d4bc3c7e33b1b6c906e233e6af2d3506c482ca),
 # vllm/v1/engine/utils.py::launch_core_engines.
 # Patch reason: vLLM enables MoE DP wave coordination when launching DP cores,
 # while AFD async-DP only needs coordinator stats.
 # Patch functionality: preserve upstream engine launch behavior but disable wave
-# coordination for AFD async-DP configs.
+# coordination for AFD async-DP Attention configs.
 # Signature: matches upstream; no added parameters.
 @contextmanager
 def launch_core_engines(
@@ -266,12 +270,39 @@ def launch_core_engines(
         vllm_config.needs_dp_coordinator and not offline_mode and dp_rank == 0
     )
 
+    coord_store = None
+
+    create_coord_store = (
+        parallel_config.enable_elastic_ep
+        and parallel_config.data_parallel_backend != "ray"
+        and dp_rank == 0
+        and not parallel_config._coord_store_port
+    )
+
+    if create_coord_store:
+        from vllm.distributed.utils import create_tcp_store
+
+        coord_store = create_tcp_store(
+            host,
+            0,
+            is_master=True,
+            world_size=-1,
+            wait_for_workers=False,
+        )
+        parallel_config._coord_store_port = coord_store.port
+        engine_utils_module.logger.info(
+            "Created Elastic EP coordination TCPStore on %s:%d",
+            host,
+            coord_store.port,
+        )
+
     if run_coordinator:
         coordinator = engine_utils_module.DPCoordinator(
             parallel_config,
             # ### PATCH START: AFD async-DP coordinator wave mode
             enable_wave_coordination=(
-                vllm_config.model_config.is_moe and not is_afd_async_dp(vllm_config)
+                vllm_config.model_config.is_moe
+                and not _is_afd_async_attention_config(vllm_config)
             ),
             # ### PATCH END: AFD async-DP coordinator wave mode
             logging_config=vllm_config.logging_config,
@@ -287,12 +318,13 @@ def launch_core_engines(
         engine_utils_module.logger.info(
             "Started DP Coordinator process (PID: %d)", coordinator.proc.pid
         )
+        if coord_store is not None:
+            coordinator._coord_store = coord_store
     else:
         coordinator = None
 
     # Hold a coordination TCPStore (alive for this frame) so engines pick DP
     # master ports at bind time; pre-allocated ports can be taken before use.
-    coord_store = None
     if (
         dp_size > 1
         and not offline_mode
@@ -391,6 +423,13 @@ def launch_core_engines(
         else:
             local_engine_manager = None
 
+        if (
+            coord_store is not None
+            and coordinator is None
+            and (local_engine_manager is not None)
+        ):
+            local_engine_manager._coord_store = coord_store
+
         launch = engine_utils_module.CoreEngineLaunch(
             local_engine_manager, coordinator, addresses, tensor_queue
         )
@@ -403,43 +442,6 @@ def launch_core_engines(
             vllm_config.cache_config,
             launch,
         )
-
-
-# Upstream source: vLLM v0.32.0 (5df63a7203cdb9328d824a27b682e77c7b9928be),
-# vllm/v1/engine/core_client.py::DPAsyncMPClient.add_request_async.
-# Patch reason: vLLM sends FIRST_REQ wakeups to coordinate DP waves, which AFD
-# async-DP engines intentionally do not use.
-# Patch functionality: preserve request routing and stats updates while skipping
-# FIRST_REQ for AFD async-DP configs.
-# Signature: matches upstream; no added parameters.
-async def add_request_async(
-    self,
-    request: EngineCoreRequest,
-) -> None:
-    """Skip the DP wave ``FIRST_REQ`` notification for AFD async-DP."""
-
-    self._ensure_stats_update_task()
-
-    request.current_wave = self.current_wave
-    request.client_index = self.client_index
-
-    chosen_engine = self.get_core_engine_for_request(request)
-    to_await = self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)
-    # ### PATCH START: AFD async-DP request wakeup
-    # Async-DP engines step independently, so skip the coordinator FIRST_REQ
-    # wakeup while preserving normal routing.
-    if not self.engines_running and not is_afd_async_dp(self.vllm_config):
-        req_msg = core_client_module.msgspec.msgpack.encode(
-            ("FIRST_REQ", chosen_engine),
-        )
-        await self.first_req_send_socket.send(req_msg)
-    # ### PATCH END: AFD async-DP request wakeup
-
-    await to_await
-
-    # The output queue task delivers completed responses and is independent of
-    # the DP-wave FIRST_REQ coordination skipped above.
-    self._ensure_output_queue_task()
 
 
 def _is_afd_async_attention_config(vllm_config: VllmConfig) -> bool:
@@ -461,13 +463,15 @@ def apply_async_dp_engine_patch() -> bool:
     AFD async Attention, so non-AFD and FFN Ascend scheduling remain untouched.
     """
 
-    if not _is_target_vllm_compatible():
+    if not _is_target_vllm_compatible("npu"):
         return False
 
     EngineCoreProc.run_engine_core = staticmethod(run_engine_core)
     engine_utils_module.launch_core_engines = launch_core_engines
     core_client_module.launch_core_engines = launch_core_engines
-    DPAsyncMPClient.add_request_async = add_request_async
+    # The CLI can bind the launch function before general plugins are loaded.
+    if (serve_module := sys.modules.get("vllm.entrypoints.cli.serve")) is not None:
+        serve_module.launch_core_engines = launch_core_engines
     engine_core_module.logger.debug("AFD async-DP engine patch applied")
     return True
 

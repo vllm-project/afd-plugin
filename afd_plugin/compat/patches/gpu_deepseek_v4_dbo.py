@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Temporary CUDA DeepSeek-V4 DBO fixes for vLLM 0.32.0.
+"""Temporary CUDA DeepSeek-V4 DBO fixes for vLLM 0.34.0.
 
-Upstream pin: 5df63a7203cdb9328d824a27b682e77c7b9928be.
+Upstream pin: 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
 
 Removal tracking:
 * Input alignment: no published upstream PR. Remove the aligned stage storage
@@ -38,6 +38,8 @@ from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -123,7 +125,7 @@ def _use_v4_ubatch_preparation(
     # Patch functionality: retain native stage-zero inputs where their fixed
     # layout is aligned; stage other inputs before native metadata builders.
     # Stable addresses are refreshed before FULL replay as well as eager/capture.
-    # Signature: matches DefaultModelState.prepare_attn at vLLM 5df63a7,
+    # Signature: matches DefaultModelState.prepare_attn at vLLM 62d4bc3,
     # vllm/v1/worker/gpu/model_states/default.py. Delegation retains native
     # metadata construction; remove when native stage buffers meet V4's ABI.
     def prepare_attn(
@@ -165,7 +167,7 @@ def _use_v4_ubatch_preparation(
     # Patch reason: native model-input slicing recreates the unaligned view.
     # Patch functionality: bind the model call to the same persistent positions
     # prepared for this stage; native threads, streams and finish stay intact.
-    # Signature: matches UBatchRunner.begin_capturable_run at vLLM 5df63a7,
+    # Signature: matches UBatchRunner.begin_capturable_run at vLLM 62d4bc3,
     # vllm/v1/worker/gpu/ubatch_utils.py. The callable accepts the native open
     # model-input dictionary. Remove with the aligned V4 preparation adapter.
     def begin_capturable_run(
@@ -194,16 +196,19 @@ def _use_v4_ubatch_preparation(
     # indexer builders, restore it even on failure, and bind aligned live/capture
     # slots. Native slicing, metadata construction and FULL replay stay native.
     # Signature: matches UBatchRunner.prepare in vllm/v1/worker/gpu/ubatch_utils.py
-    # at vLLM 5df63a7203cdb9328d824a27b682e77c7b9928be; indexer.py at the same pin
-    # owns the physical-capacity buffers and planner refill. Delegation avoids
-    # copying the full native preparation. Remove when native propagates its SM
-    # budget (#60732) and provides stable aligned V4 stage inputs.
+    # at vLLM 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca, where `cg_mode` became
+    # `batch_desc` and `dp_sync_state` was inserted before `for_capture`;
+    # indexer.py at the same pin owns the physical-capacity buffers and planner
+    # refill. Delegation avoids copying the full native preparation. Remove when
+    # native propagates its SM budget (#60732) and provides stable aligned V4
+    # stage inputs.
     def prepare(
         self,
         input_batch: InputBatch,
         block_tables: tuple[torch.Tensor, ...],
         slot_mappings: torch.Tensor,
-        cg_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        batch_desc: BatchExecutionDescriptor,
+        dp_sync_state: DPSyncState | None = None,
         for_capture: bool = False,
     ) -> UBatchState:
         # ### PATCH START: V4 stage input and indexer preparation.
@@ -217,14 +222,19 @@ def _use_v4_ubatch_preparation(
                             indexer_budgets.append((builder, builder.num_sms))
                             builder.num_sms = self.sm_control.compute_sms
             prepared = original_ubatch_prepare(
-                input_batch, block_tables, slot_mappings, cg_mode, for_capture
+                input_batch,
+                block_tables,
+                slot_mappings,
+                batch_desc,
+                dp_sync_state,
+                for_capture,
             )
         finally:
             # Reverse order also restores correctly if groups share a builder.
             for builder, num_sms in reversed(indexer_budgets):
                 builder.num_sms = num_sms
         # FULL replay uses the context captured by the graph, not this fresh one.
-        if cg_mode != CUDAGraphMode.FULL or for_capture:
+        if batch_desc.cg_mode != CUDAGraphMode.FULL or for_capture:
             for stage, context in enumerate(prepared.forward_contexts):
                 slots = inputs.slot_mappings[stage]
                 if slots is not None:
@@ -269,7 +279,7 @@ def _use_flashmla_workspace_slot(
     # Patch functionality: route only this manager's allocation-only reservation
     # to a configured slot, then restore its exact instance/class lookup.
     # Signature: matches WorkspaceManager._get_workspace_id(self) -> int in
-    # vllm/v1/worker/workspace.py, 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # vllm/v1/worker/workspace.py, 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
     # Remove with #61584 only after V4 uses its all-slot reservation API.
     def _get_workspace_id(self) -> int:
         return slot
@@ -297,7 +307,7 @@ def _reserve_flashmla_ubatch_workspace(model: nn.Module, config: VllmConfig) -> 
         return
     manager = current_workspace_manager()
     # Native forward_mqa's NoMeta branch (nvidia/flashmla.py:105-131, vLLM
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be) reserves its configured bound,
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca) reserves its configured bound,
     # zeros only this small output, and returns before KV/kernels/Indexer/FFN.
     # Visit all real layers: the first SWA-only layer does not bound C4 demand.
     # Known manager geometry is the pin-local exception above, not a new policy.
@@ -321,13 +331,13 @@ class _PaddingStageGuard(DeepseekV4Attention):
     """Skip native V4 attention on a padding-only AFD DBO stage."""
 
     # Patch reason: native V4 attention asserts on a padding-only decode stage
-    # because no tile scheduler exists for zero actual tokens (vLLM 5df63a7,
+    # because no tile scheduler exists for zero actual tokens (vLLM 62d4bc3,
     # vllm/models/deepseek_v4/nvidia/flashmla.py, forward_mqa/_forward_decode).
     # Patch functionality: return zero attention output for that stage, so the
     # native decoder layer still runs its mHC and remote FFN steps. Graph
     # capture keeps full attention because native dummy inputs give every
     # stage a positive real extent.
-    # Signature: matches DeepseekV4Attention.forward at vLLM 5df63a7,
+    # Signature: matches DeepseekV4Attention.forward at vLLM 62d4bc3,
     # vllm/models/deepseek_v4/attention.py; no added parameters.
     # Delegation: other stages call the native forward through super() instead
     # of a copy. A copy would bring back the duplicated upstream code that #599
@@ -353,7 +363,7 @@ class _PaddingStageGuard(DeepseekV4Attention):
         return super().forward(positions, hidden_states, llama_4_scaling)
 
 
-# One subclass per class that vLLM 5df63a7's _select_dsv4_attn_cls can return
+# One subclass per class that vLLM 62d4bc3's _select_dsv4_attn_cls can return
 # (vllm/models/deepseek_v4/nvidia/model.py). Subclasses keep the native weight
 # names, backend and isinstance checks.
 class AFDDeepseekV4FlashMLAAttention(_PaddingStageGuard, DeepseekV4FlashMLAAttention):

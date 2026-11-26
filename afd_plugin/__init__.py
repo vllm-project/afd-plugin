@@ -176,10 +176,13 @@ def register_afd() -> None:
     # the private A5 vendor visible before any of the runtime patch imports.
     prepare_afd_ascend950_vendor()
 
+    from vllm.platforms import current_platform
+
+    device_type = current_platform.device_type
     try:
         from afd_plugin.compat.vllm import assert_vllm_version_supported
 
-        assert_vllm_version_supported(strict=False)
+        assert_vllm_version_supported(strict=False, device_type=device_type)
     except Exception:
         _logger.debug(
             "AFD plugin: vLLM version check could not be completed",
@@ -187,8 +190,10 @@ def register_afd() -> None:
         )
 
     try:
-        import afd_plugin.compat.patches.async_dp_engine  # noqa: F401
-        import afd_plugin.compat.patches.async_dp_forward_context  # noqa: F401
+        if device_type == "npu":
+            import afd_plugin.compat.patches.async_dp_engine  # noqa: F401
+            import afd_plugin.compat.patches.async_dp_forward_context  # noqa: F401
+
         import afd_plugin.compat.patches.config_validation  # noqa: F401
         import afd_plugin.compat.patches.engine_core  # noqa: F401
     except Exception:
@@ -216,9 +221,7 @@ def register_afd() -> None:
     # EngineCore constructs Ascend schedulers before handshake revalidation or
     # AFD worker startup. Install the namespace factory at plugin registration
     # so direct scheduler calls and already imported aliases accept AFD settings.
-    from vllm.platforms import current_platform
-
-    if current_platform.device_type == "npu":
+    if device_type == "npu":
         from afd_plugin.compat.patches.npu.ascend_config import (
             apply_afd_ascend_config_patch,
         )

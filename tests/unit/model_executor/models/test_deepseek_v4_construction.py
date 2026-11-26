@@ -39,7 +39,9 @@ def _vllm_config(*, layer_count: int = 2):
         hc_sinkhorn_iters=3,
         hidden_size=8,
         index_topk=4,
-        num_hash_layers=1,
+        # vLLM 0.34 reads the hash-MoE layer count off the layer schedule;
+        # transformers' DeepseekV4Config has no num_hash_layers field.
+        mlp_layer_types=["hash_moe"],
         num_hidden_layers=layer_count,
         rms_norm_eps=1e-6,
         vocab_size=32,
@@ -304,3 +306,5 @@ def test_v4_ffn_layer_passes_hash_layer_contract_to_moe(
             "num_hash_layers": 1,
         }
     ]
+    # The count comes from the layer schedule, the same source the native
+    # 0.34 decoder layer uses (nvidia/model.py:614).

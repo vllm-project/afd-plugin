@@ -41,8 +41,8 @@ validation_paths:
   - "tests/e2e/models/deepseek_v4_flash/test_gpu.py"
   - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
 upstream_refs:
-  - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
-  - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "GPU: vLLM 0.34.0 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca"
+  - "NPU target: vLLM 0.34.0 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca"
   - "vLLM vllm.compilation and vllm.v1.worker.gpu V2 graph/ubatching APIs"
   - "vLLM-Ascend ACL graph, forward-context, and ModelRunnerV2 APIs in the tested environment"
   - "PyTorch CUDA, torch_npu, CMake, and Ascend CANN build interfaces used by the repository"
@@ -285,10 +285,9 @@ is Attention-local; without it, the CAM boundary shards replicated Attention
 tokens and restores the FFN result with TP all-gather.
 
 `NPUUBatchRunner` creates independent Ascend metadata builders per child and
-keeps stable stage-owned block-table buffers for SFA/DSA builders that clear
-padded rows in place. Plain MLA retains native persistent table views, because
-its graph updater keeps the captured table address. Stage-owned RoPE buffers
-isolate builders while preserving the addresses consumed by FULL graphs. Its scoped input adapter applies native request truncation to
+keeps stable stage-owned block tables and RoPE buffers for graph capture and
+replay. Stage block tables match the native KV cache group capacities.
+Its scoped input adapter applies native request truncation to
 Ascend's exact CPU sequence lengths as well as the native upper bounds. Native
 NPU contexts update both the NPU stream and vLLM's thread-local stream cache.
 A failed child aborts the bounded startup barrier and wakes its peer; a failed
@@ -304,23 +303,14 @@ groups and also keeps Attention TP peers aligned.
 NPU Attention follows the upstream ACL graph dispatcher while adding AFD
 metadata and, for synchronous CAMP2P, control-plane coordination. Native MRV2
 owns single/two-stage graph descriptors, warmup/capture, persistent outputs and
-replay. AFD retains formal per-stage MLA registries by the complete native descriptor, including
-LoRA specialization. Synchronous CAMP2P publishes one matching FFN control
+replay. Synchronous CAMP2P publishes one matching FFN control
 payload before each warmup, capture or live replay; Async CAM stages local
 AFD metadata without sending DP control messages.
 
-For MLA DBO full graphs, each stage records its own upstream `GraphParams`.
-`merge_mla_graph_params()` validates identical layer order and record counts,
-requires the two stages to share one FIA workspace, and merges records in
-layer-major/stage-minor order. During the upstream updater call, the merged
-registry is exposed only through the active forward context under
-`afd_mla_graph_params`; the compatibility resolver falls back to upstream
-process-global state outside that scope.
-
-This protocol belongs to the plain MLA backend alone. Upstream's sparse (SFA)
-and compressor (DSA) backends implement `update_graph_params()` as a no-op and
-register no FIA workspace, so those models, DeepSeek V4 among them, take the
-generic two-stage path with no MLA registries.
+For MLA DBO full graphs, AFD passes the active Ascend `UpdatableGraph` to
+both capture threads and tags each native task provider with its stage ID.
+On replay the provider resolves the current metadata for its own stage.
+Ascend owns the task events, workspace and update order.
 
 With synchronous CAMP2P, the NPU V2 runner supports eager, `FULL`, and
 `FULL_DECODE_ONLY`; Async CAM additionally admits DSV4 target native
@@ -333,9 +323,8 @@ AFD metadata. Both install an instance-scoped pre-replay hook because native
 full replay creates no `ForwardContext`. Native `NPUUBatchRunner` owns
 preparation, execution and merge for eager and graph DBO. Plain MLA graph DBO
 requires `FULL_DECODE_ONLY`; SFA/DSA
-accepted modes still require model-specific qualification. Native two-stage capture shares the ordinary descriptor's FIA
-workspace; replay merges captured records with current metadata for Ascend
-updates. Each child carries its actual stage ID for the opaque CAMP2P HCCL
+accepted modes still require model-specific qualification.
+Each child carries its actual stage ID for the opaque CAMP2P HCCL
 group lookup. Async CAM enables eager native DBO at DP1; it has no separate
 MoE stage pipeline. Async FFN FULL accepts eager Attention DBO; FFN stays
 outside Attention's native DBO thread schedule.

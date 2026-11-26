@@ -27,8 +27,8 @@ validation_paths:
   - "tests/gpu/**"
   - "tests/npu/test_async_cam_connector.py"
 upstream_refs:
-  - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
-  - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "GPU: vLLM 0.34.0 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca"
+  - "NPU target: vLLM 0.34.0 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca"
   - "vLLM vllm.forward_context.DPMetadata"
   - "vLLM vllm.distributed.parallel_state"
   - "PyTorch torch.distributed process-group APIs used by the pinned runtime"

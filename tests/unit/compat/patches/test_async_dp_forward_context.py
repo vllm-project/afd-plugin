@@ -36,8 +36,9 @@ def _config(*, connector: str = "CAMAsyncAFDConnector", async_dp: bool = True):
     )
 
 
-def _install_fake_vllm_forward_context(monkeypatch: pytest.MonkeyPatch):
+def _install_fake_vllm_forward_context(monkeypatch: pytest.MonkeyPatch, version: str):
     vllm_module = types.ModuleType("vllm")
+    vars(vllm_module)["__version__"] = version
     config_module = types.ModuleType("vllm.config")
     forward_module = types.ModuleType("vllm.forward_context")
     vllm_v1_module = types.ModuleType("vllm.v1")
@@ -136,16 +137,19 @@ def _install_fake_vllm_forward_context(monkeypatch: pytest.MonkeyPatch):
     return forward_module, dp_utils_module, CUDAGraphMode
 
 
-def _load_patch_module(monkeypatch: pytest.MonkeyPatch):
-    _install_fake_vllm_forward_context(monkeypatch)
+def _load_patch_module(monkeypatch: pytest.MonkeyPatch, *, version: str = "0.34.0"):
+    forward_module, _, _ = _install_fake_vllm_forward_context(monkeypatch, version)
     # Keep fake forward contexts out of real consumers and the adapter cache.
     for name in (
-        "vllm.v1.worker.gpu_model_runner",
+        "vllm.v1.worker.gpu.cudagraph_utils",
+        "vllm.v1.worker.gpu.kv_connector",
         "vllm.v1.worker.gpu.model_runner",
-        "vllm.v1.worker.kv_connector_model_runner_mixin",
-        "vllm_ascend.ascend_forward_context",
+        "vllm_ascend.worker.v2.aclgraph_utils",
     ):
         monkeypatch.delitem(sys.modules, name, raising=False)
+    ascend_alias = types.ModuleType("vllm_ascend.ascend_forward_context")
+    vars(ascend_alias)["set_forward_context"] = forward_module.set_forward_context
+    monkeypatch.setitem(sys.modules, ascend_alias.__name__, ascend_alias)
     source = (
         Path(__file__).resolve().parents[4]
         / "afd_plugin/compat/patches/async_dp_forward_context.py"
@@ -160,8 +164,9 @@ def _load_patch_module(monkeypatch: pytest.MonkeyPatch):
 def test_async_dp_forward_context_skips_dp_metadata(monkeypatch):
     _load_patch_module(monkeypatch)
     forward_module = sys.modules["vllm.forward_context"]
+    ascend_alias = sys.modules["vllm_ascend.ascend_forward_context"]
 
-    with forward_module.set_forward_context(
+    with ascend_alias.set_forward_context(
         attn_metadata=object(),
         vllm_config=_config(),
         num_tokens=4,
@@ -169,6 +174,7 @@ def test_async_dp_forward_context_skips_dp_metadata(monkeypatch):
         context = forward_module.current_forward_context
         assert context.dp_metadata is None
         assert context.additional_kwargs["platform"]["dp_metadata"] is None
+        assert context.batch_descriptor.num_tokens == 4
 
 
 def test_async_dp_forward_context_preserves_non_async_path(monkeypatch):
@@ -183,5 +189,17 @@ def test_async_dp_forward_context_preserves_non_async_path(monkeypatch):
         context = forward_module.current_forward_context
         assert context.dp_metadata is not None
         assert context.dp_metadata.num_tokens == 4
-
         assert context.dp_metadata.num_tokens_across_dp == "tokens"
+        assert context.batch_descriptor.num_tokens == 4
+
+
+def test_non_target_vllm_keeps_native_forward_context_bindings(monkeypatch):
+    _load_patch_module(monkeypatch, version="0.32.0")
+    forward_module = sys.modules["vllm.forward_context"]
+
+    with forward_module.set_forward_context(
+        attn_metadata=object(),
+        vllm_config=_config(connector="P2pNcclAFDConnector", async_dp=False),
+        num_tokens=4,
+    ):
+        assert forward_module.current_forward_context is None

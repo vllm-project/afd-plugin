@@ -696,14 +696,27 @@ def build_vllm_command(
             )
         if args.use_decode_bench_connector:
             cmd.extend(["--kv-transfer-config", decode_bench_connector_config()])
-        cmd.extend(args.attention_vllm_arg)
+        role_vllm_args = args.attention_vllm_arg
     else:
         if serves_api:
             cmd.extend(
                 ["--host", args.api_host, "--port", str(ffn_api_port(args))],
             )
-        cmd.extend(args.ffn_vllm_arg)
-    cmd.extend(args.common_vllm_arg)
+        role_vllm_args = args.ffn_vllm_arg
+
+    extra_vllm_args = [*role_vllm_args, *args.common_vllm_arg]
+    if serves_api:
+        cmd.extend(extra_vllm_args)
+    else:
+        # vLLM defaults to zero API servers in headless mode.
+        arguments = iter(extra_vllm_args)
+        for argument in arguments:
+            option, separator, _ = argument.partition("=")
+            if option.replace("_", "-") == "--api-server-count":
+                if not separator:
+                    next(arguments, None)
+            else:
+                cmd.append(argument)
     return cmd
 
 

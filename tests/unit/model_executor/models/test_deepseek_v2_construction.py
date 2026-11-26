@@ -41,9 +41,7 @@ def construction_env(monkeypatch):
     }
 
     def bind(stage_type):
-        # vLLM 0.30 resolves MoE layers with isinstance() (e.g.
-        # is_model_fused_shared_expert_compatible), so the native stand-ins
-        # must be real classes, not callable factories.
+        # Native shared-expert layer discovery uses isinstance().
         class _BoundStage(stage_type):  # type: ignore[valid-type,misc]
             def __init__(self, *args, **kwargs):
                 super().__init__(calls, *args, **kwargs)
@@ -604,6 +602,35 @@ def test_model_constructor_uses_role_aware_layers(
     assert model.hidden_size == vllm_config.model_config.hf_config.hidden_size
     assert model.use_mha
     assert model.num_redundant_experts == 0
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_npu_role_local_model_exposes_shared_expert_layers_to_native_loader(
+    monkeypatch,
+    construction_env,
+    fused,
+):
+    def load_weights(model, weights):
+        assert model.fused_shared_expert_layers == (
+            frozenset({1}) if fused else frozenset()
+        )
+        return {name for name, _ in weights}
+
+    monkeypatch.setattr(adapter.native.DeepseekV2Model, "load_weights", load_weights)
+    monkeypatch.setattr(
+        adapter, "parse_afd_config", lambda *_args, **_kwargs: AFDConfig(role="ffn")
+    )
+    monkeypatch.setattr(
+        adapter.native.DeepseekV2MoE,
+        "is_fused_shared_expert_enabled",
+        fused,
+        raising=False,
+    )
+    _patch_model_constructor_dependencies(monkeypatch, construction_env)
+    model = adapter.AFDDeepseekV2Model(vllm_config=_vllm_config(), prefix="model")
+    weight_name = "layers.1.mlp.shared_experts.down_proj.weight"
+
+    assert model.load_weights([(weight_name, torch.empty(1))]) == {weight_name}
 
 
 def test_afd_alias_without_activation_fails_before_construction(monkeypatch):

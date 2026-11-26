@@ -9,7 +9,6 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
-from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config import update_config as update_vllm_config
 from vllm.distributed.parallel_state import get_world_group, graph_capture
@@ -128,7 +127,7 @@ class GPUFFNModelRunner:
     def profile_run(self) -> None:
         pass
 
-    # Patch reason: vLLM 0.32.0 Worker.determine_available_memory calls
+    # Patch reason: vLLM 0.34.0 Worker.determine_available_memory calls
     # ``self.model_runner.profile_cudagraph_memory()`` on CUDA when the compile
     # config enables CUDA graphs (gpu_worker.py), and GPUFFNModelRunner does
     # not inherit that method from any native runner.
@@ -136,11 +135,11 @@ class GPUFFNModelRunner:
     # engine's memory planning is unchanged. The FFN runner captures its graphs
     # lazily from the connector loop after memory profiling, into its own
     # graph pool, so no graph memory belongs in the profiling estimate.
-    # Signature: matches vLLM v0.32.0 GPUModelRunner.profile_cudagraph_memory
+    # Signature: matches vLLM v0.34.0 GPUModelRunner.profile_cudagraph_memory
     # exactly: (self) -> int; 0 mirrors the upstream NONE-mode early return.
-    # Upstream: vLLM v0.32.0, vllm/v1/worker/gpu/model_runner.py,
+    # Upstream: vLLM v0.34.0, vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.profile_cudagraph_memory; commit
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
     def profile_cudagraph_memory(self) -> int:
         return 0
 
@@ -466,33 +465,29 @@ class GPUFFNModelRunner:
         if self._graph_memory_pool is None:
             self._graph_memory_pool = torch.cuda.graph_pool_handle()
 
-        set_cudagraph_capturing_enabled(True)
-        try:
-            with graph_capture(device=self.device):
-                if is_warmup:
-                    cast(
-                        AFDControlPlane, self.connector.control_plane
-                    ).update_state_from_dp_metadata(
-                        _make_dp_metadata_payload(
-                            dp_metadata_list,
-                            is_graph_capturing=False,
-                            is_warmup=True,
-                        ),
-                    )
-                    self._ffn_forward(
-                        dp_metadata_list=dp_metadata_list,
+        with graph_capture(device=self.device):
+            if is_warmup:
+                cast(
+                    AFDControlPlane, self.connector.control_plane
+                ).update_state_from_dp_metadata(
+                    _make_dp_metadata_payload(
+                        dp_metadata_list,
                         is_graph_capturing=False,
                         is_warmup=True,
-                        update_connector_state=False,
-                    )
-                else:
-                    self._dummy_run(
-                        cudagraph_runtime_mode=CUDAGraphMode.FULL,
-                        dp_metadata_list=dp_metadata_list,
-                        is_attn_graph_capturing=is_attn_graph_capturing,
-                    )
-        finally:
-            set_cudagraph_capturing_enabled(False)
+                    ),
+                )
+                self._ffn_forward(
+                    dp_metadata_list=dp_metadata_list,
+                    is_graph_capturing=False,
+                    is_warmup=True,
+                    update_connector_state=False,
+                )
+            else:
+                self._dummy_run(
+                    cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                    dp_metadata_list=dp_metadata_list,
+                    is_attn_graph_capturing=is_attn_graph_capturing,
+                )
 
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
         cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
@@ -533,8 +528,8 @@ class GPUFFNModelRunner:
     # portable subset; the FFN runner owns no KV caches or attention groups)
     # and then close AFD-owned profiler and connector resources.
     # Signature: matches GPUModelRunner.shutdown; no added parameters.
-    # Upstream: vLLM v0.32.0, vllm/v1/worker/gpu_model_runner.py
-    # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
+    # Upstream: vLLM v0.34.0, vllm/v1/worker/gpu/model_runner.py
+    # Commit: 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
     def shutdown(self) -> None:
         # ### PATCH START: release native-equivalent and AFD-owned GPU state.
         stop_afd_gpu_profiler(self.prof)

@@ -1,12 +1,13 @@
-# Target vLLM version: keep VLLM_BASE_TAG aligned with
-# [project.optional-dependencies].vllm in pyproject.toml.
+# Target vLLM version: keep VLLM_BASE_TAG aligned with the GPU pin in
+# afd_plugin/compat/vllm.py::TARGET_VLLM_VERSION (the Ascend backend keeps its
+# own 0.32.0 pair and is built outside this CUDA image).
 #
 # The base image already ships vLLM and its CUDA runtime stack (torch,
 # flashinfer, etc.) and the DeepGEMM bundled in vLLM. Install only the AFD
 # plugin, its dev/E2E tools, and afdEP-comm (the `afdep` extra, the
 # DeepEPM2NAFDConnector transport) on top.
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
-ARG VLLM_BASE_TAG=v0.32.0
+ARG VLLM_BASE_TAG=v0.34.0
 
 # deps stage: everything except the real project sources, so most PRs can
 # cache-hit on the heavy dependency layer.
@@ -51,7 +52,7 @@ RUN uv export --locked --group dev --group e2e-tests --extra afdep --no-emit-pro
 
 RUN python -c "import torch; from importlib.metadata import version; \
     print('vLLM:', version('vllm'), 'PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda); \
-    assert version('vllm') == '0.32.0', 'CI requires vLLM 0.32.0'; \
+    assert version('vllm') == '0.34.0', 'CI requires vLLM 0.34.0'; \
     import afdep.deepep; print('afdep-comm:', version('afdep-comm')); \
     from importlib.util import find_spec; \
     assert find_spec('vllm.third_party.deep_gemm'), 'DeepEP M2N needs the DeepGEMM bundled in vLLM'"
