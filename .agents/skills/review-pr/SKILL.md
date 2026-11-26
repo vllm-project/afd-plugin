@@ -51,11 +51,8 @@ never from this skill and never from memory:
   (`VLLM_BASE_TAG` plus its version assertion), and `docs/installation.md`'s
   runtime table.
 
-The values quoted in this skill are the `main` values as of its last refresh
-(vLLM `0.32.0` at `5df63a72`, vLLM-Ascend `bd42eea0`); a mismatch between the
-skill and the reviewed head is expected and the head wins. A PR that moves a pin
-without moving the gate, the CI image tag, the docs, and the design pages
-together is a finding.
+Use the values from the reviewed head. A PR that moves a pin without updating
+the gate, the CI image tag, the docs, and the design pages together is a finding.
 
 ## Reference guide
 

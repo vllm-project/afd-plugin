@@ -269,7 +269,8 @@ reassembled to match the upstream Ascend layout.
 `NPUUBatchRunner` extends native MRV2 `UBatchRunner`. Native code owns child
 slicing, threads, handoff, capture/replay and output merge. AFD supplies Ascend
 child metadata builders, NPU stream/context scopes, model-specific transport
-coordinates and nested auxiliary output handling.
+coordinates, and stage-local graph metadata. Native vLLM merges nested
+auxiliary outputs.
 
 `v1/worker/dbo.py` registers the model-side yield operation and dispatches to
 the platform DBO implementation. Eager Async Attention uses native DBO at every

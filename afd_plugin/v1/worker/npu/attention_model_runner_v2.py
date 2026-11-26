@@ -82,10 +82,10 @@ def _use_afd_fullgraph_replay_hook(
     # attention-parameter update needs fresh AFD real/padded token metadata.
     # Patch functionality: stage that metadata on this manager's replay scope;
     # synchronous connectors also publish one padded control payload.
-    # Signature: matches vLLM v0.32.0 ModelCudaGraphManager.run_fullgraph exactly.
+    # Signature: matches the vLLM ModelCudaGraphManager.run_fullgraph base.
     # Upstream source: vllm/v1/worker/gpu/cudagraph_utils.py,
     # ModelCudaGraphManager.run_fullgraph; commit
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
     # Delegation exception: native replay remains wholly in the saved bound
     # method; this scope owns only the AFD pre-replay control seam.
     # Removal/upstream plan: delete this hook when vLLM exposes a per-manager
@@ -294,8 +294,8 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             self._afd_is_profile = previous_is_profile
 
     def _afd_num_tokens_for_context(self, forward_context: ForwardContext) -> int:
-        # Ascend bd42eea0 NPUModelRunner.execute_model delegates to the vLLM
-        # 5df63a72 GPUModelRunner.execute_model token chain:
+        # Ascend 7dcdb690 NPUModelRunner.execute_model delegates to the vLLM
+        # 62d4bc3c GPUModelRunner.execute_model token chain:
         # scheduler_output.total_num_scheduled_tokens ->
         # dispatch_cg_and_sync_dp(..., need_eager=is_profile or skip_compiled)
         # -> ordinary ModelCudaGraphManager.dispatch() or the forced-eager
@@ -443,13 +443,13 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     # AFD must install its sidecar at that exact context-construction seam.
     # Patch functionality: delegate all request/input/Attention/KV/sampling/
     # output work to native V2 while temporarily installing AFD metadata.
-    # Signature: matches vLLM v0.32.0 GPUModelRunner.execute_model, including
-    # the dummy-state parameters forwarded through Ascend NPUModelRunnerV2.
+    # Signature: matches vLLM GPUModelRunner.execute_model, including
+    # randomize_inputs and the dummy-state parameters forwarded by Ascend.
     # Upstream source: vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.execute_model; commit
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be. Ascend delegates this contract
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca. Ascend delegates this contract
     # in vllm_ascend/worker/v2/model_runner.py at
-    # bd42eea01d8312c4df469fabaed45f77a12df4d3.
+    # 7dcdb690caf879a17ab07382880d5773f5202e20.
     # Delegation exception: the upstream method is intentionally not copied;
     # only this narrow provider/profiler wrapper is AFD-specific.
     # Async CAM uses the native DP opt-out for requests and profile/dummy
@@ -539,9 +539,9 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     # Signature: matches Ascend NPUModelRunner.shutdown and its vLLM
     # GPUModelRunner.shutdown delegate.
     # Upstream: vllm_ascend/worker/v2/model_runner.py at
-    # bd42eea01d8312c4df469fabaed45f77a12df4d3; delegated
+    # 7dcdb690caf879a17ab07382880d5773f5202e20; delegated
     # vllm/v1/worker/gpu/model_runner.py at
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be.
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
     # Delegation exception: super().shutdown retains Ascend's C8-view cleanup
     # and native resource release; this override has only AFD-specific finalizers.
     # Removal/upstream plan: delete this wrapper if AFD-owned lifecycle moves

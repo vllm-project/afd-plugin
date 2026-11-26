@@ -45,7 +45,7 @@ def _use_afd_draft_capture(
     tracker = _AFDCaptureEventTracker(descs)
     original_prepare = dflash_cudagraph._prepare_dflash_inputs_to_capture
 
-    # Upstream: vLLM 5df63a72, dflash/cudagraph.py; Ascend bd42eea0 delegates
+    # Upstream: vLLM 62d4bc3c, dflash/cudagraph.py; Ascend 7dcdb690 delegates
     # draft capture here. Signature matches the native preparation function.
     # Native input/KV preparation remains in the saved function; only AFD
     # metadata is added. Remove when draft capture exposes a plugin callback.
@@ -105,7 +105,7 @@ def _use_afd_draft_replay(
     previous_override = state.get("run_fullgraph")
     original_replay = manager.run_fullgraph
 
-    # Upstream: Ascend bd42eea0 DFlashAclGraphManager.run_fullgraph.
+    # Upstream: Ascend 7dcdb690 DFlashAclGraphManager.run_fullgraph.
     # Signature matches upstream. Delegate graph replay and attention updates;
     # add only AFD's model-local metadata. Remove when the native manager has
     # an instance-local pre-replay callback.

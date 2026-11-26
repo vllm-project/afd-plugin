@@ -68,8 +68,8 @@ A_DSPARK_CONFIG="$DSPARK_CONFIG"
 ```
 
 For DP2/TP1 set `A_DP=2`, recompute `NUM_A`, and use `A_DEVICES=0,1`. The W4A8 example uses F EP4.
-For a W8A8 checkpoint, size F for its larger weights; the validated W8A8
-configuration uses `NUM_F=8` and `F_DEVICES=8,9,10,11,12,13,14,15`.
+For a W8A8 checkpoint, size F for its larger weights. The earlier W8A8 eager
+configuration used `NUM_F=8` and `F_DEVICES=8,9,10,11,12,13,14,15`.
 Target and draft use matching Attention TP widths; F remains TP1 with EP.
 Target Attention may use eager execution or the native decode graph.
 `A_DSPARK_CONFIG` selects native draft eager/Graph execution on A; F's
@@ -84,9 +84,11 @@ A_DSPARK_CONFIG="{\"method\":\"dspark\",\"model\":\"$MODEL\",\"num_speculative_t
 
 Attention-local FlashComm1/SP and native PD may remain enabled with both graphs.
 For PD, keep the native full-draft P and KV-transfer configuration described
-below. The W4A8 graph comparison covers A DP1/TP4, F EP4, and native P TP4 when
-using `MooncakeHybridConnector`. Compilation mode 0 is the qualified example;
-other compilation modes have not been validated here.
+below. The earlier W4A8 graph comparison used A DP1/TP4, F EP4, and native P TP4
+with `MooncakeHybridConnector`. The
+[0.34 A3 upgrade record](https://github.com/vllm-project/afd-plugin/pull/651)
+covers W4A8 PD with target and draft graph replay. See that record for the tested
+configuration and its limits. The commands here use compilation mode 0.
 
 Native capture buckets are normalized separately for target verification and
 draft queries; choose buckets covering both query widths and `max-num-seqs`.

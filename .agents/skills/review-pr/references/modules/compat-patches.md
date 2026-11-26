@@ -7,10 +7,11 @@ Use for monkey patches under `afd_plugin/compat/patches/` (generic
 engine/GPU: `async_dp_engine.py`, `async_dp_forward_context.py`,
 `config_validation.py`, `engine_core.py`, `gpu_mrv2_ubatching.py`,
 `gpu_deepseek_v4_dbo.py`), the vLLM-Ascend patches under
-`compat/patches/npu/` (`ascend_config.py`, `ascend_platform.py`, `mla_graph.py`,
+`compat/patches/npu/` (`ascend_config.py`, `ascend_platform.py`,
 `mrv2_ubatching.py`), the version gate in `compat/vllm.py`, and the patched
 methods in `afd_plugin/v1/worker/**` (`attention_worker.py`, `ffn_worker.py`,
-`ffn_model_runner.py`, `attention_model_runner_v2.py`, and the NPU twins).
+`ffn_model_runner.py`, `attention_model_runner_v2.py`, the NPU twins, and
+`npu/mla_graph.py`).
 Does not own the deferred NPU runtime layer ([npu-compat.md](npu-compat.md)) or
 plugin-owned classes.
 
@@ -27,8 +28,7 @@ plugin-owned classes.
   any added parameter must be documented in the comments immediately above the
   patch function.
 - Require, immediately above every patch function: `# Upstream source:`
-  (module, symbol, and the pinned ref — a bare `vLLM 0.32.0` label is weaker
-  than the commit but acceptable when it names the file and symbol),
+  (module, symbol, and the pinned ref, preferably the exact commit),
   `Patch reason:`, and `Patch functionality:`. `# Removal plan:` and
   `# Expansion exception:` are expected where the patch delegates to
   `_original_*` or expands a large upstream function; their absence there is a

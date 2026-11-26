@@ -67,7 +67,7 @@ def _dspark_weight_roles(name: str) -> frozenset[str]:
 
 
 class AFDDeepseekV4DSparkModel(native.DeepseekV4DSparkModel):
-    # Upstream: Ascend bd42eea0, DeepseekV4DSparkModel.__init__.
+    # Upstream: Ascend 7dcdb690, DeepseekV4DSparkModel.__init__.
     # Patch reason: native hard-codes complete draft decoder construction.
     # Patch functionality: role-local layers/embedding and FFN-only allocation.
     # Signature matches upstream. Inherited forward, context-KV and heads remain
@@ -217,7 +217,7 @@ class AFDDSparkDeepseekV4ForCausalLM(native.DSparkDeepseekV4ForCausalLM):
 
     afd_requires_input_ids = False
 
-    # Upstream: Ascend bd42eea0, DSparkDeepseekV4ForCausalLM.__init__.
+    # Upstream: Ascend 7dcdb690, DSparkDeepseekV4ForCausalLM.__init__.
     # Patch reason: native hard-codes its inner model and allocates a head on F.
     # Patch functionality: substitute the role-local model and Attention head.
     # Signature matches upstream; native loading/remapping/forward are delegated.

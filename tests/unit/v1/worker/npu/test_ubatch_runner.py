@@ -3,7 +3,7 @@
 """CPU row/storage contracts with native imports replaced at module boundaries.
 
 Tensor operations and AFD metadata materialization are real. The DSA builder
-double models bd42eea0's padded/actual row contract, not its NPU operators.
+double models 7dcdb690's padded/actual row contract, not its NPU operators.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ class _DSAGroup:
         self.compressor_buffers = tuple(torch.empty(16) for _ in range(3))
 
     def build(self, values, full_graph):
-        # bd42eea0 dsa_v1.py:1014 and :1565-1572. FULL uses physical rows;
+        # Ascend dsa_v1.py uses physical rows in FULL;
         # eager uses actual tokens, including the min() bound for tiny batches.
         tokens = (
             values["num_input_tokens"] if full_graph else values["num_actual_tokens"]
@@ -80,7 +80,7 @@ class _DSAGroup:
 
 def _build_metadata(*, full_graph_mode=False, for_cudagraph_capture=False, **values):
     group = values["attn_groups"][0][0]
-    # bd42eea0 attn_utils.py:588 also enables the padded contract at capture.
+    # Ascend attn_utils.py also enables the padded contract at capture.
     metadata = group.build(values, full_graph_mode or for_cudagraph_capture)
     return {"layer": metadata}
 
@@ -178,7 +178,6 @@ def runtime(monkeypatch):
                 "use_async_cam_child_dp_metadata",
                 "use_npu_input_batch_slicing",
                 "use_npu_ubatch_contexts",
-                "use_npu_ubatch_output_merge",
             ),
             nullcontext,
         ),

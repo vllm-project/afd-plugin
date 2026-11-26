@@ -10,8 +10,8 @@ probe there and polls ``flush_ffn_service_evidence``. CUDA V4 also records a
 bounded set of successful live transactions, pairing native A input IDs with
 the actual first local Hash-layer F input IDs. Capture retains references
 without D2H.
-CUDA target: 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca (0.34.0).
-Ascend retains the pinned 0.32 call without CUDA's randomize_inputs argument.
+Shared vLLM target: 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca (0.34.0).
+Ascend target: 7dcdb690caf879a17ab07382880d5773f5202e20.
 Remove these wrappers when upstream exposes equivalent live Attention/FFN
 replay and microbatch counters.
 """
@@ -27,7 +27,6 @@ from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING
 
-from vllm.config import CUDAGraphMode
 from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
@@ -322,37 +321,11 @@ def _install_probes() -> tuple[type, Callable[[], None]]:
         def afd_log_execution_evidence(self) -> None:
             log_execution_evidence(self.vllm_config)
 
-    def observe_prepared(
-        input_batch: InputBatch,
-        result: UBatchState,
-        dp_size: int,
-        for_capture: bool,
-    ) -> UBatchState:
-        # ### PATCH START: retain nonempty native request-stage coordinates.
-        nonlocal native_layout
-        if hash_probe is not None:
-            hash_probe.slices = result.slices
-        if (
-            not for_capture
-            and len(result.slices) == DBO_NUM_STAGES
-            and all(
-                min(stage.token_slice.stop, input_batch.num_tokens)
-                > stage.token_slice.start
-                for stage in result.slices
-            )
-        ):
-            native_layout = tuple(
-                (index, (stage.num_tokens,) * dp_size)
-                for index, stage in enumerate(result.slices)
-            )
-        # ### PATCH END: retain nonempty native request-stage coordinates.
-        return result
-
     # Patch reason: observe native DBO and CUDA V4 hash slices in live execution.
     # Signature/source: UBatchRunner.prepare, vLLM 62d4bc3c,
     # vllm/v1/worker/gpu/ubatch_utils.py. The delegated preparation owns slicing
     # and DP alignment. Remove when upstream exposes equivalent live counters.
-    def prepare_cuda(
+    def prepare(
         self,
         input_batch: InputBatch,
         block_tables: tuple[torch.Tensor, ...],
@@ -370,40 +343,31 @@ def _install_probes() -> tuple[type, Callable[[], None]]:
             dp_sync_state,
             for_capture,
         )
-        # ### PATCH START: observe the prepared CUDA slices.
-        return observe_prepared(
-            input_batch, result, self.parallel_config.data_parallel_size, for_capture
-        )
-        # ### PATCH END: observe the prepared CUDA slices.
-
-    # Patch reason: observe live native DBO slices on the Ascend 0.32 pin.
-    # Signature/source: UBatchRunner.prepare, vLLM 5df63a7,
-    # vllm/v1/worker/gpu/ubatch_utils.py. Delegate native slicing.
-    # Retire the cg_mode signature once RFC #613 verifies the 0.34
-    # batch_desc/dp_sync_state hook still records live nonempty DBO slices
-    # on Ascend.
-    # See https://github.com/vllm-project/afd-plugin/issues/613.
-    def prepare_ascend(
-        self,
-        input_batch: InputBatch,
-        block_tables: tuple[torch.Tensor, ...],
-        slot_mappings: torch.Tensor,
-        cg_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-        for_capture: bool = False,
-    ) -> UBatchState:
-        result = native_prepare(
-            self, input_batch, block_tables, slot_mappings, cg_mode, for_capture
-        )
-        # ### PATCH START: observe the prepared Ascend slices.
-        return observe_prepared(
-            input_batch, result, self.parallel_config.data_parallel_size, for_capture
-        )
-        # ### PATCH END: observe the prepared Ascend slices.
+        # ### PATCH START: retain nonempty native request-stage coordinates.
+        nonlocal native_layout
+        if hash_probe is not None:
+            hash_probe.slices = result.slices
+        if (
+            not for_capture
+            and len(result.slices) == DBO_NUM_STAGES
+            and all(
+                min(stage.token_slice.stop, input_batch.num_tokens)
+                > stage.token_slice.start
+                for stage in result.slices
+            )
+        ):
+            dp_size = self.parallel_config.data_parallel_size
+            native_layout = tuple(
+                (index, (stage.num_tokens,) * dp_size)
+                for index, stage in enumerate(result.slices)
+            )
+        # ### PATCH END: retain nonempty native request-stage coordinates.
+        return result
 
     @wraps(native_prepare_inputs)
     # Patch reason: transported IDs must match native request inputs, including
     # FULL replay. Observe the actual InputBatch before it enters the model.
-    # Signature/source: GPUModelRunner.prepare_inputs at vLLM 5df63a7.
+    # Signature/source: GPUModelRunner.prepare_inputs at vLLM 62d4bc3c.
     # Observation-only delegation; remove with the Hash input acceptance probe.
     def prepare_inputs(
         self,
@@ -424,8 +388,7 @@ def _install_probes() -> tuple[type, Callable[[], None]]:
     @wraps(native_replay)
     # Patch reason: configured graph mode does not prove replay occurred.
     # Patch functionality: observe completed native FULL replay unchanged.
-    # Signature/source: ModelCudaGraphManager.run_fullgraph, CUDA 5df63a7
-    # and Ascend's ced6857 baseline,
+    # Signature/source: ModelCudaGraphManager.run_fullgraph at vLLM 62d4bc3c,
     # vllm/v1/worker/gpu/cudagraph_utils.py. Delegation is observation-only.
     def replay(
         self, desc: BatchExecutionDescriptor
@@ -440,11 +403,8 @@ def _install_probes() -> tuple[type, Callable[[], None]]:
     @wraps(native_execute)
     # Patch reason: graph/DBO configuration alone can pass accuracy via eager.
     # Patch functionality: count completed live replay and nonempty microbatches.
-    # Signature/source: GPUModelRunner.execute_model, CUDA vLLM 5df63a7,
+    # Signature/source: GPUModelRunner.execute_model at vLLM 62d4bc3c,
     # vllm/v1/worker/gpu/model_runner.py. Delegation is observation-only.
-    # The Ascend 0.32 hook omits randomize_inputs. Retire this call split when
-    # RFC #613 verifies the 0.34 call with that keyword and the hook still
-    # counts completed ACL replays and live DBO steps on Ascend.
     def execute(
         self,
         scheduler_output: SchedulerOutput,
@@ -465,7 +425,7 @@ def _install_probes() -> tuple[type, Callable[[], None]]:
             hash_probe.input_batch = None
             hash_probe.slices = None
         # ### PATCH END: reset replay observation for this step.
-        execute_args = (
+        result = native_execute(
             self,
             scheduler_output,
             intermediate_tensors,
@@ -474,11 +434,7 @@ def _install_probes() -> tuple[type, Callable[[], None]]:
             is_profile,
             context_len,
             valid_dummy_state_slots,
-        )
-        result = (
-            native_execute(*execute_args)
-            if current_platform.device_type == "npu"
-            else native_execute(*execute_args, randomize_inputs=randomize_inputs)
+            randomize_inputs=randomize_inputs,
         )
         # D2H is bounded and runs outside the publication lock.
         hash_samples = (
@@ -712,9 +668,7 @@ def _install_probes() -> tuple[type, Callable[[], None]]:
     GPUModelRunner.execute_model = execute
     ModelCudaGraphManager.run_fullgraph = replay
     if native_baseline or hash_probe is not None:
-        UBatchRunner.prepare = (
-            prepare_ascend if current_platform.device_type == "npu" else prepare_cuda
-        )
+        UBatchRunner.prepare = prepare
     if not native_baseline:
         ffn_model_runner.graph_run_mode = mode
         FFN_RUNNER.execute_model = (

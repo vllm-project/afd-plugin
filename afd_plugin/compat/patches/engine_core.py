@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 import vllm.v1.engine.core as core_module
 
-from afd_plugin.compat.vllm import get_target_vllm_version
+from afd_plugin.compat.vllm import TARGET_VLLM_VERSION
 from afd_plugin.compat.vllm import (
     is_target_vllm_compatible as _is_target_vllm_compatible,
 )
@@ -599,7 +599,7 @@ else:
     core_module.logger.warning(
         "Skipping AFD EngineCore patch: vLLM %s does not match target %s",
         getattr(core_module, "VLLM_VERSION", "unknown"),
-        get_target_vllm_version(),
+        TARGET_VLLM_VERSION,
     )
 
 

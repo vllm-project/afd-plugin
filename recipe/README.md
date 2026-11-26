@@ -1,11 +1,10 @@
 # AFD Recipes
 
 This directory contains deployment and benchmark recipes for AFD connectors.
-Read each recipe's support status before running it: some historical experiment
-records are retained for provenance but are not supported by the current
-runtime. Both GPU and Ascend target vLLM 0.32. The
-[Ascend validation record](https://github.com/vllm-project/afd-plugin/pull/507) links the tested
-scope; the V3.2 recipes below retain their historical versions.
+Both GPU and Ascend target vLLM 0.34.0. See the
+[installation guide](../docs/installation.md) for the runtime pins and the
+[Ascend upgrade record](https://github.com/vllm-project/afd-plugin/pull/651)
+for A3 validation. The V3.2 recipes below retain their original runtime pins.
 
 ## Directory layout
 
@@ -28,9 +27,9 @@ Recipes are organized by hardware backend, connector, and model:
 | GPU | `P2pNcclAFDConnector` | Qwen3-30B-A3B | Prefill / decode; decode-only benchmark | 2A2F graph recipe with the DeepEP M2N recipe's settings, for connector comparison | [Graph](gpu/P2pNcclAFDConnector/qwen3_30b_a3b/README.md) |
 | GPU | `P2pNcclAFDConnector` | Qwen3-235B-A22B-FP8 | Prefill / decode; decode-only benchmark | 2A2F graph recipe with the DeepEP M2N recipe's settings, for connector comparison | [Graph](gpu/P2pNcclAFDConnector/qwen3_235b_a22b_fp8/README.md) |
 | GPU | `P2pNcclAFDConnector` | Qwen3.5-122B-A10B-FP8 | Decode | Three-pod graph recipe (`2A0F,2A0F,0A2F`); other layouts remain configurable through `LAYOUT` | [Graph](gpu/P2pNcclAFDConnector/qwen3_5_122b_a10b_fp8/prefill_decode_colocation/multipod_2a_2a_2f_graph.sh) |
-| Ascend NPU | `CAMP2pAFDConnector` | DeepSeek-V3.2 | Decode | Historical v0.19.1rc1 recipe; not qualified for the 0.32 target | [Synchronous decode](npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) |
+| Ascend NPU | `CAMP2pAFDConnector` | DeepSeek-V3.2 | Decode | Historical v0.19.1rc1 recipe; current-runtime qualification is pending | [Synchronous decode](npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) |
 | Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V3.2 | Prefill / decode | Historical v0.19.1rc1/v0.26 recipes; standard V3.2 is unsupported by the current Async CAM path | [Async CAM](npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) |
-| Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V4-Flash W4A8/W8A8 DSpark | Separate P / decode, or colocated | v0.32; F layered eager/FULL. W4A8 target/draft native decode Graph: A DP1/TP4, F EP4, with Attention-local SP and with/without PD; native full-draft P TP4 for PD. Earlier eager W4A8 PD: A DP2/TP1, F EP4. W8A8 eager A/F: A DP2/TP1, F EP8; A Graph and PD not qualified | [DSpark A/F](npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md) |
+| Ascend NPU | `CAMAsyncAFDConnector` | DeepSeek-V4-Flash W4A8/W8A8 DSpark | Separate P / decode, or colocated | vLLM 0.34.0 recipe with layered FFN eager/FULL. A3 upgrade evidence covers W4A8 PD with target and draft decode graphs. See the recipe for earlier W4A8/W8A8 evidence and its limits. | [DSpark A/F](npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md) |
 
 Open the model-level README before running a recipe. It documents the required
 hardware and runtime baseline, topology, environment variables, launch order,

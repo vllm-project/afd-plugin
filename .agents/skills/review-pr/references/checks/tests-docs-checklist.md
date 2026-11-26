@@ -13,7 +13,7 @@ technical review, before delivery.
 - Pre-commit only inspects files changed in the push/PR (`--from-ref/--to-ref`);
   a violation in an untouched file is not this PR's finding.
 - Buildkite image: `docker/Dockerfile.ci` builds on
-  `vllm/vllm-openai:${VLLM_BASE_TAG}` (currently `v0.32.0`) and asserts the
+  `vllm/vllm-openai:${VLLM_BASE_TAG}` and asserts the
   installed vLLM version equals the pin. A PR that changes the pin without
   changing that assertion leaves CI unable to catch drift.
 - `test-ready` (L2) and `test-merge` (L3) run on `l4_1`: the CPU unit

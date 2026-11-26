@@ -9,7 +9,8 @@ and receive-safe resource release independently of the synchronous CAMP2P
 
 ## Selection and startup
 
-The target is the pinned vLLM 0.32 / vLLM-Ascend stack on A3/910C, with
+The target is the [pinned Ascend A3 stack](../../installation.md#ascend-npu-installation)
+with vLLM 0.34, using
 homogeneous DeepSeek-V4 W4A8 or W8A8 layers, dynamicQuant=1, static expert placement,
 F TP=1 and Attention-side gating. Both roles select
 `VLLM_USE_V2_MODEL_RUNNER=1`. Attention normally keeps `--enforce-eager`; the
@@ -22,8 +23,10 @@ been validated. Other model-based drafts and MTP remain unsupported.
 Attention may enable native DBO under the
 existing two-microbatch constraints. Enable native DBO only on Attention; FFN
 consumes CAM work items without joining Attention's DBO thread schedule.
-The [0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507) identifies the tested
-W4A8 eager/FULL fixture and its limits, including graceful-exit failures.
+The [0.34 upgrade record](https://github.com/vllm-project/afd-plugin/pull/651)
+documents the A3 Async CAM and DSpark cases. The historical
+[0.32 validation record](https://github.com/vllm-project/afd-plugin/pull/507)
+describes an earlier W4A8 eager/FULL fixture and its graceful-exit failures.
 
 On F, omit `--enforce-eager` and pass
 `--compilation-config '{"cudagraph_mode":"FULL"}'`. To select eager explicitly,

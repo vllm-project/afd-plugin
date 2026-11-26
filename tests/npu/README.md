@@ -77,7 +77,6 @@ python3 -m pytest -q -ra \
   tests/unit/connectors/npu/async_cam_runtime/test_async_cam_dbo.py \
   tests/unit/v1/worker/npu/test_attention_metadata.py \
   tests/unit/v1/worker/test_npu_model_runner_v2.py \
-  tests/unit/v1/worker/test_npu_ubatch_outputs.py \
   tests/unit/v1/worker/test_npu_mla_graph.py
 ```
 

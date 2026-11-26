@@ -286,14 +286,6 @@ def _use_installed_patch(binding, symbol, marker_name, install):
             id="npu-dbo-slicing",
         ),
         pytest.param(
-            GPU_UBATCH,
-            None,
-            "merge_ubatch_outputs",
-            None,
-            "npu-dbo-output-merge",
-            id="npu-dbo-output-merge",
-        ),
-        pytest.param(
             "vllm.v1.worker.gpu.cudagraph_utils",
             "ModelCudaGraphManager",
             "run_fullgraph",
@@ -446,7 +438,6 @@ def test_patch_preserves_upstream_signature(
         "npu-dbo-factory",
         "npu-dbo-dispatch",
         "npu-dbo-slicing",
-        "npu-dbo-output-merge",
     }:
         from afd_plugin.compat.patches.npu import mrv2_ubatching as adapter
 
@@ -462,10 +453,8 @@ def test_patch_preserves_upstream_signature(
             )
         elif scope_name == "npu-dbo-dispatch":
             scope = adapter.use_async_cam_dbo_dispatch()
-        elif scope_name == "npu-dbo-slicing":
-            scope = adapter.use_npu_input_batch_slicing()
         else:
-            scope = adapter.use_npu_ubatch_output_merge()
+            scope = adapter.use_npu_input_batch_slicing()
     elif scope_name == "npu-platform-config":
         from afd_plugin.compat.patches.npu import ascend_platform as adapter
 

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Config normalization shim for AFD-owned runtime behavior.
 
-vLLM 0.32.0 validates native microbatching by requiring a supported all2all
+vLLM 0.34.0 validates native microbatching by requiring a supported all2all
 backend. AFD ubatching uses plugin connectors instead, so this patch only
 relaxes that assertion for configs with active ``additional_config["afd"]``.
 It also replaces the platform's default worker with the role-specific AFD
@@ -37,7 +37,7 @@ _original_create_engine_config: Callable[..., Any] | None = None
 _original_vllm_config_post_init: Callable[..., Any] | None = None
 
 
-# Upstream source: vLLM v0.32.0 (5df63a7203cdb9328d824a27b682e77c7b9928be),
+# Upstream source: vLLM v0.34.0 (62d4bc3c7e33b1b6c906e233e6af2d3506c482ca),
 # vllm/engine/arg_utils.py::EngineArgs.create_engine_config.
 # Patch reason: vLLM validates native ubatching against DeepEP backends and
 # selects a generic worker before AFD can bind its NPU child lifecycle.
@@ -115,7 +115,7 @@ def create_engine_config(
     return config
 
 
-# Upstream source: vLLM v0.32.0 (5df63a7203cdb9328d824a27b682e77c7b9928be),
+# Upstream source: vLLM v0.34.0 (62d4bc3c7e33b1b6c906e233e6af2d3506c482ca),
 # vllm/config/vllm.py::VllmConfig.__post_init__.
 # Patch reason: EngineCore handshakes explicitly rerun VllmConfig.__post_init__
 # after the config's actual AFD all2all backend has been restored.

@@ -641,7 +641,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
 
     fall_back_to_pt_during_load = False
 
-    # Upstream source: vllm-ascend bd42eea01d8312c4df469fabaed45f77a12df4d3,
+    # Upstream source: vllm-ascend 7dcdb690caf879a17ab07382880d5773f5202e20,
     # vllm_ascend/models/deepseek_v4/model.py::DeepseekV4Model.__init__.
     # Patch reason: construct role-local decoder layers and retain AFD metadata.
     # Patch functionality: initialize the target SP/PP/HC/MTP model contract
@@ -868,7 +868,7 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
-    # vLLM 5df63a7 model_loader/utils.py invokes this model hook after quant
+    # vLLM 62d4bc3c model_loader/weight_utils.py invokes this hook after quant
     # finalize. AFD's CAM GMM path still needs the scale that native MegaMoE drops.
     def process_weights_after_loading(self) -> None:
         # ### PATCH START: retain FFN gate-on-A W8A8 scales after quant finalize
