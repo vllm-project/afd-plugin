@@ -129,7 +129,10 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 vllm_config,
                 prefix=f"{prefix}.ffn",
                 use_sequence_parallel=self.use_sequence_parallel,
-                num_hash_layers=config.num_hash_layers,
+                # Upstream 0.34 derives this from the layer schedule; the
+                # checkpoint's own num_hash_layers field is no longer read on
+                # this path (nvidia/model.py:614).
+                num_hash_layers=config.mlp_layer_types.count("hash_moe"),
             )
         else:
             raise ValueError(f"unsupported AFD role {afd_config.role!r}")
@@ -328,7 +331,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         )
         # ### PATCH END
         self.has_local_hash_moe = self.start_layer < min(
-            self.end_layer, config.num_hash_layers
+            self.end_layer, config.mlp_layer_types.count("hash_moe")
         )
 
         if native.get_pp_group().is_last_rank:

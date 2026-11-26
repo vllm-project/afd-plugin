@@ -1,8 +1,8 @@
 # DeepSeek-V2-Lite AFD Examples
 
 End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
-(Attention-FFN Disaggregation) plugin targeting vLLM `v0.32.0`. These are
-deployment examples, not v0.32 recipe validation. See the
+(Attention-FFN Disaggregation) plugin targeting vLLM `v0.34.0`. These are
+deployment examples. See the
 [runtime matrix](../../../../docs/support.md#tested-runtime-matrix)
 for tested E2E configurations.
 
@@ -17,7 +17,7 @@ for tested E2E configurations.
 - Four GPUs for the default `2A2F` colocation layout and the `2p1a1f_*`
   examples; `LAYOUT=4A4F` needs eight GPUs, and `LAYOUT=2A0F,0A2F` two GPUs
   on each of two pods.
-- vLLM `v0.32.0` and the `afd-plugin` package installed in the same
+- vLLM `v0.34.0` and the `afd-plugin` package installed in the same
   environment (see repository root `AGENTS.md`).
 - DeepSeek-V2-Lite weights on disk. Colocation scripts default to
   `/path/model_weights/DeepSeek-V2-Lite`; disaggregation scripts default to

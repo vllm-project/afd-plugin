@@ -142,14 +142,6 @@ def _use_installed_patch(binding, symbol, marker_name, install):
             id="engine-launch",
         ),
         pytest.param(
-            "vllm.v1.engine.core_client",
-            "DPAsyncMPClient",
-            "add_request_async",
-            "async_dp_engine",
-            None,
-            id="dp-request",
-        ),
-        pytest.param(
             "vllm.forward_context",
             None,
             "set_forward_context",
@@ -318,12 +310,20 @@ def _use_installed_patch(binding, symbol, marker_name, install):
             id="npu-platform-config",
         ),
         pytest.param(
-            "vllm_ascend.attention.mla_v1",
+            "vllm_ascend.compilation.updatable_graph",
+            "UpdatableGraph",
+            "register_task",
             None,
-            "get_graph_params",
+            "npu-ubatch-register-task",
+            id="npu-ubatch-register-task",
+        ),
+        pytest.param(
+            "vllm_ascend.worker.v2.aclgraph_utils",
+            "ModelAclGraphManager",
+            "_updatable_graph_replay",
             None,
-            "npu-mla-graph-params",
-            id="npu-mla-graph-params",
+            "npu-ubatch-updatable-replay",
+            id="npu-ubatch-updatable-replay",
         ),
     ],
 )
@@ -332,9 +332,29 @@ def test_patch_preserves_upstream_signature(
 ):  # long-test: scoped table bindings.
     pytest.importorskip("torch")
     pytest.importorskip("vllm")
+    from vllm.platforms import current_platform
+
+    on_ascend = current_platform.device_type == "npu"
+    if (
+        adapter_module in {"async_dp_engine", "async_dp_forward_context"}
+        and not on_ascend
+    ):
+        pytest.skip("Async DP overrides apply only to the pinned Ascend runtime")
+    if on_ascend and (
+        adapter_module == "gpu_mrv2_ubatching"
+        or scope_name in {"fullgraph-replay", "v4-workspace-slot"}
+    ):
+        pytest.skip("CUDA overrides apply only to the pinned GPU runtime")
     # Ascend's platform module replaces TYPE_CHECKING-only config names with
     # None at runtime. Resolve the source annotation against its real class.
     from vllm.config import VllmConfig  # noqa: F401
+
+    # 0.34 annotates UBatchRunner.prepare lazily; resolving that string needs
+    # the names in this frame's namespace.
+    from vllm.v1.worker.gpu.cudagraph_utils import (  # noqa: F401
+        BatchExecutionDescriptor,
+    )
+    from vllm.v1.worker.gpu.dp_utils import DPSyncState  # noqa: F401
 
     if (
         target_module.startswith("vllm_ascend.")
@@ -344,6 +364,8 @@ def test_patch_preserves_upstream_signature(
         and scope_name.startswith("npu-")
         or scope_name == "camp2p-dispatch"
     ):
+        if not on_ascend:
+            pytest.skip("Ascend overrides apply only to the pinned Ascend runtime")
         pytest.importorskip("torch_npu")
         pytest.importorskip("vllm_ascend")
     if scope_name == "capture-inputs":
@@ -355,8 +377,6 @@ def test_patch_preserves_upstream_signature(
         expected_module = importlib.import_module(GPU_DP)
     elif scope_name == "npu-dbo-factory":
         expected_module = importlib.import_module(GPU_UBATCH)
-    elif scope_name == "npu-mla-graph-params":
-        expected_module = importlib.import_module("vllm_ascend.compilation.acl_graph")
     else:
         expected_module = target
     expected = _upstream_signature(expected_module, owner, symbol, locals())
@@ -367,7 +387,10 @@ def test_patch_preserves_upstream_signature(
         from afd_plugin.v1.worker import attention_model_runner_v2 as adapter
 
         tracker = adapter._AFDCaptureEventTracker([])
-        scope = adapter._use_afd_capture_input_preparation(None, tracker)
+        runner = SimpleNamespace(
+            device=SimpleNamespace(type="npu" if on_ascend else "cuda"),
+        )
+        scope = adapter._use_afd_capture_input_preparation(runner, tracker)
     elif scope_name in {"npu-draft-capture", "npu-draft-replay"}:
         from vllm.config import CUDAGraphMode
 
@@ -412,6 +435,7 @@ def test_patch_preserves_upstream_signature(
                 SimpleNamespace(
                     ubatch_runner=binding,
                     vllm_config=SimpleNamespace(model_config=model),
+                    device=SimpleNamespace(type="npu" if on_ascend else "cuda"),
                 )
             )
         else:
@@ -452,35 +476,34 @@ def test_patch_preserves_upstream_signature(
             adapter._ASCEND_PLATFORM_PATCH_ATTR,
             adapter.apply_afd_ascend_dbo_config_patch,
         )
-    elif scope_name == "npu-mla-graph-params":
-        from afd_plugin.compat.patches.npu import mla_graph as adapter
+    elif scope_name in {"npu-ubatch-register-task", "npu-ubatch-updatable-replay"}:
+        from afd_plugin.v1.worker.npu import mla_graph as adapter
 
-        scope = _use_installed_patch(
-            binding,
-            symbol,
-            adapter._MLA_GRAPH_PATCH_ATTR,
-            adapter.apply_afd_mla_graph_patch,
-        )
+        binding = SimpleNamespace(**{symbol: getattr(getattr(target, owner), symbol)})
+        if scope_name == "npu-ubatch-register-task":
+            scope = adapter.use_ubatch_graph_registration(binding)
+        else:
+            scope = adapter.use_ubatch_replay_metadata(binding, ())
     else:
         adapter_name, _, renamed_symbol = adapter_module.partition(":")
         adapter = importlib.import_module(f"{PATCHES}.{adapter_name}")
+        binding = getattr(target, owner) if adapter_name == "engine_core" else adapter
         patch_symbol = renamed_symbol or symbol
         scope = nullcontext()
     original = getattr(binding, symbol) if scope_name else None
     with scope:
-        patched = getattr(binding if scope_name else adapter, patch_symbol)
+        patched = getattr(binding, patch_symbol)
         callable_patch = patched.__func__ if inspect.ismethod(patched) else patched
         namespace = vars(target) | vars(adapter) | locals()
         if target_module == ENGINE_CORE and symbol == "run_busy_loop":
-            # The pinned native decorator has no __wrapped__; compare both its
-            # exposed signature and the original function retained in its closure.
-            wrapped = callable_patch
-            callable_patch = inspect.getclosurevars(wrapped).nonlocals["busy_loop_func"]
             native_wrapper = target.fault_tolerant_wrapper(callable_patch)
-            assert _resolved_signature(wrapped, namespace) == _resolved_signature(
-                native_wrapper, namespace
-            )
-        assert _resolved_signature(callable_patch, namespace) == expected
+            assert _resolved_signature(
+                inspect.unwrap(callable_patch), namespace
+            ) == _resolved_signature(native_wrapper, namespace)
+            actual = inspect.signature(callable_patch, follow_wrapped=False)
+        else:
+            actual = _resolved_signature(callable_patch, namespace)
+        assert actual == expected
         if scope_name:
             original_callable = (
                 original.__func__ if inspect.ismethod(original) else original

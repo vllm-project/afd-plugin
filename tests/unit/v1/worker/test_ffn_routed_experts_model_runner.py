@@ -145,8 +145,8 @@ def test_constructor_rejects_connectors_without_routed_rows(monkeypatch):
         )
 
 
-def _routed_experts(*, fp8: bool, expert_ids=(4, 5), backend: str = "TRITON"):
-    num_experts = len(expert_ids)
+def _routed_experts(*, fp8: bool, use_ep: bool = True, backend: str = "TRITON"):
+    num_experts = 2
     dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
     selected = SimpleNamespace(name=backend)
     experts = SimpleNamespace(
@@ -164,7 +164,8 @@ def _routed_experts(*, fp8: bool, expert_ids=(4, 5), backend: str = "TRITON"):
             requires_grad=False,
         ),
         expert_map_manager=SimpleNamespace(
-            get_local_expert_ids=lambda: list(expert_ids),
+            expert_map=torch.tensor([-1, -1, -1, -1, 0, 1]) if use_ep else None,
+            global_num_experts=6 if use_ep else num_experts,
         ),
     )
     if fp8:
@@ -201,6 +202,12 @@ def test_local_experts_are_views_of_vllm_parameters(fp8):
         )
     else:
         assert local.weights.w13_scale is None
+
+
+def test_local_experts_preserve_all_global_ids_without_ep():
+    local = local_experts_from_vllm(_routed_experts(fp8=False, use_ep=False))
+
+    assert local.expert_ids == (0, 1)
 
 
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])

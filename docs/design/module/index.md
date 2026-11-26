@@ -17,8 +17,9 @@ validation_paths:
   - "tests/unit/**"
   - "tests/e2e/**"
 upstream_refs:
-  - "GPU and NPU target vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
-  - "vLLM-Ascend target bd42eea01d8312c4df469fabaed45f77a12df4d3"
+  - "GPU target vLLM 0.34.0 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca"
+  - "NPU target vLLM 0.34.0 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca"
+  - "vLLM-Ascend target 7dcdb690caf879a17ab07382880d5773f5202e20"
 verified_platform_refs:
   - "CUDA: tests/e2e marked e2e with AFD_E2E_BACKEND=gpu; no canonical image is recorded"
   - "Ascend: current target in docs/installation.md; V2-Lite and DSV4 Flash W4A8 evidence in docs/support.md; older environments remain historical"

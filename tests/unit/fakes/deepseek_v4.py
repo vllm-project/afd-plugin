@@ -66,6 +66,7 @@ class WorkspaceCase:
         monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: self.ubatch)
         monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
         self.config = SimpleNamespace(
+            additional_config={},
             model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(model_type="deepseek_v4")
             ),

@@ -84,9 +84,11 @@ class PreparedUBatchRunner:
         input_batch,
         block_tables,
         slot_mappings,
-        cg_mode,
+        batch_desc,
+        dp_sync_state=None,
         for_capture=False,
     ):
+        cg_mode = batch_desc.cg_mode
         slices = create_ubatch_slices(input_batch, self.num_ubatches)
         contexts = []
         for stage, ubatch_slice in enumerate(slices):
@@ -136,7 +138,7 @@ class PreparedUBatchRunner:
         return finish
 
 
-class LegacyNPUAttentionMetadataState:
+class NPUAttentionMetadataState:
     """Expose the vLLM 0.30 attention-preparation signature on CPU."""
 
     def __init__(self):
@@ -164,7 +166,7 @@ class LegacyNPUAttentionMetadataState:
         }
 
 
-class LegacyNPUUBatchRunner:
+class PreparedNPUUBatchRunner:
     """Build native stage contexts without CUDA state or scheduling."""
 
     num_ubatches = 2
@@ -174,9 +176,21 @@ class LegacyNPUUBatchRunner:
         self.kv_cache_config = kv_cache_config
 
     def prepare(
-        self, input_batch, block_tables, slot_mappings, cg_mode, for_capture=False
+        self,
+        input_batch,
+        block_tables,
+        slot_mappings,
+        batch_desc,
+        dp_sync_state=None,
+        for_capture=False,
     ):
-        slices = create_ubatch_slices(input_batch, self.num_ubatches)
+        cg_mode = batch_desc.cg_mode
+        uniform_token_count = (
+            None if dp_sync_state is None else dp_sync_state.uniform_token_count
+        )
+        slices = create_ubatch_slices(
+            input_batch, self.num_ubatches, uniform_token_count
+        )
         contexts = []
         for stage, ubatch_slice in enumerate(slices):
             slots = slot_mappings[:, ubatch_slice.token_slice]

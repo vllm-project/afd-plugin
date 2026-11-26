@@ -7,7 +7,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import torch
-from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import DPMetadata
 from vllm.logger import init_logger
@@ -378,26 +377,22 @@ class AFDNPUFFNModelRunner:
             is_attn_graph_capturing,
         )
         start_free_memory = int(torch.npu.mem_get_info()[0])
-        set_cudagraph_capturing_enabled(True)
-        try:
-            if is_warmup:
-                self._ffn_forward(
+        if is_warmup:
+            self._ffn_forward(
+                dp_metadata_list=dp_metadata_list,
+                is_graph_capturing=False,
+            )
+        else:
+            # FFN owns its capture stream and explicitly scopes capture state
+            # in the graph and its Ascend forward context.
+            stream = torch.npu.Stream(device=self.device)
+            stream.wait_stream(torch.npu.current_stream(self.device))
+            with torch.npu.stream(stream):
+                self._capture_graphs(
+                    aclgraph_runtime_mode=CUDAGraphMode.FULL,
                     dp_metadata_list=dp_metadata_list,
-                    is_graph_capturing=False,
+                    is_attn_graph_capturing=is_attn_graph_capturing,
                 )
-            else:
-                # FFN owns only its capture stream, with the same initialization
-                # dependency as the old helper; no MRV1 import is needed.
-                stream = torch.npu.Stream(device=self.device)
-                stream.wait_stream(torch.npu.current_stream(self.device))
-                with torch.npu.stream(stream):
-                    self._capture_graphs(
-                        aclgraph_runtime_mode=CUDAGraphMode.FULL,
-                        dp_metadata_list=dp_metadata_list,
-                        is_attn_graph_capturing=is_attn_graph_capturing,
-                    )
-        finally:
-            set_cudagraph_capturing_enabled(False)
 
         end_free_memory = int(torch.npu.mem_get_info()[0])
         graph_size = max(0, int(start_free_memory - end_free_memory))

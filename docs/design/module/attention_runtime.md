@@ -39,13 +39,13 @@ validation_paths:
   - "tests/e2e/accuracy/**"
   - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
 upstream_refs:
-  - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
-  - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "GPU: vLLM 0.34.0 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca"
+  - "NPU target: vLLM 0.34.0 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca"
   - "vLLM vllm.v1.worker.gpu_worker.Worker"
   - "vLLM vllm.v1.worker.gpu.model_runner.GPUModelRunner"
   - "vLLM-Ascend vllm_ascend.worker.worker.NPUWorker (tested environment evidence only)"
   - "vLLM-Ascend vllm_ascend.worker.model_runner_v1.NPUModelRunner (tested environment evidence only)"
-  - "vLLM-Ascend vllm_ascend.worker.v2.model_runner.NPUModelRunner at bd42eea0"
+  - "vLLM-Ascend vllm_ascend.worker.v2.model_runner.NPUModelRunner at 7dcdb690"
 verified_platform_refs:
   - "CUDA paths marked gpu in tests/e2e"
   - "CUDA ModelRunnerV2 DP2/TP2 eager and graph scenarios in tests/e2e"

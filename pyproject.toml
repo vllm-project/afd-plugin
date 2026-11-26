@@ -33,7 +33,7 @@ dependencies = []
 # Keep vLLM optional so macOS and CPU-only development can run import/config tests.
 # Install the runtime extra only in environments with a compatible vLLM wheel.
 [project.optional-dependencies]
-vllm = ["vllm==0.32.0"]
+vllm = ["vllm==0.34.0"]
 afdep = [
     "afdep-comm @ git+https://github.com/afdEP/afdEP-comm.git@v1.2.1",
 ]

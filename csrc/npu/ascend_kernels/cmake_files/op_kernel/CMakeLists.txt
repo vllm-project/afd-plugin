@@ -39,6 +39,9 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/afd_mega_moe_pull_native.cpp")
             -Wno-ignored-attributes -I${AFD_MC2_92_DIR} -I${AFD_CATLASS_92_DIR})
         set(AFD_MC2_ACTIVATION_DIR "${AFD_MC2_92_DIR}")
     endif()
+    # The generated activation header lives outside the SDK utils directory.
+    # Resolve sibling includes such as swiglu_epilogue_common.hpp from CANN 9.3.
+    list(APPEND KERNEL_COMPILE_OPTS -I${AFD_MC2_ACTIVATION_DIR}/utils)
     # Keep the SDK pipeline while matching Layered's activation rounding.
     execute_process(
         COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/afd_mega_moe_patch_activation.py"

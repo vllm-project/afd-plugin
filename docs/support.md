@@ -45,13 +45,21 @@ FFN remains connector-driven. The row's upgrade evidence retains its original
 scope; MRV2 deployment settings are documented in the
 [CAM async guide](npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#modelrunnerv2-deployment).
 
-Both backends target vLLM `0.32.0` (`5df63a72`); Ascend additionally targets
-vLLM-Ascend `bd42eea0`. Source-specific
-H20 model, topology, execution-mode and accuracy results are recorded in
-the [GPU upgrade validation matrix](https://github.com/vllm-project/afd-plugin/pull/501)
+The GPU backend targets vLLM `0.34.0` (`62d4bc3c`). The single-node H20-3e
+upgrade validation used the first 300 GSM8K samples per case. It covers V4
+Flash AFD eager and graph DBO and five DeepEP M2N scenarios each for
+DeepSeek-V2-Lite and Qwen3-30B-A3B. The M2N cases cover eager and graph DP2,
+graph + DBO DP2, and eager and graph TP2. The record also carries forward
+earlier vLLM 0.34 GPU gates for V2-Lite, Qwen3, Qwen3.6, and V4 Flash with
+their recorded provenance. See the [0.34 upgrade record](https://github.com/vllm-project/afd-plugin/pull/617).
+
+The Ascend backend targets vLLM `0.34.0` (`62d4bc3c`) and vLLM-Ascend
+`7dcdb690` on Ubuntu 22.04 arm64 with CANN 9.3.0. See the
+[pinned A3 environment](installation.md#ascend-npu-installation) and
+[NPU upgrade scope](https://github.com/vllm-project/afd-plugin/issues/613).
+Historical H20 GPU results for the 0.32 upgrade are in the
+[GPU upgrade validation matrix](https://github.com/vllm-project/afd-plugin/pull/501)
 and [runtime-fix validation matrix](https://github.com/vllm-project/afd-plugin/pull/502).
-Those records identify the exact tested revisions. Earlier GPU results on
-vLLM 0.30 do not establish vLLM 0.32 hardware qualification.
 
 ## Validation limits
 
@@ -59,11 +67,11 @@ vLLM 0.30 do not establish vLLM 0.32 hardware qualification.
   full-dataset accuracy, numerical equivalence, or performance improvement.
 - DeepSeek-V2-Lite TP2 Graph + DBO and DP2 eager DBO can require force
   killing during shutdown. Inference success does not imply graceful exit.
-- Native V4 DBO requires a compatible upstream communication backend. The
-  recorded native V4 accuracy reference uses Graph without DBO.
-- NPU 0.32 evidence is limited to the configurations and checks in the
-  [validation record](https://github.com/vllm-project/afd-plugin/pull/507); the seven AFD Lite
-  cases failed graceful exit. Historical NPU results do not qualify 0.32.
+- On H20, the two native V4 DBO controls on vLLM 0.34 failed during warmup
+  because the CUDA CuTeDSL compressor received an unaligned positions tensor.
+  The passing native V4 controls use eager and Graph without DBO.
+- The historical NPU 0.32 [validation record](https://github.com/vllm-project/afd-plugin/pull/507)
+  records graceful-exit failures in seven AFD Lite cases.
 
 Historical [NPU validation](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923)
 and [DBO repair](https://github.com/vllm-project/afd-plugin/pull/430#issuecomment-6063840311)
@@ -73,6 +81,4 @@ their [E2E limits](../tests/e2e/README.md#dsv4-flash-sync-camp2p-concurrent-requ
 GPU/NPU rank topology and connector resource rules remain owned by
 [connector contracts](design/module/connector_contracts.md).
 
-The repository does not record a canonical CUDA container or assert an
-official tag for the Ascend source pin `bd42eea0`; environment evidence is
-not an authoritative package tag.
+The repository does not record a canonical CUDA container.

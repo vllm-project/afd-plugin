@@ -27,8 +27,8 @@ validation_paths:
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_runtime_classpaths.py"
 upstream_refs:
-  - "GPU: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
-  - "NPU target: vLLM 0.32.0 5df63a7203cdb9328d824a27b682e77c7b9928be"
+  - "GPU: vLLM 0.34.0 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca"
+  - "NPU target: vLLM 0.34.0 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca"
   - "vLLM vllm.general_plugins entry-point group"
   - "vLLM vllm.config.VllmConfig"
 verified_platform_refs:

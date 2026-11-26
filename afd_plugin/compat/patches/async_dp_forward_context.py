@@ -1,32 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Patches for AFD async-DP forward-context coordination.
+"""Ascend patch for AFD async-DP forward-context coordination.
 
-This module patches:
-1. ``vllm.forward_context.set_forward_context``
+The async connector owns token coordination, so AFD async configs skip
+vLLM's DP metadata setup. Ascend plugin registration binds the patch to the
+vLLM forward-context factory and its already-imported MRV2 aliases.
 
-Why:
-    vLLM 0.32.0 constructs ``DPMetadata`` and coordinates token counts across
-    MoE DP ranks whenever DP size is greater than one. AFD async-DP uses the
-    connector data flow instead of vLLM's DP metadata control plane, so those
-    all-reduce and metadata paths must be skipped for the AFD async connector.
-
-How:
-    This module is imported by ``register_afd()``. Importing it patches
-    ``set_forward_context`` in-place. The patched function expands the pinned
-    upstream implementation and only changes the DP metadata section for AFD
-    async configs.
-
-Future plan:
-    Remove this patch when vLLM exposes a plugin-owned way to opt out of MoE
-    DP metadata coordination per engine role.
+Remove this patch when vLLM exposes a per-engine DP metadata opt-out.
 """
 
 from __future__ import annotations
 
 import sys
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any
 
 import vllm.forward_context as forward_context_module
 from vllm.config import CUDAGraphMode
@@ -40,24 +27,21 @@ if TYPE_CHECKING:
     import torch
     from vllm.config import VllmConfig
     from vllm.forward_context import BatchDescriptor
-    from vllm.v1.attention.backend import AttentionMetadata
     from vllm.v1.worker.ubatch_utils import UBatchSlices
 
-    AttentionMetadataMapping: TypeAlias = (
-        dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]]
-    )
 _FORWARD_CONTEXT_IMPORT_MODULES = (
-    "vllm.v1.worker.gpu_model_runner",
+    "vllm.v1.worker.gpu.cudagraph_utils",
+    "vllm.v1.worker.gpu.kv_connector",
     "vllm.v1.worker.gpu.model_runner",
-    "vllm.v1.worker.kv_connector_model_runner_mixin",
     "vllm_ascend.ascend_forward_context",
+    "vllm_ascend.worker.v2.aclgraph_utils",
 )
 
 
-# Upstream source: vLLM v0.32.0 (5df63a7203cdb9328d824a27b682e77c7b9928be),
+# Upstream source: vLLM v0.34.0 (62d4bc3c7e33b1b6c906e233e6af2d3506c482ca),
 # vllm/forward_context.py::set_forward_context.
-# Patch reason: upstream set_forward_context always creates DPMetadata for MoE
-# DP ranks, but AFD async-DP uses connector-driven coordination instead.
+# Patch reason: upstream coordinates MoE DP metadata in set_forward_context,
+# but AFD async-DP uses connector-driven coordination instead.
 # Patch functionality: preserves the target upstream tag's forward-context
 # setup and skips DPMetadata creation only for AFD async-DP configs.
 # Signature: matches upstream; no added parameters.
@@ -128,10 +112,8 @@ def set_forward_context(
         )
     # ### PATCH END: AFD async-DP forward context metadata
 
-    # Convenience: if cudagraph is used and num_tokens is given, we can just
-    # create a batch descriptor here if not given (there's no harm since if it
-    # doesn't match in the wrapper it'll fall through).
-    if cudagraph_runtime_mode != CUDAGraphMode.NONE and num_tokens is not None:
+    # Preserve the batch size before model-level sequence parallelism.
+    if num_tokens is not None:
         batch_descriptor = batch_descriptor or forward_context_module.BatchDescriptor(
             num_tokens=num_tokens,
         )
@@ -206,7 +188,7 @@ def set_forward_context(
                     )
 
 
-if _is_target_vllm_compatible():
+if _is_target_vllm_compatible("npu"):
     forward_context_module.set_forward_context = set_forward_context
     for module_name in _FORWARD_CONTEXT_IMPORT_MODULES:
         module = sys.modules.get(module_name)

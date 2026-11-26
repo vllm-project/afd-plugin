@@ -42,7 +42,8 @@ or any behavior that intentionally differs from the original AFD commit.
 
 - [ ] Purpose is clear and linked to public context when possible.
 - [ ] Scope is bounded.
-- [ ] Compatibility with vLLM v0.32.0 and, for NPU changes, the pinned vLLM-Ascend source is considered, as applicable.
+- [ ] GPU changes consider vLLM v0.34.0 compatibility. Ascend changes
+  consider vLLM v0.34.0 and the pinned vLLM-Ascend revision.
 - [ ] No changes are made to the vLLM source checkout.
 - [ ] Plugin-owned classes or explicit dotted class paths are preferred over monkey patches.
 - [ ] Any compat shim or monkey patch is isolated, idempotent, version-guarded, documented, and tested.

@@ -320,13 +320,10 @@ class AFDQwen3_5Model(native.Qwen3_5Model):  # noqa: N801
         )
         # Needed by the inherited native loader's fused shared-expert routing;
         # role-local shells never enable the fused path.
-        self.is_fused_shared_expert_enabled = (
-            native.is_model_fused_shared_expert_compatible(
-                self.layers,
-                native.Qwen3NextSparseMoeBlock,
-                "mlp",
-            )
-        )
+        # vLLM 0.34 replaced the model-level boolean with the per-layer set the
+        # native loader consumes (qwen3_5.py:264, :287). AFD never builds the
+        # native fused path, so the empty set is the former `False`.
+        self.fused_shared_expert_layers: frozenset[int] = frozenset()
         self.make_empty_intermediate_tensors = (
             native.make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"],

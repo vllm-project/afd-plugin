@@ -19,12 +19,8 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.spec_decode.dflash import cudagraph as dflash_cudagraph
-from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
 from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.worker.v2.spec_decode.dflash.aclgraph import DFlashAclGraphManager
-from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
-    prepare_dflash_inputs_factory,
-)
 from vllm_ascend.worker.v2.spec_decode.dspark.speculator import AscendDSparkSpeculator
 
 from afd_plugin.v1.worker.attention_model_runner_v2 import _AFDCaptureEventTracker
@@ -167,63 +163,22 @@ class AFDDSparkSpeculator(AscendDSparkSpeculator):
         self.afd_context = afd_context
         self.afd_runner = afd_runner
 
-    @contextmanager
-    def _physical_input_preparation(self, *, enabled: bool = True) -> Iterator[None]:
-        original_prepare = dflash_speculator.prepare_dflash_inputs
-        if enabled:
-            dflash_speculator.prepare_dflash_inputs = self._afd_prepare_inputs
-        try:
-            yield
-        finally:
-            dflash_speculator.prepare_dflash_inputs = original_prepare
-
-    # Upstream: vLLM 5df63a72 DFlashSpeculator.capture, inherited by Ascend
-    # bd42eea0 DSpark. Signature matches. Delegate native context/KV and Markov
-    # capture, adding draft-local AFD metadata and the physical block size.
-    # Remove when native capture exposes metadata and physical-size hooks.
+    # Upstream: vLLM 62d4bc3c DFlashSpeculator.capture, inherited by Ascend
+    # 7dcdb690 DSpark. Signature matches. Delegate native context/KV and Markov
+    # capture, adding draft-local AFD metadata.
+    # Remove when native capture exposes a metadata hook.
     def capture(self) -> None:
         # ### PATCH START: scope native draft capture.
         assert self.query_cudagraph_manager is not None
         manager = cast(DFlashAclGraphManager, self.query_cudagraph_manager)
         with (
             self.afd_context(True, False),
-            self._physical_input_preparation(),
             _use_afd_draft_capture(self.afd_runner, manager),
         ):
             super().capture()
         # ### PATCH END: scope native draft capture.
 
-    # Upstream: Ascend bd42eea0, AscendDSparkSpeculator.set_attn.
-    # Its input factory captures the global cache_config.block_size, which can
-    # differ from hybrid draft groups. Keep native initialization and replace
-    # only this proposal's input factory with the allocated physical size.
-    # Signature matches upstream. Remove after the native factory uses each
-    # group's physical block size instead of the global scheduler setting.
-    def set_attn(
-        self,
-        model_state: Any,
-        kv_cache_config: Any,
-        block_tables: Any,
-        target_input_buffers: Any,
-        target_attn_groups: Any,
-    ) -> None:
-        super().set_attn(
-            model_state,
-            kv_cache_config,
-            block_tables,
-            target_input_buffers,
-            target_attn_groups,
-        )
-        # ### PATCH START: retain the actual physical draft block size
-        sizes = {block_tables.block_sizes[gid] for gid in self.draft_kv_cache_group_ids}
-        if len(sizes) != 1:
-            raise ValueError("AFD DSpark requires one physical draft KV block size")
-        self._afd_prepare_inputs = prepare_dflash_inputs_factory(
-            sizes.pop(), block_tables
-        )
-        # ### PATCH END: retain the actual physical draft block size
-
-    # Upstream: Ascend bd42eea0, AscendDSparkSpeculator.propose.
+    # Upstream: Ascend 7dcdb690, AscendDSparkSpeculator.propose.
     # Patch reason: native sample_tokens proposes after execute_model returns;
     # the target's AFD provider has already left scope. Draft query token counts
     # also differ from the target counts.
@@ -263,13 +218,7 @@ class AFDDSparkSpeculator(AscendDSparkSpeculator):
             if manager is not None
             else nullcontext()
         )
-        with (
-            self.afd_context(dummy_run, is_profile),
-            self._physical_input_preparation(
-                enabled=not (dummy_run and skip_attn_for_dummy_run)
-            ),
-            replay_scope,
-        ):
+        with self.afd_context(dummy_run, is_profile), replay_scope:
             return super().propose(
                 input_batch,
                 attn_metadata,

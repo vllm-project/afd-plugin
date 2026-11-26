@@ -8,7 +8,8 @@ body:
     attributes:
       value: >
         Before submitting, please search existing issues to avoid duplicates.
-        afd-plugin targets vLLM v0.32.0 on GPU and NPU unless an issue says otherwise.
+        The GPU backend targets vLLM v0.34.0. The Ascend backend targets
+        vLLM v0.34.0 and the pinned vLLM-Ascend revision.
 
   - type: markdown
     attributes:

@@ -3,7 +3,7 @@
 """Patch vLLM-Ascend platform config normalization for AFD-owned DBO.
 
 Upstream source: ``vllm_ascend/platform.py::NPUPlatform.check_and_update_config``
-at commit ``bd42eea01d8312c4df469fabaed45f77a12df4d3``.
+at commit ``19c063b5471f90e158e163d27c2e0cc54af1700e``.
 """
 
 from __future__ import annotations
@@ -57,9 +57,8 @@ def apply_afd_ascend_dbo_config_patch() -> bool:
     original_check_and_update_config = NPUPlatform.check_and_update_config
 
     # Patch reason: vLLM-Ascend resets DBO fields in _fix_incompatible_config and
-    # later rewrites all2all_backend in check_and_update_config, while AFD owns
-    # the Ascend DBO/ubatching path and temporarily supplies a validation-safe
-    # backend.
+    # may rewrite all2all_backend during AscendConfig derivation. AFD owns the
+    # Ascend DBO/ubatching path and supplies a temporary backend for validation.
     # Patch functionality: preserves upstream normalization for non-AFD configs and
     # restores AFD DBO fields plus the temporary ubatching backend after upstream
     # normalization for AFD-enabled configs. The native platform pass uses the

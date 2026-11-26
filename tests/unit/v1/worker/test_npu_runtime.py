@@ -380,7 +380,6 @@ def test_npu_ffn_runner_warmup_uses_eager_forward_without_graph(monkeypatch):
     runner.max_num_tokens = 1
     runner.use_aclgraph = True
     runner._acl_graphs = {}
-    capture_flags: list[bool] = []
 
     def fail_capture_stream(*args, **kwargs):
         raise AssertionError("warmup must not create a capture stream")
@@ -390,11 +389,6 @@ def test_npu_ffn_runner_warmup_uses_eager_forward_without_graph(monkeypatch):
         ffn_model_runner,
         "ascend_forward_context",
         _fake_ffn_ascend_forward_context,
-    )
-    monkeypatch.setattr(
-        ffn_model_runner,
-        "set_cudagraph_capturing_enabled",
-        capture_flags.append,
     )
     monkeypatch.setattr(ffn_model_runner.torch.npu, "mem_get_info", lambda: (0, 0))
     metadata = AFDTransferMetadata.create_attention_metadata(
@@ -409,7 +403,6 @@ def test_npu_ffn_runner_warmup_uses_eager_forward_without_graph(monkeypatch):
         is_warmup=True,
     )
 
-    assert capture_flags == [True, False]
     assert runner.connector.ffn_outputs == [
         ("npu-ffn(hidden, layer=0)", metadata, {"ubatch_idx": 0}),
     ]
@@ -449,11 +442,6 @@ def test_npu_ffn_runner_capture_stores_acl_graph_and_skips_duplicate_state_updat
         lambda graph, pool: nullcontext(),
     )
     monkeypatch.setattr(ffn_model_runner.torch.npu, "NPUGraph", _FakeGraph)
-    monkeypatch.setattr(
-        ffn_model_runner,
-        "set_cudagraph_capturing_enabled",
-        lambda enabled: None,
-    )
     monkeypatch.setattr(ffn_model_runner.torch.npu, "mem_get_info", lambda: (0, 0))
     metadata = AFDTransferMetadata.create_attention_metadata(
         layer_idx=0,
