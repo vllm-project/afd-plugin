@@ -380,7 +380,7 @@ def test_patch_preserves_upstream_signature(
     else:
         expected_module = target
     expected = _upstream_signature(expected_module, owner, symbol, locals())
-    binding = target
+    binding: object = target
     patch_symbol = symbol
     auxiliary_bindings = []
     if scope_name == "capture-inputs":

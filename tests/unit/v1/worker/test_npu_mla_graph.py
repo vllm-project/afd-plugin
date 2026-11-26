@@ -14,7 +14,7 @@ from tests.unit.fakes.async_ffn import load_host_module
 
 @pytest.fixture
 def graph_runtime(monkeypatch):
-    stage = ContextVar("test_ubatch")
+    stage: ContextVar[int] = ContextVar("test_ubatch")
     ubatching = ModuleType("vllm.v1.worker.ubatching")
     vars(ubatching)["dbo_current_ubatch_id"] = stage.get
     updatable = ModuleType("vllm_ascend.compilation.updatable_graph")
@@ -78,7 +78,9 @@ def test_equal_shape_stages_refresh_each_captured_task(graph_runtime):
 
 
 @pytest.mark.parametrize("instance_override", [False, True])
-def test_replay_failure_restores_the_native_binding(graph_runtime, instance_override):
+def test_replay_failure_restores_the_native_binding(
+    graph_runtime, instance_override, monkeypatch
+):
     runtime, _ = graph_runtime
     graph = _NativeGraph()
     graph.register_task(None, {}, _NativeProvider("layer"))
@@ -89,7 +91,7 @@ def test_replay_failure_restores_the_native_binding(graph_runtime, instance_over
         def prior_override(desc, attn_metadata):
             return (*original_replay(desc, attn_metadata), "instance")
 
-        manager._updatable_graph_replay = prior_override
+        monkeypatch.setattr(manager, "_updatable_graph_replay", prior_override)
 
     expected = manager.run_fullgraph("one-stage")
     with (

@@ -170,17 +170,13 @@ def construct_model(torch):
 def construct_gate(torch):
     nn = torch.nn
 
-    class RemoteFFNProxy(nn.Module):
-        def __init__(self, *, layer_idx):
-            super().__init__()
-
     def make_linear(input_size, output_size, *, bias, **_):
         return nn.Linear(input_size, output_size, bias=bias)
 
     namespace = {
         "nn": nn,
         "torch": torch,
-        "RemoteFFNProxy": RemoteFFNProxy,
+        "RemoteFFNProxy": nn.Identity,
         "ReplicatedLinear": make_linear,
     }
     exec(_compile_constructors("AFDDeepseekV4AttentionGateRemoteMoE"), namespace)
