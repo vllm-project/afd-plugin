@@ -47,14 +47,22 @@ def snapshot(runner) -> dict:
     names = tuple(name for name, _ in draft.named_parameters())
     kv_groups = []
     if not is_ffn:
-        tables = runner.speculator.block_tables
+        speculator = runner.speculator
+        tables = speculator.block_tables
+        # Ascend stores manager block sizes on the table. Each draft backend's
+        # metadata builder owns the effective kernel block size for its group.
         kv_groups = [
             {
                 "group": gid,
                 "physical_block_size": tables.block_sizes[gid],
-                "kernel_block_size": tables.kernel_block_sizes[gid],
+                "kernel_block_sizes": sorted(
+                    {
+                        group.get_metadata_builder().kv_cache_spec.block_size
+                        for group in speculator.attn_groups[gid]
+                    }
+                ),
             }
-            for gid in runner.speculator.draft_kv_cache_group_ids
+            for gid in speculator.draft_kv_cache_group_ids
         ]
     return {
         "pid": os.getpid(),

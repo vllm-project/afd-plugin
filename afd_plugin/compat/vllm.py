@@ -9,27 +9,13 @@ import warnings
 from importlib.metadata import PackageNotFoundError, version
 from typing import Final
 
-# The GPU backend targets vLLM 0.34.0. The Ascend backend keeps its tested
-# 0.32.0 source pair; moving it to 0.34 is tracked separately in RFC #613.
 TARGET_VLLM_VERSION: Final[str] = "0.34.0"
-TARGET_NPU_VLLM_VERSION: Final[str] = "0.32.0"
-SUPPORTED_VLLM_VERSIONS: Final[tuple[str, ...]] = (
-    TARGET_VLLM_VERSION,
-    TARGET_NPU_VLLM_VERSION,
-)
+TARGET_NPU_VLLM_VERSION: Final[str] = TARGET_VLLM_VERSION
+SUPPORTED_VLLM_VERSIONS: Final[tuple[str, ...]] = (TARGET_VLLM_VERSION,)
 
 
 def get_target_vllm_version(device_type: str | None = None) -> str:
-    """Return the vLLM pin for the calling backend.
-
-    ``device_type`` is the active platform's device type. Callers that can
-    observe the runtime pass it explicitly; the default keeps the GPU pin.
-    """
-    if device_type == "npu":
-        # Keep the Ascend 0.32 pin until RFC #613 qualifies native and AFD
-        # startup on the 0.34 vLLM-Ascend pair.
-        # See https://github.com/vllm-project/afd-plugin/issues/613.
-        return TARGET_NPU_VLLM_VERSION
+    """Return the vLLM pin shared by CUDA and Ascend."""
     return TARGET_VLLM_VERSION
 
 
@@ -84,11 +70,9 @@ def assert_vllm_version_supported(
 def is_target_vllm_compatible(device_type: str | None = None) -> bool:
     """Return whether compatibility patches may install.
 
-    With no ``device_type``, any supported pin qualifies: the compatibility
-    patches are shared, and the GPU (0.34) and Ascend (0.32) runtimes each need
-    them installed. Pass ``device_type`` to require the matching pin at a
-    backend-specific seam. Both forms accept development builds of the pin.
-    Only the shared form permits a missing vLLM version for CPU-safe imports.
+    Both backends accept development builds of the shared pin. A missing
+    vLLM version is permitted for CPU-safe imports of shared patches, when
+    ``device_type`` is omitted.
     """
     try:
         import vllm
@@ -100,11 +84,7 @@ def is_target_vllm_compatible(device_type: str | None = None) -> bool:
         installed = _parse_release(str(version_value))
     except ValueError:
         return False
-    if device_type is not None:
-        return installed == _parse_release(get_target_vllm_version(device_type))
-    return any(
-        installed == _parse_release(supported) for supported in SUPPORTED_VLLM_VERSIONS
-    )
+    return installed == _parse_release(get_target_vllm_version(device_type))
 
 
 __all__ = [

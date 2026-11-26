@@ -1,127 +1,107 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Graph-local MLA parameter helpers for Ascend ubatch execution."""
+"""Bind Ascend graph tasks to the live metadata of their capture microbatch."""
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, TypeVar
+from dataclasses import dataclass
+from types import MethodType
+from typing import TYPE_CHECKING, Any
 
-from afd_plugin.compat.patches.npu.mla_graph import (
-    AFD_MLA_GRAPH_PARAMS_KEY,
-)
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+from vllm_ascend.compilation.updatable_graph import _ACTIVE_GRAPH
 
 if TYPE_CHECKING:
-    import torch
-    from vllm.forward_context import ForwardContext
-    from vllm_ascend.compilation.acl_graph import GraphParams
-
-MetadataT = TypeVar("MetadataT")
-
-
-def new_mla_graph_params(
-    num_tokens: int,
-    workspace: torch.Tensor,
-) -> GraphParams:
-    """Create an empty MLA registry for one token shape and FIA workspace."""
-    # Delay the NPU-only import so this helper remains CPU-import-safe.
-    from vllm_ascend.compilation.acl_graph import GraphParams
-
-    return GraphParams(
-        events={num_tokens: []},
-        workspaces={num_tokens: workspace},
-        handles={num_tokens: []},
-        attn_params={num_tokens: []},
+    from vllm_ascend.compilation.updatable_graph import (
+        ParamProvider,
+        Params,
+        UpdatableGraph,
     )
+    from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 
 
-def merge_mla_graph_params(
-    attn_metadata: list[dict[str, MetadataT]],
-    graph_params: tuple[GraphParams, GraphParams],
-    num_tokens: int,
-) -> tuple[dict[tuple[str, int], MetadataT], GraphParams]:
-    """Validate and merge two stage-local MLA registries for graph replay."""
-    if len(attn_metadata) != 2 or len(graph_params) != 2:
-        raise RuntimeError(
-            "MLA DBO FULL graph requires exactly two metadata stages; "
-            f"got metadata={len(attn_metadata)}, params={len(graph_params)}",
-        )
+@dataclass(frozen=True, slots=True)
+class _UBatchParamProvider:
+    ubatch_id: int
+    native_provider: ParamProvider
 
-    layer_keys = tuple(attn_metadata[0])
-    if tuple(attn_metadata[1]) != layer_keys:
-        raise RuntimeError("MLA DBO FULL graph layer order differs by stage")
-
-    expected_records = len(layer_keys)
-    for stage_index, params in enumerate(graph_params):
-        record_counts = (
-            len(params.events[num_tokens]),
-            len(params.handles[num_tokens]),
-            len(params.attn_params[num_tokens]),
-        )
-        if record_counts != (
-            expected_records,
-            expected_records,
-            expected_records,
-        ):
-            raise RuntimeError(
-                "MLA DBO FULL graph record count mismatch for "
-                f"stage {stage_index}: metadata={expected_records}, "
-                f"events={record_counts[0]}, handles={record_counts[1]}, "
-                f"params={record_counts[2]}",
-            )
-
-    workspace = graph_params[0].workspaces[num_tokens]
-    if graph_params[1].workspaces[num_tokens] is not workspace:
-        raise RuntimeError(
-            "MLA DBO FULL graph requires one shared FIA workspace",
-        )
-
-    merged_metadata: dict[tuple[str, int], MetadataT] = {}
-    merged = new_mla_graph_params(num_tokens, workspace)
-
-    # Preserve the updater's layer-major, stage-minor record order.
-    for layer_index, layer_key in enumerate(layer_keys):
-        for stage_index in range(2):
-            params = graph_params[stage_index]
-            merged_key = (layer_key, stage_index)
-            merged_metadata[merged_key] = attn_metadata[stage_index][layer_key]
-            merged.events[num_tokens].append(
-                params.events[num_tokens][layer_index],
-            )
-            merged.handles[num_tokens].append(
-                params.handles[num_tokens][layer_index],
-            )
-            merged.attn_params[num_tokens].append(
-                params.attn_params[num_tokens][layer_index],
-            )
-
-    return merged_metadata, merged
+    def resolve(self, metadata: Sequence[dict[str, Any] | None]) -> Params:
+        return self.native_provider.resolve(metadata[self.ubatch_id])
 
 
 @contextmanager
-def override_mla_graph_params(
-    forward_context: ForwardContext,
-    attn_metadata: dict[tuple[str, int], MetadataT],
-    graph_params: GraphParams,
+def _bind_graph_method(
+    graph_or_manager: UpdatableGraph | ModelAclGraphManager,
+    method: Callable[..., Any],
 ) -> Iterator[None]:
-    """Temporarily expose merged MLA state to the upstream graph updater."""
-    original_metadata = forward_context.attn_metadata
-    original_additional_kwargs = forward_context.additional_kwargs
-    # Do not mutate the parent context's shared additional_kwargs mapping.
-    temporary_kwargs = dict(original_additional_kwargs or {})
-    temporary_kwargs[AFD_MLA_GRAPH_PARAMS_KEY] = graph_params
-    forward_context.attn_metadata = attn_metadata
-    forward_context.additional_kwargs = temporary_kwargs
+    name = method.__name__
+    bindings = vars(graph_or_manager)
+    has_override = name in bindings
+    previous = bindings.get(name)
+    bindings[name] = MethodType(method, graph_or_manager)
     try:
         yield
     finally:
-        forward_context.attn_metadata = original_metadata
-        forward_context.additional_kwargs = original_additional_kwargs
+        if has_override:
+            bindings[name] = previous
+        else:
+            del bindings[name]
 
 
-__all__ = [
-    "merge_mla_graph_params",
-    "new_mla_graph_params",
-    "override_mla_graph_params",
-]
+@contextmanager
+def use_ubatch_capture_graph(graph: UpdatableGraph) -> Iterator[None]:
+    """Expose the parent capture graph inside one existing microbatch thread."""
+    token = _ACTIVE_GRAPH.set(graph)
+    try:
+        yield
+    finally:
+        _ACTIVE_GRAPH.reset(token)
+
+
+@contextmanager
+def use_ubatch_graph_registration(graph: UpdatableGraph) -> Iterator[None]:
+    """Register distinct native providers for equal-shape microbatches."""
+    native_register_task = graph.register_task
+
+    # Upstream: Ascend 7dcdb690, compilation/updatable_graph.py.
+    # Equal-sized stages can produce equal providers for the same layer. Tag
+    # the provider before native registration groups handles by provider.
+    # Signature matches UpdatableGraph.register_task. Delegate native capture
+    # event/handle/resource ownership. Remove when providers carry stage IDs.
+    def register_task(
+        self,
+        operation: Callable[..., Any],
+        kwargs: dict[str, Any],
+        provider: ParamProvider,
+    ) -> None:
+        # ### PATCH START: key graph tasks by their capture stage
+        native_register_task(
+            operation, kwargs, _UBatchParamProvider(dbo_current_ubatch_id(), provider)
+        )
+        # ### PATCH END: key graph tasks by their capture stage
+
+    with _bind_graph_method(graph, register_task):
+        yield
+
+
+@contextmanager
+def use_ubatch_replay_metadata(
+    manager: ModelAclGraphManager, stages: Sequence[dict[str, Any] | None]
+) -> Iterator[None]:
+    """Supply all live stage metadata at the native task-resolution entry."""
+    native_replay = manager._updatable_graph_replay
+
+    # Upstream: Ascend 7dcdb690, worker/v2/aclgraph_utils.py.
+    # The public manager replay handles graph selection and cleanup. Change
+    # only the metadata passed to the native updatable-graph branch, preserving
+    # its resolve/wait/replay/update sequence. Signature matches upstream.
+    # Remove when the manager can resolve separate microbatch metadata itself.
+    def _updatable_graph_replay(self, desc, attn_metadata):
+        # ### PATCH START: resolve tasks with the current microbatch metadata
+        return native_replay(desc, stages)
+        # ### PATCH END: resolve tasks with the current microbatch metadata
+
+    with _bind_graph_method(manager, _updatable_graph_replay):
+        yield

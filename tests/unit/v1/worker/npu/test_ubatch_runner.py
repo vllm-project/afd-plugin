@@ -9,8 +9,11 @@ double models bd42eea0's padded/actual row contract, not its NPU operators.
 from __future__ import annotations
 
 import sys
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import nullcontext
+from contextvars import ContextVar
 from enum import Enum
+from threading import Barrier, Event
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -87,10 +90,11 @@ class _NativeUBatchRunner:
     stage_attn_groups: list[list[list[_DSAGroup]]]
     kv_cache_config: object
 
-    def prepare(self, batch, tables, slots, cg_mode, for_capture):
+    def prepare(self, batch, tables, slots, batch_desc, dp_sync_state, for_capture):
+        self.last_dp_sync_state = dp_sync_state
         return self.model_state.prepare_attn(
             batch,
-            cg_mode,
+            batch_desc.cg_mode,
             tables,
             slots,
             self.stage_attn_groups[0],
@@ -115,27 +119,14 @@ def runtime(monkeypatch):
 
     # Unused runtime entry points stay inert; no device or graph is simulated.
     for name, exports in {
-        "vllm.forward_context": (
-            "ForwardContext get_forward_context "
-            "override_forward_context set_forward_context"
-        ),
         "vllm.v1.kv_cache_interface": "KVCacheConfig",
-        "vllm.v1.worker.gpu.cudagraph_utils": (
-            "BatchExecutionDescriptor ModelCudaGraphManager"
-        ),
+        "vllm.v1.worker.gpu.cudagraph_utils": "BatchExecutionDescriptor",
+        "vllm.v1.worker.gpu.dp_utils": "DPSyncState",
         "vllm.v1.worker.gpu.input_batch": "InputBatch",
         "vllm.v1.worker.gpu.model_states.interface": "ModelState",
         "vllm.v1.worker.ubatch_utils": "UBatchSlices",
         "vllm.v1.worker.utils": "AttentionGroup",
-        "vllm_ascend.compilation.acl_graph": (
-            "GraphParams get_graph_params update_full_graph_params"
-        ),
-        "vllm_ascend.worker.v2.aclgraph_utils": (
-            "ModelAclGraphManager _get_graph_update_backend"
-        ),
-        "afd_plugin.v1.worker.npu.mla_graph": (
-            "merge_mla_graph_params new_mla_graph_params override_mla_graph_params"
-        ),
+        "vllm_ascend.worker.v2.aclgraph_utils": "ModelAclGraphManager",
     }.items():
         stub(name, **dict.fromkeys(exports.split(), object))
     stub(
@@ -145,7 +136,17 @@ def runtime(monkeypatch):
         set_current_vllm_config=nullcontext,
     )
     stub("vllm.platforms", current_platform=object())
-    stub("vllm.v1.worker.ubatching")
+    forward_context = stub(
+        "vllm.forward_context",
+        ForwardContext=object,
+        override_forward_context=nullcontext,
+        _forward_context=None,
+    )
+    stub(
+        "vllm.v1.worker.ubatching",
+        dbo_current_ubatch_id=lambda: 0,
+        forward_context=forward_context,
+    )
     stub("vllm.v1.worker.dp_utils", skip_dp_coordination=nullcontext)
     stub("vllm.v1.worker.workspace", use_workspace_lane=nullcontext)
     stub(
@@ -165,7 +166,11 @@ def runtime(monkeypatch):
         override_mrv2_in_profile_run=nullcontext,
     )
     stub("afd_plugin.compat.npu.runtime_config", uses_async_cam_dbo=lambda _: False)
-    stub("afd_plugin.compat.patches.npu.mla_graph", AFD_MLA_GRAPH_PARAMS_KEY="mla")
+    stub(
+        "vllm_ascend.compilation.updatable_graph",
+        _ACTIVE_GRAPH=ContextVar("capture_graph", default=None),
+        UpdatableGraph=object,
+    )
     stub(
         "afd_plugin.compat.patches.npu.mrv2_ubatching",
         **dict.fromkeys(
@@ -199,6 +204,7 @@ def runtime(monkeypatch):
         "vllm_ascend.ops.rope_dsv4", RopeDataProxy=_RopeProxy, get_cos_and_sin_dsa=_rope
     )
     load_host_module(monkeypatch, "afd_plugin.v1.worker.npu.attention_metadata")
+    load_host_module(monkeypatch, "afd_plugin.v1.worker.npu.mla_graph")
     module = load_host_module(monkeypatch, "afd_plugin.v1.worker.npu.ubatch_runner")
     return module
 
@@ -216,10 +222,65 @@ def runner(runtime):
     value.kv_cache_config = object()
     value.stage_attn_groups = [[[_DSAGroup(4)]], [[_DSAGroup(4)]]]
     value.ubatch_seq_lens = [torch.zeros(4), torch.zeros(4)]
-    value._uses_mla_graph_params = False
+    value._shares_mla_block_tables = False
     value._stage_block_tables = [None, None]
     value._stage_rope_buffers = [{}, {}]
     return value
+
+
+@pytest.mark.parametrize("fail_child", [False, True])
+def test_parked_children_see_the_parent_capture_graph(
+    runtime, runner, monkeypatch, fail_child
+):  # long-test: verifies ContextVar scope across real parked threads
+    graph = SimpleNamespace(register_task=lambda *_: None)
+    original_register_task = graph.register_task
+    ready = Barrier(3)
+    release = Event()
+    active_graph = runtime._ACTIVE_GRAPH
+
+    def model():
+        observed_graph = active_graph.get()
+        if fail_child:
+            assert observed_graph is graph
+            raise RuntimeError("child failed")
+        return observed_graph
+
+    def begin_native(self, forward, *_args):
+        def child():
+            ready.wait(timeout=5)
+            assert release.wait(timeout=5)
+            try:
+                return forward()
+            finally:
+                assert active_graph.get() is None
+
+        children = [pool.submit(child) for _ in range(2)]
+        ready.wait(timeout=5)
+
+        def finish():
+            release.set()
+            _, pending = wait(children, timeout=5)
+            assert not pending
+            return [future.result() for future in children]
+
+        return finish
+
+    monkeypatch.setattr(
+        _NativeUBatchRunner, "begin_capturable_run", begin_native, raising=False
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        finish = runner.begin_capturable_run(model, {}, None, for_capture=True)
+        token = active_graph.set(graph)
+        try:
+            if fail_child:
+                with pytest.raises(RuntimeError, match="child failed"):
+                    finish()
+            else:
+                assert finish() == [graph, graph]
+            assert active_graph.get() is graph
+            assert graph.register_task is original_register_task
+        finally:
+            active_graph.reset(token)
 
 
 def _batch(actual, padded, *, offset=0):
@@ -357,13 +418,16 @@ def test_prepare_restores_native_metadata_factory(
     batch = _batch(3, 5)
     table = torch.tensor([[11, 12], [13, 14]], dtype=torch.int32)
     slots = torch.arange(5)[None, :]
+    batch_desc = SimpleNamespace(cg_mode=_GraphMode.FULL)
+    dp_sync_state = object()
 
     if fail:
         with pytest.raises(RuntimeError, match="native preparation failed"):
-            runner.prepare(batch, (table,), slots, _GraphMode.FULL)
+            runner.prepare(batch, (table,), slots, batch_desc, dp_sync_state)
     else:
-        result = runner.prepare(batch, (table,), slots, _GraphMode.FULL)
+        result = runner.prepare(batch, (table,), slots, batch_desc, dp_sync_state)
         assert result["layer"].req_metadata.num_compressed_tokens == 3
+        assert runner.last_dp_sync_state is dp_sync_state
     if existing_override:
         assert runner.model_state.prepare_attn is original
     else:

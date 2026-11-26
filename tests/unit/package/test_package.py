@@ -83,7 +83,7 @@ def registration(monkeypatch, request):
         module = ModuleType(name)
         vars(module).update(attributes)
         monkeypatch.setitem(sys.modules, name, module)
-    installed_version = "0.32.0" if request.param == "npu" else "0.34.0"
+    installed_version = "0.34.0"
     monkeypatch.setattr(compat, "get_installed_vllm_version", lambda: installed_version)
     find_spec = importlib.util.find_spec
     monkeypatch.setattr(

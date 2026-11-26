@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from types import MethodType
 from typing import TYPE_CHECKING
@@ -106,10 +106,6 @@ class _AFDCaptureEventTracker:
 def _use_afd_ubatch_preparation(
     runner: AFDAttentionModelRunnerV2,
     event_tracker: _AFDCaptureEventTracker | None = None,
-    capture_prepared: Callable[
-        [v2_cudagraph_utils.BatchExecutionDescriptor, UBatchState, bool], None
-    ]
-    | None = None,
 ) -> Iterator[None]:
     """Publish one transaction from native prepared state before stage execution."""
     ubatch_runner = runner.ubatch_runner
@@ -138,13 +134,8 @@ def _use_afd_ubatch_preparation(
         # branch also bypasses prepare_inputs_to_capture.
         # Patch functionality: decorate native stage state and publish one complete
         # A/F payload before threads start (or before FULL replay).
-        # Signature: matches UBatchRunner.prepare in the *installed* upstream
-        # revision, because this seam is shared by both pins. GPU (0.34,
-        # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca) replaced the `cg_mode`
-        # parameter with `batch_desc` and inserted `dp_sync_state` before
-        # `for_capture`, reading the graph mode off the descriptor. Ascend still
-        # pins 0.32 (5df63a7203cdb9328d824a27b682e77c7b9928be), whose `prepare`
-        # takes `cg_mode` directly and has no DP sync state.
+        # Signature: matches vLLM 0.34 UBatchRunner.prepare, including the
+        # batch descriptor and DP-agreed microbatch split.
         # Delegation exception: keep native slicing/attention preparation in the
         # bound method. Remove this seam when upstream offers a prepared-state
         # callback; no runner class or module-global function is replaced here.
@@ -155,7 +146,7 @@ def _use_afd_ubatch_preparation(
         ) -> UBatchState:
             # ### PATCH START: bind AFD to native stage state outside graph execution.
             if event_tracker is not None:
-                desc, is_warmup = event_tracker.consume(
+                _, is_warmup = event_tracker.consume(
                     input_batch.num_reqs,
                     input_batch.num_tokens_after_padding,
                     len(prepared.slices),
@@ -163,8 +154,6 @@ def _use_afd_ubatch_preparation(
                 runner._is_warmup = is_warmup
                 runner._afd_is_graph_capturing = not is_warmup
                 runner._afd_is_graph_replaying = False
-                if capture_prepared is not None:
-                    capture_prepared(desc, prepared, is_warmup)
             else:
                 runner._afd_is_graph_replaying = cg_mode == CUDAGraphMode.FULL
             runner.install_mrv2_ubatch_metadata(
@@ -178,7 +167,7 @@ def _use_afd_ubatch_preparation(
         # Patch reason: publish AFD stage metadata before native execution.
         # Upstream: vLLM v0.34.0, vllm/v1/worker/gpu/ubatch_utils.py
         # UBatchRunner.prepare.
-        def prepare_v034(
+        def prepare(
             self,
             input_batch: InputBatch,
             block_tables: tuple[torch.Tensor, ...],
@@ -195,37 +184,11 @@ def _use_afd_ubatch_preparation(
                 dp_sync_state,
                 for_capture,
             )
-            # ### PATCH START: publish the prepared CUDA stage state.
+            # ### PATCH START: publish the prepared stage state.
             return _publish_prepared(input_batch, prepared, batch_desc.cg_mode)
-            # ### PATCH END: publish the prepared CUDA stage state.
+            # ### PATCH END: publish the prepared stage state.
 
-        # Patch reason: publish AFD stage metadata before native execution.
-        # Upstream: vLLM v0.32.0, vllm/v1/worker/gpu/ubatch_utils.py
-        # UBatchRunner.prepare.
-        # Retire the cg_mode signature after RFC #613 validates the 0.34
-        # batch_desc/dp_sync_state path publishes AFD stage metadata in eager
-        # and ACL Graph DBO on Ascend.
-        # See https://github.com/vllm-project/afd-plugin/issues/613.
-        def prepare_v032(
-            self,
-            input_batch: InputBatch,
-            block_tables: tuple[torch.Tensor, ...],
-            slot_mappings: torch.Tensor,
-            cg_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-            for_capture: bool = False,
-        ) -> UBatchState:
-            prepared = original_prepare(
-                input_batch, block_tables, slot_mappings, cg_mode, for_capture
-            )
-            # ### PATCH START: publish the prepared Ascend stage state.
-            return _publish_prepared(input_batch, prepared, cg_mode)
-            # ### PATCH END: publish the prepared Ascend stage state.
-
-        ubatch_runner.prepare = (
-            MethodType(prepare_v032, ubatch_runner)
-            if runner.device.type == "npu"
-            else MethodType(prepare_v034, ubatch_runner)
-        )
+        ubatch_runner.prepare = MethodType(prepare, ubatch_runner)
         try:
             yield
         finally:
@@ -265,7 +228,7 @@ def _use_afd_capture_input_preparation(
     # Signature: preserves slot_mappings_buffer for speculative capture.
     # Delegation keeps native input construction; remove when upstream adds a
     # capture metadata hook.
-    def prepare_inputs_to_capture_v034(
+    def prepare_inputs_to_capture(
         num_reqs: int,
         num_tokens: int,
         model_state: ModelState,
@@ -296,48 +259,7 @@ def _use_afd_capture_input_preparation(
         # ### PATCH END: stage one exact AFD capture event.
         return attention_state
 
-    # Upstream: vLLM v0.32.0, vllm/v1/worker/gpu/cudagraph_utils.py.
-    # Patch reason: Ascend uses this symbol for its warmup and ACL graph capture.
-    # Patch functionality: publish AFD metadata after native preparation.
-    # Signature: the pinned 0.32 call ends at pcp_manager.
-    # Delegation keeps native input construction as in the 0.34 wrapper.
-    # Retire this wrapper once #613 validates Ascend warmup, ACL Graph
-    # capture/replay, and AFD metadata with the 0.34 input preparation
-    # signature that accepts slot_mappings_buffer.
-    def prepare_inputs_to_capture_v032(
-        num_reqs: int,
-        num_tokens: int,
-        model_state: ModelState,
-        input_buffers: InputBuffers,
-        block_tables: BlockTables,
-        attn_groups: list[list[v2_worker_utils.AttentionGroup]],
-        kv_cache_config: KVCacheConfig,
-        full_cudagraph: bool,
-        max_query_len: int | None = None,
-        pcp_manager: PCPManager | None = None,
-    ) -> v2_cudagraph_utils.AttentionState:
-        attention_state = original_prepare(
-            num_reqs=num_reqs,
-            num_tokens=num_tokens,
-            model_state=model_state,
-            input_buffers=input_buffers,
-            block_tables=block_tables,
-            attn_groups=attn_groups,
-            kv_cache_config=kv_cache_config,
-            full_cudagraph=full_cudagraph,
-            max_query_len=max_query_len,
-            pcp_manager=pcp_manager,
-        )
-        # ### PATCH START: stage one exact AFD capture event.
-        publish_capture_event(num_reqs, num_tokens)
-        # ### PATCH END: stage one exact AFD capture event.
-        return attention_state
-
-    v2_cudagraph_utils.prepare_inputs_to_capture = (
-        prepare_inputs_to_capture_v032
-        if runner.device.type == "npu"
-        else prepare_inputs_to_capture_v034
-    )
+    v2_cudagraph_utils.prepare_inputs_to_capture = prepare_inputs_to_capture
     try:
         yield
     finally:

@@ -638,10 +638,9 @@ Deployment differences worth knowing:
   `connector_extra_config`, and requires `HCCL_IF_IP` and `HCCL_SOCKET_IFNAME`.
 - `--quantization` is resolved from the checkpoint: A5's FP8/W4A8 checkpoint
   decides, A3's int8 W8A8 loads through `ascend`.
-- Both disable `multistream_dsv4_dsa_overlap` and `enable_dsa_cp` and leave
-  the gate on FFN; KV transfer is not enabled. Shutdown allows 60 seconds, and
-  the async FFN cleanup exception does not apply because no CAM receive is
-  pending.
+- Both disable `multistream_dsv4_dsa_overlap` and KV transfer and leave the
+  gate on FFN. Shutdown allows 60 seconds, and the async FFN cleanup exception
+  does not apply because no CAM receive is pending.
 
 **Known limitation: A5 produces incorrect answers under concurrent load even
 with DBO off.** A3 answer correctness remains unverified. Passing these smoke

@@ -92,7 +92,7 @@ def test_ascend_forward_context_uses_native_mrv2_layout(
 @pytest.fixture
 def isolate_ascend_config_installer(monkeypatch):
     # AscendConfig installation has dedicated lifecycle tests; these tests
-    # exercise the DBO platform and MLA patches with minimal Ascend modules.
+    # exercise the DBO platform patch with minimal Ascend modules.
     module_name = "afd_plugin.compat.patches.npu.ascend_config"
     config_patch = ModuleType(module_name)
     config_patch.__dict__["apply_afd_ascend_config_patch"] = lambda: None
@@ -101,13 +101,10 @@ def isolate_ascend_config_installer(monkeypatch):
 
 @pytest.mark.usefixtures("isolate_ascend_config_installer")
 def test_npu_afd_config_patch_raises_and_retries_after_import_error(monkeypatch):
-    from afd_plugin.compat.patches.npu import mla_graph
-
     fake_package = ModuleType("vllm_ascend")
     fake_package.__path__ = []
     monkeypatch.setitem(sys.modules, "vllm_ascend", fake_package)
     monkeypatch.setitem(sys.modules, "vllm_ascend.platform", None)
-    monkeypatch.setattr(mla_graph, "apply_afd_mla_graph_patch", lambda: True)
     monkeypatch.setattr(ascend_runtime, "_PATCHES_APPLIED", False)
 
     with pytest.raises(RuntimeError, match="DBO config patch"):
@@ -140,47 +137,12 @@ def test_npu_afd_config_patch_raises_and_retries_after_import_error(monkeypatch)
 
 
 @pytest.mark.usefixtures("isolate_ascend_config_installer")
-def test_npu_patches_reject_missing_mla_resolver(monkeypatch):
+def test_npu_patches_install_without_the_retired_mla_resolver(monkeypatch):
     fake_vllm = ModuleType("vllm")
     fake_vllm.__path__ = []
     fake_forward_context = ModuleType("vllm.forward_context")
     fake_forward_context.__dict__["get_forward_context"] = lambda: None
     fake_forward_context.__dict__["is_forward_context_available"] = lambda: False
-    fake_ascend = ModuleType("vllm_ascend")
-    fake_ascend.__path__ = []
-    fake_platform = ModuleType("vllm_ascend.platform")
-    fake_attention = ModuleType("vllm_ascend.attention")
-    fake_attention.__path__ = []
-
-    class NPUPlatform:
-        @classmethod
-        def check_and_update_config(cls, vllm_config):
-            del cls, vllm_config
-
-    fake_platform.__dict__["NPUPlatform"] = NPUPlatform
-    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
-    monkeypatch.setitem(sys.modules, "vllm.forward_context", fake_forward_context)
-    monkeypatch.setitem(sys.modules, "vllm_ascend", fake_ascend)
-    monkeypatch.setitem(sys.modules, "vllm_ascend.platform", fake_platform)
-    monkeypatch.setitem(sys.modules, "vllm_ascend.attention", fake_attention)
-    monkeypatch.delitem(
-        sys.modules,
-        "vllm_ascend.attention.mla_v1",
-        raising=False,
-    )
-    monkeypatch.setattr(ascend_runtime, "_PATCHES_APPLIED", False)
-
-    with pytest.raises(RuntimeError, match="MLA graph patch"):
-        ascend_runtime.apply_afd_ascend_patches_if_needed()
-
-
-@pytest.mark.usefixtures("isolate_ascend_config_installer")
-def test_npu_patches_route_mla_graph_params_from_forward_context(
-    monkeypatch,
-):  # long-test: native MLA resolver selection and native fallback in one scope
-    fake_vllm = ModuleType("vllm")
-    fake_vllm.__path__ = []
-    fake_forward_context = ModuleType("vllm.forward_context")
     fake_ascend = ModuleType("vllm_ascend")
     fake_ascend.__path__ = []
     fake_platform = ModuleType("vllm_ascend.platform")
@@ -193,56 +155,16 @@ def test_npu_patches_route_mla_graph_params_from_forward_context(
         def check_and_update_config(cls, vllm_config):
             del cls, vllm_config
 
-    upstream_registry = object()
-    afd_registry = object()
-    forward_context = SimpleNamespace(
-        additional_kwargs={"afd_mla_graph_params": afd_registry},
-    )
-    context_available = True
-
-    def get_forward_context():
-        return forward_context
-
-    def is_forward_context_available():
-        return context_available
-
-    def get_graph_params():
-        return upstream_registry
-
-    fake_forward_context.__dict__["get_forward_context"] = get_forward_context
-    fake_forward_context.__dict__["is_forward_context_available"] = (
-        is_forward_context_available
-    )
     fake_platform.__dict__["NPUPlatform"] = NPUPlatform
-    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.forward_context",
+    for module in (
+        fake_vllm,
         fake_forward_context,
-    )
-    monkeypatch.setitem(sys.modules, "vllm_ascend", fake_ascend)
-    monkeypatch.setitem(sys.modules, "vllm_ascend.platform", fake_platform)
-    monkeypatch.setitem(sys.modules, "vllm_ascend.attention", fake_attention)
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm_ascend.attention.mla_v1",
+        fake_ascend,
+        fake_platform,
+        fake_attention,
         fake_mla,
-    )
+    ):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setattr(ascend_runtime, "_PATCHES_APPLIED", False)
 
-    with pytest.raises(AttributeError, match="get_graph_params"):
-        ascend_runtime.apply_afd_ascend_patches_if_needed()
-
-    fake_mla.__dict__["get_graph_params"] = get_graph_params
     ascend_runtime.apply_afd_ascend_patches_if_needed()
-
-    assert fake_mla.get_graph_params() is afd_registry
-
-    forward_context.additional_kwargs = {}
-    assert fake_mla.get_graph_params() is upstream_registry
-
-    context_available = False
-    assert fake_mla.get_graph_params() is upstream_registry
-
-    ascend_runtime.apply_afd_ascend_patches_if_needed()
-    assert fake_mla.get_graph_params() is upstream_registry

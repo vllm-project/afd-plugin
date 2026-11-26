@@ -111,9 +111,7 @@ def validate_async_cam_attention_graph(vllm_config: VllmConfig) -> None:
     """Validate AFD dependencies for native Async CAM Attention graphs."""
     model = vllm_config.model_config
     parallel = vllm_config.parallel_config
-    # 0.32 exposes use_v2_model_runner. Drop the field check after RFC #613
-    # verifies native 0.34 MRV1 rejection and Ascend DeepSeek-V4 Async CAM graphs.
-    # See https://github.com/vllm-project/afd-plugin/issues/613.
+    # Ascend exposes the MRV2 selection through its VllmConfig platform patch.
     if (
         not vllm_config.use_v2_model_runner
         or model.hf_text_config.model_type != "deepseek_v4"
@@ -219,8 +217,7 @@ def validate_npu_model_runner_v2_config(
 ) -> None:
     """Validate the supported Ascend NPU ModelRunnerV2 deployment."""
 
-    # Keep the 0.32 runner-selection check until #613 verifies native 0.34
-    # rejects MRV1 at both Ascend AFD startup entry points.
+    # Check the MRV2 selection supplied by the Ascend platform patch.
     if not vllm_config.use_v2_model_runner:
         raise RuntimeError("AFD NPU requires ModelRunnerV2")
     afd_config = parse_afd_config(vllm_config, expected_role=expected_role)

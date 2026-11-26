@@ -49,7 +49,9 @@ def factory_namespace() -> Iterator[
     from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_optional_afd_config
 
     runtime = runpy.run_path(str(REPO_ROOT / "afd_plugin/compat/npu/runtime_config.py"))
-    native = SimpleNamespace(_ASCEND_CONFIG=None, _INIT_VLLM_CONFIG=None)
+    native = SimpleNamespace(
+        _ASCEND_CONFIG=None, _INIT_VLLM_CONFIG=None, _MEGA_MOE_SUPPORTED=False
+    )
 
     class NativeConfig:
         __dataclass_fields__ = dict.fromkeys(
@@ -57,6 +59,7 @@ def factory_namespace() -> Iterator[
                 "native_option",
                 "enable_force_eplb",
                 "enable_shared_expert_dp",
+                "quantized_all_reduce_config",
                 "scheduler_config",
                 "sparse_kv_offload_config",
                 "kvpp_config",
@@ -78,6 +81,12 @@ def factory_namespace() -> Iterator[
             self.runtime_config_hot_reload = kwargs["runtime_config_hot_reload"]
             self.runtime_config = kwargs["runtime_config"]
             self.initialized = False
+            self._uses_quantized_all_reduce = kwargs.get(
+                "quantized_all_reduce_config", {}
+            ).get("enable", False)
+            self.quantized_all_reduce_config = SimpleNamespace(
+                _validate_preconditions=self.validate_quantized_all_reduce,
+            )
             self.rl_config = SimpleNamespace(apply=lambda config: None)
             self.finegrained_tp_config = SimpleNamespace(
                 _validate_preconditions=lambda config: None,
@@ -92,6 +101,16 @@ def factory_namespace() -> Iterator[
             if self.native_option == "invalid":
                 raise ValueError("native option failed validation")
             self.initialized = self.native_option != "partial"
+            self._megamoe_supported = bool(self.native_option)
+
+        def validate_quantized_all_reduce(self, config):
+            if (
+                self._uses_quantized_all_reduce
+                and config.parallel_config.tensor_parallel_size > 8
+            ):
+                raise ValueError(
+                    "quantized_all_reduce_config supports tensor_parallel_size <= 8"
+                )
 
         def _check_mix_placement(self):
             pass
@@ -108,6 +127,7 @@ def factory_namespace() -> Iterator[
         return config
 
     native.get_ascend_config = get_ascend_config
+    native.is_mega_moe_supported = lambda: native._MEGA_MOE_SUPPORTED
     utils = types.ModuleType("vllm_ascend.utils")
 
     @lru_cache(maxsize=1)
@@ -152,6 +172,7 @@ def factory_namespace() -> Iterator[
         "_is_ascend_config_initialized": lambda config: (
             config is not None and config.initialized
         ),
+        "is_draft_config_context": lambda: False,
         "validate_additional_config_bool": validate_bool,
         "logger": SimpleNamespace(
             warning_once=logger.warning,
@@ -187,13 +208,13 @@ class AscendConfigLifecycleTests(unittest.TestCase):
             self.assertEqual(additional, before)
             self.assertTrue(result.enable_force_eplb)
             self.assertTrue(utils.enable_sp())
-            for legacy_key in ("typo",):
+            for unknown_key in ("typo", "profiling_chunk_config"):
                 config.additional_config = {
                     "afd": {},
-                    legacy_key: True,
+                    unknown_key: True,
                     "refresh": True,
                 }
-                with self.assertRaisesRegex(ValueError, legacy_key):
+                with self.assertRaisesRegex(ValueError, unknown_key):
                     ns["init_ascend_config"](config)
                 self.assertIs(native.get_ascend_config(), result)
                 self.assertTrue(utils.enable_sp())
@@ -213,16 +234,40 @@ class AscendConfigLifecycleTests(unittest.TestCase):
             self.assertIsNot(second, first)
             self.assertIs(native.get_ascend_config(), second)
 
+    def test_draft_config_leaves_published_target_and_capability_in_place(self):
+        target_config = SimpleNamespace(additional_config={"native_option": 1})
+        draft_config = SimpleNamespace(additional_config={"native_option": 0})
+        with factory_namespace() as (ns, native, utils):
+            target = ns["init_ascend_config"](target_config)
+            with patch.dict(ns, {"is_draft_config_context": lambda: True}):
+                draft = ns["init_ascend_config"](draft_config)
+            self.assertEqual(draft.native_option, 0)
+            self.assertIs(native.get_ascend_config(), target)
+            self.assertTrue(native.is_mega_moe_supported())
+            self.assertTrue(utils.enable_sp())
+
     def test_native_validation_failure_keeps_published_config(self):
-        config = SimpleNamespace(additional_config={"native_option": 1})
+        config = SimpleNamespace(
+            additional_config={"native_option": 1},
+            parallel_config=SimpleNamespace(tensor_parallel_size=16),
+        )
+        failures = (
+            ({"native_option": "invalid"}, "native option failed validation"),
+            (
+                {"quantized_all_reduce_config": {"enable": True}},
+                "quantized_all_reduce_config supports tensor_parallel_size <= 8",
+            ),
+        )
         with factory_namespace() as (ns, native, utils):
             first = ns["init_ascend_config"](config)
             self.assertTrue(utils.enable_sp())
-            config.additional_config = {"native_option": "invalid", "refresh": True}
-            with self.assertRaisesRegex(ValueError, "native option failed validation"):
-                ns["init_ascend_config"](config)
-            self.assertIs(native.get_ascend_config(), first)
-            self.assertTrue(utils.enable_sp())
+            for invalid_config, error in failures:
+                with self.subTest(invalid_config=invalid_config):
+                    config.additional_config = {**invalid_config, "refresh": True}
+                    with self.assertRaisesRegex(ValueError, error):
+                        ns["init_ascend_config"](config)
+                    self.assertIs(native.get_ascend_config(), first)
+                    self.assertTrue(utils.enable_sp())
 
     def test_partial_native_config_is_returned_without_replacing_singleton(self):
         config = SimpleNamespace(additional_config={"native_option": 1})

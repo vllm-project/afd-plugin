@@ -7,8 +7,8 @@ draft expert set, sharded by EP, and serves target and draft from the same loop.
 
 Use a DSV4-Flash W4A8 or W8A8 checkpoint with three draft layers and a five-token
 draft block. The runtime baseline is vLLM
-`5df63a7203cdb9328d824a27b682e77c7b9928be` and vLLM-Ascend
-`bd42eea01d8312c4df469fabaed45f77a12df4d3` on Ascend 910C/A3.
+`62d4bc3c7e33b1b6c906e233e6af2d3506c482ca` and vLLM-Ascend
+`7dcdb690caf879a17ab07382880d5773f5202e20` on Ascend 910C/A3.
 Install AFD using the repository NPU installation guide and initialize CANN.
 
 ```text
@@ -125,7 +125,7 @@ vllm serve "$MODEL" "${COMMON_ARGS[@]}" "${FFN_EXEC_ARGS[@]}" \
   --all2all-backend flashinfer_all2allv --speculative-config "$DSPARK_CONFIG" \
   --additional-config "{
     \"enable_cpu_binding\":false,\"enable_force_eplb\":false,
-    \"enable_dsa_cp\":false,\"multistream_dsv4_dsa_overlap\":false,
+    \"multistream_dsv4_dsa_overlap\":false,
     \"afd\":{
       \"role\":\"ffn\",\"connector\":\"CAMAsyncAFDConnector\",\"async_dp\":true,
       \"host\":\"$LOCAL_IP\",\"port\":12499,
@@ -144,7 +144,7 @@ vllm serve "$MODEL" "${COMMON_ARGS[@]}" "${A_EXEC_ARGS[@]}" \
   --all2all-backend allgather_reducescatter --speculative-config "$A_DSPARK_CONFIG" \
   --additional-config "{
     \"enable_cpu_binding\":false,\"enable_force_eplb\":false,
-    \"enable_dsa_cp\":false,\"multistream_dsv4_dsa_overlap\":false,
+    \"multistream_dsv4_dsa_overlap\":false,
     \"afd\":{
       \"role\":\"attention\",\"connector\":\"CAMAsyncAFDConnector\",\"async_dp\":true,
       \"host\":\"$LOCAL_IP\",\"port\":12499,
