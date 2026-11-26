@@ -39,7 +39,7 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
 
     ``FFNEnvironmentBase`` owns the state, launcher checks, ownership flags,
     the EP-group check and close-state handling. This class adds the GPU
-    device, the F-only ``VllmConfig`` (AFD routed-experts architecture and
+    device, the F-only ``VllmConfig`` (AFD architecture and
     pinned MoE backend) and vLLM's GPU Worker distributed initializer.
     """
 
@@ -104,7 +104,7 @@ class GPUFFNEnvironment(FFNEnvironmentBase[GPUFFNConfig]):
         AFD plugin's config patches, which accept DBO without a DeepEP
         all2all backend), then
         re-asserts the ``external_launcher`` executor, swaps in the
-        FFN-only routed-experts architecture that ``AFDFFNWorker.init_device``
+        AFD architecture that ``AFDFFNWorker.init_device``
         selects for this connector, and pins vLLM's MoE backend to Triton as
         ``AFDFFNWorker._make_model_runner`` does. The pin must happen before
         any FusedMoE is constructed: FusedMoE picks its weight layout at

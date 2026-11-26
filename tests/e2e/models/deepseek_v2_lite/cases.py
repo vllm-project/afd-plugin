@@ -17,6 +17,7 @@ from tests.e2e.case import (
     Case,
     CaseEnvironment,
     DboConfig,
+    FfnService,
     Gsm8kSettings,
     Gsm8kTask,
     Mrv2Check,
@@ -42,6 +43,16 @@ DEEPEP_M2N_SCENARIOS = (
     "afd-deepep-m2n-eager-tp2-2a2f",
     "afd-deepep-m2n-graph-tp2-2a2f",
 )
+# The same DeepEP M2N deployments with the FFN side served by the standalone FFN
+# service (torchrun -m afd_plugin.ffn_faas) instead of `vllm serve`; Attention
+# launches exactly as in the mirrored case.
+DEEPEP_M2N_FFN_SERVICE_SCENARIOS = (
+    "afd-deepep-m2n-faas-eager-2a2f",
+    "afd-deepep-m2n-faas-graph-2a2f",
+    "afd-deepep-m2n-faas-graph-dbo-2a2f",
+    "afd-deepep-m2n-faas-graph-tp2-2a2f",
+)
+FFN_SERVICE_BACKEND = "gpu-deepep-m2n"
 GPU_IDS = (
     "baseline-graph",
     *V2_SCENARIOS,
@@ -85,7 +96,11 @@ def stable_ids(backend: str) -> tuple[str, ...]:
 
 def build_case(case_id: str, environment: CaseEnvironment) -> Case:
     backend = environment.device_backend
-    allowed = stable_ids(backend) + (DEEPEP_M2N_SCENARIOS if backend == "gpu" else ())
+    allowed = stable_ids(backend) + (
+        (*DEEPEP_M2N_SCENARIOS, *DEEPEP_M2N_FFN_SERVICE_SCENARIOS)
+        if backend == "gpu"
+        else ()
+    )
     if case_id not in allowed:
         raise ValueError(f"unsupported {backend} DeepSeek-V2-Lite case {case_id!r}")
     return _build_case(case_id, environment)
@@ -143,12 +158,17 @@ def _build_case(case_id: str, environment: CaseEnvironment) -> Case:
         "afd-deepep-m2n-graph-dbo-2a2f": (False, True, True, 2, 1, 2, 1),
         "afd-deepep-m2n-eager-tp2-2a2f": (False, False, False, 1, 2, 2, 1),
         "afd-deepep-m2n-graph-tp2-2a2f": (False, True, False, 1, 2, 2, 1),
+        "afd-deepep-m2n-faas-eager-2a2f": (False, False, False, 2, 1, 2, 1),
+        "afd-deepep-m2n-faas-graph-2a2f": (False, True, False, 2, 1, 2, 1),
+        "afd-deepep-m2n-faas-graph-dbo-2a2f": (False, True, True, 2, 1, 2, 1),
+        "afd-deepep-m2n-faas-graph-tp2-2a2f": (False, True, False, 1, 2, 2, 1),
     }
     backend = environment.device_backend
     baseline, graph, dbo, a_dp, a_tp, f_dp, f_tp = profiles[case_id]
     execution = DECODE_GRAPH if graph else EAGER
     comparison = case_id in V2_DBO_COMPARISON_SCENARIOS
-    deepep = case_id in DEEPEP_M2N_SCENARIOS
+    ffn_service = case_id in DEEPEP_M2N_FFN_SERVICE_SCENARIOS
+    deepep = case_id in DEEPEP_M2N_SCENARIOS or ffn_service
     minimum_samples = SMOKE_MAX_SAMPLES if comparison or dbo else 1
     sample_limit = (
         V2_DBO_SAMPLE_LIMIT
@@ -176,6 +196,8 @@ def _build_case(case_id: str, environment: CaseEnvironment) -> Case:
     )
     if comparison:
         deployment = replace(deployment, max_num_seqs=CAPTURE_SIZE)
+    if ffn_service:
+        deployment = replace(deployment, ffn_service=FfnService(FFN_SERVICE_BACKEND))
     return Case(
         id=case_id,
         model="DeepSeek-V2-Lite",
@@ -223,6 +245,15 @@ if __name__ == "__main__":
     raise SystemExit(
         case_main(
             build_case,
-            tuple(dict.fromkeys((*GPU_IDS, *NPU_IDS, *DEEPEP_M2N_SCENARIOS))),
+            tuple(
+                dict.fromkeys(
+                    (
+                        *GPU_IDS,
+                        *NPU_IDS,
+                        *DEEPEP_M2N_SCENARIOS,
+                        *DEEPEP_M2N_FFN_SERVICE_SCENARIOS,
+                    )
+                )
+            ),
         )
     )

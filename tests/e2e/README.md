@@ -12,8 +12,8 @@ The V2 DP2 cases replace the duplicate GPU `afd-eager-2a2f`,
 baseline and AFD eager, graph, and graph+DBO on 2A1F. Qwen3.6 MoE retains
 three: baseline and AFD eager and graph on 2A1F. GDN DBO is unsupported.
 
-The single-deployment inventory contains 52 definitions: 42 CUDA cases
-(18 DeepSeek-V2-Lite, 13 Qwen3 MoE, three Qwen3.6 MoE and eight DSV4
+The single-deployment inventory contains 56 definitions: 46 CUDA cases
+(22 DeepSeek-V2-Lite, 13 Qwen3 MoE, three Qwen3.6 MoE and eight DSV4
 Flash) and ten NPU cases (seven DeepSeek-V2-Lite and three DSV4 Flash).
 The CUDA counts include the DeepEP M2N and standalone FFN service entries.
 CI selects 16 unique node IDs across ready/merge and weekly gates. Definitions,
@@ -315,6 +315,11 @@ not run by CI.
 python -m pytest -q -s \
   tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe_deepep_m2n_ffn_service
 ```
+
+`test_deepseek_v2_lite_deepep_m2n_ffn_service` in
+`tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py` runs
+DeepSeek-V2-Lite through the same four deployments. DeepSeek-V2 has no
+FFN-only shell yet, so the service loads its role-aware AFD model.
 
 `tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py` runs the eager,
 graph and graph + DBO cases on two pods in two layouts: one role per pod

@@ -18,6 +18,7 @@ from tests.conftest import (
 )
 from tests.e2e.environment import model_case_command
 from tests.e2e.models.deepseek_v2_lite.cases import (
+    DEEPEP_M2N_FFN_SERVICE_SCENARIOS,
     DEEPEP_M2N_SCENARIOS,
     V2_SINGLE_RANK_SCENARIOS,
     stable_ids,
@@ -104,5 +105,16 @@ def test_deepseek_v2_lite(scenario: str, tmp_path: Path) -> None:
 # run them.
 @pytest.mark.parametrize("scenario", DEEPEP_M2N_SCENARIOS, ids=DEEPEP_M2N_SCENARIOS)
 def test_deepseek_v2_lite_deepep_m2n(scenario: str, tmp_path: Path) -> None:
+    command = build_runner_command(scenario, tmp_path / scenario)
+    run_case_entry(command, tmp_path / scenario)
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    "scenario",
+    DEEPEP_M2N_FFN_SERVICE_SCENARIOS,
+    ids=DEEPEP_M2N_FFN_SERVICE_SCENARIOS,
+)
+def test_deepseek_v2_lite_deepep_m2n_ffn_service(scenario: str, tmp_path: Path) -> None:
     command = build_runner_command(scenario, tmp_path / scenario)
     run_case_entry(command, tmp_path / scenario)
