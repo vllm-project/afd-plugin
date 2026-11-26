@@ -21,7 +21,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.models import deepseek_v2 as native
 
-from afd_plugin.config import DEEPEP_M2N_CONNECTORS, parse_afd_config
+from afd_plugin.config import CAMP2P_CONNECTOR, DEEPEP_M2N_CONNECTORS, parse_afd_config
 from afd_plugin.connectors import AFDExpertRoutingSpec
 from afd_plugin.model_executor.ffn.remote import RemoteFFNProxy, build_expert
 from afd_plugin.model_executor.models._weight_utils import (
@@ -184,6 +184,24 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         # ### PATCH END: construct a remote-experts native MoE shell.
 
 
+class AFDDeepseekV2CAMP2PMoE(AFDDeepseekV2RemoteExpertsMoE):
+    """Pass the decoder's two-dimensional activation to the CAMP2P runner."""
+
+    # Patch reason: the pinned Ascend compiler can eliminate the CAMP2P send
+    # when the native MoE wraps the decoder activation in a view.
+    # Patch functionality: preserve the original activation for send, DBO
+    # yield, and receive. The NPU adapter already rejects sequence parallel MoE.
+    # Signature: matches vLLM v0.34.0 DeepseekV2MoE.forward (62d4bc3c).
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        already_sequence_parallel: bool = False,
+    ) -> torch.Tensor:
+        # ### PATCH START: preserve the CAMP2P graph reference.
+        return self.experts(hidden_states=hidden_states, router_logits=hidden_states)
+        # ### PATCH END: preserve the CAMP2P graph reference.
+
+
 class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
     """DeepSeek decoder layer with separable Attention and FFN execution."""
 
@@ -290,8 +308,18 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                 **attn_kwargs,
             )
 
-            if device_type == "cuda" and self.is_moe_layer:
-                self.mlp = AFDDeepseekV2RemoteExpertsMoE(
+            uses_camp2p_moe_runner = (
+                device_type == "npu"
+                and afd_config.connector == CAMP2P_CONNECTOR
+                and config.model_type == "deepseek_v2"
+            )
+            if self.is_moe_layer and (device_type == "cuda" or uses_camp2p_moe_runner):
+                moe_cls = (
+                    AFDDeepseekV2CAMP2PMoE
+                    if uses_camp2p_moe_runner
+                    else AFDDeepseekV2RemoteExpertsMoE
+                )
+                self.mlp = moe_cls(
                     config=config,
                     vllm_config=vllm_config,
                     prefix=f"{prefix}.mlp",

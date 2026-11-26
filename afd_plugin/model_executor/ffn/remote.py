@@ -47,11 +47,6 @@ from afd_plugin.forward_context import get_afd_metadata_from_forward_context
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 UNROUTED_EXPERT_ID = -1
-# The only device validated for native-factory Attention MoE runners. Each
-# connector's registration names its runner: AFDRemoteMoERunner for CUDA P2P,
-# and for DeepEP M2N AFDRoutedExpertsMoERunner, vLLM's runner whose routed
-# experts send the routes.
-ATTENTION_MOE_RUNNER_DEVICE = "cuda"
 
 
 def _unroute_tp_padding(topk_ids: torch.Tensor, num_tokens: int) -> torch.Tensor:
@@ -378,9 +373,12 @@ def build_expert(
     no expert weights and runs no expert kernel.
     """
     afd_config = parse_afd_config(vllm_config, validate=False)
-    runner_path = AFDConnectorFactory.get_attention_moe_runner(afd_config.connector)
-    placement = (current_platform.device_type, afd_config.connector)
-    if runner_path is None or placement[0] != ATTENTION_MOE_RUNNER_DEVICE:
+    device_type = current_platform.device_type
+    runner_path = AFDConnectorFactory.get_attention_moe_runner(
+        afd_config.connector, device_type
+    )
+    if runner_path is None:
+        placement = (device_type, afd_config.connector)
         raise ValueError(
             f"unsupported Attention remote MoE configuration: {placement!r}",
         )
@@ -407,6 +405,15 @@ def build_expert(
         moe_kwargs["routed_scaling_factor"],
     ):
         raise ValueError("routed_scaling_factor must be finite")
+
+    routed_experts_cls: type[RoutedExperts] = AFDRemoteRoutedExperts
+    if device_type == "npu":
+        from afd_plugin.model_executor.ffn.npu.remote import (
+            AFDAscendRemoteRoutedExperts,
+        )
+
+        routed_experts_cls = AFDAscendRemoteRoutedExperts
+
     # A parameter-free container: no local quantized weights, transforms or
     # EPLB, and unit TP/DP/PCP sizes, so no expert sharding. vLLM's runner
     # scales the combined routed output, as native; the P2P runner returns the
@@ -429,7 +436,7 @@ def build_expert(
         "pcp_size": 1,
         "runner_cls": getattr(importlib.import_module(runner_module), runner_class),
         "runner_args": None,
-        "routed_experts_cls": AFDRemoteRoutedExperts,
+        "routed_experts_cls": routed_experts_cls,
         "routed_experts_args": None,
     }
     reserved = moe_kwargs.keys() & factory_kwargs.keys()

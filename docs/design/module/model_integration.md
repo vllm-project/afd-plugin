@@ -69,7 +69,7 @@ make a backend-specific worker class the shared model API.
 `model_executor/models/` owns model structure and checkpoint policy.
 `model_executor/ffn/remote.py` contains the remote proxies shared by CUDA and
 Ascend models, and the Attention-role MoE runners built through vLLM's
-`FusedMoEFactory`, which its factory currently enables for CUDA P2P only.
+`FusedMoEFactory`, selected by the CUDA P2P, DeepEP M2N and Ascend CAMP2P connectors.
 `model_executor/ffn/npu/` owns the NPU-specific Async CAM
 layout, quantized weight contracts and native compute implementations:
 
@@ -202,7 +202,10 @@ shared experts as native, and its routed experts send the routes, with the TP
 padding rows unrouted. FFN runs only the routed
 experts, and combine returns each token's weighted top-k sum, which the runner
 scales as native. CUDA Attention-side remote experts currently reject EPLB. On Ascend,
-the DeepSeek V2 family uses synchronous CAMP2P with the gate on FFN.
+DeepSeek V2/V2-Lite passes the decoder's 2D activation directly to the
+CAMP2P MoE runner. FFN runs the complete native MoE. Dense layers use
+`RemoteFFNProxy`. Ascend's remote experts keep the weightless AFD quantization
+method through post-load processing.
 
 The full AFD model remains decorated with vLLM's compile support. Backend-only
 helpers are imported inside the NPU path so CUDA model import does not require

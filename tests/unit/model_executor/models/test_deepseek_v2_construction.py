@@ -169,7 +169,7 @@ def _parameter_names(module: nn.Module) -> set[str]:
     return {name for name, _ in module.named_parameters()}
 
 
-def test_standard_attention_constructs_no_ffn_parameters(
+def test_legacy_deepseek_npu_attention_constructs_no_ffn_parameters(
     monkeypatch,
     construction_env,
 ):
