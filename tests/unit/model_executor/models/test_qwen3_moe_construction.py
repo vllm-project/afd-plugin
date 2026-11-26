@@ -356,12 +356,47 @@ def test_p2p_attention_tp2_builds_no_shared_expert(
     assert text_config.shared_expert_intermediate_size == 3
 
 
+def _start_attention_build(
+    monkeypatch: pytest.MonkeyPatch,
+    vllm_config,
+    layer_idx: int,
+    built: list[nn.Module | BaseException],
+) -> threading.Thread:
+    """Build an Attention decoder layer on a new thread; record it or its error."""
+
+    def build() -> None:
+        try:
+            built.append(
+                _make_layer(
+                    monkeypatch,
+                    role="attention",
+                    layer_idx=layer_idx,
+                    vllm_config=vllm_config,
+                )
+            )
+        except BaseException as error:
+            built.append(error)
+
+    # Daemon: a thread stuck on a broken lock must not hang the test session.
+    thread = threading.Thread(target=build, daemon=True)
+    thread.start()
+    return thread
+
+
+def _swap_is_owned() -> bool:
+    """Whether another thread owns the experts-factory swap; never keeps it."""
+    if adapter._FACTORY_SWAP_LOCK.acquire(blocking=False):
+        adapter._FACTORY_SWAP_LOCK.release()
+        return False
+    return True
+
+
 def test_attention_moe_swap_is_scoped_to_its_thread(
     monkeypatch: pytest.MonkeyPatch,
     cuda_construction_env,
 ) -> None:
-    """While one thread builds an Attention MoE block, another thread gets
-    vLLM's experts factory and cannot start an overlapping swap.
+    """While one thread builds an Attention MoE block, it still owns the swap,
+    and another thread calling the factory gets vLLM's experts.
 
     Why: the swap rebinds a vLLM module attribute that every thread sees.
     """
@@ -380,32 +415,11 @@ def test_attention_moe_swap_is_scoped_to_its_thread(
 
     monkeypatch.setattr(adapter, "build_expert", paused_build_expert)
     built: list[nn.Module | BaseException] = []
-
-    def build_attention_layer() -> None:
-        try:
-            built.append(
-                _make_layer(
-                    monkeypatch,
-                    role="attention",
-                    layer_idx=0,
-                    vllm_config=cuda_construction_env,
-                )
-            )
-        except BaseException as error:
-            built.append(error)
-
-    builder = threading.Thread(target=build_attention_layer)
-    builder.start()
+    builder = _start_attention_build(monkeypatch, cuda_construction_env, 0, built)
     try:
         assert in_swap.wait(timeout=30)
         assert adapter.native.FusedMoEFactory(num_experts=8) == "vllm experts"
-        with pytest.raises(RuntimeError, match="already replaced"):
-            _make_layer(
-                monkeypatch,
-                role="attention",
-                layer_idx=1,
-                vllm_config=cuda_construction_env,
-            )
+        assert _swap_is_owned()
     finally:
         release.set()
         builder.join(timeout=30)
@@ -414,6 +428,76 @@ def test_attention_moe_swap_is_scoped_to_its_thread(
     assert isinstance(layer, nn.Module), layer
     assert isinstance(layer.mlp.experts, nn.Identity)
     assert adapter.native.FusedMoEFactory is vllm_factory
+
+
+def test_attention_moe_swap_is_owned_before_vllm_factory_is_read(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_construction_env,
+) -> None:
+    """A constructor paused between reading vLLM's factory and installing its
+    own already owns the swap; a second constructor waits, then swaps too.
+
+    Why: two constructors that both read vLLM's factory would install over
+    each other, and one would build local experts.
+    """
+
+    def vllm_factory(**kwargs):
+        return "vllm experts"
+
+    monkeypatch.setattr(adapter.native, "FusedMoEFactory", vllm_factory)
+    read_factory, release = threading.Event(), threading.Event()
+
+    class PausingFusedMoE:
+        """Pauses the first identity check, after qwen3_moe's factory is read."""
+
+        def __getattr__(self, name: str):
+            assert name == "FusedMoEFactory", name
+            if not read_factory.is_set():
+                read_factory.set()
+                assert release.wait(timeout=30)
+            return vllm_factory
+
+    monkeypatch.setattr(adapter, "fused_moe", PausingFusedMoE())
+    monkeypatch.setattr(
+        adapter, "build_expert", lambda vllm_config, **kwargs: nn.Identity()
+    )
+    built: list[nn.Module | BaseException] = []
+    threads = [_start_attention_build(monkeypatch, cuda_construction_env, 0, built)]
+    try:
+        assert read_factory.wait(timeout=30)
+        assert _swap_is_owned()
+        threads.append(
+            _start_attention_build(monkeypatch, cuda_construction_env, 1, built)
+        )
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(timeout=30)
+
+    assert len(built) == 2, built
+    for layer in built:
+        assert isinstance(layer, nn.Module), layer
+        assert isinstance(layer.mlp.experts, nn.Identity)
+    assert adapter.native.FusedMoEFactory is vllm_factory
+
+
+def test_attention_moe_refuses_a_replaced_experts_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_construction_env,
+) -> None:
+    """Attention refuses to swap qwen3_moe.FusedMoEFactory once it is not vLLM's.
+
+    Why: a nested swap, or someone else's, would stack with this one.
+    """
+    monkeypatch.setattr(adapter.native, "FusedMoEFactory", lambda **kwargs: None)
+
+    with pytest.raises(RuntimeError, match="already replaced"):
+        _make_layer(
+            monkeypatch,
+            role="attention",
+            layer_idx=0,
+            vllm_config=cuda_construction_env,
+        )
 
 
 def test_ffn_role_constructs_only_native_moe(

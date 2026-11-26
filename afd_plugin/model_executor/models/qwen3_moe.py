@@ -44,6 +44,8 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
 ROUTED_STAGE = "mlp"
+# Serializes the FusedMoEFactory swap; reentrant, so a nested swap raises.
+_FACTORY_SWAP_LOCK = threading.RLock()
 
 
 def _is_moe_layer(config: Qwen3MoeConfig, layer_idx: int) -> bool:
@@ -148,8 +150,8 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
     # Patch reason: native Qwen3 MoE constructs both Attention and FFN modules.
     # Patch functionality: construct only the large modules owned by the AFD role.
     # Attention MoE layers build vLLM's block from a config view without the
-    # shared expert, while qwen3_moe.FusedMoEFactory builds remote experts with
-    # build_expert() for this thread only; vLLM's factory is restored after.
+    # shared expert. Under a lock, qwen3_moe.FusedMoEFactory builds remote
+    # experts with build_expert() for this thread only, until it is restored.
     # Signature: matches upstream; no added parameters.
     # Upstream: vLLM v0.32.0, vllm/model_executor/models/qwen3_moe.py
     # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
@@ -210,37 +212,41 @@ class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):
                 block_config = copy.copy(vllm_config)
                 block_config.model_config = copy.copy(vllm_config.model_config)
                 block_config.model_config.hf_text_config = text_config
-                # One swap at a time, so none restores another's out of order.
-                native_factory = native.FusedMoEFactory
-                if native_factory is not fused_moe.FusedMoEFactory:
-                    raise RuntimeError("qwen3_moe.FusedMoEFactory is already replaced")
-                owner = threading.get_ident()
+                # This constructor owns the swap from reading vLLM's factory
+                # until restoring it; other Attention constructors wait.
+                with _FACTORY_SWAP_LOCK:
+                    native_factory = native.FusedMoEFactory
+                    if native_factory is not fused_moe.FusedMoEFactory:
+                        raise RuntimeError(
+                            "qwen3_moe.FusedMoEFactory is already replaced"
+                        )
+                    owner = threading.get_ident()
 
-                # Drops the gate unless Attention computes it, and what
-                # build_expert() sets itself.
-                def remote_experts(**kwargs: Any) -> "MoERunner":
-                    # Blocks built on other threads keep vLLM's experts.
-                    if threading.get_ident() != owner:
-                        return native_factory(**kwargs)
-                    for name in (
-                        "quant_config",
-                        "enable_eplb",
-                        "num_redundant_experts",
-                        "is_sequence_parallel",
-                    ):
-                        del kwargs[name]
-                    if not afd_config.compute_gate_on_attention:
-                        kwargs["gate"] = None
-                    return build_expert(vllm_config, **kwargs)
+                    # Drops the gate unless Attention computes it, and what
+                    # build_expert() sets itself.
+                    def remote_experts(**kwargs: Any) -> "MoERunner":
+                        # Blocks built on other threads keep vLLM's experts.
+                        if threading.get_ident() != owner:
+                            return native_factory(**kwargs)
+                        for name in (
+                            "quant_config",
+                            "enable_eplb",
+                            "num_redundant_experts",
+                            "is_sequence_parallel",
+                        ):
+                            del kwargs[name]
+                        if not afd_config.compute_gate_on_attention:
+                            kwargs["gate"] = None
+                        return build_expert(vllm_config, **kwargs)
 
-                native.FusedMoEFactory = remote_experts
-                try:
-                    self.mlp = native.Qwen3MoeSparseMoeBlock(
-                        vllm_config=block_config,
-                        prefix=f"{prefix}.mlp",
-                    )
-                finally:
-                    native.FusedMoEFactory = native_factory
+                    native.FusedMoEFactory = remote_experts
+                    try:
+                        self.mlp = native.Qwen3MoeSparseMoeBlock(
+                            vllm_config=block_config,
+                            prefix=f"{prefix}.mlp",
+                        )
+                    finally:
+                        native.FusedMoEFactory = native_factory
                 if not afd_config.compute_gate_on_attention:
                     self.mlp.gate = None
                 # TP peers hold the same tokens; each sends only its slice.

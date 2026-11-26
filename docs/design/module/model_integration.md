@@ -289,7 +289,8 @@ Attention role constructs native Qwen Attention and normalization modules, and
 for MoE layers vLLM's own `Qwen3MoeSparseMoeBlock`, built from a config view
 without the shared expert. For that one constructor call, and only on its
 thread, `qwen3_moe.FusedMoEFactory` builds the experts with `build_expert()`,
-as for DeepSeek; an overlapping swap is refused. With P2P, it sends hidden states and FFN
+as for DeepSeek. Constructors take the swap one at a time under a lock, and a
+factory someone else replaced is refused. With P2P, it sends hidden states and FFN
 runs the complete native MLP or MoE block; `compute_gate_on_attention=false`
 is required. With DeepEP M2N, Attention owns gate/top-k and FFN runs routed
 experts only; this requires `compute_gate_on_attention=true`, every layer to
