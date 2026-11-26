@@ -411,13 +411,11 @@ def additional_config(role: str, *, async_cam: bool) -> dict[str, bool]:
     These are not deployment preferences. The pinned Ascend runtime defaults
     `multistream_dsv4_dsa_overlap` to True (`vllm_ascend/ascend_config.py`), and
     that path drives the DSA RoPE through `inplace_partial_rotary_mul`, whose
-    tiling function rejects the shapes A5 hands it. The case therefore keeps the
-    switch off, alongside the DSA context-parallel path it does not cover.
+    tiling function rejects the shapes A5 hands it. The case keeps the switch off.
     """
     return {
         "enable_flashcomm1": async_cam and role == "attention",
         "enable_cpu_binding": True,
         "enable_force_eplb": False,
-        "enable_dsa_cp": False,
         "multistream_dsv4_dsa_overlap": False,
     }

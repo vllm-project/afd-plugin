@@ -19,9 +19,10 @@ topologies and the known graceful-exit failures.
 
 ## Prerequisites
 
-- vLLM `0.32.0` at `5df63a72` and an Ascend PyTorch/vLLM-Ascend environment
-  based on source commit
-  [`bd42eea0`](https://github.com/vllm-project/vllm-ascend/commit/bd42eea01d8312c4df469fabaed45f77a12df4d3).
+- vLLM `0.34.0` at `62d4bc3c` and the
+  [pinned Ascend A3 environment](../installation.md#ascend-npu-installation)
+  based on vLLM-Ascend commit
+  [`7dcdb690`](https://github.com/vllm-project/vllm-ascend/commit/7dcdb690caf879a17ab07382880d5773f5202e20).
 - The AFD Ascend custom operators must be built and available at runtime.
 - HCCL connectivity for the data path and Gloo connectivity for DP metadata.
 - Identical model hidden size, model dtype, AFD topology, rendezvous address,

@@ -13,8 +13,6 @@ from typing import get_type_hints
 
 import pytest
 
-from afd_plugin.compat.vllm import TARGET_NPU_VLLM_VERSION
-
 PATCHES = "afd_plugin.compat.patches"
 ENGINE_CORE = "vllm.v1.engine.core"
 GPU_RUNNER = "vllm.v1.worker.gpu.model_runner"
@@ -142,14 +140,6 @@ def _use_installed_patch(binding, symbol, marker_name, install):
             "async_dp_engine",
             None,
             id="engine-launch",
-        ),
-        pytest.param(
-            "vllm.v1.engine.core_client",
-            "DPAsyncMPClient",
-            "add_request_async",
-            "async_dp_engine",
-            None,
-            id="dp-request",
         ),
         pytest.param(
             "vllm.forward_context",
@@ -320,12 +310,20 @@ def _use_installed_patch(binding, symbol, marker_name, install):
             id="npu-platform-config",
         ),
         pytest.param(
-            "vllm_ascend.attention.mla_v1",
+            "vllm_ascend.compilation.updatable_graph",
+            "UpdatableGraph",
+            "register_task",
             None,
-            "get_graph_params",
+            "npu-ubatch-register-task",
+            id="npu-ubatch-register-task",
+        ),
+        pytest.param(
+            "vllm_ascend.worker.v2.aclgraph_utils",
+            "ModelAclGraphManager",
+            "_updatable_graph_replay",
             None,
-            "npu-mla-graph-params",
-            id="npu-mla-graph-params",
+            "npu-ubatch-updatable-replay",
+            id="npu-ubatch-updatable-replay",
         ),
     ],
 )
@@ -333,14 +331,16 @@ def test_patch_preserves_upstream_signature(
     target_module, owner, symbol, adapter_module, scope_name
 ):  # long-test: scoped table bindings.
     pytest.importorskip("torch")
-    vllm = pytest.importorskip("vllm")
-    on_ascend_pin = vllm.__version__.startswith(TARGET_NPU_VLLM_VERSION)
+    pytest.importorskip("vllm")
+    from vllm.platforms import current_platform
+
+    on_ascend = current_platform.device_type == "npu"
     if (
         adapter_module in {"async_dp_engine", "async_dp_forward_context"}
-        and not on_ascend_pin
+        and not on_ascend
     ):
         pytest.skip("Async DP overrides apply only to the pinned Ascend runtime")
-    if on_ascend_pin and (
+    if on_ascend and (
         adapter_module == "gpu_mrv2_ubatching"
         or scope_name in {"fullgraph-replay", "v4-workspace-slot"}
     ):
@@ -364,7 +364,7 @@ def test_patch_preserves_upstream_signature(
         and scope_name.startswith("npu-")
         or scope_name == "camp2p-dispatch"
     ):
-        if not on_ascend_pin:
+        if not on_ascend:
             pytest.skip("Ascend overrides apply only to the pinned Ascend runtime")
         pytest.importorskip("torch_npu")
         pytest.importorskip("vllm_ascend")
@@ -377,8 +377,6 @@ def test_patch_preserves_upstream_signature(
         expected_module = importlib.import_module(GPU_DP)
     elif scope_name == "npu-dbo-factory":
         expected_module = importlib.import_module(GPU_UBATCH)
-    elif scope_name == "npu-mla-graph-params":
-        expected_module = importlib.import_module("vllm_ascend.compilation.acl_graph")
     else:
         expected_module = target
     expected = _upstream_signature(expected_module, owner, symbol, locals())
@@ -390,7 +388,7 @@ def test_patch_preserves_upstream_signature(
 
         tracker = adapter._AFDCaptureEventTracker([])
         runner = SimpleNamespace(
-            device=SimpleNamespace(type="npu" if on_ascend_pin else "cuda"),
+            device=SimpleNamespace(type="npu" if on_ascend else "cuda"),
         )
         scope = adapter._use_afd_capture_input_preparation(runner, tracker)
     elif scope_name in {"npu-draft-capture", "npu-draft-replay"}:
@@ -437,7 +435,7 @@ def test_patch_preserves_upstream_signature(
                 SimpleNamespace(
                     ubatch_runner=binding,
                     vllm_config=SimpleNamespace(model_config=model),
-                    device=SimpleNamespace(type="npu" if on_ascend_pin else "cuda"),
+                    device=SimpleNamespace(type="npu" if on_ascend else "cuda"),
                 )
             )
         else:
@@ -478,15 +476,14 @@ def test_patch_preserves_upstream_signature(
             adapter._ASCEND_PLATFORM_PATCH_ATTR,
             adapter.apply_afd_ascend_dbo_config_patch,
         )
-    elif scope_name == "npu-mla-graph-params":
-        from afd_plugin.compat.patches.npu import mla_graph as adapter
+    elif scope_name in {"npu-ubatch-register-task", "npu-ubatch-updatable-replay"}:
+        from afd_plugin.v1.worker.npu import mla_graph as adapter
 
-        scope = _use_installed_patch(
-            binding,
-            symbol,
-            adapter._MLA_GRAPH_PATCH_ATTR,
-            adapter.apply_afd_mla_graph_patch,
-        )
+        binding = SimpleNamespace(**{symbol: getattr(getattr(target, owner), symbol)})
+        if scope_name == "npu-ubatch-register-task":
+            scope = adapter.use_ubatch_graph_registration(binding)
+        else:
+            scope = adapter.use_ubatch_replay_metadata(binding, ())
     else:
         adapter_name, _, renamed_symbol = adapter_module.partition(":")
         adapter = importlib.import_module(f"{PATCHES}.{adapter_name}")
@@ -503,15 +500,7 @@ def test_patch_preserves_upstream_signature(
             assert _resolved_signature(
                 inspect.unwrap(callable_patch), namespace
             ) == _resolved_signature(native_wrapper, namespace)
-            if on_ascend_pin:
-                # The native fault-tolerance decorator retains the original
-                # in its closure without setting __wrapped__.
-                original_loop = inspect.getclosurevars(callable_patch).nonlocals[
-                    "busy_loop_func"
-                ]
-                actual = _resolved_signature(original_loop, namespace)
-            else:
-                actual = inspect.signature(callable_patch, follow_wrapped=False)
+            actual = inspect.signature(callable_patch, follow_wrapped=False)
         else:
             actual = _resolved_signature(callable_patch, namespace)
         assert actual == expected

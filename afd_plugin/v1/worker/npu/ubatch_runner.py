@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Ascend inputs, contexts and MLA updates for native MRV2 microbatching."""
+"""Ascend inputs, contexts and graph updates for native MRV2 microbatching."""
 
 import threading
 from collections.abc import Callable
@@ -10,20 +10,13 @@ from typing import Any
 
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
-from vllm.forward_context import (
-    ForwardContext,
-    get_forward_context,
-    override_forward_context,
-    set_forward_context,
-)
+from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker import ubatching
 from vllm.v1.worker.dp_utils import skip_dp_coordination
-from vllm.v1.worker.gpu.cudagraph_utils import (
-    BatchExecutionDescriptor,
-    ModelCudaGraphManager,
-)
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.ubatch_utils import UBatchRunner, UBatchState
@@ -34,20 +27,12 @@ from vllm_ascend.ascend_forward_context import (
     get_mrv2_in_profile_run,
     override_mrv2_in_profile_run,
 )
-from vllm_ascend.compilation.acl_graph import (
-    GraphParams,
-    get_graph_params,
-    update_full_graph_params,
-)
-from vllm_ascend.worker.v2.aclgraph_utils import (
-    ModelAclGraphManager,
-    _get_graph_update_backend,
-)
+from vllm_ascend.compilation.updatable_graph import _ACTIVE_GRAPH, UpdatableGraph
+from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata, build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
 from afd_plugin.compat.npu.runtime_config import uses_async_cam_dbo
-from afd_plugin.compat.patches.npu.mla_graph import AFD_MLA_GRAPH_PARAMS_KEY
 from afd_plugin.compat.patches.npu.mrv2_ubatching import (
     use_async_cam_child_dp_metadata,
     use_npu_input_batch_slicing,
@@ -58,9 +43,9 @@ from afd_plugin.v1.worker.npu.attention_metadata import (
     materialize_attention_metadata_by_layer,
 )
 from afd_plugin.v1.worker.npu.mla_graph import (
-    merge_mla_graph_params,
-    new_mla_graph_params,
-    override_mla_graph_params,
+    use_ubatch_capture_graph,
+    use_ubatch_graph_registration,
+    use_ubatch_replay_metadata,
 )
 
 
@@ -82,11 +67,8 @@ class NPUUBatchRunner(UBatchRunner):
         )
         self.ready_barrier = threading.Barrier(self.num_ubatches + 1, timeout=timeout_s)
         self._prepared_state: UBatchState | None = None
-        self._mla_capture_params: dict[
-            BatchExecutionDescriptor, tuple[GraphParams, GraphParams]
-        ] = {}
         hf_config = vllm_config.model_config.hf_text_config
-        self._uses_mla_graph_params = (
+        self._shares_mla_block_tables = (
             vllm_config.model_config.use_mla
             and not hasattr(hf_config, "index_topk")
             and not hasattr(hf_config, "compress_ratios")
@@ -147,10 +129,10 @@ class NPUUBatchRunner(UBatchRunner):
             if cudagraph_mode == CUDAGraphMode.FULL
             else input_batch.num_tokens
         )
-        if self._uses_mla_graph_params:
+        if self._shares_mla_block_tables:
             # Native dummy and live tables share persistent input storage. The
-            # target MLA updater retains the table captured in attn_params, so
-            # a fresh clone here would replay the dummy block IDs forever.
+            # target MLA task retains the table captured in its kwargs, so
+            # the same table must be populated at capture and replay.
             stage_block_tables = block_tables
         else:
             # DSA/SFA builders clear padded rows in place. Isolate that write
@@ -227,7 +209,8 @@ class NPUUBatchRunner(UBatchRunner):
         input_batch: InputBatch,
         block_tables: tuple[torch.Tensor, ...],
         slot_mappings: torch.Tensor,
-        cg_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        batch_desc: BatchExecutionDescriptor,
+        dp_sync_state: DPSyncState | None = None,
         for_capture: bool = False,
     ) -> UBatchState:
         previous_override = self.model_state.__dict__.get("prepare_attn")
@@ -235,22 +218,13 @@ class NPUUBatchRunner(UBatchRunner):
         try:
             with use_npu_input_batch_slicing():
                 prepared = super().prepare(
-                    input_batch, block_tables, slot_mappings, cg_mode, for_capture
+                    input_batch,
+                    block_tables,
+                    slot_mappings,
+                    batch_desc,
+                    dp_sync_state,
+                    for_capture,
                 )
-            if for_capture and self._uses_mla_graph_params:
-                sizes = tuple(stage.num_tokens for stage in prepared.slices)
-                assert len(sizes) == 2 and sizes[0] == sizes[1], sizes
-                # Native capture orders each ordinary descriptor before its
-                # two-stage twin. Reuse its full-size FIA workspace, as the
-                # two native child threads share one compute stream.
-                graph_params = get_graph_params()
-                assert graph_params is not None
-                workspace = graph_params.workspaces[sum(sizes)]
-                assert workspace is not None
-                for context in prepared.forward_contexts:
-                    context.additional_kwargs[AFD_MLA_GRAPH_PARAMS_KEY] = (
-                        new_mla_graph_params(sizes[0], workspace)
-                    )
             self._prepared_state = prepared
             return prepared
         finally:
@@ -302,9 +276,10 @@ class NPUUBatchRunner(UBatchRunner):
     # Scope NPU aliases until the native finish/abort joins its own threads.
     # Signature matches vllm/v1/worker/gpu/ubatch_utils.py::
     # UBatchRunner.begin_capturable_run at
-    # 5df63a7203cdb9328d824a27b682e77c7b9928be. Native execution is too large
-    # to copy: only context and CUDA-only BLAS setup are adapted here. Remove
-    # when upstream offers NPU thread initialization hooks.
+    # 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca. Native execution is too large
+    # to copy. Scope Ascend 7dcdb690's active graph and CUDA-only BLAS setup
+    # around the native parked threads. Remove when upstream offers NPU
+    # thread initialization and capture-context hooks.
     def begin_capturable_run(
         self,
         model: Any,
@@ -314,9 +289,13 @@ class NPUUBatchRunner(UBatchRunner):
     ) -> Callable[[], Any]:
         # ### PATCH START: NPU scopes also cover parked capture threads.
         is_profile = get_mrv2_in_profile_run()
+        capture_graph: UpdatableGraph | None = None
 
         def forward(**inputs):
             with (
+                use_ubatch_capture_graph(capture_graph)
+                if capture_graph is not None
+                else nullcontext(),
                 set_current_vllm_config(self.vllm_config),
                 override_mrv2_in_profile_run(is_profile),
                 skip_dp_coordination()
@@ -352,66 +331,31 @@ class NPUUBatchRunner(UBatchRunner):
             raise
 
         def finish() -> Any:
+            nonlocal capture_graph
             try:
-                return native_finish()
+                # Native capture parks the threads before capture_begin; its
+                # finish callback releases them after the parent binds the graph.
+                capture_graph = _ACTIVE_GRAPH.get() if for_capture else None
+                with (
+                    use_ubatch_graph_registration(capture_graph)
+                    if capture_graph is not None
+                    else nullcontext()
+                ):
+                    return native_finish()
             finally:
+                capture_graph = None
                 stack.close()
 
         self._pending_finish = finish
         return finish
         # ### PATCH END: NPU scopes also cover parked capture threads.
 
-    def record_capture_graph_params(
-        self,
-        desc: BatchExecutionDescriptor,
-        prepared: UBatchState,
-        is_warmup: bool,
-    ) -> None:
-        if is_warmup or not self._uses_mla_graph_params:
-            return
-        first, second = prepared.forward_contexts
-        self._mla_capture_params[desc] = (
-            first.additional_kwargs[AFD_MLA_GRAPH_PARAMS_KEY],
-            second.additional_kwargs[AFD_MLA_GRAPH_PARAMS_KEY],
-        )
-
     def run_fullgraph(
         self, manager: ModelAclGraphManager, desc: BatchExecutionDescriptor
     ) -> Any:
-        """Replay the native graph and update the two captured MLA stages."""
-        if not self._uses_mla_graph_params:
-            return ModelAclGraphManager.run_fullgraph(manager, desc)
+        """Replay the native aggregate graph with the currently prepared stages."""
         prepared = self._prepared_state
         assert prepared is not None and len(prepared.slices) == desc.num_ubatches
-        first, second = prepared.forward_contexts
-        stage_tokens = prepared.slices[0].num_tokens
-        metadata, params = merge_mla_graph_params(
-            [first.attn_metadata, second.attn_metadata],
-            self._mla_capture_params[desc],
-            stage_tokens,
-        )
-        manager.update_stream.wait_stream(torch.npu.current_stream(self.device))
-        # Skip only Ascend's single-batch updater. The native manager still owns
-        # graph replay and persistent output buffers for this exact descriptor.
-        output = ModelCudaGraphManager.run_fullgraph(manager, desc)
-        with (
-            set_current_vllm_config(self.vllm_config),
-            set_forward_context(
-                metadata,
-                self.vllm_config,
-                num_tokens=stage_tokens,
-                num_tokens_across_dp=first.dp_metadata.num_tokens_across_dp_cpu,
-                cudagraph_runtime_mode=CUDAGraphMode.FULL,
-            ),
-        ):
-            context = get_forward_context()
-            with override_mla_graph_params(context, metadata, params):
-                update_full_graph_params(
-                    _get_graph_update_backend(self.attn_groups),
-                    manager.update_stream,
-                    context,
-                    stage_tokens,
-                    self.vllm_config,
-                    self.vllm_config.speculative_config,
-                )
-        return output
+        stages = [context.attn_metadata for context in prepared.forward_contexts]
+        with use_ubatch_replay_metadata(manager, stages):
+            return ModelAclGraphManager.run_fullgraph(manager, desc)
