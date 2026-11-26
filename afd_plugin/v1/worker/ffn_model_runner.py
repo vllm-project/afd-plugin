@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, cast
 
@@ -29,6 +30,7 @@ from afd_plugin.connectors import (
     AFDControlPlane,
     AFDDPMetadata,
 )
+from afd_plugin.connectors.base import AFDControlPlaneClosedError
 from afd_plugin.v1.worker.cuda_graph import (
     AFDCUDAGraphPolicy,
     AFDGraphRunMode,
@@ -141,11 +143,78 @@ class GPUFFNModelRunner:
     def profile_cudagraph_memory(self) -> int:
         return 0
 
+    def reset_mm_cache(self) -> None:
+        """Accept the worker startup multimodal-cache reset.
+
+        AFD FFN runners do not allocate vLLM's multimodal budget or late
+        interaction state, so there is no cache to release.
+        """
+        return None
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         return None
+
+    def execute_connector_driven_step(
+        self, *, cancel_requested: Callable[[], bool]
+    ) -> bool:
+        """Receive one control payload and run the FFN step it describes.
+
+        Blocks in the control plane until Attention rank 0 sends the next
+        payload. Warmup and capture payloads go to ``capture_model`` when FFN
+        CUDA graphs are enabled; every other payload (eager, replay, or an
+        eager fallback for a replay without a captured key) goes to
+        ``execute_model``. The step ends with a device synchronize so the
+        caller only sees completed work.
+
+        ``cancel_requested`` tells a cancelled receive apart from a broken
+        control plane: when the control plane was closed on purpose (the
+        caller set its stop flag before closing it) the method returns
+        ``False``; any other closed or failed receive raises unchanged, so a
+        peer or transport failure is never reported as a clean stop.
+
+        Shared by ``AFDFFNWorker._run_ffn_server_loop`` and the standalone
+        FFN service backend, so both drive identical capture, replay and
+        synchronization order.
+        """
+        control_plane = self.connector.control_plane
+        if control_plane is None:
+            raise NotImplementedError(
+                "GPU FFN only supports control-plane-driven connectors; "
+                "connectors without a control plane (control_plane is None) "
+                "are not supported.",
+            )
+
+        try:
+            payload = control_plane.recv_dp_metadata_list()
+        except AFDControlPlaneClosedError:
+            if not cancel_requested():
+                raise
+            return False
+        dp_metadata_list = payload.dp_metadata_list
+        is_attn_graph_capturing = payload.is_graph_capturing
+        is_warmup = payload.is_warmup
+        is_graph_replaying = payload.is_graph_replaying
+
+        if self.use_cuda_graph and (is_warmup or is_attn_graph_capturing):
+            self.capture_model(
+                dp_metadata_list=dp_metadata_list,
+                is_warmup=is_warmup,
+                is_attn_graph_capturing=is_attn_graph_capturing,
+            )
+        else:
+            self.execute_model(
+                dp_metadata_list=dp_metadata_list,
+                is_graph_capturing=is_attn_graph_capturing,
+                is_warmup=is_warmup,
+                is_graph_replaying=is_graph_replaying,
+            )
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        return True
 
     def execute_model(
         self,

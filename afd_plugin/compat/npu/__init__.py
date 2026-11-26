@@ -1,10 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Ascend/vLLM-Ascend compatibility helpers for AFD runtime classes.
+# Create: 2026-05-25
+# Note: Exports the public NPU loader and runtime compatibility helpers.
+# History: 2026-05-25 create
 """Ascend/vLLM-Ascend compatibility helpers for AFD runtime classes."""
 
 from afd_plugin.compat.npu.ops import (
     AFD_ASCEND_OPS_NAMESPACE,
     AFD_ASCEND_VENDOR_NAME,
+    AFD_ASYNC_COMBINE_RECV,
+    AFD_ASYNC_COMBINE_SEND,
+    AFD_ASYNC_DISPATCH_RECV,
+    AFD_ASYNC_DISPATCH_SEND,
+    AFD_ASYNC_OP_NAMESPACE,
     AFD_CUST_OPAPI_ENV,
     CAM_COMBINE_RECV,
     CAM_COMBINE_SEND,
@@ -12,6 +21,7 @@ from afd_plugin.compat.npu.ops import (
     CAM_DISPATCH_SEND,
     CAM_OP_NAMESPACE,
     ensure_afd_ascend_ops_loaded,
+    ensure_afd_async_ops_available,
     ensure_cam_async_ops_available,
     ensure_cam_p2p_ops_available,
     get_afd_cann_vendor_path,
@@ -38,12 +48,18 @@ __all__ = [
     "AFD_ASCEND_OPS_NAMESPACE",
     "AFD_ASCEND_VENDOR_NAME",
     "AFD_CUST_OPAPI_ENV",
+    "AFD_ASYNC_COMBINE_RECV",
+    "AFD_ASYNC_COMBINE_SEND",
+    "AFD_ASYNC_DISPATCH_RECV",
+    "AFD_ASYNC_DISPATCH_SEND",
+    "AFD_ASYNC_OP_NAMESPACE",
     "CAM_COMBINE_RECV",
     "CAM_COMBINE_SEND",
     "CAM_DISPATCH_RECV",
     "CAM_DISPATCH_SEND",
     "CAM_OP_NAMESPACE",
     "ensure_afd_ascend_ops_loaded",
+    "ensure_afd_async_ops_available",
     "ensure_cam_async_ops_available",
     "ensure_cam_p2p_ops_available",
     "fail_if_unsupported_npu_afd_features",

@@ -12,11 +12,11 @@ The V2 DP2 cases replace the duplicate GPU `afd-eager-2a2f`,
 baseline and AFD eager, graph, and graph+DBO on 2A1F. Qwen3.6 MoE retains
 three: baseline and AFD eager and graph on 2A1F. GDN DBO is unsupported.
 
-The single-deployment inventory contains 48 definitions: 38 CUDA cases
-(18 DeepSeek-V2-Lite, nine Qwen3 MoE, three Qwen3.6 MoE and eight DSV4
+The single-deployment inventory contains 52 definitions: 42 CUDA cases
+(18 DeepSeek-V2-Lite, 13 Qwen3 MoE, three Qwen3.6 MoE and eight DSV4
 Flash) and ten NPU cases (seven DeepSeek-V2-Lite and three DSV4 Flash).
-The CUDA counts include the local DeepEP M2N entries. CI still selects the
-same 15 unique node IDs across ready/merge and weekly gates. Definitions,
+The CUDA counts include the DeepEP M2N and standalone FFN service entries.
+CI selects 16 unique node IDs across ready/merge and weekly gates. Definitions,
 collected nodes and device acceptance results are different counts.
 
 The ten existing GPU multi-pod entries also use model-local Cases and the
@@ -112,7 +112,12 @@ AFD eager intentionally retains its required Hash probe.
 Deployment owns connector order (sync FFN then Attention; async CAM Attention
 then FFN), readiness, pre/post-workload liveness and cleanup. Its explicit
 `cleanup_profile` retains the scoped NPU async CAM exception; ordinary cases
-use strict cleanup. Per-role options, connector configuration, pinned Attention
+use strict cleanup. `Deployment.ffn_service` runs the FFN role as the
+standalone FFN service (`torchrun -m afd_plugin.ffn_faas serve`) on one host:
+the runner waits for every rank's `/ready`, ends the case with `/stop` on
+every rank followed by Attention shutdown, requires the launcher to exit 0 and
+every rank's status file to report released resources, and sweeps the
+torchrun workers by environment on cleanup. Per-role options, connector configuration, pinned Attention
 address and exact compilation settings preserve the existing NPU profiles.
 `Deployment.dbo` is the default for its roles. An explicit `Role.dbo` replaces
 that default; `Role.dbo=None` inherits it. `DboConfig()` enables DBO with native
@@ -286,13 +291,29 @@ DeepSeek-V2-Lite through the same five scenarios.
 They need four SM90 or newer GPUs and afdEP-comm (DeepGEMM comes with vLLM);
 see
 [Installation](../../docs/gpu/DEEPEP_M2N_CONNECTOR_USER_GUIDE.md#installation)
-in the connector guide. CI does not run them.
+in the connector guide. Weekly CI runs the Qwen3 MoE
+`afd-deepep-m2n-graph-dbo-2a2f` scenario; the others are local-only.
 
 ```bash
 export AFD_E2E_BACKEND=gpu
 export AFD_E2E_DEVICES=0,1,2,3
 python -m pytest -q -s \
   tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe_deepep_m2n
+```
+
+`test_qwen3_moe_deepep_m2n_ffn_service` runs the eager, graph, graph + DBO
+and Attention TP2 graph deployments (`afd-deepep-m2n-faas-*-2a2f`) with the
+FFN side served by the
+[standalone GPU FFN service](../../docs/gpu/STANDALONE_FFN_SERVICE.md)
+instead of `vllm serve`. Attention launches unchanged. Graph and DBO cases
+still require execution evidence from both roles: the service has no vLLM
+Worker, so its ranks run `tests.e2e.ffn_service_evidence`, which installs the
+same FFN probe and runs the unchanged CLI. It has the same requirements and is
+not run by CI.
+
+```bash
+python -m pytest -q -s \
+  tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe_deepep_m2n_ffn_service
 ```
 
 `tests/e2e/models/qwen3_moe/test_qwen3_moe_multi_pod.py` runs the eager,
@@ -381,10 +402,12 @@ do not establish numerical equivalence or full-dataset qualification.
 
 ### Weekly GSM8K
 
-The weekly pipeline runs eight scenarios: all four Qwen3 MoE cases
+The weekly pipeline runs nine scenarios: all four Qwen3 MoE cases
 (baseline, eager, graph, and graph+DBO), the three Qwen3.6 MoE cases
-(baseline, eager, and graph), and DeepSeek-V2-Lite `afd-graph-dbo-2a1f`,
-all with the default GSM8K sample limit. To reproduce locally:
+(baseline, eager, and graph), DeepSeek-V2-Lite `afd-graph-dbo-2a1f`, and the
+Qwen3 MoE DeepEP M2N `afd-deepep-m2n-graph-dbo-2a2f`, all with the default
+GSM8K sample limit. It also runs the DeepEP M2N device tests
+(`tests/gpu/test_deepep_m2n_gpu.py`). To reproduce locally:
 
 ```bash
 # Qwen3 MoE (all four P2P scenarios)
@@ -392,6 +415,10 @@ python -m pytest -q -s tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_
 
 # Qwen3.6 MoE (all three scenarios; GDN DBO unsupported)
 python -m pytest -q -s tests/e2e/models/qwen3_6/test_qwen3_6.py
+
+# Qwen3 MoE DeepEP M2N graph+DBO (needs afdEP-comm, see the M2N section)
+python -m pytest -q -s \
+  "tests/e2e/models/qwen3_moe/test_qwen3_moe.py::test_qwen3_moe_deepep_m2n[afd-deepep-m2n-graph-dbo-2a2f]"
 ```
 
 For a full 1319-sample run, export `AFD_GSM8K_LIMIT=all` before invoking
@@ -564,6 +591,7 @@ recorded launch shape:
 | Scenario | Host | Deployment | Devices |
 | --- | --- | --- | --- |
 | `afd-dsv4-flash-sync-camp2p-2a2f` | A5 (Ascend 950) | Attention DP2/TP1 + FFN DP2/TP1, expert parallel, ACL graph (`FULL_DECODE_ONLY`, capture 16), 4096 context, native DBO off, 128-token block, prefix caching off | 4 |
+| `afd-dsv4-flash-sync-camp2p-mxfp8-4a4f` | A5 (Ascend 950) | Attention DP4/TP1 + FFN DP4/TP1, gate on Attention, expert parallel, MXFP8 transport (`quant_mode=4`), ACL graph (`FULL_DECODE_ONLY`, capture 16), 4096 context, 3072 batch tokens, native DBO off, 128-token block, prefix caching off | 8 |
 | `afd-dsv4-flash-sync-camp2p-8a8f` | A3 (Ascend 910C) | Attention DP2/TP4 + FFN DP8/TP1, expert parallel, eager, 8192 context | 16 |
 
 Build the operators for the target SOC first (`SOC_VERSION=ascend950` on A5,
@@ -571,6 +599,28 @@ Build the operators for the target SOC first (`SOC_VERSION=ascend950` on A5,
 entries go to Attention and the rest to FFN, so A5 passes `2,3,0,1` for its
 recorded mapping and A3 passes `0-7` for Attention with `8-15` for FFN — and a
 list sized for the other host fails rather than skips.
+
+### A5 MXFP8 acceptance case
+
+`afd-dsv4-flash-sync-camp2p-mxfp8-4a4f` covers Attention-side routing, the MXFP8
+transport and the FFN consumer in one run: A5 4A4F, `quant_mode=4`, DBO off,
+`FULL_DECODE_ONLY`, a 3,072-token batch budget and answer checking enabled. It
+needs the A5 host, a checkpoint with FP8 expert activations and an `a2e` operator
+built from #444. When the operator probe or the loaded expert quant type does not
+match, startup is expected to fail rather than skip. The public CI carries no NPU
+lane, so select the case explicitly on the device host:
+
+```bash
+set -o pipefail
+AFD_E2E_BACKEND=npu AFD_E2E_DEVICES=0,1,2,3,4,5,6,7 \
+AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V4-Flash \
+python -m pytest -q -s \
+  "tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py::test_deepseek_v4_flash_sync_camp2p[afd-dsv4-flash-sync-camp2p-mxfp8-4a4f]"
+```
+
+Keep `run.json`, both role logs, the answer samples and the Graph artifacts with
+the run so a failure can be assigned to startup, answer checking or Graph
+execution.
 
 Both profiles are **smoke cases**: the async case's ten concurrent chat requests
 (`12 + 7` … `21 + 7`, temperature=0, thinking=false, max_tokens=256) must be served

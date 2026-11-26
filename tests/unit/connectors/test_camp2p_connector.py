@@ -30,6 +30,7 @@ from afd_plugin.connectors.npu.camp2p import (
     build_camp2p_topology,
 )
 from afd_plugin.connectors.npu.camp2p import connector as camp2p_module
+from afd_plugin.connectors.npu.camp2p import mxfp8_transport as mxfp8_module
 from tests.unit.fakes.dp_metadata import DPMetadata as _FakeDPMetadata
 
 
@@ -201,6 +202,7 @@ def test_camp2p_opaque_send_uses_current_stage_padding(
             int(with_input_ids),
             ids,
             scales,
+            camp2p_module.A2E_QUANT_MODE_BF16,
         )
         wire = sent[-1][0]
         assert wire.shape == (physical, 16)
@@ -341,6 +343,20 @@ def test_camp2p_init_scopes_fresh_options_to_each_hccl_group(
     monkeypatch.setattr(camp2p_module, "ensure_cam_p2p_ops_available", lambda: None)
     monkeypatch.setattr(camp2p_module, "_register_camp2p_custom_ops", lambda: None)
 
+    # The group handshake is not what this test is about, and its collective
+    # cannot take the SimpleNamespace stand-ins as a process group.
+    def fake_all_gather(output, local, group=None):
+        # The handshake reads the gathered rows back, so the stand-in publishes
+        # the whole local vector for every rank instead of leaving the output
+        # uninitialised. It must work for the flat buffer too.
+        output.view(-1, local.numel()).copy_(local)
+
+    monkeypatch.setattr(
+        camp2p_module.torch.distributed,
+        "all_gather_into_tensor",
+        fake_all_gather,
+    )
+
     def fake_init_afd_process_group(**kwargs):
         calls.append(kwargs)
         backend = SimpleNamespace(
@@ -479,3 +495,68 @@ def test_camp2p_init_fails_cleanly_without_ascend_runtime(monkeypatch):
 
     with pytest.raises(RuntimeError, match="AFD Ascend custom ops|torch-npu"):
         connector.init_afd_connector()
+
+
+def test_camp2p_mxfp8_send_keeps_each_stage_on_its_own_rows(monkeypatch):
+    """Mode 4 quantizes exactly the rows of the stage it is sending."""
+
+    import torch
+
+    methods = {}
+    monkeypatch.setattr(camp2p_module, "_CAMP2P_CUSTOM_OPS_REGISTERED", False)
+    monkeypatch.setattr(
+        camp2p_module,
+        "direct_register_custom_op",
+        lambda **kwargs: methods.update({kwargs["op_name"]: kwargs["op_func"]}),
+    )
+    camp2p_module._register_camp2p_custom_ops()
+
+    quantize_rows: list[int] = []
+    transport: list[tuple] = []
+
+    def fake_quantize(hidden_states):
+        rows, hidden_size = (int(size) for size in hidden_states.shape)
+        quantize_rows.append(rows)
+        scale = torch.ones((rows, -(-hidden_size // 32)), dtype=torch.uint8).view(
+            torch.float8_e8m0fnu
+        )
+        return hidden_states.to(torch.float8_e4m3fn), scale
+
+    def fake_a2e(*args):
+        transport.append(args)
+        return (None, None, None, torch.tensor([1]), None, None)
+
+    monkeypatch.setattr(mxfp8_module, "quantize_activation", fake_quantize)
+    monkeypatch.setattr(torch.ops.afd_ascend, "a2e", fake_a2e, raising=False)
+
+    for stage, rows in ((0, 3), (1, 1)):
+        context = SimpleNamespace(ubatch_idx=stage)
+        monkeypatch.setattr(camp2p_module, "get_forward_context", lambda c=context: c)
+        hidden = torch.full((rows, 32), float(stage + 1))
+        expert_ids = torch.full((rows, 2), stage + 1, dtype=torch.int32)
+        expert_scales = torch.full((rows, 2), 0.5, dtype=torch.float32)
+        methods["afd_camp2p_send_attn_output"](
+            hidden,
+            "group0",
+            "group1",
+            "",
+            rows,
+            32,
+            2,
+            4,
+            4,
+            1,
+            8,
+            1,
+            expert_ids,
+            expert_scales,
+            camp2p_module.A2E_QUANT_MODE_MXFP8,
+        )
+
+    assert quantize_rows == [3, 1]
+    assert [len(call[0]) for call in transport] == [3, 1]
+    assert [call[9] for call in transport] == ["group0", "group1"]
+    assert [call[12].shape[0] for call in transport] == [3, 1]
+    assert [call[12].dtype for call in transport] == [torch.float8_e8m0fnu] * 2
+    assert [call[13] for call in transport] == [4, 4]
+    assert not torch.equal(transport[0][0][:1].float(), transport[1][0].float())

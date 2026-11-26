@@ -11,9 +11,9 @@ steps:
           - >-
             pytest -sv -m "not gpu and not vllm_runtime"
             tests/unit
-            tests/npu/test_async_cam_harness.py
-            tests/npu/test_async_cam_performance.py
-            tests/npu/test_async_cam_golden.py
+            tests/npu/test_afd_async_harness.py
+            tests/npu/test_afd_async_performance.py
+            tests/npu/test_afd_async_golden.py
             tests/npu/test_gmm_layered_performance.py
           - "pytest -sv tests/gpu/test_attention_routing.py"
         mirror_hardwares: l4_1

@@ -354,9 +354,9 @@ the connector initializes. The package can therefore be imported without the
 NPU extension, but the CAMP2P data path cannot run without it.
 
 `CAMAsyncAFDConnector` loads the same AFD extension and additionally requires
-all four `torch.ops.afd_ascend.afd_async_*` operators. The 910C package uses
-compact routed-only metadata; Attention owns shared experts and FFN owns
-routed experts. The 950 package does not register these async operators.
+all four `torch.ops.afd_ascend.afd_async_*` operators. Both 910C and 950
+use compact routed-only metadata. Attention owns shared experts and FFN owns
+routed experts. The 950 build selects the A5 MTE kernels at build time.
 See [the routed-only guide](../npu/cam_async_routed_ops.md) for metadata
 and window lifetime contracts. Device validation remains necessary for each
 target topology.

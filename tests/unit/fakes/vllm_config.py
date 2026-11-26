@@ -21,7 +21,7 @@ def camp2p_config(
             tensor_parallel_size=1,
             num_ubatches=num_ubatches,
         ),
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
+        scheduler_config=SimpleNamespace(max_num_seqs=8, max_num_batched_tokens=16),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(
                 hidden_size=16,
@@ -296,6 +296,32 @@ def m2n_vllm_config(
             max_num_batched_tokens=M2N_MAX_NUM_BATCHED_TOKENS
         ),
     )
+
+
+def attention_moe_vllm_config(
+    *,
+    connector: str = "P2pNcclAFDConnector",
+    compute_gate_on_attention: bool = False,
+    **model_fields: Any,
+):
+    """A real CPU ``VllmConfig`` for building Attention-role MoE runners.
+
+    vLLM's ``FusedMoEFactory`` reads the full config, so this is not a
+    ``SimpleNamespace``. ``model_config`` holds only what the factory and the
+    AFD model shells read; ``model_fields`` adds model-specific fields.
+    """
+    # Deferred: this fakes module must import on CPU-only hosts without torch.
+    import torch
+    from vllm.config import DeviceConfig, VllmConfig
+
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    config.additional_config["afd"] = {
+        "role": "attention",
+        "connector": connector,
+        "compute_gate_on_attention": compute_gate_on_attention,
+    }
+    config.model_config = SimpleNamespace(dtype=torch.float32, **model_fields)
+    return config
 
 
 def npu_dspark_config(*, role="attention", draft_eager=True, tp_size=1):

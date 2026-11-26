@@ -7,7 +7,8 @@ P2pNcclAFDConnector (implemented with vLLM's PyNcclCommunicator) is a GPU-backed
 Use this connector for CUDA deployments that disaggregate Attention and FFN
 workers and exchange hidden states synchronously through NCCL point-to-point
 communication. On the GPU target vLLM 0.32, DeepSeek MoE layers keep the native MoE forward
-contract and replace only the local experts with an AFD remote-experts proxy.
+contract and build their experts through vLLM's `FusedMoEFactory` with an AFD
+runner that sends them to the FFN role and allocates no expert weights.
 The MoE gate may run on Attention or FFN.
 
 It supports both prefill and decode which all support eager mode. CUDA graph support is currently limited to `FULL_DECODE_ONLY`, which is mainly used in decode instance. The checked-in DeepSeek V2 Lite recipes cover colocated and prefill/decode-disaggregated deployments.

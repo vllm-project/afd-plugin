@@ -247,6 +247,11 @@ mirror_hardwares:
                     mountPath: /dev/shm
                   - name: hf-cache
                     mountPath: /root/.cache/huggingface
+                  # Kernel JIT caches (afdEP-comm, DeepEP, DeepGEMM); the
+                  # DeepEP M2N steps point their cache env vars here
+                  # (.buildkite/cuda/scripts/m2n-test-env.sh).
+                  - name: afd-jit-cache
+                    mountPath: /root/.cache/afd-jit
                 env:
                   - name: HF_HOME
                     value: /root/.cache/huggingface
@@ -266,4 +271,8 @@ mirror_hardwares:
               - name: hf-cache
                 hostPath:
                   path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+              - name: afd-jit-cache
+                hostPath:
+                  path: /mnt/afd-jit-cache
                   type: DirectoryOrCreate

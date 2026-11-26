@@ -108,6 +108,12 @@ configuration, a pinned Attention rendezvous address, exact compilation
 configuration, and `cleanup_profile`. Sync connectors start FFN then Attention;
 async CAM starts Attention then FFN. The NPU async profile alone keeps its
 scoped FFN process-ownership cleanup exception; other profiles are strict.
+`Deployment.ffn_service` replaces the FFN role's `vllm serve` with the
+standalone FFN service under `torchrun` on one host. Readiness adds every
+rank's `/ready`; a passing case ends with `/stop` on every rank, then
+Attention, and requires a clean launcher exit and released resources per rank.
+Its torchrun workers sit outside the launcher's process group, so cleanup also
+sweeps FFN processes by run environment.
 `Deployment.dbo` supplies a default, and an explicit `Role.dbo` overrides it.
 `Role.dbo=None` inherits the default; `DboConfig()` keeps native thresholds.
 `Deployment.dbo_for_role()` resolves this rule for commands, probe validation
@@ -191,6 +197,7 @@ tests/e2e/
 ├── deployment.py            # Case commands, service startup and cleanup
 ├── checks/mrv2.py           # Host probe preparation and phase windows
 ├── mrv2_evidence.py         # Worker-side probe
+├── ffn_service_evidence.py  # Same probe for the standalone FFN service
 ├── accuracy/<task>.py       # Shared workload and result validation
 ├── environment.py          # Resource bindings and CLI environment
 ├── multi_pod/              # Peer coordination and placement; NPU legacy entry
@@ -207,7 +214,8 @@ cleanup. Production code does not depend on the E2E harness.
 - `E2E-INV-002` — A PR case **MUST NOT** use more than four unique devices.
   AFD gate topology **MUST** match the selected suite: DeepSeek-V2-Lite
   defaults use 2A2F; Qwen3 MoE and Qwen3.6 MoE use 2A1F. Weekly CI also
-  selects the existing DeepSeek-V2-Lite 2A1F Graph + DBO case.
+  selects the existing DeepSeek-V2-Lite 2A1F Graph + DBO case and the Qwen3
+  MoE DeepEP M2N 2A2F Graph + DBO case.
 - `E2E-INV-003` — Cases sharing devices or ports **MUST** run sequentially,
   remain order-independent, and release owned process groups before the next
   case.
@@ -249,7 +257,8 @@ for NPU. The `test_deepseek_v2_lite` entry collects 13 GPU cases, including
 1A1F, 2A1F and the local-only `afd-v2-graph-dbo-tp2`; its NPU selection
 collects seven. The P2P entries across DeepSeek, Qwen3 MoE and Qwen3.6 MoE
 contain 20 CUDA cases (13 + 4 + 3). Separate DeepEP M2N entries add five GPU-only
-cases each for DeepSeek and Qwen3 MoE. Unfiltered DeepSeek module collection
+cases each for DeepSeek and Qwen3 MoE, and a Qwen3 MoE standalone FFN service
+entry adds four. Unfiltered DeepSeek module collection
 includes its five DeepEP IDs even on NPU; NPU runs select the P2P entry or
 explicit node IDs. The local-only TP2 Graph + DBO case is outside the seven-case
 ready/merge CI gate.
@@ -381,7 +390,7 @@ unverified.
 | Samples | first 7 for ordinary cases; default DBO floors at 24; V2 DP2 eager/DBO comparison defaults to 128 | first 7; all DBO cases floor at 24 |
 | Metric | GSM8K exact match | GSM8K exact match |
 | Minimum accuracy | DeepSeek-V2-Lite smoke (up to 24 samples): 0.25; otherwise 0.27 | DeepSeek-V2-Lite smoke (up to 24 samples): 0.25; otherwise 0.27 |
-| Cases | seven CUDA DeepSeek-V2-Lite cases; four existing NPU DeepSeek-V2-Lite cases | seven Qwen3 MoE / Qwen3.6 MoE cases plus DeepSeek-V2-Lite `afd-graph-dbo-2a1f` |
+| Cases | seven CUDA DeepSeek-V2-Lite cases; four existing NPU DeepSeek-V2-Lite cases | seven Qwen3 MoE / Qwen3.6 MoE cases plus DeepSeek-V2-Lite `afd-graph-dbo-2a1f` and Qwen3 MoE `afd-deepep-m2n-graph-dbo-2a2f` |
 
 An accuracy of `0.27` requires at least 2 correct answers out of 7, 7 out of
 24, or 35 out of 128. The DeepSeek smoke threshold of `0.25` requires 6 out

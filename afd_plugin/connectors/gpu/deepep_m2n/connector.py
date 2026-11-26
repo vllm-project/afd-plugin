@@ -50,8 +50,10 @@ Control plane:
     payload to every FFN rank over the AFD world's NCCL group.
 
 Transport:
-    Dispatch and combine run on afdEP-comm's DeepEP-derived ``ElasticBuffer``
-    (https://github.com/afdEP/afdEP-comm): Attention ranks only send in
+    Dispatch and combine run on afdEP-comm (https://github.com/afdEP/afdEP-comm),
+    through its role API: one ``Buffer`` per lane, built together as ``Lanes``.
+    Attention ranks call ``source_dispatch`` and ``source_collect``, FFN ranks
+    ``worker_receive`` and ``worker_reply``. Attention ranks only send in
     dispatch and only receive in combine, FFN ranks the reverse. Compared with
     FastAFD's DeepEP M2N (DeepEP V2 over one symmetric group with dummy expert
     slots on Attention ranks), it drops the entry barriers, the all-rank count
@@ -66,7 +68,6 @@ RDMA; see ``network.py``).
 from __future__ import annotations
 
 import itertools
-import os
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields
@@ -75,7 +76,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
-from afdep.deepep import DispatchHandle, ElasticBuffer, ReceiveResult
+from afdep import Buffer, Config, DispatchHandle, Lanes
 from torch.distributed.distributed_c10d import _abort_process_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
@@ -99,6 +100,8 @@ from afd_plugin.connectors.gpu.deepep_m2n.experts import (
     ExpertBackend,
 )
 from afd_plugin.connectors.gpu.deepep_m2n.layout import (
+    ATTENTION_ROLE,
+    FFN_ROLE,
     DeepEPM2NLayout,
     RankPlacement,
     TransportLayout,
@@ -141,6 +144,9 @@ BF16_PAYLOAD = "bf16"
 FP8_PAYLOAD = "fp8_block128_fp32"
 PAYLOAD_FORMATS = (BF16_PAYLOAD, FP8_PAYLOAD)
 FP8_GROUP_SIZE = 128
+# afdEP-comm's names for the two payloads (``afdep.Config.payload``).
+AFDEP_BF16_PAYLOAD = "bf16"
+AFDEP_FP8_PAYLOAD = "fp8"
 # Expert weight formats the FFN must load for each payload format.
 BF16_WEIGHTS = "bf16"
 FP8_BLOCK128_WEIGHTS = "fp8_block128"
@@ -167,7 +173,6 @@ DEFAULT_TIMEOUT_S = 120
 CONTROL_SENDER_ATTN_RANK = 0
 # Lanes = in-flight micro-batches (DBO uses two).
 MAX_LANES = 2
-PER_BUFFER_COMM_STREAM_ENV = "AFD_DEEPEP_PER_BUFFER_COMM_STREAM"
 
 
 @dataclass(frozen=True)
@@ -1004,13 +1009,11 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self.transport_group: dist.ProcessGroup | None = None
         self.transport: TransportLayout | None = None
         self.network_plan: NetworkPlan | None = None
-        self.lanes: list[ElasticBuffer] = []
+        self.lanes: Lanes | None = None
         self.lane_streams: list[torch.cuda.Stream] = []
         self.experts: DeepEPM2NExperts | None = None
         self.expert_alignment = 1
         self.stage_plans: dict[int, StagePlan] = {}
-        # Attention side: dispatch handles waiting for their combine, by stage.
-        self._pending_combines: dict[int, DispatchHandle] = {}
         # FFN side: combine completion per lane, joined by synchronize_lanes.
         self._lane_done: dict[int, torch.cuda.Event] = {}
         # FFN side: lanes join the caller's stream once per step, at an event
@@ -1018,8 +1021,6 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         self._step_fork: torch.cuda.Event | None = None
         self._step_fork_capturing = False
         self._lanes_joined: set[int] = set()
-        # Attention side: the empty combine input (see _allocate_combine_zeros).
-        self._combine_zeros: torch.Tensor | None = None
         self._op_id = next(_CONNECTOR_IDS)
         self._initialized = False
         self.control_plane: DeepEPM2NAFDControlPlane = DeepEPM2NAFDControlPlane(self)
@@ -1101,11 +1102,8 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         if self.world_rank == 0:
             logger.info("DeepEP M2N network plan: %s", self.network_plan.summary())
             logger.info("DeepEP M2N transport: %s", self.transport.summary())
-        # DeepEP reads both when each buffer is created: the GIN switch, and
-        # with several lanes a communication stream per buffer.
+        # DeepEP reads the GIN switch when each buffer is created.
         apply_gin_environment(self.network_plan)
-        if self.num_lanes > 1:
-            os.environ[PER_BUFFER_COMM_STREAM_ENV] = "1"
 
     def init_afd_connector(
         self,
@@ -1153,19 +1151,19 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             timeout=self._timeout,
         )
         try:
-            for _ in range(self.num_lanes):
-                self.lanes.append(self._new_lane())
-                # One lane runs on the caller's stream: no fork/join cost.
-                if self.num_lanes > 1:
-                    self.lane_streams.append(torch.cuda.Stream(self.device))
+            self.lanes = self._new_lanes()
+            self._check_lane_roles()
+            # One lane runs on the caller's stream: no fork/join cost.
+            if self.num_lanes > 1:
+                self.lane_streams = [
+                    torch.cuda.Stream(self.device) for _ in range(self.num_lanes)
+                ]
             if self.is_ffn:
                 self.experts = DeepEPM2NExperts(
                     self.config.expert_backend,
                     self.expert_alignment,
                     self.config.expert_num_sms,
                 )
-            else:
-                self._allocate_combine_zeros()
             self._precompile_dispatch_kernels()
         except Exception:
             self.close()
@@ -1173,49 +1171,75 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         _CONNECTORS[self._op_id] = self
         self._initialized = True
 
-    def _new_lane(self) -> ElasticBuffer:
-        """One lane's afdEP-comm transport."""
+    def _new_lanes(self) -> Lanes:
+        """afdEP-comm's transport: one ``Buffer`` per lane on the transport group."""
         assert self.transport_group is not None and self.transport is not None
         assert self.network_plan is not None
         assert self.capacity_tokens_per_rank is not None
-        return ElasticBuffer(
-            group=self.transport_group,
+        config = Config(
             capacity_tokens_per_rank=self.capacity_tokens_per_rank,
             hidden_size=self.hidden_size,
-            num_experts=self.layout.deepep_num_experts,
+            # Real experts; afdEP-comm adds DeepEP's empty Attention blocks.
+            num_experts=self.layout.num_experts,
             top_k=self.top_k,
+            # FFN ranks are transport ranks [0, F) (FFN prefix), or the first
+            # ``ffn_ranks_per_domain`` of every NVLink domain (per-domain mode).
+            ffn_ranks=self.ffn_size,
+            attention_ranks=self.attn_size,
+            ffn_ranks_per_domain=self.transport.ffn_ranks_per_domain,
+            expert_alignment=self.expert_alignment,
+            payload=AFDEP_FP8_PAYLOAD if self.is_fp8_payload else AFDEP_BF16_PAYLOAD,
             allow_hybrid_mode=self.network_plan.hybrid,
-            use_fp8_dispatch=self.is_fp8_payload,
             num_sms=self.config.num_sms,
             num_qps=self.config.num_qps,
             rdma_traffic_class=self.network_plan.rdma_traffic_class,
             cpu_timeout_s=self.config.cpu_timeout_s,
             gpu_timeout_s=self.config.gpu_timeout_s,
-            # FFN ranks are transport ranks [0, F) (FFN prefix), or the first
-            # ``ffn_ranks_per_domain`` of every NVLink domain (per-domain mode).
-            ffn_ranks=self.ffn_size,
-            ffn_ranks_per_domain=self.transport.ffn_ranks_per_domain,
         )
+        return Lanes(group=self.transport_group, config=config, lanes=self.num_lanes)
+
+    def _check_lane_roles(self) -> None:
+        """Check afdEP-comm puts this rank where the plugin's layout does.
+
+        Both compute the FFN placement; if they disagreed, an FFN rank would
+        receive rows for experts it did not load and return wrong results
+        without any error.
+        """
+        lane = self._lanes(0)
+        role = FFN_ROLE if self.is_ffn else ATTENTION_ROLE
+        mismatch = None
+        if lane.role != role or (self.is_ffn and lane.role_rank != self.role_rank):
+            mismatch = (
+                f"afdEP-comm placed world rank {self.world_rank} as "
+                f"{lane.role} {lane.role_rank}, but the DeepEP M2N layout "
+                f"has it as {role} {self.role_rank}"
+            )
+        # Closing the lanes is collective. All ranks must choose between
+        # teardown and kernel warmup together, even if just one disagrees.
+        assert self.bootstrap_group is not None
+        mismatches: list[str | None] = [None] * self.layout.union_size
+        dist.all_gather_object(mismatches, mismatch, group=self.bootstrap_group)
+        for error in mismatches:
+            if error is not None:
+                raise RuntimeError(error)
 
     def close(self) -> None:
         """Cancel the control receive and destroy DeepEP buffers; safe after
         partial init and on repeat calls."""
         self.control_plane.close()
         _CONNECTORS.pop(self._op_id, None)
-        for lane in self.lanes:
-            lane.destroy()
+        if self.lanes is not None:
+            self.lanes.close()
         if (
             self.transport_group is not None
             and self.transport_group is not self.bootstrap_group
         ):
             dist.destroy_process_group(self.transport_group)
         self.transport_group = None
-        self.lanes = []
+        self.lanes = None
         self.lane_streams = []
-        self._pending_combines.clear()
         self._lane_done.clear()
         self._reset_step_fork()
-        self._combine_zeros = None
         self._initialized = False
 
     @property
@@ -1228,7 +1252,8 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         ranks per domain in hybrid mode (2 x 4A1F: ``(2, 5)``), ``(1, world)``
         when everything is in one NVLink domain."""
         self._check_initialized()
-        return self.lanes[0].num_scaleout_ranks, self.lanes[0].num_scaleup_ranks
+        scaleout_ranks, scaleup_ranks = self._lanes(0).logical_domain
+        return scaleout_ranks, scaleup_ranks
 
     # ==============================
     # Attention side
@@ -1289,8 +1314,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
     ) -> None:
         """Eager body of the dispatch custom op (runs on the stage's lane)."""
         self._check_initialized()
-        if stage_idx in self._pending_combines:
-            raise RuntimeError(f"stage {stage_idx} dispatched twice without combine")
+        lane, plan = self._lanes(stage_idx), self._stage_plan(stage_idx)
         lane_stream = self._lane_stream(stage_idx)
         self._fork_to(lane_stream)
         with torch.cuda.stream(lane_stream):
@@ -1299,20 +1323,24 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
                 x, x_scale = per_token_group_quant_fp8(
                     hidden_states, FP8_GROUP_SIZE, use_ue8m0=False
                 )
-            result = self._dispatch(stage_idx, x, x_scale, topk_ids, topk_weights)
+            # afdEP-comm takes exact dtypes and contiguous tensors; the lane
+            # raises if the stage's previous exchange was not collected.
+            lane.source_dispatch(
+                x.contiguous(),
+                topk_ids.to(lane.topk_idx_dtype).contiguous(),
+                topk_weights.float().contiguous(),
+                x_scale,
+                bucket=plan.bucket,
+                read_host_counts=plan.do_cpu_sync,
+            )
         _keep_alive_on(lane_stream, hidden_states, topk_ids, topk_weights)
-        self._pending_combines[stage_idx] = result.handle
 
     def combine_attention(self, out: torch.Tensor, stage_idx: int) -> None:
         """Eager body of the combine custom op: lane combine, then copy to out."""
         self._check_initialized()
-        handle = self._pending_combines.pop(stage_idx)
         lane_stream = self._lane_stream(stage_idx)
         with torch.cuda.stream(lane_stream):
-            # Attention ranks hold no experts; they contribute zero rows.
-            combined = self._lanes(stage_idx).combine(
-                self._combine_zero_rows(handle.recv_shape), handle
-            )
+            combined = self._lanes(stage_idx).source_collect()
         if combined.shape != out.shape:
             raise RuntimeError(
                 f"combined shape {tuple(combined.shape)} != out {tuple(out.shape)}"
@@ -1343,26 +1371,12 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
         class docstring).
         """
         self._check_initialized()
+        lane, plan = self._lanes(ubatch_idx), self._stage_plan(ubatch_idx)
         lane_stream = self._lane_stream(ubatch_idx)
         self._join_step(ubatch_idx, lane_stream)
         with torch.cuda.stream(lane_stream):
-            empty = torch.empty(
-                (0, self.hidden_size), dtype=self.payload_dtype, device=self.device
-            )
-            empty_scale = (
-                torch.empty(
-                    (0, self.hidden_size // FP8_GROUP_SIZE),
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-                if self.is_fp8_payload
-                else None
-            )
-            no_routes = torch.empty(
-                (0, self.top_k), dtype=torch.int64, device=self.device
-            )
-            result = self._dispatch(
-                ubatch_idx, empty, empty_scale, no_routes, no_routes.float()
+            result = lane.worker_receive(
+                bucket=plan.bucket, read_host_counts=plan.do_cpu_sync
             )
             ready_event = torch.cuda.Event()
             ready_event.record(lane_stream)
@@ -1439,7 +1453,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             self._fork_to(lane_stream)
         _keep_alive_on(lane_stream, ffn_output)
         with torch.cuda.stream(lane_stream):
-            self._lanes(state.lane).combine(ffn_output, state.handle)
+            self._lanes(state.lane).worker_reply(ffn_output.contiguous(), state.handle)
             done = torch.cuda.Event()
             done.record(lane_stream)
         self._lane_done[state.lane] = done
@@ -1460,33 +1474,19 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
     # Internals
     # ==============================
 
-    def _dispatch(
-        self,
-        stage_idx: int,
-        x: torch.Tensor,
-        x_scale: torch.Tensor | None,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-    ) -> ReceiveResult:
+    def _stage_plan(self, stage_idx: int) -> StagePlan:
         plan = self.stage_plans.get(stage_idx)
         if plan is None:
             raise RuntimeError(
                 f"no plan for stage {stage_idx}; call "
                 "control_plane.update_state_from_dp_metadata first"
             )
-        return self._lanes(stage_idx).dispatch(
-            x,
-            x_scale,
-            topk_ids,
-            topk_weights,
-            bucket=plan.bucket,
-            expert_alignment=self.expert_alignment,
-            do_cpu_sync=plan.do_cpu_sync,
-        )
+        return plan
 
-    def _lanes(self, stage_idx: int) -> ElasticBuffer:
-        if not 0 <= stage_idx < len(self.lanes):
-            raise RuntimeError(f"stage {stage_idx} has no lane ({len(self.lanes)})")
+    def _lanes(self, stage_idx: int) -> Buffer:
+        num_lanes = 0 if self.lanes is None else len(self.lanes)
+        if self.lanes is None or not 0 <= stage_idx < num_lanes:
+            raise RuntimeError(f"stage {stage_idx} has no lane ({num_lanes})")
         return self.lanes[stage_idx]
 
     def _lane_stream(self, stage_idx: int) -> torch.cuda.Stream:
@@ -1545,8 +1545,46 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             self.capacity_tokens_per_rank,
             self.config.cpu_sync_min_tokens,
         )
+        assert self.lanes is not None
+        start = time.perf_counter()
+        for lane in self.lanes:
+            for bucket, do_cpu_sync in buckets:
+                if self.is_ffn:
+                    received = lane.worker_receive(
+                        bucket=bucket, read_host_counts=do_cpu_sync
+                    )
+                    rows = torch.zeros(
+                        received.handle.recv_shape, dtype=self.dtype, device=self.device
+                    )
+                    lane.worker_reply(rows, received.handle)
+                else:
+                    lane.source_dispatch(
+                        *self._empty_source_tensors(lane),
+                        bucket=bucket,
+                        read_host_counts=do_cpu_sync,
+                    )
+                    lane.source_collect()
+        torch.cuda.synchronize(self.device)
+        logger.info(
+            "DeepEP M2N precompiled %d dispatch buckets x %d lanes in %.1f s: %s",
+            len(buckets),
+            len(self.lanes),
+            time.perf_counter() - start,
+            buckets,
+        )
+
+    def _empty_source_tensors(
+        self, lane: Buffer
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """``source_dispatch`` inputs for an Attention rank that sends no tokens."""
         x = torch.empty(
             (0, self.hidden_size), dtype=self.payload_dtype, device=self.device
+        )
+        topk_ids = torch.empty(
+            (0, self.top_k), dtype=lane.topk_idx_dtype, device=self.device
+        )
+        topk_weights = torch.empty(
+            (0, self.top_k), dtype=torch.float32, device=self.device
         )
         x_scale = (
             torch.empty(
@@ -1557,62 +1595,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             if self.is_fp8_payload
             else None
         )
-        topk_ids = torch.empty((0, self.top_k), dtype=torch.int64, device=self.device)
-        topk_weights = torch.empty(
-            (0, self.top_k), dtype=torch.float32, device=self.device
-        )
-        start = time.perf_counter()
-        for lane in self.lanes:
-            for bucket, do_cpu_sync in buckets:
-                result = lane.dispatch(
-                    x,
-                    x_scale,
-                    topk_ids,
-                    topk_weights,
-                    bucket=bucket,
-                    expert_alignment=self.expert_alignment,
-                    do_cpu_sync=do_cpu_sync,
-                )
-                recv_shape = result.handle.recv_shape
-                expert_output = (
-                    torch.zeros(recv_shape, dtype=self.dtype, device=self.device)
-                    if self.is_ffn
-                    else self._combine_zero_rows(recv_shape)
-                )
-                lane.combine(expert_output, result.handle)
-        torch.cuda.synchronize(self.device)
-        logger.info(
-            "DeepEP M2N precompiled %d dispatch buckets x %d lanes in %.1f s: %s",
-            len(buckets),
-            len(self.lanes),
-            time.perf_counter() - start,
-            buckets,
-        )
-
-    def _allocate_combine_zeros(self) -> None:
-        """The empty input every combine on this Attention rank takes.
-
-        Combine takes one zero row per row this rank received, and afdEP-comm
-        gives Attention ranks no receive rows on any dispatch, with or without
-        the host sync. One zero-row tensor serves both lanes and keeps a
-        stable address for captured graphs.
-        """
-        self._combine_zeros = torch.zeros(
-            (0, self.hidden_size), dtype=self.dtype, device=self.device
-        )
-
-    def _combine_zero_rows(self, shape: tuple[int, int]) -> torch.Tensor:
-        """The first ``shape[0]`` rows of the zero buffer (a contiguous view)."""
-        zeros = self._combine_zeros
-        assert zeros is not None
-        rows = shape[0]
-        if rows > zeros.shape[0] or shape[1] != zeros.shape[1]:
-            raise RuntimeError(
-                f"combine needs zero rows of shape {shape} but the buffer holds "
-                f"{tuple(zeros.shape)}: afdEP-comm gave an Attention rank receive "
-                "rows, which its AFD transport never does"
-            )
-        return zeros[:rows]
+        return x, topk_ids, topk_weights, x_scale
 
     @staticmethod
     def _transfer_state(context: AFDTransferContext) -> DeepEPM2NTransferState:

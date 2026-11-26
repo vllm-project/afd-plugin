@@ -1,7 +1,7 @@
 # Routed-only CAM asynchronous operators
 
 The AFD native package contains four experimental asynchronous communication
-operators for Ascend 910C (`ascend910_93`). They use the
+operators for Ascend 910C (`ascend910_93`) and 950 (`ascend950`). They use the
 `cam_async_routed_only_compact_v2` protocol: only routed experts participate
 in dispatch and combine; shared-expert payloads and reserved expert slots are
 absent.
@@ -62,9 +62,10 @@ SOC_VERSION=910c AFD_BUILD_ASCEND_OPS=1 \
   pip install -e . -v --no-build-isolation
 ```
 
-For 910C, the registry selects A2E/E2A and all four routed-only operators.
-For 950, only A2E/E2A are selected, and the async PyTorch registrations are not
-compiled. `setup.py` passes the same `SOC_VERSION` to the ACLNN build and
+Both builds select A2E/E2A and all four routed-only operators. For Atlas A5
+use `SOC_VERSION=950`. The build selects compact/MTE kernel sources under
+`csrc/npu/ascend_kernels/afd_async_*_arch35/` and shares the compact PyTorch schemas
+with 910C. `setup.py` passes the same `SOC_VERSION` to the ACLNN build and
 the extension CMake configuration (`AFD_SOC_VERSION`).
 
 `AFD_SKIP_ACLNN_BUILD=1` requires an existing, matching AFD vendor package
@@ -165,21 +166,20 @@ collisions, and propagation of the SOC into the extension build:
 ```bash
 python -m pytest -q \
   tests/unit/package/test_ascend_build_files.py \
-  tests/unit/package/test_cam_async_build.py \
+  tests/unit/package/test_afd_async_build.py \
   tests/unit/compat/test_ascend_ops.py
 ```
 
-Run the dedicated Meta binding tests with a built 910C extension and its
+Run the dedicated Meta binding tests with the built extension and its
 matching torch-npu/CANN libraries:
 
 ```bash
 SOC_VERSION=910c python -m pytest -q -ra \
-  tests/npu/test_cam_async_ops.py
+  tests/npu/test_afd_async_ops.py
 ```
 
-Missing dependencies or an unspecified target SOC are reported as skips, not
-NPU validation. An installed 910C extension missing a required operator fails
-the tests.
+Set `SOC_VERSION=950` to check the 950 build. A matching compiled extension
+is required for Meta evidence. Record dependency skips separately.
 
 Before claiming device support, record the exact AFD revision, CANN/HCCL,
 torch-npu and PyTorch versions, device IDs, topology, commands, logs, and
@@ -191,11 +191,10 @@ cleanup results. Validate all four phases together, including:
   and empty MoE ranks, plus repeated use of the same communication windows.
 - Inference rejection paths, invalid metadata, timeout/abort behavior, and
   completion flags under the intended caller lifecycle.
-- Rebuilding and loading with existing A2E/E2A operators, with the 950 build
-  continuing to exclude these 910C-only operators.
+- Rebuilding and loading with the existing A2E/E2A operators on both SoCs.
 
 The standalone device check is
-`tests/e2e/operators/async_cam_roundtrip.py`. Run it with `torchrun` using
+`tests/npu/afd_async_precision.py`. Run it with `torchrun` using
 TP1/2/4 plus two FFN ranks, both FP16/BF16, and quantization off/on. Each run
 compares against an independent CPU weighted-sum/quantization reference and
 covers sparse/empty ranks, multiple chunks and repeated window reuse. Model

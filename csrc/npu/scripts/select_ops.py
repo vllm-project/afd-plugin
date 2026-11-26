@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Resolve the final AFD operator list to compile for a given SOC
+#              generation.
+# Create: 2026-09-20
+# Note: The selected SoC determines which source directory implements a public
+#       operator.
+# History: 2026-09-20 create
 """Resolve the final AFD operator list to compile for a given SOC generation.
 
 Reads operator_registry.json, validates the user selection, applies the SHMEM
@@ -8,7 +14,7 @@ availability filter, then prints the selected operator directory names (one
 per line).
 
 Notes:
-  - Operator identity = source directory name under ascend_kernels/.
+  - An _arch35 source directory shares the unsuffixed operator name and metadata.
   - "utils" is a shared header directory, always copied by the build script
     and therefore never emitted here.
 """
@@ -113,9 +119,16 @@ def main():
     args = parser.parse_args()
 
     registry = load_registry(args.registry)
-    soc_list = get_soc_list(registry, args.soc)
+    directories = get_soc_list(registry, args.soc)
+    sources = {name.removesuffix("_arch35"): name for name in directories}
+    if len(sources) != len(directories):
+        die(f"SOC '{args.soc}' lists multiple implementations of the same operator")
+    soc_list = list(sources)
     user_ops = split_ops(args.ops)
     if user_ops is not None:
+        user_ops = [
+            op.removesuffix("_arch35") if op in directories else op for op in user_ops
+        ]
         validate_user_ops(user_ops, soc_list)
 
     final_ops = resolve(registry, soc_list, args.shmem == "1", user_ops)
@@ -127,7 +140,7 @@ def main():
         )
 
     for op in final_ops:
-        print(op)
+        print(sources[op])
 
 
 if __name__ == "__main__":
