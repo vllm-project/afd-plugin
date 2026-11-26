@@ -182,7 +182,7 @@ def register_afd() -> None:
     try:
         from afd_plugin.compat.vllm import assert_vllm_version_supported
 
-        assert_vllm_version_supported(strict=False, device_type=device_type)
+        assert_vllm_version_supported(strict=False)
     except Exception:
         _logger.debug(
             "AFD plugin: vLLM version check could not be completed",

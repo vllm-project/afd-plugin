@@ -1,6 +1,5 @@
-# Target vLLM version: keep VLLM_BASE_TAG aligned with the GPU pin in
-# afd_plugin/compat/vllm.py::TARGET_VLLM_VERSION (the Ascend backend keeps its
-# own 0.32.0 pair and is built outside this CUDA image).
+# Keep VLLM_BASE_TAG aligned with the shared pin in
+# afd_plugin/compat/vllm.py::TARGET_VLLM_VERSION. This image builds the CUDA backend.
 #
 # The base image already ships vLLM and its CUDA runtime stack (torch,
 # flashinfer, etc.) and the DeepGEMM bundled in vLLM. Install only the AFD

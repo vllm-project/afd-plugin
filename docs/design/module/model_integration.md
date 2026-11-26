@@ -256,7 +256,7 @@ routing. F loads one set of target and draft expert shards before rendezvous,
 then serves both from its existing receive loop. Each native draft proposal
 installs its own AFD metadata and opts out of cross-DP synchronization; native
 sampling, rejection, heads and context-KV updates are inherited. The
-[0.32 recipe](../../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md)
+[DSpark A/F recipe](../../../recipe/npu/CAMAsyncAFDConnector/deepseek_v4_flash/README.md)
 describes A/F serving. In PD deployments, Prefill uses the upstream complete
 draft model and KV connector. Attention may use native graphs with or without
 PD and Attention-local FlashComm1/SP, with matching target/draft TP and DBO

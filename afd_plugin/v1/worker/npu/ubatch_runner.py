@@ -37,7 +37,6 @@ from afd_plugin.compat.patches.npu.mrv2_ubatching import (
     use_async_cam_child_dp_metadata,
     use_npu_input_batch_slicing,
     use_npu_ubatch_contexts,
-    use_npu_ubatch_output_merge,
 )
 from afd_plugin.v1.worker.npu.attention_metadata import (
     materialize_attention_metadata_by_layer,
@@ -96,7 +95,7 @@ class NPUUBatchRunner(UBatchRunner):
                         )
                 self.stage_attn_groups.append(groups)
 
-    # Upstream: vLLM-Ascend bd42eea01d8312c4df469fabaed45f77a12df4d3,
+    # Upstream: vLLM-Ascend 7dcdb690caf879a17ab07382880d5773f5202e20,
     # worker/v2/attn_utils.py and worker/v2/model_states/default.py::prepare_attn.
     # Native build_attn_metadata always selects builder zero.
     # Feed its existing builder function an independent group per native child;
@@ -312,7 +311,6 @@ class NPUUBatchRunner(UBatchRunner):
             override_forward_context(ubatching.forward_context._forward_context)
         )
         stack.enter_context(use_npu_ubatch_contexts())
-        stack.enter_context(use_npu_ubatch_output_merge())
         if for_capture:
             # Native capture preallocates CUDA cuBLAS handles in each child.
             # Ascend GEMMs initialize during the native warmup instead. The

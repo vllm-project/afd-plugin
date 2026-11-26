@@ -107,7 +107,7 @@ def materialize_attention_metadata(
             metadata.req_metadata.cos, metadata.req_metadata.sin = cos, sin
         else:
             # vllm_ascend/ops/rope_dsv4.py::RopeDataProxy at commit
-            # bd42eea01d8312c4df469fabaed45f77a12df4d3 shares _data between
+            # 7dcdb690caf879a17ab07382880d5773f5202e20 shares _data between
             # the cos/sin proxies. Own each Tensor pair, preserving that API.
             owned_data: dict[str, dict[str, tuple[torch.Tensor, torch.Tensor]]] = {}
             for config_key, groups in cos._data.items():

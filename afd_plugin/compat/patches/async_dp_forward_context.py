@@ -188,7 +188,7 @@ def set_forward_context(
                     )
 
 
-if _is_target_vllm_compatible("npu"):
+if _is_target_vllm_compatible(allow_missing=False):
     forward_context_module.set_forward_context = set_forward_context
     for module_name in _FORWARD_CONTEXT_IMPORT_MODULES:
         module = sys.modules.get(module_name)

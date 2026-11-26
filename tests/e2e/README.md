@@ -560,10 +560,11 @@ is recorded in the effective configuration and overrides alongside the canonical
 Attention SIGKILL escalation remains a failure. FFN uses the existing scoped
 async CAM cleanup exception.
 
-vLLM 0.32 can log `AsyncLLM`'s `EngineDeadError` after an API client starts
-its own shutdown. Record this as an upstream advisory only after inference
-succeeds, every worker group exits gracefully, and process exit codes and
-cleanup checks pass. An inference-time error or forced worker exit still fails.
+Earlier vLLM 0.32 runs logged `AsyncLLM`'s `EngineDeadError` after the API client
+started shutting down. Record a shutdown-only error as an upstream advisory
+only after inference succeeds, every worker group exits gracefully, and process
+exit codes and cleanup checks pass. An inference-time error or forced worker
+exit still fails.
 
 ```bash
 export AFD_E2E_BACKEND=npu
@@ -704,8 +705,8 @@ per-channel W8A8 checkpoint), sixteen NPU devices, Attention DP2/TP4 and FFN
 DP8/TP1/EP8. Both roles receive `ffn_mega_moe=true` and `dynamicQuant=1`.
 The existing `afd-dsv4-flash-async-cam-dp2tp4-ep8` remains Mega-off.
 
-Use the target branch's pinned vLLM/vLLM-Ascend stack (vLLM 0.32.0 target),
-CANN runtime, and plugin native operators built from the same source tip.
+Use the [pinned Ascend stack](../../docs/installation.md#ascend-npu-installation)
+with vLLM 0.34.0 and build the plugin native operators from the same AFD revision.
 Do not substitute A5 CAM async-megamoe operators or the FFN FULL helper (#509).
 The new case keeps both roles eager and the existing Attention DBO setting.
 Its test-only observers synchronize completed native work; use it for functional

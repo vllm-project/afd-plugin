@@ -3,8 +3,8 @@
 """Scoped Ascend seams for vLLM's native UBatchRunner.
 
 Upstream: vllm/v1/worker/gpu/ubatch_utils.py at
-5df63a7203cdb9328d824a27b682e77c7b9928be.
-Ascend runtime: bd42eea01d8312c4df469fabaed45f77a12df4d3.
+62d4bc3c7e33b1b6c906e233e6af2d3506c482ca.
+Ascend runtime: 7dcdb690caf879a17ab07382880d5773f5202e20.
 MRV2 owns preparation, threads, handoff and graph lifecycle.
 All bindings are scoped to AFD runners and restored on exit.
 Remove when upstream supports Ascend child inputs, streams and cancellation.
@@ -14,7 +14,7 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import ParallelConfig, VllmConfig
@@ -115,7 +115,7 @@ def use_npu_ubatch_factory(runner: "AFDNPUAttentionModelRunnerV2") -> Iterator[N
 
     # This scope runs only during AFD NPU KV initialization. Keep the native
     # eligibility check, except Async CAM needs no DP handshake at DP=1.
-    # Signature matches ubatch_utils.maybe_build_ubatch_runner at 5df63a72.
+    # Signature matches ubatch_utils.maybe_build_ubatch_runner at 62d4bc3c.
     def maybe_build_ubatch_runner(
         vllm_config: VllmConfig,
         device: torch.device,
@@ -223,7 +223,7 @@ def use_async_cam_child_dp_metadata() -> Iterator[None]:
     original_metadata = ubatch_utils.DPMetadata
 
     class AsyncCamDPMetadata:
-        # Native ubatch_utils.UBatchRunner._make_forward_contexts at 5df63a72
+        # Native ubatch_utils.UBatchRunner._make_forward_contexts at 62d4bc3c
         # calls DPMetadata.make unconditionally.
         # Async FFN owns its own DP layout; DP1 without SP also fails that factory.
         # This factory alias is scoped to native child context construction;
@@ -254,7 +254,7 @@ def use_npu_input_batch_slicing() -> Iterator[None]:
     # Native replace() retains the Ascend subtype but leaves seq_lens_np whole.
     # Delegation preserves native query/sequence truncation. Apply exactly its
     # CPU truncation delta to Ascend's exact lengths, including straddling requests.
-    # Signature matches ubatch_utils._slice_input_batch at 5df63a72.
+    # Signature matches ubatch_utils._slice_input_batch at 62d4bc3c.
     def _slice_input_batch(
         input_batch: InputBatch,
         ubatch_slice: UBatchSlice,
@@ -309,46 +309,3 @@ def use_npu_ubatch_contexts() -> Iterator[None]:
         ubatching.UBatchContext = original_context
         ubatching.current_stream = original_stream
         ubatch_utils.current_stream = original_runner_stream
-
-
-def cat_ubatch_outputs(
-    outputs: list[torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]],
-) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-    """Keep Ascend's nested auxiliary-output contract when native threads merge."""
-    first = outputs[0]
-    if isinstance(first, tuple):
-        pairs = [output for output in outputs if isinstance(output, tuple)]
-        assert len(pairs) == len(outputs)
-        assert all(len(pair[1]) == len(first[1]) for pair in pairs)
-        return (
-            torch.cat([pair[0] for pair in pairs], dim=0),
-            [
-                torch.cat([pair[1][index] for pair in pairs], dim=0)
-                for index in range(len(first[1]))
-            ],
-        )
-    tensors = [output for output in outputs if isinstance(output, torch.Tensor)]
-    assert len(tensors) == len(outputs)
-    return torch.cat(tensors, dim=0)
-
-
-@contextmanager
-def use_npu_ubatch_output_merge() -> Iterator[None]:
-    """Adapt only Ascend auxiliary-output merging; keep native input slicing."""
-    previous_merge = ubatch_utils.merge_ubatch_outputs
-
-    # Patch reason: Ascend auxiliary outputs are (Tensor, list[Tensor]), which
-    # native torch.cat(parts) cannot concatenate. Preserve the tensor merge,
-    # adapting only that nested contract. Signature matches
-    # ubatch_utils.merge_ubatch_outputs at 5df63a72.
-    # Remove when upstream handles nested aux.
-    def merge_ubatch_outputs(outputs: list[Any]) -> Any:
-        # ### PATCH START: Ascend nested auxiliary outputs.
-        return cat_ubatch_outputs(outputs)
-        # ### PATCH END: Ascend nested auxiliary outputs.
-
-    try:
-        ubatch_utils.merge_ubatch_outputs = merge_ubatch_outputs
-        yield
-    finally:
-        ubatch_utils.merge_ubatch_outputs = previous_merge

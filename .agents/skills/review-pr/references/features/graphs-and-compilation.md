@@ -2,8 +2,8 @@
 
 Load with the primary module contract for changes to graph capture or
 compilation paths: `FULL_DECODE_ONLY` / `FULL` CUDA graph
-(`v1/worker/cuda_graph.py`, GPU), ACL graph via the `mla_graph` module and
-patches (`v1/worker/npu/mla_graph.py`, `compat/patches/npu/mla_graph.py`, NPU),
+(`v1/worker/cuda_graph.py`, GPU), ACL graph via the
+`v1/worker/npu/mla_graph.py` hooks,
 `_AFDCaptureEventTracker`, graph metadata preparation, and graph/eager
 fallback.
 
@@ -22,10 +22,11 @@ Designs: `docs/design/module/attention_runtime.md`,
   contract says so; Ascend CAM uses `FULL`, rejects piecewise and decode-only
   modes, and requires plain MLA graph + DBO to use `FULL_DECODE_ONLY`. A change
   that lets an unsupported mode through to capture is a P1.
-- Keep ACL graph patches pinned: `compat/patches/npu/mla_graph.py` patches
-  `vllm_ascend/attention/mla_v1.py` at the pinned vLLM-Ascend ref — apply the
-  patch contract (markers, upstream source, signature parity) and re-verify the
-  copy against that ref.
+- Verify the scoped `UpdatableGraph.register_task` and
+  `ModelAclGraphManager._updatable_graph_replay` hooks in
+  `v1/worker/npu/mla_graph.py` against the pinned vLLM-Ascend source.
+  Registration tags each task provider with its capture microbatch, and replay
+  resolves it with that microbatch's live metadata.
 - Preserve the eager escape hatch: every graph path has a tested eager
   fallback, and fallback selection is explicit config or documented platform
   behavior, not an accident of ordering. Async CAM explicitly has *no*

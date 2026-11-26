@@ -32,9 +32,8 @@ def prepare_attention_gate_w8a8_scales(
         owner = cast("AscendRoutedExperts", experts.routed_experts)
         if owner.dynamic_eplb:
             continue
-        # bd42eea's MegaMoE finalizer deletes this ordinary derived Tensor,
-        # retaining w13_weight_scale on the same owner. This is a cache-lifetime
-        # check, not runtime-version detection; preserve every existing value.
+        # The MegaMoE finalizer at 7dcdb690 deletes this derived tensor and
+        # keeps w13_weight_scale. Rebuild only a missing cache.
         if "w13_weight_scale_fp32" not in owner.__dict__:
             owner.w13_weight_scale_fp32 = cast(
                 torch.Tensor, owner.w13_weight_scale

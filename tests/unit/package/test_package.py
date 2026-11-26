@@ -164,7 +164,7 @@ def test_register_publishes_a5_vendor_before_runtime_setup(
     monkeypatch.setenv("ASCEND_CUSTOM_OPP_PATH", "/native/vendor")
     observed = []
 
-    def check_version(*, strict, device_type):
+    def check_version(*, strict):
         observed.append(
             (
                 os.environ.get("AFD_CUST_OPAPI_LIB_PATH"),

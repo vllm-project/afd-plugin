@@ -463,7 +463,7 @@ def apply_async_dp_engine_patch() -> bool:
     AFD async Attention, so non-AFD and FFN Ascend scheduling remain untouched.
     """
 
-    if not _is_target_vllm_compatible("npu"):
+    if not _is_target_vllm_compatible(allow_missing=False):
         return False
 
     EngineCoreProc.run_engine_core = staticmethod(run_engine_core)
