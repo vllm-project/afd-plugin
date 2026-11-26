@@ -21,8 +21,13 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.models import deepseek_v2 as native
 
-from afd_plugin.config import DEEPEP_M2N_CONNECTORS, parse_afd_config
+from afd_plugin.config import DEEPEP_M2N_CONNECTORS, AFDConfig, parse_afd_config
 from afd_plugin.connectors import AFDExpertRoutingSpec
+from afd_plugin.model_executor.ffn.experts_shell import (
+    AFDFFNExpertsModel,
+    FFNExpertsSpec,
+    is_routed_block_weight,
+)
 from afd_plugin.model_executor.ffn.remote import RemoteFFNProxy, build_expert
 from afd_plugin.model_executor.models._weight_utils import (
     ATTENTION_ROLE,
@@ -40,6 +45,8 @@ logger = init_logger(__name__)
 _DeepseekAdapterConfig: TypeAlias = (
     DeepseekV2Config | DeepseekV3Config | GlmMoeDsaConfig
 )
+
+ROUTED_STAGE = "mlp"
 
 
 def _is_moe_layer(config: _DeepseekAdapterConfig, layer_idx: int) -> bool:
@@ -620,6 +627,52 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
         )
 
 
+def _validate_routed_experts_config(
+    vllm_config: VllmConfig,
+    _afd_config: AFDConfig,
+) -> None:
+    """Reject DeepSeek routed-experts configurations outside CUDA static EP."""
+    if native.current_platform.device_type != "cuda":
+        raise RuntimeError("AFD DeepSeek routed experts currently support CUDA only")
+    if vllm_config.parallel_config.use_sequence_parallel_moe:
+        raise RuntimeError(
+            "AFD DeepSeek does not support sequence-parallel MoE",
+        )
+
+
+def _build_deepseek_v2_sparse_block(
+    vllm_config: VllmConfig,
+    _layer_idx: int,
+    prefix: str,
+) -> nn.Module:
+    moe_config = copy(vllm_config.model_config.hf_text_config)
+    # HF validates this public field as int, while pinned native MoE uses
+    # only None to omit shared-expert construction (0 builds a zero-width MLP).
+    object.__setattr__(moe_config, "n_shared_experts", None)
+    return native.DeepseekV2MoE(
+        config=moe_config,
+        parallel_config=vllm_config.parallel_config,
+        quant_config=vllm_config.quant_config,
+        prefix=prefix,
+        apply_routed_scale_to_output=(not native.rocm_aiter_ops.is_fused_moe_enabled()),
+    )
+
+
+DEEPSEEK_V2_FFN_EXPERTS_SPEC = FFNExpertsSpec[_DeepseekAdapterConfig](
+    ffn_submodule=ROUTED_STAGE,
+    is_moe_layer=_is_moe_layer,
+    build_sparse_block=_build_deepseek_v2_sparse_block,
+    is_routed_expert_weight=is_routed_block_weight,
+    validate=_validate_routed_experts_config,
+)
+
+
+class AFDDeepseekV2RoutedExperts(AFDFFNExpertsModel):
+    """FFN-only DeepSeek V2 model for routed-experts connectors."""
+
+    experts_spec = DEEPSEEK_V2_FFN_EXPERTS_SPEC
+
+
 class AFDDeepseekForCausalLM(AFDDeepseekV2ForCausalLM):
     pass
 
@@ -635,6 +688,7 @@ class AFDGlmMoeDsaForCausalLM(AFDDeepseekV2ForCausalLM):
 __all__ = [
     "AFDDeepseekForCausalLM",
     "AFDDeepseekV2ForCausalLM",
+    "AFDDeepseekV2RoutedExperts",
     "AFDDeepseekV3ForCausalLM",
     "AFDGlmMoeDsaForCausalLM",
 ]

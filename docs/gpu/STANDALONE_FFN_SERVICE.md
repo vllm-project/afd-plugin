@@ -11,7 +11,7 @@ keeps its existing `vllm serve` launch, model, connector and DBO path.
 
 | Supported | Rejected at startup |
 | --- | --- |
-| A registered CUDA routed-experts model; currently `Qwen3MoeForCausalLM`, BF16, every layer MoE, no shared experts | Unregistered models, FP8 or any `quantization_config`, dense or partial-MoE Qwen3, shared experts |
+| A registered CUDA routed-experts model; currently `Qwen3MoeForCausalLM` (BF16, every layer MoE, no shared experts) and `DeepseekV2ForCausalLM` (BF16; dense layers and shared experts run on Attention, FFN loads only the sparse MoE blocks) | Unregistered models, FP8 or any `quantization_config`, dense or partial-MoE Qwen3, Qwen3 shared experts |
 | `DeepEPM2NAFDConnector` with `payload_format: bf16` | P2P, afdEP-direct, flexible placement, FP8 payload |
 | F TP=1, EP over all F ranks, linear expert placement | EPLB, elastic EP, redundant experts, PP/CP, LoRA, speculative decoding |
 | Eager, FULL_DECODE_ONLY CUDA graphs, DBO with two lanes (eager and graph) | Other graph modes, more than two micro-batches |
@@ -38,8 +38,9 @@ method the Worker-path `AFDFFNWorker` loop calls, so the data path, buckets,
 lanes, graphs and DBO order are identical to a `vllm serve` FFN. See the
 [FFN runtime design](../design/module/ffn_runtime.md#runtime-selection).
 
-Compared with a `vllm serve` FFN, F does not allocate the embedding, final
-norm and LM head (about 1.16 GiB per rank for Qwen3-30B-A3B).
+Both the standalone FFN service and the DeepEP M2N `vllm serve` FFN load the
+experts-only shell, so F does not allocate the embedding, final norm and LM
+head (about 1.16 GiB per rank for Qwen3-30B-A3B).
 
 ## Launch
 

@@ -106,6 +106,9 @@ _DEEPSEEK_MODEL_REGISTRATIONS = {
     "DeepseekV2ForCausalLM": (
         "afd_plugin.model_executor.models.deepseek_v2:AFDDeepseekV2ForCausalLM"
     ),
+    "DeepseekV2RoutedExperts": (
+        "afd_plugin.model_executor.models.deepseek_v2:AFDDeepseekV2RoutedExperts"
+    ),
     "DeepseekV3ForCausalLM": (
         "afd_plugin.model_executor.models.deepseek_v2:AFDDeepseekV3ForCausalLM"
     ),
