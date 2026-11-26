@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: NPU FFN-side worker for AFD execution.
+# Create: 2026-05-16
+# Note: The selected connector determines which FFN model runner to construct.
+# History: 2026-05-16 create
 """NPU FFN-side worker for AFD execution."""
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ from afd_plugin.compat.npu import (
     fix_all2all_backend_for_afd,
     npu_afd_num_ubatches,
 )
-from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
+from afd_plugin.compat.npu.ops import ensure_afd_async_ops_available
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
@@ -106,13 +110,13 @@ class AFDNPUFFNWorker(NPUWorker):
         )
         configure_afd_dspark(self.vllm_config)
 
-        self.device = self._init_device()
-        # FLA registration needs the selected device, before Runner construction.
-        register_ascend_fla_customop()
         if afd_config.connector == AFD_ASYNC_CONNECTOR:
             if get_ascend_device_type() != AscendDeviceType.A3:
                 raise ValueError("layered GMM requires Ascend 910C/A3")
-            ensure_cam_async_ops_available()
+            ensure_afd_async_ops_available()
+        self.device = self._init_device()
+        # FLA registration needs the selected device, before Runner construction.
+        register_ascend_fla_customop()
         init_workspace_manager(
             self.device,
             npu_afd_num_ubatches(self.vllm_config),

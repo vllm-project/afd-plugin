@@ -60,7 +60,7 @@ The existing device suite passed 31 tests with zero skips:
 
 ```bash
 SOC_VERSION=910c AFD_RUN_ASCEND_OP_RUNTIME=1 python -m pytest -q \
-  tests/npu/test_async_cam_layered_w4a8.py \
+  tests/npu/test_afd_async_layered_w4a8.py \
   tests/npu/test_gmm_layered_device_group_list.py \
   tests/npu/test_gmm_swiglu_quant_v2_layered_precision.py
 ```

@@ -34,6 +34,7 @@ class _FakeExtraInfo:
 
     def __init__(self) -> None:
         self.validated = 0
+        self.quant_mode = 0
 
     def validate_supported(self) -> None:
         self.validated += 1
@@ -61,17 +62,26 @@ def _afd_config(*, role: str = "attention"):
     )
 
 
-def _vllm_config(*, tp: int = 1, dbo: bool = False, ubatching: bool = False):
+def _vllm_config(
+    *,
+    tp: int = 1,
+    dbo: bool = False,
+    ubatching: bool = False,
+    ubatches: int = 1,
+    dp: int = 4,
+):
     hf_config = SimpleNamespace(model_type=_DSV4)
     return SimpleNamespace(
         model_config=SimpleNamespace(
             hf_config=hf_config,
             hf_text_config=SimpleNamespace(model_type=_DSV4),
+            use_mla=False,
         ),
         parallel_config=SimpleNamespace(
             enable_dbo=dbo,
             use_ubatching=ubatching,
-            num_ubatches=1,
+            num_ubatches=ubatches,
+            data_parallel_size=dp,
             tensor_parallel_size=tp,
         ),
         compilation_config=SimpleNamespace(cudagraph_mode=None),
@@ -91,12 +101,38 @@ def test_the_supported_shape_is_accepted_for_both_roles(extra_info, role):
     assert extra_info.validated == 1
 
 
+def test_dbo_is_rejected_without_attention_data_parallelism(extra_info):
+    """At DP=1 the runtime builds no ubatch runner, so DBO cannot run."""
+
+    with pytest.raises(RuntimeError, match="requires Attention DP > 1"):
+        feature_validation.fail_if_unsupported_npu_afd_features(
+            _vllm_config(dbo=True, ubatching=True, ubatches=2, dp=1),
+            afd_config=_afd_config(role="attention"),
+        )
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+@pytest.mark.parametrize("quant_mode", [0, 4])
+def test_dbo_is_accepted_with_two_ubatches(extra_info, role, quant_mode):
+    """Native DBO is part of the sync gate contract on either transport."""
+
+    extra_info.quant_mode = quant_mode
+    feature_validation.fail_if_unsupported_npu_afd_features(
+        _vllm_config(dbo=True, ubatching=True, ubatches=2),
+        afd_config=_afd_config(role=role),
+    )
+
+    assert extra_info.validated == 1
+
+
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
-        ({"dbo": True}, "DBO or ubatching"),
-        ({"ubatching": True}, "DBO or ubatching"),
         ({"tp": 2}, "tensor-parallel size 1"),
+        (
+            {"dbo": True, "ubatching": True, "ubatches": 4},
+            "exactly two microbatches",
+        ),
     ],
 )
 @pytest.mark.parametrize("role", ["attention", "ffn"])
@@ -221,8 +257,8 @@ def test_a_connector_level_gate_flag_does_not_block():
     ).validate_supported()
 
 
-def test_quant_mode_is_still_rejected():
-    """The transport mode really is unsupported, so that check has to stay."""
+def test_an_unknown_quant_mode_is_rejected():
+    """A mode outside the supported set has to fail before any communication starts."""
 
-    with pytest.raises(RuntimeError, match="only quant_mode=0"):
-        _real_extra_info().from_mapping({"quant_mode": 4}).validate_supported()
+    with pytest.raises(RuntimeError, match="quant_mode="):
+        _real_extra_info().from_mapping({"quant_mode": 2}).validate_supported()

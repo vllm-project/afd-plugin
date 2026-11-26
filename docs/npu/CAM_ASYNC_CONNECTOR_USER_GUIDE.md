@@ -59,8 +59,8 @@ The V2 Async CAM contract is:
 
 Attention-local FlashComm1/SP is supported. Set
 `VLLM_ASCEND_ENABLE_FLASHCOMM1=1` only on Attention and `0` on FFN.
-MRV2 rejects explicit `enable_shared_expert_dp=true` and finegrained TP
-configuration. Use the model-specific settings in the
+Attention supports `enable_shared_expert_dp=true` with EP and TP > 1.
+MRV2 rejects finegrained TP configuration. Use the model-specific settings in the
 [DSV4 E2E profiles](../../tests/e2e/models/deepseek_v4_flash/config.py).
 
 At every Attention DP size, `--enable-dbo` uses native child preparation,

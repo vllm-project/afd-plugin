@@ -5,13 +5,18 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 from afd_plugin import _MODEL_REGISTRATIONS, _QWEN3_5_MODEL_REGISTRATIONS
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
+
+
+_ROUTED_EXPERTS_MODEL_ARCHITECTURES: Final[dict[str, str]] = {
+    "Qwen3MoeForCausalLM": "AFDQwen3MoeRoutedExperts",
+}
 
 
 def has_afd_model_registration(model_config: ModelConfig) -> bool:
@@ -27,6 +32,7 @@ def get_afd_model_config(
     model_config: ModelConfig,
     *,
     device_type: Literal["cuda", "npu"],
+    routed_experts_connector: bool = False,
 ) -> ModelConfig:
     """Return a model config that resolves to an AFD model implementation."""
 
@@ -44,7 +50,14 @@ def get_afd_model_config(
             # automatically. vLLM Ascend uses that identity to distinguish
             # text models from multimodal models.
             afd_model_config = deepcopy(model_config)
-            afd_model_config.hf_config.architectures = [f"AFD{model_arch}"]
+            routed_architecture = (
+                _ROUTED_EXPERTS_MODEL_ARCHITECTURES.get(model_arch)
+                if routed_experts_connector and device_type == "cuda"
+                else None
+            )
+            afd_model_config.hf_config.architectures = [
+                routed_architecture or f"AFD{model_arch}"
+            ]
             return afd_model_config
     return model_config
 

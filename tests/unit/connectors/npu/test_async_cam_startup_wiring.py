@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+# Description: Real startup call sites with host stubs; not device execution coverage.
+# Create: 2026-10-19
+# Note: The tests observe whether invalid configurations reach group creation.
+# History: 2026-10-19 create
 """Real startup call sites with host stubs; not device execution coverage."""
 
 import json
@@ -412,7 +416,7 @@ def test_executor_error_reaches_store_without_retrying_transport_loader(
 
     monkeypatch.setattr(
         sys.modules["afd_plugin.compat.npu.ops"],
-        "ensure_cam_async_ops_available",
+        "ensure_afd_async_ops_available",
         unavailable_transport_ops,
     )
     module = load_host_module(monkeypatch, "afd_plugin.connectors.npu.async_cam")
@@ -710,7 +714,7 @@ def npu_worker(request, ffn_owners, monkeypatch):
             raise RuntimeError("transport operators unavailable")
 
     worker._init_device = initialize_device
-    monkeypatch.setattr(module, "ensure_cam_async_ops_available", load_ops)
+    monkeypatch.setattr(module, "ensure_afd_async_ops_available", load_ops)
     monkeypatch.setattr(
         module, "init_workspace_manager", lambda *args: events.append("workspace")
     )
@@ -752,7 +756,7 @@ def test_worker_rejects_deployment_before_device_initialization(
 def test_worker_prepares_role_config_and_dbo_before_native_device(npu_worker):
     worker = npu_worker.worker
     worker.init_device()
-    assert npu_worker.events == ["device", "ops", "workspace", "runner"]
+    assert npu_worker.events == ["ops", "device", "workspace", "runner"]
     assert worker.model_config is worker.vllm_config.model_config
     assert worker.model_config.hf_config.architectures == ["AFDDeepseekV4ForCausalLM"]
     parallel = worker.vllm_config.parallel_config
@@ -779,11 +783,11 @@ def test_dspark_transport_dimensions_fail_before_device(npu_worker):
     assert npu_worker.events == []
 
 
-def test_missing_transport_operators_fail_before_workspace_or_runner(npu_worker):
+def test_missing_transport_operators_fail_before_native_device_and_hccl(npu_worker):
     npu_worker.fail_ops = True
     with pytest.raises(RuntimeError, match="transport operators unavailable"):
         npu_worker.worker.init_device()
-    assert npu_worker.events == ["device", "ops"]
+    assert npu_worker.events == ["ops"]
 
 
 @pytest.mark.parametrize("npu_worker", ["ffn"], indirect=True)
@@ -791,7 +795,7 @@ def test_ffn_device_capability_fails_before_workspace_or_runner(npu_worker):
     npu_worker.module.get_ascend_device_type.return_value = object()
     with pytest.raises(ValueError, match="requires Ascend 910C/A3"):
         npu_worker.worker.init_device()
-    assert npu_worker.events == ["device"]
+    assert npu_worker.events == []
 
 
 @pytest.fixture
