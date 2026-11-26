@@ -266,17 +266,17 @@ def _check_qwen3_attention_moe_parity(vllm_config: VllmConfig) -> None:
             "compute_gate_on_attention": gate_on_attention,
         }
         # Equal shapes get equal values, so the gate matches the native one.
-        attention_moe = _built_moe(
+        attention_layer = _built_moe(
             partial(
-                qwen3_adapter.AFDQwen3MoeRemoteExpertsBlock,
+                qwen3_adapter.AFDQwen3MoeDecoderLayer,
                 vllm_config=vllm_config,
-                prefix=f"model.layers.{layer_idx}.mlp",
+                prefix=f"model.layers.{layer_idx}",
             ),
             vllm_config,
         )
         loopback.expected_payload = payload
         _assert_matches_native(
-            attention_moe, native_moe, attention_context, vllm_config
+            attention_layer.mlp, native_moe, attention_context, vllm_config
         )
 
 

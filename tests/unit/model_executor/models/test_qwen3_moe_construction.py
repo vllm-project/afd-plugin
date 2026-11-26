@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -17,6 +19,8 @@ else:
 pytest.importorskip("vllm")
 from torch import nn  # noqa: E402
 from vllm.config import CompilationMode, set_current_vllm_config  # noqa: E402
+from vllm.distributed import parallel_state  # noqa: E402
+from vllm.model_executor.layers import fused_moe  # noqa: E402
 
 from afd_plugin.config import DEEPEP_M2N_CONNECTOR, AFDConfig  # noqa: E402
 from afd_plugin.model_executor.ffn import remote  # noqa: E402
@@ -30,6 +34,8 @@ DEEPEP_M2N_ATTENTION = AFDConfig(
     connector=DEEPEP_M2N_CONNECTOR,
     compute_gate_on_attention=True,
 )
+NATIVE_MOE_BLOCK = adapter.native.Qwen3MoeSparseMoeBlock
+NATIVE_MLP = adapter.native.Qwen3MoeMLP
 
 
 class _FakeMissingLayer(nn.Module):
@@ -165,8 +171,11 @@ def attention_moe_env(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
-def cuda_construction_env(construction_env, attention_moe_env):
-    """Decoder layers with stand-in native stages and real Attention MoE runners."""
+def cuda_construction_env(
+    monkeypatch: pytest.MonkeyPatch, construction_env, attention_moe_env
+):
+    """Stand-in native stages, except vLLM's MoE block with real runners."""
+    monkeypatch.setattr(adapter.native, "Qwen3MoeSparseMoeBlock", NATIVE_MOE_BLOCK)
     return attention_moe_env
 
 
@@ -185,7 +194,7 @@ def test_attention_role_constructs_only_attention_and_norms(
         vllm_config=cuda_construction_env,
     )
 
-    assert isinstance(layer.mlp, adapter.AFDQwen3MoeRemoteExpertsBlock)
+    assert isinstance(layer.mlp, NATIVE_MOE_BLOCK)
     assert set(dict(layer.named_parameters())) == {
         "self_attn.weight",
         "input_layernorm.weight",
@@ -281,6 +290,216 @@ def test_attention_moe_with_ffn_gate_sends_hidden_states_only(
     assert torch.equal(output, hidden_states * 0.25)
 
 
+@pytest.mark.parametrize(
+    ("tp_size", "outcome"),
+    [
+        (1, nullcontext()),
+        (16, pytest.raises(ValueError, match="greater than the number of experts")),
+    ],
+    ids=["built", "native-error"],
+)
+def test_attention_moe_restores_vllm_experts_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_construction_env,
+    tp_size: int,
+    outcome,
+) -> None:
+    """vLLM's experts factory is restored after the Attention MoE block,
+    also when its constructor raised.
+
+    Why: models built later in the process need vLLM's experts.
+    """
+    monkeypatch.setattr(
+        adapter.native, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+
+    with outcome:
+        _make_layer(
+            monkeypatch,
+            role="attention",
+            layer_idx=0,
+            vllm_config=cuda_construction_env,
+        )
+
+    assert adapter.native.FusedMoEFactory is fused_moe.FusedMoEFactory
+
+
+def test_p2p_attention_tp2_builds_no_shared_expert(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_construction_env,
+) -> None:
+    """With P2P at Attention TP 2, Attention builds no shared expert, even one
+    that TP 2 cannot split, and the model config keeps its size.
+
+    Why: the FFN (here TP 1) runs it; vLLM's TP linear layers reject the size.
+    """
+    text_config = cuda_construction_env.model_config.hf_text_config
+    text_config.shared_expert_intermediate_size = 3
+    monkeypatch.setattr(adapter.native, "Qwen3MoeMLP", NATIVE_MLP)
+    # Attention rank 0 of TP 2, as vLLM's linear layers see it.
+    monkeypatch.setattr(
+        parallel_state, "_TP", SimpleNamespace(world_size=2, rank_in_group=0)
+    )
+    monkeypatch.setattr(
+        adapter.native, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+
+    layer = _make_layer(
+        monkeypatch,
+        role="attention",
+        layer_idx=0,
+        vllm_config=cuda_construction_env,
+    )
+
+    assert layer.mlp.shared_expert is None
+    assert layer.mlp.shared_expert_gate is None
+    assert text_config.shared_expert_intermediate_size == 3
+
+
+def _start_attention_build(
+    monkeypatch: pytest.MonkeyPatch,
+    vllm_config,
+    layer_idx: int,
+    built: list[nn.Module | BaseException],
+) -> threading.Thread:
+    """Build an Attention decoder layer on a new thread; record it or its error."""
+
+    def build() -> None:
+        try:
+            built.append(
+                _make_layer(
+                    monkeypatch,
+                    role="attention",
+                    layer_idx=layer_idx,
+                    vllm_config=vllm_config,
+                )
+            )
+        except BaseException as error:
+            built.append(error)
+
+    # Daemon: a thread stuck on a broken lock must not hang the test session.
+    thread = threading.Thread(target=build, daemon=True)
+    thread.start()
+    return thread
+
+
+def _swap_is_owned() -> bool:
+    """Whether another thread owns the experts-factory swap; never keeps it."""
+    if adapter._FACTORY_SWAP_LOCK.acquire(blocking=False):
+        adapter._FACTORY_SWAP_LOCK.release()
+        return False
+    return True
+
+
+def test_attention_moe_swap_is_scoped_to_its_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_construction_env,
+) -> None:
+    """While one thread builds an Attention MoE block, it still owns the swap,
+    and another thread calling the factory gets vLLM's experts.
+
+    Why: the swap rebinds a vLLM module attribute that every thread sees.
+    """
+
+    def vllm_factory(**kwargs):
+        return "vllm experts"
+
+    monkeypatch.setattr(fused_moe, "FusedMoEFactory", vllm_factory)
+    monkeypatch.setattr(adapter.native, "FusedMoEFactory", vllm_factory)
+    in_swap, release = threading.Event(), threading.Event()
+
+    def paused_build_expert(vllm_config, **kwargs):
+        in_swap.set()
+        assert release.wait(timeout=30)
+        return nn.Identity()
+
+    monkeypatch.setattr(adapter, "build_expert", paused_build_expert)
+    built: list[nn.Module | BaseException] = []
+    builder = _start_attention_build(monkeypatch, cuda_construction_env, 0, built)
+    try:
+        assert in_swap.wait(timeout=30)
+        assert adapter.native.FusedMoEFactory(num_experts=8) == "vllm experts"
+        assert _swap_is_owned()
+    finally:
+        release.set()
+        builder.join(timeout=30)
+
+    [layer] = built
+    assert isinstance(layer, nn.Module), layer
+    assert isinstance(layer.mlp.experts, nn.Identity)
+    assert adapter.native.FusedMoEFactory is vllm_factory
+
+
+def test_attention_moe_swap_is_owned_before_vllm_factory_is_read(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_construction_env,
+) -> None:
+    """A constructor paused between reading vLLM's factory and installing its
+    own already owns the swap; a second constructor waits, then swaps too.
+
+    Why: two constructors that both read vLLM's factory would install over
+    each other, and one would build local experts.
+    """
+
+    def vllm_factory(**kwargs):
+        return "vllm experts"
+
+    monkeypatch.setattr(adapter.native, "FusedMoEFactory", vllm_factory)
+    read_factory, release = threading.Event(), threading.Event()
+
+    class PausingFusedMoE:
+        """Pauses the first identity check, after qwen3_moe's factory is read."""
+
+        def __getattr__(self, name: str):
+            assert name == "FusedMoEFactory", name
+            if not read_factory.is_set():
+                read_factory.set()
+                assert release.wait(timeout=30)
+            return vllm_factory
+
+    monkeypatch.setattr(adapter, "fused_moe", PausingFusedMoE())
+    monkeypatch.setattr(
+        adapter, "build_expert", lambda vllm_config, **kwargs: nn.Identity()
+    )
+    built: list[nn.Module | BaseException] = []
+    threads = [_start_attention_build(monkeypatch, cuda_construction_env, 0, built)]
+    try:
+        assert read_factory.wait(timeout=30)
+        assert _swap_is_owned()
+        threads.append(
+            _start_attention_build(monkeypatch, cuda_construction_env, 1, built)
+        )
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(timeout=30)
+
+    assert len(built) == 2, built
+    for layer in built:
+        assert isinstance(layer, nn.Module), layer
+        assert isinstance(layer.mlp.experts, nn.Identity)
+    assert adapter.native.FusedMoEFactory is vllm_factory
+
+
+def test_attention_moe_refuses_a_replaced_experts_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_construction_env,
+) -> None:
+    """Attention refuses to swap qwen3_moe.FusedMoEFactory once it is not vLLM's.
+
+    Why: a nested swap, or someone else's, would stack with this one.
+    """
+    monkeypatch.setattr(adapter.native, "FusedMoEFactory", lambda **kwargs: None)
+
+    with pytest.raises(RuntimeError, match="already replaced"):
+        _make_layer(
+            monkeypatch,
+            role="attention",
+            layer_idx=0,
+            vllm_config=cuda_construction_env,
+        )
+
+
 def test_ffn_role_constructs_only_native_moe(
     monkeypatch: pytest.MonkeyPatch,
     construction_env,
@@ -368,17 +587,17 @@ def test_routed_experts_shell_builds_only_native_moe_blocks(
 
 def test_attention_causal_lm_reports_its_remote_moe_blocks_as_native(
     monkeypatch: pytest.MonkeyPatch,
-    attention_moe_env,
+    cuda_construction_env,
 ) -> None:
     """The Attention causal LM reports its MoE blocks through native metadata.
 
     Why: the native constructor raises if it finds no native MoE block.
     """
-    layer = object.__new__(adapter.AFDQwen3MoeDecoderLayer)
-    nn.Module.__init__(layer)
-    layer.mlp = adapter.AFDQwen3MoeRemoteExpertsBlock(
-        vllm_config=attention_moe_env,
-        prefix="model.layers.0.mlp",
+    layer = _make_layer(
+        monkeypatch,
+        role="attention",
+        layer_idx=0,
+        vllm_config=cuda_construction_env,
     )
 
     class FakeAFDModel(nn.Module):
@@ -401,7 +620,7 @@ def test_attention_causal_lm_reports_its_remote_moe_blocks_as_native(
     monkeypatch.setattr(adapter.native, "ParallelLMHead", FakeLMHead)
     monkeypatch.setattr(adapter.native, "LogitsProcessor", lambda *_args: object())
 
-    model = adapter.AFDQwen3MoeForCausalLM(vllm_config=attention_moe_env)
+    model = adapter.AFDQwen3MoeForCausalLM(vllm_config=cuda_construction_env)
 
     assert model.moe_layers == [layer.mlp.experts]
     assert model.num_moe_layers == 1
