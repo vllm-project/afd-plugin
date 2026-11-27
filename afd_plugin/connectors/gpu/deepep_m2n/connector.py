@@ -144,7 +144,7 @@ BF16_PAYLOAD = "bf16"
 # FP8 e4m3 rows with one fp32 scale per row and 128 channels (SM90 recipe).
 FP8_PAYLOAD = "fp8_block128_fp32"
 PAYLOAD_FORMATS = (BF16_PAYLOAD, FP8_PAYLOAD)
-# What an FFN rank receives (``afdep.Config.receive_layout``): one row per
+# What an FFN rank receives (``afdep.Config.do_expand``): one row per
 # (token, local expert) for the connector's executor, or one row per token
 # with its expert ids and weights for the MoE kernel vLLM selected.
 EXPERT_LAYOUT = "expert-major"
@@ -1241,7 +1241,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             rdma_traffic_class=self.network_plan.rdma_traffic_class,
             cpu_timeout_s=self.config.cpu_timeout_s,
             gpu_timeout_s=self.config.gpu_timeout_s,
-            receive_layout=self.config.receive_layout,
+            do_expand=not self._token_major,
         )
         return Lanes(group=self.transport_group, config=config, lanes=self.num_lanes)
 
