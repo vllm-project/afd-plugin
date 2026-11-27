@@ -81,12 +81,12 @@ def _checkpoint_weight_roles(
 
 
 class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
-    """DeepSeek MoE with a remote runner and no local expert weights."""
+    """Native DeepSeek MoE forward with remote experts and no expert weights."""
 
     # Patch reason: native DeepseekV2MoE constructs local routed/shared experts
     # through FusedMoEFactory.
-    # Patch functionality: construct only the gate owned by Attention
-    # and build the experts through FusedMoEFactory
+    # Patch functionality: keep the native MoE forward. Construct only the
+    # gate owned by Attention, and build the experts through FusedMoEFactory
     # with a runner whose experts run on the FFN role and allocate no expert
     # weights. As native, the runner holds the gate and applies it. When the
     # connector sends routes (DeepEP M2N), Attention also builds the shared
@@ -183,8 +183,14 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         )
         # ### PATCH END: construct a remote-experts native MoE shell.
 
-    # Patch reason: an Ascend graph dropped CAMP2P sends through the native view (#643).
-    # Patch functionality: pass the original 2-D activation to CAMP2P.
+
+class AFDDeepseekV2CAMP2PMoE(AFDDeepseekV2RemoteExpertsMoE):
+    """Pass the decoder's two-dimensional activation to the CAMP2P runner."""
+
+    # Patch reason: the pinned Ascend compiler can eliminate the CAMP2P send
+    # when the native MoE wraps the decoder activation in a view.
+    # Patch functionality: preserve the original activation for send, DBO
+    # yield, and receive. The NPU adapter already rejects sequence parallel MoE.
     # Signature: matches vLLM v0.34.0 DeepseekV2MoE.forward (62d4bc3c).
     def forward(
         self,
@@ -192,12 +198,8 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         already_sequence_parallel: bool = False,
     ) -> torch.Tensor:
         # ### PATCH START: preserve the CAMP2P graph reference.
-        if native.current_platform.device_type == "npu":
-            return self.experts(
-                hidden_states=hidden_states, router_logits=hidden_states
-            )
+        return self.experts(hidden_states=hidden_states, router_logits=hidden_states)
         # ### PATCH END: preserve the CAMP2P graph reference.
-        return super().forward(hidden_states, already_sequence_parallel)
 
 
 class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
@@ -312,7 +314,12 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                 and config.model_type == "deepseek_v2"
             )
             if self.is_moe_layer and (device_type == "cuda" or uses_camp2p_moe_runner):
-                self.mlp = AFDDeepseekV2RemoteExpertsMoE(
+                moe_cls = (
+                    AFDDeepseekV2CAMP2PMoE
+                    if uses_camp2p_moe_runner
+                    else AFDDeepseekV2RemoteExpertsMoE
+                )
+                self.mlp = moe_cls(
                     config=config,
                     vllm_config=vllm_config,
                     prefix=f"{prefix}.mlp",

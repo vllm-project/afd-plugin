@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from afd_plugin.model_executor.models.npu.deepseek_v4 import AFDDeepseekV4MoE
+    from afd_plugin.model_executor.models.npu.deepseek_v4_moe import AFDDeepseekV4MoE
 
 
 def local_hash_input_ids(

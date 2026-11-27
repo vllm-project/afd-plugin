@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 
-import importlib.util
 import sys
 from types import SimpleNamespace
 
@@ -10,71 +9,33 @@ import pytest
 from tests.unit.fakes.platform import use_cpu_moe_factory
 
 
-def _load_cpu_module(name):
-    """Execute the module against this fixture's dependencies without caching it."""
-    spec = importlib.util.find_spec(name)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 @pytest.fixture
 def cam_factory_on_cpu(monkeypatch):
-    """Build the CAM runners with the real vLLM factory and CPU weight owners."""
+    """Use the real vLLM factory and connector registration with CPU weight owners."""
     pytest.importorskip("torch")
     pytest.importorskip("vllm")
     from vllm.distributed import parallel_state
-    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
     from afd_plugin.model_executor.ffn import remote
 
     use_cpu_moe_factory(monkeypatch)
     monkeypatch.setattr(remote, "current_platform", SimpleNamespace(device_type="npu"))
-    with monkeypatch.context() as patch:
-        patch.setitem(
-            sys.modules,
-            "vllm_ascend.ops.fused_moe.routed_experts",
-            SimpleNamespace(AscendRoutedExperts=RoutedExperts),
-        )
-        npu_remote = _load_cpu_module("afd_plugin.model_executor.ffn.npu.remote")
-    monkeypatch.setitem(sys.modules, npu_remote.__name__, npu_remote)
+    monkeypatch.setitem(
+        sys.modules,
+        "afd_plugin.model_executor.ffn.npu.remote",
+        SimpleNamespace(AFDAscendRemoteRoutedExperts=remote.AFDRemoteRoutedExperts),
+    )
 
     monkeypatch.setattr(
         parallel_state, "_TP", SimpleNamespace(rank_in_group=0, world_size=1)
     )
-    return npu_remote
 
 
 @pytest.fixture
-def ascend_v4_model(cam_factory_on_cpu, monkeypatch):
-    """Load the model with CPU base classes without caching a fake Ascend decoder."""
-    from torch import nn
-
-    native = SimpleNamespace(
-        DeepseekV4DecoderLayer=nn.Module,
-        DeepseekV4Model=nn.Module,
-        AscendDeepseekV4ForCausalLM=nn.Module,
-        support_torch_compile=lambda cls: cls,
-        DeepseekV4Attention=nn.Identity,
-        RMSNorm=nn.Identity,
-    )
-    with monkeypatch.context() as patch:
-        patch.setitem(
-            sys.modules, "vllm_ascend.models.deepseek_v4", SimpleNamespace(model=native)
-        )
-        patch.setitem(
-            sys.modules,
-            "afd_plugin.model_executor.models.npu.deepseek_v4_weights",
-            SimpleNamespace(prepare_attention_gate_w8a8_scales=None),
-        )
-        return _load_cpu_module("afd_plugin.model_executor.models.npu.deepseek_v4")
-
-
-@pytest.fixture
-def cam_moe(ascend_v4_model, monkeypatch):
+def cam_moe(cam_factory_on_cpu, monkeypatch):
     from vllm.config import set_current_vllm_config
 
+    from afd_plugin.model_executor.models.npu.deepseek_v4_moe import AFDDeepseekV4MoE
     from tests.unit.fakes.vllm_config import attention_moe_vllm_config
 
     def build(
@@ -108,7 +69,7 @@ def cam_moe(ascend_v4_model, monkeypatch):
                 connector="CAMP2pAFDConnector", compute_gate_on_attention=gate
             )
         with set_current_vllm_config(vllm_config):
-            return ascend_v4_model.AFDDeepseekV4MoE(
+            return AFDDeepseekV4MoE(
                 vllm_config=vllm_config,
                 config=config,
                 layer_idx=layer_idx,

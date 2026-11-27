@@ -12,19 +12,18 @@ pytest.importorskip("vllm")
 from torch import nn  # noqa: E402
 
 from afd_plugin.model_executor.ffn import remote  # noqa: E402
+from afd_plugin.model_executor.models.npu import deepseek_v4_moe as model  # noqa: E402
 from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
 
 
 @pytest.mark.parametrize("explicit", [False, True], ids=["context-ids", "model-ids"])
-def test_ffn_gate_sends_local_ids(cam_moe, ascend_v4_model, monkeypatch, explicit):
+def test_ffn_gate_sends_local_ids(cam_moe, monkeypatch, explicit):
     events: list[tuple] = []
     install_proxy_context(monkeypatch, events)
     local_ids = torch.tensor([4, 7], dtype=torch.int32)
     context_ids = torch.arange(5) if explicit else local_ids
     monkeypatch.setattr(
-        ascend_v4_model,
-        "get_forward_context",
-        lambda: SimpleNamespace(input_ids=context_ids),
+        model, "get_forward_context", lambda: SimpleNamespace(input_ids=context_ids)
     )
     block = cam_moe(gate=False)
     hidden = torch.ones(2, 4)
@@ -38,11 +37,11 @@ def test_ffn_gate_sends_local_ids(cam_moe, ascend_v4_model, monkeypatch, explici
     assert list(block.parameters()) == []
 
 
-def test_ffn_gate_requires_ids_before_send(cam_moe, ascend_v4_model, monkeypatch):
+def test_ffn_gate_requires_ids_before_send(cam_moe, monkeypatch):
     events: list[tuple] = []
     install_proxy_context(monkeypatch, events)
     monkeypatch.setattr(
-        ascend_v4_model, "get_forward_context", lambda: SimpleNamespace(input_ids=None)
+        model, "get_forward_context", lambda: SimpleNamespace(input_ids=None)
     )
     with pytest.raises(RuntimeError, match="requires input_ids"):
         cam_moe(gate=False)(torch.zeros(2, 4))
@@ -53,7 +52,7 @@ def test_ffn_gate_requires_ids_before_send(cam_moe, ascend_v4_model, monkeypatch
     "has_shared", [False, True], ids=["routed-only", "with-shared"]
 )
 def test_sync_gate_preserves_routes_and_stage_across_yield(
-    cam_moe, ascend_v4_model, monkeypatch, has_shared
+    cam_moe, monkeypatch, has_shared
 ):
     events: list[tuple] = []
     stage = SimpleNamespace(ubatch_idx=0)
@@ -87,7 +86,7 @@ def test_sync_gate_preserves_routes_and_stage_across_yield(
         ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32) + owner
         weights = torch.full((2, 2), 0.75 + owner)
         monkeypatch.setattr(
-            ascend_v4_model,
+            model,
             "compute_attention_gate_topk",
             lambda *_a, routes=(weights, ids), **_kw: routes,
         )
@@ -111,10 +110,10 @@ def test_sync_gate_preserves_routes_and_stage_across_yield(
         torch.testing.assert_close(output, hidden * (3.25 if has_shared else 0.25))
 
 
-def test_sync_gate_requires_forward_metadata(cam_moe, ascend_v4_model, monkeypatch):
+def test_sync_gate_requires_forward_metadata(cam_moe, monkeypatch):
     monkeypatch.setattr(remote, "get_afd_metadata_from_forward_context", lambda: None)
     monkeypatch.setattr(
-        ascend_v4_model,
+        model,
         "compute_attention_gate_topk",
         lambda *_a, **_kw: (torch.ones(1, 2), torch.zeros(1, 2, dtype=torch.int32)),
     )

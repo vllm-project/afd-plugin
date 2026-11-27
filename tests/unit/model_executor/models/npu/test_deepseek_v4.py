@@ -200,10 +200,28 @@ def test_gate_allocates_the_checkpoint_parameters_for_its_moe_type(
 
 
 @pytest.fixture
-def dspark_cam_decoder(ascend_v4_model, prefix):
+def dspark_cam_decoder(cam_factory_on_cpu, torch, prefix):
     from transformers import DeepseekV4Config
     from vllm.config import set_current_vllm_config
 
+    from afd_plugin.config import CAMP2P_CONNECTOR, parse_afd_config
+    from afd_plugin.model_executor.models.npu.deepseek_v4_moe import AFDDeepseekV4MoE
+
+    nn = torch.nn
+    namespace = {
+        "nn": nn,
+        "torch": torch,
+        "cast": cast,
+        "native": SimpleNamespace(
+            DeepseekV4DecoderLayer=nn.Module,
+            DeepseekV4Attention=nn.Identity,
+            RMSNorm=nn.Identity,
+        ),
+        "CAMP2P_CONNECTOR": CAMP2P_CONNECTOR,
+        "parse_afd_config": parse_afd_config,
+        "AFDDeepseekV4MoE": AFDDeepseekV4MoE,
+    }
+    exec(_compile_constructors("AFDDeepseekV4DecoderLayer"), namespace)
     hf_config = DeepseekV4Config(
         num_hidden_layers=43,
         hidden_size=4,
@@ -218,7 +236,7 @@ def dspark_cam_decoder(ascend_v4_model, prefix):
     config.speculative_config = dspark.speculative_config
     config.parallel_config.enable_expert_parallel = True
     with set_current_vllm_config(config):
-        decoder = ascend_v4_model.AFDDeepseekV4DecoderLayer(
+        decoder = namespace["AFDDeepseekV4DecoderLayer"](
             config, prefix=prefix, is_draft_layer=True
         )
     return decoder, config.compilation_config.static_all_moe_layers
@@ -226,14 +244,10 @@ def dspark_cam_decoder(ascend_v4_model, prefix):
 
 @pytest.mark.parametrize("prefix, wire_layer", [("mtp.0", 43), ("mtp.1", 44)])
 def test_dspark_draft_sends_global_cam_layer_without_dbo(
-    dspark_cam_decoder,
-    ascend_v4_model,
-    cam_factory_on_cpu,
-    torch,
-    monkeypatch,
-    prefix,
-    wire_layer,
+    dspark_cam_decoder, torch, monkeypatch, prefix, wire_layer
 ):
+    from afd_plugin.model_executor.ffn.npu import cam_runner
+    from afd_plugin.model_executor.models.npu import deepseek_v4_moe
     from tests.unit.fakes.connector import install_proxy_context
 
     decoder, registered_layers = dspark_cam_decoder
@@ -241,13 +255,13 @@ def test_dspark_draft_sends_global_cam_layer_without_dbo(
     metadata = install_proxy_context(monkeypatch, events, stage_idx=0)
     metadata.stage_idx = 0
     monkeypatch.setattr(
-        cam_factory_on_cpu, "maybe_apply_dbo_yield", lambda states, *, role: states
+        cam_runner, "maybe_apply_dbo_yield", lambda states, *, role: states
     )
     hidden = torch.ones(2, 4)
     ids = torch.tensor([[0, 1], [1, 2]], dtype=torch.int32)
     weights = torch.full((2, 2), 0.5)
     monkeypatch.setattr(
-        ascend_v4_model, "compute_attention_gate_topk", lambda *a, **kw: (weights, ids)
+        deepseek_v4_moe, "compute_attention_gate_topk", lambda *a, **kw: (weights, ids)
     )
 
     output = decoder.mlp(hidden)

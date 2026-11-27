@@ -16,6 +16,8 @@ from afd_plugin.connectors.npu.async_cam_runtime import (  # noqa: E402
     async_cam_dbo,
     async_cam_layout,
 )
+from afd_plugin.model_executor.ffn.npu import cam_runner  # noqa: E402
+from afd_plugin.model_executor.models.npu import deepseek_v4_moe as model  # noqa: E402
 from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
 from tests.unit.fakes.vllm_config import (  # noqa: E402
     async_moe_config,
@@ -45,15 +47,13 @@ def target_dbo_config(sp):
     "sp", [False, True], ids=["replicated-tp", "sequence-parallel"]
 )
 def test_target_dbo_restores_its_own_layout_and_adds_shared_once(
-    cam_moe, ascend_v4_model, cam_factory_on_cpu, target_dbo_config, monkeypatch, sp
+    cam_moe, target_dbo_config, monkeypatch, sp
 ):  # long-test: check the wire handoff and restored output together
     hidden = torch.arange(20, dtype=torch.float32).reshape(5, 4)
     ids = torch.arange(10, dtype=torch.int32).reshape(5, 2) % 3
     weights = torch.arange(10, dtype=torch.float32).reshape(5, 2)
     monkeypatch.setattr(
-        ascend_v4_model,
-        "compute_attention_gate_topk",
-        lambda *_a, **_kw: (weights, ids),
+        model, "compute_attention_gate_topk", lambda *_a, **_kw: (weights, ids)
     )
     monkeypatch.setattr(
         async_cam_layout,
@@ -116,7 +116,7 @@ def test_target_dbo_restores_its_own_layout_and_adds_shared_once(
         torch.testing.assert_close(local_output, local(hidden) + 100)
         return torch.cat((hidden, torch.zeros_like(hidden[:1]))) + 100
 
-    monkeypatch.setattr(cam_factory_on_cpu, "maybe_apply_dbo_yield", yield_to_peer)
+    monkeypatch.setattr(cam_runner, "maybe_apply_dbo_yield", yield_to_peer)
     monkeypatch.setattr(async_cam_layout, "tensor_model_parallel_all_gather", gather)
 
     torch.testing.assert_close(block(hidden), hidden * 4 + 100)
