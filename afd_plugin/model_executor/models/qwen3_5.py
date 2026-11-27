@@ -507,6 +507,14 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
                 "AFD Qwen3.5/3.6 CUDA requires compute_gate_on_attention=true "
                 f"with {' or '.join(DEEPEP_M2N_CONNECTORS)} and false otherwise",
             )
+        # Under M2N, Attention also loads the shared-expert weights.
+        if _routes_on_attention(afd_config):
+            text_config = vllm_config.model_config.hf_text_config
+            if text_config.shared_expert_intermediate_size <= 0:
+                raise ValueError(
+                    f"AFD Qwen3.5/3.6 with {afd_config.connector} requires a "
+                    "shared expert (shared_expert_intermediate_size > 0)",
+                )
         if vllm_config.speculative_config is not None:
             raise ValueError(
                 "AFD Qwen3.5/3.6 CUDA does not support speculative decoding",

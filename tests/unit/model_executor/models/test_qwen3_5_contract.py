@@ -411,6 +411,7 @@ def test_qwen_text_only_uses_upstream_missing_vision_tower_stage(
         hf_config=SimpleNamespace(
             vision_config=SimpleNamespace(out_hidden_size=8),
         ),
+        hf_text_config=SimpleNamespace(shared_expert_intermediate_size=16),
         multimodal_config=multimodal_config,
         get_multimodal_config=lambda: multimodal_config,
     )
@@ -524,6 +525,19 @@ def test_qwen_rejects_unsupported_configuration_before_construction(
     setattr(target, field, value)
 
     with pytest.raises(ValueError, match=message):
+        adapter.AFDQwen3_5MoeForConditionalGeneration(
+            vllm_config=conditional_config.config
+        )
+
+
+def test_qwen_m2n_rejects_config_without_shared_expert(conditional_config):
+    conditional_config.afd.connector = DEEPEP_M2N_CONNECTOR
+    conditional_config.afd.compute_gate_on_attention = True
+    conditional_config.config.model_config.hf_text_config = SimpleNamespace(
+        shared_expert_intermediate_size=0
+    )
+
+    with pytest.raises(ValueError, match="requires a shared expert"):
         adapter.AFDQwen3_5MoeForConditionalGeneration(
             vllm_config=conditional_config.config
         )

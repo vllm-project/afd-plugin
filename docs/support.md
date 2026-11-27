@@ -11,7 +11,7 @@ source revision. See [installation](installation.md) for the pinned runtime stac
 | DeepSeek V2 / V3 / V3.2 | CUDA P2P and synchronous Ascend paths; DeepEP M2N admits V2 only. Each role loads its required components. |
 | DeepSeek V4 Flash | CUDA P2P or Ascend CAMP2P / Async CAM; backend-specific limits are in the matrix below. |
 | Qwen3 MoE | CUDA; P2P gates on FFN, DeepEP M2N gates on Attention. Rejects sequence-parallel MoE, EPLB, PP, speculative decoding, LoRA and NPU. |
-| Qwen3.5 / Qwen3.6 MoE | CUDA text-only with `--language-model-only`; evidence covers Qwen3.6-35B-A3B native DP4/TP1/EP4 and synchronous AFD 2A1F eager/graph. DeepEP M2N gates on Attention, which also runs the gated shared expert. GDN DBO, PP, async and multi-node execution are unsupported; NPU/multimodal are unsupported or unverified, quantization is unverified, and no performance claim is made. |
+| Qwen3.5 / Qwen3.6 MoE | CUDA text-only with `--language-model-only`; evidence covers Qwen3.6-35B-A3B native DP4/TP1/EP4, synchronous AFD 2A1F eager/graph, and DeepEP M2N 2A2F eager/graph/Attention TP2 on the FFN Worker and the standalone FFN service. DeepEP M2N gates on Attention, which also runs the gated shared expert. GDN DBO, PP, async and multi-node execution are unsupported; NPU/multimodal are unsupported or unverified, quantization is unverified, and no performance claim is made. |
 
 Architecture aliases and wrapper ownership are recorded in
 [model integration](design/module/model_integration.md#model-registration).
