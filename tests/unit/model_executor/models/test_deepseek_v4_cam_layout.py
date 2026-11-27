@@ -12,7 +12,6 @@ pytest.importorskip("vllm")
 
 from torch import nn  # noqa: E402
 
-from afd_plugin.config import AFD_ASYNC_CONNECTOR  # noqa: E402
 from afd_plugin.connectors.npu.async_cam_runtime import (  # noqa: E402
     async_cam_dbo,
     async_cam_layout,
@@ -20,14 +19,34 @@ from afd_plugin.connectors.npu.async_cam_runtime import (  # noqa: E402
 from afd_plugin.model_executor.ffn.npu import cam_runner  # noqa: E402
 from afd_plugin.model_executor.models.npu import deepseek_v4_moe as model  # noqa: E402
 from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
+from tests.unit.fakes.vllm_config import (  # noqa: E402
+    async_moe_config,
+    attention_moe_vllm_config,
+)
+
+
+@pytest.fixture
+def target_dbo_config(sp):
+    config = attention_moe_vllm_config(enforce_eager=True)
+    parallel = config.parallel_config
+    parallel.enable_dbo = True
+    parallel.enable_expert_parallel = True
+    parallel.tensor_parallel_size = 2
+    parallel.data_parallel_size = 2 if sp else 1
+    parallel.all2all_backend = "allgather_reducescatter"
+    config.additional_config = async_moe_config(
+        tensor_parallel_size=parallel.tensor_parallel_size,
+        num_attention_ranks=parallel.tensor_parallel_size * parallel.data_parallel_size,
+    ).additional_config
+    return config
 
 
 @pytest.mark.parametrize(
     "sp", [False, True], ids=["replicated-tp", "sequence-parallel"]
 )
-def test_draft_dispatch_restores_its_own_layout_and_adds_shared_once(
-    cam_moe, monkeypatch, sp
-):
+def test_target_dbo_restores_its_own_layout_and_adds_shared_once(
+    cam_moe, target_dbo_config, monkeypatch, sp
+):  # long-test: check the wire handoff and restored output together
     hidden = torch.arange(20, dtype=torch.float32).reshape(5, 4)
     ids = torch.arange(10, dtype=torch.int32).reshape(5, 2) % 3
     weights = torch.arange(10, dtype=torch.float32).reshape(5, 2)
@@ -48,7 +67,7 @@ def test_draft_dispatch_restores_its_own_layout_and_adds_shared_once(
 
     def send(states, context, **payload):
         events.append("send")
-        assert context.metadata.layer_idx == 43
+        assert context.metadata.layer_idx == 3
         assert context.metadata.stage_idx == 1
         assert context.metadata.seq_lens == [5 if sp else 3]
         assert payload.keys() == {"topk_ids", "topk_weights"}
@@ -65,7 +84,7 @@ def test_draft_dispatch_restores_its_own_layout_and_adds_shared_once(
     class Shared(nn.Module):
         def __init__(self, **kwargs):
             super().__init__()
-            assert kwargs["prefix"] == "mtp.0.mlp.shared_experts"
+            assert kwargs["prefix"] == "model.layers.3.mlp.shared_experts"
             assert kwargs["is_sequence_parallel"] == sp
 
         def forward(self, states):
@@ -75,11 +94,7 @@ def test_draft_dispatch_restores_its_own_layout_and_adds_shared_once(
 
     block = cam_moe(
         gate=True,
-        connector=AFD_ASYNC_CONNECTOR,
-        layer_idx=43,
-        prefix="mtp.0.mlp",
-        is_draft_layer=True,
-        sp=sp,
+        vllm_config=target_dbo_config,
         shared_cls=Shared,
     )
     metadata.connector = SimpleNamespace(send_attn_output=send, recv_ffn_output=recv)

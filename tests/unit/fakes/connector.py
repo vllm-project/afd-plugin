@@ -127,7 +127,7 @@ class ProxyConnector:
     def send_attn_output(self, hidden_states, context, **kwargs) -> None:
         self.events.append(("send", hidden_states, context, kwargs))
 
-    def recv_ffn_output(self, *, ref_tensor, ubatch_idx):
+    def recv_ffn_output(self, *, ref_tensor, ubatch_idx, context=None):
         self.events.append(("recv", ref_tensor, ubatch_idx))
         return ref_tensor * 0.25
 

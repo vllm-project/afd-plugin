@@ -16,6 +16,14 @@ def cam_factory_on_cpu(monkeypatch):
 
     from afd_plugin.model_executor.ffn import remote
 
+    # Ascend replaces both public factory bindings and retains the vLLM original.
+    ascend_patch = sys.modules.get("vllm_ascend.patch.platform.patch_fused_moe")
+    factory = (
+        remote.fused_moe.FusedMoEFactory
+        if ascend_patch is None
+        else ascend_patch._original_FusedMoE
+    )
+    monkeypatch.setattr(remote, "fused_moe", SimpleNamespace(FusedMoEFactory=factory))
     monkeypatch.setattr(remote, "current_platform", SimpleNamespace(device_type="npu"))
     monkeypatch.setitem(
         sys.modules,
@@ -24,9 +32,7 @@ def cam_factory_on_cpu(monkeypatch):
     )
 
     monkeypatch.setattr(
-        parallel_state,
-        "get_tp_group",
-        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
+        parallel_state, "_TP", SimpleNamespace(rank_in_group=0, world_size=1)
     )
 
 
@@ -40,13 +46,11 @@ def cam_moe(cam_factory_on_cpu, monkeypatch):
     def build(
         *,
         gate,
-        connector="CAMP2pAFDConnector",
+        vllm_config=None,
         layer_idx=3,
-        prefix="model.layers.3.mlp",
         is_draft_layer=False,
         routing_config=None,
         shared_cls=None,
-        sp=False,
     ):
         config = SimpleNamespace(
             hidden_size=4,
@@ -65,20 +69,16 @@ def cam_moe(cam_factory_on_cpu, monkeypatch):
                 "afd_plugin.model_executor.models.npu.deepseek_v4_shared_experts",
                 SimpleNamespace(AFDDeepseekV4SharedExperts=shared_cls),
             )
-        vllm_config = attention_moe_vllm_config(
-            connector=connector, compute_gate_on_attention=gate
-        )
-        if sp:
-            parallel = vllm_config.parallel_config
-            parallel.tensor_parallel_size = parallel.data_parallel_size = 2
-            parallel.enable_expert_parallel = True
-            parallel.all2all_backend = "allgather_reducescatter"
+        if vllm_config is None:
+            vllm_config = attention_moe_vllm_config(
+                connector="CAMP2pAFDConnector", compute_gate_on_attention=gate
+            )
         with set_current_vllm_config(vllm_config):
             return AFDDeepseekV4MoE(
                 vllm_config=vllm_config,
                 config=config,
                 layer_idx=layer_idx,
-                prefix=prefix,
+                prefix=f"model.layers.{layer_idx}.mlp",
                 compute_gate_on_attention=gate,
                 is_draft_layer=is_draft_layer,
             )

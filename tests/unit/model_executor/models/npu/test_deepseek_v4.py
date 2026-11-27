@@ -13,6 +13,8 @@ from typing import cast
 
 import pytest
 
+from tests.unit.fakes.vllm_config import attention_moe_vllm_config, npu_dspark_config
+
 
 @pytest.fixture
 def torch() -> ModuleType:
@@ -195,6 +197,76 @@ def test_gate_allocates_the_checkpoint_parameters_for_its_moe_type(
         correction_bias = state["gate.e_score_correction_bias"]
         assert correction_bias.dtype == torch.float32
         assert correction_bias.shape == (3,)
+
+
+@pytest.fixture
+def dspark_cam_decoder(cam_factory_on_cpu, torch, prefix):
+    from transformers import DeepseekV4Config
+    from vllm.config import set_current_vllm_config
+
+    from afd_plugin.config import CAMP2P_CONNECTOR, parse_afd_config
+    from afd_plugin.model_executor.models.npu.deepseek_v4_moe import AFDDeepseekV4MoE
+
+    nn = torch.nn
+    namespace = {
+        "nn": nn,
+        "torch": torch,
+        "cast": cast,
+        "native": SimpleNamespace(
+            DeepseekV4DecoderLayer=nn.Module,
+            DeepseekV4Attention=nn.Identity,
+            RMSNorm=nn.Identity,
+        ),
+        "CAMP2P_CONNECTOR": CAMP2P_CONNECTOR,
+        "parse_afd_config": parse_afd_config,
+        "AFDDeepseekV4MoE": AFDDeepseekV4MoE,
+    }
+    exec(_compile_constructors("AFDDeepseekV4DecoderLayer"), namespace)
+    hf_config = DeepseekV4Config(
+        num_hidden_layers=43,
+        hidden_size=4,
+        moe_intermediate_size=8,
+        n_routed_experts=3,
+        num_experts_per_tok=2,
+        n_shared_experts=0,
+    )
+    dspark = npu_dspark_config()
+    config = attention_moe_vllm_config(hf_config=hf_config, enforce_eager=True)
+    config.additional_config = dspark.additional_config
+    config.speculative_config = dspark.speculative_config
+    config.parallel_config.enable_expert_parallel = True
+    with set_current_vllm_config(config):
+        decoder = namespace["AFDDeepseekV4DecoderLayer"](
+            config, prefix=prefix, is_draft_layer=True
+        )
+    return decoder, config.compilation_config.static_all_moe_layers
+
+
+@pytest.mark.parametrize("prefix, wire_layer", [("mtp.0", 43), ("mtp.1", 44)])
+def test_dspark_draft_sends_global_cam_layer_without_dbo(
+    dspark_cam_decoder, torch, monkeypatch, prefix, wire_layer
+):
+    from afd_plugin.model_executor.models.npu import deepseek_v4_moe
+    from tests.unit.fakes.connector import install_proxy_context
+
+    decoder, registered_layers = dspark_cam_decoder
+    events: list[tuple] = []
+    metadata = install_proxy_context(monkeypatch, events, stage_idx=0)
+    metadata.stage_idx = 0
+    hidden = torch.ones(2, 4)
+    ids = torch.tensor([[0, 1], [1, 2]], dtype=torch.int32)
+    weights = torch.full((2, 2), 0.5)
+    monkeypatch.setattr(
+        deepseek_v4_moe, "compute_attention_gate_topk", lambda *a, **kw: (weights, ids)
+    )
+
+    output = decoder.mlp(hidden)
+
+    assert registered_layers == [f"{prefix}.mlp.experts"]
+    send, recv = events
+    assert send[0] == "send" and send[2].metadata.layer_idx == wire_layer
+    assert recv[0] == "recv" and recv[2] == send[2].metadata.stage_idx == 0
+    torch.testing.assert_close(output, hidden * 0.25)
 
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])
