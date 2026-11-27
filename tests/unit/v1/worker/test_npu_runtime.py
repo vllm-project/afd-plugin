@@ -552,6 +552,13 @@ def test_npu_ffn_worker_reports_zero_compilation_times():
     assert compilation_times.encoder == 0.0
 
 
+def test_npu_ffn_worker_accepts_startup_mm_cache_reset():
+    worker = _new_ffn_worker()
+    worker.model_runner = SimpleNamespace()
+
+    assert worker.reset_mm_cache() is None
+
+
 @pytest.mark.parametrize("enable_cpu_binding", [False, True])
 def test_npu_ffn_worker_start_binds_physical_npu_once_before_daemon(
     monkeypatch,
