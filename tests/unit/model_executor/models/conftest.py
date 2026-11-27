@@ -44,11 +44,6 @@ def ascend_v4_model(cam_factory_on_cpu, monkeypatch):
         patch.setitem(
             sys.modules, "vllm_ascend.models.deepseek_v4", SimpleNamespace(model=native)
         )
-        patch.setitem(
-            sys.modules,
-            "afd_plugin.model_executor.models.npu.deepseek_v4_weights",
-            SimpleNamespace(prepare_attention_gate_w8a8_scales=None),
-        )
         spec = importlib.util.find_spec(
             "afd_plugin.model_executor.models.npu.deepseek_v4"
         )

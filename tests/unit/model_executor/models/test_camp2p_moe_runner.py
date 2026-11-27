@@ -11,8 +11,10 @@ pytest.importorskip("vllm")
 
 from torch import nn  # noqa: E402
 
+from afd_plugin.config import AFD_ASYNC_CONNECTOR, CAMP2P_CONNECTOR  # noqa: E402
 from afd_plugin.model_executor.ffn import remote  # noqa: E402
 from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
+from tests.unit.fakes.vllm_config import attention_moe_vllm_config  # noqa: E402
 
 
 @pytest.mark.parametrize("explicit", [False, True], ids=["context-ids", "model-ids"])
@@ -53,7 +55,7 @@ def test_ffn_gate_requires_ids_before_send(cam_moe, ascend_v4_model, monkeypatch
     "has_shared", [False, True], ids=["routed-only", "with-shared"]
 )
 def test_sync_gate_preserves_routes_and_stage_across_yield(
-    cam_moe, ascend_v4_model, monkeypatch, has_shared
+    cam_moe, monkeypatch, has_shared
 ):
     events: list[tuple] = []
     stage = SimpleNamespace(ubatch_idx=0)
@@ -87,8 +89,8 @@ def test_sync_gate_preserves_routes_and_stage_across_yield(
         ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32) + owner
         weights = torch.full((2, 2), 0.75 + owner)
         monkeypatch.setattr(
-            ascend_v4_model,
-            "compute_attention_gate_topk",
+            remote,
+            "_cam_gate_topk",
             lambda *_a, routes=(weights, ids), **_kw: routes,
         )
         events.clear()
@@ -111,20 +113,27 @@ def test_sync_gate_preserves_routes_and_stage_across_yield(
         torch.testing.assert_close(output, hidden * (3.25 if has_shared else 0.25))
 
 
-def test_sync_gate_requires_forward_metadata(cam_moe, ascend_v4_model, monkeypatch):
+def test_sync_gate_requires_forward_metadata(cam_moe, monkeypatch):
     monkeypatch.setattr(remote, "get_afd_metadata_from_forward_context", lambda: None)
     monkeypatch.setattr(
-        ascend_v4_model,
-        "compute_attention_gate_topk",
+        remote,
+        "_cam_gate_topk",
         lambda *_a, **_kw: (torch.ones(1, 2), torch.zeros(1, 2, dtype=torch.int32)),
     )
     with pytest.raises(RuntimeError, match="AFD forward metadata"):
         cam_moe(gate=True)(torch.ones(1, 4))
 
 
-def test_hash_gate_sends_routes_from_the_checkpoint_table(cam_moe, monkeypatch):
+@pytest.mark.parametrize("connector", [CAMP2P_CONNECTOR, AFD_ASYNC_CONNECTOR])
+@pytest.mark.parametrize("precomputed_fp32", [False, True])
+def test_hash_gate_sends_routes_from_the_checkpoint_table(
+    cam_moe, monkeypatch, connector, precomputed_fp32
+):
     block = cam_moe(
         gate=True,
+        vllm_config=attention_moe_vllm_config(
+            connector=connector, compute_gate_on_attention=True
+        ),
         routing_config={
             "mlp_layer_types": ["moe"] * 3 + ["hash_moe"],
             "scoring_func": "sqrtsoftplus",
@@ -136,11 +145,13 @@ def test_hash_gate_sends_routes_from_the_checkpoint_table(cam_moe, monkeypatch):
     block.load_state_dict({"gate.weight": gate_weight, "gate.tid2eid": table})
     # Supply the FP32 weight produced by Ascend's post-load hook.
     block.gate.weight_fp32 = block.gate.weight.detach().float()
-    hidden = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
+    hidden_fp32 = torch.arange(8, dtype=torch.float32).reshape(2, 4) + 0.001
+    hidden = hidden_fp32.bfloat16()
     normalized = torch.tensor([[0.25, 0.75], [0.5, 0.5]])
 
     def select(*, x, input_ids, tid2eid, routed_scaling_factor, **kwargs):
-        torch.testing.assert_close(x, hidden.float() @ gate_weight.T)
+        gate_input = hidden_fp32 if precomputed_fp32 else hidden.float()
+        torch.testing.assert_close(x, gate_input @ gate_weight.T)
         return normalized * routed_scaling_factor, tid2eid[input_ids], None
 
     monkeypatch.setattr(
@@ -152,9 +163,17 @@ def test_hash_gate_sends_routes_from_the_checkpoint_table(cam_moe, monkeypatch):
     events: list[tuple] = []
     install_proxy_context(monkeypatch, events)
 
-    output = block(hidden, input_ids=torch.tensor([2, -1]))
+    output = block(
+        hidden,
+        input_ids=torch.tensor([2, -1]),
+        hidden_states_fp32=hidden_fp32 if precomputed_fp32 else None,
+    )
 
-    ids, weights = events[0][3]["routing"]
+    payload = events[0][3]
+    if connector == CAMP2P_CONNECTOR:
+        ids, weights = payload["routing"]
+    else:
+        ids, weights = payload["topk_ids"], payload["topk_weights"]
     torch.testing.assert_close(ids, table[[2, 0]])
     torch.testing.assert_close(weights, normalized * 2.5)
     torch.testing.assert_close(output, hidden * 0.25)

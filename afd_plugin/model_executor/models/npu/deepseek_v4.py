@@ -31,20 +31,13 @@ from afd_plugin.config import (
     parse_afd_config,
 )
 from afd_plugin.connectors import AFDExpertRoutingSpec
-from afd_plugin.model_executor.ffn.remote import build_expert
+from afd_plugin.model_executor.ffn.remote import build_expert, local_hash_input_ids
 from afd_plugin.model_executor.models._weight_utils import (
     ATTENTION_ROLE,
     BOTH_ROLES,
     FFN_ROLE,
     filter_role_weights,
     layer_weight_path,
-)
-from afd_plugin.model_executor.models.npu.deepseek_v4_attention_gate import (
-    compute_attention_gate_topk,
-    local_hash_input_ids,
-)
-from afd_plugin.model_executor.models.npu.deepseek_v4_weights import (
-    prepare_attention_gate_w8a8_scales,
 )
 
 try:
@@ -108,8 +101,8 @@ def _checkpoint_weight_roles(
         if remainder and remainder[0] == "gate":
             # Every router parameter, including the Hash id table, belongs to
             # each role that built a router: with the gate on Attention, the
-            # Attention gate shell registers ``tid2eid`` for Hash layers and
-            # routes from it, and the native FFN MoE registers its own copy.
+            # Attention model registers ``tid2eid`` for the CAM runner's Hash
+            # lookup, and the native FFN MoE registers its own copy.
             # With the gate on FFN the Attention MoE slot is parameter-free, so
             # Attention must not receive any of them.
             if attn_owns_gate:
@@ -122,7 +115,7 @@ def _checkpoint_weight_roles(
 
 
 class AFDDeepseekV4MoE(nn.Module):
-    """Attention's local router and shared MLP with remote routed experts."""
+    """Own the Attention gate and shared experts under their checkpoint names."""
 
     def __init__(
         self,
@@ -137,13 +130,13 @@ class AFDDeepseekV4MoE(nn.Module):
         super().__init__()
         self.gate: ReplicatedLinear | None = None
         self.shared_experts: nn.Module | None = None
-        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.5)
+        routing_args = {}
         if compute_gate_on_attention:
-            self.top_k = int(config.num_experts_per_tok)
-            self.renormalize = bool(config.norm_topk_prob)
-            self.scoring_func = getattr(config, "scoring_func", "softmax")
-            self.num_expert_group = int(getattr(config, "n_group", 1))
-            self.topk_group = int(getattr(config, "topk_group", 1))
+            routing_args = {
+                "scoring_func": getattr(config, "scoring_func", "softmax"),
+                "num_expert_group": int(getattr(config, "n_group", 1)),
+                "topk_group": int(getattr(config, "topk_group", 1)),
+            }
             # Match native DSV4's explicit shared-output reduction. Ascend keeps
             # weights TP-sharded with SP unless shared-expert DP is enabled.
             if config.n_shared_experts:
@@ -208,8 +201,9 @@ class AFDDeepseekV4MoE(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             renormalize=config.norm_topk_prob,
-            routed_scaling_factor=self.routed_scaling_factor,
+            routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.5),
             prefix=f"{prefix}.experts",
+            **routing_args,
         )
 
     def forward(
@@ -230,16 +224,13 @@ class AFDDeepseekV4MoE(nn.Module):
                 hidden_states, router_logits=hidden_states, input_ids=ids
             )
 
-        weights, ids = compute_attention_gate_topk(
-            self,
-            hidden_states,
-            input_ids=input_ids,
-            hidden_states_fp32=hidden_states_fp32,
-        )
+        # As in native internal routing, router_logits carries the gate input.
+        gate_input = hidden_states if hidden_states_fp32 is None else hidden_states_fp32
         return self.experts(
             hidden_states,
-            router_logits=hidden_states,
-            routing=(ids, weights),
+            router_logits=gate_input,
+            input_ids=input_ids,
+            attention_gate=self.gate,
             shared_experts=self.shared_experts,
         )
 
@@ -686,8 +677,8 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
         raise NotImplementedError(
-            "DSV4 AFD never returns gate outputs through this method; the "
-            "Attention-side gate keeps its top-k inside the gate shell"
+            "DSV4 AFD never returns gate outputs through this method. "
+            "The Attention CAM runner sends top-k routes directly."
         )
 
 
@@ -727,7 +718,21 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
             or not self.afd_config.compute_gate_on_attention
         ):
             return
-        prepare_attention_gate_w8a8_scales(self.model.layers)
+        from vllm_ascend.quantization.quant_type import QuantType
+
+        for module in self.model.layers:
+            layer = cast(AFDDeepseekV4DecoderLayer, module)
+            if not layer.is_moe_layer:
+                continue
+            experts = cast("AscendMoERunner", layer.mlp.experts)
+            if experts.quant_type != QuantType.W8A8:
+                continue
+            owner = cast("AscendRoutedExperts", experts.routed_experts)
+            if owner.dynamic_eplb or "w13_weight_scale_fp32" in owner.__dict__:
+                continue
+            owner.w13_weight_scale_fp32 = cast(
+                torch.Tensor, owner.w13_weight_scale
+            ).data.to(torch.float32)
         # ### PATCH END: retain FFN gate-on-A W8A8 scales after quant finalize
 
     def get_quantized_expert_weights(

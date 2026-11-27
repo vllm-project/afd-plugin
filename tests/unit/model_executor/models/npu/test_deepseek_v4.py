@@ -227,7 +227,6 @@ def dspark_cam_decoder(ascend_v4_model, prefix):
 @pytest.mark.parametrize("prefix, wire_layer", [("mtp.0", 43), ("mtp.1", 44)])
 def test_dspark_draft_sends_global_cam_layer_without_dbo(
     dspark_cam_decoder,
-    ascend_v4_model,
     cam_factory_on_cpu,
     torch,
     monkeypatch,
@@ -247,7 +246,7 @@ def test_dspark_draft_sends_global_cam_layer_without_dbo(
     ids = torch.tensor([[0, 1], [1, 2]], dtype=torch.int32)
     weights = torch.full((2, 2), 0.5)
     monkeypatch.setattr(
-        ascend_v4_model, "compute_attention_gate_topk", lambda *a, **kw: (weights, ids)
+        cam_factory_on_cpu, "_cam_gate_topk", lambda *a, **kw: (weights, ids)
     )
 
     output = decoder.mlp(hidden)

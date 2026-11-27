@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """V4 Async CAM dispatch, shared overlap and layout restoration on CPU."""
 
+import sys
 from collections.abc import Callable
 from types import SimpleNamespace
 
@@ -45,16 +46,11 @@ def target_dbo_config(sp):
     "sp", [False, True], ids=["replicated-tp", "sequence-parallel"]
 )
 def test_target_dbo_restores_its_own_layout_and_adds_shared_once(
-    cam_moe, ascend_v4_model, cam_factory_on_cpu, target_dbo_config, monkeypatch, sp
+    cam_moe, cam_factory_on_cpu, target_dbo_config, monkeypatch, sp
 ):  # long-test: check the wire handoff and restored output together
     hidden = torch.arange(20, dtype=torch.float32).reshape(5, 4)
     ids = torch.arange(10, dtype=torch.int32).reshape(5, 2) % 3
     weights = torch.arange(10, dtype=torch.float32).reshape(5, 2)
-    monkeypatch.setattr(
-        ascend_v4_model,
-        "compute_attention_gate_topk",
-        lambda *_a, **_kw: (weights, ids),
-    )
     monkeypatch.setattr(
         async_cam_layout,
         "get_tp_group",
@@ -99,6 +95,20 @@ def test_target_dbo_restores_its_own_layout_and_adds_shared_once(
         vllm_config=target_dbo_config,
         shared_cls=Shared,
     )
+    block.gate.weight_fp32 = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+
+    def select(logits, **kwargs):
+        events.append("gate")
+        torch.testing.assert_close(logits, hidden @ block.gate.weight_fp32.T)
+        assert kwargs["norm_type"] == 0
+        return weights, ids, None
+
+    monkeypatch.setitem(
+        sys.modules, "torch_npu", SimpleNamespace(npu_moe_gating_top_k=select)
+    )
+    monkeypatch.setattr(
+        torch.ops.vllm, "afd_balance_routing_ids_", lambda *_: None, raising=False
+    )
     metadata.connector = SimpleNamespace(send_attn_output=send, recv_ffn_output=recv)
     hooks: list[Callable] = []
     monkeypatch.setattr(async_cam_dbo, "dbo_enabled", lambda: True)
@@ -120,4 +130,6 @@ def test_target_dbo_restores_its_own_layout_and_adds_shared_once(
     monkeypatch.setattr(async_cam_layout, "tensor_model_parallel_all_gather", gather)
 
     torch.testing.assert_close(block(hidden), hidden * 4 + 100)
-    assert events == ["send", "shared", "yield", "recv"] + ([] if sp else ["gather"])
+    assert events == ["gate", "send", "shared", "yield", "recv"] + (
+        [] if sp else ["gather"]
+    )

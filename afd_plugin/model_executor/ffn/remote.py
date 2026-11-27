@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import importlib
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
@@ -44,6 +44,9 @@ from afd_plugin.connectors import (
 )
 from afd_plugin.forward_context import get_afd_metadata_from_forward_context
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.linear import ReplicatedLinear
 
 UNROUTED_EXPERT_ID = -1
 
@@ -370,6 +373,100 @@ class AFDRemoteMoERunner(MoERunner):
         return output if shared is None else output + shared
 
 
+def local_hash_input_ids(
+    *,
+    input_ids: torch.Tensor | None,
+    router_tokens: int,
+) -> torch.Tensor:
+    """Validate IDs already sharded by the model alongside the routed tokens.
+
+    The native model and AFD staged model both own the token split. A second
+    split here would silently route a different set of tokens on Hash layers.
+    """
+
+    if input_ids is None:
+        raise RuntimeError(
+            "DSV4 Hash routing requires input_ids to send towards the FFN role, "
+            "but the forward context carries none. This path routes by token "
+            "identity and has no fallback, so the runner must install the "
+            "request's input_ids before the model forward.",
+        )
+    ids = input_ids.reshape(-1).to(torch.int64)
+    if ids.numel() != router_tokens:
+        raise RuntimeError(
+            "DSV4 Hash routing cannot align the ids sent to FFN with the local "
+            f"tokens: ids={ids.numel()} router_tokens={router_tokens}",
+        )
+    return ids
+
+
+def _cam_gate_topk(
+    experts: RoutedExperts,
+    gate: ReplicatedLinear,
+    gate_input: torch.Tensor,
+    input_ids: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project the local V4 gate in FP32 and select routes on the same token rows."""
+    logits = torch.nn.functional.linear(gate_input.float(), gate.weight_fp32)
+    bias = gate.e_score_correction_bias
+    if bias is not None and bias.dtype != logits.dtype:
+        bias = bias.to(logits.dtype)
+
+    if experts.scoring_func == "sqrtsoftplus":
+        tid2eid = gate.tid2eid
+        if tid2eid is not None:
+            token_ids = local_hash_input_ids(
+                input_ids=get_forward_context().input_ids
+                if input_ids is None
+                else input_ids,
+                router_tokens=logits.shape[0],
+            )
+            input_ids = torch.where(token_ids == -1, 0, token_ids)
+            tid2eid = tid2eid.to(torch.int32)
+        else:
+            input_ids = None
+        weights, ids, _ = torch.ops._C_ascend.moe_gating_top_k_hash(
+            x=logits,
+            k=experts.top_k,
+            bias=bias,
+            input_ids=input_ids,
+            tid2eid=tid2eid,
+            k_group=experts.topk_group,
+            group_count=experts.num_expert_group,
+            routed_scaling_factor=experts.routed_scaling_factor,
+            eps=1e-20,
+            group_select_mode=1,
+            renorm=0,
+            norm_type=2,
+            out_flag=False,
+        )
+    elif experts.scoring_func in ("softmax", "sigmoid"):
+        import torch_npu
+
+        weights, ids, _ = torch_npu.npu_moe_gating_top_k(
+            logits,
+            k=experts.top_k,
+            k_group=experts.topk_group,
+            group_count=experts.num_expert_group,
+            group_select_mode=1,
+            renorm=int(experts.renormalize),
+            norm_type=0 if experts.scoring_func == "softmax" else 1,
+            out_flag=False,
+            routed_scaling_factor=experts.routed_scaling_factor,
+            eps=1e-20,
+            bias=bias,
+        )
+    else:
+        raise RuntimeError(
+            "Unsupported non-Hash DSV4 routing scoring function: "
+            f"{experts.scoring_func!r}"
+        )
+
+    # Read the profile flag inside the op so graph replay uses the live routes.
+    torch.ops.vllm.afd_balance_routing_ids_(ids, logits.shape[1], False)
+    return weights.to(torch.float32), ids
+
+
 class AFDCAMP2PMoERunner(AFDRemoteMoERunner):
     """Send the V2 activation or the V4 activation with its IDs or routes."""
 
@@ -380,12 +477,15 @@ class AFDCAMP2PMoERunner(AFDRemoteMoERunner):
         input_ids: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
         *,
-        routing: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_gate: ReplicatedLinear | None = None,
         shared_experts: nn.Module | None = None,
     ) -> torch.Tensor:
-        if routing is not None:
+        if attention_gate is not None:
+            weights, ids = _cam_gate_topk(
+                self.routed_experts, attention_gate, router_logits, input_ids
+            )
             return self._exchange(
-                hidden_states, routing=routing, shared_experts=shared_experts
+                hidden_states, routing=(ids, weights), shared_experts=shared_experts
             )
         if input_ids is not None:
             return self._exchange(hidden_states, input_ids=input_ids)
@@ -410,7 +510,7 @@ class AFDAsyncCAMMoERunner(AFDRemoteMoERunner):
         input_ids: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
         *,
-        routing: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_gate: ReplicatedLinear | None = None,
         shared_experts: nn.Module | None = None,
     ) -> torch.Tensor:
         from afd_plugin.connectors.npu.async_cam_runtime.async_cam_dbo import (
@@ -421,8 +521,10 @@ class AFDAsyncCAMMoERunner(AFDRemoteMoERunner):
             restore_cam_dispatch_output,
         )
 
-        assert routing is not None, "Async CAM requires Attention top-k routes"
-        topk_ids, topk_weights = routing
+        assert attention_gate is not None, "Async CAM requires an Attention gate"
+        topk_weights, topk_ids = _cam_gate_topk(
+            self.routed_experts, attention_gate, router_logits, input_ids
+        )
         dispatch_payload = prepare_cam_dispatch_payload(
             hidden_states,
             topk_weights,
@@ -469,8 +571,8 @@ def build_expert(
 
     ``moe_kwargs`` are the native model's ``FusedMoEFactory`` arguments. Pass
     the model's gate exactly when ``compute_gate_on_attention`` is set.
-    CUDA runners apply it. CAM receives routes selected by the model. Pass
-    shared experts to the native runner for DeepEP M2N. The connector selects
+    CUDA runners hold the gate. CAM runners use the model's gate at forward time.
+    Pass shared experts to the native runner for DeepEP M2N. The connector selects
     the runner. Its routed experts register with vLLM and allocate no weights.
     """
     afd_config = parse_afd_config(vllm_config, validate=False)
@@ -510,7 +612,7 @@ def build_expert(
     routed_experts_cls: type[RoutedExperts] = AFDRemoteRoutedExperts
     if device_type == "npu":
         routed_experts_cls = AFDAscendRemoteRoutedExperts
-        # CAM consumes preselected routes. Keep the gate's single checkpoint name.
+        # CAM receives the gate at forward time to keep its single checkpoint name.
         gate = None
 
     # A parameter-free container: no local quantized weights, transforms or
@@ -561,4 +663,5 @@ __all__ = [
     "AFDRoutedExpertsMoERunner",
     "RemoteFFNProxy",
     "build_expert",
+    "local_hash_input_ids",
 ]

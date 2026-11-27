@@ -96,8 +96,10 @@ The pinned Ascend factory combines AFD's weightless expert class with its
 native routed-experts class at construction. CAM transport windows and pending work
 belong to the connector. Layered and Mega use the same packed weights,
 encoded scales and graph signatures on FFN.
-Gate, Hash routing, shared experts, dense-layer behavior and DSpark target/draft
-identities remain model-owned. The Async runner receives loaded weights through
+The model owns dense-layer behavior and, for V4, the gate weights, Hash table,
+shared experts and DSpark layer identities. On Attention, the CAMP2P and Async
+CAM runners use the V4 gate to select experts before dispatch.
+The Async FFN runner receives loaded weights through
 `get_quantized_expert_weights()` and selects one compute implementation. Mega
 neither constructs Layered nor keeps the connector; its live communication
 arguments are bound after connector initialization.
@@ -122,13 +124,13 @@ SFA/MLA/DSA-specific handling stays explicit inside that worker-side module.
 | Registration map | [`afd_plugin/__init__.py`](../../../afd_plugin/__init__.py) | [`test_package.py`](../../../tests/unit/package/test_package.py) |
 | Role-aware model and weight loading | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py), [`_weight_utils.py`](../../../afd_plugin/model_executor/models/_weight_utils.py) | [`test_deepseek_v2_construction.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_construction.py), [`test_weight_utils.py`](../../../tests/unit/model_executor/models/test_weight_utils.py), model and accuracy E2E suites |
 | DeepSeek V4 CUDA role boundary | [`deepseek_v4.py`](../../../afd_plugin/model_executor/models/deepseek_v4.py) | [`test_deepseek_v4_construction.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_construction.py), [`test_deepseek_v4_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_proxy.py), [`test_deepseek_v4_weight_policy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_weight_policy.py) |
-| DeepSeek V4 Ascend Hash-id boundary | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py), [`npu/deepseek_v4_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_attention_gate.py) | [`test_deepseek_v4_hash_ids.py`](../../../tests/unit/model_executor/test_deepseek_v4_hash_ids.py), [NPU model role tests](../../../tests/unit/model_executor/models/npu/test_deepseek_v4.py), ids-mode cases in [`test_camp2p_token_ids.py`](../../../tests/unit/connectors/test_camp2p_token_ids.py) |
+| DeepSeek V4 Ascend Hash-id boundary | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py), [`ffn/remote.py`](../../../afd_plugin/model_executor/ffn/remote.py) | [`test_deepseek_v4_hash_ids.py`](../../../tests/unit/model_executor/test_deepseek_v4_hash_ids.py), [NPU model role tests](../../../tests/unit/model_executor/models/npu/test_deepseek_v4.py), ids-mode cases in [`test_camp2p_token_ids.py`](../../../tests/unit/connectors/test_camp2p_token_ids.py) |
 | Qwen3 MoE role-aware model and weight loading | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py), [`test_qwen3_moe_weight_policy.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_weight_policy.py) |
 | CUDA remote-experts boundary | [`ffn/remote.py`](../../../afd_plugin/model_executor/ffn/remote.py), [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py) | [`test_remote.py`](../../../tests/unit/model_executor/ffn/test_remote.py), [`test_p2p_experts_contract.py`](../../../tests/unit/connectors/test_p2p_experts_contract.py), [`test_deepseek_v2_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_proxy.py), bit-exact native-kernel parity in [`test_attention_routing.py`](../../../tests/gpu/test_attention_routing.py) |
 | Qwen3 MoE FFN-only routed-experts shell | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py) |
 | Forward-context adapter | [`forward_context.py`](../../../afd_plugin/forward_context.py) | [`test_forward_context.py`](../../../tests/unit/test_forward_context.py) |
 | NPU Async CAM native DBO handoff | [`async_cam_dbo.py`](../../../afd_plugin/connectors/npu/async_cam_runtime/async_cam_dbo.py), [`npu/ubatch_runner.py`](../../../afd_plugin/v1/worker/npu/ubatch_runner.py) | [`test_async_cam_dbo.py`](../../../tests/unit/connectors/npu/async_cam_runtime/test_async_cam_dbo.py), [`test_npu_model_runner_v2.py`](../../../tests/unit/v1/worker/test_npu_model_runner_v2.py) |
-| Ascend DeepSeek V4 FFN W8A8 scales | [`deepseek_v4_weights.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_weights.py) | [`test_deepseek_v4_weights.py`](../../../tests/unit/model_executor/models/npu/test_deepseek_v4_weights.py) |
+| Ascend DeepSeek V4 FFN W8A8 post-load scales | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py) | [`test_deepseek_v4_weights.py`](../../../tests/unit/model_executor/models/npu/test_deepseek_v4_weights.py) |
 | Ascend CAM dispatch layout | [`async_cam_layout.py`](../../../afd_plugin/connectors/npu/async_cam_runtime/async_cam_layout.py) | [`test_async_cam_dbo.py`](../../../tests/unit/connectors/npu/async_cam_runtime/test_async_cam_dbo.py) |
 | Ascend stage metadata and RoPE ownership | [`worker/npu/attention_metadata.py`](../../../afd_plugin/v1/worker/npu/attention_metadata.py) | [`test_attention_metadata.py`](../../../tests/unit/v1/worker/npu/test_attention_metadata.py) |
 | Ascend external-routing MoE execution | [`npu/deepseek_v4_external_routing_moe.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_external_routing_moe.py) | [`test_deepseek_v4_external_routing_moe_cpu.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_external_routing_moe_cpu.py) |
@@ -246,9 +248,13 @@ selects the runner when the layer is built.
 | Async CAM, gate on Attention | Dispatch rank-local rows and routes, run shared experts and yield. The owning microbatch restores the combined result's TP/SP layout before adding shared. The connector-driven FFN executor uses `dynamicQuant=1`. |
 
 The common `compute_gate_on_attention` field selects the placement.
-On Attention, the V4 selector operates on rank-local rows and applies
-`routed_scaling_factor` to top-k weights. The CAM runner returns a tensor
-with output scaling disabled in the native factory.
+With the gate on Attention, both CAM runners project the local token rows in
+FP32 and select top-k before preparing the transfer. Hash layers look up the
+IDs for those same rows in the model's checkpoint table. The selector applies
+`routed_scaling_factor` to the weights once.
+On FFN, `process_weights_after_loading()` restores a missing
+`w13_weight_scale_fp32` from the canonical W8A8 scale for static experts
+after native quantization finalization.
 
 The DSpark adapter follows the same boundary. Native checkpoint names
 `mtp.0..2` and KV names are retained; its CAM layer IDs start at the target's
