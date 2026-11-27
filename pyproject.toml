@@ -35,7 +35,7 @@ dependencies = []
 [project.optional-dependencies]
 vllm = ["vllm==0.32.0"]
 afdep = [
-    "afdep-comm @ git+https://github.com/afdEP/afdEP-comm.git@ea49974e07eb53bf5a960f67b36390557ddd6f0b",
+    "afdep-comm @ git+https://github.com/afdEP/afdEP-comm.git@ca729219d784eb6069f3a2ceda061d7fe6db37e8",
 ]
 
 [project.urls]
