@@ -49,6 +49,8 @@ def test_execution_mode_and_lanes(graph, dbo, graph_mode, num_lanes):
             {"connector_extra_config": {"payload_format": "fp8_block128_fp32"}},
             "payload_format='bf16'",
         ),
+        ({"attention_units": 0}, "at least 1"),
+        ({"attention_units": 2, "graph": True}, "requires --enforce-eager"),
         (
             {"connector_extra_config": {"num_lanes": 2}},
             "disagrees with no --enable-dbo",
@@ -64,6 +66,8 @@ def test_execution_mode_and_lanes(graph, dbo, graph_mode, num_lanes):
         "local-rank",
         "shutdown-timeout",
         "fp8-payload",
+        "attention-units",
+        "attention-units-graph",
         "lanes-without-dbo",
         "lanes-with-dbo",
     ],

@@ -119,6 +119,34 @@ its expert load. Independently started services must pair within
 `afd_process_group_timeout_s` on both roles, or both fail. Raise it on both
 sides to cover the expected start skew (600 s above).
 
+### Several Attention units (Take First Ready)
+
+`--attention-units K` lets the same F ranks serve K independent Attention
+units. Each unit is its own `vllm serve` deployment with its own M2N world:
+unit `u` uses `afd.port + u`, and every unit has the same
+`num_attention_ranks`, `num_ffn_ranks` and connector configuration. F holds
+one connector per unit and serves, one MoE layer at a time, the unit whose
+dispatch arrived first (round robin among several). A unit that sends long
+prefill steps therefore does not delay a unit that sends short steps.
+
+```bash
+torchrun --nproc-per-node 2 -m afd_plugin.ffn_faas serve --backend gpu-deepep-m2n \
+  ... --port 6239 --attention-units 2 --enforce-eager
+# unit 0: vllm serve ... "port":6239 ...    unit 1: vllm serve ... "port":6240 ...
+```
+
+Requirements and limits:
+
+- An afdEP-comm build with `afdep.service` (branch `ffn-service`, commit
+  `1407a54`); release v1.2.1 does not contain it. `nvcc` must be available
+  under `CUDA_HOME` at startup.
+- Eager only, no DBO, BF16 experts, on F and on every Attention unit.
+- Units connect in order: unit `u` waits until F finished the handshake of
+  unit `u - 1`, so `afd_process_group_timeout_s` must cover the start of all
+  units.
+- An idle F rank keeps one GPU kernel polling for arrivals and one CPU thread
+  per unit in the control receive.
+
 ## Management and readiness
 
 Each local F rank serves `--status-port + LOCAL_RANK` (`0` chooses a free

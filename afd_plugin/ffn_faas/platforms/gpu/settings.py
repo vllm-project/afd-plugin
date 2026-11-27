@@ -42,6 +42,8 @@ class GPUFFNConfig:
         default_factory=lambda: MappingProxyType({})
     )
     shutdown_timeout: float = 5.0
+    # Attention units this rank serves, one connector each (see ``units.py``).
+    attention_units: int = 1
 
     def __post_init__(self) -> None:
         """Reject launches no Attention peer could pair with, on the CPU.
@@ -58,6 +60,12 @@ class GPUFFNConfig:
             local_rank=self.local_rank,
             shutdown_timeout=self.shutdown_timeout,
         )
+        if self.attention_units < 1:
+            raise ValueError("--attention-units must be at least 1")
+        if self.attention_units > 1 and (self.graph or self.dbo):
+            raise ValueError(
+                "--attention-units above 1 requires --enforce-eager and no --enable-dbo"
+            )
         payload_format = self.connector_extra_config.get("payload_format", BF16_PAYLOAD)
         if payload_format != BF16_PAYLOAD:
             raise ValueError(
