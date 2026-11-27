@@ -246,6 +246,7 @@ def dspark_cam_decoder(cam_factory_on_cpu, torch, prefix):
 def test_dspark_draft_sends_global_cam_layer_without_dbo(
     dspark_cam_decoder, torch, monkeypatch, prefix, wire_layer
 ):
+    from afd_plugin.model_executor.ffn.npu import cam_runner
     from afd_plugin.model_executor.models.npu import deepseek_v4_moe
     from tests.unit.fakes.connector import install_proxy_context
 
@@ -253,6 +254,9 @@ def test_dspark_draft_sends_global_cam_layer_without_dbo(
     events: list[tuple] = []
     metadata = install_proxy_context(monkeypatch, events, stage_idx=0)
     metadata.stage_idx = 0
+    monkeypatch.setattr(
+        cam_runner, "maybe_apply_dbo_yield", lambda states, *, role: states
+    )
     hidden = torch.ones(2, 4)
     ids = torch.tensor([[0, 1], [1, 2]], dtype=torch.int32)
     weights = torch.full((2, 2), 0.5)

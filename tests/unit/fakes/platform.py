@@ -1,10 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""A CUDA-like vLLM platform for device-selection tests on hosts without GPUs."""
+"""Platform helpers for host-side vLLM tests."""
 
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
+
 import pytest
+
+
+def use_cpu_moe_factory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Build CPU test runners with vLLM's factory even after Ascend patches it."""
+    ascend_patch = sys.modules.get("vllm_ascend.patch.platform.patch_fused_moe")
+    if ascend_patch is not None:
+        from afd_plugin.model_executor.ffn import remote
+
+        factory = SimpleNamespace(FusedMoEFactory=ascend_patch._original_FusedMoE)
+        monkeypatch.setattr(remote, "fused_moe", factory)
 
 
 def cuda_like_platform(monkeypatch: pytest.MonkeyPatch) -> type:

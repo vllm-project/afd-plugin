@@ -26,6 +26,7 @@ from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
 from tests.unit.fakes.model_layers import GateLinear
 from tests.unit.fakes.model_layers import Stage as _FakeStage  # noqa: E402
 from tests.unit.fakes.model_layers import stage_type as _stage_type
+from tests.unit.fakes.platform import use_cpu_moe_factory  # noqa: E402
 from tests.unit.fakes.vllm_config import attention_moe_vllm_config  # noqa: E402
 
 
@@ -153,6 +154,7 @@ def _single_ep_rank():
 @pytest.fixture
 def cuda_construction_env(monkeypatch, construction_env):
     """A real vLLM config and CUDA placement for native-factory MoE runners."""
+    use_cpu_moe_factory(monkeypatch)
     config = attention_moe_vllm_config(
         hf_config=_vllm_config().model_config.hf_config,
         use_mla=False,
@@ -410,6 +412,7 @@ def test_ffn_constructs_no_real_attention(
 
 def _remote_experts_shell(monkeypatch, *, compute_gate_on_attention: bool):
     """A CUDA P2P Attention MoE shell with its native factory runner."""
+    use_cpu_moe_factory(monkeypatch)
     monkeypatch.setattr(remote, "current_platform", SimpleNamespace(device_type="cuda"))
     monkeypatch.setattr(adapter.native, "get_ep_group", _single_ep_rank)
     monkeypatch.setattr(adapter.native, "GateLinear", GateLinear)

@@ -28,6 +28,7 @@ from tests.unit.fakes.connector import (  # noqa: E402
     install_proxy_context,
 )
 from tests.unit.fakes.model_layers import GateLinear  # noqa: E402
+from tests.unit.fakes.platform import use_cpu_moe_factory  # noqa: E402
 from tests.unit.fakes.vllm_config import attention_moe_vllm_config  # noqa: E402
 
 LAYER_IDX = 3
@@ -67,6 +68,8 @@ RESERVED_FACTORY_ARGUMENTS = (
 
 
 def _build_runner(monkeypatch, config, *, device_type="cuda", gate=None, **kwargs):
+    if device_type == "cuda":
+        use_cpu_moe_factory(monkeypatch)
     monkeypatch.setattr(
         remote, "current_platform", SimpleNamespace(device_type=device_type)
     )

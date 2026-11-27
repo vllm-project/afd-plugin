@@ -27,6 +27,7 @@ from afd_plugin.model_executor.ffn import remote  # noqa: E402
 from afd_plugin.model_executor.models import qwen3_moe as adapter  # noqa: E402
 from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
 from tests.unit.fakes.model_layers import stage_type as _stage_type  # noqa: E402
+from tests.unit.fakes.platform import use_cpu_moe_factory  # noqa: E402
 from tests.unit.fakes.vllm_config import attention_moe_vllm_config  # noqa: E402
 
 DEEPEP_M2N_ATTENTION = AFDConfig(
@@ -158,6 +159,7 @@ def _single_ep_rank() -> SimpleNamespace:
 @pytest.fixture
 def attention_moe_env(monkeypatch: pytest.MonkeyPatch):
     """A real vLLM config and CUDA placement for the Attention MoE runners."""
+    use_cpu_moe_factory(monkeypatch)
     config = attention_moe_vllm_config(
         hf_text_config=_model_config().model_config.hf_text_config,
     )

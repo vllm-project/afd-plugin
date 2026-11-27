@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.unit.fakes.platform import use_cpu_moe_factory
+
 
 @pytest.fixture
 def cam_factory_on_cpu(monkeypatch):
@@ -16,14 +18,7 @@ def cam_factory_on_cpu(monkeypatch):
 
     from afd_plugin.model_executor.ffn import remote
 
-    # Ascend replaces both public factory bindings and retains the vLLM original.
-    ascend_patch = sys.modules.get("vllm_ascend.patch.platform.patch_fused_moe")
-    factory = (
-        remote.fused_moe.FusedMoEFactory
-        if ascend_patch is None
-        else ascend_patch._original_FusedMoE
-    )
-    monkeypatch.setattr(remote, "fused_moe", SimpleNamespace(FusedMoEFactory=factory))
+    use_cpu_moe_factory(monkeypatch)
     monkeypatch.setattr(remote, "current_platform", SimpleNamespace(device_type="npu"))
     monkeypatch.setitem(
         sys.modules,

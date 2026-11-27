@@ -33,7 +33,9 @@ def target_dbo_config(sp):
     parallel.enable_expert_parallel = True
     parallel.tensor_parallel_size = 2
     parallel.data_parallel_size = 2 if sp else 1
-    parallel.all2all_backend = "allgather_reducescatter"
+    parallel.all2all_backend = (
+        "allgather_reducescatter" if sp else "flashinfer_all2allv"
+    )
     config.additional_config = async_moe_config(
         tensor_parallel_size=parallel.tensor_parallel_size,
         num_attention_ranks=parallel.tensor_parallel_size * parallel.data_parallel_size,
