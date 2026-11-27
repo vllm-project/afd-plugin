@@ -104,7 +104,7 @@ class _InPlaceCombineConnector(ProxyConnector):
         # Record a copy: combine may be given the sent buffer.
         super().send_attn_output(hidden_states.clone(), context, **kwargs)
 
-    def recv_ffn_output(self, *, ref_tensor, ubatch_idx):
+    def recv_ffn_output(self, *, ref_tensor, ubatch_idx, context=None):
         self.events.append(("recv", ref_tensor, ubatch_idx))
         return ref_tensor.fill_(COMBINED_VALUE)
 
