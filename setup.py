@@ -60,9 +60,16 @@ class CMakeExtension(Extension):
 
 
 class BuildNativeOps(build_ext):
+    def initialize_options(self) -> None:
+        super().initialize_options()
+        self._built_cmake_sources: set[str] = set()
+
     def run(self) -> None:
         if not self.extensions:
             return super().run()
+        # Both Python extensions share one CMake build/install. CMake itself
+        # handles parallel compilation; setuptools must not run it twice.
+        self.parallel = False
         if any(ext.name == "afd_plugin._C_ascend" for ext in self.extensions) and (
             os.environ.get("AFD_SKIP_ACLNN_BUILD", "0") != "1"
         ):
@@ -137,16 +144,13 @@ if _should_build_ascend_ops():
     ext_modules.append(
         CMakeExtension("afd_plugin._C_ascend", "csrc/npu/pybind"),
     )
-<<<<<<< HEAD
-if _env_enabled(os.environ.get("AFD_BUILD_GPU_ASYNC_OPS", "0")):
-    ext_modules.append(CMakeExtension("afd_plugin._C_gpu_async", "csrc/gpu"))
-=======
     soc_version = os.environ.get("SOC_VERSION", "910c").lower()
     if soc_version == "950" or soc_version.startswith("ascend950"):
         ext_modules.append(
             CMakeExtension("afd_plugin._C_afd_async_mega", "csrc/npu/pybind"),
         )
->>>>>>> c3a2e02f ([NPU] Support DeepSeek-V4-Flash on A5 with the async Mega connector)
+if _env_enabled(os.environ.get("AFD_BUILD_GPU_ASYNC_OPS", "0")):
+    ext_modules.append(CMakeExtension("afd_plugin._C_gpu_async", "csrc/gpu"))
 
 
 setup(

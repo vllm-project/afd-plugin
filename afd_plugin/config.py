@@ -338,8 +338,7 @@ def validate_afd_config(
         MEGA_CONNECTOR,
     ):
         raise ValueError(
-            "AFD async mode requires CAMAsyncAFDConnector or "
-            "CAMAsyncMegaAFDConnector",
+            "AFD async mode requires CAMAsyncAFDConnector or CAMAsyncMegaAFDConnector",
         )
     if config.connector == "P2pNcclAFDConnector":
         from afd_plugin.distributed import validate_p2p_topology

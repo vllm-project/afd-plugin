@@ -2,62 +2,73 @@
 
 ## Source baseline
 
-The PR branch `feat/a5-async-with-megamoe` starts at upstream `main`, commit
-`0d6ec9e`, and carries the A5 work from `feature/a5-async-megamoe` (`9dcb69b`).
-The branch also merges upstream `main@3dc2347` (#600 and #601). It targets the
-[#537](https://github.com/vllm-project/afd-plugin/issues/537) software environment:
+The working branch `feature/a5-async-megamoe` is rebased onto upstream
+`main@e4ddab1`. Its runtime target follows [installation.md](../installation.md):
 
 | Component | Target |
 | --- | --- |
-| vLLM | `5df63a7203cdb9328d824a27b682e77c7b9928be` (0.32.0) |
-| vLLM-Ascend | `f9c8e0bdb263d7a8c0270536f1ea00fa7373a84e` |
-| CANN | 9.2.1 |
-| Model | DeepSeek-V4-Flash, original FP8 checkpoint with MXFP4 routed experts |
+| vLLM | `0.34.0`, `62d4bc3c7e33b1b6c906e233e6af2d3506c482ca` |
+| vLLM-Ascend | `7dcdb690caf879a17ab07382880d5773f5202e20` |
+| CANN | 9.3.0 |
+| torch / torch-npu | `2.10.0+cpu` / `2.10.0.post7` |
+| Model | DeepSeek-V4-Flash, original checkpoint with MXFP4 routed experts |
 
-The model target is V4 Flash, not V4.1. The existing A3 validation record uses an
-older Ascend commit and does not establish A5 support. On A5, the wrapper omits the DSA-CP interfaces deleted in the target Ascend
-source. The existing A3 constructor path is preserved.
-The native loader, attention, HC, hash routing and shared-expert arithmetic remain
-responsible for the model semantics.
+These are the current development targets. The installation guide's recorded
+hardware validation is on A3; earlier A5 results apply to their recorded
+commits and environments. This rebased 0.34.0 Mega path still requires A5 build,
+accuracy and end-to-end validation. The model admission remains V4 Flash.
+
+The DSV4 wrapper follows the pinned Ascend constructor: it restores missing
+`compress_ratios` through vLLM's configuration helper and uses the current
+Attention constructor without legacy version or DSA-CP arguments. The native
+loader, attention, HC, hash routing and shared-expert arithmetic own model semantics.
 
 ## Scope after PR #603 review
 
-This development branch contains only A5 `CAMAsyncMegaAFDConnector`, its three
-split operators and the DSV4 integration needed by that path. A5 support for the
-existing `CAMAsyncAFDConnector` is retained on `feature/a5-async-cam-followup` for a
-separate PR: its four operator changes, BF16 receive handling, MXFP executor,
-validation and tests are not included here. Existing A3 Async CAM behavior is
-preserved. Shared model TP layout and DBO helpers remain because Mega uses
-them; their existing CAM defaults are unchanged.
+This branch adds A5 `CAMAsyncMegaAFDConnector`, its three split operators and
+model integration. Existing CAMAsync/CAMP2P operators and connector behavior
+follow the rebased main branch. Shared entry points select Mega explicitly;
+Mega model admission, routing and native weight extraction live in the DSV4
+adapter. See [MEGA_EAGER.md](MEGA_EAGER.md#model-adapter-boundary).
 
 ## Mega execution path
 
 Attention owns routing and shared experts. Dispatch converts BF16 activations to
 MXFP8; the FFN fused operator receives, computes the MXFP4 experts and sends results.
-`connectors/npu/mega_weights.py` performs the one-time FP4 C0=32 storage
+`connectors/npu/async_mega/mega_weights.py` performs the one-time FP4 C0=32 storage
 conversion and E8M0 scale preparation after loading. Native checkpoint loading
 remains in the DSV4 model wrapper.
 
 The path requires eager ModelRunnerV2, `afd.async=true`,
 `afd.compute_gate_on_attention=true` and `enable_fused_mc2=0`. FFN selects the DP and layer on device as described in [MEGA_EAGER.md](MEGA_EAGER.md).
 
-For Mega, each ubatch stage owns a communication window and dispatch ticket.
-Within each window, each Attention DP advances the UMDK ring sequence from 1 through 32 and back to 1.
-Every FFN rank claims the DP on device, including ranks with no selected expert.
-The kernel's PUBLISHED/TAKEN/READY/CONSUMED protocol protects input/output reuse.
-Each FFN rank admits at most one fused submission per window at a time.
-The validated recipe uses 2A2F. Other A/F counts use DP x TP per role and contiguous static FFN EP in one
-MTE supernode; no graphs, MTP or EPLB. Idle fused kernels wait for new work; stopping a run may require terminating the workers.
+All ubatches share one HCCL group and one registered window per rank.
+Each Attention DP advances one sequence ring from 1 through 32 and back to 1
+across its ubatches. Python retains a ticket/result per ubatch. The native DBO
+receive hook submits the previous receive before the next send so the data slot
+is reused in stream order.
+
+Each FFN rank has one lane, one stream and at most one fused call in flight.
+The kernel scans all DPs and claims a task when all Attention TP members have
+published its next generation, including when no expert on this FFN rank was
+selected. PUBLISHED/TAKEN/READY/CONSUMED protect input/output reuse. The next
+call is submitted after the previous completion event becomes ready.
+
+The 2A2F recipe is retained as a device-validation entry. Other A/F counts follow
+DP x TP per role and contiguous static FFN EP in one MTE supernode; no graphs,
+MTP or EPLB. Idle fused kernels wait for new work, so stopping a run may require
+terminating the workers.
 
 ## Operator dependencies and current limits
 
-**Plugin development is not an A5 runtime validation result.** Remote deployment,
-accuracy, long-run communication and performance checks have not been performed.
+**The rebased 0.34.0 target needs fresh A5 validation.** Host checks do not
+establish NPU accuracy, long-run communication progress or performance.
 
-- Mega is bundled in AFD: build the extension and private Ascend950 OPP
+- The Mega build requires CANN 9.2+; the current target above uses CANN 9.3.0.
+  Mega is bundled in AFD: build the extension and private Ascend950 OPP
   together with `AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=950 pip install --no-build-isolation .`.
   No external `umdk_cam_mega` wheel is required. Import the three wrappers
-  from `afd_plugin.connectors.npu.mega_runtime`; they use `afd_plugin._C_afd_async_mega`,
+  from `afd_plugin.connectors.npu.async_mega.mega_runtime`; they use `afd_plugin._C_afd_async_mega`,
   `torch.ops.afd_ascend.afd_async_*`, and AFD's private `libcust_opapi.so`.
   The loader configures `AFD_CUST_OPAPI_LIB_PATH` automatically.
   Rebuild both the extension and OPP after protocol changes; mixing old kernels
@@ -89,16 +100,28 @@ A5 qualification; the existing 2A2F test recipe uses TP1.
 For eager Mega DBO, enable `--enable-dbo` on Attention only, with two
 ubatches and native decode/prefill thresholds of at least two tokens.
 For example, use `--dbo-prefill-token-threshold 8 --dbo-decode-token-threshold 2`
-to exercise splitting with eligible requests. Attention dispatches each shard
-into its own registered window and combines it with its own ticket after the
-DBO yield. Each FFN rank checks the completion event for each stage. While one fused kernel is in
-flight it can submit work for the other stage on a second NPU stream. An event
-on each stream protects its window until the previous fused kernel completes.
-Both stages use the same expert weights.
+to exercise splitting with eligible requests. Both ubatches share the same
+window and FFN execution lane; batches below the threshold use stage 0.
+Disabling DBO also uses that single lane.
 
-DBO allocates two full-capacity windows per rank and two HCCL groups at startup.
-Batches below the split threshold use stage 0. With Attention DBO disabled,
-the connector allocates one window and uses the original serial FFN loop.
-To verify hardware overlap, profile eligible batches after warmup and compare
-the two FFN streams' fused kernel intervals. Concurrent host submission alone
-does not establish simultaneous AIC/AIV execution or a throughput gain.
+The intended overlap is ubatch 0's FFN work with ubatch 1's Attention work.
+The next dispatch follows the previous combine receive on the Attention stream,
+so this implementation does not queue two same-DP payloads in separate slots.
+Profile Attention and FFN together after warmup to verify that overlap and
+measure the wait at the receive/send boundary. There are no two FFN streams
+to compare in the current implementation.
+
+## Host regression checks
+
+```bash
+python -m pytest tests/unit/model_executor/models/npu/test_deepseek_v4.py \
+  tests/unit/connectors/npu/test_mega_topology.py \
+  tests/unit/connectors/npu/test_mega_layers.py \
+  tests/unit/config/test_config.py tests/unit/config/test_validation.py \
+  tests/unit/package/test_mega_build_files.py
+```
+
+The DSV4 construction tests expose the current native interface without a
+legacy version helper, cover both roles, and check restoration of missing
+compression metadata. Their configuration-conversion dependency is isolated so
+they remain runnable on CPU with PyTorch and without vLLM/Ascend installed.

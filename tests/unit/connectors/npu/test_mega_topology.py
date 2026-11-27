@@ -1,15 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Exercise configuration validation without loading CANN or creating groups."""
 
 from __future__ import annotations
 
 import ast
+import sys
 import threading
 from contextlib import nullcontext
+from datetime import timedelta
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
+
+from afd_plugin.validation import validate_npu_model_runner_v2_config
+from tests.unit.fakes.vllm_config import npu_async_cam_target_graph_config
 
 
 @pytest.fixture
@@ -132,12 +138,21 @@ def connector_class():
             "_receive",
             "dp_members",
             "execute_next_experts",
+            "close",
+            "_wait_device_idle",
+            "_wait_peer_drain",
         }
     ]
     tree.body = [cls]
+    clock = iter(range(1000))
     ns = {
+        "timedelta": timedelta,
+        "CLOSE_LOCK_TIMEOUT_SECONDS": 5,
+        "CLOSE_DEVICE_TIMEOUT_SECONDS": 5,
+        "CLOSE_PEER_TIMEOUT_SECONDS": 5,
+        "dist": SimpleNamespace(destroy_process_group=lambda group: group.destroy()),
         "torch": SimpleNamespace(npu=SimpleNamespace()),
-        "time": SimpleNamespace(sleep=lambda _: None),
+        "time": SimpleNamespace(sleep=lambda _: None, monotonic=lambda: next(clock)),
         "POLL_SECONDS": 0,
         "dbo_enabled": lambda: False,
         "dbo_maybe_run_recv_hook": lambda: None,
@@ -224,3 +239,114 @@ def test_ffn_submits_the_single_lane_only_when_free(connector_class):
     rank.stages[0].completion.done = True
     rank.execute_next_experts()
     assert [args[-1] for args in calls] == ["window", "window"]
+
+
+class _ShutdownStore:
+    """Deterministic transport: missing peers fail the explicitly bounded wait."""
+
+    def __init__(self, peers=(), disconnected=False):
+        self.messages = {f"drained/{rank}": "1" for rank in peers}
+        self.disconnected = disconnected
+        self.waited = []
+
+    def set_timeout(self, timeout):
+        assert 0 < timeout.total_seconds() <= 5
+
+    def set(self, key, value):
+        if self.disconnected:
+            raise OSError("Store server disconnected")
+        self.messages[key] = value
+
+    def wait(self, keys, timeout):
+        assert 0 < timeout.total_seconds() <= 5
+        self.waited.append(keys)
+        if any(key not in self.messages for key in keys):
+            raise TimeoutError("peer absent")
+
+
+@pytest.fixture
+def closing_connector(connector_class):
+    cls, npu = connector_class
+    npu.Event = lambda: SimpleNamespace(record=lambda: None, query=lambda: True)
+
+    def make(store, rank=0, device_done=True):
+        connector = cls()
+        released = []
+        connector._step_lock = threading.Lock()
+        connector._closed = False
+        connector._shutdown_store = store
+        connector.world_rank = rank
+        connector.attn_size = connector.ffn_size = 1
+        connector.layer_ids = [0]
+        connector.layer_slots = {0: 0}
+        connector.layered_weights = (["weights"],)
+        connector.stages = [
+            SimpleNamespace(
+                completion=SimpleNamespace(query=lambda: device_done),
+                buffer=SimpleNamespace(destroy=lambda: released.append("window")),
+                group=SimpleNamespace(destroy=lambda: released.append("group")),
+            )
+        ]
+        return connector, released
+
+    return make
+
+
+@pytest.mark.parametrize("disconnected", [False, True])
+def test_close_retains_resources_when_peer_cannot_acknowledge(
+    closing_connector, disconnected
+):
+    store = _ShutdownStore(disconnected=disconnected)
+    connector, released = closing_connector(store)
+    with pytest.raises(
+        RuntimeError, match="peers did not confirm shutdown; retain resources"
+    ):
+        connector.close()
+    assert released == []
+    assert connector.layered_weights == (["weights"],)
+    if not disconnected:
+        assert store.messages == {"drained/0": "1"}
+        assert store.waited == [["drained/0", "drained/1"]]
+
+
+def test_failed_local_drain_leaves_peer_wait_bounded(closing_connector):
+    store = _ShutdownStore()
+    failed, failed_released = closing_connector(store, rank=1, device_done=False)
+    drained, drained_released = closing_connector(store)
+    with pytest.raises(RuntimeError, match="device work did not stop"):
+        failed.close()
+    assert store.messages == {}
+    with pytest.raises(RuntimeError, match="peers did not confirm shutdown"):
+        drained.close()
+    assert failed_released == drained_released == []
+    assert store.messages == {"drained/0": "1"}
+
+
+def test_close_releases_only_after_all_ranks_acknowledge(closing_connector):
+    store = _ShutdownStore(peers=(1,))
+    connector, released = closing_connector(store)
+    connector.close()
+    connector.close()  # Already closed: no second destruction or handshake.
+    assert store.messages == {"drained/0": "1", "drained/1": "1"}
+    assert store.waited == [["drained/0", "drained/1"]]
+    assert released == ["window", "group"]
+
+
+@pytest.mark.parametrize("dp_size,tp_size", [(1, 1), (1, 2), (2, 2)])
+def test_mega_eager_dbo_admits_attention_topology(monkeypatch, dp_size, tp_size):
+    model_utils = ModuleType("afd_plugin.model_executor.models.model_utils")
+    model_utils.has_afd_model_registration = lambda config: True
+    monkeypatch.setitem(sys.modules, model_utils.__name__, model_utils)
+    config = npu_async_cam_target_graph_config(
+        data_parallel_size=dp_size,
+        tensor_parallel_size=tp_size,
+        num_attention_ranks=dp_size * tp_size,
+    )
+    config.additional_config["afd"]["connector"] = "CAMAsyncMegaAFDConnector"
+    config.model_config.enforce_eager = True
+    config.parallel_config.enable_dbo = True
+    config.parallel_config.use_ubatching = True
+    config.parallel_config.num_ubatches = 2
+    validate_npu_model_runner_v2_config(
+        config, expected_role="attention", device_type="npu"
+    )

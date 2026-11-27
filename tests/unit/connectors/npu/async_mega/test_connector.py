@@ -30,6 +30,9 @@ def _host_connector():
     connector.layered_weights = (object(),)
     connector._step_lock = threading.Lock()
     connector._closed = False
+    connector.world_rank = 0
+    connector.attn_size, connector.ffn_size = 1, 0
+    connector._shutdown_store = torch.distributed.HashStore()
     return connector
 
 
@@ -45,7 +48,6 @@ class _CompletedEvent:
 def host_close(monkeypatch):
     monkeypatch.setattr(torch.npu, "synchronize", lambda: None)
     monkeypatch.setattr(torch.npu, "Event", _CompletedEvent)
-    monkeypatch.setattr(connector_module.dist, "barrier", lambda **kwargs: None)
     monkeypatch.setattr(
         connector_module.dist, "destroy_process_group", lambda *args, **kwargs: None
     )
@@ -194,8 +196,10 @@ def test_both_ubatches_share_one_window_and_one_sequence_ring(monkeypatch):
     _send(connector, 0)
     _send(connector, 1)
 
-    assert connector.ops.sent == [(connector.stages[0].buffer, 1),
-                                  (connector.stages[0].buffer, 2)]
+    assert connector.ops.sent == [
+        (connector.stages[0].buffer, 1),
+        (connector.stages[0].buffer, 2),
+    ]
     assert len(hooks) == 2
 
 
@@ -249,7 +253,8 @@ def test_peer_result_is_taken_back_before_the_next_send(monkeypatch):
     assert order == ["send", "take_back", "send"]
 
 
-def _attention_connector_ops_send(connector, _hidden, _ids, _weights, buffer,
-                                  _members, sequence, **_kw):
+def _attention_connector_ops_send(
+    connector, _hidden, _ids, _weights, buffer, _members, sequence, **_kw
+):
     connector.ops.sent.append((buffer, sequence))
     return SimpleNamespace(ticket=len(connector.ops.sent))

@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import importlib.util
-import re
 import runpy
 import subprocess
 import sys
@@ -270,24 +269,3 @@ def test_select_ops_drops_shmem_operators_when_shmem_missing():
 
     assert select_ops.resolve(registry, ["a2e", "e2a"], False, None) == ["e2a"]
     assert select_ops.resolve(registry, ["a2e", "e2a"], True, None) == ["a2e", "e2a"]
-
-
-@pytest.mark.parametrize("suffix", ["atten_send", "mega_ffn", "atten_recv"])
-def test_mega_native_registration_uses_one_op_type(suffix: str):
-    """All native registration keys must match the generated ACLNN op type."""
-    root = Path(__file__).resolve().parents[3] / "csrc/npu/ascend_kernels"
-    op = root / f"afd_async_{suffix}_arch35"
-    definition = (op / f"op_host/{suffix}_def.cpp").read_text()
-    op_type = re.search(r"OP_ADD\((\w+)\)", definition).group(1)
-    declarations = [
-        (op / f"op_host/{suffix}_infershape.cpp", "IMPL_OP_INFERSHAPE"),
-        (op / f"op_host/op_tiling/arch35/{suffix}_tiling.cpp", "IMPL_OP_OPTILING"),
-        (op / f"op_kernel/afd_async_{suffix}_tiling_key.h", "ASCENDC_TPL_ARGS_DECL"),
-    ]
-    for path, macro in declarations:
-        registered = re.search(rf"{macro}\(\s*(\w+)", path.read_text()).group(1)
-        assert registered == op_type, (
-            f"{path.name}: {macro} registers {registered}, expected {op_type}"
-        )
-    api = (op / f"op_api/aclnn_afd_async_{suffix}.cpp").read_text()
-    assert f"aclnnInner{op_type}GetWorkspaceSize(" in api

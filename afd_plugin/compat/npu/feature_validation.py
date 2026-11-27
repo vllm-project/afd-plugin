@@ -47,9 +47,7 @@ def fail_if_unsupported_npu_afd_features(
             get_mega_model_spec,
         )
 
-        validate_mega_config(
-            vllm_config, afd_config, get_mega_model_spec(vllm_config)
-        )
+        validate_mega_config(vllm_config, afd_config, get_mega_model_spec(vllm_config))
         return
 
     if afd_config.connector == AFD_ASYNC_CONNECTOR:

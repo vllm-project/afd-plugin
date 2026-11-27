@@ -1,9 +1,9 @@
 # DeepSeek-V4-Flash on A5 with asynchronous Mega
 
 The connector is now named `CAMAsyncMegaAFDConnector` and requires
-`afd.async=true`. The PR branch is based on upstream `main` at `0d6ec9e`.
+`afd.async=true`. The work branch is based on upstream `main@e4ddab1`.
 
-See [A5 development notes](A5_DSV4_ASYNC.md) for the pinned #537 environment,
+See [A5 development notes](A5_DSV4_ASYNC.md) for the pinned vLLM 0.34.0 / Ascend environment,
 operator dependencies, precision/weight handling and configuration contract.
 The old 0.30 launch instructions do not apply to this branch.
 
@@ -13,7 +13,7 @@ configuration for later device verification; it has not been run on A5.
 ## Model adapter boundary
 
 The model admission entry is `model_executor/models/npu/mega_adapter.py`.
-The validated target remains native FP4 DeepSeek-V4-Flash. Its adapter,
+The admitted model target remains native FP4 DeepSeek-V4-Flash. Its adapter,
 `deepseek_v4_mega.py`, supplies explicit dimensions and activation parameters,
 extracts native expert parameters, and computes hash/top-k routing. Ordinary
 TP still slices real local tokens **before routing**; profiling and sequence
@@ -41,9 +41,9 @@ shards. A5 end-to-end validation remains required after this Python refactor.
 The connector protocol uses `split_sequence` and `SPLIT_SEQUENCE_MAX` from
 `afd_plugin.connectors.npu.async_mega.mega_runtime`. The maximum comes from the native constant
 (`constexpr int64_t`, currently 32), shared by host tiling and device comparison.
-Each lane/DP advances 1 through 32 and wraps to 1. The per-buffer launch tag also
+Each Attention DP advances 1 through 32 and wraps to 1. The per-buffer launch tag also
 wraps; each fused launch clears its local AIV done tags before the launch barrier.
-Within each stage, the fused kernel scans DPs round-robin. It claims a DP once
+The single FFN lane scans DPs round-robin. It claims a DP once
 all its Attention ranks have published the next generation for that DP.
 Device waits use half-ring ordering and distinguish waiting for this generation
 from waiting for its predecessor.
@@ -86,9 +86,35 @@ python -m pytest tests/unit/connectors/npu/test_mega_topology.py tests/unit/conn
 
 These check host protocol messages and the actual C++ comparison arithmetic;
 they do not validate NPU store visibility. On A5, rebuild both bundled artifacts,
-run more than 96 dispatch/combine calls per active lane/DP (three ring laps),
+run more than 96 dispatch/combine calls per active DP (three ring laps),
 and include empty routes and uneven TP publication. Verify accuracy against the
 reference as well as continued progress with DBO enabled and disabled.
 
 With DBO enabled, also send work only to stage 0, then only to stage 1.
-Verify that the active stage returns results while the other waits.
+Verify that the active stage returns results while the other has no work.
+
+
+## Bounded shutdown
+
+After the FFN loop stops submitting work, `close()` waits for local device work
+with its five-second device-drain timeout. Only a drained rank publishes
+`drained/<world_rank>` in the connector's shutdown Store prefix. Publication
+and peer acknowledgement share a separate five-second deadline; the Store
+operation timeout is shortened before publication, and the remaining budget
+is passed explicitly to `Store.wait`. Shutdown does not enter an HCCL barrier
+with the 30-minute startup timeout.
+
+All A/F ranks must acknowledge before any local window or process group is
+released. Missing peers, Store disconnection or a failed local drain raise an
+error while retaining the window, group and expert weights. A rank whose local
+drain failed never publishes a drained acknowledgement. The Store reference
+is kept after successful cleanup so peers can still read their acknowledgements.
+These deadlines bound separate close phases, rather than one five-second total.
+Idle fused kernels still require external worker termination if they cannot drain.
+
+The host close regressions in `test_mega_topology.py` cover a drained rank with
+an absent peer, Store disconnection, a peer failing local drain, and successful
+acknowledgement followed by idempotent cleanup. They exercise the actual close
+methods with a deterministic Store transport; the former immediate-barrier
+stub could not expose the missing-peer failure. Device memory visibility and
+HCCL destruction still require A5 validation.

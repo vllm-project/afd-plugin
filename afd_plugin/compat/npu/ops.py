@@ -257,16 +257,15 @@ CAM_OP_NAMESPACE = AFD_ASYNC_OP_NAMESPACE
 @lru_cache(maxsize=1)
 def ensure_mega_ops_available() -> torch.library.Library:
     """Load Mega and retain its torch registrations for the process lifetime."""
-    _ensure_afd_custom_opp_env()
+    ensure_afd_custom_opp_env()
     if not get_afd_cust_opapi_path().is_file():
         raise RuntimeError(
             "AFD Mega custom operators are missing. Build with "
             "AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=950 in a torch-npu/CANN environment."
         )
     try:
-        import torch_npu  # noqa: F401
-
         import torch
+        import torch_npu  # noqa: F401
 
         from afd_plugin import _C_afd_async_mega
     except ImportError as exc:

@@ -29,10 +29,16 @@ from afd_plugin.validation import validate_npu_model_runner_v2_config
 from tests.unit.fakes.async_cam_startup import MemoryStore, startup_world
 from tests.unit.fakes.async_ffn import (
     load_async_modules,
+    load_ffn_owners,
     load_host_module,
 )
 from tests.unit.fakes.graph import Graph
 from tests.unit.fakes.vllm_config import npu_dspark_config, npu_vllm_config
+
+
+@pytest.fixture
+def ffn_owners(modules, monkeypatch):
+    return load_ffn_owners(monkeypatch, modules)
 
 
 @pytest.fixture
@@ -623,37 +629,6 @@ def test_attention_keeps_paired_warmup_and_waits_for_receiver(modules):
     assert calls == ["send", "receive", "device-done", "warmup", "captured", "service"]
 
 
-@pytest.fixture
-def ffn_owners(modules, monkeypatch):
-    _, _, async_runtime = modules
-    for name in (
-        "vllm.compilation.monitor",
-        "vllm.config",
-        "vllm.forward_context",
-        "vllm.platforms",
-        "afd_plugin.v1.worker.attention_metadata",
-        "afd_plugin.v1.worker.cuda_graph",
-        "vllm.distributed.parallel_state",
-        "vllm.v1.worker.worker_base",
-        "vllm.v1.worker.workspace",
-        "vllm_ascend.ascend_config",
-        "vllm_ascend.cpu_binding",
-        "vllm_ascend.worker.worker",
-    ):
-        module = ModuleType(name)
-        module.__dict__["__getattr__"] = lambda attr: MagicMock(name=attr)
-        if name == "vllm_ascend.worker.worker":
-            module.__dict__["NPUWorker"] = object
-        monkeypatch.setitem(sys.modules, name, module)
-    load_host_module(monkeypatch, "afd_plugin.model_executor.models.model_utils")
-    load_host_module(monkeypatch, "afd_plugin.connectors.factory")
-    sync_runtime = load_host_module(
-        monkeypatch, "afd_plugin.v1.worker.npu.ffn_model_runner"
-    )
-    worker = load_host_module(monkeypatch, "afd_plugin.v1.worker.npu.ffn_worker")
-    return sync_runtime, async_runtime, worker
-
-
 @pytest.fixture(params=["attention", "ffn"])
 def npu_worker(request, ffn_owners, monkeypatch):
     _, _, ffn_module = ffn_owners
@@ -966,17 +941,6 @@ def test_worker_selects_runner_for_connector(ffn_owners, monkeypatch, async_conn
     monkeypatch.setattr(worker, "AsyncNPUFFNModelRunner", calls.asynchronous)
     selected = calls.asynchronous if async_connector else calls.sync
     assert worker.create_npu_ffn_model_runner(config, device) is selected.return_value
-
-
-def test_worker_selects_mega_runner_for_mega_connector(ffn_owners, monkeypatch):
-    _, _, worker = ffn_owners
-    config, device, calls = object(), SimpleNamespace(type="npu", index=3), MagicMock()
-    parsed = SimpleNamespace(connector="CAMAsyncMegaAFDConnector")
-    monkeypatch.setattr(worker, "parse_afd_config", lambda *a, **k: parsed)
-    monkeypatch.setattr(worker, "get_world_group", lambda: SimpleNamespace(rank=7))
-    monkeypatch.setattr(worker.AFDConnectorFactory, "create_connector", calls.connector)
-    monkeypatch.setattr(worker, "MegaNPUFFNModelRunner", calls.mega)
-    assert worker.create_npu_ffn_model_runner(config, device) is calls.mega.return_value
 
 
 @pytest.mark.parametrize("async_connector", [False, True])

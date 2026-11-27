@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable
-from typing import NamedTuple, TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, NamedTuple, cast
 
 from afd_plugin.config import (
     MEGA_CONNECTOR,

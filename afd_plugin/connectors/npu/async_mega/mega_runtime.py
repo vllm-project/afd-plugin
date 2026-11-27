@@ -11,7 +11,6 @@ from afd_plugin.compat.npu.ops import ensure_mega_ops_available
 
 from .mega_layout import SplitLayout
 
-
 ensure_mega_ops_available()
 
 from afd_plugin._C_afd_async_mega import (  # noqa: E402
@@ -230,8 +229,16 @@ def atten_send(
         buffer.activation_parameters,
         layer_index,
     )
-    return DispatchTicket(snapshot_data, snapshot_scales, topk_ids, topk_weights,
-                          list(dp_ranks), sequence, configuration, completion)
+    return DispatchTicket(
+        snapshot_data,
+        snapshot_scales,
+        topk_ids,
+        topk_weights,
+        list(dp_ranks),
+        sequence,
+        configuration,
+        completion,
+    )
 
 
 def atten_recv(
@@ -250,9 +257,7 @@ def atten_recv(
         # The CANN dynamic-input signature needs a dtype even when no dense
         # expert executes.
         dtype = (
-            torch.float8_e4m3fn
-            if ticket.configuration[7] == 4
-            else torch.float8_e5m2
+            torch.float8_e4m3fn if ticket.configuration[7] == 4 else torch.float8_e5m2
         )
         empty_dtype = torch.empty(0, device=buffer.context.device, dtype=dtype)
         empty_scale = torch.empty(
@@ -291,5 +296,11 @@ def mega_ffn(
         buffer.layout.attn_ranks_per_dp, buffer.layout.capacity
     )
     return torch.ops.afd_ascend.afd_async_mega_ffn(
-        buffer.context, weight1, weight2, weight_scales1, weight_scales2,
-        configuration, buffer.activation_parameters)
+        buffer.context,
+        weight1,
+        weight2,
+        weight_scales1,
+        weight_scales2,
+        configuration,
+        buffer.activation_parameters,
+    )

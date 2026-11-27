@@ -436,20 +436,19 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
 
         if config is None:
             config = vllm_config.model_config.hf_config
-        if not native.vllm_version_is("0.32.0"):
-            # vLLM #61392 folded `compress_ratios` into `layer_types`; the
-            # Ascend helpers and the KV-store metadata still index the legacy
-            # field, so restore it.
-            if getattr(config, "compress_ratios", None) is None:
-                # `vllm.transformers_utils.deepseek_v4_utils` only exists on
-                # main (added by #61392), so keep the import lazy.
-                from vllm.transformers_utils.deepseek_v4_utils import (
-                    get_compress_ratios,
-                )
+        # vLLM #61392 folded `compress_ratios` into `layer_types`; the
+        # Ascend helpers and the KV-store metadata still index the legacy
+        # field, so restore it.
+        if getattr(config, "compress_ratios", None) is None:
+            # `vllm.transformers_utils.deepseek_v4_utils` only exists on
+            # main (added by #61392), so keep the import lazy.
+            from vllm.transformers_utils.deepseek_v4_utils import (
+                get_compress_ratios,
+            )
 
-                compress_ratios = get_compress_ratios(config)
-                if compress_ratios:
-                    config.compress_ratios = list(compress_ratios)
+            compress_ratios = get_compress_ratios(config)
+            if compress_ratios:
+                config.compress_ratios = list(compress_ratios)
         # ### PATCH START: AFD decoder metadata
         self.vllm_config = vllm_config
         self.config = config
@@ -496,18 +495,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             | AFDDeepseekV4RemoteMoE
             | native.DeepseekV4MoE
         )
-        # Support both vllm-ascend revisions this plugin is built for
-        # (docs/installation.md): the DSA-CP hook exists in one and not the other.
-        upstream_enable_dsa_cp = getattr(native, "enable_dsa_cp", None)
-        self.enable_dsa_cp = (
-            upstream_enable_dsa_cp() if upstream_enable_dsa_cp is not None else False
-        )
         if afd_config.role == "attention":
-            attention_kwargs = {}
-            if upstream_enable_dsa_cp is not None:
-                attention_kwargs["need_gather_q_kv"] = (
-                    self.use_sequence_parallel_moe and self.enable_dsa_cp
-                )
             self.self_attn = native.DeepseekV4Attention(
                 vllm_config=vllm_config,
                 config=config,

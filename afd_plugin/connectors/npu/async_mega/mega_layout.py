@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. Licensed under CANN OSL v2.
 """MTE registered payload geometry; mirrors arch35/common/*_peermem.h."""
+
 from dataclasses import dataclass
 
 

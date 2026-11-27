@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Layer-bank ordering and the A/F startup contract, without device execution."""
 
 import importlib.util

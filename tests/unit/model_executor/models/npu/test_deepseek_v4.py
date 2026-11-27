@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -72,8 +73,10 @@ def construct_model(torch):
         spec="none",
         last_rank=True,
         implementation=layers.DSAImpl,
+        compress_ratios=(1, 1),
     ):
         config = SimpleNamespace(
+            compress_ratios=compress_ratios,
             hidden_size=4,
             vocab_size=16,
             index_topk=2,
@@ -156,6 +159,7 @@ def construct_model(torch):
             "nn": nn,
             "native": native,
             "AFD_ASYNC_CONNECTOR": "CAMAsyncAFDConnector",
+            "MEGA_CONNECTOR": "CAMAsyncMegaAFDConnector",
             "parse_afd_config": lambda config, **kwargs: config.afd,
             "_refresh_ascend_fused_moe": lambda: None,
             "AFDDeepseekV4RemoteMoE": lambda **kwargs: nn.Identity(),
@@ -178,6 +182,10 @@ def construct_gate(torch):
         "torch": torch,
         "RemoteFFNProxy": nn.Identity,
         "ReplicatedLinear": make_linear,
+        "MEGA_CONNECTOR": "CAMAsyncMegaAFDConnector",
+        "parse_afd_config": lambda config, **kwargs: SimpleNamespace(
+            connector="CAMP2pAFDConnector"
+        ),
     }
     exec(_compile_constructors("AFDDeepseekV4AttentionGateRemoteMoE"), namespace)
     gate = namespace["AFDDeepseekV4AttentionGateRemoteMoE"]
@@ -383,3 +391,16 @@ def test_async_shared_weights_follow_attention_for_checkpoint_and_runtime_names(
         checkpoint_weight_roles(name, attention_shared_experts=True) == ATTENTION_ROLES
     )
     assert checkpoint_weight_roles(name) == FFN_ROLES
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_decoder_restores_missing_compress_ratios(construct_model, monkeypatch, role):
+    # Isolate only vLLM's config converter. The native fake deliberately exposes
+    # the pinned 0.34 API, with no legacy version helper or DSA-CP arguments.
+    helper = ModuleType("vllm.transformers_utils.deepseek_v4_utils")
+    helper.get_compress_ratios = lambda config: (1, 4)
+    monkeypatch.setitem(sys.modules, helper.__name__, helper)
+
+    model = construct_model(role=role, compress_ratios=None)
+
+    assert all(layer.config.compress_ratios == [1, 4] for layer in model.model.layers)

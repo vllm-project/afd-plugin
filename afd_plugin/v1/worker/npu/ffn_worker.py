@@ -231,7 +231,7 @@ class AFDNPUFFNWorker(NPUWorker):
 
         if isinstance(self.model_runner, MegaNPUFFNModelRunner):
             # The fused operator waits for the next ready ubatch and keeps one
-            # stream and one completion event per ubatch, so the driver must
+            # shared stream and one completion event, so the driver must
             # not add a per-step device fence.
             while not event.is_set():
                 self.model_runner.execute_connector_driven_step()
@@ -302,9 +302,7 @@ class AFDNPUFFNWorker(NPUWorker):
             if thread is not None:
                 thread.join(timeout=FFN_SHUTDOWN_TIMEOUT_SECONDS)
                 if thread.is_alive():
-                    raise RuntimeError(
-                        "Mega FFN step is pending; retain resources"
-                    )
+                    raise RuntimeError("Mega FFN step is pending; retain resources")
             self.raise_ffn_loop_error_if_any()
             self.model_runner.shutdown()
             self._ffn_thread = None

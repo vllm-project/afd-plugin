@@ -10,7 +10,9 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 pytest.importorskip("vllm_ascend")
 
-from afd_plugin.model_executor.models.npu import deepseek_v4_mega as adapter  # noqa: E402
+from afd_plugin.model_executor.models.npu import (  # noqa: E402
+    deepseek_v4_mega as adapter,
+)
 
 
 @pytest.fixture

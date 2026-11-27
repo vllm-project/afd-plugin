@@ -62,5 +62,6 @@ AFD adaptations include private OPP loading, the `afd_ascend` namespace,
 argument validation and draining HCCL warmup before channel creation.
 The redundant `common/comm_context.py` re-export and `ops.py` aliases are removed.
 
-The Python source license is retained at `afd_plugin/connectors/npu/LICENSE-CANN`;
-it also covers the migrated schema/Meta adapter block in `compat/npu/ops.py`.
+The Python interface sources use the same CANN OSL v2 text in
+[`LICENSE-CANN`](LICENSE-CANN), including the migrated schema/Meta adapter
+block in `compat/npu/ops.py`. No separate connector-local license copy is kept.

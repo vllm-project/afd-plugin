@@ -15,40 +15,9 @@ from afd_plugin.connectors.npu.async_cam_runtime import (  # noqa: E402
     async_cam_layout as async_cam,
 )
 from afd_plugin.model_executor.models.npu import deepseek_v4 as adapter  # noqa: E402
-from afd_plugin.model_executor.models.npu import (  # noqa: E402
-    deepseek_v4_attention_gate,
+from tests.unit.fakes.npu_deepseek_v4 import (  # noqa: E402
+    make_attention_gate_proxy as _make_proxy,
 )
-
-
-def _make_proxy(monkeypatch, *, use_sequence_parallel: bool, in_profile_run: bool):
-    proxy = object.__new__(adapter.AFDDeepseekV4AttentionGateRemoteMoE)
-    torch.nn.Module.__init__(proxy)
-    proxy.use_sequence_parallel_moe = use_sequence_parallel
-    proxy.mega = False
-    proxy.shared_experts = None
-    proxy.layer_idx = 3
-    connector = SimpleNamespace()
-    monkeypatch.setattr(
-        adapter,
-        "get_afd_metadata_from_forward_context",
-        lambda: SimpleNamespace(connector=connector, stage_idx=0),
-    )
-    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", lambda states, **kw: states)
-    topk_weights = torch.arange(32, dtype=torch.float32).reshape(16, 2)
-    topk_ids = torch.arange(32, dtype=torch.int32).reshape(16, 2)
-    monkeypatch.setattr(
-        deepseek_v4_attention_gate,
-        "compute_attention_gate_topk",
-        lambda _proxy, _hidden_states, **_kwargs: (topk_weights, topk_ids),
-    )
-    monkeypatch.setattr(
-        adapter,
-        "get_forward_context",
-        lambda: SimpleNamespace(
-            in_profile_run=in_profile_run,
-        ),
-    )
-    return proxy, topk_weights, topk_ids
 
 
 def test_dsv4_profile_gate_shards_plain_tp8_and_restores(monkeypatch):
@@ -112,54 +81,3 @@ def test_dsv4_gate_keeps_sequence_parallel_tokens_rank_local(monkeypatch):
     assert send_kwargs["topk_weights"] is topk_weights
     assert send_kwargs["topk_ids"] is topk_ids
     assert torch.equal(output, hidden_states + 1)
-
-
-@pytest.mark.parametrize("tokens,rank", [(5, 0), (5, 1), (1, 1)])
-def test_mega_routes_only_real_local_rows(monkeypatch, tokens, rank):
-    from vllm.distributed import parallel_state
-    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-
-    proxy, _, _ = _make_proxy(
-        monkeypatch, use_sequence_parallel=False, in_profile_run=False
-    )
-    proxy.mega = True
-    proxy.top_k = 2
-    proxy.gate = SimpleNamespace(tid2eid=True)
-    hidden = torch.arange(tokens * 4).reshape(tokens, 4).to(torch.bfloat16)
-    normalized = hidden.float() + 0.125
-    token_ids = torch.arange(tokens) + 10
-    width = (tokens + 1) // 2
-    rows = slice(rank * width, (rank + 1) * width)
-    monkeypatch.setattr(
-        parallel_state,
-        "get_tp_group",
-        lambda: SimpleNamespace(world_size=2, rank_in_group=rank),
-    )
-    monkeypatch.setattr(_EXTRA_CTX, "in_profile_run", False)
-    monkeypatch.setattr(
-        async_cam, "tensor_model_parallel_all_gather", lambda x, dim: hidden
-    )
-    seen = []
-
-    def route(_, x, *, input_ids, hidden_states_fp32):
-        seen.append(len(x))
-        assert torch.equal(x, hidden[rows])
-        assert torch.equal(input_ids, token_ids[rows])
-        assert torch.equal(hidden_states_fp32, normalized[rows])
-        return torch.ones(len(x), 2), torch.zeros(len(x), 2, dtype=torch.int32)
-
-    def send(_, x, context, **kwargs):
-        valid = len(hidden[rows])
-        assert len(x) == width
-        assert torch.equal(x[:valid], hidden[rows])
-        if valid < width:
-            assert kwargs["topk_weights"][valid:].count_nonzero() == 0
-            assert kwargs["topk_ids"][-1].tolist() == [0, 1]
-        return lambda: x
-
-    monkeypatch.setattr(
-        deepseek_v4_attention_gate, "compute_attention_gate_topk", route
-    )
-    monkeypatch.setattr(adapter, "send_and_build_receive", send)
-    proxy(hidden, input_ids=token_ids, hidden_states_fp32=normalized)
-    assert sum(seen) == len(hidden[rows])

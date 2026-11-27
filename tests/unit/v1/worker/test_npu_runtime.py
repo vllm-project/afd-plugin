@@ -29,6 +29,12 @@ from tests.unit.fakes.dp_metadata import (  # noqa: E402
 )
 from tests.unit.fakes.dp_metadata import dp_tokens as _tokens
 from tests.unit.fakes.graph import Graph as _FakeGraph  # noqa: E402
+from tests.unit.fakes.npu_runtime import (
+    new_ffn_worker as _new_ffn_worker,
+)
+from tests.unit.fakes.npu_runtime import (
+    require_npu_runtime as _require_npu_runtime,
+)
 from tests.unit.fakes.vllm_config import (  # noqa: E402
     npu_vllm_config as _vllm_config,
 )
@@ -127,12 +133,6 @@ class _FakeStructuredFFNModel:
         )
 
 
-def _require_npu_runtime():
-    pytest.importorskip("vllm", reason="NPU runtime tests require vLLM")
-    pytest.importorskip("vllm_ascend", reason="NPU runtime tests require vLLM-Ascend")
-    pytest.importorskip("torch_npu", reason="NPU runtime tests require torch-npu")
-
-
 def _new_ffn_runner():
     _require_npu_runtime()
     from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
@@ -155,18 +155,6 @@ def _new_ffn_runner():
         ),
     )
     return runner
-
-
-def _new_ffn_worker():
-    _require_npu_runtime()
-    from afd_plugin.v1.worker.npu.ffn_worker import AFDNPUFFNWorker
-
-    worker = object.__new__(AFDNPUFFNWorker)
-    worker._ffn_loop_error = None
-    # Most tests exercise the daemon loop rather than CPU placement. Tests for
-    # the startup binding path explicitly reset this guard.
-    worker._cpu_binding_attempted = True
-    return worker
 
 
 def test_npu_ffn_runner_executes_eager_ffn_step(monkeypatch):
@@ -849,146 +837,6 @@ def test_npu_ffn_worker_uses_connector_driven_loop_for_async_connector(monkeypat
     worker._run_ffn_server_loop()
 
     assert calls == [("bind", worker.device), "step", "sync"]
-
-
-def test_npu_ffn_worker_drives_mega_runner_without_device_sync(monkeypatch):
-    worker = _new_ffn_worker()
-    from afd_plugin.v1.worker.npu import ffn_worker
-
-    event = threading.Event()
-    calls: list[str | tuple[str, SimpleNamespace]] = []
-
-    def execute_connector_driven_step():
-        calls.append("step")
-        event.set()
-
-    worker._ffn_shutdown_event = event
-    worker.device = SimpleNamespace(type="cpu")
-    worker.model_runner = object.__new__(ffn_worker.MegaNPUFFNModelRunner)
-    worker.model_runner.execute_connector_driven_step = execute_connector_driven_step
-
-    monkeypatch.setattr(
-        ffn_worker.torch.npu,
-        "set_device",
-        lambda device: calls.append(("bind", device)),
-    )
-    monkeypatch.setattr(
-        ffn_worker.torch.npu, "synchronize", lambda: calls.append("sync")
-    )
-    worker._run_ffn_server_loop()
-
-    # Mega keeps one stream and one completion event per ubatch; a step-wide
-    # fence would serialize the windows it overlaps.
-    assert calls == [("bind", worker.device), "step"]
-
-
-def test_npu_ffn_worker_joins_mega_loop_before_connector_release(monkeypatch):
-    worker = _new_ffn_worker()
-    from afd_plugin.v1.worker.npu import ffn_worker
-
-    worker._ffn_shutdown_event = threading.Event()
-    calls = []
-
-    class _StoppingThread:
-        alive = False
-
-        def join(self, timeout):
-            calls.append(("join", timeout))
-
-        def is_alive(self):
-            return self.alive
-
-    runner = object.__new__(ffn_worker.MegaNPUFFNModelRunner)
-    runner.shutdown = lambda: calls.append("release")
-    worker._ffn_thread = _StoppingThread()
-    worker.model_runner = runner
-
-    worker.stop_ffn_server_loop()
-
-    assert calls == [
-        ("join", ffn_worker.FFN_SHUTDOWN_TIMEOUT_SECONDS),
-        "release",
-    ]
-
-
-def test_npu_ffn_worker_retains_mega_resources_while_step_is_pending(monkeypatch):
-    worker = _new_ffn_worker()
-    from afd_plugin.v1.worker.npu import ffn_worker
-
-    worker._ffn_shutdown_event = threading.Event()
-    calls = []
-
-    class _StoppingThread:
-        def join(self, timeout):
-            calls.append(("join", timeout))
-
-        def is_alive(self):
-            return True
-
-    runner = object.__new__(ffn_worker.MegaNPUFFNModelRunner)
-    runner.shutdown = lambda: calls.append("release")
-    worker._ffn_thread = _StoppingThread()
-    worker.model_runner = runner
-
-    with pytest.raises(RuntimeError, match="retain resources"):
-        worker.stop_ffn_server_loop()
-
-    assert calls == [("join", ffn_worker.FFN_SHUTDOWN_TIMEOUT_SECONDS)]
-
-
-def test_mega_ffn_runner_prepares_layers_before_connector_init():
-    _require_npu_runtime()
-    from afd_plugin.v1.worker.npu.async_mega_ffn_model_runner import (
-        MegaNPUFFNModelRunner,
-    )
-
-    events = []
-
-    class _Connector:
-        is_initialized = False
-        role_rank = 1
-
-        def prepare_layers(self, layers):
-            events.append(("layers", layers))
-
-        def init_afd_connector(self):
-            events.append(("init", None))
-
-    runner = object.__new__(MegaNPUFFNModelRunner)
-    runner.connector = _Connector()
-    layers = {3: (["w1"], ["w2"], ["s1"], ["s2"])}
-
-    def weights(rank):
-        assert rank == 1
-        return layers
-
-    runner.model = SimpleNamespace(get_mega_expert_weights=weights)
-
-    runner.initialize_afd_connector()
-    runner.connector.is_initialized = True
-    runner.initialize_afd_connector()
-
-    assert events == [("layers", layers), ("init", None)]
-
-
-def test_mega_ffn_runner_executes_one_connector_step():
-    _require_npu_runtime()
-    from afd_plugin.v1.worker.npu.async_mega_ffn_model_runner import (
-        MegaNPUFFNModelRunner,
-    )
-
-    steps = []
-
-    class _Connector:
-        def execute_next_experts(self):
-            steps.append("experts")
-
-    runner = object.__new__(MegaNPUFFNModelRunner)
-    runner.connector = _Connector()
-
-    runner.execute_connector_driven_step()
-
-    assert steps == ["experts"]
 
 
 class _LifecycleConnector:

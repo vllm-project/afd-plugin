@@ -49,6 +49,7 @@ POLL_SECONDS = 0.001
 # give up with an explicit error instead of destroying a live ubatch window.
 CLOSE_LOCK_TIMEOUT_SECONDS = 5.0
 CLOSE_DEVICE_TIMEOUT_SECONDS = 5.0
+CLOSE_PEER_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -93,9 +94,7 @@ def validate_mega_config(
         and experts // ffn <= 1024
         and world * (experts // ffn) <= 16384
     ):
-        raise ValueError(
-            f"Invalid Mega split geometry: A={attn}, F={ffn}, E={experts}"
-        )
+        raise ValueError(f"Invalid Mega split geometry: A={attn}, F={ffn}, E={experts}")
     p = config.parallel_config
     if (
         p.data_parallel_size * p.tensor_parallel_size
@@ -189,6 +188,7 @@ class CAMAsyncMegaAFDConnector(AFDConnectorBase):
         # submit once close started.
         self._step_lock = threading.Lock()
         self._closed = False
+        self._shutdown_store: dist.Store | None = None
 
     @property
     def is_initialized(self) -> bool:
@@ -218,6 +218,7 @@ class CAMAsyncMegaAFDConnector(AFDConnectorBase):
         )
         try:
             store = dist.PrefixStore("afd_mega", stores[0])
+            self._shutdown_store = dist.PrefixStore("shutdown", store)
             # FFN TP can differ from Attention TP. Share actual widths and check
             # all explicit declarations before anyone enters buffer collectives.
             attention = self.afd_config.role == "attention"
@@ -416,8 +417,8 @@ class CAMAsyncMegaAFDConnector(AFDConnectorBase):
             self._closed = True
             if self.stages:
                 self._wait_device_idle()
+                self._wait_peer_drain()
             for lane in reversed(self.stages):
-                dist.barrier(group=lane.group)
                 lane.buffer.destroy()
                 dist.destroy_process_group(lane.group)
             self.stages.clear()
@@ -427,6 +428,31 @@ class CAMAsyncMegaAFDConnector(AFDConnectorBase):
             self.layer_slots.clear()
         finally:
             self._step_lock.release()
+
+    def _wait_peer_drain(self) -> None:
+        """Publish local quiescence, then bound peer acknowledgement on the host."""
+        store = self._shutdown_store
+        if store is None:
+            raise RuntimeError("Mega shutdown store is unavailable; retain resources")
+        deadline = time.monotonic() + CLOSE_PEER_TIMEOUT_SECONDS
+        try:
+            # Bound set() too: the Store server itself may have exited. This
+            # connector owns the prefix and uses it only during shutdown.
+            store.set_timeout(timedelta(seconds=CLOSE_PEER_TIMEOUT_SECONDS))
+            store.set(f"drained/{self.world_rank}", "1")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Mega shutdown publication exceeded its deadline")
+            store.wait(
+                [f"drained/{rank}" for rank in range(self.attn_size + self.ffn_size)],
+                timedelta(seconds=remaining),
+            )
+        except (RuntimeError, TimeoutError, OSError) as exc:
+            raise RuntimeError(
+                "Mega peers did not confirm shutdown; retain resources"
+            ) from exc
+        # Retain the Store reference after success so this rank does not drop
+        # the rendezvous server while peers are still reading acknowledgements.
 
     def _wait_device_idle(self) -> None:
         """Wait for submitted work with a deadline; keep the windows on timeout."""
