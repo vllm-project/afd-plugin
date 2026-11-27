@@ -968,6 +968,17 @@ def test_worker_selects_runner_for_connector(ffn_owners, monkeypatch, async_conn
     assert worker.create_npu_ffn_model_runner(config, device) is selected.return_value
 
 
+def test_worker_selects_mega_runner_for_mega_connector(ffn_owners, monkeypatch):
+    _, _, worker = ffn_owners
+    config, device, calls = object(), SimpleNamespace(type="npu", index=3), MagicMock()
+    parsed = SimpleNamespace(connector="CAMAsyncMegaAFDConnector")
+    monkeypatch.setattr(worker, "parse_afd_config", lambda *a, **k: parsed)
+    monkeypatch.setattr(worker, "get_world_group", lambda: SimpleNamespace(rank=7))
+    monkeypatch.setattr(worker.AFDConnectorFactory, "create_connector", calls.connector)
+    monkeypatch.setattr(worker, "MegaNPUFFNModelRunner", calls.mega)
+    assert worker.create_npu_ffn_model_runner(config, device) is calls.mega.return_value
+
+
 @pytest.mark.parametrize("async_connector", [False, True])
 @pytest.mark.parametrize("speculative_tokens", [None, 3])
 def test_ffn_runner_loads_model_and_rejects_second_load(

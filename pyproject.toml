@@ -15,7 +15,10 @@ description = "vLLM external plugin for Attention-FFN Disaggregation (AFD)"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = [
+    "LICENSE",
+    "csrc/npu/ascend_kernels/LICENSE-CANN",
+]
 authors = [{ name = "AFD plugin contributors" }]
 keywords = ["vllm", "afd", "attention", "ffn", "disaggregation", "inference"]
 classifiers = [

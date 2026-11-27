@@ -6,9 +6,10 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable
-from typing import TYPE_CHECKING, NamedTuple
+from typing import NamedTuple, TYPE_CHECKING, cast
 
 from afd_plugin.config import (
+    MEGA_CONNECTOR,
     AFDConfig,
     connector_extra_config_from_source,
     parse_afd_config,
@@ -75,6 +76,21 @@ class AFDConnectorFactory:
             raise ValueError(f"unsupported AFD connector type: {config.connector}")
         connector_cls = cls._registry[config.connector].load_connector()
         role_rank = resolve_role_rank(vllm_config, config)
+        if config.connector == MEGA_CONNECTOR:
+            from afd_plugin.connectors.npu.async_mega import CAMAsyncMegaAFDConnector
+            from afd_plugin.model_executor.models.npu.mega_adapter import (
+                get_mega_model_spec,
+            )
+
+            mega_cls = cast(type[CAMAsyncMegaAFDConnector], connector_cls)
+            return mega_cls(
+                rank,
+                local_rank,
+                vllm_config,
+                config,
+                role_rank,
+                model_spec=get_mega_model_spec(vllm_config),
+            )
         return connector_cls(
             rank,
             local_rank,
@@ -109,6 +125,11 @@ class AFDConnectorFactory:
         )
 
 
+AFDConnectorFactory.register_connector(
+    "CAMAsyncMegaAFDConnector",
+    "afd_plugin.connectors.npu.async_mega",
+    "CAMAsyncMegaAFDConnector",
+)
 AFDConnectorFactory.register_connector(
     "P2pNcclAFDConnector",
     "afd_plugin.connectors.gpu.p2p",

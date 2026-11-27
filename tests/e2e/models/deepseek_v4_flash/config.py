@@ -15,6 +15,7 @@ from typing import NamedTuple
 
 DSV4_ASYNC_CAM_SCENARIO = "afd-dsv4-flash-async-cam-dp2tp4-ep8"
 DSV4_ASYNC_CAM_MEGA_SCENARIO = "afd-dsv4-flash-async-cam-pull-mega-dp2tp4-ep8"
+DSV4_MEGA_SCENARIO = "afd-dsv4-flash-mega-eager-2a2f"
 DSV4_SYNC_CAMP2P_A5_SCENARIO = "afd-dsv4-flash-sync-camp2p-2a2f"
 DSV4_SYNC_CAMP2P_A3_SCENARIO = "afd-dsv4-flash-sync-camp2p-8a8f"
 DSV4_SYNC_CAMP2P_MXFP8_A5_SCENARIO = "afd-dsv4-flash-sync-camp2p-mxfp8-4a4f"
@@ -23,7 +24,11 @@ DSV4_SYNC_CAMP2P_SCENARIOS = (
     DSV4_SYNC_CAMP2P_A3_SCENARIO,
     DSV4_SYNC_CAMP2P_MXFP8_A5_SCENARIO,
 )
-DSV4_SCENARIOS = (DSV4_ASYNC_CAM_SCENARIO, *DSV4_SYNC_CAMP2P_SCENARIOS)
+DSV4_SCENARIOS = (
+    DSV4_ASYNC_CAM_SCENARIO,
+    DSV4_MEGA_SCENARIO,
+    *DSV4_SYNC_CAMP2P_SCENARIOS,
+)
 DSV4_ATTENTION_RANKS = 8
 DSV4_FFN_RANKS = 8
 DSV4_ATTENTION_TP_SIZE = 4
@@ -411,6 +416,21 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "--all2all-backend",
         "allgather_reducescatter",
     ]
+
+
+def configure_mega_scenario(args: argparse.Namespace) -> None:
+    args.afd_connector = "CAMAsyncMegaAFDConnector"
+    args.compute_gate_on_attention = True
+    args.afd_async = True
+    args.afd_connector_extra_config = []
+    _configure_dsv4_arguments(
+        args,
+        None,
+        max_model_len=DSV4_SYNC_A5_MAX_MODEL_LEN,
+        max_num_batched_tokens=DSV4_SYNC_MAX_NUM_BATCHED_TOKENS,
+        memory_utilization=None,
+        multithread_load=False,
+    )
 
 
 def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:

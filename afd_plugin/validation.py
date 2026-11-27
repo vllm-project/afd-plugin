@@ -12,6 +12,7 @@ from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
     CAMP2P_CONNECTOR,
     DEEPEP_M2N_CONNECTORS,
+    MEGA_CONNECTOR,
     AFDConfig,
     parse_afd_config,
 )
@@ -223,7 +224,11 @@ def validate_npu_model_runner_v2_config(
     afd_config = parse_afd_config(vllm_config, expected_role=expected_role)
     if device_type != "npu":
         raise RuntimeError("AFD NPU ModelRunnerV2 requires NPU")
-    if afd_config.connector not in (AFD_ASYNC_CONNECTOR, CAMP2P_CONNECTOR):
+    if afd_config.connector not in (
+        AFD_ASYNC_CONNECTOR,
+        CAMP2P_CONNECTOR,
+        MEGA_CONNECTOR,
+    ):
         raise RuntimeError(
             "AFD NPU ModelRunnerV2 requires either synchronous CAMP2pAFDConnector "
             "or Async CAM",
@@ -274,6 +279,17 @@ def validate_npu_model_runner_v2_config(
                 )
             if parallel.tensor_parallel_size != 1:
                 raise RuntimeError("Async FFN FULL requires F TP=1")
+    elif afd_config.connector == MEGA_CONNECTOR:
+        if (
+            not afd_config.async_dp
+            or not vllm_config.model_config.enforce_eager
+            or not afd_config.compute_gate_on_attention
+        ):
+            raise RuntimeError(
+                "Mega requires eager execution, async DP and Attention routing"
+            )
+        if uses_dbo and not afd_config.is_attention_server:
+            raise RuntimeError("Mega DBO/ubatching requires the Attention role")
     else:
         if (
             uses_dbo

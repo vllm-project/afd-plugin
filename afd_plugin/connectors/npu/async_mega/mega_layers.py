@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+"""Static layer banks and startup agreement for device-selected Mega."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from torch import Tensor
+    from torch.distributed import Store
+
+    LayerWeights = tuple[list[Tensor], list[Tensor], list[Tensor], list[Tensor]]
+
+
+@dataclass(frozen=True)
+class MegaModelSpec:
+    """Model-independent dimensions and activation parameters for Mega kernels."""
+
+    hidden_size: int
+    intermediate_size: int
+    num_experts: int
+    top_k: int
+    activation_parameters: tuple[float, float, float]
+
+
+def pack_layer_weights(weights: Mapping[int, LayerWeights]) -> LayerWeights:
+    """Build layer-major TensorLists without copying weight storage."""
+    if not weights or min(weights) < 0:
+        raise ValueError("Mega requires nonempty, nonnegative layer IDs")
+    ordered = [weights[layer] for layer in sorted(weights)]
+    # expert_weights supplies one stacked tensor per projection per layer.
+    if any(
+        len(layer) != 4 or any(len(part) != 1 for part in layer) for layer in ordered
+    ):
+        raise ValueError("Mega layer banks require stacked expert tensors")
+    columns = [[layer[part][0] for layer in ordered] for part in range(4)]
+    return columns[0], columns[1], columns[2], columns[3]
+
+
+def agree_layer_selection(
+    store: Store,
+    ffn_size: int,
+    ffn_rank: int | None,
+    layer_ids: list[int],
+) -> dict[int, int]:
+    """All A/F ranks adopt the same model-ID to bank-slot map."""
+    if ffn_rank is not None:
+        store.set(f"layers/{ffn_rank}", json.dumps(sorted(layer_ids)))
+    configs = [json.loads(store.get(f"layers/{rank}")) for rank in range(ffn_size)]
+    if any(config != configs[0] for config in configs[1:]):
+        raise ValueError("All Mega FFN ranks must agree on layer IDs")
+    ids = configs[0]
+    if not ids or ids[0] < 0 or len(set(ids)) != len(ids):
+        raise ValueError("Mega requires unique nonnegative FFN layer IDs")
+    return {layer: slot for slot, layer in enumerate(ids)}

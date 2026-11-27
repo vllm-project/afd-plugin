@@ -204,14 +204,14 @@ completes its release when Attention shuts down too. See the
 | CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `GPUFFNRoutedExpertsModelRunner` | `DeepEPM2NAFDConnector` (any `AFDRoutedExpertsConnector`) |
 | CUDA standalone (`ffn_faas`, no Worker) | `DeepEPM2NFFNBackend` | `GPUFFNRoutedExpertsModelRunner` | `DeepEPM2NAFDConnector` |
 | NPU standalone (`ffn_faas`, no Worker) | `CAMFFNBackend` | `AsyncNPUFFNModelRunner` | `CAMAsyncAFDConnector` |
-| NPU | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | `AFDNPUFFNModelRunner` (sync) or `AsyncNPUFFNModelRunner` | `CAMP2pAFDConnector`, `CAMAsyncAFDConnector` |
+| NPU | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | `AFDNPUFFNModelRunner` (sync), `AsyncNPUFFNModelRunner` or `MegaNPUFFNModelRunner` | `CAMP2pAFDConnector`, `CAMAsyncAFDConnector`, `CAMAsyncMegaAFDConnector` |
 
 GPU and NPU FFN runners are independent, connector-driven owners. The CUDA
 FFN worker selects `GPUFFNRoutedExpertsModelRunner` when the connector class
 is an `AFDRoutedExpertsConnector`, and pins vLLM's MoE backend (`auto` becomes
 `triton`; other backends are rejected) before the model is built. Ascend
-selects the synchronous or Async runner in the FFN worker from the connector, with no MRV1
-inheritance or fallback. Native model loading owns weight materialization and
+selects the synchronous, Async or Mega runner in the FFN worker from the connector, with no
+MRV1 inheritance or fallback. Native model loading owns weight materialization and
 quantization postprocessing. The runner explicitly initializes Ascend MC2
 capacity/masks before construction, accounts for loaded memory, executes FFN
 work, and owns its graphs, profiler and cleanup. Request/KV/sampling state
@@ -274,6 +274,8 @@ does not adopt native V2 request state or scheduler-driven execution:
 - Ascend constructs `AFDNPUFFNModelRunner` for CAMP2P or
   `AsyncNPUFFNModelRunner` for Async CAM. Both use the native MRV2
   forward-context shape and install Ascend state in `additional_kwargs`.
+  Mega obtains `MegaNPUFFNModelRunner`, which hands each ready ubatch to the
+  fused connector operator instead of driving a per-layer model forward.
 - Both roles admit V2 topology and features in their Workers before device
   initialization. Runner constructors consume that admission without repeating it;
   communication resources are initialized after model loading.
@@ -297,11 +299,12 @@ describe the pair even though only Attention inherits a native V2 runner.
 
 ## Daemon step selection
 
-The worker selects one of two FFN step paths from the optional
-`connector.control_plane` interface:
+The worker selects the FFN step path from the runner chosen at construction and
+the optional `connector.control_plane` interface:
 
 | Selection state | Connectors | Worker behavior |
 | --- | --- | --- |
+| Mega runner | `CAMAsyncMegaAFDConnector` | Call the runner's single step, which hands the next ready ubatch to the fused dispatch/compute/combine operator. No control plane and no per-step device fence: the connector keeps one stream and one completion event per ubatch, and its close waits for an in-flight step before destroying them. |
 | `control_plane is not None` | `P2pNcclAFDConnector`, `CAMP2pAFDConnector` | Call `control_plane.recv_dp_metadata_list()`, then profile, warm, capture, replay, or execute its stage map. |
 | `control_plane is None` | `CAMAsyncAFDConnector` (NPU only) | Block directly on a connector work item; no separate DP-metadata control plane. |
 
@@ -361,6 +364,11 @@ loop. For each layer, the runner:
    to `AsyncCAMLayeredExecutor`;
 3. returns the routed output and original context with
    `connector.send_ffn_output()`.
+
+The Mega connector uses neither path: the worker calls
+`MegaNPUFFNModelRunner.execute_connector_driven_step()`, which invokes the
+connector's fused dispatch/compute/combine operator for the next ready ubatch
+and returns.
 
 Async eager does not use the synchronous DP-metadata graph cache. Its FULL
 mode captures a complete original DR/FFN/CS transaction with device-side layer
