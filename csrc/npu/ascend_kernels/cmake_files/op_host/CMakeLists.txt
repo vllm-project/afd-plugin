@@ -99,6 +99,21 @@ if(EXISTS "${CANN_ROOT}/include/aclnn")
     list(APPEND CODE_GEN_COMPILE_OPTS -I${CANN_ROOT}/include/aclnn)
 endif()
 
+# ### PATCH START: shared Mega headers and installed CANN OpBase
+set(MEGA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../mega_utils")
+if(EXISTS "${MEGA_ROOT}")
+    set(MEGA_INCLUDES
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${MEGA_ROOT}" "${MEGA_OPBASE_INCLUDE_DIR}")
+    include_directories(${MEGA_INCLUDES})
+    foreach(inc IN LISTS MEGA_INCLUDES)
+        list(APPEND CODE_GEN_COMPILE_OPTS "-I${inc}")
+    endforeach()
+    add_compile_definitions(BUILD_OPEN_PROJECT)
+    list(APPEND CODE_GEN_COMPILE_OPTS -DBUILD_OPEN_PROJECT -std=c++17)
+endif()
+# ### PATCH END: shared Mega headers and installed CANN OpBase
+
 # Collect all host-side source files recursively.
 file(GLOB_RECURSE ops_srcs "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
@@ -176,6 +191,11 @@ target_compile_options(cust_optiling PRIVATE
 # =====================================================
 # Step 5: Register all host-side libraries into the package
 # =====================================================
+if(EXISTS "${MEGA_ROOT}")
+    foreach(target cust_opapi cust_op_proto cust_optiling)
+        target_compile_features(${target} PRIVATE cxx_std_17)
+    endforeach()
+endif()
 npu_op_package_add(${package_name}
     LIBRARY
         cust_optiling

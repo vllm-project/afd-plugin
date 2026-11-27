@@ -54,6 +54,23 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/afd_mega_moe_pull_native.cpp")
     endif()
 endif()
 
+# ### PATCH START: shared Mega headers and installed CANN dependencies
+set(MEGA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../mega_utils")
+if(EXISTS "${MEGA_ROOT}")
+    list(APPEND KERNEL_COMPILE_OPTS -DBUILD_OPEN_PROJECT)
+    foreach(inc "${MEGA_ROOT}" ${MEGA_KERNEL_SDK_INCLUDES})
+        list(APPEND KERNEL_COMPILE_OPTS "-I${inc}")
+    endforeach()
+    # Some SDK simple-kernel targets omit custom_compile_options.ini. The build
+    # driver forwards this exact list to those generated OPC commands as well.
+    set(MEGA_OPC_OPTIONS ${KERNEL_COMPILE_OPTS})
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        list(APPEND MEGA_OPC_OPTIONS -g -O0)
+    endif()
+    file(WRITE "${CMAKE_BINARY_DIR}/mega_kernel_options.txt" "${MEGA_OPC_OPTIONS}")
+endif()
+# ### PATCH END: shared Mega headers and installed CANN dependencies
+
 # set custom compile options (single call to avoid overwriting)
 if ("${CMAKE_BUILD_TYPE}x" STREQUAL "Debugx")
     npu_op_kernel_options("" ALL OPTIONS -g -O0 ${KERNEL_COMPILE_OPTS})
