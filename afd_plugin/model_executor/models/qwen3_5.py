@@ -19,6 +19,7 @@ from afd_plugin.model_executor.models._weight_utils import (
     filter_role_weights,
     layer_weight_path,
 )
+from afd_plugin.model_executor.models.model_utils import reject_unsupported_features
 
 _NO_ROLES: frozenset[str] = frozenset()
 
@@ -27,7 +28,7 @@ def _validate_qwen_text_only(model_config: ModelConfig) -> None:
     """Reject multimodal Qwen execution before constructing the visual path."""
     multimodal_config = model_config.multimodal_config
     if multimodal_config.language_model_only is not True:
-        raise ValueError(
+        raise RuntimeError(
             "AFD Qwen3.5/3.6 currently supports text-only execution only; "
             "pass --language-model-only",
         )
@@ -84,9 +85,6 @@ class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
         # ### PATCH START: construct a remote-experts native MoE shell.
         nn.Module.__init__(self)
         config = vllm_config.model_config.hf_text_config
-        parallel_config = vllm_config.parallel_config
-        if parallel_config.use_sequence_parallel_moe:
-            raise RuntimeError("AFD Qwen3.5/3.6 does not support SP MoE")
 
         self.tp_size = next_native.get_tensor_model_parallel_world_size()
         self.ep_group = next_native.get_ep_group().device_group
@@ -105,7 +103,7 @@ class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
         self.shared_expert = None
         self.shared_expert_gate = None
         # Native Qwen3NextSparseMoeBlock factory arguments, minus local-expert
-        # ones; EPLB and the other local-expert features are rejected there.
+        # ones; build_expert() rejects EPLB and the other local-expert features.
         self.experts = build_expert(
             vllm_config,
             gate=None,
@@ -159,13 +157,11 @@ class AFDQwen3_5DecoderLayer(native.Qwen3_5DecoderLayer):  # noqa: N801
             raise RuntimeError(
                 f"AFD Qwen adapter requires qwen3_5_moe_text, got {config.model_type}",
             )
-        if parallel_config.use_sequence_parallel_moe:
-            raise RuntimeError("AFD Qwen3.5/3.6 does not support SP MoE")
 
         self.layer_type = layer_type
         self.layer_idx = native.extract_layer_index(prefix)
         # Native v0.32.0 derives the MoE reduce-scatter mode from the SP
-        # configuration; AFD rejects SP MoE above, so this is always False.
+        # configuration; the GPU validator rejects SP MoE, so this is False.
         is_moe_layer = config.model_type == "qwen3_5_moe_text"
         self.use_attn_reduce_scatter_for_moe = (
             parallel_config.use_sequence_parallel_moe
@@ -272,14 +268,10 @@ class AFDQwen3_5Model(native.Qwen3_5Model):  # noqa: N801
     # Upstream: vLLM v0.32.0, vllm/model_executor/models/qwen3_5.py
     # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        # ### PATCH START: require the minimal experts boundary.
+        # ### PATCH START: require AFD activation.
         afd_config = parse_optional_afd_config(vllm_config, validate=False)
         if afd_config is None:
             raise RuntimeError("AFD Qwen model requires AFD activation")
-        if vllm_config.parallel_config.use_sequence_parallel_moe:
-            raise RuntimeError("AFD Qwen3.5/3.6 does not support SP MoE")
-        if vllm_config.parallel_config.enable_eplb:
-            raise RuntimeError("AFD Qwen3.5/3.6 does not support EPLB")
         self.afd_config = afd_config
         # ### PATCH END
 
@@ -447,25 +439,13 @@ class AFDQwen3_5MoeForConditionalGeneration(  # noqa: N801
         if afd_config is None:
             raise RuntimeError("AFD Qwen conditional model requires AFD activation")
         if afd_config.compute_gate_on_attention:
-            raise ValueError(
+            raise RuntimeError(
                 "AFD Qwen3.5/3.6 CUDA supports compute_gate_on_attention=False only",
             )
-        if vllm_config.speculative_config is not None:
-            raise ValueError(
-                "AFD Qwen3.5/3.6 CUDA does not support speculative decoding",
-            )
-        if vllm_config.lora_config is not None:
-            raise ValueError("AFD Qwen3.5/3.6 CUDA does not support LoRA")
+        reject_unsupported_features(
+            vllm_config, "Qwen3.5/3.6", "speculative decoding", "LoRA"
+        )
         _validate_qwen_text_only(vllm_config.model_config)
-        parallel_config = vllm_config.parallel_config
-        if parallel_config.use_sequence_parallel_moe:
-            raise ValueError("AFD Qwen3.5/3.6 CUDA does not support SP MoE")
-        if parallel_config.enable_eplb:
-            raise ValueError("AFD Qwen3.5/3.6 CUDA does not support EPLB")
-        if parallel_config.pipeline_parallel_size != 1:
-            raise ValueError(
-                "AFD Qwen3.5/3.6 CUDA supports pipeline_parallel_size=1 only",
-            )
         # ### PATCH END
 
         nn.Module.__init__(self)

@@ -38,6 +38,7 @@ from afd_plugin.model_executor.models._weight_utils import (
     filter_role_weights,
     layer_weight_path,
 )
+from afd_plugin.model_executor.models.model_utils import reject_unsupported_features
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -99,7 +100,6 @@ def _validate_supported_config(
     afd_config: AFDConfig,
 ) -> None:
     """Reject Qwen3 MoE modes not covered by the initial CUDA contract."""
-    parallel_config = vllm_config.parallel_config
     if not current_platform.is_cuda():
         raise RuntimeError("AFD Qwen3 MoE currently supports CUDA only")
     # DeepEP M2N routes on Attention. Its FFN runs only routed experts and
@@ -130,18 +130,9 @@ def _validate_supported_config(
                 f"AFD Qwen3 MoE with {afd_config.connector} does not support "
                 "shared experts (shared_expert_intermediate_size > 0)",
             )
-    if parallel_config.use_sequence_parallel_moe:
-        raise RuntimeError(
-            "AFD Qwen3 MoE does not support sequence-parallel MoE",
-        )
-    if parallel_config.enable_eplb:
-        raise RuntimeError("AFD Qwen3 MoE does not support EPLB")
-    if parallel_config.pipeline_parallel_size != 1:
-        raise RuntimeError("AFD Qwen3 MoE does not support pipeline parallelism")
-    if vllm_config.speculative_config is not None:
-        raise RuntimeError("AFD Qwen3 MoE does not support speculative decoding")
-    if vllm_config.lora_config is not None:
-        raise RuntimeError("AFD Qwen3 MoE does not support LoRA")
+    reject_unsupported_features(
+        vllm_config, "Qwen3 MoE", "speculative decoding", "LoRA"
+    )
 
 
 class AFDQwen3MoeDecoderLayer(native.Qwen3MoeDecoderLayer):

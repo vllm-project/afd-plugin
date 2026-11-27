@@ -275,19 +275,16 @@ def conditional_config(monkeypatch):
     "path,value,message",
     [
         ("afd.compute_gate_on_attention", True, "compute_gate_on_attention=False"),
-        ("config.speculative_config", SimpleNamespace(), "speculative decoding"),
-        ("config.lora_config", SimpleNamespace(), "LoRA"),
+        (
+            "config.speculative_config",
+            SimpleNamespace(),
+            "Qwen3.5/3.6 does not support speculative decoding",
+        ),
+        ("config.lora_config", SimpleNamespace(), "Qwen3.5/3.6 does not support LoRA"),
         (
             "config.model_config.multimodal_config.language_model_only",
             False,
             "pass --language-model-only",
-        ),
-        ("config.parallel_config.use_sequence_parallel_moe", True, "SP MoE"),
-        ("config.parallel_config.enable_eplb", True, "EPLB"),
-        (
-            "config.parallel_config.pipeline_parallel_size",
-            2,
-            "pipeline_parallel_size=1",
         ),
     ],
 )
@@ -300,7 +297,7 @@ def test_qwen_rejects_unsupported_configuration_before_construction(
         target = getattr(target, parent)
     setattr(target, field, value)
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(RuntimeError, match=message):
         adapter.AFDQwen3_5MoeForConditionalGeneration(
             vllm_config=conditional_config.config
         )

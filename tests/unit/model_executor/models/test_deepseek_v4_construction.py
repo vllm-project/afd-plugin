@@ -51,6 +51,7 @@ def _vllm_config(*, layer_count: int = 2):
             enable_jit_warmup=False,
             moe_backend="cutlass",
         ),
+        lora_config=None,
         model_config=SimpleNamespace(hf_config=config, dtype=torch.float16),
         parallel_config=SimpleNamespace(
             enable_eplb=False,
@@ -179,6 +180,19 @@ def test_v4_model_rejects_native_and_flashinfer_mega_backends(
 
     with pytest.raises(RuntimeError, match="does not support MegaMoE"):
         _make_model(monkeypatch, role="ffn", vllm_config=vllm_config)
+
+
+def test_v4_model_rejects_lora_before_construction(monkeypatch):
+    monkeypatch.setattr(
+        adapter.native,
+        "current_platform",
+        SimpleNamespace(device_type="cuda"),
+    )
+    vllm_config = _vllm_config()
+    vllm_config.lora_config = SimpleNamespace()
+
+    with pytest.raises(RuntimeError, match="DeepSeek-V4 does not support LoRA"):
+        _make_model(monkeypatch, role="attention", vllm_config=vllm_config)
 
 
 def test_v4_ffn_model_has_no_head_mhc_parameters(

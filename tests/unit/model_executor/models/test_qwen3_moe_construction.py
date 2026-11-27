@@ -629,27 +629,13 @@ def test_attention_causal_lm_reports_its_remote_moe_blocks_as_native(
 
 
 @pytest.mark.parametrize(
-    ("is_cuda", "afd_config", "parallel_overrides", "message"),
+    ("is_cuda", "afd_config", "message"),
     [
-        (False, AFDConfig(), {}, "CUDA only"),
+        (False, AFDConfig(), "CUDA only"),
         (
             True,
             AFDConfig(compute_gate_on_attention=True),
-            {},
             "compute_gate_on_attention=false",
-        ),
-        (
-            True,
-            AFDConfig(),
-            {"use_sequence_parallel_moe": True},
-            "sequence-parallel MoE",
-        ),
-        (True, AFDConfig(), {"enable_eplb": True}, "EPLB"),
-        (
-            True,
-            AFDConfig(),
-            {"pipeline_parallel_size": 2},
-            "pipeline parallelism",
         ),
     ],
 )
@@ -657,12 +643,9 @@ def test_unsupported_modes_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     is_cuda: bool,
     afd_config: AFDConfig,
-    parallel_overrides: dict[str, int | bool],
     message: str,
 ) -> None:
     vllm_config = _model_config()
-    for name, value in parallel_overrides.items():
-        setattr(vllm_config.parallel_config, name, value)
     monkeypatch.setattr(
         adapter,
         "current_platform",

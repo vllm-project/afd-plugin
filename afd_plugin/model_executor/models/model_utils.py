@@ -18,6 +18,22 @@ _ROUTED_EXPERTS_MODEL_ARCHITECTURES: Final[dict[str, str]] = {
     "Qwen3MoeForCausalLM": "AFDQwen3MoeRoutedExperts",
 }
 
+# No PP, EPLB or SP MoE here: the GPU validator rejects them for every model.
+UnsupportedFeature = Literal["speculative decoding", "LoRA"]
+
+
+def reject_unsupported_features(
+    vllm_config: VllmConfig, model_name: str, *unsupported: UnsupportedFeature
+) -> None:
+    """Reject the vLLM features a model declares unsupported, before construction."""
+    if (
+        "speculative decoding" in unsupported
+        and vllm_config.speculative_config is not None
+    ):
+        raise RuntimeError(f"AFD {model_name} does not support speculative decoding")
+    if "LoRA" in unsupported and vllm_config.lora_config is not None:
+        raise RuntimeError(f"AFD {model_name} does not support LoRA")
+
 
 def has_afd_model_registration(model_config: ModelConfig) -> bool:
     """Return whether the architecture has an AFD registration mapping."""
@@ -37,14 +53,18 @@ def get_afd_model_config(
     """Return a model config that resolves to an AFD model implementation."""
 
     for model_arch in model_config.hf_config.architectures:
+        # Check the AFD alias too; it skips the registration lookup below.
+        if (
+            model_arch.removeprefix("AFD") in _QWEN3_5_MODEL_REGISTRATIONS
+            and device_type != "cuda"
+        ):
+            raise ValueError(
+                "AFD Qwen3.5/3.6 supports CUDA execution only; "
+                f"got device_type={device_type!r}",
+            )
         if model_arch in _MODEL_REGISTRATIONS:
             if model_arch == "DSparkDraftModel" and device_type != "npu":
                 raise ValueError("AFD DSpark currently supports only the NPU backend")
-            if model_arch in _QWEN3_5_MODEL_REGISTRATIONS and device_type != "cuda":
-                raise ValueError(
-                    "AFD Qwen3.5/3.6 supports CUDA execution only; "
-                    f"got device_type={device_type!r}",
-                )
             # deepcopy preserves aliasing within the copied object graph, so
             # the pure-text identity hf_text_config is hf_config is retained
             # automatically. vLLM Ascend uses that identity to distinguish

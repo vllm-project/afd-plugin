@@ -207,6 +207,16 @@ The full AFD model remains decorated with vLLM's compile support. Backend-only
 helpers are imported inside the NPU path so CUDA model import does not require
 vLLM-Ascend.
 
+On CUDA, each model passes the vLLM features it doesn't support to
+`reject_unsupported_features()` in
+[`model_utils.py`](../../../afd_plugin/model_executor/models/model_utils.py),
+which rejects them before construction with the same message for every model:
+speculative decoding and LoRA for the DeepSeek V2/V3 family, Qwen3 MoE and
+Qwen3.5/3.6, and LoRA for DeepSeek V4, whose Attention keeps the MTP hidden
+states. `validate_gpu_model_runner_v2_config` already rejects pipeline
+parallelism, EPLB and the `use_sequence_parallel_moe` config flag for every GPU
+model at Worker startup, so the shared check leaves them out.
+
 ### DeepSeek V4 CUDA boundary
 
 `AFDDeepseekV4ForCausalLM` wraps vLLM's NVIDIA DeepSeek V4 implementation and
@@ -229,7 +239,8 @@ other layer-local and mHC head parameters on Attention; common non-layer paths
 remain available to both roles for the native loader lifecycle. The adapter is
 CUDA-only and requires synchronous `P2pNcclAFDConnector`,
 `compute_gate_on_attention=false`, and pipeline-parallel size 1. It rejects
-sequence-parallel MoE, EPLB, and the `deep_gemm_mega_moe` backend. The P2P
+LoRA and the `deep_gemm_mega_moe` backend, and the GPU validator rejects
+sequence-parallel MoE and EPLB. The P2P
 connector validates one-dimensional `torch.int32` input IDs and preallocates
 their receive buffers for graph execution. See the
 [runtime matrix](../../support.md#tested-runtime-matrix) for tested
@@ -299,9 +310,9 @@ sequence-parallel, as in DeepSeek's M2N row: each TP rank sends its slice of
 the tokens, with the padding rows unrouted, and the TP group then all-gathers
 the output. Native weight loading follows role-based filtering.
 
-Both paths are CUDA-only and reject the `use_sequence_parallel_moe` config
-flag, EPLB, pipeline parallelism, speculative decoding, and LoRA during
-construction.
+Both paths are CUDA-only and reject speculative decoding and LoRA during
+construction. The GPU validator rejects the `use_sequence_parallel_moe` config
+flag, EPLB and pipeline parallelism before that.
 
 ### Qwen3.5/3.6 MoE CUDA boundary
 
@@ -314,11 +325,11 @@ gate, routed experts, shared expert, and shared-expert gate.
 
 This path is CUDA-only, text-only, and requires `--language-model-only`,
 `compute_gate_on_attention=false`, and `pipeline_parallel_size=1`. It rejects
-multimodal execution, sequence-parallel MoE, EPLB, speculative decoding, and
-LoRA before language-model construction; NPU model-config resolution fails
-before model loading. GDN DBO is unsupported under native hybrid/multimodal
-DBO validation; ordinary eager and graph execution remain supported. The
-2A1F suite keeps static EP and PP1. Attention-side router transport, async
+multimodal execution, speculative decoding, and LoRA before language-model
+construction, and the GPU validator rejects sequence-parallel MoE and EPLB;
+NPU model-config resolution fails before model loading. GDN DBO is
+unsupported under native hybrid/multimodal DBO validation; ordinary eager and
+graph execution remain supported. The 2A1F suite keeps static EP and PP1. Attention-side router transport, async
 communication, multi-node, quantization, and performance remain outside the
 validated scope.
 

@@ -28,6 +28,7 @@ from afd_plugin.model_executor.models._weight_utils import (
     filter_role_weights,
     layer_weight_path,
 )
+from afd_plugin.model_executor.models.model_utils import reject_unsupported_features
 
 
 def _checkpoint_weight_roles(name: str) -> frozenset[str]:
@@ -263,13 +264,8 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
             raise RuntimeError(
                 "AFD DeepSeek-V4 does not support compute_gate_on_attention",
             )
-        parallel_config = vllm_config.parallel_config
-        if parallel_config.pipeline_parallel_size != 1:
-            raise RuntimeError("AFD DeepSeek-V4 does not support PP")
-        if parallel_config.use_sequence_parallel_moe:
-            raise RuntimeError("AFD DeepSeek-V4 does not support SP MoE")
-        if parallel_config.enable_eplb:
-            raise RuntimeError("AFD DeepSeek-V4 does not support EPLB")
+        # Speculative decoding is allowed: Attention keeps the MTP hidden states.
+        reject_unsupported_features(vllm_config, "DeepSeek-V4", "LoRA")
         # ### PATCH END
 
         config = vllm_config.model_config.hf_config
