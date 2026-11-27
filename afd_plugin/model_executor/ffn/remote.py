@@ -5,7 +5,6 @@ runners; no concrete model imports."""
 
 from __future__ import annotations
 
-import importlib
 import math
 from typing import Any
 
@@ -36,9 +35,13 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 
-from afd_plugin.config import parse_afd_config
+from afd_plugin.config import (
+    AFD_ASYNC_CONNECTOR,
+    CAMP2P_CONNECTOR,
+    DEEPEP_M2N_CONNECTOR,
+    parse_afd_config,
+)
 from afd_plugin.connectors import (
-    AFDConnectorFactory,
     AFDForwardContextMetadata,
     AFDTransferContext,
     AFDTransferMetadata,
@@ -378,20 +381,10 @@ def build_expert(
     ``moe_kwargs`` are the native model's ``FusedMoEFactory`` arguments. Pass
     the model's gate exactly when ``compute_gate_on_attention`` is set.
     CUDA runners apply it. CAM receives routes selected by the model. Pass
-    shared experts to the native runner for DeepEP M2N. The connector selects
-    the runner. Its routed experts register with vLLM and allocate no weights.
+    shared experts to the native runner for DeepEP M2N. Select the runner for
+    this device and transport when constructing the weightless experts.
     """
     afd_config = parse_afd_config(vllm_config, validate=False)
-    device_type = current_platform.device_type
-    runner_path = AFDConnectorFactory.get_attention_moe_runner(
-        afd_config.connector, device_type
-    )
-    if runner_path is None:
-        placement = (device_type, afd_config.connector)
-        raise ValueError(
-            f"unsupported Attention remote MoE configuration: {placement!r}",
-        )
-    runner_module, runner_class = runner_path
     if (gate is not None) != afd_config.compute_gate_on_attention:
         raise ValueError(
             "Attention remote MoE takes the model's gate if and only if "
@@ -415,15 +408,34 @@ def build_expert(
     ):
         raise ValueError("routed_scaling_factor must be finite")
 
+    connector = afd_config.connector
+    device_type = current_platform.device_type
     routed_experts_cls: type[RoutedExperts] = AFDRemoteRoutedExperts
-    if device_type == "npu":
+    runner_cls: type[MoERunner]
+    if device_type == "cuda" and connector == "P2pNcclAFDConnector":
+        runner_cls = AFDRemoteMoERunner
+    elif device_type == "cuda" and connector == DEEPEP_M2N_CONNECTOR:
+        runner_cls = AFDRoutedExpertsMoERunner
+    elif device_type == "npu" and connector in (CAMP2P_CONNECTOR, AFD_ASYNC_CONNECTOR):
         from afd_plugin.model_executor.ffn.npu.remote import (
             AFDAscendRemoteRoutedExperts,
+            AFDAsyncCAMMoERunner,
+            AFDCAMP2PMoERunner,
         )
 
+        runner_cls = (
+            AFDCAMP2PMoERunner
+            if connector == CAMP2P_CONNECTOR
+            else AFDAsyncCAMMoERunner
+        )
         routed_experts_cls = AFDAscendRemoteRoutedExperts
         # CAM consumes preselected routes. Keep the gate's single checkpoint name.
         gate = None
+    else:
+        placement = (device_type, connector)
+        raise ValueError(
+            f"unsupported Attention remote MoE configuration: {placement!r}",
+        )
 
     # A parameter-free container: no local quantized weights, transforms or
     # EPLB, and unit TP/DP/PCP sizes, so no expert sharding. vLLM's runner
@@ -445,7 +457,7 @@ def build_expert(
         "tp_size": 1,
         "dp_size": 1,
         "pcp_size": 1,
-        "runner_cls": getattr(importlib.import_module(runner_module), runner_class),
+        "runner_cls": runner_cls,
         "runner_args": (
             {"transport_layer_idx": transport_layer_idx}
             if transport_layer_idx is not None

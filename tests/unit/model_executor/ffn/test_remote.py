@@ -21,7 +21,6 @@ from vllm.model_executor.model_loader.utils import (  # noqa: E402
 from vllm.v1.worker import ubatching  # noqa: E402
 
 from afd_plugin.config import CAMP2P_CONNECTOR, DEEPEP_M2N_CONNECTOR  # noqa: E402
-from afd_plugin.connectors import AFDConnectorFactory  # noqa: E402
 from afd_plugin.model_executor.ffn import remote  # noqa: E402
 from tests.unit.fakes.connector import (  # noqa: E402
     ProxyConnector,
@@ -84,19 +83,6 @@ def _build_runner(monkeypatch, config, *, device_type="cuda", gate=None, **kwarg
             prefix=PREFIX,
             **kwargs,
         )
-
-
-class _RegisteredRunner(remote.AFDRemoteMoERunner):
-    """A runner a test connector registers; it marks its output."""
-
-    def forward(
-        self,
-        hidden_states,
-        router_logits,
-        input_ids=None,
-        shared_experts_input=None,
-    ):
-        return hidden_states + 1
 
 
 class _InPlaceCombineConnector(ProxyConnector):
@@ -197,42 +183,19 @@ def test_runner_stays_weightless_and_fails_on_expert_checkpoints(
         ("cuda", "CAMAsyncAFDConnector"),
         ("npu", "P2pNcclAFDConnector"),
         ("cpu", "P2pNcclAFDConnector"),
+        ("cuda", "UnmappedConnector"),
     ],
 )
 def test_factory_rejects_unsupported_placement_before_registration(
     monkeypatch, device_type, connector
 ):
-    """A connector's registration must provide a runner for the active device."""
+    """Reject unsupported device/transport pairs before registering a vLLM layer."""
     config = attention_moe_vllm_config(connector=connector)
 
     with pytest.raises(ValueError, match="unsupported Attention remote MoE"):
         _build_runner(monkeypatch, config, device_type=device_type)
 
     assert config.compilation_config.static_forward_context == {}
-
-
-def test_factory_builds_the_runner_its_connector_registers(monkeypatch):
-    """The factory builds the runner class the configured connector names.
-
-    Why: each connector picks its Attention-side MoE runner, so every model
-    builds its experts with the same call whatever the connector.
-    """
-    monkeypatch.setattr(
-        AFDConnectorFactory, "_registry", dict(AFDConnectorFactory._registry)
-    )
-    AFDConnectorFactory.register_connector(
-        "RegisteredRunnerConnector",
-        "afd_plugin.connectors.gpu.p2p",
-        "P2pNcclAFDConnector",
-        attention_moe_runner=(__name__, _RegisteredRunner.__name__),
-    )
-    config = attention_moe_vllm_config(connector="RegisteredRunnerConnector")
-    runner = _build_runner(monkeypatch, config)
-    hidden_states = _hidden_states(2)
-
-    output = runner(hidden_states=hidden_states, router_logits=hidden_states)
-
-    assert torch.equal(output, hidden_states + 1)
 
 
 @pytest.mark.parametrize(
