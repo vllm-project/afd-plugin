@@ -142,7 +142,7 @@ AFDConnectorFactory.register_connector(
     "afd_plugin.connectors.npu.camp2p",
     "CAMP2pAFDConnector",
     attention_moe_runner=(
-        "afd_plugin.model_executor.ffn.npu.cam_runner",
+        "afd_plugin.model_executor.ffn.remote",
         "AFDCAMP2PMoERunner",
     ),
     attention_moe_device="npu",
@@ -152,7 +152,7 @@ AFDConnectorFactory.register_connector(
     "afd_plugin.connectors.npu.async_cam",
     "CAMAsyncAFDConnector",
     attention_moe_runner=(
-        "afd_plugin.model_executor.ffn.npu.cam_runner",
+        "afd_plugin.model_executor.ffn.remote",
         "AFDAsyncCAMMoERunner",
     ),
     attention_moe_device="npu",
