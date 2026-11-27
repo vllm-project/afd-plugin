@@ -550,3 +550,41 @@ optional control-plane split. Connector metadata ownership, transfer state
 separation, and the public shape of the connector work-item interface remain
 open in [#88](https://github.com/JiusiServe/afd-plugin/issues/88) and
 [#105](https://github.com/JiusiServe/afd-plugin/issues/105).
+
+
+## Optional MegaFFN Service Graph binding
+
+`AsyncNPUFFNModelRunner.build_megaffn_service(owner, config, group_name,
+operator_library=...)` binds an external MegaKernel service runtime after model
+loading and before `initialize_afd_connector()`. The caller owns communication
+initialization and supplies the validated owner, layer directory and operator
+library; this is a programmatic integration point, not a new CLI backend.
+
+The binding passes loaded BF16 W13/W2 matrices to MegaKernel's
+`build_service_weights`, which constructs its layer-major WeightBank. It requires
+Eager execution, static routed-only SwiGLU experts and no draft model. Shared
+experts, dynamic EPLB and unbound CAM Pull retirement are rejected.
+
+Each F-side transaction calls `submit_service()` once. The service graph owns
+Poll, DispatchRecv, planning, quantization, expert compute and CombineSend;
+AFD does not repeat receive/send outside the graph. This is a finite service
+epoch submitted by Host, not an autonomous Device loop. Persistent startup is
+performed once after connector initialization. The worker joins its receive loop
+before stopping the persistent runtime and closing communication resources.
+Device-wide synchronization is omitted because the daemon remains resident;
+`submit_service()` must wait for and validate its own finite epoch completion.
+
+MegaKernel must provide `CamServiceConfig`, `MegaFfnRunner` service methods and
+`build_service_weights`; it is loaded lazily and is not bundled with AFD.
+`tests/e2e/operators/megaffn_service_local.py` uses the MR837 local transport
+fixtures with real Device computation and deterministic per-layer expert weights.
+It requires the external fixture library, its verified build manifest and the
+Ascend950 BF16 connector support from PR #628. With that environment activated:
+
+```bash
+python tests/e2e/operators/megaffn_service_local.py \
+  --home "$MR837_TEST_OUTPUT" --layers 3 --output service-result.json
+```
+
+This harness is not a cross-card communication test or a `vllm serve` launcher.
+Production DR/CS bindings remain the communication operator team's responsibility.

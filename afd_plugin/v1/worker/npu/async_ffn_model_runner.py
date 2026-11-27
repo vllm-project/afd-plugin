@@ -40,6 +40,8 @@ from afd_plugin.model_executor.ffn.npu.expert_weights import (
 from afd_plugin.validation import cam_receive_capacity
 
 if TYPE_CHECKING:
+    from blockrt.models.mega_ffn.cam_service import CamServiceConfig
+    from blockrt.models.mega_ffn.ffn_runtime import MegaFfnRunner
     from vllm.config import VllmConfig
     from vllm.tasks import SupportedTask
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
@@ -50,6 +52,7 @@ logger = init_logger(__name__)
 
 class FFNModel(Protocol):
     def get_experts_layer_indices(self) -> tuple[int, ...]: ...
+    def get_mxfp_expert_layers(self) -> dict[int, torch.nn.Module]: ...
     def get_quantized_expert_weights(
         self,
     ) -> tuple[list[QuantizedExpertWeights], str]: ...
@@ -59,6 +62,7 @@ class AsyncNPUFFNModelRunner:
     """Run Async FFN after Worker or standalone harness deployment admission."""
 
     afd_expected_role = "ffn"
+    _service_runner: MegaFfnRunner | None = None
 
     def __init__(
         self,
@@ -98,6 +102,88 @@ class AsyncNPUFFNModelRunner:
             raise ValueError("model parameter size must be nonnegative")
         self.model = model
         self.model_memory_usage = parameter_bytes
+
+    def build_megaffn_service(
+        self,
+        owner,
+        config: CamServiceConfig,
+        group_name: str,
+        *,
+        operator_library=None,
+    ) -> None:
+        """Bind loaded experts and a communication-team-owned service graph.
+
+        A test harness may provide local communication windows. This method
+        neither creates nor interprets communication Context/Active contents.
+        """
+        from blockrt.models.mega_ffn.ffn_args import MegaFfnArgs
+        from blockrt.models.mega_ffn.ffn_runtime import MegaFfnRunner
+        from blockrt.models.mega_ffn.weight_loader import build_service_weights
+
+        if (
+            self.model is None
+            or self.connector.is_initialized
+            or self._service_runner is not None
+        ):
+            raise RuntimeError(
+                "Build one MegaFFN service after model load and before CAM startup"
+            )
+        if self.requested_mode != "eager" or self.draft_model is not None:
+            raise ValueError("MegaFFN service requires eager AFD without a draft model")
+        if self.session.requires_drain:
+            raise ValueError(
+                "MegaFFN service needs a CAM Pull retirement binding before use"
+            )
+        layers = self.model.get_mxfp_expert_layers()
+        if tuple(sorted(layers)) != config.layer_ids:
+            raise ValueError("MegaFFN layer directory differs from loaded model layers")
+        matrices = {}
+        for layer in config.layer_ids:
+            experts = layers[layer].experts
+            routed, moe = experts.routed_experts, experts.moe_config
+            if (
+                routed.dynamic_eplb
+                or experts._shared_experts is not None
+                or routed.activation.value != "silu"
+                or moe.swiglu_limit not in (None, 0)
+                or moe.swiglu_alpha not in (None, 1)
+                or moe.swiglu_beta not in (None, 0)
+                or moe.activation_situ_beta is not None
+                or moe.activation_situ_linear_beta is not None
+            ):
+                raise ValueError(
+                    "MegaFFN service requires static routed-only SwiGLU experts"
+                )
+            if routed.w13_weight.device != self.device:
+                raise ValueError(
+                    "Loaded experts and MegaFFN worker must share one device"
+                )
+            matrices[layer] = (routed.w13_weight, routed.w2_weight)
+        w13, w2 = next(iter(matrices.values()))
+        args = MegaFfnArgs(
+            hidden_size=w13.shape[1],
+            moe_intermediate_size=w2.shape[1],
+            n_routed_experts=config.local_experts,
+            num_experts_per_tok=owner.cfg["num_topk"],
+            routed_scaling_factor=1.0,
+        )
+        weights = build_service_weights(args, matrices, rank_idx=owner.cfg["recv_rank"])
+        args.n_routed_experts = config.groups
+        service = MegaFfnRunner(args, device_id=self.device.index)
+        self._service_runner = service
+        try:
+            service.build_graph(
+                mode="service",
+                persistent=True,
+                owner=owner,
+                weights=weights,
+                config=config,
+                group_name=group_name,
+                operator_library=operator_library,
+            )
+        except Exception as exc:
+            self._failure = exc
+            raise
 
     def mark_receiver_exited(self) -> None:
         """Allow release only after the owner joined a successful receive loop."""
@@ -199,6 +285,8 @@ class AsyncNPUFFNModelRunner:
                     self.connector.comm_args, self.connector.group_name
                 )
             self.effective_mode = self.connector.graph_startup.mode
+            if self._service_runner is not None:
+                self._service_runner.start_persistent()
             if self.effective_mode == "full":
                 chunks = self.connector.graph_startup_chunks() * (
                     self.connector.attn_size // self.connector.tp_size
@@ -319,6 +407,17 @@ class AsyncNPUFFNModelRunner:
 
     def _initialize_ffn_executor(self) -> str:
         assert self.model is not None
+        if self._service_runner is not None:
+            service = self._service_runner
+            if service.model.config.layer_ids != self.layer_ids:
+                raise ValueError(
+                    "MegaFFN layer directory differs from loaded model layers"
+                )
+            weights = service.model.weights
+            return (
+                f"megaffn_service:{self.layer_ids}:{weights.hidden}:"
+                f"{weights.intermediate}:{service.args.n_routed_experts}"
+            )
         layers, reason = self.model.get_quantized_expert_weights()
         if not layers:
             raise ValueError(f"layered GMM target weights are unsupported: {reason}")
@@ -387,7 +486,8 @@ class AsyncNPUFFNModelRunner:
             self._complete_graph()
         else:
             self._ffn_forward_connector_driven(single=True)
-            torch.npu.synchronize()
+            if not self.uses_megaffn_service:
+                torch.npu.synchronize()
             self.session.after_step()
 
     def _ffn_forward_connector_driven(
@@ -396,6 +496,8 @@ class AsyncNPUFFNModelRunner:
         single: bool = False,
     ) -> torch.Tensor | None:
         assert self.model is not None
+        if self._service_runner is not None:
+            return self._run_ffn_transaction()
         rank_ffn_output = None
         for _ in self.layer_ids[:1] if single else self.layer_ids:
             rank_ffn_output = self._run_ffn_transaction()
@@ -404,6 +506,12 @@ class AsyncNPUFFNModelRunner:
     def _run_ffn_transaction(
         self, *, retained_tensors: list[torch.Tensor] | None = None
     ) -> torch.Tensor:
+        if self._service_runner is not None:
+            try:
+                return self._service_runner.submit_service()
+            except Exception as exc:
+                self._failure = exc
+                raise
         if self._mega_executor is not None:
             return self._mega_executor()
         assert self._layered_executor is not None
@@ -426,6 +534,10 @@ class AsyncNPUFFNModelRunner:
             self._graph_output = output
         self.connector.send_ffn_output(output, payload.context)
         return output
+
+    @property
+    def uses_megaffn_service(self) -> bool:
+        return self._service_runner is not None
 
     @property
     def receiver_exited(self) -> bool:
@@ -453,15 +565,20 @@ class AsyncNPUFFNModelRunner:
             raise RuntimeError(
                 "Failed graph startup retains resources"
             ) from self._failure
-        if self.session.requires_drain and not self._graph_receiver_exited:
+        if (
+            self.session.requires_drain or self.uses_megaffn_service
+        ) and not self._graph_receiver_exited:
             raise RuntimeError("Receiver has not exited; retain resources")
         from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 
         if self._graph is not None:
             self.session.validate_shutdown()
             self._close_graph()
+        if self._service_runner is not None:
+            self._service_runner.stop_persistent()
         stop_afd_npu_profiler(self.prof)
         self.connector.close()
+        self._service_runner = None
         self._mega_executor = None
         self._layered_executor = None
         free_before_shutdown(self.vllm_config)

@@ -216,7 +216,10 @@ class AFDNPUFFNWorker(NPUWorker):
             # The runner consults the session once per step; a second
             # predicate here would add Store round trips to the Pull hot path.
             while self.model_runner.execute_connector_driven_step(event.is_set()):
-                if self.model_runner.effective_mode == "eager":
+                if (
+                    self.model_runner.effective_mode == "eager"
+                    and not self.model_runner.uses_megaffn_service
+                ):
                     torch.npu.synchronize()
             self.model_runner.drain()
             self.model_runner.session.finish_receiver()
@@ -245,6 +248,7 @@ class AFDNPUFFNWorker(NPUWorker):
         return isinstance(self.model_runner, AsyncNPUFFNModelRunner) and (
             self.model_runner.effective_mode == "full"
             or self.model_runner.session.requires_drain
+            or self.model_runner.uses_megaffn_service
         )
 
     def raise_ffn_loop_error_if_any(self) -> None:

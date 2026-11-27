@@ -12,7 +12,7 @@ import threading
 import weakref
 from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, Mock, call
 
 import pytest
 
@@ -28,9 +28,12 @@ from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup import (
 from afd_plugin.validation import validate_npu_model_runner_v2_config
 from tests.unit.fakes.async_cam_startup import MemoryStore, startup_world
 from tests.unit.fakes.async_ffn import (
+    fake_megaffn_service,
     load_async_modules,
     load_host_module,
+    service_model,
 )
+from tests.unit.fakes.connector import FakeFFNSession
 from tests.unit.fakes.graph import Graph
 from tests.unit.fakes.vllm_config import npu_dspark_config, npu_vllm_config
 
@@ -1210,3 +1213,144 @@ def test_runner_shutdown_retains_model_and_communication_on_unsafe_session(
         runner.shutdown()
     assert runner.get_model() is model
     assert connector.is_initialized and connector.comm_args is resource
+
+
+@pytest.fixture
+def service_worker(ffn_owners, monkeypatch, request):
+    persistent = request.param
+    _, runtime, module = ffn_owners
+    events = []
+    runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
+    runner.effective_mode = "eager"
+    runner._service_runner = object() if persistent else None
+    runner.session = SimpleNamespace(
+        requires_drain=False, finish_receiver=lambda: events.append("finished")
+    )
+    serving = iter((True, True, False))
+    runner.execute_connector_driven_step = lambda stop: next(serving)
+    runner.drain = lambda: events.append("drain")
+    runner.shutdown = lambda: events.append("shutdown")
+    runner.connector = SimpleNamespace(close=lambda: events.append("close"))
+    worker = module.AFDNPUFFNWorker.__new__(module.AFDNPUFFNWorker)
+    worker.model_runner, worker.device = runner, "npu:2"
+    worker._ffn_shutdown_event = threading.Event()
+    worker._ffn_loop_error = None
+    worker._ffn_thread = SimpleNamespace(
+        join=lambda **kw: events.append("join"), is_alive=lambda: False
+    )
+    monkeypatch.setattr(
+        runtime.torch.npu, "synchronize", lambda: events.append("fence")
+    )
+    return worker, events, persistent
+
+
+@pytest.mark.parametrize("service_worker", [False, True], indirect=True)
+def test_service_worker_avoids_device_wide_fence_and_closes_after_join(service_worker):
+    worker, events, persistent = service_worker
+    worker._run_ffn_server_loop()
+    worker.stop_ffn_server_loop()
+    if persistent:
+        assert events == ["drain", "finished", "join", "shutdown"]
+    else:
+        assert events == ["fence", "fence", "drain", "finished", "close", "join"]
+
+
+@pytest.fixture
+def service_runner(monkeypatch):
+    _, _, module = load_async_modules(monkeypatch)
+    from afd_plugin.connectors.npu.async_cam_runtime.async_cam_startup import (
+        AsyncCAMGraphStartup,
+        resolve_ffn_mode,
+    )
+
+    events = []
+    connector = SimpleNamespace(
+        is_initialized=False,
+        dynamic_quant=0,
+        graph_startup=AsyncCAMGraphStartup(2, 2, 3),
+        ffn_session=FakeFFNSession,
+        recv_attn_output=Mock(side_effect=AssertionError("external DR")),
+        send_ffn_output=Mock(side_effect=AssertionError("external CS")),
+        close=lambda: events.append("close"),
+    )
+
+    def initialize():
+        connector.graph_startup.mode = resolve_ffn_mode([connector.graph_startup.plan])
+        connector.is_initialized = True
+
+    connector.init_afd_connector = initialize
+    cfg = npu_vllm_config(
+        role="ffn",
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+    )
+    cfg.model_config.enforce_eager = True
+    runner = module.AsyncNPUFFNModelRunner(cfg, SimpleNamespace(index=2), connector)
+    runner.attach_model(service_model(runner.device), parameter_bytes=0)
+    service = fake_megaffn_service(monkeypatch, events)
+    runner.build_megaffn_service(
+        SimpleNamespace(cfg={"num_topk": 2, "recv_rank": 0}),
+        SimpleNamespace(layer_ids=(0, 1, 2), local_experts=2, groups=6),
+        "test-local",
+    )
+    return runner, connector, service, events
+
+
+def test_service_submits_one_epoch_per_step_without_external_dr_cs(service_runner):
+    runner, connector, _, events = service_runner
+    runner.initialize_afd_connector()
+    for _ in range(4):
+        assert runner.execute_connector_driven_step()
+    runner.mark_receiver_exited()
+    runner.shutdown()
+    runner.shutdown()
+    assert events == ["start", "epoch", "epoch", "epoch", "epoch", "stop", "close"]
+    connector.recv_attn_output.assert_not_called()
+    connector.send_ffn_output.assert_not_called()
+
+
+def test_service_stop_failure_retains_communication_and_model(service_runner):
+    runner, _, service, events = service_runner
+    runner.initialize_afd_connector()
+    model = runner.get_model()
+    service.stop_persistent = Mock(side_effect=RuntimeError("stop failed"))
+    runner.mark_receiver_exited()
+    with pytest.raises(RuntimeError, match="stop failed"):
+        runner.shutdown()
+    assert runner.get_model() is model
+    assert "close" not in events
+
+
+def test_service_failure_is_not_followed_by_resource_release(service_runner):
+    runner, _, service, events = service_runner
+    runner.initialize_afd_connector()
+    service.submit_service = Mock(side_effect=RuntimeError("epoch failed"))
+    with pytest.raises(RuntimeError, match="epoch failed"):
+        runner.execute_connector_driven_step()
+    with pytest.raises(RuntimeError, match="retains resources"):
+        runner.shutdown()
+    assert "close" not in events
+
+
+def test_service_drain_epoch_does_not_fence_persistent_daemon(
+    service_runner, monkeypatch
+):
+    runner, _, _, events = service_runner
+    runner.initialize_afd_connector()
+    import torch
+
+    monkeypatch.setattr(
+        torch.npu, "synchronize", Mock(side_effect=AssertionError("daemon fence"))
+    )
+    runner.session.drain = lambda run_one: run_one()
+    runner.drain()
+    assert events == ["start", "epoch"]
+
+
+def test_service_rejects_unbound_pull_retirement(service_runner):
+    runner, _, _, _ = service_runner
+    runner._service_runner = None
+    runner.session.requires_drain = True
+    with pytest.raises(ValueError, match="Pull"):
+        runner.build_megaffn_service(None, None, "test")
