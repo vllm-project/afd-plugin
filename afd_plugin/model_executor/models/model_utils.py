@@ -53,14 +53,18 @@ def get_afd_model_config(
     """Return a model config that resolves to an AFD model implementation."""
 
     for model_arch in model_config.hf_config.architectures:
+        # Check the AFD alias too; it skips the registration lookup below.
+        if (
+            model_arch.removeprefix("AFD") in _QWEN3_5_MODEL_REGISTRATIONS
+            and device_type != "cuda"
+        ):
+            raise ValueError(
+                "AFD Qwen3.5/3.6 supports CUDA execution only; "
+                f"got device_type={device_type!r}",
+            )
         if model_arch in _MODEL_REGISTRATIONS:
             if model_arch == "DSparkDraftModel" and device_type != "npu":
                 raise ValueError("AFD DSpark currently supports only the NPU backend")
-            if model_arch in _QWEN3_5_MODEL_REGISTRATIONS and device_type != "cuda":
-                raise ValueError(
-                    "AFD Qwen3.5/3.6 supports CUDA execution only; "
-                    f"got device_type={device_type!r}",
-                )
             # deepcopy preserves aliasing within the copied object graph, so
             # the pure-text identity hf_text_config is hf_config is retained
             # automatically. vLLM Ascend uses that identity to distinguish

@@ -128,13 +128,17 @@ def test_model_config_preserves_unregistered_architecture(model_utils):
     assert model_utils.get_afd_model_config(original, device_type="cuda") is original
 
 
-def test_model_config_rejects_qwen_on_npu_without_mutation(model_utils):
-    hf_config = SimpleNamespace(architectures=["Qwen3_5MoeForConditionalGeneration"])
+@pytest.mark.parametrize(
+    "architecture",
+    ["Qwen3_5MoeForConditionalGeneration", "AFDQwen3_5MoeForConditionalGeneration"],
+)
+def test_model_config_rejects_qwen_on_npu_without_mutation(model_utils, architecture):
+    hf_config = SimpleNamespace(architectures=[architecture])
     with pytest.raises(ValueError, match="Qwen3.5/3.6 supports CUDA execution only"):
         model_utils.get_afd_model_config(
             SimpleNamespace(hf_config=hf_config), device_type="npu"
         )
-    assert hf_config.architectures == ["Qwen3_5MoeForConditionalGeneration"]
+    assert hf_config.architectures == [architecture]
 
 
 @pytest.mark.parametrize(
