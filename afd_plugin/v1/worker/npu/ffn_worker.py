@@ -34,7 +34,7 @@ from afd_plugin.compat.npu import (
     npu_afd_num_ubatches,
 )
 from afd_plugin.compat.npu.ops import ensure_afd_async_ops_available
-from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
+from afd_plugin.config import AFD_ASYNC_CONNECTOR, MEGA_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
 from afd_plugin.model_executor.models.model_utils import (
@@ -42,6 +42,7 @@ from afd_plugin.model_executor.models.model_utils import (
     get_afd_model_config,
 )
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
+from afd_plugin.v1.worker.npu.async_mega_ffn_model_runner import MegaNPUFFNModelRunner
 from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
 from afd_plugin.validation import (
     NPU_FFN_WORKER_FQCN,
@@ -63,7 +64,7 @@ ASYNC_FFN_DRAIN_TIMEOUT_SECONDS = 60
 
 def create_npu_ffn_model_runner(
     vllm_config: VllmConfig, device: torch.device
-) -> AFDNPUFFNModelRunner | AsyncNPUFFNModelRunner:
+) -> AFDNPUFFNModelRunner | AsyncNPUFFNModelRunner | MegaNPUFFNModelRunner:
     """Select the FFN owner after Worker deployment admission."""
     afd_config = parse_afd_config(vllm_config, expected_role="ffn")
     if afd_config.connector == AFD_ASYNC_CONNECTOR:
@@ -73,6 +74,8 @@ def create_npu_ffn_model_runner(
         return AsyncNPUFFNModelRunner(
             vllm_config, device, cast(CAMAsyncAFDConnector, connector)
         )
+    if afd_config.connector == MEGA_CONNECTOR:
+        return MegaNPUFFNModelRunner(vllm_config, device)
     return AFDNPUFFNModelRunner(vllm_config, device)
 
 
@@ -226,6 +229,14 @@ class AFDNPUFFNWorker(NPUWorker):
             self.model_runner.session.finish_receiver()
             return
 
+        if isinstance(self.model_runner, MegaNPUFFNModelRunner):
+            # The fused operator waits for the next ready ubatch and keeps one
+            # shared stream and one completion event, so the driver must
+            # not add a per-step device fence.
+            while not event.is_set():
+                self.model_runner.execute_connector_driven_step()
+            return
+
         while not event.is_set():
             control_plane = self.model_runner.connector.control_plane
             assert control_plane is not None
@@ -276,6 +287,22 @@ class AFDNPUFFNWorker(NPUWorker):
                     raise RuntimeError(
                         "Async graph receive is pending; retain resources"
                     )
+            self.raise_ffn_loop_error_if_any()
+            self.model_runner.shutdown()
+            self._ffn_thread = None
+            self._ffn_shutdown_event = None
+            return
+        if isinstance(self.model_runner, MegaNPUFFNModelRunner):
+            # The fused operator may still be running on device. Let the loop
+            # leave the step first; closing a window under an in-flight step is
+            # what the connector's bounded close has to reject.
+            if event is not None:
+                event.set()
+            thread = self._ffn_thread
+            if thread is not None:
+                thread.join(timeout=FFN_SHUTDOWN_TIMEOUT_SECONDS)
+                if thread.is_alive():
+                    raise RuntimeError("Mega FFN step is pending; retain resources")
             self.raise_ffn_loop_error_if_any()
             self.model_runner.shutdown()
             self._ffn_thread = None

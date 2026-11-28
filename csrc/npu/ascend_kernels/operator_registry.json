@@ -19,7 +19,10 @@
       "afd_async_dispatch_send_arch35",
       "afd_async_dispatch_recv_arch35",
       "afd_async_combine_send_arch35",
-      "afd_async_combine_recv_arch35"
+      "afd_async_combine_recv_arch35",
+      "afd_async_atten_send_arch35",
+      "afd_async_mega_ffn_arch35",
+      "afd_async_atten_recv_arch35"
     ]
   },
   "operator_meta": {
@@ -51,6 +54,15 @@
       "requires_shmem": false
     },
     "afd_mega_moe_comm": {
+      "requires_shmem": false
+    },
+    "afd_async_atten_send_arch35": {
+      "requires_shmem": false
+    },
+    "afd_async_mega_ffn_arch35": {
+      "requires_shmem": false
+    },
+    "afd_async_atten_recv_arch35": {
       "requires_shmem": false
     }
   }

@@ -28,6 +28,7 @@ from vllm.sequence import IntermediateTensors
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
     CAMP2P_CONNECTOR,
+    MEGA_CONNECTOR,
     parse_afd_config,
 )
 from afd_plugin.connectors import (
@@ -42,6 +43,7 @@ from afd_plugin.connectors.npu.async_cam_runtime.async_cam_layout import (
     prepare_cam_dispatch_payload,
     restore_cam_dispatch_output,
 )
+from afd_plugin.connectors.npu.async_mega.remote import send_and_build_receive
 from afd_plugin.forward_context import get_afd_metadata_from_forward_context
 from afd_plugin.model_executor.ffn.remote import RemoteFFNProxy
 from afd_plugin.model_executor.models._weight_utils import (
@@ -50,6 +52,10 @@ from afd_plugin.model_executor.models._weight_utils import (
     FFN_ROLE,
     filter_role_weights,
     layer_weight_path,
+)
+from afd_plugin.model_executor.models.npu.deepseek_v4_mega import (
+    build_flash_mega_payload,
+    extract_mega_expert_weights,
 )
 from afd_plugin.model_executor.models.npu.deepseek_v4_shared_experts import (
     AFDDeepseekV4SharedExperts,
@@ -76,6 +82,7 @@ if TYPE_CHECKING:
         AscendW4A8DynamicFusedMoEMethod,
     )
 
+    from afd_plugin.connectors.npu.async_mega.mega_layers import LayerWeights
     from afd_plugin.model_executor.ffn.npu.expert_weights import QuantizedExpertWeights
 
 
@@ -187,6 +194,9 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         is_draft_layer: bool = False,
     ) -> None:
         super().__init__(layer_idx=layer_idx)
+        self.mega = (
+            parse_afd_config(vllm_config, validate=False).connector == MEGA_CONNECTOR
+        )
         self.use_sequence_parallel_moe = (
             vllm_config.parallel_config.use_sequence_parallel_moe
         )
@@ -262,19 +272,26 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         """Select DSV4 experts on Attention and exchange routed work via CAM."""
         from afd_plugin.model_executor.models.npu import deepseek_v4_attention_gate
 
-        topk_weights, topk_ids = deepseek_v4_attention_gate.compute_attention_gate_topk(
-            self,
-            hidden_states,
-            input_ids=input_ids,
-            hidden_states_fp32=hidden_states_fp32,
-        )
-        dispatch_payload = prepare_cam_dispatch_payload(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            None,
-            use_sequence_parallel=self.use_sequence_parallel_moe,
-        )
+        if self.mega:
+            dispatch_payload = build_flash_mega_payload(
+                self, hidden_states, input_ids, hidden_states_fp32
+            )
+        else:
+            topk_weights, topk_ids = (
+                deepseek_v4_attention_gate.compute_attention_gate_topk(
+                    self,
+                    hidden_states,
+                    input_ids=input_ids,
+                    hidden_states_fp32=hidden_states_fp32,
+                )
+            )
+            dispatch_payload = prepare_cam_dispatch_payload(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                None,
+                use_sequence_parallel=self.use_sequence_parallel_moe,
+            )
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
             raise RuntimeError("Async CAM requires AFD forward metadata")
@@ -285,13 +302,22 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
                 seq_len=int(dispatch_payload.hidden_states.shape[0]),
             )
         )
-        receive = send_async_cam_remote_call(
-            afd_metadata.connector,
-            dispatch_payload.hidden_states,
-            context,
-            topk_weights=dispatch_payload.topk_weights,
-            topk_ids=dispatch_payload.topk_ids,
-        )
+        if self.mega:
+            receive = send_and_build_receive(
+                afd_metadata.connector,
+                dispatch_payload.hidden_states,
+                context,
+                topk_weights=dispatch_payload.topk_weights,
+                topk_ids=dispatch_payload.topk_ids,
+            )
+        else:
+            receive = send_async_cam_remote_call(
+                afd_metadata.connector,
+                dispatch_payload.hidden_states,
+                context,
+                topk_weights=dispatch_payload.topk_weights,
+                topk_ids=dispatch_payload.topk_ids,
+            )
         shared_output = (
             self.shared_experts(hidden_states)
             if self.shared_experts is not None
@@ -410,6 +436,19 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
 
         if config is None:
             config = vllm_config.model_config.hf_config
+        # vLLM #61392 folded `compress_ratios` into `layer_types`; the
+        # Ascend helpers and the KV-store metadata still index the legacy
+        # field, so restore it.
+        if getattr(config, "compress_ratios", None) is None:
+            # `vllm.transformers_utils.deepseek_v4_utils` only exists on
+            # main (added by #61392), so keep the import lazy.
+            from vllm.transformers_utils.deepseek_v4_utils import (
+                get_compress_ratios,
+            )
+
+            compress_ratios = get_compress_ratios(config)
+            if compress_ratios:
+                config.compress_ratios = list(compress_ratios)
         # ### PATCH START: AFD decoder metadata
         self.vllm_config = vllm_config
         self.config = config
@@ -472,7 +511,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 # differs. Choosing by connector keeps the async CAM path unchanged.
                 gate_shell = (
                     AFDDeepseekV4AttentionGateRemoteMoE
-                    if afd_config.connector == AFD_ASYNC_CONNECTOR
+                    if afd_config.connector in (AFD_ASYNC_CONNECTOR, MEGA_CONNECTOR)
                     else AFDDeepseekV4SyncAttentionGateRemoteMoE
                 )
                 self.mlp = gate_shell(
@@ -651,7 +690,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         # ### PATCH START: initialize role-local model
         afd_config = parse_afd_config(vllm_config, validate=False)
         if (
-            afd_config.connector == AFD_ASYNC_CONNECTOR
+            afd_config.connector in (AFD_ASYNC_CONNECTOR, MEGA_CONNECTOR)
             and not afd_config.compute_gate_on_attention
         ):
             raise ValueError(
@@ -880,6 +919,14 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
             return
         prepare_attention_gate_w8a8_scales(self.model.layers)
         # ### PATCH END: retain FFN gate-on-A W8A8 scales after quant finalize
+
+    def get_mega_expert_weights(self, rank: int) -> dict[int, "LayerWeights"]:
+        return extract_mega_expert_weights(
+            self.model.layers,
+            rank,
+            self.config.hidden_size,
+            self.config.moe_intermediate_size,
+        )
 
     def get_quantized_expert_weights(
         self,

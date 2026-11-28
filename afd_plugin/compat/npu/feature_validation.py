@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
     CAMP2P_CONNECTOR,
+    MEGA_CONNECTOR,
     AFDConfig,
     parse_afd_config,
 )
@@ -39,6 +40,15 @@ def fail_if_unsupported_npu_afd_features(
         afd_config.connector,
         vllm_config,
     )
+
+    if afd_config.connector == MEGA_CONNECTOR:
+        from afd_plugin.connectors.npu.async_mega import validate_mega_config
+        from afd_plugin.model_executor.models.npu.deepseek_v4_mega import (
+            get_mega_model_spec,
+        )
+
+        validate_mega_config(vllm_config, afd_config, get_mega_model_spec(vllm_config))
+        return
 
     if afd_config.connector == AFD_ASYNC_CONNECTOR:
         _fail_if_unsupported_npu_afd_async_features(

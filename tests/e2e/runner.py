@@ -54,6 +54,7 @@ from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_ATTENTION_RANKS,
     DSV4_ATTENTION_TP_SIZE,
     DSV4_FFN_RANKS,
+    DSV4_MEGA_SCENARIO,
     DSV4_PROCESS_TERMINATION_TIMEOUT_S,
     DSV4_SCENARIOS,
     DSV4_SYNC_CAMP2P_SCENARIOS,
@@ -374,6 +375,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
             DSV4_ATTENTION_RANKS,
             DSV4_FFN_RANKS,
         ),
+        DSV4_MEGA_SCENARIO: (False, False, False, 2, 2),
     }
     for scenario, sync_profile in DSV4_SYNC_SHAPES.items():
         # The A5 host profile keeps native DBO off: split batches are the
@@ -407,6 +409,8 @@ def configure_scenario(args: argparse.Namespace) -> None:
         raise ValueError("--gsm8k-output-path is required for GSM8K scenarios")
     if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
         dsv4_config.configure_scenario(args)
+    elif args.scenario == DSV4_MEGA_SCENARIO:
+        dsv4_config.configure_mega_scenario(args)
     elif args.scenario in DSV4_SYNC_CAMP2P_SCENARIOS:
         dsv4_config.configure_sync_camp2p_scenario(args)
     if graph:
@@ -762,7 +766,10 @@ def uses_async_connector(args: argparse.Namespace) -> bool:
 
 def uses_npu_async_process_cleanup(args: argparse.Namespace) -> bool:
     """Return whether E2E teardown must find and kill every FFN process."""
-    return args.device_backend == "npu" and args.scenario == DSV4_ASYNC_CAM_SCENARIO
+    return args.device_backend == "npu" and args.scenario in (
+        DSV4_ASYNC_CAM_SCENARIO,
+        DSV4_MEGA_SCENARIO,
+    )
 
 
 def process_termination_timeout(args: argparse.Namespace) -> float:

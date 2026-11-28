@@ -29,6 +29,12 @@ from tests.unit.fakes.dp_metadata import (  # noqa: E402
 )
 from tests.unit.fakes.dp_metadata import dp_tokens as _tokens
 from tests.unit.fakes.graph import Graph as _FakeGraph  # noqa: E402
+from tests.unit.fakes.npu_runtime import (
+    new_ffn_worker as _new_ffn_worker,
+)
+from tests.unit.fakes.npu_runtime import (
+    require_npu_runtime as _require_npu_runtime,
+)
 from tests.unit.fakes.vllm_config import (  # noqa: E402
     npu_vllm_config as _vllm_config,
 )
@@ -127,12 +133,6 @@ class _FakeStructuredFFNModel:
         )
 
 
-def _require_npu_runtime():
-    pytest.importorskip("vllm", reason="NPU runtime tests require vLLM")
-    pytest.importorskip("vllm_ascend", reason="NPU runtime tests require vLLM-Ascend")
-    pytest.importorskip("torch_npu", reason="NPU runtime tests require torch-npu")
-
-
 def _new_ffn_runner():
     _require_npu_runtime()
     from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
@@ -155,18 +155,6 @@ def _new_ffn_runner():
         ),
     )
     return runner
-
-
-def _new_ffn_worker():
-    _require_npu_runtime()
-    from afd_plugin.v1.worker.npu.ffn_worker import AFDNPUFFNWorker
-
-    worker = object.__new__(AFDNPUFFNWorker)
-    worker._ffn_loop_error = None
-    # Most tests exercise the daemon loop rather than CPU placement. Tests for
-    # the startup binding path explicitly reset this guard.
-    worker._cpu_binding_attempted = True
-    return worker
 
 
 def test_npu_ffn_runner_executes_eager_ffn_step(monkeypatch):

@@ -15,39 +15,9 @@ from afd_plugin.connectors.npu.async_cam_runtime import (  # noqa: E402
     async_cam_layout as async_cam,
 )
 from afd_plugin.model_executor.models.npu import deepseek_v4 as adapter  # noqa: E402
-from afd_plugin.model_executor.models.npu import (  # noqa: E402
-    deepseek_v4_attention_gate,
+from tests.unit.fakes.npu_deepseek_v4 import (  # noqa: E402
+    make_attention_gate_proxy as _make_proxy,
 )
-
-
-def _make_proxy(monkeypatch, *, use_sequence_parallel: bool, in_profile_run: bool):
-    proxy = object.__new__(adapter.AFDDeepseekV4AttentionGateRemoteMoE)
-    torch.nn.Module.__init__(proxy)
-    proxy.use_sequence_parallel_moe = use_sequence_parallel
-    proxy.shared_experts = None
-    proxy.layer_idx = 3
-    connector = SimpleNamespace()
-    monkeypatch.setattr(
-        adapter,
-        "get_afd_metadata_from_forward_context",
-        lambda: SimpleNamespace(connector=connector, stage_idx=0),
-    )
-    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", lambda states, **kw: states)
-    topk_weights = torch.arange(32, dtype=torch.float32).reshape(16, 2)
-    topk_ids = torch.arange(32, dtype=torch.int32).reshape(16, 2)
-    monkeypatch.setattr(
-        deepseek_v4_attention_gate,
-        "compute_attention_gate_topk",
-        lambda _proxy, _hidden_states, **_kwargs: (topk_weights, topk_ids),
-    )
-    monkeypatch.setattr(
-        adapter,
-        "get_forward_context",
-        lambda: SimpleNamespace(
-            in_profile_run=in_profile_run,
-        ),
-    )
-    return proxy, topk_weights, topk_ids
 
 
 def test_dsv4_profile_gate_shards_plain_tp8_and_restores(monkeypatch):
