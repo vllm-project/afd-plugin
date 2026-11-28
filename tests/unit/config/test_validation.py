@@ -298,7 +298,10 @@ def test_routed_transport_preserves_runner_and_gate_policy(
         pytest.param("AFDDeepseekV2ForCausalLM", True, id="afd-deepseek-v2"),
         pytest.param("DeepseekV3ForCausalLM", False, id="deepseek-v3"),
         pytest.param("AFDDeepseekV3ForCausalLM", False, id="afd-deepseek-v3"),
-        pytest.param("Qwen3_5MoeForConditionalGeneration", False, id="qwen3-5-moe"),
+        pytest.param("Qwen3_5MoeForConditionalGeneration", True, id="qwen3-5-moe"),
+        pytest.param(
+            "AFDQwen3_5MoeForConditionalGeneration", True, id="afd-qwen3-5-moe"
+        ),
     ],
 )
 def test_routed_transport_requires_model_that_routes_on_attention(

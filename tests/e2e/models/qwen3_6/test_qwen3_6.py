@@ -17,7 +17,11 @@ from tests.conftest import (
     run_case_entry,
 )
 from tests.e2e.environment import model_case_command
-from tests.e2e.models.qwen3_6.cases import SCENARIOS
+from tests.e2e.models.qwen3_6.cases import (
+    DEEPEP_M2N_FFN_SERVICE_SCENARIOS,
+    DEEPEP_M2N_SCENARIOS,
+    SCENARIOS,
+)
 
 GSM8K_DATASET_ID = "openai/gsm8k"
 GSM8K_DATASET_CONFIG = "main"
@@ -70,5 +74,25 @@ def _prepare_e2e_assets() -> Iterator[None]:
 @pytest.mark.e2e
 @pytest.mark.parametrize("scenario", SCENARIOS, ids=SCENARIOS)
 def test_qwen3_6(scenario: str, tmp_path: Path) -> None:
+    command = build_runner_command(scenario, tmp_path / scenario)
+    run_case_entry(command, tmp_path / scenario)
+
+
+@pytest.mark.e2e
+# DeepEP M2N runs 2A2F, including Attention TP2. The cases need DeepEP and 4
+# GPUs; CI selects test ids explicitly and does not run them.
+@pytest.mark.parametrize("scenario", DEEPEP_M2N_SCENARIOS, ids=DEEPEP_M2N_SCENARIOS)
+def test_qwen3_6_deepep_m2n(scenario: str, tmp_path: Path) -> None:
+    command = build_runner_command(scenario, tmp_path / scenario)
+    run_case_entry(command, tmp_path / scenario)
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    "scenario",
+    DEEPEP_M2N_FFN_SERVICE_SCENARIOS,
+    ids=DEEPEP_M2N_FFN_SERVICE_SCENARIOS,
+)
+def test_qwen3_6_deepep_m2n_ffn_service(scenario: str, tmp_path: Path) -> None:
     command = build_runner_command(scenario, tmp_path / scenario)
     run_case_entry(command, tmp_path / scenario)

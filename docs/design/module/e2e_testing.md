@@ -261,7 +261,8 @@ cases each for DeepSeek and Qwen3 MoE, and a Qwen3 MoE standalone FFN service
 entry adds four. Unfiltered DeepSeek module collection
 includes its five DeepEP IDs even on NPU; NPU runs select the P2P entry or
 explicit node IDs. The local-only TP2 Graph + DBO case is outside the seven-case
-ready/merge CI gate.
+ready/merge CI gate. Qwen3.6 MoE's DeepEP M2N and standalone FFN service entries
+add three GPU-only cases each.
 
 GPU cases gate accuracy, service liveness and cleanup. AFD GPU graph/DBO
 cases additionally use a test-only worker extension to collect bounded per-rank
@@ -376,9 +377,10 @@ recorded an FFN CUDA illegal memory access during a live two-ubatch decode
 split before v0.30. Neither historical record qualifies current GDN DBO support.
 Qwen3 MoE retains its graph+DBO case in
 [weekly E2E](../../../tests/e2e/README.md#weekly-gsm8k).
-Multimodal, NPU, `compute_gate_on_attention=true`, pipeline-parallel,
-asynchronous, and multi-node execution are outside this case; quantization is
-unverified.
+Separate local-only DeepEP M2N entries run `compute_gate_on_attention=true` on
+2A2F: eager, graph and Attention TP2 graph, each also with the FFN side on the
+standalone FFN service. Multimodal, NPU, pipeline-parallel, asynchronous, and
+multi-node execution are outside this case; quantization is unverified.
 
 ## Accuracy gate
 

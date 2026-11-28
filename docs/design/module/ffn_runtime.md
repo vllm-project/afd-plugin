@@ -178,14 +178,17 @@ F, `--backend gpu-deepep-m2n`, under `ffn_faas/platforms/gpu/`:
   the FFN-only routed-experts architecture, pins vLLM's MoE backend to Triton
   before any FusedMoE is built, and creates the F-only world through vLLM's
   `init_worker_distributed_environment`.
-- The AFD model registry selects the FFN-only shell for the configured model.
-  For example, `AFDQwen3MoeRoutedExperts` keeps only `model.layers.<i>.mlp`
+- The AFD model registry selects the FFN model, as on the Worker path: the
+  FFN-only shell when the architecture has one, otherwise its role-aware AFD
+  model. `AFDQwen3MoeRoutedExperts` keeps only `model.layers.<i>.mlp`
   (native `Qwen3MoeSparseMoeBlock`) and loads through vLLM's
   `DefaultModelLoader`, so the EP weight filter, FusedMoE expert loading and
   strict loaded-weights check run unchanged; the embedding, final norm and LM
-  head are not allocated.
+  head are not allocated. Qwen3.5/3.6 has no shell, so F loads
+  `AFDQwen3_5MoeForConditionalGeneration`, whose FFN role builds each layer's
+  native MoE block and no embedding, norms or LM head.
 - `DeepEPM2NFFNBackend` constructs `GPUFFNRoutedExpertsModelRunner`, loads the
-  shell through that runner, starts the connector, and delegates each step to
+  model through that runner, starts the connector, and delegates each step to
   `execute_connector_driven_step()`, the method the Worker loop also calls.
   CUDA graphs are captured lazily from Attention's payloads, as on the Worker
   path, so `/ready` means paired and receiving.

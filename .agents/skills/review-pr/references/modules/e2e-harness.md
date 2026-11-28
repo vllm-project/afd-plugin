@@ -37,7 +37,9 @@ describes cases.
     Attention-TP variants) through `test_qwen3_moe_deepep_m2n`; CI selects node
     IDs explicitly and does not run them.
   - Qwen3.6 MoE GPU: `baseline-graph`, `afd-eager-2a1f`, `afd-graph-2a1f`
-    (GDN DBO unsupported).
+    (GDN DBO unsupported). The module also collects the local-only DeepEP M2N
+    2A2F scenarios (`afd-deepep-m2n-{eager,graph,graph-tp2}-2a2f`) and their
+    FFN service twins (`afd-deepep-m2n-faas-*`).
   - DeepSeek-V4 Flash: separate `test_gpu.py`, `test_async_cam_npu.py`, and
     `test_sync_camp2p_npu.py` suites; DSV4 Flash W4A8 async CAM is a local-only
     16-NPU case.

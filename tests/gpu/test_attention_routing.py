@@ -18,7 +18,11 @@ else:
     torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 from torch import nn  # noqa: E402
-from transformers import DeepseekV2Config, Qwen3MoeConfig  # noqa: E402
+from transformers import (  # noqa: E402
+    DeepseekV2Config,
+    Qwen3_5MoeTextConfig,
+    Qwen3MoeConfig,
+)
 from vllm.config import VllmConfig, set_current_vllm_config  # noqa: E402
 from vllm.distributed import (  # noqa: E402
     destroy_distributed_environment,
@@ -35,6 +39,7 @@ from vllm.model_executor.model_loader.utils import (  # noqa: E402
 )
 from vllm.model_executor.models import deepseek_v2 as native  # noqa: E402
 from vllm.model_executor.models import qwen3_moe as qwen3_native  # noqa: E402
+from vllm.model_executor.models import qwen3_next as qwen3_next_native  # noqa: E402
 from vllm.utils.network_utils import get_open_port  # noqa: E402
 from vllm.utils.torch_utils import set_default_torch_dtype  # noqa: E402
 from vllm.v1.worker.gpu_worker import (  # noqa: E402
@@ -48,6 +53,7 @@ from vllm.v1.worker.workspace import (  # noqa: E402
 from afd_plugin.config import DEEPEP_M2N_CONNECTOR  # noqa: E402
 from afd_plugin.connectors import AFDForwardContextMetadata  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
+from afd_plugin.model_executor.models import qwen3_5 as qwen3_5_adapter  # noqa: E402
 from afd_plugin.model_executor.models import qwen3_moe as qwen3_adapter  # noqa: E402
 from tests.conftest import REPO_ROOT  # noqa: E402
 
@@ -108,6 +114,16 @@ def test_qwen3_attention_moe_matches_native_moe_bit_for_bit(tmp_path, renormaliz
     Why: splitting the MoE between the roles must not change any output.
     """
     _run_parity_child(tmp_path, "_run_qwen3_attention_moe_parity", renormalize)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="native MoE needs CUDA")
+def test_qwen3_5_attention_moe_matches_native_moe_bit_for_bit(tmp_path):
+    """Qwen3.5's split MoE, gated shared expert included, matches the native
+    block bit for bit, for P2P and DeepEP M2N.
+
+    Why: splitting the MoE between the roles must not change any output.
+    """
+    _run_parity_child(tmp_path, "_run_qwen3_5_attention_moe_parity", None)
 
 
 def _run_parity_child(tmp_path: Path, function: str, argument: object) -> None:
@@ -280,6 +296,43 @@ def _check_qwen3_attention_moe_parity(vllm_config: VllmConfig) -> None:
         )
 
 
+def _check_qwen3_5_attention_moe_parity(vllm_config: VllmConfig) -> None:
+    native_moe = _built_moe(
+        partial(
+            qwen3_next_native.Qwen3NextSparseMoeBlock,
+            vllm_config=vllm_config,
+            prefix="model.layers.0.mlp",
+        ),
+        vllm_config,
+    )
+    # FFN runs the whole block, or under DeepEP M2N only its routed experts.
+    loopback = _LoopbackFFN(vllm_config, native_moe, native_moe)
+    attention_context = _attention_context(vllm_config, loopback)
+    for layer_idx, connector, gate_on_attention, payload in (
+        (1, "P2pNcclAFDConnector", False, set()),
+        (2, DEEPEP_M2N_CONNECTOR, True, {"topk_ids", "topk_weights"}),
+    ):
+        vllm_config.additional_config["afd"] = {
+            "role": "attention",
+            "connector": connector,
+            "compute_gate_on_attention": gate_on_attention,
+        }
+        # Equal shapes get equal values, so the gate and the shared expert
+        # match the native ones.
+        attention_moe = _built_moe(
+            partial(
+                qwen3_5_adapter.AFDQwen3_5RemoteExpertsMoE,
+                vllm_config=vllm_config,
+                prefix=f"model.layers.{layer_idx}.mlp",
+            ),
+            vllm_config,
+        )
+        loopback.expected_payload = payload
+        _assert_matches_native(
+            attention_moe, native_moe, attention_context, vllm_config
+        )
+
+
 def _attention_context(
     vllm_config: VllmConfig, connector: _LoopbackFFN
 ) -> ForwardContext:
@@ -370,9 +423,27 @@ def _run_qwen3_attention_moe_parity(model_dir: str, renormalize: bool) -> None:
     _run_in_vllm_rank(model_dir, hf_config, _check_qwen3_attention_moe_parity)
 
 
+def _run_qwen3_5_attention_moe_parity(model_dir: str, _argument: None) -> None:
+    """Child-process body of the Qwen3.5 MoE parity test."""
+    hf_config = Qwen3_5MoeTextConfig(
+        architectures=["Qwen3_5MoeForCausalLM"],
+        vocab_size=128,
+        hidden_size=PARITY_HIDDEN_SIZE,
+        moe_intermediate_size=128,
+        shared_expert_intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=PARITY_MODEL_LEN,
+        num_experts=4,
+        num_experts_per_tok=2,
+    )
+    _run_in_vllm_rank(model_dir, hf_config, _check_qwen3_5_attention_moe_parity)
+
+
 def _run_in_vllm_rank(
     model_dir: str,
-    hf_config: DeepseekV2Config | Qwen3MoeConfig,
+    hf_config: DeepseekV2Config | Qwen3MoeConfig | Qwen3_5MoeTextConfig,
     check: Callable[[VllmConfig], None],
 ) -> None:
     """Run ``check`` on one CUDA rank of vLLM built from ``hf_config``."""

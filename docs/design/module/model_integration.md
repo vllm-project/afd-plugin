@@ -37,6 +37,7 @@ upstream_refs:
 verified_platform_refs:
   - "DeepSeek V2 Lite GPU and NPU model E2E paths"
   - "DeepSeek V2 Lite DeepEP M2N 2A2F E2E paths (eager, graph, graph + DBO, Attention TP2)"
+  - "Qwen3.6 MoE DeepEP M2N 2A2F E2E paths (eager, graph, Attention TP2), also on the standalone FFN service"
   - "CAM async NPU model E2E path"
   - "DeepSeek V4 CUDA contract tests and E2E profiles; see docs/support.md for hardware scope"
   - "DeepSeek V4 Ascend Hash-id boundary has focused unit coverage and a historical manual Ascend 950 run"
@@ -183,7 +184,7 @@ needed by the split execution.
 | Attention module and KV-facing computation | Constructed and executed. | Not constructed. |
 | MoE with `compute_gate_on_attention=false` | CUDA constructs the native MoE shell without a gate; its experts are a `FusedMoEFactory` runner without expert weights that sends the hidden states. NPU sends after post-Attention normalization. | Native gate and experts are constructed and executed from connector input. |
 | MoE with `compute_gate_on_attention=true`, CUDA P2P | CUDA keeps the native gate on the shell and passes it to the `FusedMoEFactory` runner, which applies it and sends the router logits with the hidden states. | Expert MLP is constructed and consumes transferred router logits or routed payloads without rerunning the gate. |
-| MoE with `compute_gate_on_attention=true`, DeepEP M2N (CUDA) | CUDA keeps the native gate and builds the native shared-expert MLP on the shell. Its experts are vLLM's runner, which selects top-k and runs the shared MLP while the routes are in flight; its weightless routed experts send the top-k IDs and weights with the hidden states and return the combined output. With TP > 1 the shell is sequence-parallel: each TP rank sends its slice, with the padding rows unrouted, and runs a replicated shared MLP on it; the TP group then all-gathers the output. | Native `DeepseekV2MoE` without shared experts; runs only the routed experts on the dispatched top-k IDs and weights. |
+| MoE with `compute_gate_on_attention=true`, DeepEP M2N (CUDA) | CUDA keeps the native gate and builds the native shared-expert MLP on the shell. Its experts are vLLM's runner, which selects top-k and runs the shared MLP while the routes are in flight; its weightless routed experts send the top-k IDs and weights with the hidden states and return the combined output. With TP > 1 the shell is sequence-parallel: each TP rank sends its slice, with the padding rows unrouted, and runs a replicated shared MLP on it; the TP group then all-gathers the output. | Native `DeepseekV2MoE` without shared experts, or Qwen3.5/3.6's full native block, whose gate and shared expert stay unused; runs only the routed experts on the dispatched top-k IDs and weights. |
 | Dense MLP, normal mode | Not constructed; output is sent after post-Attention normalization. | Constructed and executed from connector input. |
 | Dense MLP with `compute_gate_on_attention=true` | Constructed and executed locally because there is no routed MoE handoff. | Not constructed and a dense-layer FFN compute request is rejected. |
 | Embedding, final norm, pipeline placeholders | Created according to the pinned pipeline-rank rules. | Same wrapper lifecycle rules; only role-required parameters are loaded. |
@@ -307,20 +308,22 @@ construction.
 
 `AFDQwen3_5MoeForConditionalGeneration` is a distinct wrapper around vLLM's
 native hybrid Qwen3.5/3.6 architecture. Attention owns embeddings, norms, and
-linear/full-attention state, then sends hidden states only: its MoE keeps the
-native `Qwen3NextSparseMoeBlock.forward`, with experts built by the same
-`FusedMoEFactory` runner as DeepSeek's gate-on-FFN path. FFN owns the native
-gate, routed experts, shared expert, and shared-expert gate.
+linear/full-attention state. Its MoE keeps the native
+`Qwen3NextSparseMoeBlock.forward`, with experts built through `build_expert()`
+as for DeepSeek. With P2P it sends hidden states only, and FFN owns the gate and
+all experts. With DeepEP M2N, as in DeepSeek's M2N row, Attention also builds
+the gate and the gated shared expert, sends the routes and runs the shared
+expert; FFN loads the gate and shared expert too but runs only routed experts.
 
 This path is CUDA-only, text-only, and requires `--language-model-only`,
-`compute_gate_on_attention=false`, and `pipeline_parallel_size=1`. It rejects
+`compute_gate_on_attention=true` with DeepEP M2N and `false` otherwise, and
+`pipeline_parallel_size=1`. It rejects
 multimodal execution, sequence-parallel MoE, EPLB, speculative decoding, and
 LoRA before language-model construction; NPU model-config resolution fails
 before model loading. GDN DBO is unsupported under native hybrid/multimodal
 DBO validation; ordinary eager and graph execution remain supported. The
-2A1F suite keeps static EP and PP1. Attention-side router transport, async
-communication, multi-node, quantization, and performance remain outside the
-validated scope.
+2A1F suite keeps static EP and PP1. Async communication, multi-node,
+quantization, and performance remain outside the validated scope.
 
 ## Forward-context contract
 
@@ -410,8 +413,9 @@ filtering:
 - FFN loads the MLP/expert and required common parameters and skips unrelated
   Attention parameters. In gate-on-Attention mode it also skips dense MLP
   parameters because those layers execute on Attention.
-- With a routed-experts connector (DeepEP M2N), MoE `shared_experts`
+- With a routed-experts connector (DeepEP M2N), DeepSeek's MoE `shared_experts`
   parameters load on Attention only; FFN builds its MoE without shared experts.
+  Qwen3.5/3.6 loads its gate and gated shared expert on both roles instead.
 - Model-specific missing, fused, redundant, and pipeline parameters retain the
   upstream skip/mapping behavior instead of being treated as AFD errors.
 
