@@ -47,11 +47,6 @@ from afd_plugin.forward_context import get_afd_metadata_from_forward_context
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 UNROUTED_EXPERT_ID = -1
-# The only device validated for native-factory Attention MoE runners. Each
-# connector's registration names its runner: AFDRemoteMoERunner for CUDA P2P,
-# and for DeepEP M2N AFDRoutedExpertsMoERunner, vLLM's runner whose routed
-# experts send the routes.
-ATTENTION_MOE_RUNNER_DEVICE = "cuda"
 
 
 def _unroute_tp_padding(topk_ids: torch.Tensor, num_tokens: int) -> torch.Tensor:
@@ -89,7 +84,7 @@ def _send_attention_output(
     hidden_states: torch.Tensor,
     *,
     layer_idx: int,
-    **send_kwargs: torch.Tensor,
+    **send_kwargs: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
 ) -> int:
     """Send a layer's Attention output to the FFN role; return the stage to
     receive."""
@@ -274,7 +269,7 @@ class AFDRoutedExpertsMoERunner(MoERunner):
     microbatch before the runner reads it, so each microbatch needs its own
     output slot. vLLM picks the slot per microbatch only when its runner gets
     ``enable_dbo``, but AFD also runs two microbatches with ``--ubatch-size 2``
-    alone. Pass ``enable_dbo`` whenever vLLM microbatches; vLLM 0.32 reads the
+    alone. Pass ``enable_dbo`` whenever vLLM microbatches; vLLM 0.34 reads the
     runner's ``enable_dbo`` only to pick that slot.
     """
 
@@ -378,9 +373,12 @@ def build_expert(
     no expert weights and runs no expert kernel.
     """
     afd_config = parse_afd_config(vllm_config, validate=False)
-    runner_path = AFDConnectorFactory.get_attention_moe_runner(afd_config.connector)
-    placement = (current_platform.device_type, afd_config.connector)
-    if runner_path is None or placement[0] != ATTENTION_MOE_RUNNER_DEVICE:
+    device_type = current_platform.device_type
+    runner_path = AFDConnectorFactory.get_attention_moe_runner(
+        afd_config.connector, device_type
+    )
+    if runner_path is None:
+        placement = (device_type, afd_config.connector)
         raise ValueError(
             f"unsupported Attention remote MoE configuration: {placement!r}",
         )
@@ -438,6 +436,10 @@ def build_expert(
             "Attention remote MoE factory reserves these arguments: "
             + ", ".join(sorted(reserved)),
         )
+    if device_type == "npu":
+        from afd_plugin.model_executor.ffn.npu.remote import cam_factory_kwargs
+
+        factory_kwargs.update(cam_factory_kwargs())
     return fused_moe.FusedMoEFactory(**moe_kwargs, **factory_kwargs)
 
 

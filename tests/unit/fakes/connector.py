@@ -127,12 +127,12 @@ class ProxyConnector:
     def send_attn_output(self, hidden_states, context, **kwargs) -> None:
         self.events.append(("send", hidden_states, context, kwargs))
 
-    def recv_ffn_output(self, *, ref_tensor, ubatch_idx):
+    def recv_ffn_output(self, *, ref_tensor, ubatch_idx, context=None):
         self.events.append(("recv", ref_tensor, ubatch_idx))
         return ref_tensor * 0.25
 
 
-def install_proxy_context(monkeypatch, events, *, stage_idx=2):
+def install_proxy_context(monkeypatch, events, *, stage_idx=2, yield_module=None):
     connector = ProxyConnector(events)
     afd_metadata = SimpleNamespace(connector=connector, stage_idx=9)
     from afd_plugin.model_executor.ffn import remote
@@ -147,5 +147,5 @@ def install_proxy_context(monkeypatch, events, *, stage_idx=2):
     monkeypatch.setattr(
         remote, "get_forward_context", lambda: SimpleNamespace(ubatch_idx=stage_idx)
     )
-    monkeypatch.setattr(remote, "maybe_apply_dbo_yield", record_yield)
+    monkeypatch.setattr(yield_module or remote, "maybe_apply_dbo_yield", record_yield)
     return afd_metadata

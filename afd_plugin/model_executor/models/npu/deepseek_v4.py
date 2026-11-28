@@ -6,7 +6,7 @@ The Ascend DSV4 implementation is not a DeepSeek V2 layer with different
 dimensions.  Its decoder layer owns the DSA attention path and the
 hyper-connection (HC) state transitions around both attention and FFN.  This
 adapter therefore keeps the native layer forward path on the Attention role
-and replaces only the FFN module with the AFD remote proxy.  The FFN role
+and replaces only the MoE with an AFD runner.  The FFN role
 constructs the native MoE module and exposes it through the runner-facing
 ``compute_ffn_output`` hook.
 """
@@ -30,20 +30,9 @@ from afd_plugin.config import (
     CAMP2P_CONNECTOR,
     parse_afd_config,
 )
-from afd_plugin.connectors import (
-    AFDExpertRoutingSpec,
-    AFDTransferContext,
-    AFDTransferMetadata,
-)
-from afd_plugin.connectors.npu.async_cam_runtime.async_cam_dbo import (
-    send_async_cam_remote_call,
-)
-from afd_plugin.connectors.npu.async_cam_runtime.async_cam_layout import (
-    prepare_cam_dispatch_payload,
-    restore_cam_dispatch_output,
-)
-from afd_plugin.forward_context import get_afd_metadata_from_forward_context
-from afd_plugin.model_executor.ffn.remote import RemoteFFNProxy
+from afd_plugin.connectors import AFDExpertRoutingSpec
+from afd_plugin.model_executor.ffn.npu.remote import local_hash_input_ids
+from afd_plugin.model_executor.ffn.remote import build_expert
 from afd_plugin.model_executor.models._weight_utils import (
     ATTENTION_ROLE,
     BOTH_ROLES,
@@ -51,13 +40,6 @@ from afd_plugin.model_executor.models._weight_utils import (
     filter_role_weights,
     layer_weight_path,
 )
-from afd_plugin.model_executor.models.npu.deepseek_v4_shared_experts import (
-    AFDDeepseekV4SharedExperts,
-)
-from afd_plugin.model_executor.models.npu.deepseek_v4_weights import (
-    prepare_attention_gate_w8a8_scales,
-)
-from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 try:
     from vllm_ascend.models.deepseek_v4 import model as native
@@ -120,8 +102,8 @@ def _checkpoint_weight_roles(
         if remainder and remainder[0] == "gate":
             # Every router parameter, including the Hash id table, belongs to
             # each role that built a router: with the gate on Attention, the
-            # Attention gate shell registers ``tid2eid`` for Hash layers and
-            # routes from it, and the native FFN MoE registers its own copy.
+            # Attention model registers ``tid2eid`` for the CAM runner's Hash
+            # lookup, and the native FFN MoE registers its own copy.
             # With the gate on FFN the Attention MoE slot is parameter-free, so
             # Attention must not receive any of them.
             if attn_owns_gate:
@@ -133,125 +115,98 @@ def _checkpoint_weight_roles(
     return BOTH_ROLES
 
 
-class AFDDeepseekV4RemoteMoE(RemoteFFNProxy):
-    """DSV4 gate-on-FFN shell that sends Hash ids alongside the activations.
-
-    The FFN role owns the gate for this configuration. Its Hash layers route by
-    token identity, and only Attention holds ``input_ids``, so Attention sends
-    the rank-local ids that the FFN rank's tokens correspond to. Connectors that
-    do not transport ids ignore the extra argument, which keeps this shell valid
-    for gate-on-FFN configurations in general.
-
-    Whether ids cross the boundary is a run-level decision the two roles share
-    through the model's ``afd_requires_input_ids`` declaration, not a per-layer
-    one, because the FFN role cannot tell Hash layers from non-Hash ones. A
-    forward context with no ids is therefore an error here rather than a silent
-    activations-only send.
-    """
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
-        hidden_states_fp32: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        from afd_plugin.model_executor.models.npu.deepseek_v4_attention_gate import (
-            local_hash_input_ids,
-        )
-
-        # The FFN rank asks for the operator's ids channel on every layer, so
-        # this side must send ids rather than fall back to an activations-only
-        # transfer. ``local_hash_input_ids`` raises if the forward context
-        # cannot supply them.
-        return self._send_and_receive(
-            hidden_states,
-            input_ids=local_hash_input_ids(
-                input_ids=(
-                    get_forward_context().input_ids if input_ids is None else input_ids
-                ),
-                router_tokens=int(hidden_states.shape[0]),
-            ),
-        )
-
-
-class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
-    """DSV4 gate shell that routes local Attention tokens through Async CAM."""
+class AFDDeepseekV4MoE(nn.Module):
+    """Own the Attention gate and shared experts under their checkpoint names."""
 
     def __init__(
         self,
         *,
-        config: Any,
+        config: DeepseekV2Config,
         layer_idx: int,
         prefix: str,
         vllm_config: VllmConfig,
+        compute_gate_on_attention: bool,
         is_draft_layer: bool = False,
     ) -> None:
-        super().__init__(layer_idx=layer_idx)
-        self.use_sequence_parallel_moe = (
-            vllm_config.parallel_config.use_sequence_parallel_moe
-        )
-        self.top_k = int(config.num_experts_per_tok)
-        self.n_routed_experts = int(config.n_routed_experts)
-        self.renormalize = bool(config.norm_topk_prob)
-        self.scoring_func = getattr(config, "scoring_func", "softmax")
-        self.num_expert_group = int(getattr(config, "n_group", 1))
-        self.topk_group = int(getattr(config, "topk_group", 1))
-        self.routed_scaling_factor = float(
-            getattr(config, "routed_scaling_factor", 1.5),
-        )
-        # Match native DSV4's explicit shared-output reduction. Ascend keeps
-        # weights TP-sharded with SP unless shared-expert DP is enabled.
-        self.shared_experts = (
-            AFDDeepseekV4SharedExperts(
-                hidden_size=config.hidden_size,
-                intermediate_size=config.moe_intermediate_size
-                * config.n_shared_experts,
-                hidden_act=config.hidden_act,
-                swiglu_limit=getattr(config, "swiglu_limit", None),
-                quant_config=vllm_config.quant_config,
-                reduce_results=False,
-                is_sequence_parallel=self.use_sequence_parallel_moe,
-                prefix=f"{prefix}.shared_experts",
-            )
-            if config.n_shared_experts
-            else None
-        )
-        self.gate = ReplicatedLinear(
-            config.hidden_size,
-            config.n_routed_experts,
-            bias=False,
-            quant_config=None,
-            prefix=f"{prefix}.gate",
-        )
-        self.gate.precast_fp32_weight = True
-        # Match DeepseekV4MoE in Ascend 7dcdb690. Transformers may place Hash
-        # MoE at nonconsecutive layers and omits the legacy count.
-        if is_draft_layer:
-            uses_hash = False
-        else:
-            mlp_layer_types = getattr(config, "mlp_layer_types", None)
-            if mlp_layer_types is not None:
-                uses_hash = (
-                    layer_idx < len(mlp_layer_types)
-                    and mlp_layer_types[layer_idx] == "hash_moe"
+        super().__init__()
+        self.gate: ReplicatedLinear | None = None
+        self.shared_experts: nn.Module | None = None
+        routing_args = {}
+        if compute_gate_on_attention:
+            routing_args = {
+                "scoring_func": getattr(config, "scoring_func", "softmax"),
+                "num_expert_group": int(getattr(config, "n_group", 1)),
+                "topk_group": int(getattr(config, "topk_group", 1)),
+            }
+            # Match native DSV4's explicit shared-output reduction. Ascend keeps
+            # weights TP-sharded with SP unless shared-expert DP is enabled.
+            if config.n_shared_experts:
+                from .deepseek_v4_shared_experts import AFDDeepseekV4SharedExperts
+
+                self.shared_experts = AFDDeepseekV4SharedExperts(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.moe_intermediate_size
+                    * config.n_shared_experts,
+                    hidden_act=config.hidden_act,
+                    swiglu_limit=getattr(config, "swiglu_limit", None),
+                    quant_config=vllm_config.quant_config,
+                    reduce_results=False,
+                    is_sequence_parallel=(
+                        vllm_config.parallel_config.use_sequence_parallel_moe
+                    ),
+                    prefix=f"{prefix}.shared_experts",
                 )
+            self.gate = ReplicatedLinear(
+                config.hidden_size,
+                config.n_routed_experts,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.gate",
+            )
+            self.gate.precast_fp32_weight = True
+            # Match DeepseekV4MoE in Ascend 7dcdb690. Transformers may place Hash
+            # MoE at nonconsecutive layers and omits the legacy count.
+            if is_draft_layer:
+                uses_hash = False
             else:
-                uses_hash = layer_idx < getattr(config, "num_hash_layers", 0)
-        if uses_hash:
-            self.gate.tid2eid = nn.Parameter(
-                (
-                    torch.arange(config.vocab_size, dtype=torch.int32).unsqueeze(1)
-                    + torch.arange(config.num_experts_per_tok, dtype=torch.int32)
+                mlp_layer_types = getattr(config, "mlp_layer_types", None)
+                if mlp_layer_types is not None:
+                    uses_hash = (
+                        layer_idx < len(mlp_layer_types)
+                        and mlp_layer_types[layer_idx] == "hash_moe"
+                    )
+                else:
+                    uses_hash = layer_idx < getattr(config, "num_hash_layers", 0)
+            if uses_hash:
+                self.gate.tid2eid = nn.Parameter(
+                    (
+                        torch.arange(config.vocab_size, dtype=torch.int32).unsqueeze(1)
+                        + torch.arange(config.num_experts_per_tok, dtype=torch.int32)
+                    )
+                    % config.n_routed_experts,
+                    requires_grad=False,
                 )
-                % config.n_routed_experts,
-                requires_grad=False,
-            )
-            self.gate.e_score_correction_bias = None
-        else:
-            self.gate.tid2eid = None
-            self.gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, dtype=torch.float32),
-            )
+                self.gate.e_score_correction_bias = None
+            else:
+                self.gate.tid2eid = None
+                self.gate.e_score_correction_bias = nn.Parameter(
+                    torch.empty(config.n_routed_experts, dtype=torch.float32),
+                )
+
+        self.experts = build_expert(
+            vllm_config,
+            gate=self.gate,
+            num_experts=config.n_routed_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            renormalize=config.norm_topk_prob,
+            routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.5),
+            prefix=f"{prefix}.experts",
+            **routing_args,
+        )
+        # DSpark uses draft-local checkpoint names and target-global CAM layer IDs.
+        self.experts.layer_idx = layer_idx
 
     def forward(
         self,
@@ -259,134 +214,34 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         input_ids: torch.Tensor | None = None,
         hidden_states_fp32: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Select DSV4 experts on Attention and exchange routed work via CAM."""
-        from afd_plugin.model_executor.models.npu import deepseek_v4_attention_gate
-
-        topk_weights, topk_ids = deepseek_v4_attention_gate.compute_attention_gate_topk(
-            self,
-            hidden_states,
-            input_ids=input_ids,
-            hidden_states_fp32=hidden_states_fp32,
-        )
-        dispatch_payload = prepare_cam_dispatch_payload(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            None,
-            use_sequence_parallel=self.use_sequence_parallel_moe,
-        )
-        afd_metadata = get_afd_metadata_from_forward_context()
-        if afd_metadata is None:
-            raise RuntimeError("Async CAM requires AFD forward metadata")
-        context = AFDTransferContext(
-            metadata=AFDTransferMetadata.create_attention_metadata(
-                layer_idx=self.layer_idx,
-                stage_idx=afd_metadata.stage_idx,
-                seq_len=int(dispatch_payload.hidden_states.shape[0]),
+        if self.gate is None:
+            # FFN opens the IDs channel on every V4 layer, including non-Hash MoE.
+            ids = local_hash_input_ids(
+                input_ids=get_forward_context().input_ids
+                if input_ids is None
+                else input_ids,
+                router_tokens=hidden_states.shape[0],
             )
-        )
-        receive = send_async_cam_remote_call(
-            afd_metadata.connector,
-            dispatch_payload.hidden_states,
-            context,
-            topk_weights=dispatch_payload.topk_weights,
-            topk_ids=dispatch_payload.topk_ids,
-        )
-        shared_output = (
-            self.shared_experts(hidden_states)
-            if self.shared_experts is not None
-            else None
-        )
-        maybe_apply_dbo_yield(hidden_states, role="attention")
-        output = receive()
-        output = restore_cam_dispatch_output(output, dispatch_payload.layout)
-        if shared_output is not None:
-            output = output + shared_output
-        return output
-
-
-class AFDDeepseekV4SyncAttentionGateRemoteMoE(AFDDeepseekV4AttentionGateRemoteMoE):
-    """DSV4 gate shell that keeps the router on Attention for the sync connector.
-
-    Inheritance is deliberate: the gate construction, the FP32 precast weight, the
-    hash-layer table and the shared-expert module are identical to the async shell,
-    and only the transport differs. Duplicating that construction would let the two
-    shells drift on routing parameters.
-
-    The forward differs in three ways, all forced by the sync contract:
-
-    - routing travels on the A2E wire slot instead of a CAM dispatch payload, so the
-      send and the receive are separate calls;
-    - the shared experts run *between* those calls, which is the whole point of
-      moving them here: their work overlaps the FFN side's routed work;
-    - with native DBO the stage is resolved before the routing send, the forward
-      yields between the send and the receive, and the receive reuses the resolved
-      stage so a peer ubatch cannot switch it mid-transfer.
-
-    Reusing ``RemoteFFNProxy._send_and_receive`` is not possible here: it issues the
-    send and the receive back to back, leaving no window for the shared experts.
-    """
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
-        hidden_states_fp32: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        from afd_plugin.model_executor.models.npu import deepseek_v4_attention_gate
-
-        topk_weights, topk_ids = deepseek_v4_attention_gate.compute_attention_gate_topk(
-            self,
-            hidden_states,
-            input_ids=input_ids,
-            hidden_states_fp32=hidden_states_fp32,
-        )
-        afd_metadata = get_afd_metadata_from_forward_context()
-        if afd_metadata is None:
-            raise RuntimeError("Sync Attention-side gate requires AFD forward metadata")
-        # AFD metadata is shared by the layer while DBO gives each ubatch its own
-        # thread and forward context, so resolve the stage once, before the send.
-        stage_idx = int(
-            getattr(get_forward_context(), "ubatch_idx", afd_metadata.stage_idx),
-        )
-        afd_metadata.stage_idx = stage_idx
-        context = AFDTransferContext(
-            metadata=AFDTransferMetadata.create_attention_metadata(
-                layer_idx=self.layer_idx,
-                stage_idx=stage_idx,
-                seq_len=int(hidden_states.shape[0]),
+            return self.experts(
+                hidden_states, router_logits=hidden_states, input_ids=ids
             )
-        )
-        # Routing shares the wire slot with token ids, so this send carries routing
-        # only. The FFN side is configured with recv_routing for the same reason.
-        afd_metadata.connector.send_attn_output(
+
+        # As in native internal routing, router_logits carries the gate input.
+        gate_input = hidden_states if hidden_states_fp32 is None else hidden_states_fp32
+        return self.experts(
             hidden_states,
-            context,
-            routing=(topk_ids, topk_weights),
+            router_logits=gate_input,
+            input_ids=input_ids,
+            attention_gate=self.gate,
+            shared_experts=self.shared_experts,
         )
-        shared_output = (
-            self.shared_experts(hidden_states)
-            if self.shared_experts is not None
-            else None
-        )
-        maybe_apply_dbo_yield(hidden_states, role="attention")
-        output = afd_metadata.connector.recv_ffn_output(
-            ref_tensor=hidden_states,
-            ubatch_idx=stage_idx,
-        )
-        if shared_output is not None:
-            output = output + shared_output
-        return output
 
 
 class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
     """Role-local DSV4 decoder layer.
 
-    The inherited native ``forward`` is intentionally retained.  On the
-    Attention role it executes the full native HC/DSA sequence and the
-    ``RemoteFFNProxy`` makes the AFD transfer at exactly the native FFN
-    boundary.  The FFN role is connector-driven and does not call this full
-    forward method; it invokes ``compute_ffn_output`` instead.
+    Attention runs native HC/DSA and calls the remote runner at the MoE
+    boundary. FFN workers call ``compute_ffn_output`` directly.
     """
 
     # Upstream source: vllm-ascend 7dcdb690caf879a17ab07382880d5773f5202e20,
@@ -451,11 +306,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         self.use_sequence_parallel_moe = parallel_config.use_sequence_parallel_moe
 
         # ### PATCH START: role-local Attention and remote experts
-        self.mlp: (
-            AFDDeepseekV4AttentionGateRemoteMoE
-            | AFDDeepseekV4RemoteMoE
-            | native.DeepseekV4MoE
-        )
+        self.mlp: AFDDeepseekV4MoE | native.DeepseekV4MoE
         if afd_config.role == "attention":
             self.self_attn = native.DeepseekV4Attention(
                 vllm_config=vllm_config,
@@ -467,23 +318,14 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 topk_indices_buffer=topk_indices_buffer,
                 reduce_results=not self.use_sequence_parallel_moe,
             )
-            if self.compute_gate_on_attention:
-                # Both shells keep the router on Attention; only the transport
-                # differs. Choosing by connector keeps the async CAM path unchanged.
-                gate_shell = (
-                    AFDDeepseekV4AttentionGateRemoteMoE
-                    if afd_config.connector == AFD_ASYNC_CONNECTOR
-                    else AFDDeepseekV4SyncAttentionGateRemoteMoE
-                )
-                self.mlp = gate_shell(
-                    config=config,
-                    layer_idx=self.layer_idx,
-                    prefix=f"{prefix}.mlp",
-                    vllm_config=vllm_config,
-                    is_draft_layer=is_draft_layer,
-                )
-            else:
-                self.mlp = AFDDeepseekV4RemoteMoE(layer_idx=layer_idx)
+            self.mlp = AFDDeepseekV4MoE(
+                config=config,
+                layer_idx=self.layer_idx,
+                prefix=f"{prefix}.mlp",
+                vllm_config=vllm_config,
+                compute_gate_on_attention=self.compute_gate_on_attention,
+                is_draft_layer=is_draft_layer,
+            )
         elif afd_config.role == "ffn":
             self.self_attn = native.PPMissingLayer()
             _refresh_ascend_fused_moe()
@@ -837,8 +679,8 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
         raise NotImplementedError(
-            "DSV4 AFD never returns gate outputs through this method; the "
-            "Attention-side gate keeps its top-k inside the gate shell"
+            "DSV4 AFD never returns gate outputs through this method. "
+            "The Attention CAM runner sends top-k routes directly."
         )
 
 
@@ -878,7 +720,21 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
             or not self.afd_config.compute_gate_on_attention
         ):
             return
-        prepare_attention_gate_w8a8_scales(self.model.layers)
+        from vllm_ascend.quantization.quant_type import QuantType
+
+        for module in self.model.layers:
+            layer = cast(AFDDeepseekV4DecoderLayer, module)
+            if not layer.is_moe_layer:
+                continue
+            experts = cast("AscendMoERunner", layer.mlp.experts)
+            if experts.quant_type != QuantType.W8A8:
+                continue
+            owner = cast("AscendRoutedExperts", experts.routed_experts)
+            if owner.dynamic_eplb or "w13_weight_scale_fp32" in owner.__dict__:
+                continue
+            owner.w13_weight_scale_fp32 = cast(
+                torch.Tensor, owner.w13_weight_scale
+            ).data.to(torch.float32)
         # ### PATCH END: retain FFN gate-on-A W8A8 scales after quant finalize
 
     def get_quantized_expert_weights(

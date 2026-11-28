@@ -47,7 +47,8 @@ related_issues:
   - "#105"
   - "#129"
   - "#225"
-last_reviewed: 2026-11-09
+  - "#638"
+last_reviewed: 2026-11-26
 ---
 
 # Model integration
@@ -67,18 +68,18 @@ make a backend-specific worker class the shared model API.
 ## Shared FFN components
 
 `model_executor/models/` owns model structure and checkpoint policy.
-`model_executor/ffn/remote.py` contains the remote proxies shared by CUDA and
-Ascend models, and the Attention-role MoE runners built through vLLM's
-`FusedMoEFactory`, which its factory currently enables for CUDA P2P only.
-`model_executor/ffn/npu/` owns the NPU-specific Async CAM
-layout, quantized weight contracts and native compute implementations:
+`model_executor/ffn/remote.py` contains the shared remote proxies and CUDA
+MoE runners. Ascend CAM runners and their V4 gate logic live in
+`model_executor/ffn/npu/remote.py`. Each connector registers its runner and device
+with `AFDConnectorFactory`. At layer construction, `build_expert()` looks up
+the registered class and passes it to vLLM's `FusedMoEFactory`.
 
 | Component | Responsibility | Dependencies |
 | --- | --- | --- |
-| `remote.py` | Connector-independent dense/MoE proxies, routed TP padding, and the Attention-role MoE runners built through vLLM's `FusedMoEFactory` | Connector contracts, the plugin AFD config, public vLLM helpers, the native fused-MoE factory, runner and routed-experts classes, and package forward context; no CAM, concrete model or compute imports |
-| `npu/async_cam.py` | CAM model-side TP/SP layout conversion, padding, output restoration and native DBO receive handoff | Connector contracts and native DBO hooks; no concrete model or compute imports |
+| `remote.py` | Build remote experts, send and receive FFN results, and run CUDA P2P and DeepEP M2N | Connector registry, vLLM MoE factory and forward context |
+| `npu/remote.py` | CAMP2P and Async CAM runners, V4 gate routing and Ascend weightless experts | Shared remote runner, CAM layout and DBO helpers |
 | `npu/expert_weights.py` | Loaded `QuantizedExpertWeights`, Ascend quantized layout validation, geometry and graph signatures | Torch tensors with the Layered/Mega W4A8/W8A8 storage and scale contracts; no native operator lookup or workspace allocation |
-| `npu/compute.py` | Independent NPU Layered and Mega native implementations and their buffers | Expert weights and explicit configuration/communication arguments; no model internals |
+| `async_cam_runtime/async_cam_layered.py`, `async_cam_runtime/async_cam_mega.py` | Execute Layered or Mega work on FFN | Loaded expert weights, runtime configuration and communication state |
 
 ```mermaid
 flowchart TD
@@ -86,25 +87,23 @@ flowchart TD
     Runner --> Model[Concrete model adapter]
     Model --> Remote[ffn/remote.py]
     Remote --> Connector[Connector / Session]
-    Model --> CAM[ffn/npu/async_cam.py]
+    Remote -->|Ascend CAM| CAM[ffn/npu/remote.py]
     CAM --> Connector
     Model --> Weights[ffn/npu/expert_weights.py]
-    Runner --> Compute[ffn/npu/compute.py: Layered OR Mega]
+    Runner --> Compute[Async CAM Layered or Mega executor]
     Compute --> Weights
     Compute --> Native[Native NPU operators]
 ```
 
 DeepSeek V2, Qwen3, Qwen3.5 and CUDA/Ascend V4 use the shared remote components.
-The NPU CAM helpers adapt model tensors to remote FFN calls across Ascend
-model families. Their placement under `ffn/npu/` reflects the backend-specific
-CAM contract. The quantized weight contract is shared by Layered and Mega;
-its packed weights, encoded scales and graph signatures describe the Ascend
-layout rather than a cross-platform quantization interface. Connector/Session
-owns transport windows, pending work and Push/Pull protocol state. The shared
-remote module does not import `ffn/npu/`, and neither remote module imports
-compute.
-Gate, Hash routing, shared experts, dense-layer behavior and DSpark target/draft
-identities remain model-owned. The Async runner receives loaded weights through
+The pinned Ascend factory combines AFD's weightless expert class with its
+native routed-experts class at construction. CAM transport windows and pending work
+belong to the connector. Layered and Mega use the same packed weights,
+encoded scales and graph signatures on FFN.
+The model owns dense-layer behavior and, for V4, the gate weights, Hash table,
+shared experts and DSpark layer identities. On Attention, the CAMP2P and Async
+CAM runners use the V4 gate to select experts before dispatch.
+The Async FFN runner receives loaded weights through
 `get_quantized_expert_weights()` and selects one compute implementation. Mega
 neither constructs Layered nor keeps the connector; its live communication
 arguments are bound after connector initialization.
@@ -129,18 +128,17 @@ SFA/MLA/DSA-specific handling stays explicit inside that worker-side module.
 | Registration map | [`afd_plugin/__init__.py`](../../../afd_plugin/__init__.py) | [`test_package.py`](../../../tests/unit/package/test_package.py) |
 | Role-aware model and weight loading | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py), [`_weight_utils.py`](../../../afd_plugin/model_executor/models/_weight_utils.py) | [`test_deepseek_v2_construction.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_construction.py), [`test_weight_utils.py`](../../../tests/unit/model_executor/models/test_weight_utils.py), model and accuracy E2E suites |
 | DeepSeek V4 CUDA role boundary | [`deepseek_v4.py`](../../../afd_plugin/model_executor/models/deepseek_v4.py) | [`test_deepseek_v4_construction.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_construction.py), [`test_deepseek_v4_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_proxy.py), [`test_deepseek_v4_weight_policy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_weight_policy.py) |
-| DeepSeek V4 Ascend Hash-id boundary | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py), [`npu/deepseek_v4_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_attention_gate.py) | [`test_deepseek_v4_hash_ids.py`](../../../tests/unit/model_executor/test_deepseek_v4_hash_ids.py), [NPU model role tests](../../../tests/unit/model_executor/models/npu/test_deepseek_v4.py), ids-mode cases in [`test_camp2p_token_ids.py`](../../../tests/unit/connectors/test_camp2p_token_ids.py) |
+| DeepSeek V4 Ascend Hash-id boundary | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py), [`ffn/npu/remote.py`](../../../afd_plugin/model_executor/ffn/npu/remote.py) | [`test_deepseek_v4_hash_ids.py`](../../../tests/unit/model_executor/test_deepseek_v4_hash_ids.py), [NPU model role tests](../../../tests/unit/model_executor/models/npu/test_deepseek_v4.py), ids-mode cases in [`test_camp2p_token_ids.py`](../../../tests/unit/connectors/test_camp2p_token_ids.py) |
 | Qwen3 MoE role-aware model and weight loading | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py), [`test_qwen3_moe_weight_policy.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_weight_policy.py) |
 | CUDA remote-experts boundary | [`ffn/remote.py`](../../../afd_plugin/model_executor/ffn/remote.py), [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py) | [`test_remote.py`](../../../tests/unit/model_executor/ffn/test_remote.py), [`test_p2p_experts_contract.py`](../../../tests/unit/connectors/test_p2p_experts_contract.py), [`test_deepseek_v2_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_proxy.py), bit-exact native-kernel parity in [`test_attention_routing.py`](../../../tests/gpu/test_attention_routing.py) |
 | Qwen3 MoE FFN-only routed-experts shell | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py) |
 | Forward-context adapter | [`forward_context.py`](../../../afd_plugin/forward_context.py) | [`test_forward_context.py`](../../../tests/unit/test_forward_context.py) |
 | NPU Async CAM native DBO handoff | [`async_cam_dbo.py`](../../../afd_plugin/connectors/npu/async_cam_runtime/async_cam_dbo.py), [`npu/ubatch_runner.py`](../../../afd_plugin/v1/worker/npu/ubatch_runner.py) | [`test_async_cam_dbo.py`](../../../tests/unit/connectors/npu/async_cam_runtime/test_async_cam_dbo.py), [`test_npu_model_runner_v2.py`](../../../tests/unit/v1/worker/test_npu_model_runner_v2.py) |
-| Ascend DeepSeek V4 FFN W8A8 scales | [`deepseek_v4_weights.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_weights.py) | [`test_deepseek_v4_weights.py`](../../../tests/unit/model_executor/models/npu/test_deepseek_v4_weights.py) |
+| Ascend DeepSeek V4 FFN W8A8 post-load scales | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py) | [`test_deepseek_v4_weights.py`](../../../tests/unit/model_executor/models/npu/test_deepseek_v4_weights.py) |
 | Ascend CAM dispatch layout | [`async_cam_layout.py`](../../../afd_plugin/connectors/npu/async_cam_runtime/async_cam_layout.py) | [`test_async_cam_dbo.py`](../../../tests/unit/connectors/npu/async_cam_runtime/test_async_cam_dbo.py) |
 | Ascend stage metadata and RoPE ownership | [`worker/npu/attention_metadata.py`](../../../afd_plugin/v1/worker/npu/attention_metadata.py) | [`test_attention_metadata.py`](../../../tests/unit/v1/worker/npu/test_attention_metadata.py) |
 | Ascend external-routing MoE execution | [`npu/deepseek_v4_external_routing_moe.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_external_routing_moe.py) | [`test_deepseek_v4_external_routing_moe_cpu.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_external_routing_moe_cpu.py) |
-
-| Ascend CAM orchestration | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py) | [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py) |
+| Ascend CAM orchestration | [`ffn/npu/remote.py`](../../../afd_plugin/model_executor/ffn/npu/remote.py), [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py) | [CAMP2P runner](../../../tests/unit/model_executor/models/test_camp2p_moe_runner.py), [Async CAM runner](../../../tests/unit/model_executor/models/test_deepseek_v4_cam_layout.py), [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py) |
 
 ## Model registration
 
@@ -202,7 +200,10 @@ shared experts as native, and its routed experts send the routes, with the TP
 padding rows unrouted. FFN runs only the routed
 experts, and combine returns each token's weighted top-k sum, which the runner
 scales as native. CUDA Attention-side remote experts currently reject EPLB. On Ascend,
-the DeepSeek V2 family uses synchronous CAMP2P with the gate on FFN.
+DeepSeek V2/V2-Lite passes the decoder's 2D activation directly to the
+CAMP2P MoE runner. FFN runs the complete native MoE. Dense layers use
+`RemoteFFNProxy`. Ascend's remote experts keep the weightless AFD quantization
+method through post-load processing.
 
 The full AFD model remains decorated with vLLM's compile support. Backend-only
 helpers are imported inside the NPU path so CUDA model import does not require
@@ -240,15 +241,24 @@ CUDA configurations and validation limits.
 
 [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py)
 wraps the native Ascend model independently of the CUDA adapter. Attention
-owns attention, mHC, normalization and finalization. Synchronous CAMP2P has two
-shapes, selected by the common `compute_gate_on_attention` field: with `false`
-the FFN role owns the native gate and MoE, and with `true` (DeepSeek-V4, TP 1; DBO or
-ubatching additionally requires Attention DP > 1 and exactly two microbatches) the
-router and shared experts run on Attention and FFN executes only the transported
-routed experts. The connector-local flag of the same name is
-kept for compatibility and does not select the mode. Async CAM keeps the
-Hash/top-k router and shared experts on Attention and sends only routed-expert
-work; `dynamicQuant=1` is required.
+owns attention, mHC, normalization and finalization. The MoE block creates
+the role-local gate and shared MLP at their checkpoint names. The connector
+selects the runner when the layer is built.
+
+| V4 configuration | Attention-side wire and completion |
+| --- | --- |
+| CAMP2P, gate on FFN | Every layer sends its normalized activation and rank-local token IDs, then receives the complete MoE output. |
+| CAMP2P, gate on Attention | Send the activation and top-k IDs/weights, run shared experts on the original rows, yield, receive on the sending stage, then add shared once. FFN runs external routing. Both roles use TP 1. DBO requires Attention DP > 1, two microbatches and speculative decoding disabled. |
+| Async CAM, gate on Attention | Dispatch rank-local rows and routes, run shared experts and yield. The owning microbatch restores the combined result's TP/SP layout before adding shared. The connector-driven FFN executor uses `dynamicQuant=1`. |
+
+The common `compute_gate_on_attention` field selects the placement.
+With the gate on Attention, both CAM runners project the local token rows in
+FP32 and select top-k before preparing the transfer. Hash layers look up the
+IDs for those same rows in the model's checkpoint table. The selector applies
+`routed_scaling_factor` to the weights once.
+On FFN, `process_weights_after_loading()` restores a missing
+`w13_weight_scale_fp32` from the canonical W8A8 scale for static experts
+after native quantization finalization.
 
 The DSpark adapter follows the same boundary. Native checkpoint names
 `mtp.0..2` and KV names are retained; its CAM layer IDs start at the target's
@@ -350,10 +360,9 @@ and [#105](https://github.com/JiusiServe/afd-plugin/issues/105).
 
 ## Model execution flow
 
-On Ascend, DeepSeek V2 runs the native decoder forward. After Attention and
-normalization, the layer's `RemoteFFNProxy` sends hidden states through
-synchronous CAMP2P, yields when DBO is enabled, and receives the FFN result
-for that layer. The native model forward advances to the next layer.
+On Ascend, the DeepSeek V2/V2-Lite decoder calls the CAMP2P runner at MoE
+layers and `RemoteFFNProxy` at dense layers. Both send the normalized hidden
+states, yield for DBO and receive the completed FFN result for that stage.
 
 The FFN runner calls the causal-LM wrapper's `compute_ffn_output()`, which
 dispatches to the selected decoder layer. Normal mode executes that layer's
@@ -390,8 +399,8 @@ sequenceDiagram
 ```
 
 DeepSeek V4 Async CAM uses the same model forward for unsplit execution and
-native DBO children. Its MoE sends top-k payloads through `send_async_cam_remote_call()`;
-native peer receive hooks reclaim the single CAM window before another send.
+native DBO children. Its registered Async CAM runner sends top-k payloads through
+`send_async_cam_remote_call()`. Native peer receive hooks reclaim the single CAM window before another send.
 Only the resumed owner restores layout, performs TP collectives, and adds its
 shared output. Native DBO owns all microbatch boundaries.
 

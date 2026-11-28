@@ -26,6 +26,7 @@ class _ConnectorRegistration(NamedTuple):
     # ``build_expert`` builds for this connector; None when the connector has
     # no factory-built Attention MoE path.
     attention_moe_runner: tuple[str, str] | None
+    attention_moe_device: str
 
 
 class AFDConnectorFactory:
@@ -39,6 +40,7 @@ class AFDConnectorFactory:
         class_name: str,
         *,
         attention_moe_runner: tuple[str, str] | None = None,
+        attention_moe_device: str = "cuda",
         replace: bool = False,
     ) -> None:
         if name in cls._registry and not replace:
@@ -56,7 +58,9 @@ class AFDConnectorFactory:
                 )
             return connector_cls
 
-        cls._registry[name] = _ConnectorRegistration(loader, attention_moe_runner)
+        cls._registry[name] = _ConnectorRegistration(
+            loader, attention_moe_runner, attention_moe_device
+        )
 
     @classmethod
     def create_connector(
@@ -90,12 +94,16 @@ class AFDConnectorFactory:
         return cls._registry[connector_name].load_connector()
 
     @classmethod
-    def get_attention_moe_runner(cls, connector_name: str) -> tuple[str, str] | None:
-        """Return the (module path, class name) of the connector's
-        Attention-role MoE runner, or None when it registers none."""
+    def get_attention_moe_runner(
+        cls, connector_name: str, device_type: str = "cuda"
+    ) -> tuple[str, str] | None:
+        """Return the connector's Attention-role MoE runner path for the device."""
         if connector_name not in cls._registry:
             raise ValueError(f"unsupported AFD connector type: {connector_name}")
-        return cls._registry[connector_name].attention_moe_runner
+        registration = cls._registry[connector_name]
+        if registration.attention_moe_device != device_type:
+            return None
+        return registration.attention_moe_runner
 
     @classmethod
     def parse_connector_extra_info(
@@ -133,11 +141,21 @@ AFDConnectorFactory.register_connector(
     "CAMP2pAFDConnector",
     "afd_plugin.connectors.npu.camp2p",
     "CAMP2pAFDConnector",
+    attention_moe_runner=(
+        "afd_plugin.model_executor.ffn.npu.remote",
+        "AFDCAMP2PMoERunner",
+    ),
+    attention_moe_device="npu",
 )
 AFDConnectorFactory.register_connector(
     "CAMAsyncAFDConnector",
     "afd_plugin.connectors.npu.async_cam",
     "CAMAsyncAFDConnector",
+    attention_moe_runner=(
+        "afd_plugin.model_executor.ffn.npu.remote",
+        "AFDAsyncCAMMoERunner",
+    ),
+    attention_moe_device="npu",
 )
 
 

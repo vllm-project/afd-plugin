@@ -13,6 +13,8 @@ from typing import cast
 
 import pytest
 
+from tests.unit.fakes.vllm_config import attention_moe_vllm_config, npu_dspark_config
+
 
 @pytest.fixture
 def torch() -> ModuleType:
@@ -158,50 +160,10 @@ def construct_model(torch):
             "AFD_ASYNC_CONNECTOR": "CAMAsyncAFDConnector",
             "parse_afd_config": lambda config, **kwargs: config.afd,
             "_refresh_ascend_fused_moe": lambda: None,
-            "AFDDeepseekV4RemoteMoE": lambda **kwargs: nn.Identity(),
+            "AFDDeepseekV4MoE": lambda **kwargs: nn.Identity(),
         }
         exec(constructors, namespace)
         return namespace["AFDDeepseekV4ForCausalLM"](vllm_config=vllm_config)
-
-    return construct
-
-
-@pytest.fixture
-def construct_gate(torch):
-    nn = torch.nn
-
-    def make_linear(input_size, output_size, *, bias, **_):
-        return nn.Linear(input_size, output_size, bias=bias)
-
-    namespace = {
-        "nn": nn,
-        "torch": torch,
-        "RemoteFFNProxy": nn.Identity,
-        "ReplicatedLinear": make_linear,
-    }
-    exec(_compile_constructors("AFDDeepseekV4AttentionGateRemoteMoE"), namespace)
-    gate = namespace["AFDDeepseekV4AttentionGateRemoteMoE"]
-    vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(use_sequence_parallel_moe=False),
-    )
-
-    def construct(routing_config, layer_idx, is_draft_layer):
-        config = SimpleNamespace(
-            hidden_size=2,
-            vocab_size=4,
-            num_experts_per_tok=2,
-            n_routed_experts=3,
-            n_shared_experts=None,
-            norm_topk_prob=True,
-            **routing_config,
-        )
-        return gate(
-            config=config,
-            layer_idx=layer_idx,
-            prefix=f"model.layers.{layer_idx}.mlp",
-            vllm_config=vllm_config,
-            is_draft_layer=is_draft_layer,
-        )
 
     return construct
 
@@ -218,9 +180,14 @@ def construct_gate(torch):
     ],
 )
 def test_gate_allocates_the_checkpoint_parameters_for_its_moe_type(
-    construct_gate, torch, routing_config, layer_idx, is_draft_layer, uses_hash
+    cam_moe, torch, routing_config, layer_idx, is_draft_layer, uses_hash
 ):
-    state = construct_gate(routing_config, layer_idx, is_draft_layer).state_dict()
+    state = cam_moe(
+        gate=True,
+        routing_config=routing_config,
+        layer_idx=layer_idx,
+        is_draft_layer=is_draft_layer,
+    ).state_dict()
     if uses_hash:
         assert state["gate.tid2eid"].dtype == torch.int32
         assert state["gate.tid2eid"].tolist() == [[0, 1], [1, 2], [2, 0], [0, 1]]
@@ -230,6 +197,63 @@ def test_gate_allocates_the_checkpoint_parameters_for_its_moe_type(
         correction_bias = state["gate.e_score_correction_bias"]
         assert correction_bias.dtype == torch.float32
         assert correction_bias.shape == (3,)
+
+
+@pytest.fixture
+def dspark_cam_decoder(ascend_v4_model, prefix):
+    from transformers import DeepseekV4Config
+    from vllm.config import set_current_vllm_config
+
+    hf_config = DeepseekV4Config(
+        num_hidden_layers=43,
+        hidden_size=4,
+        moe_intermediate_size=8,
+        n_routed_experts=3,
+        num_experts_per_tok=2,
+        n_shared_experts=0,
+    )
+    dspark = npu_dspark_config()
+    config = attention_moe_vllm_config(hf_config=hf_config, enforce_eager=True)
+    config.additional_config = dspark.additional_config
+    config.speculative_config = dspark.speculative_config
+    config.parallel_config.enable_expert_parallel = True
+    with set_current_vllm_config(config):
+        decoder = ascend_v4_model.AFDDeepseekV4DecoderLayer(
+            config, prefix=prefix, is_draft_layer=True
+        )
+    return decoder, config.compilation_config.static_all_moe_layers
+
+
+@pytest.mark.parametrize("prefix, wire_layer", [("mtp.0", 43), ("mtp.1", 44)])
+def test_dspark_draft_sends_global_cam_layer_without_dbo(
+    dspark_cam_decoder,
+    torch,
+    monkeypatch,
+    prefix,
+    wire_layer,
+):
+    from afd_plugin.model_executor.ffn.npu import remote as npu_remote
+    from tests.unit.fakes.connector import install_proxy_context
+
+    decoder, registered_layers = dspark_cam_decoder
+    events: list[tuple] = []
+    metadata = install_proxy_context(monkeypatch, events, stage_idx=0)
+    metadata.stage_idx = 0
+    monkeypatch.setattr(
+        npu_remote, "maybe_apply_dbo_yield", lambda states, *, role: states
+    )
+    hidden = torch.ones(2, 4)
+    ids = torch.tensor([[0, 1], [1, 2]], dtype=torch.int32)
+    weights = torch.full((2, 2), 0.5)
+    monkeypatch.setattr(npu_remote, "_cam_gate_topk", lambda *a, **kw: (weights, ids))
+
+    output = decoder.mlp(hidden)
+
+    assert registered_layers == [f"{prefix}.mlp.experts"]
+    send, recv = events
+    assert send[0] == "send" and send[2].metadata.layer_idx == wire_layer
+    assert recv[0] == "recv" and recv[2] == send[2].metadata.stage_idx == 0
+    torch.testing.assert_close(output, hidden * 0.25)
 
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])

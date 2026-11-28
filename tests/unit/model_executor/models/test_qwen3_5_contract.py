@@ -22,6 +22,7 @@ from afd_plugin.config import DEEPEP_M2N_CONNECTOR  # noqa: E402
 from afd_plugin.model_executor.ffn import remote  # noqa: E402
 from afd_plugin.model_executor.models import qwen3_5 as adapter  # noqa: E402
 from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
+from tests.unit.fakes.platform import use_cpu_moe_factory  # noqa: E402
 from tests.unit.fakes.vllm_config import attention_moe_vllm_config  # noqa: E402
 
 QWEN_LAYER_IDX = 7
@@ -44,6 +45,7 @@ class _StandInLayer(nn.Module):
 def build_attention_qwen_layer(monkeypatch):
     """Builds a CUDA Attention-role Qwen3.5 decoder layer for a connector and
     an Attention TP size; DeepEP M2N computes the gate on Attention."""
+    use_cpu_moe_factory(monkeypatch)
     text_config = SimpleNamespace(
         model_type="qwen3_5_moe_text",
         rms_norm_eps=1e-6,

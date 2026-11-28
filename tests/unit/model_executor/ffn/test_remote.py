@@ -20,7 +20,7 @@ from vllm.model_executor.model_loader.utils import (  # noqa: E402
 )
 from vllm.v1.worker import ubatching  # noqa: E402
 
-from afd_plugin.config import DEEPEP_M2N_CONNECTOR  # noqa: E402
+from afd_plugin.config import CAMP2P_CONNECTOR, DEEPEP_M2N_CONNECTOR  # noqa: E402
 from afd_plugin.connectors import AFDConnectorFactory  # noqa: E402
 from afd_plugin.model_executor.ffn import remote  # noqa: E402
 from tests.unit.fakes.connector import (  # noqa: E402
@@ -28,6 +28,7 @@ from tests.unit.fakes.connector import (  # noqa: E402
     install_proxy_context,
 )
 from tests.unit.fakes.model_layers import GateLinear  # noqa: E402
+from tests.unit.fakes.platform import use_cpu_moe_factory  # noqa: E402
 from tests.unit.fakes.vllm_config import attention_moe_vllm_config  # noqa: E402
 
 LAYER_IDX = 3
@@ -38,6 +39,7 @@ TOP_K = 2
 INTERMEDIATE_SIZE = 11
 # ``ProxyConnector.recv_ffn_output`` returns the reference rows times this.
 FFN_OUTPUT_SCALE = 0.25
+ROUTED_SCALING_FACTOR = 2.5
 STAGE_IDX = 1
 # The in-place combine below writes this into the receive buffer.
 COMBINED_VALUE = 1.0
@@ -66,6 +68,8 @@ RESERVED_FACTORY_ARGUMENTS = (
 
 
 def _build_runner(monkeypatch, config, *, device_type="cuda", gate=None, **kwargs):
+    if device_type == "cuda":
+        use_cpu_moe_factory(monkeypatch)
     monkeypatch.setattr(
         remote, "current_platform", SimpleNamespace(device_type=device_type)
     )
@@ -103,7 +107,7 @@ class _InPlaceCombineConnector(ProxyConnector):
         # Record a copy: combine may be given the sent buffer.
         super().send_attn_output(hidden_states.clone(), context, **kwargs)
 
-    def recv_ffn_output(self, *, ref_tensor, ubatch_idx):
+    def recv_ffn_output(self, *, ref_tensor, ubatch_idx, context=None):
         self.events.append(("recv", ref_tensor, ubatch_idx))
         return ref_tensor.fill_(COMBINED_VALUE)
 
@@ -148,14 +152,32 @@ def test_factory_registers_native_runner_without_expert_weights(
     assert list(runner.buffers()) == []
 
 
-def test_runner_stays_weightless_and_fails_on_expert_checkpoints(monkeypatch):
+@pytest.mark.parametrize(
+    ("device_type", "connector"),
+    [("cuda", "P2pNcclAFDConnector"), ("npu", CAMP2P_CONNECTOR)],
+    ids=["cuda-p2p", "ascend-camp2p"],
+)
+def test_runner_stays_weightless_and_fails_on_expert_checkpoints(
+    monkeypatch, device_type, connector
+):
     """Post-load processing keeps the runner weightless, and an expert weight
     that reaches it fails the load.
 
     Why: Attention role filtering must keep FFN expert weights away; a leaked
     weight must fail loudly instead of being dropped.
     """
-    runner = _build_runner(monkeypatch, attention_moe_vllm_config())
+    if device_type == "npu":
+        ascend_config = pytest.importorskip("vllm_ascend.ascend_config")
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+        monkeypatch.setattr(
+            ascend_config,
+            "_ASCEND_CONFIG",
+            ascend_config.AscendConfig(
+                sparse_kv_offload_config=ascend_config.SparseKVOffloadConfig()
+            ),
+        )
+    config = attention_moe_vllm_config(connector=connector)
+    runner = _build_runner(monkeypatch, config, device_type=device_type)
     model_config = SimpleNamespace(
         quantization=None, word_embeddings_untied_by_checkpoint=False
     )
@@ -171,19 +193,16 @@ def test_runner_stays_weightless_and_fails_on_expert_checkpoints(monkeypatch):
 @pytest.mark.parametrize(
     ("device_type", "connector"),
     [
+        ("cuda", "CAMP2pAFDConnector"),
         ("cuda", "CAMAsyncAFDConnector"),
-        ("npu", "CAMP2pAFDConnector"),
+        ("npu", "P2pNcclAFDConnector"),
         ("cpu", "P2pNcclAFDConnector"),
     ],
 )
 def test_factory_rejects_unsupported_placement_before_registration(
     monkeypatch, device_type, connector
 ):
-    """Only a CUDA connector whose registration names a runner builds one.
-
-    Why: the other connectors run on NPU through their own model paths, which
-    expect a different payload.
-    """
+    """A connector's registration must provide a runner for the active device."""
     config = attention_moe_vllm_config(connector=connector)
 
     with pytest.raises(ValueError, match="unsupported Attention remote MoE"):
@@ -323,7 +342,11 @@ def test_runner_without_gate_sends_hidden_states_only(
     )
     events: list[tuple] = []
     install_proxy_context(monkeypatch, events, stage_idx=STAGE_IDX)
-    runner = _build_runner(monkeypatch, attention_moe_vllm_config())
+    runner = _build_runner(
+        monkeypatch,
+        attention_moe_vllm_config(),
+        routed_scaling_factor=ROUTED_SCALING_FACTOR,
+    )
     hidden_states = _hidden_states(num_tokens)
 
     output = runner(hidden_states=hidden_states, router_logits=hidden_states)
