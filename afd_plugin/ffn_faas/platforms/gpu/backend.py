@@ -11,10 +11,13 @@ transport logic are not re-implemented: they belong to
 
 from __future__ import annotations
 
+import os
 import threading
 from argparse import Namespace
+from typing import TYPE_CHECKING
 
 import torch
+from afdep.deepep import PER_BUFFER_COMM_STREAM_ENV
 from vllm.config import set_current_vllm_config
 
 from afd_plugin.connectors.gpu.deepep_m2n.connector import DeepEPM2NAFDConnector
@@ -27,6 +30,9 @@ from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (
     RoutedExpertsModel,
 )
 from afd_plugin.validation import validate_gpu_model_runner_v2_config
+
+if TYPE_CHECKING:
+    from afd_plugin.ffn_faas.platforms.gpu.units import AttentionUnits
 
 
 class DeepEPM2NFFNBackend:
@@ -48,6 +54,8 @@ class DeepEPM2NFFNBackend:
         self.runner: GPUFFNRoutedExpertsModelRunner | None = None
         self.model: RoutedExpertsModel | None = None
         self._cancel_requested = threading.Event()
+        # Set only with --attention-units above 1 (Take First Ready).
+        self.units: AttentionUnits | None = None
 
     def prepare(self, service: FFNService) -> None:
         """Bring this F rank from launch to paired with Attention.
@@ -121,7 +129,22 @@ class DeepEPM2NFFNBackend:
                 local_expert_first=local_expert_ids[0],
                 local_expert_last=local_expert_ids[-1],
             )
+            several_units = self.settings.attention_units > 1
+            if several_units:
+                # One DeepEP buffer per unit in this process (afdEP-comm reads
+                # this when a buffer is created).
+                os.environ[PER_BUFFER_COMM_STREAM_ENV] = "1"
             self.runner.initialize_afd_connector()
+            if several_units:
+                # Lazy: afdep.service exists only in the afdEP-comm build that
+                # has the FFN service.
+                from afd_plugin.ffn_faas.platforms.gpu.units import AttentionUnits
+
+                self.units = AttentionUnits(
+                    self.runner,
+                    self.settings.attention_units,
+                    self._cancel_requested.is_set,
+                )
             assert connector.attn_tp_size is not None
             assert connector.capacity_tokens_per_rank is not None
             assert connector.bucket_ladder is not None
@@ -139,6 +162,8 @@ class DeepEPM2NFFNBackend:
     def start_receiver(self) -> None:
         """Select the GPU once on the receiving thread, as the Worker does."""
         self.environment.activate_thread()
+        if self.units is not None:
+            self.units.start()
 
     def execute_step(self) -> bool:
         """Run one control payload's step through the shared GPU runner method.
@@ -152,6 +177,9 @@ class DeepEPM2NFFNBackend:
         a peer failed), raises and fails the service with owners retained.
         """
         assert self.runner is not None
+        if self.units is not None:
+            # One MoE layer of the first ready Attention unit.
+            return self.units.step()
         return self.runner.execute_connector_driven_step(
             cancel_requested=self._cancel_requested.is_set
         )
@@ -167,7 +195,9 @@ class DeepEPM2NFFNBackend:
         mechanism as ``AFDFFNWorker.stop_ffn_server_loop``.
         """
         self._cancel_requested.set()
-        if self.runner is not None:
+        if self.units is not None:
+            self.units.cancel()
+        elif self.runner is not None:
             control_plane = self.runner.connector.control_plane
             if control_plane is not None:
                 control_plane.close()
@@ -191,6 +221,8 @@ class DeepEPM2NFFNBackend:
         assert self.runner is not None
         if not self.runner.receiver_exited:
             raise RuntimeError("GPU FFN receiver has not exited; retain resources")
+        if self.units is not None:
+            self.units.close()
         self.runner.shutdown()
         self.environment.close()
         self.model = None

@@ -1040,7 +1040,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             init_method=self._rendezvous,
             world_size=self.layout.union_size,
             rank=self.world_rank,
-            group_name=BOOTSTRAP_GROUP_NAME,
+            group_name=self._group_name(BOOTSTRAP_GROUP_NAME),
             timeout=self._timeout,
         )
         local_alignment = None
@@ -1096,7 +1096,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
                 rank=self.transport.transport_rank(
                     self.afd_config.role, self.role_rank
                 ),
-                group_name=TRANSPORT_GROUP_NAME,
+                group_name=self._group_name(TRANSPORT_GROUP_NAME),
                 timeout=self._timeout,
             )
         if self.world_rank == 0:
@@ -1147,7 +1147,7 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             init_method=self._rendezvous,
             world_size=self.layout.union_size,
             rank=self.world_rank,
-            group_name=PROCESS_GROUP_NAME,
+            group_name=self._group_name(PROCESS_GROUP_NAME),
             timeout=self._timeout,
         )
         try:
@@ -1170,6 +1170,12 @@ class DeepEPM2NAFDConnector(AFDRoutedExpertsConnector):
             raise
         _CONNECTORS[self._op_id] = self
         self._initialized = True
+
+    def _group_name(self, name: str) -> str:
+        """Per rendezvous port: torch rejects a repeated group name in one
+        process, and an FFN rank serving several Attention units holds one
+        connector (one port) per unit."""
+        return f"{name}_{self.afd_config.port}"
 
     def _new_lanes(self) -> Lanes:
         """afdEP-comm's transport: one ``Buffer`` per lane on the transport group."""

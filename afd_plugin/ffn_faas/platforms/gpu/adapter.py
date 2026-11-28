@@ -87,6 +87,13 @@ class GPUDeepEPM2NAdapter:
         """
         parser = create_ffn_engine_parser()
         parser.set_defaults(skip_tokenizer_init=True, enable_ep_weight_filter=True)
+        parser.add_argument(
+            "--attention-units",
+            type=int,
+            default=1,
+            help="Attention units (separate vllm serve deployments on afd.port, "
+            "afd.port + 1, ...) served in arrival order (Take First Ready)",
+        )
         return parser
 
     def configure(self, args: Namespace) -> FFNLaunch:
@@ -117,6 +124,7 @@ class GPUDeepEPM2NAdapter:
             dbo=bool(args.enable_dbo),
             connector_extra_config=MappingProxyType(dict(afd.connector_extra_config)),
             shutdown_timeout=args.receiver_shutdown_timeout,
+            attention_units=args.attention_units,
         )
         return FFNLaunch(
             rank=launcher.rank,
@@ -126,7 +134,9 @@ class GPUDeepEPM2NAdapter:
             shutdown_timeout=settings.shutdown_timeout,
             backend_factory=partial(create_backend, settings, args),
             initial_status={
-                "payload_format": BF16_PAYLOAD,
+                "payload_format": settings.connector_extra_config.get(
+                    "payload_format", BF16_PAYLOAD
+                ),
                 "num_lanes": settings.num_lanes,
                 "graph_mode": settings.graph_mode,
                 "dbo": settings.dbo,
