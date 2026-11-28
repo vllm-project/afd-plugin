@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from afd_plugin.connectors.npu.async_mega import CAMAsyncMegaAFDConnector
 from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from afd_plugin.connectors.npu.async_mega.mega_layers import LayerWeights
 
 
+@runtime_checkable
 class MegaFFNModel(Protocol):
     def get_mega_expert_weights(self, rank: int) -> dict[int, LayerWeights]: ...
 
@@ -33,18 +34,29 @@ class MegaNPUFFNModelRunner(AFDNPUFFNModelRunner):
     """
 
     def initialize_afd_connector(self) -> None:
-        if self.connector.is_initialized:
+        connector = self.connector
+        if not isinstance(connector, CAMAsyncMegaAFDConnector):
+            raise TypeError("Mega FFN runner requires CAMAsyncMegaAFDConnector")
+        self.mega_connector = connector
+        if connector.is_initialized:
             return
-        connector = cast(CAMAsyncMegaAFDConnector, self.connector)
         # Layer weights exist only after the model is loaded; the connector
         # packs them once and selects the layer on device per dispatched tile.
-        model = cast(MegaFFNModel, self.get_model())
-        connector.prepare_layers(model.get_mega_expert_weights(connector.role_rank))
-        connector.init_afd_connector()
+        preparation_error = None
+        try:
+            model = self.get_model()
+            if not isinstance(model, MegaFFNModel):
+                raise TypeError("Mega FFN model must provide get_mega_expert_weights")
+            connector.prepare_layers(model.get_mega_expert_weights(connector.role_rank))
+        except Exception as exc:
+            # Join the host rendezvous even on conversion failure so Attention
+            # receives the original error before any communication window exists.
+            preparation_error = exc
+        connector.init_afd_connector(preparation_error=preparation_error)
 
     def execute_connector_driven_step(self) -> None:
         """Run one fused dispatch/compute/combine step for the next ready ubatch."""
-        cast(CAMAsyncMegaAFDConnector, self.connector).execute_next_experts()
+        self.mega_connector.execute_next_experts()
 
 
 __all__ = ["MegaNPUFFNModelRunner"]

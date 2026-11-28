@@ -67,14 +67,18 @@ def test_mega_native_registration_uses_one_op_type(suffix: str):
     root = Path(__file__).resolve().parents[3] / "csrc/npu/ascend_kernels"
     op = root / f"afd_async_{suffix}_arch35"
     definition = (op / f"op_host/{suffix}_def.cpp").read_text()
-    op_type = re.search(r"OP_ADD\((\w+)\)", definition).group(1)
+    op_match = re.search(r"OP_ADD\((\w+)\)", definition)
+    assert op_match is not None, f"{op}: missing OP_ADD registration"
+    op_type = op_match.group(1)
     declarations = [
         (op / f"op_host/{suffix}_infershape.cpp", "IMPL_OP_INFERSHAPE"),
         (op / f"op_host/op_tiling/arch35/{suffix}_tiling.cpp", "IMPL_OP_OPTILING"),
         (op / f"op_kernel/afd_async_{suffix}_tiling_key.h", "ASCENDC_TPL_ARGS_DECL"),
     ]
     for path, macro in declarations:
-        registered = re.search(rf"{macro}\(\s*(\w+)", path.read_text()).group(1)
+        registration = re.search(rf"{macro}\(\s*(\w+)", path.read_text())
+        assert registration is not None, f"{path}: missing {macro} registration"
+        registered = registration.group(1)
         assert registered == op_type, (
             f"{path.name}: {macro} registers {registered}, expected {op_type}"
         )

@@ -398,7 +398,9 @@ def test_decoder_restores_missing_compress_ratios(construct_model, monkeypatch, 
     # Isolate only vLLM's config converter. The native fake deliberately exposes
     # the pinned 0.34 API, with no legacy version helper or DSA-CP arguments.
     helper = ModuleType("vllm.transformers_utils.deepseek_v4_utils")
-    helper.get_compress_ratios = lambda config: (1, 4)
+    monkeypatch.setattr(
+        helper, "get_compress_ratios", lambda config: (1, 4), raising=False
+    )
     monkeypatch.setitem(sys.modules, helper.__name__, helper)
 
     model = construct_model(role=role, compress_ratios=None)

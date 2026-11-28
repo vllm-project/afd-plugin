@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from .mega_layers import LayerWeights
 
 ACL_FORMAT_ND = 2
@@ -85,3 +87,17 @@ def convert_expert_weights(
     w1 = _packed_weight(weight1, (local, 2 * intermediate, hidden // 2))
     w2 = _packed_weight(weight2, (local, hidden, intermediate // 2))
     return [w1], [w2], [scale1], [scale2]
+
+
+def pack_layer_weights(weights: Mapping[int, LayerWeights]) -> LayerWeights:
+    """Build layer-major TensorLists without copying weight storage."""
+    if not weights or min(weights) < 0:
+        raise ValueError("Mega requires nonempty, nonnegative layer IDs")
+    ordered = [weights[layer] for layer in sorted(weights)]
+    # expert_weights supplies one stacked tensor per projection per layer.
+    if any(
+        len(layer) != 4 or any(len(part) != 1 for part in layer) for layer in ordered
+    ):
+        raise ValueError("Mega layer banks require stacked expert tensors")
+    columns = [[layer[part][0] for layer in ordered] for part in range(4)]
+    return columns[0], columns[1], columns[2], columns[3]

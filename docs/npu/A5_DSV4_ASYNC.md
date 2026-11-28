@@ -96,7 +96,6 @@ shards. Disable SP on FFN. FFN TP may differ from Attention TP when static EP
 assigns each rank complete local experts. This eager topology extension needs
 A5 qualification; the existing 2A2F test recipe uses TP1.
 
-
 For eager Mega DBO, enable `--enable-dbo` on Attention only, with two
 ubatches and native decode/prefill thresholds of at least two tokens.
 For example, use `--dbo-prefill-token-threshold 8 --dbo-decode-token-threshold 2`

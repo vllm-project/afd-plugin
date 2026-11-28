@@ -46,7 +46,7 @@ def test_npu_ffn_worker_joins_mega_loop_before_connector_release(monkeypatch):
     from afd_plugin.v1.worker.npu import ffn_worker
 
     worker._ffn_shutdown_event = threading.Event()
-    calls = []
+    calls: list[str | tuple[str, float]] = []
 
     class _StoppingThread:
         alive = False
@@ -75,7 +75,7 @@ def test_npu_ffn_worker_retains_mega_resources_while_step_is_pending(monkeypatch
     from afd_plugin.v1.worker.npu import ffn_worker
 
     worker._ffn_shutdown_event = threading.Event()
-    calls = []
+    calls: list[str | tuple[str, float]] = []
 
     class _StoppingThread:
         def join(self, timeout):

@@ -5,12 +5,15 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
+
+from torch import Tensor  # noqa: E402
 
 from afd_plugin.connectors.npu.async_mega import (  # noqa: E402
     connector as connector_module,
@@ -21,10 +24,7 @@ def _host_connector():
     # The Worker may close the connector while its FFN loop is still running;
     # build the connector without process groups or device buffers.
     connector = object.__new__(connector_module.CAMAsyncMegaAFDConnector)
-    connector.stages = [
-        connector_module.MegaStage(group=object(), buffer=SimpleNamespace())
-    ]
-    connector.next_stage = 0
+    connector.lane = connector_module.MegaLane(group=object(), buffer=SimpleNamespace())
     connector.layer_ids = [0]
     connector.layer_slots = {0: 0}
     connector.layered_weights = (object(),)
@@ -46,8 +46,12 @@ class _CompletedEvent:
 
 @pytest.fixture
 def host_close(monkeypatch):
-    monkeypatch.setattr(torch.npu, "synchronize", lambda: None)
-    monkeypatch.setattr(torch.npu, "Event", _CompletedEvent)
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(synchronize=lambda: None, Event=_CompletedEvent),
+        raising=False,
+    )
     monkeypatch.setattr(
         connector_module.dist, "destroy_process_group", lambda *args, **kwargs: None
     )
@@ -55,7 +59,7 @@ def host_close(monkeypatch):
 
 def test_no_step_submits_after_close(host_close):
     connector = _host_connector()
-    connector.stages[0].buffer.destroy = lambda: None
+    connector.lane.buffer.destroy = lambda: None
     submitted = []
     connector.ops = SimpleNamespace(mega_ffn=lambda *args: submitted.append("op"))
 
@@ -71,7 +75,7 @@ def test_close_waits_for_the_in_flight_step(host_close):
     op_started = threading.Event()
     op_release = threading.Event()
     events = []
-    connector.stages[0].buffer.destroy = lambda: events.append("destroy")
+    connector.lane.buffer.destroy = lambda: events.append("destroy")
 
     def mega_ffn(*_args):
         op_started.set()
@@ -101,7 +105,7 @@ def test_close_reports_a_step_that_does_not_return(host_close, monkeypatch):
     step_started = threading.Event()
     step_release = threading.Event()
     destroyed = []
-    connector.stages[0].buffer.destroy = lambda: destroyed.append("destroy")
+    connector.lane.buffer.destroy = lambda: destroyed.append("destroy")
 
     def mega_ffn(*_args):
         step_started.set()
@@ -118,26 +122,26 @@ def test_close_reports_a_step_that_does_not_return(host_close, monkeypatch):
     step_release.set()
     step.join(5)
     assert destroyed == []
-    assert connector.stages
+    assert connector.is_initialized
 
 
 def test_close_reports_device_work_that_never_completes(host_close, monkeypatch):
     connector = _host_connector()
     monkeypatch.setattr(connector_module, "CLOSE_DEVICE_TIMEOUT_SECONDS", 0.05)
     destroyed = []
-    connector.stages[0].buffer.destroy = lambda: destroyed.append("destroy")
+    connector.lane.buffer.destroy = lambda: destroyed.append("destroy")
 
     class _PendingEvent:
         def query(self):
             return False
 
-    connector.stages[0].completion = _PendingEvent()
+    connector.lane.completion = _PendingEvent()
 
     with pytest.raises(RuntimeError, match="retain resources"):
         connector.close()
 
     assert destroyed == []
-    assert connector.stages
+    assert connector.is_initialized
 
 
 class _FakeOps:
@@ -190,22 +194,22 @@ def test_both_ubatches_share_one_window_and_one_sequence_ring(monkeypatch):
     connector = _attention_connector()
     monkeypatch.setattr(connector_module, "dbo_enabled", lambda: True)
     monkeypatch.setattr(connector_module, "dbo_maybe_run_recv_hook", lambda: None)
-    hooks = []
+    hooks: list[Callable[[], Tensor]] = []
     monkeypatch.setattr(connector_module, "dbo_register_recv_hook", hooks.append)
 
     _send(connector, 0)
     _send(connector, 1)
 
     assert connector.ops.sent == [
-        (connector.stages[0].buffer, 1),
-        (connector.stages[0].buffer, 2),
+        (connector.lane.buffer, 1),
+        (connector.lane.buffer, 2),
     ]
     assert len(hooks) == 2
 
 
 def test_receive_hook_and_owner_return_the_same_result_once(monkeypatch):
     connector = _attention_connector()
-    hooks = []
+    hooks: list[Callable[[], Tensor]] = []
     monkeypatch.setattr(connector_module, "dbo_enabled", lambda: True)
     monkeypatch.setattr(connector_module, "dbo_maybe_run_recv_hook", lambda: None)
     monkeypatch.setattr(connector_module, "dbo_register_recv_hook", hooks.append)
@@ -258,3 +262,33 @@ def _attention_connector_ops_send(
 ):
     connector.ops.sent.append((buffer, sequence))
     return SimpleNamespace(ticket=len(connector.ops.sent))
+
+
+def test_factory_accepts_standard_mega_constructor_replacement(monkeypatch):
+    from afd_plugin.config import AFDConfig
+    from afd_plugin.connectors.base import AFDConnectorBase
+    from afd_plugin.connectors.factory import AFDConnectorFactory
+    from tests.unit.fakes.vllm_config import camp2p_config as vllm_config
+
+    class Replacement(connector_module.CAMAsyncMegaAFDConnector):
+        # Use the common five-argument constructor without Mega-only kwargs.
+        __init__ = AFDConnectorBase.__init__
+
+    class Factory(AFDConnectorFactory):
+        _registry = {}
+
+    monkeypatch.setattr(connector_module, "Replacement", Replacement, raising=False)
+    Factory.register_connector(
+        "CAMAsyncMegaAFDConnector", connector_module.__name__, "Replacement"
+    )
+    config = AFDConfig(
+        connector="CAMAsyncMegaAFDConnector",
+        role="attention",
+        num_attention_ranks=1,
+        num_ffn_ranks=1,
+        async_dp=True,
+        compute_gate_on_attention=True,
+    )
+    instance = Factory.create_connector(0, 0, vllm_config(), config)
+    assert isinstance(instance, Replacement)
+    assert instance.role_rank == 0

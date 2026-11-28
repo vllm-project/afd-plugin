@@ -18,7 +18,6 @@ from vllm.v1.worker.ubatching import (
     dbo_maybe_run_recv_hook,
     dbo_register_recv_hook,
 )
-from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 from afd_plugin.connectors.base import AFDConnectorBase, ConnectorExtraInfo
 from afd_plugin.distributed.afd_process_group import (
@@ -26,11 +25,8 @@ from afd_plugin.distributed.afd_process_group import (
     init_afd_process_group,
 )
 
-from .mega_layers import (
-    MegaModelSpec,
-    agree_layer_selection,
-    pack_layer_weights,
-)
+from .mega_startup import agree_layer_selection
+from .mega_weights import pack_layer_weights
 
 if TYPE_CHECKING:
     from torch_npu.npu import Event, Stream
@@ -40,7 +36,7 @@ if TYPE_CHECKING:
     from afd_plugin.connectors import AFDA2FTransferPayload
     from afd_plugin.connectors.metadata import AFDTransferContext
 
-    from .mega_layers import LayerWeights
+    from .mega_layers import LayerWeights, MegaModelSpec
     from .mega_runtime import DispatchTicket, SplitBuffer
 
 STARTUP_TIMEOUT = timedelta(minutes=30)
@@ -63,7 +59,7 @@ class MegaExtraInfo(ConnectorExtraInfo):
 
 
 @dataclass
-class MegaStage:
+class MegaLane:
     """The single fused-FFN lane shared by every ubatch."""
 
     group: dist.ProcessGroup
@@ -76,6 +72,8 @@ class MegaStage:
 def validate_mega_config(
     config: VllmConfig, afd: AFDConfig, model: MegaModelSpec
 ) -> None:
+    from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
     if (
         get_ascend_device_type() != AscendDeviceType.A5
         or config.model_config.dtype != torch.bfloat16
@@ -141,8 +139,10 @@ def validate_mega_config(
 
 
 class CAMAsyncMegaAFDConnector(AFDConnectorBase):
+    extra_info: MegaExtraInfo
+
     @classmethod
-    def parse_extra_config(cls, raw: Mapping[str, Any] | None) -> ConnectorExtraInfo:
+    def parse_extra_config(cls, raw: Mapping[str, Any] | None) -> MegaExtraInfo:
         # Match the base interface: values are unvalidated here and may have
         # any type. Validate them before constructing the typed MegaExtraInfo.
         raw = raw or {}
@@ -160,18 +160,19 @@ class CAMAsyncMegaAFDConnector(AFDConnectorBase):
         vllm_config: VllmConfig,
         afd_config: AFDConfig,
         role_rank: int,
-        *,
-        model_spec: MegaModelSpec,
     ) -> None:
         super().__init__(rank, local_rank, vllm_config, afd_config, role_rank)
-        self.model_spec = model_spec
+        from afd_plugin.model_executor.models.npu.deepseek_v4_mega import (
+            get_mega_model_spec,
+        )
+
+        self.model_spec = get_mega_model_spec(vllm_config)
         self.attn_size = afd_config.num_attention_ranks
         self.ffn_size = afd_config.num_ffn_ranks
         self.world_rank = (
             role_rank if afd_config.role == "attention" else self.attn_size + role_rank
         )
-        self.stages: list[MegaStage] = []
-        self.next_stage = 0
+        self.lane: MegaLane | None = None
         # One window serves every ubatch. Attention keeps one in-flight ticket
         # and one cached result per ubatch, and serializes the sends through the
         # native DBO receive hook so the shared window never holds two inputs.
@@ -192,21 +193,36 @@ class CAMAsyncMegaAFDConnector(AFDConnectorBase):
 
     @property
     def is_initialized(self) -> bool:
-        return bool(self.stages)
+        return self.lane is not None
 
     def prepare_layers(self, weights: Mapping[int, LayerWeights]) -> None:
         """Accept model-extracted, Mega-formatted tensors indexed by layer ID."""
         self.layered_weights = pack_layer_weights(weights)
         self.layer_ids = sorted(weights)
 
-    def init_afd_connector(self) -> None:
+    def init_afd_connector(self, *, preparation_error: Exception | None = None) -> None:
         if self.is_initialized:
             return
         self._closed = False
         from . import mega_runtime as ops
 
         self.ops = ops
-        stores = []
+
+        def initialize_startup(store: dist.Store) -> None:
+            self._shutdown_store = dist.PrefixStore("shutdown", store)
+            self.layer_slots = agree_layer_selection(
+                store,
+                self.attn_size,
+                self.ffn_size,
+                self.world_rank,
+                self.layer_ids,
+                timeout=STARTUP_TIMEOUT,
+                preparation_error=preparation_error,
+            )
+            store.set_timeout(STARTUP_TIMEOUT)
+            stores.append(store)
+
+        stores: list[dist.Store] = []
         group = init_afd_process_group(
             backend="hccl",
             init_method=f"tcp://{self.afd_config.host}:{self.afd_config.port}",
@@ -214,20 +230,13 @@ class CAMAsyncMegaAFDConnector(AFDConnectorBase):
             rank=self.world_rank,
             group_name="afd_mega",
             timeout=STARTUP_TIMEOUT,
-            store_callback=stores.append,
+            store_callback=initialize_startup,
         )
         try:
-            store = dist.PrefixStore("afd_mega", stores[0])
-            self._shutdown_store = dist.PrefixStore("shutdown", store)
+            store = stores[0]
             # FFN TP can differ from Attention TP. Share actual widths and check
             # all explicit declarations before anyone enters buffer collectives.
             attention = self.afd_config.role == "attention"
-            self.layer_slots = agree_layer_selection(
-                store,
-                self.ffn_size,
-                None if attention else self.role_rank,
-                self.layer_ids,
-            )
             width = (
                 self.vllm_config.parallel_config.tensor_parallel_size
                 if attention
@@ -252,8 +261,8 @@ class CAMAsyncMegaAFDConnector(AFDConnectorBase):
                 or any(declared not in (0, self.attn_tp) for _, declared, _ in widths)
             ):
                 raise ValueError("Inconsistent Attention TP / attn_ranks_per_dp")
-            dual_stage = widths[0][2]
-            if any(dbo != dual_stage for _, _, dbo in widths[: self.attn_size]):
+            use_ubatching = widths[0][2]
+            if any(dbo != use_ubatching for _, _, dbo in widths[: self.attn_size]):
                 raise ValueError("All Attention ranks must agree on Mega ubatching")
             # Only Attention schedulers own the token limit. All window offsets
             # must be derived from the same capacity, including on FFN workers.
@@ -288,9 +297,9 @@ class CAMAsyncMegaAFDConnector(AFDConnectorBase):
                     combine_quant_mode=0,
                     activation_parameters=model.activation_parameters,
                 )
-            lane = MegaStage(group, buffer)
-            self.stages.append(lane)
-            self.num_ubatches = 1 + int(dual_stage)
+            lane = MegaLane(group, buffer)
+            self.lane = lane
+            self.num_ubatches = 1 + int(use_ubatching)
             self.ubatch_tickets = [None] * self.num_ubatches
             self.ubatch_outputs = [None] * self.num_ubatches
             self._recv_locks = [threading.Lock() for _ in range(self.num_ubatches)]
@@ -298,12 +307,10 @@ class CAMAsyncMegaAFDConnector(AFDConnectorBase):
                 lane.stream = torch.npu.Stream()
                 lane.stream.wait_stream(torch.npu.current_stream())
         except Exception:
-            if all(group is not lane.group for lane in self.stages):
-                dist.destroy_process_group(group)
-            for lane in reversed(self.stages):
-                lane.buffer.destroy()
-                dist.destroy_process_group(lane.group)
-            self.stages.clear()
+            if self.lane is not None:
+                self.lane.buffer.destroy()
+                self.lane = None
+            dist.destroy_process_group(group)
             raise
 
     def send_attn_output(
@@ -315,7 +322,8 @@ class CAMAsyncMegaAFDConnector(AFDConnectorBase):
         stage = context.metadata.stage_idx
         if not 0 <= stage < self.num_ubatches:
             raise RuntimeError("Unexpected Mega Attention ubatch")
-        lane = self.stages[0]
+        lane = self.lane
+        assert lane is not None
         with self._send_lock:
             if self.ubatch_tickets[stage] is not None:
                 raise RuntimeError(
@@ -360,7 +368,8 @@ class CAMAsyncMegaAFDConnector(AFDConnectorBase):
                     raise RuntimeError(
                         "Mega combine requires the matching ubatch ticket"
                     )
-                output = self.ops.atten_recv(ticket, self.stages[0].buffer)
+                assert self.lane is not None
+                output = self.ops.atten_recv(ticket, self.lane.buffer)
                 self.ubatch_tickets[ubatch_idx] = None
                 self.ubatch_outputs[ubatch_idx] = output
         return output
@@ -374,11 +383,9 @@ class CAMAsyncMegaAFDConnector(AFDConnectorBase):
         with self._step_lock:
             if self._closed:
                 return
-            for offset in range(len(self.stages)):
-                idx = (self.next_stage + offset) % len(self.stages)
-                lane = self.stages[idx]
-                if lane.completion is not None and not lane.completion.query():
-                    continue
+            lane = self.lane
+            assert lane is not None
+            if lane.completion is None or lane.completion.query():
                 assert self.layered_weights is not None
                 args = (*self.layered_weights, lane.buffer)
                 if lane.stream is None:
@@ -390,7 +397,6 @@ class CAMAsyncMegaAFDConnector(AFDConnectorBase):
                         if lane.completion is None:
                             lane.completion = torch.npu.Event()
                         lane.completion.record(lane.stream)
-                self.next_stage = (idx + 1) % len(self.stages)
                 return
         time.sleep(POLL_SECONDS)
 
@@ -415,14 +421,12 @@ class CAMAsyncMegaAFDConnector(AFDConnectorBase):
             )
         try:
             self._closed = True
-            if self.stages:
+            if self.lane is not None:
                 self._wait_device_idle()
                 self._wait_peer_drain()
-            for lane in reversed(self.stages):
-                lane.buffer.destroy()
-                dist.destroy_process_group(lane.group)
-            self.stages.clear()
-            self.next_stage = 0
+                self.lane.buffer.destroy()
+                dist.destroy_process_group(self.lane.group)
+                self.lane = None
             self.layer_ids.clear()
             self.layered_weights = None
             self.layer_slots.clear()
@@ -456,9 +460,9 @@ class CAMAsyncMegaAFDConnector(AFDConnectorBase):
 
     def _wait_device_idle(self) -> None:
         """Wait for submitted work with a deadline; keep the windows on timeout."""
-        pending = [
-            lane.completion for lane in self.stages if lane.completion is not None
-        ]
+        pending = []
+        if self.lane is not None and self.lane.completion is not None:
+            pending.append(self.lane.completion)
         current = torch.npu.Event()
         current.record()
         pending.append(current)

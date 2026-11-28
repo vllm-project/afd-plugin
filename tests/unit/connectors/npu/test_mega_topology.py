@@ -19,7 +19,7 @@ from tests.unit.fakes.vllm_config import npu_async_cam_target_graph_config
 
 
 @pytest.fixture
-def validate():
+def validate(monkeypatch):
     path = (
         Path(__file__).resolve().parents[4]
         / "afd_plugin/connectors/npu/async_mega/connector.py"
@@ -34,11 +34,15 @@ def validate():
     ]
     from datetime import timedelta
 
+    utils = ModuleType("vllm_ascend.utils")
+    monkeypatch.setattr(utils, "get_ascend_device_type", lambda: "A5", raising=False)
+    monkeypatch.setattr(
+        utils, "AscendDeviceType", SimpleNamespace(A5="A5"), raising=False
+    )
+    monkeypatch.setitem(sys.modules, "vllm_ascend.utils", utils)
     ns = dict(
         timedelta=timedelta,
         torch=SimpleNamespace(bfloat16="bf16"),
-        get_ascend_device_type=lambda: "A5",
-        AscendDeviceType=SimpleNamespace(A5="A5"),
     )
     exec(compile(tree, str(path), "exec"), ns)
     return ns["validate_mega_config"]
@@ -145,13 +149,14 @@ def connector_class():
     ]
     tree.body = [cls]
     clock = iter(range(1000))
+    npu = SimpleNamespace()
     ns = {
         "timedelta": timedelta,
         "CLOSE_LOCK_TIMEOUT_SECONDS": 5,
         "CLOSE_DEVICE_TIMEOUT_SECONDS": 5,
         "CLOSE_PEER_TIMEOUT_SECONDS": 5,
         "dist": SimpleNamespace(destroy_process_group=lambda group: group.destroy()),
-        "torch": SimpleNamespace(npu=SimpleNamespace()),
+        "torch": SimpleNamespace(npu=npu),
         "time": SimpleNamespace(sleep=lambda _: None, monotonic=lambda: next(clock)),
         "POLL_SECONDS": 0,
         "dbo_enabled": lambda: False,
@@ -159,7 +164,7 @@ def connector_class():
         "dbo_register_recv_hook": lambda _hook: None,
     }
     exec(compile(tree, str(path), "exec"), ns)
-    return ns[cls.name], ns["torch"].npu
+    return ns[cls.name], npu
 
 
 def test_both_ubatches_share_one_window_and_one_sequence_ring(connector_class):
@@ -189,7 +194,7 @@ def test_both_ubatches_share_one_window_and_one_sequence_ring(connector_class):
             atten_recv=combine,
             split_sequence=lambda value: (value - 1) % 32 + 1,
         )
-        rank.stages = [SimpleNamespace(buffer=0, sequence=32)]
+        rank.lane = SimpleNamespace(buffer=0, sequence=32)
         for stage in (0, 1):
             ctx = SimpleNamespace(
                 metadata=SimpleNamespace(stage_idx=stage, layer_idx=7)
@@ -225,18 +230,17 @@ def test_ffn_submits_the_single_lane_only_when_free(connector_class):
     rank = connector()
     rank._step_lock = threading.Lock()
     rank._closed = False
-    rank.next_stage = 0
     rank.layered_weights = (("layer7", "layer8"),) * 4
     calls = []
     rank.ops = SimpleNamespace(mega_ffn=lambda *args: calls.append(args))
-    rank.stages = [SimpleNamespace(buffer="window", stream="s0", completion=None)]
+    rank.lane = SimpleNamespace(buffer="window", stream="s0", completion=None)
 
     for _ in range(3):
         rank.execute_next_experts()
     assert calls == [(*rank.layered_weights, "window")]
-    assert rank.stages[0].completion.stream == "s0"
+    assert rank.lane.completion.stream == "s0"
 
-    rank.stages[0].completion.done = True
+    rank.lane.completion.done = True
     rank.execute_next_experts()
     assert [args[-1] for args in calls] == ["window", "window"]
 
@@ -280,13 +284,11 @@ def closing_connector(connector_class):
         connector.layer_ids = [0]
         connector.layer_slots = {0: 0}
         connector.layered_weights = (["weights"],)
-        connector.stages = [
-            SimpleNamespace(
-                completion=SimpleNamespace(query=lambda: device_done),
-                buffer=SimpleNamespace(destroy=lambda: released.append("window")),
-                group=SimpleNamespace(destroy=lambda: released.append("group")),
-            )
-        ]
+        connector.lane = SimpleNamespace(
+            completion=SimpleNamespace(query=lambda: device_done),
+            buffer=SimpleNamespace(destroy=lambda: released.append("window")),
+            group=SimpleNamespace(destroy=lambda: released.append("group")),
+        )
         return connector, released
 
     return make
@@ -335,7 +337,9 @@ def test_close_releases_only_after_all_ranks_acknowledge(closing_connector):
 @pytest.mark.parametrize("dp_size,tp_size", [(1, 1), (1, 2), (2, 2)])
 def test_mega_eager_dbo_admits_attention_topology(monkeypatch, dp_size, tp_size):
     model_utils = ModuleType("afd_plugin.model_executor.models.model_utils")
-    model_utils.has_afd_model_registration = lambda config: True
+    monkeypatch.setattr(
+        model_utils, "has_afd_model_registration", lambda config: True, raising=False
+    )
     monkeypatch.setitem(sys.modules, model_utils.__name__, model_utils)
     config = npu_async_cam_target_graph_config(
         data_parallel_size=dp_size,

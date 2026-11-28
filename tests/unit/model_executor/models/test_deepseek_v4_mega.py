@@ -47,6 +47,12 @@ def test_flash_admission_rejects_unvalidated_models(flash_config, field, value):
         adapter.flash_mega_model_spec(flash_config)
 
 
+def test_admission_rejects_other_models_before_reading_flash_dimensions(flash_config):
+    flash_config.model_config.hf_config = SimpleNamespace(model_type="other")
+    with pytest.raises(ValueError, match="DeepSeek-V4-Flash"):
+        adapter.get_mega_model_spec(flash_config)
+
+
 def test_flash_admission_exports_explicit_geometry_and_activation(flash_config):
     spec = adapter.flash_mega_model_spec(flash_config)
     assert (spec.hidden_size, spec.intermediate_size, spec.num_experts, spec.top_k) == (

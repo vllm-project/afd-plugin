@@ -43,7 +43,7 @@ def fail_if_unsupported_npu_afd_features(
 
     if afd_config.connector == MEGA_CONNECTOR:
         from afd_plugin.connectors.npu.async_mega import validate_mega_config
-        from afd_plugin.model_executor.models.npu.mega_adapter import (
+        from afd_plugin.model_executor.models.npu.deepseek_v4_mega import (
             get_mega_model_spec,
         )
 

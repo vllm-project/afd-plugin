@@ -95,7 +95,9 @@ def load_ffn_owners(monkeypatch, modules):
     )
     # Worker selection needs the runner class, not the device connector runtime.
     mega_connector = ModuleType("afd_plugin.connectors.npu.async_mega")
-    mega_connector.CAMAsyncMegaAFDConnector = object
+    monkeypatch.setattr(
+        mega_connector, "CAMAsyncMegaAFDConnector", object, raising=False
+    )
     monkeypatch.setitem(sys.modules, mega_connector.__name__, mega_connector)
     load_host_module(
         monkeypatch, "afd_plugin.v1.worker.npu.async_mega_ffn_model_runner"

@@ -36,6 +36,14 @@ if TYPE_CHECKING:
 FLASH_GEOMETRY = (4096, 2048, 256, 6)
 
 
+def get_mega_model_spec(config: VllmConfig) -> MegaModelSpec:
+    # Extend model admission here when another adapter is validated. Connector
+    # and FFN execution consume the same explicit dimensions/weights contract.
+    if config.model_config.hf_config.model_type == "deepseek_v4":
+        return flash_mega_model_spec(config)
+    raise ValueError("Mega currently supports the DeepSeek-V4-Flash model adapter")
+
+
 def flash_mega_model_spec(config: VllmConfig) -> MegaModelSpec:
     """Keep the accepted checkpoint family in the model adapter."""
     hf = config.model_config.hf_config

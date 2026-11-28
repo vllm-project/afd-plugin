@@ -12,16 +12,19 @@ configuration for later device verification; it has not been run on A5.
 
 ## Model adapter boundary
 
-The model admission entry is `model_executor/models/npu/mega_adapter.py`.
+The model admission entry is `get_mega_model_spec()` in
+`model_executor/models/npu/deepseek_v4_mega.py`.
 The admitted model target remains native FP4 DeepSeek-V4-Flash. Its adapter,
 `deepseek_v4_mega.py`, supplies explicit dimensions and activation parameters,
 extracts native expert parameters, and computes hash/top-k routing. Ordinary
 TP still slices real local tokens **before routing**; profiling and sequence
 parallel retain their existing paths.
 
-The connector receives a `MegaModelSpec` and weights indexed by model layer ID.
-`mega_weights.py` owns output-major FP4 NZ conversion and E8M0 layout checks;
-the model adapter replaces its native parameter storage with the converted
+The factory uses the standard five-argument connector constructor. Mega resolves
+its `MegaModelSpec` through the model adapter during setup and receives weights
+indexed by model layer ID.
+`mega_weights.py` owns output-major FP4 NZ conversion, E8M0 layout checks and
+layer-bank packing; the model adapter replaces its native parameter storage with the converted
 views so the old weight copy can be released. The FFN runner calls the model's
 `get_mega_expert_weights(rank)` interface without traversing decoder layers.
 Window/sequence handling, TP padding and the single FFN lane remain in Mega.
@@ -93,6 +96,52 @@ reference as well as continued progress with DBO enabled and disabled.
 With DBO enabled, also send work only to stage 0, then only to stage 1.
 Verify that the active stage returns results while the other has no work.
 
+## Startup preparation failures
+
+FFN weight conversion and layer-bank packing are attempted before transport
+initialization. On failure, the FFN runner still joins the host Store rendezvous
+and publishes the exception type and message with its preparation status.
+`mega_startup.py` exchanges preparation outcomes and layer IDs in the process-group
+Store callback, before HCCL group or window creation. All A/F ranks read and
+acknowledge the outcomes before raising the same error, so Attention can report
+the failed FFN rank and original cause.
+
+Rendezvous and preparation-status exchange retain the 30-minute startup allowance:
+Attention may reach the Store while FFN is still loading or converting weights.
+A caught conversion failure is published as an outcome, so peers receive the
+error when preparation outcomes arrive instead of waiting for an absent rank.
+After all outcomes are available, read acknowledgements have a 30-second timeout.
+A worker that exits before publishing its outcome still requires the startup
+timeout or external worker supervision.
+
+Host regression coverage uses a shared Store to check matching layer maps,
+invalid or inconsistent layer IDs, and an FFN conversion failure observed by
+Attention and the other FFN rank. These tests do not exercise HCCL or NPU kernels.
+
+## Host imports
+
+The Mega package follows CAMP2P's lazy exports. Importing dispatch-layout or
+FP4 byte-reordering helpers does not load the connector or vLLM-Ascend. The
+connector imports Ascend device lookup only when performing device admission.
+Host connector tests supply their own NPU event interfaces; actual device
+behavior remains covered by A5 testing. The existing step/close tests retain
+single-lane submission, ubatch result ownership and shutdown coverage. The
+factory regression verifies a replacement Mega connector with the standard
+constructor, while runner tests cover interface validation and forwarding a
+weight-conversion failure into peer startup.
+
+Run the affected host tests with Torch and vLLM installed, without vLLM-Ascend:
+
+```bash
+python -m pytest -q tests/unit/connectors/npu/async_mega \
+  tests/unit/connectors/npu/test_mega_layers.py \
+  tests/unit/connectors/npu/test_mega_topology.py \
+  tests/unit/model_executor/npu/test_mega_weights.py \
+  tests/unit/v1/worker/npu/test_async_mega_ffn_model_runner.py
+```
+
+Also use `--collect-only` with the selection in
+`.buildkite/cuda/test-ready.yml` to check imports across the non-Ascend suite.
 
 ## Bounded shutdown
 
