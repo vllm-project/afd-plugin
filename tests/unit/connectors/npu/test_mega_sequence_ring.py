@@ -1,4 +1,5 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. Licensed under CANN OSL v2.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Exercise the device's actual arithmetic on the host, independently of CANN."""
 
 import shutil

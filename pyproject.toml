@@ -149,6 +149,8 @@ extend-ignore-identifiers-re = [
     ".*thw",
     "ein",
     ".*arange",
+    # AscendC::Reg::Arange is a CANN API identifier.
+    "^Arange$",
     ".*MoBA",
     ".*temperal_downsample",
     ".*nd",

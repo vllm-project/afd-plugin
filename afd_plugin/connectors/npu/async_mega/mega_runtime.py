@@ -1,4 +1,5 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. Licensed under CANN OSL v2.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Shared registered MTE window and per-request ownership."""
 
 from collections.abc import Sequence
