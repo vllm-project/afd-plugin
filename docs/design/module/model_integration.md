@@ -68,14 +68,16 @@ make a backend-specific worker class the shared model API.
 ## Shared FFN components
 
 `model_executor/models/` owns model structure and checkpoint policy.
-`model_executor/ffn/remote.py` contains the remote proxies and all four
-Attention-side MoE runners. Each connector registers its runner and device
+`model_executor/ffn/remote.py` contains the shared remote proxies and CUDA
+MoE runners. Ascend CAM runners and their V4 gate logic live in
+`model_executor/ffn/npu/remote.py`. Each connector registers its runner and device
 with `AFDConnectorFactory`. At layer construction, `build_expert()` looks up
 the registered class and passes it to vLLM's `FusedMoEFactory`.
 
 | Component | Responsibility | Dependencies |
 | --- | --- | --- |
-| `remote.py` | Shared FFN proxies, routed TP padding, weightless experts and the CUDA P2P, DeepEP M2N, CAMP2P and Async CAM runners | Connector registry and contracts, vLLM MoE factory and forward context. The Async CAM runner loads the CAM layout and DBO helpers on its execution path. |
+| `remote.py` | Build remote experts, send and receive FFN results, and run CUDA P2P and DeepEP M2N | Connector registry, vLLM MoE factory and forward context |
+| `npu/remote.py` | CAMP2P and Async CAM runners, V4 gate routing and Ascend weightless experts | Shared remote runner, CAM layout and DBO helpers |
 | `npu/expert_weights.py` | Loaded `QuantizedExpertWeights`, Ascend quantized layout validation, geometry and graph signatures | Torch tensors with the Layered/Mega W4A8/W8A8 storage and scale contracts; no native operator lookup or workspace allocation |
 | `async_cam_runtime/async_cam_layered.py`, `async_cam_runtime/async_cam_mega.py` | Execute Layered or Mega work on FFN | Loaded expert weights, runtime configuration and communication state |
 
@@ -85,6 +87,8 @@ flowchart TD
     Runner --> Model[Concrete model adapter]
     Model --> Remote[ffn/remote.py]
     Remote --> Connector[Connector / Session]
+    Remote -->|Ascend CAM| CAM[ffn/npu/remote.py]
+    CAM --> Connector
     Model --> Weights[ffn/npu/expert_weights.py]
     Runner --> Compute[Async CAM Layered or Mega executor]
     Compute --> Weights
@@ -124,7 +128,7 @@ SFA/MLA/DSA-specific handling stays explicit inside that worker-side module.
 | Registration map | [`afd_plugin/__init__.py`](../../../afd_plugin/__init__.py) | [`test_package.py`](../../../tests/unit/package/test_package.py) |
 | Role-aware model and weight loading | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py), [`_weight_utils.py`](../../../afd_plugin/model_executor/models/_weight_utils.py) | [`test_deepseek_v2_construction.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_construction.py), [`test_weight_utils.py`](../../../tests/unit/model_executor/models/test_weight_utils.py), model and accuracy E2E suites |
 | DeepSeek V4 CUDA role boundary | [`deepseek_v4.py`](../../../afd_plugin/model_executor/models/deepseek_v4.py) | [`test_deepseek_v4_construction.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_construction.py), [`test_deepseek_v4_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_proxy.py), [`test_deepseek_v4_weight_policy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_weight_policy.py) |
-| DeepSeek V4 Ascend Hash-id boundary | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py), [`ffn/remote.py`](../../../afd_plugin/model_executor/ffn/remote.py) | [`test_deepseek_v4_hash_ids.py`](../../../tests/unit/model_executor/test_deepseek_v4_hash_ids.py), [NPU model role tests](../../../tests/unit/model_executor/models/npu/test_deepseek_v4.py), ids-mode cases in [`test_camp2p_token_ids.py`](../../../tests/unit/connectors/test_camp2p_token_ids.py) |
+| DeepSeek V4 Ascend Hash-id boundary | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py), [`ffn/npu/remote.py`](../../../afd_plugin/model_executor/ffn/npu/remote.py) | [`test_deepseek_v4_hash_ids.py`](../../../tests/unit/model_executor/test_deepseek_v4_hash_ids.py), [NPU model role tests](../../../tests/unit/model_executor/models/npu/test_deepseek_v4.py), ids-mode cases in [`test_camp2p_token_ids.py`](../../../tests/unit/connectors/test_camp2p_token_ids.py) |
 | Qwen3 MoE role-aware model and weight loading | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py), [`test_qwen3_moe_weight_policy.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_weight_policy.py) |
 | CUDA remote-experts boundary | [`ffn/remote.py`](../../../afd_plugin/model_executor/ffn/remote.py), [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py) | [`test_remote.py`](../../../tests/unit/model_executor/ffn/test_remote.py), [`test_p2p_experts_contract.py`](../../../tests/unit/connectors/test_p2p_experts_contract.py), [`test_deepseek_v2_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_proxy.py), bit-exact native-kernel parity in [`test_attention_routing.py`](../../../tests/gpu/test_attention_routing.py) |
 | Qwen3 MoE FFN-only routed-experts shell | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py) |
@@ -134,7 +138,7 @@ SFA/MLA/DSA-specific handling stays explicit inside that worker-side module.
 | Ascend CAM dispatch layout | [`async_cam_layout.py`](../../../afd_plugin/connectors/npu/async_cam_runtime/async_cam_layout.py) | [`test_async_cam_dbo.py`](../../../tests/unit/connectors/npu/async_cam_runtime/test_async_cam_dbo.py) |
 | Ascend stage metadata and RoPE ownership | [`worker/npu/attention_metadata.py`](../../../afd_plugin/v1/worker/npu/attention_metadata.py) | [`test_attention_metadata.py`](../../../tests/unit/v1/worker/npu/test_attention_metadata.py) |
 | Ascend external-routing MoE execution | [`npu/deepseek_v4_external_routing_moe.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_external_routing_moe.py) | [`test_deepseek_v4_external_routing_moe_cpu.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_external_routing_moe_cpu.py) |
-| Ascend CAM orchestration | [`ffn/remote.py`](../../../afd_plugin/model_executor/ffn/remote.py), [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py) | [CAMP2P runner](../../../tests/unit/model_executor/models/test_camp2p_moe_runner.py), [Async CAM runner](../../../tests/unit/model_executor/models/test_deepseek_v4_cam_layout.py), [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py) |
+| Ascend CAM orchestration | [`ffn/npu/remote.py`](../../../afd_plugin/model_executor/ffn/npu/remote.py), [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py) | [CAMP2P runner](../../../tests/unit/model_executor/models/test_camp2p_moe_runner.py), [Async CAM runner](../../../tests/unit/model_executor/models/test_deepseek_v4_cam_layout.py), [`test_async_cam_npu.py`](../../../tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py) |
 
 ## Model registration
 

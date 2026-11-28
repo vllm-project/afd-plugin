@@ -13,6 +13,7 @@ from torch import nn  # noqa: E402
 
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, CAMP2P_CONNECTOR  # noqa: E402
 from afd_plugin.model_executor.ffn import remote  # noqa: E402
+from afd_plugin.model_executor.ffn.npu import remote as npu_remote  # noqa: E402
 from tests.unit.fakes.connector import install_proxy_context  # noqa: E402
 from tests.unit.fakes.vllm_config import attention_moe_vllm_config  # noqa: E402
 
@@ -89,7 +90,7 @@ def test_sync_gate_preserves_routes_and_stage_across_yield(
         ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32) + owner
         weights = torch.full((2, 2), 0.75 + owner)
         monkeypatch.setattr(
-            remote,
+            npu_remote,
             "_cam_gate_topk",
             lambda *_a, routes=(weights, ids), **_kw: routes,
         )
@@ -116,7 +117,7 @@ def test_sync_gate_preserves_routes_and_stage_across_yield(
 def test_sync_gate_requires_forward_metadata(cam_moe, monkeypatch):
     monkeypatch.setattr(remote, "get_afd_metadata_from_forward_context", lambda: None)
     monkeypatch.setattr(
-        remote,
+        npu_remote,
         "_cam_gate_topk",
         lambda *_a, **_kw: (torch.ones(1, 2), torch.zeros(1, 2, dtype=torch.int32)),
     )

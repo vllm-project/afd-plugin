@@ -24,7 +24,6 @@ def cam_factory_on_cpu(monkeypatch):
     monkeypatch.setattr(
         parallel_state, "_TP", SimpleNamespace(rank_in_group=0, world_size=1)
     )
-    return remote
 
 
 @pytest.fixture

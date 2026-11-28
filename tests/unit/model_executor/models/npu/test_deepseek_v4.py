@@ -227,12 +227,12 @@ def dspark_cam_decoder(ascend_v4_model, prefix):
 @pytest.mark.parametrize("prefix, wire_layer", [("mtp.0", 43), ("mtp.1", 44)])
 def test_dspark_draft_sends_global_cam_layer_without_dbo(
     dspark_cam_decoder,
-    cam_factory_on_cpu,
     torch,
     monkeypatch,
     prefix,
     wire_layer,
 ):
+    from afd_plugin.model_executor.ffn.npu import remote as npu_remote
     from tests.unit.fakes.connector import install_proxy_context
 
     decoder, registered_layers = dspark_cam_decoder
@@ -240,14 +240,12 @@ def test_dspark_draft_sends_global_cam_layer_without_dbo(
     metadata = install_proxy_context(monkeypatch, events, stage_idx=0)
     metadata.stage_idx = 0
     monkeypatch.setattr(
-        cam_factory_on_cpu, "maybe_apply_dbo_yield", lambda states, *, role: states
+        npu_remote, "maybe_apply_dbo_yield", lambda states, *, role: states
     )
     hidden = torch.ones(2, 4)
     ids = torch.tensor([[0, 1], [1, 2]], dtype=torch.int32)
     weights = torch.full((2, 2), 0.5)
-    monkeypatch.setattr(
-        cam_factory_on_cpu, "_cam_gate_topk", lambda *a, **kw: (weights, ids)
-    )
+    monkeypatch.setattr(npu_remote, "_cam_gate_topk", lambda *a, **kw: (weights, ids))
 
     output = decoder.mlp(hidden)
 

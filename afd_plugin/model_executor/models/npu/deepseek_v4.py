@@ -31,7 +31,8 @@ from afd_plugin.config import (
     parse_afd_config,
 )
 from afd_plugin.connectors import AFDExpertRoutingSpec
-from afd_plugin.model_executor.ffn.remote import build_expert, local_hash_input_ids
+from afd_plugin.model_executor.ffn.npu.remote import local_hash_input_ids
+from afd_plugin.model_executor.ffn.remote import build_expert
 from afd_plugin.model_executor.models._weight_utils import (
     ATTENTION_ROLE,
     BOTH_ROLES,

@@ -12,8 +12,10 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
-from afd_plugin.model_executor.ffn import remote  # noqa: E402
-from afd_plugin.model_executor.ffn.remote import local_hash_input_ids  # noqa: E402
+from afd_plugin.model_executor.ffn.npu.remote import (  # noqa: E402
+    _cam_gate_topk,
+    local_hash_input_ids,
+)
 
 
 def test_returns_ids_aligned_with_router_tokens():
@@ -117,7 +119,7 @@ def test_dsv4_router_uses_model_gate(
             sys.modules, "torch_npu", SimpleNamespace(npu_moe_gating_top_k=select)
         )
 
-    weights, ids = remote._cam_gate_topk(experts, gate, gate_input, None)
+    weights, ids = _cam_gate_topk(experts, gate, gate_input, None)
 
     assert ids.tolist() == [[int(precomputed_fp32 and not in_profile_run)]]
     torch.testing.assert_close(weights, torch.tensor([[2.5]], dtype=torch.float32))
