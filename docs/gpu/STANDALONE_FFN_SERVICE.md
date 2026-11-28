@@ -140,7 +140,8 @@ Requirements and limits:
 - An afdEP-comm build with `afdep.service` (branch `ffn-service`, commit
   `1407a54`); release v1.2.1 does not contain it. `nvcc` must be available
   under `CUDA_HOME` at startup.
-- Eager only, no DBO, BF16 experts, on F and on every Attention unit.
+- Eager only and no DBO, on F and on every Attention unit. FP8 experts
+  (`payload_format: fp8_block128_fp32`) ran with Qwen3-235B-A22B-FP8 on 8 H100.
 - Units connect in order: unit `u` waits until F finished the handshake of
   unit `u - 1`, so `afd_process_group_timeout_s` must cover the start of all
   units.

@@ -19,7 +19,7 @@ from typing import Any
 
 from afd_plugin.ffn_faas.platforms.launch import validate_ffn_rank_settings
 
-# The only qualified payload: BF16 rows against BF16 expert weights.
+# The qualified payload of one Attention unit: BF16 rows, BF16 expert weights.
 BF16_PAYLOAD = "bf16"
 SINGLE_LANE = 1
 # DBO runs two micro-batches, one DeepEP lane each.
@@ -49,10 +49,11 @@ class GPUFFNConfig:
         """Reject launches no Attention peer could pair with, on the CPU.
 
         Checks this rank, the shutdown timeout, and the two connector options
-        the service fixes: ``payload_format`` must be ``bf16`` and an explicit
-        ``num_lanes`` must equal the lane count ``--enable-dbo`` implies (1
-        without, 2 with). Every other connector option is validated by
-        ``DeepEPM2NConfig.from_mapping`` once the backend runs.
+        the service fixes: ``payload_format`` must be ``bf16`` with one
+        Attention unit, and an explicit ``num_lanes`` must equal the lane count
+        ``--enable-dbo`` implies (1 without, 2 with). Every other connector
+        option is validated by ``DeepEPM2NConfig.from_mapping`` once the
+        backend runs.
         """
         validate_ffn_rank_settings(
             ffn_ranks=self.ffn_ranks,
@@ -67,10 +68,11 @@ class GPUFFNConfig:
                 "--attention-units above 1 requires --enforce-eager and no --enable-dbo"
             )
         payload_format = self.connector_extra_config.get("payload_format", BF16_PAYLOAD)
-        if payload_format != BF16_PAYLOAD:
+        # FP8 was run only with several Attention units (see ``units.py``).
+        if payload_format != BF16_PAYLOAD and self.attention_units == 1:
             raise ValueError(
-                f"GPU standalone FFN supports only payload_format={BF16_PAYLOAD!r}, "
-                f"got {payload_format!r}"
+                f"GPU standalone FFN with one Attention unit supports only "
+                f"payload_format={BF16_PAYLOAD!r}, got {payload_format!r}"
             )
         num_lanes = self.connector_extra_config.get("num_lanes")
         if num_lanes is not None and num_lanes != self.num_lanes:

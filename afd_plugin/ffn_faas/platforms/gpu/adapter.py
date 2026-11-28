@@ -134,7 +134,9 @@ class GPUDeepEPM2NAdapter:
             shutdown_timeout=settings.shutdown_timeout,
             backend_factory=partial(create_backend, settings, args),
             initial_status={
-                "payload_format": BF16_PAYLOAD,
+                "payload_format": settings.connector_extra_config.get(
+                    "payload_format", BF16_PAYLOAD
+                ),
                 "num_lanes": settings.num_lanes,
                 "graph_mode": settings.graph_mode,
                 "dbo": settings.dbo,

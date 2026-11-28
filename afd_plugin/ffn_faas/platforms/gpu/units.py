@@ -8,7 +8,7 @@ afdEP-comm's ``FfnService`` picks the next unit whose dispatch has arrived
 (round robin when several have), and this rank runs one MoE layer of that unit.
 A unit with a long step therefore does not hold a unit with a short one.
 
-Limits: eager, one lane, BF16 experts, and every control payload runs all MoE
+Limits: eager, one lane, and every control payload runs all MoE
 layers. An idle rank spins the pick kernel on its GPU and blocks one CPU thread
 per unit in the control receive.
 """
@@ -25,7 +25,10 @@ import torch
 from afdep.service import CHOICE_TIMEOUT, FfnService, client_row, order_ring
 
 from afd_plugin.connectors.base import AFDControlPlaneClosedError
-from afd_plugin.connectors.gpu.deepep_m2n.connector import DeepEPM2NAFDConnector
+from afd_plugin.connectors.gpu.deepep_m2n.connector import (
+    FP8_GROUP_SIZE,
+    DeepEPM2NAFDConnector,
+)
 from afd_plugin.connectors.metadata import AFDControlPayload
 from afd_plugin.v1.worker.ffn_routed_experts_model_runner import (
     GPUFFNRoutedExpertsModelRunner,
@@ -102,17 +105,17 @@ class AttentionUnits:
         """
         first = self.connectors[0]
         weights = self.runner.local_experts[self.runner.moe_layer_indices[0]].weights
-        if weights.is_fp8:
-            raise NotImplementedError("several Attention units need BF16 experts")
         assert first.experts is not None  # set on every FFN rank at connector init
+        hidden = weights.w13.shape[2]
         with torch.cuda.stream(self.stream):
             first.experts(
                 torch.zeros(
-                    (WARM_ROWS, weights.w13.shape[2]),
-                    dtype=torch.bfloat16,
-                    device=first.device,
+                    (WARM_ROWS, hidden), dtype=first.payload_dtype, device=first.device
                 ),
-                None,
+                # FP8 rows carry one scale per FP8_GROUP_SIZE channels.
+                torch.ones((WARM_ROWS, hidden // FP8_GROUP_SIZE), device=first.device)
+                if first.is_fp8_payload
+                else None,
                 torch.zeros(WARM_ROWS, device=first.device),
                 # Prefix sum of rows per expert: every row belongs to expert 0.
                 torch.full(

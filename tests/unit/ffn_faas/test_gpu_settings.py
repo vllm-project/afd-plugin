@@ -79,3 +79,12 @@ def test_invalid_launch_settings_are_rejected(overrides, message):
 
 def test_matching_explicit_lane_count_is_accepted():
     assert _settings(dbo=True, connector_extra_config={"num_lanes": 2}).num_lanes == 2
+
+
+def test_fp8_payload_is_accepted_with_several_attention_units():
+    settings = _settings(
+        attention_units=2,
+        connector_extra_config={"payload_format": "fp8_block128_fp32"},
+    )
+
+    assert settings.attention_units == 2
