@@ -5,7 +5,7 @@
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 
@@ -65,3 +65,66 @@ def load_async_modules(monkeypatch):
         monkeypatch, "afd_plugin.v1.worker.npu.async_ffn_model_runner"
     )
     return group, connector, runtime
+
+
+def fake_megaffn_service(monkeypatch, events):
+    """Service graph boundary only; no Device planner/compute is simulated."""
+    service = SimpleNamespace(graph=None, model=None)
+
+    def make(args, device_id):
+        service.args = args
+        service.device = SimpleNamespace(index=device_id)
+        return service
+
+    def build(owner, weights, config, group_name, **kwargs):
+        service.graph = object()
+        service.model = SimpleNamespace(config=config, weights=weights)
+
+    def pack(args, matrices, rank_idx):
+        return SimpleNamespace(
+            hidden=args.hidden_size, intermediate=args.moe_intermediate_size
+        )
+
+    service.build_graph = build
+    service.start_persistent = lambda: events.append("start")
+    service.submit_service = lambda: events.append("epoch")
+    service.stop_persistent = lambda: events.append("stop")
+    for suffix, name, value in (
+        ("ffn_args", "MegaFfnArgs", SimpleNamespace),
+        ("ffn_runtime", "MegaFfnRunner", make),
+        ("weight_loader", "build_service_weights", pack),
+    ):
+        full = "blockrt.models.mega_ffn." + suffix
+        module = ModuleType(full)
+        vars(module)[name] = value
+        monkeypatch.setitem(sys.modules, full, module)
+    return service
+
+
+def service_model(device):
+    """Three BF16 expert layers at the loaded-model boundary."""
+    layers = {
+        layer: SimpleNamespace(
+            experts=SimpleNamespace(
+                routed_experts=SimpleNamespace(
+                    w13_weight=SimpleNamespace(shape=(2, 64, 128), device=device),
+                    w2_weight=SimpleNamespace(shape=(2, 64, 64)),
+                    dynamic_eplb=False,
+                    activation=SimpleNamespace(value="silu"),
+                ),
+                _shared_experts=None,
+                moe_config=SimpleNamespace(
+                    swiglu_limit=0,
+                    swiglu_alpha=1,
+                    swiglu_beta=0,
+                    activation_situ_beta=None,
+                    activation_situ_linear_beta=None,
+                ),
+            )
+        )
+        for layer in (0, 1, 2)
+    }
+    return SimpleNamespace(
+        get_experts_layer_indices=lambda: (0, 1, 2),
+        get_mxfp_expert_layers=lambda: layers,
+    )
