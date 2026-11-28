@@ -196,7 +196,6 @@ class AFDDeepseekV4MoE(nn.Module):
         self.experts = build_expert(
             vllm_config,
             gate=self.gate,
-            transport_layer_idx=layer_idx,
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
@@ -206,6 +205,8 @@ class AFDDeepseekV4MoE(nn.Module):
             prefix=f"{prefix}.experts",
             **routing_args,
         )
+        # DSpark uses draft-local checkpoint names and target-global CAM layer IDs.
+        self.experts.layer_idx = layer_idx
 
     def forward(
         self,

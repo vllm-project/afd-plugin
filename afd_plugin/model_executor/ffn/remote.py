@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Remote FFN proxies and Attention-side MoE runners for CUDA and Ascend."""
+"""Connector-independent remote dense/MoE proxies and Attention-side MoE
+runners; no concrete model imports."""
 
 from __future__ import annotations
 
@@ -268,8 +269,8 @@ class AFDRoutedExpertsMoERunner(MoERunner):
     microbatch before the runner reads it, so each microbatch needs its own
     output slot. vLLM picks the slot per microbatch only when its runner gets
     ``enable_dbo``, but AFD also runs two microbatches with ``--ubatch-size 2``
-    alone. On vLLM 0.34, pass ``enable_dbo`` whenever vLLM microbatches so
-    the shared-expert output slot follows the active microbatch.
+    alone. Pass ``enable_dbo`` whenever vLLM microbatches; vLLM 0.34 reads the
+    runner's ``enable_dbo`` only to pick that slot.
     """
 
     def __init__(self, *args: Any, enable_dbo: bool = False, **kwargs: Any) -> None:
@@ -303,7 +304,6 @@ class AFDRemoteMoERunner(MoERunner):
         routed_input_transform: nn.Module | None = None,
         routed_output_transform: nn.Module | None = None,
         routed_scaling_factor: float = 1.0,
-        transport_layer_idx: int | None = None,
     ) -> None:
         super().__init__(
             layer_name=layer_name,
@@ -318,10 +318,9 @@ class AFDRemoteMoERunner(MoERunner):
             routed_output_transform=routed_output_transform,
             routed_scaling_factor=routed_scaling_factor,
         )
-        # DSpark uses draft-local checkpoint names and target-global CAM layer IDs.
-        self.layer_idx: int = (
-            self.layer_id if transport_layer_idx is None else transport_layer_idx
-        )
+        # The native layer name carries the decoder layer index. Parse it
+        # once: forward may be traced by torch.compile.
+        self.layer_idx: int = self.layer_id
 
     def forward(
         self,
@@ -342,25 +341,17 @@ class AFDRemoteMoERunner(MoERunner):
         if self.gate is not None:
             router_logits, _ = self.gate(hidden_states)
             send_kwargs["router_logits"] = router_logits
-        return self._exchange(hidden_states, **send_kwargs)
-
-    def _exchange(
-        self,
-        hidden_states: torch.Tensor,
-        *,
-        shared_experts: nn.Module | None = None,
-        **send_kwargs: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        metadata = _current_afd_metadata()
         stage_idx = _send_attention_output(
-            metadata, hidden_states, layer_idx=self.layer_idx, **send_kwargs
+            _current_afd_metadata(),
+            hidden_states,
+            layer_idx=self.layer_idx,
+            **send_kwargs,
         )
-        shared = shared_experts(hidden_states) if shared_experts is not None else None
         hidden_states = maybe_apply_dbo_yield(hidden_states, role="attention")
-        output = metadata.connector.recv_ffn_output(
-            ref_tensor=hidden_states, ubatch_idx=stage_idx
+        return _current_afd_metadata().connector.recv_ffn_output(
+            ref_tensor=hidden_states,
+            ubatch_idx=stage_idx,
         )
-        return output if shared is None else output + shared
 
 
 def build_expert(
@@ -368,17 +359,18 @@ def build_expert(
     *,
     gate: nn.Module | None,
     shared_experts: nn.Module | None = None,
-    transport_layer_idx: int | None = None,
     **moe_kwargs: Any,
 ) -> MoERunner:
     """Build an Attention-role MoE ``experts`` module through native
     ``FusedMoEFactory``.
 
     ``moe_kwargs`` are the native model's ``FusedMoEFactory`` arguments. Pass
-    the model's gate exactly when ``compute_gate_on_attention`` is set.
-    CUDA runners hold the gate. CAM runners use the model's gate at forward time.
-    Pass shared experts to the native runner for DeepEP M2N. The connector selects
-    the runner. Its routed experts register with vLLM and allocate no weights.
+    the model's gate exactly when ``compute_gate_on_attention`` is set; the
+    runner then applies it. Pass the shared experts when Attention runs them
+    (DeepEP M2N). The configured connector's registration names the runner
+    class, imported here. This function fixes the arguments that describe
+    local experts: the runner registers like a native MoE layer but allocates
+    no expert weights and runs no expert kernel.
     """
     afd_config = parse_afd_config(vllm_config, validate=False)
     device_type = current_platform.device_type
@@ -413,17 +405,6 @@ def build_expert(
         moe_kwargs["routed_scaling_factor"],
     ):
         raise ValueError("routed_scaling_factor must be finite")
-
-    routed_experts_cls: type[RoutedExperts] = AFDRemoteRoutedExperts
-    if device_type == "npu":
-        from afd_plugin.model_executor.ffn.npu.remote import (
-            AFDAscendRemoteRoutedExperts,
-        )
-
-        routed_experts_cls = AFDAscendRemoteRoutedExperts
-        # CAM receives the gate at forward time to keep its single checkpoint name.
-        gate = None
-
     # A parameter-free container: no local quantized weights, transforms or
     # EPLB, and unit TP/DP/PCP sizes, so no expert sharding. vLLM's runner
     # scales the combined routed output, as native; the P2P runner returns the
@@ -437,7 +418,7 @@ def build_expert(
         "routed_output_transform": None,
         "n_shared_experts": None,
         "fuse_shared_experts": False,
-        "apply_routed_scale_to_output": device_type != "npu",
+        "apply_routed_scale_to_output": True,
         "enable_eplb": False,
         "num_redundant_experts": 0,
         "is_sequence_parallel": False,
@@ -445,12 +426,8 @@ def build_expert(
         "dp_size": 1,
         "pcp_size": 1,
         "runner_cls": getattr(importlib.import_module(runner_module), runner_class),
-        "runner_args": (
-            {"transport_layer_idx": transport_layer_idx}
-            if transport_layer_idx is not None
-            else None
-        ),
-        "routed_experts_cls": routed_experts_cls,
+        "runner_args": None,
+        "routed_experts_cls": AFDRemoteRoutedExperts,
         "routed_experts_args": None,
     }
     reserved = moe_kwargs.keys() & factory_kwargs.keys()
@@ -459,6 +436,10 @@ def build_expert(
             "Attention remote MoE factory reserves these arguments: "
             + ", ".join(sorted(reserved)),
         )
+    if device_type == "npu":
+        from afd_plugin.model_executor.ffn.npu.remote import cam_factory_kwargs
+
+        factory_kwargs.update(cam_factory_kwargs())
     return fused_moe.FusedMoEFactory(**moe_kwargs, **factory_kwargs)
 
 

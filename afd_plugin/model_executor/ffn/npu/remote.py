@@ -20,6 +20,7 @@ from afd_plugin.model_executor.ffn.remote import (
     AFDRemoteMoERunner,
     AFDRemoteRoutedExperts,
     _current_afd_metadata,
+    _send_attention_output,
 )
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
@@ -32,6 +33,15 @@ class AFDAscendRemoteRoutedExperts(AFDRemoteRoutedExperts):
 
     def _replace_quant_method(self, quant_method: FusedMoEMethodBase) -> None:
         """Keep the weightless AFD method when Ascend installs its BF16 method."""
+
+
+def cam_factory_kwargs() -> dict[str, Any]:
+    # The model owns the checkpoint gate. CAM routes already include its scaling.
+    return {
+        "gate": None,
+        "apply_routed_scale_to_output": False,
+        "routed_experts_cls": AFDAscendRemoteRoutedExperts,
+    }
 
 
 def local_hash_input_ids(
@@ -153,6 +163,24 @@ class AFDCAMP2PMoERunner(AFDRemoteMoERunner):
         return super().forward(
             hidden_states, router_logits, input_ids, shared_experts_input
         )
+
+    def _exchange(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        shared_experts: nn.Module | None = None,
+        **send_kwargs: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        metadata = _current_afd_metadata()
+        stage_idx = _send_attention_output(
+            metadata, hidden_states, layer_idx=self.layer_idx, **send_kwargs
+        )
+        shared = shared_experts(hidden_states) if shared_experts is not None else None
+        hidden_states = maybe_apply_dbo_yield(hidden_states, role="attention")
+        output = metadata.connector.recv_ffn_output(
+            ref_tensor=hidden_states, ubatch_idx=stage_idx
+        )
+        return output if shared is None else output + shared
 
 
 class AFDAsyncCAMMoERunner(AFDRemoteMoERunner):

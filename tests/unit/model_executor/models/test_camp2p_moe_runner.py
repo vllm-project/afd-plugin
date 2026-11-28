@@ -21,7 +21,7 @@ from tests.unit.fakes.vllm_config import attention_moe_vllm_config  # noqa: E402
 @pytest.mark.parametrize("explicit", [False, True], ids=["context-ids", "model-ids"])
 def test_ffn_gate_sends_local_ids(cam_moe, ascend_v4_model, monkeypatch, explicit):
     events: list[tuple] = []
-    install_proxy_context(monkeypatch, events)
+    install_proxy_context(monkeypatch, events, yield_module=npu_remote)
     local_ids = torch.tensor([4, 7], dtype=torch.int32)
     context_ids = torch.arange(5) if explicit else local_ids
     monkeypatch.setattr(
@@ -69,7 +69,7 @@ def test_sync_gate_preserves_routes_and_stage_across_yield(
         metadata.stage_idx = stage.ubatch_idx
         return hidden
 
-    monkeypatch.setattr(remote, "maybe_apply_dbo_yield", switch_stage)
+    monkeypatch.setattr(npu_remote, "maybe_apply_dbo_yield", switch_stage)
 
     class Shared(nn.Module):
         def __init__(self, **kwargs):
