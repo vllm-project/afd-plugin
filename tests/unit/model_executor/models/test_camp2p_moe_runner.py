@@ -162,7 +162,7 @@ def test_hash_gate_sends_routes_from_the_checkpoint_table(
         torch.ops.vllm, "afd_balance_routing_ids_", lambda *_: None, raising=False
     )
     events: list[tuple] = []
-    install_proxy_context(monkeypatch, events)
+    install_proxy_context(monkeypatch, events, yield_module=npu_remote)
 
     output = block(
         hidden,
